@@ -497,3 +497,182 @@ fn bench_a_frame_inside_a_transition() {
     let _ = std::fs::create_dir_all(&out);
     let _ = std::fs::write(out.join("bench-transitions.txt"), &report);
 }
+
+/// A moving zoom, a mask and the effects, frame by frame: FFmpeg's own still of the frame, and the
+/// export graph's per-frame cost (what `geq` costs: 93 ms of CPU a 960x540 frame and 402 ms at 1080p
+/// in the review), against the compositor — a still (decode, then the passes and the readback) and an
+/// export frame through `MotionFrames`, forward, the mask plane already made (a mask does not move: it
+/// is made once, timed on its own). Same gate as the still benchmark.
+#[test]
+#[ignore = "benchmark: set KERF_BENCH=1; needs ffmpeg and a GPU adapter"]
+fn bench_a_mask_a_blur_and_a_moving_zoom() {
+    if std::env::var_os("KERF_BENCH").is_none() {
+        eprintln!("skipped: set KERF_BENCH=1 to run the benchmark");
+        return;
+    }
+    use kerf_core::{Container, Delivery, Fit, Keyframe, Mask, MaskShape, RateControl, VideoEffect};
+    let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter");
+    let info = gpu.adapter_info().clone();
+    let comp = Compositor::new(gpu).expect("compositor");
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let scratch = dir.join(format!("bench-zoom-{}.jpg", std::process::id()));
+    let asset = playback_source(dir, 1920, 1080, 2);
+    let assets = std::slice::from_ref(&asset);
+    let opts = ExportOptions::default();
+    let policy = kerf_core::composite_color_policy();
+    let key = |time: f64, scale: f64, pos_x: f64| Keyframe {
+        time,
+        scale,
+        pos_x,
+        pos_y: 0.0,
+        rotation: 0.0,
+        opacity: 1.0,
+        easing: Default::default(),
+    };
+    let mask = Mask {
+        shape: MaskShape::Ellipse,
+        x: 0.5,
+        y: 0.5,
+        width: 0.6,
+        height: 0.6,
+        feather: 0.15,
+        inverted: false,
+    };
+    type Edit = Box<dyn Fn(&mut Clip)>;
+    let frames: Vec<(&str, Edit)> = vec![
+        ("plain cut", Box::new(|_| {})),
+        ("ellipse mask, feathered", Box::new(move |c| c.mask = Some(mask))),
+        (
+            "blur sigma 6",
+            Box::new(|c| c.effects = vec![VideoEffect::Blur { sigma: 6.0 }]),
+        ),
+        (
+            "sharpen 0.5",
+            Box::new(|c| c.effects = vec![VideoEffect::Sharpen { amount: 0.5 }]),
+        ),
+        (
+            "moving zoom 1 -> 1.25",
+            Box::new(move |c| c.keyframes = vec![key(0.0, 1.0, 0.0), key(2.0, 1.25, -0.05)]),
+        ),
+        (
+            "zoom + mask + blur",
+            Box::new(move |c| {
+                c.keyframes = vec![key(0.0, 1.0, 0.0), key(2.0, 1.25, -0.05)];
+                c.mask = Some(mask);
+                c.effects = vec![VideoEffect::Blur { sigma: 6.0 }];
+            }),
+        ),
+    ];
+    let mut report = format!(
+        "adapter: {} ({:?}, {:?}); ffmpeg: {}; a 1920x1080 30 fps source, min of 7 runs after a warm-up (median in brackets)\n",
+        info.name,
+        info.backend,
+        info.device_type,
+        kerf_core::ffmpeg_path(),
+    );
+    let both = |v: Vec<Duration>| {
+        let min = v.iter().min().copied().unwrap_or_default();
+        format!("{:>6.0} ({:.0})", ms(min), ms(median(v)))
+    };
+    // The mask plane, on its own: made once per (mask, size).
+    for (w, h) in [(960u32, 540u32), (1920, 1080)] {
+        let t0 = Instant::now();
+        let plane = kerf_core::mask_alpha_plane(&mask, w, h);
+        let line = format!(
+            "mask plane {w}x{h}: {:.1} ms, once ({} bytes)\n",
+            ms(t0.elapsed()),
+            plane.len()
+        );
+        eprint!("{line}");
+        report.push_str(&line);
+    }
+    report.push_str(&format!(
+        "\n{:<26} {:<8} {:>14} {:>16} {:>19}\n",
+        "still of", "render", "ffmpeg ms", "gpu decode ms", "gpu composite ms"
+    ));
+    for (name, width) in [("960 px", 960u32), ("1080p", u32::MAX)] {
+        for (label, edit) in &frames {
+            let mut tl = timeline(&asset, 1);
+            edit(&mut tl.tracks[0].clips[0]);
+            tl.tracks[0].clips[0].source_out = 2.0;
+            let plan = RenderPlan::at(&tl, assets, &opts, 1.0, policy).expect("plan");
+            let size = plan.size(width);
+            assert!(plan.reasons(&Compositor::CAPS, size).is_empty(), "{label}");
+            let (mut ff, mut dec, mut comp_t) = (Vec::new(), Vec::new(), Vec::new());
+            for run in 0..8 {
+                let t0 = Instant::now();
+                export_still(&tl, assets, &opts, 1.0, &scratch, ImageFormat::Jpeg, 4).expect("ffmpeg still");
+                let ffmpeg_time = t0.elapsed();
+                let (_, timings) = comp.render_plan(&plan, size).expect("gpu render");
+                if run > 0 {
+                    ff.push(ffmpeg_time);
+                    dec.push(timings.decode);
+                    comp_t.push(timings.composite);
+                }
+            }
+            let line = format!(
+                "{:<26} {:<8} {:>14} {:>16} {:>19}\n",
+                label,
+                name,
+                both(ff),
+                both(dec),
+                both(comp_t)
+            );
+            eprint!("{line}");
+            report.push_str(&line);
+        }
+    }
+    // An export frame: FFmpeg's export of the second (graph + a cheap x264, 30 frames, the cost of the
+    // plain cut being the part that is not the effect) against the compositor's frames through one cursor
+    // per clip, forward.
+    report.push_str(&format!(
+        "\n{:<26} {:>26} {:>26}\n",
+        "export of a second, 960x540", "ffmpeg ms a frame", "gpu ms a frame (decode + composite)"
+    ));
+    let export_opts = ExportOptions {
+        resolution: Some((960, 540)),
+        fps: Some(30.0),
+        container: Container::Mkv,
+        video_codec: Some("libx264".into()),
+        rate_control: RateControl::Lossless,
+        ..ExportOptions::default()
+    };
+    let out = dir.join(format!("bench-zoom-{}.mkv", std::process::id()));
+    for (label, edit) in &frames {
+        let mut tl = timeline(&asset, 1);
+        edit(&mut tl.tracks[0].clips[0]);
+        tl.tracks[0].clips[0].source_in = 0.5;
+        tl.tracks[0].clips[0].source_out = 1.5;
+        tl.format = Some(Delivery::new(960, 540, Fit::Cover));
+        let planner =
+            kerf_core::Planner::new(&tl, assets, &export_opts, kerf_core::PlanRequest::motion(policy)).expect("planner");
+        let size = planner.at_frame(0).expect("plan").size(960);
+        let (mut ff, mut gpu_t) = (Vec::new(), Vec::new());
+        for run in 0..4 {
+            let t0 = Instant::now();
+            kerf_core::render_with(&tl, assets, &out, &export_opts).expect("ffmpeg export");
+            let ffmpeg_time = t0.elapsed();
+            let mut motion = kerf_gpu::MotionFrames::new(kerf_gpu::FrameSource::new(kerf_gpu::FrameSourceConfig::default()));
+            let t0 = Instant::now();
+            for k in 0..30 {
+                let plan = planner.at_frame(k).expect("plan");
+                assert!(plan.reasons(&Compositor::CAPS, size).is_empty(), "{label} frame {k}");
+                let frames = motion.frames(&plan).expect("cursor frames");
+                comp.composite_shared(&plan, &frames, size).expect("composite");
+            }
+            let gpu_time = t0.elapsed();
+            if run > 0 {
+                ff.push(ffmpeg_time / 30);
+                gpu_t.push(gpu_time / 30);
+            }
+        }
+        let line = format!("{:<26} {:>26} {:>26}\n", label, both(ff), both(gpu_t));
+        eprint!("{line}");
+        report.push_str(&line);
+    }
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&scratch);
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).parent().unwrap().join("parity");
+    let _ = std::fs::create_dir_all(&out);
+    let _ = std::fs::write(out.join("bench-zoom-mask-effects.txt"), &report);
+}

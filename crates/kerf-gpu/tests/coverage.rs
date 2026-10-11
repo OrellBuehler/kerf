@@ -1,5 +1,7 @@
-//! How much of a cut the compositor draws, frame by frame, before and after fades, dips, dissolves, slides
-//! and pushes (in still plans and in export frames): constructed cuts (not measured projects), planned
+//! How much of a cut the compositor draws, frame by frame, as it grew: layers and text (GPU-2), then
+//! fades, dips, dissolves, slides and pushes (GPU-4), then a moving zoom drawn last, masks and the
+//! blur / sharpen / grayscale / invert effects (GPU-6), in still plans and in export frames:
+//! constructed cuts (not measured projects), planned
 //! with the real planner and judged by what a compositor says it draws
 //! ([`kerf_gpu::Compositor::CAPS`]). No adapter and no decode — one short source file is made so the
 //! assets are probed like an import's. `#[ignore]`d (needs `ffmpeg`); run with
@@ -229,6 +231,15 @@ fn before_transitions() -> GpuCaps {
     caps
 }
 
+/// ... and before a moving zoom, masks and effects: fades and transitions in still plans and export frames.
+fn before_zoom_mask_effects() -> GpuCaps {
+    let mut caps = Compositor::CAPS;
+    caps.keyed_zoom = false;
+    caps.mask = false;
+    caps.effects = kerf_core::EffectKinds::NONE;
+    caps
+}
+
 #[test]
 #[ignore = "needs ffmpeg"]
 fn captioned_cuts_and_transitions_are_drawn_by_the_compositor_where_they_were_refused() {
@@ -240,8 +251,8 @@ fn captioned_cuts_and_transitions_are_drawn_by_the_compositor_where_they_were_re
     let policy = composite_color_policy();
     eprintln!("composite colour policy: {policy:?}");
     eprintln!(
-        "{:<76} {:>14} {:>14}   reasons left",
-        "cut (render 540 px wide), plan", "before", "after"
+        "{:<76} {:>14} {:>14} {:>14}   reasons left",
+        "cut (render 540 px wide), plan", "GPU-2", "GPU-4", "GPU-6"
     );
     let mut table = vec![];
     for (name, tl) in archetypes(&base, &side) {
@@ -253,8 +264,10 @@ fn captioned_cuts_and_transitions_are_drawn_by_the_compositor_where_they_were_re
             let end = tl.duration();
             let frames = (end * f64::from(fps.num) / f64::from(fps.den)).floor() as u64;
             let size = first.size(540);
-            // Before: the compositor GPU-2 left (text drawn, no fades, travel or tails, no export frames).
-            let before = drawn(&planner, &before_transitions(), frames, size, end);
+            // GPU-2: text drawn, no fades, travel or tails, no export frames. GPU-4: those. GPU-6: a moving
+            // zoom, masks and effects as well.
+            let was = drawn(&planner, &before_transitions(), frames, size, end);
+            let before = drawn(&planner, &before_zoom_mask_effects(), frames, size, end);
             let after = drawn(&planner, &Compositor::CAPS, frames, size, end);
             // What refuses the frames, before and after: the reasons' kinds and the frames each is a reason for.
             let reasons_left = |caps: &GpuCaps| {
@@ -281,10 +294,13 @@ fn captioned_cuts_and_transitions_are_drawn_by_the_compositor_where_they_were_re
                 }
                 left.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ")
             };
-            let (was, left) = (reasons_left(&before_transitions()), reasons_left(&Compositor::CAPS));
+            let (gpu4, left) = (reasons_left(&before_zoom_mask_effects()), reasons_left(&Compositor::CAPS));
             eprintln!(
-                "{:<76} {:>5.1}% {:>4}/{:<4} {:>5.1}% {:>4}/{:<4}   {}",
+                "{:<76} {:>5.1}% {:>4}/{:<4} {:>5.1}% {:>4}/{:<4} {:>5.1}% {:>4}/{:<4}   {}",
                 format!("{name} [{mode}]"),
+                was.0,
+                was.1,
+                was.2,
                 before.0,
                 before.1,
                 before.2,
@@ -293,41 +309,41 @@ fn captioned_cuts_and_transitions_are_drawn_by_the_compositor_where_they_were_re
                 after.2,
                 left
             );
-            eprintln!("{:<76} refused before: {was}", "");
-            table.push((name, mode, before.0, after.0));
+            eprintln!("{:<76} refused by GPU-4's caps: {gpu4}", "");
+            table.push((name, mode, was.0, before.0, after.0));
         }
     }
     let at = |name: &str, mode: &str| {
         table
             .iter()
             .find(|(n, m, ..)| n.starts_with(name) && *m == mode)
-            .map(|(_, _, before, after)| (*before, *after))
+            .map(|(_, _, was, before, after)| (*was, *before, *after))
             .expect("an archetype")
     };
     // A talking head with clip fades: drawn throughout once fades are.
     for mode in ["still", "motion"] {
-        let (before, after) = at("T1  ", mode);
-        assert!(
-            before < 100.0 && (after - 100.0).abs() < 1e-9,
-            "T1 {mode}: {before} -> {after}"
-        );
-        let (before, after) = at("T1c", mode);
-        assert!(
-            before < 100.0 && (after - 100.0).abs() < 1e-9,
-            "T1c {mode}: {before} -> {after}"
-        );
-        let (before, after) = at("T1b", mode);
-        assert!(
-            (after - 100.0).abs() < 1e-9 && after >= before,
-            "T1b {mode}: {before} -> {after}"
-        );
+        let (was, _, after) = at("T1  ", mode);
+        assert!(was < 100.0 && (after - 100.0).abs() < 1e-9, "T1 {mode}: {was} -> {after}");
+        let (was, _, after) = at("T1c", mode);
+        assert!(was < 100.0 && (after - 100.0).abs() < 1e-9, "T1c {mode}: {was} -> {after}");
+        let (was, _, after) = at("T1b", mode);
+        assert!((after - 100.0).abs() < 1e-9 && after >= was, "T1b {mode}: {was} -> {after}");
     }
     // The montage: dissolves, dips and a slide, drawn but for what is not a transition (the titles are).
     for mode in ["still", "motion"] {
-        let (before, after) = at("T2", mode);
+        let (was, _, after) = at("T2", mode);
         assert!(
-            after > before + 20.0 && (after - 100.0).abs() < 1e-9,
-            "T2 {mode}: {before} -> {after}"
+            after > was + 20.0 && (after - 100.0).abs() < 1e-9,
+            "T2 {mode}: {was} -> {after}"
+        );
+    }
+    // The tutorial: its push-ins are a moving zoom, and one clip adds a feathered mask and a blur to it.
+    // Drawn throughout once a zoom comes last and masks and blurs are drawn.
+    for mode in ["still", "motion"] {
+        let (_, before, after) = at("T3", mode);
+        assert!(
+            before < 90.0 && (after - 100.0).abs() < 1e-9,
+            "T3 {mode}: {before} -> {after}"
         );
     }
 }

@@ -123,13 +123,30 @@
 //!   FFmpegs for busy chroma, so none is claimed
 //!   (`resizing_a_picture_ffmpeg_scales_in_another_format_is_refused`). A picture left
 //!   at its size is drawn for every format.
-//! * **A moving zoom with a rotation, a grade or a fade of opacity in front of it** is
-//!   refused (`refused/moving-zoom-behind-*`): FFmpeg, the still and the export alike, runs a
-//!   moving zoom as the *last* stage of the clip's chain, so those act on the picture at its
-//!   fit size and are magnified with it, an order the compositor does not have. The same
-//!   keys with nothing in front of the zoom are drawn (`time/keyframes`, a zoom and a
-//!   position moving), as are a rotation and an opacity moving over a zoom that holds
-//!   (`time/keyframes+rotation+opacity`).
+//! * **A moving zoom is the last stage of FFmpeg's chain** (the still and the export alike), so a
+//!   grade, effects, a mask and the clip's fades act on the picture at its fit size and are magnified
+//!   with it; the compositor draws that order (`a_moving_zoom_is_the_last_stage_of_the_still_too`,
+//!   `tests/motion_parity.rs`). The two it does not order that way, a rotation and an opacity below 1 in
+//!   front of the zoom, are refused (`refused/moving-zoom-behind-*`). A rotation and an opacity moving
+//!   over a zoom that holds are drawn (`time/keyframes+rotation+opacity`).
+//! * **Masks and effects** (`masks_cut_a_layer_to_a_shape`, `effects_are_drawn_as_their_filters_draw_them`,
+//!   `the_effect_filters_match_ffmpeg_plane_by_plane`): a mask's alpha is `geq`'s, blended per sample (luma)
+//!   and over each 2x2 block's average (chroma) like `overlay`; grayscale, invert and sharpen are exact;
+//!   a blur is `gblur`'s float recursion in the portable order, one level off on a few samples in a hundred
+//!   thousand (FFmpeg's own SIMD orders the same sums otherwise). A mask on a letterbox is cut from the
+//!   whole padded frame, as `geq` is. A vignette, a chroma key, a mask on a rotated or translucent layer, a
+//!   blur or a sharpen on a letterbox, an invert / blur / sharpen on a full-range picture (FFmpeg runs it on
+//!   the raw values and converts the range afterwards: an invert 8 levels off, a sharpen's overshoot 26)
+//!   and an invert of a gray picture (its chroma stays 128 in FFmpeg) are refused. On a 10-bit, 4:2:2,
+//!   4:4:4, RGB or gray picture the effects and masks are drawn at the plain source's own figures.
+//! * **`geq` on FFmpeg 6.1 copies a plane's last column and row from the ones before them** (its bilinear
+//!   read clamps to `w - 2` / `h - 2`; 9.0 copies them), so a masked picture's right-most column and bottom
+//!   row differ between the two FFmpegs (up to 224 levels of chroma at the bottom row of a frame whose picture
+//!   changes there). `kerf_core::geq_edge()` measures which the build in use does and the compositor draws
+//!   it, so the mask cases hold on both (`a_mask_hands_the_planes_on_as_the_geq_that_clamps_its_read_does`).
+//! * **A dip to white ahead of a moving zoom** is refused: the zoom's `scale` takes the RGB frame the fade
+//!   leaves and converts it in the same pass (up to 14 levels off a draw that scales the converted picture on
+//!   6.1.1, 3 on 9.0.2).
 //! * **A shrink steeper than 40:1** (`kerf_core::MAX_SHRINK`) is refused: past what
 //!   the scaler comparison measures, swscale's x86 vertical scaler drifts further
 //!   from the C arithmetic the shader follows (a 58:1 shrink of a 4K test pattern
@@ -2092,10 +2109,10 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
         0.5,
         Refusal::Plan("odd size"),
     );
-    // A moving zoom with a rotation, a grade or a fade of opacity in front of it: FFmpeg (the
-    // still and the export alike) runs the zoom last, so those act on the picture at its fit
-    // size and are magnified with it, an order the compositor does not have. The same keys
-    // at an instant where all of them are neutral are drawn (`time/keyframes`).
+    // A moving zoom with a rotation or a fade of opacity in front of it: FFmpeg (the still and the
+    // export alike) runs the zoom last, so those act on the picture at its fit size and are
+    // magnified with it, an order the compositor does not have for these two (a grade, a mask, the
+    // effects and the fades it does: `a_moving_zoom_is_the_last_stage_of_the_still_too`).
     let key = |time: f64, scale: f64, rotation: f64, opacity: f64| Keyframe {
         easing: Default::default(),
         time,
@@ -2115,16 +2132,96 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
         1.25,
         Refusal::Plan("moving zoom"),
     );
-    let mut graded = clip(&m.testsrc, 0.0, 2.0, 0.5);
-    graded.keyframes = vec![key(0.0, 1.0, 0.0, 1.0), key(1.5, 0.5, 0.0, 1.0)];
-    graded.color.contrast = 1.3;
-    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![graded]], None);
+    let mut faint = clip(&m.testsrc, 0.0, 2.0, 0.5);
+    faint.keyframes = vec![key(0.0, 1.0, 0.0, 0.6), key(1.5, 0.5, 0.0, 0.6)];
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![faint]], None);
     check_refused(
-        "refused/moving-zoom-behind-a-grade",
+        "refused/moving-zoom-behind-an-opacity",
         &tl,
         &[m.bars.clone(), m.testsrc.clone()],
         1.25,
         Refusal::Plan("moving zoom"),
+    );
+    // What the compositor does not draw of an effect or a mask: a vignette (its dither is a counter that runs
+    // on from frame to frame), a chroma key (an alpha from a float colour distance), a mask on a turned layer
+    // or one below full opacity, a blur or a sharpen on the padded frame of a letterbox, a value the filters refuse.
+    let effect = |e: kerf_core::VideoEffect| {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.effects = vec![e];
+        timeline(vec![vec![c]], None)
+    };
+    check_refused(
+        "refused/vignette",
+        &effect(kerf_core::VideoEffect::Vignette),
+        std::slice::from_ref(&m.testsrc),
+        0.5,
+        Refusal::Plan("vignette"),
+    );
+    check_refused(
+        "refused/chroma-key",
+        &effect(kerf_core::VideoEffect::ChromaKey {
+            color: "green".into(),
+            similarity: 0.1,
+            blend: 0.1,
+        }),
+        std::slice::from_ref(&m.testsrc),
+        0.5,
+        Refusal::Plan("chroma key"),
+    );
+    // (A value the filter's own option refuses fails in FFmpeg too: the plan refuses the frame so that FFmpeg
+    // reports it, which is all there is to check.)
+    for (name, e, reason) in [
+        ("blur sigma", kerf_core::VideoEffect::Blur { sigma: 5000.0 }, "gblur refuses"),
+        (
+            "sharpen amount",
+            kerf_core::VideoEffect::Sharpen { amount: 8.0 },
+            "unsharp refuses",
+        ),
+    ] {
+        let tl = effect(e);
+        let plan = RenderPlan::at(
+            &tl,
+            std::slice::from_ref(&m.testsrc),
+            &ExportOptions::default(),
+            0.5,
+            policy(),
+        )
+        .expect("plan");
+        let why = reasons(&plan, plan.size(u32::MAX)).join("; ");
+        assert!(why.contains(reason), "refused/{name}-out-of-range: {why:?}");
+        eprintln!(
+            "{:<40} refused as expected (FFmpeg refuses the value too)",
+            format!("refused/{name}-out-of-range")
+        );
+    }
+    let masked = |edit: &dyn Fn(&mut Clip), format: Option<Delivery>| {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.mask = Some(a_mask(kerf_core::MaskShape::Rect, 0.1, false));
+        edit(&mut c);
+        timeline(vec![vec![c]], format)
+    };
+    check_refused(
+        "refused/mask-on-a-rotated-layer",
+        &masked(&|c| c.transform.rotation = 12.0, None),
+        std::slice::from_ref(&m.testsrc),
+        0.5,
+        Refusal::Plan("rotated layer"),
+    );
+    check_refused(
+        "refused/mask-below-full-opacity",
+        &masked(&|c| c.transform.opacity = 0.6, None),
+        std::slice::from_ref(&m.testsrc),
+        0.5,
+        Refusal::Plan("below full opacity"),
+    );
+    let mut blurred = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    blurred.effects = vec![kerf_core::VideoEffect::Blur { sigma: 3.0 }];
+    check_refused(
+        "refused/blur-on-a-letterbox",
+        &timeline(vec![vec![blurred]], Some(Delivery::new(360, 640, Fit::Contain))),
+        std::slice::from_ref(&m.testsrc),
+        0.5,
+        Refusal::Plan("letterboxed"),
     );
     // A black or white fade on a layer below full opacity: `colorchannelmixer` leaves the picture in
     // RGBA and `fade` runs on that, alpha plane included, ahead of the conversion back to `yuva420p`
@@ -4097,6 +4194,587 @@ fn the_scaler_matches_ffmpegs_scale_plane_by_plane() {
         0.05,
         Refusal::Plan("steeper"),
     );
+    write_report();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// ---- a moving zoom last, masks and effects, in a still -----------------------------------------------
+
+fn zoom_keys(from: f64, to: f64, pos: (f64, f64)) -> Vec<Keyframe> {
+    let key = |time: f64, scale: f64, pos: (f64, f64)| Keyframe {
+        easing: Default::default(),
+        time,
+        scale,
+        pos_x: pos.0,
+        pos_y: pos.1,
+        rotation: 0.0,
+        opacity: 1.0,
+    };
+    vec![key(0.0, from, (0.0, 0.0)), key(1.5, to, pos)]
+}
+
+fn a_mask(shape: kerf_core::MaskShape, feather: f64, inverted: bool) -> kerf_core::Mask {
+    kerf_core::Mask {
+        shape,
+        x: 0.5,
+        y: 0.5,
+        width: 0.6,
+        height: 0.6,
+        feather,
+        inverted,
+    }
+}
+
+/// The still runs a moving zoom as the last stage of the clip's chain, like the export, so what is in
+/// front of it (a grade, a mask, an effect, the clip's fades) acts at the fit size and is magnified.
+/// Held to FFmpeg's still, at several moments of the zoom.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_moving_zoom_is_the_last_stage_of_the_still_too() {
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let times = [0.5, 1.0, 1.25, 1.9];
+    let zooming = |edit: &dyn Fn(&mut Clip)| {
+        let mut z = clip(&m.testsrc, 0.0, 2.0, 0.5);
+        z.keyframes = zoom_keys(1.0, 1.6, (0.0, 0.0));
+        edit(&mut z);
+        timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![z]], None)
+    };
+    check("zoom/plain", &zooming(&|_| {}), &assets, &times, STRICT);
+    check(
+        "zoom/out with position",
+        &zooming(&|c| c.keyframes = zoom_keys(1.0, 0.6, (0.2, -0.1))),
+        &assets,
+        &times,
+        STRICT,
+    );
+    check(
+        "zoom+grade",
+        &zooming(&|c| {
+            c.color = Color {
+                contrast: 1.3,
+                saturation: 1.2,
+                ..Color::default()
+            }
+        }),
+        &assets,
+        &times,
+        STRICT,
+    );
+    check(
+        "zoom+mask",
+        &zooming(&|c| c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.2, false))),
+        &assets,
+        &times,
+        STRICT,
+    );
+    check(
+        "zoom+mask rect inverted",
+        &zooming(&|c| c.mask = Some(a_mask(kerf_core::MaskShape::Rect, 0.1, true))),
+        &assets,
+        &times,
+        STRICT,
+    );
+    for (name, effect) in [
+        ("blur", E::Blur { sigma: 5.0 }),
+        ("sharpen", E::Sharpen { amount: 1.5 }),
+        ("grayscale", E::Grayscale),
+        ("invert", E::Invert),
+    ] {
+        check(
+            &format!("zoom+{name}"),
+            &zooming(&|c| c.effects = vec![effect.clone()]),
+            &assets,
+            &times,
+            STRICT,
+        );
+    }
+    // The tutorial's clip: a feathered mask over a blurred picture, in a Cover frame, zooming in.
+    let mut z = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    z.keyframes = zoom_keys(1.0, 1.25, (-0.05, 0.0));
+    z.mask = Some(a_mask(kerf_core::MaskShape::Rect, 0.1, false));
+    z.effects = vec![E::Blur { sigma: 6.0 }];
+    let tl = timeline(
+        vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![z]],
+        Some(Delivery::new(960, 540, Fit::Cover)),
+    );
+    check("zoom+mask+blur cover", &tl, &assets, &times, STRICT);
+    // A fade-in running at the moment of the still: faded at the fit size, then zoomed.
+    check(
+        "zoom+fade-in",
+        &zooming(&|c| c.fade_in = 1.0),
+        &assets,
+        &[0.6, 0.9, 1.2],
+        STRICT,
+    );
+    // A dissolve into a zooming, masked clip.
+    let out = clip(&m.bars, 0.0, 2.0, 0.0);
+    let mut inc = clip(&m.testsrc, 0.0, 2.0, 1.0);
+    inc.keyframes = zoom_keys(1.0, 1.4, (0.0, 0.0));
+    inc.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.2, false));
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.6,
+    });
+    let tl = timeline(vec![vec![out, inc]], None);
+    check("zoom/dissolve+mask", &tl, &assets, &[1.1, 1.3, 1.5], STRICT);
+}
+
+/// A mask in a still: the alpha `geq` writes, blended by `overlay` (luma per sample; chroma over the
+/// average of its block's alphas).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn masks_cut_a_layer_to_a_shape() {
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let masked = |edit: &dyn Fn(&mut Clip), format: Option<Delivery>| {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        edit(&mut c);
+        timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], format)
+    };
+    for shape in [kerf_core::MaskShape::Rect, kerf_core::MaskShape::Ellipse] {
+        for (feather, inverted) in [(0.0, false), (0.15, false), (0.6, false), (0.1, true)] {
+            check(
+                &format!("mask/{shape:?}-{feather}{}", if inverted { "-inverted" } else { "" }),
+                &masked(&|c| c.mask = Some(a_mask(shape, feather, inverted)), None),
+                &assets,
+                &[0.5, 1.2],
+                STRICT,
+            );
+        }
+    }
+    // Smaller, moved and odd-sized layers (211x118: the last chroma row and column have fewer neighbours).
+    for (name, scale, pos) in [
+        ("pip", 0.5, (0.2, -0.15)),
+        ("odd", 0.33, (0.1, 0.1)),
+        ("off the frame", 0.8, (0.45, 0.4)),
+    ] {
+        check(
+            &format!("mask/{name}"),
+            &masked(
+                &|c| {
+                    c.transform.scale = scale;
+                    c.transform.pos_x = pos.0;
+                    c.transform.pos_y = pos.1;
+                    c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.2, false));
+                },
+                None,
+            ),
+            &assets,
+            &[0.5],
+            STRICT,
+        );
+    }
+    // A letterboxed picture: the mask is cut from the whole padded frame, bars included.
+    check(
+        "mask/letterboxed 9:16",
+        &masked(
+            &|c| c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.2, false)),
+            Some(Delivery::new(360, 640, Fit::Contain)),
+        ),
+        &assets,
+        &[0.5],
+        STRICT,
+    );
+    // A cropped clip Cover-fitted into a vertical frame, the clip's fades running.
+    let tl = masked(
+        &|c| {
+            c.transform.crop_left = 0.2;
+            c.transform.crop_right = 0.2;
+            c.mask = Some(a_mask(kerf_core::MaskShape::Rect, 0.12, false));
+            c.fade_in = 1.0;
+        },
+        Some(Delivery::new(360, 640, Fit::Cover)),
+    );
+    check("mask/9:16 cover crop fade-in", &tl, &assets, &[0.2, 0.4, 1.0], STRICT);
+    // Over a busy picture, a mask is a mask: noise under a feathered ellipse.
+    let mut c = clip(&m.noise, 0.0, 0.2, 0.0);
+    c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.3, false));
+    let tl = timeline(vec![vec![clip(&m.black, 0.0, 2.0, 0.0)], vec![c]], None);
+    check("mask/over noise", &tl, &[m.black.clone(), m.noise.clone()], &[0.1], BUSY);
+    // The mask is the alpha plane alone, whatever the picture it cuts: the plain source's own figures.
+    for (label, asset) in [
+        ("10-bit", &m.tenbit),
+        ("4:4:4", &m.yuv444),
+        ("full-range", &m.fullrange),
+        ("gray", &m.gray),
+        ("rgb-png", &m.png640),
+    ] {
+        let mut c = clip(asset, 0.0, asset.duration.min(2.0), 0.0);
+        c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.2, false));
+        check(
+            &format!("mask/on-{label}"),
+            &timeline(vec![vec![c]], None),
+            std::slice::from_ref(asset),
+            &[0.5],
+            STRICT,
+        );
+    }
+}
+
+/// The effects in a still, against FFmpeg's.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn effects_are_drawn_as_their_filters_draw_them() {
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    for (name, effects) in [
+        ("blur-0.5", vec![E::Blur { sigma: 0.5 }]),
+        ("blur-3", vec![E::Blur { sigma: 3.0 }]),
+        ("blur-12", vec![E::Blur { sigma: 12.0 }]),
+        ("sharpen-1", vec![E::Sharpen { amount: 1.0 }]),
+        ("sharpen-2.5", vec![E::Sharpen { amount: 2.5 }]),
+        ("sharpen-neg", vec![E::Sharpen { amount: -1.5 }]),
+        ("grayscale", vec![E::Grayscale]),
+        ("invert", vec![E::Invert]),
+        (
+            "chain",
+            vec![E::Sharpen { amount: 1.0 }, E::Grayscale, E::Blur { sigma: 2.0 }, E::Invert],
+        ),
+    ] {
+        for (asset, label) in [(&m.testsrc, "testsrc2"), (&m.bars, "bars")] {
+            let mut c = clip(asset, 0.0, 2.0, 0.0);
+            c.effects = effects.clone();
+            let tl = timeline(vec![vec![c]], None);
+            check(
+                &format!("effect/{name}-{label}"),
+                &tl,
+                std::slice::from_ref(asset),
+                &[0.5, 1.5],
+                STRICT,
+            );
+        }
+    }
+    // Under a grade, scaled, odd-sized, in a Cover frame, translucent and rotated: the effect comes
+    // ahead of the opacity and the rotation.
+    for (name, edit) in [
+        (
+            "graded",
+            Box::new(|c: &mut Clip| {
+                c.color.contrast = 1.25;
+                c.color.saturation = 1.3;
+            }) as Box<dyn Fn(&mut Clip)>,
+        ),
+        ("scaled", Box::new(|c: &mut Clip| c.transform.scale = 0.6)),
+        ("odd", Box::new(|c: &mut Clip| c.transform.scale = 0.33)),
+        (
+            "translucent",
+            Box::new(|c: &mut Clip| {
+                c.transform.scale = 0.6;
+                c.transform.opacity = 0.7;
+            }),
+        ),
+        (
+            "rotated",
+            Box::new(|c: &mut Clip| {
+                c.transform.scale = 0.6;
+                c.transform.rotation = 15.0;
+            }),
+        ),
+    ] {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        edit(&mut c);
+        // (A sharpen after a scale is drawn to half strength: past it the scaler's level is amplified.)
+        c.effects = vec![E::Blur { sigma: 3.0 }, E::Sharpen { amount: 0.5 }];
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
+        let limits = if name == "rotated" { ROTATED } else { STRICT };
+        check(
+            &format!("effect/{name}"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            &[0.5],
+            limits,
+        );
+    }
+    // A sharpen whose gain on a scale's or a blur's level passes 2 is FFmpeg's: past half strength after a scale
+    // or a blur, or two of half strength.
+    for (name, effects) in [
+        ("sharpen-1.5", vec![E::Sharpen { amount: 1.5 }]),
+        ("sharpen-5", vec![E::Sharpen { amount: 5.0 }]),
+        (
+            "blur-then-sharpen-1.5",
+            vec![E::Blur { sigma: 3.0 }, E::Sharpen { amount: 1.5 }],
+        ),
+        (
+            "sharpen-0.5-twice",
+            vec![E::Sharpen { amount: 0.5 }, E::Sharpen { amount: 0.5 }],
+        ),
+        (
+            "sharpen-0.2-twice",
+            vec![E::Sharpen { amount: 0.2 }, E::Sharpen { amount: 0.2 }],
+        ),
+    ] {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.transform.scale = 0.6;
+        c.effects = effects;
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
+        check_refused(
+            &format!("refused/effect-{name}-after-a-scale"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            0.5,
+            Refusal::Plan("sharpen after a scale or a blur"),
+        );
+    }
+    // ...and after a blur with nothing scaled.
+    for (name, effects) in [
+        (
+            "blur-then-sharpen-1",
+            vec![E::Blur { sigma: 3.0 }, E::Sharpen { amount: 1.0 }],
+        ),
+        (
+            "blur-then-sharpen-5",
+            vec![E::Blur { sigma: 3.0 }, E::Sharpen { amount: 5.0 }],
+        ),
+    ] {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.effects = effects;
+        check_refused(
+            &format!("refused/effect-{name}"),
+            &timeline(vec![vec![c]], None),
+            std::slice::from_ref(&m.testsrc),
+            0.5,
+            Refusal::Plan("sharpen after a scale or a blur"),
+        );
+    }
+    // A table on a letterbox: the bars are part of the frame `pad` hands the effect, so they go through it.
+    for (name, effect) in [("invert", E::Invert), ("grayscale", E::Grayscale)] {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.effects = vec![effect];
+        let tl = timeline(
+            vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]],
+            Some(Delivery::new(360, 640, Fit::Contain)),
+        );
+        check(
+            &format!("effect/{name}-on-a-letterbox"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            &[0.5],
+            STRICT,
+        );
+    }
+    // Pictures the decode converts to 4:2:0 first (10-bit, 4:2:2, 4:4:4, RGB, gray): FFmpeg runs the effect on
+    // the picture as it is and converts afterwards, so the figures are the plain source's own (the decode's
+    // rounding, `source/` above), not more. Not an invert of a gray picture, whose chroma FFmpeg leaves at 128.
+    for (label, asset) in [
+        ("10-bit", &m.tenbit),
+        ("4:4:4", &m.yuv444),
+        ("4:2:2", &m.yuv422),
+        ("bgr0", &m.bgr0),
+        ("rgb-png", &m.png640),
+        ("gray", &m.gray),
+    ] {
+        for (name, effect) in [
+            ("grayscale", E::Grayscale),
+            ("invert", E::Invert),
+            ("blur", E::Blur { sigma: 3.0 }),
+            ("sharpen", E::Sharpen { amount: 1.0 }),
+        ] {
+            if label == "gray" && name == "invert" {
+                continue;
+            }
+            let mut c = clip(asset, 0.0, asset.duration.min(2.0), 0.0);
+            c.effects = vec![effect];
+            let tl = timeline(vec![vec![c]], None);
+            // A deeper-than-8-bit picture may be `pc`-tagged, which FFmpeg 9 keeps the raw values of (as a
+            // `yuvj` one): where the range is negotiated the effects but grayscale are refused.
+            if label == "10-bit" && name != "grayscale" && policy() != CompositeColorPolicy::FixedBt601 {
+                check_refused(
+                    &format!("refused/effect-{name}-on-{label}"),
+                    &tl,
+                    std::slice::from_ref(asset),
+                    0.5,
+                    Refusal::Plan("full-range"),
+                );
+                continue;
+            }
+            check(
+                &format!("effect/{name}-on-{label}"),
+                &tl,
+                std::slice::from_ref(asset),
+                &[0.5],
+                STRICT,
+            );
+        }
+    }
+    // A full-range picture reaches the filter with its raw values and is converted afterwards: grayscale (chroma
+    // to 128) is the same either way and is drawn; an invert is up to 8 levels off, a sharpen's overshoot 26 and a
+    // blur 4 on 9.0.2, and an invert of a gray picture leaves FFmpeg's chroma at 128: refused.
+    let on = |asset: &Asset, effect: E| {
+        let mut c = clip(asset, 0.0, asset.duration.min(2.0), 0.0);
+        c.effects = vec![effect];
+        timeline(vec![vec![c]], None)
+    };
+    check(
+        "effect/grayscale-on-full-range",
+        &on(&m.fullrange, E::Grayscale),
+        std::slice::from_ref(&m.fullrange),
+        &[0.5],
+        STRICT,
+    );
+    for (name, effect) in [
+        ("invert", E::Invert),
+        ("blur", E::Blur { sigma: 3.0 }),
+        ("sharpen", E::Sharpen { amount: 1.0 }),
+    ] {
+        check_refused(
+            &format!("refused/effect-{name}-on-full-range"),
+            &on(&m.fullrange, effect.clone()),
+            std::slice::from_ref(&m.fullrange),
+            0.5,
+            Refusal::Plan("full-range"),
+        );
+        check_refused(
+            &format!("refused/effect-{name}-on-a-jpeg"),
+            &on(&m.jpeg, effect),
+            std::slice::from_ref(&m.jpeg),
+            0.0,
+            Refusal::Plan("full-range"),
+        );
+    }
+    check_refused(
+        "refused/effect-invert-on-gray",
+        &on(&m.gray, E::Invert),
+        std::slice::from_ref(&m.gray),
+        0.5,
+        Refusal::Plan("gray picture"),
+    );
+    // Noise in all three planes under every effect: every sample matters to its neighbours.
+    for (name, effects) in [
+        ("blur", vec![E::Blur { sigma: 2.5 }]),
+        ("sharpen", vec![E::Sharpen { amount: 1.5 }]),
+        ("invert", vec![E::Invert]),
+        // A sharpen of half strength after a blur: the blur's level times a gain of two.
+        (
+            "blur-then-sharpen-0.5",
+            vec![E::Blur { sigma: 2.5 }, E::Sharpen { amount: 0.5 }],
+        ),
+    ] {
+        let mut c = clip(&m.noise, 0.0, 0.2, 0.0);
+        c.effects = effects;
+        let tl = timeline(vec![vec![c]], None);
+        check(
+            &format!("effect/noise-{name}"),
+            &tl,
+            std::slice::from_ref(&m.noise),
+            &[0.1],
+            BUSY,
+        );
+    }
+}
+
+/// Each effect's shader against its filter, **plane by plane**: the picture at its own size, so
+/// nothing is scaled and no colour is converted, and what is compared is the filter's arithmetic. The
+/// sharpen, the grayscale and the invert are integer arithmetic and equal to the byte on every
+/// sample; the blur is `gblur`'s float recursion in the portable order (see `effects.rs`).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_effect_filters_match_ffmpeg_plane_by_plane() {
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    let opts = ExportOptions::default();
+    // (name, the effect, FFmpeg's filter for it, whether it is exact to the byte)
+    let cases: Vec<(&str, E, String, bool)> = vec![
+        ("invert", E::Invert, "negate".into(), true),
+        ("grayscale", E::Grayscale, "hue=s=0".into(), true),
+        (
+            "sharpen 1",
+            E::Sharpen { amount: 1.0 },
+            "unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=1".into(),
+            true,
+        ),
+        (
+            "sharpen 2.5",
+            E::Sharpen { amount: 2.5 },
+            "unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=2.5".into(),
+            true,
+        ),
+        (
+            "sharpen 0.7",
+            E::Sharpen { amount: 0.7 },
+            "unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.7".into(),
+            true,
+        ),
+        (
+            "sharpen -2",
+            E::Sharpen { amount: -2.0 },
+            "unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=-2".into(),
+            true,
+        ),
+        ("blur 0.5", E::Blur { sigma: 0.5 }, "gblur=sigma=0.5".into(), false),
+        ("blur 2", E::Blur { sigma: 2.0 }, "gblur=sigma=2".into(), false),
+        ("blur 6", E::Blur { sigma: 6.0 }, "gblur=sigma=6".into(), false),
+        ("blur 6.3", E::Blur { sigma: 6.3 }, "gblur=sigma=6.3".into(), false),
+        ("blur 25", E::Blur { sigma: 25.0 }, "gblur=sigma=25".into(), false),
+    ];
+    let mut failures = Vec::new();
+    for (asset, label, t) in [
+        (&m.noise, "noise", 0.1),
+        (&m.testsrc, "testsrc2", 0.5),
+        (&m.bars, "bars", 0.5),
+    ] {
+        for (name, effect, filter, exact) in &cases {
+            let mut c = clip(asset, 0.0, asset.duration, 0.0);
+            c.effects = vec![effect.clone()];
+            let tl = timeline(vec![vec![c]], None);
+            let plan = RenderPlan::at(&tl, std::slice::from_ref(asset), &opts, t, policy()).expect("plan");
+            let size = plan.size(u32::MAX);
+            let why = reasons(&plan, size);
+            assert!(why.is_empty(), "{why:?}");
+            let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+            let got = compositor().composite_yuv(&plan, &frames, size).expect("composite");
+            let seek = format!("{}", plan.layers[0].source_time);
+            let raw = ffmpeg(&[
+                "-ss",
+                &seek,
+                "-i",
+                &plan.layers[0].path,
+                "-frames:v",
+                "1",
+                "-vf",
+                filter,
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "pipe:1",
+            ]);
+            let (w, h) = (size.0 as usize, size.1 as usize);
+            let (luma, chroma) = (w * h, (w / 2) * (h / 2));
+            assert_eq!(raw.len(), luma + 2 * chroma);
+            for (plane, a, b) in [
+                ("Y", &got.y[..], &raw[..luma]),
+                ("U", &got.u[..], &raw[luma..luma + chroma]),
+                ("V", &got.v[..], &raw[luma + chroma..]),
+            ] {
+                let (mut max, mut differing) = (0i32, 0usize);
+                for (x, y) in a.iter().zip(b) {
+                    let d = (i32::from(*x) - i32::from(*y)).abs();
+                    max = max.max(d);
+                    differing += usize::from(d != 0);
+                }
+                let line = format!(
+                    "effect-planes/{label:<8} {name:<12} {plane}: max {max}  differing {differing} of {}",
+                    a.len()
+                );
+                eprintln!("{line}");
+                report()
+                    .lock()
+                    .unwrap()
+                    .insert(format!("effect-planes {label} {name} {plane}"), line);
+                // The blur may sit a level off on the samples whose value is on a half (see `effects.rs`):
+                // a handful, never more than a level and never more than a few in ten thousand.
+                let (max_limit, share) = if *exact { (0, 0.0) } else { (1, 2e-4) };
+                if max > max_limit || differing as f64 > share * a.len() as f64 {
+                    failures.push(format!(
+                        "{label} {name} {plane}: max {max} (<= {max_limit}), differing {differing} of {}",
+                        a.len()
+                    ));
+                }
+            }
+        }
+    }
     write_report();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

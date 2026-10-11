@@ -531,3 +531,102 @@ fn a_keyframed_zoom_is_read_at_the_output_frame_and_nothing_after_it_holds_it_st
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The alpha plane `geq` writes for a mask is what `mask_alpha_plane` makes of it, sample for
+/// sample: both shapes, hard and feathered, inverted, off-centre and larger than the frame, at
+/// sizes that are odd and even (the expression reads `W` and `H` of the plane). The shapes are
+/// built from the very text `mask_filter` writes into the graph. Both FFmpegs.
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+#[allow(clippy::print_stderr)]
+fn a_mask_plane_is_the_geq_planes_sample_for_sample() {
+    use crate::mask_plane::mask_alpha_plane;
+    use crate::model::{Mask, MaskShape};
+    let sizes = [(64u32, 36u32), (97, 61), (320, 180), (641, 361), (960, 540)];
+    let mut shapes = Vec::new();
+    for shape in [MaskShape::Rect, MaskShape::Ellipse] {
+        for feather in [0.0, 0.1, 0.15, 0.5, 1.0] {
+            for inverted in [false, true] {
+                shapes.push(Mask {
+                    shape,
+                    x: 0.5,
+                    y: 0.5,
+                    width: 0.6,
+                    height: 0.6,
+                    feather,
+                    inverted,
+                });
+            }
+        }
+        shapes.push(Mask {
+            shape,
+            x: 0.3,
+            y: 0.62,
+            width: 0.45,
+            height: 0.8,
+            feather: 0.25,
+            inverted: false,
+        });
+        shapes.push(Mask {
+            shape,
+            x: 0.5,
+            y: 0.5,
+            width: 2.0,
+            height: 1.3,
+            feather: 0.1,
+            inverted: false,
+        });
+        shapes.push(Mask {
+            shape,
+            x: 0.123456789,
+            y: 0.987654321,
+            width: 0.31415926,
+            height: 0.27182818,
+            feather: 0.0123,
+            inverted: true,
+        });
+    }
+    let mut compared = 0usize;
+    for &(w, h) in &sizes {
+        for mask in &shapes {
+            let run = command(&ffmpeg_bin())
+                .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+                // (A source refuses an odd size on 6.1; a scale produces one.)
+                .arg(format!(
+                    "color=c=black:s={}x{}:r=1:d=1,scale={w}:{h},format=yuva420p,{}",
+                    w + w % 2,
+                    h + h % 2,
+                    mask_filter(mask)
+                ))
+                .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuva420p", "-"])
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+            let (wu, hu) = (w as usize, h as usize);
+            let chroma = wu.div_ceil(2) * hu.div_ceil(2);
+            assert_eq!(run.stdout.len(), wu * hu * 2 + chroma * 2);
+            let alpha = &run.stdout[wu * hu + chroma * 2..];
+            let want = mask_alpha_plane(mask, w, h);
+            let bad: Vec<_> = alpha
+                .iter()
+                .zip(&want)
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .map(|(i, (a, b))| (i % wu, i / wu, *a, *b))
+                .take(5)
+                .collect();
+            assert!(
+                bad.is_empty(),
+                "{w}x{h} {mask:?}: (x, y, geq, ours) differ at {bad:?}\n{}",
+                mask_filter(mask)
+            );
+            compared += alpha.len();
+        }
+    }
+    eprintln!(
+        "mask planes: {compared} alpha samples equal to geq's over {} masks x {} sizes",
+        shapes.len(),
+        sizes.len()
+    );
+}

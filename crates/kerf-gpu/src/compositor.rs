@@ -39,13 +39,16 @@
 //! space — so there is no linear-light round trip to disagree about.
 
 use std::borrow::Borrow;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
-use kerf_core::{FadeEdge, FadeTint, GpuCaps, RenderPlan, YuvMatrix, FADE_FULL};
+use kerf_core::{
+    EffectKinds, FadeEdge, FadeTint, GeqEdge, GpuCaps, Mask, MaskShape, RenderPlan, VideoEffect, YuvMatrix, FADE_FULL,
+};
 use wgpu::util::DeviceExt;
 
+use crate::effects::{self, Gaussian};
 use crate::eq;
 use crate::frame_source::{FrameSource, Hint};
 use crate::gpu::{Gpu, GpuError};
@@ -166,7 +169,8 @@ struct ComposeParams {
     pic_shows: [i32; 2],
     rotate: u32,
     tail: u32,
-    pad: [u32; 2],
+    has_alpha: u32,
+    edge: u32,
     fade_in: u32,
     fade_out: u32,
     black: u32,
@@ -211,6 +215,30 @@ struct TextParams {
     pad: u32,
 }
 
+/// `planeops.wgsl`'s uniform: one table lookup, `fade` or `unsharp` over a plane.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PlaneOpParams {
+    size: [i32; 2],
+    row: i32,
+    amount: i32,
+    kind: u32,
+    black: u32,
+    f_in: u32,
+    f_out: u32,
+}
+
+/// `blur.wgsl`'s uniform: `gblur`'s numbers for one plane.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct BlurParams {
+    size: [i32; 2],
+    nu: f32,
+    boundary: f32,
+    post: f32,
+    pad: [f32; 3],
+}
+
 /// One plane on the GPU. A handle: cloning shares the texture.
 #[derive(Clone)]
 struct Plane {
@@ -232,7 +260,7 @@ const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// The GPU compositor: pipelines created once, textures per frame.
 ///
-/// v0 allocates its textures and buffers per call and keeps no cache — simple
+/// v0 allocates its textures and buffers per call and keeps no cache but the mask planes' — simple
 /// to reason about while the numbers are what matters; pooling is A1.
 pub struct Compositor {
     gpu: Arc<Gpu>,
@@ -260,6 +288,139 @@ pub struct Compositor {
     /// A 256x3 table that changes nothing, bound when a layer has no `eq`.
     identity_lut: wgpu::TextureView,
     text: TextPass,
+    ops: PlaneOps,
+    masks: MaskCache,
+    /// What FFmpeg's `geq` does at a plane's last column and row, when the host knows it: else probed.
+    geq_edge: Option<GeqEdge>,
+}
+
+/// The passes over a layer's planes between the scaler and the blend (`planeops.wgsl`, `blur.wgsl`):
+/// a table, `fade`, `unsharp`, and `gblur`'s two recursions and the pass that writes them back.
+struct PlaneOps {
+    layout: wgpu::BindGroupLayout,
+    lut: wgpu::RenderPipeline,
+    fade: wgpu::RenderPipeline,
+    unsharp: wgpu::RenderPipeline,
+    edge: wgpu::RenderPipeline,
+    blur_layout: wgpu::BindGroupLayout,
+    blur_h: wgpu::ComputePipeline,
+    blur_v: wgpu::ComputePipeline,
+    blur_out_layout: wgpu::BindGroupLayout,
+    blur_out: wgpu::RenderPipeline,
+}
+
+/// A mask's alpha plane for one picture size (`kerf_core::mask_alpha_plane`), made once because a
+/// mask does not move — `geq` evaluates it again for every frame — and uploaded by the first frame
+/// that draws it.
+struct MaskPlane {
+    w: u32,
+    h: u32,
+    data: Vec<u8>,
+    gpu: OnceLock<Plane>,
+}
+
+/// The mask planes in use, newest first: a few, under a byte cap that counts each plane twice (the
+/// CPU copy and the one uploaded for it).
+struct MaskCache {
+    entries: Mutex<Vec<(MaskKey, Arc<MaskPlane>)>>,
+    max_entries: usize,
+    max_bytes: usize,
+}
+
+type MaskKey = ([u64; 6], u32, u32);
+
+const MASK_CACHE_ENTRIES: usize = 8;
+const MASK_CACHE_BYTES: usize = 96 << 20;
+
+impl Default for MaskCache {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::default(),
+            max_entries: MASK_CACHE_ENTRIES,
+            max_bytes: MASK_CACHE_BYTES,
+        }
+    }
+}
+
+impl MaskCache {
+    fn get(&self, mask: &Mask, w: u32, h: u32) -> Arc<MaskPlane> {
+        let m = mask.normalized();
+        let shape = match m.shape {
+            MaskShape::Rect => 0,
+            MaskShape::Ellipse => 1,
+        };
+        let key: MaskKey = (
+            [
+                shape | (u64::from(m.inverted) << 1),
+                m.x.to_bits(),
+                m.y.to_bits(),
+                m.width.to_bits(),
+                m.height.to_bits(),
+                m.feather.to_bits(),
+            ],
+            w,
+            h,
+        );
+        let held = |entries: &mut Vec<(MaskKey, Arc<MaskPlane>)>| {
+            entries.iter().position(|(k, _)| *k == key).map(|at| {
+                let hit = entries.remove(at);
+                let plane = Arc::clone(&hit.1);
+                entries.insert(0, hit);
+                plane
+            })
+        };
+        if let Some(plane) = held(&mut self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner)) {
+            return plane;
+        }
+        // (Made with no lock held: a 1080p ellipse is a few milliseconds.)
+        let plane = Arc::new(MaskPlane {
+            w,
+            h,
+            data: kerf_core::mask_alpha_plane(&m, w, h),
+            gpu: OnceLock::new(),
+        });
+        let mut entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(found) = held(&mut entries) {
+            return found;
+        }
+        entries.insert(0, (key, Arc::clone(&plane)));
+        let (mut bytes, mut keep) = (0usize, 0usize);
+        for (_, p) in entries.iter() {
+            // (The texture a plane is uploaded to is as many bytes again: one 8-bit sample each.)
+            bytes += 2 * p.data.len();
+            if keep > 0 && (keep >= self.max_entries || bytes > self.max_bytes) {
+                break;
+            }
+            keep += 1;
+        }
+        entries.truncate(keep);
+        plane
+    }
+}
+
+/// What happens to a layer's planes between the scaler and the blend, beyond the fades: worked out
+/// before the GPU is touched.
+struct LayerLook {
+    /// `eq` and every pointwise effect (grayscale, invert) ahead of the first blur or sharpen,
+    /// composed into one table per plane and applied in the scaler's last pass before the zoom.
+    leading: Option<[[u8; 256]; 3]>,
+    /// What follows the first blur or sharpen, in the clip's order.
+    steps: Vec<Step>,
+    /// The mask's alpha, at the size of the picture the mask is cut from.
+    mask: Option<Arc<MaskPlane>>,
+    /// `geq` copies the planes through `lum` / `cb` / `cr` and, on a build that reads its last
+    /// column and row one in, changes them: the planes' own last column and row are their neighbours'.
+    mask_edge: bool,
+    /// A moving zoom comes last in FFmpeg's chain: everything above runs on the fit-size picture,
+    /// and the second scale stage zooms the result.
+    zoom_last: bool,
+}
+
+enum Step {
+    /// Pointwise effects that follow a blur or sharpen.
+    Table(Box<[[u8; 256]; 3]>),
+    Blur(Gaussian),
+    Sharpen(i32),
 }
 
 /// What drawing overlays needs: `text.wgsl`'s pipeline, a mask for the blends that have none (the
@@ -327,6 +488,7 @@ struct Drawn<'a> {
     /// Per stage, per plane (Y, U, V): the scaler's tables.
     filters: Vec<[PlaneFilters; 3]>,
     fades: LayerFades,
+    look: LayerLook,
 }
 
 /// What the `fade` filters of a layer's chain do at this frame, as the passes take them:
@@ -464,13 +626,28 @@ fn extent(w: u32, h: u32) -> wgpu::Extent3d {
     }
 }
 
+/// Do ahead of a frame what a plan needs measured and what takes a while: today FFmpeg's `geq`, for a
+/// masked plan (one short child process, once per process). Call it from a blocking thread **off the
+/// render lock**, with the plan in hand, so the first masked frame does not pay for it under the
+/// lock; a compositor pinned with [`Compositor::with_geq_edge`] needs none of it.
+pub fn prepare(plan: &RenderPlan) {
+    if plan.layers.iter().any(|l| l.mask.is_some()) {
+        let _ = kerf_core::geq_edge();
+    }
+}
+
 impl Compositor {
     /// What this compositor draws exactly, as data: the plan refuses (through
-    /// [`RenderPlan::reasons`]) whatever is not in it. That is [`GpuCaps::A0`] — layers,
-    /// transform, crop, fit, `eq`, opacity, stills and sampled keyframes — and **text**: titles and
-    /// captions, FFmpeg's own `drawtext` rasterised once and blended here (see [`crate::text`]) —
-    /// and **fades, dips, dissolves, slides and pushes** in still plans and in export frames
-    /// (`motion`, `fades`, `transitions`, `dip_white`; `tests/motion_parity.rs`).
+    /// [`RenderPlan::reasons`]) whatever is not in it. [`GpuCaps::A0`] (layers, transform, crop, fit,
+    /// `eq`, opacity, stills, sampled keyframes) and
+    ///
+    /// * `text`: titles and captions, FFmpeg's own `drawtext` raster blended here ([`crate::text`]);
+    /// * `motion`, `fades`, `transitions`, `dip_white`: fades, dips, dissolves, slides and pushes, in
+    ///   still plans and in export frames (`tests/motion_parity.rs`);
+    /// * `keyed_zoom`: a moving zoom drawn last, as FFmpeg's chain has it;
+    /// * `mask`, and the blur, sharpen, grayscale and invert `effects`.
+    ///
+    /// A vignette, a chroma key and the combinations the plan names (`Unsupported`) stay FFmpeg's.
     /// Each later pass flips its bit beside the pass and its parity cases.
     pub fn caps(&self) -> GpuCaps {
         Self::CAPS
@@ -484,8 +661,27 @@ impl Compositor {
         caps.fades = true;
         caps.transitions = true;
         caps.dip_white = true;
+        caps.keyed_zoom = true;
+        caps.mask = true;
+        caps.effects = EffectKinds::BLUR
+            .union(EffectKinds::SHARPEN)
+            .union(EffectKinds::GRAYSCALE)
+            .union(EffectKinds::INVERT);
         caps
     };
+
+    /// Pin what FFmpeg's `geq` does at a plane's last column and row, instead of measuring the
+    /// ffmpeg this process runs ([`kerf_core::geq_edge`], one child process, on the first masked
+    /// frame unless [`prepare`] ran ahead of it): for a host that knows its ffmpeg, and for tests.
+    #[must_use]
+    pub fn with_geq_edge(mut self, edge: GeqEdge) -> Self {
+        self.geq_edge = Some(edge);
+        self
+    }
+
+    fn geq_edge(&self) -> GeqEdge {
+        self.geq_edge.unwrap_or_else(kerf_core::geq_edge)
+    }
 
     /// Build the pipelines on `gpu`. Fails with a [`GpuError`] — it never panics —
     /// when the device rejects the shader or a pipeline, or is already lost.
@@ -513,6 +709,7 @@ impl Compositor {
                     texture_entry(2),
                     texture_entry(3),
                     texture_entry(4),
+                    texture_entry(5),
                 ],
             });
             let convert_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -700,6 +897,7 @@ impl Compositor {
                     &[0],
                 )
                 .create_view(&wgpu::TextureViewDescriptor::default());
+            let ops = Self::plane_ops(device);
             Ok(Self {
                 gpu: Arc::clone(&g),
                 resample_layout,
@@ -725,8 +923,134 @@ impl Compositor {
                     blank,
                     atlas: TextAtlas::default(),
                 },
+                ops,
+                masks: MaskCache::default(),
+                geq_edge: None,
             })
         })
+    }
+
+    /// The pipelines of [`PlaneOps`].
+    fn plane_ops(device: &wgpu::Device) -> PlaneOps {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("plane ops"),
+            entries: &[uniform_entry(0), texture_entry(1), texture_entry(2)],
+        });
+        let render = |label: &str, module: &wgpu::ShaderModule, layout: &wgpu::BindGroupLayout, fs: &str| {
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[Some(layout)],
+                immediate_size: 0,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some(fs),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: PLANE_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let ops_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kerf plane ops"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/planeops.wgsl").into()),
+        });
+        let lut = render("ops lut", &ops_module, &layout, "fs_lut");
+        let fade = render("ops fade", &ops_module, &layout, "fs_fade");
+        let unsharp = render("ops unsharp", &ops_module, &layout, "fs_unsharp");
+        let edge = render("ops edge", &ops_module, &layout, "fs_edge");
+
+        let entry = |binding: u32, ty: wgpu::BindingType, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty,
+            count: None,
+        };
+        let uniform = wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let storage = |read_only| wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let texture = wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        };
+        let blur_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blur"),
+            entries: &[
+                entry(0, uniform, wgpu::ShaderStages::COMPUTE),
+                entry(1, texture, wgpu::ShaderStages::COMPUTE),
+                entry(2, storage(false), wgpu::ShaderStages::COMPUTE),
+            ],
+        });
+        let blur_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kerf blur"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/blur.wgsl").into()),
+        });
+        let compute = |label: &str, cs: &str| {
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[Some(&blur_layout)],
+                immediate_size: 0,
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pl),
+                module: &blur_module,
+                entry_point: Some(cs),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let blur_h = compute("blur rows", "cs_h");
+        let blur_v = compute("blur columns", "cs_v");
+        let blur_out_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("blur out"),
+            entries: &[
+                entry(0, uniform, wgpu::ShaderStages::FRAGMENT),
+                entry(1, storage(true), wgpu::ShaderStages::FRAGMENT),
+            ],
+        });
+        let out_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kerf blur out"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/blur_out.wgsl").into()),
+        });
+        let blur_out = render("blur out", &out_module, &blur_out_layout, "fs_out");
+        PlaneOps {
+            layout,
+            lut,
+            fade,
+            unsharp,
+            edge,
+            blur_layout,
+            blur_h,
+            blur_v,
+            blur_out_layout,
+            blur_out,
+        }
     }
 
     fn lut_texture(gpu: &Gpu, rows: &[u8]) -> wgpu::TextureView {
@@ -1014,6 +1338,344 @@ impl Compositor {
         out
     }
 
+    /// A bind group over one uniform and two textures for a pass of [`PlaneOps`].
+    fn ops_bind(&self, params: &PlaneOpParams, src: &wgpu::TextureView, aux: &wgpu::TextureView) -> wgpu::BindGroup {
+        let device = &self.gpu.device;
+        let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("plane op params"),
+            contents: bytemuck::bytes_of(params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("plane op"),
+            layout: &self.ops.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(src),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(aux),
+                },
+            ],
+        })
+    }
+
+    /// A new 8-bit plane of the size of `like`, to render into.
+    fn out_plane(&self, label: &str, like: &Plane) -> Plane {
+        self.plane(
+            label,
+            like.w,
+            like.h,
+            PLANE_FORMAT,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        )
+    }
+
+    /// The three planes through per-plane tables (Y, U, V).
+    fn table_planes(&self, enc: &mut wgpu::CommandEncoder, input: &[Plane; 3], tables: &[[u8; 256]; 3]) -> [Plane; 3] {
+        let flat: Vec<u8> = tables.iter().flatten().copied().collect();
+        let view = Self::lut_texture(&self.gpu, &flat);
+        std::array::from_fn(|row| {
+            let plane = &input[row];
+            let out = self.out_plane("table", plane);
+            let params = PlaneOpParams {
+                size: [plane.w as i32, plane.h as i32],
+                row: row as i32,
+                amount: 0,
+                kind: 0,
+                black: 0,
+                f_in: 0,
+                f_out: 0,
+            };
+            let bind = self.ops_bind(&params, &plane.view, &view);
+            self.pass(enc, &self.ops.lut, &out.view, &bind, None, None);
+            out
+        })
+    }
+
+    /// `fade` on one plane of a layer that is faded before it is zoomed: `kind` 0 luma (the
+    /// layer's black level), 1 chroma, 2 the alpha plane (`f_in` is the dissolve's ramp).
+    fn fade_plane(&self, enc: &mut wgpu::CommandEncoder, input: &Plane, kind: u32, black: u32, f_in: u32, f_out: u32) -> Plane {
+        let out = self.out_plane("fade", input);
+        let params = PlaneOpParams {
+            size: [input.w as i32, input.h as i32],
+            row: 0,
+            amount: 0,
+            kind,
+            black,
+            f_in,
+            f_out,
+        };
+        let bind = self.ops_bind(&params, &input.view, &self.text.blank);
+        self.pass(enc, &self.ops.fade, &out.view, &bind, None, None);
+        out
+    }
+
+    /// The three planes as `geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)'` hands them on where it reads
+    /// one in from a plane's last column and row (`kerf_core::GeqEdge::Penultimate`).
+    fn edge_planes(&self, enc: &mut wgpu::CommandEncoder, input: &[Plane; 3]) -> [Plane; 3] {
+        std::array::from_fn(|i| {
+            let plane = &input[i];
+            let out = self.out_plane("geq edge", plane);
+            let params = PlaneOpParams {
+                size: [plane.w as i32, plane.h as i32],
+                row: 0,
+                amount: 0,
+                kind: 0,
+                black: 0,
+                f_in: 0,
+                f_out: 0,
+            };
+            let bind = self.ops_bind(&params, &plane.view, &self.text.blank);
+            self.pass(enc, &self.ops.edge, &out.view, &bind, None, None);
+            out
+        })
+    }
+
+    /// `unsharp` (5x5, luma only: the chroma amount is 0, which copies) on the luma plane.
+    fn sharpen_planes(&self, enc: &mut wgpu::CommandEncoder, input: &[Plane; 3], amount: i32) -> [Plane; 3] {
+        let out = self.out_plane("sharpen", &input[0]);
+        let params = PlaneOpParams {
+            size: [out.w as i32, out.h as i32],
+            row: 0,
+            amount,
+            kind: 0,
+            black: 0,
+            f_in: 0,
+            f_out: 0,
+        };
+        let bind = self.ops_bind(&params, &input[0].view, &self.text.blank);
+        self.pass(enc, &self.ops.unsharp, &out.view, &bind, None, None);
+        [out, input[1].clone(), input[2].clone()]
+    }
+
+    /// `gblur` on all three planes, each at its own size with the same sigma.
+    fn blur_planes(&self, enc: &mut wgpu::CommandEncoder, input: &[Plane; 3], g: &Gaussian) -> [Plane; 3] {
+        let device = &self.gpu.device;
+        std::array::from_fn(|i| {
+            let plane = &input[i];
+            let params = BlurParams {
+                size: [plane.w as i32, plane.h as i32],
+                nu: g.nu,
+                boundary: g.boundary,
+                post: g.post,
+                pad: [0.0; 3],
+            };
+            let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("blur params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let work = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("blur work"),
+                size: u64::from(plane.w) * u64::from(plane.h) * 4,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("blur"),
+                layout: &self.ops.blur_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: ubuf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&plane.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: work.as_entire_binding(),
+                    },
+                ],
+            });
+            for (pipeline, lines) in [(&self.ops.blur_h, plane.h), (&self.ops.blur_v, plane.w)] {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("gblur"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups(lines.div_ceil(64), 1, 1);
+            }
+            let out = self.out_plane("blurred", plane);
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("blur out"),
+                layout: &self.ops.blur_out_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: ubuf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: work.as_entire_binding(),
+                    },
+                ],
+            });
+            self.pass(enc, &self.ops.blur_out, &out.view, &bind, None, None);
+            out
+        })
+    }
+
+    /// One scale stage over the three planes (a stage that changes nothing is the plane itself).
+    /// `lut` is a table texture to apply in the vertical pass of each plane (rows Y, U, V).
+    fn scale_stage(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        input: &[Plane; 3],
+        stage: &ScaleStage,
+        filters: &[PlaneFilters; 3],
+        lut: Option<&wgpu::TextureView>,
+    ) -> [Plane; 3] {
+        std::array::from_fn(|pi| {
+            let plane = &input[pi];
+            let ps = plane_stage(stage, pi > 0);
+            let lut = lut.map(|t| (t, pi as u32));
+            // A stage that changes nothing — the whole plane, at its own size, no table to apply —
+            // is the plane itself. FFmpeg's `scale` is a passthrough in the same case, and it is by
+            // far the common one (footage already at the delivery size).
+            let identity = lut.is_none()
+                && ps.src == Rect::whole(plane.w, plane.h)
+                && ps.keep == Rect::whole(ps.src.w, ps.src.h)
+                && ps.scaled == (ps.src.w, ps.src.h);
+            if identity {
+                plane.clone()
+            } else {
+                self.scale_plane(enc, plane, ps, &filters[pi], lut)
+            }
+        })
+    }
+
+    /// The alpha plane through a scale stage: scaled like luma (swscale's `yuva420p` alpha uses the
+    /// luma filters).
+    fn scale_alpha(&self, enc: &mut wgpu::CommandEncoder, alpha: &Plane, stage: &ScaleStage, filters: &PlaneFilters) -> Plane {
+        let ps = plane_stage(stage, false);
+        if ps.src == Rect::whole(alpha.w, alpha.h)
+            && ps.keep == Rect::whole(ps.src.w, ps.src.h)
+            && ps.scaled == (ps.src.w, ps.src.h)
+        {
+            return alpha.clone();
+        }
+        self.scale_plane(enc, alpha, ps, filters, None)
+    }
+
+    /// What happens to `layer`'s planes between the scaler and the blend, beyond its fades.
+    fn look_of(&self, layer: &kerf_core::PlanLayer, geom: &LayerGeometry) -> Result<LayerLook, GpuError> {
+        let unsupported = |what: String| GpuError::Unsupported(format!("layer {}: {what}", layer.name));
+        let zoom_last = layer.animated.is_some_and(|a| a.zooms) && geom.stages.len() == 2;
+        // The picture the effects and the mask act on: the fit-size one when the zoom comes last.
+        let (pw, ph) = if zoom_last {
+            (geom.stages[0].keep.w, geom.stages[0].keep.h)
+        } else {
+            geom.picture
+        };
+        let mut leading = eq::luts(&layer.color);
+        let mut steps: Vec<Step> = Vec::new();
+        let mut pending: Option<[[u8; 256]; 3]> = None;
+        let mut split = false;
+        for effect in &layer.effects {
+            match effect {
+                VideoEffect::Grayscale | VideoEffect::Invert => {
+                    let table = effects::table(if matches!(effect, VideoEffect::Grayscale) {
+                        effects::GRAYSCALE
+                    } else {
+                        effects::INVERT
+                    });
+                    let slot = if split { &mut pending } else { &mut leading };
+                    *slot = Some(match slot.take() {
+                        Some(first) => effects::then(&first, &table),
+                        None => table,
+                    });
+                }
+                VideoEffect::Blur { sigma } => {
+                    let g = effects::gaussian(*sigma).ok_or_else(|| unsupported(format!("a blur sigma of {sigma}")))?;
+                    // Sigma 0 is a recursion that changes nothing (`nu` 0, every scale 1).
+                    if g.nu == 0.0 && g.boundary == 1.0 && g.post == 1.0 {
+                        continue;
+                    }
+                    let limit = self.gpu.device.limits().max_storage_buffer_binding_size;
+                    if u64::from(pw) * u64::from(ph) * 4 > limit {
+                        return Err(unsupported(format!(
+                            "a blur of a {pw}x{ph} picture, over this device's {limit}-byte storage buffer"
+                        )));
+                    }
+                    if let Some(table) = pending.take() {
+                        steps.push(Step::Table(Box::new(table)));
+                    }
+                    split = true;
+                    steps.push(Step::Blur(g));
+                }
+                VideoEffect::Sharpen { amount } => {
+                    let a =
+                        effects::unsharp_amount(*amount).ok_or_else(|| unsupported(format!("a sharpen amount of {amount}")))?;
+                    if a == 0 {
+                        continue;
+                    }
+                    if let Some(table) = pending.take() {
+                        steps.push(Step::Table(Box::new(table)));
+                    }
+                    split = true;
+                    steps.push(Step::Sharpen(a));
+                }
+                other => return Err(unsupported(format!("the {} effect is not drawn", other.name()))),
+            }
+        }
+        if let Some(table) = pending {
+            steps.push(Step::Table(Box::new(table)));
+        }
+        // `geq` runs on the frame `pad` made of a letterboxed picture, bars included: the mask is the
+        // size of the whole layer there, the canvas.
+        let mask = match &layer.mask {
+            Some(mask) => {
+                if geom.rotation.is_some() {
+                    return Err(unsupported("a mask on a rotated layer".into()));
+                }
+                let (mw, mh) = if geom.matte { geom.layer } else { (pw, ph) };
+                Some(self.masks.get(mask, mw, mh))
+            }
+            None => None,
+        };
+        // (Only a masked layer asks: the first answer is a child process.)
+        let mask_edge = if mask.is_none() {
+            false
+        } else {
+            match self.geq_edge() {
+                GeqEdge::Exact => false,
+                GeqEdge::Penultimate => {
+                    // A frame one chroma sample wide or high has nothing to read one in from (`geq` reads
+                    // outside the plane there).
+                    let (mw, mh) = if geom.matte { geom.layer } else { (pw, ph) };
+                    if mw.div_ceil(2) < 2 || mh.div_ceil(2) < 2 {
+                        return Err(unsupported(format!(
+                            "a mask on a {mw}x{mh} frame, on an FFmpeg whose geq reads a plane's last column and row one in"
+                        )));
+                    }
+                    true
+                }
+                GeqEdge::Unknown => {
+                    return Err(unsupported(
+                        "a mask, until FFmpeg's geq can be measured (it reads a plane's last column and row differently on some builds)".into(),
+                    ));
+                }
+            }
+        };
+        Ok(LayerLook {
+            leading,
+            steps,
+            mask,
+            mask_edge,
+            zoom_last,
+        })
+    }
+
     /// Composite `frames` (one decoded picture per plan layer; `None` is a layer
     /// whose source had no frame there, which FFmpeg draws nothing for) at `size`.
     ///
@@ -1172,12 +1834,14 @@ impl Compositor {
                 filters.push([table(false)?, table(true)?, table(true)?]);
             }
             let fades = LayerFades::of(plan, layer, &geom)?;
+            let look = self.look_of(layer, &geom)?;
             drawn.push(Drawn {
                 layer,
                 frame,
                 geom,
                 filters,
                 fades,
+                look,
             });
         }
         // FFmpeg rasterises what text there is, here, before the GPU is touched. No project lock is
@@ -1274,6 +1938,7 @@ impl Compositor {
             geom,
             filters,
             fades,
+            look,
         } in drawn
         {
             let (cw, ch) = frame.chroma_size();
@@ -1283,41 +1948,44 @@ impl Compositor {
                 self.upload("v", cw, ch, &frame.v),
             ];
 
-            // `eq` tables, applied on the final stage only.
-            let eq_rows = eq::luts(&layer.color);
-            let tables = eq_rows.as_ref().map(|rows| {
+            // `eq` (and the pointwise effects that follow it) as tables, applied in the vertical pass of the
+            // last scale stage that comes before the zoom.
+            let tables = look.leading.as_ref().map(|rows| {
                 let flat: Vec<u8> = rows.iter().flatten().copied().collect();
                 Self::lut_texture(&self.gpu, &flat)
             });
             // `pad`'s black bars go through the same tables (they are part of the
             // frame `eq` sees): Y 16, U = V = 128 mapped through them.
-            let matte = eq_rows.as_ref().map_or([16.0, 128.0, 128.0], |t| {
+            let matte = look.leading.as_ref().map_or([16.0, 128.0, 128.0], |t| {
                 [f32::from(t[0][16]), f32::from(t[1][128]), f32::from(t[2][128])]
             });
 
+            // A moving zoom is the last stage of FFmpeg's chain: the fit scale, the grade, the effects, the
+            // mask and the fades all act on the picture at its fit size, and the zoom scales the result.
+            let before_zoom = if look.zoom_last { 1 } else { geom.stages.len() };
             let mut current = planes;
-            for (si, stage) in geom.stages.iter().enumerate() {
-                let last = si + 1 == geom.stages.len();
-                let mut next: Vec<Plane> = Vec::with_capacity(3);
-                for (pi, input) in current.iter().enumerate() {
-                    let ps = plane_stage(stage, pi > 0);
-                    let lut = last.then_some(tables.as_ref()).flatten().map(|t| (t, pi as u32));
-                    // A stage that changes nothing — the whole plane, at its own
-                    // size, no table to apply — is the plane itself. FFmpeg's
-                    // `scale` is a passthrough in the same case, and it is by far
-                    // the common one (footage already at the delivery size).
-                    let identity = lut.is_none()
-                        && ps.src == Rect::whole(input.w, input.h)
-                        && ps.keep == Rect::whole(ps.src.w, ps.src.h)
-                        && ps.scaled == (ps.src.w, ps.src.h);
-                    next.push(if identity {
-                        input.clone()
-                    } else {
-                        self.scale_plane(&mut enc, input, ps, &filters[si][pi], lut)
-                    });
-                }
-                current = next.try_into().unwrap_or_else(|_| unreachable!("three planes in, three out"));
+            for (si, stage) in geom.stages[..before_zoom].iter().enumerate() {
+                let lut = (si + 1 == before_zoom).then_some(tables.as_ref()).flatten();
+                current = self.scale_stage(&mut enc, &current, stage, &filters[si], lut);
             }
+            for step in &look.steps {
+                current = match step {
+                    Step::Table(rows) => self.table_planes(&mut enc, &current, rows),
+                    Step::Blur(g) => self.blur_planes(&mut enc, &current, g),
+                    Step::Sharpen(amount) => self.sharpen_planes(&mut enc, &current, *amount),
+                };
+            }
+            // (Where the zoom comes last the planes are shifted here, ahead of the zoom's scale; else
+            // the blend reads them one in from the layer's last column and row.)
+            if look.mask_edge && look.zoom_last {
+                current = self.edge_planes(&mut enc, &current);
+            }
+            // The mask is the alpha plane (`geq` rewrites it); nothing else gives the layer one but the
+            // dissolve's ramp, which acts on whatever plane there is.
+            let mut alpha: Option<Plane> = look
+                .mask
+                .as_ref()
+                .map(|m| m.gpu.get_or_init(|| self.upload("mask", m.w, m.h, &m.data)).clone());
             // Below full opacity FFmpeg takes the layer through RGB and back before
             // `overlay` sees it (see `roundtrip.rs`); that happens to the scaled
             // picture, ahead of the rotation. An opaque layer never leaves YUV.
@@ -1328,6 +1996,29 @@ impl Compositor {
                 let white = [fades.white_in, fades.white_out];
                 current = self.translucent_planes(&mut enc, &current, forward, plan.canvas.matrix, white)?;
             }
+            // What the blend pass still has to do about fades: all of them, unless the zoom is last.
+            let mut fades = *fades;
+            if look.zoom_last {
+                if fades.fade_in < FADE_FULL || fades.fade_out < FADE_FULL {
+                    let [y, u, v] = &current;
+                    current = [
+                        self.fade_plane(&mut enc, y, 0, fades.black, fades.fade_in, fades.fade_out),
+                        self.fade_plane(&mut enc, u, 1, fades.black, fades.fade_in, fades.fade_out),
+                        self.fade_plane(&mut enc, v, 1, fades.black, fades.fade_in, fades.fade_out),
+                    ];
+                    fades.fade_in = FADE_FULL;
+                    fades.fade_out = FADE_FULL;
+                }
+                // (Without a mask the ramp scales a uniform alpha plane into the same uniform one: the
+                // blend pass applies it.)
+                if let (Some(a), true) = (&alpha, fades.ramp < FADE_FULL) {
+                    alpha = Some(self.fade_plane(&mut enc, a, 2, 0, fades.ramp, FADE_FULL));
+                    fades.ramp = FADE_FULL;
+                }
+                current = self.scale_stage(&mut enc, &current, &geom.stages[1], &filters[1], None);
+                alpha = alpha.map(|a| self.scale_alpha(&mut enc, &a, &geom.stages[1], &filters[1][0]));
+            }
+            let fades = &fades;
             let [py, pu, pv] = &current;
 
             let (rotate, rot) = match geom.rotation {
@@ -1350,7 +2041,8 @@ impl Compositor {
                 pic_shows: [geom.picture_shows.0 as i32, geom.picture_shows.1 as i32],
                 rotate,
                 tail: 0,
-                pad: [0; 2],
+                has_alpha: u32::from(alpha.is_some()),
+                edge: u32::from(look.mask_edge && !look.zoom_last),
                 fade_in: fades.fade_in,
                 fade_out: fades.fade_out,
                 black: fades.black,
@@ -1381,7 +2073,7 @@ impl Compositor {
 
             // A layer that blends reads the canvas as it stands, and a pass cannot read what it writes:
             // the region it touches is copied aside first.
-            let canvas_before = if fades.blends() {
+            let canvas_before = if fades.blends() || alpha.is_some() {
                 let copy = before
                     .get_or_insert_with(|| self.plane("canvas before", ow, oh, CANVAS_FORMAT, wgpu::TextureUsages::COPY_DST));
                 enc.copy_texture_to_texture(
@@ -1412,7 +2104,10 @@ impl Compositor {
                 None
             };
             let (bind, pipeline) = match &canvas_before {
-                Some(prev) => (self.compose_bind_exact(&params, views, prev), &self.compose_exact),
+                Some(prev) => (
+                    self.compose_bind_exact(&params, views, prev, alpha.as_ref()),
+                    &self.compose_exact,
+                ),
                 None => (self.compose_bind(&params, views), &self.compose),
             };
             self.pass(
@@ -1427,7 +2122,10 @@ impl Compositor {
             if tail {
                 params.tail = 1;
                 let (bind, pipeline) = match &canvas_before {
-                    Some(prev) => (self.compose_bind_exact(&params, views, prev), &self.compose_exact_chroma),
+                    Some(prev) => (
+                        self.compose_bind_exact(&params, views, prev, alpha.as_ref()),
+                        &self.compose_exact_chroma,
+                    ),
                     None => (self.compose_bind(&params, views), &self.compose_chroma),
                 };
                 self.pass(
@@ -1624,6 +2322,7 @@ impl Compositor {
         params: &ComposeParams,
         planes: [&wgpu::TextureView; 3],
         before: &wgpu::TextureView,
+        alpha: Option<&Plane>,
     ) -> wgpu::BindGroup {
         let device = &self.gpu.device;
         let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1647,6 +2346,7 @@ impl Compositor {
                 texture(2, planes[1]),
                 texture(3, planes[2]),
                 texture(4, before),
+                texture(5, alpha.map_or(&self.text.blank, |a| &a.view)),
             ],
         })
     }
@@ -1960,6 +2660,83 @@ fn plane_stage(stage: &ScaleStage, chroma: bool) -> PlaneStage {
             w: half(stage.keep.w),
             h: half(stage.keep.h),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mask(x: f64) -> Mask {
+        Mask {
+            shape: MaskShape::Rect,
+            x,
+            y: 0.5,
+            width: 0.5,
+            height: 0.5,
+            feather: 0.1,
+            inverted: false,
+        }
+    }
+
+    fn held(cache: &MaskCache) -> Vec<(u32, u32)> {
+        let entries = cache.entries.lock().unwrap();
+        entries.iter().map(|(k, _)| (k.1, k.2)).collect()
+    }
+
+    #[test]
+    fn a_mask_plane_is_made_once_for_a_mask_and_a_size() {
+        let cache = MaskCache::default();
+        let a = cache.get(&mask(0.5), 32, 18);
+        assert_eq!(a.data, kerf_core::mask_alpha_plane(&mask(0.5), 32, 18));
+        assert!(
+            Arc::ptr_eq(&a, &cache.get(&mask(0.5), 32, 18)),
+            "the same mask and size is one plane"
+        );
+        assert!(
+            !Arc::ptr_eq(&a, &cache.get(&mask(0.5), 64, 36)),
+            "another size is another plane"
+        );
+        assert!(
+            !Arc::ptr_eq(&a, &cache.get(&mask(0.4), 32, 18)),
+            "another mask is another plane"
+        );
+        // A size no mask can have is clamped to a visible one before it is a key.
+        let wide = |w| Mask { width: w, ..mask(0.5) };
+        assert!(Arc::ptr_eq(&cache.get(&wide(9.0), 8, 8), &cache.get(&wide(99.0), 8, 8)));
+    }
+
+    #[test]
+    fn the_newest_planes_are_kept_under_the_entry_cap_and_the_byte_cap() {
+        let cache = MaskCache {
+            max_entries: 3,
+            ..MaskCache::default()
+        };
+        for w in 10..15 {
+            cache.get(&mask(0.5), w, 10);
+        }
+        assert_eq!(held(&cache), [(14, 10), (13, 10), (12, 10)], "three, newest first");
+        // A hit moves a plane to the front, so it outlives older ones.
+        cache.get(&mask(0.5), 12, 10);
+        cache.get(&mask(0.5), 15, 10);
+        assert_eq!(held(&cache), [(15, 10), (12, 10), (14, 10)]);
+
+        // The cap counts the CPU copy and the uploaded one: a plane of 120 samples is 240 bytes.
+        let cache = MaskCache {
+            max_bytes: 500,
+            ..MaskCache::default()
+        };
+        for w in [10, 11, 12] {
+            cache.get(&mask(0.5), w, 10);
+        }
+        assert_eq!(
+            held(&cache),
+            [(12, 10), (11, 10)],
+            "two planes are 460 bytes counted twice, a third 660"
+        );
+        // The plane just asked for is kept whatever its size.
+        cache.get(&mask(0.5), 100, 100);
+        assert_eq!(held(&cache), [(100, 100)]);
     }
 }
 

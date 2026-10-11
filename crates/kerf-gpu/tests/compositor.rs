@@ -173,7 +173,7 @@ fn a_layer_with_no_frame_draws_nothing() {
 fn a_plan_the_gpu_cannot_draw_is_refused_not_drawn_wrong() {
     let a = asset(64, 36);
     let mut c = Clip::new(a.id, 0.0, 1.0, 0.0);
-    c.effects.push(VideoEffect::Blur { sigma: 3.0 });
+    c.effects.push(VideoEffect::Vignette);
     let plan = plan_for(&a, c);
     assert!(!plan.gpu_supported());
     let err = compositor()
@@ -256,4 +256,227 @@ fn a_lost_device_is_an_error_not_a_panic_and_stays_one() {
     assert!(fresh.composite(&plan, &[flat(64, 36, 100, 128, 128)], (64, 36)).is_ok());
     // And a compositor cannot be built on the lost one.
     assert!(matches!(Compositor::new(gpu), Err(GpuError::DeviceLost(_))));
+}
+
+// ---- masks and effects, against their own references (no FFmpeg) -------------------------------------
+
+/// A deterministic noisy frame: every sample of Y, U and V is different from its neighbours.
+fn noise(w: u32, h: u32, seed: u32) -> YuvFrame {
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let mut next = move || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (state >> 24) as u8
+    };
+    YuvFrame {
+        width: w,
+        height: h,
+        y: (0..w * h).map(|_| 16 + next() % 220).collect(),
+        u: (0..cw * ch).map(|_| 16 + next() % 224).collect(),
+        v: (0..cw * ch).map(|_| 16 + next() % 224).collect(),
+    }
+}
+
+fn drawn_planes(a: &Asset, c: Clip, frame: &YuvFrame, size: (u32, u32)) -> YuvFrame {
+    let plan = plan_for(a, c);
+    assert_eq!(plan.reasons(&Compositor::CAPS, size), vec![], "the plan draws it");
+    compositor().composite_yuv(&plan, &[Some(frame.clone())], size).unwrap()
+}
+
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn a_blur_is_the_references_recursion_plane_by_plane() {
+    use kerf_gpu::effects;
+    for (w, h) in [(64u32, 36u32), (98, 62)] {
+        let a = asset(w, h);
+        let frame = noise(w, h, 7);
+        for sigma in [0.5, 2.0, 6.0, 25.0] {
+            let mut c = Clip::new(a.id, 0.0, 1.0, 0.0);
+            c.effects = vec![VideoEffect::Blur { sigma }];
+            let got = drawn_planes(&a, c, &frame, (w, h));
+            let g = effects::gaussian(sigma).unwrap();
+            let (cw, ch) = (w as usize / 2, h as usize / 2);
+            let want_y = effects::blur_plane(&frame.y, w as usize, h as usize, &g);
+            let want_u = effects::blur_plane(&frame.u, cw, ch, &g);
+            let want_v = effects::blur_plane(&frame.v, cw, ch, &g);
+            for (plane, a, b) in [("Y", &got.y, &want_y), ("U", &got.u, &want_u), ("V", &got.v, &want_v)] {
+                let differing = a.iter().zip(b).filter(|(x, y)| x != y).count();
+                let max = a
+                    .iter()
+                    .zip(b)
+                    .map(|(x, y)| (i32::from(*x) - i32::from(*y)).abs())
+                    .max()
+                    .unwrap();
+                // The shader's order is the reference's; a fused multiply-add on the device may flip a
+                // sample that sits on a half.
+                assert!(
+                    max <= 1 && differing * 500 <= a.len(),
+                    "{w}x{h} sigma {sigma} {plane}: max {max}, {differing} differ"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn a_sharpen_and_the_tables_are_the_references_byte_for_byte() {
+    use kerf_gpu::effects;
+    let (w, h) = (64u32, 36u32);
+    let a = asset(w, h);
+    let frame = noise(w, h, 11);
+    for amount in [1.0, 2.5, 0.7, -1.0, -2.0, 5.0] {
+        let mut c = Clip::new(a.id, 0.0, 1.0, 0.0);
+        c.effects = vec![VideoEffect::Sharpen { amount }];
+        let got = drawn_planes(&a, c, &frame, (w, h));
+        let want = effects::sharpen_plane(&frame.y, w as usize, h as usize, effects::unsharp_amount(amount).unwrap());
+        assert_eq!(got.y, want, "sharpen {amount}");
+        assert_eq!((&got.u, &got.v), (&frame.u, &frame.v), "the chroma is left alone");
+    }
+    type Table = (fn(u8) -> u8, fn(u8) -> u8);
+    let cases: [(Vec<VideoEffect>, Table); 4] = [
+        (vec![VideoEffect::Invert], (|v| 255 - v, |v| 255 - v)),
+        (vec![VideoEffect::Grayscale], (|v| v, |_| 128)),
+        (vec![VideoEffect::Grayscale, VideoEffect::Invert], (|v| 255 - v, |_| 127)),
+        (vec![VideoEffect::Invert, VideoEffect::Grayscale], (|v| 255 - v, |_| 128)),
+    ];
+    for (effects, f) in cases {
+        let mut c = Clip::new(a.id, 0.0, 1.0, 0.0);
+        c.effects = effects.clone();
+        let got = drawn_planes(&a, c, &frame, (w, h));
+        assert_eq!(got.y, frame.y.iter().map(|v| f.0(*v)).collect::<Vec<_>>(), "{effects:?} Y");
+        assert_eq!(got.u, frame.u.iter().map(|v| f.1(*v)).collect::<Vec<_>>(), "{effects:?} U");
+        assert_eq!(got.v, frame.v.iter().map(|v| f.1(*v)).collect::<Vec<_>>(), "{effects:?} V");
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn a_mask_is_the_alpha_plane_blended_over_black() {
+    use kerf_core::{Mask, MaskShape};
+    let (w, h) = (64u32, 36u32);
+    let a = asset(w, h);
+    let mask = Mask {
+        shape: MaskShape::Rect,
+        x: 0.5,
+        y: 0.5,
+        width: 0.5,
+        height: 0.5,
+        feather: 0.4,
+        inverted: false,
+    };
+    let mut c = Clip::new(a.id, 0.0, 1.0, 0.0);
+    c.mask = Some(mask);
+    let frame = flat(w, h, 200, 128, 128).unwrap();
+    let got = drawn_planes(&a, c, &frame, (w, h));
+    let alpha = kerf_core::mask_alpha_plane(&mask, w, h);
+    // Luma is `overlay`'s FAST_DIV255 of the layer over the black base (Y 16) with the sample's own alpha.
+    for (i, (y, al)) in got.y.iter().zip(&alpha).enumerate() {
+        let want = ((16 * (255 - u32::from(*al)) + 200 * u32::from(*al) + 128) * 257) >> 16;
+        assert_eq!(u32::from(*y), want, "luma sample {i} (alpha {al})");
+    }
+    // Chroma is blended with the average of its block's alphas (the last column and row average what they have).
+    let (cw, ch) = (w as usize / 2, h as usize / 2);
+    for cy in 0..ch {
+        for cx in 0..cw {
+            let at = |dx: usize, dy: usize| u32::from(alpha[(2 * cy + dy) * w as usize + 2 * cx + dx]);
+            let (right, below) = (cx + 1 < cw, cy + 1 < ch);
+            let al = if right && below {
+                (at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1)) >> 2
+            } else {
+                let ah = if right { (at(0, 0) + at(1, 0)) >> 1 } else { at(0, 0) };
+                let av = if below { (at(0, 0) + at(0, 1)) >> 1 } else { at(0, 0) };
+                (av + ah) >> 1
+            };
+            // (U and V of the layer and the base are both 128: the blend keeps 128.)
+            assert_eq!(got.u[cy * cw + cx], 128, "chroma ({cx}, {cy}) alpha {al}");
+        }
+    }
+    assert!(got.y.contains(&16) && got.y.contains(&200) && got.y.iter().any(|v| *v > 16 && *v < 200));
+}
+
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn a_mask_hands_the_planes_on_as_the_geq_that_clamps_its_read_does() {
+    use kerf_core::{geq_penultimate_plane, GeqEdge, Mask, MaskShape};
+    // A mask that keeps everything (alpha 255 on every sample): what is left is `geq`'s own copy of the
+    // three planes. On a build that clamps its read to `w - 2` / `h - 2` (FFmpeg 6.1) its last column and
+    // row are the ones before; on one that does not (9.0) they are the picture's own.
+    for (w, h) in [(64u32, 36u32), (98, 62)] {
+        let a = asset(w, h);
+        let frame = noise(w, h, 11);
+        let mask = Mask {
+            shape: MaskShape::Rect,
+            x: 0.5,
+            y: 0.5,
+            width: 1.0,
+            height: 1.0,
+            feather: 0.0,
+            inverted: false,
+        };
+        assert!(kerf_core::mask_alpha_plane(&mask, w, h).iter().all(|a| *a == 255));
+        let mut c = Clip::new(a.id, 0.0, 1.0, 0.0);
+        c.mask = Some(mask);
+        let plan = plan_for(&a, c);
+        let draw = |edge: GeqEdge| {
+            compositor()
+                .with_geq_edge(edge)
+                .composite_yuv(&plan, &[Some(frame.clone())], (w, h))
+        };
+        let exact = draw(GeqEdge::Exact).unwrap();
+        assert_eq!((&exact.y, &exact.u, &exact.v), (&frame.y, &frame.u, &frame.v), "{w}x{h}");
+        let got = draw(GeqEdge::Penultimate).unwrap();
+        let (cw, ch) = (w as usize / 2, h as usize / 2);
+        let (w, h) = (w as usize, h as usize);
+        let want_y = geq_penultimate_plane(&frame.y, w, h);
+        assert_eq!(got.y, want_y, "luma {w}x{h}");
+        for (name, got, src) in [("U", &got.u, &frame.u), ("V", &got.v, &frame.v)] {
+            let want = geq_penultimate_plane(src, cw, ch);
+            assert_eq!(*got, want, "{name} {w}x{h}");
+        }
+        assert_ne!(want_y, frame.y, "the clamp changes this picture");
+        // Neither answer known: refused, not drawn on a guess.
+        let err = draw(GeqEdge::Unknown).unwrap_err();
+        assert!(matches!(err, GpuError::Unsupported(_)), "{err:?}");
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn a_mask_blends_chroma_with_the_block_average_of_the_alpha() {
+    use kerf_core::{Mask, MaskShape};
+    // A layer of chroma 200 over a base of 128 shows the alpha the chroma samples were blended with.
+    let (w, h) = (64u32, 36u32);
+    let a = asset(w, h);
+    let mask = Mask {
+        shape: MaskShape::Ellipse,
+        x: 0.5,
+        y: 0.5,
+        width: 0.7,
+        height: 0.7,
+        feather: 0.5,
+        inverted: false,
+    };
+    let mut c = Clip::new(a.id, 0.0, 1.0, 0.0);
+    c.mask = Some(mask);
+    let frame = flat(w, h, 128, 200, 60).unwrap();
+    let got = drawn_planes(&a, c, &frame, (w, h));
+    let alpha = kerf_core::mask_alpha_plane(&mask, w, h);
+    let (cw, ch) = (w as usize / 2, h as usize / 2);
+    for cy in 0..ch {
+        for cx in 0..cw {
+            let at = |dx: usize, dy: usize| u32::from(alpha[(2 * cy + dy) * w as usize + 2 * cx + dx]);
+            let (right, below) = (cx + 1 < cw, cy + 1 < ch);
+            let al = if right && below {
+                (at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1)) >> 2
+            } else {
+                let ah = if right { (at(0, 0) + at(1, 0)) >> 1 } else { at(0, 0) };
+                let av = if below { (at(0, 0) + at(0, 1)) >> 1 } else { at(0, 0) };
+                (av + ah) >> 1
+            };
+            let blend = |d: u32, s: u32| ((d * (255 - al) + s * al + 128) * 257) >> 16;
+            assert_eq!(u32::from(got.u[cy * cw + cx]), blend(128, 200), "U ({cx}, {cy}) alpha {al}");
+            assert_eq!(u32::from(got.v[cy * cw + cx]), blend(128, 60), "V ({cx}, {cy}) alpha {al}");
+        }
+    }
 }
