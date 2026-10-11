@@ -20,7 +20,8 @@
 | GPU-4 Motion fades/transitions | gpu-4 (on gpu-2) | | r1 fixes (4 blockers: unrefused dip-to-white on letterbox / odd size / RGB source; fades on full-range under 9.0.2) | gpu-compositor WP-4 | dev done: still-plan GPU frames T1 96.0→100%, T2 78.8→100%, T3 83.3% (WP-6 refusals); Motion export frames 0→100% (T3 16.6%); motion parity plane-exact where unscaled, 1–2 levels where scaled, dip-to-white 2 levels; golden unchanged |
 | PERF-5 AMF/VAAPI export encode | perf-5 | | review r2 | gpu-media WP4, WP5, WP11 | wave 4 |
 | macOS presenter (WP-8) | macos-presenter | | review | gpu-compositor WP-8 | dev done: main-thread surface hop on macOS (step 1 could never work: raw-window-metal needs the main thread), plan + acceptance list in app.md; macOS default unchanged |
-| GPU-5 … GPU-7 | | | todo | | wave 4 |
+| GPU-6 Keyed zoom, masks, blur | gpu-6 (on gpu-4) | | in-progress | gpu-compositor WP-6 | wave 4 |
+| GPU-5, GPU-7 | | | todo | | wave 4; GPU-5 overlaps PERF-4 (gpu_preview / frame_source), GPU-7 needs GPU-4/5 |
 | CI: retry + cache ffmpeg download | ci-fetch-retry | #131 | closed (landed via #130) | not a review finding | evermeet.cx throttles the macOS pinned-ffmpeg fetch (ffprobe 429 for 6.5+ min); retry + actions/cache ported into #129, #130, #132; cache fills only after one successful run |
 
 ## Decisions
