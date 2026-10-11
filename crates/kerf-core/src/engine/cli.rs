@@ -6145,20 +6145,23 @@ fn audio_effect_filter(e: &AudioEffect) -> String {
 /// and cut the text short on 6.1, and a backslash vanish. `drawtext_text_is_what_the_user_typed`
 /// renders each against the literal text on whichever FFmpeg runs it.
 ///
-/// Newlines collapse to spaces — drawtext here is single-line. Control characters other than tab and
-/// carriage return are dropped: a NUL cannot be passed in an argv at all ("nul byte found in provided
-/// data" — every preview and export would fail to spawn until the title was found and deleted) and
-/// the rest (ESC, the C1 block) draw as nothing useful.
+/// A line break (LF, CR, CRLF as one, the Unicode line and paragraph separators) collapses to a
+/// space: the overlays are one line, and FFmpeg's `drawtext` would otherwise start another one at a
+/// CR as well as at an LF. Control characters other than tab are dropped: a NUL cannot be passed in an
+/// argv at all ("nul byte found in provided data" — every preview and export would fail to spawn until
+/// the title was found and deleted) and the rest (ESC, the C1 block) draw as nothing useful.
 fn escape_drawtext(s: &str, expansion: bool) -> String {
-    let blank = |c: char| matches!(c, ' ' | '\t' | '\r');
-    let clean: String = s
-        .chars()
-        .filter_map(|c| match c {
-            '\n' => Some(' '),
-            c if c.is_control() && !blank(c) => None,
-            c => Some(c),
-        })
-        .collect();
+    let blank = |c: char| matches!(c, ' ' | '\t');
+    let mut clean = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' if chars.peek() == Some(&'\n') => {}
+            '\n' | '\r' | '\u{2028}' | '\u{2029}' => clean.push(' '),
+            c if c.is_control() && !blank(c) => {}
+            c => clean.push(c),
+        }
+    }
     let expanded = if expansion {
         clean.replace('\\', "\\\\").replace('%', "\\%")
     } else {
@@ -10204,9 +10207,13 @@ mod tests {
         for plain in ["Hello, world", "50 OFF - it is \"live\"", "tab\there", "Café ☕ 日本語 🎬"] {
             assert_eq!(escape_drawtext_text(plain), plain);
         }
-        // A newline is a space (drawtext here is single-line); a carriage return stays.
+        // Every kind of line break is one space: drawtext starts a new line at a CR as well as an LF.
         assert_eq!(escape_drawtext_text("two\nlines"), "two lines");
-        assert_eq!(escape_drawtext_text("crlf\r\nline"), "crlf\r line");
+        assert_eq!(escape_drawtext_text("crlf\r\nline"), "crlf line");
+        assert_eq!(
+            escape_drawtext_text("cr\rline\u{2028}sep\u{2029}par\n\rx"),
+            "cr line sep par  x"
+        );
     }
 
     #[test]
@@ -10284,6 +10291,19 @@ mod tests {
             literal.push("expansion=none".into());
             assert_ne!(ours, blank, "{text:?} drew nothing");
             assert!(ours == render(literal), "{text:?} is not what was typed");
+        }
+        // A line break of any kind is the one space it is turned into, never a second line.
+        let look = |text| TextLook {
+            text,
+            size: 0.375,
+            color: "white",
+            bg: None,
+            font_file: Some(&font),
+            border: false,
+        };
+        let one_line = render(look("one two").options(80.0));
+        for broken in ["one\ntwo", "one\rtwo", "one\r\ntwo", "one\u{2028}two"] {
+            assert!(render(look(broken).options(80.0)) == one_line, "{broken:?} is not one line");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
