@@ -2,8 +2,10 @@
  * works out. The shape is one filled polygon per lane — the upper edge through
  * every column's peak, back along the lower — not a line per sample, so there are
  * no hairline seams between columns and the cost is one fill however wide the clip
- * is. Columns at full scale are then painted over in the clip colour, one polygon
- * per run of them.
+ * is. A column at full scale is marked at its tips: a few pixels of the clip colour
+ * on the upper and the lower edge, one polygon each per run of such columns, the body
+ * between left in the wave colour. Painting the whole column in it made a loud passage
+ * a solid red block that hid the very waveform it was meant to flag.
  *
  * Colours come in as resolved strings: a canvas cannot read `var(--waveform)`, so
  * `readPalette` asks the browser what the theme's tokens are *now*, once per theme
@@ -42,6 +44,9 @@ export interface DrawOptions {
 }
 
 const clamp1 = (v: number) => Math.max(-1, Math.min(1, v));
+
+/** How thick a clipped peak's marker is at either tip, css px. */
+export const CLIP_TIP_PX = 3;
 
 /** What the browser resolves `var(--token)` to right now, as a colour string a
  *  canvas accepts. Reads through a throwaway element so a token that is itself an
@@ -97,16 +102,40 @@ function fillRun(ctx: Ctx2D, top: Float32Array, bottom: Float32Array, from: numb
 	ctx.fill();
 }
 
+/** One band `depth` px thick along an edge, over columns `[from, to)` (a negative depth hangs
+ *  it above the edge): the marker at the upper or lower tip of a run of clipped columns. */
+function fillBand(ctx: Ctx2D, edge: Float32Array, from: number, to: number, depth: number) {
+	ctx.beginPath();
+	ctx.moveTo(from, edge[from]);
+	for (let d = from; d < to; d++) ctx.lineTo(d + 0.5, edge[d]);
+	ctx.lineTo(to, edge[to - 1]);
+	ctx.lineTo(to, edge[to - 1] + depth);
+	for (let d = to - 1; d >= from; d--) ctx.lineTo(d + 0.5, edge[d] + depth);
+	ctx.lineTo(from, edge[from] + depth);
+	ctx.closePath();
+	ctx.fill();
+}
+
+/** The two tips of a run of clipped columns, `tip` px each and never more than half the shortest of them. */
+function fillTips(ctx: Ctx2D, top: Float32Array, bottom: Float32Array, from: number, to: number, tip: number) {
+	let room = Infinity;
+	for (let d = from; d < to; d++) room = Math.min(room, (bottom[d] - top[d]) / 2);
+	const depth = Math.min(tip, room);
+	fillBand(ctx, top, from, to, depth);
+	fillBand(ctx, bottom, from, to, -depth);
+}
+
 /**
  * Paint `cols` onto `ctx`: each lane's waveform in the wave colour, scaled by
  * `gain` (and held inside the lane — a boosted clip peaks at the lane's edge, not
- * past it), and the columns whose peak is clipped over it in the clip colour.
+ * past it), and the tips of the columns whose peak is clipped in the clip colour.
  * Returns how many columns were clipped.
  */
 export function drawWaveform(ctx: Ctx2D, cols: Columns, o: DrawOptions): number {
 	ctx.clearRect(0, 0, o.width, o.height);
 	if (cols.count === 0) return 0;
 	let clippedColumns = 0;
+	const tip = Math.max(2, CLIP_TIP_PX * o.dpr);
 	for (let lane = 0; lane < cols.lanes; lane++) {
 		const { top, bottom } = laneEdges(cols, lane, o);
 		ctx.fillStyle = o.palette.wave;
@@ -118,7 +147,7 @@ export function drawWaveform(ctx: Ctx2D, cols: Columns, o: DrawOptions): number 
 			const clipped = d < cols.count && isClipped(cols.min[lane][d], cols.max[lane][d], o.gain);
 			if (clipped && start < 0) start = d;
 			if (!clipped && start >= 0) {
-				fillRun(ctx, top, bottom, start, d);
+				fillTips(ctx, top, bottom, start, d, tip);
 				clippedColumns += d - start;
 				start = -1;
 			}

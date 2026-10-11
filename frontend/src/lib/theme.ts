@@ -84,6 +84,7 @@ export const COLOR_GROUPS = [
 			{ name: 'track-text', label: 'Text clip' },
 			{ name: 'track-text-edge', label: 'Text clip edge' },
 			{ name: 'waveform', label: 'Waveform' },
+			{ name: 'clip-accent', label: 'Clip handles and lines' },
 			{ name: 'drag-ghost', label: 'Drag ghost' },
 			{ name: 'frame-matte', label: 'Frame matte' }
 		]
@@ -184,6 +185,7 @@ export const PRESETS: Record<PresetId, Theme> = {
 			'track-text': '#3a2c49',
 			'track-text-edge': '#8a6aa8',
 			waveform: '#6fcfa8',
+			'clip-accent': '#f0c277',
 			'drag-ghost': '#788cff',
 			'frame-matte': '#000000'
 		},
@@ -242,6 +244,7 @@ export const PRESETS: Record<PresetId, Theme> = {
 			'track-text': '#5d4180',
 			'track-text-edge': '#7b56a0',
 			waveform: '#a8ecca',
+			'clip-accent': '#ffdf9e',
 			'drag-ghost': '#4a5fd6',
 			'frame-matte': '#000000'
 		},
@@ -306,6 +309,7 @@ export const PRESETS: Record<PresetId, Theme> = {
 			'track-text': '#35244a',
 			'track-text-edge': '#c39bf0',
 			waveform: '#8ef5c2',
+			'clip-accent': '#ffd280',
 			'drag-ghost': '#9aa8ff',
 			'frame-matte': '#000000'
 		},
@@ -329,7 +333,10 @@ export const PRESETS: Record<PresetId, Theme> = {
  *  darkened its clip bodies, amber and status hues. `upgradeStoredTheme` moves a
  *  stored theme whose colors are *exactly* one of these to the current preset and
  *  leaves everything else alone. Whenever Kerf Light's colors change again, the
- *  outgoing set goes on the end of this list. */
+ *  outgoing set goes on the end of this list. A token added after a set was
+ *  superseded (`clip-accent`) carries the current value in it: a stored theme
+ *  that lacks it is given Kerf Light's on parse (`colorsBase`, the preset its other
+ *  colors are). */
 export const SUPERSEDED_KERF_LIGHT: readonly Record<ColorToken, string>[] = [
 	// As shipped up to v0.22.0.
 	{
@@ -381,6 +388,7 @@ export const SUPERSEDED_KERF_LIGHT: readonly Record<ColorToken, string>[] = [
 		'track-text': '#d8c8e6',
 		'track-text-edge': '#7b56a0',
 		waveform: '#1f8f60',
+		'clip-accent': '#ffdf9e',
 		'drag-ghost': '#4a5fd6',
 		'frame-matte': '#000000'
 	},
@@ -434,6 +442,7 @@ export const SUPERSEDED_KERF_LIGHT: readonly Record<ColorToken, string>[] = [
 		'track-text': '#5d4180',
 		'track-text-edge': '#7b56a0',
 		waveform: '#a8ecca',
+		'clip-accent': '#ffdf9e',
 		'drag-ghost': '#4a5fd6',
 		'frame-matte': '#000000'
 	},
@@ -488,6 +497,7 @@ export const SUPERSEDED_KERF_LIGHT: readonly Record<ColorToken, string>[] = [
 		'track-text': '#5d4180',
 		'track-text-edge': '#7b56a0',
 		waveform: '#a8ecca',
+		'clip-accent': '#ffdf9e',
 		'drag-ghost': '#4a5fd6',
 		'frame-matte': '#000000'
 	},
@@ -541,6 +551,7 @@ export const SUPERSEDED_KERF_LIGHT: readonly Record<ColorToken, string>[] = [
 		'track-text': '#5d4180',
 		'track-text-edge': '#7b56a0',
 		waveform: '#a8ecca',
+		'clip-accent': '#ffdf9e',
 		'drag-ghost': '#4a5fd6',
 		'frame-matte': '#000000'
 	}
@@ -585,9 +596,20 @@ function shapeBase(scheme: Scheme, colors: Record<ColorToken, string>): Shape {
 	return PRESETS[same ?? (scheme === 'light' ? 'kerf-light' : 'kerf-dark')].shape;
 }
 
+/** The preset a theme with only some of its colors was taken from: the first of its scheme whose
+ *  colors are exactly the ones given (a High contrast saved before `clip-accent` existed has every
+ *  other token of High contrast), else the scheme's own. What it lacks is read from there. */
+function colorsBase(scheme: Scheme, given: Partial<Record<ColorToken, string>>): Record<ColorToken, string> {
+	const same = PRESET_IDS.find(
+		(id) => PRESETS[id].scheme === scheme && COLOR_TOKENS.every((t) => given[t] === undefined || PRESETS[id].colors[t] === given[t])
+	);
+	return PRESETS[same ?? (scheme === 'light' ? 'kerf-light' : 'kerf-dark')].colors;
+}
+
 /** A theme from stored or imported JSON, or `null` when it is not one.
- *  Unknown tokens are dropped and missing ones filled from the scheme's
- *  preset, so a file from a build with fewer tokens still applies. */
+ *  Unknown tokens are dropped and missing ones filled from the preset the colors it does carry
+ *  are exactly (else the scheme's own), so a file from a build with fewer tokens still applies
+ *  and stays the preset it was. */
 export function parseTheme(raw: unknown): Theme | null {
 	if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
 	const r = raw as Record<string, unknown>;
@@ -595,18 +617,17 @@ export function parseTheme(raw: unknown): Theme | null {
 	if (r.scheme !== 'dark' && r.scheme !== 'light') return null;
 	if (typeof r.name !== 'string' || r.name.trim() === '') return null;
 	if (typeof r.colors !== 'object' || r.colors === null) return null;
-	const given = r.colors as Record<string, unknown>;
-	const base = PRESETS[r.scheme === 'light' ? 'kerf-light' : 'kerf-dark'].colors;
-	const colors = {} as Record<ColorToken, string>;
+	const stored = r.colors as Record<string, unknown>;
+	const given: Partial<Record<ColorToken, string>> = {};
 	for (const t of COLOR_TOKENS) {
-		const v = given[t];
-		if (v === undefined) {
-			colors[t] = base[t];
-			continue;
-		}
+		const v = stored[t];
+		if (v === undefined) continue;
 		if (typeof v !== 'string' || !HEX.test(v)) return null;
-		colors[t] = v.toLowerCase();
+		given[t] = v.toLowerCase();
 	}
+	const base = colorsBase(r.scheme, given);
+	const colors = {} as Record<ColorToken, string>;
+	for (const t of COLOR_TOKENS) colors[t] = given[t] ?? base[t];
 	const baseShape = shapeBase(r.scheme, colors);
 	const gs = typeof r.shape === 'object' && r.shape !== null && !Array.isArray(r.shape) ? (r.shape as Record<string, unknown>) : {};
 	const shape = { ...baseShape };

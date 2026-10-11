@@ -183,6 +183,9 @@ class EditorState {
 	previewingStaged = $state(false);
 	currentPath = $state<string | null>(null);
 	loading = $state(false);
+	/** Counts completed `load()`s — launch, New, Open: a new one is a different cut, which the
+	 *  timeline fits to its window again. */
+	loadEpoch = $state(0);
 	/** Count of edits/exports currently in flight, not a flag — two overlapping
 	 *  operations (an edit fired while an export streams, or two edits in quick
 	 *  succession) must not have the first to finish turn this off while the
@@ -461,6 +464,7 @@ class EditorState {
 			this.#setTimeline(timeline);
 			this.history = history;
 			this.currentPath = currentPath;
+			this.loadEpoch++;
 			await this.refreshStaged();
 			if (!this.selectedAssetId && this.assets.length > 0) {
 				await this.select(this.assets[0].id);
