@@ -9,6 +9,7 @@
 	import { chip } from '$lib/chip';
 	import type { TransitionKind } from '$lib/types';
 	import { FieldEdits } from '$lib/field-edit';
+	import { tip } from '$lib/tip';
 
 	const clip = $derived(editor.selectedClip);
 	const current = $derived(clip?.transition_in ?? null);
@@ -74,10 +75,10 @@
 	{/if}
 
 	<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:4px">
-		<button
+		<button aria-pressed={!!clip && !current}
 			style="{chip(!!clip && !current)};{off ? 'opacity:.5;cursor:default' : ''}"
 			disabled={off}
-			title={reason ?? 'A hard cut — no transition into this clip'}
+			use:tip={reason ?? 'A hard cut — no transition into this clip'}
 			onclick={() => clip && void attempt(() => editor.setTransition(clip.id, null))}>None</button
 		>
 	</div>
@@ -91,10 +92,10 @@
 		<div style="font-size:11px;color:var(--text-muted);margin-bottom:6px">{g.hint}</div>
 		<div style="display:flex;gap:5px;flex-wrap:wrap">
 			{#each g.options as o (o.id)}
-				<button
+				<button aria-pressed={current?.kind === o.id}
 					style="{chip(current?.kind === o.id)};{off ? 'opacity:.5;cursor:default' : ''}"
 					disabled={off}
-					title={reason ?? o.label}
+					use:tip={reason ?? o.label}
 					onclick={() => pick(o.id)}>{o.label}</button
 				>
 			{/each}

@@ -7,10 +7,9 @@ import { editor } from './state.svelte';
 import { ui } from './editor-ui.svelte';
 import { toast } from './notifications.svelte';
 import { confirmAction, pickCaptionFile, type CaptionFilePick } from './api';
+import { CONFIRM } from './confirm-copy';
 import { describeImport } from './caption-import';
 import {
-	CAPTION_CONFIRM_TITLE,
-	IMPORT_CONFIRM_TITLE,
 	TIMELINE_CHOICE,
 	generatedCount,
 	importRequest,
@@ -61,7 +60,7 @@ export function pickTitle(o: TextOverlay) {
 		return;
 	}
 	editor.selectOverlay(o.id);
-	if (ui.time < o.start || ui.time > o.end) ui.seek(o.start);
+	if (ui.time < o.start || ui.time > o.end) ui.seek(o.start, { snap: 'up', end: o.end });
 }
 
 /** Captions are placed in timeline time, so they follow the cut — which also
@@ -74,7 +73,7 @@ export async function makeCaptions(): Promise<void> {
 		return;
 	}
 	return attempt(async () => {
-		if (!(await confirmReplaceCaptions(CAPTION_CONFIRM_TITLE))) return;
+		if (!(await confirmReplaceCaptions())) return;
 		await editor.generateCaptions({ style: ui.captionStyle });
 	});
 }
@@ -85,9 +84,10 @@ export async function makeCaptions(): Promise<void> {
  *  the live cut, the one the edit lands on, even while a proposal is on screen.
  *  `true` when there is nothing to replace or the user agreed; `fileName` names
  *  what is coming in, for an import. */
-export async function confirmReplaceCaptions(title: string, fileName?: string): Promise<boolean> {
+export async function confirmReplaceCaptions(fileName?: string): Promise<boolean> {
 	const existing = generatedCount(editor.liveTimeline.overlays);
-	return existing === 0 || (await confirmAction(replaceConfirm(existing, fileName), title));
+	const copy = CONFIRM.replaceCaptions;
+	return existing === 0 || (await confirmAction(replaceConfirm(existing, fileName), copy.title, copy));
 }
 
 export function dropCaptions(): Promise<void> {
@@ -121,7 +121,7 @@ export async function importCaptionFile(choice: ImportChoice = TIMELINE_CHOICE):
 	if (!picked || importing) return false;
 	importing = true;
 	try {
-		if (!(await confirmReplaceCaptions(IMPORT_CONFIRM_TITLE, picked.name))) return false;
+		if (!(await confirmReplaceCaptions(picked.name))) return false;
 		const req = importRequest(choice, ui.captionStyle, {
 			keepLines: keepLinesOn(ui.captionImportKeepLines, ui.captionStyle, editor.liveTimeline.format),
 			offset: ui.captionImportOffset

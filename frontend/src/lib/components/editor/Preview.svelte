@@ -34,10 +34,15 @@
 	import { RESIZE_SETTLE_MS, capToSource, dprQuery, requestWidth } from '$lib/preview-size';
 	import type { PreviewBoundsReport } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
-	import { createFrameGate, PLAYBACK_FPS } from '$lib/playback-sync';
+	import { createFrameGate, createLadder } from '$lib/playback-sync';
+	import { CANVAS_PAINTER, createStreamPainter, jpegDataUrl } from '$lib/frame-transport';
+	import { decodeJpeg, paintPicture } from '$lib/frame-canvas';
+	import { renderedDuration, renderedFps } from '$lib/timecode';
+	import { logFrontend } from '$lib/log';
 	import { clipDuration } from '$lib/types';
 	import type { TextOverlay } from '$lib/types';
-	import { LINE_HEIGHT, boxPadding, containRect, dragPosition, isVisibleAt, sampleOverlay, scaledSize } from '$lib/titles';
+	import { boxPadding, containRect, dragPosition, inkBox, isVisibleAt, sampleOverlay, scaledSize, titleFamily } from '$lib/titles';
+	import { tip } from '$lib/tip';
 
 	const duration = $derived(Math.max(editor.duration, 0.001));
 	/** The transport bar's own width, or undefined until it has been measured (and while it
@@ -130,6 +135,7 @@
 	});
 	const frameUrl = $derived(frames.frameUrl);
 	const gpuShown = $derived(frames.gpuShown);
+	const streamShown = $derived(frames.streamShown);
 	const imgAspect = $derived(frames.imgAspect);
 
 	// ---- playback: a streamed frame source instead of per-frame decodes -------
@@ -138,11 +144,23 @@
 	// from the playhead and pushes frames up as they render. Scrubbing, shuttle
 	// and the paused frame keep the per-frame path below: that one is right when
 	// you want *one* frame, and streaming is right when you want all of them.
+	//
+	// The stream plays at the cut's own frame rate (`renderedFps`: the cut as it renders, as the
+	// engine reads it) and the width the pane asks for. Its frames are raw JPEG bytes; the ones
+	// the gate lets through become a data URL for the pane's one `<img>` (`frame-transport.ts`: with
+	// `CANVAS_PAINTER` on, a canvas decoded by `createImageBitmap` instead). A machine that cannot hold
+	// the rate is not played behind the sound: the gate says so and the stream restarts from the
+	// playhead one rung cheaper (`createLadder`, `playback-sync.ts`), halving the rate before it
+	// narrows the picture.
 	let streaming = $state(false);
 	let stopStream: (() => void) | null = null;
+	let canvasEl = $state<HTMLCanvasElement | null>(null);
 	/** Bumped when the stream has fallen so far behind the clock that it is worth
 	 *  restarting it from where playback has actually got to. */
 	let resyncs = $state(0);
+	/** How far down the ladder the stream is for this cut at this width, and where the next one starts.
+	 *  Not reactive: it is read when the stream (re)starts, not watched. */
+	const ladder = createLadder();
 
 	// Every seek or edit restarts the stream, so a timeline that cannot render
 	// would raise the same failure on each restart; say it once per spell.
@@ -170,50 +188,112 @@
 
 	$effect(() => {
 		// Restart the stream whenever what it is rendering changes: play/pause,
-		// shuttle rate, a deliberate seek, or an edit to the timeline it
-		// composited from. Deliberately *not* `ui.time` — that ticks with every
-		// animation frame during playback, and depending on it would tear down
-		// and respawn ffmpeg 60 times a second.
+		// shuttle rate, a deliberate seek, an edit to the timeline it composited
+		// from, or the width the pane asks for. Deliberately *not* `ui.time` — that
+		// ticks with every animation frame during playback, and depending on it would
+		// tear down and respawn ffmpeg 60 times a second.
 		const play = ui.playing && ui.rate === 1;
 		void ui.seekEpoch;
 		void resyncs;
-		void editor.timeline;
-		void ui.previewEpoch;
-		const from = untrack(() => ui.time);
+		const timeline = editor.timeline;
+		const epoch = ui.previewEpoch;
+		const box = boxWidth;
 		playbackWaiting = null;
 		if (!play || !hasClips) {
 			endStream();
 			return;
 		}
+		// The width is the one the still is asked at, held to the source at the playhead; read
+		// untracked, since that source changes as the playhead crosses clips and the stream
+		// is not restarted for it.
+		const { rung, request, from, lead, cheaper, heal } = untrack(() =>
+			ladder.start(
+				{ timeline, epoch, width: box },
+				{
+					fps: renderedFps(editor.timeline, editor.assets),
+					width: frameWidth,
+					playhead: ui.time,
+					duration: renderedDuration(editor.timeline)
+				}
+			)
+		);
 		let live = true;
-		const verdict = createFrameGate();
+		// At the cheapest rung there is nothing to restart into, and a restart costs an ffmpeg spawn on a
+		// machine that is already short: the frames are skipped to the resync, as they were before.
+		// A stream a lag restart started a moment ago is not offered a restart for healing either: a stall that
+		// comes with every start would be restarted over and over, paying itself again each time.
+		const verdict = createFrameGate({
+			fps: rung.fps,
+			overloadAfter: cheaper ? undefined : Infinity,
+			healWatch: heal ? undefined : Infinity,
+			lead
+		});
+		const painter = CANVAS_PAINTER
+			? createStreamPainter({
+					decode: decodeJpeg,
+					paint: (picture) => {
+						if (!canvasEl) return;
+						paintPicture(canvasEl, picture);
+						frames.streamDrawn(picture.width / picture.height);
+					}
+				})
+			: null;
+		let restarted = '';
 		streaming = true;
-		const stop = startPlayback(from, PLAYBACK_FPS, (f) => {
-			if (!live) return;
-			// The audio clock owns time; picture chases it.
-			switch (verdict(ui.time - f.time)) {
-				case 'resync':
-					// Compositing can't keep up with real time on this timeline. Playing
-					// the backlog out would run the picture in slow motion against the
-					// sound, and dropping it forever would freeze the pane — so jump the
-					// stream forward to where playback has actually got to.
-					live = false;
-					resyncs++;
-					return;
-				case 'skip':
-					// A frame the clock has moved past would drag the picture behind the
-					// sound, so wait for one that still applies.
-					return;
-				case 'show':
-					frames.showStreamed(f.jpeg);
-			}
-		}, reportPlaybackError);
+		const stop = startPlayback(
+			from,
+			request,
+			(f) => {
+				if (!live) return;
+				// The audio clock owns time; picture chases it.
+				const call = verdict(ui.time - f.time, performance.now() / 1000);
+				switch (call) {
+					case 'resync':
+					case 'degrade': {
+						// Compositing can't keep up with real time on this timeline. Playing
+						// the backlog out would run the picture in slow motion against the
+						// sound, and dropping it forever would freeze the pane — so jump the
+						// stream forward to where playback has actually got to, and when it
+						// is slow rather than stalled, at a cost the machine can carry.
+						live = false;
+						restarted = call;
+						ladder.restarted(call, verdict.floor());
+						resyncs++;
+						return;
+					}
+					case 'skip':
+						// A frame the clock has moved past would drag the picture behind the
+						// sound, so wait for one that still applies.
+						return;
+					case 'show':
+						// Only a frame that is shown is turned into anything: the data URL is built here, not
+						// before the gate has had its say.
+						if (painter) painter.push(f.jpeg);
+						else frames.showStreamed(jpegDataUrl(f.jpeg));
+				}
+			},
+			reportPlaybackError
+		);
 		stopStream = stop;
 		return () => {
 			live = false;
+			painter?.stop();
 			stop();
 			if (stopStream === stop) stopStream = null;
 			streaming = false;
+			// What the gate dropped is the one number that says whether this stream was smooth, so a stream
+			// that dropped anything leaves a line in the log (a clean one would only be noise).
+			ladder.ended(verdict.floor());
+			const seen = verdict.stats();
+			const painted = painter?.stats();
+			if (seen.skipped > 0 || restarted || (painted && painted.failed + painted.discarded + painted.replaced > 0)) {
+				logFrontend(
+					'info',
+					`playback stream ended: ${rung.fps} fps at ${rung.width} px, shown ${seen.shown}, skipped ${seen.skipped}` +
+						`${restarted ? `, restarted (${restarted})` : ''}${painted ? `, painter ${JSON.stringify(painted)}` : ''}`,
+					'playback'
+				);
+			}
 		};
 	});
 
@@ -277,7 +357,7 @@
 	// fractions are of what is drawn.
 
 	const layerBox = $derived.by(() => {
-		if ((!frameUrl && !gpuShown) || !imgAspect) return 'inset:0';
+		if ((!frameUrl && !gpuShown && !streamShown) || !imgAspect) return 'inset:0';
 		const r = containRect(imgAspect, aspect);
 		return `left:${r.left}%;top:${r.top}%;width:${r.width}%;height:${r.height}%`;
 	});
@@ -727,6 +807,7 @@
 
 <div
 	bind:this={rootEl}
+	data-editor-surface
 	{@attach onWindow({
 		// Abandoning a drag is all Escape does then — not also "clear the selection". These
 		// listen to the window the panel is in, which is a detached window's when it is in one.
@@ -768,10 +849,24 @@
 					<div bind:this={matteEl} aria-hidden="true" style="position:absolute;width:0;height:0;background:var(--frame-matte)"></div>
 					<div bind:this={backdropEl} aria-hidden="true" style="position:absolute;width:0;height:0;background:var(--surface-app)"></div>
 				{/if}
+				<!-- With `CANVAS_PAINTER` on: the playback stream's frames, drawn here as they are decoded.
+				     Mounted from the start, so the first frame has somewhere to land; shown while it holds the
+				     last one played, until a fetched frame (the settled still, the GPU's surface) takes the
+				     pane back. Off, the stream goes through the `<img>` below, which is the pane's one picture
+				     and so never swaps for the still. -->
+				{#if CANVAS_PAINTER}
+					<canvas
+						bind:this={canvasEl}
+						aria-label="playback frame"
+						style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:var(--frame-matte);border-radius:3px;display:{streamShown && !gpuShown ? 'block' : 'none'}"
+					></canvas>
+				{/if}
 				{#if gpuShown}
 					<!-- Drawn by the GPU in the native surface: nothing here covers it. -->
+				{:else if streamShown}
+					<!-- The canvas above is the picture. -->
 				{:else if frameUrl}
-					<img src={frameUrl} alt="preview frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:var(--frame-matte);border-radius:3px"
+					<img src={frameUrl} decoding="async" alt="preview frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:var(--frame-matte);border-radius:3px"
 						onload={(e) => {
 							const im = e.currentTarget as HTMLImageElement;
 							if (im.naturalWidth && im.naturalHeight) frames.pictureAspect(im.naturalWidth / im.naturalHeight);
@@ -811,18 +906,19 @@
 							{@const pose = sampleOverlay(o, ui.time)}
 							{@const selected = editor.selectedOverlayId === o.id}
 							{@const pad = boxPadding(o, delivery?.height) * 100}
+							{@const ink = inkBox(o)}
 							<div
 								role="presentation"
 								data-title-box
-								title={selected ? undefined : `Select “${o.text}”`}
+								use:tip={selected ? undefined : `Select “${o.text}”`}
 								onpointerdown={(e) => onTitleDown(e, o, 'move')}
 								onpointermove={onTitleMove}
 								onpointerup={onTitleUp}
 								onpointercancel={cancelTitleDrag}
 								onlostpointercapture={onTitleLostCapture}
-								style="position:absolute;left:{(live?.x ?? pose.x) * 100}%;top:{(live?.y ?? pose.y) * 100}%;transform:translate(-50%,-50%);padding:{pad}cqh;font-size:{(live?.size ?? o.size) * 100}cqh;line-height:{LINE_HEIGHT};font-weight:{o.bold ? 700 : 400};font-family:{o.font ? `'${o.font.replace(/['\\]/g, '')}', ` : ''}sans-serif;white-space:nowrap;color:{live?.moved ? ghostColor(o.color) : 'transparent'};pointer-events:auto;touch-action:none;cursor:{live ? 'grabbing' : 'move'};user-select:none;outline:{selected ? '1.5px solid var(--kerf-400)' : '1px dashed color-mix(in srgb,var(--text-on-video) 35%,transparent)'};outline-offset:0;background:{live?.moved ? 'color-mix(in srgb,var(--scrim) 25%,transparent)' : 'transparent'}"
+								style="position:absolute;left:{(live?.x ?? pose.x) * 100}%;top:{(live?.y ?? pose.y) * 100}%;transform:translate(-50%,-50%);padding:{pad}cqh;font-size:{(live?.size ?? o.size) * 100}cqh;line-height:{ink.height};font-weight:{o.bold ? 700 : 400};font-family:{titleFamily(o)};white-space:nowrap;color:{live?.moved ? ghostColor(o.color) : 'transparent'};pointer-events:auto;touch-action:none;cursor:{live ? 'grabbing' : 'move'};user-select:none;outline:{selected ? '1.5px solid var(--kerf-400)' : '1px dashed color-mix(in srgb,var(--text-on-video) 35%,transparent)'};outline-offset:0;background:{live?.moved ? 'color-mix(in srgb,var(--scrim) 25%,transparent)' : 'transparent'}"
 							>
-								{o.text}
+								<span style="position:relative;top:{ink.shift}em">{o.text}</span>
 								{#if selected}
 									{#each HANDLES as h (h.at)}
 										<span
@@ -848,11 +944,11 @@
 					style="position:absolute;left:12px;right:12px;top:10px;display:flex;align-items:flex-start;justify-content:space-between;gap:8px;pointer-events:none"
 				>
 					<div style="display:flex;flex-wrap:wrap;gap:6px;min-width:0;max-width:62%">
-						<span data-hud="name" class="hud" style="pointer-events:auto" title={previewAsset?.name}>{previewAsset?.name ?? 'preview'}</span>
-						{#if playbackWaiting}<span class="hud" style="pointer-events:auto" title={playbackWaiting} data-testid="playback-waiting"
+						<span data-hud="name" class="hud" style="pointer-events:auto" use:tip={previewAsset?.name}>{previewAsset?.name ?? 'preview'}</span>
+						{#if playbackWaiting}<span class="hud" style="pointer-events:auto" use:tip={playbackWaiting} data-testid="playback-waiting"
 								><i class="dot" style="background:var(--orange-500)"></i>playback waits for the proxy</span
 							>{/if}
-						{#if waitingOnProxy}<span class="hud" style="pointer-events:auto" title={waitingOnProxy.title}
+						{#if waitingOnProxy}<span class="hud" style="pointer-events:auto" use:tip={waitingOnProxy.title}
 								><i class="dot" style="background:var(--orange-500)"></i>{waitingOnProxy.text.replace('preview: ', '')}</span
 							>{/if}
 						{#if ui.analyzing}<span class="hud"><i class="dot" style="background:var(--agent-400)"></i>{ui.analysisLabel ?? 'analyzing'}</span>{/if}
@@ -873,7 +969,7 @@
 		style="height:40px;flex:none;display:flex;align-items:center;gap:{parts.tight ? 6 : 10}px;padding:0 {parts.tight ? 8 : 14}px;border-top:var(--line-width) solid var(--border-default);background:var(--surface-app)"
 	>
 		<button
-			title={settings.withShortcut('Go to start', 'playback.toStart')}
+			use:tip={settings.tip('Go to start', 'playback.toStart')}
 			aria-label="Go to start"
 			disabled={empty}
 			onclick={() => ui.seek(0)}
@@ -882,7 +978,7 @@
 			<Icon n="skip-back" s={14} />
 		</button>
 		<button
-			title={settings.withShortcut(ui.playing ? 'Pause' : 'Play', 'playback.toggle')}
+			use:tip={settings.tip(ui.playing ? 'Pause' : 'Play', 'playback.toggle')}
 			aria-label={ui.playing ? 'Pause' : 'Play'}
 			onclick={() => ui.togglePlay()}
 			style="background:var(--surface-hover);border:none;border-radius:var(--radius-sm);cursor:pointer;color:var(--text-primary);display:grid;place-items:center;padding:4px 6px"
@@ -890,7 +986,7 @@
 			<Icon n={ui.playing ? 'pause' : 'play'} s={16} />
 		</button>
 		<button
-			title={settings.withShortcut('Go to end', 'playback.toEnd')}
+			use:tip={settings.tip('Go to end', 'playback.toEnd')}
 			aria-label="Go to end"
 			disabled={empty}
 			onclick={() => ui.seek(editor.duration)}
@@ -899,7 +995,7 @@
 			<Icon n="skip-forward" s={14} />
 		</button>
 		<span
-			title="Timeline timecode · {editor.fps.toFixed(3)} fps · non-drop"
+			use:tip={`Timeline timecode · ${editor.fps.toFixed(3)} fps · non-drop`}
 			style="font-family:var(--font-mono);font-size:12px;color:var(--kerf-300);font-weight:500;white-space:nowrap">{tc(ui.time)}</span
 		>
 		<ScrubBar {duration} {empty} />
@@ -908,7 +1004,7 @@
 		{/if}
 		{#if parts.rate}
 			<span
-				title="Timeline frame rate; non-drop timecode"
+				use:tip={'Timeline frame rate; non-drop timecode'}
 				style="font-size:11px;color:var(--text-muted);white-space:nowrap">{Number(editor.fps.toFixed(3))} fps</span
 			>
 		{/if}

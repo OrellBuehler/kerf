@@ -48,6 +48,12 @@ export function detectPlatform(nav: NavigatorLike | undefined = typeof navigator
 	return /mac|iphone|ipad|ipod/i.test(platformText(nav)) ? 'mac' : 'other';
 }
 
+/** Whether this is Windows, or at least neither a Mac nor a Linux desktop: the one platform where the
+ *  updater's installer takes the app down itself when the download is done. */
+export function isWindows(nav: NavigatorLike | undefined = typeof navigator === 'undefined' ? undefined : navigator): boolean {
+	return detectPlatform(nav) !== 'mac' && !isLinux(nav);
+}
+
 /** Whether this is a Linux desktop (Android's webview says "Linux" too, and is not one). */
 export function isLinux(nav: NavigatorLike | undefined = typeof navigator === 'undefined' ? undefined : navigator): boolean {
 	return /linux/i.test(platformText(nav)) && !/android/i.test(nav?.userAgent ?? '');
@@ -272,6 +278,13 @@ export function formatChord(c: Chord, platform: Platform): string {
 	return parts.join('+');
 }
 
+/** An action's label as prose: the trailing ellipsis that says it opens a dialog (`Open project…`) is a
+ *  promise about a menu entry, not part of the name, and reads as a typo in a sentence ("is already used
+ *  by Open project…."). */
+export function plainLabel(label: string): string {
+	return label.replace(/…$/, '').replace(/\.\.\.$/, '');
+}
+
 /** How a chord reads in a menu or tooltip: `⇧⌘Z` on a Mac, `Ctrl+Shift+Z` elsewhere. */
 export function displayChord(c: Chord, platform: Platform): string {
 	const key = (platform === 'mac' ? MAC_KEY_GLYPHS[c.key] : undefined) ?? KEY_GLYPHS[c.key] ?? keyName(c.key);
@@ -353,7 +366,7 @@ const ACTION_LIST = [
 		defaults: [],
 		hint: 'Writes the frame under the playhead, at the full delivery frame, as an image.'
 	},
-	{ id: 'app.settings', repeat: false, label: 'Settings', group: 'project', context: 'global', defaults: ['Mod+,'] },
+	{ id: 'app.settings', repeat: false, label: 'Settings…', group: 'project', context: 'global', defaults: ['Mod+,'] },
 	{ id: 'app.quit', repeat: false, label: 'Quit Kerf', group: 'project', context: 'global', defaults: [] },
 
 	{ id: 'edit.undo', label: 'Undo', group: 'edit', context: 'global', defaults: ['Mod+Z'] },
@@ -503,6 +516,22 @@ const ACTION_LIST = [
 	{ id: 'marker.add', repeat: false, label: 'Add marker at playhead', group: 'markers', context: 'global', defaults: ['M'] },
 	{ id: 'marker.prev', label: 'Previous marker', group: 'markers', context: 'global', defaults: [','] },
 	{ id: 'marker.next', label: 'Next marker', group: 'markers', context: 'global', defaults: ['.'] },
+	{
+		id: 'review.prevChange',
+		label: 'Previous proposed change',
+		group: 'markers',
+		context: 'global',
+		defaults: ['PageUp', '['],
+		hint: 'While an agent’s proposed cut is on the timeline: moves the playhead to the change before it. Page Up works on every keyboard layout; [ needs one that types it without AltGr or Option.'
+	},
+	{
+		id: 'review.nextChange',
+		label: 'Next proposed change',
+		group: 'markers',
+		context: 'global',
+		defaults: ['PageDown', ']'],
+		hint: 'While an agent’s proposed cut is on the timeline: moves the playhead to the change after it. Page Down works on every keyboard layout; ] needs one that types it without AltGr or Option.'
+	},
 	{ id: 'range.markIn', label: 'Set in point', group: 'markers', context: 'global', defaults: ['I'] },
 	{ id: 'range.markOut', label: 'Set out point', group: 'markers', context: 'global', defaults: ['O'] },
 	{ id: 'range.clearIn', label: 'Clear in point', group: 'markers', context: 'global', defaults: ['Shift+I'] },
@@ -536,7 +565,7 @@ const ACTION_LIST = [
 		defaults: [],
 		hint: 'Puts the panels of the workspace on screen back where its default has them, and its library tab.'
 	},
-	{ id: 'window.resetAllWorkspaces', repeat: false, label: 'Reset all workspaces', group: 'window', context: 'global', defaults: [] },
+	{ id: 'window.resetAllWorkspaces', repeat: false, label: 'Reset all workspaces…', group: 'window', context: 'global', defaults: [] },
 	{
 		id: 'window.dockAll',
 		repeat: false,
@@ -550,15 +579,15 @@ const ACTION_LIST = [
 	{
 		id: 'app.keyboard',
 		repeat: false,
-		label: 'Keyboard shortcuts',
+		label: 'Keyboard shortcuts…',
 		group: 'help',
 		context: 'global',
 		defaults: [],
 		hint: 'Opens Settings on this list.'
 	},
 	{ id: 'app.checkUpdate', repeat: false, label: 'Check for updates…', group: 'help', context: 'global', defaults: [] },
-	{ id: 'app.releases', repeat: false, label: 'Release page', group: 'help', context: 'global', defaults: [] },
-	{ id: 'app.logs', repeat: false, label: 'Open the log folder', group: 'help', context: 'global', defaults: [] },
+	{ id: 'app.releases', repeat: false, label: 'Release notes', group: 'help', context: 'global', defaults: [] },
+	{ id: 'app.logs', repeat: false, label: 'Show log folder', group: 'help', context: 'global', defaults: [] },
 	{ id: 'app.about', repeat: false, label: 'About Kerf', group: 'help', context: 'global', defaults: [] }
 ] as const satisfies readonly ActionDef[];
 
@@ -586,7 +615,8 @@ export const FIXED_KEYS: readonly { keys: string; does: string }[] = [
 	{ keys: 'Alt, or F10', does: 'Focuses the menu bar; ← → move along it, ↓ opens a menu, Esc closes it' },
 	{ keys: '← → ↑ ↓', does: 'Operate a focused slider, panel tab or list' },
 	{ keys: 'Ctrl/⌘ + wheel', does: 'Zooms the timeline at the pointer' },
-	{ keys: 'Shift / Ctrl/⌘ + click', does: 'Extends or toggles the clip selection' }
+	{ keys: 'Shift / Ctrl/⌘ + click', does: 'Extends or toggles the clip selection' },
+	{ keys: '← → on a focused clip', does: 'Nudges it a frame (Shift: a second); a run of presses is one edit' }
 ];
 
 // ---- bindings ----------------------------------------------------------------

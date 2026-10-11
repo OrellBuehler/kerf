@@ -7,6 +7,7 @@
 	import ExportDialog from '$lib/components/editor/ExportDialog.svelte';
 	import SettingsDialog from '$lib/components/editor/SettingsDialog.svelte';
 	import UpdateDialog from '$lib/components/editor/UpdateDialog.svelte';
+	import AboutDialog from '$lib/components/editor/AboutDialog.svelte';
 	import VoiceoverDialog from '$lib/components/editor/VoiceoverDialog.svelte';
 	import FitMusicDialog from '$lib/components/editor/FitMusicDialog.svelte';
 	import StemsDialog from '$lib/components/editor/StemsDialog.svelte';
@@ -34,9 +35,10 @@
 	} from '$lib/ops';
 	import { allowsRepeat, type ActionId } from '$lib/keymap';
 	import { runMenuCommand } from '$lib/menu-commands';
-	import { saveCoverFrame } from '$lib/file-actions';
+	import { saveCoverFrame, saveProject } from '$lib/file-actions';
 	import { importCaptionFile } from '$lib/title-actions';
 	import {
+		askUnsaved,
 		inTauri,
 		isMediaPath,
 		confirmAction,
@@ -51,6 +53,11 @@
 	} from '$lib/api';
 	import { afterPaint, fontsReady, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
+	import { tip } from '$lib/tip';
+	import { CONFIRM, UNSAVED, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
+	import { changeIndex, changePoints, stepChange } from '$lib/staged-diff';
+	import { clampPlayhead, secondFrames, stepFrames } from '$lib/frames';
+	import { isPagingKey, onEditorSurface } from '$lib/focus-area';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
@@ -60,6 +67,7 @@
 			settings.open ||
 			updater.dialogOpen ||
 			ui.voiceoverDialog !== null ||
+			ui.aboutDialog ||
 			ui.fitMusicDialog !== null ||
 			ui.stemsDialog !== null
 	);
@@ -81,6 +89,17 @@
 	$effect(() => {
 		void editor.timeline;
 		untrack(() => ui.resync());
+	});
+
+	// The playhead cannot stand past the end of the cut. An edit that shortens it (a delete, an undo, an
+	// agent's trim, a proposal on screen) takes it back to the new end rather than leaving it parked in
+	// nothing, reading a time the cut does not have.
+	$effect(() => {
+		const end = editor.duration;
+		untrack(() => {
+			const back = clampPlayhead(ui.time, end);
+			if (back !== null) ui.seek(back);
+		});
 	});
 
 	// The desktop window is created hidden, so the unthemed first frame is never
@@ -113,7 +132,7 @@
 		// would drop it without a word, so ask first.
 		void onWindowCloseRequested(
 			() => editor.hasUnsavedWork,
-			() => confirmAction('This project has never been saved. Close Kerf and lose it?', 'Close Kerf')
+			() => proceedUnsaved(UNSAVED.close)
 		).then((un) => unlisteners.push(un));
 
 		// Each asset's preview proxy and per-kind analysis, kept current by the backend's events
@@ -231,10 +250,13 @@
 
 	/** New / Open replace the project; one that was never saved would be gone. */
 	async function okToReplace(): Promise<boolean> {
-		return (
-			!editor.hasUnsavedWork ||
-			confirmAction('This project has never been saved and will be lost. Continue?', 'Unsaved project')
-		);
+		return !editor.hasUnsavedWork || proceedUnsaved(UNSAVED.replace);
+	}
+
+	/** The unsaved-project prompt and what its answer means: whether to go ahead. "Save…" opens
+	 *  the save dialog and goes ahead only once the project is on disk. */
+	async function proceedUnsaved(copy: UnsavedCopy): Promise<boolean> {
+		return proceedAfter(await askUnsaved(copy), saveProject);
 	}
 
 	async function onNew() {
@@ -277,11 +299,7 @@
 			toast.info('Saving a project file is available in the desktop app.');
 			return;
 		}
-		try {
-			if (await editor.saveProjectAs()) toast.success(`Saved → ${editor.currentPath}`);
-		} catch (e) {
-			toast.error(e instanceof Error ? e.message : String(e));
-		}
+		await saveProject();
 	}
 
 	function onExport() {
@@ -296,7 +314,7 @@
 		}
 		await quitApp(
 			() => editor.hasUnsavedWork,
-			() => confirmAction('This project has never been saved. Quit Kerf and lose it?', 'Quit Kerf')
+			() => proceedUnsaved(UNSAVED.quit)
 		);
 	}
 
@@ -305,16 +323,13 @@
 	async function resetAllWorkspaces() {
 		const w = settings.workspaces;
 		const stored = Object.keys(w.layouts).length > 0 || Object.keys(w.library.tabs).length > 0;
-		if (stored && !(await confirmAction('Reset every workspace to its default arrangement? The arrangements you made are lost.', 'Reset all workspaces'))) {
-			return;
-		}
+		const reset = CONFIRM.resetWorkspaces;
+		if (stored && !(await confirmAction(reset.message, reset.title, reset))) return;
 		workspace.resetAll();
 	}
 
 	function onAbout() {
-		toast.info(`Kerf ${updater.version || ''}`.trim(), {
-			description: 'Non-destructive, AI-assisted video editing. PolyForm Noncommercial 1.0.0 — github.com/OrellBuehler/kerf'
-		});
+		ui.openAbout();
 	}
 
 	async function onImport() {
@@ -371,9 +386,20 @@
 		hadStaged = has;
 	});
 
-	/** Step by one timeline frame; Shift seeks a whole second. */
-	function frameStep(coarse: boolean): number {
-		return coarse ? 1 : 1 / editor.fps;
+	/** The times the proposal on screen changes the cut at, for stepping through them. */
+	const reviewPoints = $derived(editor.previewingStaged && editor.staged ? changePoints(editor.staged.diff.entries) : []);
+
+	/** `[` / `]`: the playhead to the change before / after it, while a proposal is on the timeline. */
+	function stepReview(dir: 1 | -1): void | false {
+		if (!editor.previewingStaged) return false;
+		const at = stepChange(reviewPoints, ui.time, dir, editor.fps, editor.duration);
+		if (at === null) toast.info(dir > 0 ? 'That is the last change in the proposal' : 'That is the first change in the proposal');
+		else ui.seek(at);
+	}
+
+	/** Step by frames of the cut from the frame being shown (a paused playhead can be mid-frame). */
+	function step(frames: number) {
+		ui.seek(stepFrames(ui.time, frames, editor.fps, editor.duration));
 	}
 
 	// Suppress the native browser context menu app-wide so views can supply their
@@ -488,10 +514,10 @@
 		'playback.shuttleBack': () => ui.shuttle(-1),
 		'playback.pause': () => ui.pause(),
 		'playback.shuttleForward': () => ui.shuttle(1),
-		'playback.stepBack': () => ui.seek(ui.time - frameStep(false)),
-		'playback.stepForward': () => ui.seek(ui.time + frameStep(false)),
-		'playback.jumpBack': () => ui.seek(ui.time - frameStep(true)),
-		'playback.jumpForward': () => ui.seek(ui.time + frameStep(true)),
+		'playback.stepBack': () => step(-1),
+		'playback.stepForward': () => step(1),
+		'playback.jumpBack': () => step(-secondFrames(editor.fps)),
+		'playback.jumpForward': () => step(secondFrames(editor.fps)),
 		'playback.toStart': () => ui.seek(0),
 		'playback.toEnd': () => ui.seek(editor.duration),
 
@@ -502,6 +528,8 @@
 				.catch(clipErr),
 		'marker.prev': () => ui.gotoMarker(-1),
 		'marker.next': () => ui.gotoMarker(1),
+		'review.prevChange': () => stepReview(-1),
+		'review.nextChange': () => stepReview(1),
 		// The in / out pair stays ordered so a mark can't cross its partner.
 		'range.markIn': () => {
 			ui.markIn = Math.min(ui.time, ui.markOut ?? Infinity);
@@ -569,6 +597,9 @@
 		// shorter chord (⌘C is not the razor's bare C).
 		const id = settings.actionFor(e);
 		if (!id) return;
+		// Page Up / Page Down scroll whichever panel has the keyboard; a proposal's review takes them only
+		// from the editor surface (the timeline, the preview, nothing in particular).
+		if (id.startsWith('review.') && isPagingKey(e.key) && !onEditorSurface(target)) return;
 		// One press, one action: a held ⌘V must not paste a dozen copies. The repeat
 		// is consumed, so the browser does not scroll or click on it either.
 		if (e.repeat && !allowsRepeat(id)) {
@@ -593,6 +624,53 @@
 			<span style="width:7px;height:7px;border-radius:50%;background:var(--agent-400);box-shadow:0 0 8px var(--agent-400)"
 			></span>
 			<span>Previewing the agent's proposed cut — your timeline is unchanged.</span>
+			{#if editor.staged}
+				<!-- The proposal as marks on the timeline: stepping from change to change, and what the
+				     marks mean (colour and outline style both say it). -->
+				<span
+					data-review-nav
+					style="display:inline-flex;align-items:center;gap:4px;margin-left:6px;color:var(--text-secondary);font-size:11px"
+				>
+					<button
+						use:tip={settings.tip('Previous change', 'review.prevChange')}
+						aria-label="Previous change"
+						disabled={reviewPoints.length === 0}
+						onclick={() => void stepReview(-1)}
+						style="display:grid;place-items:center;width:22px;height:22px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);cursor:pointer"
+						><Icon n="chevron-left" s={12} /></button
+					>
+					<span
+						style="font-family:var(--font-mono);min-width:8ch;text-align:center"
+						aria-live="polite"
+						use:tip={`The proposal changes the cut at ${reviewPoints.length} place${reviewPoints.length === 1 ? '' : 's'}; ${editor.staged.diff.entries.length} change${editor.staged.diff.entries.length === 1 ? '' : 's'} in all`}
+						>{reviewPoints.length > 0 ? `place ${changeIndex(reviewPoints, ui.time, editor.fps, editor.duration)}/${reviewPoints.length}` : 'no places'}</span
+					>
+					<button
+						use:tip={settings.tip('Next change', 'review.nextChange')}
+						aria-label="Next change"
+						disabled={reviewPoints.length === 0}
+						onclick={() => void stepReview(1)}
+						style="display:grid;place-items:center;width:22px;height:22px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);cursor:pointer"
+						><Icon n="chevron-right" s={12} /></button
+					>
+					<span style="margin-left:4px;font-family:var(--font-mono)"
+						>· {editor.staged.diff.entries.length} change{editor.staged.diff.entries.length === 1 ? '' : 's'}</span
+					>
+				</span>
+				<span data-review-legend style="display:inline-flex;align-items:center;gap:10px;margin-left:8px;font-size:11px;color:var(--text-secondary)">
+					<span style="display:inline-flex;align-items:center;gap:4px"
+						><span style="width:12px;height:9px;border:2px solid var(--diff-add);border-radius:2px"></span>added</span
+					>
+					<span style="display:inline-flex;align-items:center;gap:4px"
+						><span style="width:12px;height:9px;border:2px dashed var(--diff-shift);border-radius:2px"></span>changed</span
+					>
+					<span style="display:inline-flex;align-items:center;gap:4px"
+						><span
+							style="width:12px;height:9px;border:1.5px dashed var(--diff-remove);border-radius:2px;background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--diff-remove) 55%,transparent) 0 1px,transparent 1px 4px)"
+						></span>removed</span
+					>
+				</span>
+			{/if}
 			<div style="flex:1"></div>
 			<button
 				onclick={() => editor.exitStagedPreview()}
@@ -663,6 +741,10 @@
 
 {#if updater.dialogOpen}
 	<UpdateDialog />
+{/if}
+
+{#if ui.aboutDialog}
+	<AboutDialog onClose={() => ui.closeAbout()} />
 {/if}
 
 <ContextMenu />

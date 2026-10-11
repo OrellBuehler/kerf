@@ -13,7 +13,7 @@ const read = (path: string) => readFileSync(join(SRC, path), 'utf8');
 const EDITOR = 'lib/components/editor/';
 const code = (css: string) => css.replace(/\/\*[\s\S]*?\*\//g, '');
 
-const DIALOGS = ['ExportDialog', 'SettingsDialog', 'UpdateDialog', 'VoiceoverDialog', 'FitMusicDialog', 'StemsDialog'];
+const DIALOGS = ['ExportDialog', 'SettingsDialog', 'UpdateDialog', 'VoiceoverDialog', 'FitMusicDialog', 'StemsDialog', 'AboutDialog'];
 
 /** The opening `<Modal …>` tag of a dialog, whatever it spans. */
 function modalTag(name: string): string {
@@ -82,7 +82,14 @@ describe('Modal', () => {
 	test('the others lock while they run and move focus to the live action', () => {
 		expect(modalTag('FitMusicDialog')).toContain('busy={applying}');
 		expect(modalTag('StemsDialog')).toContain('busy={running}');
+		// The update download cannot be walked away from: on Windows the installer takes the app down when
+		// it is done, past every close guard, so the dialog holds still (no Hide) and the install is
+		// asked about first, with named buttons.
 		expect(modalTag('UpdateDialog')).toContain("busy={u.phase === 'downloading'}");
+		const update = read(`${EDITOR}UpdateDialog.svelte`);
+		expect(update).not.toContain('>Hide<');
+		expect(update).toContain('installPrompt(');
+		expect(update).toContain('onclick={install}');
 		for (const name of ['FitMusicDialog', 'StemsDialog', 'UpdateDialog']) expect(modalTag(name), name).toContain('rescue');
 		// Settings has nothing to lock and no footer to swap.
 		expect(modalTag('SettingsDialog')).not.toMatch(/busy|rescue|dismissOnScrim/);

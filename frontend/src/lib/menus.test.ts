@@ -19,7 +19,6 @@ const state = (over: Partial<MenuState> = {}): MenuState => ({
 	safeAreas: false,
 	hasFrame: true,
 	tool: 'pointer',
-	playing: false,
 	delivery: 'source',
 	allHeight: 'medium',
 	workspace: 'edit',
@@ -81,7 +80,7 @@ describe('File', () => {
 			'Import captions…',
 			'Export…',
 			'Save cover frame…',
-			'Settings',
+			'Settings…',
 			'Quit Kerf'
 		]);
 	});
@@ -242,10 +241,14 @@ describe('Playback', () => {
 		for (const a of ACTIONS.filter((a) => /^(playback|range|marker)\./.test(a.id))) expect(have.has(a.id as never), a.id).toBe(true);
 	});
 
-	test('play shows the icon of what it will do, and needs a cut', () => {
-		const icon = (playing: boolean) => (find(menu('playback', { playing }).items, 'Play / pause') as { icon?: string }).icon;
-		expect(icon(false)).toBe('play');
-		expect(icon(true)).toBe('pause');
+	test('a menu bar is text-first: no entry carries an icon, so the labels line up in one column', () => {
+		const all = buildMenus(state()).flatMap((m) => flatten(m.items));
+		expect(all.length).toBeGreaterThan(50);
+		expect(all.filter((e) => 'icon' in e)).toEqual([]);
+	});
+
+	test('play / pause needs a cut, and says so', () => {
+		expect((find(menu('playback').items, 'Play / pause') as { disabled?: boolean }).disabled).toBe(false);
 		const empty = find(menu('playback', { hasClips: false }).items, 'Play / pause');
 		expect('disabled' in empty && empty.disabled).toBe(true);
 		expect('reason' in empty && empty.reason).toBeTruthy();
@@ -309,7 +312,7 @@ describe('Window', () => {
 
 	test('resetting names the workspace on screen, and every workspace can be reset at once', () => {
 		expect(labels(menu('window', { workspace: 'color' }).items)).toEqual(
-			expect.arrayContaining(['Reset Color workspace', 'Reset all workspaces'])
+			expect.arrayContaining(['Reset Color workspace', 'Reset all workspaces…'])
 		);
 		expect(labels(menu('window', { workspace: 'deliver' }).items)).toContain('Reset Deliver workspace');
 	});
@@ -322,7 +325,7 @@ describe('Help', () => {
 	});
 
 	test('the log folder is a desktop thing, and says so elsewhere', () => {
-		const logs = find(menu('help', { desktop: false }).items, 'Open the log folder');
+		const logs = find(menu('help', { desktop: false }).items, 'Show log folder');
 		expect('disabled' in logs && logs.disabled).toBe(true);
 	});
 });

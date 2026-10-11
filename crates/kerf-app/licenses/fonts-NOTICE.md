@@ -1,4 +1,4 @@
-# Fonts (interface typefaces)
+# Fonts (interface typefaces and the default text font)
 
 Kerf's interface is set in three typefaces that ship inside the app, served from the
 bundled web view (they are not fetched from the network). They are the variable-font
@@ -8,6 +8,11 @@ converted to WOFF2 and split into unicode-range subsets, the glyphs unchanged):
 - **Geist** - Copyright 2024 The Geist Project Authors (https://github.com/vercel/geist-font)
 - **Geist Mono** - Copyright 2024 The Geist Project Authors (https://github.com/vercel/geist-font)
 - **Space Grotesk** - Copyright 2020 The Space Grotesk Project Authors (https://github.com/floriankarsten/space-grotesk)
+
+The engine ships **Geist Regular and Geist Bold** (the unmodified static TrueType files of the
+`geist` package, version 1.7.2, Copyright (c) 2023 Vercel, in collaboration with basement.studio)
+as the default font of titles and captions that name no other, written to the cache directory the
+first time one is drawn because FFmpeg's `drawtext` reads a font file.
 
 Each is licensed under the **SIL Open Font License, Version 1.1**, reproduced below. The
 license is also available with a FAQ at <https://openfontlicense.org>.

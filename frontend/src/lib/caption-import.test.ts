@@ -630,13 +630,20 @@ describe('describeImport', () => {
 		replaced: 0
 	};
 	test('says what was too short', () => {
-		expect(describeImport({ ...base, placed: 8, dropped_short: 2 })).toBe('Imported 14 captions from 8 of 10 cues (2 too short)');
+		expect(describeImport({ ...base, placed: 8, dropped_short: 2 })).toBe('Imported 8 of 10 cues. 2 were too short.');
 	});
 	test('names only what happened', () => {
-		expect(describeImport(base)).toBe('Imported 14 captions from 10 of 10 cues');
-		expect(describeImport({ ...base, captions: 1, placed: 1, cues: 1 })).toBe('Imported 1 caption from 1 of 1 cues');
+		expect(describeImport(base)).toBe('Imported 10 cues.');
+		expect(describeImport({ ...base, captions: 1, placed: 1, cues: 1 })).toBe('Imported 1 cue.');
 		expect(describeImport({ ...base, placed: 6, dropped_outside: 3, dropped_overlap: 1, skipped_lines: 2, replaced: 5 })).toBe(
-			'Imported 14 captions from 6 of 10 cues (3 outside the cut, 1 overlapping, 2 unreadable) · replaced 5'
+			'Imported 6 of 10 cues. 3 fell outside the cut. 1 overlapped another cue. 2 unreadable lines were skipped. Replaced 5 captions.'
 		);
+	});
+	test('the deck’s own example, and the singular forms', () => {
+		expect(describeImport({ ...base, cues: 3, placed: 2, dropped_outside: 1 })).toBe('Imported 2 of 3 cues. 1 fell outside the cut.');
+		expect(describeImport({ ...base, cues: 2, placed: 1, dropped_short: 1, skipped_lines: 1, replaced: 1 })).toBe(
+			'Imported 1 of 2 cues. 1 was too short. 1 unreadable line was skipped. Replaced 1 caption.'
+		);
+		expect(describeImport({ ...base, cues: 1, placed: 0, dropped_outside: 1 })).toBe('Imported 0 of 1 cue. 1 fell outside the cut.');
 	});
 });

@@ -70,6 +70,25 @@
   export, 750 still and 1550 preview cases differ. `zoom-keyed-last`, `alpha-kept` and
   `still-zoom-last` are structural families (read off how the chains *end*: the text of a moving
   zoom and of an alpha source's terminal format is the same `format=yuva420p`).
+- **The still inside a transition** (fades, tails and travel drawn as the export draws them,
+  `engine/cli/still_fx.rs`) re-blessed `still.txt` alone: 1577 of 5600 still cases moved, exactly the
+  cases hitting the new `still-fade` (`settb=expr=`; plus `still-fade-alpha`, `still-fade-white`,
+  `still-fade-pixel-format`), `still-tail` and `still-travel` (structural: a clip kept past its end,
+  a clip a slide or push moves) families; export and preview digests are identical per case. The
+  review round moved 11 of them again: 3 clips that fade after a dissolve (the chain stays on an
+  alpha plane) and 8 whose tail window closes inside the still's frame (1581 against the base);
+  all in the same families.
+- **The default font and the `drawtext` escapes** (two commits, `export.txt` / `still.txt` / `preview.txt` each time). Every overlay now names a
+  font file (`fontfile='...'`, the shipped Geist, pinned in the oracle at `/kerf-test/fonts/Geist-*.ttf` by `fonts::with_pinned_default_font`, with
+  `fonts::PINNED_FAMILY` — a family with no bold face — standing in for the named-font and synthetic-bold branches: a bold overlay that is not `generated`
+  names it, chosen from draws already made so no other case moves). 1481 export / 388 still / 795 preview of 5600 cases moved, exactly the cases hitting
+  the new families `overlay-default-font[-bold]`, `overlay-named-font` (and their `still-` / `preview-` forms). Then the three-level escape of apostrophe, colon and
+  backslash (`overlay-quote`, `overlay-colon`, `overlay-backslash` and their `still-` / `preview-` forms): 801 / 148 / 402 cases moved, exactly those. Both sets
+  tied with `KERF_GOLDEN_CASES` before / after and `KERF_GOLDEN_FAMILIES`.
+- **Line breaks in overlay text** (`export.txt` / `still.txt` / `preview.txt`): half of the draws of the pool text `"two\nlines"` (those whose `start` has
+  a fraction of at least one half, from draws already made so no other case moves) are `"one\rtwo\r\nthree\u{2028}four\u{2029}five"`, which every kind of break turns
+  into one space. New families `overlay-linebreak` (`one two three four five`) and its `still-` / `preview-` forms: 152 / 23 / 85 cases moved
+  (180 of 5600), exactly the cases hitting them.
 - **Sample-exact `adelay`** (a clip starting between milliseconds is delayed by samples)
   re-blessed `export.txt` alone: 2718 of 4800 cases moved, exactly the new
   `audio-delay-samples` family (`S:all=1`); still and preview carry no sound.

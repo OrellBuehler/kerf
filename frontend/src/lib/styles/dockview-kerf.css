@@ -83,3 +83,22 @@
 	outline: var(--focus-outline) !important;
 	outline-offset: calc(var(--focus-offset) * -1);
 }
+
+/* Hit targets. A tab's close X is 12 px of glyph in a 22 px target (dockview gave it 19 around an 11 px
+   one), and a sash — 4 px of visible line — is grabbed over 8 px: the line stays thin, the area the
+   pointer has to find does not. */
+.dockview-theme-kerf .dv-tab .dv-default-tab .dv-default-tab-action {
+	width: 22px;
+	height: 22px;
+	padding: 0;
+}
+.dockview-theme-kerf .dv-split-view-container.dv-horizontal > .dv-sash-container > .dv-sash::after {
+	content: '';
+	position: absolute;
+	inset: 0 -2px;
+}
+.dockview-theme-kerf .dv-split-view-container.dv-vertical > .dv-sash-container > .dv-sash::after {
+	content: '';
+	position: absolute;
+	inset: -2px 0;
+}

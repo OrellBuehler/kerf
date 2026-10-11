@@ -3703,7 +3703,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Render the assembled timeline at a timeline time into one composite image the model can see — the actual cut on screen at that moment (footage layered in track order, picture-in-picture placement, crop, color; gaps render black). Use to verify an edit you just made; pass `region` to zoom into a detail of it. A moment inside a transition is not: dissolves, dips and slides render as the plain cut."
+        description = "Render the assembled timeline at a timeline time into one composite image the model can see — the actual cut on screen at that moment (footage layered in track order, picture-in-picture placement, crop, color; gaps render black). Use to verify an edit you just made; pass `region` to zoom into a detail of it. A moment inside a fade, dip, dissolve, slide or push is drawn as the export draws it: the outgoing clip under the incoming one's ramp, the dip's fade, the clips part-way across the frame."
     )]
     async fn preview_timeline(&self, Parameters(p): Parameters<TimelineFrameParams>) -> Result<CallToolResult, McpError> {
         let project = self.project.clone();

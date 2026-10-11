@@ -26,6 +26,7 @@
 		toPos,
 		type RowSpec
 	} from '$lib/slider-row';
+	import { tip } from '$lib/tip';
 
 	let {
 		label,
@@ -121,7 +122,7 @@
 </script>
 
 <div class="row" class:slotless={!reserve && !keyframe} style="--label-w:{labelWidth}px;--num-w:{NUMBER_COL}px">
-	<span class="label" title={label}>{label}</span>
+	<span class="label" use:tip={label}>{label}</span>
 	<MixSlider
 		orientation="horizontal"
 		solid

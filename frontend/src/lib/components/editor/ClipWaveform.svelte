@@ -26,6 +26,7 @@
 		tilesForColumns,
 		type TileData
 	} from '$lib/waveform-view';
+	import { tip } from '$lib/tip';
 
 	let {
 		clip,
@@ -184,7 +185,7 @@
 		     for a file that failed, so a missing waveform is told apart from a
 		     loading one. -->
 		<div
-			title={status === 'failed' ? `Waveform unavailable — ${failure}` : undefined}
+			use:tip={status === 'failed' ? `Waveform unavailable — ${failure}` : undefined}
 			style="position:absolute;inset:0;background:repeating-linear-gradient(90deg, var(--waveform) 0 1px, transparent 1px 3px);opacity:{status ===
 			'failed'
 				? 0.12

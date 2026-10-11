@@ -217,7 +217,7 @@ pub(crate) fn parse_y4m(raw: &[u8]) -> Result<Option<YuvFrame>, String> {
 }
 
 /// Why a child run did not produce output.
-enum RunError {
+pub(crate) enum RunError {
     /// It wrote more than the cap allows.
     Overflow,
     Failed(String),
@@ -260,7 +260,7 @@ fn run_ffmpeg(args: &[String], cap: usize) -> Result<Vec<u8>, RunError> {
 
 /// Run `cmd`, capturing stdout up to `cap` bytes and a tail of stderr; kill the
 /// child when it writes more than `cap` or runs past `timeout`.
-fn run_child(mut cmd: std::process::Command, cap: usize, timeout: Duration) -> Result<Vec<u8>, RunError> {
+pub(crate) fn run_child(mut cmd: std::process::Command, cap: usize, timeout: Duration) -> Result<Vec<u8>, RunError> {
     let bin = cmd.get_program().to_string_lossy().into_owned();
     let mut child = cmd
         .stdin(Stdio::null())
