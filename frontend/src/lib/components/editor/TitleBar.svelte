@@ -25,6 +25,12 @@
 	let leftWidth = $state(0);
 	const compact = $derived(leftWidth > 0 && leftWidth < MENU_FULL_PX);
 
+	// The right cell holds the project's name and badge, a review chip, Export, the gear, the bell and the
+	// version; narrower than this the chip is its icon and count (the name has the least to give up).
+	const REVIEW_FULL_PX = 510;
+	let rightWidth = $state(0);
+	const shortReview = $derived(rightWidth > 0 && rightWidth < REVIEW_FULL_PX);
+
 	// An available update stays offered here after the dialog is dismissed;
 	// otherwise the version label doubles as a manual "check for updates".
 	const available = $derived(updater.update !== null);
@@ -44,11 +50,11 @@
 	style="height:var(--titlebar-h);display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:10px;padding:0 12px;background:var(--surface-app);flex:none;-webkit-app-region:drag"
 >
 	<div bind:clientWidth={leftWidth} style="min-width:0;display:flex;align-items:center;gap:8px">
-		<KerfMark size={15} />
+		<KerfMark size={18} />
 		<MenuBar {compact} {onAction} {onCommand} />
 	</div>
 	<WorkspaceTabs />
-	<div style="min-width:0;display:flex;align-items:center;justify-content:flex-end;gap:8px">
+	<div bind:clientWidth={rightWidth} style="min-width:0;display:flex;align-items:center;justify-content:flex-end;gap:8px">
 		<!-- What the project is: its name and whether it has a file. It gives way first
 		     when the window is narrow. -->
 		<div style="min-width:0;flex:0 1 auto;display:flex;align-items:center;gap:8px;overflow:hidden">
@@ -67,12 +73,13 @@
 			<button
 				class="k-ibtn"
 				data-agent
+				aria-label={proposal.label}
 				onclick={() => workspace.show('agent')}
 				use:tip={proposal.tip}
 				style="-webkit-app-region:no-drag;flex:none;gap:6px;height:28px;padding:0 9px;font:var(--type-ui);white-space:nowrap"
 			>
 				<Icon n="git-pull-request-arrow" s={13} />
-				{proposal.label}
+				{shortReview ? proposal.count || 'Review' : proposal.label}
 			</button>
 		{/if}
 		<!-- The app's goal had no button outside the Deliver workspace; it is File › Export… and Ctrl+E too. A

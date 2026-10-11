@@ -9,6 +9,7 @@
 	import { inTauri, revealLogs } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 	import { tip } from '$lib/tip';
+	import { clock } from '$lib/clock';
 
 	const showLogs = inTauri();
 
@@ -40,26 +41,15 @@
 			ui.time
 		)
 	);
-
-	function tc(s: number): string {
-		const total = Math.max(0, s);
-		const h = Math.floor(total / 3600);
-		const m = Math.floor((total % 3600) / 60);
-		const sec = Math.floor(total % 60);
-		const mm = `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
-		return h > 0 ? `${h}:${mm}` : mm;
-	}
 </script>
 
 <div
 	style="height:var(--statusbar-h);flex:none;display:flex;align-items:center;gap:12px;padding:0 12px;background:var(--surface-app);border-top:var(--line-width) solid var(--border-default);font-variant-numeric:tabular-nums"
 >
 	{#if meta}
-		<span style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted)">{meta}</span>
+		<span use:tip={'The selected asset: frame rate, size and codec'} style="font-size:var(--text-xs);color:var(--text-muted)">{meta}</span>
 	{/if}
-	<span style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted)">
-		{tc(editor.duration)}
-	</span>
+	<span use:tip={'Length of the cut'} style="font-size:var(--text-xs);color:var(--text-muted)">Cut {clock(editor.duration)}</span>
 	<div style="flex:1"></div>
 	{#if sourceNote}
 		<!-- Which file this frame was decoded from: the preview proxy, or the original and why. -->
@@ -67,7 +57,7 @@
 			data-testid="preview-source"
 			data-source={sourceNote.tone}
 			use:tip={sourceNote.title}
-			style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:var(--text-xs);color:{sourceNote.tone === 'proxy'
+			style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--text-xs);color:{sourceNote.tone === 'proxy'
 				? 'var(--kerf-300)'
 				: sourceNote.tone === 'waiting'
 					? 'var(--orange-400)'
@@ -82,7 +72,7 @@
 		<span
 			data-testid="preview-renderer"
 			use:tip={gpuPreview.reasons.length ? gpuPreview.reasons.join('\n') : 'Drawn by the GPU compositor'}
-			style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:var(--text-xs);color:{gpuPreview.renderer === 'gpu' ? 'var(--kerf-300)' : 'var(--text-muted)'}"
+			style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--text-xs);color:{gpuPreview.renderer === 'gpu' ? 'var(--kerf-300)' : 'var(--text-muted)'}"
 		>
 			{gpuPreview.label}
 		</span>

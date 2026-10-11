@@ -340,7 +340,7 @@
 	>
 		<code
 			data-selectable
-			style="flex:1;min-width:0;padding-top:4px;font-family:var(--font-mono);font-size:var(--text-sm);line-height:1.45;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all"
+			style="flex:1;min-width:0;padding-top:4px;font-family:var(--font-mono);font-size:var(--text-sm);line-height:1.45;color:var(--text-secondary);white-space:pre-wrap;overflow-wrap:anywhere"
 			>{value}</code
 		>
 		<IconBtn

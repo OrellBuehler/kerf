@@ -3,7 +3,7 @@
 .dockview-theme-kerf {
 	--dv-group-view-background-color: var(--surface-panel);
 	--dv-tabs-and-actions-container-background-color: var(--surface-app);
-	--dv-tabs-and-actions-container-height: 34px;
+	--dv-tabs-and-actions-container-height: 30px;
 	--dv-tabs-and-actions-container-font-size: var(--text-sm);
 	--dv-activegroup-visiblepanel-tab-background-color: var(--surface-panel);
 	--dv-activegroup-hiddenpanel-tab-background-color: var(--surface-app);
@@ -20,8 +20,8 @@
 	--dv-drag-over-background-color: var(--selection-fill);
 	--dv-drag-over-border-color: var(--selection-border);
 	--dv-sash-color: transparent;
-	--dv-active-sash-color: var(--kerf-500);
-	--dv-active-sash-transition-delay: 0.2s;
+	--dv-active-sash-color: color-mix(in srgb, var(--kerf-500) 65%, transparent);
+	--dv-active-sash-transition-delay: 0.1s;
 	--dv-icon-hover-background-color: var(--surface-hover);
 	--dv-tabs-container-scrollbar-color: var(--scrollbar-thumb);
 	--dv-floating-box-shadow: var(--shadow-lg);
@@ -121,4 +121,15 @@
 	letter-spacing: 0;
 	background: var(--agent-500);
 	color: var(--agent-fg);
+}
+
+/* A tab's close X shows when the pointer is on the tab (or something in it has focus), not on the one showing
+   all the time: Preview, Timeline and Library were one mis-click from gone, and each one's way back is the
+   Window menu. Right-click on a tab still offers Close. */
+.dockview-theme-kerf .dv-tab .dv-default-tab .dv-default-tab-action {
+	visibility: hidden;
+}
+.dockview-theme-kerf .dv-tab:hover .dv-default-tab .dv-default-tab-action,
+.dockview-theme-kerf .dv-tab:focus-within .dv-default-tab .dv-default-tab-action {
+	visibility: visible;
 }

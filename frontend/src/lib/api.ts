@@ -583,6 +583,18 @@ export async function onWindowCloseRequested(
 	});
 }
 
+/** Set the OS window's title (the taskbar and the window switcher read it; Kerf's own title bar is drawn
+ *  under the native caption). In the browser harness it is the tab's title. A failure is not worth a toast:
+ *  the title is a courtesy, not state. */
+export async function setWindowTitle(title: string): Promise<void> {
+	if (!inTauri()) {
+		if (typeof document !== 'undefined') document.title = title;
+		return;
+	}
+	const { getCurrentWindow } = await import('@tauri-apps/api/window');
+	await getCurrentWindow().setTitle(title);
+}
+
 /** Quit Kerf from a menu. The window's own close button is guarded by
  *  `onWindowCloseRequested` (a project that was never saved is asked about first);
  *  this is the same question put to the same window, then the same `destroy` that

@@ -48,9 +48,11 @@
 		openReleases,
 		quitApp,
 		revealLogs,
+		setWindowTitle,
 		showMainWindow,
 		takeLaunchProject
 	} from '$lib/api';
+	import { windowTitle } from '$lib/window-title';
 	import { afterPaint, fontsReady, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
 	import { CONFIRM, UNSAVED, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
@@ -79,6 +81,12 @@
 
 	// A modal over the editor window puts what is in the detached windows out of reach too.
 	$effect(() => popout.setInert(modalOpen));
+
+	// The OS hears the project's name, and that it has work that is not saved.
+	$effect(() => {
+		const title = windowTitle(editor.projectName, editor.hasUnsavedWork);
+		void setWindowTitle(title).catch(() => {});
+	});
 
 	// Any timeline edit mid-playback re-anchors the audio so what's heard
 	// matches the new cut (volume/fade tweaks land live too).
