@@ -460,9 +460,13 @@ updates live and **one** backend edit lands on release. The box is laid out in
 the engine's units: `cqh` against a size container covering the drawn picture,
 centred on `(pos_x, pos_y)`, font `size` of the height, browser text metrics
 standing in for drawtext's (the family the engine draws: the title's `font`, else — also when that one is
-not installed — the shipped Geist, `'Geist Variable'` here at `LINE_HEIGHT` 1.30, its own hhea line height,
-which a bun test reads off the font file; a named family takes `line-height: normal`), `boxborderw` as padding,
-so it is aligned to within font-metric differences. A **keyframed** title follows the Transform convention:
+not installed — the shipped Geist, `'Geist Variable'` here), `boxborderw` as padding. **The box is as tall as the
+string's ink**, as `drawtext`'s `text_h` is (`H` 0.71 of the font size in Geist, `x` 0.53, `Hxg` 0.87), not the
+font's line height (1.30): `inkBox` measures it with a canvas (`actualBoundingBoxAscent + Descent` at 100 px, cached,
+not remembered while the face is still loading), `FALLBACK_INK` 0.9 where there is no canvas, and shifts the
+ghost's glyphs from the line box's centre to the ink's, as the engine centres the ink at `(pos_x, pos_y)`; the headless
+harness reads 0.71 / 0.54 / 0.88 for `H` / `x` / `Hxg`. It is aligned to within font-metric differences.
+A **keyframed** title follows the Transform convention:
 moving it keyframes the position at the playhead (`editor.moveOverlay`, updating
 an existing keyframe within 20 ms, else inserting one carrying the opacity in
 force), because the static `pos_x/pos_y` is not what an animated render reads;
