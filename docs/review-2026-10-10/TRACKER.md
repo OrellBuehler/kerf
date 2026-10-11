@@ -142,3 +142,4 @@
 - UI-3: add an `edit.split` key (suggested Mod+K) plus a one-revision batch split command in the engine? Without the batch op, N per-clip splits give N undo steps and split linked pairs twice.
 - UI-3: should audio-only clips offer only Crossfade (and Dips) in Transition (in), instead of all eleven kinds?
 - UI-3: should the toolbar's "N selected" also count a linked pair as one?
+- UI-7 (review r3 nits, unfixed after 3 rounds): MenuBar `hasClips` reads `editor.timeline` while Export uses `liveTimeline` (staged preview on an empty cut shows File ▸ Export enabled, then refuses); the mixer strip guard hard-codes padding/edges, so at `--line-width:3px` DUCK overflows 2 px into padding; `.k-btn[aria-disabled]` duplicates the `:disabled` rule.
