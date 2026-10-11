@@ -5,6 +5,7 @@ import { contrastRatio, mixSrgb } from './contrast';
 import { posix, SRC, uiSources } from './test-sources';
 import { PRESET_IDS, PRESETS, SUPERSEDED_KERF_LIGHT, type ColorToken } from './theme';
 import { GENERATED_TITLE_FILL } from './titles';
+import { NAME_CHIP_PCT } from './clip-label';
 
 // Two guards that keep "every color is themable" and "every theme is readable"
 // true as the UI grows.
@@ -134,7 +135,6 @@ const DISABLED_INK_ALLOWED: Record<string, string> = {
 	'lib/components/editor/MenuBar.svelte': 'the rows of a menu that are off',
 	'lib/components/editor/ContextMenu.svelte': 'the rows of a menu that are off',
 	'lib/components/editor/NotificationCenter.svelte': 'a note\'s icon, a read mark, and the buttons that have nothing to act on',
-	'lib/components/editor/Timeline.svelte': 'the ruler\'s minor ticks, a mark and not text',
 	'lib/components/editor/AgentPanel.svelte': 'the empty queue\'s decorative icon'
 };
 
@@ -254,7 +254,11 @@ const PAIRS: Pair[] = [
 		'clip edge, playhead / selection amber and drag ghost on the lane'
 	),
 	...cross(['kerf-500'], ['surface-panel'], SECONDARY, 'playhead amber on the ruler'),
-	...cross(['waveform'], ['track-audio'], SECONDARY, 'waveform on its clip')
+	...cross(['waveform'], ['track-audio'], SECONDARY, 'waveform on its clip'),
+	// What is drawn on a clip beside its body (`ClipOverlays`): the volume line, the fade handles and
+	// ramps, the keyframe diamonds. Kerf Light's `kerf-300` is a dark amber for text on a white
+	// panel, which on its dark clip bodies is 1.0:1; `clip-accent` is the light one.
+	...cross(['clip-accent'], CLIP_BODIES, SECONDARY, 'volume line, fade handles and keyframes on the clip body')
 ];
 
 /** The pairs a set of colors does not meet, each phrased with its numbers. */
@@ -423,6 +427,17 @@ describe('contrast', () => {
 			const fill = resolveMix(GENERATED_TITLE_FILL, c);
 			const ratio = contrastRatio(c['text-on-video'], fill);
 			expect(ratio, `text-on-video ${c['text-on-video']} on the generated fill ${fill}`).toBeGreaterThanOrEqual(READING);
+		});
+	}
+
+	for (const id of PRESET_IDS) {
+		test(`${PRESETS[id].name}: a clip's name keeps 4.5:1 on its chip over the brightest waveform`, () => {
+			const c = PRESETS[id].colors;
+			for (const under of [c['waveform'], c['track-audio'], c['track-video']]) {
+				const chip = mixSrgb(c['scrim'], under, NAME_CHIP_PCT / 100);
+				const ratio = contrastRatio(c['text-on-video'], chip);
+				expect(ratio, `text-on-video on the chip over ${under}`).toBeGreaterThanOrEqual(READING);
+			}
 		});
 	}
 

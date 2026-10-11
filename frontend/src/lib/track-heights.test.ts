@@ -5,6 +5,7 @@ import {
 	HEIGHT_PRESETS,
 	MAX_REMEMBERED,
 	MINIMAP_KEY,
+	COLLAPSED_TITLE_PX,
 	MIN_TITLE_LANE_PX,
 	MIXER_MIN_PX,
 	PRESET_PX,
@@ -23,6 +24,7 @@ import {
 	setTrack,
 	stepPreset,
 	titleLaneHeight,
+	titleLaneHeightFor,
 	uniformPreset,
 	type TrackHeights
 } from './track-heights';
@@ -259,5 +261,21 @@ describe('persistence', () => {
 		expect(loadMinimap()).toBe(false);
 		saveMinimap(true);
 		expect(loadMinimap()).toBe(true);
+	});
+});
+
+describe('the empty titles lane', () => {
+	test('is a strip, much shorter than a row, at every height', () => {
+		for (const p of HEIGHT_PRESETS) {
+			expect(titleLaneHeightFor(p, 1, 0)).toBe(COLLAPSED_TITLE_PX);
+			expect(COLLAPSED_TITLE_PX).toBeLessThan(MIN_TITLE_LANE_PX / 1.5);
+		}
+	});
+
+	test('is the full lane the moment there is a title, however many rows it stacks to', () => {
+		for (const p of HEIGHT_PRESETS) {
+			expect(titleLaneHeightFor(p, 1, 1)).toBe(titleLaneHeight(p, 1));
+			expect(titleLaneHeightFor(p, 3, 5)).toBe(titleLaneHeight(p, 3));
+		}
 	});
 });

@@ -127,6 +127,7 @@
 	--track-text: #3a2c49;
 	--track-text-edge: #8a6aa8;
 	--waveform: #6fcfa8;
+	--clip-accent: #f0c277;
 	--scene-marker: var(--kerf-500);
 	--beat-marker: var(--agent-500);
 	--silence-region: color-mix(in srgb, var(--red-500) 12%, transparent);

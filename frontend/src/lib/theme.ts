@@ -84,6 +84,7 @@ export const COLOR_GROUPS = [
 			{ name: 'track-text', label: 'Text clip' },
 			{ name: 'track-text-edge', label: 'Text clip edge' },
 			{ name: 'waveform', label: 'Waveform' },
+			{ name: 'clip-accent', label: 'Clip handles and lines' },
 			{ name: 'drag-ghost', label: 'Drag ghost' },
 			{ name: 'frame-matte', label: 'Frame matte' }
 		]
@@ -184,6 +185,7 @@ export const PRESETS: Record<PresetId, Theme> = {
 			'track-text': '#3a2c49',
 			'track-text-edge': '#8a6aa8',
 			waveform: '#6fcfa8',
+			'clip-accent': '#f0c277',
 			'drag-ghost': '#788cff',
 			'frame-matte': '#000000'
 		},
@@ -242,6 +244,7 @@ export const PRESETS: Record<PresetId, Theme> = {
 			'track-text': '#5d4180',
 			'track-text-edge': '#7b56a0',
 			waveform: '#a8ecca',
+			'clip-accent': '#ffdf9e',
 			'drag-ghost': '#4a5fd6',
 			'frame-matte': '#000000'
 		},
@@ -306,6 +309,7 @@ export const PRESETS: Record<PresetId, Theme> = {
 			'track-text': '#35244a',
 			'track-text-edge': '#c39bf0',
 			waveform: '#8ef5c2',
+			'clip-accent': '#ffd280',
 			'drag-ghost': '#9aa8ff',
 			'frame-matte': '#000000'
 		},
@@ -329,7 +333,9 @@ export const PRESETS: Record<PresetId, Theme> = {
  *  darkened its clip bodies, amber and status hues. `upgradeStoredTheme` moves a
  *  stored theme whose colors are *exactly* one of these to the current preset and
  *  leaves everything else alone. Whenever Kerf Light's colors change again, the
- *  outgoing set goes on the end of this list. */
+ *  outgoing set goes on the end of this list. A token added after a set was
+ *  superseded (`clip-accent`) carries the current value in it: a stored theme
+ *  that lacks it is given the preset's on parse. */
 export const SUPERSEDED_KERF_LIGHT: readonly Record<ColorToken, string>[] = [
 	// As shipped up to v0.22.0.
 	{
@@ -381,6 +387,7 @@ export const SUPERSEDED_KERF_LIGHT: readonly Record<ColorToken, string>[] = [
 		'track-text': '#d8c8e6',
 		'track-text-edge': '#7b56a0',
 		waveform: '#1f8f60',
+		'clip-accent': '#ffdf9e',
 		'drag-ghost': '#4a5fd6',
 		'frame-matte': '#000000'
 	},
@@ -434,6 +441,7 @@ export const SUPERSEDED_KERF_LIGHT: readonly Record<ColorToken, string>[] = [
 		'track-text': '#5d4180',
 		'track-text-edge': '#7b56a0',
 		waveform: '#a8ecca',
+		'clip-accent': '#ffdf9e',
 		'drag-ghost': '#4a5fd6',
 		'frame-matte': '#000000'
 	},
@@ -488,6 +496,7 @@ export const SUPERSEDED_KERF_LIGHT: readonly Record<ColorToken, string>[] = [
 		'track-text': '#5d4180',
 		'track-text-edge': '#7b56a0',
 		waveform: '#a8ecca',
+		'clip-accent': '#ffdf9e',
 		'drag-ghost': '#4a5fd6',
 		'frame-matte': '#000000'
 	},
@@ -541,6 +550,7 @@ export const SUPERSEDED_KERF_LIGHT: readonly Record<ColorToken, string>[] = [
 		'track-text': '#5d4180',
 		'track-text-edge': '#7b56a0',
 		waveform: '#a8ecca',
+		'clip-accent': '#ffdf9e',
 		'drag-ghost': '#4a5fd6',
 		'frame-matte': '#000000'
 	}
