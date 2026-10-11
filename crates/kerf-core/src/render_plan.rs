@@ -695,6 +695,64 @@ impl RenderPlan {
             {
                 reasons.push(Unsupported::Shrink(n, (stage.src.w, stage.src.h), stage.scaled));
             }
+            // The round trip of a dip to white is the fade's own: the picture goes to `rgb24` and back
+            // around it, and what the compositor can draw is the picture at the size the chain makes
+            // it. The black bars of a letterboxed layer are padded in before the round trip, so
+            // FFmpeg whitens them with the picture. A picture with an odd side makes the round trip
+            // read past the line (the chroma pairs reach one pixel beyond it, into memory nothing
+            // initialised). And a layer the scaler resizes is converted by the `scale` filter itself,
+            // which negotiates the fade's `rgb24` as its output: scaling and converting in one pass,
+            // with chroma interpolated from other samples than the compositor's scale-then-convert
+            // (a half-size layer reads Y 19, UV 28 off at the picture's sharp edges; a crop is exact).
+            if caps.dip_white && self.white_round_trip(layer) {
+                let why = if geom.matte {
+                    Some(
+                        "on a letterboxed picture, whose black bars FFmpeg pads in before the round trip and so whitens too"
+                            .to_string(),
+                    )
+                } else if geom.picture.0 % 2 == 1 || geom.picture.1 % 2 == 1 {
+                    Some(format!(
+                        "on a picture of odd size {}x{} (FFmpeg's RGB round trip reads past it)",
+                        geom.picture.0, geom.picture.1
+                    ))
+                } else if geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
+                    Some("on a layer the scaler resizes (the scale filter converts to RGB itself, from chroma the compositor has already scaled)".to_string())
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    reasons.push(Unsupported::DipToWhite(
+                        LayerRef {
+                            index: n,
+                            name: layer.name.clone(),
+                        },
+                        why,
+                    ));
+                }
+            }
+            // A full-range picture the scaler resizes: swscale converts the range *inside* the
+            // resize, from the chroma it has not yet scaled, where the compositor converts the
+            // range and then scales. Plain, the two agree outside the picture's sharp edges (a still
+            // is held to that); in an export's planes the chroma reads up to 15 levels off (FFmpeg 6 as
+            // much as 9), and a fade running on it takes the flat error past the bound too (14).
+            if layer.stream.maybe_full_range() && geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
+                let where_ = if self.mode == PlanMode::Motion {
+                    Some("in an export frame")
+                } else if self.fade_ops(layer).iter().any(|o| o.factor < FADE_FULL) {
+                    Some("inside a fade, a dip or a dissolve")
+                } else {
+                    None
+                };
+                if let Some(where_) = where_ {
+                    reasons.push(Unsupported::FullRangeResized(
+                        LayerRef {
+                            index: n,
+                            name: layer.name.clone(),
+                        },
+                        where_,
+                    ));
+                }
+            }
             let resizing = geom.stages.iter().find(|s| s.scaled != (s.src.w, s.src.h));
             if let Some(stage) = resizing.filter(|_| !matches!(layer.stream.layout(), Some(PixLayout::Yuv420 | PixLayout::Gray)))
             {
@@ -825,25 +883,45 @@ impl RenderPlan {
             }
             // A dip to white is a filter in the export's chain for every frame of the clip, and in
             // the still's while the fade runs. `fade c=white` only takes RGB, so the picture is
-            // converted `yuv420p -> rgb24 -> yuv420p` around it: reproduced for a plain chain. On an
-            // alpha plane FFmpeg takes another RGB format, and a black fade of the clip that runs
-            // ahead of it is a filter of its own in the YUV.
+            // converted `yuv420p -> rgb24 -> yuv420p` around it: reproduced for a plain chain on an
+            // 8-bit limited-range 4:2:0 picture (the conversion's own kernel is within 2 levels of the
+            // tables the compositor follows; every other format was measured 9 to 21 levels off,
+            // gray 2 on one picture and not claimed). On an alpha plane FFmpeg takes another RGB
+            // format, and a black fade of the clip that runs ahead of it is a filter of its own in
+            // the YUV.
             let ops = self.fade_ops(layer);
-            let white = ops
-                .iter()
-                .any(|o| o.tint == FadeTint::White && (self.mode == PlanMode::Motion || o.factor < FADE_FULL));
-            if white {
+            if self.white_round_trip(layer) {
                 let why = if !caps.dip_white {
                     Some("(fade through an RGB round trip)")
                 } else if self.on_alpha_plane(layer) {
                     Some("on an alpha plane (a rotation, an opacity, a dissolve or a mask in the same chain), where FFmpeg converts through another RGB format")
                 } else if ops.iter().any(|o| o.tint == FadeTint::Black && o.factor < FADE_FULL) {
                     Some("while a black fade of the same clip runs ahead of it")
+                } else if stream.pix_fmt.as_deref() != Some("yuv420p") {
+                    Some("from a picture that is not 8-bit limited-range `yuv420p`, which FFmpeg converts to RGB from its own chroma grid and range (9 to 21 levels off the round trip the compositor draws)")
+                } else if !matches!(stream.matrix(), Some(YuvMatrix::Bt601 | YuvMatrix::Bt709)) {
+                    Some("from a picture whose colour matrix has no measured round trip")
                 } else {
                     None
                 };
                 if let Some(why) = why {
-                    out.push(Unsupported::DipToWhite(at(), why));
+                    out.push(Unsupported::DipToWhite(at(), why.to_string()));
+                }
+            }
+            // FFmpeg 9 keeps a full-range picture's raw values in the graph and converts the range
+            // at the end: the export's planes hold them as they are (17 levels off a compositor that
+            // converts first, in every frame, fades or not), and `fade` darkens them toward the
+            // limited-range black 16. FFmpeg 6 converts at the decode, as the compositor does.
+            if self.canvas.policy != CompositeColorPolicy::FixedBt601 && stream.maybe_full_range() {
+                let where_ = if self.mode == PlanMode::Motion {
+                    Some("in an export frame")
+                } else if ops.iter().any(|o| o.factor < FADE_FULL) {
+                    Some("inside a fade, a dip or a dissolve")
+                } else {
+                    None
+                };
+                if let Some(where_) = where_ {
+                    out.push(Unsupported::FullRangeNegotiated(at(), where_));
                 }
             }
             if self.through_rgba(layer) && ops.iter().any(|o| o.tint != FadeTint::Alpha && o.factor < FADE_FULL) {
@@ -1008,6 +1086,17 @@ impl RenderPlan {
                 factor: s.factor_at_frame(self.frame, fps.num, fps.den),
             })
             .collect()
+    }
+
+    /// Whether the clip's chain takes the `yuv420p -> rgb24 -> yuv420p` round trip a dip to white
+    /// needs at this frame: in an export it is a filter of every frame of the clip, in a still only
+    /// while the fade runs.
+    pub fn white_round_trip(&self, layer: &PlanLayer) -> bool {
+        let fps = self.canvas.fps;
+        layer.fx.fades.iter().any(|s| {
+            s.tint == FadeTint::White
+                && (self.mode == PlanMode::Motion || s.factor_at_frame(self.frame, fps.num, fps.den) < FADE_FULL)
+        })
     }
 
     /// Whether the clip's picture is in RGBA when its fades run: an opacity below 1 is a
@@ -1808,12 +1897,23 @@ mod tests {
         assert!(ok, "{why:?}");
     }
 
-    /// The still plan of `edit`ed clip `a` (0..10 s on the timeline) at `t`, with the compositor's caps.
+    /// The still plan of `edit`ed clip `a` (0..10 s on the timeline) at `t`.
     fn fading_plan(edit: impl FnOnce(&mut Clip), t: f64) -> RenderPlan {
-        let a = asset("a", 20.0, vec![video(640, 360)]);
+        fading_plan_of(video(640, 360), None, CompositeColorPolicy::FixedBt601, edit, t)
+    }
+
+    fn fading_plan_of(
+        stream: StreamInfo,
+        delivery: Option<Delivery>,
+        policy: CompositeColorPolicy,
+        edit: impl FnOnce(&mut Clip),
+        t: f64,
+    ) -> RenderPlan {
+        let a = asset("a", 20.0, vec![stream]);
         let mut clip = Clip::new(a.id, 0.0, 10.0, 0.0);
         edit(&mut clip);
-        let tl = timeline(vec![vec![clip]]);
+        let mut tl = timeline(vec![vec![clip]]);
+        tl.format = delivery;
         RenderPlan::at(
             &tl,
             std::slice::from_ref(&a),
@@ -1822,7 +1922,7 @@ mod tests {
                 ..ExportOptions::default()
             },
             t,
-            CompositeColorPolicy::FixedBt601,
+            policy,
         )
         .unwrap()
     }
@@ -1975,6 +2075,165 @@ mod tests {
         assert!(plan
             .reasons(&GpuCaps { dip_white: false, ..all }, plan.size(u32::MAX))
             .is_empty());
+    }
+
+    #[test]
+    fn a_dip_to_white_is_drawn_for_the_pictures_the_round_trip_was_measured_on() {
+        let all = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            ..GpuCaps::A0
+        };
+        let white = |c: &mut Clip| {
+            c.transition_in = Some(Transition {
+                kind: TransitionKind::DipToWhite,
+                duration: 2.0,
+            });
+        };
+        let why = |stream: StreamInfo, delivery: Option<Delivery>, t: f64| {
+            let plan = fading_plan_of(stream, delivery, CompositeColorPolicy::FixedBt601, white, t);
+            plan.reasons(&all, plan.size(u32::MAX))
+        };
+        assert!(why(video(640, 360), None, 0.5).is_empty());
+        let tagged = |space: &str| StreamInfo {
+            color_space: Some(space.into()),
+            ..video(640, 360)
+        };
+        assert!(
+            why(tagged("bt709"), None, 0.5).is_empty(),
+            "BT.709 was measured: 3 / 2 levels"
+        );
+        let dipped = |w: Vec<Unsupported>, what: &str| {
+            assert!(
+                matches!(w.as_slice(), [Unsupported::DipToWhite(_, m)] if m.contains(what)),
+                "{what}: {w:?}"
+            );
+        };
+        dipped(why(tagged("bt2020nc"), None, 0.5), "colour matrix");
+        // Every other format was measured 9 to 21 levels off the round trip: RGB (a PNG), 10-bit,
+        // 4:4:4, 4:2:2, gray and full range, and one whose format was never recorded.
+        for fmt in ["rgb24", "yuv420p10le", "yuv444p", "yuv422p", "gray", "yuvj420p"] {
+            let stream = StreamInfo {
+                pix_fmt: Some(fmt.into()),
+                ..video(640, 360)
+            };
+            dipped(why(stream, None, 0.5), "not 8-bit limited-range");
+        }
+        let unrecorded = StreamInfo {
+            pix_fmt: None,
+            ..video(640, 360)
+        };
+        dipped(why(unrecorded, None, 0.5), "not 8-bit limited-range");
+        // A letterboxed picture: FFmpeg pads before the round trip, so the bars whiten as well.
+        let portrait = video(360, 640);
+        let delivery = Some(Delivery::new(640, 360, Fit::Contain));
+        dipped(why(portrait.clone(), delivery, 0.5), "letterboxed");
+        // ... but not in a still once the fade is over: no round trip is in its chain then.
+        assert!(why(portrait.clone(), delivery, 5.0).is_empty());
+        let plan = fading_plan_of(portrait, delivery, CompositeColorPolicy::FixedBt601, |_| {}, 0.5);
+
+        assert!(plan.reasons(&all, plan.size(u32::MAX)).is_empty(), "no dip, no round trip");
+        // A picture with an odd side (a layer scaled to 319x179): the round trip reads past it.
+        let on_layer = |edit: &dyn Fn(&mut Clip)| {
+            let plan = fading_plan_of(
+                video(640, 360),
+                None,
+                CompositeColorPolicy::FixedBt601,
+                |c| {
+                    white(c);
+                    edit(c);
+                },
+                0.5,
+            );
+            plan.reasons(&all, plan.size(u32::MAX))
+        };
+        dipped(on_layer(&|c| c.transform.scale = 0.4985), "odd size 319x179");
+        // A layer the scaler resizes, whatever the ratio: the scale filter converts to RGB itself.
+        dipped(on_layer(&|c| c.transform.scale = 0.5), "scaler resizes");
+        dipped(on_layer(&|c| c.transform.scale = 1.5), "scaler resizes");
+        // ... where a crop that leaves the picture its size is exact, and so is a layer that is not resized.
+        assert!(on_layer(&|c| {
+            c.transform.crop_left = 0.25;
+            c.transform.crop_right = 0.25;
+        })
+        .is_empty());
+        // A compositor without the ability is not asked about the geometry.
+        let plan = fading_plan_of(video(640, 360), None, CompositeColorPolicy::FixedBt601, white, 0.5);
+        assert!(matches!(
+            plan.reasons(&GpuCaps { dip_white: false, ..all }, plan.size(u32::MAX))
+                .as_slice(),
+            [Unsupported::DipToWhite(..)]
+        ));
+    }
+
+    #[test]
+    fn a_full_range_picture_is_not_faded_or_exported_where_ffmpeg_9_keeps_its_raw_values() {
+        let all = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            ..GpuCaps::A0
+        };
+        let full = StreamInfo {
+            pix_fmt: Some("yuvj420p".into()),
+            ..video(640, 360)
+        };
+        let plan = |stream: &StreamInfo, policy, fade: f64, t: f64| {
+            fading_plan_of(stream.clone(), None, policy, |c| c.fade_in = fade, t)
+        };
+        let reasons = |p: &RenderPlan| p.reasons(&all, p.size(u32::MAX));
+        let policies = [CompositeColorPolicy::BottomLayerTag, CompositeColorPolicy::Unknown];
+        for policy in policies {
+            let running = reasons(&plan(&full, policy, 1.0, 0.5));
+            assert!(
+                matches!(running.as_slice(), [Unsupported::FullRangeNegotiated(_, w)] if w.contains("fade")),
+                "{policy:?}: {running:?}"
+            );
+            assert!(
+                reasons(&plan(&full, policy, 1.0, 5.0)).is_empty(),
+                "{policy:?}: a still with the fade over"
+            );
+            assert!(
+                reasons(&plan(&full, policy, 0.0, 0.5)).is_empty(),
+                "{policy:?}: no fade, no raw values"
+            );
+            assert!(
+                reasons(&plan(&video(640, 360), policy, 1.0, 0.5)).is_empty(),
+                "{policy:?}: a limited-range picture fades as drawn"
+            );
+        }
+        // FFmpeg 6 converts the range at the decode: the compositor's order.
+        assert!(reasons(&plan(&full, CompositeColorPolicy::FixedBt601, 1.0, 0.5)).is_empty());
+        // ... unless the scaler resizes the picture, which converts the range inside the resize
+        // (chroma up to 15 levels off): refused under either FFmpeg inside a fade, and drawn plain in a still.
+        let resized = |stream: &StreamInfo, policy, fade: f64, t: f64| {
+            fading_plan_of(
+                stream.clone(),
+                None,
+                policy,
+                |c| {
+                    c.fade_in = fade;
+                    c.transform.scale = 0.5;
+                },
+                t,
+            )
+        };
+        for policy in [CompositeColorPolicy::FixedBt601, CompositeColorPolicy::BottomLayerTag] {
+            let why = reasons(&resized(&full, policy, 1.0, 0.5));
+            assert!(
+                why.iter()
+                    .any(|w| matches!(w, Unsupported::FullRangeResized(_, m) if m.contains("fade"))),
+                "{policy:?}: {why:?}"
+            );
+            assert!(
+                reasons(&resized(&video(640, 360), policy, 1.0, 0.5)).is_empty(),
+                "{policy:?}: limited range is exact"
+            );
+        }
+        assert!(reasons(&resized(&full, CompositeColorPolicy::FixedBt601, 0.0, 0.5)).is_empty());
     }
 
     #[test]

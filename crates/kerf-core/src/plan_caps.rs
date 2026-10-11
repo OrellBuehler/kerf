@@ -172,7 +172,15 @@ pub enum Unsupported {
     Travel(LayerRef),
     /// A dip to white is in the layer's chain (`fade c=white`, through an RGB round trip) in a way the
     /// compositor does not draw: the detail says how.
-    DipToWhite(LayerRef, &'static str),
+    DipToWhite(LayerRef, String),
+    /// A full-range picture where FFmpeg 9 works on its raw values and converts the range later
+    /// (the detail says where): the composite colour policy is not the one that matches the
+    /// compositor's order (range first).
+    FullRangeNegotiated(LayerRef, &'static str),
+    /// A full-range picture the scaler resizes, in an export frame or inside a fade (the detail says
+    /// which): swscale converts the range inside the resize, from chroma the compositor has already
+    /// converted and scaled, which reads up to 15 levels of chroma off (FFmpeg 6 as well as 9).
+    FullRangeResized(LayerRef, &'static str),
     /// The layer plays on past its end, under the clip that replaces it.
     Tail(LayerRef),
     KeyedOpacity(LayerRef),
@@ -251,6 +259,14 @@ impl fmt::Display for Unsupported {
             ),
             Self::Travel(l) => write!(f, "{l}: moving through a slide or push transition"),
             Self::DipToWhite(l, why) => write!(f, "{l}: a dip to white {why}"),
+            Self::FullRangeResized(l, where_) => write!(
+                f,
+                "{l}: a full-range picture {where_} that the scaler resizes (swscale converts its range inside the resize: chroma up to 15 levels off)"
+            ),
+            Self::FullRangeNegotiated(l, where_) => write!(
+                f,
+                "{l}: a full-range picture {where_}, where FFmpeg 9 works on its raw values and converts the range afterwards"
+            ),
             Self::Tail(l) => write!(f, "{l}: playing on past its end under a transition"),
             Self::KeyedOpacity(l) => write!(f, "{l}: keyframed opacity (a geq alpha, whose rounding is not measured)"),
             Self::KeyedColor(l) => write!(

@@ -1074,6 +1074,80 @@ mod tests {
     }
 
     #[test]
+    fn an_export_frame_with_a_dip_to_white_or_a_full_range_clip_is_refused_where_it_is_not_drawn_exactly() {
+        let caps = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            ..GpuCaps::A0
+        };
+        let frame = |pix_fmt: &str, size: (u32, u32), fit: Fit, dip: TransitionKind, policy: CompositeColorPolicy| {
+            let mut a = asset();
+            a.streams[0].pix_fmt = Some(pix_fmt.into());
+            a.streams[0].width = Some(size.0);
+            a.streams[0].height = Some(size.1);
+            let out = make_clip(a.id, 0.0, 4.0, 0.0);
+            let mut inc = make_clip(a.id, 4.0, 8.0, 4.0);
+            inc.transition_in = Some(Transition {
+                kind: dip,
+                duration: 1.0,
+            });
+            let mut tl = single(vec![out, inc]);
+            tl.format = Some(Delivery::new(640, 360, fit));
+            let plan = Planner::new(
+                &tl,
+                std::slice::from_ref(&a),
+                &opts(30.0),
+                PlanRequest {
+                    mode: PlanMode::Motion,
+                    ..PlanRequest::still(policy)
+                },
+            )
+            .unwrap()
+            .at_frame(30)
+            .unwrap();
+            plan.reasons(&caps, (640, 360))
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        let (white, black) = (TransitionKind::DipToWhite, TransitionKind::DipToBlack);
+        let (plain, bt) = (CompositeColorPolicy::FixedBt601, CompositeColorPolicy::BottomLayerTag);
+        // Before the dip's fade starts (frame 30 of a clip that dips from 4 s) the export's chain
+        // still holds the round trip, so the letterbox is refused there too.
+        assert!(frame("yuv420p", (640, 360), Fit::Contain, white, plain).is_empty());
+        let why = frame("yuv420p", (1920, 1080), Fit::Contain, white, plain);
+        assert!(why.iter().any(|w| w.contains("scaler resizes")), "{why:?}");
+        assert!(frame("yuv420p", (1920, 1080), Fit::Contain, black, plain).is_empty());
+        let why = frame("yuv420p", (360, 640), Fit::Contain, white, plain);
+        assert!(why.iter().any(|w| w.contains("letterboxed")), "{why:?}");
+        assert!(frame("yuv420p", (360, 640), Fit::Contain, black, plain).is_empty());
+        let why = frame("yuv420p", (360, 640), Fit::Cover, white, plain);
+        assert!(
+            why.iter().any(|w| w.contains("scaler resizes")) && !why.iter().any(|w| w.contains("letterboxed")),
+            "{why:?}"
+        );
+        let why = frame("rgb24", (640, 360), Fit::Contain, white, plain);
+        assert!(why.iter().any(|w| w.contains("not 8-bit limited-range")), "{why:?}");
+        assert!(frame("rgb24", (640, 360), Fit::Contain, black, plain).is_empty());
+        // A full-range clip is the raw values FFmpeg 9 exports; FFmpeg 6 converts at the decode.
+        assert!(frame("yuvj420p", (640, 360), Fit::Contain, black, plain).is_empty());
+        let why = frame("yuvj420p", (640, 360), Fit::Contain, black, bt);
+        assert!(
+            why.iter().any(|w| w.contains("full-range") && w.contains("export frame")),
+            "{why:?}"
+        );
+        assert!(frame("yuv420p", (1920, 1080), Fit::Contain, black, bt).is_empty());
+        // A full-range clip the scaler resizes is refused in an export frame under FFmpeg 6 too.
+        let why = frame("yuvj420p", (1920, 1080), Fit::Contain, black, plain);
+        assert!(
+            why.iter().any(|w| w.contains("scaler resizes") && w.contains("full-range")),
+            "{why:?}"
+        );
+    }
+
+    #[test]
     fn a_slide_travels_the_whole_padded_frame_and_a_keyframed_clip_is_not_padded() {
         let a = asset();
         let out = make_clip(a.id, 0.0, 2.0, 0.0);
