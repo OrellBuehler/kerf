@@ -14,7 +14,7 @@
 | GPU-1 Proxy colour normalisation | gpu-1 (pushed, no PR) | | blocked (needs a decision) | gpu-compositor WP-3 (partial: untagged HD labelled bt709; SD/601/2020/RGB not converted) | stacks refused on 9.0.2 (15 cases): 11 → 5; untagged HD colour vs source 28.0 dB → 43.3 dB on 9.0.2; nothing moves on 6.1.1 |
 | UI-5 Timeline gestures | ui-5 (on ui-4) | | review | timeline H3–H5, H12, H13, H15 + medium; + playhead past the end after the cut shrinks; clip arrow-key nudge (M18 rest); scrub rail hover chip + marker ticks (H6 rest) | wave 3 |
 | UI-7 Panels polish | | | todo | panels/shell medium + polish; shell H6 | wave 3 |
-| UI-8 Export dialog logic | ui-8 (on ui-6) | | verify | dialogs 3 | wave 3 |
+| UI-8 Export dialog logic | ui-8 (on ui-6, pushed) | | ready (PR after UI-6) | dialogs 3 | wave 3 |
 | PERF-4 Still cache and prefetch | | | todo | gpu-media WP6, WP9 | wave 3 |
 | GPU-2 Text on the GPU | | | todo | gpu-compositor | wave 3 |
 | GPU-4 … GPU-7, PERF-5, macOS presenter | | | todo | | wave 4 |
