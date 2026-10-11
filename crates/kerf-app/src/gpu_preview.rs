@@ -1258,7 +1258,7 @@ impl GpuPreview {
         run: impl FnOnce(Box<dyn FnOnce() + Send>),
     ) -> oneshot::Receiver<Answer> {
         request.scrubbing = lock(&self.pace).observe(request.arrived);
-        let order = request.order.clone();
+        let order = request.order.take();
         let (answer, start) = self.mail.post(request, order);
         if start {
             let starter = Starter(Some(Arc::clone(self)));
