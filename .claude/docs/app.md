@@ -341,6 +341,15 @@ ends it with `renderer: "stream"` and `play.ahead` (a cursor that died, a surfac
 a frame is drawn (teardown never waits for one), a panic in a step is caught and is the stream's too, and its prefetch thread
 (`kerf-gpu-play-prefetch`) looks 2 s ahead: it opens the cursor of every clip about to come on screen (the file's probes and the process
 start are paid before the cut) and has the titles of the next 1.5 s rasterised (`Compositor::warm_text`), neither on the frame's path.
+**Priming** (`gpu_preview/prime.rs`): the start of a session is mostly `ffmpeg` starting (50 to 70 ms for one clip, more for several), and the playhead
+it will play from is known long before Play, so when a **paused** GPU frame has been the last request for 300 ms (`PRIME_AFTER`) the thread
+`kerf-gpu-prime` makes the `PlayCut` from it and opens the cursors of the frame on screen (each `ffmpeg` decodes its first frames into the pipe and
+waits). The Play that follows adopts it (`take_primed`) if it asks from within `[start - 0.3, start + 0.15]` of the same plan epoch and backend; the
+scan, the surface, the self-test and the plan are asked at adoption as at any start, so priming decides nothing. A cut the stream will play
+(anything refused in the 5 s, a check that has not passed, a clip no run is trusted for) is not primed, and a primed session is dropped (its
+`ffmpeg`s killed) by anything that is not a play from that playhead, a project change, the backend or the setting going, and 10 s (`PRIME_TTL`)
+unplayed. The cost is one `ffmpeg` per layer of the frame on screen, idle, while the playhead rests: it is opened once per rest, not per frame.
+Cursor timeouts of a session are `play_config()` (first frame 10 s, next 3 s), shorter than the export's so a hung decode ends in the stream's hands.
 `gpu_preview_diagnostics.play` counts `{sessions, declined, handed_over, frames, skipped, repeats}`; the log has a line per session
 (`GPU playback session begun` / `ended`, with the mean decode, composite and present time of its frames and the worst).
 `gpu_preview/play_tests.rs` (`#[ignore]`d, a device and an FFmpeg) drives it without a window: the check pending, a cut crossed with its

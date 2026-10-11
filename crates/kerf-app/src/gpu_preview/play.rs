@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kerf_core::{PlayAhead, PlayCut, ProxyMedia};
-use kerf_gpu::{Compositor, CursorFeed, MotionFrames};
+use kerf_gpu::{Compositor, CursorConfig, CursorFeed, MotionFrames};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -71,6 +71,20 @@ pub const IDLE: Duration = Duration::from_secs(5);
 /// A request this far (seconds) behind the one before it starts the session over: the page seeked
 /// without saying so. A smaller step back is the clock's jitter, and shows the frame already shown.
 const BACK: f64 = 1.0;
+
+/// How long a playing frame waits for `ffmpeg` to produce a first frame / the next one before the cursor's
+/// watchdog kills it, and the session goes to the stream: a decode that takes seconds is not playing.
+const FIRST_FRAME: Duration = Duration::from_secs(10);
+const NEXT_FRAME: Duration = Duration::from_secs(3);
+
+/// The limits of the cursors of a play session.
+pub(super) fn play_config() -> CursorConfig {
+    CursorConfig {
+        first_frame_timeout: FIRST_FRAME,
+        frame_timeout: NEXT_FRAME,
+        ..CursorConfig::default()
+    }
+}
 
 /// Which session a forward request belongs to: the page that asked (its pump's name) and its number.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -486,10 +500,19 @@ impl GpuPreview {
                 "the page has something to draw over the picture, and this surface sits above the page".into(),
             ));
         }
-        let cut = PlayCut::new(&inputs.timeline, &inputs.assets, t, (self.policy)(), &ProxyMedia)
-            .map_err(|e| one("no_plan", format!("no plan to play from here: {e}")))?;
         self.ensure_backend(technique, now).map_err(|why| one("backend", why))?;
         let drawing = self.drawing().map_err(|r| vec![r])?;
+        // A play from where the paused frame was drawn was made ready while the playhead rested there: its
+        // cursors are open, and its first frames are in their pipes.
+        let (cut, motion, primed) = match self.take_primed(inputs.epoch(), t, &drawing.source, now) {
+            Some(primed) => (primed.cut, primed.motion, true),
+            None => {
+                let cut = PlayCut::new(&inputs.timeline, &inputs.assets, t, (self.policy)(), &ProxyMedia)
+                    .map_err(|e| one("no_plan", format!("no plan to play from here: {e}")))?;
+                let motion = MotionFrames::with_config(Arc::clone(&drawing.source), play_config());
+                (Arc::new(cut), motion, false)
+            }
+        };
         let first = cut
             .plan(t)
             .map_err(|e| one("no_plan", format!("no plan for the first frame: {e}")))?;
@@ -502,13 +525,12 @@ impl GpuPreview {
         }
         // Nothing the user looks at before the GPU has been checked against this FFmpeg.
         self.gate(&drawing.gpu, &drawing.adapter).map_err(|r| vec![r])?;
-        let cut = Arc::new(cut);
-        let motion = MotionFrames::new(Arc::clone(&drawing.source));
         let feeder = Feeder::start(Arc::clone(&cut), motion.feed(), Arc::clone(&drawing.compositor));
         tracing::info!(
             session = key.session,
             from = t,
             start = cut.start(),
+            primed,
             width = size.0,
             height = size.1,
             "GPU playback session begun"
@@ -664,4 +686,181 @@ enum Step {
     Answer(PreviewFrameResult),
     /// The stream takes over: the reasons, and where from.
     Handover(Vec<Reason>, AheadInfo),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kerf_core::{CompositeColorPolicy, GpuCaps, Project, StreamKind};
+    use kerf_gpu::{FrameSource, FrameSourceConfig};
+
+    fn key(session: u64) -> PlayKey {
+        PlayKey {
+            client: "page".into(),
+            session,
+        }
+    }
+
+    /// A session over the sample project's cut (nothing is decoded: it is not played).
+    fn session(failures: Vec<(f64, String)>, now: Instant) -> PlaySession {
+        let project = Project::sample().expect("the sample project");
+        let inputs = PlanInputs::of(&project).expect("inputs");
+        let mut assets = inputs.assets.clone();
+        for stream in assets.iter_mut().flat_map(|a| a.streams.iter_mut()) {
+            if stream.kind == StreamKind::Video {
+                stream.pix_fmt = Some("yuv420p".into());
+            }
+        }
+        let cut = PlayCut::new(&inputs.timeline, &assets, 0.0, CompositeColorPolicy::FixedBt601, &ProxyMedia).expect("a cut");
+        let source = FrameSource::new(FrameSourceConfig::default());
+        let motion = MotionFrames::with_config(Arc::clone(&source), play_config());
+        let (tx, _rx) = mpsc::channel();
+        PlaySession {
+            key: key(1),
+            epoch: 7,
+            cut: Arc::new(cut),
+            motion,
+            source,
+            feeder: Some(Feeder {
+                tx,
+                failures: Arc::new(Mutex::new(failures)),
+                told: None,
+            }),
+            scan: None,
+            shown: None,
+            last_used: now,
+            began: now,
+            stats: PlayTally::default(),
+            decode_ms: 0.0,
+            composite_ms: 0.0,
+            present_ms: 0.0,
+            worst_ms: 0.0,
+        }
+    }
+
+    /// What a compositor that draws motion, fades and transitions and text asks of a plan.
+    fn caps() -> GpuCaps {
+        let mut caps = GpuCaps::A0;
+        caps.motion = true;
+        caps.fades = true;
+        caps.transitions = true;
+        caps.text = true;
+        caps
+    }
+
+    #[test]
+    fn a_session_answers_its_own_page_epoch_and_a_request_that_is_not_far_behind() {
+        let now = Instant::now();
+        let mut s = session(Vec::new(), now);
+        assert!(s.fits(&key(1), 7, 3.0, now), "its own, before anything was shown");
+        s.shown = Some((90, 3.0));
+        assert!(s.fits(&key(1), 7, 3.2, now));
+        assert!(s.fits(&key(1), 7, 2.9, now), "a step back is the clock's jitter");
+        assert!(s.fits(&key(1), 7, 2.1, now));
+        assert!(
+            !s.fits(&key(1), 7, 1.9, now),
+            "more than a second back is a seek the page did not announce"
+        );
+        assert!(!s.fits(&key(2), 7, 3.2, now), "another session of the page");
+        assert!(
+            !s.fits(
+                &PlayKey {
+                    client: "other".into(),
+                    ..key(1)
+                },
+                7,
+                3.2,
+                now
+            ),
+            "another page"
+        );
+        assert!(!s.fits(&key(1), 8, 3.2, now), "the project changed under it");
+        assert!(s.fits(&key(1), 7, 3.2, now + IDLE - Duration::from_millis(1)));
+        assert!(!s.fits(&key(1), 7, 3.2, now + IDLE), "nobody asked for it in a while");
+    }
+
+    #[test]
+    fn what_is_ahead_is_the_earliest_of_the_scan_and_the_clips_the_prefetch_could_not_open() {
+        let now = Instant::now();
+        // The sample cut is drawn through, so only the prefetch has anything to say.
+        let mut s = session(Vec::new(), now);
+        assert_eq!(s.ahead(0.0, (640, 360), &caps()), None);
+        let mut s = session(
+            vec![(2.5, "c.ts: not an indexed container".into()), (1.5, "d.ts: no".into())],
+            now,
+        );
+        let ahead = s.ahead(0.0, (640, 360), &caps()).expect("a clip that cannot be opened");
+        assert_eq!((ahead.at, ahead.kind), (1.5, "cursor"), "the nearest of them");
+        assert!(ahead.why.starts_with("d.ts"));
+        assert!(ahead.handover <= ahead.at);
+        // A scan that refuses the first frame (a compositor that draws no motion) comes first; another
+        // size is another scan.
+        let refused = s.ahead(0.0, (320, 180), &GpuCaps::A0).expect("the scan");
+        assert_eq!(refused.at, 0.0);
+        assert_eq!(refused.kind, "motion");
+    }
+
+    #[test]
+    fn the_scan_is_made_again_after_half_a_second_of_playback_and_when_the_size_changes() {
+        let now = Instant::now();
+        let mut s = session(Vec::new(), now);
+        s.ahead(1.0, (640, 360), &caps());
+        let first = s.scan.as_ref().map(|sc| (sc.from, sc.size));
+        s.ahead(1.2, (640, 360), &caps());
+        assert_eq!(s.scan.as_ref().map(|sc| sc.from), Some(1.0), "not yet");
+        s.ahead(1.6, (640, 360), &caps());
+        assert_eq!(s.scan.as_ref().map(|sc| sc.from), Some(1.6));
+        s.ahead(1.7, (320, 180), &caps());
+        assert_eq!(
+            s.scan.as_ref().map(|sc| sc.size),
+            Some((320, 180)),
+            "another size is another answer"
+        );
+        s.ahead(0.2, (320, 180), &caps());
+        assert_eq!(s.scan.as_ref().map(|sc| sc.from), Some(0.2), "and so is going back");
+        assert_eq!(first, Some((1.0, (640, 360))));
+    }
+
+    #[test]
+    fn the_answers_are_what_the_page_reads() {
+        let result = PreviewFrameResult {
+            renderer: "gpu",
+            frame: None,
+            reasons: Vec::new(),
+            timings: None,
+            play: Some(PlayInfo {
+                session: 3,
+                start: 1.5,
+                frame: 12,
+                repeat: false,
+                ahead: Some(AheadInfo {
+                    at: 6.0,
+                    handover: 5.5,
+                    kind: "mask",
+                    why: "a mask".into(),
+                }),
+            }),
+        };
+        let json = serde_json::to_value(&result).expect("json");
+        assert_eq!(json["renderer"], "gpu");
+        assert_eq!(
+            json["play"],
+            serde_json::json!({"session": 3, "start": 1.5, "frame": 12, "repeat": false,
+                "ahead": {"at": 6.0, "handover": 5.5, "kind": "mask", "why": "a mask"}})
+        );
+        let plain = serde_json::to_value(PreviewFrameResult::superseded()).expect("json");
+        assert!(plain["play"].is_null());
+        let tally = serde_json::to_value(PlayTally::default()).expect("json");
+        for field in ["sessions", "declined", "handed_over", "frames", "skipped", "repeats"] {
+            assert_eq!(tally[field], 0, "{field}");
+        }
+    }
+
+    #[test]
+    fn a_play_session_is_given_limits_a_playing_frame_can_wait_for() {
+        let config = play_config();
+        assert!(config.frame_timeout <= Duration::from_secs(5));
+        assert!(config.first_frame_timeout <= Duration::from_secs(15));
+        assert_eq!(config.window_cap_bytes, CursorConfig::default().window_cap_bytes);
+    }
 }

@@ -301,3 +301,95 @@ fn a_change_a_seek_another_session_and_turning_it_off_each_end_the_session() {
     assert_eq!(off.renderer, "stream");
     assert!(off.reasons[0].contains("off"), "{:?}", off.reasons);
 }
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_playhead_that_rests_primes_the_play_from_it_and_play_starts_from_cursors_that_are_open() {
+    let _turn = exclusive();
+    let log = Arc::new(Mutex::new(ScreenLog::default()));
+    let (take, shared) = super::drive_tests::taker(project());
+    let preview = Arc::new(preview(&log));
+    let ask = |t: f64| {
+        let request = FrameRequest::new(Arc::clone(&take), t, 320, false);
+        preview
+            .post(request, |job| {
+                std::thread::spawn(job);
+            })
+            .blocking_recv()
+            .expect("answered")
+    };
+    // The first paused frame builds the backend and starts the check; the one after it is the GPU's.
+    assert!(matches!(ask(0.1), Delivery::Done(Ok(_))));
+    wait_open(&preview);
+    let Delivery::Done(Ok(frame)) = ask(0.5) else {
+        panic!("a frame")
+    };
+    assert_eq!(frame.renderer, "gpu", "{:?}", frame.reasons);
+
+    // Cold: a play from a playhead nothing was made ready for.
+    let inputs = preview.inputs(&take).expect("inputs");
+    assert!(lock(&preview.primed).is_none(), "the playhead has not rested yet");
+    let cold = preview.play(&inputs, &key(1), 0.5, false).expect("an answer");
+    assert_eq!(cold.renderer, "gpu", "{:?}", cold.reasons);
+    let cold_decode = cold.timings.expect("timings").decode_ms;
+    preview.end_play();
+
+    // The playhead rests on a frame of the cut: after a moment the play from it is made ready, with
+    // the cursor of the frame on the screen open.
+    let Delivery::Done(Ok(frame)) = ask(0.2) else {
+        panic!("a frame")
+    };
+    assert_eq!(frame.renderer, "gpu");
+    wait_for("the play to be primed", || lock(&preview.primed).is_some());
+    let waiting = lock(&preview.primed).as_ref().map(|p| p.motion.feed().waiting());
+    assert_eq!(waiting, Some(1), "the cursor of the clip on the screen is open");
+
+    // Play from a little before it (the picture is asked for what is audible) adopts it.
+    let inputs = preview.inputs(&take).expect("inputs");
+    let warm = preview.play(&inputs, &key(2), 0.2 - 0.04, false).expect("an answer");
+    assert_eq!(warm.renderer, "gpu", "{:?}", warm.reasons);
+    assert!(lock(&preview.primed).is_none(), "the play took it");
+    let warm_decode = warm.timings.expect("timings").decode_ms;
+    assert!(
+        warm_decode < cold_decode * 0.8 && warm_decode < 40.0,
+        "the first frame waited {warm_decode:.1} ms for cursors that were open (cold: {cold_decode:.1} ms)"
+    );
+    // It is the session of the playhead: frame 0 is the paused frame.
+    let info = warm.play.expect("play");
+    assert_eq!((info.frame, info.start), (0, 6.0 / FPS));
+    preview.end_play();
+
+    // Another paused frame, a change, and a play from somewhere else each leave nothing primed.
+    assert!(matches!(ask(0.2), Delivery::Done(Ok(_))));
+    wait_for("the play to be primed", || lock(&preview.primed).is_some());
+    assert!(matches!(ask(0.7), Delivery::Done(Ok(_))));
+    assert!(lock(&preview.primed).is_none(), "a different paused frame");
+    wait_for("the play from the new playhead to be primed", || {
+        lock(&preview.primed).is_some()
+    });
+    let clip = lock(&shared).working_timeline().unwrap().tracks[0].clips[1].id;
+    lock(&shared).set_clip_enabled(clip, false).expect("an edit");
+    let edited = preview.inputs(&take).expect("inputs after the edit");
+    // The edit moved the plan epoch: what was primed is for the cut as it was.
+    let after = preview.play(&edited, &key(3), 0.7 - 0.04, false).expect("an answer");
+    assert_eq!(after.renderer, "gpu", "{:?}", after.reasons);
+    assert!(lock(&preview.primed).is_none());
+    preview.end_play();
+
+    // A play started well after the primed start does not adopt it either (the cursors would read
+    // forward to it), and nothing is left primed.
+    assert!(matches!(ask(0.2), Delivery::Done(Ok(_))));
+    wait_for("the play to be primed", || lock(&preview.primed).is_some());
+    let edited = preview.inputs(&take).expect("inputs");
+    let late = preview.play(&edited, &key(4), 0.9, false).expect("an answer");
+    assert_eq!(late.renderer, "gpu", "{:?}", late.reasons);
+    assert!(lock(&preview.primed).is_none());
+
+    // The setting off drops it and the work waiting to make one.
+    preview.end_play();
+    assert!(matches!(ask(0.2), Delivery::Done(Ok(_))));
+    wait_for("the play to be primed", || lock(&preview.primed).is_some());
+    assert!(preview.set_enabled(false));
+    preview.teardown_if_off();
+    assert!(lock(&preview.primed).is_none());
+}

@@ -46,6 +46,7 @@ mod diagnostics;
 mod mailbox;
 mod pace;
 mod play;
+mod prime;
 mod snapshot;
 #[cfg(target_os = "linux")]
 mod x11;
@@ -55,7 +56,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -77,6 +78,7 @@ use mailbox::{Mailbox, MailboxStats, Order, Worker};
 use pace::Pace;
 use play::PlaySession;
 pub use play::{PlayInfo, PlayKey, PlayTally};
+use prime::{Primed, Primer};
 pub use snapshot::Taken;
 use snapshot::{PlanInputs, PlanSnapshots, SnapshotStats};
 
@@ -1066,6 +1068,11 @@ pub struct GpuPreview {
     play: Mutex<Option<PlaySession>>,
     /// What the sessions that ended did.
     play_tally: Mutex<PlayTally>,
+    /// The session from the playhead the paused frame is at, made ready (see [`prime`]).
+    primed: Mutex<Option<Primed>>,
+    primer: Arc<Primer>,
+    /// This preview, for the thread that primes (set by the first [`GpuPreview::post`]).
+    me: OnceLock<Weak<GpuPreview>>,
     /// Frame requests: only the newest is drawn.
     mail: Mailbox<FrameRequest, Result<PreviewFrameResult, String>>,
     /// Whether requests are arriving like a drag.
@@ -1131,6 +1138,9 @@ impl GpuPreview {
             snapshots: PlanSnapshots::default(),
             play: Mutex::new(None),
             play_tally: Mutex::new(PlayTally::default()),
+            primed: Mutex::new(None),
+            primer: Primer::new(),
+            me: OnceLock::new(),
             mail: Mailbox::default(),
             pace: Mutex::new(Pace::default()),
             counters: Mutex::new(Counters::default()),
@@ -1268,6 +1278,7 @@ impl GpuPreview {
         tracing::info!(session = %lock(&self.counters).tally(self.mail.stats().superseded).line(), "the GPU preview's frames so far");
         self.snapshots.forget();
         self.end_play();
+        self.drop_primed();
         *lock(&self.host) = None;
         let backend = lock(&self.render).backend.take();
         // A panic while dropping a broken backend must not take the caller with it.
@@ -1302,6 +1313,7 @@ impl GpuPreview {
         mut request: FrameRequest,
         run: impl FnOnce(Box<dyn FnOnce() + Send>),
     ) -> oneshot::Receiver<Answer> {
+        let _ = self.me.set(Arc::downgrade(self));
         // Frames of a play session are not a drag: they are shown with the refresh, and do not
         // teach the pace what a click after them is.
         if request.play.is_none() {
@@ -1338,10 +1350,12 @@ impl GpuPreview {
             return self.play(&inputs, key, request.t, request.overlays);
         }
         self.end_play();
+        // A primed play was made for the playhead of an earlier paused frame; this is another.
+        self.drop_primed();
         if let Some(wait) = inputs.proxy_wait(request.t)? {
             return Err(wait);
         }
-        self.frame(
+        let result = self.frame(
             &inputs,
             Want {
                 t: request.t,
@@ -1349,7 +1363,12 @@ impl GpuPreview {
                 scrubbing: request.scrubbing,
             },
             request.ffmpeg_width,
-        )
+        )?;
+        // The playhead rests on a frame the GPU drew: the cut from here is made ready for Play.
+        if result.renderer == "gpu" && !request.overlays {
+            self.prime_soon(&inputs, request.t);
+        }
+        Ok(result)
     }
 
     /// The inputs frames are planned from: the held snapshot while it is fresh, else taken from the
@@ -1525,6 +1544,7 @@ impl GpuPreview {
         };
         *lock(&self.host) = None;
         self.end_play();
+        self.drop_primed();
         let _ = catch_unwind(AssertUnwindSafe(move || drop(backend)));
         self.clear_marker();
         let mut info = lock(&self.info);
