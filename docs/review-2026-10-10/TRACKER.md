@@ -16,10 +16,10 @@
 | UI-7 Panels polish | ui-7 (on ui-8) | | pushed (awaits ui-8 merge for PR) | panels/shell medium + polish; shell H6 | wave 3 |
 | UI-8 Export dialog logic | ui-8 (on ui-6, pushed) | | ready (PR after UI-6) | dialogs 3 | wave 3 |
 | PERF-4 Still cache and prefetch | perf-4 (on perf-3 + gpu-3) | | r1 fixes (no blockers) | gpu-media WP6, WP9; gpu-compositor Hint::Prefetch | dev done: 20-step 60 Hz scrub drag 990–1419 → 317 ms (1 layer, 9.0.2), 1872–2386 → 317–396 ms (3 layers); marginal window frame ~0.05–9 ms vs 50–119 ms per spawn; cut stall 145–183 ms → 0.22 ms with Hint::Prefetch; golden unchanged |
-| GPU-2 Text on the GPU | gpu-2 (on gpu-3, pushed) | | ready (PR after #129) | gpu-compositor | dev done: T1 captioned 12.7%→96.0% GPU frames, T1b 13.3%→100%, T2 69.5%→78.8%, T3 65.6%→83.3%; 76 text parity cases pass on 6.1.1 + 9.0.2; also fixes drawtext escaping of ' : \ (pre-existing export bug) |
+| GPU-2 Text on the GPU | gpu-2 | #138 | review (CI) | gpu-compositor | dev done: T1 captioned 12.7%→96.0% GPU frames, T1b 13.3%→100%, T2 69.5%→78.8%, T3 65.6%→83.3%; 76 text parity cases pass on 6.1.1 + 9.0.2; also fixes drawtext escaping of ' : \ (pre-existing export bug) |
 | GPU-4 Motion fades/transitions | gpu-4 (on gpu-2) | | r1 fixes (4 blockers: unrefused dip-to-white on letterbox / odd size / RGB source; fades on full-range under 9.0.2) | gpu-compositor WP-4 | dev done: still-plan GPU frames T1 96.0→100%, T2 78.8→100%, T3 83.3% (WP-6 refusals); Motion export frames 0→100% (T3 16.6%); motion parity plane-exact where unscaled, 1–2 levels where scaled, dip-to-white 2 levels; golden unchanged |
-| PERF-5 AMF/VAAPI export encode | perf-5 | | review r2 | gpu-media WP4, WP5, WP11 | wave 4 |
-| macOS presenter (WP-8) | macos-presenter | | review | gpu-compositor WP-8 | dev done: main-thread surface hop on macOS (step 1 could never work: raw-window-metal needs the main thread), plan + acceptance list in app.md; macOS default unchanged |
+| PERF-5 AMF/VAAPI export encode | perf-5 | | verify (r2: no blockers) | gpu-media WP4, WP5, WP11 | wave 4 |
+| macOS presenter (WP-8) | macos-presenter | | r1 fixes (no blockers) | gpu-compositor WP-8 | dev done: main-thread surface hop on macOS (step 1 could never work: raw-window-metal needs the main thread), plan + acceptance list in app.md; macOS default unchanged |
 | GPU-6 Keyed zoom, masks, blur | gpu-6 (on gpu-4) | | in-progress | gpu-compositor WP-6 | wave 4 |
 | GPU-5, GPU-7 | | | todo | | wave 4; GPU-5 overlaps PERF-4 (gpu_preview / frame_source), GPU-7 needs GPU-4/5 |
 | CI: retry + cache ffmpeg download | ci-fetch-retry | #131 | closed (landed via #130) | not a review finding | evermeet.cx throttles the macOS pinned-ffmpeg fetch (ffprobe 429 for 6.5+ min); retry + actions/cache ported into #129, #130, #132; cache fills only after one successful run |
@@ -131,6 +131,7 @@
 - UI-3: dialog focus return, `inert` timing and the focus rescue checked in Chromium only; confirm in WebView2, WebKitGTK and WKWebView.
 
 ## Needs a decision
+- PERF-5 (r2 nit, unfixed): the VAAPI device wait covers the whole hardware probe, so a slow NVENC wake on a hybrid laptop can make an agent's first VAAPI export fall back to the renderD128 stand-in; publishing the VAAPI result to its own cell would decouple it.
 - macOS presenter: make `window` the macOS default if the Mac test passes? Build step 2 (own NSView/CAMetalLayer) at all, or let the WP-2 canvas presenter cover macOS?
 - PERF-5: retry an export once in x264 when a hardware *encoder* fails (decode failures already retry)? Calibrate NVENC/QSV/VT the same way once measured? Make "Fast (GPU)" the default where an encoder is verified, after VMAF?
 - PERF-4: a Settings switch for the GPU lane (API exported, no UI); an `hw_decoders()` probe so Linux/macOS qualify for the lane; add `,format=yuv420p` to the one-shot still's `color` base so the still matches export on ffmpeg < 7 (6.1.1 differs by ~14 chroma levels on every cut; moves the still golden family); more threads for multi-layer windows.
