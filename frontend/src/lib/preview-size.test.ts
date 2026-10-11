@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { DEFAULT_FRAME_PX, FRAME_STEPS, MAX_FRAME_PX, RESIZE_SETTLE_MS, requestWidth } from './preview-size';
+import { DEFAULT_FRAME_PX, FRAME_STEPS, MAX_FRAME_PX, MIN_FRAME_PX, RESIZE_SETTLE_MS, capToSource, dprQuery, requestWidth } from './preview-size';
 
 describe('requestWidth', () => {
 	test('is css width × pixel ratio, rounded up to a step', () => {
@@ -50,5 +50,33 @@ describe('requestWidth', () => {
 		for (let i = 1; i < FRAME_STEPS.length; i++) expect(FRAME_STEPS[i]).toBeGreaterThan(FRAME_STEPS[i - 1]);
 		expect(RESIZE_SETTLE_MS).toBeGreaterThanOrEqual(100);
 		expect(RESIZE_SETTLE_MS).toBeLessThanOrEqual(400);
+	});
+});
+
+describe('capToSource', () => {
+	test('a frame is never asked wider than the source the preview reads', () => {
+		expect(capToSource(1920, 1280)).toBe(1280); // the default proxy
+		expect(capToSource(1440, 1280)).toBe(1280);
+		expect(capToSource(960, 1280)).toBe(960);
+		expect(capToSource(1920, 720)).toBe(720);
+	});
+
+	test('a source that is not known, or has no width, bounds nothing', () => {
+		expect(capToSource(1920, null)).toBe(1920);
+		expect(capToSource(1920, 0)).toBe(1920);
+		expect(capToSource(1920, NaN)).toBe(1920);
+	});
+
+	test('and a sliver of a source is not asked at a sliver', () => {
+		expect(capToSource(960, 10)).toBe(MIN_FRAME_PX);
+	});
+});
+
+describe('dprQuery', () => {
+	test('names the ratio, so the query stops matching when the ratio moves', () => {
+		expect(dprQuery(1)).toBe('(resolution: 1dppx)');
+		expect(dprQuery(1.25)).toBe('(resolution: 1.25dppx)');
+		expect(dprQuery(NaN)).toBe('(resolution: 1dppx)');
+		expect(dprQuery(0)).toBe('(resolution: 1dppx)');
 	});
 });

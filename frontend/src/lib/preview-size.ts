@@ -26,3 +26,16 @@ export function requestWidth(cssWidth: number, dpr: number): number {
 	const wanted = Math.ceil(cssWidth * ratio - 1e-6);
 	return FRAME_STEPS.find((s) => s >= wanted) ?? MAX_FRAME_PX;
 }
+
+/** The least a frame is asked at, px: a source this narrow is not a picture worth bounding to. */
+export const MIN_FRAME_PX = 64;
+
+/** `width` held to the widest source the preview reads (`previewSourceWidth`), when that is known. */
+export function capToSource(width: number, sourceWidth: number | null): number {
+	if (sourceWidth === null || !(sourceWidth > 0)) return width;
+	return Math.max(MIN_FRAME_PX, Math.min(width, Math.round(sourceWidth)));
+}
+
+/** The media query that stops matching when the pixel ratio changes (a window dragged to another
+ *  monitor fires neither a resize observer nor `resize`, but this one does). */
+export const dprQuery = (dpr: number): string => `(resolution: ${Number.isFinite(dpr) && dpr > 0 ? dpr : 1}dppx)`;

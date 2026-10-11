@@ -15,7 +15,7 @@
 	import { saveCoverFrame } from '$lib/file-actions';
 	import { gpuPreview } from '$lib/gpu-preview.svelte';
 	import { mediaStatus } from '$lib/media-status.svelte';
-	import { isProxyWaitMessage, previewSourceNote } from '$lib/proxy-info';
+	import { isProxyWaitMessage, previewSourceNote, previewSourceWidth } from '$lib/proxy-info';
 	import {
 		anyCovered,
 		boundsReport,
@@ -31,7 +31,7 @@
 	import { createFramePump } from '$lib/frame-pump.svelte';
 	import { singleFlight } from '$lib/single-flight';
 	import { measuredWidth, transportParts } from '$lib/transport-bar';
-	import { RESIZE_SETTLE_MS, requestWidth } from '$lib/preview-size';
+	import { RESIZE_SETTLE_MS, capToSource, dprQuery, requestWidth } from '$lib/preview-size';
 	import type { PreviewBoundsReport } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
 	import { createFrameGate, PLAYBACK_FPS } from '$lib/playback-sync';
@@ -335,31 +335,59 @@
 
 	// How wide a frame to ask for: the picture's box as it is drawn (CSS px, at this window's pixel
 	// ratio — a detached window may be on another screen), in the steps of `preview-size.ts`. Null
-	// until the box has been measured, so the pump asks nothing at a guess. A change settles first
-	// (`RESIZE_SETTLE_MS`): dragging a panel edge is a stream of sizes, and each width asked for is an
-	// FFmpeg composite.
-	let frameWidth = $state<number | null>(null);
+	// until the box has been measured, so the pump asks nothing at a guess; a box with no width (the
+	// panel is in a hidden tab) is not a measurement, and keeps the last one or waits. A change settles
+	// first (`RESIZE_SETTLE_MS`): dragging a panel edge is a stream of sizes, and each width asked for
+	// is an FFmpeg composite. A window moved to a monitor of another pixel ratio fires neither the
+	// observer nor `resize`, so the ratio is watched through its own media query.
+	let boxWidth = $state<number | null>(null);
 	$effect(() => {
 		const el = frameEl;
 		if (!el) return;
 		void windows.version;
 		const win = windowOf(el);
-		const read = () => requestWidth(el.clientWidth, win.devicePixelRatio);
-		frameWidth = read();
+		const measure = () => {
+			if (el.clientWidth > 0) boxWidth = requestWidth(el.clientWidth, win.devicePixelRatio);
+		};
+		measure();
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const settle = () => {
 			clearTimeout(timer);
-			timer = setTimeout(() => (frameWidth = read()), RESIZE_SETTLE_MS);
+			timer = setTimeout(measure, RESIZE_SETTLE_MS);
 		};
 		const observer = resizeObserverFor(el, settle);
 		observer.observe(el);
 		win.addEventListener('resize', settle);
+		let ratio: MediaQueryList | null = null;
+		const onRatio = () => {
+			settle();
+			watchRatio();
+		};
+		const watchRatio = () => {
+			ratio?.removeEventListener('change', onRatio);
+			ratio = win.matchMedia(dprQuery(win.devicePixelRatio));
+			ratio.addEventListener('change', onRatio);
+		};
+		watchRatio();
 		return () => {
 			clearTimeout(timer);
 			observer.disconnect();
 			win.removeEventListener('resize', settle);
+			ratio?.removeEventListener('change', onRatio);
 		};
 	});
+	// What is asked is the box's width, held to the widest source the preview actually reads: the default
+	// proxy is 1280 px wide, and a 1440 or 1920 px frame composited from it is the same picture upscaled, at
+	// several times the decode cost on every scrub frame. With a delivery frame set the canvas is not the
+	// source's shape (a 16:9 proxy under a 9:16 canvas is cropped and scaled by the fit), so the source's
+	// width says nothing about the canvas's and the box's is asked as it is — the backend never goes past
+	// the frame's own width.
+	const sourceWidth = $derived(
+		editor.timeline.format
+			? null
+			: previewSourceWidth(editor.timeline, editor.assets, mediaStatus.proxies, settings.previewSource, settings.proxySize, ui.time)
+	);
+	const frameWidth = $derived(boxWidth === null ? null : capToSource(boxWidth, sourceWidth));
 	/** Bumped when the backend has taken a new place for the surface: the frame is drawn again. */
 	let boundsEpoch = $state(0);
 	let wantedBounds: PreviewBoundsReport | null = null;
@@ -820,7 +848,7 @@
 					style="position:absolute;left:12px;right:12px;top:10px;display:flex;align-items:flex-start;justify-content:space-between;gap:8px;pointer-events:none"
 				>
 					<div style="display:flex;flex-wrap:wrap;gap:6px;min-width:0;max-width:62%">
-						<span data-hud="name" class="hud" title={previewAsset?.name}>{previewAsset?.name ?? 'preview'}</span>
+						<span data-hud="name" class="hud" style="pointer-events:auto" title={previewAsset?.name}>{previewAsset?.name ?? 'preview'}</span>
 						{#if playbackWaiting}<span class="hud" style="pointer-events:auto" title={playbackWaiting} data-testid="playback-waiting"
 								><i class="dot" style="background:var(--orange-500)"></i>playback waits for the proxy</span
 							>{/if}

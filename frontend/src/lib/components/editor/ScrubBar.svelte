@@ -21,10 +21,12 @@
 	const range = $derived(scrubRange(ui.markIn, ui.markOut, duration));
 
 	function onDown(e: PointerEvent) {
-		if (e.button !== 0 || empty) return;
-		// No text selection, and no focus: a bar left focused after a click would own the arrow keys and
-		// Space (the page leaves a slider's keys to it), and the transport shortcuts would go quiet.
+		if (e.button !== 0) return;
+		// No text selection, and no focus — on an empty cut too, where a click still focuses a
+		// tabindex=-1 element: a bar left focused after a click would own the arrow keys and Space (the
+		// page leaves a slider's keys to it), and the transport shortcuts would go quiet.
 		e.preventDefault();
+		if (empty) return;
 		const el = e.currentTarget as HTMLElement;
 		const win = windowOf(el);
 		const from = ui.time;
@@ -38,7 +40,14 @@
 		});
 		const done = () => {
 			held = false;
-			if (resume) ui.play(rate);
+			// An engine that focuses on a canceled pointerdown anyway: only a keyboard focus stays.
+			try {
+				if (!el.matches(':focus-visible')) el.blur();
+			} catch {
+				el.blur();
+			}
+			// Letting go at the very end must not start playback over again: play() restarts a cut that has played out.
+			if (resume && ui.time < editor.duration) ui.play(rate);
 		};
 		held = true;
 		ui.seek(timeAt(e));
@@ -61,6 +70,11 @@
 	 *  second — the steps the page's own frame keys take —, Home / End go to the ends, and Space still plays. */
 	function onKey(e: KeyboardEvent) {
 		if (empty || e.ctrlKey || e.metaKey || e.altKey) return;
+		// One press, one action, as the page's own play key (`allowsRepeat`).
+		if (e.repeat && e.key === ' ') {
+			e.preventDefault();
+			return;
+		}
 		const step = e.shiftKey ? 1 : 1 / editor.fps;
 		switch (e.key) {
 			case 'ArrowLeft':

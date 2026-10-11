@@ -18,7 +18,8 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   the opaque color tokens (grouped for the editor), three presets (Kerf Dark —
   bun-tested to equal the stylesheet's defaults — Kerf Light, High contrast),
   `parseTheme` (a stored or imported JSON; unknown tokens dropped, missing ones
-  filled from the scheme's preset) and `applyTheme`, which writes the tokens as
+  filled from the preset the colors it does carry are exactly — a High contrast saved before a token existed stays
+  High contrast — else the scheme's) and `applyTheme`, which writes the tokens as
   inline properties on `<html>` (beating the stylesheet), toggles the `dark`
   class and `color-scheme`. Every translucent token in `kerf-tokens.css`
   (borders, fills, glows, the scrim) is a `color-mix` of an opaque base so a
@@ -640,9 +641,14 @@ engine. Below the queue, the **History** section renders
 pane — the 720 px cap it had left it 62 % of the pane at 1920×1080 and a postage stamp at 2560×1440. What is asked of the
 backend follows the box: `preview-size.ts` `requestWidth(css width, dpr)` rounds `ceil(css × dpr)` up to 480 / 960 /
 1440 / 1920 (the top is the MCP frame tools' own cap; the backend takes any width and never scales a picture past its
-own, so the bound is only on cost), measured from the frame element by a `ResizeObserver` and the window's resize,
-**settled 200 ms** so a dragged panel edge is a few requests, not one per pixel (`data-request-width` on the frame
-says what it asked). The pump (`frame-pump.svelte.ts`) takes it as `width()`, reads it in `run()` — a different
+own, so the bound is only on cost), measured from the frame element by a `ResizeObserver`, the window's resize and a
+`(resolution: Xdppx)` media query (a window dragged to another monitor fires neither of the first two),
+**settled 200 ms** so a dragged panel edge is a few requests, not one per pixel; a box with no width (a hidden dock
+tab) is not a measurement — the last one stands, or nothing is asked. The width is then **held to the widest source the
+preview reads at the playhead** (`proxy-info.ts` `previewSourceWidth`: a ready proxy's width when the preview decodes it,
+else the original's; `capToSource`), since the default proxy is 1280 px wide and a 1440 / 1920 px composite of it is the
+same picture upscaled at several times the decode cost on every scrub frame — not under a delivery frame, whose canvas is
+not the source's shape (`data-request-width` on the frame says what it asked). The pump (`frame-pump.svelte.ts`) takes it as `width()`, reads it in `run()` — a different
 step is a new frame — and asks nothing until the box has been measured, so a first frame is not decoded at a guess
 and again at the real size. (Playback's streamed frames keep the backend's fixed stream width.) The picture is clipped to the
 frame's radius and the frame's border is `border-strong`, since a black matte is 1.05:1 on the pane. **The HUD** over the
@@ -655,7 +661,8 @@ the in / out range behind the fill and a thumb that grows while held. A press mo
 *live* (`scrub.ts`: `scrubTime`, and `frameLimited` — at most one `ui.seek` per animation frame, with the newest position, since
 each seek is an FFmpeg composite); it is `beginDrag` (pointer capture, so the pointer may leave the bar; Escape /
 pointercancel / lost capture / blur put the playhead back where the press found it), playback is paused while the bar is held
-and resumes at either end of the gesture (a seek mid-play restarts the audio each time). It is a `role=slider` with the cut's
+and resumes at either end of the gesture — except when it was let go at the very end of the cut, where `play()` would start
+the cut over (a seek mid-play restarts the audio each time). It is a `role=slider` with the cut's
 timecode as its value text; a press does not focus it (a focused slider owns Space and the arrows — the page stands down for
 the keys a slider operates — so one left focused after a click would silence the transport shortcuts), and once Tab has
 put focus there its own keys are ← → a frame, ⇧← ⇧→ a second, Home / End the ends, Space play.
