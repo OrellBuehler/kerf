@@ -7717,6 +7717,10 @@ use still_fx::{still_layers, StillFades};
 #[cfg(test)]
 mod lane_tests;
 
+/// The deadline on a one-shot still's process.
+#[cfg(all(test, unix))]
+mod output_bounded_tests;
+
 /// A bounded cache of composited stills, keyed by the argv that would draw each.
 mod still_cache;
 
