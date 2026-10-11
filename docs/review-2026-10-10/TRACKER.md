@@ -19,7 +19,8 @@
 | GPU-2 Text on the GPU | gpu-2 (on gpu-3, pushed) | | ready (PR after #129) | gpu-compositor | dev done: T1 captioned 12.7%→96.0% GPU frames, T1b 13.3%→100%, T2 69.5%→78.8%, T3 65.6%→83.3%; 76 text parity cases pass on 6.1.1 + 9.0.2; also fixes drawtext escaping of ' : \ (pre-existing export bug) |
 | GPU-4 Motion fades/transitions | gpu-4 (on gpu-2) | | r1 fixes (4 blockers: unrefused dip-to-white on letterbox / odd size / RGB source; fades on full-range under 9.0.2) | gpu-compositor WP-4 | dev done: still-plan GPU frames T1 96.0→100%, T2 78.8→100%, T3 83.3% (WP-6 refusals); Motion export frames 0→100% (T3 16.6%); motion parity plane-exact where unscaled, 1–2 levels where scaled, dip-to-white 2 levels; golden unchanged |
 | PERF-5 AMF/VAAPI export encode | perf-5 | | r1 fixes (no blockers; golden verified: only the 282 AMF export digests moved) | gpu-media WP4, WP5, WP11 | wave 4 |
-| GPU-5 … GPU-7, macOS presenter | | | todo | | wave 4 |
+| macOS presenter (WP-8) | macos-presenter | | review | gpu-compositor WP-8 | dev done: main-thread surface hop on macOS (step 1 could never work: raw-window-metal needs the main thread), plan + acceptance list in app.md; macOS default unchanged |
+| GPU-5 … GPU-7 | | | todo | | wave 4 |
 | CI: retry + cache ffmpeg download | ci-fetch-retry | #131 | closed (landed via #130) | not a review finding | evermeet.cx throttles the macOS pinned-ffmpeg fetch (ffprobe 429 for 6.5+ min); retry + actions/cache ported into #129, #130, #132; cache fills only after one successful run |
 
 ## Decisions
@@ -82,7 +83,10 @@
 
 - #134 (PERF-3) macOS CI: `a_frame_reports_how_far_behind_its_slot_it_arrived` assumed the scheduler wakes within 50 ms (20 ms slots); the macOS runner overslept ~130 ms so a frame was really late. Fixed by pacing the not-late case at 4 fps and widening the late frame's upper bound (4565713).
 
+- macOS presenter: macOS stays "no technique" by default (a Metal sublayer over the page would hide a clickable UI with no in-app way off); the main-thread hop lives in kerf-app (`Gpu::new` + `create_surface`), chosen at runtime by OS so it is tested on Linux; the review's "needs macos-private-api" premise is wrong (it gates only `transparent`).
+
 ## Needs a real machine
+- macOS presenter: `KERF_GPU_SURFACE=window` on a Mac — is the CAMetalLayer sublayer over or under the WKWebView (source predicts over, covering a clickable UI) and is it left behind after off / device loss (source predicts yes); if so, step 2 = app-owned CAMetalLayer in an NSView below the webview; Metal start-up vs BUILD_DEADLINE, present/composite ms, nextDrawable timeouts, sRGB layer colour vs JPEG; parity suite on Metal; display-scale moves, zoom, full screen, minimized.
 - PERF-5: proxies no longer hardware-encode on NVENC / QSV / VideoToolbox either (WP5 was measured on AMD RX 7900 XT only): confirm proxy CPU cost on NVIDIA and Apple Silicon with long 4K footage.
 - PERF-5: VMAF on real footage for AMF H.264/HEVC/AV1 at the new QPs (+6, AV1 ×4) vs x264, and `-quality quality` timing — only then change any default; `av1_amf` on RX 7000+; Linux radeonsi/iHD VAAPI probe + `-vaapi_device`/`hwupload` encode (with `-hwaccel auto` decode), CQP acceptance, `av1_vaapi`; distro FFmpeg without VAAPI, AppImage/Flatpak `/dev/dri`, missing libva; NVENC/QSV/VideoToolbox QP calibration.
 - PERF-4: the GPU lane (`Resource::Gpu`, MAX_GPU_JOBS=2) and its software fall-back on a real Windows/AMD driver; the GPU-preview prefetch driver against a real surface (cut-stall numbers are debug-build lavapipe).
@@ -124,6 +128,7 @@
 - UI-3: dialog focus return, `inert` timing and the focus rescue checked in Chromium only; confirm in WebView2, WebKitGTK and WKWebView.
 
 ## Needs a decision
+- macOS presenter: make `window` the macOS default if the Mac test passes? Build step 2 (own NSView/CAMetalLayer) at all, or let the WP-2 canvas presenter cover macOS?
 - PERF-5: retry an export once in x264 when a hardware *encoder* fails (decode failures already retry)? Calibrate NVENC/QSV/VT the same way once measured? Make "Fast (GPU)" the default where an encoder is verified, after VMAF?
 - PERF-4: a Settings switch for the GPU lane (API exported, no UI); an `hw_decoders()` probe so Linux/macOS qualify for the lane; add `,format=yuv420p` to the one-shot still's `color` base so the still matches export on ffmpeg < 7 (6.1.1 differs by ~14 chroma levels on every cut; moves the still golden family); more threads for multi-layer windows.
 - GPU-4: keep `Compositor::CAPS.dip_white` on (drawn within 2 levels: x86 yuv→rgb24 kernel vs C tables) or off to hold "match exactly" strictly? Draw black fades on translucent layers exactly (fade inside the RGB stage, alpha included) or keep refusing? `MotionFrames` decodes clips sequentially, no prefetch (WP-7 needs parallel cursors).
