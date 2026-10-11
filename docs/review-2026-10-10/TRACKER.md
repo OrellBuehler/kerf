@@ -30,6 +30,7 @@
 - UI-6 is stacked on ui-2 and PERF-3 on ui-4 while those PRs wait on CI. Each merges main once its base lands.
 - UI-6: the themed tooltip is not hoverable (`pointer-events:none`), so it can't swallow a click on the next toolbar row. Escape is consumed only when keyboard focus raised the tip. `confirmAction` requires named buttons. The Update dialog stays busy while downloading: on Windows the updater exits the process when the download ends, which would lose unsaved work, so Hide was reverted. Failure copy is one line, `X failed — Reason`. Toast glyphs use the -400 hues for contrast.
 - Wave 3 starts before wave 2 merges: the merges are blocked only by the external CI outage. UI-5 is stacked on ui-4 (Timeline) and UI-8 on ui-6 (ExportDialog), the branches they overlap most. PERF-4 and GPU-2 wait for GPU-3 and PERF-3 (still path, stream).
+- PERF-3: playback frames travel as raw bytes, but the page decodes them through one persistent `<img>` from a data URL built in JS. The ImageBitmap/canvas path is off by default: it measured slower in Chromium (the Windows WebView) and is unmeasured in WebKit.
 - CI: wrote the small ffmpeg-download retry myself (#131) instead of starting a dev agent: it is CI plumbing, not feature code, and two PRs were blocked on it.
 - Commits are authored as the repo owner (the container's default git identity names the assistant, which the commit rules forbid).
 - The tracker and `after/` artifacts are force-added (docs/ is git-ignored) and pushed to `docs/review-2026-10-10` so they survive the container. That commit skips the hooks, since whitespace fixers would corrupt the prototype .patch files and typos flags hash fragments in them. Earlier note: the tracker and the `after/` screenshots live on the `docs/review-2026-10-10` branch, since work-package branches start from main, which does not carry this folder.
@@ -86,7 +87,6 @@
 
 ## Needs a decision
 
-- PERF-3: the picture trails the sound by the stream's first-frame latency (~110–200 ms). Starting the stream ahead risks leading the audio; left as is.
 
 - UI-6: make the tooltip hoverable (WCAG 1.4.13)? It's a one-line change.
 - UI-6: show "Step n of m" on multi-stage progress?
