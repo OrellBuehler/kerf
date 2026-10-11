@@ -197,7 +197,20 @@ remounts it on every tab switch, unfold and workspace switch, and each remount
 used to decode every asset again; it keeps answers, including "no frame", but not
 a failed decode, which is retried on the next mount), Titles (`TitlesControls`), Effects (color looks +
 video effects), Transitions (the grouped picker), Audio (audio effects + the
-voiceover entry point), Transcript (`TranscriptPanel`). Effects, Transitions and
+voiceover entry point), Transcript (`TranscriptPanel`). **The Media tab's header is the one place for the count and the
+ways in**: `MEDIA · 3` with the voiceover and import buttons (`importMedia`, `import-media.ts`; the import tooltip carries
+`file.import`'s key from the keymap) — the bin used to stack the dock tab, `MEDIA` and `3 ASSETS`. **A bin row is
+compact**: name and duration on one line, the spec in 11 px under it, then the proxy badge, one **analysis pill**
+(`3 of 5 analyzed`, the kinds one per line in its tooltip: `analysisMeter`, `analysis-steps.ts`) and the `×2` (its tooltip
+says "Used in 2 clips"). A kind the file cannot give — scenes of a song, speech of silent footage, anything of a still — is not
+drawn (`applicable` / `chipsFor`) unless it ran, is running or failed; the Inspector's header keeps the five tags, minus those.
+The row is a `role=button` with `aria-pressed`, takes Enter *and* Space, and its facts moved to the Inspector (below), so the
+right-click menu is the actions. The **tile grid** of the Effects and Audio tabs is `minmax(96px, 1fr)` `Tile`s (one line, an ellipsis
+and the tooltip when a name is longer — "Compressor" ran into its border at 76 px); the **Titles** controls are a 2-column grid of
+equal `Btn sm` (`+ Title` / `+ Lower third` / `+ Caption` / `+ Text`; `Captions` or `Recaption` with a trash icon for Clear,
+`Import`, `Write a voiceover…`) under `ADD TEXT` and `CAPTIONS` overlines, the two caption looks being the only chips.
+`Reset` is a ghost `Btn` on the heading line of Color looks, never a chip among the looks. The Transcript marks the playhead's line with a
+2 px accent bar and lights a line under the pointer, and its empty states are `EmptyState`s with `ProgressBar`s. Effects, Transitions and
 Audio act on the selected clip and say why they are off when none is; they own no
 value (a look is a `Color`, an effect an entry in the clip's chain), so the
 Inspector stays where you tune — the presets are `effect-presets.ts`, shared with
@@ -273,10 +286,17 @@ content — `-webkit-app-region` marks it draggable and every control `no-drag`)
 custom window decorations, which would put the menus in the caption bar like VS Code,
 are a possible follow-up and not this change. `TitleBar` is three cells (so the
 workspace tabs stay on the centre line): the logo and the **menu bar** on the left;
-the workspaces in the middle; the project's name with its Saved / Unsaved badge, the
-settings gear, the notification bell and the version chip on the right (the chip still
-turns amber when an update is waiting, which is why it stayed out of Help; Help also
-has *Check for updates…*). The project's path moved to the status bar. **The menus**
+the workspaces in the middle; the project's name with its Saved / Unsaved badge, an
+**Export** button (a primary `Btn`, `file.export`'s key in its tooltip: the app's goal had no button outside the Deliver
+workspace; off, with the reason as its tooltip, while the cut has no clips — `exportButtonState`, and `aria-disabled` rather than `disabled` so it stays focusable and the keyboard reaches the reason; File › Export… is greyed with the same reason and Ctrl+E answers it in a toast; while a render runs the button shows `42%` with a spinner, reopens the dialog and is on), the settings gear, the
+notification bell and the version chip on the right. A pending agent proposal adds a cyan **Review 4 changes** chip
+left of Export (`proposalIndicator`, `agent-status.ts`; it is its icon and count in a right cell narrower than 560 px — `reviewChipText`, 1366×768 has 513 — so the project's name keeps its room) that raises the Agent panel, and a count on the Agent dock tab
+(`Workspace.svelte` sets `data-pending` on the tab's label, `dockview-kerf.css` draws it; the tab's `aria-label` becomes `Agent, 4 changes to review`: `agentTabLabel`) — in
+Audio and Deliver the agent is only a tab, and a proposal there was invisible. The bell's badge sits off the corner with a
+ring in the bar's colour, and a red one carries a warning triangle before the count so it is not colour alone (a mono `!` read as a `1`). The version chip
+still turns amber when an update is waiting, which is why it stayed out of Help; Help also
+has *Check for updates…*. The OS window's title is `• interview.kerf — Kerf` (`window-title.ts`; the dot leads while there is
+unsaved work), set through `setWindowTitle` and the `core:window:allow-set-title` capability. The project's path moved to the status bar. **The menus**
 (`MenuBar.svelte` over the pure, bun-tested `menus.ts`): *File* (New, Open…, Save…,
 Import media…, Import captions…, Export…, Save cover frame…, Settings, Quit — Save is
 "as…" once the project has a file, since a saved project is its own SQLite file and
@@ -402,9 +422,9 @@ the shape alone does not suggest — a lower track shows through, so a blurred f
 is a duplicated, blurred copy above, masked), a **360 reframe**
 section (yaw / pitch / roll / FOV, auto-keyframing
 at the playhead like Transform — note its `lerpAngle` takes the shortest arc, which
-plain `lerp` would read as a 340° swing across the seam; for a source Kerf did not
-detect as 360 it instead offers a projection picker that marks the whole asset via
-`set_asset_projection`), and an always-visible
+plain `lerp` would read as a 340° swing across the seam; a source Kerf did not
+detect as 360 has no such section — its projection picker, which marks the whole asset via
+`set_asset_projection`, is the collapsed **Advanced** section, below), and an always-visible
 **Text overlays** section (add titles / lower-thirds, caption the whole cut in
 a **Lines / Word punch** style chosen by two chips above the button — the
 selection is deliberately *not* derived from the overlays already there, since
@@ -414,6 +434,23 @@ the button relabels to `Recaption` once there are generated captions, since a
 later trim moves the words out from under them, with `Clear` beside it taking
 only the generated ones (imported ones included) — and edit text / timing / position / size / color /
 box / bold).
+**The Inspector's finish.** Every field is one height (`--control-sm`, 28 px): numbers in mono and right-aligned, words in the sans
+(a title's text was typed in the number face), and a field of seconds says so with an `s` in the keyframe slot beside it. A section
+header is 32 px (it was 49) with a flex summary that ends in an ellipsis beside the title, and its summary says what it holds: Timing
+`Start 0:00.0 · Dur 0:12.5`, Color `None` for an ungraded clip (it read `Custom`), the look it matches, `Custom`, or `Animated · 2 keys`
+(`inspector-summary.ts`). Positions read `m:ss.d` everywhere in the panels (`clock.ts`: the Inspector, the titles list, the status bar's
+`Cut 0:20.5`; the transport keeps frame timecode and a bin row its `m:ss` duration — three formats with three jobs, where the Inspector alone used to mix five). A ◇ is amber and outlined when the
+number is keyed somewhere, filled when a key sits at the playhead, and its tooltip names the row (`warmth`, not `temperature`). Crop is
+`Left / Right / Top / Bottom`, the mask `Center X / Y`, the title's `Position X / Y`, the section `Transition` with an `Into clip` select.
+**Footage Kerf did not detect as 360 has no 360 section**: the override (a source select and `This is 360 footage`) is a collapsed
+`Advanced` section at the end of a picture clip's list, summarised `Not 360`; detected or reframed footage keeps its `360 reframe`
+section. A title's Color and Box are a **swatch (native colour input) plus the free-text field** (`title-color.ts`: the engine's own
+spelling — a name, `#rrggbb[aa]`, `@alpha` — read for the swatch, and a pick written back keeping the alpha; a box with none starts at
+`@0.55`). Reverse, Bold and Invert are `CheckRow`s, box first. The destructive pair is one row of two small buttons (`Remove clip`,
+`Ripple delete`; Remove is red ink on the neutral edge — `data-quiet` on a destructive `Btn` — not an outline in alarm colour). **With no clip or title selected, a library asset selected in the bin is the Inspector's subject**
+(`AssetInspector`, `asset-facts.ts`): name and kind, the proxy and analysis chips and Analyze, Add at playhead / Append, and
+Media / Analysis / Proxy sections with what the bin's right-click menu used to list as twenty rows (it was 960 px tall; it is the
+actions now, with Analyze as one entry that opens its own menu).
 **Polish presets** (`src/lib/style-presets.ts`, pure data over the existing
 surfaces): the Color section leads with one-click **looks** —
 Punchy / Warm / Cool / Faded / B&W chips (the active one highlights; the sliders
@@ -442,7 +479,10 @@ paints over any fill, because inline styles never set `box-shadow`), except the 
 rows and dockview's own controls (its close X has a hover of its own; matched by class-token start, `[class^='dv-']` / `[class*=' dv-']`, not a substring), and a disabled one falls back to `opacity:.5` with a `default` cursor (not
 `not-allowed`: a red circle on a greyed Undo reads as an error) — a control that must stay legible when off
 sets `opacity:1` itself (the context menu's rows, the transcript's cut lines, which used to be dimmed twice).
-Dock tabs hover and press in `dockview-kerf.css`. **One keyboard focus indicator**: `--focus-outline`
+Dock tabs hover and press in `dockview-kerf.css`; a tab strip is 30 px, a tab's close X shows on hover or keyboard focus (`:focus-visible`) rather than on
+the active tab all the time — dimmed to nothing, not hidden, so it stays in the accessibility tree, and without a pointer until it shows (Preview, Timeline and Library were one mis-click from gone; right-click on a tab still offers Close), and
+a sash lights at 65 % amber after 0.1 s over its 8 px grip. A workspace tab's amber marker is a bar inset from the pill's corners, not an inset
+shadow that curled up its sides. **One keyboard focus indicator**: `--focus-outline`
 (2 px `kerf-400`, offset `--focus-offset`) from a zero-specificity `:where(button, summary, input, select,
 textarea, a[href], [role=button], [role=tab])` rule in `layout.css`, inset in dense strips (the menu bar, the library rail, which clips an outset ring, dock
 tabs — dockview's own was a 1 px outline in the divider colour, invisible), and a bordered wrapper around a bare
@@ -715,12 +755,17 @@ click seeks, the playhead line highlights, and `×` cuts the sentence from the t
 of the five reasons applies (nothing selected / no backend / model not downloaded /
 not analyzed / no speech) and offers the matching action — a model picker + download,
 or Analyze — instead of a dead end. The **agent panel is a real MCP task
-queue** (status · queue · history · add-task) — Kerf has no in-app chat; a connected
+queue** (one status line · review card · queue · quick edits · history · composer) — Kerf has no in-app chat; a connected
 LLM claims tasks over MCP. The queue is `agent` state (`src/lib/agent.svelte.ts`, a third
 runes singleton) backed by the `tasks` table over Tauri/MCP: the add-task box and preset chips
 `agent.add(...)` real tasks, and `ready` tasks show Apply/Dismiss (`resolve_task`/`remove_task`).
-The panel orders **review card → queue (ready first) → quick edits → connect →
-history**, and since it shares a tab group with the Inspector by default,
+The panel is **one status line** (`agentLine`: `Agent connected` / `No agent connected` / `Last seen 4m ago` /
+`Agent working` / the endpoint's error — it had an `idle` badge over a "No agent connected" row, two statuses that could
+disagree) with a **Connect** button that opens the setup card *under it* (the code rows wrap), then **review card → queue
+(ready first) → quick edits → history**, and a one-row **composer** (32 px; its hint line shows only when the panel is at least
+520 px tall — `showComposerHint` — and is the field's description otherwise). The sections share the overline-and-rule heading; Quick
+edits folds from a chevron in it, and its one legend line says what the two icons mean (`play` runs now, `list-plus` is queued). A task's badge is
+`STATUS_MAP`: queued neutral with a clock, working and ready the agent's cyan, **applied green, failed red with an alert icon**. Since it shares a tab group with the Inspector by default,
 `+page.svelte` brings it forward once when a proposal lands (`editor.staged`
 going null → set) — a review nobody can see is not a review. Under **Quick
 edits**, five preset chips (`Remove silences` / `Assemble rough cut` / `Frame for the delivery`
@@ -741,7 +786,9 @@ the live cut, and `refreshTimeline` parks an incoming live update rather than
 yanking the view) — so the proposal can be *watched*, not only read, and the timeline marks what it
 changes (outlines on added / moved clips and titles, hatched ghosts for what it removes, Page Up / Page Down to step through the
 changes, a `place 2/3 · 5 changes` chip in the banner: frontend-timeline.md, *A proposal on the timeline is marked*). Apply lands it
-as one revision (confirming first when it went `stale`), Discard drops it. The queue card of the
+as one revision (confirming first when it went `stale`), Discard drops it. **The Apply / Preview / Discard row is pinned to
+the bottom of the scrolling panel** (`position: sticky` in a card clipped with `overflow: clip`, which does not make the card a
+scroll container) — at 1366×768 the change list is taller than the room and Apply was below the fold. The queue card of the
 task whose edits are staged has no buttons of its own (`readyCard`: one Apply, in the review card);
 any other ready task's Apply / Dismiss and the remove ✕ report a refusal as a toast (`agent-tasks.ts`). The
 headline arithmetic is `src/lib/diff.ts`, the bun-tested TS mirror of
@@ -751,6 +798,19 @@ engine. Below the queue, the **History** section renders
 `editor.history` (the `Revision[]` edit log, attributed to user/agent/system) with one-click
 `editor.revertTo(seq)`, and each row expands to *what* that revision changed
 (`revision_diff`).
+
+**The Preview with nothing on the timeline** is `PreviewEmpty` (it was a clapperboard and "No media loaded"): a card of three steps — *Import
+media*, *Cut it on the timeline*, *Export* — each marked done / current / to do from the project (`firstRunSteps`, `first-run.ts`: an
+asset in the library finishes the first, a clip the second), with the keymap's own key for import and export in the line, an
+*Import media…* (or *Open Library*) and an *Export…* button (off, with the reason in its tooltip, until a clip is on the timeline — as the title
+bar's is: `exportButtonState`, which stays on while a render runs, since the button reopens its dialog), and "Or connect an agent over MCP and let it assemble a first cut" with a button
+that raises the Agent panel, whose status line carries *Connect*. The card fills the pane, which is a size container, and gives way by its
+height rather than spilling over the transport: spacing tightens under 345 px of content (1366×768 has 326), the lines under each step go
+under 310 (1280×720 has 296), the agent row under 260 (960×640 has 247), and what still does not fit scrolls inside the card.
+
+**Z-order** (no tokens yet; the layers in use, low to high): the timeline's sticky and ghost layers 24–29, dockview's own overlay 45, dialogs 50
+(`Modal`, later siblings stack over earlier), the file-drop overlay 60, the notification log 70, the menu bar's panels 950, a context menu 1000,
+and the toaster (Sonner's own, very large) above them all. A new overlay takes the layer of what it is most like.
 
 **The Preview frame and its scrub bar.** The frame is the delivery shape at `min(100%, 100cqh × aspect)` of its
 pane — the 720 px cap it had left it 62 % of the pane at 1920×1080 and a postage stamp at 2560×1440. What is asked of the
@@ -838,13 +898,24 @@ re-rendered with the new selection's value*, so reading either writes the other 
 `noteTyped` / `endEdit` in the Inspector); a select or a checkbox changes at once and only needs the scope. A bun test holds every
 text and number input of the Inspector to this. Rest values are the model's
 `DEFAULT_TRANSFORM` / `DEFAULT_COLOR` / `DEFAULT_REFRAME` / `DEFAULT_MASK`. The Inspector's other rows (read-only values, plain number
-fields) share the label column and run to the panel's edge over the keyframe slot, which a source range needs at the 250 px minimum. The ◇ is a 24 px `IconBtn` with a `diamond` icon (filled while a key sits at the playhead).
+fields) share the label column and end where the sliders' numbers do, a field's unit (`s`) sitting in the keyframe slot. The ◇ is a 24 px `IconBtn` with a `diamond` icon (filled while a key sits at the playhead).
 A plain `<input type=range>` (Settings, the timeline zoom) gets an 18 px hit box and `min-width:0` from `layout.css`.
 **`ToolbarToggle`** is a button of the timeline toolbar: 24 px high and at least 24 px wide, one radius, and one "on" for every kind
 of button — the amber outline and wash (`kerf-400` border, `kerf-300` on `selection-fill`, a pair the contrast guard holds to 4.5:1)
 whether it is a tool, a mode (snapping is a pressed magnet, not a word that changes width), a view or a menu with something chosen.
 `pressed` is a toggle (announced as one), `on` lights without announcing, neither is an action; `bare` is no outline while idle (tools,
 zoom), `square` a picture-only button. Its states are `.k-tt` in `controls.css`, which the veil leaves alone.
+**One control scale for the panels**: `Btn sm` is `--control-sm` (28 px; it was 30) beside every field, chip and tile in a panel.
+**`Chip`** (`.k-chip`) is for what is *on or off* among choices — `pressed` is required, so a chip never reads as an action; an action is
+a `Btn`, and a ghost `Btn` is a quiet one (the hover wash is the veil's). The dialogs that still draw a chip by hand use `chip()`
+(`chip.ts`), which has the same height, weight and radius. **`Tile`** (`.k-tile`) is a preset in a grid: one line, an ellipsis, the
+tooltip. **`Hint`** is the box that says why a tab's controls are off, the same in Effects, Transitions and Audio. **`CheckRow`**
+(`.k-check`) is a checkbox with its words, box first, the whole row the target. **`EmptyState`** is a panel with nothing to show: one icon,
+one line, one reason, optionally a button (the Inspector, the notification log, the Transcript and the dock's watermark, which offers
+*Open Library* and *Reset workspace*). Three small classes in `controls.css`: `.k-select` (a native select drawn as a field, its
+chevron two gradients of the muted ink, so it follows the theme; use `background-color`, never the `background` shorthand, beside it),
+`.k-swatch` (a colour input as a field-high swatch) and `.k-overline`. `tip-guard.test.ts` lists `Chip`, `Tile` and `EmptyState` among the
+components whose `title` is theirs. Pills (`radius-full`) are for count badges and dots; chips, buttons and the shell's small controls are `--radius-sm`.
 
 **Tooltips are `use:tip`, not `title=`** (`tip.ts`; `tip-guard.test.ts` fails on a native `title` on any plain element, on a
 component that would pass one on to a plain element, and on one set from script — `Btn`, `IconBtn` and `ToolbarToggle` take a `title`
@@ -923,8 +994,8 @@ a fourth runes singleton). Components import `toast` from *there* rather than fr
 `svelte-sonner` — a drop-in wrapper, so no call site changed — because a toast is
 gone in four seconds, which is fine for "Clip copied" and useless for the model
 download that failed with a reason worth reading. The title bar's bell opens
-`NotificationCenter.svelte` (All / Unread / Problems, per-row read toggle, mark all
-read, clear) and badges the unread count, red when anything unread actually failed.
+`NotificationCenter.svelte` (All / Unread / Problems as `Chip`s, per-row read toggle, `Mark all read` and `Clear`
+as `Btn sm` — the panels' one 28 px scale, no longer 22 px pills) and badges the unread count, red when anything unread actually failed.
 Errors and warnings also linger longer on screen than sonner's default. **The log keeps a notice's
 `description`** (the reason under a failure — "permission denied (os error 13)") and shows it under the
 line; the panel takes focus when it opens and Escape gives it back to the bell. A failure toast leads with what was being done
@@ -1106,37 +1177,37 @@ cannot give: silent b-roll gets scenes only, a still nothing) — — Remove sil
 editor chrome derives from real state — `MediaBin` shows a dropzone until `editor.assets` is
 non-empty, `StatusBar` shows the selected asset's real fps/resolution/codec and timeline
 duration (plus the analysis step, what is still queued behind it and a **Stop**), and
-`Preview` shows the decoded frame or a "No media loaded" placeholder.
+`Preview` shows the decoded frame or, with nothing on the timeline, the first-run card (`PreviewEmpty`, below).
 Each **bin row is the asset's specs**, not just its name: a real decoded frame
 (`get_frame` 10% in, cached per asset across re-docks; the icon stays in the
-browser harness, which has no decoder), the spec line
-(`1920×1080 · 29.97 fps · h264 · stereo`), and badges for 360 / still / how many
-clips already use it, and **`MediaChips`** — the preview proxy's badge (`queued` / `proxy 42%` / `proxy` /
-`proxy failed`, tooltip carrying the reason; nothing for a still or audio file) and one chip per analysis
-kind (`SIL` `SCN` `LUFS` `BPM` `TXT`: done ✓ green, not run outlined, running spinning, failed `!` red,
-off dashed `–`; state is a mark and a border as well as a colour, the tooltip says why). The Inspector's
-clip header draws the same chips from the same store plus an **Analyze** button, and the timeline clip
+browser harness, which has no decoder), the name with its `m:ss` duration beside it, the spec line
+(`1920×1080 · 29.97 fps · h264 · stereo`), then one line of status — badges for 360 / still / how many
+clips already use it, and **`MediaChips`** in its `compact` form: the preview proxy's badge (`queued` / `proxy 42%` / `proxy` /
+`proxy failed`, tooltip carrying the reason; nothing for a still or audio file) and **one analysis pill** — `analyzed`,
+`3 of 5 analyzed`, `not analyzed`, `analyzing…`, `1 failed` or `analysis off`, its tooltip listing the five kinds with their states (`analysisMeter`; a
+kind the file cannot give is not counted: `applicable` / `chipsFor`). State is a mark and a tint as well as a colour. The Inspector's
+clip header draws the five tags (`SIL` `SCN` `LUFS` `BPM` `TXT`: done ✓ green, not run outlined, running spinning, failed `!` red,
+off dashed `–`; minus the kinds the file cannot give) from the same store plus an **Analyze** button, and the timeline clip
 menu lists how many are done and an `Analyze…` entry. The store is `media-status.svelte.ts`
 (`mediaStatus`): `proxy-progress` / `analysis-status` events note into it, and it is re-read when the set of
 assets changes and after a setting that moves what a status means. The **status bar** says which file
 the frame under the playhead is decoded from (`preview: proxy 1280 px`, `preview: original · proxy 42%`,
 `preview: waiting for proxy · 42%` under Proxy only, which also puts a badge in the Preview pane —
-`previewSourceNote`, judged from the statuses already held, nothing asked per frame). Its **context menu leads with the facts** — the
-frame, rate, codec, audio, projection, the stitched lens pair, the use count, the
-import date, then how much of the analysis has run, what it found (loudness, tempo, silence, shots,
-transcript) and the proxy's state — above the actions that need them: add at the
+`previewSourceNote`, judged from the statuses already held, nothing asked per frame). Its **context menu is the actions only** — the facts moved to the Inspector (`AssetInspector`, `asset-facts.ts`: the
+frame, rate, codec, audio, projection, the stitched lens pair, the use count, the import date, how much of the analysis has run
+and what it found, the proxy's state), which shows the selected asset when no clip or title is selected. The menu: add at the
 playhead / append, the audio action — labelled for what the backend will do (`extract_audio` or, for an asset not
 playing its own sound, `add_asset_audio`)
 (`media-info.ts` `audioExtraction`: `Detach audio from N clips` when clips of the asset still play
-their own sound, else `Add audio to A1`, with `again` when its sound is already on an audio
-track), remove silences (greyed out until silence has been detected), **Separate stems…** (assets with sound; see below), **Analyze** — one entry per kind
-("Detect silence", "Find scene changes", "Measure loudness", "Find the beat and tempo", "Transcribe
-speech", "Analyze everything"), each saying `done · run again` / `failed · retry`, disabled with the reason
-for a voiceover, a running pass, a file with no audio or no speech backend — and Stop analysis, **Rebuild /
-Build / Restart proxy** and **Delete / Cancel proxy** (`proxyActions`), mark the asset 360 or flat, copy the
-path, show in folder. The phrasing is `src/lib/media-info.ts`, pure and bun-tested, so the
-row and the menu cannot drift apart; `MenuItem` grew `header` / `info` rows for
-it, which the shared `ContextMenu` renders non-interactively.
+their own sound, else `Add audio to A1`, with `(a second copy)` when its sound is already on an audio
+track), remove silences (greyed out until silence has been detected), **Separate stems…** (assets with sound; see below), **Analyze…**
+(one entry that opens the Analyze menu where the pointer was: one item per kind — "Detect silence", "Find scene changes",
+"Measure loudness", "Find the beat and tempo", "Transcribe speech", "Analyze everything" — each saying `done · run again` /
+`failed · retry`, disabled with the reason for a voiceover, a running pass, a file with no audio or no speech backend — and
+Stop analysis), **Rebuild / Build / Restart proxy** and **Delete / Cancel proxy** (`proxyActions`), mark the asset 360 (a globe)
+or flat, copy the path, show in folder. The phrasing is `src/lib/media-info.ts` and `asset-facts.ts`, pure and bun-tested, so the
+row, the Inspector and the menu cannot drift apart; `MenuItem` has `header` / `info` rows (the timeline's menus use `info`), which the
+shared `ContextMenu` renders non-interactively.
 **Stem separation** (Demucs: drums / bass / other / vocals). One modal, `StemsDialog` (`ui.stemsDialog`,
 `ui.openStems(assetId, clipId?)`, inert-behind like the voiceover's), reached from the bin's **Separate
 stems…** (the stems join the library as `<name> · drums` …, the cut is untouched) and the clip menu's

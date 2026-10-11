@@ -15,10 +15,10 @@ const EDITOR = 'lib/components/editor/';
 /** Plain elements that may carry a native `title`, by file, and why. Nothing today. */
 const NATIVE_TITLE_ALLOWED: Record<string, string> = {};
 
-/** Components that take a `title` and route it to `use:tip` (or, for the last two, mean something
- *  else by it: a dialog's heading, a section's heading). A component not listed would spread it
- *  onto its <button> as a native tooltip. */
-const TITLE_PROPS = new Set(['Btn', 'IconBtn', 'ToolbarToggle', 'Modal', 'InspectorSection']);
+/** Components that take a `title` and route it to `use:tip` (or, for the last three, mean something
+ *  else by it: a dialog's heading, a section's heading, an empty state's line). A component not listed
+ *  would spread it onto its <button> as a native tooltip. */
+const TITLE_PROPS = new Set(['Btn', 'IconBtn', 'ToolbarToggle', 'Chip', 'Tile', 'Modal', 'InspectorSection', 'EmptyState']);
 
 interface Node {
 	type: string;

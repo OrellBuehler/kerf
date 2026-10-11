@@ -48,6 +48,15 @@ export function detectPlatform(nav: NavigatorLike | undefined = typeof navigator
 	return /mac|iphone|ipad|ipod/i.test(platformText(nav)) ? 'mac' : 'other';
 }
 
+/** A modifier named in running prose — a slider's tooltip saying how far a key nudges — the way the platform's own
+ *  keyboard names it: `Option` and `Command` on a Mac, `Alt` and `Ctrl` elsewhere. A shortcut itself is
+ *  `settings.shortcut(id)`; this is for the words around one. */
+export function modLabel(platform: Platform, which: 'primary' | 'alt' | 'shift'): string {
+	if (which === 'shift') return 'Shift';
+	if (which === 'alt') return platform === 'mac' ? 'Option' : 'Alt';
+	return platform === 'mac' ? 'Command' : 'Ctrl';
+}
+
 /** Whether this is Windows, or at least neither a Mac nor a Linux desktop: the one platform where the
  *  updater's installer takes the app down itself when the download is done. */
 export function isWindows(nav: NavigatorLike | undefined = typeof navigator === 'undefined' ? undefined : navigator): boolean {

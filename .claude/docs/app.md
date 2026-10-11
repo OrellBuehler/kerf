@@ -184,7 +184,8 @@ bumps, which is how an rmcp upgrade broke `cargo test -p kerf-app` on Windows.
 `capabilities/default.json` grants `core:default` + `dialog:default` +
 `updater:default` + `process:allow-restart` + `core:window:allow-destroy` (the
 unsaved-project close guard holds the window open, then destroys it once the user
-confirms) + `opener:allow-open-url`. That last
+confirms) + `core:window:allow-set-title` (the OS title follows the project's name and
+whether it has unsaved work: `window-title.ts`, `setWindowTitle` in `api.ts`) + `opener:allow-open-url`. That last
 one enables the command **with no scope of its own** (`allow-default-urls` is a
 separate permission), so it is listed in object form with an `allow` entry for
 `https://github.com/OrellBuehler/kerf/*` — without a scope every `openUrl` call

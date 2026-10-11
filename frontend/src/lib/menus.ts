@@ -12,6 +12,7 @@
 import { actionDef, type ActionId } from './keymap';
 import { focusableRows, stepRow, typeaheadRow, type NavRow } from './menu-nav';
 import { DELIVERY_PRESETS, fitLabel } from './delivery-formats';
+import { exportButtonState } from './export-button';
 import { PANEL_IDS, PANELS, type PanelId } from './layout';
 import { detachBlocked, type PanelLocation } from './popouts';
 import { HEIGHT_PRESETS, PRESET_LABEL, PRESET_PX, type HeightPreset } from './track-heights';
@@ -58,6 +59,8 @@ export interface MenuState {
 	canRedo: boolean;
 	/** The cut has a clip at all / a clip is selected. */
 	hasClips: boolean;
+	/** A render is under way: File › Export… then reopens its dialog (the title bar's button does too). */
+	exporting: boolean;
 	hasSelection: boolean;
 	rippleMode: boolean;
 	snap: boolean;
@@ -93,6 +96,8 @@ export function buildMenus(s: MenuState): MenuDef[] {
 	const sel = { disabled: !s.hasSelection, reason: s.hasSelection ? undefined : NEEDS_SELECTION };
 	const clips = { disabled: !s.hasClips, reason: s.hasClips ? undefined : NEEDS_CLIPS };
 	const desk = { disabled: !s.desktop, reason: s.desktop ? undefined : DESKTOP_ONLY };
+	// The one rule the title bar's Export button and the shortcut use too (`export-button.ts`).
+	const exportOff = exportButtonState({ clips: s.hasClips ? 1 : 0, running: s.exporting });
 
 	const file: MenuDef = {
 		id: 'file',
@@ -106,7 +111,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			act('file.import'),
 			act('file.importCaptions'),
 			sep,
-			act('file.export'),
+			act('file.export', { disabled: exportOff.disabled, reason: exportOff.reason }),
 			act('file.saveCover', { ...clips }),
 			sep,
 			act('app.settings'),

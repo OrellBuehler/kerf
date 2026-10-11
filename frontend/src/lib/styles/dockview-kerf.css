@@ -3,7 +3,7 @@
 .dockview-theme-kerf {
 	--dv-group-view-background-color: var(--surface-panel);
 	--dv-tabs-and-actions-container-background-color: var(--surface-app);
-	--dv-tabs-and-actions-container-height: 34px;
+	--dv-tabs-and-actions-container-height: 30px;
 	--dv-tabs-and-actions-container-font-size: var(--text-sm);
 	--dv-activegroup-visiblepanel-tab-background-color: var(--surface-panel);
 	--dv-activegroup-hiddenpanel-tab-background-color: var(--surface-app);
@@ -20,8 +20,8 @@
 	--dv-drag-over-background-color: var(--selection-fill);
 	--dv-drag-over-border-color: var(--selection-border);
 	--dv-sash-color: transparent;
-	--dv-active-sash-color: var(--kerf-500);
-	--dv-active-sash-transition-delay: 0.2s;
+	--dv-active-sash-color: color-mix(in srgb, var(--kerf-500) 65%, transparent);
+	--dv-active-sash-transition-delay: 0.1s;
 	--dv-icon-hover-background-color: var(--surface-hover);
 	--dv-tabs-container-scrollbar-color: var(--scrollbar-thumb);
 	--dv-floating-box-shadow: var(--shadow-lg);
@@ -101,4 +101,40 @@
 	content: '';
 	position: absolute;
 	inset: -2px 0;
+}
+
+/* A proposal waiting on the Agent tab: the number of changes, in the agent's hue (`agent-fg` on `agent-500`,
+   a pair the contrast guard holds to 4.5:1). The attribute is set by `Workspace.svelte`. */
+.dockview-theme-kerf .dv-default-tab-content[data-pending]::after {
+	content: attr(data-pending);
+	display: inline-block;
+	min-width: 14px;
+	height: 14px;
+	margin-left: 6px;
+	padding: 0 4px;
+	box-sizing: border-box;
+	border-radius: var(--radius-full);
+	vertical-align: 1px;
+	text-align: center;
+	font: var(--type-overline);
+	line-height: 14px;
+	letter-spacing: 0;
+	background: var(--agent-500);
+	color: var(--agent-fg);
+}
+
+/* A tab's close X shows when the pointer is on the tab or keyboard focus is (`:focus-visible`: a click on a tab
+   must not light it), not on the one showing all the time: Preview, Timeline and Library were one mis-click from
+   gone, and each one's way back is the Window menu. Right-click on a tab still offers Close. It is dimmed to
+   nothing rather than hidden, so it stays in the accessibility tree, and it takes no pointer until it shows: a tap
+   on the right edge of a tab must not close it unseen. */
+.dockview-theme-kerf .dv-tab .dv-default-tab .dv-default-tab-action {
+	opacity: 0;
+	pointer-events: none;
+}
+.dockview-theme-kerf .dv-tab:hover .dv-default-tab .dv-default-tab-action,
+.dockview-theme-kerf .dv-tab:focus-visible .dv-default-tab .dv-default-tab-action,
+.dockview-theme-kerf .dv-tab:has(:focus-visible) .dv-default-tab .dv-default-tab-action {
+	opacity: 1;
+	pointer-events: auto;
 }

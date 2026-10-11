@@ -8,9 +8,9 @@ import type { TaskStatus } from '$lib/types';
 export const STATUS_MAP: Record<TaskStatus, { tone: string; icon: string; label: string }> = {
 	queued: { tone: 'neutral', icon: 'clock', label: 'Queued' },
 	working: { tone: 'agent', icon: 'loader', label: 'Working' },
-	ready: { tone: 'success', icon: 'git-pull-request-arrow', label: 'Ready to review' },
-	done: { tone: 'neutral', icon: 'check', label: 'Applied' },
-	failed: { tone: 'neutral', icon: 'history', label: 'Failed' }
+	ready: { tone: 'agent', icon: 'git-pull-request-arrow', label: 'Ready to review' },
+	done: { tone: 'success', icon: 'check', label: 'Applied' },
+	failed: { tone: 'danger', icon: 'circle-alert', label: 'Failed' }
 };
 
 /** The placeholder a video clip gets where a thumbnail would go. */

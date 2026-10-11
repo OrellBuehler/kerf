@@ -12,6 +12,7 @@ const state = (over: Partial<MenuState> = {}): MenuState => ({
 	canUndo: true,
 	canRedo: true,
 	hasClips: true,
+	exporting: false,
 	hasSelection: true,
 	rippleMode: false,
 	snap: true,
@@ -83,6 +84,17 @@ describe('File', () => {
 			'Settings…',
 			'Quit Kerf'
 		]);
+	});
+
+	test('Export… follows the title bar’s button: off with a reason for an empty cut, on once there is a clip, and on while a render runs', () => {
+		const entry = (over: Partial<MenuState>) => find(menu('file', over).items, 'Export…');
+		const empty = entry({ hasClips: false });
+		expect('disabled' in empty && empty.disabled).toBe(true);
+		expect('reason' in empty && empty.reason).toContain('Nothing to export');
+		const live = entry({ hasClips: true });
+		expect('disabled' in live && live.disabled).toBe(false);
+		const running = entry({ hasClips: false, exporting: true });
+		expect('disabled' in running && running.disabled).toBe(false);
 	});
 
 	test('Save is "as…" once the project has a file', () => {

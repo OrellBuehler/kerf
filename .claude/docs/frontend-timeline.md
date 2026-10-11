@@ -422,7 +422,7 @@ audible track plus a `MasterStrip`. Which tracks are audible is `mixer-strips.ts
 `trackHasSound`, which the track header uses too. It mirrors the export graph's
 `clip_sounds`: `Clip.source_audio`, written only when false, marks a picture whose sound
 was detached, and a video track made only of those has no strip. Each strip has a dB-tapered fader,
-pan, M / S / Duck and a meter. The taper (`gainToFader` / `faderToGain` in `mixer.ts`:
+pan, M / S / DUCK (spelled out, as in the track header; M and S are 24 px wide at least, which is why a strip is 108 px — `panels-polish.test.ts` does the sum) and a meter. The taper (`gainToFader` / `faderToGain` in `mixer.ts`:
 unity at 0.75, floor −60 dB) is shared with the header's level slider, so a level sits
 at the same place on both. `MixSlider` gives every fader and pan the same gesture, from
 `slider-gesture.ts`: one edit per drag, written on release, and a run of arrow-key
@@ -439,12 +439,17 @@ from the clip envelope (`clipGainAt`) onto the bus, which is the same product, s
 plays is unchanged. `meter.ts` holds the ballistics: peak with fall-off, smoothed RMS
 and a held peak. The meters animate only while playing. Ducking is **export-only**:
 Web Audio has no sidechain without an AudioWorklet, and the Duck toggle's tooltip says
-the preview plays the track at its fader. The master strip's **Duck** pair chooses *how*
+the preview plays the track at its fader. The master strip's **FX block** — the Limiter toggle, its Ceiling and the Duck mode — is a disclosure under the
+`MASTER` header, folded by default and remembered (`master-fx.ts`, `localStorage`), with one line beside `FX` saying what is on (`Limiter -1.5
+dBFS`, `Speech gate`, `Off`: `fxSummary`) so a folded block does not hide a limiter that is switched on; stacked above the fader
+the controls left it about 70 px of travel against 190 px for a track's, and the dB scale dropped its +6 / +3 labels. A muted or empty strip
+dims what it shows (name, pan, fader, meter) and keeps its M / S / D at full strength; the footnote under the strips is gone (the Duck and
+Limiter tooltips and the peak readout's say the same). The master strip's **Duck** pair chooses *how*
 tracks flagged Duck dip on export (`MasterBus.duck_depth_db`, `set_master_duck`): a select
 of **Compressor** (the sidechain compressor, no depth) or **Speech gate** (the ducked bus
 drops by exactly the depth while the rest of the mix speaks), and a depth slider
 (`levels.ts` `duckToPos` / `posToDuck` / `nudgeDuck`: -40 on the left to -1 on the right, whole
-dB, double-click for -12; disabled and dimmed under Compressor). Choosing Speech gate returns
+dB, double-click for -12; shown only under Speech gate, since under Compressor it was a stray unlabelled slider). Choosing Speech gate returns
 to the last depth the strip held (-12 until one is set); the depth slider commits one edit per
 gesture like the ceiling, and nothing previews (export-only). The harness keeps the key absent
 for the compressor so the master goes back to absent too, like the saved file. A line says

@@ -20,6 +20,7 @@ import {
 	findCollisions,
 	formatChord,
 	matchAction,
+	modLabel,
 	parseChord,
 	parseKeyOverrides,
 	rebindConflicts,
@@ -1065,15 +1066,17 @@ describe('no key is hard-coded outside the registry', () => {
 	});
 
 	test('tooltips and labels do not spell one either', () => {
-		// A modifier glyph, or a `(R)` / `(Space)` hint inside a string, in code
-		// that is not a comment is a key being printed by hand. (A pointer gesture
-		// — wheel, click — is not a binding and may say ⌘.)
-		const printed = /[⌘⇧⌥⌃]|['"`][^'"`\n]*\((?:[A-Z]|Space|Del|Esc|Enter)\)/;
+		// A modifier glyph, a `Ctrl +` / `Cmd +` / `Alt +` hint, or a `(R)` / `(Space)` hint inside a string,
+		// in code that is not a comment, is a key being printed by hand. A pointer gesture (a wheel turn, a
+		// click) is no exception: its modifier is `settings.modLabel`, which says Command on a Mac and Ctrl
+		// elsewhere — "⌘/Ctrl + wheel" printed a Mac glyph on Windows.
+		const printed =
+			/[⌘⇧⌥⌃]|['"`][^'"`\n]*\((?:[A-Z]|Space|Del|Esc|Enter)\)|['"`][^'"`\n]*\b(?:Ctrl|Cmd|Command|Option|Alt)\s*\+/;
 		const offenders = files.flatMap((f) =>
 			readFileSync(f, 'utf8')
 				.split('\n')
 				.map((line, i) => ({ line, at: `${f.slice(SRC.length + 1)}:${i + 1}` }))
-				.filter(({ line }) => !/^\s*(\/\/|\*|\/\*|<!--)/.test(line) && printed.test(line) && !/wheel|click/i.test(line))
+				.filter(({ line }) => !/^\s*(\/\/|\*|\/\*|<!--)/.test(line) && printed.test(line))
 				.map(({ at }) => at)
 		);
 		expect(offenders).toEqual([]);
@@ -1120,4 +1123,23 @@ test('sameChord compares all five parts', () => {
 	expect(sameChord(chord('Mod+Z'), chord('Z'))).toBe(false);
 	expect(sameChord(chord('Alt+Z'), chord('Z'))).toBe(false);
 	expect(sameChord(chord('Mod+Z'), chord('Mod+Y'))).toBe(false);
+});
+
+describe('modifiers in prose', () => {
+	test('a Mac says Option and Command, everywhere else Alt and Ctrl, and Shift is Shift', () => {
+		expect(modLabel('mac', 'alt')).toBe('Option');
+		expect(modLabel('other', 'alt')).toBe('Alt');
+		expect(modLabel('mac', 'primary')).toBe('Command');
+		expect(modLabel('other', 'primary')).toBe('Ctrl');
+		expect(modLabel('mac', 'shift')).toBe('Shift');
+		expect(modLabel('other', 'shift')).toBe('Shift');
+	});
+
+	test('the mixer’s tooltips take theirs from the platform instead of printing Alt', () => {
+		for (const f of ['MasterStrip', 'FaderMeter', 'MixerStrip']) {
+			const source = readFileSync(join(import.meta.dir, `components/editor/${f}.svelte`), 'utf8');
+			expect(source, f).toContain("settings.modLabel('alt')");
+			expect(source, f).not.toMatch(/[,(]\s*Alt\s/);
+		}
+	});
 });

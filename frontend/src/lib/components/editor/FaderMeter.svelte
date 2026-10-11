@@ -18,6 +18,7 @@
 	} from '$lib/mixer';
 	import { clippedAny, peakLabel, strongest, type StereoMeter } from '$lib/meter';
 	import type { SliderKey } from '$lib/slider-gesture';
+	import { settings } from '$lib/settings.svelte';
 	import { tip as tooltip } from '$lib/tip';
 
 	let {
@@ -61,7 +62,7 @@
 	const clipped = $derived(clippedAny(meter));
 	const fine = FADER_STEP_DB.fine;
 	const tip = $derived(
-		`${name} level ${gainLabel(value)} — drag, or ↑ ↓ to nudge ${FADER_STEP_DB.normal} dB (Shift ${FADER_STEP_DB.coarse}, Alt ${fine}); double-click for ${unityNote}`
+		`${name} level ${gainLabel(value)} — drag, or ↑ ↓ to nudge ${FADER_STEP_DB.normal} dB (${settings.modLabel('shift')} ${FADER_STEP_DB.coarse}, ${settings.modLabel('alt')} ${fine}); double-click for ${unityNote}`
 	);
 </script>
 

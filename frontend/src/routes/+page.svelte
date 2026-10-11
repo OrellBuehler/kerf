@@ -48,9 +48,13 @@
 		openReleases,
 		quitApp,
 		revealLogs,
+		setWindowTitle,
 		showMainWindow,
 		takeLaunchProject
 	} from '$lib/api';
+	import { windowTitle } from '$lib/window-title';
+	import { finishImport, importMedia } from '$lib/import-media';
+	import { clipsIn, exportButtonState } from '$lib/export-button';
 	import { afterPaint, fontsReady, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
 	import { tip } from '$lib/tip';
@@ -83,6 +87,12 @@
 
 	// A modal over the editor window puts what is in the detached windows out of reach too.
 	$effect(() => popout.setInert(modalOpen));
+
+	// The OS hears the project's name, and that it has work that is not saved.
+	const title = $derived(windowTitle(editor.projectName, editor.hasUnsavedWork));
+	$effect(() => {
+		void setWindowTitle(title).catch(() => {});
+	});
 
 	// Any timeline edit mid-playback re-anchors the audio so what's heard
 	// matches the new cut (volume/fade tweaks land live too).
@@ -302,7 +312,14 @@
 		await saveProject();
 	}
 
+	/** File › Export… and its key: the title bar's button's rule (`exportButtonState`) — an empty cut says why
+	 *  instead of opening a dialog with nothing to render, and a render under way reopens its dialog. */
 	function onExport() {
+		const state = exportButtonState({ clips: clipsIn(editor.liveTimeline), running: editor.exportRun !== null });
+		if (state.disabled) {
+			toast.info(state.reason ?? 'Nothing to export yet');
+			return;
+		}
 		ui.openExport();
 	}
 
@@ -332,14 +349,6 @@
 		ui.openAbout();
 	}
 
-	async function onImport() {
-		if (!inTauri()) {
-			toast.info('Importing media is available in the desktop app.');
-			return;
-		}
-		await finishImport(editor.importMedia());
-	}
-
 	/** Files dropped onto the window. Non-media is filtered out here rather than
 	 *  handed to ffprobe, so dropping a folder's worth of mixed files doesn't
 	 *  answer with one error toast per README. */
@@ -353,26 +362,6 @@
 		}
 		if (rejected > 0) toast.info(`Skipped ${rejected} non-media file${rejected === 1 ? '' : 's'}`);
 		await finishImport(editor.importPaths(media));
-	}
-
-	/** Report what landed, then analyze it — one asset at a time, because each
-	 *  pass is ffmpeg-bound, and stoppable, because the transcription at the end
-	 *  of each one runs for minutes. */
-	async function finishImport(job: ReturnType<typeof editor.importMedia>) {
-		try {
-			const { imported, failed } = await job;
-			for (const f of failed) toast.error(`Couldn't import ${f.name}: ${f.message}`);
-			if (imported.length === 0) return;
-			toast.success(
-				imported.length === 1 ? `Imported ${imported[0].name}` : `Imported ${imported.length} files`
-			);
-			await ui.analyzeImported(
-				imported.map((a) => a.id),
-				settings.autoAnalysis
-			);
-		} catch (e) {
-			toast.error(e instanceof Error ? e.message : String(e));
-		}
 	}
 
 	// A proposal the agent stages is only visible in the Agent panel, which
@@ -438,7 +427,7 @@
 		'file.new': () => void onNew(),
 		'file.open': () => void openProjectAt(),
 		'file.save': () => void onSave(),
-		'file.import': () => void onImport(),
+		'file.import': () => void importMedia(),
 		'file.export': () => onExport(),
 		'file.importCaptions': () => void importCaptionFile(),
 		'file.saveCover': () => void saveCoverFrame(),
@@ -674,7 +663,7 @@
 			<div style="flex:1"></div>
 			<button
 				onclick={() => editor.exitStagedPreview()}
-				style="height:22px;padding:0 9px;border-radius:var(--radius-full);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);font-size:11px;cursor:pointer"
+				style="height:24px;padding:0 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);font-size:11px;cursor:pointer"
 				>Exit preview</button
 			>
 		</div>
@@ -690,7 +679,7 @@
 			<span style="flex:1;min-width:0">{editor.error}</span>
 			<button
 				onclick={() => (editor.error = null)}
-				style="height:22px;padding:0 9px;border-radius:var(--radius-full);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:var(--text-secondary);font-size:11px;cursor:pointer"
+				style="height:24px;padding:0 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:var(--text-secondary);font-size:11px;cursor:pointer"
 				>Dismiss</button
 			>
 		</div>

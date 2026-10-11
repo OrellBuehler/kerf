@@ -5,9 +5,13 @@
 	import Badge from './Badge.svelte';
 	import Btn from './Btn.svelte';
 	import IconBtn from './IconBtn.svelte';
+	import Chip from './Chip.svelte';
+	import EmptyState from './EmptyState.svelte';
+	import CheckRow from './CheckRow.svelte';
 	import SliderRow from './SliderRow.svelte';
 	import TitlesControls from './TitlesControls.svelte';
 	import MediaChips from './MediaChips.svelte';
+	import AssetInspector from './AssetInspector.svelte';
 	import { analyzeMenuItems } from '$lib/analyze-menu';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
@@ -39,6 +43,9 @@
 	import { toast } from '$lib/notifications.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { linkBadge, selectionUnits } from '$lib/link-ui';
+	import { clock, clockRange } from '$lib/clock';
+	import { parseColor, swatchHex, withPicked } from '$lib/title-color';
+	import { colorSummary, keyLabel, keyNeighbours, timingSummary } from '$lib/inspector-summary';
 	import { fitOffer, musicSummary } from '$lib/music-ui';
 	import { DEGREES, NUMBER_COL, PERCENT, SECONDS, TIMES, readout, type RowSpec } from '$lib/slider-row';
 	import { FieldEdits } from '$lib/field-edit';
@@ -178,6 +185,30 @@
 		} else {
 			void run(() => keyAtPlayhead(c, prop, propertyAt(c, prop, localTime)));
 		}
+	}
+	/** Right-click on a ◇: step to the previous or next key of that number, key it here, or take its keys out. */
+	function keyMenu(e: MouseEvent, prop: Property) {
+		const c = clip;
+		if (!c) return;
+		e.preventDefault();
+		e.stopPropagation();
+		const keys = propertyKeys(c, prop);
+		const near = keyNeighbours(keys.map((k) => k.time), localTime);
+		const go = (t: number) => ui.seek(c.timeline_start + t);
+		const items: MenuItem[] = [
+			{ label: 'Previous key', icon: 'skip-back', disabled: near.prev === null, reason: near.prev === null ? 'no earlier key' : undefined, action: () => go(near.prev!) },
+			{ label: 'Next key', icon: 'skip-forward', disabled: near.next === null, reason: near.next === null ? 'no later key' : undefined, action: () => go(near.next!) },
+			{ type: 'separator' },
+			{ label: near.here ? 'Remove the key here' : 'Key at the playhead', icon: 'diamond', action: () => toggleKey(prop) }
+		];
+		if (keys.length > 0)
+			items.push({
+				label: `Remove all ${keyLabel(prop)} keys`,
+				icon: 'trash',
+				danger: true,
+				action: () => void run(() => editor.setPropertyKeyframes(c.id, prop, []))
+			});
+		contextMenu.show(e, items);
 	}
 	/** Route a colour edit: a key at the playhead for each number that is keyed, the static
 	 *  colour for the rest. */
@@ -326,16 +357,6 @@
 	}
 	const hasCaptions = $derived(overlays.some((o) => o.generated));
 
-	function tc(s: number): string {
-		const t = Math.max(0, s);
-		const m = Math.floor(t / 60);
-		const sec = Math.floor(t % 60);
-		const cs = Math.floor((t % 1) * 100);
-		return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}.${cs
-			.toString()
-			.padStart(2, '0')}`;
-	}
-
 	// Smart crop only has a decision to make when the shot and the delivery frame
 	// are different shapes — a 16:9 interview headed for a 9:16 Reel loses most
 	// of its width, and which half survives is the whole question. When they
@@ -410,16 +431,14 @@
 		}
 	}
 
-	const inputCss =
-		'width:90px;background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-mono);font-size:12px;padding:5px 7px;text-align:right';
-	const selectCss =
-		'background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:12px;padding:5px 7px';
-	const fxNum =
-		'width:58px;background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-mono);font-size:12px;padding:4px 5px;text-align:right';
-	const fxTxt =
-		'width:70px;background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:12px;padding:4px 5px';
-	const xBtn =
-		'margin-left:auto;background:transparent;border:none;color:var(--text-muted);cursor:pointer;font-size:16px;line-height:1;min-width:28px;min-height:28px;padding:2px 5px';
+	// One height for every field in the panel (`--control-sm`), so a number, a text and a select sit on one line.
+	const FIELD = 'box-sizing:border-box;height:var(--control-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:var(--text-sm)';
+	/** A number: mono, right-aligned, in the value column. */
+	const inputCss = `${FIELD};width:90px;font-family:var(--font-mono);padding:0 7px;text-align:right`;
+	/** Words — a title's text, an effect's string parameter — are set in the sans, not the number face. */
+	const textCss = `${FIELD};padding:0 8px`;
+	const fxNum = `${FIELD};width:58px;font-family:var(--font-mono);padding:0 5px;text-align:right`;
+	const fxTxt = `${FIELD};width:70px;padding:0 5px`;
 	/** A fade is a second or two: the slider covers the first FADE_TRAVEL seconds and a typed entry the whole clip. */
 	const FADE_TRAVEL = 5;
 	const fadeSpec = (c: Clip): RowSpec => ({
@@ -430,23 +449,17 @@
 		...SECONDS,
 		limit: { max: clipDuration(c) }
 	});
-	/** The rows that are not sliders share the sliders' label column; their value runs to the panel's edge, over the keyframe slot, which a long one (a source range) needs at the panel's minimum width. */
+	/** The rows that are not sliders share the sliders' label column and end where the sliders' numbers do; a field's unit sits in the keyframe slot. */
 	const ROW_GRID = `display:grid;grid-template-columns:72px minmax(0,1fr) ${NUMBER_COL}px 24px;align-items:center;column-gap:8px;padding:3px 0`;
 	/** What a fade reads as in its row, so the section's summary says the same. */
 	const SECONDS_SPEC: RowSpec = { min: 0, max: 0, step: 0.1, ...SECONDS };
 	const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
-	const chip = (active: boolean) =>
-		`padding:4px 9px;font-size:12px;cursor:pointer;border-radius:var(--radius-sm);border:var(--line-width) solid ${
-			active ? 'var(--kerf-500)' : 'var(--border-strong)'
-		};background:${active ? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)' : 'var(--surface-inset)'};color:${
-			active ? 'var(--text-primary)' : 'var(--text-secondary)'
-		}`;
 </script>
 
 {#snippet readRow(label: string, value: string)}
 	<div style={ROW_GRID}>
 		<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">{label}</span>
-		<span data-selectable style="grid-column:2 / 5;justify-self:end;white-space:nowrap;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)">{value}</span>
+		<span data-selectable style="grid-column:2 / 4;justify-self:end;white-space:nowrap;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)">{value}</span>
 	</div>
 {/snippet}
 
@@ -471,8 +484,9 @@
 				e.currentTarget.value = String(value);
 				if (Number.isFinite(v) && v >= 0) onCommit(v, at);
 			}}
-			style="{inputCss};grid-column:2 / 5;justify-self:end"
+			style="{inputCss};grid-column:2 / 4;justify-self:end"
 		/>
+		<span aria-hidden="true" style="font-size:var(--text-sm);color:var(--text-muted)">s</span>
 	</label>
 {/snippet}
 
@@ -485,16 +499,17 @@
 		active={here}
 		disabled={editor.busy}
 		title={here
-			? `Remove the ${prop} keyframe at the playhead`
+			? `Remove the ${keyLabel(prop)} keyframe at the playhead`
 			: keyed
-				? `Add a ${prop} keyframe at the playhead`
-				: `Animate ${prop}: key it at the playhead`}
-		aria-label={`${here ? 'Remove' : 'Add'} a ${prop} keyframe at the playhead`}
+				? { text: `Add a ${keyLabel(prop)} keyframe at the playhead`, detail: 'Right-click to step to the previous or next key.' }
+				: `Animate ${keyLabel(prop)}: key it at the playhead`}
+		aria-label={`${here ? 'Remove' : 'Add'} a ${keyLabel(prop)} keyframe at the playhead`}
 		onclick={(e: MouseEvent) => {
 			e.preventDefault();
 			toggleKey(prop);
 		}}
-		style="--k-ink:{keyed ? 'var(--text-secondary)' : 'var(--text-muted)'};--k-on-ink:var(--playhead)"
+		oncontextmenu={(e: MouseEvent) => keyMenu(e, prop)}
+		style="--k-ink:{keyed ? 'var(--playhead)' : 'var(--text-muted)'};--k-on-ink:var(--playhead)"
 	>
 		<Icon n="diamond" s={12} style={here ? 'fill:currentColor' : ''} />
 	</IconBtn>
@@ -564,17 +579,25 @@
 					/>
 				{/if}
 			{/each}
-			<button onclick={() => onRemove(i)} disabled={editor.busy} use:tip={'Remove'} aria-label="Remove {String(e.type).replace('_', ' ')}" style={xBtn}><Icon n="x" s={14} /></button>
+			<IconBtn
+				size={28}
+				data-tone="quiet"
+				title={`Remove ${String(e.type).replace('_', ' ')}`}
+				disabled={editor.busy}
+				onclick={() => onRemove(i)}
+				style="margin-left:auto"><Icon n="x" s={14} /></IconBtn
+			>
 		</div>
 	{/each}
 	<select
+		class="k-select"
 		disabled={editor.busy}
 		onchange={(ev) => {
 			const v = ev.currentTarget.value;
 			ev.currentTarget.value = '';
 			if (v) onAdd(v);
 		}}
-		style={selectCss + ';width:100%;margin-top:4px'}
+		style="width:100%;margin-top:4px"
 	>
 		<option value="">+ Add effect…</option>
 		{#each Object.keys(presets) as k (k)}
@@ -585,14 +608,52 @@
 
 {/snippet}
 
+{#snippet colorField(
+	label: string,
+	value: string,
+	empty: string,
+	name: string,
+	patch: (typed: string) => Partial<Omit<TextOverlay, 'id' | 'keyframes'>>,
+	boxAlpha: number | null
+)}
+	{@const parsed = parseColor(value)}
+	<div style={ROW_GRID}>
+		<span style="font-size:12px;color:var(--text-muted)">{label}</span>
+		<div style="grid-column:2 / 5;display:flex;align-items:center;gap:6px;min-width:0">
+			<input
+				type="color"
+				class="k-swatch"
+				value={swatchHex(value)}
+				data-empty={parsed ? undefined : ''}
+				disabled={editor.busy}
+				aria-label="{name}: pick a color"
+				onfocus={noteFocus}
+				onchange={(e) => patchTitle(e.currentTarget, (picked) => patch(withPicked(value, picked, boxAlpha)))}
+			/>
+			<input
+				type="text"
+				{value}
+				placeholder={empty}
+				disabled={editor.busy}
+				aria-label={name}
+				onfocus={noteFocus}
+				oninput={noteTyped}
+				oncompositionend={noteTyped}
+				onchange={(e) => patchTitle(e.currentTarget, (typed) => patch(typed))}
+				style="{textCss};flex:1;min-width:0;font-family:var(--font-mono)"
+			/>
+		</div>
+	</div>
+{/snippet}
+
 {#snippet overlayEditor(o: TextOverlay)}
 	{@const pose = sampleOverlay(o, ui.time)}
 	{@const keys = o.keyframes ?? []}
 	<div style="display:flex;gap:9px;align-items:center">
 		<div
-			style="width:40px;height:28px;border-radius:3px;flex:none;background:{o.generated
+			style="width:40px;height:28px;border-radius:var(--radius-sm);flex:none;background:{o.generated
 				? GENERATED_TITLE_FILL
-				: 'var(--track-text)'};border:1px solid var(--track-text-edge);display:grid;place-items:center;color:var(--text-on-video)"
+				: 'var(--track-text)'};border:var(--line-width) solid var(--track-text-edge);display:grid;place-items:center;color:var(--text-on-video)"
 		>
 			<Icon n="captions" s={14} />
 		</div>
@@ -610,9 +671,9 @@
 		On its own lane, independent of the clips beneath it. Drag it in the preview to move it, or a corner to resize.
 	</div>
 
-	<InspectorSection title="Text" summary={`${tc(o.start)} – ${tc(o.end)}`} open>
-		<label style="display:flex;align-items:center;gap:8px;padding:3px 0">
-			<span style="font-size:12px;color:var(--text-muted);width:72px;flex:none">Text</span>
+	<InspectorSection title="Text" summary={clockRange(o.start, o.end)} open>
+		<label style={ROW_GRID}>
+			<span style="font-size:12px;color:var(--text-muted)">Text</span>
 			<input
 				type="text"
 				value={o.text}
@@ -621,7 +682,7 @@
 				oninput={noteTyped}
 				oncompositionend={noteTyped}
 				onchange={(e) => patchTitle(e.currentTarget, (typed) => ({ text: typed }))}
-				style={inputCss + ';flex:1;width:auto;text-align:left'}
+				style="{textCss};grid-column:2 / 5;min-width:0"
 			/>
 		</label>
 		{@render numRow('Start', o.start, 0.1, (v, at) => {
@@ -632,45 +693,23 @@
 			const ov = overlayOf(at);
 			if (ov) void run(() => editor.retimeOverlay(ov.id, ov.start, Math.max(v, ov.start + MIN_TITLE)));
 		})}
-		{@render rangeRow('Pos X', pose.x, { min: 0, max: 1, step: 0.01 }, (v, at) => moveTitle(at, { x: v }))}
-		{@render rangeRow('Pos Y', pose.y, { min: 0, max: 1, step: 0.01 }, (v, at) => moveTitle(at, { y: v }))}
+		{@render rangeRow('Position X', pose.x, { min: 0, max: 1, step: 0.01 }, (v, at) => moveTitle(at, { x: v }))}
+		{@render rangeRow('Position Y', pose.y, { min: 0, max: 1, step: 0.01 }, (v, at) => moveTitle(at, { y: v }))}
 		{@render rangeRow('Size', o.size, { min: TITLE_SIZE_MIN, max: Math.max(0.2, TITLE_SIZE_MAX, o.size), step: 0.005, ...PERCENT, digits: 1 }, (v, at) => {
 			const ov = overlayOf(at);
 			if (ov) return run(() => editor.updateOverlay(ov.id, { size: v }));
 		})}
-		<label style="display:flex;align-items:center;gap:8px;padding:3px 0">
-			<span style="font-size:12px;color:var(--text-muted);width:72px;flex:none">Color</span>
-			<input
-				type="text"
-				value={o.color}
-				disabled={editor.busy}
-				onfocus={noteFocus}
-				oninput={noteTyped}
-				oncompositionend={noteTyped}
-				onchange={(e) => patchTitle(e.currentTarget, (typed) => ({ color: typed }))}
-				style={fxTxt}
-			/>
-			<span style="font-size:12px;color:var(--text-muted)">Box</span>
-			<input
-				type="text"
-				value={o.bg ?? ''}
-				placeholder="none"
-				disabled={editor.busy}
-				onfocus={noteFocus}
-				oninput={noteTyped}
-				oncompositionend={noteTyped}
-				onchange={(e) => patchTitle(e.currentTarget, (typed) => ({ bg: typed }))}
-				style={fxTxt}
-			/>
-		</label>
-		<label style="display:flex;align-items:center;gap:8px;padding:3px 0">
-			<span style="font-size:12px;color:var(--text-muted);width:72px;flex:none">Font</span>
+		{@render colorField('Color', o.color, 'white', 'Title color', (typed) => ({ color: typed }), null)}
+		{@render colorField('Box', o.bg ?? '', 'none', 'Box behind the title', (typed) => ({ bg: typed }), 0.55)}
+		<label style={ROW_GRID}>
+			<span style="font-size:12px;color:var(--text-muted)">Font</span>
 			<select
+				class="k-select"
 				value={o.font ?? ''}
 				disabled={editor.busy}
 				onfocus={noteFocus}
 				onchange={(e) => patchTitle(e.currentTarget, (typed) => ({ font: typed }))}
-				style={selectCss + ';flex:1'}
+				style="grid-column:2 / 5"
 			>
 				<option value="">Default</option>
 				{#each ui.availableFonts as f (f)}
@@ -678,18 +717,15 @@
 				{/each}
 			</select>
 		</label>
-		<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
-			<span style="font-size:12px;color:var(--text-muted)">Bold</span>
-			<input
-				type="checkbox"
-				checked={o.bold}
-				disabled={editor.busy}
-				onfocus={noteFocus}
-				onchange={(e) => patchTitle(e.currentTarget, () => ({ bold: e.currentTarget.checked }))}
-				style="accent-color:var(--kerf-500);width:18px;height:18px"
-			/>
-		</label>
-		</InspectorSection>
+		<CheckRow
+			checked={o.bold}
+			disabled={editor.busy}
+			onfocus={noteFocus}
+			onchange={(e) => patchTitle(e.currentTarget, () => ({ bold: e.currentTarget.checked }))}
+		>
+			Bold
+		</CheckRow>
+	</InspectorSection>
 
 	<InspectorSection title="Animation" summary={count(keys.length, 'keyframe')}>
 		{#if keys.length}
@@ -701,18 +737,23 @@
 					<span style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 						>({k.pos_x.toFixed(2)},{k.pos_y.toFixed(2)}) · {Math.round(k.opacity * 100)}%</span
 					>
-					<button onclick={() => removeOverlayKeyframe(o, i)} disabled={editor.busy} use:tip={'Remove'} aria-label="Remove keyframe at {k.time.toFixed(2)}s" style={xBtn}><Icon n="x" s={14} /></button>
+					<IconBtn
+						size={28}
+						data-tone="quiet"
+						title={`Remove the keyframe at ${k.time.toFixed(2)}s`}
+						disabled={editor.busy}
+						onclick={() => removeOverlayKeyframe(o, i)}><Icon n="x" s={14} /></IconBtn
+					>
 				</div>
 			{/each}
 			<Btn
 				size="sm"
-				variant="ghost"
 				style="margin-top:4px"
 				disabled={editor.busy}
 				onclick={() => run(() => editor.setOverlayKeyframes(o.id, []))}>Clear keyframes</Btn
 			>
 			<div style="font-size:12px;color:var(--text-muted);margin-top:4px;line-height:1.4">
-				This title is animated: moving it in the preview or with Pos X / Pos Y keyframes the position at the playhead.
+				This title is animated: moving it in the preview or with Position X / Position Y keyframes the position at the playhead.
 			</div>
 		{:else}
 			<div style="font-size:12px;color:var(--text-muted);line-height:1.4">
@@ -724,6 +765,7 @@
 	<div style="margin-top:18px">
 		<Btn
 			variant="destructive"
+			data-quiet
 			size="sm"
 			icon="trash"
 			iconSize={13}
@@ -764,7 +806,7 @@
 			{/if}
 			<div style="display:flex;gap:9px;align-items:center">
 				<div
-					style="width:40px;height:28px;border-radius:3px;flex:none;background:{picture
+					style="width:40px;height:28px;border-radius:var(--radius-sm);flex:none;background:{picture
 						? VIDEO_THUMB_BG
 						: 'var(--track-audio)'};display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 80%,transparent)"
 				>
@@ -804,12 +846,12 @@
 				</div>
 			{/if}
 
-			<InspectorSection title="Timing" summary={`${tc(clip.timeline_start)} · ${tc(clipDuration(clip))}`} open>
-			{@render readRow('Start', tc(clip.timeline_start))}
-			{@render readRow('Duration', tc(clipDuration(clip)))}
+			<InspectorSection title="Timing" summary={timingSummary(clip.timeline_start, clipDuration(clip))} open>
+			{@render readRow('Start', clock(clip.timeline_start))}
+			{@render readRow('Duration', clock(clipDuration(clip)))}
 
-			<div style="font-size:12px;color:var(--text-muted);margin:8px 0">Trim source</div>
-			{@render readRow('Source range', `${tc(clip.source_in)} – ${tc(clip.source_out)}`)}
+			<div class="k-overline" style="margin:12px 0 4px">Trim source</div>
+			{@render readRow('Source range', clockRange(clip.source_in, clip.source_out))}
 			{@render numRow('In', clip.source_in, 0.1, (v, at) => {
 				const c = clipOf(at);
 				if (c) void run(() => editor.trim(c.id, v, undefined));
@@ -845,12 +887,13 @@
 
 			{#if musicOffer.show && music}
 				<InspectorSection title="Music" summary={musicSummary(music)}>
-				<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
-					<button
-						style={chip(false)}
+				<div style="margin-bottom:6px">
+					<Btn
+						size="sm"
+						icon="film"
 						disabled={editor.busy || musicOffer.reason !== null}
-						use:tip={'Make this music last as long as the picture, repeating or dropping whole phrases'}
-						onclick={() => ui.openFitMusic(clip.id)}>Fit to video…</button
+						title={'Make this music last as long as the picture, repeating or dropping whole phrases'}
+						onclick={() => ui.openFitMusic(clip.id)}>Fit to video…</Btn
 					>
 				</div>
 				<div style="font:var(--type-caption);color:var(--text-muted)">
@@ -870,19 +913,12 @@
 				const c = clipOf(at);
 				if (c) return run(() => editor.setSpeed(c.id, (c.speed ?? 1) < 0 ? -v : v));
 			})}
-			<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
-				<span style="font-size:12px;color:var(--text-muted)">Reverse</span>
-				<input
-					type="checkbox"
-					checked={speed < 0}
-					disabled={editor.busy}
-					onchange={() => run(() => editor.setSpeed(clip.id, -speed))}
-					style="accent-color:var(--kerf-500);width:18px;height:18px"
-				/>
-			</label>
+			<CheckRow checked={speed < 0} disabled={editor.busy} onchange={() => run(() => editor.setSpeed(clip.id, -speed))}>
+				Reverse
+			</CheckRow>
 			</InspectorSection>
 
-			{#if picture}
+			{#if picture && (reframe || sourceProjection)}
 				<InspectorSection title="360 reframe" summary={reframe ? (reframeKeys.length ? `Animated · ${count(reframeKeys.length, 'key')}` : 'On') : 'Off'}>
 				{#if reframe}
 					{@render rangeRow('Yaw', cam.yaw, { min: -180, max: 180, step: 1, neutral: DEFAULT_REFRAME.yaw, ...DEGREES }, (v, at) =>
@@ -904,9 +940,11 @@
 							join.
 						</p>
 					{/if}
-					<div style="display:flex;gap:6px;padding:6px 0 0">
+					<div style="display:flex;flex-wrap:wrap;gap:6px;padding:6px 0 0">
 						<Btn
 							size="sm"
+							icon="diamond"
+							iconSize={12}
 							disabled={editor.busy}
 							onclick={() =>
 								run(() =>
@@ -914,7 +952,7 @@
 										clip.id,
 										Math.round(Math.max(0, ui.time - clip.timeline_start) * 1000) / 1000
 									)
-								)}>+ Camera key</Btn
+								)}>Camera key</Btn
 						>
 						{#if reframeKeys.length}
 							<Btn
@@ -924,9 +962,7 @@
 								>Clear {reframeKeys.length} key{reframeKeys.length === 1 ? '' : 's'}</Btn
 							>
 						{/if}
-						<button style={xBtn} use:tip={'Stop reframing'} aria-label="Stop reframing" disabled={editor.busy}
-							onclick={() => run(() => editor.clearReframe(clip.id))}><Icon n="x" s={14} /></button
-						>
+						<Btn size="sm" disabled={editor.busy} onclick={() => run(() => editor.clearReframe(clip.id))}>Stop reframing</Btn>
 					</div>
 				{:else if sourceProjection}
 					<p style="font-size:12px;color:var(--text-muted);margin:0 0 6px;line-height:1.4">
@@ -938,33 +974,6 @@
 						disabled={editor.busy}
 						onclick={() => run(() => editor.setReframe(clip.id, { input: sourceProjection! }))}
 						>Reframe to flat</Btn
-					>
-				{:else}
-					<p style="font-size:12px;color:var(--text-muted);margin:0 0 6px;line-height:1.4">
-						Not detected as 360. If this really is spherical footage, pick how the source is
-						packed — the whole asset is marked, so every clip cut from it reframes.
-					</p>
-					<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
-						<span style="font-size:12px;color:var(--text-muted)">Source is</span>
-						<select
-							value={manualProjection}
-							disabled={editor.busy}
-							onchange={(e) => (manualProjection = e.currentTarget.value as Projection)}
-							style={selectCss}
-						>
-							<option value="equirect">Equirectangular</option>
-							<option value="dual_fisheye">Dual fisheye</option>
-							<option value="fisheye">Fisheye</option>
-						</select>
-					</label>
-					<Btn
-						size="sm"
-						disabled={editor.busy}
-						onclick={() =>
-							run(async () => {
-								await editor.setAssetProjection(clip.asset_id, manualProjection);
-								await editor.setReframe(clip.id, { input: manualProjection });
-							})}>Mark as 360 &amp; reframe</Btn
 					>
 				{/if}
 				</InspectorSection>
@@ -986,19 +995,21 @@
 				</InspectorSection>
 
 				<InspectorSection title="Framing" summary={hasCrop ? 'Cropped' : 'Full frame'}>
-				<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
-					<button
-						style={chip(false)}
+				<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
+					<Btn
+						size="sm"
+						icon="crop"
+						iconSize={12}
 						disabled={editor.busy || !reframable}
-						use:tip={"Sample where this shot's content is and crop to the delivery frame around it"}
+						title={"Sample where this shot's content is and crop to the delivery frame around it"}
 						onclick={() =>
 							runUndoable('Framed for the delivery frame', () => editor.smartCrop(clip.id))}
-						>Smart crop</button
+						>Smart crop</Btn
 					>
-					<button
-						style={chip(false)}
+					<Btn
+						size="sm"
 						disabled={editor.busy || !hasCrop}
-						use:tip={'Clear the crop'}
+						title={'Clear the crop'}
 						onclick={() =>
 							run(() =>
 								editor.setTransform(clip.id, {
@@ -1007,7 +1018,7 @@
 									crop_top: 0,
 									crop_bottom: 0
 								})
-							)}>Reset crop</button
+							)}>Reset crop</Btn
 					>
 				</div>
 				{#if !reframable}
@@ -1017,27 +1028,21 @@
 							: 'This shot already matches the delivery frame.'}
 					</div>
 				{/if}
-				{@render rangeRow('Crop L', tf.crop_left, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_left }, (v, at) => setTf({ crop_left: v }, at))}
-				{@render rangeRow('Crop R', tf.crop_right, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_right }, (v, at) => setTf({ crop_right: v }, at))}
-				{@render rangeRow('Crop T', tf.crop_top, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_top }, (v, at) => setTf({ crop_top: v }, at))}
-				{@render rangeRow('Crop B', tf.crop_bottom, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_bottom }, (v, at) => setTf({ crop_bottom: v }, at))}
+				{@render rangeRow('Left', tf.crop_left, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_left }, (v, at) => setTf({ crop_left: v }, at))}
+				{@render rangeRow('Right', tf.crop_right, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_right }, (v, at) => setTf({ crop_right: v }, at))}
+				{@render rangeRow('Top', tf.crop_top, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_top }, (v, at) => setTf({ crop_top: v }, at))}
+				{@render rangeRow('Bottom', tf.crop_bottom, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_bottom }, (v, at) => setTf({ crop_bottom: v }, at))}
 				</InspectorSection>
 
-				<InspectorSection title="Color" summary={activeLook(col)?.label ?? 'Custom'}>
-				<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">
+				<InspectorSection title="Color" summary={colorSummary(clip, col)}>
+				<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+					<span class="k-overline" style="flex:1">Looks</span>
+					<Btn variant="ghost" size="sm" disabled={editor.busy} title={'Back to the ungraded picture'} onclick={() => setCol(DEFAULT_COLOR)}>Reset</Btn>
+				</div>
+				<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px">
 					{#each COLOR_LOOKS as look (look.id)}
-						<button aria-pressed={activeLook(col)?.id === look.id}
-							style={chip(activeLook(col)?.id === look.id)}
-							disabled={editor.busy}
-							onclick={() => setCol(look.color)}>{look.label}</button
-						>
+						<Chip pressed={activeLook(col)?.id === look.id} disabled={editor.busy} onclick={() => setCol(look.color)}>{look.label}</Chip>
 					{/each}
-					<button
-						style={chip(false)}
-						disabled={editor.busy}
-						use:tip={'Reset color'}
-						onclick={() => setCol(DEFAULT_COLOR)}>Reset</button
-					>
 				</div>
 				{@render rangeRow('Brightness', col.brightness, { min: -1, max: 1, step: 0.05, neutral: DEFAULT_COLOR.brightness }, (v, at) => setCol({ brightness: v }, at), 'brightness')}
 				{@render rangeRow('Contrast', col.contrast, { min: 0, max: 4, step: 0.05, neutral: DEFAULT_COLOR.contrast }, (v, at) => setCol({ contrast: v }, at), 'contrast')}
@@ -1048,43 +1053,37 @@
 
 			<InspectorSection title="Mask" summary={mask ? (mask.shape === 'rect' ? 'Rectangle' : 'Ellipse') : 'None'}>
 			<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
-				<button aria-pressed={!mask}
-					style={chip(!mask)}
+				<Chip
+					pressed={!mask}
 					disabled={editor.busy}
-					use:tip={'No mask — the whole frame'}
-					onclick={() => run(() => editor.setMask(clip.id, null))}>None</button
+					title={'No mask — the whole frame'}
+					onclick={() => run(() => editor.setMask(clip.id, null))}>None</Chip
 				>
-				<button aria-pressed={mask?.shape === 'rect'}
-					style={chip(mask?.shape === 'rect')}
+				<Chip
+					pressed={mask?.shape === 'rect'}
 					disabled={editor.busy}
-					use:tip={'Cut this clip to a rectangle'}
-					onclick={() => patchMask({ shape: 'rect' })}>Rectangle</button
+					title={'Cut this clip to a rectangle'}
+					onclick={() => patchMask({ shape: 'rect' })}>Rectangle</Chip
 				>
-				<button aria-pressed={mask?.shape === 'ellipse'}
-					style={chip(mask?.shape === 'ellipse')}
+				<Chip
+					pressed={mask?.shape === 'ellipse'}
 					disabled={editor.busy}
-					use:tip={'Cut this clip to an ellipse'}
-					onclick={() => patchMask({ shape: 'ellipse' })}>Ellipse</button
+					title={'Cut this clip to an ellipse'}
+					onclick={() => patchMask({ shape: 'ellipse' })}>Ellipse</Chip
 				>
 			</div>
 			{#if mask}
-				{@render rangeRow('Centre X', mask.x, { min: 0, max: 1, step: 0.01, neutral: DEFAULT_MASK.x, bipolar: true }, (v, at) => patchMask({ x: v }, at))}
-				{@render rangeRow('Centre Y', mask.y, { min: 0, max: 1, step: 0.01, neutral: DEFAULT_MASK.y, bipolar: true }, (v, at) => patchMask({ y: v }, at))}
+				{@render rangeRow('Center X', mask.x, { min: 0, max: 1, step: 0.01, neutral: DEFAULT_MASK.x, bipolar: true }, (v, at) => patchMask({ x: v }, at))}
+				{@render rangeRow('Center Y', mask.y, { min: 0, max: 1, step: 0.01, neutral: DEFAULT_MASK.y, bipolar: true }, (v, at) => patchMask({ y: v }, at))}
 				{@render rangeRow('Width', mask.width, { min: 0.02, max: 1.5, step: 0.01, neutral: DEFAULT_MASK.width }, (v, at) =>
 					patchMask({ width: v }, at))}
 				{@render rangeRow('Height', mask.height, { min: 0.02, max: 1.5, step: 0.01, neutral: DEFAULT_MASK.height }, (v, at) =>
 					patchMask({ height: v }, at))}
 				{@render rangeRow('Feather', mask.feather, { min: 0, max: 1, step: 0.01, neutral: DEFAULT_MASK.feather }, (v, at) =>
 					patchMask({ feather: v }, at))}
-				<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
-					<span style="font-size:12px;color:var(--text-muted)">Invert</span>
-					<input
-						type="checkbox"
-						checked={!!mask.inverted}
-						disabled={editor.busy}
-						onchange={(e) => patchMask({ inverted: e.currentTarget.checked })}
-					/>
-				</label>
+				<CheckRow checked={!!mask.inverted} disabled={editor.busy} onchange={(e) => patchMask({ inverted: e.currentTarget.checked })}>
+					Invert
+				</CheckRow>
 				<div style="font:var(--type-caption);color:var(--text-muted);margin:2px 0 6px">
 					Outside the shape this clip is transparent, so a lower track shows through. To blur a
 					face: duplicate the shot onto the track above, blur the copy, mask the copy.
@@ -1093,10 +1092,11 @@
 			</InspectorSection>
 			{/if}
 
-			<InspectorSection title="Transition (in)" summary={transition ? `${transition.kind.replaceAll('_', ' ')} · ${transition.duration}s` : 'None'}>
-			<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
-				<span style="font-size:12px;color:var(--text-muted)">Type</span>
+			<InspectorSection title="Transition" summary={transition ? `${transition.kind.replaceAll('_', ' ')} · ${transition.duration}s` : 'None'}>
+			<label style={ROW_GRID}>
+				<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">Into clip</span>
 				<select
+					class="k-select"
 					value={transition?.kind ?? ''}
 					disabled={editor.busy}
 					onchange={(e) => {
@@ -1104,7 +1104,7 @@
 						if (!k) void run(() => editor.setTransition(clip.id, null));
 						else void run(() => editor.setTransition(clip.id, { kind: k, duration: transition?.duration ?? DEFAULT_TRANSITION_SECONDS }));
 					}}
-					style={selectCss}
+					style="grid-column:2 / 5"
 				>
 					<option value="">None</option>
 					{#each TRANSITION_GROUPS as g (g.label)}
@@ -1134,13 +1134,12 @@
 
 					<InspectorSection title="Animation" summary={count(keyframes.length, 'keyframe')}>
 					<div style="display:flex;gap:7px;margin-bottom:4px">
-						<Btn size="sm" variant="ghost" style="flex:1" disabled={editor.busy} onclick={addKeyframeHere}
-							>+ Keyframe @ playhead</Btn
+						<Btn size="sm" icon="diamond" iconSize={12} style="flex:1" disabled={editor.busy} onclick={addKeyframeHere}
+							>Keyframe at playhead</Btn
 						>
 						{#if keyframes.length}
 							<Btn
 								size="sm"
-								variant="ghost"
 								disabled={editor.busy}
 								onclick={() => run(() => editor.clearKeyframes(clip.id))}>Clear</Btn
 							>
@@ -1160,12 +1159,13 @@
 								{#if i < keyframes.length - 1}
 									{@const current = easingId(k.easing)}
 									<select
+										class="k-select"
 										value={current}
 										disabled={editor.busy}
 										use:tip={'How the clip moves from this keyframe to the next'}
 										aria-label={`Easing after the keyframe at ${k.time.toFixed(2)} seconds`}
 										onchange={(e) => setEasing(k, e.currentTarget.value)}
-										style={selectCss + ';flex:none;width:96px'}
+										style="flex:none;width:104px"
 									>
 										{#each EASING_CHOICES as e (e.id)}
 											<option value={e.id}>{e.label}</option>
@@ -1175,7 +1175,13 @@
 										{/if}
 									</select>
 								{/if}
-								<button onclick={() => removeKeyframe(i)} disabled={editor.busy} use:tip={'Remove'} aria-label="Remove keyframe {i + 1}" style={xBtn}><Icon n="x" s={14} /></button>
+								<IconBtn
+									size={28}
+									data-tone="quiet"
+									title={`Remove keyframe ${i + 1}`}
+									disabled={editor.busy}
+									onclick={() => removeKeyframe(i)}><Icon n="x" s={14} /></IconBtn
+								>
 							</div>
 						{/each}
 						<div style="font-size:12px;color:var(--text-muted);margin-top:4px;line-height:1.4">
@@ -1184,34 +1190,69 @@
 					{/if}
 					</InspectorSection>
 
+					{#if !reframe && !sourceProjection}
+						<!-- Kerf detects 360 footage from its tags, so a flat clip has nothing to say about it. The
+						     override for footage it missed (a remux that lost the tag) is here, out of the way. -->
+						<InspectorSection title="Advanced" summary="Not 360">
+						<p style="font-size:12px;color:var(--text-muted);margin:0 0 6px;line-height:1.4">
+							Kerf did not detect this as 360 footage. If it really is spherical, pick how the source is
+							packed — the whole asset is marked, so every clip cut from it reframes.
+						</p>
+						<label style={ROW_GRID}>
+							<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">Source is</span>
+							<select
+								class="k-select"
+								value={manualProjection}
+								disabled={editor.busy}
+								onchange={(e) => (manualProjection = e.currentTarget.value as Projection)}
+								style="grid-column:2 / 5"
+							>
+								<option value="equirect">Equirectangular</option>
+								<option value="dual_fisheye">Dual fisheye</option>
+								<option value="fisheye">Fisheye</option>
+							</select>
+						</label>
+						<div style="margin-top:6px">
+							<Btn
+								size="sm"
+								icon="globe"
+								disabled={editor.busy}
+								onclick={() =>
+									run(async () => {
+										await editor.setAssetProjection(clip.asset_id, manualProjection);
+										await editor.setReframe(clip.id, { input: manualProjection });
+									})}>This is 360 footage</Btn
+							>
+						</div>
+						</InspectorSection>
+					{/if}
+
 				{/if}
 
-				<div style="margin-top:18px;display:flex;flex-direction:column;gap:7px">
+				<div style="margin-top:18px;display:grid;grid-template-columns:1fr 1fr;gap:6px">
 				<Btn
 					variant="destructive"
+					data-quiet
 					size="sm"
 					icon="trash"
 					iconSize={13}
-					style="width:100%"
 					disabled={editor.busy}
 					onclick={() => runUndoable('Clip removed', () => editor.remove(clip.id))}>Remove clip</Btn
 				>
 				<Btn
-					variant="ghost"
 					size="sm"
-					style="width:100%"
 					disabled={editor.busy}
+					title={'Remove the clip and close the gap it leaves'}
 					onclick={() => runUndoable('Clip ripple-deleted', () => editor.rippleDelete(clip.id))}
-					>Ripple delete · close gap</Btn
+					>Ripple delete</Btn
 				>
 			</div>
+		{:else if editor.selectedAsset}
+			<!-- Nothing on the timeline is selected, but the library has an asset: its facts are here, not in the
+			     bin's right-click menu. -->
+			<AssetInspector asset={editor.selectedAsset} />
 		{:else}
-			<div
-				style="display:flex;flex-direction:column;align-items:center;gap:10px;padding:40px 16px;color:var(--text-muted);text-align:center"
-			>
-				<Icon n="sliders-horizontal" s={22} />
-				<span style="font-size:12px">Select a clip or a title to inspect it</span>
-			</div>
+			<EmptyState icon="sliders-horizontal" pad={40} title="Select a clip or a title to inspect it" />
 		{/if}
 
 		{@render overlaysSection()}

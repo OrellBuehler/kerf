@@ -38,6 +38,7 @@ import {
 	emptyOverrides,
 	hasOverrides,
 	matchAction,
+	modLabel,
 	parseKeyOverrides,
 	rebindConflicts,
 	resetAll,
@@ -361,6 +362,11 @@ class SettingsStore {
 	 *  the hint disappears with the key. */
 	shortcut(id: ActionId): string {
 		return this.keysFor(id)[0] ?? '';
+	}
+
+	/** A modifier's name in prose for this platform (`Option` on a Mac, `Alt` elsewhere). */
+	modLabel(which: 'primary' | 'alt' | 'shift'): string {
+		return modLabel(this.platform, which);
 	}
 
 	/** `Razor (C)`, or `Razor` when nothing is bound to it. */
