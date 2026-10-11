@@ -272,6 +272,16 @@ impl Project {
         Ok(project)
     }
 
+    /// Become `other` (a project just opened or created), for the one `Project` the app and its MCP
+    /// server share. The plan epoch moves **after** the swap: opening `other` moved it, but a frame
+    /// that took its inputs from this project between that and the swap read the old project under the
+    /// new epoch. Call it under the lock the shared project sits behind, so no reader sees the new
+    /// project under the old epoch either.
+    pub fn replace_with(&mut self, other: Project) {
+        *self = other;
+        crate::plan_epoch::bump_plan_epoch();
+    }
+
     /// Set who subsequent edits are attributed to in the history. The MCP server
     /// calls this with [`EditSource::Agent`]; the desktop app keeps the default
     /// [`EditSource::User`].
@@ -1631,7 +1641,7 @@ impl Project {
         // recording a revision here would put an edit that changed nothing into
         // the user's history.
         if diff.is_empty() {
-            self.conn.execute("DELETE FROM staged", [])?;
+            self.clear_staged()?;
             return self.timeline();
         }
         let label = match (&row.note, row.edits.as_slice()) {
@@ -1642,14 +1652,20 @@ impl Project {
         let tx = self.conn.unchecked_transaction()?;
         self.save_timeline_str(&row.timeline)?;
         self.record_revision(&label, EditSource::Agent, &row.timeline)?;
-        self.conn.execute("DELETE FROM staged", [])?;
+        self.clear_staged()?;
         tx.commit()?;
         Ok(proposed)
     }
 
+    /// Empty the staged table. `WHERE 1` keeps SQLite from truncating it, which does not call the
+    /// update hook the plan epoch is moved by.
+    fn clear_staged(&self) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM staged WHERE 1", [])?)
+    }
+
     /// Throw the proposal away, leaving the live timeline untouched.
     pub fn discard_staged(&self) -> Result<Timeline> {
-        if self.conn.execute("DELETE FROM staged", [])? == 0 {
+        if self.clear_staged()? == 0 {
             return Err(Error::NoStagedEdit);
         }
         self.timeline()
@@ -7221,6 +7237,57 @@ mod tests {
         assert!(project.timeline().unwrap().clip(clip.id).is_some());
         assert_eq!(project.history().unwrap().len(), revisions_before);
         assert!(matches!(project.discard_staged(), Err(Error::NoStagedEdit)));
+    }
+
+    #[test]
+    fn closing_a_staging_session_moves_the_plan_epoch_though_sqlite_empties_the_table_without_a_hook() {
+        use crate::plan_epoch::bumps_here;
+        let project = agent_project();
+        let clip = first_clip(&project);
+
+        project.begin_staging(None, None).unwrap();
+        project.remove(clip.id).unwrap();
+        let before = bumps_here();
+        project.discard_staged().unwrap();
+        assert!(bumps_here() > before, "discarding a proposal");
+
+        // A session that staged nothing just closes: no revision, no timeline written.
+        project.begin_staging(None, None).unwrap();
+        let before = bumps_here();
+        project.apply_staged(false).unwrap();
+        assert!(bumps_here() > before, "closing an empty proposal");
+        assert!(project.staged().unwrap().is_none());
+    }
+
+    #[test]
+    fn undo_redo_and_a_row_replaced_by_its_key_each_move_the_plan_epoch() {
+        use crate::plan_epoch::bumps_here;
+        let project = Project::sample().unwrap();
+        let clip = first_clip(&project);
+        project.set_volume(clip.id, 0.4).unwrap();
+
+        let before = bumps_here();
+        project.undo().unwrap();
+        assert!(bumps_here() > before, "undo");
+        let before = bumps_here();
+        project.redo().unwrap();
+        assert!(bumps_here() > before, "redo");
+
+        project.set_meta("epoch-key", "one").unwrap();
+        let before = bumps_here();
+        project.set_meta("epoch-key", "two").unwrap();
+        assert!(bumps_here() > before, "INSERT OR REPLACE over an existing row");
+        assert_eq!(project.meta("epoch-key").unwrap().as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn a_project_replaced_by_another_moves_the_plan_epoch_after_the_swap() {
+        use crate::plan_epoch::bumps_here;
+        let mut shared = Project::open_in_memory().unwrap();
+        let opened = Project::open_in_memory().unwrap();
+        let before = bumps_here();
+        shared.replace_with(opened);
+        assert!(bumps_here() > before);
     }
 
     #[test]

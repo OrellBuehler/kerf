@@ -363,10 +363,15 @@
   (`GpuError::Unsupported`): a picture that decodes at another size than probed, an
   alpha channel found in the pixels of an asset that never recorded its format.
 - `plan_epoch.rs` — **has anything a plan is made from changed?** A process-wide counter
-  (`plan_epoch()`) that moves for every row written through a `Project` connection (an
+  (`plan_epoch()`) that moves for every row a `Project` connection inserts, updates or deletes one by one (an
   `update_hook`, installed in `Project::init`; the `analysis`, `history` and `tasks` tables are
-  skipped, they are written all the time by background work and no plan reads them), whenever a
-  project is opened or created, when a preview proxy lands (`finalize_proxy`, after the rename) or is
+  skipped, they are written all the time by background work and no plan reads them). **The hook does not
+  see a `DELETE` without a `WHERE`** (SQLite empties the table instead of visiting its rows): `clear_staged`
+  says `WHERE 1`, and any new statement that clears a table must too. Nor does it see the row an
+  `INSERT OR REPLACE` replaces, only the insert. The counter also moves whenever a
+  project is opened or created, and **after** one replaces another (`Project::replace_with`, which every
+  place that swaps the shared project uses, under its lock: a frame that took its inputs from the old
+  project after the new one was opened would otherwise stay fresh), when a preview proxy lands (`finalize_proxy`, after the rename) or is
   deleted (`remove_proxy_files`) and when the proxy size or the preview source changes. A holder of a
   frame's inputs (the GPU preview's snapshot, `app.md`) reads it **under the project lock, before it
   reads the project**, and keeps the inputs while the counter is the same: a bump that changed
