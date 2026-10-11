@@ -85,6 +85,8 @@
 
 - macOS presenter: macOS stays "no technique" by default (a Metal sublayer over the page would hide a clickable UI with no in-app way off); the main-thread hop lives in kerf-app (`Gpu::new` + `create_surface`), chosen at runtime by OS so it is tested on Linux; the review's "needs macos-private-api" premise is wrong (it gates only `transparent`).
 
+- CI #137 (ci-ffmpeg-complete): the per-run archive cache let throttled runs' partial (ffmpeg-only) saves shadow main's complete set, and Rust caches evict old entries; a complete set now lives under a fixed per-pin-set key tried first. Ported into perf-3 (#134) and ui-6 (#136).
+
 ## Needs a real machine
 - macOS presenter: `KERF_GPU_SURFACE=window` on a Mac — is the CAMetalLayer sublayer over or under the WKWebView (source predicts over, covering a clickable UI) and is it left behind after off / device loss (source predicts yes); if so, step 2 = app-owned CAMetalLayer in an NSView below the webview; Metal start-up vs BUILD_DEADLINE, present/composite ms, nextDrawable timeouts, sRGB layer colour vs JPEG; parity suite on Metal; display-scale moves, zoom, full screen, minimized.
 - PERF-5: proxies no longer hardware-encode on NVENC / QSV / VideoToolbox either (WP5 was measured on AMD RX 7900 XT only): confirm proxy CPU cost on NVIDIA and Apple Silicon with long 4K footage.
