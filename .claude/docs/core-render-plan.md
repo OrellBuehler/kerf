@@ -258,6 +258,10 @@
   but `FixedBt601` **no frame of a cut that holds a full-range clip** is drawn — before it, after it, on another track or a gap. FFmpeg 6 converts at the decode, as the
   compositor does, and draws it all to the level, except that **`FullRangeResized`** (under either FFmpeg, from `reasons(size)`) refuses a full-range
   picture the scaler resizes in an export frame and inside a fade (swscale converts the range inside the resize: chroma up to 15 levels off).
+  `maybe_full_range()` is a name heuristic (`yuvj…`, or no recorded format): the range tag (`color_range`) is the truth and `StreamInfo` does not record it. Under a policy that is not
+  `FixedBt601`, `maybe_full_range_in(policy)` therefore also counts any deeper-than-8-bit YCbCr / gray format (`pix_fmt_is_high_bit`): a `pc`-tagged 10-bit file probes as `yuv420p10le`, 9.0.2 handles it as `yuvj`, and the
+  limited 10-bit picture is refused with it (it is what the cut flag, `FullRangeNegotiated` and the grading refusals use; 6.1.1 draws both exactly, so the name alone decides there). Only a clip the export holds sets the cut flag (not a muted track, a
+  disabled clip, a track a solo shadows, or an audio track's use of the asset).
   The policy condition is a **proxy measured only on FFmpeg 6.1.1 and 9.0.2** (5.x, 7.x, 8.x and distro builds are unmeasured).
   **`gpu_supported_at(size)` is the per-frame fallback switch** (`gpu_supported()` is
   its size-free half; `unsupported_reasons_at(size)` says *no, with reasons*) for
