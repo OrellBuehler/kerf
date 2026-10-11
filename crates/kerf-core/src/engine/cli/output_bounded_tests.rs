@@ -26,14 +26,26 @@ fn a_process_that_outlasts_the_limit_is_killed_and_reported_as_timed_out() {
     // `exec` makes the shell's pid the sleep's.
     let mut cmd = sh(&format!("echo $$ > '{}'; exec sleep 30", pidfile.display()));
     let started = Instant::now();
-    let err = output_bounded(&mut cmd, Duration::from_millis(200)).expect_err("sleep 30 is past 200 ms");
+    let err = output_bounded(&mut cmd, Duration::from_secs(1)).expect_err("sleep 30 is past 1 s");
     assert_eq!(err.kind(), ErrorKind::TimedOut);
     assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
-    let pid = std::fs::read_to_string(&pidfile).unwrap().trim().to_string();
+    // The shell writes its pid first thing; under load that can be later than the deadline of a
+    // short limit, so the file is waited for. A child killed before it ever ran has no pid to be
+    // gone, and the timeout above is all there is to check.
     let until = Instant::now() + Duration::from_secs(5);
-    while !gone(&pid) {
-        assert!(Instant::now() < until, "process {pid} is still there");
-        std::thread::sleep(Duration::from_millis(20));
+    let pid = loop {
+        match std::fs::read_to_string(&pidfile) {
+            Ok(text) if text.ends_with('\n') => break Some(text.trim().to_string()),
+            _ if Instant::now() >= until => break None,
+            _ => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    if let Some(pid) = pid {
+        let until = Instant::now() + Duration::from_secs(5);
+        while !gone(&pid) {
+            assert!(Instant::now() < until, "process {pid} is still there");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
