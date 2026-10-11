@@ -15772,7 +15772,11 @@ mod tests {
                 tried += 1;
             }
         }
-        assert!(tried > 0, "this ffmpeg has none of the AMF or VAAPI encoders");
+        // The pinned Linux and Windows builds carry them; the macOS one has neither family.
+        assert!(
+            tried > 0 || cfg!(target_os = "macos"),
+            "this ffmpeg has none of the AMF or VAAPI encoders"
+        );
     }
 
     /// With no GPU the probe still finishes, names only encoders it knows, and finds no VAAPI
