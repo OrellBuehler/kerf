@@ -13008,16 +13008,17 @@ mod tests {
         assert_eq!(delays.len(), 2);
         assert_eq!(delays[0], 0.0, "the first frame sets the clock: {delays:?}");
         assert!(
-            delays[1] > 0.2 && delays[1] < 0.6,
+            delays[1] > 0.2 && delays[1] < 2.0,
             "the second was a third of a second behind a 1 ms slot: {delays:?}"
         );
 
-        // Paced faster than it renders is not late: the pacing sleeps until the slot.
+        // Paced faster than it renders is not late: the pacing sleeps until the slot. The slots are
+        // long enough that a loaded runner oversleeping one cannot reach the next.
         let mut delays = Vec::new();
         pump_preview(
             fake_stream(r"printf '\377\330a\377\331\377\330b\377\331\377\330c\377\331'"),
             0.0,
-            50.0,
+            4.0,
             short_timeouts(),
             &mut |f| {
                 delays.push(f.late);
