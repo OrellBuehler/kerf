@@ -1,7 +1,9 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
 	import { windows } from '$lib/windows.svelte';
-	import { notifications, type Notice, type NoticeKind } from '$lib/notifications.svelte';
+	import { documentOf } from '$lib/realm';
+	import { notifications, type Notice } from '$lib/notifications.svelte';
+	import { STATUS_LOOK as look } from '$lib/status-look';
 	import { tip } from '$lib/tip';
 
 	let el = $state<HTMLDivElement | null>(null);
@@ -22,14 +24,6 @@
 		)
 	);
 
-	const look: Record<NoticeKind, { icon: string; color: string }> = {
-		success: { icon: 'check', color: 'var(--success)' },
-		error: { icon: 'alert-triangle', color: 'var(--danger)' },
-		warning: { icon: 'alert-triangle', color: 'var(--warning)' },
-		info: { icon: 'lightbulb', color: 'var(--kerf-400)' },
-		note: { icon: 'bell', color: 'var(--text-disabled)' }
-	};
-
 	function age(n: Notice): string {
 		const s = Math.max(0, Math.round((now - n.at) / 1000));
 		if (s < 60) return 'just now';
@@ -40,10 +34,17 @@
 
 	const clock = (n: Notice) => new Date(n.at).toLocaleTimeString();
 
+	// The panel takes focus when it opens, so the keys start inside it, and Escape gives it back to
+	// the bell that opened it.
+	$effect(() => {
+		if (notifications.open && el) el.focus({ preventScroll: true });
+	});
+
 	function onEscape(e: KeyboardEvent) {
 		if (notifications.open && e.key === 'Escape') {
 			e.preventDefault();
 			notifications.open = false;
+			documentOf(el).querySelector<HTMLElement>('[data-notification-bell]')?.focus({ preventScroll: true });
 		}
 	}
 
@@ -70,6 +71,7 @@
 		bind:this={el}
 		role="dialog"
 		aria-label="Notifications"
+		tabindex="-1"
 		style="position:fixed;top:calc(var(--titlebar-h) + 4px);right:10px;z-index:70;width:380px;max-width:calc(100vw - 20px);max-height:min(60vh,520px);display:flex;flex-direction:column;background:var(--surface-panel);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-md);box-shadow:var(--shadow-lg);overflow:hidden;font-family:var(--font-sans)"
 	>
 		<div
@@ -147,6 +149,13 @@
 									? 'var(--text-secondary)'
 									: 'var(--text-primary)'};overflow-wrap:anywhere;user-select:text">{n.text}</span
 							>
+							{#if n.description}
+								<span
+									data-selectable
+									style="font-size:12px;line-height:1.45;color:var(--text-secondary);overflow-wrap:anywhere;user-select:text"
+									>{n.description}</span
+								>
+							{/if}
 							<span
 								use:tip={clock(n)}
 								style="font-family:var(--font-mono);font-size:var(--text-2xs);color:var(--text-muted)">{age(n)}</span
@@ -156,21 +165,21 @@
 							onclick={() => notifications.markRead(n.id, !n.read)}
 							use:tip={n.read ? 'Mark as unread' : 'Mark as read'}
 							aria-label={n.read ? 'Mark as unread' : 'Mark as read'}
-							style="flex:none;width:20px;height:20px;display:grid;place-items:center;border:none;background:none;cursor:pointer;color:{n.read
+							style="flex:none;width:24px;height:24px;display:grid;place-items:center;border:none;background:none;cursor:pointer;color:{n.read
 								? 'var(--text-disabled)'
 								: look[n.kind].color}"
 						>
 							{#if n.read}
-								<span style="width:7px;height:7px;border-radius:50%;border:var(--line-width) solid currentColor"></span>
+								<span style="width:8px;height:8px;border-radius:50%;border:var(--line-width) solid currentColor"></span>
 							{:else}
-								<span style="width:7px;height:7px;border-radius:50%;background:currentColor"></span>
+								<span style="width:8px;height:8px;border-radius:50%;background:currentColor"></span>
 							{/if}
 						</button>
 						<button
 							onclick={() => notifications.remove(n.id)}
 							use:tip={'Remove'}
-							aria-label="Remove"
-							style="flex:none;width:20px;height:20px;display:grid;place-items:center;border:none;background:none;cursor:pointer;color:var(--text-muted)"
+							aria-label="Remove notification"
+							style="flex:none;width:24px;height:24px;display:grid;place-items:center;border:none;background:none;cursor:pointer;color:var(--text-muted)"
 						>
 							<Icon n="x" s={12} color="currentColor" />
 						</button>

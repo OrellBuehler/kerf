@@ -343,6 +343,12 @@ describe('contrast', () => {
 		{ fg: 'kerf-300', tint: tintOf('selection-fill'), min: READING, what: 'lit toggle in the timeline toolbar', on: PANELS },
 		// Written inline in the dialogs' error blocks: `color-mix(in srgb,var(--red-600) 14%,transparent)`.
 		{ fg: 'red-400', tint: { hue: 'red-600', weight: 0.14 }, min: READING, what: 'error block in a dialog' },
+		// Toasts: the kind's 12 % wash over the toast's own surface (`routes/layout.css`), its line, its
+		// description, and its glyph and edge in the `-400` shade.
+		{ fg: 'text-primary', tint: tintOf('success-surface'), min: READING, what: 'success toast', on: ['surface-raised'] },
+		{ fg: 'text-secondary', tint: tintOf('success-surface'), min: READING, what: 'success toast description', on: ['surface-raised'] },
+		{ fg: 'text-secondary', tint: tintOf('danger-surface'), min: READING, what: 'error toast description', on: ['surface-raised'] },
+		{ fg: 'text-secondary', tint: tintOf('warning-surface'), min: READING, what: 'warning toast description', on: ['surface-raised'] },
 		{ fg: 'text-primary', tint: tintOf('danger-surface'), min: READING, what: 'agent connection banner' },
 		{ fg: 'text-primary', tint: tintOf('warning-surface'), min: READING, what: 'keyboard conflict prompt' },
 		{ fg: 'text-secondary', tint: tintOf('diff-remove-surface'), min: READING, what: 'stale proposal note' },

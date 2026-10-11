@@ -23,6 +23,8 @@ export interface Notice {
 	id: number;
 	kind: NoticeKind;
 	text: string;
+	/** The reason, under the line — the part of a failure worth reading afterwards. */
+	description?: string;
 	/** Epoch ms, so the panel can age it. */
 	at: number;
 	read: boolean;
@@ -55,8 +57,15 @@ class Notifications {
 		return this.items.some((i) => !i.read && (i.kind === 'error' || i.kind === 'warning'));
 	}
 
-	record(kind: NoticeKind, text: string) {
-		this.items.unshift({ id: this.#nextId++, kind, text, at: Date.now(), read: false });
+	record(kind: NoticeKind, text: string, description?: string) {
+		this.items.unshift({
+			id: this.#nextId++,
+			kind,
+			text,
+			...(description ? { description } : {}),
+			at: Date.now(),
+			read: false
+		});
 		if (this.items.length > MAX) this.items.length = MAX;
 	}
 
@@ -87,7 +96,7 @@ export const notifications = new Notifications();
 type Opts = ExternalToast;
 
 function show(kind: NoticeKind, message: string, opts?: Opts) {
-	notifications.record(kind, message);
+	notifications.record(kind, message, typeof opts?.description === 'string' ? opts.description : undefined);
 	if (kind === 'error' || kind === 'warning') {
 		const detail = typeof opts?.description === 'string' ? ` — ${opts.description}` : '';
 		logFrontend(kind === 'error' ? 'error' : 'warn', `${message}${detail}`, 'toast');
