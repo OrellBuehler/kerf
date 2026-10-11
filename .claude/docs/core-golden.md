@@ -17,7 +17,10 @@
   ignores `\r`). A refactor of the graph builders must leave all three untouched; an
   intended argv change moves the files of the builders it touched. (`build_proxy_args` and
   the probe `generate_proxy` now runs for its sidecar are outside it: the oracle covers the
-  export, still and preview builders, and the sidecar changed none of them.) **Bless** with
+  export, still and preview builders, and the sidecar changed none of them. Nor did the
+  BT.709 label on a proxy of untagged HD footage, which is a `build_proxy_args` argument and
+  a proxy cache key: all three digest files are byte-identical; its argv is pinned by unit
+  tests in `cli.rs`.) **Bless** with
   `KERF_GOLDEN_BLESS=1 cargo test -p kerf-core --no-default-features golden -- --nocapture`
   (exactly `1`): it rewrites **all three** files and says so, and `git diff` is the guard —
   only the files you meant to change should move. It is **machine-independent**: the

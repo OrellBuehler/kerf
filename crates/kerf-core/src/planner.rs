@@ -1689,6 +1689,68 @@ mod tests {
         assert_eq!(PlanRequest::still(FIXED).media.resolve(&a), SourceMedia::original(&a));
     }
 
+    /// Every asset decodes from a proxy whose sidecar names the matrix given for it (`None` is a
+    /// proxy that names none, as every proxy of untagged footage was before it was labelled).
+    #[derive(Debug)]
+    struct Tagged(Vec<(Uuid, Option<&'static str>)>);
+
+    impl MediaResolver for Tagged {
+        fn resolve(&self, asset: &Asset) -> SourceMedia {
+            let mut video = asset.streams[0].clone();
+            (video.width, video.height, video.pix_fmt) = (Some(1280), Some(720), Some("yuv420p".into()));
+            video.color_space = self
+                .0
+                .iter()
+                .find(|(id, _)| *id == asset.id)
+                .and_then(|(_, tag)| tag.map(str::to_string));
+            SourceMedia {
+                path: format!("/home/u/.cache/kerf/proxies/{}.mp4", asset.id.simple()),
+                proxy: true,
+                video: Some(video),
+            }
+        }
+    }
+
+    #[test]
+    fn a_plan_reads_the_matrix_a_proxy_states_and_never_reinterprets_one_that_states_none() {
+        let (bottom, top) = (asset(), asset());
+        let tl = timeline_of(vec![
+            video_track(vec![make_clip(bottom.id, 0.0, 2.0, 0.0)]),
+            video_track(vec![make_clip(top.id, 0.0, 2.0, 0.0)]),
+        ]);
+        let assets = [bottom.clone(), top.clone()];
+        let drawn = |policy, bottom_tag, top_tag| {
+            let media = Tagged(vec![(bottom.id, bottom_tag), (top.id, top_tag)]);
+            let request = PlanRequest::still(policy).with_media(&media);
+            let plan = Planner::new(&tl, &assets, &opts(30.0), request).unwrap().at(0.5).unwrap();
+            (plan.canvas.matrix, plan.unsupported_reasons())
+        };
+        use CompositeColorPolicy::BottomLayerTag as Negotiating;
+        // The proxy of untagged HD footage is labelled BT.709 and stacks with a phone's.
+        let (matrix, reasons) = drawn(Negotiating, Some("bt709"), Some("bt709"));
+        assert!(
+            reasons.is_empty() && matrix == crate::render_plan::YuvMatrix::Bt709,
+            "{reasons:?}"
+        );
+        // One cached before the label says nothing, so it is BT.601 — what the FFmpeg fallback reads
+        // of the same file — and a stack with a BT.709 proxy is refused, in either order.
+        for (a, b) in [(None, Some("bt709")), (Some("bt709"), None)] {
+            let (_, reasons) = drawn(Negotiating, a, b);
+            assert!(
+                reasons.iter().any(|r| r.contains("different YCbCr matrices")),
+                "{a:?} {b:?}: {reasons:?}"
+            );
+        }
+        // Where the composite is BT.601 whatever the tags say, every stack is drawn.
+        for (a, b) in [(None, Some("bt709")), (Some("bt709"), Some("bt709")), (None, None)] {
+            let (matrix, reasons) = drawn(FIXED, a, b);
+            assert!(
+                reasons.is_empty() && matrix == crate::render_plan::YuvMatrix::Bt601,
+                "{reasons:?}"
+            );
+        }
+    }
+
     /// Counts how often it is asked.
     #[derive(Debug, Default)]
     struct Counting(std::sync::atomic::AtomicUsize);

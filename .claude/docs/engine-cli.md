@@ -98,7 +98,33 @@ so the feature is **only** activated through these forwards — which is what ma
   remove the sidecar as well (they used to leave `<hash>.json` behind). Only a
   probe is added: `generate_proxy`'s own argv, and every argv in the golden oracle, is
   unchanged. `proxy_path` still costs the one cached `source_traits` probe of the *original*
-  (it keys the file on HDR and the lead), as it did before.
+  (it keys the file on HDR, the lead and the matrix label below), as it did before.
+  **A proxy of untagged HD footage says BT.709.** FFmpeg reads a picture that names no matrix as
+  BT.601, so an untagged proxy beside a phone's BT.709 one was two matrices — which FFmpeg 9
+  converts between and the GPU plan refuses (`MixedMatrices`) — although every player shows the
+  untagged one as BT.709 (HD, `width >= 1280 || height > 576`, is BT.709 by mpv's rule; the
+  proxy's own size is no evidence, a 720-wide proxy of a 1080p file is still HD).
+  `untagged_hd_yuv` (a field of `SourceTraits`, the same probe) is true for a stream that
+  names no `color_space`, is YCbCr on the pixel-format allow-list but not `yuvj…` (JFIF, a
+  webcam's MJPEG, is BT.601 by definition) and not HDR (tone-mapped to a tagged BT.709 picture
+  already), and is HD: `build_proxy_args` then ends its chain with `setparams=colorspace=bt709`
+  (`BT709_LABEL`, the `colour` argument it shares with the tone-map). **A label, not a
+  conversion**: not one pixel moves (the output option `-colorspace bt709` is an order to
+  convert on FFmpeg 9 — up to 22 levels moved — and is never used), so FFmpeg 6, which ignores
+  tags, previews it exactly as before, and FFmpeg 9 reads the footage's own colours (28.0 dB →
+  43.3 dB against the colours a test clip was made from). **The preview colour target is
+  BT.709 for HD, as the players show the file and the export**; SD stays BT.601. The key gains
+  `|bt709` for these sources only, so a proxy cached before is not found and the usual queue
+  rebuilds it (`queue_auto`), and the replacement deletes it and its sidecar
+  (`superseded_proxy_path`, also cleared by `remove_proxy_files`). It is not reinterpreted in
+  place: the plan has to read what the FFmpeg fallback reads, and that reads the file. Every
+  other proxy keeps its tags and its key — SD and `smpte170m` / `bt470bg` stay BT.601,
+  `bt2020nc` stays BT.2020, an RGB capture (converted with BT.601 by the proxy's scaler) and a
+  full-range JPEG picture stay as they were — so a stack of one of those with a BT.709 proxy is
+  still refused on FFmpeg 9. Converting them to BT.709 at proxy time would read wrong on an
+  FFmpeg that ignores tags, and a key that followed the measured composite policy would flap
+  while the probe is `Unknown`. `build_proxy_args` is outside the golden oracle, so no digest
+  moved; the unit tests pin the argv and an `#[ignore]`d render test pins the files.
   **A proxy reports, can be abandoned, and cannot hang.** `generate_proxy_with(src, width,
   ProxyRun { reservation, duration, progress, cancel })` is `generate_proxy` with hooks (the
   latter is it with none): the encode runs through `run_ffmpeg_streamed`, which writes

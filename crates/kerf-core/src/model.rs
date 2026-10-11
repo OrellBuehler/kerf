@@ -465,7 +465,9 @@ impl Asset {
         let mut asset = self.clone();
         for s in asset.streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
             // The proxy of HDR footage is tagged BT.709 when it is tone-mapped;
-            // an SDR proxy keeps the original's matrix.
+            // an SDR proxy keeps the original's matrix (a proxy of untagged HD
+            // footage is labelled BT.709, but a filter graph reads the file's own
+            // tag and a plan reads the proxy's sidecar, so this asset need not say).
             if s.hdr().is_some() {
                 s.color_space = Some("bt709".into());
             }

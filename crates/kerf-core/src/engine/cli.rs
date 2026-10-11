@@ -26,8 +26,9 @@ use crate::clip_timing::{
 };
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, Projection, Property, Reframe, ReframeKeyframe,
-    ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, VideoEffect,
+    pix_fmt_layout, Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, PixLayout, Projection, Property, Reframe,
+    ReframeKeyframe, ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform,
+    VideoEffect,
 };
 use crate::render_plan::{active_video_clips, still_size, CompositeColorPolicy};
 
@@ -1130,7 +1131,37 @@ pub(crate) struct SourceTraits {
     /// path has to ask of them: whether to request a hardware decoder (`decode_policy`).
     pub codec: Codec,
     pub chroma: Chroma,
+    /// The stream is HD YCbCr that names no matrix, so its proxy is labelled BT.709
+    /// ([`untagged_hd_yuv`]).
+    pub label_bt709: bool,
 }
+
+/// Whether a stream is **untagged HD YCbCr**: a picture whose proxy states the matrix, because
+/// the one every player assumes for it is BT.709 and nothing in the file says so.
+///
+/// FFmpeg reads a picture that names no matrix as BT.601, so an untagged proxy and a BT.709
+/// one (a phone's) are two matrices — which a negotiating FFmpeg converts between and the GPU
+/// compositor refuses — although the untagged picture is, by the convention, BT.709 like the
+/// other. That convention is mpv's: HD (`width >= 1280 || height > 576`) is BT.709, anything
+/// smaller BT.601, which is what an untagged proxy already reads as and so stays as it is.
+///
+/// Only a picture whose matrix is a fact about it counts. It is YCbCr (an RGB capture is
+/// converted by the proxy's scaler with BT.601 whatever its size; a grey picture has none), not
+/// full range (`yuvj…`: JFIF, a webcam's MJPEG, is BT.601 by definition, and the name is a
+/// Canon DSLR's BT.709 file's too), and a pixel format the allow-list knows (alpha excluded).
+/// A tag of any kind, `bt470bg` and `smpte170m` included, is the file's word and is kept. HDR
+/// is tone-mapped to a BT.709 picture that is tagged already ([`tonemap_filter`]).
+fn untagged_hd_yuv(color_space: Option<&str>, pix_fmt: &str, width: u32, height: u32, hdr: Option<Hdr>) -> bool {
+    if hdr.is_some() || known_color(color_space).is_some() || pix_fmt.to_ascii_lowercase().starts_with("yuvj") {
+        return false;
+    }
+    matches!(pix_fmt_layout(pix_fmt), Some(PixLayout::Yuv420 | PixLayout::OtherYuv)) && (width >= 1280 || height > 576)
+}
+
+/// The filter that labels a proxy's frames BT.709 without touching a pixel: `setparams`, after
+/// the downscale. Not the output option `-colorspace bt709`, which FFmpeg 9 takes as an order
+/// to convert the picture into that matrix on the way (up to 22 levels moved, measured).
+const BT709_LABEL: &str = "setparams=colorspace=bt709";
 
 /// [`SourceTraits`] of the file at `path`, probed once per file and cached against the file's
 /// size and modified time. One `ffprobe`, killed after [`SOURCE_PROBE_TIMEOUT`]; `None` when the
@@ -1154,7 +1185,7 @@ fn probe_source_traits(ffprobe: &str, path: &Path, timeout: std::time::Duration)
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=color_transfer,start_time,codec_name,pix_fmt:format=start_time,format_name",
+        "stream=color_transfer,color_space,start_time,codec_name,pix_fmt,width,height:format=start_time,format_name",
     ])
     // JSON rather than `csv`/`default`: the stream and the format both have a
     // `start_time`, and a file with side data (a phone's display matrix) makes
@@ -1210,12 +1241,25 @@ fn parse_source_traits(json: &str) -> SourceTraits {
         .and_then(|n| n.as_str())
         .is_some_and(|n| n.split(',').any(|n| matches!(n, "mp4" | "matroska")));
     let text = |key: &str| stream.and_then(|s| s.get(key)).and_then(|v| v.as_str()).unwrap_or("");
+    let size = |key: &str| {
+        stream
+            .and_then(|s| s.get(key))
+            .and_then(|v| v.as_u64())
+            .map_or(0, |n| n.min(u64::from(u32::MAX)) as u32)
+    };
     SourceTraits {
         hdr,
         lead,
         indexed,
         codec: Codec::from_name(text("codec_name")),
         chroma: Chroma::from_pix_fmt(text("pix_fmt")),
+        label_bt709: untagged_hd_yuv(
+            stream.and_then(|s| s.get("color_space")).and_then(|v| v.as_str()),
+            text("pix_fmt"),
+            size("width"),
+            size("height"),
+            hdr,
+        ),
     }
 }
 
@@ -2181,10 +2225,11 @@ fn needs_head_pad(lead: f64) -> bool {
 /// plain one. A suffix is only ever *added* to a source that needs it, so the
 /// key of every ordinary SDR file with a normal start is what it always was and
 /// its cached proxy stays good.
-fn proxy_key(source_key: &str, width: u32, tonemapped: bool, head_padded: bool) -> String {
+fn proxy_key(source_key: &str, width: u32, tonemapped: bool, head_padded: bool, bt709_label: bool) -> String {
     let tone = if tonemapped { "|sdr" } else { "" };
     let pad = if head_padded { "|lead" } else { "" };
-    format!("{source_key}|{width}{tone}{pad}")
+    let label = if bt709_label { "|bt709" } else { "" };
+    format!("{source_key}|{width}{tone}{pad}{label}")
 }
 
 /// The on-disk path of `src`'s preview proxy at `width` (whether or not it
@@ -2206,12 +2251,30 @@ fn proxy_key(source_key: &str, width: u32, tonemapped: bool, head_padded: bool) 
 /// FFmpeg 9 wrote exactly such proxies for every build that had the default
 /// frame-sync mode of its day. Only these sources are rebuilt, and their proxy is
 /// named `<hash>.lead.mp4` (`is_head_padded_proxy`, in `clip_timing`).
+///
+/// And so does an HD picture that **names no matrix** (`|bt709`, [`untagged_hd_yuv`]): its proxy
+/// states BT.709, which the plain one (read as BT.601) did not, and a proxy of an untagged and
+/// one of a BT.709 clip are one matrix only if both say so. Only those are rebuilt; the old
+/// file is deleted when the new one is in place ([`superseded_proxy_path`]).
 pub fn proxy_path(src: &Path, width: u32) -> Option<PathBuf> {
-    let dir = dirs::cache_dir()?.join("kerf").join("proxies");
     let traits = source_traits(src).unwrap_or_default();
+    proxy_path_of(src, width, traits, traits.label_bt709)
+}
+
+/// [`proxy_path`] for given traits, with the BT.709 label decided: `false` is where the same
+/// proxy was kept before the label existed.
+fn proxy_path_of(src: &Path, width: u32, traits: SourceTraits, bt709_label: bool) -> Option<PathBuf> {
+    let dir = dirs::cache_dir()?.join("kerf").join("proxies");
     let padded = needs_head_pad(traits.lead);
-    let key = proxy_key(&source_key(src), width, traits.hdr.is_some(), padded);
+    let key = proxy_key(&source_key(src), width, traits.hdr.is_some(), padded, bt709_label);
     Some(dir.join(proxy_file_name(fnv1a(&key), padded)))
+}
+
+/// Where `src`'s proxy was kept before it was labelled BT.709, for a source whose proxy has
+/// moved: the file a new encode replaces, and so one to delete.
+fn superseded_proxy_path(src: &Path, width: u32) -> Option<PathBuf> {
+    let traits = source_traits(src).unwrap_or_default();
+    traits.label_bt709.then(|| proxy_path_of(src, width, traits, false)).flatten()
 }
 
 /// A proxy's file name (pure, unit-tested): `<hash>.mp4`, or `<hash>.lead.mp4` for
@@ -2232,14 +2295,22 @@ pub fn ready_proxy(src: &Path, width: u32) -> Option<PathBuf> {
     proxy_path(src, width).filter(|p| p.is_file())
 }
 
-/// Delete `src`'s proxy at `width` and the sidecar beside it, returning the bytes
-/// freed (0 when there was none). A proxy that is being written is a `.part` file
-/// and is left to the encode that owns it.
+/// Delete `src`'s proxy at `width` and the sidecar beside it (and the one this proxy
+/// superseded, if it is still there), returning the bytes freed (0 when there was
+/// none). A proxy that is being written is a `.part` file and is left to the encode
+/// that owns it.
 pub fn remove_proxy_files(src: &Path, width: u32) -> u64 {
-    let Some(proxy) = proxy_path(src, width) else {
-        return 0;
-    };
-    [proxy.clone(), proxy_sidecar_path(&proxy)]
+    [proxy_path(src, width), superseded_proxy_path(src, width)]
+        .iter()
+        .flatten()
+        .map(|proxy| remove_proxy_pair(proxy))
+        .sum()
+}
+
+/// Delete `proxy` and its sidecar, returning the bytes freed. Best effort: a file something
+/// still has open (Windows) stays, and costs only its space.
+fn remove_proxy_pair(proxy: &Path) -> u64 {
+    [proxy.to_path_buf(), proxy_sidecar_path(proxy)]
         .iter()
         .filter_map(|file| {
             let bytes = std::fs::metadata(file).ok()?.len();
@@ -2312,12 +2383,14 @@ fn proxy_hw_encoder() -> Option<&'static str> {
 /// exactly one frame (instant scrub even on long-GOP 4K/HEVC). fps and duration
 /// are left untouched — no `-r`, no `-t`, no trim — so a source time maps 1:1
 /// onto the proxy and a preview seek lands on the same frame the export (which
-/// always reads the original) would. `tonemap`, for an HDR source, is the chain
-/// that brings it down to SDR BT.709 after the downscale: the **proxy is where
-/// that conversion happens**, so everything that decodes it afterwards — the
-/// preview stream, scrubbed stills, the composited frame — sees ordinary SDR and
-/// converts nothing a second time. (Upright rotation is the decoder's: ffmpeg
-/// autorotates and writes the proxy without a matrix.)
+/// always reads the original) would. `colour` is the chain that settles the proxy's colour
+/// after the downscale, and the **proxy is where that happens**, so everything that decodes it
+/// afterwards — the preview stream, scrubbed stills, the composited frame — sees a picture whose
+/// colour is stated and converts nothing a second time. For an HDR source it is the tone-map
+/// that brings it down to SDR BT.709; for untagged HD footage it is the label that says BT.709
+/// ([`BT709_LABEL`], [`untagged_hd_yuv`]); an ordinary source passes `None` and keeps whatever
+/// tags it had. (Upright rotation is the decoder's: ffmpeg autorotates and writes the proxy
+/// without a matrix.)
 ///
 /// `head_pad` is for a source whose video starts after its container (see
 /// [`head_lead`]), and carries the spelling of the frame-sync flag
@@ -2347,7 +2420,7 @@ fn build_proxy_args(
     width: u32,
     encoder: &str,
     hw_decode: Option<&str>,
-    tonemap: Option<&str>,
+    colour: Option<&str>,
     head_pad: Option<&str>,
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
@@ -2360,8 +2433,8 @@ fn build_proxy_args(
         args.push("-hwaccel".to_string());
         args.push(hw.to_string());
     }
-    let chain = match tonemap {
-        Some(t) => format!("scale='min({width},iw)':-2:flags=bilinear,{t}"),
+    let chain = match colour {
+        Some(c) => format!("scale='min({width},iw)':-2:flags=bilinear,{c}"),
         None => format!("scale='min({width},iw)':-2:flags=bilinear"),
     };
     args.extend(["-i".to_string(), src.to_string(), "-an".to_string()]);
@@ -2495,10 +2568,13 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         progress(0.0);
     }
     let threads = proxy_threads(cpu.threads());
-    // One cached probe answers both: whether to tone-map and whether the video
-    // starts late (the same one `proxy_path` keyed this proxy on).
+    // One cached probe answers all three: whether to tone-map, whether to label BT.709 and
+    // whether the video starts late (the same one `proxy_path` keyed this proxy on).
     let traits = source_traits(src).unwrap_or_default();
-    let tonemap = traits.hdr.map(tonemap_filter);
+    let colour = traits
+        .hdr
+        .map(tonemap_filter)
+        .or_else(|| traits.label_bt709.then(|| BT709_LABEL.to_string()));
     let head_pad = needs_head_pad(traits.lead).then(fps_mode_flag);
     let mut run = |encoder: &str, hw_decode: Option<&str>| -> Result<Streamed> {
         let mut args = build_proxy_args(
@@ -2508,7 +2584,7 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
             width,
             encoder,
             hw_decode,
-            tonemap.as_deref(),
+            colour.as_deref(),
             head_pad,
         );
         cpu::limit_args(&mut args, threads);
@@ -2579,11 +2655,15 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
     }
     // Another generator may have finished the same proxy while we encoded: theirs is in place
     // with its own sidecar, and ours is redundant.
-    finalize_proxy(&tmp, &dst, || {
+    let placed = finalize_proxy(&tmp, &dst, || {
         probe(&tmp)
             .ok()
             .and_then(|p| p.streams.into_iter().find(|s| s.kind == StreamKind::Video))
-    })
+    })?;
+    if let Some(old) = superseded_proxy_path(src, width) {
+        remove_proxy_pair(&old);
+    }
+    Ok(placed)
 }
 
 /// Which hardware a software rerun that succeeded convicts (pure, unit-tested). The rerun
@@ -7585,6 +7665,42 @@ mod tests {
     }
 
     #[test]
+    fn a_label_is_a_filter_after_the_downscale_and_not_an_option_that_converts() {
+        let plain = build_proxy_args("/in.mov", "/out.mp4", 3, 1280, "libx264", None, None, None);
+        let labelled = build_proxy_args("/in.mov", "/out.mp4", 3, 1280, "libx264", None, Some(BT709_LABEL), None);
+        let vf = |args: &[String]| args.iter().position(|a| a == "-vf").map(|i| args[i + 1].clone());
+        assert_eq!(vf(&plain).as_deref(), Some("scale='min(1280,iw)':-2:flags=bilinear"));
+        assert_eq!(
+            vf(&labelled).as_deref(),
+            Some("scale='min(1280,iw)':-2:flags=bilinear,setparams=colorspace=bt709")
+        );
+        // The rest of the argv is the plain proxy's, word for word: the label touches no pixel,
+        // the timing, the encoder or the GOP.
+        let without = |args: &[String]| args.iter().filter(|a| !a.contains("scale=")).cloned().collect::<Vec<_>>();
+        assert_eq!(without(&plain), without(&labelled));
+        // FFmpeg 9 converts the picture on an output `-colorspace`; the label never uses one.
+        assert!(!labelled
+            .iter()
+            .any(|a| a.starts_with("-colorspace") || a.starts_with("-color_")));
+        // A padded proxy labels before the split, so the held first frame carries it too.
+        let padded = build_proxy_args(
+            "/in.mov",
+            "/out.mp4",
+            3,
+            1280,
+            "libx264",
+            None,
+            Some(BT709_LABEL),
+            Some("-fps_mode"),
+        );
+        let graph = padded.iter().find(|a| a.contains("interleave")).expect("a graph");
+        assert!(
+            graph.starts_with("[0:v:0]scale='min(1280,iw)':-2:flags=bilinear,setparams=colorspace=bt709,split[a][b]"),
+            "{graph}"
+        );
+    }
+
+    #[test]
     fn a_late_video_start_is_filled_by_one_held_frame_and_keeps_every_timestamp() {
         let args = build_proxy_args(
             "/in.mov",
@@ -7767,19 +7883,133 @@ mod tests {
         let src = "/media/a.mov|1234|99";
         // The key of an ordinary SDR file with a normal start is what it has
         // always been, so its cached proxy is still found.
-        assert_eq!(proxy_key(src, 1280, false, false), "/media/a.mov|1234|99|1280");
-        // The `|sdr` precedent, and the new suffix stacked after it.
-        assert_eq!(proxy_key(src, 1280, true, false), "/media/a.mov|1234|99|1280|sdr");
-        assert_eq!(proxy_key(src, 1280, false, true), "/media/a.mov|1234|99|1280|lead");
-        assert_eq!(proxy_key(src, 3072, true, true), "/media/a.mov|1234|99|3072|sdr|lead");
-        let keys = [
-            proxy_key(src, 1280, false, false),
-            proxy_key(src, 1280, true, false),
-            proxy_key(src, 1280, false, true),
-            proxy_key(src, 1280, true, true),
-        ];
+        assert_eq!(proxy_key(src, 1280, false, false, false), "/media/a.mov|1234|99|1280");
+        // The `|sdr` precedent, and the new suffixes stacked after it.
+        assert_eq!(proxy_key(src, 1280, true, false, false), "/media/a.mov|1234|99|1280|sdr");
+        assert_eq!(proxy_key(src, 1280, false, true, false), "/media/a.mov|1234|99|1280|lead");
+        assert_eq!(proxy_key(src, 3072, true, true, false), "/media/a.mov|1234|99|3072|sdr|lead");
+        assert_eq!(proxy_key(src, 1280, false, false, true), "/media/a.mov|1234|99|1280|bt709");
+        assert_eq!(
+            proxy_key(src, 1280, false, true, true),
+            "/media/a.mov|1234|99|1280|lead|bt709"
+        );
+        let keys: Vec<String> = [false, true]
+            .into_iter()
+            .flat_map(|tone| {
+                [false, true]
+                    .into_iter()
+                    .flat_map(move |pad| [false, true].map(move |label| proxy_key(src, 1280, tone, pad, label)))
+            })
+            .collect();
         let hashes: std::collections::HashSet<u64> = keys.iter().map(|k| fnv1a(k)).collect();
         assert_eq!(hashes.len(), keys.len(), "every variant gets its own file");
+    }
+
+    #[test]
+    fn only_untagged_hd_ycbcr_is_labelled_bt709() {
+        let label = |tag: Option<&str>, fmt: &str, w, h| untagged_hd_yuv(tag, fmt, w, h, None);
+        // What a screen recording or a web download is: HD, YCbCr, no matrix named.
+        for tag in [None, Some("unknown"), Some("unspecified"), Some("")] {
+            for (w, h) in [
+                (1280, 720),
+                (1920, 1080),
+                (3840, 2160),
+                (1440, 1080),
+                (1080, 1920),
+                (1280, 536),
+            ] {
+                assert!(label(tag, "yuv420p", w, h), "{tag:?} {w}x{h}");
+            }
+        }
+        for fmt in ["yuv420p10le", "yuv422p", "yuv422p10le", "yuv444p", "nv12", "yuv420p12le"] {
+            assert!(label(None, fmt, 1920, 1080), "{fmt}");
+        }
+        // SD is BT.601, which is what an untagged proxy reads as already: unchanged.
+        for (w, h) in [(720, 576), (720, 480), (640, 480), (960, 540), (1024, 576), (640, 360)] {
+            assert!(!label(None, "yuv420p", w, h), "{w}x{h}");
+        }
+        // One side past the line is HD, as for the players (portrait included).
+        assert!(label(None, "yuv420p", 576, 1024) && label(None, "yuv420p", 1280, 480) && label(None, "yuv420p", 720, 577));
+        // A tag is the file's word, whatever the matrix and whatever the size.
+        for tag in [
+            "bt709",
+            "smpte170m",
+            "bt470bg",
+            "bt2020nc",
+            "bt2020c",
+            "smpte240m",
+            "fcc",
+            "gbr",
+            "ycgco",
+        ] {
+            assert!(!label(Some(tag), "yuv420p", 1920, 1080), "{tag}");
+        }
+        // Not YCbCr (an RGB capture is converted with BT.601 by the proxy's own scaler), not
+        // grey, not full range, nothing on the allow-list's blind side (alpha, unknown, unrecorded).
+        for fmt in [
+            "rgb24", "bgr0", "gbrp", "gray", "gray10le", "yuvj420p", "yuvj422p", "yuvj444p", "YUVJ420P", "yuva420p", "ayuv64le",
+            "pal8", "", "mystery",
+        ] {
+            assert!(!label(None, fmt, 1920, 1080), "{fmt:?}");
+        }
+        // HDR is tone-mapped to a tagged BT.709 picture of its own.
+        assert!(!untagged_hd_yuv(None, "yuv420p10le", 3840, 2160, Some(Hdr::Hlg)));
+        assert!(!untagged_hd_yuv(Some("bt2020nc"), "yuv420p10le", 3840, 2160, Some(Hdr::Pq)));
+        // A probe that said nothing about the size labels nothing.
+        assert!(!label(None, "yuv420p", 0, 0));
+    }
+
+    #[test]
+    fn the_probe_reads_what_decides_the_bt709_label() {
+        let probe = |stream: &str| {
+            parse_source_traits(&format!(
+                r#"{{"streams":[{stream}],"format":{{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","start_time":"0.0"}}}}"#
+            ))
+        };
+        let hd = r#""codec_name":"h264","pix_fmt":"yuv420p","width":1920,"height":1080"#;
+        assert!(probe(&format!("{{{hd}}}")).label_bt709, "no colour tag at all");
+        assert!(
+            probe(&format!(r#"{{{hd},"color_space":"unknown"}}"#)).label_bt709,
+            "ffprobe's word for none"
+        );
+        assert!(!probe(&format!(r#"{{{hd},"color_space":"bt709"}}"#)).label_bt709);
+        assert!(!probe(&format!(r#"{{{hd},"color_space":"smpte170m"}}"#)).label_bt709);
+        assert!(!probe(r#"{"codec_name":"h264","pix_fmt":"yuv420p","width":720,"height":576}"#).label_bt709);
+        assert!(!probe(r#"{"codec_name":"h264","pix_fmt":"yuvj420p","width":1920,"height":1080}"#).label_bt709);
+        assert!(!probe(r#"{"codec_name":"ffv1","pix_fmt":"bgr0","width":1920,"height":1080}"#).label_bt709);
+        assert!(
+            !probe(&format!(r#"{{{hd},"color_transfer":"arib-std-b67"}}"#)).label_bt709,
+            "an HDR source is tone-mapped, not labelled"
+        );
+        // A probe that read nothing, or a source that never said, is an ordinary one.
+        assert!(!probe("{}").label_bt709);
+        assert!(!parse_source_traits("not json").label_bt709);
+        assert_eq!(parse_source_traits(r#"{"streams":[],"format":{}}"#), SourceTraits::default());
+    }
+
+    #[test]
+    fn a_labelled_proxy_moves_and_the_old_one_is_what_it_replaces() {
+        let src = Path::new("/media/screen-recording.mkv");
+        let plain = SourceTraits::default();
+        let labelled = SourceTraits {
+            label_bt709: true,
+            ..plain
+        };
+        let before = proxy_path_of(src, 1280, labelled, false).expect("a cache dir");
+        let after = proxy_path_of(src, 1280, labelled, true).expect("a cache dir");
+        assert_ne!(before, after, "the labelled proxy is a file of its own");
+        // The old place is exactly where a source with no label has always kept its proxy.
+        assert_eq!(Some(before), proxy_path_of(src, 1280, plain, false));
+        assert_eq!(
+            proxy_path_of(src, 1280, labelled, true),
+            proxy_path_of(src, 1280, labelled, true)
+        );
+        // The padded variant keeps its name for what it is, labelled or not.
+        let padded = SourceTraits { lead: 0.5, ..labelled };
+        for label in [false, true] {
+            let name = proxy_path_of(src, 1280, padded, label).unwrap();
+            assert!(is_head_padded_proxy(&name.to_string_lossy()), "{name:?}");
+        }
     }
 
     #[test]
@@ -9003,7 +9233,7 @@ mod tests {
                 e.file_name().to_string_lossy().ends_with(".part")
                     && e.file_name().to_string_lossy().starts_with(&format!(
                         "{:016x}",
-                        fnv1a(&proxy_key(&source_key(&media2), PROXY_MAX_WIDTH, false, false))
+                        fnv1a(&proxy_key(&source_key(&media2), PROXY_MAX_WIDTH, false, false, false))
                     ))
             })
             .collect();
@@ -14896,6 +15126,129 @@ mod tests {
                 / (f.len() / 3) as f64
         };
         (mad, colourful(a), colourful(b))
+    }
+
+    /// The raw `yuv420p` planes of every frame of `path`: what a proxy holds, whatever it is tagged.
+    fn yuv_planes(path: &Path) -> Vec<u8> {
+        let out = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(path)
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1"])
+            .output()
+            .expect("run ffmpeg");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        out.stdout
+    }
+
+    /// An HD clip that names no matrix is a BT.709 picture for every player, though FFmpeg
+    /// reads it as BT.601. Its proxy says so — in the file, in the sidecar the plan reads, in
+    /// the cache key — and changes no pixel; a source that is tagged, SD, full range or RGB is
+    /// made as it always was, and the proxy it replaces is deleted.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored untagged_hd_footage`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn the_proxy_of_untagged_hd_footage_says_bt709_and_changes_no_pixel() {
+        let dir = Scratch::new("label-proxy");
+        let unknown = "setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown";
+        let bt709 = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709";
+        let bt601 = "setparams=colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m";
+        let make = |name: &str, size: &str, label: &str, pix_fmt: &str, codec: &[&str]| -> PathBuf {
+            let path = dir.join(name);
+            let graph = format!("testsrc2=size={size}:rate=10:duration=1,format={pix_fmt},{label}");
+            let mut args = vec!["-f", "lavfi", "-i", graph.as_str(), "-c:v"];
+            args.extend_from_slice(codec);
+            args.extend(["-pix_fmt", pix_fmt, path.to_str().unwrap()]);
+            run_ffmpeg(&args);
+            path
+        };
+        let x264 = ["libx264", "-preset", "ultrafast", "-qp", "0"];
+        let ffv1 = ["ffv1"];
+        let mjpeg = ["mjpeg", "-qscale:v", "1"];
+        // (clip, the matrix its proxy is tagged with — `*` for whatever the scaler's own range
+        // conversion writes, anything but BT.709 — and whether that is a label we put there)
+        let clips = [
+            (make("hd-untagged.mp4", "1280x720", unknown, "yuv420p", &x264), "bt709", true),
+            (
+                make("uhd-untagged.mp4", "3840x2160", unknown, "yuv420p", &x264),
+                "bt709",
+                true,
+            ),
+            (
+                make("hd-422-untagged.mkv", "1280x720", unknown, "yuv422p", &ffv1),
+                "bt709",
+                true,
+            ),
+            (make("hd-709.mp4", "1280x720", bt709, "yuv420p", &x264), "bt709", false),
+            (make("hd-601.mp4", "1280x720", bt601, "yuv420p", &x264), "smpte170m", false),
+            (
+                make("sd-untagged.mp4", "720x576", unknown, "yuv420p", &x264),
+                "unknown",
+                false,
+            ),
+            (make("hd-rgb.mkv", "1280x720", unknown, "bgr0", &ffv1), "unknown", false),
+            (make("hd-mjpeg.mkv", "1280x720", unknown, "yuvj420p", &mjpeg), "*", false),
+        ];
+        for (media, matrix, labelled) in &clips {
+            let name = media.file_name().unwrap().to_string_lossy().into_owned();
+            let traits = source_traits(media).expect("probe");
+            assert_eq!(traits.label_bt709, *labelled, "{name}: the probe's verdict");
+
+            // The proxy the clip had before the label: where it was kept, and what it holds.
+            let old = proxy_path_of(media, PROXY_MAX_WIDTH, traits, false).expect("a cache dir");
+            let unlabelled = traits.label_bt709.then(|| {
+                let plain = dir.join(&format!("plain-{name}.mp4"));
+                let args = build_proxy_args(
+                    media.to_str().unwrap(),
+                    plain.to_str().unwrap(),
+                    2,
+                    PROXY_MAX_WIDTH,
+                    "libx264",
+                    None,
+                    None,
+                    None,
+                );
+                run_ffmpeg(&args.iter().map(String::as_str).collect::<Vec<_>>());
+                plain
+            });
+            // A proxy left by the previous version, which the new one replaces.
+            if traits.label_bt709 {
+                std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+                std::fs::write(&old, b"an old, untagged proxy").unwrap();
+                std::fs::write(proxy_sidecar_path(&old), b"{}").unwrap();
+            }
+
+            let proxy = generate_proxy(media, PROXY_MAX_WIDTH).expect("proxy");
+            let _cleanup = ProxyGuard(proxy.clone());
+            assert_eq!(proxy != old, *labelled, "{name}: only a labelled proxy moves ({proxy:?})");
+            let tag = ffprobe_field(&proxy, "v:0", "stream=color_space");
+            if *matrix == "*" {
+                assert_ne!(tag, "bt709", "{name}: a full-range JPEG picture is not BT.709");
+            } else {
+                assert_eq!(tag, *matrix, "{name}: the proxy's own tag");
+            }
+            // The sidecar is what the plan reads: it says the same.
+            let described = proxy_video_info(&proxy).expect("a sidecar or a probe");
+            assert_eq!(
+                described.color_space.as_deref(),
+                known_color(Some(&tag)).as_deref(),
+                "{name}: the sidecar"
+            );
+            // (FFmpeg 9 keeps a full-range JPEG picture full range: `yuvj420p`.)
+            assert!(matches!(described.pix_fmt.as_deref(), Some("yuv420p" | "yuvj420p")), "{name}");
+            if let Some(plain) = unlabelled {
+                assert_eq!(
+                    yuv_planes(&proxy),
+                    yuv_planes(&plain),
+                    "{name}: the label moved a pixel of the proxy"
+                );
+                assert!(!old.exists(), "{name}: the proxy the new one replaces is still there");
+                assert!(!proxy_sidecar_path(&old).exists(), "{name}: its sidecar too");
+                assert_eq!(superseded_proxy_path(media, PROXY_MAX_WIDTH), Some(old));
+            } else {
+                assert_eq!(superseded_proxy_path(media, PROXY_MAX_WIDTH), None, "{name}: nothing moved");
+            }
+        }
     }
 
     /// An iPhone's HLG BT.2020 footage squeezed into BT.709 untouched is washed

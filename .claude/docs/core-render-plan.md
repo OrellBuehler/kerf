@@ -260,7 +260,14 @@
     because FFmpeg converts the other layers into the bottom layer's matrix with an
     arithmetic that was not reproduced (float and fixed-point models of it were off by
     up to 26 levels). `PlanCanvas.matrix` is the result; `PlanStream::matrix` is the
-    one a translucent layer is taken out of YUV with.
+    one a translucent layer is taken out of YUV with. **Proxies are where the matrices are
+    made to agree** (`engine-cli.md`, "A proxy of untagged HD footage says BT.709"): a proxy of
+    HD footage that names no matrix is labelled BT.709 (no pixel converted), so it stacks with
+    a phone's BT.709 proxy — and an HLG one, tone-mapped to a tagged BT.709 picture — without
+    `MixedMatrices`. The plan reads the proxy's own tag from its sidecar, so a proxy cached
+    before the label (untagged) is still BT.601 here, exactly what the FFmpeg fallback reads
+    of it; it is rebuilt, not reinterpreted. SD, `smpte170m`, `bt2020nc`, RGB and full-range
+    JPEG proxies keep their class, so those mixed with a BT.709 proxy are refused as ever.
   - **What depends on the render size** is decided in the plan, before any decode
     (`LayerGeometry` lives in kerf-core as `layer_geometry.rs` for this reason): a
     translucent layer of odd size, **resizing a picture that is not 8/10-bit
