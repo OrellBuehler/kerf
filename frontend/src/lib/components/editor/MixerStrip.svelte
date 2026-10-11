@@ -205,7 +205,10 @@
 		border-radius: var(--radius-md);
 		transition: opacity var(--dur-normal) var(--ease-out);
 	}
-	.strip.quiet {
+	/* A muted or empty strip dims what it shows, not what it offers: the M / S / D buttons — the way back — and
+	   the name's own red "muted" stay at full strength. */
+	.strip.quiet > :global(:not(header):not(.toggles)),
+	.strip.quiet .name {
 		opacity: 0.6;
 	}
 	header {
