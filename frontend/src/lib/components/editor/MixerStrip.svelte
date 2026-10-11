@@ -193,7 +193,7 @@
 <style>
 	.strip {
 		flex: none;
-		width: 100px;
+		width: 108px;
 		display: flex;
 		flex-direction: column;
 		gap: 5px;
@@ -242,7 +242,8 @@
 	}
 	.tog {
 		flex: 1;
-		min-width: 0;
+		/* A hit target is 24 px at least: M and S never go narrower, whatever DUCK is given. */
+		min-width: 24px;
 		height: 24px;
 		padding: 0;
 		cursor: pointer;
@@ -258,9 +259,11 @@
 	.tog:hover {
 		color: var(--text-primary);
 	}
-	/* Duck is spelled out, as it is in the timeline's track header: M and S are the narrow ones. */
+	/* Duck is spelled out, as it is in the timeline's track header. The strip is wide enough for 24 + 24 + 36 and the
+	   gaps (108 less its padding and edges), so this takes what is left after M and S, never what they need. */
 	.tog.duck {
-		flex: 2.1;
+		flex: 1.6;
+		min-width: 36px;
 		font-size: var(--text-xs);
 		letter-spacing: 0.02em;
 	}
