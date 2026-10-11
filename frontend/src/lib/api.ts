@@ -462,10 +462,28 @@ export async function listFonts(): Promise<string[]> {
 	return invoke<string[]>('list_fonts');
 }
 
-/** GPU video encoders the backend verified usable (empty in the browser). */
+let hwEncodersKnown: string[] | null = null;
+
+/** `?hw=h264_amf,hevc_amf` makes the browser harness answer as a machine with those encoders. */
+function harnessHwEncoders(): string[] {
+	try {
+		return (new URLSearchParams(location.search).get('hw') ?? '').split(',').filter(Boolean);
+	} catch {
+		return [];
+	}
+}
+
+/** GPU video encoders the backend verified usable (none in the browser harness, unless `?hw=`
+ *  names some). The backend probes once per process, so the answer is kept: a reopened export
+ *  dialog starts with it. */
 export async function hwEncoders(): Promise<string[]> {
-	if (!inTauri()) return [];
-	return invoke<string[]>('hw_encoders');
+	hwEncodersKnown = inTauri() ? await invoke<string[]>('hw_encoders') : harnessHwEncoders();
+	return hwEncodersKnown;
+}
+
+/** What [`hwEncoders`] last answered, `[]` before it has. */
+export function knownHwEncoders(): string[] {
+	return hwEncodersKnown ?? [];
 }
 
 export async function getTimeline(): Promise<Timeline> {

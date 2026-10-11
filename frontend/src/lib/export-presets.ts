@@ -19,8 +19,19 @@ export interface ContainerInfo {
 	videoOnly: boolean;
 }
 
-const HW_H26X = ['h264_nvenc', 'hevc_nvenc', 'h264_qsv', 'hevc_qsv', 'h264_videotoolbox', 'hevc_videotoolbox', 'h264_amf', 'hevc_amf'];
-const HW_AV1 = ['av1_nvenc', 'av1_qsv'];
+const HW_H26X = [
+	'h264_nvenc',
+	'hevc_nvenc',
+	'h264_qsv',
+	'hevc_qsv',
+	'h264_videotoolbox',
+	'hevc_videotoolbox',
+	'h264_amf',
+	'hevc_amf',
+	'h264_vaapi',
+	'hevc_vaapi'
+];
+const HW_AV1 = ['av1_nvenc', 'av1_qsv', 'av1_amf', 'av1_vaapi'];
 
 export const CONTAINERS: ContainerInfo[] = [
 	{ id: 'mp4', label: 'MP4', ext: 'mp4', video: ['libx264', 'libx265', 'libsvtav1'], hwVideo: [...HW_H26X, ...HW_AV1], audio: ['aac', 'alac'], faststart: true, audioOnly: false, videoOnly: false },
@@ -37,7 +48,15 @@ export const CONTAINERS: ContainerInfo[] = [
 /** Whether a `-c:v` value is a hardware encoder (family read from its suffix,
  *  as in the Rust engine). */
 export function isHwCodec(id?: string | null): boolean {
-	return !!id && /_(nvenc|qsv|videotoolbox|amf)$/.test(id);
+	return !!id && /_(nvenc|qsv|videotoolbox|amf|vaapi)$/.test(id);
+}
+
+/** The constant QP an AMF or VAAPI encoder gets for a software-scale CRF — `hw_qp` in the
+ *  engine. Hardware H.264 / HEVC spend about twice the bits at the x264 CRF's number, so the QP
+ *  sits 6 above it (x264 CRF 20 measured equal to QP 26 on an RX 7900 XT); AV1's 0..255
+ *  quantiser takes 4 per CRF step. */
+export function hwQp(codec: string, crf: number): number {
+	return codec.startsWith('av1_') ? Math.min(255, crf * 4) : Math.min(51, crf + 6);
 }
 
 export interface VideoCodecInfo {
@@ -82,8 +101,12 @@ export const HW_VIDEO_CODECS: Record<string, VideoCodecInfo> = {
 	av1_qsv: hwCodec('av1_qsv', 'AV1 · Intel GPU (QuickSync)', 30, QSV_PRESETS, 'medium'),
 	h264_videotoolbox: hwCodec('h264_videotoolbox', 'H.264 · Apple GPU (VideoToolbox)', 20, null, undefined, ['baseline', 'main', 'high']),
 	hevc_videotoolbox: hwCodec('hevc_videotoolbox', 'HEVC · Apple GPU (VideoToolbox)', 22, null, undefined, ['main']),
-	h264_amf: hwCodec('h264_amf', 'H.264 · AMD GPU (AMF)', 23, null, undefined, ['baseline', 'main', 'high']),
-	hevc_amf: hwCodec('hevc_amf', 'HEVC · AMD GPU (AMF)', 25, null, undefined, ['main'])
+	h264_amf: hwCodec('h264_amf', 'H.264 · AMD GPU (AMF)', 23, null, undefined, ['constrained_baseline', 'main', 'high']),
+	hevc_amf: hwCodec('hevc_amf', 'HEVC · AMD GPU (AMF)', 25, null, undefined, ['main']),
+	av1_amf: hwCodec('av1_amf', 'AV1 · AMD GPU (AMF)', 30, null),
+	h264_vaapi: hwCodec('h264_vaapi', 'H.264 · GPU (VAAPI)', 23, null, undefined, ['main', 'high']),
+	hevc_vaapi: hwCodec('hevc_vaapi', 'HEVC · GPU (VAAPI)', 25, null, undefined, ['main']),
+	av1_vaapi: hwCodec('av1_vaapi', 'AV1 · GPU (VAAPI)', 30, null)
 };
 
 export const VIDEO_CODECS: Record<string, VideoCodecInfo> = {
@@ -321,9 +344,45 @@ export const PRESETS: Preset[] = [
 	}
 ];
 
+export const GPU_PRESET_ID = 'gpu_fast';
+
+/** The H.264 encoders the "Fast (GPU)" preset takes the first verified one of, in the engine's
+ *  family order. */
+const GPU_H264 = ['h264_nvenc', 'h264_qsv', 'h264_videotoolbox', 'h264_amf', 'h264_vaapi'];
+
+/** "Fast (GPU)": Web 1080p on the graphics card, encode and decode. Offered only when the backend
+ *  verified an H.264 hardware encoder (`hw_encoders`), and never the default: x264 stays the
+ *  default until the hardware encoders' quality is confirmed on real footage. */
+export function gpuPreset(hw: readonly string[]): Preset | null {
+	const codec = GPU_H264.find((id) => hw.includes(id));
+	if (!codec) return null;
+	return {
+		id: GPU_PRESET_ID,
+		label: 'Fast (GPU)',
+		description: `${HW_VIDEO_CODECS[codec].label} MP4 at 1080p with GPU decode: far quicker than Web 1080p. Hardware encoders usually need a somewhat larger file for the same quality.`,
+		opts: {
+			container: 'mp4',
+			...videoCodecDefaults(codec),
+			rate_control: 'crf',
+			resolution: [1920, 1080],
+			hwaccel: 'auto',
+			audio_codec: 'aac',
+			audio_bitrate: '192k',
+			faststart: true
+		}
+	};
+}
+
+/** The presets the dialog lists: the built-in ones, with "Fast (GPU)" after Web 1080p when this
+ *  machine has a verified hardware encoder to run it on. */
+export function presetsFor(hw: readonly string[] = []): Preset[] {
+	const gpu = gpuPreset(hw);
+	return gpu ? [PRESETS[0], gpu, ...PRESETS.slice(1)] : PRESETS;
+}
+
 /** A full options object for a preset id, layered over the bare default. */
-export function applyPreset(id: string): ExportOptions {
-	const p = PRESETS.find((x) => x.id === id);
+export function applyPreset(id: string, hw: readonly string[] = []): ExportOptions {
+	const p = presetsFor(hw).find((x) => x.id === id);
 	return { ...DEFAULT_EXPORT_OPTIONS, ...(p?.opts ?? {}) };
 }
 
@@ -392,6 +451,9 @@ export function validateExport(opts: ExportOptions, hasVideo: boolean, hasAudio:
 	if (wantVideo && opts.tune && (opts.video_codec === 'libx264' || opts.video_codec === 'libx265') && !VIDEO_CODECS[opts.video_codec].tunes.includes(opts.tune)) {
 		issues.push(`tune "${opts.tune}" is not valid for ${opts.video_codec}.`);
 	}
+	if (wantVideo && info.id !== 'gif' && opts.video_codec?.endsWith('_vaapi') && opts.pix_fmt && opts.pix_fmt !== 'yuv420p' && opts.pix_fmt !== 'nv12') {
+		issues.push('VAAPI encoders take 8-bit 4:2:0 (yuv420p) here.');
+	}
 	if (opts.video_bitrate && !bitrateValid(opts.video_bitrate)) issues.push(`Invalid video bitrate "${opts.video_bitrate}".`);
 	if (opts.max_rate && !bitrateValid(opts.max_rate)) issues.push(`Invalid max rate "${opts.max_rate}".`);
 	if (opts.buf_size && !bitrateValid(opts.buf_size)) issues.push(`Invalid buffer size "${opts.buf_size}".`);
@@ -451,7 +513,8 @@ export function buildCommandPreview(opts: ExportOptions, hasVideo: boolean, hasA
 	const wantVideo = hasVideo && !info.audioOnly;
 	const wantAudio = hasAudio && !info.videoOnly && opts.include_audio;
 	const hwaccel = opts.hwaccel && opts.hwaccel !== 'none' ? ['-hwaccel', opts.hwaccel] : [];
-	const a: string[] = ['ffmpeg', '-y', ...hwaccel, '-i', '…inputs…', '-filter_complex', '…graph…'];
+	const vaapi = wantVideo && !!opts.video_codec?.endsWith('_vaapi') && opts.container !== 'gif';
+	const a: string[] = ['ffmpeg', '-y', ...(vaapi ? ['-vaapi_device', '/dev/dri/renderD128'] : []), ...hwaccel, '-i', '…inputs…', '-filter_complex', vaapi ? '…graph…,format=nv12,hwupload' : '…graph…'];
 	if (wantVideo) a.push('-map', '[outv]');
 	if (wantAudio) a.push('-map', '[outa]');
 
@@ -466,11 +529,13 @@ export function buildCommandPreview(opts: ExportOptions, hasVideo: boolean, hasA
 			if (opts.rate_control === 'crf') {
 				// Hardware families spell the constant-quality knob differently.
 				const q = opts.crf != null ? String(opts.crf) : null;
+				const qp = opts.crf != null ? String(hwQp(vc, opts.crf)) : null;
 				if (vc.endsWith('_nvenc')) a.push('-rc', 'vbr', ...(q ? ['-cq', q] : []), '-b:v', '0');
 				else if (vc.endsWith('_qsv')) q && a.push('-global_quality', q);
 				else if (vc.endsWith('_videotoolbox'))
 					opts.crf != null && a.push('-q:v', String(Math.min(100, Math.max(1, Math.round((1 - Math.min(opts.crf, 51) / 51) * 100)))));
-				else if (vc.endsWith('_amf')) a.push('-rc', 'cqp', ...(q ? ['-qp_i', q, '-qp_p', q] : []));
+				else if (vc.endsWith('_amf')) a.push('-rc', 'cqp', ...(qp ? ['-qp_i', qp, '-qp_p', qp] : []));
+				else if (vc.endsWith('_vaapi')) a.push('-rc_mode', 'CQP', ...(qp ? ['-global_quality', qp] : []));
 				else {
 					if (q) a.push('-crf', q);
 					if (vc === 'libvpx-vp9') a.push('-b:v', '0');
@@ -485,11 +550,12 @@ export function buildCommandPreview(opts: ExportOptions, hasVideo: boolean, hasA
 				a.push(vc === 'libvpx-vp9' ? '-lossless 1' : '-crf 0');
 			}
 			if (vc === 'libvpx-vp9') a.push('-cpu-used', opts.preset ?? '4');
+			else if (vc.endsWith('_amf')) a.push('-quality', 'quality');
 			else if (opts.preset) a.push('-preset', opts.preset);
 			if ((vc === 'libx264' || vc === 'libx265') && opts.tune) a.push('-tune', opts.tune);
 			if ((h264 || hevc) && opts.profile_v) a.push('-profile:v', opts.profile_v);
 			if (hevc && (opts.container === 'mp4' || opts.container === 'mov')) a.push('-tag:v', 'hvc1');
-			a.push('-pix_fmt', opts.pix_fmt ?? 'yuv420p');
+			if (!vc.endsWith('_vaapi')) a.push('-pix_fmt', opts.pix_fmt ?? 'yuv420p');
 		}
 	}
 	const ac = opts.audio_codec;

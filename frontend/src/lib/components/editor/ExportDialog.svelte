@@ -8,7 +8,7 @@
 	import Readiness from './Readiness.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
-	import { inTauri, pickExportPath, hwEncoders, revealPath } from '$lib/api';
+	import { inTauri, pickExportPath, hwEncoders, knownHwEncoders, revealPath } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 	import { formatsFor, hasPicture } from '$lib/delivery-formats';
 	import { formatTimecode } from '$lib/timecode';
@@ -29,6 +29,7 @@
 		RESOLUTIONS,
 		frameRateOptions,
 		applyPreset,
+		presetsFor,
 		containerInfo,
 		isHwCodec,
 		LOUDNESS_TARGETS,
@@ -90,7 +91,8 @@
 
 	// GPU encoders the backend verified usable on this machine; merged into the
 	// codec choices once known (empty in the browser harness).
-	let hwCodecs = $state<string[]>([]);
+	let hwCodecs = $state<string[]>(knownHwEncoders());
+	const presets = $derived(presetsFor(hwCodecs));
 	$effect(() => {
 		hwEncoders()
 			.then((list) => (hwCodecs = list))
@@ -155,7 +157,7 @@
 		activePreset = 'custom';
 	}
 	function choosePreset(id: string) {
-		opts = applyPreset(id);
+		opts = applyPreset(id, hwCodecs);
 		activePreset = id;
 		customRes = false;
 	}
@@ -333,12 +335,12 @@
 				activePreset,
 				[
 					...(activePreset === 'custom' ? [{ value: 'custom', label: 'Custom settings' }] : []),
-					...PRESETS.map((p) => ({ value: p.id, label: p.label }))
+					...presets.map((p) => ({ value: p.id, label: p.label }))
 				],
 				choosePreset
 			)}
 			<p style="font-size:12px;color:var(--text-muted);margin:2px 0 4px;line-height:1.45">
-				{PRESETS.find((p) => p.id === activePreset)?.description ?? 'Your own settings — pick a preset to start over from one.'}
+				{presets.find((p) => p.id === activePreset)?.description ?? 'Your own settings — pick a preset to start over from one.'}
 			</p>
 			<!-- destination -->
 			{@render secHead('Destination')}
