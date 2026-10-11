@@ -274,7 +274,7 @@
   its size-free half; `unsupported_reasons_at(size)` says *no, with reasons*) for
   anything the compositor does not render exactly: video effects (`Effects(layer, what)`: names the effect and
   why — a vignette's dither is a counter that runs on across frames, a chroma key's alpha is a float colour distance — or the value
-  `gblur` / `unsharp` refuse itself: a sigma outside 0 to 1024, an amount outside -2 to 5; or what the picture changes: an invert, blur or sharpen on a full-range or never-recorded picture, an invert on a gray one; and in `reasons`, by render size, a sharpen above 0.5 on a picture scaled ahead of it), masks (`Mask` without `caps.mask`;
+  `gblur` / `unsharp` refuse itself: a sigma outside 0 to 1024, an amount outside -2 to 5; or what the picture changes: an invert, blur or sharpen on a full-range or never-recorded picture, an invert on a gray one; and in `reasons`, by render size, a sharpen after a scale or a blur: the gains `1 + 2 x amount` of the sharpens that follow the first scale or blur multiply, and the frame is refused past 2), masks (`Mask` without `caps.mask`;
   `MaskWith(layer, what)` with it, on a rotated layer or one below full opacity; `Matte(layer, what)` for a blur or a sharpen on a
   letterboxed picture, judged with the geometry in `reasons`: FFmpeg's `pad` hands them the padded frame, bars included — a mask is cut
   from that frame too and is drawn at the layer's size), 360 reframe,

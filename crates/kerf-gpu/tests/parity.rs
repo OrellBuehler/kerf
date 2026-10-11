@@ -4439,13 +4439,18 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             limits,
         );
     }
-    // A sharpen past half strength on a picture scaled ahead of it is FFmpeg's, with or without a blur.
+    // A sharpen whose gain on a scale's or a blur's level passes 2 is FFmpeg's: past half strength after a scale
+    // or a blur, or two of half strength.
     for (name, effects) in [
         ("sharpen-1.5", vec![E::Sharpen { amount: 1.5 }]),
         ("sharpen-5", vec![E::Sharpen { amount: 5.0 }]),
         (
             "blur-then-sharpen-1.5",
             vec![E::Blur { sigma: 3.0 }, E::Sharpen { amount: 1.5 }],
+        ),
+        (
+            "sharpen-0.5-twice",
+            vec![E::Sharpen { amount: 0.5 }, E::Sharpen { amount: 0.5 }],
         ),
     ] {
         let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
@@ -4457,7 +4462,28 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             &tl,
             &[m.bars.clone(), m.testsrc.clone()],
             0.5,
-            Refusal::Plan("sharpen above 0.5"),
+            Refusal::Plan("sharpen after a scale or a blur"),
+        );
+    }
+    // ...and after a blur with nothing scaled.
+    for (name, effects) in [
+        (
+            "blur-then-sharpen-1",
+            vec![E::Blur { sigma: 3.0 }, E::Sharpen { amount: 1.0 }],
+        ),
+        (
+            "blur-then-sharpen-5",
+            vec![E::Blur { sigma: 3.0 }, E::Sharpen { amount: 5.0 }],
+        ),
+    ] {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.effects = effects;
+        check_refused(
+            &format!("refused/effect-{name}"),
+            &timeline(vec![vec![c]], None),
+            std::slice::from_ref(&m.testsrc),
+            0.5,
+            Refusal::Plan("sharpen after a scale or a blur"),
         );
     }
     // A table on a letterbox: the bars are part of the frame `pad` hands the effect, so they go through it.
@@ -4567,6 +4593,11 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         ("blur", vec![E::Blur { sigma: 2.5 }]),
         ("sharpen", vec![E::Sharpen { amount: 1.5 }]),
         ("invert", vec![E::Invert]),
+        // A sharpen of half strength after a blur: the blur's level times a gain of two.
+        (
+            "blur-then-sharpen-0.5",
+            vec![E::Blur { sigma: 2.5 }, E::Sharpen { amount: 0.5 }],
+        ),
     ] {
         let mut c = clip(&m.noise, 0.0, 0.2, 0.0);
         c.effects = effects;

@@ -2608,10 +2608,18 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         ("blur 6.3", vec![E::Blur { sigma: 6.3 }], EFFECT),
         ("blur then invert", vec![E::Blur { sigma: 3.0 }, E::Invert], EFFECT),
         ("invert then blur", vec![E::Invert, E::Blur { sigma: 3.0 }], EFFECT),
+        // A sharpen after a blur amplifies the blur's own level (FFmpeg's SIMD order against ours) by its gain
+        // (`1 + 2 * amount`): at half strength that is two levels (`EFFECT_SCALED`), past it the plan refuses
+        // (below). Sharpens with nothing inexact ahead of them are exact, chained too.
         (
-            "blur then sharpen",
-            vec![E::Blur { sigma: 2.0 }, E::Sharpen { amount: 1.0 }],
-            EFFECT,
+            "blur then sharpen 0.5",
+            vec![E::Blur { sigma: 2.0 }, E::Sharpen { amount: 0.5 }],
+            EFFECT_SCALED,
+        ),
+        (
+            "sharpen twice",
+            vec![E::Sharpen { amount: 1.0 }, E::Sharpen { amount: 2.0 }],
+            EXACT,
         ),
         (
             "sharpen, gray, blur, invert",
@@ -2647,6 +2655,18 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             EFFECT,
         );
     }
+    // A blur then a sharpen of half strength over noise (every sample on a tie of the blur's rounding is a
+    // chance for the blur's level to be amplified): held to two levels.
+    let mut c = clip(&m.noise, 0.5, 1.5, 0.0);
+    c.effects = vec![E::Blur { sigma: 2.5 }, E::Sharpen { amount: 0.5 }];
+    run(
+        "effect/noise blur then sharpen 0.5",
+        &timeline(vec![vec![c]], None),
+        std::slice::from_ref(&m.noise),
+        30.0,
+        0.4,
+        EFFECT_SCALED,
+    );
     // After a scale: the effect sees the picture at the size it is drawn at (the zoom comes first
     // when it does not move).
     let (tl, assets) = over_bars(m, &|c| {
@@ -2680,8 +2700,12 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         });
         run(&format!("effect/{name} on a pip"), &tl, &assets, 30.0, 0.5, EFFECT_SCALED);
     }
-    // ...and past it refused, with or without a blur beside it: FFmpeg renders them.
+    // ...and past a gain of 2 refused, after a scale or a blur: FFmpeg renders them.
     for (name, effects) in [
+        (
+            "sharpen 0.5 twice",
+            vec![E::Sharpen { amount: 0.5 }, E::Sharpen { amount: 0.5 }],
+        ),
         ("sharpen 1.5", vec![E::Sharpen { amount: 1.5 }]),
         ("sharpen 3", vec![E::Sharpen { amount: 3.0 }]),
         ("sharpen 5", vec![E::Sharpen { amount: 5.0 }]),
@@ -2706,7 +2730,36 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             &assets,
             &at_fps(30.0),
             upto(1.0, 30.0),
-            "sharpen above 0.5",
+            "sharpen after a scale or a blur",
+        );
+    }
+    // After a blur, unscaled: the blur's level is amplified the same way.
+    for (name, effects) in [
+        (
+            "blur then sharpen 0.6",
+            vec![E::Blur { sigma: 2.0 }, E::Sharpen { amount: 0.6 }],
+        ),
+        (
+            "blur then sharpen 1",
+            vec![E::Blur { sigma: 2.0 }, E::Sharpen { amount: 1.0 }],
+        ),
+        (
+            "blur then sharpen 5",
+            vec![E::Blur { sigma: 2.0 }, E::Sharpen { amount: 5.0 }],
+        ),
+        (
+            "blur then sharpen 0.5 twice",
+            vec![E::Blur { sigma: 2.0 }, E::Sharpen { amount: 0.5 }, E::Sharpen { amount: 0.5 }],
+        ),
+    ] {
+        let (tl, assets) = over_bars(m, &|c| c.effects = effects.clone());
+        refused(
+            &format!("effect/{name}"),
+            &tl,
+            &assets,
+            &at_fps(30.0),
+            upto(1.0, 30.0),
+            "sharpen after a scale or a blur",
         );
     }
     // A table on a letterbox: `pad`'s bars are part of the frame the effect sees, so they go through it
