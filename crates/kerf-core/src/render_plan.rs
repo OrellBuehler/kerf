@@ -693,12 +693,13 @@ fn effect_refusal(effect: &VideoEffect, caps: &GpuCaps) -> Option<&'static str> 
 /// conversion to 4:2:0 comes after. An invert of a gray picture negates its luma and has no chroma to negate
 /// (the compositor's neutral chroma would go to 127); a full-range picture reaches the filter with its raw
 /// values and is converted to limited range afterwards (an invert is off by up to 8 levels, a sharpen's
-/// overshoot by 26: measured on both FFmpegs), and a picture whose format was never recorded may be either.
+/// overshoot by 26: measured on 9.0.2), and a picture whose format was never recorded may be either, as may
+/// a deeper-than-8-bit one where FFmpeg 9 keeps a `pc` tag's raw values ([`PlanStream::maybe_full_range_in`]).
 /// Grayscale (chroma to 128, luma untouched) is the same on all of them, and so are the other formats the
-/// decode converts (10-bit, 4:2:2, 4:4:4, RGB), to the decode's own rounding.
-fn effect_on_picture_refusal(effect: &VideoEffect, stream: &PlanStream) -> Option<&'static str> {
+/// decode converts (4:2:2, 4:4:4, RGB; 10-bit under `FixedBt601`), to the decode's own rounding.
+fn effect_on_picture_refusal(effect: &VideoEffect, stream: &PlanStream, policy: CompositeColorPolicy) -> Option<&'static str> {
     match effect {
-        VideoEffect::Invert | VideoEffect::Blur { .. } | VideoEffect::Sharpen { .. } if stream.maybe_full_range() => {
+        VideoEffect::Invert | VideoEffect::Blur { .. } | VideoEffect::Sharpen { .. } if stream.maybe_full_range_in(policy) => {
             Some("a blur, a sharpen or an invert on a full-range picture, or one whose pixel format was never recorded (FFmpeg runs it on the raw values and converts the range afterwards)")
         }
         VideoEffect::Invert if stream.layout() == Some(PixLayout::Gray) => {
@@ -939,7 +940,7 @@ impl RenderPlan {
             if let Some(what) = layer
                 .effects
                 .iter()
-                .find_map(|e| effect_refusal(e, caps).or_else(|| effect_on_picture_refusal(e, stream)))
+                .find_map(|e| effect_refusal(e, caps).or_else(|| effect_on_picture_refusal(e, stream, self.canvas.policy)))
             {
                 out.push(Unsupported::Effects(at(), what));
             }
@@ -2421,14 +2422,22 @@ mod tests {
                 .union(EffectKinds::INVERT),
             ..GpuCaps::A0
         };
-        let reasons = |fmt: Option<&str>, effect: VideoEffect| {
+        let reasons_in = |policy: CompositeColorPolicy, fmt: Option<&str>, effect: VideoEffect| {
             let mut a = asset("a", 20.0, vec![video(640, 360)]);
             a.streams[0].pix_fmt = fmt.map(Into::into);
             let mut clip = Clip::new(a.id, 0.0, 10.0, 0.0);
             clip.effects = vec![effect];
-            let planned = plan(&timeline(vec![vec![clip]]), std::slice::from_ref(&a), 0.5);
+            let planned = RenderPlan::at(
+                &timeline(vec![vec![clip]]),
+                std::slice::from_ref(&a),
+                &ExportOptions::default(),
+                0.5,
+                policy,
+            )
+            .unwrap();
             planned.reasons(&caps, planned.size(u32::MAX))
         };
+        let reasons = |fmt: Option<&str>, effect: VideoEffect| reasons_in(CompositeColorPolicy::FixedBt601, fmt, effect);
         let effects = || {
             [
                 VideoEffect::Blur { sigma: 3.0 },
@@ -2454,6 +2463,20 @@ mod tests {
                     _ => assert!(
                         matches!(why.as_slice(), [Unsupported::Effects(_, w)] if w.contains("full-range")),
                         "{fmt:?} {e:?}: {why:?}"
+                    ),
+                }
+            }
+        }
+        // A deeper-than-8-bit picture may carry a `pc` tag FFmpeg 9 keeps the raw values of: where the range is
+        // negotiated it is refused like a full-range one (grayscale apart), under `FixedBt601` it is drawn.
+        for policy in [CompositeColorPolicy::BottomLayerTag, CompositeColorPolicy::Unknown] {
+            for e in effects() {
+                let why = reasons_in(policy, Some("yuv420p10le"), e.clone());
+                match e {
+                    VideoEffect::Grayscale => assert!(why.is_empty(), "{policy:?}: {why:?}"),
+                    _ => assert!(
+                        matches!(why.as_slice(), [Unsupported::Effects(_, w)] if w.contains("full-range")),
+                        "{policy:?} {e:?}: {why:?}"
                     ),
                 }
             }

@@ -550,10 +550,11 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
 * Refused (`Effects`): a vignette (its dither is an LCG counter that runs on across frames), a chroma key (a float colour distance), a sigma outside 0 to 1024
   or an amount outside -2 to 5 (FFmpeg's options refuse them too), a blur over the device's storage-buffer limit. `Matte`: a blur or a sharpen on a
   letterbox (they would see the bars as picture; tables and a grade carry the bars through). By the picture (`effect_on_picture_refusal`): an invert,
-  blur or sharpen on a **full-range** picture or one whose format was never recorded (FFmpeg runs it on the raw values and converts the range afterwards:
-  an invert is 8 levels off, a sharpen's overshoot 26, on 9.0.2; grayscale is the same on any range), and an invert of a **gray** picture (FFmpeg leaves
+  blur or sharpen on a **full-range** picture or one whose format was never recorded (`maybe_full_range_in(policy)`: where FFmpeg 9 negotiates the range this
+  holds a deeper-than-8-bit one too, which may carry a `pc` tag; FFmpeg runs the filter on the raw values and converts the range afterwards: an invert is 8
+  levels off, a sharpen's overshoot 26, on 9.0.2; grayscale is the same on any range), and an invert of a **gray** picture (FFmpeg leaves
   its chroma at 128, the compositor's planes would go to 127).
-* 10-bit, 4:2:2, 4:4:4, RGB and gray pictures take every other effect and a mask at the plain source's own figures (max 3: the decode's rounding).
+* 4:2:2, 4:4:4, RGB and gray pictures (and 10-bit under `FixedBt601`) take every other effect and a mask at the plain source's own figures (max 3: the decode's rounding).
   Compute passes are core wgpu on every backend and the blur writes no storage texture: no optional feature.
 
 **`tests/motion_parity.rs`** (`#[ignore]`d; both FFmpegs in CI's parity job) holds the compositor to the **export**, frame by frame: each case builds a short

@@ -4477,6 +4477,18 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             let mut c = clip(asset, 0.0, asset.duration.min(2.0), 0.0);
             c.effects = vec![effect];
             let tl = timeline(vec![vec![c]], None);
+            // A deeper-than-8-bit picture may be `pc`-tagged, which FFmpeg 9 keeps the raw values of (as a
+            // `yuvj` one): where the range is negotiated the effects but grayscale are refused.
+            if label == "10-bit" && name != "grayscale" && policy() != CompositeColorPolicy::FixedBt601 {
+                check_refused(
+                    &format!("refused/effect-{name}-on-{label}"),
+                    &tl,
+                    std::slice::from_ref(asset),
+                    0.5,
+                    Refusal::Plan("full-range"),
+                );
+                continue;
+            }
             check(
                 &format!("effect/{name}-on-{label}"),
                 &tl,
