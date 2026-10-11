@@ -12,12 +12,15 @@
 //!   **none does** — a clip that fails that is a bad fixture, not a flaky test;
 //! * the cut lists themselves at the default threshold and at a lower one, frame-exact;
 //! * sources: 8-bit H.264 with B-frames and audio, 10-bit HEVC, 4:2:2 10-bit HEVC, a video
-//!   that starts 64 ms and 1.5 s after its audio (head-padded `.lead.mp4` proxies), a portrait
-//!   clip carried by a display matrix, a variable-frame-rate Matroska file;
+//!   that starts 64 ms and 1.5 s after its audio (head-padded `.lead.mp4` proxies; also in
+//!   Matroska), a portrait clip carried by a display matrix, a variable-frame-rate Matroska file
+//!   (all through the software, libx264, proxy: a hardware-encoded one is unmeasured);
 //! * the control: the *unpadded* proxy of a late-starting source finds every cut `lead`
 //!   seconds early, which is what the head pad prevents;
-//! * an HDR (HLG) source, where the proxy moves the scores by a fifth of the scale: scene detection
-//!   keeps reading the original, and a transport stream is not read from its proxy either;
+//! * an HDR (HLG) source, where the proxy moves the scores by 0.20 to 0.21, and RGB-family
+//!   sources (QuickTime Animation, x264 RGB, FFV1 BGR0), where the scene filter scores another
+//!   plane than the proxy's luma (0.5 and more, cuts lost): scene detection keeps reading the
+//!   original of these, and a transport stream is not read from its proxy either;
 //! * a contact sheet shows the same frame in every cell from the proxy as from the original,
 //!   from the start and from a seek, for an ordinary and a head-padded proxy.
 //!
@@ -428,6 +431,13 @@ fn scenes_on_proxy_late_starting_video_is_padded_and_keeps_its_cut_times() {
         }
     }
 
+    // The same in Matroska (millisecond ticks): padded, and the same cuts.
+    let mkv = fixture!(late(&dir, &h264, "late.mkv", 0.5), "a late-starting Matroska clip");
+    let traits = source_traits(&mkv).expect("probe");
+    assert!((traits.lead - 0.5).abs() < 0.005, "the probe saw {}", traits.lead);
+    let cuts = same_cuts("lead 0.5, Matroska", &mkv, true);
+    assert_eq!(cuts.len(), reference.len(), "{cuts:?} against {reference:?}");
+
     // A transport stream cannot be padded (its demuxer rebases a read without the audio), so its
     // proxy is not trusted for times: the scene detector and the sheet read the original.
     let late = dir.join("late2.mp4");
@@ -473,8 +483,75 @@ fn scenes_on_proxy_rotated_and_variable_rate_sources() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `src` as an RGB-family picture in `codec_args`.
+fn rgb_family(dir: &Path, src: &Path, name: &str, codec_args: &[&str]) -> Option<PathBuf> {
+    let out = dir.join(name);
+    let mut args = vec!["-i", path_str(src), "-an"];
+    args.extend(codec_args);
+    args.push(path_str(&out));
+    ffmpeg(&args).then_some(out)
+}
+
+/// `select='scene'` scores plane 0: the G plane of planar RGB, every interleaved byte of packed
+/// RGB. The proxy is yuv420p, whose plane 0 is luma, so the scores (and the cuts) move; scene
+/// detection reads the original of these, and a contact sheet, which only looks, the proxy.
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+fn scenes_on_proxy_rgb_sources_are_read_from_the_original_for_scores() {
+    let dir = scratch("rgb");
+    // Small: lossless RGB of grain is large.
+    let base = fixture!(shots(&dir, "base.mp4", 320, 180, 30), "the shots");
+    let cases: [(&str, &str, &[&str]); 3] = [
+        ("qtrle.mov", "rgb24", &["-c:v", "qtrle", "-pix_fmt", "rgb24"]),
+        (
+            "x264rgb.mp4",
+            "gbrp",
+            &["-c:v", "libx264rgb", "-crf", "12", "-pix_fmt", "gbrp"],
+        ),
+        ("ffv1.mkv", "bgr0", &["-c:v", "ffv1", "-pix_fmt", "bgr0"]),
+    ];
+    for (name, pix_fmt, codec_args) in cases {
+        let clip = fixture!(rgb_family(&dir, &base, name, codec_args), name);
+        let asset = imported(&clip);
+        let video = asset.streams.iter().find(|s| s.kind == StreamKind::Video).unwrap();
+        assert_eq!(video.pix_fmt.as_deref(), Some(pix_fmt), "{name}");
+        assert_eq!(
+            proxy_fidelity(&clip),
+            ProxyFidelity {
+                times: true,
+                scores: false
+            },
+            "{name}"
+        );
+
+        let proxy = generate_proxy(&clip, PROXY_MAX_WIDTH).expect("proxy");
+        let _cleanup = ProxyGuard(proxy.clone());
+        let (want, got) = (scene_scores(&clip), scene_scores(&proxy));
+        assert_eq!(want.len(), got.len(), "{name}");
+        let moved = want
+            .iter()
+            .zip(&got)
+            .map(|((_, w), (_, g))| (w - g).abs())
+            .fold(0.0, f64::max);
+        eprintln!("{name} ({pix_fmt}): the proxy moves a score by up to {moved:.3}");
+        assert!(
+            moved > 0.05,
+            "{name}: the proxy no longer moves the scores: the RGB gate can be lifted"
+        );
+
+        assert_eq!(Project::scoring_proxy(&asset), None, "{name}");
+        assert_eq!(Project::sheet_proxy(&asset).as_deref(), Some(proxy.as_path()), "{name}");
+        assert_eq!(
+            FfmpegSceneDetector::default().detect_scenes(&asset).unwrap(),
+            detect_scenes(&clip, 0.4).unwrap(),
+            "{name}: the detector reads the original"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// An HDR source is scored in its HLG code values and its proxy in the tone-mapped SDR picture,
-/// which moves a frame's score by a quarter of the scale: the cuts could be different cuts, so
+/// which moves a frame's score by 0.20 to 0.21: the cuts could be different cuts, so
 /// scene detection reads the original, and a contact sheet (which only looks) the proxy.
 #[test]
 #[ignore = "needs the ffmpeg binary"]
@@ -721,6 +798,17 @@ fn scenes_on_proxy_contact_sheet_shows_the_same_frames() {
                 "{label}: the clip never moved: {want:?} at {times:?}"
             );
         }
+
+        // A proxy that does not read: the sheet is the original's, not an error.
+        let (original, _) = engine_sheet(&clip, 0.0, asset.duration);
+        std::fs::write(&proxy, b"not a movie").unwrap();
+        assert_eq!(Project::sheet_proxy(&asset).as_deref(), Some(proxy.as_path()));
+        let (fallen_back, _) = Project::decode_contact_sheet(&asset, None, None, 4, 2, 160, 2).unwrap();
+        assert_eq!(
+            sheet_numbers(&dir, &fallen_back, 4, 2),
+            sheet_numbers(&dir, &original, 4, 2),
+            "{label}: a proxy that does not read"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

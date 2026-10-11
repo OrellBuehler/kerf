@@ -26,8 +26,9 @@ use crate::clip_timing::{
 };
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, Projection, Property, Reframe, ReframeKeyframe,
-    ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, VideoEffect,
+    pix_fmt_layout, Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, PixLayout, Projection, Property, Reframe,
+    ReframeKeyframe, ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform,
+    VideoEffect,
 };
 use crate::render_plan::{active_video_clips, still_size, CompositeColorPolicy};
 
@@ -947,6 +948,124 @@ pub(super) fn run_piped_until(cmd: &mut Command, input: Vec<u8>, deadline: Insta
     status.success().then_some(out)
 }
 
+/// How long a whole-file read ([`scene_pass`], [`contact_sheet`]) may go without a word from
+/// ffmpeg before it is killed. `-progress` reports twice a second whatever the footage, so a
+/// minute of silence is a wedged decoder, not a long file (the same bound the waveform decode
+/// and the filmstrip give theirs).
+const READ_STALL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The `-progress` flags a bounded read adds **at spawn time** (like the thread caps, never in
+/// a pure builder): the report goes to stderr, which stdout-carrying reads (a contact sheet's
+/// JPEG) leave free, and is what [`output_unless_stalled`] listens for.
+const PROGRESS_ON_STDERR: [&str; 4] = ["-progress", "pipe:2", "-stats_period", "1"];
+
+/// Whether `line` is one of the `key=value` lines of ffmpeg's `-progress` report.
+fn is_progress_line(line: &str) -> bool {
+    let Some((key, _)) = line.trim().split_once('=') else {
+        return false;
+    };
+    key.starts_with("stream_")
+        || matches!(
+            key,
+            "frame"
+                | "fps"
+                | "bitrate"
+                | "total_size"
+                | "out_time_us"
+                | "out_time_ms"
+                | "out_time"
+                | "dup_frames"
+                | "drop_frames"
+                | "speed"
+                | "progress"
+        )
+}
+
+/// What [`output_unless_stalled`] collected.
+struct Collected {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    /// stderr without the `-progress` report lines.
+    stderr: String,
+    /// ffmpeg said nothing for the stall bound and was killed.
+    stalled: bool,
+}
+
+impl Collected {
+    fn succeeded(&self) -> bool {
+        self.status.success() && !self.stalled
+    }
+}
+
+/// [`Command::output`] that cannot wait forever: `cmd` is given `-progress pipe:2`
+/// ([`PROGRESS_ON_STDERR`]) and is killed once its stderr has been silent for `stall`. Both
+/// pipes are drained on side threads, so neither a flood of warnings nor a large stdout can fill
+/// a pipe and wedge the child. A stalled read returns no output at all.
+fn output_unless_stalled(mut cmd: Command, stall: std::time::Duration) -> std::io::Result<Collected> {
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::{Arc, Mutex};
+
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let heard = Arc::new(Mutex::new(Instant::now()));
+    let out_handle = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let err_handle = {
+        let heard = Arc::clone(&heard);
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            for line in BufReader::new(stderr).split(b'\n') {
+                let Ok(line) = line else { break };
+                if let Ok(mut at) = heard.lock() {
+                    *at = Instant::now();
+                }
+                let line = String::from_utf8_lossy(&line);
+                if !is_progress_line(&line) {
+                    text.push_str(&line);
+                    text.push('\n');
+                }
+            }
+            text
+        })
+    };
+    let mut stalled = false;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if heard.lock().is_ok_and(|at| at.elapsed() > stall) {
+            stalled = true;
+            let _ = child.kill();
+            break child.wait()?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    if stalled {
+        // The side threads end on their own when the pipes close; a wrapper that spawned the real
+        // ffmpeg keeps them open past the kill, and the caller must not wait for that.
+        return Ok(Collected {
+            status,
+            stdout: Vec::new(),
+            stderr: String::new(),
+            stalled,
+        });
+    }
+    Ok(Collected {
+        status,
+        stdout: out_handle.join().unwrap_or_default(),
+        stderr: err_handle.join().unwrap_or_default(),
+        stalled,
+    })
+}
+
 /// The red of the middle pixel of the still graph's composite over a one-frame
 /// clip of [`POLICY_PROBE_YUV`], with the clip tagged BT.709 or not.
 fn probe_composite_red(ffmpeg: &str, ffprobe: &str, tag_bt709: bool, deadline: Instant) -> Option<u8> {
@@ -1130,6 +1249,26 @@ pub(crate) struct SourceTraits {
     /// path has to ask of them: whether to request a hardware decoder (`decode_policy`).
     pub codec: Codec,
     pub chroma: Chroma,
+    /// The first plane of the decoded picture is the luma alone (see [`luma_plane_pix_fmt`]):
+    /// what a yuv420p proxy's first plane is, and the only plane `select='scene'` scores.
+    pub luma_plane: bool,
+}
+
+/// Whether a picture of this `pix_fmt` keeps its luma alone in plane 0: planar or semi-planar
+/// YCbCr of any subsampling or depth, and gray. `select='scene'` scores plane 0 only, so on an
+/// RGB-family picture (`gbrp`: the G plane; `rgb24`, `bgr0`: every interleaved byte), a packed
+/// YCbCr one (`yuyv422`: luma and chroma bytes interleaved), a palette, an alpha-carrying
+/// format or a name nobody here knows, it scores something a yuv420p proxy cannot reproduce.
+fn luma_plane_pix_fmt(name: &str) -> bool {
+    let packed = matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "uyvy422" | "yuyv422" | "yvyu422" | "uyyvyy411"
+    );
+    !packed
+        && matches!(
+            pix_fmt_layout(name.trim()),
+            Some(PixLayout::Yuv420 | PixLayout::Gray | PixLayout::OtherYuv)
+        )
 }
 
 /// [`SourceTraits`] of the file at `path`, probed once per file and cached against the file's
@@ -1216,6 +1355,7 @@ fn parse_source_traits(json: &str) -> SourceTraits {
         indexed,
         codec: Codec::from_name(text("codec_name")),
         chroma: Chroma::from_pix_fmt(text("pix_fmt")),
+        luma_plane: luma_plane_pix_fmt(text("pix_fmt")),
     }
 }
 
@@ -1238,9 +1378,12 @@ pub struct ProxyFidelity {
     /// unproven.
     pub times: bool,
     /// ...and a frame's *scene score* comes out within a few hundredths of the original's, so
-    /// the cuts found are the same: also an SDR source. A proxy is tone-mapped at encode, and
-    /// the original is scored in its HLG / PQ code values, which the tone curve moves by a quarter
-    /// of the scale.
+    /// the cuts found are the same: also an SDR source whose luma sits alone in plane 0
+    /// ([`SourceTraits::luma_plane`]; not RGB, not packed YCbCr). A proxy is tone-mapped at
+    /// encode, and the original is scored in its HLG / PQ code values, which the tone curve moves
+    /// by a fifth of the scale (0.20 to 0.21 measured); an RGB original is scored on its G plane
+    /// or its interleaved bytes against the proxy's luma (up to 0.56 measured, cuts lost). The few
+    /// hundredths are for the software (libx264) proxy; a hardware-encoded one is unmeasured.
     pub scores: bool,
 }
 
@@ -1254,7 +1397,7 @@ pub fn proxy_fidelity(path: &Path) -> ProxyFidelity {
 fn fidelity_of(traits: SourceTraits) -> ProxyFidelity {
     ProxyFidelity {
         times: traits.indexed,
-        scores: traits.indexed && traits.hdr.is_none(),
+        scores: traits.indexed && traits.hdr.is_none() && traits.luma_plane,
     }
 }
 
@@ -1345,7 +1488,8 @@ pub fn detect_scenes_preferring(original: &Path, proxy: Option<&Path>, threshold
 
 /// One scene-detection pass over `path`: the cut times and whether ffmpeg ended cleanly.
 /// [`detect_scenes`] has always answered with whatever the log held, so a run that failed
-/// reads as "no cuts"; the flag is what lets a caller with somewhere else to read tell.
+/// reads as "no cuts"; the flag is what lets a caller with somewhere else to read tell. A run
+/// that goes [`READ_STALL`] without a word is killed and is an error, not a short list of cuts.
 fn scene_pass(path: &Path, threshold: f64) -> Result<(Vec<f64>, bool)> {
     use std::sync::atomic::Ordering;
 
@@ -1356,27 +1500,25 @@ fn scene_pass(path: &Path, threshold: f64) -> Result<(Vec<f64>, bool)> {
     // The whole file is decoded, so this queues behind any other heavy job.
     let cpu = cpu::lease();
     let run = |hw: Option<&str>| {
-        let mut cmd = bg_command(&bin);
-        cpu::limit_cmd(&mut cmd, cpu.threads());
-        cmd.args(["-hide_banner", "-nostats"]);
+        let mut args: Vec<String> = vec!["-hide_banner".into(), "-nostats".into()];
         if let Some(hw) = hw {
-            cmd.args(["-hwaccel", hw]);
+            args.extend(["-hwaccel".into(), hw.into()]);
         }
-        cmd.arg("-i")
-            .arg(path)
-            .args(["-map", "0:v:0?", "-vf", &filter, "-f", "null", "-"])
-            .stdout(Stdio::null())
-            .output()
-            .map_err(|e| launch_err(&bin, e))
+        args.extend(["-i".into(), path.to_string_lossy().into_owned()]);
+        args.extend(["-map", "0:v:0?", "-vf", &filter, "-f", "null", "-"].map(String::from));
+        cpu::limit_args(&mut args, cpu.threads());
+        let mut cmd = bg_command(&bin);
+        cmd.args(PROGRESS_ON_STDERR).args(&args);
+        output_unless_stalled(cmd, READ_STALL).map_err(|e| launch_err(&bin, e))
     };
     let output = match hw.as_deref() {
         Some(h) => {
             let out = run(Some(h))?;
-            if out.status.success() {
+            if out.succeeded() {
                 out
             } else {
                 let sw = run(None)?;
-                if sw.status.success() {
+                if sw.succeeded() {
                     HWACCEL_OK.store(false, Ordering::Relaxed);
                     tracing::warn!("hardware decode failed during scene detection; using software decode");
                 }
@@ -1385,10 +1527,14 @@ fn scene_pass(path: &Path, threshold: f64) -> Result<(Vec<f64>, bool)> {
         }
         None => run(None)?,
     };
-    Ok((
-        parse_scenes(&String::from_utf8_lossy(&output.stderr)),
-        output.status.success(),
-    ))
+    if output.stalled {
+        return Err(Error::Engine(format!(
+            "scene detection stalled: ffmpeg said nothing for {}s reading {}",
+            READ_STALL.as_secs(),
+            path.display()
+        )));
+    }
+    Ok((parse_scenes(&output.stderr), output.status.success()))
 }
 
 fn parse_scenes(stderr: &str) -> Vec<f64> {
@@ -1812,16 +1958,16 @@ pub fn contact_sheet(
     // making it wait out a ten-minute render would read as a hung server. It
     // still runs thread-capped and at background priority.
     cpu::limit_args(&mut args, cpu::budget_threads());
-    let output = bg_command(&bin)
-        .args(&args)
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| launch_err(&bin, e))?;
-    if !output.status.success() || output.stdout.is_empty() {
-        return Err(Error::Engine(format!(
-            "could not build contact sheet: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+    let mut cmd = bg_command(&bin);
+    cmd.args(PROGRESS_ON_STDERR).args(&args);
+    let output = output_unless_stalled(cmd, READ_STALL).map_err(|e| launch_err(&bin, e))?;
+    if !output.succeeded() || output.stdout.is_empty() {
+        let why = if output.stalled {
+            format!("ffmpeg said nothing for {}s", READ_STALL.as_secs())
+        } else {
+            output.stderr.trim().to_string()
+        };
+        return Err(Error::Engine(format!("could not build contact sheet: {why}")));
     }
     Ok((output.stdout, times))
 }
@@ -7821,12 +7967,13 @@ mod tests {
     }
 
     #[test]
-    fn a_proxy_stands_in_for_an_sdr_mp4_or_matroska_source_and_for_nothing_else() {
-        let traits = |format: &str, transfer: &str| {
+    fn a_proxy_stands_in_for_an_sdr_yuv_mp4_or_matroska_source_and_for_nothing_else() {
+        let traits_of = |format: &str, transfer: &str, pix_fmt: &str| {
             parse_source_traits(&format!(
-                r#"{{"streams":[{{"color_transfer":"{transfer}"}}],"format":{{"format_name":"{format}"}}}}"#
+                r#"{{"streams":[{{"color_transfer":"{transfer}","pix_fmt":"{pix_fmt}"}}],"format":{{"format_name":"{format}"}}}}"#
             ))
         };
+        let traits = |format: &str, transfer: &str| traits_of(format, transfer, "yuv420p");
         let (yes, picture) = (
             ProxyFidelity {
                 times: true,
@@ -7842,12 +7989,93 @@ mod tests {
         // HDR: times hold, but the scores are taken in HLG / PQ code values and the proxy is SDR.
         assert_eq!(fidelity_of(traits("mov,mp4,m4a,3gp,3g2,mj2", "arib-std-b67")), picture);
         assert_eq!(fidelity_of(traits("matroska,webm", "smpte2084")), picture);
+        // Every YCbCr layout keeps its luma alone in plane 0, which is what the scene filter scores.
+        for pix_fmt in [
+            "yuv420p10le",
+            "yuvj420p",
+            "yuv422p10le",
+            "yuv444p12le",
+            "gray",
+            "gray10le",
+            "nv12",
+        ] {
+            assert_eq!(
+                fidelity_of(traits_of("mov,mp4,m4a,3gp,3g2,mj2", "bt709", pix_fmt)),
+                yes,
+                "{pix_fmt}"
+            );
+        }
+        // RGB (G plane, or every interleaved byte), packed YCbCr, a palette, alpha and a name nobody
+        // knows are scored on something else than the proxy's luma.
+        for pix_fmt in [
+            "gbrp", "gbrp10le", "rgb24", "bgr24", "bgr0", "rgb48le", "yuyv422", "uyvy422", "pal8", "yuva420p", "rgba", "",
+            "newfmt",
+        ] {
+            assert_eq!(
+                fidelity_of(traits_of("mov,mp4,m4a,3gp,3g2,mj2", "bt709", pix_fmt)),
+                picture,
+                "{pix_fmt}"
+            );
+            assert_eq!(fidelity_of(traits_of("matroska,webm", "", pix_fmt)), picture, "{pix_fmt}");
+        }
         // A transport stream's proxy is `lead` off when its video starts late; the others are unproven.
         for other in ["mpegts", "avi", "mpeg", "flv", "mxf", "h264"] {
             assert_eq!(fidelity_of(traits(other, "bt709")), ProxyFidelity::default(), "{other}");
         }
         // A failed probe trusts nothing.
         assert_eq!(fidelity_of(SourceTraits::default()), ProxyFidelity::default());
+    }
+
+    #[test]
+    fn the_progress_report_is_told_from_the_log() {
+        for line in [
+            "frame=120",
+            "fps=0.0",
+            "stream_0_0_q=-0.0",
+            "out_time_us=4000000",
+            "out_time=00:00:04.000000",
+            "progress=end",
+            "speed=N/A",
+        ] {
+            assert!(is_progress_line(line), "{line}");
+        }
+        for line in [
+            "[Parsed_showinfo_1 @ 0x1] n:   4 pts:  4 pts_time:4 fmt:yuv420p",
+            "Error opening input file x.mp4.",
+            "x.mp4: Invalid data found when processing input",
+            "key=value without being ffmpeg's",
+            "",
+        ] {
+            assert!(!is_progress_line(line), "{line}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_that_goes_quiet_is_killed_and_one_that_reports_is_not() {
+        let sh = |script: &str| {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", script]);
+            cmd
+        };
+        // Quiet: a child that never writes (a wedged decoder) is killed at the bound, not waited for.
+        let started = Instant::now();
+        let quiet = output_unless_stalled(sh("sleep 30"), std::time::Duration::from_millis(300)).unwrap();
+        assert!(quiet.stalled && !quiet.succeeded());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // Reporting: each line of stderr is a word, so a long run that keeps talking is not cut off,
+        // and the progress lines are not in the text the caller reads errors from.
+        let talking = output_unless_stalled(
+            sh("for i in 1 2 3 4 5 6; do echo frame=$i >&2; sleep 0.1; done; echo oops >&2; printf out"),
+            std::time::Duration::from_millis(400),
+        )
+        .unwrap();
+        assert!(talking.succeeded(), "{:?}", talking.stderr);
+        assert_eq!((talking.stdout.as_slice(), talking.stderr.as_str()), (&b"out"[..], "oops\n"));
+        // A failure is a failure, not a stall.
+        let failed = output_unless_stalled(sh("echo bad >&2; exit 3"), std::time::Duration::from_secs(5)).unwrap();
+        assert!(!failed.stalled && !failed.succeeded());
+        assert_eq!(failed.stderr, "bad\n");
     }
 
     #[test]

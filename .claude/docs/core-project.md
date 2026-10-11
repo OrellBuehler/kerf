@@ -178,8 +178,8 @@
   `Project::sheet_proxy` for `decode_contact_sheet` / the `skim_asset` sheet; pure
   `resolve_analysis_proxy`): the same `preview_source` rule (Always original, or size Off, reads
   the original; a proxy still building is not waited for, analysis already queues behind the proxy
-  lane) plus `engine::proxy_fidelity` — an MP4 / MOV / Matroska source for times, also SDR for
-  scene scores (`engine-cli.md` has why and the measured limits). A proxy that fails to read falls
+  lane) plus `engine::proxy_fidelity` — an MP4 / MOV / Matroska source for times, also SDR
+  YCbCr (not RGB) for scene scores (`engine-cli.md` has the exact gate and the measured limits). A proxy that fails to read falls
   back to the original. Smart crop's `salience_map` is not swapped.
 - `error.rs` — `Error`/`Result`; the `Ffmpeg(#[from] ffmpeg_next::Error)` variant is
   itself `#[cfg(feature = "ffmpeg")]`.
