@@ -10,6 +10,7 @@ import {
 	mapSpan,
 	minWindowSeconds,
 	moveTo,
+	viewCoversCut,
 	resizeLeft,
 	resizeRight,
 	rowLayout,
@@ -43,6 +44,33 @@ describe('the strip', () => {
 		expect(timeToX(50, geo)).toBe(500);
 		expect(xToTime(250, geo)).toBe(25);
 		for (const t of [0, 1.5, 33.3, 100]) close(xToTime(timeToX(t, geo), geo), t);
+	});
+});
+
+describe('when the strip is worth its height', () => {
+	const view = (scrollLeft: number, viewW: number, pxPerSec: number) => ({ scrollLeft, viewW, pxPerSec });
+
+	test('not while the view takes in the whole cut', () => {
+		expect(viewCoversCut(view(0, 1680, 80), 20)).toBe(true); // 21 s of window for 20 s of cut
+		expect(viewCoversCut(view(0, 1600, 80), 20)).toBe(true); // exactly the cut
+	});
+
+	test('not while it takes in 98 % of it, and yes below that', () => {
+		expect(viewCoversCut(view(0, 1568, 80), 20)).toBe(true); // 19.6 s of 20
+		expect(viewCoversCut(view(0, 1560, 80), 20)).toBe(false); // 19.5 s
+	});
+
+	test('yes when zoomed in, wherever the window sits', () => {
+		expect(viewCoversCut(view(0, 1680, 160), 20)).toBe(false);
+		expect(viewCoversCut(view(800, 1680, 160), 20)).toBe(false);
+	});
+
+	test('a window scrolled past the start does not cover what it has left behind', () => {
+		expect(viewCoversCut(view(160, 1680, 80), 20)).toBe(false); // 2 s of the cut is off to the left
+	});
+
+	test('an empty cut has nothing to map', () => {
+		expect(viewCoversCut(view(0, 1680, 36), 0)).toBe(true);
 	});
 });
 

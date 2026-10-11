@@ -3,24 +3,25 @@
 	// and all. The first use downloads the voice model, so the dialog says so up
 	// front and then names each stage as it runs.
 	import { untrack } from 'svelte';
-	import Icon from './Icon.svelte';
+	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
-	import { trapFocus } from '$lib/modal';
+	import SliderRow from './SliderRow.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { cancelVoiceover, onVoiceoverProgress, voiceoverStatus } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 	import { CAPTION_LOOKS } from '$lib/style-presets';
 	import { fmtDuration } from '$lib/media-info';
+	import { TIMES } from '$lib/slider-row';
 	import type { CaptionStyle, VoiceoverProgress, VoiceoverStatus } from '$lib/types';
 	import {
+		DEFAULT_SPEED,
 		MAX_SPEED,
 		MIN_SPEED,
 		approxMB,
 		clampSpeed,
 		defaultCaptionStyle,
 		estimateSeconds,
-		fmtSpeed,
 		isVoiceoverCancelled,
 		loadDraft,
 		loadPrefs,
@@ -121,147 +122,120 @@
 	}
 
 	const chip = (active: boolean) =>
-		`padding:4px 9px;font-size:12px;cursor:pointer;border-radius:var(--radius-sm);border:1px solid ${
+		`padding:4px 9px;font-size:12px;cursor:pointer;border-radius:var(--radius-sm);border:var(--line-width) solid ${
 			active ? 'var(--kerf-500)' : 'var(--border-strong)'
 		};background:${active ? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)' : 'var(--surface-inset)'};color:${
 			active ? 'var(--text-primary)' : 'var(--text-secondary)'
 		}`;
 	const selectCss =
-		'background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;min-height:32px;padding:5px 7px;min-width:220px;max-width:100%';
+		'background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:13px;min-height:32px;padding:5px 7px;min-width:220px;max-width:100%';
 	const labelCss = 'font-size:12px;color:var(--text-muted)';
 </script>
 
-<!-- svelte-ignore a11y_click_events_have_key_events -->
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div
-	use:trapFocus={{ initial: 'textarea', rescue: true }}
-	role="dialog"
-	aria-modal="true"
-	aria-label="Voiceover"
-	tabindex="-1"
-	onclick={() => scrimCloses(text, generating) && onClose()}
-	onkeydown={(e) => {
-		if (e.key === 'Escape' && !generating) onClose();
-		e.stopPropagation();
-	}}
-	style="position:fixed;inset:0;z-index:50;background:color-mix(in srgb,var(--scrim) 55%,transparent);display:flex;align-items:center;justify-content:center;padding:24px"
+<Modal
+	title="Voiceover"
+	icon="mic"
+	width={560}
+	busy={generating}
+	dismissOnScrim={scrimCloses(text, generating)}
+	initial="textarea"
+	rescue
+	{onClose}
 >
-	<div
-		onclick={(e) => e.stopPropagation()}
-		style="width:560px;max-width:100%;max-height:100%;display:flex;flex-direction:column;background:var(--surface-panel);border:1px solid var(--border-default);border-radius:var(--radius-md);box-shadow:var(--shadow-lg);overflow:hidden"
+	<fieldset
+		disabled={generating}
+		style="flex:1;min-height:0;min-width:0;margin:0;border:0;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px"
 	>
-		<div
-			style="height:var(--toolbar-h);flex:none;display:flex;align-items:center;gap:8px;padding:0 14px;border-bottom:1px solid var(--border-default)"
-		>
-			<Icon n="mic" s={15} color="var(--text-secondary)" />
-			<span style="font:var(--type-ui);font-weight:600;color:var(--text-primary);flex:1">Voiceover</span>
-			{#if !generating}
-				<Btn variant="ghost" size="sm" onclick={onClose}>✕</Btn>
-			{/if}
+		{#if unavailable}
+			<div
+				style="font-size:12px;color:var(--red-400);background:color-mix(in srgb,var(--red-600) 14%,transparent);border-radius:var(--radius-sm);padding:8px 10px"
+			>
+				⚠ {status?.reason ?? statusError ?? 'Voiceover is not available.'}
+			</div>
+		{:else if status && !status.ready}
+			<div
+				style="font-size:12px;color:var(--text-secondary);background:var(--surface-inset);border-radius:var(--radius-sm);padding:8px 10px"
+			>
+				The first voiceover downloads the voice model ({approxMB(status.approx_download_bytes)}).
+			</div>
+		{/if}
+
+		<div style="display:flex;flex-direction:column;gap:5px">
+			<span style={labelCss}>Script</span>
+			<textarea
+				bind:value={text}
+				rows="7"
+				placeholder="Write what the voice should say. A blank line makes a longer pause."
+				onkeydown={(e) => {
+					if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+						e.preventDefault();
+						void generate();
+					}
+				}}
+				style="resize:vertical;min-height:110px;background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-sans);font-size:13px;line-height:1.5;padding:8px 10px"
+			></textarea>
+			<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">
+				{words} {words === 1 ? 'word' : 'words'}{#if words > 0}
+					&nbsp;·&nbsp;about {fmtDuration(estimate)} (estimate){/if}
+			</span>
 		</div>
 
-		<fieldset
-			disabled={generating}
-			style="flex:1;min-height:0;min-width:0;margin:0;border:0;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px"
-		>
-			{#if unavailable}
-				<div
-					style="font-size:12px;color:var(--red-400);background:color-mix(in srgb,var(--red-600) 14%,transparent);border-radius:var(--radius-sm);padding:8px 10px"
-				>
-					⚠ {status?.reason ?? statusError ?? 'Voiceover is not available.'}
-				</div>
-			{:else if status && !status.ready}
-				<div
-					style="font-size:12px;color:var(--text-secondary);background:var(--surface-inset);border-radius:var(--radius-sm);padding:8px 10px"
-				>
-					The first voiceover downloads the voice model ({approxMB(status.approx_download_bytes)}).
-				</div>
-			{/if}
-
-			<div style="display:flex;flex-direction:column;gap:5px">
-				<span style={labelCss}>Script</span>
-				<textarea
-					bind:value={text}
-					rows="7"
-					placeholder="Write what the voice should say. A blank line makes a longer pause."
-					onkeydown={(e) => {
-						if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-							e.preventDefault();
-							void generate();
-						}
-					}}
-					style="resize:vertical;min-height:110px;background:var(--surface-inset);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-family:var(--font-sans);font-size:13px;line-height:1.5;padding:8px 10px"
-				></textarea>
-				<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">
-					{words} {words === 1 ? 'word' : 'words'}{#if words > 0}
-						&nbsp;·&nbsp;about {fmtDuration(estimate)} (estimate){/if}
-				</span>
-			</div>
-
-			<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 0">
-				<span style={labelCss}>Voice</span>
-				<select bind:value={voice} disabled={!status} style={selectCss}>
-					{#if status}
-						<optgroup label="American">
-							{#each american as v (v.id)}
-								<option value={v.id}>{voiceLabel(v)}</option>
-							{/each}
-						</optgroup>
-						<optgroup label="British">
-							{#each british as v (v.id)}
-								<option value={v.id}>{voiceLabel(v)}</option>
-							{/each}
-						</optgroup>
-					{/if}
-				</select>
-			</label>
-
-			<label style="display:flex;align-items:center;gap:10px;padding:4px 0">
-				<span style="{labelCss};width:90px;flex:none">Speed</span>
-				<input
-					type="range"
-					min={MIN_SPEED}
-					max={MAX_SPEED}
-					step="0.05"
-					value={speed}
-					oninput={(e) => (speed = parseFloat(e.currentTarget.value))}
-					ondblclick={() => (speed = 1)}
-					title="Double-click to reset"
-					style="flex:1;accent-color:var(--kerf-500)"
-				/>
-				<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);width:54px;text-align:right"
-					>{fmtSpeed(speed)}</span
-				>
-			</label>
-
-			<div style="display:flex;align-items:center;gap:5px;padding:4px 0">
-				<span style="{labelCss};width:90px;flex:none">Place</span>
-				<button type="button" style={chip(place === 'playhead')} onclick={() => (place = 'playhead')}>
-					At playhead ({fmtDuration(ui.time)})
-				</button>
-				<button type="button" style={chip(place === 'append')} onclick={() => (place = 'append')}>
-					Append to VO track
-				</button>
-			</div>
-
-			<div style="display:flex;align-items:center;gap:5px;padding:4px 0">
-				<label style="display:flex;align-items:center;gap:8px;width:90px;flex:none;cursor:pointer">
-					<input type="checkbox" bind:checked={caption} style="accent-color:var(--kerf-500);width:15px;height:15px" />
-					<span style={labelCss}>Caption it</span>
-				</label>
-				{#if caption}
-					{#each CAPTION_LOOKS as c (c.id)}
-						<button type="button" style={chip(captionStyle === c.id)} title={c.hint} onclick={() => (styleChoice = c.id)}>
-							{c.label}
-						</button>
-					{/each}
-				{:else}
-					<span style="font-size:12px;color:var(--text-muted)">No captions are added.</span>
+		<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 0">
+			<span style={labelCss}>Voice</span>
+			<select bind:value={voice} disabled={!status} style={selectCss}>
+				{#if status}
+					<optgroup label="American">
+						{#each american as v (v.id)}
+							<option value={v.id}>{voiceLabel(v)}</option>
+						{/each}
+					</optgroup>
+					<optgroup label="British">
+						{#each british as v (v.id)}
+							<option value={v.id}>{voiceLabel(v)}</option>
+						{/each}
+					</optgroup>
 				{/if}
-			</div>
-		</fieldset>
+			</select>
+		</label>
 
-		<div style="flex:none;border-top:1px solid var(--border-default);padding:12px 16px">
+		<SliderRow
+			label="Speed"
+			value={speed}
+			spec={{ min: MIN_SPEED, max: MAX_SPEED, step: 0.05, neutral: DEFAULT_SPEED, ...TIMES }}
+			labelWidth={90}
+			reserve={false}
+			disabled={generating}
+			onCommit={(v) => (speed = v)}
+		/>
+
+		<div style="display:flex;align-items:center;gap:5px;padding:4px 0">
+			<span style="{labelCss};width:90px;flex:none">Place</span>
+			<button type="button" style={chip(place === 'playhead')} onclick={() => (place = 'playhead')}>
+				At playhead ({fmtDuration(ui.time)})
+			</button>
+			<button type="button" style={chip(place === 'append')} onclick={() => (place = 'append')}>
+				Append to VO track
+			</button>
+		</div>
+
+		<div style="display:flex;align-items:center;gap:5px;padding:4px 0">
+			<label style="display:flex;align-items:center;gap:8px;width:90px;flex:none;cursor:pointer">
+				<input type="checkbox" bind:checked={caption} style="accent-color:var(--kerf-500);width:15px;height:15px" />
+				<span style={labelCss}>Caption it</span>
+			</label>
+			{#if caption}
+				{#each CAPTION_LOOKS as c (c.id)}
+					<button type="button" style={chip(captionStyle === c.id)} title={c.hint} onclick={() => (styleChoice = c.id)}>
+						{c.label}
+					</button>
+				{/each}
+			{:else}
+				<span style="font-size:12px;color:var(--text-muted)">No captions are added.</span>
+			{/if}
+		</div>
+	</fieldset>
+	{#snippet footer()}
+		<div style="padding:12px 16px">
 			{#if generating}
 				<div style="display:flex;align-items:center;gap:10px">
 					<div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:6px">
@@ -293,5 +267,5 @@
 				</div>
 			{/if}
 		</div>
-	</div>
-</div>
+	{/snippet}
+</Modal>

@@ -5,6 +5,7 @@ import {
 	fmtBytes,
 	isProxyWaitMessage,
 	previewSourceNote,
+	previewSourceWidth,
 	proxyActions,
 	proxyBadge,
 	proxyFacts
@@ -122,6 +123,50 @@ describe('the status bar line: which file is this frame from', () => {
 		expect(note({ g: st('ready') }, 'auto', 1280, 25)).toBeNull();
 		const onlyStill = { tracks: [{ kind: 'video', clips: [{ asset_id: 's', source_in: 0, source_out: 5, timeline_start: 0 }] }] } as unknown as Timeline;
 		expect(previewSourceNote(onlyStill, [still], {}, 'auto', 1280, 1)).toBeNull();
+	});
+});
+
+describe('the widest picture the preview reads', () => {
+	const mk = (id: string, width: number | undefined): Asset => ({
+		id,
+		path: `/m/${id}`,
+		name: id,
+		duration: 60,
+		imported_at: '',
+		streams: [{ index: 0, kind: 'video', codec: 'hevc', width, height: 2988, fps: 30 }]
+	});
+	const big = mk('g', 5312);
+	const small = mk('h', 1920);
+	const tl = (...ids: string[]) =>
+		({
+			tracks: ids.map((id) => ({ kind: 'video', clips: [{ asset_id: id, source_in: 0, source_out: 10, timeline_start: 0 }] }))
+		}) as unknown as Timeline;
+	const width = (ids: string[], assets: Asset[], statuses: Record<string, ProxyStatus>, source: 'auto' | 'original' | 'proxy_only', size: 0 | 720 | 1080 | 1280 = 1280) =>
+		previewSourceWidth(tl(...ids), assets, statuses, source, size, 5);
+
+	test('a ready proxy is what is decoded, so its width is all there is to see', () => {
+		expect(width(['g'], [big], { g: st('ready', { width: 1280 }) }, 'auto')).toBe(1280);
+		expect(width(['g'], [big], { g: st('ready', { width: 1280 }) }, 'proxy_only')).toBe(1280);
+	});
+
+	test('until it is ready, with the original forced, or with proxies off, the original is read', () => {
+		expect(width(['g'], [big], { g: st('building', { fraction: 0.4 }) }, 'auto')).toBe(5312);
+		expect(width(['g'], [big], { g: st('ready', { width: 1280 }) }, 'original')).toBe(5312);
+		expect(width(['g'], [big], { g: st('ready', { width: 1280 }) }, 'auto', 0)).toBe(5312);
+		expect(width(['g'], [big], {}, 'auto')).toBe(5312);
+	});
+
+	test('with several clips under the playhead it is the widest of them', () => {
+		const s = { g: st('ready', { width: 1280 }), h: st('missing') };
+		expect(width(['g', 'h'], [big, small], s, 'auto')).toBe(1920);
+	});
+
+	test('nothing is known for a gap, an audio clip or a source with no stated width', () => {
+		expect(previewSourceWidth(tl('g'), [big], {}, 'auto', 1280, 99)).toBeNull();
+		expect(width(['x'], [mk('x', undefined)], {}, 'auto')).toBeNull();
+		expect(width(['g', 'x'], [big, mk('x', undefined)], {}, 'auto')).toBeNull();
+		const sound: Asset = { ...big, id: 'a', streams: [{ index: 0, kind: 'audio', codec: 'aac' }] };
+		expect(width(['a'], [sound], {}, 'auto')).toBeNull();
 	});
 });
 

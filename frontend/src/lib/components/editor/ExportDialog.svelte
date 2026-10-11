@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
-	import Icon from './Icon.svelte';
-	import { trapFocus } from '$lib/modal';
+	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
+	import SliderRow from './SliderRow.svelte';
 	import SectionHead from './SectionHead.svelte';
 	import DeliverTo from './DeliverTo.svelte';
 	import Readiness from './Readiness.svelte';
@@ -11,7 +11,9 @@
 	import { inTauri, pickExportPath, hwEncoders, revealPath } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 	import { formatsFor, hasPicture } from '$lib/delivery-formats';
+	import { formatTimecode } from '$lib/timecode';
 	import { frameKey, restoreDraft } from '$lib/export-draft';
+	import type { RowSpec } from '$lib/slider-row';
 	import type { Container, ExportOptions, Fit, RateControl } from '$lib/types';
 	import {
 		PRESETS,
@@ -103,11 +105,7 @@
 			: null
 	);
 
-	function fmtTime(s: number): string {
-		const m = Math.floor(s / 60);
-		const sec = (s % 60).toFixed(1).padStart(4, '0');
-		return `${m}:${sec}`;
-	}
+	const fmtTime = (s: number): string => formatTimecode(s, editor.fps);
 
 	function fmtEta(s: number | null | undefined): string {
 		if (s == null || !isFinite(s)) return '';
@@ -275,20 +273,8 @@
 	</label>
 {/snippet}
 
-{#snippet sliderRow(label: string, value: number, min: number, max: number, step: number, display: string, onChange: (v: number) => void)}
-	<label style="display:flex;align-items:center;gap:10px;padding:4px 0">
-		<span style="font-size:12px;color:var(--text-muted);width:90px;flex:none">{label}</span>
-		<input
-			type="range"
-			{min}
-			{max}
-			{step}
-			{value}
-			oninput={(e) => onChange(parseFloat(e.currentTarget.value))}
-			style="flex:1"
-		/>
-		<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);width:54px;text-align:right">{display}</span>
-	</label>
+{#snippet sliderRow(label: string, value: number, spec: RowSpec, onChange: (v: number) => void)}
+	<SliderRow {label} {value} {spec} labelWidth={90} reserve={false} onCommit={onChange} />
 {/snippet}
 
 {#snippet textRow(label: string, value: string, placeholder: string, onChange: (v: string) => void)}
@@ -305,414 +291,387 @@
 {/snippet}
 
 <!-- A click on the scrim does not close this one: it holds a preset, shapes and encoder settings. -->
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div
-	use:trapFocus={{ rescue: true }}
-	role="dialog"
-	aria-modal="true"
-	aria-label="Export video"
-	tabindex="-1"
-	onkeydown={(e) => {
-		if (e.key === 'Escape') onClose();
-		e.stopPropagation();
-	}}
-	style="position:fixed;inset:0;z-index:50;background:color-mix(in srgb,var(--scrim) 55%,transparent);display:flex;align-items:center;justify-content:center;padding:24px"
->
-	<div
-		style="width:600px;max-width:100%;max-height:100%;display:flex;flex-direction:column;background:var(--surface-panel);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-md);box-shadow:var(--shadow-lg);overflow:hidden"
-	>
-		<!-- header -->
-		<div
-			style="height:var(--toolbar-h);flex:none;display:flex;align-items:center;gap:8px;padding:0 14px;border-bottom:var(--line-width) solid var(--border-default)"
-		>
-			<Icon n="upload" s={15} color="var(--text-secondary)" />
-			<span style="font:var(--type-ui);font-weight:600;color:var(--text-primary);flex:1">Export</span>
-			<Btn variant="ghost" size="sm" onclick={onClose}>✕</Btn>
+<Modal title="Export" icon="upload" width={600} dismissOnScrim={false} rescue {onClose}>
+	<div style="flex:1;overflow-y:auto;padding:12px 16px">
+		{@render selectRow(
+			'Preset',
+			activePreset,
+			[
+				...(activePreset === 'custom' ? [{ value: 'custom', label: 'Custom settings' }] : []),
+				...PRESETS.map((p) => ({ value: p.id, label: p.label }))
+			],
+			choosePreset
+		)}
+		<p style="font-size:12px;color:var(--text-muted);margin:2px 0 4px;line-height:1.45">
+			{PRESETS.find((p) => p.id === activePreset)?.description ?? 'Your own settings — pick a preset to start over from one.'}
+		</p>
+		<!-- destination -->
+		{@render secHead('Destination')}
+		<div style="display:flex;align-items:center;gap:8px;padding:4px 0">
+			<input
+				type="text"
+				readonly
+				value={outputPath}
+				aria-label="Export destination"
+				placeholder="Choose a file…"
+				style="{inputCss};flex:1;text-align:left;color:var(--text-secondary)"
+			/>
+			<Btn variant="secondary" size="sm" icon="folder-open" onclick={browse}>Browse</Btn>
 		</div>
-
-		<div style="flex:1;overflow-y:auto;padding:12px 16px">
+		{#if marks}
 			{@render selectRow(
-				'Preset',
-				activePreset,
+				'Range',
+				useRange ? 'range' : 'full',
 				[
-					...(activePreset === 'custom' ? [{ value: 'custom', label: 'Custom settings' }] : []),
-					...PRESETS.map((p) => ({ value: p.id, label: p.label }))
+					{ value: 'full', label: 'Full timeline' },
+					{ value: 'range', label: `In → out (${fmtTime(marks.start)}–${fmtTime(marks.end)})` }
 				],
-				choosePreset
+				(v) => (useRange = v === 'range')
 			)}
-			<p style="font-size:12px;color:var(--text-muted);margin:2px 0 4px;line-height:1.45">
-				{PRESETS.find((p) => p.id === activePreset)?.description ?? 'Your own settings — pick a preset to start over from one.'}
-			</p>
-			<!-- destination -->
-			{@render secHead('Destination')}
-			<div style="display:flex;align-items:center;gap:8px;padding:4px 0">
-				<input
-					type="text"
-					readonly
-					value={outputPath}
-					aria-label="Export destination"
-					placeholder="Choose a file…"
-					style="{inputCss};flex:1;text-align:left;color:var(--text-secondary)"
-				/>
-				<Btn variant="secondary" size="sm" icon="folder-open" onclick={browse}>Browse</Btn>
-			</div>
-			{#if marks}
-				{@render selectRow(
-					'Range',
-					useRange ? 'range' : 'full',
-					[
-						{ value: 'full', label: 'Full timeline' },
-						{ value: 'range', label: `In → out (${fmtTime(marks.start)}–${fmtTime(marks.end)})` }
-					],
-					(v) => (useRange = v === 'range')
-				)}
-			{/if}
+		{/if}
 
-			{#if showVideo}
-				{@render secHead('Picture')}
-				{#if variantFormats.length}
-					<div style="font-size:12px;color:var(--text-muted);padding:4px 0">
-						Resolution and fit come from each delivery frame below.
-					</div>
-				{:else}
-				{@render selectRow(
-					'Resolution',
-					resValue(),
-					[
-						...RESOLUTIONS.map((r) => ({
-							value: r.value ? `${r.value[0]}x${r.value[1]}` : 'source',
-							// With a project frame set, "Source" is that frame — the export and
-							// the preview must not be able to disagree about the deliverable.
-							label: r.value ? r.label : projectFrame ? `Project frame (${projectFrame})` : r.label
-						})),
-						{ value: 'custom', label: 'Custom…' }
-					],
-					setRes
-				)}
-				{#if !opts.resolution && projectFrame}
-					<div style="font-size:12px;color:var(--text-muted);padding:0 0 6px;text-align:right">
-						Renders the frame you have been cutting in. Pick a size to override it here only.
-					</div>
-				{/if}
-				{#if customRes}
-					<div style="display:flex;align-items:center;gap:8px;padding:4px 0;justify-content:flex-end">
-						<input
-							type="number"
-							min="2"
-							step="2"
-							value={opts.resolution?.[0] ?? 1920}
-							onchange={(e) => patch({ resolution: [parseInt(e.currentTarget.value) || 1920, opts.resolution?.[1] ?? 1080] })}
-							style="{inputCss};width:90px;text-align:right"
-						/>
-						<span style="color:var(--text-muted)">×</span>
-						<input
-							type="number"
-							min="2"
-							step="2"
-							value={opts.resolution?.[1] ?? 1080}
-							onchange={(e) => patch({ resolution: [opts.resolution?.[0] ?? 1920, parseInt(e.currentTarget.value) || 1080] })}
-							style="{inputCss};width:90px;text-align:right"
-						/>
-					</div>
-				{/if}
-				{#if opts.resolution}
-					{@render selectRow(
-						'Aspect fit',
-						opts.fit ?? 'contain',
-						FITS.map((f) => ({ value: f.id, label: f.label })),
-						(v) => patch({ fit: v as Fit })
-					)}
-					<div style="font-size:12px;color:var(--text-muted);padding:0 0 6px;text-align:right">
-						{FITS.find((f) => f.id === (opts.fit ?? 'contain'))?.hint}
-					</div>
-				{/if}
-				{/if}
-				{@render selectRow(
-					'Frame rate',
-					opts.fps ? String(opts.fps) : 'source',
-					frameRateOptions(opts.fps).map((f) => ({ value: f.value ? String(f.value) : 'source', label: f.label })),
-					(v) => patch({ fps: v === 'source' ? null : parseFloat(v) })
-				)}
-				{#if qualityOptions.length}
-					{@render selectRow(
-						'Quality',
-						qualityValue,
-						[
-							...(qualityValue === 'custom' ? [{ value: 'custom', label: 'Custom · see Advanced' }] : []),
-							...qualityOptions
-						],
-						(v) => {
-							if (v !== 'custom') patch({ rate_control: 'crf', crf: Number(v) });
-						}
-					)}
-					<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0;line-height:1.45">Higher quality keeps more detail and makes a larger file.</p>
-				{:else if opts.video_codec === 'gif'}
-					<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0">GIF quality follows the picture size and the palette settings in Advanced.</p>
-				{:else}
-					<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0">This preset is a mastering format. Its profile is in Advanced.</p>
-				{/if}
-			{/if}
-			{#if showAudio}
-				{@render secHead('Sound')}
-				{@render toggleRow('Include audio', !!opts.include_audio, (v) => patch({ include_audio: v }))}
-				{#if opts.include_audio}
-					{@render selectRow(
-						'Normalize loudness',
-						loudness,
-						LOUDNESS_TARGETS.map((t) => ({ value: t.id, label: t.label })),
-						(v) => patch(withLoudness(opts, v as LoudnessChoice))
-					)}
-					<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0;line-height:1.45">{loudnessHint}</p>
-				{/if}
-			{/if}
-			<!-- one cut, every platform -->
-			{#if showVideo}
-				{@render secHead('Deliver to')}
-				<DeliverTo {outputPath} ext={info.ext} />
-			{/if}
-
-			<!-- where this is going (per file when several are being written) -->
-			{#if !variantFormats.length}
-				<Readiness frame={opts.resolution ?? null} />
-			{/if}
-
-			<details bind:open={showAdvanced} style="margin-top:12px;border-top:var(--line-width) solid var(--border-default)">
-				<summary style="cursor:pointer;padding:12px 0;font-size:13px;font-weight:600;color:var(--text-secondary)">Advanced encoding</summary>
-			<!-- summary -->
-			<div
-				data-selectable
-					style="margin-top:12px;padding:8px 10px;border-radius:var(--radius-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-subtle);font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)"
-			>
-				{summary}
-			</div>
-
+		{#if showVideo}
+			{@render secHead('Picture')}
+			{#if variantFormats.length}
+				<div style="font-size:12px;color:var(--text-muted);padding:4px 0">
+					Resolution and fit come from each delivery frame below.
+				</div>
+			{:else}
 			{@render selectRow(
-				'Container',
-				opts.container,
-				CONTAINERS.map((c) => ({ value: c.id, label: `${c.label} (.${c.ext})` })),
-				(v) => changeContainer(v as Container)
-			)}
-			<!-- video -->
-			{#if showVideo}
-				{@render secHead('Video')}
-				{@render selectRow(
-					'Codec',
-					opts.video_codec ?? '',
-					[...info.video, ...info.hwVideo.filter((id) => hwCodecs.includes(id))].map((id) => ({
-						value: id,
-						label: VIDEO_CODECS[id]?.label ?? id
+				'Resolution',
+				resValue(),
+				[
+					...RESOLUTIONS.map((r) => ({
+						value: r.value ? `${r.value[0]}x${r.value[1]}` : 'source',
+						// With a project frame set, "Source" is that frame — the export and
+						// the preview must not be able to disagree about the deliverable.
+						label: r.value ? r.label : projectFrame ? `Project frame (${projectFrame})` : r.label
 					})),
-					setVideoCodec
-				)}
-
-				{#if opts.video_codec === 'prores_ks'}
-					{@render selectRow(
-						'Profile',
-						String(opts.prores_profile ?? 3),
-						PRORES_PROFILES.map((p) => ({ value: String(p.value), label: p.label })),
-						(v) => patch({ prores_profile: Number(v) })
-					)}
-				{:else if opts.video_codec === 'gif'}
-					<div style="font-size:12px;color:var(--text-muted);padding:4px 0">Quality is set by the palette and the resolution / fps below.</div>
-				{:else}
-					<!-- rate control segmented -->
-					<div style="display:flex;align-items:center;gap:8px;padding:4px 0">
-						<span style="font-size:12px;color:var(--text-muted);width:90px;flex:none">Rate control</span>
-						<div style="display:flex;gap:4px;flex:1">
-							{#each RATE_CONTROLS.filter((rc) => rc.id !== 'two_pass' || !isHwCodec(opts.video_codec)) as rc (rc.id)}
-								<button
-									onclick={() => setRate(rc.id)}
-									style="flex:1;padding:5px 4px;font-size:12px;cursor:pointer;border-radius:var(--radius-sm);border:var(--line-width) solid {opts.rate_control ===
-									rc.id
-										? 'var(--kerf-500)'
-										: 'var(--border-strong)'};background:{opts.rate_control === rc.id
-										? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)'
-										: 'var(--surface-inset)'};color:{opts.rate_control === rc.id ? 'var(--text-primary)' : 'var(--text-secondary)'}"
-									>{rc.label}</button
-								>
-							{/each}
-						</div>
-					</div>
-
-					{#if opts.rate_control === 'crf' && vc?.crf}
-						{@render sliderRow('Quality (CRF)', opts.crf ?? vc.crf[2], vc.crf[0], vc.crf[1], 1, String(opts.crf ?? vc.crf[2]), (v) =>
-							patch({ crf: Math.round(v) })
-						)}
-						<div style="font-size:12px;color:var(--text-muted);padding:0 0 2px 100px">lower = higher quality &amp; larger file</div>
-					{:else if opts.rate_control === 'bitrate' || opts.rate_control === 'two_pass'}
-						{@render textRow('Target bitrate', opts.video_bitrate ?? '', 'e.g. 8M', (v) => patch({ video_bitrate: v }))}
-						{#if opts.rate_control === 'two_pass'}
-							<div style="font-size:12px;color:var(--text-muted);padding:0 0 2px 0">Two passes ≈ double the render time.</div>
-						{/if}
-					{:else if opts.rate_control === 'lossless'}
-						<div style="font-size:12px;color:var(--text-muted);padding:4px 0">Mathematically lossless — very large files.</div>
-					{/if}
-
-					{#if vc?.presets}
-						{@render selectRow(
-							vc.presetKind === 'cpuused' ? 'Speed (cpu-used)' : vc.presetKind === 'svtav1' ? 'Speed (preset)' : 'Speed preset',
-							opts.preset ?? vc.presets[0],
-							vc.presets.map((p) => ({ value: p, label: p })),
-							(v) => patch({ preset: v })
-						)}
-					{/if}
-				{/if}
-
-				{#if opts.video_codec !== 'gif'}
-					{#if vc && opts.video_codec !== 'prores_ks'}
-						{#if vc.tunes.length}
-							{@render selectRow(
-								'Tune',
-								opts.tune ?? '',
-								[{ value: '', label: 'None' }, ...vc.tunes.map((t) => ({ value: t, label: t }))],
-								(v) => patch({ tune: v || null })
-							)}
-						{/if}
-						{#if vc.profiles.length}
-							{@render selectRow(
-								'Profile',
-								opts.profile_v ?? '',
-								[{ value: '', label: 'Auto' }, ...vc.profiles.map((p) => ({ value: p, label: p }))],
-								(v) => patch({ profile_v: v || null })
-							)}
-						{/if}
-					{/if}
-					{#if vc?.pixFmts.length}
-						{@render selectRow(
-							'Pixel format',
-							opts.pix_fmt ?? vc.pixFmts[0],
-							vc.pixFmts.map((p) => ({ value: p, label: p })),
-							(v) => patch({ pix_fmt: v })
-						)}
-					{/if}
-					{@render selectRow(
-						'Scaler',
-						opts.scaler ?? '',
-						[{ value: '', label: 'Default (bicubic)' }, ...SCALERS.map((s) => ({ value: s, label: s }))],
-						(v) => patch({ scaler: v || null })
-					)}
-					{@render toggleRow('GPU decode (hwaccel)', !!opts.hwaccel && opts.hwaccel !== 'none', (v) =>
-						patch({ hwaccel: v ? 'auto' : null })
-					)}
-				{/if}
-
-
-			{/if}
-
-			<!-- audio -->
-			{#if showAudio}
-				{@render secHead('Audio')}
-				{#if opts.include_audio}
-					{@render selectRow(
-						'Codec',
-						opts.audio_codec ?? '',
-						info.audio.map((id) => ({ value: id, label: AUDIO_CODECS[id]?.label ?? id })),
-						(v) => patch({ audio_codec: v })
-					)}
-					{#if ac?.lossy}
-						{@render selectRow(
-							'Bitrate',
-							opts.audio_bitrate ?? '192k',
-							AUDIO_BITRATES.map((b) => ({ value: b, label: b })),
-							(v) => patch({ audio_bitrate: v })
-						)}
-					{:else if opts.audio_codec === 'flac'}
-						{@render sliderRow('Compression', opts.flac_compression ?? 5, 0, 12, 1, String(opts.flac_compression ?? 5), (v) =>
-							patch({ flac_compression: Math.round(v) })
-						)}
-					{:else}
-						<div style="font-size:12px;color:var(--text-muted);padding:4px 0">Uncompressed / lossless — no bitrate.</div>
-					{/if}
-					{@render selectRow(
-						'Sample rate',
-						opts.audio_codec === 'libopus' ? '48000' : opts.audio_sample_rate ? String(opts.audio_sample_rate) : 'source',
-						[{ value: 'source', label: 'Source' }, ...SAMPLE_RATES.map((r) => ({ value: String(r), label: `${r / 1000} kHz` }))],
-						(v) => patch({ audio_sample_rate: v === 'source' ? null : parseInt(v) }),
-						opts.audio_codec === 'libopus'
-					)}
-					{@render selectRow(
-						'Channels',
-						opts.audio_channels ? String(opts.audio_channels) : 'source',
-						[
-							{ value: 'source', label: 'Source' },
-							{ value: '1', label: 'Mono' },
-							{ value: '2', label: 'Stereo' }
-						],
-						(v) => patch({ audio_channels: v === 'source' ? null : parseInt(v) })
-					)}
-				{/if}
-			{/if}
-
-			<!-- container options -->
-			{@render secHead('Container')}
-			{#if opts.container === 'gif'}
-				{@render selectRow(
-					'Dither',
-					opts.gif_dither ?? 'bayer',
-					GIF_DITHERS.map((d) => ({ value: d, label: d })),
-					(v) => patch({ gif_dither: v })
-				)}
-				{@render toggleRow('Loop forever', opts.gif_loop, (v) => patch({ gif_loop: v }))}
-			{/if}
-			{#if info.faststart}
-				{@render toggleRow('Fast start (web streaming)', opts.faststart, (v) => patch({ faststart: v }))}
-			{/if}
-			{@render textRow('Title', opts.metadata_title ?? '', 'optional', (v) => patch({ metadata_title: v || null }))}
-
-			<!-- command preview -->
-			<button
-				onclick={() => (showCommand = !showCommand)}
-				style="margin-top:12px;background:none;border:none;color:var(--text-secondary);font-size:12px;cursor:pointer;padding:2px 0"
-				>{showCommand ? '▾' : '▸'} Show ffmpeg command</button
-			>
-			{#if showCommand}
-				<pre
-					data-selectable
-					style="margin:6px 0 0;padding:8px 10px;background:var(--surface-void);border:var(--line-width) solid var(--border-subtle);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all">{command}</pre>
-			{/if}
-			</details>
-		</div>
-
-		<!-- footer -->
-		<div style="flex:none;border-top:var(--line-width) solid var(--border-default)">
-			{#if issues.length}
-				<div style="padding:8px 16px;display:flex;flex-direction:column;gap:3px;background:color-mix(in srgb,var(--red-600) 14%,transparent)">
-					{#each issues as issue (issue)}
-						<div style="font-size:12px;color:var(--red-400)">⚠ {issue}</div>
-					{/each}
+					{ value: 'custom', label: 'Custom…' }
+				],
+				setRes
+			)}
+			{#if !opts.resolution && projectFrame}
+				<div style="font-size:12px;color:var(--text-muted);padding:0 0 6px;text-align:right">
+					Renders the frame you have been cutting in. Pick a size to override it here only.
 				</div>
 			{/if}
-			<div style="display:flex;align-items:center;gap:8px;padding:12px 16px">
-				{#if rendering}
-					<div style="flex:1;display:flex;align-items:center;gap:10px">
-						<div style="flex:1;height:6px;border-radius:3px;background:var(--surface-inset);overflow:hidden">
-							<div
-								style="height:100%;width:{Math.round(
-									(progress?.fraction ?? 0) * 100
-								)}%;background:var(--kerf-500);transition:width var(--dur-fast) linear"
-							></div>
-						</div>
-						<span
-							data-testid="export-progress-text"
-							style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);min-width:104px;text-align:right"
-						>
-							{#if progress?.waiting}{progress.waiting}…{:else}
-							{#if progress?.total != null && progress.total > 1}{(progress.variant ?? 0) + 1}/{progress.total} · {/if}{Math.round(
-								(progress?.fraction ?? 0) * 100
-							)}%{progress?.eta_secs != null ? ` · ${fmtEta(progress.eta_secs)} left` : ''}{/if}
-						</span>
-					</div>
-					<Btn variant="destructive" size="md" data-rescue disabled={cancelling} onclick={stop}>
-						{cancelling ? 'Stopping…' : 'Stop'}
-					</Btn>
-				{:else}
-					<div style="flex:1"></div>
-					<Btn variant="ghost" size="md" onclick={onClose}>Cancel</Btn>
-					<Btn variant="primary" size="md" icon="upload" data-rescue disabled={!canExport} onclick={doExport}>
-						{variantFormats.length > 1 ? `Export ${variantFormats.length} files` : 'Export'}
-					</Btn>
-				{/if}
-			</div>
+			{#if customRes}
+				<div style="display:flex;align-items:center;gap:8px;padding:4px 0;justify-content:flex-end">
+					<input
+						type="number"
+						min="2"
+						step="2"
+						value={opts.resolution?.[0] ?? 1920}
+						onchange={(e) => patch({ resolution: [parseInt(e.currentTarget.value) || 1920, opts.resolution?.[1] ?? 1080] })}
+						style="{inputCss};width:90px;text-align:right"
+					/>
+					<span style="color:var(--text-muted)">×</span>
+					<input
+						type="number"
+						min="2"
+						step="2"
+						value={opts.resolution?.[1] ?? 1080}
+						onchange={(e) => patch({ resolution: [opts.resolution?.[0] ?? 1920, parseInt(e.currentTarget.value) || 1080] })}
+						style="{inputCss};width:90px;text-align:right"
+					/>
+				</div>
+			{/if}
+			{#if opts.resolution}
+				{@render selectRow(
+					'Aspect fit',
+					opts.fit ?? 'contain',
+					FITS.map((f) => ({ value: f.id, label: f.label })),
+					(v) => patch({ fit: v as Fit })
+				)}
+				<div style="font-size:12px;color:var(--text-muted);padding:0 0 6px;text-align:right">
+					{FITS.find((f) => f.id === (opts.fit ?? 'contain'))?.hint}
+				</div>
+			{/if}
+			{/if}
+			{@render selectRow(
+				'Frame rate',
+				opts.fps ? String(opts.fps) : 'source',
+				frameRateOptions(opts.fps).map((f) => ({ value: f.value ? String(f.value) : 'source', label: f.label })),
+				(v) => patch({ fps: v === 'source' ? null : parseFloat(v) })
+			)}
+			{#if qualityOptions.length}
+				{@render selectRow(
+					'Quality',
+					qualityValue,
+					[
+						...(qualityValue === 'custom' ? [{ value: 'custom', label: 'Custom · see Advanced' }] : []),
+						...qualityOptions
+					],
+					(v) => {
+						if (v !== 'custom') patch({ rate_control: 'crf', crf: Number(v) });
+					}
+				)}
+				<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0;line-height:1.45">Higher quality keeps more detail and makes a larger file.</p>
+			{:else if opts.video_codec === 'gif'}
+				<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0">GIF quality follows the picture size and the palette settings in Advanced.</p>
+			{:else}
+				<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0">This preset is a mastering format. Its profile is in Advanced.</p>
+			{/if}
+		{/if}
+		{#if showAudio}
+			{@render secHead('Sound')}
+			{@render toggleRow('Include audio', !!opts.include_audio, (v) => patch({ include_audio: v }))}
+			{#if opts.include_audio}
+				{@render selectRow(
+					'Normalize loudness',
+					loudness,
+					LOUDNESS_TARGETS.map((t) => ({ value: t.id, label: t.label })),
+					(v) => patch(withLoudness(opts, v as LoudnessChoice))
+				)}
+				<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0;line-height:1.45">{loudnessHint}</p>
+			{/if}
+		{/if}
+		<!-- one cut, every platform -->
+		{#if showVideo}
+			{@render secHead('Deliver to')}
+			<DeliverTo {outputPath} ext={info.ext} />
+		{/if}
+
+		<!-- where this is going (per file when several are being written) -->
+		{#if !variantFormats.length}
+			<Readiness frame={opts.resolution ?? null} />
+		{/if}
+
+		<details bind:open={showAdvanced} style="margin-top:12px;border-top:var(--line-width) solid var(--border-default)">
+			<summary style="cursor:pointer;padding:12px 0;font-size:13px;font-weight:600;color:var(--text-secondary)">Advanced encoding</summary>
+		<!-- summary -->
+		<div
+			data-selectable
+				style="margin-top:12px;padding:8px 10px;border-radius:var(--radius-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-subtle);font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)"
+		>
+			{summary}
 		</div>
+
+		{@render selectRow(
+			'Container',
+			opts.container,
+			CONTAINERS.map((c) => ({ value: c.id, label: `${c.label} (.${c.ext})` })),
+			(v) => changeContainer(v as Container)
+		)}
+		<!-- video -->
+		{#if showVideo}
+			{@render secHead('Video')}
+			{@render selectRow(
+				'Codec',
+				opts.video_codec ?? '',
+				[...info.video, ...info.hwVideo.filter((id) => hwCodecs.includes(id))].map((id) => ({
+					value: id,
+					label: VIDEO_CODECS[id]?.label ?? id
+				})),
+				setVideoCodec
+			)}
+
+			{#if opts.video_codec === 'prores_ks'}
+				{@render selectRow(
+					'Profile',
+					String(opts.prores_profile ?? 3),
+					PRORES_PROFILES.map((p) => ({ value: String(p.value), label: p.label })),
+					(v) => patch({ prores_profile: Number(v) })
+				)}
+			{:else if opts.video_codec === 'gif'}
+				<div style="font-size:12px;color:var(--text-muted);padding:4px 0">Quality is set by the palette and the resolution / fps below.</div>
+			{:else}
+				<!-- rate control segmented -->
+				<div style="display:flex;align-items:center;gap:8px;padding:4px 0">
+					<span style="font-size:12px;color:var(--text-muted);width:90px;flex:none">Rate control</span>
+					<div style="display:flex;gap:4px;flex:1">
+						{#each RATE_CONTROLS.filter((rc) => rc.id !== 'two_pass' || !isHwCodec(opts.video_codec)) as rc (rc.id)}
+							<button
+								onclick={() => setRate(rc.id)}
+								style="flex:1;padding:5px 4px;font-size:12px;cursor:pointer;border-radius:var(--radius-sm);border:var(--line-width) solid {opts.rate_control ===
+								rc.id
+									? 'var(--kerf-500)'
+									: 'var(--border-strong)'};background:{opts.rate_control === rc.id
+									? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)'
+									: 'var(--surface-inset)'};color:{opts.rate_control === rc.id ? 'var(--text-primary)' : 'var(--text-secondary)'}"
+								>{rc.label}</button
+							>
+						{/each}
+					</div>
+				</div>
+
+				{#if opts.rate_control === 'crf' && vc?.crf}
+					{@render sliderRow('Quality (CRF)', opts.crf ?? vc.crf[2], { min: vc.crf[0], max: vc.crf[1], step: 1, digits: 0, neutral: vc.crf[2] }, (v) =>
+						patch({ crf: Math.round(v) })
+					)}
+					<div style="font-size:12px;color:var(--text-muted);padding:0 0 2px 98px">lower = higher quality &amp; larger file</div>
+				{:else if opts.rate_control === 'bitrate' || opts.rate_control === 'two_pass'}
+					{@render textRow('Target bitrate', opts.video_bitrate ?? '', 'e.g. 8M', (v) => patch({ video_bitrate: v }))}
+					{#if opts.rate_control === 'two_pass'}
+						<div style="font-size:12px;color:var(--text-muted);padding:0 0 2px 0">Two passes ≈ double the render time.</div>
+					{/if}
+				{:else if opts.rate_control === 'lossless'}
+					<div style="font-size:12px;color:var(--text-muted);padding:4px 0">Mathematically lossless — very large files.</div>
+				{/if}
+
+				{#if vc?.presets}
+					{@render selectRow(
+						vc.presetKind === 'cpuused' ? 'Speed (cpu-used)' : vc.presetKind === 'svtav1' ? 'Speed (preset)' : 'Speed preset',
+						opts.preset ?? vc.presets[0],
+						vc.presets.map((p) => ({ value: p, label: p })),
+						(v) => patch({ preset: v })
+					)}
+				{/if}
+			{/if}
+
+			{#if opts.video_codec !== 'gif'}
+				{#if vc && opts.video_codec !== 'prores_ks'}
+					{#if vc.tunes.length}
+						{@render selectRow(
+							'Tune',
+							opts.tune ?? '',
+							[{ value: '', label: 'None' }, ...vc.tunes.map((t) => ({ value: t, label: t }))],
+							(v) => patch({ tune: v || null })
+						)}
+					{/if}
+					{#if vc.profiles.length}
+						{@render selectRow(
+							'Profile',
+							opts.profile_v ?? '',
+							[{ value: '', label: 'Auto' }, ...vc.profiles.map((p) => ({ value: p, label: p }))],
+							(v) => patch({ profile_v: v || null })
+						)}
+					{/if}
+				{/if}
+				{#if vc?.pixFmts.length}
+					{@render selectRow(
+						'Pixel format',
+						opts.pix_fmt ?? vc.pixFmts[0],
+						vc.pixFmts.map((p) => ({ value: p, label: p })),
+						(v) => patch({ pix_fmt: v })
+					)}
+				{/if}
+				{@render selectRow(
+					'Scaler',
+					opts.scaler ?? '',
+					[{ value: '', label: 'Default (bicubic)' }, ...SCALERS.map((s) => ({ value: s, label: s }))],
+					(v) => patch({ scaler: v || null })
+				)}
+				{@render toggleRow('GPU decode (hwaccel)', !!opts.hwaccel && opts.hwaccel !== 'none', (v) =>
+					patch({ hwaccel: v ? 'auto' : null })
+				)}
+			{/if}
+
+
+		{/if}
+
+		<!-- audio -->
+		{#if showAudio}
+			{@render secHead('Audio')}
+			{#if opts.include_audio}
+				{@render selectRow(
+					'Codec',
+					opts.audio_codec ?? '',
+					info.audio.map((id) => ({ value: id, label: AUDIO_CODECS[id]?.label ?? id })),
+					(v) => patch({ audio_codec: v })
+				)}
+				{#if ac?.lossy}
+					{@render selectRow(
+						'Bitrate',
+						opts.audio_bitrate ?? '192k',
+						AUDIO_BITRATES.map((b) => ({ value: b, label: b })),
+						(v) => patch({ audio_bitrate: v })
+					)}
+				{:else if opts.audio_codec === 'flac'}
+					{@render sliderRow('Compression', opts.flac_compression ?? 5, { min: 0, max: 12, step: 1, digits: 0, neutral: 5 }, (v) =>
+						patch({ flac_compression: Math.round(v) })
+					)}
+				{:else}
+					<div style="font-size:12px;color:var(--text-muted);padding:4px 0">Uncompressed / lossless — no bitrate.</div>
+				{/if}
+				{@render selectRow(
+					'Sample rate',
+					opts.audio_codec === 'libopus' ? '48000' : opts.audio_sample_rate ? String(opts.audio_sample_rate) : 'source',
+					[{ value: 'source', label: 'Source' }, ...SAMPLE_RATES.map((r) => ({ value: String(r), label: `${r / 1000} kHz` }))],
+					(v) => patch({ audio_sample_rate: v === 'source' ? null : parseInt(v) }),
+					opts.audio_codec === 'libopus'
+				)}
+				{@render selectRow(
+					'Channels',
+					opts.audio_channels ? String(opts.audio_channels) : 'source',
+					[
+						{ value: 'source', label: 'Source' },
+						{ value: '1', label: 'Mono' },
+						{ value: '2', label: 'Stereo' }
+					],
+					(v) => patch({ audio_channels: v === 'source' ? null : parseInt(v) })
+				)}
+			{/if}
+		{/if}
+
+		<!-- container options -->
+		{@render secHead('Container')}
+		{#if opts.container === 'gif'}
+			{@render selectRow(
+				'Dither',
+				opts.gif_dither ?? 'bayer',
+				GIF_DITHERS.map((d) => ({ value: d, label: d })),
+				(v) => patch({ gif_dither: v })
+			)}
+			{@render toggleRow('Loop forever', opts.gif_loop, (v) => patch({ gif_loop: v }))}
+		{/if}
+		{#if info.faststart}
+			{@render toggleRow('Fast start (web streaming)', opts.faststart, (v) => patch({ faststart: v }))}
+		{/if}
+		{@render textRow('Title', opts.metadata_title ?? '', 'optional', (v) => patch({ metadata_title: v || null }))}
+
+		<!-- command preview -->
+		<button
+			onclick={() => (showCommand = !showCommand)}
+			style="margin-top:12px;background:none;border:none;color:var(--text-secondary);font-size:12px;cursor:pointer;padding:2px 0"
+			>{showCommand ? '▾' : '▸'} Show ffmpeg command</button
+		>
+		{#if showCommand}
+			<pre
+				data-selectable
+				style="margin:6px 0 0;padding:8px 10px;background:var(--surface-void);border:var(--line-width) solid var(--border-subtle);border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);white-space:pre-wrap;word-break:break-all">{command}</pre>
+		{/if}
+		</details>
 	</div>
-</div>
+	{#snippet footer()}
+		{#if issues.length}
+			<div style="padding:8px 16px;display:flex;flex-direction:column;gap:3px;background:color-mix(in srgb,var(--red-600) 14%,transparent)">
+				{#each issues as issue (issue)}
+					<div style="font-size:12px;color:var(--red-400)">⚠ {issue}</div>
+				{/each}
+			</div>
+		{/if}
+		<div style="display:flex;align-items:center;gap:8px;padding:12px 16px">
+			{#if rendering}
+				<div style="flex:1;display:flex;align-items:center;gap:10px">
+					<div style="flex:1;height:6px;border-radius:3px;background:var(--surface-inset);overflow:hidden">
+						<div
+							style="height:100%;width:{Math.round(
+								(progress?.fraction ?? 0) * 100
+							)}%;background:var(--kerf-500);transition:width var(--dur-fast) linear"
+						></div>
+					</div>
+					<span
+						data-testid="export-progress-text"
+						style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);min-width:104px;text-align:right"
+					>
+						{#if progress?.waiting}{progress.waiting}…{:else}
+						{#if progress?.total != null && progress.total > 1}{(progress.variant ?? 0) + 1}/{progress.total} · {/if}{Math.round(
+							(progress?.fraction ?? 0) * 100
+						)}%{progress?.eta_secs != null ? ` · ${fmtEta(progress.eta_secs)} left` : ''}{/if}
+					</span>
+				</div>
+				<Btn variant="destructive" size="md" data-rescue disabled={cancelling} onclick={stop}>
+					{cancelling ? 'Stopping…' : 'Stop'}
+				</Btn>
+			{:else}
+				<div style="flex:1"></div>
+				<Btn variant="ghost" size="md" onclick={onClose}>Cancel</Btn>
+				<Btn variant="primary" size="md" icon="upload" data-rescue disabled={!canExport} onclick={doExport}>
+					{variantFormats.length > 1 ? `Export ${variantFormats.length} files` : 'Export'}
+				</Btn>
+			{/if}
+		</div>
+	{/snippet}
+</Modal>

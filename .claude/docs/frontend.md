@@ -18,7 +18,8 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   the opaque color tokens (grouped for the editor), three presets (Kerf Dark —
   bun-tested to equal the stylesheet's defaults — Kerf Light, High contrast),
   `parseTheme` (a stored or imported JSON; unknown tokens dropped, missing ones
-  filled from the scheme's preset) and `applyTheme`, which writes the tokens as
+  filled from the preset the colors it does carry are exactly — a High contrast saved before a token existed stays
+  High contrast — else the scheme's) and `applyTheme`, which writes the tokens as
   inline properties on `<html>` (beating the stylesheet), toggles the `dark`
   class and `color-scheme`. Every translucent token in `kerf-tokens.css`
   (borders, fills, glows, the scrim) is a `color-mix` of an opaque base so a
@@ -57,7 +58,8 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   ones, `text-on-accent`, `agent-fg`, `text-on-video` on the clip bodies), 3:1 for
   muted text on hover / active, accent and status hues as text on the panels and
   the strokes that carry meaning (clip edges, the playhead / selection amber, the
-  waveform, the drag ghost), plus the `color-mix` fill of a generated caption's
+  waveform, the drag ghost, and `clip-accent` — the volume line, fade handles and keyframes on every clip
+  body), plus the `color-mix` fill of a generated caption's
   block (`GENERATED_TITLE_FILL`, resolved per preset by `mixSrgb` and held to 4.5
   under its label). `text-disabled` is exempt on a *disabled* control; it used to be
   the idle colour of live toggles too (DUCK / S / L, the bell), which is no longer so (see below),
@@ -336,8 +338,9 @@ contrast guard covers it. **Where the old toolbar's controls went**: the transpo
 start, play / pause, go to end, the timecode with the timeline's fps; J / K / L stay on
 the keyboard) is the **Preview**'s own bar, which sheds the duration and the rate below
 ~380 px of its *measured* width (`transport-bar.ts`, bun-tested: an unknown or 0 width is the
-full bar, and the buttons, timecode and scrub bar never go); the tools, Ripple, Snapping,
-Undo / Redo and the delivery-frame picker are the **Timeline**'s toolbar, which wraps to a
+full bar, and the buttons, timecode and scrub bar never go) — see **the Preview frame and its
+scrub bar** below; the tools, Ripple, Snapping,
+Undo / Redo and the delivery-frame picker are the **Timeline**'s toolbar (every button a `ToolbarToggle`), which wraps to a
 second row rather than clip
 (its "Timeline" caption is gone — the dock tab says it); New / Open / Save / Export and
 Panels are the File and Window menus. `menus.test.ts` holds each of those paths, and
@@ -375,7 +378,7 @@ animate from the same panel**: a ◇ beside each colour number and the volume ke
 the value it has there (◆ when a key sits there, and clicking it takes the key out; the last one makes
 the number static), and once a number is keyed its slider shows the curve at the playhead and an edit
 writes a key there — `setCol` / `setGain` / `keyAtPlayhead` over `set_property_keyframes` with the
-mirror's `upsertKey`, so a drag is one edit. The Transform sliders do the same for numbers keyed on
+mirror's `upsertKey`, so a drag is one edit (every number row is a `SliderRow`, below). The Transform sliders do the same for numbers keyed on
 their own; the Animation list is still the legacy bundle's, and the per-number rows, dope sheet and easing
 popover are the next slice. The preview's Web Audio gain follows a keyed volume — `gainAutomation`
 ramps linearly through the curve's points and the fade edges, and **steps where the curve does** (a hold
@@ -641,6 +644,36 @@ engine. Below the queue, the **History** section renders
 `editor.revertTo(seq)`, and each row expands to *what* that revision changed
 (`revision_diff`).
 
+**The Preview frame and its scrub bar.** The frame is the delivery shape at `min(100%, 100cqh × aspect)` of its
+pane — the 720 px cap it had left it 62 % of the pane at 1920×1080 and a postage stamp at 2560×1440. What is asked of the
+backend follows the box: `preview-size.ts` `requestWidth(css width, dpr)` rounds `ceil(css × dpr)` up to 480 / 960 /
+1440 / 1920 (the top is the MCP frame tools' own cap; the backend takes any width and never scales a picture past its
+own, so the bound is only on cost), measured from the frame element by a `ResizeObserver`, the window's resize and a
+`(resolution: Xdppx)` media query (a window dragged to another monitor fires neither of the first two),
+**settled 200 ms** so a dragged panel edge is a few requests, not one per pixel; a box with no width (a hidden dock
+tab) is not a measurement — the last one stands, or nothing is asked. The width is then **held to the widest source the
+preview reads at the playhead** (`proxy-info.ts` `previewSourceWidth`: a ready proxy's width when the preview decodes it,
+else the original's; `capToSource`), since the default proxy is 1280 px wide and a 1440 / 1920 px composite of it is the
+same picture upscaled at several times the decode cost on every scrub frame — not under a delivery frame, whose canvas is
+not the source's shape (`data-request-width` on the frame says what it asked). The pump (`frame-pump.svelte.ts`) takes it as `width()`, reads it in `run()` — a different
+step is a new frame — and asks nothing until the box has been measured, so a first frame is not decoded at a guess
+and again at the real size. (Playback's streamed frames keep the backend's fixed stream width.) The picture is clipped to the
+frame's radius and the frame's border is `border-strong`, since a black matte is 1.05:1 on the pane. **The HUD** over the
+picture is scrim chips with `text-on-video` (the name, ellipsised at 62 % of the width so a long file name never reaches the
+format, then `1920×1080 · 30 fps` in the transport's own rate format, and the proxy / analysis status chips with a dot) — bare
+tinted text was unreadable on a snow shot and on the Light theme's pale placeholder — and it no longer prints the timecode, which
+is the transport's. **`ScrubBar.svelte`** is a 16 px hit area around a 4 px rail (`--scrub-rail`, an alias of `text-disabled`, so
+the 3:1 it is held to covers it and it shows in High contrast, where the old `surface-inset` rail on the black bar was 1.05:1) with
+the in / out range behind the fill and a thumb that grows while held. A press moves the playhead there and a drag moves it
+*live* (`scrub.ts`: `scrubTime`, and `frameLimited` — at most one `ui.seek` per animation frame, with the newest position, since
+each seek is an FFmpeg composite); it is `beginDrag` (pointer capture, so the pointer may leave the bar; Escape /
+pointercancel / lost capture / blur put the playhead back where the press found it), playback is paused while the bar is held
+and resumes at either end of the gesture — except when it was let go at the very end of the cut, where `play()` would start
+the cut over (a seek mid-play restarts the audio each time). It is a `role=slider` with the cut's
+timecode as its value text; a press does not focus it (a focused slider owns Space and the arrows — the page stands down for
+the keys a slider operates — so one left focused after a click would silence the transport shortcuts), and once Tab has
+put focus there its own keys are ← → a frame, ⇧← ⇧→ a second, Home / End the ends, Space play.
+
 **The GPU preview in the page** (`Preview.svelte`, `preview-bounds.ts`,
 `gpu-preview.svelte.ts`). With the setting on, a frame whose route is `gpu`
 (`routePreview`: pure and bun-tested — setting, platform support, playback streaming, an
@@ -661,15 +694,58 @@ background shows the hole. The status bar names the renderer of the frame on scr
 430×240 · 23 ms · llvmpipe`, or `FFmpeg · <why>`), only while the setting is on, and the
 Settings dialog's Preview section carries the toggle and the machine's status line.
 
-**Modals are modal.** `ExportDialog` / `SettingsDialog` / `UpdateDialog` /
-`FitMusicDialog` / `StemsDialog` use the
+**Shared components** (`components/editor/`; `shared-components.test.ts` keeps the dialogs, the Inspector's rows and the toolbar on them).
+**`Modal`** is the shell of every dialog: the scrim (`--scrim` at 55 %, one `z-index` of 50 — a later sibling, the
+update dialog, stacks over an earlier), the panel (`--line-width` border, `--shadow-lg`), a header with an icon, the title (the
+dialog's accessible name, `aria-labelledby`) and a named close button (an `IconBtn`, `title="Close"`, an `x` icon), `trapFocus`,
+Escape, and an optional `footer` snippet drawn under a rule; the body is the dialog's own. What differs is props:
+`width` / `height` (px, never wider than the window), `busy` (a run that cannot be walked away from: Escape, the scrim *and* the
+close button are off, and the button is gone), `dismissOnScrim` (off for a dialog holding typed input or chosen options),
+`initial` (a selector for the field that takes focus on open) and `rescue` (see below). The close rules are the pure
+`mayClose(via, {busy, dismissOnScrim})` and `scrimClick` in `modal.ts`: a click closes only if the *press* began on the scrim
+too, so selecting text in a field and letting go over the dark no longer closes the dialog. Policy per dialog: Export
+`dismissOnScrim={false}` and never `busy` (closing mid-render leaves it running); Voiceover `busy={generating}`,
+`dismissOnScrim={scrimCloses(text, generating)}`, `initial="textarea"`; Fit / Stems / Update `busy` while they run; Settings none.
+**`SliderRow`** is one numeric property: label, slider, number field, and a 24 px slot for the keyframe button, on one grid
+(`72px 1fr 60px 24px` — `NUMBER_COL`, room for `100.00s` in the 12 px mono type — the slot kept when empty so every slider in the panel is the same length; `reserve={false}` in
+a dialog; `minmax(0, 1fr)` so the row shrinks to the Inspector's 260 px minimum without clipping a value). The slider is
+`MixSlider` (`solid`: drawn like the plain range) so a drag writes **one edit on release**, Escape / pointercancel / blur
+abandon it, a run of arrow keys is one edit and a double-click puts the property back to its rest value. **Only the thumb
+takes hold, so a click elsewhere on the track no longer jumps the value** — a deliberate change from the native range it
+replaced, as in the mixer: a jump on the first click would make a double-click three edits (jump, jump, reset). The rest value (`neutral`) is a
+tick on the travel, and a property that goes both ways (`bipolar`, by default a travel across zero) fills from it instead of
+from the left. The number is a field (click, type, Enter or Tab to write, Escape to put it back; `1.1` on a 0.25 step is fine):
+what is shown is `value × scale` with `digits` decimals and a `unit` (`PERCENT`, `DEGREES`, `TIMES`, `SECONDS`), and the geometry,
+snapping, readout, entry parsing and key steps are the pure, bun-tested `slider-row.ts` (a typed entry is NFKC-normalised, so full-width digits parse, and held to `limit`, a fade
+as long as its clip on a 5 s slider, and to the digits shown: a fade is 0.01 s, a title's size 0.1 %). A value is *at rest* only when it
+is exactly there — a 0.4° rotation reads 0° and can still be reset or typed to 0. **A write goes to what the edit began on**: a typed
+entry is written when the field blurs, and the click that selects another clip blurs it after the selection has moved, so the row
+reads its `scope` (clip, title, playhead time; `Pending` in `slider-row.ts`) when a drag, a key run or a typed entry *starts* and hands it
+back with the value (`at`); the entry is parsed with the **spec it began with** too (a fade typed on a 20 s clip and committed by the click on a 3 s one is not
+clamped to 3 s), and focusing the number field starts a fresh `Pending`, so one left behind by a row that was disabled mid-focus is not inherited; the Inspector's helpers (`setTf`, `setCol`, `setCam`, `patchMask`, `setFade`, `moveTitle`, and a keyed
+number's `keyAtPlayhead`) read that clip. **A plain field** (`numRow`, a title's Text / Color / Box / Font / Bold, an effect's parameters, the
+Transitions tab's length) is no different: its `change` comes with the blur, by when the selection has moved *and the field has been
+re-rendered with the new selection's value*, so reading either writes the other clip's number onto this one. `FieldEdits`
+(`field-edit.ts`) notes the scope on `focus` and the typed text on `input` and `compositionend`, and the commit takes both from there (`noteFocus` /
+`noteTyped` / `endEdit` in the Inspector); a select or a checkbox changes at once and only needs the scope. A bun test holds every
+text and number input of the Inspector to this. Rest values are the model's
+`DEFAULT_TRANSFORM` / `DEFAULT_COLOR` / `DEFAULT_REFRAME` / `DEFAULT_MASK`. The Inspector's other rows (read-only values, plain number
+fields) share the label column and run to the panel's edge over the keyframe slot, which a source range needs at the 250 px minimum. The ◇ is a 24 px `IconBtn` with a `diamond` icon (filled while a key sits at the playhead).
+A plain `<input type=range>` (Settings, the timeline zoom) gets an 18 px hit box and `min-width:0` from `layout.css`.
+**`ToolbarToggle`** is a button of the timeline toolbar: 24 px high and at least 24 px wide, one radius, and one "on" for every kind
+of button — the amber outline and wash (`kerf-400` border, `kerf-300` on `selection-fill`, a pair the contrast guard holds to 4.5:1)
+whether it is a tool, a mode (snapping is a pressed magnet, not a word that changes width), a view or a menu with something chosen.
+`pressed` is a toggle (announced as one), `on` lights without announcing, neither is an action; `bare` is no outline while idle (tools,
+zoom), `square` a picture-only button. Its states are `.k-tt` in `controls.css`, which the veil leaves alone.
+
+**Modals are modal.** Every dialog is a `Modal` (above), which uses the
 `trapFocus` action (`src/lib/modal.ts`: takes focus, wraps Tab, restores focus on
-close; `VoiceoverDialog` too, with `initial: 'textarea'`), and `+page.svelte` makes the app behind them `inert` and returns early from its global key handler while
+close; Voiceover starts on its textarea via `initial`), and `+page.svelte` makes the app behind them `inert` and returns early from its global key handler while
 any is open — Space / Delete / J-K-L / ⌘Z would
 otherwise edit the live project under a dialog; a file drop is ignored then too.
 Every shortcut — bare keys and ⌘ chords alike — stands down inside any text input /
 textarea / select / contenteditable. **Focus survives a run and a menu.** A dialog whose footer
-swaps for a run (Export, Voiceover, Stems, Fit) passes `rescue: true` and marks its footer actions
+swaps for a run (Export, Voiceover, Stems, Fit, Update) passes `rescue` and marks its footer actions
 `data-rescue`: when the button that had focus is replaced or disabled a `MutationObserver` moves it to
 the live action (Generate → Cancel, and back to Generate when the run ends) or to the dialog root,
 not `<body>` (`focusLost`, pure). On close focus goes back to the control that had it; if that is
