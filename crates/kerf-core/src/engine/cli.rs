@@ -587,9 +587,10 @@ pub(crate) fn displayed_size(width: Option<u32>, height: Option<u32>, rotation: 
 }
 
 /// A colour tag as the engine stores it: `None` when the file does not say,
-/// rather than ffprobe's literal `"unknown"`.
+/// rather than ffprobe's literal `"unknown"` — or `"reserved"`, a value no matrix has,
+/// which FFmpeg reads as it reads none.
 pub(crate) fn known_color(tag: Option<&str>) -> Option<String> {
-    tag.filter(|t| !t.is_empty() && *t != "unknown" && *t != "unspecified")
+    tag.filter(|t| !t.is_empty() && !matches!(*t, "unknown" | "unspecified" | "reserved"))
         .map(str::to_string)
 }
 
@@ -2255,9 +2256,15 @@ fn proxy_key(source_key: &str, width: u32, tonemapped: bool, head_padded: bool, 
 /// And so does an HD picture that **names no matrix** (`|bt709`, [`untagged_hd_yuv`]): its proxy
 /// states BT.709, which the plain one (read as BT.601) did not, and a proxy of an untagged and
 /// one of a BT.709 clip are one matrix only if both say so. Only those are rebuilt; the old
-/// file is deleted when the new one is in place ([`superseded_proxy_path`]).
+/// file is deleted when the new one is in place ([`superseded_proxy_path_for`]).
 pub fn proxy_path(src: &Path, width: u32) -> Option<PathBuf> {
-    let traits = source_traits(src).unwrap_or_default();
+    proxy_path_for(src, width, source_traits(src).unwrap_or_default())
+}
+
+/// [`proxy_path`] for traits already read: an encode takes **one** reading for its destination, its
+/// filters and what it replaces, because a probe that failed once is remembered for a minute and a
+/// second reading can answer differently.
+fn proxy_path_for(src: &Path, width: u32, traits: SourceTraits) -> Option<PathBuf> {
     proxy_path_of(src, width, traits, traits.label_bt709)
 }
 
@@ -2272,9 +2279,15 @@ fn proxy_path_of(src: &Path, width: u32, traits: SourceTraits, bt709_label: bool
 
 /// Where `src`'s proxy was kept before it was labelled BT.709, for a source whose proxy has
 /// moved: the file a new encode replaces, and so one to delete.
-fn superseded_proxy_path(src: &Path, width: u32) -> Option<PathBuf> {
-    let traits = source_traits(src).unwrap_or_default();
-    traits.label_bt709.then(|| proxy_path_of(src, width, traits, false)).flatten()
+///
+/// Takes traits already read, like [`proxy_path_for`], and is never the proxy that is current: a path
+/// that is the destination is not something this proxy replaces.
+fn superseded_proxy_path_for(src: &Path, width: u32, traits: SourceTraits) -> Option<PathBuf> {
+    let old = traits
+        .label_bt709
+        .then(|| proxy_path_of(src, width, traits, false))
+        .flatten()?;
+    (Some(&old) != proxy_path_for(src, width, traits).as_ref()).then_some(old)
 }
 
 /// A proxy's file name (pure, unit-tested): `<hash>.mp4`, or `<hash>.lead.mp4` for
@@ -2300,11 +2313,15 @@ pub fn ready_proxy(src: &Path, width: u32) -> Option<PathBuf> {
 /// none). A proxy that is being written is a `.part` file and is left to the encode
 /// that owns it.
 pub fn remove_proxy_files(src: &Path, width: u32) -> u64 {
-    [proxy_path(src, width), superseded_proxy_path(src, width)]
-        .iter()
-        .flatten()
-        .map(|proxy| remove_proxy_pair(proxy))
-        .sum()
+    let traits = source_traits(src).unwrap_or_default();
+    [
+        proxy_path_for(src, width, traits),
+        superseded_proxy_path_for(src, width, traits),
+    ]
+    .iter()
+    .flatten()
+    .map(|proxy| remove_proxy_pair(proxy))
+    .sum()
 }
 
 /// Delete `proxy` and its sidecar, returning the bytes freed. Best effort: a file something
@@ -2528,9 +2545,18 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         progress,
         cancel,
     } = run;
-    let dst =
-        proxy_path(src, width).ok_or_else(|| Error::Engine("no cache directory available for preview proxies".to_string()))?;
+    // One reading of the source answers everything below: where the proxy goes, whether to tone-map or
+    // label it, whether the video starts late, and which older proxy it replaces.
+    let traits = source_traits(src).unwrap_or_default();
+    let dst = proxy_path_for(src, width, traits)
+        .ok_or_else(|| Error::Engine("no cache directory available for preview proxies".to_string()))?;
+    let superseded = superseded_proxy_path_for(src, width, traits);
     if dst.is_file() {
+        // A proxy already in place has outlived the one it replaced, if that survived (a file
+        // something held open when it was first deleted): try again.
+        if let Some(old) = &superseded {
+            remove_proxy_pair(old);
+        }
         return Ok(dst);
     }
     if cancel() {
@@ -2568,9 +2594,6 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         progress(0.0);
     }
     let threads = proxy_threads(cpu.threads());
-    // One cached probe answers all three: whether to tone-map, whether to label BT.709 and
-    // whether the video starts late (the same one `proxy_path` keyed this proxy on).
-    let traits = source_traits(src).unwrap_or_default();
     let colour = traits
         .hdr
         .map(tonemap_filter)
@@ -2660,8 +2683,8 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
             .ok()
             .and_then(|p| p.streams.into_iter().find(|s| s.kind == StreamKind::Video))
     })?;
-    if let Some(old) = superseded_proxy_path(src, width) {
-        remove_proxy_pair(&old);
+    if let Some(old) = &superseded {
+        remove_proxy_pair(old);
     }
     Ok(placed)
 }
@@ -8004,6 +8027,13 @@ mod tests {
             proxy_path_of(src, 1280, labelled, true),
             proxy_path_of(src, 1280, labelled, true)
         );
+        // An encode reads the source once: where it goes and what it replaces are one reading's answers,
+        // and what it replaces is never where it goes.
+        assert_eq!(proxy_path_for(src, 1280, labelled), Some(after));
+        assert_eq!(superseded_proxy_path_for(src, 1280, plain), None);
+        let old = superseded_proxy_path_for(src, 1280, labelled);
+        assert_eq!(old, proxy_path_of(src, 1280, labelled, false));
+        assert!(old.is_some() && old != proxy_path_for(src, 1280, labelled));
         // The padded variant keeps its name for what it is, labelled or not.
         let padded = SourceTraits { lead: 0.5, ..labelled };
         for label in [false, true] {
@@ -14422,6 +14452,11 @@ mod tests {
         let untagged = probe_json(r#""width":1280,"height":720,"color_space":"unknown""#);
         assert_eq!(untagged.streams[0].color_space, None);
         assert_eq!(probe_json(r#""width":1280,"height":720"#).streams[0].color_space, None);
+        // `reserved` (a value no matrix has) and `unspecified` are read by FFmpeg as no tag at all.
+        for none in ["reserved", "unspecified", ""] {
+            let probed = probe_json(&format!(r#""width":1280,"height":720,"color_space":"{none}""#));
+            assert_eq!(probed.streams[0].color_space, None, "{none:?}");
+        }
     }
 
     #[test]
@@ -15165,9 +15200,57 @@ mod tests {
         let x264 = ["libx264", "-preset", "ultrafast", "-qp", "0"];
         let ffv1 = ["ffv1"];
         let mjpeg = ["mjpeg", "-qscale:v", "1"];
+        // A late-starting source (its video opens half a second after its audio, an empty edit in the
+        // mp4): the proxy is the padded one, `<hash>.lead.mp4`, and is labelled all the same.
+        let late = {
+            let (video, audio, out) = (
+                dir.join("v-late.mp4"),
+                dir.join("a-late.mp4"),
+                dir.join("hd-untagged-late.mp4"),
+            );
+            let graph = format!("testsrc2=size=1280x720:rate=10:duration=2,format=yuv420p,{unknown}");
+            let ok = try_ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                &graph,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "10",
+                "-pix_fmt",
+                "yuv420p",
+                video.to_str().unwrap(),
+            ]) && try_ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=3",
+                "-c:a",
+                "aac",
+                audio.to_str().unwrap(),
+            ]) && try_ffmpeg(&[
+                "-itsoffset",
+                "0.5",
+                "-i",
+                video.to_str().unwrap(),
+                "-i",
+                audio.to_str().unwrap(),
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-c",
+                "copy",
+                out.to_str().unwrap(),
+            ]);
+            ok.then_some(out)
+        };
         // (clip, the matrix its proxy is tagged with — `*` for whatever the scaler's own range
         // conversion writes, anything but BT.709 — and whether that is a label we put there)
-        let clips = [
+        let mut clips = vec![
             (make("hd-untagged.mp4", "1280x720", unknown, "yuv420p", &x264), "bt709", true),
             (
                 make("uhd-untagged.mp4", "3840x2160", unknown, "yuv420p", &x264),
@@ -15189,10 +15272,21 @@ mod tests {
             (make("hd-rgb.mkv", "1280x720", unknown, "bgr0", &ffv1), "unknown", false),
             (make("hd-mjpeg.mkv", "1280x720", unknown, "yuvj420p", &mjpeg), "*", false),
         ];
+        match late {
+            Some(media) => clips.push((media, "bt709", true)),
+            None => skip("skipped the late-starting row: this ffmpeg cannot make the clip"),
+        }
         for (media, matrix, labelled) in &clips {
             let name = media.file_name().unwrap().to_string_lossy().into_owned();
             let traits = source_traits(media).expect("probe");
             assert_eq!(traits.label_bt709, *labelled, "{name}: the probe's verdict");
+            let late = name.contains("late");
+            assert_eq!(
+                needs_head_pad(traits.lead),
+                late,
+                "{name}: the probe saw a lead of {}",
+                traits.lead
+            );
 
             // The proxy the clip had before the label: where it was kept, and what it holds.
             let old = proxy_path_of(media, PROXY_MAX_WIDTH, traits, false).expect("a cache dir");
@@ -15206,7 +15300,7 @@ mod tests {
                     "libx264",
                     None,
                     None,
-                    None,
+                    needs_head_pad(traits.lead).then(fps_mode_flag),
                 );
                 run_ffmpeg(&args.iter().map(String::as_str).collect::<Vec<_>>());
                 plain
@@ -15221,6 +15315,11 @@ mod tests {
             let proxy = generate_proxy(media, PROXY_MAX_WIDTH).expect("proxy");
             let _cleanup = ProxyGuard(proxy.clone());
             assert_eq!(proxy != old, *labelled, "{name}: only a labelled proxy moves ({proxy:?})");
+            assert_eq!(
+                is_head_padded_proxy(&proxy.to_string_lossy()),
+                late,
+                "{name}: the padded name ({proxy:?})"
+            );
             let tag = ffprobe_field(&proxy, "v:0", "stream=color_space");
             if *matrix == "*" {
                 assert_ne!(tag, "bt709", "{name}: a full-range JPEG picture is not BT.709");
@@ -15244,9 +15343,22 @@ mod tests {
                 );
                 assert!(!old.exists(), "{name}: the proxy the new one replaces is still there");
                 assert!(!proxy_sidecar_path(&old).exists(), "{name}: its sidecar too");
-                assert_eq!(superseded_proxy_path(media, PROXY_MAX_WIDTH), Some(old));
+                assert_eq!(superseded_proxy_path_for(media, PROXY_MAX_WIDTH, traits), Some(old.clone()));
+                // A pair that survived (a file something held open when it was deleted) goes the next
+                // time the proxy is asked for, which finds the new one already in place.
+                std::fs::write(&old, b"an old proxy that outlived its replacement").unwrap();
+                std::fs::write(proxy_sidecar_path(&old), b"{}").unwrap();
+                assert_eq!(generate_proxy(media, PROXY_MAX_WIDTH).expect("proxy"), proxy);
+                assert!(
+                    !old.exists() && !proxy_sidecar_path(&old).exists(),
+                    "{name}: the survivor was not retried"
+                );
             } else {
-                assert_eq!(superseded_proxy_path(media, PROXY_MAX_WIDTH), None, "{name}: nothing moved");
+                assert_eq!(
+                    superseded_proxy_path_for(media, PROXY_MAX_WIDTH, traits),
+                    None,
+                    "{name}: nothing moved"
+                );
             }
         }
     }
