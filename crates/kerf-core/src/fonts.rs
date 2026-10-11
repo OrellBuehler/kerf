@@ -108,22 +108,24 @@ pub fn default_font_file(bold: bool) -> Option<PathBuf> {
         }));
     }
     static FILES: [Mutex<Option<OnDisk>>; 2] = [Mutex::new(None), Mutex::new(None)];
+    // The name carries a digest of the bytes: worked out once, not on every call.
+    static NAMES: [OnceLock<String>; 2] = [OnceLock::new(), OnceLock::new()];
     let (name, bytes) = if bold {
         ("Geist-Bold", BOLD)
     } else {
         ("Geist-Regular", REGULAR)
     };
-    let file = format!("{name}-{:08x}.ttf", digest(bytes));
-    ensure(&FILES[usize::from(bold)], font_dirs, &file, bytes)
+    let file = NAMES[usize::from(bold)].get_or_init(|| format!("{name}-{:08x}.ttf", digest(bytes)));
+    ensure(&FILES[usize::from(bold)], font_dirs, file, bytes)
 }
 
-/// Where the shipped fonts are written, in order of preference.
-fn font_dirs() -> Vec<PathBuf> {
+/// Where the shipped fonts are written, in order of preference. Lazy: the private temp directory
+/// is only made when the cache directory did not work.
+fn font_dirs() -> impl Iterator<Item = PathBuf> {
     dirs::cache_dir()
         .map(|d| d.join("kerf").join("fonts"))
         .into_iter()
-        .chain(private_dir(&std::env::temp_dir()))
-        .collect()
+        .chain(std::iter::once_with(|| private_dir(&std::env::temp_dir())).flatten())
 }
 
 /// A directory under `base` that only this user can write: `base` is `/tmp` on Linux, shared by
@@ -175,12 +177,17 @@ impl OnDisk {
 
 /// The path of `file` holding `bytes`: the one in `slot` while it is unchanged, else the first of
 /// `dirs()` that holds or can be made to hold it. A miss leaves `slot` empty.
-fn ensure(slot: &Mutex<Option<OnDisk>>, dirs: impl FnOnce() -> Vec<PathBuf>, file: &str, bytes: &[u8]) -> Option<PathBuf> {
+fn ensure<I: IntoIterator<Item = PathBuf>>(
+    slot: &Mutex<Option<OnDisk>>,
+    dirs: impl FnOnce() -> I,
+    file: &str,
+    bytes: &[u8],
+) -> Option<PathBuf> {
     let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(known) = slot.as_ref().filter(|k| k.unchanged()) {
         return Some(known.path.clone());
     }
-    *slot = dirs().iter().find_map(|dir| write_font(dir, file, bytes));
+    *slot = dirs().into_iter().find_map(|dir| write_font(&dir, file, bytes));
     slot.as_ref().map(|k| k.path.clone())
 }
 
@@ -324,6 +331,20 @@ mod tests {
         let good = dir.join("good");
         let path = ensure(&slot, || vec![blocked.clone(), good.clone()], "a.ttf", REGULAR);
         assert_eq!(path, Some(good.join("a.ttf")), "the first directory that works");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_later_directory_is_not_touched_when_the_first_works() {
+        let dir = scratch("lazy");
+        let slot = Mutex::new(None);
+        let first = dir.join("first");
+        let dirs = || {
+            std::iter::once(first.clone()).chain(std::iter::once_with(|| -> PathBuf {
+                panic!("the fallback directory was made though the first one worked")
+            }))
+        };
+        assert_eq!(ensure(&slot, dirs, "a.ttf", REGULAR), Some(first.join("a.ttf")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
