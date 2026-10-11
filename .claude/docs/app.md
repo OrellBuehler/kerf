@@ -204,7 +204,7 @@ stays the one-shot still on purpose: an agent asks for exactly that time and the
 (`Settings.gpu_preview`, default off, persisted beside `safe_areas`) draws the Preview
 panel's frame with `kerf-gpu`'s compositor in a native surface. Off, none of it runs and the
 webview sends no extra command: the JPEG path is what it was. On, `get_preview_frame
-{ time_secs, max_width, overlays }` plans the frame from a **snapshot of the plan's inputs**
+{ time_secs, max_width, overlays, client?, seq? }` plans the frame from a **snapshot of the plan's inputs**
 (`gpu_preview/snapshot.rs`: the working timeline, the assets as imported, the proxy-swapped ones the
 FFmpeg graph reads and every asset's proxy input, in an `Arc`), plans it (`Planner` over `ProxyMedia`, the
 measured colour policy, at the start of the output frame whose slot holds the time, `plan_at_grid`, as the JPEG route's

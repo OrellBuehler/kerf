@@ -3003,8 +3003,11 @@ export async function getTimelineFrame(timeSecs: number, maxWidth = 960): Promis
  * native surface when the GPU preview is on and draws it exactly, else FFmpeg's JPEG (the
  * same one {@link getTimelineFrame} returns), in the same call, with the reasons. `overlays`
  * says the page has something to draw over the picture (a title box, the trim monitor,
- * safe-area guides), which a surface above the page cannot show. In the browser harness
- * there is no backend: the answer is "FFmpeg, no frame", as `getTimelineFrame` is `null`.
+ * safe-area guides), which a surface above the page cannot show. `order` says which request
+ * of which pump this is (`PreviewOrder`): the calls are separate tasks over the IPC and can
+ * arrive reversed, and the backend answers `superseded` to one that arrives after a newer one
+ * of the same `client` instead of drawing it last. In the browser harness there is no backend:
+ * the answer is "FFmpeg, no frame", as `getTimelineFrame` is `null`, and `order` is unused.
  */
 export async function getPreviewFrame(
 	timeSecs: number,

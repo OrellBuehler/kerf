@@ -51,7 +51,9 @@ target in RGBA, BGRA and sRGB formats. **`Presenter::skip_vsync(on)`** switches 
 only on a change and not at all where the surface has neither `Immediate` nor `Mailbox`
 (`present_mode_for`, pure, tested over the mode lists); the contents of a reconfigured surface are
 not guaranteed, so the caller changes the mode just before the frame it presents. The app asks for
-it while frames of a drag follow each other (`app.md`).
+it while frames of a drag follow each other (`app.md`). The app's request mailbox drops a frame request that
+arrives after a newer one of the same pump, remembering **one** pump's newest number: two pumps alternating
+requests (two windows scrubbing at once) are ordered by arrival, as one without a number is.
 
 **Which adapter.** `GpuOptions::refuse_cpu` makes a device request that wgpu answers with a CPU
 rasteriser (lavapipe, WARP: wgpu ranks `Cpu` last but still returns it when it is the only adapter) a
