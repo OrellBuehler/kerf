@@ -432,8 +432,9 @@ the same shader blends on the RGB picture and `composite_yuv` refuses such a pla
 **sample for sample** on both FFmpegs (plain, boxed, odd offsets, edges, corners, wholly outside, opacity 0 to 0.99, hex / named /
 translucent colours, BT.709 and BT.2020, escapes, Cyrillic, missing glyphs); `the_text_pass_is_the_reference_blend_plane_by_plane`
 holds the shader to the reference on the compositor's own planes (0 differing samples, 9 frames, 4 overlays); the `text/` parity
-cases hold the whole picture to the still, each against the same picture without the text: no allowance, but the lower third's
-fade-in (+1), 12 px text (+2) and full-range pictures on 9.0 (+2), measured and commented at the case.
+cases hold the whole picture to the still, each against the same picture without the text: no allowance, but two glyph-edge
+pixels of the lower third at 0.1 s (+1, YUV -> RGB error near the gamut edge over saturated green), 12 px text (+2) and
+full-range pictures on 9.0 (+2, a known model difference: text drawn in full range, converted last), each with its reason at the case.
 
 *Refusals* (the plan, `Unsupported::Text*`). A **font under 12 px** (`MIN_TEXT_PX`): `drawtext` blends each glyph bitmap in turn
 and the mask is all of them, so a pixel two glyphs share is one blend here and two there. Ordinary text is exact (Latin kerned
