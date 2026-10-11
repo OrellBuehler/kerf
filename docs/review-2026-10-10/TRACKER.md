@@ -13,7 +13,7 @@
 | PERF-3 Playback | perf-3 (on ui-4, pushed) | | ready (PR after #130) | gpu-compositor WP-0(a)(c); gpu-media WP7; + playback stream width follows the preview request width (fixed PREVIEW_STREAM_WIDTH makes playing frames softer than paused, found in UI-4) | delivered 24.1/30.1/60.1 fps at 24/30/60 cuts (was 24 always); CPU 60 fps 0.68 core (1 layer). Overload (1 core, 60 fps, 3 layers, 1280 px): frozen 5.0 s → longest freeze 0.79 s via step-down. Webview decode in headless Chromium: canvas path slower (960 px 3.6→5.2 ms), bytes −25% |
 | GPU-1 Proxy colour normalisation | gpu-1 (pushed, no PR) | | blocked (needs a decision) | gpu-compositor WP-3 (partial: untagged HD labelled bt709; SD/601/2020/RGB not converted) | stacks refused on 9.0.2 (15 cases): 11 → 5; untagged HD colour vs source 28.0 dB → 43.3 dB on 9.0.2; nothing moves on 6.1.1 |
 | UI-5 Timeline gestures | ui-5 (on ui-4, pushed) | | ready (PR after #130) | timeline H3–H5, H12, H13, H15 + medium; + playhead past the end after the cut shrinks; clip arrow-key nudge (M18 rest); scrub rail hover chip + marker ticks (H6 rest) | wave 3 |
-| UI-7 Panels polish | ui-7 (on ui-8) | | in-progress | panels/shell medium + polish; shell H6 | wave 3 |
+| UI-7 Panels polish | ui-7 (on ui-8) | | review | panels/shell medium + polish; shell H6 | wave 3 |
 | UI-8 Export dialog logic | ui-8 (on ui-6, pushed) | | ready (PR after UI-6) | dialogs 3 | wave 3 |
 | PERF-4 Still cache and prefetch | | | todo | gpu-media WP6, WP9 | wave 3 |
 | GPU-2 Text on the GPU | gpu-2 (on gpu-3) | | in-progress | gpu-compositor | wave 3 |
@@ -34,6 +34,7 @@
 - UI-8: the shape-mismatch sentence ("…would be letterboxed. Tick 9:16…") shows only when a project cut for a shape exports a wider file; otherwise it's the neutral line (one function, `barsLine`). With nothing ticked, length limits still show for the platforms the frame is made for. `kerf_core::platform` stays authoritative: the app's `platform_check` returns the judged cut and takes a range, and the MCP tool is unchanged.
 - UI-5: video tracks are drawn highest on top (V2 over V1), display only; storage, export and MCP keep V1… order. A click on a clip or title never seeks; an empty-lane click clears a selection without seeking, or seeks when nothing is selected. `ui.seek` rounds to the nearest frame. `[` / `]` step through a staged proposal's changes (rebindable). Autoscroll uses a 48 px band, up to 1400 px/s sideways and 700 px/s vertically.
 - PERF-3: playback restarts are led by the least start-up seen for the cut, rung and pane (capped at 0.25 s), so the picture never leads the sound. A heal restart is disabled within 10 s of a previous lag restart, which stops restart loops. Stream starts are capped by the rendered end.
+- UI-7: a Chip is for toggles only and an action is a Btn; Btn sm is 28 px app-wide. Time reads three ways, each with one job: frame timecode in the transport, m:ss durations, m:ss.d positions in the panels. A selected asset is the Inspector's subject only when no clip or title is selected. The window title uses the `core:window:allow-set-title` capability, not a new command.
 - CI: wrote the small ffmpeg-download retry myself (#131) instead of starting a dev agent: it is CI plumbing, not feature code, and two PRs were blocked on it.
 - Commits are authored as the repo owner (the container's default git identity names the assistant, which the commit rules forbid).
 - The tracker and `after/` artifacts are force-added (docs/ is git-ignored) and pushed to `docs/review-2026-10-10` so they survive the container. That commit skips the hooks, since whitespace fixers would corrupt the prototype .patch files and typos flags hash fragments in them. Earlier note: the tracker and the `after/` screenshots live on the `docs/review-2026-10-10` branch, since work-package branches start from main, which does not carry this folder.
@@ -61,6 +62,8 @@
 - zizmor fails here only because its online audits get a 401 without a GitHub token; CI's `workflow audit (zizmor)` job covers it.
 
 ## Needs a real machine
+
+- UI-7: setTitle + capability in a Tauri build; native <input type=color> in all webviews; overflow:clip + sticky on older WKWebView; hover-only dock close X with real pointer/touch.
 
 - UI-5: autoscroll feel (trackpad, pointer capture) in all webviews; sticky snap-label chip in WebKit; smooth scrollTo + reduced motion; `[`/`]` on non-US layouts.
 
@@ -93,6 +96,8 @@
 - UI-3: dialog focus return, `inert` timing and the focus rescue checked in Chromium only; confirm in WebView2, WebKitGTK and WKWebView.
 
 ## Needs a decision
+
+- UI-7: bin double-click/Enter to add at the playhead, search, sort and a compact list (panels polish 4, M10); visible ◀ ▶ key-step buttons; rename the project on double-click; a shared .kmenu stylesheet; icon-size and spacing tokens; shell P9, P10, P19.
 
 - UI-5/UI-3: add a one-revision batch split engine op (+ Tauri/MCP/harness), which would give the razor Shift = cut all tracks and an `edit.split` key?
 - UI-5: make the video-track drawing order a user option?
