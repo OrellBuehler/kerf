@@ -101,7 +101,7 @@ pub struct GpuCaps {
     /// the colour and draws it like a static one.
     pub keyed_color: bool,
     /// A mask (`geq` rewriting the alpha plane): drawn as a per-sample alpha. Still refused on a
-    /// rotated layer, on one below full opacity (`MaskWith`) and on a letterboxed picture (`Matte`).
+    /// rotated layer and on one below full opacity (`MaskWith`).
     pub mask: bool,
     pub text: bool,
     pub reframe: bool,
@@ -169,7 +169,7 @@ pub enum Unsupported {
     Mask(LayerRef),
     /// A mask in a chain the compositor draws no mask in: the detail says which.
     MaskWith(LayerRef, &'static str),
-    /// An effect or a mask on a letterboxed picture: FFmpeg's `pad` hands the filter the whole
+    /// An effect on a letterboxed picture: FFmpeg's `pad` hands the filter the whole
     /// padded frame, black bars included, and the compositor draws the picture and the bars
     /// apart (the detail names what runs on the frame).
     Matte(LayerRef, &'static str),

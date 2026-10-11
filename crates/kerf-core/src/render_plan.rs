@@ -670,6 +670,26 @@ fn effect_refusal(effect: &VideoEffect, caps: &GpuCaps) -> Option<&'static str> 
     }
 }
 
+/// What an effect does to this kind of picture that the compositor, which works on the 4:2:0 limited-range
+/// planes the decode hands it, does not: FFmpeg runs the filter on the picture as it is in the graph, and the
+/// conversion to 4:2:0 comes after. An invert of a gray picture negates its luma and has no chroma to negate
+/// (the compositor's neutral chroma would go to 127); a full-range picture reaches the filter with its raw
+/// values and is converted to limited range afterwards (an invert is off by up to 8 levels, a sharpen's
+/// overshoot by 26: measured on both FFmpegs), and a picture whose format was never recorded may be either.
+/// Grayscale (chroma to 128, luma untouched) is the same on all of them, and so are the other formats the
+/// decode converts (10-bit, 4:2:2, 4:4:4, RGB), to the decode's own rounding.
+fn effect_on_picture_refusal(effect: &VideoEffect, stream: &PlanStream) -> Option<&'static str> {
+    match effect {
+        VideoEffect::Invert | VideoEffect::Blur { .. } | VideoEffect::Sharpen { .. } if stream.maybe_full_range() => {
+            Some("a blur, a sharpen or an invert on a full-range picture, or one whose pixel format was never recorded (FFmpeg runs it on the raw values and converts the range afterwards)")
+        }
+        VideoEffect::Invert if stream.layout() == Some(PixLayout::Gray) => {
+            Some("an invert on a gray picture (FFmpeg negates its luma only)")
+        }
+        _ => None,
+    }
+}
+
 impl RenderPlan {
     /// The plan for timeline time `t`: what `timeline_frame` / `export_still`
     /// would draw ([`PlanMode::Still`]). Like them it renders the cut as
@@ -706,11 +726,9 @@ impl RenderPlan {
             };
             // `pad` hands everything after it the whole padded frame, bars included. A pointwise
             // effect (a grade, grayscale, invert) is a table, and the bars go through it like the
-            // picture; a blur, a sharpen and a mask see the bars as picture.
+            // picture, and a mask is cut from the whole padded frame (the compositor's layer is that
+            // frame); a blur and a sharpen see the bars as picture, which it does not draw.
             if geom.matte {
-                if layer.mask.is_some() {
-                    reasons.push(Unsupported::Matte(self.layer_ref(n, layer), "a mask"));
-                }
                 if let Some(what) = layer.effects.iter().find_map(|e| match e {
                     VideoEffect::Blur { .. } => Some("a blur"),
                     VideoEffect::Sharpen { .. } => Some("a sharpen"),
@@ -836,7 +854,11 @@ impl RenderPlan {
                 };
                 out.push(Unsupported::GradedFullRange(at(), detail));
             }
-            if let Some(what) = layer.effects.iter().find_map(|e| effect_refusal(e, caps)) {
+            if let Some(what) = layer
+                .effects
+                .iter()
+                .find_map(|e| effect_refusal(e, caps).or_else(|| effect_on_picture_refusal(e, stream)))
+            {
                 out.push(Unsupported::Effects(at(), what));
             }
             if layer.mask.is_some() {
@@ -912,7 +934,7 @@ impl RenderPlan {
                     // at the fit size and zooms after them. A rotation and an opacity below 1 are
                     // the two it does not order that way: the rotated picture's alpha and the RGB
                     // round trip would both have to be scaled with the zoom.
-                    if let Some(what) = self.zoom_order_refusal(layer) {
+                    if let Some(what) = self.zoom_order_refusal(layer, &ops) {
                         out.push(Unsupported::ZoomBehind(at(), what));
                     }
                 } else if keyed {
@@ -984,14 +1006,23 @@ impl RenderPlan {
         }
     }
 
-    /// What is ahead of a moving zoom that a compositor with `keyed_zoom` still does not draw.
-    fn zoom_order_refusal(&self, layer: &PlanLayer) -> Option<&'static str> {
+    /// What is ahead of a moving zoom that a compositor with `keyed_zoom` still does not draw: a
+    /// rotation and an opacity below 1 (their alpha plane and RGB round trip would be scaled with
+    /// the zoom), and a dip to white (the zoom's `scale` takes the RGB frame `fade c=white` leaves
+    /// and converts it to 4:2:0 in the same pass, which neither FFmpeg 6.1 nor 9.0 does as a scale of
+    /// the converted picture: up to 14 levels off on 6.1, 3 on 9.0).
+    fn zoom_order_refusal(&self, layer: &PlanLayer, ops: &[FadeOp]) -> Option<&'static str> {
         let rotated =
             layer.transform.rotation != 0.0 || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.rotates));
         if rotated {
             Some("a rotation")
         } else if layer.transform.opacity < 1.0 {
             Some("an opacity below 1")
+        } else if ops
+            .iter()
+            .any(|o| o.tint == FadeTint::White && (self.mode == PlanMode::Motion || o.factor < FADE_FULL))
+        {
+            Some("a dip to white")
         } else {
             None
         }
@@ -2064,6 +2095,230 @@ mod tests {
         assert!(plan
             .reasons(&GpuCaps { dip_white: false, ..all }, plan.size(u32::MAX))
             .is_empty());
+    }
+
+    #[test]
+    fn what_the_compositor_cannot_do_with_a_mask_an_effect_or_a_moving_zoom_is_refused_with_its_own_reason() {
+        use crate::model::Keyframe;
+        let caps = GpuCaps {
+            mask: true,
+            keyed_zoom: true,
+            fades: true,
+            effects: EffectKinds::BLUR
+                .union(EffectKinds::SHARPEN)
+                .union(EffectKinds::GRAYSCALE)
+                .union(EffectKinds::INVERT),
+            ..GpuCaps::A0
+        };
+        let mask = Mask {
+            shape: MaskShape::Ellipse,
+            x: 0.5,
+            y: 0.5,
+            width: 0.5,
+            height: 0.5,
+            feather: 0.1,
+            inverted: false,
+        };
+        let reasons = |edit: &dyn Fn(&mut Clip)| {
+            let plan = fading_plan(|c| edit(c), 0.5);
+            plan.reasons(&caps, plan.size(u32::MAX))
+        };
+        // What it draws: a mask, the four effects, all of them at once, and a moving zoom in front of which they are.
+        let zoom = |c: &mut Clip| {
+            let key = |time: f64, scale: f64| Keyframe {
+                time,
+                scale,
+                pos_x: 0.0,
+                pos_y: 0.0,
+                rotation: 0.0,
+                opacity: 1.0,
+                easing: Default::default(),
+            };
+            c.keyframes = vec![key(0.0, 1.0), key(4.0, 1.5)];
+        };
+        assert!(reasons(&|c| c.mask = Some(mask)).is_empty());
+        assert!(reasons(&|c| c.effects = vec![
+            VideoEffect::Blur { sigma: 3.0 },
+            VideoEffect::Sharpen { amount: 1.0 },
+            VideoEffect::Grayscale,
+            VideoEffect::Invert,
+        ])
+        .is_empty());
+        assert!(reasons(&|c| {
+            zoom(c);
+            c.mask = Some(mask);
+            c.color.contrast = 1.2;
+            c.fade_in = 2.0;
+            c.effects = vec![VideoEffect::Blur { sigma: 3.0 }];
+        })
+        .is_empty());
+        // A vignette (its dither is a counter that runs on across frames) and a chroma key (a float colour
+        // distance): FFmpeg's, named.
+        for (e, what) in [
+            (VideoEffect::Vignette, "vignette"),
+            (
+                VideoEffect::ChromaKey {
+                    color: "green".into(),
+                    similarity: 0.1,
+                    blend: 0.1,
+                },
+                "chroma key",
+            ),
+        ] {
+            let why = reasons(&|c| c.effects = vec![VideoEffect::Blur { sigma: 3.0 }, e.clone()]);
+            assert!(
+                matches!(why.as_slice(), [Unsupported::Effects(_, w)] if w.contains(what)),
+                "{why:?}"
+            );
+        }
+        // A value the filter's own option refuses.
+        for e in [
+            VideoEffect::Blur { sigma: 2000.0 },
+            VideoEffect::Blur { sigma: f64::NAN },
+            VideoEffect::Sharpen { amount: 6.0 },
+            VideoEffect::Sharpen { amount: -3.0 },
+        ] {
+            let why = reasons(&|c| c.effects = vec![e.clone()]);
+            assert!(matches!(why.as_slice(), [Unsupported::Effects(..)]), "{e:?}: {why:?}");
+        }
+        // A mask on a rotated layer, and on one below full opacity.
+        let why = reasons(&|c| {
+            c.mask = Some(mask);
+            c.transform.rotation = 10.0;
+        });
+        assert!(
+            matches!(why.as_slice(), [Unsupported::MaskWith(_, w)] if w.contains("rotated")),
+            "{why:?}"
+        );
+        let why = reasons(&|c| {
+            c.mask = Some(mask);
+            c.transform.opacity = 0.5;
+        });
+        assert!(
+            matches!(why.as_slice(), [Unsupported::MaskWith(_, w)] if w.contains("opacity")),
+            "{why:?}"
+        );
+        // Without the ability: the mask is refused as a mask.
+        let masked = fading_plan(|c| c.mask = Some(mask), 0.5);
+        let why = masked.reasons(&GpuCaps { mask: false, ..caps }, masked.size(u32::MAX));
+        assert!(matches!(why.as_slice(), [Unsupported::Mask(_)]), "{why:?}");
+        // A moving zoom with a rotation or an opacity below 1 in front of it: refused whatever the caps.
+        let why = reasons(&|c| {
+            zoom(c);
+            c.keyframes.iter_mut().for_each(|k| k.rotation = 12.0);
+        });
+        assert!(
+            matches!(why.as_slice(), [Unsupported::ZoomBehind(_, w)] if w.contains("rotation")),
+            "{why:?}"
+        );
+        let why = reasons(&|c| {
+            zoom(c);
+            c.keyframes.iter_mut().for_each(|k| k.opacity = 0.7);
+        });
+        assert!(
+            matches!(why.as_slice(), [Unsupported::ZoomBehind(_, w)] if w.contains("opacity")),
+            "{why:?}"
+        );
+        // ... and a dip to white (the zoom's `scale` takes FFmpeg's RGB frame and converts it in the same pass).
+        let dip = fading_plan(
+            |c| {
+                zoom(c);
+                c.transition_in = Some(Transition {
+                    kind: TransitionKind::DipToWhite,
+                    duration: 2.0,
+                });
+            },
+            0.5,
+        );
+        let why = dip.reasons(
+            &GpuCaps {
+                transitions: true,
+                dip_white: true,
+                ..caps
+            },
+            dip.size(u32::MAX),
+        );
+        assert!(
+            matches!(why.as_slice(), [Unsupported::ZoomBehind(_, w)] if w.contains("dip to white")),
+            "{why:?}"
+        );
+        // On a letterbox (a 640x360 picture in a vertical frame) the padded frame is what a blur sees; a
+        // table is the same on the bars as on the picture, and a mask is cut from the whole padded frame.
+        let a = asset("a", 20.0, vec![video(640, 360)]);
+        let letterboxed = |edit: &dyn Fn(&mut Clip)| {
+            let mut clip = Clip::new(a.id, 0.0, 10.0, 0.0);
+            edit(&mut clip);
+            let mut tl = timeline(vec![vec![clip]]);
+            tl.format = Some(crate::model::Delivery::new(360, 640, Fit::Contain));
+            let planned = plan(&tl, std::slice::from_ref(&a), 0.5);
+            planned.reasons(&caps, planned.size(u32::MAX))
+        };
+        assert!(letterboxed(&|c| c.mask = Some(mask)).is_empty());
+        let why = letterboxed(&|c| c.effects = vec![VideoEffect::Blur { sigma: 3.0 }]);
+        assert!(
+            matches!(why.as_slice(), [Unsupported::Matte(_, w)] if w.contains("blur")),
+            "{why:?}"
+        );
+        assert!(letterboxed(&|c| c.effects = vec![VideoEffect::Invert, VideoEffect::Grayscale]).is_empty());
+    }
+
+    #[test]
+    fn an_effect_the_picture_changes_the_meaning_of_is_refused() {
+        let caps = GpuCaps {
+            effects: EffectKinds::BLUR
+                .union(EffectKinds::SHARPEN)
+                .union(EffectKinds::GRAYSCALE)
+                .union(EffectKinds::INVERT),
+            ..GpuCaps::A0
+        };
+        let reasons = |fmt: Option<&str>, effect: VideoEffect| {
+            let mut a = asset("a", 20.0, vec![video(640, 360)]);
+            a.streams[0].pix_fmt = fmt.map(Into::into);
+            let mut clip = Clip::new(a.id, 0.0, 10.0, 0.0);
+            clip.effects = vec![effect];
+            let planned = plan(&timeline(vec![vec![clip]]), std::slice::from_ref(&a), 0.5);
+            planned.reasons(&caps, planned.size(u32::MAX))
+        };
+        let effects = || {
+            [
+                VideoEffect::Blur { sigma: 3.0 },
+                VideoEffect::Sharpen { amount: 1.0 },
+                VideoEffect::Grayscale,
+                VideoEffect::Invert,
+            ]
+        };
+        // Limited-range 4:2:0 and the formats the decode converts to it: all drawn.
+        for fmt in ["yuv420p", "yuv420p10le", "yuv422p", "yuv444p", "bgr0", "rgb24"] {
+            for e in effects() {
+                let why = reasons(Some(fmt), e.clone());
+                assert!(why.is_empty(), "{fmt} {e:?}: {why:?}");
+            }
+        }
+        // Full range (a JPEG, an mjpeg, an H.264 file flagged `pc`) or never recorded: an invert, a blur and a
+        // sharpen are FFmpeg's; grayscale is the same on any range.
+        for fmt in [Some("yuvj420p"), Some("yuvj444p"), None] {
+            for e in effects() {
+                let why = reasons(fmt, e.clone());
+                match e {
+                    VideoEffect::Grayscale => assert!(why.is_empty(), "{fmt:?}: {why:?}"),
+                    _ => assert!(
+                        matches!(why.as_slice(), [Unsupported::Effects(_, w)] if w.contains("full-range")),
+                        "{fmt:?} {e:?}: {why:?}"
+                    ),
+                }
+            }
+        }
+        // Gray: no chroma for FFmpeg's negate to touch, so only an invert is refused.
+        for e in effects() {
+            let why = reasons(Some("gray"), e.clone());
+            match e {
+                VideoEffect::Invert => assert!(
+                    matches!(why.as_slice(), [Unsupported::Effects(_, w)] if w.contains("gray")),
+                    "{why:?}"
+                ),
+                _ => assert!(why.is_empty(), "{e:?}: {why:?}"),
+            }
+        }
     }
 
     #[test]
