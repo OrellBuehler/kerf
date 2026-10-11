@@ -43,7 +43,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
-use kerf_core::{EffectKinds, FadeEdge, FadeTint, GpuCaps, Mask, MaskShape, RenderPlan, VideoEffect, YuvMatrix, FADE_FULL};
+use kerf_core::{
+    EffectKinds, FadeEdge, FadeTint, GeqEdge, GpuCaps, Mask, MaskShape, RenderPlan, VideoEffect, YuvMatrix, FADE_FULL,
+};
 use wgpu::util::DeviceExt;
 
 use crate::effects::{self, Gaussian};
@@ -167,7 +169,7 @@ struct ComposeParams {
     rotate: u32,
     tail: u32,
     has_alpha: u32,
-    pad: u32,
+    edge: u32,
     fade_in: u32,
     fade_out: u32,
     black: u32,
@@ -287,6 +289,8 @@ pub struct Compositor {
     text: TextPass,
     ops: PlaneOps,
     masks: MaskCache,
+    /// What FFmpeg's `geq` does at a plane's last column and row, when the host knows it: else probed.
+    geq_edge: Option<GeqEdge>,
 }
 
 /// The passes over a layer's planes between the scaler and the blend (`planeops.wgsl`, `blur.wgsl`):
@@ -296,6 +300,7 @@ struct PlaneOps {
     lut: wgpu::RenderPipeline,
     fade: wgpu::RenderPipeline,
     unsharp: wgpu::RenderPipeline,
+    edge: wgpu::RenderPipeline,
     blur_layout: wgpu::BindGroupLayout,
     blur_h: wgpu::ComputePipeline,
     blur_v: wgpu::ComputePipeline,
@@ -389,6 +394,9 @@ struct LayerLook {
     steps: Vec<Step>,
     /// The mask's alpha, at the size of the picture the mask is cut from.
     mask: Option<Arc<MaskPlane>>,
+    /// `geq` copies the planes through `lum` / `cb` / `cr` and, on a build that reads its last
+    /// column and row one in, changes them: the planes' own last column and row are their neighbours'.
+    mask_edge: bool,
     /// A moving zoom comes last in FFmpeg's chain: everything above runs on the fit-size picture,
     /// and the second scale stage zooms the result.
     zoom_last: bool,
@@ -635,6 +643,19 @@ impl Compositor {
         caps
     };
 
+    /// Pin what FFmpeg's `geq` does at a plane's last column and row, instead of measuring the
+    /// ffmpeg this process runs ([`kerf_core::geq_edge`], probed on the first masked frame): for a
+    /// host that knows its ffmpeg, and for tests.
+    #[must_use]
+    pub fn with_geq_edge(mut self, edge: GeqEdge) -> Self {
+        self.geq_edge = Some(edge);
+        self
+    }
+
+    fn geq_edge(&self) -> GeqEdge {
+        self.geq_edge.unwrap_or_else(kerf_core::geq_edge)
+    }
+
     /// Build the pipelines on `gpu`. Fails with a [`GpuError`] — it never panics —
     /// when the device rejects the shader or a pipeline, or is already lost.
     pub fn new(gpu: Arc<Gpu>) -> Result<Self, GpuError> {
@@ -877,6 +898,7 @@ impl Compositor {
                 },
                 ops,
                 masks: MaskCache::default(),
+                geq_edge: None,
             })
         })
     }
@@ -926,6 +948,7 @@ impl Compositor {
         let lut = render("ops lut", &ops_module, &layout, "fs_lut");
         let fade = render("ops fade", &ops_module, &layout, "fs_fade");
         let unsharp = render("ops unsharp", &ops_module, &layout, "fs_unsharp");
+        let edge = render("ops edge", &ops_module, &layout, "fs_edge");
 
         let entry = |binding: u32, ty: wgpu::BindingType, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
             binding,
@@ -994,6 +1017,7 @@ impl Compositor {
             lut,
             fade,
             unsharp,
+            edge,
             blur_layout,
             blur_h,
             blur_v,
@@ -1366,6 +1390,27 @@ impl Compositor {
         out
     }
 
+    /// The three planes as `geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)'` hands them on where it reads
+    /// one in from a plane's last column and row (`kerf_core::GeqEdge::Penultimate`).
+    fn edge_planes(&self, enc: &mut wgpu::CommandEncoder, input: &[Plane; 3]) -> [Plane; 3] {
+        std::array::from_fn(|i| {
+            let plane = &input[i];
+            let out = self.out_plane("geq edge", plane);
+            let params = PlaneOpParams {
+                size: [plane.w as i32, plane.h as i32],
+                row: 0,
+                amount: 0,
+                kind: 0,
+                black: 0,
+                f_in: 0,
+                f_out: 0,
+            };
+            let bind = self.ops_bind(&params, &plane.view, &self.text.blank);
+            self.pass(enc, &self.ops.edge, &out.view, &bind, None, None);
+            out
+        })
+    }
+
     /// `unsharp` (5x5, luma only: the chroma amount is 0, which copies) on the luma plane.
     fn sharpen_planes(&self, enc: &mut wgpu::CommandEncoder, input: &[Plane; 3], amount: i32) -> [Plane; 3] {
         let out = self.out_plane("sharpen", &input[0]);
@@ -1559,19 +1604,42 @@ impl Compositor {
         if let Some(table) = pending {
             steps.push(Step::Table(Box::new(table)));
         }
+        // `geq` runs on the frame `pad` made of a letterboxed picture, bars included: the mask is the
+        // size of the whole layer there, the canvas.
         let mask = match &layer.mask {
             Some(mask) => {
-                if geom.rotation.is_some() || geom.matte {
-                    return Err(unsupported("a mask on a rotated or letterboxed layer".into()));
+                if geom.rotation.is_some() {
+                    return Err(unsupported("a mask on a rotated layer".into()));
                 }
-                Some(self.masks.get(mask, pw, ph))
+                let (mw, mh) = if geom.matte { geom.layer } else { (pw, ph) };
+                Some(self.masks.get(mask, mw, mh))
             }
             None => None,
+        };
+        let mask_edge = match (&mask, self.geq_edge()) {
+            (None, _) | (_, GeqEdge::Exact) => false,
+            (Some(_), GeqEdge::Penultimate) => {
+                // A frame one chroma sample wide or high has nothing to read one in from (`geq` reads
+                // outside the plane there).
+                let (mw, mh) = if geom.matte { geom.layer } else { (pw, ph) };
+                if mw.div_ceil(2) < 2 || mh.div_ceil(2) < 2 {
+                    return Err(unsupported(format!(
+                        "a mask on a {mw}x{mh} frame, on an FFmpeg whose geq reads a plane's last column and row one in"
+                    )));
+                }
+                true
+            }
+            (Some(_), GeqEdge::Unknown) => {
+                return Err(unsupported(
+                    "a mask, until FFmpeg's geq can be measured (it reads a plane's last column and row differently on some builds)".into(),
+                ));
+            }
         };
         Ok(LayerLook {
             leading,
             steps,
             mask,
+            mask_edge,
             zoom_last,
         })
     }
@@ -1875,6 +1943,11 @@ impl Compositor {
                     Step::Sharpen(amount) => self.sharpen_planes(&mut enc, &current, *amount),
                 };
             }
+            // (Where the zoom comes last the planes are shifted here, ahead of the zoom's scale; else
+            // the blend reads them one in from the layer's last column and row.)
+            if look.mask_edge && look.zoom_last {
+                current = self.edge_planes(&mut enc, &current);
+            }
             // The mask is the alpha plane (`geq` rewrites it); nothing else gives the layer one but the
             // dissolve's ramp, which acts on whatever plane there is.
             let mut alpha: Option<Plane> = look
@@ -1937,7 +2010,7 @@ impl Compositor {
                 rotate,
                 tail: 0,
                 has_alpha: u32::from(alpha.is_some()),
-                pad: 0,
+                edge: u32::from(look.mask_edge && !look.zoom_last),
                 fade_in: fades.fade_in,
                 fade_out: fades.fade_out,
                 black: fades.black,

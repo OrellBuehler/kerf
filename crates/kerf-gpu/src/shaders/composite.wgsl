@@ -93,7 +93,7 @@ struct ComposeParams {
     rotate: u32,
     tail: u32,          // 1: draw only the chroma of an odd layer's last half block
     has_alpha: u32,     // 1: the layer's alpha is a plane (a mask), bound as `atex`
-    pad1: u32,
+    edge: u32,          // 1: `geq` read the layer's last column and row one in (the mask's filter, on some builds)
     // `fade`'s integer factors (65535: not running), then the black level it takes for the layer's
     // pixel format and the layer's alpha before the ramp (0..255).
     fade_in: u32,
@@ -221,7 +221,15 @@ fn layer_pixel(frag: vec4<f32>) -> vec4<f32> {
     }
     // Chroma is shared by 2x2 luma pixels (the layer's origin is even, so the
     // grids line up); the final conversion replicates it, as swscale's does.
-    let lc = vec2<i32>(l.x / 2, l.y / 2);
+    var lc = vec2<i32>(l.x / 2, l.y / 2);
+    var ly = l;
+    if (cp.edge != 0u) {
+        // `geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)'` on a build that clamps its read to `w - 2` /
+        // `h - 2`: each plane's last column and row are their neighbours' (the planes are the layer's, the
+        // padded frame of a letterboxed picture included).
+        ly = min(l, cp.layer - vec2<i32>(2, 2));
+        lc = min(lc, cp.clayer - vec2<i32>(2, 2));
+    }
     let uv = layer_uv(lc);
     var u = i32(round(uv.x));
     var v = i32(round(uv.y));
@@ -230,7 +238,7 @@ fn layer_pixel(frag: vec4<f32>) -> vec4<f32> {
     // `overlay` blends whole chroma samples, so the chroma block an odd layer ends in reaches one pixel
     // past it — with the luma left to the layers below (the tail pass writes only U and V).
     if (cp.tail == 0u) {
-        let sy = layer_y(l);
+        let sy = layer_y(ly);
         y = i32(round(sy.x));
         cov = sy.y;
     }

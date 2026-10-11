@@ -23,6 +23,10 @@ pub struct ProbeResult {
 
 mod cli;
 
+// How `geq` (a mask's filter) reads the last column and row of a plane on this ffmpeg: measured, once.
+mod geq_edge;
+pub use geq_edge::{geq_edge, geq_penultimate_plane, GeqEdge};
+
 // What the decodes ask `ffprobe` per file, bounded and remembered: container, HDR, start, and
 // whether a seek lands on a keyframe.
 mod source_probe;

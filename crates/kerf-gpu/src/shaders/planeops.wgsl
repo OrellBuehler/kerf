@@ -4,6 +4,8 @@
 //   fs_fade     `fade` on a plane that is not blended yet: luma, chroma or the alpha ramp. A layer
 //               whose moving zoom comes last is faded at the size it is zoomed from
 //   fs_unsharp  `unsharp`, 5x5, luma: integer arithmetic (the binomial [1 4 6 4 1] blur, exactly summed)
+//   fs_edge     `geq`'s copy of a plane on a build that reads the last column and row one in: the sample
+//               at (min(x, w - 2), min(y, h - 2))
 //
 // FFmpeg's arithmetic, not a formula for it: see `src/effects.rs` for the references and
 // `kerf_core::fade_luma` for `fade`.
@@ -91,4 +93,11 @@ fn fs_unsharp(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // (`>> 16` of a negative number is an arithmetic shift, as the C filter's is.)
     let res = s + (((s - ((sum + 128) >> 8u)) * p.amount) >> 16u);
     return out_byte(clamp(res, 0, 255));
+}
+
+@fragment
+fn fs_edge(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let o = vec2<i32>(frag.xy);
+    let at = vec2<i32>(min(o.x, p.size.x - 2), min(o.y, p.size.y - 2));
+    return textureLoad(src, at, 0);
 }
