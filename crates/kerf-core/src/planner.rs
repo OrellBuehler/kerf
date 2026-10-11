@@ -333,6 +333,12 @@ impl Planner {
             })
             .collect();
 
+        let full_range_cut = clips.iter().any(|c| {
+            c.asset
+                .as_ref()
+                .and_then(|a| a.stream.as_ref())
+                .is_some_and(|s| s.maybe_full_range_in(req.color))
+        });
         Ok(Self {
             mode: req.mode,
             canvas: PlanCanvas {
@@ -346,6 +352,7 @@ impl Planner {
                 pick_fps,
                 pix_fmt: geom.pix_fmt,
                 gif: opts.container == Container::Gif,
+                full_range_cut,
             },
             rendered,
             clips,
@@ -479,15 +486,17 @@ impl Planner {
         windows
     }
 
-    /// The clips of `track` that could be on screen at `eval`, bottom to top within the track.
-    fn candidates(&self, track: &TrackIndex, eval: f64) -> Vec<usize> {
-        let upto = track.order.partition_point(|&c| self.clips[c].window.0 <= eval);
+    /// The clips of `track` that could be on screen between `lo` and `hi` (`hi` is the time the graph
+    /// is evaluated at, `lo` is also `hi` unless a still's tail window is judged earlier), bottom to top
+    /// within the track: their window starts at or before `hi` and ends at or after `lo`.
+    fn candidates_between(&self, track: &TrackIndex, lo: f64, hi: f64) -> Vec<usize> {
+        let upto = track.order.partition_point(|&c| self.clips[c].window.0 <= hi);
         let mut found = Vec::new();
         let mut i = upto;
-        // The prefix maximum bounds the scan: once no earlier window reaches `eval`, stop.
-        while i > 0 && track.max_end[i - 1] >= eval {
+        // The prefix maximum bounds the scan: once no earlier window reaches `lo`, stop.
+        while i > 0 && track.max_end[i - 1] >= lo {
             i -= 1;
-            if self.clips[track.order[i]].window.1 >= eval {
+            if self.clips[track.order[i]].window.1 >= lo {
                 found.push(track.order[i]);
             }
         }
@@ -499,19 +508,31 @@ impl Planner {
     /// expressions are evaluated at, `frame` the output frame fades are counted in.
     fn plan(&self, slot: f64, eval: f64, frame: i64) -> Result<RenderPlan> {
         let motion = self.mode == PlanMode::Motion;
+        // What the graph evaluates its expressions at for this output frame (a slide's travel is
+        // read at it in a still too: the overlay truncates it to whole pixels, and a `t` an ulp off
+        // the frame's own time can land two pixels away), and the instant a tail window is judged at:
+        // the frames whose slot *starts* inside it have the tail, a window that closes inside a frame
+        // is still open for that frame, and one that ends on a frame boundary is closed for the frame
+        // that starts there (a nanosecond late), as the source has no picture to show then.
+        let fps = self.canvas.fps;
+        let graph_time = ffmpeg_frame_time(frame.max(0) as u64, fps.num, fps.den);
+        let tail_at = fps.exact_time(frame.max(0) as u64) + 1e-9;
         let mut layers = Vec::new();
         let mut pictureless = Vec::new();
+        // A still's tail window is judged at the slot's start, which can be before `eval` (the `t`
+        // it was asked for, inside the frame): look from there.
+        let from = if motion { eval } else { eval.min(tail_at) };
         for track in &self.tracks {
-            for ci in self.candidates(track, eval) {
+            for ci in self.candidates_between(track, from, eval) {
                 let planned = &self.clips[ci];
                 let clip = &self.rendered.tracks[planned.track].clips[planned.index];
                 // The index only narrows to windows that could hold `eval`. The export asks
                 // the overlay's own `enable` (tail included, closed at the end); a still shows
-                // the clip's own span, half open.
+                // the clip's own span, half open, and its tail for the frames the tail window is open for.
                 let on = if motion {
                     ClipTiming::new(clip, &planned.fx).enabled(eval)
                 } else {
-                    eval < clip.timeline_end()
+                    eval < clip.timeline_end() || (planned.tail && tail_at < clip.timeline_end() + planned.fx.tail)
                 };
                 if !on {
                     continue;
@@ -570,8 +591,11 @@ impl Planner {
                     reframe,
                     fx: LayerFx {
                         fades: planned.fades.clone(),
-                        motion: planned.keys.as_ref().map_or((0.0, 0.0), |k| k.at(eval - clip.timeline_start)),
-                        tail: motion && planned.tail && eval >= clip.timeline_end(),
+                        motion: planned
+                            .keys
+                            .as_ref()
+                            .map_or((0.0, 0.0), |k| k.at(graph_time - clip.timeline_start)),
+                        tail: planned.tail && eval >= clip.timeline_end(),
                     },
                     animated: planned.animated,
                     timing: PlanTiming {
@@ -581,30 +605,6 @@ impl Planner {
                         reversed: clip.is_reversed(),
                     },
                 });
-            }
-        }
-        // A still has no layer for a clip playing on under a transition, and the export keeps
-        // drawing it — around an incoming clip that does not cover it, in front of black.
-        // Whether its tail window is open is read at the time the graph would evaluate it for
-        // this frame, and at `t` itself.
-        let mut tails = Vec::new();
-        if !motion {
-            let fps = self.canvas.fps;
-            let graph_time = ffmpeg_frame_time(frame.max(0) as u64, fps.num, fps.den);
-            let mut open: Vec<usize> = Vec::new();
-            for track in &self.tracks {
-                for at in [eval, graph_time] {
-                    for ci in self.candidates(track, at) {
-                        let clip = &self.rendered.tracks[self.clips[ci].track].clips[self.clips[ci].index];
-                        if self.clips[ci].fx.tail > 0.0 && at >= clip.timeline_end() && !open.contains(&ci) {
-                            open.push(ci);
-                            tails.push(LayerRef {
-                                index: layers.len(),
-                                name: self.clips[ci].asset.as_ref().map(|a| a.name.clone()).unwrap_or_default(),
-                            });
-                        }
-                    }
-                }
             }
         }
         let matrix = composite_matrix(&layers, self.canvas.policy).0;
@@ -642,7 +642,6 @@ impl Planner {
             layers,
             overlays,
             pictureless,
-            tails,
         })
     }
 }
@@ -735,7 +734,7 @@ mod tests {
     use super::*;
     use crate::clip_timing::FadeTint;
     use crate::engine::test_support::{make_clip, single, test_asset, timeline_of, video_stream, video_track};
-    use crate::model::{Delivery, Fit, Framing, Keyframe, Mask, Track, Transform, Transition, TransitionKind};
+    use crate::model::{Clip, Delivery, Fit, Framing, Keyframe, Mask, Track, Transform, Transition, TransitionKind};
     use crate::plan_caps::{EffectKinds, GpuCaps, Unsupported};
     use crate::render_plan::active_video_clips;
     use crate::render_plan::RenderPlan;
@@ -937,21 +936,22 @@ mod tests {
         // Before the cut there is only the outgoing clip, and not on its tail.
         let before = motion.at_frame(59).unwrap();
         assert_eq!((before.layers.len(), before.layers[0].fx.tail), (1, false));
-        // A still at the same time has no tail layer (the clip's own span ended) but
-        // the incoming clip's ramp, which is what makes A0 refuse it.
+        // A still at the same time holds the same two layers, the outgoing one on its tail and the
+        // incoming one on the ramp, as the FFmpeg still draws them; the frame it is in counts the ramp.
         let still = planner(&tl, &assets, PlanMode::Still, &ExportOptions::default())
             .at(2.5)
             .unwrap();
-        assert_eq!(still.layers.len(), 1);
+        assert_eq!(still.layers.len(), 2);
+        assert!(still.layers[0].fx.tail && !still.layers[1].fx.tail);
         assert_eq!(
-            still.layers[0].fx.strength(FadeTint::Alpha, still.frame, still.canvas.fps),
+            still.layers[1].fx.strength(FadeTint::Alpha, still.frame, still.canvas.fps),
             0.5
         );
-        assert!(!still.layers[0].fx.tail);
+        assert!((still.layers[0].source_time - 2.5).abs() < 1e-9);
     }
 
     #[test]
-    fn a_still_is_refused_while_a_tail_window_is_open_even_after_the_ramp_is_over() {
+    fn a_still_holds_a_tail_for_as_long_as_its_window_is_open_even_after_the_ramp_is_over() {
         // 24 fps: A on 0..2 s, B from 2.0 s on a 0.6 s dissolve, B at half size so that A, which the
         // export keeps drawing until 2.6 s, shows around it. The ramp counts 14 frames from frame 48
         // and is over at frame 62, where A's window (read at 2.5833) is still open.
@@ -972,32 +972,62 @@ mod tests {
         };
         assert!(why(47).0.is_empty());
         for k in 48..=61 {
-            assert!(has(&why(k).0, |u| matches!(u, Unsupported::Fade(..))), "frame {k}");
+            let (reasons, plan) = why(k);
+            assert!(has(&reasons, |u| matches!(u, Unsupported::Fade(..))), "frame {k}");
+            assert!(has(&reasons, |u| matches!(u, Unsupported::Tail(..))), "frame {k}");
+            assert_eq!(plan.layers.len(), 2, "frame {k}: the tail and the ramp");
         }
         // Frame 62: the ramp is over, the tail window is not; nothing but the tail says so.
         let (reasons, plan) = why(62);
-        assert!(
-            matches!(reasons.as_slice(), [Unsupported::StillTail(t)] if plan.tails == [t.clone()]),
-            "{reasons:?}"
-        );
-        // No cap opens it: a still plan has no layer for that clip.
+        assert!(matches!(reasons.as_slice(), [Unsupported::Tail(_)]), "{reasons:?}");
+        assert!(plan.layers[0].fx.tail && !plan.layers[1].fx.tail);
+        // A compositor that draws fades and transitions draws every one of them.
         let all = GpuCaps {
             motion: true,
             fades: true,
             transitions: true,
             ..GpuCaps::A0
         };
-        assert!(has(&plan.reasons(&all, plan.size(u32::MAX)), |u| matches!(
-            u,
-            Unsupported::StillTail(_)
-        )));
+        for k in 40..=70 {
+            let (_, plan) = why(k);
+            assert!(plan.reasons(&all, plan.size(u32::MAX)).is_empty(), "frame {k}");
+        }
         assert!(why(63).0.is_empty() && why(70).0.is_empty());
         // The export frame is the two layers, A on its tail and B all the way up.
         let motion = planner(&tl, &assets, PlanMode::Motion, &opts(24.0)).at_frame(62).unwrap();
         assert_eq!(motion.layers.len(), 2);
         assert!(motion.layers[0].fx.tail && !motion.layers[1].fx.tail);
         assert_eq!(motion.strength(&motion.layers[1], FadeTint::Alpha), 1.0);
-        assert!(motion.tails.is_empty());
+    }
+
+    #[test]
+    fn a_stills_tail_is_judged_at_the_start_of_its_frame_and_a_window_closing_inside_one_is_open_for_it() {
+        // 30 fps, a 0.61 s dissolve: the tail window closes at 2.61, inside frame 78 (2.6 to 2.6333).
+        // A time late in that frame is past the window, and the frame still draws the tail, as the
+        // FFmpeg still does (`still_fx`); frame 79 starts after the window and has none.
+        let a = asset();
+        let mut inc = make_clip(a.id, 10.0, 14.0, 2.0);
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.61,
+        });
+        let tl = single(vec![make_clip(a.id, 0.0, 2.0, 0.0), inc]);
+        let still = planner(&tl, std::slice::from_ref(&a), PlanMode::Still, &opts(30.0));
+        let layers = |t: f64| still.at(t).unwrap().layers.len();
+        assert_eq!((layers(2.6), layers(2.6167), layers(2.6299)), (2, 2, 2));
+        assert_eq!(layers(2.6334), 1);
+        // On the grid the window ends on a frame boundary, and that frame has no tail.
+        let grid = single(vec![make_clip(a.id, 0.0, 2.0, 0.0), {
+            let mut c = make_clip(a.id, 10.0, 14.0, 2.0);
+            c.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 0.5,
+            });
+            c
+        }]);
+        let still = planner(&grid, std::slice::from_ref(&a), PlanMode::Still, &opts(30.0));
+        let layers = |t: f64| still.at(t).unwrap().layers.len();
+        assert_eq!((layers(2.0 + 14.0 / 30.0), layers(2.5), layers(2.5 + 0.5 / 30.0)), (2, 1, 1));
     }
 
     #[test]
@@ -1014,7 +1044,7 @@ mod tests {
         let still = planner(&tl, std::slice::from_ref(&a), PlanMode::Still, &opts(24.0));
         let refused = |k: u64| {
             let plan = still.at(k as f64 / 24.0).unwrap();
-            assert!(plan.tails.is_empty());
+            assert!(plan.layers.iter().all(|l| !l.fx.tail), "a dip has no tail");
             !plan.reasons(&GpuCaps::A0, plan.size(u32::MAX)).is_empty()
         };
         // Out: frames 36 (full) to 48; in: 48 to 60 (full). Both ends are plain.
@@ -1047,6 +1077,261 @@ mod tests {
                 },
             );
             assert!(matches!(refused, Err(Error::InvalidArgument(_))), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn an_export_frame_with_a_dip_to_white_or_a_full_range_clip_is_refused_where_it_is_not_drawn_exactly() {
+        let caps = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            ..GpuCaps::A0
+        };
+        let frame = |pix_fmt: &str, size: (u32, u32), fit: Fit, dip: TransitionKind, policy: CompositeColorPolicy| {
+            let mut a = asset();
+            a.streams[0].pix_fmt = Some(pix_fmt.into());
+            a.streams[0].width = Some(size.0);
+            a.streams[0].height = Some(size.1);
+            let out = make_clip(a.id, 0.0, 4.0, 0.0);
+            let mut inc = make_clip(a.id, 4.0, 8.0, 4.0);
+            inc.transition_in = Some(Transition {
+                kind: dip,
+                duration: 1.0,
+            });
+            let mut tl = single(vec![out, inc]);
+            tl.format = Some(Delivery::new(640, 360, fit));
+            let plan = Planner::new(
+                &tl,
+                std::slice::from_ref(&a),
+                &opts(30.0),
+                PlanRequest {
+                    mode: PlanMode::Motion,
+                    ..PlanRequest::still(policy)
+                },
+            )
+            .unwrap()
+            .at_frame(30)
+            .unwrap();
+            plan.reasons(&caps, (640, 360))
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        let (white, black) = (TransitionKind::DipToWhite, TransitionKind::DipToBlack);
+        let (plain, bt) = (CompositeColorPolicy::FixedBt601, CompositeColorPolicy::BottomLayerTag);
+        // Before the dip's fade starts (frame 30 of a clip that dips from 4 s) the export's chain
+        // still holds the round trip, so the letterbox is refused there too.
+        assert!(frame("yuv420p", (640, 360), Fit::Contain, white, plain).is_empty());
+        let why = frame("yuv420p", (1920, 1080), Fit::Contain, white, plain);
+        assert!(why.iter().any(|w| w.contains("scaler resizes")), "{why:?}");
+        assert!(frame("yuv420p", (1920, 1080), Fit::Contain, black, plain).is_empty());
+        let why = frame("yuv420p", (360, 640), Fit::Contain, white, plain);
+        assert!(why.iter().any(|w| w.contains("letterboxed")), "{why:?}");
+        assert!(frame("yuv420p", (360, 640), Fit::Contain, black, plain).is_empty());
+        let why = frame("yuv420p", (360, 640), Fit::Cover, white, plain);
+        assert!(
+            why.iter().any(|w| w.contains("scaler resizes")) && !why.iter().any(|w| w.contains("letterboxed")),
+            "{why:?}"
+        );
+        let why = frame("rgb24", (640, 360), Fit::Contain, white, plain);
+        assert!(why.iter().any(|w| w.contains("not 8-bit limited-range")), "{why:?}");
+        assert!(frame("rgb24", (640, 360), Fit::Contain, black, plain).is_empty());
+        // A full-range clip is the raw values FFmpeg 9 exports; FFmpeg 6 converts at the decode.
+        assert!(frame("yuvj420p", (640, 360), Fit::Contain, black, plain).is_empty());
+        let why = frame("yuvj420p", (640, 360), Fit::Contain, black, bt);
+        assert!(why.iter().any(|w| w.contains("cut holds a full-range picture")), "{why:?}");
+        assert!(frame("yuv420p", (1920, 1080), Fit::Contain, black, bt).is_empty());
+        // A full-range clip the scaler resizes is refused in an export frame under FFmpeg 6 too.
+        let why = frame("yuvj420p", (1920, 1080), Fit::Contain, black, plain);
+        assert!(
+            why.iter().any(|w| w.contains("scaler resizes") && w.contains("full-range")),
+            "{why:?}"
+        );
+    }
+
+    #[test]
+    fn a_full_range_clip_anywhere_in_the_cut_refuses_every_export_frame_where_ffmpeg_9_flags_the_export_full_range() {
+        let caps = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            ..GpuCaps::A0
+        };
+        let limited = asset();
+        let mut full = asset();
+        full.streams[0].pix_fmt = Some("yuvj420p".into());
+        let assets = [limited.clone(), full.clone()];
+        let cut = |clips: Vec<Vec<Clip>>, policy: CompositeColorPolicy, k: u64| {
+            let mut tl = single(Vec::new());
+            tl.tracks = clips
+                .into_iter()
+                .map(|c| {
+                    let mut t = Track::new(crate::model::StreamKind::Video, "V");
+                    t.clips = c;
+                    t
+                })
+                .collect();
+            let plan = Planner::new(
+                &tl,
+                &assets,
+                &opts(30.0),
+                PlanRequest {
+                    mode: PlanMode::Motion,
+                    ..PlanRequest::still(policy)
+                },
+            )
+            .unwrap()
+            .at_frame(k)
+            .unwrap();
+            (plan.layers.len(), plan.reasons(&caps, plan.size(u32::MAX)))
+        };
+        let (plain, bt) = (CompositeColorPolicy::FixedBt601, CompositeColorPolicy::BottomLayerTag);
+        let first = 30;
+        let cases: [(&str, Vec<Vec<Clip>>, u64); 5] = [
+            (
+                "black, then the full-range clip: a frame of the black clip",
+                vec![vec![make_clip(limited.id, 0.0, 4.0, 0.0), make_clip(full.id, 0.0, 4.0, 4.0)]],
+                first,
+            ),
+            (
+                "the full-range clip, then limited range: a frame of the limited clip",
+                vec![vec![make_clip(full.id, 0.0, 4.0, 0.0), make_clip(limited.id, 0.0, 4.0, 4.0)]],
+                30 * 6,
+            ),
+            (
+                "a full-range clip on another track, later: a frame before it",
+                vec![
+                    vec![make_clip(limited.id, 0.0, 8.0, 0.0)],
+                    vec![make_clip(full.id, 0.0, 2.0, 5.0)],
+                ],
+                first,
+            ),
+            (
+                "a gap before the full-range clip",
+                vec![vec![make_clip(full.id, 0.0, 2.0, 5.0)]],
+                first,
+            ),
+            (
+                "the full-range clip alone",
+                vec![vec![make_clip(full.id, 0.0, 2.0, 0.0)]],
+                first,
+            ),
+        ];
+        for (name, clips, k) in cases {
+            let (_, why) = cut(clips.clone(), bt, k);
+            assert!(why.contains(&Unsupported::FullRangeCut), "{name}: {why:?}");
+            assert!(
+                !why.iter().any(|w| matches!(w, Unsupported::FullRangeNegotiated(_))),
+                "{name}: a layer's own reason is a still's: {why:?}"
+            );
+            // FFmpeg 6 converts the range at the decode, as the compositor does.
+            let (_, why) = cut(clips, plain, k);
+            assert!(!why.contains(&Unsupported::FullRangeCut), "{name}: {why:?}");
+        }
+        // A cut of limited-range clips only is not the cut's business.
+        let (_, why) = cut(vec![vec![make_clip(limited.id, 0.0, 4.0, 0.0)]], bt, first);
+        assert!(!why.contains(&Unsupported::FullRangeCut), "{why:?}");
+    }
+
+    #[test]
+    fn only_a_full_range_clip_the_export_would_hold_sets_the_cut_flag() {
+        use crate::model::StreamKind;
+        let limited = asset();
+        let mut full = asset();
+        full.streams[0].pix_fmt = Some("yuvj420p".into());
+        let assets = [limited.clone(), full.clone()];
+        let bt = CompositeColorPolicy::BottomLayerTag;
+        let holds = |tracks: Vec<Track>, policy: CompositeColorPolicy| {
+            let mut tl = single(Vec::new());
+            tl.tracks = tracks;
+            Planner::new(&tl, &assets, &opts(30.0), PlanRequest::motion(policy))
+                .unwrap()
+                .canvas()
+                .full_range_cut
+        };
+        let track = |kind: StreamKind, clips: Vec<Clip>, edit: &dyn Fn(&mut Track)| {
+            let mut t = Track::new(kind, "T");
+            t.clips = clips;
+            edit(&mut t);
+            t
+        };
+        let base = || track(StreamKind::Video, vec![make_clip(limited.id, 0.0, 4.0, 0.0)], &|_| {});
+        let none = |_: &mut Track| {};
+        // The control: the full-range clip on a video track that renders.
+        let on_top = || track(StreamKind::Video, vec![make_clip(full.id, 0.0, 2.0, 1.0)], &none);
+        assert!(holds(vec![base(), on_top()], bt));
+        // (A fact about the cut under any policy: FFmpeg 6, which converts the range at the decode, is
+        // let off by the refusal's own policy check, not by the flag.)
+        assert!(holds(vec![base(), on_top()], CompositeColorPolicy::FixedBt601));
+        // A muted track is not in the graph.
+        let muted = track(StreamKind::Video, vec![make_clip(full.id, 0.0, 2.0, 1.0)], &|t| {
+            t.muted = true;
+        });
+        assert!(!holds(vec![base(), muted], bt), "muted");
+        // Nor is a disabled clip.
+        let mut off = make_clip(full.id, 0.0, 2.0, 1.0);
+        off.enabled = false;
+        assert!(
+            !holds(vec![base(), track(StreamKind::Video, vec![off], &none)], bt),
+            "disabled"
+        );
+        // Nor a track a soloed one shadows.
+        let solo = track(StreamKind::Video, vec![make_clip(limited.id, 0.0, 4.0, 0.0)], &|t| {
+            t.solo = true;
+        });
+        assert!(
+            !holds(
+                vec![solo, track(StreamKind::Video, vec![make_clip(full.id, 0.0, 2.0, 1.0)], &none)],
+                bt
+            ),
+            "solo-shadowed"
+        );
+        // The soloed track itself is in it.
+        let soloed_full = track(StreamKind::Video, vec![make_clip(full.id, 0.0, 2.0, 1.0)], &|t| t.solo = true);
+        assert!(holds(vec![base(), soloed_full], bt), "soloed");
+        // An audio track's use of the asset (its sound) is not a picture.
+        let audio = track(StreamKind::Audio, vec![make_clip(full.id, 0.0, 2.0, 1.0)], &none);
+        assert!(!holds(vec![base(), audio], bt), "audio-only use");
+    }
+
+    #[test]
+    fn a_deeper_than_8_bit_picture_may_be_full_range_only_where_ffmpeg_9_handles_it_raw() {
+        let mut limited = asset();
+        limited.streams[0].pix_fmt = Some("yuv420p".into());
+        let mut deep = asset();
+        deep.streams[0].pix_fmt = Some("yuv420p10le".into());
+        let assets = [limited.clone(), deep.clone()];
+        let holds = |policy: CompositeColorPolicy| {
+            let mut tl = single(Vec::new());
+            let mut t = Track::new(crate::model::StreamKind::Video, "V");
+            t.clips = vec![make_clip(limited.id, 0.0, 4.0, 0.0), make_clip(deep.id, 0.0, 2.0, 4.0)];
+            tl.tracks = vec![t];
+            Planner::new(&tl, &assets, &opts(30.0), PlanRequest::motion(policy))
+                .unwrap()
+                .canvas()
+                .full_range_cut
+        };
+        // The file's range tag is not recorded, so a 10-bit picture is not known to be limited.
+        assert!(holds(CompositeColorPolicy::BottomLayerTag));
+        assert!(holds(CompositeColorPolicy::Unknown));
+        assert!(!holds(CompositeColorPolicy::FixedBt601), "FFmpeg 6 draws 10-bit to the level");
+        for (fmt, high) in [
+            ("yuv420p10le", true),
+            ("yuv420p12le", true),
+            ("yuv444p10le", true),
+            ("yuv422p16le", true),
+            ("p010le", true),
+            ("gray10le", true),
+            ("yuv420p", false),
+            ("gray", false),
+            ("rgb24", false),
+            ("gbrp10le", false),
+            ("yuvj420p", false),
+        ] {
+            assert_eq!(crate::model::pix_fmt_is_high_bit(fmt), high, "{fmt}");
         }
     }
 
@@ -1154,14 +1439,14 @@ mod tests {
             assert!(!has(&now, gone), "{now:?}");
             assert_eq!(now.len(), why.len() - 1, "{now:?}");
         }
-        // Fades are the export's: a *still* plan holds none (the FFmpeg still draws them), so one
-        // inside a fade is refused whatever the caps say, and a Motion plan (frame 15 of 30 fps is 0.5 s) by `caps.fades`.
+        // Fades are `caps.fades`' in a still plan (it holds the fades the FFmpeg still draws) and in a
+        // Motion one (frame 15 of 30 fps is 0.5 s) alike.
         let fading = GpuCaps {
             fades: true,
             transitions: true,
             ..GpuCaps::A0
         };
-        assert!(has(&plan.reasons(&fading, size), |u| matches!(u, Unsupported::Fade(..))));
+        assert!(!has(&plan.reasons(&fading, size), |u| matches!(u, Unsupported::Fade(..))));
         let export = planner(&tl, std::slice::from_ref(&a), PlanMode::Motion, &opts(30.0))
             .at_frame(15)
             .unwrap();
@@ -1176,6 +1461,7 @@ mod tests {
             motion: true,
             fades: true,
             transitions: true,
+            dip_white: true,
             keyed_opacity: true,
             keyed_zoom: true,
             keyed_color: true,
@@ -1185,11 +1471,8 @@ mod tests {
             hdr: true,
             effects: EffectKinds::ALL,
         };
-        // (The overlay names the shipped default font, which a text pass can draw, and a still
-        // plan is still inside the fade.)
-        let left = plan.reasons(&all, size);
-        assert_eq!(left.len(), 1, "{left:?}");
-        assert!(has(&left, |u| matches!(u, Unsupported::Fade(..))));
+        // (The overlay names the shipped default font, which a text pass can draw.)
+        assert_eq!(plan.reasons(&all, size), vec![]);
         assert_eq!(export.reasons(&all, size), vec![]);
         // Without a file to name — the default could not be written — no text pass has anything to draw.
         let mut unnamed = export;
@@ -1768,7 +2051,27 @@ mod tests {
         // 29.970029 is 92997/3103 on the canvas and 29970029/1000000 on a clip: two frame grids.
         assert!(refused(29.970029, PlanMode::Motion));
         assert!(!refused(29.97, PlanMode::Motion) && !refused(30.0, PlanMode::Motion));
+        // A still counts its fades on the canvas's rate and the still's `fade` runs on the clip's:
+        // different frame grids refuse a still too, while one is running and not otherwise.
         assert!(!refused(29.970029, PlanMode::Still));
+        let mut fading = make_clip(a.id, 0.0, 4.0, 0.0);
+        fading.fade_in = 2.0;
+        let tl = single(vec![fading]);
+        let still_refused = |fps: f64, frame: u64| {
+            let plan = planner(&tl, std::slice::from_ref(&a), PlanMode::Still, &opts(fps))
+                .at_frame(frame)
+                .unwrap();
+            let caps = GpuCaps {
+                fades: true,
+                ..GpuCaps::A0
+            };
+            plan.reasons(&caps, plan.size(u32::MAX))
+                .iter()
+                .any(|r| matches!(r, Unsupported::PickRate { .. }))
+        };
+        assert!(still_refused(29.970029, 5), "inside the fade");
+        assert!(!still_refused(29.970029, 90), "after it");
+        assert!(!still_refused(29.97, 5) && !still_refused(30.0, 5));
     }
 
     /// A 30 fps export of a cut with a fade-in over the first second and a dissolve into a second

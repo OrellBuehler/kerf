@@ -164,6 +164,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use kerf_core::{
     export_still, Asset, Clip, Color, CompositeColorPolicy, Container, Delivery, ExportOptions, Fit, ImageFormat, Keyframe,
     Project, RateControl, RenderPlan, StreamKind, Subsampling, Timeline, Track, Transform, Transition, TransitionKind,
+    Unsupported,
 };
 use kerf_gpu::geometry::LayerGeometry;
 use kerf_gpu::{Compositor, Gpu, GpuOptions};
@@ -375,6 +376,8 @@ struct Media {
     /// differs: 10-bit, 4:4:4, full-range JPEG, odd-sized, and a phone-style
     /// rotated one (a landscape frame plus a display matrix).
     tenbit: Asset,
+    /// The same 10-bit picture tagged full range: it probes as `yuv420p10le` too.
+    tenbit_pc: Asset,
     yuv444: Asset,
     fullrange: Asset,
     /// A JPEG still: full-range YUV in a file FFmpeg reads as an image.
@@ -502,6 +505,24 @@ fn media() -> &'static Media {
             "yuv420p10le",
             tenbit.to_str().unwrap(),
         ]);
+        let tenbit_pc = dir.join("tenbit_pc.mp4");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x360:rate=30:duration=2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-qp",
+            "0",
+            "-color_range",
+            "pc",
+            "-pix_fmt",
+            "yuv420p10le",
+            tenbit_pc.to_str().unwrap(),
+        ]);
         let yuv444 = ffv1("yuv444.mkv", "testsrc2=size=640x360:rate=30:duration=2", "yuv444p", &["ffv1"]);
         let fullrange = ffv1(
             "fullrange.mkv",
@@ -621,6 +642,7 @@ fn media() -> &'static Media {
             grey: probed(&grey),
             black: probed(&black),
             tenbit: probed(&tenbit),
+            tenbit_pc: probed(&tenbit_pc),
             yuv444: probed(&yuv444),
             fullrange: probed(&fullrange),
             jpeg: probed(&jpeg),
@@ -1955,12 +1977,16 @@ enum Refusal {
 /// FFmpeg still renders the frame (that is the fallback), and the GPU path says
 /// no — by the plan or by the decode — instead of drawing it wrong.
 fn check_refused(case: &str, tl: &Timeline, assets: &[Asset], t: f64, expect: Refusal) {
-    let opts = ExportOptions::default();
-    let plan = RenderPlan::at(tl, assets, &opts, t, policy()).expect("plan");
+    check_refused_with(case, tl, assets, t, expect, &ExportOptions::default());
+}
+
+/// [`check_refused`] for a render with options.
+fn check_refused_with(case: &str, tl: &Timeline, assets: &[Asset], t: f64, expect: Refusal, opts: &ExportOptions) {
+    let plan = RenderPlan::at(tl, assets, opts, t, policy()).expect("plan");
     let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-ref");
     std::fs::create_dir_all(&scratch).unwrap();
     let png = scratch.join(format!("refused-{}.png", case.replace('/', "_")));
-    export_still(tl, assets, &opts, t, &png, ImageFormat::Png, 0).expect("the FFmpeg fallback renders it");
+    export_still(tl, assets, opts, t, &png, ImageFormat::Png, 0).expect("the FFmpeg fallback renders it");
     let _ = std::fs::remove_file(&png);
     match expect {
         Refusal::Plan(reason) => {
@@ -2100,6 +2126,415 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
         1.25,
         Refusal::Plan("moving zoom"),
     );
+    // A black or white fade on a layer below full opacity: `colorchannelmixer` leaves the picture in
+    // RGBA and `fade` runs on that, alpha plane included, ahead of the conversion back to `yuva420p`
+    // (the first measurement of the Motion harness: Y 153 levels off). The frames the fade is
+    // running on are FFmpeg's; the dissolve's ramp, which touches the alpha alone, is drawn
+    // (`motion_parity.rs`).
+    let mut glass = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    glass.transform.opacity = 0.6;
+    glass.fade_in = 1.0;
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![glass]], None);
+    check_refused(
+        "refused/fade-on-a-translucent-layer",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        0.3,
+        Refusal::Plan("below full opacity"),
+    );
+    // A dip to white is drawn through the RGB round trip on a plain chain; on an alpha plane FFmpeg
+    // converts through another RGB format, and a black fade of the same clip ahead of it is a filter
+    // of its own in the YUV.
+    let white_in = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.transition_in = Some(Transition {
+            kind: TransitionKind::DipToWhite,
+            duration: 1.0,
+        });
+        edit(&mut c);
+        timeline(vec![vec![c]], None)
+    };
+    check_refused(
+        "refused/dip-to-white-on-a-rotated-layer",
+        &white_in(&|c| c.transform.rotation = 10.0),
+        std::slice::from_ref(&m.testsrc),
+        0.2,
+        Refusal::Plan("alpha plane"),
+    );
+    check_refused(
+        "refused/dip-to-white-with-a-black-fade",
+        &white_in(&|c| c.fade_in = 0.8),
+        std::slice::from_ref(&m.testsrc),
+        0.2,
+        Refusal::Plan("black fade"),
+    );
+}
+
+/// The full-range (`yuvj`) picture under a fade, a dip or a dissolve: FFmpeg 6 converts the range at the
+/// decode, as the compositor does, and the case is drawn strictly; FFmpeg 9 fades the raw full-range
+/// values (black 16) and converts the range afterwards (measured 17 levels in Y and 16 in UV off), so the
+/// plan refuses it. Under either, a picture the scaler *resizes* is refused while a fade runs on it
+/// (`resized`): swscale converts the range inside the resize (flat error 14 on a 1.5x enlargement
+/// on FFmpeg 6). `negotiated` says whether FFmpeg 9 refuses the picture under a running fade at all (a `yuvj` or a
+/// deeper-than-8-bit one: its range is not told by its name). The frames the plan does not refuse (the case lists
+/// some on purpose) are drawn.
+fn check_full_range(
+    case: &str,
+    tl: &Timeline,
+    assets: &[Asset],
+    times: &[f64],
+    opts: &ExportOptions,
+    resized: bool,
+    negotiated: bool,
+) {
+    let mut refused = 0;
+    for &t in times {
+        let plan = RenderPlan::at(tl, assets, opts, t, policy()).expect("plan");
+        if reasons(&plan, plan.size(u32::MAX)).is_empty() {
+            check_with(case, tl, assets, &[t], STRICT, opts);
+        } else {
+            // Which reason, by variant: FFmpeg 6 only refuses what the scaler resizes, FFmpeg 9 any picture
+            // under a running fade (the two messages share their words).
+            let why = plan.reasons(&compositor().caps(), plan.size(u32::MAX));
+            let want = |u: &Unsupported| match policy() {
+                CompositeColorPolicy::FixedBt601 => matches!(u, Unsupported::FullRangeResized(..)),
+                _ => matches!(u, Unsupported::FullRangeNegotiated(_)),
+            };
+            assert!(
+                why.iter().any(want),
+                "{case} @ {t}: not refused for the expected reason: {why:?}"
+            );
+            check_refused_with(
+                &format!("{case} (refused)"),
+                tl,
+                assets,
+                t,
+                Refusal::Plan("full-range picture"),
+                opts,
+            );
+            refused += 1;
+        }
+    }
+    let wanted = resized || (negotiated && policy() != CompositeColorPolicy::FixedBt601);
+    assert_eq!(refused > 0, wanted, "{case}: {refused} of {} frames refused", times.len());
+}
+
+/// A dip to white goes through `yuv420p -> rgb24 -> yuv420p`, and the compositor draws that for the
+/// pictures it was measured on (8-bit limited-range 4:2:0, untagged or BT.709): 2 levels of the
+/// planes (3 on BT.709), well inside the strict bounds. The pictures it is not drawn for were all
+/// measured off by more than the bound — RGB 11 / 12, 10-bit 9 / 16, 4:4:4 16 / 17, 4:2:2 9 / 13 — and so
+/// was a letterbox (FFmpeg pads before the round trip, so its bars go white too: Y 126 against 16 at
+/// half way), a picture with an odd side (the round trip reads past it) and a layer the scaler
+/// resizes (the `scale` filter converts to RGB itself). The dip to black on the same pictures is
+/// exact, and is drawn.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_dip_to_white_is_drawn_where_its_round_trip_was_measured_and_refused_elsewhere() {
+    let m = media();
+    let opts = ExportOptions {
+        fps: Some(30.0),
+        ..ExportOptions::default()
+    };
+    let dip = |a: &Asset, kind: TransitionKind, edit: &dyn Fn(&mut Clip), format: Option<Delivery>| {
+        let mut c = clip(a, 0.0, 1.5, 0.0);
+        c.transition_in = Some(Transition { kind, duration: 1.0 });
+        edit(&mut c);
+        timeline(vec![vec![c]], format)
+    };
+    let (white, black) = (TransitionKind::DipToWhite, TransitionKind::DipToBlack);
+    let times = [0.05, 0.2, 0.4];
+    let none = |_: &mut Clip| {};
+    // Drawn: the BT.709 picture.
+    let one = |a: &Asset| std::slice::from_ref(a).to_vec();
+    check_with(
+        "dip-white/bt709-tagged",
+        &dip(&m.testsrc709, white, &none, None),
+        &one(&m.testsrc709),
+        &times,
+        STRICT,
+        &opts,
+    );
+    // A smaller layer that is not resized (a crop) is drawn, its edge included; one the scaler resizes
+    // is refused: the `scale` filter converts to RGB itself (Y 19 / UV 28 off at sharp edges).
+    check_with(
+        "dip-white/cropped-layer",
+        &dip(
+            &m.testsrc,
+            white,
+            &|c| {
+                c.transform.crop_left = 0.25;
+                c.transform.crop_right = 0.25;
+            },
+            None,
+        ),
+        &one(&m.testsrc),
+        &times,
+        STRICT,
+        &opts,
+    );
+    check_refused(
+        "refused/dip-to-white-half-size-layer",
+        &dip(&m.testsrc, white, &|c| c.transform.scale = 0.5, None),
+        &one(&m.testsrc),
+        0.2,
+        Refusal::Plan("scaler resizes"),
+    );
+    check_with(
+        "dip-black/half-size-layer",
+        &dip(&m.testsrc, black, &|c| c.transform.scale = 0.5, None),
+        &one(&m.testsrc),
+        &times,
+        STRICT,
+        &opts,
+    );
+    // Refused: a letterboxed layer, and a layer of odd size (319x179 in a 640x360 canvas).
+    let tall = Some(Delivery::new(640, 360, Fit::Contain));
+    check_refused(
+        "refused/dip-to-white-letterboxed",
+        &dip(&m.portrait, white, &none, tall),
+        &one(&m.portrait),
+        0.2,
+        Refusal::Plan("letterboxed"),
+    );
+    check_with(
+        "dip-black/letterboxed",
+        &dip(&m.portrait, black, &none, tall),
+        &one(&m.portrait),
+        &times,
+        STRICT,
+        &opts,
+    );
+    check_refused(
+        "refused/dip-to-white-odd-layer",
+        &dip(&m.testsrc, white, &|c| c.transform.scale = 0.4985, None),
+        &one(&m.testsrc),
+        0.2,
+        Refusal::Plan("odd size 319x179"),
+    );
+    // A matrix with no measured round trip.
+    check_refused(
+        "refused/dip-to-white-bt2020",
+        &dip(&m.testsrc2020, white, &none, None),
+        &one(&m.testsrc2020),
+        0.2,
+        Refusal::Plan("colour matrix"),
+    );
+    // Refused: every picture that is not 8-bit limited-range 4:2:0; the dip to black on it is drawn.
+    for (name, a) in [
+        ("rgb-png", &m.png640),
+        ("10-bit", &m.tenbit),
+        ("4:4:4", &m.yuv444),
+        ("4:2:2", &m.yuv422),
+        ("bgr0", &m.bgr0),
+        ("gray", &m.gray),
+    ] {
+        check_refused(
+            &format!("refused/dip-to-white-{name}"),
+            &dip(a, white, &none, None),
+            &one(a),
+            0.2,
+            Refusal::Plan("not 8-bit limited-range"),
+        );
+        // (a 10-bit picture is maybe full range under FFmpeg 9, so its dip to black is refused there)
+        check_full_range(
+            &format!("dip-black/{name}"),
+            &dip(a, black, &none, None),
+            &one(a),
+            &times,
+            &opts,
+            false,
+            name == "10-bit",
+        );
+    }
+    for (name, a) in [("full-range-mjpeg", &m.fullrange), ("full-range-jpeg-still", &m.jpeg)] {
+        check_refused(
+            &format!("refused/dip-to-white-{name}"),
+            &dip(a, white, &none, None),
+            &one(a),
+            0.2,
+            Refusal::Plan("not 8-bit limited-range"),
+        );
+    }
+}
+
+/// A fade, a dip and a dissolve on a full-range picture: see [`check_full_range`].
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_full_range_picture_fades_as_the_ffmpeg_in_use_converts_its_range() {
+    let m = media();
+    eprintln!("composite colour policy of this FFmpeg: {:?}", policy());
+    let opts = ExportOptions {
+        fps: Some(30.0),
+        ..ExportOptions::default()
+    };
+    // (the JPEG still is 480x270 and the canvas of a cut that starts with the bars 640x360: resized)
+    for (name, a, resized) in [("mjpeg", &m.fullrange, false), ("jpeg-still", &m.jpeg, true)] {
+        let mut fading = clip(a, 0.0, 1.5, 0.0);
+        fading.fade_in = 0.5;
+        fading.fade_out = 0.5;
+        let tl = timeline(vec![vec![fading]], None);
+        check_full_range(
+            &format!("full-range/fade-in-out {name}"),
+            &tl,
+            std::slice::from_ref(a),
+            &[0.0, 0.1, 0.25, 1.1, 1.45],
+            &opts,
+            false,
+            true,
+        );
+        let mut dipped = clip(a, 0.0, 1.5, 1.0);
+        dipped.transition_in = Some(Transition {
+            kind: TransitionKind::DipToBlack,
+            duration: 0.6,
+        });
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 1.0, 0.0), dipped]], None);
+        check_full_range(
+            &format!("full-range/dip-black {name}"),
+            &tl,
+            &[m.bars.clone(), a.clone()],
+            &[0.8, 1.1, 1.25],
+            &opts,
+            resized,
+            true,
+        );
+        let mut dissolved = clip(a, 0.0, 1.5, 1.0);
+        dissolved.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.6,
+        });
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 1.0, 0.0), dissolved]], None);
+        check_full_range(
+            &format!("full-range/dissolve {name}"),
+            &tl,
+            &[m.bars.clone(), a.clone()],
+            &[1.1, 1.3],
+            &opts,
+            resized,
+            true,
+        );
+        // Not fading, the picture is drawn: the range is converted at the decode in a still.
+        let tl = timeline(vec![vec![clip(a, 0.0, 1.5, 0.0)]], None);
+        check_with(
+            &format!("full-range/plain {name}"),
+            &tl,
+            std::slice::from_ref(a),
+            &[0.5],
+            STRICT,
+            &opts,
+        );
+    }
+    // An enlargement of the MJPEG clip, fading in.
+    let mut fading = clip(&m.fullrange, 0.0, 1.5, 0.0);
+    fading.fade_in = 0.5;
+    let tl = timeline(vec![vec![fading]], Some(Delivery::new(960, 540, Fit::Contain)));
+    check_full_range(
+        "full-range/fade-in enlarged",
+        &tl,
+        std::slice::from_ref(&m.fullrange),
+        &[0.1, 0.25, 1.0],
+        &opts,
+        true,
+        true,
+    );
+    // A 10-bit file tagged full range probes as `yuv420p10le` like the limited one and 9.0.2 fades its raw values
+    // (flat max 16 / 15 / 11 against a bound of 8): the name cannot tell the two apart, so under FFmpeg 9 every
+    // deeper-than-8-bit picture is refused inside a fade, the limited one included. FFmpeg 6 draws both.
+    for (name, a) in [("pc-tagged 10-bit", &m.tenbit_pc), ("limited 10-bit", &m.tenbit)] {
+        let mut fading = clip(a, 0.0, 1.5, 0.0);
+        fading.fade_in = 0.5;
+        fading.fade_out = 0.5;
+        let tl = timeline(vec![vec![fading]], None);
+        check_full_range(
+            &format!("full-range/fade-in-out {name}"),
+            &tl,
+            std::slice::from_ref(a),
+            &[0.0, 0.1, 0.25, 1.1, 1.45],
+            &opts,
+            false,
+            true,
+        );
+    }
+}
+
+/// Every kind of transition and a clip's own fades, in a still, strictly against FFmpeg's still:
+/// a frame just inside each transition and one two thirds through (the outgoing clip on its tail,
+/// the incoming one on its ramp, dipped, travelling), the incoming clip covering the frame and
+/// smaller than it (so that the outgoing clip is seen around it).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn every_kind_of_transition_and_the_clips_own_fades_are_drawn_in_a_still() {
+    let m = media();
+    let opts = ExportOptions {
+        fps: Some(30.0),
+        ..ExportOptions::default()
+    };
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    for kind in TransitionKind::ALL {
+        for (cover, scale) in [("covering", 1.0), ("partial", 0.5)] {
+            let mut incoming = clip(&m.testsrc, 0.0, 1.0, 1.0);
+            incoming.transform.scale = scale;
+            incoming.transition_in = Some(Transition { kind, duration: 0.6 });
+            let tl = timeline(vec![vec![clip(&m.bars, 0.0, 1.0, 0.0), incoming]], None);
+            // A dip's halves are 0.3 s either side of the cut, the others run 0.6 s after it.
+            let times = [0.8, 1.0 + 0.1, 1.0 + 0.4, 1.0 + 0.58];
+            // A dip to white on a layer the scaler resizes is FFmpeg's (`scale` converts to RGB itself).
+            if kind == TransitionKind::DipToWhite && scale < 1.0 {
+                check_refused_with(
+                    &format!("transition-kind/{}-{cover}", kind.as_str()),
+                    &tl,
+                    &assets,
+                    times[1],
+                    Refusal::Plan("scaler resizes"),
+                    &opts,
+                );
+                continue;
+            }
+            check_with(
+                &format!("transition-kind/{}-{cover}", kind.as_str()),
+                &tl,
+                &assets,
+                &times,
+                STRICT,
+                &opts,
+            );
+        }
+    }
+    // A clip's own fades, alone and over another track, on a letterbox and graded.
+    let mut fading = clip(&m.testsrc, 0.0, 1.5, 0.0);
+    fading.fade_in = 0.5;
+    fading.fade_out = 0.5;
+    let tl = timeline(vec![vec![fading.clone()]], None);
+    check_with(
+        "fade/in-out",
+        &tl,
+        std::slice::from_ref(&m.testsrc),
+        &[0.1, 0.25, 0.4, 1.1, 1.3, 1.45],
+        STRICT,
+        &opts,
+    );
+    let mut small = fading;
+    small.transform.scale = 0.5;
+    small.color.contrast = 1.2;
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 1.5, 0.0)], vec![small]], None);
+    check_with(
+        "fade/small-graded-over-another",
+        &tl,
+        &assets,
+        &[0.1, 0.25, 1.3],
+        STRICT,
+        &opts,
+    );
+    let mut tall = clip(&m.portrait, 0.0, 1.5, 0.0);
+    tall.fade_in = 0.5;
+    let tl = timeline(vec![vec![tall]], Some(Delivery::new(640, 360, Fit::Contain)));
+    check_with(
+        "fade/letterboxed",
+        &tl,
+        std::slice::from_ref(&m.portrait),
+        &[0.1, 0.3],
+        STRICT,
+        &opts,
+    );
 }
 
 /// One transition cut at 30 fps — an outgoing clip for a second, then `testsrc2` from 1.0 s —
@@ -2107,21 +2542,20 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
 /// border).
 ///
 /// FFmpeg's still draws a frame inside a transition as the export does (the outgoing clip on its
-/// tail under the incoming one's ramp, the dips, the slide and push travel), and the compositor
-/// does not: a *still* plan has no tail layer and no fade, so a plan is refused wherever a fade
-/// is changing the picture, a travel moves a clip or a tail is open, and the frame goes to
-/// FFmpeg. So the contract tested here is that for every frame listed the still it draws like
-/// is the export's frame, and that the plan refuses exactly the frames expected — before the
-/// transition and after it frames are drawn (and the GPU matches that still strictly), inside it
-/// (and on the frame after the ramp where only the tail is left) they are refused, and the second
-/// half of a dip, which has neither a tail nor a fade left, is drawn. Both FFmpegs.
+/// tail under the incoming one's ramp, the dips, the slide and push travel), and so does the
+/// compositor: a still plan holds the fades still changing the picture, the travel and the tail
+/// layer. So every frame listed — before the transition, inside it, the frame on which only the
+/// outgoing clip's tail is left, and after it — is **drawn** by the plan and held strictly to
+/// FFmpeg's still, and the still it stands for is held to the export's own frame (>= 35 dB: the
+/// still's frame *pick* is `-ss`, not the `fps` filter's, so moving footage can differ from the
+/// file by a source frame). Both FFmpegs. The frame-by-frame comparison with the export itself is
+/// `tests/motion_parity.rs`.
 ///
 /// A dissolve of 0.61 s is chosen so that a frame with *only* the tail left exists at 30 fps:
-/// the fade counts 18 frames (it is over at frame 48) and the window covers 18.3 of them. The
-/// still used to part from the export on that frame (a tail it did not draw); it draws it now.
+/// the fade counts 18 frames (it is over at frame 48) and the window covers 18.3 of them.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn() {
+fn frames_inside_a_transition_are_drawn_as_ffmpegs_still_draws_them() {
     let m = media();
     // The export runs at 30 fps whatever the outgoing clip's own rate is (it would take the first clip's).
     let opts = ExportOptions {
@@ -2130,34 +2564,16 @@ fn frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn() {
     };
     let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-ref");
     std::fs::create_dir_all(&scratch).unwrap();
-    // Per kind: the length, the frames to look at as `(frame, refused)`, and the frame on which
-    // only the outgoing clip's tail is left.
-    type Frames = &'static [(u64, bool)];
-    let motion: Frames = &[
-        (15, false),
-        (29, false),
-        (30, true),
-        (37, true),
-        (44, true),
-        (45, true),
-        (46, false),
-        (55, false),
-    ];
+    // Per kind: the length and the frames to look at, the frame on which only the outgoing clip's
+    // tail is left among them.
+    type Frames = &'static [u64];
+    let motion: Frames = &[15, 29, 30, 37, 44, 45, 46, 55];
     let cases: [(&str, TransitionKind, f64, Frames, Option<u64>); 4] = [
         (
             "dissolve",
             TransitionKind::Crossfade,
             0.61,
-            &[
-                (15, false),
-                (29, false),
-                (30, true),
-                (38, true),
-                (47, true),
-                (48, true),
-                (49, false),
-                (55, false),
-            ],
+            &[15, 29, 30, 38, 47, 48, 49, 55],
             Some(48),
         ),
         ("slide", TransitionKind::SlideLeft, 0.5, motion, None),
@@ -2166,17 +2582,7 @@ fn frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn() {
             "dip",
             TransitionKind::DipToBlack,
             0.8,
-            &[
-                (15, false),
-                (18, false),
-                (19, true),
-                (29, true),
-                (30, true),
-                (41, true),
-                (42, false),
-                (43, false),
-                (55, false),
-            ],
+            &[15, 18, 19, 29, 30, 41, 42, 43, 55],
             None,
         ),
     ];
@@ -2198,7 +2604,7 @@ fn frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn() {
             kerf_core::render_with(&tl, &assets, &file, &lossless).expect("export");
             let played = ffmpeg(&["-i", file.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]);
             let _ = std::fs::remove_file(&file);
-            for &(k, refused) in frames {
+            for &k in frames {
                 let case = format!("transition/{name}-{cover}");
                 let t = k as f64 / 30.0;
                 let plan = RenderPlan::at(&tl, &assets, &opts, t, policy()).expect("plan");
@@ -2206,7 +2612,17 @@ fn frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn() {
                 let (w, h) = (size.0 as usize, size.1 as usize);
                 assert_eq!(plan.frame, k as i64);
                 let why = reasons(&plan, size);
-                assert_eq!(!why.is_empty(), refused, "{case}: frame {k}: {why:?}");
+                assert!(why.is_empty(), "{case}: frame {k}: {why:?}");
+                if scale < 1.0 && tail_only == Some(k) {
+                    assert!(
+                        plan.layers.iter().any(|l| l.fx.tail)
+                            && plan
+                                .layers
+                                .iter()
+                                .all(|l| l.fx.in_progress(plan.frame, plan.canvas.fps).is_none()),
+                        "{case}: frame {k}: only the tail is left"
+                    );
+                }
                 // The still the plan stands for, against the frame that plays.
                 let png = scratch.join(format!("transition-{name}-{cover}-{k}.png"));
                 export_still(&tl, &assets, &opts, t, &png, ImageFormat::Png, 0).expect("FFmpeg still");
@@ -2214,27 +2630,13 @@ fn frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn() {
                 let _ = std::fs::remove_file(&png);
                 let export = &played[k as usize * w * h * 3..(k as usize + 1) * w * h * 3];
                 let (apart, _) = compare(export, &still, w, h, EDGE_STEP);
-                eprintln!(
-                    "{case:<28} frame {k:<3} {} still vs export {:>5.1} dB",
-                    if refused { "refused" } else { "drawn  " },
-                    apart.psnr_all
-                );
+                eprintln!("{case:<28} frame {k:<3} still vs export {:>5.1} dB", apart.psnr_all);
                 assert!(
                     apart.psnr_all >= 35.0,
                     "{case}: frame {k}: the FFmpeg still draws the transition differently from the export ({:.1} dB)",
                     apart.psnr_all
                 );
-                if refused {
-                    // Only the tail is left on this frame: the plan says so, and the still draws it.
-                    if scale < 1.0 && tail_only == Some(k) {
-                        assert!(
-                            why.iter().any(|r| r.contains("past its end")) && !why.iter().any(|r| r.contains("inside")),
-                            "{case}: frame {k}: {why:?}"
-                        );
-                    }
-                } else {
-                    check_with(&case, &tl, &assets, &[t], STRICT, &opts);
-                }
+                check_with(&case, &tl, &assets, &[t], STRICT, &opts);
             }
         }
     }

@@ -293,6 +293,30 @@ pub enum FadeTint {
     Alpha,
 }
 
+/// `UINT16_MAX`: the factor of a `fade` that leaves the picture alone (the filter does not run on
+/// the frame at all, so not even a rounding touches it).
+pub const FADE_FULL: u32 = 65535;
+
+/// What `fade` does to one luma sample at `factor` (below [`FADE_FULL`]). `black` is the black level
+/// the filter takes for the pixel format: 16 on `yuv420p`, **0 on `yuva420p`** (a plane with an alpha
+/// channel is taken for a full-range one). Bit for bit on 6.1 and 9.0
+/// (`tests/motion_parity.rs`, `fade_arithmetic_is_ffmpegs`).
+pub fn fade_luma(y: u8, factor: u32, black: u8) -> u8 {
+    let black = i64::from(black);
+    (((i64::from(y) - black) * i64::from(factor) + (black << 16) + 32768) >> 16).clamp(0, 255) as u8
+}
+
+/// ... a chroma sample, toward 128, with the filter's own rounding constant (`8421367`, nine short of
+/// `(128 << 16) + 32768`: a plain `+ 32768` is a level off at a few factors).
+pub fn fade_chroma(c: u8, factor: u32) -> u8 {
+    (((i64::from(c) - 128) * i64::from(factor) + 8_421_367) >> 16).clamp(0, 255) as u8
+}
+
+/// ... an alpha sample, for `alpha=1`: `(a * factor + 32768) >> 16`.
+pub fn fade_alpha(a: u8, factor: u32) -> u8 {
+    ((i64::from(a) * i64::from(factor) + 32768) >> 16).clamp(0, 255) as u8
+}
+
 /// One `fade` of a clip's picture. `st` is on the **timeline** (`setpts` has
 /// already moved the frames there), `d` is clamped to the clip's length with its
 /// tail.
@@ -358,6 +382,21 @@ impl FadeStep {
         match self.edge {
             FadeEdge::In => done,
             FadeEdge::Out => 1.0 - done,
+        }
+    }
+
+    /// The integer `fade` multiplies by at output frame `k`: `UINT16_MAX * i / N` truncated (frame
+    /// `S + i` of a fade of `N` steps, see [`Self::progress_at_frame`]), and `UINT16_MAX` less that
+    /// for a fade-out. [`FADE_FULL`] is "untouched". Everything a pixel does follows from this one
+    /// number ([`fade_luma`], [`fade_chroma`], [`fade_alpha`]), identically on 6.1 and 9.0.
+    pub fn factor_at_frame(&self, k: i64, fps_num: u32, fps_den: u32) -> u32 {
+        let start = fade_ticks(self.st, fps_num, fps_den);
+        let steps = fade_ticks(self.d, fps_num, fps_den).max(1);
+        let done = (k - start).clamp(0, steps);
+        let rising = (i64::from(FADE_FULL) * done / steps) as u32;
+        match self.edge {
+            FadeEdge::In => rising,
+            FadeEdge::Out => FADE_FULL - rising,
         }
     }
 
@@ -1066,5 +1105,56 @@ mod tests {
         assert!((0..2000u64).all(|k| ntsc.frame_containing(ntsc.exact_time(k)) == k));
         assert_eq!(ntsc.frame_at(ntsc.exact_time(90)), 90);
         assert!(Rational::new(0, 1).is_none() && Rational::new(1, 0).is_none());
+    }
+
+    #[test]
+    fn a_fades_factor_is_the_integer_the_filter_counts_and_its_pixels_are_the_filters() {
+        let step = |edge, st, d| FadeStep {
+            edge,
+            tint: FadeTint::Black,
+            st,
+            d,
+        };
+        // 25 fps, a second from the start: frame i of 25 carries 65535 * i / 25, truncated.
+        let fade_in = step(FadeEdge::In, 0.0, 1.0);
+        let factors: Vec<u32> = [0, 1, 5, 12, 24, 25, 26, 99]
+            .iter()
+            .map(|&k| fade_in.factor_at_frame(k, 25, 1))
+            .collect();
+        assert_eq!(factors, [0, 2621, 13107, 31456, 62913, FADE_FULL, FADE_FULL, FADE_FULL]);
+        let fade_out = step(FadeEdge::Out, 0.0, 1.0);
+        let factors: Vec<u32> = [0, 1, 24, 25].iter().map(|&k| fade_out.factor_at_frame(k, 25, 1)).collect();
+        assert_eq!(factors, [FADE_FULL, 62914, 2622, 0]);
+        // Before a fade-in starts nothing of the picture is there; before a fade-out, all of it.
+        let late = step(FadeEdge::In, 2.0, 0.5);
+        assert_eq!(late.factor_at_frame(0, 25, 1), 0);
+        // A duration under half a frame is a one-step fade (N is at least 1).
+        let tiny = step(FadeEdge::In, 1.0, 0.001);
+        assert_eq!(
+            (tiny.factor_at_frame(25, 25, 1), tiny.factor_at_frame(26, 25, 1)),
+            (0, FADE_FULL)
+        );
+        // The factor and the progress agree on what is "running".
+        for k in 0..60 {
+            for s in [fade_in, fade_out, late, tiny] {
+                assert_eq!(
+                    s.factor_at_frame(k, 25, 1) < FADE_FULL,
+                    s.progress_at_frame(k, 25, 1) < 1.0,
+                    "{s:?} @{k}"
+                );
+            }
+        }
+        // Pixels, against what the filter itself writes (measured: yuv420p, black 16; yuva420p,
+        // black 0; a ramp of every value at frame 1 of 25): luma, chroma, alpha.
+        let f = 2621;
+        let luma = |black| [0u8, 16, 100, 235, 255].map(|y| fade_luma(y, f, black));
+        assert_eq!(luma(16), [15, 16, 19, 25, 26]);
+        assert_eq!(luma(0), [0, 1, 4, 9, 10]);
+        assert_eq!([0u8, 128, 254].map(|c| fade_chroma(c, f)), [123, 128, 133]);
+        assert_eq!([0u8, 128, 255].map(|a| fade_alpha(a, f)), [0, 5, 10]);
+        // Half way, and the factor a hair under full strength: nothing is the identity but FADE_FULL.
+        assert_eq!(fade_luma(235, 32767, 16), 125);
+        assert_eq!(fade_chroma(254, FADE_FULL - 1), 254);
+        assert_eq!(fade_alpha(255, FADE_FULL - 1), 255);
     }
 }

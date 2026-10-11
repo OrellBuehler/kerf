@@ -18,22 +18,23 @@
 //!
 //! **Two modes.** [`PlanMode::Still`] is the contract the GPU path started with:
 //! what `build_still_args` draws at a time `t` (the transform sampled once, text drawn
-//! statically) while no fade, tail or travel is open — inside one the FFmpeg still draws
-//! the export's frame and the plan, which holds none of it, is refused. [`PlanMode::Motion`]
+//! statically) — and, inside a fade, a dip, a dissolve, a slide or a push, the export's own
+//! frame as `engine::cli::still_fx` draws it: the fades still changing the picture, the
+//! travel, and the outgoing clip on its tail. [`PlanMode::Motion`]
 //! is the export graph at output frame `k`: see [`Planner`].
 
 use uuid::Uuid;
 
-use crate::clip_timing::{FadeEdge, FadeStep, FadeTint, Rational};
+use crate::clip_timing::{FadeEdge, FadeStep, FadeTint, Rational, FADE_FULL};
 use crate::engine::Fit;
 use crate::error::Result;
 use crate::frame_pick::Pick;
 use crate::layer_geometry::{Keyed, LayerGeometry, Placement};
 use crate::model::{
-    pix_fmt_layout, pix_fmt_subsampling, Asset, Clip, Color, Hdr, Mask, PixLayout, Projection, ResolvedReframe, StreamInfo,
-    StreamKind, Subsampling, Timeline, Transform, VideoEffect,
+    pix_fmt_is_high_bit, pix_fmt_layout, pix_fmt_subsampling, Asset, Clip, Color, Hdr, Mask, PixLayout, Projection,
+    ResolvedReframe, StreamInfo, StreamKind, Subsampling, Timeline, Transform, VideoEffect,
 };
-use crate::plan_caps::{EffectKinds, GpuCaps, LayerRef, Unsupported};
+use crate::plan_caps::{DipWhy, EffectKinds, GpuCaps, LayerRef, Unsupported};
 use crate::planner::{PlanRequest, Planner};
 use crate::ExportOptions;
 
@@ -218,9 +219,11 @@ pub const MIN_TEXT_PX: u32 = 12;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanMode {
     /// What `build_still_args` draws at a time `t`: the transform sampled at that
-    /// instant, text drawn statically, and no fade, tail or travel (the FFmpeg still draws
-    /// those too, and a still plan inside one is refused). The contract the GPU path
-    /// started with, and what every `RenderPlan::at` returns.
+    /// instant, text drawn statically, the frame the still's `-ss` lands on, and inside a
+    /// transition the export's frame as the still draws it (the fades still changing the
+    /// picture counted at the output frame `t` falls in, the slide or push travel at the
+    /// graph's time for that frame, an outgoing clip on its tail). The contract the GPU
+    /// path started with, and what every `RenderPlan::at` returns.
     Still,
     /// What the export graph draws at output frame `k` (`Planner::at_frame`): the
     /// graph's own time for every expression it evaluates, outgoing clips playing on
@@ -265,6 +268,10 @@ pub struct PlanCanvas {
     pub pix_fmt: String,
     /// The delivery is a gif (palettegen / paletteuse on the composite).
     pub gif: bool,
+    /// The cut holds a clip whose picture may be full range ([`PlanStream::maybe_full_range_in`]
+    /// under this plan's policy), wherever it is on the timeline: the export's range is one for the
+    /// whole stream.
+    pub full_range_cut: bool,
 }
 
 /// What the compositor needs to know about a layer's source picture.
@@ -327,13 +334,27 @@ impl PlanStream {
         self.pix_fmt.as_deref().and_then(pix_fmt_subsampling)
     }
 
-    /// Whether the picture may be full range: ffprobe names every full-range 4:2:0 /
-    /// 4:2:2 / 4:4:4 picture `yuvj…` (a JPEG, an mjpeg, an H.264 file flagged `pc`),
-    /// and an asset that never recorded its format is not known not to be.
+    /// Whether the picture may be full range **by its name**: ffprobe names a full-range 8-bit
+    /// 4:2:0 / 4:2:2 / 4:4:4 picture `yuvj…` (a JPEG, an mjpeg, an H.264 file flagged `pc`), and an
+    /// asset that never recorded its format is not known not to be. This is a heuristic: the
+    /// range *tag* (`color_range`) is the truth, and [`StreamInfo`] does not record it, so a
+    /// deeper-than-8-bit file flagged `pc` still reads `yuv420p10le` and is not caught here; see
+    /// [`PlanStream::maybe_full_range_in`].
     pub fn maybe_full_range(&self) -> bool {
         self.pix_fmt
             .as_deref()
             .is_none_or(|f| f.to_ascii_lowercase().starts_with("yuvj"))
+    }
+
+    /// [`PlanStream::maybe_full_range`], and under a policy that is not
+    /// [`CompositeColorPolicy::FixedBt601`] (FFmpeg 9 and what could not be measured) **every
+    /// deeper-than-8-bit YCbCr or gray format too**: the name says nothing about its range there,
+    /// and 9.0.2 handles a `pc`-tagged one as it does `yuvj` (raw values kept, the whole export
+    /// flagged full range; measured Y 16 off on 10-bit). FFmpeg 6 handled the high-bit pictures
+    /// measured exactly whatever their tag, so there the name alone decides, as before.
+    pub fn maybe_full_range_in(&self, policy: CompositeColorPolicy) -> bool {
+        self.maybe_full_range()
+            || (policy != CompositeColorPolicy::FixedBt601 && self.pix_fmt.as_deref().is_some_and(pix_fmt_is_high_bit))
     }
 
     /// An RGB-family picture (see [`PixLayout::Rgb`]).
@@ -426,7 +447,7 @@ impl LayerFx {
     pub fn in_progress(&self, frame: i64, fps: Rational) -> Option<(FadeEdge, bool)> {
         self.fades
             .iter()
-            .find(|s| s.progress_at_frame(frame, fps.num, fps.den) < 1.0)
+            .find(|s| s.factor_at_frame(frame, fps.num, fps.den) < FADE_FULL)
             .map(|s| (s.edge, s.tint == FadeTint::Alpha))
     }
 
@@ -582,12 +603,16 @@ pub struct RenderPlan {
     /// Clips that are on screen but whose source has no picture to draw. `index` is the
     /// number of drawn layers below it: the slot in `layers` it would have taken.
     pub pictureless: Vec<Pictureless>,
-    /// **Still plans only**: the clips whose tail window is open at this frame. The export keeps
-    /// drawing a clip past its end under the one that replaces it (a dissolve, a slide, a
-    /// push), around an incoming clip that does not cover it; a still plan has no layer for
-    /// that, and is refused ([`Unsupported::StillTail`]) whatever the caps. A Motion plan holds
-    /// them as layers (`fx.tail`). `index` as for `pictureless`.
-    pub tails: Vec<LayerRef>,
+}
+
+/// One `fade` filter of a layer's chain at this frame: what it fades ([`FadeTint`]), from which
+/// side, and the integer it multiplies by ([`FadeStep::factor_at_frame`]). A factor of
+/// [`FADE_FULL`] is a fade that is not changing the picture at this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FadeOp {
+    pub tint: FadeTint,
+    pub edge: FadeEdge,
+    pub factor: u32,
 }
 
 /// The matrix the composite is converted with under `policy`, and the reasons a
@@ -688,6 +713,58 @@ impl RenderPlan {
             {
                 reasons.push(Unsupported::Shrink(n, (stage.src.w, stage.src.h), stage.scaled));
             }
+            // The round trip of a dip to white is the fade's own: the picture goes to `rgb24` and back
+            // around it, and what the compositor can draw is the picture at the size the chain makes
+            // it. The black bars of a letterboxed layer are padded in before the round trip, so
+            // FFmpeg whitens them with the picture. A picture with an odd side makes the round trip
+            // read past the line (the chroma pairs reach one pixel beyond it, into memory nothing
+            // initialised). And a layer the scaler resizes is converted by the `scale` filter itself,
+            // which negotiates the fade's `rgb24` as its output: scaling and converting in one pass,
+            // with chroma interpolated from other samples than the compositor's scale-then-convert
+            // (a half-size layer reads Y 19, UV 28 off at the picture's sharp edges; a crop is exact).
+            if caps.dip_white && self.white_round_trip(layer) {
+                let why = if geom.matte {
+                    Some(DipWhy::Letterboxed)
+                } else if geom.picture.0 % 2 == 1 || geom.picture.1 % 2 == 1 {
+                    Some(DipWhy::OddSize(geom.picture.0, geom.picture.1))
+                } else if geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
+                    Some(DipWhy::Resized)
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    reasons.push(Unsupported::DipToWhite(
+                        LayerRef {
+                            index: n,
+                            name: layer.name.clone(),
+                        },
+                        why,
+                    ));
+                }
+            }
+            // A full-range picture the scaler resizes: swscale converts the range *inside* the
+            // resize, from the chroma it has not yet scaled, where the compositor converts the
+            // range and then scales. Plain, the two agree outside the picture's sharp edges (a still
+            // is held to that); in an export's planes the chroma reads up to 15 levels off (FFmpeg 6 as
+            // much as 9), and a fade running on it takes the flat error past the bound too (14).
+            if layer.stream.maybe_full_range() && geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
+                let where_ = if self.mode == PlanMode::Motion {
+                    Some("in an export frame")
+                } else if self.fade_ops(layer).iter().any(|o| o.factor < FADE_FULL) {
+                    Some("inside a fade, a dip or a dissolve")
+                } else {
+                    None
+                };
+                if let Some(where_) = where_ {
+                    reasons.push(Unsupported::FullRangeResized(
+                        LayerRef {
+                            index: n,
+                            name: layer.name.clone(),
+                        },
+                        where_,
+                    ));
+                }
+            }
             let resizing = geom.stages.iter().find(|s| s.scaled != (s.src.w, s.src.h));
             if let Some(stage) = resizing.filter(|_| !matches!(layer.stream.layout(), Some(PixLayout::Yuv420 | PixLayout::Gray)))
             {
@@ -734,9 +811,17 @@ impl RenderPlan {
                     clips: self.canvas.pick_fps,
                 });
             }
+            // FFmpeg 9 keeps a full-range picture's raw values through the graph and flags the whole
+            // export full range: its own planes stay raw (17 levels off a compositor that converts to
+            // limited range first) and **every limited-range frame of the cut is converted to full range**
+            // (a black frame reads Y 0, not 16; a test pattern 76, not 81). That is a fact about the cut,
+            // not about the layers in this frame: a frame before the clip, after it, on another track, or a
+            // gap, is as far off. FFmpeg 6 converts at the decode, as the compositor does.
+            if self.canvas.full_range_cut && self.canvas.policy != CompositeColorPolicy::FixedBt601 {
+                out.push(Unsupported::FullRangeCut);
+            }
         }
         out.extend(self.pictureless.iter().cloned().map(Unsupported::NoPicture));
-        out.extend(self.tails.iter().cloned().map(Unsupported::StillTail));
         for (n, layer) in self.layers.iter().enumerate() {
             let at = || LayerRef {
                 index: n,
@@ -782,9 +867,12 @@ impl RenderPlan {
             // clip, in every knob), so a full-range picture is not graded on the GPU
             // — and a picture whose format was never recorded is not known not to be
             // full-range.
-            if !layer.color.is_identity() && stream.maybe_full_range() {
+            if !layer.color.is_identity() && stream.maybe_full_range_in(self.canvas.policy) {
                 let detail = match stream.pix_fmt.as_deref() {
-                    Some(f) => format!("a full-range picture ({f}), which FFmpeg grades before converting its range"),
+                    Some(f) if stream.maybe_full_range() => {
+                        format!("a full-range picture ({f}), which FFmpeg grades before converting its range")
+                    }
+                    Some(f) => format!("a picture deeper than 8 bits ({f}) whose range is not recorded (it may be full range)"),
                     None => "a picture whose pixel format was never recorded (it may be full range)".to_string(),
                 };
                 out.push(Unsupported::GradedFullRange(at(), detail));
@@ -798,15 +886,67 @@ impl RenderPlan {
             if (layer.reframe.is_some() || layer.projection.is_some()) && !caps.reframe {
                 out.push(Unsupported::Reframe(at()));
             }
-            // The FFmpeg still draws a frame inside a fade or a transition as the export does
-            // (`engine::cli::still_fx`); a **still plan** has no tail layers and no fade, so it
-            // is never drawn inside one, whatever the caps say: those abilities are for
-            // [`PlanMode::Motion`] plans, and a frame inside a fade or a transition is FFmpeg's.
-            let motion = self.mode == PlanMode::Motion;
-            if let Some((edge, dissolve)) = layer.fx.in_progress(frame, fps).filter(|_| !(motion && caps.fades)) {
+            // A fade, a dip, a dissolve, a slide or a push: both modes hold them (the FFmpeg still
+            // draws the export's frame inside one, `engine::cli::still_fx`), and a compositor says
+            // whether it draws them. The `fade` filter of a still runs on the timebase of the clip's
+            // `fps=` filter and the plan counts frames on the canvas's; where the two parse the rate to
+            // different rationals the count is not the plan's.
+            let in_progress = layer.fx.in_progress(frame, fps);
+            if let Some((edge, dissolve)) = in_progress.filter(|_| !caps.fades) {
                 out.push(Unsupported::Fade(at(), edge, dissolve));
             }
-            if layer.fx.travels() && !(motion && caps.transitions) {
+            if in_progress.is_some()
+                && self.mode == PlanMode::Still
+                && self.canvas.fps != self.canvas.pick_fps
+                && !out.iter().any(|u| matches!(u, Unsupported::PickRate { .. }))
+            {
+                out.push(Unsupported::PickRate {
+                    canvas: self.canvas.fps,
+                    clips: self.canvas.pick_fps,
+                });
+            }
+            // A dip to white is a filter in the export's chain for every frame of the clip, and in
+            // the still's while the fade runs. `fade c=white` only takes RGB, so the picture is
+            // converted `yuv420p -> rgb24 -> yuv420p` around it: reproduced for a plain chain on an
+            // 8-bit limited-range 4:2:0 picture (the conversion's own kernel is within 2 levels of the
+            // tables the compositor follows; every other format was measured 9 to 21 levels off,
+            // gray 2 on one picture and not claimed). On an alpha plane FFmpeg takes another RGB
+            // format, and a black fade of the clip that runs ahead of it is a filter of its own in
+            // the YUV.
+            let ops = self.fade_ops(layer);
+            if self.white_round_trip(layer) {
+                let why = if !caps.dip_white {
+                    Some(DipWhy::NoRoundTrip)
+                } else if self.on_alpha_plane(layer) {
+                    Some(DipWhy::AlphaPlane)
+                } else if ops.iter().any(|o| o.tint == FadeTint::Black && o.factor < FADE_FULL) {
+                    Some(DipWhy::BlackFade)
+                } else if stream.pix_fmt.as_deref() != Some("yuv420p") {
+                    Some(DipWhy::Format)
+                } else if !matches!(stream.matrix(), Some(YuvMatrix::Bt601 | YuvMatrix::Bt709)) {
+                    Some(DipWhy::Matrix)
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    out.push(Unsupported::DipToWhite(at(), why));
+                }
+            }
+            // FFmpeg 9 keeps a full-range picture's raw values in the graph and converts the range at
+            // the end: `fade` darkens them toward the limited-range black 16 first (frame 0 of a
+            // fade-in reads Y 30 where black is 16). FFmpeg 6 converts at the decode, as the compositor
+            // does. (An export frame is refused for the cut it is in, below.)
+            if self.mode == PlanMode::Still
+                && self.canvas.policy != CompositeColorPolicy::FixedBt601
+                && stream.maybe_full_range_in(self.canvas.policy)
+                && ops.iter().any(|o| o.factor < FADE_FULL)
+            {
+                out.push(Unsupported::FullRangeNegotiated(at()));
+            }
+            if self.through_rgba(layer) && ops.iter().any(|o| o.tint != FadeTint::Alpha && o.factor < FADE_FULL) {
+                out.push(Unsupported::FadeOnTranslucent(at()));
+            }
+            if layer.fx.travels() && !caps.transitions {
                 out.push(Unsupported::Travel(at()));
             }
             if layer.fx.tail && !caps.transitions {
@@ -855,9 +995,9 @@ impl RenderPlan {
         // 40 to 44 dB off (a limited-range clip over a limited-range one is exact). Where
         // the composite's colour is negotiated, or not known, grading in a stack that
         // holds a full-range picture is FFmpeg's.
-        if policy != CompositeColorPolicy::FixedBt601 && self.layers.iter().any(|l| l.stream.maybe_full_range()) {
+        if policy != CompositeColorPolicy::FixedBt601 && self.layers.iter().any(|l| l.stream.maybe_full_range_in(policy)) {
             for (n, layer) in self.layers.iter().enumerate() {
-                if !layer.color.is_identity() && !layer.stream.maybe_full_range() {
+                if !layer.color.is_identity() && !layer.stream.maybe_full_range_in(policy) {
                     out.push(Unsupported::GradedInFullRangeStack(n));
                 }
             }
@@ -944,6 +1084,66 @@ impl RenderPlan {
     /// ([`LayerFx::strength`]): `1` untouched, `0` gone.
     pub fn strength(&self, layer: &PlanLayer, tint: FadeTint) -> f64 {
         layer.fx.strength(tint, self.frame, self.canvas.fps)
+    }
+
+    /// The `fade` filters of `layer`'s chain at this frame, **in the order the chain applies them**
+    /// (its own fade-in and out merged with a dip to black's, then a dip to white's, then a
+    /// dissolve's alpha ramp), each with the integer factor it multiplies by
+    /// ([`FadeStep::factor_at_frame`]). One whose factor is [`FADE_FULL`] is not changing the
+    /// picture at this frame; a compositor skips it, except that in an export frame a dip to white
+    /// is a filter that is there for every frame of the clip (the RGB round trip around it is what
+    /// is drawn, whatever the factor).
+    pub fn fade_ops(&self, layer: &PlanLayer) -> Vec<FadeOp> {
+        let fps = self.canvas.fps;
+        layer
+            .fx
+            .fades
+            .iter()
+            .map(|s| FadeOp {
+                tint: s.tint,
+                edge: s.edge,
+                factor: s.factor_at_frame(self.frame, fps.num, fps.den),
+            })
+            .collect()
+    }
+
+    /// Whether the clip's chain takes the `yuv420p -> rgb24 -> yuv420p` round trip a dip to white
+    /// needs at this frame: in an export it is a filter of every frame of the clip, in a still only
+    /// while the fade runs.
+    pub fn white_round_trip(&self, layer: &PlanLayer) -> bool {
+        let fps = self.canvas.fps;
+        layer.fx.fades.iter().any(|s| {
+            s.tint == FadeTint::White
+                && (self.mode == PlanMode::Motion || s.factor_at_frame(self.frame, fps.num, fps.den) < FADE_FULL)
+        })
+    }
+
+    /// Whether the clip's picture is in RGBA when its fades run: an opacity below 1 is a
+    /// `colorchannelmixer`, which only takes RGB, and what follows it (`rotate`, `fade`) takes RGBA
+    /// as it is until the `overlay` asks for `yuva420p`. A keyed opacity is a `geq` alpha instead.
+    pub fn through_rgba(&self, layer: &PlanLayer) -> bool {
+        let keyed = self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.keys.is_some_and(|k| k.opacity));
+        !keyed && layer.transform.opacity < 1.0
+    }
+
+    /// Whether the clip's chain is on a `yuva420p` picture at its fades, as the graph that made this
+    /// plan builds it: `fade` takes a black of 0 there and 16 on `yuv420p`, and a dip to white
+    /// converts through another RGB format. The export puts a chain on an alpha plane for a rotation,
+    /// an opacity below 1 (either one *keyed* too, whatever its value at this frame), a mask, a chroma
+    /// key and for the dissolve the clip enters through (the whole clip, not only its ramp); the still
+    /// builds the chain for the pose it samples, so a keyed number counts only by its value.
+    pub fn on_alpha_plane(&self, layer: &PlanLayer) -> bool {
+        let motion = self.mode == PlanMode::Motion;
+        let keys = layer.animated.filter(|_| motion).and_then(|a| a.keys);
+        let keyed_rotation = keys.is_some_and(|k| k.rotation);
+        let keyed_opacity = keys.is_some_and(|k| k.opacity);
+        let animated = layer.animated.filter(|_| motion);
+        (!keyed_rotation && layer.transform.rotation != 0.0)
+            || (!keyed_opacity && layer.transform.opacity < 1.0)
+            || animated.is_some_and(|a| a.rotates || a.opacity)
+            || layer.mask.is_some()
+            || layer.effects.iter().any(|e| e.produces_alpha())
+            || layer.fx.fades.iter().any(|s| s.tint == FadeTint::Alpha)
     }
 
     /// The size a render of this plan at `max_width` comes out — what the FFmpeg
@@ -1714,6 +1914,348 @@ mod tests {
             });
         });
         assert!(ok, "{why:?}");
+    }
+
+    /// The still plan of `edit`ed clip `a` (0..10 s on the timeline) at `t`.
+    fn fading_plan(edit: impl FnOnce(&mut Clip), t: f64) -> RenderPlan {
+        fading_plan_of(video(640, 360), None, CompositeColorPolicy::FixedBt601, edit, t)
+    }
+
+    fn fading_plan_of(
+        stream: StreamInfo,
+        delivery: Option<Delivery>,
+        policy: CompositeColorPolicy,
+        edit: impl FnOnce(&mut Clip),
+        t: f64,
+    ) -> RenderPlan {
+        let a = asset("a", 20.0, vec![stream]);
+        let mut clip = Clip::new(a.id, 0.0, 10.0, 0.0);
+        edit(&mut clip);
+        let mut tl = timeline(vec![vec![clip]]);
+        tl.format = delivery;
+        RenderPlan::at(
+            &tl,
+            std::slice::from_ref(&a),
+            &ExportOptions {
+                fps: Some(30.0),
+                ..ExportOptions::default()
+            },
+            t,
+            policy,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_fades_ops_carry_the_integer_the_filter_multiplies_by_in_chain_order() {
+        // Fade-in over 1 s (30 frames of 30 fps), fade-out over the last 0.5 s: at frame 15 the
+        // in-fade is half way (65535 * 15 / 30, truncated), the out-fade has not begun.
+        let plan = fading_plan(
+            |c| {
+                c.fade_in = 1.0;
+                c.fade_out = 0.5;
+            },
+            0.5,
+        );
+        assert_eq!(plan.frame, 15);
+        let ops = plan.fade_ops(&plan.layers[0]);
+        assert_eq!(
+            ops,
+            vec![
+                FadeOp {
+                    tint: FadeTint::Black,
+                    edge: FadeEdge::In,
+                    factor: 32767
+                },
+                FadeOp {
+                    tint: FadeTint::Black,
+                    edge: FadeEdge::Out,
+                    factor: FADE_FULL
+                },
+            ]
+        );
+        // The last frames: the out-fade counts down to 0 on frame 300, and the in-fade is full.
+        let plan = fading_plan(
+            |c| {
+                c.fade_in = 1.0;
+                c.fade_out = 0.5;
+            },
+            9.9,
+        );
+        let ops = plan.fade_ops(&plan.layers[0]);
+        assert_eq!((ops[0].factor, ops[1].factor), (FADE_FULL, 65535 - 65535 * 12 / 15));
+    }
+
+    #[test]
+    fn the_chain_is_on_an_alpha_plane_for_a_rotation_an_opacity_and_a_dissolve() {
+        let on = |edit: &dyn Fn(&mut Clip)| {
+            let plan = fading_plan(|c| edit(c), 0.5);
+            plan.on_alpha_plane(&plan.layers[0])
+        };
+        assert!(!on(&|_| {}));
+        assert!(!on(&|c| c.fade_in = 1.0), "a plain fade is on yuv420p, black 16");
+        assert!(on(&|c| c.transform.rotation = 10.0));
+        assert!(on(&|c| c.transform.opacity = 0.5));
+        assert!(on(&|c| c.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 1.0
+        })));
+        // A dip is a fade of the picture itself: no alpha plane.
+        assert!(!on(&|c| c.transition_in = Some(Transition {
+            kind: TransitionKind::DipToBlack,
+            duration: 1.0
+        })));
+        // Only an opacity below 1 leaves the picture in RGBA at its fades.
+        let plan = fading_plan(|c| c.transform.opacity = 0.5, 0.5);
+        assert!(plan.through_rgba(&plan.layers[0]));
+        let plan = fading_plan(|c| c.transform.rotation = 10.0, 0.5);
+        assert!(!plan.through_rgba(&plan.layers[0]));
+    }
+
+    #[test]
+    fn what_the_compositor_cannot_do_with_a_fade_is_refused_with_its_own_reason() {
+        let all = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            ..GpuCaps::A0
+        };
+        let reasons = |edit: &dyn Fn(&mut Clip), t: f64| {
+            let plan = fading_plan(|c| edit(c), t);
+            plan.reasons(&all, plan.size(u32::MAX))
+        };
+        // A black fade on a translucent layer runs on the RGBA picture, alpha included.
+        let why = reasons(
+            &|c| {
+                c.transform.opacity = 0.5;
+                c.fade_in = 1.0;
+            },
+            0.5,
+        );
+        assert!(matches!(why.as_slice(), [Unsupported::FadeOnTranslucent(_)]), "{why:?}");
+        // ... but not once it is over (nothing runs), and a dissolve's ramp only touches alpha.
+        assert!(reasons(
+            &|c| {
+                c.transform.opacity = 0.5;
+                c.fade_in = 1.0;
+            },
+            2.0
+        )
+        .is_empty());
+        assert!(reasons(
+            &|c| {
+                c.transform.opacity = 0.5;
+                c.transition_in = Some(Transition {
+                    kind: TransitionKind::Crossfade,
+                    duration: 1.0,
+                });
+            },
+            0.5
+        )
+        .is_empty());
+        // A dip to white is drawn on a plain chain only: an alpha plane and a black fade running
+        // ahead of it are FFmpeg's.
+        let white = |c: &mut Clip| {
+            c.transition_in = Some(Transition {
+                kind: TransitionKind::DipToWhite,
+                duration: 2.0,
+            });
+        };
+        assert!(reasons(&white, 0.5).is_empty());
+        let why = reasons(
+            &|c| {
+                white(c);
+                c.transform.rotation = 10.0;
+            },
+            0.5,
+        );
+        assert!(
+            matches!(why.as_slice(), [Unsupported::DipToWhite(_, DipWhy::AlphaPlane)]),
+            "{why:?}"
+        );
+        let why = reasons(
+            &|c| {
+                white(c);
+                c.fade_in = 2.0;
+            },
+            0.5,
+        );
+        assert!(
+            matches!(why.as_slice(), [Unsupported::DipToWhite(_, DipWhy::BlackFade)]),
+            "{why:?}"
+        );
+        // Without the ability the frame is refused for it, once the fade is running.
+        let plan = fading_plan(white, 0.5);
+        let why = plan.reasons(&GpuCaps { dip_white: false, ..all }, plan.size(u32::MAX));
+        assert!(
+            matches!(why.as_slice(), [Unsupported::DipToWhite(_, DipWhy::NoRoundTrip)]),
+            "{why:?}"
+        );
+        // A still plan has no dip to white in its chain once the fade is over; an export frame always has.
+        let plan = fading_plan(white, 5.0);
+        assert!(plan
+            .reasons(&GpuCaps { dip_white: false, ..all }, plan.size(u32::MAX))
+            .is_empty());
+    }
+
+    #[test]
+    fn a_dip_to_white_is_drawn_for_the_pictures_the_round_trip_was_measured_on() {
+        let all = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            ..GpuCaps::A0
+        };
+        let white = |c: &mut Clip| {
+            c.transition_in = Some(Transition {
+                kind: TransitionKind::DipToWhite,
+                duration: 2.0,
+            });
+        };
+        let why = |stream: StreamInfo, delivery: Option<Delivery>, t: f64| {
+            let plan = fading_plan_of(stream, delivery, CompositeColorPolicy::FixedBt601, white, t);
+            plan.reasons(&all, plan.size(u32::MAX))
+        };
+        assert!(why(video(640, 360), None, 0.5).is_empty());
+        let tagged = |space: &str| StreamInfo {
+            color_space: Some(space.into()),
+            ..video(640, 360)
+        };
+        assert!(
+            why(tagged("bt709"), None, 0.5).is_empty(),
+            "BT.709 was measured: 3 / 2 levels"
+        );
+        let dipped = |w: Vec<Unsupported>, what: DipWhy| {
+            assert!(
+                matches!(w.as_slice(), [Unsupported::DipToWhite(_, m)] if *m == what),
+                "{what:?}: {w:?}"
+            );
+        };
+        dipped(why(tagged("bt2020nc"), None, 0.5), DipWhy::Matrix);
+        // Every other format was measured 9 to 21 levels off the round trip: RGB (a PNG), 10-bit,
+        // 4:4:4, 4:2:2, gray and full range, and one whose format was never recorded.
+        for fmt in ["rgb24", "yuv420p10le", "yuv444p", "yuv422p", "gray", "yuvj420p"] {
+            let stream = StreamInfo {
+                pix_fmt: Some(fmt.into()),
+                ..video(640, 360)
+            };
+            dipped(why(stream, None, 0.5), DipWhy::Format);
+        }
+        let unrecorded = StreamInfo {
+            pix_fmt: None,
+            ..video(640, 360)
+        };
+        dipped(why(unrecorded, None, 0.5), DipWhy::Format);
+        // A letterboxed picture: FFmpeg pads before the round trip, so the bars whiten as well.
+        let portrait = video(360, 640);
+        let delivery = Some(Delivery::new(640, 360, Fit::Contain));
+        dipped(why(portrait.clone(), delivery, 0.5), DipWhy::Letterboxed);
+        // ... but not in a still once the fade is over: no round trip is in its chain then.
+        assert!(why(portrait.clone(), delivery, 5.0).is_empty());
+        let plan = fading_plan_of(portrait, delivery, CompositeColorPolicy::FixedBt601, |_| {}, 0.5);
+
+        assert!(plan.reasons(&all, plan.size(u32::MAX)).is_empty(), "no dip, no round trip");
+        // A picture with an odd side (a layer scaled to 319x179): the round trip reads past it.
+        let on_layer = |edit: &dyn Fn(&mut Clip)| {
+            let plan = fading_plan_of(
+                video(640, 360),
+                None,
+                CompositeColorPolicy::FixedBt601,
+                |c| {
+                    white(c);
+                    edit(c);
+                },
+                0.5,
+            );
+            plan.reasons(&all, plan.size(u32::MAX))
+        };
+        dipped(on_layer(&|c| c.transform.scale = 0.4985), DipWhy::OddSize(319, 179));
+        // A layer the scaler resizes, whatever the ratio: the scale filter converts to RGB itself.
+        dipped(on_layer(&|c| c.transform.scale = 0.5), DipWhy::Resized);
+        dipped(on_layer(&|c| c.transform.scale = 1.5), DipWhy::Resized);
+        // ... where a crop that leaves the picture its size is exact, and so is a layer that is not resized.
+        assert!(on_layer(&|c| {
+            c.transform.crop_left = 0.25;
+            c.transform.crop_right = 0.25;
+        })
+        .is_empty());
+        // A compositor without the ability is not asked about the geometry.
+        let plan = fading_plan_of(video(640, 360), None, CompositeColorPolicy::FixedBt601, white, 0.5);
+        assert!(matches!(
+            plan.reasons(&GpuCaps { dip_white: false, ..all }, plan.size(u32::MAX))
+                .as_slice(),
+            [Unsupported::DipToWhite(_, DipWhy::NoRoundTrip)]
+        ));
+    }
+
+    #[test]
+    fn a_full_range_picture_is_not_faded_where_ffmpeg_9_keeps_its_raw_values() {
+        let all = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            ..GpuCaps::A0
+        };
+        let full = StreamInfo {
+            pix_fmt: Some("yuvj420p".into()),
+            ..video(640, 360)
+        };
+        let plan = |stream: &StreamInfo, policy, fade: f64, t: f64| {
+            fading_plan_of(stream.clone(), None, policy, |c| c.fade_in = fade, t)
+        };
+        let reasons = |p: &RenderPlan| p.reasons(&all, p.size(u32::MAX));
+        let policies = [CompositeColorPolicy::BottomLayerTag, CompositeColorPolicy::Unknown];
+        for policy in policies {
+            let running = reasons(&plan(&full, policy, 1.0, 0.5));
+            assert!(
+                matches!(running.as_slice(), [Unsupported::FullRangeNegotiated(_)]),
+                "{policy:?}: {running:?}"
+            );
+            assert!(
+                reasons(&plan(&full, policy, 1.0, 5.0)).is_empty(),
+                "{policy:?}: a still with the fade over"
+            );
+            assert!(
+                reasons(&plan(&full, policy, 0.0, 0.5)).is_empty(),
+                "{policy:?}: no fade, no raw values"
+            );
+            assert!(
+                reasons(&plan(&video(640, 360), policy, 1.0, 0.5)).is_empty(),
+                "{policy:?}: a limited-range picture fades as drawn"
+            );
+        }
+        // FFmpeg 6 converts the range at the decode: the compositor's order.
+        assert!(reasons(&plan(&full, CompositeColorPolicy::FixedBt601, 1.0, 0.5)).is_empty());
+        // ... unless the scaler resizes the picture, which converts the range inside the resize
+        // (chroma up to 15 levels off): refused under either FFmpeg inside a fade, and drawn plain in a still.
+        let resized = |stream: &StreamInfo, policy, fade: f64, t: f64| {
+            fading_plan_of(
+                stream.clone(),
+                None,
+                policy,
+                |c| {
+                    c.fade_in = fade;
+                    c.transform.scale = 0.5;
+                },
+                t,
+            )
+        };
+        for policy in [CompositeColorPolicy::FixedBt601, CompositeColorPolicy::BottomLayerTag] {
+            let why = reasons(&resized(&full, policy, 1.0, 0.5));
+            assert!(
+                why.iter()
+                    .any(|w| matches!(w, Unsupported::FullRangeResized(_, m) if m.contains("fade"))),
+                "{policy:?}: {why:?}"
+            );
+            assert!(
+                reasons(&resized(&video(640, 360), policy, 1.0, 0.5)).is_empty(),
+                "{policy:?}: limited range is exact"
+            );
+        }
+        assert!(reasons(&resized(&full, CompositeColorPolicy::FixedBt601, 0.0, 0.5)).is_empty());
     }
 
     #[test]

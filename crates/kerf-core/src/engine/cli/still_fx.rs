@@ -310,6 +310,76 @@ mod tests {
         assert_eq!((count(10.0 + 14.0 / 30.0), count(10.5), count(10.5 + 0.5 / 30.0)), (2, 1, 1));
     }
 
+    /// A cut of every transition kind (and a clip's own fades) with one track and another over it:
+    /// what the still draws and what the Still plan holds must be the same layers, frame by frame.
+    #[test]
+    fn the_still_plan_holds_the_layers_the_still_draws_at_every_time_of_every_transition() {
+        use crate::planner::{PlanRequest, Planner};
+        use crate::render_plan::{CompositeColorPolicy, PlanMode};
+        use crate::ExportOptions;
+
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let kinds = crate::model::TransitionKind::ALL;
+        for fps in [24.0, 29.97, 30.0, 60.0] {
+            let mut clips = vec![make_clip(asset.id, 0.0, 3.0, 0.0)];
+            for (i, kind) in kinds.iter().enumerate() {
+                let start = 3.0 * (i + 1) as f64;
+                let mut c = make_clip(asset.id, 20.0, 23.0, start);
+                // 0.61 s is a whole number of frames at no rate: the window closes inside a frame.
+                c.transition_in = Some(Transition {
+                    kind: *kind,
+                    duration: [0.61, 0.5, 1.0][i % 3],
+                });
+                if i % 4 == 0 {
+                    c.fade_out = 0.4;
+                }
+                clips.push(c);
+            }
+            clips[1].fade_in = 0.3;
+            let tl = single(clips);
+            let opts = ExportOptions {
+                fps: Some(fps),
+                ..ExportOptions::default()
+            };
+            let planner = Planner::new(
+                &tl,
+                std::slice::from_ref(&asset),
+                &opts,
+                PlanRequest::still(CompositeColorPolicy::FixedBt601),
+            )
+            .unwrap();
+            assert_eq!(planner.mode(), PlanMode::Still);
+            let rendered = tl.for_render();
+            let total = tl.duration();
+            let mut t = 0.0;
+            let mut checked = 0;
+            while t < total + 1.0 {
+                let want = still_layers(&rendered, std::slice::from_ref(&asset), fps, t);
+                let plan = planner.at(t).unwrap();
+                let frame = plan.frame;
+                assert_eq!(plan.layers.len(), want.len(), "fps {fps} t {t}");
+                for (got, want) in plan.layers.iter().zip(&want) {
+                    assert_eq!(got.clip_id, want.active.clip.id, "fps {fps} t {t}");
+                    assert_eq!(got.source_time, want.active.source_time, "fps {fps} t {t}");
+                    assert_eq!(got.fx.motion, want.motion, "fps {fps} t {t}");
+                    let steps: Vec<FadeStep> = got
+                        .fx
+                        .fades
+                        .iter()
+                        .copied()
+                        .filter(|s| {
+                            s.factor_at_frame(frame, plan.canvas.fps.num, plan.canvas.fps.den) < crate::clip_timing::FADE_FULL
+                        })
+                        .collect();
+                    assert_eq!(steps, want.fades.steps, "fps {fps} t {t}");
+                    checked += 1;
+                }
+                t += 0.0137;
+            }
+            assert!(checked > 100);
+        }
+    }
+
     #[test]
     fn a_frame_rate_ffmpeg_refuses_leaves_the_still_without_transitions() {
         let asset = asset();

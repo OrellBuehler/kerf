@@ -94,6 +94,17 @@ struct ComposeParams {
     tail: u32,          // 1: draw only the chroma of an odd layer's last half block
     pad0: u32,
     pad1: u32,
+    // `fade`'s integer factors (65535: not running), then the black level it takes for the layer's
+    // pixel format and the layer's alpha before the ramp (0..255).
+    fade_in: u32,
+    fade_out: u32,
+    black: u32,
+    alpha: u32,
+    // The dissolve's `fade alpha=1` factor (65535: not running).
+    ramp: u32,
+    pad2: u32,
+    pad3: u32,
+    pad4: u32,
 }
 
 @group(0) @binding(0) var<uniform> cp: ComposeParams;
@@ -175,13 +186,27 @@ fn layer_uv(lc: vec2<i32>) -> vec2<f32> {
     return vec2<f32>(textureLoad(utex, pc, 0).r * 255.0, textureLoad(vtex, pc, 0).r * 255.0);
 }
 
-@fragment
-fn fs_compose(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+// `fade`'s arithmetic (libavfilter `vf_fade.c`, identical in 6.1 and 9.0): the factor is
+// `UINT16_MAX * i / N`, a luma sample goes toward the black level, chroma toward 128 with its own
+// rounding constant, alpha toward 0. A factor of 65535 means the filter does not run at all.
+fn fade_luma(y: i32, f: u32) -> i32 {
+    let bl = i32(cp.black);
+    return clamp((((y - bl) * i32(f)) + (bl << 16u) + 32768) >> 16u, 0, 255);
+}
+
+fn fade_chroma(c: i32, f: u32) -> i32 {
+    return clamp((((c - 128) * i32(f)) + 8421367) >> 16u, 0, 255);
+}
+
+// The picture of the layer at canvas pixel `frag`: Y, U, V as the bytes `overlay` would see (the
+// rotation, the letterbox matte and `fade` applied), and the luma pixel's coverage in w (a negative
+// w: this pass does not draw the pixel).
+fn layer_pixel(frag: vec4<f32>) -> vec4<f32> {
     let l = vec2<i32>(frag.xy) - cp.origin;
     let inside = l.x >= 0 && l.y >= 0 && l.x < cp.layer.x && l.y < cp.layer.y;
     if (cp.tail == 0u) {
         if (!inside) {
-            discard;
+            return vec4<f32>(0.0, 0.0, 0.0, -1.0);
         }
     } else {
         // Only the pixels just beyond an odd layer's last column / row (and the
@@ -191,27 +216,83 @@ fn fs_compose(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let in_x = l.x >= 0 && l.x < cp.layer.x;
         let in_y = l.y >= 0 && l.y < cp.layer.y;
         if (!((tx && in_y) || (ty && in_x) || (tx && ty))) {
-            discard;
+            return vec4<f32>(0.0, 0.0, 0.0, -1.0);
         }
     }
     // Chroma is shared by 2x2 luma pixels (the layer's origin is even, so the
     // grids line up); the final conversion replicates it, as swscale's does.
     let lc = vec2<i32>(l.x / 2, l.y / 2);
     let uv = layer_uv(lc);
-    if (cp.tail != 0u) {
-        // `overlay` blends whole chroma samples, so the chroma block an odd
-        // layer ends in reaches one pixel past it — with the luma left to the
-        // layers below (this pass writes only U and V).
-        return vec4<f32>(0.0, round(uv.x) / 255.0, round(uv.y) / 255.0, cp.opacity.x);
+    var u = i32(round(uv.x));
+    var v = i32(round(uv.y));
+    var y = 0;
+    var cov = 1.0;
+    // `overlay` blends whole chroma samples, so the chroma block an odd layer ends in reaches one pixel
+    // past it — with the luma left to the layers below (the tail pass writes only U and V).
+    if (cp.tail == 0u) {
+        let sy = layer_y(l);
+        y = i32(round(sy.x));
+        cov = sy.y;
     }
-    let sy = layer_y(l);
-    let y = sy.x;
+    // `fade` runs after `rotate`, on the 8-bit picture: the clip's own fade-in and out (a dip's
+    // halves are merged into them), each one a filter of its own.
+    if (cp.fade_in < 65535u) {
+        y = fade_luma(y, cp.fade_in);
+        u = fade_chroma(u, cp.fade_in);
+        v = fade_chroma(v, cp.fade_in);
+    }
+    if (cp.fade_out < 65535u) {
+        y = fade_luma(y, cp.fade_out);
+        u = fade_chroma(u, cp.fade_out);
+        v = fade_chroma(v, cp.fade_out);
+    }
+    return vec4<f32>(f32(y), f32(u), f32(v), cov);
+}
+
+@fragment
+fn fs_compose(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let px = layer_pixel(frag);
+    if (px.w < 0.0) {
+        discard;
+    }
     // Blend in YUV, like FFmpeg's overlay: the canvas holds the encoded Y, U, V
     // values (chroma replicated per pixel) and the blend factors act on each
     // channel alike. Converting each layer to RGB first would clamp it before
     // the blend, and a legal-but-out-of-gamut picture (saturated test patterns,
     // super-whites) would then composite differently.
-    return vec4<f32>(round(y) / 255.0, round(uv.x) / 255.0, round(uv.y) / 255.0, sy.y * cp.opacity.x);
+    return vec4<f32>(px.x / 255.0, px.y / 255.0, px.z / 255.0, px.w * cp.opacity.x);
+}
+
+// The canvas before this layer, for a layer whose alpha is below 255 and so cannot be the hardware's
+// blend: FFmpeg's own, in integers.
+@group(0) @binding(4) var prev: texture_2d<f32>;
+
+// `overlay`'s blend of a `yuva420p` picture on a `yuv420p` one (`blend_plane`): `d * (255 - a) + s * a`
+// divided by 255 with `FAST_DIV255`, rounding to nearest. Exact for a = 255 (the source) and 0 (the
+// destination). 6.1 and 9.0 alike, on all three planes for a uniform alpha.
+fn blend255(d: u32, s: u32, a: u32) -> u32 {
+    return ((d * (255u - a) + s * a + 128u) * 257u) >> 16u;
+}
+
+@fragment
+fn fs_compose_exact(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let px = layer_pixel(frag);
+    if (px.w < 0.0) {
+        discard;
+    }
+    // The alpha plane: opacity (colorchannelmixer), then the dissolve's ramp (`fade alpha=1`), and
+    // wherever a rotation left the picture there is none.
+    var a = cp.alpha;
+    if (cp.ramp < 65535u) {
+        a = u32(((i32(a) * i32(cp.ramp)) + 32768) >> 16u);
+    }
+    if (px.w < 0.5) {
+        a = 0u;
+    }
+    let d = vec3<u32>(round(textureLoad(prev, vec2<i32>(frag.xy), 0).rgb * 255.0));
+    let s = vec3<u32>(px.xyz);
+    let out = vec3<u32>(blend255(d.x, s.x, a), blend255(d.y, s.y, a), blend255(d.z, s.z, a));
+    return vec4<f32>(vec3<f32>(out) / 255.0, 1.0);
 }
 
 // ---- convert ----------------------------------------------------------------

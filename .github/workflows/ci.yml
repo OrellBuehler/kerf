@@ -171,8 +171,8 @@ jobs:
             ffmpeg: pinned
             triple: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
-    # A green run takes 1-5 minutes; anything near this is a hang, not a slow test.
-    timeout-minutes: 15
+    # A green run takes 7-15 minutes (macOS Intel is the slowest); anything near this is a hang.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

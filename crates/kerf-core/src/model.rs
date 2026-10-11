@@ -207,6 +207,24 @@ pub enum PixLayout {
     Rgb,
 }
 
+/// Whether `name` is a YCbCr or gray format deeper than 8 bits per component (`yuv420p10le`,
+/// `yuv444p12`, `p010le`, `gray10le`, ...). RGB formats have no range to be unsure of and are
+/// not counted.
+pub fn pix_fmt_is_high_bit(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let t = n.strip_suffix("le").or_else(|| n.strip_suffix("be")).unwrap_or(&n);
+    if matches!(
+        t,
+        "p010" | "p012" | "p016" | "p210" | "p212" | "p216" | "p410" | "p412" | "p416"
+    ) {
+        return true;
+    }
+    let digits = t.chars().rev().take_while(char::is_ascii_digit).count();
+    let (stem, tail) = t.split_at(t.len() - digits);
+    matches!(tail.parse::<u32>(), Ok(9 | 10 | 12 | 14 | 16))
+        && (stem == "gray" || (stem.starts_with("yuv") && stem.ends_with('p')))
+}
+
 /// The layout of a **known-opaque** pixel format, from an allow-list; `None` for
 /// anything else — alpha-carrying, palettised, or simply not on the list. A
 /// renderer that cannot draw alpha should refuse what is not here rather than
