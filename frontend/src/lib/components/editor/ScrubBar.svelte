@@ -12,6 +12,7 @@
 	import { beginDrag } from '$lib/drag';
 	import { windowOf } from '$lib/realm';
 	import { formatTimecode } from '$lib/timecode';
+	import { secondFrames, seekTime, stepFrames } from '$lib/frames';
 	import { chipLeft, frameLimited, markerTicks, scrubFraction, scrubRange, scrubTime } from '$lib/scrub';
 
 	let { duration, empty }: { duration: number; empty: boolean } = $props();
@@ -27,7 +28,10 @@
 	let hoverX = $state<number | null>(null);
 	let barW = $state(0);
 	const CHIP_W = 84;
-	const hoverTime = $derived(hoverX === null || empty ? null : scrubTime(hoverX, 0, barW, duration));
+	/** The frame a click here would land on (`ui.seek` rounds to one), so the chip says what happens. */
+	const hoverTime = $derived(
+		hoverX === null || empty ? null : seekTime(scrubTime(hoverX, 0, barW, duration), editor.fps, editor.duration)
+	);
 
 	function onHover(e: PointerEvent) {
 		if (empty) return;
@@ -89,15 +93,16 @@
 			e.preventDefault();
 			return;
 		}
-		const step = e.shiftKey ? 1 : 1 / editor.fps;
+		const frames = e.shiftKey ? secondFrames(editor.fps) : 1;
+		const step = (n: number) => ui.seek(stepFrames(ui.time, n, editor.fps, editor.duration));
 		switch (e.key) {
 			case 'ArrowLeft':
 			case 'ArrowDown':
-				ui.seek(ui.time - step);
+				step(-frames);
 				break;
 			case 'ArrowRight':
 			case 'ArrowUp':
-				ui.seek(ui.time + step);
+				step(frames);
 				break;
 			case 'Home':
 				ui.seek(0);

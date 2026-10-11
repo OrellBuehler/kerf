@@ -323,7 +323,11 @@ const ADDED: Record<string, string> = {
 	u: 'tool.slide',
 	q: 'edit.trimStart',
 	w: 'edit.trimEnd',
-	s: 'tool.snap'
+	s: 'tool.snap',
+	// The previous / next change of a proposal on the timeline. Page Up / Down, not the arrows: a focused
+	// button (the Preview button just clicked) keeps the arrows, and these types on every layout.
+	PageUp: 'review.prevChange',
+	PageDown: 'review.nextChange'
 };
 
 /** The chords with a modifier that were given an action after the registry existed (linked
@@ -339,7 +343,7 @@ function expectedAction(e: KeyEventLike): string | null {
 	const k = e.key.toLowerCase();
 	const mod = e.metaKey || e.ctrlKey;
 	if (!e.altKey) {
-		const added = mod && e.shiftKey ? ADDED_MOD_SHIFT[k] : mod ? ADDED_MOD[k] : e.shiftKey ? ADDED_SHIFT[k] : ADDED[k];
+		const added = mod && e.shiftKey ? ADDED_MOD_SHIFT[k] : mod ? ADDED_MOD[k] : e.shiftKey ? ADDED_SHIFT[k] : (ADDED[e.key] ?? ADDED[k]);
 		if (added) return added;
 	}
 	return legacyAction(e);

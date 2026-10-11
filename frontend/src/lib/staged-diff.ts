@@ -103,13 +103,16 @@ export function changePoints(entries: readonly DiffEntry[]): number[] {
 	return [...new Set(at)].sort((a, b) => a - b);
 }
 
-/** The change after (`dir` 1) or before (-1) `time`, or null when there is none that way: where the
- *  playhead will stand on it (`stepPoint`), which is what a step from it must be measured against. */
-export const stepChange = stepPoint;
+/** The change after (`dir` 1) or before (-1) `time`, or null when there is none that way. A change is
+ *  the start of something, so the playhead goes to the first frame at or after it (`up`) and a step
+ *  from there is measured against that. */
+export function stepChange(points: readonly number[], time: number, dir: 1 | -1, fps: number, duration: number): number | null {
+	return stepPoint(points, time, dir, fps, duration, 'up');
+}
 
 /** Which change the playhead is at or has just passed, 1-based, for "2 of 4"; 0 before the first. */
 export function changeIndex(points: readonly number[], time: number, fps: number, duration: number): number {
 	let n = 0;
-	for (const p of points) if (seekTime(p, fps, duration) <= time + 1e-4) n++;
+	for (const p of points) if (seekTime(p, fps, duration, { snap: 'up' }) <= time + 1e-4) n++;
 	return n;
 }

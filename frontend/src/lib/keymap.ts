@@ -508,16 +508,16 @@ const ACTION_LIST = [
 		label: 'Previous proposed change',
 		group: 'markers',
 		context: 'global',
-		defaults: ['['],
-		hint: 'While an agent’s proposed cut is on the timeline: moves the playhead to the change before it.'
+		defaults: ['PageUp', '['],
+		hint: 'While an agent’s proposed cut is on the timeline: moves the playhead to the change before it. Page Up works on every keyboard layout; [ needs one that types it without AltGr or Option.'
 	},
 	{
 		id: 'review.nextChange',
 		label: 'Next proposed change',
 		group: 'markers',
 		context: 'global',
-		defaults: [']'],
-		hint: 'While an agent’s proposed cut is on the timeline: moves the playhead to the change after it.'
+		defaults: ['PageDown', ']'],
+		hint: 'While an agent’s proposed cut is on the timeline: moves the playhead to the change after it. Page Down works on every keyboard layout; ] needs one that types it without AltGr or Option.'
 	},
 	{ id: 'range.markIn', label: 'Set in point', group: 'markers', context: 'global', defaults: ['I'] },
 	{ id: 'range.markOut', label: 'Set out point', group: 'markers', context: 'global', defaults: ['O'] },

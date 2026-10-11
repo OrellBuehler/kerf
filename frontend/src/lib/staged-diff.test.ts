@@ -150,10 +150,18 @@ describe('walking the changes', () => {
 			seen.push(next);
 			at = next;
 		}
+		// the start of a change is its first frame: 5.1234 s is inside frame 154 (5.1333 s), not before it
 		expect(seen).toEqual([frameTime(154, 30), 9]);
 		// and back again
 		expect(stepChange(odd, 9, -1, fps, dur)).toBe(frameTime(154, 30));
 		expect(stepChange(odd, frameTime(154, 30), -1, fps, dur)).toBe(2);
+	});
+
+	test('a change begins on its first frame: the playhead is never put before it', () => {
+		// 5.1067 s is frame 153.2: rounding would stand on 153 (5.1 s), where the new clip is not yet there
+		expect(stepChange([5.1067], 0, 1, fps, dur)).toBe(frameTime(154, 30));
+		expect(changeIndex([5.1067], frameTime(153, 30), fps, dur)).toBe(0);
+		expect(changeIndex([5.1067], frameTime(154, 30), fps, dur)).toBe(1);
 	});
 
 	test('which change the playhead is at, for "3 of 7"', () => {

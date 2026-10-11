@@ -61,7 +61,7 @@ export function pickTitle(o: TextOverlay) {
 		return;
 	}
 	editor.selectOverlay(o.id);
-	if (ui.time < o.start || ui.time > o.end) ui.seek(o.start);
+	if (ui.time < o.start || ui.time > o.end) ui.seek(o.start, { snap: 'up', end: o.end });
 }
 
 /** Captions are placed in timeline time, so they follow the cut — which also

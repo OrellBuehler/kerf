@@ -32,7 +32,7 @@ import type { ExportDraft } from './export-draft';
 import type { VoiceoverPrefill } from './voiceover';
 import type { TrimMonitor, TrimTool } from './trim-tools';
 import { ZOOM_DEFAULT, stepZoom } from './zoom';
-import { seekTime, stepPoint } from './frames';
+import { seekTime, stepPoint, type SeekOptions } from './frames';
 import {
 	heightOf,
 	heightPx,
@@ -489,9 +489,11 @@ class EditorUi {
 	/** Move the playhead to the frame `t` falls on, clamped to the timeline so it can't park past
 	 *  the end or before zero. A scrub or a click lands on a frame of the cut, so a step from it is
 	 *  a whole frame and the timecode, the picture and the playhead agree; the end of the cut itself
-	 *  is kept as it is. Re-anchors audio when it lands mid-playback. */
-	seek(t: number) {
-		this.time = seekTime(t, editor.fps, editor.duration);
+	 *  is kept as it is. Pass `{ snap: 'up' }` to go to the *start* of something (a title, a changed clip,
+	 *  a transcript line): the first frame at or after it, so the playhead is inside it, not before it.
+	 *  Re-anchors audio when it lands mid-playback. */
+	seek(t: number, o?: SeekOptions) {
+		this.time = seekTime(t, editor.fps, editor.duration, o);
 		this.seekEpoch++;
 		if (this.playing) this.#startAudio();
 	}

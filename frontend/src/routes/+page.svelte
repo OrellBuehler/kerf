@@ -52,7 +52,7 @@
 	import { afterPaint, fontsReady, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
 	import { changeIndex, changePoints, stepChange } from '$lib/staged-diff';
-	import { clampPlayhead } from '$lib/frames';
+	import { clampPlayhead, secondFrames, stepFrames } from '$lib/frames';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
@@ -395,9 +395,9 @@
 		else ui.seek(at);
 	}
 
-	/** Step by one timeline frame; Shift seeks a whole second. */
-	function frameStep(coarse: boolean): number {
-		return coarse ? 1 : 1 / editor.fps;
+	/** Step by frames of the cut from the frame being shown (a paused playhead can be mid-frame). */
+	function step(frames: number) {
+		ui.seek(stepFrames(ui.time, frames, editor.fps, editor.duration));
 	}
 
 	// Suppress the native browser context menu app-wide so views can supply their
@@ -512,10 +512,10 @@
 		'playback.shuttleBack': () => ui.shuttle(-1),
 		'playback.pause': () => ui.pause(),
 		'playback.shuttleForward': () => ui.shuttle(1),
-		'playback.stepBack': () => ui.seek(ui.time - frameStep(false)),
-		'playback.stepForward': () => ui.seek(ui.time + frameStep(false)),
-		'playback.jumpBack': () => ui.seek(ui.time - frameStep(true)),
-		'playback.jumpForward': () => ui.seek(ui.time + frameStep(true)),
+		'playback.stepBack': () => step(-1),
+		'playback.stepForward': () => step(1),
+		'playback.jumpBack': () => step(-secondFrames(editor.fps)),
+		'playback.jumpForward': () => step(secondFrames(editor.fps)),
 		'playback.toStart': () => ui.seek(0),
 		'playback.toEnd': () => ui.seek(editor.duration),
 
@@ -634,8 +634,11 @@
 						style="display:grid;place-items:center;width:22px;height:22px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);cursor:pointer"
 						><Icon n="chevron-left" s={12} /></button
 					>
-					<span style="font-family:var(--font-mono);min-width:7ch;text-align:center" aria-live="polite"
-						>{editor.staged.diff.entries.length} change{editor.staged.diff.entries.length === 1 ? '' : 's'}{reviewPoints.length > 0 ? ` · ${changeIndex(reviewPoints, ui.time, editor.fps, editor.duration)}/${reviewPoints.length}` : ''}</span
+					<span
+						style="font-family:var(--font-mono);min-width:8ch;text-align:center"
+						aria-live="polite"
+						title="The proposal changes the cut at {reviewPoints.length} place{reviewPoints.length === 1 ? '' : 's'}; {editor.staged.diff.entries.length} change{editor.staged.diff.entries.length === 1 ? '' : 's'} in all"
+						>{reviewPoints.length > 0 ? `place ${changeIndex(reviewPoints, ui.time, editor.fps, editor.duration)}/${reviewPoints.length}` : 'no places'}</span
 					>
 					<button
 						title={settings.withShortcut('Next change', 'review.nextChange')}
@@ -644,6 +647,9 @@
 						onclick={() => void stepReview(1)}
 						style="display:grid;place-items:center;width:22px;height:22px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);cursor:pointer"
 						><Icon n="chevron-right" s={12} /></button
+					>
+					<span style="margin-left:4px;font-family:var(--font-mono)"
+						>· {editor.staged.diff.entries.length} change{editor.staged.diff.entries.length === 1 ? '' : 's'}</span
 					>
 				</span>
 				<span data-review-legend style="display:inline-flex;align-items:center;gap:10px;margin-left:8px;font-size:11px;color:var(--text-secondary)">

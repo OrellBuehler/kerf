@@ -21,6 +21,11 @@ describe('the timeline draws one track order', () => {
 		expect(src.match(/\{#each editor\.timeline\.tracks as /g)).toBeNull();
 		expect(src).toContain('const drawn = $derived(displayTracks(editor.timeline.tracks));');
 	});
+
+	test('a group move is planned over the lanes as drawn, so "up" is the same way for every kind', () => {
+		expect(src).not.toMatch(/planMove\(moveTracks\(/);
+		expect(src.match(/planMove\(drawnMoveTracks\(/g)).toHaveLength(3);
+	});
 });
 
 describe('a click selects and leaves the playhead where it was parked', () => {

@@ -89,7 +89,7 @@
 	import { mediaStatus } from '$lib/media-status.svelte';
 	import { linkedTrimBounds, linkedTrimPreview } from '$lib/linked-trim';
 	import { marqueeHits, normalizeRect, type LaneBox, type SpanClip } from '$lib/marquee';
-	import { moveTracks, planMove, type Ghost, type MovePlan } from '$lib/multi-move';
+	import { drawnMoveTracks, planMove, type Ghost, type MovePlan } from '$lib/multi-move';
 	import { frameTicksIn, minorTicksIn, rulerGrid, showsFrameTicks, tickLabel, ticksIn } from '$lib/ruler';
 	import { formatTimecode } from '$lib/timecode';
 	import { MIN_CLIP, trimBounds, type TrimBounds } from '$lib/ripple-trim';
@@ -385,9 +385,9 @@
 	 *  same Δt on their own tracks and drawn as ghosts; Alt: they stay where they are). */
 	const dragPlan = $derived.by((): MovePlan | null => {
 		const d = drag;
-		if (d?.moved) return planMove(moveTracks(editor.timeline), d.members, d.clipId, d.start, d.trackId, { links: !alt });
+		if (d?.moved) return planMove(drawnMoveTracks(editor.timeline), d.members, d.clipId, d.start, d.trackId, { links: !alt });
 		const n = nudge;
-		if (n && nudgeAt !== null) return planMove(moveTracks(editor.timeline), n.members, n.clipId, nudgeAt, n.trackId, { links: !n.alone });
+		if (n && nudgeAt !== null) return planMove(drawnMoveTracks(editor.timeline), n.members, n.clipId, nudgeAt, n.trackId, { links: !n.alone });
 		return null;
 	});
 	/** A run of arrow-key nudges on a focused clip: drawn where the clip will land, as a drag is, and
@@ -800,6 +800,12 @@
 	/** Clear every drag/scrub state WITHOUT committing anything — the pointer
 	 *  is gone and whatever position it last reported is not trustworthy. */
 	function resetDragState() {
+		// A scrub and a mark drag change the view and the marks as they go; given up, they go back.
+		if (scrubbing && scrubFrom !== null) ui.seek(scrubFrom);
+		if (markDrag) {
+			ui.markIn = markFrom.in;
+			ui.markOut = markFrom.out;
+		}
 		drag = null;
 		abandonNudge();
 		trimDrag = null;
@@ -840,6 +846,9 @@
 	/** The pointer's last client position, and where the press that began the gesture was. */
 	let pointer = { x: 0, y: 0 };
 	let press = { x: 0, y: 0 };
+	/** The buttons the last real pointer event held: a re-read after a scroll says the same, so a release
+	 *  that was missed is still the net it always was (`onPointerMove`). */
+	let heldButtons = 1;
 
 	const gestureLive = $derived.by(
 		() => !!(drag?.moved || trimDrag?.moved || tg?.moved || titleDrag?.moved || marquee?.moved || scrubbing || markDrag || markerDrag)
@@ -871,7 +880,7 @@
 
 	/** The gestures read the pointer again once the view has moved under it. */
 	function rereadPointer() {
-		const e: PointerLike = { clientX: pointer.x, clientY: pointer.y, altKey: alt, buttons: 1 };
+		const e: PointerLike = { clientX: pointer.x, clientY: pointer.y, altKey: alt, buttons: heldButtons };
 		onPointerMove(e);
 		if (tg) onTrimToolMove(e);
 	}
@@ -1101,6 +1110,7 @@
 	function onPointerMove(e: PointerLike) {
 		alt = e.altKey;
 		pointer = { x: e.clientX, y: e.clientY };
+		heldButtons = e.buttons;
 		// The primary button is up but we never saw pointerup for it — treat
 		// exactly like a cancel rather than trust a move that outran its release.
 		if ((drag || trimDrag || titleDrag || marquee || scrubbing || markDrag || markerDrag) && (e.buttons & 1) === 0) {
@@ -1202,7 +1212,7 @@
 			return;
 		}
 		// Asked again, as the ghosts were: the cut, the pointer's last place and Alt are what count now.
-		const plan = planMove(moveTracks(editor.timeline), d.members, d.clipId, d.start, d.trackId, { links: !alt });
+		const plan = planMove(drawnMoveTracks(editor.timeline), d.members, d.clipId, d.start, d.trackId, { links: !alt });
 		// A refused drop — an overlap, before 0, a locked or missing lane, a partner that does not
 		// fit — was red all the way; letting go changes nothing. A drop that moves nothing too.
 		if (!plan.ok || plan.noop) return;
@@ -2153,7 +2163,7 @@
 		e.stopPropagation();
 		editor.selectOverlay(o.id);
 		contextMenu.show(e, [
-			{ label: 'Go to start', icon: 'skip-back', action: () => ui.seek(o.start) },
+			{ label: 'Go to start', icon: 'skip-back', action: () => ui.seek(o.start, { snap: 'up', end: o.end }) },
 			{ type: 'separator' },
 			{
 				label: o.generated ? 'Remove caption' : 'Remove title',
@@ -2197,6 +2207,9 @@
 
 	let scrubbing = $state(false);
 	let markDrag = $state<'in' | 'out' | null>(null);
+	/** Where the playhead and the marks were when a scrub or a mark drag began: what giving it up restores. */
+	let scrubFrom: number | null = null;
+	let markFrom: { in: number | null; out: number | null } = { in: null, out: null };
 
 	const rulerTime = (clientX: number) =>
 		Math.max(0, (clientX - (rulerEl?.getBoundingClientRect().left ?? 0)) / pxPerSec);
@@ -2204,6 +2217,7 @@
 	function onRulerPointerDown(e: PointerEvent) {
 		if (e.button !== 0) return;
 		scrubbing = true;
+		scrubFrom = ui.time;
 		capturePointer(e);
 		ui.seek(rulerTime(e.clientX));
 	}
@@ -2212,6 +2226,7 @@
 		if (e.button !== 0) return;
 		e.stopPropagation();
 		markDrag = which;
+		markFrom = { in: ui.markIn, out: ui.markOut };
 		capturePointer(e);
 	}
 
@@ -2343,6 +2358,7 @@
 		pointerdowncapture: (e: PointerEvent) => {
 			press = { x: e.clientX, y: e.clientY };
 			pointer = press;
+			heldButtons = e.buttons;
 		},
 		pointermove: onPointerMove,
 		pointerup: onPointerUp,
@@ -2354,18 +2370,24 @@
 		},
 		keydowncapture: (e: KeyboardEvent) => {
 			if (e.key === 'Alt') alt = true;
-			// Escape gives a clip, edge, title or marquee drag up without writing
-			// anything — and that is all it does: the page's Escape (clear the
-			// selection) must not also fire.
-			if (e.key === 'Escape' && (drag || trimDrag || titleDrag || marquee || nudge)) {
+			// Escape gives a clip, edge, title, marquee, scrub or mark drag up without writing
+			// anything (a scrub puts the playhead back, a mark drag the marks) — and that is all it
+			// does: the page's Escape (clear the selection) must not also fire.
+			if (e.key === 'Escape' && (drag || trimDrag || titleDrag || marquee || nudge || scrubbing || markDrag || markerDrag)) {
 				resetDragState();
 				e.stopPropagation();
 			}
-			// Undo while a nudge is unwritten takes the nudge back, not the edit before it.
-			if (nudge && !nudge.writing && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
-				abandonNudge();
-				e.preventDefault();
-				e.stopPropagation();
+			// A history key while a nudge is unwritten drops the run: undo takes the nudge back (and
+			// not the edit before it), redo drops it and goes on.
+			if (nudge && !nudge.writing) {
+				const act = settings.actionFor(e);
+				if (act === 'edit.undo') {
+					abandonNudge();
+					e.preventDefault();
+					e.stopPropagation();
+				} else if (act === 'edit.redo') {
+					abandonNudge();
+				}
 			}
 		}
 	})}
@@ -3447,17 +3469,24 @@
 		z-index: 4;
 	}
 
-	/* A staged proposal on the timeline: what it adds is outlined solid in the add colour, what it
-	   changes dashed in the shift colour, so the two read apart without the hue. */
-	.kclip[data-diff='added'],
-	.ktitle[data-diff='added'] {
-		outline: 2px solid var(--diff-add);
-		outline-offset: 1px;
+	/* A staged proposal on the timeline: what it adds is framed solid in the add colour, what it changes
+	   dashed in the shift colour, so the two read apart without the hue. The frame is drawn just inside
+	   the clip (a pseudo-element, not the outline), so the partner highlight and the focus ring above
+	   still show on a marked clip. */
+	.kclip[data-diff]::after,
+	.ktitle[data-diff]::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		z-index: 3;
+		box-sizing: border-box;
+		border: 2px solid var(--diff-add);
+		border-radius: inherit;
+		pointer-events: none;
 	}
-	.kclip[data-diff='shifted'],
-	.ktitle[data-diff='shifted'] {
-		outline: 2px dashed var(--diff-shift);
-		outline-offset: 1px;
+	.kclip[data-diff='shifted']::after,
+	.ktitle[data-diff='shifted']::after {
+		border: 2px dashed var(--diff-shift);
 	}
 
 	.kname {
