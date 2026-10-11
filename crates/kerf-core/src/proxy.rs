@@ -125,6 +125,7 @@ pub fn set_proxy_size(size: ProxySize) {
     if size != ProxySize::Off {
         engine::set_proxy_base_width(size.px());
     }
+    crate::plan_epoch::bump_plan_epoch();
 }
 
 /// Whether moving the proxy size from `before` to `after` abandons what is queued or building
@@ -153,6 +154,7 @@ pub fn set_preview_source_setting(source: PreviewSource) {
     if source == PreviewSource::Original {
         cancel_all();
     }
+    crate::plan_epoch::bump_plan_epoch();
 }
 
 /// The source mode in force: with proxies off there is nothing but the original.

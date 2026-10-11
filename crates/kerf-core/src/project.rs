@@ -311,6 +311,14 @@ impl Project {
     }
 
     fn init(&self) -> Result<()> {
+        // Every row written through this connection moves the plan epoch (but for the background
+        // tables), so a caller holding the inputs of a frame can tell they are stale without the lock.
+        self.conn.update_hook(Some(|_action, _db: &str, table: &str, _row| {
+            if crate::plan_epoch::table_moves_plan(table) {
+                crate::plan_epoch::bump_plan_epoch();
+            }
+        }))?;
+        crate::plan_epoch::bump_plan_epoch();
         self.conn.execute_batch(SCHEMA)?;
 
         // `CREATE TABLE IF NOT EXISTS` leaves an existing table's columns alone,

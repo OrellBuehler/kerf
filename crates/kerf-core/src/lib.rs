@@ -15,6 +15,7 @@ pub mod layer_geometry;
 pub mod media;
 pub mod model;
 pub mod plan_caps;
+pub mod plan_epoch;
 pub mod planner;
 pub mod platform;
 pub mod project;
@@ -71,6 +72,7 @@ pub use model::{
     MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_CHANNEL_VOLUME, MIN_EDIT_CLIP,
 };
 pub use plan_caps::{EffectKinds, GpuCaps, LayerRef, Unsupported};
+pub use plan_epoch::{bump_plan_epoch, plan_epoch};
 pub use planner::{Handover, PlanRequest, Planner, SpanPlan, SpanRun};
 pub use platform::{
     check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind, PlatformReport, PlatformTarget, Severity,
