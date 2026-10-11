@@ -248,7 +248,17 @@ a real file's probe makes of it), plus six threads at once. The rules it holds t
   within a tick of being asked again. A `Scrub` / `Forward` request gives up after
   `request_timeout` (5 s), `Exact` after the one-shot's 30 s; a run blocks once it is past what
   was asked (plus `Forward`'s read-ahead, 48 MiB of frames, at most 24), so the pipe fills and
-  ffmpeg idles; `release(source)`, `release_all()` and `Drop` kill every child. A run that closes
+  ffmpeg idles; `release(source)`, `release_all()` and `Drop` kill every child. **A request waiting
+  on a file that is released fails** (`GpuError::Decode`): a run the *router* stops sends its
+  request to route afresh, which for a released file started a new run of it right after `release`
+  returned (`spawned: 2`; a test reading `stats().runs` failed whenever that request won the lock).
+  `Shared::releases` counts the releases (an atomic, bumped under the state lock) and `frame()`
+  reads it **before anything else, the probes included** (an ffprobe before the first lock takes
+  seconds on a loaded machine, and a release then is one the request began before);
+  `State::released` (`Releases`) holds each file's count and time, and a request fails on a file whose
+  count is above the one it read; the reaper forgets a release after twice the longest deadline. A
+  request that read the count after the release is an ordinary one and starts a run (a closed source
+  notes nothing). A run that closes
   its stdout and does not exit is killed after `EXIT_GRACE` (5 s; `wait_until`, a `try_wait` loop
   that holds the child's lock only for a poll — the reader used to `wait()` under it, so every
   `kill` and, through `stop` under the state lock, every request waited too). **No process is
@@ -271,8 +281,10 @@ a real file's probe makes of it), plus six threads at once. The rules it holds t
   render uses.
 - `tests/frame_source_fake.rs` (unix, its own binary: it points `KERF_FFMPEG` at a wrapper)
   holds a run that hangs and one that dies to a prompt `GpuError::Decode`, a run that closes its
-  output and never exits (`release` must not wait on it) and a second run whose pictures differ
-  from the first's at the same pts (the file goes one-shot, no panic).
+  output and never exits (`release` must not wait on it, and the request that waited on it fails
+  rather than starts another run; the test polls for the wrapper's `closed.done` marker, as a loaded
+  machine takes seconds to get a run that far) and a second run whose pictures differ from the
+  first's at the same pts (the file goes one-shot, no panic).
   `bench_frame_source_decode_vs_one_shot` (`KERF_BENCH=1`) times both paths: here, release, software
   decode, 1x playback is 4.9 / 4.4 / 27 ms a frame at 720p / 1080p / 4K against 102 / 133 / 314
   one-shot, and a scrub (jumps of about a second) 23 / 65 / 217 against 101 / 139 / 314.
