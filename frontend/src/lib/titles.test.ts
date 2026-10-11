@@ -200,7 +200,7 @@ describe('the title handle is the ink of the text, as drawtext boxes it', () => 
 	test('the glyphs move from the line box centre to the ink centre', () => {
 		// Caps only: the ink centre (0.355 above the baseline) is where Geist's own content centre is.
 		expect(inkBox(overlay(), ink(0.71, 0)).shift).toBeCloseTo(0);
-		// A descender pulls the ink centre up, so the glyphs go up (negative) to be centred as the engine centres them.
+		// A descender moves the ink centre down towards the baseline, so the glyphs go up (negative) to be centred as the engine centres them.
 		expect(inkBox(overlay(), ink(0.71, 0.2)).shift).toBeCloseTo(0.255 - 0.355);
 		// Without the font's own metrics the line box is taken to be the ink.
 		expect(inkBox(overlay(), () => ({ ascent: 0.7, descent: 0.2 })).shift).toBeCloseTo(0);
@@ -258,5 +258,15 @@ describe('the title handle is the ink of the text, as drawtext boxes it', () => 
 		});
 		const none = { font: '', measureText: () => ({}) };
 		expect(inkFromContext(none as never, 'x', false, 'sans-serif')).toBeNull();
+	});
+});
+
+describe('the title box in the preview', () => {
+	test('is sized by its line height, so the box padding adds to the ink as boxborderw does', async () => {
+		const { readFileSync } = await import('node:fs');
+		const src = readFileSync(new URL('./components/editor/Preview.svelte', import.meta.url), 'utf8');
+		const style = src.slice(src.indexOf('\t\t\t\t\t\t\t\tdata-title-box\n'), src.indexOf('</span>', src.indexOf('\t\t\t\t\t\t\t\tdata-title-box\n')));
+		expect(style).toContain('line-height:{ink.height}');
+		expect(style).not.toMatch(/[;"]height:/);
 	});
 });

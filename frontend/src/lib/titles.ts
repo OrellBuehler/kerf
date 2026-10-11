@@ -61,7 +61,7 @@ export const measureInk: MeasureInk = (text, bold, family) => {
 	if (hit !== undefined) return hit;
 	const ink = inkFromContext(inkContext, text, bold, family);
 	// A face that has not loaded yet measures as its fallback: do not remember that.
-	if (document.fonts?.check(`${bold ? 700 : 400} ${MEASURE_PX}px ${family}`) !== false) {
+	if (document.fonts?.check(`${bold ? 700 : 400} ${MEASURE_PX}px ${family}`, text) !== false) {
 		if (inkCache.size >= 512) inkCache.clear();
 		inkCache.set(key, ink);
 	}

@@ -462,7 +462,8 @@ centred on `(pos_x, pos_y)`, font `size` of the height, browser text metrics
 standing in for drawtext's (the family the engine draws: the title's `font`, else — also when that one is
 not installed — the shipped Geist, `'Geist Variable'` here), `boxborderw` as padding. **The box is as tall as the
 string's ink**, as `drawtext`'s `text_h` is (`H` 0.71 of the font size in Geist, `x` 0.53, `Hxg` 0.87), not the
-font's line height (1.30): `inkBox` measures it with a canvas (`actualBoundingBoxAscent + Descent` at 100 px, cached,
+font's line height (1.30): the single line's `line-height` is the ink, with no explicit `height` (preflight's
+`border-box` would swallow the box padding), and `inkBox` measures it with a canvas (`actualBoundingBoxAscent + Descent` at 100 px, cached,
 not remembered while the face is still loading), `FALLBACK_INK` 0.9 where there is no canvas, and shifts the
 ghost's glyphs from the line box's centre to the ink's, as the engine centres the ink at `(pos_x, pos_y)`; the headless
 harness reads 0.71 / 0.54 / 0.88 for `H` / `x` / `Hxg`. It is aligned to within font-metric differences.
