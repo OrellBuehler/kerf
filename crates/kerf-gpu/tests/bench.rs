@@ -295,3 +295,85 @@ fn bench_frame_source_decode_vs_one_shot() {
     let _ = std::fs::create_dir_all(&out);
     let _ = std::fs::write(out.join("bench-frame-source.txt"), &report);
 }
+
+/// A captioned frame: the first sight of a caption (FFmpeg rasterises it: one process) against the same
+/// caption again (the atlas) and against no caption, and FFmpeg's own still of the captioned frame, at a
+/// 960 px preview and at the delivery size. Same gate as the still benchmark.
+#[test]
+#[ignore = "benchmark: set KERF_BENCH=1; needs ffmpeg and a GPU adapter"]
+fn bench_a_captioned_frame_cold_and_warm() {
+    if std::env::var_os("KERF_BENCH").is_none() {
+        eprintln!("skipped: set KERF_BENCH=1 to run the benchmark");
+        return;
+    }
+    let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter");
+    let info = gpu.adapter_info().clone();
+    let comp = Compositor::new(gpu).expect("compositor");
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let scratch = dir.join(format!("bench-text-{}.jpg", std::process::id()));
+    let asset = source(dir, 1920, 1080);
+    let assets = std::slice::from_ref(&asset);
+    let opts = ExportOptions::default();
+    let policy = kerf_core::composite_color_policy();
+    let captioned = |text: &str| {
+        let mut tl = timeline(&asset, 1);
+        let mut o = kerf_core::TextOverlay::new(text, 0.0, 1.0);
+        o.bg = Some("black@0.5".into());
+        o.size = 0.05;
+        o.pos_y = 0.88;
+        tl.overlays.push(o);
+        tl
+    };
+    let mut report = format!(
+        "adapter: {} ({:?}, {:?}); ffmpeg: {}\n{:<14} {:>12} {:>16} {:>16} {:>14} {:>16}\n",
+        info.name,
+        info.backend,
+        info.device_type,
+        kerf_core::ffmpeg_path(),
+        "render",
+        "ffmpeg ms",
+        "gpu, no text ms",
+        "gpu, new caption",
+        "gpu, again ms",
+        "text cost, cold"
+    );
+    for (name, width) in [("960 px", 960u32), ("1920 px", u32::MAX)] {
+        let plain = RenderPlan::at(&timeline(&asset, 1), assets, &opts, 0.5, policy).expect("plan");
+        let size = plain.size(width);
+        let mut bare = Vec::new();
+        let (mut cold, mut warm, mut ff) = (Vec::new(), Vec::new(), Vec::new());
+        for run in 0..6 {
+            let tl = captioned(&format!("a caption number {run} for this frame"));
+            let plan = RenderPlan::at(&tl, assets, &opts, 0.5, policy).expect("plan");
+            assert!(plan.reasons(&Compositor::CAPS, size).is_empty());
+            let t0 = Instant::now();
+            export_still(&tl, assets, &opts, 0.5, &scratch, ImageFormat::Jpeg, 4).expect("ffmpeg still");
+            let ffmpeg_time = t0.elapsed();
+            let (_, without) = comp.render_plan(&plain, size).expect("render without text");
+            let (_, first) = comp.render_plan(&plan, size).expect("render with a new caption");
+            let (_, again) = comp.render_plan(&plan, size).expect("render with it again");
+            if run > 0 {
+                bare.push(without.composite);
+                cold.push(first.composite);
+                warm.push(again.composite);
+                ff.push(ffmpeg_time);
+            }
+        }
+        let (bare, cold, warm, ff) = (median(bare), median(cold), median(warm), median(ff));
+        let line = format!(
+            "{:<14} {:>12.0} {:>16.0} {:>16.0} {:>14.0} {:>16.0}\n",
+            name,
+            ms(ff),
+            ms(bare),
+            ms(cold),
+            ms(warm),
+            ms(cold.saturating_sub(bare))
+        );
+        eprint!("{line}");
+        report.push_str(&line);
+    }
+    let _ = std::fs::remove_file(&scratch);
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).parent().unwrap().join("parity");
+    let _ = std::fs::create_dir_all(&out);
+    let _ = std::fs::write(out.join("bench-text.txt"), &report);
+}

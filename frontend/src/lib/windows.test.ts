@@ -370,6 +370,7 @@ describe('which window an element is in', () => {
 
 	test('is the editor window for no element, or one in no document', () => {
 		const fallback = (globalThis as unknown as { window?: Window }).window;
+		const fallbackDocument = (globalThis as unknown as { document?: Document }).document;
 		const main = { name: 'main' } as unknown as Window;
 		(globalThis as unknown as { window: Window; document: Document }).window = main;
 		(globalThis as unknown as { document: Document }).document = { defaultView: main } as unknown as Document;
@@ -381,6 +382,7 @@ describe('which window an element is in', () => {
 			expect(windowOf({ nodeType: 1, ownerDocument: { defaultView: null } as unknown as Document })).toBe(main);
 		} finally {
 			(globalThis as unknown as { window?: Window }).window = fallback;
+			(globalThis as unknown as { document?: Document }).document = fallbackDocument;
 		}
 	});
 

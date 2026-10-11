@@ -1896,7 +1896,7 @@ pub struct TextOverlay {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bg: Option<String>,
     /// Optional system font family name (see `fonts::list_system_fonts`);
-    /// `None` = FFmpeg's `drawtext` default.
+    /// `None` (or a family that is not installed) = the font Kerf ships (`fonts::DEFAULT_FAMILY`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font: Option<String>,
     #[serde(default)]
@@ -2169,9 +2169,11 @@ impl CaptionOptions {
 }
 
 /// Roughly how wide one character is as a fraction of the font size, measured
-/// off `drawtext`'s default face. Real caption text runs 0.44–0.75 depending on
-/// the word; 0.6 sits above the 0.52–0.55 that *long* text averages, and long
-/// text is the only kind that ever reaches the cap.
+/// off `drawtext`'s default face (first DejaVu Sans, now the shipped Geist, which
+/// is narrower: 0.44–0.5 for a sentence in the regular face and 0.47–0.53 in the
+/// bold, against DejaVu's 0.49–0.52 and 0.56–0.6). Real caption text runs
+/// 0.44–0.75 depending on the word; 0.6 sits above the 0.52–0.55 that *long* text
+/// averages, and long text is the only kind that ever reaches the cap.
 const CHAR_ADVANCE: f64 = 0.6;
 
 /// How much of the frame width a caption may take.
