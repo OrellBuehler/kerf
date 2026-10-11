@@ -294,6 +294,23 @@ pub struct Presenter {
     config: wgpu::SurfaceConfiguration,
     blit: Blit,
     size: (u32, u32),
+    /// What the surface can present with, read when it was configured.
+    present_modes: Vec<wgpu::PresentMode>,
+}
+
+/// The present mode to ask the surface for. `skip_vsync` (a drag: frames follow each other as
+/// fast as they are drawn, and a frame waits for no refresh) is `AutoNoVsync` where the surface has
+/// `Immediate` or `Mailbox`, and `None` where it has neither: the caller keeps vsync, which is
+/// what that surface does anyway, and a reconfigure to the same thing is avoided. Vsync is
+/// `AutoVsync`, supported everywhere.
+pub fn present_mode_for(supported: &[wgpu::PresentMode], skip_vsync: bool) -> Option<wgpu::PresentMode> {
+    if !skip_vsync {
+        return Some(wgpu::PresentMode::AutoVsync);
+    }
+    supported
+        .iter()
+        .any(|m| matches!(m, wgpu::PresentMode::Immediate | wgpu::PresentMode::Mailbox))
+        .then_some(wgpu::PresentMode::AutoNoVsync)
 }
 
 impl Presenter {
@@ -338,6 +355,7 @@ impl Presenter {
             config,
             blit,
             size,
+            present_modes: caps.present_modes,
         };
         this.configure()?;
         tracing::info!(
@@ -345,9 +363,40 @@ impl Presenter {
             ?alpha_mode,
             width = size.0,
             height = size.1,
+            present_modes = ?this.present_modes,
             "kerf-gpu presenter ready"
         );
         Ok(this)
+    }
+
+    /// Whether the surface can present without waiting for a refresh (`Immediate` or `Mailbox`).
+    pub fn can_skip_vsync(&self) -> bool {
+        present_mode_for(&self.present_modes, true).is_some()
+    }
+
+    /// Whether frames are being presented without waiting for a refresh.
+    pub fn skipping_vsync(&self) -> bool {
+        self.config.present_mode == wgpu::PresentMode::AutoNoVsync
+    }
+
+    /// Present without waiting for a refresh (`on`) or with vsync, reconfiguring the surface only
+    /// when that changes something. A surface that cannot skip the refresh stays as it is. Returns
+    /// whether the surface was reconfigured; the previous contents of a reconfigured surface are not
+    /// guaranteed, so the caller presents again.
+    pub fn skip_vsync(&mut self, on: bool) -> Result<bool, GpuError> {
+        let Some(mode) = present_mode_for(&self.present_modes, on) else {
+            return Ok(false);
+        };
+        if mode == self.config.present_mode {
+            return Ok(false);
+        }
+        let before = std::mem::replace(&mut self.config.present_mode, mode);
+        if let Err(e) = self.configure() {
+            self.config.present_mode = before;
+            return Err(e);
+        }
+        tracing::debug!(?mode, "kerf-gpu presenter changed its present mode");
+        Ok(true)
     }
 
     fn configure(&self) -> Result<(), GpuError> {
@@ -432,6 +481,21 @@ mod tests {
     use super::*;
     use crate::compositor::RenderedFrame;
     use crate::gpu::GpuOptions;
+
+    #[test]
+    fn skipping_vsync_is_asked_for_only_where_the_surface_can_and_vsync_everywhere() {
+        use wgpu::PresentMode::{AutoNoVsync, AutoVsync, Fifo, FifoRelaxed, Immediate, Mailbox};
+        assert_eq!(present_mode_for(&[Fifo], false), Some(AutoVsync));
+        assert_eq!(present_mode_for(&[], false), Some(AutoVsync));
+        assert_eq!(present_mode_for(&[Fifo, FifoRelaxed, Immediate], true), Some(AutoNoVsync));
+        assert_eq!(present_mode_for(&[Fifo, Mailbox], true), Some(AutoNoVsync));
+        assert_eq!(
+            present_mode_for(&[Fifo], true),
+            None,
+            "a surface with only Fifo has no mode to skip to"
+        );
+        assert_eq!(present_mode_for(&[Fifo, FifoRelaxed], true), None);
+    }
 
     #[test]
     fn a_rectangle_is_clamped_into_the_target_and_vanishes_outside_it() {
