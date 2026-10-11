@@ -6,7 +6,14 @@
 //!   the Preview asked for on every step;
 //! * **first frame**: a cold miss on `ScrubFrames` (a window is started for it);
 //! * **marginal frame**: the next frames of a scrub, asked for at the 60 Hz a dragged playhead moves
-//!   at, and again back to back once drawn (a pure hit).
+//!   at, and again back to back once drawn (a pure hit);
+//! * **backward drag**: twenty steps back at 60 Hz, which a window that draws the frames behind the
+//!   playhead first would have made wait on its lead;
+//! * **jumps**: twelve seeks far apart on one `ScrubFrames` (a click on the ruler), each judged
+//!   against the one-shot still of the same frame.
+//!
+//! A 1080p long-GOP original (`-g 250`, B-frames: what a camera file is) is measured beside the
+//! proxies: its frames cost a decode each, so the order the window draws them in shows.
 //!
 //! ```text
 //! KERF_BENCH_OUT=/path/to/dir cargo test -p kerf-core --no-default-features --release \
@@ -64,6 +71,27 @@ fn proxy(dir: &Path, hash: &str, pattern: &str) -> Asset {
     Project::probe_asset(&path).expect("probe")
 }
 
+/// A camera-like original: 1920x1080 30 fps long-GOP x264 outside any `kerf/proxies` folder.
+fn original(dir: &Path, name: &str) -> Asset {
+    let folder = dir.join("originals");
+    std::fs::create_dir_all(&folder).unwrap();
+    let path = folder.join(format!("{name}.mp4"));
+    if !path.exists() {
+        let made = Command::new(ffmpeg())
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc2=size=1920x1080:rate=30:duration=20")
+            .args([
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-g", "250", "-bf", "2", "-pix_fmt", "yuv420p",
+            ])
+            .arg(&path)
+            .stdin(Stdio::null())
+            .status()
+            .expect("run ffmpeg");
+        assert!(made.success());
+    }
+    Project::probe_asset(&path).expect("probe")
+}
+
 fn timeline(tracks: Vec<Vec<Clip>>) -> Timeline {
     Timeline {
         tracks: tracks
@@ -101,7 +129,14 @@ fn cases(dir: &Path) -> Vec<Case> {
     pip2.transform.pos_x = -0.3;
     pip2.transform.pos_y = 0.3;
     let three = timeline(vec![vec![Clip::new(a.id, 0.0, 18.0, 0.0)], vec![pip1], vec![pip2]]);
+    let o = original(dir, "camera");
+    let camera = timeline(vec![vec![Clip::new(o.id, 0.0, 18.0, 0.0)]]);
     vec![
+        Case {
+            name: "1 layer original 1080p",
+            timeline: camera,
+            assets: vec![o],
+        },
         Case {
             name: "1 layer",
             timeline: one,
@@ -164,6 +199,9 @@ fn what_the_scrub_cache_buys() {
     let version = version();
     let mut report = Vec::new();
     for case in cases(&dir.0) {
+        if std::env::var("KERF_BENCH_ONLY").is_ok_and(|only| !case.name.contains(&only)) {
+            continue;
+        }
         let assets = &case.assets;
         // Warm the page cache and the process-wide probes once, off the clock.
         let _ = Project::composite_timeline_frame(&case.timeline, assets, 1.0, WIDTH, QUALITY).unwrap();
@@ -212,40 +250,102 @@ fn what_the_scrub_cache_buys() {
             paced_total.push(secs(started.elapsed()));
         }
 
-        // A pure hit: a window already drawn, every frame of it asked for back to back.
+        // A pure hit: a window already drawn, its first six frames asked for back to back.
         let mut hits = Vec::new();
         let scrub = ScrubFrames::new(ScrubConfig::default());
         let _ = scrub.frame(&case.timeline, assets, time_of(300), WIDTH, QUALITY).unwrap();
         let until = Instant::now() + Duration::from_secs(10);
-        while scrub.stats().drawn < 24 {
+        // Six frames are drawn in every case: a window over an original is that long to begin with.
+        while scrub.stats().drawn < 6 {
             assert!(Instant::now() < until, "the window never finished");
             std::thread::sleep(Duration::from_millis(5));
         }
         std::thread::sleep(Duration::from_millis(100));
         for _ in 0..20 {
-            for k in 298..322u64 {
+            for k in 300..306u64 {
                 let t0 = Instant::now();
                 let _ = scrub.frame(&case.timeline, assets, time_of(k), WIDTH, QUALITY).unwrap();
                 hits.push(secs(t0.elapsed()));
             }
         }
 
+        // Backward drag: twenty steps back at 60 Hz, from a cold start.
+        let mut back = Vec::new();
+        let mut back_total = Vec::new();
+        for run in 0..8u64 {
+            let scrub = ScrubFrames::new(ScrubConfig::default());
+            let k0 = 100 + run * 41;
+            let started = Instant::now();
+            for step in 0..20u64 {
+                let due = Duration::from_secs_f64(step as f64 / 60.0);
+                if let Some(wait) = due.checked_sub(started.elapsed()) {
+                    std::thread::sleep(wait);
+                }
+                let t0 = Instant::now();
+                let _ = scrub
+                    .frame(&case.timeline, assets, time_of(k0 + 19 - step), WIDTH, QUALITY)
+                    .unwrap();
+                back.push(secs(t0.elapsed()));
+            }
+            back_total.push(secs(started.elapsed()));
+        }
+
+        // One step back out of a drawn window: the frame 24 before the one asked for, which the
+        // window did not draw. What the first step of a backward drag costs.
+        let mut step_back = Vec::new();
+        for run in 0..10u64 {
+            let scrub = ScrubFrames::new(ScrubConfig::default());
+            let k0 = 200 + run * 17;
+            let _ = scrub.frame(&case.timeline, assets, time_of(k0), WIDTH, QUALITY).unwrap();
+            let until = Instant::now() + Duration::from_secs(10);
+            while scrub.stats().drawn < 6 {
+                assert!(Instant::now() < until, "the window never drew");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(400));
+            let t0 = Instant::now();
+            let _ = scrub.frame(&case.timeline, assets, time_of(k0 - 24), WIDTH, QUALITY).unwrap();
+            step_back.push(secs(t0.elapsed()));
+        }
+
+        // Jumps: one cache, twelve seeks far apart.
+        let mut jumps = Vec::new();
+        let scrub = ScrubFrames::new(ScrubConfig::default());
+        for k in [300u64, 60, 420, 150, 510, 90, 360, 30, 480, 210, 540, 120] {
+            let t0 = Instant::now();
+            let _ = scrub.frame(&case.timeline, assets, time_of(k), WIDTH, QUALITY).unwrap();
+            jumps.push(secs(t0.elapsed()));
+            std::thread::sleep(Duration::from_millis(250));
+        }
+
         let (before, first, paced, hit) = (stat(single), stat(first), stat(paced), stat(hits));
         let drag_before = before.median * 20.0;
         let drag_after = stat(paced_total).median;
+        let (back, jump, step) = (stat(back), stat(jumps), stat(step_back));
+        let back_before = before.median * 20.0;
+        let back_after = stat(back_total).median;
+        eprintln!(
+            "ffmpeg {version} | {:>8} | backward drag: step median {:>6.1} ms (p95 {:>6.1}), 20 steps {:>6.0} ms -> {:>6.0} ms | jumps: median {:>6.1} (p95 {:>6.1}) against {:>6.1} for the one-shot | one step back: median {:>6.1} (p95 {:>6.1})",
+            case.name, back.median, back.p95, back_before, back_after, jump.median, jump.p95, before.median, step.median, step.p95
+        );
         eprintln!(
             "ffmpeg {version} | {:>8} | per-frame spawn: median {:>6.1} ms (p95 {:>6.1}) | first frame: median {:>6.1} (p95 {:>6.1}) | marginal while dragging at 60 Hz: median {:>5.1} (p95 {:>5.1}) | pure hit: median {:>5.2} (p95 {:>5.2}) | 20-step drag: {:>6.0} ms -> {:>6.0} ms",
             case.name, before.median, before.p95, first.median, first.p95, paced.median, paced.p95, hit.median, hit.p95, drag_before, drag_after
         );
         report.push(format!(
-            "{{\"case\":\"{}\",\"per_frame_spawn\":{},\"first_frame\":{},\"marginal_dragging_60hz\":{},\"pure_hit\":{},\"drag_20_steps_before_ms\":{:.1},\"drag_20_steps_after_ms\":{:.1}}}",
+            "{{\"case\":\"{}\",\"per_frame_spawn\":{},\"first_frame\":{},\"marginal_dragging_60hz\":{},\"pure_hit\":{},\"drag_20_steps_before_ms\":{:.1},\"drag_20_steps_after_ms\":{:.1},\"backward_drag_step\":{},\"backward_drag_20_steps_before_ms\":{:.1},\"backward_drag_20_steps_after_ms\":{:.1},\"jumps\":{},\"one_step_back\":{}}}",
             case.name,
             json(before),
             json(first),
             json(paced),
             json(hit),
             drag_before,
-            drag_after
+            drag_after,
+            json(back),
+            back_before,
+            back_after,
+            json(jump),
+            json(step)
         ));
     }
     let body = format!(

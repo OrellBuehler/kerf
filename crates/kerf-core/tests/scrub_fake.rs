@@ -99,12 +99,22 @@ struct Rig {
 }
 
 impl Rig {
+    /// A preview proxy by its name: the frames of a window over it are cheap.
     fn new(name: &str) -> Self {
+        Self::at(name, "kerf/proxies/0123456789abcdef.mp4")
+    }
+
+    /// An original: every frame of a window over it costs a decode.
+    fn original(name: &str) -> Self {
+        Self::at(name, "clip.mp4")
+    }
+
+    fn at(name: &str, file: &str) -> Self {
         install();
-        let dir = root().join(name);
-        let _ = std::fs::remove_dir_all(&dir);
+        let path = root().join(name).join(file);
+        let dir = path.parent().unwrap().to_path_buf();
+        let _ = std::fs::remove_dir_all(root().join(name));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("clip.mp4");
         std::fs::write(&path, b"not a video").unwrap();
         let asset = Asset {
             id: uuid::Uuid::new_v4(),
@@ -257,6 +267,28 @@ fn a_miss_starts_one_window_and_the_next_frames_are_hits() {
 }
 
 #[test]
+fn a_window_over_an_original_starts_at_the_frame_so_that_frame_is_the_first_out() {
+    let rig = Rig::original("slow-first");
+    let tl = rig.cut(|_| {});
+    let s = scrub_reading_ahead(0);
+    let got = window_frame(&frame(&s, &tl, &rig, 100));
+    assert_eq!(got.1, 0, "no frame before it to decode: it is the first the process draws");
+    assert_eq!(rig.runs()[0].1, 24);
+}
+
+#[test]
+fn a_step_back_over_an_original_has_the_window_behind_it_like_over_a_proxy() {
+    // A drag back is one window behind the frame, not a window of its own at every step.
+    let rig = Rig::original("slow-back");
+    let tl = rig.cut(|_| {});
+    let s = scrub_reading_ahead(0);
+    let _ = frame(&s, &tl, &rig, 200);
+    wait_for("the first window", Duration::from_secs(5), || s.stats().drawn >= 24);
+    let got = window_frame(&frame(&s, &tl, &rig, 199));
+    assert_eq!((got.1, rig.runs()[1].1), (22, 24), "the 23rd of 24 frames, ending after it");
+}
+
+#[test]
 fn a_frame_asked_again_is_the_same_picture_and_starts_nothing() {
     let rig = Rig::new("again");
     let tl = rig.cut(|_| {});
@@ -385,6 +417,24 @@ fn stopping_kills_the_window_and_keeps_what_it_drew() {
 }
 
 #[test]
+fn a_request_waiting_when_playback_stops_is_a_one_shot_and_starts_no_window() {
+    let rig = Rig::new("stop-waiter");
+    rig.mode("slow");
+    let tl = rig.cut(|_| {});
+    let s = scrub();
+    let _ = frame(&s, &tl, &rig, 100);
+    std::thread::scope(|scope| {
+        // Eight frames ahead of what the slow window has drawn: waited for.
+        let waiter = scope.spawn(|| frame(&s, &tl, &rig, 108));
+        std::thread::sleep(Duration::from_millis(150));
+        s.stop();
+        let got = waiter.join().unwrap();
+        assert!(text(&got).starts_with("single-"), "{}", text(&got));
+    });
+    assert_eq!(rig.windows().len(), 1, "no window was started after the stop");
+}
+
+#[test]
 fn clearing_forgets_the_frames_too() {
     let rig = Rig::new("clear");
     let tl = rig.cut(|_| {});
@@ -418,6 +468,7 @@ fn a_window_that_draws_nothing_is_killed_and_the_frame_is_a_one_shot() {
     let got = text(&frame(&s, &tl, &rig, 100));
     assert!(got.starts_with("single-"), "{got}");
     assert!(started.elapsed() < Duration::from_secs(8), "after its timeouts, not for ever");
+    assert_eq!(rig.windows().len(), 1, "nor is one that stalled");
     for pid in rig.windows() {
         wait_for("a hung window to die", Duration::from_secs(5), || !alive(pid));
     }
@@ -433,6 +484,7 @@ fn a_window_that_dies_leaves_the_frame_to_a_one_shot() {
     let got = text(&frame(&s, &tl, &rig, 100));
     assert!(got.starts_with("single-"), "{got}");
     assert_eq!(s.stats().singles, 1);
+    assert_eq!(rig.windows().len(), 1, "a window that died is not started a second time");
     // And it is cached: no process for the same frame again.
     let runs = rig.runs().len();
     assert_eq!(text(&frame(&s, &tl, &rig, 100)), got);

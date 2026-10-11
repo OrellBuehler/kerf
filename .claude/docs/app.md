@@ -71,13 +71,7 @@ JPEG added as a base64 `data:` URL (`FilmstripPayload` — the CSP admits `data:
 and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**, since
 `skim_asset` is how an agent looks at footage,
 `get_preview_frame` / `set_preview_bounds` / `gpu_preview_status` (the GPU preview, below; GUI-only),
-`get_timeline_frame` goes through `AppState.scrub` (one `kerf_core::ScrubFrames` per process, shared with the GPU
-preview's JPEG route): the frame of the cut's grid that holds the time, from a bounded cache or from the window of
-neighbours one process draws for it (`engine-cli.md`, "Scrubbed frames"). `start_playback` stops the window
-(`scrub.stop()`), `new_project` / `open_project` clear it (`scrub.clear()`), the MCP `preview_timeline` stays the
-one-shot still on purpose (an agent asks for exactly that time and the staged cut). Environment:
-`KERF_SCRUB_CACHE_MB` (64), `KERF_SCRUB_WINDOW` (frames per window, 24; `off` / `0` = one cached still per miss);
-`KERF_GPU_LANE=off` keeps every job on the cores' slot (`engine-cli.md`, `cpu.rs`).
+`get_timeline_frame` (the composited still at a time; see Scrubbed frames below),
 detached panels (`popout_expect` / `popout_cancel` / `popout_focus` / `popout_move` / `close_popout`, see Detached panels below; GUI-only, no MCP tool),
 `start_playback { playback_id, start, fps?, max_width?, on_frame }` / `stop_playback` — streamed
 composited frames over a `tauri::ipc::Channel<InvokeResponseBody>`, **raw bytes** (`playback_message`:
@@ -196,6 +190,14 @@ one enables the command **with no scope of its own** (`allow-default-urls` is a
 separate permission), so it is listed in object form with an `allow` entry for
 `https://github.com/OrellBuehler/kerf/*` — without a scope every `openUrl` call
 comes back `ForbiddenUrl` and the "Release page" button silently does nothing.
+
+**Scrubbed frames.** `get_timeline_frame` and the GPU preview's JPEG route go through `AppState.scrub`, one
+`kerf_core::ScrubFrames` per process: the frame of the cut's grid that holds the time, from a bounded cache or from
+the window of neighbours one process draws for it (`engine-cli.md`, "Scrubbed frames"). `start_playback` stops the
+window (`scrub.stop()`), `new_project` / `open_project` clear it (`scrub.clear()`). The MCP `preview_timeline`
+stays the one-shot still on purpose: an agent asks for exactly that time and the staged cut. Environment:
+`KERF_SCRUB_CACHE_MB` (64), `KERF_SCRUB_WINDOW` (frames per window, 24; `off` / `0` = one cached still per miss);
+`KERF_GPU_LANE=off` keeps every job on the cores' slot (`engine-cli.md`, `cpu.rs`).
 
 **GPU preview (A2, `gpu_preview.rs`, opt-in).** *Settings › Preview › GPU preview (experimental)*
 (`Settings.gpu_preview`, default off, persisted beside `safe_areas`) draws the Preview

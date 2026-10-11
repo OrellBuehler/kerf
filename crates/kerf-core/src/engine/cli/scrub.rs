@@ -31,12 +31,16 @@
 //!   it will draw waits for that frame. A scrub that runs off the end of a window starts the next
 //!   one before it is reached (read-ahead), and one going backwards starts a window that ends at the
 //!   frame it is on.
+//! * **Proxies are cheap, originals are not.** Over proxies and images a window starts a frame
+//!   before the one asked for, so the frame behind it is a hit. Over an original every frame is a
+//!   decode: the asked frame is the first out, and the window starts at it.
 //! * **Nothing waits forever, nothing is spawned under a lock.** The process is started with the
 //!   state lock released; a reaper kills a window that has drawn nothing for
 //!   [`ScrubConfig::first_frame_timeout`] or stalled between frames for
 //!   [`ScrubConfig::frame_timeout`]; `stop`, `clear`, an edit that makes the window useless, a jump
-//!   away from it and `Drop` kill it. A request that cannot be served from a window renders the
-//!   one-shot still, bounded like every still.
+//!   away from it and `Drop` kill it, and `stop` and `clear` also keep a request already waiting
+//!   from starting another. A request that cannot be served from a window (or whose window died
+//!   or stalled by itself) renders the one-shot still, bounded like every still.
 
 use std::borrow::Cow;
 use std::io::Read;
@@ -68,8 +72,9 @@ pub struct ScrubConfig {
     /// Frames one window draws, at most. `0` turns windows off: every miss is a one-shot still
     /// (still cached, still on the frame grid).
     pub window_frames: u32,
-    /// Frames before the requested one a window starts, going forward (the first frames back
-    /// are then hits as well).
+    /// Frames before the requested one a window over proxies and images starts, going forward (the
+    /// first frames back are then hits as well). A window over anything else has none: every frame
+    /// of it is a decode, and the one asked for is the first out.
     pub lead_frames: u32,
     /// Frames from the end of a window at which a scrub moving that way starts the next window.
     /// `0` turns the read-ahead off.
@@ -156,6 +161,9 @@ struct State {
     next_id: u64,
     stats: ScrubStats,
     closed: bool,
+    /// Counts the `stop`s and `clear`s: a request that began, or a read-ahead that was planned,
+    /// before one does not start a window after it.
+    epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,9 +356,25 @@ impl<'a> Snapshot<'a> {
             })
     }
 
+    /// Whether every layer on screen at frame `k` reads a preview proxy or a still image: a few
+    /// milliseconds a frame, so that a window may draw frames before `k` and `k` after them.
+    fn cheap_at(&self, k: u64) -> bool {
+        let facts = facts_from_assets(&self.assets);
+        still_layers(&self.rendered, &self.assets, self.grid.fps, self.grid.time_of(k))
+            .iter()
+            .all(|layer| {
+                self.assets
+                    .iter()
+                    .find(|a| a.id == layer.active.clip.asset_id)
+                    .is_some_and(|asset| facts(&asset.path).cheap())
+            })
+    }
+
     /// The frames `[a, b)` of a window started for frame `k`, or `None` when `k` itself is not one
-    /// the window graph draws. Going forward the window starts `lead` frames before `k`; going
-    /// back it ends two frames after it. Stops at the first frame that is not [`plain`](Self::plain).
+    /// the window graph draws. Going forward the window starts `lead_frames` before `k` (none over
+    /// anything but proxies and images, whose every frame is a decode: `k` is the first one out);
+    /// going back it ends two frames after it. Stops at the first frame that is not
+    /// [`plain`](Self::plain).
     pub(super) fn window_range(&self, k: u64, reverse: bool, config: &ScrubConfig) -> Option<(u64, u64)> {
         let n = u64::from(config.window_frames);
         if n < 2 || !self.plain(k) {
@@ -358,10 +382,12 @@ impl<'a> Snapshot<'a> {
         }
         let lead = if reverse {
             n.saturating_sub(2)
-        } else {
+        } else if self.cheap_at(k) {
             u64::from(config.lead_frames)
-        }
-        .min(k);
+        } else {
+            0
+        };
+        let lead = lead.min(k);
         let lo = k - lead;
         let mut a = k;
         while a > lo && self.plain(a - 1) {
@@ -462,6 +488,28 @@ struct Offer {
     head: u64,
 }
 
+/// A read-ahead window a hit has asked for: where from, which way, and what to check before it
+/// starts (the finished window's cut, and the epoch the request saw).
+struct Ahead {
+    from: u64,
+    forward: bool,
+    k: u64,
+    key: StillKey,
+    epoch: u64,
+    theirs: Arc<Snapshot<'static>>,
+}
+
+/// What the latest window offers a request: nothing, an answer, or a question for its cut.
+enum Offered {
+    Nothing,
+    Is(Offer),
+    /// The window's own snapshot has to say whether it draws the requested frame; asked off the lock.
+    Ask {
+        id: u64,
+        theirs: Arc<Snapshot<'static>>,
+    },
+}
+
 /// Whether a request for frame `k` waits for the running window (pure, so each rule is a test),
 /// rather than starting one of its own or drawing the frame alone. `mine` is the window this
 /// request started itself (waited for whatever the distance: a window going back is started far
@@ -498,6 +546,7 @@ impl ScrubFrames {
                 next_id: 0,
                 stats: ScrubStats::default(),
                 closed: false,
+                epoch: 0,
             }),
             changed: Condvar::new(),
             config,
@@ -522,8 +571,10 @@ impl ScrubFrames {
         let k = snap.grid.frame_of(t);
         let key = snap.key(k)?;
         let toward;
+        let epoch;
         {
             let mut st = shared.lock();
+            epoch = st.epoch;
             toward = direction(st.last, k, u64::from(config.window_frames).max(8));
             st.last = Some(k);
             if let Some(frame) = st.cache.get(key) {
@@ -551,7 +602,23 @@ impl ScrubFrames {
                 shared.read_ahead_later(&snap, ahead);
                 return Ok(frame);
             }
-            let offer = st.offer(&snap, k, key, &mut related);
+            // Stopped since the request began (playback took the pane): no window is started for it.
+            // Its own window ending by itself (it died, stalled, or finished without this frame) is
+            // not tried again; only a window another request replaced is.
+            let ended = |st: &State| mine.is_some_and(|id| st.window.as_ref().is_some_and(|w| w.id == id && !w.alive()));
+            if st.epoch != epoch || ended(&st) {
+                break;
+            }
+            let offer = match st.offer(k, related) {
+                Offered::Nothing => None,
+                Offered::Is(offer) => Some(offer),
+                Offered::Ask { id, theirs } => {
+                    // Whether that window draws this frame is asked of its cut off the lock.
+                    drop(st);
+                    related = Some((id, theirs.key(k).is_ok_and(|ours| ours == key)));
+                    continue;
+                }
+            };
             if waits_for(offer, k, u64::from(config.wait_frames), mine) {
                 let now = Instant::now();
                 if now >= deadline {
@@ -573,7 +640,7 @@ impl ScrubFrames {
             };
             let fresh = Arc::new(snap.to_static());
             let st = shared.lock();
-            if st.closed {
+            if st.closed || st.epoch != epoch {
                 break;
             }
             starts += 1;
@@ -607,7 +674,11 @@ impl ScrubFrames {
     /// Stop the window that is running (playback took over, the project was replaced): its process
     /// is killed and what it drew stays cached.
     pub fn stop(&self) {
-        let victim = self.shared.lock().retire_window("stopped");
+        let victim = {
+            let mut st = self.shared.lock();
+            st.epoch += 1;
+            st.retire_window("stopped")
+        };
         self.shared.changed.notify_all();
         if let Some(child) = victim {
             reap_later(child);
@@ -619,6 +690,7 @@ impl ScrubFrames {
         let victim = {
             let mut st = self.shared.lock();
             st.cache.clear();
+            st.epoch += 1;
             let victim = st.retire_window("cleared");
             st.window = None;
             st.last = None;
@@ -642,8 +714,9 @@ impl ScrubFrames {
 impl Shared {
     /// Where the next window should start for the request just served, if it should start one: a
     /// scrub moving along a finished window that has come within `read_ahead_frames` of its end
-    /// (or, going back, of its start). `(frame to start from, forward)`.
-    fn ahead(&self, st: &State, k: u64, key: StillKey, toward: Option<bool>) -> Option<(u64, bool)> {
+    /// (or, going back, of its start). Only what is cheap to know under the lock; the rest is
+    /// asked in [`read_ahead_later`](Self::read_ahead_later).
+    fn ahead(&self, st: &State, k: u64, key: StillKey, toward: Option<bool>) -> Option<Ahead> {
         let forward = toward?;
         if self.config.read_ahead_frames == 0 {
             return None;
@@ -652,25 +725,33 @@ impl Shared {
         if !near_edge(w.a, w.head, k, forward, u64::from(self.config.read_ahead_frames)) {
             return None;
         }
-        // Only a window of this cut is continued (an edit since may have moved the frames).
-        if !w.snap.key(k).is_ok_and(|theirs| theirs == key) {
-            return None;
-        }
-        Some((if forward { w.head } else { w.a }, forward))
+        Some(Ahead {
+            from: if forward { w.head } else { w.a },
+            forward,
+            k,
+            key,
+            epoch: st.epoch,
+            theirs: Arc::clone(&w.snap),
+        })
     }
 
     /// Start the read-ahead window on a thread of its own: the request that wanted it has its
-    /// frame and does not wait for a process to be spawned.
-    fn read_ahead_later(self: &Arc<Self>, snap: &Snapshot<'_>, ahead: Option<(u64, bool)>) {
-        let Some((from, forward)) = ahead else { return };
+    /// frame and does not wait for a process to be spawned. The thread checks that the finished
+    /// window is of this cut (an edit since may have moved its frames) and that nothing was
+    /// stopped since.
+    fn read_ahead_later(self: &Arc<Self>, snap: &Snapshot<'_>, ahead: Option<Ahead>) {
+        let Some(ahead) = ahead else { return };
         let shared = Arc::clone(self);
         let snap = Arc::new(snap.to_static());
         let _ = std::thread::Builder::new().name("kerf-scrub-ahead".into()).spawn(move || {
-            let Some((a, b)) = snap.window_beyond(from, forward, &shared.config) else {
+            if !ahead.theirs.key(ahead.k).is_ok_and(|theirs| theirs == ahead.key) {
+                return;
+            }
+            let Some((a, b)) = snap.window_beyond(ahead.from, ahead.forward, &shared.config) else {
                 return;
             };
             let st = shared.lock();
-            if st.closed || st.window.as_ref().is_some_and(Window::alive) {
+            if st.closed || st.epoch != ahead.epoch || st.window.as_ref().is_some_and(Window::alive) {
                 return;
             }
             shared.start_window(st, snap, a, b);
@@ -764,23 +845,25 @@ impl Drop for ScrubFrames {
 }
 
 impl State {
-    /// What the latest window offers the request for `k` (whose key is `key`). Whether the window
-    /// draws the same frame is asked of its own cut once per window (`related` remembers it).
-    fn offer(&self, snap: &Snapshot<'_>, k: u64, key: StillKey, related: &mut Option<(u64, bool)>) -> Option<Offer> {
-        let _ = snap;
-        let w = self.window.as_ref()?;
-        let same = match *related {
+    /// What the latest window offers the request for frame `k`. Whether the window draws the same
+    /// frame is the question of its own cut (`related` remembers the answer for a window): the
+    /// window is for this request only if its snapshot's frame `k` is the one asked for (an edit
+    /// that moved it makes the window useless here, and one that did not leaves it useful).
+    fn offer(&self, k: u64, related: Option<(u64, bool)>) -> Offered {
+        let Some(w) = self.window.as_ref() else {
+            return Offered::Nothing;
+        };
+        let same = match related {
             Some((id, same)) if id == w.id => same,
+            _ if !(k >= w.a && k < w.b) => false,
             _ => {
-                // The window draws its frames from its own snapshot of the cut: it is for this
-                // request only if that snapshot's frame `k` is the one asked for (an edit that
-                // moved it makes the window useless here, and one that did not leaves it useful).
-                let same = k >= w.a && k < w.b && w.snap.key(k).is_ok_and(|theirs| theirs == key);
-                *related = Some((w.id, same));
-                same
+                return Offered::Ask {
+                    id: w.id,
+                    theirs: Arc::clone(&w.snap),
+                }
             }
         };
-        Some(Offer {
+        Offered::Is(Offer {
             id: w.id,
             alive: w.alive(),
             related: same,
@@ -988,36 +1071,49 @@ fn reap_later(child: Arc<Mutex<Child>>) {
     }
 }
 
-/// How often the reaper looks at the running window.
-const REAPER_TICK: Duration = Duration::from_millis(100);
+/// How long the reaper sleeps when no window is alive: it is woken when one starts, and this only
+/// bounds a wake-up that was missed.
+const REAPER_IDLE: Duration = Duration::from_secs(5);
 
 /// Kills a window that has stopped drawing: nothing for `first_frame_timeout`, or a gap of
-/// `frame_timeout` between frames. Holds only a `Weak`: it ends with the last handle.
+/// `frame_timeout` between frames. Parked on the state's condvar while no window is alive and, with
+/// one, until the moment it would be late (every frame it files wakes the reaper to move that
+/// moment). Holds only a `Weak` between rounds: it ends with the last handle.
 fn reaper(weak: &Weak<Shared>) {
     loop {
-        std::thread::sleep(REAPER_TICK);
         let Some(shared) = weak.upgrade() else { return };
         let victim = {
             let mut st = shared.lock();
             if st.closed {
                 return;
             }
-            let now = Instant::now();
-            let late = st.window.as_ref().filter(|w| w.alive()).and_then(|w| {
-                let (since, limit) = if w.head == w.a {
-                    (w.started, shared.config.first_frame_timeout)
+            let due = st.window.as_ref().filter(|w| w.alive()).map(|w| {
+                if w.head == w.a {
+                    w.started + shared.config.first_frame_timeout
                 } else {
-                    (w.last_progress, shared.config.frame_timeout)
-                };
-                (now.duration_since(since) > limit).then_some(w.id)
+                    w.last_progress + shared.config.frame_timeout
+                }
             });
-            late.and_then(|id| st.fail_window(id, "the window stopped drawing"))
+            let now = Instant::now();
+            match due {
+                Some(due) if due <= now => {
+                    let id = st.window.as_ref().map(|w| w.id);
+                    id.and_then(|id| st.fail_window(id, "the window stopped drawing"))
+                }
+                other => {
+                    let wait = other.map_or(REAPER_IDLE, |due| due - now);
+                    drop(shared.changed.wait_timeout(st, wait).unwrap_or_else(PoisonError::into_inner));
+                    None
+                }
+            }
         };
         if let Some(child) = victim {
             tracing::warn!("a scrub window stopped drawing; killed");
             shared.changed.notify_all();
             reap_later(child);
         }
+        // The strong handle is dropped here, so a parked reaper never keeps the cache alive for
+        // longer than one wait.
     }
 }
 
@@ -1138,8 +1234,16 @@ mod tests {
     use crate::engine::test_support::{image_stream, make_clip, test_asset, timeline_of, video_stream, video_track};
     use crate::model::{Projection, Reframe, TextOverlay, Transition, TransitionKind};
 
+    /// A preview proxy by its name (`.../kerf/proxies/<16 hex>.mp4`).
     fn video(fps: f64) -> Asset {
         let mut a = test_asset(vec![video_stream(1280, 720, fps)]);
+        a.path = format!("/media/kerf/proxies/{:016x}.mp4", fps.to_bits());
+        a
+    }
+
+    /// An original: any other path.
+    fn original(fps: f64) -> Asset {
+        let mut a = test_asset(vec![video_stream(3840, 2160, fps)]);
         a.path = format!("/media/clip-{fps}.mp4");
         a
     }
@@ -1338,6 +1442,58 @@ mod tests {
             Some((0, 24)),
             "held to the start of the cut"
         );
+    }
+
+    #[test]
+    fn a_window_over_an_original_starts_at_the_frame_so_that_frame_is_the_first_out() {
+        let a = original(30.0);
+        let assets = vec![a.clone()];
+        let snap = snap_of(&one_clip(&a, |_| {}), &assets);
+        assert_eq!(
+            snap.window_range(100, false, &cfg()),
+            Some((100, 124)),
+            "no frame before it to decode"
+        );
+        assert_eq!(snap.window_range(0, false, &cfg()), Some((0, 24)));
+        // Over a proxy the frame before is nearly free, and a hit when the scrub steps back.
+        let p = video(30.0);
+        let proxies = vec![p.clone()];
+        let snap = snap_of(&one_clip(&p, |_| {}), &proxies);
+        assert_eq!(snap.window_range(100, false, &cfg()), Some((98, 122)));
+    }
+
+    #[test]
+    fn a_step_back_has_the_window_behind_it_over_an_original_too() {
+        // A drag back is one window behind the frame, not a window of its own at every step: twenty
+        // steps back over a 1080p long-GOP original took 1.7 s that way and 3.0 s with a short
+        // window at the frame for the first step (`tests/scrub_bench.rs`).
+        let a = original(30.0);
+        let assets = vec![a.clone()];
+        let snap = snap_of(&one_clip(&a, |_| {}), &assets);
+        assert_eq!(snap.window_range(100, true, &cfg()), Some((78, 102)));
+    }
+
+    #[test]
+    fn a_proxy_under_an_original_is_not_cheap_and_a_proxy_and_an_image_are() {
+        let proxy = video(30.0);
+        let big = original(30.0);
+        let mut image = test_asset(vec![image_stream(800, 600)]);
+        image.path = "/media/title.png".into();
+        let mut inset = make_clip(big.id, 0.0, 5.0, 0.0);
+        inset.transform.scale = 0.4;
+        let mut second = video_track(vec![inset]);
+        second.name = "V2".into();
+        let mixed = timeline_of(vec![video_track(vec![make_clip(proxy.id, 0.0, 10.0, 0.0)]), second]);
+        let assets = vec![proxy.clone(), big];
+        assert!(!snap_of(&mixed, &assets).cheap_at(30), "one original makes the frame costly");
+        assert!(snap_of(&mixed, &assets).cheap_at(300), "past the inset it is the proxy alone");
+
+        let mut sticker = make_clip(image.id, 0.0, 5.0, 0.0);
+        sticker.transform.scale = 0.4;
+        let mut over = video_track(vec![sticker]);
+        over.name = "V2".into();
+        let pictured = timeline_of(vec![video_track(vec![make_clip(proxy.id, 0.0, 10.0, 0.0)]), over]);
+        assert!(snap_of(&pictured, &[proxy, image]).cheap_at(30));
     }
 
     #[test]
