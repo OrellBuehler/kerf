@@ -267,13 +267,19 @@ fn a_miss_starts_one_window_and_the_next_frames_are_hits() {
 }
 
 #[test]
-fn a_window_over_an_original_starts_at_the_frame_so_that_frame_is_the_first_out() {
-    let rig = Rig::original("slow-first");
+fn a_click_on_an_original_then_a_step_back_one_is_a_hit() {
+    // The process decodes every frame from the keyframe to reach the one asked for, so the frame
+    // before it is nearly free and kept; without it the step back starts a window of its own.
+    let rig = Rig::original("click-back");
     let tl = rig.cut(|_| {});
     let s = scrub_reading_ahead(0);
-    let got = window_frame(&frame(&s, &tl, &rig, 100));
-    assert_eq!(got.1, 0, "no frame before it to decode: it is the first the process draws");
-    assert_eq!(rig.runs()[0].1, 24);
+    let first = window_frame(&frame(&s, &tl, &rig, 100));
+    assert_eq!(first.1, 2, "two frames of lead in this config");
+    let before = s.stats();
+    let back = window_frame(&frame(&s, &tl, &rig, 99));
+    assert_eq!(back, (first.0, 1), "the frame before, from the same process");
+    let after = s.stats();
+    assert_eq!((after.windows, after.hits), (before.windows, before.hits + 1));
 }
 
 #[test]
@@ -284,7 +290,8 @@ fn a_step_back_over_an_original_has_the_window_behind_it_like_over_a_proxy() {
     let s = scrub_reading_ahead(0);
     let _ = frame(&s, &tl, &rig, 200);
     wait_for("the first window", Duration::from_secs(5), || s.stats().drawn >= 24);
-    let got = window_frame(&frame(&s, &tl, &rig, 199));
+    // Past the lead: a miss going back.
+    let got = window_frame(&frame(&s, &tl, &rig, 196));
     assert_eq!((got.1, rig.runs()[1].1), (22, 24), "the 23rd of 24 frames, ending after it");
 }
 

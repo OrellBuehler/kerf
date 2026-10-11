@@ -429,12 +429,12 @@ so the feature is **only** activated through these forwards — which is what ma
     its reader filing each JPEG under the key of the still it stands for; the request returns when *its* frame is
     out. A request the running window will draw (its own cut says so, asked off the lock) waits, any other kills it
     ("latest wins"). A scrub within 8 frames of the end of a finished window starts the next (`read_ahead_frames`).
-  - **Cheap or a decode a frame** (`Snapshot::cheap_at`: proxies and images are cheap). A window over cheap inputs
-    starts 1 frame before the one asked for, so the step back is a hit. Over an original **the asked frame is the
-    first out**: the window starts at it. A step back is a window that ends 2 frames after the frame, over originals
-    too. Measured against the alternative (a short window at the frame for the first step back, the window behind
-    from the second): one step back 1.1 s against 1.3 s, but a twenty-step drag back 3.4 s against 2.2 s, since the
-    drag then pays a second process; so the window behind is kept.
+  - **Lead.** A window starts 1 frame before the one asked for (2 after it going back), so the step the other way is
+    a hit. That holds over an original too: reaching `k` the process decodes every frame from the keyframe, so `k - 1`
+    costs a filter and a JPEG, and without it a click then a step back is a miss that starts a window of its own (870 ms
+    against 0.1 on a 1080p long-GOP original, 370 for the one-shot). A drag back is one window behind the frame:
+    over originals a short window at the frame for the first step back saved 160 ms on that step and cost 1.2 s on the
+    drag, and a short first window doubled a forward drag from a cold start, so neither is used.
   - **Lifecycle.** Spawned off the lock (`Reading::Window`, one thread when every input is cheap: 192 to 109 ms for
     three proxy layers). Killed by `stop()` (playback), `clear()` (project opened), an edit or jump, a reaper (10 s
     with nothing drawn, 5 s between frames; parked on the condvar when idle) and `Drop`. `stop` / `clear` bump an

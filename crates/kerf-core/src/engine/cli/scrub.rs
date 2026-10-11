@@ -31,9 +31,6 @@
 //!   it will draw waits for that frame. A scrub that runs off the end of a window starts the next
 //!   one before it is reached (read-ahead), and one going backwards starts a window that ends at the
 //!   frame it is on.
-//! * **Proxies are cheap, originals are not.** Over proxies and images a window starts a frame
-//!   before the one asked for, so the frame behind it is a hit. Over an original every frame is a
-//!   decode: the asked frame is the first out, and the window starts at it.
 //! * **Nothing waits forever, nothing is spawned under a lock.** The process is started with the
 //!   state lock released; a reaper kills a window that has drawn nothing for
 //!   [`ScrubConfig::first_frame_timeout`] or stalled between frames for
@@ -72,9 +69,8 @@ pub struct ScrubConfig {
     /// Frames one window draws, at most. `0` turns windows off: every miss is a one-shot still
     /// (still cached, still on the frame grid).
     pub window_frames: u32,
-    /// Frames before the requested one a window over proxies and images starts, going forward (the
-    /// first frames back are then hits as well). A window over anything else has none: every frame
-    /// of it is a decode, and the one asked for is the first out.
+    /// Frames before the requested one a window starts, going forward (the first frames back are
+    /// then hits as well).
     pub lead_frames: u32,
     /// Frames from the end of a window at which a scrub moving that way starts the next window.
     /// `0` turns the read-ahead off.
@@ -356,25 +352,14 @@ impl<'a> Snapshot<'a> {
             })
     }
 
-    /// Whether every layer on screen at frame `k` reads a preview proxy or a still image: a few
-    /// milliseconds a frame, so that a window may draw frames before `k` and `k` after them.
-    fn cheap_at(&self, k: u64) -> bool {
-        let facts = facts_from_assets(&self.assets);
-        still_layers(&self.rendered, &self.assets, self.grid.fps, self.grid.time_of(k))
-            .iter()
-            .all(|layer| {
-                self.assets
-                    .iter()
-                    .find(|a| a.id == layer.active.clip.asset_id)
-                    .is_some_and(|asset| facts(&asset.path).cheap())
-            })
-    }
-
     /// The frames `[a, b)` of a window started for frame `k`, or `None` when `k` itself is not one
-    /// the window graph draws. Going forward the window starts `lead_frames` before `k` (none over
-    /// anything but proxies and images, whose every frame is a decode: `k` is the first one out);
-    /// going back it ends two frames after it. Stops at the first frame that is not
-    /// [`plain`](Self::plain).
+    /// the window graph draws. Going forward the window starts `lead_frames` before `k`, going
+    /// back it ends two frames after it, so the step the other way is a hit. The lead is one frame
+    /// over an original too: reaching `k` the process decodes every frame from the keyframe, so
+    /// `k - 1` costs a filter and a JPEG, and without it a click followed by a step back is a miss
+    /// that starts a window of its own (`tests/scrub_bench.rs`: 0.1 ms with the lead, 870 ms without
+    /// on a 1080p long-GOP original, against 370 for the one-shot). Stops at the first frame that
+    /// is not [`plain`](Self::plain).
     pub(super) fn window_range(&self, k: u64, reverse: bool, config: &ScrubConfig) -> Option<(u64, u64)> {
         let n = u64::from(config.window_frames);
         if n < 2 || !self.plain(k) {
@@ -382,10 +367,8 @@ impl<'a> Snapshot<'a> {
         }
         let lead = if reverse {
             n.saturating_sub(2)
-        } else if self.cheap_at(k) {
-            u64::from(config.lead_frames)
         } else {
-            0
+            u64::from(config.lead_frames)
         };
         let lead = lead.min(k);
         let lo = k - lead;
@@ -1234,16 +1217,8 @@ mod tests {
     use crate::engine::test_support::{image_stream, make_clip, test_asset, timeline_of, video_stream, video_track};
     use crate::model::{Projection, Reframe, TextOverlay, Transition, TransitionKind};
 
-    /// A preview proxy by its name (`.../kerf/proxies/<16 hex>.mp4`).
     fn video(fps: f64) -> Asset {
         let mut a = test_asset(vec![video_stream(1280, 720, fps)]);
-        a.path = format!("/media/kerf/proxies/{:016x}.mp4", fps.to_bits());
-        a
-    }
-
-    /// An original: any other path.
-    fn original(fps: f64) -> Asset {
-        let mut a = test_asset(vec![video_stream(3840, 2160, fps)]);
         a.path = format!("/media/clip-{fps}.mp4");
         a
     }
@@ -1445,55 +1420,22 @@ mod tests {
     }
 
     #[test]
-    fn a_window_over_an_original_starts_at_the_frame_so_that_frame_is_the_first_out() {
-        let a = original(30.0);
+    fn a_window_starts_a_frame_early_over_an_original_too_so_a_click_then_a_step_back_is_a_hit() {
+        // Not a proxy by its name: a camera file.
+        let a = video(30.0);
         let assets = vec![a.clone()];
         let snap = snap_of(&one_clip(&a, |_| {}), &assets);
-        assert_eq!(
-            snap.window_range(100, false, &cfg()),
-            Some((100, 124)),
-            "no frame before it to decode"
-        );
-        assert_eq!(snap.window_range(0, false, &cfg()), Some((0, 24)));
-        // Over a proxy the frame before is nearly free, and a hit when the scrub steps back.
-        let p = video(30.0);
-        let proxies = vec![p.clone()];
-        let snap = snap_of(&one_clip(&p, |_| {}), &proxies);
-        assert_eq!(snap.window_range(100, false, &cfg()), Some((98, 122)));
+        let c = ScrubConfig { lead_frames: 1, ..cfg() };
+        assert_eq!(snap.window_range(100, false, &c), Some((99, 123)));
+        assert_eq!(snap.window_range(0, false, &c), Some((0, 24)), "not before the first frame");
     }
 
     #[test]
-    fn a_step_back_has_the_window_behind_it_over_an_original_too() {
-        // A drag back is one window behind the frame, not a window of its own at every step: twenty
-        // steps back over a 1080p long-GOP original took 1.7 s that way and 3.0 s with a short
-        // window at the frame for the first step (`tests/scrub_bench.rs`).
-        let a = original(30.0);
+    fn a_step_back_has_the_window_behind_it_over_an_original_as_over_a_proxy() {
+        let a = video(30.0);
         let assets = vec![a.clone()];
         let snap = snap_of(&one_clip(&a, |_| {}), &assets);
         assert_eq!(snap.window_range(100, true, &cfg()), Some((78, 102)));
-    }
-
-    #[test]
-    fn a_proxy_under_an_original_is_not_cheap_and_a_proxy_and_an_image_are() {
-        let proxy = video(30.0);
-        let big = original(30.0);
-        let mut image = test_asset(vec![image_stream(800, 600)]);
-        image.path = "/media/title.png".into();
-        let mut inset = make_clip(big.id, 0.0, 5.0, 0.0);
-        inset.transform.scale = 0.4;
-        let mut second = video_track(vec![inset]);
-        second.name = "V2".into();
-        let mixed = timeline_of(vec![video_track(vec![make_clip(proxy.id, 0.0, 10.0, 0.0)]), second]);
-        let assets = vec![proxy.clone(), big];
-        assert!(!snap_of(&mixed, &assets).cheap_at(30), "one original makes the frame costly");
-        assert!(snap_of(&mixed, &assets).cheap_at(300), "past the inset it is the proxy alone");
-
-        let mut sticker = make_clip(image.id, 0.0, 5.0, 0.0);
-        sticker.transform.scale = 0.4;
-        let mut over = video_track(vec![sticker]);
-        over.name = "V2".into();
-        let pictured = timeline_of(vec![video_track(vec![make_clip(proxy.id, 0.0, 10.0, 0.0)]), over]);
-        assert!(snap_of(&pictured, &[proxy, image]).cheap_at(30));
     }
 
     #[test]

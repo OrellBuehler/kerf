@@ -161,7 +161,7 @@ impl InputFacts {
     }
 
     /// An input that takes next to nothing to decode.
-    pub(crate) fn cheap(self) -> bool {
+    fn cheap(self) -> bool {
         self.proxy || self.image
     }
 

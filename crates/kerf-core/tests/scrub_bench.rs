@@ -10,7 +10,10 @@
 //! * **backward drag**: twenty steps back at 60 Hz, which a window that draws the frames behind the
 //!   playhead first would have made wait on its lead;
 //! * **jumps**: twelve seeks far apart on one `ScrubFrames` (a click on the ruler), each judged
-//!   against the one-shot still of the same frame.
+//!   against the one-shot still of the same frame;
+//! * **click, then step back one**: a click on frame k and, once its window is drawn, the frame
+//!   before it: a hit when the window starts a frame early, a miss that starts a window of its own
+//!   when it does not. `KERF_BENCH_CLICK_ONLY=1` runs only this and the case's one-shot control.
 //!
 //! A 1080p long-GOP original (`-g 250`, B-frames: what a camera file is) is measured beside the
 //! proxies: its frames cost a decode each, so the order the window draws them in shows.
@@ -185,6 +188,30 @@ fn time_of(k: u64) -> f64 {
     k as f64 / FPS
 }
 
+/// Click on a frame, wait for its window, then ask for the frame before it.
+fn click_then_back_one(case: &Case) -> Stat {
+    let mut ms = Vec::new();
+    for run in 0..10u64 {
+        let scrub = ScrubFrames::new(ScrubConfig::default());
+        let k0 = 200 + run * 17;
+        let _ = scrub
+            .frame(&case.timeline, &case.assets, time_of(k0), WIDTH, QUALITY)
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        while scrub.stats().drawn < 4 {
+            assert!(Instant::now() < until, "the window never drew");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let t0 = Instant::now();
+        let _ = scrub
+            .frame(&case.timeline, &case.assets, time_of(k0 - 1), WIDTH, QUALITY)
+            .unwrap();
+        ms.push(secs(t0.elapsed()));
+    }
+    stat(ms)
+}
+
 fn json(s: Stat) -> String {
     format!(
         "{{\"n\":{},\"min_ms\":{:.2},\"median_ms\":{:.2},\"p95_ms\":{:.2}}}",
@@ -205,6 +232,32 @@ fn what_the_scrub_cache_buys() {
         let assets = &case.assets;
         // Warm the page cache and the process-wide probes once, off the clock.
         let _ = Project::composite_timeline_frame(&case.timeline, assets, 1.0, WIDTH, QUALITY).unwrap();
+
+        if std::env::var_os("KERF_BENCH_CLICK_ONLY").is_some() {
+            let one_shot = {
+                let ms: Vec<f64> = (0..8u64)
+                    .map(|i| {
+                        let t0 = Instant::now();
+                        let _ = Project::composite_timeline_frame(&case.timeline, assets, time_of(30 + i * 7), WIDTH, QUALITY)
+                            .unwrap();
+                        secs(t0.elapsed())
+                    })
+                    .collect();
+                stat(ms)
+            };
+            let click = click_then_back_one(&case);
+            eprintln!(
+                "ffmpeg {version} | {:>8} | click, then step back one: median {:>6.1} ms (p95 {:>6.1}) against {:>6.1} for the one-shot",
+                case.name, click.median, click.p95, one_shot.median
+            );
+            report.push(format!(
+                "{{\"case\":\"{}\",\"per_frame_spawn\":{},\"click_then_back_one\":{}}}",
+                case.name,
+                json(one_shot),
+                json(click)
+            ));
+            continue;
+        }
 
         // Before: one process per frame, at 40 different frames.
         let mut single = Vec::new();
@@ -322,18 +375,19 @@ fn what_the_scrub_cache_buys() {
         let drag_before = before.median * 20.0;
         let drag_after = stat(paced_total).median;
         let (back, jump, step) = (stat(back), stat(jumps), stat(step_back));
+        let click = click_then_back_one(&case);
         let back_before = before.median * 20.0;
         let back_after = stat(back_total).median;
         eprintln!(
-            "ffmpeg {version} | {:>8} | backward drag: step median {:>6.1} ms (p95 {:>6.1}), 20 steps {:>6.0} ms -> {:>6.0} ms | jumps: median {:>6.1} (p95 {:>6.1}) against {:>6.1} for the one-shot | one step back: median {:>6.1} (p95 {:>6.1})",
-            case.name, back.median, back.p95, back_before, back_after, jump.median, jump.p95, before.median, step.median, step.p95
+            "ffmpeg {version} | {:>8} | backward drag: step median {:>6.1} ms (p95 {:>6.1}), 20 steps {:>6.0} ms -> {:>6.0} ms | jumps: median {:>6.1} (p95 {:>6.1}) against {:>6.1} for the one-shot | one step back: median {:>6.1} (p95 {:>6.1}) | click, then back one: median {:>6.1} (p95 {:>6.1})",
+            case.name, back.median, back.p95, back_before, back_after, jump.median, jump.p95, before.median, step.median, step.p95, click.median, click.p95
         );
         eprintln!(
             "ffmpeg {version} | {:>8} | per-frame spawn: median {:>6.1} ms (p95 {:>6.1}) | first frame: median {:>6.1} (p95 {:>6.1}) | marginal while dragging at 60 Hz: median {:>5.1} (p95 {:>5.1}) | pure hit: median {:>5.2} (p95 {:>5.2}) | 20-step drag: {:>6.0} ms -> {:>6.0} ms",
             case.name, before.median, before.p95, first.median, first.p95, paced.median, paced.p95, hit.median, hit.p95, drag_before, drag_after
         );
         report.push(format!(
-            "{{\"case\":\"{}\",\"per_frame_spawn\":{},\"first_frame\":{},\"marginal_dragging_60hz\":{},\"pure_hit\":{},\"drag_20_steps_before_ms\":{:.1},\"drag_20_steps_after_ms\":{:.1},\"backward_drag_step\":{},\"backward_drag_20_steps_before_ms\":{:.1},\"backward_drag_20_steps_after_ms\":{:.1},\"jumps\":{},\"one_step_back\":{}}}",
+            "{{\"case\":\"{}\",\"per_frame_spawn\":{},\"first_frame\":{},\"marginal_dragging_60hz\":{},\"pure_hit\":{},\"drag_20_steps_before_ms\":{:.1},\"drag_20_steps_after_ms\":{:.1},\"backward_drag_step\":{},\"backward_drag_20_steps_before_ms\":{:.1},\"backward_drag_20_steps_after_ms\":{:.1},\"jumps\":{},\"one_step_back\":{},\"click_then_back_one\":{}}}",
             case.name,
             json(before),
             json(first),
@@ -345,7 +399,8 @@ fn what_the_scrub_cache_buys() {
             back_before,
             back_after,
             json(jump),
-            json(step)
+            json(step),
+            json(click)
         ));
     }
     let body = format!(
