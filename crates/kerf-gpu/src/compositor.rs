@@ -2424,6 +2424,7 @@ impl Compositor {
         if !reasons.is_empty() {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));
         }
+        refuse_prefetch(hint)?;
         let t0 = Instant::now();
         let frames = source.frames(&plan.layers, hint)?;
         let decode = t0.elapsed();
@@ -2455,6 +2456,7 @@ impl Compositor {
         if !reasons.is_empty() {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));
         }
+        refuse_prefetch(hint)?;
         let t0 = Instant::now();
         let frames = source.frames(&plan.layers, hint)?;
         let decode = t0.elapsed();
@@ -2470,6 +2472,17 @@ impl Compositor {
                 composite: t1.elapsed(),
             },
         ))
+    }
+}
+
+/// A frame is drawn from frames, and [`Hint::Prefetch`] returns none: a render with it would
+/// composite layers of nothing.
+fn refuse_prefetch(hint: Hint) -> Result<(), GpuError> {
+    match hint {
+        Hint::Prefetch => Err(GpuError::Unsupported(
+            "Hint::Prefetch decodes nothing to draw (it warms the next clip's run)".into(),
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -2668,5 +2681,19 @@ mod tests {
         // The plane just asked for is kept whatever its size.
         cache.get(&mask(0.5), 100, 100);
         assert_eq!(held(&cache), [(100, 100)]);
+    }
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+
+    #[test]
+    fn a_render_is_not_made_with_the_hint_that_draws_nothing() {
+        let refused = refuse_prefetch(Hint::Prefetch);
+        assert!(matches!(refused, Err(GpuError::Unsupported(_))), "{refused:?}");
+        for hint in [Hint::Exact, Hint::Scrub, Hint::Forward { fps: 30.0 }] {
+            assert!(refuse_prefetch(hint).is_ok(), "{hint:?}");
+        }
     }
 }

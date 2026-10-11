@@ -74,8 +74,9 @@ impl Codec {
     }
 }
 
-/// The chroma format of an input, coarsely: 4:2:0 (8 or 10 bit) is what every GPU decodes,
-/// anything else (4:2:2, 4:4:4, 12 bit and up, alpha) is what most do not.
+/// The chroma format of an input, coarsely: 4:2:0 (8 or 10 bit) is what every GPU decodes of
+/// the codecs that have a 10 bit profile at all (see [`InputFacts::hardware_decodes`]), anything
+/// else (4:2:2, 4:4:4, 12 bit and up, alpha) is what most do not.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Chroma {
     /// Not recorded, not probed, or a name nobody here knows: nothing is assumed.
@@ -99,6 +100,28 @@ impl Chroma {
     }
 }
 
+/// The bit depth of a 4:2:0 pixel format (`yuv420p` 8, `yuv420p10le` and `p010le` 10); `None` for
+/// every other layout and for names nobody here knows.
+pub(crate) fn pix_fmt_bits_420(name: &str) -> Option<u8> {
+    if pix_fmt_layout(name) != Some(PixLayout::Yuv420) {
+        return None;
+    }
+    let n = name.trim().to_ascii_lowercase();
+    let t = n.strip_suffix("le").or_else(|| n.strip_suffix("be")).unwrap_or(&n);
+    if t == "p010" {
+        return Some(10);
+    }
+    let digits = t.chars().rev().take_while(char::is_ascii_digit).count();
+    let tail = &t[t.len() - digits..];
+    match (
+        t.strip_suffix(tail).is_some_and(|stem| stem.ends_with('p')),
+        tail.parse::<u8>(),
+    ) {
+        (true, Ok(bits)) => Some(bits),
+        _ => Some(8),
+    }
+}
+
 /// What a run reads from an input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reading {
@@ -106,6 +129,10 @@ pub(crate) enum Reading {
     Frame,
     /// A long-lived process feeding the preview.
     Stream,
+    /// A process that draws a few dozen frames and exits (the scrub window): hardware as for a
+    /// [`Reading::Stream`], but a preview proxy's decoder is one thread, as for one frame — the
+    /// pools are created per process, and a window of intra frames is done before they pay.
+    Window,
     /// The whole file: an export, a proxy, an analysis pass.
     Whole,
 }
@@ -119,6 +146,8 @@ pub(crate) struct InputFacts {
     pub image: bool,
     pub codec: Codec,
     pub chroma: Chroma,
+    /// The bit depth of a 4:2:0 stream; `None` when not recorded or not 4:2:0.
+    pub bits: Option<u8>,
 }
 
 impl InputFacts {
@@ -134,6 +163,19 @@ impl InputFacts {
     /// An input that takes next to nothing to decode.
     fn cheap(self) -> bool {
         self.proxy || self.image
+    }
+
+    /// Whether a named hardware decoder has this stream, so that a run holding the hardware's slot
+    /// is hardware and not software that was started beside it: H.264 in 4:2:0 at **8 bit** (High10
+    /// has no D3D11VA, DXVA2 or VAAPI decoder: ffmpeg decodes it in software without a word) and HEVC
+    /// in 4:2:0 at 8 or 10 bit (Main, Main10). An H.264 stream whose depth is not recorded is not
+    /// assumed to be 8.
+    pub(crate) fn hardware_decodes(self) -> bool {
+        match self.codec {
+            Codec::H264 => self.chroma == Chroma::Yuv420 && self.bits == Some(8),
+            Codec::Hevc => self.chroma == Chroma::Yuv420,
+            Codec::Unknown | Codec::Other => false,
+        }
     }
 }
 
@@ -152,6 +194,7 @@ pub(crate) fn facts_from_assets(assets: &[Asset]) -> impl Fn(&str) -> InputFacts
             chroma: video
                 .and_then(|s| s.pix_fmt.as_deref())
                 .map_or(Chroma::Unknown, Chroma::from_pix_fmt),
+            bits: video.and_then(|s| s.pix_fmt.as_deref()).and_then(pix_fmt_bits_420),
         }
     }
 }
@@ -301,7 +344,7 @@ pub(crate) fn tune_inputs(args: &mut Vec<String>, os: HostOs, reading: Reading, 
                 }
             }
         }
-        if reading == Reading::Frame && facts.proxy {
+        if matches!(reading, Reading::Frame | Reading::Window) && facts.proxy {
             group.extend(["-threads".to_string(), "1".to_string()]);
         }
         out.append(&mut group);
@@ -346,7 +389,7 @@ mod tests {
     }
 
     const OSES: [HostOs; 3] = [HostOs::Windows, HostOs::MacOs, HostOs::Other];
-    const READINGS: [Reading; 3] = [Reading::Frame, Reading::Stream, Reading::Whole];
+    const READINGS: [Reading; 4] = [Reading::Frame, Reading::Stream, Reading::Whole, Reading::Window];
 
     #[test]
     fn nothing_requested_is_nothing_asked_for() {
@@ -658,6 +701,33 @@ mod tests {
             "{a:?}"
         );
         assert!(!t.hw);
+    }
+
+    #[test]
+    fn a_proxy_in_a_window_loses_its_hwaccel_and_decodes_on_one_thread_while_an_original_is_a_streams() {
+        let mut a = opts("auto", PROXY, "-ss 3.000000");
+        let t = tune_inputs(&mut a, HostOs::Windows, Reading::Window, &InputFacts::of_path);
+        assert_eq!(
+            a.join(" "),
+            format!(
+                "-hide_banner -loglevel error -ss 3.000000 -threads 1 -i {PROXY} -filter_complex [0:v]null[outv] -map [outv] -frames:v 1 pipe:1"
+            )
+        );
+        assert_eq!(
+            t,
+            Tuning {
+                hw: false,
+                all_cheap: true
+            }
+        );
+        // An original keeps its decoder, named on Windows, and is not told to use one thread; and a
+        // 4:2:2 one is not skipped as it is for one frame (a window is many).
+        let c422 = |_: &str| facts(Codec::Hevc, Chroma::Other);
+        let mut b = opts("auto", "/media/r5.mp4", "-ss 1.5");
+        let t = tune_inputs(&mut b, HostOs::Windows, Reading::Window, &c422);
+        assert_eq!(flag_after(&b, "-hwaccel"), Some("d3d11va"));
+        assert!(!b.contains(&"-threads".to_string()));
+        assert!(t.hw && !t.all_cheap);
     }
 
     #[test]

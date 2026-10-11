@@ -103,8 +103,8 @@ pub use cli::{
     proxy_width, proxy_width_for, ready_proxy, remove_proxy_files, salience_map, seek_arg, set_proxy_base_width, source_identity,
     stitch_insta360, stitched_path, stream_preview, stream_preview_with, timeline_frame, timeline_frame_region, validate_export,
     waveform, Container, ExportOptions, ExportProgress, ExportVariant, Fit, ImageFormat, LoudnessPreset, PlaybackParams,
-    PlaybackRequest, PreviewFrame, ProxyRun, RateControl, Region, RenderStatus, VariantProgress, MAX_STREAM_FPS,
-    MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
+    PlaybackRequest, PreviewFrame, ProxyRun, RateControl, Region, RenderStatus, ScrubConfig, ScrubFrames, ScrubStats,
+    VariantProgress, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
 };
 
 pub(crate) use cli::insta360_pair_name;

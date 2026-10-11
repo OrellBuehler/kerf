@@ -113,11 +113,9 @@ pub(super) fn export_frames_sized(
         args.join(" "),
         String::from_utf8_lossy(&run.stderr)
     );
-    std::fs::read(&out)
-        .unwrap_or_else(|e| panic!("{}: {e}\n{}", out.display(), args.join(" ")))
-        .chunks((w * h * 3) as usize)
-        .map(<[u8]>::to_vec)
-        .collect()
+    let raw = std::fs::read(&out).unwrap_or_else(|e| panic!("{}: {e}\n{}", out.display(), args.join(" ")));
+    let _ = std::fs::remove_file(&out);
+    raw.chunks((w * h * 3) as usize).map(<[u8]>::to_vec).collect()
 }
 
 /// The first pixel of a frame.
