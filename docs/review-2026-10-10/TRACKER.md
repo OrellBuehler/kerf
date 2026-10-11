@@ -27,7 +27,7 @@
 - Disk: free space fell to ~4 GB once (a 16 GB worktree target plus reviewer scratch builds). A worktree's target is now deleted as soon as its PR is pushed, and finished agents' scratch builds are removed.
 - CI: wrote the small ffmpeg-download retry myself (#131) instead of starting a dev agent: it is CI plumbing, not feature code, and two PRs were blocked on it.
 - Commits are authored as the repo owner (the container's default git identity names the assistant, which the commit rules forbid).
-- The tracker and the `after/` screenshots live on the `docs/review-2026-10-10` branch, since work-package branches start from main, which does not carry this folder.
+- The tracker and `after/` artifacts are force-added (docs/ is git-ignored) and pushed to `docs/review-2026-10-10` so they survive the container. That commit skips the hooks, since whitespace fixers would corrupt the prototype .patch files and typos flags hash fragments in them. Earlier note: the tracker and the `after/` screenshots live on the `docs/review-2026-10-10` branch, since work-package branches start from main, which does not carry this folder.
 - UI-3: export options are remembered per session (not on disk) and dropped when the project frame changes, so a remembered 9:16 preset can't open on a 16:9 cut.
 - UI-3: after a menu-opened dialog closes, focus returns to the menu bar only for keyboard users; a pointer user's focus on a menu title would steal Space from play/pause.
 - UI-3: dialogs.md "items 1, 2, 4, 8" read as its Top-10 ranks (H3, H2, H4, H5).
