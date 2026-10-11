@@ -75,6 +75,7 @@ import type {
 	VoiceoverStatus,
 	WaveformRange
 } from './types';
+import { unsavedChoice, type UnsavedChoice, type UnsavedCopy } from './confirm-copy';
 import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
 import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
 import { fileTooLarge, importCaptionsInto, MAX_CAPTION_FILE_BYTES, parseFormat, resolveBase } from './caption-import';
@@ -524,13 +525,45 @@ export async function projectPath(): Promise<string | null> {
 	return (await invoke<string | null>('project_path')) ?? null;
 }
 
-/** Ask a yes/no question before something irreversible. `window.confirm` is
- *  replaced by the dialog plugin in the desktop app and returns a promise
- *  there, so it can't be used synchronously — hence this. */
-export async function confirmAction(message: string, title = 'Kerf'): Promise<boolean> {
+/** Ask before something irreversible, with the two ends named as what they do (`labels`) — "Reset
+ *  all" / "Cancel" rather than Yes / No. `window.confirm` is replaced by the dialog plugin in the
+ *  desktop app and returns a promise there, so it can't be used synchronously — hence this. */
+export async function confirmAction(
+	message: string,
+	title = 'Kerf',
+	labels?: { ok: string; cancel: string }
+): Promise<boolean> {
 	if (!inTauri()) return window.confirm(message);
-	const { ask } = await import('@tauri-apps/plugin-dialog');
-	return ask(message, { title, kind: 'warning' });
+	if (!labels) {
+		const { ask } = await import('@tauri-apps/plugin-dialog');
+		return ask(message, { title, kind: 'warning' });
+	}
+	const { message: show, ask } = await import('@tauri-apps/plugin-dialog');
+	try {
+		return (await show(message, { title, kind: 'warning', buttons: { ok: labels.ok, cancel: labels.cancel } })) === labels.ok;
+	} catch {
+		// A platform without custom buttons still gets the question, with the plugin's own.
+		return ask(message, { title, kind: 'warning', okLabel: labels.ok, cancelLabel: labels.cancel });
+	}
+}
+
+/** The unsaved-project prompt: Save…, Don't save and Cancel (`confirm-copy.ts`). Where the native
+ *  dialog cannot show three named buttons it asks the two-button question and Save is not on offer;
+ *  closing the dialog is always Cancel. The browser harness has `window.confirm`, which can only
+ *  discard or cancel. */
+export async function askUnsaved(copy: UnsavedCopy): Promise<UnsavedChoice> {
+	if (!inTauri()) return window.confirm(copy.message) ? 'discard' : 'cancel';
+	const { message: show } = await import('@tauri-apps/plugin-dialog');
+	try {
+		const answer = await show(copy.message, {
+			title: copy.title,
+			kind: 'warning',
+			buttons: { yes: copy.save, no: copy.discard, cancel: copy.cancel }
+		});
+		return unsavedChoice(answer, copy);
+	} catch {
+		return (await confirmAction(copy.message, copy.title, { ok: copy.discard, cancel: copy.cancel })) ? 'discard' : 'cancel';
+	}
 }
 
 /** When the window is asked to close and `needsConfirm()` says there is

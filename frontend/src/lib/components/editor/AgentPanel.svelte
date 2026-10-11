@@ -10,8 +10,8 @@
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { diffHeadline, groupEntries, polarity } from '$lib/diff';
-	import { CAPTION_CONFIRM_TITLE } from '$lib/caption-import-ui';
 	import { confirmReplaceCaptions } from '$lib/title-actions';
+	import { CONFIRM } from '$lib/confirm-copy';
 	import { QUICK_EDIT_STEPS } from '$lib/analysis-steps';
 	import { STATUS_MAP, PRESETS } from './data';
 	import type { DiffEntry, EditSource, Task, TaskStatus, TimelineDiff } from '$lib/types';
@@ -79,7 +79,7 @@
 				if (copied === key) copied = null;
 			}, 1400);
 		} catch {
-			toast.error('Could not copy — select the text and copy manually');
+			toast.error("Couldn't copy — select the text and copy manually");
 		}
 	}
 
@@ -137,10 +137,7 @@
 		if (!staged) return;
 		if (
 			staged.stale &&
-			!(await confirmAction(
-				'You have edited the timeline since these changes were staged. Applying replaces your newer cut. Continue?',
-				'Apply stale changes'
-			))
+			!(await confirmAction(CONFIRM.staleApply.message, CONFIRM.staleApply.title, CONFIRM.staleApply))
 		)
 			return;
 		applying = true;
@@ -233,7 +230,7 @@
 		// The one preset that writes over something the user may care about: captions
 		// from transcripts replace a set already on the cut, an imported one included.
 		// Asked before the task is queued, so declining leaves nothing behind.
-		if (p === 'Caption the cut' && !(await confirmReplaceCaptions(CAPTION_CONFIRM_TITLE))) return;
+		if (p === 'Caption the cut' && !(await confirmReplaceCaptions())) return;
 		let task: Task | null = null;
 		try {
 			task = await agent.add(p);

@@ -79,10 +79,15 @@ describe('Modal', () => {
 		expect(tag).toContain('rescue');
 	});
 
-	test('the others lock while they run and move focus to the live action', () => {
+	test('Fit and Stems lock while they run and move focus to the live action; the update download does not lock, it hides', () => {
 		expect(modalTag('FitMusicDialog')).toContain('busy={applying}');
 		expect(modalTag('StemsDialog')).toContain('busy={running}');
-		expect(modalTag('UpdateDialog')).toContain("busy={u.phase === 'downloading'}");
+		// The download goes on in the background: a modal that cannot be closed would block the whole
+		// app for it, so the dialog says so and offers Hide.
+		expect(modalTag('UpdateDialog')).not.toContain('busy');
+		const update = read(`${EDITOR}UpdateDialog.svelte`);
+		expect(update).toContain('DOWNLOADING_NOTE');
+		expect(update).toMatch(/data-rescue onclick=\{\(\) => u\.close\(\)\}>Hide</);
 		for (const name of ['FitMusicDialog', 'StemsDialog', 'UpdateDialog']) expect(modalTag(name), name).toContain('rescue');
 		// Settings has nothing to lock and no footer to swap.
 		expect(modalTag('SettingsDialog')).not.toMatch(/busy|rescue|dismissOnScrim/);

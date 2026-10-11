@@ -294,7 +294,7 @@
 				void navigator.clipboard
 					.writeText(asset.path)
 					.then(() => toast.success('Path copied'))
-					.catch(() => toast.error('Could not copy the path'))
+					.catch(() => toast.error("Couldn't copy the path"))
 		});
 		items.push({
 			label: 'Show in folder',

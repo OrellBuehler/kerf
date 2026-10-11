@@ -37,6 +37,7 @@
 	import { saveCoverFrame } from '$lib/file-actions';
 	import { importCaptionFile } from '$lib/title-actions';
 	import {
+		askUnsaved,
 		inTauri,
 		isMediaPath,
 		confirmAction,
@@ -46,11 +47,13 @@
 		openReleases,
 		quitApp,
 		revealLogs,
+		revealPath,
 		showMainWindow,
 		takeLaunchProject
 	} from '$lib/api';
 	import { afterPaint, fontsReady, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
+	import { CONFIRM, UNSAVED, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
@@ -113,7 +116,7 @@
 		// would drop it without a word, so ask first.
 		void onWindowCloseRequested(
 			() => editor.hasUnsavedWork,
-			() => confirmAction('This project has never been saved. Close Kerf and lose it?', 'Close Kerf')
+			() => proceedUnsaved(UNSAVED.close)
 		).then((un) => unlisteners.push(un));
 
 		// Each asset's preview proxy and per-kind analysis, kept current by the backend's events
@@ -231,10 +234,13 @@
 
 	/** New / Open replace the project; one that was never saved would be gone. */
 	async function okToReplace(): Promise<boolean> {
-		return (
-			!editor.hasUnsavedWork ||
-			confirmAction('This project has never been saved and will be lost. Continue?', 'Unsaved project')
-		);
+		return !editor.hasUnsavedWork || proceedUnsaved(UNSAVED.replace);
+	}
+
+	/** The unsaved-project prompt and what its answer means: whether to go ahead. "Save…" opens
+	 *  the save dialog and goes ahead only once the project is on disk. */
+	async function proceedUnsaved(copy: UnsavedCopy): Promise<boolean> {
+		return proceedAfter(await askUnsaved(copy), saveProject);
 	}
 
 	async function onNew() {
@@ -272,16 +278,27 @@
 		}
 	}
 
+	/** Write the project to a file the user picks; true once it is on disk. Says how it went. */
+	async function saveProject(): Promise<boolean> {
+		try {
+			if (!(await editor.saveProjectAs())) return false;
+		} catch (e) {
+			toast.error("Couldn't save the project", { description: e instanceof Error ? e.message : String(e) });
+			return false;
+		}
+		const path = editor.currentPath;
+		toast.success(`Saved ${editor.projectName}`, {
+			...(path ? { action: { label: 'Show in folder', onClick: () => void revealPath(path).catch(() => {}) } } : {})
+		});
+		return true;
+	}
+
 	async function onSave() {
 		if (!inTauri()) {
 			toast.info('Saving a project file is available in the desktop app.');
 			return;
 		}
-		try {
-			if (await editor.saveProjectAs()) toast.success(`Saved → ${editor.currentPath}`);
-		} catch (e) {
-			toast.error(e instanceof Error ? e.message : String(e));
-		}
+		await saveProject();
 	}
 
 	function onExport() {
@@ -296,7 +313,7 @@
 		}
 		await quitApp(
 			() => editor.hasUnsavedWork,
-			() => confirmAction('This project has never been saved. Quit Kerf and lose it?', 'Quit Kerf')
+			() => proceedUnsaved(UNSAVED.quit)
 		);
 	}
 
@@ -305,9 +322,8 @@
 	async function resetAllWorkspaces() {
 		const w = settings.workspaces;
 		const stored = Object.keys(w.layouts).length > 0 || Object.keys(w.library.tabs).length > 0;
-		if (stored && !(await confirmAction('Reset every workspace to its default arrangement? The arrangements you made are lost.', 'Reset all workspaces'))) {
-			return;
-		}
+		const reset = CONFIRM.resetWorkspaces;
+		if (stored && !(await confirmAction(reset.message, reset.title, reset))) return;
 		workspace.resetAll();
 	}
 

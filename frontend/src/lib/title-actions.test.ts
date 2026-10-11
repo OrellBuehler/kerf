@@ -101,8 +101,8 @@ describe('importCaptionFile', () => {
 		expect(await importCaptionFile()).toBe(true);
 		expect(asked).toEqual([
 			{
-				message: 'Replace the 2 captions already on the cut with those in second.srt? Titles you added by hand are kept.',
-				title: 'Import captions'
+				message: 'Replace the 2 captions on the cut with those in second.srt? Titles you added by hand are kept.',
+				title: 'Replace captions?'
 			}
 		]);
 		expect(captions().map((o) => o.text)).toEqual(['Hello again', 'General Kenobi']);
@@ -268,7 +268,7 @@ describe('captioning from transcripts', () => {
 		expect(asked).toEqual([]);
 		await makeCaptions();
 		expect(asked).toEqual([
-			{ message: 'Replace the 2 captions already on the cut? Titles you added by hand are kept.', title: 'Caption the cut' }
+			{ message: 'Replace the 2 captions on the cut? Titles you added by hand are kept.', title: 'Replace captions?' }
 		]);
 		// Agreed: the imported set is gone, replaced by the transcript's.
 		expect(generated()).not.toContain('Hello there');

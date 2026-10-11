@@ -214,7 +214,7 @@ class SettingsStore {
 			this.absorb(await setSettings(patch));
 			return true;
 		} catch (e) {
-			toast.error(`Could not save the ${what}`, { description: String(e) });
+			toast.error(`Couldn't save the ${what}`, { description: String(e) });
 			await this.load();
 			return false;
 		} finally {
@@ -511,7 +511,7 @@ class SettingsStore {
 			const where = await exportThemeFile(themeJson(this.theme), `${slug}.kerf-theme.json`);
 			if (where) toast.success('Theme saved', { description: where });
 		} catch (e) {
-			toast.error('Could not save the theme', { description: String(e) });
+			toast.error("Couldn't save the theme", { description: String(e) });
 		}
 	}
 
