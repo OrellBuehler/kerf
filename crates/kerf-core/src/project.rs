@@ -1205,7 +1205,13 @@ impl Project {
     /// the decoded pixels come from the lighter all-intra proxy. Export reads
     /// [`Project::list_assets`] (originals) and is unaffected.
     fn preview_assets(&self) -> Result<Vec<Asset>> {
-        let mut assets = self.list_assets()?;
+        Ok(Self::preview_assets_of(self.list_assets()?))
+    }
+
+    /// [`Project::preview_assets`] over assets already read: each one swapped for its ready
+    /// proxy where there is one. Touches the disk (is the proxy there), not the project, so it
+    /// belongs outside the project lock.
+    pub fn preview_assets_of(mut assets: Vec<Asset>) -> Vec<Asset> {
         for asset in &mut assets {
             let source = Self::preview_source(asset);
             if source != Path::new(&asset.path) {
@@ -1215,7 +1221,7 @@ impl Project {
                 asset.path = source.to_string_lossy().into_owned();
             }
         }
-        Ok(assets)
+        assets
     }
 
     /// Reduce an asset's first audio stream to `buckets` peak magnitudes in
