@@ -15,8 +15,8 @@ use std::time::Instant;
 
 use super::cpu;
 use super::decode_policy::{
-    export_hwaccel_request, facts_from_assets, facts_matter, looks_like_hardware_decode_failure, resolve_hwaccel, tune_inputs,
-    Chroma, Codec, HostOs, InputFacts, Reading,
+    export_hwaccel_request, facts_from_assets, facts_matter, looks_like_hardware_decode_failure, pix_fmt_bits_420,
+    resolve_hwaccel, tune_inputs, Chroma, Codec, HostOs, InputFacts, Reading,
 };
 use super::source_probe::{ProbeCache, SOURCE_PROBE_TIMEOUT};
 use super::ProbeResult;
@@ -190,6 +190,7 @@ fn path_facts(path: &Path) -> InputFacts {
     InputFacts {
         codec: traits.codec,
         chroma: traits.chroma,
+        bits: traits.bits,
         ..InputFacts::default()
     }
 }
@@ -1475,6 +1476,8 @@ pub(crate) struct SourceTraits {
     /// path has to ask of them: whether to request a hardware decoder (`decode_policy`).
     pub codec: Codec,
     pub chroma: Chroma,
+    /// The bit depth of a 4:2:0 stream.
+    pub bits: Option<u8>,
     /// The first plane of the decoded picture is the luma alone (see [`luma_plane_pix_fmt`]):
     /// what a yuv420p proxy's first plane is, and the only plane `select='scene'` scores.
     pub luma_plane: bool,
@@ -1581,6 +1584,7 @@ fn parse_source_traits(json: &str) -> SourceTraits {
         indexed,
         codec: Codec::from_name(text("codec_name")),
         chroma: Chroma::from_pix_fmt(text("pix_fmt")),
+        bits: pix_fmt_bits_420(text("pix_fmt")),
         luma_plane: luma_plane_pix_fmt(text("pix_fmt")),
     }
 }
@@ -5295,6 +5299,147 @@ fn tune_export_args(args: &mut Vec<String>, assets: &[Asset], os: HostOs) -> boo
     tune_inputs(args, os, Reading::Whole, &facts_from_assets(assets)).hw
 }
 
+/// The filters a graph may hold and still be hardware from end to end: the picture goes through
+/// the cores only to be scaled, laid over a canvas and handed to the encoder (about 5 % of a
+/// hardware export's wall time, measured; a VAAPI export's `format=nv12,hwupload` tail is a copy of
+/// each frame to the device and belongs to the same 5 %), and the sound through filters that cost next to nothing
+/// beside a video encode. Anything else (`zscale` and the tone-map, `geq`, `rotate`, `v360`,
+/// `drawtext`, a blur, a grade, a chroma key, a keyed opacity) is per-pixel work on the cores, and
+/// a name nobody here has judged is such work until it is.
+const HARDWARE_GRAPH_FILTERS: [&str; 34] = [
+    // picture
+    "color",
+    "format",
+    "trim",
+    "setpts",
+    "scale",
+    "pad",
+    "setsar",
+    "fps",
+    "overlay",
+    "null",
+    "split",
+    "crop",
+    "settb",
+    "fade",
+    "hwupload",
+    // sound
+    "anullsrc",
+    "atrim",
+    "asetpts",
+    "atempo",
+    "volume",
+    "afade",
+    "aformat",
+    "adelay",
+    "amix",
+    "apad",
+    "pan",
+    "alimiter",
+    "aresample",
+    "asplit",
+    "anull",
+    "loudnorm",
+    "acompressor",
+    "agate",
+    "asetnsamples",
+];
+
+/// The filter names of a `-filter_complex` value, in order (pure, unit-tested): what follows each
+/// run of `[label]`s at the start of a filter, up to its `=` or `[`. Commas and semicolons inside
+/// single quotes or after a backslash are the filter's own (an expression), not the next filter.
+fn filter_names(graph: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    let bytes = graph.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Labels and spaces in front of a filter.
+        while i < bytes.len() && (bytes[i] == b'[' || bytes[i].is_ascii_whitespace()) {
+            if bytes[i] == b'[' {
+                while i < bytes.len() && bytes[i] != b']' {
+                    i += 1;
+                }
+            }
+            i += 1;
+        }
+        let from = i;
+        while i < bytes.len() && !matches!(bytes[i], b'=' | b'[' | b',' | b';') && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i > from {
+            names.push(&graph[from..i]);
+        }
+        // The rest of this filter: to the next `,` or `;` that is not quoted or escaped.
+        let mut quoted = false;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 1,
+                b'\'' => quoted = !quoted,
+                b',' | b';' if !quoted => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        i += 1;
+    }
+    names
+}
+
+/// Which resource a built export argv (after `tune_inputs`, before the graph is spilled to a file)
+/// spends (pure, unit-tested): the hardware's slot ([`cpu::Resource::Gpu`]) only when the run is
+/// hardware from end to end, and the cores' for everything else, which includes every doubt.
+///
+/// Hardware from end to end means all of: the lane is on; the video encoder is a hardware one
+/// (`h264_amf`, `hevc_nvenc`, ...); every input is either a still image or a video that is
+/// handed a **named** accelerator (`d3d11va`: it exits non-zero without a device where `auto`
+/// falls back to software without a word, and a run that does that is a software run holding a
+/// hardware slot) and that accelerator decodes (`InputFacts::hardware_decodes`: H.264 4:2:0 at 8 bit,
+/// HEVC 4:2:0 at 8 or 10, by what the asset records);
+/// and the graph holds only [`HARDWARE_GRAPH_FILTERS`]. A run asked for no hardware decode at all,
+/// as the rerun after a failure is, fails the second test and is the cores'.
+fn export_resource(args: &[String], facts_of: &dyn Fn(&str) -> InputFacts, lane_on: bool) -> cpu::Resource {
+    if !lane_on {
+        return cpu::Resource::Cpu;
+    }
+    let value_of = |flag: &str| args.iter().position(|a| a == flag).and_then(|at| args.get(at + 1));
+    if !value_of("-c:v").is_some_and(|enc| enc_family(enc) != EncFamily::Software) {
+        return cpu::Resource::Cpu;
+    }
+    // Inputs, in groups: everything up to and including each `-i <path>`.
+    let mut group_hwaccel: Option<&str> = None;
+    let mut graph: Option<&str> = None;
+    let mut inputs = 0;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "-hwaccel" => group_hwaccel = rest.next().map(String::as_str),
+            "-i" => {
+                inputs += 1;
+                let Some(path) = rest.next() else { return cpu::Resource::Cpu };
+                let facts = facts_of(path);
+                let video = facts.hardware_decodes();
+                let named = group_hwaccel.is_some_and(|h| {
+                    !h.trim().is_empty() && !h.trim().eq_ignore_ascii_case("auto") && !h.trim().eq_ignore_ascii_case("none")
+                });
+                if !(facts.image || (video && named)) {
+                    return cpu::Resource::Cpu;
+                }
+                group_hwaccel = None;
+            }
+            "-filter_complex" => graph = rest.next().map(String::as_str),
+            _ => {}
+        }
+    }
+    let Some(graph) = graph.filter(|_| inputs > 0) else {
+        return cpu::Resource::Cpu;
+    };
+    if filter_names(graph).iter().all(|name| HARDWARE_GRAPH_FILTERS.contains(name)) {
+        cpu::Resource::Gpu
+    } else {
+        cpu::Resource::Cpu
+    }
+}
+
 /// Point a built argv's `-vaapi_device` at `device`, when the probe found one (pure). Without
 /// one the builder's stand-in stays, and the export fails with ffmpeg's own words for it.
 fn set_vaapi_device(args: &mut [String], device: Option<&str>) {
@@ -5492,8 +5637,11 @@ fn render_attempt(
     } else {
         let mut args = build_export_args(timeline, assets, output_str, opts)?;
         hw_used.set(tune_export_args(&mut args, assets, HostOs::CURRENT));
+        // Judged on the argv as it will run, before a long graph is spilled to a file: a run
+        // that asks no input for hardware (the rerun after a hardware failure) is the cores'.
+        let resource = export_resource(&args, &facts_from_assets(assets), cpu::gpu_lane());
         let _g = externalize_filter_complex(&mut args, "s")?;
-        run_ffmpeg_progress(
+        run_ffmpeg_progress_as(
             &args,
             output,
             Bar {
@@ -5502,6 +5650,7 @@ fn render_attempt(
                 width: 1.0,
                 start,
             },
+            resource,
             progress,
             cancel,
         )
@@ -5670,6 +5819,19 @@ fn run_ffmpeg_progress(
     progress: &mut dyn FnMut(ExportProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<RenderStatus> {
+    run_ffmpeg_progress_as(args, output, bar, cpu::Resource::Cpu, progress, cancel)
+}
+
+/// [`run_ffmpeg_progress`] for a run that spends `resource`: the cores' slot for any software
+/// run, the hardware's for one that is hardware from end to end ([`export_resource`]).
+fn run_ffmpeg_progress_as(
+    args: &[String],
+    output: &Path,
+    bar: Bar,
+    resource: cpu::Resource,
+    progress: &mut dyn FnMut(ExportProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<RenderStatus> {
     use std::io::{BufRead, BufReader, Read};
     use std::process::Stdio;
 
@@ -5678,17 +5840,19 @@ fn run_ffmpeg_progress(
     // second pass and a stitch inside an import do not queue behind themselves. It is the
     // foreground lane — ahead of any proxy still queued — and a render that has to wait says
     // so through `progress` and can be cancelled while it does.
-    let cpu = match cpu::lease_waiting(
-        &mut |wait| {
-            progress(ExportProgress {
-                fraction: bar.offset,
-                elapsed_secs: bar.start.elapsed().as_secs_f64(),
-                eta_secs: None,
-                waiting: Some(wait.message()),
-            });
-        },
-        cancel,
-    ) {
+    let mut on_wait = |wait: cpu::Wait| {
+        progress(ExportProgress {
+            fraction: bar.offset,
+            elapsed_secs: bar.start.elapsed().as_secs_f64(),
+            eta_secs: None,
+            waiting: Some(wait.message()),
+        });
+    };
+    let leased = match resource {
+        cpu::Resource::Cpu => cpu::lease_waiting(&mut on_wait, cancel),
+        cpu::Resource::Gpu => cpu::lease_gpu_waiting(&mut on_wait, cancel),
+    };
+    let cpu = match leased {
         Ok(lease) => lease,
         Err(Error::Cancelled) => return Ok(RenderStatus::Cancelled),
         Err(e) => return Err(e),
@@ -5696,7 +5860,7 @@ fn run_ffmpeg_progress(
     let mut args = args.to_vec();
     cpu::limit_args(&mut args, cpu.threads());
     let args = &args[..];
-    tracing::info!(output = %output.display(), "exporting timeline");
+    tracing::info!(output = %output.display(), resource = ?cpu.resource(), "exporting timeline");
     tracing::debug!(command = %format!("{bin} {}", args.join(" ")), "ffmpeg export command");
 
     // `-progress pipe:1` writes machine-readable key=value blocks to stdout;
@@ -7492,11 +7656,13 @@ fn run_still(
         let mut args = build_still_args(timeline, assets, o, t, max_width, region, out)?;
         hw_used.set(tune_still_args(&mut args, assets, HostOs::CURRENT));
         let bin = ffmpeg_bin();
-        let output = command(&bin)
-            .args(&args)
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| launch_err(&bin, e))?;
+        let output = output_bounded(command(&bin).args(&args), STILL_TIMEOUT).map_err(|e| match e.kind() {
+            std::io::ErrorKind::TimedOut => Error::Engine(format!(
+                "could not render timeline frame at {t:.3}s: ffmpeg did not answer in {} s and was stopped",
+                STILL_TIMEOUT.as_secs()
+            )),
+            _ => launch_err(&bin, e),
+        })?;
         if !output.status.success() || (piping && output.stdout.is_empty()) {
             return Err(Error::Engine(format!(
                 "could not render timeline frame at {t:.3}s: {}",
@@ -7522,6 +7688,85 @@ fn run_still(
         },
         result => result,
     }
+}
+
+/// How long one composited still may run before it is killed. A still of a 4K 4:2:2 original is
+/// a second or two; this is for the one that hangs (a hardware decoder stuck in a driver), which
+/// would otherwise hold the caller, and the Preview's one frame in flight, for good.
+const STILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// `Command::output()` with a deadline: run `cmd` with its stdin closed and both output pipes
+/// read, and kill it if it has not finished in `limit` (`ErrorKind::TimedOut`). The calling thread
+/// reads stdout to its end, a watchdog kills the process at the deadline (which ends that read),
+/// and nothing waits on the child while the watchdog could need it.
+fn output_bounded(cmd: &mut Command, limit: std::time::Duration) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    use std::sync::Arc;
+
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let child = Arc::new(Mutex::new(child));
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let (done, finished) = channel::<()>();
+    let watchdog = {
+        let child = Arc::clone(&child);
+        let timed_out = Arc::clone(&timed_out);
+        std::thread::spawn(move || {
+            if matches!(finished.recv_timeout(limit), Err(RecvTimeoutError::Timeout)) {
+                timed_out.store(true, Ordering::SeqCst);
+                let _ = child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+            }
+        })
+    };
+    let err_reader = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        if let Some(mut e) = stderr {
+            let _ = e.read_to_end(&mut text);
+        }
+        text
+    });
+    let mut out = Vec::new();
+    let read = match stdout.as_mut() {
+        Some(o) => o.read_to_end(&mut out).map(|_| ()),
+        None => Ok(()),
+    };
+    // The output has ended, so the process is exiting; poll rather than block in `wait`, which
+    // would hold the child's lock against the watchdog's kill.
+    let started = Instant::now();
+    let status = loop {
+        let mut c = child.lock().unwrap_or_else(|e| e.into_inner());
+        match c.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if started.elapsed() > limit => {
+                timed_out.store(true, Ordering::SeqCst);
+                let _ = c.kill();
+                break c.wait();
+            }
+            Ok(None) => {}
+            Err(e) => break Err(e),
+        }
+        drop(c);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    let _ = done.send(());
+    let _ = watchdog.join();
+    let stderr = err_reader.join().unwrap_or_default();
+    if timed_out.load(Ordering::SeqCst) {
+        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the process timed out"));
+    }
+    read?;
+    Ok(std::process::Output {
+        status: status?,
+        stdout: out,
+        stderr,
+    })
 }
 
 /// Tune a built still argv for the process about to be spawned: each input's `-hwaccel` and
@@ -7684,8 +7929,21 @@ fn build_still_args(
 ) -> Result<Vec<String>> {
     // Same gate as the export, so the still shows the cut that would render.
     let rendered = timeline.for_render();
-    let timeline = &rendered;
+    build_still_args_rendered(&rendered, assets, opts, t, max_width, region, out)
+}
 
+/// [`build_still_args`] over a timeline that has already been through [`Timeline::for_render`]:
+/// what a caller asking for many frames of one cut (the scrub cache keys every frame of a
+/// window) does once instead of per frame.
+fn build_still_args_rendered(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    max_width: u32,
+    region: Option<Region>,
+    out: &StillOutput,
+) -> Result<Vec<String>> {
     let fmt = export_format(timeline, assets, opts);
     // A region zoom composites a canvas wide enough that the region alone is
     // `max_width` — the delivery frame caps it, so a zoom never upscales.
@@ -8085,6 +8343,25 @@ mod rendered;
 /// The still inside a fade, a dip, a dissolve, a slide or a push: its layers and their fades.
 mod still_fx;
 use still_fx::{still_layers, StillFades};
+
+/// Which slot a job takes, the cores' or the hardware's.
+#[cfg(test)]
+mod lane_tests;
+
+/// The deadline on a one-shot still's process.
+#[cfg(all(test, unix))]
+mod output_bounded_tests;
+
+/// A bounded cache of composited stills, keyed by the argv that would draw each.
+mod still_cache;
+
+/// The scrubbed frame: cached, with a window of its neighbours drawn by one process.
+mod scrub;
+pub use scrub::{ScrubConfig, ScrubFrames, ScrubStats};
+
+/// The scrub window held to the export's frames and the still's (`#[ignore]`d).
+#[cfg(test)]
+mod scrub_rendered;
 
 /// The scrubbed still held to the export's frame at the same moment (`#[ignore]`d).
 #[cfg(test)]
