@@ -4291,9 +4291,6 @@ fn require_window(start: f64, end: f64) -> Result<(), McpError> {
     }
 }
 
-/// Refuse to silently clobber an existing file. A model that hallucinates or
-/// mis-remembers a path would otherwise destroy whatever is already there with
-/// no recourse — this is the write side of `require_local_output_path`.
 /// One rendered variant as `export_variants` reports it: the file, and the platforms it is ready for
 /// with every issue that is more than a tip — judged at *that* file's frame and over the span it wrote
 /// (`range`, the export's own), so a Reel cut from a long timeline is not held to the timeline's length.
@@ -4331,6 +4328,9 @@ fn variant_output(
     }))
 }
 
+/// Refuse to silently clobber an existing file. A model that hallucinates or
+/// mis-remembers a path would otherwise destroy whatever is already there with
+/// no recourse — this is the write side of `require_local_output_path`.
 fn refuse_overwrite(path: &std::path::Path, overwrite: bool) -> Result<(), McpError> {
     if !overwrite && path.exists() {
         return Err(McpError::invalid_params(

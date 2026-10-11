@@ -17,6 +17,7 @@
 
 import { VARIANT_PRESETS, hasPicture, ratioLabel } from './delivery-formats';
 import { containerInfo } from './export-presets';
+import { TARGETS } from './platforms';
 import type { DeliveryCheck, DeliveryIssue, ExportOptions, PlatformReport, Timeline } from './types';
 
 export type VerdictLevel = 'ok' | 'note' | 'warning' | 'error';
@@ -120,12 +121,14 @@ function tipsFor(reports: PlatformReport[]): string[] {
 		const soft = aimed.filter((c) => c.issues.some((i) => i.kind === 'resolution'));
 		if (soft.length) {
 			const many = soft.length > 1;
+			const native = TARGETS.find((t) => t.id === soft[0].target);
+			const size = native ? ` (${native.width}×${native.height})` : '';
 			const names = list(
 				soft.map((c) => c.label),
 				'and'
 			);
 			out.add(
-				`${r.cut.width}×${r.cut.height} is below the size ${names} ${many ? 'are' : 'is'} made for; ${many ? 'they' : 'the platform'} will upscale it and it will look soft.`
+				`${r.cut.width}×${r.cut.height} is below the size ${names} ${many ? 'are' : 'is'} made for${size}; ${many ? 'they' : 'the platform'} will upscale it and it will look soft.`
 			);
 		}
 		for (const c of aimed)

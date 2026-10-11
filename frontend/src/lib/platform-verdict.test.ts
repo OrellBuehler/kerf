@@ -135,7 +135,7 @@ describe('the default 16:9 export, no shape ticked', () => {
 		expect(levels(v)).toEqual(['note']);
 		const soft = v.tips.filter((t) => t.includes('upscale'));
 		expect(soft).toEqual([
-			'720×1280 is below the size Instagram Reels, YouTube Shorts and TikTok are made for; they will upscale it and it will look soft.'
+			'720×1280 is below the size Instagram Reels, YouTube Shorts and TikTok are made for (1080×1920); they will upscale it and it will look soft.'
 		]);
 		const ticked = verdict({ shapes: [{ label: '9:16', report: rep(720, 1280) }, { label: '9:16', report: rep(720, 1280) }] });
 		expect(ticked.tips.filter((t) => t.includes('upscale'))).toHaveLength(1);
@@ -146,7 +146,7 @@ describe('the default 16:9 export, no shape ticked', () => {
 		expect(levels(v)).toEqual(['note']);
 		expect(texts(v)[0]).toBe('1280×720, 16:9, 0:20. Fine for YouTube and the web. Tick a shape under Deliver to for Reels, Shorts or TikTok.');
 		expect(v.tips).toEqual([
-			'1280×720 is below the size YouTube is made for; the platform will upscale it and it will look soft.'
+			'1280×720 is below the size YouTube is made for (1920×1080); the platform will upscale it and it will look soft.'
 		]);
 	});
 });

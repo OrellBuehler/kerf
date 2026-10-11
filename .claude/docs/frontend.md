@@ -514,7 +514,7 @@ the platforms are the ones whose check had no `shape` issue at that
 frame, so a 1:1 cut is "fine for YouTube Shorts and Instagram feed" and never told it is
 letterboxed) — and amber / red appear only for a *length* limit of a platform that frame is made for
 (the reach warning, the hard cap, the minimum). A low resolution (one tip for the frame, naming every
-platform that would upscale it) and the muted-feed captions tip are folded tips, never amber (the
+platform that would upscale it, and the size they are made for) and the muted-feed captions tip are folded tips, never amber (the
 captions tip is not given for YouTube). With **shapes ticked**
 each file is a row ("9:16 · Ready for Instagram Reels · YouTube Shorts · TikTok", then its length
 problems), judged only for the platforms that take that shape, and the single-file line is gone.
