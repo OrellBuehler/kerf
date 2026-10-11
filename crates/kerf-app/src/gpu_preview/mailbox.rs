@@ -55,7 +55,6 @@ impl<R, T> Default for Mailbox<R, T> {
 }
 
 /// What the mailbox counted.
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct MailboxStats {
     pub posted: u64,
@@ -107,7 +106,6 @@ impl<R, T> Mailbox<R, T> {
         }
     }
 
-    #[cfg(test)]
     pub fn stats(&self) -> MailboxStats {
         let st = self.state();
         MailboxStats {

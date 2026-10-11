@@ -32,6 +32,7 @@ import type {
 	ExportOptions,
 	ExportProgress,
 	Filmstrip,
+	GpuPreviewDiagnostics,
 	GpuPreviewStatus,
 	ImportProgress,
 	Easing,
@@ -3064,6 +3065,13 @@ export async function gpuPreviewStatus(): Promise<GpuPreviewStatus> {
 		};
 	}
 	return invoke<GpuPreviewStatus>('gpu_preview_status');
+}
+
+/** What this session's GPU preview frames did, and why the others went through FFmpeg. Local
+ *  and in memory; there is none in the browser harness. */
+export async function gpuPreviewDiagnostics(): Promise<GpuPreviewDiagnostics | null> {
+	if (!inTauri()) return null;
+	return invoke<GpuPreviewDiagnostics>('gpu_preview_diagnostics');
 }
 
 export async function getWaveform(assetId: string, buckets: number): Promise<number[]> {

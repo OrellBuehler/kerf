@@ -2072,6 +2072,16 @@ fn gpu_preview_status(gpu: State<'_, Arc<gpu_preview::GpuPreview>>) -> gpu_previ
     gpu.status()
 }
 
+/// What this session's preview frames did, for diagnostics: how many the GPU drew and how many went
+/// through FFmpeg and for which kind of reason (the plan's refusals counted by kind, with the first
+/// message as an example), how often the frames' inputs were served from the held snapshot, how many
+/// requests a newer one replaced, and where the parity self-test stands. Local and in memory; also
+/// logged when the preview is torn down.
+#[tauri::command(async)]
+fn gpu_preview_diagnostics(gpu: State<'_, Arc<gpu_preview::GpuPreview>>) -> gpu_preview::GpuDiagnostics {
+    gpu.diagnostics()
+}
+
 /// Bytes in front of the JPEG in a playback message: the frame's timeline time as an `f64`, little
 /// endian. Mirrored by `parsePlaybackMessage` in `frontend/src/lib/frame-transport.ts`.
 const PLAYBACK_HEADER_BYTES: usize = 8;
@@ -3488,6 +3498,7 @@ pub fn run() {
             get_preview_frame,
             set_preview_bounds,
             gpu_preview_status,
+            gpu_preview_diagnostics,
             start_playback,
             stop_playback,
             get_waveform,

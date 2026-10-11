@@ -19,7 +19,8 @@
 //!   before anything is decoded, planned from files or rendered; a scrubbed frame takes none.
 //! * **Latest wins** ([`mailbox`]): a request replaces the one waiting, so a drag draws the frames
 //!   it ends on and not every one it passed.
-//! * **Paced**: frames of a drag are presented without waiting for the refresh ([`pace`]).
+//! * **Counted, paced**: every refusal is counted by kind ([`diagnostics`]), and frames of a drag are
+//!   presented without waiting for the refresh ([`pace`]).
 //! * **Lazy and rebuildable**: the device, compositor, frame source and surface are made on the
 //!   first frame that wants them ([`Backend`]); a failure is remembered with a backoff
 //!   ([`Backoff`]) and a lost device is dropped and rebuilt on the next use, as `kerf-gpu`
@@ -39,6 +40,7 @@
 //! This is a GUI-only surface: it has no MCP tool, because the agent already has
 //! `preview_timeline` (a JPEG of the cut) and nothing here is an edit.
 
+mod diagnostics;
 mod mailbox;
 mod pace;
 mod snapshot;
@@ -65,11 +67,12 @@ use kerf_gpu::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+use diagnostics::{Counters, Reason, Tally};
 pub use mailbox::Delivery;
-use mailbox::{Mailbox, Worker};
+use mailbox::{Mailbox, MailboxStats, Worker};
 use pace::Pace;
 pub use snapshot::Taken;
-use snapshot::{PlanInputs, PlanSnapshots};
+use snapshot::{PlanInputs, PlanSnapshots, SnapshotStats};
 
 /// The widest frame the GPU preview renders; a bigger panel is drawn from this, scaled up.
 pub const MAX_RENDER_WIDTH: u32 = 1920;
@@ -428,6 +431,22 @@ pub fn react(error: &GpuError) -> Reaction {
         GpuError::Surface(why) if why.contains("occluded") || why.contains("timed out") => Reaction::Frame,
         GpuError::Surface(_) => Reaction::Rebuild,
         GpuError::Unsupported(_) | GpuError::Decode(_) | GpuError::Busy(_) | GpuError::Readback(_) => Reaction::Frame,
+    }
+}
+
+/// A fixed word for a GPU error, to count failures by.
+fn error_kind(error: &GpuError) -> &'static str {
+    match error {
+        GpuError::NoAdapter(_) => "gpu_no_adapter",
+        GpuError::Device(_) => "gpu_device",
+        GpuError::DeviceLost(_) => "gpu_device_lost",
+        GpuError::OutOfMemory => "gpu_out_of_memory",
+        GpuError::Gpu(_) => "gpu_rejected",
+        GpuError::Decode(_) => "decode",
+        GpuError::Unsupported(_) => "gpu_unsupported",
+        GpuError::Busy(_) => "decode_busy",
+        GpuError::Readback(_) => "gpu_readback",
+        GpuError::Surface(_) => "surface",
     }
 }
 
@@ -836,9 +855,22 @@ impl Want {
 /// How a `get_preview_frame` ended, for the command: the frame, or "a newer request took its place".
 type Answer = Delivery<Result<PreviewFrameResult, String>>;
 
+/// What `gpu_preview_diagnostics` answers: what this session's frames did and why the others went
+/// through FFmpeg, and what the machinery around them did.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct GpuDiagnostics {
+    pub tally: Tally,
+    /// How often the frames' inputs were served from the held snapshot and how often taken again.
+    pub snapshots: SnapshotStats,
+    /// Requests posted, and how many a newer one replaced.
+    pub requests: MailboxStats,
+    pub adapter: Option<String>,
+    pub software: bool,
+}
+
 enum Attempt {
     Presented(GpuTimings),
-    Fallback(Vec<String>),
+    Fallback(Vec<Reason>),
 }
 
 /// Why a backend did not come up.
@@ -887,6 +919,7 @@ pub struct GpuPreview {
     mail: Mailbox<FrameRequest, Result<PreviewFrameResult, String>>,
     /// Whether requests are arriving like a drag.
     pace: Mutex<Pace>,
+    counters: Mutex<Counters>,
     bounds: Mutex<BoundsState>,
     /// The live host, outside the render lock so hiding the surface never waits for a render.
     host: Mutex<Option<Arc<Mutex<Host>>>>,
@@ -927,6 +960,7 @@ impl GpuPreview {
             snapshots: PlanSnapshots::default(),
             mail: Mailbox::default(),
             pace: Mutex::new(Pace::default()),
+            counters: Mutex::new(Counters::default()),
             enabled: AtomicBool::new(false),
             reset_backoff: AtomicBool::new(false),
             info: Mutex::new(Info {
@@ -1051,6 +1085,7 @@ impl GpuPreview {
 
     /// Drop the backend (device, surface, decodes). The window host goes back to normal.
     fn teardown(&self) {
+        tracing::info!(session = %lock(&self.counters).tally(self.mail.stats().superseded).line(), "the GPU preview's frames so far");
         self.snapshots.forget();
         *lock(&self.host) = None;
         let backend = lock(&self.render).backend.take();
@@ -1149,6 +1184,7 @@ impl GpuPreview {
         let attempt = catch_unwind(AssertUnwindSafe(|| self.attempt(inputs, want, Instant::now())));
         let reasons = match attempt {
             Ok(Attempt::Presented(timings)) => {
+                lock(&self.counters).presented();
                 return Ok(PreviewFrameResult {
                     renderer: "gpu",
                     frame: None,
@@ -1157,9 +1193,22 @@ impl GpuPreview {
                 });
             }
             Ok(Attempt::Fallback(reasons)) => reasons,
-            Err(payload) => vec![self.after_panic(payload.as_ref())],
+            Err(payload) => vec![Reason::new("panic", self.after_panic(payload.as_ref()))],
         };
-        tracing::debug!(?reasons, t = want.t, "preview frame through FFmpeg");
+        for kind in lock(&self.counters).refused(&reasons) {
+            let example = reasons
+                .iter()
+                .find(|r| r.kind == kind)
+                .map(|r| r.text.as_str())
+                .unwrap_or_default();
+            tracing::info!(
+                kind,
+                example,
+                "a preview frame went through FFmpeg for a reason not seen this session"
+            );
+        }
+        let texts: Vec<String> = reasons.into_iter().map(|r| r.text).collect();
+        tracing::debug!(reasons = ?texts, t = want.t, "preview frame through FFmpeg");
         let jpeg = self
             .scrub
             .frame(&inputs.timeline, &inputs.preview_assets, want.t, ffmpeg_width, 4)
@@ -1168,9 +1217,22 @@ impl GpuPreview {
         Ok(PreviewFrameResult {
             renderer: "ffmpeg",
             frame: Some(format!("data:image/jpeg;base64,{b64}")),
-            reasons,
+            reasons: texts,
             timings: None,
         })
+    }
+
+    /// What this session's frames did and why the others went through FFmpeg.
+    pub fn diagnostics(&self) -> GpuDiagnostics {
+        let mail = self.mail.stats();
+        let info = lock(&self.info);
+        GpuDiagnostics {
+            tally: lock(&self.counters).tally(mail.superseded),
+            snapshots: self.snapshots.stats(),
+            requests: mail,
+            adapter: info.adapter.clone(),
+            software: info.software,
+        }
     }
 
     /// The GPU path panicked: say so, hide the surface and drop the backend (it may be in any
@@ -1264,28 +1326,33 @@ impl GpuPreview {
 
     fn attempt(&self, inputs: &PlanInputs, want: Want, now: Instant) -> Attempt {
         let t = want.t;
-        let fallback = |why: String| {
+        let fallback = |kind: &'static str, why: String| {
             self.hide();
-            Attempt::Fallback(vec![why])
+            Attempt::Fallback(vec![Reason::new(kind, why)])
         };
         if !self.is_enabled() {
-            return Attempt::Fallback(vec!["the GPU preview is off".into()]);
+            return Attempt::Fallback(vec![Reason::new("preview_off", "the GPU preview is off")]);
         }
         let Some(technique) = self.technique.technique else {
-            return Attempt::Fallback(vec![self
-                .technique
-                .note
-                .clone()
-                .unwrap_or_else(|| "no preview surface here".into())]);
+            return Attempt::Fallback(vec![Reason::new(
+                "no_surface",
+                self.technique
+                    .note
+                    .clone()
+                    .unwrap_or_else(|| "no preview surface here".into()),
+            )]);
         };
         let Some(bounds) = lock(&self.bounds).current else {
-            return Attempt::Fallback(vec!["the preview has not reported where it is".into()]);
+            return Attempt::Fallback(vec![Reason::new("no_bounds", "the preview has not reported where it is")]);
         };
         if !bounds.visible {
-            return fallback("the preview surface is hidden".into());
+            return fallback("hidden", "the preview surface is hidden".into());
         }
         if want.overlays && !technique.overlays() {
-            return fallback("the page has something to draw over the picture, and this surface sits above the page".into());
+            return fallback(
+                "overlays",
+                "the page has something to draw over the picture, and this surface sits above the page".into(),
+            );
         }
 
         // The plan, off the project lock.
@@ -1296,17 +1363,17 @@ impl GpuPreview {
             PlanRequest::still((self.policy)()).with_media(&ProxyMedia),
         ) {
             Ok(planner) => planner,
-            Err(e) => return fallback(format!("no plan for this frame: {e}")),
+            Err(e) => return fallback("no_plan", format!("no plan for this frame: {e}")),
         };
         let plan = match plan_at_grid(&planner, t) {
             Ok(plan) => plan,
-            Err(e) => return fallback(format!("no plan for this frame: {e}")),
+            Err(e) => return fallback("no_plan", format!("no plan for this frame: {e}")),
         };
 
         // A backend is built off the render lock, with a deadline: a slow or stuck build is a frame
         // that goes through FFmpeg, not a preview that waits for it.
         if let Err(why) = self.ensure_backend(technique, now) {
-            return fallback(why);
+            return fallback("backend", why);
         }
         // What the frame draws with is taken under the render lock and kept without it: the lock is
         // not held while the frame decodes (which waits for FFmpeg) or renders, so turning the setting
@@ -1316,7 +1383,7 @@ impl GpuPreview {
             // Looked at again under the lock: the setting may have gone off while this frame was planned.
             if !self.is_enabled() {
                 drop(state);
-                return fallback("the GPU preview was turned off".into());
+                return fallback("preview_off", "the GPU preview was turned off".into());
             }
             match state.backend.as_ref() {
                 Some(b) => Drawing {
@@ -1326,7 +1393,7 @@ impl GpuPreview {
                 },
                 None => {
                     drop(state);
-                    return fallback("the GPU preview is not up".into());
+                    return fallback("backend", "the GPU preview is not up".into());
                 }
             }
         };
@@ -1338,10 +1405,10 @@ impl GpuPreview {
             Technique::Child => Some((0, 0)),
         };
         let Some(window_size) = window_size else {
-            return fallback("the window has no size".into());
+            return fallback("no_window", "the window has no size".into());
         };
         let Some(layout) = layout_for(technique, &bounds, window_size) else {
-            return fallback("the preview frame is outside the window".into());
+            return fallback("outside_window", "the preview frame is outside the window".into());
         };
         let canvas = (plan.canvas.width, plan.canvas.height);
         let (width, _) = place_frame(canvas, layout.area, |w| plan.size(w));
@@ -1350,7 +1417,7 @@ impl GpuPreview {
         let reasons = plan.reasons(&caps, size);
         if !reasons.is_empty() {
             self.hide();
-            return Attempt::Fallback(reasons.iter().map(ToString::to_string).collect());
+            return Attempt::Fallback(reasons.iter().map(|r| Reason::new(r.kind(), r.to_string())).collect());
         }
         let rendered = drawing
             .compositor
@@ -1366,7 +1433,7 @@ impl GpuPreview {
             (Err(error), _) => Err(error),
             (Ok(_), None) => {
                 drop(state);
-                return fallback("the GPU preview was restarted while the frame was drawn".into());
+                return fallback("backend", "the GPU preview was restarted while the frame was drawn".into());
             }
             // `None`: the surface was hidden (or the setting turned off) while the frame was drawn.
             (Ok((frame, timings)), Some(backend)) => self.show(backend, &host, technique, canvas, want, &frame, timings),
@@ -1385,7 +1452,7 @@ impl GpuPreview {
             }
             Ok(None) => {
                 drop(state);
-                fallback("the preview surface was hidden while the frame was drawn".into())
+                fallback("hidden", "the preview surface was hidden while the frame was drawn".into())
             }
             Err(error) => {
                 let reaction = react(&error);
@@ -1406,7 +1473,7 @@ impl GpuPreview {
                     );
                 }
                 self.hide();
-                Attempt::Fallback(vec![error.to_string()])
+                Attempt::Fallback(vec![Reason::new(error_kind(&error), error.to_string())])
             }
         }
     }
@@ -2319,7 +2386,7 @@ mod tests {
         let Attempt::Fallback(reasons) = preview.attempt(&inputs(), Want::at(0.5), Instant::now()) else {
             panic!("a disabled preview drew a frame");
         };
-        assert!(reasons[0].contains("off"), "{reasons:?}");
+        assert!(reasons[0].text.contains("off"), "{reasons:?}");
         assert_eq!(built.load(Ordering::SeqCst), 0);
         assert!(!preview.status().enabled);
     }
@@ -2336,7 +2403,7 @@ mod tests {
             let Attempt::Fallback(reasons) = preview.attempt(&inputs, Want::at(0.5), t0 + Duration::from_millis(n)) else {
                 panic!("a failing backend drew a frame");
             };
-            assert!(reasons[0].contains("no usable GPU adapter"), "{reasons:?}");
+            assert!(reasons[0].text.contains("no usable GPU adapter"), "{reasons:?}");
         }
         assert_eq!(
             built.load(Ordering::SeqCst),
@@ -2370,7 +2437,7 @@ mod tests {
         ) else {
             panic!("drew over the page");
         };
-        assert!(reasons[0].contains("draw over the picture"), "{reasons:?}");
+        assert!(reasons[0].text.contains("draw over the picture"), "{reasons:?}");
         assert_eq!(built.load(Ordering::SeqCst), 0, "decided before a device is made");
     }
 
@@ -2382,14 +2449,14 @@ mod tests {
         let Attempt::Fallback(r) = preview.attempt(&inputs(), Want::at(0.5), Instant::now()) else {
             panic!()
         };
-        assert!(r[0].contains("not reported"), "{r:?}");
+        assert!(r[0].text.contains("not reported"), "{r:?}");
         let mut hidden = report();
         hidden.visible = false;
         preview.set_bounds(&hidden).unwrap();
         let Attempt::Fallback(r) = preview.attempt(&inputs(), Want::at(0.5), Instant::now()) else {
             panic!()
         };
-        assert!(r[0].contains("hidden"), "{r:?}");
+        assert!(r[0].text.contains("hidden"), "{r:?}");
         assert_eq!(built.load(Ordering::SeqCst), 0);
 
         let macos = with(resolve_technique("macos", None), Box::new(|_| Err("unreachable".into())));
@@ -2400,7 +2467,7 @@ mod tests {
         let Attempt::Fallback(r) = macos.attempt(&inputs(), Want::at(0.5), Instant::now()) else {
             panic!()
         };
-        assert!(r[0].contains("not been verified on a Mac"), "{r:?}");
+        assert!(r[0].text.contains("not been verified on a Mac"), "{r:?}");
     }
 
     /// The app's first step on a machine with no Vulkan driver at all, run in a child process with
@@ -2459,7 +2526,7 @@ mod tests {
             else {
                 panic!("drew a frame with no adapter");
             };
-            assert!(reasons[0].contains("no usable GPU adapter"), "{reasons:?}");
+            assert!(reasons[0].text.contains("no usable GPU adapter"), "{reasons:?}");
         }
         assert_eq!(
             built.load(Ordering::SeqCst),
@@ -2629,13 +2696,13 @@ mod tests {
             panic!("drew a frame while the backend was building");
         };
         assert!(t.elapsed() < Duration::from_millis(300), "waited {:?}", t.elapsed());
-        assert!(reasons[0].contains("starting"), "{reasons:?}");
+        assert!(reasons[0].text.contains("starting"), "{reasons:?}");
 
         let (began, outcome) = slow.join().unwrap();
         let Attempt::Fallback(reasons) = outcome else {
             panic!("drew a frame with a stalled backend");
         };
-        assert!(reasons[0].contains("took longer"), "{reasons:?}");
+        assert!(reasons[0].text.contains("took longer"), "{reasons:?}");
         assert!(
             began.elapsed() < Duration::from_secs(5),
             "the preview waited for the stalled build"
@@ -2660,7 +2727,7 @@ mod tests {
             panic!("drew a frame");
         };
         assert!(
-            reasons[0].contains("panicked") && reasons[0].contains("x11rb blew up"),
+            reasons[0].text.contains("panicked") && reasons[0].text.contains("x11rb blew up"),
             "{reasons:?}"
         );
         assert!(!preview.status().ready);
