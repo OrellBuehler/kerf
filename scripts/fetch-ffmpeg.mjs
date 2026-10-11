@@ -105,13 +105,38 @@ function sources({ btbn: BTBN, build: BTBN_BUILD, branch: BTBN_BRANCH, evermeet:
   };
 }
 
+// Mirrors rate-limit CI runners (evermeet answers 429 or refuses the connection
+// when several jobs fetch at once), so a refused or throttled request is retried
+// with backoff, honouring Retry-After. The digest check still guards the bytes.
+const ATTEMPTS = 6;
+
 async function download(url) {
-  console.log(`\u2193 ${url}`);
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`download failed (${res.status}) for ${url}`);
-  const bytes = new Uint8Array(await res.arrayBuffer());
-  const digest = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
-  return { bytes, digest };
+  for (let attempt = 1; ; attempt++) {
+    console.log(`\u2193 ${url}${attempt > 1 ? ` (attempt ${attempt})` : ""}`);
+    let res;
+    try {
+      res = await fetch(url);
+    } catch (err) {
+      if (attempt >= ATTEMPTS) throw err;
+      await backoff(attempt, null, String(err));
+      continue;
+    }
+    if (res.ok) {
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      const digest = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+      return { bytes, digest };
+    }
+    const transient = res.status === 429 || res.status >= 500;
+    if (!transient || attempt >= ATTEMPTS) throw new Error(`download failed (${res.status}) for ${url}`);
+    await backoff(attempt, res.headers.get("retry-after"), `HTTP ${res.status}`);
+  }
+}
+
+async function backoff(attempt, retryAfter, why) {
+  const asked = Number(retryAfter);
+  const ms = Number.isFinite(asked) && asked > 0 ? Math.min(asked, 120) * 1000 : Math.min(2 ** attempt * 2500, 60_000);
+  console.log(`  ${why}; retrying in ${Math.round(ms / 1000)}s`);
+  await Bun.sleep(ms);
 }
 
 // `--print-hashes` fetches every pinned archive and prints its digest, so
