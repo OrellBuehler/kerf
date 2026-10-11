@@ -115,6 +115,14 @@ fn cases(dir: &Path) -> Vec<Case> {
     ]
 }
 
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn secs(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }
@@ -152,10 +160,10 @@ fn json(s: Stat) -> String {
 #[test]
 #[ignore = "drives the real ffmpeg; run with --release --nocapture"]
 fn what_the_scrub_cache_buys() {
-    let dir = std::env::temp_dir().join(format!("kerf-scrub-bench-{}", std::process::id()));
+    let dir = Scratch(std::env::temp_dir().join(format!("kerf-scrub-bench-{}", std::process::id())));
     let version = version();
     let mut report = Vec::new();
-    for case in cases(&dir) {
+    for case in cases(&dir.0) {
         let assets = &case.assets;
         // Warm the page cache and the process-wide probes once, off the clock.
         let _ = Project::composite_timeline_frame(&case.timeline, assets, 1.0, WIDTH, QUALITY).unwrap();
@@ -248,5 +256,4 @@ fn what_the_scrub_cache_buys() {
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join(format!("scrub-{version}.json")), body).unwrap();
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -31,6 +31,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use super::rendered::export_frames_sized;
 use super::scrub::Snapshot;
@@ -43,7 +45,9 @@ const H: u32 = 180;
 const QUALITY: u8 = 4;
 
 fn scratch() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("kerf-scrub-rendered-{}", std::process::id()));
+    static MADE: AtomicU64 = AtomicU64::new(0);
+    let n = MADE.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("kerf-scrub-rendered-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir
 }
@@ -210,10 +214,17 @@ struct Rig {
 }
 
 impl Rig {
-    /// One per process: the sources are made once, and the tests that share them run side by side.
-    fn shared() -> &'static Rig {
-        static RIG: std::sync::OnceLock<Rig> = std::sync::OnceLock::new();
-        RIG.get_or_init(Rig::new)
+    /// The sources are made once for the tests that run side by side, and removed with the last of
+    /// them, a panic included.
+    fn shared() -> Arc<Rig> {
+        static HELD: Mutex<Weak<Rig>> = Mutex::new(Weak::new());
+        let mut held = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(rig) = held.upgrade() {
+            return rig;
+        }
+        let rig = Arc::new(Rig::new());
+        *held = Arc::downgrade(&rig);
+        rig
     }
 
     fn new() -> Self {
@@ -229,6 +240,12 @@ impl Rig {
             image,
             dir,
         }
+    }
+}
+
+impl Drop for Rig {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -462,7 +479,7 @@ fn a_scrub_window_frame_is_the_exports_frame() {
         if only.as_deref().is_some_and(|name| name != case.name) {
             continue;
         }
-        run(&case, rig);
+        run(&case, &rig);
     }
 }
 
@@ -482,7 +499,7 @@ fn a_source_that_is_not_a_whole_multiple_of_the_rate_is_refused() {
         ("speed1.5", Box::new(|r| one(r, 0.5, 4.5, 0.0, |c| c.speed = 1.5)), (1, 25)),
     ];
     for (name, build, (a, b)) in refused {
-        let (timeline, assets) = build(rig);
+        let (timeline, assets) = build(&rig);
         let snap = Snapshot::new(&timeline, &assets, W, QUALITY);
         assert!(!(a..b).any(|k| snap.plain(k)), "{name}: a window may not draw this clip");
         let export = export_frames_sized(snap.rendered(), &assets, snap.fps(), (W, H), &rig.dir, name);
