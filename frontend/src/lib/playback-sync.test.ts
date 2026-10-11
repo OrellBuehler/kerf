@@ -512,6 +512,21 @@ describe('createLadder', () => {
 		ladder.start(k, cut);
 		ladder.ended(null);
 		expect(ladder.start(k, cut).from).toBe(5);
+		expect(ladder.startup).toBeNull();
+	});
+
+	test('says what a start-up costs, held to the most a stream is led by (the hand-over from the GPU reads it)', () => {
+		const ladder = fresh();
+		const k = key();
+		expect(ladder.startup).toBeNull();
+		ladder.start(k, cut);
+		ladder.ended(0.18);
+		expect(ladder.startup).toBeCloseTo(0.18, 10);
+		// A stall that landed in a start-up is not one to start ahead by.
+		const slow = fresh();
+		slow.start(k, cut);
+		slow.ended(2);
+		expect(slow.startup).toBe(MAX_LEAD);
 	});
 
 	test('the least start-up seen is what the next one is led by: nothing that comes in under it puts the picture ahead', () => {

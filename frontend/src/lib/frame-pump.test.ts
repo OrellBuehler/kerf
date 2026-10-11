@@ -2,7 +2,8 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { compileModule } from 'svelte/compiler';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { PreviewFrameResult, PreviewOrder } from './types';
+import { GpuPlayback } from './gpu-playback';
+import type { PlayAhead, PlayAsk, PlayInfo, PreviewFrameResult, PreviewOrder } from './types';
 
 // The Preview's frame fetching is the one place a stray reactive read costs an FFmpeg composite,
 // so its reactivity is tested for real: the module is compiled with Svelte's own compiler and run
@@ -32,6 +33,7 @@ export function harness(env) {
 	let titles = $state.raw([]);
 	let covered = $state(false);
 	let width = $state(env.width === undefined ? 960 : env.width);
+	let playback = $state.raw(null);
 	let status = $state.raw({ supported: true, overlays: env.overlaysCapable ?? false });
 	const route = $derived(
 		routePreview({
@@ -66,7 +68,13 @@ export function harness(env) {
 			// What gpuPreview.note() ends in: the status is read again, and replaced by a new object.
 			status = { ...status };
 		},
-		gpuFailed: (error) => env.gpuFailed?.(error)
+		gpuFailed: (error) => env.gpuFailed?.(error),
+		playback: () => playback,
+		playClock: () => ({ clock: time, latency: env.latency ?? 0, fps: 30 }),
+		startup: () => env.startup,
+		playHandover: (pb, ahead, now, why) => env.playHandover?.(pb, ahead, now, why),
+		playWaiting: (pb, message) => env.playWaiting?.(pb, message),
+		now: () => env.now?.() ?? performance.now() / 1000
 	});
 	const stop = $effect.root(() => {
 		$effect(() => frames.run());
@@ -83,7 +91,8 @@ export function harness(env) {
 		set titles(v) { titles = v; },
 		set covered(v) { covered = v; },
 		set width(v) { width = v; },
-		set status(v) { status = v; }
+		set status(v) { status = v; },
+		set playback(v) { playback = v; }
 	};
 }
 `;
@@ -95,9 +104,14 @@ interface Env {
 	overlaysCapable?: boolean;
 	width?: number | null;
 	timelineFrame: (t: number, width: number) => Promise<string | null>;
-	previewFrame: (t: number, overlays: boolean, width: number, order: PreviewOrder) => Promise<PreviewFrameResult>;
+	previewFrame: (t: number, overlays: boolean, width: number, order: PreviewOrder, play?: PlayAsk) => Promise<PreviewFrameResult>;
 	answered?: (r: PreviewFrameResult) => void;
 	gpuFailed?: (e: unknown) => void;
+	latency?: number;
+	startup?: number;
+	playHandover?: (pb: GpuPlayback, ahead: PlayAhead | null, now: boolean, why: string) => void;
+	playWaiting?: (pb: GpuPlayback, message: string) => void;
+	now?: () => number;
 }
 
 interface Harness {
@@ -120,6 +134,7 @@ interface Harness {
 	covered: boolean;
 	width: number | null;
 	status: unknown;
+	playback: GpuPlayback | null;
 }
 
 beforeAll(async () => {
@@ -138,25 +153,33 @@ const settle = () => new Promise((resolve) => setTimeout(resolve, 15));
 const tick = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** A recorder of what the pump asked for. */
-function recorder(opts: { jpeg?: (t: number) => Promise<string | null>; gpu?: (t: number, o: boolean) => Promise<PreviewFrameResult> } = {}) {
+function recorder(
+	opts: {
+		jpeg?: (t: number) => Promise<string | null>;
+		gpu?: (t: number, o: boolean, play?: PlayAsk) => Promise<PreviewFrameResult>;
+	} = {}
+) {
 	const asked: string[] = [];
 	const widths: number[] = [];
 	const orders: PreviewOrder[] = [];
+	const plays: Array<PlayAsk | undefined> = [];
 	return {
 		asked,
 		widths,
 		orders,
+		plays,
 		timelineFrame: async (t: number, width: number) => {
 			asked.push(`jpeg@${t}`);
 			widths.push(width);
 			return opts.jpeg ? opts.jpeg(t) : `data:jpeg-${t}`;
 		},
-		previewFrame: async (t: number, overlays: boolean, width: number, order: PreviewOrder) => {
-			asked.push(`gpu@${t}${overlays ? '+overlays' : ''}`);
+		previewFrame: async (t: number, overlays: boolean, width: number, order: PreviewOrder, play?: PlayAsk) => {
+			asked.push(`${play ? 'play' : 'gpu'}@${t}${overlays ? '+overlays' : ''}`);
 			widths.push(width);
 			orders.push(order);
+			plays.push(play);
 			return opts.gpu
-				? opts.gpu(t, overlays)
+				? opts.gpu(t, overlays, play)
 				: { renderer: 'ffmpeg' as const, frame: `data:ffmpeg-${t}`, reasons: ['a refusal'], timings: null };
 		}
 	};
@@ -618,6 +641,242 @@ describe('the playback stream\u2019s canvas and the fetched frame take the pane 
 		await settle();
 		expect(h.frames.streamShown).toBe(false);
 		expect(h.frames.frameUrl).toBe('data:ffmpeg-2');
+		h.stop();
+	});
+});
+
+// ---- GPU playback -------------------------------------------------------------------------
+
+const timings = { width: 960, height: 540, decode_ms: 3, composite_ms: 1, present_ms: 1 };
+
+function playInfo(over: Partial<PlayInfo> = {}): PlayInfo {
+	return { session: 1, start: 0, frame: 0, repeat: false, ahead: null, ...over };
+}
+
+const drew = (over: Partial<PlayInfo> = {}): PreviewFrameResult => ({
+	renderer: 'gpu',
+	frame: null,
+	reasons: [],
+	timings,
+	play: playInfo(over)
+});
+
+describe('GPU playback', () => {
+	test('asks once per frame of the cut for the picture that is audible, with the session, and shows the surface', async () => {
+		const r = recorder({ gpu: async () => drew() });
+		const h = harness({ enabled: true, overlaysCapable: true, latency: 0.05, ...r });
+		await settle();
+		expect(r.asked).toEqual(['gpu@0']);
+		const pb = new GpuPlayback(30);
+		h.playback = pb;
+		await settle();
+		// The first request of a session decides it.
+		expect(r.asked.at(-1)).toBe('play@0');
+		expect(r.plays.at(-1)).toEqual({ session: pb.session });
+		expect(pb.decided).toBe('gpu');
+		expect(h.frames.gpuShown).toBe(true);
+		// The picture is the one that is audible: the clock less the sound's 50 ms.
+		const before = r.asked.length;
+		h.time = 1;
+		await settle();
+		expect(r.asked.length).toBe(before + 1);
+		const asked = Number(r.asked.at(-1)?.slice('play@'.length));
+		expect(asked).toBeGreaterThan(0.94);
+		expect(asked).toBeLessThan(0.951);
+		// A 60 Hz display for a fifth of a second, a 30 fps cut: a request for every other animation frame.
+		const plays = () => r.asked.filter((a) => a.startsWith('play')).length;
+		const start = plays();
+		for (let i = 1; i <= 12; i++) {
+			h.time = 1 + i / 60;
+			await settle();
+		}
+		expect(plays() - start).toBeGreaterThanOrEqual(5);
+		expect(plays() - start).toBeLessThanOrEqual(7);
+		// The order of every request is the pump's, counting up.
+		const seqs = r.orders.map((o) => o.seq);
+		expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+		h.stop();
+	});
+
+	test('the first request is the only one out until the session is decided', async () => {
+		const resolvers: Array<(x: PreviewFrameResult) => void> = [];
+		const r = recorder({
+			gpu: (t, _o, play) =>
+				play
+					? new Promise((resolve) => resolvers.push(resolve))
+					: Promise.resolve({ renderer: 'ffmpeg' as const, frame: `data:ffmpeg-${t}`, reasons: [], timings: null })
+		});
+		const h = harness({ enabled: true, overlaysCapable: true, ...r });
+		await settle();
+		h.playback = new GpuPlayback(30);
+		await settle();
+		for (let i = 1; i <= 10; i++) {
+			h.time = i / 30;
+			await settle();
+		}
+		expect(r.asked.filter((a) => a.startsWith('play'))).toHaveLength(1);
+		resolvers[0](drew());
+		await settle();
+		h.time = 1;
+		await settle();
+		expect(r.asked.filter((a) => a.startsWith('play'))).toHaveLength(2);
+		h.stop();
+	});
+
+	test('a stream verdict hands the session over at once, shows nothing, and says where from', async () => {
+		const handovers: Array<[boolean, number | null, string]> = [];
+		const answered: string[] = [];
+		const stream: PreviewFrameResult = {
+			renderer: 'stream',
+			frame: null,
+			reasons: ['a mask'],
+			timings: null,
+			play: playInfo({ ahead: { at: 3, handover: 2.8, kind: 'mask', why: 'a mask' } })
+		};
+		const r = recorder({
+			gpu: async (t, _o, play) =>
+				play ? stream : { renderer: 'ffmpeg', frame: `data:ffmpeg-${t}`, reasons: [], timings: null }
+		});
+		const h = harness({
+			enabled: true,
+			overlaysCapable: true,
+			...r,
+			answered: (x) => answered.push(x.renderer),
+			playHandover: (_pb, ahead, now, why) => handovers.push([now, ahead?.handover ?? null, why])
+		});
+		await settle();
+		const pb = new GpuPlayback(30);
+		h.playback = pb;
+		await settle();
+		expect(handovers).toEqual([[true, 2.8, 'a mask']]);
+		expect(answered).toEqual(['ffmpeg', 'stream']);
+		expect(h.frames.gpuShown).toBe(false);
+		expect(pb.ended).toBe(true);
+		// Nothing more is asked of an ended session.
+		h.time = 5;
+		await settle();
+		expect(r.asked.filter((a) => a.startsWith('play'))).toHaveLength(1);
+		h.stop();
+	});
+
+	test('a request that fails hands over and hides the surface; a proxy wait waits instead', async () => {
+		const failed: unknown[] = [];
+		const handovers: string[] = [];
+		const waiting: string[] = [];
+		let reject: unknown = new Error('the GPU preview\'s frame worker stopped');
+		const r = recorder({
+			gpu: async (t, _o, play) => {
+				if (play) throw reject;
+				return { renderer: 'ffmpeg', frame: `data:ffmpeg-${t}`, reasons: [], timings: null };
+			}
+		});
+		const h = harness({
+			enabled: true,
+			overlaysCapable: true,
+			...r,
+			gpuFailed: (e) => failed.push(e),
+			playHandover: (_pb, _ahead, now, why) => handovers.push(`${now}:${why}`),
+			playWaiting: (_pb, m) => waiting.push(m)
+		});
+		await settle();
+		h.playback = new GpuPlayback(30);
+		await settle();
+		expect(failed).toHaveLength(1);
+		expect(handovers).toEqual(["true:the GPU preview's frame worker stopped"]);
+
+		reject = 'waiting for the preview proxy of "a.mp4" (40%)';
+		h.playback = new GpuPlayback(30);
+		await settle();
+		expect(waiting).toHaveLength(1);
+		expect(failed, 'a wait is not a failure').toHaveLength(1);
+		h.stop();
+	});
+
+	test('the hand-over the answers announce is made once, when the playhead gets to it, and the GPU keeps drawing', async () => {
+		const handovers: Array<[boolean, number]> = [];
+		const ahead = { at: 6, handover: 5.5, kind: 'mask', why: 'a mask' };
+		const r = recorder({ gpu: async () => drew({ ahead }) });
+		const h = harness({
+			enabled: true,
+			overlaysCapable: true,
+			startup: 0.2,
+			...r,
+			playHandover: (pb, a, now) => {
+				handovers.push([now, a?.handover ?? -1]);
+				pb.handOver();
+			}
+		});
+		await settle();
+		const pb = new GpuPlayback(30);
+		h.playback = pb;
+		h.time = 1;
+		await settle();
+		expect(pb.ahead?.handover).toBe(5.5);
+		h.time = 5.2;
+		await settle();
+		expect(handovers).toEqual([]);
+		h.time = 5.31;
+		await settle();
+		expect(handovers).toEqual([[false, 5.5]]);
+		// The surface is still the GPU's, and it is asked for frames on: the stream is not on screen yet.
+		const before = r.asked.length;
+		h.time = 5.5;
+		await settle();
+		h.time = 5.6;
+		await settle();
+		expect(handovers).toHaveLength(1);
+		expect(r.asked.length).toBeGreaterThan(before);
+		expect(h.frames.gpuShown).toBe(true);
+		h.stop();
+	});
+
+	test('answers for a session that is over are dropped, and a repeat or a superseded answer changes nothing', async () => {
+		const resolvers: Array<(x: PreviewFrameResult) => void> = [];
+		const answered: string[] = [];
+		const r = recorder({ gpu: () => new Promise((resolve) => resolvers.push(resolve)) });
+		const h = harness({ enabled: true, overlaysCapable: true, ...r, answered: (x) => answered.push(`${x.renderer}:${x.play?.repeat ?? ''}`) });
+		await settle();
+		resolvers.shift()?.({ renderer: 'ffmpeg', frame: 'data:x', reasons: [], timings: null });
+		const first = new GpuPlayback(30);
+		h.playback = first;
+		await settle();
+		// The session is replaced (a seek) while its first request is out.
+		h.playback = new GpuPlayback(30);
+		await settle();
+		resolvers.shift()?.(drew());
+		await settle();
+		expect(h.frames.gpuShown, 'the answer of a session that was replaced is not shown').toBe(false);
+		expect(first.decided).toBe('pending');
+		// The new session: a drawn frame, then a repeat, then a superseded one.
+		resolvers.shift()?.(drew());
+		await settle();
+		expect(h.frames.gpuShown).toBe(true);
+		const shownBefore = answered.length;
+		h.time = 1;
+		await settle();
+		resolvers.shift()?.(drew({ repeat: true }));
+		await settle();
+		h.time = 2;
+		await settle();
+		resolvers.shift()?.({ renderer: 'superseded', frame: null, reasons: [], timings: null });
+		await settle();
+		expect(answered.length, 'neither is a new picture').toBe(shownBefore);
+		h.stop();
+	});
+
+	test('when the session ends the settled frame comes back through the ordinary route', async () => {
+		const r = recorder({ gpu: async () => drew() });
+		const h = harness({ enabled: true, overlaysCapable: true, ...r });
+		await settle();
+		h.playback = new GpuPlayback(30);
+		h.time = 2;
+		await settle();
+		const forward = r.asked.filter((a) => a.startsWith('play')).length;
+		expect(forward).toBeGreaterThan(0);
+		h.playback = null;
+		await settle();
+		expect(r.asked.at(-1)).toBe('gpu@2');
+		expect(r.plays.at(-1)).toBeUndefined();
 		h.stop();
 	});
 });

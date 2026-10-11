@@ -318,6 +318,11 @@ export function createLadder(clock: () => number = () => performance.now()) {
 		},
 		get steps() {
 			return steps;
+		},
+		/** The start-up a stream of this cut has been seen to take, seconds, held to [`MAX_LEAD`]: how far
+		 *  ahead of the playhead the hand-over from the GPU starts a stream. `null` before any. */
+		get startup(): number | null {
+			return startup === null || !Number.isFinite(startup) ? null : Math.min(MAX_LEAD, Math.max(0, startup));
 		}
 	};
 }

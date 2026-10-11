@@ -366,6 +366,17 @@ describe('scheduling is what it was', () => {
 		expect(engine.clock()).toBeNull();
 	});
 
+	test('says how late the sound is: 0 before there is a context, then what the context measures', async () => {
+		expect(engine.outputLatency()).toBe(0);
+		await play({ tracks: [track('a1', 'audio', [clip('c', 'voice')])] });
+		// The fake knows nothing of its device.
+		expect(engine.outputLatency()).toBe(0);
+		Object.assign(ctx, { currentTime: 5.06, getOutputTimestamp: () => ({ contextTime: 5, performanceTime: 1 }) });
+		expect(engine.outputLatency()).toBeCloseTo(0.06, 9);
+		// The clock is the context's and stays so: the latency is for the caller to subtract.
+		expect(engine.clock()).toBeCloseTo(5.06, 9);
+	});
+
 	test('a window that cannot be decoded is reported once and does not stop the rest', async () => {
 		const failing = new AudioEngine({
 			createContext: () => ctx as unknown as AudioContext,

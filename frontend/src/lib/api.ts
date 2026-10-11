@@ -45,6 +45,7 @@ import type {
 	MusicFit,
 	MusicFitted,
 	PreviewBoundsReport,
+	PlayAsk,
 	PreviewFrameResult,
 	PreviewOrder,
 	Projection,
@@ -3006,36 +3007,104 @@ export async function getTimelineFrame(timeSecs: number, maxWidth = 960): Promis
  * safe-area guides), which a surface above the page cannot show. `order` says which request
  * of which pump this is (`PreviewOrder`): the calls are separate tasks over the IPC and can
  * arrive reversed, and the backend answers `superseded` to one that arrives after a newer one
- * of the same `client` instead of drawing it last. In the browser harness there is no backend:
- * the answer is "FFmpeg, no frame", as `getTimelineFrame` is `null`, and `order` is unused.
+ * of the same `client` instead of drawing it last. `play` makes it a frame of **GPU playback**
+ * (`hint: 'forward'`): the time is the one the picture should show, asked once per animation
+ * frame while the cut plays, and the first request of a `session` decides whether the GPU plays
+ * it or the stream does (`renderer: 'stream'`). In the browser harness there is no backend: the
+ * answer is "FFmpeg, no frame" (to a forward request, "the stream"), as `getTimelineFrame` is
+ * `null`, and `order` is unused.
  */
 export async function getPreviewFrame(
 	timeSecs: number,
 	maxWidth = 960,
 	overlays = false,
-	order?: PreviewOrder
+	order?: PreviewOrder,
+	play?: PlayAsk
 ): Promise<PreviewFrameResult> {
 	if (!inTauri()) {
 		// `?gpusurface=1` pretends a surface under a transparent webview drew the frame, so the
 		// page's side of it (the hole in the pane, nothing painted over the surface) can be looked
 		// at under `bun run dev`. Otherwise there is no GPU here.
 		if (harnessSurface()) {
+			// `?gpuplay=stream` makes the GPU decline every session (the stream plays, as when a frame is
+			// refused); `?gpuplay=ahead` has it draw for two seconds and then announce a refusal ahead.
+			const mode = harnessPlay();
+			if (play && mode === 'stream') {
+				return {
+					renderer: 'stream',
+					frame: null,
+					reasons: ['the browser harness was told to decline'],
+					timings: null,
+					play: null
+				};
+			}
+			if (play) harnessPlayStart.set(play.session, harnessPlayStart.get(play.session) ?? timeSecs);
+			const began = play ? (harnessPlayStart.get(play.session) ?? timeSecs) : 0;
+			const stops = began + 2;
+			if (play && mode === 'ahead' && timeSecs >= stops) {
+				return {
+					renderer: 'stream',
+					frame: null,
+					reasons: ['the browser harness announced a refusal'],
+					timings: null,
+					play: {
+						session: play.session,
+						start: began,
+						frame: 0,
+						repeat: false,
+						ahead: { at: stops, handover: stops - 0.1, kind: 'mask', why: 'the browser harness announces a refusal' }
+					}
+				};
+			}
 			return {
 				renderer: 'gpu',
 				frame: null,
 				reasons: [],
-				timings: { width: 1920, height: 1080, decode_ms: 4, composite_ms: 9, present_ms: 1 }
+				timings: { width: 1920, height: 1080, decode_ms: 4, composite_ms: 9, present_ms: 1 },
+				play: play
+					? {
+							session: play.session,
+							start: began,
+							frame: Math.max(0, Math.floor((timeSecs - began) * 30)),
+							repeat: false,
+							ahead:
+								mode === 'ahead'
+									? { at: stops, handover: stops - 0.1, kind: 'mask', why: 'the browser harness announces a refusal' }
+									: null
+						}
+					: null
 			};
 		}
-		return { renderer: 'ffmpeg', frame: null, reasons: ['the browser harness has no GPU'], timings: null };
+		return {
+			renderer: play ? 'stream' : 'ffmpeg',
+			frame: null,
+			reasons: ['the browser harness has no GPU'],
+			timings: null,
+			play: null
+		};
 	}
 	return invoke<PreviewFrameResult>('get_preview_frame', {
 		timeSecs,
 		maxWidth,
 		overlays,
 		client: order?.client,
-		seq: order?.seq
+		seq: order?.seq,
+		hint: play ? 'forward' : undefined,
+		session: play?.session
 	});
+}
+
+/** When each GPU play session of the harness began (its first request's time). */
+const harnessPlayStart = new Map<number, number>();
+
+/** `?gpuplay=stream|ahead` in the browser harness (see {@link getPreviewFrame}). */
+function harnessPlay(): 'gpu' | 'stream' | 'ahead' {
+	try {
+		const mode = new URLSearchParams(location.search).get('gpuplay');
+		return mode === 'stream' || mode === 'ahead' ? mode : 'gpu';
+	} catch {
+		return 'gpu';
+	}
 }
 
 /** The browser harness was opened with `?gpusurface=1`. */

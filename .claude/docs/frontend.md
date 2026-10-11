@@ -876,6 +876,32 @@ background shows the hole. The status bar names the renderer of the frame on scr
 430×240 · 23 ms · llvmpipe`, or `FFmpeg · <why>`), only while the setting is on, and the
 Settings dialog's Preview section carries the toggle and the machine's status line.
 
+**GPU playback in the page** (`gpu-playback.ts`, `output-latency.ts`, `frame-pump.svelte.ts`, `Preview.svelte`; the backend's half is in
+`app.md`). With the GPU preview on and the route `gpu` at the moment Play starts (the setting, a surface, nothing over the frame that a surface above
+the page cannot show, not a detached panel), the **playback effect starts a `GpuPlayback` session instead of the stream** and the frame pump
+takes over (`playback` / `playClock` deps): the webview stays the clock owner, and the audio stays the clock. Once per animation frame (the
+effect on `ui.time`), the pump asks `getPreviewFrame(time, …, { session })` (`hint: 'forward'`) for **`pictureTime(clock, outputLatency, roundTrip)`**:
+the audio clock less the sound's **output latency** (`audio.outputLatency()`; `outputLatency(ctx)`: `getOutputTimestamp()`'s context time against the
+render head, else the browser's `outputLatency + baseLatency`, else 0; held to 0.5 s and smoothed by a median of 9) plus the **median round trip** of
+the requests that drew a frame (held to 0.25 s), so a picture lands on the screen when its sound lands in the room and a slow frame is asked for
+ahead by what it will cost. A frame of the cut is asked for **once** (`frameIndex`; never twice, never an earlier one when an estimate moves), and the
+first request of a session is the only one in flight until it is answered, because it **decides the session** (`renderer: 'gpu'` or `'stream'`);
+requests the backend replaced answer `superseded` and change nothing (**skip, never slow down** is the latest-wins mailbox's, not a gate's: a GPU
+that overruns a slot loses the frames it overran, and `createFrameGate` stays the stream's). A `stream` answer, a rejected request (the GPU is marked
+failed and the surface hidden), or a GPU whose median round trip is over **three frame periods for a second** (`OVERLOAD_PERIODS`, `OVERLOAD_AFTER`)
+**hands the session to the stream at once** (`handOverToStream(now)`); an answer's **`play.ahead`** (the first frame the GPU will not draw and the
+time a stream must start at) hands over **when the playhead is within the stream's start-up of it** (`handoverDue`; the ladder's measured start-up,
+else 0.15 s). A hand-over starts the stream through the same ladder (`takeover`): the stream is *not* `streaming` (so the route stays `gpu` and the
+surface stays up) until its first frame **at or past where the GPU stops** is shown, and only then does the GPU's session end and the surface go. A
+session that was given up on is **barred** for the rest of that play (`gpuBarred`: until a deliberate seek or an edit, not for a stream restart for
+lag), so the renderers never flip back and forth. Under Proxy only the first request is rejected as the stream is (`playWaiting` →
+`playbackWaiting`). The status bar names the renderer of each drawn frame (`GPU 960×540 · 14 ms · adapter`; a repeat is not a new frame and
+changes nothing). Pausing ends the session (the effect's cleanup), and the settled frame comes back through the ordinary GPU route. In the
+browser harness `getPreviewFrame` answers a forward request `stream` (no GPU), so playback is the synthesised stream as ever; `?gpusurface=1` pretends
+a surface and has the GPU play, `&gpuplay=stream` has it decline every session and `&gpuplay=ahead` has it draw for two seconds and announce a
+refusal (the hand-over). Tests: `gpu-playback.test.ts` (the request arithmetic, the decision, the hand-over, the overload),
+`output-latency.test.ts`, the `GPU playback` cases of `frame-pump.test.ts` (the pump over the real Svelte runtime), and the ladder's `startup`.
+
 **Shared components** (`components/editor/`; `shared-components.test.ts` keeps the dialogs, the Inspector's rows and the toolbar on them).
 **`Modal`** is the shell of every dialog: the scrim (`--scrim` at 55 %, one `z-index` of 50 — a later sibling, the
 update dialog, stacks over an earlier), the panel (`--line-width` border, `--shadow-lg`), a header with an icon, the title (the

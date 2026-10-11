@@ -40,6 +40,7 @@ import { clipSounds } from './mixer-strips';
 import { clampMasterVolume, masterOf, trackRenders } from './levels';
 import { readBlock, type Reading } from './meter';
 import { toast } from './notifications.svelte';
+import { outputLatency } from './output-latency';
 
 /** Preview decode rate: mono 32 kHz keeps a minute of PCM under 4 MB on the
  *  wire while staying honest enough to judge a cut. */
@@ -136,6 +137,13 @@ export class AudioEngine {
 			fetchPcm: env.fetchPcm ?? getAudio,
 			report: env.report ?? ((m) => void toast.error(m))
 		};
+	}
+
+	/** Seconds between the audio clock and the sound coming out of the speakers
+	 *  ([`outputLatency`](./output-latency.ts)): the picture of GPU playback is asked for the clock
+	 *  *less* this, so it is not ahead of what is heard. 0 until a context exists. */
+	outputLatency(): number {
+		return outputLatency(this.#ctx);
 	}
 
 	/** Current timeline time by the audio clock, or `null` when not playing. */

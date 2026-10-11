@@ -1230,6 +1230,9 @@ export interface GpuPreviewDiagnostics {
 	 *  from the project (its lock, its timeline parsed). */
 	snapshots: { served: number; taken: number };
 	requests: { posted: number; superseded: number };
+	/** What the play sessions did (`PlayTally`): sessions the GPU played, first requests it
+	 *  declined, sessions that ended in the stream, frames drawn / skipped / repeated. */
+	play: { sessions: number; declined: number; handed_over: number; frames: number; skipped: number; repeats: number };
 	/** The parity self-test against this machine's FFmpeg: running, passed or closed (and why). */
 	self_test: string | null;
 	adapter: string | null;
@@ -1275,18 +1278,52 @@ export interface PreviewOrder {
 	seq: number;
 }
 
+/** The first frame ahead that the GPU will not draw during playback (`AheadInfo` in
+ *  `crates/kerf-app/src/gpu_preview/play.rs`), and where a stream that carries on from the compositor
+ *  has to start. */
+export interface PlayAhead {
+	/** The time of that frame, timeline seconds. */
+	at: number;
+	/** The time to start the stream at: at or before `at`, with no transition window open. */
+	handover: number;
+	/** A stable key for the reason (`mask`, `reversed`, `moving_text`, `cursor`, …). */
+	kind: string;
+	why: string;
+}
+
+/** What a forward `get_preview_frame` says about its play session (`PlayInfo`). */
+export interface PlayInfo {
+	session: number;
+	/** The timeline time of the session's first frame (a frame of the project's grid). */
+	start: number;
+	/** The frame drawn, counted from `start`. */
+	frame: number;
+	/** The request fell in the frame already on the screen: nothing was drawn. */
+	repeat: boolean;
+	ahead: PlayAhead | null;
+}
+
 /** The answer of `get_preview_frame` (`PreviewFrameResult`): which renderer made the
  *  frame, and the JPEG when it was FFmpeg. */
 export interface PreviewFrameResult {
 	/** `gpu`: drawn in the native surface (the webview shows it by showing nothing
 	 *  over it). `ffmpeg`: the `frame` data URL. `superseded`: a newer request took this
 	 *  one's place before it was drawn (the backend keeps only the newest); nothing was
-	 *  drawn and the answer is ignored. */
-	renderer: 'gpu' | 'ffmpeg' | 'superseded';
+	 *  drawn and the answer is ignored. `stream` (to a forward request only): the GPU does
+	 *  not play this session, or no longer, and the page plays the stream, from
+	 *  `play.ahead.handover` when there is one. */
+	renderer: 'gpu' | 'ffmpeg' | 'superseded' | 'stream';
 	frame: string | null;
 	/** Why the GPU did not draw it (empty when it did). */
 	reasons: string[];
 	timings: GpuTimings | null;
+	/** To a forward request: the session's state. */
+	play?: PlayInfo | null;
+}
+
+/** How the page asks for a frame of GPU playback: the session it belongs to. */
+export interface PlayAsk {
+	session: number;
 }
 
 /** The answer of `fit_music` (`MusicFitted` in `crates/kerf-app/src/lib.rs`): the refreshed
