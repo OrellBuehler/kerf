@@ -206,7 +206,7 @@ fn project_path(state: State<'_, AppState>) -> CmdResult<Option<String>> {
 #[tauri::command(async)]
 fn new_project(state: State<'_, AppState>) -> CmdResult<Option<String>> {
     let mut project = state.project();
-    *project = Project::open_in_memory().map_err(|e| e.to_string())?;
+    project.replace_with(Project::open_in_memory().map_err(|e| e.to_string())?);
     state.scrub.clear();
     Ok(project.path().map(|p| p.display().to_string()))
 }
@@ -223,7 +223,7 @@ async fn open_project(app: AppHandle, state: State<'_, AppState>, path: String) 
         // hold the shared lock, and a failed open leaves the current project intact.
         let opened = Project::open(&path).map_err(|e| e.to_string())?;
         let mut project = lock_user(&shared);
-        *project = opened;
+        project.replace_with(opened);
         let result = project.path().map(|p| p.display().to_string());
         drop(project);
         // The frames of the project that was open are of no use to this one.
@@ -275,13 +275,13 @@ async fn save_project_as(state: State<'_, AppState>, path: String) -> CmdResult<
         let opened = Project::open(&path).map_err(|e| e.to_string())?;
         let mut project = lock_user(&shared);
         if project_fingerprint(&project)? == before {
-            *project = opened;
+            project.replace_with(opened);
         } else {
             // Close the stale copy first: `save_as` deletes the file it replaces,
             // which Windows refuses while it is open.
             drop(opened);
             project.save_as(&path).map_err(|e| e.to_string())?;
-            *project = Project::open(&path).map_err(|e| e.to_string())?;
+            project.replace_with(Project::open(&path).map_err(|e| e.to_string())?);
         }
         Ok(project.path().map(|p| p.display().to_string()))
     })
