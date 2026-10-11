@@ -116,7 +116,9 @@ import { analysisKindDone, ALL_KINDS } from './analysis-steps';
 import { sampleFilmstrip } from './sample-filmstrip';
 import { synthPcm } from './sample-audio';
 import { sampleFrameJpeg } from './sample-frame';
-import { jpegBlob, parsePlaybackMessage } from './frame-transport';
+import { renderedFps } from './timecode';
+import { playbackFps } from './playback-sync';
+import { parsePlaybackMessage } from './frame-transport';
 import { captionsForTimeline, resolveCaptions } from './captions';
 import { describeError, logFrontend } from './log';
 import { parseLaunchRequest } from './launch';
@@ -950,8 +952,9 @@ async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Pro
 export interface PlaybackFrame {
 	/** Timeline time this frame shows, for dropping ones the clock has passed. */
 	time: number;
-	/** The frame as JPEG bytes, undecoded — `createImageBitmap` takes it from here. */
-	jpeg: Blob;
+	/** The frame as JPEG bytes, undecoded: a view into the channel message, so nothing is copied
+	 *  until the preview decides to show it. */
+	jpeg: Uint8Array<ArrayBuffer>;
 }
 
 /** What a playback stream is asked for. `null` leaves it to the engine: the cut's own frame rate
@@ -968,8 +971,8 @@ export interface PlaybackRequest {
  * One long-lived ffmpeg renders the whole span, rather than the one process per
  * frame that scrubbing uses — the difference between a slideshow and video. Its frames
  * come up as raw bytes (the timeline time, then the JPEG), not as base64 data URLs in
- * JSON. In the browser harness there is no backend, so frames are synthesized instead
- * (see `samplePlayback`).
+ * JSON; the page builds a data URL itself, for the frames it shows. In the browser harness
+ * there is no backend, so frames are synthesized instead (see `samplePlayback`).
  */
 let playbackSeq = 0;
 
@@ -979,7 +982,7 @@ export function startPlayback(
 	onFrame: (f: PlaybackFrame) => void,
 	onError?: (message: string) => void
 ): () => void {
-	if (!inTauri()) return samplePlayback(start, request.fps ?? SAMPLE_FPS, onFrame);
+	if (!inTauri()) return samplePlayback(start, request, onFrame);
 	// The backend cancels *by id* rather than by a generation counter: start and
 	// stop are separate async calls that can arrive out of order, and a stop
 	// meant for the previous stream must not kill the one that replaced it.
@@ -991,8 +994,14 @@ export function startPlayback(
 		const channel = new Channel<ArrayBuffer>();
 		channel.onmessage = (message) => {
 			if (stopped) return;
-			const frame = parsePlaybackMessage(message);
-			if (frame) onFrame({ time: frame.time, jpeg: jpegBlob(frame.jpeg) });
+			// A throw here would end up in the channel's own bookkeeping, which delivers the messages
+			// after this one in order: one bad frame must not stop the stream behind it.
+			try {
+				const frame = parsePlaybackMessage(message);
+				if (frame) onFrame(frame);
+			} catch (e) {
+				logFrontend('warn', `a playback frame was dropped: ${describeError(e)}`, 'playback');
+			}
 		};
 		// Resolves only when playback ends; nothing waits on it.
 		// The backend only rejects for a real failure (ffmpeg died, inputs
@@ -1015,8 +1024,8 @@ export function startPlayback(
 	};
 }
 
-/** The rate the harness plays at when the page does not state one. */
-const SAMPLE_FPS = 30;
+/** What the harness renders a frame at when the page does not say: the sample frame's own size. */
+const SAMPLE_WIDTH = 640;
 
 /** What the desktop app really pays to put one frame on screen: ffmpeg's startup
  *  plus the channel. Deliberately larger than the preview's staleness budget — a
@@ -1026,20 +1035,25 @@ const SAMPLE_FRAME_LAG_MS = 90;
 
 /**
  * The browser harness's stand-in for the streamed composite: a generated JPEG per tick, paced
- * at `fps` and delayed by a realistic transport cost, so playback moves in `bun run dev`
- * through the same decode-and-draw path as the desktop app and the preview's frame pacing is
+ * at the rate asked for (the cut's own, as the engine would read it, when none is) and drawn at
+ * the width asked for, delayed by a realistic transport cost, so playback moves in `bun run dev`
+ * through the same route as the desktop app and the preview's frame pacing and ladder are
  * exercised end to end without a backend.
  */
-function samplePlayback(start: number, fps: number, onFrame: (f: PlaybackFrame) => void): () => void {
+function samplePlayback(start: number, request: PlaybackRequest, onFrame: (f: PlaybackFrame) => void): () => void {
+	const fps = request.fps ?? playbackFps(renderedFps(devTimeline, sampleAssets));
+	const width = request.width ?? SAMPLE_WIDTH;
 	let index = 0;
 	let timer: ReturnType<typeof setInterval> | null = null;
 	let stopped = false;
 	const spawn = setTimeout(() => {
 		timer = setInterval(() => {
 			const time = start + index++ / fps;
-			void sampleFrameJpeg(time).then((jpeg) => {
-				if (jpeg && !stopped) onFrame({ time, jpeg });
-			});
+			void sampleFrameJpeg(time, width)
+				.then((jpeg) => jpeg?.arrayBuffer())
+				.then((bytes) => {
+					if (bytes && !stopped) onFrame({ time, jpeg: new Uint8Array(bytes) });
+				});
 		}, 1000 / fps);
 	}, SAMPLE_FRAME_LAG_MS);
 	return () => {

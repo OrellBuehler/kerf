@@ -2061,10 +2061,12 @@ const PLAYBACK_HEADER_BYTES: usize = 8;
 /// timeline time (so the webview can drop a frame that arrived after the audio clock has already
 /// moved past it), then the JPEG, undecoded.
 ///
-/// Raw bytes through the channel rather than a base64 `data:` URL in JSON. What the data URL cost
-/// was never the encode here: the webview had to take a ~33 % larger string, parse it as JSON,
-/// and decode the URL on the main thread before it could draw a frame, where `createImageBitmap`
-/// takes the bytes and decodes them off it.
+/// Raw bytes through the channel rather than a base64 `data:` URL in JSON: a quarter fewer bytes
+/// (76 -> 57 KB a frame at 1080p), no JSON to parse and no base64 to encode here. It is *not* a faster
+/// decode: measured in headless Chromium, the old path's `JSON.parse` + `img.src =` cost 0.1-0.3 ms a
+/// frame, since a data-URL image is decoded lazily and off the main thread, and `createImageBitmap`
+/// plus a canvas draw took no less than the `<img>` did (see `frame-transport.ts`). The page builds
+/// the data URL itself, for the frames it shows.
 fn playback_message(time: f64, jpeg: &[u8]) -> Vec<u8> {
     let mut message = Vec::with_capacity(PLAYBACK_HEADER_BYTES + jpeg.len());
     message.extend_from_slice(&time.to_le_bytes());

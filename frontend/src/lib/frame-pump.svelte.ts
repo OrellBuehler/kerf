@@ -1,7 +1,7 @@
 // The Preview panel's frame fetching, out of the component so its reactivity can be tested: one
 // frame in flight at a time, the latest wanted time waiting, and the answer shown as a picture
-// (`frameUrl`), as nothing at all (`gpuShown`: the native surface is what is seen) or as the last
-// frame of the playback stream, which the page draws on a canvas of its own (`streamShown`).
+// (`frameUrl`), as nothing at all (`gpuShown`: the native surface is what is seen) or, with the canvas
+// painter on (`CANVAS_PAINTER`), as the last frame of the playback stream on a canvas of its own (`streamShown`).
 //
 // The one rule that matters: **what the effect depends on is what it reads in `run`**, and `pump`
 // reads nothing reactive before its first await. A frame fetch is expensive (an FFmpeg composite),
@@ -134,6 +134,13 @@ export function createFramePump(deps: FramePumpDeps) {
 		},
 		get streamShown() {
 			return streamShown;
+		},
+		/** A frame of the playback stream, as the data URL the pane's `<img>` shows: the picture,
+		 *  never the surface, in the element the settled still then replaces it in. */
+		showStreamed(url: string) {
+			gpuShown = false;
+			streamShown = false;
+			frameUrl = url;
 		},
 		/** A frame of the playback stream was drawn on the canvas, `aspect` wide for its height: it is
 		 *  the picture, never the surface, and stays so until a fetched frame replaces it. */

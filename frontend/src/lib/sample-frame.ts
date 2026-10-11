@@ -18,18 +18,21 @@ export function sampleFrameUrl(time: number): string {
 let scratch: HTMLCanvasElement | null = null;
 
 /** [`sampleFrameUrl`]'s picture as the JPEG bytes the desktop app's playback stream sends, so the
- *  harness drives the same decode-and-draw path (`null` where there is no canvas to draw it on). */
-export function sampleFrameJpeg(time: number): Promise<Blob | null> {
+ *  harness drives the same route as the app (`null` where there is no canvas to draw it on), drawn
+ *  `width` wide as the stream would be. */
+export function sampleFrameJpeg(time: number, width = 640): Promise<Blob | null> {
 	if (typeof document === 'undefined') return Promise.resolve(null);
 	const canvas = (scratch ??= document.createElement('canvas'));
-	canvas.width = 640;
-	canvas.height = 360;
+	const k = width / 640;
+	canvas.width = Math.round(640 * k);
+	canvas.height = Math.round(360 * k);
 	const ctx = canvas.getContext('2d');
 	if (!ctx) return Promise.resolve(null);
+	ctx.scale(k, k);
 	ctx.fillStyle = '#0d1116';
 	ctx.fillRect(0, 0, 640, 360);
 	ctx.fillStyle = '#e29d2e';
-	ctx.fillRect((time * 90) % 700 - 60, 150, 60, 60);
+	ctx.fillRect(((time * 90) % 700) - 60, 150, 60, 60);
 	ctx.fillStyle = '#8fa3b8';
 	ctx.font = '22px monospace';
 	ctx.fillText(`${time.toFixed(2)}s`, 20, 336);

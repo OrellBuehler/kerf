@@ -107,6 +107,7 @@ interface Harness {
 		imgAspect: number | null;
 		streamShown: boolean;
 		streamDrawn(aspect: number): void;
+		showStreamed(url: string): void;
 	};
 	stop: () => void;
 	time: number;
@@ -441,6 +442,39 @@ describe('the width a frame is asked at', () => {
 		await settle();
 		expect(r.asked).toEqual(['jpeg@3']);
 		expect(r.widths).toEqual([1440]);
+		h.stop();
+	});
+});
+
+describe('the playback stream through the pane\u2019s one <img>', () => {
+	test('a streamed frame is the picture, never the surface, and the settled still replaces it in the same place', async () => {
+		const r = recorder({ gpu: async () => ({ renderer: 'gpu', frame: null, reasons: [], timings: { width: 1920, height: 1080, decode_ms: 1, composite_ms: 1, present_ms: 1 } }) });
+		const h = harness({ enabled: true, ...r });
+		await settle();
+		expect(h.frames.gpuShown).toBe(true);
+		h.streaming = true;
+		h.frames.showStreamed('data:image/jpeg;base64,AAA');
+		expect(h.frames.gpuShown).toBe(false);
+		expect(h.frames.streamShown).toBe(false);
+		expect(h.frames.frameUrl).toBe('data:image/jpeg;base64,AAA');
+		h.frames.showStreamed('data:image/jpeg;base64,BBB');
+		expect(h.frames.frameUrl).toBe('data:image/jpeg;base64,BBB');
+		h.stop();
+	});
+
+	test('what the pump fetches after playback ends lands in frameUrl, the one the stream was in', async () => {
+		const r = recorder();
+		const h = harness({ enabled: false, ...r });
+		await settle();
+		h.streaming = true;
+		h.frames.showStreamed('data:streamed');
+		h.time = 4;
+		await settle();
+		expect(h.frames.frameUrl).toBe('data:streamed');
+		h.streaming = false;
+		await settle();
+		expect(h.frames.frameUrl).toBe('data:jpeg-4');
+		expect(h.frames.streamShown).toBe(false);
 		h.stop();
 	});
 });

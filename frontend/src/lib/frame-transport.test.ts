@@ -1,10 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import {
+	CANVAS_PAINTER,
 	createStreamPainter,
 	jpegBlob,
+	jpegDataUrl,
 	MAX_DECODES,
 	parsePlaybackMessage,
 	PLAYBACK_HEADER_BYTES,
+	toBase64,
+	toBase64Chunked,
 	type Picture
 } from './frame-transport';
 
@@ -56,6 +60,41 @@ describe('parsePlaybackMessage', () => {
 	});
 });
 
+describe('the data URL the pane shows', () => {
+	const sizes = [0, 1, 2, 3, 4, 100, 0x7fff, 0x8000, 0x8001, 0x10000, 123_457];
+	const bytes = (n: number) => Uint8Array.from({ length: n }, (_, i) => (i * 31 + 7) & 0xff);
+
+	test('is the frame in base64 behind the image/jpeg prefix, whatever its length', () => {
+		for (const n of sizes) {
+			const b = bytes(n);
+			expect(toBase64Chunked(b)).toBe(Buffer.from(b).toString('base64'));
+			expect(toBase64(b)).toBe(Buffer.from(b).toString('base64'));
+			expect(jpegDataUrl(b)).toBe(`data:image/jpeg;base64,${Buffer.from(b).toString('base64')}`);
+		}
+	});
+
+	test('reads a view into a larger message, as the channel hands the JPEG over', () => {
+		const message = new Uint8Array(SENT).buffer;
+		const view = parsePlaybackMessage(message)!.jpeg;
+		expect(jpegDataUrl(view)).toBe(`data:image/jpeg;base64,${Buffer.from([0xff, 0xd8, 1, 2, 0xff, 0xd9]).toString('base64')}`);
+	});
+
+	test('falls back to the chunked btoa where the webview has no toBase64', () => {
+		const b = bytes(70_000);
+		const own = Object.getOwnPropertyDescriptor(Uint8Array.prototype, 'toBase64');
+		try {
+			Object.defineProperty(Uint8Array.prototype, 'toBase64', { value: undefined, configurable: true, writable: true });
+			expect(toBase64(b)).toBe(Buffer.from(b).toString('base64'));
+		} finally {
+			if (own) Object.defineProperty(Uint8Array.prototype, 'toBase64', own);
+		}
+	});
+
+	test('the canvas painter is off until a webview is measured where it wins', () => {
+		expect(CANVAS_PAINTER).toBe(false);
+	});
+});
+
 describe('jpegBlob', () => {
 	test('holds the frame’s bytes as an image/jpeg', async () => {
 		const message = parsePlaybackMessage(new Uint8Array(SENT).buffer)!;
@@ -72,9 +111,9 @@ function decoder() {
 	return {
 		pending,
 		closed,
-		decode: (jpeg: Blob) =>
+		decode: (jpeg: Uint8Array<ArrayBuffer>) =>
 			new Promise<Picture>((resolve, reject) => {
-				const name = (jpeg as unknown as { name: string }).name;
+				const name = String.fromCharCode(...jpeg);
 				pending.push({
 					name,
 					resolve: () => resolve({ source: {} as CanvasImageSource, width: 640, height: 360, close: () => closed.push(name) }),
@@ -84,7 +123,7 @@ function decoder() {
 	};
 }
 
-const frame = (name: string) => Object.assign(new Blob([name]), { name });
+const frame = (name: string) => new Uint8Array([...name].map((c) => c.charCodeAt(0)));
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 describe('createStreamPainter', () => {

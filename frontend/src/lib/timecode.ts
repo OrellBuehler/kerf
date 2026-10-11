@@ -1,3 +1,4 @@
+import { trackRenders } from './levels';
 import type { Asset, Timeline } from './types';
 
 const validFps = (fps: number | undefined): number =>
@@ -8,6 +9,23 @@ const validFps = (fps: number | undefined): number =>
 export function timelineFps(timeline: Timeline, assets: Asset[]): number {
 	for (const track of timeline.tracks) {
 		for (const clip of track.clips) {
+			const stream = assets.find(a => a.id === clip.asset_id)?.streams.find(s => s.kind === 'video');
+			if (stream) return validFps(stream.fps);
+		}
+	}
+	return 30;
+}
+
+/** The rate the cut plays and exports at: [`timelineFps`] read from the cut **as it renders**, as the
+	* engine reads it (`export_format` of `Timeline::for_render` — the muted and solo-shadowed tracks
+	* (`trackRenders`) and the disabled clips are not in it, so their footage does not set the rate).
+	* What playback's rate, ladder and gate follow; timecode keeps [`timelineFps`], which is a frame
+	* count of the cut as it is edited. */
+export function renderedFps(timeline: Timeline, assets: Asset[]): number {
+	for (const track of timeline.tracks) {
+		if (!trackRenders(timeline, track)) continue;
+		for (const clip of track.clips) {
+			if (clip.enabled === false) continue;
 			const stream = assets.find(a => a.id === clip.asset_id)?.streams.find(s => s.kind === 'video');
 			if (stream) return validFps(stream.fps);
 		}

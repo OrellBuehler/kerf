@@ -75,12 +75,13 @@ detached panels (`popout_expect` / `popout_cancel` / `popout_focus` / `popout_mo
 `start_playback { playback_id, start, fps?, max_width?, on_frame }` / `stop_playback` — streamed
 composited frames over a `tauri::ipc::Channel<InvokeResponseBody>`, **raw bytes** (`playback_message`:
 the frame's timeline time as a little-endian `f64`, then the JPEG undecoded; the page parses it with
-`frame-transport.ts`, and both ends hold the same fixed vector in a test) — not base64 in JSON, whose
-cost was the webview taking a third more bytes, parsing them and decoding the `data:` URL on its main
-thread. Tauri 2.12 sends a raw payload over 1 KiB through its `fetch` channel command and a smaller one
+`frame-transport.ts`, and both ends hold the same fixed vector in a test) — not base64 in JSON: a quarter
+fewer bytes through the channel and no base64 / JSON at this end. It is not a faster webview decode (headless
+Chromium measured none, `frontend.md`): the page builds the data URL itself, for the frames it shows. Tauri 2.12
+sends a raw payload over 1 KiB through its `fetch` channel command and a smaller one
 inline; the page receives an `ArrayBuffer` either way, in order. `fps` / `max_width` left out mean the
-cut's own rate and the default width (`kerf_core::playback_params`); the preview states them only when
-restarting a stream that could not keep up. The "playback stream ended" log line carries `fps`,
+cut's own rate and the default width (`kerf_core::playback_params`); the preview always states the width and
+the rate only when restarting a stream that could not keep up. The "playback stream ended" log line carries `fps`,
 `max_width`, `late_frames` (more than two frame intervals behind the schedule) and `worst_late_ms`,
 the numbers to read from a user's log when playback is reported choppy. Cancelled **by caller-supplied
 id** rather than a generation counter, because start and stop are separate async calls that can arrive

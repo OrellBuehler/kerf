@@ -5,7 +5,10 @@ import { SRC } from './test-sources';
 import { FRAME_STEPS, MIN_FRAME_PX } from './preview-size';
 import {
 	createFrameGate,
+	createLadder,
 	DEGRADE_MEMORY_MS,
+	HEAL_WATCH,
+	MAX_LEAD,
 	MAX_PLAYBACK_FPS,
 	MIN_PLAYBACK_FPS,
 	MIN_STALE_AFTER,
@@ -15,6 +18,7 @@ import {
 	RESYNC_AFTER,
 	rungAfter,
 	staleAfter,
+	startAt,
 	startRung,
 	stepDown,
 	stepsAfter,
@@ -58,13 +62,12 @@ describe('playbackFps', () => {
 describe('staleAfter', () => {
 	test('is two frames at the low rates, as it was at 24 fps', () => {
 		expect(staleAfter(24)).toBeCloseTo(2 / 24, 10);
-		expect(staleAfter(30)).toBeCloseTo(2 / 30, 10);
+		expect(staleAfter(12)).toBeCloseTo(2 / 12, 10);
 	});
 
-	test('does not shrink below what one main-thread hiccup costs at 50 and 60 fps', () => {
-		expect(staleAfter(60)).toBe(MIN_STALE_AFTER);
-		expect(staleAfter(50)).toBe(MIN_STALE_AFTER);
-		expect(staleAfter(60)).toBeGreaterThan(2 / 60);
+	test('does not shrink below what a main-thread hiccup and ui.time\u2019s refresh cost at 30 to 60 fps', () => {
+		for (const fps of [30, 50, 60]) expect(staleAfter(fps)).toBe(MIN_STALE_AFTER);
+		expect(staleAfter(60)).toBeGreaterThan(2 / 60 + 1 / 60);
 	});
 });
 
@@ -120,11 +123,22 @@ describe('createFrameGate', () => {
 		expect(second(0.5)).toBe('show');
 	});
 
-	test('the budget follows the rate it is told: a 60 fps stream keeps 50 ms, not 33', () => {
+	test('the budget follows the rate it is told: a 60 fps stream keeps 75 ms, not 33', () => {
 		const verdict = createFrameGate({ fps: 60 });
 		verdict(0.09);
-		expect(verdict(0.09 + 0.04)).toBe('show');
+		expect(verdict(0.09 + 0.06)).toBe('show');
 		expect(verdict(0.09 + MIN_STALE_AFTER + 0.005)).toBe('skip');
+	});
+
+	test('says what the stream\u2019s start-up cost and what it dropped', () => {
+		const verdict = createFrameGate({ fps: 24 });
+		expect(verdict.floor()).toBeNull();
+		verdict(0.3);
+		verdict(0.12);
+		verdict(0.5);
+		verdict(0.13);
+		expect(verdict.floor()).toBe(0.12);
+		expect(verdict.stats()).toEqual({ shown: 3, skipped: 1 });
 	});
 });
 
@@ -144,6 +158,39 @@ function play(plays: number, renders: number, seconds: number, spawn = 0.15): { 
 		if (v === 'resync' || v === 'degrade') break;
 	}
 	return { verdicts, at };
+}
+
+/**
+ * A stream that was in step with the clock, stalls for `stallFor` seconds at its 2 s mark, then delivers
+ * what it owes at `catchUp` times real time (`Infinity`: all at once) until it is back on its schedule.
+ * The clock runs at real time and frame i of the stream is `i / fps` of media time, so a frame's lag is
+ * its arrival minus that. Returns what the gate said and how long the pane showed nothing after the
+ * stall ended: until the first frame shown, or until the restart a `resync` / `degrade` costs
+ * (`spawn` of ffmpeg and its first frame). `heal: false` is the gate without the projection of how long
+ * the catching up takes.
+ */
+function stall(fps: number, stallFor: number, catchUp: number, o: { heal?: boolean } = {}) {
+	const verdict = createFrameGate({ fps, healWatch: o.heal === false ? Infinity : undefined });
+	const spawn = 0.15;
+	const resumes = spawn + 2 + stallFor;
+	const owed = Math.round(2 * fps);
+	const verdicts: FrameVerdict[] = [];
+	let shownAfter: number | null = null;
+	let prev = 0;
+	for (let i = 0; ; i++) {
+		const due = spawn + i / fps;
+		const arrival = i < owed ? due : Math.max(due, i === owed ? resumes : prev + 1 / (catchUp * fps));
+		if (arrival > spawn + 14) break;
+		prev = arrival;
+		const v = verdict(arrival - i / fps, arrival);
+		verdicts.push(v);
+		if (i >= owed && shownAfter === null && v === 'show') shownAfter = arrival;
+		if (v === 'resync' || v === 'degrade') {
+			shownAfter = arrival + spawn;
+			break;
+		}
+	}
+	return { verdicts, frozen: (shownAfter ?? Infinity) - resumes };
 }
 
 describe('a stream that cannot keep up', () => {
@@ -204,6 +251,64 @@ describe('a stream that cannot keep up', () => {
 			if (v === 'resync') break;
 		}
 		expect([...seen].sort()).toEqual(['resync', 'show', 'skip']);
+	});
+
+	test('a stall that is caught up slowly is restarted, not skipped through', () => {
+		// The case the one-second resync does not see: 60 fps, a 600 ms stall, then frames at 1.1x real
+		// time. The drift heals by a ninth of a second per second, so the pane would show nothing for
+		// the six seconds until it is back inside the budget.
+		const slow = stall(60, 0.6, 1.1);
+		expect(slow.verdicts.at(-1)).toBe('resync');
+		expect(slow.frozen).toBeLessThan(0.6);
+		const without = stall(60, 0.6, 1.1, { heal: false });
+		expect(without.verdicts.includes('resync')).toBe(false);
+		expect(without.frozen).toBeGreaterThan(5);
+	});
+
+	test('whatever the rate, and however long the stall, when the catch-up is slow', () => {
+		for (const fps of [24, 30, 60]) {
+			for (const [stallFor, catchUp] of [
+				[0.3, 1.2],
+				[0.6, 1.1],
+				[0.9, 1.3]
+			]) {
+				const r = stall(fps, stallFor, catchUp);
+				expect(r.verdicts.at(-1), `${fps} fps, ${stallFor} s at ${catchUp}x`).toBe('resync');
+				expect(r.frozen, `${fps} fps, ${stallFor} s at ${catchUp}x`).toBeLessThan(1);
+			}
+		}
+	});
+
+	test('but a stall that is caught up quickly is waited out: the burst is the picture catching up', () => {
+		for (const fps of [24, 60]) {
+			const r = stall(fps, 0.45, Infinity);
+			expect(r.verdicts.includes('resync') || r.verdicts.includes('degrade')).toBe(false);
+			expect(r.frozen).toBeLessThan(0.1);
+		}
+		// Four times real time: back inside the budget in half a second, which is what a restart costs.
+		const fast = stall(60, 0.4, 4);
+		expect(fast.verdicts.includes('resync')).toBe(false);
+		expect(fast.frozen).toBeLessThan(0.5);
+	});
+
+	test('a drift a hair over the budget heals before it matters and is not restarted over', () => {
+		const verdict = createFrameGate({ fps: 60 });
+		let at = 0;
+		for (let i = 0; i < 60; i++) verdict(0.1, (at += 1 / 60));
+		const seen = new Set<FrameVerdict>();
+		// 85 ms over the floor, closing slowly: skipped for a moment, never worth a restart.
+		for (let i = 0; i < 30; i++) seen.add(verdict(0.1 + 0.085 - i * 0.0004, (at += 1 / 60)));
+		expect(seen.has('resync')).toBe(false);
+	});
+
+	test('watches a run for as long as it takes to read a rate, no less', () => {
+		const verdict = createFrameGate({ fps: 60 });
+		let at = 0;
+		for (let i = 0; i < 60; i++) verdict(0.1, (at += 1 / 60));
+		// 600 ms behind and healing at a ninth per second, but only a few frames in.
+		expect(verdict(0.7, (at += 1 / 60))).toBe('skip');
+		expect(verdict(0.7 - 0.0015, (at += 1 / 60))).toBe('skip');
+		expect(HEAL_WATCH).toBeGreaterThan(2 / 60);
 	});
 
 	test('a stall of a second is a resync, not a degrade', () => {
@@ -287,6 +392,161 @@ describe('stepsToStart', () => {
 		expect(stepsToStart(2, DEGRADE_MEMORY_MS + 1)).toBe(0);
 		expect(stepsToStart(0, Infinity)).toBe(0);
 		expect(stepsToStart(3, Infinity)).toBe(0);
+	});
+});
+
+describe('startAt', () => {
+	test('is the playhead, or a head start of the stream\u2019s own floor after a restart for lag', () => {
+		expect(startAt(10, null, 100, 30)).toBe(10);
+		expect(startAt(10, 0.3, 100, 30)).toBeCloseTo(10.3, 10);
+		expect(startAt(10, 0, 100, 30)).toBe(10);
+	});
+
+	test('a floor that is not a start-up to make up for is not taken: negative, not a number, or very long', () => {
+		expect(startAt(10, -0.2, 100, 30)).toBe(10);
+		expect(startAt(10, NaN, 100, 30)).toBe(10);
+		expect(startAt(10, Infinity, 100, 30)).toBe(10);
+		expect(startAt(10, 3, 100, 30)).toBeCloseTo(10 + MAX_LEAD, 10);
+	});
+
+	test('never past the last frame of the cut, which the engine would refuse', () => {
+		expect(startAt(99.9, 0.4, 100, 30)).toBeCloseTo(100 - 1 / 30, 10);
+		expect(startAt(100, 0.4, 100, 30)).toBe(100);
+		expect(startAt(99, 0.4, 100, 60)).toBeCloseTo(99.4, 10);
+	});
+
+	test('puts the first frame in step with the sound rather than a start-up behind it', () => {
+		// The restart's own spawn takes what the last stream's took (its floor): the sound is that far on
+		// when the first frame arrives, and so is the frame.
+		const floor = 0.3;
+		const playhead = 12;
+		const from = startAt(playhead, floor, 100, 30);
+		const arrives = playhead + floor;
+		expect(arrives - from).toBeCloseTo(0, 10);
+		expect(arrives - startAt(playhead, null, 100, 30)).toBeCloseTo(floor, 10);
+	});
+});
+
+describe('createLadder', () => {
+	const cut = { fps: 60, width: 1920 as number | null, playhead: 5, duration: 60 };
+	const key = (timeline: unknown = {}, epoch = 0, width: number | null = 1920) => ({ timeline, epoch, width });
+	let now = 0;
+	const fresh = () => {
+		now = 0;
+		return createLadder(() => now);
+	};
+
+	test('starts at the top: the cut\u2019s own rate left to the engine, the pane\u2019s width, the playhead', () => {
+		const ladder = fresh();
+		const start = ladder.start(key(), cut);
+		expect(start.rung).toEqual({ fps: 60, width: 1920 });
+		expect(start.request).toEqual({ fps: null, width: 1920 });
+		expect(start.from).toBe(5);
+		expect(start.cheaper).toBe(true);
+		expect(ladder.steps).toBe(0);
+	});
+
+	test('an unmeasured pane asks for nothing and plays at the default width', () => {
+		const start = fresh().start(key(undefined, 0, null), { ...cut, width: null });
+		expect(start.request).toEqual({ fps: null, width: null });
+		expect(start.rung).toEqual({ fps: 60, width: 960 });
+	});
+
+	test('a degrade steps down, states what it asks for, and starts a head start ahead', () => {
+		const ladder = fresh();
+		const k = key();
+		ladder.start(k, cut);
+		now = 3000;
+		ladder.restarted('degrade', 0.3);
+		const start = ladder.start(k, cut);
+		expect(start.rung).toEqual({ fps: 30, width: 1920 });
+		expect(start.request).toEqual({ fps: 30, width: 1920 });
+		expect(start.from).toBeCloseTo(5.3, 10);
+		expect(ladder.steps).toBe(1);
+	});
+
+	test('the head start is for the restart that asked for it: a seek or an edit starts at the playhead', () => {
+		const ladder = fresh();
+		const k = key();
+		ladder.start(k, cut);
+		ladder.restarted('degrade', 0.3);
+		expect(ladder.start(k, cut).from).toBeCloseTo(5.3, 10);
+		expect(ladder.start(k, { ...cut, playhead: 9 }).from).toBe(9);
+	});
+
+	test('a stream that was started ahead hands its start-up on whole, not what is left of it', () => {
+		// The first restart's stream was given 0.3 s and was in step to the millisecond (floor 0): the
+		// next restart still has a 0.3 s spawn to make up for.
+		const ladder = fresh();
+		const k = key();
+		ladder.start(k, cut);
+		ladder.restarted('degrade', 0.3);
+		expect(ladder.start(k, cut).from).toBeCloseTo(5.3, 10);
+		ladder.restarted('degrade', 0);
+		expect(ladder.start(k, cut).from).toBeCloseTo(5.3, 10);
+		// ...and one that was given too much (floor -0.1: the picture ran ahead) hands on less.
+		ladder.restarted('degrade', -0.1);
+		expect(ladder.start(k, cut).from).toBeCloseTo(5.2, 10);
+	});
+
+	test('a resync is a step only when it follows another within ten seconds', () => {
+		const ladder = fresh();
+		const k = key();
+		ladder.start(k, cut);
+		now = 1000;
+		ladder.restarted('resync', 0.2);
+		expect(ladder.start(k, cut).rung.fps).toBe(60);
+		now = 4000;
+		ladder.restarted('resync', 0.2);
+		expect(ladder.start(k, cut).rung.fps).toBe(30);
+	});
+
+	test('a new cut, a proxy that landed or another pane starts at the top again', () => {
+		const ladder = fresh();
+		const timeline = {};
+		ladder.start(key(timeline), cut);
+		ladder.restarted('degrade', 0.3);
+		expect(ladder.start(key(timeline), cut).rung.fps).toBe(30);
+		ladder.restarted('degrade', 0.3);
+		expect(ladder.start(key({}), cut).rung.fps).toBe(60);
+		ladder.restarted('degrade', 0.3);
+		expect(ladder.start(key(timeline, 1), cut).rung.fps).toBe(60);
+		const again = key(timeline, 1);
+		ladder.restarted('degrade', 0.3);
+		expect(ladder.start(again, cut).rung.fps).toBe(30);
+		ladder.restarted('degrade', 0.3);
+		expect(ladder.start(key(timeline, 1, 960), cut).rung.fps).toBe(60);
+		// ...and the head start of the restart before it is gone with it.
+		expect(ladder.start(key(timeline, 1, 960), cut).from).toBe(5);
+	});
+
+	test('forgets a step after a minute, and not before', () => {
+		const ladder = fresh();
+		const k = key();
+		ladder.start(k, cut);
+		ladder.restarted('degrade', 0.3);
+		ladder.start(k, cut);
+		now = DEGRADE_MEMORY_MS - 1;
+		expect(ladder.start(k, cut).rung.fps).toBe(30);
+		now = DEGRADE_MEMORY_MS + 1;
+		expect(ladder.start(k, cut).rung.fps).toBe(60);
+		expect(ladder.steps).toBe(0);
+	});
+
+	test('says when a restart has nowhere cheaper to go', () => {
+		const ladder = fresh();
+		const k = key();
+		ladder.start(k, { ...cut, fps: 15, width: 480 });
+		expect(ladder.start(k, { ...cut, fps: 15, width: 480 }).cheaper).toBe(false);
+		expect(ladder.start(k, { ...cut, fps: 24, width: 480 }).cheaper).toBe(true);
+	});
+
+	test('never starts past the end of the cut', () => {
+		const ladder = fresh();
+		const k = key();
+		ladder.start(k, cut);
+		ladder.restarted('degrade', 0.4);
+		expect(ladder.start(k, { ...cut, playhead: 59.9 }).from).toBeCloseTo(60 - 1 / 30, 10);
 	});
 });
 

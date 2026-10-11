@@ -78,8 +78,7 @@ describe('startPlayback (desktop)', () => {
 		channel.onmessage(message(1.5, [0xff, 0xd8, 1, 2, 0xff, 0xd9]));
 		channel.onmessage(message(1.5 + 1 / 60, [0xff, 0xd8, 3, 0xff, 0xd9]));
 		expect(frames.map((f) => f.time)).toEqual([1.5, 1.5 + 1 / 60]);
-		expect(frames[0].jpeg.type).toBe('image/jpeg');
-		expect([...new Uint8Array(await frames[0].jpeg.arrayBuffer())]).toEqual([0xff, 0xd8, 1, 2, 0xff, 0xd9]);
+		expect([...frames[0].jpeg]).toEqual([0xff, 0xd8, 1, 2, 0xff, 0xd9]);
 		stop();
 	});
 
@@ -92,6 +91,23 @@ describe('startPlayback (desktop)', () => {
 		channel.onmessage({ time: 1, jpeg: 'x' });
 		channel.onmessage(undefined);
 		expect(frames).toEqual([]);
+		stop();
+	});
+
+	test('a frame that makes the page throw does not end the stream behind it', async () => {
+		const frames: PlaybackFrame[] = [];
+		let first = true;
+		const stop = startPlayback(0, { fps: null, width: null }, (f) => {
+			if (first) {
+				first = false;
+				throw new Error('the page choked on this one');
+			}
+			frames.push(f);
+		});
+		const channel = await started();
+		expect(() => channel.onmessage(message(0, [0xff, 0xd8, 0xff, 0xd9]))).not.toThrow();
+		channel.onmessage(message(1 / 60, [0xff, 0xd8, 1, 0xff, 0xd9]));
+		expect(frames.map((f) => f.time)).toEqual([1 / 60]);
 		stop();
 	});
 

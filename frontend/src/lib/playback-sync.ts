@@ -21,9 +21,11 @@ export function playbackFps(timelineFps: number): number {
 }
 
 /** The least a frame may trail the audio clock, beyond the stream's own transport floor, before it
- *  is not worth showing: two frames at the low rates, but not less than this at 60 fps, where two
- *  frames are 33 ms and one main-thread hiccup is more than that. */
-export const MIN_STALE_AFTER = 0.05;
+ *  is not worth showing: two frames at the low rates, but not less than this at 50 and 60 fps. Two
+ *  frames there are 33-40 ms, and `ui.time` is only written once per animation frame (16.7 ms of
+ *  jitter in every lag, all of it on the same side) before the channel's own jitter and one hiccup
+ *  are counted, so 50 ms left about 33 ms for everything else and skipped frames of a healthy stream. */
+export const MIN_STALE_AFTER = 0.075;
 
 /** How much further behind the audio clock a frame may *drift* than the stream's
  *  own transport floor, and still be worth showing. Roughly two frames: enough
@@ -42,11 +44,20 @@ export const RESYNC_AFTER = 1.0;
  *  further behind with every one. */
 export const OVERLOAD_AFTER = 0.4;
 
+/** How long a run of skips is watched before its drift is read as a rate of healing. */
+export const HEAL_WATCH = 0.2;
+/** How far past the staleness budget the drift must be for the rate of healing to be believed: a
+ *  hair over it heals before it matters, and the estimate is only as good as `ui.time`'s 17 ms. */
+export const HEAL_MARGIN = 0.05;
+/** What a restart costs the picture at least, seconds frozen: ffmpeg's spawn and the first frame. The
+ *  stream's own floor is what its start-up really took, and counts when it is longer. */
+export const RESTART_COST = 0.5;
+
 export type FrameVerdict = 'show' | 'skip' | 'resync' | 'degrade';
 
 /**
  * Build the per-stream gate: give it how far behind the audio clock a frame
- * arrived, and it says what to do with that frame.
+ * arrived (and, for the rate of healing, when), and it says what to do with that frame.
  *
  * Every frame arrives *some* amount late — ffmpeg's startup, then IPC and the
  * decode per frame — and the backend paces from the first frame it emits, so
@@ -57,23 +68,39 @@ export type FrameVerdict = 'show' | 'skip' | 'resync' | 'degrade';
  * whatever still it had. So lag is judged against the smallest this stream has
  * managed — its transport floor — and only growth beyond that counts as drift.
  *
- * Drift is one of three things. A frame a little late is skipped (`skip`), so a picture
+ * Drift is one of four things. A frame a little late is skipped (`skip`), so a picture
  * that trails the sound catches up instead of dragging. One a second late means the
- * stream stalled, so it is restarted from the playhead (`resync`). And frames that are late
+ * stream stalled, so it is restarted from the playhead (`resync`). Frames that are late
  * and later with every one are a stream that renders slower than it plays — at 60 fps on a
  * machine that does 50, drift grows by a sixth of a second per second and skipping alone
  * would freeze the pane for the six seconds until the resync — so after
  * [`OVERLOAD_AFTER`] of it the gate says `degrade`: restart from the playhead at a cost the
  * machine can carry (see [`stepDown`]), dropping frames from the source rather than drifting.
+ * And frames that are late but *less* late with every one are a stream catching up, which is
+ * fine when it is quick (the burst after a hiccup) and a frozen pane when it is slow: a 600 ms
+ * stall caught up at 1.1x real time heals at a ninth of a second per second, six seconds of
+ * skipping under the one-second resync. So once a run has been watched for [`HEAL_WATCH`], the
+ * gate projects how long the pane would still be frozen, until the drift is back inside the
+ * budget, and when that is more than a restart costs it says `resync` instead. Pass `at`
+ * (seconds, any origin) to time the run; without it each call is taken to be one frame apart.
  */
-export function createFrameGate({ fps = 24, resyncAfter = RESYNC_AFTER, overloadAfter = OVERLOAD_AFTER } = {}) {
+export function createFrameGate({
+	fps = 24,
+	resyncAfter = RESYNC_AFTER,
+	overloadAfter = OVERLOAD_AFTER,
+	healWatch = HEAL_WATCH
+} = {}) {
 	const rate = playbackFps(fps);
 	const stale = staleAfter(rate);
 	const overloadRun = Math.max(2, Math.ceil(overloadAfter * rate));
 	let floor: number | null = null;
 	let skips = 0;
 	let runStart = 0;
-	return function verdict(lag: number): FrameVerdict {
+	let runAt = 0;
+	let calls = 0;
+	const seen = { shown: 0, skipped: 0 };
+	function verdict(lag: number, at: number = calls / rate): FrameVerdict {
+		calls++;
 		// The floor tracks the minimum rather than trusting the first frame alone:
 		// that one carries ffmpeg's spawn and is usually the slowest of the stream,
 		// so taking it as the baseline would leave the budget permanently generous.
@@ -81,14 +108,31 @@ export function createFrameGate({ fps = 24, resyncAfter = RESYNC_AFTER, overload
 		const drift = lag - floor;
 		if (drift > resyncAfter) return 'resync';
 		if (drift > stale) {
-			if (skips === 0) runStart = drift;
+			if (skips === 0) {
+				runStart = drift;
+				runAt = at;
+			}
 			skips++;
 			if (skips >= overloadRun && drift >= runStart) return 'degrade';
+			const watched = at - runAt;
+			if (watched >= healWatch && drift - stale >= HEAL_MARGIN) {
+				const healing = (runStart - drift) / watched;
+				if (healing > 0 && (drift - stale) / healing > Math.max(RESTART_COST, floor)) return 'resync';
+			}
+			seen.skipped++;
 			return 'skip';
 		}
 		skips = 0;
+		seen.shown++;
 		return 'show';
-	};
+	}
+	return Object.assign(verdict, {
+		/** The least lag this stream has managed, seconds: what its start-up and transport really cost,
+		 *  or `null` before any frame. */
+		floor: (): number | null => floor,
+		/** What it has said so far, for the log. */
+		stats: () => ({ ...seen })
+	});
 }
 
 /** A cost the stream can be restarted at: the rate it plays and the width it renders. */
@@ -164,4 +208,92 @@ export const DEGRADE_MEMORY_MS = 60_000;
 /** The steps a stream starts with: where it was, unless its last restart was long enough ago. */
 export function stepsToStart(steps: number, sinceLastRestartMs: number): number {
 	return sinceLastRestartMs > DEGRADE_MEMORY_MS ? 0 : steps;
+}
+
+/** The most a restart is started ahead of the playhead, seconds: a floor this long is a stream that
+ *  was never in step to begin with, not a start-up to make up for. */
+export const MAX_LEAD = 0.5;
+
+/** Where a stream starts: the playhead, and after a restart for lag the stream's own floor ahead of it
+ *  — the sound goes on while ffmpeg spawns, and a stream started at the playhead would show its first
+ *  frame that long behind the sound and keep it there (the gate judges lag against its floor, so
+ *  nothing else would ever notice). Never past the last frame of the cut, which the engine refuses. */
+export function startAt(playhead: number, floor: number | null, duration: number, fps: number): number {
+	const lead = floor !== null && Number.isFinite(floor) ? Math.min(MAX_LEAD, Math.max(0, floor)) : 0;
+	return Math.min(playhead + lead, Math.max(playhead, duration - 1 / playbackFps(fps)));
+}
+
+/** What the ladder says about a stream about to start. */
+export interface StreamStart {
+	/** The cost it plays at. */
+	rung: Rung;
+	/** What is asked of the backend: the cut's own rate (`null`) until a step down, and the pane's width. */
+	request: { fps: number | null; width: number | null };
+	/** The timeline time it starts at. */
+	from: number;
+	/** Whether a restart has anywhere cheaper to go: the gate is built without `degrade` when not. */
+	cheaper: boolean;
+}
+
+/** What a ladder is for: a new cut, a proxy that landed or another pane width starts again at the top. */
+export interface LadderKey {
+	timeline: unknown;
+	epoch: number;
+	width: number | null;
+}
+
+/**
+ * The bookkeeping of playing at the cost a machine can carry, out of the component so it can be tested:
+ * how many steps down this cut is at this width, when it last restarted for lag, and how far the next
+ * start is ahead of the playhead. `start` is called whenever a stream (re)starts and says how; `restarted`
+ * when the gate asked for a lag restart. The steps are a counter read at the start, not state anything
+ * watches, and are forgotten after [`DEGRADE_MEMORY_MS`] (`stepsToStart`).
+ */
+export function createLadder(clock: () => number = () => performance.now()) {
+	let key: LadderKey | null = null;
+	let steps = 0;
+	let lastRestart = -Infinity;
+	let floor: number | null = null;
+	let applied = 0;
+	return {
+		start(
+			next: LadderKey,
+			cut: { fps: number; width: number | null; playhead: number; duration: number }
+		): StreamStart {
+			if (!key || key.timeline !== next.timeline || key.epoch !== next.epoch || key.width !== next.width) {
+				key = next;
+				steps = 0;
+				lastRestart = -Infinity;
+				floor = null;
+				applied = 0;
+			}
+			steps = stepsToStart(steps, clock() - lastRestart);
+			const rung = rungAfter(startRung(cut.fps, cut.width), steps);
+			const from = startAt(cut.playhead, floor, cut.duration, rung.fps);
+			// The head start is for the restart that asked for it; a seek or an edit starts at the playhead.
+			floor = null;
+			applied = from - cut.playhead;
+			return {
+				rung,
+				request: steps > 0 ? { fps: rung.fps, width: rung.width } : { fps: null, width: cut.width },
+				from,
+				cheaper: stepDown(rung) !== null
+			};
+		},
+		/**
+		 * The gate said `resync` or `degrade`; `lag` is its floor. A stream that was started ahead is in
+		 * step by its floor and no more, so what its start-up really took is the floor *and* the head
+		 * start it was given: without it a second restart would take the first one's success for a
+		 * start-up that cost nothing.
+		 */
+		restarted(verdict: 'resync' | 'degrade', lag: number | null) {
+			const now = clock();
+			steps = stepsAfter(verdict, steps, now - lastRestart);
+			lastRestart = now;
+			floor = lag === null ? null : lag + applied;
+		},
+		get steps() {
+			return steps;
+		}
+	};
 }
