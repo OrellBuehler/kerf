@@ -4562,12 +4562,60 @@ pub struct PreviewFrame {
     pub time: f64,
     /// The frame as JPEG bytes.
     pub jpeg: Vec<u8>,
+    /// How far behind its slot on the wall-clock schedule the frame arrived, in seconds (0 when
+    /// it was early or on time). A stream that renders slower than it was asked to play grows
+    /// this frame by frame; a hiccup shows once and is gone.
+    pub late: f64,
 }
 
-/// Cap on the live preview's width. Playback has to composite, encode and ship a
-/// frame every ~40 ms, so it renders smaller than the drill-in still does — the
-/// preview pane is well under this on a normal window anyway.
+/// The width a playback stream renders at when the caller does not say.
 const PREVIEW_STREAM_WIDTH: u32 = 960;
+
+/// The widest and narrowest stream asked for. The top is the MCP frame tools' own cap and the
+/// preview's (`preview-size.ts`): the engine never scales a picture past its own width, so the
+/// bound is only on cost.
+pub const MAX_STREAM_WIDTH: u32 = 1920;
+pub const MIN_STREAM_WIDTH: u32 = 64;
+
+/// The fastest a stream plays. The webview paints at the display's rate, so frames past this
+/// are composited and shipped for nothing.
+pub const MAX_STREAM_FPS: f64 = 60.0;
+pub const MIN_STREAM_FPS: f64 = 1.0;
+
+/// What a playback stream is asked for. Both are optional: the caller that knows better (the
+/// preview, after the machine failed to keep up with the rate it was given) states them, and
+/// leaving them out means the timeline's own rate and the default width.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PlaybackRequest {
+    pub fps: Option<f64>,
+    pub max_width: Option<u32>,
+}
+
+/// What a stream really runs at, once [`PlaybackRequest`] is resolved.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlaybackParams {
+    pub fps: f64,
+    pub max_width: u32,
+}
+
+/// The frame rate and width a stream plays at.
+///
+/// An unstated rate is the timeline's own — the one the export would deliver, read from the
+/// cut as it renders (a muted track's footage does not set it) — held to
+/// [`MIN_STREAM_FPS`]`..=`[`MAX_STREAM_FPS`], so a 24 fps cut plays at 24 and a 60 fps one at 60
+/// instead of both at the 24 this once was. A stated rate is clamped to the same range, and an
+/// unusable one (not finite, not positive) is treated as unstated. An unstated width is
+/// [`PREVIEW_STREAM_WIDTH`]; a stated one is held to [`MIN_STREAM_WIDTH`]`..=`[`MAX_STREAM_WIDTH`].
+pub fn playback_params(timeline: &Timeline, assets: &[Asset], request: PlaybackRequest) -> PlaybackParams {
+    let stated = request.fps.filter(|f| f.is_finite() && *f > 0.0);
+    let fps = stated.unwrap_or_else(|| export_format(&timeline.for_render(), assets, &ExportOptions::default()).fps);
+    PlaybackParams {
+        fps: fps.clamp(MIN_STREAM_FPS, MAX_STREAM_FPS),
+        max_width: request
+            .max_width
+            .map_or(PREVIEW_STREAM_WIDTH, |w| w.clamp(MIN_STREAM_WIDTH, MAX_STREAM_WIDTH)),
+    }
+}
 
 /// JPEG quality (`-q:v`) for streamed frames: 2 is best, 31 worst. 6 is visually
 /// clean while keeping a 960px frame near 40 KB, so 30 fps costs ~1.2 MB/s over
@@ -4694,25 +4742,28 @@ fn next_jpeg(buf: &[u8]) -> Option<(usize, usize)> {
 /// is. One long-lived process decoding sequentially instead amortizes all of
 /// that, and the all-intra proxies keep each decode cheap.
 ///
-/// Frames are paced to `fps` against the wall clock rather than pushed as fast
+/// Frames are paced to the rate against the wall clock rather than pushed as fast
 /// as they render, which keeps the pipe (and so ffmpeg itself) throttled to real
 /// time instead of racing ahead and buffering the whole timeline. Each frame
 /// carries its timeline time so a caller following the audio clock can drop one
-/// that arrived too late to be worth showing.
-pub fn stream_preview(
+/// that arrived too late to be worth showing, and how late it was against the
+/// schedule, which is how a caller tells a hiccup from a stream that cannot keep
+/// up (see [`playback_params`] for what the rate and width default to).
+pub fn stream_preview_with(
     timeline: &Timeline,
     assets: &[Asset],
     start: f64,
-    fps: f64,
+    request: PlaybackRequest,
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
 ) -> Result<()> {
+    let params = playback_params(timeline, assets, request);
     // Whether the run that was spawned asked any input for hardware decode: none of a proxy's
     // inputs do, and a failure of a run that did not is not the hardware's.
     let mut hw = false;
     // `None` until ffmpeg is running: a timeline with nothing to play fails
     // before that, and says nothing about the hardware.
     let mut sent = None;
-    match stream_preview_once(timeline, assets, start, fps, on_frame, &mut sent, &mut hw) {
+    match stream_preview_once(timeline, assets, start, params, on_frame, &mut sent, &mut hw) {
         // A hardware decode that dies before the first frame is `-hwaccel`
         // being unusable here, not the graph: a static ffmpeg aborts outright
         // when `auto` probes a VAAPI whose libva isn't installed. Once frames
@@ -4721,10 +4772,25 @@ pub fn stream_preview(
         Err(e) if hw && sent == Some(0) => {
             HWACCEL_OK.store(false, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!("hardware decode failed starting playback; using software decode: {e}");
-            stream_preview_once(timeline, assets, start, fps, on_frame, &mut sent, &mut hw)
+            stream_preview_once(timeline, assets, start, params, on_frame, &mut sent, &mut hw)
         }
         r => r,
     }
+}
+
+/// [`stream_preview_with`] at a stated `fps` and the default width.
+pub fn stream_preview(
+    timeline: &Timeline,
+    assets: &[Asset],
+    start: f64,
+    fps: f64,
+    on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
+) -> Result<()> {
+    let request = PlaybackRequest {
+        fps: Some(fps),
+        max_width: None,
+    };
+    stream_preview_with(timeline, assets, start, request, on_frame)
 }
 
 /// How long a playback stream may go without producing a frame before it is
@@ -4750,13 +4816,13 @@ fn stream_preview_once(
     timeline: &Timeline,
     assets: &[Asset],
     start: f64,
-    fps: f64,
+    params: PlaybackParams,
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
     sent: &mut Option<u64>,
     hw_used: &mut bool,
 ) -> Result<()> {
-    let fps = fps.clamp(1.0, 60.0);
-    let mut args = build_preview_args(timeline, assets, start, fps, PREVIEW_STREAM_WIDTH, PREVIEW_STREAM_QUALITY)?;
+    let PlaybackParams { fps, max_width } = params;
+    let mut args = build_preview_args(timeline, assets, start, fps, max_width, PREVIEW_STREAM_QUALITY)?;
     // The composited graph outgrows argv just as the export's does.
     let _script = externalize_filter_complex(&mut args, "preview")?;
     // Hardware decode is per input, and a proxy (what the stream reads once one is ready) is
@@ -4767,7 +4833,7 @@ fn stream_preview_once(
     cpu::limit_args(&mut args, cpu::budget_threads());
 
     let bin = ffmpeg_bin();
-    tracing::debug!(start, fps, "starting preview stream");
+    tracing::debug!(start, fps, max_width, "starting preview stream");
     let child = command(&bin)
         .args(&args)
         .stdin(Stdio::null())
@@ -4841,12 +4907,19 @@ fn pump_preview(
             // look overdue and play the whole stream at a sprint.
             let t0 = *origin.get_or_insert_with(std::time::Instant::now);
             let due = std::time::Duration::from_secs_f64(index as f64 / fps);
-            if let Some(wait) = due.checked_sub(t0.elapsed()) {
-                std::thread::sleep(wait);
-            }
+            let late = match due.checked_sub(t0.elapsed()) {
+                Some(wait) => {
+                    std::thread::sleep(wait);
+                    0.0
+                }
+                // The first frame is the clock's origin, on time by definition.
+                None if index == 0 => 0.0,
+                None => (t0.elapsed() - due).as_secs_f64(),
+            };
             let frame = PreviewFrame {
                 time: start + index as f64 / fps,
                 jpeg,
+                late,
             };
             index += 1;
             *sent = Some(index);
@@ -13632,6 +13705,163 @@ mod tests {
         assert_eq!(frames, 1);
     }
 
+    /// A frame that arrives behind the wall-clock schedule says by how much; one that is early or
+    /// on time says nothing. A caller tells a stream that cannot keep up from a hiccup by whether
+    /// that number keeps growing.
+    #[cfg(unix)]
+    #[test]
+    fn a_frame_reports_how_far_behind_its_slot_it_arrived() {
+        let mut delays = Vec::new();
+        let mut sent = Some(0);
+        pump_preview(
+            fake_stream(r"printf '\377\330a\377\331'; sleep 0.3; printf '\377\330b\377\331'"),
+            0.0,
+            1000.0,
+            short_timeouts(),
+            &mut |f| {
+                delays.push(f.late);
+                true
+            },
+            &mut sent,
+        )
+        .expect("ends cleanly");
+        assert_eq!(delays.len(), 2);
+        assert_eq!(delays[0], 0.0, "the first frame sets the clock: {delays:?}");
+        assert!(
+            delays[1] > 0.2 && delays[1] < 2.0,
+            "the second was a third of a second behind a 1 ms slot: {delays:?}"
+        );
+
+        // Paced faster than it renders is not late: the pacing sleeps until the slot. The slots are
+        // long enough that a loaded runner oversleeping one cannot reach the next.
+        let mut delays = Vec::new();
+        pump_preview(
+            fake_stream(r"printf '\377\330a\377\331\377\330b\377\331\377\330c\377\331'"),
+            0.0,
+            4.0,
+            short_timeouts(),
+            &mut |f| {
+                delays.push(f.late);
+                true
+            },
+            &mut sent,
+        )
+        .expect("ends cleanly");
+        assert!(delays.iter().all(|l| *l < 0.05), "{delays:?}");
+    }
+
+    fn params_for(fps: f64, request: PlaybackRequest) -> PlaybackParams {
+        let asset = test_asset(vec![video_stream(1920, 1080, fps)]);
+        let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        playback_params(&timeline, &[asset], request)
+    }
+
+    #[test]
+    fn playback_runs_at_the_timelines_own_rate() {
+        for fps in [12.0, 23.976, 24.0, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0] {
+            let p = params_for(fps, PlaybackRequest::default());
+            assert_eq!(p.fps, fps, "a {fps} fps cut plays at {fps}");
+        }
+        // Past what a display paints there is nothing to gain: the cap.
+        assert_eq!(params_for(120.0, PlaybackRequest::default()).fps, MAX_STREAM_FPS);
+        assert_eq!(params_for(240.0, PlaybackRequest::default()).fps, MAX_STREAM_FPS);
+        // A cut with no footage to read a rate from plays at the engine's default, not at nothing.
+        let empty = timeline_of(vec![video_track(vec![])]);
+        assert_eq!(playback_params(&empty, &[], PlaybackRequest::default()).fps, 30.0);
+    }
+
+    #[test]
+    fn a_stated_rate_wins_within_bounds_and_an_unusable_one_is_not_stated() {
+        let say = |fps| {
+            params_for(
+                60.0,
+                PlaybackRequest {
+                    fps: Some(fps),
+                    max_width: None,
+                },
+            )
+            .fps
+        };
+        assert_eq!(say(30.0), 30.0);
+        assert_eq!(say(29.97), 29.97);
+        assert_eq!(say(15.0), 15.0);
+        assert_eq!(say(0.2), MIN_STREAM_FPS);
+        assert_eq!(say(500.0), MAX_STREAM_FPS);
+        // The cut's own rate stands in for a number that is not one.
+        let own = params_for(25.0, PlaybackRequest::default()).fps;
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -24.0] {
+            assert_eq!(
+                params_for(
+                    25.0,
+                    PlaybackRequest {
+                        fps: Some(bad),
+                        max_width: None
+                    }
+                )
+                .fps,
+                own,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rate_is_the_cut_as_it_renders_not_a_muted_tracks_footage() {
+        let slow = test_asset(vec![video_stream(1920, 1080, 24.0)]);
+        let fast = test_asset(vec![video_stream(1920, 1080, 60.0)]);
+        let mut muted = video_track(vec![make_clip(slow.id, 0.0, 5.0, 0.0)]);
+        muted.muted = true;
+        let timeline = timeline_of(vec![muted, video_track(vec![make_clip(fast.id, 0.0, 5.0, 0.0)])]);
+        let p = playback_params(&timeline, &[slow, fast], PlaybackRequest::default());
+        assert_eq!(p.fps, 60.0);
+    }
+
+    #[test]
+    fn the_stream_width_is_the_one_asked_for_within_bounds() {
+        let width = |w| params_for(30.0, PlaybackRequest { fps: None, max_width: w }).max_width;
+        assert_eq!(width(None), PREVIEW_STREAM_WIDTH);
+        for w in [480, 960, 1280, 1440, 1920] {
+            assert_eq!(width(Some(w)), w);
+        }
+        assert_eq!(width(Some(0)), MIN_STREAM_WIDTH);
+        assert_eq!(width(Some(10)), MIN_STREAM_WIDTH);
+        assert_eq!(width(Some(100_000)), MAX_STREAM_WIDTH);
+        // What the page asks for is bucketed to the steps of `preview-size.ts`, and the top of
+        // them is the engine's own bound.
+        assert_eq!(MAX_STREAM_WIDTH, 1920);
+    }
+
+    #[test]
+    fn the_requested_width_and_rate_reach_the_stream_graph() {
+        let asset = av_asset(Uuid::new_v4(), 10.0);
+        let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        let assets = [asset];
+        let params = playback_params(
+            &timeline,
+            &assets,
+            PlaybackRequest {
+                fps: None,
+                max_width: Some(1440),
+            },
+        );
+        assert_eq!((params.fps, params.max_width), (30.0, 1440));
+        let args = build_preview_args(&timeline, &assets, 0.0, params.fps, params.max_width, PREVIEW_STREAM_QUALITY).unwrap();
+        let graph = flag_val(&args, "-filter_complex").unwrap();
+        assert!(graph.contains("1440") && graph.contains("fps=30"), "{graph}");
+        let slim = build_preview_args(&timeline, &assets, 0.0, 60.0, 960, PREVIEW_STREAM_QUALITY).unwrap();
+        let graph = flag_val(&slim, "-filter_complex").unwrap();
+        assert!(graph.contains("fps=60") && !graph.contains("1440"), "{graph}");
+        // A source narrower than the request is not scaled up to it.
+        let narrow = test_asset(vec![video_stream(640, 360, 30.0)]);
+        let tl = single(vec![make_clip(narrow.id, 0.0, 5.0, 0.0)]);
+        let args = build_preview_args(&tl, &[narrow], 0.0, 30.0, 1920, PREVIEW_STREAM_QUALITY).unwrap();
+        let graph = flag_val(&args, "-filter_complex").unwrap();
+        assert!(
+            graph.contains("640") && !graph.contains("1920"),
+            "narrow source keeps its width: {graph}"
+        );
+    }
+
     #[test]
     fn a_smart_cropped_clip_crops_before_the_fit_so_cover_has_nothing_left_to_take() {
         let asset = av_asset(Uuid::new_v4(), 30.0); // 1920x1080
@@ -13856,6 +14086,101 @@ mod tests {
         // Paced to real time rather than dumped as fast as it renders: a second
         // of frames takes about a second (with slack for the graph starting up).
         assert!(elapsed.as_secs_f64() > 0.8, "playback ran ahead of real time: {elapsed:?}");
+    }
+
+    /// The size a JPEG says it is: the first start-of-frame segment's height and width.
+    fn jpeg_size(jpeg: &[u8]) -> Option<(u32, u32)> {
+        let mut at = 2;
+        while at + 9 < jpeg.len() {
+            if jpeg[at] != 0xFF {
+                return None;
+            }
+            let marker = jpeg[at + 1];
+            let len = u16::from_be_bytes([jpeg[at + 2], jpeg[at + 3]]) as usize;
+            if matches!(marker, 0xC0..=0xC2) {
+                let h = u16::from_be_bytes([jpeg[at + 5], jpeg[at + 6]]) as u32;
+                let w = u16::from_be_bytes([jpeg[at + 7], jpeg[at + 8]]) as u32;
+                return Some((w, h));
+            }
+            at += 2 + len;
+        }
+        None
+    }
+
+    /// End to end against the real `ffmpeg` binary: a 60 fps cut plays at 60 fps and at the width
+    /// the preview asked for, a 30 fps cut at 30 and, with nothing asked, the default width.
+    /// `cargo test -p kerf-core --no-default-features -- --ignored streams_at_the_timelines_rate`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn streams_at_the_timelines_rate_and_the_requested_width() {
+        let dir = std::env::temp_dir().join(format!("kerf-preview-rate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let play = |fps: u32, request: PlaybackRequest, frames_wanted: usize| {
+            let media = dir.join(format!("src{fps}.mp4"));
+            let ok = command(&ffmpeg_bin())
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(["-f", "lavfi", "-i", &format!("testsrc2=size=1280x720:rate={fps}:duration=4")])
+                .args(["-c:v", "libx264", "-preset", "veryfast", "-g", "1", "-pix_fmt", "yuv420p"])
+                .arg(&media)
+                .status_bounded()
+                .expect("run ffmpeg");
+            assert!(ok.success(), "could not synthesize test media");
+            let mut asset = av_asset(Uuid::new_v4(), 4.0);
+            asset.path = media.to_string_lossy().into_owned();
+            asset.streams = vec![video_stream(1280, 720, fps as f64)];
+            let timeline = single(vec![make_clip(asset.id, 0.0, 4.0, 0.0)]);
+            let mut frames: Vec<PreviewFrame> = Vec::new();
+            let began = std::time::Instant::now();
+            let mut first = None;
+            stream_preview_with(&timeline, &[asset], 0.5, request, &mut |f| {
+                first.get_or_insert_with(|| began.elapsed());
+                frames.push(f);
+                frames.len() < frames_wanted
+            })
+            .expect("stream");
+            let span = (began.elapsed() - first.unwrap()).as_secs_f64();
+            (frames, span)
+        };
+
+        let (frames, span) = play(
+            60,
+            PlaybackRequest {
+                fps: None,
+                max_width: Some(640),
+            },
+            60,
+        );
+        assert_eq!(frames.len(), 60);
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(jpeg_size(&f.jpeg), Some((640, 360)), "frame {i}");
+            assert!((f.time - (0.5 + i as f64 / 60.0)).abs() < 1e-9, "frame {i} is at {}", f.time);
+        }
+        // 59 gaps of 1/60 s: a second of video takes about a second, not the 2.5 s it took at 24.
+        assert!(span > 0.85 && span < 1.4, "60 frames at 60 fps took {span:.2}s");
+
+        let (frames, span) = play(30, PlaybackRequest::default(), 30);
+        assert_eq!(frames.len(), 30);
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(jpeg_size(&f.jpeg), Some((960, 540)), "frame {i} at the default width");
+            assert!((f.time - (0.5 + i as f64 / 30.0)).abs() < 1e-9, "frame {i} is at {}", f.time);
+        }
+        assert!(span > 0.85 && span < 1.4, "30 frames at 30 fps took {span:.2}s");
+
+        // A request past the source's own width is not scaled up to it.
+        let (frames, _) = play(
+            30,
+            PlaybackRequest {
+                fps: Some(24.0),
+                max_width: Some(1920),
+            },
+            4,
+        );
+        assert_eq!(jpeg_size(&frames[0].jpeg), Some((1280, 720)));
+        assert!(
+            (frames[1].time - frames[0].time - 1.0 / 24.0).abs() < 1e-9,
+            "a stated rate overrides the cut's"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The graph features most likely to break only at runtime — a looped still
