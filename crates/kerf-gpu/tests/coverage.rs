@@ -231,8 +231,8 @@ fn captioned_cuts_are_drawn_by_the_compositor_where_they_were_all_refused() {
     let policy = composite_color_policy();
     eprintln!("composite colour policy: {policy:?}");
     eprintln!(
-        "{:<76} {:>14} {:>14}   {}",
-        "cut (still plans, render 540 px wide)", "before", "after", "reasons left"
+        "{:<76} {:>14} {:>14}   reasons left",
+        "cut (still plans, render 540 px wide)", "before", "after"
     );
     let mut table = vec![];
     for (name, tl) in archetypes(&base, &side) {
