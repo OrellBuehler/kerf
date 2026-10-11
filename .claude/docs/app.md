@@ -278,9 +278,9 @@ one with a dialog, a menu or a drag ghost over the frame (`covered`: a 3x3
 `elementFromPoint` grid on the frame, every 150 ms and after each click or key — the
 Settings dialog opened *under* the picture before this existed); the in-frame HUD
 (the name and `resolution · fps` chips, on a scrim) is under it too; it no longer prints a timecode, which is the transport bar's. **macOS has
-no technique in this build**: a surface under the webview needs a transparent window, which
-Tauri gates behind `macos-private-api` (a private WKWebView key, and a feature that changes
-every macOS bundle); it is not enabled blind (`KERF_GPU_SURFACE=window` forces the attempt).
+no technique by default** (nothing here has run on a Mac, and the status line says so);
+`KERF_GPU_SURFACE=window` forces the attempt for a developer, and may cover the window (relaunch
+without it). Tauri's `macos-private-api` is *not* what is missing: see *macOS presenter* below.
 `KERF_GPU_ADAPTER=software` takes the CPU adapter (lavapipe, WARP) instead of the machine's GPU.
 Playback (forward 1×) is still the FFmpeg stream: `streaming` is a JPEG route, the surface
 is hidden while it runs and shown again on the settled frame (A4; scrubbing at GPU speed and
@@ -294,6 +294,29 @@ and never the abstract socket libxcb tries first, and waited out a TCP timeout o
 null one, so its handle is not used — only the toplevel's window id comes from the window handle —
 and one display is kept for the whole life of the process however often the backend is rebuilt.
 Every request on the child window is `check()`ed, so a server that refuses it falls back promptly.
+
+**macOS presenter (WP-8): what the source says.** Read from tauri 2.12, wry 0.57, tao 0.37,
+wgpu-hal 30 and raw-window-metal 1.1; none of it has run on a Mac. (1) Tauri's `macos-private-api`
+gates only the `transparent` option of the window and webview builders: the surface goes *under* the
+webview and the window stays opaque. wry itself clears the WKWebView's `drawsBackground` (a private
+KVC key) whenever a `backgroundColor` is configured (Kerf's is), so the page is see-through
+wherever it paints nothing, which `Preview.svelte`'s `data-surface-hole` arranges. (2) tao hands
+wgpu the window's *current* content view, after wry's build its `WryWebViewParent` holding the
+WKWebView. wgpu's Metal backend does not replace that view's layer: it makes it layer-backed and
+adds a `CAMetalLayer` **sublayer** that follows it by KVO. Hence: **(a)** creating the surface
+asserts the main thread and `build_backend` runs on `kerf-gpu-build`, so `KERF_GPU_SURFACE=window`
+on a Mac could only fail; now `surface_on_main_thread("macos")` opens the device off-thread and
+`on_main_thread` (Tauri's `run_on_main_thread`, 5 s deadline, a panic is an error, a task that
+arrives after the deadline does not run its work) makes only the surface there; other platforms
+are unchanged. **(b)** The sublayer is added after the WKWebView's layer, so it should draw
+**above** the page: backdrop and picture over an invisible, still clickable UI, with the Settings
+toggle unreachable. That is why macOS stays "none" by default and why the user-visible note does not
+name the variable. **(c)** Nothing removes it: the superlayer retains it (the layer's `Drop`, which
+only deregisters its observers, never runs), so dropping the surface (setting off, `drop_backend`,
+device loss) leaves the last drawable on screen and a rebuild stacks another. A developer who forced
+it recovers by quitting and relaunching without `KERF_GPU_SURFACE`. The test of it on a Mac, the
+design of an app-owned layer if it fails, the measurements and the acceptance list are in
+`.claude/plans/macos-presenter.md`.
 
 **Detached panels (`popout.rs`).** A panel moved into a window of its own is dockview's
 popout: `window.open`, then the panel's DOM is moved into the new window's document while

@@ -210,9 +210,9 @@ impl Gpu {
         Ok((gpu, surface))
     }
 
-    /// A surface for another window on this device's instance (the first one came with
-    /// [`Gpu::new_for_surface`]). Whether the adapter can present to it is the
-    /// [`crate::Presenter`]'s to find out.
+    /// A surface for a window on this device's instance, made after the device is open (another
+    /// window's, or the only one when it has to be made on a particular thread). Whether the
+    /// adapter can present to it is the [`crate::Presenter`]'s to find out.
     pub fn create_surface(&self, target: impl Into<wgpu::SurfaceTarget<'static>>) -> Result<wgpu::Surface<'static>, GpuError> {
         self.check_alive()?;
         self.instance
