@@ -123,7 +123,7 @@ Round 2 added cut shapes: a cut that is itself 29.97 and 23.976 (frame `k * 1001
 meet at a frame (with a `%` in the text). All 20 cases pass on 9.0.2 and on 6.1.1. On 9.0.2 the 29.97 and 23.976
 cuts, the in-point case and the captions are the still's JPEG byte for byte (281 of 281 frames), the animated title
 57 of 62 (the other 5 the still's picture through the encoder's rounding, 0.15 on the mean); on 6.1.1 every window frame
-is the export's frame (the still's chroma is the odd one out there, below). A caption may not contain `:` or `'`: see the findings.
+is the export's frame (the still's chroma is the odd one out there, below). The caption and the title text carry a `:` and an `'` too, since GPU-2's `escape_drawtext` is on the branch.
 
 
 `scrub_rendered.rs` (`#[ignore]`d, drives the real ffmpeg): a window frame is the still's JPEG byte for byte or
@@ -136,10 +136,6 @@ Findings from writing them, all in `.claude/docs/engine-cli.md`:
   cut: its bare `color` base lets the overlay settle on another pixel format and `testsrc2`'s one-pixel chroma
   lines come out 14 levels off on the mean. Adding `format=yuv420p` after the base (as the window's graph has)
   gives the window's picture exactly. The window equals the export there. The still's argv was left alone.
-- **Found, not fixed (export, not scrub):** a `:` in a title or caption aborts the whole export on 9.0.2 (`No option
-  name near ...`; 6.1.1 accepts it), and an `'` makes the text draw black at the default size at the top left on both
-  builds. The `text='...'` quoting is one level short: the filtergraph parser strips the quotes before the filter's
-  own option parser reads the value. The window tests avoid both characters; the fix is in `escape_drawtext`.
 - A source whose rate is not a whole multiple of the cut's (24 or 25 in 30, speed 0.5 or 1.5) samples frames
   depending on where the slice starts, so a window is refused there and the still serves it.
 - A start exactly half a frame off the grid is a tie between two source frames: window and still take one on
