@@ -85,6 +85,20 @@
 //! when the plan said it could draw the frame, and a refusal is asserted rather
 //! than assumed.
 //!
+//! # Preview proxies
+//!
+//! The preview decodes proxies, whose colour the engine settles when it makes them: a
+//! proxy of HD footage that names no matrix is labelled BT.709 (no pixel converted), so
+//! it is one matrix with a phone's BT.709 proxy. The `proxy/…` cases make their proxies
+//! with the product's own `generate_proxy`, read the stream from the sidecar the plan
+//! reads, and hold the GPU to FFmpeg's still of the same files: an untagged-HD proxy
+//! stacks with a BT.709 one (and with a tone-mapped HLG one) under either policy, and
+//! the other matrices (SD, `smpte170m`, `bt2020nc`, an RGB capture) are drawn among
+//! themselves and refused beside a BT.709 proxy on a negotiating FFmpeg. One case
+//! (`labelling_a_proxy_moves_no_pixel…`) holds the proxy's colours to the colours the
+//! footage was made from: the label is what lifts FFmpeg 9.0.2's reading of untagged HD
+//! from 28.0 to 43.3 dB, and FFmpeg 6.1.1, which ignores tags, does not move.
+//!
 //! # Known divergences (none hidden by a threshold)
 //!
 //! * **Opacity below 1** is reproduced, not approximated: FFmpeg takes the layer
@@ -313,6 +327,14 @@ fn policy() -> CompositeColorPolicy {
         kerf_core::ffmpeg_path()
     );
     measured
+}
+
+fn policy_name() -> &'static str {
+    match policy() {
+        CompositeColorPolicy::FixedBt601 => "fixed-bt601",
+        CompositeColorPolicy::BottomLayerTag => "bottom-layer-tag",
+        CompositeColorPolicy::Unknown => "unknown",
+    }
 }
 
 /// Run `f` with `policy` in force on this thread, whatever the FFmpeg is.
@@ -3135,6 +3157,419 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
     }
 }
 
+// ---- preview proxies ------------------------------------------------------------
+
+/// Footage as it arrives: the **same pictures** encoded with a known matrix and labelled in
+/// each of the ways a camera or an encoder labels them, in the two sizes where the convention
+/// for an untagged picture differs (HD is read as BT.709, SD as BT.601). Every picture is made
+/// from RGB, so the file's real colours are known (`truth`).
+struct HdMedia {
+    files: BTreeMap<&'static str, Asset>,
+}
+
+impl HdMedia {
+    fn get(&self, name: &str) -> &Asset {
+        self.files.get(name).unwrap_or_else(|| panic!("no media {name}"))
+    }
+}
+
+/// The smooth, saturated picture (`grad/…`) and the busy test card (`detail/…`).
+const GRADIENT: &str = "gradients=size=1280x720:rate=10:duration=1:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1=1280:y1=720:speed=0.00001";
+const GRADIENT_SD: &str = "gradients=size=720x576:rate=10:duration=1:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1=720:y1=576:speed=0.00001";
+const DETAIL: &str = "testsrc2=size=1280x720:rate=10:duration=1";
+const DETAIL_SD: &str = "testsrc2=size=720x576:rate=10:duration=1";
+
+fn hd_media() -> &'static HdMedia {
+    static M: OnceLock<HdMedia> = OnceLock::new();
+    M.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-media-hd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut files = BTreeMap::new();
+        let none = "setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown";
+        let bt709 = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709";
+        let bt601 = "setparams=colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m";
+        let bt2020 = "setparams=colorspace=bt2020nc:color_primaries=bt2020:color_trc=bt709";
+        // (matrix the values are encoded with, how the file labels itself)
+        let encode = |files: &mut BTreeMap<&'static str, Asset>, name: &'static str, source: &str, matrix: &str, label: &str| {
+            let p = dir.join(format!("{}.mp4", name.replace('/', "-")));
+            ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("{source},format=gbrp,scale=out_color_matrix={matrix}:out_range=tv,format=yuv420p,{label}"),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-qp",
+                "0",
+                "-g",
+                "10",
+                "-pix_fmt",
+                "yuv420p",
+                p.to_str().unwrap(),
+            ]);
+            files.insert(name, probed(&p));
+        };
+        for (picture, hd, sd) in [("grad", GRADIENT, GRADIENT_SD), ("detail", DETAIL, DETAIL_SD)] {
+            let n = |hd_or_sd: &str, label: &str| -> &'static str {
+                Box::leak(format!("{picture}/{hd_or_sd}-{label}").into_boxed_str())
+            };
+            encode(&mut files, n("hd", "untagged"), hd, "bt709", none);
+            encode(&mut files, n("hd", "709"), hd, "bt709", bt709);
+            encode(&mut files, n("hd", "601"), hd, "bt601", bt601);
+            encode(&mut files, n("hd", "2020"), hd, "bt2020", bt2020);
+            encode(&mut files, n("sd", "untagged"), sd, "bt601", none);
+            encode(&mut files, n("sd", "601"), sd, "bt601", bt601);
+        }
+        let rgb = dir.join("rgb.mkv");
+        for (name, source) in [("grad/rgb", GRADIENT), ("detail/rgb", DETAIL)] {
+            let p = dir.join(format!("{}.mkv", name.replace('/', "-")));
+            ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                source,
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "bgr0",
+                p.to_str().unwrap(),
+            ]);
+            files.insert(name, probed(&p));
+        }
+        let _ = rgb;
+        let hlg = dir.join("hlg.mp4");
+        let made = Command::new(kerf_core::ffmpeg_path())
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(format!(
+                "{DETAIL},format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv,\
+                 zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt2020:t=arib-std-b67:m=bt2020nc:r=tv,format=yuv420p10le"
+            ))
+            .args([
+                "-c:v",
+                "libx265",
+                "-x265-params",
+                "log-level=error",
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                "arib-std-b67",
+                "-colorspace",
+                "bt2020nc",
+            ])
+            .arg(&hlg)
+            .stdin(Stdio::null())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if made {
+            files.insert("detail/hlg", probed(&hlg));
+        }
+        HdMedia { files }
+    })
+}
+
+/// Preview proxies generated for a test and removed when it ends (the cache is the
+/// user's: the engine's own tests do the same with `ProxyGuard`). A proxy's place is a
+/// function of its source, so two tests that proxy one file would delete each other's:
+/// the tests that hold proxies run one at a time.
+struct Proxies {
+    made: Vec<PathBuf>,
+    _one_at_a_time: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Proxies {
+    fn new() -> Self {
+        static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+        Proxies {
+            made: Vec::new(),
+            _one_at_a_time: ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        }
+    }
+
+    /// `a` as the preview decodes it: its proxy, made by the product's own `generate_proxy`, and
+    /// **the stream the proxy's sidecar describes** (what `ProxyMedia` hands the plan).
+    fn of(&mut self, a: &Asset) -> Asset {
+        let src = Path::new(&a.path);
+        let proxy = kerf_core::generate_proxy(src, kerf_core::proxy_width(a.projection()))
+            .unwrap_or_else(|e| panic!("proxy of {}: {e}", a.path));
+        self.made.push(proxy.clone());
+        let media = kerf_core::MediaResolver::resolve(&kerf_core::ProxyMedia, a);
+        assert!(
+            media.proxy && Path::new(&media.path) == proxy,
+            "{}: the preview does not resolve to the proxy that was just made",
+            a.path
+        );
+        let mut proxied = a.clone();
+        proxied.path = media.path;
+        let video = media.video.expect("the proxy has a video stream");
+        *proxied
+            .streams
+            .iter_mut()
+            .find(|s| s.kind == StreamKind::Video)
+            .expect("a video stream") = video;
+        proxied
+    }
+}
+
+impl Drop for Proxies {
+    fn drop(&mut self) {
+        for proxy in &self.made {
+            let _ = std::fs::remove_file(proxy);
+            let _ = std::fs::remove_file(proxy.with_extension("json"));
+        }
+    }
+}
+
+/// A picture-in-picture clip: the top layer of a stack.
+fn pip_clip(a: &Asset) -> Clip {
+    let mut c = clip(a, 0.0, 1.0, 0.0);
+    c.transform = Transform {
+        scale: 0.5,
+        pos_x: 0.2,
+        pos_y: -0.1,
+        ..Transform::default()
+    };
+    c
+}
+
+/// The delivery shape of the proxy cases: half of 1280x720, so each render is cheap and the
+/// HD layers are shrunk 2:1 (the scaler's best-measured regime).
+fn proxy_canvas() -> Option<Delivery> {
+    Some(Delivery::new(640, 360, Fit::Contain))
+}
+
+/// Proxies of `base` and `top` (a picture-in-picture over it), as the preview decodes them.
+fn proxy_stack(proxies: &mut Proxies, base: &Asset, top: &Asset, opacity: f64) -> (Timeline, Vec<Asset>) {
+    let (b, t) = (proxies.of(base), proxies.of(top));
+    let mut over = pip_clip(&t);
+    over.transform.opacity = opacity;
+    let tl = timeline(vec![vec![clip(&b, 0.0, 1.0, 0.0)], vec![over]], proxy_canvas());
+    (tl, vec![b, t])
+}
+
+/// The matrix a proxy states, as the plan reads it from the sidecar.
+fn proxy_matrix(a: &Asset) -> Option<&str> {
+    a.streams[0].color_space.as_deref()
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn untagged_hd_proxies_stack_with_bt709_ones() {
+    let h = hd_media();
+    let mut proxies = Proxies::new();
+    eprintln!("composite colour policy of this FFmpeg: {:?}", policy());
+    // The label: HD footage that names no matrix is BT.709 for every player, and its proxy now
+    // says so, as a phone's does.
+    let untagged = proxies.of(h.get("grad/hd-untagged"));
+    let phone = proxies.of(h.get("detail/hd-709"));
+    assert_eq!(proxy_matrix(&untagged), Some("bt709"), "the untagged HD proxy is labelled");
+    assert_eq!(proxy_matrix(&phone), Some("bt709"), "and the tagged one is as it was");
+    assert_eq!(
+        h.get("grad/hd-untagged").streams[0].color_space,
+        None,
+        "while the source says nothing"
+    );
+
+    // Alone (read as BT.709 now, where it was read as BT.601), and in every stack with a BT.709
+    // proxy, in both orders and translucent: not a refusal, and the GPU draws what FFmpeg draws.
+    let tl = timeline(vec![vec![clip(&untagged, 0.0, 1.0, 0.0)]], proxy_canvas());
+    check(
+        "proxy/untagged-hd-alone",
+        &tl,
+        std::slice::from_ref(&untagged),
+        &[0.5],
+        STRICT,
+    );
+    for (name, base, top, opacity) in [
+        ("proxy/untagged-hd-over-709", "detail/hd-709", "grad/hd-untagged", 1.0),
+        ("proxy/709-over-untagged-hd", "grad/hd-untagged", "detail/hd-709", 1.0),
+        (
+            "proxy/untagged-hd-over-untagged-hd",
+            "grad/hd-untagged",
+            "detail/hd-untagged",
+            1.0,
+        ),
+        (
+            "proxy/untagged-hd-translucent-over-709",
+            "detail/hd-709",
+            "grad/hd-untagged",
+            0.5,
+        ),
+        (
+            "proxy/709-translucent-over-untagged-hd",
+            "grad/hd-untagged",
+            "detail/hd-709",
+            0.5,
+        ),
+    ] {
+        let (tl, assets) = proxy_stack(&mut proxies, h.get(base), h.get(top), opacity);
+        check(name, &tl, &assets, &[0.5], STRICT);
+    }
+
+    // Footage that is already BT.709 and a tone-mapped HDR proxy (tagged BT.709 by the tone-map)
+    // beside it.
+    match h.files.get("detail/hlg") {
+        Some(hlg) => {
+            let tone_mapped = proxies.of(hlg);
+            assert_eq!(proxy_matrix(&tone_mapped), Some("bt709"), "the tone-map tags its picture");
+            for (name, base, top) in [
+                ("proxy/hlg-tone-mapped-over-untagged-hd", "grad/hd-untagged", hlg),
+                (
+                    "proxy/untagged-hd-over-hlg-tone-mapped",
+                    "detail/hlg",
+                    h.get("grad/hd-untagged"),
+                ),
+            ] {
+                let (tl, assets) = proxy_stack(&mut proxies, h.get(base), top, 1.0);
+                check(name, &tl, &assets, &[0.5], STRICT);
+            }
+        }
+        None => eprintln!("skipped: this FFmpeg cannot make the HLG test clip"),
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn proxies_of_the_other_matrices_are_made_as_they_were_and_refused_when_mixed_with_bt709() {
+    let h = hd_media();
+    let mut proxies = Proxies::new();
+    // Nothing else is relabelled: what a file says is kept, SD and RGB read as BT.601 as before.
+    for (name, want) in [
+        ("detail/sd-untagged", None),
+        ("detail/sd-601", Some("smpte170m")),
+        ("detail/hd-601", Some("smpte170m")),
+        ("detail/hd-2020", Some("bt2020nc")),
+        ("detail/rgb", None),
+    ] {
+        let p = proxies.of(h.get(name));
+        assert_eq!(proxy_matrix(&p), want, "{name}: the proxy's matrix");
+    }
+    // One class among themselves: drawn, strictly (BT.601 throughout).
+    let (tl, assets) = proxy_stack(&mut proxies, h.get("grad/sd-untagged"), h.get("detail/sd-601"), 1.0);
+    check("proxy/sd-601-over-sd-untagged", &tl, &assets, &[0.5], STRICT);
+    let (tl, assets) = proxy_stack(&mut proxies, h.get("grad/sd-601"), h.get("detail/sd-untagged"), 1.0);
+    check("proxy/sd-untagged-over-sd-601", &tl, &assets, &[0.5], STRICT);
+    // Against a BT.709 proxy they are another matrix, which a negotiating FFmpeg converts with an
+    // arithmetic the compositor does not reproduce: refused (FFmpeg still renders the frame),
+    // and drawn where the composite is BT.601 whatever the tags say.
+    for (name, base, top) in [
+        ("proxy/sd-untagged-over-709", "detail/hd-709", "detail/sd-untagged"),
+        ("proxy/709-over-sd-601", "detail/sd-601", "detail/hd-709"),
+        ("proxy/hd-601-over-709", "grad/hd-709", "detail/hd-601"),
+        ("proxy/hd-2020-over-709", "grad/hd-709", "detail/hd-2020"),
+        ("proxy/rgb-capture-over-709", "grad/hd-709", "detail/rgb"),
+    ] {
+        let (tl, assets) = proxy_stack(&mut proxies, h.get(base), h.get(top), 1.0);
+        check_mixed(name, &tl, &assets, &[0.5], "different YCbCr matrices");
+    }
+}
+
+/// The first frame of `source` as RGB, at its own size: the colours a file made from it is meant to show.
+fn truth(source: &str, w: usize, h: usize) -> Vec<u8> {
+    let out = ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        source,
+        "-frames:v",
+        "1",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "pipe:1",
+    ]);
+    assert_eq!(out.len(), w * h * 3);
+    out
+}
+
+/// FFmpeg's still of a single clip of `a` at the size of its picture, as RGB.
+fn single_still(a: &Asset, w: usize, h: usize) -> Vec<u8> {
+    let tl = timeline(vec![vec![clip(a, 0.0, 1.0, 0.0)]], None);
+    let png = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("single-still-{}.png", a.id));
+    export_still(
+        &tl,
+        std::slice::from_ref(a),
+        &ExportOptions::default(),
+        0.0,
+        &png,
+        ImageFormat::Png,
+        0,
+    )
+    .expect("still");
+    let rgb = ffmpeg(&["-i", png.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]);
+    let _ = std::fs::remove_file(&png);
+    assert_eq!(rgb.len(), w * h * 3);
+    rgb
+}
+
+/// PSNR and the largest error of two same-sized RGB pictures.
+fn rgb_error(a: &[u8], b: &[u8]) -> (f64, i32) {
+    let (mut se, mut max) = (0.0, 0);
+    for (x, y) in a.iter().zip(b) {
+        let d = i32::from(*x) - i32::from(*y);
+        se += f64::from(d * d);
+        max = max.max(d.abs());
+    }
+    (psnr(se, a.len()), max)
+}
+
+/// A frame of the footage as the FFmpeg still shows it, against the colours the file was made
+/// from: the decision (BT.709 is HD's matrix) as a measurement.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn labelling_a_proxy_moves_no_pixel_and_brings_the_preview_to_the_footages_own_colours() {
+    let h = hd_media();
+    let mut proxies = Proxies::new();
+    let hd = truth(GRADIENT, 1280, 720);
+    let sd = truth(GRADIENT_SD, 720, 576);
+    eprintln!("composite colour policy of this FFmpeg: {:?}", policy());
+    for (name, truth, w, hh) in [
+        ("grad/hd-untagged", &hd, 1280, 720),
+        ("grad/hd-709", &hd, 1280, 720),
+        ("grad/hd-601", &hd, 1280, 720),
+        ("grad/sd-untagged", &sd, 720, 576),
+        ("grad/sd-601", &sd, 720, 576),
+        ("grad/rgb", &hd, 1280, 720),
+    ] {
+        let original = h.get(name);
+        let proxy = proxies.of(original);
+        let (from_original, from_proxy) = (single_still(original, w, hh), single_still(&proxy, w, hh));
+        let (psnr_original, max_original) = rgb_error(&from_original, truth);
+        let (psnr_proxy, max_proxy) = rgb_error(&from_proxy, truth);
+        if std::env::var_os("KERF_PARITY_KEEP").is_some() {
+            let dir = target_dir().join("parity");
+            std::fs::create_dir_all(&dir).unwrap();
+            let stem = format!("colour-{}-{}", name.replace('/', "-"), policy_name());
+            write_png(&dir.join(format!("{stem}-truth.png")), truth, w, hh);
+            write_png(&dir.join(format!("{stem}-original.png")), &from_original, w, hh);
+            write_png(&dir.join(format!("{stem}-proxy.png")), &from_proxy, w, hh);
+        }
+        eprintln!(
+            "{name:<18} {:<10} -> {:<10} | original vs the footage's colours {psnr_original:>5.1} dB max {max_original:>3} | proxy {psnr_proxy:>5.1} dB max {max_proxy:>3}",
+            original.streams[0].color_space.as_deref().unwrap_or("-"),
+            proxy_matrix(&proxy).unwrap_or("-"),
+        );
+        // The proxy of the clip made with BT.709 values and no tag is the one that moves: a
+        // negotiating FFmpeg now reads it as BT.709 (it read BT.601), a fixed one reads every
+        // proxy as BT.601 and does not move. Every other proxy reads as its original does.
+        let moves = name == "grad/hd-untagged" && policy() == CompositeColorPolicy::BottomLayerTag;
+        if moves {
+            assert!(
+                psnr_original < 30.0 && psnr_proxy > 40.0,
+                "{name}: {psnr_original:.1} dB before the label, {psnr_proxy:.1} after"
+            );
+        } else {
+            assert!(
+                (psnr_proxy - psnr_original).abs() < 1.5,
+                "{name}: the proxy reads {psnr_proxy:.1} dB, the original {psnr_original:.1}"
+            );
+        }
+    }
+}
+
 // ---- recorded numbers -----------------------------------------------------------
 //
 // Final limits (the constants at the top; no case relaxes the flat-region ones):
@@ -3159,6 +3594,8 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // scale`, a 202x100 frame, band 43.1%; the other `grid/*-cover-odd-y` cases 59.4%); the
 // largest band among the cases judged strictly is that one. Every run rewrites `target/parity/report.txt` (these columns plus the
 // decode / composite time of the GPU path and the scaler lines).
+// The `proxy/` rows are stacks of preview proxies made by `generate_proxy` (1280x720 sources,
+// a 640x360 canvas, the top layer a 0.5 picture-in-picture), in the same two columns.
 //
 // case                                             t    canvas | flat PSNR flat max |  all PSNR  all max |  band 9.0.2
 // busy/checker-to-384x216                        0.1   384x216 |    48.2 dB        2 |    48.2 dB        2 |  0.0%    =
@@ -3266,6 +3703,21 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // pip/odd-361x203-in-722x640                     0.5   722x640 |    48.4 dB        5 |    48.3 dB        5 |  7.7%    =
 // pip/scaled+offset                                0   640x360 |    49.4 dB        3 |    49.3 dB        5 | 15.9%    =
 // pip/scaled+offset                                1   640x360 |    49.4 dB        5 |    49.3 dB        5 | 16.0%    =
+// proxy/709-over-sd-601                          0.5   640x360 |    51.0 dB        4 |    49.9 dB        5 | 22.5% refused
+// proxy/709-over-untagged-hd                     0.5   640x360 |    44.8 dB        5 |    44.8 dB        5 |  9.4% 44.3 / 5
+// proxy/709-translucent-over-untagged-hd         0.5   640x360 |    43.6 dB        5 |    43.4 dB        6 |  8.9% 43.2 / 5
+// proxy/hd-2020-over-709                         0.5   640x360 |    44.8 dB        5 |    44.9 dB        6 |  9.4% refused
+// proxy/hd-601-over-709                          0.5   640x360 |    44.8 dB        5 |    44.9 dB        5 |  9.4% refused
+// proxy/hlg-tone-mapped-over-untagged-hd         0.5   640x360 |    44.6 dB        5 |    44.6 dB        5 |  9.5% 43.8 / 5
+// proxy/rgb-capture-over-709                     0.5   640x360 |    44.8 dB        5 |    44.9 dB        5 |  9.3% refused
+// proxy/sd-601-over-sd-untagged                  0.5   640x360 |    48.3 dB        5 |    48.2 dB        5 |  9.5% =
+// proxy/sd-untagged-over-709                     0.5   640x360 |    49.7 dB        4 |    48.8 dB        5 | 22.7% refused
+// proxy/sd-untagged-over-sd-601                  0.5   640x360 |    48.3 dB        5 |    48.2 dB        5 |  9.5% =
+// proxy/untagged-hd-alone                        0.5   640x360 |    43.9 dB        5 |    43.9 dB        5 |  0.0% 43.3 / 5
+// proxy/untagged-hd-over-709                     0.5   640x360 |    47.0 dB        5 |    46.9 dB        5 | 16.6% 46.2 / 5
+// proxy/untagged-hd-over-hlg-tone-mapped         0.5   640x360 |    46.2 dB        5 |    46.0 dB        5 | 17.5% 44.4 / 5
+// proxy/untagged-hd-over-untagged-hd             0.5   640x360 |    44.8 dB        5 |    44.8 dB        5 |  9.4% 44.3 / 5
+// proxy/untagged-hd-translucent-over-709         0.5   640x360 |    46.9 dB        6 |    46.6 dB        7 | 19.8% 45.9 / 7
 // range/graded-limited-over-full                 0.5   640x360 |    48.5 dB        4 |    48.3 dB        5 | 21.1% refused
 // range/graded-translucent-png-over-full         0.5   640x360 |    44.8 dB        5 |    44.8 dB        5 | 18.6% refused
 // same-size/bgr0                                 0.5   640x360 |    48.4 dB        3 |    48.3 dB        3 | 15.7%    =

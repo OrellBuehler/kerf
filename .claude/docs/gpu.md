@@ -342,9 +342,16 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   (`composite_color_policy`), the plan takes it as input, **stacks of one matrix are drawn
   with it and stacks of mixed matrices are refused** (see `render_plan.rs` above), and the
   CI parity job runs both builds. The consequence to know about: an *export* is untagged
-  `yuv420p` that a player shows as BT.709 for HD, so the FFmpeg preview already disagrees
-  with the file by a few levels on saturated colour. Fixing that is a decision for when
-  the GPU path replaces the FFmpeg preview. The stream's own matrix
+  `yuv420p` that a player shows as BT.709 for HD, so the FFmpeg preview disagrees with the
+  file by a few levels on saturated colour wherever it reads HD as BT.601 — every tagged
+  BT.709 clip on a fixed-601 FFmpeg, and an *untagged* HD clip on either. **The preview's colour
+  target is BT.709 for HD** (what the player shows, and so the export), and the place it is
+  fixed is the proxy, not the compositor: a proxy of untagged HD footage is labelled BT.709
+  (`engine-cli.md`), which leaves FFmpeg 6.1 as it was (it ignores tags) and takes FFmpeg 9.0.2
+  from 28.0 dB to 43.3 dB against the colours the test clip was made from, and lets the
+  stack with a phone's BT.709 proxy through the plan (`parity.rs`, `proxy/…`). What stays
+  BT.601 is what is BT.601 (SD, a `smpte170m` tag, an RGB capture's own conversion): those
+  proxies mixed with BT.709 ones are still refused on a negotiating FFmpeg. The stream's own matrix
   (`PlanStream::matrix`, from the probed `color_space`) is used for taking a translucent
   layer out of YUV in the round trip below and for choosing the composite's matrix.
 - **`eq` is a YUV operation**, not an RGB one: `eq.rs` builds vf_eq's own per-plane
@@ -442,12 +449,16 @@ format, **chroma-grid cases** (crops, Cover offsets and letterbox gaps chosen so
 4:2:0 and the native rounding differ, on 4:2:0 / 4:2:2 / 4:4:4 / gray / BGR0 / RGB PNG —
 the crops of finer-chroma pictures that cannot be placed exactly are asserted refused),
 the **unmeasured-policy** case (`Unknown`: BT.601 stacks drawn, BT.709 / BT.2020 refused),
+**preview proxies** made by the product's own `generate_proxy` (`proxy/…`; HD in several labellings, SD, RGB, an HLG
+tone-map — the proxies of untagged HD footage stack with BT.709 ones and are compared strictly,
+the other matrices are asserted refused when mixed with BT.709 on a negotiating FFmpeg, and a
+measurement holds the proxy's colours to the footage's own),
 the **full-range grading** cases (a graded `yuvj` clip, and a graded layer in a stack with
 one, refused; ungraded and limited-range controls drawn),
 and **refusals** (an EXIF-oriented JPEG, FFV1 `yuva420p`, the same with the pixel
 format unrecorded, a translucent odd layer, a moving zoom behind a rotation or a grade) —
-each of which FFmpeg still renders. 160
-renders in the table on FFmpeg 6.1.1 (150 compared and 10 asserted refused on the pinned
+each of which FFmpeg still renders. 175
+renders in the table on FFmpeg 6.1.1 (160 compared and 15 asserted refused on the pinned
 9.0.2 the Windows and macOS bundles ship) plus the plane-level scaler runs, all passing
 strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
 (`KERF_PARITY_KEEP=1` keeps them for passing ones; `KERF_PARITY_EXPLORE=1` prints
