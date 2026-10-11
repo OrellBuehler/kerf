@@ -1125,7 +1125,7 @@ impl GpuPreview {
             self.reset_backoff.store(true, Ordering::SeqCst);
             if !was {
                 lock(&self.info).reason = self.technique.note.clone();
-                // A self-test that could not be made is tried again; a mismatch stands.
+                // A self-test that failed, whatever way, is run again.
                 self.check.retry();
             }
         }

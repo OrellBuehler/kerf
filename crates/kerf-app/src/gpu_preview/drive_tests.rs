@@ -217,11 +217,14 @@ fn the_first_frame_waits_for_the_self_test_and_the_ones_after_it_are_the_gpus() 
 
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn a_self_test_that_fails_keeps_every_frame_on_ffmpeg_with_its_reason() {
+fn a_self_test_that_fails_keeps_every_frame_on_ffmpeg_with_its_reason_until_the_setting_is_turned_off_and_on() {
     let _turn = exclusive();
     let log = Arc::new(Mutex::new(ScreenLog::default()));
     let mut preview = preview(&log);
-    preview.checker = Arc::new(|_| {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    preview.checker = Arc::new(move |_| {
+        counted.fetch_add(1, Ordering::SeqCst);
         Err(SelfTestError::Mismatch(SelfTestReport {
             cases: Vec::new(),
             policy: CompositeColorPolicy::BottomLayerTag,
@@ -231,15 +234,7 @@ fn a_self_test_that_fails_keeps_every_frame_on_ffmpeg_with_its_reason() {
     let inputs = PlanInputs::of(&project()).expect("inputs");
     let first = preview.frame(&inputs, Want::at(0.5), 320).expect("a frame");
     assert_eq!(first.renderer, "ffmpeg");
-    let until = Instant::now() + Duration::from_secs(30);
-    while !lock(&preview.info)
-        .reason
-        .as_deref()
-        .is_some_and(|r| r.contains("off for this session"))
-    {
-        assert!(Instant::now() < until, "no verdict");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    wait_for_reason(&preview, "turned off and on again");
     for _ in 0..3 {
         let frame = preview.frame(&inputs, Want::at(0.5), 320).expect("a frame");
         assert_eq!(frame.renderer, "ffmpeg");
@@ -250,8 +245,29 @@ fn a_self_test_that_fails_keeps_every_frame_on_ffmpeg_with_its_reason() {
         );
     }
     assert!(lock(&log).presented.is_empty(), "the GPU drew nothing");
-    assert!(preview.status().reason.unwrap().contains("off for this session"));
+    assert!(preview.status().reason.unwrap().contains("turned off and on again"));
     assert!(preview.diagnostics().self_test.unwrap().starts_with("closed"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the verdict stands for the frames after it");
+
+    // Turning the setting off and on runs the check again, a mismatch or not, and logs its verdict.
+    preview.set_enabled(false);
+    preview.teardown_if_off();
+    preview.set_enabled(true);
+    assert_eq!(
+        preview.frame(&inputs, Want::at(0.5), 320).expect("a frame").renderer,
+        "ffmpeg"
+    );
+    wait_for_reason(&preview, "turned off and on again");
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "checked again");
+}
+
+/// Wait for the status to say something containing `part` (a self-test's verdict arrives on its own thread).
+fn wait_for_reason(preview: &GpuPreview, part: &str) {
+    let until = Instant::now() + Duration::from_secs(30);
+    while !preview.status().reason.as_deref().is_some_and(|r| r.contains(part)) {
+        assert!(Instant::now() < until, "no verdict");
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 #[test]

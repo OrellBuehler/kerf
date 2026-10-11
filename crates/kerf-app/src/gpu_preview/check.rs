@@ -1,14 +1,14 @@
 //! The GPU path draws nothing the user looks at until it has been checked against this machine's
 //! FFmpeg ([`kerf_gpu::parity_self_test`]): the first frame that wants the GPU starts the check on a
-//! thread of its own and goes through FFmpeg, as does every frame until the verdict, which then
-//! stands for the session.
+//! thread of its own and goes through FFmpeg, as does every frame until the verdict.
 //!
-//! * **Passed**: the GPU path is open.
-//! * **Mismatch**: the GPU draws something else than this FFmpeg does. Closed for the session — turning
-//!   the setting off and on does not try again — and the reason is what Settings shows.
-//! * **Could not check** (an FFmpeg that would not make the fixtures, a colour policy that could not be
-//!   measured, a deadline, the GPU failing on the check frame): closed too, but turning the setting off
-//!   and on again is a retry, since what failed may not be there next time.
+//! * **Passed**: the GPU path is open, and stays so for the session.
+//! * **Mismatch** (the GPU draws something else than this FFmpeg does) and **could not check** (an
+//!   FFmpeg that would not make the fixtures, a colour policy that could not be measured, a deadline,
+//!   the GPU failing on the check frame): the GPU path is closed, and the reason is what Settings shows.
+//!   Turning the setting off and on again runs the check again, for either: what failed may not be
+//!   there next time (a driver, an FFmpeg, a machine under load), and a mismatch that is real is found
+//!   again at the price of a couple of seconds of work. Every verdict is logged.
 //!
 //! The verdict belongs to an adapter and an FFmpeg ([`AdapterKey`]): a backend rebuilt on the same
 //! device after a loss keeps it, one rebuilt on another adapter is checked again.
@@ -63,7 +63,7 @@ enum Phase {
     Idle,
     Running,
     Passed(String),
-    Failed { reason: String, session: bool },
+    Failed(String),
 }
 
 #[derive(Debug)]
@@ -125,7 +125,7 @@ impl Check {
         match &slot.phase {
             Phase::Passed(_) => Gate::Open,
             Phase::Running => Gate::Wait(CHECKING.into()),
-            Phase::Failed { reason, .. } => Gate::Closed(reason.clone()),
+            Phase::Failed(reason) => Gate::Closed(reason.clone()),
             Phase::Idle => {
                 slot.phase = Phase::Running;
                 Gate::Begin(CHECKING.into())
@@ -146,16 +146,8 @@ impl Check {
                 Verdict::Passed(summary)
             }
             Err(error) => {
-                let session = matches!(error, SelfTestError::Mismatch(_));
-                let reason = if session {
-                    format!("{error} — the GPU preview is off for this session")
-                } else {
-                    format!("{error} — the GPU preview stays off until it is turned off and on again")
-                };
-                slot.phase = Phase::Failed {
-                    reason: reason.clone(),
-                    session,
-                };
+                let reason = format!("{error} — the GPU preview stays off until it is turned off and on again");
+                slot.phase = Phase::Failed(reason.clone());
                 Verdict::Failed(reason)
             }
         }
@@ -167,11 +159,10 @@ impl Check {
         self.finish(key, Err(SelfTestError::Inconclusive(why.to_string())))
     }
 
-    /// The setting was turned on: a check that could not be made is tried again; a mismatch and a
-    /// pass stand.
+    /// The setting was turned on: a check that failed, whatever way, is run again; a pass stands.
     pub fn retry(&self) {
         let mut slot = self.slot();
-        if matches!(slot.phase, Phase::Failed { session: false, .. }) {
+        if matches!(slot.phase, Phase::Failed(_)) {
             slot.phase = Phase::Idle;
         }
     }
@@ -180,7 +171,7 @@ impl Check {
     pub fn standing(&self) -> Option<String> {
         match &self.slot().phase {
             Phase::Passed(summary) => Some(format!("passed: {summary}")),
-            Phase::Failed { reason, .. } => Some(format!("closed: {reason}")),
+            Phase::Failed(reason) => Some(format!("closed: {reason}")),
             Phase::Running => Some("running".into()),
             Phase::Idle => None,
         }
@@ -219,21 +210,20 @@ mod tests {
     }
 
     #[test]
-    fn a_mismatch_closes_the_gate_for_the_session_even_through_a_retry() {
+    fn a_mismatch_closes_the_gate_until_the_setting_is_turned_on_again_and_the_check_runs_again() {
         let check = Check::new(false);
         let key = AdapterKey::named("a gpu");
         check.gate(&key);
         let Verdict::Failed(reason) = check.finish(&key, Err(mismatch())) else {
             panic!("failed")
         };
-        assert!(reason.contains("off for this session"), "{reason}");
-        assert_eq!(check.gate(&key), Gate::Closed(reason.clone()));
+        assert!(reason.contains("turned off and on again"), "{reason}");
+        assert_eq!(check.gate(&key), Gate::Closed(reason));
         check.retry();
-        assert_eq!(
-            check.gate(&key),
-            Gate::Closed(reason),
-            "turning it off and on does not argue with a mismatch"
-        );
+        assert!(matches!(check.gate(&key), Gate::Begin(_)), "the check runs again");
+        // And a mismatch that is still there is found again.
+        assert!(matches!(check.finish(&key, Err(mismatch())), Verdict::Failed(_)));
+        assert!(matches!(check.gate(&key), Gate::Closed(_)));
     }
 
     #[test]

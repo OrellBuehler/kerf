@@ -20,10 +20,10 @@
 //! a test there).
 //!
 //! The result is a verdict for the caller to act on: [`SelfTestError::Mismatch`] (the GPU draws
-//! something else than this FFmpeg: switch the GPU path off for the session) or
-//! [`SelfTestError::Inconclusive`] (it could not be checked: an FFmpeg that would not make the
-//! fixtures, a colour policy that could not be measured, a deadline; the GPU path stays off until
-//! someone asks again). Nothing here touches a project, a window or the preview's device state: it
+//! something else than this FFmpeg: switch the GPU path off) or [`SelfTestError::Inconclusive`] (it
+//! could not be checked: an FFmpeg that would not make the fixtures, a colour policy that could not
+//! be measured, a deadline; the GPU path stays off). What the caller does about either, and whether
+//! it asks again, is its business (the app asks again when the setting is turned off and on). Nothing here touches a project, a window or the preview's device state: it
 //! makes its own compositor and frame source on the `Gpu` it is given, runs FFmpeg the way the
 //! interactive paths do (a thread-capped child, no machine-budget slot), and takes about a second.
 
@@ -56,7 +56,9 @@ pub const PSNR_ALL_MIN: f64 = 40.0;
 pub const FLAT_SHARE_MIN: f64 = 0.5;
 
 /// The whole self-test is given this long; past it nothing more is started and the answer is
-/// "could not check".
+/// "could not check". It is looked at between steps (before the clips and before each case), not
+/// inside one: a case begun just before it still runs its reference (`export_still`, which has a 120 s
+/// timeout of its own) and a conversion (30 s), so the worst case is about four minutes.
 pub const DEADLINE: Duration = Duration::from_secs(90);
 /// One fixture clip, one container probe, one conversion.
 const STEP_TIMEOUT: Duration = Duration::from_secs(30);
