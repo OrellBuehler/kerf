@@ -274,7 +274,7 @@ jobs:
           - ffmpeg: pinned
             triple: x86_64-unknown-linux-gnu
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       KERF_HWACCEL: none
       KERF_HW_ENCODE: none
