@@ -1192,7 +1192,7 @@ mod tests {
         assert!(has(&left, |u| matches!(u, Unsupported::Fade(..))));
         assert_eq!(export.reasons(&all, size), vec![]);
         // Without a file to name — the default could not be written — no text pass has anything to draw.
-        let mut unnamed = export.clone();
+        let mut unnamed = export;
         unnamed.overlays[0].font_file = None;
         assert_eq!(unnamed.reasons(&all, size), vec![Unsupported::TextWithoutFont]);
     }
@@ -1526,6 +1526,13 @@ mod tests {
         };
         let size = thick.size(u32::MAX);
         assert_eq!(thick.reasons(&drawn, size), vec![Unsupported::TextBorder]);
+        // ...and so is text whose glyph bitmaps share too many pixels: a font height under 12 px.
+        let mut small = export.at_frame(30).unwrap();
+        let (_, h) = small.size(u32::MAX);
+        small.overlays[0].size = 11.4 / f64::from(h);
+        assert_eq!(small.reasons(&drawn, size), vec![Unsupported::TextTooSmall(11)]);
+        small.overlays[0].size = 11.6 / f64::from(h);
+        assert!(small.reasons(&drawn, size).is_empty());
     }
 
     #[test]

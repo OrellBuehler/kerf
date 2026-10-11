@@ -48,6 +48,7 @@ use crate::gpu::{Gpu, GpuError};
 use crate::roundtrip::{Rgb2Yuv, Yuv2Rgb};
 use crate::source::{chroma_size, decode_layers, YuvFrame};
 use crate::sws::{self, Filter};
+use crate::text::{self, Blend, Raster, Source, TextAtlas};
 use kerf_core::layer_geometry::{LayerGeometry, Rect, ScaleStage};
 
 /// A rendered frame: tightly packed 8-bit RGBA, top row first.
@@ -186,6 +187,18 @@ struct RoundTripParams {
     pad: [i32; 2],
 }
 
+/// `text.wgsl`'s uniform: one blend of an overlay.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct TextParams {
+    colour: [u32; 4],
+    area: [i32; 4],
+    alpha: u32,
+    kind: u32,
+    rgb: u32,
+    pad: u32,
+}
+
 /// One plane on the GPU. A handle: cloning shares the texture.
 #[derive(Clone)]
 struct Plane {
@@ -229,6 +242,22 @@ pub struct Compositor {
     rt_v_layout: wgpu::BindGroupLayout,
     /// A 256x3 table that changes nothing, bound when a layer has no `eq`.
     identity_lut: wgpu::TextureView,
+    text: TextPass,
+}
+
+/// What drawing overlays needs: `text.wgsl`'s pipeline, a mask for the blends that have none (the
+/// box), and the rasterised overlays ([`TextAtlas`]).
+struct TextPass {
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+    blank: wgpu::TextureView,
+    atlas: TextAtlas,
+}
+
+/// An overlay of a frame, rasterised: what to blend and the masks to blend it with.
+struct PreparedText {
+    raster: Arc<Raster>,
+    blends: Vec<Blend>,
 }
 
 /// Limited-range YUV -> full-range RGB coefficients for a matrix, `([ky, rv, bu,
@@ -320,12 +349,20 @@ fn extent(w: u32, h: u32) -> wgpu::Extent3d {
 
 impl Compositor {
     /// What this compositor draws exactly, as data: the plan refuses (through
-    /// [`RenderPlan::reasons`]) whatever is not in it. Today that is [`GpuCaps::A0`] —
-    /// layers, transform, crop, fit, `eq`, opacity, stills and sampled keyframes; each
-    /// later pass flips its bit beside the pass and its parity cases.
+    /// [`RenderPlan::reasons`]) whatever is not in it. That is [`GpuCaps::A0`] — layers,
+    /// transform, crop, fit, `eq`, opacity, stills and sampled keyframes — and **text**: titles and
+    /// captions, FFmpeg's own `drawtext` rasterised once and blended here (see [`crate::text`]).
+    /// Each later pass flips its bit beside the pass and its parity cases.
     pub fn caps(&self) -> GpuCaps {
-        GpuCaps::A0
+        Self::CAPS
     }
+
+    /// [`Compositor::caps`] without a device: what any compositor of this build draws.
+    pub const CAPS: GpuCaps = {
+        let mut caps = GpuCaps::A0;
+        caps.text = true;
+        caps
+    };
 
     /// Build the pipelines on `gpu`. Fails with a [`GpuError`] — it never panics —
     /// when the device rejects the shader or a pipeline, or is already lost.
@@ -456,6 +493,64 @@ impl Compositor {
 
             let identity: Vec<u8> = (0..3).flat_map(|_| 0..=255u8).collect();
             let identity_lut = Self::lut_texture(&g, &identity);
+
+            // Overlays: one pipeline, whose input is the canvas and a mask.
+            let text_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("kerf text"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/text.wgsl").into()),
+            });
+            let text_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("text"),
+                entries: &[uniform_entry(0), texture_entry(1), texture_entry(2)],
+            });
+            let text_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("text"),
+                bind_group_layouts: &[Some(&text_layout)],
+                immediate_size: 0,
+            });
+            let text_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("text"),
+                layout: Some(&text_pl),
+                vertex: wgpu::VertexState {
+                    module: &text_shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &text_shader,
+                    entry_point: Some("fs_text"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: CANVAS_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            let blank = g
+                .device
+                .create_texture_with_data(
+                    &g.queue,
+                    &wgpu::TextureDescriptor {
+                        label: Some("text blank mask"),
+                        size: extent(1, 1),
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: PLANE_FORMAT,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    },
+                    wgpu::util::TextureDataOrder::LayerMajor,
+                    &[0],
+                )
+                .create_view(&wgpu::TextureViewDescriptor::default());
             Ok(Self {
                 gpu: Arc::clone(&g),
                 resample_layout,
@@ -472,6 +567,12 @@ impl Compositor {
                 rt_chroma_v,
                 rt_v_layout,
                 identity_lut,
+                text: TextPass {
+                    layout: text_layout,
+                    pipeline: text_pipeline,
+                    blank,
+                    atlas: TextAtlas::default(),
+                },
             })
         })
     }
@@ -896,12 +997,45 @@ impl Compositor {
                 filters,
             });
         }
+        // FFmpeg rasterises what text there is, here, before the GPU is touched and with no lock held.
+        let texts = self.prepare_text(plan, size)?;
         self.gpu
-            .guarded("compositing a frame", || self.draw(plan, &drawn, size, output))
+            .guarded("compositing a frame", || self.draw(plan, &drawn, &texts, size, output))
+    }
+
+    /// Every overlay of the frame rasterised (or served from the atlas) and turned into the blends
+    /// that draw it. Blocks for a process the first time a state is seen.
+    fn prepare_text(&self, plan: &RenderPlan, size: (u32, u32)) -> Result<Vec<PreparedText>, GpuError> {
+        let limit = self.gpu.device.limits().max_texture_dimension_2d;
+        plan.overlays
+            .iter()
+            .map(|t| {
+                let graph = kerf_core::text_raster_graph(t, size);
+                let key = text::Key::new(&graph, t.font_file.as_deref());
+                let raster = self.text.atlas.get(key, || text::rasterize(&graph))?;
+                if let Some(mask) = &raster.glyphs {
+                    if mask.w > limit || mask.h > limit {
+                        return Err(GpuError::Unsupported(format!(
+                            "a {}x{} text mask is over this device's {limit}px texture limit",
+                            mask.w, mask.h
+                        )));
+                    }
+                }
+                let blends = text::blends(t, &raster, plan.canvas.matrix, plan.layers.is_empty())?;
+                Ok(PreparedText { raster, blends })
+            })
+            .collect()
     }
 
     /// Record, submit and read back the passes for the layers that are drawn.
-    fn draw(&self, plan: &RenderPlan, drawn: &[Drawn], size: (u32, u32), output: Output) -> Result<Rendered, GpuError> {
+    fn draw(
+        &self,
+        plan: &RenderPlan,
+        drawn: &[Drawn],
+        texts: &[PreparedText],
+        size: (u32, u32),
+        output: Output,
+    ) -> Result<Rendered, GpuError> {
         let (ow, oh) = size;
         let device = &self.gpu.device;
         // The canvas holds Y, U, V (and alpha) in an RGBA8 texture: FFmpeg's
@@ -1070,6 +1204,15 @@ impl Compositor {
             }
         }
 
+        // Overlays go on last of all: `drawtext` runs on the finished composite, in its YUV. A frame
+        // with no layer has no YUV composite — FFmpeg hands the black base to `drawtext` and on to
+        // the PNG as RGB, never converting it — so there the text goes on after the conversion.
+        let text_in_rgb = plan.layers.is_empty();
+        let canvas = if text_in_rgb {
+            canvas
+        } else {
+            self.draw_text(&mut enc, canvas, texts, false)?
+        };
         if output == Output::Yuv {
             return self.read_back(enc, &canvas).map(Rendered::Pixels);
         }
@@ -1105,6 +1248,11 @@ impl Compositor {
             ],
         });
         self.pass(&mut enc, &self.convert, &rgb.view, &bind, Some(wgpu::Color::BLACK), None);
+        let rgb = if text_in_rgb {
+            self.draw_text(&mut enc, rgb, texts, true)?
+        } else {
+            rgb
+        };
 
         if output == Output::Texture {
             // No wait: whatever draws it next is on the same queue, behind this.
@@ -1116,6 +1264,121 @@ impl Compositor {
             }));
         }
         self.read_back(enc, &rgb).map(Rendered::Pixels)
+    }
+
+    /// Blend `texts` onto `cur` (the composite's Y, U, V in its channels, or RGB when `rgb`): one
+    /// pass per blend, each reading the canvas as the one before left it and writing the other of two
+    /// canvases that agree outside the region the overlays can touch. Returns the canvas that holds
+    /// the result.
+    fn draw_text(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        cur: Plane,
+        texts: &[PreparedText],
+        rgb: bool,
+    ) -> Result<Plane, GpuError> {
+        let (w, h) = (cur.w, cur.h);
+        let mut region: Option<(u32, u32, u32, u32)> = None;
+        for t in texts {
+            if let Some((x0, y0, x1, y1)) = text::touched(&t.raster, &t.blends, w, h) {
+                region = Some(match region {
+                    None => (x0, y0, x1, y1),
+                    Some((a, b, c, d)) => (a.min(x0), b.min(y0), c.max(x1), d.max(y1)),
+                });
+            }
+        }
+        let Some((x0, y0, x1, y1)) = region else {
+            return Ok(cur);
+        };
+        let other = self.plane(
+            "canvas with text",
+            w,
+            h,
+            CANVAS_FORMAT,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+        );
+        enc.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &cur.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &other.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            extent(w, h),
+        );
+        let device = &self.gpu.device;
+        let (mut from, mut to) = (cur, other);
+        for t in texts {
+            let masks = t.raster.uploaded.get_or_init(|| text::UploadedMasks {
+                glyphs: t
+                    .raster
+                    .glyphs
+                    .as_ref()
+                    .map(|m| text::UploadedMask::new(self.upload("text glyphs", m.w, m.h, &m.data).texture)),
+            });
+            for b in &t.blends {
+                let (kind, area, mask_view) = match b.source {
+                    Source::Box(r) => (1, [r.x, r.y, r.w, r.h], &self.text.blank),
+                    Source::Glyphs => {
+                        let (Some(mask), Some(uploaded)) = (&t.raster.glyphs, &masks.glyphs) else {
+                            continue;
+                        };
+                        (
+                            0,
+                            [mask.x as i32, mask.y as i32, mask.w as i32, mask.h as i32],
+                            &uploaded.view,
+                        )
+                    }
+                };
+                let params = TextParams {
+                    colour: [u32::from(b.colour[0]), u32::from(b.colour[1]), u32::from(b.colour[2]), 0],
+                    area,
+                    alpha: b.alpha,
+                    kind,
+                    rgb: u32::from(rgb),
+                    pad: 0,
+                };
+                let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("text params"),
+                    contents: bytemuck::bytes_of(&params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+                let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("text"),
+                    layout: &self.text.layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&from.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(mask_view),
+                        },
+                    ],
+                });
+                self.pass(
+                    enc,
+                    &self.text.pipeline,
+                    &to.view,
+                    &bind,
+                    None,
+                    Some((x0, y0, x1 - x0, y1 - y0)),
+                );
+                std::mem::swap(&mut from, &mut to);
+            }
+        }
+        Ok(from)
     }
 
     fn compose_bind(&self, params: &ComposeParams, planes: [&wgpu::TextureView; 3]) -> wgpu::BindGroup {

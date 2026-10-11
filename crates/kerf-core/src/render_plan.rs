@@ -206,6 +206,14 @@ pub enum CompositeColorPolicy {
 /// frame goes through FFmpeg.
 pub const MAX_SHRINK: u32 = 40;
 
+/// The smallest font a text pass is held to, in pixels (`drawtext`'s `fontsize`, the frame's height
+/// times the overlay's `size`, rounded). `drawtext` blends each glyph's bitmap in turn and a mask
+/// holds all of them at once; the two agree to rounding where glyphs do not share a pixel, and
+/// small text is all shared pixels: measured against `drawtext`'s own planes, 3 to 11 px text
+/// reads up to 7 levels off in chroma at a dozen samples, 12 px and up at most 2
+/// (`the_reference_blend_is_drawtexts_own_for_small_text`). A frame with smaller text goes through FFmpeg.
+pub const MIN_TEXT_PX: u32 = 12;
+
 /// Which graph a plan describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanMode {
@@ -689,6 +697,17 @@ impl RenderPlan {
                     stage.scaled,
                     layer.stream.pix_fmt.clone().unwrap_or_else(|| "not recorded".to_string()),
                 ));
+            }
+        }
+        // `drawtext`'s `fontsize` is the frame's height times the overlay's size, rounded.
+        if caps.text {
+            let smallest = self
+                .overlays
+                .iter()
+                .map(|o| (f64::from(size.1) * o.size).round().max(1.0) as u32)
+                .min();
+            if let Some(px) = smallest.filter(|px| *px < MIN_TEXT_PX) {
+                reasons.push(Unsupported::TextTooSmall(px));
             }
         }
         reasons

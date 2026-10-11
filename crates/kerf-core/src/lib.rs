@@ -79,5 +79,5 @@ pub use project::{FramingPlan, Project, SmartCropJob, SmartCropPlan, StemsPlaced
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use render_plan::{
     Animated, CompositeColorPolicy, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream, PlanText,
-    PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_SHRINK,
+    PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_SHRINK, MIN_TEXT_PX,
 };

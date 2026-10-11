@@ -323,6 +323,15 @@ fn with_policy<T>(forced: CompositeColorPolicy, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Why the compositor would refuse `plan` at `size`: what *it* says it draws (`Compositor::caps`),
+/// not the plan's size-free A0 answer, which refuses every text overlay.
+fn reasons(plan: &RenderPlan, size: (u32, u32)) -> Vec<String> {
+    plan.reasons(&compositor().caps(), size)
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
 fn target_dir() -> PathBuf {
     Path::new(env!("CARGO_TARGET_TMPDIR"))
         .parent()
@@ -834,7 +843,7 @@ fn check(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Lim
 }
 
 /// [`check`] for a render with options (the frame rate the plan counts frames in, say).
-fn check_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Limits, opts: &ExportOptions) {
+fn check_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Limits, opts: &ExportOptions) -> Vec<i32> {
     let out_dir = target_dir().join("parity");
     let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-ref");
     std::fs::create_dir_all(&scratch).unwrap();
@@ -844,10 +853,11 @@ fn check_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
     let mut failures = Vec::new();
+    let mut maxes = Vec::new();
     for &t in times {
         let plan = RenderPlan::at(tl, assets, opts, t, policy()).expect("plan");
         let size = plan.size(u32::MAX);
-        let why = plan.unsupported_reasons_at(size);
+        let why = reasons(&plan, size);
         assert!(
             why.is_empty(),
             "{case} @ {t}: the plan says the GPU cannot draw this at {size:?} (canvas {}x{}): {why:?}",
@@ -887,6 +897,7 @@ fn check_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits
         let gpu_rgb = rgba_to_rgb(&frame.data);
 
         let (m, band) = compare(&reference, &gpu_rgb, w, h, limits.edge_step);
+        maxes.push(m.max_all);
         let line = format!(
             "{case:<28} t={t:<7} {w}x{h} layers={} flat: PSNR {:>5.1} dB  max {:>2}  mean {:.2} | all: PSNR {:>5.1} dB  max {:>3} | edge band {:>4.1}%  (decode {:.0} ms, composite {:.0} ms)",
             plan.layers.len(),
@@ -950,9 +961,10 @@ fn check_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits
         for f in &failures {
             eprintln!("WOULD FAIL: {f}");
         }
-        return;
+        return maxes;
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+    maxes
 }
 
 fn write_report() {
@@ -1041,6 +1053,25 @@ fn rendering_through_the_frame_source_is_the_picture_the_one_shot_decodes_give()
             vec![1.0, 1.4, 1.7],
         ),
     ];
+    let mut captioned = vec![overlay("A caption, with a box: 50%", 0.0, 2.0), overlay("Title", 0.5, 1.5)];
+    (captioned[0].size, captioned[0].pos_y, captioned[0].bg) = (0.05, 0.88, Some("black@0.5".into()));
+    (captioned[1].size, captioned[1].bold, captioned[1].color) = (0.1, true, "yellow@0.9".into());
+    let cases = {
+        let mut cases = cases.to_vec();
+        cases.push((
+            "text over a transform",
+            with_text(
+                timeline(
+                    vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]],
+                    None,
+                ),
+                captioned,
+            ),
+            vec![m.gradient.clone(), m.testsrc.clone()],
+            vec![0.25, 1.0],
+        ));
+        cases
+    };
     let compositor = compositor();
     let source = kerf_gpu::FrameSource::new(kerf_gpu::FrameSourceConfig::default());
     assert!(source.runs_enabled(), "the run path is off on this ffmpeg");
@@ -1876,13 +1907,13 @@ fn check_refused(case: &str, tl: &Timeline, assets: &[Asset], t: f64, expect: Re
     let _ = std::fs::remove_file(&png);
     match expect {
         Refusal::Plan(reason) => {
-            let reasons = plan.unsupported_reasons_at(plan.size(u32::MAX));
+            let reasons = reasons(&plan, plan.size(u32::MAX));
             assert!(!reasons.is_empty(), "{case}: the plan should refuse");
             let reasons = reasons.join("; ");
             assert!(reasons.contains(reason), "{case}: {reasons:?} does not say {reason:?}");
         }
         Refusal::Render(reason) => {
-            let why = plan.unsupported_reasons_at(plan.size(u32::MAX));
+            let why = reasons(&plan, plan.size(u32::MAX));
             assert!(why.is_empty(), "{case}: {why:?}");
             let err = compositor()
                 .render_plan(&plan, plan.size(u32::MAX))
@@ -2117,7 +2148,7 @@ fn frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn() {
                 let size = plan.size(u32::MAX);
                 let (w, h) = (size.0 as usize, size.1 as usize);
                 assert_eq!(plan.frame, k as i64);
-                let why = plan.unsupported_reasons_at(size);
+                let why = reasons(&plan, size);
                 assert_eq!(!why.is_empty(), refused, "{case}: frame {k}: {why:?}");
                 // The still the plan stands for, against the frame that plays.
                 let png = scratch.join(format!("transition-{name}-{cover}-{k}.png"));
@@ -2849,6 +2880,471 @@ fn an_asset_that_never_recorded_its_pixel_format_is_assumed_nothing() {
     check_refused("old-asset/enlarged", &tl, assets, 0.5, Refusal::Plan("not recorded"));
 }
 
+// ---- text ---------------------------------------------------------------------
+
+/// Text is edge everywhere — a glyph is a few pixels wide, and the edge band (two pixels around every
+/// strong step of the reference) would excuse every pixel of it — so a text case is not judged by
+/// the band. It is held to **the same picture without the text**: the whole-image error may be at
+/// most [`TEXT_EXTRA`] levels more than it is for that control (which the suite's own bounds judge),
+/// so whatever the composite and the YUV -> RGB conversion cost everywhere (up to 3 levels on the
+/// test picture, 5 under a letterbox or a translucent layer) is not charged to the text. Measured:
+/// every case adds at most 1 level but the 12 px one (the smallest the plan draws), which adds 2 (a level
+/// or two of chroma at the pixels glyph bitmaps share, times the 1.77 of the blue channel).
+/// (`tests/text.rs` holds the blend to FFmpeg's `drawtext` sample for sample.)
+const TEXT_EXTRA: i32 = 2;
+
+fn check_text(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
+    let mut bare = tl.clone();
+    bare.overlays.clear();
+    for &t in times {
+        let control = check_with(
+            &format!("{case} (no text)"),
+            &bare,
+            assets,
+            &[t],
+            STRICT,
+            &ExportOptions::default(),
+        );
+        let limits = Limits {
+            flat_share: 0.0,
+            max_all: control.first().map(|worst| worst + TEXT_EXTRA),
+            ..STRICT
+        };
+        check_with(case, tl, assets, &[t], limits, &ExportOptions::default());
+    }
+}
+
+fn overlay(text: &str, start: f64, end: f64) -> kerf_core::TextOverlay {
+    kerf_core::TextOverlay::new(text, start, end)
+}
+
+fn with_text(mut tl: Timeline, overlays: Vec<kerf_core::TextOverlay>) -> Timeline {
+    tl.overlays = overlays;
+    tl
+}
+
+/// An overlay in one of the app's own looks (`style-presets.ts`, `CaptionStyle`): position, size,
+/// colour, box and weight, with the opacity fade the preset writes as keyframes.
+fn preset(text: &str, (x, y): (f64, f64), size: f64, bold: bool, bg: Option<&str>, fade: f64) -> kerf_core::TextOverlay {
+    let mut o = overlay(text, 0.0, 2.0);
+    (o.pos_x, o.pos_y, o.size, o.bold, o.bg) = (x, y, size, bold, bg.map(String::from));
+    if fade > 0.0 {
+        let key = |time, opacity| kerf_core::TextKeyframe {
+            time,
+            pos_x: x,
+            pos_y: y,
+            opacity,
+        };
+        o.keyframes = vec![key(0.0, 0.0), key(fade, 1.0), key(2.0 - fade, 1.0), key(2.0, 0.0)];
+    }
+    o
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_apps_title_and_caption_styles_are_drawn_as_ffmpeg_draws_them() {
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    let base = || vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]];
+    // Title / Lower third / Caption (the presets), both caption looks (`Lines` and `WordPunch`, which
+    // is bold in the default font's own bold face), each at times through its fade.
+    let styles: [(&str, kerf_core::TextOverlay, &[f64]); 5] = [
+        (
+            "text/title",
+            preset("Title", (0.5, 0.4), 0.085, true, None, 0.5),
+            &[0.0, 0.25, 0.5, 1.0, 1.7, 1.99],
+        ),
+        (
+            "text/lower-third",
+            preset("Name \u{2014} Role", (0.24, 0.86), 0.042, true, Some("black@0.55"), 0.35),
+            &[0.1, 0.35, 1.0, 1.8],
+        ),
+        (
+            "text/caption",
+            preset("Caption", (0.5, 0.88), 0.05, false, Some("black@0.5"), 0.0),
+            &[0.5],
+        ),
+        (
+            "text/captions-lines",
+            preset("A few words held", (0.5, 0.88), 0.05, false, Some("black@0.5"), 0.0),
+            &[0.5],
+        ),
+        (
+            "text/captions-word-punch",
+            preset("WORD", (0.5, 0.72), 0.11, true, Some("black@0.5"), 0.0),
+            &[0.5],
+        ),
+    ];
+    for (name, o, times) in styles {
+        check_text(name, &with_text(timeline(base(), None), vec![o.clone()]), one, times);
+        // The same styles in the 9:16 frame the captions are made for (the font is a fraction of the
+        // frame's height, so the text is a different size in pixels).
+        let tall = with_text(timeline(base(), Some(Delivery::new(360, 640, Fit::Cover))), vec![o]);
+        check_text(&format!("{name}-9x16"), &tall, one, &times[..1]);
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn text_positions_sizes_colours_and_boxes_are_drawn_as_ffmpeg_draws_them() {
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    let tl =
+        |overlays: Vec<kerf_core::TextOverlay>| with_text(timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None), overlays);
+    // Sizes from 12 px (the smallest the plan lets through) to a fifth of the frame, at fractional positions
+    // (quarter-pixel glyph phases).
+    for size in [0.034, 0.06, 0.12, 0.2] {
+        let mut o = overlay("Hello, World", 0.0, 2.0);
+        (o.size, o.pos_x, o.pos_y) = (size, 0.4137, 0.5821);
+        check_text(&format!("text/size-{size}"), &tl(vec![o]), one, &[0.5]);
+    }
+    // At the frame's edges, half off it, and wholly outside (drawn as nothing).
+    for (name, pos) in [
+        ("left", (0.0, 0.5)),
+        ("right", (1.0, 0.5)),
+        ("top", (0.5, 0.0)),
+        ("bottom", (0.5, 1.0)),
+        ("corner", (1.0, 1.0)),
+        ("outside", (2.5, 0.5)),
+    ] {
+        for bg in [None, Some("black@0.5")] {
+            let mut o = overlay("Edge of the frame", 0.0, 2.0);
+            (o.pos_x, o.pos_y, o.size) = (pos.0, pos.1, 0.08);
+            o.bg = bg.map(String::from);
+            check_text(
+                &format!("text/edge-{name}{}", if bg.is_some() { "-boxed" } else { "" }),
+                &tl(vec![o]),
+                one,
+                &[0.5],
+            );
+        }
+    }
+    // Colours: a name, a hex, translucent, with a translucent box, and an invalid one (drawn as the
+    // default, white, as the graph does).
+    for (name, color, bg) in [
+        ("yellow", "yellow", None),
+        ("hex", "#ff6a00", Some("black@0.6")),
+        ("translucent", "white@0.5", Some("0x203040")),
+        ("translucent-box", "#ffcc00", Some("#00000080")),
+        ("invalid", "not a colour!", Some("bad:colour")),
+    ] {
+        let mut o = overlay("Coloured text", 0.0, 2.0);
+        (o.color, o.bg, o.pos_y) = (color.into(), bg.map(String::from), 0.3);
+        check_text(&format!("text/colour-{name}"), &tl(vec![o]), one, &[0.5]);
+    }
+    // A keyframed overlay: position and opacity moving, sampled at times between the frame grid's.
+    let mut moving = overlay("Sliding in", 0.0, 2.0);
+    moving.size = 0.07;
+    moving.keyframes = vec![
+        kerf_core::TextKeyframe {
+            time: 0.0,
+            pos_x: 0.2,
+            pos_y: 0.3,
+            opacity: 0.1,
+        },
+        kerf_core::TextKeyframe {
+            time: 1.5,
+            pos_x: 0.7,
+            pos_y: 0.6,
+            opacity: 1.0,
+        },
+    ];
+    check_text("text/keyframed", &tl(vec![moving]), one, &[0.0, 0.37, 0.8, 1.2345, 1.9]);
+    // Several at once, overlapping: drawn in order, the later on the earlier.
+    let (mut a, mut b) = (overlay("Back", 0.0, 2.0), overlay("Front, over it", 0.5, 2.0));
+    (a.size, a.bg, a.pos_y) = (0.2, Some("black@0.4".into()), 0.5);
+    (b.size, b.color, b.bg, b.pos_y) = (0.08, "yellow".into(), Some("white@0.5".into()), 0.5);
+    check_text("text/overlapping", &tl(vec![a, b]), one, &[0.2, 1.0]);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn text_over_every_kind_of_picture_is_drawn_as_ffmpeg_draws_it() {
+    let m = media();
+    let title = |text: &str| {
+        let mut o = overlay(text, 0.0, 2.0);
+        (o.size, o.pos_y, o.bg, o.color) = (0.09, 0.5, Some("black@0.5".into()), "yellow@0.9".into());
+        o
+    };
+    // The composite's matrix is what FFmpeg converts the text colour with: BT.601 under 6.1 whatever
+    // the picture is tagged, the tag under 9.0. (A mixed stack is refused by the plan, as ever.)
+    for (name, a) in [
+        ("untagged", &m.bars),
+        ("bt709", &m.bars709),
+        ("bt2020", &m.bars2020),
+        ("gradient-709", &m.gradient709),
+    ] {
+        let tl = with_text(
+            timeline(vec![vec![clip(a, 0.0, 2.0, 0.0)]], None),
+            vec![title("Over the bars")],
+        );
+        check_text(&format!("text/over-{name}"), &tl, std::slice::from_ref(a), &[0.5]);
+    }
+    for (name, a) in [("full-range-mjpeg", &m.fullrange), ("full-range-jpeg-still", &m.jpeg)] {
+        let tl = with_text(
+            timeline(vec![vec![clip(a, 0.0, 2.0, 0.0)]], None),
+            vec![title("Over a full-range picture")],
+        );
+        check_text(&format!("text/over-{name}"), &tl, std::slice::from_ref(a), &[0.5]);
+    }
+    // Over a graded layer, a translucent one and a letterbox (the bars are part of the picture).
+    let mut graded = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    graded.color = Color {
+        contrast: 1.3,
+        saturation: 0.6,
+        brightness: 0.05,
+        ..Color::default()
+    };
+    let tl = with_text(timeline(vec![vec![graded]], None), vec![title("Graded")]);
+    check_text("text/over-graded", &tl, std::slice::from_ref(&m.testsrc), &[0.5]);
+    let mut half = clip(&m.bars, 0.0, 2.0, 0.0);
+    half.transform.opacity = 0.5;
+    let tl = with_text(
+        timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![half]], None),
+        vec![title("Translucent")],
+    );
+    check_text("text/over-translucent", &tl, &[m.gradient.clone(), m.bars.clone()], &[0.5]);
+    let tl = with_text(
+        timeline(
+            vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]],
+            Some(Delivery::new(360, 640, Fit::Contain)),
+        ),
+        vec![title("Letterboxed")],
+    );
+    check_text("text/over-letterbox-9x16", &tl, std::slice::from_ref(&m.testsrc), &[0.5]);
+    // 9:16 from a landscape source, and a frame with an odd chroma grid at the box's edge.
+    let mut odd = title("Odd");
+    (odd.pos_x, odd.size) = (0.4999, 0.14);
+    let tl = with_text(
+        timeline(
+            vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]],
+            Some(Delivery::new(202, 100, Fit::Cover)),
+        ),
+        vec![odd],
+    );
+    check_text("text/odd-canvas-202x100", &tl, std::slice::from_ref(&m.testsrc), &[0.5]);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn text_on_a_frame_with_no_layer_is_drawn_in_rgb_as_ffmpeg_draws_it() {
+    let m = media();
+    // Past the clip: FFmpeg hands the black base straight to `drawtext` and the PNG without ever
+    // converting it to YUV, so the text is blended on RGB (and the colour is the one written).
+    let tl = |o: kerf_core::TextOverlay| with_text(timeline(vec![vec![clip(&m.testsrc, 0.0, 1.0, 0.0)]], None), vec![o]);
+    for (name, color, bg) in [
+        ("white", "white", None),
+        ("yellow-boxed", "yellow@0.9", Some("black@0.5")),
+        ("hex-on-a-solid-box", "#33aaff", Some("#ff00aa")),
+    ] {
+        let mut o = overlay("Title card, no picture", 1.2, 2.0);
+        (o.size, o.pos_y, o.color, o.bg) = (0.09, 0.5, color.into(), bg.map(String::from));
+        check_text(
+            &format!("text/blank-{name}"),
+            &tl(o),
+            std::slice::from_ref(&m.testsrc),
+            &[1.5],
+        );
+    }
+    let mut fading = preset("Fading in", (0.5, 0.5), 0.1, true, Some("black@0.5"), 0.5);
+    (fading.start, fading.end) = (1.2, 3.2);
+    check_text(
+        "text/blank-fading",
+        &tl(fading),
+        std::slice::from_ref(&m.testsrc),
+        &[1.4, 2.2],
+    );
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn text_that_needs_escaping_is_drawn_as_the_user_typed_it() {
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    // Each of these used to draw something else in the still itself (an apostrophe swallowed the options
+    // after it, a colon failed the render on FFmpeg 9 and cut the text on 6.1, a backslash vanished): the
+    // text is what was typed, in the still and on the GPU alike.
+    for (n, text) in [
+        "It's here",
+        "Note: this works",
+        "50% off, 100%",
+        "back\\slash",
+        "say \"hi\", ok; [x] {y}",
+        "  padded  ",
+        "Café ☕ 世界",
+        "Привет, Łódź",
+        "%{pts}",
+        "",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut o = overlay(text, 0.0, 2.0);
+        (o.size, o.pos_y, o.bg) = (0.08, 0.4, Some("black@0.5".into()));
+        let tl = with_text(timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None), vec![o]);
+        check_text(&format!("text/escapes-{n}"), &tl, one, &[0.5]);
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn text_in_an_installed_font_is_drawn_as_ffmpeg_draws_it() {
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    // Whatever families this machine has: a face with a real bold is drawn bold, the one with none is
+    // refused (the border `drawtext` thickens it with is blended glyph by glyph, which a mask cannot
+    // be), and a family that is not installed is the shipped default.
+    let installed = kerf_core::list_system_fonts();
+    let mut drawn = 0;
+    for family in [
+        "DejaVu Sans",
+        "Liberation Sans",
+        "Noto Sans",
+        "Arial",
+        "Helvetica",
+        "Segoe UI",
+        "Inter",
+    ] {
+        if !installed.iter().any(|f| f == family) {
+            continue;
+        }
+        let regular = kerf_core::fonts::resolve_font_file(family, false).is_some();
+        let has_bold = kerf_core::fonts::resolve_font_file(family, true).is_some_and(|(_, bold)| bold);
+        if !regular {
+            continue;
+        }
+        let mut o = overlay("Named font, Ay Te", 0.0, 2.0);
+        (o.font, o.size, o.pos_y, o.bold) = (Some(family.into()), 0.08, 0.5, has_bold);
+        let tl = with_text(timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None), vec![o]);
+        check_text(&format!("text/font-{}", family.replace(' ', "-")), &tl, one, &[0.5]);
+        drawn += 1;
+    }
+    eprintln!("installed families drawn: {drawn}");
+    let mut o = overlay("Not installed", 0.0, 2.0);
+    (o.font, o.size, o.bold) = (Some("No Such Family 123".into()), 0.08, true);
+    let tl = with_text(timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None), vec![o]);
+    check_text("text/font-not-installed", &tl, one, &[0.5]);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_text_pass_is_the_reference_blend_plane_by_plane() {
+    // The shader against its scalar reference on the planes themselves (no YUV -> RGB in between), over
+    // pictures with texture: the composite with and without the overlays, the reference blend applied to
+    // the second. `tests/text.rs` holds the reference to `drawtext`, so the two together hold the shader to it.
+    let m = media();
+    let mut title = overlay("Plane by plane, Ay Te 50%", 0.0, 2.0);
+    (title.size, title.pos_x, title.pos_y, title.bg) = (0.07, 0.4137, 0.5821, Some("black@0.55".into()));
+    let mut caption = overlay("Odd origin", 0.0, 2.0);
+    (caption.size, caption.pos_x, caption.pos_y) = (0.09, 0.0031, 0.9733);
+    caption.color = "yellow@0.8".into();
+    let mut solid = overlay("Solid", 0.0, 2.0);
+    (solid.size, solid.pos_x, solid.pos_y, solid.bg) = (0.12, 0.9, 0.12, Some("0x30a0c0".into()));
+    let mut fading = overlay("Fading", 0.0, 2.0);
+    (fading.size, fading.pos_y, fading.bg) = (0.1, 0.3, Some("white@0.5".into()));
+    fading.keyframes = vec![
+        kerf_core::TextKeyframe {
+            time: 0.0,
+            pos_x: 0.5,
+            pos_y: 0.3,
+            opacity: 0.0,
+        },
+        kerf_core::TextKeyframe {
+            time: 1.0,
+            pos_x: 0.5,
+            pos_y: 0.3,
+            opacity: 1.0,
+        },
+    ];
+    for (name, asset) in [
+        ("testsrc2", &m.testsrc),
+        ("bt709 bars", &m.bars709),
+        ("gradient", &m.gradient),
+    ] {
+        let tl = with_text(
+            timeline(vec![vec![clip(asset, 0.0, 2.0, 0.0)]], None),
+            vec![title.clone(), caption.clone(), solid.clone(), fading.clone()],
+        );
+        for t in [0.2, 0.6, 1.4] {
+            let plan = RenderPlan::at(&tl, std::slice::from_ref(asset), &ExportOptions::default(), t, policy()).expect("plan");
+            let size = plan.size(u32::MAX);
+            assert!(reasons(&plan, size).is_empty(), "{:?}", reasons(&plan, size));
+            let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+            let mut bare = plan.clone();
+            bare.overlays.clear();
+            let base = compositor().composite_yuv(&bare, &frames, size).expect("composite");
+            let with = compositor().composite_yuv(&plan, &frames, size).expect("composite with text");
+            let (mut y, mut u, mut v) = (base.y.clone(), base.u.clone(), base.v.clone());
+            for text in &plan.overlays {
+                let graph = kerf_core::text_raster_graph(text, size);
+                let raster = kerf_gpu::text::rasterize(&graph).expect("rasterise");
+                let blends = kerf_gpu::text::blends(text, &raster, plan.canvas.matrix, false).expect("blends");
+                let mut pic = kerf_gpu::text::Planes {
+                    w: size.0 as usize,
+                    h: size.1 as usize,
+                    subsampled: true,
+                    planes: [&mut y, &mut u, &mut v],
+                };
+                kerf_gpu::text::blend_all(&mut pic, &raster, &blends);
+            }
+            assert_ne!(y, base.y, "{name} @ {t}: the text drew nothing");
+            for (plane, got, want) in [("Y", &with.y, &y), ("U", &with.u, &u), ("V", &with.v, &v)] {
+                let wrong = got.iter().zip(want.iter()).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    wrong, 0,
+                    "{name} @ {t}: {wrong} samples of the {plane} plane differ from the reference blend"
+                );
+            }
+            eprintln!(
+                "text pass == reference blend: {name} @ {t} ({}x{}, {} overlays)",
+                size.0,
+                size.1,
+                plan.overlays.len()
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn text_the_gpu_cannot_reproduce_is_refused() {
+    let m = media();
+    let tl = with_text(
+        timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None),
+        vec![overlay("Bold, in a font with no bold face", 0.0, 2.0)],
+    );
+    let assets = std::slice::from_ref(&m.testsrc);
+    let mut plan = RenderPlan::at(&tl, assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
+    let size = plan.size(u32::MAX);
+    assert!(reasons(&plan, size).is_empty(), "the control is drawn");
+    // A bold request the face cannot meet (the plan marks it): `drawtext` thickens it with a border.
+    plan.overlays[0].synthetic_bold = true;
+    let why = reasons(&plan, size).join("; ");
+    assert!(why.contains("no bold face"), "{why}");
+    let err = compositor().render_plan(&plan, size).expect_err("the render should refuse");
+    assert!(
+        matches!(&err, kerf_gpu::GpuError::Unsupported(w) if w.contains("no bold face")),
+        "{err}"
+    );
+    plan.overlays[0].synthetic_bold = false;
+    // Text under 12 px is all shared pixels: a mask cannot stand for the bitmaps `drawtext` blends in turn.
+    plan.overlays[0].size = 0.03;
+    let why = reasons(&plan, size).join("; ");
+    assert!(why.contains("11 px font"), "{why}");
+    let err = compositor().render_plan(&plan, size).expect_err("the render should refuse");
+    assert!(
+        matches!(&err, kerf_gpu::GpuError::Unsupported(w) if w.contains("11 px font")),
+        "{err}"
+    );
+    plan.overlays[0].size = 0.034;
+    assert!(reasons(&plan, size).is_empty(), "12 px and up is drawn");
+    // A font file the plan cannot name (the default could not be written): FFmpeg's own default font.
+    plan.overlays[0].font_file = None;
+    let why = reasons(&plan, size).join("; ");
+    assert!(why.contains("no font file"), "{why}");
+    eprintln!("refused/text: border, small text, no font file");
+}
+
 // ---- the scaler, plane by plane --------------------------------------------------
 
 /// The picture scaled by FFmpeg's own `scale` (default flags: bicubic) to the
@@ -2941,7 +3437,7 @@ fn the_scaler_matches_ffmpegs_scale_plane_by_plane() {
                 Some(Delivery::new(w, h, Fit::Contain)),
             );
             let plan = RenderPlan::at(&tl, std::slice::from_ref(asset), &opts, t, policy()).expect("plan");
-            let why = plan.unsupported_reasons_at((w, h));
+            let why = reasons(&plan, (w, h));
             assert!(why.is_empty(), "{why:?}");
             let gpu_planes = {
                 let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
