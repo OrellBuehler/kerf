@@ -106,8 +106,10 @@ forward drag hits.
 
 Round 2 added cut shapes: a cut that is itself 29.97 and 23.976 (frame `k * 1001 / 30000`, `k * 1001 / 24000`), a
 23.976 cut with an in-point half a frame off, an animated keyframed title over a box, and two generated captions that
-meet at a frame (with a `%` in the text). All pass on 9.0.2 and 6.1.1 (20 cases): on 9.0.2 every one is the still's JPEG
-byte for byte but the 5 rounding cases below. A caption may not contain `:` or `'`: see the findings.
+meet at a frame (with a `%` in the text). All 20 cases pass on 9.0.2 and on 6.1.1. On 9.0.2 the 29.97 and 23.976
+cuts, the in-point case and the captions are the still's JPEG byte for byte (281 of 281 frames), the animated title
+57 of 62 (the other 5 the still's picture through the encoder's rounding, 0.15 on the mean); on 6.1.1 every window frame
+is the export's frame (the still's chroma is the odd one out there, below). A caption may not contain `:` or `'`: see the findings.
 
 
 `scrub_rendered.rs` (`#[ignore]`d, drives the real ffmpeg): a window frame is the still's JPEG byte for byte or
