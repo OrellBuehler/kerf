@@ -53,6 +53,7 @@
 		takeLaunchProject
 	} from '$lib/api';
 	import { windowTitle } from '$lib/window-title';
+	import { finishImport, importMedia } from '$lib/import-media';
 	import { afterPaint, fontsReady, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
 	import { CONFIRM, UNSAVED, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
@@ -83,8 +84,8 @@
 	$effect(() => popout.setInert(modalOpen));
 
 	// The OS hears the project's name, and that it has work that is not saved.
+	const title = $derived(windowTitle(editor.projectName, editor.hasUnsavedWork));
 	$effect(() => {
-		const title = windowTitle(editor.projectName, editor.hasUnsavedWork);
 		void setWindowTitle(title).catch(() => {});
 	});
 
@@ -325,14 +326,6 @@
 		ui.openAbout();
 	}
 
-	async function onImport() {
-		if (!inTauri()) {
-			toast.info('Importing media is available in the desktop app.');
-			return;
-		}
-		await finishImport(editor.importMedia());
-	}
-
 	/** Files dropped onto the window. Non-media is filtered out here rather than
 	 *  handed to ffprobe, so dropping a folder's worth of mixed files doesn't
 	 *  answer with one error toast per README. */
@@ -346,26 +339,6 @@
 		}
 		if (rejected > 0) toast.info(`Skipped ${rejected} non-media file${rejected === 1 ? '' : 's'}`);
 		await finishImport(editor.importPaths(media));
-	}
-
-	/** Report what landed, then analyze it — one asset at a time, because each
-	 *  pass is ffmpeg-bound, and stoppable, because the transcription at the end
-	 *  of each one runs for minutes. */
-	async function finishImport(job: ReturnType<typeof editor.importMedia>) {
-		try {
-			const { imported, failed } = await job;
-			for (const f of failed) toast.error(`Couldn't import ${f.name}: ${f.message}`);
-			if (imported.length === 0) return;
-			toast.success(
-				imported.length === 1 ? `Imported ${imported[0].name}` : `Imported ${imported.length} files`
-			);
-			await ui.analyzeImported(
-				imported.map((a) => a.id),
-				settings.autoAnalysis
-			);
-		} catch (e) {
-			toast.error(e instanceof Error ? e.message : String(e));
-		}
 	}
 
 	// A proposal the agent stages is only visible in the Agent panel, which
@@ -420,7 +393,7 @@
 		'file.new': () => void onNew(),
 		'file.open': () => void openProjectAt(),
 		'file.save': () => void onSave(),
-		'file.import': () => void onImport(),
+		'file.import': () => void importMedia(),
 		'file.export': () => onExport(),
 		'file.importCaptions': () => void importCaptionFile(),
 		'file.saveCover': () => void saveCoverFrame(),
