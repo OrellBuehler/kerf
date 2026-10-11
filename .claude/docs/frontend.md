@@ -710,12 +710,14 @@ prop and route it to the action). `use:tip={'Razor'}`, or `{ text, keys, detail 
 one with the user's key (`keys`, drawn as keycaps by `accel.ts`) and a muted second line, so a long hint is a noun plus a sentence
 instead of a paragraph in one line (a string's lines after the first are its detail). One tip is up at a time: it shows after 400 ms
 (60 ms right after another has gone, so a row of buttons reads as one sweep, and at once when the keyboard focuses a control —
-`:focus-visible` only, a click that focuses is not asking), and goes on a press, a scroll, leaving or Escape (Escape is *consumed* only
-when keyboard focus holds the tip up; a tip the pointer is holding lets it through to whatever wanted it). It is dismissible and
+`:focus-visible` only, a click that focuses is not asking, and never a field you type in — `raisesFocusTip`: it would cover the next one),
+and goes on a press, a scroll, leaving or Escape. **Escape only dismisses; it is never consumed**, so a slider's Escape-to-abandon and a dialog's Close
+work with a tip showing. It is dismissible and
 persistent but **not hoverable by design** — a tip that took the pointer would sit over the next toolbar row and eat the click meant for
 it. It is the menu's surface (`--surface-raised`, `--shadow-md`, `--radius-sm`), `role=tooltip`, and `aria-describedby` points at it
-while it shows; an element with no name of its own (an icon button) takes the tip's text as its `aria-label`, since the `title` that
-used to name it is gone. One element per *document* (`realm.ts`), so a detached panel window draws its own; no fade under
+while it shows — the whole tip when it says more than the element's name, only its detail when the name *is* the tip's text
+(`describeTarget`: a screen reader would say the label twice); an element with no name of its own (an icon button) takes the tip's text as its
+`aria-label`, since the `title` that used to name it is gone. One element per *document* (`realm.ts`), so a detached panel window draws its own; no fade under
 `prefers-reduced-motion`. The timing (`createTipController`), placement (`placeTip`) and the rest are pure and bun-tested; the tip
 does not appear on a disabled control in engines that drop its pointer events (Chromium delivers them; WebKit untested).
 **Context menus are keyboard menus** (`ContextMenu.svelte` over `menu-nav.ts`, shared with the menu bar's `stepFocus` / `typeahead`): it
@@ -725,8 +727,10 @@ that starts with it, Escape closes and gives focus back to the invoker, Tab clos
 row is `aria-disabled`, not `disabled`, so it takes focus and says why; the lit row is one at a time (`:hover` and the keys' `:focus-visible`, the
 pointer moving focus to the row it is over). The capture-phase key handler keeps a menu's keys from reaching the page's shortcuts. An action that
 opens a dialog finds focus on the invoker, so the dialog's own focus return works. At 1366×768 an ArrowDown used to scroll the page and
-close the menu. A group of radio chips (Settings' proxy size and preview source) is one tab stop the arrows move through
-(`roving.ts`); a chip that is on or off carries `aria-pressed`, the Settings rail `aria-current="page"`, and a button that is a picture or a glyph has a name
+close the menu. A menu opened from the keyboard starts on its first *runnable* row (`startRow`). A group of radio chips (Settings' proxy size and preview
+source) is one tab stop (`tabStop`: the chosen chip if it can take focus, else the first that can — Preview source disables all but "Always original"
+while proxies are off) the arrows move through (`roving.ts`; selection follows focus, except Proxy size, where a choice rebuilds every proxy, so its
+arrows only move focus and Space / Enter choose); a chip that is on or off carries `aria-pressed`, the Settings rail `aria-current="page"`, and a button that is a picture or a glyph has a name
 (`a11y-guard.test.ts` scans the markup for each, and that the one focus rule lists `textarea`).
 **Progress bars say what they know** (`ProgressBar.svelte`, `.k-progress` in `controls.css`): a `progressbar` with an accessible name that fills to its
 value, or — with none (a download of unknown size, a stage that reports nothing, an export waiting on its proxy) — sweeps a segment along the track
@@ -871,8 +875,11 @@ alongside `editor`/`ui`/`agent`): it runs a *silent* check at startup and every
 title bar's version chip turns into an amber "⬇ 0.18.0" button when something is
 available and opens `UpdateDialog` (release notes, download progress, then
 **Restart now** — which warns first when the project has unsaved changes (the same fact in the dialog's
-banner); the download does not lock the app — the footer says "Downloading in the background." and offers
-*Hide* (the chip reopens it); the line over the body reads `Current 0.24.0 → 0.25.0 · 1 Oct 2026`
+banner). The download **holds the dialog still** (`busy`, no Hide): on Windows the plugin's `downloadAndInstall` launches the
+installer and exits the app when it is done, past every close guard, so a hidden download could take unsaved work and a running
+export with it, silently. **Install asks first** (`installPrompt`, `confirm-copy.ts`): with an unsaved project the three-button
+*Save… · Install anyway · Cancel*, with only an export or an analysis running a two-button one saying it will be stopped, and
+nothing at stake no question; `install()` itself ignores a second press while one runs. The line over the body reads `Current 0.24.0 → 0.25.0 · 1 Oct 2026`
 (`versionLine`, not "Installed … →"); a failed *check* is titled
 "Couldn't check for updates", never "up to date", says so in a sentence with the raw error under a
 *Details* disclosure, and the AppImage fallback note shows only for a failed install on Linux

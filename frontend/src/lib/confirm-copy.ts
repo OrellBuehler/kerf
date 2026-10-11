@@ -72,6 +72,33 @@ export const CONFIRM = {
 	replaceCaptions: { title: 'Replace captions?', ok: 'Replace', cancel: 'Cancel' }
 } as const;
 
+/** What would be lost if the app closed this moment: the project nobody saved, a render, an analysis. */
+export interface InstallRisk {
+	unsaved: boolean;
+	exporting: boolean;
+	analyzing: boolean;
+}
+
+/** The prompt before an update is installed. On Windows the installer takes the app down when the
+ *  download is done, past every close guard, so the question is asked *before* it starts: with
+ *  unsaved work it is the three-button Save… / Install anyway / Cancel, with only a job running a
+ *  two-button one, and with nothing at stake `null`. */
+export function installPrompt(risk: InstallRisk):
+	| { kind: 'unsaved'; copy: UnsavedCopy }
+	| { kind: 'jobs'; copy: ConfirmCopy }
+	| null {
+	const lines = ['Kerf will close to install the update.'];
+	if (risk.unsaved) lines.push(`${UNSAVED_FACT} If you install now it will be lost.`);
+	if (risk.exporting) lines.push('The export in progress will be stopped.');
+	if (risk.analyzing) lines.push('The analysis in progress will be stopped.');
+	const message = lines.join(' ');
+	if (risk.unsaved)
+		return { kind: 'unsaved', copy: { title: 'Install the update?', message, save: 'Save…', discard: 'Install anyway', cancel: 'Cancel' } };
+	if (risk.exporting || risk.analyzing)
+		return { kind: 'jobs', copy: { title: 'Install the update?', message, ok: 'Install anyway', cancel: 'Cancel' } };
+	return null;
+}
+
 /** The update dialog's own line, over the Restart button: the same fact, the way to fix it. */
 export const UPDATE_UNSAVED_NOTE = `${UNSAVED_FACT} Save it before restarting or it will be lost.`;
 

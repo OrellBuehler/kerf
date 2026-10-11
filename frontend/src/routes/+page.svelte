@@ -35,7 +35,7 @@
 	} from '$lib/ops';
 	import { allowsRepeat, type ActionId } from '$lib/keymap';
 	import { runMenuCommand } from '$lib/menu-commands';
-	import { saveCoverFrame } from '$lib/file-actions';
+	import { saveCoverFrame, saveProject } from '$lib/file-actions';
 	import { importCaptionFile } from '$lib/title-actions';
 	import {
 		askUnsaved,
@@ -48,14 +48,12 @@
 		openReleases,
 		quitApp,
 		revealLogs,
-		revealPath,
 		showMainWindow,
 		takeLaunchProject
 	} from '$lib/api';
 	import { afterPaint, fontsReady, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
 	import { CONFIRM, UNSAVED, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
-	import { savedLine } from '$lib/failure-copy';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
@@ -279,21 +277,6 @@
 		} catch (e) {
 			toast.error(e instanceof Error ? e.message : String(e));
 		}
-	}
-
-	/** Write the project to a file the user picks; true once it is on disk. Says how it went. */
-	async function saveProject(): Promise<boolean> {
-		try {
-			if (!(await editor.saveProjectAs())) return false;
-		} catch (e) {
-			toast.error("Couldn't save the project", { description: e instanceof Error ? e.message : String(e) });
-			return false;
-		}
-		const path = editor.currentPath;
-		toast.success(path ? savedLine(path) : `Saved ${editor.projectName}`, {
-			...(path ? { action: { label: 'Show in folder', onClick: () => void revealPath(path).catch(() => {}) } } : {})
-		});
-		return true;
 	}
 
 	async function onSave() {

@@ -5,11 +5,15 @@
 // What a native tooltip could not do: it was the OS's light-grey box on a dark editor, appeared
 // after a second, could not show a key, and never appeared for the keyboard. This one is the
 // menu's surface, shows after 400 ms (immediately once one has just shown, so a row of buttons
-// reads as one sweep), on keyboard focus at once, and goes on Escape, a press, a scroll or
-// leaving — but not when the pointer moves onto the tip itself (WCAG 1.4.13: dismissible,
-// hoverable, persistent). It describes its element (`aria-describedby`) while it shows; an
-// element with no name of its own — an icon button — takes the tip's text as its `aria-label`,
-// since the `title` that used to name it is gone. No motion under `prefers-reduced-motion`.
+// reads as one sweep), on keyboard focus at once (not for a field you type in: a tip would sit
+// over the next one), and goes on Escape, a press, a scroll or leaving. It is dismissible and
+// persistent (WCAG 1.4.13) but deliberately not hoverable: a tip that took the pointer would sit
+// over the next toolbar row and eat the click meant for it (`pointer-events:none`). Escape only
+// dismisses it — the key still goes on to whatever wanted it, so a slider's Escape-to-abandon and
+// a dialog's Close still work with a tip showing. It describes its element (`aria-describedby`)
+// while it shows, saying only what the element's name has not already said; an element with no
+// name of its own — an icon button — takes the tip's text as its `aria-label`, since the `title`
+// that used to name it is gone. No motion under `prefers-reduced-motion`.
 //
 // The pure parts (what to say, where to put it, when to show) are tested without a DOM; the glue
 // below `createTipController` creates one tip element per *document*, so a detached panel window
@@ -58,6 +62,33 @@ export function tipText(input: TipInput): string {
  *  operates, and nothing else — text, `aria-label`, a `<label>` — names it. */
 export function needsName(el: { interactive: boolean; text: string; ariaLabel: boolean; labelled: boolean }): boolean {
 	return el.interactive && !el.ariaLabel && !el.labelled && el.text.trim() === '';
+}
+
+const lower = (s: string) => s.replace(/\s+/g, ' ').trim().toLowerCase();
+
+/** What a tip should be described *as*, given the name its element already has: the whole tip when it
+ *  says something the name does not; only its detail when the name *is* the tip's text (an icon button
+ *  named by its tip, an `IconBtn` whose `aria-label` is the same words) — a screen reader would say the
+ *  label twice otherwise; nothing when there is no detail to add. */
+export function describeTarget(name: string, spec: TipSpec, namedByTip = false): 'tip' | 'detail' | 'none' {
+	const same =
+		namedByTip || lower(name) === lower(spec.text) || lower(name) === lower(spec.keys ? `${spec.text} (${spec.keys})` : spec.text);
+	if (!same) return 'tip';
+	return spec.detail ? 'detail' : 'none';
+}
+
+/** Input types whose focus is typing: a `:focus-visible` that always matches, and a tip over it would
+ *  cover the next field (and the one being typed in). */
+const TEXT_ENTRY = new Set(['', 'text', 'search', 'email', 'url', 'tel', 'password', 'number', 'date', 'datetime-local', 'month', 'time', 'week']);
+
+/** Whether keyboard focus on this element should raise its tip: not for a text field, a text area or
+ *  anything editable. Hover still does, and the tip is still its description. */
+export function raisesFocusTip(el: { tag: string; type?: string; editable?: boolean }): boolean {
+	if (el.editable) return false;
+	const tag = el.tag.toLowerCase();
+	if (tag === 'textarea') return false;
+	if (tag === 'input') return !TEXT_ENTRY.has((el.type ?? '').toLowerCase());
+	return true;
 }
 
 export interface Rect {
@@ -111,14 +142,6 @@ export interface TipEnv<E> {
 	/** Draw (or redraw) the tip for `el`. */
 	show(el: E, spec: TipSpec, via: Via): void;
 	hide(): void;
-}
-
-export interface Dismissal {
-	/** A tip was showing and has gone. */
-	hidden: boolean;
-	/** The key should not go on to anything else: the tip belonged to the focused control, and
-	 *  Escape was said to it. A tip that only the pointer was holding up lets Escape through. */
-	consume: boolean;
 }
 
 /** The tip's timing and who it is for, over an environment that can be faked — one controller is
@@ -245,12 +268,13 @@ export function createTipController<E>(env: TipEnv<E>) {
 		dismissAll() {
 			hideNow();
 		},
-		escape(): Dismissal {
-			if (!shown) return { hidden: false, consume: false };
-			const consume = via === 'focus';
+		/** Escape: put the tip away, and keep it away from this control until the pointer has left and
+		 *  focus has gone. True when one was up. The key is not the tip's to keep. */
+		escape(): boolean {
+			if (!shown) return false;
 			if (anchor) muted.add(anchor);
 			hideNow();
-			return { hidden: true, consume };
+			return true;
 		},
 		get shown() {
 			return shown;
@@ -292,6 +316,7 @@ function hostFor(doc: Document): Host {
 	keys.style.cssText = 'flex:none';
 	line.append(text, keys);
 	const detail = doc.createElement('div');
+	detail.id = `${root.id}-detail`;
 	detail.style.cssText = 'margin-top:2px;color:var(--text-muted);white-space:pre-line';
 	root.append(line, detail);
 	doc.body.appendChild(root);
@@ -352,17 +377,13 @@ const controller = createTipController<HTMLElement>({
 		root.style.transform = `translate(${at.left}px,${at.top}px)`;
 		root.style.visibility = 'visible';
 		root.style.opacity = '1';
-		describe(el, root.id);
+		const mode = describeTarget(nameOf(el), spec, el.dataset.tipNamed !== undefined);
+		describe(el, mode === 'tip' ? root.id : mode === 'detail' ? `${root.id}-detail` : null);
 		if (!stopShownListeners || shownIn?.doc !== doc) {
 			stopShownListeners?.();
 			const away = () => controller.dismissAll();
 			const key = (e: KeyboardEvent) => {
-				if (e.key !== 'Escape') return;
-				const d = controller.escape();
-				if (d.consume) {
-					e.preventDefault();
-					e.stopPropagation();
-				}
+				if (e.key === 'Escape') controller.escape();
 			};
 			win.addEventListener('keydown', key, true);
 			win.addEventListener('pointerdown', away, true);
@@ -394,6 +415,11 @@ const controller = createTipController<HTMLElement>({
 	}
 });
 
+/** The name the element already has: its `aria-label`, else the text it is made of. */
+function nameOf(el: HTMLElement): string {
+	return el.getAttribute('aria-label')?.trim() || el.textContent?.trim() || '';
+}
+
 const INTERACTIVE = /^(button|a|input|select|textarea|summary)$/i;
 const INTERACTIVE_ROLES = new Set(['button', 'tab', 'menuitem', 'switch', 'checkbox', 'radio', 'slider', 'link']);
 
@@ -413,7 +439,12 @@ export function tip(node: HTMLElement, input: TipInput) {
 		if (e.pointerType !== 'touch') controller.enter(node);
 	};
 	const leave = () => controller.leave(node);
-	const focus = () => controller.focus(node, node.matches(':focus-visible'));
+	const focus = () =>
+		controller.focus(
+			node,
+			node.matches(':focus-visible') &&
+				raisesFocusTip({ tag: node.tagName, type: (node as HTMLInputElement).type, editable: node.isContentEditable })
+		);
 	const blur = () => controller.blur(node);
 	const press = () => controller.press(node);
 	node.addEventListener('pointerenter', enter);

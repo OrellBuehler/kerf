@@ -3,8 +3,9 @@
 // the preview's own context menu, so each of them does exactly the same thing.
 
 import { exportCover, inTauri, pickCoverPath, revealPath } from './api';
+import { editor } from './state.svelte';
 import { toast } from './notifications.svelte';
-import { coverLine, failure } from './failure-copy';
+import { coverLine, failure, savedLine } from './failure-copy';
 import { ui } from './editor-ui.svelte';
 
 /** Write the frame under the playhead as a cover image — the thumbnail a
@@ -26,4 +27,20 @@ export async function saveCoverFrame(): Promise<void> {
 	} catch (e) {
 		toast.error(failure("Couldn't save the cover frame", e));
 	}
+}
+
+/** Write the project to a file the user picks; true once it is on disk. Says how it went — the
+ *  File menu's Save, and the "Save…" an unsaved-project prompt offers, are this. */
+export async function saveProject(): Promise<boolean> {
+	try {
+		if (!(await editor.saveProjectAs())) return false;
+	} catch (e) {
+		toast.error("Couldn't save the project", { description: e instanceof Error ? e.message : String(e) });
+		return false;
+	}
+	const path = editor.currentPath;
+	toast.success(path ? savedLine(path) : `Saved ${editor.projectName}`, {
+		...(path ? { action: { label: 'Show in folder', onClick: () => void revealPath(path).catch(() => {}) } } : {})
+	});
+	return true;
 }

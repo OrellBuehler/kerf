@@ -5,7 +5,7 @@
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { contextRows } from '$lib/menu-items';
-	import { firstRow, menuKey, rowFor } from '$lib/menu-nav';
+	import { menuKey, rowFor, startRow } from '$lib/menu-nav';
 	import { tip } from '$lib/tip';
 
 	/** The window this instance draws in. One is mounted in the editor window and one in
@@ -39,6 +39,12 @@
 		pos = { x: Math.max(margin, x), y: Math.max(margin, y) };
 	});
 
+	// Whatever closed the menu — a row, Escape, a press elsewhere, a scroll, a resize, the window losing
+	// focus — what it remembered to give focus back to goes with it, so the next menu starts clean.
+	$effect(() => {
+		if (!here) returnTo = null;
+	});
+
 	function rowEl(i: number): HTMLElement | null {
 		return el?.querySelector<HTMLElement>(`[data-row="${i}"]`) ?? null;
 	}
@@ -55,7 +61,7 @@
 			const was = own.document.activeElement;
 			if (was instanceof HTMLElement && was !== own.document.body && !menu.contains(was)) returnTo = was;
 			const keys = !!returnTo?.matches(':focus-visible');
-			active = keys ? firstRow(rows) : -1;
+			active = keys ? startRow(rows) : -1;
 			(keys && active >= 0 ? rowEl(active) : menu)?.focus({ preventScroll: true });
 		});
 	});

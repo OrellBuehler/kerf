@@ -74,6 +74,8 @@ export function removeRows(o: RemoveRows): MenuItem[] {
  *  header, a fact and a rule are not controls), and a disabled one still does so it can say why. */
 export function contextRows(items: readonly MenuItem[]): NavRow[] {
 	return items.map((i) =>
-		i.type === undefined || i.type === 'item' ? { focusable: true, label: i.label } : { focusable: false, label: '' }
+		i.type === undefined || i.type === 'item'
+			? { focusable: true, label: i.label, enabled: !i.disabled }
+			: { focusable: false, label: '' }
 	);
 }

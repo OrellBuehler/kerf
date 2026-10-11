@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { MenuItem } from './context-menu.svelte';
 import { contextRows } from './menu-items';
-import { firstRow, focusableRows, lastRow, menuKey, radioKey, rowFor, stepRow, typeaheadRow, type NavRow } from './menu-nav';
+import { firstRow, focusableRows, lastRow, menuKey, radioKey, rowFor, startRow, stepRow, tabStop, typeaheadRow, type NavRow } from './menu-nav';
 
 const row = (label: string, focusable = true): NavRow => ({ label, focusable });
 const rows = [row('Header', false), row('Copy'), row('Cut'), row('', false), row('Paste'), row('Delete')];
@@ -105,8 +105,8 @@ describe('the context menu as rows', () => {
 			{ focusable: false, label: '' },
 			{ focusable: false, label: '' },
 			{ focusable: false, label: '' },
-			{ focusable: true, label: 'Add at playhead' },
-			{ focusable: true, label: 'Separate stems…' }
+			{ focusable: true, label: 'Add at playhead', enabled: true },
+			{ focusable: true, label: 'Separate stems…', enabled: false }
 		]);
 	});
 });
@@ -129,5 +129,43 @@ describe('a group of radio buttons', () => {
 		expect(rowFor(chips, 0, { do: 'next' })).toBe(2);
 		expect(rowFor(chips, 3, { do: 'next' })).toBe(0);
 		expect(rowFor(chips, 0, { do: 'prev' })).toBe(3);
+	});
+});
+
+describe('the tab stop of a radio group', () => {
+	const chip = (checked: boolean, enabled = true) => ({ checked, enabled });
+	test('is the chosen one', () => {
+		expect(tabStop([chip(false), chip(true), chip(false)])).toBe(1);
+	});
+	test('is the first that can take focus when the chosen one cannot', () => {
+		// proxies off: "Auto" is the setting but disabled, only "Always original" is live
+		expect(tabStop([chip(true, false), chip(false), chip(false, false)])).toBe(1);
+		expect(tabStop([chip(false, false), chip(true, false), chip(false)])).toBe(2);
+	});
+	test('is the first when none is chosen', () => {
+		expect(tabStop([chip(false), chip(false)])).toBe(0);
+	});
+	test('is none when nothing can take focus, so the group is not a trap', () => {
+		expect(tabStop([chip(true, false), chip(false, false)])).toBe(-1);
+		expect(tabStop([])).toBe(-1);
+	});
+});
+
+describe('where a menu opened from the keyboard starts', () => {
+	test('on the first row that can be run, skipping a disabled one', () => {
+		const rows: NavRow[] = [
+			{ focusable: false, label: 'Header' },
+			{ focusable: true, label: 'Split at playhead', enabled: false },
+			{ focusable: true, label: 'Copy', enabled: true }
+		];
+		expect(startRow(rows)).toBe(2);
+	});
+	test('on the first row when nothing can be run, so there is still somewhere to stand', () => {
+		expect(startRow([{ focusable: true, label: 'A', enabled: false }, { focusable: true, label: 'B', enabled: false }])).toBe(0);
+	});
+	test('a row with no `enabled` is runnable; an empty menu has no start', () => {
+		expect(startRow([row('A'), row('B')])).toBe(0);
+		expect(startRow([])).toBe(-1);
+		expect(startRow([row('Fact', false)])).toBe(-1);
 	});
 });

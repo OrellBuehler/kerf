@@ -91,6 +91,7 @@ describe('the version line', () => {
 describe('what the dialog says while it works', () => {
 	test('the quiet and the busy lines', () => {
 		expect(CURRENT_LINE).toBe("You're on the latest version.");
-		expect(DOWNLOADING_NOTE).toBe('Downloading in the background.');
+		expect(DOWNLOADING_NOTE).toBe('Downloading the update. Kerf may close when it is done.');
+		expect(DOWNLOADING_NOTE).not.toMatch(/background/);
 	});
 });

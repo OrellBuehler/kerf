@@ -6,6 +6,8 @@
 	import Btn from './Btn.svelte';
 	import KerfMark from './KerfMark.svelte';
 	import { updater } from '$lib/updater.svelte';
+	import { openReleases } from '$lib/api';
+	import { failure } from '$lib/failure-copy';
 	import { toast } from '$lib/notifications.svelte';
 	import { aboutRows, platformName, REPOSITORY, TAGLINE, versionInfo, type AboutInfo } from '$lib/about';
 
@@ -16,6 +18,15 @@
 		platform: platformName(typeof navigator === 'undefined' ? undefined : navigator),
 		development: import.meta.env.DEV
 	});
+
+	/** A failure here is this dialog's, said in a toast — not the update dialog's error box. */
+	async function openNotes() {
+		try {
+			await openReleases();
+		} catch (e) {
+			toast.error(failure("Couldn't open the release notes", e));
+		}
+	}
 
 	async function copy() {
 		try {
@@ -46,7 +57,7 @@
 	</dl>
 	{#snippet footer()}
 		<div style="display:flex;align-items:center;gap:8px;padding:12px 16px">
-			<Btn variant="ghost" size="sm" icon="external-link" onclick={() => updater.openReleasePage()}>Release notes</Btn>
+			<Btn variant="ghost" size="sm" icon="external-link" onclick={openNotes}>Release notes</Btn>
 			<div style="flex:1"></div>
 			<Btn variant="secondary" size="md" icon="copy" data-copy data-rescue onclick={copy}>Copy version info</Btn>
 			<Btn variant="primary" size="md" data-rescue onclick={onClose}>Close</Btn>

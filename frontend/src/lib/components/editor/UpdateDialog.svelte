@@ -4,9 +4,11 @@
 	import ProgressBar from './ProgressBar.svelte';
 	import { updater } from '$lib/updater.svelte';
 	import { editor } from '$lib/state.svelte';
-	import { confirmAction } from '$lib/api';
+	import { askUnsaved, confirmAction } from '$lib/api';
+	import { ui } from '$lib/editor-ui.svelte';
+	import { saveProject } from '$lib/file-actions';
 	import { CURRENT_LINE, DOWNLOADING_NOTE, errorView, installNote, updateTitle, versionLine } from '$lib/update-copy';
-	import { CONFIRM, UPDATE_UNSAVED_NOTE } from '$lib/confirm-copy';
+	import { CONFIRM, UPDATE_UNSAVED_NOTE, installPrompt, proceedAfter } from '$lib/confirm-copy';
 	import { isLinux } from '$lib/keymap';
 
 	const u = updater;
@@ -28,12 +30,22 @@
 		await u.restart();
 	}
 
+	/** Installing can take the app down when the download is done (on Windows the installer exits it past
+	 *  every close guard), so what that would cost is asked about first, with named buttons. */
+	async function install() {
+		const prompt = installPrompt({ unsaved, exporting: !!editor.exportRun, analyzing: ui.analyzing });
+		if (prompt?.kind === 'unsaved') {
+			if (!(await proceedAfter(await askUnsaved(prompt.copy), saveProject))) return;
+		} else if (prompt && !(await confirmAction(prompt.copy.message, prompt.copy.title, prompt.copy))) return;
+		await u.install();
+	}
+
 	const title = $derived(updateTitle(u.phase, u.update));
 	const note = $derived(installNote(u.errorKind, isLinux()));
 	const failure = $derived(u.error ? errorView(u.errorKind, u.error) : null);
 </script>
 
-<Modal title={title} icon="download" width={460} rescue onClose={() => u.close()}>
+<Modal title={title} icon="download" width={460} busy={u.phase === 'downloading'} rescue onClose={() => u.close()}>
 	<div style="flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px">
 		<div style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">
 			{versionLine(u.version, u.update)}
@@ -93,10 +105,9 @@
 				<Btn variant="primary" size="md" icon="refresh-cw" data-rescue onclick={restart}>Restart now</Btn>
 			{:else if u.phase === 'downloading'}
 				<span style="font-size:12px;color:var(--text-muted)">{DOWNLOADING_NOTE}</span>
-				<Btn variant="ghost" size="md" data-rescue onclick={() => u.close()}>Hide</Btn>
 			{:else if u.update}
 				<Btn variant="ghost" size="md" onclick={() => u.close()}>Later</Btn>
-				<Btn variant="primary" size="md" icon="download" data-rescue onclick={() => u.install()}>
+				<Btn variant="primary" size="md" icon="download" data-rescue onclick={install}>
 					{u.error ? 'Retry install' : 'Install update'}
 				</Btn>
 			{:else}

@@ -24,7 +24,7 @@ interface Node {
 	type: string;
 	name?: string;
 	start: number;
-	attributes?: { type: string; name: string; start: number }[];
+	attributes?: { type: string; name: string; start: number; value?: unknown }[];
 	[key: string]: unknown;
 }
 
@@ -96,6 +96,32 @@ describe('tooltips', () => {
 					.filter(({ line }) => /setAttribute\(\s*['"]title['"]|\.title\s*=(?!=)/.test(line) && !/document\.title/.test(line))
 					.map(({ at }) => at)
 			);
+		expect(offenders).toEqual([]);
+	});
+
+	test('a static attribute never carries a backslash-n: it would render as those two characters', () => {
+		// `title="Label\nDetail"` is not a newline in a template attribute (it is in an expression). A
+		// tip's detail is `{ text, detail }`, or a string in an expression where `\n` is real.
+		const offenders = svelteFiles.flatMap((f) => {
+			const source = read(f);
+			const ast = parse(source, { modern: true });
+			const out: string[] = [];
+			const walk = (n: unknown) => {
+				if (!n || typeof n !== 'object') return;
+				if (Array.isArray(n)) return n.forEach(walk);
+				const node = n as Node & { value?: unknown };
+				if ((node.type === 'RegularElement' || node.type === 'Component') && node.attributes) {
+					for (const a of node.attributes) {
+						if (a.type !== 'Attribute' || !Array.isArray(a.value)) continue;
+						const text = (a.value as { type: string; raw?: string }[]).filter((p) => p.type === 'Text').map((p) => p.raw ?? '').join('');
+						if (text.includes('\\n')) out.push(`${f}:${source.slice(0, a.start).split('\n').length}  ${a.name}="…\\n…"`);
+					}
+				}
+				for (const k of Object.keys(node)) if (k !== 'parent') walk(node[k]);
+			};
+			walk(ast.fragment);
+			return out;
+		});
 		expect(offenders).toEqual([]);
 	});
 });

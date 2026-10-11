@@ -5,8 +5,10 @@ import {
 	WARM_DELAY,
 	WARM_WINDOW,
 	createTipController,
+	describeTarget,
 	needsName,
 	placeTip,
+	raisesFocusTip,
 	tipText,
 	toTip,
 	type TipSpec,
@@ -286,29 +288,34 @@ describe('the controller: keyboard', () => {
 		expect(log).toEqual(['show a A focus', 'hide']);
 	});
 
-	test('Escape hides it and, for a focused control, is not passed on', () => {
+	test('Escape hides it and keeps it away from that control until focus has gone', () => {
 		const { ctl, log, advance } = rig();
 		ctl.set('a', { text: 'A' });
 		ctl.focus('a', true);
 		advance(0);
-		expect(ctl.escape()).toEqual({ hidden: true, consume: true });
+		expect(ctl.escape()).toBe(true);
 		expect(log).toEqual(['show a A focus', 'hide']);
 		ctl.focus('a', true);
 		advance(1000);
 		expect(log).toEqual(['show a A focus', 'hide']);
+		ctl.blur('a');
+		ctl.focus('a', true);
+		advance(0);
+		expect(log.at(-1)).toBe('show a A focus');
 	});
 
-	test('Escape over a tip only the pointer holds up goes on to whatever wanted it', () => {
-		const { ctl, advance } = rig();
+	test('Escape over a tip only the pointer holds up hides it too', () => {
+		const { ctl, log, advance } = rig();
 		ctl.set('a', { text: 'A' });
 		ctl.enter('a');
 		advance(SHOW_DELAY);
-		expect(ctl.escape()).toEqual({ hidden: true, consume: false });
+		expect(ctl.escape()).toBe(true);
+		expect(log).toEqual(['show a A pointer', 'hide']);
 	});
 
 	test('Escape with no tip up is nothing', () => {
 		const { ctl } = rig();
-		expect(ctl.escape()).toEqual({ hidden: false, consume: false });
+		expect(ctl.escape()).toBe(false);
 	});
 
 	test('leaving with the pointer does not take down a tip the keyboard is holding', () => {
@@ -329,5 +336,37 @@ describe('the controller: keyboard', () => {
 		advance(SHOW_DELAY);
 		ctl.dismissAll();
 		expect(log).toEqual(['show a A pointer', 'hide']);
+	});
+});
+
+describe('what a tip is described as', () => {
+	test('the whole tip when it says more than the name', () => {
+		expect(describeTarget('Export', { text: 'Export the cut as a file', keys: 'Ctrl+E' })).toBe('tip');
+		expect(describeTarget('', { text: 'Razor' })).toBe('tip');
+	});
+	test('only its detail when the name is the tip’s text — said once, not twice', () => {
+		expect(describeTarget('Settings', { text: 'Settings', keys: 'Ctrl+,', detail: 'Performance, appearance and keyboard shortcuts' })).toBe('detail');
+		expect(describeTarget('settings ', { text: 'Settings', detail: 'x' })).toBe('detail');
+		// an IconBtn's aria-label is the tip's words with the key
+		expect(describeTarget('Undo (Ctrl+Z)', { text: 'Undo', keys: 'Ctrl+Z' })).toBe('none');
+	});
+	test('a name the tip gave is the tip’s text, so nothing is added unless there is a detail', () => {
+		expect(describeTarget('Close', { text: 'Close' }, true)).toBe('none');
+		expect(describeTarget('Remove (x)', { text: 'Remove', detail: 'Cannot be undone' }, true)).toBe('detail');
+	});
+});
+
+describe('which focus raises a tip', () => {
+	test('a button, a link, a checkbox and a slider do', () => {
+		expect(raisesFocusTip({ tag: 'BUTTON' })).toBe(true);
+		expect(raisesFocusTip({ tag: 'A' })).toBe(true);
+		expect(raisesFocusTip({ tag: 'INPUT', type: 'checkbox' })).toBe(true);
+		expect(raisesFocusTip({ tag: 'INPUT', type: 'range' })).toBe(true);
+		expect(raisesFocusTip({ tag: 'SELECT' })).toBe(true);
+	});
+	test('a field you type in does not: it always matches :focus-visible and the tip would cover the next one', () => {
+		for (const type of ['text', 'search', 'number', 'password', 'email', '']) expect(raisesFocusTip({ tag: 'INPUT', type }), type).toBe(false);
+		expect(raisesFocusTip({ tag: 'TEXTAREA' })).toBe(false);
+		expect(raisesFocusTip({ tag: 'DIV', editable: true })).toBe(false);
 	});
 });

@@ -376,7 +376,7 @@
 						</span>
 					{:else}
 						<span style="display:inline-flex;gap:2px">
-							<IconBtn title="Write a voiceover…\nSpeak a script onto the timeline." size={30} onclick={() => ui.openVoiceover()}
+							<IconBtn title={{ text: 'Write a voiceover…', detail: 'Speak a script onto the timeline.' }} size={30} onclick={() => ui.openVoiceover()}
 								><Icon n="mic" s={14} /></IconBtn
 							>
 							<IconBtn title="Import" size={30} onclick={onImport}><Icon n="plus" s={14} /></IconBtn>

@@ -125,8 +125,19 @@ describe('a chip that is on or off says which', () => {
 		const groups = [...settings.matchAll(/role="radiogroup"[^>]*>/g)].map((m) => m[0]);
 		expect(groups.length).toBe(2);
 		for (const g of groups) expect(g).toContain('use:roving');
-		for (const radio of settings.matchAll(/role="radio"[\s\S]*?aria-checked=\{[^}]*\}\s*tabindex=\{[^}]*\? 0 : -1\}/g)) expect(radio[0]).toBeTruthy();
-		expect(settings.match(/role="radio"/g)?.length).toBe(settings.match(/\? 0 : -1\}/g)?.length);
+		expect(settings.match(/role="radio"/g)?.length).toBe(2);
+		// the tab stop is `tabStop()`'s pick — the chosen chip if it can take focus, else the first that can
+		expect(settings).toContain('tabindex={PROXY_SIZES.indexOf(p) === proxyStop ? 0 : -1}');
+		expect(settings).toContain('tabindex={PREVIEW_SOURCES.indexOf(p) === sourceStop ? 0 : -1}');
+		expect(settings).toContain('enabled: !(settings.proxySize === 0 && p.source !== \'original\')');
+	});
+
+	test('proxy size only moves focus on an arrow: choosing one rebuilds every proxy', () => {
+		const settings = read(`${EDITOR}SettingsDialog.svelte`);
+		expect(settings).toMatch(/aria-label="Proxy size" use:roving=\{\{ follow: false \}\}/);
+		expect(settings).toMatch(/aria-label="Preview source" use:roving /);
+		const roving = read('lib/roving.ts');
+		expect(roving).toContain('if (follow) radios[to].click();');
 	});
 });
 

@@ -52,9 +52,11 @@ export function versionLine(current: string, update: { version: string; date?: s
 	return `${now} → ${update.version}${date ? ` · ${date}` : ''}`;
 }
 
-/** What the dialog says when there is nothing to install, and while a download runs. */
+/** What the dialog says when there is nothing to install, and while a download runs. The download
+ *  is not something to walk away from — on Windows the installer takes the app down when it is
+ *  done — so the dialog holds still and says so, instead of claiming to work "in the background". */
 export const CURRENT_LINE = "You're on the latest version.";
-export const DOWNLOADING_NOTE = 'Downloading in the background.';
+export const DOWNLOADING_NOTE = 'Downloading the update. Kerf may close when it is done.';
 
 /** The fallback offered under a failed install. Only the AppImage build updates in place, so
  *  only on Linux is there a build that cannot — elsewhere the error says all there is to say. */

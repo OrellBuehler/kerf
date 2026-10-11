@@ -9,6 +9,8 @@
 export interface NavRow {
 	focusable: boolean;
 	label: string;
+	/** Can be run (default: yes). A disabled row still takes focus, but is not where a menu starts. */
+	enabled?: boolean;
 }
 
 /** The rows that can take focus. */
@@ -29,6 +31,13 @@ export function stepRow(rows: readonly NavRow[], at: number, by: 1 | -1): number
 /** The first row that can take focus, or -1. */
 export function firstRow(rows: readonly NavRow[]): number {
 	return focusableRows(rows)[0] ?? -1;
+}
+
+/** Where a menu opened from the keyboard starts: the first row that can be *run*, else the first that
+ *  can take focus, or -1. */
+export function startRow(rows: readonly NavRow[]): number {
+	const idx = focusableRows(rows);
+	return idx.find((i) => rows[i].enabled !== false) ?? idx[0] ?? -1;
 }
 
 /** The last row that can take focus, or -1. */
@@ -130,4 +139,13 @@ export function radioKey(e: KeyLike): MenuKey | null {
 			return { do: 'last' };
 	}
 	return null;
+}
+
+/** Which radio button holds the group's one tab stop: the chosen one, when it can take focus; else the
+ *  first that can. (Preview source disables every option but "Always original" while proxies are off,
+ *  and the chosen one may be a disabled other — a tab stop on a disabled chip is no tab stop at all.)
+ *  -1 when none can. */
+export function tabStop(radios: readonly { checked: boolean; enabled: boolean }[]): number {
+	const chosen = radios.findIndex((r) => r.checked && r.enabled);
+	return chosen >= 0 ? chosen : radios.findIndex((r) => r.enabled);
 }

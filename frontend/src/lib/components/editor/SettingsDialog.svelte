@@ -19,6 +19,7 @@
 	import { PREVIEW_SOURCES, PROXY_SIZES } from '$lib/proxy-info';
 	import { approxMB, isVoiceoverCancelled, loadPrefs, stageLabel } from '$lib/voiceover';
 	import { roving } from '$lib/roving';
+	import { tabStop } from '$lib/menu-nav';
 	import type { VoiceoverProgress, VoiceoverStatus } from '$lib/types';
 	import { tip } from '$lib/tip';
 
@@ -47,6 +48,18 @@
 	const spare = $derived(Math.max(0, cores - threads));
 
 	const themePreset = $derived(settings.themePreset);
+
+	// Each radio group has one tab stop: the chosen chip, or — while proxies are off and every source but
+	// "Always original" is disabled — the first one that can take focus.
+	const proxyStop = $derived(tabStop(PROXY_SIZES.map((p) => ({ checked: settings.proxySize === p.size, enabled: true }))));
+	const sourceStop = $derived(
+		tabStop(
+			PREVIEW_SOURCES.map((p) => ({
+				checked: settings.previewSource === p.source,
+				enabled: !(settings.proxySize === 0 && p.source !== 'original')
+			}))
+		)
+	);
 
 	// What the GPU preview is doing on this machine; read when its section opens.
 	const gpuStatus = $derived(gpuPreview.status);
@@ -335,12 +348,12 @@
 					Kerf makes a lightweight copy of each video so scrubbing stays smooth, even with 4K or 5K footage.
 					Exports always use your original files.
 				</p>
-				<div role="radiogroup" aria-label="Proxy size" use:roving style="display:flex;flex-wrap:wrap;gap:6px">
+				<div role="radiogroup" aria-label="Proxy size" use:roving={{ follow: false }} style="display:flex;flex-wrap:wrap;gap:6px">
 					{#each PROXY_SIZES as p (p.size)}
 						<button
 							role="radio"
 							aria-checked={settings.proxySize === p.size}
-							tabindex={settings.proxySize === p.size ? 0 : -1}
+							tabindex={PROXY_SIZES.indexOf(p) === proxyStop ? 0 : -1}
 							data-testid="proxy-size-{p.size}"
 							use:tip={p.hint}
 							onclick={() => settings.setProxySize(p.size)}
@@ -363,7 +376,7 @@
 						<button
 							role="radio"
 							aria-checked={settings.previewSource === p.source}
-							tabindex={settings.previewSource === p.source ? 0 : -1}
+							tabindex={PREVIEW_SOURCES.indexOf(p) === sourceStop ? 0 : -1}
 							data-testid="preview-source-{p.source}"
 							use:tip={p.hint}
 							disabled={settings.proxySize === 0 && p.source !== 'original'}
