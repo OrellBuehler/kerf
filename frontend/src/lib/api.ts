@@ -32,6 +32,7 @@ import type {
 	ExportOptions,
 	ExportProgress,
 	Filmstrip,
+	GpuPreviewDiagnostics,
 	GpuPreviewStatus,
 	ImportProgress,
 	Easing,
@@ -45,6 +46,7 @@ import type {
 	MusicFitted,
 	PreviewBoundsReport,
 	PreviewFrameResult,
+	PreviewOrder,
 	Projection,
 	Reframe,
 	ReframeKeyframe,
@@ -3001,10 +3003,18 @@ export async function getTimelineFrame(timeSecs: number, maxWidth = 960): Promis
  * native surface when the GPU preview is on and draws it exactly, else FFmpeg's JPEG (the
  * same one {@link getTimelineFrame} returns), in the same call, with the reasons. `overlays`
  * says the page has something to draw over the picture (a title box, the trim monitor,
- * safe-area guides), which a surface above the page cannot show. In the browser harness
- * there is no backend: the answer is "FFmpeg, no frame", as `getTimelineFrame` is `null`.
+ * safe-area guides), which a surface above the page cannot show. `order` says which request
+ * of which pump this is (`PreviewOrder`): the calls are separate tasks over the IPC and can
+ * arrive reversed, and the backend answers `superseded` to one that arrives after a newer one
+ * of the same `client` instead of drawing it last. In the browser harness there is no backend:
+ * the answer is "FFmpeg, no frame", as `getTimelineFrame` is `null`, and `order` is unused.
  */
-export async function getPreviewFrame(timeSecs: number, maxWidth = 960, overlays = false): Promise<PreviewFrameResult> {
+export async function getPreviewFrame(
+	timeSecs: number,
+	maxWidth = 960,
+	overlays = false,
+	order?: PreviewOrder
+): Promise<PreviewFrameResult> {
 	if (!inTauri()) {
 		// `?gpusurface=1` pretends a surface under a transparent webview drew the frame, so the
 		// page's side of it (the hole in the pane, nothing painted over the surface) can be looked
@@ -3019,7 +3029,13 @@ export async function getPreviewFrame(timeSecs: number, maxWidth = 960, overlays
 		}
 		return { renderer: 'ffmpeg', frame: null, reasons: ['the browser harness has no GPU'], timings: null };
 	}
-	return invoke<PreviewFrameResult>('get_preview_frame', { timeSecs, maxWidth, overlays });
+	return invoke<PreviewFrameResult>('get_preview_frame', {
+		timeSecs,
+		maxWidth,
+		overlays,
+		client: order?.client,
+		seq: order?.seq
+	});
 }
 
 /** The browser harness was opened with `?gpusurface=1`. */
@@ -3064,6 +3080,13 @@ export async function gpuPreviewStatus(): Promise<GpuPreviewStatus> {
 		};
 	}
 	return invoke<GpuPreviewStatus>('gpu_preview_status');
+}
+
+/** What this session's GPU preview frames did, and why the others went through FFmpeg. Local
+ *  and in memory; there is none in the browser harness. */
+export async function gpuPreviewDiagnostics(): Promise<GpuPreviewDiagnostics | null> {
+	if (!inTauri()) return null;
+	return invoke<GpuPreviewDiagnostics>('gpu_preview_diagnostics');
 }
 
 export async function getWaveform(assetId: string, buckets: number): Promise<number[]> {

@@ -357,6 +357,7 @@ mod tests {
     /// destroyed to rehearse a loss. Needs an X server (WSLg, Xvfb) and an adapter (lavapipe).
     #[test]
     #[ignore = "needs an X server and a Vulkan adapter (lavapipe is enough)"]
+    #[allow(clippy::print_stderr)]
     fn a_frame_presented_to_the_child_window_is_what_the_x_server_holds() {
         let display = display().expect("an X display (is DISPLAY set?)");
         let (conn, screen) = connect(display.name()).expect("connect to the X server");
@@ -411,27 +412,50 @@ mod tests {
         presenter.present(&frame, whole, Surround::whole([0, 0, 0])).expect("present");
 
         // Let the server have the image, then read the child back from it.
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        let image = conn
-            .get_image(ImageFormat::Z_PIXMAP, child.id, 0, 0, 64, 48, !0)
-            .unwrap()
-            .reply()
-            .expect("read the child window");
-        let got = RgbaFrame {
-            width: 64,
-            height: 48,
-            // The server's pixels are BGRX.
-            data: image
-                .data
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .flat_map(|p| [p[2], p[1], p[0], 255])
-                .collect(),
+        let read_child = || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let image = conn
+                .get_image(ImageFormat::Z_PIXMAP, child.id, 0, 0, 64, 48, !0)
+                .unwrap()
+                .reply()
+                .expect("read the child window");
+            RgbaFrame {
+                width: 64,
+                height: 48,
+                // The server's pixels are BGRX.
+                data: image
+                    .data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .flat_map(|p| [p[2], p[1], p[0], 255])
+                    .collect(),
+            }
         };
-        for (x, y) in [(5, 5), (60, 5), (5, 40), (60, 40), (31, 23), (32, 24)] {
+        let corners = [(5, 5), (60, 5), (5, 40), (60, 40), (31, 23), (32, 24)];
+        let got = read_child();
+        for (x, y) in corners {
             assert_eq!(pixel(&got, x, y), pixel(&sent, x, y), "pixel ({x}, {y}) of the child window");
         }
+
+        // A drag presents without waiting for a refresh where the surface can, and the frame still
+        // reaches the server; a surface that cannot stays on vsync.
+        let can_skip = presenter.can_skip_vsync();
+        assert_eq!(presenter.skip_vsync(true).expect("no vsync"), can_skip);
+        assert_eq!(presenter.skipping_vsync(), can_skip);
+        presenter
+            .present(&frame, whole, Surround::whole([0, 0, 0]))
+            .expect("present without vsync");
+        let got = read_child();
+        for (x, y) in corners {
+            assert_eq!(pixel(&got, x, y), pixel(&sent, x, y), "pixel ({x}, {y}) without vsync");
+        }
+        assert_eq!(presenter.skip_vsync(false).expect("vsync again"), can_skip);
+        assert!(!presenter.skipping_vsync());
+        presenter
+            .present(&frame, whole, Surround::whole([0, 0, 0]))
+            .expect("present on vsync");
+        eprintln!("surface can present without vsync: {can_skip}");
 
         // Moved and hidden like the page asks.
         child.place(0, 0, 32, 24).expect("move it");

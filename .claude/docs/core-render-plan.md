@@ -281,7 +281,9 @@
   HDR, a text overlay it cannot reproduce (below), a fade or transition in progress, a non-bicubic scaler, a
   layer with no known picture size, a shrink steeper than `MAX_SHRINK` (40:1, the
   steepest the scaler comparison measures), and the classes below. Pure + unit-tested
-  like the rest of the timeline math.
+  like the rest of the timeline math. **`Unsupported::kind()`** names a refusal without its layer
+  names and numbers (`mask`, `mixed_matrices`, `text_too_small`, …; an exhaustive `match`, so a new
+  variant must choose one): the key the GPU preview counts refusals by (`app.md`).
   - **Text** (`caps.text`, which `kerf-gpu`'s compositor sets: FFmpeg rasterises `drawtext`, the compositor blends it —
     `gpu.md`). The font is **always a file the plan can name**: `fonts::resolve_text_font` (the installed family the overlay
     names, else the shipped Geist, `Regular` or `Bold`, written to `<cache>/kerf/fonts/`, checked on each call) is called by the graph
@@ -372,3 +374,23 @@
   What only the decode or the compositor can see is refused there instead
   (`GpuError::Unsupported`): a picture that decodes at another size than probed, an
   alpha channel found in the pixels of an asset that never recorded its format.
+- `plan_epoch.rs` — **has anything a plan is made from changed?** A process-wide counter
+  (`plan_epoch()`) that moves for every row a `Project` connection inserts, updates or deletes one by one (an
+  `update_hook`, installed in `Project::init`; the `analysis`, `history` and `tasks` tables are
+  skipped, they are written all the time by background work and no plan reads them). **The hook does not
+  see a `DELETE` without a `WHERE`** (SQLite empties the table instead of visiting its rows): `clear_staged`
+  says `WHERE 1`, and any new statement that clears a table must too. Nor does it see the row an
+  `INSERT OR REPLACE` replaces, only the insert. The counter also moves whenever a
+  project is opened or created, and **after** one replaces another (`Project::replace_with`, which every
+  place that swaps the shared project uses, under its lock: a frame that took its inputs from the old
+  project after the new one was opened would otherwise stay fresh), when a preview proxy lands (`finalize_proxy`, after the rename) or is
+  deleted (`remove_proxy_files`) and when the proxy size or the preview source changes. A holder of a
+  frame's inputs (the GPU preview's snapshot, `app.md`) reads it **under the project lock, before it
+  reads the project**, and keeps the inputs while the counter is the same: a bump that changed
+  nothing costs one rebuild, a change that does not bump is the thing it must not allow (so the rule is
+  "everything but what is known to be irrelevant"). It cannot see a proxy file deleted by hand, which is
+  why the snapshot is also dropped after 2 s. `Project::preview_assets_of(assets)` resolves the
+  proxy-swapped assets from assets already read (it touches the disk, so off the lock), and
+  `Project::proxy_waits_in(timeline, source, from, to, input)` is `proxy_waits` over a timeline and
+  proxy inputs in hand, so Proxy only can refuse a frame without the lock (`proxy_waits` is the same
+  function over the live project; a test holds the two equal).

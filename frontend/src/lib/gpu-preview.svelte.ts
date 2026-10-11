@@ -31,6 +31,7 @@ class GpuPreviewStore {
 
 	/** Record what `getPreviewFrame` answered. */
 	note(result: PreviewFrameResult) {
+		if (result.renderer === 'superseded') return;
 		const before = this.renderer;
 		this.renderer = result.renderer;
 		this.reasons = result.reasons;

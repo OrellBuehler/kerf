@@ -260,29 +260,35 @@ fn a_prefetch_returns_nothing_for_every_layer() {
 #[test]
 #[ignore = "needs ffmpeg"]
 fn dropping_the_source_kills_a_prefetched_run() {
-    let a = proxy("pf-a.mp4", 6);
-    let before = ffmpeg_children();
+    let a = copy_of(&proxy("pf-a.mp4", 6), "pf-drop.mp4");
+    assert_eq!(ffmpeg_children_reading("pf-drop.mp4"), 0);
     {
         let src = source();
         src.frame(&at(&a, 1.0), Hint::Prefetch).unwrap();
         wait_for("its run", || src.stats().runs == 1);
-        wait_for("its process", || ffmpeg_children() > before);
+        wait_for("its process", || ffmpeg_children_reading("pf-drop.mp4") > 0);
     }
-    wait_for("the run's process to be gone", || ffmpeg_children() <= before);
+    wait_for("the run's process to be gone", || ffmpeg_children_reading("pf-drop.mp4") == 0);
 }
 
-/// Processes named after the ffmpeg this suite runs that are children of this one (Linux `/proc`).
-fn ffmpeg_children() -> usize {
+/// Processes named after the ffmpeg this suite runs that are children of this one and read `file`
+/// (Linux `/proc`): the other tests of the binary have children of their own, which come and go.
+fn ffmpeg_children_reading(file: &str) -> usize {
     let me = std::process::id().to_string();
     let Ok(procs) = std::fs::read_dir("/proc") else { return 0 };
     procs
         .flatten()
-        .filter_map(|e| std::fs::read_to_string(e.path().join("stat")).ok())
-        .filter(|stat| {
+        .filter(|e| {
+            let Ok(stat) = std::fs::read_to_string(e.path().join("stat")) else {
+                return false;
+            };
             let after_name = stat.rsplit_once(')').map_or("", |(_, rest)| rest);
             let mut fields = after_name.split_whitespace();
             let (state, ppid) = (fields.next().unwrap_or(""), fields.next().unwrap_or(""));
-            stat.contains("(ffmpeg") && ppid == me && state != "Z"
+            stat.contains("(ffmpeg")
+                && ppid == me
+                && state != "Z"
+                && std::fs::read(e.path().join("cmdline")).is_ok_and(|c| String::from_utf8_lossy(&c).contains(file))
         })
         .count()
 }
