@@ -4,6 +4,7 @@
 	// from the timeline. Empty, it says which of the five reasons applies.
 	import Icon from './Icon.svelte';
 	import Btn from './Btn.svelte';
+	import IconBtn from './IconBtn.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { editor } from '$lib/state.svelte';
@@ -157,12 +158,13 @@
 						>
 					</button>
 					{#if l.clip}
-						<button
+						<IconBtn
+							size={24}
+							data-tone="quiet"
 							title="Cut this line out of the timeline"
 							aria-label="Cut line"
 							onclick={() => void cutLine(l)}
-							style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center;padding:1px 0 0"
-							><Icon n="x" s={11} /></button
+							style="margin:-4px 0"><Icon n="x" s={12} /></IconBtn
 						>
 					{/if}
 				</div>
