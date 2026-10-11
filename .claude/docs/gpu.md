@@ -215,6 +215,23 @@ timestamp on a coarse time base can hide a late landing of exactly one rounded t
   (`FrameCache::conflicts_with`; the cache refuses and counts it, never a panic) ends the run and
   marks the file, so a file whose runs always die is not spawned and killed once a request.
 
+**`Hint::Prefetch`** is a request for a frame that will be wanted soon (the first of the clip a cut is about
+to bring): it returns `Ok(None)` for every layer, **waits for nothing and draws nothing**, and has a run
+waiting at the frame when it can. It opens the file's two probes (container, seek points: 50 ms between
+them, once a file), does nothing when the cache or a run already covers the frame, takes only a **spare**
+slot (the router's `Intent::Prefetch`: never stops a run anyone may be reading; at the file's cap of 3 or
+the process's 6 it is a `Skip`), and leaves a file the runs are not proved equal for alone (no one-shot
+decode for a frame nobody asked for). A still image is decoded once and cached. The run reads to the frame and
+parks (`want` = the target), is idle to the router from then on and ages out like any run. Counted in
+`SourceStats::prefetched`. `render_plan_with` / `_texture_with` refuse it (`Unsupported`): it returns no
+frames to draw. `kerf-app` drives it past the playhead (`app.md`, "GPU preview").
+`tests/prefetch.rs` (`#[ignore]`d, real ffmpeg): the run is waiting and the request that follows starts
+nothing, a covered or heading-for frame starts nothing, the file's cap is respected, an unproven container
+is left alone, dropping the source kills the prefetched run; with `KERF_BENCH=1` the first frame past a cut
+with and without a prefetch (1280x720 all-intra, a loaded 4-core box, debug build: a clip never read before
+145 to 183 ms on 9.0.2 and 321 to 361 on 6.1.1, 33 to 38 and 73 to 93 once its probes are done, 0.2 ms with a
+prefetch; `docs/review-2026-10-10/after/perf-4`).
+
 The checks: the parity harness decodes every compared case both ways and asserts equal planes
 (FFmpeg 6.1.1 and 9.0.2) and `rendering_through_the_frame_source_is_the_picture_the_one_shot_decodes_give`
 asserts the **rendered** RGBA of `render_plan_with` equals `render_plan`'s, bit for bit, on five

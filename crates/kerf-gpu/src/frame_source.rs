@@ -81,6 +81,14 @@ pub enum Hint {
     Scrub,
     /// Playback at `fps`: frame after frame, read ahead.
     Forward { fps: f64 },
+    /// The frame will be wanted soon (the first of the next clip, past a cut): have a run
+    /// waiting for it. **Draws nothing and waits for nothing**: a call is `Ok(None)` per layer
+    /// whatever became of the frame. It only ever uses a spare slot (never stops a run anyone
+    /// may be reading), does nothing for a frame the cache or a run already covers, and opens the
+    /// file's two probes (its container, its seek points: 50 ms between them, once a file) so the
+    /// request that follows pays for neither. Not a hint a compositor can render with: asking
+    /// for a frame with it is `Unsupported`.
+    Prefetch,
 }
 
 impl Hint {
@@ -89,6 +97,7 @@ impl Hint {
             Hint::Exact => Intent::Exact,
             Hint::Scrub => Intent::Scrub,
             Hint::Forward { .. } => Intent::Forward,
+            Hint::Prefetch => Intent::Prefetch,
         }
     }
 }
@@ -147,6 +156,8 @@ pub struct SourceStats {
     pub oneshots: u64,
     /// Requests that gave up on runs and decoded one-shot after repeated misses.
     pub fallbacks: u64,
+    /// Runs started by a [`Hint::Prefetch`] (they are in `spawned` too).
+    pub prefetched: u64,
     /// Files decoded one-shot because a run found something no run could be proved equal to it
     /// on (see `run_reader`).
     pub distrusted: usize,
@@ -576,6 +587,9 @@ impl FrameSource {
                 layer.path, layer.pick
             )));
         };
+        if hint == Hint::Prefetch {
+            return self.prefetch(layer, t).map(|()| None);
+        }
         // A disabled path, and an asset that never recorded its pixel format (whose alpha only
         // A0's second decode can rule out), decode one-shot.
         if !path_enabled() || layer.stream.pix_fmt.is_none() {
@@ -768,6 +782,79 @@ impl FrameSource {
             st = back;
             set_waiting(&mut st, mine, -1);
         }
+    }
+
+    /// [`Hint::Prefetch`] for one layer at `t`: have a run waiting at its frame, if a run can be
+    /// had for it. Nothing here waits for a frame or decodes one on its own; the probes it runs
+    /// (container, seek points) are the ones the request that follows would run, cached, so it
+    /// belongs on a thread that may block for them, never under a lock.
+    ///
+    /// A file the runs cannot be proved equal to the one-shot for (the probes say, or a run found
+    /// out) is left alone: a one-shot decode is not worth doing for a frame nobody asked for yet. A
+    /// still image is decoded and cached (it is one cheap decode, and the frame is the file).
+    fn prefetch(&self, layer: &PlanLayer, t: f64) -> Result<(), GpuError> {
+        let Some(fmt) = layer.stream.pix_fmt.as_deref() else {
+            return Ok(());
+        };
+        if !path_enabled() || kerf_core::model::pix_fmt_layout(fmt).is_none() {
+            return Ok(());
+        }
+        let source = SourceId::of(Path::new(&layer.path));
+        if layer.is_image {
+            // A failed decode is the request's to report, if there is one.
+            let _ = self.image(layer, source);
+            return Ok(());
+        }
+        if unproven_for_runs(Path::new(&layer.path)).is_some() {
+            return Ok(());
+        }
+        let frame_bytes = yuv420p_len(layer.stream.width, layer.stream.height).unwrap_or(0);
+        let mut st = self.shared.lock();
+        if st.closed || st.distrusted.contains_key(&source) {
+            return Ok(());
+        }
+        let info = st.files.get(&source).copied();
+        let target = info.map(|i| seek_ticks(t, i.time_base));
+        if let Some(target) = target {
+            if !matches!(st.cache.at_or_after(source, target), Lookup::Miss) {
+                return Ok(());
+            }
+        }
+        // A run already on its way to the frame, or one starting before the time base is known
+        // (whatever it reads first is what the request would have started for).
+        let heading = st.runs.iter().any(|r| {
+            r.file == source
+                && r.alive()
+                && match target {
+                    Some(tg) => r.head <= tg && r.want >= tg,
+                    None => r.life == Life::Starting,
+                }
+        });
+        if heading {
+            return Ok(());
+        }
+        let req = Request {
+            file: source,
+            target: target.unwrap_or(0),
+            frame_ticks: info.map_or(1, |i| i.frame_ticks),
+            proxy: layer.source.proxy,
+            intent: Intent::Prefetch,
+            frame_bytes,
+            cache_cap: self.shared.config.cache_bytes,
+        };
+        if !matches!(route(&run_states(&st), &req), Route::Start { evict: None, lead: 0 }) {
+            return Ok(());
+        }
+        st.stats.prefetched += 1;
+        let (mut st, spawned) = self.spawn(st, layer, source, t, None, info, target);
+        if let Ok(id) = spawned {
+            // The run reads to the frame and parks there; `spawn` counted this call as its first
+            // waiter and `attach` gave that back, so it is idle to the router from here on.
+            want_ahead(&mut st, Some(id), target, 0);
+        }
+        drop(st);
+        self.shared.changed.notify_all();
+        Ok(())
     }
 
     /// Start a run of `layer`'s file at `seek` seconds and register it. `info` is the file's
@@ -1615,5 +1702,18 @@ mod tests {
         assert_eq!(read_ahead(fwd, &cfg, 3840 * 2160 * 3 / 2, 100), 400);
         assert_eq!(read_ahead(Hint::Scrub, &cfg, 1280 * 720 * 3 / 2, 100), 0);
         assert_eq!(read_ahead(Hint::Exact, &cfg, 1280 * 720 * 3 / 2, 100), 0);
+        assert_eq!(
+            read_ahead(Hint::Prefetch, &cfg, 1280 * 720 * 3 / 2, 100),
+            0,
+            "it reads to the frame and parks"
+        );
+    }
+
+    #[test]
+    fn every_hint_is_the_routers_intent_of_the_same_name() {
+        assert_eq!(Hint::Exact.intent(), Intent::Exact);
+        assert_eq!(Hint::Scrub.intent(), Intent::Scrub);
+        assert_eq!(Hint::Forward { fps: 24.0 }.intent(), Intent::Forward);
+        assert_eq!(Hint::Prefetch.intent(), Intent::Prefetch);
     }
 }
