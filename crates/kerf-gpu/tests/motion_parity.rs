@@ -1582,6 +1582,10 @@ fn a_translucent_layer_dissolves_and_is_refused_its_fades_to_black() {
 /// trip of a dip was not measured on, what FFmpeg 9 fades before converting its range, a BT.709 tag.
 struct Variants {
     tenbit: Asset,
+    /// 10-bit tagged full range (`-color_range pc`): ffprobe names it `yuv420p10le`, like the limited
+    /// one, and [`StreamInfo`](kerf_core::StreamInfo) does not record the tag, so nothing in a plan
+    /// tells the two apart.
+    tenbit_pc: Asset,
     yuv444: Asset,
     yuv422: Asset,
     gray: Asset,
@@ -1592,6 +1596,18 @@ struct Variants {
     jpeg: Asset,
     bars709: Asset,
     testsrc709: Asset,
+}
+
+/// The file's range tag as ffprobe reads it (`pc`, `tv`, or empty when untagged).
+fn color_range_tag(path: &Path) -> String {
+    let probe = std::env::var("KERF_FFPROBE").unwrap_or_else(|_| "ffprobe".to_string());
+    let out = Command::new(probe)
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=color_range"])
+        .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(path)
+        .output()
+        .expect("run ffprobe");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn variants() -> &'static Variants {
@@ -1613,6 +1629,32 @@ fn variants() -> &'static Variants {
         let still = ["-frames:v", "1"];
         Variants {
             tenbit: make("tenbit.mp4", ts, "yuv420p10le", &x264),
+            tenbit_pc: {
+                let pc = [
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-qp",
+                    "0",
+                    "-g",
+                    "10",
+                    "-color_range",
+                    "pc",
+                ];
+                let a = make("tenbit_pc.mp4", ts, "yuv420p10le", &pc);
+                assert_eq!(
+                    a.streams[0].pix_fmt.as_deref(),
+                    Some("yuv420p10le"),
+                    "it probes as an ordinary 10-bit picture"
+                );
+                assert_eq!(
+                    color_range_tag(Path::new(&a.path)),
+                    "pc",
+                    "and it really is tagged full range"
+                );
+                a
+            },
             yuv444: make("yuv444.mkv", ts, "yuv444p", &["-c:v", "ffv1"]),
             yuv422: make("yuv422.mkv", ts, "yuv422p", &["-c:v", "ffv1"]),
             gray: make("gray.mkv", ts, "gray", &["-c:v", "ffv1"]),
@@ -1751,18 +1793,30 @@ fn a_dip_to_white_is_drawn_only_where_its_round_trip_was_measured() {
         ("4:2:2", &v.yuv422),
         ("gray", &v.gray),
     ] {
+        // A 10-bit picture is maybe full range where FFmpeg 9 works on raw values (its tag is not recorded):
+        // the cut is refused whole there, whatever the dip.
+        let negotiated = name == "10-bit" && policy() != CompositeColorPolicy::FixedBt601;
         let (tl, assets) = after_black(a, white, 0.8, 1.0, None);
-        run_refusing(
-            &format!("dip/white {name}"),
-            &tl,
-            &assets,
-            30.0,
-            2.0,
-            EXACT,
-            &dip_refused(DipWhy::Format),
-        );
+        let refused_for = if negotiated {
+            full_range_cut_refused()
+        } else {
+            dip_refused(DipWhy::Format)
+        };
+        run_refusing(&format!("dip/white {name}"), &tl, &assets, 30.0, 2.0, EXACT, &refused_for);
         let (tl, assets) = after_black(a, black, 0.8, 1.0, None);
-        run(&format!("dip/black {name}"), &tl, &assets, 30.0, 2.0, EXACT);
+        if negotiated {
+            run_refusing(
+                &format!("dip/black {name}"),
+                &tl,
+                &assets,
+                30.0,
+                2.0,
+                EXACT,
+                &full_range_cut_refused(),
+            );
+        } else {
+            run(&format!("dip/black {name}"), &tl, &assets, 30.0, 2.0, EXACT);
+        }
     }
 }
 
@@ -1850,6 +1904,34 @@ fn a_full_range_picture_is_drawn_as_the_ffmpeg_in_use_converts_its_range() {
         EXACT,
         &full_range_resized_refused(),
     );
+    // A 10-bit file tagged full range probes as `yuv420p10le`, like the limited one, and 9.0.2 handles it as it
+    // does `yuvj`: raw values kept, the export flagged full range, every other frame of the cut converted
+    // (measured Y 16 off). The plan cannot tell the two apart, so under FFmpeg 9 every deeper-than-8-bit
+    // picture counts as maybe full range, the limited one included; FFmpeg 6 draws both to the level.
+    let tenbit = &v.tenbit;
+    for (name, a) in [("pc-tagged 10-bit", &v.tenbit_pc), ("limited 10-bit", tenbit)] {
+        let tl = timeline(vec![vec![clip(&m.black, 0.5, 1.5, 0.0), clip(a, 0.5, 1.5, 1.0)]], None);
+        run_full_range(
+            &format!("full-range/black then {name}"),
+            &tl,
+            &[m.black.clone(), a.clone()],
+            30.0,
+            2.0,
+            EXACT,
+        );
+        let mut fading = clip(a, 0.5, 1.5, 0.0);
+        fading.fade_in = 0.5;
+        fading.fade_out = 0.5;
+        let tl = timeline(vec![vec![fading]], None);
+        run_full_range(
+            &format!("full-range/fade {name}"),
+            &tl,
+            std::slice::from_ref(a),
+            30.0,
+            1.0,
+            EXACT,
+        );
+    }
     // The cut is what FFmpeg 9 flags full range, not the frame: the limited-range frames of a cut that
     // holds a full-range clip somewhere read 16 levels off too (black Y 0 against 16, the test pattern
     // 76 against 81), before the clip, after it, and on another track. Every frame of these is refused

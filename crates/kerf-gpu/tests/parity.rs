@@ -376,6 +376,8 @@ struct Media {
     /// differs: 10-bit, 4:4:4, full-range JPEG, odd-sized, and a phone-style
     /// rotated one (a landscape frame plus a display matrix).
     tenbit: Asset,
+    /// The same 10-bit picture tagged full range: it probes as `yuv420p10le` too.
+    tenbit_pc: Asset,
     yuv444: Asset,
     fullrange: Asset,
     /// A JPEG still: full-range YUV in a file FFmpeg reads as an image.
@@ -503,6 +505,24 @@ fn media() -> &'static Media {
             "yuv420p10le",
             tenbit.to_str().unwrap(),
         ]);
+        let tenbit_pc = dir.join("tenbit_pc.mp4");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x360:rate=30:duration=2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-qp",
+            "0",
+            "-color_range",
+            "pc",
+            "-pix_fmt",
+            "yuv420p10le",
+            tenbit_pc.to_str().unwrap(),
+        ]);
         let yuv444 = ffv1("yuv444.mkv", "testsrc2=size=640x360:rate=30:duration=2", "yuv444p", &["ffv1"]);
         let fullrange = ffv1(
             "fullrange.mkv",
@@ -622,6 +642,7 @@ fn media() -> &'static Media {
             grey: probed(&grey),
             black: probed(&black),
             tenbit: probed(&tenbit),
+            tenbit_pc: probed(&tenbit_pc),
             yuv444: probed(&yuv444),
             fullrange: probed(&fullrange),
             jpeg: probed(&jpeg),
@@ -2106,8 +2127,18 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
 /// values (black 16) and converts the range afterwards (measured 17 levels in Y and 16 in UV off), so the
 /// plan refuses it. Under either, a picture the scaler *resizes* is refused while a fade runs on it
 /// (`resized`): swscale converts the range inside the resize (flat error 14 on a 1.5x enlargement
-/// on FFmpeg 6). The frames the plan does not refuse (the case lists some on purpose) are drawn.
-fn check_full_range(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], opts: &ExportOptions, resized: bool) {
+/// on FFmpeg 6). `negotiated` says whether FFmpeg 9 refuses the picture under a running fade at all (a `yuvj` or a
+/// deeper-than-8-bit one: its range is not told by its name). The frames the plan does not refuse (the case lists
+/// some on purpose) are drawn.
+fn check_full_range(
+    case: &str,
+    tl: &Timeline,
+    assets: &[Asset],
+    times: &[f64],
+    opts: &ExportOptions,
+    resized: bool,
+    negotiated: bool,
+) {
     let mut refused = 0;
     for &t in times {
         let plan = RenderPlan::at(tl, assets, opts, t, policy()).expect("plan");
@@ -2136,7 +2167,7 @@ fn check_full_range(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], 
             refused += 1;
         }
     }
-    let wanted = resized || policy() != CompositeColorPolicy::FixedBt601;
+    let wanted = resized || (negotiated && policy() != CompositeColorPolicy::FixedBt601);
     assert_eq!(refused > 0, wanted, "{case}: {refused} of {} frames refused", times.len());
 }
 
@@ -2256,13 +2287,15 @@ fn a_dip_to_white_is_drawn_where_its_round_trip_was_measured_and_refused_elsewhe
             0.2,
             Refusal::Plan("not 8-bit limited-range"),
         );
-        check_with(
+        // (a 10-bit picture is maybe full range under FFmpeg 9, so its dip to black is refused there)
+        check_full_range(
             &format!("dip-black/{name}"),
             &dip(a, black, &none, None),
             &one(a),
             &times,
-            STRICT,
             &opts,
+            false,
+            name == "10-bit",
         );
     }
     for (name, a) in [("full-range-mjpeg", &m.fullrange), ("full-range-jpeg-still", &m.jpeg)] {
@@ -2299,6 +2332,7 @@ fn a_full_range_picture_fades_as_the_ffmpeg_in_use_converts_its_range() {
             &[0.0, 0.1, 0.25, 1.1, 1.45],
             &opts,
             false,
+            true,
         );
         let mut dipped = clip(a, 0.0, 1.5, 1.0);
         dipped.transition_in = Some(Transition {
@@ -2313,6 +2347,7 @@ fn a_full_range_picture_fades_as_the_ffmpeg_in_use_converts_its_range() {
             &[0.8, 1.1, 1.25],
             &opts,
             resized,
+            true,
         );
         let mut dissolved = clip(a, 0.0, 1.5, 1.0);
         dissolved.transition_in = Some(Transition {
@@ -2327,6 +2362,7 @@ fn a_full_range_picture_fades_as_the_ffmpeg_in_use_converts_its_range() {
             &[1.1, 1.3],
             &opts,
             resized,
+            true,
         );
         // Not fading, the picture is drawn: the range is converted at the decode in a still.
         let tl = timeline(vec![vec![clip(a, 0.0, 1.5, 0.0)]], None);
@@ -2350,7 +2386,26 @@ fn a_full_range_picture_fades_as_the_ffmpeg_in_use_converts_its_range() {
         &[0.1, 0.25, 1.0],
         &opts,
         true,
+        true,
     );
+    // A 10-bit file tagged full range probes as `yuv420p10le` like the limited one and 9.0.2 fades its raw values
+    // (flat max 16 / 15 / 11 against a bound of 8): the name cannot tell the two apart, so under FFmpeg 9 every
+    // deeper-than-8-bit picture is refused inside a fade, the limited one included. FFmpeg 6 draws both.
+    for (name, a) in [("pc-tagged 10-bit", &m.tenbit_pc), ("limited 10-bit", &m.tenbit)] {
+        let mut fading = clip(a, 0.0, 1.5, 0.0);
+        fading.fade_in = 0.5;
+        fading.fade_out = 0.5;
+        let tl = timeline(vec![vec![fading]], None);
+        check_full_range(
+            &format!("full-range/fade-in-out {name}"),
+            &tl,
+            std::slice::from_ref(a),
+            &[0.0, 0.1, 0.25, 1.1, 1.45],
+            &opts,
+            false,
+            true,
+        );
+    }
 }
 
 /// Every kind of transition and a clip's own fades, in a still, strictly against FFmpeg's still:
