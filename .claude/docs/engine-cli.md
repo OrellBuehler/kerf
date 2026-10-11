@@ -122,8 +122,14 @@ so the feature is **only** activated through these forwards — which is what ma
   a frame there. A sheet from a `.lead` proxy prefixes `trim=start_frame=1` when it starts at 0.000
   (a later seek has skipped the clone), or the clone takes a slot and every cell shows its
   neighbour's frame. Both reads are bounded: `-progress pipe:2` is added at spawn time and
-  `output_unless_stalled` kills ffmpeg after `READ_STALL` (60 s) of stderr silence, so a hung proxy
-  read falls back to the original (a stalled original read is an error, not a short list of cuts).
+  `output_unless_stalled` kills ffmpeg after a stretch of stderr silence, so a hung proxy read
+  falls back to the original (a stalled original read is an error, not a short list of cuts).
+  ffmpeg reports **nothing until a frame has reached the output**, so the bound has to fit the
+  read: the scene pass selects frame 0 too (`eq(n,0)`, dropped again by `parse_scenes`, which
+  skips showinfo's `n:0`; never a cut) and reports every second from the start, 60 s
+  (`READ_STALL`) of silence being a wedge; a contact sheet's `tile` outputs only when the window
+  is decoded, so its bound is `sheet_stall` = 30 s per second of window, between 60 s and 2 h
+  (a 4:2:2 4K sheet is silent for the whole decode: 29 to 39 s measured).
   `salience_map` (smart crop, framing) stays on the original: its crop moved by up to 4.6 % of the
   frame width between original and proxy.
   **A proxy reports, can be abandoned, and cannot hang.** `generate_proxy_with(src, width,

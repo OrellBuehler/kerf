@@ -22,7 +22,10 @@
 //!   plane than the proxy's luma (0.5 and more, cuts lost): scene detection keeps reading the
 //!   original of these, and a transport stream is not read from its proxy either;
 //! * a contact sheet shows the same frame in every cell from the proxy as from the original,
-//!   from the start and from a seek, for an ordinary and a head-padded proxy.
+//!   from the start and from a seek, for an ordinary and a head-padded proxy, and from the
+//!   original when the proxy does not read;
+//! * a scene pass over a single take keeps reporting (frame 0 is let through), so the stall
+//!   bound does not kill a long take with no cut.
 //!
 //! `cargo test -p kerf-core --no-default-features -- --ignored scenes_on_proxy`
 //! (and again with `KERF_FFMPEG` / `KERF_FFPROBE` at the pinned build.)
@@ -547,6 +550,54 @@ fn scenes_on_proxy_rgb_sources_are_read_from_the_original_for_scores() {
             "{name}: the detector reads the original"
         );
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A pass with no cut in it must not look wedged: ffmpeg reports nothing until a frame has
+/// reached the output, so the scene pass lets frame 0 through (`eq(n,0)`, dropped again by
+/// `parse_scenes`) and the report runs from the first second. A read of a single take, slowed to
+/// real time, must not be killed by a stall bound far shorter than its length; the filter without
+/// that frame is the control, and is.
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+fn scenes_on_proxy_a_single_take_keeps_reporting_while_it_is_scanned() {
+    let dir = scratch("take");
+    let take = dir.join("take.mp4");
+    if !ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=s=640x360:r=30:d=10",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        path_str(&take),
+    ]) {
+        eprintln!("skipped: this ffmpeg cannot make the single take");
+        return;
+    }
+    let scan = |filter: &str| {
+        let mut cmd = command(&ffmpeg_bin());
+        cmd.args(PROGRESS_ON_STDERR)
+            .args(["-hide_banner", "-nostats", "-readrate", "1", "-i"])
+            .arg(&take)
+            .args(["-map", "0:v:0", "-vf", filter, "-f", "null", "-"]);
+        output_unless_stalled(cmd, std::time::Duration::from_secs(4)).expect("run ffmpeg")
+    };
+    let seen = scan(&scene_filter(0.4));
+    assert!(seen.succeeded(), "stalled: {}", seen.stderr_tail());
+    assert!(
+        parse_scenes(&seen.stderr).is_empty(),
+        "a single take has no cut: {}",
+        seen.stderr_tail()
+    );
+    let without = scan(&format!(
+        "scale='min({SCENE_DETECT_WIDTH},iw)':-2:flags=bilinear,select='gt(scene,0.4)',showinfo"
+    ));
+    assert!(without.stalled, "without frame 0 the pass is silent until it ends");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

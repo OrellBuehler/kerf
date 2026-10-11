@@ -949,10 +949,36 @@ pub(super) fn run_piped_until(cmd: &mut Command, input: Vec<u8>, deadline: Insta
 }
 
 /// How long a whole-file read ([`scene_pass`], [`contact_sheet`]) may go without a word from
-/// ffmpeg before it is killed. `-progress` reports twice a second whatever the footage, so a
-/// minute of silence is a wedged decoder, not a long file (the same bound the waveform decode
-/// and the filmstrip give theirs).
+/// ffmpeg before it is killed, at the least (the same floor the waveform decode and the
+/// filmstrip give theirs). `-progress` reports every [`PROGRESS_ON_STDERR`] second, but **only
+/// once a frame has reached the output**: a read that outputs nothing until its last frame is
+/// silent for the whole decode, so it gets either a frame to report on early (the scene pass
+/// selects frame 0) or a bound that grows with the work ([`stall_for_work`], the sheet's).
 const READ_STALL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most a read that is silent until it ends is given before it counts as wedged.
+const READ_STALL_CEILING: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+
+/// Silence a read of `work_secs` of footage that outputs only at its end is allowed (pure): `per_sec`
+/// per second of footage — a decode slower than `1 / per_sec` of real time is a wedge, not a slow
+/// machine — between `floor`, which covers start-up and the first seek, and `ceiling`, which keeps
+/// even a wedged hour-long read finite. Clamped in seconds first: `from_secs_f64` panics on
+/// infinity, and a container can report an absurd duration.
+fn stall_for_work(work_secs: f64, per_sec: f64, floor: std::time::Duration, ceiling: std::time::Duration) -> std::time::Duration {
+    let secs = if work_secs.is_finite() {
+        (work_secs * per_sec).clamp(0.0, ceiling.as_secs_f64())
+    } else {
+        0.0
+    };
+    std::time::Duration::from_secs_f64(secs).max(floor)
+}
+
+/// The stall bound of a contact sheet of a `window_secs` window: the whole window is decoded
+/// before `tile` outputs the one frame, so the read says nothing until it ends. Thirty seconds of
+/// silence per second of footage, at least [`READ_STALL`], at most [`READ_STALL_CEILING`].
+fn sheet_stall(window_secs: f64) -> std::time::Duration {
+    stall_for_work(window_secs, 30.0, READ_STALL, READ_STALL_CEILING)
+}
 
 /// The `-progress` flags a bounded read adds **at spawn time** (like the thread caps, never in
 /// a pure builder): the report goes to stderr, which stdout-carrying reads (a contact sheet's
@@ -985,7 +1011,7 @@ fn is_progress_line(line: &str) -> bool {
 struct Collected {
     status: std::process::ExitStatus,
     stdout: Vec<u8>,
-    /// stderr without the `-progress` report lines.
+    /// stderr without the `-progress` report lines (what had arrived, when the read stalled).
     stderr: String,
     /// ffmpeg said nothing for the stall bound and was killed.
     stalled: bool,
@@ -995,15 +1021,28 @@ impl Collected {
     fn succeeded(&self) -> bool {
         self.status.success() && !self.stalled
     }
+
+    /// The last lines of stderr, for an error message.
+    fn stderr_tail(&self) -> String {
+        let lines: Vec<&str> = self.stderr.lines().rev().take(12).collect();
+        lines.into_iter().rev().collect::<Vec<_>>().join("\n").trim().to_string()
+    }
 }
 
 /// [`Command::output`] that cannot wait forever: `cmd` is given `-progress pipe:2`
 /// ([`PROGRESS_ON_STDERR`]) and is killed once its stderr has been silent for `stall`. Both
 /// pipes are drained on side threads, so neither a flood of warnings nor a large stdout can fill
-/// a pipe and wedge the child. A stalled read returns no output at all.
+/// a pipe and wedge the child. A stalled read returns the stderr that had arrived and no stdout.
+/// The child is always reaped, whatever fails on the way.
 fn output_unless_stalled(mut cmd: Command, stall: std::time::Duration) -> std::io::Result<Collected> {
     use std::io::{BufRead, BufReader, Read};
     use std::sync::{Arc, Mutex};
+
+    /// When stderr was last heard from, and what it said so far.
+    struct Heard {
+        at: Instant,
+        text: String,
+    }
 
     let mut child = cmd
         .stdin(Stdio::null())
@@ -1012,7 +1051,10 @@ fn output_unless_stalled(mut cmd: Command, stall: std::time::Duration) -> std::i
         .spawn()?;
     let mut stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
-    let heard = Arc::new(Mutex::new(Instant::now()));
+    let heard = Arc::new(Mutex::new(Heard {
+        at: Instant::now(),
+        text: String::new(),
+    }));
     let out_handle = std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let _ = stdout.read_to_end(&mut bytes);
@@ -1021,47 +1063,54 @@ fn output_unless_stalled(mut cmd: Command, stall: std::time::Duration) -> std::i
     let err_handle = {
         let heard = Arc::clone(&heard);
         std::thread::spawn(move || {
-            let mut text = String::new();
             for line in BufReader::new(stderr).split(b'\n') {
                 let Ok(line) = line else { break };
-                if let Ok(mut at) = heard.lock() {
-                    *at = Instant::now();
-                }
                 let line = String::from_utf8_lossy(&line);
-                if !is_progress_line(&line) {
-                    text.push_str(&line);
-                    text.push('\n');
+                if let Ok(mut heard) = heard.lock() {
+                    heard.at = Instant::now();
+                    if !is_progress_line(&line) {
+                        heard.text.push_str(&line);
+                        heard.text.push('\n');
+                    }
                 }
             }
-            text
         })
     };
     let mut stalled = false;
     let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
         }
-        if heard.lock().is_ok_and(|at| at.elapsed() > stall) {
+        if heard.lock().is_ok_and(|heard| heard.at.elapsed() > stall) {
             stalled = true;
             let _ = child.kill();
             break child.wait()?;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
+    let text = |heard: &Mutex<Heard>| heard.lock().map(|heard| heard.text.clone()).unwrap_or_default();
     if stalled {
         // The side threads end on their own when the pipes close; a wrapper that spawned the real
         // ffmpeg keeps them open past the kill, and the caller must not wait for that.
         return Ok(Collected {
             status,
             stdout: Vec::new(),
-            stderr: String::new(),
+            stderr: text(&heard),
             stalled,
         });
     }
+    let stdout = out_handle.join().unwrap_or_default();
+    let _ = err_handle.join();
     Ok(Collected {
         status,
-        stdout: out_handle.join().unwrap_or_default(),
-        stderr: err_handle.join().unwrap_or_default(),
+        stdout,
+        stderr: text(&heard),
         stalled,
     })
 }
@@ -1486,6 +1535,14 @@ pub fn detect_scenes_preferring(original: &Path, proxy: Option<&Path>, threshold
     detect_scenes(original, threshold)
 }
 
+/// The `-vf` chain of a scene pass (pure). Frame 0 is selected too (`eq(n,0)`) and dropped again
+/// by [`parse_scenes`]: a pass with no cut outputs nothing otherwise, and ffmpeg reports no
+/// progress until a frame has reached the output, so a long single take would look wedged from
+/// its first second.
+fn scene_filter(threshold: f64) -> String {
+    format!("scale='min({SCENE_DETECT_WIDTH},iw)':-2:flags=bilinear,select='gt(scene,{threshold})+eq(n,0)',showinfo")
+}
+
 /// One scene-detection pass over `path`: the cut times and whether ffmpeg ended cleanly.
 /// [`detect_scenes`] has always answered with whatever the log held, so a run that failed
 /// reads as "no cuts"; the flag is what lets a caller with somewhere else to read tell. A run
@@ -1494,7 +1551,7 @@ fn scene_pass(path: &Path, threshold: f64) -> Result<(Vec<f64>, bool)> {
     use std::sync::atomic::Ordering;
 
     let bin = ffmpeg_bin();
-    let filter = format!("scale='min({SCENE_DETECT_WIDTH},iw)':-2:flags=bilinear,select='gt(scene,{threshold})',showinfo");
+    let filter = scene_filter(threshold);
     // Probed before queueing: a hung probe must not hold the one heavy-job slot.
     let hw = decode_hwaccel_for(path, Reading::Whole);
     // The whole file is decoded, so this queues behind any other heavy job.
@@ -1529,17 +1586,24 @@ fn scene_pass(path: &Path, threshold: f64) -> Result<(Vec<f64>, bool)> {
     };
     if output.stalled {
         return Err(Error::Engine(format!(
-            "scene detection stalled: ffmpeg said nothing for {}s reading {}",
+            "scene detection stalled: ffmpeg said nothing for {}s reading {}: {}",
             READ_STALL.as_secs(),
-            path.display()
+            path.display(),
+            output.stderr_tail()
         )));
     }
     Ok((parse_scenes(&output.stderr), output.status.success()))
 }
 
+/// The cut times in a scene pass's `showinfo` log. Its first line (`n:0`, showinfo's own count of
+/// the frames that reached it) is frame 0, which the pass lets through to keep ffmpeg reporting
+/// and which never scores as a cut: not a cut.
 fn parse_scenes(stderr: &str) -> Vec<f64> {
     let mut times = Vec::new();
     for line in stderr.lines() {
+        if field_after(line, "] n:") == Some(0.0) {
+            continue;
+        }
         if let Some(t) = field_after(line, "pts_time:") {
             times.push(t);
         }
@@ -1960,10 +2024,13 @@ pub fn contact_sheet(
     cpu::limit_args(&mut args, cpu::budget_threads());
     let mut cmd = bg_command(&bin);
     cmd.args(PROGRESS_ON_STDERR).args(&args);
-    let output = output_unless_stalled(cmd, READ_STALL).map_err(|e| launch_err(&bin, e))?;
+    // `tile` outputs the one frame when the window has been decoded, and ffmpeg reports nothing
+    // before: the bound grows with the window (see `sheet_stall`).
+    let stall = sheet_stall(end - start);
+    let output = output_unless_stalled(cmd, stall).map_err(|e| launch_err(&bin, e))?;
     if !output.succeeded() || output.stdout.is_empty() {
         let why = if output.stalled {
-            format!("ffmpeg said nothing for {}s", READ_STALL.as_secs())
+            format!("ffmpeg said nothing for {}s: {}", stall.as_secs(), output.stderr_tail())
         } else {
             output.stderr.trim().to_string()
         };
@@ -7677,13 +7744,17 @@ mod tests {
 
     #[test]
     fn parses_scene_times() {
+        // `n:0` is frame 0, which the pass lets through to keep ffmpeg reporting: not a cut.
         let log = "\
-[Parsed_showinfo_1 @ 0x1] n:0 pts:0 pts_time:0 duration_time:0.04
-[Parsed_showinfo_1 @ 0x1] n:1 pts:720 pts_time:30.0 duration_time:0.04
-[Parsed_showinfo_1 @ 0x1] n:2 pts:1800 pts_time:75.5 duration_time:0.04
+[Parsed_showinfo_1 @ 0x1] n:   0 pts:0 pts_time:0 duration_time:0.04
+[Parsed_showinfo_1 @ 0x1] n:   1 pts:720 pts_time:30.0 duration_time:0.04
+[Parsed_showinfo_1 @ 0x1] n:   2 pts:1800 pts_time:75.5 duration_time:0.04
 ";
         let scenes = parse_scenes(log);
-        assert_eq!(scenes, vec![0.0, 30.0, 75.5]);
+        assert_eq!(scenes, vec![30.0, 75.5]);
+        // A log of frame 0 alone (a single take) has no cut; a run that logged nothing none either.
+        assert!(parse_scenes("[Parsed_showinfo_1 @ 0x1] n:0 pts:0 pts_time:0 duration_time:0.04\n").is_empty());
+        assert!(parse_scenes("").is_empty());
     }
 
     #[test]
@@ -8050,6 +8121,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_silence_a_read_may_keep_grows_with_the_work_between_a_floor_and_a_ceiling() {
+        use std::time::Duration as D;
+        let secs = |window: f64| sheet_stall(window).as_secs_f64();
+        // Start-up and a short window get the floor: a minute.
+        assert_eq!((secs(0.0), secs(1.0), secs(2.0)), (60.0, 60.0, 60.0));
+        // A longer window is decoded for longer before `tile` says anything: 30 s per second of footage.
+        assert_eq!((secs(10.0), secs(60.0)), (300.0, 1800.0));
+        // Wedged is still finite, and nonsense (a negative or unknown duration) falls back to the floor.
+        assert_eq!(secs(1e9), 2.0 * 3600.0);
+        assert_eq!((secs(-5.0), secs(f64::NAN)), (60.0, 60.0));
+        assert_eq!(secs(f64::INFINITY), 60.0);
+        assert_eq!(
+            stall_for_work(4.0, 0.5, D::from_millis(100), D::from_secs(10)),
+            D::from_secs(2)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_that_is_busy_and_silent_is_not_killed_within_its_bound() {
+        use std::time::Duration as D;
+        let busy = || {
+            let mut cmd = Command::new("sh");
+            // Silent for 1.2 s, then the whole answer on stdout: a contact sheet's shape.
+            cmd.args(["-c", "sleep 1.2; printf sheet"]);
+            cmd
+        };
+        // A 4 s window at half a second of silence per second of footage: two seconds is enough...
+        let bound = stall_for_work(4.0, 0.5, std::time::Duration::from_millis(100), D::from_secs(10));
+        let done = output_unless_stalled(busy(), bound).unwrap();
+        assert!(done.succeeded() && !done.stalled, "{:?}", done.stderr);
+        assert_eq!(done.stdout, b"sheet");
+        // ...and with no window to scale by, the floor alone kills the same child.
+        let floor_only = stall_for_work(0.0, 0.5, std::time::Duration::from_millis(100), D::from_secs(10));
+        let killed = output_unless_stalled(busy(), floor_only).unwrap();
+        assert!(killed.stalled && killed.stdout.is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_read_that_goes_quiet_is_killed_and_one_that_reports_is_not() {
@@ -8060,8 +8170,14 @@ mod tests {
         };
         // Quiet: a child that never writes (a wedged decoder) is killed at the bound, not waited for.
         let started = Instant::now();
-        let quiet = output_unless_stalled(sh("sleep 30"), std::time::Duration::from_millis(300)).unwrap();
+        let quiet = output_unless_stalled(
+            sh("echo warming up >&2; echo frame=1 >&2; sleep 30"),
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap();
         assert!(quiet.stalled && !quiet.succeeded());
+        // What it had said is kept for the error message (without the progress lines).
+        assert_eq!(quiet.stderr_tail(), "warming up");
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
         // Reporting: each line of stderr is a word, so a long run that keeps talking is not cut off,
         // and the progress lines are not in the text the caller reads errors from.
