@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { alphaOf, parseColor, swatchHex, withPicked } from './title-color';
+import { alphaOf, hexAlphaByte, parseColor, swatchHex, withPicked } from './title-color';
 
 describe('reading a title colour', () => {
 	test('hex in either spelling, with or without an alpha byte', () => {
@@ -16,6 +16,14 @@ describe('reading a title colour', () => {
 
 	test('nothing it cannot draw: empty, an unlisted name, a broken alpha, a short hex', () => {
 		for (const t of ['', '  ', 'chartreuse', 'white@', 'white@x', '#fff', null, undefined]) expect(parseColor(t as string)).toBeNull();
+	});
+});
+
+describe('the alpha byte', () => {
+	test('is the last two digits of an 8-digit hex, and nothing else', () => {
+		expect(hexAlphaByte('#ffaa00CC')).toBe('cc');
+		expect(hexAlphaByte('0x11223344')).toBe('44');
+		for (const t of ['#ffaa00', 'white', 'black@0.5', '', null, undefined]) expect(hexAlphaByte(t as string)).toBeNull();
 	});
 });
 
@@ -48,9 +56,20 @@ describe('writing a pick back', () => {
 		expect(withPicked('white@', '#112233', 0.55)).toBe('#112233');
 	});
 
-	test('what it writes is what the engine accepts: #rrggbb or #rrggbb@alpha', () => {
-		for (const out of [withPicked('white@0.5', '#ABCDEF'), withPicked('', '#ABCDEF', 0.55), withPicked('red', '#ABCDEF')])
-			expect(out).toMatch(/^#[0-9a-f]{6}(@\d+(\.\d+)?)?$/);
+	test('an 8-digit hex keeps its alpha byte, in either spelling', () => {
+		expect(withPicked('#ffaa00cc', '#112233')).toBe('#112233cc');
+		expect(withPicked('0xAABBCC80', '#112233')).toBe('#11223380');
+		expect(withPicked('#FFAA00CC', '#ABCDEF', 0.55)).toBe('#abcdefcc');
+	});
+
+	test('what it writes is what the engine accepts: #rrggbb, #rrggbbaa or #rrggbb@alpha', () => {
+		for (const out of [
+			withPicked('white@0.5', '#ABCDEF'),
+			withPicked('', '#ABCDEF', 0.55),
+			withPicked('red', '#ABCDEF'),
+			withPicked('#ffaa00cc', '#ABCDEF')
+		])
+			expect(out).toMatch(/^#[0-9a-f]{6}([0-9a-f]{2}|@\d+(\.\d+)?)?$/);
 	});
 });
 

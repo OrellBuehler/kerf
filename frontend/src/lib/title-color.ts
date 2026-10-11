@@ -62,11 +62,22 @@ export function parseColor(text: string | null | undefined): ParsedColor | null 
 	return named ? { hex: named, alpha } : null;
 }
 
-/** The text after a pick: the picked `#rrggbb`, with the field's `@alpha` kept, or `fallbackAlpha` when
- *  the field had none (a title's box has no alpha until one is chosen, and a solid box hides the picture). */
+/** The alpha byte of an 8-digit hex spelling (`#rrggbbaa`, `0xRRGGBBAA`) as two hex digits, or null: that
+ *  spelling carries its alpha in the colour itself, not after an `@`. */
+export function hexAlphaByte(text: string | null | undefined): string | null {
+	const m = /^(?:#|0x)[0-9a-f]{6}([0-9a-f]{2})$/i.exec((text ?? '').trim());
+	return m ? m[1].toLowerCase() : null;
+}
+
+/** The text after a pick: the picked `#rrggbb`, with the field's alpha kept — an `@alpha`, or the last byte of
+ *  an 8-digit hex — or `fallbackAlpha` when the field had none (a title's box has no alpha until one is chosen, and
+ *  a solid box hides the picture). */
 export function withPicked(current: string | null | undefined, picked: string, fallbackAlpha: number | null = null): string {
+	const color = picked.toLowerCase();
+	const byte = hexAlphaByte(current);
+	if (byte !== null) return `${color}${byte}`;
 	const alpha = alphaOf(current) ?? (current?.includes('@') ? null : fallbackAlpha);
-	return alpha === null ? picked.toLowerCase() : `${picked.toLowerCase()}@${alpha}`;
+	return alpha === null ? color : `${color}@${alpha}`;
 }
 
 /** What the picker shows for a field's text: its colour, else black (the picker cannot be empty). */
