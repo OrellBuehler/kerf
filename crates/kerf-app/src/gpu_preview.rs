@@ -47,8 +47,8 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use kerf_core::{
-    composite_color_policy, Asset, CompositeColorPolicy, ExportOptions, PlanLayer, PlanRequest, Planner, Project, ProxyMedia,
-    ScrubConfig, ScrubFrames, StreamKind, Timeline,
+    composite_color_policy, Asset, CompositeColorPolicy, ExportOptions, GpuCaps, PlanLayer, PlanRequest, Planner, Project,
+    ProxyMedia, RenderPlan, ScrubConfig, ScrubFrames, StreamKind, Timeline,
 };
 use kerf_gpu::{Compositor, FrameSource, FrameSourceConfig, Gpu, GpuError, GpuOptions, Hint, PixelRect, Presenter, Surround};
 use serde::{Deserialize, Serialize};
@@ -542,6 +542,22 @@ impl Host {
     }
 }
 
+/// The plan the preview draws for time `t`: the output frame whose slot holds it, at the slot's
+/// start. The JPEG route counts the same grid (`ScrubFrames`), so the two routes show the same
+/// frame for a time between two frames, not the source frame at `t` itself.
+fn plan_at_grid(planner: &Planner, t: f64) -> kerf_core::Result<RenderPlan> {
+    planner.at_frame(planner.canvas().fps.frame_containing(t))
+}
+
+/// Clears a flag when dropped, a panic included.
+struct ClearOnDrop(Arc<AtomicBool>);
+
+impl Drop for ClearOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// How far past the playhead, in seconds, the clips whose first frames are prefetched start.
 const PREFETCH_HORIZON: f64 = 2.0;
 
@@ -1009,7 +1025,17 @@ impl GpuPreview {
     /// the asking is on a thread of its own (the probes block), at most one at a time, and not again
     /// for the same clips within a second. It never takes a run another layer is reading (a spare
     /// slot, `Hint::Prefetch`), and a failure to prefetch is nothing: the frame is decoded when asked.
-    fn prefetch_ahead(&self, planner: &Planner, timeline: &Timeline, t: f64, _size: (u32, u32), source: Arc<FrameSource>) {
+    /// A moment the GPU will refuse at this size (`caps`) is not prefetched: its frame goes through
+    /// FFmpeg, and a run waiting for it would be a decode nobody reads.
+    fn prefetch_ahead(
+        &self,
+        planner: &Planner,
+        timeline: &Timeline,
+        t: f64,
+        size: (u32, u32),
+        caps: &GpuCaps,
+        source: Arc<FrameSource>,
+    ) {
         let starts = upcoming_clip_starts(timeline, t, PREFETCH_HORIZON, PREFETCH_CLIPS);
         if starts.is_empty() {
             return;
@@ -1025,22 +1051,22 @@ impl GpuPreview {
         let layers: Vec<PlanLayer> = starts
             .iter()
             .filter_map(|&start| planner.at(start).ok())
+            .filter(|plan| plan.reasons(caps, size).is_empty())
             .flat_map(|plan| plan.layers)
             .collect();
         if layers.is_empty() || self.prefetching.swap(true, Ordering::SeqCst) {
             return;
         }
-        let flag = Arc::clone(&self.prefetching);
-        let spawned = std::thread::Builder::new().name("kerf-gpu-prefetch".into()).spawn(move || {
+        // Moved into the thread, so that whatever ends it, a panic or a thread that never started,
+        // clears the flag.
+        let clear = ClearOnDrop(Arc::clone(&self.prefetching));
+        let _ = std::thread::Builder::new().name("kerf-gpu-prefetch".into()).spawn(move || {
+            let _clear = clear;
             // `Hint::Prefetch` returns nothing for every layer; an error is only a layer not ready.
             if let Err(error) = source.frames(&layers, Hint::Prefetch) {
                 tracing::debug!(%error, "prefetching the next clip");
             }
-            flag.store(false, Ordering::SeqCst);
         });
-        if spawned.is_err() {
-            self.prefetching.store(false, Ordering::SeqCst);
-        }
     }
 
     /// Drop the backend, remember why, and wait before building another (`immediate`: a device that
@@ -1096,7 +1122,7 @@ impl GpuPreview {
             Ok(planner) => planner,
             Err(e) => return fallback(format!("no plan for this frame: {e}")),
         };
-        let plan = match planner.at(t) {
+        let plan = match plan_at_grid(&planner, t) {
             Ok(plan) => plan,
             Err(e) => return fallback(format!("no plan for this frame: {e}")),
         };
@@ -1135,7 +1161,8 @@ impl GpuPreview {
         let canvas = (plan.canvas.width, plan.canvas.height);
         let (width, _) = place_frame(canvas, layout.area, |w| plan.size(w));
         let size = plan.size(width);
-        let reasons = plan.reasons(&backend.compositor.caps(), size);
+        let caps = backend.compositor.caps();
+        let reasons = plan.reasons(&caps, size);
         if !reasons.is_empty() {
             drop(state);
             self.hide();
@@ -1192,7 +1219,7 @@ impl GpuPreview {
                 }
                 tracing::debug!(?timings, t, "GPU preview frame presented");
                 drop(state);
-                self.prefetch_ahead(&planner, &inputs.timeline, t, size, source);
+                self.prefetch_ahead(&planner, &inputs.timeline, t, size, &caps, source);
                 Attempt::Presented(timings)
             }
             Ok(None) => {
@@ -1408,6 +1435,44 @@ mod tests {
             format: None,
             master: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_time_between_two_frames_is_planned_at_the_start_of_its_frame() {
+        let tl = cut(vec![(StreamKind::Video, "V1", vec![])]);
+        let planner = Planner::new(
+            &tl,
+            &[],
+            &ExportOptions::default(),
+            PlanRequest::still(CompositeColorPolicy::FixedBt601),
+        )
+        .unwrap();
+        let fps = planner.canvas().fps;
+        let start = fps.exact_time(37);
+        for t in [start, start + 0.25 / 30.0, start + 0.99 / 30.0] {
+            let plan = plan_at_grid(&planner, t).unwrap();
+            assert_eq!(plan.time, start, "t = {t}");
+            assert_eq!(plan.frame, 37);
+        }
+        assert_eq!(plan_at_grid(&planner, fps.exact_time(38)).unwrap().frame, 38);
+        assert_eq!(
+            plan_at_grid(&planner, -1.0).unwrap().frame,
+            0,
+            "before the start is its first frame"
+        );
+    }
+
+    #[test]
+    fn a_flag_is_cleared_when_what_held_it_panics() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let held = ClearOnDrop(Arc::clone(&flag));
+        let ended = std::thread::spawn(move || {
+            let _held = held;
+            panic!("the prefetch panicked");
+        })
+        .join();
+        assert!(ended.is_err());
+        assert!(!flag.load(Ordering::SeqCst));
     }
 
     #[test]

@@ -206,7 +206,8 @@ webview sends no extra command: the JPEG path is what it was. On, `get_preview_f
 { time_secs, max_width, overlays }` takes the plan's inputs under the project lock
 (`plan_inputs`: the working timeline, the assets as imported and the proxy-swapped ones the
 FFmpeg graph reads), **releases it**, plans the frame (`Planner` over `ProxyMedia`, the
-measured colour policy) and answers `{renderer: 'gpu' | 'ffmpeg', frame?, reasons,
+measured colour policy, at the start of the output frame whose slot holds the time, `plan_at_grid`, as the JPEG route's
+`ScrubFrames` counts it, so the two show one frame between two frames) and answers `{renderer: 'gpu' | 'ffmpeg', frame?, reasons,
 timings?}`: the GPU when `RenderPlan::reasons(caps, size)` is empty and everything works,
 else FFmpeg's JPEG **of that frame, in the same call**, with the plan's reasons (a refusal
 is not an error). The device, compositor, `FrameSource` and presenter are built lazily by
@@ -219,7 +220,7 @@ presented asks the frame source for the clips past the next cut** (`prefetch_ahe
 tracks that render and start within 2 s of the playhead (`upcoming_clip_starts`, at most 3, each moment
 once) are planned at their start and their layers handed to `FrameSource::frames(.., Hint::Prefetch)` on a
 thread of its own (one at a time, the same clips not again within a second, after the render lock is
-released), so a run is waiting and the file's two probes are done when the playhead crosses the cut
+released; a moment the GPU would refuse at this size is skipped, and a panic clears the in-flight flag), so a run is waiting and the file's two probes are done when the playhead crosses the cut
 instead of the first frame there costing a process start. It never takes a run another layer is reading
 and a failure is nothing: the frame is decoded when asked. **Nothing
 here may freeze the preview**: a backend is built **off the render lock** and with a deadline
