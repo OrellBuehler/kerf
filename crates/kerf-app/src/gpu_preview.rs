@@ -17,6 +17,8 @@
 //! * **Lock-free**: the plan's inputs are an `Arc` snapshot ([`snapshot`]) taken under the project
 //!   lock only when the plan epoch says the project or its proxies changed, and the lock is released
 //!   before anything is decoded, planned from files or rendered; a scrubbed frame takes none.
+//! * **Latest wins** ([`mailbox`]): a request replaces the one waiting, so a drag draws the frames
+//!   it ends on and not every one it passed.
 //! * **Lazy and rebuildable**: the device, compositor, frame source and surface are made on the
 //!   first frame that wants them ([`Backend`]); a failure is remembered with a backoff
 //!   ([`Backoff`]) and a lost device is dropped and rebuilt on the next use, as `kerf-gpu`
@@ -36,6 +38,7 @@
 //! This is a GUI-only surface: it has no MCP tool, because the agent already has
 //! `preview_timeline` (a JPEG of the cut) and nothing here is an edit.
 
+mod mailbox;
 mod snapshot;
 #[cfg(target_os = "linux")]
 mod x11;
@@ -55,7 +58,10 @@ use kerf_core::{
 };
 use kerf_gpu::{Compositor, FrameSource, FrameSourceConfig, Gpu, GpuError, GpuOptions, Hint, PixelRect, Presenter, Surround};
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 
+pub use mailbox::Delivery;
+use mailbox::{Mailbox, Worker};
 pub use snapshot::Taken;
 use snapshot::{PlanInputs, PlanSnapshots};
 
@@ -711,13 +717,26 @@ pub struct GpuTimings {
 /// FFmpeg.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PreviewFrameResult {
-    /// `"gpu"` (drawn in the native surface; the webview shows it by showing nothing over it) or
-    /// `"ffmpeg"` (the `frame` data URL).
+    /// `"gpu"` (drawn in the native surface; the webview shows it by showing nothing over it),
+    /// `"ffmpeg"` (the `frame` data URL) or `"superseded"` (a newer request replaced this one before
+    /// it was drawn: nothing was, and the page ignores the answer).
     pub renderer: &'static str,
     pub frame: Option<String>,
     /// Why the GPU did not draw it (empty when it did).
     pub reasons: Vec<String>,
     pub timings: Option<GpuTimings>,
+}
+
+impl PreviewFrameResult {
+    /// The answer of a request that a newer one replaced.
+    pub fn superseded() -> Self {
+        Self {
+            renderer: "superseded",
+            frame: None,
+            reasons: Vec::new(),
+            timings: None,
+        }
+    }
 }
 
 /// Take the inputs of a frame: what needs the project lock, in one pass. Call under the lock;
@@ -729,6 +748,28 @@ pub fn take_inputs(project: &Project) -> Result<Taken, String> {
 /// Takes the inputs of a frame from the project (the app's: under `lock_user`), called only when
 /// the held snapshot is stale.
 pub type TakeInputs = Arc<dyn Fn() -> Result<Taken, String> + Send + Sync>;
+
+/// One `get_preview_frame`.
+pub struct FrameRequest {
+    take: TakeInputs,
+    t: f64,
+    ffmpeg_width: u32,
+    overlays: bool,
+}
+
+impl FrameRequest {
+    pub fn new(take: TakeInputs, t: f64, ffmpeg_width: u32, overlays: bool) -> Self {
+        Self {
+            take,
+            t,
+            ffmpeg_width,
+            overlays,
+        }
+    }
+}
+
+/// How a `get_preview_frame` ended, for the command: the frame, or "a newer request took its place".
+type Answer = Delivery<Result<PreviewFrameResult, String>>;
 
 enum Attempt {
     Presented(GpuTimings),
@@ -777,6 +818,8 @@ pub struct GpuPreview {
     prefetching: Arc<AtomicBool>,
     /// The inputs of the frames being drawn, held between frames (see [`snapshot`]).
     snapshots: PlanSnapshots,
+    /// Frame requests: only the newest is drawn.
+    mail: Mailbox<FrameRequest, Result<PreviewFrameResult, String>>,
     bounds: Mutex<BoundsState>,
     /// The live host, outside the render lock so hiding the surface never waits for a render.
     host: Mutex<Option<Arc<Mutex<Host>>>>,
@@ -813,6 +856,7 @@ impl GpuPreview {
             prefetched: Mutex::new((Vec::new(), None)),
             prefetching: Arc::new(AtomicBool::new(false)),
             snapshots: PlanSnapshots::default(),
+            mail: Mailbox::default(),
             enabled: AtomicBool::new(false),
             reset_backoff: AtomicBool::new(false),
             info: Mutex::new(Info {
@@ -974,37 +1018,55 @@ impl GpuPreview {
         Ok(self.snapshots.keep(taken.resolve()))
     }
 
+    /// Ask for a frame. **Latest wins**: the request replaces the one waiting (which is answered
+    /// [`Delivery::Superseded`] at once), the frame being drawn is finished, and the newest waiting
+    /// request is drawn next. `run` starts the worker on a thread that may block (the app's: the
+    /// blocking pool) when none is running; the answer comes on the receiver.
+    pub fn post(
+        self: &Arc<Self>,
+        request: FrameRequest,
+        run: impl FnOnce(Box<dyn FnOnce() + Send>),
+    ) -> oneshot::Receiver<Answer> {
+        let (answer, start) = self.mail.post(request);
+        if start {
+            let me = Arc::clone(self);
+            run(Box::new(move || me.drain()));
+        }
+        answer
+    }
+
+    /// The worker: draw what is posted, newest first, until nothing waits.
+    fn drain(&self) {
+        let mut worker = Worker::new(&self.mail);
+        while let Some((request, reply)) = worker.next() {
+            let answer = catch_unwind(AssertUnwindSafe(|| self.serve(&request))).unwrap_or_else(|payload| {
+                Err(format!(
+                    "the GPU preview's frame worker panicked: {}",
+                    panic_text(payload.as_ref())
+                ))
+            });
+            reply.send(answer);
+        }
+    }
+
+    /// One request: its inputs (the held snapshot, or taken from the project once it is stale),
+    /// the Proxy-only refusal, then the frame.
+    fn serve(&self, request: &FrameRequest) -> Result<PreviewFrameResult, String> {
+        let inputs = self.inputs(&request.take)?;
+        if let Some(wait) = inputs.proxy_wait(request.t)? {
+            return Err(wait);
+        }
+        self.frame(&inputs, request.t, request.ffmpeg_width, request.overlays)
+    }
+
     /// A frame for `t`: drawn by the GPU when the plan allows it and everything works, else
     /// FFmpeg's JPEG of `ffmpeg_width`. `overlays_needed` is the page saying it must draw over
     /// the picture (a title box, the trim monitor, safe-area guides).
     ///
-    /// The project lock is taken only inside `take`, and only when the held snapshot of the
-    /// inputs is stale. Under Proxy only a frame whose proxy is still building is refused from the
-    /// snapshot, as it was from the project.
-    pub fn frame(
-        &self,
-        take: &TakeInputs,
-        t: f64,
-        ffmpeg_width: u32,
-        overlays_needed: bool,
-    ) -> Result<PreviewFrameResult, String> {
-        let inputs = self.inputs(take)?;
-        if let Some(wait) = inputs.proxy_wait(t)? {
-            return Err(wait);
-        }
-        self.frame_with(&inputs, t, ffmpeg_width, overlays_needed)
-    }
-
-    /// [`GpuPreview::frame`] over inputs in hand. A panic in the GPU path (wgpu, the X connection)
+    /// The project lock is not taken here at all. A panic in the GPU path (wgpu, the X connection)
     /// is caught here: the backend is dropped and rebuilt behind the backoff, the surface hidden,
     /// and the frame is FFmpeg's like any other fallback.
-    fn frame_with(
-        &self,
-        inputs: &PlanInputs,
-        t: f64,
-        ffmpeg_width: u32,
-        overlays_needed: bool,
-    ) -> Result<PreviewFrameResult, String> {
+    fn frame(&self, inputs: &PlanInputs, t: f64, ffmpeg_width: u32, overlays_needed: bool) -> Result<PreviewFrameResult, String> {
         let attempt = catch_unwind(AssertUnwindSafe(|| self.attempt(inputs, t, overlays_needed, Instant::now())));
         let reasons = match attempt {
             Ok(Attempt::Presented(timings)) => {
@@ -2474,7 +2536,7 @@ mod tests {
         preview.policy = || panic!("wgpu panicked");
         preview.set_enabled(true);
         visible(&preview);
-        let result = catch_unwind(AssertUnwindSafe(|| preview.frame_with(&inputs(), 0.5, 320, false)));
+        let result = catch_unwind(AssertUnwindSafe(|| preview.frame(&inputs(), 0.5, 320, false)));
         let result = result.expect("the panic reached the caller");
         // The FFmpeg half has nothing to read here, so it is its own error: what matters is that it was
         // reached, instead of the command dying with the panic.

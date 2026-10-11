@@ -1240,8 +1240,10 @@ export interface GpuTimings {
  *  frame, and the JPEG when it was FFmpeg. */
 export interface PreviewFrameResult {
 	/** `gpu`: drawn in the native surface (the webview shows it by showing nothing
-	 *  over it). `ffmpeg`: the `frame` data URL. */
-	renderer: 'gpu' | 'ffmpeg';
+	 *  over it). `ffmpeg`: the `frame` data URL. `superseded`: a newer request took this
+	 *  one's place before it was drawn (the backend keeps only the newest); nothing was
+	 *  drawn and the answer is ignored. */
+	renderer: 'gpu' | 'ffmpeg' | 'superseded';
 	frame: string | null;
 	/** Why the GPU did not draw it (empty when it did). */
 	reasons: string[];

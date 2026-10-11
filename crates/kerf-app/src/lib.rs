@@ -2023,8 +2023,11 @@ async fn get_timeline_frame(state: State<'_, AppState>, time_secs: f64, max_widt
 /// monitor, safe-area guides): a surface that sits above the page cannot show those, so such a
 /// frame is the JPEG. See [`gpu_preview`]; GUI-only, so there is no MCP tool.
 ///
-/// The frame's inputs are a snapshot of the project (`gpu_preview::snapshot`): the project lock is
-/// taken only when the plan epoch says something changed, never per frame.
+/// **Latest wins**: a request does not wait behind the ones before it. It replaces the one waiting
+/// (that call answers `renderer: "superseded"` at once, with nothing drawn) and is drawn when the
+/// frame in hand is done, so a drag can post a request per playhead move without queueing them. The
+/// frame's inputs are a snapshot of the project (`gpu_preview::snapshot`): the project lock is taken
+/// only when the plan epoch says something changed, never per frame.
 #[tauri::command]
 async fn get_preview_frame(
     state: State<'_, AppState>,
@@ -2034,15 +2037,24 @@ async fn get_preview_frame(
     overlays: Option<bool>,
 ) -> CmdResult<gpu_preview::PreviewFrameResult> {
     let shared = state.project.clone();
-    let gpu = gpu.inner().clone();
-    blocking(move || {
-        let take: gpu_preview::TakeInputs = Arc::new(move || {
+    let request = gpu_preview::FrameRequest::new(
+        Arc::new(move || {
             let project = lock_user(&shared);
             gpu_preview::take_inputs(&project)
-        });
-        gpu.frame(&take, time_secs, max_width.unwrap_or(960), overlays.unwrap_or(false))
-    })
-    .await
+        }),
+        time_secs,
+        max_width.unwrap_or(960),
+        overlays.unwrap_or(false),
+    );
+    let answer = gpu.post(request, |job| {
+        // The worker waits for FFmpeg and the GPU: the blocking pool's, never a runtime thread.
+        tauri::async_runtime::spawn_blocking(job);
+    });
+    match answer.await {
+        Ok(gpu_preview::Delivery::Done(result)) => result,
+        Ok(gpu_preview::Delivery::Superseded) => Ok(gpu_preview::PreviewFrameResult::superseded()),
+        Ok(gpu_preview::Delivery::Abandoned) | Err(_) => Err("the GPU preview's frame worker stopped".to_string()),
+    }
 }
 
 /// Where the Preview frame is in the window (device pixels, relative to the webview) and whether

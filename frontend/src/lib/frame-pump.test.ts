@@ -215,6 +215,65 @@ describe('with the GPU preview on', () => {
 		h.stop();
 	});
 
+	test('the GPU route is not single-flight: every wanted time goes out, and a superseded answer changes nothing', async () => {
+		const resolvers: Array<(r: PreviewFrameResult) => void> = [];
+		const answered: string[] = [];
+		const r = recorder({ gpu: () => new Promise((resolve) => resolvers.push(resolve)) });
+		const h = harness({ enabled: true, overlaysCapable: true, ...r, answered: (result) => answered.push(result.renderer) });
+		await settle();
+		h.time = 1;
+		await settle();
+		h.time = 2;
+		await settle();
+		h.time = 3;
+		await settle();
+		expect(r.asked, 'nothing waits for the frame in flight').toEqual(['gpu@0', 'gpu@1', 'gpu@2', 'gpu@3']);
+		const superseded: PreviewFrameResult = { renderer: 'superseded', frame: null, reasons: [], timings: null };
+		const ffmpeg = (t: number): PreviewFrameResult => ({ renderer: 'ffmpeg', frame: `data:ffmpeg-${t}`, reasons: ['a refusal'], timings: null });
+		// What the backend does: it finishes the frame in hand, tells the ones it replaced, draws the newest.
+		resolvers[1](superseded);
+		resolvers[2](superseded);
+		await settle();
+		expect(answered).toEqual([]);
+		expect(h.frames.frameUrl).toBeNull();
+		resolvers[0](ffmpeg(0));
+		await settle();
+		expect(h.frames.frameUrl).toBe('data:ffmpeg-0');
+		resolvers[3](ffmpeg(3));
+		await settle();
+		expect(h.frames.frameUrl).toBe('data:ffmpeg-3');
+		expect(answered).toEqual(['ffmpeg', 'ffmpeg']);
+		h.stop();
+	});
+
+	test('an answer older than the one on show is dropped, whichever route it came by', async () => {
+		const resolvers: Array<(r: PreviewFrameResult) => void> = [];
+		const r = recorder({ gpu: () => new Promise((resolve) => resolvers.push(resolve)) });
+		const h = harness({ enabled: true, overlaysCapable: false, ...r });
+		await settle();
+		h.time = 1;
+		await settle();
+		const ffmpeg = (t: number): PreviewFrameResult => ({ renderer: 'ffmpeg', frame: `data:ffmpeg-${t}`, reasons: [], timings: null });
+		// The newer request is answered first; the older one then lands and must not replace it.
+		resolvers[1](ffmpeg(1));
+		await settle();
+		resolvers[0](ffmpeg(0));
+		await settle();
+		expect(h.frames.frameUrl).toBe('data:ffmpeg-1');
+
+		// A dialog opens over the frame: the JPEG route asks while a GPU request is still out, and its
+		// picture is what stays when the GPU answer finally arrives.
+		h.time = 2;
+		await settle();
+		h.covered = true;
+		await settle();
+		expect(r.asked.slice(-2)).toEqual(['gpu@2', 'jpeg@2']);
+		resolvers[2](ffmpeg(2));
+		await settle();
+		expect(h.frames.frameUrl).toBe('data:jpeg-2');
+		h.stop();
+	});
+
 	test('a frame the GPU drew shows nothing over the surface, and the canvas shape comes with it', async () => {
 		const r = recorder({
 			gpu: async () => ({
