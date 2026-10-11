@@ -122,7 +122,7 @@ Round 2 added cut shapes: a cut that is itself 29.97 and 23.976 (frame `k * 1001
 23.976 cut with an in-point half a frame off, an animated keyframed title over a box, and two generated captions that
 meet at a frame (with a `%` in the text). All 20 cases pass on 9.0.2 and on 6.1.1. On 9.0.2 the 29.97 and 23.976
 cuts, the in-point case and the captions are the still's JPEG byte for byte (281 of 281 frames), the animated title
-57 of 62 (the other 5 the still's picture through the encoder's rounding, 0.15 on the mean); on 6.1.1 every window frame
+57 of 62 (3 more the still's picture through the encoder's rounding, 0.5 on the mean, and 2 the export's frame); on 6.1.1 every window frame
 is the export's frame (the still's chroma is the odd one out there, below). The caption and the title text carry a `:` and an `'` too, since GPU-2's `escape_drawtext` is on the branch.
 
 
