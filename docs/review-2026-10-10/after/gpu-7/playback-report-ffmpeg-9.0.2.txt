@@ -1,0 +1,21 @@
+play/mid-clip/dissolve pair @0.2000                  start  0.2000 s |   9 frames (every 1) vs whole | worst 0 levels, 0 samples differ
+play/25-in-30/@0.000                                 start  0.0000 s |  30 frames (every 1) vs slice | worst 0 levels, 0 samples differ
+play/in-a-dissolve                                   start  0.3667 s |  18 frames (every 1) vs whole | worst 0 levels, 0 samples differ
+play/mid-clip/dissolve pair @0.2133                  start  0.2000 s |   9 frames (every 1) vs whole | worst 0 levels, 0 samples differ
+play/from-the-start/dissolve                         start  0.0000 s |  60 frames (every 1) vs whole | worst 0 levels, 0 samples differ
+play/in-a-transition/DipToBlack                      start  0.7333 s |  15 frames (every 1) vs whole | worst 0 levels, 0 samples differ
+play/25-in-30/@1.000                                 start  1.0000 s |  30 frames (every 1) vs slice | worst 0 levels, 0 samples differ
+play/mid-clip/dissolve pair @0.3000                  start  0.3000 s |   9 frames (every 1) vs whole | worst 0 levels, 0 samples differ
+play/in-a-transition/SlideLeft                       start  0.5000 s |  15 frames (every 1) vs slice | worst 0 levels, 0 samples differ
+play/25-in-30/@1.700                                 start  1.7000 s |  30 frames (every 1) vs slice | worst 0 levels, 0 samples differ
+play/from-the-start/hard-cut                         start  0.0000 s |  60 frames (every 1) vs whole | worst 0 levels, 0 samples differ
+play/in-a-transition/PushUp                          start  0.5000 s |  15 frames (every 1) vs slice | worst 0 levels, 0 samples differ
+play/mid-clip/deep in a long clip                    start  3.5000 s |  30 frames (every 1) vs whole | worst 0 levels, 0 samples differ
+play/25-in-30/@2.510                                 start  2.5000 s |  30 frames (every 1) vs slice | worst 0 levels, 0 samples differ
+play/in-a-transition/SlideDown                       start  0.5000 s |  15 frames (every 1) vs slice | worst 0 levels, 0 samples differ
+play/from-the-start/fades                            start  0.0000 s |  30 frames (every 1) vs whole | worst 0 levels, 0 samples differ
+play/skipping/every 2                                start  0.0000 s |  30 frames (every 2) vs whole | worst 0 levels, 0 samples differ
+play/speed-2                                         start  0.6000 s |  30 frames (every 1) vs slice | worst 0 levels, 0 samples differ
+play/skipping/every 3                                start  0.0000 s |  20 frames (every 3) vs whole | worst 0 levels, 0 samples differ
+play/skipping/every 7                                start  0.0000 s |   9 frames (every 7) vs whole | worst 0 levels, 0 samples differ
+play/skipping/every 30                               start  0.0000 s |   2 frames (every 30) vs whole | worst 0 levels, 0 samples differ

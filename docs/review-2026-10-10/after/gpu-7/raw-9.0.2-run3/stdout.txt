@@ -1,0 +1,38 @@
+
+running 1 test
+test gpu_preview::bench_tests::a_play_session_through_the_frame_path ... # GPU playback over 1280x720 all-intra clips on llvmpipe (LLVM 20.1.2, 256 bits) (a software adapter: its raster is the frame time, so GPU timings here are not a real GPU's)
+# first frame: the first request of a session to its answer. start: Play to the first frame on the screen, warm backend (no IPC: add 1 to 3 ms).
+# A/V: how far from the frame's own time the frame reached the screen, on a clock that runs from the start of the play; the sound's output latency is not in it.
+
+## light: one layer, a hard cut at 5 s
+start latency, GPU session cold    (Play to first frame): : min  102.7 p50  109.7 p95  118.9 ms
+  ...of which the wait for the cursors' first frames:      : min   34.5 p50   38.2 p95   44.2 ms
+  ...without the screen's wait for the GPU:                : min   36.3 p50   40.1 p95   45.8 ms
+start latency, GPU session rested  (Play to first frame): : min   47.9 p50   51.9 p95   59.0 ms
+  ...of which the wait for the cursors' first frames:      : min    1.8 p50    2.2 p95    4.1 ms
+  ...without the screen's wait for the GPU:                : min    3.4 p50    3.9 p95    5.8 ms
+start latency, GPU session instant (Play to first frame): : min   92.9 p50  104.0 p95  109.3 ms
+  ...of which the wait for the cursors' first frames:      : min   28.6 p50   38.4 p95   41.7 ms
+  ...without the screen's wait for the GPU:                : min   30.3 p50   40.2 p95   46.2 ms
+start latency, stream_preview         (start to first JPEG): : min   68.2 p50   79.1 p95   85.5 ms
+GPU session, light                  4 s:  90 drawn   0 repeats  25 replaced | first frame  132.5 ms | frame time to screen p50   10.0 p95   28.7 max  149.4 ms ( 78% inside the frame's own slot) | round trip p50  60.0 ms | CPU per drawn frame: process 143.8 ms, cursors   7.8 ms | decode wait  0.8 record  1.1 present  40.5 ms
+stream_preview, light: 119 frames in 4 s, first frame 73.6 ms, ffmpeg CPU per frame 11.0 ms
+
+## heavy: base + dissolve + a translucent PiP + a rotated PiP + a title
+start latency, GPU session cold    (Play to first frame): : min  233.9 p50  239.6 p95  282.7 ms
+  ...of which the wait for the cursors' first frames:      : min   50.0 p50   59.8 p95   70.6 ms
+  ...without the screen's wait for the GPU:                : min   55.6 p50   67.3 p95   87.5 ms
+start latency, GPU session rested  (Play to first frame): : min  151.0 p50  165.2 p95  177.4 ms
+  ...of which the wait for the cursors' first frames:      : min    3.1 p50    4.0 p95    9.6 ms
+  ...without the screen's wait for the GPU:                : min    9.1 p50   12.6 p95   18.2 ms
+start latency, GPU session instant (Play to first frame): : min  229.4 p50  239.0 p95  243.0 ms
+  ...of which the wait for the cursors' first frames:      : min   50.7 p50   54.1 p95   61.7 ms
+  ...without the screen's wait for the GPU:                : min   56.0 p50   62.2 p95   73.5 ms
+start latency, stream_preview         (start to first JPEG): : min  133.9 p50  141.7 p95  153.2 ms
+GPU session, heavy                  4 s:  58 drawn   0 repeats  50 replaced | first frame  246.4 ms | frame time to screen p50    7.8 p95   28.8 max  263.2 ms ( 59% inside the frame's own slot) | round trip p50  65.1 ms | CPU per drawn frame: process 221.6 ms, cursors  19.5 ms | decode wait  1.4 record  1.3 present  43.7 ms
+stream_preview, heavy: 117 frames in 4 s, first frame 146.0 ms, ffmpeg CPU per frame 18.4 ms
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 188 filtered out; finished in 62.78s
+
