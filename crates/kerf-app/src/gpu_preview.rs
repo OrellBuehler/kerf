@@ -915,6 +915,26 @@ impl FrameRequest {
     }
 }
 
+/// The job that runs the worker. Dropped without having run (the executor refused it, or is gone),
+/// the mailbox is handed back, or no later request would ever start a worker.
+struct Starter(Option<Arc<GpuPreview>>);
+
+impl Starter {
+    fn run(mut self) {
+        if let Some(preview) = self.0.take() {
+            preview.drain();
+        }
+    }
+}
+
+impl Drop for Starter {
+    fn drop(&mut self) {
+        if let Some(preview) = self.0.take() {
+            preview.mail.abandon();
+        }
+    }
+}
+
 /// What one frame is asked to be.
 #[derive(Debug, Clone, Copy)]
 struct Want {
@@ -1238,8 +1258,8 @@ impl GpuPreview {
         let order = request.order.clone();
         let (answer, start) = self.mail.post(request, order);
         if start {
-            let me = Arc::clone(self);
-            run(Box::new(move || me.drain()));
+            let starter = Starter(Some(Arc::clone(self)));
+            run(Box::new(move || starter.run()));
         }
         answer
     }
@@ -2668,6 +2688,22 @@ mod tests {
 
     fn no_inputs() -> TakeInputs {
         Arc::new(|| Err("no project in this test".to_string()))
+    }
+
+    #[test]
+    fn a_worker_job_dropped_without_running_hands_the_mailbox_back() {
+        let preview = Arc::new(failing(Arc::new(std::sync::atomic::AtomicUsize::new(0)), "no adapter"));
+        let mut lost = preview.post(FrameRequest::new(no_inputs(), 0.5, 320, false), drop);
+        assert!(
+            matches!(lost.try_recv(), Ok(Delivery::Abandoned)),
+            "told its worker never ran, not left waiting"
+        );
+        // The mailbox is idle again: the next request starts a worker, which answers it.
+        let mut next = preview.post(FrameRequest::new(no_inputs(), 0.6, 320, false), |job| job());
+        let Ok(Delivery::Done(answer)) = next.try_recv() else {
+            panic!("the worker did not run");
+        };
+        assert_eq!(answer.unwrap_err(), "no project in this test");
     }
 
     #[test]
