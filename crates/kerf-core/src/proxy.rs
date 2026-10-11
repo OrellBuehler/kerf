@@ -439,17 +439,15 @@ struct Queued {
     notify: Notify,
 }
 
-/// How many proxy encodes may be taken off the queue at once. The gate lets one run on the
-/// cores whatever this says, so more workers only means more queued encodes already past their
-/// ffprobe; but a proxy that is hardware from end to end takes the hardware's slot beside it
-/// (`cpu::Resource::Gpu`), and with one worker it would wait for the software one in front of
-/// it. `cpu::queue_workers` is 2 where that can happen (the lane on, Windows) and 1 elsewhere.
+/// How many proxy encodes may be taken off the queue at once. The heavy-job gate lets
+/// one run at a time whatever this says (the encode is x264 on the cores, always), so more
+/// workers only means more queued encodes already past their ffprobe.
 fn workers() -> usize {
     std::env::var("KERF_PROXY_WORKERS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .map(|n| n.max(1))
-        .unwrap_or_else(cpu::queue_workers)
+        .unwrap_or(1)
 }
 
 fn sender() -> &'static std::sync::mpsc::Sender<Queued> {

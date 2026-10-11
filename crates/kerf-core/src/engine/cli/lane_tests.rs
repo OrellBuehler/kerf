@@ -1,4 +1,5 @@
-//! Which slot a job takes: the hardware's only when it is hardware from end to end (pure).
+//! Which slot an export takes: the hardware's only when it is hardware from end to end (pure). A
+//! preview proxy is always the cores': its encode is x264.
 
 use super::*;
 use crate::engine::cpu::Resource;
@@ -26,45 +27,20 @@ fn h264_420() -> InputFacts {
     video(Codec::H264, Chroma::Yuv420)
 }
 
-// ---- proxies ---------------------------------------------------------------------------------
-
 #[test]
-fn a_proxy_that_is_hardware_from_end_to_end_takes_the_hardware_slot() {
-    assert_eq!(
-        proxy_resource(Some("h264_amf"), Some("d3d11va"), false, h264_420(), true),
-        Resource::Gpu
+fn ten_bit_h264_has_no_hardware_decoder_and_ten_bit_hevc_has() {
+    assert!(deep(Codec::H264, Some(8)).hardware_decodes());
+    assert!(
+        !deep(Codec::H264, Some(10)).hardware_decodes(),
+        "High10 is decoded in software"
     );
-    assert_eq!(
-        proxy_resource(
-            Some("h264_nvenc"),
-            Some("cuda"),
-            false,
-            video(Codec::Hevc, Chroma::Yuv420),
-            true
-        ),
-        Resource::Gpu,
-        "a named accelerator, whatever it is called"
+    assert!(
+        !deep(Codec::H264, None).hardware_decodes(),
+        "a depth nobody recorded is not assumed to be 8"
     );
-}
-
-#[test]
-fn every_doubt_is_the_cores() {
-    let gpu = |enc, dec, tone, facts: InputFacts, lane| proxy_resource(enc, dec, tone, facts, lane);
-    // The lane is off.
-    assert_eq!(
-        gpu(Some("h264_amf"), Some("d3d11va"), false, h264_420(), false),
-        Resource::Cpu
-    );
-    // A software encoder.
-    assert_eq!(gpu(None, Some("d3d11va"), false, h264_420(), true), Resource::Cpu);
-    // No decoder asked for, or `auto`, which falls back to software without a word.
-    assert_eq!(gpu(Some("h264_amf"), None, false, h264_420(), true), Resource::Cpu);
-    assert_eq!(gpu(Some("h264_amf"), Some("auto"), false, h264_420(), true), Resource::Cpu);
-    assert_eq!(gpu(Some("h264_amf"), Some(" AUTO "), false, h264_420(), true), Resource::Cpu);
-    assert_eq!(gpu(Some("h264_amf"), Some(""), false, h264_420(), true), Resource::Cpu);
-    // A tone-map is `zscale` on the cores.
-    assert_eq!(gpu(Some("h264_amf"), Some("d3d11va"), true, h264_420(), true), Resource::Cpu);
-    // What no hardware decoder is known to decode, or nobody has said what it is.
+    assert!(deep(Codec::Hevc, Some(10)).hardware_decodes(), "Main10");
+    assert!(deep(Codec::Hevc, Some(8)).hardware_decodes());
+    assert!(deep(Codec::Hevc, None).hardware_decodes());
     for facts in [
         video(Codec::H264, Chroma::Other),
         video(Codec::Hevc, Chroma::Other),
@@ -73,31 +49,8 @@ fn every_doubt_is_the_cores() {
         video(Codec::H264, Chroma::Unknown),
         InputFacts::default(),
     ] {
-        assert_eq!(
-            gpu(Some("h264_amf"), Some("d3d11va"), false, facts, true),
-            Resource::Cpu,
-            "{facts:?}"
-        );
+        assert!(!facts.hardware_decodes(), "{facts:?}");
     }
-}
-
-#[test]
-fn ten_bit_h264_has_no_hardware_decoder_and_ten_bit_hevc_has() {
-    let dec = |facts: InputFacts| proxy_resource(Some("h264_amf"), Some("d3d11va"), false, facts, true);
-    assert_eq!(dec(deep(Codec::H264, Some(8))), Resource::Gpu);
-    assert_eq!(
-        dec(deep(Codec::H264, Some(10))),
-        Resource::Cpu,
-        "High10 is decoded in software"
-    );
-    assert_eq!(
-        dec(deep(Codec::H264, None)),
-        Resource::Cpu,
-        "a depth nobody recorded is not assumed to be 8"
-    );
-    assert_eq!(dec(deep(Codec::Hevc, Some(10))), Resource::Gpu, "Main10");
-    assert_eq!(dec(deep(Codec::Hevc, Some(8))), Resource::Gpu);
-    assert_eq!(dec(deep(Codec::Hevc, None)), Resource::Gpu);
 }
 
 #[test]
@@ -425,4 +378,51 @@ mod built {
             "no input is handed a decoder, so it is a software decode however it encodes"
         );
     }
+}
+
+#[test]
+fn a_vaapi_export_is_hardware_with_its_device_and_upload_and_not_with_work_on_the_cores() {
+    // The graph ends `format=nv12,hwupload` and the argv names `-vaapi_device` (`uploads_to_vaapi`).
+    let graph = PLAIN_GRAPH.replace("[outv]", "[vhw];[vhw]format=nv12,hwupload[outv]");
+    let device = "-vaapi_device /dev/dri/renderD128";
+    let facts = by_path(vec![("/a.mp4", h264_420())]);
+    let named = export("h264_vaapi", &format!("{device} -hwaccel vaapi -i /a.mp4"), &graph);
+    assert_eq!(export_resource(&named, &facts, true), Resource::Gpu);
+    assert_eq!(
+        export_resource(
+            &export("hevc_vaapi", &format!("{device} -hwaccel vaapi -i /a.mp4"), &graph),
+            &facts,
+            true
+        ),
+        Resource::Gpu
+    );
+    // `auto` may be software, as everywhere else.
+    let auto = export("h264_vaapi", &format!("{device} -hwaccel auto -i /a.mp4"), &graph);
+    assert_eq!(export_resource(&auto, &facts, true), Resource::Cpu);
+    // A blur ahead of the upload is per-pixel work on the cores.
+    let blurred = graph.replace("setsar=1", "setsar=1,gblur=sigma=3");
+    let heavy = export("h264_vaapi", &format!("{device} -hwaccel vaapi -i /a.mp4"), &blurred);
+    assert_eq!(export_resource(&heavy, &facts, true), Resource::Cpu);
+}
+
+#[test]
+fn the_vaapi_export_the_builder_writes_is_judged_hardware() {
+    use crate::engine::test_support::{make_clip, test_asset, timeline_of, video_stream, video_track};
+    let mut asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+    asset.path = "/a.mp4".to_string();
+    if let Some(v) = asset.streams.iter_mut().find(|s| s.kind == crate::model::StreamKind::Video) {
+        v.codec = "h264".to_string();
+        v.pix_fmt = Some("yuv420p".to_string());
+    }
+    let assets = std::slice::from_ref(&asset);
+    let timeline = timeline_of(vec![video_track(vec![make_clip(asset.id, 0.0, 5.0, 0.0)])]);
+    let opts = ExportOptions {
+        video_codec: Some("h264_vaapi".to_string()),
+        hwaccel: Some("vaapi".to_string()),
+        ..ExportOptions::default()
+    };
+    let args = build_export_args(&timeline, assets, "out.mp4", &opts).unwrap();
+    assert!(args.iter().any(|a| a == "-vaapi_device"), "{args:?}");
+    assert!(args.iter().any(|a| a.contains("hwupload")), "{args:?}");
+    assert_eq!(export_resource(&args, &facts_from_assets(assets), true), Resource::Gpu);
 }

@@ -28,8 +28,8 @@
 //!
 //! A job that is hardware from end to end (decode, encode and nothing heavy between) spends
 //! little of the cores and takes a slot of its own instead ([`Resource::Gpu`], [`MAX_GPU_JOBS`]
-//! beside the one CPU job), with the same three lanes; a hardware job that falls back to software
-//! queues for the cores' slot before it reruns ([`Lease::fall_back_to_cpu`]).
+//! beside the one CPU job), with the same three lanes. Only an export can be one: a preview proxy
+//! is an x264 encode on the cores whatever decodes it, so it takes the cores' slot.
 //!
 //! At **100%** the second half is off entirely: no thread flags are added and
 //! priority is untouched, so a full-speed render produces byte-identical ffmpeg
@@ -120,10 +120,10 @@ fn limited() -> bool {
 /// no tone-map, no per-pixel filter, no software encoder) uses 0.3 to 0.7 of a core to feed them,
 /// does not slow a software job and is not slowed by one, and two of them together finish about a
 /// third sooner than one after the other (measured; a third adds nothing). Whether a job is one is
-/// the caller's to decide from what it is about to run, and it is conservative: a job that falls
+/// the caller's to decide from what it is about to run, and it is conservative: a job that fell
 /// back to software while holding only a hardware slot would be a second software job on the
-/// cores, which is why a fallback gives its slot up and queues for the CPU one
-/// ([`Lease::fall_back_to_cpu`]).
+/// cores, which is why an export's software rerun is a new attempt that asks for the cores' slot
+/// (judged again on its own argv).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Resource {
     /// The cores: one job at a time, whatever it runs.
@@ -326,23 +326,6 @@ impl Lease {
     pub fn resource(&self) -> Resource {
         self.resource
     }
-
-    /// A hardware job whose run failed in a way that makes the rerun software: give the hardware
-    /// slot up and wait for the cores', in the same lane, saying why it waits (`on_wait`, as
-    /// [`lease_waiting`]) and giving up with [`Error::Cancelled`] when `cancel` turns true. The
-    /// rerun is then a software job holding the slot a software job holds, instead of a second
-    /// one beside the CPU job that is running. A lease that is already the CPU's (or nested in
-    /// one) is returned as it is.
-    pub fn fall_back_to_cpu(self, on_wait: &mut dyn FnMut(Wait), cancel: &dyn Fn() -> bool) -> Result<Lease> {
-        if self.nested || self.resource == Resource::Cpu {
-            return Ok(self);
-        }
-        let priority = self.priority;
-        // The slot and the nesting depth go back before the wait: the hardware is free for the
-        // next job, and this thread holds nothing it could queue behind.
-        drop(self);
-        acquire(Resource::Cpu, priority, false, on_wait, cancel)
-    }
 }
 
 impl Drop for Lease {
@@ -412,20 +395,6 @@ impl Reservation {
         self.held = false;
         acquire(Resource::Cpu, Priority::Proxy, true, on_wait, cancel)
     }
-
-    /// The proxy turned out to be a hardware job: its place in front of the cores' background work
-    /// is given up (it will not spend them) and it queues in the proxy lane for the hardware's
-    /// slot instead, as [`Reservation::lease_waiting`] would for the cores'.
-    pub fn lease_gpu_waiting(mut self, on_wait: &mut dyn FnMut(Wait), cancel: &dyn Fn() -> bool) -> Result<Lease> {
-        self.held = false;
-        let gate = gate();
-        {
-            let mut s = state(gate);
-            s.cpu.proxy = s.cpu.proxy.saturating_sub(1);
-        }
-        gate.free.notify_all();
-        acquire(Resource::Gpu, Priority::Proxy, false, on_wait, cancel)
-    }
 }
 
 impl Drop for Reservation {
@@ -444,27 +413,6 @@ impl Drop for Reservation {
 /// ask for the slot would be made to wait behind.
 pub fn high_pending() -> bool {
     state(gate()).cpu.proxy > 0
-}
-
-/// How many whole-file jobs a queue should have in flight to keep every slot busy: one for the
-/// cores' slot, and with the lane on and a platform where a job can be hardware from end to end
-/// at all (Windows, where `auto` becomes the named `d3d11va`, see `decode_policy`) as many as the
-/// hardware has slots, so that a hardware proxy behind a software one does not wait for it. Two
-/// software jobs in flight just wait at the gate in arrival order, the second already past its
-/// probe.
-pub fn queue_workers() -> usize {
-    queue_workers_for(
-        gpu_lane(),
-        super::decode_policy::HostOs::CURRENT == super::decode_policy::HostOs::Windows,
-    )
-}
-
-fn queue_workers_for(lane_on: bool, hardware_possible: bool) -> usize {
-    if lane_on && hardware_possible {
-        MAX_GPU_JOBS
-    } else {
-        1
-    }
 }
 
 /// Whether jobs that are hardware from end to end may take the hardware's slot instead of the
@@ -528,7 +476,9 @@ pub fn lease_gpu_waiting(on_wait: &mut dyn FnMut(Wait), cancel: &dyn Fn() -> boo
     acquire(Resource::Gpu, lane(), false, on_wait, cancel)
 }
 
-/// [`lease_gpu_waiting`] in the given lane.
+/// [`lease_gpu_waiting`] in the given lane (the gate's tests: an export is the only hardware job,
+/// and it is foreground).
+#[cfg(test)]
 pub fn lease_gpu_priority_waiting(priority: Priority, on_wait: &mut dyn FnMut(Wait), cancel: &dyn Fn() -> bool) -> Result<Lease> {
     acquire(Resource::Gpu, priority, false, on_wait, cancel)
 }
@@ -1306,13 +1256,6 @@ mod tests {
     fn no_more_than_the_limit_of_hardware_jobs_run_together() {
         let _serial = exclusive();
         assert_eq!(MAX_GPU_JOBS, 2);
-        assert_eq!(
-            queue_workers_for(true, true),
-            2,
-            "a hardware job can run beside a software one"
-        );
-        assert_eq!(queue_workers_for(false, true), 1, "the lane is off");
-        assert_eq!(queue_workers_for(true, false), 1, "nothing qualifies on this platform");
         let order = std::sync::Arc::new(Mutex::new(Vec::new()));
         let (a, b) = (
             hold(Resource::Gpu, Priority::Foreground),
@@ -1349,127 +1292,6 @@ mod tests {
             t.join().unwrap();
         }
         assert_eq!(*order.lock().unwrap(), ["foreground", "proxy", "background"]);
-        b.release();
-    }
-
-    #[test]
-    fn a_hardware_job_that_falls_back_frees_the_hardware_and_waits_for_the_cores() {
-        let _serial = exclusive();
-        let cores = hold(Resource::Cpu, Priority::Foreground);
-        let other = hold(Resource::Gpu, Priority::Foreground);
-        let said = std::sync::Arc::new(Mutex::new(Vec::<Wait>::new()));
-        let (took, took_rx) = std::sync::mpsc::channel();
-        let worker = {
-            let said = said.clone();
-            std::thread::spawn(move || {
-                let hardware = gpu_lease(Priority::Foreground);
-                took.send(()).unwrap();
-                hardware
-                    .fall_back_to_cpu(&mut |w| said.lock().unwrap().push(w), &|| false)
-                    .map(|l| l.resource())
-            })
-        };
-        took_rx.recv().unwrap();
-        wait_until("the fallback to say it waits", || !said.lock().unwrap().is_empty());
-        assert_eq!(*said.lock().unwrap(), [Wait::Job], "the cores have a job on them");
-        // It no longer holds the hardware: the slot it had is free again (the other job holds one).
-        assert!(can_have(Resource::Gpu, Priority::Foreground), "the hardware went back");
-        cores.release();
-        assert_eq!(worker.join().unwrap().unwrap(), Resource::Cpu);
-        other.release();
-    }
-
-    #[test]
-    fn a_fallback_can_be_stopped_while_it_waits_and_leaves_nothing_held() {
-        let _serial = exclusive();
-        let cores = hold(Resource::Cpu, Priority::Foreground);
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (took, took_rx) = std::sync::mpsc::channel();
-        let worker = {
-            let cancel = cancel.clone();
-            std::thread::spawn(move || {
-                let hardware = gpu_lease(Priority::Foreground);
-                took.send(()).unwrap();
-                hardware
-                    .fall_back_to_cpu(&mut |_| {}, &|| cancel.load(Ordering::SeqCst))
-                    .map(|_| ())
-            })
-        };
-        took_rx.recv().unwrap();
-        wait_until("the fallback to queue", || queued() == (1, 0));
-        cancel.store(true, Ordering::SeqCst);
-        assert!(matches!(worker.join().unwrap(), Err(Error::Cancelled)));
-        assert_eq!(queued(), (0, 0));
-        assert_eq!(state(gate()).gpu.running.len(), 0, "the hardware slot went back");
-        cores.release();
-        assert!(can_have(Resource::Cpu, Priority::Foreground));
-    }
-
-    #[test]
-    fn a_cpu_lease_falls_back_to_itself() {
-        let _serial = exclusive();
-        let cores = lease();
-        let same = cores
-            .fall_back_to_cpu(&mut |_| panic!("a CPU job has nothing to wait for"), &|| false)
-            .unwrap();
-        assert_eq!(same.resource(), Resource::Cpu);
-        drop(same);
-        let _next = lease();
-    }
-
-    #[test]
-    fn a_proxy_that_is_hardware_gives_its_place_in_front_of_the_cores_back() {
-        let _serial = exclusive();
-        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let reservation = reserve();
-        assert!(high_pending());
-        let analysis = waiter("analysis", Priority::Background, &order);
-        wait_until("the analysis to queue", || queued() == (0, 1));
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        assert!(order.lock().unwrap().is_empty(), "the analysis ran ahead of a queued proxy");
-        let (release, release_rx) = std::sync::mpsc::channel::<()>();
-        let proxy = {
-            let order = order.clone();
-            std::thread::spawn(move || {
-                let lease = reservation.lease_gpu_waiting(&mut |_| {}, &|| false).unwrap();
-                assert_eq!(lease.resource(), Resource::Gpu);
-                order.lock().unwrap().push("proxy");
-                let _ = release_rx.recv();
-            })
-        };
-        // The proxy holds the hardware, not the cores: the analysis goes beside it.
-        analysis.join().unwrap();
-        assert!(!high_pending(), "the reservation was spent on the hardware's queue");
-        drop(release);
-        proxy.join().unwrap();
-        let mut ran = order.lock().unwrap().clone();
-        ran.sort_unstable();
-        assert_eq!(ran, ["analysis", "proxy"]);
-    }
-
-    #[test]
-    fn a_proxy_that_is_stopped_while_it_waits_for_the_hardware_gives_that_place_up_too() {
-        let _serial = exclusive();
-        let (a, b) = (
-            hold(Resource::Gpu, Priority::Foreground),
-            hold(Resource::Gpu, Priority::Foreground),
-        );
-        let reservation = reserve();
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let worker = {
-            let cancel = cancel.clone();
-            std::thread::spawn(move || {
-                reservation
-                    .lease_gpu_waiting(&mut |_| {}, &|| cancel.load(Ordering::SeqCst))
-                    .map(|_| ())
-            })
-        };
-        wait_until("the proxy to wait for the hardware", || state(gate()).gpu.proxy == 1);
-        cancel.store(true, Ordering::SeqCst);
-        assert!(matches!(worker.join().unwrap(), Err(Error::Cancelled)));
-        assert_eq!(state(gate()).gpu.proxy, 0);
-        assert!(!high_pending());
-        a.release();
         b.release();
     }
 

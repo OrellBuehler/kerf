@@ -65,9 +65,7 @@ so the feature is **only** activated through these forwards — which is what ma
   starts on the real first frame: `transition_fx` sets `ClipFx.head_pad` from the
   input's name and `video_clip_chain` opens that chain with `trim=start_frame=1`.
   Any seeked read skips the clone already. Ordinary assets get no such filter and
-  an unchanged argv. A padded proxy never takes a hardware encoder (its output
-  has no frame rate for the encoder to be told, and one refusal disables HW
-  encode process-wide). **MPEG-TS is not fixed and is left alone**
+  an unchanged argv. **MPEG-TS is not fixed and is left alone**
   (`.ts`/`.mts`/`.m2ts`, `format_name` `mpegts`: lead reported 0, plain proxy,
   unchanged key): the TS demuxer measures the container start over the streams it
   reads, so the audio-less read rebases the video to zero and no pad can restore
@@ -141,25 +139,51 @@ so the feature is **only** activated through these forwards — which is what ma
   `.part`, `Error::Cancelled`) and kills ffmpeg after `EXPORT_STALL` (300 s) without a word — it
   used to be a bare `.output()` that waited forever *while holding the machine's one heavy slot*.
   The first report (0.0) comes when the encode holds the slot, so a proxy queued behind an export
-  is not shown building. **A stalled hardware encode or decode is a hardware failure like a refusal**
-  (`retry_proxy_in_software`, pure): it turns hardware encode (and decode) off for the process and the
+  is not shown building. **A stalled hardware decode is a hardware failure like a refusal**
+  (`retry_proxy_in_software`, pure): it turns hardware decode off for the process and the
   proxy is run again once in software, instead of hanging 300 s per proxy; a cancel is never retried. Each
   encode's temp file is `<hash>.<pid>.<n>.part` (a counter), so a rebuild that cancels the encode
   before it does not share one with its replacement. **The size is a setting**: `proxy_width(projection)`
   = `proxy_width_for(projection, proxy_base_width())`, the base width being 1280 (the default, whose
   cache stays valid) or the 720 / 1080 Settings pick (`set_proxy_base_width`, driven by
-  `proxy::set_proxy_size`); a spherical source keeps the 3072 / 1280 ratio capped at 3072 (hardware
-  H.264 stops at 4096 across and one refusal turns every hardware encode off). The width is in the
+  `proxy::set_proxy_size`); a spherical source keeps the 3072 / 1280 ratio capped at 3072 (set when
+  proxies were hardware-encoded, which stops at 4096 across; the cap stays). The width is in the
   key, so each size is its own file. `remove_proxy_files(src, width)` deletes a proxy and its sidecar.
-  **GPU acceleration**: `hw_encoders()` probes once per process which hardware
-  encoders (NVENC / QSV / VideoToolbox / AMF) this ffmpeg can *actually* use —
-  each compiled-in candidate is verified with a one-frame test encode, because
-  `-encoders` listing alone is not proof (`KERF_HW_ENCODE=none` disables). The
-  list is surfaced as the `hw_encoders` Tauri command and the
-  `export_capabilities` MCP tool, and the export dialog merges the verified ones
-  into its codec choices. Proxy generation uses the first verified h264 HW
-  encoder and stitching the first hevc one (both fall back to libx264 on any
-  failure, and one such failure disables HW encode for the process). Background
+  **GPU acceleration**: `hw_encoders()` probes once per process which hardware encoders this
+  ffmpeg can *actually* use: each compiled-in candidate gets a one-frame test encode, because
+  `-encoders` alone is not proof (`KERF_HW_ENCODE=none` disables). Candidates are
+  `HW_ENCODER_CANDIDATES` (NVENC, QSV, VideoToolbox, AMF incl. `av1_amf`: system-memory frames),
+  then `VAAPI_ENCODER_CANDIDATES`. One thread per vendor, its encoders one at a time (consumer
+  NVENC counts sessions); a test encode still running at 20 s is killed and ends its family or
+  render node, and the `-encoders` listing gets 60 s (a cold first launch under a virus scan must
+  not cache "none"). Surfaced as the `hw_encoders` command, the `export_capabilities` tool and
+  the dialog's codec list plus a **Fast (GPU)** preset (frontend.md).
+  **Proxies never encode in hardware** — deliberate, for NVENC / QSV / VideoToolbox users too:
+  `generate_proxy_with` runs `libx264 -g 1` (`proxy_encode_args`, pinned by a test) with hardware
+  *decode* only. Measured on a 7900 XT, 4K HEVC10 to 720p all-intra, 8 s: `d3d11va` + x264 1.90 s /
+  1.0 CPU-s against `d3d11va` + AMF 1.85 s / 0.56 CPU-s, the same wall time, with AMF proxies a third
+  larger (7.35 vs 5.54 MB) and one refusal turning hardware encode off for every later proxy and
+  stitch. Only AMD was measured; the CPU saving elsewhere is unconfirmed. `HW_ENCODE_OK` is now
+  the Insta360 stitch's alone (first verified HEVC hardware encoder, libx264 on any failure).
+  **Export on AMF**: constant QP is `hw_qp(vc, crf)` (CRF + 6, at most 51; `av1_amf` CRF x 4, at
+  most 255) and `-quality quality`. Source, the media review's 4K HEVC10 to 1080p30 8 s SDR render
+  on an RX 7900 XT scored against a lossless render (PSNR of noisy synthetic content): x264 medium
+  CRF 20 5.59 MB / 45.1 dB; `h264_amf` QP 20 (the old 1:1) 10.7 MB / 48.9 dB; QP 26 5.31 MB /
+  45.5 dB (5.21 MB with `-quality quality`); `hevc_amf` QP 26 5.56 MB / 46.1 dB; `av1_amf` QP 90
+  6.41 MB / 46.4 dB. The AV1 slope (the SVT-AV1 0..63 scale on 0..255) and the offset on real
+  footage (VMAF) are **unconfirmed**, so x264 stays every default and "Fast (GPU)" is opt-in.
+  NVENC, QSV and VideoToolbox are unchanged and unmeasured; the stitch's `quality_args` keeps AMF
+  1:1 (a source decoded again). `-profile:v baseline` is no AMF name: `constrained_baseline`.
+  **VAAPI export** (Linux AMD / Intel): the encoders take only frames on the device, so the builder
+  names `-vaapi_device` (stand-in `VAAPI_DEFAULT_DEVICE`, builder stays pure) and the graph ends
+  `[vhw]format=nv12,hwupload[outv]` after the titles (no `-pix_fmt`; validation allows only 8-bit
+  4:2:0). At spawn `tune_export_args` swaps in the probed render node (`/dev/dri/renderD*`, four at
+  most, or `KERF_VAAPI_DEVICE`; first node where anything encodes). An export that is the first to
+  ask starts the probe on a thread and waits 10 s (`vaapi_device_within`), then keeps the stand-in
+  node. Rate control `-rc_mode CQP -global_quality hw_qp(crf)` (lossless 1); the offset is the AMD
+  one. Stitches and proxies never see VAAPI. Unconfirmed without a GPU: that an upload plus encode
+  runs (the graph is rendered with the upload removed, `#[ignore]`d), `/dev/dri` in AppImage /
+  Flatpak, the distro's `libva` (a missing one aborts the probe, read as no VAAPI). Background
   decodes (proxy, stitch, scene detection of an original, the composited still) use the same
   `-hwaccel` (default `auto`, `KERF_HWACCEL=none` to disable) with a learned
   software fallback shared with the preview path (`disable_decode_hwaccel()` is how a
@@ -196,10 +220,8 @@ so the feature is **only** activated through these forwards — which is what ma
   `Failed setup for format`, which a successful `auto` run prints too, so a missing output
   directory or a full disk is not the hardware's) convicts, through `convict_hardware_decode`
   (which also sets the separate `HWACCEL_PROVEN_BAD`): `render_with_progress`
-  (`retry_export_in_software`) and `generate_proxy_with` when only a decoder was in use (with an
-  encoder too the encoder is blamed, as it always was, and the next proxy finds out about the
-  decoder — `blame_after_software_success`; a *stall* still convicts both before the rerun, via
-  the unclassified flag only). **An export drops its symbolic `auto` before the argv is built
+  (`retry_export_in_software`) and `generate_proxy_with` (the decoder is all the hardware a proxy
+  uses; a *stall* convicts it before the rerun, via the unclassified flag only). **An export drops its symbolic `auto` before the argv is built
   (`export_hwaccel_request`) under `KERF_HWACCEL=none` or once `HWACCEL_PROVEN_BAD` is set** — not
   on the previews' flag, so one spurious preview rescue does not send every export to software;
   the GUI's "GPU decode" toggle still shows on meanwhile, and the first export after only a

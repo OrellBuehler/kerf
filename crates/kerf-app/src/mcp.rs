@@ -1113,8 +1113,11 @@ struct ExportParams {
     #[schemars(description = "Optional encode settings. Omit for the safe default (H.264 + AAC MP4). \
                        Key fields: container (mp4/mov/mkv/webm/gif/mp3/m4a/wav/flac); video_codec \
                        (libx264/libx265/libvpx-vp9/libsvtav1/prores_ks/gif, plus GPU encoders \
-                       h264_nvenc/hevc_nvenc/av1_nvenc/h264_qsv/hevc_qsv/h264_videotoolbox/\
-                       hevc_videotoolbox/h264_amf/hevc_amf — far faster, crf still applies); \
+                       h264_nvenc/hevc_nvenc/av1_nvenc/h264_qsv/hevc_qsv/av1_qsv/h264_videotoolbox/\
+                       hevc_videotoolbox/h264_amf/hevc_amf/av1_amf/h264_vaapi/hevc_vaapi/av1_vaapi — \
+                       far faster, crf still applies; use only the ones export_capabilities lists — \
+                       a VAAPI codec on a machine nothing has probed yet waits up to 10 s for the probe \
+                       to find the render node); \
                        audio_codec (aac/libmp3lame/libopus/flac/alac/pcm_s16le/pcm_s24le); \
                        rate_control (crf/bitrate/two_pass/lossless); crf; video_bitrate (\"8M\"); \
                        preset; hwaccel (\"auto\"/\"cuda\"/\"vaapi\"/\"videotoolbox\"/\"qsv\" — GPU \
@@ -3157,7 +3160,7 @@ impl KerfMcp {
     #[tool(
         description = "List the hardware (GPU) video encoders this machine's ffmpeg can actually use (verified by a \
                        test encode) — pass one as export's video_codec for a much faster render. Empty means software \
-                       encoders only."
+                       encoders only. libx264 stays the safe default: a hardware encoder trades file size for speed."
     )]
     async fn export_capabilities(&self) -> Result<String, McpError> {
         let encoders = blocking(|| Ok(kerf_core::hw_encoders().to_vec())).await?;
