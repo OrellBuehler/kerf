@@ -221,8 +221,9 @@ fn a_run_that_closes_its_output_and_never_exits_blocks_nothing_that_stops_it() {
     assert_eq!(stats.runs, 0, "{stats:?}");
 
     let err = asking.join().unwrap().expect_err("a request on a released file");
+    // Failed by the release itself, or by the run it was starting being stopped under it.
     assert!(
-        matches!(&err, GpuError::Decode(why) if why.contains("released")),
+        matches!(&err, GpuError::Decode(why) if why.contains("released") || why.contains("stopped as it started")),
         "the request should fail for the release, not wait out its deadline: {err}"
     );
     let stats = src.stats();

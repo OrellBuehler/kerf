@@ -249,11 +249,16 @@ a real file's probe makes of it), plus six threads at once. The rules it holds t
   `request_timeout` (5 s), `Exact` after the one-shot's 30 s; a run blocks once it is past what
   was asked (plus `Forward`'s read-ahead, 48 MiB of frames, at most 24), so the pipe fills and
   ffmpeg idles; `release(source)`, `release_all()` and `Drop` kill every child. **A request waiting
-  on a file that is released fails** (`GpuError::Decode`; `State::released` keeps the release's
-  epoch for twice the longest deadline, the reaper forgets it): a run the *router* stops sends its
+  on a file that is released fails** (`GpuError::Decode`): a run the *router* stops sends its
   request to route afresh, which for a released file started a new run of it right after `release`
   returned (`spawned: 2`; a test reading `stats().runs` failed whenever that request won the lock).
-  A request that begins after the release is an ordinary one. A run that closes
+  `Shared::releases` counts the releases (an atomic, bumped under the state lock) and `frame()`
+  reads it **before anything else, the probes included** (an ffprobe before the first lock takes
+  seconds on a loaded machine, and a release then is one the request began before);
+  `State::released` (`Releases`) holds each file's count and time, and a request fails on a file whose
+  count is above the one it read; the reaper forgets a release after twice the longest deadline. A
+  request that read the count after the release is an ordinary one and starts a run (a closed source
+  notes nothing). A run that closes
   its stdout and does not exit is killed after `EXIT_GRACE` (5 s; `wait_until`, a `try_wait` loop
   that holds the child's lock only for a poll — the reader used to `wait()` under it, so every
   `kill` and, through `stop` under the state lock, every request waited too). **No process is
