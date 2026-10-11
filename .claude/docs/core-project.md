@@ -167,7 +167,9 @@
   a rebuild put in its place. The adapters pass a `Notify` that turns each change into the
   `proxy-progress` event. A job stays `Queued` until it holds the machine's slot (its first report is
   0.0), and a *manual* Rebuild's progress shows under Always original, which builds none by itself.
-  A worker's per-job run is `catch_unwind`-guarded (`run_guarded`): a panic marks that job `Failed`
+  The queue has `cpu::queue_workers()` workers (`KERF_PROXY_WORKERS` overrides): 1, or 2 where a proxy can take the
+  hardware's slot beside a software one (the lane on, Windows; `engine-cli.md`), so one behind a software proxy does
+  not wait for it. A worker's per-job run is `catch_unwind`-guarded (`run_guarded`): a panic marks that job `Failed`
   and the worker takes the next one. A deleted proxy is remembered **in the project** (`Project::proxy_declined`,
   meta key `proxy_declined`, a list of asset ids; not an edit) so the next open does not build it
   again; a rebuild forgives it. Under **Proxy only** `Project::proxy_waits(from, to)` names the clips

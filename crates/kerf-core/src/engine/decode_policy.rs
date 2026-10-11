@@ -74,8 +74,9 @@ impl Codec {
     }
 }
 
-/// The chroma format of an input, coarsely: 4:2:0 (8 or 10 bit) is what every GPU decodes,
-/// anything else (4:2:2, 4:4:4, 12 bit and up, alpha) is what most do not.
+/// The chroma format of an input, coarsely: 4:2:0 (8 or 10 bit) is what every GPU decodes of
+/// the codecs that have a 10 bit profile at all (see [`InputFacts::hardware_decodes`]), anything
+/// else (4:2:2, 4:4:4, 12 bit and up, alpha) is what most do not.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Chroma {
     /// Not recorded, not probed, or a name nobody here knows: nothing is assumed.
@@ -96,6 +97,28 @@ impl Chroma {
             Some(_) => Chroma::Other,
             None => Chroma::Unknown,
         }
+    }
+}
+
+/// The bit depth of a 4:2:0 pixel format (`yuv420p` 8, `yuv420p10le` and `p010le` 10); `None` for
+/// every other layout and for names nobody here knows.
+pub(crate) fn pix_fmt_bits_420(name: &str) -> Option<u8> {
+    if pix_fmt_layout(name) != Some(PixLayout::Yuv420) {
+        return None;
+    }
+    let n = name.trim().to_ascii_lowercase();
+    let t = n.strip_suffix("le").or_else(|| n.strip_suffix("be")).unwrap_or(&n);
+    if t == "p010" {
+        return Some(10);
+    }
+    let digits = t.chars().rev().take_while(char::is_ascii_digit).count();
+    let tail = &t[t.len() - digits..];
+    match (
+        t.strip_suffix(tail).is_some_and(|stem| stem.ends_with('p')),
+        tail.parse::<u8>(),
+    ) {
+        (true, Ok(bits)) => Some(bits),
+        _ => Some(8),
     }
 }
 
@@ -123,6 +146,8 @@ pub(crate) struct InputFacts {
     pub image: bool,
     pub codec: Codec,
     pub chroma: Chroma,
+    /// The bit depth of a 4:2:0 stream; `None` when not recorded or not 4:2:0.
+    pub bits: Option<u8>,
 }
 
 impl InputFacts {
@@ -136,8 +161,21 @@ impl InputFacts {
     }
 
     /// An input that takes next to nothing to decode.
-    fn cheap(self) -> bool {
+    pub(crate) fn cheap(self) -> bool {
         self.proxy || self.image
+    }
+
+    /// Whether a named hardware decoder has this stream, so that a run holding the hardware's slot
+    /// is hardware and not software that was started beside it: H.264 in 4:2:0 at **8 bit** (High10
+    /// has no D3D11VA, DXVA2 or VAAPI decoder: ffmpeg decodes it in software without a word) and HEVC
+    /// in 4:2:0 at 8 or 10 bit (Main, Main10). An H.264 stream whose depth is not recorded is not
+    /// assumed to be 8.
+    pub(crate) fn hardware_decodes(self) -> bool {
+        match self.codec {
+            Codec::H264 => self.chroma == Chroma::Yuv420 && self.bits == Some(8),
+            Codec::Hevc => self.chroma == Chroma::Yuv420,
+            Codec::Unknown | Codec::Other => false,
+        }
     }
 }
 
@@ -156,6 +194,7 @@ pub(crate) fn facts_from_assets(assets: &[Asset]) -> impl Fn(&str) -> InputFacts
             chroma: video
                 .and_then(|s| s.pix_fmt.as_deref())
                 .map_or(Chroma::Unknown, Chroma::from_pix_fmt),
+            bits: video.and_then(|s| s.pix_fmt.as_deref()).and_then(pix_fmt_bits_420),
         }
     }
 }

@@ -446,6 +446,27 @@ pub fn high_pending() -> bool {
     state(gate()).cpu.proxy > 0
 }
 
+/// How many whole-file jobs a queue should have in flight to keep every slot busy: one for the
+/// cores' slot, and with the lane on and a platform where a job can be hardware from end to end
+/// at all (Windows, where `auto` becomes the named `d3d11va`, see `decode_policy`) as many as the
+/// hardware has slots, so that a hardware proxy behind a software one does not wait for it. Two
+/// software jobs in flight just wait at the gate in arrival order, the second already past its
+/// probe.
+pub fn queue_workers() -> usize {
+    queue_workers_for(
+        gpu_lane(),
+        super::decode_policy::HostOs::CURRENT == super::decode_policy::HostOs::Windows,
+    )
+}
+
+fn queue_workers_for(lane_on: bool, hardware_possible: bool) -> usize {
+    if lane_on && hardware_possible {
+        MAX_GPU_JOBS
+    } else {
+        1
+    }
+}
+
 /// Whether jobs that are hardware from end to end may take the hardware's slot instead of the
 /// cores': on unless `KERF_GPU_LANE` is `off` / `0` / `false`, or [`set_gpu_lane`] turned it off.
 pub fn gpu_lane() -> bool {
@@ -1285,6 +1306,13 @@ mod tests {
     fn no_more_than_the_limit_of_hardware_jobs_run_together() {
         let _serial = exclusive();
         assert_eq!(MAX_GPU_JOBS, 2);
+        assert_eq!(
+            queue_workers_for(true, true),
+            2,
+            "a hardware job can run beside a software one"
+        );
+        assert_eq!(queue_workers_for(false, true), 1, "the lane is off");
+        assert_eq!(queue_workers_for(true, false), 1, "nothing qualifies on this platform");
         let order = std::sync::Arc::new(Mutex::new(Vec::new()));
         let (a, b) = (
             hold(Resource::Gpu, Priority::Foreground),

@@ -15,8 +15,8 @@ use std::time::Instant;
 
 use super::cpu;
 use super::decode_policy::{
-    export_hwaccel_request, facts_from_assets, facts_matter, looks_like_hardware_decode_failure, resolve_hwaccel, tune_inputs,
-    Chroma, Codec, HostOs, InputFacts, Reading,
+    export_hwaccel_request, facts_from_assets, facts_matter, looks_like_hardware_decode_failure, pix_fmt_bits_420,
+    resolve_hwaccel, tune_inputs, Chroma, Codec, HostOs, InputFacts, Reading,
 };
 use super::source_probe::{ProbeCache, SOURCE_PROBE_TIMEOUT};
 use super::ProbeResult;
@@ -189,6 +189,7 @@ fn path_facts(path: &Path) -> InputFacts {
     InputFacts {
         codec: traits.codec,
         chroma: traits.chroma,
+        bits: traits.bits,
         ..InputFacts::default()
     }
 }
@@ -1130,6 +1131,8 @@ pub(crate) struct SourceTraits {
     /// path has to ask of them: whether to request a hardware decoder (`decode_policy`).
     pub codec: Codec,
     pub chroma: Chroma,
+    /// The bit depth of a 4:2:0 stream.
+    pub bits: Option<u8>,
 }
 
 /// [`SourceTraits`] of the file at `path`, probed once per file and cached against the file's
@@ -1216,6 +1219,7 @@ fn parse_source_traits(json: &str) -> SourceTraits {
         indexed,
         codec: Codec::from_name(text("codec_name")),
         chroma: Chroma::from_pix_fmt(text("pix_fmt")),
+        bits: pix_fmt_bits_420(text("pix_fmt")),
     }
 }
 
@@ -2502,6 +2506,7 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         InputFacts {
             codec: traits.codec,
             chroma: traits.chroma,
+            bits: traits.bits,
             ..InputFacts::default()
         },
         cpu::gpu_lane(),
@@ -2641,8 +2646,8 @@ fn retry_proxy_in_software(outcome: StreamOutcome, success: bool, hw_encode: boo
 /// lane is on; a verified hardware encoder (`hw_encoder`) takes it; the source is handed a **named**
 /// decoder (`d3d11va`, which exits non-zero without a device, where `auto` falls back to software
 /// without a word — on Linux and macOS the request stays `auto`, so those stay the cores' until
-/// a decoder is probed); that decoder decodes this source (H.264 or HEVC in 4:2:0, by what the
-/// probe says); and nothing is tone-mapped (that is `zscale` on the cores, about two of them).
+/// a decoder is probed); that decoder decodes this source (`InputFacts::hardware_decodes`: H.264 4:2:0 at 8 bit, HEVC 4:2:0
+/// at 8 or 10, by what the probe says); and nothing is tone-mapped (that is `zscale` on the cores, about two of them).
 fn proxy_resource(
     hw_encoder: Option<&str>,
     hw_decoder: Option<&str>,
@@ -2651,8 +2656,7 @@ fn proxy_resource(
     lane_on: bool,
 ) -> cpu::Resource {
     let named = hw_decoder.is_some_and(|d| !d.trim().is_empty() && !d.trim().eq_ignore_ascii_case("auto"));
-    let decodes = matches!(source.codec, Codec::H264 | Codec::Hevc) && source.chroma == Chroma::Yuv420;
-    if lane_on && hw_encoder.is_some() && named && decodes && !tone_mapped {
+    if lane_on && hw_encoder.is_some() && named && source.hardware_decodes() && !tone_mapped {
         cpu::Resource::Gpu
     } else {
         cpu::Resource::Cpu
@@ -4936,7 +4940,8 @@ fn filter_names(graph: &str) -> Vec<&str> {
 /// (`h264_amf`, `hevc_nvenc`, ...); every input is either a still image or a video that is
 /// handed a **named** accelerator (`d3d11va`: it exits non-zero without a device where `auto`
 /// falls back to software without a word, and a run that does that is a software run holding a
-/// hardware slot) and that accelerator decodes (H.264 or HEVC, 4:2:0, by what the asset records);
+/// hardware slot) and that accelerator decodes (`InputFacts::hardware_decodes`: H.264 4:2:0 at 8 bit,
+/// HEVC 4:2:0 at 8 or 10, by what the asset records);
 /// and the graph holds only [`HARDWARE_GRAPH_FILTERS`]. A run asked for no hardware decode at all,
 /// as the rerun after a failure is, fails the second test and is the cores'.
 fn export_resource(args: &[String], facts_of: &dyn Fn(&str) -> InputFacts, lane_on: bool) -> cpu::Resource {
@@ -4959,7 +4964,7 @@ fn export_resource(args: &[String], facts_of: &dyn Fn(&str) -> InputFacts, lane_
                 inputs += 1;
                 let Some(path) = rest.next() else { return cpu::Resource::Cpu };
                 let facts = facts_of(path);
-                let video = matches!(facts.codec, Codec::H264 | Codec::Hevc) && facts.chroma == Chroma::Yuv420;
+                let video = facts.hardware_decodes();
                 let named = group_hwaccel.is_some_and(|h| {
                     !h.trim().is_empty() && !h.trim().eq_ignore_ascii_case("auto") && !h.trim().eq_ignore_ascii_case("none")
                 });

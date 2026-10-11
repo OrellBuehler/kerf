@@ -209,25 +209,7 @@ so the feature is **only** activated through these forwards — which is what ma
   stage, a levels measurement only honours the Stop; a proxy waiting for its slot is cancelled by a
   delete / rebuild / settings change without ever starting. **Still one job on the cores at a time at
   any budget**: two at once would be two shares of the machine, which is what `cpu_percent` says one
-  job may take. **The one exception is the hardware's own slot** (`cpu::Resource::Gpu`, `MAX_GPU_JOBS` 2): a job
-  that is hardware from end to end feeds the decoder and the encoder with 0.3 to 0.7 of a core, so it neither
-  waits for the cores' job nor holds it up, and two together finish about a third sooner than one after the
-  other (a third gains nothing). It has the **same three lanes** (foreground before proxy before background,
-  arrival order within a lane; a proxy's `Reservation::lease_gpu_waiting` gives its place in front of the
-  cores' background work back, since it will not spend the cores). What qualifies is decided by the caller
-  from what it is about to run and every doubt is the cores: `proxy_resource` (a verified hardware encoder, the
-  source handed a **named** decoder, H.264 or HEVC 4:2:0 by the probe, no tone-map) and `export_resource` (a
-  hardware `-c:v`, every input an image or a video with a named `-hwaccel` that decodes it, and a graph whose
-  filters are all in `HARDWARE_GRAPH_FILTERS`: scale, pad, overlay, fps, ... and the sound ones, none of
-  `zscale` / `geq` / `rotate` / `v360` / `drawtext` / a blur / a grade; judged on the tuned argv, so the rerun
-  after a hardware failure, which asks no input for hardware, is the cores'). `auto` is never named (it falls
-  back to software without a word), so only Windows, where `decode_policy` makes it `d3d11va`, qualifies until
-  a decoder is probed. **A hardware job that falls back to software takes the cores' slot before it reruns**:
-  `Lease::fall_back_to_cpu` gives the hardware slot back first and queues in the same lane (the proxy's rerun;
-  the export's is a fresh attempt that asks for the cores and says "waiting" through `ExportProgress`).
-  `KERF_GPU_LANE=off` / `cpu::set_gpu_lane(false)` keeps every job on the cores' slot. Not measured on a GPU
-  here (nothing in this environment has one): the gate, the classification and the fall-back are unit-tested,
-  the 0.3 to 0.7 core and +32 % figures are the review's, taken on an RX 7900 XT) and **a share of the cores for that job** (`cpu_percent`,
+  job may take) and **a share of the cores for that job** (`cpu_percent`,
   seeded from `KERF_CPU_PERCENT`, set at runtime by the app's settings). **Gated** =
   a whole-file job whose *result* is wanted later and that nobody is looking at:
   silence / scene / loudness detection, the PCM decode behind rhythm and in-process
@@ -254,6 +236,27 @@ so the feature is **only** activated through these forwards — which is what ma
   / `cpu::background_always`, which hold at every budget, because "at 100% leave
   ffmpeg alone" is for the job that owns the machine, and the filmstrip is the side
   job that must stay out of that job's way.
+  **The hardware's slot** (`cpu::Resource::Gpu`, `MAX_GPU_JOBS` 2) is the one exception to one job at a time. A
+  job that is hardware from end to end feeds the decoder and the encoder with 0.3 to 0.7 of a core, so it neither
+  waits for the cores' job nor holds it up, and two together finish about a third sooner than one after the other
+  (a third gains nothing). Same three lanes (foreground, proxy, background; arrival order within one), and a proxy's
+  `Reservation::lease_gpu_waiting` gives its place in front of the cores' background work back. The caller decides
+  what qualifies and every doubt is the cores. `proxy_resource`: the lane on, a verified hardware encoder, the
+  source handed a **named** decoder (`auto` is never named: it falls back to software without a word, so only
+  Windows, where `decode_policy` makes it `d3d11va`, qualifies until a decoder is probed), no tone-map, and a
+  stream the decoder has (`InputFacts::hardware_decodes`: H.264 4:2:0 at **8 bit**, since High10 has no D3D11VA,
+  DXVA2 or VAAPI decoder and ffmpeg decodes it in software without a word, or HEVC 4:2:0 at 8 or 10 bit; an H.264
+  stream whose depth was not recorded is not assumed to be 8). `export_resource`: a hardware `-c:v`, every input an
+  image or a video with a named `-hwaccel` that decodes it, and a graph whose filters are all in
+  `HARDWARE_GRAPH_FILTERS` (scale, pad, overlay, fps, ... and the sound ones; none of `zscale` / `geq` / `rotate` /
+  `v360` / `drawtext` / a blur / a grade), judged on the tuned argv, so the rerun after a hardware failure, which
+  asks no input for hardware, is the cores'. A hardware job that falls back to software takes the cores' slot
+  before it reruns (`Lease::fall_back_to_cpu`: the hardware slot goes back first, then the same lane). The proxy
+  queue runs `cpu::queue_workers()` encodes at once, 2 where the lane can qualify (on, Windows) and 1 elsewhere
+  (`KERF_PROXY_WORKERS` overrides), so a hardware proxy behind a software one does not wait for it; two software
+  ones just wait at the gate in arrival order. `KERF_GPU_LANE=off` / `cpu::set_gpu_lane(false)` keeps every job on
+  the cores' slot. Not measured on a GPU (none here): the gate, the classification and the fall-back are
+  unit-tested, and the 0.3 to 0.7 core and +32 % figures are the review's, from an RX 7900 XT.
   Export is a **positional, multi-track** `filter_complex`
   (`build_export_args` / `build_filter_complex`, both pure + unit-tested): a black
   canvas with every video clip `overlay`'d at its `timeline_start` (later tracks on

@@ -8,6 +8,16 @@ fn video(codec: Codec, chroma: Chroma) -> InputFacts {
     InputFacts {
         codec,
         chroma,
+        bits: (chroma == Chroma::Yuv420).then_some(8),
+        ..InputFacts::default()
+    }
+}
+
+fn deep(codec: Codec, bits: Option<u8>) -> InputFacts {
+    InputFacts {
+        codec,
+        chroma: Chroma::Yuv420,
+        bits,
         ..InputFacts::default()
     }
 }
@@ -68,6 +78,81 @@ fn every_doubt_is_the_cores() {
             Resource::Cpu,
             "{facts:?}"
         );
+    }
+}
+
+#[test]
+fn ten_bit_h264_has_no_hardware_decoder_and_ten_bit_hevc_has() {
+    let dec = |facts: InputFacts| proxy_resource(Some("h264_amf"), Some("d3d11va"), false, facts, true);
+    assert_eq!(dec(deep(Codec::H264, Some(8))), Resource::Gpu);
+    assert_eq!(
+        dec(deep(Codec::H264, Some(10))),
+        Resource::Cpu,
+        "High10 is decoded in software"
+    );
+    assert_eq!(
+        dec(deep(Codec::H264, None)),
+        Resource::Cpu,
+        "a depth nobody recorded is not assumed to be 8"
+    );
+    assert_eq!(dec(deep(Codec::Hevc, Some(10))), Resource::Gpu, "Main10");
+    assert_eq!(dec(deep(Codec::Hevc, Some(8))), Resource::Gpu);
+    assert_eq!(dec(deep(Codec::Hevc, None)), Resource::Gpu);
+}
+
+#[test]
+fn an_export_of_ten_bit_h264_is_the_cores_and_of_ten_bit_hevc_the_hardware() {
+    let a = export("h264_amf", "-hwaccel d3d11va -i /a.mp4", PLAIN_GRAPH);
+    let of = |facts: InputFacts| export_resource(&a, &by_path(vec![("/a.mp4", facts)]), true);
+    assert_eq!(of(deep(Codec::H264, Some(8))), Resource::Gpu);
+    assert_eq!(of(deep(Codec::H264, Some(10))), Resource::Cpu);
+    assert_eq!(of(deep(Codec::H264, None)), Resource::Cpu);
+    assert_eq!(of(deep(Codec::Hevc, Some(10))), Resource::Gpu);
+}
+
+#[test]
+fn the_depth_of_a_4_2_0_name_is_read_from_it() {
+    use crate::engine::decode_policy::pix_fmt_bits_420;
+    for (name, bits) in [
+        ("yuv420p", 8),
+        ("yuvj420p", 8),
+        ("nv12", 8),
+        ("yuv420p10le", 10),
+        ("yuv420p10be", 10),
+        ("yuv420p9le", 9),
+        ("p010le", 10),
+    ] {
+        assert_eq!(pix_fmt_bits_420(name), Some(bits), "{name}");
+    }
+    for name in [
+        "yuv422p10le",
+        "yuv444p",
+        "yuv420p12le",
+        "yuva420p",
+        "rgb24",
+        "gray",
+        "something_new",
+        "",
+    ] {
+        assert_eq!(pix_fmt_bits_420(name), None, "{name}");
+    }
+}
+
+#[test]
+fn the_asset_lists_depth_reaches_the_facts() {
+    let mut asset = crate::engine::test_support::test_asset(vec![crate::engine::test_support::video_stream(1920, 1080, 30.0)]);
+    asset.path = "/a.mp4".to_string();
+    for (pix_fmt, codec, expected) in [
+        ("yuv420p", "h264", Some(8)),
+        ("yuv420p10le", "h264", Some(10)),
+        ("yuv420p10le", "hevc", Some(10)),
+        ("yuv422p10le", "hevc", None),
+    ] {
+        let video = asset.streams.iter_mut().find(|s| s.kind == StreamKind::Video).unwrap();
+        video.pix_fmt = Some(pix_fmt.to_string());
+        video.codec = codec.to_string();
+        let facts = crate::engine::decode_policy::facts_from_assets(std::slice::from_ref(&asset))("/a.mp4");
+        assert_eq!(facts.bits, expected, "{codec} {pix_fmt}");
     }
 }
 
