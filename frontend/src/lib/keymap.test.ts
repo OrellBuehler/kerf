@@ -20,6 +20,7 @@ import {
 	findCollisions,
 	formatChord,
 	matchAction,
+	modLabel,
 	parseChord,
 	parseKeyOverrides,
 	rebindConflicts,
@@ -1112,4 +1113,23 @@ test('sameChord compares all five parts', () => {
 	expect(sameChord(chord('Mod+Z'), chord('Z'))).toBe(false);
 	expect(sameChord(chord('Alt+Z'), chord('Z'))).toBe(false);
 	expect(sameChord(chord('Mod+Z'), chord('Mod+Y'))).toBe(false);
+});
+
+describe('modifiers in prose', () => {
+	test('a Mac says Option and Command, everywhere else Alt and Ctrl, and Shift is Shift', () => {
+		expect(modLabel('mac', 'alt')).toBe('Option');
+		expect(modLabel('other', 'alt')).toBe('Alt');
+		expect(modLabel('mac', 'primary')).toBe('Command');
+		expect(modLabel('other', 'primary')).toBe('Ctrl');
+		expect(modLabel('mac', 'shift')).toBe('Shift');
+		expect(modLabel('other', 'shift')).toBe('Shift');
+	});
+
+	test('the mixer’s tooltips take theirs from the platform instead of printing Alt', () => {
+		for (const f of ['MasterStrip', 'FaderMeter', 'MixerStrip']) {
+			const source = readFileSync(join(import.meta.dir, `components/editor/${f}.svelte`), 'utf8');
+			expect(source, f).toContain("settings.modLabel('alt')");
+			expect(source, f).not.toMatch(/[,(]\s*Alt\s/);
+		}
+	});
 });

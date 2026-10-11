@@ -15,6 +15,7 @@
 	import { readingText } from '$lib/levels-view';
 	import type { SliderKey } from '$lib/slider-gesture';
 	import type { LevelReading } from '$lib/types';
+	import { settings } from '$lib/settings.svelte';
 	import { tip } from '$lib/tip';
 
 	let {
@@ -157,7 +158,7 @@
 			label="{strip.name} pan"
 			valueText={panLabel}
 			tip="Pan {panLabel(pan)} — left {sideLabel(sides.left)}, right {sideLabel(sides.right)}. Drag, or ← → to nudge {PAN_STEP.normal *
-				100}% (Shift {PAN_STEP.coarse * 100}%, Alt {PAN_STEP.fine * 100}%); double-click to centre"
+				100}% ({settings.modLabel('shift')} {PAN_STEP.coarse * 100}%, {settings.modLabel('alt')} {PAN_STEP.fine * 100}%); double-click to centre"
 			detent={0.5}
 			fillFrom={0.5}
 			accent="var(--text-muted)"

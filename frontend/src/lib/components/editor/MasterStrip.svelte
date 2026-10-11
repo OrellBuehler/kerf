@@ -41,6 +41,7 @@
 	import type { MasterBus } from '$lib/types';
 	import type { MeasureResult } from '$lib/editor-ui.svelte';
 	import { fxSummary, loadMasterFxOpen, saveMasterFxOpen } from '$lib/master-fx';
+	import { settings } from '$lib/settings.svelte';
 	import { tip } from '$lib/tip';
 
 	let {
@@ -225,7 +226,7 @@
 						step={ceilingStep}
 						label="Limiter ceiling"
 						valueText={ceilingLabel}
-						tip="Limiter ceiling {ceilingLabel(ceiling)} — the level the finished mix is held under. Drag, or ← → to nudge {CEILING_STEP.normal} dB (Shift {CEILING_STEP.coarse}, Alt {CEILING_STEP.fine}); double-click for {ceilingLabel(
+						tip="Limiter ceiling {ceilingLabel(ceiling)} — the level the finished mix is held under. Drag, or ← → to nudge {CEILING_STEP.normal} dB ({settings.modLabel('shift')} {CEILING_STEP.coarse}, {settings.modLabel('alt')} {CEILING_STEP.fine}); double-click for {ceilingLabel(
 							MASTER_DEFAULT_CEILING_DB
 						)}. {APPROX}"
 						detent={ceilingToPos(MASTER_DEFAULT_CEILING_DB)}
@@ -264,7 +265,7 @@
 							step={duckStep}
 							label="Speech gate depth"
 							valueText={duckLabel}
-							tip={`Speech gate depth ${duckLabel(depth)} — how far a ducked track drops while the rest of the mix speaks. Drag, or ← → to nudge ${DUCK_STEP.normal} dB (Shift ${DUCK_STEP.coarse}); double-click for ${duckLabel(DUCK_DEFAULT_DEPTH_DB)}. ${DUCK_NOTE}`}
+							tip={`Speech gate depth ${duckLabel(depth)} — how far a ducked track drops while the rest of the mix speaks. Drag, or ← → to nudge ${DUCK_STEP.normal} dB (${settings.modLabel('shift')} ${DUCK_STEP.coarse}); double-click for ${duckLabel(DUCK_DEFAULT_DEPTH_DB)}. ${DUCK_NOTE}`}
 							detent={duckToPos(DUCK_DEFAULT_DEPTH_DB)}
 							accent="var(--text-muted)"
 							onpreview={(v) => (duckPreview = v)}
