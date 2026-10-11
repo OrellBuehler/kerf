@@ -2902,8 +2902,9 @@ fn an_asset_that_never_recorded_its_pixel_format_is_assumed_nothing() {
 /// to FFmpeg's `drawtext` sample for sample).
 ///
 /// **The allowance over the control is nothing**, and a case that needs some says how much and why
-/// ([`check_text_extra`]); measured on both FFmpegs, three do: two pixels of the lower third's box one
-/// level over inside its fade-in, the 12 px text (two levels), and the full-range pictures on 9.0.
+/// ([`check_text_extra`]); measured on both FFmpegs, three do: two glyph-edge pixels of the lower third
+/// one level over at 0.1 s (YUV -> RGB error near the gamut edge), the 12 px text (two levels), and the
+/// full-range pictures on 9.0 (a known model difference).
 const CONVERSION_BIAS: i32 = 3;
 
 fn check_text(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
@@ -3008,8 +3009,9 @@ fn the_apps_title_and_caption_styles_are_drawn_as_ffmpeg_draws_them() {
                 one,
                 &times[..1],
                 1,
-                "inside the fade-in the box's alpha is a sampled number here and drawtext's own float \
-                 expression there: two pixels of it one level over the control, at 0.1 s",
+                "two glyph-edge pixels of low coverage over saturated green are one level over the control at 0.1 s: \
+                 the YUV -> RGB conversion's error near the gamut edge, not the blend (`tests/text.rs` holds \
+                 the blend's arithmetic to drawtext's, sample for sample)",
             );
             check_text(name, &tl, one, &times[1..]);
         } else {
@@ -3139,7 +3141,8 @@ fn text_over_every_kind_of_picture_is_drawn_as_ffmpeg_draws_it() {
             std::slice::from_ref(a),
             &[0.5],
             if negotiates { 2 } else { 0 },
-            "9.0 draws the text in full range and converts the range last, which the control (no text) does not",
+            "a known model difference, not rounding: 9.0 draws the text in full range and converts the range last, \
+             the compositor blends it in the limited-range composite",
         );
     }
     // Over a layer whose source has no frame there (a clip longer than its footage): nothing is drawn
