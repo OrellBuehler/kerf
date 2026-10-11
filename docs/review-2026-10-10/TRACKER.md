@@ -18,7 +18,7 @@
 | PERF-4 Still cache and prefetch | perf-4 (on perf-3 + gpu-3) | | r1 fixes (no blockers) | gpu-media WP6, WP9; gpu-compositor Hint::Prefetch | dev done: 20-step 60 Hz scrub drag 990–1419 → 317 ms (1 layer, 9.0.2), 1872–2386 → 317–396 ms (3 layers); marginal window frame ~0.05–9 ms vs 50–119 ms per spawn; cut stall 145–183 ms → 0.22 ms with Hint::Prefetch; golden unchanged |
 | GPU-2 Text on the GPU | gpu-2 (on gpu-3, pushed) | | ready (PR after #129) | gpu-compositor | dev done: T1 captioned 12.7%→96.0% GPU frames, T1b 13.3%→100%, T2 69.5%→78.8%, T3 65.6%→83.3%; 76 text parity cases pass on 6.1.1 + 9.0.2; also fixes drawtext escaping of ' : \ (pre-existing export bug) |
 | GPU-4 Motion fades/transitions | gpu-4 (on gpu-2) | | r1 fixes (4 blockers: unrefused dip-to-white on letterbox / odd size / RGB source; fades on full-range under 9.0.2) | gpu-compositor WP-4 | dev done: still-plan GPU frames T1 96.0→100%, T2 78.8→100%, T3 83.3% (WP-6 refusals); Motion export frames 0→100% (T3 16.6%); motion parity plane-exact where unscaled, 1–2 levels where scaled, dip-to-white 2 levels; golden unchanged |
-| PERF-5 AMF/VAAPI export encode | perf-5 | | review | gpu-media WP4, WP5, WP11 | wave 4 |
+| PERF-5 AMF/VAAPI export encode | perf-5 | | r1 fixes (no blockers; golden verified: only the 282 AMF export digests moved) | gpu-media WP4, WP5, WP11 | wave 4 |
 | GPU-5 … GPU-7, macOS presenter | | | todo | | wave 4 |
 | CI: retry + cache ffmpeg download | ci-fetch-retry | #131 | closed (landed via #130) | not a review finding | evermeet.cx throttles the macOS pinned-ffmpeg fetch (ffprobe 429 for 6.5+ min); retry + actions/cache ported into #129, #130, #132; cache fills only after one successful run |
 
@@ -80,7 +80,10 @@
 - PERF-5: proxies never hardware-encode (libx264 -g 1, HW decode kept). AMF/VAAPI QP = CRF+6 (H.264/HEVC), CRF×4 (AV1), from the review's size/PSNR calibration; other HW families unchanged. x264 stays every default; GPU export is a frontend preset "Fast (GPU)", listed only with a verified H.264 HW encoder. VAAPI 8-bit 4:2:0 only, device a builder stand-in swapped at spawn. AMF baseline profile → constrained_baseline (AMF rejects baseline).
 - Merging main into ui-6 after UI-4 landed: UI-4's new title= attributes converted to use:tip (UI-6's native-title guard).
 
+- #134 (PERF-3) macOS CI: `a_frame_reports_how_far_behind_its_slot_it_arrived` assumed the scheduler wakes within 50 ms (20 ms slots); the macOS runner overslept ~130 ms so a frame was really late. Fixed by pacing the not-late case at 4 fps and widening the late frame's upper bound (4565713).
+
 ## Needs a real machine
+- PERF-5: proxies no longer hardware-encode on NVENC / QSV / VideoToolbox either (WP5 was measured on AMD RX 7900 XT only): confirm proxy CPU cost on NVIDIA and Apple Silicon with long 4K footage.
 - PERF-5: VMAF on real footage for AMF H.264/HEVC/AV1 at the new QPs (+6, AV1 ×4) vs x264, and `-quality quality` timing — only then change any default; `av1_amf` on RX 7000+; Linux radeonsi/iHD VAAPI probe + `-vaapi_device`/`hwupload` encode (with `-hwaccel auto` decode), CQP acceptance, `av1_vaapi`; distro FFmpeg without VAAPI, AppImage/Flatpak `/dev/dri`, missing libva; NVENC/QSV/VideoToolbox QP calibration.
 - PERF-4: the GPU lane (`Resource::Gpu`, MAX_GPU_JOBS=2) and its software fall-back on a real Windows/AMD driver; the GPU-preview prefetch driver against a real surface (cut-stall numbers are debug-build lavapipe).
 - GPU-4: fade/blend integer math bit-identical on real Metal / DX12 / Vulkan and WARP (lavapipe only); dip-to-white 2-level bound measured on x86 swscale only (macOS arm64 NEON unmeasured); a paused frame inside a dissolve in the real GPU preview.
