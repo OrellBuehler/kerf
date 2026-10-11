@@ -140,6 +140,19 @@ describe('the hardware encoders', () => {
 		expect(cmd('libx264')).toContain('-pix_fmt yuv420p');
 	});
 
+	test('lossless is spelled per family, as the engine does', () => {
+		const lossless = (codec: string) =>
+			buildCommandPreview({ ...applyPreset('web_1080p'), video_codec: codec, rate_control: 'lossless', preset: null }, true, false);
+		expect(lossless('h264_vaapi')).toContain('-c:v h264_vaapi -rc_mode CQP -global_quality 1');
+		expect(lossless('h264_amf')).toContain('-rc cqp -qp_i 0 -qp_p 0');
+		expect(lossless('h264_nvenc')).toContain('-rc constqp -qp 0');
+		expect(lossless('hevc_qsv')).toContain('-global_quality 1');
+		expect(lossless('hevc_videotoolbox')).toContain('-q:v 100');
+		expect(lossless('libx264')).toContain('-crf 0');
+		expect(lossless('libvpx-vp9')).toContain('-lossless 1');
+		expect(lossless('h264_vaapi')).not.toContain('-crf');
+	});
+
 	test('VAAPI is an 8-bit 4:2:0 encoder, as the engine validates', () => {
 		const base = { ...applyPreset('web_1080p'), video_codec: 'h264_vaapi' };
 		expect(validateExport({ ...base, pix_fmt: 'yuv420p' }, true, true)).toEqual([]);
@@ -196,13 +209,15 @@ describe('the "Fast (GPU)" preset', () => {
 		expect(gpuPreset(['h264_amf', 'h264_nvenc'])?.opts.video_codec).toBe('h264_nvenc');
 	});
 
-	test("is a legal export in the container it names, at the encoder's own defaults", () => {
+	test("is a legal export in the container it names, at Web 1080p's quality", () => {
 		for (const codec of ['h264_nvenc', 'h264_qsv', 'h264_videotoolbox', 'h264_amf', 'h264_vaapi']) {
 			const opts = applyPreset(GPU_PRESET_ID, [codec]);
 			expect(opts.video_codec, codec).toBe(codec);
 			expect(opts.container).toBe('mp4');
 			expect(opts.hwaccel).toBe('auto');
-			expect(opts.crf).toBe(HW_VIDEO_CODECS[codec].crf?.[2]);
+			// Web 1080p's CRF, not the encoder's own default (23: QP 29 on AMF, a smaller, softer file).
+			expect(opts.crf).toBe(applyPreset('web_1080p').crf);
+			expect(opts.crf).toBe(20);
 			expect(opts.pix_fmt).toBe('yuv420p');
 			expect(opts.profile_v ?? null).toBeNull();
 			expect(validateExport(opts, true, true), codec).toEqual([]);
@@ -218,5 +233,6 @@ describe('the "Fast (GPU)" preset', () => {
 		expect(p.label).toBe('Fast (GPU)');
 		expect(p.description).toContain('AMD GPU (AMF)');
 		expect(p.description).toContain('somewhat larger file');
+		expect(p.description).toContain('CRF 20');
 	});
 });

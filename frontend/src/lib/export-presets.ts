@@ -350,7 +350,9 @@ export const GPU_PRESET_ID = 'gpu_fast';
  *  family order. */
 const GPU_H264 = ['h264_nvenc', 'h264_qsv', 'h264_videotoolbox', 'h264_amf', 'h264_vaapi'];
 
-/** "Fast (GPU)": Web 1080p on the graphics card, encode and decode. Offered only when the backend
+/** "Fast (GPU)": Web 1080p on the graphics card, encode and decode, at Web 1080p's CRF 20 (the AMD
+ *  and VAAPI encoders map it to the equal-quality QP, `hwQp`; NVENC, QSV and VideoToolbox take the
+ *  number as it is, unverified). Offered only when the backend
  *  verified an H.264 hardware encoder (`hw_encoders`), and never the default: x264 stays the
  *  default until the hardware encoders' quality is confirmed on real footage. */
 export function gpuPreset(hw: readonly string[]): Preset | null {
@@ -359,11 +361,12 @@ export function gpuPreset(hw: readonly string[]): Preset | null {
 	return {
 		id: GPU_PRESET_ID,
 		label: 'Fast (GPU)',
-		description: `${HW_VIDEO_CODECS[codec].label} MP4 at 1080p with GPU decode: far quicker than Web 1080p. Hardware encoders usually need a somewhat larger file for the same quality.`,
+		description: `${HW_VIDEO_CODECS[codec].label} MP4 at 1080p with GPU decode, at Web 1080p's quality setting (CRF 20): far quicker. Hardware encoders usually need a somewhat larger file for the same quality.`,
 		opts: {
 			container: 'mp4',
 			...videoCodecDefaults(codec),
 			rate_control: 'crf',
+			crf: 20,
 			resolution: [1920, 1080],
 			hwaccel: 'auto',
 			audio_codec: 'aac',
@@ -547,7 +550,13 @@ export function buildCommandPreview(opts: ExportOptions, hasVideo: boolean, hasA
 			} else if (opts.rate_control === 'two_pass' && opts.video_bitrate) {
 				a.push('-b:v', opts.video_bitrate, '-pass', '1/2');
 			} else if (opts.rate_control === 'lossless') {
-				a.push(vc === 'libvpx-vp9' ? '-lossless 1' : '-crf 0');
+				// The extreme of each family's quality knob, as `push_video_opts` spells it.
+				if (vc.endsWith('_nvenc')) a.push('-rc', 'constqp', '-qp', '0');
+				else if (vc.endsWith('_qsv')) a.push('-global_quality', '1');
+				else if (vc.endsWith('_videotoolbox')) a.push('-q:v', '100');
+				else if (vc.endsWith('_amf')) a.push('-rc', 'cqp', '-qp_i', '0', '-qp_p', '0');
+				else if (vc.endsWith('_vaapi')) a.push('-rc_mode', 'CQP', '-global_quality', '1');
+				else a.push(vc === 'libvpx-vp9' ? '-lossless 1' : '-crf 0');
 			}
 			if (vc === 'libvpx-vp9') a.push('-cpu-used', opts.preset ?? '4');
 			else if (vc.endsWith('_amf')) a.push('-quality', 'quality');

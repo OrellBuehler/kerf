@@ -590,7 +590,8 @@ landscape and the readiness panel warned about the shape the user had just chose
 **Fast (GPU)** (`gpuPreset(hw)`, after Web 1080p) is listed only when `hw_encoders` verified an
 H.264 hardware encoder (`api.hwEncoders()`, whose answer `knownHwEncoders()` keeps so a reopened
 dialog lists it at once) and is never what the dialog opens on: it is Web 1080p with that encoder
-(first of NVENC, QuickSync, VideoToolbox, AMF, VAAPI), its own default CRF and GPU decode. The x264
+(first of NVENC, QuickSync, VideoToolbox, AMF, VAAPI), Web 1080p's CRF 20 (the engine maps it to the
+equal-quality QP on AMF and VAAPI; the other families take the number as it is) and GPU decode. The x264
 presets stay the defaults until the hardware encoders' quality is confirmed on real footage.
 `hwQp` mirrors the engine's CRF→QP offset for the command preview. Under `bun run dev`,
 **`?hw=h264_amf,hevc_amf`** answers `hw_encoders` as a machine with those encoders (none by default).
