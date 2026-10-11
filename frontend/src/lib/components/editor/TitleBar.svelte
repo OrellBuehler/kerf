@@ -9,6 +9,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { workspace } from '$lib/workspace.svelte';
 	import { proposalIndicator, reviewChipText } from '$lib/agent-status';
+	import { exportButtonState } from '$lib/export-button';
 	import { updater } from '$lib/updater.svelte';
 	import { notifications } from '$lib/notifications.svelte';
 	import { settings } from '$lib/settings.svelte';
@@ -38,6 +39,9 @@
 	const proposal = $derived(proposalIndicator(editor.staged));
 	const exporting = $derived(editor.exportRun);
 	const exportPercent = $derived(Math.round((exporting?.progress?.fraction ?? 0) * 100));
+	const exportState = $derived(
+		exportButtonState({ clips: editor.liveTimeline.tracks.reduce((n, t) => n + t.clips.length, 0), running: exporting !== null })
+	);
 </script>
 
 <!-- Three cells so the workspace tabs sit on the centre line whatever else the
@@ -82,26 +86,33 @@
 		{/if}
 		<!-- The app's goal had no button outside the Deliver workspace; it is File › Export… and Ctrl+E too. A
 		     render that is under way shows here as well as in the status bar, and the button reopens its dialog. -->
-		<Btn
-			variant="primary"
-			size="sm"
-			icon={exporting ? undefined : 'upload'}
-			title={exporting
-				? { text: `Exporting ${exportPercent}%`, detail: 'Open the export dialog to follow or stop it.' }
-				: settings.tip('Export…', 'file.export', 'Render the cut to a file')}
-			onclick={() => ui.openExport()}
-			style="-webkit-app-region:no-drag"
-		>
-			{#if exporting}
-				<span
-					class="kerf-spin"
-					style="width:10px;height:10px;border:1.5px solid currentColor;border-top-color:transparent;border-radius:50%"
-				></span>
-				{exporting.progress?.waiting ? 'Waiting…' : `${exportPercent}%`}
-			{:else}
-				Export
-			{/if}
-		</Btn>
+		<!-- An empty cut has nothing to render, so the button is off and says so; the tooltip sits on a wrapper
+		     because a disabled button swallows the pointer. -->
+		<span use:tip={exportState.reason} style="display:inline-flex;-webkit-app-region:no-drag">
+			<Btn
+				variant="primary"
+				size="sm"
+				icon={exporting ? undefined : 'upload'}
+				disabled={exportState.disabled}
+				title={exportState.disabled
+					? undefined
+					: exporting
+						? { text: `Exporting ${exportPercent}%`, detail: 'Open the export dialog to follow or stop it.' }
+						: settings.tip('Export…', 'file.export', 'Render the cut to a file')}
+				onclick={() => ui.openExport()}
+				style={exportState.disabled ? 'pointer-events:none' : ''}
+			>
+				{#if exporting}
+					<span
+						class="kerf-spin"
+						style="width:10px;height:10px;border:1.5px solid currentColor;border-top-color:transparent;border-radius:50%"
+					></span>
+					{exporting.progress?.waiting ? 'Waiting…' : `${exportPercent}%`}
+				{:else}
+					Export
+				{/if}
+			</Btn>
+		</span>
 		<button
 			class="k-ibtn"
 			data-on={settings.open ? '' : undefined}
@@ -130,10 +141,10 @@
 			<Icon n="bell" s={13} color="currentColor" />
 			{#if notifications.unread}
 				<span
-					style="position:absolute;top:-3px;right:-4px;min-width:14px;height:14px;padding:0 3px;border-radius:999px;display:grid;place-items:center;box-shadow:0 0 0 1.5px var(--surface-app);font-family:var(--font-mono);font-size:var(--text-2xs);line-height:1;color:var(--text-on-accent);background:{notifications.unreadProblem
+					style="position:absolute;top:-3px;right:-4px;min-width:14px;height:14px;padding:0 3px;border-radius:999px;display:inline-flex;align-items:center;justify-content:center;gap:1px;box-shadow:0 0 0 1.5px var(--surface-app);font-family:var(--font-mono);font-size:var(--text-2xs);line-height:1;color:var(--text-on-accent);background:{notifications.unreadProblem
 						? 'var(--danger)'
 						: 'var(--kerf-500)'}"
-					>{notifications.unreadProblem ? '!' : ''}{notifications.unread > 99 ? '99+' : notifications.unread}</span
+					>{#if notifications.unreadProblem}<Icon n="alert-triangle" s={9} color="currentColor" />{/if}{notifications.unread > 99 ? '99+' : notifications.unread}</span
 				>
 			{/if}
 		</button>
