@@ -567,20 +567,64 @@ export and a saved cover offer **Show in folder** in their toast.
 — per-frame `get_timeline_frame` decodes stay for scrubbing, shuttle and the
 settled frame, where you want *one* frame rather than all of them. Its effect keys
 off `ui.seekEpoch` (bumped only by a deliberate seek or a fresh play) and never off
-`ui.time`, which ticks every animation frame and would respawn ffmpeg 60×/sec.
+`ui.time`, which ticks every animation frame and would respawn ffmpeg 60×/sec; it
+also restarts for the pane's request width (`boxWidth`, which moves a few times in a
+session) but not for the source cap, which changes as the playhead crosses clips.
+**The stream plays at the cut's own frame rate** (`playbackFps(editor.fps)`, held to 1..60;
+the page leaves `fps` out and the engine reads the same number, `playback_params`) **and at
+the width the pane asks for**, `frameWidth` held to the source at the playhead, so a playing frame
+is as sharp as the paused one. **Its frames are raw JPEG bytes**, not data URLs:
+`api.ts` `startPlayback` parses each channel message (`frame-transport.ts`
+`parsePlaybackMessage`: an `f64` time, then the JPEG) into `{ time, jpeg: Blob }`, and the
+stream painter (`createStreamPainter`: two decodes in flight at most, the newest waiting
+frame wins, a frame that finishes after a newer one is dropped, nothing is drawn after
+`stop`) decodes it with `createImageBitmap` (`frame-canvas.ts`, which falls back to a data URL
+through an `Image` if a webview lacks it or cannot read a frame the image route can) and draws
+it on a `<canvas>` over the still (`object-fit: contain`, like the `<img>`; a `blob:` URL would
+need a CSP entry). The pump's `streamShown` says the canvas holds the picture; a fetched frame
+(the settled still after a pause, a seek) clears it. In the browser harness `startPlayback`
+**synthesizes** JPEG frames (`sampleFrameJpeg`) at the requested fps behind a deliberate 90 ms
+lag, through the same decode-and-draw path, so playback moves under `bun run dev` and the
+failure modes are reproducible without a desktop build.
 Which frames survive is `playback-sync.ts`'s `createFrameGate` (`show`/`skip`/
-`resync`, unit-tested — the one piece of frontend logic with tests): every frame
-arrives late by a *constant* transport cost (ffmpeg's spawn, then base64 + JSON +
-IPC) that on its own exceeds the two-frame `STALE_AFTER` budget, so lag is judged
-against the smallest this stream has managed rather than against zero — measuring
-from zero dropped every frame forever and froze the pane. Only growth past that
-floor is drift: `STALE_AFTER` skips the frame, `RESYNC_AFTER` restarts the stream
-from the playhead rather than playing it out in slow motion against the sound.
-`start_playback` logs `frames` / `first_frame_ms` per run, which is what separates
-"never started" from "sent but dropped"; in the browser harness `startPlayback`
-**synthesizes** frames at the requested fps behind a deliberate 90 ms lag, so
-playback moves under `bun run dev` and that failure mode is reproducible without a
-desktop build. `ExportDialog` (⌘E) drives
+`resync`/`degrade`, unit-tested): every frame
+arrives late by a *constant* transport cost (ffmpeg's spawn, then IPC and the decode)
+that on its own exceeds the two-frame `staleAfter` budget (not less than 50 ms, so 60 fps
+keeps three frames), so lag is judged against the smallest this stream has managed rather
+than against zero — measuring from zero dropped every frame forever and froze the pane.
+Only growth past that floor is drift: `staleAfter` skips the frame, `RESYNC_AFTER` restarts
+the stream from the playhead rather than playing it out in slow motion against the sound.
+**A stream that renders slower than it plays** (60 fps asked of a machine that does 50: the
+frames are a sixth of a second further behind every second) would be skipped to a frozen
+pane for the six seconds it takes to drift a second behind, so the gate counts a run of skips
+whose drift is still growing and after `OVERLOAD_AFTER` (0.4 s of frames) says `degrade` (a
+burst after a hiccup is a run of skips too, but its drift shrinks). `degrade` — and a `resync`
+that follows another within 10 s — restarts the stream from the playhead one rung cheaper
+(`stepDown`): **frames are dropped from the source, not from the stream** — ffmpeg has no
+wall clock, so dropping the ones it already rendered saves nothing — halving a rate above 30
+first (60 → 30), then narrowing the width a step at a time to 960 (1920 → 1440 → 960), then
+halving again (30 → 15), then the narrowest step; smooth motion before a sharp picture that is
+moving. The rung is remembered per cut, proxy epoch and pane width (a new one starts at the top
+again) for a minute after the last restart (`stepsToStart`: a stream that met a busy moment finds
+out; one that cannot is stepped down again within a second). It is a counter read when the stream
+starts, not state, and an explicit `fps` / `width` goes to the backend only from the first step down.
+At the cheapest rung the gate is built
+without `degrade` (a restart is an ffmpeg spawn on a machine that is already short): it skips to the
+resync, as it did before.
+`start_playback` logs `frames` / `first_frame_ms` / `late_frames` per run, which is what separates
+"never started" from "sent but dropped" from "could not keep up".
+**What the raw transport measured** (headless Chromium, software rendering, 4 shared cores, 300
+unique JPEG frames per size): it is **not** the 2-4x the review expected. Per frame, `JSON.parse` of
+the data-URL message 0.1 ms and `img.src =` 0.1-0.3 ms are already cheap — Chromium decodes lazily
+off the main thread — so the old path's `decode()` took 3.1 / 5.4 / 8.4 ms at 960 / 1280 / 1920 px
+where header + `Blob` + `createImageBitmap` took 4.5 / 6.3 / 11.6 ms including 0.6 ms of copying;
+the browser's CPU per painted frame at 30 and 60 fps was within 10% either way, and the canvas path
+keeps the main thread a little busier (a software `drawImage`; `bitmaprenderer` was no better). What it
+does buy is 25% fewer bytes through the channel (76 → 57 KB at 1080p) and no base64 / JSON at either
+end. (An explicit `img.decode()` on data URLs loaded back to back in a tight loop rejected with
+EncodingError for about half of them, which `createImageBitmap` never did; the old path never called it.)
+WebKit and WebView2 are unmeasured.
+`ExportDialog` (⌘E) drives
 the full `ExportOptions` surface — presets, containers/codecs, rate control, resolution,
 a loudness target, and a **Range: In → out** choice when marks are set. It **opens on
 the frame the project is cut for** (`initialExport`): the preset whose resolution is
@@ -650,7 +694,7 @@ else the original's; `capToSource`), since the default proxy is 1280 px wide and
 same picture upscaled at several times the decode cost on every scrub frame — not under a delivery frame, whose canvas is
 not the source's shape (`data-request-width` on the frame says what it asked). The pump (`frame-pump.svelte.ts`) takes it as `width()`, reads it in `run()` — a different
 step is a new frame — and asks nothing until the box has been measured, so a first frame is not decoded at a guess
-and again at the real size. (Playback's streamed frames keep the backend's fixed stream width.) The picture is clipped to the
+and again at the real size. (Playback's streamed frames ask for the same width, read when the stream starts.) The picture is clipped to the
 frame's radius and the frame's border is `border-strong`, since a black matte is 1.05:1 on the pane. **The HUD** over the
 picture is scrim chips with `text-on-video` (the name, ellipsised at 62 % of the width so a long file name never reaches the
 format, then `1920×1080 · 30 fps` in the transport's own rate format, and the proxy / analysis status chips with a dot) — bare

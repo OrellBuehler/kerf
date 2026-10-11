@@ -115,7 +115,8 @@ import { synthWaveformRange } from './sample-waveform';
 import { analysisKindDone, ALL_KINDS } from './analysis-steps';
 import { sampleFilmstrip } from './sample-filmstrip';
 import { synthPcm } from './sample-audio';
-import { sampleFrameUrl } from './sample-frame';
+import { sampleFrameJpeg } from './sample-frame';
+import { jpegBlob, parsePlaybackMessage } from './frame-transport';
 import { captionsForTimeline, resolveCaptions } from './captions';
 import { describeError, logFrontend } from './log';
 import { parseLaunchRequest } from './launch';
@@ -949,8 +950,15 @@ async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Pro
 export interface PlaybackFrame {
 	/** Timeline time this frame shows, for dropping ones the clock has passed. */
 	time: number;
-	/** `data:image/jpeg;base64,…` — the same shape `getTimelineFrame` returns. */
-	jpeg: string;
+	/** The frame as JPEG bytes, undecoded — `createImageBitmap` takes it from here. */
+	jpeg: Blob;
+}
+
+/** What a playback stream is asked for. `null` leaves it to the engine: the cut's own frame rate
+ *  and the default width. The preview states both only after a stream could not keep up. */
+export interface PlaybackRequest {
+	fps: number | null;
+	width: number | null;
 }
 
 /**
@@ -958,19 +966,20 @@ export interface PlaybackFrame {
  * until playback stops. Returns a function that stops it.
  *
  * One long-lived ffmpeg renders the whole span, rather than the one process per
- * frame that scrubbing uses — the difference between a slideshow and video. In
- * the browser harness there is no backend, so frames are synthesized instead
+ * frame that scrubbing uses — the difference between a slideshow and video. Its frames
+ * come up as raw bytes (the timeline time, then the JPEG), not as base64 data URLs in
+ * JSON. In the browser harness there is no backend, so frames are synthesized instead
  * (see `samplePlayback`).
  */
 let playbackSeq = 0;
 
 export function startPlayback(
 	start: number,
-	fps: number,
+	request: PlaybackRequest,
 	onFrame: (f: PlaybackFrame) => void,
 	onError?: (message: string) => void
 ): () => void {
-	if (!inTauri()) return samplePlayback(start, fps, onFrame);
+	if (!inTauri()) return samplePlayback(start, request.fps ?? SAMPLE_FPS, onFrame);
 	// The backend cancels *by id* rather than by a generation counter: start and
 	// stop are separate async calls that can arrive out of order, and a stop
 	// meant for the previous stream must not kill the one that replaced it.
@@ -979,15 +988,23 @@ export function startPlayback(
 	void (async () => {
 		const { Channel } = await import('@tauri-apps/api/core');
 		if (stopped) return;
-		const channel = new Channel<PlaybackFrame>();
-		channel.onmessage = (f) => {
-			if (!stopped) onFrame(f);
+		const channel = new Channel<ArrayBuffer>();
+		channel.onmessage = (message) => {
+			if (stopped) return;
+			const frame = parsePlaybackMessage(message);
+			if (frame) onFrame({ time: frame.time, jpeg: jpegBlob(frame.jpeg) });
 		};
 		// Resolves only when playback ends; nothing waits on it.
 		// The backend only rejects for a real failure (ffmpeg died, inputs
 		// would not resolve), never for a stop or a supersede — but a stream
 		// already stopped on this side has no one left to tell.
-		void invoke('start_playback', { playbackId, start, fps, onFrame: channel }).catch((e) => {
+		void invoke('start_playback', {
+			playbackId,
+			start,
+			fps: request.fps,
+			maxWidth: request.width,
+			onFrame: channel
+		}).catch((e) => {
 			if (!stopped) onError?.(e instanceof Error ? e.message : String(e));
 		});
 	})();
@@ -998,28 +1015,35 @@ export function startPlayback(
 	};
 }
 
+/** The rate the harness plays at when the page does not state one. */
+const SAMPLE_FPS = 30;
+
 /** What the desktop app really pays to put one frame on screen: ffmpeg's startup
- *  plus base64, JSON and IPC. Deliberately larger than the preview's two-frame
- *  staleness budget — a harness whose frames arrive instantly cannot reproduce
- *  the class of bug where that constant is mistaken for the picture drifting. */
+ *  plus the channel. Deliberately larger than the preview's staleness budget — a
+ *  harness whose frames arrive instantly cannot reproduce the class of bug where
+ *  that constant is mistaken for the picture drifting. */
 const SAMPLE_FRAME_LAG_MS = 90;
 
 /**
- * The browser harness's stand-in for the streamed composite: a generated frame
- * per tick, paced at `fps` and delayed by a realistic transport cost, so
- * playback moves in `bun run dev` and the preview's frame pacing is exercised
- * end to end without a backend.
+ * The browser harness's stand-in for the streamed composite: a generated JPEG per tick, paced
+ * at `fps` and delayed by a realistic transport cost, so playback moves in `bun run dev`
+ * through the same decode-and-draw path as the desktop app and the preview's frame pacing is
+ * exercised end to end without a backend.
  */
 function samplePlayback(start: number, fps: number, onFrame: (f: PlaybackFrame) => void): () => void {
 	let index = 0;
 	let timer: ReturnType<typeof setInterval> | null = null;
+	let stopped = false;
 	const spawn = setTimeout(() => {
 		timer = setInterval(() => {
 			const time = start + index++ / fps;
-			onFrame({ time, jpeg: sampleFrameUrl(time) });
+			void sampleFrameJpeg(time).then((jpeg) => {
+				if (jpeg && !stopped) onFrame({ time, jpeg });
+			});
 		}, 1000 / fps);
 	}, SAMPLE_FRAME_LAG_MS);
 	return () => {
+		stopped = true;
 		clearTimeout(spawn);
 		if (timer) clearInterval(timer);
 	};

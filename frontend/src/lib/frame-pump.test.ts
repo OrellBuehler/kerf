@@ -101,7 +101,13 @@ interface Env {
 }
 
 interface Harness {
-	frames: { frameUrl: string | null; gpuShown: boolean; imgAspect: number | null };
+	frames: {
+		frameUrl: string | null;
+		gpuShown: boolean;
+		imgAspect: number | null;
+		streamShown: boolean;
+		streamDrawn(aspect: number): void;
+	};
 	stop: () => void;
 	time: number;
 	timeline: unknown;
@@ -435,6 +441,69 @@ describe('the width a frame is asked at', () => {
 		await settle();
 		expect(r.asked).toEqual(['jpeg@3']);
 		expect(r.widths).toEqual([1440]);
+		h.stop();
+	});
+});
+
+describe('the playback stream\u2019s canvas and the fetched frame take the pane turn about', () => {
+	test('a drawn stream frame is the picture, never the surface, and says its shape', async () => {
+		const r = recorder({ gpu: async () => ({ renderer: 'gpu', frame: null, reasons: [], timings: { width: 1920, height: 1080, decode_ms: 1, composite_ms: 1, present_ms: 1 } }) });
+		const h = harness({ enabled: true, ...r });
+		await settle();
+		expect(h.frames.gpuShown).toBe(true);
+		h.streaming = true;
+		h.frames.streamDrawn(16 / 9);
+		expect(h.frames.streamShown).toBe(true);
+		expect(h.frames.gpuShown).toBe(false);
+		expect(h.frames.imgAspect).toBeCloseTo(16 / 9, 10);
+		h.stop();
+	});
+
+	test('the settled frame that lands after playback ends takes the pane back from it', async () => {
+		const r = recorder();
+		const h = harness({ enabled: false, ...r });
+		await settle();
+		h.streaming = true;
+		h.frames.streamDrawn(1.5);
+		h.time = 4;
+		await settle();
+		// Streaming: nothing is fetched, and the last streamed frame stays on show.
+		expect(r.asked).toEqual(['jpeg@0']);
+		expect(h.frames.streamShown).toBe(true);
+		h.streaming = false;
+		await settle();
+		expect(r.asked).toEqual(['jpeg@0', 'jpeg@4']);
+		expect(h.frames.streamShown).toBe(false);
+		expect(h.frames.frameUrl).toBe('data:jpeg-4');
+		h.stop();
+	});
+
+	test('a frame the GPU draws, or the backend hands back, takes it back too', async () => {
+		let draws = true;
+		const r = recorder({
+			gpu: async (t) =>
+				draws
+					? { renderer: 'gpu', frame: null, reasons: [], timings: { width: 1280, height: 720, decode_ms: 1, composite_ms: 1, present_ms: 1 } }
+					: { renderer: 'ffmpeg', frame: `data:ffmpeg-${t}`, reasons: ['a refusal'], timings: null }
+		});
+		const h = harness({ enabled: true, ...r });
+		await settle();
+		h.streaming = true;
+		h.frames.streamDrawn(1.5);
+		h.streaming = false;
+		h.time = 1;
+		await settle();
+		expect(h.frames.streamShown).toBe(false);
+		expect(h.frames.gpuShown).toBe(true);
+
+		h.streaming = true;
+		h.frames.streamDrawn(1.5);
+		h.streaming = false;
+		draws = false;
+		h.time = 2;
+		await settle();
+		expect(h.frames.streamShown).toBe(false);
+		expect(h.frames.frameUrl).toBe('data:ffmpeg-2');
 		h.stop();
 	});
 });

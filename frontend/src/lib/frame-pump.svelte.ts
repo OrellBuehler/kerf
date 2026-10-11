@@ -1,6 +1,7 @@
 // The Preview panel's frame fetching, out of the component so its reactivity can be tested: one
 // frame in flight at a time, the latest wanted time waiting, and the answer shown as a picture
-// (`frameUrl`) or as nothing at all (`gpuShown`: the native surface is what is seen).
+// (`frameUrl`), as nothing at all (`gpuShown`: the native surface is what is seen) or as the last
+// frame of the playback stream, which the page draws on a canvas of its own (`streamShown`).
 //
 // The one rule that matters: **what the effect depends on is what it reads in `run`**, and `pump`
 // reads nothing reactive before its first await. A frame fetch is expensive (an FFmpeg composite),
@@ -45,6 +46,9 @@ export function createFramePump(deps: FramePumpDeps) {
 	let frameUrl = $state<string | null>(null);
 	/** The frame on show was drawn in the native surface: nothing is painted over it. */
 	let gpuShown = $state(false);
+	/** The frame on show is the playback stream's, drawn on the canvas: the picture until a fetched
+	 *  frame lands on top of it. */
+	let streamShown = $state(false);
 	/** The aspect of the picture on show (the canvas the compositor drew, or the JPEG). */
 	let imgAspect = $state<number | null>(null);
 	let inFlight = false;
@@ -81,6 +85,7 @@ export function createFramePump(deps: FramePumpDeps) {
 					if (url && !deps.streaming()) {
 						frameUrl = url;
 						gpuShown = false;
+						streamShown = false;
 					}
 				}
 				// Playback may have taken over while this was decoding.
@@ -88,10 +93,12 @@ export function createFramePump(deps: FramePumpDeps) {
 					deps.answered(result);
 					if (result.renderer === 'gpu') {
 						gpuShown = true;
+						streamShown = false;
 						// The canvas the compositor drew has the delivery's shape.
 						if (result.timings?.width && result.timings.height) imgAspect = result.timings.width / result.timings.height;
 					} else if (result.frame) {
 						gpuShown = false;
+						streamShown = false;
 						frameUrl = result.frame;
 					}
 				}
@@ -105,6 +112,7 @@ export function createFramePump(deps: FramePumpDeps) {
 				if (url && !deps.streaming()) {
 					frameUrl = url;
 					gpuShown = false;
+					streamShown = false;
 				}
 			}
 		} catch {
@@ -124,10 +132,15 @@ export function createFramePump(deps: FramePumpDeps) {
 		get imgAspect() {
 			return imgAspect;
 		},
-		/** A frame of the playback stream: the picture, never the surface. */
-		showStreamed(jpeg: string) {
+		get streamShown() {
+			return streamShown;
+		},
+		/** A frame of the playback stream was drawn on the canvas, `aspect` wide for its height: it is
+		 *  the picture, never the surface, and stays so until a fetched frame replaces it. */
+		streamDrawn(aspect: number) {
 			gpuShown = false;
-			frameUrl = jpeg;
+			streamShown = true;
+			imgAspect = aspect;
 		},
 		/** The picture on screen is not the surface's any more (the setting went off). */
 		surfaceGone() {
@@ -158,6 +171,7 @@ export function createFramePump(deps: FramePumpDeps) {
 			if (!deps.hasClips()) {
 				frameUrl = null;
 				gpuShown = false;
+				streamShown = false;
 				queued = null;
 				return;
 			}

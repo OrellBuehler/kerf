@@ -34,7 +34,9 @@
 	import { RESIZE_SETTLE_MS, capToSource, dprQuery, requestWidth } from '$lib/preview-size';
 	import type { PreviewBoundsReport } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
-	import { createFrameGate, PLAYBACK_FPS } from '$lib/playback-sync';
+	import { createFrameGate, rungAfter, startRung, stepDown, stepsAfter, stepsToStart } from '$lib/playback-sync';
+	import { createStreamPainter } from '$lib/frame-transport';
+	import { decodeJpeg, paintPicture } from '$lib/frame-canvas';
 	import { clipDuration } from '$lib/types';
 	import type { TextOverlay } from '$lib/types';
 	import { LINE_HEIGHT, boxPadding, containRect, dragPosition, isVisibleAt, sampleOverlay, scaledSize } from '$lib/titles';
@@ -130,6 +132,7 @@
 	});
 	const frameUrl = $derived(frames.frameUrl);
 	const gpuShown = $derived(frames.gpuShown);
+	const streamShown = $derived(frames.streamShown);
 	const imgAspect = $derived(frames.imgAspect);
 
 	// ---- playback: a streamed frame source instead of per-frame decodes -------
@@ -138,11 +141,22 @@
 	// from the playhead and pushes frames up as they render. Scrubbing, shuttle
 	// and the paused frame keep the per-frame path below: that one is right when
 	// you want *one* frame, and streaming is right when you want all of them.
+	//
+	// The stream plays at the cut's own frame rate and the width the pane asks for, and its
+	// frames are raw JPEG bytes decoded by `createImageBitmap` and drawn on a canvas that sits
+	// over the still (`frame-transport.ts`). A machine that cannot hold that rate is not played
+	// behind the sound: the gate says so (`degrade`) and the stream restarts from the playhead one
+	// rung cheaper (`playback-sync.ts`), halving the rate before it narrows the picture.
 	let streaming = $state(false);
 	let stopStream: (() => void) | null = null;
+	let canvasEl = $state<HTMLCanvasElement | null>(null);
 	/** Bumped when the stream has fallen so far behind the clock that it is worth
 	 *  restarting it from where playback has actually got to. */
 	let resyncs = $state(0);
+	/** How far down the ladder the stream is for this cut at this width, and when it last restarted
+	 *  for lag. A new cut, a proxy that landed or a different pane starts at the top again: what it
+	 *  costs is not what it cost. Not reactive: it is read when the stream (re)starts, not watched. */
+	let ladder = { timeline: null as unknown, epoch: -1, width: null as number | null, steps: 0, lastRestart: -Infinity };
 
 	// Every seek or edit restarts the stream, so a timeline that cannot render
 	// would raise the same failure on each restart; say it once per spell.
@@ -170,47 +184,83 @@
 
 	$effect(() => {
 		// Restart the stream whenever what it is rendering changes: play/pause,
-		// shuttle rate, a deliberate seek, or an edit to the timeline it
-		// composited from. Deliberately *not* `ui.time` — that ticks with every
-		// animation frame during playback, and depending on it would tear down
-		// and respawn ffmpeg 60 times a second.
+		// shuttle rate, a deliberate seek, an edit to the timeline it composited
+		// from, or the width the pane asks for. Deliberately *not* `ui.time` — that
+		// ticks with every animation frame during playback, and depending on it would
+		// tear down and respawn ffmpeg 60 times a second.
 		const play = ui.playing && ui.rate === 1;
 		void ui.seekEpoch;
 		void resyncs;
-		void editor.timeline;
-		void ui.previewEpoch;
+		const timeline = editor.timeline;
+		const epoch = ui.previewEpoch;
+		const box = boxWidth;
 		const from = untrack(() => ui.time);
 		playbackWaiting = null;
 		if (!play || !hasClips) {
 			endStream();
 			return;
 		}
+		if (ladder.timeline !== timeline || ladder.epoch !== epoch || ladder.width !== box) {
+			ladder = { timeline, epoch, width: box, steps: 0, lastRestart: -Infinity };
+		}
+		ladder.steps = stepsToStart(ladder.steps, performance.now() - ladder.lastRestart);
+		// The width is the one the still is asked at, held to the source at the playhead; read
+		// untracked, since that source changes as the playhead crosses clips and the stream
+		// is not restarted for it.
+		const { rung, request } = untrack(() => {
+			const asked = frameWidth;
+			const rung = rungAfter(startRung(editor.fps, asked), ladder.steps);
+			return { rung, request: ladder.steps > 0 ? { fps: rung.fps, width: rung.width } : { fps: null, width: asked } };
+		});
 		let live = true;
-		const verdict = createFrameGate();
-		streaming = true;
-		const stop = startPlayback(from, PLAYBACK_FPS, (f) => {
-			if (!live) return;
-			// The audio clock owns time; picture chases it.
-			switch (verdict(ui.time - f.time)) {
-				case 'resync':
-					// Compositing can't keep up with real time on this timeline. Playing
-					// the backlog out would run the picture in slow motion against the
-					// sound, and dropping it forever would freeze the pane — so jump the
-					// stream forward to where playback has actually got to.
-					live = false;
-					resyncs++;
-					return;
-				case 'skip':
-					// A frame the clock has moved past would drag the picture behind the
-					// sound, so wait for one that still applies.
-					return;
-				case 'show':
-					frames.showStreamed(f.jpeg);
+		// At the cheapest rung there is nothing to restart into, and a restart costs an ffmpeg spawn on a
+		// machine that is already short: the frames are skipped to the resync, as they were before.
+		const verdict = createFrameGate({ fps: rung.fps, overloadAfter: stepDown(rung) ? undefined : Infinity });
+		const painter = createStreamPainter({
+			decode: decodeJpeg,
+			paint: (picture) => {
+				if (!canvasEl) return;
+				paintPicture(canvasEl, picture);
+				frames.streamDrawn(picture.width / picture.height);
 			}
-		}, reportPlaybackError);
+		});
+		streaming = true;
+		const stop = startPlayback(
+			from,
+			request,
+			(f) => {
+				if (!live) return;
+				// The audio clock owns time; picture chases it.
+				const call = verdict(ui.time - f.time);
+				switch (call) {
+					case 'resync':
+					case 'degrade': {
+						// Compositing can't keep up with real time on this timeline. Playing
+						// the backlog out would run the picture in slow motion against the
+						// sound, and dropping it forever would freeze the pane — so jump the
+						// stream forward to where playback has actually got to, and when it
+						// is slow rather than stalled, at a cost the machine can carry.
+						live = false;
+						const now = performance.now();
+						ladder.steps = stepsAfter(call, ladder.steps, now - ladder.lastRestart);
+						ladder.lastRestart = now;
+						resyncs++;
+						return;
+					}
+					case 'skip':
+						// A frame the clock has moved past would drag the picture behind the
+						// sound, so wait for one that still applies.
+						return;
+					case 'show':
+						painter.push(f.jpeg);
+				}
+			},
+			reportPlaybackError
+		);
 		stopStream = stop;
 		return () => {
 			live = false;
+			painter.stop();
 			stop();
 			if (stopStream === stop) stopStream = null;
 			streaming = false;
@@ -277,7 +327,7 @@
 	// fractions are of what is drawn.
 
 	const layerBox = $derived.by(() => {
-		if ((!frameUrl && !gpuShown) || !imgAspect) return 'inset:0';
+		if ((!frameUrl && !gpuShown && !streamShown) || !imgAspect) return 'inset:0';
 		const r = containRect(imgAspect, aspect);
 		return `left:${r.left}%;top:${r.top}%;width:${r.width}%;height:${r.height}%`;
 	});
@@ -768,8 +818,18 @@
 					<div bind:this={matteEl} aria-hidden="true" style="position:absolute;width:0;height:0;background:var(--frame-matte)"></div>
 					<div bind:this={backdropEl} aria-hidden="true" style="position:absolute;width:0;height:0;background:var(--surface-app)"></div>
 				{/if}
+				<!-- The playback stream's frames, drawn here as they are decoded. Always mounted, so the first
+				     frame has somewhere to land; shown while it holds the last one played, until a fetched
+				     frame (the settled still, the GPU's surface) takes the pane back. -->
+				<canvas
+					bind:this={canvasEl}
+					aria-label="playback frame"
+					style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:var(--frame-matte);border-radius:3px;display:{streamShown && !gpuShown ? 'block' : 'none'}"
+				></canvas>
 				{#if gpuShown}
 					<!-- Drawn by the GPU in the native surface: nothing here covers it. -->
+				{:else if streamShown}
+					<!-- The canvas above is the picture. -->
 				{:else if frameUrl}
 					<img src={frameUrl} alt="preview frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:var(--frame-matte);border-radius:3px"
 						onload={(e) => {
