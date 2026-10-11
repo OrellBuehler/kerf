@@ -8,9 +8,8 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { mediaStatus } from '$lib/media-status.svelte';
-	import { analyzeMenuItems } from '$lib/analyze-menu';
-	import { doneCount, doneSummary, kindInfo } from '$lib/analysis-steps';
-	import { proxyActions, proxyFacts } from '$lib/proxy-info';
+	import { analyzeSubmenuItem } from '$lib/analyze-menu';
+		import { proxyActions } from '$lib/proxy-info';
 	import { deleteProxy, rebuildProxy } from '$lib/api';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
@@ -18,7 +17,7 @@
 	import { importMedia } from '$lib/import-media';
 	import { toast } from '$lib/notifications.svelte';
 	import { thumbnails } from '$lib/thumbnails';
-	import { analysisFacts, audioExtraction, mediaInfo, shortPath, specLine, thumbTime, type MediaInfo } from '$lib/media-info';
+	import { audioExtraction, mediaInfo, shortPath, specLine, thumbTime, type MediaInfo } from '$lib/media-info';
 	import type { Asset } from '$lib/types';
 	import { tip } from '$lib/tip';
 
@@ -89,58 +88,12 @@
 	function onAssetContextMenu(e: MouseEvent, { asset, info }: BinAsset) {
 		void editor.select(asset.id);
 		const analysis = editor.analysisFor(asset.id);
-		const analyzing = ui.analyzingId === asset.id;
 		const spherical = !!info.projection;
-		const facts = analysisFacts(analysis, asset.duration);
-		const status = mediaStatus.analysis(asset.id);
-		const imported = new Date(asset.imported_at);
 
 		const items: MenuItem[] = [{ type: 'header', label: asset.name, sub: shortPath(asset.path) }];
 
-		items.push({ type: 'info', label: 'Duration', value: info.duration });
-		if (info.resolution)
-			items.push({
-				type: 'info',
-				label: 'Frame',
-				value: info.aspect ? `${info.resolution} · ${info.aspect}` : info.resolution
-			});
-		if (info.fps) items.push({ type: 'info', label: 'Rate', value: info.fps });
-		if (info.codec) items.push({ type: 'info', label: 'Codec', value: info.codec });
-		if (info.audio) items.push({ type: 'info', label: 'Audio', value: info.audio });
-		if (info.projection) items.push({ type: 'info', label: 'Projection', value: info.projection });
-		if (info.voiceover) items.push({ type: 'info', label: 'Voiceover', value: info.voiceover });
-		if (info.stitched)
-			items.push({
-				type: 'info',
-				label: 'Stitched',
-				value: `${asset.source_paths?.length ?? 0} lens files`,
-				title: asset.source_paths?.join('\n')
-			});
-		items.push({ type: 'info', label: 'Used in', value: info.uses === 1 ? '1 clip' : `${info.uses} clips` });
-		if (!Number.isNaN(imported.getTime()))
-			items.push({ type: 'info', label: 'Imported', value: imported.toLocaleDateString() });
-
-		items.push({ type: 'separator' });
-		items.push({
-			type: 'info',
-			label: 'Analyzed',
-			value: analyzing ? 'running…' : doneCount(status),
-			title: doneSummary(status)
-		});
-		for (const k of status?.kinds ?? []) {
-			if (k.state === 'failed')
-				items.push({ type: 'info', label: kindInfo(k.kind).label, value: 'failed', title: k.reason ?? undefined });
-		}
-		for (const f of facts) items.push({ type: 'info', label: f.label, value: f.value });
-
-		const proxy = mediaStatus.proxy(asset.id);
-		const proxyRows = proxyFacts(proxy);
-		if (proxyRows.length > 0) {
-			items.push({ type: 'separator' });
-			for (const f of proxyRows) items.push({ type: 'info', label: f.label, value: f.value, title: f.title });
-		}
-
-		items.push({ type: 'separator' });
+		// The facts — length, frame, codec, where it is used, what analysis found, the proxy — are the Inspector's
+		// view of the asset (`AssetInspector`); this menu is what can be done to it.
 		items.push({
 			label: 'Add at playhead',
 			icon: 'plus',
@@ -219,7 +172,7 @@
 				action: () => ui.openVoiceover({ text: vo.text, voice: vo.voice, speed: vo.speed })
 			});
 		}
-		items.push(...analyzeMenuItems(asset));
+		items.push(analyzeSubmenuItem(asset, { x: e.clientX, y: e.clientY }));
 		if (info.kind === 'video')
 			items.push({
 				label: spherical ? 'Mark as flat footage' : 'Mark as 360 (equirect)',
@@ -231,7 +184,7 @@
 						.catch(err)
 			});
 		if (info.kind === 'video') {
-			const act = proxyActions(proxy);
+			const act = proxyActions(mediaStatus.proxy(asset.id));
 			items.push({ type: 'separator' });
 			items.push({
 				label: act.rebuild.label,

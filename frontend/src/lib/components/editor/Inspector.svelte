@@ -6,10 +6,12 @@
 	import Btn from './Btn.svelte';
 	import IconBtn from './IconBtn.svelte';
 	import Chip from './Chip.svelte';
+	import EmptyState from './EmptyState.svelte';
 	import CheckRow from './CheckRow.svelte';
 	import SliderRow from './SliderRow.svelte';
 	import TitlesControls from './TitlesControls.svelte';
 	import MediaChips from './MediaChips.svelte';
+	import AssetInspector from './AssetInspector.svelte';
 	import { analyzeMenuItems } from '$lib/analyze-menu';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
@@ -43,7 +45,7 @@
 	import { linkBadge, selectionUnits } from '$lib/link-ui';
 	import { clock, clockRange } from '$lib/clock';
 	import { parseColor, swatchHex, withPicked } from '$lib/title-color';
-	import { colorSummary, keyLabel, timingSummary } from '$lib/inspector-summary';
+	import { colorSummary, keyLabel, keyNeighbours, timingSummary } from '$lib/inspector-summary';
 	import { fitOffer, musicSummary } from '$lib/music-ui';
 	import { DEGREES, NUMBER_COL, PERCENT, SECONDS, TIMES, readout, type RowSpec } from '$lib/slider-row';
 	import { FieldEdits } from '$lib/field-edit';
@@ -183,6 +185,30 @@
 		} else {
 			void run(() => keyAtPlayhead(c, prop, propertyAt(c, prop, localTime)));
 		}
+	}
+	/** Right-click on a ◇: step to the previous or next key of that number, key it here, or take its keys out. */
+	function keyMenu(e: MouseEvent, prop: Property) {
+		const c = clip;
+		if (!c) return;
+		e.preventDefault();
+		e.stopPropagation();
+		const keys = propertyKeys(c, prop);
+		const near = keyNeighbours(keys.map((k) => k.time), localTime);
+		const go = (t: number) => ui.seek(c.timeline_start + t);
+		const items: MenuItem[] = [
+			{ label: 'Previous key', icon: 'skip-back', disabled: near.prev === null, reason: near.prev === null ? 'no earlier key' : undefined, action: () => go(near.prev!) },
+			{ label: 'Next key', icon: 'skip-forward', disabled: near.next === null, reason: near.next === null ? 'no later key' : undefined, action: () => go(near.next!) },
+			{ type: 'separator' },
+			{ label: near.here ? 'Remove the key here' : 'Key at the playhead', icon: 'diamond', action: () => toggleKey(prop) }
+		];
+		if (keys.length > 0)
+			items.push({
+				label: `Remove all ${keyLabel(prop)} keys`,
+				icon: 'trash',
+				danger: true,
+				action: () => void run(() => editor.setPropertyKeyframes(c.id, prop, []))
+			});
+		contextMenu.show(e, items);
 	}
 	/** Route a colour edit: a key at the playhead for each number that is keyed, the static
 	 *  colour for the rest. */
@@ -475,13 +501,14 @@
 		title={here
 			? `Remove the ${keyLabel(prop)} keyframe at the playhead`
 			: keyed
-				? `Add a ${keyLabel(prop)} keyframe at the playhead`
+				? { text: `Add a ${keyLabel(prop)} keyframe at the playhead`, detail: 'Right-click to step to the previous or next key.' }
 				: `Animate ${keyLabel(prop)}: key it at the playhead`}
 		aria-label={`${here ? 'Remove' : 'Add'} a ${keyLabel(prop)} keyframe at the playhead`}
 		onclick={(e: MouseEvent) => {
 			e.preventDefault();
 			toggleKey(prop);
 		}}
+		oncontextmenu={(e: MouseEvent) => keyMenu(e, prop)}
 		style="--k-ink:{keyed ? 'var(--playhead)' : 'var(--text-muted)'};--k-on-ink:var(--playhead)"
 	>
 		<Icon n="diamond" s={12} style={here ? 'fill:currentColor' : ''} />
@@ -624,7 +651,7 @@
 	{@const keys = o.keyframes ?? []}
 	<div style="display:flex;gap:9px;align-items:center">
 		<div
-			style="width:40px;height:28px;border-radius:3px;flex:none;background:{o.generated
+			style="width:40px;height:28px;border-radius:var(--radius-sm);flex:none;background:{o.generated
 				? GENERATED_TITLE_FILL
 				: 'var(--track-text)'};border:var(--line-width) solid var(--track-text-edge);display:grid;place-items:center;color:var(--text-on-video)"
 		>
@@ -778,7 +805,7 @@
 			{/if}
 			<div style="display:flex;gap:9px;align-items:center">
 				<div
-					style="width:40px;height:28px;border-radius:3px;flex:none;background:{picture
+					style="width:40px;height:28px;border-radius:var(--radius-sm);flex:none;background:{picture
 						? VIDEO_THUMB_BG
 						: 'var(--track-audio)'};display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 80%,transparent)"
 				>
@@ -1218,13 +1245,12 @@
 					>Ripple delete</Btn
 				>
 			</div>
+		{:else if editor.selectedAsset}
+			<!-- Nothing on the timeline is selected, but the library has an asset: its facts are here, not in the
+			     bin's right-click menu. -->
+			<AssetInspector asset={editor.selectedAsset} />
 		{:else}
-			<div
-				style="display:flex;flex-direction:column;align-items:center;gap:10px;padding:40px 16px;color:var(--text-muted);text-align:center"
-			>
-				<Icon n="sliders-horizontal" s={22} />
-				<span style="font-size:12px">Select a clip or a title to inspect it</span>
-			</div>
+			<EmptyState icon="sliders-horizontal" pad={40} title="Select a clip or a title to inspect it" />
 		{/if}
 
 		{@render overlaysSection()}

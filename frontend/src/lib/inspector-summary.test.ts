@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { colorKeyCount, colorSummary, isNeutralColor, keyLabel, timingSummary } from './inspector-summary';
+import { colorKeyCount, colorSummary, isNeutralColor, keyLabel, keyNeighbours, timingSummary } from './inspector-summary';
 import { COLOR_LOOKS } from './style-presets';
 import { DEFAULT_COLOR, type Clip, type Color } from './types';
 
@@ -49,5 +49,23 @@ describe('the Timing summary and the key labels', () => {
 		expect(keyLabel('temperature')).toBe('warmth');
 		expect(keyLabel('pos_x')).toBe('position x');
 		expect(keyLabel('brightness')).toBe('brightness');
+	});
+});
+
+describe('the keys around the playhead', () => {
+	test('the nearest one on each side, whatever order they are in', () => {
+		expect(keyNeighbours([4, 0, 2, 9], 3)).toEqual({ prev: 2, next: 4, here: false });
+	});
+
+	test('nothing before the first or after the last', () => {
+		expect(keyNeighbours([2, 5], 1)).toEqual({ prev: null, next: 2, here: false });
+		expect(keyNeighbours([2, 5], 8)).toEqual({ prev: 5, next: null, here: false });
+		expect(keyNeighbours([], 1)).toEqual({ prev: null, next: null, here: false });
+	});
+
+	test('a key at the playhead is here, so stepping moves past it', () => {
+		expect(keyNeighbours([0, 2, 4], 2)).toEqual({ prev: 0, next: 4, here: true });
+		expect(keyNeighbours([0, 2, 4], 2.015)).toEqual({ prev: 0, next: 4, here: true });
+		expect(keyNeighbours([0, 2, 4], 2.03)).toEqual({ prev: 2, next: 4, here: false });
 	});
 });

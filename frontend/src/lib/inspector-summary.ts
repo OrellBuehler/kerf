@@ -46,3 +46,26 @@ export function timingSummary(start: number, duration: number): string {
 export function keyLabel(p: Property): string {
 	return p === 'temperature' ? 'warmth' : propertyLabel(p);
 }
+
+export interface KeyNeighbours {
+	/** The nearest key before the playhead, clip-local seconds, or null. */
+	prev: number | null;
+	/** The nearest key after it, or null. */
+	next: number | null;
+	/** A key sits at the playhead (within `eps`). */
+	here: boolean;
+}
+
+/** Where the keys of a number are around the playhead — for "previous key" / "next key" on its ◇. A key
+ *  within `eps` of the playhead is *here*, not a neighbour: stepping must move somewhere. */
+export function keyNeighbours(times: readonly number[], at: number, eps = 0.02): KeyNeighbours {
+	let prev: number | null = null;
+	let next: number | null = null;
+	let here = false;
+	for (const t of times) {
+		if (Math.abs(t - at) <= eps) here = true;
+		else if (t < at && (prev === null || t > prev)) prev = t;
+		else if (t > at && (next === null || t < next)) next = t;
+	}
+	return { prev, next, here };
+}
