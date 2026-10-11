@@ -342,7 +342,8 @@ forces the CPU adapter, `auto` / `any` takes whatever wgpu prefers, CPU included
 first-use check below.
 Playback (forward 1×) is still the FFmpeg stream: `streaming` is a JPEG route, the surface
 is hidden while it runs and shown again on the settled frame (A4). `x11.rs`' ignored tests present to a real child window and read the
-pixels back **from the X server**, destroy the device and draw again on a new one, and reach a
+pixels back **from the X server** (also after `skip_vsync(true)` and back: lavapipe on an `Xvfb` has a
+mode that skips the refresh wait), destroy the device and draw again on a new one, and reach a
 server that listens on the **abstract socket only** (an `Xvfb` where `/tmp/.X11-unix` is not
 writable, WSL's case) at once: `RustConnection::connect` tries the filesystem socket and then TCP
 and never the abstract socket libxcb tries first, and waited out a TCP timeout of minutes
