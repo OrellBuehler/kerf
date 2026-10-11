@@ -889,7 +889,8 @@ first request of a session is the only one in flight until it is answered, becau
 requests the backend replaced answer `superseded` and change nothing (**skip, never slow down** is the latest-wins mailbox's, not a gate's: a GPU
 that overruns a slot loses the frames it overran, and `createFrameGate` stays the stream's). A `stream` answer, a rejected request (the GPU is marked
 failed and the surface hidden), or a GPU whose median round trip is over **three frame periods for a second** (`OVERLOAD_PERIODS`, `OVERLOAD_AFTER`)
-**hands the session to the stream at once** (`handOverToStream(now)`); an answer's **`play.ahead`** (the first frame the GPU will not draw and the
+**hands the session to the stream at once** (`handOverToStream(now)`), as does a request the backend has not answered at all for 1.5 s (5 s before the first
+answer; `STALL_AFTER`, `GpuPlayback.stalled`: only a request *waiting* counts, a clock that stands still asks for nothing) — a decode that hangs blocks the one worker that draws; an answer's **`play.ahead`** (the first frame the GPU will not draw and the
 time a stream must start at) hands over **when the playhead is within the stream's start-up of it** (`handoverDue`; the ladder's measured start-up,
 else 0.15 s). A hand-over starts the stream through the same ladder (`takeover`): the stream is *not* `streaming` (so the route stays `gpu` and the
 surface stays up) until its first frame **at or past where the GPU stops** is shown, and only then does the GPU's session end and the surface go. A

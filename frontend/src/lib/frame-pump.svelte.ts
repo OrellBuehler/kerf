@@ -157,10 +157,16 @@ export function createFramePump(deps: FramePumpDeps) {
 			deps.playHandover?.(playback, due, false, due.why);
 			return;
 		}
+		if (playback.stalled(now())) {
+			deps.gpuFailed(new Error('the GPU preview stopped answering during playback'));
+			deps.playHandover?.(playback, playback.ahead, true, 'the GPU stopped answering');
+			return;
+		}
 		const step = playback.next(clock.clock, clock.latency, clock.fps);
 		if (!step) return;
 		const seq = ++asked;
 		const sent = now();
+		playback.noteSent(sent);
 		let result: PreviewFrameResult;
 		try {
 			result = await deps.previewFrame(step.time, overlays, width, { client, seq }, { session: playback.session });

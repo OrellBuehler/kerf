@@ -435,8 +435,9 @@
 						<span style="font-size:12px;line-height:1.55;color:var(--text-secondary)">
 							Draws frames the GPU compositor can render exactly in a native surface instead of FFmpeg's JPEG,
 							including fades, dissolves, dips, slides and pushes. Anything it can't draw, such as an unsupported
-							effect or a dip to white it hasn't measured, is still drawn by FFmpeg. Playback still uses FFmpeg.
-							The status bar shows which renderer made the frame you're looking at.
+							effect or a dip to white it hasn't measured, is still drawn by FFmpeg. Playback is drawn on the GPU
+							too when everything in the next five seconds is something it can draw exactly, and is FFmpeg's
+							stream otherwise. The status bar shows which renderer made the frame you're looking at.
 						</span>
 					</span>
 				</label>

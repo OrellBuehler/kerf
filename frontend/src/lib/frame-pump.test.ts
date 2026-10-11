@@ -864,6 +864,39 @@ describe('GPU playback', () => {
 		h.stop();
 	});
 
+	test('a backend that stops answering is given up on: the session goes to the stream and the GPU is marked failed', async () => {
+		let clock = 0;
+		const failed: string[] = [];
+		const handovers: Array<[boolean, string]> = [];
+		const r = recorder({
+			gpu: (t, _o, play) =>
+				play
+					? new Promise<PreviewFrameResult>(() => {})
+					: Promise.resolve({ renderer: 'ffmpeg' as const, frame: `data:ffmpeg-${t}`, reasons: [], timings: null })
+		});
+		const h = harness({
+			enabled: true,
+			overlaysCapable: true,
+			...r,
+			now: () => clock,
+			gpuFailed: (e) => failed.push(e instanceof Error ? e.message : String(e)),
+			playHandover: (_pb, _ahead, now, why) => handovers.push([now, why])
+		});
+		await settle();
+		h.playback = new GpuPlayback(30);
+		await settle();
+		clock = 3;
+		h.time = 0.5;
+		await settle();
+		expect(handovers).toEqual([]);
+		clock = 5.2;
+		h.time = 1;
+		await settle();
+		expect(handovers).toEqual([[true, 'the GPU stopped answering']]);
+		expect(failed).toHaveLength(1);
+		h.stop();
+	});
+
 	test('when the session ends the settled frame comes back through the ordinary route', async () => {
 		const r = recorder({ gpu: async () => drew() });
 		const h = harness({ enabled: true, overlaysCapable: true, ...r });

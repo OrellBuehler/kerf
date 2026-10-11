@@ -29,6 +29,12 @@ export const OVERLOAD_PERIODS = 3;
 /** ...for this long, seconds of the clock the answers are timed by. */
 export const OVERLOAD_AFTER = 1;
 
+/** The GPU is given up on when it has not answered anything for this long, seconds: a decode that hangs
+ *  blocks the one worker that draws, and the picture would freeze until the engine's own timeouts (3 s). */
+export const STALL_AFTER = 1.5;
+/** ...or this long before it has answered the first request (a file that takes a while to open). */
+export const STALL_AFTER_FIRST = 5;
+
 /** The start-up of a stream when none has been measured, seconds: the stream is started this long
  *  before the playhead reaches its handover, so its first frame is there when it does. */
 export const DEFAULT_STARTUP = 0.15;
@@ -109,6 +115,8 @@ export class GpuPlayback {
 	private over = false;
 	private handing = false;
 	private slowSince: number | null = null;
+	private pending = 0;
+	private waitingSince: number | null = null;
 	private trips = new Median();
 	private heard = new Median();
 
@@ -145,6 +153,9 @@ export class GpuPlayback {
 	 */
 	answer(result: PreviewFrameResult, trip: number, at: number): PlayVerdict {
 		if (this.over) return 'ignore';
+		// Anything the backend says, a replaced request included, is it being there.
+		this.pending = Math.max(0, this.pending - 1);
+		this.waitingSince = this.pending > 0 ? at : null;
 		switch (result.renderer) {
 			case 'superseded':
 				// The first request, replaced before it was decided: ask again.
@@ -174,6 +185,19 @@ export class GpuPlayback {
 				this.ahead = result.play?.ahead ?? null;
 				return 'stream';
 		}
+	}
+
+	/** A request is going out at `at` (the clock `answer` is given). */
+	noteSent(at: number) {
+		if (this.pending === 0) this.waitingSince = at;
+		this.pending++;
+	}
+
+	/** Whether a request has been waiting too long for the backend to say anything ([`STALL_AFTER`]): a
+	 *  clock that stands still asks for nothing, and nothing asked for is not waited on. */
+	stalled(at: number): boolean {
+		if (this.over || this.waitingSince === null) return false;
+		return at - this.waitingSince > (this.decided === 'gpu' ? STALL_AFTER : STALL_AFTER_FIRST);
 	}
 
 	/** Whether the median round trip has been over `OVERLOAD_PERIODS` frame periods for `OVERLOAD_AFTER`. */

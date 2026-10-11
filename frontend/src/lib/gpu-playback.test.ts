@@ -229,6 +229,47 @@ describe('the hand-over', () => {
 	});
 });
 
+describe('a backend that stops answering', () => {
+	test('is given up on after a second and a half once it was answering, and five before the first answer', () => {
+		const p = new GpuPlayback(30);
+		expect(p.stalled(100)).toBe(false);
+		p.noteSent(10);
+		expect(p.stalled(14.9)).toBe(false);
+		expect(p.stalled(15.1)).toBe(true);
+		// An answer of any kind is it being there.
+		p.answer(superseded, 0, 14);
+		expect(p.stalled(15.1)).toBe(false);
+		p.noteSent(14.1);
+		p.answer(drew(), 0.02, 14.2);
+		p.noteSent(14.2);
+		expect(p.stalled(15.6)).toBe(false);
+		expect(p.stalled(15.8)).toBe(true);
+		p.answer(drew({ repeat: true }), 0.001, 15.7);
+		expect(p.stalled(17)).toBe(false);
+	});
+
+	test('a request is waited on from when it went out, and several from the last word heard', () => {
+		const p = new GpuPlayback(30);
+		p.noteSent(0);
+		p.answer(drew(), 0.02, 0.1);
+		// The clock stood still for ten seconds: nothing was asked, so nothing is late.
+		expect(p.stalled(10)).toBe(false);
+		p.noteSent(10);
+		expect(p.stalled(11.4)).toBe(false);
+		p.noteSent(10.5);
+		p.answer(drew(), 0.5, 11.2);
+		expect(p.stalled(12.6)).toBe(false);
+		expect(p.stalled(12.8)).toBe(true);
+	});
+
+	test('an ended session is not stalled', () => {
+		const p = new GpuPlayback(30);
+		p.noteSent(0);
+		p.end();
+		expect(p.stalled(100)).toBe(false);
+	});
+});
+
 describe('sessions', () => {
 	test('are numbered apart', () => {
 		const a = new GpuPlayback(30);
