@@ -1,0 +1,131 @@
+diff --git a/crates/kerf-core/src/clip_timing.rs b/crates/kerf-core/src/clip_timing.rs
+index 31a631e..3c7ea5a 100644
+--- a/crates/kerf-core/src/clip_timing.rs
++++ b/crates/kerf-core/src/clip_timing.rs
+@@ -34,7 +34,7 @@
+ 
+ use std::path::Path;
+ 
+-use crate::model::{interpolate, Asset, Clip, Hdr, Timeline};
++use crate::model::{interpolate, Asset, Clip, Hdr, StreamKind, Timeline};
+ 
+ /// The marker a head-padded proxy carries in its file name, ahead of `.mp4`.
+ pub(crate) const HEAD_PADDED_SUFFIX: &str = ".lead.mp4";
+@@ -111,6 +111,9 @@ pub struct ClipFx {
+     /// from the start with no seek, such an input opens with the pad's clone of the
+     /// first frame, which the original it stands for has no frame for.
+     pub head_pad: bool,
++    /// The clip's picture is untagged HD YCbCr and shares the graph with an input that is not
++    /// (so FFmpeg 9 would negotiate it into another matrix): the chain labels it BT.709.
++    pub label_bt709: bool,
+ }
+ 
+ /// Compute the [`ClipFx`] for every clip, resolving each `transition_in` against the
+@@ -132,6 +135,22 @@ pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
+         fx[flat].alpha = asset.is_some_and(|a| a.has_alpha());
+         fx[flat].head_pad = asset.is_some_and(|a| is_head_padded_proxy(&a.path));
+     }
++    // Which inputs are untagged HD, among the pictures this graph composites.
++    let mut hd: Vec<Option<(bool, bool)>> = Vec::with_capacity(total_clips);
++    for track in &timeline.tracks {
++        for clip in &track.clips {
++            let video = (track.kind == StreamKind::Video)
++                .then(|| assets.iter().find(|a| a.id == clip.asset_id))
++                .flatten()
++                .and_then(|a| a.streams.iter().find(|s| s.kind == StreamKind::Video));
++            hd.push(video.map(|s| (s.is_untagged_hd_yuv(), crate::model::names_a_matrix(s.color_space.as_deref()) || s.hdr().is_some())));
++        }
++    }
++    if hd.iter().flatten().any(|h| h.1) {
++        for (flat, h) in hd.iter().enumerate() {
++            fx[flat].label_bt709 = h.is_some_and(|h| h.0);
++        }
++    }
+     let asset_dur = |id| assets.iter().find(|a| a.id == id).map(|a| a.duration);
+     let is_still = |id| assets.iter().find(|a| a.id == id).is_some_and(|a| a.is_image());
+ 
+diff --git a/crates/kerf-core/src/engine/cli.rs b/crates/kerf-core/src/engine/cli.rs
+index 8634643..63453ba 100644
+--- a/crates/kerf-core/src/engine/cli.rs
++++ b/crates/kerf-core/src/engine/cli.rs
+@@ -6520,6 +6520,9 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
+     });
+ 
+     let mut p: Vec<String> = Vec::new();
++    if fx.label_bt709 {
++        p.push(BT709_LABEL.to_string());
++    }
+     // A head-padded proxy opens with one clone of its first frame at time zero (see
+     // [`build_proxy_args`]), which a seek skips — and a read from the start does
+     // not. The original has no such frame: its first one is the real one, and the
+@@ -7074,12 +7077,23 @@ fn build_still_args(
+     };
+     let mut chains: Vec<String> = vec![format!("color=c=black:s={ow}x{oh}:d=0.1[base]")];
+     let mut cur = "base".to_string();
++    let untagged: Vec<Option<(bool, bool)>> = active
++        .iter()
++        .map(|ac| {
++            asset_of(ac.clip.asset_id)
++                .and_then(|a| a.streams.iter().find(|s| s.kind == StreamKind::Video))
++                .map(|s| (s.is_untagged_hd_yuv(), crate::model::names_a_matrix(s.color_space.as_deref()) || s.hdr().is_some()))
++        })
++        .collect();
++    let mixed = untagged.iter().flatten().any(|h| h.1);
++    let label: Vec<bool> = untagged.iter().map(|h| mixed && h.is_some_and(|h| h.0)).collect();
+     for (n, ac) in active.iter().enumerate() {
+         let clip = ac.clip;
+         let tf = ac.transform();
+         let rf = clip.reframe_at(ac.local_time);
+         let hdr = asset_of(clip.asset_id).and_then(|a| a.hdr());
+         let tone = hdr.map(|h| format!("{},", tonemap_filter(h))).unwrap_or_default();
++        let tone = if label[n] { format!("{BT709_LABEL},{tone}") } else { tone };
+         chains.push(format!(
+             "[{n}:v]{tone}{chain}[v{n}]",
+             chain = still_clip_chain(
+diff --git a/crates/kerf-core/src/model.rs b/crates/kerf-core/src/model.rs
+index 0b2f046..b574fb8 100644
+--- a/crates/kerf-core/src/model.rs
++++ b/crates/kerf-core/src/model.rs
+@@ -207,6 +207,23 @@ pub enum PixLayout {
+     Rgb,
+ }
+ 
++/// Whether a colour-matrix tag names a matrix: `unknown`, `unspecified` and `reserved` (which
++/// FFmpeg reads as the default, BT.601) do not, and neither does no tag at all.
++pub fn names_a_matrix(tag: Option<&str>) -> bool {
++    tag.is_some_and(|t| !matches!(t, "" | "unknown" | "unspecified" | "reserved"))
++}
++
++/// Whether a picture is **untagged HD YCbCr**: HD (mpv's rule, `width >= 1280 || height > 576`),
++/// YCbCr on the pixel-format allow-list but not `yuvj…` (JFIF and a webcam's MJPEG are BT.601 by
++/// definition), naming no matrix and not HDR (tone-mapped to a tagged BT.709 picture already).
++/// What every player shows as BT.709 and FFmpeg reads as BT.601.
++pub fn untagged_hd_yuv(color_space: Option<&str>, pix_fmt: &str, width: u32, height: u32, hdr: bool) -> bool {
++    if hdr || names_a_matrix(color_space) || pix_fmt.to_ascii_lowercase().starts_with("yuvj") {
++        return false;
++    }
++    matches!(pix_fmt_layout(pix_fmt), Some(PixLayout::Yuv420 | PixLayout::OtherYuv)) && (width >= 1280 || height > 576)
++}
++
+ /// The layout of a **known-opaque** pixel format, from an allow-list; `None` for
+ /// anything else — alpha-carrying, palettised, or simply not on the list. A
+ /// renderer that cannot draw alpha should refuse what is not here rather than
+@@ -344,6 +361,18 @@ impl StreamInfo {
+         }
+     }
+ 
++    /// Whether this video stream is **untagged HD YCbCr** ([`untagged_hd_yuv`]).
++    pub fn is_untagged_hd_yuv(&self) -> bool {
++        self.kind == StreamKind::Video
++            && untagged_hd_yuv(
++                self.color_space.as_deref(),
++                self.pix_fmt.as_deref().unwrap_or(""),
++                self.width.unwrap_or(0),
++                self.height.unwrap_or(0),
++                self.hdr().is_some(),
++            )
++    }
++
+     /// The HDR transfer this video stream is encoded in, or `None` for SDR and
+     /// for anything that is not video.
+     pub fn hdr(&self) -> Option<Hdr> {

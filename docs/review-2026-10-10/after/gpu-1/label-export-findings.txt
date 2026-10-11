@@ -1,0 +1,49 @@
+GPU-1 follow-up: labelling the export graphs like the proxy (review round 1, item 1) -- STOPPED, decision needed
+Mesa lavapipe host. FFmpeg 9.0.2 = pinned (policy BottomLayerTag); FFmpeg 6.1.1 = system (FixedBt601).
+Method: kerf-core's own export_still / render_with / composite_timeline_frame on 1280x720 gradient clips (BT.709 values),
+"U" = untagged original, "T" = the same file tagged bt709 (what the proxy label gives the graph); "P" = preview assets
+(proxy files made by generate_proxy, the original's metadata) against the originals. PSNR dB / max level error.
+
+1. Does a single untagged-HD clip's export move when the input is labelled? (U vs T, exported yuv420p, frame 5)
+                      FFmpeg 9.0.2        FFmpeg 6.1.1
+ opaque, pip, colour, fade, mask, rotate, grayscale, vignette:  99 dB / 0 on both  (pixel-identical)
+ translucent (opacity 0.6)                  51.6 / 2            33.2 / 10
+ pip + translucent                          57.6 / 2            39.2 / 10
+ coloured caption (drawtext)                55.1 / 16 (glyphs)  99 / 0
+ output file's VUI matrix tag               unknown -> bt709    unchanged
+ RGB still (PNG, export_still), opaque      27.3 / 22           99 / 0
+ default MJPEG webview still, opaque        byte-identical      byte-identical
+ => the single-clip export is pixel-identical only when opaque; a translucent clip moves on both builds.
+
+2. Stacks (U vs T, export yuv / PNG still), FFmpeg 9.0.2; on 6.1.1 every row is 99 dB / 0 except translucent top layers (37-39 dB / 10-16)
+                                          (HD over / HD under) exported yuv, max level
+ untagged HD with a BT.709 clip            35.3 / 14   29.7 / 36
+ ... with an HLG clip                      35.3 / 14   32.0 / 26
+ ... with an untagged SD clip              34.0 / 17   36.6 / 14
+ ... with a PNG logo                       31.1 / 16   34.9 / 16
+ ... with a smpte170m SD clip                       34.0 / 17
+ BT.709 clip *earlier on the same track*, never on screen with the HD clip   29.3 / 14   (negotiation is per graph, not per frame)
+ => preview(labelled proxy) != export(original) in all of these on 9.0.2, not only the BT.709 pair the review measured.
+
+3. What labelling the export / still / stream graphs would do (prototype patches in label-export-prototype/)
+ Rule R*  = label an untagged-HD input when the graph holds any input that is not untagged HD
+ Rule R   = label it only when another input names a matrix (tag or HDR)
+ golden digests moved (of 5600 cases, 4000 + 800 master + 800 channels):
+                     export   still   preview
+   R*                2921     628     2075
+   R                 2879     613     2026
+ (all pool assets are untagged HD except the two HDR ones and the alpha twins; a fuzz timeline holding HDR and anything else moves)
+ preview assets (labelled proxies) against the originals, R* graph, 9.0.2:
+   BT.709 / SD / PNG stacks: PNG still 47.3-56.6 dB, exported yuv 52.9-64.3 dB (the proxy's encode loss included)
+   HLG stacks 36-49 dB (the proxy's tone-map is not the graph's)
+   still unchanged: translucent single clip 6.1.1 33.2 / 10, 9.0.2 51.2 / 2 ; coloured caption 53.3 / 16 ; RGB still of a single opaque clip 27.3
+ On 6.1.1 the label does nothing for negotiation (it negotiates nothing) and only changes translucent clips.
+ A faithful rule also needs the plan to mirror it (PlanStream::matrix per layer, graph-wide for a Motion plan),
+ a measured-policy input to the builders (6.1 gains nothing) or accepts the 6.1 translucent shift, a golden family, three builders.
+
+4. Options (decision pending)
+ A. keep the proxy label and label the graphs too (R*): golden 2921/2075/628, plan mirror, residual translucent / caption divergence.
+ B. drop the proxy label (revert it, no proxy re-encode), label the graphs only where a tagged layer shares the graph (R):
+    preview == export by construction in every stack, single clips unchanged everywhere, golden 2879/2026/613,
+    the GPU's colour target for a lone untagged HD clip stays FFmpeg's (27.3 dB vs a player on 9.0.2, as before).
+ C. drop the proxy label, label nothing: mixed stacks stay refused on 9.0.2 and render through FFmpeg as before.

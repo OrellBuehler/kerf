@@ -1,0 +1,1 @@
+["-threads", "1", "-hide_banner", "-loglevel", "error", "-ss", "3.5", "-i", "/tmp/perf-1/src_4k_hevc10.mp4", "-frames:v", "1", "-vf", "scale=960:-2", "-q:v", "4", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]

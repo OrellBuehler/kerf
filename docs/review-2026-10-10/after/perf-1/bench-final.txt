@@ -1,0 +1,29 @@
+== scrub still, 1 proxy layer (default budget 75% = 3 of 4 threads), 60 interleaved runs per variant
+still1_old.json              wall ms median   111.7 p10   106.8 p90   123.6 | cpu ms median   130.6 | md5 fe09427b
+still1_sw.json               wall ms median    64.5 p10    60.0 p90    75.8 | cpu ms median    82.2 | md5 fe09427b
+still1_real_new.json         wall ms median    53.7 p10    50.9 p90    59.9 | cpu ms median    62.0 | md5 fe09427b
+== scrub still, 3 proxy layers, 60 interleaved runs per variant, measured twice (review round 1: still3_sw now strips -hwaccel from all 3 inputs; the first version stripped only the first)
+-- run A (load average 7 -> 5)
+still3_old.json              wall ms median   201.2 p10   185.2 p90   256.7 | cpu ms median   268.5 | md5 fe09427b
+still3_sw.json               wall ms median   152.0 p10   140.5 p90   202.4 | cpu ms median   221.6 | md5 fe09427b
+still3_real_new.json         wall ms median   119.8 p10   112.4 p90   144.4 | cpu ms median   144.4 | md5 fe09427b
+-- run B (load average 5)
+still3_old.json              wall ms median   266.6 p10   231.5 p90   321.2 | cpu ms median   252.2 | md5 fe09427b
+still3_sw.json               wall ms median   213.0 p10   182.9 p90   252.5 | cpu ms median   205.8 | md5 fe09427b
+still3_real_new.json         wall ms median   152.0 p10   129.4 p90   201.4 | cpu ms median   137.2 | md5 fe09427b
+== frame grab (decode_frame), proxy, 60 runs per variant
+frame_old.json               wall ms median   120.6 p10   109.6 p90   136.5 | cpu ms median   121.3 | md5 68f5eb42
+frame_real_new.json          wall ms median    56.2 p10    50.5 p90    67.3 | cpu ms median    54.6 | md5 68f5eb42
+== scrub still 1 layer, CPU budget 100% (no thread flags before), 60 runs per variant
+still1_old100.json           wall ms median   124.0 p10   115.5 p90   139.2 | cpu ms median   150.1 | md5 fe09427b
+still1_real_new.json         wall ms median    55.7 p10    51.5 p90    64.5 | cpu ms median    62.6 | md5 fe09427b
+== playback stream start + 240 frames from proxy, 15 runs per variant
+stream_old.json              wall ms median   940.1 p10   868.9 p90   980.4 | cpu ms median  2220.9 | md5 29ab3fc3
+stream_new.json              wall ms median   871.6 p10   833.5 p90   964.7 | cpu ms median  2148.2 | md5 29ab3fc3
+== playback stream start-up (first frame) from proxy, 60 runs per variant
+stream_old_first.json        wall ms median   148.7 p10   132.1 p90   175.9 | cpu ms median   155.1 | md5 2835b326
+stream_new_first.json        wall ms median    97.8 p10    86.0 p90   112.6 | cpu ms median   107.0 | md5 2835b326
+== why originals keep the budget: one frame of a 4K HEVC 10-bit original (GOP 60, -ss 3.5), software, 12 runs
+orig_t1.json                 wall ms median  2231.1 p10  2161.1 p90  2276.9 | cpu ms median  2238.4 | md5 cd44898e
+orig_t3.json                 wall ms median  1263.4 p10  1073.4 p90  1391.4 | cpu ms median  2420.1 | md5 cd44898e
+orig_auto.json               wall ms median  1264.8 p10  1071.1 p90  1338.7 | cpu ms median  2584.6 | md5 cd44898e

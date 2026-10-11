@@ -1,0 +1,58 @@
+GPU-1 proxy colour normalisation: before / after
+Mesa lavapipe. FFmpeg 9.0.2 (pinned) = policy BottomLayerTag; FFmpeg 6.1.1 (system) = FixedBt601.
+
+1. Colour fidelity of the proxy-fed preview
+FFmpeg's still of a single clip against the colours the clip was made from (a smooth saturated RGB gradient,
+1280x720 or 720x576, encoded with a known matrix). PSNR in dB / worst channel error in levels.
+
+                                          FFmpeg 9.0.2                          FFmpeg 6.1.1
+source (matrix of its values, its tag)    original   proxy before  proxy after    original   proxy before  proxy after
+HD, BT.709 values, no tag                 28.0 / 21  28.0 / 22     43.3 / 6       28.0 / 21  28.0 / 22     28.0 / 22
+HD, BT.709 values, tagged bt709           43.6 / 4   43.3 / 6      43.3 / 6       28.0 / 21  28.0 / 22     28.0 / 22
+HD, BT.601 values, tagged smpte170m       46.3 / 4   45.8 / 6      45.8 / 6       46.3 / 4   45.8 / 6      45.8 / 6
+HD, BT.2020 values, tagged bt2020nc       46.6 / 4   46.2 / 6      46.2 / 6       30.5 / 14  30.5 / 16     30.5 / 16
+SD, BT.601 values, no tag                 46.8 / 4   46.6 / 5      46.6 / 5       46.8 / 4   46.6 / 5      46.6 / 5
+SD, BT.601 values, tagged smpte170m       46.8 / 4   46.6 / 5      46.6 / 5       46.8 / 4   46.6 / 5      46.6 / 5
+RGB capture (bgr0)                        46.3 / 4   45.8 / 6      45.8 / 6       46.3 / 4   45.8 / 6      45.8 / 6
+Only the first row moves, and only on FFmpeg 9.0.2, which reads tags: 28.0 -> 43.3 dB (the BT.709-tagged
+proxy of the same picture reads 43.3). FFmpeg 6.1.1 ignores tags and does not move. The original of an
+untagged HD clip still reads 28.0 on FFmpeg 9.0.2 (the preview flips to the right colours when its proxy
+lands: the graph for originals is not touched).
+
+2. Stacks of two preview proxies (top layer a 0.5 picture-in-picture), FFmpeg 9.0.2
+"before" is the plan's verdict on the proxies as they were made (an untagged proxy reads as BT.601: measured
+for the first seven rows on the unchanged code; the translucent and HLG rows are the same classification).
+"after" is parity.rs `proxy/...`, GPU against FFmpeg's still of the same files (flat PSNR / flat max error).
+
+stack (top over bottom)                          before                 after
+untagged HD over BT.709                          refused                drawn   46.2 dB / 5
+BT.709 over untagged HD                          refused                drawn   44.3 dB / 5
+untagged HD, 50% opacity, over BT.709            refused                drawn   45.9 dB / 7
+BT.709, 50% opacity, over untagged HD            refused                drawn   43.2 dB / 5
+tone-mapped HLG over untagged HD                 refused                drawn   43.8 dB / 5
+untagged HD over tone-mapped HLG                 refused                drawn   44.4 dB / 5
+untagged HD over untagged HD                     drawn (as BT.601)      drawn   44.3 dB / 5   (now read as BT.709)
+untagged HD alone                                drawn (as BT.601)      drawn   43.3 dB / 5   (now read as BT.709)
+SD untagged over BT.709                          refused                refused
+BT.709 over SD tagged smpte170m                  refused                refused
+HD tagged smpte170m over BT.709                  refused                refused
+HD tagged bt2020nc over BT.709                   refused                refused
+RGB capture over BT.709                          refused                refused
+SD tagged smpte170m over SD untagged             drawn                  drawn   48.3 dB / 5
+SD untagged over SD tagged smpte170m             drawn                  drawn   48.3 dB / 5
+
+Refusals among the 15: 11 -> 5 (the 6 stacks of an untagged HD proxy beside a BT.709 or tone-mapped one,
+plain or translucent, are no longer refused). The five that stay refused are other matrices (BT.601-class
+or BT.2020 against BT.709): FFmpeg 9 converts those layers into the bottom layer's matrix with arithmetic
+the compositor does not reproduce, and they stay on the FFmpeg path.
+Deliberate regression: an untagged HD proxy beside a BT.601-class proxy (SD, smpte170m, an RGB capture) was
+drawn (both read as BT.601) and is now refused (BT.709 vs BT.601), which is the right reading of it.
+
+3. FFmpeg 6.1.1 (FixedBt601)
+No stack is ever refused for its matrices. All 15 stacks drawn, flat PSNR 43.6 - 51.0 dB, max error 4 - 6; the
+frames are the ones they were before (the label moves no pixel and 6.1.1 ignores tags).
+
+4. Existing suites
+kerf-gpu `-- --ignored`: all pass on both FFmpegs (parity 31 tests incl. the 3 new; frame_source, cursor, ...).
+kerf-core unit tests 1114; `-- --ignored` 91 pass on 9.0.2 (the one failure needs network: tts model download).
+Golden digests: untouched (build_proxy_args is outside the oracle).
