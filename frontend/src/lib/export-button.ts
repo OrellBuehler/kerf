@@ -14,3 +14,8 @@ export function exportButtonState(o: { clips: number; running: boolean }): Expor
 	if (o.running || o.clips > 0) return { disabled: false };
 	return { disabled: true, reason: NOTHING_TO_EXPORT };
 }
+
+/** How many clips a timeline holds, over every track. */
+export function clipsIn(timeline: { tracks: ReadonlyArray<{ clips: ReadonlyArray<unknown> }> }): number {
+	return timeline.tracks.reduce((n, t) => n + t.clips.length, 0);
+}

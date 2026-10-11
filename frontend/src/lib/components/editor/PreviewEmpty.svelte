@@ -9,8 +9,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { importMedia } from '$lib/import-media';
 	import { firstRunSteps } from '$lib/first-run';
-	import { exportButtonState } from '$lib/export-button';
-	import { tip } from '$lib/tip';
+	import { clipsIn, exportButtonState } from '$lib/export-button';
 
 	const steps = $derived(
 		firstRunSteps({
@@ -21,7 +20,7 @@
 		})
 	);
 	const exportState = $derived(
-		exportButtonState({ clips: editor.liveTimeline.tracks.reduce((n, t) => n + t.clips.length, 0), running: editor.exportRun !== null })
+		exportButtonState({ clips: clipsIn(editor.liveTimeline), running: editor.exportRun !== null })
 	);
 </script>
 
@@ -72,9 +71,15 @@
 		{:else}
 			<Btn size="sm" icon="film" onclick={() => workspace.show('library')}>Open Library</Btn>
 		{/if}
-		<span use:tip={exportState.reason} style="display:inline-flex">
-			<Btn size="sm" icon="upload" disabled={exportState.disabled} style={exportState.disabled ? 'pointer-events:none' : ''} onclick={() => ui.openExport()}>Export…</Btn>
-		</span>
+		<Btn
+			size="sm"
+			icon="upload"
+			aria-disabled={exportState.disabled ? 'true' : undefined}
+			title={exportState.reason}
+			onclick={() => {
+				if (!exportState.disabled) ui.openExport();
+			}}>Export…</Btn
+		>
 	</div>
 	<div class="agent" style="border-top:var(--line-width) solid var(--border-subtle)">
 		<span style="flex:1;font-size:12px;line-height:1.45;color:var(--text-muted)"

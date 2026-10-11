@@ -54,6 +54,7 @@
 	} from '$lib/api';
 	import { windowTitle } from '$lib/window-title';
 	import { finishImport, importMedia } from '$lib/import-media';
+	import { clipsIn, exportButtonState } from '$lib/export-button';
 	import { afterPaint, fontsReady, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
 	import { CONFIRM, UNSAVED, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
@@ -296,7 +297,14 @@
 		await saveProject();
 	}
 
+	/** File › Export… and its key: the title bar's button's rule (`exportButtonState`) — an empty cut says why
+	 *  instead of opening a dialog with nothing to render, and a render under way reopens its dialog. */
 	function onExport() {
+		const state = exportButtonState({ clips: clipsIn(editor.liveTimeline), running: editor.exportRun !== null });
+		if (state.disabled) {
+			toast.info(state.reason ?? 'Nothing to export yet');
+			return;
+		}
 		ui.openExport();
 	}
 

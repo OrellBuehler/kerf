@@ -196,14 +196,24 @@ describe('the empty Preview', () => {
 });
 
 describe('the Export buttons', () => {
-	test('the title bar’s and the empty Preview’s are off for an empty cut, with the reason on a wrapper that can be hovered', () => {
+	test('the title bar’s and the empty Preview’s are off for an empty cut but stay focusable, so the reason reaches the keyboard', () => {
 		for (const f of ['TitleBar', 'PreviewEmpty']) {
 			const source = read(`${EDITOR}${f}.svelte`);
 			expect(source, f).toContain('exportButtonState(');
-			expect(source, f).toContain('disabled={exportState.disabled}');
-			expect(source, f).toContain('use:tip={exportState.reason}');
-			expect(source, f).toContain('pointer-events:none');
+			expect(source, f).toContain("aria-disabled={exportState.disabled ? 'true' : undefined}");
+			expect(source, f).toContain('if (!exportState.disabled) ui.openExport()');
+			// not natively disabled: a disabled button cannot be focused, and its tooltip is the reason
+			expect(source, f).not.toContain('disabled={exportState.disabled}');
 		}
+		expect(rule(CONTROLS, ".k-btn[aria-disabled='true']")).toContain('color: var(--text-disabled)');
+		expect(CONTROLS).toContain(".k-btn:hover:not(:disabled):not([aria-disabled='true'])");
+	});
+
+	test('File › Export… and its key go by the same rule', () => {
+		expect(read('lib/menus.ts')).toContain('exportButtonState({ clips: s.hasClips ? 1 : 0, running: s.exporting })');
+		expect(read(`${EDITOR}MenuBar.svelte`)).toContain('exporting: editor.exportRun !== null');
+		const page = read('routes/+page.svelte');
+		expect(page).toMatch(/function onExport\(\) \{\s*const state = exportButtonState\(/);
 	});
 });
 
@@ -246,5 +256,39 @@ describe('smaller things the review asked for', () => {
 	test('a clip’s Remove is red ink on the neutral edge, not an alarm-coloured outline', () => {
 		expect(rule(CONTROLS, ".k-btn[data-variant='destructive'][data-quiet]")).toContain('--k-edge: var(--border-strong)');
 		expect(read(`${EDITOR}Inspector.svelte`).match(/data-quiet/g)?.length).toBe(2);
+	});
+});
+
+describe('the mixer’s toggles', () => {
+	const strip = read(`${EDITOR}MixerStrip.svelte`);
+	const css = strip.slice(strip.indexOf('<style>'));
+	const px = (selector: string, prop: string): number => {
+		const at = css.indexOf(`${selector} {`);
+		expect(at, selector).toBeGreaterThan(-1);
+		const m = new RegExp(`(?:^|[\\s;])${prop}:\\s*(\\d+)px`).exec(css.slice(css.indexOf('{', at) + 1, css.indexOf('}', at)));
+		expect(m, `${selector} has no ${prop}`).not.toBeNull();
+		return Number(m![1]);
+	};
+
+	test('M and S are 24 px wide at least, and so is every other button of the row', () => {
+		expect(px('.tog', 'min-width')).toBeGreaterThanOrEqual(24);
+		expect(px('.tog', 'height')).toBeGreaterThanOrEqual(24);
+	});
+
+	test('the strip holds M, S and DUCK at their minimum with room to spare, whatever DUCK is given', () => {
+		const width = px('.strip', 'width');
+		const padding = 14; // 7 px a side
+		const edges = 3; // a 1.5 px border a side, High contrast's
+		const gaps = 2 * px('.toggles', 'gap');
+		const row = px('.tog', 'min-width') * 2 + px('.tog.duck', 'min-width');
+		expect(width - padding - edges - gaps).toBeGreaterThanOrEqual(row);
+	});
+});
+
+describe('the minimap', () => {
+	test('draws its radii from the tokens', () => {
+		const map = read(`${EDITOR}Minimap.svelte`);
+		expect(map).not.toMatch(/border-radius:\s*\d/);
+		expect(map).toContain('border-radius:var(--radius-xs)');
 	});
 });

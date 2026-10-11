@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { exportButtonState, NOTHING_TO_EXPORT } from './export-button';
+import { clipsIn, exportButtonState, NOTHING_TO_EXPORT } from './export-button';
 
 describe('the Export button', () => {
 	test('is off for an empty cut, and says why', () => {
@@ -13,5 +13,12 @@ describe('the Export button', () => {
 
 	test('stays on while a render runs, even if the cut was emptied under it: it reopens the dialog with Stop', () => {
 		expect(exportButtonState({ clips: 0, running: true })).toEqual({ disabled: false });
+	});
+});
+
+describe('counting clips', () => {
+	test('over every track, picture and sound alike', () => {
+		expect(clipsIn({ tracks: [] })).toBe(0);
+		expect(clipsIn({ tracks: [{ clips: [] }, { clips: [{}, {}] }, { clips: [{}] }] })).toBe(3);
 	});
 });

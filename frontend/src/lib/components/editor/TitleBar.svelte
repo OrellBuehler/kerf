@@ -9,7 +9,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { workspace } from '$lib/workspace.svelte';
 	import { proposalIndicator, reviewChipText } from '$lib/agent-status';
-	import { exportButtonState } from '$lib/export-button';
+	import { clipsIn, exportButtonState } from '$lib/export-button';
 	import { updater } from '$lib/updater.svelte';
 	import { notifications } from '$lib/notifications.svelte';
 	import { settings } from '$lib/settings.svelte';
@@ -40,7 +40,7 @@
 	const exporting = $derived(editor.exportRun);
 	const exportPercent = $derived(Math.round((exporting?.progress?.fraction ?? 0) * 100));
 	const exportState = $derived(
-		exportButtonState({ clips: editor.liveTimeline.tracks.reduce((n, t) => n + t.clips.length, 0), running: exporting !== null })
+		exportButtonState({ clips: clipsIn(editor.liveTimeline), running: exporting !== null })
 	);
 </script>
 
@@ -86,33 +86,33 @@
 		{/if}
 		<!-- The app's goal had no button outside the Deliver workspace; it is File › Export… and Ctrl+E too. A
 		     render that is under way shows here as well as in the status bar, and the button reopens its dialog. -->
-		<!-- An empty cut has nothing to render, so the button is off and says so; the tooltip sits on a wrapper
-		     because a disabled button swallows the pointer. -->
-		<span use:tip={exportState.reason} style="display:inline-flex;-webkit-app-region:no-drag">
-			<Btn
-				variant="primary"
-				size="sm"
-				icon={exporting ? undefined : 'upload'}
-				disabled={exportState.disabled}
-				title={exportState.disabled
-					? undefined
-					: exporting
-						? { text: `Exporting ${exportPercent}%`, detail: 'Open the export dialog to follow or stop it.' }
-						: settings.tip('Export…', 'file.export', 'Render the cut to a file')}
-				onclick={() => ui.openExport()}
-				style={exportState.disabled ? 'pointer-events:none' : ''}
-			>
-				{#if exporting}
-					<span
-						class="kerf-spin"
-						style="width:10px;height:10px;border:1.5px solid currentColor;border-top-color:transparent;border-radius:50%"
-					></span>
-					{exporting.progress?.waiting ? 'Waiting…' : `${exportPercent}%`}
-				{:else}
-					Export
-				{/if}
-			</Btn>
-		</span>
+		<!-- An empty cut has nothing to render, so the button is off and says so. It is `aria-disabled`, not `disabled`:
+		     it stays focusable, so its reason — the tooltip — is there for the keyboard as well as the pointer. -->
+		<Btn
+			variant="primary"
+			size="sm"
+			icon={exporting ? undefined : 'upload'}
+			aria-disabled={exportState.disabled ? 'true' : undefined}
+			title={exportState.disabled
+				? exportState.reason
+				: exporting
+					? { text: `Exporting ${exportPercent}%`, detail: 'Open the export dialog to follow or stop it.' }
+					: settings.tip('Export…', 'file.export', 'Render the cut to a file')}
+			onclick={() => {
+				if (!exportState.disabled) ui.openExport();
+			}}
+			style="-webkit-app-region:no-drag"
+		>
+			{#if exporting}
+				<span
+					class="kerf-spin"
+					style="width:10px;height:10px;border:1.5px solid currentColor;border-top-color:transparent;border-radius:50%"
+				></span>
+				{exporting.progress?.waiting ? 'Waiting…' : `${exportPercent}%`}
+			{:else}
+				Export
+			{/if}
+		</Btn>
 		<button
 			class="k-ibtn"
 			data-on={settings.open ? '' : undefined}

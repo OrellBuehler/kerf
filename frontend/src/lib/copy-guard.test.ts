@@ -17,6 +17,7 @@ const state: MenuState = {
 	canUndo: true,
 	canRedo: true,
 	hasClips: true,
+	exporting: false,
 	hasSelection: true,
 	rippleMode: false,
 	snap: true,

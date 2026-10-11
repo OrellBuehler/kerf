@@ -99,22 +99,32 @@
 .k-btn[data-variant='destructive'][data-quiet] {
 	--k-edge: var(--border-strong);
 }
-.k-btn:hover:not(:disabled) {
+.k-btn:hover:not(:disabled):not([aria-disabled='true']) {
 	background: var(--k-fill-hover, var(--k-fill));
 	border-color: var(--k-edge-hover, var(--k-edge));
 	color: var(--k-ink-hover, var(--k-ink));
 }
-.k-btn:active:not(:disabled) {
+.k-btn:active:not(:disabled):not([aria-disabled='true']) {
 	background: var(--k-fill-press, var(--k-fill-hover, var(--k-fill)));
 	border-color: var(--k-edge-press, var(--k-edge-hover, var(--k-edge)));
 	color: var(--k-ink-press, var(--k-ink-hover, var(--k-ink)));
 }
-.k-btn[data-variant='secondary']:active:not(:disabled) {
+.k-btn[data-variant='secondary']:active:not(:disabled):not([aria-disabled='true']) {
 	box-shadow: inset 0 1px 2px color-mix(in srgb, var(--shadow-color) calc(var(--shadow-strength) * 0.5), transparent);
 }
 /* Off is a plain outline in the disabled ink, not a dimmed copy of the live look: the old blanket
    50 % made a secondary label 2.7:1 and an amber button a washed-out amber. */
 .k-btn:disabled {
+	background: transparent;
+	border-color: var(--k-edge-off);
+	color: var(--text-disabled);
+	box-shadow: none;
+	cursor: default;
+	opacity: 1;
+}
+/* Off but still focusable (`aria-disabled`): a button that explains itself — its tooltip is the reason, and a keyboard
+   user reaches it, which a `disabled` button cannot be. The same look; the click is the handler's to refuse. */
+.k-btn[aria-disabled='true'] {
 	background: transparent;
 	border-color: var(--k-edge-off);
 	color: var(--text-disabled);
