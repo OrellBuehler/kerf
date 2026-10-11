@@ -80,6 +80,26 @@ describe('parseTheme', () => {
 		expect('bogus' in out!.colors).toBe(false);
 	});
 
+	test('a stored preset that lacks a token a later build added is still that preset', () => {
+		// A theme file written before `clip-accent` existed: every other color, none of that one.
+		for (const id of PRESET_IDS) {
+			const { 'clip-accent': _added, ...old } = PRESETS[id].colors;
+			const stored = JSON.parse(JSON.stringify({ ...PRESETS[id], colors: old }));
+			const out = parseTheme(stored)!;
+			expect(out.colors['clip-accent'], id).toBe(PRESETS[id].colors['clip-accent']);
+			expect(presetIdFor(out), id).toBe(id);
+			expect(out.shape, id).toEqual(PRESETS[id].shape);
+		}
+	});
+
+	test('a theme the user changed takes what it lacks from its scheme, not from a preset it no longer is', () => {
+		const { 'clip-accent': _added, ...old } = PRESETS['high-contrast'].colors;
+		const edited = { ...PRESETS['high-contrast'], colors: { ...old, waveform: '#123456' } };
+		const out = parseTheme(edited)!;
+		expect(out.colors['clip-accent']).toBe(PRESETS['kerf-dark'].colors['clip-accent']);
+		expect(presetIdFor(out)).toBe('custom');
+	});
+
 	test('normalizes hex case', () => {
 		const out = parseTheme({ ...PRESETS['kerf-dark'], colors: { ...PRESETS['kerf-dark'].colors, 'kerf-500': '#E29D2E' } });
 		expect(out!.colors['kerf-500']).toBe('#e29d2e');

@@ -91,7 +91,9 @@ holds the time under the pointer (`zoomAround`; the scroll is applied after the 
 been rewidened); **⇧Z / the fit button** fits the cut (`ui.zoomToFit()` bumps `fitEpoch`,
 since only the timeline knows its width). **Until anyone sets the zoom it follows the cut**
 (`ui.zoomFollowsCut`, true again for each project; `ui.zoom` is an accessor whose setter is "a
-person took it", the timeline's own fit goes through `ui.fitZoomTo`): `followZoom` fits when a
+person took it"; only `followZoom`'s own fit goes through `ui.fitZoomTo`, and an **explicit Fit is a person's
+action too** — ⇧Z or the button ends the following, so a later resize does not swap the uncapped fit
+for the 100 px/s-capped one): `followZoom` fits when a
 project opens (`editor.loadEpoch`), when the first clip lands, when the window changes width (settled
 150 ms, so a panel sash does not rescale the lane per frame) and when the cut outgrows the window —
 but never past `AUTO_FIT_MAX` (100 px/s, so a 3 s cut is not blown up to the window) and not when

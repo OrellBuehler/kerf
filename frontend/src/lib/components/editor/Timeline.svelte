@@ -1644,12 +1644,15 @@
 		const v = viewport();
 		const next = v ? fitZoom(editor.duration, v.viewW) : null;
 		if (!v || next === null) return;
+		// Asked for by a person: from here the zoom is theirs, so a later resize does not swap
+		// this uncapped fit for the capped one the follow takes.
+		ui.zoomFollowsCut = false;
 		if (next === ui.zoom) {
 			v.el.scrollLeft = 0;
 			return;
 		}
 		pendingScroll = 0;
-		ui.fitZoomTo(next);
+		ui.zoom = next;
 	}
 
 	// Until anyone sets the zoom it follows the cut (`followZoom`, `zoom.ts`): fitted when a project
@@ -2252,6 +2255,8 @@
 				<span style="flex:1"></span>
 				{#if editor.rippleMode}
 					<span
+						role="img"
+						aria-label="Ripple mode is on"
 						title="Ripple mode is on — edits pull the later clips on their track along"
 						style="display:inline-flex;color:var(--kerf-300)"><Icon n="between-horizontal-start" s={12} /></span
 					>
@@ -2684,8 +2689,13 @@
 							oncontextmenu={(e) => onClipContextMenu(e, c, t)}
 							onclick={(e) => {
 								e.stopPropagation();
-								// Enter or Space on a focused clip: a click has no pointer position.
-								if (e.detail === 0) {
+								if (e.detail > 0) {
+									// A pointer click: the clip is not left holding the keyboard, or Space (play) would
+									// press it — and replace a multi-selection with it — instead of reaching the page.
+									(e.currentTarget as HTMLElement).blur();
+								} else if (!selected) {
+									// Enter or Space on a focused clip: a click has no pointer position. A clip that is
+									// already selected leaves the selection (a group, a linked pair) as it is.
 									editor.selectClip(c.id);
 									void editor.select(c.asset_id);
 								}

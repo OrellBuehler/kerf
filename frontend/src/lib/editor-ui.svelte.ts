@@ -160,7 +160,8 @@ class EditorUi {
 	/** Whether the zoom is still the timeline's own: fitted to the cut when it opens and as it
 	 *  outgrows the window (`followZoom`), until anyone sets `zoom`. A new project starts it again. */
 	zoomFollowsCut = $state(true);
-	/** The timeline fitting its own zoom: not a person's choice, so it keeps following the cut. */
+	/** The timeline following the cut (`followZoom`): not a person's choice, so it keeps following. An
+	 *  explicit Fit (⇧Z, the button) is one, and goes through the setter. */
 	fitZoomTo(z: number) {
 		this.#zoom = z;
 	}
