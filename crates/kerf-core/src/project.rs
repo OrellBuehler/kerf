@@ -883,6 +883,22 @@ impl Project {
             return Ok(Vec::new());
         }
         let timeline = self.working_timeline()?;
+        Self::proxy_waits_in(&timeline, source, from, to, |id| self.proxy_input(id))
+    }
+
+    /// [`Project::proxy_waits`] over a timeline and proxy inputs already in hand, so a caller
+    /// holding both (the GPU preview's snapshot of a frame's inputs) asks without the project
+    /// lock. `input` answers for an asset id; the status is read now, from the proxy queue.
+    pub fn proxy_waits_in(
+        timeline: &Timeline,
+        source: crate::proxy::PreviewSource,
+        from: f64,
+        to: Option<f64>,
+        mut input: impl FnMut(Uuid) -> Result<crate::proxy::ProxyInput>,
+    ) -> Result<Vec<crate::proxy::ProxyWait>> {
+        if source != crate::proxy::PreviewSource::ProxyOnly {
+            return Ok(Vec::new());
+        }
         let mut wanted: Vec<Uuid> = Vec::new();
         for track in timeline.tracks.iter().filter(|t| t.kind == StreamKind::Video) {
             for clip in &track.clips {
@@ -894,7 +910,7 @@ impl Project {
         }
         let mut waits = Vec::new();
         for id in wanted {
-            let input = self.proxy_input(id)?;
+            let input = input(id)?;
             if crate::proxy::needs_proxy(&input.asset) && Self::preview_source(&input.asset) == Path::new(&input.asset.path) {
                 waits.push(crate::proxy::ProxyWait {
                     asset_id: id,
@@ -5792,6 +5808,22 @@ mod tests {
             .proxy_waits_under(PreviewSource::ProxyOnly, 9.0, Some(9.0))
             .unwrap()
             .is_empty());
+
+        // The same answers from a timeline and inputs held outside the project (a snapshot).
+        let timeline = project.working_timeline().unwrap();
+        let inputs: HashMap<Uuid, crate::proxy::ProxyInput> =
+            project.proxy_inputs().unwrap().into_iter().map(|i| (i.asset.id, i)).collect();
+        let held = |id: Uuid| inputs.get(&id).cloned().ok_or(Error::AssetNotFound(id));
+        for (source, from, to) in [
+            (PreviewSource::Auto, 0.0, None),
+            (PreviewSource::ProxyOnly, 0.0, None),
+            (PreviewSource::ProxyOnly, 3.0, Some(3.0)),
+            (PreviewSource::ProxyOnly, 9.0, Some(9.0)),
+        ] {
+            let live = project.proxy_waits_under(source, from, to).unwrap();
+            let kept = Project::proxy_waits_in(&timeline, source, from, to, &held).unwrap();
+            assert_eq!(live, kept, "{source:?} {from} {to:?}");
+        }
     }
 
     #[test]
