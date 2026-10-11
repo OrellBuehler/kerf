@@ -264,8 +264,8 @@ non-Xlib handle, which leaves the JPEG with that reason in the status). A child 
 frame that needs a title box, the trim monitor or safe-area guides to the JPEG, and so does
 one with a dialog, a menu or a drag ghost over the frame (`covered`: a 3x3
 `elementFromPoint` grid on the frame, every 150 ms and after each click or key — the
-Settings dialog opened *under* the picture before this existed); the in-frame badge,
-resolution and timecode are under it too (the transport bar has the timecode). **macOS has
+Settings dialog opened *under* the picture before this existed); the in-frame HUD
+(the name and `resolution · fps` chips, on a scrim) is under it too; it no longer prints a timecode, which is the transport bar's. **macOS has
 no technique in this build**: a surface under the webview needs a transparent window, which
 Tauri gates behind `macos-private-api` (a private WKWebView key, and a feature that changes
 every macOS bundle); it is not enabled blind (`KERF_GPU_SURFACE=window` forces the attempt).

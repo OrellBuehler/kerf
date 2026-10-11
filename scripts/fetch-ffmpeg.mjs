@@ -105,13 +105,61 @@ function sources({ btbn: BTBN, build: BTBN_BUILD, branch: BTBN_BRANCH, evermeet:
   };
 }
 
+// Mirrors rate-limit CI runners (evermeet answers 429 or refuses the connection
+// when several jobs fetch at once), so a refused or throttled request is retried
+// with backoff (about six and a half minutes in all), honouring Retry-After.
+// The digest check still guards the bytes.
+const ATTEMPTS = 8;
+
 async function download(url) {
-  console.log(`\u2193 ${url}`);
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`download failed (${res.status}) for ${url}`);
-  const bytes = new Uint8Array(await res.arrayBuffer());
-  const digest = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
-  return { bytes, digest };
+  for (let attempt = 1; ; attempt++) {
+    console.log(`\u2193 ${url}${attempt > 1 ? ` (attempt ${attempt})` : ""}`);
+    let res;
+    try {
+      res = await fetch(url);
+    } catch (err) {
+      if (attempt >= ATTEMPTS) throw err;
+      await backoff(attempt, null, String(err));
+      continue;
+    }
+    if (res.ok) {
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      const digest = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+      return { bytes, digest };
+    }
+    const transient = res.status === 429 || res.status >= 500;
+    if (!transient || attempt >= ATTEMPTS) throw new Error(`download failed (${res.status}) for ${url}`);
+    await backoff(attempt, res.headers.get("retry-after"), `HTTP ${res.status}`);
+  }
+}
+
+// `KERF_FFMPEG_ARCHIVES` names a directory that keeps verified archives between
+// runs (CI caches it), so a pin already fetched is never asked of a mirror again.
+// The digest is checked either way; a stale or damaged copy is fetched afresh.
+async function fetchPinned(url, sha256) {
+  const keep = process.env.KERF_FFMPEG_ARCHIVES;
+  const kept = keep && join(keep, `${sha256}-${url.split("/").pop().replace(/[^\w.-]/g, "_")}`);
+  if (kept && (await Bun.file(kept).exists())) {
+    const bytes = new Uint8Array(await Bun.file(kept).arrayBuffer());
+    const digest = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+    if (digest === sha256) {
+      console.log(`\u2713 kept ${url}`);
+      return { bytes, digest };
+    }
+  }
+  const got = await download(url);
+  if (kept && got.digest === sha256) {
+    await mkdir(keep, { recursive: true });
+    await Bun.write(kept, got.bytes);
+  }
+  return got;
+}
+
+async function backoff(attempt, retryAfter, why) {
+  const asked = Number(retryAfter);
+  const ms = Number.isFinite(asked) && asked > 0 ? Math.min(asked, 120) * 1000 : Math.min(2 ** attempt * 2500, 120_000);
+  console.log(`  ${why}; retrying in ${Math.round(ms / 1000)}s`);
+  await Bun.sleep(ms);
 }
 
 // `--print-hashes` fetches every pinned archive and prints its digest, so
@@ -212,7 +260,7 @@ const work = await mkdtemp(join(tmpdir(), "kerf-ffmpeg-"));
 let licenseWritten = false;
 try {
   for (const { url, wants, sha256 } of source.archives) {
-    const { bytes, digest } = await download(url);
+    const { bytes, digest } = await fetchPinned(url, sha256);
     // Verified before anything unpacks it — a tampered archive is never handed
     // to `tar`, let alone bundled into a signed installer.
     if (digest !== sha256) {

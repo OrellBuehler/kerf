@@ -18,7 +18,8 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   the opaque color tokens (grouped for the editor), three presets (Kerf Dark —
   bun-tested to equal the stylesheet's defaults — Kerf Light, High contrast),
   `parseTheme` (a stored or imported JSON; unknown tokens dropped, missing ones
-  filled from the scheme's preset) and `applyTheme`, which writes the tokens as
+  filled from the preset the colors it does carry are exactly — a High contrast saved before a token existed stays
+  High contrast — else the scheme's) and `applyTheme`, which writes the tokens as
   inline properties on `<html>` (beating the stylesheet), toggles the `dark`
   class and `color-scheme`. Every translucent token in `kerf-tokens.css`
   (borders, fills, glows, the scrim) is a `color-mix` of an opaque base so a
@@ -57,7 +58,8 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   ones, `text-on-accent`, `agent-fg`, `text-on-video` on the clip bodies), 3:1 for
   muted text on hover / active, accent and status hues as text on the panels and
   the strokes that carry meaning (clip edges, the playhead / selection amber, the
-  waveform, the drag ghost), plus the `color-mix` fill of a generated caption's
+  waveform, the drag ghost, and `clip-accent` — the volume line, fade handles and keyframes on every clip
+  body), plus the `color-mix` fill of a generated caption's
   block (`GENERATED_TITLE_FILL`, resolved per preset by `mixSrgb` and held to 4.5
   under its label). `text-disabled` is exempt on a *disabled* control; it used to be
   the idle colour of live toggles too (DUCK / S / L, the bell), which is no longer so (see below),
@@ -336,7 +338,8 @@ contrast guard covers it. **Where the old toolbar's controls went**: the transpo
 start, play / pause, go to end, the timecode with the timeline's fps; J / K / L stay on
 the keyboard) is the **Preview**'s own bar, which sheds the duration and the rate below
 ~380 px of its *measured* width (`transport-bar.ts`, bun-tested: an unknown or 0 width is the
-full bar, and the buttons, timecode and scrub bar never go); the tools, Ripple, Snapping,
+full bar, and the buttons, timecode and scrub bar never go) — see **the Preview frame and its
+scrub bar** below; the tools, Ripple, Snapping,
 Undo / Redo and the delivery-frame picker are the **Timeline**'s toolbar, which wraps to a
 second row rather than clip
 (its "Timeline" caption is gone — the dock tab says it); New / Open / Save / Export and
@@ -633,6 +636,36 @@ engine. Below the queue, the **History** section renders
 `editor.history` (the `Revision[]` edit log, attributed to user/agent/system) with one-click
 `editor.revertTo(seq)`, and each row expands to *what* that revision changed
 (`revision_diff`).
+
+**The Preview frame and its scrub bar.** The frame is the delivery shape at `min(100%, 100cqh × aspect)` of its
+pane — the 720 px cap it had left it 62 % of the pane at 1920×1080 and a postage stamp at 2560×1440. What is asked of the
+backend follows the box: `preview-size.ts` `requestWidth(css width, dpr)` rounds `ceil(css × dpr)` up to 480 / 960 /
+1440 / 1920 (the top is the MCP frame tools' own cap; the backend takes any width and never scales a picture past its
+own, so the bound is only on cost), measured from the frame element by a `ResizeObserver`, the window's resize and a
+`(resolution: Xdppx)` media query (a window dragged to another monitor fires neither of the first two),
+**settled 200 ms** so a dragged panel edge is a few requests, not one per pixel; a box with no width (a hidden dock
+tab) is not a measurement — the last one stands, or nothing is asked. The width is then **held to the widest source the
+preview reads at the playhead** (`proxy-info.ts` `previewSourceWidth`: a ready proxy's width when the preview decodes it,
+else the original's; `capToSource`), since the default proxy is 1280 px wide and a 1440 / 1920 px composite of it is the
+same picture upscaled at several times the decode cost on every scrub frame — not under a delivery frame, whose canvas is
+not the source's shape (`data-request-width` on the frame says what it asked). The pump (`frame-pump.svelte.ts`) takes it as `width()`, reads it in `run()` — a different
+step is a new frame — and asks nothing until the box has been measured, so a first frame is not decoded at a guess
+and again at the real size. (Playback's streamed frames keep the backend's fixed stream width.) The picture is clipped to the
+frame's radius and the frame's border is `border-strong`, since a black matte is 1.05:1 on the pane. **The HUD** over the
+picture is scrim chips with `text-on-video` (the name, ellipsised at 62 % of the width so a long file name never reaches the
+format, then `1920×1080 · 30 fps` in the transport's own rate format, and the proxy / analysis status chips with a dot) — bare
+tinted text was unreadable on a snow shot and on the Light theme's pale placeholder — and it no longer prints the timecode, which
+is the transport's. **`ScrubBar.svelte`** is a 16 px hit area around a 4 px rail (`--scrub-rail`, an alias of `text-disabled`, so
+the 3:1 it is held to covers it and it shows in High contrast, where the old `surface-inset` rail on the black bar was 1.05:1) with
+the in / out range behind the fill and a thumb that grows while held. A press moves the playhead there and a drag moves it
+*live* (`scrub.ts`: `scrubTime`, and `frameLimited` — at most one `ui.seek` per animation frame, with the newest position, since
+each seek is an FFmpeg composite); it is `beginDrag` (pointer capture, so the pointer may leave the bar; Escape /
+pointercancel / lost capture / blur put the playhead back where the press found it), playback is paused while the bar is held
+and resumes at either end of the gesture — except when it was let go at the very end of the cut, where `play()` would start
+the cut over (a seek mid-play restarts the audio each time). It is a `role=slider` with the cut's
+timecode as its value text; a press does not focus it (a focused slider owns Space and the arrows — the page stands down for
+the keys a slider operates — so one left focused after a click would silence the transport shortcuts), and once Tab has
+put focus there its own keys are ← → a frame, ⇧← ⇧→ a second, Home / End the ends, Space play.
 
 **The GPU preview in the page** (`Preview.svelte`, `preview-bounds.ts`,
 `gpu-preview.svelte.ts`). With the setting on, a frame whose route is `gpu`
