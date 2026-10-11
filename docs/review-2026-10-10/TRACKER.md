@@ -16,7 +16,7 @@
 | UI-7 Panels polish | ui-7 (on ui-8) | | pushed (awaits ui-8 merge for PR) | panels/shell medium + polish; shell H6 | wave 3 |
 | UI-8 Export dialog logic | ui-8 (on ui-6, pushed) | | ready (PR after UI-6) | dialogs 3 | wave 3 |
 | PERF-4 Still cache and prefetch | perf-4 (on perf-3 + gpu-3) | | in-progress | gpu-media WP6, WP9; gpu-compositor Hint::Prefetch | wave 3 |
-| GPU-2 Text on the GPU | gpu-2 (on gpu-3) | | review r3 | gpu-compositor | dev done: T1 captioned 12.7%→96.0% GPU frames, T1b 13.3%→100%, T2 69.5%→78.8%, T3 65.6%→83.3%; 76 text parity cases pass on 6.1.1 + 9.0.2; also fixes drawtext escaping of ' : \ (pre-existing export bug) |
+| GPU-2 Text on the GPU | gpu-2 (on gpu-3) | | verify (r3 blocker fixed in c3c6bf6) | gpu-compositor | dev done: T1 captioned 12.7%→96.0% GPU frames, T1b 13.3%→100%, T2 69.5%→78.8%, T3 65.6%→83.3%; 76 text parity cases pass on 6.1.1 + 9.0.2; also fixes drawtext escaping of ' : \ (pre-existing export bug) |
 | GPU-4 Motion fades/transitions | gpu-4 (on gpu-2) | | in-progress | gpu-compositor WP-4 | wave 4 |
 | GPU-5 … GPU-7, PERF-5, macOS presenter | | | todo | | wave 4 |
 | CI: retry + cache ffmpeg download | ci-fetch-retry | #131 | blocked (evermeet 429) | not a review finding | evermeet.cx throttles the macOS pinned-ffmpeg fetch (ffprobe 429 for 6.5+ min); retry + actions/cache ported into #129, #130, #132; cache fills only after one successful run |
@@ -65,6 +65,8 @@
 - GPU-2: bundle Geist Regular+Bold (OFL, ~255 KB) as the default text font instead of resolving a platform font: same pixels on every machine, the plan can name the file, and the Windows/macOS FFmpeg bundles have no fontconfig. Text <12 px and synthetic-bold borders are refused (drawtext blends per glyph; a combined mask rounds differently). Full-range pictures are drawn; layerless frames blend in RGB like FFmpeg.
 - PERF-4 and GPU-4 start stacked (perf-4 on perf-3 + gpu-3; gpu-4 on gpu-2) rather than waiting for the CI-blocked merges.
 
+- GPU-2 r3 blocker (preflight `border-box` collapsed every boxed title's handle to its padding) was a one-line CSS fix; the orchestrator applied it directly (c3c6bf6, with a source guard test) rather than spend a fourth review round.
+
 ## Needs a real machine
 - GPU-2: the private 0700 temp font dir + ownership check (Linux only exercised); sbix/COLR colour fonts (only CBDT tested: drawtext errors on it in both FFmpegs, 6.1.1 segfaults).
 - GPU-2: default font lives under the user profile on Windows; drawtext opens `fontfile` via FreeType's narrow open, so a non-ASCII profile name may fail every title export.
@@ -103,6 +105,7 @@
 - UI-3: dialog focus return, `inert` timing and the focus rescue checked in Chromium only; confirm in WebView2, WebKitGTK and WKWebView.
 
 ## Needs a decision
+- GPU-2 (r3 nits, unfixed): the title handle is not re-measured when Geist finishes loading (stays on the fallback measure until the next render); the atlas position key is full precision, so a keyframed slide-in rasterises once per frame.
 
 - GPU-2: Greek/CJK titles draw missing-glyph boxes with bundled Geist (Latin/Cyrillic only), identically in FFmpeg and GPU — per-text system-font fallback or a second bundled font (Noto, large)? Frontend `titlesShown` gating may still route titled frames off the GPU. Synthetic-bold and sub-12 px text stay refused (needs per-glyph masks).
 - UI-7: bin double-click/Enter to add at the playhead, search, sort and a compact list (panels polish 4, M10); visible ◀ ▶ key-step buttons; rename the project on double-click; a shared .kmenu stylesheet; icon-size and spacing tokens; shell P9, P10, P19.
