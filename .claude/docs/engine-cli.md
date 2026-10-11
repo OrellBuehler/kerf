@@ -65,9 +65,7 @@ so the feature is **only** activated through these forwards — which is what ma
   starts on the real first frame: `transition_fx` sets `ClipFx.head_pad` from the
   input's name and `video_clip_chain` opens that chain with `trim=start_frame=1`.
   Any seeked read skips the clone already. Ordinary assets get no such filter and
-  an unchanged argv. A padded proxy never takes a hardware encoder (its output
-  has no frame rate for the encoder to be told, and one refusal disables HW
-  encode process-wide). **MPEG-TS is not fixed and is left alone**
+  an unchanged argv. **MPEG-TS is not fixed and is left alone**
   (`.ts`/`.mts`/`.m2ts`, `format_name` `mpegts`: lead reported 0, plain proxy,
   unchanged key): the TS demuxer measures the container start over the streams it
   reads, so the audio-less read rebases the video to zero and no pad can restore
@@ -108,15 +106,15 @@ so the feature is **only** activated through these forwards — which is what ma
   `.part`, `Error::Cancelled`) and kills ffmpeg after `EXPORT_STALL` (300 s) without a word — it
   used to be a bare `.output()` that waited forever *while holding the machine's one heavy slot*.
   The first report (0.0) comes when the encode holds the slot, so a proxy queued behind an export
-  is not shown building. **A stalled hardware encode or decode is a hardware failure like a refusal**
-  (`retry_proxy_in_software`, pure): it turns hardware encode (and decode) off for the process and the
+  is not shown building. **A stalled hardware decode is a hardware failure like a refusal**
+  (`retry_proxy_in_software`, pure): it turns hardware decode off for the process and the
   proxy is run again once in software, instead of hanging 300 s per proxy; a cancel is never retried. Each
   encode's temp file is `<hash>.<pid>.<n>.part` (a counter), so a rebuild that cancels the encode
   before it does not share one with its replacement. **The size is a setting**: `proxy_width(projection)`
   = `proxy_width_for(projection, proxy_base_width())`, the base width being 1280 (the default, whose
   cache stays valid) or the 720 / 1080 Settings pick (`set_proxy_base_width`, driven by
-  `proxy::set_proxy_size`); a spherical source keeps the 3072 / 1280 ratio capped at 3072 (hardware
-  H.264 stops at 4096 across and one refusal turns every hardware encode off). The width is in the
+  `proxy::set_proxy_size`); a spherical source keeps the 3072 / 1280 ratio capped at 3072 (set when
+  proxies were hardware-encoded, which stops at 4096 across; the cap stays). The width is in the
   key, so each size is its own file. `remove_proxy_files(src, width)` deletes a proxy and its sidecar.
   **GPU acceleration**: `hw_encoders()` probes once per process which hardware
   encoders (NVENC / QSV / VideoToolbox / AMF) this ffmpeg can *actually* use —
@@ -124,9 +122,13 @@ so the feature is **only** activated through these forwards — which is what ma
   `-encoders` listing alone is not proof (`KERF_HW_ENCODE=none` disables). The
   list is surfaced as the `hw_encoders` Tauri command and the
   `export_capabilities` MCP tool, and the export dialog merges the verified ones
-  into its codec choices. Proxy generation uses the first verified h264 HW
-  encoder and stitching the first hevc one (both fall back to libx264 on any
-  failure, and one such failure disables HW encode for the process). Background
+  into its codec choices. **Proxies never encode in hardware**: `generate_proxy_with` always
+  runs `libx264 -g 1`, with hardware *decode* only. Measured on a 7900 XT, 4K HEVC10 to 720p
+  all-intra, 8 s: `d3d11va` + x264 1.90 s / 1.0 CPU-s against `d3d11va` + AMF 1.85 s / 0.56 CPU-s —
+  the same wall time — while AMF proxies were a third larger (7.35 vs 5.54 MB) and one refusal
+  turned hardware encode off for every later proxy and stitch. Stitching takes the first verified
+  hevc encoder and falls back to libx264 on any failure (one such failure disables HW encode for
+  the process, `HW_ENCODE_OK`, which only a stitch now sets). Background
   decodes (proxy, stitch, scene detection, the composited still) use the same
   `-hwaccel` (default `auto`, `KERF_HWACCEL=none` to disable) with a learned
   software fallback shared with the preview path (`disable_decode_hwaccel()` is how a
@@ -163,10 +165,8 @@ so the feature is **only** activated through these forwards — which is what ma
   `Failed setup for format`, which a successful `auto` run prints too, so a missing output
   directory or a full disk is not the hardware's) convicts, through `convict_hardware_decode`
   (which also sets the separate `HWACCEL_PROVEN_BAD`): `render_with_progress`
-  (`retry_export_in_software`) and `generate_proxy_with` when only a decoder was in use (with an
-  encoder too the encoder is blamed, as it always was, and the next proxy finds out about the
-  decoder — `blame_after_software_success`; a *stall* still convicts both before the rerun, via
-  the unclassified flag only). **An export drops its symbolic `auto` before the argv is built
+  (`retry_export_in_software`) and `generate_proxy_with` (the decoder is all the hardware a proxy
+  uses; a *stall* convicts it before the rerun, via the unclassified flag only). **An export drops its symbolic `auto` before the argv is built
   (`export_hwaccel_request`) under `KERF_HWACCEL=none` or once `HWACCEL_PROVEN_BAD` is set** — not
   on the previews' flag, so one spurious preview rescue does not send every export to software;
   the GUI's "GPU decode" toggle still shows on meanwhile, and the first export after only a

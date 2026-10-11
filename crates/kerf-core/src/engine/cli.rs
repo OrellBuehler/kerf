@@ -143,9 +143,9 @@ fn hwaccel() -> Option<String> {
 /// `-hwaccel auto` doesn't double every frame's latency.
 static HWACCEL_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// Cleared the first time a hardware *encode* (proxy / stitch) fails while the
+/// Cleared the first time a hardware *encode* (the Insta360 stitch) fails while the
 /// software retry succeeds, so a broken GPU encoder doesn't double every later
-/// background encode.
+/// stitch. Proxies never encode in hardware, and an export's encoder is the user's.
 static HW_ENCODE_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Set only when a failure that read as the hardware's (`looks_like_hardware_decode_failure`) was
@@ -2288,27 +2288,12 @@ fn encode_pix_fmt(vc: &str) -> &'static str {
     }
 }
 
-/// The hardware H.264 encoder to generate proxies with, when one is available
-/// and hardware encoding hasn't been disabled or found broken. H.264 rather
-/// than HEVC because every proxy width (≤3072) sits inside even H.264 NVENC's
-/// 4096-wide ceiling, and H.264 decodes cheapest — which is the whole point of
-/// a scrubbing proxy.
-fn proxy_hw_encoder() -> Option<&'static str> {
-    if !HW_ENCODE_OK.load(std::sync::atomic::Ordering::Relaxed) {
-        return None;
-    }
-    HW_ENCODER_CANDIDATES
-        .iter()
-        .find(|e| e.starts_with("h264_") && hw_encoders().iter().any(|h| h == *e))
-        .copied()
-}
-
 /// Build the ffmpeg argument list (pure, unit-tested) that transcodes `src` into
 /// an all-intra, audio-less preview proxy at `dst`, capped to `width` pixels
 /// across (see [`proxy_width`]) and using at most `threads` CPU threads.
-/// `encoder` is `libx264` or a detected hardware encoder (which offloads the
-/// whole background transcode to the GPU); `hw_decode` adds an input-side
-/// `-hwaccel`. `-g 1` makes every frame a keyframe, so a seek decodes
+/// `encoder` is `libx264`: [`generate_proxy_with`] never hands a proxy to a hardware
+/// encoder (the builder still spells their quality flags); `hw_decode` adds an
+/// input-side `-hwaccel`. `-g 1` makes every frame a keyframe, so a seek decodes
 /// exactly one frame (instant scrub even on long-GOP 4K/HEVC). fps and duration
 /// are left untouched — no `-r`, no `-t`, no trim — so a source time maps 1:1
 /// onto the proxy and a preview seek lands on the same frame the export (which
@@ -2514,34 +2499,23 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         cpu::limit_args(&mut args, threads);
         run_ffmpeg_streamed(&bin, &args, duration, EXPORT_STALL, &mut *progress, cancel)
     };
-    // GPU encode (and decode) when available — a background proxy transcode
-    // then costs the CPU almost nothing. A failure falls back to the software
-    // pipeline once, and a hardware-*encoder* failure whose software retry
-    // succeeds disables hardware encodes for the rest of the process.
-    // A padded proxy is encoded from a graph whose output has no frame rate (its
-    // `interleave` hands the encoder microsecond timestamps), which a hardware
-    // encoder may refuse — and one refusal turns hardware encoding off for the
-    // whole process. These sources are rare and the encode is the same all-intra
-    // x264 pass, so they never ask.
-    let hw_enc = if head_pad.is_some() { None } else { proxy_hw_encoder() };
+    // The decode is the GPU's when there is one; the encode never is. A hardware H.264 intra
+    // pass costs the same wall time as x264's (1.85 s against 1.90 s for 8 s of 4K), saves
+    // about 0.4 CPU-s, writes proxies a third larger, and one refusal used to turn hardware
+    // encoding off for the whole process. A decode failure falls back to software once.
     let hw_dec = decode_hwaccel_for(src, Reading::Whole);
-    let mut output = run(hw_enc.unwrap_or("libx264"), hw_dec.as_deref())?;
+    let mut output = run("libx264", hw_dec.as_deref())?;
     if output.outcome == StreamOutcome::Cancelled {
         let _ = std::fs::remove_file(&tmp);
         return Err(Error::Cancelled);
     }
-    if retry_proxy_in_software(output.outcome, output.status.success(), hw_enc.is_some(), hw_dec.is_some()) {
+    if retry_proxy_in_software(output.outcome, output.status.success(), hw_dec.is_some()) {
         let _ = std::fs::remove_file(&tmp);
         let err = if output.outcome == StreamOutcome::Stalled {
-            // A hardware encoder or decoder that hangs is as broken as one that refuses, and
-            // costs five minutes a proxy to find out: turn it off for the process, like any
-            // other hardware failure, and go again in software.
-            if hw_enc.is_some() {
-                HW_ENCODE_OK.store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-            if hw_dec.is_some() {
-                disable_decode_hwaccel();
-            }
+            // A hardware decoder that hangs is as broken as one that refuses, and costs five
+            // minutes a proxy to find out: turn it off for the process, like any other
+            // hardware failure, and go again in software.
+            disable_decode_hwaccel();
             format!("ffmpeg stopped reporting progress for {}s", EXPORT_STALL.as_secs())
         } else {
             output.stderr.trim().to_string()
@@ -2552,15 +2526,15 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
             return Err(Error::Cancelled);
         }
         if output.status.success() {
-            let blame =
-                blame_after_software_success(hw_enc.is_some(), hw_dec.is_some(), looks_like_hardware_decode_failure(&err));
-            if blame.encode {
-                HW_ENCODE_OK.store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-            if blame.decode {
+            // The decoder is the culprit only if the failure reads as a hardware one: a named
+            // accelerator such as `d3d11va` exits non-zero on a machine with no device, where
+            // `auto` fell back quietly, so without this every proxy would pay a failed launch
+            // first; a full disk or a bad file must not turn it off for the process. (A
+            // *stall* is convicted before the rerun, as it always was.)
+            if looks_like_hardware_decode_failure(&err) {
                 convict_hardware_decode();
             }
-            tracing::warn!(error = %err, "hardware-accelerated proxy encode failed; using software");
+            tracing::warn!(error = %err, "hardware-accelerated proxy decode failed; using software");
         }
     }
     if output.outcome == StreamOutcome::Stalled {
@@ -2586,34 +2560,11 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
     })
 }
 
-/// Which hardware a software rerun that succeeded convicts (pure, unit-tested). The rerun
-/// changes the encoder *and* the decoder, so with both in use there is no telling which one
-/// failed: the encoder is blamed, as it always was, and the next proxy — no longer offered one —
-/// finds out about the decoder. With only a decoder in use it is the culprit **if the failure
-/// reads as a hardware one** (`decoder_message`: the first run's error text through
-/// `looks_like_hardware_decode_failure`) — a named accelerator such as `d3d11va` exits non-zero
-/// on a machine with no device, where `auto` fell back quietly, so without this every proxy would
-/// pay a failed launch first; a failure that is not the decoder's (a full disk, a bad file) must
-/// not turn it off for the process. (A *stall* is convicted before the rerun, as it always was.)
-fn blame_after_software_success(hw_encode: bool, hw_decode: bool, decoder_message: bool) -> Blame {
-    Blame {
-        encode: hw_encode,
-        decode: hw_decode && !hw_encode && decoder_message,
-    }
-}
-
-/// What to stop asking for: see [`blame_after_software_success`].
-#[derive(Debug, PartialEq, Eq)]
-struct Blame {
-    encode: bool,
-    decode: bool,
-}
-
-/// Whether a proxy encode that went through hardware is run again in software (pure,
+/// Whether a proxy encode that used hardware decode is run again in software (pure,
 /// unit-tested): when it failed on its own **or stalled** — a cancelled one is not a failure,
 /// and an encode that was software already has nothing to fall back to.
-fn retry_proxy_in_software(outcome: StreamOutcome, success: bool, hw_encode: bool, hw_decode: bool) -> bool {
-    !success && matches!(outcome, StreamOutcome::Ended | StreamOutcome::Stalled) && (hw_encode || hw_decode)
+fn retry_proxy_in_software(outcome: StreamOutcome, success: bool, hw_decode: bool) -> bool {
+    !success && matches!(outcome, StreamOutcome::Ended | StreamOutcome::Stalled) && hw_decode
 }
 
 /// How a streamed ffmpeg run ended.
@@ -8210,21 +8161,6 @@ mod tests {
     }
 
     #[test]
-    fn a_software_rerun_that_works_convicts_the_hardware_that_was_in_use() {
-        let blame = |encode, decode| Blame { encode, decode };
-        // A decoder alone is the culprit when the failure reads as the hardware's ...
-        assert_eq!(blame_after_software_success(false, true, true), blame(false, true));
-        // ... and not when it does not (a full disk that the rerun happened to dodge).
-        assert_eq!(blame_after_software_success(false, true, false), blame(false, false));
-        // An encoder alone, as ever.
-        assert_eq!(blame_after_software_success(true, false, false), blame(true, false));
-        // Both: the encoder is blamed and the next proxy, offered no encoder, finds out about the
-        // decoder.
-        assert_eq!(blame_after_software_success(true, true, true), blame(true, false));
-        assert_eq!(blame_after_software_success(false, false, true), blame(false, false));
-    }
-
-    #[test]
     fn an_export_that_fails_in_hardware_decode_is_rerun_in_software_and_blames_it() {
         let opts = ExportOptions {
             hwaccel: Some("d3d11va".to_string()),
@@ -8808,20 +8744,19 @@ mod tests {
     }
 
     #[test]
-    fn a_hardware_proxy_that_stalls_is_retried_in_software_like_one_that_fails() {
+    fn a_hardware_decoded_proxy_that_stalls_is_retried_in_software_like_one_that_fails() {
         use StreamOutcome::*;
-        // Failed on its own or stalled, through hardware: go again in software.
-        assert!(retry_proxy_in_software(Ended, false, true, false));
-        assert!(retry_proxy_in_software(Ended, false, false, true));
+        // Failed on its own or stalled, through hardware decode: go again in software.
+        assert!(retry_proxy_in_software(Ended, false, true));
         assert!(
-            retry_proxy_in_software(Stalled, false, true, true),
-            "a hung hardware encoder is as broken as a refusing one"
+            retry_proxy_in_software(Stalled, false, true),
+            "a hung hardware decoder is as broken as a refusing one"
         );
         // Not when it worked, when the user cancelled, or when it was software already.
-        assert!(!retry_proxy_in_software(Ended, true, true, true));
-        assert!(!retry_proxy_in_software(Cancelled, false, true, true));
-        assert!(!retry_proxy_in_software(Stalled, false, false, false));
-        assert!(!retry_proxy_in_software(Ended, false, false, false));
+        assert!(!retry_proxy_in_software(Ended, true, true));
+        assert!(!retry_proxy_in_software(Cancelled, false, true));
+        assert!(!retry_proxy_in_software(Stalled, false, false));
+        assert!(!retry_proxy_in_software(Ended, false, false));
     }
 
     /// A child that says nothing is killed after the stall allowance, and a cancel kills one
