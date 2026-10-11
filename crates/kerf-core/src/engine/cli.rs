@@ -29,7 +29,7 @@ use crate::model::{
     Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, Projection, Property, Reframe, ReframeKeyframe,
     ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, VideoEffect,
 };
-use crate::render_plan::{active_video_clips, still_size, CompositeColorPolicy};
+use crate::render_plan::{still_size, CompositeColorPolicy};
 
 /// A small process-global LRU of decoded single frames. Decoded frames are a
 /// pure function of (source path, time, filter, codec, quality), so caching is
@@ -6994,12 +6994,13 @@ pub fn export_seek_arg(seconds: f64) -> String {
 /// Every video clip whose timeline span contains `t` is decoded at its
 /// corresponding source time (`-ss` input seek), put through the same geometry /
 /// color chain the export uses ([`still_clip_chain`] mirrors [`video_clip_chain`]
-/// minus the time-domain `trim`/`setpts`/`fps`/fade steps), then `overlay`d onto
-/// a black canvas in **track-then-timeline order** — so later tracks composite on
+/// minus the time-domain `trim`/`setpts`/`fps` steps and the fades not changing
+/// the picture at `t`), then `overlay`d onto a black canvas in **track-then-timeline order** — so later tracks composite on
 /// top and gaps fall through to black, matching export framing. The output canvas
-/// keeps the export aspect ratio capped to `max_width`. Static blends
-/// (mid-crossfade dissolve, dip-to-black) are intentionally *not* reproduced; the
-/// still shows the frame each visible clip contributes at `t`.
+/// keeps the export aspect ratio capped to `max_width`. A frame inside a fade, a
+/// dip, a dissolve, a slide or a push is drawn as the export draws it
+/// ([`still_fx`]): the outgoing clip on its tail, the export's own `fade` filters
+/// at the output frame `t` falls in, the travel at that frame's time.
 fn build_still_args(
     timeline: &Timeline,
     assets: &[Asset],
@@ -7028,12 +7029,13 @@ fn build_still_args(
 
     // Active video clips at `t`, in composite order (tracks in list order, clips
     // within a track in timeline order), paired with their source time. The GPU
-    // compositor's `RenderPlan` is built from the same list.
-    let active = active_video_clips(timeline, assets, t);
+    // compositor's `RenderPlan` is built from the same list, less the clips a
+    // transition keeps on screen past their end (which it refuses).
+    let active = still_layers(timeline, assets, fmt.fps, t);
 
     let mut args: Vec<String> = vec!["-hide_banner".to_string(), "-loglevel".to_string(), "error".to_string()];
-    for ac in &active {
-        let (clip, src) = (ac.clip, ac.source_time);
+    for layer in &active {
+        let (clip, src) = (layer.active.clip, layer.active.source_time);
         let asset = asset_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
         // A still has a single frame at t=0 (`trim=end_frame=1` in the chain picks
         // it up); seeking into it decodes nothing, so skip the `-ss` (and any
@@ -7067,8 +7069,8 @@ fn build_still_args(
     };
     let mut chains: Vec<String> = vec![format!("color=c=black:s={ow}x{oh}:d=0.1[base]")];
     let mut cur = "base".to_string();
-    for (n, ac) in active.iter().enumerate() {
-        let clip = ac.clip;
+    for (n, layer) in active.iter().enumerate() {
+        let (ac, clip) = (&layer.active, layer.active.clip);
         let tf = ac.transform();
         let rf = clip.reframe_at(ac.local_time);
         let hdr = asset_of(clip.asset_id).and_then(|a| a.hdr());
@@ -7082,11 +7084,15 @@ fn build_still_args(
                 rf.as_ref(),
                 &canvas,
                 clip.mask.as_ref(),
-                clip.zoom_animated()
+                clip.zoom_animated(),
+                &layer.fades
             )
         ));
         let out = format!("ov{n}");
-        chains.push(format!("[{cur}][v{n}]{overlay}[{out}]", overlay = still_overlay(&tf)));
+        chains.push(format!(
+            "[{cur}][v{n}]{overlay}[{out}]",
+            overlay = still_overlay(&tf, layer.motion)
+        ));
         cur = out;
     }
     for (oi, ov) in live.iter().enumerate() {
@@ -7137,6 +7143,12 @@ struct StillCanvas {
 /// act on the picture at its fit size and are magnified with it. The still follows, or
 /// the frame you scrub to would be sharper than the file at a zoom-in and softer at a
 /// zoom-out. Every other clip zooms first, as it always did.
+///
+/// `fades` are the clip's fades still changing the picture at the still's frame
+/// ([`still_fx`]): where the export's chain applies its `fade` steps, after the rotation and
+/// ahead of a moving zoom, the same filters run on the frame. None at all for a still
+/// outside any fade, and then the chain is what it was.
+#[allow(clippy::too_many_arguments)]
 fn still_clip_chain(
     tf: &Transform,
     color: &Color,
@@ -7145,11 +7157,12 @@ fn still_clip_chain(
     canvas: &StillCanvas,
     mask: Option<&Mask>,
     zoom_last: bool,
+    fades: &StillFades,
 ) -> String {
     let StillCanvas { w: ow, h: oh, fit, sf } = canvas;
     let (ow, oh, fit) = (*ow, *oh, *fit);
     let chroma = effects.iter().any(|e| e.produces_alpha());
-    let needs_alpha = (!tf.is_identity() && tf.needs_alpha()) || chroma || mask.is_some();
+    let needs_alpha = (!tf.is_identity() && tf.needs_alpha()) || chroma || mask.is_some() || fades.needs_alpha();
     let mut p: Vec<String> = vec!["trim=end_frame=1".to_string(), "setpts=PTS-STARTPTS".to_string()];
     let crop = tf.has_crop().then(|| {
         let cw = (1.0 - tf.crop_left - tf.crop_right).max(0.0);
@@ -7219,16 +7232,29 @@ fn still_clip_chain(
         let rad = tf.rotation.to_radians();
         p.push(format!("rotate={rad}:fillcolor=none:ow=rotw({rad}):oh=roth({rad})"));
     }
+    p.extend(fades.filters());
+    if !fades.is_empty() && !needs_alpha && late_zoom.is_none() {
+        p.push(format!("format={}", fades.terminal_format()));
+    }
     p.extend(late_zoom);
     p.join(",")
 }
 
 /// The `overlay` placement for a clip in a [`timeline_frame`] composite: a full
 /// frame for an identity transform, else centered with the clip's fractional
-/// `pos_x`/`pos_y` offset (matching the export overlay positions).
-fn still_overlay(t: &Transform) -> String {
-    if t.is_identity() {
+/// `pos_x`/`pos_y` offset (matching the export overlay positions). `motion` is the
+/// travel a slide or push gives the clip at this frame, added to that offset as the
+/// export adds it; a clip that is not moving passes `(0, 0)` and is placed as ever.
+fn still_overlay(t: &Transform, motion: (f64, f64)) -> String {
+    let moving = motion != (0.0, 0.0);
+    if t.is_identity() && !moving {
         "overlay=(W-w)/2:(H-h)/2".to_string()
+    } else if moving {
+        format!(
+            "overlay=x=(W-w)/2+({px})*W:y=(H-h)/2+({py})*H",
+            px = fnum(t.pos_x + motion.0),
+            py = fnum(t.pos_y + motion.1)
+        )
     } else {
         format!("overlay=x=(W-w)/2+({px})*W:y=(H-h)/2+({py})*H", px = t.pos_x, py = t.pos_y)
     }
@@ -7383,6 +7409,14 @@ mod golden;
 /// What the export graph draws, pinned against rendered pixels (`#[ignore]`d).
 #[cfg(test)]
 mod rendered;
+
+/// The still inside a fade, a dip, a dissolve, a slide or a push: its layers and their fades.
+mod still_fx;
+use still_fx::{still_layers, StillFades};
+
+/// The scrubbed still held to the export's frame at the same moment (`#[ignore]`d).
+#[cfg(test)]
+mod still_rendered;
 
 /// The sound of detached / linked clips: that `extract_audio` used to double, that a
 /// detached clip's *own* chain is the chain it had, and that its **level** survives
@@ -9767,8 +9801,26 @@ mod tests {
         let effects = [VideoEffect::Blur { sigma: 3.0 }];
         let mask = Mask::default();
         let canvas = still_canvas(Fit::Contain);
-        let last = still_clip_chain(&tf, &color, &effects, None, &canvas, Some(&mask), true);
-        let first = still_clip_chain(&tf, &color, &effects, None, &canvas, Some(&mask), false);
+        let last = still_clip_chain(
+            &tf,
+            &color,
+            &effects,
+            None,
+            &canvas,
+            Some(&mask),
+            true,
+            &StillFades::default(),
+        );
+        let first = still_clip_chain(
+            &tf,
+            &color,
+            &effects,
+            None,
+            &canvas,
+            Some(&mask),
+            false,
+            &StillFades::default(),
+        );
         let zoom = "scale=iw*1.4:ih*1.4";
         // Last: after the rotation, with nothing behind it, and only once.
         assert!(last.ends_with(zoom), "{last}");
@@ -9784,8 +9836,8 @@ mod tests {
         // A moving zoom that has no zoom at the sampled instant has none to move.
         let at_rest = Transform { scale: 1.0, ..tf };
         assert_eq!(
-            still_clip_chain(&at_rest, &color, &effects, None, &canvas, None, true),
-            still_clip_chain(&at_rest, &color, &effects, None, &canvas, None, false)
+            still_clip_chain(&at_rest, &color, &effects, None, &canvas, None, true, &StillFades::default()),
+            still_clip_chain(&at_rest, &color, &effects, None, &canvas, None, false, &StillFades::default())
         );
     }
 
@@ -9857,7 +9909,16 @@ mod tests {
             scale: 0.0004,
             ..Transform::default()
         };
-        let c = still_clip_chain(&tf, &Color::default(), &[], None, &canvas, None, false);
+        let c = still_clip_chain(
+            &tf,
+            &Color::default(),
+            &[],
+            None,
+            &canvas,
+            None,
+            false,
+            &StillFades::default(),
+        );
         assert!(c.contains("scale=w='max(1,iw*0.0004)':h='max(1,ih*0.0004)'"), "{c}");
         let c = still_clip_chain(
             &Transform { scale: 0.5, ..tf },
@@ -9867,6 +9928,7 @@ mod tests {
             &canvas,
             None,
             false,
+            &StillFades::default(),
         );
         assert!(c.contains("scale=iw*0.5:ih*0.5"), "{c}");
     }
@@ -9921,6 +9983,7 @@ mod tests {
             &still_canvas(Fit::Contain),
             None,
             false,
+            &StillFades::default(),
         );
         assert!(!still.contains("force_divisible_by") && !still.contains("trunc("), "{still}");
     }
@@ -10215,6 +10278,197 @@ mod tests {
             "still draws overlays: {joined}"
         );
         assert!(joined.contains("null[outv]"), "still terminates on [outv]: {joined}");
+    }
+
+    /// Two adjacent 10 s clips of one 100 s, 30 fps asset (source 0..10 and 20..30), the second
+    /// entering through `kind` over `secs`: the cut the transition stills are built from.
+    fn transition_cut(kind: TransitionKind, secs: f64) -> (Timeline, Vec<Asset>) {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let a = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let mut b = make_clip(asset.id, 20.0, 30.0, 10.0);
+        b.transition_in = Some(crate::model::Transition { kind, duration: secs });
+        (single(vec![a, b]), vec![asset])
+    }
+
+    fn still_args_at(timeline: &Timeline, assets: &[Asset], t: f64) -> Vec<String> {
+        build_timeline_frame_args(timeline, assets, &ExportOptions::default(), t, 640, 4).unwrap()
+    }
+
+    /// The `-ss` of every input of a still's argv.
+    fn seeks(args: &[String]) -> Vec<&str> {
+        args.windows(2).filter(|w| w[0] == "-ss").map(|w| w[1].as_str()).collect()
+    }
+
+    /// The still of a frame inside a dissolve is the export's: the outgoing clip on its tail,
+    /// from the source it borrows, under the incoming clip's alpha ramp, run through the
+    /// export's own `fade` filter at the output frame the time falls in.
+    #[test]
+    fn a_still_inside_a_dissolve_draws_the_tail_and_the_ramp() {
+        let (tl, assets) = transition_cut(TransitionKind::Crossfade, 1.0);
+        let args = still_args_at(&tl, &assets, 10.5);
+        assert_eq!(
+            seeks(&args),
+            ["10.500000", "20.500000"],
+            "the outgoing clip plays on past its end"
+        );
+        let graph = args.join(" ");
+        assert!(
+            graph.contains("format=yuva420p,settb=expr=1/30,setpts=315,fade=t=in:st=10:d=1:alpha=1,setpts=PTS-STARTPTS[v1]"),
+            "the ramp is the export's fade, at frame 315: {graph}"
+        );
+        assert!(
+            !graph.contains("[0:v]") || !graph.split("[v0]").next().unwrap().contains("fade"),
+            "{graph}"
+        );
+        // Before the dissolve and once it is over there is one clip and no fade.
+        for t in [5.0, 9.99, 11.2, 19.9] {
+            let plain = still_args_at(&tl, &assets, t).join(" ");
+            assert!(!plain.contains("fade") && !plain.contains("settb"), "t = {t}: {plain}");
+            assert_eq!(seeks(&still_args_at(&tl, &assets, t)).len(), 1, "t = {t}");
+        }
+    }
+
+    /// A dip fades the picture itself, to black or through white, either side of the cut; the
+    /// chain then ends in the format the export's does, which is what the fade runs on.
+    #[test]
+    fn a_still_inside_a_dip_fades_the_picture_in_the_exports_pixel_format() {
+        let (tl, assets) = transition_cut(TransitionKind::DipToBlack, 2.0);
+        let before = still_args_at(&tl, &assets, 9.5).join(" ");
+        assert!(
+            before.contains("settb=expr=1/30,setpts=285,fade=t=out:st=9:d=1,setpts=PTS-STARTPTS,format=yuv420p[v0]"),
+            "{before}"
+        );
+        let after = still_args_at(&tl, &assets, 10.5).join(" ");
+        assert!(
+            after.contains("setpts=315,fade=t=in:st=10:d=1,setpts=PTS-STARTPTS,format=yuv420p[v0]"),
+            "{after}"
+        );
+        assert!(
+            !after.contains("alpha=1") && !after.contains("yuva420p"),
+            "a dip needs no alpha plane: {after}"
+        );
+        let (white, assets) = transition_cut(TransitionKind::DipToWhite, 2.0);
+        assert!(still_args_at(&white, &assets, 10.5)
+            .join(" ")
+            .contains("fade=t=in:st=10:d=1:c=white"));
+        // A picture that has an alpha channel of its own keeps it through the fade.
+        let (tl, mut assets) = transition_cut(TransitionKind::DipToBlack, 2.0);
+        assets[0].streams[0].pix_fmt = Some("yuva420p".into());
+        assert!(still_args_at(&tl, &assets, 9.5)
+            .join(" ")
+            .contains("fade=t=out:st=9:d=1,setpts=PTS-STARTPTS,format=yuva420p[v0]"));
+    }
+
+    /// A clip that entered through a dissolve has its whole chain on an alpha plane in the export,
+    /// so a fade of its own after the ramp is over runs on `yuva420p` (where black is 0), and the
+    /// still's chain ends in no `yuv420p` that would run it on another format.
+    #[test]
+    fn a_fade_after_a_dissolve_runs_on_yuva420p_like_the_exports() {
+        let (mut tl, assets) = transition_cut(TransitionKind::Crossfade, 1.0);
+        tl.tracks[0].clips[1].fade_out = 1.0;
+        let graph = still_args_at(&tl, &assets, 19.5).join(" ");
+        assert!(
+            graph.contains("setsar=1,format=yuva420p,settb=expr=1/30,setpts=585,fade=t=out:st=19:d=1,setpts=PTS-STARTPTS[v0]"),
+            "{graph}"
+        );
+        assert!(!graph.contains("format=yuv420p"), "{graph}");
+        // Outside the fade it is the plain chain.
+        let plain = still_args_at(&tl, &assets, 15.0).join(" ");
+        assert!(!plain.contains("yuva420p") && !plain.contains("fade"), "{plain}");
+    }
+
+    /// A clip's own fade-in is drawn until it is done, and then the still is what it always was.
+    #[test]
+    fn a_still_inside_a_clips_own_fade_runs_the_fade_until_it_is_over() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+        clip.fade_in = 1.0;
+        clip.fade_out = 1.0;
+        let tl = single(vec![clip]);
+        let assets = [asset];
+        assert!(still_args_at(&tl, &assets, 0.0)
+            .join(" ")
+            .contains("setpts=0,fade=t=in:st=0:d=1,"));
+        assert!(still_args_at(&tl, &assets, 0.5)
+            .join(" ")
+            .contains("setpts=15,fade=t=in:st=0:d=1,"));
+        assert!(still_args_at(&tl, &assets, 9.5)
+            .join(" ")
+            .contains("setpts=285,fade=t=out:st=9:d=1,"));
+        for t in [1.0, 5.0, 8.99] {
+            assert!(!still_args_at(&tl, &assets, t).join(" ").contains("fade"), "t = {t}");
+        }
+    }
+
+    /// A slide adds its travel at this frame to the overlay position, a push moves both clips,
+    /// and a clip that is not travelling is placed as ever.
+    #[test]
+    fn a_still_inside_a_slide_or_a_push_places_the_clips_by_their_travel() {
+        let (tl, assets) = transition_cut(TransitionKind::SlideLeft, 2.0);
+        let graph = still_args_at(&tl, &assets, 11.0).join(" ");
+        assert!(
+            graph.contains("[ov0][v1]overlay=x=(W-w)/2+(0.5)*W:y=(H-h)/2+(0)*H[ov1]"),
+            "{graph}"
+        );
+        assert!(
+            graph.contains("[base][v0]overlay=(W-w)/2:(H-h)/2[ov0]"),
+            "a slide covers the outgoing clip where it sits: {graph}"
+        );
+        assert!(!graph.contains("fade"), "{graph}");
+        let (push, assets) = transition_cut(TransitionKind::PushUp, 2.0);
+        let graph = still_args_at(&push, &assets, 11.0).join(" ");
+        assert!(
+            graph.contains("[base][v0]overlay=x=(W-w)/2+(0)*W:y=(H-h)/2+(-0.5)*H[ov0]"),
+            "{graph}"
+        );
+        assert!(
+            graph.contains("[ov0][v1]overlay=x=(W-w)/2+(0)*W:y=(H-h)/2+(0.5)*H[ov1]"),
+            "{graph}"
+        );
+    }
+
+    /// Nothing about a still changes outside a transition: the same cut without its transition
+    /// gives the same argv at every time a transition does not reach.
+    #[test]
+    fn a_still_outside_every_transition_is_what_it_was() {
+        for kind in [
+            TransitionKind::Crossfade,
+            TransitionKind::DipToBlack,
+            TransitionKind::SlideLeft,
+            TransitionKind::PushDown,
+        ] {
+            let (tl, assets) = transition_cut(kind, 2.0);
+            let mut bare = tl.clone();
+            bare.tracks[0].clips[1].transition_in = None;
+            for t in [0.0, 4.0, 7.9, 12.1, 19.9] {
+                assert_eq!(
+                    still_args_at(&tl, &assets, t),
+                    still_args_at(&bare, &assets, t),
+                    "{kind:?} at {t}"
+                );
+            }
+        }
+    }
+
+    /// A moving zoom is the last stage of the export's chain, after the fades; the still follows.
+    #[test]
+    fn a_fade_runs_ahead_of_a_moving_zoom() {
+        let (mut tl, assets) = transition_cut(TransitionKind::Crossfade, 1.0);
+        let key = |time, scale| crate::model::Keyframe {
+            time,
+            scale,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+            easing: Default::default(),
+        };
+        tl.tracks[0].clips[1].keyframes = vec![key(0.0, 0.5), key(2.0, 1.0)];
+        let graph = still_args_at(&tl, &assets, 10.5).join(" ");
+        let chain = graph.split("[v1]").next().unwrap().rsplit(';').next().unwrap().to_string();
+        let (fade, zoom) = (chain.find("fade=").unwrap(), chain.rfind("scale=iw*").unwrap());
+        assert!(fade < zoom, "{chain}");
+        assert!(!chain.contains("format=yuv420p"), "{chain}");
     }
 
     #[test]
@@ -12744,6 +12998,7 @@ mod tests {
             &canvas(Fit::Contain),
             None,
             false,
+            &StillFades::default(),
         );
         assert!(contained.contains("force_original_aspect_ratio=decrease"));
         assert!(contained.contains("pad=1080:1920"), "contain letterboxes: {contained}");
@@ -12756,6 +13011,7 @@ mod tests {
             &canvas(Fit::Cover),
             None,
             false,
+            &StillFades::default(),
         );
         assert!(covered.contains("force_original_aspect_ratio=increase"));
         assert!(covered.contains("crop=1080:1920"), "cover crops: {covered}");

@@ -361,6 +361,41 @@ so the feature is **only** activated through these forwards — which is what ma
   dissolve) starts at `timeline_start + …` — timed from 0 they blacked out any
   later clip with a fade-out and dropped its fade-in and transitions. Audio is
   re-based to the clip before `adelay`, so its `afade`s stay clip-local.
+  **The scrubbed still draws fades, dips, dissolves, slides and pushes as the file does**
+  (`engine/cli/still_fx.rs`; it used to show each clip's own span unfaded — the incoming clip alone
+  inside a dissolve, 176 levels off the export's frame — and the agent's `timeline_frame`, the cover
+  and the preview fallback all went through that). `still_layers` takes the clips from
+  `active_video_clips_with_tails` (an outgoing clip stays a layer for its `ClipFx::tail`, read from
+  the source it borrows) and, per layer, the `ClipTiming::fades` still changing the picture at output
+  frame `k = Rational::frame_containing(t)` and the slide / push travel at `ffmpeg_frame_time(k)`
+  (added to the overlay position; `overlay` truncates it to pixels as it does in the file). A fade
+  is the export's own `fade` filter, run where the export runs it (after the rotation, ahead of a
+  moving zoom) on the frame restamped as frame `k` of a `1/fps` stream
+  (`settb=expr=den/num,setpts=k,fade=…,setpts=PTS-STARTPTS`: a `fade` counts frames of its input
+  time base, and `overlay` shows a secondary frame only from its timestamp on). A chain with no alpha
+  plane ends `format=yuv420p` after the fades (`yuva420p` for an alpha source), as the export's does:
+  left to negotiation `fade` runs on the `yuva420p` the overlay asks for, where black is 0 and not
+  the limited-range 16, up to 17 levels off on the way to black. A clip that entered through a
+  dissolve is on an alpha plane for good in the export (`xfade_in > 0`), so a later fade of its own
+  or a dip out runs on `yuva420p` too: the alpha decision is made from the clip's whole `fades()`
+  list whenever a fade is in progress (`StillFades::alpha_chain`), not from the ramp alone. A tail
+  is open for the frames whose slot starts inside its window (`active_video_clips_with_tails`'s
+  `tail_at`: the exact slot start plus a nanosecond), not for the still's raw `t`: a window of
+  18.3 frames closes inside one, and that frame still draws the tail (on the grid the frame that
+  starts at the window's end has none). A fade that is not changing the
+  picture is left out, so every still outside a transition keeps its argv (golden: 1581 of 5600
+  still cases moved, exactly the new `still-fade` / `still-tail` / `still-travel` families; export
+  and preview 0). **Everything that renders a still now returns the export's frame inside a
+  transition**: `timeline_frame` / `preview_timeline`, the preview fallback and `export_cover`, so a
+  cover at `t = 0` of a clip with a fade-in is black (or mid-fade at a later `t`), as the video's
+  frame is. Measured (`still_rendered.rs`, `#[ignore]`d, 6.1 and 9.0, 24 to 60 fps): every
+  pixel of every frame of a dissolve (also from black, from a still image, with a reversed or 2x
+  outgoing clip, a transformed, graded, translucent or zooming incoming one, over another track,
+  with the clips' own fades, one that fades or dips out after its dissolve, and a 0.61 s transition
+  at 30 fps asked for at the start, middle and end of every frame), a dip to black, a fade-in / out
+  and the eight slides and pushes is equal to the export's; a dip to white is up to 2 levels off outside its fade, where the file's
+  `fade c=white` at full strength still rounds. The still's frame *pick* is unchanged (`-ss`, not
+  the `fps` filter's), so moving footage can differ from the file by a source frame as ever.
   **What a clip does in time is `clip_timing.rs`** (pure, `pub(crate)`, no dependency
   on the engine): `ClipFx` (what its transitions gave it: tail, dissolve, dips, travel,
   HDR, head pad), `transition_fx` (indexed by flat clip *storage* index over the

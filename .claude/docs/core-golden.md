@@ -70,6 +70,14 @@
   export, 750 still and 1550 preview cases differ. `zoom-keyed-last`, `alpha-kept` and
   `still-zoom-last` are structural families (read off how the chains *end*: the text of a moving
   zoom and of an alpha source's terminal format is the same `format=yuva420p`).
+- **The still inside a transition** (fades, tails and travel drawn as the export draws them,
+  `engine/cli/still_fx.rs`) re-blessed `still.txt` alone: 1577 of 5600 still cases moved, exactly the
+  cases hitting the new `still-fade` (`settb=expr=`; plus `still-fade-alpha`, `still-fade-white`,
+  `still-fade-pixel-format`), `still-tail` and `still-travel` (structural: a clip kept past its end,
+  a clip a slide or push moves) families; export and preview digests are identical per case. The
+  review round moved 11 of them again: 3 clips that fade after a dissolve (the chain stays on an
+  alpha plane) and 8 whose tail window closes inside the still's frame (1581 against the base);
+  all in the same families.
 - **Sample-exact `adelay`** (a clip starting between milliseconds is delayed by samples)
   re-blessed `export.txt` alone: 2718 of 4800 cases moved, exactly the new
   `audio-delay-samples` family (`S:all=1`); still and preview carry no sound.
