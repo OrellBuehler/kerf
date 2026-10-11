@@ -728,6 +728,7 @@
 
 <div
 	bind:this={rootEl}
+	data-editor-surface
 	{@attach onWindow({
 		// Abandoning a drag is all Escape does then — not also "clear the selection". These
 		// listen to the window the panel is in, which is a detached window's when it is in one.

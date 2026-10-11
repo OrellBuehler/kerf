@@ -17,9 +17,10 @@
 //! that frame goes through FFmpeg instead of being drawn wrong.
 //!
 //! **Two modes.** [`PlanMode::Still`] is the contract the GPU path started with:
-//! what `build_still_args` draws at a time `t` (the transform sampled once, fades and
-//! transitions left out, text drawn statically). [`PlanMode::Motion`] is the export
-//! graph at output frame `k`: see [`Planner`].
+//! what `build_still_args` draws at a time `t` (the transform sampled once, text drawn
+//! statically) while no fade, tail or travel is open — inside one the FFmpeg still draws
+//! the export's frame and the plan, which holds none of it, is refused. [`PlanMode::Motion`]
+//! is the export graph at output frame `k`: see [`Planner`].
 
 use uuid::Uuid;
 
@@ -41,6 +42,8 @@ use crate::ExportOptions;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ActiveClip<'a> {
     pub clip: &'a Clip,
+    /// The clip's index in storage order across all tracks: what `transition_fx` is indexed by.
+    pub flat: usize,
     /// The source time to decode, honoring speed / reverse and clamped to the
     /// asset's duration (a seek past the end would decode nothing).
     pub source_time: f64,
@@ -84,9 +87,28 @@ pub(crate) fn clip_source_time(clip: &Clip, asset_duration: f64, t: f64) -> f64 
 /// This is the computation `build_still_args` always made inline; it lives here
 /// so the GPU plan shares it instead of copying it.
 pub(crate) fn active_video_clips<'a>(timeline: &'a Timeline, assets: &[Asset], t: f64) -> Vec<ActiveClip<'a>> {
+    active_video_clips_with_tails(timeline, assets, t, &[], t)
+}
+
+/// [`active_video_clips`] with a clip kept on screen for `tails[flat]` seconds past its end
+/// (an outgoing clip playing on under a transition: `ClipFx::tail`), its tail window judged at
+/// `tail_at` instead of `t`. The export decides a frame's tail from the frame's own time, which
+/// is the start of its slot and so can be before the `t` a still is asked for: a window that
+/// closes inside a frame is still open for that frame. A `flat` past the end of `tails` has no
+/// tail, so an empty slice is `active_video_clips` itself.
+pub(crate) fn active_video_clips_with_tails<'a>(
+    timeline: &'a Timeline,
+    assets: &[Asset],
+    t: f64,
+    tails: &[f64],
+    tail_at: f64,
+) -> Vec<ActiveClip<'a>> {
     let asset_of = |id| assets.iter().find(|a: &&Asset| a.id == id);
     let mut active = Vec::new();
+    let mut base = 0;
     for track in &timeline.tracks {
+        let first = base;
+        base += track.clips.len();
         if track.kind != StreamKind::Video {
             continue;
         }
@@ -94,12 +116,16 @@ pub(crate) fn active_video_clips<'a>(timeline: &'a Timeline, assets: &[Asset], t
         order.sort_by(|&a, &b| track.clips[a].timeline_start.total_cmp(&track.clips[b].timeline_start));
         for &ci in &order {
             let clip = &track.clips[ci];
-            if t < clip.timeline_start || t >= clip.timeline_end() {
+            let tail = tails.get(first + ci).copied().unwrap_or(0.0);
+            let on =
+                t >= clip.timeline_start && (t < clip.timeline_end() || (tail > 0.0 && tail_at < clip.timeline_end() + tail));
+            if !on {
                 continue;
             }
             let dur = asset_of(clip.asset_id).map(|a| a.duration).unwrap_or(clip.source_out);
             active.push(ActiveClip {
                 clip,
+                flat: first + ci,
                 source_time: clip_source_time(clip, dur, t),
                 local_time: (t - clip.timeline_start).max(0.0),
             });
@@ -184,8 +210,9 @@ pub const MAX_SHRINK: u32 = 40;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanMode {
     /// What `build_still_args` draws at a time `t`: the transform sampled at that
-    /// instant, no fades or transitions in the picture, text drawn statically. The
-    /// contract the GPU path started with, and what every `RenderPlan::at` returns.
+    /// instant, text drawn statically, and no fade, tail or travel (the FFmpeg still draws
+    /// those too, and a still plan inside one is refused). The contract the GPU path
+    /// started with, and what every `RenderPlan::at` returns.
     Still,
     /// What the export graph draws at output frame `k` (`Planner::at_frame`): the
     /// graph's own time for every expression it evaluates, outgoing clips playing on
@@ -750,11 +777,10 @@ impl RenderPlan {
             if (layer.reframe.is_some() || layer.projection.is_some()) && !caps.reframe {
                 out.push(Unsupported::Reframe(at()));
             }
-            // The still ignores fades and transitions (it shows the frame each visible clip
-            // contributes), the export and the streamed playback do not. A **still plan** has
-            // no tail layers and the FFmpeg still no fades, so it is never drawn inside one,
-            // whatever the caps say: those abilities are for [`PlanMode::Motion`] plans, and a
-            // frame inside a fade or a transition is FFmpeg's.
+            // The FFmpeg still draws a frame inside a fade or a transition as the export does
+            // (`engine::cli::still_fx`); a **still plan** has no tail layers and no fade, so it
+            // is never drawn inside one, whatever the caps say: those abilities are for
+            // [`PlanMode::Motion`] plans, and a frame inside a fade or a transition is FFmpeg's.
             let motion = self.mode == PlanMode::Motion;
             if let Some((edge, dissolve)) = layer.fx.in_progress(frame, fps).filter(|_| !(motion && caps.fades)) {
                 out.push(Unsupported::Fade(at(), edge, dissolve));
@@ -970,6 +996,37 @@ mod tests {
         // ...and the clip appears at its start but not at its end (half-open).
         assert_eq!(plan(&tl, std::slice::from_ref(&a), 2.0).layers.len(), 1);
         assert!(plan(&tl, std::slice::from_ref(&a), 6.0).layers.is_empty());
+    }
+
+    #[test]
+    fn a_clip_with_a_tail_stays_on_screen_past_its_end_and_flat_counts_every_track() {
+        let a = asset("a", 20.0, vec![video(640, 360)]);
+        let mut tl = timeline(vec![vec![Clip::new(a.id, 0.0, 4.0, 0.0), Clip::new(a.id, 8.0, 12.0, 4.0)]]);
+        // An audio track ahead of the picture shifts the picture clips' storage index.
+        let mut sound = Track::new(StreamKind::Audio, "A");
+        sound.clips = vec![Clip::new(a.id, 0.0, 9.0, 0.0)];
+        tl.tracks.insert(0, sound);
+        let assets = std::slice::from_ref(&a);
+        let tails = [0.0, 1.5, 0.0];
+        let at = |t: f64| {
+            active_video_clips_with_tails(&tl, assets, t, &tails, t)
+                .iter()
+                .map(|c| (c.flat, (c.source_time * 1000.0).round() as i64))
+                .collect::<Vec<_>>()
+        };
+        // The first picture clip is flat index 1; its tail keeps it under the next one, on the
+        // source past its out point, until the tail ends.
+        assert_eq!(at(3.0), vec![(1, 3000)]);
+        assert_eq!(at(4.5), vec![(1, 4500), (2, 8500)]);
+        assert_eq!(at(5.49), vec![(1, 5490), (2, 9490)]);
+        assert_eq!(at(5.5), vec![(2, 9500)]);
+        // Without tails (or with a table that stops short) it is `active_video_clips`.
+        let plain = active_video_clips(&tl, assets, 4.5);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(active_video_clips_with_tails(&tl, assets, 4.5, &[0.0], 4.5).len(), 1);
+        // The tail is judged at `tail_at`: a window that closes inside a frame is open for it.
+        let at = |t, tail_at| active_video_clips_with_tails(&tl, assets, t, &tails, tail_at).len();
+        assert_eq!((at(5.52, 5.5), at(5.52, 5.49)), (1, 2));
     }
 
     #[test]

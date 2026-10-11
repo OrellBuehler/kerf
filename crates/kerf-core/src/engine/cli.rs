@@ -21,15 +21,16 @@ use super::decode_policy::{
 use super::source_probe::{ProbeCache, SOURCE_PROBE_TIMEOUT};
 use super::ProbeResult;
 use crate::clip_timing::{
-    clip_seek, clip_source_window, is_cache_proxy, transition_fx, ClipFx, ClipTiming, FadeEdge, FadeStep, FadeTint,
-    HEAD_PADDED_SUFFIX,
+    clip_seek, clip_source_window, is_cache_proxy, is_head_padded_proxy, transition_fx, ClipFx, ClipTiming, FadeEdge, FadeStep,
+    FadeTint, HEAD_PADDED_SUFFIX,
 };
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, Projection, Property, Reframe, ReframeKeyframe,
-    ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, VideoEffect,
+    pix_fmt_layout, Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, PixLayout, Projection, Property, Reframe,
+    ReframeKeyframe, ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform,
+    VideoEffect,
 };
-use crate::render_plan::{active_video_clips, still_size, CompositeColorPolicy};
+use crate::render_plan::{still_size, CompositeColorPolicy};
 
 /// A small process-global LRU of decoded single frames. Decoded frames are a
 /// pure function of (source path, time, filter, codec, quality), so caching is
@@ -947,6 +948,173 @@ pub(super) fn run_piped_until(cmd: &mut Command, input: Vec<u8>, deadline: Insta
     status.success().then_some(out)
 }
 
+/// How long a whole-file read ([`scene_pass`], [`contact_sheet`]) may go without a word from
+/// ffmpeg before it is killed, at the least (the same floor the waveform decode and the
+/// filmstrip give theirs). `-progress` reports every [`PROGRESS_ON_STDERR`] second, but **only
+/// once a frame has reached the output**: a read that outputs nothing until its last frame is
+/// silent for the whole decode, so it gets either a frame to report on early (the scene pass
+/// selects frame 0) or a bound that grows with the work ([`stall_for_work`], the sheet's).
+const READ_STALL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most a read that is silent until it ends is given before it counts as wedged.
+const READ_STALL_CEILING: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+
+/// Silence a read of `work_secs` of footage that outputs only at its end is allowed (pure): `per_sec`
+/// per second of footage — a decode slower than `1 / per_sec` of real time is a wedge, not a slow
+/// machine — between `floor`, which covers start-up and the first seek, and `ceiling`, which keeps
+/// even a wedged hour-long read finite. Clamped in seconds first: `from_secs_f64` panics on
+/// infinity, and a container can report an absurd duration.
+fn stall_for_work(work_secs: f64, per_sec: f64, floor: std::time::Duration, ceiling: std::time::Duration) -> std::time::Duration {
+    let secs = if work_secs.is_finite() {
+        (work_secs * per_sec).clamp(0.0, ceiling.as_secs_f64())
+    } else {
+        0.0
+    };
+    std::time::Duration::from_secs_f64(secs).max(floor)
+}
+
+/// The stall bound of a contact sheet of a `window_secs` window: the whole window is decoded
+/// before `tile` outputs the one frame, so the read says nothing until it ends. Thirty seconds of
+/// silence per second of footage, at least [`READ_STALL`], at most [`READ_STALL_CEILING`].
+fn sheet_stall(window_secs: f64) -> std::time::Duration {
+    stall_for_work(window_secs, 30.0, READ_STALL, READ_STALL_CEILING)
+}
+
+/// The `-progress` flags a bounded read adds **at spawn time** (like the thread caps, never in
+/// a pure builder): the report goes to stderr, which stdout-carrying reads (a contact sheet's
+/// JPEG) leave free, and is what [`output_unless_stalled`] listens for.
+const PROGRESS_ON_STDERR: [&str; 4] = ["-progress", "pipe:2", "-stats_period", "1"];
+
+/// Whether `line` is one of the `key=value` lines of ffmpeg's `-progress` report.
+fn is_progress_line(line: &str) -> bool {
+    let Some((key, _)) = line.trim().split_once('=') else {
+        return false;
+    };
+    key.starts_with("stream_")
+        || matches!(
+            key,
+            "frame"
+                | "fps"
+                | "bitrate"
+                | "total_size"
+                | "out_time_us"
+                | "out_time_ms"
+                | "out_time"
+                | "dup_frames"
+                | "drop_frames"
+                | "speed"
+                | "progress"
+        )
+}
+
+/// What [`output_unless_stalled`] collected.
+struct Collected {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    /// stderr without the `-progress` report lines (what had arrived, when the read stalled).
+    stderr: String,
+    /// ffmpeg said nothing for the stall bound and was killed.
+    stalled: bool,
+}
+
+impl Collected {
+    fn succeeded(&self) -> bool {
+        self.status.success() && !self.stalled
+    }
+
+    /// The last lines of stderr, for an error message.
+    fn stderr_tail(&self) -> String {
+        let lines: Vec<&str> = self.stderr.lines().rev().take(12).collect();
+        lines.into_iter().rev().collect::<Vec<_>>().join("\n").trim().to_string()
+    }
+}
+
+/// [`Command::output`] that cannot wait forever: `cmd` is given `-progress pipe:2`
+/// ([`PROGRESS_ON_STDERR`]) and is killed once its stderr has been silent for `stall`. Both
+/// pipes are drained on side threads, so neither a flood of warnings nor a large stdout can fill
+/// a pipe and wedge the child. A stalled read returns the stderr that had arrived and no stdout.
+/// The child is always reaped, whatever fails on the way.
+fn output_unless_stalled(mut cmd: Command, stall: std::time::Duration) -> std::io::Result<Collected> {
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::{Arc, Mutex};
+
+    /// When stderr was last heard from, and what it said so far.
+    struct Heard {
+        at: Instant,
+        text: String,
+    }
+
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let heard = Arc::new(Mutex::new(Heard {
+        at: Instant::now(),
+        text: String::new(),
+    }));
+    let out_handle = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let err_handle = {
+        let heard = Arc::clone(&heard);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).split(b'\n') {
+                let Ok(line) = line else { break };
+                let line = String::from_utf8_lossy(&line);
+                if let Ok(mut heard) = heard.lock() {
+                    heard.at = Instant::now();
+                    if !is_progress_line(&line) {
+                        heard.text.push_str(&line);
+                        heard.text.push('\n');
+                    }
+                }
+            }
+        })
+    };
+    let mut stalled = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        }
+        if heard.lock().is_ok_and(|heard| heard.at.elapsed() > stall) {
+            stalled = true;
+            let _ = child.kill();
+            break child.wait()?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let text = |heard: &Mutex<Heard>| heard.lock().map(|heard| heard.text.clone()).unwrap_or_default();
+    if stalled {
+        // The side threads end on their own when the pipes close; a wrapper that spawned the real
+        // ffmpeg keeps them open past the kill, and the caller must not wait for that.
+        return Ok(Collected {
+            status,
+            stdout: Vec::new(),
+            stderr: text(&heard),
+            stalled,
+        });
+    }
+    let stdout = out_handle.join().unwrap_or_default();
+    let _ = err_handle.join();
+    Ok(Collected {
+        status,
+        stdout,
+        stderr: text(&heard),
+        stalled,
+    })
+}
+
 /// The red of the middle pixel of the still graph's composite over a one-frame
 /// clip of [`POLICY_PROBE_YUV`], with the clip tagged BT.709 or not.
 fn probe_composite_red(ffmpeg: &str, ffprobe: &str, tag_bt709: bool, deadline: Instant) -> Option<u8> {
@@ -1130,6 +1298,26 @@ pub(crate) struct SourceTraits {
     /// path has to ask of them: whether to request a hardware decoder (`decode_policy`).
     pub codec: Codec,
     pub chroma: Chroma,
+    /// The first plane of the decoded picture is the luma alone (see [`luma_plane_pix_fmt`]):
+    /// what a yuv420p proxy's first plane is, and the only plane `select='scene'` scores.
+    pub luma_plane: bool,
+}
+
+/// Whether a picture of this `pix_fmt` keeps its luma alone in plane 0: planar or semi-planar
+/// YCbCr of any subsampling or depth, and gray. `select='scene'` scores plane 0 only, so on an
+/// RGB-family picture (`gbrp`: the G plane; `rgb24`, `bgr0`: every interleaved byte), a packed
+/// YCbCr one (`yuyv422`: luma and chroma bytes interleaved), a palette, an alpha-carrying
+/// format or a name nobody here knows, it scores something a yuv420p proxy cannot reproduce.
+fn luma_plane_pix_fmt(name: &str) -> bool {
+    let packed = matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "uyvy422" | "yuyv422" | "yvyu422" | "uyyvyy411"
+    );
+    !packed
+        && matches!(
+            pix_fmt_layout(name.trim()),
+            Some(PixLayout::Yuv420 | PixLayout::Gray | PixLayout::OtherYuv)
+        )
 }
 
 /// [`SourceTraits`] of the file at `path`, probed once per file and cached against the file's
@@ -1216,6 +1404,7 @@ fn parse_source_traits(json: &str) -> SourceTraits {
         indexed,
         codec: Codec::from_name(text("codec_name")),
         chroma: Chroma::from_pix_fmt(text("pix_fmt")),
+        luma_plane: luma_plane_pix_fmt(text("pix_fmt")),
     }
 }
 
@@ -1225,6 +1414,40 @@ fn parse_source_traits(json: &str) -> SourceTraits {
 /// spawns a process: not under a lock); `false` when the probe fails.
 pub fn source_is_indexed_container(path: &Path) -> bool {
     source_traits(path).is_some_and(|t| t.indexed)
+}
+
+/// What a whole-file *analysis* read can take from the preview proxy of a file in place of the
+/// file itself (see [`proxy_fidelity`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProxyFidelity {
+    /// A frame sits at the time it does in the original, so a read that picks frames by time
+    /// (a contact sheet) or reports a time (a cut) says the same: an MP4 / MOV or Matroska / WebM
+    /// source, the containers the proxy's timing is verified for. A transport stream's proxy is
+    /// `lead` seconds off whenever its video starts late (`engine-cli.md`), and the rest are
+    /// unproven.
+    pub times: bool,
+    /// ...and a frame's *scene score* comes out within a few hundredths of the original's, so
+    /// the cuts found are the same: also an SDR source whose luma sits alone in plane 0
+    /// ([`SourceTraits::luma_plane`]; not RGB, not packed YCbCr). A proxy is tone-mapped at
+    /// encode, and the original is scored in its HLG / PQ code values, which the tone curve moves
+    /// by a fifth of the scale (0.20 to 0.21 measured); an RGB original is scored on its G plane
+    /// or its interleaved bytes against the proxy's luma (up to 0.56 measured, cuts lost). The few
+    /// hundredths are for the software (libx264) proxy; a hardware-encoded one is unmeasured.
+    pub scores: bool,
+}
+
+/// [`ProxyFidelity`] of the file at `path`. One cached `ffprobe` (the one the proxy's own name
+/// already cost); nothing is trusted when the probe fails. Spawns a process: not under a lock.
+pub fn proxy_fidelity(path: &Path) -> ProxyFidelity {
+    fidelity_of(source_traits(path).unwrap_or_default())
+}
+
+/// The pure half of [`proxy_fidelity`].
+fn fidelity_of(traits: SourceTraits) -> ProxyFidelity {
+    ProxyFidelity {
+        times: traits.indexed,
+        scores: traits.indexed && traits.hdr.is_none() && traits.luma_plane,
+    }
 }
 
 /// The HDR transfer of the first video stream of the file at `path`, for the
@@ -1290,36 +1513,69 @@ const SCENE_DETECT_WIDTH: u32 = 640;
 /// the expensive part for 4K sources); a failed accelerated run retries in
 /// software, mirroring [`decode_frame`]'s fallback.
 pub fn detect_scenes(path: &Path, threshold: f64) -> Result<Vec<f64>> {
+    scene_pass(path, threshold).map(|(times, _)| times)
+}
+
+/// [`detect_scenes`] for the file at `original`, reading its preview `proxy` instead when one
+/// is given: a small all-intra decode in place of a whole 4K long-GOP one.
+///
+/// The proxy is only ever a faster way to the *same answer*, so a proxy that does not read
+/// (a truncated or foreign file, a decoder that dies on it) is not a failed analysis: the
+/// original is read instead, as if there had been none. The cut times themselves come out
+/// the same because a proxy answers `-ss T` with the frame the original does (see
+/// [`build_proxy_args`]; a late-starting video is padded so its frames keep their
+/// timestamps), and the detector scores at [`SCENE_DETECT_WIDTH`] either way.
+pub fn detect_scenes_preferring(original: &Path, proxy: Option<&Path>, threshold: f64) -> Result<Vec<f64>> {
+    if let Some(proxy) = proxy {
+        if let Ok((times, true)) = scene_pass(proxy, threshold) {
+            return Ok(times);
+        }
+        tracing::warn!(proxy = %proxy.display(), "scene detection could not read the proxy; reading the original");
+    }
+    detect_scenes(original, threshold)
+}
+
+/// The `-vf` chain of a scene pass (pure). Frame 0 is selected too (`eq(n,0)`) and dropped again
+/// by [`parse_scenes`]: a pass with no cut outputs nothing otherwise, and ffmpeg reports no
+/// progress until a frame has reached the output, so a long single take would look wedged from
+/// its first second.
+fn scene_filter(threshold: f64) -> String {
+    format!("scale='min({SCENE_DETECT_WIDTH},iw)':-2:flags=bilinear,select='gt(scene,{threshold})+eq(n,0)',showinfo")
+}
+
+/// One scene-detection pass over `path`: the cut times and whether ffmpeg ended cleanly.
+/// [`detect_scenes`] has always answered with whatever the log held, so a run that failed
+/// reads as "no cuts"; the flag is what lets a caller with somewhere else to read tell. A run
+/// that goes [`READ_STALL`] without a word is killed and is an error, not a short list of cuts.
+fn scene_pass(path: &Path, threshold: f64) -> Result<(Vec<f64>, bool)> {
     use std::sync::atomic::Ordering;
 
     let bin = ffmpeg_bin();
-    let filter = format!("scale='min({SCENE_DETECT_WIDTH},iw)':-2:flags=bilinear,select='gt(scene,{threshold})',showinfo");
+    let filter = scene_filter(threshold);
     // Probed before queueing: a hung probe must not hold the one heavy-job slot.
     let hw = decode_hwaccel_for(path, Reading::Whole);
     // The whole file is decoded, so this queues behind any other heavy job.
     let cpu = cpu::lease();
     let run = |hw: Option<&str>| {
-        let mut cmd = bg_command(&bin);
-        cpu::limit_cmd(&mut cmd, cpu.threads());
-        cmd.args(["-hide_banner", "-nostats"]);
+        let mut args: Vec<String> = vec!["-hide_banner".into(), "-nostats".into()];
         if let Some(hw) = hw {
-            cmd.args(["-hwaccel", hw]);
+            args.extend(["-hwaccel".into(), hw.into()]);
         }
-        cmd.arg("-i")
-            .arg(path)
-            .args(["-map", "0:v:0?", "-vf", &filter, "-f", "null", "-"])
-            .stdout(Stdio::null())
-            .output()
-            .map_err(|e| launch_err(&bin, e))
+        args.extend(["-i".into(), path.to_string_lossy().into_owned()]);
+        args.extend(["-map", "0:v:0?", "-vf", &filter, "-f", "null", "-"].map(String::from));
+        cpu::limit_args(&mut args, cpu.threads());
+        let mut cmd = bg_command(&bin);
+        cmd.args(PROGRESS_ON_STDERR).args(&args);
+        output_unless_stalled(cmd, READ_STALL).map_err(|e| launch_err(&bin, e))
     };
     let output = match hw.as_deref() {
         Some(h) => {
             let out = run(Some(h))?;
-            if out.status.success() {
+            if out.succeeded() {
                 out
             } else {
                 let sw = run(None)?;
-                if sw.status.success() {
+                if sw.succeeded() {
                     HWACCEL_OK.store(false, Ordering::Relaxed);
                     tracing::warn!("hardware decode failed during scene detection; using software decode");
                 }
@@ -1328,12 +1584,26 @@ pub fn detect_scenes(path: &Path, threshold: f64) -> Result<Vec<f64>> {
         }
         None => run(None)?,
     };
-    Ok(parse_scenes(&String::from_utf8_lossy(&output.stderr)))
+    if output.stalled {
+        return Err(Error::Engine(format!(
+            "scene detection stalled: ffmpeg said nothing for {}s reading {}: {}",
+            READ_STALL.as_secs(),
+            path.display(),
+            output.stderr_tail()
+        )));
+    }
+    Ok((parse_scenes(&output.stderr), output.status.success()))
 }
 
+/// The cut times in a scene pass's `showinfo` log. Its first line (`n:0`, showinfo's own count of
+/// the frames that reached it) is frame 0, which the pass lets through to keep ffmpeg reporting
+/// and which never scores as a cut: not a cut.
 fn parse_scenes(stderr: &str) -> Vec<f64> {
     let mut times = Vec::new();
     for line in stderr.lines() {
+        if field_after(line, "] n:") == Some(0.0) {
+            continue;
+        }
         if let Some(t) = field_after(line, "pts_time:") {
             times.push(t);
         }
@@ -1752,16 +2022,19 @@ pub fn contact_sheet(
     // making it wait out a ten-minute render would read as a hung server. It
     // still runs thread-capped and at background priority.
     cpu::limit_args(&mut args, cpu::budget_threads());
-    let output = bg_command(&bin)
-        .args(&args)
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| launch_err(&bin, e))?;
-    if !output.status.success() || output.stdout.is_empty() {
-        return Err(Error::Engine(format!(
-            "could not build contact sheet: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+    let mut cmd = bg_command(&bin);
+    cmd.args(PROGRESS_ON_STDERR).args(&args);
+    // `tile` outputs the one frame when the window has been decoded, and ffmpeg reports nothing
+    // before: the bound grows with the window (see `sheet_stall`).
+    let stall = sheet_stall(end - start);
+    let output = output_unless_stalled(cmd, stall).map_err(|e| launch_err(&bin, e))?;
+    if !output.succeeded() || output.stdout.is_empty() {
+        let why = if output.stalled {
+            format!("ffmpeg said nothing for {}s: {}", stall.as_secs(), output.stderr_tail())
+        } else {
+            output.stderr.trim().to_string()
+        };
+        return Err(Error::Engine(format!("could not build contact sheet: {why}")));
     }
     Ok((output.stdout, times))
 }
@@ -1804,7 +2077,15 @@ fn build_contact_sheet_args(
     let rate = if window > 0.0 { cells as f64 / window } else { 1.0 };
     // HDR sources are tone-mapped per cell, after the downscale, before the tile.
     let tone = tonemap.map(|t| format!("{t},")).unwrap_or_default();
-    let vf = format!("fps={rate},scale={cell_width}:-2:flags=bilinear,{tone}tile={columns}x{rows}");
+    // A head-padded proxy opens with a clone of its first frame, which the original has no
+    // counterpart for: read from the very start (a seek to 0.000 keeps it) it would take a
+    // slot of its own and push every cell one over. Any later seek has skipped it already.
+    let unpad = if start < 0.0005 && is_head_padded_proxy(path) {
+        "trim=start_frame=1,"
+    } else {
+        ""
+    };
+    let vf = format!("{unpad}fps={rate},scale={cell_width}:-2:flags=bilinear,{tone}tile={columns}x{rows}");
     let args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
@@ -6921,12 +7202,13 @@ pub fn export_seek_arg(seconds: f64) -> String {
 /// Every video clip whose timeline span contains `t` is decoded at its
 /// corresponding source time (`-ss` input seek), put through the same geometry /
 /// color chain the export uses ([`still_clip_chain`] mirrors [`video_clip_chain`]
-/// minus the time-domain `trim`/`setpts`/`fps`/fade steps), then `overlay`d onto
-/// a black canvas in **track-then-timeline order** — so later tracks composite on
+/// minus the time-domain `trim`/`setpts`/`fps` steps and the fades not changing
+/// the picture at `t`), then `overlay`d onto a black canvas in **track-then-timeline order** — so later tracks composite on
 /// top and gaps fall through to black, matching export framing. The output canvas
-/// keeps the export aspect ratio capped to `max_width`. Static blends
-/// (mid-crossfade dissolve, dip-to-black) are intentionally *not* reproduced; the
-/// still shows the frame each visible clip contributes at `t`.
+/// keeps the export aspect ratio capped to `max_width`. A frame inside a fade, a
+/// dip, a dissolve, a slide or a push is drawn as the export draws it
+/// ([`still_fx`]): the outgoing clip on its tail, the export's own `fade` filters
+/// at the output frame `t` falls in, the travel at that frame's time.
 fn build_still_args(
     timeline: &Timeline,
     assets: &[Asset],
@@ -6955,12 +7237,13 @@ fn build_still_args(
 
     // Active video clips at `t`, in composite order (tracks in list order, clips
     // within a track in timeline order), paired with their source time. The GPU
-    // compositor's `RenderPlan` is built from the same list.
-    let active = active_video_clips(timeline, assets, t);
+    // compositor's `RenderPlan` is built from the same list, less the clips a
+    // transition keeps on screen past their end (which it refuses).
+    let active = still_layers(timeline, assets, fmt.fps, t);
 
     let mut args: Vec<String> = vec!["-hide_banner".to_string(), "-loglevel".to_string(), "error".to_string()];
-    for ac in &active {
-        let (clip, src) = (ac.clip, ac.source_time);
+    for layer in &active {
+        let (clip, src) = (layer.active.clip, layer.active.source_time);
         let asset = asset_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
         // A still has a single frame at t=0 (`trim=end_frame=1` in the chain picks
         // it up); seeking into it decodes nothing, so skip the `-ss` (and any
@@ -6994,8 +7277,8 @@ fn build_still_args(
     };
     let mut chains: Vec<String> = vec![format!("color=c=black:s={ow}x{oh}:d=0.1[base]")];
     let mut cur = "base".to_string();
-    for (n, ac) in active.iter().enumerate() {
-        let clip = ac.clip;
+    for (n, layer) in active.iter().enumerate() {
+        let (ac, clip) = (&layer.active, layer.active.clip);
         let tf = ac.transform();
         let rf = clip.reframe_at(ac.local_time);
         let hdr = asset_of(clip.asset_id).and_then(|a| a.hdr());
@@ -7009,11 +7292,15 @@ fn build_still_args(
                 rf.as_ref(),
                 &canvas,
                 clip.mask.as_ref(),
-                clip.zoom_animated()
+                clip.zoom_animated(),
+                &layer.fades
             )
         ));
         let out = format!("ov{n}");
-        chains.push(format!("[{cur}][v{n}]{overlay}[{out}]", overlay = still_overlay(&tf)));
+        chains.push(format!(
+            "[{cur}][v{n}]{overlay}[{out}]",
+            overlay = still_overlay(&tf, layer.motion)
+        ));
         cur = out;
     }
     for (oi, ov) in live.iter().enumerate() {
@@ -7064,6 +7351,12 @@ struct StillCanvas {
 /// act on the picture at its fit size and are magnified with it. The still follows, or
 /// the frame you scrub to would be sharper than the file at a zoom-in and softer at a
 /// zoom-out. Every other clip zooms first, as it always did.
+///
+/// `fades` are the clip's fades still changing the picture at the still's frame
+/// ([`still_fx`]): where the export's chain applies its `fade` steps, after the rotation and
+/// ahead of a moving zoom, the same filters run on the frame. None at all for a still
+/// outside any fade, and then the chain is what it was.
+#[allow(clippy::too_many_arguments)]
 fn still_clip_chain(
     tf: &Transform,
     color: &Color,
@@ -7072,11 +7365,12 @@ fn still_clip_chain(
     canvas: &StillCanvas,
     mask: Option<&Mask>,
     zoom_last: bool,
+    fades: &StillFades,
 ) -> String {
     let StillCanvas { w: ow, h: oh, fit, sf } = canvas;
     let (ow, oh, fit) = (*ow, *oh, *fit);
     let chroma = effects.iter().any(|e| e.produces_alpha());
-    let needs_alpha = (!tf.is_identity() && tf.needs_alpha()) || chroma || mask.is_some();
+    let needs_alpha = (!tf.is_identity() && tf.needs_alpha()) || chroma || mask.is_some() || fades.needs_alpha();
     let mut p: Vec<String> = vec!["trim=end_frame=1".to_string(), "setpts=PTS-STARTPTS".to_string()];
     let crop = tf.has_crop().then(|| {
         let cw = (1.0 - tf.crop_left - tf.crop_right).max(0.0);
@@ -7146,16 +7440,29 @@ fn still_clip_chain(
         let rad = tf.rotation.to_radians();
         p.push(format!("rotate={rad}:fillcolor=none:ow=rotw({rad}):oh=roth({rad})"));
     }
+    p.extend(fades.filters());
+    if !fades.is_empty() && !needs_alpha && late_zoom.is_none() {
+        p.push(format!("format={}", fades.terminal_format()));
+    }
     p.extend(late_zoom);
     p.join(",")
 }
 
 /// The `overlay` placement for a clip in a [`timeline_frame`] composite: a full
 /// frame for an identity transform, else centered with the clip's fractional
-/// `pos_x`/`pos_y` offset (matching the export overlay positions).
-fn still_overlay(t: &Transform) -> String {
-    if t.is_identity() {
+/// `pos_x`/`pos_y` offset (matching the export overlay positions). `motion` is the
+/// travel a slide or push gives the clip at this frame, added to that offset as the
+/// export adds it; a clip that is not moving passes `(0, 0)` and is placed as ever.
+fn still_overlay(t: &Transform, motion: (f64, f64)) -> String {
+    let moving = motion != (0.0, 0.0);
+    if t.is_identity() && !moving {
         "overlay=(W-w)/2:(H-h)/2".to_string()
+    } else if moving {
+        format!(
+            "overlay=x=(W-w)/2+({px})*W:y=(H-h)/2+({py})*H",
+            px = fnum(t.pos_x + motion.0),
+            py = fnum(t.pos_y + motion.1)
+        )
     } else {
         format!("overlay=x=(W-w)/2+({px})*W:y=(H-h)/2+({py})*H", px = t.pos_x, py = t.pos_y)
     }
@@ -7311,6 +7618,14 @@ mod golden;
 #[cfg(test)]
 mod rendered;
 
+/// The still inside a fade, a dip, a dissolve, a slide or a push: its layers and their fades.
+mod still_fx;
+use still_fx::{still_layers, StillFades};
+
+/// The scrubbed still held to the export's frame at the same moment (`#[ignore]`d).
+#[cfg(test)]
+mod still_rendered;
+
 /// The sound of detached / linked clips: that `extract_audio` used to double, that a
 /// detached clip's *own* chain is the chain it had, and that its **level** survives
 /// the move between a picture track's fader and an audio track's (graph level, and
@@ -7336,6 +7651,10 @@ mod keyed_zoom;
 /// the export renders (`#[ignore]`d).
 #[cfg(test)]
 mod keyed_channels;
+
+/// Scene detection and contact sheets on a proxy against the original (`#[ignore]`d).
+#[cfg(test)]
+mod scenes_on_proxy;
 
 #[cfg(test)]
 mod tests {
@@ -7459,13 +7778,17 @@ mod tests {
 
     #[test]
     fn parses_scene_times() {
+        // `n:0` is frame 0, which the pass lets through to keep ffmpeg reporting: not a cut.
         let log = "\
-[Parsed_showinfo_1 @ 0x1] n:0 pts:0 pts_time:0 duration_time:0.04
-[Parsed_showinfo_1 @ 0x1] n:1 pts:720 pts_time:30.0 duration_time:0.04
-[Parsed_showinfo_1 @ 0x1] n:2 pts:1800 pts_time:75.5 duration_time:0.04
+[Parsed_showinfo_1 @ 0x1] n:   0 pts:0 pts_time:0 duration_time:0.04
+[Parsed_showinfo_1 @ 0x1] n:   1 pts:720 pts_time:30.0 duration_time:0.04
+[Parsed_showinfo_1 @ 0x1] n:   2 pts:1800 pts_time:75.5 duration_time:0.04
 ";
         let scenes = parse_scenes(log);
-        assert_eq!(scenes, vec![0.0, 30.0, 75.5]);
+        assert_eq!(scenes, vec![30.0, 75.5]);
+        // A log of frame 0 alone (a single take) has no cut; a run that logged nothing none either.
+        assert!(parse_scenes("[Parsed_showinfo_1 @ 0x1] n:0 pts:0 pts_time:0 duration_time:0.04\n").is_empty());
+        assert!(parse_scenes("").is_empty());
     }
 
     #[test]
@@ -7746,6 +8069,181 @@ mod tests {
         let ok = probe_source_traits(&script("ok", &format!("echo '{json}'")), file, limit).expect("an answer");
         assert_eq!((ok.hdr, ok.indexed), (Some(Hdr::Pq), true));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_proxy_stands_in_for_an_sdr_yuv_mp4_or_matroska_source_and_for_nothing_else() {
+        let traits_of = |format: &str, transfer: &str, pix_fmt: &str| {
+            parse_source_traits(&format!(
+                r#"{{"streams":[{{"color_transfer":"{transfer}","pix_fmt":"{pix_fmt}"}}],"format":{{"format_name":"{format}"}}}}"#
+            ))
+        };
+        let traits = |format: &str, transfer: &str| traits_of(format, transfer, "yuv420p");
+        let (yes, picture) = (
+            ProxyFidelity {
+                times: true,
+                scores: true,
+            },
+            ProxyFidelity {
+                times: true,
+                scores: false,
+            },
+        );
+        assert_eq!(fidelity_of(traits("mov,mp4,m4a,3gp,3g2,mj2", "bt709")), yes);
+        assert_eq!(fidelity_of(traits("matroska,webm", "")), yes);
+        // HDR: times hold, but the scores are taken in HLG / PQ code values and the proxy is SDR.
+        assert_eq!(fidelity_of(traits("mov,mp4,m4a,3gp,3g2,mj2", "arib-std-b67")), picture);
+        assert_eq!(fidelity_of(traits("matroska,webm", "smpte2084")), picture);
+        // Every YCbCr layout keeps its luma alone in plane 0, which is what the scene filter scores.
+        for pix_fmt in [
+            "yuv420p10le",
+            "yuvj420p",
+            "yuv422p10le",
+            "yuv444p12le",
+            "gray",
+            "gray10le",
+            "nv12",
+        ] {
+            assert_eq!(
+                fidelity_of(traits_of("mov,mp4,m4a,3gp,3g2,mj2", "bt709", pix_fmt)),
+                yes,
+                "{pix_fmt}"
+            );
+        }
+        // RGB (G plane, or every interleaved byte), packed YCbCr, a palette, alpha and a name nobody
+        // knows are scored on something else than the proxy's luma.
+        for pix_fmt in [
+            "gbrp", "gbrp10le", "rgb24", "bgr24", "bgr0", "rgb48le", "yuyv422", "uyvy422", "pal8", "yuva420p", "rgba", "",
+            "newfmt",
+        ] {
+            assert_eq!(
+                fidelity_of(traits_of("mov,mp4,m4a,3gp,3g2,mj2", "bt709", pix_fmt)),
+                picture,
+                "{pix_fmt}"
+            );
+            assert_eq!(fidelity_of(traits_of("matroska,webm", "", pix_fmt)), picture, "{pix_fmt}");
+        }
+        // A transport stream's proxy is `lead` off when its video starts late; the others are unproven.
+        for other in ["mpegts", "avi", "mpeg", "flv", "mxf", "h264"] {
+            assert_eq!(fidelity_of(traits(other, "bt709")), ProxyFidelity::default(), "{other}");
+        }
+        // A failed probe trusts nothing.
+        assert_eq!(fidelity_of(SourceTraits::default()), ProxyFidelity::default());
+    }
+
+    #[test]
+    fn the_progress_report_is_told_from_the_log() {
+        for line in [
+            "frame=120",
+            "fps=0.0",
+            "stream_0_0_q=-0.0",
+            "out_time_us=4000000",
+            "out_time=00:00:04.000000",
+            "progress=end",
+            "speed=N/A",
+        ] {
+            assert!(is_progress_line(line), "{line}");
+        }
+        for line in [
+            "[Parsed_showinfo_1 @ 0x1] n:   4 pts:  4 pts_time:4 fmt:yuv420p",
+            "Error opening input file x.mp4.",
+            "x.mp4: Invalid data found when processing input",
+            "key=value without being ffmpeg's",
+            "",
+        ] {
+            assert!(!is_progress_line(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_silence_a_read_may_keep_grows_with_the_work_between_a_floor_and_a_ceiling() {
+        use std::time::Duration as D;
+        let secs = |window: f64| sheet_stall(window).as_secs_f64();
+        // Start-up and a short window get the floor: a minute.
+        assert_eq!((secs(0.0), secs(1.0), secs(2.0)), (60.0, 60.0, 60.0));
+        // A longer window is decoded for longer before `tile` says anything: 30 s per second of footage.
+        assert_eq!((secs(10.0), secs(60.0)), (300.0, 1800.0));
+        // Wedged is still finite, and nonsense (a negative or unknown duration) falls back to the floor.
+        assert_eq!(secs(1e9), 2.0 * 3600.0);
+        assert_eq!((secs(-5.0), secs(f64::NAN)), (60.0, 60.0));
+        assert_eq!(secs(f64::INFINITY), 60.0);
+        assert_eq!(
+            stall_for_work(4.0, 0.5, D::from_millis(100), D::from_secs(10)),
+            D::from_secs(2)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_that_is_busy_and_silent_is_not_killed_within_its_bound() {
+        use std::time::Duration as D;
+        let busy = || {
+            let mut cmd = Command::new("sh");
+            // Silent for 1.2 s, then the whole answer on stdout: a contact sheet's shape.
+            cmd.args(["-c", "sleep 1.2; printf sheet"]);
+            cmd
+        };
+        // A 4 s window at half a second of silence per second of footage: two seconds is enough...
+        let bound = stall_for_work(4.0, 0.5, std::time::Duration::from_millis(100), D::from_secs(10));
+        let done = output_unless_stalled(busy(), bound).unwrap();
+        assert!(done.succeeded() && !done.stalled, "{:?}", done.stderr);
+        assert_eq!(done.stdout, b"sheet");
+        // ...and with no window to scale by, the floor alone kills the same child.
+        let floor_only = stall_for_work(0.0, 0.5, std::time::Duration::from_millis(100), D::from_secs(10));
+        let killed = output_unless_stalled(busy(), floor_only).unwrap();
+        assert!(killed.stalled && killed.stdout.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_that_goes_quiet_is_killed_and_one_that_reports_is_not() {
+        let sh = |script: &str| {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", script]);
+            cmd
+        };
+        // Quiet: a child that never writes (a wedged decoder) is killed at the bound, not waited for.
+        let started = Instant::now();
+        let quiet = output_unless_stalled(
+            sh("echo warming up >&2; echo frame=1 >&2; sleep 30"),
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap();
+        assert!(quiet.stalled && !quiet.succeeded());
+        // What it had said is kept for the error message (without the progress lines).
+        assert_eq!(quiet.stderr_tail(), "warming up");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // Reporting: each line of stderr is a word, so a long run that keeps talking is not cut off,
+        // and the progress lines are not in the text the caller reads errors from.
+        let talking = output_unless_stalled(
+            sh("for i in 1 2 3 4 5 6; do echo frame=$i >&2; sleep 0.1; done; echo oops >&2; printf out"),
+            std::time::Duration::from_millis(400),
+        )
+        .unwrap();
+        assert!(talking.succeeded(), "{:?}", talking.stderr);
+        assert_eq!((talking.stdout.as_slice(), talking.stderr.as_str()), (&b"out"[..], "oops\n"));
+        // A failure is a failure, not a stall.
+        let failed = output_unless_stalled(sh("echo bad >&2; exit 3"), std::time::Duration::from_secs(5)).unwrap();
+        assert!(!failed.stalled && !failed.succeeded());
+        assert_eq!(failed.stderr, "bad\n");
+    }
+
+    #[test]
+    fn a_contact_sheet_drops_the_head_pad_clone_when_it_reads_from_the_start_only() {
+        let padded = "/home/u/.cache/kerf/proxies/0123456789abcdef.lead.mp4";
+        let plain = "/home/u/.cache/kerf/proxies/0123456789abcdef.mp4";
+        let vf = |path: &str, start: f64| {
+            let (args, _) = build_contact_sheet_args(path, start, start + 8.0, 4, 2, 160, 3, None);
+            args[args.iter().position(|a| a == "-vf").unwrap() + 1].clone()
+        };
+        // A seek to 0.000 keeps pts 0, the clone with it: it would take a slot of its own.
+        assert!(vf(padded, 0.0).starts_with("trim=start_frame=1,fps="), "{}", vf(padded, 0.0));
+        assert!(vf(padded, 0.0004).starts_with("trim=start_frame=1,fps="));
+        // Any later seek has skipped it already, and dropping a frame there would drop a real one.
+        assert!(vf(padded, 0.5).starts_with("fps="));
+        // An ordinary proxy and an original have no clone: their argv is what it always was.
+        assert!(vf(plain, 0.0).starts_with("fps="));
+        assert!(vf("/media/clip.lead.mp4", 0.0).starts_with("fps="));
     }
 
     #[test]
@@ -9694,8 +10192,26 @@ mod tests {
         let effects = [VideoEffect::Blur { sigma: 3.0 }];
         let mask = Mask::default();
         let canvas = still_canvas(Fit::Contain);
-        let last = still_clip_chain(&tf, &color, &effects, None, &canvas, Some(&mask), true);
-        let first = still_clip_chain(&tf, &color, &effects, None, &canvas, Some(&mask), false);
+        let last = still_clip_chain(
+            &tf,
+            &color,
+            &effects,
+            None,
+            &canvas,
+            Some(&mask),
+            true,
+            &StillFades::default(),
+        );
+        let first = still_clip_chain(
+            &tf,
+            &color,
+            &effects,
+            None,
+            &canvas,
+            Some(&mask),
+            false,
+            &StillFades::default(),
+        );
         let zoom = "scale=iw*1.4:ih*1.4";
         // Last: after the rotation, with nothing behind it, and only once.
         assert!(last.ends_with(zoom), "{last}");
@@ -9711,8 +10227,8 @@ mod tests {
         // A moving zoom that has no zoom at the sampled instant has none to move.
         let at_rest = Transform { scale: 1.0, ..tf };
         assert_eq!(
-            still_clip_chain(&at_rest, &color, &effects, None, &canvas, None, true),
-            still_clip_chain(&at_rest, &color, &effects, None, &canvas, None, false)
+            still_clip_chain(&at_rest, &color, &effects, None, &canvas, None, true, &StillFades::default()),
+            still_clip_chain(&at_rest, &color, &effects, None, &canvas, None, false, &StillFades::default())
         );
     }
 
@@ -9784,7 +10300,16 @@ mod tests {
             scale: 0.0004,
             ..Transform::default()
         };
-        let c = still_clip_chain(&tf, &Color::default(), &[], None, &canvas, None, false);
+        let c = still_clip_chain(
+            &tf,
+            &Color::default(),
+            &[],
+            None,
+            &canvas,
+            None,
+            false,
+            &StillFades::default(),
+        );
         assert!(c.contains("scale=w='max(1,iw*0.0004)':h='max(1,ih*0.0004)'"), "{c}");
         let c = still_clip_chain(
             &Transform { scale: 0.5, ..tf },
@@ -9794,6 +10319,7 @@ mod tests {
             &canvas,
             None,
             false,
+            &StillFades::default(),
         );
         assert!(c.contains("scale=iw*0.5:ih*0.5"), "{c}");
     }
@@ -9848,6 +10374,7 @@ mod tests {
             &still_canvas(Fit::Contain),
             None,
             false,
+            &StillFades::default(),
         );
         assert!(!still.contains("force_divisible_by") && !still.contains("trunc("), "{still}");
     }
@@ -10142,6 +10669,197 @@ mod tests {
             "still draws overlays: {joined}"
         );
         assert!(joined.contains("null[outv]"), "still terminates on [outv]: {joined}");
+    }
+
+    /// Two adjacent 10 s clips of one 100 s, 30 fps asset (source 0..10 and 20..30), the second
+    /// entering through `kind` over `secs`: the cut the transition stills are built from.
+    fn transition_cut(kind: TransitionKind, secs: f64) -> (Timeline, Vec<Asset>) {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let a = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let mut b = make_clip(asset.id, 20.0, 30.0, 10.0);
+        b.transition_in = Some(crate::model::Transition { kind, duration: secs });
+        (single(vec![a, b]), vec![asset])
+    }
+
+    fn still_args_at(timeline: &Timeline, assets: &[Asset], t: f64) -> Vec<String> {
+        build_timeline_frame_args(timeline, assets, &ExportOptions::default(), t, 640, 4).unwrap()
+    }
+
+    /// The `-ss` of every input of a still's argv.
+    fn seeks(args: &[String]) -> Vec<&str> {
+        args.windows(2).filter(|w| w[0] == "-ss").map(|w| w[1].as_str()).collect()
+    }
+
+    /// The still of a frame inside a dissolve is the export's: the outgoing clip on its tail,
+    /// from the source it borrows, under the incoming clip's alpha ramp, run through the
+    /// export's own `fade` filter at the output frame the time falls in.
+    #[test]
+    fn a_still_inside_a_dissolve_draws_the_tail_and_the_ramp() {
+        let (tl, assets) = transition_cut(TransitionKind::Crossfade, 1.0);
+        let args = still_args_at(&tl, &assets, 10.5);
+        assert_eq!(
+            seeks(&args),
+            ["10.500000", "20.500000"],
+            "the outgoing clip plays on past its end"
+        );
+        let graph = args.join(" ");
+        assert!(
+            graph.contains("format=yuva420p,settb=expr=1/30,setpts=315,fade=t=in:st=10:d=1:alpha=1,setpts=PTS-STARTPTS[v1]"),
+            "the ramp is the export's fade, at frame 315: {graph}"
+        );
+        assert!(
+            !graph.contains("[0:v]") || !graph.split("[v0]").next().unwrap().contains("fade"),
+            "{graph}"
+        );
+        // Before the dissolve and once it is over there is one clip and no fade.
+        for t in [5.0, 9.99, 11.2, 19.9] {
+            let plain = still_args_at(&tl, &assets, t).join(" ");
+            assert!(!plain.contains("fade") && !plain.contains("settb"), "t = {t}: {plain}");
+            assert_eq!(seeks(&still_args_at(&tl, &assets, t)).len(), 1, "t = {t}");
+        }
+    }
+
+    /// A dip fades the picture itself, to black or through white, either side of the cut; the
+    /// chain then ends in the format the export's does, which is what the fade runs on.
+    #[test]
+    fn a_still_inside_a_dip_fades_the_picture_in_the_exports_pixel_format() {
+        let (tl, assets) = transition_cut(TransitionKind::DipToBlack, 2.0);
+        let before = still_args_at(&tl, &assets, 9.5).join(" ");
+        assert!(
+            before.contains("settb=expr=1/30,setpts=285,fade=t=out:st=9:d=1,setpts=PTS-STARTPTS,format=yuv420p[v0]"),
+            "{before}"
+        );
+        let after = still_args_at(&tl, &assets, 10.5).join(" ");
+        assert!(
+            after.contains("setpts=315,fade=t=in:st=10:d=1,setpts=PTS-STARTPTS,format=yuv420p[v0]"),
+            "{after}"
+        );
+        assert!(
+            !after.contains("alpha=1") && !after.contains("yuva420p"),
+            "a dip needs no alpha plane: {after}"
+        );
+        let (white, assets) = transition_cut(TransitionKind::DipToWhite, 2.0);
+        assert!(still_args_at(&white, &assets, 10.5)
+            .join(" ")
+            .contains("fade=t=in:st=10:d=1:c=white"));
+        // A picture that has an alpha channel of its own keeps it through the fade.
+        let (tl, mut assets) = transition_cut(TransitionKind::DipToBlack, 2.0);
+        assets[0].streams[0].pix_fmt = Some("yuva420p".into());
+        assert!(still_args_at(&tl, &assets, 9.5)
+            .join(" ")
+            .contains("fade=t=out:st=9:d=1,setpts=PTS-STARTPTS,format=yuva420p[v0]"));
+    }
+
+    /// A clip that entered through a dissolve has its whole chain on an alpha plane in the export,
+    /// so a fade of its own after the ramp is over runs on `yuva420p` (where black is 0), and the
+    /// still's chain ends in no `yuv420p` that would run it on another format.
+    #[test]
+    fn a_fade_after_a_dissolve_runs_on_yuva420p_like_the_exports() {
+        let (mut tl, assets) = transition_cut(TransitionKind::Crossfade, 1.0);
+        tl.tracks[0].clips[1].fade_out = 1.0;
+        let graph = still_args_at(&tl, &assets, 19.5).join(" ");
+        assert!(
+            graph.contains("setsar=1,format=yuva420p,settb=expr=1/30,setpts=585,fade=t=out:st=19:d=1,setpts=PTS-STARTPTS[v0]"),
+            "{graph}"
+        );
+        assert!(!graph.contains("format=yuv420p"), "{graph}");
+        // Outside the fade it is the plain chain.
+        let plain = still_args_at(&tl, &assets, 15.0).join(" ");
+        assert!(!plain.contains("yuva420p") && !plain.contains("fade"), "{plain}");
+    }
+
+    /// A clip's own fade-in is drawn until it is done, and then the still is what it always was.
+    #[test]
+    fn a_still_inside_a_clips_own_fade_runs_the_fade_until_it_is_over() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
+        clip.fade_in = 1.0;
+        clip.fade_out = 1.0;
+        let tl = single(vec![clip]);
+        let assets = [asset];
+        assert!(still_args_at(&tl, &assets, 0.0)
+            .join(" ")
+            .contains("setpts=0,fade=t=in:st=0:d=1,"));
+        assert!(still_args_at(&tl, &assets, 0.5)
+            .join(" ")
+            .contains("setpts=15,fade=t=in:st=0:d=1,"));
+        assert!(still_args_at(&tl, &assets, 9.5)
+            .join(" ")
+            .contains("setpts=285,fade=t=out:st=9:d=1,"));
+        for t in [1.0, 5.0, 8.99] {
+            assert!(!still_args_at(&tl, &assets, t).join(" ").contains("fade"), "t = {t}");
+        }
+    }
+
+    /// A slide adds its travel at this frame to the overlay position, a push moves both clips,
+    /// and a clip that is not travelling is placed as ever.
+    #[test]
+    fn a_still_inside_a_slide_or_a_push_places_the_clips_by_their_travel() {
+        let (tl, assets) = transition_cut(TransitionKind::SlideLeft, 2.0);
+        let graph = still_args_at(&tl, &assets, 11.0).join(" ");
+        assert!(
+            graph.contains("[ov0][v1]overlay=x=(W-w)/2+(0.5)*W:y=(H-h)/2+(0)*H[ov1]"),
+            "{graph}"
+        );
+        assert!(
+            graph.contains("[base][v0]overlay=(W-w)/2:(H-h)/2[ov0]"),
+            "a slide covers the outgoing clip where it sits: {graph}"
+        );
+        assert!(!graph.contains("fade"), "{graph}");
+        let (push, assets) = transition_cut(TransitionKind::PushUp, 2.0);
+        let graph = still_args_at(&push, &assets, 11.0).join(" ");
+        assert!(
+            graph.contains("[base][v0]overlay=x=(W-w)/2+(0)*W:y=(H-h)/2+(-0.5)*H[ov0]"),
+            "{graph}"
+        );
+        assert!(
+            graph.contains("[ov0][v1]overlay=x=(W-w)/2+(0)*W:y=(H-h)/2+(0.5)*H[ov1]"),
+            "{graph}"
+        );
+    }
+
+    /// Nothing about a still changes outside a transition: the same cut without its transition
+    /// gives the same argv at every time a transition does not reach.
+    #[test]
+    fn a_still_outside_every_transition_is_what_it_was() {
+        for kind in [
+            TransitionKind::Crossfade,
+            TransitionKind::DipToBlack,
+            TransitionKind::SlideLeft,
+            TransitionKind::PushDown,
+        ] {
+            let (tl, assets) = transition_cut(kind, 2.0);
+            let mut bare = tl.clone();
+            bare.tracks[0].clips[1].transition_in = None;
+            for t in [0.0, 4.0, 7.9, 12.1, 19.9] {
+                assert_eq!(
+                    still_args_at(&tl, &assets, t),
+                    still_args_at(&bare, &assets, t),
+                    "{kind:?} at {t}"
+                );
+            }
+        }
+    }
+
+    /// A moving zoom is the last stage of the export's chain, after the fades; the still follows.
+    #[test]
+    fn a_fade_runs_ahead_of_a_moving_zoom() {
+        let (mut tl, assets) = transition_cut(TransitionKind::Crossfade, 1.0);
+        let key = |time, scale| crate::model::Keyframe {
+            time,
+            scale,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+            easing: Default::default(),
+        };
+        tl.tracks[0].clips[1].keyframes = vec![key(0.0, 0.5), key(2.0, 1.0)];
+        let graph = still_args_at(&tl, &assets, 10.5).join(" ");
+        let chain = graph.split("[v1]").next().unwrap().rsplit(';').next().unwrap().to_string();
+        let (fade, zoom) = (chain.find("fade=").unwrap(), chain.rfind("scale=iw*").unwrap());
+        assert!(fade < zoom, "{chain}");
+        assert!(!chain.contains("format=yuv420p"), "{chain}");
     }
 
     #[test]
@@ -12671,6 +13389,7 @@ mod tests {
             &canvas(Fit::Contain),
             None,
             false,
+            &StillFades::default(),
         );
         assert!(contained.contains("force_original_aspect_ratio=decrease"));
         assert!(contained.contains("pad=1080:1920"), "contain letterboxes: {contained}");
@@ -12683,6 +13402,7 @@ mod tests {
             &canvas(Fit::Cover),
             None,
             false,
+            &StillFades::default(),
         );
         assert!(covered.contains("force_original_aspect_ratio=increase"));
         assert!(covered.contains("crop=1080:1920"), "cover crops: {covered}");

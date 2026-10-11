@@ -66,3 +66,37 @@ export function frameLimited<T>(apply: (value: T) => void, clock: FrameClock) {
 		}
 	};
 }
+
+/** One marker's tick on the bar. */
+export interface MarkerTick {
+	/** How far along, 0..1. */
+	at: number;
+	color: string | null;
+	name: string;
+}
+
+/** The ticks of the markers along the bar: those outside the cut are left out, and two on the same
+ *  spot are one tick (the first keeps its colour and name). */
+export function markerTicks(
+	markers: readonly { time: number; color?: string | null; name?: string }[],
+	duration: number
+): MarkerTick[] {
+	if (!(duration > 0)) return [];
+	const seen = new Set<number>();
+	const out: MarkerTick[] = [];
+	for (const m of markers) {
+		if (!Number.isFinite(m.time) || m.time < 0 || m.time > duration) continue;
+		const at = scrubFraction(m.time, duration);
+		if (seen.has(at)) continue;
+		seen.add(at);
+		out.push({ at, color: m.color || null, name: m.name ?? '' });
+	}
+	return out.sort((a, b) => a.at - b.at);
+}
+
+/** Where a chip `width` px wide centred on a point `x` px along a bar `barWidth` px wide may sit: held
+ *  inside the bar, so the time is never cut off at either end. */
+export function chipLeft(x: number, width: number, barWidth: number): number {
+	if (!(barWidth > 0)) return 0;
+	return Math.min(Math.max(x - width / 2, 0), Math.max(0, barWidth - width));
+}
