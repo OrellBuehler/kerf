@@ -647,7 +647,7 @@ above), **a moving zoom last, masks and effects** (`zoom/`, `zoom+mask/`, `mask/
 caption styles, positions and edges, boxes, colours, sizes, keyframed and overlapping overlays, escapes, installed fonts,
 over every kind of picture, with no layer, and the text it must refuse, each held to the same picture without the text; see
 "Text" above). The table
-holds 680 rows on FFmpeg 6.1.1 and 640 on the pinned 9.0.2 the Windows and macOS bundles ship (where the mixed-tag stacks are asserted refused instead of compared; 152 rows are `text/`, its
+holds 681 rows on FFmpeg 6.1.1 and 641 on the pinned 9.0.2 the Windows and macOS bundles ship (where the mixed-tag stacks are asserted refused instead of compared; 152 rows are `text/`, its
 controls included, 165 the transitions and fades and 145 the zoom, mask and effect cases) plus the plane-level scaler (75) and effect (99) runs, all passing strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
 (`KERF_PARITY_KEEP=1` keeps them for passing ones; `KERF_PARITY_EXPLORE=1` prints
 everything and fails nothing); every run writes `target/parity/report.txt`.
