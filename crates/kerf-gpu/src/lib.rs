@@ -135,6 +135,7 @@ pub mod gpu;
 pub mod present;
 pub mod roundtrip;
 pub mod router;
+pub mod selftest;
 pub mod showinfo;
 pub mod source;
 pub mod sws;
@@ -148,4 +149,5 @@ pub use gpu::{Gpu, GpuError, GpuOptions};
 /// FFmpeg's integer layer geometry (it lives in kerf-core: the plan needs it too).
 pub use kerf_core::layer_geometry as geometry;
 pub use present::{PixelRect, Presenter, Surround};
+pub use selftest::{parity_self_test, SelfTestError, SelfTestReport};
 pub use source::{decode_args, decode_layer, decode_layers, YuvFrame};
