@@ -226,36 +226,47 @@ proportional to its depth — a rate in px/s over real frame time with the sub-p
 (`rereadPointer`: the handlers take a `PointerLike`, so they do not need an event). A press that began inside the band waits
 until the pointer has been in the interior or moved 16 px toward the edge, so a clip grabbed near the window's edge does not
 run away on its first pixel. A slip counts the scroll as travel. The lane box **widens with the gesture** (`liveEnd`), so
-there is room to scroll into past the end of the cut. Escape / pointercancel / blur stop it with the gesture. The playhead's
+there is room to scroll into past the end of the cut. Escape / pointercancel / blur stop it with the gesture — a ruler scrub puts the
+playhead back where it was and an in / out mark drag puts the marks back (`scrubFrom` / `markFrom`), a marker drag writes nothing. The playhead's
 *follow* is the same module (`followScroll`): while playing the view moves with it, pinned inside the edge it runs toward
 (no 75 % page flip); a jump off screen scrolls there smoothly (instantly under `prefers-reduced-motion`); never while a gesture
 is held.
 **A click selects and nothing more**: a plain click on a clip (a locked one too), a title, or a roll / slip / slide press that
 never drags leaves the playhead where it was parked, so a clip can be picked and then trimmed or cut at the playhead. The ruler
 (and the scrub bar, the minimap) seek. A click on empty lane space that has a selection to clear clears it and does not seek;
-with nothing selected it seeks. **The playhead is on a frame**: `ui.seek` rounds to the frame of the cut (`frames.ts`
-`seekTime`; the end of the cut stays exactly the end), so a scrub, a click or a step lands on `k / fps`, and
-the timecode, the picture and the playhead agree. It also **cannot stand past the end of the cut**: an effect in
+with nothing selected it seeks. **The playhead is on a frame**: `ui.seek` rounds to the *nearest* frame of the cut (`frames.ts`
+`seekTime`; the end of the cut stays exactly the end), so a scrub or a click lands on `k / fps`, and
+the timecode, the picture and the playhead agree. A programmatic "go to the *start* of X" — a title picked or its menu's Go to
+start, a changed clip in the review card, a transcript line, `[` / `]` / Page Up / Page Down through a proposal — passes `{ snap: 'up' }` (the first
+frame at or after it, capped at the span's end for one shorter than a frame): rounding to nearest could stand up to half a
+frame *before* a title, where it is not yet on screen to select or drag. A **step** (← →, ⇧ a second, the scrub bar's keys) is
+`stepFrames`, measured from the frame being *shown* (`shownFrame`, the timecode's floor): a playhead left mid-frame by playback
+would otherwise round back onto the frame it shows, or skip one. A scrub bar's hover chip says the frame a click would land on. It also **cannot stand past the end of the cut**: an effect in
 `+page.svelte` takes it back to the new end when an edit shortens the cut (an empty cut reads `00:00:00:00 / 00:00:00:00`).
 The playhead's *head* lives in the sticky ruler, so it stays when the tracks scroll vertically.
 **A clip with the keyboard focus nudges**: ← / → move it (and the selection it is part of) a frame, ⇧ a second, Alt leaves its
 linked partners (`nudge.ts`). A run of presses is one edit, written once the keys go quiet (450 ms), on Enter or when focus
 leaves; until then the clip is drawn where it will land as a drag is (the plan is `planMove`'s, so overlaps, locks and links
-are the drag's), Escape abandons it and ⌘Z during an unwritten run takes the run back, not the edit before it. A move the
-backend would refuse is said in a toast.
+are the drag's), Escape abandons it, and the undo key (`settings.actionFor(e) === 'edit.undo'`) during an unwritten run takes the
+run back, not the edit before it (redo drops the run and goes on). A move the backend would refuse is said in a toast.
 **Track order is drawn, not stored**: the lanes and headers show the video group highest layer first, then the audio
 (`track-order.ts` `displayTracks`: V3, V2, V1, A1, A2 — a later video track composites on top, and now it is drawn on top), with
 a 2 px rule between the groups; the overview strip follows. `Timeline.tracks`, every edit, the export and the agent's tools keep
 V1 … A1 order (`+ V` adds after the last video track, so it appears at the top). Lane lookup is by id (`data-track-id`), so
-hit-testing, marquee and the group move's per-kind lane offset are unaffected.
+hit-testing and the marquee are unaffected, and a move names its destination by track id. The group move *is* told: its lane
+offset ("two lanes down", applied within each kind) and the "no video track above V2" in its refusals are counted in the order
+drawn, so `planMove` is handed `drawnMoveTracks` (`multi-move.ts`: `displayTracks` of `moveTracks`) — a picture dragged up a lane
+takes its selected sound up too, as on screen, not toward A2.
 **A proposal on the timeline is marked** (`staged-diff.ts` `diffView`, from the staged `TimelineDiff` entries matched by id
 — `DiffEntry.overlay_id` carries the title an `overlay_*` entry is about — and the parked live cut for the geometry of what is
 gone): while `editor.previewingStaged`, added clips and titles are outlined solid in `--diff-add`, moved / trimmed / adjusted
 ones dashed in `--diff-shift` (the line style says it without the hue), a track the proposal adds or alters has a coloured bar on
 its header, and a clip or title it removes is a hatched `--diff-remove` ghost where it stood (under whatever now fills the space,
-with a strip along the lane's top that stays visible). The page's banner carries `‹ 5 changes · 2/3 ›` and a legend; `[` / `]`
-(`review.prevChange` / `review.nextChange`, rebindable) step the playhead from change to change (`changePoints` /
-`stepChange`).
+with a strip along the lane's top that stays visible). The page's banner carries `‹ place 2/3 › · 5 changes` (places are the distinct times the
+changes sit at, `changePoints`; changes are the entries, so the two counts are not mixed) and a legend. Page Up / Page Down (and `[` / `]`, which
+need a layout that types them without AltGr or Option; not the arrows, which a focused button keeps) — `review.prevChange` / `review.nextChange`, rebindable, only while a
+proposal is on the timeline — step the playhead from place to place (`stepChange`, `snap: 'up'`). The mark is a frame drawn just
+inside the clip (`::after`), not an outline, so the partner highlight and the focus ring still show on a marked clip.
 **One timecode** (`timecode.ts`): `HH:MM:SS:FF`, non-drop, hours always there so `00:00:20:15` is not read as
 minutes:seconds:frames — the transport, the timeline's clock, the status bar, the ruler (`HH:MM:SS` for a whole-second
 step), the mark and marker tooltips, the trim readouts, the keyframe tooltips and the export range. `mm:ss.cc`

@@ -626,8 +626,8 @@ it describes. **Preview** swaps the editor onto the proposed timeline behind a
 banner (`editor.previewingStaged`; any real edit or a fresh `load()` drops back to
 the live cut, and `refreshTimeline` parks an incoming live update rather than
 yanking the view) — so the proposal can be *watched*, not only read, and the timeline marks what it
-changes (outlines on added / moved clips and titles, hatched ghosts for what it removes, `[` / `]` to step through the
-changes, a `5 changes · 2/3` chip in the banner: frontend-timeline.md, *A proposal on the timeline is marked*). Apply lands it
+changes (outlines on added / moved clips and titles, hatched ghosts for what it removes, Page Up / Page Down to step through the
+changes, a `place 2/3 · 5 changes` chip in the banner: frontend-timeline.md, *A proposal on the timeline is marked*). Apply lands it
 as one revision (confirming first when it went `stale`), Discard drops it. The queue card of the
 task whose edits are staged has no buttons of its own (`readyCard`: one Apply, in the review card);
 any other ready task's Apply / Dismiss and the remove ✕ report a refusal as a toast (`agent-tasks.ts`). The
