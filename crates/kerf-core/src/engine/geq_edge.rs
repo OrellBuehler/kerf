@@ -86,6 +86,9 @@ fn cached(state: &Mutex<State>, now: Instant, measure: impl FnOnce() -> Option<G
             s.measured = Some(edge);
             edge
         }
+        // (A failure another caller recorded while this probe ran has put the retry in the future: this one
+        // is the same failure, not another, and does not double the wait.)
+        None if s.retry_at.is_some_and(|t| t > now) => GeqEdge::Unknown,
         None => {
             s.failures += 1;
             let wait = backoff(s.failures);
@@ -242,6 +245,22 @@ mod tests {
         });
         assert_eq!(got, GeqEdge::Exact);
         assert_eq!(state.lock().unwrap().failures, 0);
+        // Two failures at once are one: the second does not double the wait.
+        let state = Mutex::new(State {
+            measured: None,
+            failures: 0,
+            retry_at: None,
+        });
+        let got = cached(&state, now, || {
+            assert_eq!(cached(&state, now, || None), GeqEdge::Unknown);
+            None
+        });
+        assert_eq!(got, GeqEdge::Unknown);
+        assert_eq!(state.lock().unwrap().failures, 1);
+        // ...while one after the wait has passed is another, and does.
+        let later = now + Duration::from_secs(60);
+        assert_eq!(cached(&state, later, || None), GeqEdge::Unknown);
+        assert_eq!(state.lock().unwrap().failures, 2);
     }
 
     #[test]
