@@ -414,6 +414,58 @@ so the feature is **only** activated through these forwards — which is what ma
   and the eight slides and pushes is equal to the export's; a dip to white is up to 2 levels off outside its fade, where the file's
   `fade c=white` at full strength still rounds. The still's frame *pick* is unchanged (`-ss`, not
   the `fps` filter's), so moving footage can differ from the file by a source frame as ever.
+  **Scrubbed frames (`engine/cli/scrub.rs`, `still_cache.rs`).** The Preview asks for a frame at the
+  playhead again and again; a still is one process (55 to 150 ms, of which 3 to 10 is the frame), so
+  `ScrubFrames` (one per process, in `AppState`) pays the process once per **window**. `frame(timeline,
+  assets, t, width, quality)` quantises `t` to the cut's frame grid (`Rational::frame_containing`: the output
+  frame whose slot holds it, drawn at the slot's start, as the export draws it; the raw `-ss` landed on the first
+  source frame *at or after* a time, a frame later than the file shows there), keys it, and serves it from a
+  bounded LRU (`KERF_SCRUB_CACHE_MB` 64 MiB and 2048 entries; a JPEG bigger than a quarter of the budget is not
+  kept; a held key keeps its first frame). **The key is the still's own argv** (`StillKey`: SHA-256 of the
+  `build_still_args_rendered` text at that frame's time, hardware decode left out, plus the size and mtime of
+  every `-i`), so nothing is invalidated: an edit that changes the frame, a proxy that lands (the path), another
+  width or quality and a replaced file are other keys; an edit elsewhere in the cut leaves this frame's key and
+  the frame stays; an undo is a hit. A miss starts **one window**: `Snapshot::window_args` is the export graph
+  (`push_inputs` + `build_filter_complex`) over `Timeline::slice` from the window's first frame, at the still's
+  size, scaler and quality, `-frames:v n` (24, `KERF_SCRUB_WINDOW`; one frame of lead going forward, 22 before
+  the frame going back, so the steps the other way are hits), and its reader files every JPEG under the key of the
+  still it stands for. The request returns as soon as *its* frame is out (the process does not wait to be
+  asked for more); a request for a frame the running window will draw (same key from the window's own snapshot,
+  within 12 frames of its head) waits for it, anything else kills it and starts its own ("latest wins"). A scrub
+  that comes within 8 frames of the end of a finished window going forward (or the start going back) starts the
+  next one before it gets there (`read_ahead_frames`, 0 = off; the planning of a window and the copy of the cut
+  for it are done off the state's lock, which the window's reader files frames under). Spawned with the lock released, tuned as a stream is (`Reading::Window`: a
+  proxy's decoder in software, and with every input a proxy or an image **one thread** for decoders, graph and
+  encoder: the first frame of three proxy layers was 192 ms on the budget's 3 threads and 109 on one), killed
+  by `stop()` (playback began), `clear()` (a project opened), an edit or jump that makes it useless, a reaper
+  (nothing drawn for 10 s, 5 s between frames) and `Drop`.
+  **Where the window is the still, and where it is not** (`scrub_rendered.rs`, `#[ignore]`d, 6.1 and 9.0, all
+  cases pass on both): on 9.0 a window frame is the still's JPEG byte for byte on every plain cut (84 of 84
+  frames, from windows started at frames 0, 7, 61 and 100; also 60 or 2x as fast, 29.97 in a 30 fps cut, a clip
+  or an in-point or a start off the grid, a title); on a reversed clip it is the export's frame (the still is a
+  frame off); over another track, a still image and Cover it is the still's picture through the encoder's
+  rounding (0.2 to 0.3 on the mean, 17 to 43 at worst); under a grade or a blur it is the still's picture 3.3
+  levels apart on the mean (the still's own distance from the file). **On 6.1 the still is the odd one out on every cut**: its bare `color` base (no `format=yuv420p`,
+  which the window's graph has) lets `overlay` settle on another pixel format and the chroma of one-pixel lines
+  comes out 14 levels off on the mean on `testsrc2`; the window is the export there (the test classifies by
+  picture, not bytes). The still's argv is untouched (`,format=yuv420p` after its base would fix it and move the
+  still golden family: a decision, not done here). A start exactly half a frame off the grid is a tie between two
+  source frames: window and still take one on 6.1, the export its neighbour. So a window never spans a frame inside a **fade, dissolve, slide, push or tail** (the slice drops the fade-in and
+  transition of a clip it cuts at the front and the fade-out of one it cuts at the back: those frames are the
+  one-shot still, which draws them as the file does), a source that is **not a whole number of times the cut's
+  rate** (24 or 25 in 30, 1.5x, 0.5x: the `fps` filter's pick depends on where the slice starts, and 8 to 13 of 24
+  frames are another picture than the export's *and* the still's), the **last frame of a title** (`drawtext`'s
+  `between` includes `end`, the still stops before it), 360 and HDR originals; `Snapshot::plain` decides, pure and
+  unit-tested over every case above. Known limit: a keyed zoom whose size lands on a whole number of pixels
+  (`320 * 1.1`) rounds on the last bit of a key the slice recomputed, and 2 of 120 frames were a pixel larger.
+  Measured (`tests/scrub_bench.rs`, release, 1280x720 all-intra proxies at 960 px, 4 cores shared at a load
+  of ~10, three runs each; `docs/review-2026-10-10/after/perf-4/`), one layer / three layers, FFmpeg 9.0.2
+  then 6.1.1: a one-shot still 50-71 / 94-119 ms then 88-94 / 118-129; the **first frame** of a window 71-89 /
+  104-132 then 97-120 / 142-154 (**10 to 20 ms more than a still** for an isolated seek: the window's graph and
+  the frame before the one asked for); the **next frames** of a drag at 60 Hz 0.0-0.1 / 4.8-9.0 ms then 4.6-7.4 /
+  12.7-14.7 (what a single-threaded window can draw per step; a pure hit is 0.01 ms); twenty consecutive frames
+  1.0-1.4 s / 1.9-2.4 s shown one still at a time against the 0.32 s the drag itself takes (9.0.2). The one-shot
+  still itself is now bounded (`output_bounded`, 120 s, killed) like every child.
   **What a clip does in time is `clip_timing.rs`** (pure, `pub(crate)`, no dependency
   on the engine): `ClipFx` (what its transitions gave it: tail, dissolve, dips, travel,
   HDR, head pad), `transition_fx` (indexed by flat clip *storage* index over the

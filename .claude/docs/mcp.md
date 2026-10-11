@@ -29,7 +29,9 @@ contact-sheet montage of an asset + a text index of cell→timestamp, for findin
 parts) and `preview_timeline` (the composited cut at a timeline time) — return
 `Result<CallToolResult, McpError>` built by the `image_result` helper: a caption
 `Content::text` plus a `Content::image(bare_base64, "image/jpeg")` block the LLM can
-actually *see* (rmcp wants bare base64 + MIME, **not** a `data:` URL).
+actually *see* (rmcp wants bare base64 + MIME, **not** a `data:` URL). `preview_timeline` stays the one-shot
+still (`composite_timeline_frame`, the working cut, the exact time asked): the scrub cache and its windows
+(`app.md`) are the GUI's, where frames come one after another from a dragged playhead.
 **Look, then look closer**: `get_frame` and `preview_timeline` take an optional
 `region` (a `Region` — fractions of the frame, normalized into it) that is
 cropped out *before* the scale to `max_width`, and `skim_asset` takes a `cell`

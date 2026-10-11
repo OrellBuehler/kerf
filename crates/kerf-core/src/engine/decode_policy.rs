@@ -106,6 +106,10 @@ pub(crate) enum Reading {
     Frame,
     /// A long-lived process feeding the preview.
     Stream,
+    /// A process that draws a few dozen frames and exits (the scrub window): hardware as for a
+    /// [`Reading::Stream`], but a preview proxy's decoder is one thread, as for one frame — the
+    /// pools are created per process, and a window of intra frames is done before they pay.
+    Window,
     /// The whole file: an export, a proxy, an analysis pass.
     Whole,
 }
@@ -301,7 +305,7 @@ pub(crate) fn tune_inputs(args: &mut Vec<String>, os: HostOs, reading: Reading, 
                 }
             }
         }
-        if reading == Reading::Frame && facts.proxy {
+        if matches!(reading, Reading::Frame | Reading::Window) && facts.proxy {
             group.extend(["-threads".to_string(), "1".to_string()]);
         }
         out.append(&mut group);
@@ -346,7 +350,7 @@ mod tests {
     }
 
     const OSES: [HostOs; 3] = [HostOs::Windows, HostOs::MacOs, HostOs::Other];
-    const READINGS: [Reading; 3] = [Reading::Frame, Reading::Stream, Reading::Whole];
+    const READINGS: [Reading; 4] = [Reading::Frame, Reading::Stream, Reading::Whole, Reading::Window];
 
     #[test]
     fn nothing_requested_is_nothing_asked_for() {
@@ -658,6 +662,33 @@ mod tests {
             "{a:?}"
         );
         assert!(!t.hw);
+    }
+
+    #[test]
+    fn a_proxy_in_a_window_loses_its_hwaccel_and_decodes_on_one_thread_while_an_original_is_a_streams() {
+        let mut a = opts("auto", PROXY, "-ss 3.000000");
+        let t = tune_inputs(&mut a, HostOs::Windows, Reading::Window, &InputFacts::of_path);
+        assert_eq!(
+            a.join(" "),
+            format!(
+                "-hide_banner -loglevel error -ss 3.000000 -threads 1 -i {PROXY} -filter_complex [0:v]null[outv] -map [outv] -frames:v 1 pipe:1"
+            )
+        );
+        assert_eq!(
+            t,
+            Tuning {
+                hw: false,
+                all_cheap: true
+            }
+        );
+        // An original keeps its decoder, named on Windows, and is not told to use one thread; and a
+        // 4:2:2 one is not skipped as it is for one frame (a window is many).
+        let c422 = |_: &str| facts(Codec::Hevc, Chroma::Other);
+        let mut b = opts("auto", "/media/r5.mp4", "-ss 1.5");
+        let t = tune_inputs(&mut b, HostOs::Windows, Reading::Window, &c422);
+        assert_eq!(flag_after(&b, "-hwaccel"), Some("d3d11va"));
+        assert!(!b.contains(&"-threads".to_string()));
+        assert!(t.hw && !t.all_cheap);
     }
 
     #[test]

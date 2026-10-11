@@ -7020,11 +7020,13 @@ fn run_still(
         let mut args = build_still_args(timeline, assets, o, t, max_width, region, out)?;
         hw_used.set(tune_still_args(&mut args, assets, HostOs::CURRENT));
         let bin = ffmpeg_bin();
-        let output = command(&bin)
-            .args(&args)
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| launch_err(&bin, e))?;
+        let output = output_bounded(command(&bin).args(&args), STILL_TIMEOUT).map_err(|e| match e.kind() {
+            std::io::ErrorKind::TimedOut => Error::Engine(format!(
+                "could not render timeline frame at {t:.3}s: ffmpeg did not answer in {} s and was stopped",
+                STILL_TIMEOUT.as_secs()
+            )),
+            _ => launch_err(&bin, e),
+        })?;
         if !output.status.success() || (piping && output.stdout.is_empty()) {
             return Err(Error::Engine(format!(
                 "could not render timeline frame at {t:.3}s: {}",
@@ -7050,6 +7052,85 @@ fn run_still(
         },
         result => result,
     }
+}
+
+/// How long one composited still may run before it is killed. A still of a 4K 4:2:2 original is
+/// a second or two; this is for the one that hangs (a hardware decoder stuck in a driver), which
+/// would otherwise hold the caller, and the Preview's one frame in flight, for good.
+const STILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// `Command::output()` with a deadline: run `cmd` with its stdin closed and both output pipes
+/// read, and kill it if it has not finished in `limit` (`ErrorKind::TimedOut`). The calling thread
+/// reads stdout to its end, a watchdog kills the process at the deadline (which ends that read),
+/// and nothing waits on the child while the watchdog could need it.
+fn output_bounded(cmd: &mut Command, limit: std::time::Duration) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    use std::sync::Arc;
+
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let child = Arc::new(Mutex::new(child));
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let (done, finished) = channel::<()>();
+    let watchdog = {
+        let child = Arc::clone(&child);
+        let timed_out = Arc::clone(&timed_out);
+        std::thread::spawn(move || {
+            if matches!(finished.recv_timeout(limit), Err(RecvTimeoutError::Timeout)) {
+                timed_out.store(true, Ordering::SeqCst);
+                let _ = child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+            }
+        })
+    };
+    let err_reader = std::thread::spawn(move || {
+        let mut text = Vec::new();
+        if let Some(mut e) = stderr {
+            let _ = e.read_to_end(&mut text);
+        }
+        text
+    });
+    let mut out = Vec::new();
+    let read = match stdout.as_mut() {
+        Some(o) => o.read_to_end(&mut out).map(|_| ()),
+        None => Ok(()),
+    };
+    // The output has ended, so the process is exiting; poll rather than block in `wait`, which
+    // would hold the child's lock against the watchdog's kill.
+    let started = Instant::now();
+    let status = loop {
+        let mut c = child.lock().unwrap_or_else(|e| e.into_inner());
+        match c.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if started.elapsed() > limit => {
+                timed_out.store(true, Ordering::SeqCst);
+                let _ = c.kill();
+                break c.wait();
+            }
+            Ok(None) => {}
+            Err(e) => break Err(e),
+        }
+        drop(c);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    let _ = done.send(());
+    let _ = watchdog.join();
+    let stderr = err_reader.join().unwrap_or_default();
+    if timed_out.load(Ordering::SeqCst) {
+        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the process timed out"));
+    }
+    read?;
+    Ok(std::process::Output {
+        status: status?,
+        stdout: out,
+        stderr,
+    })
 }
 
 /// Tune a built still argv for the process about to be spawned: each input's `-hwaccel` and
@@ -7212,8 +7293,21 @@ fn build_still_args(
 ) -> Result<Vec<String>> {
     // Same gate as the export, so the still shows the cut that would render.
     let rendered = timeline.for_render();
-    let timeline = &rendered;
+    build_still_args_rendered(&rendered, assets, opts, t, max_width, region, out)
+}
 
+/// [`build_still_args`] over a timeline that has already been through [`Timeline::for_render`]:
+/// what a caller asking for many frames of one cut (the scrub cache keys every frame of a
+/// window) does once instead of per frame.
+fn build_still_args_rendered(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    max_width: u32,
+    region: Option<Region>,
+    out: &StillOutput,
+) -> Result<Vec<String>> {
     let fmt = export_format(timeline, assets, opts);
     // A region zoom composites a canvas wide enough that the region alone is
     // `max_width` — the delivery frame caps it, so a zoom never upscales.
@@ -7617,6 +7711,17 @@ use still_fx::{still_layers, StillFades};
 /// Which slot a job takes, the cores' or the hardware's.
 #[cfg(test)]
 mod lane_tests;
+
+/// A bounded cache of composited stills, keyed by the argv that would draw each.
+mod still_cache;
+
+/// The scrubbed frame: cached, with a window of its neighbours drawn by one process.
+mod scrub;
+pub use scrub::{ScrubConfig, ScrubFrames, ScrubStats};
+
+/// The scrub window held to the export's frames and the still's (`#[ignore]`d).
+#[cfg(test)]
+mod scrub_rendered;
 
 /// The scrubbed still held to the export's frame at the same moment (`#[ignore]`d).
 #[cfg(test)]

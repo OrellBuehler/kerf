@@ -59,6 +59,9 @@ struct AppState {
     /// (`take_launch_project`). A pull rather than an event: an event emitted
     /// before the page has a listener is lost.
     launch: Mutex<LaunchSlot>,
+    /// The Preview's composited frames, cached, and the one process that draws the frames
+    /// around the playhead. Shared with the GPU preview, whose JPEG route reads it too.
+    scrub: Arc<kerf_core::ScrubFrames>,
 }
 
 #[derive(Serialize)]
@@ -204,6 +207,7 @@ fn project_path(state: State<'_, AppState>) -> CmdResult<Option<String>> {
 fn new_project(state: State<'_, AppState>) -> CmdResult<Option<String>> {
     let mut project = state.project();
     *project = Project::open_in_memory().map_err(|e| e.to_string())?;
+    state.scrub.clear();
     Ok(project.path().map(|p| p.display().to_string()))
 }
 
@@ -213,6 +217,7 @@ fn new_project(state: State<'_, AppState>) -> CmdResult<Option<String>> {
 #[tauri::command]
 async fn open_project(app: AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<Option<String>> {
     let shared = state.project.clone();
+    let scrub = state.scrub.clone();
     blocking(move || {
         // Open the file first, then swap it in — the (disk-bound) open doesn't
         // hold the shared lock, and a failed open leaves the current project intact.
@@ -221,6 +226,8 @@ async fn open_project(app: AppHandle, state: State<'_, AppState>, path: String) 
         *project = opened;
         let result = project.path().map(|p| p.display().to_string());
         drop(project);
+        // The frames of the project that was open are of no use to this one.
+        scrub.clear();
         // The speech model is remembered per project, so transcribing in the
         // reopened one uses the model it was cut with.
         restore_speech_model(&shared);
@@ -1986,6 +1993,7 @@ async fn get_frame(
 #[tauri::command]
 async fn get_timeline_frame(state: State<'_, AppState>, time_secs: f64, max_width: Option<u32>) -> CmdResult<String> {
     let shared = state.project.clone();
+    let scrub = state.scrub.clone();
     blocking(move || {
         // Resolve the inputs under the lock, then *drop the guard* before the ffmpeg
         // composite — the preview fetches frames continuously during playback, and
@@ -1996,9 +2004,12 @@ async fn get_timeline_frame(state: State<'_, AppState>, time_secs: f64, max_widt
             refuse_unless_proxied(&project, time_secs, Some(time_secs))?;
             project.timeline_frame_inputs().map_err(|e| e.to_string())?
         };
-        let jpeg = Project::composite_timeline_frame(&timeline, &assets, time_secs, max_width.unwrap_or(960), 4)
+        // Through the scrub cache: the frame of the cut's grid that holds the time, from the cache,
+        // or from the window of neighbours one process draws for it, or alone (`ScrubFrames`).
+        let jpeg = scrub
+            .frame(&timeline, &assets, time_secs, max_width.unwrap_or(960), 4)
             .map_err(|e| e.to_string())?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg.as_slice());
         Ok(format!("data:image/jpeg;base64,{b64}"))
     })
     .await
@@ -2122,6 +2133,9 @@ async fn start_playback(
     use std::sync::atomic::Ordering;
 
     let shared = state.project.clone();
+    // The stream takes the pane over: the window of frames being drawn around the playhead is of
+    // no use until it stops, and is not left running beside it.
+    state.scrub.stop();
     ACTIVE_PLAYBACK.store(playback_id, Ordering::SeqCst);
     blocking(move || {
         // Resolve the inputs under the lock and drop the guard before streaming:
@@ -3260,6 +3274,7 @@ pub fn run() {
     // forwarded by the single-instance plugin, which never reaches this far).
     let launch = first_launch_project();
     let main_window_shown = Arc::new(AtomicBool::new(false));
+    let scrub = Arc::new(kerf_core::ScrubFrames::new(kerf_core::ScrubConfig::default()));
 
     tauri::Builder::default()
         // Must be the first plugin. A second launch (a `.kerf` double-clicked
@@ -3280,6 +3295,7 @@ pub fn run() {
             stems_cancel: Arc::new(AtomicBool::new(false)),
             main_window_shown: main_window_shown.clone(),
             launch: Mutex::new(LaunchSlot::new(launch.clone())),
+            scrub: scrub.clone(),
         })
         .manage(popout::PopoutState::default())
         .on_window_event(popout::on_window_event)
