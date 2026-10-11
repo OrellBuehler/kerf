@@ -16,7 +16,7 @@
 | UI-7 Panels polish | ui-7 (on ui-8) | | in-progress | panels/shell medium + polish; shell H6 | wave 3 |
 | UI-8 Export dialog logic | ui-8 (on ui-6, pushed) | | ready (PR after UI-6) | dialogs 3 | wave 3 |
 | PERF-4 Still cache and prefetch | | | todo | gpu-media WP6, WP9 | wave 3 |
-| GPU-2 Text on the GPU | | | todo | gpu-compositor | wave 3 |
+| GPU-2 Text on the GPU | gpu-2 (on gpu-3) | | in-progress | gpu-compositor | wave 3 |
 | GPU-4 … GPU-7, PERF-5, macOS presenter | | | todo | | wave 4 |
 | CI: retry + cache ffmpeg download | ci-fetch-retry | #131 | blocked (evermeet 429) | not a review finding | evermeet.cx throttles the macOS pinned-ffmpeg fetch (ffprobe 429 for 6.5+ min); retry + actions/cache ported into #129, #130, #132; cache fills only after one successful run |
 
