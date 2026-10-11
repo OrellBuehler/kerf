@@ -484,40 +484,47 @@ the last it answered. A still plan (what the app's preview and `FrameSource` ser
 a paused frame inside a transition is drawn like the file shows it — where the FFmpeg *still* used to be the only thing that did.
 
 **A moving zoom last, masks and effects** (`composite.wgsl`, `shaders/planeops.wgsl`, `shaders/blur*.wgsl`, `effects.rs`;
-`GpuCaps::{keyed_zoom, mask, effects}`). FFmpeg runs a clip with a **moving zoom** as `crop, fit, setsar, fps, eq, effects, format=yuva420p, mask,
-rotate, fades, scale eval=frame` (the zoom last: `video_clip_chain`, and `still_clip_chain(.., zoom_last)` for the still), so the grade, the
-effects, the mask and the fades act on the picture at its **fit size** and the zoom magnifies the result (a blur grows with it, a hard mask edge softens).
-The compositor draws that order (`LayerLook::zoom_last`: `animated.zooms` and two scale stages): stage 0 is the fit scale with the `eq` tables in its
-vertical pass, then the effects, the mask's alpha plane and the fades run over the fit-size planes (`fs_fade`: Y, U, V and the alpha), and **stage 1
-scales four planes** (the alpha with the luma filters, which is what swscale does for `yuva420p`: identical to luma, both FFmpegs) before the blend.
-A zoom that holds still keeps the old order (the zoom first). Refused whatever the caps (`ZoomBehind(layer, what)`): a **rotation**, an **opacity
-below 1** and a **dip to white** in front of a moving zoom (the rotated alpha and the RGB round trip would have to be scaled with it; and the zoom's `scale` takes the RGB frame the white
-fade leaves and converts it in the same pass: up to 14 levels off on 6.1.1, 3 on 9.0.2).
+`GpuCaps::{keyed_zoom, mask, effects}`). FFmpeg's chain for a clip with a **moving zoom** is `crop, fit, setsar, fps, eq, effects,
+format=yuva420p, mask, rotate, fades, scale eval=frame` (`video_clip_chain`; `still_clip_chain(.., zoom_last)` for the still): everything
+before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows, a hard mask edge softens).
 
-**Masks** are the alpha plane `geq` writes: `kerf_core::mask_alpha_plane` evaluates the expression in `f64` and truncates as `geq` stores it
-(`255 * 0.999` is 254), equal to the real filter on 21 million samples on both FFmpegs (`rendered.rs`), made once per `(mask, size)` (`MaskCache`, 8
-planes / 96 MiB: a few ms at 1080p on the first frame) where `geq` costs 93 ms of CPU a 960x540 frame, every frame. **FFmpeg 6.1's `geq` also reads a plane's last column and row one in** (its bilinear read clamps to `w - 2` / `h - 2`): the masked picture's right-most column and bottom row, luma and both chroma planes, come out as their neighbours' (a 640x360 frame: the last chroma column and row), where 9.0 copies them. `kerf_core::geq_edge()` measures which (the filter itself over a 16x16 picture whose every sample differs, once per process; `Unknown`, not a guess, when it cannot, retried after a backoff); the blend then reads the layer one in from its last column and row (`ComposeParams::edge`, the padded frame of a letterbox included), a late zoom's planes are shifted before its scale (`fs_edge`), and a mask is `Unsupported` while the build is `Unknown` (`Compositor::with_geq_edge` pins it). The blend takes the alpha **per
-sample** (`fs_compose_exact`): luma with its own, each chroma sample with `overlay`'s average over its 2x2 block (`>> 2`; the last chroma column and
-row average what they have, the last column not reading its second luma column: `blend_plane`, 6.1.1 and 9.0.2 alike, SSE4 row function included); a
-dissolve's ramp acts on that plane sample by sample. On a **letterbox** the mask is cut from the whole padded frame (`pad` runs ahead of the
-`geq`), so it is the canvas's size. Refused (`MaskWith`, `Matte`): a mask on a **rotated** layer or one **below full opacity** (its alpha goes through
-`colorchannelmixer`), and a blur or a sharpen on a letterbox (they would see the bars as picture; the tables and a grade carry the bars through).
+* The compositor draws that order (`LayerLook::zoom_last`: `animated.zooms` and two scale stages). Stage 0 is the fit scale with the `eq` tables in
+  its vertical pass; the effects, the mask plane and the fades (`fs_fade`: Y, U, V and the alpha) run on the fit-size planes; **stage 1 scales four
+  planes** (swscale scales alpha like luma, identically on both FFmpegs). A zoom that holds still keeps the old order.
+* Refused whatever the caps (`ZoomBehind`): a rotation and an opacity below 1 (the rotated alpha and the RGB round trip would scale with the zoom), and
+  a dip to white (the zoom's `scale` takes the RGB frame the fade leaves and converts it in the same pass: up to 14 levels off on 6.1.1, 3 on 9.0.2).
 
-**Effects.** `Grayscale` is `hue=s=0` (U, V to 128) and `Invert` is `negate` (`255 - v` on Y, U, V): tables, composed with `eq`'s in order and applied in
-the scaler's vertical pass, byte for byte. **Sharpen** is `unsharp` 5x5 on luma, integer arithmetic (the binomial `[1 4 6 4 1]` twice, `s + (((s - ((b +
-128) >> 8)) * amount) >> 16)`, `amount` the float option times 65536, truncated), byte for byte. **Blur** is `gblur` (`blur.wgsl`): the first-order
-recursive Gaussian in `float`, rightwards, leftwards, downwards, upwards, one compute invocation per row and per column, then `postscale`, clip and
-`lrintf`, each plane at its own size. It is **not** bit-exact and cannot be: FFmpeg's x86 build runs the horizontal pass in AVX2 / AVX-512 with
-another association of the same sums and a fused multiply-add, so its own answer depends on the CPU by the last bits of a `float`, which `lrintf` turns
-into a level where a value sits on a half. Measured on 9.0.2 against this port (a second of 640x360 frames): 0 to 59 samples in 3.2 million are a level off
-and none more, sigma 2 equal, a blur chained with a sharpen equal. A blur is held to one level, after a scale or the translucent round trip to two.
-**Refused**: a vignette (its dither is an LCG counter that runs on across frames, so frame N's noise depends on how many came before it), a chroma key
-(an alpha from a float colour distance), a sigma outside 0 to 1024 and an amount outside -2 to 5 (FFmpeg's options refuse them too), a blur over the
-device's storage-buffer limit, and by the picture (`effect_on_picture_refusal`): an invert, blur or sharpen on a **full-range** picture or one whose format was never
-recorded (FFmpeg runs it on the raw values and converts the range afterwards: an invert is 8 levels off and a sharpen's overshoot 26 on 9.0.2; grayscale is the
-same on any range) and an invert of a **gray** picture (FFmpeg leaves its chroma at 128, the compositor's planes would go to 127). 10-bit, 4:2:2, 4:4:4, RGB and
-gray pictures take every other effect and a mask at the plain source's own figures (max 3: the decode's rounding, FFmpeg runs the effect before it converts). Compute passes are core wgpu on every backend the compositor builds for; the blur writes no storage texture, so no optional
-feature is needed.
+**Masks.**
+
+* The alpha plane is `geq`'s: `kerf_core::mask_alpha_plane` evaluates the expression in `f64` and truncates as `geq` stores it (`255 * 0.999` is 254),
+  equal to the real filter on 21 million samples on both FFmpegs (`rendered.rs`). It is made once per `(mask, size)` (`MaskCache`: 8 planes or 96 MiB,
+  the GPU copy counted), where `geq` costs 93 ms of CPU a 960x540 frame, every frame.
+* The blend takes the alpha **per sample** (`fs_compose_exact`): luma with its own, each chroma sample with `overlay`'s average over its 2x2 block (`>> 2`;
+  the last chroma column and row average what they have, the last column not reading its second luma column: `blend_plane`, the same on both FFmpegs).
+  A dissolve's ramp acts on that plane sample by sample. On a letterbox the mask is the padded frame's (`pad` runs ahead of `geq`): the canvas's size.
+* **FFmpeg 6.1's `geq` reads a plane's last column and row one in** (its bilinear read clamps to `w - 2` / `h - 2`): the masked picture's right-most
+  column and bottom row, on all three planes, are their neighbours'; 9.0 copies them. `kerf_core::geq_edge()` measures which (the filter over a 16x16
+  picture of distinct samples, once per process, outside any lock; `Unknown`, not a guess, retried after a backoff). The blend then reads the layer one in
+  (`ComposeParams::edge`, a letterbox included), a late zoom's planes are shifted before its scale (`fs_edge`), and a mask is `Unsupported` while the build
+  is `Unknown`. `kerf_gpu::prepare(&plan)` measures it ahead of the render lock; `Compositor::with_geq_edge` pins it.
+* Refused (`MaskWith`): a mask on a **rotated** layer, or one below full opacity (the sampled one: its alpha goes through `colorchannelmixer`).
+
+**Effects.**
+
+* `Grayscale` (`hue=s=0`: U, V to 128) and `Invert` (`negate`: `255 - v` on Y, U, V) are tables, composed with `eq`'s and applied in the scaler's vertical
+  pass. **Sharpen** is `unsharp` 5x5 on luma in integers (the binomial `[1 4 6 4 1]` twice, `s + (((s - ((b + 128) >> 8)) * amount) >> 16)`). Byte for byte.
+* **Blur** is `gblur` (`blur.wgsl`): the first-order recursive Gaussian in `float` (right, left, down, up; one compute invocation per row and column),
+  then `postscale`, clip and `lrintf`, each plane at its own size. It is **not bit-exact and cannot be**: FFmpeg's x86 build runs the horizontal pass
+  in AVX2 / AVX-512 with another association of the same sums and an FMA, so its answer depends on the CPU by the last bits of a `float`, which `lrintf`
+  turns into a level where a value sits on a half. Measured on 9.0.2: 0 to 59 samples in 3.2 million a level off, none more.
+* Refused (`Effects`): a vignette (its dither is an LCG counter that runs on across frames), a chroma key (a float colour distance), a sigma outside 0 to 1024
+  or an amount outside -2 to 5 (FFmpeg's options refuse them too), a blur over the device's storage-buffer limit. `Matte`: a blur or a sharpen on a
+  letterbox (they would see the bars as picture; tables and a grade carry the bars through). By the picture (`effect_on_picture_refusal`): an invert,
+  blur or sharpen on a **full-range** picture or one whose format was never recorded (FFmpeg runs it on the raw values and converts the range afterwards:
+  an invert is 8 levels off, a sharpen's overshoot 26, on 9.0.2; grayscale is the same on any range), and an invert of a **gray** picture (FFmpeg leaves
+  its chroma at 128, the compositor's planes would go to 127).
+* 10-bit, 4:2:2, 4:4:4, RGB and gray pictures take every other effect and a mask at the plain source's own figures (max 3: the decode's rounding).
+  Compute passes are core wgpu on every backend and the blur writes no storage texture: no optional feature.
 
 **`tests/motion_parity.rs`** (`#[ignore]`d; both FFmpegs in CI's parity job) holds the compositor to the **export**, frame by frame: each case builds a short
 cut, renders it through `render_with` (the real graph) losslessly, reads **every frame back as `yuv420p` planes** (no colour conversion between: the planes `overlay`
@@ -535,12 +542,17 @@ samples)**, one level where the compositor scales a layer (the scaler's, `parity
 (the band within 3 px of its edge, from the plan's geometry, is left out), and a dip to white at two. A mutation of the chroma constant by nine in 65536 fails the dips at once. The Still-plan side is
 `parity.rs`: `frames_inside_a_transition_are_drawn_as_ffmpegs_still_draws_them` (the plan holds the frame and the GPU is held strictly to the still, the still to the export), and
 `every_kind_of_transition_and_the_clips_own_fades_are_drawn_in_a_still` (all eleven kinds, covering and partial, four frames each, and fades over another track, graded and letterboxed), the three refusals above
-in `frames_the_gpu_would_draw_wrong_are_refused`. **GPU-6 in the same harness** (`motion_parity.rs`, 9.0.2 and 6.1.1): a **mask** is exact — shapes x feather x invert, off-centre, larger than the
-frame, thin, the shape's edge on the picture's border (the chroma alpha of the last column and row), over noise, with fades and a dissolve: max 0, 0 differing samples — and
-one level (the scaler's; the mask adds none) on a layer the compositor scales: a picture-in-picture, an odd 211x118 one (its last chroma column and row average fewer luma samples), a ramp to the picture's border, a letterbox, a Cover crop; **grayscale, invert and sharpen** are exact (every case, noise included); a **blur** is a level off on 0 to 59
-samples in 3.2 million; a **moving zoom** (in, out, from small, with a position, eased, three keys, late on the timeline, speed 2, reversed, Cover into 960x540 and 9:16) is one level (the scaler's), two where two
-scale stages are in cascade (the fit scale, then the zoom) and two with a soft mask edge on the zoomed picture (the picture's level and the alpha's); the grade, the clip's fades, a hard mask, grayscale, invert,
-blur and sharpen in front of a zoom are one level. A dissolve into a zooming clip ramps the alpha at the fit size (one level, two with a mask).
+in `frames_the_gpu_would_draw_wrong_are_refused`. **GPU-6's cases** (zoom in, out, from small, with a position, eased, three keys, late, speed 2, reversed, Cover into 960x540 and 9:16; masks
+shapes x feather x invert, off-centre, larger than the frame, thin, the shape's edge on the picture's border, over noise; the effects and their chains;
+a dissolve, dip, slide or push into a zooming clip and out of one) hold the bounds of the ladder below, **on both FFmpegs**:
+
+| Bound (Y / UV) | Cases | Why |
+| --- | --- | --- |
+| 0 | a mask at the picture's size (20 of 27 mask rows), grayscale, invert, sharpen at the picture's size | integer arithmetic, reproduced |
+| 1 (`SCALED`) | a layer the compositor scales, a mask on it, a one-stage zoom | swscale's x86 scaler is not bit-exact with the C arithmetic the shader follows |
+| 1 (`EFFECT`) | a blur at the picture's size | `gblur`'s SIMD summation order (above) |
+| 2 | `EFFECT_SCALED`: a blur on a scaled or translucent layer. `CASCADED`: a zoom (the fit scale, then the zoom's). `ZOOMED_MASK`: a soft mask edge on a zoomed picture. Rotated, graded and scaled, dip to white | two of the causes above on one sample; the RGB kernel for white |
+| luma `1 + 2 * amount`, UV 2 | a sharpen after a scale (`sharpened`): 3 measured at amount 1.5 after a blur, 7 at 3, 11 at 5 | `unsharp` is exact; it amplifies the scaler's level (the sample a level off one way, its neighbours the other) |
 
 **`tests/parity.rs`** (`#[ignore]`d; CI job `parity`, a **matrix of the distro FFmpeg and
 the pinned one** — the two compose colour differently, so a green run on one proves

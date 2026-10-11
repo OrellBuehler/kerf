@@ -259,7 +259,7 @@ const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// The GPU compositor: pipelines created once, textures per frame.
 ///
-/// v0 allocates its textures and buffers per call and keeps no cache — simple
+/// v0 allocates its textures and buffers per call and keeps no cache but the mask planes' — simple
 /// to reason about while the numbers are what matters; pooling is A1.
 pub struct Compositor {
     gpu: Arc<Gpu>,
@@ -637,14 +637,17 @@ pub fn prepare(plan: &RenderPlan) {
 
 impl Compositor {
     /// What this compositor draws exactly, as data: the plan refuses (through
-    /// [`RenderPlan::reasons`]) whatever is not in it. That is [`GpuCaps::A0`] — layers,
-    /// transform, crop, fit, `eq`, opacity, stills and sampled keyframes — and **text**: titles and
-    /// captions, FFmpeg's own `drawtext` rasterised once and blended here (see [`crate::text`]) —
-    /// and **fades, dips, dissolves, slides and pushes** in still plans and in export frames
-    /// (`motion`, `fades`, `transitions`, `dip_white`; `tests/motion_parity.rs`), a **moving zoom**
-    /// drawn last as FFmpeg's chain has it (`keyed_zoom`), **masks** (`mask`) and the **blur,
-    /// sharpen, grayscale and invert** effects (`effects`); a vignette and a chroma key are
-    /// FFmpeg's. Each later pass flips its bit beside the pass and its parity cases.
+    /// [`RenderPlan::reasons`]) whatever is not in it. [`GpuCaps::A0`] (layers, transform, crop, fit,
+    /// `eq`, opacity, stills, sampled keyframes) and
+    ///
+    /// * `text`: titles and captions, FFmpeg's own `drawtext` raster blended here ([`crate::text`]);
+    /// * `motion`, `fades`, `transitions`, `dip_white`: fades, dips, dissolves, slides and pushes, in
+    ///   still plans and in export frames (`tests/motion_parity.rs`);
+    /// * `keyed_zoom`: a moving zoom drawn last, as FFmpeg's chain has it;
+    /// * `mask`, and the blur, sharpen, grayscale and invert `effects`.
+    ///
+    /// A vignette, a chroma key and the combinations the plan names (`Unsupported`) stay FFmpeg's.
+    /// Each later pass flips its bit beside the pass and its parity cases.
     pub fn caps(&self) -> GpuCaps {
         Self::CAPS
     }

@@ -214,11 +214,10 @@
   `Placement::keyframed` carries that (`Keyed::all(rotates)` is the legacy bundle), a colour-only clip is
   placed as a static one, and the sweep holds origin, zoom, turn, opacity and grade of the new cuts to the
   evaluated graph.
-  **What the compositor may draw is data**: `GpuCaps` (`Compositor::caps()`, today
-  `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `mask` and the
-  blur / sharpen / grayscale / invert `effects`: `motion`, `fades`, `transitions`,
-  `dip_white`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`,
-  `text`, `reframe`, `hdr` and an `EffectKinds` bitset), and **`RenderPlan::reasons(&caps,
+  **What the compositor may draw is data**: `GpuCaps` (`Compositor::caps()`: the bits `motion`, `fades`,
+  `transitions`, `dip_white`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`, `text`, `reframe`, `hdr` and an
+  `EffectKinds` bitset; today `GpuCaps::A0` plus every one of them but `keyed_opacity`, `keyed_color`, `reframe`, `hdr`
+  and the vignette / chroma-key kinds), and **`RenderPlan::reasons(&caps,
   size)` is a pure function of the plan's fields** returning `Unsupported` values whose
   `Display` is the message the plan has always given — nothing is decided while planning,
   so one plan answers for any caps and an A5 pass is a flip beside the pass and its parity

@@ -1,5 +1,6 @@
 //! Ports of the FFmpeg filters behind Kerf's video effects, as scalar references and the
-//! parameters the shaders take (`shaders/effects.wgsl`).
+//! parameters the shaders take (`shaders/planeops.wgsl`: tables and `unsharp`; `shaders/blur.wgsl` and
+//! `blur_out.wgsl`: `gblur`).
 //!
 //! * **blur** is `gblur` (`vf_gblur.c`): a first-order recursive (IIR) Gaussian, run rightwards then
 //!   leftwards along every row and downwards then upwards along every column, on each plane in

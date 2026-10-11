@@ -44,7 +44,9 @@ fn fs_lut(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     return out_byte(byte(textureLoad(aux, vec2<i32>(v, p.row), 0).r));
 }
 
-// `vf_fade.c`: the factor is `UINT16_MAX * i / N`; 65535 means the filter does not run.
+// `vf_fade.c`: the factor is `UINT16_MAX * i / N`; 65535 means the filter does not run. (The same
+// arithmetic as `fade_luma` / `fade_chroma` in composite.wgsl, which read their black level from
+// another uniform: two copies, both held to the filter by the Motion parity cases.)
 fn fade_luma(y: i32, f: u32) -> i32 {
     let bl = i32(p.black);
     return clamp((((y - bl) * i32(f)) + (bl << 16u) + 32768) >> 16u, 0, 255);
