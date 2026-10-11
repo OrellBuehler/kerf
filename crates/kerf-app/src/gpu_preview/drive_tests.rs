@@ -60,14 +60,19 @@ pub(super) fn passing() -> SelfTestReport {
     }
 }
 
-/// Two short all-intra clips, made once.
+/// Two short all-intra clips, made once per machine (a part file under this process's name, then a
+/// rename, so processes running together do not read one another's half).
 pub(super) fn media() -> &'static [PathBuf; 2] {
     static MEDIA: OnceLock<[PathBuf; 2]> = OnceLock::new();
     MEDIA.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("kerf-app-drive-{}", std::process::id()));
+        let dir = std::env::temp_dir().join("kerf-app-drive-media-v1");
         std::fs::create_dir_all(&dir).unwrap();
         let make = |name: &str, lavfi: &str| -> PathBuf {
             let path = dir.join(name);
+            if path.exists() {
+                return path;
+            }
+            let part = dir.join(format!("part-{}-{name}", std::process::id()));
             let out = kerf_core::ffmpeg_command()
                 .args([
                     "-hide_banner",
@@ -81,10 +86,11 @@ pub(super) fn media() -> &'static [PathBuf; 2] {
                     lavfi,
                 ])
                 .args(["-c:v", "ffv1", "-pix_fmt", "yuv420p"])
-                .arg(&path)
+                .arg(&part)
                 .output()
                 .expect("run ffmpeg");
             assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            std::fs::rename(&part, &path).unwrap();
             path
         };
         [
