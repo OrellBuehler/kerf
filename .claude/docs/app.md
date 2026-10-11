@@ -212,7 +212,14 @@ the first frame that wants them and dropped together (`Backend`); a build failur
 remembered with a backoff (5 s doubling to 5 min, `Backoff`), a `DeviceLost` or any error
 that says the device or surface is gone (`react`) drops the backend and rebuilds it on the
 next use — the first loss at once, as `kerf-gpu` documents: the owner builds a new `Gpu` —
-and a refused plan, a busy decode or an occluded window is only that frame's fallback. **Nothing
+and a refused plan, a busy decode or an occluded window is only that frame's fallback. **A frame that was
+presented asks the frame source for the clips past the next cut** (`prefetch_ahead`): the clips of video
+tracks that render and start within 2 s of the playhead (`upcoming_clip_starts`, at most 3, each moment
+once) are planned at their start and their layers handed to `FrameSource::frames(.., Hint::Prefetch)` on a
+thread of its own (one at a time, the same clips not again within a second, after the render lock is
+released), so a run is waiting and the file's two probes are done when the playhead crosses the cut
+instead of the first frame there costing a process start. It never takes a run another layer is reading
+and a failure is nothing: the frame is decoded when asked. **Nothing
 here may freeze the preview**: a backend is built **off the render lock** and with a deadline
 (`BUILD_DEADLINE`, 10 s, on a thread of its own; a frame that finds a build under way is the
 JPEG at once, "the GPU preview is starting", and one that outlives the deadline is left to finish

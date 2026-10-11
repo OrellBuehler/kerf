@@ -47,7 +47,8 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use kerf_core::{
-    composite_color_policy, Asset, CompositeColorPolicy, ExportOptions, PlanRequest, Planner, Project, ProxyMedia, Timeline,
+    composite_color_policy, Asset, CompositeColorPolicy, ExportOptions, PlanLayer, PlanRequest, Planner, Project, ProxyMedia,
+    ScrubConfig, ScrubFrames, StreamKind, Timeline,
 };
 use kerf_gpu::{Compositor, FrameSource, FrameSourceConfig, Gpu, GpuError, GpuOptions, Hint, PixelRect, Presenter, Surround};
 use serde::{Deserialize, Serialize};
@@ -541,6 +542,40 @@ impl Host {
     }
 }
 
+/// How far past the playhead, in seconds, the clips whose first frames are prefetched start.
+const PREFETCH_HORIZON: f64 = 2.0;
+
+/// How many upcoming clips are prefetched at a time.
+const PREFETCH_CLIPS: usize = 3;
+
+/// The same clips are not asked for again within this long.
+const PREFETCH_REPEAT: Duration = Duration::from_secs(1);
+
+/// The times, in `(t, t + horizon]`, at which a clip of the cut starts on a video track that
+/// renders: the moments a cut brings a frame the decoders have not been reading, nearest first, at
+/// most `limit`, each once (two tracks starting together are one moment). Muted and solo-shadowed
+/// tracks and disabled clips are not the picture.
+pub fn upcoming_clip_starts(timeline: &Timeline, t: f64, horizon: f64, limit: usize) -> Vec<f64> {
+    if !t.is_finite() || !horizon.is_finite() || horizon <= 0.0 {
+        return Vec::new();
+    }
+    let mut starts: Vec<f64> = timeline
+        .tracks
+        .iter()
+        .filter(|track| track.kind == StreamKind::Video && timeline.track_renders(track))
+        .flat_map(|track| track.clips.iter())
+        .filter(|clip| clip.enabled)
+        .map(|clip| clip.timeline_start)
+        // Strictly past `t`, by a thousandth of a frame at 30 fps: the clip already on screen is
+        // being read, and the frame at its first instant is not "upcoming".
+        .filter(|&start| start > t + 1e-5 && start <= t + horizon)
+        .collect();
+    starts.sort_by(f64::total_cmp);
+    starts.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+    starts.truncate(limit);
+    starts
+}
+
 /// Everything a GPU frame needs, built together and dropped together.
 struct Backend {
     // Field order is drop order: the presenter (and its surface) go before the window host.
@@ -722,6 +757,12 @@ pub struct GpuPreview {
     build_deadline: Duration,
     /// The crash marker's path (the app's config directory), when there is one.
     marker: Option<PathBuf>,
+    /// Where the JPEG route gets its frames: the cache the Preview's other route reads.
+    scrub: Arc<ScrubFrames>,
+    /// What the frame source was last asked to have ready for the clips past a cut, and when.
+    prefetched: Mutex<(Vec<u64>, Option<Instant>)>,
+    /// A prefetch is under way: the next is not started on top of it.
+    prefetching: Arc<AtomicBool>,
     bounds: Mutex<BoundsState>,
     /// The live host, outside the render lock so hiding the surface never waits for a render.
     host: Mutex<Option<Arc<Mutex<Host>>>>,
@@ -732,7 +773,7 @@ pub struct GpuPreview {
 
 impl GpuPreview {
     /// The app's: `app`'s main window is the host. `crashed` is [`take_crash_marker_in`]'s answer.
-    pub fn for_app(app: tauri::AppHandle, crashed: bool) -> Self {
+    pub fn for_app(app: tauri::AppHandle, crashed: bool, scrub: Arc<ScrubFrames>) -> Self {
         use tauri::Manager as _;
 
         let choice = std::env::var("KERF_GPU_SURFACE").ok();
@@ -741,6 +782,7 @@ impl GpuPreview {
             resolve_technique(std::env::consts::OS, choice.as_deref()),
             Arc::new(move |technique| build_backend(&app, technique)),
         );
+        preview.scrub = scrub;
         preview.marker = marker;
         if crashed {
             lock(&preview.info).reason = Some(CRASH_NOTE.into());
@@ -753,6 +795,9 @@ impl GpuPreview {
             policy: composite_color_policy,
             build_deadline: BUILD_DEADLINE,
             marker: None,
+            scrub: Arc::new(ScrubFrames::new(ScrubConfig::default())),
+            prefetched: Mutex::new((Vec::new(), None)),
+            prefetching: Arc::new(AtomicBool::new(false)),
             enabled: AtomicBool::new(false),
             reset_backoff: AtomicBool::new(false),
             info: Mutex::new(Info {
@@ -931,9 +976,11 @@ impl GpuPreview {
             Err(payload) => vec![self.after_panic(payload.as_ref())],
         };
         tracing::debug!(?reasons, t, "preview frame through FFmpeg");
-        let jpeg = Project::composite_timeline_frame(&inputs.timeline, &inputs.preview_assets, t, ffmpeg_width, 4)
+        let jpeg = self
+            .scrub
+            .frame(&inputs.timeline, &inputs.preview_assets, t, ffmpeg_width, 4)
             .map_err(|e| e.to_string())?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg.as_slice());
         Ok(PreviewFrameResult {
             renderer: "ffmpeg",
             frame: Some(format!("data:image/jpeg;base64,{b64}")),
@@ -953,6 +1000,47 @@ impl GpuPreview {
             self.drop_backend(&why, false, Instant::now());
         }));
         why
+    }
+
+    /// Have the frame source ready for the clips that start within [`PREFETCH_HORIZON`] seconds past
+    /// `t`: their first frames are asked for with [`Hint::Prefetch`], so a run is waiting (and the
+    /// file's probes are done) by the time the playhead crosses the cut, instead of the first frame
+    /// there costing a process start. Called after a frame was shown, with the render lock released;
+    /// the asking is on a thread of its own (the probes block), at most one at a time, and not again
+    /// for the same clips within a second. It never takes a run another layer is reading (a spare
+    /// slot, `Hint::Prefetch`), and a failure to prefetch is nothing: the frame is decoded when asked.
+    fn prefetch_ahead(&self, planner: &Planner, timeline: &Timeline, t: f64, _size: (u32, u32), source: Arc<FrameSource>) {
+        let starts = upcoming_clip_starts(timeline, t, PREFETCH_HORIZON, PREFETCH_CLIPS);
+        if starts.is_empty() {
+            return;
+        }
+        {
+            let key: Vec<u64> = starts.iter().map(|s| s.to_bits()).collect();
+            let mut last = lock(&self.prefetched);
+            if last.0 == key && last.1.is_some_and(|at| at.elapsed() < PREFETCH_REPEAT) {
+                return;
+            }
+            *last = (key, Some(Instant::now()));
+        }
+        let layers: Vec<PlanLayer> = starts
+            .iter()
+            .filter_map(|&start| planner.at(start).ok())
+            .flat_map(|plan| plan.layers)
+            .collect();
+        if layers.is_empty() || self.prefetching.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let flag = Arc::clone(&self.prefetching);
+        let spawned = std::thread::Builder::new().name("kerf-gpu-prefetch".into()).spawn(move || {
+            // `Hint::Prefetch` returns nothing for every layer; an error is only a layer not ready.
+            if let Err(error) = source.frames(&layers, Hint::Prefetch) {
+                tracing::debug!(%error, "prefetching the next clip");
+            }
+            flag.store(false, Ordering::SeqCst);
+        });
+        if spawned.is_err() {
+            self.prefetching.store(false, Ordering::SeqCst);
+        }
     }
 
     /// Drop the backend, remember why, and wait before building another (`immediate`: a device that
@@ -999,14 +1087,16 @@ impl GpuPreview {
         }
 
         // The plan, off the project lock.
-        let plan = match Planner::new(
+        let planner = match Planner::new(
             &inputs.timeline,
             &inputs.assets,
             &ExportOptions::default(),
             PlanRequest::still((self.policy)()).with_media(&ProxyMedia),
-        )
-        .and_then(|planner| planner.at(t))
-        {
+        ) {
+            Ok(planner) => planner,
+            Err(e) => return fallback(format!("no plan for this frame: {e}")),
+        };
+        let plan = match planner.at(t) {
             Ok(plan) => plan,
             Err(e) => return fallback(format!("no plan for this frame: {e}")),
         };
@@ -1027,6 +1117,7 @@ impl GpuPreview {
             return fallback("the GPU preview is not up".into());
         };
         let host = Arc::clone(&backend.host);
+        let source = Arc::clone(&backend.source);
 
         // A child window's surface is the frame itself; the window's covers the window.
         let window_size = match technique {
@@ -1100,6 +1191,8 @@ impl GpuPreview {
                     self.clear_marker();
                 }
                 tracing::debug!(?timings, t, "GPU preview frame presented");
+                drop(state);
+                self.prefetch_ahead(&planner, &inputs.timeline, t, size, source);
                 Attempt::Presented(timings)
             }
             Ok(None) => {
@@ -1296,6 +1389,95 @@ mod tests {
 
     fn rect(x: u32, y: u32, width: u32, height: u32) -> PixelRect {
         PixelRect { x, y, width, height }
+    }
+
+    fn cut(tracks: Vec<(StreamKind, &str, Vec<f64>)>) -> Timeline {
+        Timeline {
+            tracks: tracks
+                .into_iter()
+                .map(|(kind, name, starts)| kerf_core::Track {
+                    clips: starts
+                        .into_iter()
+                        .map(|s| kerf_core::Clip::new(uuid::Uuid::nil(), 0.0, 1.0, s))
+                        .collect(),
+                    ..kerf_core::Track::new(kind, name.to_string())
+                })
+                .collect(),
+            overlays: Vec::new(),
+            markers: Vec::new(),
+            format: None,
+            master: Default::default(),
+        }
+    }
+
+    #[test]
+    fn the_clips_that_start_within_the_horizon_are_the_upcoming_ones_nearest_first() {
+        let tl = cut(vec![(StreamKind::Video, "V1", vec![0.0, 1.0, 2.0, 3.5, 6.0])]);
+        assert_eq!(upcoming_clip_starts(&tl, 0.5, 2.0, 3), vec![1.0, 2.0]);
+        assert_eq!(upcoming_clip_starts(&tl, 0.5, 4.0, 3), vec![1.0, 2.0, 3.5]);
+        assert_eq!(
+            upcoming_clip_starts(&tl, 0.5, 6.0, 2),
+            vec![1.0, 2.0],
+            "at most the limit, the nearest"
+        );
+        assert_eq!(
+            upcoming_clip_starts(&tl, 6.5, 2.0, 3),
+            Vec::<f64>::new(),
+            "none past the last"
+        );
+    }
+
+    #[test]
+    fn the_clip_on_screen_and_the_cut_under_the_playhead_are_not_upcoming() {
+        let tl = cut(vec![(StreamKind::Video, "V1", vec![0.0, 1.0, 2.0])]);
+        // At the very frame a clip starts, it is the one being read.
+        assert_eq!(upcoming_clip_starts(&tl, 1.0, 2.0, 3), vec![2.0]);
+        assert_eq!(
+            upcoming_clip_starts(&tl, 1.0 - 1e-7, 2.0, 3),
+            vec![2.0],
+            "a hair before is the same frame"
+        );
+        assert_eq!(
+            upcoming_clip_starts(&tl, 0.9, 0.05, 3),
+            Vec::<f64>::new(),
+            "and the horizon is a horizon"
+        );
+    }
+
+    #[test]
+    fn tracks_that_do_not_render_and_clips_that_are_off_are_not_upcoming() {
+        let mut tl = cut(vec![
+            (StreamKind::Video, "V1", vec![1.0, 3.0]),
+            (StreamKind::Audio, "A1", vec![1.5]),
+            (StreamKind::Video, "V2", vec![2.0]),
+        ]);
+        assert_eq!(
+            upcoming_clip_starts(&tl, 0.0, 4.0, 5),
+            vec![1.0, 2.0, 3.0],
+            "audio is not a picture"
+        );
+        tl.tracks[2].muted = true;
+        assert_eq!(upcoming_clip_starts(&tl, 0.0, 4.0, 5), vec![1.0, 3.0]);
+        tl.tracks[0].clips[1].enabled = false;
+        assert_eq!(upcoming_clip_starts(&tl, 0.0, 4.0, 5), vec![1.0]);
+    }
+
+    #[test]
+    fn clips_on_two_tracks_that_start_together_are_one_moment() {
+        let tl = cut(vec![
+            (StreamKind::Video, "V1", vec![1.0]),
+            (StreamKind::Video, "V2", vec![1.0]),
+        ]);
+        assert_eq!(upcoming_clip_starts(&tl, 0.0, 2.0, 5), vec![1.0]);
+    }
+
+    #[test]
+    fn a_time_that_is_not_a_time_has_nothing_upcoming() {
+        let tl = cut(vec![(StreamKind::Video, "V1", vec![1.0])]);
+        assert!(upcoming_clip_starts(&tl, f64::NAN, 2.0, 3).is_empty());
+        assert!(upcoming_clip_starts(&tl, 0.0, f64::NAN, 3).is_empty());
+        assert!(upcoming_clip_starts(&tl, 0.0, 0.0, 3).is_empty());
+        assert!(upcoming_clip_starts(&tl, 0.0, -1.0, 3).is_empty());
     }
 
     fn report() -> BoundsReport {

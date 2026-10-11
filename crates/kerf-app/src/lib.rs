@@ -3323,7 +3323,7 @@ pub fn run() {
             let stored = settings::load(app.handle());
             settings::apply(&stored);
             // The GPU preview builds nothing until a frame wants it; this is only the setting.
-            let gpu = Arc::new(gpu_preview::GpuPreview::for_app(app.handle().clone(), crashed));
+            let gpu = Arc::new(gpu_preview::GpuPreview::for_app(app.handle().clone(), crashed, scrub));
             gpu.set_enabled(stored.gpu_preview);
             app.manage(gpu);
             tracing::info!(
