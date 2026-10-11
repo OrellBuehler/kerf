@@ -136,6 +136,51 @@ describe('SliderRow', () => {
 		expect(row).toContain('oncommit={commit}');
 	});
 
+	/** The text of every `{@render rangeRow(…)}` / `{@render numRow(…)}` call, to its closing brace. */
+	function calls(source: string, name: string): string[] {
+		const out: string[] = [];
+		for (let at = source.indexOf(`{@render ${name}(`); at >= 0; at = source.indexOf(`{@render ${name}(`, at + 1)) {
+			let depth = 0;
+			let end = at;
+			for (; end < source.length; end++) {
+				if (source[end] === '{') depth++;
+				else if (source[end] === '}' && --depth === 0) break;
+			}
+			out.push(source.slice(at, end + 1));
+		}
+		return out;
+	}
+
+	test('a write goes to what the edit began on: no row reads the selection when it ends', () => {
+		// The click that selects another clip also blurs the field, and a typed entry is written on that blur.
+		for (const name of ['rangeRow', 'numRow']) {
+			const found = calls(inspector, name);
+			expect(found.length, name).toBeGreaterThan(3);
+			for (const call of found) {
+				// What a row hands back is the `at` it was given, never the selection as it is by then.
+				const from = call.search(/\(v, at\) =>|setGain/);
+				expect(from, call.slice(0, 60)).toBeGreaterThan(0);
+				expect(call.slice(from), call.slice(0, 60)).not.toMatch(/\bclip[.!]|\bo\.id|ui\.time|selectedClip|\boverlay\b/);
+			}
+		}
+		expect(inspector).toContain('{scope}');
+		expect(inspector).toContain('began.get(e.currentTarget) ?? scope');
+		expect(row).toContain('pending.end(');
+		expect(row).toContain('onCommit(v, at)');
+		expect(row).toContain('generics="S');
+	});
+
+	test('a row reads the clip it was told, and keys at the playhead it was told', () => {
+		for (const helper of ['setTf', 'setCol', 'setGain', 'setCam', 'patchMask', 'setFade', 'moveTitle'])
+			expect(inspector, helper).toMatch(new RegExp(`(function ${helper}|const ${helper} = )\\(?[^)]*at: Edit`));
+		expect(inspector).toMatch(/function keyAtPlayhead\([^)]*playhead: number = ui\.time\)/);
+	});
+
+	test('the rest values are the model’s defaults, not copies of them', () => {
+		for (const name of ['DEFAULT_TRANSFORM', 'DEFAULT_COLOR', 'DEFAULT_REFRAME', 'DEFAULT_MASK'])
+			expect(inspector, name).toMatch(new RegExp(`neutral: ${name}\\.`));
+	});
+
 	test('the dialogs’ slider rows are the same component', () => {
 		expect(read(`${EDITOR}VoiceoverDialog.svelte`)).toContain('<SliderRow');
 		expect(read(`${EDITOR}ExportDialog.svelte`)).toContain('<SliderRow');

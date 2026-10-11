@@ -19,6 +19,6 @@
 	summary::marker { color: var(--text-muted); font-size: 11px; }
 	summary:hover { color: var(--text-primary); }
 	.title { font-weight: 600; }
-	.value { float: right; max-width: 48%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 400; color: var(--text-muted); }
+	.value { float: right; max-width: 64%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 400; color: var(--text-muted); }
 	.content { padding-bottom: 6px; }
 </style>

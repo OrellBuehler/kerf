@@ -31,7 +31,31 @@ export interface RowSpec {
 export const PERCENT = { scale: 100, digits: 0, unit: '%' } as const;
 export const DEGREES = { digits: 0, unit: '°' } as const;
 export const TIMES = { digits: 2, unit: '×' } as const;
-export const SECONDS = { digits: 1, unit: 's' } as const;
+export const SECONDS = { digits: 2, unit: 's' } as const;
+
+/** What an edit was on when it began, held until it ends, so a write lands where the edit was
+ *  started even when the selection has moved on in between: a typed entry that is written by the
+ *  very click that selects another clip, a run of arrow keys written when focus leaves. */
+export class Pending<S> {
+	#began: { scope: S; value: number } | null = null;
+
+	/** Note what the edit is on, unless one is already under way. */
+	begin(scope: S, value: number): void {
+		this.#began ??= { scope, value };
+	}
+
+	/** What the edit began on, or `now` when it did not begin anywhere (a double-click); ends it. */
+	end(now: { scope: S; value: number }): { scope: S; value: number } {
+		const began = this.#began ?? now;
+		this.#began = null;
+		return began;
+	}
+
+	/** The edit was given up. */
+	drop(): void {
+		this.#began = null;
+	}
+}
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
@@ -83,15 +107,16 @@ export function tickPos(s: RowSpec): number | null {
 	return p > 1e-6 && p < 1 - 1e-6 ? p : null;
 }
 
-/** The value a double-click puts the row back to, or `null` when there is none or it is already there. */
+/** The value a double-click puts the row back to, or `null` when there is none or it is already exactly there. */
 export function resetTo(v: number, s: RowSpec): number | null {
 	const n = neutralOf(s);
 	if (n === null) return null;
-	return same(v, n, s) ? null : n;
+	return same(v, n) ? null : n;
 }
 
-/** Two values are the same for the row when they read the same. */
-const same = (a: number, b: number, s: RowSpec): boolean => display(a, s) === display(b, s);
+/** Two values are the same when they are, give or take float noise: not when they read the same,
+ *  or a 0.4° rotation (which reads 0°) could neither be reset nor typed back to 0. */
+const same = (a: number, b: number): boolean => Math.abs(a - b) < 1e-9;
 
 const display = (v: number, s: RowSpec): number => {
 	const d = s.digits ?? 2;
@@ -132,7 +157,7 @@ export type Entry = { kind: 'commit'; value: number } | { kind: 'revert' };
 
 export function entryFor(text: string, current: number, s: RowSpec): Entry {
 	const v = parseEntry(text, s);
-	if (v === null || same(v, current, s)) return { kind: 'revert' };
+	if (v === null || same(v, current)) return { kind: 'revert' };
 	return { kind: 'commit', value: v };
 }
 

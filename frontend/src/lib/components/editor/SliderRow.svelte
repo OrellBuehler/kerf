@@ -1,4 +1,4 @@
-<script lang="ts">
+<script lang="ts" generics="S = undefined">
 	// One numeric property: a label, a slider, a number field and a slot for the keyframe button,
 	// on one grid, so every slider in a panel starts and ends at the same place whether or not it
 	// can be animated (the slot is kept even when it is empty). The slider is `MixSlider`'s, so a
@@ -6,7 +6,9 @@
 	// one edit, and a double-click puts the property back to its rest value; the rest value is a tick
 	// on the travel, and a property that goes both ways fills from it. The number is a field: click it,
 	// type a value (not held to the slider's step), Enter or leave to write it, Escape to put it back.
-	// The numbers are `slider-row.ts`'s, which has the tests.
+	// What a write goes to is what the edit *began* on (`scope`, read when a drag, a run of keys or a typed
+	// entry starts), not what is selected when it ends: the click that selects another clip also
+	// blurs the field, and the entry is written on that blur. The numbers are `slider-row.ts`'s, which has the tests.
 	import type { Snippet } from 'svelte';
 	import MixSlider from './MixSlider.svelte';
 	import {
@@ -14,6 +16,8 @@
 		entryFor,
 		fillOrigin,
 		fromPos,
+		neutralOf,
+		Pending,
 		readout,
 		resetTo,
 		stepBy,
@@ -30,6 +34,7 @@
 		labelWidth = 72,
 		reserve = true,
 		keyframe = undefined,
+		scope = undefined,
 		onCommit
 	}: {
 		label: string;
@@ -42,33 +47,42 @@
 		/** Keep the keyframe slot's 24 px when there is no keyframe button, so the rows of a panel line up. */
 		reserve?: boolean;
 		keyframe?: Snippet;
-		/** The value a gesture ended on, or a typed entry, or the rest value: write it. One call per gesture. */
-		onCommit: (v: number) => unknown;
+		/** What the row is editing — a clip, a playhead time — as it is now. Handed back, as it was when the
+		 *  edit began, with the value to write. */
+		scope?: S;
+		/** The value a gesture ended on, or a typed entry, or the rest value: write it, to `scope`. One call per gesture. */
+		onCommit: (v: number, scope: S) => unknown;
 	} = $props();
 
 	let preview = $state<number | null>(null);
 	const shown = $derived(preview ?? value);
+	const pending = new Pending<S>();
+	const now = () => ({ scope: scope as S, value });
 
 	function move(v: number) {
+		pending.begin(scope as S, value);
 		preview = v;
 	}
 	/** The slider keeps showing where it was let go until the write has landed, so it does not
 	 *  jump back to the old value for the length of a round trip. */
-	async function commit(v: number) {
+	async function write(v: number, at: S) {
 		preview = v;
 		try {
-			await onCommit(v);
+			await onCommit(v, at);
 		} finally {
 			preview = null;
 		}
 	}
+	const commit = (v: number) => write(v, pending.end(now()).scope);
 	function cancel() {
+		pending.drop();
 		preview = null;
 	}
 	function reset() {
+		pending.drop();
 		preview = null;
 		const to = resetTo(value, spec);
-		if (to !== null) void commit(to);
+		if (to !== null) void write(to, scope as S);
 	}
 
 	let editing = $state(false);
@@ -78,15 +92,17 @@
 	function enter(e: FocusEvent & { currentTarget: HTMLInputElement }) {
 		editing = true;
 		dirty = false;
+		pending.begin(scope as S, value);
 		text = editable(shown, spec);
 		e.currentTarget.value = text;
 		e.currentTarget.select();
 	}
 	function leave(e: FocusEvent & { currentTarget: HTMLInputElement }) {
 		editing = false;
-		const entry = dirty ? entryFor(e.currentTarget.value, value, spec) : ({ kind: 'revert' } as const);
+		const from = pending.end(now());
+		const entry = dirty ? entryFor(e.currentTarget.value, from.value, spec) : ({ kind: 'revert' } as const);
 		dirty = false;
-		if (entry.kind === 'commit') void commit(entry.value);
+		if (entry.kind === 'commit') void write(entry.value, from.scope);
 	}
 	function typed(e: KeyboardEvent & { currentTarget: HTMLInputElement }) {
 		if (e.key === 'Enter') {
@@ -112,7 +128,7 @@
 		step={(v, key) => stepBy(v, key, spec)}
 		{label}
 		valueText={(v) => readout(v, spec)}
-		tip="{label} {readout(shown, spec)} — drag the handle, or use the arrow keys; double-click to reset"
+		tip="{label} {readout(shown, spec)} — drag the handle, or use the arrow keys{neutralOf(spec) === null ? '' : '; double-click to reset'}"
 		detent={tickPos(spec)}
 		fillFrom={fillOrigin(spec)}
 		accent="var(--kerf-500)"

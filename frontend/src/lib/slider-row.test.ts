@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
 	DEGREES,
+	Pending,
 	PERCENT,
 	SECONDS,
 	TIMES,
@@ -29,7 +30,7 @@ const ROTATION: RowSpec = { min: -180, max: 180, step: 1, digits: 0, unit: '°' 
 const CROP: RowSpec = { min: 0, max: 0.9, step: 0.01, neutral: 0 };
 const OPACITY: RowSpec = { min: 0, max: 1, step: 0.05, neutral: 1, scale: 100, digits: 0, unit: '%' };
 const CENTRE: RowSpec = { min: 0, max: 1, step: 0.01, neutral: 0.5, bipolar: true };
-const FADE: RowSpec = { min: 0, max: 5, step: 0.1, neutral: 0, digits: 1, unit: 's', limit: { max: 12.5 } };
+const FADE: RowSpec = { min: 0, max: 5, step: 0.1, neutral: 0, ...SECONDS, limit: { max: 12.5 } };
 
 describe('toPos / fromPos', () => {
 	test('a value is its place on the travel, held to it', () => {
@@ -107,9 +108,15 @@ describe('reset', () => {
 	test('is nothing when the row is already there, so a double-click writes no edit', () => {
 		expect(resetTo(0, POS_X)).toBeNull();
 		expect(resetTo(1, CONTRAST)).toBeNull();
-		// 99.6 % reads as 100 %.
-		expect(resetTo(0.996, SCALE)).toBeNull();
 		expect(resetTo(0.9, SCALE)).toBe(1);
+		// Float noise from a drag is not a difference.
+		expect(resetTo(0.1 + 0.2 - 0.3, POS_X)).toBeNull();
+	});
+
+	test('puts back a value that only reads like the rest: 0.4° shows as 0° and is not 0', () => {
+		expect(resetTo(0.4, ROTATION)).toBe(0);
+		expect(resetTo(0.996, SCALE)).toBe(1);
+		expect(resetTo(1.004, CONTRAST)).toBe(1);
 	});
 
 	test('is nothing when the row has no rest to go back to', () => {
@@ -124,7 +131,7 @@ describe('readout', () => {
 		expect(readout(0.55, SCALE)).toBe('55%');
 		expect(readout(1, RATE)).toBe('1.00×');
 		expect(readout(45.4, ROTATION)).toBe('45°');
-		expect(readout(1.25, FADE)).toBe('1.3s');
+		expect(readout(1.25, FADE)).toBe('1.25s');
 	});
 
 	test('never shows a negative zero', () => {
@@ -149,6 +156,11 @@ describe('parseEntry', () => {
 		expect(parseEntry('-30°', ROTATION)).toBe(-30);
 		expect(parseEntry('+0.25', POS_X)).toBe(0.25);
 		expect(parseEntry('.5', CENTRE)).toBe(0.5);
+	});
+
+	test('a fade can be a quarter second or a few frames: two digits, not one', () => {
+		expect(parseEntry('0.25', FADE)).toBe(0.25);
+		expect(parseEntry('0.04', FADE)).toBe(0.04);
 	});
 
 	test('is not held to the slider step, only to the digits shown', () => {
@@ -179,10 +191,14 @@ describe('entryFor', () => {
 		expect(entryFor('30', 0.5, SCALE)).toEqual({ kind: 'commit', value: 0.3 });
 	});
 
-	test('the number it already shows puts the field back and writes nothing', () => {
+	test('the number it already has puts the field back and writes nothing', () => {
 		expect(entryFor('1.00', 1, RATE)).toEqual({ kind: 'revert' });
 		expect(entryFor('100%', 1, SCALE)).toEqual({ kind: 'revert' });
-		expect(entryFor('100', 0.996, SCALE)).toEqual({ kind: 'revert' });
+	});
+
+	test('a number that only reads like the one it has is still a change', () => {
+		expect(entryFor('100', 0.996, SCALE)).toEqual({ kind: 'commit', value: 1 });
+		expect(entryFor('0', 0.4, ROTATION)).toEqual({ kind: 'commit', value: 0 });
 	});
 
 	test('so does text that is not a number', () => {
@@ -229,6 +245,48 @@ describe('the unit presets', () => {
 		expect(readout(0.55, { min: 0, max: 1, step: 0.05, ...PERCENT })).toBe('55%');
 		expect(readout(12.6, { min: -180, max: 180, step: 1, ...DEGREES })).toBe('13°');
 		expect(readout(0.5, { min: 0.25, max: 4, step: 0.25, ...TIMES })).toBe('0.50×');
-		expect(readout(0.5, { min: 0, max: 5, step: 0.1, ...SECONDS })).toBe('0.5s');
+		expect(readout(0.5, { min: 0, max: 5, step: 0.1, ...SECONDS })).toBe('0.50s');
+	});
+});
+
+describe('Pending', () => {
+	const A = { scope: 'clip A', value: 1 };
+	const B = { scope: 'clip B', value: 2 };
+
+	test('an edit ends on what it began on, not on what is selected by then', () => {
+		const edit = new Pending<string>();
+		edit.begin(A.scope, A.value);
+		expect(edit.end(B)).toEqual(A);
+	});
+
+	test('with no beginning it ends where it is: a double-click is its own whole gesture', () => {
+		expect(new Pending<string>().end(B)).toEqual(B);
+	});
+
+	test('the first beginning stands: a drag does not move the target it started on', () => {
+		const edit = new Pending<string>();
+		edit.begin(A.scope, A.value);
+		edit.begin(B.scope, B.value);
+		expect(edit.end(B)).toEqual(A);
+	});
+
+	test('it ends once: the next edit begins afresh', () => {
+		const edit = new Pending<string>();
+		edit.begin(A.scope, A.value);
+		edit.end(A);
+		expect(edit.end(B)).toEqual(B);
+	});
+
+	test('a given-up edit leaves nothing behind', () => {
+		const edit = new Pending<string>();
+		edit.begin(A.scope, A.value);
+		edit.drop();
+		expect(edit.end(B)).toEqual(B);
+	});
+
+	test('a clip and a playhead time travel together', () => {
+		const edit = new Pending<{ clip: string; time: number }>();
+		edit.begin({ clip: 'c1', time: 1.5 }, 0.4);
+		expect(edit.end({ scope: { clip: 'c2', time: 9 }, value: 1 })).toEqual({ scope: { clip: 'c1', time: 1.5 }, value: 0.4 });
 	});
 });

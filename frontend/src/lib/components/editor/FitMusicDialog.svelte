@@ -202,7 +202,7 @@
 		<div style="padding:12px 16px">
 			<div style="display:flex;align-items:center;gap:8px">
 				<div style="flex:1"></div>
-				<Btn variant="ghost" size="md" onclick={onClose}>Cancel</Btn>
+				<Btn variant="ghost" size="md" disabled={applying} onclick={onClose}>Cancel</Btn>
 				<Btn variant="primary" size="md" icon="music" data-rescue disabled={!canApply} onclick={apply}>Fit music</Btn>
 			</div>
 		</div>
