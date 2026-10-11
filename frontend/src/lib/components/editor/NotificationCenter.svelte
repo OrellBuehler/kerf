@@ -89,7 +89,7 @@
 				onclick={() => notifications.markAllRead()}
 				disabled={notifications.unread === 0}
 				use:tip={'Mark every notification as read'}
-				style="height:22px;padding:0 8px;border-radius:var(--radius-full);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:{notifications.unread
+				style="height:22px;padding:0 8px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:{notifications.unread
 					? 'var(--text-secondary)'
 					: 'var(--text-disabled)'};font-size:11px;opacity:1;cursor:{notifications.unread ? 'pointer' : 'default'}"
 				>Mark all read</button
@@ -98,7 +98,7 @@
 				onclick={() => notifications.clear()}
 				disabled={notifications.items.length === 0}
 				use:tip={'Clear the log'}
-				style="height:22px;padding:0 8px;border-radius:var(--radius-full);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:{notifications
+				style="height:22px;padding:0 8px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:{notifications
 					.items.length
 					? 'var(--text-secondary)'
 					: 'var(--text-disabled)'};font-size:11px;opacity:1;cursor:{notifications.items.length ? 'pointer' : 'default'}"
@@ -110,7 +110,7 @@
 			{#each [['all', 'All'], ['unread', 'Unread'], ['errors', 'Problems']] as const as [k, label] (k)}
 				<button
 					onclick={() => (filter = k)}
-					style="height:22px;padding:0 9px;border-radius:var(--radius-full);font-size:11px;cursor:pointer;border:var(--line-width) solid {filter ===
+					style="height:22px;padding:0 9px;border-radius:var(--radius-sm);font-size:11px;cursor:pointer;border:var(--line-width) solid {filter ===
 					k
 						? 'var(--border-strong)'
 						: 'transparent'};background:{filter === k ? 'var(--surface-active)' : 'transparent'};color:{filter === k

@@ -596,7 +596,7 @@
 			<div style="flex:1"></div>
 			<button
 				onclick={() => editor.exitStagedPreview()}
-				style="height:22px;padding:0 9px;border-radius:var(--radius-full);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);font-size:11px;cursor:pointer"
+				style="height:24px;padding:0 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);font-size:11px;cursor:pointer"
 				>Exit preview</button
 			>
 		</div>
@@ -612,7 +612,7 @@
 			<span style="flex:1;min-width:0">{editor.error}</span>
 			<button
 				onclick={() => (editor.error = null)}
-				style="height:22px;padding:0 9px;border-radius:var(--radius-full);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:var(--text-secondary);font-size:11px;cursor:pointer"
+				style="height:24px;padding:0 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:var(--text-secondary);font-size:11px;cursor:pointer"
 				>Dismiss</button
 			>
 		</div>
