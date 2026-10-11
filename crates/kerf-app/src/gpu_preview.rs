@@ -19,7 +19,8 @@
 //!   before anything is decoded, planned from files or rendered; a scrubbed frame takes none.
 //! * **Latest wins** ([`mailbox`]): a request replaces the one waiting, so a drag draws the frames
 //!   it ends on and not every one it passed.
-//! * **Counted, paced**: every refusal is counted by kind ([`diagnostics`]), and frames of a drag are
+//! * **Checked, counted, paced**: the first frame the GPU would draw waits for the parity self-test
+//!   ([`check`]), every refusal is counted by kind ([`diagnostics`]), and frames of a drag are
 //!   presented without waiting for the refresh ([`pace`]).
 //! * **Lazy and rebuildable**: the device, compositor, frame source and surface are made on the
 //!   first frame that wants them ([`Backend`]); a failure is remembered with a backoff
@@ -40,6 +41,7 @@
 //! This is a GUI-only surface: it has no MCP tool, because the agent already has
 //! `preview_timeline` (a JPEG of the cut) and nothing here is an edit.
 
+mod check;
 mod diagnostics;
 mod mailbox;
 mod pace;
@@ -62,11 +64,12 @@ use kerf_core::{
 };
 use kerf_gpu::{
     Compositor, FrameSource, FrameSourceConfig, Gpu, GpuError, GpuOptions, Hint, PixelRect, Presenter, RenderTimings,
-    RenderedFrame, Surround,
+    RenderedFrame, SelfTestError, SelfTestReport, Surround,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+use check::{AdapterKey, Check, Gate, Verdict};
 use diagnostics::{Counters, Reason, Tally};
 pub use mailbox::Delivery;
 use mailbox::{Mailbox, MailboxStats, Worker};
@@ -670,6 +673,7 @@ struct Backend {
 struct Drawing {
     compositor: Arc<Compositor>,
     source: Arc<FrameSource>,
+    gpu: Arc<Gpu>,
     host: Arc<Mutex<Host>>,
 }
 
@@ -864,6 +868,9 @@ pub struct GpuDiagnostics {
     pub snapshots: SnapshotStats,
     /// Requests posted, and how many a newer one replaced.
     pub requests: MailboxStats,
+    /// The parity self-test: running, passed (with its figures) or closed (and why); `None` before the
+    /// first frame that wanted the GPU.
+    pub self_test: Option<String>,
     pub adapter: Option<String>,
     pub software: bool,
 }
@@ -920,6 +927,11 @@ pub struct GpuPreview {
     /// Whether requests are arriving like a drag.
     pace: Mutex<Pace>,
     counters: Mutex<Counters>,
+    /// The parity self-test's standing, and what runs it.
+    check: Arc<Check>,
+    checker: Arc<Checker>,
+    /// Told when the self-test has a verdict, so the page asks for the frame again.
+    notify: Option<Arc<dyn Fn() + Send + Sync>>,
     bounds: Mutex<BoundsState>,
     /// The live host, outside the render lock so hiding the surface never waits for a render.
     host: Mutex<Option<Arc<Mutex<Host>>>>,
@@ -927,22 +939,34 @@ pub struct GpuPreview {
     /// (`Drawing`), lets go, and takes the lock again to show the result.
     render: Mutex<RenderState>,
     building: Mutex<()>,
-    info: Mutex<Info>,
+    info: Arc<Mutex<Info>>,
 }
+
+/// Runs the parity self-test on a device (injected so the gate is testable without an FFmpeg).
+type Checker = dyn Fn(Arc<Gpu>) -> Result<SelfTestReport, SelfTestError> + Send + Sync;
 
 impl GpuPreview {
     /// The app's: `app`'s main window is the host. `crashed` is [`take_crash_marker_in`]'s answer.
     pub fn for_app(app: tauri::AppHandle, crashed: bool, scrub: Arc<ScrubFrames>) -> Self {
+        use tauri::Emitter as _;
         use tauri::Manager as _;
 
         let choice = std::env::var("KERF_GPU_SURFACE").ok();
         let marker = app.path().app_config_dir().ok().map(|dir| dir.join(CRASH_MARKER));
+        let notify = app.clone();
         let mut preview = Self::with_factory(
             resolve_technique(std::env::consts::OS, choice.as_deref()),
             Arc::new(move |technique| build_backend(&app, technique)),
         );
         preview.scrub = scrub;
         preview.marker = marker;
+        // The page asks for the frame under the playhead again (the one that waited for the check
+        // went through FFmpeg), and reads the status the verdict changed.
+        preview.notify = Some(Arc::new(move || {
+            if let Err(e) = notify.emit("gpu-preview-checked", ()) {
+                tracing::warn!(error = %e, "failed to emit gpu-preview-checked");
+            }
+        }));
         if crashed {
             lock(&preview.info).reason = Some(CRASH_NOTE.into());
         }
@@ -961,12 +985,15 @@ impl GpuPreview {
             mail: Mailbox::default(),
             pace: Mutex::new(Pace::default()),
             counters: Mutex::new(Counters::default()),
+            check: Arc::new(Check::default()),
+            checker: Arc::new(|gpu| kerf_gpu::parity_self_test(&gpu)),
+            notify: None,
             enabled: AtomicBool::new(false),
             reset_backoff: AtomicBool::new(false),
-            info: Mutex::new(Info {
+            info: Arc::new(Mutex::new(Info {
                 reason: technique.note.clone(),
                 ..Info::default()
-            }),
+            })),
             technique,
             factory,
             bounds: Mutex::new(BoundsState::default()),
@@ -991,6 +1018,8 @@ impl GpuPreview {
             self.reset_backoff.store(true, Ordering::SeqCst);
             if !was {
                 lock(&self.info).reason = self.technique.note.clone();
+                // A self-test that could not be made is tried again; a mismatch stands.
+                self.check.retry();
             }
         }
         was && !on
@@ -1230,6 +1259,7 @@ impl GpuPreview {
             tally: lock(&self.counters).tally(mail.superseded),
             snapshots: self.snapshots.stats(),
             requests: mail,
+            self_test: self.check.standing(),
             adapter: info.adapter.clone(),
             software: info.software,
         }
@@ -1324,6 +1354,51 @@ impl GpuPreview {
         info.reason = Some(why.to_string());
     }
 
+    /// May the GPU draw on `gpu`'s adapter? The first frame that asks starts the parity self-test on
+    /// a thread of its own and is FFmpeg's, as is every frame until the verdict.
+    fn gate(&self, gpu: &Arc<Gpu>) -> Result<(), Reason> {
+        let key = AdapterKey::of(gpu);
+        match self.check.gate(&key) {
+            Gate::Open => Ok(()),
+            Gate::Wait(why) => Err(Reason::new("self_test_pending", why)),
+            Gate::Closed(why) => Err(Reason::new("self_test_failed", why)),
+            Gate::Begin(why) => {
+                self.begin_check(key, Arc::clone(gpu));
+                Err(Reason::new("self_test_pending", why))
+            }
+        }
+    }
+
+    /// Run the self-test off every lock and thread the page waits on. It runs FFmpeg the way the
+    /// interactive paths do (thread-capped, no machine-budget slot) and takes about a second.
+    fn begin_check(&self, key: AdapterKey, gpu: Arc<Gpu>) {
+        let (check, checker, info, notify) = (
+            Arc::clone(&self.check),
+            Arc::clone(&self.checker),
+            Arc::clone(&self.info),
+            self.notify.clone(),
+        );
+        let adapter = gpu.adapter_info().name.clone();
+        let started = {
+            let (check, info, notify, key) = (Arc::clone(&check), Arc::clone(&info), notify.clone(), key.clone());
+            std::thread::Builder::new().name("kerf-gpu-selftest".into()).spawn(move || {
+                let result = catch_unwind(AssertUnwindSafe(|| checker(gpu))).unwrap_or_else(|payload| {
+                    Err(SelfTestError::Inconclusive(format!(
+                        "the self-test panicked: {}",
+                        panic_text(payload.as_ref())
+                    )))
+                });
+                finish_check(&check, &info, notify.as_deref(), &key, &adapter, result);
+            })
+        };
+        if let Err(e) = started {
+            let verdict = check.failed_to_start(&key, &format!("could not start the self-test's thread: {e}"));
+            if let Verdict::Failed(reason) = verdict {
+                lock(&info).reason = Some(reason);
+            }
+        }
+    }
+
     fn attempt(&self, inputs: &PlanInputs, want: Want, now: Instant) -> Attempt {
         let t = want.t;
         let fallback = |kind: &'static str, why: String| {
@@ -1389,6 +1464,7 @@ impl GpuPreview {
                 Some(b) => Drawing {
                     compositor: Arc::clone(&b.compositor),
                     source: Arc::clone(&b.source),
+                    gpu: Arc::clone(&b.gpu),
                     host: Arc::clone(&b.host),
                 },
                 None => {
@@ -1419,6 +1495,12 @@ impl GpuPreview {
             self.hide();
             return Attempt::Fallback(reasons.iter().map(|r| Reason::new(r.kind(), r.to_string())).collect());
         }
+        // The GPU draws nothing the user looks at before it has been checked against this FFmpeg.
+        if let Err(reason) = self.gate(&drawing.gpu) {
+            self.hide();
+            return Attempt::Fallback(vec![reason]);
+        }
+
         let rendered = drawing
             .compositor
             .render_plan_texture_with(&plan, size, &drawing.source, Hint::Scrub);
@@ -1646,6 +1728,31 @@ impl GpuPreview {
                 "the GPU preview's build thread ended without an answer".into(),
             )),
         }
+    }
+}
+
+/// A self-test ended: record the verdict, log it, put a failure where Settings shows it, and tell the
+/// page to ask for the frame again.
+fn finish_check(
+    check: &Check,
+    info: &Mutex<Info>,
+    notify: Option<&(dyn Fn() + Send + Sync)>,
+    key: &AdapterKey,
+    adapter: &str,
+    result: Result<SelfTestReport, SelfTestError>,
+) {
+    match check.finish(key, result) {
+        Verdict::Passed(summary) => {
+            tracing::info!(adapter, %summary, "the GPU passed its self-test against this FFmpeg; the GPU preview is open");
+        }
+        Verdict::Failed(reason) => {
+            tracing::warn!(adapter, %reason, "the GPU preview is off: its self-test against this FFmpeg did not pass");
+            lock(info).reason = Some(reason);
+        }
+        Verdict::Stale => return,
+    }
+    if let Some(notify) = notify {
+        notify();
     }
 }
 
