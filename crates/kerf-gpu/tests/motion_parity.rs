@@ -601,7 +601,7 @@ fn check_motion(check: Check) -> (i32, i32) {
         layers_seen = layers_seen.max(plan.layers.len());
         let picture = motion.frames(&plan).unwrap_or_else(|e| panic!("{case}: frame {k}: {e}"));
         let drawn = compositor()
-            .composite_yuv(&plan, &picture, size)
+            .composite_yuv_shared(&plan, &picture, size)
             .unwrap_or_else(|e| panic!("{case}: frame {k}: {e}"));
         let want = played.planes(k as usize);
         let got = planes_of(&drawn);

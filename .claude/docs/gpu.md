@@ -408,40 +408,46 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   green pixels there; the GPU does not copy them).
 
 **Text: FFmpeg rasterises, the compositor blends** (`text.rs`, `shaders/text.wgsl`, `GpuCaps::text`).
-`drawtext` is layout (shaping, kerning, hinting, the quarter-pixel phase each glyph bitmap is rendered at) and a
-blend, and only the blend is arithmetic a shader can copy exactly — so the layout is never redone. For each
-distinct overlay state `rasterize` runs **one `ffmpeg`** (`kerf_core::text_raster_graph`, one frame of a lavfi
-canvas, `limit_frame_args`, killed at `RASTER_TIMEOUT` 5 s) that draws the overlay's own `drawtext` — the same options
-and the same `x=(w*px-text_w/2)` expressions the still runs, at the **render size and at the sampled
-position** (glyph bitmaps are rendered at a quarter-pixel phase of a fractional position, so the position is part of the
-picture; a mask moved by whole pixels was wrong from the first measurement) — white on black in `rgb24` (255 over 0 at coverage `m`
-is exactly `m` there; a gray or YUV canvas writes 235 on FFmpeg 6.1, whose `drawtext` ignores the range tag), once for the
-glyphs and once, fontcolor invisible (`@0`), for the box, and reads the red planes back. A mask is trimmed to its box and
-cached in `TextAtlas` (key: the graph text, the font file's length and mtime, the `ffmpeg` path; 256 states / 48 MiB, least
-recently used out, a state asked for by several frames at once runs once, a failure is not remembered; the textures are made by the first frame
-that draws one). The pass is `drawutils.c`'s own integer arithmetic (identical in 6.1.1 and 9.0.2), in u32: a sample blends
-to `((K - a) * d + a * s) >> 24` (`K = 0x1010101`), `a` = coverage x `(0x10307 * alpha + 3) >> 8` for luma and
-`(sum of the 2x2 coverage >> 2)` x the same for 4:2:0 chroma (a block that sticks out of the mask counts only what is in it),
-`0x10203 * alpha + 2` for the box with half of it per missing row or column at an odd edge; `s` is `ff_draw_color` (the composite's
-matrix — `PlanCanvas.matrix` is also what 9.0's `drawtext` reads off its link, and 6.1's ignores the tag and uses BT.601, which is what
-`FixedBt601` already says — limited range, `+ 0.5`, truncated) and the colour's alpha `(a * 256·opacity) / 255`. **Colours are parsed
-as `av_parse_color` does** (`parse_color`: the 140 names, `#` / `0x` hex with alpha, `@alpha` truncated), not asked of FFmpeg
-(its `color` source drops alpha and goes through YUV). Passes ping-pong between two canvases that agree outside the region
-the overlays can touch (one copy, then one scissored pass per blend: box, then glyphs). **A frame with no layer is drawn in RGB**: FFmpeg
-hands the black base to `drawtext` and on to the PNG without ever making it YUV (the colour is the one written, bit for bit), so the same shader
-blends on the RGB picture, three full-resolution channels. Verified three ways: `tests/text.rs` holds the scalar reference
-(`blend_coverage` / `blend_rect`) to `drawtext`'s own `yuv420p` planes **sample for sample** over busy pictures (plain, boxed, odd
-offsets, edges and corners and wholly outside, opacity 0 to 0.99, hex / named / translucent colours, BT.709 and BT.2020 pictures,
-escapes, Cyrillic and missing glyphs) on both FFmpegs; `the_text_pass_is_the_reference_blend_plane_by_plane` holds the shader to the
-reference on the compositor's own planes (zero differing samples, 9 frames, 4 overlays); and the `text/` parity cases hold the
-whole picture to the still. **Where it is not drawn** (refused by the plan, `Unsupported::Text*`): a **font under 12 px**
-(`MIN_TEXT_PX`: `drawtext` blends each glyph bitmap in turn and the mask is all of them, so a pixel two glyphs share is one blend
-here and two there — rounding for ordinary text, Latin kerned pairs and a missing glyph's box included (0 to 2 samples, a level), but
-3 to 11 px text is all shared pixels: up to 7 levels of chroma at a dozen samples, which is 2 levels at 12 px and up) and a **bold
-request in a font with no bold face** (`TextBorder`: `drawtext` thickens it with a same-colour border whose bitmaps overlap along every letter gap, 33 levels of
-chroma at those pixels). The shipped default font has a real bold, so neither a title nor a caption in the default font is ever refused for it. A text
-`FFmpeg` cannot read a colour of (not reachable from `valid_color`) or a rasterisation that fails is `GpuError::Unsupported` for that frame. Over a **full-range** picture on
-9.0 (which draws the text in full range and converts last) the picture is within 2 levels of the control without the text; it is drawn, not refused.
+
+*Design.* `drawtext` is layout (shaping, kerning, hinting, the quarter-pixel phase of each glyph bitmap) and a blend; only
+the blend is arithmetic a shader can copy, so the layout is never redone. For each distinct overlay state `rasterize` runs
+**one `ffmpeg`** (`kerf_core::text_raster_graph`, `limit_frame_args`, killed at `RASTER_TIMEOUT` 5 s) that draws the overlay's own
+`drawtext` (the still's options and `x=(w*px-text_w/2)` expressions) **at the render size and the sampled position**, since a glyph
+is rendered at the quarter-pixel phase of a fractional position. It draws white on black in `rgb24` (255 over 0 at coverage `m` is
+exactly `m`; a gray or YUV canvas writes 235 on 6.1), once for the glyphs and once, fontcolor `@0`, for the box, and reads the red
+planes. A mask is trimmed and cached in `TextAtlas` (key: graph text, font file length + mtime, `ffmpeg` path; 256 states /
+48 MiB, LRU; a state wanted by several frames runs once; a failure is not remembered; textures are made by the first frame that
+draws one). `prepare_text` blocks on that process for a first-seen state, so a caller's render lock (the app's `RenderState`) is
+held that long; no project lock is. The pass is `drawutils.c`'s integer arithmetic (the same in 6.1.1 and 9.0.2), in u32:
+`((K - a) * d + a * s) >> 24` (`K = 0x1010101`), `a` = coverage x `(0x10307 * alpha + 3) >> 8` for luma and the 2x2 coverage sum
+`>> 2` for 4:2:0 chroma (a block sticking out of the mask counts only what is in it), `0x10203 * alpha + 2` for the box (half per
+missing row or column at an odd edge); `s` is `ff_draw_color` in the composite's matrix (`PlanCanvas.matrix`: 9.0's `drawtext` reads it
+off its link, 6.1's uses BT.601, which `FixedBt601` already says; limited range, `+ 0.5`, truncated) and the colour's alpha is
+`(a * 256·opacity) / 255`. Colours are parsed as `av_parse_color` does (`parse_color`: 140 names, `#` / `0x` hex with alpha, `@alpha`
+truncated), not asked of FFmpeg. Passes ping-pong between two canvases that agree outside the region the overlays can touch
+(box, then glyphs, one scissored pass each). **A frame with no layer is drawn in RGB** (FFmpeg never makes the black base YUV), so
+the same shader blends on the RGB picture and `composite_yuv` refuses such a plan rather than return planes without its text.
+
+*Verification.* `tests/text.rs` holds the scalar reference (`blend_coverage` / `blend_rect`) to `drawtext`'s own `yuv420p` planes
+**sample for sample** on both FFmpegs (plain, boxed, odd offsets, edges, corners, wholly outside, opacity 0 to 0.99, hex / named /
+translucent colours, BT.709 and BT.2020, escapes, Cyrillic, missing glyphs); `the_text_pass_is_the_reference_blend_plane_by_plane`
+holds the shader to the reference on the compositor's own planes (0 differing samples, 9 frames, 4 overlays); the `text/` parity
+cases hold the whole picture to the still, each against the same picture without the text: no allowance, but two glyph-edge
+pixels of the lower third at 0.1 s (+1, YUV -> RGB error near the gamut edge over saturated green), 12 px text (+2) and
+full-range pictures on 9.0 (+2, a known model difference: text drawn in full range, converted last), each with its reason at the case.
+
+*Refusals* (the plan, `Unsupported::Text*`). A **font under 12 px** (`MIN_TEXT_PX`): `drawtext` blends each glyph bitmap in turn
+and the mask is all of them, so a pixel two glyphs share is one blend here and two there. Ordinary text is exact (Latin kerned
+pairs 0 samples, a missing glyph's box 1 to 2 samples by a level), but 3 to 11 px text is all shared pixels (up to 7 levels of
+chroma). A **bold request in a font with no bold face** (`TextBorder`): `drawtext` thickens it with a same-colour border whose
+bitmaps overlap along every letter gap (33 levels of chroma there); the shipped default has a real bold, so neither a title nor a
+caption in it is ever refused for it. A rasterisation that fails (or a colour FFmpeg cannot read) is `GpuError::Unsupported` for the
+frame. **Colour fonts**: `drawtext` loads glyphs without `FT_LOAD_COLOR` and has no BGRA path — a CBDT font (Noto Color Emoji) is a hard
+error on 6.1.1 (a segfault) and 9.0.2 at every size, so there is no colour glyph to draw as a silhouette; a COLR font is drawn by
+`drawtext` itself as monochrome outlines and the mask is exactly that (sbix and COLR were not available to test). Known costs, not fixed:
+the atlas key holds the sampled position at full precision, so a **keyframed slide-in rasterises per frame** (quantising it risks
+exactness); a Windows profile path with non-ASCII characters reaches `fontfile` through FreeType's narrow open (not run on Windows).
+Over a full-range picture on 9.0 (text drawn in full range, converted last) the picture is within 2 levels of the control: drawn.
 
 **Fades, dips, dissolves, slides and pushes** (`composite.wgsl`, `roundtrip.wgsl`, `motion.rs`; `GpuCaps::{motion, fades,
 transitions, dip_white}`). The plan hands each layer's `fade` steps as integers (`RenderPlan::fade_ops`: tint, edge and the

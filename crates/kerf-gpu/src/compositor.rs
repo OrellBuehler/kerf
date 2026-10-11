@@ -1039,7 +1039,23 @@ impl Compositor {
     /// the canvas as the 8-bit Y, U and V planes the layers were blended in (the
     /// chroma planes at half size). It exists so the scaler and the blend can be
     /// compared with FFmpeg's planes directly, without a conversion in between.
-    pub fn composite_yuv<F: Borrow<YuvFrame>>(
+    /// A plan with overlays and no layer is `Unsupported`: its text is blended in RGB, and
+    /// returning the black planes without it would be a frame that silently lacks its text.
+    pub fn composite_yuv(&self, plan: &RenderPlan, frames: &[Option<YuvFrame>], size: (u32, u32)) -> Result<YuvFrame, GpuError> {
+        self.yuv_planes(plan, frames, size)
+    }
+
+    /// [`Compositor::composite_yuv`] over shared frames (a [`crate::MotionFrames`]'s or a [`FrameSource`]'s).
+    pub fn composite_yuv_shared(
+        &self,
+        plan: &RenderPlan,
+        frames: &[Option<Arc<YuvFrame>>],
+        size: (u32, u32),
+    ) -> Result<YuvFrame, GpuError> {
+        self.yuv_planes(plan, frames, size)
+    }
+
+    fn yuv_planes<F: Borrow<YuvFrame>>(
         &self,
         plan: &RenderPlan,
         frames: &[Option<F>],
@@ -1076,6 +1092,13 @@ impl Compositor {
         let reasons = plan.reasons(&self.caps(), size);
         if !reasons.is_empty() {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));
+        }
+        if output == Output::Yuv && plan.layers.is_empty() && !plan.overlays.is_empty() {
+            // Such a frame is RGB all the way in FFmpeg (the text goes on the black base after no
+            // conversion), so there are no YUV planes the text could be compared in.
+            return Err(GpuError::Unsupported(
+                "text over a frame with no layer has no YUV planes (it is drawn in RGB)".into(),
+            ));
         }
         if frames.len() != plan.layers.len() {
             return Err(GpuError::Decode(format!(
@@ -1156,14 +1179,17 @@ impl Compositor {
                 fades,
             });
         }
-        // FFmpeg rasterises what text there is, here, before the GPU is touched and with no lock held.
+        // FFmpeg rasterises what text there is, here, before the GPU is touched. No project lock is
+        // held, but the caller's render lock is (the app's preview holds `RenderState` across a render,
+        // decode included): the wait for a first-seen caption is one process, bounded by RASTER_TIMEOUT.
         let texts = self.prepare_text(plan, size)?;
         self.gpu
             .guarded("compositing a frame", || self.draw(plan, &drawn, &texts, size, output))
     }
 
     /// Every overlay of the frame rasterised (or served from the atlas) and turned into the blends
-    /// that draw it. Blocks for a process the first time a state is seen.
+    /// that draw it. Blocks for one `ffmpeg` process (at most `RASTER_TIMEOUT`) the first time a state
+    /// is seen, so a caller holding a lock across a render holds it that long.
     fn prepare_text(&self, plan: &RenderPlan, size: (u32, u32)) -> Result<Vec<PreparedText>, GpuError> {
         let limit = self.gpu.device.limits().max_texture_dimension_2d;
         plan.overlays

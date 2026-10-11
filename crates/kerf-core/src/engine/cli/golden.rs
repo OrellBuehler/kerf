@@ -28,8 +28,9 @@
 //! holding HDR footage is built *both* ways), `alimiter_latency_available()`
 //! (`with_alimiter_latency`; every case is built with the option, and a case with the
 //! limiter on has its export argv appended once more without it), `drawtext`'s
-//! font path (no overlay names a font, so no system font is looked up; the shipped
-//! default every overlay then gets is pinned to a fixed path, `with_pinned_default_font`),
+//! font path (`with_pinned_default_font`: the shipped default that an overlay with no
+//! family gets, and the one family an overlay names, `PINNED_FAMILY`, are fixed paths, so
+//! neither this machine's cache directory nor its installed fonts reach the argv),
 //! and libm: the
 //! compressor and gate thresholds go through `powf`, whose last digits differ between
 //! glibc builds (FMA or not), macOS, Windows and arm, so [`round_libm`] compares those
@@ -150,12 +151,15 @@ overlay-percent \\%
 overlay-quote \'\''
 overlay-colon a\: b
 overlay-backslash back\\\\slash
+overlay-linebreak one two three four five
 still-overlay-quote \'\''
 still-overlay-colon a\: b
 still-overlay-backslash back\\\\slash
+still-overlay-linebreak one two three four five
 preview-overlay-quote \'\''
 preview-overlay-colon a\: b
 preview-overlay-backslash back\\\\slash
+preview-overlay-linebreak one two three four five
 overlay-bold borderw=2
 overlay-box box=1
 overlay-default-font fontfile='/kerf-test/fonts/Geist-Regular.ttf'
@@ -717,6 +721,10 @@ fn clip(r: &mut Rng, a: &Asset, start: f64, earlier: &[Clip]) -> Clip {
 fn overlay(r: &mut Rng) -> TextOverlay {
     let text = r.pick(&["Hello", "50% off", "It's \"quoted\"", "back\\slash", "two\nlines", "a: b, c; [d] =e", "日本語 ünï", "", "%{pts}"]);
     let start = r.real(0.0, 20.0);
+    // Half of the draws of "two\nlines" break the line with every other kind of break as well (a CR, a CRLF,
+    // the Unicode separators), so the oracle pins that they are all one space; from draws already made, so no
+    // other case moves.
+    let text = if text == "two\nlines" && start.fract() >= 0.5 { "one\rtwo\r\nthree\u{2028}four\u{2029}five" } else { text };
     let mut o = TextOverlay::new(text, start, start + r.real(0.2, 6.0));
     o.id = r.id();
     (o.pos_x, o.pos_y, o.size) = (r.real(0.0, 1.0), r.real(0.0, 1.0), r.real(0.02, 0.2));

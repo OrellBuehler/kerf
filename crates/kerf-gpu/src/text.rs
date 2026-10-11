@@ -646,7 +646,8 @@ pub fn touched(raster: &Raster, blends: &[Blend], w: u32, h: u32) -> Option<(u32
 // ---- rasterising --------------------------------------------------------------
 
 /// Draw `graph` with FFmpeg and read the masks back. Blocking: a process of tens of milliseconds,
-/// killed after [`RASTER_TIMEOUT`]; callers are on a blocking thread and hold no project lock.
+/// killed after [`RASTER_TIMEOUT`]; callers are on a blocking thread and hold no project lock (they may
+/// hold their own render lock, which waits this long on a first-seen state).
 pub fn rasterize(graph: &TextRasterGraph) -> Result<Raster, GpuError> {
     let (w, h) = graph.size;
     let plane = (w as usize).checked_mul(h as usize);
@@ -780,7 +781,8 @@ impl TextAtlas {
     }
 
     /// How many states are held and how many bytes they are charged.
-    pub fn held(&self) -> (usize, usize) {
+    #[cfg(test)]
+    fn held(&self) -> (usize, usize) {
         let inner = locked(&self.inner);
         (
             inner.slots.values().filter(|s| locked(&s.raster).is_some()).count(),

@@ -5,8 +5,87 @@ export const MIN_TITLE = 0.1;
 /** Bounds a title's font height may be dragged between (the Inspector slider's range, widened). */
 export const TITLE_SIZE_MIN = 0.02;
 export const TITLE_SIZE_MAX = 0.3;
-/** `drawtext` lays a line out about this tall, as a multiple of `fontsize`. */
-export const LINE_HEIGHT = 1.17;
+/** The family the engine draws a title with when it names none, or names one that is not installed. */
+export const DEFAULT_TITLE_FONT = "'Geist Variable'";
+/** The CSS family list a title is drawn in: its own family, then the shipped default. */
+export function titleFamily(o: Pick<TextOverlay, 'font'>): string {
+	const own = o.font?.replace(/['\\]/g, '');
+	return `${own ? `'${own}', ` : ''}${DEFAULT_TITLE_FONT}, sans-serif`;
+}
+
+/** How tall a title's handle is, as a multiple of its font size, when the text cannot be measured. */
+export const FALLBACK_INK = 0.9;
+/** The ink of a string in em: how far its glyphs reach above and below the baseline, and the font's own
+ *  ascent and descent (absent in engines without `fontBoundingBox*`). */
+export interface InkMetrics {
+	ascent: number;
+	descent: number;
+	fontAscent?: number;
+	fontDescent?: number;
+}
+export type MeasureInk = (text: string, bold: boolean, family: string) => InkMetrics | null;
+
+/** The size the canvas measures at: large enough that its rounding does not show. */
+const MEASURE_PX = 100;
+interface InkContext {
+	font: string;
+	measureText(text: string): {
+		actualBoundingBoxAscent: number;
+		actualBoundingBoxDescent: number;
+		fontBoundingBoxAscent?: number;
+		fontBoundingBoxDescent?: number;
+	};
+}
+
+/** [`InkMetrics`] of `text` from a 2D context, or null when it cannot say. */
+export function inkFromContext(ctx: InkContext, text: string, bold: boolean, family: string): InkMetrics | null {
+	ctx.font = `${bold ? 700 : 400} ${MEASURE_PX}px ${family}`;
+	const m = ctx.measureText(text);
+	const em = (v: number | undefined) => (v !== undefined && Number.isFinite(v) ? v / MEASURE_PX : undefined);
+	const [ascent, descent] = [em(m.actualBoundingBoxAscent), em(m.actualBoundingBoxDescent)];
+	if (ascent === undefined || descent === undefined) return null;
+	return { ascent, descent, fontAscent: em(m.fontBoundingBoxAscent), fontDescent: em(m.fontBoundingBoxDescent) };
+}
+
+const inkCache = new Map<string, InkMetrics | null>();
+let inkContext: InkContext | null | undefined;
+
+/** [`inkFromContext`] on the page's own canvas, cached; null where there is no canvas (tests, SSR). */
+export const measureInk: MeasureInk = (text, bold, family) => {
+	if (inkContext === undefined) {
+		inkContext = typeof document === 'undefined' ? null : (document.createElement('canvas').getContext('2d') as InkContext | null);
+	}
+	if (!inkContext) return null;
+	const key = `${bold ? 1 : 0}|${family}|${text}`;
+	const hit = inkCache.get(key);
+	if (hit !== undefined) return hit;
+	const ink = inkFromContext(inkContext, text, bold, family);
+	// A face that has not loaded yet measures as its fallback: do not remember that.
+	if (document.fonts?.check(`${bold ? 700 : 400} ${MEASURE_PX}px ${family}`, text) !== false) {
+		if (inkCache.size >= 512) inkCache.clear();
+		inkCache.set(key, ink);
+	}
+	return ink;
+};
+
+/**
+ * The box the engine draws a title in, for its handle, in em of the font size. `drawtext`'s `text_h`
+ * is the **ink** of the string (`H` is 0.71 of the font size in Geist, `x` 0.53, `Hxg` 0.87, a full stop
+ * 0.11), not the font's line height (1.30 for Geist), so the handle is as tall as the glyphs reach
+ * above and below the baseline, measured in the family the engine draws. `shift` moves the glyphs
+ * (em, down is positive) from where a line box of that height puts them to where the engine centres the
+ * ink. A string that cannot be measured is [`FALLBACK_INK`] tall.
+ */
+export function inkBox(
+	o: Pick<TextOverlay, 'text' | 'font' | 'bold'>,
+	measure: MeasureInk = measureInk
+): { height: number; shift: number } {
+	const ink = measure(o.text, !!o.bold, titleFamily(o));
+	if (!ink || !(ink.ascent + ink.descent > 0.05)) return { height: FALLBACK_INK, shift: 0 };
+	const inkMid = (ink.ascent - ink.descent) / 2;
+	const lineMid = ink.fontAscent !== undefined && ink.fontDescent !== undefined ? (ink.fontAscent - ink.fontDescent) / 2 : inkMid;
+	return { height: ink.ascent + ink.descent, shift: inkMid - lineMid };
+}
 /** `drawtext`'s `boxborderw`, in output pixels, drawn around the text when a box colour is set. */
 export const BOX_BORDER_PX = 12;
 /** Height the box padding is taken against when the project has no delivery frame. */

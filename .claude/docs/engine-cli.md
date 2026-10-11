@@ -552,15 +552,18 @@ so the feature is **only** activated through these forwards — which is what ma
   (a backslash escapes, `%` starts `%{..}`), the filter's *option string* (`av_get_token` ends a value at `:`, a backslash
   escapes, an apostrophe quotes, blanks at the ends are dropped) and the *filtergraph* (`'...'` protects `[],;`, an
   apostrophe is `'\''`). So `\` -> `\\` and `%` -> `\%` for the expansion, then `\` -> `\\`, `'` -> `\'`, `:` -> `\:` and an end
-  blank -> `\ ` for the option string, then `'` -> `'\''` for the graph. It used to write for the last alone, and **an
+  blank -> `\ ` for the option string, then `'` -> `'\''` for the graph. A line break (LF, CR, CRLF as one, U+2028/2029) is one
+  space (`drawtext` starts a new line at a CR too) and other control characters but a tab are dropped. It used to write for the last alone, and **an
   apostrophe swallowed every option after it** (the title came out as small black garbage at the top left: `It's here` drew
   `Its here:fontsize=36:fontcolor=...`), **a colon failed the whole render on FFmpeg 9** (`No option name near ' b'`) and cut the
   text on 6.1, and a backslash vanished. `drawtext_text_is_what_the_user_typed` (`#[ignore]`d) renders each against the same
   text read literally from a file (`textfile=` + `expansion=none`) on whichever FFmpeg runs it. `fontfile=` is escaped the same
   way minus the expansion level, which is also what a Windows path (`C:\Fonts\a.ttf` -> `C\:\\Fonts\\a.ttf`) needs (not run on
   Windows). **Every overlay names a font file**: `fonts::resolve_text_font` — the installed family it names, else the shipped
-  Geist (`crates/kerf-core/assets/fonts`, SIL OFL 1.1, Regular and Bold, written to `<cache>/kerf/fonts/<name>-<digest>.ttf`
-  on first use) — because a bare `drawtext` asks its own build for "Sans" (nothing at all in a build without fontconfig, which
+  Geist (`crates/kerf-core/assets/fonts`, SIL OFL 1.1, Regular and Bold, written to `<cache>/kerf/fonts/<name>-<digest>.ttf`;
+  else to a per-user `0700` directory in the temp one, `kerf-fonts-<uid>`, refused if it is someone else's or open to others) —
+  **checked on every use** (a `stat`, the bytes compared only when it changed, never trusting a length), rewritten when the cache
+  was cleared or `/tmp` swept while the app ran, and a failed write is not remembered — because a bare `drawtext` asks its own build for "Sans" (nothing at all in a build without fontconfig, which
   is what the Windows and macOS bundles ship) and a render plan can only name a file. Geist covers Latin, Latin Extended and
   Cyrillic; Greek (a few letters) and CJK draw as `drawtext`'s missing-glyph boxes, as they did in a system Sans without
   them. The golden pins the default at a fixed path (`fonts::with_pinned_default_font`). `text_raster_graph` is the same

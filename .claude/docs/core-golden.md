@@ -85,6 +85,10 @@
   the new families `overlay-default-font[-bold]`, `overlay-named-font` (and their `still-` / `preview-` forms). Then the three-level escape of apostrophe, colon and
   backslash (`overlay-quote`, `overlay-colon`, `overlay-backslash` and their `still-` / `preview-` forms): 801 / 148 / 402 cases moved, exactly those. Both sets
   tied with `KERF_GOLDEN_CASES` before / after and `KERF_GOLDEN_FAMILIES`.
+- **Line breaks in overlay text** (`export.txt` / `still.txt` / `preview.txt`): half of the draws of the pool text `"two\nlines"` (those whose `start` has
+  a fraction of at least one half, from draws already made so no other case moves) are `"one\rtwo\r\nthree\u{2028}four\u{2029}five"`, which every kind of break turns
+  into one space. New families `overlay-linebreak` (`one two three four five`) and its `still-` / `preview-` forms: 152 / 23 / 85 cases moved
+  (180 of 5600), exactly the cases hitting them.
 - **Sample-exact `adelay`** (a clip starting between milliseconds is delayed by samples)
   re-blessed `export.txt` alone: 2718 of 4800 cases moved, exactly the new
   `audio-delay-samples` family (`S:all=1`); still and preview carry no sound.
