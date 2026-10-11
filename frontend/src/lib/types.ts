@@ -804,6 +804,8 @@ export interface DiffEntry {
 	detail?: string | null;
 	track_id?: string | null;
 	clip_id?: string | null;
+	/** The title or caption an `overlay_*` entry is about. */
+	overlay_id?: string | null;
 	at?: number | null;
 }
 

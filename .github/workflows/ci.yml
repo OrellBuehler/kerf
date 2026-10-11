@@ -194,26 +194,37 @@ jobs:
       # system bsdtar the script (and the release build) expects.
       # The pins are immutable and digest-checked, so the archives are kept
       # between runs and a mirror is asked once per pin: evermeet rate-limits CI
-      # runners hard enough to fail a job. Saved even when the fetch fails, so a
-      # run that got one archive before being throttled is not wasted.
+      # runners hard enough to fail a job. A complete set is kept under one fixed
+      # key per pin set, which is tried first: a later partial save must never
+      # shadow it. A run that got only some archives before being throttled
+      # keeps them under its own key, so the next run fetches only the rest.
       - name: Restore the pinned FFmpeg archives
+        id: archives
         if: matrix.ffmpeg == 'pinned'
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: .ffmpeg-archives
-          key: ffmpeg-archives-${{ matrix.triple }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ffmpeg-archives-${{ matrix.triple }}-
+          key: ffmpeg-archives-${{ matrix.triple }}-${{ hashFiles('scripts/fetch-ffmpeg.mjs') }}-complete
+          restore-keys: |
+            ffmpeg-archives-${{ matrix.triple }}-${{ hashFiles('scripts/fetch-ffmpeg.mjs') }}-
+            ffmpeg-archives-${{ matrix.triple }}-
       - name: Fetch FFmpeg (pinned)
         if: matrix.ffmpeg == 'pinned'
         env:
           KERF_FFMPEG_ARCHIVES: .ffmpeg-archives
         run: bun scripts/fetch-ffmpeg.mjs ${{ matrix.triple }}
-      - name: Keep the pinned FFmpeg archives
-        if: always() && matrix.ffmpeg == 'pinned' && hashFiles('.ffmpeg-archives/*') != ''
+      - name: Keep the complete pinned FFmpeg archives
+        if: success() && matrix.ffmpeg == 'pinned' && steps.archives.outputs.cache-hit != 'true'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: .ffmpeg-archives
-          key: ffmpeg-archives-${{ matrix.triple }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ffmpeg-archives-${{ matrix.triple }}-${{ hashFiles('scripts/fetch-ffmpeg.mjs') }}-complete
+      - name: Keep the pinned FFmpeg archives fetched so far
+        if: failure() && matrix.ffmpeg == 'pinned' && hashFiles('.ffmpeg-archives/*') != ''
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: .ffmpeg-archives
+          key: ffmpeg-archives-${{ matrix.triple }}-${{ hashFiles('scripts/fetch-ffmpeg.mjs') }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Use the pinned FFmpeg
         if: matrix.ffmpeg == 'pinned'
         shell: bash
@@ -289,26 +300,37 @@ jobs:
         if: matrix.ffmpeg == 'pinned'
       # The pins are immutable and digest-checked, so the archives are kept
       # between runs and a mirror is asked once per pin: evermeet rate-limits CI
-      # runners hard enough to fail a job. Saved even when the fetch fails, so a
-      # run that got one archive before being throttled is not wasted.
+      # runners hard enough to fail a job. A complete set is kept under one fixed
+      # key per pin set, which is tried first: a later partial save must never
+      # shadow it. A run that got only some archives before being throttled
+      # keeps them under its own key, so the next run fetches only the rest.
       - name: Restore the pinned FFmpeg archives
+        id: archives
         if: matrix.ffmpeg == 'pinned'
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: .ffmpeg-archives
-          key: ffmpeg-archives-${{ matrix.triple }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ffmpeg-archives-${{ matrix.triple }}-
+          key: ffmpeg-archives-${{ matrix.triple }}-${{ hashFiles('scripts/fetch-ffmpeg.mjs') }}-complete
+          restore-keys: |
+            ffmpeg-archives-${{ matrix.triple }}-${{ hashFiles('scripts/fetch-ffmpeg.mjs') }}-
+            ffmpeg-archives-${{ matrix.triple }}-
       - name: Fetch FFmpeg (pinned)
         if: matrix.ffmpeg == 'pinned'
         env:
           KERF_FFMPEG_ARCHIVES: .ffmpeg-archives
         run: bun scripts/fetch-ffmpeg.mjs ${{ matrix.triple }}
-      - name: Keep the pinned FFmpeg archives
-        if: always() && matrix.ffmpeg == 'pinned' && hashFiles('.ffmpeg-archives/*') != ''
+      - name: Keep the complete pinned FFmpeg archives
+        if: success() && matrix.ffmpeg == 'pinned' && steps.archives.outputs.cache-hit != 'true'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: .ffmpeg-archives
-          key: ffmpeg-archives-${{ matrix.triple }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ffmpeg-archives-${{ matrix.triple }}-${{ hashFiles('scripts/fetch-ffmpeg.mjs') }}-complete
+      - name: Keep the pinned FFmpeg archives fetched so far
+        if: failure() && matrix.ffmpeg == 'pinned' && hashFiles('.ffmpeg-archives/*') != ''
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: .ffmpeg-archives
+          key: ffmpeg-archives-${{ matrix.triple }}-${{ hashFiles('scripts/fetch-ffmpeg.mjs') }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Use the pinned FFmpeg
         if: matrix.ffmpeg == 'pinned'
         shell: bash

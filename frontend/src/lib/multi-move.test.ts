@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { withLinkedMoves } from './links';
 import { moveClips } from './multi-edit';
-import { moveTracks, planMove, type MoveTrack } from './multi-move';
+import { drawnMoveTracks, moveTracks, planMove, type MoveTrack } from './multi-move';
 import type { Clip, StreamKind, Timeline, Track } from './types';
 import { clipDuration } from './types';
 
@@ -249,6 +249,74 @@ describe('planMove — lanes', () => {
 // agrees with `Timeline::move_clips` (via its faithful mirror), on a spread of
 // drags over a few layouts — accepted exactly when the backend accepts, and, when
 // it does, landing every clip exactly where the ghosts were drawn.
+// The timeline draws V2 above V1 (`track-order.ts`), so the planner is handed the tracks in that
+// order: a lane offset is "up" or "down" for every kind on screen, and its words are the screen's.
+describe('planMove — in the order the lanes are drawn', () => {
+	test('the video group is handed over highest layer first, the audio after it', () => {
+		expect(drawnMoveTracks(sample()).map((t) => t.id)).toEqual(['v2', 'v1', 'a1', 'a2']);
+		// and it is only the order: the tracks and their clips are the same
+		expect(new Set(drawnMoveTracks(sample()).map((t) => t.id))).toEqual(new Set(moveTracks(sample()).map((t) => t.id)));
+	});
+
+	test('dragging a picture up a lane takes the sound up too — there is none above A1', () => {
+		// c1 on V1 dragged up onto V2 with c5 (A1) selected: up for the audio is nowhere, as drawn
+		const tl = sample();
+		tl.tracks[1].clips = [];
+		const p = planMove(drawnMoveTracks(tl), ['c1', 'c5'], 'c1', 0, 'v2');
+		expect(p.ok).toBe(false);
+		expect(p.laneShift).toBe(-1);
+		expect(p.reason).toBe('There is no audio track above A1 for its clip');
+	});
+
+	test('dragging down takes both down: V2 to V1 and A1 to A2', () => {
+		const tl = sample();
+		tl.tracks[0].clips = [clip('c1', 0, 10)]; // room on V1 below the V2 clip's span
+		tl.tracks[1].clips = [clip('c4', 20, 10)];
+		const p = planMove(drawnMoveTracks(tl), ['c4', 'c5'], 'c4', 20, 'v1');
+		expect(p.ok).toBe(true);
+		expect(p.laneShift).toBe(1);
+		expect(p.moves).toEqual([
+			{ clip_id: 'c5', timeline_start: 0, track_id: 'a2' },
+			{ clip_id: 'c4', timeline_start: 20, track_id: 'v1' }
+		]);
+	});
+
+	test('a group with a clip on the top video layer says there is no track above it', () => {
+		// V2 is the topmost layer; dragging V1's clip up onto it pushes the V2 clip off the top
+		const tl = sample();
+		tl.tracks[1].clips = [clip('c4', 50, 5)];
+		tl.tracks[2].clips = [];
+		const p = planMove(drawnMoveTracks(tl), ['c1', 'c4'], 'c1', 0, 'v2');
+		expect(p.ok).toBe(false);
+		expect(p.reason).toBe('There is no video track above V2 for its clip');
+		// in storage order the same drop was described the other way round
+		expect(planMove(moveTracks(tl), ['c1', 'c4'], 'c1', 0, 'v2').reason).toBe('There is no video track below V2 for its clip');
+	});
+
+	test('a drop onto another track of its kind names the track by id, whatever the order', () => {
+		const tl = sample();
+		tl.tracks[1].clips = [];
+		const drawn = planMove(drawnMoveTracks(tl), ['c3'], 'c3', 30, 'v2');
+		const stored = planMove(moveTracks(tl), ['c3'], 'c3', 30, 'v2');
+		expect(drawn.ok).toBe(true);
+		expect(drawn.moves).toEqual(stored.moves);
+		expect(drawn.moves).toEqual([{ clip_id: 'c3', timeline_start: 30, track_id: 'v2' }]);
+	});
+
+	test('what it plans is what move_clips does: both land on the lanes the plan named', () => {
+		const tl = sample();
+		tl.tracks[0].clips = [];
+		tl.tracks[1].clips = [clip('c4', 5, 10)];
+		tl.tracks[3].clips = [];
+		const p = planMove(drawnMoveTracks(tl), ['c4', 'c5'], 'c4', 5, 'v1');
+		expect(p.ok).toBe(true);
+		const backend = JSON.parse(JSON.stringify(tl)) as Timeline;
+		moveClips(backend, p.moves);
+		const lane = (id: string) => backend.tracks.find((t) => t.clips.some((c) => c.id === id))?.id;
+		expect([lane('c4'), lane('c5')]).toEqual(['v1', 'a2']);
+	});
+});
+
 describe('planMove agrees with move_clips', () => {
 	// A small deterministic generator, so a failure names a case that can be replayed.
 	let state = 12345;

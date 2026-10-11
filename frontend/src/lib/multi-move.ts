@@ -4,7 +4,10 @@
  * if the pointer is over another lane of the grabbed clip's kind, one *lane
  * offset* — "two lanes down" — applied to every clip within **its own kind's**
  * lanes (video clips shift through the video tracks, audio clips through the audio
- * ones; the lanes of a kind are its tracks in timeline order). A group that would
+ * ones; the lanes of a kind are its tracks **in the order they are drawn** —
+ * `drawnMoveTracks`: the video group is stacked highest layer first, so "down" is the
+ * same way for every kind on screen and the words say what the user sees). Which
+ * track each clip lands on is then a track *id*, which is all the backend is told. A group that would
  * need a lane that is not there, or one that is locked, does not land.
  *
  * `planMove` produces both halves of that: the ghosts the timeline draws (also for
@@ -31,6 +34,7 @@
 
 import { formatTime } from './diff';
 import { DIFF_EPS, spansOverlap } from './ripple';
+import { displayTracks } from './track-order';
 import type { ClipMove, StreamKind, Timeline } from './types';
 import { clipDuration } from './types';
 
@@ -97,6 +101,12 @@ export interface MovePlan {
 	laneShift: number;
 	/** The drop changes nothing: no time, no lane. */
 	noop: boolean;
+}
+
+/** `moveTracks` in the order the timeline draws the tracks (`track-order.ts`): the order to give
+ *  `planMove`, so a lane offset and its "above" / "below" are those of the screen. */
+export function drawnMoveTracks(timeline: Timeline): MoveTrack[] {
+	return displayTracks(moveTracks(timeline));
 }
 
 const refuse = (reason: string, ghosts: Ghost[], delta = 0, laneShift = 0, links = false): MovePlan => ({

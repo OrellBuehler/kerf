@@ -166,6 +166,10 @@ input[type='range'] {
 	background: transparent;
 	cursor: pointer;
 	--slider-accent: var(--kerf-500);
+	/* The track is 4 px: the box is what a pointer has to hit, and a native range has an intrinsic
+	   width that keeps a row from shrinking, so a value beside it clipped at the panel's minimum. */
+	height: 18px;
+	min-width: 0;
 }
 input[type='range']:disabled {
 	cursor: default;
@@ -250,15 +254,34 @@ input[type='range']:focus-visible::-moz-range-thumb {
 	outline: var(--focus-outline);
 	outline-offset: var(--focus-offset);
 }
+/* A toast says what kind it is the way the notification log does (`status-look.ts` is the one list of
+   glyphs and hues; a test holds this to it): the glyph in the kind's hue, a 3 px edge in it, and for the
+   three that matter a 12 % wash of it over the toast's own surface. The hues are the `-400` shades the
+   badges draw their text in, which the contrast guard holds to 4.5:1 on exactly this wash. */
 [data-sonner-toaster] [data-sonner-toast][data-type='success'] [data-icon] {
-	color: var(--success);
+	color: var(--green-400);
 }
 [data-sonner-toaster] [data-sonner-toast][data-type='error'] [data-icon] {
-	color: var(--danger);
+	color: var(--red-400);
 }
 [data-sonner-toaster] [data-sonner-toast][data-type='warning'] [data-icon] {
-	color: var(--warning);
+	color: var(--orange-400);
 }
 [data-sonner-toaster] [data-sonner-toast][data-type='info'] [data-icon] {
-	color: var(--info);
+	color: var(--agent-300);
+}
+[data-sonner-toaster] [data-sonner-toast][data-styled='true'][data-type='success'] {
+	border-left: 3px solid var(--green-400);
+	background: linear-gradient(var(--success-surface), var(--success-surface)), var(--surface-raised);
+}
+[data-sonner-toaster] [data-sonner-toast][data-styled='true'][data-type='error'] {
+	border-left: 3px solid var(--red-400);
+	background: linear-gradient(var(--danger-surface), var(--danger-surface)), var(--surface-raised);
+}
+[data-sonner-toaster] [data-sonner-toast][data-styled='true'][data-type='warning'] {
+	border-left: 3px solid var(--orange-400);
+	background: linear-gradient(var(--warning-surface), var(--warning-surface)), var(--surface-raised);
+}
+[data-sonner-toaster] [data-sonner-toast][data-styled='true'][data-type='info'] {
+	border-left: 3px solid var(--agent-300);
 }

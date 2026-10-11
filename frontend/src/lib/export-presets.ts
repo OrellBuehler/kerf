@@ -268,10 +268,16 @@ export function frameRateOptions(fps: number | null | undefined): { label: strin
 	return [...FRAME_RATES, { label: String(fps), value: fps }];
 }
 
+/** How the preset select groups its options. */
+export const PRESET_GROUPS = ['Video', 'Social', 'Master', 'Audio'] as const;
+export type PresetGroup = (typeof PRESET_GROUPS)[number];
+
 export interface Preset {
 	id: string;
 	label: string;
+	/** One or two plain sentences under the select: what you get and what it costs. */
 	description: string;
+	group: PresetGroup;
 	opts: Partial<ExportOptions>;
 }
 
@@ -279,67 +285,78 @@ export const PRESETS: Preset[] = [
 	{
 		id: 'web_1080p',
 		label: 'Web 1080p',
-		description: 'H.264 MP4 that plays everywhere.',
+		description: 'H.264 MP4 at 1080p. Plays everywhere; the safe default.',
+		group: 'Video',
 		opts: { container: 'mp4', video_codec: 'libx264', rate_control: 'crf', crf: 20, preset: 'medium', profile_v: 'high', pix_fmt: 'yuv420p', resolution: [1920, 1080], audio_codec: 'aac', audio_bitrate: '192k', faststart: true }
 	},
 	{
 		id: 'youtube_4k',
 		label: 'YouTube 4K (HEVC)',
-		description: 'Half-size UHD via H.265.',
+		description: 'H.265 at 4K. About half the size of H.264 at the same quality; needs a recent player.',
+		group: 'Video',
 		opts: { container: 'mp4', video_codec: 'libx265', rate_control: 'crf', crf: 23, preset: 'medium', pix_fmt: 'yuv420p', resolution: [3840, 2160], audio_codec: 'aac', audio_bitrate: '256k', faststart: true }
 	},
 	{
 		id: 'av1_web',
 		label: 'AV1 (smallest)',
-		description: 'Next-gen efficiency via SVT-AV1.',
+		description: "AV1 in MKV at 1080p. Smallest files and slowest to encode; some devices can't play it.",
+		group: 'Video',
 		opts: { container: 'mkv', video_codec: 'libsvtav1', rate_control: 'crf', crf: 30, preset: '8', pix_fmt: 'yuv420p', resolution: [1920, 1080], audio_codec: 'libopus', audio_bitrate: '128k' }
 	},
 	{
 		id: 'prores_master',
 		label: 'ProRes 422 HQ',
-		description: 'Edit-grade intermediate. Large files.',
+		description: 'Edit-grade master in a .mov file. Very large.',
+		group: 'Master',
 		opts: { container: 'mov', video_codec: 'prores_ks', prores_profile: 3, pix_fmt: 'yuv422p10le', audio_codec: 'pcm_s24le' }
 	},
 	{
 		id: 'web_720p',
 		label: 'Small share (720p)',
-		description: 'Compact H.264 for messaging.',
+		description: '720p H.264 for chat apps and email.',
+		group: 'Video',
 		opts: { container: 'mp4', video_codec: 'libx264', rate_control: 'crf', crf: 26, preset: 'slower', profile_v: 'high', pix_fmt: 'yuv420p', resolution: [1280, 720], audio_codec: 'aac', audio_bitrate: '128k', faststart: true }
 	},
 	{
 		id: 'vertical_reel',
 		label: 'Reels / Shorts (9:16)',
-		description: '1080×1920 vertical H.264, filled and cropped.',
+		description: '1080x1920 vertical H.264 at 30 fps. Fills the frame and crops the sides.',
+		group: 'Social',
 		opts: { container: 'mp4', video_codec: 'libx264', rate_control: 'crf', crf: 23, preset: 'medium', pix_fmt: 'yuv420p', resolution: [1080, 1920], fit: 'cover', fps: 30, audio_codec: 'aac', audio_bitrate: '128k', faststart: true }
 	},
 	{
 		id: 'square_social',
 		label: 'Square (1:1)',
-		description: '1080×1080 for the feed, filled and cropped.',
+		description: '1080x1080 H.264 at 30 fps for feed posts. Fills the frame and crops.',
+		group: 'Social',
 		opts: { container: 'mp4', video_codec: 'libx264', rate_control: 'crf', crf: 23, preset: 'medium', pix_fmt: 'yuv420p', resolution: [1080, 1080], fit: 'cover', fps: 30, audio_codec: 'aac', audio_bitrate: '128k', faststart: true }
 	},
 	{
 		id: 'target_size_2pass',
 		label: 'Target size (2-pass)',
-		description: 'Hit a specific average bitrate.',
+		description: 'H.264 at a fixed average bitrate (8 Mbps to start). Takes about twice as long.',
+		group: 'Video',
 		opts: { container: 'mp4', video_codec: 'libx264', rate_control: 'two_pass', video_bitrate: '8M', preset: 'slow', pix_fmt: 'yuv420p', resolution: [1920, 1080], audio_codec: 'aac', audio_bitrate: '192k', faststart: true }
 	},
 	{
 		id: 'gif',
 		label: 'Animated GIF',
-		description: 'Looping GIF, optimized palette, no audio.',
+		description: 'Looping GIF at 480p, 15 fps, no sound.',
+		group: 'Social',
 		opts: { container: 'gif', video_codec: 'gif', include_audio: false, resolution: [854, 480], fps: 15, gif_dither: 'bayer', gif_loop: true }
 	},
 	{
 		id: 'audio_mp3',
-		label: 'Audio · MP3 320k',
-		description: 'Just the mixed audio bed.',
+		label: 'MP3 audio (320 kbps)',
+		description: 'Just the mixed sound as an MP3.',
+		group: 'Audio',
 		opts: { container: 'mp3', video_codec: null, audio_codec: 'libmp3lame', audio_bitrate: '320k' }
 	},
 	{
 		id: 'audio_wav',
-		label: 'Audio · WAV',
-		description: 'Uncompressed 24-bit master.',
+		label: 'WAV audio (24-bit)',
+		description: 'Uncompressed 24-bit master of the mix.',
+		group: 'Audio',
 		opts: { container: 'wav', video_codec: null, audio_codec: 'pcm_s24le', audio_sample_rate: 48000 }
 	}
 ];
@@ -362,6 +379,7 @@ export function gpuPreset(hw: readonly string[]): Preset | null {
 		id: GPU_PRESET_ID,
 		label: 'Fast (GPU)',
 		description: `${HW_VIDEO_CODECS[codec].label} MP4 at 1080p with GPU decode, at Web 1080p's quality setting (CRF 20): far quicker. Hardware encoders usually need a somewhat larger file for the same quality.`,
+		group: 'Video',
 		opts: {
 			container: 'mp4',
 			...videoCodecDefaults(codec),
@@ -381,6 +399,11 @@ export function gpuPreset(hw: readonly string[]): Preset | null {
 export function presetsFor(hw: readonly string[] = []): Preset[] {
 	const gpu = gpuPreset(hw);
 	return gpu ? [PRESETS[0], gpu, ...PRESETS.slice(1)] : PRESETS;
+}
+
+/** The presets in the order the select shows them: by group, each group in the list's own order. */
+export function presetsByGroup(presets: readonly Preset[] = PRESETS): { group: PresetGroup; presets: Preset[] }[] {
+	return PRESET_GROUPS.map((group) => ({ group, presets: presets.filter((p) => p.group === group) })).filter((g) => g.presets.length > 0);
 }
 
 /** A full options object for a preset id, layered over the bare default. */

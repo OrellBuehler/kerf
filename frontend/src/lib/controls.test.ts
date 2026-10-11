@@ -161,8 +161,13 @@ describe('the old rules are gone', () => {
 	});
 
 	test('a disabled context-menu row is not dimmed on top of its disabled color', () => {
+		// The rows are `aria-disabled`, never `disabled`: the blanket `button:disabled` 50 % would
+		// dim them on top of their disabled ink, and a disabled button cannot take focus, which
+		// the menu pattern wants so a row can say why it is off.
 		const menu = read(`${EDITOR}ContextMenu.svelte`);
+		expect(menu).toContain('aria-disabled=');
+		expect(menu).not.toMatch(/\sdisabled=/);
 		expect(menu).not.toMatch(/opacity:\{[^}]*0\.\d+/);
-		expect(menu).toContain('opacity:1');
+		expect(CONTROLS).toMatch(/\.k-mrow\[aria-disabled='true'\]\s*\{[^}]*text-disabled/);
 	});
 });

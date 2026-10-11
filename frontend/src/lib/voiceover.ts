@@ -52,7 +52,7 @@ export function clampSpeed(speed: number): number {
 }
 
 export function fmtSpeed(speed: number): string {
-	return `${speed.toFixed(2).replace(/0$/, '')}×`;
+	return `${speed.toFixed(2)}×`;
 }
 
 export function wordCount(text: string): number {

@@ -4,15 +4,15 @@
 	// shows it before it is made: target against achieved length, the splices it takes and what is
 	// left over. Apply writes it as clips on the original file (`fit_music`), one revision.
 	import { tick } from 'svelte';
-	import Icon from './Icon.svelte';
+	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
-	import { trapFocus } from '$lib/modal';
 	import { editor } from '$lib/state.svelte';
 	import { planMusicFit } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 	import { formatTime } from '$lib/diff';
 	import { describeFit, describeRemainder, fitVerdict, musicSummary, parseTarget } from '$lib/music-ui';
 	import type { MusicFit } from '$lib/types';
+	import { tip } from '$lib/tip';
 
 	let { clipId, onClose }: { clipId: string; onClose: () => void } = $props();
 
@@ -108,130 +108,104 @@
 	const valueCss = 'font-family:var(--font-mono);font-size:12px;color:var(--text-primary)';
 </script>
 
-<!-- svelte-ignore a11y_click_events_have_key_events -->
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div
-	use:trapFocus={{ rescue: true }}
-	role="dialog"
-	aria-modal="true"
-	aria-label="Fit music to video"
-	tabindex="-1"
-	onclick={() => !applying && onClose()}
-	onkeydown={(e) => {
-		if (e.key === 'Escape' && !applying) onClose();
-		e.stopPropagation();
-	}}
-	style="position:fixed;inset:0;z-index:50;background:color-mix(in srgb,var(--scrim) 55%,transparent);display:flex;align-items:center;justify-content:center;padding:24px"
->
-	<div
-		onclick={(e) => e.stopPropagation()}
-		style="width:460px;max-width:100%;max-height:100%;display:flex;flex-direction:column;background:var(--surface-panel);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-md);box-shadow:var(--shadow-lg);overflow:hidden"
+<Modal title="Fit to video" icon="music" width={460} busy={applying} rescue {onClose}>
+	<fieldset
+		disabled={applying}
+		style="flex:1;min-height:0;min-width:0;margin:0;border:0;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px"
 	>
-		<div
-			style="height:var(--toolbar-h);flex:none;display:flex;align-items:center;gap:8px;padding:0 14px;border-bottom:var(--line-width) solid var(--border-default)"
-		>
-			<Icon n="music" s={15} color="var(--text-secondary)" />
-			<span style="font:var(--type-ui);font-weight:600;color:var(--text-primary);flex:1">Fit music to video</span>
-			<Btn variant="ghost" size="sm" aria-label="Close" onclick={onClose}>✕</Btn>
+		<div style="display:flex;flex-direction:column;gap:2px">
+			<span
+				style="font-size:13px;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+				use:tip={clip ? editor.assetName(clip.asset_id) : ''}>{clip ? editor.assetName(clip.asset_id) : ''}</span
+			>
+			{#if music}
+				<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">{musicSummary(music)}</span>
+			{/if}
 		</div>
 
-		<fieldset
-			disabled={applying}
-			style="flex:1;min-height:0;min-width:0;margin:0;border:0;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px"
-		>
-			<div style="display:flex;flex-direction:column;gap:2px">
-				<span
-					style="font-size:13px;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-					title={clip ? editor.assetName(clip.asset_id) : ''}>{clip ? editor.assetName(clip.asset_id) : ''}</span
-				>
-				{#if music}
-					<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">{musicSummary(music)}</span>
-				{/if}
-			</div>
-
-			<div style="display:flex;align-items:center;gap:5px;padding:4px 0">
-				<span style="{labelCss};width:70px;flex:none">Length</span>
-				<button type="button" style={chip(!custom)} aria-pressed={!custom} onclick={() => (custom = false)}>
-					To the picture
-				</button>
-				<button type="button" style={chip(custom)} aria-pressed={custom} onclick={chooseCustom}>Custom</button>
-				{#if custom}
-					<input
-						bind:this={lengthEl}
-						type="text"
-						inputmode="decimal"
-						aria-label="Length in seconds"
-						bind:value={customText}
-						onkeydown={(e) => {
-							if (e.key === 'Enter') {
-								e.preventDefault();
-								void apply();
-							}
-						}}
-						style={inputCss}
-					/>
-					<span style={labelCss}>s</span>
-				{/if}
-			</div>
-
-			<div
-				aria-live="polite"
-				style="display:grid;grid-template-columns:1fr auto;gap:5px 12px;padding:10px 12px;border-radius:var(--radius-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-subtle);min-height:150px;align-content:start"
-			>
-				{#if fit}
-					<span style={labelCss}>Target</span>
-					<span style={valueCss}>{formatTime(fit.target)}</span>
-					<span style={labelCss}>Fitted</span>
-					<span style={valueCss}>{formatTime(fit.duration)}</span>
-					<span style={labelCss}>Splices</span>
-					<span style={valueCss}>{fit.splices}</span>
-					<span style={labelCss}>Bars between intro and ending</span>
-					<span style={valueCss}>{fit.bars}</span>
-					<span
-						data-verdict={verdict}
-						style="grid-column:1 / -1;margin-top:3px;font-size:12px;line-height:1.4;color:{verdict === 'exact'
-							? 'var(--success)'
-							: 'var(--warning)'}">{describeRemainder(fit, fadeOut)}</span
-					>
-				{:else if problem}
-					<span style="grid-column:1 / -1;font-size:12px;line-height:1.4;color:var(--text-muted)">{problem}</span>
-				{:else}
-					<span style="grid-column:1 / -1;font-size:12px;color:var(--text-muted)">Planning…</span>
-				{/if}
-			</div>
-
-			<label
-				style="display:flex;align-items:center;gap:8px;padding:2px 0;cursor:{overruns ? 'pointer' : 'default'};opacity:{overruns
-					? 1
-					: 0.6}"
-				title={overruns
-					? 'Cut the music at the target and fade it out over its last two seconds.'
-					: 'Only matters when the arrangement runs past the target.'}
-			>
+		<div style="display:flex;align-items:center;gap:5px;padding:4px 0">
+			<span style="{labelCss};width:70px;flex:none">Length</span>
+			<button type="button" style={chip(!custom)} aria-pressed={!custom} onclick={() => (custom = false)}>
+				To the picture
+			</button>
+			<button type="button" style={chip(custom)} aria-pressed={custom} onclick={chooseCustom}>Custom</button>
+			{#if custom}
 				<input
-					type="checkbox"
-					bind:checked={fadeOut}
-					disabled={!overruns}
-					style="accent-color:var(--kerf-500);width:15px;height:15px"
+					bind:this={lengthEl}
+					type="text"
+					inputmode="decimal"
+					aria-label="Length in seconds"
+					bind:value={customText}
+					onkeydown={(e) => {
+						if (e.key === 'Enter') {
+							e.preventDefault();
+							void apply();
+						}
+					}}
+					style={inputCss}
 				/>
-				<span style="font-size:12px;color:var(--text-secondary)">Fade out at the end</span>
-				{#if fit && !overruns}
-					<span style="font-size:11px;color:var(--text-muted)">— nothing runs over</span>
-				{/if}
-			</label>
+				<span style={labelCss}>s</span>
+			{/if}
+		</div>
 
-			<p style="margin:0;font-size:11px;line-height:1.5;color:var(--text-muted)">
-				Keeps the intro and the ending and repeats or drops whole phrases between, splicing on bar lines with a 10 ms
-				crossfade. The clip is replaced by clips on the original file; undo puts it back.
-			</p>
-		</fieldset>
+		<div
+			aria-live="polite"
+			style="display:grid;grid-template-columns:1fr auto;gap:5px 12px;padding:10px 12px;border-radius:var(--radius-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-subtle);min-height:150px;align-content:start"
+		>
+			{#if fit}
+				<span style={labelCss}>Target</span>
+				<span style={valueCss}>{formatTime(fit.target)}</span>
+				<span style={labelCss}>Fitted</span>
+				<span style={valueCss}>{formatTime(fit.duration)}</span>
+				<span style={labelCss}>Splices</span>
+				<span style={valueCss}>{fit.splices}</span>
+				<span style={labelCss}>Bars between intro and ending</span>
+				<span style={valueCss}>{fit.bars}</span>
+				<span
+					data-verdict={verdict}
+					style="grid-column:1 / -1;margin-top:3px;font-size:12px;line-height:1.4;color:{verdict === 'exact'
+						? 'var(--success)'
+						: 'var(--warning)'}">{describeRemainder(fit, fadeOut)}</span
+				>
+			{:else if problem}
+				<span style="grid-column:1 / -1;font-size:12px;line-height:1.4;color:var(--text-muted)">{problem}</span>
+			{:else}
+				<span style="grid-column:1 / -1;font-size:12px;color:var(--text-muted)">Planning…</span>
+			{/if}
+		</div>
 
-		<div style="flex:none;border-top:var(--line-width) solid var(--border-default);padding:12px 16px">
+		<label
+			style="display:flex;align-items:center;gap:8px;padding:2px 0;cursor:{overruns ? 'pointer' : 'default'};opacity:{overruns
+				? 1
+				: 0.6}"
+			use:tip={overruns
+				? 'Cut the music at the target and fade it out over its last two seconds.'
+				: 'Only matters when the arrangement runs past the target.'}
+		>
+			<input
+				type="checkbox"
+				bind:checked={fadeOut}
+				disabled={!overruns}
+				style="accent-color:var(--kerf-500);width:15px;height:15px"
+			/>
+			<span style="font-size:12px;color:var(--text-secondary)">Fade out at the end</span>
+			{#if fit && !overruns}
+				<span style="font-size:11px;color:var(--text-muted)">— nothing runs over</span>
+			{/if}
+		</label>
+
+		<p style="margin:0;font-size:11px;line-height:1.5;color:var(--text-muted)">
+			Keeps the intro and the ending and repeats or drops whole phrases between, splicing on bar lines with a 10 ms
+			crossfade. The clip is replaced by clips on the original file; undo puts it back.
+		</p>
+	</fieldset>
+	{#snippet footer()}
+		<div style="padding:12px 16px">
 			<div style="display:flex;align-items:center;gap:8px">
 				<div style="flex:1"></div>
-				<Btn variant="ghost" size="md" onclick={onClose}>Cancel</Btn>
-				<Btn variant="primary" size="md" icon="music" data-rescue disabled={!canApply} onclick={apply}>Fit music</Btn>
+				<Btn variant="ghost" size="md" disabled={applying} onclick={onClose}>Cancel</Btn>
+				<Btn variant="primary" size="md" icon="music" data-rescue disabled={!canApply} onclick={apply}>Fit</Btn>
 			</div>
 		</div>
-	</div>
-</div>
+	{/snippet}
+</Modal>

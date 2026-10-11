@@ -15,6 +15,7 @@ import {
 	isHwCodec,
 	LOUDNESS_TARGETS,
 	loudnessChoice,
+	presetsByGroup,
 	presetsFor,
 	reconcileContainer,
 	validateExport,
@@ -228,11 +229,53 @@ describe('the "Fast (GPU)" preset', () => {
 		expect(applyPreset(GPU_PRESET_ID, ['h264_amf']).preset ?? null).toBeNull();
 	});
 
+	test('lands in the Video group, right after Web 1080p, and loses no other preset', () => {
+		const groups = presetsByGroup(presetsFor(['h264_amf']));
+		const video = groups.find((g) => g.group === 'Video')!.presets.map((p) => p.id);
+		expect(video.slice(0, 3)).toEqual(['web_1080p', GPU_PRESET_ID, 'youtube_4k']);
+		expect(groups.flatMap((g) => g.presets.map((p) => p.id)).sort()).toEqual([...PRESETS.map((p) => p.id), GPU_PRESET_ID].sort());
+		expect(presetsByGroup(presetsFor([])).flatMap((g) => g.presets.map((p) => p.id))).not.toContain(GPU_PRESET_ID);
+	});
+
 	test('says what it runs on and what the trade is', () => {
 		const p = gpuPreset(['h264_amf'])!;
 		expect(p.label).toBe('Fast (GPU)');
 		expect(p.description).toContain('AMD GPU (AMF)');
 		expect(p.description).toContain('somewhat larger file');
 		expect(p.description).toContain('CRF 20');
+	});
+});
+
+describe('the preset select', () => {
+	test('names and describes each preset the way the copy deck does', () => {
+		const label = (id: string) => PRESETS.find((p) => p.id === id)!;
+		expect(label('web_1080p').description).toBe('H.264 MP4 at 1080p. Plays everywhere; the safe default.');
+		expect(label('av1_web').description).toBe("AV1 in MKV at 1080p. Smallest files and slowest to encode; some devices can't play it.");
+		expect(label('gif').description).toBe('Looping GIF at 480p, 15 fps, no sound.');
+		expect(label('audio_mp3').label).toBe('MP3 audio (320 kbps)');
+		expect(label('audio_wav').label).toBe('WAV audio (24-bit)');
+		for (const p of PRESETS) {
+			expect(p.description, p.id).not.toMatch(/via |Next-gen|intermediate/);
+			expect(p.description.endsWith('.'), p.id).toBe(true);
+		}
+	});
+
+	test('what a description says matches what the preset does', () => {
+		const get = (id: string) => PRESETS.find((p) => p.id === id)!.opts;
+		expect(get('gif').fps).toBe(15);
+		expect(get('gif').resolution).toEqual([854, 480]);
+		expect(get('vertical_reel').resolution).toEqual([1080, 1920]);
+		expect(get('vertical_reel').fps).toBe(30);
+		expect(get('square_social').fps).toBe(30);
+		expect(get('target_size_2pass').video_bitrate).toBe('8M');
+		expect(get('web_720p').resolution).toEqual([1280, 720]);
+		expect(get('audio_mp3').audio_bitrate).toBe('320k');
+	});
+
+	test('every preset is in a group, the groups come in the deck’s order, and none is lost', () => {
+		const groups = presetsByGroup();
+		expect(groups.map((g) => g.group)).toEqual(['Video', 'Social', 'Master', 'Audio']);
+		expect(groups.flatMap((g) => g.presets.map((p) => p.id)).sort()).toEqual(PRESETS.map((p) => p.id).sort());
+		expect(groups.find((g) => g.group === 'Audio')!.presets.map((p) => p.id)).toEqual(['audio_mp3', 'audio_wav']);
 	});
 });

@@ -164,6 +164,10 @@ gif-loop-forever -loop 0
 gif-loop-once -loop -1
 hwaccel -hwaccel
 still-region crop=2*trunc(
+still-fade settb=expr=
+still-fade-alpha :alpha=1,setpts=PTS-STARTPTS
+still-fade-white :c=white,setpts=PTS-STARTPTS
+still-fade-pixel-format ,setpts=PTS-STARTPTS,format=yuv
 still-file-png image2 -vcodec png
 still-file-jpeg image2 -vcodec mjpeg -y
 still-jpeg-pipe image2pipe
@@ -993,7 +997,7 @@ fn transitions(c: &Case, assets: &[Asset]) -> Vec<String> {
 }
 
 /// The families that come from the case's structure rather than from argv text.
-const STRUCTURAL: [&str; 25] = [
+const STRUCTURAL: [&str; 27] = [
     "muted-track",
     "solo-track",
     "disabled-clip",
@@ -1019,6 +1023,8 @@ const STRUCTURAL: [&str; 25] = [
     "channel-held-static",
     "channel-colour-only",
     "channel-opacity-alone",
+    "still-tail",
+    "still-travel",
 ];
 
 fn expected(table: &[(&str, &str)]) -> Vec<String> {
@@ -1118,6 +1124,16 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
             .flat_map(|t| &t.clips)
     };
     let times = [c.stills[0].0, c.stills[1].0, c.preview.0];
+    // A still inside a transition: a clip kept on screen past its end, or one a slide or a push moves.
+    let fps = export_format(&rendered, assets, &c.opts).fps;
+    let layers = |t: f64| still_layers(&rendered, assets, fps, t.max(0.0));
+    let still_transitions = c.stills.iter().fold((false, false), |(tail, travel), (t, _)| {
+        let layers = layers(*t);
+        (
+            tail || layers.iter().any(|l| t.max(0.0) >= l.active.clip.timeline_end()),
+            travel || layers.iter().any(|l| l.motion != (0.0, 0.0)),
+        )
+    });
     let channels = |rf: &Reframe| {
         let k = &rf.keyframes;
         [
@@ -1182,6 +1198,8 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
             clips().any(|k| k.is_keyed(Property::Opacity) && !k.is_keyed(Property::Scale)),
             "channel-opacity-alone",
         ),
+        (still_transitions.0, "still-tail"),
+        (still_transitions.1, "still-travel"),
         (chain_tails(&flat[0]).0, "zoom-keyed-last"),
         (chain_tails(&flat[2]).0, "preview-zoom-keyed-last"),
         (chain_tails(&flat[0]).1, "alpha-kept"),

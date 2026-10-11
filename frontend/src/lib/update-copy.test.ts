@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { errorView, installNote, updateTitle } from './update-copy';
+import { CURRENT_LINE, downloadingNote, errorView, installNote, releaseDate, updateTitle, versionLine } from './update-copy';
 
 const found = { version: '0.25.0' };
 
@@ -61,5 +61,41 @@ describe('installNote', () => {
 	test('a failed check has no install to fall back from', () => {
 		expect(installNote('check', true)).toBeNull();
 		expect(installNote(null, true)).toBeNull();
+	});
+});
+
+describe('the version line', () => {
+	test('says what is running and what is on offer, with the date as people write it', () => {
+		expect(versionLine('0.24.0', { version: '0.25.0', date: '2026-10-01T09:30:00Z' })).toBe('Current 0.24.0 → 0.25.0 · 1 Oct 2026');
+		expect(versionLine('0.24.0', { version: '0.25.0', date: '2026-12-25' })).toBe('Current 0.24.0 → 0.25.0 · 25 Dec 2026');
+	});
+
+	test('it never says Installed, which reads as though the new version were in', () => {
+		expect(versionLine('dev', { version: '0.99.0' })).toBe('Current dev → 0.99.0');
+		expect(versionLine('dev', { version: '0.99.0' })).not.toContain('Installed');
+	});
+
+	test('with nothing on offer it is just what is running; before the version is known, an ellipsis', () => {
+		expect(versionLine('0.24.0', null)).toBe('Current 0.24.0');
+		expect(versionLine('', null)).toBe('Current …');
+	});
+
+	test('a date that is not one is left out', () => {
+		expect(releaseDate('yesterday')).toBeNull();
+		expect(releaseDate('2026-13-01')).toBeNull();
+		expect(releaseDate(null)).toBeNull();
+		expect(versionLine('1', { version: '2', date: 'soon' })).toBe('Current 1 → 2');
+	});
+});
+
+describe('what the dialog says while it works', () => {
+	test('the quiet and the busy lines', () => {
+		expect(CURRENT_LINE).toBe("You're on the latest version.");
+		expect(downloadingNote(true)).toBe('Downloading the update. Kerf may close when it is done.');
+		expect(downloadingNote(false)).toBe('Downloading the update…');
+		for (const windows of [true, false]) expect(downloadingNote(windows)).not.toMatch(/background/);
+	});
+	test('"Kerf may close" is said only where the installer really closes it', () => {
+		expect(downloadingNote(false)).not.toMatch(/close/);
 	});
 });
