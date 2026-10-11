@@ -18,7 +18,7 @@ const NATIVE_TITLE_ALLOWED: Record<string, string> = {};
 /** Components that take a `title` and route it to `use:tip` (or, for the last two, mean something
  *  else by it: a dialog's heading, a section's heading). A component not listed would spread it
  *  onto its <button> as a native tooltip. */
-const TITLE_PROPS = new Set(['Btn', 'IconBtn', 'ToolbarToggle', 'Modal', 'InspectorSection']);
+const TITLE_PROPS = new Set(['Btn', 'IconBtn', 'ToolbarToggle', 'Chip', 'Tile', 'Modal', 'InspectorSection']);
 
 interface Node {
 	type: string;

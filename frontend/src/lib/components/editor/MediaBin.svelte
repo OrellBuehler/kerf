@@ -5,10 +5,8 @@
 	import Badge from './Badge.svelte';
 	import MediaChips from './MediaChips.svelte';
 	import Btn from './Btn.svelte';
-	import IconBtn from './IconBtn.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
-	import { settings } from '$lib/settings.svelte';
 	import { mediaStatus } from '$lib/media-status.svelte';
 	import { analyzeMenuItems } from '$lib/analyze-menu';
 	import { doneCount, doneSummary, kindInfo } from '$lib/analysis-steps';
@@ -17,6 +15,7 @@
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { getFrame, inTauri, revealPath } from '$lib/api';
+	import { importMedia } from '$lib/import-media';
 	import { toast } from '$lib/notifications.svelte';
 	import { thumbnails } from '$lib/thumbnails';
 	import { analysisFacts, audioExtraction, mediaInfo, shortPath, specLine, thumbTime, type MediaInfo } from '$lib/media-info';
@@ -62,28 +61,6 @@
 			});
 		}
 	});
-
-	async function onImport() {
-		if (!inTauri()) {
-			toast.info('Importing media is available in the desktop app.');
-			return;
-		}
-		try {
-			const { imported, failed } = await editor.importMedia();
-			for (const f of failed) toast.error(`Couldn't import ${f.name}: ${f.message}`);
-			if (imported.length > 0) {
-				toast.success(
-					imported.length === 1 ? `Imported ${imported[0].name}` : `Imported ${imported.length} files`
-				);
-				await ui.analyzeImported(
-					imported.map((a) => a.id),
-					settings.autoAnalysis
-				);
-			}
-		} catch (e) {
-			toast.error(e instanceof Error ? e.message : String(e));
-		}
-	}
 
 	function onSelect(assetId: string) {
 		void editor.select(assetId);
@@ -246,7 +223,7 @@
 		if (info.kind === 'video')
 			items.push({
 				label: spherical ? 'Mark as flat footage' : 'Mark as 360 (equirect)',
-				icon: 'rotate-ccw',
+				icon: spherical ? 'video' : 'globe',
 				action: () =>
 					void editor
 						.setAssetProjection(asset.id, spherical ? 'flat' : 'equirect')
@@ -332,10 +309,10 @@
 			{:else}
 				<!-- dropzone -->
 				<div
-					onclick={onImport}
+					onclick={importMedia}
 					role="button"
 					tabindex="0"
-					onkeydown={(e) => e.key === 'Enter' && onImport()}
+					onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), void importMedia())}
 					style="border:1.5px dashed var(--border-strong);border-radius:var(--radius-md);padding:32px 16px;display:flex;flex-direction:column;align-items:center;gap:12px;cursor:pointer;background:var(--surface-inset);text-align:center"
 				>
 					<div
@@ -356,104 +333,89 @@
 				</div>
 			{/if}
 		{:else}
-			<!-- asset grid -->
+			<!-- asset list; the count and the import actions are the library's header -->
 			<div style="display:flex;flex-direction:column;gap:8px">
-				<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:2px">
-					<span
-						style="font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted)"
-						>{assets.length} assets</span
-					>
-					{#if editor.importing}
-						<span style="display:inline-flex;align-items:center;gap:5px">
-							{#if editor.importProgress !== null}
-								<span
-									style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)"
-									use:tip={'Stitching a 360 lens pair'}
-									>{Math.round(editor.importProgress * 100)}%</span
-								>
-							{/if}
-							<span class="kerf-spin" style="color:var(--kerf-400)"><Icon n="loader" s={14} /></span>
-						</span>
-					{:else}
-						<span style="display:inline-flex;gap:2px">
-							<IconBtn title={{ text: 'Write a voiceover…', detail: 'Speak a script onto the timeline.' }} size={30} onclick={() => ui.openVoiceover()}
-								><Icon n="mic" s={14} /></IconBtn
-							>
-							<IconBtn title="Import" size={30} onclick={onImport}><Icon n="plus" s={14} /></IconBtn>
-						</span>
-					{/if}
-				</div>
 				{#each assets as a (a.asset.id)}
 					{@const sel = a.asset.id === editor.selectedAssetId}
 					{@const spec = specLine(a.info)}
 					<div
 						role="button"
 						tabindex="0"
+						aria-pressed={sel}
 						draggable={true}
 						ondragstart={(e) => onAssetDragStart(e, a)}
 						ondragend={onAssetDragEnd}
 						oncontextmenu={(e) => onAssetContextMenu(e, a)}
 						onclick={() => onSelect(a.asset.id)}
-						onkeydown={(e) => e.key === 'Enter' && onSelect(a.asset.id)}
+						onkeydown={(e) => {
+							if (e.key === 'Enter' || e.key === ' ') {
+								e.preventDefault();
+								onSelect(a.asset.id);
+							}
+						}}
 						use:tip={`${a.asset.path}
 Drag onto a timeline track to add a clip · right-click for details`}
 						style="display:flex;flex-direction:column;gap:6px;padding:7px;border-radius:var(--radius-sm);background:{sel ? 'var(--surface-hover)' : 'var(--surface-raised)'};border:var(--line-width) solid {sel ? 'var(--kerf-500)' : 'var(--border-subtle)'};cursor:grab"
 					>
 						<div style="display:flex;gap:9px;align-items:center">
-						<div
-							style="width:56px;height:36px;border-radius:3px;flex:none;overflow:hidden;background:{a.info
-								.kind === 'audio'
-								? 'var(--track-audio)'
-								: VIDEO_THUMB_BG};display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 80%,transparent)"
-						>
-							{#if thumbs[a.asset.id]}
-								<img
-									src={thumbs[a.asset.id]}
-									alt=""
-									draggable={false}
-									style="width:100%;height:100%;object-fit:cover;display:block"
-								/>
-							{:else}
-								<Icon
-									n={a.info.kind === 'image' ? 'image' : a.info.kind === 'audio' ? 'audio-waveform' : 'video'}
-									s={14}
-								/>
-							{/if}
-						</div>
-						<div style="flex:1;min-width:0">
 							<div
-								style="font-size:12px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+								style="width:56px;height:36px;border-radius:var(--radius-sm);flex:none;overflow:hidden;background:{a.info
+									.kind === 'audio'
+									? 'var(--track-audio)'
+									: VIDEO_THUMB_BG};display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 80%,transparent)"
 							>
-								{a.asset.name}
+								{#if thumbs[a.asset.id]}
+									<img
+										src={thumbs[a.asset.id]}
+										alt=""
+										draggable={false}
+										style="width:100%;height:100%;object-fit:cover;display:block"
+									/>
+								{:else}
+									<Icon
+										n={a.info.kind === 'image' ? 'image' : a.info.kind === 'audio' ? 'audio-waveform' : 'video'}
+										s={14}
+									/>
+								{/if}
 							</div>
-							{#if spec}
-								<div
-									style="font-size:12px;color:{sel ? 'var(--text-secondary)' : 'var(--text-muted)'};margin-top:3px;line-height:1.4;overflow-wrap:anywhere"
-									use:tip={spec}
-								>
-									{spec}
+							<div style="flex:1;min-width:0">
+								<div style="display:flex;align-items:baseline;gap:8px">
+									<span
+										style="flex:1;min-width:0;font-size:12px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+										>{a.asset.name}</span
+									>
+									<span
+										style="flex:none;font-family:var(--font-mono);font-size:11px;font-variant-numeric:tabular-nums;color:{sel ? 'var(--text-secondary)' : 'var(--text-muted)'}"
+										>{a.info.duration}</span
+									>
 								</div>
-							{/if}
-							<div style="display:flex;gap:5px;align-items:center;margin-top:4px;flex-wrap:wrap">
-								<span style="font-family:var(--font-mono);font-size:11px;color:{sel ? 'var(--text-secondary)' : 'var(--text-muted)'}"
-									>{a.info.duration}</span
-								>
-								{#if a.info.projection}
-									<Badge tone="kerf">360</Badge>
-								{/if}
-								{#if a.info.voiceover}
-									<Badge tone="kerf">voiceover</Badge>
-								{/if}
-								{#if a.info.kind === 'image'}
-									<Badge tone="neutral">still</Badge>
-								{/if}
-								{#if a.info.uses > 0}
-									<Badge tone="neutral" style="font-family:var(--font-mono)">×{a.info.uses}</Badge>
+								{#if spec}
+									<div
+										style="font-size:11px;color:{sel ? 'var(--text-secondary)' : 'var(--text-muted)'};margin-top:2px;line-height:1.4;overflow-wrap:anywhere"
+										use:tip={spec}
+									>
+										{spec}
+									</div>
 								{/if}
 							</div>
 						</div>
+						<div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap">
+							<MediaChips assetId={a.asset.id} compact />
+							{#if a.info.projection}
+								<Badge tone="kerf">360</Badge>
+							{/if}
+							{#if a.info.voiceover}
+								<Badge tone="kerf">voiceover</Badge>
+							{/if}
+							{#if a.info.kind === 'image'}
+								<Badge tone="neutral">still</Badge>
+							{/if}
+							{#if a.info.uses > 0}
+								<span use:tip={`Used in ${a.info.uses === 1 ? '1 clip' : `${a.info.uses} clips`} on the timeline`}>
+									<Badge tone="neutral" style="font-family:var(--font-mono)">×{a.info.uses}</Badge>
+								</span>
+							{/if}
 						</div>
-						<MediaChips assetId={a.asset.id} />
 					</div>
 				{/each}
 			</div>

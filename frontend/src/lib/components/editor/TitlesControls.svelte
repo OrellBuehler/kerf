@@ -5,6 +5,9 @@
 	// Inspector's "Titles lane" section and of the library's Titles tab — one
 	// component, so the two cannot drift.
 	import Btn from './Btn.svelte';
+	import IconBtn from './IconBtn.svelte';
+	import Chip from './Chip.svelte';
+	import CheckRow from './CheckRow.svelte';
 	import Icon from './Icon.svelte';
 	import { documentOf } from '$lib/realm';
 	import { editor } from '$lib/state.svelte';
@@ -27,8 +30,7 @@
 		resolveChoice
 	} from '$lib/caption-import-ui';
 	import { attempt } from '$lib/ops';
-	import { chip } from '$lib/chip';
-	import { tip } from '$lib/tip';
+	import { clock } from '$lib/clock';
 
 	const uid = $props.id();
 	/** The options row: where its window (the panel may be in a detached one) is read from. */
@@ -87,70 +89,59 @@
 		closeImport(true);
 	}
 
-	/** Minutes:seconds.centiseconds — a title's start in the lane's list. */
-	function tc(s: number): string {
-		const t = Math.max(0, s);
-		const m = Math.floor(t / 60);
-		const sec = Math.floor(t % 60);
-		const cs = Math.floor((t % 1) * 100);
-		return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}.${cs.toString().padStart(2, '0')}`;
-	}
-
-	const selectCss =
-		'background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:12px;padding:5px 7px';
+	const fieldCss =
+		'box-sizing:border-box;height:var(--control-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:var(--text-sm);padding:0 8px';
 	const fieldLabel = 'font-size:12px;color:var(--text-muted)';
-
-	const xBtn =
-		'margin-left:auto;background:transparent;border:none;color:var(--text-muted);cursor:pointer;font-size:16px;line-height:1;min-width:28px;min-height:28px;padding:2px 5px';
 </script>
 
-<div style="font-size:12px;color:var(--text-muted);line-height:1.4;margin-bottom:6px">
+<div style="font-size:12px;color:var(--text-muted);line-height:1.4;margin-bottom:10px">
 	Titles sit on their own lane in the timeline, apart from the clips.
 </div>
-<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">
+<div class="k-overline" style="margin-bottom:6px">Add text</div>
+<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:6px;margin-bottom:14px">
 	{#each TEXT_STYLES as s (s.id)}
-		<button style={chip(false)} disabled={editor.busy} onclick={() => void addStyledTitle(s)}>+ {s.label}</button>
+		<Btn size="sm" icon="plus" iconSize={12} disabled={editor.busy} onclick={() => void addStyledTitle(s)}>{s.label}</Btn>
 	{/each}
+	<Btn size="sm" icon="plus" iconSize={12} disabled={editor.busy} onclick={() => void addTextHere()}>Text</Btn>
 </div>
-<div style="display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin-bottom:6px">
-	<span style="font-size:12px;color:var(--text-muted)">Caption style</span>
+<div class="k-overline" style="margin-bottom:6px">Captions</div>
+<div role="group" aria-label="Caption style" style="display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin-bottom:6px">
+	<span style="font-size:12px;color:var(--text-muted)">Style</span>
 	{#each CAPTION_LOOKS as c (c.id)}
-		<button
-			style={chip(ui.captionStyle === c.id)}
-			use:tip={c.hint}
-			aria-pressed={ui.captionStyle === c.id}
-			onclick={() => (ui.captionStyle = c.id)}
-		>
-			{c.label}
-		</button>
+		<Chip pressed={ui.captionStyle === c.id} title={c.hint} onclick={() => (ui.captionStyle = c.id)}>{c.label}</Chip>
 	{/each}
 </div>
-<div style="display:flex;flex-wrap:wrap;gap:7px;margin-bottom:6px">
-	<Btn size="sm" variant="ghost" style="flex:1" disabled={editor.busy} onclick={() => void addTextHere()}>+ Text</Btn>
-	<Btn
-		size="sm"
-		variant="ghost"
-		disabled={editor.busy}
-		title={hasCaptions ? recaptionHint(captionCount) : CAPTION_HINT}
-		onclick={() => void makeCaptions()}
-	>
-		{hasCaptions ? 'Recaption' : 'Captions'}
-	</Btn>
-	{#if hasCaptions}
-		<Btn size="sm" variant="ghost" disabled={editor.busy} title={clearHint(captionCount)} onclick={() => void dropCaptions()}>Clear</Btn>
-	{/if}
-	<Btn size="sm" variant="ghost" icon="mic" disabled={editor.busy} title="Speak a script onto the timeline" onclick={() => ui.openVoiceover()}
-		>Write a voiceover…</Btn
-	>
+<div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin-bottom:6px">
+	<div style="display:flex;gap:4px;min-width:0">
+		<Btn
+			size="sm"
+			disabled={editor.busy}
+			title={hasCaptions ? recaptionHint(captionCount) : CAPTION_HINT}
+			style="flex:1;min-width:0"
+			onclick={() => void makeCaptions()}
+		>
+			{hasCaptions ? 'Recaption' : 'Captions'}
+		</Btn>
+		{#if hasCaptions}
+			<IconBtn size={30} title={clearHint(captionCount)} disabled={editor.busy} onclick={() => void dropCaptions()}>
+				<Icon n="trash" s={14} />
+			</IconBtn>
+		{/if}
+	</div>
 	<Btn
 		id="{uid}-toggle"
 		size="sm"
-		variant={importOpen ? 'secondary' : 'ghost'}
+		variant={importOpen ? 'primary' : 'secondary'}
 		icon="file-text"
 		aria-expanded={importOpen}
 		aria-controls="{uid}-import"
 		title="Caption the cut from a .srt or .ass subtitle file"
-		onclick={() => (importOpen = !importOpen)}>Import captions…</Btn
+		onclick={() => (importOpen = !importOpen)}>Import</Btn
+	>
+</div>
+<div style="margin-bottom:10px">
+	<Btn size="sm" icon="mic" disabled={editor.busy} title="Speak a script onto the timeline" style="width:100%" onclick={() => ui.openVoiceover()}
+		>Write a voiceover…</Btn
 	>
 </div>
 {#if importOpen}
@@ -170,14 +161,9 @@
 				<div role="group" aria-label="Timing" style="display:flex;gap:5px;flex-wrap:wrap">
 					{#each IMPORT_BASES as b (b.id)}
 						{@const unavailable = b.id === 'source' && offered.length === 0}
-						<button
-							style={chip(choice.base === b.id) + (unavailable ? ';opacity:0.5;cursor:default' : '')}
-							aria-pressed={choice.base === b.id}
-							disabled={unavailable}
-							onclick={() => (ui.captionImportBase = b.id)}
-						>
+						<Chip pressed={choice.base === b.id} disabled={unavailable} onclick={() => (ui.captionImportBase = b.id)}>
 							{b.label}
-						</button>
+						</Chip>
 					{/each}
 				</div>
 			</div>
@@ -185,9 +171,10 @@
 				<label style="display:flex;align-items:center;gap:8px">
 					<span style="{fieldLabel};flex:none">Clip</span>
 					<select
+						class="k-select"
 						value={choice.assetId ?? ''}
 						onchange={(e) => (ui.captionImportAsset = e.currentTarget.value)}
-						style="{selectCss};flex:1;min-width:0"
+						style="flex:1"
 					>
 						{#each offered as a (a.id)}
 							<option value={a.id}>{a.label}{a.clips > 1 ? ` · ${a.clips} clips` : ''}</option>
@@ -198,21 +185,16 @@
 			<div style="font-size:12px;color:var(--text-muted);line-height:1.4">
 				{offered.length === 0 ? NO_SOURCE_HINT : baseHint(choice, choiceAsset?.label)}
 			</div>
-			<label style="display:flex;align-items:flex-start;gap:8px;cursor:{ui.captionStyle === 'lines' ? 'pointer' : 'default'}">
-				<input
-					type="checkbox"
-					checked={keepLines}
-					disabled={ui.captionStyle !== 'lines'}
-					onchange={(e) => (ui.captionImportKeepLines = e.currentTarget.checked)}
-					style="accent-color:var(--kerf-500);width:15px;height:15px;margin-top:1px;flex:none"
-				/>
-				<span style="display:flex;flex-direction:column;gap:2px">
-					<span style="font-size:12px;color:var(--text-primary)">Keep the file's lines</span>
-					<span style="font-size:12px;color:var(--text-muted);line-height:1.4"
-						>{keepLinesHint(ui.captionStyle, keepLines, frame)}</span
-					>
-				</span>
-			</label>
+			<CheckRow
+				checked={keepLines}
+				disabled={ui.captionStyle !== 'lines'}
+				onchange={(e) => (ui.captionImportKeepLines = e.currentTarget.checked)}
+			>
+				Keep the file's lines
+			</CheckRow>
+			<div style="font-size:12px;color:var(--text-muted);line-height:1.4;margin:-4px 0 0 24px">
+				{keepLinesHint(ui.captionStyle, keepLines, frame)}
+			</div>
 			<label style="display:flex;align-items:center;gap:8px">
 				<span style="{fieldLabel};flex:none">Shift times</span>
 				<input
@@ -221,7 +203,7 @@
 					bind:value={ui.captionImportOffset}
 					placeholder="0"
 					aria-label="Shift every time in the file by this many seconds"
-					style="{selectCss};width:84px;min-width:0"
+					style="{fieldCss};width:84px;min-width:0"
 				/>
 				<span style={fieldLabel}>seconds</span>
 			</label>
@@ -254,15 +236,20 @@
 	<div style="display:flex;align-items:center;gap:6px;padding:3px 0">
 		<button
 			onclick={() => pickTitle(o)}
-			style="flex:1;min-width:0;display:flex;align-items:center;gap:8px;background:transparent;border:none;cursor:pointer;text-align:left;color:{editor.selectedOverlayId === o.id ? 'var(--kerf-300)' : 'var(--text-secondary)'};padding:0"
+			aria-pressed={editor.selectedOverlayId === o.id}
+			style="flex:1;min-width:0;display:flex;align-items:center;gap:8px;background:transparent;border:none;cursor:pointer;text-align:left;color:{editor.selectedOverlayId === o.id ? 'var(--kerf-300)' : 'var(--text-secondary)'};padding:4px 0"
 		>
 			<span style="flex:1;min-width:0;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 				>{o.text || '(empty)'}</span
 			>
-			<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">{tc(o.start)}</span>
+			<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);font-variant-numeric:tabular-nums">{clock(o.start)}</span>
 		</button>
-		<button onclick={() => void attempt(() => editor.removeOverlay(o.id))} disabled={editor.busy} use:tip={'Remove'} aria-label="Remove {o.text ? `“${o.text}”` : 'this title'}" style={xBtn}
-			><Icon n="x" s={14} /></button
+		<IconBtn
+			size={28}
+			data-tone="quiet"
+			title={`Remove ${o.text ? `“${o.text}”` : 'this title'}`}
+			disabled={editor.busy}
+			onclick={() => void attempt(() => editor.removeOverlay(o.id))}><Icon n="x" s={14} /></IconBtn
 		>
 	</div>
 {/each}

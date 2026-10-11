@@ -18,6 +18,9 @@
 	import TranscriptPanel from './TranscriptPanel.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { workspace } from '$lib/workspace.svelte';
+	import { editor } from '$lib/state.svelte';
+	import { ui } from '$lib/editor-ui.svelte';
+	import { importMedia } from '$lib/import-media';
 	import { LIBRARY_MIN_OPEN_WIDTH, LIBRARY_OPEN_WIDTH, LIBRARY_RAIL_WIDTH } from '$lib/layout';
 	import { LIBRARY_TAB_SPECS, stepTab, type LibraryTab } from '$lib/workspaces';
 	import { tip } from '$lib/tip';
@@ -27,6 +30,8 @@
 	let { panelApi, dock }: { panelApi?: DockviewPanelApi; dock?: DockviewApi } = $props();
 
 	const tab = $derived(settings.libraryTab);
+	/** The Media tab's header carries the count and the two ways in once there is something in the bin. */
+	const assetCount = $derived(tab === 'media' ? editor.assets.length : 0);
 	const spec = $derived(LIBRARY_TAB_SPECS.find((t) => t.id === tab) ?? LIBRARY_TAB_SPECS[0]);
 
 	// The rail can only stand alone when the library has its group to itself — a
@@ -224,10 +229,32 @@
 				style="height:32px;flex:none;display:flex;align-items:center;gap:8px;padding:0 6px 0 12px;border-bottom:var(--line-width) solid var(--border-subtle)"
 			>
 				<span
-					use:tip={spec.hint}
+					use:tip={assetCount > 0 ? `${spec.hint}\n${assetCount} ${assetCount === 1 ? 'asset' : 'assets'} in the bin` : spec.hint}
 					style="flex:1;min-width:0;font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-					>{spec.label}</span
+					>{spec.label}{#if assetCount > 0}<span style="margin-left:6px;font-variant-numeric:tabular-nums">· {assetCount}</span>{/if}</span
 				>
+				{#if assetCount > 0}
+					{#if editor.importing}
+						<span style="display:inline-flex;align-items:center;gap:5px">
+							{#if editor.importProgress !== null}
+								<span
+									style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted)"
+									use:tip={'Stitching a 360 lens pair'}>{Math.round(editor.importProgress * 100)}%</span
+								>
+							{/if}
+							<span class="kerf-spin" style="color:var(--kerf-400)"><Icon n="loader" s={14} /></span>
+						</span>
+					{:else}
+						<IconBtn
+							title={{ text: 'Write a voiceover…', detail: 'Speak a script onto the timeline.' }}
+							size={24}
+							onclick={() => ui.openVoiceover()}><Icon n="mic" s={14} /></IconBtn
+						>
+						<IconBtn title={settings.tip('Import media…', 'file.import')} size={24} onclick={importMedia}
+							><Icon n="plus" s={14} /></IconBtn
+						>
+					{/if}
+				{/if}
 				{#if solo}
 					<IconBtn title="Collapse the library to its rail" size={24} onclick={foldFromHeader}>
 						<Icon n="chevron-left" s={14} />

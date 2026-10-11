@@ -4,6 +4,9 @@ import {
 	QUICK_EDIT_STEPS,
 	analysisChips,
 	analysisKindDone,
+	analysisMeter,
+	applicable,
+	chipsFor,
 	analyzeChoices,
 	autoSteps,
 	doneCount,
@@ -181,5 +184,75 @@ describe('stages and cached data', () => {
 		expect(analysisKindDone({ ...empty, ran: ['transcript'] }, 'transcript')).toBe(true);
 		expect(analysisKindDone({ ...empty, ran: ['transcript'] }, 'silence')).toBe(false);
 		expect(analysisKindDone({ ...empty, audio_class: { class: 'music', confidence: 0.9 } }, 'rhythm')).toBe(true);
+	});
+});
+
+describe('the kinds a file can give', () => {
+	const song = { audio: true, image: false, video: false };
+	const silentClip = { audio: false, image: false, video: true };
+	const still = { audio: false, image: true, video: false };
+	const footage = { audio: true, image: false, video: true };
+
+	test('footage gives all five; a song no scenes; silent footage only scenes; a still nothing', () => {
+		const kinds = (m: Parameters<typeof applicable>[1]) => ALL_KINDS.filter((k) => applicable(k, m));
+		expect(kinds(footage)).toEqual([...ALL_KINDS]);
+		expect(kinds(song)).toEqual(['silence', 'loudness', 'rhythm', 'transcript']);
+		expect(kinds(silentClip)).toEqual(['scenes']);
+		expect(kinds(still)).toEqual([]);
+	});
+
+	test('a trait that is not known reads as a picture, so an old caller keeps every kind', () => {
+		expect(applicable('scenes', { audio: true, image: false })).toBe(true);
+	});
+
+	test('an mp3 is not shown a permanent "not run" for scenes, but a kind that happened is never hidden', () => {
+		const chips = analysisChips(status({}));
+		expect(chipsFor(chips, song).map((c) => c.kind)).toEqual(['silence', 'loudness', 'rhythm', 'transcript']);
+		const ran = analysisChips(status({ scenes: 'failed' }));
+		expect(chipsFor(ran, song).map((c) => c.kind)).toContain('scenes');
+		expect(chipsFor(analysisChips(status({ scenes: 'done' })), song).map((c) => c.kind)).toContain('scenes');
+		expect(chipsFor(analysisChips(status({}), 'scenes'), song).map((c) => c.kind)).toContain('scenes');
+	});
+});
+
+describe('the analysis meter', () => {
+	const meter = (states: Parameters<typeof status>[0], media = { audio: true, image: false, video: true }, running: AnalysisKind | null = null) =>
+		analysisMeter(chipsFor(analysisChips(status(states), running), media))!;
+
+	test('says how much has run in words', () => {
+		expect(meter({}).text).toBe('not analyzed');
+		expect(meter({ silence: 'done', rhythm: 'done' }).text).toBe('2 of 5 analyzed');
+		expect(meter(Object.fromEntries(ALL_KINDS.map((k) => [k, 'done']))).text).toBe('analyzed');
+		expect(meter(Object.fromEntries(ALL_KINDS.map((k) => [k, 'done']))).tone).toBe('done');
+	});
+
+	test('counts only what the file can give, so a song that has had everything is complete', () => {
+		const song = { audio: true, image: false, video: false };
+		const done = meter({ silence: 'done', loudness: 'done', rhythm: 'done', transcript: 'done' }, song);
+		expect(done.total).toBe(4);
+		expect(done.text).toBe('analyzed');
+	});
+
+	test('a kind switched off is not waiting for anything', () => {
+		const m = meter({ silence: 'done', scenes: 'done', loudness: 'done', rhythm: 'done', transcript: 'off' });
+		expect(m.total).toBe(4);
+		expect(m.text).toBe('analyzed');
+		expect(meter(Object.fromEntries(ALL_KINDS.map((k) => [k, 'off']))).text).toBe('analysis off');
+	});
+
+	test('a running pass and a failure outrank the count', () => {
+		expect(meter({ silence: 'done' }, undefined, 'scenes')).toMatchObject({ tone: 'running', text: 'analyzing…' });
+		expect(meter({ silence: 'done', loudness: 'failed' })).toMatchObject({ tone: 'failed', text: '1 failed' });
+	});
+
+	test('the tooltip leads with the headline and then lists every kind', () => {
+		const lines = meter({ silence: 'done', loudness: ['failed', 'ffmpeg exited with 1'] }).title.split('\n');
+		expect(lines[0]).toBe('Analysis — 1 of 5 done');
+		expect(lines).toContain('Silence — done');
+		expect(lines).toContain('Loudness — failed (ffmpeg exited with 1)');
+	});
+
+	test('nothing to draw when the file can give nothing', () => {
+		expect(analysisMeter(chipsFor(analysisChips(status({})), { audio: false, image: true }))).toBeNull();
 	});
 });

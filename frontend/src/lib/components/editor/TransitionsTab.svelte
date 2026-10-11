@@ -2,14 +2,13 @@
 	// The library's Transitions tab: the grouped picker from `transitions.ts`,
 	// applied to the clip selected on the timeline as the transition *into* it
 	// (the same `transition_in` the Inspector's Transition section edits).
-	import Icon from './Icon.svelte';
+	import Chip from './Chip.svelte';
+	import Hint from './Hint.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { DEFAULT_TRANSITION_SECONDS, TRANSITION_GROUPS, needsSourceHandle, transitionLabel } from '$lib/transitions';
 	import { attempt } from '$lib/ops';
-	import { chip } from '$lib/chip';
 	import type { TransitionKind } from '$lib/types';
 	import { FieldEdits } from '$lib/field-edit';
-	import { tip } from '$lib/tip';
 
 	const clip = $derived(editor.selectedClip);
 	const current = $derived(clip?.transition_in ?? null);
@@ -28,13 +27,7 @@
 
 <div style="flex:1;min-height:0;overflow-y:auto;padding:12px">
 	{#if reason}
-		<div
-			role="status"
-			style="display:flex;gap:7px;align-items:flex-start;padding:8px 10px;margin-bottom:12px;border-radius:var(--radius-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-subtle);font-size:12px;line-height:1.45;color:var(--text-muted)"
-		>
-			<span style="margin-top:1px"><Icon n="lightbulb" s={13} color="var(--text-muted)" /></span>
-			<span>{reason}</span>
-		</div>
+		<div style="margin-bottom:14px"><Hint>{reason}</Hint></div>
 	{:else}
 		<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:12px;color:var(--text-secondary)">
 			<span style="flex:1;min-width:0">
@@ -75,35 +68,31 @@
 	{/if}
 
 	<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:4px">
-		<button aria-pressed={!!clip && !current}
-			style="{chip(!!clip && !current)};{off ? 'opacity:.5;cursor:default' : ''}"
+		<Chip
+			pressed={!!clip && !current}
 			disabled={off}
-			use:tip={reason ?? 'A hard cut — no transition into this clip'}
-			onclick={() => clip && void attempt(() => editor.setTransition(clip.id, null))}>None</button
+			title={reason ?? 'A hard cut — no transition into this clip'}
+			onclick={() => clip && void attempt(() => editor.setTransition(clip.id, null))}>None</Chip
 		>
 	</div>
 
 	{#each TRANSITION_GROUPS as g (g.label)}
-		<div
-			style="margin:14px 0 4px;font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted)"
-		>
-			{g.label}
-		</div>
-		<div style="font-size:11px;color:var(--text-muted);margin-bottom:6px">{g.hint}</div>
+		<div class="k-overline" style="margin:14px 0 4px">{g.label}</div>
+		<div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">{g.hint}</div>
 		<div style="display:flex;gap:5px;flex-wrap:wrap">
 			{#each g.options as o (o.id)}
-				<button aria-pressed={current?.kind === o.id}
-					style="{chip(current?.kind === o.id)};{off ? 'opacity:.5;cursor:default' : ''}"
+				<Chip
+					pressed={current?.kind === o.id}
 					disabled={off}
-					use:tip={reason ?? o.label}
-					onclick={() => pick(o.id)}>{o.label}</button
+					title={reason ?? o.label}
+					onclick={() => pick(o.id)}>{o.label}</Chip
 				>
 			{/each}
 		</div>
 	{/each}
 
 	{#if current && needsSourceHandle(current.kind)}
-		<div style="font-size:11px;color:var(--text-muted);line-height:1.45;margin-top:14px">
+		<div style="font-size:12px;color:var(--text-muted);line-height:1.45;margin-top:14px">
 			This transition plays both shots at once, so it borrows the unused footage after the previous clip's cut.
 			A clip trimmed to the very end of its source has none to lend and cuts hard instead.
 		</div>

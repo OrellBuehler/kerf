@@ -82,7 +82,7 @@
 			<Icon n="captions" s={22} />
 			<span style="font-size:12px;color:var(--text-secondary)">{tx.title}</span>
 			{#if tx.body}
-				<span style="font-size:11px;line-height:1.5;max-width:240px">{tx.body}</span>
+				<span style="font-size:12px;line-height:1.5;max-width:240px">{tx.body}</span>
 			{/if}
 			{#if ui.analyzing}
 				<div style="width:200px;height:3px;border-radius:999px;background:var(--surface-inset);overflow:hidden">
@@ -98,7 +98,8 @@
 						value={ui.transcription?.model ?? ''}
 						onchange={(e) => void ui.chooseSpeechModel((e.currentTarget as HTMLSelectElement).value)}
 						disabled={!!ui.downloadingModel}
-						style="background:var(--surface-inset);color:var(--text-secondary);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-sm);font-size:11px;padding:4px 6px"
+						class="k-select"
+						style="color:var(--text-secondary)"
 					>
 						{#each ui.transcription?.models ?? [] as m (m.name)}
 							<option value={m.name}
@@ -134,12 +135,7 @@
 	{:else}
 		<div data-selectable style="display:flex;flex-direction:column;gap:2px">
 			{#each txLines as l, i (i)}
-				<div
-					style="display:flex;gap:8px;padding:7px 8px;border-radius:var(--radius-sm);align-items:flex-start;background:{i ===
-					activeTx
-						? 'var(--surface-inset)'
-						: 'transparent'}"
-				>
+				<div class="line" data-active={i === activeTx ? '' : undefined}>
 					<button
 						onclick={() => seekLine(l)}
 						disabled={!l.clip}
@@ -153,9 +149,8 @@
 							>{l.t}</span
 						>
 						<span
-							style="font-size:12px;line-height:1.45;color:{l.clip
-								? 'var(--text-secondary)'
-								: 'var(--text-muted)'};text-decoration:{l.clip ? 'none' : 'line-through'}">{l.s}</span
+							class="words"
+							style="text-decoration:{l.clip ? 'none' : 'line-through'};color:{l.clip ? '' : 'var(--text-muted)'}">{l.s}</span
 						>
 					</button>
 					{#if l.clip}
@@ -174,3 +169,31 @@
 	{/if}
 	</div>
 </div>
+
+<style>
+	/* A line is lit by the pointer, and the one the playhead is in carries the accent bar: the old
+	   darker block alone was easy to miss. Text on `surface-hover` is held to 4.5:1 by the contrast guard. */
+	.line {
+		display: flex;
+		gap: 8px;
+		align-items: flex-start;
+		padding: 7px 8px 7px 6px;
+		border-left: 2px solid transparent;
+		border-radius: var(--radius-sm);
+	}
+	.line:hover {
+		background: color-mix(in srgb, var(--surface-hover) 60%, transparent);
+	}
+	.line[data-active] {
+		background: var(--surface-hover);
+		border-left-color: var(--kerf-500);
+	}
+	.words {
+		font-size: var(--text-sm);
+		line-height: 1.45;
+		color: var(--text-secondary);
+	}
+	.line[data-active] .words {
+		color: var(--text-primary);
+	}
+</style>
