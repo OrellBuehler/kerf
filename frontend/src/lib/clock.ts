@@ -1,8 +1,9 @@
 // How a time reads in the side panels. There are three, each for one job: the transport's frame
-// timecode (`timecode.ts`, what the playhead is at), a duration's `m:ss` (a bin row, the status bar), and
-// this — a *position* in the cut or a source, `m:ss.d`, which the Inspector, the titles list and the
-// agent's review card (`diff.ts`'s `formatTime`, the mirror of what the backend prints) all use. The
-// Inspector used to say `00:12.50` above a field that said `12.5`; a field holds seconds, and says so.
+// timecode (`timecode.ts`, what the playhead is at), a bin row's `m:ss` duration (`media-info.ts`), and
+// this — a *position* or a length in the cut or a source, `m:ss.d`, which the Inspector, the titles list,
+// the status bar's "Cut" and the agent's review card (`diff.ts`'s `formatTime`, the mirror of what the
+// backend prints) all use. The Inspector used to say `00:12.50` above a field that said `12.5`; a field holds
+// seconds, and says so.
 
 /** `m:ss.d` (`h:mm:ss.d` from an hour). The tenth is rounded first, so 59.96 is `1:00.0`, never `0:60.0`. */
 export function clock(seconds: number): string {

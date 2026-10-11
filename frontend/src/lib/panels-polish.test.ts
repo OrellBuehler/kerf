@@ -175,3 +175,76 @@ describe('the buttons', () => {
 		expect(rule(CONTROLS, '.k-tile')).toContain('height: var(--control-sm)');
 	});
 });
+
+describe('the empty Preview', () => {
+	const card = read(`${EDITOR}PreviewEmpty.svelte`);
+
+	test('the card fills the pane and scrolls inside it instead of spilling over the transport', () => {
+		expect(card).toMatch(/\.pane \{[^}]*position: absolute;[^}]*inset: 0;/);
+		expect(card).toContain('grid-template-rows: minmax(0, 1fr)');
+		expect(card).toMatch(/max-height:100%;overflow:auto/);
+	});
+
+	test('it gives way by the pane’s height: spacing, then the lines under each step, then the agent row', () => {
+		const heights = [...card.matchAll(/@container \(max-height: (\d+)px\)/g)].map((m) => Number(m[1]));
+		expect(heights).toEqual([344, 309, 259]);
+		expect(card).toMatch(/@container \(max-height: 309px\) \{\s*\.body \{\s*display: none/);
+		expect(card).toMatch(/@container \(max-height: 259px\) \{\s*\.agent \{\s*display: none/);
+		// the Preview's pane is the container the queries are about
+		expect(read(`${EDITOR}Preview.svelte`)).toContain('position:relative;container-type:size');
+	});
+});
+
+describe('the Export buttons', () => {
+	test('the title bar’s and the empty Preview’s are off for an empty cut, with the reason on a wrapper that can be hovered', () => {
+		for (const f of ['TitleBar', 'PreviewEmpty']) {
+			const source = read(`${EDITOR}${f}.svelte`);
+			expect(source, f).toContain('exportButtonState(');
+			expect(source, f).toContain('disabled={exportState.disabled}');
+			expect(source, f).toContain('use:tip={exportState.reason}');
+			expect(source, f).toContain('pointer-events:none');
+		}
+	});
+});
+
+describe('smaller things the review asked for', () => {
+	test('the dock’s close X is dimmed, not hidden, and shows for hover and keyboard focus only', () => {
+		const dock = read('lib/styles/dockview-kerf.css');
+		const x = '.dockview-theme-kerf .dv-tab .dv-default-tab .dv-default-tab-action {';
+		const at = dock.lastIndexOf(x);
+		expect(at).toBeGreaterThan(-1);
+		const hidden = dock.slice(at, dock.indexOf('}', at));
+		expect(hidden).toContain('opacity: 0');
+		expect(hidden).toContain('pointer-events: none');
+		expect(dock).not.toMatch(/dv-default-tab-action \{[^}]*visibility: hidden/);
+		expect(dock).toContain('.dv-tab:focus-visible .dv-default-tab .dv-default-tab-action');
+		expect(dock).not.toContain('.dv-tab:focus-within .dv-default-tab .dv-default-tab-action');
+	});
+
+	test('the page imports through the library’s one import, not a copy of it', () => {
+		const page = read('routes/+page.svelte');
+		expect(page).toContain("from '$lib/import-media'");
+		expect(page).not.toContain('async function finishImport');
+		expect(page).not.toContain('async function onImport');
+	});
+
+	test('the window title is derived once and the effect only sends it', () => {
+		expect(read('routes/+page.svelte')).toContain('const title = $derived(windowTitle(');
+	});
+
+	test('the notification log’s buttons and filters are on the one control scale, not 22 px pills', () => {
+		const log = read(`${EDITOR}NotificationCenter.svelte`);
+		expect(log).toContain('<Btn');
+		expect(log).toContain('<Chip pressed={filter === k}');
+		expect(log).not.toContain('height:22px');
+	});
+
+	test('Duck is spelled out on a mixer strip, as in the timeline’s track header', () => {
+		expect(read(`${EDITOR}MixerStrip.svelte`)).toContain('>DUCK</button');
+	});
+
+	test('a clip’s Remove is red ink on the neutral edge, not an alarm-coloured outline', () => {
+		expect(rule(CONTROLS, ".k-btn[data-variant='destructive'][data-quiet]")).toContain('--k-edge: var(--border-strong)');
+		expect(read(`${EDITOR}Inspector.svelte`).match(/data-quiet/g)?.length).toBe(2);
+	});
+});

@@ -286,12 +286,12 @@ are a possible follow-up and not this change. `TitleBar` is three cells (so the
 workspace tabs stay on the centre line): the logo and the **menu bar** on the left;
 the workspaces in the middle; the project's name with its Saved / Unsaved badge, an
 **Export** button (a primary `Btn`, `file.export`'s key in its tooltip: the app's goal had no button outside the Deliver
-workspace; while a render runs it shows `42%` with a spinner and reopens the dialog), the settings gear, the
+workspace; off, with the reason in its tooltip, while the cut has no clips — `exportButtonState`; while a render runs it shows `42%` with a spinner and reopens the dialog, and is on), the settings gear, the
 notification bell and the version chip on the right. A pending agent proposal adds a cyan **Review 4 changes** chip
-left of Export (`proposalIndicator`, `agent-status.ts`) that raises the Agent panel, and a count on the Agent dock tab
-(`Workspace.svelte` sets `data-pending` on the tab's label, `dockview-kerf.css` draws it; the tab's `aria-label` says it too) — in
+left of Export (`proposalIndicator`, `agent-status.ts`; it is its icon and count in a right cell narrower than 560 px — `reviewChipText`, 1366×768 has 513 — so the project's name keeps its room) that raises the Agent panel, and a count on the Agent dock tab
+(`Workspace.svelte` sets `data-pending` on the tab's label, `dockview-kerf.css` draws it; the tab's `aria-label` becomes `Agent, 4 changes to review`: `agentTabLabel`) — in
 Audio and Deliver the agent is only a tab, and a proposal there was invisible. The bell's badge sits off the corner with a
-ring in the bar's colour, and a red one leads with `!` so it is not colour alone. The version chip
+ring in the bar's colour, and a red one carries a warning triangle before the count so it is not colour alone (a mono `!` read as a `1`). The version chip
 still turns amber when an update is waiting, which is why it stayed out of Help; Help also
 has *Check for updates…*. The OS window's title is `• interview.kerf — Kerf` (`window-title.ts`; the dot leads while there is
 unsaved work), set through `setWindowTitle` and the `core:window:allow-set-title` capability. The project's path moved to the status bar. **The menus**
@@ -419,9 +419,9 @@ the shape alone does not suggest — a lower track shows through, so a blurred f
 is a duplicated, blurred copy above, masked), a **360 reframe**
 section (yaw / pitch / roll / FOV, auto-keyframing
 at the playhead like Transform — note its `lerpAngle` takes the shortest arc, which
-plain `lerp` would read as a 340° swing across the seam; for a source Kerf did not
-detect as 360 it instead offers a projection picker that marks the whole asset via
-`set_asset_projection`), and an always-visible
+plain `lerp` would read as a 340° swing across the seam; a source Kerf did not
+detect as 360 has no such section — its projection picker, which marks the whole asset via
+`set_asset_projection`, is the collapsed **Advanced** section, below), and an always-visible
 **Text overlays** section (add titles / lower-thirds, caption the whole cut in
 a **Lines / Word punch** style chosen by two chips above the button — the
 selection is deliberately *not* derived from the overlays already there, since
@@ -435,8 +435,8 @@ box / bold).
 (a title's text was typed in the number face), and a field of seconds says so with an `s` in the keyframe slot beside it. A section
 header is 32 px (it was 49) with a flex summary that ends in an ellipsis beside the title, and its summary says what it holds: Timing
 `Start 0:00.0 · Dur 0:12.5`, Color `None` for an ungraded clip (it read `Custom`), the look it matches, `Custom`, or `Animated · 2 keys`
-(`inspector-summary.ts`). Positions read `m:ss.d` everywhere in the panels (`clock.ts`; the transport keeps frame timecode, a bin row and the
-status bar `m:ss` durations — three formats with three jobs, where the Inspector alone used to mix five). A ◇ is amber and outlined when the
+(`inspector-summary.ts`). Positions read `m:ss.d` everywhere in the panels (`clock.ts`: the Inspector, the titles list, the status bar's
+`Cut 0:20.5`; the transport keeps frame timecode and a bin row its `m:ss` duration — three formats with three jobs, where the Inspector alone used to mix five). A ◇ is amber and outlined when the
 number is keyed somewhere, filled when a key sits at the playhead, and its tooltip names the row (`warmth`, not `temperature`). Crop is
 `Left / Right / Top / Bottom`, the mask `Center X / Y`, the title's `Position X / Y`, the section `Transition` with an `Into clip` select.
 **Footage Kerf did not detect as 360 has no 360 section**: the override (a source select and `This is 360 footage`) is a collapsed
@@ -444,7 +444,7 @@ number is keyed somewhere, filled when a key sits at the playhead, and its toolt
 section. A title's Color and Box are a **swatch (native colour input) plus the free-text field** (`title-color.ts`: the engine's own
 spelling — a name, `#rrggbb[aa]`, `@alpha` — read for the swatch, and a pick written back keeping the alpha; a box with none starts at
 `@0.55`). Reverse, Bold and Invert are `CheckRow`s, box first. The destructive pair is one row of two small buttons (`Remove clip`,
-`Ripple delete`). **With no clip or title selected, a library asset selected in the bin is the Inspector's subject**
+`Ripple delete`; Remove is red ink on the neutral edge — `data-quiet` on a destructive `Btn` — not an outline in alarm colour). **With no clip or title selected, a library asset selected in the bin is the Inspector's subject**
 (`AssetInspector`, `asset-facts.ts`): name and kind, the proxy and analysis chips and Analyze, Add at playhead / Append, and
 Media / Analysis / Proxy sections with what the bin's right-click menu used to list as twenty rows (it was 960 px tall; it is the
 actions now, with Analyze as one entry that opens its own menu).
@@ -476,8 +476,8 @@ paints over any fill, because inline styles never set `box-shadow`), except the 
 rows and dockview's own controls (its close X has a hover of its own; matched by class-token start, `[class^='dv-']` / `[class*=' dv-']`, not a substring), and a disabled one falls back to `opacity:.5` with a `default` cursor (not
 `not-allowed`: a red circle on a greyed Undo reads as an error) — a control that must stay legible when off
 sets `opacity:1` itself (the context menu's rows, the transcript's cut lines, which used to be dimmed twice).
-Dock tabs hover and press in `dockview-kerf.css`; a tab strip is 30 px, a tab's close X shows on hover or focus-within rather than on
-the active tab all the time (Preview, Timeline and Library were one mis-click from gone; right-click on a tab still offers Close), and
+Dock tabs hover and press in `dockview-kerf.css`; a tab strip is 30 px, a tab's close X shows on hover or keyboard focus (`:focus-visible`) rather than on
+the active tab all the time — dimmed to nothing, not hidden, so it stays in the accessibility tree, and without a pointer until it shows (Preview, Timeline and Library were one mis-click from gone; right-click on a tab still offers Close), and
 a sash lights at 65 % amber after 0.1 s over its 8 px grip. A workspace tab's amber marker is a bar inset from the pill's corners, not an inset
 shadow that curled up its sides. **One keyboard focus indicator**: `--focus-outline`
 (2 px `kerf-400`, offset `--focus-offset`) from a zero-specificity `:where(button, summary, input, select,
@@ -712,8 +712,11 @@ engine. Below the queue, the **History** section renders
 **The Preview with nothing on the timeline** is `PreviewEmpty` (it was a clapperboard and "No media loaded"): a card of three steps — *Import
 media*, *Cut it on the timeline*, *Export* — each marked done / current / to do from the project (`firstRunSteps`, `first-run.ts`: an
 asset in the library finishes the first, a clip the second), with the keymap's own key for import and export in the line, an
-*Import media…* (or *Open Library*) and *Export…* button, and "Or connect an agent over MCP and let it assemble a first cut" with a button
-that raises the Agent panel, whose status line carries *Connect*.
+*Import media…* (or *Open Library*) and an *Export…* button (off, with the reason in its tooltip, until a clip is on the timeline — as the title
+bar's is: `exportButtonState`, which stays on while a render runs, since the button reopens its dialog), and "Or connect an agent over MCP and let it assemble a first cut" with a button
+that raises the Agent panel, whose status line carries *Connect*. The card fills the pane, which is a size container, and gives way by its
+height rather than spilling over the transport: spacing tightens under 345 px of content (1366×768 has 326), the lines under each step go
+under 310 (1280×720 has 296), the agent row under 260 (960×640 has 247), and what still does not fit scrolls inside the card.
 
 **Z-order** (no tokens yet; the layers in use, low to high): the timeline's sticky and ghost layers 24–29, dockview's own overlay 45, dialogs 50
 (`Modal`, later siblings stack over earlier), the file-drop overlay 60, the notification log 70, the menu bar's panels 950, a context menu 1000,
@@ -871,8 +874,8 @@ a fourth runes singleton). Components import `toast` from *there* rather than fr
 `svelte-sonner` — a drop-in wrapper, so no call site changed — because a toast is
 gone in four seconds, which is fine for "Clip copied" and useless for the model
 download that failed with a reason worth reading. The title bar's bell opens
-`NotificationCenter.svelte` (All / Unread / Problems, per-row read toggle, mark all
-read, clear) and badges the unread count, red when anything unread actually failed.
+`NotificationCenter.svelte` (All / Unread / Problems as `Chip`s, per-row read toggle, `Mark all read` and `Clear`
+as `Btn sm` — the panels' one 28 px scale, no longer 22 px pills) and badges the unread count, red when anything unread actually failed.
 Errors and warnings also linger longer on screen than sonner's default. **The log keeps a notice's
 `description`** (the reason under a failure — "permission denied (os error 13)") and shows it under the
 line; the panel takes focus when it opens and Escape gives it back to the bell. A failure toast leads with what was being done
@@ -1053,37 +1056,37 @@ cannot give: silent b-roll gets scenes only, a still nothing) — — Remove sil
 editor chrome derives from real state — `MediaBin` shows a dropzone until `editor.assets` is
 non-empty, `StatusBar` shows the selected asset's real fps/resolution/codec and timeline
 duration (plus the analysis step, what is still queued behind it and a **Stop**), and
-`Preview` shows the decoded frame or a "No media loaded" placeholder.
+`Preview` shows the decoded frame or, with nothing on the timeline, the first-run card (`PreviewEmpty`, below).
 Each **bin row is the asset's specs**, not just its name: a real decoded frame
 (`get_frame` 10% in, cached per asset across re-docks; the icon stays in the
-browser harness, which has no decoder), the spec line
-(`1920×1080 · 29.97 fps · h264 · stereo`), and badges for 360 / still / how many
-clips already use it, and **`MediaChips`** — the preview proxy's badge (`queued` / `proxy 42%` / `proxy` /
-`proxy failed`, tooltip carrying the reason; nothing for a still or audio file) and one chip per analysis
-kind (`SIL` `SCN` `LUFS` `BPM` `TXT`: done ✓ green, not run outlined, running spinning, failed `!` red,
-off dashed `–`; state is a mark and a border as well as a colour, the tooltip says why). The Inspector's
-clip header draws the same chips from the same store plus an **Analyze** button, and the timeline clip
+browser harness, which has no decoder), the name with its `m:ss` duration beside it, the spec line
+(`1920×1080 · 29.97 fps · h264 · stereo`), then one line of status — badges for 360 / still / how many
+clips already use it, and **`MediaChips`** in its `compact` form: the preview proxy's badge (`queued` / `proxy 42%` / `proxy` /
+`proxy failed`, tooltip carrying the reason; nothing for a still or audio file) and **one analysis pill** — `analyzed`,
+`3 of 5 analyzed`, `not analyzed`, `analyzing…`, `1 failed` or `analysis off`, its tooltip listing the five kinds with their states (`analysisMeter`; a
+kind the file cannot give is not counted: `applicable` / `chipsFor`). State is a mark and a tint as well as a colour. The Inspector's
+clip header draws the five tags (`SIL` `SCN` `LUFS` `BPM` `TXT`: done ✓ green, not run outlined, running spinning, failed `!` red,
+off dashed `–`; minus the kinds the file cannot give) from the same store plus an **Analyze** button, and the timeline clip
 menu lists how many are done and an `Analyze…` entry. The store is `media-status.svelte.ts`
 (`mediaStatus`): `proxy-progress` / `analysis-status` events note into it, and it is re-read when the set of
 assets changes and after a setting that moves what a status means. The **status bar** says which file
 the frame under the playhead is decoded from (`preview: proxy 1280 px`, `preview: original · proxy 42%`,
 `preview: waiting for proxy · 42%` under Proxy only, which also puts a badge in the Preview pane —
-`previewSourceNote`, judged from the statuses already held, nothing asked per frame). Its **context menu leads with the facts** — the
-frame, rate, codec, audio, projection, the stitched lens pair, the use count, the
-import date, then how much of the analysis has run, what it found (loudness, tempo, silence, shots,
-transcript) and the proxy's state — above the actions that need them: add at the
+`previewSourceNote`, judged from the statuses already held, nothing asked per frame). Its **context menu is the actions only** — the facts moved to the Inspector (`AssetInspector`, `asset-facts.ts`: the
+frame, rate, codec, audio, projection, the stitched lens pair, the use count, the import date, how much of the analysis has run
+and what it found, the proxy's state), which shows the selected asset when no clip or title is selected. The menu: add at the
 playhead / append, the audio action — labelled for what the backend will do (`extract_audio` or, for an asset not
 playing its own sound, `add_asset_audio`)
 (`media-info.ts` `audioExtraction`: `Detach audio from N clips` when clips of the asset still play
-their own sound, else `Add audio to A1`, with `again` when its sound is already on an audio
-track), remove silences (greyed out until silence has been detected), **Separate stems…** (assets with sound; see below), **Analyze** — one entry per kind
-("Detect silence", "Find scene changes", "Measure loudness", "Find the beat and tempo", "Transcribe
-speech", "Analyze everything"), each saying `done · run again` / `failed · retry`, disabled with the reason
-for a voiceover, a running pass, a file with no audio or no speech backend — and Stop analysis, **Rebuild /
-Build / Restart proxy** and **Delete / Cancel proxy** (`proxyActions`), mark the asset 360 or flat, copy the
-path, show in folder. The phrasing is `src/lib/media-info.ts`, pure and bun-tested, so the
-row and the menu cannot drift apart; `MenuItem` grew `header` / `info` rows for
-it, which the shared `ContextMenu` renders non-interactively.
+their own sound, else `Add audio to A1`, with `(a second copy)` when its sound is already on an audio
+track), remove silences (greyed out until silence has been detected), **Separate stems…** (assets with sound; see below), **Analyze…**
+(one entry that opens the Analyze menu where the pointer was: one item per kind — "Detect silence", "Find scene changes",
+"Measure loudness", "Find the beat and tempo", "Transcribe speech", "Analyze everything" — each saying `done · run again` /
+`failed · retry`, disabled with the reason for a voiceover, a running pass, a file with no audio or no speech backend — and
+Stop analysis), **Rebuild / Build / Restart proxy** and **Delete / Cancel proxy** (`proxyActions`), mark the asset 360 (a globe)
+or flat, copy the path, show in folder. The phrasing is `src/lib/media-info.ts` and `asset-facts.ts`, pure and bun-tested, so the
+row, the Inspector and the menu cannot drift apart; `MenuItem` has `header` / `info` rows (the timeline's menus use `info`), which the
+shared `ContextMenu` renders non-interactively.
 **Stem separation** (Demucs: drums / bass / other / vocals). One modal, `StemsDialog` (`ui.stemsDialog`,
 `ui.openStems(assetId, clipId?)`, inert-behind like the voiceover's), reached from the bin's **Separate
 stems…** (the stems join the library as `<name> · drums` …, the cut is untouched) and the clip menu's
