@@ -264,7 +264,8 @@
     made to agree** (`engine-cli.md`, "A proxy of untagged HD footage says BT.709"): a proxy of
     HD footage that names no matrix is labelled BT.709 (no pixel converted), so it stacks with
     a phone's BT.709 proxy — and an HLG one, tone-mapped to a tagged BT.709 picture — without
-    `MixedMatrices`. The plan reads the proxy's own tag from its sidecar, so a proxy cached
+    `MixedMatrices` (the export of the original is not labelled, so preview and export differ in
+    those stacks on 9.0.2 — `engine-cli.md`, open). The plan reads the proxy's own tag from its sidecar, so a proxy cached
     before the label (untagged) is still BT.601 here, exactly what the FFmpeg fallback reads
     of it; it is rebuilt, not reinterpreted. SD, `smpte170m`, `bt2020nc`, RGB and full-range
     JPEG proxies keep their class, so those mixed with a BT.709 proxy are refused as ever.

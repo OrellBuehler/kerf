@@ -3222,7 +3222,6 @@ fn hd_media() -> &'static HdMedia {
             encode(&mut files, n("sd", "untagged"), sd, "bt601", none);
             encode(&mut files, n("sd", "601"), sd, "bt601", bt601);
         }
-        let rgb = dir.join("rgb.mkv");
         for (name, source) in [("grad/rgb", GRADIENT), ("detail/rgb", DETAIL)] {
             let p = dir.join(format!("{}.mkv", name.replace('/', "-")));
             ffmpeg(&[
@@ -3238,7 +3237,6 @@ fn hd_media() -> &'static HdMedia {
             ]);
             files.insert(name, probed(&p));
         }
-        let _ = rgb;
         let hlg = dir.join("hlg.mp4");
         let made = Command::new(kerf_core::ffmpeg_path())
             .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])

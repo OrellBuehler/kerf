@@ -98,7 +98,9 @@ so the feature is **only** activated through these forwards — which is what ma
   remove the sidecar as well (they used to leave `<hash>.json` behind). Only a
   probe is added: `generate_proxy`'s own argv, and every argv in the golden oracle, is
   unchanged. `proxy_path` still costs the one cached `source_traits` probe of the *original*
-  (it keys the file on HDR, the lead and the matrix label below), as it did before.
+  (it keys the file on HDR, the lead and the matrix label below), as it did before; an encode
+  reads the traits **once** (`proxy_path_for`) for its destination, filters and what it replaces, because a probe
+  that failed is remembered for a minute and a second reading can answer differently.
   **A proxy of untagged HD footage says BT.709.** FFmpeg reads a picture that names no matrix as
   BT.601, so an untagged proxy beside a phone's BT.709 one was two matrices — which FFmpeg 9
   converts between and the GPU plan refuses (`MixedMatrices`) — although every player shows the
@@ -111,12 +113,15 @@ so the feature is **only** activated through these forwards — which is what ma
   (`BT709_LABEL`, the `colour` argument it shares with the tone-map). **A label, not a
   conversion**: not one pixel moves (the output option `-colorspace bt709` is an order to
   convert on FFmpeg 9 — up to 22 levels moved — and is never used), so FFmpeg 6, which ignores
-  tags, previews it exactly as before, and FFmpeg 9 reads the footage's own colours (28.0 dB →
-  43.3 dB against the colours a test clip was made from). **The preview colour target is
-  BT.709 for HD, as the players show the file and the export**; SD stays BT.601. The key gains
+  tags, previews an opaque clip exactly as before, and FFmpeg 9 reads the footage's own colours
+  (28.0 dB → 43.3 dB against the colours a test clip was made from): the colour target of the GPU
+  surface and of RGB stills is BT.709 for HD, as a player shows the file; SD stays BT.601. **The
+  default MJPEG webview preview of an opaque clip is byte-identical** (a JPEG carries no matrix:
+  the YCbCr values go in as they are). The key gains
   `|bt709` for these sources only, so a proxy cached before is not found and the usual queue
   rebuilds it (`queue_auto`), and the replacement deletes it and its sidecar
-  (`superseded_proxy_path`, also cleared by `remove_proxy_files`). It is not reinterpreted in
+  (`superseded_proxy_path_for`, also cleared by `remove_proxy_files`, and retried when the new proxy is asked for
+  again and found in place). It is not reinterpreted in
   place: the plan has to read what the FFmpeg fallback reads, and that reads the file. Every
   other proxy keeps its tags and its key — SD and `smpte170m` / `bt470bg` stay BT.601,
   `bt2020nc` stays BT.2020, an RGB capture (converted with BT.601 by the proxy's scaler) and a
@@ -124,7 +129,27 @@ so the feature is **only** activated through these forwards — which is what ma
   still refused on FFmpeg 9. Converting them to BT.709 at proxy time would read wrong on an
   FFmpeg that ignores tags, and a key that followed the measured composite policy would flap
   while the probe is `Unknown`. `build_proxy_args` is outside the golden oracle, so no digest
-  moved; the unit tests pin the argv and an `#[ignore]`d render test pins the files.
+  moved; the unit tests pin the argv and an `#[ignore]`d render test pins the files (the
+  late-starting `.lead.mp4` proxy too).
+  **Open: the export of the original is not labelled, so wherever FFmpeg reads the tag a
+  labelled proxy's preview and the export disagree** (measured through the same graph, preview
+  assets against originals, FFmpeg 9.0.2 / 6.1.1; an opaque single clip is identical in the
+  exported YCbCr, 99 dB). On 9.0.2, a stack that sets an untagged HD picture beside anything FFmpeg
+  negotiates it against — a BT.709 or HLG clip, an untagged SD clip, a PNG logo — converts the
+  untagged layer 601→709 in the export and not in the preview: 31–36 dB, 14–25 levels (negotiation
+  is per graph, not per frame: a BT.709 clip *later on the same track* does it too, 29 dB / 14).
+  A translucent clip (`opacity < 1`) round-trips through RGB with the tag on **both** builds:
+  6.1.1 31–33 dB, 10 levels (the original round-trips 601/601, the labelled proxy 709 out and 601
+  back), 9.0.2 2 levels; coloured text on 9.0.2 16 levels on the glyphs; an RGB still of a single
+  clip on 9.0.2 27 dB (the colour target above, which a still of the original does not have).
+  Labelling the untagged HD inputs of the export / still / stream graphs the same way closes the
+  stacks (47–57 dB, the proxy's own encode loss included; the HLG ones 36–49 dB, as a tone-mapped
+  proxy is not the graph's tone-map) but moves the golden oracle widely —
+  2921 of 5600 export, 2075 preview and 628 still digests, because untagged HD sits beside HDR in
+  half the corpus, with a family of its own — and on 6.1, which negotiates nothing, it only
+  worsens translucent clips. Decision pending: label the graphs as well, label **only** the graphs
+  (a tagged layer in the graph; no proxy rebuild; preview == export by construction; the GPU's
+  colour target stays FFmpeg's), or drop the label.
   **A proxy reports, can be abandoned, and cannot hang.** `generate_proxy_with(src, width,
   ProxyRun { reservation, duration, progress, cancel })` is `generate_proxy` with hooks (the
   latter is it with none): the encode runs through `run_ffmpeg_streamed`, which writes

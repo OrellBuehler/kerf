@@ -344,14 +344,18 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   CI parity job runs both builds. The consequence to know about: an *export* is untagged
   `yuv420p` that a player shows as BT.709 for HD, so the FFmpeg preview disagrees with the
   file by a few levels on saturated colour wherever it reads HD as BT.601 — every tagged
-  BT.709 clip on a fixed-601 FFmpeg, and an *untagged* HD clip on either. **The preview's colour
-  target is BT.709 for HD** (what the player shows, and so the export), and the place it is
+  BT.709 clip on a fixed-601 FFmpeg, and an *untagged* HD clip on either. The place that is
   fixed is the proxy, not the compositor: a proxy of untagged HD footage is labelled BT.709
-  (`engine-cli.md`), which leaves FFmpeg 6.1 as it was (it ignores tags) and takes FFmpeg 9.0.2
-  from 28.0 dB to 43.3 dB against the colours the test clip was made from, and lets the
-  stack with a phone's BT.709 proxy through the plan (`parity.rs`, `proxy/…`). What stays
-  BT.601 is what is BT.601 (SD, a `smpte170m` tag, an RGB capture's own conversion): those
-  proxies mixed with BT.709 ones are still refused on a negotiating FFmpeg. The stream's own matrix
+  (`engine-cli.md`), which leaves an opaque clip on FFmpeg 6.1 as it was (it ignores tags there)
+  and takes FFmpeg 9.0.2 from 28.0 dB to 43.3 dB against the colours the test clip was made from
+  — on the GPU surface and in RGB stills; the default MJPEG webview preview of an opaque clip is
+  byte-identical — and lets the stack with a phone's BT.709 proxy through the plan (`parity.rs`,
+  `proxy/…`). What stays BT.601 is what is BT.601 (SD, a `smpte170m` tag, an RGB capture's own
+  conversion): those proxies mixed with BT.709 ones are still refused on a negotiating FFmpeg.
+  **The export of the original is not labelled**, so where FFmpeg reads the tag the preview of a
+  labelled proxy and the export differ (9.0.2: untagged HD stacked with a BT.709 / HLG / untagged
+  SD / PNG layer, 31–36 dB; translucent clips on both builds, 6.1.1 10 levels; the numbers and the
+  decision pending are in `engine-cli.md`). The stream's own matrix
   (`PlanStream::matrix`, from the probed `color_space`) is used for taking a translucent
   layer out of YUV in the round trip below and for choosing the composite's matrix.
 - **`eq` is a YUV operation**, not an RGB one: `eq.rs` builds vf_eq's own per-plane
