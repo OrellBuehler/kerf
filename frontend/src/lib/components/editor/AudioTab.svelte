@@ -69,7 +69,7 @@
 					use:tip={`Remove ${effectLabel(e)}`}
 					aria-label="Remove {effectLabel(e)}"
 					style="background:transparent;border:none;color:var(--text-muted);cursor:pointer;font-size:16px;line-height:1;min-width:28px;min-height:28px;padding:2px 5px"
-					>×</button
+					><Icon n="x" s={14} /></button
 				>
 			</div>
 		{/each}

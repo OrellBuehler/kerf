@@ -111,3 +111,23 @@ export function rowFor(rows: readonly NavRow[], at: number, k: MenuKey): number 
 			return null;
 	}
 }
+
+/** What a key does in a group of radio buttons: the arrows move to the neighbour (both axes — it is
+ *  a row of chips, not a column), Home / End jump, selection follows focus. Anything else is the
+ *  page's. */
+export function radioKey(e: KeyLike): MenuKey | null {
+	if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return null;
+	switch (e.key) {
+		case 'ArrowDown':
+		case 'ArrowRight':
+			return { do: 'next' };
+		case 'ArrowUp':
+		case 'ArrowLeft':
+			return { do: 'prev' };
+		case 'Home':
+			return { do: 'first' };
+		case 'End':
+			return { do: 'last' };
+	}
+	return null;
+}

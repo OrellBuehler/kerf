@@ -211,10 +211,10 @@
 
 		<div style="display:flex;align-items:center;gap:5px;padding:4px 0">
 			<span style="{labelCss};width:90px;flex:none">Place</span>
-			<button type="button" style={chip(place === 'playhead')} onclick={() => (place = 'playhead')}>
+			<button type="button" style={chip(place === 'playhead')} aria-pressed={place === 'playhead'} onclick={() => (place = 'playhead')}>
 				At playhead ({fmtDuration(ui.time)})
 			</button>
-			<button type="button" style={chip(place === 'append')} onclick={() => (place = 'append')}>
+			<button type="button" style={chip(place === 'append')} aria-pressed={place === 'append'} onclick={() => (place = 'append')}>
 				Append to VO track
 			</button>
 		</div>
@@ -226,7 +226,13 @@
 			</label>
 			{#if caption}
 				{#each CAPTION_LOOKS as c (c.id)}
-					<button type="button" style={chip(captionStyle === c.id)} use:tip={c.hint} onclick={() => (styleChoice = c.id)}>
+					<button
+						type="button"
+						style={chip(captionStyle === c.id)}
+						aria-pressed={captionStyle === c.id}
+						use:tip={c.hint}
+						onclick={() => (styleChoice = c.id)}
+					>
 						{c.label}
 					</button>
 				{/each}

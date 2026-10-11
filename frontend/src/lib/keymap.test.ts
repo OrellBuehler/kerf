@@ -1090,6 +1090,7 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/components/editor/WorkspaceTabs.svelte',
 			'lib/drag.ts',
 			'lib/modal.ts',
+			'lib/roving.ts',
 			'lib/tip.ts',
 			'routes/+page.svelte'
 		]);

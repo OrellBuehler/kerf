@@ -75,7 +75,7 @@
 	{/if}
 
 	<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:4px">
-		<button
+		<button aria-pressed={!!clip && !current}
 			style="{chip(!!clip && !current)};{off ? 'opacity:.5;cursor:default' : ''}"
 			disabled={off}
 			use:tip={reason ?? 'A hard cut — no transition into this clip'}
@@ -92,7 +92,7 @@
 		<div style="font-size:11px;color:var(--text-muted);margin-bottom:6px">{g.hint}</div>
 		<div style="display:flex;gap:5px;flex-wrap:wrap">
 			{#each g.options as o (o.id)}
-				<button
+				<button aria-pressed={current?.kind === o.id}
 					style="{chip(current?.kind === o.id)};{off ? 'opacity:.5;cursor:default' : ''}"
 					disabled={off}
 					use:tip={reason ?? o.label}

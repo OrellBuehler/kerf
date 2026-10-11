@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { MenuItem } from './context-menu.svelte';
 import { contextRows } from './menu-items';
-import { firstRow, focusableRows, lastRow, menuKey, rowFor, stepRow, typeaheadRow, type NavRow } from './menu-nav';
+import { firstRow, focusableRows, lastRow, menuKey, radioKey, rowFor, stepRow, typeaheadRow, type NavRow } from './menu-nav';
 
 const row = (label: string, focusable = true): NavRow => ({ label, focusable });
 const rows = [row('Header', false), row('Copy'), row('Cut'), row('', false), row('Paste'), row('Delete')];
@@ -108,5 +108,26 @@ describe('the context menu as rows', () => {
 			{ focusable: true, label: 'Add at playhead' },
 			{ focusable: true, label: 'Separate stems…' }
 		]);
+	});
+});
+
+describe('a group of radio buttons', () => {
+	test('arrows on either axis step to the neighbour, Home and End jump', () => {
+		expect(radioKey({ key: 'ArrowRight' })).toEqual({ do: 'next' });
+		expect(radioKey({ key: 'ArrowDown' })).toEqual({ do: 'next' });
+		expect(radioKey({ key: 'ArrowLeft' })).toEqual({ do: 'prev' });
+		expect(radioKey({ key: 'ArrowUp' })).toEqual({ do: 'prev' });
+		expect(radioKey({ key: 'Home' })).toEqual({ do: 'first' });
+		expect(radioKey({ key: 'End' })).toEqual({ do: 'last' });
+	});
+	test('a chord, a letter, Enter and Tab are not the group’s', () => {
+		for (const e of [{ key: 'a' }, { key: 'Enter' }, { key: 'Tab' }, { key: 'ArrowRight', ctrlKey: true }, { key: 'ArrowRight', shiftKey: true }])
+			expect(radioKey(e)).toBeNull();
+	});
+	test('a disabled option is stepped over', () => {
+		const chips = [row('720'), row('1080', false), row('1280'), row('Off')];
+		expect(rowFor(chips, 0, { do: 'next' })).toBe(2);
+		expect(rowFor(chips, 3, { do: 'next' })).toBe(0);
+		expect(rowFor(chips, 0, { do: 'prev' })).toBe(3);
 	});
 });

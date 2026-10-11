@@ -5,6 +5,7 @@
 	// Inspector's "Titles lane" section and of the library's Titles tab — one
 	// component, so the two cannot drift.
 	import Btn from './Btn.svelte';
+	import Icon from './Icon.svelte';
 	import { documentOf } from '$lib/realm';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
@@ -260,8 +261,8 @@
 			>
 			<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">{tc(o.start)}</span>
 		</button>
-		<button onclick={() => void attempt(() => editor.removeOverlay(o.id))} disabled={editor.busy} use:tip={'Remove'} aria-label="Remove" style={xBtn}
-			>×</button
+		<button onclick={() => void attempt(() => editor.removeOverlay(o.id))} disabled={editor.busy} use:tip={'Remove'} aria-label="Remove {o.text ? `“${o.text}”` : 'this title'}" style={xBtn}
+			><Icon n="x" s={14} /></button
 		>
 	</div>
 {/each}

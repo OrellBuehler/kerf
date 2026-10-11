@@ -564,7 +564,7 @@
 					/>
 				{/if}
 			{/each}
-			<button onclick={() => onRemove(i)} disabled={editor.busy} use:tip={'Remove'} style={xBtn}>×</button>
+			<button onclick={() => onRemove(i)} disabled={editor.busy} use:tip={'Remove'} aria-label="Remove {String(e.type).replace('_', ' ')}" style={xBtn}><Icon n="x" s={14} /></button>
 		</div>
 	{/each}
 	<select
@@ -701,7 +701,7 @@
 					<span style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 						>({k.pos_x.toFixed(2)},{k.pos_y.toFixed(2)}) · {Math.round(k.opacity * 100)}%</span
 					>
-					<button onclick={() => removeOverlayKeyframe(o, i)} disabled={editor.busy} use:tip={'Remove'} style={xBtn}>×</button>
+					<button onclick={() => removeOverlayKeyframe(o, i)} disabled={editor.busy} use:tip={'Remove'} aria-label="Remove keyframe at {k.time.toFixed(2)}s" style={xBtn}><Icon n="x" s={14} /></button>
 				</div>
 			{/each}
 			<Btn
@@ -924,8 +924,8 @@
 								>Clear {reframeKeys.length} key{reframeKeys.length === 1 ? '' : 's'}</Btn
 							>
 						{/if}
-						<button style={xBtn} use:tip={'Stop reframing'} disabled={editor.busy}
-							onclick={() => run(() => editor.clearReframe(clip.id))}>×</button
+						<button style={xBtn} use:tip={'Stop reframing'} aria-label="Stop reframing" disabled={editor.busy}
+							onclick={() => run(() => editor.clearReframe(clip.id))}><Icon n="x" s={14} /></button
 						>
 					</div>
 				{:else if sourceProjection}
@@ -1026,7 +1026,7 @@
 				<InspectorSection title="Color" summary={activeLook(col)?.label ?? 'Custom'}>
 				<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">
 					{#each COLOR_LOOKS as look (look.id)}
-						<button
+						<button aria-pressed={activeLook(col)?.id === look.id}
 							style={chip(activeLook(col)?.id === look.id)}
 							disabled={editor.busy}
 							onclick={() => setCol(look.color)}>{look.label}</button
@@ -1048,19 +1048,19 @@
 
 			<InspectorSection title="Mask" summary={mask ? (mask.shape === 'rect' ? 'Rectangle' : 'Ellipse') : 'None'}>
 			<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
-				<button
+				<button aria-pressed={!mask}
 					style={chip(!mask)}
 					disabled={editor.busy}
 					use:tip={'No mask — the whole frame'}
 					onclick={() => run(() => editor.setMask(clip.id, null))}>None</button
 				>
-				<button
+				<button aria-pressed={mask?.shape === 'rect'}
 					style={chip(mask?.shape === 'rect')}
 					disabled={editor.busy}
 					use:tip={'Cut this clip to a rectangle'}
 					onclick={() => patchMask({ shape: 'rect' })}>Rectangle</button
 				>
-				<button
+				<button aria-pressed={mask?.shape === 'ellipse'}
 					style={chip(mask?.shape === 'ellipse')}
 					disabled={editor.busy}
 					use:tip={'Cut this clip to an ellipse'}
@@ -1175,7 +1175,7 @@
 										{/if}
 									</select>
 								{/if}
-								<button onclick={() => removeKeyframe(i)} disabled={editor.busy} use:tip={'Remove'} style={xBtn}>×</button>
+								<button onclick={() => removeKeyframe(i)} disabled={editor.busy} use:tip={'Remove'} aria-label="Remove keyframe {i + 1}" style={xBtn}><Icon n="x" s={14} /></button>
 							</div>
 						{/each}
 						<div style="font-size:12px;color:var(--text-muted);margin-top:4px;line-height:1.4">

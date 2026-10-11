@@ -57,7 +57,7 @@
 	</div>
 	<div style="display:flex;gap:5px;flex-wrap:wrap">
 		{#each COLOR_LOOKS as look (look.id)}
-			<button
+			<button aria-pressed={!!clip && activeLook(color)?.id === look.id}
 				style="{chip(!!clip && activeLook(color)?.id === look.id)};{off ? 'opacity:.5;cursor:default' : ''}"
 				disabled={off}
 				use:tip={reason ?? `${look.label} — sets brightness, contrast, saturation, warmth and gamma`}
@@ -100,7 +100,7 @@
 					use:tip={`Remove ${effectLabel(e)}`}
 					aria-label="Remove {effectLabel(e)}"
 					style="background:transparent;border:none;color:var(--text-muted);cursor:pointer;font-size:16px;line-height:1;min-width:28px;min-height:28px;padding:2px 5px"
-					>×</button
+					><Icon n="x" s={14} /></button
 				>
 			</div>
 		{/each}
