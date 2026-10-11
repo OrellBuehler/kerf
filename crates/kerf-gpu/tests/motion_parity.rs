@@ -38,9 +38,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use kerf_core::{
-    fade_alpha, fade_chroma, fade_luma, Asset, Clip, Color, CompositeColorPolicy, Container, Delivery, ExportOptions, FadeEdge,
-    FadeStep, FadeTint, Fit, PlanMode, PlanRequest, Planner, Project, RateControl, StreamKind, Timeline, Track, Transition,
-    TransitionKind, FADE_FULL,
+    fade_alpha, fade_chroma, fade_luma, Asset, Clip, Color, CompositeColorPolicy, Container, Delivery, DipWhy, ExportOptions,
+    FadeEdge, FadeStep, FadeTint, Fit, PlanMode, PlanRequest, Planner, Project, RateControl, StreamKind, Timeline, Track,
+    Transition, TransitionKind, Unsupported, FADE_FULL,
 };
 use kerf_gpu::{Compositor, FrameSource, FrameSourceConfig, Gpu, GpuOptions, MotionFrames, YuvFrame};
 
@@ -512,7 +512,7 @@ struct Check<'a> {
     /// least one must be: the case is about a refusal. Every other frame is compared with the
     /// export, so a refusal that is wider than it has to be shows too. A frame the plan refuses
     /// for another reason is a failure.
-    refusing: Option<&'a str>,
+    refusing: Option<&'a Refusing>,
 }
 
 /// Samples this close to the edge of a rotated layer are the edge band.
@@ -607,7 +607,7 @@ fn check_motion(check: Check) -> (i32, i32) {
         let plan = planner.at_frame(k).expect("plan");
         assert_eq!((plan.canvas.width, plan.canvas.height), (played.w as u32, played.h as u32));
         let why = plan.reasons(&compositor().caps(), size);
-        if refusing.is_some_and(|r| why.iter().any(|w| w.to_string().contains(r))) {
+        if refusing.is_some_and(|r| why.iter().any(|w| (r.is)(w))) {
             refused_frames += 1;
             continue;
         }
@@ -675,11 +675,14 @@ fn check_motion(check: Check) -> (i32, i32) {
     } else {
         String::new()
     };
-    if let Some(reason) = refusing {
-        assert!(refused_frames > 0, "{case}: no frame was refused for `{reason}`");
+    if let Some(r) = refusing {
+        assert!(refused_frames > 0, "{case}: no frame was refused for {}", r.label);
     }
     let banded = match refusing {
-        Some(reason) => format!("{banded} | {refused_frames} frames refused for `{reason}`, FFmpeg draws them"),
+        Some(r) => format!(
+            "{banded} | {refused_frames} frames refused for {}, FFmpeg draws them",
+            r.label
+        ),
         None => banded,
     };
     let line = format!(
@@ -867,9 +870,43 @@ fn run(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, limits:
     });
 }
 
-/// [`run`] for a case about a refusal: the frames the plan refuses for `reason` are FFmpeg's, the
+/// A refusal a case is about, matched by the [`Unsupported`] **variant** the plan gives (a message
+/// can be shared by two reasons; a variant cannot).
+struct Refusing {
+    label: String,
+    is: Box<dyn Fn(&Unsupported) -> bool>,
+}
+
+fn refusing(label: &str, is: impl Fn(&Unsupported) -> bool + 'static) -> Refusing {
+    Refusing {
+        label: label.to_string(),
+        is: Box::new(is),
+    }
+}
+
+/// A dip to white refused for `why`.
+fn dip_refused(why: DipWhy) -> Refusing {
+    refusing(
+        &format!("DipToWhite({why:?})"),
+        move |u| matches!(u, Unsupported::DipToWhite(_, w) if *w == why),
+    )
+}
+
+fn translucent_fade_refused() -> Refusing {
+    refusing("FadeOnTranslucent", |u| matches!(u, Unsupported::FadeOnTranslucent(_)))
+}
+
+fn full_range_cut_refused() -> Refusing {
+    refusing("FullRangeCut", |u| matches!(u, Unsupported::FullRangeCut))
+}
+
+fn full_range_resized_refused() -> Refusing {
+    refusing("FullRangeResized", |u| matches!(u, Unsupported::FullRangeResized(..)))
+}
+
+/// [`run`] for a case about a refusal: the frames the plan refuses for it are FFmpeg's, the
 /// others are compared with the export as usual.
-fn run_refusing(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, limits: Limits, reason: &str) {
+fn run_refusing(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, limits: Limits, reason: &Refusing) {
     check_motion(Check {
         case,
         tl,
@@ -1511,7 +1548,15 @@ fn a_translucent_layer_dissolves_and_is_refused_its_fades_to_black() {
     glass.fade_in = 0.4;
     glass.fade_out = 0.4;
     let tl = timeline(vec![vec![under], vec![glass]], None);
-    run_refusing("fade/translucent", &tl, &assets, 30.0, 1.0, TRANSLUCENT, "below full opacity");
+    run_refusing(
+        "fade/translucent",
+        &tl,
+        &assets,
+        30.0,
+        1.0,
+        TRANSLUCENT,
+        &translucent_fade_refused(),
+    );
     let out = clip(&m.bars, 0.5, 1.5, 0.0);
     let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
     inc.transform.opacity = 0.7;
@@ -1527,7 +1572,7 @@ fn a_translucent_layer_dissolves_and_is_refused_its_fades_to_black() {
         30.0,
         2.0,
         TRANSLUCENT,
-        "below full opacity",
+        &translucent_fade_refused(),
     );
 }
 
@@ -1605,8 +1650,6 @@ fn after_black(
     )
 }
 
-const NOT_MEASURED: &str = "not 8-bit limited-range";
-
 /// A dip to white is `yuv420p -> rgb24 -> yuv420p` around the fade, drawn for the pictures the round
 /// trip was measured on (8-bit limited-range 4:2:0, untagged: [`WHITE`]; BT.709: [`WHITE_709`]) and
 /// FFmpeg's for every other. What it is refused for was measured, and each refusal is held here:
@@ -1661,19 +1704,43 @@ fn a_dip_to_white_is_drawn_only_where_its_round_trip_was_measured() {
         ("enlarged to 960x540", 1.0, Some(Delivery::new(960, 540, Fit::Contain))),
     ] {
         let (tl, assets) = after_black(&m.testsrc, white, 0.8, scale, format);
-        run_refusing(&format!("dip/white {name}"), &tl, &assets, 30.0, 2.0, EXACT, "scaler resizes");
+        run_refusing(
+            &format!("dip/white {name}"),
+            &tl,
+            &assets,
+            30.0,
+            2.0,
+            EXACT,
+            &dip_refused(DipWhy::Resized),
+        );
         let (tl, assets) = after_black(&m.testsrc, black, 0.8, scale, format);
         run(&format!("dip/black {name}"), &tl, &assets, 30.0, 2.0, SCALED);
     }
     // Refused: a letterboxed layer.
     let tall = Some(Delivery::new(640, 360, Fit::Contain));
     let (tl, assets) = after_black(&m.portrait, white, 0.8, 1.0, tall);
-    run_refusing("dip/white letterboxed", &tl, &assets, 30.0, 2.0, EXACT, "letterboxed");
+    run_refusing(
+        "dip/white letterboxed",
+        &tl,
+        &assets,
+        30.0,
+        2.0,
+        EXACT,
+        &dip_refused(DipWhy::Letterboxed),
+    );
     let (tl, assets) = after_black(&m.portrait, black, 0.8, 1.0, tall);
     run("dip/black letterboxed", &tl, &assets, 30.0, 2.0, SCALED);
     // ... a layer of odd size (0.4985 of 640x360 is 319x179), which a dip to black draws.
     let (tl, assets) = after_black(&m.testsrc, white, 0.8, 0.4985, None);
-    run_refusing("dip/white odd layer", &tl, &assets, 30.0, 2.0, EXACT, "odd size 319x179");
+    run_refusing(
+        "dip/white odd layer",
+        &tl,
+        &assets,
+        30.0,
+        2.0,
+        EXACT,
+        &dip_refused(DipWhy::OddSize(319, 179)),
+    );
     let (tl, assets) = after_black(&m.testsrc, black, 0.8, 0.4985, None);
     run("dip/black odd layer", &tl, &assets, 30.0, 2.0, SCALED);
     // ... every picture that is not 8-bit limited-range 4:2:0.
@@ -1685,7 +1752,15 @@ fn a_dip_to_white_is_drawn_only_where_its_round_trip_was_measured() {
         ("gray", &v.gray),
     ] {
         let (tl, assets) = after_black(a, white, 0.8, 1.0, None);
-        run_refusing(&format!("dip/white {name}"), &tl, &assets, 30.0, 2.0, EXACT, NOT_MEASURED);
+        run_refusing(
+            &format!("dip/white {name}"),
+            &tl,
+            &assets,
+            30.0,
+            2.0,
+            EXACT,
+            &dip_refused(DipWhy::Format),
+        );
         let (tl, assets) = after_black(a, black, 0.8, 1.0, None);
         run(&format!("dip/black {name}"), &tl, &assets, 30.0, 2.0, EXACT);
     }
@@ -1697,11 +1772,11 @@ fn a_dip_to_white_is_drawn_only_where_its_round_trip_was_measured() {
 /// compositor that converts first, in every frame, and the stream is tagged full range as a
 /// whole) and `fade` darkens them toward the limited-range black 16 before the range is converted
 /// (frame 0 of a fade-in reads Y 30 where black is 16), so the plan refuses the picture in an
-/// export frame and inside a fade, a dip or a dissolve on that FFmpeg.
+/// export frame of the cut that holds it and inside a fade, a dip or a dissolve in a still, on that FFmpeg.
 fn run_full_range(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, limits: Limits) {
     match policy() {
         CompositeColorPolicy::FixedBt601 => run(case, tl, assets, fps, secs, limits),
-        _ => run_refusing(case, tl, assets, fps, secs, limits, "full-range picture"),
+        _ => run_refusing(case, tl, assets, fps, secs, limits, &full_range_cut_refused()),
     }
 }
 
@@ -1749,8 +1824,8 @@ fn a_full_range_picture_is_drawn_as_the_ffmpeg_in_use_converts_its_range() {
         });
         let tl = timeline(vec![vec![clip(a, lo, hi, 0.0), inc]], None);
         let reason = match policy() {
-            CompositeColorPolicy::FixedBt601 => NOT_MEASURED,
-            _ => "full-range picture",
+            CompositeColorPolicy::FixedBt601 => dip_refused(DipWhy::Format),
+            _ => full_range_cut_refused(),
         };
         run_refusing(
             &format!("full-range/dip-white {name}"),
@@ -1759,7 +1834,7 @@ fn a_full_range_picture_is_drawn_as_the_ffmpeg_in_use_converts_its_range() {
             30.0,
             2.0,
             EXACT,
-            reason,
+            &reason,
         );
     }
     // The scaler resizes it (the clip into a 960x540 frame): swscale converts the range inside the resize,
@@ -1773,7 +1848,42 @@ fn a_full_range_picture_is_drawn_as_the_ffmpeg_in_use_converts_its_range() {
         30.0,
         1.0,
         EXACT,
-        "full-range picture",
+        &full_range_resized_refused(),
+    );
+    // The cut is what FFmpeg 9 flags full range, not the frame: the limited-range frames of a cut that
+    // holds a full-range clip somewhere read 16 levels off too (black Y 0 against 16, the test pattern
+    // 76 against 81), before the clip, after it, and on another track. Every frame of these is refused
+    // there, whatever it shows; under FFmpeg 6 all of it is drawn to the level.
+    let (black, testsrc, mjpeg, jpeg) = (&m.black, &m.testsrc, &v.mjpeg, &v.jpeg);
+    let tl = timeline(vec![vec![clip(black, 0.5, 1.5, 0.0), clip(mjpeg, 0.5, 1.5, 1.0)]], None);
+    run_full_range(
+        "full-range/black then full-range",
+        &tl,
+        &[black.clone(), mjpeg.clone()],
+        30.0,
+        2.0,
+        EXACT,
+    );
+    let tl = timeline(vec![vec![clip(mjpeg, 0.5, 1.5, 0.0), clip(testsrc, 0.5, 1.5, 1.0)]], None);
+    run_full_range(
+        "full-range/full-range then limited",
+        &tl,
+        &[testsrc.clone(), mjpeg.clone()],
+        30.0,
+        2.0,
+        EXACT,
+    );
+    let tl = timeline(
+        vec![vec![clip(testsrc, 0.5, 2.5, 0.0)], vec![clip(jpeg, 0.0, 1.0, 1.0)]],
+        None,
+    );
+    run_full_range(
+        "full-range/on another track, later",
+        &tl,
+        &[testsrc.clone(), jpeg.clone()],
+        30.0,
+        2.0,
+        EXACT,
     );
     // A limited-range layer fading over a full-range one: the stack's export is the raw values.
     let mut over = clip(&m.testsrc, 0.5, 1.5, 0.0);

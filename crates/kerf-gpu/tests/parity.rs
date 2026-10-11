@@ -164,6 +164,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use kerf_core::{
     export_still, Asset, Clip, Color, CompositeColorPolicy, Container, Delivery, ExportOptions, Fit, ImageFormat, Keyframe,
     Project, RateControl, RenderPlan, StreamKind, Subsampling, Timeline, Track, Transform, Transition, TransitionKind,
+    Unsupported,
 };
 use kerf_gpu::geometry::LayerGeometry;
 use kerf_gpu::{Compositor, Gpu, GpuOptions};
@@ -2113,6 +2114,17 @@ fn check_full_range(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], 
         if reasons(&plan, plan.size(u32::MAX)).is_empty() {
             check_with(case, tl, assets, &[t], STRICT, opts);
         } else {
+            // Which reason, by variant: FFmpeg 6 only refuses what the scaler resizes, FFmpeg 9 any picture
+            // under a running fade (the two messages share their words).
+            let why = plan.reasons(&compositor().caps(), plan.size(u32::MAX));
+            let want = |u: &Unsupported| match policy() {
+                CompositeColorPolicy::FixedBt601 => matches!(u, Unsupported::FullRangeResized(..)),
+                _ => matches!(u, Unsupported::FullRangeNegotiated(_)),
+            };
+            assert!(
+                why.iter().any(want),
+                "{case} @ {t}: not refused for the expected reason: {why:?}"
+            );
             check_refused_with(
                 &format!("{case} (refused)"),
                 tl,
