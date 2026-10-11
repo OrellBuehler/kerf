@@ -62,6 +62,9 @@ const PREFETCH: f64 = 2.0;
 /// comes due is not waited for on the frame, so it must have had time to run).
 const WARM: f64 = 1.5;
 
+/// The longest a session's end waits for its prefetch thread to finish what it is doing.
+const FEEDER_JOIN: Duration = Duration::from_secs(1);
+
 /// How often the prefetch is told where the playhead is.
 const FEED_EVERY: Duration = Duration::from_millis(250);
 
@@ -141,10 +144,11 @@ pub struct PlayTally {
 
 /// A thread that looks ahead of the playhead and opens what the frames to come need.
 struct Feeder {
-    tx: Sender<(f64, (u32, u32))>,
+    tx: Option<Sender<(f64, (u32, u32))>>,
     /// Clips the prefetch found no run trusted for: (the time of the frame that needs them, why).
     failures: Arc<Mutex<Vec<(f64, String)>>>,
     told: Option<Instant>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Feeder {
@@ -156,10 +160,11 @@ impl Feeder {
             .name("kerf-gpu-play-prefetch".into())
             .spawn(move || feeder_loop(&rx, &cut, &feed, &compositor, &shared))
             .ok()
-            .map(|_| Self {
-                tx,
+            .map(|thread| Self {
+                tx: Some(tx),
                 failures,
                 told: None,
+                thread: Some(thread),
             })
     }
 
@@ -169,7 +174,29 @@ impl Feeder {
             return;
         }
         self.told = Some(now);
-        let _ = self.tx.send((t, size));
+        if let Some(tx) = &self.tx {
+            let _ = tx.send((t, size));
+        }
+    }
+}
+
+impl Drop for Feeder {
+    /// The thread ends with its sender, and what it holds (the compositor, so possibly the device) is
+    /// released before the session is gone — not on a thread nobody waits for, which would be the last
+    /// to use the device as the process exits. It is waited for [`FEEDER_JOIN`] at most: a clip being
+    /// opened is a probe with a timeout, and a frame that ends a session does not wait longer for it.
+    fn drop(&mut self) {
+        self.tx = None;
+        let Some(thread) = self.thread.take() else { return };
+        let until = Instant::now() + FEEDER_JOIN;
+        while !thread.is_finished() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if thread.is_finished() {
+            let _ = thread.join();
+        } else {
+            tracing::debug!("the prefetch thread of a play session is still opening a clip");
+        }
     }
 }
 
@@ -722,9 +749,10 @@ mod tests {
             motion,
             source,
             feeder: Some(Feeder {
-                tx,
+                tx: Some(tx),
                 failures: Arc::new(Mutex::new(failures)),
                 told: None,
+                thread: None,
             }),
             scan: None,
             shown: None,

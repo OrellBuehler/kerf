@@ -163,6 +163,8 @@ fn primer_loop(primer: &Primer, preview: &Weak<GpuPreview>) {
                     .unwrap_or_else(|poisoned| poisoned.into_inner().0);
             }
         };
+        #[cfg(test)]
+        let _busy = busy::Busy::enter();
         let Some(preview) = preview.upgrade() else {
             lock(&primer.state).running = false;
             return;
@@ -269,5 +271,38 @@ impl GpuPreview {
     fn expire_primed(&self) {
         let primed = lock(&self.primed).take();
         drop(primed);
+    }
+}
+
+/// What a test waits for before its process may exit: the priming thread holds a strong reference to the
+/// preview while it works, and may be the one that drops the last, device and all. A process that exits
+/// while a device is being torn down on another thread crashes in the driver (lavapipe's shader compiler).
+#[cfg(test)]
+pub(super) mod busy {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    static WORKING: AtomicUsize = AtomicUsize::new(0);
+
+    pub struct Busy;
+
+    impl Busy {
+        pub fn enter() -> Self {
+            WORKING.fetch_add(1, Ordering::SeqCst);
+            Busy
+        }
+    }
+
+    impl Drop for Busy {
+        fn drop(&mut self) {
+            WORKING.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    pub fn wait_idle(limit: Duration) {
+        let until = Instant::now() + limit;
+        while WORKING.load(Ordering::SeqCst) > 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }

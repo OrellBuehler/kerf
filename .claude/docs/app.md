@@ -340,7 +340,8 @@ frame, a scrub), a backend that was replaced, the setting turned off and `IDLE` 
 ends it with `renderer: "stream"` and `play.ahead` (a cursor that died, a surface hidden mid-frame). The session is out of its lock while
 a frame is drawn (teardown never waits for one), a panic in a step is caught and is the stream's too, and its prefetch thread
 (`kerf-gpu-play-prefetch`) looks 2 s ahead: it opens the cursor of every clip about to come on screen (the file's probes and the process
-start are paid before the cut) and has the titles of the next 1.5 s rasterised (`Compositor::warm_text`), neither on the frame's path.
+start are paid before the cut) and has the titles of the next 1.5 s rasterised (`Compositor::warm_text`), neither on the frame's path. A session's end waits for that thread
+(at most `FEEDER_JOIN`, 1 s, for a clip it is opening) so that what it holds, the device included, is released before the next frame and not by a detached thread as a process exits (the lavapipe shader compiler crashed such an exit about one drive-test run in ten; the tests' `Turn` also waits for the priming thread).
 **Priming** (`gpu_preview/prime.rs`): the start of a session is mostly `ffmpeg` starting (50 to 70 ms for one clip, more for several), and the playhead
 it will play from is known long before Play, so when a **paused** GPU frame has been the last request for 300 ms (`PRIME_AFTER`) the thread
 `kerf-gpu-prime` makes the `PlayCut` from it and opens the cursors of the frame on screen (each `ffmpeg` decodes its first frames into the pipe and
