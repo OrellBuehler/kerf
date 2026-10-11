@@ -1705,7 +1705,7 @@ fn what_is_ahead_of_a_moving_zoom_is_drawn_at_the_fit_size_and_magnified() {
     // the scaler's level through its own.
     for (name, effect, limits) in [
         ("blur", kerf_core::VideoEffect::Blur { sigma: 4.0 }, EFFECT_SCALED),
-        ("sharpen", kerf_core::VideoEffect::Sharpen { amount: 1.5 }, EFFECT_SCALED),
+        ("sharpen", kerf_core::VideoEffect::Sharpen { amount: 1.5 }, sharpened(1.5)),
         ("grayscale", kerf_core::VideoEffect::Grayscale, SCALED),
         ("invert", kerf_core::VideoEffect::Invert, SCALED),
     ] {
@@ -1738,10 +1738,20 @@ fn what_is_ahead_of_a_moving_zoom_is_drawn_at_the_fit_size_and_magnified() {
 /// off, none more. Everything else an effect does (the tables, the sharpen) is exact, 0 differing.
 const EFFECT: Limits = Limits { y: 1, uv: 1 };
 
-/// An effect on a picture the compositor scaled first (or took through the translucent round trip):
-/// the scaler's level (`SCALED`), carried through the effect — a sharpen passes a one-level difference
-/// of its input on with a gain of up to two — and the blur's own.
+/// A blur, grayscale or invert on a picture the compositor scaled first (or took through the translucent
+/// round trip): the scaler's level (`SCALED`) and the blur's own (`EFFECT`) on a sample where both fall.
 const EFFECT_SCALED: Limits = Limits { y: 2, uv: 2 };
+
+/// A sharpen after a scale. `unsharp` is exact, so what differs is the scaler's one level in its input,
+/// which the filter amplifies: `s + (s - blur(s)) * amount`, where the sample is a level off one way and
+/// its neighbours the other, is `1 + 2 * amount` levels of luma at worst (measured on a pip: 3 at amount
+/// 1.5 chained after a blur, 7 at 3, 11 at 5). The chroma is not sharpened and stays at the blur's bound.
+fn sharpened(amount: f64) -> Limits {
+    Limits {
+        y: 1 + (2.0 * amount).ceil() as i32,
+        uv: 2,
+    }
+}
 
 /// Two scale stages in cascade, the fit scale and then the zoom: the first stage is a level off the
 /// second's input, an interpolation of a few such samples, and the zoom's own rounding is the second.
@@ -2127,7 +2137,29 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         c.transform.scale = 0.33;
         c.effects = vec![E::Blur { sigma: 2.0 }, E::Sharpen { amount: 1.0 }];
     });
-    run("effect/odd 211x118", &tl, &assets, 30.0, 0.5, EFFECT_SCALED);
+    run("effect/odd 211x118", &tl, &assets, 30.0, 0.5, sharpened(1.0));
+    // Chains after a scale: the scaler's level goes through the sharpen's gain and the blur adds its own.
+    for (name, effects, limits) in [
+        (
+            "blur then sharpen",
+            vec![E::Blur { sigma: 3.0 }, E::Sharpen { amount: 1.5 }],
+            sharpened(1.5),
+        ),
+        (
+            "sharpen then blur",
+            vec![E::Sharpen { amount: 1.5 }, E::Blur { sigma: 3.0 }],
+            sharpened(1.5),
+        ),
+        ("sharpen 3", vec![E::Sharpen { amount: 3.0 }], sharpened(3.0)),
+        ("sharpen 5", vec![E::Sharpen { amount: 5.0 }], sharpened(5.0)),
+    ] {
+        let (tl, assets) = over_bars(m, &|c| {
+            c.transform.scale = 0.6;
+            c.transform.pos_x = 0.15;
+            c.effects = effects.clone();
+        });
+        run(&format!("effect/{name} on a pip"), &tl, &assets, 30.0, 0.5, limits);
+    }
     // A table on a letterbox: `pad`'s bars are part of the frame the effect sees, so they go through it
     // (invert makes them 239, 127, 127) and cover what is below.
     for (name, effect) in [("invert", E::Invert), ("grayscale", E::Grayscale)] {
