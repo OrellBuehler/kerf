@@ -621,20 +621,29 @@ that follows another within 10 s — restarts the stream from the playhead one r
 wall clock, so dropping the ones it already rendered saves nothing — halving a rate above 30
 first (60 → 30), then narrowing the width a step at a time to 960 (1920 → 1440 → 960), then
 halving again (30 → 15), then the narrowest step; smooth motion before a sharp picture that is
-moving. **A restart for lag starts the new stream the old one's start-up ahead of the playhead**
-(`startAt`: the gate's floor plus the head start that stream was itself given, at most 0.5 s, never
-past the last frame): the sound goes on while ffmpeg spawns, and a stream started at the playhead
-would show its first frame that long behind it for good, since the gate judges lag against its own
-floor (replayed on the recorded traces: 294 ms behind at the restarted stream's first frame, 54 ms
-with the head start). The ladder is `createLadder` (`playback-sync.ts`,
-tested): the steps down this cut is at, for this proxy epoch and pane width (a new one starts at the
-top again), remembered for a minute after the last restart (`stepsToStart`: a stream that met a busy
-moment finds out; one that cannot is stepped down again within a second), and the head start for the
-next stream, which only the restart that asked for it gets. It is a counter read when the stream
-starts, not state; an explicit `fps` goes to the backend only from the first step down. At the
-cheapest rung the gate is built without `degrade` (a restart is an ffmpeg spawn on a machine that is
-already short): it skips to the resync, as it did before. A stream that dropped anything leaves a line
-in the log when it ends (rate, width, frames shown and skipped, why it restarted).
+moving. **A stream starts the cut's usual start-up ahead of the playhead** (`startAt`): the sound goes on
+while ffmpeg spawns, and a stream started at the playhead would show its first frame that long behind it
+for good, since the gate judges lag against its own floor. The ladder remembers, per key (cut, proxy epoch,
+pane width), the **least** start-up any of its streams has taken — a stream is in step by its floor, so its
+start-up is the floor plus the head start it was given — and starts every later stream, a Play, a seek or a
+lag restart, that far ahead, capped at `MAX_LEAD` (0.25 s: a longer one is a stall that landed in a start-up,
+not one to make up for) and at the end of the cut **as it renders** (`renderedDuration`: the engine refuses a
+start at or past it). The first Play of a cut has nothing to lead by. The minimum, not the latest, because a
+start that comes in quicker than the last one would put the picture ahead of the sound, which is worse than
+behind it. (Replayed on the recorded traces, the restarted stream's first frame was 294 ms behind the sound
+without a head start and 54 ms with it, and never ahead.) The ladder is `createLadder` (`playback-sync.ts`,
+tested): the steps down this cut is at (remembered for a minute after the last restart, `stepsToStart`: a stream
+that met a busy moment finds out; one that cannot is stepped down again within a second), that start-up, and
+**whether the next stream may be restarted to heal a slow catch-up**: not for `REPEAT_RESYNC_WINDOW_MS` (10 s)
+after a lag restart (`heal`; the gate is built with `healWatch: Infinity`), because a stall that comes with
+every start (a decoder's first second) would be restarted into itself over and over (a simulation of a 0.6 s
+stall a second into every stream, caught up at 1.1x: 20 restarts and 21 s of frozen picture in 40 s with the
+ladder stepping to the floor; with the breaker, one restart). The gate adds the head start a stream was given to
+its floor for what a restart costs. It is a counter read when the stream starts, not state; an explicit `fps`
+goes to the backend only from the first step down. At the cheapest rung the gate is built without `degrade` (a
+restart is an ffmpeg spawn on a machine that is already short): it skips to the resync, as it did before. A
+stream that dropped anything leaves a line in the log when it ends (rate, width, frames shown and skipped, why it
+restarted).
 `start_playback` logs `frames` / `first_frame_ms` / `late_frames` per run, which is what separates
 "never started" from "sent but dropped" from "could not keep up".
 **What the transport measured** (headless Chromium, software rendering, 4 shared cores, 300

@@ -37,7 +37,7 @@
 	import { createFrameGate, createLadder } from '$lib/playback-sync';
 	import { CANVAS_PAINTER, createStreamPainter, jpegDataUrl } from '$lib/frame-transport';
 	import { decodeJpeg, paintPicture } from '$lib/frame-canvas';
-	import { renderedFps } from '$lib/timecode';
+	import { renderedDuration, renderedFps } from '$lib/timecode';
 	import { logFrontend } from '$lib/log';
 	import { clipDuration } from '$lib/types';
 	import type { TextOverlay } from '$lib/types';
@@ -205,16 +205,28 @@
 		// The width is the one the still is asked at, held to the source at the playhead; read
 		// untracked, since that source changes as the playhead crosses clips and the stream
 		// is not restarted for it.
-		const { rung, request, from, cheaper } = untrack(() =>
+		const { rung, request, from, lead, cheaper, heal } = untrack(() =>
 			ladder.start(
 				{ timeline, epoch, width: box },
-				{ fps: renderedFps(editor.timeline, editor.assets), width: frameWidth, playhead: ui.time, duration: editor.duration }
+				{
+					fps: renderedFps(editor.timeline, editor.assets),
+					width: frameWidth,
+					playhead: ui.time,
+					duration: renderedDuration(editor.timeline)
+				}
 			)
 		);
 		let live = true;
 		// At the cheapest rung there is nothing to restart into, and a restart costs an ffmpeg spawn on a
 		// machine that is already short: the frames are skipped to the resync, as they were before.
-		const verdict = createFrameGate({ fps: rung.fps, overloadAfter: cheaper ? undefined : Infinity });
+		// A stream a lag restart started a moment ago is not offered a restart for healing either: a stall that
+		// comes with every start would be restarted over and over, paying itself again each time.
+		const verdict = createFrameGate({
+			fps: rung.fps,
+			overloadAfter: cheaper ? undefined : Infinity,
+			healWatch: heal ? undefined : Infinity,
+			lead
+		});
 		const painter = CANVAS_PAINTER
 			? createStreamPainter({
 					decode: decodeJpeg,
@@ -270,6 +282,7 @@
 			streaming = false;
 			// What the gate dropped is the one number that says whether this stream was smooth, so a stream
 			// that dropped anything leaves a line in the log (a clean one would only be noise).
+			ladder.ended(verdict.floor());
 			const seen = verdict.stats();
 			const painted = painter?.stats();
 			if (seen.skipped > 0 || restarted || (painted && painted.failed + painted.discarded + painted.replaced > 0)) {

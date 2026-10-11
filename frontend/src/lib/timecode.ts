@@ -1,5 +1,5 @@
 import { trackRenders } from './levels';
-import type { Asset, Timeline } from './types';
+import { clipDuration, type Asset, type Timeline } from './types';
 
 const validFps = (fps: number | undefined): number =>
 	fps !== undefined && Number.isFinite(fps) && fps > 0 ? fps : 30;
@@ -31,6 +31,22 @@ export function renderedFps(timeline: Timeline, assets: Asset[]): number {
 		}
 	}
 	return 30;
+}
+
+/** How long the cut is **as it renders** (`Timeline::for_render().duration()`): the end of the last
+	* enabled clip on a track that renders. What a stream may start before — the engine refuses a start at
+	* or past it ("nothing to play past the playhead") — where the timeline's own length also counts the
+	* clips that are muted, shadowed by a solo or disabled. */
+export function renderedDuration(timeline: Timeline): number {
+	let end = 0;
+	for (const track of timeline.tracks) {
+		if (!trackRenders(timeline, track)) continue;
+		for (const clip of track.clips) {
+			if (clip.enabled === false) continue;
+			end = Math.max(end, clip.timeline_start + clipDuration(clip));
+		}
+	}
+	return end;
 }
 
 /** The project's one timecode: non-drop `HH:MM:SS:FF`. Hours are always shown, so a cut under

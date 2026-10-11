@@ -82,13 +82,17 @@ export type FrameVerdict = 'show' | 'skip' | 'resync' | 'degrade';
  * skipping under the one-second resync. So once a run has been watched for [`HEAL_WATCH`], the
  * gate projects how long the pane would still be frozen, until the drift is back inside the
  * budget, and when that is more than a restart costs it says `resync` instead. Pass `at`
- * (seconds, any origin) to time the run; without it each call is taken to be one frame apart.
+ * (seconds, any origin) to time the run; without it each call is taken to be one frame apart. A stream
+ * that was started `lead` seconds ahead of the playhead is in step by its floor *and* that: what a
+ * restart costs is the start-up it makes up for, `floor + lead`. Build the gate with `healWatch:
+ * Infinity` where a restart for healing must not be offered (see [`createLadder`]).
  */
 export function createFrameGate({
 	fps = 24,
 	resyncAfter = RESYNC_AFTER,
 	overloadAfter = OVERLOAD_AFTER,
-	healWatch = HEAL_WATCH
+	healWatch = HEAL_WATCH,
+	lead = 0
 } = {}) {
 	const rate = playbackFps(fps);
 	const stale = staleAfter(rate);
@@ -117,7 +121,7 @@ export function createFrameGate({
 			const watched = at - runAt;
 			if (watched >= healWatch && drift - stale >= HEAL_MARGIN) {
 				const healing = (runStart - drift) / watched;
-				if (healing > 0 && (drift - stale) / healing > Math.max(RESTART_COST, floor)) return 'resync';
+				if (healing > 0 && (drift - stale) / healing > Math.max(RESTART_COST, floor + lead)) return 'resync';
 			}
 			seen.skipped++;
 			return 'skip';
@@ -210,16 +214,18 @@ export function stepsToStart(steps: number, sinceLastRestartMs: number): number 
 	return sinceLastRestartMs > DEGRADE_MEMORY_MS ? 0 : steps;
 }
 
-/** The most a restart is started ahead of the playhead, seconds: a floor this long is a stream that
- *  was never in step to begin with, not a start-up to make up for. */
-export const MAX_LEAD = 0.5;
+/** The most a stream is started ahead of the playhead, seconds. A start-up this long is a stream that
+ *  was never in step to begin with (or a stall that happened to land in it), not one to make up for,
+ *  and starting too far ahead leaves the picture leading the sound, which is worse than trailing it. */
+export const MAX_LEAD = 0.25;
 
-/** Where a stream starts: the playhead, and after a restart for lag the stream's own floor ahead of it
- *  — the sound goes on while ffmpeg spawns, and a stream started at the playhead would show its first
+/** Where a stream starts: the playhead, and the start-up this cut has been seen to take ahead of it —
+ *  the sound goes on while ffmpeg spawns, and a stream started at the playhead would show its first
  *  frame that long behind the sound and keep it there (the gate judges lag against its floor, so
- *  nothing else would ever notice). Never past the last frame of the cut, which the engine refuses. */
-export function startAt(playhead: number, floor: number | null, duration: number, fps: number): number {
-	const lead = floor !== null && Number.isFinite(floor) ? Math.min(MAX_LEAD, Math.max(0, floor)) : 0;
+ *  nothing else would ever notice). Never past the last frame of the cut as it renders, which the
+ *  engine refuses. */
+export function startAt(playhead: number, startup: number | null, duration: number, fps: number): number {
+	const lead = startup !== null && Number.isFinite(startup) ? Math.min(MAX_LEAD, Math.max(0, startup)) : 0;
 	return Math.min(playhead + lead, Math.max(playhead, duration - 1 / playbackFps(fps)));
 }
 
@@ -231,8 +237,15 @@ export interface StreamStart {
 	request: { fps: number | null; width: number | null };
 	/** The timeline time it starts at. */
 	from: number;
+	/** How far ahead of the playhead that is, seconds: the gate adds it to its floor for what a restart costs. */
+	lead: number;
 	/** Whether a restart has anywhere cheaper to go: the gate is built without `degrade` when not. */
 	cheaper: boolean;
+	/** Whether the gate may restart the stream to heal a slow catch-up. Not on a stream that a restart for
+	 *  lag started less than [`REPEAT_RESYNC_WINDOW_MS`] ago: a stall that comes with every start (a decoder's
+	 *  first second, a cold cache) would be restarted over and over, each restart paying the stall again and
+	 *  the ladder stepping down for it. Build the gate with `healWatch: Infinity` when this is false. */
+	heal: boolean;
 }
 
 /** What a ladder is for: a new cut, a proxy that landed or another pane width starts again at the top. */
@@ -244,17 +257,28 @@ export interface LadderKey {
 
 /**
  * The bookkeeping of playing at the cost a machine can carry, out of the component so it can be tested:
- * how many steps down this cut is at this width, when it last restarted for lag, and how far the next
- * start is ahead of the playhead. `start` is called whenever a stream (re)starts and says how; `restarted`
- * when the gate asked for a lag restart. The steps are a counter read at the start, not state anything
- * watches, and are forgotten after [`DEGRADE_MEMORY_MS`] (`stepsToStart`).
+ * how many steps down this cut is at this width, when it last restarted for lag, and how long a stream
+ * takes to start, which is how far ahead of the playhead the next one begins. `start` is called whenever
+ * a stream (re)starts and says how; `restarted` when the gate asked for a lag restart and `ended` when
+ * any stream ends. The steps are a counter read at the start, not state anything watches, and are
+ * forgotten after [`DEGRADE_MEMORY_MS`] (`stepsToStart`).
+ *
+ * **The start-up is the least this cut has been seen to take** (per key; the first Play has none, so it
+ * starts at the playhead): every stream is in step by its floor, so its start-up is that floor plus the
+ * head start it was given, and the minimum is what no start is likely to beat — a start-up that comes in
+ * under the last one would have put the picture ahead of the sound.
  */
 export function createLadder(clock: () => number = () => performance.now()) {
 	let key: LadderKey | null = null;
 	let steps = 0;
 	let lastRestart = -Infinity;
-	let floor: number | null = null;
+	let startup: number | null = null;
 	let applied = 0;
+	function observe(floor: number | null) {
+		if (floor === null || !Number.isFinite(floor)) return;
+		const seen = floor + applied;
+		startup = startup === null ? seen : Math.min(startup, seen);
+	}
 	return {
 		start(
 			next: LadderKey,
@@ -264,33 +288,33 @@ export function createLadder(clock: () => number = () => performance.now()) {
 				key = next;
 				steps = 0;
 				lastRestart = -Infinity;
-				floor = null;
+				startup = null;
 				applied = 0;
 			}
-			steps = stepsToStart(steps, clock() - lastRestart);
+			const now = clock();
+			steps = stepsToStart(steps, now - lastRestart);
 			const rung = rungAfter(startRung(cut.fps, cut.width), steps);
-			const from = startAt(cut.playhead, floor, cut.duration, rung.fps);
-			// The head start is for the restart that asked for it; a seek or an edit starts at the playhead.
-			floor = null;
+			const from = startAt(cut.playhead, startup, cut.duration, rung.fps);
 			applied = from - cut.playhead;
 			return {
 				rung,
 				request: steps > 0 ? { fps: rung.fps, width: rung.width } : { fps: null, width: cut.width },
 				from,
-				cheaper: stepDown(rung) !== null
+				lead: applied,
+				cheaper: stepDown(rung) !== null,
+				heal: now - lastRestart >= REPEAT_RESYNC_WINDOW_MS
 			};
 		},
-		/**
-		 * The gate said `resync` or `degrade`; `lag` is its floor. A stream that was started ahead is in
-		 * step by its floor and no more, so what its start-up really took is the floor *and* the head
-		 * start it was given: without it a second restart would take the first one's success for a
-		 * start-up that cost nothing.
-		 */
-		restarted(verdict: 'resync' | 'degrade', lag: number | null) {
+		/** The gate said `resync` or `degrade`; `floor` is its floor. */
+		restarted(verdict: 'resync' | 'degrade', floor: number | null) {
+			observe(floor);
 			const now = clock();
 			steps = stepsAfter(verdict, steps, now - lastRestart);
 			lastRestart = now;
-			floor = lag === null ? null : lag + applied;
+		},
+		/** A stream ended, for whatever reason; `floor` is its gate's, `null` if it never showed a frame. */
+		ended(floor: number | null) {
+			observe(floor);
 		},
 		get steps() {
 			return steps;
