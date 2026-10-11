@@ -204,6 +204,78 @@
 	outline-offset: calc(var(--focus-offset) * -1);
 }
 
+/* ---------- ToolbarToggle: the timeline toolbar's buttons ---------- */
+
+/* One height, one target, one radius, one "on". Outlined while idle, or `data-bare` for a tool
+   or a zoom button; `data-square` is the icon-only one, 24 px each way. On is the amber outline and
+   wash (`kerf-300` on `selection-fill`, held to 4.5:1 by the contrast guard) for every kind of
+   button the toolbar has, whether it is a tool, a mode, a view or a menu with something chosen. */
+.k-tt {
+	flex: none;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 5px;
+	box-sizing: border-box;
+	height: 24px;
+	min-width: 24px;
+	padding: 0 7px;
+	font: var(--type-label);
+	white-space: nowrap;
+	cursor: pointer;
+	border: var(--line-width) solid var(--border-strong);
+	border-radius: var(--radius-sm);
+	background: transparent;
+	color: var(--text-muted);
+	transition:
+		background-color var(--dur-fast) var(--ease-out),
+		border-color var(--dur-fast) var(--ease-out),
+		color var(--dur-fast) var(--ease-out),
+		box-shadow var(--dur-fast) var(--ease-out);
+}
+.k-tt[data-square] {
+	width: 24px;
+	padding: 0;
+}
+.k-tt[data-bare] {
+	border-color: transparent;
+	color: var(--text-secondary);
+}
+.k-tt:hover:not(:disabled) {
+	background: var(--surface-hover);
+	color: var(--text-primary);
+}
+.k-tt:active:not(:disabled) {
+	background: var(--surface-active);
+	color: var(--text-primary);
+}
+.k-tt[data-on] {
+	background: var(--selection-fill);
+	border-color: var(--kerf-400);
+	color: var(--kerf-300);
+}
+.k-tt[data-on]:hover:not(:disabled) {
+	background: var(--selection-fill);
+	color: var(--kerf-300);
+	box-shadow: var(--hover-fill);
+}
+.k-tt[data-on]:active:not(:disabled) {
+	background: var(--selection-fill);
+	color: var(--kerf-300);
+	box-shadow: var(--press-fill);
+}
+.k-tt:disabled {
+	background: transparent;
+	border-color: var(--border-subtle);
+	color: var(--text-disabled);
+	box-shadow: none;
+	cursor: default;
+	opacity: 1;
+}
+.k-tt[data-bare]:disabled {
+	border-color: transparent;
+}
+
 /* ---------- Workspace tabs ---------- */
 
 .k-tab {
@@ -251,15 +323,15 @@
    timeline (they are the picture, and carry their own hover), nor menu rows (which light
    themselves from the pointer and the keys alike), nor dockview's own controls (the tab's close
    X, the overflow menu), which have a hover of theirs. */
-button:not(:disabled):not(.k-btn):not(.k-ibtn):not(.k-tab):not(.kclip):not([role^='menuitem']):not([class^='dv-']):not([class*=' dv-']):hover,
+button:not(:disabled):not(.k-btn):not(.k-ibtn):not(.k-tab):not(.k-tt):not(.kclip):not([role^='menuitem']):not([class^='dv-']):not([class*=' dv-']):hover,
 [role='button']:not([aria-disabled='true']):not([class^='dv-']):not([class*=' dv-']):hover {
 	box-shadow: var(--hover-fill);
 }
-button:not(:disabled):not(.k-btn):not(.k-ibtn):not(.k-tab):not(.kclip):not([role^='menuitem']):not([class^='dv-']):not([class*=' dv-']):active,
+button:not(:disabled):not(.k-btn):not(.k-ibtn):not(.k-tab):not(.k-tt):not(.kclip):not([role^='menuitem']):not([class^='dv-']):not([class*=' dv-']):active,
 [role='button']:not([aria-disabled='true']):not([class^='dv-']):not([class*=' dv-']):active {
 	box-shadow: var(--press-fill);
 }
-button:not(.k-btn):not(.k-ibtn):not(.k-tab):not(.kclip):not([role^='menuitem']):not([class^='dv-']):not([class*=' dv-']),
+button:not(.k-btn):not(.k-ibtn):not(.k-tab):not(.k-tt):not(.kclip):not([role^='menuitem']):not([class^='dv-']):not([class*=' dv-']),
 [role='button']:not([class^='dv-']):not([class*=' dv-']) {
 	transition: box-shadow var(--dur-fast) var(--ease-out);
 }
