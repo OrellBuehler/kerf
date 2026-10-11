@@ -7,7 +7,9 @@
  *
  * Keep the numbers in step with `crates/kerf-core/src/platform.rs`. */
 
-import type { DeliveryCheck, DeliveryIssue, PlatformTarget } from './types';
+import type { CutSummary, DeliveryCheck, DeliveryIssue, PlatformReport, PlatformTarget } from './types';
+
+export type { CutSummary };
 
 const VERTICAL: [number, number][] = [[9, 16]];
 
@@ -76,18 +78,15 @@ export const TARGETS: PlatformTarget[] = [
 	}
 ];
 
-export interface CutSummary {
-	duration: number;
-	width: number;
-	height: number;
-	has_audio: boolean;
-	has_text: boolean;
-}
-
 /** `m:ss`, how a length is spoken about. */
 export function fmtDur(secs: number): string {
 	const s = Math.max(0, Math.round(secs));
 	return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+/** `Instagram Reels'`, `TikTok's`: the possessive of a platform's name. */
+function possessive(label: string): string {
+	return label.endsWith('s') ? `${label}'` : `${label}'s`;
 }
 
 function ratioLabel(w: number, h: number): string {
@@ -106,14 +105,14 @@ export function check(target: PlatformTarget, cut: CutSummary): DeliveryCheck {
 		issues.push({
 			severity: 'error',
 			kind: 'length',
-			message: `${fmtDur(cut.duration)} is shorter than ${target.label}'s ${target.min_secs}s minimum.`
+			message: `${fmtDur(cut.duration)} is shorter than ${possessive(target.label)} ${target.min_secs}s minimum.`
 		});
 	}
 	if (target.max_secs != null && cut.duration > target.max_secs) {
 		issues.push({
 			severity: 'error',
 			kind: 'length',
-			message: `${fmtDur(cut.duration)} is over ${target.label}'s ${fmtDur(target.max_secs)} limit — trim ${fmtDur(cut.duration - target.max_secs)} to fit.`
+			message: `${fmtDur(cut.duration)} is over ${possessive(target.label)} ${fmtDur(target.max_secs)} limit — trim ${fmtDur(cut.duration - target.max_secs)} to fit.`
 		});
 	}
 	const withinHard = target.max_secs == null || cut.duration <= target.max_secs;
@@ -139,7 +138,7 @@ export function check(target: PlatformTarget, cut: CutSummary): DeliveryCheck {
 		issues.push({
 			severity: 'warning',
 			kind: 'resolution',
-			message: `${cut.width}×${cut.height} is below ${target.label}'s ${target.width}×${target.height}; the platform will upscale it and it will look soft.`
+			message: `${cut.width}×${cut.height} is below ${possessive(target.label)} ${target.width}×${target.height}; the platform will upscale it and it will look soft.`
 		});
 	}
 
@@ -161,4 +160,18 @@ export function check(target: PlatformTarget, cut: CutSummary): DeliveryCheck {
 
 export function checkAll(cut: CutSummary): DeliveryCheck[] {
 	return TARGETS.map((t) => check(t, cut));
+}
+
+/** `Timeline::export_span`: the span a range export writes — the range clamped to the cut, or `null`
+ *  when there is none or it is empty after clamping (the export then writes everything). */
+export function exportSpan(duration: number, range: { start: number; end: number } | null | undefined): [number, number] | null {
+	if (!range) return null;
+	const start = Math.max(0, range.start);
+	const end = Math.min(range.end, duration);
+	return end - start > 1e-9 ? [start, end] : null;
+}
+
+/** Every target's check with the cut it judged (`kerf_core::platform::report`). */
+export function report(cut: CutSummary): PlatformReport {
+	return { cut, targets: checkAll(cut) };
 }

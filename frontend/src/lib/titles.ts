@@ -53,7 +53,10 @@ let inkContext: InkContext | null | undefined;
 /** [`inkFromContext`] on the page's own canvas, cached; null where there is no canvas (tests, SSR). */
 export const measureInk: MeasureInk = (text, bold, family) => {
 	if (inkContext === undefined) {
-		inkContext = typeof document === 'undefined' ? null : (document.createElement('canvas').getContext('2d') as InkContext | null);
+		inkContext =
+			typeof document !== 'undefined' && typeof document.createElement === 'function'
+				? (document.createElement('canvas').getContext?.('2d') as InkContext | null | undefined) ?? null
+				: null;
 	}
 	if (!inkContext) return null;
 	const key = `${bold ? 1 : 0}|${family}|${text}`;

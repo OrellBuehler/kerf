@@ -14,10 +14,21 @@
   ("0:20 over", "cutting 1:00 would keep it in the feed"); aspect is compared as
   a **ratio**, so 720x1280 reads as the right shape and merely soft. The numbers
   are other companies' product decisions, verified 2026-08-25 and **advisory** —
-  nothing here ever blocks an export. `Project::platform_check(frame)` resolves
+  nothing here ever blocks an export. `Project::platform_report(frame, range)` resolves
   the summary from `working_timeline` (so an agent is judged on its own
   proposal) with an optional frame override, which the export dialog passes when
-  a render resizes away from the project frame.
+  a render resizes away from the project frame, and an optional `range`: the span an
+  export of that range writes. `Project::cut_summary_in` summarises it on the *sliced*
+  timeline (`Timeline::export_span` — the one clamp the export's `effective_range` also
+  reads, so an empty or inverted span is the whole cut — then `Timeline::slice`), so the
+  length, the footage-derived frame, whether the span has sound and whether a title is on
+  screen in it all describe the file, and a Reel cut from the middle of a long timeline is
+  judged as the Reel. The MCP `platform_check` takes the same optional `range`, and
+  `export_variants` judges each file over the range it was exported with. It answers a
+  `PlatformReport`: every
+  target's check *and* the `CutSummary` they judged, so a UI can state the file's
+  frame and length without reading the project a second time. Messages say
+  `Instagram Reels'` / `TikTok's` (`possessive`); `platforms.ts` mirrors it.
 - `render_plan.rs` + `planner.rs` + `plan_caps.rs` — **what one frame is made of**,
   shared by every renderer. `RenderPlan::at(timeline, assets, opts, t, color)` is the
   canvas (the same `export_format` the still uses, through `render_geometry`) plus the
@@ -236,10 +247,29 @@
   draws fades still refuses** (specific reasons, whatever the caps): `FadeOnTranslucent` (a black or white fade running on a
   layer whose opacity is below 1: FFmpeg fades the RGBA picture `colorchannelmixer` leaves, alpha plane
   included, ahead of the conversion back to `yuva420p`; a dissolve's ramp touches the alpha alone and is
-  drawn) and, with `caps.dip_white`, `DipToWhite` on an alpha plane (`fade c=white` takes RGB only and
-  FFmpeg picks another RGB format there) or beside a black fade of the same clip running ahead of it. A dip
-  to white is a filter in the export's chain for every frame of the clip, in a still's for the frames the
-  fade runs.
+  drawn) and, with `caps.dip_white`, `DipToWhite(layer, why)`: a dip to white is `yuv420p -> rgb24 -> yuv420p` around
+  the fade (a filter of every frame of the clip in an export, of the frames the fade runs in a still), measured within 2
+  levels (3 on BT.709) of the compositor's tables on x86-64 (arm64 NEON untested), and only on **8-bit limited-range
+  untagged / BT.601 / BT.709 `yuv420p`**. Refused, each with its own `why`: an alpha plane (FFmpeg picks another RGB
+  format), a black fade of the clip running ahead of it, any other pixel format (RGB 11 / 12 levels of Y / UV off,
+  10-bit 9 / 16, 4:4:4 16 / 17, 4:2:2 9 / 13, full range up to 21 — in an export's planes on 9.0.2 — or an unrecorded format) or matrix, and, from `reasons(size)`
+  (the geometry): a letterboxed layer (`pad` runs before the round trip, so FFmpeg's bars whiten; Y 126 against 16 at half
+  way), a picture with an odd side (the round trip reads past it), and any layer the scaler resizes (the `scale` filter hands
+  the fade its `rgb24` itself, scaling and converting in one pass: Y up to 19, UV 28 off, a crop that leaves the size is exact).
+  The dip-to-white refusals are the **Motion** plane bound's and are conservative in stills on purpose: bypassed, RGB, 10-bit, 4:4:4,
+  4:2:2, gray, BT.2020, full-range and half-size layers all pass a still's strict bounds, but `reasons()` is one function for both modes.
+  `FullRangeNegotiated(layer)` (a still): a `yuvj` (or unrecorded-format) picture inside a running fade, dip or dissolve where FFmpeg 9 works on its raw
+  values and converts the range afterwards (`fade` darkens toward the limited-range 16 first: frame 0 of a fade-in reads Y 30 where black is 16).
+  **`FullRangeCut`** (an export frame; a plan-level reason, from `PlanCanvas::full_range_cut`, which the `Planner` sets when any clip of the cut
+  `maybe_full_range()`): FFmpeg 9 flags the whole export full range and converts every limited-range frame of it (a black frame reads Y 0, not 16), so under any policy
+  but `FixedBt601` **no frame of a cut that holds a full-range clip** is drawn — before it, after it, on another track or a gap. FFmpeg 6 converts at the decode, as the
+  compositor does, and draws it all to the level, except that **`FullRangeResized`** (under either FFmpeg, from `reasons(size)`) refuses a full-range
+  picture the scaler resizes in an export frame and inside a fade (swscale converts the range inside the resize: chroma up to 15 levels off).
+  `maybe_full_range()` is a name heuristic (`yuvj…`, or no recorded format): the range tag (`color_range`) is the truth and `StreamInfo` does not record it. Under a policy that is not
+  `FixedBt601`, `maybe_full_range_in(policy)` therefore also counts any deeper-than-8-bit YCbCr / gray format (`pix_fmt_is_high_bit`): a `pc`-tagged 10-bit file probes as `yuv420p10le`, 9.0.2 handles it as `yuvj`, and the
+  limited 10-bit picture is refused with it (it is what the cut flag, `FullRangeNegotiated` and the grading refusals use; 6.1.1 draws both exactly, so the name alone decides there). Only a clip the export holds sets the cut flag (not a muted track, a
+  disabled clip, a track a solo shadows, or an audio track's use of the asset).
+  The policy condition is a **proxy measured only on FFmpeg 6.1.1 and 9.0.2** (5.x, 7.x, 8.x and distro builds are unmeasured).
   **`gpu_supported_at(size)` is the per-frame fallback switch** (`gpu_supported()` is
   its size-free half; `unsupported_reasons_at(size)` says *no, with reasons*) for
   anything the compositor does not render exactly: video effects (`Effects(layer, what)`: names the effect and

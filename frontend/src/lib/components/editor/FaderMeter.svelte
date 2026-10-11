@@ -18,6 +18,8 @@
 	} from '$lib/mixer';
 	import { clippedAny, peakLabel, strongest, type StereoMeter } from '$lib/meter';
 	import type { SliderKey } from '$lib/slider-gesture';
+	import { settings } from '$lib/settings.svelte';
+	import { tip as tooltip } from '$lib/tip';
 
 	let {
 		value,
@@ -60,7 +62,7 @@
 	const clipped = $derived(clippedAny(meter));
 	const fine = FADER_STEP_DB.fine;
 	const tip = $derived(
-		`${name} level ${gainLabel(value)} — drag, or ↑ ↓ to nudge ${FADER_STEP_DB.normal} dB (Shift ${FADER_STEP_DB.coarse}, Alt ${fine}); double-click for ${unityNote}`
+		`${name} level ${gainLabel(value)} — drag, or ↑ ↓ to nudge ${FADER_STEP_DB.normal} dB (${settings.modLabel('shift')} ${FADER_STEP_DB.coarse}, ${settings.modLabel('alt')} ${fine}); double-click for ${unityNote}`
 	);
 </script>
 
@@ -84,13 +86,13 @@
 	<LevelMeter {meter} {maxDb} label="{name} level meter" />
 </div>
 <div class="readouts">
-	<span class="db" title="The fader, in dB">{gainLabel(value)}</span>
+	<span class="db" use:tooltip={'The fader, in dB'}>{gainLabel(value)}</span>
 	<button
 		type="button"
 		class="peak"
 		class:clipped
 		disabled={!onclear}
-		title={clipped
+		use:tooltip={clipped
 			? `${name} reached full scale — click to clear`
 			: 'Highest sample peak since playback started (the Measure button reads the true peak) — click to clear'}
 		aria-label="{name} highest peak{clipped ? ', clipped' : ''}: {peakLabel(peak)} dBFS. Click to clear."

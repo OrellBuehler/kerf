@@ -28,6 +28,7 @@ import {
 	Eye,
 	EyeOff,
 	Lock,
+	LockOpen,
 	Volume2,
 	VolumeX,
 	Clock,
@@ -56,6 +57,9 @@ import {
 	Download,
 	RefreshCw,
 	TriangleAlert,
+	CircleCheck,
+	CircleX,
+	Info,
 	Lightbulb,
 	ExternalLink,
 	Bell,
@@ -77,7 +81,11 @@ import {
 	Menu,
 	Music2,
 	Layers,
-	Headphones
+	Headphones,
+	Diamond,
+	Globe,
+	CircleAlert,
+	ChevronUp
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -109,6 +117,7 @@ export const icons: Record<string, LucideIcon> = {
 	'eye': Eye,
 	'eye-off': EyeOff,
 	'lock': Lock,
+	'lock-open': LockOpen,
 	'volume-2': Volume2,
 	'volume-x': VolumeX,
 	'clock': Clock,
@@ -134,10 +143,14 @@ export const icons: Record<string, LucideIcon> = {
 	'chevron-down': ChevronDown,
 	'image': Image,
 	'x': X,
+	'diamond': Diamond,
 	'download': Download,
 	'refresh-cw': RefreshCw,
 	'external-link': ExternalLink,
 	'alert-triangle': TriangleAlert,
+	'circle-check': CircleCheck,
+	'circle-x': CircleX,
+	'info': Info,
 	'lightbulb': Lightbulb,
 	'bell': Bell,
 	'settings': Settings,
@@ -164,7 +177,11 @@ export const icons: Record<string, LucideIcon> = {
 	'music': Music2,
 	// Stems: the parts a sound is split into, stacked.
 	'layers': Layers,
-	'headphones': Headphones
+	'headphones': Headphones,
+	// 360 footage, and a failure that is not the app's own (a task that failed).
+	'globe': Globe,
+	'circle-alert': CircleAlert,
+	'chevron-up': ChevronUp
 };
 
 export type IconName = keyof typeof icons;

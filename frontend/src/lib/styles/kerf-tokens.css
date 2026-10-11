@@ -127,11 +127,15 @@
 	--track-text: #3a2c49;
 	--track-text-edge: #8a6aa8;
 	--waveform: #6fcfa8;
+	--clip-accent: #f0c277;
 	--scene-marker: var(--kerf-500);
 	--beat-marker: var(--agent-500);
 	--silence-region: color-mix(in srgb, var(--red-500) 12%, transparent);
 	--timeline-grid: color-mix(in srgb, var(--border-base) 4%, transparent);
 	--timeline-grid-major: color-mix(in srgb, var(--border-base) 8%, transparent);
+	/* The unfilled rail of the transport's scrub bar: a control, not a hairline, so it is held to 3:1 on the
+	   bar through text-disabled's own pair (`theme-guard.test.ts`) and shows in High contrast too. */
+	--scrub-rail: var(--text-disabled);
 	/* The trim / move ghost and the transition ramp. */
 	--drag-ghost: #788cff;
 

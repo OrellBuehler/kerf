@@ -333,6 +333,12 @@ impl Planner {
             })
             .collect();
 
+        let full_range_cut = clips.iter().any(|c| {
+            c.asset
+                .as_ref()
+                .and_then(|a| a.stream.as_ref())
+                .is_some_and(|s| s.maybe_full_range_in(req.color))
+        });
         Ok(Self {
             mode: req.mode,
             canvas: PlanCanvas {
@@ -346,6 +352,7 @@ impl Planner {
                 pick_fps,
                 pix_fmt: geom.pix_fmt,
                 gif: opts.container == Container::Gif,
+                full_range_cut,
             },
             rendered,
             clips,
@@ -727,7 +734,7 @@ mod tests {
     use super::*;
     use crate::clip_timing::FadeTint;
     use crate::engine::test_support::{make_clip, single, test_asset, timeline_of, video_stream, video_track};
-    use crate::model::{Delivery, Fit, Framing, Keyframe, Mask, Track, Transform, Transition, TransitionKind};
+    use crate::model::{Clip, Delivery, Fit, Framing, Keyframe, Mask, Track, Transform, Transition, TransitionKind};
     use crate::plan_caps::{EffectKinds, GpuCaps, Unsupported};
     use crate::render_plan::active_video_clips;
     use crate::render_plan::RenderPlan;
@@ -1070,6 +1077,261 @@ mod tests {
                 },
             );
             assert!(matches!(refused, Err(Error::InvalidArgument(_))), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn an_export_frame_with_a_dip_to_white_or_a_full_range_clip_is_refused_where_it_is_not_drawn_exactly() {
+        let caps = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            ..GpuCaps::A0
+        };
+        let frame = |pix_fmt: &str, size: (u32, u32), fit: Fit, dip: TransitionKind, policy: CompositeColorPolicy| {
+            let mut a = asset();
+            a.streams[0].pix_fmt = Some(pix_fmt.into());
+            a.streams[0].width = Some(size.0);
+            a.streams[0].height = Some(size.1);
+            let out = make_clip(a.id, 0.0, 4.0, 0.0);
+            let mut inc = make_clip(a.id, 4.0, 8.0, 4.0);
+            inc.transition_in = Some(Transition {
+                kind: dip,
+                duration: 1.0,
+            });
+            let mut tl = single(vec![out, inc]);
+            tl.format = Some(Delivery::new(640, 360, fit));
+            let plan = Planner::new(
+                &tl,
+                std::slice::from_ref(&a),
+                &opts(30.0),
+                PlanRequest {
+                    mode: PlanMode::Motion,
+                    ..PlanRequest::still(policy)
+                },
+            )
+            .unwrap()
+            .at_frame(30)
+            .unwrap();
+            plan.reasons(&caps, (640, 360))
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        let (white, black) = (TransitionKind::DipToWhite, TransitionKind::DipToBlack);
+        let (plain, bt) = (CompositeColorPolicy::FixedBt601, CompositeColorPolicy::BottomLayerTag);
+        // Before the dip's fade starts (frame 30 of a clip that dips from 4 s) the export's chain
+        // still holds the round trip, so the letterbox is refused there too.
+        assert!(frame("yuv420p", (640, 360), Fit::Contain, white, plain).is_empty());
+        let why = frame("yuv420p", (1920, 1080), Fit::Contain, white, plain);
+        assert!(why.iter().any(|w| w.contains("scaler resizes")), "{why:?}");
+        assert!(frame("yuv420p", (1920, 1080), Fit::Contain, black, plain).is_empty());
+        let why = frame("yuv420p", (360, 640), Fit::Contain, white, plain);
+        assert!(why.iter().any(|w| w.contains("letterboxed")), "{why:?}");
+        assert!(frame("yuv420p", (360, 640), Fit::Contain, black, plain).is_empty());
+        let why = frame("yuv420p", (360, 640), Fit::Cover, white, plain);
+        assert!(
+            why.iter().any(|w| w.contains("scaler resizes")) && !why.iter().any(|w| w.contains("letterboxed")),
+            "{why:?}"
+        );
+        let why = frame("rgb24", (640, 360), Fit::Contain, white, plain);
+        assert!(why.iter().any(|w| w.contains("not 8-bit limited-range")), "{why:?}");
+        assert!(frame("rgb24", (640, 360), Fit::Contain, black, plain).is_empty());
+        // A full-range clip is the raw values FFmpeg 9 exports; FFmpeg 6 converts at the decode.
+        assert!(frame("yuvj420p", (640, 360), Fit::Contain, black, plain).is_empty());
+        let why = frame("yuvj420p", (640, 360), Fit::Contain, black, bt);
+        assert!(why.iter().any(|w| w.contains("cut holds a full-range picture")), "{why:?}");
+        assert!(frame("yuv420p", (1920, 1080), Fit::Contain, black, bt).is_empty());
+        // A full-range clip the scaler resizes is refused in an export frame under FFmpeg 6 too.
+        let why = frame("yuvj420p", (1920, 1080), Fit::Contain, black, plain);
+        assert!(
+            why.iter().any(|w| w.contains("scaler resizes") && w.contains("full-range")),
+            "{why:?}"
+        );
+    }
+
+    #[test]
+    fn a_full_range_clip_anywhere_in_the_cut_refuses_every_export_frame_where_ffmpeg_9_flags_the_export_full_range() {
+        let caps = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            ..GpuCaps::A0
+        };
+        let limited = asset();
+        let mut full = asset();
+        full.streams[0].pix_fmt = Some("yuvj420p".into());
+        let assets = [limited.clone(), full.clone()];
+        let cut = |clips: Vec<Vec<Clip>>, policy: CompositeColorPolicy, k: u64| {
+            let mut tl = single(Vec::new());
+            tl.tracks = clips
+                .into_iter()
+                .map(|c| {
+                    let mut t = Track::new(crate::model::StreamKind::Video, "V");
+                    t.clips = c;
+                    t
+                })
+                .collect();
+            let plan = Planner::new(
+                &tl,
+                &assets,
+                &opts(30.0),
+                PlanRequest {
+                    mode: PlanMode::Motion,
+                    ..PlanRequest::still(policy)
+                },
+            )
+            .unwrap()
+            .at_frame(k)
+            .unwrap();
+            (plan.layers.len(), plan.reasons(&caps, plan.size(u32::MAX)))
+        };
+        let (plain, bt) = (CompositeColorPolicy::FixedBt601, CompositeColorPolicy::BottomLayerTag);
+        let first = 30;
+        let cases: [(&str, Vec<Vec<Clip>>, u64); 5] = [
+            (
+                "black, then the full-range clip: a frame of the black clip",
+                vec![vec![make_clip(limited.id, 0.0, 4.0, 0.0), make_clip(full.id, 0.0, 4.0, 4.0)]],
+                first,
+            ),
+            (
+                "the full-range clip, then limited range: a frame of the limited clip",
+                vec![vec![make_clip(full.id, 0.0, 4.0, 0.0), make_clip(limited.id, 0.0, 4.0, 4.0)]],
+                30 * 6,
+            ),
+            (
+                "a full-range clip on another track, later: a frame before it",
+                vec![
+                    vec![make_clip(limited.id, 0.0, 8.0, 0.0)],
+                    vec![make_clip(full.id, 0.0, 2.0, 5.0)],
+                ],
+                first,
+            ),
+            (
+                "a gap before the full-range clip",
+                vec![vec![make_clip(full.id, 0.0, 2.0, 5.0)]],
+                first,
+            ),
+            (
+                "the full-range clip alone",
+                vec![vec![make_clip(full.id, 0.0, 2.0, 0.0)]],
+                first,
+            ),
+        ];
+        for (name, clips, k) in cases {
+            let (_, why) = cut(clips.clone(), bt, k);
+            assert!(why.contains(&Unsupported::FullRangeCut), "{name}: {why:?}");
+            assert!(
+                !why.iter().any(|w| matches!(w, Unsupported::FullRangeNegotiated(_))),
+                "{name}: a layer's own reason is a still's: {why:?}"
+            );
+            // FFmpeg 6 converts the range at the decode, as the compositor does.
+            let (_, why) = cut(clips, plain, k);
+            assert!(!why.contains(&Unsupported::FullRangeCut), "{name}: {why:?}");
+        }
+        // A cut of limited-range clips only is not the cut's business.
+        let (_, why) = cut(vec![vec![make_clip(limited.id, 0.0, 4.0, 0.0)]], bt, first);
+        assert!(!why.contains(&Unsupported::FullRangeCut), "{why:?}");
+    }
+
+    #[test]
+    fn only_a_full_range_clip_the_export_would_hold_sets_the_cut_flag() {
+        use crate::model::StreamKind;
+        let limited = asset();
+        let mut full = asset();
+        full.streams[0].pix_fmt = Some("yuvj420p".into());
+        let assets = [limited.clone(), full.clone()];
+        let bt = CompositeColorPolicy::BottomLayerTag;
+        let holds = |tracks: Vec<Track>, policy: CompositeColorPolicy| {
+            let mut tl = single(Vec::new());
+            tl.tracks = tracks;
+            Planner::new(&tl, &assets, &opts(30.0), PlanRequest::motion(policy))
+                .unwrap()
+                .canvas()
+                .full_range_cut
+        };
+        let track = |kind: StreamKind, clips: Vec<Clip>, edit: &dyn Fn(&mut Track)| {
+            let mut t = Track::new(kind, "T");
+            t.clips = clips;
+            edit(&mut t);
+            t
+        };
+        let base = || track(StreamKind::Video, vec![make_clip(limited.id, 0.0, 4.0, 0.0)], &|_| {});
+        let none = |_: &mut Track| {};
+        // The control: the full-range clip on a video track that renders.
+        let on_top = || track(StreamKind::Video, vec![make_clip(full.id, 0.0, 2.0, 1.0)], &none);
+        assert!(holds(vec![base(), on_top()], bt));
+        // (A fact about the cut under any policy: FFmpeg 6, which converts the range at the decode, is
+        // let off by the refusal's own policy check, not by the flag.)
+        assert!(holds(vec![base(), on_top()], CompositeColorPolicy::FixedBt601));
+        // A muted track is not in the graph.
+        let muted = track(StreamKind::Video, vec![make_clip(full.id, 0.0, 2.0, 1.0)], &|t| {
+            t.muted = true;
+        });
+        assert!(!holds(vec![base(), muted], bt), "muted");
+        // Nor is a disabled clip.
+        let mut off = make_clip(full.id, 0.0, 2.0, 1.0);
+        off.enabled = false;
+        assert!(
+            !holds(vec![base(), track(StreamKind::Video, vec![off], &none)], bt),
+            "disabled"
+        );
+        // Nor a track a soloed one shadows.
+        let solo = track(StreamKind::Video, vec![make_clip(limited.id, 0.0, 4.0, 0.0)], &|t| {
+            t.solo = true;
+        });
+        assert!(
+            !holds(
+                vec![solo, track(StreamKind::Video, vec![make_clip(full.id, 0.0, 2.0, 1.0)], &none)],
+                bt
+            ),
+            "solo-shadowed"
+        );
+        // The soloed track itself is in it.
+        let soloed_full = track(StreamKind::Video, vec![make_clip(full.id, 0.0, 2.0, 1.0)], &|t| t.solo = true);
+        assert!(holds(vec![base(), soloed_full], bt), "soloed");
+        // An audio track's use of the asset (its sound) is not a picture.
+        let audio = track(StreamKind::Audio, vec![make_clip(full.id, 0.0, 2.0, 1.0)], &none);
+        assert!(!holds(vec![base(), audio], bt), "audio-only use");
+    }
+
+    #[test]
+    fn a_deeper_than_8_bit_picture_may_be_full_range_only_where_ffmpeg_9_handles_it_raw() {
+        let mut limited = asset();
+        limited.streams[0].pix_fmt = Some("yuv420p".into());
+        let mut deep = asset();
+        deep.streams[0].pix_fmt = Some("yuv420p10le".into());
+        let assets = [limited.clone(), deep.clone()];
+        let holds = |policy: CompositeColorPolicy| {
+            let mut tl = single(Vec::new());
+            let mut t = Track::new(crate::model::StreamKind::Video, "V");
+            t.clips = vec![make_clip(limited.id, 0.0, 4.0, 0.0), make_clip(deep.id, 0.0, 2.0, 4.0)];
+            tl.tracks = vec![t];
+            Planner::new(&tl, &assets, &opts(30.0), PlanRequest::motion(policy))
+                .unwrap()
+                .canvas()
+                .full_range_cut
+        };
+        // The file's range tag is not recorded, so a 10-bit picture is not known to be limited.
+        assert!(holds(CompositeColorPolicy::BottomLayerTag));
+        assert!(holds(CompositeColorPolicy::Unknown));
+        assert!(!holds(CompositeColorPolicy::FixedBt601), "FFmpeg 6 draws 10-bit to the level");
+        for (fmt, high) in [
+            ("yuv420p10le", true),
+            ("yuv420p12le", true),
+            ("yuv444p10le", true),
+            ("yuv422p16le", true),
+            ("p010le", true),
+            ("gray10le", true),
+            ("yuv420p", false),
+            ("gray", false),
+            ("rgb24", false),
+            ("gbrp10le", false),
+            ("yuvj420p", false),
+        ] {
+            assert_eq!(crate::model::pix_fmt_is_high_bit(fmt), high, "{fmt}");
         }
     }
 

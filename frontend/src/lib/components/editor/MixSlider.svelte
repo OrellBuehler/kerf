@@ -14,6 +14,7 @@
 	import { windowOf } from '$lib/realm';
 	import { windows } from '$lib/windows.svelte';
 	import { grabOffset, KEY_COMMIT_MS, moved, positionAt, sliderKey, type SliderKey } from '$lib/slider-gesture';
+	import { tip as tooltip } from '$lib/tip';
 
 	let {
 		orientation = 'vertical',
@@ -28,6 +29,7 @@
 		detent = null,
 		fillFrom = null,
 		accent = 'var(--kerf-400)',
+		solid = false,
 		disabled = false,
 		onpreview,
 		oncommit,
@@ -55,6 +57,8 @@
 		/** Where the filled part of the rail starts, `0..1`; `null` draws no fill. */
 		fillFrom?: number | null;
 		accent?: string;
+		/** Drawn like the theme's plain range input: a flat track, the fill and the thumb in the accent. */
+		solid?: boolean;
 		disabled?: boolean;
 		onpreview?: (v: number) => void;
 		oncommit?: (v: number) => unknown;
@@ -226,6 +230,7 @@
 <div
 	bind:this={root}
 	class="slider {orientation}"
+	class:solid
 	class:disabled
 	role="slider"
 	tabindex={disabled ? -1 : 0}
@@ -236,7 +241,7 @@
 	aria-valuenow={Number(pos.toFixed(3))}
 	aria-valuetext={valueText(value)}
 	aria-disabled={disabled}
-	title={tip}
+	use:tooltip={tip}
 	{onpointerdown}
 	{onpointermove}
 	onpointerup={end}
@@ -408,6 +413,30 @@
 	.slider:hover .thumb,
 	.slider:focus-visible .thumb {
 		background: var(--text-primary);
+	}
+	.solid .line {
+		background: var(--surface-active);
+		background-clip: padding-box;
+		border-color: transparent;
+	}
+	.solid .fill {
+		background: var(--accent);
+	}
+	.slider.solid .thumb,
+	.slider.solid:hover .thumb,
+	.slider.solid:focus-visible .thumb {
+		background: var(--accent);
+		border-color: transparent;
+	}
+	.slider.solid:hover .thumb {
+		filter: brightness(1.15);
+	}
+	/* The rest tick is a notch beside the track, no taller than the thumb that sits on it at rest. */
+	.horizontal.solid .detent {
+		top: 50%;
+		bottom: auto;
+		height: calc(var(--slider-track) + 8px);
+		transform: translateY(-50%);
 	}
 	.slider:active .thumb {
 		cursor: grabbing;

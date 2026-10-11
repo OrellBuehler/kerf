@@ -655,6 +655,14 @@ struct GetLevelsParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PlatformCheckParams {
+    #[schemars(
+        description = "Judge only this span of the cut, {start, end} in timeline seconds — what an export with the same `range` would write. Omit for the whole cut"
+    )]
+    range: Option<TimeRange>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SetDeliveryFormatParams {
     #[schemars(description = "Delivery frame width in pixels, e.g. 1080. Omit (with height) to clear the \
                               format and go back to following the footage's shape.")]
@@ -1105,8 +1113,11 @@ struct ExportParams {
     #[schemars(description = "Optional encode settings. Omit for the safe default (H.264 + AAC MP4). \
                        Key fields: container (mp4/mov/mkv/webm/gif/mp3/m4a/wav/flac); video_codec \
                        (libx264/libx265/libvpx-vp9/libsvtav1/prores_ks/gif, plus GPU encoders \
-                       h264_nvenc/hevc_nvenc/av1_nvenc/h264_qsv/hevc_qsv/h264_videotoolbox/\
-                       hevc_videotoolbox/h264_amf/hevc_amf — far faster, crf still applies); \
+                       h264_nvenc/hevc_nvenc/av1_nvenc/h264_qsv/hevc_qsv/av1_qsv/h264_videotoolbox/\
+                       hevc_videotoolbox/h264_amf/hevc_amf/av1_amf/h264_vaapi/hevc_vaapi/av1_vaapi — \
+                       far faster, crf still applies; use only the ones export_capabilities lists — \
+                       a VAAPI codec on a machine nothing has probed yet waits up to 10 s for the probe \
+                       to find the render node); \
                        audio_codec (aac/libmp3lame/libopus/flac/alac/pcm_s16le/pcm_s24le); \
                        rate_control (crf/bitrate/two_pass/lossless); crf; video_bitrate (\"8M\"); \
                        preset; hwaccel (\"auto\"/\"cuda\"/\"vaapi\"/\"videotoolbox\"/\"qsv\" — GPU \
@@ -3149,7 +3160,7 @@ impl KerfMcp {
     #[tool(
         description = "List the hardware (GPU) video encoders this machine's ffmpeg can actually use (verified by a \
                        test encode) — pass one as export's video_codec for a much faster render. Empty means software \
-                       encoders only."
+                       encoders only. libx264 stays the safe default: a hardware encoder trades file size for speed."
     )]
     async fn export_capabilities(&self) -> Result<String, McpError> {
         let encoders = blocking(|| Ok(kerf_core::hw_encoders().to_vec())).await?;
@@ -3357,37 +3368,12 @@ impl KerfMcp {
                     cancel.is_cancelled()
                 })
                 .map_err(core_err)?;
-            // Judged per file, at the frame that file actually is.
+            // Judged per file, at the frame that file actually is and over the span it writes.
+            let range = opts.range.map(|r| (r.start, r.end));
             let mut outputs = Vec::new();
             let project = lock_agent(&project);
             for v in render_variants.iter().take(done) {
-                let summary = project
-                    .cut_summary(Some((v.delivery.width, v.delivery.height)))
-                    .map_err(core_err)?;
-                let checks = kerf_core::platform::check_all(&summary);
-                let is_tip = |i: &kerf_core::platform::DeliveryIssue| i.severity == kerf_core::platform::Severity::Tip;
-                let ready_for: Vec<&str> = checks
-                    .iter()
-                    .filter(|c| c.issues.iter().all(is_tip))
-                    .map(|c| c.label.as_str())
-                    .collect();
-                let issues: Vec<serde_json::Value> = checks
-                    .iter()
-                    .flat_map(|c| {
-                        c.issues
-                            .iter()
-                            .filter(|i| !is_tip(i))
-                            .map(move |i| serde_json::json!({ "target": c.label, "severity": i.severity, "message": i.message }))
-                    })
-                    .collect();
-                outputs.push(serde_json::json!({
-                    "format": v.delivery.ratio_label(),
-                    "width": v.delivery.width,
-                    "height": v.delivery.height,
-                    "output": v.output.to_string_lossy(),
-                    "ready_for": ready_for,
-                    "issues": issues,
-                }));
+                outputs.push(variant_output(&project, v, range)?);
             }
             Ok((status, framed, outputs))
         })
@@ -3415,13 +3401,18 @@ impl KerfMcp {
                        TikTok / Instagram feed / YouTube): length limits, frame shape, and the reach limits a platform \
                        enforces silently — e.g. a Reel over 3 minutes uploads fine and is then shown only to existing \
                        followers. Returns errors (would be rejected), warnings (accepted but under-distributed or \
-                       letterboxed) and tips. Advisory: export is never blocked. Use before reporting a cut finished."
+                       letterboxed) and tips. Advisory: export is never blocked. Pass `range` to judge only the span an \
+                       export of that range would write (a Reel cut from the middle of a long timeline is judged at \
+                       the Reel's length, frame and sound, not the timeline's). Use before reporting a cut finished."
     )]
-    fn platform_check(&self) -> Result<String, McpError> {
-        // One summary, not two: `Project::platform_check` resolves its own, and
+    fn platform_check(&self, Parameters(p): Parameters<PlatformCheckParams>) -> Result<String, McpError> {
+        // One summary, not two: `Project::platform_report` resolves its own, and
         // each resolve deserializes the whole timeline and re-reads every asset
         // row to answer the identical question.
-        let summary = self.lock().cut_summary(None).map_err(core_err)?;
+        let summary = self
+            .lock()
+            .cut_summary_in(None, p.range.map(|r| (r.start, r.end)))
+            .map_err(core_err)?;
         let targets = kerf_core::platform::check_all(&summary);
         json(&serde_json::json!({
             "cut": {
@@ -4303,6 +4294,43 @@ fn require_window(start: f64, end: f64) -> Result<(), McpError> {
     }
 }
 
+/// One rendered variant as `export_variants` reports it: the file, and the platforms it is ready for
+/// with every issue that is more than a tip — judged at *that* file's frame and over the span it wrote
+/// (`range`, the export's own), so a Reel cut from a long timeline is not held to the timeline's length.
+fn variant_output(
+    project: &Project,
+    v: &kerf_core::ExportVariant,
+    range: Option<(f64, f64)>,
+) -> Result<serde_json::Value, McpError> {
+    let summary = project
+        .cut_summary_in(Some((v.delivery.width, v.delivery.height)), range)
+        .map_err(core_err)?;
+    let checks = kerf_core::platform::check_all(&summary);
+    let is_tip = |i: &kerf_core::platform::DeliveryIssue| i.severity == kerf_core::platform::Severity::Tip;
+    let ready_for: Vec<&str> = checks
+        .iter()
+        .filter(|c| c.issues.iter().all(is_tip))
+        .map(|c| c.label.as_str())
+        .collect();
+    let issues: Vec<serde_json::Value> = checks
+        .iter()
+        .flat_map(|c| {
+            c.issues
+                .iter()
+                .filter(|i| !is_tip(i))
+                .map(move |i| serde_json::json!({ "target": c.label, "severity": i.severity, "message": i.message }))
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "format": v.delivery.ratio_label(),
+        "width": v.delivery.width,
+        "height": v.delivery.height,
+        "output": v.output.to_string_lossy(),
+        "ready_for": ready_for,
+        "issues": issues,
+    }))
+}
+
 /// Refuse to silently clobber an existing file. A model that hallucinates or
 /// mis-remembers a path would otherwise destroy whatever is already there with
 /// no recourse — this is the write side of `require_local_output_path`.
@@ -4361,7 +4389,7 @@ fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
 mod tests {
     use super::{
         allowed_hosts, caption_source, clip_moves, core_err, describe_server_error, fmt_ts, image_result, log_tool_error,
-        refuse_overwrite, require_window, router, server_identity, track_gaps, ClipMoveParams,
+        refuse_overwrite, require_window, router, server_identity, track_gaps, variant_output, ClipMoveParams,
     };
 
     #[test]
@@ -5101,6 +5129,8 @@ mod tests {
             schema("get_levels"),
             (vec!["loudnorm".to_string(), "range".to_string()], Vec::<String>::new())
         );
+        // The check takes an optional range and nothing else: a bare call still judges the whole cut.
+        assert_eq!(schema("platform_check"), (vec!["range".to_string()], Vec::<String>::new()));
     }
 
     /// The words an agent reads have to name the ceiling the engine actually defaults to
@@ -5116,6 +5146,59 @@ mod tests {
             .as_str()
             .unwrap_or_default();
         assert!(param.contains(&format!("({default} until")), "{param}");
+    }
+
+    /// A Reel written from the middle of a long timeline is judged at the Reel's length: the per-file
+    /// verdict `export_variants` reports reads the range the export was given, not the whole cut.
+    #[test]
+    fn an_exported_variant_is_judged_over_the_span_it_wrote() {
+        let project = kerf_core::Project::sample().unwrap();
+        let interview = project
+            .list_assets()
+            .unwrap()
+            .into_iter()
+            .find(|a| a.name == "interview.mp4")
+            .unwrap();
+        // 20.5 s of sample cut, then two more full interviews: 260.5 s, past the 3 min Shorts cap.
+        project
+            .add_clip_to_timeline(interview.id, None, 0.0, 120.0, Some(20.5))
+            .unwrap();
+        project
+            .add_clip_to_timeline(interview.id, None, 0.0, 120.0, Some(140.5))
+            .unwrap();
+        let reel = kerf_core::ExportVariant::beside(
+            std::path::Path::new("/renders/cut.mp4"),
+            kerf_core::Delivery::parse("9:16").unwrap(),
+        );
+
+        let whole = variant_output(&project, &reel, None).unwrap();
+        let issues = whole["issues"].as_array().unwrap();
+        assert!(
+            issues
+                .iter()
+                .any(|i| i["target"] == "YouTube Shorts" && i["severity"] == "error"),
+            "{whole}"
+        );
+
+        // Over the 20 s span the three vertical feeds are ready; what remains is the other platforms'
+        // shape, never a length.
+        let span = variant_output(&project, &reel, Some((10.0, 30.0))).unwrap();
+        let ready: Vec<&str> = span["ready_for"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(ready, ["Instagram Reels", "YouTube Shorts", "TikTok"]);
+        assert!(
+            span["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|i| !ready.contains(&i["target"].as_str().unwrap())),
+            "{span}"
+        );
+        assert_eq!(span["format"], "9:16");
     }
 
     #[test]

@@ -16,6 +16,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { singleFlight } from '$lib/single-flight';
 	import type { MonitorCell } from '$lib/trim-tools';
+	import { tip } from '$lib/tip';
 
 	let { cell }: { cell: MonitorCell } = $props();
 
@@ -51,7 +52,7 @@
 
 <div style="flex:1;min-width:0;min-height:0;display:flex;flex-direction:column;gap:5px">
 	<div
-		style="flex:1;min-height:0;position:relative;display:grid;place-items:center;background:var(--frame-matte);border:var(--line-width) solid var(--border-default);border-radius:3px;overflow:hidden"
+		style="flex:1;min-height:0;position:relative;display:grid;place-items:center;background:var(--frame-matte);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-sm);overflow:hidden"
 	>
 		{#if url}
 			<img src={url} alt="{cell.label} frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain" />
@@ -69,6 +70,6 @@
 		<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-secondary)"
 			>{editor.assetName(cell.assetId)}</span
 		>
-		<span style="flex:none;font-family:var(--font-mono);color:var(--kerf-300)" title="Source timecode">{cell.timecode}</span>
+		<span style="flex:none;font-family:var(--font-mono);color:var(--kerf-300)" use:tip={'Source timecode'}>{cell.timecode}</span>
 	</div>
 </div>

@@ -79,8 +79,9 @@ impl MotionFrames {
         let Some(open) = self.open.get_mut(&layer.clip_id) else {
             return Err(GpuError::Gpu("a cursor that was just opened is gone".into()));
         };
+        let frame = open.cursor.pick(&layer.pick)?;
         open.at = pick.frame;
-        open.cursor.pick(&layer.pick)
+        Ok(frame)
     }
 
     /// Cursors alive (their `ffmpeg` runs).

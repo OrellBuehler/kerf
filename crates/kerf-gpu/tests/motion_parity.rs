@@ -21,8 +21,9 @@
 //!
 //! Where the source is drawn at its own size (these cases are: a 1:1 `scale` is skipped and the
 //! compositor's scaler is not in play) the planes agree **to the level**: `fade` is integer
-//! arithmetic ([`kerf_core::fade_luma`], `fade_chroma`, `fade_alpha`: identical on 6.1.1 and 9.0.2, checked by
-//! [`fade_arithmetic_is_ffmpegs`] on every factor), the dissolve is `overlay`'s own
+//! arithmetic ([`kerf_core::fade_luma`], `fade_chroma`, `fade_alpha`: the filter is identical on 6.1.1 and 9.0.2,
+//! checked by [`fade_arithmetic_is_ffmpegs`] on every factor; what FFmpeg 9 does around it to a full-range
+//! picture is not, and is refused), the dissolve is `overlay`'s own
 //! `FAST_DIV255` on the ramped alpha, a slide is a position the overlay truncates, a tail is a
 //! clip that plays on. A bound above zero is a measured, named thing (a rotated edge, a
 //! translucent layer's RGB round trip) and says so next to the case.
@@ -37,9 +38,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use kerf_core::{
-    fade_alpha, fade_chroma, fade_luma, Asset, Clip, Color, CompositeColorPolicy, Container, Delivery, ExportOptions, FadeEdge,
-    FadeStep, FadeTint, Fit, PlanMode, PlanRequest, Planner, Project, RateControl, StreamKind, Timeline, Track, Transition,
-    TransitionKind, FADE_FULL,
+    fade_alpha, fade_chroma, fade_luma, Asset, Clip, Color, CompositeColorPolicy, Container, Delivery, DipWhy, ExportOptions,
+    FadeEdge, FadeStep, FadeTint, Fit, PlanMode, PlanRequest, Planner, Project, RateControl, StreamKind, Timeline, Track,
+    Transition, TransitionKind, Unsupported, FADE_FULL,
 };
 use kerf_gpu::{Compositor, FrameSource, FrameSourceConfig, Gpu, GpuOptions, MotionFrames, YuvFrame};
 
@@ -384,9 +385,10 @@ const ROTATED: Limits = Limits { y: 2, uv: 2 };
 /// `eq` contrast (1.1) and rounded again.
 const GRADED_SCALED: Limits = Limits { y: 2, uv: 2 };
 
-/// A dip to white: two levels in every plane, on every picture measured (test patterns, and noise in
-/// all three planes, which is every Y, U, V combination, clipped RGB included), identically on 6.1.1
-/// and 9.0.2. `fade c=white` only takes RGB, so FFmpeg converts `yuv420p -> rgb24 -> yuv420p`
+/// A dip to white: two levels in every plane on the pictures it is drawn for — 8-bit limited-range
+/// untagged 4:2:0, test patterns and noise in all three planes (every Y, U, V combination, clipped RGB
+/// included) — identically on 6.1.1 and 9.0.2, on x86-64 (the arm64 kernel is not measured).
+/// `fade c=white` only takes RGB, so FFmpeg converts `yuv420p -> rgb24 -> yuv420p`
 /// around it, and the way out of YUV is **not** the C table converter the translucent round trip
 /// is exact against (`yuva420p -> argb`): `yuv420p -> rgb24` runs an x86 kernel whose 13-bit
 /// coefficients land up to two levels from the tables' (random planes against the tables of
@@ -394,6 +396,10 @@ const GRADED_SCALED: Limits = Limits { y: 2, uv: 2 };
 /// tables, which are the portable arithmetic; the plane error is the kernel's. A dip to white is
 /// the one transition drawn within a bound rather than to the level.
 const WHITE: Limits = Limits { y: 2, uv: 2 };
+
+/// A BT.709-tagged picture in a dip to white (both clips tagged): three levels of Y and two of UV,
+/// the same kernel read through BT.709's coefficients, identically on 6.1.1 and 9.0.2.
+const WHITE_709: Limits = Limits { y: 3, uv: 2 };
 
 #[derive(Default, Clone, Copy)]
 struct PlaneStats {
@@ -502,6 +508,11 @@ struct Check<'a> {
     /// rotated layer's picture (its footprint, from the plan's geometry: a content-based band
     /// vanishes where a fade makes the edge faint) are left out. Everything inside is compared.
     rotated: bool,
+    /// The frames the plan refuses for this reason (FFmpeg draws them) are not compared, and at
+    /// least one must be: the case is about a refusal. Every other frame is compared with the
+    /// export, so a refusal that is wider than it has to be shows too. A frame the plan refuses
+    /// for another reason is a failure.
+    refusing: Option<&'a Refusing>,
 }
 
 /// Samples this close to the edge of a rotated layer are the edge band.
@@ -570,6 +581,7 @@ fn check_motion(check: Check) -> (i32, i32) {
         limits,
         look,
         rotated,
+        refusing,
     } = check;
     let slug: String = case
         .chars()
@@ -590,10 +602,15 @@ fn check_motion(check: Check) -> (i32, i32) {
     let mut worst: Vec<(u64, i32, i32)> = Vec::new();
     let mut layers_seen = 0;
     let mut excluded_share = 0.0f64;
+    let mut refused_frames = 0usize;
     for k in frames.clone() {
         let plan = planner.at_frame(k).expect("plan");
         assert_eq!((plan.canvas.width, plan.canvas.height), (played.w as u32, played.h as u32));
         let why = plan.reasons(&compositor().caps(), size);
+        if refusing.is_some_and(|r| why.iter().any(|w| (r.is)(w))) {
+            refused_frames += 1;
+            continue;
+        }
         assert!(
             why.is_empty(),
             "{case}: frame {k}: the plan says the GPU cannot draw this: {why:?}"
@@ -657,6 +674,16 @@ fn check_motion(check: Check) -> (i32, i32) {
         format!(" | edge band <= {:.1}% left out", excluded_share * 100.0)
     } else {
         String::new()
+    };
+    if let Some(r) = refusing {
+        assert!(refused_frames > 0, "{case}: no frame was refused for {}", r.label);
+    }
+    let banded = match refusing {
+        Some(r) => format!(
+            "{banded} | {refused_frames} frames refused for {}, FFmpeg draws them",
+            r.label
+        ),
+        None => banded,
     };
     let line = format!(
         "{case:<44} frames {:>3}..{:<3} layers<={layers_seen} | Y: max {:>2} differing {:>7} PSNR {:>5.1} dB | UV: max {:>2} differing {:>7} PSNR {:>5.1} dB{banded}",
@@ -821,11 +848,10 @@ fn fade_arithmetic_is_ffmpegs() {
 
 // ---- cases ---------------------------------------------------------------------------------
 
-/// The output frames of `secs` seconds at `fps`, less the last: the export's final frame is the one
-/// the video ends on, and a window that closes on it is a different question (the closing-edge
-/// cases of `kerf-core`'s `picked.rs`).
+/// The output frames of `secs` seconds at `fps`, the last one included: a fade-out's final frame is
+/// the one that is black.
 fn upto(secs: f64, fps: f64) -> Range<u64> {
-    0..((secs * fps).floor() as u64).saturating_sub(1)
+    0..(secs * fps).floor() as u64
 }
 
 /// Two clips back to back (a second each, cut from the middle of four seconds of footage so that
@@ -861,6 +887,57 @@ fn run(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, limits:
         limits,
         look: &look_at(secs, fps),
         rotated: false,
+        refusing: None,
+    });
+}
+
+/// A refusal a case is about, matched by the [`Unsupported`] **variant** the plan gives (a message
+/// can be shared by two reasons; a variant cannot).
+struct Refusing {
+    label: String,
+    is: Box<dyn Fn(&Unsupported) -> bool>,
+}
+
+fn refusing(label: &str, is: impl Fn(&Unsupported) -> bool + 'static) -> Refusing {
+    Refusing {
+        label: label.to_string(),
+        is: Box::new(is),
+    }
+}
+
+/// A dip to white refused for `why`.
+fn dip_refused(why: DipWhy) -> Refusing {
+    refusing(
+        &format!("DipToWhite({why:?})"),
+        move |u| matches!(u, Unsupported::DipToWhite(_, w) if *w == why),
+    )
+}
+
+fn translucent_fade_refused() -> Refusing {
+    refusing("FadeOnTranslucent", |u| matches!(u, Unsupported::FadeOnTranslucent(_)))
+}
+
+fn full_range_cut_refused() -> Refusing {
+    refusing("FullRangeCut", |u| matches!(u, Unsupported::FullRangeCut))
+}
+
+fn full_range_resized_refused() -> Refusing {
+    refusing("FullRangeResized", |u| matches!(u, Unsupported::FullRangeResized(..)))
+}
+
+/// [`run`] for a case about a refusal: the frames the plan refuses for it are FFmpeg's, the
+/// others are compared with the export as usual.
+fn run_refusing(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, limits: Limits, reason: &Refusing) {
+    check_motion(Check {
+        case,
+        tl,
+        assets,
+        opts: at_fps(fps),
+        frames: upto(secs, fps),
+        limits,
+        look: &[],
+        rotated: false,
+        refusing: Some(reason),
     });
 }
 
@@ -875,6 +952,7 @@ fn run_rotated(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64,
         limits,
         look: &look_at(secs, fps),
         rotated: true,
+        refusing: None,
     });
 }
 
@@ -1491,13 +1569,14 @@ fn a_translucent_layer_dissolves_and_is_refused_its_fades_to_black() {
     glass.fade_in = 0.4;
     glass.fade_out = 0.4;
     let tl = timeline(vec![vec![under], vec![glass]], None);
-    refused(
+    run_refusing(
         "fade/translucent",
         &tl,
         &assets,
-        &at_fps(30.0),
-        upto(1.0, 30.0),
-        "below full opacity",
+        30.0,
+        1.0,
+        TRANSLUCENT,
+        &translucent_fade_refused(),
     );
     let out = clip(&m.bars, 0.5, 1.5, 0.0);
     let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
@@ -1507,13 +1586,421 @@ fn a_translucent_layer_dissolves_and_is_refused_its_fades_to_black() {
         duration: 0.6,
     });
     let tl = timeline(vec![vec![out, inc]], None);
-    refused(
+    run_refusing(
         "dip/black translucent-incoming",
         &tl,
         &assets,
-        &at_fps(30.0),
-        upto(2.0, 30.0),
-        "below full opacity",
+        30.0,
+        2.0,
+        TRANSLUCENT,
+        &translucent_fade_refused(),
+    );
+}
+
+// ---- other pictures: pixel formats, tags, full range -----------------------------------------
+
+/// The test pattern in the pictures a dip to white or a fade treats differently: what the round
+/// trip of a dip was not measured on, what FFmpeg 9 fades before converting its range, a BT.709 tag.
+struct Variants {
+    tenbit: Asset,
+    /// 10-bit tagged full range (`-color_range pc`): ffprobe names it `yuv420p10le`, like the limited
+    /// one, and [`StreamInfo`](kerf_core::StreamInfo) does not record the tag, so nothing in a plan
+    /// tells the two apart.
+    tenbit_pc: Asset,
+    yuv444: Asset,
+    yuv422: Asset,
+    gray: Asset,
+    /// A busy RGB PNG (a still image, `rgb24`).
+    rgb_png: Asset,
+    /// A full-range (`yuvj420p`) MJPEG clip and a JPEG still.
+    mjpeg: Asset,
+    jpeg: Asset,
+    bars709: Asset,
+    testsrc709: Asset,
+}
+
+/// The file's range tag as ffprobe reads it (`pc`, `tv`, or empty when untagged).
+fn color_range_tag(path: &Path) -> String {
+    let probe = std::env::var("KERF_FFPROBE").unwrap_or_else(|_| "ffprobe".to_string());
+    let out = Command::new(probe)
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=color_range"])
+        .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(path)
+        .output()
+        .expect("run ffprobe");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn variants() -> &'static Variants {
+    static V: OnceLock<Variants> = OnceLock::new();
+    V.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-variants");
+        std::fs::create_dir_all(&dir).unwrap();
+        let make = |name: &str, lavfi: &str, pix: &str, codec: &[&str]| -> Asset {
+            let p = dir.join(name);
+            let mut args = vec!["-f", "lavfi", "-i", lavfi];
+            args.extend_from_slice(codec);
+            args.extend_from_slice(&["-pix_fmt", pix, p.to_str().unwrap()]);
+            ffmpeg(&args);
+            probed(&p)
+        };
+        let ts = "testsrc2=size=640x360:rate=30:duration=4";
+        let bt709 = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709";
+        let x264 = ["-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", "-g", "10"];
+        let still = ["-frames:v", "1"];
+        Variants {
+            tenbit: make("tenbit.mp4", ts, "yuv420p10le", &x264),
+            tenbit_pc: {
+                let pc = [
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-qp",
+                    "0",
+                    "-g",
+                    "10",
+                    "-color_range",
+                    "pc",
+                ];
+                let a = make("tenbit_pc.mp4", ts, "yuv420p10le", &pc);
+                assert_eq!(
+                    a.streams[0].pix_fmt.as_deref(),
+                    Some("yuv420p10le"),
+                    "it probes as an ordinary 10-bit picture"
+                );
+                assert_eq!(
+                    color_range_tag(Path::new(&a.path)),
+                    "pc",
+                    "and it really is tagged full range"
+                );
+                a
+            },
+            yuv444: make("yuv444.mkv", ts, "yuv444p", &["-c:v", "ffv1"]),
+            yuv422: make("yuv422.mkv", ts, "yuv422p", &["-c:v", "ffv1"]),
+            gray: make("gray.mkv", ts, "gray", &["-c:v", "ffv1"]),
+            rgb_png: make("rgb.png", "testsrc2=size=640x360:rate=1:duration=1", "rgb24", &still),
+            mjpeg: make("fullrange.mkv", ts, "yuvj420p", &["-c:v", "mjpeg", "-qscale:v", "1"]),
+            jpeg: make("still.jpg", "testsrc2=size=640x360:rate=1:duration=1", "yuvj420p", &still),
+            bars709: make(
+                "bars709.mp4",
+                &format!("smptehdbars=size=640x360:rate=30:duration=4,{bt709}"),
+                "yuv420p",
+                &x264,
+            ),
+            testsrc709: make("testsrc709.mp4", &format!("{ts},{bt709}"), "yuv420p", &x264),
+        }
+    })
+}
+
+/// The cut every case of this section is made of: the black clip, then `incoming` (the picture
+/// under test) entering through `kind` over `secs`, `scale` of the frame, in `format`.
+fn after_black(
+    incoming: &Asset,
+    kind: TransitionKind,
+    secs: f64,
+    scale: f64,
+    format: Option<Delivery>,
+) -> (Timeline, Vec<Asset>) {
+    let m = media();
+    let (lo, hi) = if incoming.streams[0].image { (0.0, 1.0) } else { (0.5, 1.5) };
+    let mut inc = clip(incoming, lo, hi, 1.0);
+    inc.transform.scale = scale;
+    inc.transition_in = Some(Transition { kind, duration: secs });
+    (
+        timeline(vec![vec![clip(&m.black, 0.5, 1.5, 0.0), inc]], format),
+        vec![m.black.clone(), incoming.clone()],
+    )
+}
+
+/// A dip to white is `yuv420p -> rgb24 -> yuv420p` around the fade, drawn for the pictures the round
+/// trip was measured on (8-bit limited-range 4:2:0, untagged: [`WHITE`]; BT.709: [`WHITE_709`]) and
+/// FFmpeg's for every other. What it is refused for was measured, and each refusal is held here:
+/// a letterbox (FFmpeg pads before the round trip, so the bars whiten as well: the first probe read Y 126
+/// against 16 at half way), a picture with an odd side (the round trip reads past it), a layer the
+/// scaler resizes (the `scale` filter converts to RGB itself) and every picture that is not `yuv420p` (RGB 11 / 12 levels of Y / UV off, 10-bit 9 / 16, 4:4:4 16 / 17,
+/// 4:2:2 9 / 13, gray 2, full range up to 21). The dip to black on the same pictures is drawn
+/// exactly, which is how the frames either side of a refusal are held.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_dip_to_white_is_drawn_only_where_its_round_trip_was_measured() {
+    let m = media();
+    let v = variants();
+    let (white, black) = (TransitionKind::DipToWhite, TransitionKind::DipToBlack);
+    // Drawn: BT.709 footage (both clips tagged, so the stack has one matrix), and a half-size layer.
+    let mut inc = clip(&v.testsrc709, 0.5, 1.5, 1.0);
+    inc.transition_in = Some(Transition {
+        kind: white,
+        duration: 0.8,
+    });
+    let tl = timeline(vec![vec![clip(&v.bars709, 0.5, 1.5, 0.0), inc]], None);
+    run(
+        "dip/white bt709",
+        &tl,
+        &[v.bars709.clone(), v.testsrc709.clone()],
+        30.0,
+        2.0,
+        WHITE_709,
+    );
+    // A layer smaller than the frame that is not resized (a crop, a Cover fit at the footage's scale)
+    // is drawn, its edge included.
+    let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+    inc.transform.crop_left = 0.25;
+    inc.transform.crop_right = 0.25;
+    inc.transition_in = Some(Transition {
+        kind: white,
+        duration: 0.8,
+    });
+    let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0), inc]], None);
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    run("dip/white cropped layer", &tl, &assets, 30.0, 2.0, WHITE);
+    let cover = Some(Delivery::new(480, 360, Fit::Cover));
+    let (tl, assets) = after_black(&m.testsrc, white, 0.8, 1.0, cover);
+    run("dip/white cover 480x360", &tl, &assets, 30.0, 2.0, WHITE);
+    // Refused: a layer the scaler resizes, which the scale filter converts to RGB itself (the first
+    // measurement of a half-size layer: Y 19 / UV 28 off at the picture's sharp edges, and 11 / 10 for
+    // an enlargement). The dip to black on it is drawn.
+    for (name, scale, format) in [
+        ("half-size", 0.5, None),
+        ("three-quarter-size", 0.75, None),
+        ("shrunk to 320x180", 1.0, Some(Delivery::new(320, 180, Fit::Contain))),
+        ("enlarged to 960x540", 1.0, Some(Delivery::new(960, 540, Fit::Contain))),
+    ] {
+        let (tl, assets) = after_black(&m.testsrc, white, 0.8, scale, format);
+        run_refusing(
+            &format!("dip/white {name}"),
+            &tl,
+            &assets,
+            30.0,
+            2.0,
+            EXACT,
+            &dip_refused(DipWhy::Resized),
+        );
+        let (tl, assets) = after_black(&m.testsrc, black, 0.8, scale, format);
+        run(&format!("dip/black {name}"), &tl, &assets, 30.0, 2.0, SCALED);
+    }
+    // Refused: a letterboxed layer.
+    let tall = Some(Delivery::new(640, 360, Fit::Contain));
+    let (tl, assets) = after_black(&m.portrait, white, 0.8, 1.0, tall);
+    run_refusing(
+        "dip/white letterboxed",
+        &tl,
+        &assets,
+        30.0,
+        2.0,
+        EXACT,
+        &dip_refused(DipWhy::Letterboxed),
+    );
+    let (tl, assets) = after_black(&m.portrait, black, 0.8, 1.0, tall);
+    run("dip/black letterboxed", &tl, &assets, 30.0, 2.0, SCALED);
+    // ... a layer of odd size (0.4985 of 640x360 is 319x179), which a dip to black draws.
+    let (tl, assets) = after_black(&m.testsrc, white, 0.8, 0.4985, None);
+    run_refusing(
+        "dip/white odd layer",
+        &tl,
+        &assets,
+        30.0,
+        2.0,
+        EXACT,
+        &dip_refused(DipWhy::OddSize(319, 179)),
+    );
+    let (tl, assets) = after_black(&m.testsrc, black, 0.8, 0.4985, None);
+    run("dip/black odd layer", &tl, &assets, 30.0, 2.0, SCALED);
+    // ... every picture that is not 8-bit limited-range 4:2:0.
+    for (name, a) in [
+        ("rgb-png", &v.rgb_png),
+        ("10-bit", &v.tenbit),
+        ("4:4:4", &v.yuv444),
+        ("4:2:2", &v.yuv422),
+        ("gray", &v.gray),
+    ] {
+        // A 10-bit picture is maybe full range where FFmpeg 9 works on raw values (its tag is not recorded):
+        // the cut is refused whole there, whatever the dip.
+        let negotiated = name == "10-bit" && policy() != CompositeColorPolicy::FixedBt601;
+        let (tl, assets) = after_black(a, white, 0.8, 1.0, None);
+        let refused_for = if negotiated {
+            full_range_cut_refused()
+        } else {
+            dip_refused(DipWhy::Format)
+        };
+        run_refusing(&format!("dip/white {name}"), &tl, &assets, 30.0, 2.0, EXACT, &refused_for);
+        let (tl, assets) = after_black(a, black, 0.8, 1.0, None);
+        if negotiated {
+            run_refusing(
+                &format!("dip/black {name}"),
+                &tl,
+                &assets,
+                30.0,
+                2.0,
+                EXACT,
+                &full_range_cut_refused(),
+            );
+        } else {
+            run(&format!("dip/black {name}"), &tl, &assets, 30.0, 2.0, EXACT);
+        }
+    }
+}
+
+/// Under FFmpeg 6 a full-range (`yuvj420p`) picture is converted to limited range at the decode, as
+/// the compositor does, and everything below is drawn to the level. FFmpeg 9 keeps its raw
+/// values through the graph (the export's planes hold them: 17 levels of Y and 16 of UV off a
+/// compositor that converts first, in every frame, and the stream is tagged full range as a
+/// whole) and `fade` darkens them toward the limited-range black 16 before the range is converted
+/// (frame 0 of a fade-in reads Y 30 where black is 16), so the plan refuses the picture in an
+/// export frame of the cut that holds it and inside a fade, a dip or a dissolve in a still, on that FFmpeg.
+fn run_full_range(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, limits: Limits) {
+    match policy() {
+        CompositeColorPolicy::FixedBt601 => run(case, tl, assets, fps, secs, limits),
+        _ => run_refusing(case, tl, assets, fps, secs, limits, &full_range_cut_refused()),
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_full_range_picture_is_drawn_as_the_ffmpeg_in_use_converts_its_range() {
+    let m = media();
+    let v = variants();
+    eprintln!("composite colour policy of this FFmpeg: {:?}", policy());
+    for (name, a) in [("mjpeg", &v.mjpeg), ("jpeg-still", &v.jpeg)] {
+        let (lo, hi) = if a.streams[0].image { (0.0, 1.0) } else { (0.5, 1.5) };
+        assert_eq!(a.streams[0].pix_fmt.as_deref(), Some("yuvj420p"));
+        let mut fading = clip(a, lo, hi, 0.0);
+        fading.fade_in = 0.5;
+        fading.fade_out = 0.5;
+        let tl = timeline(vec![vec![fading]], None);
+        let one = std::slice::from_ref(a);
+        run_full_range(&format!("full-range/fade {name}"), &tl, one, 30.0, 1.0, EXACT);
+        let tl = timeline(vec![vec![clip(a, lo, hi, 0.0)]], None);
+        run_full_range(&format!("full-range/plain {name}"), &tl, one, 30.0, 1.0, EXACT);
+        // A cut between two full-range clips: FFmpeg 9 flags the export as full range as a whole,
+        // so a limited-range clip in the same cut is read 16 levels off too (the black before it).
+        let cuts = [
+            ("dip-black", TransitionKind::DipToBlack, 0.8),
+            ("dissolve", TransitionKind::Crossfade, 0.6),
+        ];
+        for (label, kind, secs) in cuts {
+            let mut inc = clip(a, lo, hi, 1.0);
+            inc.transition_in = Some(Transition { kind, duration: secs });
+            let tl = timeline(vec![vec![clip(a, lo, hi, 0.0), inc]], None);
+            run_full_range(
+                &format!("full-range/{label} {name}"),
+                &tl,
+                &[a.clone(), a.clone()],
+                30.0,
+                2.0,
+                EXACT,
+            );
+        }
+        // A dip to white on it is a picture the round trip was not measured on, whatever FFmpeg does with the range.
+        let mut inc = clip(a, lo, hi, 1.0);
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::DipToWhite,
+            duration: 0.8,
+        });
+        let tl = timeline(vec![vec![clip(a, lo, hi, 0.0), inc]], None);
+        let reason = match policy() {
+            CompositeColorPolicy::FixedBt601 => dip_refused(DipWhy::Format),
+            _ => full_range_cut_refused(),
+        };
+        run_refusing(
+            &format!("full-range/dip-white {name}"),
+            &tl,
+            &[a.clone(), a.clone()],
+            30.0,
+            2.0,
+            EXACT,
+            &reason,
+        );
+    }
+    // The scaler resizes it (the clip into a 960x540 frame): swscale converts the range inside the resize,
+    // which reads up to 15 levels of chroma off whichever FFmpeg this is, so it is refused under both.
+    let enlarged = Some(Delivery::new(960, 540, Fit::Contain));
+    let tl = timeline(vec![vec![clip(&v.mjpeg, 0.5, 1.5, 0.0)]], enlarged);
+    run_refusing(
+        "full-range/plain mjpeg enlarged",
+        &tl,
+        std::slice::from_ref(&v.mjpeg),
+        30.0,
+        1.0,
+        EXACT,
+        &full_range_resized_refused(),
+    );
+    // A 10-bit file tagged full range probes as `yuv420p10le`, like the limited one, and 9.0.2 handles it as it
+    // does `yuvj`: raw values kept, the export flagged full range, every other frame of the cut converted
+    // (measured Y 16 off). The plan cannot tell the two apart, so under FFmpeg 9 every deeper-than-8-bit
+    // picture counts as maybe full range, the limited one included; FFmpeg 6 draws both to the level.
+    let tenbit = &v.tenbit;
+    for (name, a) in [("pc-tagged 10-bit", &v.tenbit_pc), ("limited 10-bit", tenbit)] {
+        let tl = timeline(vec![vec![clip(&m.black, 0.5, 1.5, 0.0), clip(a, 0.5, 1.5, 1.0)]], None);
+        run_full_range(
+            &format!("full-range/black then {name}"),
+            &tl,
+            &[m.black.clone(), a.clone()],
+            30.0,
+            2.0,
+            EXACT,
+        );
+        let mut fading = clip(a, 0.5, 1.5, 0.0);
+        fading.fade_in = 0.5;
+        fading.fade_out = 0.5;
+        let tl = timeline(vec![vec![fading]], None);
+        run_full_range(
+            &format!("full-range/fade {name}"),
+            &tl,
+            std::slice::from_ref(a),
+            30.0,
+            1.0,
+            EXACT,
+        );
+    }
+    // The cut is what FFmpeg 9 flags full range, not the frame: the limited-range frames of a cut that
+    // holds a full-range clip somewhere read 16 levels off too (black Y 0 against 16, the test pattern
+    // 76 against 81), before the clip, after it, and on another track. Every frame of these is refused
+    // there, whatever it shows; under FFmpeg 6 all of it is drawn to the level.
+    let (black, testsrc, mjpeg, jpeg) = (&m.black, &m.testsrc, &v.mjpeg, &v.jpeg);
+    let tl = timeline(vec![vec![clip(black, 0.5, 1.5, 0.0), clip(mjpeg, 0.5, 1.5, 1.0)]], None);
+    run_full_range(
+        "full-range/black then full-range",
+        &tl,
+        &[black.clone(), mjpeg.clone()],
+        30.0,
+        2.0,
+        EXACT,
+    );
+    let tl = timeline(vec![vec![clip(mjpeg, 0.5, 1.5, 0.0), clip(testsrc, 0.5, 1.5, 1.0)]], None);
+    run_full_range(
+        "full-range/full-range then limited",
+        &tl,
+        &[testsrc.clone(), mjpeg.clone()],
+        30.0,
+        2.0,
+        EXACT,
+    );
+    let tl = timeline(
+        vec![vec![clip(testsrc, 0.5, 2.5, 0.0)], vec![clip(jpeg, 0.0, 1.0, 1.0)]],
+        None,
+    );
+    run_full_range(
+        "full-range/on another track, later",
+        &tl,
+        &[testsrc.clone(), jpeg.clone()],
+        30.0,
+        2.0,
+        EXACT,
+    );
+    // A limited-range layer fading over a full-range one: the stack's export is the raw values.
+    let mut over = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    over.transform.scale = 0.5;
+    over.fade_in = 0.4;
+    over.fade_out = 0.4;
+    let tl = timeline(vec![vec![clip(&v.mjpeg, 0.5, 1.5, 0.0)], vec![over]], None);
+    run_full_range(
+        "full-range/under a fading layer",
+        &tl,
+        &[v.mjpeg.clone(), m.testsrc.clone()],
+        30.0,
+        1.0,
+        SCALED,
     );
 }
 
@@ -1569,6 +2056,7 @@ fn run_zoom(case: &str, tl: &Timeline, assets: &[Asset], limits: Limits) {
         limits,
         look: &LOOK_ZOOM,
         rotated: false,
+        refusing: None,
     });
 }
 
@@ -1623,6 +2111,7 @@ fn a_moving_zoom_is_drawn_as_the_export_draws_it() {
         limits: SCALED,
         look: &[],
         rotated: false,
+        refusing: None,
     });
     for (name, speed) in [("speed 2", 2.0), ("reversed", -1.0)] {
         let mut c = zooming(&m.testsrc, 1.0, 1.5, (0.0, 0.0));
@@ -1639,6 +2128,7 @@ fn a_moving_zoom_is_drawn_as_the_export_draws_it() {
             limits: SCALED,
             look: &[],
             rotated: false,
+            refusing: None,
         });
     }
     // Cover into a frame the footage is scaled to: two scalers in cascade, the second one zooming.
@@ -1789,6 +2279,7 @@ fn a_dissolve_into_a_moving_zoom_ramps_the_alpha_at_the_fit_size() {
             limits: if mask.is_some() { ZOOMED_MASK } else { SCALED },
             look: &[33, 40],
             rotated: false,
+            refusing: None,
         });
     }
     // A slide in with a zoom, and a dip to black.
@@ -1807,6 +2298,7 @@ fn a_dissolve_into_a_moving_zoom_ramps_the_alpha_at_the_fit_size() {
             limits: SCALED,
             look: &[33],
             rotated: false,
+            refusing: None,
         });
     }
 }
@@ -1844,6 +2336,7 @@ fn a_moving_zoom_on_the_outgoing_clip_under_a_transition() {
             limits: if mask.is_some() { ZOOMED_MASK } else { SCALED },
             look: &[33, 40],
             rotated: false,
+            refusing: None,
         });
     }
 }

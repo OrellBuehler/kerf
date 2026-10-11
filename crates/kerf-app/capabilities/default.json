@@ -9,6 +9,7 @@
     "updater:default",
     "process:allow-restart",
     "core:window:allow-destroy",
+    "core:window:allow-set-title",
     {
       "identifier": "opener:allow-open-url",
       "allow": [{ "url": "https://github.com/OrellBuehler/kerf/*" }]

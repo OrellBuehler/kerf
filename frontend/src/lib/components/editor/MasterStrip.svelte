@@ -7,6 +7,9 @@
 	// The preview's limiter is an approximation — a compressor with a hard knee at the
 	// ceiling — and the toggle's tooltip says so; Measure reads the real thing.
 	//
+	// The limiter, its ceiling and the duck mode are the strip's FX block: folded by default and remembered
+	// (`master-fx.ts`), so the fader gets the strip's height and a limiter that is on still says so.
+	//
 	// The Duck pair picks how the tracks flagged Duck dip: under the sidechain compressor
 	// (the default; it dips by how loud the rest is) or the speech gate (exactly the depth set
 	// here while the rest speaks). Export only, like the Duck toggle itself.
@@ -37,6 +40,9 @@
 	import { readingText, scopeLabel } from '$lib/levels-view';
 	import type { MasterBus } from '$lib/types';
 	import type { MeasureResult } from '$lib/editor-ui.svelte';
+	import { fxSummary, loadMasterFxOpen, saveMasterFxOpen } from '$lib/master-fx';
+	import { settings } from '$lib/settings.svelte';
+	import { tip } from '$lib/tip';
 
 	let {
 		master,
@@ -59,6 +65,13 @@
 		onstop: () => void;
 		onclear: () => void;
 	} = $props();
+
+	let fxOpen = $state(loadMasterFxOpen());
+	const fx = $derived(fxSummary(master));
+	function toggleFx() {
+		fxOpen = !fxOpen;
+		saveMasterFxOpen(fxOpen);
+	}
 
 	let faderPreview = $state<number | null>(null);
 	let ceilingPreview = $state<number | null>(null);
@@ -176,79 +189,98 @@
 
 	<button
 		type="button"
-		class="limiter"
-		class:on={master.limiter}
-		aria-pressed={master.limiter}
-		title={master.limiter
-			? `Limiter on — holds the finished mix under ${ceilingLabel(master.ceiling_db)}. ${APPROX}`
-			: `Limiter off — turn it on to hold the finished mix under the ceiling. ${APPROX}`}
-		onclick={toggleLimiter}>Limiter</button
+		class="fx-toggle"
+		class:active={fx.active}
+		aria-expanded={fxOpen}
+		aria-controls="master-fx"
+		use:tip={fxOpen
+			? 'Fold the limiter and duck controls away'
+			: 'The limiter and the duck mode — folded so the fader has the strip’s height'}
+		onclick={toggleFx}
 	>
-	<div class="ceiling" class:dim={!master.limiter}>
-		<span class="cap">Ceiling</span>
-		<div class="ceiling-row">
-			<MixSlider
-				orientation="horizontal"
-				value={ceiling}
-				toPos={ceilingToPos}
-				fromPos={posToCeiling}
-				step={ceilingStep}
-				label="Limiter ceiling"
-				valueText={ceilingLabel}
-				tip="Limiter ceiling {ceilingLabel(ceiling)} — the level the finished mix is held under. Drag, or ← → to nudge {CEILING_STEP.normal} dB (Shift {CEILING_STEP.coarse}, Alt {CEILING_STEP.fine}); double-click for {ceilingLabel(
-					MASTER_DEFAULT_CEILING_DB
-				)}. {APPROX}"
-				detent={ceilingToPos(MASTER_DEFAULT_CEILING_DB)}
-				accent="var(--text-muted)"
-				onpreview={ceilingMove}
-				oncommit={ceilingCommit}
-				oncancel={ceilingCancel}
-				onreset={ceilingReset}
-			/>
-		</div>
-		<span class="ceil-val">{ceilingLabel(ceiling)}</span>
-	</div>
+		<span class="fx-label">FX</span>
+		<span class="fx-sum">{fx.text}</span>
+		<Icon n={fxOpen ? 'chevron-up' : 'chevron-down'} s={12} />
+	</button>
 
-	<div class="duck">
-		<div class="duck-head">
-			<span class="cap">Duck</span>
-			{#if gate}<span class="ceil-val">{duckLabel(depth)}</span>{/if}
+	{#if fxOpen}
+		<div id="master-fx" class="fx">
+			<button
+				type="button"
+				class="limiter"
+				class:on={master.limiter}
+				aria-pressed={master.limiter}
+				use:tip={master.limiter
+					? `Limiter on — holds the finished mix under ${ceilingLabel(master.ceiling_db)}. ${APPROX}`
+					: `Limiter off — turn it on to hold the finished mix under the ceiling. ${APPROX}`}
+				onclick={toggleLimiter}>Limiter</button
+			>
+			<div class="ceiling" class:dim={!master.limiter}>
+				<span class="cap">Ceiling</span>
+				<div class="ceiling-row">
+					<MixSlider
+						orientation="horizontal"
+						value={ceiling}
+						toPos={ceilingToPos}
+						fromPos={posToCeiling}
+						step={ceilingStep}
+						label="Limiter ceiling"
+						valueText={ceilingLabel}
+						tip="Limiter ceiling {ceilingLabel(ceiling)} — the level the finished mix is held under. Drag, or ← → to nudge {CEILING_STEP.normal} dB ({settings.modLabel('shift')} {CEILING_STEP.coarse}, {settings.modLabel('alt')} {CEILING_STEP.fine}); double-click for {ceilingLabel(
+							MASTER_DEFAULT_CEILING_DB
+						)}. {APPROX}"
+						detent={ceilingToPos(MASTER_DEFAULT_CEILING_DB)}
+						accent="var(--text-muted)"
+						onpreview={ceilingMove}
+						oncommit={ceilingCommit}
+						oncancel={ceilingCancel}
+						onreset={ceilingReset}
+					/>
+				</div>
+				<span class="ceil-val">{ceilingLabel(ceiling)}</span>
+			</div>
+
+			<div class="duck">
+				<div class="duck-head">
+					<span class="cap">Duck</span>
+					{#if gate}<span class="ceil-val">{duckLabel(depth)}</span>{/if}
+				</div>
+				<select
+					class="mode k-select"
+					aria-label="Duck mode"
+					value={gate ? 'gate' : 'compressor'}
+					use:tip={`How tracks flagged Duck dip under the rest of the mix. Compressor: a sidechain compressor dips them by how loud the rest is. Speech gate: they drop by exactly the depth set below while the rest of the mix speaks (easing down in about 50 ms, back up about 300 ms after it stops). ${DUCK_NOTE}`}
+					onchange={(e) => void chooseMode(e.currentTarget)}
+				>
+					<option value="compressor">Compressor</option>
+					<option value="gate">Speech gate</option>
+				</select>
+				{#if gate}
+					<div class="depth">
+						<MixSlider
+							orientation="horizontal"
+							value={depth}
+							toPos={duckToPos}
+							fromPos={posToDuck}
+							step={duckStep}
+							label="Speech gate depth"
+							valueText={duckLabel}
+							tip={`Speech gate depth ${duckLabel(depth)} — how far a ducked track drops while the rest of the mix speaks. Drag, or ← → to nudge ${DUCK_STEP.normal} dB (${settings.modLabel('shift')} ${DUCK_STEP.coarse}); double-click for ${duckLabel(DUCK_DEFAULT_DEPTH_DB)}. ${DUCK_NOTE}`}
+							detent={duckToPos(DUCK_DEFAULT_DEPTH_DB)}
+							accent="var(--text-muted)"
+							onpreview={(v) => (duckPreview = v)}
+							oncommit={duckCommit}
+							oncancel={() => (duckPreview = null)}
+							onreset={duckReset}
+						/>
+					</div>
+				{/if}
+				{#if !anyDucked}
+					<span class="hint">No track set to Duck</span>
+				{/if}
+			</div>
 		</div>
-		<select
-			class="mode"
-			aria-label="Duck mode"
-			value={gate ? 'gate' : 'compressor'}
-			title="How tracks flagged Duck dip under the rest of the mix. Compressor: a sidechain compressor dips them by how loud the rest is. Speech gate: they drop by exactly the depth set below while the rest of the mix speaks (easing down in about 50 ms, back up about 300 ms after it stops). {DUCK_NOTE}"
-			onchange={(e) => void chooseMode(e.currentTarget)}
-		>
-			<option value="compressor">Compressor</option>
-			<option value="gate">Speech gate</option>
-		</select>
-		<div class="depth" class:dim={!gate}>
-			<MixSlider
-				orientation="horizontal"
-				value={depth}
-				toPos={duckToPos}
-				fromPos={posToDuck}
-				step={duckStep}
-				label="Speech gate depth"
-				valueText={duckLabel}
-				disabled={!gate}
-				tip={gate
-					? `Speech gate depth ${duckLabel(depth)} — how far a ducked track drops while the rest of the mix speaks. Drag, or ← → to nudge ${DUCK_STEP.normal} dB (Shift ${DUCK_STEP.coarse}); double-click for ${duckLabel(DUCK_DEFAULT_DEPTH_DB)}. ${DUCK_NOTE}`
-					: 'Choose Speech gate to set how far a ducked track drops.'}
-				detent={duckToPos(DUCK_DEFAULT_DEPTH_DB)}
-				accent="var(--text-muted)"
-				onpreview={(v) => (duckPreview = v)}
-				oncommit={duckCommit}
-				oncancel={() => (duckPreview = null)}
-				onreset={duckReset}
-			/>
-		</div>
-		{#if !anyDucked}
-			<span class="hint">No track set to Duck</span>
-		{/if}
-	</div>
+	{/if}
 
 	<FaderMeter
 		value={volume}
@@ -267,7 +299,7 @@
 		class="measure"
 		disabled={stopping}
 		aria-busy={measuring}
-		title={measuring
+		use:tip={measuring
 			? 'Stop measuring. The pass reads the whole mix, so on a long cut it can run for minutes; stopping keeps the last result.'
 			: 'Measure the loudness of the cut — integrated LUFS, true peak and loudness range, for the finished mix and each track — over the whole cut, or the in / out range when both marks are set. It reads the audio the export would render, so it takes a while on a long cut.'}
 		onclick={measuring ? onstop : onmeasure}
@@ -283,7 +315,7 @@
 
 	{#if result}
 		<div class="scope" class:stale>
-			<span title={stale ? 'The cut changed after this was measured — measure again' : undefined}
+			<span use:tip={stale ? 'The cut changed after this was measured — measure again' : undefined}
 				>{stale ? 'Out of date · ' : ''}{scopeLabel(result.range, result.levels.duration)}</span
 			>
 			{#if result.levels.estimated}
@@ -297,7 +329,7 @@
 				<div><dt>LUFS</dt><dd>{read.lufs}</dd></div>
 				<div><dt>True peak</dt><dd>{read.truePeak}</dd></div>
 				<div><dt>LRA</dt><dd>{read.range}</dd></div>
-				{#if read.shortTerm}<div title="The loudest three seconds"><dt>Short-term</dt><dd>{read.shortTerm}</dd></div>{/if}
+				{#if read.shortTerm}<div use:tip={'The loudest three seconds'}><dt>Short-term</dt><dd>{read.shortTerm}</dd></div>{/if}
 			</dl>
 		{/if}
 	{/if}
@@ -327,6 +359,45 @@
 		letter-spacing: var(--tracking-caps);
 		text-transform: uppercase;
 		color: var(--text-secondary);
+	}
+	.fx-toggle {
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		height: 24px;
+		padding: 0 6px;
+		cursor: pointer;
+		font-family: var(--font-sans);
+		font-size: var(--text-2xs);
+		color: var(--text-muted);
+		background: transparent;
+		border: var(--line-width) solid var(--border-default);
+		border-radius: var(--radius-xs);
+	}
+	.fx-toggle:hover {
+		color: var(--text-primary);
+	}
+	.fx-toggle.active {
+		color: var(--text-secondary);
+	}
+	.fx-label {
+		flex: none;
+		font-weight: 600;
+		letter-spacing: var(--tracking-wide);
+	}
+	.fx-sum {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		text-align: left;
+		font-family: var(--font-mono);
+	}
+	.fx {
+		display: flex;
+		flex-direction: column;
+		gap: 5px;
 	}
 	.limiter,
 	.measure {
@@ -403,26 +474,15 @@
 	}
 	.mode {
 		height: 24px;
-		min-width: 0;
-		padding: 0 4px;
-		cursor: pointer;
-		font-family: var(--font-sans);
-		font-size: 11px;
+		padding-left: 6px;
+		font-size: var(--text-xs);
 		font-weight: 600;
 		color: var(--text-secondary);
-		background: var(--surface-inset);
-		border: var(--line-width) solid var(--border-strong);
 		border-radius: var(--radius-xs);
-	}
-	.mode:hover {
-		color: var(--text-primary);
 	}
 	.depth {
 		display: flex;
 		margin: 0 -4px;
-	}
-	.depth.dim {
-		opacity: 0.6;
 	}
 	.hint {
 		font-size: 10px;

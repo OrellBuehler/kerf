@@ -382,6 +382,26 @@ fn an_exact_frame_takes_no_run_from_anyone() {
     assert_eq!(after.runs, 1, "{after:?}");
 }
 
+/// A release stops the file's runs and forgets its frames; the next request is an ordinary one
+/// and starts a run of its own, and the frame it gets is the one-shot decode's.
+#[test]
+#[ignore = "needs ffmpeg"]
+fn a_request_after_a_release_of_its_file_starts_a_new_run() {
+    let a = &media().cfr;
+    let src = source();
+    let l = at(a, 0.5);
+    assert!(src.frame(&l, Hint::Scrub).expect("a frame").is_some());
+    let before = src.stats();
+    assert_eq!((before.spawned, before.runs), (1, 1), "{before:?}");
+    src.release(kerf_gpu::frame_cache::SourceId::of(Path::new(&a.path)));
+    let released = src.stats();
+    assert_eq!((released.spawned, released.runs), (1, 0), "{released:?}");
+    let got = src.frame(&l, Hint::Scrub).expect("a frame after the release");
+    assert_eq!(got, decode_layer(&l).unwrap().map(std::sync::Arc::new));
+    let after = src.stats();
+    assert_eq!((after.spawned, after.runs), (2, 1), "{after:?}");
+}
+
 #[test]
 #[ignore = "needs ffmpeg"]
 fn past_the_last_frame_there_is_no_frame_and_it_is_remembered() {

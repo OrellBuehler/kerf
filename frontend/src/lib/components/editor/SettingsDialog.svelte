@@ -5,18 +5,23 @@
 	// the right, so the next one is a row in a list.
 	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
-	import { trapFocus } from '$lib/modal';
+	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
+	import ProgressBar from './ProgressBar.svelte';
 	import KeyboardSettings from './KeyboardSettings.svelte';
 	import { settings, CPU_PRESETS } from '$lib/settings.svelte';
 	import { gpuPreview } from '$lib/gpu-preview.svelte';
 	import { COLOR_GROUPS, PRESETS, PRESET_IDS, SHAPE_TOKENS, THUMB_STYLES } from '$lib/theme';
 	import { cancelVoiceover, onVoiceoverProgress, prepareVoiceover, voiceoverStatus } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
+	import { failure } from '$lib/failure-copy';
 	import { ANALYSIS_KINDS } from '$lib/analysis-steps';
 	import { PREVIEW_SOURCES, PROXY_SIZES } from '$lib/proxy-info';
 	import { approxMB, isVoiceoverCancelled, loadPrefs, stageLabel } from '$lib/voiceover';
+	import { roving } from '$lib/roving';
+	import { tabStop } from '$lib/menu-nav';
 	import type { VoiceoverProgress, VoiceoverStatus } from '$lib/types';
+	import { tip } from '$lib/tip';
 
 	let { onClose }: { onClose: () => void } = $props();
 
@@ -44,6 +49,18 @@
 
 	const themePreset = $derived(settings.themePreset);
 
+	// Each radio group has one tab stop: the chosen chip, or — while proxies are off and every source but
+	// "Always original" is disabled — the first one that can take focus.
+	const proxyStop = $derived(tabStop(PROXY_SIZES.map((p) => ({ checked: settings.proxySize === p.size, enabled: true }))));
+	const sourceStop = $derived(
+		tabStop(
+			PREVIEW_SOURCES.map((p) => ({
+				checked: settings.previewSource === p.source,
+				enabled: !(settings.proxySize === 0 && p.source !== 'original')
+			}))
+		)
+	);
+
 	// What the GPU preview is doing on this machine; read when its section opens.
 	const gpuStatus = $derived(gpuPreview.status);
 	$effect(() => {
@@ -64,7 +81,9 @@
 		);
 	});
 	const voLine = $derived(
-		voStatus
+		voPreparing
+			? 'Downloading the voice model…'
+			: voStatus
 			? !voStatus.available
 				? (voStatus.reason ?? 'Voiceover is not available.')
 				: voStatus.ready
@@ -87,7 +106,7 @@
 			voStatus = await prepareVoiceover(voice);
 			toast.success('Voice model ready');
 		} catch (e) {
-			if (!isVoiceoverCancelled(e)) toast.error(e instanceof Error ? e.message : String(e));
+			if (!isVoiceoverCancelled(e)) toast.error(failure('Voice model download failed', e));
 		} finally {
 			unlisten();
 			voPreparing = false;
@@ -111,462 +130,448 @@
 	};
 
 	const chip = (active: boolean) =>
-		`padding:5px 10px;border-radius:999px;font-size:12px;cursor:pointer;white-space:nowrap;border:var(--line-width) solid ${
+		`padding:5px 10px;border-radius:var(--radius-sm);font-size:12px;cursor:pointer;white-space:nowrap;border:var(--line-width) solid ${
 			active ? 'var(--kerf-500)' : 'var(--border-strong)'
 		};background:${
 			active ? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)' : 'var(--surface-inset)'
 		};color:${active ? 'var(--text-primary)' : 'var(--text-secondary)'}`;
 </script>
 
-<!-- svelte-ignore a11y_click_events_have_key_events -->
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div
-	use:trapFocus
-	role="dialog"
-	aria-modal="true"
-	aria-label="Settings"
-	tabindex="-1"
-	onclick={onClose}
-	onkeydown={(e) => {
-		if (e.key === 'Escape') onClose();
-		e.stopPropagation();
-	}}
-	style="position:fixed;inset:0;z-index:50;background:color-mix(in srgb,var(--scrim) 55%,transparent);display:flex;align-items:center;justify-content:center;padding:24px"
->
-	<div
-		onclick={(e) => e.stopPropagation()}
-		style="width:min(620px,100%);height:min(640px,100%);display:flex;flex-direction:column;background:var(--surface-panel);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-md);box-shadow:var(--shadow-lg);overflow:hidden"
-	>
-		<div
-			style="height:var(--toolbar-h);flex:none;display:flex;align-items:center;gap:8px;padding:0 14px;border-bottom:var(--line-width) solid var(--border-default)"
+<Modal title="Settings" icon="settings" width={620} height={640} onClose={onClose}>
+	<div style="flex:1;display:flex;min-height:0">
+		<!-- section rail -->
+		<nav
+			aria-label="Settings sections"
+			style="flex:none;width:150px;padding:10px 8px;border-right:var(--line-width) solid var(--border-default);display:flex;flex-direction:column;gap:2px"
 		>
-			<Icon n="settings" s={15} color="var(--text-secondary)" />
-			<span style="font:var(--type-ui);font-weight:600;color:var(--text-primary);flex:1">Settings</span>
-			<Btn variant="ghost" size="sm" onclick={onClose}>✕</Btn>
-		</div>
+			{#each SECTIONS as s (s.id)}
+				<button
+					onclick={() => (section = s.id)}
+					aria-current={section === s.id ? 'page' : undefined}
+					style="display:flex;align-items:center;gap:7px;padding:6px 9px;border-radius:var(--radius-sm);cursor:pointer;text-align:left;font-size:12px;border:var(--line-width) solid {section ===
+					s.id
+						? 'var(--border-strong)'
+						: 'transparent'};background:{section === s.id
+						? 'var(--surface-active)'
+						: 'transparent'};color:{section === s.id ? 'var(--text-primary)' : 'var(--text-secondary)'}"
+				>
+					<Icon n={s.icon} s={13} color="currentColor" />
+					{s.label}
+				</button>
+			{/each}
+		</nav>
 
-		<div style="flex:1;display:flex;min-height:0">
-			<!-- section rail -->
-			<div
-				style="flex:none;width:150px;padding:10px 8px;border-right:var(--line-width) solid var(--border-default);display:flex;flex-direction:column;gap:2px"
-			>
-				{#each SECTIONS as s (s.id)}
-					<button
-						onclick={() => (section = s.id)}
-						style="display:flex;align-items:center;gap:7px;padding:6px 9px;border-radius:var(--radius-sm);cursor:pointer;text-align:left;font-size:12px;border:var(--line-width) solid {section ===
-						s.id
-							? 'var(--border-strong)'
-							: 'transparent'};background:{section === s.id
-							? 'var(--surface-active)'
-							: 'transparent'};color:{section === s.id ? 'var(--text-primary)' : 'var(--text-secondary)'}"
-					>
-						<Icon n={s.icon} s={13} color="currentColor" />
-						{s.label}
-					</button>
-				{/each}
-			</div>
+		<!-- The keyboard list has its own search and scroll, so it gets the panel whole. -->
+		<div
+			style="flex:1;min-width:0;{section === 'keyboard'
+				? 'display:flex;flex-direction:column;overflow:hidden'
+				: 'overflow-y:auto;padding:14px 16px'}"
+		>
+			{#if section === 'performance'}
+				<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
+					CPU limit
+				</div>
+				<p style="margin:6px 0 12px;font-size:12px;line-height:1.55;color:var(--text-secondary)">
+					Kerf runs one heavy job at a time — an analysis pass, a transcription, a proxy, an export — and
+					this is how much of the machine that job may take. Left alone, FFmpeg takes all of it.
+				</p>
 
-			<!-- The keyboard list has its own search and scroll, so it gets the panel whole. -->
-			<div
-				style="flex:1;min-width:0;{section === 'keyboard'
-					? 'display:flex;flex-direction:column;overflow:hidden'
-					: 'overflow-y:auto;padding:14px 16px'}"
-			>
-				{#if section === 'performance'}
-					<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
-						CPU limit
-					</div>
-					<p style="margin:6px 0 12px;font-size:12px;line-height:1.55;color:var(--text-secondary)">
-						Kerf runs one heavy job at a time — an analysis pass, a transcription, a proxy, an export — and
-						this is how much of the machine that job may take. Left alone, FFmpeg takes all of it.
-					</p>
-
-					<div style="display:flex;flex-wrap:wrap;gap:6px">
-						{#each CPU_PRESETS as p (p.id)}
-							<button title={p.hint} onclick={() => settings.setCpuPercent(p.percent)} style={chip(percent === p.percent)}>
-								{p.label}
-							</button>
-						{/each}
-					</div>
-
-					<div style="margin-top:14px;display:flex;align-items:center;gap:10px">
-						<input
-							type="range"
-							min={settings.cpuMinPercent}
-							max="100"
-							step="5"
-							value={percent}
-							aria-label="CPU limit"
-							oninput={(e) => (settings.cpuPercent = Number(e.currentTarget.value))}
-							onchange={(e) => settings.setCpuPercent(Number(e.currentTarget.value))}
-							style="flex:1"
-						/>
-						<span
-							style="flex:none;width:52px;text-align:right;font-family:var(--font-mono);font-size:13px;color:var(--text-primary)"
-							>{percent}%</span
-						>
-					</div>
-
-					<div
-						data-selectable
-						style="margin-top:12px;padding:9px 11px;border-radius:var(--radius-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-subtle);font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);line-height:1.6"
-					>
-						{threads} of {cores}
-						{cores === 1 ? 'core' : 'cores'} for Kerf · {spare === 0
-							? 'nothing held back'
-							: `${spare} left for everything else`}
-					</div>
-
-					<p style="margin:10px 0 0;font-size:12px;line-height:1.55;color:var(--text-secondary)">
-						{#if preset}
-							{preset.hint}
-						{:else}
-							Renders scale roughly with the share you allow; everything else on the machine gets the rest.
-						{/if}
-					</p>
-
-					{#if percent < 100}
-						<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
-							Below 100%, background work also runs at lower scheduling priority, so the window you are
-							looking at always wins a core when it wants one.
-						</p>
-					{/if}
-
-					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
-						A job already running keeps the cores it started with — FFmpeg cannot be told otherwise
-						mid-render. The next one picks this up.
-					</p>
-				{:else if section === 'analysis'}
-					<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
-						Analyze on import
-					</div>
-					<label style="margin-top:12px;display:flex;align-items:flex-start;gap:10px;cursor:pointer">
-						<input
-							type="checkbox"
-							data-testid="auto-analysis-master"
-							checked={settings.autoAnalysis.enabled}
-							onchange={(e) => settings.setAutoAnalysis({ enabled: e.currentTarget.checked })}
-							style="margin-top:2px;accent-color:var(--kerf-500);cursor:pointer"
-						/>
-						<span style="display:flex;flex-direction:column;gap:3px">
-							<span style="font-size:12px;color:var(--text-primary)">Analyze new media when it is imported</span>
-							<span style="font-size:12px;line-height:1.55;color:var(--text-secondary)">
-								Each pass reads the whole file, one clip at a time, behind any preview proxy that is being built.
-								Off, nothing runs by itself — right-click a clip in the bin and pick what to analyze.
-							</span>
-						</span>
-					</label>
-
-					<div
-						style="margin-top:20px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
-					>
-						What to analyze
-					</div>
-					<div style="margin-top:8px;display:flex;flex-direction:column;gap:2px">
-						{#each ANALYSIS_KINDS as k (k.kind)}
-							<label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:5px 0">
-								<input
-									type="checkbox"
-									data-testid="auto-analysis-{k.kind}"
-									checked={settings.autoAnalysis[k.kind]}
-									onchange={(e) => settings.setAutoKind(k.kind, e.currentTarget.checked)}
-									style="margin-top:2px;accent-color:var(--kerf-500);cursor:pointer"
-								/>
-								<span style="display:flex;flex-direction:column;gap:2px">
-									<span style="font-size:12px;color:var(--text-primary)">{k.label}</span>
-									<span style="font-size:12px;line-height:1.5;color:var(--text-secondary)">{KIND_HELP[k.kind]}</span>
-								</span>
-							</label>
-						{/each}
-					</div>
-					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
-						With the switch above off nothing runs on import, but these still decide what an agent's analyze_asset
-						runs when it names no steps. A clip can always be analyzed by hand, whatever is switched off here.
-					</p>
-				{:else if section === 'speech'}
-					<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
-						Speech-to-text
-					</div>
-					<p style="margin:10px 0 0;font-size:12px;line-height:1.55;color:var(--text-secondary)">
-						Transcription downloads a speech model on first use and then runs for a good fraction of each clip's
-						length. Whether it runs on import is decided under
+				<div style="display:flex;flex-wrap:wrap;gap:6px">
+					{#each CPU_PRESETS as p (p.id)}
 						<button
-							type="button"
-							onclick={() => (section = 'analysis')}
-							style="background:none;border:none;padding:0;cursor:pointer;color:var(--kerf-300);font:inherit;text-decoration:underline"
-							>Analysis</button
-						>.
-					</p>
-					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
-						{settings.autoAnalysis.transcript
-							? 'Transcription is on for new imports.'
-							: 'Transcription is off for new imports: the Transcript tab and captions have nothing to work from until you transcribe a clip by hand (right-click it in the bin, Analyze).'}
-					</p>
-
-					<div
-						style="margin-top:24px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
-					>
-						Voiceover
-					</div>
-					<div style="margin-top:10px;display:flex;align-items:center;gap:10px">
-						<span
-							style="flex:1;min-width:0;font-size:12px;color:{voStatus && !voStatus.available
-								? 'var(--red-400)'
-								: 'var(--text-primary)'}">{voLine}</span
+							use:tip={p.hint}
+							aria-pressed={percent === p.percent}
+							onclick={() => settings.setCpuPercent(p.percent)}
+							style={chip(percent === p.percent)}
 						>
-						{#if voPreparing}
-							<Btn variant="destructive" size="sm" disabled={voCancelling} onclick={stopVoiceover}>
-								{voCancelling ? 'Stopping…' : 'Cancel'}
-							</Btn>
-						{:else if voStatus?.available && !voStatus.ready}
-							<Btn variant="secondary" size="sm" icon="download" onclick={downloadVoiceover}>Download now</Btn>
-						{/if}
-					</div>
+							{p.label}
+						</button>
+					{/each}
+				</div>
+
+				<div style="margin-top:14px;display:flex;align-items:center;gap:10px">
+					<input
+						type="range"
+						min={settings.cpuMinPercent}
+						max="100"
+						step="5"
+						value={percent}
+						aria-label="CPU limit"
+						oninput={(e) => (settings.cpuPercent = Number(e.currentTarget.value))}
+						onchange={(e) => settings.setCpuPercent(Number(e.currentTarget.value))}
+						style="flex:1"
+					/>
+					<span
+						style="flex:none;width:52px;text-align:right;font-family:var(--font-mono);font-size:13px;color:var(--text-primary)"
+						>{percent}%</span
+					>
+				</div>
+
+				<div
+					data-selectable
+					style="margin-top:12px;padding:9px 11px;border-radius:var(--radius-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-subtle);font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);line-height:1.6"
+				>
+					{threads} of {cores}
+					{cores === 1 ? 'core' : 'cores'} for Kerf · {spare === 0
+						? 'nothing held back'
+						: `${spare} left for everything else`}
+				</div>
+
+				<p style="margin:10px 0 0;font-size:12px;line-height:1.55;color:var(--text-secondary)">
+					{#if preset}
+						{preset.hint}
+					{:else}
+						Renders scale roughly with the share you allow; everything else on the machine gets the rest.
+					{/if}
+				</p>
+
+				{#if percent < 100}
+					<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
+						Below 100%, background work also runs at lower scheduling priority, so the window you are
+						looking at always wins a core when it wants one.
+					</p>
+				{/if}
+
+				<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
+					A job already running keeps the cores it started with — FFmpeg cannot be told otherwise
+					mid-render. The next one picks this up.
+				</p>
+			{:else if section === 'analysis'}
+				<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
+					Analyze on import
+				</div>
+				<label style="margin-top:12px;display:flex;align-items:flex-start;gap:10px;cursor:pointer">
+					<input
+						type="checkbox"
+						data-testid="auto-analysis-master"
+						checked={settings.autoAnalysis.enabled}
+						onchange={(e) => settings.setAutoAnalysis({ enabled: e.currentTarget.checked })}
+						style="margin-top:2px;accent-color:var(--kerf-500);cursor:pointer"
+					/>
+					<span style="display:flex;flex-direction:column;gap:3px">
+						<span style="font-size:12px;color:var(--text-primary)">Analyze new media when it is imported</span>
+						<span style="font-size:12px;line-height:1.55;color:var(--text-secondary)">
+							Each pass reads the whole file, one clip at a time, behind any preview proxy that is being built.
+							Off, nothing runs by itself — right-click a clip in the bin and pick what to analyze.
+						</span>
+					</span>
+				</label>
+
+				<div
+					style="margin-top:20px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
+				>
+					What to analyze
+				</div>
+				<div style="margin-top:8px;display:flex;flex-direction:column;gap:2px">
+					{#each ANALYSIS_KINDS as k (k.kind)}
+						<label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;padding:5px 0">
+							<input
+								type="checkbox"
+								data-testid="auto-analysis-{k.kind}"
+								checked={settings.autoAnalysis[k.kind]}
+								onchange={(e) => settings.setAutoKind(k.kind, e.currentTarget.checked)}
+								style="margin-top:2px;accent-color:var(--kerf-500);cursor:pointer"
+							/>
+							<span style="display:flex;flex-direction:column;gap:2px">
+								<span style="font-size:12px;color:var(--text-primary)">{k.label}</span>
+								<span style="font-size:12px;line-height:1.5;color:var(--text-secondary)">{KIND_HELP[k.kind]}</span>
+							</span>
+						</label>
+					{/each}
+				</div>
+				<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
+					With the switch above off, nothing runs on import. These choices still decide what a connected agent
+					analyzes when it doesn't ask for specific steps. You can always analyze a clip by hand.
+				</p>
+			{:else if section === 'speech'}
+				<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
+					Speech-to-text
+				</div>
+				<p style="margin:10px 0 0;font-size:12px;line-height:1.55;color:var(--text-secondary)">
+					Transcription downloads a speech model on first use and then runs for a good fraction of each clip's
+					length. Whether it runs on import is decided under
+					<button
+						type="button"
+						onclick={() => (section = 'analysis')}
+						style="background:none;border:none;padding:0;cursor:pointer;color:var(--kerf-300);font:inherit;text-decoration:underline"
+						>Analysis</button
+					>.
+				</p>
+				<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
+					{settings.autoAnalysis.transcript
+						? 'Transcription is on for new imports.'
+						: 'Transcription is off for new imports: the Transcript tab and captions have nothing to work from until you transcribe a clip by hand (right-click it in the bin, Analyze).'}
+				</p>
+
+				<div
+					style="margin-top:24px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
+				>
+					Voiceover
+				</div>
+				<div style="margin-top:10px;display:flex;align-items:center;gap:10px">
+					<span
+						style="flex:1;min-width:0;font-size:12px;color:{voStatus && !voStatus.available
+							? 'var(--red-400)'
+							: 'var(--text-primary)'}">{voLine}</span
+					>
 					{#if voPreparing}
-						<div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
-							<div style="display:flex;align-items:baseline;gap:8px;font-size:12px">
-								<span style="color:var(--text-secondary)"
-									>{voProgress ? stageLabel(voProgress.stage) : 'Starting…'}</span
-								>
-								<span
-									style="flex:1;font-family:var(--font-mono);font-size:11px;color:var(--text-muted);text-align:right"
-									>{voProgress?.detail ?? ''}{voPct !== null ? ` · ${voPct}%` : ''}</span
-								>
-							</div>
-							<div style="height:6px;border-radius:3px;background:var(--surface-inset);overflow:hidden">
-								<div
-									style="height:100%;width:{voPct ?? 30}%;background:var(--kerf-500);transition:width var(--dur-fast) linear"
-								></div>
-							</div>
+						<Btn variant="destructive" size="sm" disabled={voCancelling} onclick={stopVoiceover}>
+							{voCancelling ? 'Stopping…' : 'Cancel'}
+						</Btn>
+					{:else if voStatus?.available && !voStatus.ready}
+						<Btn variant="secondary" size="sm" icon="download" onclick={downloadVoiceover}>Download now</Btn>
+					{/if}
+				</div>
+				{#if voPreparing}
+					<div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
+						<div style="display:flex;align-items:baseline;gap:8px;font-size:12px">
+							<span style="color:var(--text-secondary)"
+								>{voProgress ? stageLabel(voProgress.stage) : 'Starting…'}</span
+							>
+							<span
+								style="flex:1;font-family:var(--font-mono);font-size:11px;color:var(--text-muted);text-align:right"
+								>{voProgress?.detail ?? ''}{voPct !== null ? ` · ${voPct}%` : ''}</span
+							>
 						</div>
-					{/if}
-					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
-						Voiceover turns a script into speech on this machine, in English, with a voice model fetched once.
-						Without this it downloads the first time you generate one.
-					</p>
-				{:else if section === 'preview'}
-					<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
-						Preview proxies
+						<ProgressBar value={voProgress?.fraction ?? null} label="Downloading the voice model" />
 					</div>
-					<p style="margin:6px 0 10px;font-size:12px;line-height:1.55;color:var(--text-secondary)">
-						Kerf builds a light, all-intra copy of each video so scrubbing decodes one frame instead of a long GOP of
-						4K or 5K footage. Export always reads the original. A proxy is built before any analysis that is waiting.
-					</p>
-					<div role="radiogroup" aria-label="Proxy size" style="display:flex;flex-wrap:wrap;gap:6px">
-						{#each PROXY_SIZES as p (p.size)}
-							<button
-								role="radio"
-								aria-checked={settings.proxySize === p.size}
-								data-testid="proxy-size-{p.size}"
-								title={p.hint}
-								onclick={() => settings.setProxySize(p.size)}
-								style={chip(settings.proxySize === p.size)}>{p.label}</button
-							>
-						{/each}
-					</div>
-					<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
-						{PROXY_SIZES.find((p) => p.size === settings.proxySize)?.hint} Pixels across; 360 footage keeps its larger
-						ratio. A proxy made at another size stays on disk until you delete it from the bin.
-					</p>
-
-					<div
-						style="margin-top:20px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
-					>
-						Preview source
-					</div>
-					<div role="radiogroup" aria-label="Preview source" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px">
-						{#each PREVIEW_SOURCES as p (p.source)}
-							<button
-								role="radio"
-								aria-checked={settings.previewSource === p.source}
-								data-testid="preview-source-{p.source}"
-								title={p.hint}
-								disabled={settings.proxySize === 0 && p.source !== 'original'}
-								onclick={() => settings.setPreviewSource(p.source)}
-								style="{chip(settings.previewSource === p.source)};{settings.proxySize === 0 && p.source !== 'original'
-									? 'opacity:.45;cursor:not-allowed'
-									: ''}">{p.label}</button
-							>
-						{/each}
-					</div>
-					<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
-						{settings.proxySize === 0
-							? 'Proxies are off, so the preview decodes the original.'
-							: PREVIEW_SOURCES.find((p) => p.source === settings.previewSource)?.hint}
-					</p>
-
-					<div
-						style="margin-top:22px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
-					>
-						Safe areas
-					</div>
-					<label style="margin-top:12px;display:flex;align-items:flex-start;gap:10px;cursor:pointer">
-						<input
-							type="checkbox"
-							checked={settings.safeAreas}
-							onchange={(e) => settings.setSafeAreas(e.currentTarget.checked)}
-							style="margin-top:2px;accent-color:var(--kerf-500);cursor:pointer"
-						/>
-						<span style="display:flex;flex-direction:column;gap:3px">
-							<span style="font-size:12px;color:var(--text-primary)">Shade the safe areas over the preview</span>
-							<span style="font-size:12px;line-height:1.55;color:var(--text-secondary)">
-								Where a phone's own interface covers a vertical or square cut: the status strip at the top,
-								the caption rail along the bottom and the action buttons on the right, plus a title-safe box
-								inset from every edge. Keep faces and text out of the shaded zones.
-							</span>
-						</span>
-					</label>
-					<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
-						A guide only — nothing is cropped, and a 16:9 project draws none. The preview's right-click menu
-						toggles the same setting.
-					</p>
-					<div
-						style="margin-top:22px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
-					>
-						GPU preview (experimental)
-					</div>
-					<label style="margin-top:12px;display:flex;align-items:flex-start;gap:10px;cursor:pointer">
-						<input
-							type="checkbox"
-							checked={settings.gpuPreview}
-							onchange={(e) => settings.setGpuPreview(e.currentTarget.checked)}
-							style="margin-top:2px;accent-color:var(--kerf-500);cursor:pointer"
-						/>
-						<span style="display:flex;flex-direction:column;gap:3px">
-							<span style="font-size:12px;color:var(--text-primary)">Draw the preview on the GPU</span>
-							<span style="font-size:12px;line-height:1.55;color:var(--text-secondary)">
-								Frames the GPU compositor draws exactly are shown from a native surface instead of FFmpeg's
-								JPEG. Every other frame — a transition in progress, an effect it does not draw yet, anything
-								that fails — is FFmpeg's, as before. Playback still uses FFmpeg. The status bar says which
-								renderer made the frame you are looking at.
-							</span>
-						</span>
-					</label>
-					{#if gpuStatus}
-						<p
-							data-testid="gpu-preview-status"
-							style="margin:10px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted);font-family:var(--font-mono)"
+				{/if}
+				<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
+					Voiceover turns a script into speech on this machine, in English, with a voice model fetched once.{#if !voStatus?.ready}
+						Without this it downloads the first time you generate one.{/if}
+				</p>
+			{:else if section === 'preview'}
+				<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
+					Preview proxies
+				</div>
+				<p style="margin:6px 0 10px;font-size:12px;line-height:1.55;color:var(--text-secondary)">
+					Kerf makes a lightweight copy of each video so scrubbing stays smooth, even with 4K or 5K footage.
+					Exports always use your original files.
+				</p>
+				<div role="radiogroup" aria-label="Proxy size" use:roving={{ follow: false }} style="display:flex;flex-wrap:wrap;gap:6px">
+					{#each PROXY_SIZES as p (p.size)}
+						<button
+							role="radio"
+							aria-checked={settings.proxySize === p.size}
+							tabindex={PROXY_SIZES.indexOf(p) === proxyStop ? 0 : -1}
+							data-testid="proxy-size-{p.size}"
+							use:tip={p.hint}
+							onclick={() => settings.setProxySize(p.size)}
+							style={chip(settings.proxySize === p.size)}>{p.label}</button
 						>
-							{#if !gpuStatus.supported}
-								Not available here: {gpuStatus.reason ?? 'no native surface on this platform'}
-							{:else if gpuStatus.ready}
-								{gpuStatus.technique === 'child' ? 'Child window' : 'Window surface'} · {gpuStatus.adapter}{gpuStatus.software
-									? ' (software)'
-									: ''}
-							{:else if settings.gpuPreview}
-								{gpuStatus.reason ?? 'Starts with the next frame.'}
-							{:else if gpuStatus.reason}
-								{gpuStatus.reason}
-							{:else}
-								Available: {gpuStatus.technique === 'child' ? 'a child window over the preview' : 'the window surface under the preview'}.
-							{/if}
-						</p>
-					{/if}
-					{#if gpuStatus?.supported && gpuStatus.technique === 'child'}
-						<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
-							On this platform the surface is a window over the preview, so a frame with a title box, the trim
-							monitor or safe-area guides on it is FFmpeg's.
-						</p>
-					{/if}
-				{:else if section === 'appearance'}
-					<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
-						Theme
-					</div>
-					<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">
-						{#each PRESET_IDS as id (id)}
-							<button onclick={() => settings.applyPreset(id)} style={chip(themePreset === id)}>
-								{PRESETS[id].name}
-							</button>
-						{/each}
-						{#if themePreset === 'custom'}
-							<span style={chip(true)}>Custom</span>
+					{/each}
+				</div>
+				<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
+					Width of the copy in pixels. 1280 is the default: sharp enough to judge framing, light enough to scrub. 360
+					footage keeps its wider ratio. Copies made at another size stay on disk until you delete them from the bin.
+				</p>
+
+				<div
+					style="margin-top:20px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
+				>
+					Preview source
+				</div>
+				<div role="radiogroup" aria-label="Preview source" use:roving style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px">
+					{#each PREVIEW_SOURCES as p (p.source)}
+						<button
+							role="radio"
+							aria-checked={settings.previewSource === p.source}
+							tabindex={PREVIEW_SOURCES.indexOf(p) === sourceStop ? 0 : -1}
+							data-testid="preview-source-{p.source}"
+							use:tip={p.hint}
+							disabled={settings.proxySize === 0 && p.source !== 'original'}
+							onclick={() => settings.setPreviewSource(p.source)}
+							style="{chip(settings.previewSource === p.source)};{settings.proxySize === 0 && p.source !== 'original'
+								? 'opacity:.45;cursor:not-allowed'
+								: ''}">{p.label}</button
+						>
+					{/each}
+				</div>
+				<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
+					{settings.proxySize === 0
+						? 'Proxies are off, so the preview decodes the original.'
+						: PREVIEW_SOURCES.find((p) => p.source === settings.previewSource)?.hint}
+				</p>
+
+				<div
+					style="margin-top:22px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
+				>
+					Safe areas
+				</div>
+				<label style="margin-top:12px;display:flex;align-items:flex-start;gap:10px;cursor:pointer">
+					<input
+						type="checkbox"
+						checked={settings.safeAreas}
+						onchange={(e) => settings.setSafeAreas(e.currentTarget.checked)}
+						style="margin-top:2px;accent-color:var(--kerf-500);cursor:pointer"
+					/>
+					<span style="display:flex;flex-direction:column;gap:3px">
+						<span style="font-size:12px;color:var(--text-primary)">Shade the safe areas over the preview</span>
+						<span style="font-size:12px;line-height:1.55;color:var(--text-secondary)">
+							Where a phone's own interface covers a vertical or square cut: the status strip at the top,
+							the caption rail along the bottom and the action buttons on the right, plus a title-safe box
+							inset from every edge. Keep faces and text out of the shaded zones.
+						</span>
+					</span>
+				</label>
+				<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
+					A guide only — nothing is cropped, and a 16:9 project draws none. The preview's right-click menu
+					toggles the same setting.
+				</p>
+				<div
+					style="margin-top:22px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
+				>
+					GPU preview (experimental)
+				</div>
+				<label style="margin-top:12px;display:flex;align-items:flex-start;gap:10px;cursor:pointer">
+					<input
+						type="checkbox"
+						checked={settings.gpuPreview}
+						onchange={(e) => settings.setGpuPreview(e.currentTarget.checked)}
+						style="margin-top:2px;accent-color:var(--kerf-500);cursor:pointer"
+					/>
+					<span style="display:flex;flex-direction:column;gap:3px">
+						<span style="font-size:12px;color:var(--text-primary)">Draw the preview on the GPU</span>
+						<span style="font-size:12px;line-height:1.55;color:var(--text-secondary)">
+							Draws frames the GPU compositor can render exactly in a native surface instead of FFmpeg's JPEG,
+							including fades, dissolves, dips, slides and pushes. Anything it can't draw, such as an unsupported
+							effect or a dip to white it hasn't measured, is still drawn by FFmpeg. Playback still uses FFmpeg.
+							The status bar shows which renderer made the frame you're looking at.
+						</span>
+					</span>
+				</label>
+				{#if gpuStatus}
+					<p
+						data-testid="gpu-preview-status"
+						style="margin:10px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted);font-family:var(--font-mono)"
+					>
+						{#if !gpuStatus.supported}
+							Not available here: {gpuStatus.reason ?? 'no native surface on this platform'}
+						{:else if gpuStatus.ready}
+							{gpuStatus.technique === 'child' ? 'Child window' : 'Window surface'} · {gpuStatus.adapter}{gpuStatus.software
+								? ' (software)'
+								: ''}
+						{:else if settings.gpuPreview}
+							{gpuStatus.reason ?? 'Starts with the next frame.'}
+						{:else if gpuStatus.reason}
+							{gpuStatus.reason}
+						{:else}
+							Available: {gpuStatus.technique === 'child' ? 'a child window over the preview' : 'the window surface under the preview'}.
 						{/if}
-						<div style="flex:1"></div>
-						<Btn variant="ghost" size="sm" icon="folder-open" onclick={() => settings.importTheme()}>Import…</Btn>
-						<Btn variant="ghost" size="sm" icon="save" onclick={() => settings.exportTheme()}>Export…</Btn>
-					</div>
-
-					<div style="margin-top:12px;display:flex;gap:10px;align-items:center">
-						<input
-							type="text"
-							value={settings.theme.name}
-							aria-label="Theme name"
-							onchange={(e) => settings.setThemeName(e.currentTarget.value)}
-							style="flex:1;min-width:0;height:28px;padding:0 8px;background:var(--surface-inset);color:var(--text-primary);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-sm);font-size:12px"
-						/>
-						<button onclick={() => settings.setScheme('dark')} style={chip(settings.theme.scheme === 'dark')}>Dark</button>
-						<button onclick={() => settings.setScheme('light')} style={chip(settings.theme.scheme === 'light')}
-							>Light</button
-						>
-					</div>
-					<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
-						Every color and line the editor draws with. Changing one makes the theme custom; a theme exports
-						as a JSON file you can share or bring back with Import.
 					</p>
+				{/if}
+				{#if gpuStatus?.supported && gpuStatus.technique === 'child'}
+					<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
+						On this platform the surface is a window over the preview, so a frame with a title box, the trim
+						monitor or safe-area guides on it is FFmpeg's.
+					</p>
+				{/if}
+			{:else if section === 'appearance'}
+				<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
+					Theme
+				</div>
+				<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+					{#each PRESET_IDS as id (id)}
+						<button onclick={() => settings.applyPreset(id)} aria-pressed={themePreset === id} style={chip(themePreset === id)}>
+							{PRESETS[id].name}
+						</button>
+					{/each}
+					{#if themePreset === 'custom'}
+						<span style={chip(true)}>Custom</span>
+					{/if}
+					<div style="flex:1"></div>
+					<Btn variant="ghost" size="sm" icon="folder-open" onclick={() => settings.importTheme()}>Import…</Btn>
+					<Btn variant="ghost" size="sm" icon="save" onclick={() => settings.exportTheme()}>Export…</Btn>
+				</div>
 
+				<div style="margin-top:12px;display:flex;gap:10px;align-items:center">
+					<input
+						type="text"
+						value={settings.theme.name}
+						aria-label="Theme name"
+						onchange={(e) => settings.setThemeName(e.currentTarget.value)}
+						style="flex:1;min-width:0;height:28px;padding:0 8px;background:var(--surface-inset);color:var(--text-primary);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-sm);font-size:12px"
+					/>
+					<button
+						onclick={() => settings.setScheme('dark')}
+						aria-pressed={settings.theme.scheme === 'dark'}
+						style={chip(settings.theme.scheme === 'dark')}>Dark</button
+					>
+					<button
+						onclick={() => settings.setScheme('light')}
+						aria-pressed={settings.theme.scheme === 'light'}
+						style={chip(settings.theme.scheme === 'light')}>Light</button
+					>
+				</div>
+				<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
+					Every color and line the editor draws with. Changing one makes the theme custom; a theme exports
+					as a JSON file you can share or bring back with Import.
+				</p>
+
+				<div
+					style="margin-top:16px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
+				>
+					Lines, shadows and sliders
+				</div>
+				<div style="margin-top:6px;display:flex;flex-direction:column;gap:2px">
+					{#each SHAPE_TOKENS as t (t.name)}
+						<label use:tip={t.hint} style="display:flex;align-items:center;gap:10px;height:28px;font-size:12px;color:var(--text-secondary)">
+							<span style="width:130px;flex:none">{t.label}</span>
+							<input
+								type="range"
+								min={t.min}
+								max={t.max}
+								step={t.step}
+								value={settings.theme.shape[t.name]}
+								aria-label={t.label}
+								oninput={(e) => settings.setShape(t.name, Number(e.currentTarget.value))}
+								style="flex:1;min-width:0"
+							/>
+							<span style="flex:none;width:44px;text-align:right;font-family:var(--font-mono);font-size:11px;color:var(--text-primary)"
+								>{settings.theme.shape[t.name]}{t.unit}</span
+							>
+						</label>
+					{/each}
+					<div style="display:flex;align-items:center;gap:10px;height:32px;font-size:12px;color:var(--text-secondary)">
+						<span style="width:130px;flex:none">Thumb style</span>
+						{#each THUMB_STYLES as ts (ts.id)}
+							<button
+								onclick={() => settings.setThumbStyle(ts.id)}
+								aria-pressed={settings.theme.shape['slider-thumb-style'] === ts.id}
+								style={chip(settings.theme.shape['slider-thumb-style'] === ts.id)}>{ts.label}</button
+							>
+						{/each}
+					</div>
+				</div>
+
+				{#each COLOR_GROUPS as g (g.label)}
 					<div
 						style="margin-top:16px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
 					>
-						Lines, shadows and sliders
+						{g.label}
 					</div>
-					<div style="margin-top:6px;display:flex;flex-direction:column;gap:2px">
-						{#each SHAPE_TOKENS as t (t.name)}
-							<label title={t.hint} style="display:flex;align-items:center;gap:10px;height:28px;font-size:12px;color:var(--text-secondary)">
-								<span style="width:130px;flex:none">{t.label}</span>
+					<div style="margin-top:6px;display:grid;grid-template-columns:1fr 1fr;gap:4px 16px">
+						{#each g.tokens as t (t.name)}
+							<label
+								style="display:flex;align-items:center;gap:8px;height:28px;font-size:12px;color:var(--text-secondary);cursor:pointer"
+							>
 								<input
-									type="range"
-									min={t.min}
-									max={t.max}
-									step={t.step}
-									value={settings.theme.shape[t.name]}
-									aria-label={t.label}
-									oninput={(e) => settings.setShape(t.name, Number(e.currentTarget.value))}
-									style="flex:1;min-width:0"
+									type="color"
+									value={settings.theme.colors[t.name]}
+									oninput={(e) => settings.setColor(t.name, e.currentTarget.value)}
+									style="width:26px;height:20px;padding:0;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-xs);background:none;cursor:pointer"
 								/>
-								<span style="flex:none;width:44px;text-align:right;font-family:var(--font-mono);font-size:11px;color:var(--text-primary)"
-									>{settings.theme.shape[t.name]}{t.unit}</span
+								<span style="flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{t.label}</span>
+								<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)"
+									>{settings.theme.colors[t.name]}</span
 								>
 							</label>
 						{/each}
-						<div style="display:flex;align-items:center;gap:10px;height:32px;font-size:12px;color:var(--text-secondary)">
-							<span style="width:130px;flex:none">Thumb style</span>
-							{#each THUMB_STYLES as ts (ts.id)}
-								<button onclick={() => settings.setThumbStyle(ts.id)} style={chip(settings.theme.shape['slider-thumb-style'] === ts.id)}
-									>{ts.label}</button
-								>
-							{/each}
-						</div>
 					</div>
-
-					{#each COLOR_GROUPS as g (g.label)}
-						<div
-							style="margin-top:16px;font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em"
-						>
-							{g.label}
-						</div>
-						<div style="margin-top:6px;display:grid;grid-template-columns:1fr 1fr;gap:4px 16px">
-							{#each g.tokens as t (t.name)}
-								<label
-									style="display:flex;align-items:center;gap:8px;height:28px;font-size:12px;color:var(--text-secondary);cursor:pointer"
-								>
-									<input
-										type="color"
-										value={settings.theme.colors[t.name]}
-										oninput={(e) => settings.setColor(t.name, e.currentTarget.value)}
-										style="width:26px;height:20px;padding:0;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-xs);background:none;cursor:pointer"
-									/>
-									<span style="flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{t.label}</span>
-									<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)"
-										>{settings.theme.colors[t.name]}</span
-									>
-								</label>
-							{/each}
-						</div>
-					{/each}
-				{:else if section === 'keyboard'}
-					<KeyboardSettings />
-				{/if}
-			</div>
+				{/each}
+			{:else if section === 'keyboard'}
+				<KeyboardSettings />
+			{/if}
 		</div>
 	</div>
-</div>
+</Modal>

@@ -29,7 +29,8 @@
 //!   (the preferred one: the page keeps drawing titles, guides and timecode over the picture) and
 //!   [`Technique::Child`] puts a borderless child X11 window over the panel (Linux; WebKitGTK
 //!   paints into the toplevel's window, so a swapchain there loses to GTK's repaints). The
-//!   evidence for each is in `CLAUDE.md` and the progress log.
+//!   evidence for each is in `CLAUDE.md` and the progress log. macOS has neither until it has been
+//!   run on a Mac (`.claude/docs/app.md`, *macOS presenter*).
 //!
 //! This is a GUI-only surface: it has no MCP tool, because the agent already has
 //! `preview_timeline` (a JPEG of the cut) and nothing here is an edit.
@@ -40,7 +41,7 @@ mod x11;
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
@@ -96,9 +97,12 @@ pub struct Resolution {
 ///   runtime (`WebviewWindow::set_background_color`, alpha 0); tao does not clip children, so
 ///   the swapchain on the parent HWND shows through. Unconfirmed: needs a Windows machine.
 /// * **Linux** — a child X11 window. Confirmed under WSLg/Xwayland with Mesa lavapipe.
-/// * **macOS** — none: a surface under the webview needs a transparent window, which Tauri
-///   gates behind its `macos-private-api` feature (a private WKWebView key). That changes the
-///   build of every macOS bundle, so it is left for a session that can run one.
+/// * **macOS** — none until it has been run on a Mac. Tauri's `macos-private-api` is *not* the
+///   obstacle (it gates only the `transparent` option; the webview is already see-through wherever
+///   the page paints nothing). What is unproven is where wgpu's Metal layer ends up relative to
+///   the WKWebView and how it is removed again. `KERF_GPU_SURFACE=window` forces the attempt for
+///   whoever can run it; it may cover the window (`.claude/docs/app.md`, *macOS presenter*). The
+///   note is shown to the user as it stands, so it does not name the variable.
 pub fn resolve_technique(os: &str, choice: Option<&str>) -> Resolution {
     let some = |technique| Resolution {
         technique: Some(technique),
@@ -122,10 +126,7 @@ pub fn resolve_technique(os: &str, choice: Option<&str>) -> Resolution {
     match os {
         "windows" => some(Technique::Window),
         "linux" => some(Technique::Child),
-        "macos" => none(
-            "a native surface under the webview needs a transparent window, which on macOS is Tauri's \
-             macos-private-api feature; it is not enabled in this build (KERF_GPU_SURFACE=window forces it)",
-        ),
+        "macos" => none("the macOS preview surface has not been verified on a Mac yet, so it is not used"),
         other => none(&format!("no native preview surface on {other}")),
     }
 }
@@ -1247,6 +1248,82 @@ impl GpuPreview {
     }
 }
 
+/// Whether `os` makes a [`Technique::Window`] surface on the main thread only. AppKit views belong
+/// to it, and wgpu's Metal backend touches the content view (it makes it layer-backed and adds a
+/// `CAMetalLayer` to it) the moment the surface is created, panicking anywhere else.
+fn surface_on_main_thread(os: &str) -> bool {
+    os == "macos"
+}
+
+/// How long the main thread gets to make a surface before the build gives up on it.
+const MAIN_THREAD_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Where a task posted by [`on_main_thread`] stands: the task claims `RUNNING`, or the waiter
+/// claims `ABANDONED`, and whoever is second backs off.
+const PENDING: u8 = 0;
+const RUNNING: u8 = 1;
+const ABANDONED: u8 = 2;
+
+/// Run `work` on the main thread and wait for its result at most `deadline`. `post` hands the task
+/// to the main thread (the app's: `AppHandle::run_on_main_thread`, which runs it inline when the
+/// caller already is the main thread). A panic in `work` comes back as an error and never unwinds
+/// into the event loop that ran it.
+///
+/// A task that reaches the main thread after the deadline does **not** run `work`: what it makes
+/// (a layer on the content view) would outlive everything that could remove it, and every retry
+/// would add another. The same goes for a task `post` queued and then reported as failed. A task
+/// that has already started when the deadline passes is waited for for half a deadline more, since
+/// it cannot be called back and its result is the only handle on what it made; the two waits add up
+/// to one and a half deadlines, which is why the app's 5 s fits inside [`BUILD_DEADLINE`].
+fn on_main_thread<T: Send + 'static>(
+    post: impl FnOnce(Box<dyn FnOnce() + Send>) -> Result<(), String>,
+    deadline: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    on_main_thread_with_grace(post, deadline, deadline / 2, work)
+}
+
+/// [`on_main_thread`] with the extra wait for a task that has started given, so a test can make
+/// it generous without making the deadline long.
+fn on_main_thread_with_grace<T: Send + 'static>(
+    post: impl FnOnce(Box<dyn FnOnce() + Send>) -> Result<(), String>,
+    deadline: Duration,
+    grace: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(AtomicU8::new(PENDING));
+    let claim = Arc::clone(&state);
+    let posted = post(Box::new(move || {
+        if claim
+            .compare_exchange(PENDING, RUNNING, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let _ = tx.send(catch_unwind(AssertUnwindSafe(work)));
+        }
+    }));
+    if let Err(refused) = posted {
+        state.store(ABANDONED, Ordering::SeqCst);
+        return Err(refused);
+    }
+    let mut waited = deadline;
+    let mut answer = rx.recv_timeout(deadline);
+    if matches!(answer, Err(RecvTimeoutError::Timeout))
+        && state
+            .compare_exchange(PENDING, ABANDONED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+    {
+        waited += grace;
+        answer = rx.recv_timeout(grace);
+    }
+    match answer {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(payload)) => Err(format!("panicked on the main thread: {}", panic_text(payload.as_ref()))),
+        Err(RecvTimeoutError::Timeout) => Err(format!("the main thread did not answer within {} s", waited.as_secs_f64())),
+        Err(RecvTimeoutError::Disconnected) => Err("the main thread dropped the task".into()),
+    }
+}
+
 /// Build the app's backend: the device on an adapter that can present to the host, the
 /// compositor, a frame source and the presenter.
 fn build_backend(app: &tauri::AppHandle, technique: Technique) -> Result<Backend, String> {
@@ -1262,7 +1339,23 @@ fn build_backend(app: &tauri::AppHandle, technique: Technique) -> Result<Backend
     };
     let (gpu, presenter, mut host) = match technique {
         Technique::Window => {
-            let (gpu, surface) = Gpu::new_for_surface(options, window.clone()).map_err(e("the window surface"))?;
+            let (gpu, surface) = if surface_on_main_thread(std::env::consts::OS) {
+                // The device is opened here, off the main thread; only the surface is made there.
+                let gpu = Gpu::new(options).map_err(e("the window surface"))?;
+                let surface = on_main_thread(
+                    |task| app.run_on_main_thread(task).map_err(|err| err.to_string()),
+                    MAIN_THREAD_DEADLINE,
+                    {
+                        let (gpu, window) = (Arc::clone(&gpu), window.clone());
+                        move || gpu.create_surface(window)
+                    },
+                )
+                .map_err(|why| format!("the window surface: {why}"))?
+                .map_err(e("the window surface"))?;
+                (gpu, surface)
+            } else {
+                Gpu::new_for_surface(options, window.clone()).map_err(e("the window surface"))?
+            };
             let size = window.inner_size().map_err(|err| err.to_string())?;
             let presenter =
                 Presenter::new(Arc::clone(&gpu), surface, (size.width, size.height)).map_err(e("the window surface"))?;
@@ -1324,7 +1417,13 @@ mod tests {
         assert_eq!(t("linux", None).technique, Some(Technique::Child));
         let mac = t("macos", None);
         assert_eq!(mac.technique, None);
-        assert!(mac.note.unwrap().contains("macos-private-api"));
+        let note = mac.note.unwrap();
+        assert!(note.contains("not been verified on a Mac"), "{note}");
+        assert!(
+            !note.contains("KERF_GPU_SURFACE"),
+            "the user is not invited to force it: {note}"
+        );
+        assert!(!note.contains("private-api"), "the private API is not the obstacle: {note}");
         assert!(t("freebsd", None).technique.is_none());
         // The environment overrides, in both directions.
         assert_eq!(t("linux", Some("window")).technique, Some(Technique::Window));
@@ -1332,12 +1431,166 @@ mod tests {
         assert_eq!(t("macos", Some("window")).technique, Some(Technique::Window));
         assert_eq!(t("linux", Some("child")).technique, Some(Technique::Child));
         assert!(t("windows", Some("child")).technique.is_none(), "no child window outside X11");
+        assert!(t("macos", Some("child")).technique.is_none(), "no child window outside X11");
+        assert_eq!(t("macos", Some("off")).technique, None);
         // A value nobody defined is not obeyed.
         assert_eq!(t("windows", Some("nonsense")).technique, Some(Technique::Window));
         assert_eq!(t("linux", Some("")).technique, Some(Technique::Child));
         // Only the technique under a transparent webview lets the page draw over the picture.
         assert!(Technique::Window.overlays());
         assert!(!Technique::Child.overlays());
+    }
+
+    #[test]
+    fn only_macos_makes_its_window_surface_on_the_main_thread() {
+        assert!(surface_on_main_thread("macos"));
+        for os in ["windows", "linux", "freebsd", "ios", ""] {
+            assert!(!surface_on_main_thread(os), "{os}");
+        }
+    }
+
+    /// A stand-in for the event loop: runs each posted task on a thread of its own.
+    fn loop_thread(task: Box<dyn FnOnce() + Send>) -> Result<(), String> {
+        std::thread::Builder::new()
+            .name("stand-in-main".into())
+            .spawn(task)
+            .map(drop)
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn work_posted_to_the_main_thread_runs_there_and_its_answer_comes_back() {
+        let caller = std::thread::current().id();
+        let (ran_on, name) = on_main_thread(loop_thread, Duration::from_secs(5), move || {
+            (std::thread::current().id(), std::thread::current().name().map(str::to_string))
+        })
+        .unwrap();
+        assert_ne!(ran_on, caller);
+        assert_eq!(name.as_deref(), Some("stand-in-main"));
+        // Tauri runs a task inline when the caller already is the main thread.
+        let inline = on_main_thread(
+            |task| {
+                task();
+                Ok(())
+            },
+            Duration::from_secs(5),
+            || 7,
+        );
+        assert_eq!(inline, Ok(7));
+    }
+
+    #[test]
+    fn a_main_thread_that_cannot_run_the_task_is_an_error_not_a_hang() {
+        let t = Duration::from_millis(100);
+        // The loop refuses the task.
+        assert_eq!(
+            on_main_thread(|_| Err("the event loop is closed".to_string()), t, || 1),
+            Err("the event loop is closed".to_string())
+        );
+        // The loop drops it unrun (the app is closing): the answer can never come.
+        let dropped = on_main_thread(
+            |task| {
+                drop(task);
+                Ok(())
+            },
+            t,
+            || 1,
+        )
+        .unwrap_err();
+        assert!(dropped.contains("dropped"), "{dropped}");
+    }
+
+    #[test]
+    fn a_task_that_reaches_the_main_thread_late_does_not_run_its_work() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let started = Instant::now();
+        let late = on_main_thread(
+            move |task| {
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(1500));
+                    task();
+                    let _ = finished_tx.send(());
+                });
+                Ok(())
+            },
+            Duration::from_millis(300),
+            move || flag.store(true, Ordering::SeqCst),
+        )
+        .unwrap_err();
+        assert!(late.contains("did not answer within 0.3 s"), "{late}");
+        assert!(started.elapsed() < Duration::from_millis(1000), "waited past the deadline");
+        finished_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the late task never ran at all");
+        assert!(!ran.load(Ordering::SeqCst), "a layer made now would never be removed");
+    }
+
+    #[test]
+    fn a_task_that_was_queued_and_then_reported_as_failed_does_not_run_its_work() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        let queued = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&queued);
+        let err = on_main_thread(
+            move |task| {
+                *lock(&slot) = Some(task);
+                Err("the loop refused it after queueing".to_string())
+            },
+            Duration::from_secs(1),
+            move || flag.store(true, Ordering::SeqCst),
+        )
+        .unwrap_err();
+        assert_eq!(err, "the loop refused it after queueing");
+        let task = lock(&queued).take().expect("the task was queued");
+        task();
+        assert!(!ran.load(Ordering::SeqCst), "nobody waits for what this would make");
+    }
+
+    #[test]
+    fn a_task_already_running_at_the_deadline_is_waited_for_once_more() {
+        let got = on_main_thread_with_grace(loop_thread, Duration::from_secs(1), Duration::from_secs(20), || {
+            std::thread::sleep(Duration::from_millis(1500));
+            "made"
+        });
+        assert_eq!(got, Ok("made"));
+    }
+
+    #[test]
+    fn the_wait_for_a_running_task_is_bounded_and_the_message_gives_the_total() {
+        let started = Instant::now();
+        let stuck = on_main_thread_with_grace(loop_thread, Duration::from_millis(300), Duration::from_millis(200), || {
+            std::thread::sleep(Duration::from_secs(4));
+        })
+        .unwrap_err();
+        assert!(stuck.contains("did not answer within 0.5 s"), "{stuck}");
+        assert!(started.elapsed() < Duration::from_secs(3), "waited for the whole task");
+        // The default grace is half a deadline: 1.5 deadlines in all.
+        let stuck = on_main_thread(loop_thread, Duration::from_millis(400), || {
+            std::thread::sleep(Duration::from_secs(4));
+        })
+        .unwrap_err();
+        assert!(stuck.contains("did not answer within 0.6 s"), "{stuck}");
+    }
+
+    #[test]
+    fn a_panic_on_the_main_thread_does_not_unwind_into_its_loop() {
+        // The task itself must return normally: a panic that escaped it would take the event loop down.
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        let got = on_main_thread::<()>(
+            move |task| {
+                task();
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            Duration::from_secs(5),
+            || panic!("a backend that asserts on a handle it cannot use"),
+        )
+        .unwrap_err();
+        assert!(ran.load(Ordering::SeqCst), "the posted task returned");
+        assert!(got.contains("a backend that asserts on a handle it cannot use"), "{got}");
     }
 
     #[test]
@@ -1675,12 +1928,12 @@ mod tests {
         let macos = with(resolve_technique("macos", None), Box::new(|_| Err("unreachable".into())));
         macos.set_enabled(true);
         assert!(!macos.status().supported);
-        assert!(macos.status().reason.unwrap().contains("macos-private-api"));
+        assert!(macos.status().reason.unwrap().contains("not been verified on a Mac"));
         visible(&macos);
         let Attempt::Fallback(r) = macos.attempt(&inputs(), 0.5, false, Instant::now()) else {
             panic!()
         };
-        assert!(r[0].contains("macos-private-api"), "{r:?}");
+        assert!(r[0].contains("not been verified on a Mac"), "{r:?}");
     }
 
     /// The app's first step on a machine with no Vulkan driver at all, run in a child process with

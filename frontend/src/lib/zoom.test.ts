@@ -1,14 +1,18 @@
 import { describe, expect, test } from 'bun:test';
 import {
+	AUTO_FIT_MAX,
 	LANE_MIN_PX,
 	LANE_PX_CAP,
 	LANE_TAIL_PX,
+	MIN_FOLLOW_VIEW_PX,
 	ZOOM_DEFAULT,
 	ZOOM_MAX,
 	ZOOM_MIN,
 	ZOOM_STEP,
+	autoFitZoom,
 	clampZoom,
 	fitZoom,
+	followZoom,
 	laneWidth,
 	scrollFor,
 	sliderToZoom,
@@ -214,6 +218,67 @@ describe('fitZoom', () => {
 
 	test('a window narrower than the tail still gets a usable zoom', () => {
 		expect(fitZoom(60, 30)).toBe(ZOOM_MIN);
+	});
+});
+
+describe('autoFitZoom', () => {
+	test('is the fit for a cut longer than the window shows at a readable scale', () => {
+		expect(autoFitZoom(20.5, 1680)).toBe(fitZoom(20.5, 1680)!);
+		expect(autoFitZoom(120, 1248)).toBe(fitZoom(120, 1248)!);
+	});
+
+	test('never blows a short cut up to fill the window', () => {
+		expect(fitZoom(2, 1680)!).toBeGreaterThan(AUTO_FIT_MAX);
+		expect(autoFitZoom(2, 1680)).toBe(AUTO_FIT_MAX);
+	});
+
+	test('has nothing to fit for an empty cut or no width, like fitZoom', () => {
+		expect(autoFitZoom(0, 1000)).toBeNull();
+		expect(autoFitZoom(60, 0)).toBeNull();
+	});
+});
+
+describe('followZoom', () => {
+	const at = (viewW: number, duration: number, generation = 1) => ({ viewW, duration, generation });
+
+	test('fits the first time it sees a cut, and not again for the same one', () => {
+		const first = followZoom(null, at(1680, 20.5), ZOOM_DEFAULT)!;
+		expect(first).toBe(autoFitZoom(20.5, 1680)!);
+		expect(followZoom(at(1680, 20.5), at(1680, 20.5), first)).toBeNull();
+	});
+
+	test('fits when the first clip arrives in an empty project', () => {
+		expect(followZoom(at(1680, 0), at(1680, 12), ZOOM_DEFAULT)).toBe(autoFitZoom(12, 1680)!);
+	});
+
+	test('does nothing for an empty cut or before the window has a width', () => {
+		expect(followZoom(null, at(1680, 0), ZOOM_DEFAULT)).toBeNull();
+		expect(followZoom(null, at(0, 20), ZOOM_DEFAULT)).toBeNull();
+	});
+
+	test('does not fit a cut to a panel squeezed (or hidden in a tab) to nothing', () => {
+		expect(followZoom(null, at(1, 20), ZOOM_DEFAULT)).toBeNull();
+		expect(followZoom(null, at(MIN_FOLLOW_VIEW_PX - 1, 20), ZOOM_DEFAULT)).toBeNull();
+		expect(followZoom(null, at(MIN_FOLLOW_VIEW_PX, 20), ZOOM_DEFAULT)).not.toBeNull();
+	});
+
+	test('fits again when the window changes width, or another project is opened', () => {
+		const z = autoFitZoom(20, 1680)!;
+		expect(followZoom(at(1680, 20), at(1000, 20), z)).toBe(autoFitZoom(20, 1000)!);
+		expect(followZoom(at(1680, 20), at(1680, 20, 2), z)).toBeNull(); // the same cut again: already there
+		expect(followZoom(at(1680, 20), at(1680, 90, 2), z)).toBe(autoFitZoom(90, 1680)!);
+	});
+
+	test('follows a cut that grows past the window, not one that shrinks', () => {
+		const z = autoFitZoom(20, 1680)!;
+		expect(followZoom(at(1680, 20), at(1680, 60), z)).toBe(autoFitZoom(60, 1680)!);
+		expect(followZoom(at(1680, 60), at(1680, 40), autoFitZoom(60, 1680)!)).toBeNull();
+	});
+
+	test('a cut that grows but still fits leaves the zoom alone, so a trim never rescales the lane', () => {
+		const z = autoFitZoom(8, 1680)!;
+		expect(z).toBe(AUTO_FIT_MAX);
+		expect(followZoom(at(1680, 8), at(1680, 12), z)).toBeNull();
 	});
 });
 

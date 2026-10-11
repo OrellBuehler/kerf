@@ -169,7 +169,7 @@ describe('audioExtraction — what the bin’s audio action will do', () => {
 		const t = tracks([{ asset_id: 'a', source_audio: false }], [{ asset_id: 'a' }]);
 		const x = audioExtraction(video, t)!;
 		expect(x.mode).toBe('append');
-		expect(x.label).toBe('Add audio to A1 again');
+		expect(x.label).toBe('Add audio to A1 (a second copy)');
 		expect(x.detail).toContain('another copy');
 	});
 

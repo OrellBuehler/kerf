@@ -10,7 +10,9 @@
 // pure and the menus can be held to the registry in a test.
 
 import { actionDef, type ActionId } from './keymap';
+import { focusableRows, stepRow, typeaheadRow, type NavRow } from './menu-nav';
 import { DELIVERY_PRESETS, fitLabel } from './delivery-formats';
+import { exportButtonState } from './export-button';
 import { PANEL_IDS, PANELS, type PanelId } from './layout';
 import { detachBlocked, type PanelLocation } from './popouts';
 import { HEIGHT_PRESETS, PRESET_LABEL, PRESET_PX, type HeightPreset } from './track-heights';
@@ -31,7 +33,6 @@ export type MenuCommand =
 export type MenuRole = 'item' | 'check' | 'radio';
 
 interface Common {
-	icon?: string;
 	disabled?: boolean;
 	/** Why it is disabled — an entry that cannot be used and does not say why is
 	 *  a dead end. */
@@ -58,6 +59,8 @@ export interface MenuState {
 	canRedo: boolean;
 	/** The cut has a clip at all / a clip is selected. */
 	hasClips: boolean;
+	/** A render is under way: File › Export… then reopens its dialog (the title bar's button does too). */
+	exporting: boolean;
 	hasSelection: boolean;
 	rippleMode: boolean;
 	snap: boolean;
@@ -66,8 +69,6 @@ export interface MenuState {
 	/** The project is cut for a delivery frame (the safe-area guides need one). */
 	hasFrame: boolean;
 	tool: string;
-	/** The cut is playing (the transport's play / pause button shows the other). */
-	playing: boolean;
 	/** The id of the delivery preset the project is cut for. */
 	delivery: string;
 	/** The height every track shares, or null when they differ. */
@@ -95,23 +96,25 @@ export function buildMenus(s: MenuState): MenuDef[] {
 	const sel = { disabled: !s.hasSelection, reason: s.hasSelection ? undefined : NEEDS_SELECTION };
 	const clips = { disabled: !s.hasClips, reason: s.hasClips ? undefined : NEEDS_CLIPS };
 	const desk = { disabled: !s.desktop, reason: s.desktop ? undefined : DESKTOP_ONLY };
+	// The one rule the title bar's Export button and the shortcut use too (`export-button.ts`).
+	const exportOff = exportButtonState({ clips: s.hasClips ? 1 : 0, running: s.exporting });
 
 	const file: MenuDef = {
 		id: 'file',
 		label: 'File',
 		items: [
-			act('file.new', { icon: 'file-plus' }),
-			act('file.open', { icon: 'folder-open' }),
+			act('file.new'),
+			act('file.open'),
 			sep,
-			act('file.save', { icon: 'save', label: s.saved ? 'Save project as…' : 'Save project…' }),
+			act('file.save', { label: s.saved ? 'Save project as…' : 'Save project…' }),
 			sep,
-			act('file.import', { icon: 'film' }),
-			act('file.importCaptions', { icon: 'captions' }),
+			act('file.import'),
+			act('file.importCaptions'),
 			sep,
-			act('file.export', { icon: 'upload' }),
-			act('file.saveCover', { icon: 'image', ...clips }),
+			act('file.export', { disabled: exportOff.disabled, reason: exportOff.reason }),
+			act('file.saveCover', { ...clips }),
 			sep,
-			act('app.settings', { icon: 'settings' }),
+			act('app.settings'),
 			sep,
 			act('app.quit', { ...desk })
 		]
@@ -128,15 +131,15 @@ export function buildMenus(s: MenuState): MenuDef[] {
 		id: 'edit',
 		label: 'Edit',
 		items: [
-			act('edit.undo', { icon: 'undo', disabled: !s.canUndo }),
-			act('edit.redo', { icon: 'redo', disabled: !s.canRedo }),
+			act('edit.undo', { disabled: !s.canUndo }),
+			act('edit.redo', { disabled: !s.canRedo }),
 			sep,
 			act('edit.cut', { ...sel }),
-			act('edit.copy', { icon: 'copy', ...sel }),
+			act('edit.copy', { ...sel }),
 			act('edit.paste'),
 			act('edit.duplicate', { ...sel }),
 			sep,
-			act('edit.delete', { icon: 'trash', ...sel }),
+			act('edit.delete', { ...sel }),
 			act('edit.rippleDelete', { ...sel }),
 			act('edit.selectAll', { ...clips }),
 			sep,
@@ -163,7 +166,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			act('tool.rippleMode', { role: 'check', checked: s.rippleMode, label: 'Ripple mode' }),
 			act('tool.snap', { role: 'check', checked: s.snap, label: 'Snapping' }),
 			sep,
-			act('app.keyboard', { icon: 'keyboard', label: 'Keyboard shortcuts…' })
+			act('app.keyboard')
 		]
 	};
 
@@ -171,9 +174,9 @@ export function buildMenus(s: MenuState): MenuDef[] {
 		id: 'view',
 		label: 'View',
 		items: [
-			act('view.zoomIn', { icon: 'zoom-in' }),
-			act('view.zoomOut', { icon: 'zoom-out' }),
-			act('view.zoomFit', { icon: 'fold-horizontal', ...clips }),
+			act('view.zoomIn'),
+			act('view.zoomOut'),
+			act('view.zoomFit', { ...clips }),
 			sep,
 			{
 				kind: 'submenu',
@@ -228,10 +231,10 @@ export function buildMenus(s: MenuState): MenuDef[] {
 		id: 'playback',
 		label: 'Playback',
 		items: [
-			act('playback.toggle', { icon: s.playing ? 'pause' : 'play', ...clips }),
+			act('playback.toggle', { ...clips }),
 			sep,
-			act('playback.toStart', { icon: 'skip-back' }),
-			act('playback.toEnd', { icon: 'skip-forward' }),
+			act('playback.toStart'),
+			act('playback.toEnd'),
 			sep,
 			act('playback.stepBack'),
 			act('playback.stepForward'),
@@ -247,7 +250,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			act('range.clearIn'),
 			act('range.clearOut'),
 			sep,
-			act('marker.add', { icon: 'bookmark' }),
+			act('marker.add'),
 			act('marker.prev'),
 			act('marker.next')
 		]
@@ -274,7 +277,6 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			{
 				kind: 'submenu',
 				label: 'Panel windows',
-				icon: 'external-link',
 				items: [
 					...PANEL_IDS.map((id): MenuEntry => {
 						const blocked = detachBlocked(id, where);
@@ -294,8 +296,8 @@ export function buildMenus(s: MenuState): MenuDef[] {
 				]
 			},
 			sep,
-			act('window.resetWorkspace', { icon: 'rotate-ccw', label: `Reset ${label} workspace` }),
-			act('window.resetAllWorkspaces', { label: 'Reset all workspaces' })
+			act('window.resetWorkspace', { label: `Reset ${label} workspace` }),
+			act('window.resetAllWorkspaces')
 		]
 	};
 
@@ -303,11 +305,11 @@ export function buildMenus(s: MenuState): MenuDef[] {
 		id: 'help',
 		label: 'Help',
 		items: [
-			act('app.keyboard', { icon: 'keyboard', label: 'Keyboard shortcuts' }),
+			act('app.keyboard'),
 			sep,
-			act('app.checkUpdate', { icon: 'refresh-cw' }),
-			act('app.releases', { icon: 'external-link' }),
-			act('app.logs', { icon: 'folder-open', ...desk }),
+			act('app.checkUpdate'),
+			act('app.releases'),
+			act('app.logs', { ...desk }),
 			sep,
 			act('app.about')
 		]
@@ -335,36 +337,26 @@ export function collapseMenus(menus: readonly MenuDef[]): MenuDef[] {
 
 // ---- moving about a menu -------------------------------------------------------
 //
-// The bar's keyboard model, as pure functions over a menu's entries so it can be
-// tested without a DOM: which entries can take focus, where an arrow goes, where a
-// typed letter jumps.
+// The bar's keyboard model is `menu-nav.ts` (shared with the context menu), over this menu's
+// entries: which can take focus, where an arrow goes, where a typed letter jumps.
+
+const rowsOf = (items: readonly MenuEntry[]): NavRow[] =>
+	items.map((e) => ({ focusable: e.kind !== 'separator', label: e.kind === 'separator' ? '' : entryLabel(e) }));
 
 /** The entries that can take focus: everything but separators. A disabled entry can
  *  — it says why when asked — which is the menu pattern's rule. */
 export function focusable(items: readonly MenuEntry[]): number[] {
-	return items.flatMap((e, i) => (e.kind === 'separator' ? [] : [i]));
+	return focusableRows(rowsOf(items));
 }
 
 /** The entry `by` steps from `at` in `items`, wrapping at both ends; `at` when there is
  *  nothing to move to. */
 export function stepFocus(items: readonly MenuEntry[], at: number, by: 1 | -1): number {
-	const idx = focusable(items);
-	if (idx.length === 0) return at;
-	const pos = idx.indexOf(at);
-	// From nowhere (a separator, or no entry), down goes to the first and up to the last.
-	if (pos < 0) return by === 1 ? idx[0] : idx[idx.length - 1];
-	return idx[(pos + by + idx.length) % idx.length];
+	return stepRow(rowsOf(items), at, by);
 }
 
 /** The next entry after `at` whose label starts with `ch` (case-insensitive), wrapping
  *  round to `at` itself last; null when none does. */
 export function typeahead(items: readonly MenuEntry[], at: number, ch: string): number | null {
-	const idx = focusable(items);
-	const order = [...idx.filter((i) => i > at), ...idx.filter((i) => i <= at)];
-	const want = ch.toLowerCase();
-	const hit = order.find((i) => {
-		const e = items[i];
-		return e.kind !== 'separator' && entryLabel(e).trim().toLowerCase().startsWith(want);
-	});
-	return hit ?? null;
+	return typeaheadRow(rowsOf(items), at, ch);
 }

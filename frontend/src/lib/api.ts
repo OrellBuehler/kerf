@@ -27,7 +27,7 @@ import type {
 	Mask,
 	Color,
 	Delivery,
-	DeliveryCheck,
+	PlatformReport,
 	EditSource,
 	ExportOptions,
 	ExportProgress,
@@ -75,6 +75,7 @@ import type {
 	VoiceoverStatus,
 	WaveformRange
 } from './types';
+import { unsavedChoice, type UnsavedChoice, type UnsavedCopy } from './confirm-copy';
 import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
 import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
 import { fileTooLarge, importCaptionsInto, MAX_CAPTION_FILE_BYTES, parseFormat, resolveBase } from './caption-import';
@@ -109,13 +110,16 @@ import { clampCeiling, clampDuckDepth, clampMasterVolume, DEFAULT_MASTER, estima
 import { toFixedEven } from './format-fixed';
 import { fitMusicOnto, musicFitInputs, type FitSources } from './music-fit';
 import { sampleMusicAnalysis, SAMPLE_MUSIC_DURATION } from './sample-music';
-import { checkAll } from './platforms';
+import { exportSpan, report as platformReport } from './platforms';
 import { centeredCrop } from './smart-crop';
 import { synthWaveformRange } from './sample-waveform';
 import { analysisKindDone, ALL_KINDS } from './analysis-steps';
 import { sampleFilmstrip } from './sample-filmstrip';
 import { synthPcm } from './sample-audio';
-import { sampleFrameUrl } from './sample-frame';
+import { sampleFrameJpeg } from './sample-frame';
+import { renderedFps } from './timecode';
+import { playbackFps } from './playback-sync';
+import { parsePlaybackMessage } from './frame-transport';
 import { captionsForTimeline, resolveCaptions } from './captions';
 import { describeError, logFrontend } from './log';
 import { parseLaunchRequest } from './launch';
@@ -462,10 +466,28 @@ export async function listFonts(): Promise<string[]> {
 	return invoke<string[]>('list_fonts');
 }
 
-/** GPU video encoders the backend verified usable (empty in the browser). */
+let hwEncodersKnown: string[] | null = null;
+
+/** `?hw=h264_amf,hevc_amf` makes the browser harness answer as a machine with those encoders. */
+function harnessHwEncoders(): string[] {
+	try {
+		return (new URLSearchParams(location.search).get('hw') ?? '').split(',').filter(Boolean);
+	} catch {
+		return [];
+	}
+}
+
+/** GPU video encoders the backend verified usable (none in the browser harness, unless `?hw=`
+ *  names some). The backend probes once per process, so the answer is kept: a reopened export
+ *  dialog starts with it. */
 export async function hwEncoders(): Promise<string[]> {
-	if (!inTauri()) return [];
-	return invoke<string[]>('hw_encoders');
+	hwEncodersKnown = inTauri() ? await invoke<string[]>('hw_encoders') : harnessHwEncoders();
+	return hwEncodersKnown;
+}
+
+/** What [`hwEncoders`] last answered, `[]` before it has. */
+export function knownHwEncoders(): string[] {
+	return hwEncodersKnown ?? [];
 }
 
 export async function getTimeline(): Promise<Timeline> {
@@ -524,13 +546,38 @@ export async function projectPath(): Promise<string | null> {
 	return (await invoke<string | null>('project_path')) ?? null;
 }
 
-/** Ask a yes/no question before something irreversible. `window.confirm` is
- *  replaced by the dialog plugin in the desktop app and returns a promise
- *  there, so it can't be used synchronously — hence this. */
-export async function confirmAction(message: string, title = 'Kerf'): Promise<boolean> {
+/** Ask before something irreversible, with the two ends named as what they do (`labels`) — "Reset
+ *  all" / "Cancel" rather than Yes / No; there is no way to ask without naming them. `window.confirm`
+ *  is replaced by the dialog plugin in the desktop app and returns a promise there, so it can't be
+ *  used synchronously — hence this. */
+export async function confirmAction(message: string, title: string, labels: { ok: string; cancel: string }): Promise<boolean> {
 	if (!inTauri()) return window.confirm(message);
-	const { ask } = await import('@tauri-apps/plugin-dialog');
-	return ask(message, { title, kind: 'warning' });
+	const { message: show, ask } = await import('@tauri-apps/plugin-dialog');
+	try {
+		return (await show(message, { title, kind: 'warning', buttons: { ok: labels.ok, cancel: labels.cancel } })) === labels.ok;
+	} catch {
+		// A platform without custom buttons still gets the question, with the plugin's own.
+		return ask(message, { title, kind: 'warning', okLabel: labels.ok, cancelLabel: labels.cancel });
+	}
+}
+
+/** The unsaved-project prompt: Save…, Don't save and Cancel (`confirm-copy.ts`). Where the native
+ *  dialog cannot show three named buttons it asks the two-button question and Save is not on offer;
+ *  closing the dialog is always Cancel. The browser harness has `window.confirm`, which can only
+ *  discard or cancel. */
+export async function askUnsaved(copy: UnsavedCopy): Promise<UnsavedChoice> {
+	if (!inTauri()) return window.confirm(copy.message) ? 'discard' : 'cancel';
+	const { message: show } = await import('@tauri-apps/plugin-dialog');
+	try {
+		const answer = await show(copy.message, {
+			title: copy.title,
+			kind: 'warning',
+			buttons: { yes: copy.save, no: copy.discard, cancel: copy.cancel }
+		});
+		return unsavedChoice(answer, copy);
+	} catch {
+		return (await confirmAction(copy.message, copy.title, { ok: copy.discard, cancel: copy.cancel })) ? 'discard' : 'cancel';
+	}
 }
 
 /** When the window is asked to close and `needsConfirm()` says there is
@@ -555,6 +602,18 @@ export async function onWindowCloseRequested(
 		}
 		if (close) await win.destroy();
 	});
+}
+
+/** Set the OS window's title (the taskbar and the window switcher read it; Kerf's own title bar is drawn
+ *  under the native caption). In the browser harness it is the tab's title. A failure is not worth a toast:
+ *  the title is a courtesy, not state. */
+export async function setWindowTitle(title: string): Promise<void> {
+	if (!inTauri()) {
+		if (typeof document !== 'undefined') document.title = title;
+		return;
+	}
+	const { getCurrentWindow } = await import('@tauri-apps/api/window');
+	await getCurrentWindow().setTitle(title);
 }
 
 /** Quit Kerf from a menu. The window's own close button is guarded by
@@ -949,8 +1008,16 @@ async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Pro
 export interface PlaybackFrame {
 	/** Timeline time this frame shows, for dropping ones the clock has passed. */
 	time: number;
-	/** `data:image/jpeg;base64,…` — the same shape `getTimelineFrame` returns. */
-	jpeg: string;
+	/** The frame as JPEG bytes, undecoded: a view into the channel message, so nothing is copied
+	 *  until the preview decides to show it. */
+	jpeg: Uint8Array<ArrayBuffer>;
+}
+
+/** What a playback stream is asked for. `null` leaves it to the engine: the cut's own frame rate
+ *  and the default width. The preview states both only after a stream could not keep up. */
+export interface PlaybackRequest {
+	fps: number | null;
+	width: number | null;
 }
 
 /**
@@ -958,19 +1025,20 @@ export interface PlaybackFrame {
  * until playback stops. Returns a function that stops it.
  *
  * One long-lived ffmpeg renders the whole span, rather than the one process per
- * frame that scrubbing uses — the difference between a slideshow and video. In
- * the browser harness there is no backend, so frames are synthesized instead
- * (see `samplePlayback`).
+ * frame that scrubbing uses — the difference between a slideshow and video. Its frames
+ * come up as raw bytes (the timeline time, then the JPEG), not as base64 data URLs in
+ * JSON; the page builds a data URL itself, for the frames it shows. In the browser harness
+ * there is no backend, so frames are synthesized instead (see `samplePlayback`).
  */
 let playbackSeq = 0;
 
 export function startPlayback(
 	start: number,
-	fps: number,
+	request: PlaybackRequest,
 	onFrame: (f: PlaybackFrame) => void,
 	onError?: (message: string) => void
 ): () => void {
-	if (!inTauri()) return samplePlayback(start, fps, onFrame);
+	if (!inTauri()) return samplePlayback(start, request, onFrame);
 	// The backend cancels *by id* rather than by a generation counter: start and
 	// stop are separate async calls that can arrive out of order, and a stop
 	// meant for the previous stream must not kill the one that replaced it.
@@ -979,15 +1047,29 @@ export function startPlayback(
 	void (async () => {
 		const { Channel } = await import('@tauri-apps/api/core');
 		if (stopped) return;
-		const channel = new Channel<PlaybackFrame>();
-		channel.onmessage = (f) => {
-			if (!stopped) onFrame(f);
+		const channel = new Channel<ArrayBuffer>();
+		channel.onmessage = (message) => {
+			if (stopped) return;
+			// A throw here would end up in the channel's own bookkeeping, which delivers the messages
+			// after this one in order: one bad frame must not stop the stream behind it.
+			try {
+				const frame = parsePlaybackMessage(message);
+				if (frame) onFrame(frame);
+			} catch (e) {
+				logFrontend('warn', `a playback frame was dropped: ${describeError(e)}`, 'playback');
+			}
 		};
 		// Resolves only when playback ends; nothing waits on it.
 		// The backend only rejects for a real failure (ffmpeg died, inputs
 		// would not resolve), never for a stop or a supersede — but a stream
 		// already stopped on this side has no one left to tell.
-		void invoke('start_playback', { playbackId, start, fps, onFrame: channel }).catch((e) => {
+		void invoke('start_playback', {
+			playbackId,
+			start,
+			fps: request.fps,
+			maxWidth: request.width,
+			onFrame: channel
+		}).catch((e) => {
 			if (!stopped) onError?.(e instanceof Error ? e.message : String(e));
 		});
 	})();
@@ -998,28 +1080,40 @@ export function startPlayback(
 	};
 }
 
+/** What the harness renders a frame at when the page does not say: the sample frame's own size. */
+const SAMPLE_WIDTH = 640;
+
 /** What the desktop app really pays to put one frame on screen: ffmpeg's startup
- *  plus base64, JSON and IPC. Deliberately larger than the preview's two-frame
- *  staleness budget — a harness whose frames arrive instantly cannot reproduce
- *  the class of bug where that constant is mistaken for the picture drifting. */
+ *  plus the channel. Deliberately larger than the preview's staleness budget — a
+ *  harness whose frames arrive instantly cannot reproduce the class of bug where
+ *  that constant is mistaken for the picture drifting. */
 const SAMPLE_FRAME_LAG_MS = 90;
 
 /**
- * The browser harness's stand-in for the streamed composite: a generated frame
- * per tick, paced at `fps` and delayed by a realistic transport cost, so
- * playback moves in `bun run dev` and the preview's frame pacing is exercised
- * end to end without a backend.
+ * The browser harness's stand-in for the streamed composite: a generated JPEG per tick, paced
+ * at the rate asked for (the cut's own, as the engine would read it, when none is) and drawn at
+ * the width asked for, delayed by a realistic transport cost, so playback moves in `bun run dev`
+ * through the same route as the desktop app and the preview's frame pacing and ladder are
+ * exercised end to end without a backend.
  */
-function samplePlayback(start: number, fps: number, onFrame: (f: PlaybackFrame) => void): () => void {
+function samplePlayback(start: number, request: PlaybackRequest, onFrame: (f: PlaybackFrame) => void): () => void {
+	const fps = request.fps ?? playbackFps(renderedFps(devTimeline, sampleAssets));
+	const width = request.width ?? SAMPLE_WIDTH;
 	let index = 0;
 	let timer: ReturnType<typeof setInterval> | null = null;
+	let stopped = false;
 	const spawn = setTimeout(() => {
 		timer = setInterval(() => {
 			const time = start + index++ / fps;
-			onFrame({ time, jpeg: sampleFrameUrl(time) });
+			void sampleFrameJpeg(time, width)
+				.then((jpeg) => jpeg?.arrayBuffer())
+				.then((bytes) => {
+					if (bytes && !stopped) onFrame({ time, jpeg: new Uint8Array(bytes) });
+				});
 		}, 1000 / fps);
 	}, SAMPLE_FRAME_LAG_MS);
 	return () => {
+		stopped = true;
 		clearTimeout(spawn);
 		if (timer) clearInterval(timer);
 	};
@@ -2750,8 +2844,22 @@ function seedDevStaged() {
 	entries.push({
 		kind: 'overlay_added',
 		summary: `Added text “${overlay.text}” at ${fmtTime(overlay.start)}–${fmtTime(overlay.end)}`,
+		overlay_id: overlay.id,
 		at: overlay.start
 	});
+	// With the sample song on a track of its own (`?music=1`), the proposal also drops it, so the
+	// review has a removal to draw.
+	const bedTrack = proposed.tracks.find((t) => t.kind === 'audio' && t !== audio && t.clips.length > 0);
+	if (bedTrack) {
+		const [gone] = bedTrack.clips.splice(0, 1);
+		entries.push({
+			kind: 'clip_removed',
+			summary: `Removed clip from ${bedTrack.name} at ${fmtTime(gone.timeline_start)} (${clipDuration(gone).toFixed(1)}s)`,
+			track_id: bedTrack.id,
+			clip_id: gone.id,
+			at: gone.timeline_start
+		});
+	}
 
 	const countClips = (tl: Timeline) => tl.tracks.reduce((n, t) => n + t.clips.length, 0);
 	devStaged = {
@@ -2760,7 +2868,7 @@ function seedDevStaged() {
 			base_seq: devHead,
 			task_id: devTasks.find((t) => t.status === 'ready')?.id ?? null,
 			note: 'Tighten the intro',
-			edits: ['Trim clip', 'Move clip', 'Trim clip', 'Add overlay'],
+			edits: ['Trim clip', 'Move clip', 'Trim clip', 'Add overlay', ...(bedTrack ? ['Remove clip'] : [])],
 			created_at: now(),
 			updated_at: now(),
 			stale: false,
@@ -3158,26 +3266,37 @@ export async function revealPath(path: string): Promise<void> {
 	await invoke('reveal_path', { path });
 }
 
-/** How ready the current cut is for each publishing target. `frame` overrides
- *  the shape it is judged at — the export dialog passes the resolution it is
- *  about to render when that differs from the project frame.
+/** How ready the current cut is for each publishing target, with the cut it was judged on (its
+ *  frame and length, in words). `frame` overrides the shape it is judged at and `range` the span —
+ *  the export dialog passes the resolution it is about to render when that differs from the
+ *  project frame, and the In → out it is about to write.
  *
  *  `kerf_core::platform` decides this in the app. The browser harness runs the
  *  mirror in `platforms.ts` over the dev timeline so the panel is explorable
  *  under `bun run dev`. */
-export async function platformCheck(frame?: [number, number] | null): Promise<DeliveryCheck[]> {
+export async function platformCheck(
+	frame?: [number, number] | null,
+	range?: { start: number; end: number } | null
+): Promise<PlatformReport> {
 	if (!inTauri()) {
 		const fmt = devTimeline.format;
 		const first = sampleAssets[0];
-		return checkAll({
-			duration: timelineDuration(devTimeline),
+		const full = timelineDuration(devTimeline);
+		const span = exportSpan(full, range);
+		// A title counts when it is on screen somewhere in the span, as it is in the sliced cut the export builds.
+		return platformReport({
+			duration: span ? span[1] - span[0] : full,
 			width: frame?.[0] ?? fmt?.width ?? first.streams[0]?.width ?? 1920,
 			height: frame?.[1] ?? fmt?.height ?? first.streams[0]?.height ?? 1080,
 			has_audio: true,
-			has_text: (devTimeline.overlays ?? []).length > 0
+			has_text: (devTimeline.overlays ?? []).some((o) => !span || (o.end > span[0] && o.start < span[1]))
 		});
 	}
-	return invoke<DeliveryCheck[]>('platform_check', { width: frame?.[0] ?? null, height: frame?.[1] ?? null });
+	return invoke<PlatformReport>('platform_check', {
+		width: frame?.[0] ?? null,
+		height: frame?.[1] ?? null,
+		range: range ?? null
+	});
 }
 
 // ---- agent connection (MCP endpoint) ---------------------------------------

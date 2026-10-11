@@ -21,13 +21,14 @@ use super::decode_policy::{
 use super::source_probe::{ProbeCache, SOURCE_PROBE_TIMEOUT};
 use super::ProbeResult;
 use crate::clip_timing::{
-    clip_seek, clip_source_window, is_cache_proxy, transition_fx, ClipFx, ClipTiming, FadeEdge, FadeStep, FadeTint,
-    HEAD_PADDED_SUFFIX,
+    clip_seek, clip_source_window, is_cache_proxy, is_head_padded_proxy, transition_fx, ClipFx, ClipTiming, FadeEdge, FadeStep,
+    FadeTint, HEAD_PADDED_SUFFIX,
 };
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, Projection, Property, Reframe, ReframeKeyframe,
-    ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, VideoEffect,
+    pix_fmt_layout, Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, PixLayout, Projection, Property, Reframe,
+    ReframeKeyframe, ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform,
+    VideoEffect,
 };
 use crate::render_plan::{still_size, CompositeColorPolicy};
 
@@ -143,9 +144,9 @@ fn hwaccel() -> Option<String> {
 /// `-hwaccel auto` doesn't double every frame's latency.
 static HWACCEL_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// Cleared the first time a hardware *encode* (proxy / stitch) fails while the
+/// Cleared the first time a hardware *encode* (the Insta360 stitch) fails while the
 /// software retry succeeds, so a broken GPU encoder doesn't double every later
-/// background encode.
+/// stitch. Proxies never encode in hardware, and an export's encoder is the user's.
 static HW_ENCODE_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Set only when a failure that read as the hardware's (`looks_like_hardware_decode_failure`) was
@@ -246,12 +247,13 @@ fn hw_encode_enabled() -> bool {
     }
 }
 
-/// Every hardware encoder the export surface knows how to drive, in family
-/// preference order (NVENC, QuickSync, VideoToolbox, AMF). VAAPI encoders are
-/// deliberately absent: they only accept frames already uploaded to the GPU,
-/// which the software filtergraph never produces, whereas these all take system
-/// memory frames directly.
-const HW_ENCODER_CANDIDATES: [&str; 10] = [
+/// Every hardware encoder that takes system-memory frames directly, in family
+/// preference order (NVENC, QuickSync, VideoToolbox, AMF). VAAPI is not here:
+/// its encoders only accept frames already uploaded to a VAAPI device, which the
+/// software filtergraph never produces without a tail of its own
+/// ([`VAAPI_ENCODER_CANDIDATES`]) — and a stitch, which has no such tail, picks
+/// its encoder from this list.
+const HW_ENCODER_CANDIDATES: [&str; 11] = [
     "h264_nvenc",
     "hevc_nvenc",
     "av1_nvenc",
@@ -262,68 +264,244 @@ const HW_ENCODER_CANDIDATES: [&str; 10] = [
     "hevc_videotoolbox",
     "h264_amf",
     "hevc_amf",
+    "av1_amf",
 ];
+
+/// The VAAPI encoders the export can drive: `-vaapi_device` plus a
+/// `format=nv12,hwupload` tail on the picture pad (`build_filter_complex`).
+const VAAPI_ENCODER_CANDIDATES: [&str; 3] = ["h264_vaapi", "hevc_vaapi", "av1_vaapi"];
+
+/// The render node a VAAPI export names in its argv. The builder is pure, so this
+/// is a stand-in: the process that spawns it swaps in the node the probe found
+/// (`set_vaapi_device`, from `tune_export_args`).
+const VAAPI_DEFAULT_DEVICE: &str = "/dev/dri/renderD128";
+
+/// Render nodes tried for VAAPI before giving up (a laptop has two, a workstation
+/// rarely more); each costs up to [`HW_PROBE_TIMEOUT`] should its driver hang.
+const VAAPI_DEVICES_TRIED: usize = 4;
+
+/// How long one candidate gets to encode a single frame.
+const HW_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long the `-encoders` listing gets. Longer than a test encode: the first launch of a
+/// freshly installed ffmpeg can sit under a virus scan, and an answer given up on is cached for
+/// the whole process as "no hardware encoders".
+const HW_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long an export waits for the probe to name the VAAPI device when nothing has probed yet.
+const VAAPI_DEVICE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the one-per-process hardware encoder probe found.
+struct HwProbe {
+    encoders: Vec<String>,
+    vaapi_device: Option<String>,
+}
+
+static HW_PROBE: OnceLock<HwProbe> = OnceLock::new();
+
+fn hw_probe() -> &'static HwProbe {
+    HW_PROBE.get_or_init(detect_hw_encoders)
+}
+
+/// The value of `cell` once something has set it, waiting up to `limit` (unit-tested over a
+/// local cell).
+fn wait_for<T>(cell: &OnceLock<T>, limit: std::time::Duration) -> Option<&T> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(value) = cell.get() {
+            return Some(value);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
 
 /// The hardware video encoders this machine's ffmpeg can actually use, probed
 /// once per process and cached. `-encoders` listing an encoder is not proof —
 /// an nvenc-enabled build without a usable NVIDIA driver still lists it and
 /// then fails at open — so each compiled-in candidate is exercised with a
 /// one-frame test encode and only the ones that succeed are reported. Ordered
-/// by [`HW_ENCODER_CANDIDATES`]. `KERF_HW_ENCODE=none` reports none.
+/// by [`HW_ENCODER_CANDIDATES`], then [`VAAPI_ENCODER_CANDIDATES`].
+/// `KERF_HW_ENCODE=none` reports none.
 pub fn hw_encoders() -> &'static [String] {
-    /// How long one candidate gets to encode a single frame.
-    const HW_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+    &hw_probe().encoders
+}
 
-    static ENCODERS: OnceLock<Vec<String>> = OnceLock::new();
-    ENCODERS.get_or_init(|| {
-        if !hw_encode_enabled() {
-            return Vec::new();
-        }
-        let bin = ffmpeg_bin();
-        let listed = match command(&bin)
-            .args(["-hide_banner", "-v", "error", "-encoders"])
-            .stderr(Stdio::null())
-            .output()
-        {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-            _ => return Vec::new(),
-        };
-        // `-encoders` prints ` V....D h264_nvenc  NVIDIA NVENC…` — the name is
-        // the second whitespace-separated token.
-        let compiled: std::collections::HashSet<&str> = listed.lines().filter_map(|l| l.split_whitespace().nth(1)).collect();
-        let found: Vec<String> = HW_ENCODER_CANDIDATES
-            .iter()
-            .filter(|enc| compiled.contains(**enc))
-            .filter(|enc| {
-                // 256x256 clears every family's minimum-dimension floor; nv12 is
-                // the input format they all accept.
-                let mut probe = command(&bin);
-                probe
-                    .args([
-                        "-hide_banner",
-                        "-v",
-                        "error",
-                        "-f",
-                        "lavfi",
-                        "-i",
-                        "color=black:s=256x256:r=30:d=0.2",
-                    ])
-                    .args(["-frames:v", "1", "-pix_fmt", "nv12", "-c:v", enc, "-f", "null", "-"])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null());
-                // A one-frame encode finishes in well under a second where the
-                // encoder works; a driver that hangs instead of failing must not
-                // take every later caller of this `OnceLock` with it.
-                status_within(&mut probe, HW_PROBE_TIMEOUT)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|s| s.success())
-            })
-            .map(|s| s.to_string())
+/// The render node the VAAPI encoders in [`hw_encoders`] were verified on. An export that is
+/// the first to ask starts the probe on its own thread and waits [`VAAPI_DEVICE_WAIT`] for it,
+/// not for its worst case (a hung driver is minutes): `None` leaves the builder's stand-in node
+/// in the argv, and the probe goes on for the exports after.
+fn vaapi_device_within(limit: std::time::Duration) -> Option<&'static str> {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        std::thread::spawn(|| {
+            hw_probe();
+        });
+    });
+    wait_for(&HW_PROBE, limit)?.vaapi_device.as_deref()
+}
+
+fn detect_hw_encoders() -> HwProbe {
+    let nothing = || HwProbe {
+        encoders: Vec::new(),
+        vaapi_device: None,
+    };
+    if !hw_encode_enabled() {
+        return nothing();
+    }
+    let bin = ffmpeg_bin();
+    let mut list = command(&bin);
+    list.args(["-hide_banner", "-v", "error", "-encoders"]);
+    let Some(listed) = run_piped_until(&mut list, Vec::new(), Instant::now() + HW_LIST_TIMEOUT) else {
+        return nothing();
+    };
+    let listed = String::from_utf8_lossy(&listed).into_owned();
+    // `-encoders` prints ` V....D h264_nvenc  NVIDIA NVENC…` — the name is
+    // the second whitespace-separated token.
+    let compiled: std::collections::HashSet<&str> = listed.lines().filter_map(|l| l.split_whitespace().nth(1)).collect();
+    // One thread per vendor: a driver is asked about one encoder at a time (consumer
+    // NVENC counts sessions), but the vendors' probes — about a second in a row — overlap.
+    let (mut system, vaapi) = std::thread::scope(|scope| {
+        let (bin, compiled) = (&bin, &compiled);
+        let families: Vec<_> = [EncFamily::Nvenc, EncFamily::Qsv, EncFamily::VideoToolbox, EncFamily::Amf]
+            .into_iter()
+            .map(|family| scope.spawn(move || probe_family(bin, family, compiled, HW_PROBE_TIMEOUT)))
             .collect();
-        tracing::info!(encoders = ?found, "hardware video encoders detected");
-        found
-    })
+        let vaapi = scope.spawn(move || probe_vaapi(bin, compiled, &vaapi_render_nodes(), HW_PROBE_TIMEOUT));
+        let system: Vec<&'static str> = families.into_iter().flat_map(|f| f.join().unwrap_or_default()).collect();
+        (system, vaapi.join().unwrap_or_default())
+    });
+    system.sort_by_key(|enc| HW_ENCODER_CANDIDATES.iter().position(|c| c == enc));
+    let (vaapi_encoders, vaapi_device) = vaapi;
+    let found: Vec<String> = system.into_iter().chain(vaapi_encoders).map(str::to_string).collect();
+    tracing::info!(encoders = ?found, vaapi_device = ?vaapi_device, "hardware video encoders detected");
+    HwProbe {
+        encoders: found,
+        vaapi_device,
+    }
+}
+
+/// How one test encode ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+    Works,
+    Refused,
+    /// Still running at [`HW_PROBE_TIMEOUT`] and killed: the driver wedged.
+    Hung,
+}
+
+/// The test encode for `encoder` (pure): one 256x256 frame — enough to clear every
+/// family's minimum-dimension floor — to the null muxer. System-memory encoders
+/// take `nv12`, which they all accept; a VAAPI one is uploaded to `vaapi_device`
+/// first, the way an export hands it frames.
+fn encoder_probe_args(encoder: &str, vaapi_device: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = ["-hide_banner", "-v", "error"].map(String::from).into();
+    if let Some(device) = vaapi_device {
+        args.extend(["-vaapi_device".to_string(), device.to_string()]);
+    }
+    args.extend(["-f", "lavfi", "-i", "color=black:s=256x256:r=30:d=0.2"].map(String::from));
+    match vaapi_device {
+        Some(_) => args.extend(["-vf", "format=nv12,hwupload", "-frames:v", "1"].map(String::from)),
+        None => args.extend(["-frames:v", "1", "-pix_fmt", "nv12"].map(String::from)),
+    }
+    args.extend(["-c:v", encoder, "-f", "null", "-"].map(String::from));
+    args
+}
+
+/// Run a test encode. A one-frame encode finishes in well under a second where the
+/// encoder works; a driver that hangs instead of failing must not take every later
+/// caller of the `OnceLock` with it, so the child is killed at `limit`
+/// ([`HW_PROBE_TIMEOUT`]). A child that dies on a signal (a missing hardware library
+/// aborts the pinned build) is a refusal like any other.
+fn run_probe(bin: &str, args: &[String], limit: std::time::Duration) -> Probe {
+    let mut probe = command(bin);
+    probe.args(args).stdout(Stdio::null()).stderr(Stdio::null());
+    match status_within(&mut probe, limit) {
+        Ok(Some(status)) if status.success() => Probe::Works,
+        Ok(None) => Probe::Hung,
+        _ => Probe::Refused,
+    }
+}
+
+/// The compiled-in encoders of one vendor family that really encode, in candidate
+/// order. A hung one ends the family: its siblings share the driver.
+fn probe_family(
+    bin: &str,
+    family: EncFamily,
+    compiled: &std::collections::HashSet<&str>,
+    limit: std::time::Duration,
+) -> Vec<&'static str> {
+    let mut works = Vec::new();
+    for encoder in HW_ENCODER_CANDIDATES
+        .iter()
+        .copied()
+        .filter(|e| enc_family(e) == family && compiled.contains(e))
+    {
+        match run_probe(bin, &encoder_probe_args(encoder, None), limit) {
+            Probe::Works => works.push(encoder),
+            Probe::Refused => {}
+            Probe::Hung => break,
+        }
+    }
+    works
+}
+
+/// The render nodes to try VAAPI on: `KERF_VAAPI_DEVICE` when set, else what
+/// `/dev/dri` holds. A machine with no such directory (every Windows and macOS one)
+/// has none, and so no VAAPI encoder.
+fn vaapi_render_nodes() -> Vec<String> {
+    render_nodes(Path::new("/dev/dri"), std::env::var("KERF_VAAPI_DEVICE").ok())
+}
+
+/// [`vaapi_render_nodes`] for a given directory and override (pure of the machine).
+fn render_nodes(dir: &Path, forced: Option<String>) -> Vec<String> {
+    if let Some(device) = forced.filter(|d| !d.is_empty()) {
+        return vec![device];
+    }
+    let mut nodes: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("renderD"))
+        .map(|entry| entry.path().to_string_lossy().into_owned())
+        .collect();
+    nodes.sort();
+    nodes.truncate(VAAPI_DEVICES_TRIED);
+    nodes
+}
+
+/// The VAAPI encoders that work on the first of `nodes` that has any, and that node.
+/// Per node they are tried in turn and a hang gives the node up.
+fn probe_vaapi(
+    bin: &str,
+    compiled: &std::collections::HashSet<&str>,
+    nodes: &[String],
+    limit: std::time::Duration,
+) -> (Vec<&'static str>, Option<String>) {
+    let wanted: Vec<&'static str> = VAAPI_ENCODER_CANDIDATES
+        .iter()
+        .copied()
+        .filter(|e| compiled.contains(e))
+        .collect();
+    if wanted.is_empty() {
+        return (Vec::new(), None);
+    }
+    for node in nodes {
+        let mut works = Vec::new();
+        for &encoder in &wanted {
+            match run_probe(bin, &encoder_probe_args(encoder, Some(node)), limit) {
+                Probe::Works => works.push(encoder),
+                Probe::Refused => {}
+                Probe::Hung => break,
+            }
+        }
+        if !works.is_empty() {
+            return (works, Some(node.clone()));
+        }
+    }
+    (Vec::new(), None)
 }
 
 /// Run `cmd` to completion, but give up on it after `limit`: the child is killed
@@ -947,6 +1125,173 @@ pub(super) fn run_piped_until(cmd: &mut Command, input: Vec<u8>, deadline: Insta
     status.success().then_some(out)
 }
 
+/// How long a whole-file read ([`scene_pass`], [`contact_sheet`]) may go without a word from
+/// ffmpeg before it is killed, at the least (the same floor the waveform decode and the
+/// filmstrip give theirs). `-progress` reports every [`PROGRESS_ON_STDERR`] second, but **only
+/// once a frame has reached the output**: a read that outputs nothing until its last frame is
+/// silent for the whole decode, so it gets either a frame to report on early (the scene pass
+/// selects frame 0) or a bound that grows with the work ([`stall_for_work`], the sheet's).
+const READ_STALL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most a read that is silent until it ends is given before it counts as wedged.
+const READ_STALL_CEILING: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+
+/// Silence a read of `work_secs` of footage that outputs only at its end is allowed (pure): `per_sec`
+/// per second of footage — a decode slower than `1 / per_sec` of real time is a wedge, not a slow
+/// machine — between `floor`, which covers start-up and the first seek, and `ceiling`, which keeps
+/// even a wedged hour-long read finite. Clamped in seconds first: `from_secs_f64` panics on
+/// infinity, and a container can report an absurd duration.
+fn stall_for_work(work_secs: f64, per_sec: f64, floor: std::time::Duration, ceiling: std::time::Duration) -> std::time::Duration {
+    let secs = if work_secs.is_finite() {
+        (work_secs * per_sec).clamp(0.0, ceiling.as_secs_f64())
+    } else {
+        0.0
+    };
+    std::time::Duration::from_secs_f64(secs).max(floor)
+}
+
+/// The stall bound of a contact sheet of a `window_secs` window: the whole window is decoded
+/// before `tile` outputs the one frame, so the read says nothing until it ends. Thirty seconds of
+/// silence per second of footage, at least [`READ_STALL`], at most [`READ_STALL_CEILING`].
+fn sheet_stall(window_secs: f64) -> std::time::Duration {
+    stall_for_work(window_secs, 30.0, READ_STALL, READ_STALL_CEILING)
+}
+
+/// The `-progress` flags a bounded read adds **at spawn time** (like the thread caps, never in
+/// a pure builder): the report goes to stderr, which stdout-carrying reads (a contact sheet's
+/// JPEG) leave free, and is what [`output_unless_stalled`] listens for.
+const PROGRESS_ON_STDERR: [&str; 4] = ["-progress", "pipe:2", "-stats_period", "1"];
+
+/// Whether `line` is one of the `key=value` lines of ffmpeg's `-progress` report.
+fn is_progress_line(line: &str) -> bool {
+    let Some((key, _)) = line.trim().split_once('=') else {
+        return false;
+    };
+    key.starts_with("stream_")
+        || matches!(
+            key,
+            "frame"
+                | "fps"
+                | "bitrate"
+                | "total_size"
+                | "out_time_us"
+                | "out_time_ms"
+                | "out_time"
+                | "dup_frames"
+                | "drop_frames"
+                | "speed"
+                | "progress"
+        )
+}
+
+/// What [`output_unless_stalled`] collected.
+struct Collected {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    /// stderr without the `-progress` report lines (what had arrived, when the read stalled).
+    stderr: String,
+    /// ffmpeg said nothing for the stall bound and was killed.
+    stalled: bool,
+}
+
+impl Collected {
+    fn succeeded(&self) -> bool {
+        self.status.success() && !self.stalled
+    }
+
+    /// The last lines of stderr, for an error message.
+    fn stderr_tail(&self) -> String {
+        let lines: Vec<&str> = self.stderr.lines().rev().take(12).collect();
+        lines.into_iter().rev().collect::<Vec<_>>().join("\n").trim().to_string()
+    }
+}
+
+/// [`Command::output`] that cannot wait forever: `cmd` is given `-progress pipe:2`
+/// ([`PROGRESS_ON_STDERR`]) and is killed once its stderr has been silent for `stall`. Both
+/// pipes are drained on side threads, so neither a flood of warnings nor a large stdout can fill
+/// a pipe and wedge the child. A stalled read returns the stderr that had arrived and no stdout.
+/// The child is always reaped, whatever fails on the way.
+fn output_unless_stalled(mut cmd: Command, stall: std::time::Duration) -> std::io::Result<Collected> {
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::{Arc, Mutex};
+
+    /// When stderr was last heard from, and what it said so far.
+    struct Heard {
+        at: Instant,
+        text: String,
+    }
+
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let heard = Arc::new(Mutex::new(Heard {
+        at: Instant::now(),
+        text: String::new(),
+    }));
+    let out_handle = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let err_handle = {
+        let heard = Arc::clone(&heard);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).split(b'\n') {
+                let Ok(line) = line else { break };
+                let line = String::from_utf8_lossy(&line);
+                if let Ok(mut heard) = heard.lock() {
+                    heard.at = Instant::now();
+                    if !is_progress_line(&line) {
+                        heard.text.push_str(&line);
+                        heard.text.push('\n');
+                    }
+                }
+            }
+        })
+    };
+    let mut stalled = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        }
+        if heard.lock().is_ok_and(|heard| heard.at.elapsed() > stall) {
+            stalled = true;
+            let _ = child.kill();
+            break child.wait()?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let text = |heard: &Mutex<Heard>| heard.lock().map(|heard| heard.text.clone()).unwrap_or_default();
+    if stalled {
+        // The side threads end on their own when the pipes close; a wrapper that spawned the real
+        // ffmpeg keeps them open past the kill, and the caller must not wait for that.
+        return Ok(Collected {
+            status,
+            stdout: Vec::new(),
+            stderr: text(&heard),
+            stalled,
+        });
+    }
+    let stdout = out_handle.join().unwrap_or_default();
+    let _ = err_handle.join();
+    Ok(Collected {
+        status,
+        stdout,
+        stderr: text(&heard),
+        stalled,
+    })
+}
+
 /// The red of the middle pixel of the still graph's composite over a one-frame
 /// clip of [`POLICY_PROBE_YUV`], with the clip tagged BT.709 or not.
 fn probe_composite_red(ffmpeg: &str, ffprobe: &str, tag_bt709: bool, deadline: Instant) -> Option<u8> {
@@ -1130,6 +1475,26 @@ pub(crate) struct SourceTraits {
     /// path has to ask of them: whether to request a hardware decoder (`decode_policy`).
     pub codec: Codec,
     pub chroma: Chroma,
+    /// The first plane of the decoded picture is the luma alone (see [`luma_plane_pix_fmt`]):
+    /// what a yuv420p proxy's first plane is, and the only plane `select='scene'` scores.
+    pub luma_plane: bool,
+}
+
+/// Whether a picture of this `pix_fmt` keeps its luma alone in plane 0: planar or semi-planar
+/// YCbCr of any subsampling or depth, and gray. `select='scene'` scores plane 0 only, so on an
+/// RGB-family picture (`gbrp`: the G plane; `rgb24`, `bgr0`: every interleaved byte), a packed
+/// YCbCr one (`yuyv422`: luma and chroma bytes interleaved), a palette, an alpha-carrying
+/// format or a name nobody here knows, it scores something a yuv420p proxy cannot reproduce.
+fn luma_plane_pix_fmt(name: &str) -> bool {
+    let packed = matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "uyvy422" | "yuyv422" | "yvyu422" | "uyyvyy411"
+    );
+    !packed
+        && matches!(
+            pix_fmt_layout(name.trim()),
+            Some(PixLayout::Yuv420 | PixLayout::Gray | PixLayout::OtherYuv)
+        )
 }
 
 /// [`SourceTraits`] of the file at `path`, probed once per file and cached against the file's
@@ -1216,6 +1581,7 @@ fn parse_source_traits(json: &str) -> SourceTraits {
         indexed,
         codec: Codec::from_name(text("codec_name")),
         chroma: Chroma::from_pix_fmt(text("pix_fmt")),
+        luma_plane: luma_plane_pix_fmt(text("pix_fmt")),
     }
 }
 
@@ -1225,6 +1591,40 @@ fn parse_source_traits(json: &str) -> SourceTraits {
 /// spawns a process: not under a lock); `false` when the probe fails.
 pub fn source_is_indexed_container(path: &Path) -> bool {
     source_traits(path).is_some_and(|t| t.indexed)
+}
+
+/// What a whole-file *analysis* read can take from the preview proxy of a file in place of the
+/// file itself (see [`proxy_fidelity`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProxyFidelity {
+    /// A frame sits at the time it does in the original, so a read that picks frames by time
+    /// (a contact sheet) or reports a time (a cut) says the same: an MP4 / MOV or Matroska / WebM
+    /// source, the containers the proxy's timing is verified for. A transport stream's proxy is
+    /// `lead` seconds off whenever its video starts late (`engine-cli.md`), and the rest are
+    /// unproven.
+    pub times: bool,
+    /// ...and a frame's *scene score* comes out within a few hundredths of the original's, so
+    /// the cuts found are the same: also an SDR source whose luma sits alone in plane 0
+    /// ([`SourceTraits::luma_plane`]; not RGB, not packed YCbCr). A proxy is tone-mapped at
+    /// encode, and the original is scored in its HLG / PQ code values, which the tone curve moves
+    /// by a fifth of the scale (0.20 to 0.21 measured); an RGB original is scored on its G plane
+    /// or its interleaved bytes against the proxy's luma (up to 0.56 measured, cuts lost). The few
+    /// hundredths are for the software (libx264) proxy; a hardware-encoded one is unmeasured.
+    pub scores: bool,
+}
+
+/// [`ProxyFidelity`] of the file at `path`. One cached `ffprobe` (the one the proxy's own name
+/// already cost); nothing is trusted when the probe fails. Spawns a process: not under a lock.
+pub fn proxy_fidelity(path: &Path) -> ProxyFidelity {
+    fidelity_of(source_traits(path).unwrap_or_default())
+}
+
+/// The pure half of [`proxy_fidelity`].
+fn fidelity_of(traits: SourceTraits) -> ProxyFidelity {
+    ProxyFidelity {
+        times: traits.indexed,
+        scores: traits.indexed && traits.hdr.is_none() && traits.luma_plane,
+    }
 }
 
 /// The HDR transfer of the first video stream of the file at `path`, for the
@@ -1290,36 +1690,69 @@ const SCENE_DETECT_WIDTH: u32 = 640;
 /// the expensive part for 4K sources); a failed accelerated run retries in
 /// software, mirroring [`decode_frame`]'s fallback.
 pub fn detect_scenes(path: &Path, threshold: f64) -> Result<Vec<f64>> {
+    scene_pass(path, threshold).map(|(times, _)| times)
+}
+
+/// [`detect_scenes`] for the file at `original`, reading its preview `proxy` instead when one
+/// is given: a small all-intra decode in place of a whole 4K long-GOP one.
+///
+/// The proxy is only ever a faster way to the *same answer*, so a proxy that does not read
+/// (a truncated or foreign file, a decoder that dies on it) is not a failed analysis: the
+/// original is read instead, as if there had been none. The cut times themselves come out
+/// the same because a proxy answers `-ss T` with the frame the original does (see
+/// [`build_proxy_args`]; a late-starting video is padded so its frames keep their
+/// timestamps), and the detector scores at [`SCENE_DETECT_WIDTH`] either way.
+pub fn detect_scenes_preferring(original: &Path, proxy: Option<&Path>, threshold: f64) -> Result<Vec<f64>> {
+    if let Some(proxy) = proxy {
+        if let Ok((times, true)) = scene_pass(proxy, threshold) {
+            return Ok(times);
+        }
+        tracing::warn!(proxy = %proxy.display(), "scene detection could not read the proxy; reading the original");
+    }
+    detect_scenes(original, threshold)
+}
+
+/// The `-vf` chain of a scene pass (pure). Frame 0 is selected too (`eq(n,0)`) and dropped again
+/// by [`parse_scenes`]: a pass with no cut outputs nothing otherwise, and ffmpeg reports no
+/// progress until a frame has reached the output, so a long single take would look wedged from
+/// its first second.
+fn scene_filter(threshold: f64) -> String {
+    format!("scale='min({SCENE_DETECT_WIDTH},iw)':-2:flags=bilinear,select='gt(scene,{threshold})+eq(n,0)',showinfo")
+}
+
+/// One scene-detection pass over `path`: the cut times and whether ffmpeg ended cleanly.
+/// [`detect_scenes`] has always answered with whatever the log held, so a run that failed
+/// reads as "no cuts"; the flag is what lets a caller with somewhere else to read tell. A run
+/// that goes [`READ_STALL`] without a word is killed and is an error, not a short list of cuts.
+fn scene_pass(path: &Path, threshold: f64) -> Result<(Vec<f64>, bool)> {
     use std::sync::atomic::Ordering;
 
     let bin = ffmpeg_bin();
-    let filter = format!("scale='min({SCENE_DETECT_WIDTH},iw)':-2:flags=bilinear,select='gt(scene,{threshold})',showinfo");
+    let filter = scene_filter(threshold);
     // Probed before queueing: a hung probe must not hold the one heavy-job slot.
     let hw = decode_hwaccel_for(path, Reading::Whole);
     // The whole file is decoded, so this queues behind any other heavy job.
     let cpu = cpu::lease();
     let run = |hw: Option<&str>| {
-        let mut cmd = bg_command(&bin);
-        cpu::limit_cmd(&mut cmd, cpu.threads());
-        cmd.args(["-hide_banner", "-nostats"]);
+        let mut args: Vec<String> = vec!["-hide_banner".into(), "-nostats".into()];
         if let Some(hw) = hw {
-            cmd.args(["-hwaccel", hw]);
+            args.extend(["-hwaccel".into(), hw.into()]);
         }
-        cmd.arg("-i")
-            .arg(path)
-            .args(["-map", "0:v:0?", "-vf", &filter, "-f", "null", "-"])
-            .stdout(Stdio::null())
-            .output()
-            .map_err(|e| launch_err(&bin, e))
+        args.extend(["-i".into(), path.to_string_lossy().into_owned()]);
+        args.extend(["-map", "0:v:0?", "-vf", &filter, "-f", "null", "-"].map(String::from));
+        cpu::limit_args(&mut args, cpu.threads());
+        let mut cmd = bg_command(&bin);
+        cmd.args(PROGRESS_ON_STDERR).args(&args);
+        output_unless_stalled(cmd, READ_STALL).map_err(|e| launch_err(&bin, e))
     };
     let output = match hw.as_deref() {
         Some(h) => {
             let out = run(Some(h))?;
-            if out.status.success() {
+            if out.succeeded() {
                 out
             } else {
                 let sw = run(None)?;
-                if sw.status.success() {
+                if sw.succeeded() {
                     HWACCEL_OK.store(false, Ordering::Relaxed);
                     tracing::warn!("hardware decode failed during scene detection; using software decode");
                 }
@@ -1328,12 +1761,26 @@ pub fn detect_scenes(path: &Path, threshold: f64) -> Result<Vec<f64>> {
         }
         None => run(None)?,
     };
-    Ok(parse_scenes(&String::from_utf8_lossy(&output.stderr)))
+    if output.stalled {
+        return Err(Error::Engine(format!(
+            "scene detection stalled: ffmpeg said nothing for {}s reading {}: {}",
+            READ_STALL.as_secs(),
+            path.display(),
+            output.stderr_tail()
+        )));
+    }
+    Ok((parse_scenes(&output.stderr), output.status.success()))
 }
 
+/// The cut times in a scene pass's `showinfo` log. Its first line (`n:0`, showinfo's own count of
+/// the frames that reached it) is frame 0, which the pass lets through to keep ffmpeg reporting
+/// and which never scores as a cut: not a cut.
 fn parse_scenes(stderr: &str) -> Vec<f64> {
     let mut times = Vec::new();
     for line in stderr.lines() {
+        if field_after(line, "] n:") == Some(0.0) {
+            continue;
+        }
         if let Some(t) = field_after(line, "pts_time:") {
             times.push(t);
         }
@@ -1752,16 +2199,19 @@ pub fn contact_sheet(
     // making it wait out a ten-minute render would read as a hung server. It
     // still runs thread-capped and at background priority.
     cpu::limit_args(&mut args, cpu::budget_threads());
-    let output = bg_command(&bin)
-        .args(&args)
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| launch_err(&bin, e))?;
-    if !output.status.success() || output.stdout.is_empty() {
-        return Err(Error::Engine(format!(
-            "could not build contact sheet: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+    let mut cmd = bg_command(&bin);
+    cmd.args(PROGRESS_ON_STDERR).args(&args);
+    // `tile` outputs the one frame when the window has been decoded, and ffmpeg reports nothing
+    // before: the bound grows with the window (see `sheet_stall`).
+    let stall = sheet_stall(end - start);
+    let output = output_unless_stalled(cmd, stall).map_err(|e| launch_err(&bin, e))?;
+    if !output.succeeded() || output.stdout.is_empty() {
+        let why = if output.stalled {
+            format!("ffmpeg said nothing for {}s: {}", stall.as_secs(), output.stderr_tail())
+        } else {
+            output.stderr.trim().to_string()
+        };
+        return Err(Error::Engine(format!("could not build contact sheet: {why}")));
     }
     Ok((output.stdout, times))
 }
@@ -1804,7 +2254,15 @@ fn build_contact_sheet_args(
     let rate = if window > 0.0 { cells as f64 / window } else { 1.0 };
     // HDR sources are tone-mapped per cell, after the downscale, before the tile.
     let tone = tonemap.map(|t| format!("{t},")).unwrap_or_default();
-    let vf = format!("fps={rate},scale={cell_width}:-2:flags=bilinear,{tone}tile={columns}x{rows}");
+    // A head-padded proxy opens with a clone of its first frame, which the original has no
+    // counterpart for: read from the very start (a seek to 0.000 keeps it) it would take a
+    // slot of its own and push every cell one over. Any later seek has skipped it already.
+    let unpad = if start < 0.0005 && is_head_padded_proxy(path) {
+        "trim=start_frame=1,"
+    } else {
+        ""
+    };
+    let vf = format!("{unpad}fps={rate},scale={cell_width}:-2:flags=bilinear,{tone}tile={columns}x{rows}");
     let args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
@@ -2095,8 +2553,8 @@ pub fn set_proxy_base_width(width: u32) {
 
 /// The proxy width for an asset when flat proxies are `base` wide (pure,
 /// unit-tested): `base` itself, or for a spherical source the same ratio the
-/// default has (3072 for 1280), never past [`PROXY_MAX_WIDTH_SPHERICAL`] — the
-/// hardware H.264 encoders stop at 4096 across and one refusal turns them all off.
+/// default has (3072 for 1280), never past [`PROXY_MAX_WIDTH_SPHERICAL`]. (The cap dates from
+/// proxies that were hardware-encoded, which stops at 4096 across; it stays.)
 pub fn proxy_width_for(projection: Option<Projection>, base: u32) -> u32 {
     if projection.is_some_and(|p| p.is_spherical()) {
         (base.saturating_mul(PROXY_MAX_WIDTH_SPHERICAL) / PROXY_MAX_WIDTH).min(PROXY_MAX_WIDTH_SPHERICAL)
@@ -2270,45 +2728,50 @@ fn quality_args(vc: &str, crf: u32) -> Vec<String> {
         EncFamily::Nvenc => vec![s("-rc"), s("vbr"), s("-cq"), crf.to_string(), s("-b:v"), s("0")],
         EncFamily::Qsv => vec![s("-global_quality"), crf.to_string()],
         EncFamily::VideoToolbox => vec![s("-q:v"), crf_to_vt_quality(crf).to_string()],
+        // The QP is the CRF's number, not `hw_qp`'s: this spells the stitch, a source that is
+        // decoded again, where the extra bits cost disk and not picture. The export is what
+        // the offset is for.
         EncFamily::Amf => {
             let qp = crf.to_string();
             vec![s("-rc"), s("cqp"), s("-qp_i"), qp.clone(), s("-qp_p"), qp]
         }
+        EncFamily::Vaapi => unreachable!("a stitch or a proxy has no upload for a VAAPI encoder"),
     }
 }
 
 /// Encoder input pixel format: the hardware encoders all take `nv12` (some take
 /// nothing else), the software path keeps its historical `yuv420p`. Both are
-/// 4:2:0, so the decoded proxy looks the same either way.
+/// 4:2:0, so the decoded proxy looks the same either way. (A VAAPI encoder is fed by an
+/// upload the export graph ends in, which a stitch and a proxy do not have.)
 fn encode_pix_fmt(vc: &str) -> &'static str {
-    if enc_family(vc) == EncFamily::Software {
-        "yuv420p"
-    } else {
-        "nv12"
+    match enc_family(vc) {
+        EncFamily::Software => "yuv420p",
+        EncFamily::Vaapi => unreachable!("a stitch or a proxy has no upload for a VAAPI encoder"),
+        _ => "nv12",
     }
 }
 
-/// The hardware H.264 encoder to generate proxies with, when one is available
-/// and hardware encoding hasn't been disabled or found broken. H.264 rather
-/// than HEVC because every proxy width (≤3072) sits inside even H.264 NVENC's
-/// 4096-wide ceiling, and H.264 decodes cheapest — which is the whole point of
-/// a scrubbing proxy.
-fn proxy_hw_encoder() -> Option<&'static str> {
-    if !HW_ENCODE_OK.load(std::sync::atomic::Ordering::Relaxed) {
-        return None;
-    }
-    HW_ENCODER_CANDIDATES
-        .iter()
-        .find(|e| e.starts_with("h264_") && hw_encoders().iter().any(|h| h == *e))
-        .copied()
+/// The proxy's argv as [`generate_proxy_with`] runs it: [`build_proxy_args`] with the encoder
+/// fixed to `libx264`. A proxy is never hardware-encoded, whatever encoders the machine has
+/// (pinned by a test over every combination of the other inputs).
+fn proxy_encode_args(
+    src: &str,
+    dst: &str,
+    threads: usize,
+    width: u32,
+    hw_decode: Option<&str>,
+    tonemap: Option<&str>,
+    head_pad: Option<&str>,
+) -> Vec<String> {
+    build_proxy_args(src, dst, threads, width, "libx264", hw_decode, tonemap, head_pad)
 }
 
 /// Build the ffmpeg argument list (pure, unit-tested) that transcodes `src` into
 /// an all-intra, audio-less preview proxy at `dst`, capped to `width` pixels
 /// across (see [`proxy_width`]) and using at most `threads` CPU threads.
-/// `encoder` is `libx264` or a detected hardware encoder (which offloads the
-/// whole background transcode to the GPU); `hw_decode` adds an input-side
-/// `-hwaccel`. `-g 1` makes every frame a keyframe, so a seek decodes
+/// `encoder` is `libx264`: [`generate_proxy_with`] never hands a proxy to a hardware
+/// encoder (the builder still spells their quality flags); `hw_decode` adds an
+/// input-side `-hwaccel`. `-g 1` makes every frame a keyframe, so a seek decodes
 /// exactly one frame (instant scrub even on long-GOP 4K/HEVC). fps and duration
 /// are left untouched — no `-r`, no `-t`, no trim — so a source time maps 1:1
 /// onto the proxy and a preview seek lands on the same frame the export (which
@@ -2500,67 +2963,47 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
     let traits = source_traits(src).unwrap_or_default();
     let tonemap = traits.hdr.map(tonemap_filter);
     let head_pad = needs_head_pad(traits.lead).then(fps_mode_flag);
-    let mut run = |encoder: &str, hw_decode: Option<&str>| -> Result<Streamed> {
-        let mut args = build_proxy_args(
-            src_str,
-            tmp_str,
-            threads,
-            width,
-            encoder,
-            hw_decode,
-            tonemap.as_deref(),
-            head_pad,
-        );
+    let mut run = |hw_decode: Option<&str>| -> Result<Streamed> {
+        let mut args = proxy_encode_args(src_str, tmp_str, threads, width, hw_decode, tonemap.as_deref(), head_pad);
         cpu::limit_args(&mut args, threads);
         run_ffmpeg_streamed(&bin, &args, duration, EXPORT_STALL, &mut *progress, cancel)
     };
-    // GPU encode (and decode) when available — a background proxy transcode
-    // then costs the CPU almost nothing. A failure falls back to the software
-    // pipeline once, and a hardware-*encoder* failure whose software retry
-    // succeeds disables hardware encodes for the rest of the process.
-    // A padded proxy is encoded from a graph whose output has no frame rate (its
-    // `interleave` hands the encoder microsecond timestamps), which a hardware
-    // encoder may refuse — and one refusal turns hardware encoding off for the
-    // whole process. These sources are rare and the encode is the same all-intra
-    // x264 pass, so they never ask.
-    let hw_enc = if head_pad.is_some() { None } else { proxy_hw_encoder() };
+    // The decode is the GPU's when there is one; the encode never is. A hardware H.264 intra
+    // pass costs the same wall time as x264's (1.85 s against 1.90 s for 8 s of 4K), saves
+    // about 0.4 CPU-s, writes proxies a third larger, and one refusal used to turn hardware
+    // encoding off for the whole process. A decode failure falls back to software once.
     let hw_dec = decode_hwaccel_for(src, Reading::Whole);
-    let mut output = run(hw_enc.unwrap_or("libx264"), hw_dec.as_deref())?;
+    let mut output = run(hw_dec.as_deref())?;
     if output.outcome == StreamOutcome::Cancelled {
         let _ = std::fs::remove_file(&tmp);
         return Err(Error::Cancelled);
     }
-    if retry_proxy_in_software(output.outcome, output.status.success(), hw_enc.is_some(), hw_dec.is_some()) {
+    if retry_proxy_in_software(output.outcome, output.status.success(), hw_dec.is_some()) {
         let _ = std::fs::remove_file(&tmp);
         let err = if output.outcome == StreamOutcome::Stalled {
-            // A hardware encoder or decoder that hangs is as broken as one that refuses, and
-            // costs five minutes a proxy to find out: turn it off for the process, like any
-            // other hardware failure, and go again in software.
-            if hw_enc.is_some() {
-                HW_ENCODE_OK.store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-            if hw_dec.is_some() {
-                disable_decode_hwaccel();
-            }
+            // A hardware decoder that hangs is as broken as one that refuses, and costs five
+            // minutes a proxy to find out: turn it off for the process, like any other
+            // hardware failure, and go again in software.
+            disable_decode_hwaccel();
             format!("ffmpeg stopped reporting progress for {}s", EXPORT_STALL.as_secs())
         } else {
             output.stderr.trim().to_string()
         };
-        output = run("libx264", None)?;
+        output = run(None)?;
         if output.outcome == StreamOutcome::Cancelled {
             let _ = std::fs::remove_file(&tmp);
             return Err(Error::Cancelled);
         }
         if output.status.success() {
-            let blame =
-                blame_after_software_success(hw_enc.is_some(), hw_dec.is_some(), looks_like_hardware_decode_failure(&err));
-            if blame.encode {
-                HW_ENCODE_OK.store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-            if blame.decode {
+            // The decoder is the culprit only if the failure reads as a hardware one: a named
+            // accelerator such as `d3d11va` exits non-zero on a machine with no device, where
+            // `auto` fell back quietly, so without this every proxy would pay a failed launch
+            // first; a full disk or a bad file must not turn it off for the process. (A
+            // *stall* is convicted before the rerun, as it always was.)
+            if looks_like_hardware_decode_failure(&err) {
                 convict_hardware_decode();
             }
-            tracing::warn!(error = %err, "hardware-accelerated proxy encode failed; using software");
+            tracing::warn!(error = %err, "hardware-accelerated proxy decode failed; using software");
         }
     }
     if output.outcome == StreamOutcome::Stalled {
@@ -2586,34 +3029,11 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
     })
 }
 
-/// Which hardware a software rerun that succeeded convicts (pure, unit-tested). The rerun
-/// changes the encoder *and* the decoder, so with both in use there is no telling which one
-/// failed: the encoder is blamed, as it always was, and the next proxy — no longer offered one —
-/// finds out about the decoder. With only a decoder in use it is the culprit **if the failure
-/// reads as a hardware one** (`decoder_message`: the first run's error text through
-/// `looks_like_hardware_decode_failure`) — a named accelerator such as `d3d11va` exits non-zero
-/// on a machine with no device, where `auto` fell back quietly, so without this every proxy would
-/// pay a failed launch first; a failure that is not the decoder's (a full disk, a bad file) must
-/// not turn it off for the process. (A *stall* is convicted before the rerun, as it always was.)
-fn blame_after_software_success(hw_encode: bool, hw_decode: bool, decoder_message: bool) -> Blame {
-    Blame {
-        encode: hw_encode,
-        decode: hw_decode && !hw_encode && decoder_message,
-    }
-}
-
-/// What to stop asking for: see [`blame_after_software_success`].
-#[derive(Debug, PartialEq, Eq)]
-struct Blame {
-    encode: bool,
-    decode: bool,
-}
-
-/// Whether a proxy encode that went through hardware is run again in software (pure,
+/// Whether a proxy encode that used hardware decode is run again in software (pure,
 /// unit-tested): when it failed on its own **or stalled** — a cancelled one is not a failure,
 /// and an encode that was software already has nothing to fall back to.
-fn retry_proxy_in_software(outcome: StreamOutcome, success: bool, hw_encode: bool, hw_decode: bool) -> bool {
-    !success && matches!(outcome, StreamOutcome::Ended | StreamOutcome::Stalled) && (hw_encode || hw_decode)
+fn retry_proxy_in_software(outcome: StreamOutcome, success: bool, hw_decode: bool) -> bool {
+    !success && matches!(outcome, StreamOutcome::Ended | StreamOutcome::Stalled) && hw_decode
 }
 
 /// How a streamed ffmpeg run ended.
@@ -3150,6 +3570,10 @@ impl Container {
                 "hevc_videotoolbox",
                 "h264_amf",
                 "hevc_amf",
+                "av1_amf",
+                "h264_vaapi",
+                "hevc_vaapi",
+                "av1_vaapi",
             ],
             Self::Mov => &[
                 "prores_ks",
@@ -3163,6 +3587,8 @@ impl Container {
                 "hevc_videotoolbox",
                 "h264_amf",
                 "hevc_amf",
+                "h264_vaapi",
+                "hevc_vaapi",
             ],
             Self::Mkv => &[
                 "libx264",
@@ -3179,8 +3605,12 @@ impl Container {
                 "hevc_videotoolbox",
                 "h264_amf",
                 "hevc_amf",
+                "av1_amf",
+                "h264_vaapi",
+                "hevc_vaapi",
+                "av1_vaapi",
             ],
-            Self::Webm => &["libvpx-vp9", "libsvtav1", "av1_nvenc", "av1_qsv"],
+            Self::Webm => &["libvpx-vp9", "libsvtav1", "av1_nvenc", "av1_qsv", "av1_amf", "av1_vaapi"],
             Self::Gif => &["gif"],
             _ => &[],
         }
@@ -3401,10 +3831,7 @@ impl Default for ExportOptions {
 /// The validated export range from `opts`, clamped to the timeline. `None`
 /// when absent or empty after clamping (which falls back to a full export).
 fn effective_range(timeline: &Timeline, opts: &ExportOptions) -> Option<(f64, f64)> {
-    let r = opts.range?;
-    let start = r.start.max(0.0);
-    let end = r.end.min(timeline.duration());
-    (end - start > 1e-9).then_some((start, end))
+    timeline.export_span(opts.range.map(|r| (r.start, r.end)))
 }
 
 /// Whether a bitrate token like "8M" / "2500k" / "800000" is well-formed.
@@ -3505,6 +3932,7 @@ enum EncFamily {
     Qsv,
     VideoToolbox,
     Amf,
+    Vaapi,
 }
 
 fn enc_family(vc: &str) -> EncFamily {
@@ -3516,8 +3944,41 @@ fn enc_family(vc: &str) -> EncFamily {
         EncFamily::VideoToolbox
     } else if vc.ends_with("_amf") {
         EncFamily::Amf
+    } else if vc.ends_with("_vaapi") {
+        EncFamily::Vaapi
     } else {
         EncFamily::Software
+    }
+}
+
+/// Whether the export hands `opts`' picture to a VAAPI encoder, which takes only frames
+/// uploaded to the device: the graph ends in `format=nv12,hwupload` and the argv names the
+/// device. (A GIF is paletted, so a VAAPI codec on one is ignored like any other.)
+fn uploads_to_vaapi(opts: &ExportOptions) -> bool {
+    opts.container != Container::Gif
+        && opts
+            .video_codec
+            .as_deref()
+            .is_some_and(|vc| enc_family(vc) == EncFamily::Vaapi)
+}
+
+/// At the x264 CRF's number a hardware H.264 / HEVC encoder's constant QP spends about twice
+/// the bits. Measured on a Radeon RX 7900 XT, 4K to 1080p, against a lossless render: x264
+/// medium CRF 20 is 5.59 MB / 45.1 dB where `h264_amf` at constant QP 20 (the old 1:1
+/// spelling) was 10.7 MB / 48.9 dB, and `h264_amf` / `hevc_amf` at QP 26 5.3-5.6 MB / 45.5-46.1 dB.
+const HW_QP_OFFSET: u32 = 6;
+
+/// AV1's quantiser index runs 0..255; the dialog's AV1 CRF scale (SVT-AV1's) 0..63.
+const AV1_QP_PER_CRF: u32 = 4;
+
+/// The constant QP an AMF or VAAPI encoder gets for the software-scale `crf` the options
+/// carry. The one AV1 point measured (`av1_amf` QP 90: 6.41 MB / 46.4 dB) sits on the
+/// high-quality side of x264 CRF 20; the rest of the AV1 line is the scale's slope.
+fn hw_qp(vc: &str, crf: u32) -> u32 {
+    if vc.starts_with("av1_") {
+        crf.saturating_mul(AV1_QP_PER_CRF).min(255)
+    } else {
+        crf.saturating_add(HW_QP_OFFSET).min(51)
     }
 }
 
@@ -3600,6 +4061,9 @@ pub fn validate_export(opts: &ExportOptions, has_video: bool, has_audio: bool) -
         if !PIX_FMTS.contains(&pf) {
             issues.push(format!("Unsupported pixel format \"{pf}\"."));
         }
+    }
+    if want_video && uploads_to_vaapi(opts) && !matches!(opts.pix_fmt.as_deref(), None | Some("yuv420p" | "nv12")) {
+        issues.push("VAAPI encoders take 8-bit 4:2:0 (yuv420p) here.".to_string());
     }
     if let Some(s) = opts.scaler.as_deref() {
         if !SCALERS.contains(&s) {
@@ -3984,6 +4448,10 @@ fn build_export_args_phase(
     // (matching the probe/frame calls); without `-nostats` the per-frame progress
     // lines would accumulate unbounded in memory for a long export.
     let mut args: Vec<String> = vec!["-y".to_string(), "-hide_banner".to_string(), "-nostats".to_string()];
+    if want_video && uploads_to_vaapi(opts) {
+        args.push("-vaapi_device".to_string());
+        args.push(VAAPI_DEFAULT_DEVICE.to_string());
+    }
     // Per-input fast-seek: an input-side `-ss` to each clip's source-window start
     // so ffmpeg decodes only the kept region instead of everything from t=0 — a
     // 20-subclip cut from a 1h source no longer decodes the hour 20 times over.
@@ -4015,8 +4483,9 @@ fn build_export_args_phase(
             args.push("-c:v".to_string());
             args.push(vc.to_string());
             push_video_opts(&mut args, opts, vc, pass, passlog);
-            // `-pix_fmt` must equal the graph terminal `format=`; gif is pal8.
-            if vc != "gif" {
+            // `-pix_fmt` must equal the graph terminal `format=`; gif is pal8, and a VAAPI
+            // encoder's frames are on the device, formatted by the graph's tail.
+            if vc != "gif" && enc_family(vc) != EncFamily::Vaapi {
                 args.push("-pix_fmt".to_string());
                 args.push(fmt.pix_fmt.clone());
             }
@@ -4136,16 +4605,26 @@ fn push_video_opts(args: &mut Vec<String>, opts: &ExportOptions, vc: &str, pass:
                     args.push(crf_to_vt_quality(n).to_string());
                 }
             }
-            // AMF: constant QP.
+            // AMF: constant QP, on the scale `hw_qp` maps the CRF to.
             EncFamily::Amf => {
                 args.push("-rc".to_string());
                 args.push("cqp".to_string());
                 if let Some(n) = opts.crf {
-                    let qp = n.to_string();
+                    let qp = hw_qp(vc, n).to_string();
                     args.push("-qp_i".to_string());
                     args.push(qp.clone());
                     args.push("-qp_p".to_string());
                     args.push(qp);
+                }
+            }
+            // VAAPI: constant QP too; `-global_quality` is what every VAAPI encoder
+            // reads it from (`-qp` exists on H.264 and HEVC only).
+            EncFamily::Vaapi => {
+                args.push("-rc_mode".to_string());
+                args.push("CQP".to_string());
+                if let Some(n) = opts.crf {
+                    args.push("-global_quality".to_string());
+                    args.push(hw_qp(vc, n).to_string());
                 }
             }
         },
@@ -4217,6 +4696,12 @@ fn push_video_opts(args: &mut Vec<String>, opts: &ExportOptions, vc: &str, pass:
                 args.push("-qp_p".to_string());
                 args.push("0".to_string());
             }
+            EncFamily::Vaapi => {
+                args.push("-rc_mode".to_string());
+                args.push("CQP".to_string());
+                args.push("-global_quality".to_string());
+                args.push("1".to_string());
+            }
         },
     }
 
@@ -4247,8 +4732,13 @@ fn push_video_opts(args: &mut Vec<String>, opts: &ExportOptions, vc: &str, pass:
                 args.push(p.clone());
             }
         }
-        // VideoToolbox / AMF have no `-preset` knob in this shape.
-        EncFamily::VideoToolbox | EncFamily::Amf => {}
+        // At one QP `h264_amf` came out 2 % smaller and 0.06 dB better with it (RX 7900 XT).
+        EncFamily::Amf => {
+            args.push("-quality".to_string());
+            args.push("quality".to_string());
+        }
+        // VideoToolbox and VAAPI have no `-preset` knob in this shape.
+        EncFamily::VideoToolbox | EncFamily::Vaapi => {}
     }
 
     // -tune: software x264 / x265 only. Emit only a tune the encoder accepts
@@ -4281,12 +4771,60 @@ pub struct PreviewFrame {
     pub time: f64,
     /// The frame as JPEG bytes.
     pub jpeg: Vec<u8>,
+    /// How far behind its slot on the wall-clock schedule the frame arrived, in seconds (0 when
+    /// it was early or on time). A stream that renders slower than it was asked to play grows
+    /// this frame by frame; a hiccup shows once and is gone.
+    pub late: f64,
 }
 
-/// Cap on the live preview's width. Playback has to composite, encode and ship a
-/// frame every ~40 ms, so it renders smaller than the drill-in still does — the
-/// preview pane is well under this on a normal window anyway.
+/// The width a playback stream renders at when the caller does not say.
 const PREVIEW_STREAM_WIDTH: u32 = 960;
+
+/// The widest and narrowest stream asked for. The top is the MCP frame tools' own cap and the
+/// preview's (`preview-size.ts`): the engine never scales a picture past its own width, so the
+/// bound is only on cost.
+pub const MAX_STREAM_WIDTH: u32 = 1920;
+pub const MIN_STREAM_WIDTH: u32 = 64;
+
+/// The fastest a stream plays. The webview paints at the display's rate, so frames past this
+/// are composited and shipped for nothing.
+pub const MAX_STREAM_FPS: f64 = 60.0;
+pub const MIN_STREAM_FPS: f64 = 1.0;
+
+/// What a playback stream is asked for. Both are optional: the caller that knows better (the
+/// preview, after the machine failed to keep up with the rate it was given) states them, and
+/// leaving them out means the timeline's own rate and the default width.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PlaybackRequest {
+    pub fps: Option<f64>,
+    pub max_width: Option<u32>,
+}
+
+/// What a stream really runs at, once [`PlaybackRequest`] is resolved.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlaybackParams {
+    pub fps: f64,
+    pub max_width: u32,
+}
+
+/// The frame rate and width a stream plays at.
+///
+/// An unstated rate is the timeline's own — the one the export would deliver, read from the
+/// cut as it renders (a muted track's footage does not set it) — held to
+/// [`MIN_STREAM_FPS`]`..=`[`MAX_STREAM_FPS`], so a 24 fps cut plays at 24 and a 60 fps one at 60
+/// instead of both at the 24 this once was. A stated rate is clamped to the same range, and an
+/// unusable one (not finite, not positive) is treated as unstated. An unstated width is
+/// [`PREVIEW_STREAM_WIDTH`]; a stated one is held to [`MIN_STREAM_WIDTH`]`..=`[`MAX_STREAM_WIDTH`].
+pub fn playback_params(timeline: &Timeline, assets: &[Asset], request: PlaybackRequest) -> PlaybackParams {
+    let stated = request.fps.filter(|f| f.is_finite() && *f > 0.0);
+    let fps = stated.unwrap_or_else(|| export_format(&timeline.for_render(), assets, &ExportOptions::default()).fps);
+    PlaybackParams {
+        fps: fps.clamp(MIN_STREAM_FPS, MAX_STREAM_FPS),
+        max_width: request
+            .max_width
+            .map_or(PREVIEW_STREAM_WIDTH, |w| w.clamp(MIN_STREAM_WIDTH, MAX_STREAM_WIDTH)),
+    }
+}
 
 /// JPEG quality (`-q:v`) for streamed frames: 2 is best, 31 worst. 6 is visually
 /// clean while keeping a 960px frame near 40 KB, so 30 fps costs ~1.2 MB/s over
@@ -4413,25 +4951,28 @@ fn next_jpeg(buf: &[u8]) -> Option<(usize, usize)> {
 /// is. One long-lived process decoding sequentially instead amortizes all of
 /// that, and the all-intra proxies keep each decode cheap.
 ///
-/// Frames are paced to `fps` against the wall clock rather than pushed as fast
+/// Frames are paced to the rate against the wall clock rather than pushed as fast
 /// as they render, which keeps the pipe (and so ffmpeg itself) throttled to real
 /// time instead of racing ahead and buffering the whole timeline. Each frame
 /// carries its timeline time so a caller following the audio clock can drop one
-/// that arrived too late to be worth showing.
-pub fn stream_preview(
+/// that arrived too late to be worth showing, and how late it was against the
+/// schedule, which is how a caller tells a hiccup from a stream that cannot keep
+/// up (see [`playback_params`] for what the rate and width default to).
+pub fn stream_preview_with(
     timeline: &Timeline,
     assets: &[Asset],
     start: f64,
-    fps: f64,
+    request: PlaybackRequest,
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
 ) -> Result<()> {
+    let params = playback_params(timeline, assets, request);
     // Whether the run that was spawned asked any input for hardware decode: none of a proxy's
     // inputs do, and a failure of a run that did not is not the hardware's.
     let mut hw = false;
     // `None` until ffmpeg is running: a timeline with nothing to play fails
     // before that, and says nothing about the hardware.
     let mut sent = None;
-    match stream_preview_once(timeline, assets, start, fps, on_frame, &mut sent, &mut hw) {
+    match stream_preview_once(timeline, assets, start, params, on_frame, &mut sent, &mut hw) {
         // A hardware decode that dies before the first frame is `-hwaccel`
         // being unusable here, not the graph: a static ffmpeg aborts outright
         // when `auto` probes a VAAPI whose libva isn't installed. Once frames
@@ -4440,10 +4981,25 @@ pub fn stream_preview(
         Err(e) if hw && sent == Some(0) => {
             HWACCEL_OK.store(false, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!("hardware decode failed starting playback; using software decode: {e}");
-            stream_preview_once(timeline, assets, start, fps, on_frame, &mut sent, &mut hw)
+            stream_preview_once(timeline, assets, start, params, on_frame, &mut sent, &mut hw)
         }
         r => r,
     }
+}
+
+/// [`stream_preview_with`] at a stated `fps` and the default width.
+pub fn stream_preview(
+    timeline: &Timeline,
+    assets: &[Asset],
+    start: f64,
+    fps: f64,
+    on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
+) -> Result<()> {
+    let request = PlaybackRequest {
+        fps: Some(fps),
+        max_width: None,
+    };
+    stream_preview_with(timeline, assets, start, request, on_frame)
 }
 
 /// How long a playback stream may go without producing a frame before it is
@@ -4469,13 +5025,13 @@ fn stream_preview_once(
     timeline: &Timeline,
     assets: &[Asset],
     start: f64,
-    fps: f64,
+    params: PlaybackParams,
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
     sent: &mut Option<u64>,
     hw_used: &mut bool,
 ) -> Result<()> {
-    let fps = fps.clamp(1.0, 60.0);
-    let mut args = build_preview_args(timeline, assets, start, fps, PREVIEW_STREAM_WIDTH, PREVIEW_STREAM_QUALITY)?;
+    let PlaybackParams { fps, max_width } = params;
+    let mut args = build_preview_args(timeline, assets, start, fps, max_width, PREVIEW_STREAM_QUALITY)?;
     // The composited graph outgrows argv just as the export's does.
     let _script = externalize_filter_complex(&mut args, "preview")?;
     // Hardware decode is per input, and a proxy (what the stream reads once one is ready) is
@@ -4486,7 +5042,7 @@ fn stream_preview_once(
     cpu::limit_args(&mut args, cpu::budget_threads());
 
     let bin = ffmpeg_bin();
-    tracing::debug!(start, fps, "starting preview stream");
+    tracing::debug!(start, fps, max_width, "starting preview stream");
     let child = command(&bin)
         .args(&args)
         .stdin(Stdio::null())
@@ -4560,12 +5116,19 @@ fn pump_preview(
             // look overdue and play the whole stream at a sprint.
             let t0 = *origin.get_or_insert_with(std::time::Instant::now);
             let due = std::time::Duration::from_secs_f64(index as f64 / fps);
-            if let Some(wait) = due.checked_sub(t0.elapsed()) {
-                std::thread::sleep(wait);
-            }
+            let late = match due.checked_sub(t0.elapsed()) {
+                Some(wait) => {
+                    std::thread::sleep(wait);
+                    0.0
+                }
+                // The first frame is the clock's origin, on time by definition.
+                None if index == 0 => 0.0,
+                None => (t0.elapsed() - due).as_secs_f64(),
+            };
             let frame = PreviewFrame {
                 time: start + index as f64 / fps,
                 jpeg,
+                late,
             };
             index += 1;
             *sent = Some(index);
@@ -4721,11 +5284,26 @@ fn retry_export_in_software(
 }
 
 /// Tune a built export argv for the process about to be spawned: each input's `-hwaccel` per
-/// `decode_policy` (on Windows `auto` becomes `d3d11va` for H.264 and HEVC), the threads left
-/// to [`run_ffmpeg_progress`]. The builders emit the options as given. Returns whether any input
+/// `decode_policy` (on Windows `auto` becomes `d3d11va` for H.264 and HEVC), a VAAPI export's
+/// device swapped for the render node the probe verified, the threads left to
+/// [`run_ffmpeg_progress`]. The builders emit the options as given. Returns whether any input
 /// still asks for hardware decode.
 fn tune_export_args(args: &mut Vec<String>, assets: &[Asset], os: HostOs) -> bool {
+    if args.iter().any(|a| a == "-vaapi_device") {
+        set_vaapi_device(args, vaapi_device_within(VAAPI_DEVICE_WAIT));
+    }
     tune_inputs(args, os, Reading::Whole, &facts_from_assets(assets)).hw
+}
+
+/// Point a built argv's `-vaapi_device` at `device`, when the probe found one (pure). Without
+/// one the builder's stand-in stays, and the export fails with ffmpeg's own words for it.
+fn set_vaapi_device(args: &mut [String], device: Option<&str>) {
+    let (Some(device), Some(at)) = (device, args.iter().position(|a| a == "-vaapi_device")) else {
+        return;
+    };
+    if let Some(value) = args.get_mut(at + 1) {
+        *value = device.to_string();
+    }
 }
 
 /// One delivery of a multi-format export: the frame and where its file goes.
@@ -5437,14 +6015,17 @@ fn build_filter_complex_metered(
         ));
         let mut cur = "vbase".to_string();
         let draw = !timeline.overlays.is_empty();
+        // The picture ends on `[outv]`, or on `vhw` when a VAAPI encoder's upload follows.
+        let vaapi = uploads_to_vaapi(opts);
+        let final_pad = if vaapi { "vhw" } else { "outv" };
         // The composite lands on `vcomp` for gif (palettegen follows), on `vtext`
-        // when text overlays will be drawn on top, else directly on `[outv]`.
+        // when text overlays will be drawn on top, else directly on `final_pad`.
         let composite_pad = if draw {
             "vtext"
         } else if gif {
             "vcomp"
         } else {
-            "outv"
+            final_pad
         };
         let last = video.len() - 1;
         for (n, (flat, input, clip)) in video.iter().enumerate() {
@@ -5513,7 +6094,7 @@ fn build_filter_complex_metered(
         if draw {
             let mut tcur = composite_pad.to_string();
             let last_o = timeline.overlays.len() - 1;
-            let text_final = if gif { "vcomp" } else { "outv" };
+            let text_final = if gif { "vcomp" } else { final_pad };
             for (oi, ov) in timeline.overlays.iter().enumerate() {
                 let out = if oi == last_o {
                     text_final.to_string()
@@ -5537,6 +6118,9 @@ fn build_filter_complex_metered(
             chains.push("[vcomp]split[gpsrc][gpuse]".to_string());
             chains.push("[gpsrc]palettegen=stats_mode=diff[gpal]".to_string());
             chains.push(format!("[gpuse][gpal]paletteuse=dither={dither}[outv]"));
+        }
+        if vaapi {
+            chains.push("[vhw]format=nv12,hwupload[outv]".to_string());
         }
     }
 
@@ -7116,9 +7700,9 @@ fn build_still_args(
     let asset_of = |id| assets.iter().find(|a: &&Asset| a.id == id);
 
     // Active video clips at `t`, in composite order (tracks in list order, clips
-    // within a track in timeline order), paired with their source time. The GPU
-    // compositor's `RenderPlan` is built from the same list, less the clips a
-    // transition keeps on screen past their end (which it refuses).
+    // within a track in timeline order), paired with their source time, the clips a
+    // transition keeps on screen past their end included. The `RenderPlan` a compositor
+    // draws from is built from the same list.
     let active = still_layers(timeline, assets, fmt.fps, t);
 
     let mut args: Vec<String> = vec!["-hide_banner".to_string(), "-loglevel".to_string(), "error".to_string()];
@@ -7532,6 +8116,10 @@ mod keyed_zoom;
 #[cfg(test)]
 mod keyed_channels;
 
+/// Scene detection and contact sheets on a proxy against the original (`#[ignore]`d).
+#[cfg(test)]
+mod scenes_on_proxy;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7654,13 +8242,17 @@ mod tests {
 
     #[test]
     fn parses_scene_times() {
+        // `n:0` is frame 0, which the pass lets through to keep ffmpeg reporting: not a cut.
         let log = "\
-[Parsed_showinfo_1 @ 0x1] n:0 pts:0 pts_time:0 duration_time:0.04
-[Parsed_showinfo_1 @ 0x1] n:1 pts:720 pts_time:30.0 duration_time:0.04
-[Parsed_showinfo_1 @ 0x1] n:2 pts:1800 pts_time:75.5 duration_time:0.04
+[Parsed_showinfo_1 @ 0x1] n:   0 pts:0 pts_time:0 duration_time:0.04
+[Parsed_showinfo_1 @ 0x1] n:   1 pts:720 pts_time:30.0 duration_time:0.04
+[Parsed_showinfo_1 @ 0x1] n:   2 pts:1800 pts_time:75.5 duration_time:0.04
 ";
         let scenes = parse_scenes(log);
-        assert_eq!(scenes, vec![0.0, 30.0, 75.5]);
+        assert_eq!(scenes, vec![30.0, 75.5]);
+        // A log of frame 0 alone (a single take) has no cut; a run that logged nothing none either.
+        assert!(parse_scenes("[Parsed_showinfo_1 @ 0x1] n:0 pts:0 pts_time:0 duration_time:0.04\n").is_empty());
+        assert!(parse_scenes("").is_empty());
     }
 
     #[test]
@@ -7941,6 +8533,181 @@ mod tests {
         let ok = probe_source_traits(&script("ok", &format!("echo '{json}'")), file, limit).expect("an answer");
         assert_eq!((ok.hdr, ok.indexed), (Some(Hdr::Pq), true));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_proxy_stands_in_for_an_sdr_yuv_mp4_or_matroska_source_and_for_nothing_else() {
+        let traits_of = |format: &str, transfer: &str, pix_fmt: &str| {
+            parse_source_traits(&format!(
+                r#"{{"streams":[{{"color_transfer":"{transfer}","pix_fmt":"{pix_fmt}"}}],"format":{{"format_name":"{format}"}}}}"#
+            ))
+        };
+        let traits = |format: &str, transfer: &str| traits_of(format, transfer, "yuv420p");
+        let (yes, picture) = (
+            ProxyFidelity {
+                times: true,
+                scores: true,
+            },
+            ProxyFidelity {
+                times: true,
+                scores: false,
+            },
+        );
+        assert_eq!(fidelity_of(traits("mov,mp4,m4a,3gp,3g2,mj2", "bt709")), yes);
+        assert_eq!(fidelity_of(traits("matroska,webm", "")), yes);
+        // HDR: times hold, but the scores are taken in HLG / PQ code values and the proxy is SDR.
+        assert_eq!(fidelity_of(traits("mov,mp4,m4a,3gp,3g2,mj2", "arib-std-b67")), picture);
+        assert_eq!(fidelity_of(traits("matroska,webm", "smpte2084")), picture);
+        // Every YCbCr layout keeps its luma alone in plane 0, which is what the scene filter scores.
+        for pix_fmt in [
+            "yuv420p10le",
+            "yuvj420p",
+            "yuv422p10le",
+            "yuv444p12le",
+            "gray",
+            "gray10le",
+            "nv12",
+        ] {
+            assert_eq!(
+                fidelity_of(traits_of("mov,mp4,m4a,3gp,3g2,mj2", "bt709", pix_fmt)),
+                yes,
+                "{pix_fmt}"
+            );
+        }
+        // RGB (G plane, or every interleaved byte), packed YCbCr, a palette, alpha and a name nobody
+        // knows are scored on something else than the proxy's luma.
+        for pix_fmt in [
+            "gbrp", "gbrp10le", "rgb24", "bgr24", "bgr0", "rgb48le", "yuyv422", "uyvy422", "pal8", "yuva420p", "rgba", "",
+            "newfmt",
+        ] {
+            assert_eq!(
+                fidelity_of(traits_of("mov,mp4,m4a,3gp,3g2,mj2", "bt709", pix_fmt)),
+                picture,
+                "{pix_fmt}"
+            );
+            assert_eq!(fidelity_of(traits_of("matroska,webm", "", pix_fmt)), picture, "{pix_fmt}");
+        }
+        // A transport stream's proxy is `lead` off when its video starts late; the others are unproven.
+        for other in ["mpegts", "avi", "mpeg", "flv", "mxf", "h264"] {
+            assert_eq!(fidelity_of(traits(other, "bt709")), ProxyFidelity::default(), "{other}");
+        }
+        // A failed probe trusts nothing.
+        assert_eq!(fidelity_of(SourceTraits::default()), ProxyFidelity::default());
+    }
+
+    #[test]
+    fn the_progress_report_is_told_from_the_log() {
+        for line in [
+            "frame=120",
+            "fps=0.0",
+            "stream_0_0_q=-0.0",
+            "out_time_us=4000000",
+            "out_time=00:00:04.000000",
+            "progress=end",
+            "speed=N/A",
+        ] {
+            assert!(is_progress_line(line), "{line}");
+        }
+        for line in [
+            "[Parsed_showinfo_1 @ 0x1] n:   4 pts:  4 pts_time:4 fmt:yuv420p",
+            "Error opening input file x.mp4.",
+            "x.mp4: Invalid data found when processing input",
+            "key=value without being ffmpeg's",
+            "",
+        ] {
+            assert!(!is_progress_line(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_silence_a_read_may_keep_grows_with_the_work_between_a_floor_and_a_ceiling() {
+        use std::time::Duration as D;
+        let secs = |window: f64| sheet_stall(window).as_secs_f64();
+        // Start-up and a short window get the floor: a minute.
+        assert_eq!((secs(0.0), secs(1.0), secs(2.0)), (60.0, 60.0, 60.0));
+        // A longer window is decoded for longer before `tile` says anything: 30 s per second of footage.
+        assert_eq!((secs(10.0), secs(60.0)), (300.0, 1800.0));
+        // Wedged is still finite, and nonsense (a negative or unknown duration) falls back to the floor.
+        assert_eq!(secs(1e9), 2.0 * 3600.0);
+        assert_eq!((secs(-5.0), secs(f64::NAN)), (60.0, 60.0));
+        assert_eq!(secs(f64::INFINITY), 60.0);
+        assert_eq!(
+            stall_for_work(4.0, 0.5, D::from_millis(100), D::from_secs(10)),
+            D::from_secs(2)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_that_is_busy_and_silent_is_not_killed_within_its_bound() {
+        use std::time::Duration as D;
+        let busy = || {
+            let mut cmd = Command::new("sh");
+            // Silent for 1.2 s, then the whole answer on stdout: a contact sheet's shape.
+            cmd.args(["-c", "sleep 1.2; printf sheet"]);
+            cmd
+        };
+        // A 4 s window at half a second of silence per second of footage: two seconds is enough...
+        let bound = stall_for_work(4.0, 0.5, std::time::Duration::from_millis(100), D::from_secs(10));
+        let done = output_unless_stalled(busy(), bound).unwrap();
+        assert!(done.succeeded() && !done.stalled, "{:?}", done.stderr);
+        assert_eq!(done.stdout, b"sheet");
+        // ...and with no window to scale by, the floor alone kills the same child.
+        let floor_only = stall_for_work(0.0, 0.5, std::time::Duration::from_millis(100), D::from_secs(10));
+        let killed = output_unless_stalled(busy(), floor_only).unwrap();
+        assert!(killed.stalled && killed.stdout.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_that_goes_quiet_is_killed_and_one_that_reports_is_not() {
+        let sh = |script: &str| {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", script]);
+            cmd
+        };
+        // Quiet: a child that never writes (a wedged decoder) is killed at the bound, not waited for.
+        let started = Instant::now();
+        let quiet = output_unless_stalled(
+            sh("echo warming up >&2; echo frame=1 >&2; sleep 30"),
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap();
+        assert!(quiet.stalled && !quiet.succeeded());
+        // What it had said is kept for the error message (without the progress lines).
+        assert_eq!(quiet.stderr_tail(), "warming up");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // Reporting: each line of stderr is a word, so a long run that keeps talking is not cut off,
+        // and the progress lines are not in the text the caller reads errors from.
+        let talking = output_unless_stalled(
+            sh("for i in 1 2 3 4 5 6; do echo frame=$i >&2; sleep 0.1; done; echo oops >&2; printf out"),
+            std::time::Duration::from_millis(400),
+        )
+        .unwrap();
+        assert!(talking.succeeded(), "{:?}", talking.stderr);
+        assert_eq!((talking.stdout.as_slice(), talking.stderr.as_str()), (&b"out"[..], "oops\n"));
+        // A failure is a failure, not a stall.
+        let failed = output_unless_stalled(sh("echo bad >&2; exit 3"), std::time::Duration::from_secs(5)).unwrap();
+        assert!(!failed.stalled && !failed.succeeded());
+        assert_eq!(failed.stderr, "bad\n");
+    }
+
+    #[test]
+    fn a_contact_sheet_drops_the_head_pad_clone_when_it_reads_from_the_start_only() {
+        let padded = "/home/u/.cache/kerf/proxies/0123456789abcdef.lead.mp4";
+        let plain = "/home/u/.cache/kerf/proxies/0123456789abcdef.mp4";
+        let vf = |path: &str, start: f64| {
+            let (args, _) = build_contact_sheet_args(path, start, start + 8.0, 4, 2, 160, 3, None);
+            args[args.iter().position(|a| a == "-vf").unwrap() + 1].clone()
+        };
+        // A seek to 0.000 keeps pts 0, the clone with it: it would take a slot of its own.
+        assert!(vf(padded, 0.0).starts_with("trim=start_frame=1,fps="), "{}", vf(padded, 0.0));
+        assert!(vf(padded, 0.0004).starts_with("trim=start_frame=1,fps="));
+        // Any later seek has skipped it already, and dropping a frame there would drop a real one.
+        assert!(vf(padded, 0.5).starts_with("fps="));
+        // An ordinary proxy and an original have no clone: their argv is what it always was.
+        assert!(vf(plain, 0.0).starts_with("fps="));
+        assert!(vf("/media/clip.lead.mp4", 0.0).starts_with("fps="));
     }
 
     #[test]
@@ -8402,21 +9169,6 @@ mod tests {
         assert_eq!(hwaccel_for_asset(Some("none".into()), HostOs::Windows, &h264), None);
         let proxy = at_path(PROXY_PATH, "h264", "yuv420p");
         assert_eq!(hwaccel_for_asset(auto(), HostOs::Windows, &proxy), None);
-    }
-
-    #[test]
-    fn a_software_rerun_that_works_convicts_the_hardware_that_was_in_use() {
-        let blame = |encode, decode| Blame { encode, decode };
-        // A decoder alone is the culprit when the failure reads as the hardware's ...
-        assert_eq!(blame_after_software_success(false, true, true), blame(false, true));
-        // ... and not when it does not (a full disk that the rerun happened to dodge).
-        assert_eq!(blame_after_software_success(false, true, false), blame(false, false));
-        // An encoder alone, as ever.
-        assert_eq!(blame_after_software_success(true, false, false), blame(true, false));
-        // Both: the encoder is blamed and the next proxy, offered no encoder, finds out about the
-        // decoder.
-        assert_eq!(blame_after_software_success(true, true, true), blame(true, false));
-        assert_eq!(blame_after_software_success(false, false, true), blame(false, false));
     }
 
     #[test]
@@ -9003,20 +9755,19 @@ mod tests {
     }
 
     #[test]
-    fn a_hardware_proxy_that_stalls_is_retried_in_software_like_one_that_fails() {
+    fn a_hardware_decoded_proxy_that_stalls_is_retried_in_software_like_one_that_fails() {
         use StreamOutcome::*;
-        // Failed on its own or stalled, through hardware: go again in software.
-        assert!(retry_proxy_in_software(Ended, false, true, false));
-        assert!(retry_proxy_in_software(Ended, false, false, true));
+        // Failed on its own or stalled, through hardware decode: go again in software.
+        assert!(retry_proxy_in_software(Ended, false, true));
         assert!(
-            retry_proxy_in_software(Stalled, false, true, true),
-            "a hung hardware encoder is as broken as a refusing one"
+            retry_proxy_in_software(Stalled, false, true),
+            "a hung hardware decoder is as broken as a refusing one"
         );
         // Not when it worked, when the user cancelled, or when it was software already.
-        assert!(!retry_proxy_in_software(Ended, true, true, true));
-        assert!(!retry_proxy_in_software(Cancelled, false, true, true));
-        assert!(!retry_proxy_in_software(Stalled, false, false, false));
-        assert!(!retry_proxy_in_software(Ended, false, false, false));
+        assert!(!retry_proxy_in_software(Ended, true, true));
+        assert!(!retry_proxy_in_software(Cancelled, false, true));
+        assert!(!retry_proxy_in_software(Stalled, false, false));
+        assert!(!retry_proxy_in_software(Ended, false, false));
     }
 
     /// A child that says nothing is killed after the stall allowance, and a cancel kills one
@@ -12757,6 +13508,436 @@ mod tests {
     }
 
     #[test]
+    fn amf_crf_is_offset_onto_the_qp_scale_and_asks_for_quality() {
+        // x264 CRF 20 measured equal to constant QP 26 on h264_amf and hevc_amf, not QP 20.
+        for codec in ["h264_amf", "hevc_amf"] {
+            let args = args_of(&ExportOptions {
+                video_codec: Some(codec.into()),
+                crf: Some(20),
+                ..Default::default()
+            });
+            assert_eq!(flag_val(&args, "-rc"), Some("cqp"), "{codec}");
+            assert_eq!(flag_val(&args, "-qp_i"), Some("26"), "{codec}");
+            assert_eq!(flag_val(&args, "-qp_p"), Some("26"), "{codec}");
+            assert_eq!(flag_val(&args, "-quality"), Some("quality"), "{codec}");
+            assert!(!args.contains(&"-crf".to_string()));
+        }
+        // The AMF ranges are 0..51 (H.264, HEVC) and 0..255 (AV1): neither is run past.
+        assert_eq!(hw_qp("h264_amf", 20), 26);
+        assert_eq!(hw_qp("hevc_amf", 0), 6);
+        assert_eq!(hw_qp("hevc_amf", 51), 51);
+        assert_eq!(hw_qp("h264_amf", u32::MAX), 51);
+        assert_eq!(hw_qp("av1_amf", 30), 120);
+        assert_eq!(hw_qp("av1_amf", 63), 252);
+        assert_eq!(hw_qp("av1_amf", 200), 255);
+        assert_eq!(hw_qp("av1_vaapi", u32::MAX), 255);
+    }
+
+    #[test]
+    fn av1_amf_goes_in_mp4_mkv_and_webm_and_takes_the_av1_qp_scale() {
+        let args = args_of(&ExportOptions {
+            video_codec: Some("av1_amf".into()),
+            crf: Some(30),
+            ..Default::default()
+        });
+        assert_eq!(flag_val(&args, "-c:v"), Some("av1_amf"));
+        assert_eq!(flag_val(&args, "-qp_i"), Some("120"));
+        assert_eq!(flag_val(&args, "-quality"), Some("quality"));
+        assert_eq!(flag_val(&args, "-tag:v"), None, "AV1 takes no hvc1 tag");
+        for container in [Container::Mp4, Container::Mkv, Container::Webm] {
+            assert!(container.video_ok("av1_amf"), "{container:?}");
+        }
+        assert!(!Container::Mov.video_ok("av1_amf"));
+    }
+
+    #[test]
+    fn amf_lossless_and_bitrate_keep_their_spelling_and_gain_only_the_quality_preset() {
+        let lossless = args_of(&ExportOptions {
+            video_codec: Some("h264_amf".into()),
+            rate_control: RateControl::Lossless,
+            ..Default::default()
+        });
+        assert_eq!(flag_val(&lossless, "-qp_i"), Some("0"));
+        assert_eq!(flag_val(&lossless, "-quality"), Some("quality"));
+        let bitrate = args_of(&ExportOptions {
+            video_codec: Some("hevc_amf".into()),
+            rate_control: RateControl::Bitrate,
+            video_bitrate: Some("8M".into()),
+            ..Default::default()
+        });
+        assert_eq!(flag_val(&bitrate, "-b:v"), Some("8M"));
+        assert!(!bitrate.contains(&"-qp_i".to_string()));
+    }
+
+    #[test]
+    fn the_other_hardware_families_keep_their_one_to_one_crf() {
+        for (codec, flag) in [("h264_nvenc", "-cq"), ("hevc_qsv", "-global_quality")] {
+            let args = args_of(&ExportOptions {
+                video_codec: Some(codec.into()),
+                crf: Some(20),
+                ..Default::default()
+            });
+            assert_eq!(flag_val(&args, flag), Some("20"), "{codec}");
+            assert!(!args.contains(&"-quality".to_string()), "{codec}");
+        }
+    }
+
+    #[test]
+    fn a_vaapi_export_names_the_device_and_uploads_the_picture() {
+        let args = args_of(&ExportOptions {
+            video_codec: Some("h264_vaapi".into()),
+            crf: Some(20),
+            pix_fmt: Some("yuv420p".into()),
+            ..Default::default()
+        });
+        assert_eq!(flag_val(&args, "-vaapi_device"), Some(VAAPI_DEFAULT_DEVICE));
+        assert!(
+            args.iter().position(|a| a == "-vaapi_device").unwrap() < args.iter().position(|a| a == "-i").unwrap(),
+            "a global option, named ahead of the inputs"
+        );
+        let graph = flag_val(&args, "-filter_complex").unwrap();
+        assert!(
+            graph.contains("[vbase][v0]overlay=eof_action=pass:enable='between(t,0,10)'[vhw];[vhw]format=nv12,hwupload[outv];"),
+            "{graph}"
+        );
+        assert_eq!(graph.matches("[outv]").count(), 1, "one producer of the mapped pad: {graph}");
+        assert_eq!(flag_val(&args, "-c:v"), Some("h264_vaapi"));
+        assert_eq!(flag_val(&args, "-rc_mode"), Some("CQP"));
+        assert_eq!(flag_val(&args, "-global_quality"), Some("26"));
+        assert!(
+            !args.contains(&"-pix_fmt".to_string()),
+            "the device's frames are formatted by the graph"
+        );
+        assert!(!args.contains(&"-crf".to_string()) && !args.contains(&"-preset".to_string()));
+    }
+
+    #[test]
+    fn a_vaapi_export_with_text_uploads_after_the_titles() {
+        let asset = av_asset(Uuid::new_v4(), 30.0);
+        let mut timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
+        timeline.overlays = vec![TextOverlay::new("Hello", 1.0, 4.0)];
+        let args = build_export_args(
+            &timeline,
+            &[asset],
+            "/out/x",
+            &ExportOptions {
+                video_codec: Some("hevc_vaapi".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let graph = flag_val(&args, "-filter_complex").unwrap();
+        assert!(graph.contains("[vtext]"), "{graph}");
+        assert!(graph.contains("drawtext=") && graph.contains("[vhw];"), "{graph}");
+        assert!(graph.contains("[vhw]format=nv12,hwupload[outv]"), "{graph}");
+        assert_eq!(flag_val(&args, "-tag:v"), Some("hvc1"), "HEVC in mp4 keeps its tag");
+    }
+
+    #[test]
+    fn a_vaapi_codec_with_no_picture_to_upload_adds_nothing() {
+        for container in [Container::Gif, Container::Mp3] {
+            let args = args_of(&ExportOptions {
+                container,
+                video_codec: Some("h264_vaapi".into()),
+                ..Default::default()
+            });
+            assert!(!args.contains(&"-vaapi_device".to_string()), "{container:?}");
+            assert!(
+                !flag_val(&args, "-filter_complex").unwrap_or("").contains("hwupload"),
+                "{container:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exports_without_a_vaapi_codec_never_mention_it() {
+        for codec in [
+            None,
+            Some("libx264"),
+            Some("h264_amf"),
+            Some("h264_nvenc"),
+            Some("hevc_videotoolbox"),
+        ] {
+            let args = args_of(&ExportOptions {
+                video_codec: codec.map(String::from),
+                ..Default::default()
+            });
+            assert!(!args.contains(&"-vaapi_device".to_string()), "{codec:?}");
+            assert!(
+                !args.iter().any(|a| a.contains("hwupload") || a.contains("[vhw]")),
+                "{codec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vaapi_lossless_and_av1_use_the_device_quality_scale() {
+        let lossless = args_of(&ExportOptions {
+            video_codec: Some("hevc_vaapi".into()),
+            rate_control: RateControl::Lossless,
+            ..Default::default()
+        });
+        assert_eq!(flag_val(&lossless, "-global_quality"), Some("1"));
+        let av1 = args_of(&ExportOptions {
+            video_codec: Some("av1_vaapi".into()),
+            crf: Some(30),
+            ..Default::default()
+        });
+        assert_eq!(flag_val(&av1, "-global_quality"), Some("120"));
+        assert!(!av1.contains(&"-tag:v".to_string()));
+    }
+
+    #[test]
+    fn vaapi_is_validated_against_the_container_and_the_pixel_format() {
+        let ok = ExportOptions {
+            video_codec: Some("h264_vaapi".into()),
+            ..Default::default()
+        };
+        assert!(validate_export(&ok, true, true).is_empty());
+        for pix_fmt in ["yuv420p", "nv12"] {
+            let with = ExportOptions {
+                pix_fmt: Some(pix_fmt.into()),
+                ..ok.clone()
+            };
+            assert!(validate_export(&with, true, true).is_empty(), "{pix_fmt}");
+        }
+        let ten_bit = ExportOptions {
+            pix_fmt: Some("yuv420p10le".into()),
+            ..ok.clone()
+        };
+        assert_eq!(
+            validate_export(&ten_bit, true, true),
+            ["VAAPI encoders take 8-bit 4:2:0 (yuv420p) here."]
+        );
+        // Not a VAAPI export, so a 10-bit software one is left alone.
+        let software = ExportOptions {
+            video_codec: Some("libx265".into()),
+            pix_fmt: Some("yuv420p10le".into()),
+            ..Default::default()
+        };
+        assert!(validate_export(&software, true, true).is_empty());
+        let two_pass = ExportOptions {
+            rate_control: RateControl::TwoPass,
+            video_bitrate: Some("8M".into()),
+            ..ok
+        };
+        assert!(validate_export(&two_pass, true, true).iter().any(|i| i.contains("Two-pass")));
+        // H.264 and HEVC go in mov, AV1 does not; WebM takes AV1 only.
+        assert!(Container::Mov.video_ok("hevc_vaapi") && !Container::Mov.video_ok("av1_vaapi"));
+        assert!(Container::Webm.video_ok("av1_vaapi") && !Container::Webm.video_ok("h264_vaapi"));
+        assert!(Container::Mkv.video_ok("av1_vaapi") && Container::Mp4.video_ok("h264_vaapi"));
+    }
+
+    #[test]
+    fn the_probe_encode_matches_how_each_family_is_fed() {
+        let system = encoder_probe_args("h264_amf", None).join(" ");
+        assert_eq!(
+            system,
+            "-hide_banner -v error -f lavfi -i color=black:s=256x256:r=30:d=0.2 -frames:v 1 -pix_fmt nv12 -c:v h264_amf -f null -"
+        );
+        let vaapi = encoder_probe_args("hevc_vaapi", Some("/dev/dri/renderD129")).join(" ");
+        assert_eq!(
+            vaapi,
+            "-hide_banner -v error -vaapi_device /dev/dri/renderD129 -f lavfi -i color=black:s=256x256:r=30:d=0.2 \
+             -vf format=nv12,hwupload -frames:v 1 -c:v hevc_vaapi -f null -"
+        );
+    }
+
+    #[test]
+    fn render_nodes_are_what_dri_holds_unless_one_is_named() {
+        let scratch = Scratch::new("dri");
+        let dir = scratch.join("dri");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["card0", "renderD129", "renderD128", "controlD64"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let nodes = render_nodes(&dir, None);
+        let names: Vec<_> = nodes
+            .iter()
+            .map(|n| Path::new(n).file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["renderD128", "renderD129"], "render nodes only, in order");
+        assert_eq!(
+            render_nodes(&dir, Some("/dev/dri/renderD130".into())),
+            ["/dev/dri/renderD130"]
+        );
+        assert_eq!(
+            render_nodes(&dir, Some(String::new())).len(),
+            2,
+            "an empty override is no override"
+        );
+        for i in 0..8 {
+            std::fs::write(dir.join(format!("renderD{}", 200 + i)), b"").unwrap();
+        }
+        assert_eq!(render_nodes(&dir, None).len(), VAAPI_DEVICES_TRIED);
+        assert!(render_nodes(&dir.join("missing"), None).is_empty(), "no /dev/dri, no VAAPI");
+    }
+
+    /// Scripts standing in for `ffmpeg`, which decide by their argv alone: the probe is
+    /// handed a binary, a device and a limit, and nothing else.
+    #[cfg(unix)]
+    fn probe_script(scratch: &Scratch, name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = scratch.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_that_refuses_aborts_or_hangs_is_told_apart_and_a_hang_is_killed() {
+        let scratch = Scratch::new("probe");
+        let limit = std::time::Duration::from_secs(3);
+        let probe = |body: &str| run_probe(&probe_script(&scratch, "p.sh", body), &[], limit);
+        assert_eq!(probe("exit 0"), Probe::Works);
+        assert_eq!(probe("exit 234"), Probe::Refused);
+        // The pinned build aborts when a hardware library is missing: not a success.
+        assert_eq!(probe("kill -ABRT $$"), Probe::Refused);
+        let started = Instant::now();
+        assert_eq!(probe("exec sleep 30"), Probe::Hung);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "it waited for the driver"
+        );
+        assert_eq!(
+            run_probe(&scratch.join("missing").to_string_lossy(), &[], limit),
+            Probe::Refused,
+            "no such binary"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vaapi_takes_the_first_render_node_that_encodes_and_gives_up_a_hung_one() {
+        let scratch = Scratch::new("vaapi-nodes");
+        let limit = std::time::Duration::from_secs(3);
+        let all = ["h264_vaapi", "hevc_vaapi", "av1_vaapi", "h264_amf"];
+        let compiled: std::collections::HashSet<&str> = all.into_iter().collect();
+        let nodes = |names: &[&str]| names.iter().map(|n| format!("/dev/dri/{n}")).collect::<Vec<_>>();
+        // renderD128 is somebody else's GPU (every encode refused), renderD129 encodes H.264
+        // and HEVC but not AV1.
+        let bin = probe_script(
+            &scratch,
+            "ffmpeg.sh",
+            "case \"$*\" in *renderD129*av1_vaapi*) exit 1;; *renderD129*) exit 0;; *) exit 1;; esac",
+        );
+        let (found, device) = probe_vaapi(&bin, &compiled, &nodes(&["renderD128", "renderD129"]), limit);
+        assert_eq!(found, ["h264_vaapi", "hevc_vaapi"]);
+        assert_eq!(device.as_deref(), Some("/dev/dri/renderD129"));
+        // Nothing works anywhere: no encoders, no device.
+        let refused = probe_script(&scratch, "refuse.sh", "exit 1");
+        assert_eq!(
+            probe_vaapi(&refused, &compiled, &nodes(&["renderD128"]), limit),
+            (Vec::new(), None)
+        );
+        // An ffmpeg without VAAPI is not probed at all (a script that would hang proves it).
+        let hang = probe_script(&scratch, "hang.sh", "exec sleep 30");
+        let started = Instant::now();
+        let without: std::collections::HashSet<&str> = ["h264_amf"].into_iter().collect();
+        assert_eq!(
+            probe_vaapi(&hang, &without, &nodes(&["renderD128"]), limit),
+            (Vec::new(), None)
+        );
+        // A wedged node costs one limit, not one per encoder, and the next node is still tried.
+        let wedged = probe_script(
+            &scratch,
+            "wedged.sh",
+            "case \"$*\" in *renderD128*) exec sleep 30;; *) exit 0;; esac",
+        );
+        let (found, device) = probe_vaapi(&wedged, &compiled, &nodes(&["renderD128", "renderD129"]), limit);
+        assert_eq!(device.as_deref(), Some("/dev/dri/renderD129"));
+        assert_eq!(found.len(), 3);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the hung node held the probe"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_family_is_asked_one_encoder_at_a_time_and_stops_at_a_hang() {
+        let scratch = Scratch::new("family");
+        let limit = std::time::Duration::from_secs(3);
+        let compiled: std::collections::HashSet<&str> = ["h264_amf", "hevc_amf", "av1_amf", "h264_nvenc"].into_iter().collect();
+        let works_but_hevc = probe_script(&scratch, "amf.sh", "case \"$*\" in *hevc_amf*) exit 1;; *) exit 0;; esac");
+        // Only AMF's own encoders are asked, in candidate order.
+        assert_eq!(
+            probe_family(&works_but_hevc, EncFamily::Amf, &compiled, limit),
+            ["h264_amf", "av1_amf"]
+        );
+        let started = Instant::now();
+        let hangs = probe_script(&scratch, "hang.sh", "exec sleep 30");
+        assert!(probe_family(&hangs, EncFamily::Amf, &compiled, limit).is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(7),
+            "three hung probes would take three limits"
+        );
+    }
+
+    #[test]
+    fn a_wait_for_a_probe_that_is_still_running_gives_up_and_one_that_finishes_is_read() {
+        let late: OnceLock<u32> = OnceLock::new();
+        let never: OnceLock<u32> = OnceLock::new();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let _ = late.set(7);
+            });
+            assert_eq!(wait_for(&late, std::time::Duration::from_secs(30)), Some(&7));
+        });
+        assert_eq!(
+            wait_for(&late, std::time::Duration::ZERO),
+            Some(&7),
+            "already set: no waiting"
+        );
+        let started = Instant::now();
+        assert_eq!(wait_for(&never, std::time::Duration::from_millis(100)), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn only_encoders_that_take_system_memory_frames_are_candidates_for_a_stitch() {
+        for encoder in HW_ENCODER_CANDIDATES {
+            assert_ne!(enc_family(encoder), EncFamily::Vaapi, "{encoder}");
+            assert_ne!(enc_family(encoder), EncFamily::Software, "{encoder}");
+        }
+        assert!(VAAPI_ENCODER_CANDIDATES.iter().all(|e| enc_family(e) == EncFamily::Vaapi));
+        assert!(!HW_ENCODER_CANDIDATES.iter().any(|e| VAAPI_ENCODER_CANDIDATES.contains(e)));
+    }
+
+    #[test]
+    fn a_proxy_is_never_hardware_encoded_whatever_else_it_asks_for() {
+        let hardware = ["_nvenc", "_qsv", "_videotoolbox", "_amf", "_vaapi"];
+        for hw_decode in [None, Some("auto"), Some("d3d11va"), Some("vaapi")] {
+            for tonemap in [None, Some("zscale=t=linear")] {
+                for head_pad in [None, Some("-fps_mode")] {
+                    let args = proxy_encode_args("/in.mov", "/out.mp4", 3, 1280, hw_decode, tonemap, head_pad);
+                    let at = args.iter().position(|a| a == "-c:v").expect("an encoder");
+                    assert_eq!(args[at + 1], "libx264", "{hw_decode:?} {tonemap:?} {head_pad:?}");
+                    assert!(!args.iter().any(|a| hardware.iter().any(|h| a.ends_with(h))), "{args:?}");
+                    assert_eq!(args.contains(&"-hwaccel".to_string()), hw_decode.is_some(), "decode stays");
+                    assert_eq!(flag_val(&args, "-g"), Some("1"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_probed_device_replaces_the_builders_stand_in() {
+        let mut args: Vec<String> = ["-y", "-vaapi_device", VAAPI_DEFAULT_DEVICE, "-i", "a.mp4"]
+            .map(String::from)
+            .into();
+        set_vaapi_device(&mut args, None);
+        assert_eq!(args[2], VAAPI_DEFAULT_DEVICE, "nothing probed, nothing swapped");
+        set_vaapi_device(&mut args, Some("/dev/dri/renderD129"));
+        assert_eq!(args[2], "/dev/dri/renderD129");
+        let mut plain: Vec<String> = ["-y", "-i", "a.mp4"].map(String::from).into();
+        set_vaapi_device(&mut plain, Some("/dev/dri/renderD129"));
+        assert_eq!(plain, ["-y", "-i", "a.mp4"]);
+    }
+
+    #[test]
     fn build_export_args_hevc_hw_gets_hvc1_tag() {
         let opts = ExportOptions {
             video_codec: Some("hevc_nvenc".into()),
@@ -13523,6 +14704,163 @@ mod tests {
         assert_eq!(frames, 1);
     }
 
+    /// A frame that arrives behind the wall-clock schedule says by how much; one that is early or
+    /// on time says nothing. A caller tells a stream that cannot keep up from a hiccup by whether
+    /// that number keeps growing.
+    #[cfg(unix)]
+    #[test]
+    fn a_frame_reports_how_far_behind_its_slot_it_arrived() {
+        let mut delays = Vec::new();
+        let mut sent = Some(0);
+        pump_preview(
+            fake_stream(r"printf '\377\330a\377\331'; sleep 0.3; printf '\377\330b\377\331'"),
+            0.0,
+            1000.0,
+            short_timeouts(),
+            &mut |f| {
+                delays.push(f.late);
+                true
+            },
+            &mut sent,
+        )
+        .expect("ends cleanly");
+        assert_eq!(delays.len(), 2);
+        assert_eq!(delays[0], 0.0, "the first frame sets the clock: {delays:?}");
+        assert!(
+            delays[1] > 0.2 && delays[1] < 2.0,
+            "the second was a third of a second behind a 1 ms slot: {delays:?}"
+        );
+
+        // Paced faster than it renders is not late: the pacing sleeps until the slot. The slots are
+        // long enough that a loaded runner oversleeping one cannot reach the next.
+        let mut delays = Vec::new();
+        pump_preview(
+            fake_stream(r"printf '\377\330a\377\331\377\330b\377\331\377\330c\377\331'"),
+            0.0,
+            4.0,
+            short_timeouts(),
+            &mut |f| {
+                delays.push(f.late);
+                true
+            },
+            &mut sent,
+        )
+        .expect("ends cleanly");
+        assert!(delays.iter().all(|l| *l < 0.05), "{delays:?}");
+    }
+
+    fn params_for(fps: f64, request: PlaybackRequest) -> PlaybackParams {
+        let asset = test_asset(vec![video_stream(1920, 1080, fps)]);
+        let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        playback_params(&timeline, &[asset], request)
+    }
+
+    #[test]
+    fn playback_runs_at_the_timelines_own_rate() {
+        for fps in [12.0, 23.976, 24.0, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0] {
+            let p = params_for(fps, PlaybackRequest::default());
+            assert_eq!(p.fps, fps, "a {fps} fps cut plays at {fps}");
+        }
+        // Past what a display paints there is nothing to gain: the cap.
+        assert_eq!(params_for(120.0, PlaybackRequest::default()).fps, MAX_STREAM_FPS);
+        assert_eq!(params_for(240.0, PlaybackRequest::default()).fps, MAX_STREAM_FPS);
+        // A cut with no footage to read a rate from plays at the engine's default, not at nothing.
+        let empty = timeline_of(vec![video_track(vec![])]);
+        assert_eq!(playback_params(&empty, &[], PlaybackRequest::default()).fps, 30.0);
+    }
+
+    #[test]
+    fn a_stated_rate_wins_within_bounds_and_an_unusable_one_is_not_stated() {
+        let say = |fps| {
+            params_for(
+                60.0,
+                PlaybackRequest {
+                    fps: Some(fps),
+                    max_width: None,
+                },
+            )
+            .fps
+        };
+        assert_eq!(say(30.0), 30.0);
+        assert_eq!(say(29.97), 29.97);
+        assert_eq!(say(15.0), 15.0);
+        assert_eq!(say(0.2), MIN_STREAM_FPS);
+        assert_eq!(say(500.0), MAX_STREAM_FPS);
+        // The cut's own rate stands in for a number that is not one.
+        let own = params_for(25.0, PlaybackRequest::default()).fps;
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -24.0] {
+            assert_eq!(
+                params_for(
+                    25.0,
+                    PlaybackRequest {
+                        fps: Some(bad),
+                        max_width: None
+                    }
+                )
+                .fps,
+                own,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rate_is_the_cut_as_it_renders_not_a_muted_tracks_footage() {
+        let slow = test_asset(vec![video_stream(1920, 1080, 24.0)]);
+        let fast = test_asset(vec![video_stream(1920, 1080, 60.0)]);
+        let mut muted = video_track(vec![make_clip(slow.id, 0.0, 5.0, 0.0)]);
+        muted.muted = true;
+        let timeline = timeline_of(vec![muted, video_track(vec![make_clip(fast.id, 0.0, 5.0, 0.0)])]);
+        let p = playback_params(&timeline, &[slow, fast], PlaybackRequest::default());
+        assert_eq!(p.fps, 60.0);
+    }
+
+    #[test]
+    fn the_stream_width_is_the_one_asked_for_within_bounds() {
+        let width = |w| params_for(30.0, PlaybackRequest { fps: None, max_width: w }).max_width;
+        assert_eq!(width(None), PREVIEW_STREAM_WIDTH);
+        for w in [480, 960, 1280, 1440, 1920] {
+            assert_eq!(width(Some(w)), w);
+        }
+        assert_eq!(width(Some(0)), MIN_STREAM_WIDTH);
+        assert_eq!(width(Some(10)), MIN_STREAM_WIDTH);
+        assert_eq!(width(Some(100_000)), MAX_STREAM_WIDTH);
+        // What the page asks for is bucketed to the steps of `preview-size.ts`, and the top of
+        // them is the engine's own bound.
+        assert_eq!(MAX_STREAM_WIDTH, 1920);
+    }
+
+    #[test]
+    fn the_requested_width_and_rate_reach_the_stream_graph() {
+        let asset = av_asset(Uuid::new_v4(), 10.0);
+        let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        let assets = [asset];
+        let params = playback_params(
+            &timeline,
+            &assets,
+            PlaybackRequest {
+                fps: None,
+                max_width: Some(1440),
+            },
+        );
+        assert_eq!((params.fps, params.max_width), (30.0, 1440));
+        let args = build_preview_args(&timeline, &assets, 0.0, params.fps, params.max_width, PREVIEW_STREAM_QUALITY).unwrap();
+        let graph = flag_val(&args, "-filter_complex").unwrap();
+        assert!(graph.contains("1440") && graph.contains("fps=30"), "{graph}");
+        let slim = build_preview_args(&timeline, &assets, 0.0, 60.0, 960, PREVIEW_STREAM_QUALITY).unwrap();
+        let graph = flag_val(&slim, "-filter_complex").unwrap();
+        assert!(graph.contains("fps=60") && !graph.contains("1440"), "{graph}");
+        // A source narrower than the request is not scaled up to it.
+        let narrow = test_asset(vec![video_stream(640, 360, 30.0)]);
+        let tl = single(vec![make_clip(narrow.id, 0.0, 5.0, 0.0)]);
+        let args = build_preview_args(&tl, &[narrow], 0.0, 30.0, 1920, PREVIEW_STREAM_QUALITY).unwrap();
+        let graph = flag_val(&args, "-filter_complex").unwrap();
+        assert!(
+            graph.contains("640") && !graph.contains("1920"),
+            "narrow source keeps its width: {graph}"
+        );
+    }
+
     #[test]
     fn a_smart_cropped_clip_crops_before_the_fit_so_cover_has_nothing_left_to_take() {
         let asset = av_asset(Uuid::new_v4(), 30.0); // 1920x1080
@@ -13747,6 +15085,101 @@ mod tests {
         // Paced to real time rather than dumped as fast as it renders: a second
         // of frames takes about a second (with slack for the graph starting up).
         assert!(elapsed.as_secs_f64() > 0.8, "playback ran ahead of real time: {elapsed:?}");
+    }
+
+    /// The size a JPEG says it is: the first start-of-frame segment's height and width.
+    fn jpeg_size(jpeg: &[u8]) -> Option<(u32, u32)> {
+        let mut at = 2;
+        while at + 9 < jpeg.len() {
+            if jpeg[at] != 0xFF {
+                return None;
+            }
+            let marker = jpeg[at + 1];
+            let len = u16::from_be_bytes([jpeg[at + 2], jpeg[at + 3]]) as usize;
+            if matches!(marker, 0xC0..=0xC2) {
+                let h = u16::from_be_bytes([jpeg[at + 5], jpeg[at + 6]]) as u32;
+                let w = u16::from_be_bytes([jpeg[at + 7], jpeg[at + 8]]) as u32;
+                return Some((w, h));
+            }
+            at += 2 + len;
+        }
+        None
+    }
+
+    /// End to end against the real `ffmpeg` binary: a 60 fps cut plays at 60 fps and at the width
+    /// the preview asked for, a 30 fps cut at 30 and, with nothing asked, the default width.
+    /// `cargo test -p kerf-core --no-default-features -- --ignored streams_at_the_timelines_rate`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn streams_at_the_timelines_rate_and_the_requested_width() {
+        let dir = std::env::temp_dir().join(format!("kerf-preview-rate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let play = |fps: u32, request: PlaybackRequest, frames_wanted: usize| {
+            let media = dir.join(format!("src{fps}.mp4"));
+            let ok = command(&ffmpeg_bin())
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(["-f", "lavfi", "-i", &format!("testsrc2=size=1280x720:rate={fps}:duration=4")])
+                .args(["-c:v", "libx264", "-preset", "veryfast", "-g", "1", "-pix_fmt", "yuv420p"])
+                .arg(&media)
+                .status_bounded()
+                .expect("run ffmpeg");
+            assert!(ok.success(), "could not synthesize test media");
+            let mut asset = av_asset(Uuid::new_v4(), 4.0);
+            asset.path = media.to_string_lossy().into_owned();
+            asset.streams = vec![video_stream(1280, 720, fps as f64)];
+            let timeline = single(vec![make_clip(asset.id, 0.0, 4.0, 0.0)]);
+            let mut frames: Vec<PreviewFrame> = Vec::new();
+            let began = std::time::Instant::now();
+            let mut first = None;
+            stream_preview_with(&timeline, &[asset], 0.5, request, &mut |f| {
+                first.get_or_insert_with(|| began.elapsed());
+                frames.push(f);
+                frames.len() < frames_wanted
+            })
+            .expect("stream");
+            let span = (began.elapsed() - first.unwrap()).as_secs_f64();
+            (frames, span)
+        };
+
+        let (frames, span) = play(
+            60,
+            PlaybackRequest {
+                fps: None,
+                max_width: Some(640),
+            },
+            60,
+        );
+        assert_eq!(frames.len(), 60);
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(jpeg_size(&f.jpeg), Some((640, 360)), "frame {i}");
+            assert!((f.time - (0.5 + i as f64 / 60.0)).abs() < 1e-9, "frame {i} is at {}", f.time);
+        }
+        // 59 gaps of 1/60 s: a second of video takes about a second, not the 2.5 s it took at 24.
+        assert!(span > 0.85 && span < 1.4, "60 frames at 60 fps took {span:.2}s");
+
+        let (frames, span) = play(30, PlaybackRequest::default(), 30);
+        assert_eq!(frames.len(), 30);
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(jpeg_size(&f.jpeg), Some((960, 540)), "frame {i} at the default width");
+            assert!((f.time - (0.5 + i as f64 / 30.0)).abs() < 1e-9, "frame {i} is at {}", f.time);
+        }
+        assert!(span > 0.85 && span < 1.4, "30 frames at 30 fps took {span:.2}s");
+
+        // A request past the source's own width is not scaled up to it.
+        let (frames, _) = play(
+            30,
+            PlaybackRequest {
+                fps: Some(24.0),
+                max_width: Some(1920),
+            },
+            4,
+        );
+        assert_eq!(jpeg_size(&frames[0].jpeg), Some((1280, 720)));
+        assert!(
+            (frames[1].time - frames[0].time - 1.0 / 24.0).abs() < 1e-9,
+            "a stated rate overrides the cut's"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The graph features most likely to break only at runtime — a looped still
@@ -14165,6 +15598,212 @@ mod tests {
             "the still showed ramp frame {frame} (grey {grey}), not the one at 1.0006 s"
         );
         assert!(args.join(" ").contains("-ss 1.000600 -i "), "{args:?}");
+    }
+
+    /// A VAAPI export's argv with the device taken out: `-vaapi_device` dropped, the upload
+    /// left as a plain `format=nv12`, and the encoder swapped for lossless FFV1 into `out`.
+    /// What is left is the graph ffmpeg would be handed, shape for shape, minus the one filter
+    /// that needs a GPU.
+    fn vaapi_argv_without_the_device(args: &[String], out: &str) -> Vec<String> {
+        let mut rewritten = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "-vaapi_device" => i += 2,
+                "-c:v" => {
+                    i += 1;
+                    while i + 1 < args.len() && !matches!(args[i].as_str(), "-c:a" | "-an" | "-movflags") {
+                        i += 1;
+                    }
+                    rewritten.extend(["-c:v", "ffv1"].map(String::from));
+                }
+                _ => {
+                    rewritten.push(args[i].replace(",hwupload", ""));
+                    i += 1;
+                }
+            }
+        }
+        *rewritten.last_mut().unwrap() = out.to_string();
+        rewritten
+    }
+
+    /// MD5 of every decoded video frame of `path`, as 8-bit planar YUV.
+    fn frames_md5(path: &Path) -> String {
+        let out = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-i"])
+            .arg(path)
+            .args(["-pix_fmt", "yuv420p", "-f", "md5", "-"])
+            .output()
+            .expect("run ffmpeg");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The VAAPI export's graph, rendered: the `vhw` pad and `format=nv12` tail it ends in are
+    /// accepted by ffmpeg and carry the same picture as the graph without them, with and
+    /// without titles on top. (The upload itself needs a GPU; see `needs a real machine`.)
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored vaapi_graph`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn the_vaapi_graph_carries_the_same_picture_as_the_plain_one() {
+        let scratch = Scratch::new("vaapi-graph");
+        let media = scratch.join("src.mp4");
+        let ok = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=1"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&media)
+            .status_bounded()
+            .expect("run ffmpeg");
+        assert!(ok.success());
+        let mut asset = av_asset(Uuid::new_v4(), 1.0);
+        asset.path = media.to_string_lossy().into_owned();
+        asset.streams = vec![video_stream(640, 360, 30.0)];
+        for titled in [false, true] {
+            let mut timeline = single(vec![make_clip(asset.id, 0.0, 1.0, 0.0)]);
+            if titled {
+                let mut title = TextOverlay::new("VAAPI", 0.0, 1.0);
+                title.size = 0.3;
+                timeline.overlays = vec![title];
+            }
+            let render = |codec: &str, name: &str| {
+                let opts = ExportOptions {
+                    video_codec: Some(codec.into()),
+                    include_audio: false,
+                    ..Default::default()
+                };
+                let args = build_export_args(&timeline, std::slice::from_ref(&asset), "/out/x.mp4", &opts).unwrap();
+                let out = scratch.join(name);
+                let args = vaapi_argv_without_the_device(&args, &out.to_string_lossy());
+                assert_eq!(
+                    args.iter().any(|a| a.contains("[vhw]format=nv12[outv]")),
+                    codec == "h264_vaapi"
+                );
+                let run = command(&ffmpeg_bin())
+                    .args(["-hide_banner", "-loglevel", "error"])
+                    .args(&args)
+                    .output()
+                    .expect("run ffmpeg");
+                assert!(
+                    run.status.success(),
+                    "{codec} titled={titled}: {}",
+                    String::from_utf8_lossy(&run.stderr)
+                );
+                out
+            };
+            let vaapi = render("h264_vaapi", &format!("vaapi-{titled}.mkv"));
+            let plain = render("libx264", &format!("plain-{titled}.mkv"));
+            assert_eq!(frames_md5(&vaapi), frames_md5(&plain), "titled={titled}");
+        }
+    }
+
+    /// The options each AMF and VAAPI export spells are ones the encoder knows, with values in
+    /// its range — checked where ffmpeg checks them, when the encoder is opened, which is
+    /// before the missing GPU is noticed. A QP past `qp_i`'s 51 (or an AV1 one past 255) is the
+    /// failure this guards: the old 1:1 mapping put `-qp_i 60` on the line for a CRF of 60.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored encoder_options`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn the_hardware_encoder_options_are_ones_the_encoder_accepts() {
+        let scratch = Scratch::new("hw-options");
+        let listed = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-encoders"])
+            .output()
+            .expect("run ffmpeg");
+        let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+        let mut asset = av_asset(Uuid::new_v4(), 1.0);
+        asset.path = scratch.join("src.mp4").to_string_lossy().into_owned();
+        asset.streams = vec![video_stream(640, 360, 30.0)];
+        let ok = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "color=c=gray:s=640x360:r=30:d=1"])
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&asset.path)
+            .status_bounded()
+            .expect("run ffmpeg");
+        assert!(ok.success());
+        let timeline = single(vec![make_clip(asset.id, 0.0, 1.0, 0.0)]);
+        let mut tried = 0;
+        for codec in ["h264_amf", "hevc_amf", "av1_amf", "h264_vaapi", "hevc_vaapi", "av1_vaapi"] {
+            if !listed.lines().any(|l| l.split_whitespace().nth(1) == Some(codec)) {
+                continue;
+            }
+            for (rate_control, crf) in [
+                (RateControl::Crf, Some(0)),
+                (RateControl::Crf, Some(20)),
+                (RateControl::Crf, Some(51)),
+                (RateControl::Crf, Some(63)),
+                (RateControl::Crf, Some(u32::MAX)),
+                (RateControl::Lossless, None),
+            ] {
+                let opts = ExportOptions {
+                    video_codec: Some(codec.into()),
+                    rate_control,
+                    crf,
+                    include_audio: false,
+                    ..Default::default()
+                };
+                let args = build_export_args(&timeline, std::slice::from_ref(&asset), "/out/x.mp4", &opts).unwrap();
+                let args: Vec<String> = args
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, a)| a.as_str() != "-vaapi_device" && (*i == 0 || args[i - 1] != "-vaapi_device"))
+                    .map(|(_, a)| a.replace(",hwupload", ""))
+                    .collect();
+                let out = scratch.join("out.mp4");
+                let run = command(&ffmpeg_bin())
+                    .args(["-hide_banner", "-loglevel", "error"])
+                    .args(&args[..args.len() - 1])
+                    .arg(&out)
+                    .output()
+                    .expect("run ffmpeg");
+                let stderr = String::from_utf8_lossy(&run.stderr);
+                for refusal in [
+                    "Unrecognized option",
+                    "not found",
+                    "out of range",
+                    "Error setting option",
+                    "Error applying",
+                ] {
+                    assert!(!stderr.contains(refusal), "{codec} {rate_control:?} crf {crf:?}: {stderr}");
+                }
+                tried += 1;
+            }
+        }
+        // The pinned Linux and Windows builds carry them; the macOS one has neither family.
+        assert!(
+            tried > 0 || cfg!(target_os = "macos"),
+            "this ffmpeg has none of the AMF or VAAPI encoders"
+        );
+    }
+
+    /// With no GPU the probe still finishes, names only encoders it knows, and finds no VAAPI
+    /// device; with one, whatever it names it verified. Never hangs.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored hw_encoders_probe`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn the_hw_encoders_probe_finishes_and_names_only_what_it_knows() {
+        let started = Instant::now();
+        let found = hw_encoders();
+        assert!(started.elapsed() < std::time::Duration::from_secs(60));
+        for encoder in found {
+            assert!(
+                HW_ENCODER_CANDIDATES.contains(&encoder.as_str()) || VAAPI_ENCODER_CANDIDATES.contains(&encoder.as_str()),
+                "{encoder}"
+            );
+        }
+        let vaapi = found.iter().any(|e| enc_family(e) == EncFamily::Vaapi);
+        assert_eq!(
+            vaapi,
+            hw_probe().vaapi_device.is_some(),
+            "a VAAPI encoder is verified on a device, and only then"
+        );
+        if !Path::new("/dev/dri").exists() {
+            assert!(!vaapi);
+        }
     }
 
     /// A bare `%` used to be a drawtext configuration error that silently
