@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { frameLimited, scrubFraction, scrubRange, scrubTime, type FrameClock } from './scrub';
+import { chipLeft, frameLimited, markerTicks, scrubFraction, scrubRange, scrubTime, type FrameClock } from './scrub';
 
 describe('scrubTime', () => {
 	test('is the pointer\'s share of the bar, times the cut', () => {
@@ -120,5 +120,47 @@ describe('frameLimited', () => {
 		f.push(3);
 		k.frame();
 		expect(seen).toEqual([3]);
+	});
+});
+
+describe('markerTicks', () => {
+	test('a tick per marker, along the bar, in order, with its colour and name', () => {
+		const ticks = markerTicks(
+			[
+				{ time: 15, color: '#fff', name: 'b' },
+				{ time: 5, name: 'a' }
+			],
+			20
+		);
+		expect(ticks).toEqual([
+			{ at: 0.25, color: null, name: 'a' },
+			{ at: 0.75, color: '#fff', name: 'b' }
+		]);
+	});
+
+	test('markers outside the cut have no tick, and two on one spot are one', () => {
+		expect(markerTicks([{ time: -1 }, { time: 21 }, { time: Number.NaN }], 20)).toEqual([]);
+		expect(markerTicks([{ time: 10, name: 'first' }, { time: 10, name: 'second' }], 20)).toEqual([{ at: 0.5, color: null, name: 'first' }]);
+		expect(markerTicks([{ time: 0 }, { time: 20 }], 20).map((t) => t.at)).toEqual([0, 1]);
+	});
+
+	test('a cut with no length has none', () => {
+		expect(markerTicks([{ time: 0 }], 0)).toEqual([]);
+	});
+});
+
+describe('chipLeft', () => {
+	test('centres the chip on the pointer', () => {
+		expect(chipLeft(200, 80, 600)).toBe(160);
+	});
+
+	test('keeps it inside the bar at either end, so the time is never cut off', () => {
+		expect(chipLeft(10, 80, 600)).toBe(0);
+		expect(chipLeft(595, 80, 600)).toBe(520);
+	});
+
+	test('a bar narrower than the chip pins it to the start', () => {
+		expect(chipLeft(30, 80, 50)).toBe(0);
+		expect(chipLeft(30, 80, 0)).toBe(0);
 	});
 });

@@ -503,6 +503,22 @@ const ACTION_LIST = [
 	{ id: 'marker.add', repeat: false, label: 'Add marker at playhead', group: 'markers', context: 'global', defaults: ['M'] },
 	{ id: 'marker.prev', label: 'Previous marker', group: 'markers', context: 'global', defaults: [','] },
 	{ id: 'marker.next', label: 'Next marker', group: 'markers', context: 'global', defaults: ['.'] },
+	{
+		id: 'review.prevChange',
+		label: 'Previous proposed change',
+		group: 'markers',
+		context: 'global',
+		defaults: ['PageUp', '['],
+		hint: 'While an agent’s proposed cut is on the timeline: moves the playhead to the change before it. Page Up works on every keyboard layout; [ needs one that types it without AltGr or Option.'
+	},
+	{
+		id: 'review.nextChange',
+		label: 'Next proposed change',
+		group: 'markers',
+		context: 'global',
+		defaults: ['PageDown', ']'],
+		hint: 'While an agent’s proposed cut is on the timeline: moves the playhead to the change after it. Page Down works on every keyboard layout; ] needs one that types it without AltGr or Option.'
+	},
 	{ id: 'range.markIn', label: 'Set in point', group: 'markers', context: 'global', defaults: ['I'] },
 	{ id: 'range.markOut', label: 'Set out point', group: 'markers', context: 'global', defaults: ['O'] },
 	{ id: 'range.clearIn', label: 'Clear in point', group: 'markers', context: 'global', defaults: ['Shift+I'] },
@@ -586,7 +602,8 @@ export const FIXED_KEYS: readonly { keys: string; does: string }[] = [
 	{ keys: 'Alt, or F10', does: 'Focuses the menu bar; ← → move along it, ↓ opens a menu, Esc closes it' },
 	{ keys: '← → ↑ ↓', does: 'Operate a focused slider, panel tab or list' },
 	{ keys: 'Ctrl/⌘ + wheel', does: 'Zooms the timeline at the pointer' },
-	{ keys: 'Shift / Ctrl/⌘ + click', does: 'Extends or toggles the clip selection' }
+	{ keys: 'Shift / Ctrl/⌘ + click', does: 'Extends or toggles the clip selection' },
+	{ keys: '← → on a focused clip', does: 'Nudges it a frame (Shift: a second); a run of presses is one edit' }
 ];
 
 // ---- bindings ----------------------------------------------------------------

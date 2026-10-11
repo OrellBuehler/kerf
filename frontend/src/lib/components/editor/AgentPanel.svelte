@@ -128,7 +128,7 @@
 	/** Jump the playhead to where a change happens, so it can be looked at. */
 	function inspect(e: DiffEntry) {
 		if (e.at == null) return;
-		ui.seek(e.at);
+		ui.seek(e.at, { snap: 'up' });
 		if (e.clip_id) editor.selectClip(e.clip_id);
 	}
 

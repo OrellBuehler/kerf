@@ -32,6 +32,7 @@ import type { ExportDraft } from './export-draft';
 import type { VoiceoverPrefill } from './voiceover';
 import type { TrimMonitor, TrimTool } from './trim-tools';
 import { ZOOM_DEFAULT, stepZoom } from './zoom';
+import { seekTime, stepPoint, type SeekOptions } from './frames';
 import {
 	heightOf,
 	heightPx,
@@ -485,22 +486,32 @@ class EditorUi {
 	 */
 	seekEpoch = $state(0);
 
-	/** Move the playhead, clamped to the timeline so it can't park past the end
-	 *  or before zero. Re-anchors audio when it lands mid-playback. */
-	seek(t: number) {
-		this.time = Math.min(Math.max(0, t), Math.max(0, editor.duration));
+	/** Move the playhead to the frame `t` falls on, clamped to the timeline so it can't park past
+	 *  the end or before zero. A scrub or a click lands on a frame of the cut, so a step from it is
+	 *  a whole frame and the timecode, the picture and the playhead agree; the end of the cut itself
+	 *  is kept as it is. Pass `{ snap: 'up' }` to go to the *start* of something (a title, a changed clip,
+	 *  a transcript line): the first frame at or after it, so the playhead is inside it, not before it.
+	 *  Re-anchors audio when it lands mid-playback. */
+	seek(t: number, o?: SeekOptions) {
+		this.time = seekTime(t, editor.fps, editor.duration, o);
+		this.seekEpoch++;
+		if (this.playing) this.#startAudio();
+	}
+
+	/** Put the playhead back exactly where it was (a scrub given up): the time as it stood, not
+	 *  re-rounded to a frame — it may be mid-frame after playback — held to the cut as it is now. */
+	restoreTime(t: number) {
+		this.time = Math.min(Math.max(0, Number.isFinite(t) ? t : 0), Math.max(0, editor.duration));
 		this.seekEpoch++;
 		if (this.playing) this.#startAudio();
 	}
 
 	/** Jump to the nearest marker before (-1) or after (+1) the playhead. */
 	gotoMarker(dir: 1 | -1) {
-		const eps = 1e-4;
-		const times = editor.markers
-			.map((m) => m.time)
-			.filter((t) => (dir > 0 ? t > this.time + eps : t < this.time - eps));
-		if (times.length === 0) return;
-		this.seek(dir > 0 ? Math.min(...times) : Math.max(...times));
+		// Compared where the playhead will stand on them (it lands on a frame): a marker between frames
+		// is not still ahead of a playhead that has just gone to it.
+		const at = stepPoint(editor.markers.map((m) => m.time), this.time, dir, editor.fps, editor.duration);
+		if (at !== null) this.seek(at);
 	}
 
 	togglePlay() {
