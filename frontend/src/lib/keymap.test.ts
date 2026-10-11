@@ -294,6 +294,9 @@ function legacyAction(e: KeyEventLike): string | null {
 	if (k === 'm') return 'marker.add';
 	if (e.key === ',') return 'marker.prev';
 	if (e.key === '.') return 'marker.next';
+	// Added with the proposal review (the symbol keys, like , and ., answer whatever Shift says).
+	if (e.key === '[') return 'review.prevChange';
+	if (e.key === ']') return 'review.nextChange';
 	if (k === 'j') return 'playback.shuttleBack';
 	if (k === 'k') return 'playback.pause';
 	if (k === 'l') return 'playback.shuttleForward';

@@ -12,13 +12,27 @@
 	import { beginDrag } from '$lib/drag';
 	import { windowOf } from '$lib/realm';
 	import { formatTimecode } from '$lib/timecode';
-	import { frameLimited, scrubFraction, scrubRange, scrubTime } from '$lib/scrub';
+	import { chipLeft, frameLimited, markerTicks, scrubFraction, scrubRange, scrubTime } from '$lib/scrub';
 
 	let { duration, empty }: { duration: number; empty: boolean } = $props();
 
 	let held = $state(false);
 	const at = $derived(empty ? 0 : scrubFraction(ui.time, duration));
 	const range = $derived(scrubRange(ui.markIn, ui.markOut, duration));
+	/** The markers on the cut, as ticks along the rail. */
+	const ticks = $derived(empty ? [] : markerTicks(editor.markers, duration));
+
+	/** Where the pointer is along the bar, px — the time under it is on a chip above the bar, so a scrub
+	 *  can be aimed (and read) before it is pressed. */
+	let hoverX = $state<number | null>(null);
+	let barW = $state(0);
+	const CHIP_W = 84;
+	const hoverTime = $derived(hoverX === null || empty ? null : scrubTime(hoverX, 0, barW, duration));
+
+	function onHover(e: PointerEvent) {
+		if (empty) return;
+		hoverX = e.clientX - (e.currentTarget as HTMLElement).getBoundingClientRect().left;
+	}
 
 	function onDown(e: PointerEvent) {
 		if (e.button !== 0) return;
@@ -112,7 +126,10 @@
 	aria-disabled={empty}
 	data-scrub
 	data-held={held ? '' : undefined}
+	bind:clientWidth={barW}
 	onpointerdown={onDown}
+	onpointermove={onHover}
+	onpointerleave={() => (hoverX = null)}
 	onkeydown={onKey}
 	style="flex:1;min-width:24px;height:16px;position:relative;display:flex;align-items:center;cursor:{empty ? 'default' : 'pointer'};touch-action:none;user-select:none"
 >
@@ -129,6 +146,22 @@
 		{/if}
 		<div style="position:absolute;inset:0 auto 0 0;width:{at * 100}%;background:var(--kerf-500);border-radius:999px"></div>
 	</div>
+	{#each ticks as m (m.at)}
+		<div
+			aria-hidden="true"
+			data-scrub-marker
+			style="position:absolute;left:{m.at * 100}%;top:50%;width:2px;height:10px;margin:-5px 0 0 -1px;border-radius:1px;background:{m.color || 'var(--agent-400)'};box-shadow:0 0 0 1px var(--surface-app);pointer-events:none"
+		></div>
+	{/each}
+	{#if hoverTime !== null && hoverX !== null}
+		<div
+			aria-hidden="true"
+			data-scrub-chip
+			style="position:absolute;bottom:calc(100% + 2px);left:{chipLeft(hoverX, CHIP_W, barW)}px;width:{CHIP_W}px;box-sizing:border-box;text-align:center;padding:1px 0;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:var(--text-primary);font-family:var(--font-mono);font-size:11px;line-height:14px;pointer-events:none;z-index:2"
+		>
+			{formatTimecode(hoverTime, editor.fps)}
+		</div>
+	{/if}
 	<div
 		aria-hidden="true"
 		data-scrub-thumb
