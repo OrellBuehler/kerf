@@ -31,8 +31,8 @@ use crate::error::Result;
 use crate::frame_pick::Pick;
 use crate::layer_geometry::{Keyed, LayerGeometry, Placement};
 use crate::model::{
-    pix_fmt_layout, pix_fmt_subsampling, Asset, Clip, Color, Hdr, Mask, PixLayout, Projection, ResolvedReframe, StreamInfo,
-    StreamKind, Subsampling, Timeline, Transform, VideoEffect,
+    pix_fmt_is_high_bit, pix_fmt_layout, pix_fmt_subsampling, Asset, Clip, Color, Hdr, Mask, PixLayout, Projection,
+    ResolvedReframe, StreamInfo, StreamKind, Subsampling, Timeline, Transform, VideoEffect,
 };
 use crate::plan_caps::{DipWhy, EffectKinds, GpuCaps, LayerRef, Unsupported};
 use crate::planner::{PlanRequest, Planner};
@@ -268,8 +268,9 @@ pub struct PlanCanvas {
     pub pix_fmt: String,
     /// The delivery is a gif (palettegen / paletteuse on the composite).
     pub gif: bool,
-    /// The cut holds a clip whose picture may be full range ([`PlanStream::maybe_full_range`]),
-    /// wherever it is on the timeline: the export's range is one for the whole stream.
+    /// The cut holds a clip whose picture may be full range ([`PlanStream::maybe_full_range_in`]
+    /// under this plan's policy), wherever it is on the timeline: the export's range is one for the
+    /// whole stream.
     pub full_range_cut: bool,
 }
 
@@ -333,13 +334,27 @@ impl PlanStream {
         self.pix_fmt.as_deref().and_then(pix_fmt_subsampling)
     }
 
-    /// Whether the picture may be full range: ffprobe names every full-range 4:2:0 /
-    /// 4:2:2 / 4:4:4 picture `yuvj…` (a JPEG, an mjpeg, an H.264 file flagged `pc`),
-    /// and an asset that never recorded its format is not known not to be.
+    /// Whether the picture may be full range **by its name**: ffprobe names a full-range 8-bit
+    /// 4:2:0 / 4:2:2 / 4:4:4 picture `yuvj…` (a JPEG, an mjpeg, an H.264 file flagged `pc`), and an
+    /// asset that never recorded its format is not known not to be. This is a heuristic: the
+    /// range *tag* (`color_range`) is the truth, and [`StreamInfo`] does not record it, so a
+    /// deeper-than-8-bit file flagged `pc` still reads `yuv420p10le` and is not caught here; see
+    /// [`PlanStream::maybe_full_range_in`].
     pub fn maybe_full_range(&self) -> bool {
         self.pix_fmt
             .as_deref()
             .is_none_or(|f| f.to_ascii_lowercase().starts_with("yuvj"))
+    }
+
+    /// [`PlanStream::maybe_full_range`], and under a policy that is not
+    /// [`CompositeColorPolicy::FixedBt601`] (FFmpeg 9 and what could not be measured) **every
+    /// deeper-than-8-bit YCbCr or gray format too**: the name says nothing about its range there,
+    /// and 9.0.2 handles a `pc`-tagged one as it does `yuvj` (raw values kept, the whole export
+    /// flagged full range; measured Y 16 off on 10-bit). FFmpeg 6 handled the high-bit pictures
+    /// measured exactly whatever their tag, so there the name alone decides, as before.
+    pub fn maybe_full_range_in(&self, policy: CompositeColorPolicy) -> bool {
+        self.maybe_full_range()
+            || (policy != CompositeColorPolicy::FixedBt601 && self.pix_fmt.as_deref().is_some_and(pix_fmt_is_high_bit))
     }
 
     /// An RGB-family picture (see [`PixLayout::Rgb`]).
@@ -852,9 +867,12 @@ impl RenderPlan {
             // clip, in every knob), so a full-range picture is not graded on the GPU
             // — and a picture whose format was never recorded is not known not to be
             // full-range.
-            if !layer.color.is_identity() && stream.maybe_full_range() {
+            if !layer.color.is_identity() && stream.maybe_full_range_in(self.canvas.policy) {
                 let detail = match stream.pix_fmt.as_deref() {
-                    Some(f) => format!("a full-range picture ({f}), which FFmpeg grades before converting its range"),
+                    Some(f) if stream.maybe_full_range() => {
+                        format!("a full-range picture ({f}), which FFmpeg grades before converting its range")
+                    }
+                    Some(f) => format!("a picture deeper than 8 bits ({f}) whose range is not recorded (it may be full range)"),
                     None => "a picture whose pixel format was never recorded (it may be full range)".to_string(),
                 };
                 out.push(Unsupported::GradedFullRange(at(), detail));
@@ -920,7 +938,7 @@ impl RenderPlan {
             // does. (An export frame is refused for the cut it is in, below.)
             if self.mode == PlanMode::Still
                 && self.canvas.policy != CompositeColorPolicy::FixedBt601
-                && stream.maybe_full_range()
+                && stream.maybe_full_range_in(self.canvas.policy)
                 && ops.iter().any(|o| o.factor < FADE_FULL)
             {
                 out.push(Unsupported::FullRangeNegotiated(at()));
@@ -977,9 +995,9 @@ impl RenderPlan {
         // 40 to 44 dB off (a limited-range clip over a limited-range one is exact). Where
         // the composite's colour is negotiated, or not known, grading in a stack that
         // holds a full-range picture is FFmpeg's.
-        if policy != CompositeColorPolicy::FixedBt601 && self.layers.iter().any(|l| l.stream.maybe_full_range()) {
+        if policy != CompositeColorPolicy::FixedBt601 && self.layers.iter().any(|l| l.stream.maybe_full_range_in(policy)) {
             for (n, layer) in self.layers.iter().enumerate() {
-                if !layer.color.is_identity() && !layer.stream.maybe_full_range() {
+                if !layer.color.is_identity() && !layer.stream.maybe_full_range_in(policy) {
                     out.push(Unsupported::GradedInFullRangeStack(n));
                 }
             }

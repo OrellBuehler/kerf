@@ -337,7 +337,7 @@ impl Planner {
             c.asset
                 .as_ref()
                 .and_then(|a| a.stream.as_ref())
-                .is_some_and(PlanStream::maybe_full_range)
+                .is_some_and(|s| s.maybe_full_range_in(req.color))
         });
         Ok(Self {
             mode: req.mode,
@@ -1234,6 +1234,105 @@ mod tests {
         // A cut of limited-range clips only is not the cut's business.
         let (_, why) = cut(vec![vec![make_clip(limited.id, 0.0, 4.0, 0.0)]], bt, first);
         assert!(!why.contains(&Unsupported::FullRangeCut), "{why:?}");
+    }
+
+    #[test]
+    fn only_a_full_range_clip_the_export_would_hold_sets_the_cut_flag() {
+        use crate::model::StreamKind;
+        let limited = asset();
+        let mut full = asset();
+        full.streams[0].pix_fmt = Some("yuvj420p".into());
+        let assets = [limited.clone(), full.clone()];
+        let bt = CompositeColorPolicy::BottomLayerTag;
+        let holds = |tracks: Vec<Track>, policy: CompositeColorPolicy| {
+            let mut tl = single(Vec::new());
+            tl.tracks = tracks;
+            Planner::new(&tl, &assets, &opts(30.0), PlanRequest::motion(policy))
+                .unwrap()
+                .canvas()
+                .full_range_cut
+        };
+        let track = |kind: StreamKind, clips: Vec<Clip>, edit: &dyn Fn(&mut Track)| {
+            let mut t = Track::new(kind, "T");
+            t.clips = clips;
+            edit(&mut t);
+            t
+        };
+        let base = || track(StreamKind::Video, vec![make_clip(limited.id, 0.0, 4.0, 0.0)], &|_| {});
+        let none = |_: &mut Track| {};
+        // The control: the full-range clip on a video track that renders.
+        let on_top = || track(StreamKind::Video, vec![make_clip(full.id, 0.0, 2.0, 1.0)], &none);
+        assert!(holds(vec![base(), on_top()], bt));
+        // (A fact about the cut under any policy: FFmpeg 6, which converts the range at the decode, is
+        // let off by the refusal's own policy check, not by the flag.)
+        assert!(holds(vec![base(), on_top()], CompositeColorPolicy::FixedBt601));
+        // A muted track is not in the graph.
+        let muted = track(StreamKind::Video, vec![make_clip(full.id, 0.0, 2.0, 1.0)], &|t| {
+            t.muted = true;
+        });
+        assert!(!holds(vec![base(), muted], bt), "muted");
+        // Nor is a disabled clip.
+        let mut off = make_clip(full.id, 0.0, 2.0, 1.0);
+        off.enabled = false;
+        assert!(
+            !holds(vec![base(), track(StreamKind::Video, vec![off], &none)], bt),
+            "disabled"
+        );
+        // Nor a track a soloed one shadows.
+        let solo = track(StreamKind::Video, vec![make_clip(limited.id, 0.0, 4.0, 0.0)], &|t| {
+            t.solo = true;
+        });
+        assert!(
+            !holds(
+                vec![solo, track(StreamKind::Video, vec![make_clip(full.id, 0.0, 2.0, 1.0)], &none)],
+                bt
+            ),
+            "solo-shadowed"
+        );
+        // The soloed track itself is in it.
+        let soloed_full = track(StreamKind::Video, vec![make_clip(full.id, 0.0, 2.0, 1.0)], &|t| t.solo = true);
+        assert!(holds(vec![base(), soloed_full], bt), "soloed");
+        // An audio track's use of the asset (its sound) is not a picture.
+        let audio = track(StreamKind::Audio, vec![make_clip(full.id, 0.0, 2.0, 1.0)], &none);
+        assert!(!holds(vec![base(), audio], bt), "audio-only use");
+    }
+
+    #[test]
+    fn a_deeper_than_8_bit_picture_may_be_full_range_only_where_ffmpeg_9_handles_it_raw() {
+        let mut limited = asset();
+        limited.streams[0].pix_fmt = Some("yuv420p".into());
+        let mut deep = asset();
+        deep.streams[0].pix_fmt = Some("yuv420p10le".into());
+        let assets = [limited.clone(), deep.clone()];
+        let holds = |policy: CompositeColorPolicy| {
+            let mut tl = single(Vec::new());
+            let mut t = Track::new(crate::model::StreamKind::Video, "V");
+            t.clips = vec![make_clip(limited.id, 0.0, 4.0, 0.0), make_clip(deep.id, 0.0, 2.0, 4.0)];
+            tl.tracks = vec![t];
+            Planner::new(&tl, &assets, &opts(30.0), PlanRequest::motion(policy))
+                .unwrap()
+                .canvas()
+                .full_range_cut
+        };
+        // The file's range tag is not recorded, so a 10-bit picture is not known to be limited.
+        assert!(holds(CompositeColorPolicy::BottomLayerTag));
+        assert!(holds(CompositeColorPolicy::Unknown));
+        assert!(!holds(CompositeColorPolicy::FixedBt601), "FFmpeg 6 draws 10-bit to the level");
+        for (fmt, high) in [
+            ("yuv420p10le", true),
+            ("yuv420p12le", true),
+            ("yuv444p10le", true),
+            ("yuv422p16le", true),
+            ("p010le", true),
+            ("gray10le", true),
+            ("yuv420p", false),
+            ("gray", false),
+            ("rgb24", false),
+            ("gbrp10le", false),
+            ("yuvj420p", false),
+        ] {
+            assert_eq!(crate::model::pix_fmt_is_high_bit(fmt), high, "{fmt}");
+        }
     }
 
     #[test]
