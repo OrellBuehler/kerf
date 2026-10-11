@@ -140,6 +140,14 @@
 //!   GPU does not copy them (`a_rotated_neutral_layer_has_no_colour_fringe`).
 //! * **swscale's YUV -> RGB** truncates, a mean bias of up to a level (the flat
 //!   mean error column in the report); the shader rounds.
+//! * **Text** is FFmpeg's own `drawtext` raster blended with `drawtext`'s own arithmetic
+//!   (`tests/text.rs` holds that blend to `drawtext` sample for sample, the `text/` cases and
+//!   `the_text_pass_is_the_reference_blend_plane_by_plane` hold the shader to it). Text is edge
+//!   everywhere, so a text case is judged against the same picture *without* the text
+//!   ([`TEXT_EXTRA`]), not by the band. What the compositor cannot reproduce is refused
+//!   (`text_the_gpu_cannot_reproduce_is_refused`): a synthetic-bold border, text under 12 px
+//!   (glyphs that overlap are blended once as a mask and in turn by `drawtext`), a face the
+//!   plan cannot name.
 //! * **A 10-bit source that is also scaled**: FFmpeg's `scale` converts and scales
 //!   in one pass (with ordered dither), the GPU path decodes to 8 bits first.
 //!   Measured unscaled only (`source/10-bit`).
@@ -2890,27 +2898,35 @@ fn an_asset_that_never_recorded_its_pixel_format_is_assumed_nothing() {
 /// test picture, 5 under a letterbox or a translucent layer) is not charged to the text. Measured:
 /// every case adds at most 1 level but the 12 px one (the smallest the plan draws), which adds 2 (a level
 /// or two of chroma at the pixels glyph bitmaps share, times the 1.77 of the blue channel).
-/// (`tests/text.rs` holds the blend to FFmpeg's `drawtext` sample for sample.)
+/// A control with no colour in it (a black frame) has none of the conversion's bias (up to
+/// [`CONVERSION_BIAS`] levels on any colour: swscale truncates, the shader rounds) to show, so that is
+/// its floor. A frame with **no layer** is blended in RGB, with no conversion at all, and is
+/// held to the control exactly (`tests/text.rs` holds the blend to FFmpeg's `drawtext` sample for sample).
 const TEXT_EXTRA: i32 = 2;
+const CONVERSION_BIAS: i32 = 3;
 
 fn check_text(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
     let mut bare = tl.clone();
     bare.overlays.clear();
     for &t in times {
-        let control = check_with(
-            &format!("{case} (no text)"),
-            &bare,
-            assets,
-            &[t],
-            STRICT,
-            &ExportOptions::default(),
-        );
+        let opts = ExportOptions::default();
+        let control = check_with(&format!("{case} (no text)"), &bare, assets, &[t], STRICT, &opts);
+        let in_rgb = RenderPlan::at(tl, assets, &opts, t, policy())
+            .expect("plan")
+            .layers
+            .is_empty();
         let limits = Limits {
             flat_share: 0.0,
-            max_all: control.first().map(|worst| worst + TEXT_EXTRA),
+            max_all: control.first().map(|worst| {
+                if in_rgb {
+                    *worst
+                } else {
+                    (*worst).max(CONVERSION_BIAS) + TEXT_EXTRA
+                }
+            }),
             ..STRICT
         };
-        check_with(case, tl, assets, &[t], limits, &ExportOptions::default());
+        check_with(case, tl, assets, &[t], limits, &opts);
     }
 }
 
@@ -3087,6 +3103,26 @@ fn text_over_every_kind_of_picture_is_drawn_as_ffmpeg_draws_it() {
         );
         check_text(&format!("text/over-{name}"), &tl, std::slice::from_ref(a), &[0.5]);
     }
+    // Over a layer whose source has no frame there (a clip longer than its footage): nothing is drawn
+    // for it, but the overlay chain is in the graph, so the text is blended as YUV, not as the RGB of a
+    // frame with no layer at all.
+    let mut late = title("Past the end of the footage");
+    late.end = 5.0;
+    let tl = with_text(timeline(vec![vec![clip(&m.testsrc, 0.0, 5.0, 0.0)]], None), vec![late]);
+    assert!(kerf_gpu::decode_layers(
+        &RenderPlan::at(
+            &tl,
+            std::slice::from_ref(&m.testsrc),
+            &ExportOptions::default(),
+            3.0,
+            policy()
+        )
+        .expect("plan")
+        .layers
+    )
+    .expect("decode")[0]
+        .is_none());
+    check_text("text/over-an-empty-layer", &tl, std::slice::from_ref(&m.testsrc), &[3.0]);
     // Over a graded layer, a translucent one and a letterbox (the bars are part of the picture).
     let mut graded = clip(&m.testsrc, 0.0, 2.0, 0.0);
     graded.color = Color {
@@ -3638,6 +3674,9 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // FFmpeg (mixed matrices, an RGB picture in a non-BT.601 stack, an asset that
 // never recorded its pixel format), asserted refused rather than compared. Both
 // runs pass every case, strictly (no `KERF_PARITY_EXPLORE`).
+// The `text/` rows are the cases with text, judged against the same picture without it
+// (whole-image max at most the control's, floor 3, plus 2); the `(no text)` controls are in the
+// report, not here. The `blank-*` rows are frames with no layer (drawn in RGB: exact).
 // The smallest flat share of any non-busy case is 56.9% (`grid/yuv420p-cover-odd-y-then-
 // scale`, a 202x100 frame, band 43.1%; the other `grid/*-cover-odd-y` cases 59.4%); the
 // largest band among the cases judged strictly is that one. Every run rewrites `target/parity/report.txt` (these columns plus the
@@ -3774,6 +3813,82 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
 // still/jpeg                                       1   480x270 |    48.8 dB        3 |    48.6 dB        3 | 17.7% 52.7 / 3
 // still/pip-over-video                             1   640x360 |    46.4 dB        5 |    45.6 dB       17 |  9.4% 48.0 / 5
 // still/png-under-video-pip                        1   640x360 |    47.6 dB        5 |    47.6 dB        5 | 13.5%    =
+// text/blank-fading                              1.4   640x360 |    99.0 dB        0 |    99.0 dB        0 |  1.9%    =
+// text/blank-fading                              2.2   640x360 |    99.0 dB        0 |    99.0 dB        0 |  1.9%    =
+// text/blank-hex-on-a-solid-box                  1.5   640x360 |    99.0 dB        0 |    99.0 dB        0 |  4.8%    =
+// text/blank-white                               1.5   640x360 |    99.0 dB        0 |    99.0 dB        0 |  2.9%    =
+// text/blank-yellow-boxed                        1.5   640x360 |    99.0 dB        0 |    99.0 dB        0 |  2.8%    =
+// text/caption                                   0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 16.9%    =
+// text/caption-9x16                              0.5   360x640 |    46.3 dB        5 |    46.4 dB        5 |  9.7%    =
+// text/captions-lines                            0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.9%    =
+// text/captions-lines-9x16                       0.5   360x640 |    46.3 dB        5 |    46.4 dB        5 | 11.4%    =
+// text/captions-word-punch                       0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 18.4%    =
+// text/captions-word-punch-9x16                  0.5   360x640 |    46.3 dB        5 |    46.4 dB        5 | 12.6%    =
+// text/colour-hex                                0.5   640x360 |    49.0 dB        3 |    48.8 dB        3 | 17.8%    =
+// text/colour-invalid                            0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 16.8%    =
+// text/colour-translucent                        0.5   640x360 |    49.0 dB        3 |    48.8 dB        3 | 17.8%    =
+// text/colour-translucent-box                    0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.8%    =
+// text/colour-yellow                             0.5   640x360 |    48.8 dB        3 |    48.8 dB        3 | 16.2%    =
+// text/edge-bottom                               0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 16.8%    =
+// text/edge-bottom-boxed                         0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.8%    =
+// text/edge-corner                               0.5   640x360 |    48.8 dB        3 |    48.8 dB        3 | 16.3%    =
+// text/edge-corner-boxed                         0.5   640x360 |    48.8 dB        3 |    48.7 dB        3 | 16.7%    =
+// text/edge-left                                 0.5   640x360 |    48.8 dB        3 |    48.7 dB        3 | 16.8%    =
+// text/edge-left-boxed                           0.5   640x360 |    48.8 dB        3 |    48.7 dB        3 | 17.7%    =
+// text/edge-outside                              0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
+// text/edge-outside-boxed                        0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
+// text/edge-right                                0.5   640x360 |    48.8 dB        3 |    48.8 dB        3 | 16.8%    =
+// text/edge-right-boxed                          0.5   640x360 |    48.7 dB        3 |    48.6 dB        3 | 17.7%    =
+// text/edge-top                                  0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 16.7%    =
+// text/edge-top-boxed                            0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.6%    =
+// text/escapes-0                                 0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.5%    =
+// text/escapes-1                                 0.5   640x360 |    48.9 dB        3 |    48.6 dB        3 | 19.0%    =
+// text/escapes-2                                 0.5   640x360 |    48.9 dB        3 |    48.6 dB        3 | 18.7%    =
+// text/escapes-3                                 0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 18.4%    =
+// text/escapes-4                                 0.5   640x360 |    48.8 dB        3 |    48.6 dB        3 | 19.4%    =
+// text/escapes-5                                 0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.8%    =
+// text/escapes-6                                 0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 18.2%    =
+// text/escapes-7                                 0.5   640x360 |    48.9 dB        3 |    48.6 dB        3 | 18.8%    =
+// text/escapes-8                                 0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.5%    =
+// text/escapes-9                                 0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
+// text/font-DejaVu-Sans                          0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 18.0%    =
+// text/font-Inter                                0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 17.6%    =
+// text/font-Liberation-Sans                      0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 17.6%    =
+// text/font-not-installed                        0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 17.5%    =
+// text/keyframed                                   0   640x360 |    48.8 dB        3 |    48.7 dB        3 | 14.3%    =
+// text/keyframed                                0.37   640x360 |    48.9 dB        3 |    48.8 dB        3 | 16.3%    =
+// text/keyframed                                 0.8   640x360 |    48.9 dB        3 |    48.8 dB        3 | 16.0%    =
+// text/keyframed                              1.2345   640x360 |    48.8 dB        3 |    48.7 dB        3 | 16.8%    =
+// text/keyframed                                 1.9   640x360 |    48.8 dB        3 |    48.7 dB        3 | 16.0%    =
+// text/lower-third                               0.1   640x360 |    48.8 dB        3 |    48.7 dB        4 | 16.0%    =
+// text/lower-third                              0.35   640x360 |    48.8 dB        3 |    48.7 dB        3 | 17.0%    =
+// text/lower-third                                 1   640x360 |    48.8 dB        3 |    48.7 dB        3 | 16.5%    =
+// text/lower-third                               1.8   640x360 |    48.8 dB        3 |    48.7 dB        3 | 16.3%    =
+// text/lower-third-9x16                          0.1   360x640 |    46.4 dB        4 |    46.4 dB        5 |  9.7%    =
+// text/odd-canvas-202x100                        0.5   202x100 |    49.1 dB        3 |    48.3 dB        5 | 45.5%    =
+// text/over-an-empty-layer                         3   640x360 |    99.0 dB        0 |    63.3 dB        3 |  3.8%    =
+// text/over-bt2020                               0.5   640x360 |    49.0 dB        3 |    48.9 dB        3 | 11.1% 47.9 / 2
+// text/over-bt709                                0.5   640x360 |    49.8 dB        3 |    49.5 dB        3 | 13.6% 50.0 / 3
+// text/over-full-range-jpeg-still                0.5   480x270 |    48.8 dB        3 |    48.3 dB        3 | 24.8% 52.7 / 3
+// text/over-full-range-mjpeg                     0.5   640x360 |    48.8 dB        3 |    48.5 dB        3 | 20.7% 52.9 / 3
+// text/over-graded                               0.5   640x360 |    48.1 dB        3 |    47.9 dB        3 | 17.0%    =
+// text/over-gradient-709                         0.5   640x360 |    46.3 dB        3 |    46.3 dB        3 |  3.5% 46.5 / 3
+// text/over-letterbox-9x16                       0.5   360x640 |    55.3 dB        3 |    52.8 dB        5 | 15.6%    =
+// text/over-translucent                          0.5   640x360 |    43.8 dB        5 |    43.9 dB        5 | 12.6%    =
+// text/over-untagged                             0.5   640x360 |    49.8 dB        3 |    49.5 dB        3 | 13.6%    =
+// text/overlapping                               0.2   640x360 |    49.2 dB        3 |    49.1 dB        3 | 19.3%    =
+// text/overlapping                                 1   640x360 |    49.1 dB        3 |    48.9 dB        3 | 20.4%    =
+// text/size-0.034                                0.5   640x360 |    48.9 dB        3 |    48.8 dB        5 | 16.1%    =
+// text/size-0.06                                 0.5   640x360 |    49.0 dB        3 |    48.8 dB        3 | 16.6%    =
+// text/size-0.12                                 0.5   640x360 |    49.0 dB        3 |    48.8 dB        3 | 18.3%    =
+// text/size-0.2                                  0.5   640x360 |    48.9 dB        3 |    48.9 dB        3 | 20.8%    =
+// text/title                                       0   640x360 |    48.8 dB        3 |    48.7 dB        3 | 14.3%    =
+// text/title                                    0.25   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.9%    =
+// text/title                                     0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 16.4%    =
+// text/title                                       1   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.9%    =
+// text/title                                     1.7   640x360 |    48.9 dB        3 |    48.7 dB        3 | 16.0%    =
+// text/title                                    1.99   640x360 |    74.4 dB        1 |    74.4 dB        1 |  0.0%    =
+// text/title-9x16                                  0   360x640 |    46.3 dB        4 |    46.4 dB        5 |  7.1%    =
 // time/keyframes                                 0.5   640x360 |    48.8 dB        3 |    48.7 dB        3 | 14.3%    =
 // time/keyframes                                1.25   640x360 |    50.3 dB        4 |    49.9 dB        5 | 18.4%    =
 // time/keyframes                                   2   640x360 |    56.2 dB        4 |    54.3 dB        5 |  9.5%    =
