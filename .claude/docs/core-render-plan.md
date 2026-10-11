@@ -234,17 +234,20 @@
   levels (3 on BT.709) of the compositor's tables on x86-64 (arm64 NEON untested), and only on **8-bit limited-range
   untagged / BT.601 / BT.709 `yuv420p`**. Refused, each with its own `why`: an alpha plane (FFmpeg picks another RGB
   format), a black fade of the clip running ahead of it, any other pixel format (RGB 11 / 12 levels of Y / UV off,
-  10-bit 9 / 16, 4:4:4 16 / 17, 4:2:2 9 / 13, full range up to 21, an unrecorded format) or matrix, and, from `reasons(size)`
+  10-bit 9 / 16, 4:4:4 16 / 17, 4:2:2 9 / 13, full range up to 21 — in an export's planes on 9.0.2 — or an unrecorded format) or matrix, and, from `reasons(size)`
   (the geometry): a letterboxed layer (`pad` runs before the round trip, so FFmpeg's bars whiten; Y 126 against 16 at half
   way), a picture with an odd side (the round trip reads past it), and any layer the scaler resizes (the `scale` filter hands
   the fade its `rgb24` itself, scaling and converting in one pass: Y up to 19, UV 28 off, a crop that leaves the size is exact).
-  `FullRangeNegotiated(layer, where)`: a `yuvj` (or unrecorded-format) picture where FFmpeg 9 works on its raw values and
-  converts the range afterwards, so under any policy but `FixedBt601` it is refused in **every export frame** (the planes
-  hold the raw values and the stream is flagged full range as a whole: 17 / 16 levels off, in the frames of a cut that does
-  not even show the clip) and in a still **while a fade, dip or dissolve runs on it** (`fade` darkens toward the
-  limited-range 16 first: frame 0 of a fade-in reads Y 30 where black is 16). FFmpeg 6 converts at the decode, as the
+  The dip-to-white refusals are the **Motion** plane bound's and are conservative in stills on purpose: bypassed, RGB, 10-bit, 4:4:4,
+  4:2:2, gray, BT.2020, full-range and half-size layers all pass a still's strict bounds, but `reasons()` is one function for both modes.
+  `FullRangeNegotiated(layer)` (a still): a `yuvj` (or unrecorded-format) picture inside a running fade, dip or dissolve where FFmpeg 9 works on its raw
+  values and converts the range afterwards (`fade` darkens toward the limited-range 16 first: frame 0 of a fade-in reads Y 30 where black is 16).
+  **`FullRangeCut`** (an export frame; a plan-level reason, from `PlanCanvas::full_range_cut`, which the `Planner` sets when any clip of the cut
+  `maybe_full_range()`): FFmpeg 9 flags the whole export full range and converts every limited-range frame of it (a black frame reads Y 0, not 16), so under any policy
+  but `FixedBt601` **no frame of a cut that holds a full-range clip** is drawn — before it, after it, on another track or a gap. FFmpeg 6 converts at the decode, as the
   compositor does, and draws it all to the level, except that **`FullRangeResized`** (under either FFmpeg, from `reasons(size)`) refuses a full-range
   picture the scaler resizes in an export frame and inside a fade (swscale converts the range inside the resize: chroma up to 15 levels off).
+  The policy condition is a **proxy measured only on FFmpeg 6.1.1 and 9.0.2** (5.x, 7.x, 8.x and distro builds are unmeasured).
   **`gpu_supported_at(size)` is the per-frame fallback switch** (`gpu_supported()` is
   its size-free half; `unsupported_reasons_at(size)` says *no, with reasons*) for
   anything the compositor does not render exactly: video effects, masks, 360 reframe,

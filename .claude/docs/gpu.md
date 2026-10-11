@@ -477,17 +477,23 @@ is within **two levels in every plane (three of Y on BT.709)**, a per-effect bou
 untested**. **Where it is refused** (specific reasons, `Unsupported::FadeOnTranslucent` / `DipToWhite` / `FullRangeNegotiated`): a black or white fade
 running on a layer below full opacity (`colorchannelmixer` leaves RGBA and `rotate` and `fade` run on that, **alpha plane included**: Y 153 levels off the
 first time it was drawn like a plain fade — the harness found it); a dip to white on an alpha plane (FFmpeg picks another RGB format) or beside a running black
-fade of the same clip; on any picture that is not `yuv420p` (RGB, 10-bit, 4:4:4, 4:2:2, gray, `yuvj`: 9 to 21 levels off) or whose matrix is not BT.601 / BT.709;
+fade of the same clip; on any picture that is not `yuv420p` (RGB, 10-bit, 4:4:4, 4:2:2, gray, `yuvj`: 9 to 21 levels off **in an export's planes on 9.0.2**) or whose matrix is not BT.601 / BT.709;
 on a **letterboxed** layer (FFmpeg pads before the round trip, so its bars whiten: Y 126 against 16 at half way, where the compositor's matte stays black); on a picture
 with an **odd** side (the round trip reads past the line); and on a layer the **scaler resizes** (a layer that is only cropped is exact): the `scale` filter is handed
 `rgb24` by the fade's negotiation and scales and converts in one pass, chroma interpolated from other samples than the compositor's scale-then-convert (a half-size layer
 Y 19, UV 28 off at sharp edges, an enlargement 11 / 10) — found by the harness comparing the frames beside a refusal. **A full-range (`yuvj`) picture is refused
-whenever the composite policy is not `FixedBt601`** (FFmpeg 9): in every export frame (its planes keep the raw full-range values and the stream is flagged full range as a
-whole, so even the black frames before the clip read 16 levels off) and, in a still, while a fade, dip or dissolve runs on it (`fade` darkens the *raw* values toward the
-limited-range black 16 and converts the range afterwards: frame 0 of a fade-in reads Y 30 where black is 16, 15 to 19 levels off over the fade). FFmpeg 6 converts
+whenever the composite policy is not `FixedBt601`** (FFmpeg 9): in a still, while a fade, dip or dissolve runs on it (`fade` darkens the *raw* values toward the
+limited-range black 16 and converts the range afterwards: frame 0 of a fade-in reads Y 30 where black is 16, 15 to 19 levels off over the fade), and **every export frame of a cut that holds one**
+(`Unsupported::FullRangeCut`, from `PlanCanvas::full_range_cut`, which the `Planner` sets from the cut's clips): FFmpeg 9 flags the whole export full range, keeps the full-range
+clip's raw values (Y 17 / UV 16 off a compositor that converts first) and **converts every limited-range frame of the cut to full range** (a black frame reads Y 0 where the compositor draws 16, a test pattern
+76 against 81, a gap too), before the clip, after it and on another track alike, so no frame of such a cut is drawn, not only the full-range layer's. **The policy is a proxy for the behaviour, measured on
+FFmpeg 6.1.1 and 9.0.2 only: 5.x, 7.x, 8.x and distro builds are unmeasured** (`composite_color_policy()` probes the composite's colour, not the range handling; a build that negotiates the colour but
+not the range would be refused needlessly, one that does the reverse would be drawn wrong). FFmpeg 6 converts
 at the decode, as the compositor does, and draws all of it to the level — **unless the scaler resizes the picture** (`FullRangeResized`, both FFmpegs): swscale converts the range inside
 the resize, and an export's chroma reads up to 15 levels off (a fade on a 1.5x enlargement: flat 14), so a resized full-range picture is refused in an export frame and inside a fade (plain, in a still, it is
-drawn inside the strict bounds, 5 flat). **Export frames** (`PlanMode::Motion`, `caps.motion`) pick source frames with the `fps` filter
+drawn inside the strict bounds, 5 flat). **The dip-to-white refusals follow the Motion plane bound (2 levels) and are conservative in stills on purpose**: with
+them bypassed, RGB, 10-bit, 4:4:4, 4:2:2, gray, BT.2020, full-range and half-size layers all pass the still's STRICT bounds, but `reasons()` is one function for both plan modes and a refusal
+is not drawn approximately. **Export frames** (`PlanMode::Motion`, `caps.motion`) pick source frames with the `fps` filter
 (`Pick::Fps`), which a `FrameCursor` serves; `MotionFrames` (`motion.rs`) is the per-clip bookkeeping: a cursor opened the first
 time a clip is on screen, handed the pick of each later frame in order, dropped when the clip leaves the plan, reopened for a frame earlier than
 the last it answered. A still plan (what the app's preview and `FrameSource` serve) holds the same fades, travel and tails with the still's `-ss` picks, so
