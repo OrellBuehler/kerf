@@ -105,6 +105,10 @@ describe('one name for one action', () => {
 		expect(read(`${EDITOR}MediaBin.svelte`)).toContain("label: 'Separate stems…'");
 	});
 
+	test('Browse opens a file picker, so it says so', () => {
+		expect(read(`${EDITOR}ExportDialog.svelte`)).toContain('onclick={browse}>Browse…</Btn>');
+	});
+
 	test('the empty bin imports "media", as the menu does', () => {
 		const bin = read(`${EDITOR}MediaBin.svelte`);
 		expect(bin).toContain('Import media…</Btn>');

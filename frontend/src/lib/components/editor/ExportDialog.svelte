@@ -328,7 +328,7 @@
 				placeholder="Choose a file…"
 				style="{inputCss};flex:1;text-align:left;color:var(--text-secondary)"
 			/>
-			<Btn variant="secondary" size="sm" icon="folder-open" onclick={browse}>Browse</Btn>
+			<Btn variant="secondary" size="sm" icon="folder-open" onclick={browse}>Browse…</Btn>
 		</div>
 		{#if marks}
 			{@render selectRow(
