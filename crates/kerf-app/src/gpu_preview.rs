@@ -19,6 +19,7 @@
 //!   before anything is decoded, planned from files or rendered; a scrubbed frame takes none.
 //! * **Latest wins** ([`mailbox`]): a request replaces the one waiting, so a drag draws the frames
 //!   it ends on and not every one it passed.
+//! * **Paced**: frames of a drag are presented without waiting for the refresh ([`pace`]).
 //! * **Lazy and rebuildable**: the device, compositor, frame source and surface are made on the
 //!   first frame that wants them ([`Backend`]); a failure is remembered with a backoff
 //!   ([`Backoff`]) and a lost device is dropped and rebuilt on the next use, as `kerf-gpu`
@@ -39,6 +40,7 @@
 //! `preview_timeline` (a JPEG of the cut) and nothing here is an edit.
 
 mod mailbox;
+mod pace;
 mod snapshot;
 #[cfg(target_os = "linux")]
 mod x11;
@@ -56,12 +58,16 @@ use kerf_core::{
     composite_color_policy, CompositeColorPolicy, ExportOptions, GpuCaps, PlanLayer, PlanRequest, Planner, Project, ProxyMedia,
     RenderPlan, ScrubConfig, ScrubFrames, StreamKind, Timeline,
 };
-use kerf_gpu::{Compositor, FrameSource, FrameSourceConfig, Gpu, GpuError, GpuOptions, Hint, PixelRect, Presenter, Surround};
+use kerf_gpu::{
+    Compositor, FrameSource, FrameSourceConfig, Gpu, GpuError, GpuOptions, Hint, PixelRect, Presenter, RenderTimings,
+    RenderedFrame, Surround,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 pub use mailbox::Delivery;
 use mailbox::{Mailbox, Worker};
+use pace::Pace;
 pub use snapshot::Taken;
 use snapshot::{PlanInputs, PlanSnapshots};
 
@@ -554,6 +560,31 @@ impl Host {
     }
 }
 
+/// What a frame is shown with: the presenter and its surface. A trait so the frame path can be
+/// driven without a window (the tests' screen records what it was asked to do).
+trait Screen: Send {
+    /// Follow the surface's new size.
+    fn resize(&mut self, size: (u32, u32)) -> Result<(), GpuError>;
+    /// Present without waiting for the refresh (`on`: frames of a drag) or with vsync; a surface that
+    /// cannot skip the wait stays as it is. Done before the frame is presented.
+    fn skip_vsync(&mut self, on: bool) -> Result<(), GpuError>;
+    fn present(&mut self, frame: &RenderedFrame, dest: PixelRect, surround: Surround) -> Result<(), GpuError>;
+}
+
+impl Screen for Presenter {
+    fn resize(&mut self, size: (u32, u32)) -> Result<(), GpuError> {
+        Presenter::resize(self, size)
+    }
+
+    fn skip_vsync(&mut self, on: bool) -> Result<(), GpuError> {
+        Presenter::skip_vsync(self, on).map(|_| ())
+    }
+
+    fn present(&mut self, frame: &RenderedFrame, dest: PixelRect, surround: Surround) -> Result<(), GpuError> {
+        Presenter::present(self, frame, dest, surround)
+    }
+}
+
 /// The plan the preview draws for time `t`: the output frame whose slot holds it, at the slot's
 /// start. The JPEG route counts the same grid (`ScrubFrames`), so the two routes show the same
 /// frame for a time between two frames, not the source frame at `t` itself.
@@ -607,10 +638,19 @@ pub fn upcoming_clip_starts(timeline: &Timeline, t: f64, horizon: f64, limit: us
 /// Everything a GPU frame needs, built together and dropped together.
 struct Backend {
     // Field order is drop order: the presenter (and its surface) go before the window host.
-    presenter: Presenter,
-    compositor: Compositor,
+    screen: Box<dyn Screen>,
+    /// Shared: a frame draws with it after the render lock is let go of.
+    compositor: Arc<Compositor>,
     source: Arc<FrameSource>,
     gpu: Arc<Gpu>,
+    host: Arc<Mutex<Host>>,
+}
+
+/// What a frame draws with, held by the frame itself while the backend stays under the render lock.
+/// The backend it came from is told by `source` (a new backend has a new frame source).
+struct Drawing {
+    compositor: Arc<Compositor>,
+    source: Arc<FrameSource>,
     host: Arc<Mutex<Host>>,
 }
 
@@ -755,6 +795,9 @@ pub struct FrameRequest {
     t: f64,
     ffmpeg_width: u32,
     overlays: bool,
+    arrived: Instant,
+    /// Frames are being dragged (how fast requests arrive): set by [`GpuPreview::post`].
+    scrubbing: bool,
 }
 
 impl FrameRequest {
@@ -764,6 +807,28 @@ impl FrameRequest {
             t,
             ffmpeg_width,
             overlays,
+            arrived: Instant::now(),
+            scrubbing: false,
+        }
+    }
+}
+
+/// What one frame is asked to be.
+#[derive(Debug, Clone, Copy)]
+struct Want {
+    t: f64,
+    /// The page must draw over the picture (a title box, the trim monitor, safe-area guides).
+    overlays: bool,
+    scrubbing: bool,
+}
+
+#[cfg(test)]
+impl Want {
+    fn at(t: f64) -> Self {
+        Self {
+            t,
+            overlays: false,
+            scrubbing: false,
         }
     }
 }
@@ -820,9 +885,13 @@ pub struct GpuPreview {
     snapshots: PlanSnapshots,
     /// Frame requests: only the newest is drawn.
     mail: Mailbox<FrameRequest, Result<PreviewFrameResult, String>>,
+    /// Whether requests are arriving like a drag.
+    pace: Mutex<Pace>,
     bounds: Mutex<BoundsState>,
     /// The live host, outside the render lock so hiding the surface never waits for a render.
     host: Mutex<Option<Arc<Mutex<Host>>>>,
+    /// The backend. **Not held while a frame decodes or renders**: a frame takes what it draws with
+    /// (`Drawing`), lets go, and takes the lock again to show the result.
     render: Mutex<RenderState>,
     building: Mutex<()>,
     info: Mutex<Info>,
@@ -857,6 +926,7 @@ impl GpuPreview {
             prefetching: Arc::new(AtomicBool::new(false)),
             snapshots: PlanSnapshots::default(),
             mail: Mailbox::default(),
+            pace: Mutex::new(Pace::default()),
             enabled: AtomicBool::new(false),
             reset_backoff: AtomicBool::new(false),
             info: Mutex::new(Info {
@@ -1007,26 +1077,16 @@ impl GpuPreview {
         }
     }
 
-    /// The inputs frames are planned from: the held snapshot while it is fresh, else taken from the
-    /// project again (`take` is where the project lock is, and it is gone by the time this
-    /// returns).
-    fn inputs(&self, take: &TakeInputs) -> Result<Arc<PlanInputs>, String> {
-        if let Some(held) = self.snapshots.fresh(Instant::now()) {
-            return Ok(held);
-        }
-        let taken = take()?;
-        Ok(self.snapshots.keep(taken.resolve()))
-    }
-
     /// Ask for a frame. **Latest wins**: the request replaces the one waiting (which is answered
     /// [`Delivery::Superseded`] at once), the frame being drawn is finished, and the newest waiting
     /// request is drawn next. `run` starts the worker on a thread that may block (the app's: the
     /// blocking pool) when none is running; the answer comes on the receiver.
     pub fn post(
         self: &Arc<Self>,
-        request: FrameRequest,
+        mut request: FrameRequest,
         run: impl FnOnce(Box<dyn FnOnce() + Send>),
     ) -> oneshot::Receiver<Answer> {
+        request.scrubbing = lock(&self.pace).observe(request.arrived);
         let (answer, start) = self.mail.post(request);
         if start {
             let me = Arc::clone(self);
@@ -1056,18 +1116,37 @@ impl GpuPreview {
         if let Some(wait) = inputs.proxy_wait(request.t)? {
             return Err(wait);
         }
-        self.frame(&inputs, request.t, request.ffmpeg_width, request.overlays)
+        self.frame(
+            &inputs,
+            Want {
+                t: request.t,
+                overlays: request.overlays,
+                scrubbing: request.scrubbing,
+            },
+            request.ffmpeg_width,
+        )
     }
 
-    /// A frame for `t`: drawn by the GPU when the plan allows it and everything works, else
-    /// FFmpeg's JPEG of `ffmpeg_width`. `overlays_needed` is the page saying it must draw over
-    /// the picture (a title box, the trim monitor, safe-area guides).
+    /// The inputs frames are planned from: the held snapshot while it is fresh, else taken from the
+    /// project again (`take` is where the project lock is, and it is gone by the time this
+    /// returns).
+    fn inputs(&self, take: &TakeInputs) -> Result<Arc<PlanInputs>, String> {
+        if let Some(held) = self.snapshots.fresh(Instant::now()) {
+            return Ok(held);
+        }
+        let taken = take()?;
+        Ok(self.snapshots.keep(taken.resolve()))
+    }
+
+    /// A frame for `want.t`: drawn by the GPU when the plan allows it and everything works, else
+    /// FFmpeg's JPEG of `ffmpeg_width`. `want.overlays` is the page saying it must draw over the
+    /// picture (a title box, the trim monitor, safe-area guides).
     ///
-    /// The project lock is not taken here at all. A panic in the GPU path (wgpu, the X connection)
-    /// is caught here: the backend is dropped and rebuilt behind the backoff, the surface hidden,
-    /// and the frame is FFmpeg's like any other fallback.
-    fn frame(&self, inputs: &PlanInputs, t: f64, ffmpeg_width: u32, overlays_needed: bool) -> Result<PreviewFrameResult, String> {
-        let attempt = catch_unwind(AssertUnwindSafe(|| self.attempt(inputs, t, overlays_needed, Instant::now())));
+    /// The project lock is not taken here at all. A panic in the GPU path (wgpu, the X connection) is
+    /// caught here: the backend is dropped and rebuilt behind the backoff, the surface hidden, and the
+    /// frame is FFmpeg's like any other fallback.
+    fn frame(&self, inputs: &PlanInputs, want: Want, ffmpeg_width: u32) -> Result<PreviewFrameResult, String> {
+        let attempt = catch_unwind(AssertUnwindSafe(|| self.attempt(inputs, want, Instant::now())));
         let reasons = match attempt {
             Ok(Attempt::Presented(timings)) => {
                 return Ok(PreviewFrameResult {
@@ -1075,15 +1154,15 @@ impl GpuPreview {
                     frame: None,
                     reasons: Vec::new(),
                     timings: Some(timings),
-                })
+                });
             }
             Ok(Attempt::Fallback(reasons)) => reasons,
             Err(payload) => vec![self.after_panic(payload.as_ref())],
         };
-        tracing::debug!(?reasons, t, "preview frame through FFmpeg");
+        tracing::debug!(?reasons, t = want.t, "preview frame through FFmpeg");
         let jpeg = self
             .scrub
-            .frame(&inputs.timeline, &inputs.preview_assets, t, ffmpeg_width, 4)
+            .frame(&inputs.timeline, &inputs.preview_assets, want.t, ffmpeg_width, 4)
             .map_err(|e| e.to_string())?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg.as_slice());
         Ok(PreviewFrameResult {
@@ -1102,7 +1181,7 @@ impl GpuPreview {
         let why = format!("the GPU preview panicked: {message}");
         let _ = catch_unwind(AssertUnwindSafe(|| {
             self.hide();
-            self.drop_backend(&why, false, Instant::now());
+            self.drop_backend(&why, false, Instant::now(), None);
         }));
         why
     }
@@ -1159,10 +1238,17 @@ impl GpuPreview {
     }
 
     /// Drop the backend, remember why, and wait before building another (`immediate`: a device that
-    /// worked and was lost is rebuilt at once, the first time).
-    fn drop_backend(&self, why: &str, immediate: bool, now: Instant) {
+    /// worked and was lost is rebuilt at once, the first time). With `only`, the backend is dropped
+    /// only if it is still the one that frame source belongs to: a frame that failed on a backend
+    /// that was replaced meanwhile must not take the new one down.
+    fn drop_backend(&self, why: &str, immediate: bool, now: Instant, only: Option<&Arc<FrameSource>>) {
         let backend = {
             let mut state = lock(&self.render);
+            if let Some(only) = only {
+                if !state.backend.as_ref().is_some_and(|b| Arc::ptr_eq(&b.source, only)) {
+                    return;
+                }
+            }
             let wait = state.backoff.fail(immediate);
             state.retry_at = Some(now + wait);
             state.unproven = false;
@@ -1176,7 +1262,8 @@ impl GpuPreview {
         info.reason = Some(why.to_string());
     }
 
-    fn attempt(&self, inputs: &PlanInputs, t: f64, overlays_needed: bool, now: Instant) -> Attempt {
+    fn attempt(&self, inputs: &PlanInputs, want: Want, now: Instant) -> Attempt {
+        let t = want.t;
         let fallback = |why: String| {
             self.hide();
             Attempt::Fallback(vec![why])
@@ -1197,7 +1284,7 @@ impl GpuPreview {
         if !bounds.visible {
             return fallback("the preview surface is hidden".into());
         }
-        if overlays_needed && !technique.overlays() {
+        if want.overlays && !technique.overlays() {
             return fallback("the page has something to draw over the picture, and this surface sits above the page".into());
         }
 
@@ -1221,18 +1308,29 @@ impl GpuPreview {
         if let Err(why) = self.ensure_backend(technique, now) {
             return fallback(why);
         }
-        let mut state = lock(&self.render);
-        // Looked at again under the lock: the setting may have gone off while this frame was planned.
-        if !self.is_enabled() {
-            drop(state);
-            return fallback("the GPU preview was turned off".into());
-        }
-        let Some(backend) = state.backend.as_mut() else {
-            drop(state);
-            return fallback("the GPU preview is not up".into());
+        // What the frame draws with is taken under the render lock and kept without it: the lock is
+        // not held while the frame decodes (which waits for FFmpeg) or renders, so turning the setting
+        // off, a lost device or a build never waits for a frame.
+        let drawing = {
+            let state = lock(&self.render);
+            // Looked at again under the lock: the setting may have gone off while this frame was planned.
+            if !self.is_enabled() {
+                drop(state);
+                return fallback("the GPU preview was turned off".into());
+            }
+            match state.backend.as_ref() {
+                Some(b) => Drawing {
+                    compositor: Arc::clone(&b.compositor),
+                    source: Arc::clone(&b.source),
+                    host: Arc::clone(&b.host),
+                },
+                None => {
+                    drop(state);
+                    return fallback("the GPU preview is not up".into());
+                }
+            }
         };
-        let host = Arc::clone(&backend.host);
-        let source = Arc::clone(&backend.source);
+        let host = Arc::clone(&drawing.host);
 
         // A child window's surface is the frame itself; the window's covers the window.
         let window_size = match technique {
@@ -1240,65 +1338,39 @@ impl GpuPreview {
             Technique::Child => Some((0, 0)),
         };
         let Some(window_size) = window_size else {
-            drop(state);
             return fallback("the window has no size".into());
         };
         let Some(layout) = layout_for(technique, &bounds, window_size) else {
-            drop(state);
             return fallback("the preview frame is outside the window".into());
         };
         let canvas = (plan.canvas.width, plan.canvas.height);
         let (width, _) = place_frame(canvas, layout.area, |w| plan.size(w));
         let size = plan.size(width);
-        let caps = backend.compositor.caps();
+        let caps = drawing.compositor.caps();
         let reasons = plan.reasons(&caps, size);
         if !reasons.is_empty() {
-            drop(state);
             self.hide();
             return Attempt::Fallback(reasons.iter().map(ToString::to_string).collect());
         }
+        let rendered = drawing
+            .compositor
+            .render_plan_texture_with(&plan, size, &drawing.source, Hint::Scrub);
 
-        // `None`: the surface was hidden (or the setting turned off) while the frame was drawn.
-        let outcome = (|| -> Result<Option<GpuTimings>, GpuError> {
-            let (frame, timings) = backend
-                .compositor
-                .render_plan_texture_with(&plan, size, &backend.source, Hint::Scrub)?;
-            let t0 = Instant::now();
-            // From here the page's frame is looked at again, and `set_bounds` waits: the layout is the
-            // one of the bounds as they are now (the frame may have moved during the render; the
-            // picture is scaled into where it is), and a hide that arrived is respected.
-            self.under_bounds(|now_bounds| -> Result<GpuTimings, GpuError> {
-                let window_size = match technique {
-                    Technique::Window => lock(&host).window_size(),
-                    Technique::Child => Some((0, 0)),
-                }
-                .ok_or_else(|| GpuError::Surface("the window has no size".into()))?;
-                let layout = layout_for(technique, now_bounds, window_size)
-                    .ok_or_else(|| GpuError::Surface("the preview frame is outside the window".into()))?;
-                let dest = fit_contain(canvas, layout.area);
-                backend.presenter.resize(layout.surface)?;
-                // The surface is placed after the frame is drawn, just before it is shown: a child
-                // window moved earlier would flash its previous contents.
-                lock(&host).apply(&layout).map_err(GpuError::Surface)?;
-                backend.presenter.present(
-                    &frame,
-                    dest,
-                    Surround {
-                        area: layout.area,
-                        matte: now_bounds.matte,
-                        backdrop: now_bounds.backdrop,
-                    },
-                )?;
-                Ok(GpuTimings {
-                    width: frame.width,
-                    height: frame.height,
-                    decode_ms: timings.decode.as_secs_f64() * 1e3,
-                    composite_ms: timings.composite.as_secs_f64() * 1e3,
-                    present_ms: t0.elapsed().as_secs_f64() * 1e3,
-                })
-            })
-            .transpose()
-        })();
+        // Back under the render lock to show it, if the backend is still the one that drew it.
+        let mut state = lock(&self.render);
+        let same = state
+            .backend
+            .as_ref()
+            .is_some_and(|b| Arc::ptr_eq(&b.source, &drawing.source));
+        let outcome = match (rendered, state.backend.as_mut().filter(|_| same)) {
+            (Err(error), _) => Err(error),
+            (Ok(_), None) => {
+                drop(state);
+                return fallback("the GPU preview was restarted while the frame was drawn".into());
+            }
+            // `None`: the surface was hidden (or the setting turned off) while the frame was drawn.
+            (Ok((frame, timings)), Some(backend)) => self.show(backend, &host, technique, canvas, want, &frame, timings),
+        };
         match outcome {
             Ok(Some(timings)) => {
                 state.backoff.succeeded();
@@ -1308,7 +1380,7 @@ impl GpuPreview {
                 }
                 tracing::debug!(?timings, t, "GPU preview frame presented");
                 drop(state);
-                self.prefetch_ahead(&planner, &inputs.timeline, t, size, &caps, source);
+                self.prefetch_ahead(&planner, &inputs.timeline, t, size, &caps, Arc::clone(&drawing.source));
                 Attempt::Presented(timings)
             }
             Ok(None) => {
@@ -1326,12 +1398,70 @@ impl GpuPreview {
                 }
                 drop(state);
                 if reaction == Reaction::Rebuild {
-                    self.drop_backend(&error.to_string(), matches!(error, GpuError::DeviceLost(_)), now);
+                    self.drop_backend(
+                        &error.to_string(),
+                        matches!(error, GpuError::DeviceLost(_)),
+                        now,
+                        Some(&drawing.source),
+                    );
                 }
                 self.hide();
                 Attempt::Fallback(vec![error.to_string()])
             }
         }
+    }
+
+    /// Put a drawn frame on the screen: the surface is sized and placed for the bounds as they are
+    /// **now** (the frame may have moved during the render; the picture is scaled into where it is),
+    /// with `set_bounds` held off until it is shown. `None`: the surface was hidden (or the setting
+    /// turned off) while the frame was drawn.
+    #[allow(clippy::too_many_arguments)]
+    fn show(
+        &self,
+        backend: &mut Backend,
+        host: &Arc<Mutex<Host>>,
+        technique: Technique,
+        canvas: (u32, u32),
+        want: Want,
+        frame: &RenderedFrame,
+        timings: RenderTimings,
+    ) -> Result<Option<GpuTimings>, GpuError> {
+        let t0 = Instant::now();
+        self.under_bounds(|now_bounds| -> Result<GpuTimings, GpuError> {
+            let window_size = match technique {
+                Technique::Window => lock(host).window_size(),
+                Technique::Child => Some((0, 0)),
+            }
+            .ok_or_else(|| GpuError::Surface("the window has no size".into()))?;
+            let layout = layout_for(technique, now_bounds, window_size)
+                .ok_or_else(|| GpuError::Surface("the preview frame is outside the window".into()))?;
+            let dest = fit_contain(canvas, layout.area);
+            backend.screen.resize(layout.surface)?;
+            // Frames of a drag are shown as soon as they are drawn, the settled one with vsync; a change
+            // reconfigures the surface, which is why it is decided here, before the frame that is
+            // presented into it.
+            backend.screen.skip_vsync(want.scrubbing)?;
+            // The surface is placed after the frame is drawn, just before it is shown: a child window
+            // moved earlier would flash its previous contents.
+            lock(host).apply(&layout).map_err(GpuError::Surface)?;
+            backend.screen.present(
+                frame,
+                dest,
+                Surround {
+                    area: layout.area,
+                    matte: now_bounds.matte,
+                    backdrop: now_bounds.backdrop,
+                },
+            )?;
+            Ok(GpuTimings {
+                width: frame.width,
+                height: frame.height,
+                decode_ms: timings.decode.as_secs_f64() * 1e3,
+                composite_ms: timings.composite.as_secs_f64() * 1e3,
+                present_ms: t0.elapsed().as_secs_f64() * 1e3,
+            })
+        })
+        .transpose()
     }
 
     /// Make sure a backend is up, building one if the backoff allows. A device that was lost is
@@ -1581,8 +1711,8 @@ fn build_backend(app: &tauri::AppHandle, technique: Technique) -> Result<Backend
     // host (and so the background) goes back to normal as it is dropped.
     host.make_transparent()?;
     Ok(Backend {
-        presenter,
-        compositor,
+        screen: Box::new(presenter),
+        compositor: Arc::new(compositor),
         source,
         gpu,
         host: Arc::new(Mutex::new(host)),
@@ -2186,7 +2316,7 @@ mod tests {
         let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let preview = failing(built.clone(), "should not be called");
         visible(&preview);
-        let Attempt::Fallback(reasons) = preview.attempt(&inputs(), 0.5, false, Instant::now()) else {
+        let Attempt::Fallback(reasons) = preview.attempt(&inputs(), Want::at(0.5), Instant::now()) else {
             panic!("a disabled preview drew a frame");
         };
         assert!(reasons[0].contains("off"), "{reasons:?}");
@@ -2203,7 +2333,7 @@ mod tests {
         let inputs = inputs();
         let t0 = Instant::now();
         for n in 0..3 {
-            let Attempt::Fallback(reasons) = preview.attempt(&inputs, 0.5, false, t0 + Duration::from_millis(n)) else {
+            let Attempt::Fallback(reasons) = preview.attempt(&inputs, Want::at(0.5), t0 + Duration::from_millis(n)) else {
                 panic!("a failing backend drew a frame");
             };
             assert!(reasons[0].contains("no usable GPU adapter"), "{reasons:?}");
@@ -2217,7 +2347,7 @@ mod tests {
         assert!(status.enabled && status.supported && !status.ready);
         assert!(status.reason.unwrap().contains("no usable GPU adapter"));
         // After the backoff it tries again.
-        let _ = preview.attempt(&inputs, 0.5, false, t0 + Duration::from_secs(6));
+        let _ = preview.attempt(&inputs, Want::at(0.5), t0 + Duration::from_secs(6));
         assert_eq!(built.load(Ordering::SeqCst), 2);
         // Turning the setting off and on again forgets nothing it should not, and draws nothing.
         preview.set_enabled(false);
@@ -2230,7 +2360,14 @@ mod tests {
         let preview = failing(built.clone(), "unused");
         preview.set_enabled(true);
         visible(&preview);
-        let Attempt::Fallback(reasons) = preview.attempt(&inputs(), 0.5, true, Instant::now()) else {
+        let Attempt::Fallback(reasons) = preview.attempt(
+            &inputs(),
+            Want {
+                overlays: true,
+                ..Want::at(0.5)
+            },
+            Instant::now(),
+        ) else {
             panic!("drew over the page");
         };
         assert!(reasons[0].contains("draw over the picture"), "{reasons:?}");
@@ -2242,14 +2379,14 @@ mod tests {
         let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let preview = failing(built.clone(), "unused");
         preview.set_enabled(true);
-        let Attempt::Fallback(r) = preview.attempt(&inputs(), 0.5, false, Instant::now()) else {
+        let Attempt::Fallback(r) = preview.attempt(&inputs(), Want::at(0.5), Instant::now()) else {
             panic!()
         };
         assert!(r[0].contains("not reported"), "{r:?}");
         let mut hidden = report();
         hidden.visible = false;
         preview.set_bounds(&hidden).unwrap();
-        let Attempt::Fallback(r) = preview.attempt(&inputs(), 0.5, false, Instant::now()) else {
+        let Attempt::Fallback(r) = preview.attempt(&inputs(), Want::at(0.5), Instant::now()) else {
             panic!()
         };
         assert!(r[0].contains("hidden"), "{r:?}");
@@ -2260,7 +2397,7 @@ mod tests {
         assert!(!macos.status().supported);
         assert!(macos.status().reason.unwrap().contains("not been verified on a Mac"));
         visible(&macos);
-        let Attempt::Fallback(r) = macos.attempt(&inputs(), 0.5, false, Instant::now()) else {
+        let Attempt::Fallback(r) = macos.attempt(&inputs(), Want::at(0.5), Instant::now()) else {
             panic!()
         };
         assert!(r[0].contains("not been verified on a Mac"), "{r:?}");
@@ -2318,7 +2455,7 @@ mod tests {
         visible(&preview);
         let inputs = inputs();
         for n in 0..3 {
-            let Attempt::Fallback(reasons) = preview.attempt(&inputs, 0.5, false, Instant::now() + Duration::from_millis(n))
+            let Attempt::Fallback(reasons) = preview.attempt(&inputs, Want::at(0.5), Instant::now() + Duration::from_millis(n))
             else {
                 panic!("drew a frame with no adapter");
             };
@@ -2446,13 +2583,13 @@ mod tests {
         visible(&preview);
         let inputs = inputs();
         let t0 = Instant::now();
-        let _ = preview.attempt(&inputs, 0.5, false, t0);
-        let _ = preview.attempt(&inputs, 0.5, false, t0 + Duration::from_secs(1));
+        let _ = preview.attempt(&inputs, Want::at(0.5), t0);
+        let _ = preview.attempt(&inputs, Want::at(0.5), t0 + Duration::from_secs(1));
         assert_eq!(built.load(Ordering::SeqCst), 1, "backing off");
         // Off and on: the next frame builds again without waiting out the 5 seconds.
         preview.set_enabled(false);
         preview.set_enabled(true);
-        let _ = preview.attempt(&inputs, 0.5, false, t0 + Duration::from_secs(2));
+        let _ = preview.attempt(&inputs, Want::at(0.5), t0 + Duration::from_secs(2));
         assert_eq!(built.load(Ordering::SeqCst), 2);
     }
 
@@ -2482,13 +2619,13 @@ mod tests {
 
         let slow = {
             let (preview, inputs) = (Arc::clone(&preview), Arc::clone(&inputs));
-            std::thread::spawn(move || (Instant::now(), preview.attempt(&inputs, 0.5, false, Instant::now())))
+            std::thread::spawn(move || (Instant::now(), preview.attempt(&inputs, Want::at(0.5), Instant::now())))
         };
         // While it builds, the render lock is free and another frame does not wait for the build.
         std::thread::sleep(Duration::from_millis(150));
         assert!(preview.render.try_lock().is_ok(), "the build holds the render lock");
         let t = Instant::now();
-        let Attempt::Fallback(reasons) = preview.attempt(&inputs, 0.6, false, Instant::now()) else {
+        let Attempt::Fallback(reasons) = preview.attempt(&inputs, Want::at(0.6), Instant::now()) else {
             panic!("drew a frame while the backend was building");
         };
         assert!(t.elapsed() < Duration::from_millis(300), "waited {:?}", t.elapsed());
@@ -2519,7 +2656,7 @@ mod tests {
         );
         preview.set_enabled(true);
         visible(&preview);
-        let Attempt::Fallback(reasons) = preview.attempt(&inputs(), 0.5, false, Instant::now()) else {
+        let Attempt::Fallback(reasons) = preview.attempt(&inputs(), Want::at(0.5), Instant::now()) else {
             panic!("drew a frame");
         };
         assert!(
@@ -2536,7 +2673,7 @@ mod tests {
         preview.policy = || panic!("wgpu panicked");
         preview.set_enabled(true);
         visible(&preview);
-        let result = catch_unwind(AssertUnwindSafe(|| preview.frame(&inputs(), 0.5, 320, false)));
+        let result = catch_unwind(AssertUnwindSafe(|| preview.frame(&inputs(), Want::at(0.5), 320)));
         let result = result.expect("the panic reached the caller");
         // The FFmpeg half has nothing to read here, so it is its own error: what matters is that it was
         // reached, instead of the command dying with the panic.
@@ -2580,7 +2717,7 @@ mod tests {
         preview.marker = Some(marker.clone());
         preview.set_enabled(true);
         visible(&preview);
-        let _ = preview.attempt(&inputs(), 0.5, false, Instant::now());
+        let _ = preview.attempt(&inputs(), Want::at(0.5), Instant::now());
         assert_eq!(*lock(&seen), Some(true), "the marker was down during the build");
         assert!(!marker.exists(), "a build that failed cleanly is not a crash");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2605,7 +2742,7 @@ mod tests {
         preview.build_deadline = Duration::from_millis(100);
         preview.set_enabled(true);
         visible(&preview);
-        let _ = preview.attempt(&inputs(), 0.5, false, Instant::now());
+        let _ = preview.attempt(&inputs(), Want::at(0.5), Instant::now());
         // If the app is killed now (a hung driver) the next launch starts with the preview off.
         assert!(marker.exists());
         let _ = std::fs::remove_dir_all(&dir);
