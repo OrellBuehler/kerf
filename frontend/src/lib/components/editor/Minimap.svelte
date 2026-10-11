@@ -32,6 +32,7 @@
 		type Target,
 		type View
 	} from '$lib/minimap';
+	import { tip } from '$lib/tip';
 
 	let {
 		tracks,
@@ -141,7 +142,7 @@
 	bind:this={strip}
 	bind:clientWidth={width}
 	role="presentation"
-	title="Overview of the whole cut — drag the box to scroll, drag its edges to zoom, click to jump, double-click to move the playhead"
+	use:tip={'Overview of the whole cut — drag the box to scroll, drag its edges to zoom, click to jump, double-click to move the playhead'}
 	onpointerdown={onDown}
 	onpointermove={onHover}
 	ondblclick={onDouble}

@@ -18,7 +18,8 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   the opaque color tokens (grouped for the editor), three presets (Kerf Dark —
   bun-tested to equal the stylesheet's defaults — Kerf Light, High contrast),
   `parseTheme` (a stored or imported JSON; unknown tokens dropped, missing ones
-  filled from the scheme's preset) and `applyTheme`, which writes the tokens as
+  filled from the preset the colors it does carry are exactly — a High contrast saved before a token existed stays
+  High contrast — else the scheme's) and `applyTheme`, which writes the tokens as
   inline properties on `<html>` (beating the stylesheet), toggles the `dark`
   class and `color-scheme`. Every translucent token in `kerf-tokens.css`
   (borders, fills, glows, the scrim) is a `color-mix` of an opaque base so a
@@ -57,7 +58,8 @@ SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   ones, `text-on-accent`, `agent-fg`, `text-on-video` on the clip bodies), 3:1 for
   muted text on hover / active, accent and status hues as text on the panels and
   the strokes that carry meaning (clip edges, the playhead / selection amber, the
-  waveform, the drag ghost), plus the `color-mix` fill of a generated caption's
+  waveform, the drag ghost, and `clip-accent` — the volume line, fade handles and keyframes on every clip
+  body), plus the `color-mix` fill of a generated caption's
   block (`GENERATED_TITLE_FILL`, resolved per preset by `mixSrgb` and held to 4.5
   under its label). `text-disabled` is exempt on a *disabled* control; it used to be
   the idle colour of live toggles too (DUCK / S / L, the bell), which is no longer so (see below),
@@ -287,8 +289,14 @@ workspace, Reset all workspaces — which asks first when any arrangement is sto
 *Playback* (Play / pause, Go to start / end, back and forward a frame and a second,
 Shuttle J / K / L, Set / Clear in and out, markers — the transport lives in the Preview
 panel and a panel can be closed, so the whole of it is here as registry actions with
-their bindings), *Help* (Keyboard shortcuts, Check for updates…, Release page, Open the
-log folder, About). **Every entry names a keymap action**
+their bindings), *Help* (Keyboard shortcuts…, Check for updates…, Release notes, Show log folder,
+About). **An ellipsis promises a dialog or a picker and nothing else** — `Settings…`, `Keyboard
+shortcuts…`, `Reset all workspaces…` (it asks), `Import media…`; an action's name in a sentence is
+`plainLabel()` (`keymap.ts`), so the shortcut recorder says "already used by Open project", not
+"Open project…." (`copy-guard.test.ts` holds both rules). A menu bar is text-first: **no entry carries
+an icon** (a ragged icon column read as a rendering bug), only the check column of ticks and radios; the
+key beside an entry is `Kbd` (`.k-kbd`, `accel.ts`: 11 px mono, muted, a punctuation key in a small
+keycap, an arrow a size larger) — the same look as the context menus and the tooltips. **Every entry names a keymap action**
 (`file.importCaptions`, `file.saveCover`, `app.quit`, `tool.snap` — default `S` —,
 `view.minimap`, `view.safeAreas`, `workspace.<id>`, `window.resetWorkspace` /
 `resetAllWorkspaces`, `app.keyboard` / `checkUpdate` / `releases` / `logs` / `about`
@@ -336,20 +344,21 @@ contrast guard covers it. **Where the old toolbar's controls went**: the transpo
 start, play / pause, go to end, the timecode with the timeline's fps; J / K / L stay on
 the keyboard) is the **Preview**'s own bar, which sheds the duration and the rate below
 ~380 px of its *measured* width (`transport-bar.ts`, bun-tested: an unknown or 0 width is the
-full bar, and the buttons, timecode and scrub bar never go); the tools, Ripple, Snapping,
-Undo / Redo and the delivery-frame picker are the **Timeline**'s toolbar, which wraps to a
+full bar, and the buttons, timecode and scrub bar never go) — see **the Preview frame and its
+scrub bar** below; the tools, Ripple, Snapping,
+Undo / Redo and the delivery-frame picker are the **Timeline**'s toolbar (every button a `ToolbarToggle`), which wraps to a
 second row rather than clip
 (its "Timeline" caption is gone — the dock tab says it); New / Open / Save / Export and
 Panels are the File and Window menus. `menus.test.ts` holds each of those paths, and
 that no entry of the old toolbar lost its place.
-The **Deliver panel** (`DeliverPanel.svelte`) docks the export dialog's readiness
-verdict and *Deliver to* shapes, extracted into `Readiness` / `DeliverTo` /
+The **Deliver panel** (`DeliverPanel.svelte`) docks the export dialog's platform
+check and *Deliver to* shapes, extracted into `Readiness` / `DeliverTo` /
 `SectionHead` which the dialog uses too — no fork. The shape choice and the
 smart-crop toggle live on `ui` (`deliverShapes`, `deliverSmartCrop`) because both
 places edit them (session-global, so a shape ticked in the panel is ticked when the
-dialog opens), and both components re-judge on every `editor.timeline` change
+dialog opens), and `Readiness` re-judges on every `editor.timeline` change
 (docked beside a timeline being edited, a verdict cached at tick time goes
-stale), keeping the newest answer. Shapes are for a picture, so the panel hides
+stale), keeping the newest answer. Shapes and the platform check are for a picture, so the panel hides
 them, and the button never says "Export N files", for a cut with no video clip
 (`hasPicture`, the same gate the dialog uses). The render still goes through the full dialog
 (`ui.openExport()`); the panel shows its progress and Stop while one runs.
@@ -375,7 +384,7 @@ animate from the same panel**: a ◇ beside each colour number and the volume ke
 the value it has there (◆ when a key sits there, and clicking it takes the key out; the last one makes
 the number static), and once a number is keyed its slider shows the curve at the playhead and an edit
 writes a key there — `setCol` / `setGain` / `keyAtPlayhead` over `set_property_keyframes` with the
-mirror's `upsertKey`, so a drag is one edit. The Transform sliders do the same for numbers keyed on
+mirror's `upsertKey`, so a drag is one edit (every number row is a `SliderRow`, below). The Transform sliders do the same for numbers keyed on
 their own; the Animation list is still the legacy bundle's, and the per-number rows, dope sheet and easing
 popover are the next slice. The preview's Web Audio gain follows a keyed volume — `gainAutomation`
 ramps linearly through the curve's points and the fade edges, and **steps where the curve does** (a hold
@@ -441,7 +450,7 @@ tabs — dockview's own was a 1 px outline in the divider colour, invisible), an
 same colour and width as a ring (`--focus-ring`); `outline-ring/50` is gone from the base layer. **Toasts
 are in the theme** (`ui/sonner`): Kerf's scheme (not the OS's, since `ModeWatcher` is not mounted), an
 offset above the status bar, the menu's surface / shadow / radius, a ghost accent action instead of
-sonner's inverse pill, and status-coloured icons (`layout.css`). **Titles are their own items, not part of a clip.** `Timeline.overlays` has always
+sonner's inverse pill, and — one list shared with the notification log, `status-look.ts`: a circle-check, circle-x, triangle, info — a glyph and a 3 px edge in the kind's `-400` hue, with a 12 % wash of it over the toast for success / error / warning (`layout.css`; `status-look.test.ts` holds the stylesheet and both components to the list, and the contrast guard holds the text on those washes to 4.5:1). **Titles are their own items, not part of a clip.** `Timeline.overlays` has always
 been timeline-level, and the UI now says so: the Timeline has a **titles lane**
 (`T`, above V1; `data-title-lane`) where every title / lower-third / caption is a
 block from `start` to `end` (generated captions dashed and dimmer; overlapping
@@ -485,7 +494,7 @@ Settings › Preview or the preview context menu, which both write the same
 persisted `Settings.safe_areas` — it is held process-wide in `settings.rs`
 rather than in the engine, since nothing in kerf-core cares about it). The export dialog's "Source" resolution relabels to
 **Project frame (WxH)** so the two surfaces cannot silently disagree. The dialog
-is **preset → destination → picture → sound → where it is going**, with a
+is **preset → destination → picture → sound → deliver to → platform check** (the preset select is grouped Video / Social / Master / Audio, each described in a plain sentence of what you get and what it costs — `presetsByGroup`), with a
 `Quality` select of three named CRF points (Smaller file / Balanced / Higher
 quality, derived from the codec's CRF range) standing in for the encoder; the
 codec, rate control, tune/profile/pixel format, audio codec and container knobs
@@ -504,14 +513,36 @@ a remembered 9:16 preset must not open on a 16:9 cut — and dropped by `ui.proj
 project is opened or created), and a click on the scrim does not close the
 dialog (Esc, Cancel and ✕ do). The frame-rate select is `frameRateOptions(fps)`: `FRAME_RATES`
 (15 / 12 / 10 are the GIF's) plus the current value when the list lacks it, never a blank select.
-The **readiness panel** stays visible
-(only its tips fold): "Ready for Instagram Reels · YouTube Shorts ·
-TikTok", then any length errors / reach warnings one line each, then a *single*
-collapsed line for shape ("A 16:9 cut is letterboxed on … Pick a delivery frame
-in the toolbar") — grouped by `IssueKind`, because otherwise four vertical feeds
-each say the same thing. It re-checks against `opts.resolution`, so a 9:16
-project exported at 1920×1080 is judged as the landscape file it will be.
-`kerf_core::platform` decides all of it; `src/lib/platforms.ts` is a bun-tested
+The **Platform check** (`Readiness`, over the pure `platform-verdict.ts`) is for a *video
+export of a cut with a picture* and says nothing otherwise: `judgeable` is false for audio
+containers, a GIF and a cut with no video clip, and the verdict is `null` for a cut with
+no length (the dialog and the Deliver panel both gate on it). With **no shape ticked** it is
+one neutral line stating the file and where it already fits — "1920×1080, 16:9, 0:20. Fine for
+YouTube and the web. Tick a shape under Deliver to for Reels, Shorts or TikTok." (the length rounded
+exactly as the platform messages round it, so "3:01" never sits beside "3:01 is over …" for a 180.6 s cut;
+the platforms are the ones whose check had no `shape` issue at that
+frame, so a 1:1 cut is "fine for YouTube Shorts and Instagram feed" and never told it is
+letterboxed) — and amber / red appear only for a *length* limit of a platform that frame is made for
+(the reach warning, the hard cap, the minimum). A low resolution (one tip for the frame, naming every
+platform that would upscale it, and the size they are made for) and the muted-feed captions tip are folded tips, never amber (the
+captions tip is not given for YouTube). With **shapes ticked**
+each file is a row ("9:16 · Ready for Instagram Reels · YouTube Shorts · TikTok", then its length
+problems), judged only for the platforms that take that shape, and the single-file line is gone.
+The one shape sentence — "Instagram Reels, YouTube Shorts and TikTok are vertical (9:16). This 16:9
+cut would be letterboxed. Tick 9:16 under Deliver to to export a vertical version." — appears only
+when the *project* is cut for a shape and the file the options write is wider (a 9:16 project sent
+through "Web 1080p"), naming the platforms that frame is for; a landscape project exported 9:16 is
+a reframe the user asked for and says nothing. The check is judged at the frame the render
+will produce (`opts.resolution`, else the project's) and the length it will write (the marked In → out
+when chosen): `platform_check(width, height, range)` answers a `PlatformReport` — the targets *and*
+the `CutSummary` they judged, so the line states the file's real frame and length, not a second reading.
+Rust summarises the range on the *sliced* timeline the export builds (`Project::cut_summary_in`), so the
+frame, sound and titles are those of the span; the harness mirror (`exportSpan`, `api.ts`) clamps the
+span and re-reads the titles over it, and keeps the sample's frame and sound.
+There are no size rules: `kerf_core::platform` has length and shape limits only (TikTok's 500 MB / 2 GB
+caps are prose in its `notes`), so a size warning would need an engine estimate first.
+`kerf_core::platform` decides what each platform accepts; `platform-verdict.ts` only decides which of
+its answers to show. `src/lib/platforms.ts` is a bun-tested
 mirror used **only** by the browser harness, so the panel is drivable under
 `bun run dev`. `src/lib/smart-crop.ts` is the same arrangement for smart crop: only
 the *shape* arithmetic is mirrored (bun-tested), because the harness has no decoder
@@ -571,32 +602,110 @@ export and a saved cover offer **Show in folder** in their toast.
 — per-frame `get_timeline_frame` decodes stay for scrubbing, shuttle and the
 settled frame, where you want *one* frame rather than all of them. Its effect keys
 off `ui.seekEpoch` (bumped only by a deliberate seek or a fresh play) and never off
-`ui.time`, which ticks every animation frame and would respawn ffmpeg 60×/sec.
+`ui.time`, which ticks every animation frame and would respawn ffmpeg 60×/sec; it
+also restarts for the pane's request width (`boxWidth`, which moves a few times in a
+session) but not for the source cap, which changes as the playhead crosses clips.
+**The stream plays at the cut's own frame rate and at the width the pane asks for.** The rate is
+`renderedFps(timeline, assets)` (`timecode.ts`, held to 1..60 by `playbackFps`): the first clip with
+video **in the cut as it renders**, the way the engine reads it (`export_format` of `for_render()`:
+muted and solo-shadowed tracks, `trackRenders`, and disabled clips do not set it), where
+`timelineFps` — what timecode counts frames in — scans every track and clip as edited. The page
+leaves `fps` out at the top of the ladder and the engine reads the same number (`playback_params`),
+so the ladder and the gate start from the rate the stream really runs at; the twin of the engine's
+`the_rate_is_the_cut_as_it_renders_not_a_muted_tracks_footage` is in `timecode.test.ts`. The width
+is `frameWidth` (the pane's, held to the source at the playhead) and is always sent, so a playing
+frame is as sharp as the paused one.
+**Its frames are raw JPEG bytes**, not data URLs: `api.ts` `startPlayback` parses each channel
+message (`frame-transport.ts` `parsePlaybackMessage`: an `f64` time, then the JPEG, a view into the
+message; the handler cannot throw into the channel's own ordering) into `{ time, jpeg }`, and only a
+frame the gate lets through is turned into anything: `jpegDataUrl` (`Uint8Array.toBase64` where the
+webview has it, a chunked `btoa` otherwise) goes to `frames.showStreamed`, into the pane's **one
+persistent `<img decoding="async">`** — which the settled still then replaces the `src` of, so
+pausing swaps no element. `CANVAS_PAINTER` (`frame-transport.ts`, **off**) is the alternative: a
+stream painter (`createStreamPainter`: two decodes in flight at most, the newest waiting frame wins,
+a frame that finishes after a newer one is dropped, nothing is drawn after `stop`) decodes with
+`createImageBitmap` (`frame-canvas.ts`, with a data-URL `Image` fallback it only commits to after
+five bad frames in a row) onto a `<canvas>` over the still, and `streamShown` says it holds the
+picture until a fetched frame clears it. Turn it on per engine only after measuring there. In the
+browser harness `startPlayback` **synthesizes** JPEG bytes (`sampleFrameJpeg`) at the rate and width
+asked for (the cut's own rate when none is) behind a deliberate 90 ms lag, through the same route,
+so playback moves under `bun run dev` and the failure modes are reproducible without a desktop build.
 Which frames survive is `playback-sync.ts`'s `createFrameGate` (`show`/`skip`/
-`resync`, unit-tested — the one piece of frontend logic with tests): every frame
-arrives late by a *constant* transport cost (ffmpeg's spawn, then base64 + JSON +
-IPC) that on its own exceeds the two-frame `STALE_AFTER` budget, so lag is judged
-against the smallest this stream has managed rather than against zero — measuring
-from zero dropped every frame forever and froze the pane. Only growth past that
-floor is drift: `STALE_AFTER` skips the frame, `RESYNC_AFTER` restarts the stream
-from the playhead rather than playing it out in slow motion against the sound.
-`start_playback` logs `frames` / `first_frame_ms` per run, which is what separates
-"never started" from "sent but dropped"; in the browser harness `startPlayback`
-**synthesizes** frames at the requested fps behind a deliberate 90 ms lag, so
-playback moves under `bun run dev` and that failure mode is reproducible without a
-desktop build. `ExportDialog` (⌘E) drives
+`resync`/`degrade`, unit-tested): every frame
+arrives late by a *constant* transport cost (ffmpeg's spawn, then IPC and the decode)
+that on its own exceeds the two-frame `staleAfter` budget (not less than 75 ms: `ui.time` is written
+once per animation frame, 17 ms of jitter in every lag, so 50 ms at 60 fps left 33 ms for the rest), so
+lag is judged against the smallest this stream has managed (its `floor()`) rather
+than against zero — measuring from zero dropped every frame forever and froze the pane.
+Only growth past that floor is drift: `staleAfter` skips the frame, `RESYNC_AFTER` restarts
+the stream from the playhead rather than playing it out in slow motion against the sound.
+**A stream that renders slower than it plays** (60 fps asked of a machine that does 50: the
+frames are a sixth of a second further behind every second) would be skipped to a frozen
+pane for the six seconds it takes to drift a second behind, so the gate counts a run of skips
+whose drift is still growing and after `OVERLOAD_AFTER` (0.4 s of frames) says `degrade` (a
+burst after a hiccup is a run of skips too, but its drift shrinks). **A stream that catches up
+slowly** is the same freeze the other way round (a 600 ms stall caught up at 1.1x real time heals at
+a ninth of a second per second: six seconds of skips under the one-second resync): once a run of skips
+has been watched for `HEAL_WATCH` (0.2 s, timed by the `at` the page passes), the gate projects how long
+the pane stays frozen until the drift is back inside the budget and says `resync` when that is more
+than a restart costs (`RESTART_COST` 0.5 s, or the stream's own floor when longer; only when the drift
+is `HEAL_MARGIN` past the budget, since it is only as good as `ui.time`'s 17 ms). A quick catch-up (the
+burst after a hiccup; four times real time) is waited out. `degrade` — and a `resync`
+that follows another within 10 s — restarts the stream from the playhead one rung cheaper
+(`stepDown`): **frames are dropped from the source, not from the stream** — ffmpeg has no
+wall clock, so dropping the ones it already rendered saves nothing — halving a rate above 30
+first (60 → 30), then narrowing the width a step at a time to 960 (1920 → 1440 → 960), then
+halving again (30 → 15), then the narrowest step; smooth motion before a sharp picture that is
+moving. **A stream starts the cut's usual start-up ahead of the playhead** (`startAt`): the sound goes on
+while ffmpeg spawns, and a stream started at the playhead would show its first frame that long behind it
+for good, since the gate judges lag against its own floor. The ladder remembers, per key (cut, proxy epoch,
+pane width), the **least** start-up any of its streams has taken — a stream is in step by its floor, so its
+start-up is the floor plus the head start it was given — and starts every later stream, a Play, a seek or a
+lag restart, that far ahead, capped at `MAX_LEAD` (0.25 s: a longer one is a stall that landed in a start-up,
+not one to make up for) and at the end of the cut **as it renders** (`renderedDuration`: the engine refuses a
+start at or past it). The first Play of a cut has nothing to lead by. The minimum, not the latest, because a
+start that comes in quicker than the last one would put the picture ahead of the sound, which is worse than
+behind it. (Replayed on the recorded traces, the restarted stream's first frame was 294 ms behind the sound
+without a head start and 54 ms with it, and never ahead.) The ladder is `createLadder` (`playback-sync.ts`,
+tested): the steps down this cut is at (remembered for a minute after the last restart, `stepsToStart`: a stream
+that met a busy moment finds out; one that cannot is stepped down again within a second), that start-up, and
+**whether the next stream may be restarted to heal a slow catch-up**: not for `REPEAT_RESYNC_WINDOW_MS` (10 s)
+after a lag restart (`heal`; the gate is built with `healWatch: Infinity`), because a stall that comes with
+every start (a decoder's first second) would be restarted into itself over and over (a simulation of a 0.6 s
+stall a second into every stream, caught up at 1.1x: 20 restarts and 21 s of frozen picture in 40 s with the
+ladder stepping to the floor; with the breaker, one restart). The gate adds the head start a stream was given to
+its floor for what a restart costs. It is a counter read when the stream starts, not state; an explicit `fps`
+goes to the backend only from the first step down. At the cheapest rung the gate is built without `degrade` (a
+restart is an ffmpeg spawn on a machine that is already short): it skips to the resync, as it did before. A
+stream that dropped anything leaves a line in the log when it ends (rate, width, frames shown and skipped, why it
+restarted).
+`start_playback` logs `frames` / `first_frame_ms` / `late_frames` per run, which is what separates
+"never started" from "sent but dropped" from "could not keep up".
+**What the transport measured** (headless Chromium, software rendering, 4 shared cores, 300
+unique JPEG frames per size, medians): raw bytes are 25% fewer through the channel (76 → 57 KB at
+1080p) and no base64 / JSON at the backend's end, but **not** the 2-4x decode win the review expected.
+The old path's `JSON.parse` of the message is 0.1 ms and `img.src =` 0.1-0.3 ms — Chromium decodes
+a data-URL image lazily and off the main thread — and its `decode()` took 3.5 / 5.9 / 9.3 ms at 960 /
+1280 / 1920 px, where header + `Blob` + `createImageBitmap` + canvas draw took 5.2 / 7.2 / 12.2 ms; the
+browser's CPU per painted frame at 30 and 60 fps was within 10% either way, and the canvas path
+keeps the main thread busier (a software `drawImage`; `bitmaprenderer` was no better). So the page
+keeps the `<img>`: building the data URL in JS from the raw bytes costs the same per frame as the old
+`JSON.parse` + `img.src =` (0.1 / 0.2 / 0.2 ms synchronous with `toBase64`, 0.3 / 0.5 / 0.7 ms with the
+chunked `btoa` fallback, at 960 / 1280 / 1920 px; load time and paced CPU unchanged). WebKit and WebView2
+are unmeasured.
+`ExportDialog` (⌘E) drives
 the full `ExportOptions` surface — presets, containers/codecs, rate control, resolution,
 a loudness target, and a **Range: In → out** choice when marks are set. It **opens on
 the frame the project is cut for** (`initialExport`): the preset whose resolution is
 that frame when one matches, else the default preset with its resolution cleared so
 "Project frame" renders — otherwise a 9:16 project opened its export already
-landscape and the readiness panel warned about the shape the user had just chosen.
+landscape and the platform check warned about the shape the user had just chosen.
 Its **Deliver to** section is the multi-format export: shape chips (the
 `DELIVERY_PRESETS` minus Source) that each add a file beside the chosen path
 named by shape (`variantPath`, the bun-tested mirror of
 `ExportVariant::beside`), a *Smart crop each shot for every shape* toggle, and a
-per-file readiness line judged at that file's frame (`platformCheck([w, h])`),
-in place of the single panel — with shapes picked, the Scaling rows hide (each
+per-file row in the platform check judged at that file's frame (`platformCheck([w, h])`),
+in place of the single-file line — with shapes picked, the Scaling rows hide (each
 delivery brings its own resolution and fit) and the button reads `Export N
 files`; `export-progress` then carries `variant` / `total`. The
 **Transcript tab** of the library (`TranscriptPanel.svelte`, over the pure, bun-tested
@@ -629,7 +738,9 @@ the changes grouped by what they touch and tinted by the design system's own
 it describes. **Preview** swaps the editor onto the proposed timeline behind a
 banner (`editor.previewingStaged`; any real edit or a fresh `load()` drops back to
 the live cut, and `refreshTimeline` parks an incoming live update rather than
-yanking the view) — so the proposal can be *watched*, not only read. Apply lands it
+yanking the view) — so the proposal can be *watched*, not only read, and the timeline marks what it
+changes (outlines on added / moved clips and titles, hatched ghosts for what it removes, Page Up / Page Down to step through the
+changes, a `place 2/3 · 5 changes` chip in the banner: frontend-timeline.md, *A proposal on the timeline is marked*). Apply lands it
 as one revision (confirming first when it went `stale`), Discard drops it. The queue card of the
 task whose edits are staged has no buttons of its own (`readyCard`: one Apply, in the review card);
 any other ready task's Apply / Dismiss and the remove ✕ report a refusal as a toast (`agent-tasks.ts`). The
@@ -640,6 +751,36 @@ engine. Below the queue, the **History** section renders
 `editor.history` (the `Revision[]` edit log, attributed to user/agent/system) with one-click
 `editor.revertTo(seq)`, and each row expands to *what* that revision changed
 (`revision_diff`).
+
+**The Preview frame and its scrub bar.** The frame is the delivery shape at `min(100%, 100cqh × aspect)` of its
+pane — the 720 px cap it had left it 62 % of the pane at 1920×1080 and a postage stamp at 2560×1440. What is asked of the
+backend follows the box: `preview-size.ts` `requestWidth(css width, dpr)` rounds `ceil(css × dpr)` up to 480 / 960 /
+1440 / 1920 (the top is the MCP frame tools' own cap; the backend takes any width and never scales a picture past its
+own, so the bound is only on cost), measured from the frame element by a `ResizeObserver`, the window's resize and a
+`(resolution: Xdppx)` media query (a window dragged to another monitor fires neither of the first two),
+**settled 200 ms** so a dragged panel edge is a few requests, not one per pixel; a box with no width (a hidden dock
+tab) is not a measurement — the last one stands, or nothing is asked. The width is then **held to the widest source the
+preview reads at the playhead** (`proxy-info.ts` `previewSourceWidth`: a ready proxy's width when the preview decodes it,
+else the original's; `capToSource`), since the default proxy is 1280 px wide and a 1440 / 1920 px composite of it is the
+same picture upscaled at several times the decode cost on every scrub frame — not under a delivery frame, whose canvas is
+not the source's shape (`data-request-width` on the frame says what it asked). The pump (`frame-pump.svelte.ts`) takes it as `width()`, reads it in `run()` — a different
+step is a new frame — and asks nothing until the box has been measured, so a first frame is not decoded at a guess
+and again at the real size. (Playback's streamed frames ask for the same width, read when the stream starts.) The picture is clipped to the
+frame's radius and the frame's border is `border-strong`, since a black matte is 1.05:1 on the pane. **The HUD** over the
+picture is scrim chips with `text-on-video` (the name, ellipsised at 62 % of the width so a long file name never reaches the
+format, then `1920×1080 · 30 fps` in the transport's own rate format, and the proxy / analysis status chips with a dot) — bare
+tinted text was unreadable on a snow shot and on the Light theme's pale placeholder — and it no longer prints the timecode, which
+is the transport's. **`ScrubBar.svelte`** is a 16 px hit area around a 4 px rail (`--scrub-rail`, an alias of `text-disabled`, so
+the 3:1 it is held to covers it and it shows in High contrast, where the old `surface-inset` rail on the black bar was 1.05:1) with
+the in / out range behind the fill and a thumb that grows while held. A press moves the playhead there and a drag moves it
+*live* (`scrub.ts`: `scrubTime`, and `frameLimited` — at most one `ui.seek` per animation frame, with the newest position, since
+each seek is an FFmpeg composite); it is `beginDrag` (pointer capture, so the pointer may leave the bar; Escape /
+pointercancel / lost capture / blur put the playhead back where the press found it), playback is paused while the bar is held
+and resumes at either end of the gesture — except when it was let go at the very end of the cut, where `play()` would start
+the cut over (a seek mid-play restarts the audio each time). It is a `role=slider` with the cut's
+timecode as its value text; a press does not focus it (a focused slider owns Space and the arrows — the page stands down for
+the keys a slider operates — so one left focused after a click would silence the transport shortcuts), and once Tab has
+put focus there its own keys are ← → a frame, ⇧← ⇧→ a second, Home / End the ends, Space play.
 
 **The GPU preview in the page** (`Preview.svelte`, `preview-bounds.ts`,
 `gpu-preview.svelte.ts`). With the setting on, a frame whose route is `gpu`
@@ -661,15 +802,92 @@ background shows the hole. The status bar names the renderer of the frame on scr
 430×240 · 23 ms · llvmpipe`, or `FFmpeg · <why>`), only while the setting is on, and the
 Settings dialog's Preview section carries the toggle and the machine's status line.
 
-**Modals are modal.** `ExportDialog` / `SettingsDialog` / `UpdateDialog` /
-`FitMusicDialog` / `StemsDialog` use the
+**Shared components** (`components/editor/`; `shared-components.test.ts` keeps the dialogs, the Inspector's rows and the toolbar on them).
+**`Modal`** is the shell of every dialog: the scrim (`--scrim` at 55 %, one `z-index` of 50 — a later sibling, the
+update dialog, stacks over an earlier), the panel (`--line-width` border, `--shadow-lg`), a header with an icon, the title (the
+dialog's accessible name, `aria-labelledby`) and a named close button (an `IconBtn`, `title="Close"`, an `x` icon), `trapFocus`,
+Escape, and an optional `footer` snippet drawn under a rule; the body is the dialog's own. What differs is props:
+`width` / `height` (px, never wider than the window), `busy` (a run that cannot be walked away from: Escape, the scrim *and* the
+close button are off, and the button is gone), `dismissOnScrim` (off for a dialog holding typed input or chosen options),
+`initial` (a selector for the field that takes focus on open) and `rescue` (see below). The close rules are the pure
+`mayClose(via, {busy, dismissOnScrim})` and `scrimClick` in `modal.ts`: a click closes only if the *press* began on the scrim
+too, so selecting text in a field and letting go over the dark no longer closes the dialog. Policy per dialog: Export
+`dismissOnScrim={false}` and never `busy` (closing mid-render leaves it running); Voiceover `busy={generating}`,
+`dismissOnScrim={scrimCloses(text, generating)}`, `initial="textarea"`; Fit / Stems / Update `busy` while they run; Settings none.
+**`SliderRow`** is one numeric property: label, slider, number field, and a 24 px slot for the keyframe button, on one grid
+(`72px 1fr 60px 24px` — `NUMBER_COL`, room for `100.00s` in the 12 px mono type — the slot kept when empty so every slider in the panel is the same length; `reserve={false}` in
+a dialog; `minmax(0, 1fr)` so the row shrinks to the Inspector's 260 px minimum without clipping a value). The slider is
+`MixSlider` (`solid`: drawn like the plain range) so a drag writes **one edit on release**, Escape / pointercancel / blur
+abandon it, a run of arrow keys is one edit and a double-click puts the property back to its rest value. **Only the thumb
+takes hold, so a click elsewhere on the track no longer jumps the value** — a deliberate change from the native range it
+replaced, as in the mixer: a jump on the first click would make a double-click three edits (jump, jump, reset). The rest value (`neutral`) is a
+tick on the travel, and a property that goes both ways (`bipolar`, by default a travel across zero) fills from it instead of
+from the left. The number is a field (click, type, Enter or Tab to write, Escape to put it back; `1.1` on a 0.25 step is fine):
+what is shown is `value × scale` with `digits` decimals and a `unit` (`PERCENT`, `DEGREES`, `TIMES`, `SECONDS`), and the geometry,
+snapping, readout, entry parsing and key steps are the pure, bun-tested `slider-row.ts` (a typed entry is NFKC-normalised, so full-width digits parse, and held to `limit`, a fade
+as long as its clip on a 5 s slider, and to the digits shown: a fade is 0.01 s, a title's size 0.1 %). A value is *at rest* only when it
+is exactly there — a 0.4° rotation reads 0° and can still be reset or typed to 0. **A write goes to what the edit began on**: a typed
+entry is written when the field blurs, and the click that selects another clip blurs it after the selection has moved, so the row
+reads its `scope` (clip, title, playhead time; `Pending` in `slider-row.ts`) when a drag, a key run or a typed entry *starts* and hands it
+back with the value (`at`); the entry is parsed with the **spec it began with** too (a fade typed on a 20 s clip and committed by the click on a 3 s one is not
+clamped to 3 s), and focusing the number field starts a fresh `Pending`, so one left behind by a row that was disabled mid-focus is not inherited; the Inspector's helpers (`setTf`, `setCol`, `setCam`, `patchMask`, `setFade`, `moveTitle`, and a keyed
+number's `keyAtPlayhead`) read that clip. **A plain field** (`numRow`, a title's Text / Color / Box / Font / Bold, an effect's parameters, the
+Transitions tab's length) is no different: its `change` comes with the blur, by when the selection has moved *and the field has been
+re-rendered with the new selection's value*, so reading either writes the other clip's number onto this one. `FieldEdits`
+(`field-edit.ts`) notes the scope on `focus` and the typed text on `input` and `compositionend`, and the commit takes both from there (`noteFocus` /
+`noteTyped` / `endEdit` in the Inspector); a select or a checkbox changes at once and only needs the scope. A bun test holds every
+text and number input of the Inspector to this. Rest values are the model's
+`DEFAULT_TRANSFORM` / `DEFAULT_COLOR` / `DEFAULT_REFRAME` / `DEFAULT_MASK`. The Inspector's other rows (read-only values, plain number
+fields) share the label column and run to the panel's edge over the keyframe slot, which a source range needs at the 250 px minimum. The ◇ is a 24 px `IconBtn` with a `diamond` icon (filled while a key sits at the playhead).
+A plain `<input type=range>` (Settings, the timeline zoom) gets an 18 px hit box and `min-width:0` from `layout.css`.
+**`ToolbarToggle`** is a button of the timeline toolbar: 24 px high and at least 24 px wide, one radius, and one "on" for every kind
+of button — the amber outline and wash (`kerf-400` border, `kerf-300` on `selection-fill`, a pair the contrast guard holds to 4.5:1)
+whether it is a tool, a mode (snapping is a pressed magnet, not a word that changes width), a view or a menu with something chosen.
+`pressed` is a toggle (announced as one), `on` lights without announcing, neither is an action; `bare` is no outline while idle (tools,
+zoom), `square` a picture-only button. Its states are `.k-tt` in `controls.css`, which the veil leaves alone.
+
+**Tooltips are `use:tip`, not `title=`** (`tip.ts`; `tip-guard.test.ts` fails on a native `title` on any plain element, on a
+component that would pass one on to a plain element, and on one set from script — `Btn`, `IconBtn` and `ToolbarToggle` take a `title`
+prop and route it to the action). `use:tip={'Razor'}`, or `{ text, keys, detail }` — `settings.tip(label, actionId, detail?)` makes
+one with the user's key (`keys`, drawn as keycaps by `accel.ts`) and a muted second line, so a long hint is a noun plus a sentence
+instead of a paragraph in one line (a string's lines after the first are its detail). One tip is up at a time: it shows after 400 ms
+(60 ms right after another has gone, so a row of buttons reads as one sweep, and at once when the keyboard focuses a control —
+`:focus-visible` only, a click that focuses is not asking, and never a field you type in — `raisesFocusTip`: it would cover the next one),
+and goes on a press, a scroll, leaving or Escape. **Escape only dismisses; it is never consumed**, so a slider's Escape-to-abandon and a dialog's Close
+work with a tip showing. It is dismissible and
+persistent but **not hoverable by design** — a tip that took the pointer would sit over the next toolbar row and eat the click meant for
+it. It is the menu's surface (`--surface-raised`, `--shadow-md`, `--radius-sm`), `role=tooltip`, and `aria-describedby` points at it
+while it shows — the whole tip when it says more than the element's name, only its detail when the name *is* the tip's text
+(`describeTarget`: a screen reader would say the label twice); an element with no name of its own (an icon button) takes the tip's text as its
+`aria-label`, since the `title` that used to name it is gone. One element per *document* (`realm.ts`), so a detached panel window draws its own; no fade under
+`prefers-reduced-motion`. The timing (`createTipController`), placement (`placeTip`) and the rest are pure and bun-tested; the tip
+does not appear on a disabled control in engines that drop its pointer events (Chromium delivers them; WebKit untested).
+**Context menus are keyboard menus** (`ContextMenu.svelte` over `menu-nav.ts`, shared with the menu bar's `stepFocus` / `typeahead`): it
+takes focus when it opens — the panel for a pointer, the first row when it was opened from the keyboard (the Menu key, Shift+F10, Enter
+on a button; judged from the invoker's `:focus-visible`) — ↓ ↑ wrap, Home / End jump, Enter / Space run, a letter jumps to the next row
+that starts with it, Escape closes and gives focus back to the invoker, Tab closes and goes on. Rows are roving-tabindex `menuitem`s; a disabled
+row is `aria-disabled`, not `disabled`, so it takes focus and says why; the lit row is one at a time (`:hover` and the keys' `:focus-visible`, the
+pointer moving focus to the row it is over). The capture-phase key handler keeps a menu's keys from reaching the page's shortcuts. An action that
+opens a dialog finds focus on the invoker, so the dialog's own focus return works. At 1366×768 an ArrowDown used to scroll the page and
+close the menu. A menu opened from the keyboard starts on its first *runnable* row (`startRow`). A group of radio chips (Settings' proxy size and preview
+source) is one tab stop (`tabStop`: the chosen chip if it can take focus, else the first that can — Preview source disables all but "Always original"
+while proxies are off) the arrows move through (`roving.ts`; selection follows focus, except Proxy size, where a choice rebuilds every proxy, so its
+arrows only move focus and Space / Enter choose); a chip that is on or off carries `aria-pressed`, the Settings rail `aria-current="page"`, and a button that is a picture or a glyph has a name
+(`a11y-guard.test.ts` scans the markup for each, and that the one focus rule lists `textarea`).
+**Progress bars say what they know** (`ProgressBar.svelte`, `.k-progress` in `controls.css`): a `progressbar` with an accessible name that fills to its
+value, or — with none (a download of unknown size, a stage that reports nothing, an export waiting on its proxy) — sweeps a segment along the track
+rather than parking it at 30 %; under `prefers-reduced-motion` the whole track is tinted instead (`progress-guard.test.ts`).
+**About Kerf** is a dialog (`AboutDialog`, `ui.aboutDialog`; `about.ts`): version, platform, build, licence, and *Copy version info* — the text a bug
+report needs, the same lines that are on screen.
+
+**Modals are modal.** Every dialog is a `Modal` (above), which uses the
 `trapFocus` action (`src/lib/modal.ts`: takes focus, wraps Tab, restores focus on
-close; `VoiceoverDialog` too, with `initial: 'textarea'`), and `+page.svelte` makes the app behind them `inert` and returns early from its global key handler while
+close; Voiceover starts on its textarea via `initial`), and `+page.svelte` makes the app behind them `inert` and returns early from its global key handler while
 any is open — Space / Delete / J-K-L / ⌘Z would
 otherwise edit the live project under a dialog; a file drop is ignored then too.
 Every shortcut — bare keys and ⌘ chords alike — stands down inside any text input /
 textarea / select / contenteditable. **Focus survives a run and a menu.** A dialog whose footer
-swaps for a run (Export, Voiceover, Stems, Fit) passes `rescue: true` and marks its footer actions
+swaps for a run (Export, Voiceover, Stems, Fit, Update) passes `rescue` and marks its footer actions
 `data-rescue`: when the button that had focus is replaced or disabled a `MutationObserver` moves it to
 the live action (Generate → Cancel, and back to Generate when the run ends) or to the dialog root,
 not `<body>` (`focusLost`, pure). On close focus goes back to the control that had it; if that is
@@ -684,8 +902,14 @@ regenerated from an existing voiceover); Settings / Update / Fit / Stems still c
 SQLite file and every edit is committed as it happens, so only a never-saved,
 non-empty project (`editor.hasUnsavedWork`) can be lost — New, Open, the window's
 close request (`onWindowCloseRequested`) and the updater's *Restart now* all
-confirm first through `confirmAction` (the dialog plugin's `ask`; the plugin
-replaces `window.confirm` with an async one, so it cannot be used as a guard). A
+confirm first (the plugin replaces `window.confirm` with an async one, so it cannot be used as a
+guard). **A confirm names its buttons as verbs** (`confirm-copy.ts` is the copy deck as data): the
+unsaved-project prompts are `askUnsaved` — a native three-button dialog, **Save… · Don't save ·
+Cancel** (Discard on New / Open), "Save…" opening the save dialog and going ahead only once a file was
+written (`proceedAfter`), and a dismissed or unrecognised answer always Cancel so nothing is lost; the
+rest are `confirmAction(message, title, { ok, cancel })` — *Restart anyway*, *Reset all*, *Apply and
+replace*, *Replace* — where `labels` is a required argument, so a Yes / No prompt cannot be asked. A platform that cannot show
+named buttons falls back to the plugin's own two-button `ask` with the same labels (without Save); the browser harness has `window.confirm`. A
 render is `editor.exportRun` (progress + cancelling), not dialog state: closing
 the export dialog mid-render leaves it running, the status bar shows it with a
 **Stop**, and reopening the dialog shows the same bar. The `invoke` wrapper
@@ -701,7 +925,12 @@ gone in four seconds, which is fine for "Clip copied" and useless for the model
 download that failed with a reason worth reading. The title bar's bell opens
 `NotificationCenter.svelte` (All / Unread / Problems, per-row read toggle, mark all
 read, clear) and badges the unread count, red when anything unread actually failed.
-Errors and warnings also linger longer on screen than sonner's default. The log is
+Errors and warnings also linger longer on screen than sonner's default. **The log keeps a notice's
+`description`** (the reason under a failure — "permission denied (os error 13)") and shows it under the
+line; the panel takes focus when it opens and Escape gives it back to the bell. A failure toast leads with what was being done
+and then says why — `Export failed — Permission denied (os error 13)` (`failure-copy.ts`: the backend's
+`invalid argument:` / `media engine error:` layer off, the first letter up; `Couldn't …`, never `Could
+not`) — and a finished file is named by its file, `Exported cut-1x1.mp4` with *Show in folder*. The log is
 deliberately *not* replayable — a toast's "Undo" action is dropped rather than kept,
 since an hour later it would undo whatever the newest revision is, not the edit the
 notice was about. It is also why the failure paths that used to reject into nothing
@@ -787,7 +1016,14 @@ alongside `editor`/`ui`/`agent`): it runs a *silent* check at startup and every
 `idle → checking → { current | available → downloading → ready } | error`. The
 title bar's version chip turns into an amber "⬇ 0.18.0" button when something is
 available and opens `UpdateDialog` (release notes, download progress, then
-**Restart now** — which warns first when the project has unsaved changes; a failed *check* is titled
+**Restart now** — which warns first when the project has unsaved changes (the same fact in the dialog's
+banner). The download **holds the dialog still** (`busy`, no Hide): on Windows the plugin's `downloadAndInstall` launches the
+installer and exits the app when it is done, past every close guard, so a hidden download could take unsaved work and a running
+export with it, silently. **Install asks first, on Windows only** (`installPrompt(risk, isWindows())`, `confirm-copy.ts`; macOS and Linux do not exit after the
+download — the update waits for *Restart now*, which asks about unsaved work itself — so they keep the plain flow and the neutral footer
+`downloadingNote`): with an unsaved project the three-button *Save… · Install anyway · Cancel*, with only an export, an analysis or an import
+(or 360 stitch) running a two-button one saying it will be stopped, and nothing at stake no question; `install()` itself ignores a second press while one runs. The line over the body reads `Current 0.24.0 → 0.25.0 · 1 Oct 2026`
+(`versionLine`, not "Installed … →"); a failed *check* is titled
 "Couldn't check for updates", never "up to date", says so in a sentence with the raw error under a
 *Details* disclosure, and the AppImage fallback note shows only for a failed install on Linux
 (`isLinux`, `keymap.ts`) — `update-copy.ts`); the
@@ -799,7 +1035,8 @@ with **`?update=1`** offers a synthetic 0.99.0 and simulates the download, makin
 the dialog explorable without a signed desktop build.
 `bun run dev` with **`?staged=1`** seeds a synthetic agent proposal (a tightened
 intro), which is how the whole review flow — card, preview swap, apply, discard — is
-driven end-to-end without a desktop build. **`?music=1`** lays the harness's song (`music.mp3`,
+driven end-to-end without a desktop build (with `?music=1` as well it also removes the song, so there is a removal
+to draw). **`?music=1`** lays the harness's song (`music.mp3`,
 always in the library, with a bar grid) on its own track A2 — bar ticks on the ruler and
 *Fit to video* (see frontend-timeline.md) are then one right-click away.
 `data.ts` keeps only the `STATUS_MAP`/`PRESETS` presentation bits —

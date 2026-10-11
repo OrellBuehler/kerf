@@ -8,6 +8,8 @@
 	import { previewSourceNote } from '$lib/proxy-info';
 	import { inTauri, revealLogs } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
+	import { tip } from '$lib/tip';
+	import { formatTimecode } from '$lib/timecode';
 
 	const showLogs = inTauri();
 
@@ -40,14 +42,7 @@
 		)
 	);
 
-	function tc(s: number): string {
-		const total = Math.max(0, s);
-		const h = Math.floor(total / 3600);
-		const m = Math.floor((total % 3600) / 60);
-		const sec = Math.floor(total % 60);
-		const mm = `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
-		return h > 0 ? `${h}:${mm}` : mm;
-	}
+	const tc = (s: number): string => formatTimecode(s, editor.fps);
 </script>
 
 <div
@@ -56,7 +51,7 @@
 	{#if meta}
 		<span style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted)">{meta}</span>
 	{/if}
-	<span style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted)">
+	<span use:tip={'Length of the cut'} style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted)">
 		{tc(editor.duration)}
 	</span>
 	<div style="flex:1"></div>
@@ -65,7 +60,7 @@
 		<span
 			data-testid="preview-source"
 			data-source={sourceNote.tone}
-			title={sourceNote.title}
+			use:tip={sourceNote.title}
 			style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:var(--text-xs);color:{sourceNote.tone === 'proxy'
 				? 'var(--kerf-300)'
 				: sourceNote.tone === 'waiting'
@@ -80,7 +75,7 @@
 		<!-- Which renderer made the frame on screen (a dev aid; only with the GPU preview on). -->
 		<span
 			data-testid="preview-renderer"
-			title={gpuPreview.reasons.length ? gpuPreview.reasons.join('\n') : 'Drawn by the GPU compositor'}
+			use:tip={gpuPreview.reasons.length ? gpuPreview.reasons.join('\n') : 'Drawn by the GPU compositor'}
 			style="max-width:46%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:var(--text-xs);color:{gpuPreview.renderer === 'gpu' ? 'var(--kerf-300)' : 'var(--text-muted)'}"
 		>
 			{gpuPreview.label}
@@ -104,9 +99,9 @@
 		<button
 			type="button"
 			disabled={editor.exportRun.cancelling}
-			title="Stop the export and delete the partial file"
+			use:tip={'Stop the export and delete the partial file'}
 			onclick={() => void editor.stopExport()}
-			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);padding:1px 6px"
+			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);height:24px;padding:0 8px"
 		>
 			{editor.exportRun.cancelling ? 'Stopping…' : 'Stop'}
 		</button>
@@ -121,9 +116,9 @@
 		<button
 			type="button"
 			disabled={ui.stoppingAnalysis}
-			title="Stop analyzing — it gives up between steps, and within about a second during transcription"
+			use:tip={'Stop analyzing — it gives up between steps, and within about a second during transcription'}
 			onclick={() => ui.stopAnalysis()}
-			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);padding:1px 6px"
+			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);height:24px;padding:0 8px"
 		>
 			{ui.stoppingAnalysis ? 'Stopping…' : 'Stop'}
 		</button>
@@ -138,7 +133,7 @@
 	<!-- Where the project lives; the title bar has its name. -->
 	<span style="width:1px;height:12px;background:var(--border-default)"></span>
 	<span
-		title={editor.currentPath ?? 'In-memory project — not yet saved'}
+		use:tip={editor.currentPath ?? 'In-memory project — not yet saved'}
 		style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted);max-width:min(320px,40vw);min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 		>{editor.currentPath ?? 'local · in-memory'}</span
 	>
@@ -146,10 +141,10 @@
 		<span style="width:1px;height:12px;background:var(--border-default)"></span>
 		<button
 			type="button"
-			title="Open the log folder — attach kerf.<date>.log when reporting an issue"
+			use:tip={'Show log folder\nAttach kerf.<date>.log when reporting an issue.'}
 			onclick={() =>
 				revealLogs().catch((e) => toast.error(e instanceof Error ? e.message : String(e)))}
-			style="display:inline-flex;align-items:center;gap:5px;background:none;border:none;cursor:pointer;color:var(--text-muted);font-size:var(--text-xs);padding:0"
+			style="display:inline-flex;align-items:center;gap:5px;background:none;border:none;cursor:pointer;color:var(--text-muted);font-size:var(--text-xs);height:24px;padding:0 6px"
 		>
 			<Icon n="folder-open" s={11} />
 			Logs

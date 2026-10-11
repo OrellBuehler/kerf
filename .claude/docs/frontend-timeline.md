@@ -11,7 +11,8 @@ tempos' `downbeats`, which music with a fitted bar grid carries and speech does 
 taller and heavier than a beat, in the same `--beat-marker` token, and kept when the beats
 have folded away on zoom-out — a bar is ~4× sparser) mapped from `AssetAnalysis` and
 real audio waveforms (below); the razor tool splits, Delete removes, Shift+Delete
-ripple-deletes, clicks select/seek, and (pointer tool) **clips drag to reposition** — free
+ripple-deletes, clicks select (a click on a clip, a title or empty lane space leaves the playhead alone — see
+*Gestures* below; the ruler seeks), and (pointer tool) **clips drag to reposition** — free
 positioning with gaps, snapping to clip edges / playhead / 0 / beats, and **dropping onto another
 same-kind track** (`move_clip`, via pointer events + `data-lane` hit-testing) — and
 **edge-drag to trim** (6px `ew-resize` handles; clamped to source handles, neighbors and
@@ -89,13 +90,32 @@ forces ripple; a clip on a locked track is left alone and stays selected, and Cu
 and a logarithmic slider; ⌘/Ctrl + wheel is exponential in the delta (a pinch is smooth) and
 holds the time under the pointer (`zoomAround`; the scroll is applied after the lane has
 been rewidened); **⇧Z / the fit button** fits the cut (`ui.zoomToFit()` bumps `fitEpoch`,
-since only the timeline knows its width). The ceiling comes down for a very long cut so the
+since only the timeline knows its width). **Until anyone sets the zoom it follows the cut**
+(`ui.zoomFollowsCut`, true again for each project; `ui.zoom` is an accessor whose setter is "a
+person took it"; only `followZoom`'s own fit goes through `ui.fitZoomTo`, and an **explicit Fit is a person's
+action too** — ⇧Z or the button ends the following, so a later resize does not swap the uncapped fit
+for the 100 px/s-capped one): `followZoom` fits when a
+project opens (`editor.loadEpoch`), when the first clip lands, when the window changes width (settled
+150 ms, so a panel sash does not rescale the lane per frame) and when the cut outgrows the window —
+but never past `AUTO_FIT_MAX` (100 px/s, so a 3 s cut is not blown up to the window) and not when
+the cut shrinks or a clip is trimmed, which would rescale the lane under every edit; a window
+under 160 px (a hidden dock tab) is nothing to fit to. **The lane box is at least the window wide**
+(`min-width: calc(100% - var(--track-header-w))`, `laneW`): the ruler, the row borders and the grid
+run to the edge, and what lies past the end of the cut (`cutEndX`) is dimmed behind a line, so a
+short cut is not taken for a short timeline. The ceiling comes down for a very long cut so the
 lane stays under 8 M px — the one thing a browser cannot lay out. Nothing else assumed a
 range: the waveform rung choice scales to any px/s (bottoming out at the engine's 2 ms
 bucket, 4 px at the ceiling) and frame snapping works in seconds. `ruler.ts` makes the
 label step follow the zoom and renders only the ticks in the visible window (hundreds,
-not an hour's worth), with sub-second labels and, once a frame is 8 px wide, a mark per
-frame.
+not an hour's worth). **The ruler is timecode.** Its steps are timecode steps (`rulerGrid(px/s, fps)`:
+a second is `nominal` frames, 30 at 29.97, and a step under a second is 1 / 2 / 5 / 10 / half-second
+frames), so a label is the project's `HH:MM:SS` (a whole-second step) or `HH:MM:SS:FF` (below it) of
+a tick that stands on that frame, at any rate. Ruler rows: what the analysis found hangs from the
+**top** edge (scene cuts, beats 3 px, bars 5 px), the label sits under it **beside its own major
+tick**, and the ticks stand on the bottom edge — a 12 px major at every label, 4 px minors between
+(ten, five, six… per step from a table of round divisions, never closer than 6 px) with a 7 px one
+halfway when the division is even, and once a frame is 8 px wide the frame ticks (6 px) *are* the
+minors. Beats and bars can no longer land on a label, which a bar tick used to.
 **Roll, slip and slide** are three more tools beside Select and Razor (timeline toolbar buttons, and Edit › Tool;
 `N` / `Y` / `U`; `Tool` is `'pointer' | 'razor' | TrimTool`) over `edit-modes.ts`.
 `src/lib/trim-tools.ts` is everything a drag needs of them, pure and bun-tested;
@@ -173,6 +193,98 @@ validation halves of `linkClips` / `unlinkClips`). A detached picture plays none
 line, no mixer strip when a video track's clips are all detached, and the Inspector's Volume / Audio
 effects give way to a note saying where it plays (its fades stay — they are the picture's). Picture clips
 never drew a waveform, so there is none to hide.
+**Locked tracks, clip names, the clock.** A **locked track looks locked**: its lane is hatched
+(`[data-lane][data-locked]`, the muted text colour at 22 % so every theme draws it), its clips are desaturated
+(`saturate(.45)`, not dimmed, which would drop the label's contrast) and a padlock chip stays at the left edge
+of the window as the lane scrolls; the header's lock is a padlock glyph (open / closed, a neutral fill when on —
+amber belongs to selection and solo), not the letter L. **A clip's name** (`.kname`, `clip-label.ts`) is
+`position: sticky` at the window's left edge, so a clip that starts off-screen keeps its name for as long as any of it
+is in view and never leaves the clip (the clip is `overflow: clip`, not `hidden`, because a hidden one is a scroll
+container and the label would stick to the clip instead of the window); a clip under 40 px shows none and says it in
+a tooltip; an audio clip's name (and a video clip's once it has thumbnails) sits at the foot on a 55 % scrim chip
+(`NAME_CHIP_PCT`, held to 4.5:1 over the brightest waveform in every preset). A clip has a **keyboard focus ring**
+(`--focus-outline`; it used to be beaten by an inline `outline: none`) and Enter / Space on a focused clip selects it.
+**Gestures give feedback** (all of it pure and bun-tested; `Timeline.svelte` draws it). *Snap lines* (`snap.ts`):
+a gesture that finishes an edge exactly on a magnet draws a full-height line at it with the magnet's name (`Playhead`,
+`Start`, `Bar 12`, `Beat`, `Edge V1`, `Title edge`) — read off the *result* (`markAt` / `snapLines`: which of the marks in play the
+edge sits on), not from a second snap, so it cannot disagree with where the clip went; a frame the edge merely rounded to is
+on nothing, and nothing shows with snapping off. Clip moves, edge trims, roll, slide, titles and a bin drop have it. *Readouts*
+(`gesture-readout.ts`, one `readoutChip` snippet, the roll / slip / slide chip's look): an **edge trim** says
+`Trim out −12 f · −0.40 s · length 00:00:09:18` beside the pointer, amber when the pointer asked for more than the clip may
+have (`trimLimitWhy`: neighbour / footage / the 0.05 s floor / the cut's start), red with the engine's reason when a linked or
+rippling trim would be refused; the part the trim takes away is hatched; and `ui.trimMonitor` gets a one-cell monitor of the
+edge frame (`trimEdgeMonitor`, the source frame the edge would show). A **clip move** says
+`Move +75 f · +2.50 s · 00:00:15:00 · V1` (the drop's refusal as its second line), the lane under the pointer takes a
+`--selection-fill` tint and the lanes of the wrong kind are stood back. The **razor** draws the cut it would make before it is
+pressed — a line through the clip under the pointer and through each linked partner it would take with it (none with Alt) at
+`splitPoint(snapPoint(…))`, with `Cut 00:00:05:12 · with A1` (+ the magnet it is on). *Shift = cut every track* is not here: it
+needs a one-revision batch split in the engine (`split_remove_clips` is the only batch cut).
+**Autoscroll** (`autoscroll.ts`): while a clip drag, edge trim, marquee, roll / slip / slide, title drag, ruler scrub or in / out /
+marker drag is held, the pointer in the 48 px band along the lanes' edge (or beyond it) scrolls the view at a speed
+proportional to its depth — a rate in px/s over real frame time with the sub-pixel remainder carried, 1400 px/s sideways at most,
+700 vertically for the two gestures that go between tracks — and then the gesture reads the pointer again
+(`rereadPointer`: the handlers take a `PointerLike`, so they do not need an event). A press that began inside the band waits
+until the pointer has been in the interior or moved 16 px toward the edge, so a clip grabbed near the window's edge does not
+run away on its first pixel. A slip counts the scroll as travel. The lane box **widens with the gesture** (`liveEnd`), so
+there is room to scroll into past the end of the cut. Escape / pointercancel / blur / a lost pointer capture stop it with the gesture — a ruler scrub puts the
+playhead back exactly where it was (`ui.restoreTime`, not re-rounded to a frame) and an in / out mark drag puts the marks back
+(`scrubFrom` / `markFrom`), a marker drag writes nothing. The playhead's
+*follow* is the same module (`followScroll`): while playing the view moves with it, pinned inside the edge it runs toward
+(no 75 % page flip); a jump off screen scrolls there smoothly (instantly under `prefers-reduced-motion`); never while a gesture
+is held.
+**A click selects and nothing more**: a plain click on a clip (a locked one too), a title, or a roll / slip / slide press that
+never drags leaves the playhead where it was parked, so a clip can be picked and then trimmed or cut at the playhead. The ruler
+(and the scrub bar, the minimap) seek. A click on empty lane space that has a selection to clear clears it and does not seek;
+with nothing selected it seeks. **The playhead is on a frame**: `ui.seek` rounds to the *nearest* frame of the cut (`frames.ts`
+`seekTime`; the end of the cut stays exactly the end), so a scrub or a click lands on `k / fps`, and
+the timecode, the picture and the playhead agree. A programmatic "go to the *start* of X" — a title picked or its menu's Go to
+start, a changed clip in the review card, a transcript line, `[` / `]` / Page Up / Page Down through a proposal — passes `{ snap: 'up' }` (the first
+frame at or after it, capped at the span's end for one shorter than a frame): rounding to nearest could stand up to half a
+frame *before* a title, where it is not yet on screen to select or drag. A **step** (← →, ⇧ a second, the scrub bar's keys) is
+`stepFrames`, measured from the frame being *shown* (`shownFrame`, the timecode's floor): a playhead left mid-frame by playback
+would otherwise round back onto the frame it shows, or skip one. A keyframe diamond seeks to the key exactly (`{ snap: 'exact' }`: keyframes are in seconds, and the Inspector's
+keyframe-at-playhead check has a tolerance that assumes the playhead is *at* the key). A scrub bar's hover chip says the frame a
+click would land on. It also **cannot stand past the end of the cut**: an effect in
+`+page.svelte` takes it back to the new end when an edit shortens the cut (an empty cut reads `00:00:00:00 / 00:00:00:00`).
+The playhead's *head* lives in the sticky ruler, so it stays when the tracks scroll vertically.
+**A clip with the keyboard focus nudges**: ← / → move it (and the selection it is part of) a frame, ⇧ a second, Alt leaves its
+linked partners (`nudge.ts`). A run of presses is one edit, written once the keys go quiet (450 ms), on Enter or when focus
+leaves; until then the clip is drawn where it will land as a drag is (the plan is `planMove`'s, so overlaps, locks and links
+are the drag's), Escape abandons it, and the undo key (`settings.actionFor(e) === 'edit.undo'`) during an unwritten run takes the
+run back, not the edit before it (redo drops the run and goes on). A move the backend would refuse is said in a toast.
+**Track order is drawn, not stored**: the lanes and headers show the video group highest layer first, then the audio
+(`track-order.ts` `displayTracks`: V3, V2, V1, A1, A2 — a later video track composites on top, and now it is drawn on top), with
+a 2 px rule between the groups; the overview strip follows. `Timeline.tracks`, every edit, the export and the agent's tools keep
+V1 … A1 order (`+ V` adds after the last video track, so it appears at the top). Lane lookup is by id (`data-track-id`), so
+hit-testing and the marquee are unaffected, and a move names its destination by track id. The group move *is* told: its lane
+offset ("two lanes down", applied within each kind) and the "no video track above V2" in its refusals are counted in the order
+drawn, so `planMove` is handed `drawnMoveTracks` (`multi-move.ts`: `displayTracks` of `moveTracks`) — a picture dragged up a lane
+takes its selected sound up too, as on screen, not toward A2.
+**A proposal on the timeline is marked** (`staged-diff.ts` `diffView`, from the staged `TimelineDiff` entries matched by id
+— `DiffEntry.overlay_id` carries the title an `overlay_*` entry is about — and the parked live cut for the geometry of what is
+gone): while `editor.previewingStaged`, added clips and titles are outlined solid in `--diff-add`, moved / trimmed / adjusted
+ones dashed in `--diff-shift` (the line style says it without the hue), a track the proposal adds or alters has a coloured bar on
+its header, and a clip or title it removes is a hatched `--diff-remove` ghost where it stood (under whatever now fills the space,
+with a strip along the lane's top that stays visible). The page's banner carries `‹ place 2/3 › · 5 changes` (places are the distinct times the
+changes sit at, `changePoints`; changes are the entries, so the two counts are not mixed) and a legend. Page Up / Page Down (and `[` / `]`, which
+need a layout that types them without AltGr or Option; not the arrows, which a focused button keeps) — `review.prevChange` / `review.nextChange`, rebindable, only while a
+proposal is on the timeline — step the playhead from place to place (`stepChange`, `snap: 'up'`). Page Up / Page Down scroll whichever panel has the keyboard, so the review takes
+them only from the editor surface (`focus-area.ts`: the page, the timeline or the preview — panels mark `data-editor-surface` — or
+the dock container around one); `[` / `]` work from anywhere. The mark is a frame drawn just
+inside the clip's border (`::after`, under `ClipOverlays` — handles, edges and the link badge draw over it — and
+`pointer-events: none`), not an outline, so the partner highlight and the focus ring still show on a marked clip.
+**One timecode** (`timecode.ts`): `HH:MM:SS:FF`, non-drop, hours always there so `00:00:20:15` is not read as
+minutes:seconds:frames — the transport, the timeline's clock, the status bar, the ruler (`HH:MM:SS` for a whole-second
+step), the mark and marker tooltips, the trim readouts, the keyframe tooltips and the export range. `mm:ss.cc`
+survives only in the Inspector's editable seconds fields and in the prose that mirrors Rust (`diff.ts`
+`formatTime`). **The timeline's clock** is the ruler's corner (`data-timeline-time`: playhead in amber, `/`, the cut's length;
+an empty cut is `00:00:00:00`, not the lane's 8 s minimum); the toolbar's unlabelled length is gone, and ripple's cue there
+is its icon.
+
+The transport's **scrub bar** (`ScrubBar.svelte`, `scrub.ts`) shows the time under the pointer on a chip above the rail
+(`chipLeft` keeps it inside the bar, and it follows the pointer while the bar is held) and a tick per marker (`markerTicks`:
+the marker's colour, one tick per spot).
+
 **Waveforms** are one `<canvas>` per audio clip covering only the on-screen part of it
 plus overscan (`ClipWaveform.svelte`; a one-hour clip at 96 px/s is 345 600 px, which no
 canvas holds). `waveform-view.ts` is the pure geometry: `sourceAt` maps clip pixels to
@@ -195,7 +307,9 @@ releases its tiles and shrinks its canvas to 1x1 (a canvas keeps its whole backi
 otherwise), and a redraw only assigns the canvas size when it changed.
 `waveform-draw.ts` fills one polygon per lane (not a line per sample), scaled by
 `effectiveGain` — clip volume through the track fader, as the export multiplies them —
-and repaints columns at full scale (|peak| ≥ 0.999, or pushed there by gain) in `--danger`;
+and marks columns at full scale (|peak| ≥ 0.999, or pushed there by gain) at their **tips**: 3 px of
+`--danger` on the upper and the lower edge, one band each per run, the body between left the wave colour
+(the whole column in red hid a loud passage behind a solid block that read as a rendering error);
 a canvas cannot read `var()`, so `readPalette` resolves `--waveform` / `--danger` once per
 `settings.theme` change. A stereo clip gets two lanes when its clip is at least
 `STEREO_MIN_HEIGHT` (48) px tall (`laneCount`, a function of pixels so the track-height
@@ -234,9 +348,19 @@ override, "all tracks" clears every exception, and the table is capped at 256. T
 three glyph buttons set all tracks (lit when every track agrees; View › Track height is the same choice); a track header's name is its
 menu (so is the header's right-click). Marquee hit-testing and lane `offsetTop` read the DOM,
 so they follow the heights. The compact titles lane is 27 px (`MIN_TITLE_LANE_PX`: the 26 px
-add button plus the lane's border).
-The **minimap** (`Minimap.svelte` over the pure `minimap.ts`; toolbar toggle, remembered) is
-the whole cut on a 36 px strip: a block per clip per track row (runs too fine to tell apart
+add button plus the lane's border). **With no title or caption on the cut the titles lane is a 16 px
+strip** (`COLLAPSED_TITLE_PX`, `titleLaneHeightFor`): its header is one button ("T Titles +") that adds a title
+at the playhead, and the lane still takes a right-click and a marquee; the first title expands it to the full
+lane. (It does not open on hover: a lane that grows under the pointer on its way to a track moves the clip it
+was aiming at.)
+The **toolbar** is `ToolbarToggle`s (`frontend.md`, Shared components): tools | Undo / Redo on the left, then
+zoom | snapping and Ripple | the three track heights and the overview | `+ V` / `+ A` and the delivery frame on the right,
+a rule between each group. Every one is 24 px high with a 24 px target at least, and lit the same way (amber outline
+and wash) — a tool, snapping (a magnet, `aria-pressed`), Ripple, the heights, the overview, a fade that is set, and the delivery
+frame once one is chosen. The track header's own S / L / DUCK toggles are not part of it.
+The **minimap** (`Minimap.svelte` over the pure `minimap.ts`; toolbar toggle, remembered; **hidden while
+the view already takes in 98 % of the cut** — `viewCoversCut`, so it costs its 37 px only once you are zoomed
+in, and the window fitted at open never shows it) is the whole cut on a 36 px strip: a block per clip per track row (runs too fine to tell apart
 merge, so blocks are bounded by the strip's width), the playhead, the in / out marks, and the
 visible window as a box. The box and the timeline's `scrollLeft` / zoom are one thing seen two
 ways (`windowRect` view -> box, `targetForRect` box -> view). Drag the body to scroll (the zoom
@@ -256,7 +380,11 @@ since the export omits unity from the graph; double-click resets), **fade handle
 at the top corners (picture and sound both fade, so every clip has them; the volume line
 is only for clips whose asset has audio; clamped to the clip and to each other,
 double-click clears), the fade ramps, **keyframe diamonds** (clip-local seconds; click
-seeks), and the **trim edges** with their halos. The top 14 px of a clip is the handles'
+seeks), and the **trim edges** with their halos — all drawn in **`--clip-accent`**, not `kerf-300`:
+Kerf Light's amber scale is dark (it is for text on a white panel), which over its dark clip bodies
+was 1.0–1.5:1, so the line and the handles were invisible; `clip-accent` is the light amber that holds 3:1 on
+every clip body in every preset (`theme-guard.test.ts`), the volume line carries a 70 % scrim halo so it
+also parts from a waveform of its own colour. The top 14 px of a clip is the handles'
 alone and the line's travel stays below it; the edge strips and the line's grab band do
 not overlap; nothing is hit-testable until the clip is hovered or selected, nor under the
 razor, nor on a locked track (keyframes still seek). Every gesture is `drag.ts`'s

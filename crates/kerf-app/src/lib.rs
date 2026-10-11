@@ -2053,15 +2053,25 @@ fn gpu_preview_status(gpu: State<'_, Arc<gpu_preview::GpuPreview>>) -> gpu_previ
     gpu.status()
 }
 
-/// One composited frame pushed to the webview during playback.
-#[derive(Serialize, Clone)]
-struct PlaybackFrame {
-    /// The timeline time this frame shows, so the webview can drop a frame that
-    /// arrived after the audio clock has already moved past it.
-    time: f64,
-    /// `data:image/jpeg;base64,…`, the same shape `get_timeline_frame` returns —
-    /// so the preview renders streamed frames through its existing path.
-    jpeg: String,
+/// Bytes in front of the JPEG in a playback message: the frame's timeline time as an `f64`, little
+/// endian. Mirrored by `parsePlaybackMessage` in `frontend/src/lib/frame-transport.ts`.
+const PLAYBACK_HEADER_BYTES: usize = 8;
+
+/// One composited frame as it goes to the webview during playback: [`PLAYBACK_HEADER_BYTES`] of
+/// timeline time (so the webview can drop a frame that arrived after the audio clock has already
+/// moved past it), then the JPEG, undecoded.
+///
+/// Raw bytes through the channel rather than a base64 `data:` URL in JSON: a quarter fewer bytes
+/// (76 -> 57 KB a frame at 1080p), no JSON to parse and no base64 to encode here. It is *not* a faster
+/// decode: measured in headless Chromium, the old path's `JSON.parse` + `img.src =` cost 0.1-0.3 ms a
+/// frame, since a data-URL image is decoded lazily and off the main thread, and `createImageBitmap`
+/// plus a canvas draw took no less than the `<img>` did (see `frame-transport.ts`). The page builds
+/// the data URL itself, for the frames it shows.
+fn playback_message(time: f64, jpeg: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(PLAYBACK_HEADER_BYTES + jpeg.len());
+    message.extend_from_slice(&time.to_le_bytes());
+    message.extend_from_slice(jpeg);
+    message
 }
 
 /// The id of the playback that *should* be running (0 = none). A stream keeps
@@ -2090,9 +2100,14 @@ static STOPPED_PLAYBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 ///
 /// Scrubbing and the settled frame still go through `get_timeline_frame` — one
 /// process per frame is right when you want *one* frame. Playback is the case
-/// that can't work that way: a spawn-seek-decode-exit cycle per frame caps well
-/// below frame rate, so this hands the whole span to a single long-lived ffmpeg
-/// and pushes frames up as they render.
+/// that can't work that way: a spawn-seek-decode-exit cycle per frame caps out
+/// well below frame rate, so this hands the whole span to a single long-lived
+/// ffmpeg and pushes frames up as they render, each as a raw message
+/// ([`playback_message`]).
+///
+/// `fps` and `max_width` are what the preview asks for; left out, the stream plays at the
+/// timeline's own rate and the default width (`kerf_core::playback_params`). The preview states
+/// them only after a stream could not keep up and it is restarting cheaper.
 ///
 /// Resolves only when playback ends; the caller is not expected to await it.
 #[tauri::command]
@@ -2101,7 +2116,8 @@ async fn start_playback(
     playback_id: u64,
     start: f64,
     fps: Option<f64>,
-    on_frame: tauri::ipc::Channel<PlaybackFrame>,
+    max_width: Option<u32>,
+    on_frame: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> CmdResult<()> {
     use std::sync::atomic::Ordering;
 
@@ -2119,25 +2135,31 @@ async fn start_playback(
         // Counted and logged below: whether frames reached the webview at all, and
         // how long the first one took, are the two facts that tell a stream that
         // never started from one whose frames the preview received and discarded.
-        // Without them a black pane looks identical either way.
+        // Without them a black pane looks identical either way. Late frames are the
+        // third: a stream whose count of them keeps growing is one that cannot render
+        // at the rate it was given, and the preview is restarting it cheaper.
+        let request = kerf_core::PlaybackRequest { fps, max_width };
+        let params = kerf_core::playback_params(&timeline, &assets, request);
         let began = std::time::Instant::now();
         let mut frames: u64 = 0;
+        let mut late_frames: u64 = 0;
+        let mut worst_late = 0.0_f64;
         let mut first_frame: Option<std::time::Duration> = None;
-        let result = kerf_core::stream_preview(&timeline, &assets, start, fps.unwrap_or(24.0), &mut |f| {
+        let result = kerf_core::stream_preview_with(&timeline, &assets, start, request, &mut |f| {
             // Superseded by a newer playback, or explicitly stopped — including by
             // a stop that arrived before this stream even started.
             if ACTIVE_PLAYBACK.load(Ordering::SeqCst) != playback_id || STOPPED_PLAYBACK.load(Ordering::SeqCst) == playback_id {
                 return false;
             }
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&f.jpeg);
             let sent = on_frame
-                .send(PlaybackFrame {
-                    time: f.time,
-                    jpeg: format!("data:image/jpeg;base64,{b64}"),
-                })
+                .send(tauri::ipc::InvokeResponseBody::Raw(playback_message(f.time, &f.jpeg)))
                 .is_ok();
             if sent {
                 frames += 1;
+                if f.late > 2.0 / params.fps {
+                    late_frames += 1;
+                }
+                worst_late = worst_late.max(f.late);
                 first_frame.get_or_insert_with(|| began.elapsed());
             }
             sent
@@ -2145,6 +2167,10 @@ async fn start_playback(
         tracing::info!(
             playback_id,
             frames,
+            fps = params.fps,
+            max_width = params.max_width,
+            late_frames,
+            worst_late_ms = (worst_late * 1000.0) as u64,
             first_frame_ms = first_frame.map(|d| d.as_millis() as u64),
             elapsed_ms = began.elapsed().as_millis() as u64,
             "playback stream ended"
@@ -2602,12 +2628,16 @@ fn platform_check(
     state: State<'_, AppState>,
     width: Option<u32>,
     height: Option<u32>,
-) -> CmdResult<Vec<kerf_core::DeliveryCheck>> {
-    // The export dialog can resize away from the project frame; when it does it
-    // passes the frame it is actually about to render, so the verdict is about
-    // the file that will exist rather than the one the project defaults to.
+    range: Option<kerf_core::TimeRange>,
+) -> CmdResult<kerf_core::PlatformReport> {
+    // The export dialog can resize away from the project frame and write only
+    // the marked span; when it does it passes the frame and range it is actually
+    // about to render, so the verdict is about the file that will exist rather
+    // than the one the project defaults to. The answer carries the cut it judged
+    // so the dialog can say its frame and length in words.
     let frame = width.zip(height);
-    state.project().platform_check(frame).map_err(|e| e.to_string())
+    let range = range.map(|r| (r.start, r.end));
+    state.project().platform_report(frame, range).map_err(|e| e.to_string())
 }
 
 /// Show a file in the OS file manager. The last step of an export: the render
@@ -3485,15 +3515,32 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        bring_forward, file_appender, file_layer, filmstrip_payload, launch_project, log_panic, panic_summary, project_arg,
-        require_json_path, require_local_output_path, reveal_once, truncate_log, LaunchProject, LaunchSlot, LogBudget,
-        FRONTEND_LOG_PER_SEC, REVEAL_FAILSAFE,
+        bring_forward, file_appender, file_layer, filmstrip_payload, launch_project, log_panic, panic_summary, playback_message,
+        project_arg, require_json_path, require_local_output_path, reveal_once, truncate_log, LaunchProject, LaunchSlot,
+        LogBudget, FRONTEND_LOG_PER_SEC, PLAYBACK_HEADER_BYTES, REVEAL_FAILSAFE,
     };
     use base64::Engine as _;
     use kerf_core::{Filmstrip, FilmstripSheet};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tracing_subscriber::prelude::*;
+
+    /// The bytes `parsePlaybackMessage` (frontend/src/lib/frame-transport.test.ts) is held to: the
+    /// same vector is spelled there, so the two ends cannot drift apart.
+    #[test]
+    fn a_playback_message_is_the_time_then_the_jpeg() {
+        let jpeg = [0xFF, 0xD8, 1, 2, 0xFF, 0xD9];
+        let message = playback_message(1.5, &jpeg);
+        assert_eq!(
+            message,
+            [0, 0, 0, 0, 0, 0, 0xF8, 0x3F, 0xFF, 0xD8, 1, 2, 0xFF, 0xD9],
+            "1.5 as a little-endian f64, then the frame untouched"
+        );
+        assert_eq!(message.len(), PLAYBACK_HEADER_BYTES + jpeg.len());
+        assert_eq!(f64::from_le_bytes(message[..8].try_into().unwrap()), 1.5);
+        let empty = playback_message(0.0, &[]);
+        assert_eq!(empty, [0u8; PLAYBACK_HEADER_BYTES]);
+    }
 
     /// A fresh directory under the system temp dir, removed when dropped.
     struct Scratch(PathBuf);

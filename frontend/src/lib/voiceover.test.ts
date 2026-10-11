@@ -94,11 +94,11 @@ describe('voices', () => {
 });
 
 describe('helpers', () => {
-	test('speed is clamped and printed without trailing zeros', () => {
+	test('speed is clamped and printed to two decimals, as the speed slider shows it', () => {
 		expect(clampSpeed(9)).toBe(2);
 		expect(clampSpeed(0.1)).toBe(0.5);
 		expect(clampSpeed(NaN)).toBe(1);
-		expect(fmtSpeed(1)).toBe('1.0×');
+		expect(fmtSpeed(1)).toBe('1.00×');
 		expect(fmtSpeed(1.25)).toBe('1.25×');
 		expect(fmtSpeed(0.95)).toBe('0.95×');
 	});

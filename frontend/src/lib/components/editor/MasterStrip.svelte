@@ -37,6 +37,7 @@
 	import { readingText, scopeLabel } from '$lib/levels-view';
 	import type { MasterBus } from '$lib/types';
 	import type { MeasureResult } from '$lib/editor-ui.svelte';
+	import { tip } from '$lib/tip';
 
 	let {
 		master,
@@ -179,7 +180,7 @@
 		class="limiter"
 		class:on={master.limiter}
 		aria-pressed={master.limiter}
-		title={master.limiter
+		use:tip={master.limiter
 			? `Limiter on — holds the finished mix under ${ceilingLabel(master.ceiling_db)}. ${APPROX}`
 			: `Limiter off — turn it on to hold the finished mix under the ceiling. ${APPROX}`}
 		onclick={toggleLimiter}>Limiter</button
@@ -218,7 +219,7 @@
 			class="mode"
 			aria-label="Duck mode"
 			value={gate ? 'gate' : 'compressor'}
-			title="How tracks flagged Duck dip under the rest of the mix. Compressor: a sidechain compressor dips them by how loud the rest is. Speech gate: they drop by exactly the depth set below while the rest of the mix speaks (easing down in about 50 ms, back up about 300 ms after it stops). {DUCK_NOTE}"
+			use:tip={`How tracks flagged Duck dip under the rest of the mix. Compressor: a sidechain compressor dips them by how loud the rest is. Speech gate: they drop by exactly the depth set below while the rest of the mix speaks (easing down in about 50 ms, back up about 300 ms after it stops). ${DUCK_NOTE}`}
 			onchange={(e) => void chooseMode(e.currentTarget)}
 		>
 			<option value="compressor">Compressor</option>
@@ -267,7 +268,7 @@
 		class="measure"
 		disabled={stopping}
 		aria-busy={measuring}
-		title={measuring
+		use:tip={measuring
 			? 'Stop measuring. The pass reads the whole mix, so on a long cut it can run for minutes; stopping keeps the last result.'
 			: 'Measure the loudness of the cut — integrated LUFS, true peak and loudness range, for the finished mix and each track — over the whole cut, or the in / out range when both marks are set. It reads the audio the export would render, so it takes a while on a long cut.'}
 		onclick={measuring ? onstop : onmeasure}
@@ -283,7 +284,7 @@
 
 	{#if result}
 		<div class="scope" class:stale>
-			<span title={stale ? 'The cut changed after this was measured — measure again' : undefined}
+			<span use:tip={stale ? 'The cut changed after this was measured — measure again' : undefined}
 				>{stale ? 'Out of date · ' : ''}{scopeLabel(result.range, result.levels.duration)}</span
 			>
 			{#if result.levels.estimated}
@@ -297,7 +298,7 @@
 				<div><dt>LUFS</dt><dd>{read.lufs}</dd></div>
 				<div><dt>True peak</dt><dd>{read.truePeak}</dd></div>
 				<div><dt>LRA</dt><dd>{read.range}</dd></div>
-				{#if read.shortTerm}<div title="The loudest three seconds"><dt>Short-term</dt><dd>{read.shortTerm}</dd></div>{/if}
+				{#if read.shortTerm}<div use:tip={'The loudest three seconds'}><dt>Short-term</dt><dd>{read.shortTerm}</dd></div>{/if}
 			</dl>
 		{/if}
 	{/if}

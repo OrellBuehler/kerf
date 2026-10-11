@@ -20,6 +20,7 @@
 	import { workspace } from '$lib/workspace.svelte';
 	import { LIBRARY_MIN_OPEN_WIDTH, LIBRARY_OPEN_WIDTH, LIBRARY_RAIL_WIDTH } from '$lib/layout';
 	import { LIBRARY_TAB_SPECS, stepTab, type LibraryTab } from '$lib/workspaces';
+	import { tip } from '$lib/tip';
 
 	/** The dockview panel this is mounted in, and the dock around it; absent when
 	 *  rendered on its own. */
@@ -201,7 +202,7 @@
 				aria-selected={open}
 				aria-controls={open ? 'library-content' : undefined}
 				aria-label={t.label}
-				title={open && solo ? `${t.label} — click to collapse` : `${t.label} — ${t.hint}`}
+				use:tip={open && solo ? `${t.label} — click to collapse` : `${t.label} — ${t.hint}`}
 				tabindex={t.id === focusTab ? 0 : -1}
 				onclick={(e) => pick(t.id, e)}
 				onfocus={() => (focusTab = t.id)}
@@ -223,7 +224,7 @@
 				style="height:32px;flex:none;display:flex;align-items:center;gap:8px;padding:0 6px 0 12px;border-bottom:var(--line-width) solid var(--border-subtle)"
 			>
 				<span
-					title={spec.hint}
+					use:tip={spec.hint}
 					style="flex:1;min-width:0;font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 					>{spec.label}</span
 				>

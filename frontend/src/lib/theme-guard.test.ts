@@ -5,6 +5,7 @@ import { contrastRatio, mixSrgb } from './contrast';
 import { posix, SRC, uiSources } from './test-sources';
 import { PRESET_IDS, PRESETS, SUPERSEDED_KERF_LIGHT, type ColorToken } from './theme';
 import { GENERATED_TITLE_FILL } from './titles';
+import { NAME_CHIP_PCT } from './clip-label';
 
 // Two guards that keep "every color is themable" and "every theme is readable"
 // true as the UI grows.
@@ -90,6 +91,12 @@ describe('color literals', () => {
 		expect(offenders).toEqual([]);
 	});
 
+	test('the scrub rail is the disabled color, so the 3:1 it is held to below covers it', () => {
+		const css = readFileSync(join(SRC, 'lib/styles/kerf-tokens.css'), 'utf8');
+		expect(css).toMatch(/--scrub-rail:\s*var\(--text-disabled\)/);
+		expect(readFileSync(join(SRC, 'lib/components/editor/ScrubBar.svelte'), 'utf8')).toContain('var(--scrub-rail)');
+	});
+
 	test('every exception is still needed', () => {
 		// A stale entry would quietly let literals back into a file that no longer
 		// has any reason to hold them.
@@ -134,7 +141,6 @@ const DISABLED_INK_ALLOWED: Record<string, string> = {
 	'lib/components/editor/MenuBar.svelte': 'the rows of a menu that are off',
 	'lib/components/editor/ContextMenu.svelte': 'the rows of a menu that are off',
 	'lib/components/editor/NotificationCenter.svelte': 'a note\'s icon, a read mark, and the buttons that have nothing to act on',
-	'lib/components/editor/Timeline.svelte': 'the ruler\'s minor ticks, a mark and not text',
 	'lib/components/editor/AgentPanel.svelte': 'the empty queue\'s decorative icon'
 };
 
@@ -254,7 +260,11 @@ const PAIRS: Pair[] = [
 		'clip edge, playhead / selection amber and drag ghost on the lane'
 	),
 	...cross(['kerf-500'], ['surface-panel'], SECONDARY, 'playhead amber on the ruler'),
-	...cross(['waveform'], ['track-audio'], SECONDARY, 'waveform on its clip')
+	...cross(['waveform'], ['track-audio'], SECONDARY, 'waveform on its clip'),
+	// What is drawn on a clip beside its body (`ClipOverlays`): the volume line, the fade handles and
+	// ramps, the keyframe diamonds. Kerf Light's `kerf-300` is a dark amber for text on a white
+	// panel, which on its dark clip bodies is 1.0:1; `clip-accent` is the light one.
+	...cross(['clip-accent'], CLIP_BODIES, SECONDARY, 'volume line, fade handles and keyframes on the clip body')
 ];
 
 /** The pairs a set of colors does not meet, each phrased with its numbers. */
@@ -343,6 +353,12 @@ describe('contrast', () => {
 		{ fg: 'kerf-300', tint: tintOf('selection-fill'), min: READING, what: 'lit toggle in the timeline toolbar', on: PANELS },
 		// Written inline in the dialogs' error blocks: `color-mix(in srgb,var(--red-600) 14%,transparent)`.
 		{ fg: 'red-400', tint: { hue: 'red-600', weight: 0.14 }, min: READING, what: 'error block in a dialog' },
+		// Toasts: the kind's 12 % wash over the toast's own surface (`routes/layout.css`), its line, its
+		// description, and its glyph and edge in the `-400` shade.
+		{ fg: 'text-primary', tint: tintOf('success-surface'), min: READING, what: 'success toast', on: ['surface-raised'] },
+		{ fg: 'text-secondary', tint: tintOf('success-surface'), min: READING, what: 'success toast description', on: ['surface-raised'] },
+		{ fg: 'text-secondary', tint: tintOf('danger-surface'), min: READING, what: 'error toast description', on: ['surface-raised'] },
+		{ fg: 'text-secondary', tint: tintOf('warning-surface'), min: READING, what: 'warning toast description', on: ['surface-raised'] },
 		{ fg: 'text-primary', tint: tintOf('danger-surface'), min: READING, what: 'agent connection banner' },
 		{ fg: 'text-primary', tint: tintOf('warning-surface'), min: READING, what: 'keyboard conflict prompt' },
 		{ fg: 'text-secondary', tint: tintOf('diff-remove-surface'), min: READING, what: 'stale proposal note' },
@@ -423,6 +439,17 @@ describe('contrast', () => {
 			const fill = resolveMix(GENERATED_TITLE_FILL, c);
 			const ratio = contrastRatio(c['text-on-video'], fill);
 			expect(ratio, `text-on-video ${c['text-on-video']} on the generated fill ${fill}`).toBeGreaterThanOrEqual(READING);
+		});
+	}
+
+	for (const id of PRESET_IDS) {
+		test(`${PRESETS[id].name}: a clip's name keeps 4.5:1 on its chip over the brightest waveform`, () => {
+			const c = PRESETS[id].colors;
+			for (const under of [c['waveform'], c['track-audio'], c['track-video']]) {
+				const chip = mixSrgb(c['scrim'], under, NAME_CHIP_PCT / 100);
+				const ratio = contrastRatio(c['text-on-video'], chip);
+				expect(ratio, `text-on-video on the chip over ${under}`).toBeGreaterThanOrEqual(READING);
+			}
 		});
 	}
 

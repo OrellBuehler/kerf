@@ -26,7 +26,7 @@ export interface MediaInfo {
 	duration: string;
 	/** True when this is a derived file (a stitched Insta360 pair). */
 	stitched: boolean;
-	/** `Heart · 1.0×` for a synthesized voiceover, else `null`. */
+	/** `Heart · 1.00×` for a synthesized voiceover, else `null`. */
 	voiceover: string | null;
 }
 

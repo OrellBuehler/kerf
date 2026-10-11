@@ -99,6 +99,39 @@ so the feature is **only** activated through these forwards — which is what ma
   probe is added: `generate_proxy`'s own argv, and every argv in the golden oracle, is
   unchanged. `proxy_path` still costs the one cached `source_traits` probe of the *original*
   (it keys the file on HDR and the lead), as it did before.
+  **Whole-file analysis reads the proxy when one is ready** (never waited for: no file yet, "Always
+  original" or size Off, or a proxy that fails to read, and the original is read). Scene detection
+  (`detect_scenes_preferring(original, proxy, threshold)`, fed by `Project::scoring_proxy`) and a
+  contact sheet (`Project::sheet_proxy`) swap the path and nothing else, so no golden argv moves.
+  **The gate** is `proxy_fidelity`, from the cached `source_traits` of the original. *Times* (the
+  sheet): an MP4 / MOV / Matroska / WebM source (a transport stream's pad is not fixed and every
+  other container is unproven). *Scores* (scene detection): also SDR (no HLG / PQ transfer) and
+  `luma_plane` — a planar or semi-planar YCbCr or gray picture, whose plane 0 is the luma that
+  `select='scene'` scores and that a yuv420p proxy has; RGB (`gbrp`: the G plane; `rgb24`, `bgr0`:
+  every interleaved byte), packed YCbCr, a palette, alpha, an unknown or unprobed `pix_fmt` read the
+  original. Measured on the pinned 9.0.2 (`cli/scenes_on_proxy.rs`, `#[ignore]`d), through the software
+  (libx264) proxy — a hardware-encoded one is unmeasured: cut lists frame-exact for H.264, 10-bit
+  HEVC, 4:2:2 HEVC, a late video in MP4 and Matroska (the `.lead` pad's clone scores 0, and so does
+  the real first frame it duplicates), a display-matrix portrait clip and variable-rate Matroska;
+  the unpadded proxy of a late video is `lead` early. What a proxy does move is a frame's *score*,
+  by at most ~0.02 on SDR YCbCr (grain, compression), so a cut scored within that of the threshold
+  can flip; each fixture asserts its scores keep clear of it. HLG moves it by 0.20 to 0.21 (the
+  original is scored in its code values, the proxy is tone-mapped) and RGB by 0.53 (cuts lost), so
+  those read the original for scenes; a sheet only looks, so it takes the proxy (tone-mapped once).
+  FFmpeg 6 and older write a constant-rate proxy, so a variable-rate source's cuts are within half
+  a frame there. A sheet from a `.lead` proxy prefixes `trim=start_frame=1` when it starts at 0.000
+  (a later seek has skipped the clone), or the clone takes a slot and every cell shows its
+  neighbour's frame. Both reads are bounded: `-progress pipe:2` is added at spawn time and
+  `output_unless_stalled` kills ffmpeg after a stretch of stderr silence, so a hung proxy read
+  falls back to the original (a stalled original read is an error, not a short list of cuts).
+  ffmpeg reports **nothing until a frame has reached the output**, so the bound has to fit the
+  read: the scene pass selects frame 0 too (`eq(n,0)`, dropped again by `parse_scenes`, which
+  skips showinfo's `n:0`; never a cut) and reports every second from the start, 60 s
+  (`READ_STALL`) of silence being a wedge; a contact sheet's `tile` outputs only when the window
+  is decoded, so its bound is `sheet_stall` = 30 s per second of window, between 60 s and 2 h
+  (a 4:2:2 4K sheet is silent for the whole decode: 29 to 39 s measured).
+  `salience_map` (smart crop, framing) stays on the original: its crop moved by up to 4.6 % of the
+  frame width between original and proxy.
   **A proxy reports, can be abandoned, and cannot hang.** `generate_proxy_with(src, width,
   ProxyRun { reservation, duration, progress, cancel })` is `generate_proxy` with hooks (the
   latter is it with none): the encode runs through `run_ffmpeg_streamed`, which writes
@@ -127,7 +160,7 @@ so the feature is **only** activated through these forwards — which is what ma
   into its codec choices. Proxy generation uses the first verified h264 HW
   encoder and stitching the first hevc one (both fall back to libx264 on any
   failure, and one such failure disables HW encode for the process). Background
-  decodes (proxy, stitch, scene detection, the composited still) use the same
+  decodes (proxy, stitch, scene detection of an original, the composited still) use the same
   `-hwaccel` (default `auto`, `KERF_HWACCEL=none` to disable) with a learned
   software fallback shared with the preview path (`disable_decode_hwaccel()` is how a
   decoder outside the engine, `kerf-gpu`'s runs, teaches it one); the GUI defaults export
@@ -648,7 +681,29 @@ so the feature is **only** activated through these forwards — which is what ma
   used to delete each other's script. Frames are **paced to the requested fps against the wall clock**, which
   throttles ffmpeg through pipe backpressure instead of letting it race ahead and
   buffer the whole timeline, and each carries its timeline time so the webview can
-  drop one the audio clock has already passed.
+  drop one the audio clock has already passed, and `late` (seconds behind its slot on
+  that schedule; 0 when early) so a caller can tell a hiccup from a stream that renders
+  slower than it plays — late grows frame by frame in the second case. **Rate and
+  width are `playback_params`** (pure, unit-tested; `stream_preview_with` takes a
+  `PlaybackRequest { fps, max_width }`, `stream_preview` is a stated rate at the default
+  width): an unstated rate is **the cut's own** — `export_format` of `for_render()`, so a
+  muted track's footage does not set it — clamped to `MIN_STREAM_FPS..=MAX_STREAM_FPS`
+  (1..60: a display paints no more), and a stated one is clamped the same, a NaN /
+  zero / negative one counting as unstated; an unstated width is 960
+  (`PREVIEW_STREAM_WIDTH`), a stated one is clamped to 64..=1920 (the frame tools' own
+  cap), and `preview_resolution` still never renders wider than the footage. The preview
+  asks for its pane's width (`preview-size.ts`) so a playing frame is as sharp as the paused
+  one. Neither moves a golden: the builders take them as arguments. **A stream that cannot
+  keep up is restarted cheaper by the page, not caught up by the engine** — see
+  `frontend.md`: ffmpeg has no wall clock, so frames dropped after it rendered them save
+  nothing, and a stream at 50 of 60 fps is a sixth of a second further behind per second.
+  Measured here (4 shared cores, no GPU, ffmpeg 6.1, a 1280x720 all-intra proxy, JPEG q6, 3
+  threads): unpaced, one clip renders ~200 fps at 960 px (~12 ms CPU a frame), 160 at 1440, 80 at
+  1920; three layers 130 / 85 / 45. Paced at the cut's rate it delivers 24.1 / 30.1 / 60.1 fps with a
+  p99 lateness under 6 ms, for 0.40 / 0.43 / 0.68 cores (one layer, 1280 px) and 0.56 / 0.65 / 1.07
+  (three layers) — 60 fps costs about 1.7x the CPU of the 24 it used to be for 2.5x the frames. On
+  one pinned core at a 25% budget, 3 layers at 60 fps hold at 960 px (0.89 of the core) and not at
+  1280 (~50 fps) or 1920 (25), which is the overload the page steps down from.
   **Phone and camera footage** needs two things the container says rather than
   the pixels. *Rotation*: an iPhone portrait clip is a landscape frame plus a
   `Display Matrix`, and every FFmpeg decode autorotates it (nothing here passes
@@ -678,7 +733,9 @@ so the feature is **only** activated through these forwards — which is what ma
   (a view of `source_traits`, one cached ffprobe per file) and append the chain
   after their own downscale.
   Salience and scene detection are analysis, not picture, and read the raw
-  frames. **The proxy is where preview footage is converted**: `generate_proxy`
+  frames of the original; scene detection reads the proxy's instead only where
+  `proxy_fidelity` says its scores are the same (SDR YCbCr in MP4 / MOV / Matroska, see
+  above). **The proxy is where preview footage is converted**: `generate_proxy`
   tone-maps while it downsizes, `Project::preview_assets` hands the graph the
   proxy-swapped asset as `Asset::as_sdr_proxy` (same geometry, no HDR tags), and
   a file's proxy key gains `|sdr` when it is HDR, so a proxy cached before this

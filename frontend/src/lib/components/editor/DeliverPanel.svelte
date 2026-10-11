@@ -1,11 +1,12 @@
 <script lang="ts">
 	// The Deliver workspace's panel: where the cut is going, and the shapes to
-	// write it in. It is the export dialog's readiness verdict and its "Deliver
+	// write it in. It is the export dialog's platform check and its "Deliver
 	// to" choice, docked beside the preview — the same components, reading the
 	// same `ui.deliverShapes`, so a shape ticked here is ticked in the dialog.
 	// The render itself still goes through the full dialog (preset, destination,
 	// quality, range), which one button opens.
 	import Btn from './Btn.svelte';
+	import ProgressBar from './ProgressBar.svelte';
 	import SectionHead from './SectionHead.svelte';
 	import DeliverTo from './DeliverTo.svelte';
 	import Readiness from './Readiness.svelte';
@@ -13,6 +14,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { formatsFor, hasPicture, presetFor, ratioLabel } from '$lib/delivery-formats';
 	import { formatTimecode } from '$lib/timecode';
+	import { tip } from '$lib/tip';
 
 	const hasClips = $derived(editor.timeline.tracks.some((t) => t.clips.length > 0));
 	// Shapes are for a picture: the dialog ignores them for an audio-only cut, so
@@ -31,7 +33,7 @@
 		<div style="display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--text-secondary)">
 			<div style="display:flex;justify-content:space-between;gap:8px">
 				<span style="color:var(--text-muted)">Length</span>
-				<span style="font-family:var(--font-mono)" title="Non-drop timecode"
+				<span style="font-family:var(--font-mono)" use:tip={'Non-drop timecode'}
 					>{formatTimecode(editor.duration, editor.fps)}</span
 				>
 			</div>
@@ -49,16 +51,13 @@
 
 		{#if !hasClips}
 			<div style="margin-top:14px;font-size:12px;color:var(--text-muted);line-height:1.45">
-				Nothing to deliver yet — add a clip to the timeline and this panel judges the cut against each platform.
+				Nothing to deliver yet — add a clip to the timeline and this panel shows where it fits.
 			</div>
 		{/if}
 
 		{#if picture}
 			<SectionHead label="Deliver to" />
 			<DeliverTo where="named by shape beside the file you choose when you export, as" />
-		{/if}
-
-		{#if !shapes.length}
 			<Readiness />
 		{/if}
 	</div>
@@ -68,11 +67,7 @@
 	>
 		{#if rendering}
 			<div style="flex:1;display:flex;align-items:center;gap:10px;min-width:0">
-				<div style="flex:1;height:6px;border-radius:3px;background:var(--surface-inset);overflow:hidden">
-					<div
-						style="height:100%;width:{Math.round((progress?.fraction ?? 0) * 100)}%;background:var(--kerf-500);transition:width var(--dur-fast) linear"
-					></div>
-				</div>
+				<ProgressBar value={progress?.waiting ? null : (progress?.fraction ?? 0)} label="Exporting" />
 				<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)"
 					>{#if progress?.total != null && progress.total > 1}{(progress.variant ?? 0) + 1}/{progress.total} · {/if}{Math.round(
 						(progress?.fraction ?? 0) * 100

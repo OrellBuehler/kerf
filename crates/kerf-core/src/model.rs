@@ -4042,6 +4042,16 @@ impl Timeline {
         }
     }
 
+    /// The span a range export of `range` writes: `range` clamped to the cut, or `None` when there is
+    /// none or it is empty after clamping — an inverted, empty or wholly-past-the-end range falls back
+    /// to exporting everything. The one clamp the export and the platform check both read.
+    pub fn export_span(&self, range: Option<(f64, f64)>) -> Option<(f64, f64)> {
+        let (start, end) = range?;
+        let start = start.max(0.0);
+        let end = end.min(self.duration());
+        (end - start > 1e-9).then_some((start, end))
+    }
+
     /// A copy containing only `[start, end)`, shifted so `start` lands at 0 —
     /// the sub-timeline a range export renders. Clips overlapping the window
     /// edges are cut down (source window and keyframes adjusted, honoring speed
@@ -5328,6 +5338,9 @@ pub struct DiffEntry {
     pub track_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clip_id: Option<Uuid>,
+    /// The title or caption an `Overlay*` entry is about, so a view of the proposal can mark it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_id: Option<Uuid>,
     /// Where on the timeline to look, so the reviewer can jump straight to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<f64>,
@@ -5341,6 +5354,7 @@ impl DiffEntry {
             detail: None,
             track_id: None,
             clip_id: None,
+            overlay_id: None,
             at: None,
         }
     }
@@ -5357,6 +5371,11 @@ impl DiffEntry {
 
     fn on_clip(mut self, id: Uuid) -> Self {
         self.clip_id = Some(id);
+        self
+    }
+
+    fn on_overlay(mut self, id: Uuid) -> Self {
+        self.overlay_id = Some(id);
         self
     }
 
@@ -5948,6 +5967,7 @@ impl Timeline {
                             fmt_time(overlay.end)
                         ),
                     )
+                    .on_overlay(overlay.id)
                     .at(overlay.start),
                 ),
                 Some(before) => {
@@ -5955,6 +5975,7 @@ impl Timeline {
                         rest.push(
                             DiffEntry::new(DiffKind::OverlayChanged, format!("Changed text “{}”", overlay.text))
                                 .detail(detail)
+                                .on_overlay(overlay.id)
                                 .at(overlay.start),
                         );
                     }
@@ -5968,6 +5989,7 @@ impl Timeline {
                         DiffKind::OverlayRemoved,
                         format!("Removed text “{}” at {}", overlay.text, fmt_time(overlay.start)),
                     )
+                    .on_overlay(overlay.id)
                     .at(overlay.start),
                 );
             }
@@ -6999,6 +7021,24 @@ mod tests {
     }
 
     #[test]
+    fn export_span_clamps_to_the_cut_and_falls_back_to_everything_when_empty() {
+        let tl = Timeline {
+            tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 60.0)])],
+            overlays: Vec::new(),
+            markers: Vec::new(),
+            format: None,
+            master: Default::default(),
+        };
+        assert_eq!(tl.export_span(None), None);
+        assert_eq!(tl.export_span(Some((10.0, 30.0))), Some((10.0, 30.0)));
+        assert_eq!(tl.export_span(Some((-5.0, 20.0))), Some((0.0, 20.0)));
+        assert_eq!(tl.export_span(Some((40.0, 500.0))), Some((40.0, 60.0)));
+        assert_eq!(tl.export_span(Some((10.0, 10.0))), None);
+        assert_eq!(tl.export_span(Some((30.0, 10.0))), None);
+        assert_eq!(tl.export_span(Some((90.0, 120.0))), None);
+    }
+
+    #[test]
     fn slice_shifts_markers_into_the_window_and_drops_the_rest() {
         let mk = |t: f64, n: &str| Marker {
             id: Uuid::new_v4(),
@@ -7250,6 +7290,34 @@ mod tests {
         );
         // Every entry lands in the rendered summary the agent reads back.
         assert_eq!(diff.summary().lines().count(), 4);
+    }
+
+    #[test]
+    fn diff_overlay_entries_name_the_overlay() {
+        let mut before = Timeline::new();
+        let kept = TextOverlay::new("Kept", 0.0, 2.0);
+        let removed = TextOverlay::new("Gone", 5.0, 7.0);
+        before.overlays.push(kept.clone());
+        before.overlays.push(removed.clone());
+
+        let mut after = Timeline::new();
+        let mut changed = kept.clone();
+        changed.start = 0.5;
+        let added = TextOverlay::new("New", 3.0, 4.0);
+        after.overlays.push(changed);
+        after.overlays.push(added.clone());
+
+        let diff = before.diff(&after);
+        let id_of = |kind: DiffKind| diff.entries.iter().find(|e| e.kind == kind).and_then(|e| e.overlay_id);
+        assert_eq!(id_of(DiffKind::OverlayChanged), Some(kept.id));
+        assert_eq!(id_of(DiffKind::OverlayAdded), Some(added.id));
+        assert_eq!(id_of(DiffKind::OverlayRemoved), Some(removed.id));
+        // It rides the JSON the surfaces send, and is left out of an entry that has none.
+        let entry = diff.entries.iter().find(|e| e.kind == DiffKind::OverlayAdded).unwrap();
+        let json = serde_json::to_value(entry).unwrap();
+        assert_eq!(json["overlay_id"], serde_json::json!(added.id.to_string()), "{json}");
+        let marker = DiffEntry::new(DiffKind::MarkerAdded, "m".to_string());
+        assert!(serde_json::to_value(&marker).unwrap().get("overlay_id").is_none());
     }
 
     // ---- smart crop ---------------------------------------------------------

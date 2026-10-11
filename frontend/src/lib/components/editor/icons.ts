@@ -28,6 +28,7 @@ import {
 	Eye,
 	EyeOff,
 	Lock,
+	LockOpen,
 	Volume2,
 	VolumeX,
 	Clock,
@@ -56,6 +57,9 @@ import {
 	Download,
 	RefreshCw,
 	TriangleAlert,
+	CircleCheck,
+	CircleX,
+	Info,
 	Lightbulb,
 	ExternalLink,
 	Bell,
@@ -77,7 +81,8 @@ import {
 	Menu,
 	Music2,
 	Layers,
-	Headphones
+	Headphones,
+	Diamond
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -109,6 +114,7 @@ export const icons: Record<string, LucideIcon> = {
 	'eye': Eye,
 	'eye-off': EyeOff,
 	'lock': Lock,
+	'lock-open': LockOpen,
 	'volume-2': Volume2,
 	'volume-x': VolumeX,
 	'clock': Clock,
@@ -134,10 +140,14 @@ export const icons: Record<string, LucideIcon> = {
 	'chevron-down': ChevronDown,
 	'image': Image,
 	'x': X,
+	'diamond': Diamond,
 	'download': Download,
 	'refresh-cw': RefreshCw,
 	'external-link': ExternalLink,
 	'alert-triangle': TriangleAlert,
+	'circle-check': CircleCheck,
+	'circle-x': CircleX,
+	'info': Info,
 	'lightbulb': Lightbulb,
 	'bell': Bell,
 	'settings': Settings,

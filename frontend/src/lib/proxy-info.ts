@@ -162,7 +162,7 @@ export const PREVIEW_SOURCES: readonly { source: PreviewSource; label: string; h
 	{
 		source: 'original',
 		label: 'Always original',
-		hint: 'Full resolution, always. Proxies are not built, and scrubbing long-GOP 4K and 5K footage is slow.'
+		hint: 'Full resolution, always. Proxies are not built, and scrubbing 4K and 5K footage is slow.'
 	},
 	{
 		source: 'proxy_only',
@@ -189,6 +189,35 @@ function assetsAt(timeline: Pick<Timeline, 'tracks'>, assets: readonly Asset[], 
 		}
 	}
 	return out;
+}
+
+/**
+ * The widest picture the preview reads at `t`, px: for each video clip under the playhead, its proxy's
+ * width when that is the file the preview decodes (`ready`, and the source is not "always original" or
+ * proxies off), else the original's; the widest of them. `null` when it is not known (no clip, a
+ * source with no stated width) — a bound only ever applies to what is known. What is asked of the
+ * backend is capped at this: a 1440 px frame composited from a 1280 px proxy is the same picture,
+ * upscaled, at several times the decode cost on every scrub frame.
+ */
+export function previewSourceWidth(
+	timeline: Pick<Timeline, 'tracks'>,
+	assets: readonly Asset[],
+	statuses: Readonly<Record<string, ProxyStatus | undefined>>,
+	source: PreviewSource,
+	size: ProxySize,
+	t: number
+): number | null {
+	const mode: PreviewSource = size === 0 ? 'original' : source;
+	let widest: number | null = null;
+	for (const asset of assetsAt(timeline, assets, t)) {
+		const video = asset.streams.find((s) => s.kind === 'video');
+		if (!video) continue;
+		const status = statuses[asset.id];
+		const read = mode !== 'original' && status?.state === 'ready' && status.width ? status.width : video.width;
+		if (!read || !(read > 0)) return null; // one source of unknown width: no bound is safe
+		widest = Math.max(widest ?? 0, read);
+	}
+	return widest;
 }
 
 export interface PreviewSourceNote {
@@ -234,7 +263,7 @@ export function previewSourceNote(
 		return {
 			text: `preview: proxy${width ? ` ${width} px` : ''}`,
 			tone: 'proxy',
-			title: 'The frame is decoded from the all-intra preview proxy. Export reads the original.'
+			title: 'The frame comes from the lightweight preview copy. Export reads the original.'
 		};
 	}
 	const first = notReady[0];

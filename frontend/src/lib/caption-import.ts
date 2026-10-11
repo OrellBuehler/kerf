@@ -525,17 +525,15 @@ export function importCaptionsInto(
 	};
 }
 
-/** The one-line account of an import a toast can show: what landed, and — only
- *  when it happened — what did not. */
+/** The short account of an import a toast can show: what landed, and — only when it happened —
+ *  what did not, a sentence each (`Imported 2 of 3 cues. 1 fell outside the cut.`). */
 export function describeImport(s: CaptionImportSummary): string {
-	const lines = s.captions === 1 ? '1 caption' : `${s.captions} captions`;
-	const parts = [`Imported ${lines} from ${s.placed} of ${s.cues} cues`];
-	const aside: string[] = [];
-	if (s.dropped_outside) aside.push(`${s.dropped_outside} outside the cut`);
-	if (s.dropped_short) aside.push(`${s.dropped_short} too short`);
-	if (s.dropped_overlap) aside.push(`${s.dropped_overlap} overlapping`);
-	if (s.skipped_lines) aside.push(`${s.skipped_lines} unreadable`);
-	if (aside.length) parts.push(`(${aside.join(', ')})`);
-	if (s.replaced) parts.push(`· replaced ${s.replaced}`);
+	const cues = (n: number) => `${n} ${n === 1 ? 'cue' : 'cues'}`;
+	const parts = [s.placed === s.cues ? `Imported ${cues(s.placed)}.` : `Imported ${s.placed} of ${cues(s.cues)}.`];
+	if (s.dropped_outside) parts.push(`${s.dropped_outside} fell outside the cut.`);
+	if (s.dropped_short) parts.push(`${s.dropped_short} ${s.dropped_short === 1 ? 'was' : 'were'} too short.`);
+	if (s.dropped_overlap) parts.push(`${s.dropped_overlap} overlapped another cue.`);
+	if (s.skipped_lines) parts.push(`${s.skipped_lines} unreadable ${s.skipped_lines === 1 ? 'line was' : 'lines were'} skipped.`);
+	if (s.replaced) parts.push(`Replaced ${s.replaced} ${s.replaced === 1 ? 'caption' : 'captions'}.`);
 	return parts.join(' ');
 }

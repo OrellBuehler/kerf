@@ -4,12 +4,14 @@
 	// from the timeline. Empty, it says which of the five reasons applies.
 	import Icon from './Icon.svelte';
 	import Btn from './Btn.svelte';
+	import IconBtn from './IconBtn.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { mediaStatus } from '$lib/media-status.svelte';
 	import { toast } from '$lib/notifications.svelte';
 	import { activeLineIndex, srcToTimeline, transcriptLines, type TxLine } from '$lib/transcript';
+	import { tip } from '$lib/tip';
 
 	const txLines = $derived(
 		transcriptLines(editor.selectedMetadata?.analysis?.transcript ?? [], editor.selectedAssetId, editor.timeline.tracks)
@@ -17,7 +19,10 @@
 	const activeTx = $derived(activeLineIndex(txLines, ui.time));
 
 	function seekLine(l: TxLine) {
-		if (l.clip) ui.seek(srcToTimeline(l.clip, l.start));
+		if (!l.clip) return;
+		// The start of a line: the first frame inside it, so it is the line the playhead is on.
+		const from = srcToTimeline(l.clip, l.start);
+		ui.seek(from, { snap: 'up', end: Math.max(from, srcToTimeline(l.clip, l.end)) });
 	}
 
 	async function cutLine(l: TxLine) {
@@ -141,7 +146,7 @@
 					<button
 						onclick={() => seekLine(l)}
 						disabled={!l.clip}
-						title={l.clip ? 'Jump to this line on the timeline' : 'Not on the timeline (cut)'}
+						use:tip={l.clip ? 'Jump to this line on the timeline' : 'Not on the timeline (cut)'}
 						style="display:flex;gap:8px;flex:1;background:none;border:none;padding:0;text-align:left;opacity:1;cursor:{l.clip
 							? 'pointer'
 							: 'default'}"
@@ -157,12 +162,13 @@
 						>
 					</button>
 					{#if l.clip}
-						<button
+						<IconBtn
+							size={24}
+							data-tone="quiet"
 							title="Cut this line out of the timeline"
 							aria-label="Cut line"
 							onclick={() => void cutLine(l)}
-							style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center;padding:1px 0 0"
-							><Icon n="x" s={11} /></button
+							style="margin:-4px 0"><Icon n="x" s={12} /></IconBtn
 						>
 					{/if}
 				</div>

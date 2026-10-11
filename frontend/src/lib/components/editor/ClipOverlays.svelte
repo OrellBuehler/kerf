@@ -28,10 +28,12 @@
 	 * clip linked to it carries the level), and its fades are the picture's alone. */
 	import type { Keyframe, Clip } from '$lib/types';
 	import { clipDuration } from '$lib/types';
+	import { formatTimecode } from '$lib/timecode';
 	import { beginDrag } from '$lib/drag';
 	import { quantizeFade } from '$lib/frames';
 	import { gainLabel } from '$lib/mixer';
 	import { dragGain, lineTravel, lineY } from '$lib/volume-line';
+	import { tip } from '$lib/tip';
 
 	let {
 		clip,
@@ -230,7 +232,7 @@
 
 	const stop = (e: Event) => e.stopPropagation();
 
-	const stamp = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toFixed(2).padStart(5, '0')}`;
+	const stamp = (s: number) => formatTimecode(s, fps);
 </script>
 
 <div
@@ -260,7 +262,7 @@
 		<div
 			role="presentation"
 			class="grab vgrab"
-			title="Volume {gainLabel(volume)} — drag to change, double-click for 0 dB"
+			use:tip={`Volume ${gainLabel(volume)} — drag to change, double-click for 0 dB`}
 			onpointerdown={onVolumeDown}
 			ondblclick={onVolumeReset}
 			onclick={stop}
@@ -272,7 +274,7 @@
 		<div
 			role="presentation"
 			class="grab fgrab"
-			title="Fade in {fmtSeconds(fadeIn)} — drag to change, double-click to clear"
+			use:tip={`Fade in ${fmtSeconds(fadeIn)} — drag to change, double-click to clear`}
 			onpointerdown={(e) => onFadeDown(e, 'in')}
 			ondblclick={(e) => onFadeClear(e, 'in')}
 			onclick={stop}
@@ -283,7 +285,7 @@
 		<div
 			role="presentation"
 			class="grab fgrab"
-			title="Fade out {fmtSeconds(fadeOut)} — drag to change, double-click to clear"
+			use:tip={`Fade out ${fmtSeconds(fadeOut)} — drag to change, double-click to clear`}
 			onpointerdown={(e) => onFadeDown(e, 'out')}
 			ondblclick={(e) => onFadeClear(e, 'out')}
 			onclick={stop}
@@ -298,7 +300,7 @@
 			role="presentation"
 			class="kf"
 			class:blocked={tooled}
-			title="Keyframe at {stamp(k.time)} — click to go there"
+			use:tip={`Keyframe at ${stamp(k.time)} — click to go there`}
 			onpointerdown={stop}
 			onclick={(e) => onKeyframeClick(e, k)}
 			style="left:{Math.min(Math.max(k.time * pxPerSec, HANDLE / 2), Math.max(HANDLE / 2, width - HANDLE / 2)) - HANDLE / 2}px;top:{Math.max(0, height - HANDLE - 2)}px"
@@ -355,7 +357,7 @@
 		fill-opacity: 0.5;
 	}
 	.ramp {
-		stroke: var(--kerf-300);
+		stroke: var(--clip-accent);
 		stroke-opacity: 0.7;
 		stroke-width: 1;
 	}
@@ -367,8 +369,8 @@
 		left: 0;
 		right: 0;
 		height: 0;
-		border-top: 1.5px solid var(--kerf-300);
-		box-shadow: 0 0 0 1px color-mix(in srgb, var(--scrim) 45%, transparent);
+		border-top: 1.5px solid var(--clip-accent);
+		box-shadow: 0 0 0 1px color-mix(in srgb, var(--scrim) 70%, transparent);
 		opacity: 0;
 		pointer-events: none;
 	}
@@ -409,12 +411,12 @@
 		width: 10px;
 		height: 10px;
 		border-radius: 2px;
-		background: var(--kerf-400);
-		border: var(--line-width) solid var(--surface-void);
+		background: var(--clip-accent);
+		border: var(--line-width) solid var(--scrim);
 		box-sizing: border-box;
 	}
 	.fgrab:hover .square {
-		background: var(--kerf-200);
+		background: var(--text-on-video);
 	}
 
 	.kf {
@@ -435,12 +437,12 @@
 		width: 8px;
 		height: 8px;
 		transform: rotate(45deg);
-		background: var(--kerf-300);
-		border: var(--line-width) solid var(--surface-void);
+		background: var(--clip-accent);
+		border: var(--line-width) solid var(--scrim);
 		box-sizing: border-box;
 	}
 	.kf:hover .diamond {
-		background: var(--kerf-200);
+		background: var(--text-on-video);
 	}
 
 	.edge {
@@ -474,13 +476,13 @@
 	}
 	.halo.l {
 		left: 0;
-		border-left: 2px solid var(--kerf-400);
-		background: linear-gradient(to right, color-mix(in srgb, var(--kerf-400) 45%, transparent), transparent);
+		border-left: 2px solid var(--clip-accent);
+		background: linear-gradient(to right, color-mix(in srgb, var(--clip-accent) 45%, transparent), transparent);
 	}
 	.halo.r {
 		right: 0;
-		border-right: 2px solid var(--kerf-400);
-		background: linear-gradient(to left, color-mix(in srgb, var(--kerf-400) 45%, transparent), transparent);
+		border-right: 2px solid var(--clip-accent);
+		background: linear-gradient(to left, color-mix(in srgb, var(--clip-accent) 45%, transparent), transparent);
 	}
 	.edge:hover + .halo:not(.locked),
 	.halo.on {

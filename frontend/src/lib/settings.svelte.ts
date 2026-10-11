@@ -56,6 +56,7 @@ import {
 	type Resolution
 } from './keymap';
 import type { AnalysisKind, AppSettings, AutoAnalysis, PreviewSource, ProxySize, SettingsView } from './types';
+import type { TipSpec } from './tip';
 
 /** The named budgets. The slider still offers everything in between; these are
  *  the three answers people actually have to "how much of my computer?". */
@@ -213,7 +214,7 @@ class SettingsStore {
 			this.absorb(await setSettings(patch));
 			return true;
 		} catch (e) {
-			toast.error(`Could not save the ${what}`, { description: String(e) });
+			toast.error(`Couldn't save the ${what}`, { description: String(e) });
 			await this.load();
 			return false;
 		} finally {
@@ -368,6 +369,13 @@ class SettingsStore {
 		return k ? `${label} (${k})` : label;
 	}
 
+	/** A tooltip for an action: its label, the key as keycaps (nothing when unbound) and a muted
+	 *  second line for what the label cannot hold (`tip.ts`). */
+	tip(label: string, id: ActionId, detail?: string): TipSpec {
+		const keys = this.shortcut(id);
+		return { text: label, ...(keys ? { keys } : {}), ...(detail ? { detail } : {}) };
+	}
+
 	/** The other actions that already use this chord where `rebind` would put it. */
 	conflictsFor(rebind: Rebind): ActionDef[] {
 		return rebindConflicts(this.bindings, rebind);
@@ -503,7 +511,7 @@ class SettingsStore {
 			const where = await exportThemeFile(themeJson(this.theme), `${slug}.kerf-theme.json`);
 			if (where) toast.success('Theme saved', { description: where });
 		} catch (e) {
-			toast.error('Could not save the theme', { description: String(e) });
+			toast.error("Couldn't save the theme", { description: String(e) });
 		}
 	}
 

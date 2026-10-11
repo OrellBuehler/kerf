@@ -21,13 +21,14 @@ use super::decode_policy::{
 use super::source_probe::{ProbeCache, SOURCE_PROBE_TIMEOUT};
 use super::ProbeResult;
 use crate::clip_timing::{
-    clip_seek, clip_source_window, is_cache_proxy, transition_fx, ClipFx, ClipTiming, FadeEdge, FadeStep, FadeTint,
-    HEAD_PADDED_SUFFIX,
+    clip_seek, clip_source_window, is_cache_proxy, is_head_padded_proxy, transition_fx, ClipFx, ClipTiming, FadeEdge, FadeStep,
+    FadeTint, HEAD_PADDED_SUFFIX,
 };
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, Projection, Property, Reframe, ReframeKeyframe,
-    ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform, VideoEffect,
+    pix_fmt_layout, Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, PixLayout, Projection, Property, Reframe,
+    ReframeKeyframe, ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform,
+    VideoEffect,
 };
 use crate::render_plan::{still_size, CompositeColorPolicy};
 
@@ -947,6 +948,173 @@ pub(super) fn run_piped_until(cmd: &mut Command, input: Vec<u8>, deadline: Insta
     status.success().then_some(out)
 }
 
+/// How long a whole-file read ([`scene_pass`], [`contact_sheet`]) may go without a word from
+/// ffmpeg before it is killed, at the least (the same floor the waveform decode and the
+/// filmstrip give theirs). `-progress` reports every [`PROGRESS_ON_STDERR`] second, but **only
+/// once a frame has reached the output**: a read that outputs nothing until its last frame is
+/// silent for the whole decode, so it gets either a frame to report on early (the scene pass
+/// selects frame 0) or a bound that grows with the work ([`stall_for_work`], the sheet's).
+const READ_STALL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most a read that is silent until it ends is given before it counts as wedged.
+const READ_STALL_CEILING: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+
+/// Silence a read of `work_secs` of footage that outputs only at its end is allowed (pure): `per_sec`
+/// per second of footage — a decode slower than `1 / per_sec` of real time is a wedge, not a slow
+/// machine — between `floor`, which covers start-up and the first seek, and `ceiling`, which keeps
+/// even a wedged hour-long read finite. Clamped in seconds first: `from_secs_f64` panics on
+/// infinity, and a container can report an absurd duration.
+fn stall_for_work(work_secs: f64, per_sec: f64, floor: std::time::Duration, ceiling: std::time::Duration) -> std::time::Duration {
+    let secs = if work_secs.is_finite() {
+        (work_secs * per_sec).clamp(0.0, ceiling.as_secs_f64())
+    } else {
+        0.0
+    };
+    std::time::Duration::from_secs_f64(secs).max(floor)
+}
+
+/// The stall bound of a contact sheet of a `window_secs` window: the whole window is decoded
+/// before `tile` outputs the one frame, so the read says nothing until it ends. Thirty seconds of
+/// silence per second of footage, at least [`READ_STALL`], at most [`READ_STALL_CEILING`].
+fn sheet_stall(window_secs: f64) -> std::time::Duration {
+    stall_for_work(window_secs, 30.0, READ_STALL, READ_STALL_CEILING)
+}
+
+/// The `-progress` flags a bounded read adds **at spawn time** (like the thread caps, never in
+/// a pure builder): the report goes to stderr, which stdout-carrying reads (a contact sheet's
+/// JPEG) leave free, and is what [`output_unless_stalled`] listens for.
+const PROGRESS_ON_STDERR: [&str; 4] = ["-progress", "pipe:2", "-stats_period", "1"];
+
+/// Whether `line` is one of the `key=value` lines of ffmpeg's `-progress` report.
+fn is_progress_line(line: &str) -> bool {
+    let Some((key, _)) = line.trim().split_once('=') else {
+        return false;
+    };
+    key.starts_with("stream_")
+        || matches!(
+            key,
+            "frame"
+                | "fps"
+                | "bitrate"
+                | "total_size"
+                | "out_time_us"
+                | "out_time_ms"
+                | "out_time"
+                | "dup_frames"
+                | "drop_frames"
+                | "speed"
+                | "progress"
+        )
+}
+
+/// What [`output_unless_stalled`] collected.
+struct Collected {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    /// stderr without the `-progress` report lines (what had arrived, when the read stalled).
+    stderr: String,
+    /// ffmpeg said nothing for the stall bound and was killed.
+    stalled: bool,
+}
+
+impl Collected {
+    fn succeeded(&self) -> bool {
+        self.status.success() && !self.stalled
+    }
+
+    /// The last lines of stderr, for an error message.
+    fn stderr_tail(&self) -> String {
+        let lines: Vec<&str> = self.stderr.lines().rev().take(12).collect();
+        lines.into_iter().rev().collect::<Vec<_>>().join("\n").trim().to_string()
+    }
+}
+
+/// [`Command::output`] that cannot wait forever: `cmd` is given `-progress pipe:2`
+/// ([`PROGRESS_ON_STDERR`]) and is killed once its stderr has been silent for `stall`. Both
+/// pipes are drained on side threads, so neither a flood of warnings nor a large stdout can fill
+/// a pipe and wedge the child. A stalled read returns the stderr that had arrived and no stdout.
+/// The child is always reaped, whatever fails on the way.
+fn output_unless_stalled(mut cmd: Command, stall: std::time::Duration) -> std::io::Result<Collected> {
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::{Arc, Mutex};
+
+    /// When stderr was last heard from, and what it said so far.
+    struct Heard {
+        at: Instant,
+        text: String,
+    }
+
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let heard = Arc::new(Mutex::new(Heard {
+        at: Instant::now(),
+        text: String::new(),
+    }));
+    let out_handle = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let err_handle = {
+        let heard = Arc::clone(&heard);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).split(b'\n') {
+                let Ok(line) = line else { break };
+                let line = String::from_utf8_lossy(&line);
+                if let Ok(mut heard) = heard.lock() {
+                    heard.at = Instant::now();
+                    if !is_progress_line(&line) {
+                        heard.text.push_str(&line);
+                        heard.text.push('\n');
+                    }
+                }
+            }
+        })
+    };
+    let mut stalled = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        }
+        if heard.lock().is_ok_and(|heard| heard.at.elapsed() > stall) {
+            stalled = true;
+            let _ = child.kill();
+            break child.wait()?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let text = |heard: &Mutex<Heard>| heard.lock().map(|heard| heard.text.clone()).unwrap_or_default();
+    if stalled {
+        // The side threads end on their own when the pipes close; a wrapper that spawned the real
+        // ffmpeg keeps them open past the kill, and the caller must not wait for that.
+        return Ok(Collected {
+            status,
+            stdout: Vec::new(),
+            stderr: text(&heard),
+            stalled,
+        });
+    }
+    let stdout = out_handle.join().unwrap_or_default();
+    let _ = err_handle.join();
+    Ok(Collected {
+        status,
+        stdout,
+        stderr: text(&heard),
+        stalled,
+    })
+}
+
 /// The red of the middle pixel of the still graph's composite over a one-frame
 /// clip of [`POLICY_PROBE_YUV`], with the clip tagged BT.709 or not.
 fn probe_composite_red(ffmpeg: &str, ffprobe: &str, tag_bt709: bool, deadline: Instant) -> Option<u8> {
@@ -1130,6 +1298,26 @@ pub(crate) struct SourceTraits {
     /// path has to ask of them: whether to request a hardware decoder (`decode_policy`).
     pub codec: Codec,
     pub chroma: Chroma,
+    /// The first plane of the decoded picture is the luma alone (see [`luma_plane_pix_fmt`]):
+    /// what a yuv420p proxy's first plane is, and the only plane `select='scene'` scores.
+    pub luma_plane: bool,
+}
+
+/// Whether a picture of this `pix_fmt` keeps its luma alone in plane 0: planar or semi-planar
+/// YCbCr of any subsampling or depth, and gray. `select='scene'` scores plane 0 only, so on an
+/// RGB-family picture (`gbrp`: the G plane; `rgb24`, `bgr0`: every interleaved byte), a packed
+/// YCbCr one (`yuyv422`: luma and chroma bytes interleaved), a palette, an alpha-carrying
+/// format or a name nobody here knows, it scores something a yuv420p proxy cannot reproduce.
+fn luma_plane_pix_fmt(name: &str) -> bool {
+    let packed = matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "uyvy422" | "yuyv422" | "yvyu422" | "uyyvyy411"
+    );
+    !packed
+        && matches!(
+            pix_fmt_layout(name.trim()),
+            Some(PixLayout::Yuv420 | PixLayout::Gray | PixLayout::OtherYuv)
+        )
 }
 
 /// [`SourceTraits`] of the file at `path`, probed once per file and cached against the file's
@@ -1216,6 +1404,7 @@ fn parse_source_traits(json: &str) -> SourceTraits {
         indexed,
         codec: Codec::from_name(text("codec_name")),
         chroma: Chroma::from_pix_fmt(text("pix_fmt")),
+        luma_plane: luma_plane_pix_fmt(text("pix_fmt")),
     }
 }
 
@@ -1225,6 +1414,40 @@ fn parse_source_traits(json: &str) -> SourceTraits {
 /// spawns a process: not under a lock); `false` when the probe fails.
 pub fn source_is_indexed_container(path: &Path) -> bool {
     source_traits(path).is_some_and(|t| t.indexed)
+}
+
+/// What a whole-file *analysis* read can take from the preview proxy of a file in place of the
+/// file itself (see [`proxy_fidelity`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProxyFidelity {
+    /// A frame sits at the time it does in the original, so a read that picks frames by time
+    /// (a contact sheet) or reports a time (a cut) says the same: an MP4 / MOV or Matroska / WebM
+    /// source, the containers the proxy's timing is verified for. A transport stream's proxy is
+    /// `lead` seconds off whenever its video starts late (`engine-cli.md`), and the rest are
+    /// unproven.
+    pub times: bool,
+    /// ...and a frame's *scene score* comes out within a few hundredths of the original's, so
+    /// the cuts found are the same: also an SDR source whose luma sits alone in plane 0
+    /// ([`SourceTraits::luma_plane`]; not RGB, not packed YCbCr). A proxy is tone-mapped at
+    /// encode, and the original is scored in its HLG / PQ code values, which the tone curve moves
+    /// by a fifth of the scale (0.20 to 0.21 measured); an RGB original is scored on its G plane
+    /// or its interleaved bytes against the proxy's luma (up to 0.56 measured, cuts lost). The few
+    /// hundredths are for the software (libx264) proxy; a hardware-encoded one is unmeasured.
+    pub scores: bool,
+}
+
+/// [`ProxyFidelity`] of the file at `path`. One cached `ffprobe` (the one the proxy's own name
+/// already cost); nothing is trusted when the probe fails. Spawns a process: not under a lock.
+pub fn proxy_fidelity(path: &Path) -> ProxyFidelity {
+    fidelity_of(source_traits(path).unwrap_or_default())
+}
+
+/// The pure half of [`proxy_fidelity`].
+fn fidelity_of(traits: SourceTraits) -> ProxyFidelity {
+    ProxyFidelity {
+        times: traits.indexed,
+        scores: traits.indexed && traits.hdr.is_none() && traits.luma_plane,
+    }
 }
 
 /// The HDR transfer of the first video stream of the file at `path`, for the
@@ -1290,36 +1513,69 @@ const SCENE_DETECT_WIDTH: u32 = 640;
 /// the expensive part for 4K sources); a failed accelerated run retries in
 /// software, mirroring [`decode_frame`]'s fallback.
 pub fn detect_scenes(path: &Path, threshold: f64) -> Result<Vec<f64>> {
+    scene_pass(path, threshold).map(|(times, _)| times)
+}
+
+/// [`detect_scenes`] for the file at `original`, reading its preview `proxy` instead when one
+/// is given: a small all-intra decode in place of a whole 4K long-GOP one.
+///
+/// The proxy is only ever a faster way to the *same answer*, so a proxy that does not read
+/// (a truncated or foreign file, a decoder that dies on it) is not a failed analysis: the
+/// original is read instead, as if there had been none. The cut times themselves come out
+/// the same because a proxy answers `-ss T` with the frame the original does (see
+/// [`build_proxy_args`]; a late-starting video is padded so its frames keep their
+/// timestamps), and the detector scores at [`SCENE_DETECT_WIDTH`] either way.
+pub fn detect_scenes_preferring(original: &Path, proxy: Option<&Path>, threshold: f64) -> Result<Vec<f64>> {
+    if let Some(proxy) = proxy {
+        if let Ok((times, true)) = scene_pass(proxy, threshold) {
+            return Ok(times);
+        }
+        tracing::warn!(proxy = %proxy.display(), "scene detection could not read the proxy; reading the original");
+    }
+    detect_scenes(original, threshold)
+}
+
+/// The `-vf` chain of a scene pass (pure). Frame 0 is selected too (`eq(n,0)`) and dropped again
+/// by [`parse_scenes`]: a pass with no cut outputs nothing otherwise, and ffmpeg reports no
+/// progress until a frame has reached the output, so a long single take would look wedged from
+/// its first second.
+fn scene_filter(threshold: f64) -> String {
+    format!("scale='min({SCENE_DETECT_WIDTH},iw)':-2:flags=bilinear,select='gt(scene,{threshold})+eq(n,0)',showinfo")
+}
+
+/// One scene-detection pass over `path`: the cut times and whether ffmpeg ended cleanly.
+/// [`detect_scenes`] has always answered with whatever the log held, so a run that failed
+/// reads as "no cuts"; the flag is what lets a caller with somewhere else to read tell. A run
+/// that goes [`READ_STALL`] without a word is killed and is an error, not a short list of cuts.
+fn scene_pass(path: &Path, threshold: f64) -> Result<(Vec<f64>, bool)> {
     use std::sync::atomic::Ordering;
 
     let bin = ffmpeg_bin();
-    let filter = format!("scale='min({SCENE_DETECT_WIDTH},iw)':-2:flags=bilinear,select='gt(scene,{threshold})',showinfo");
+    let filter = scene_filter(threshold);
     // Probed before queueing: a hung probe must not hold the one heavy-job slot.
     let hw = decode_hwaccel_for(path, Reading::Whole);
     // The whole file is decoded, so this queues behind any other heavy job.
     let cpu = cpu::lease();
     let run = |hw: Option<&str>| {
-        let mut cmd = bg_command(&bin);
-        cpu::limit_cmd(&mut cmd, cpu.threads());
-        cmd.args(["-hide_banner", "-nostats"]);
+        let mut args: Vec<String> = vec!["-hide_banner".into(), "-nostats".into()];
         if let Some(hw) = hw {
-            cmd.args(["-hwaccel", hw]);
+            args.extend(["-hwaccel".into(), hw.into()]);
         }
-        cmd.arg("-i")
-            .arg(path)
-            .args(["-map", "0:v:0?", "-vf", &filter, "-f", "null", "-"])
-            .stdout(Stdio::null())
-            .output()
-            .map_err(|e| launch_err(&bin, e))
+        args.extend(["-i".into(), path.to_string_lossy().into_owned()]);
+        args.extend(["-map", "0:v:0?", "-vf", &filter, "-f", "null", "-"].map(String::from));
+        cpu::limit_args(&mut args, cpu.threads());
+        let mut cmd = bg_command(&bin);
+        cmd.args(PROGRESS_ON_STDERR).args(&args);
+        output_unless_stalled(cmd, READ_STALL).map_err(|e| launch_err(&bin, e))
     };
     let output = match hw.as_deref() {
         Some(h) => {
             let out = run(Some(h))?;
-            if out.status.success() {
+            if out.succeeded() {
                 out
             } else {
                 let sw = run(None)?;
-                if sw.status.success() {
+                if sw.succeeded() {
                     HWACCEL_OK.store(false, Ordering::Relaxed);
                     tracing::warn!("hardware decode failed during scene detection; using software decode");
                 }
@@ -1328,12 +1584,26 @@ pub fn detect_scenes(path: &Path, threshold: f64) -> Result<Vec<f64>> {
         }
         None => run(None)?,
     };
-    Ok(parse_scenes(&String::from_utf8_lossy(&output.stderr)))
+    if output.stalled {
+        return Err(Error::Engine(format!(
+            "scene detection stalled: ffmpeg said nothing for {}s reading {}: {}",
+            READ_STALL.as_secs(),
+            path.display(),
+            output.stderr_tail()
+        )));
+    }
+    Ok((parse_scenes(&output.stderr), output.status.success()))
 }
 
+/// The cut times in a scene pass's `showinfo` log. Its first line (`n:0`, showinfo's own count of
+/// the frames that reached it) is frame 0, which the pass lets through to keep ffmpeg reporting
+/// and which never scores as a cut: not a cut.
 fn parse_scenes(stderr: &str) -> Vec<f64> {
     let mut times = Vec::new();
     for line in stderr.lines() {
+        if field_after(line, "] n:") == Some(0.0) {
+            continue;
+        }
         if let Some(t) = field_after(line, "pts_time:") {
             times.push(t);
         }
@@ -1752,16 +2022,19 @@ pub fn contact_sheet(
     // making it wait out a ten-minute render would read as a hung server. It
     // still runs thread-capped and at background priority.
     cpu::limit_args(&mut args, cpu::budget_threads());
-    let output = bg_command(&bin)
-        .args(&args)
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| launch_err(&bin, e))?;
-    if !output.status.success() || output.stdout.is_empty() {
-        return Err(Error::Engine(format!(
-            "could not build contact sheet: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+    let mut cmd = bg_command(&bin);
+    cmd.args(PROGRESS_ON_STDERR).args(&args);
+    // `tile` outputs the one frame when the window has been decoded, and ffmpeg reports nothing
+    // before: the bound grows with the window (see `sheet_stall`).
+    let stall = sheet_stall(end - start);
+    let output = output_unless_stalled(cmd, stall).map_err(|e| launch_err(&bin, e))?;
+    if !output.succeeded() || output.stdout.is_empty() {
+        let why = if output.stalled {
+            format!("ffmpeg said nothing for {}s: {}", stall.as_secs(), output.stderr_tail())
+        } else {
+            output.stderr.trim().to_string()
+        };
+        return Err(Error::Engine(format!("could not build contact sheet: {why}")));
     }
     Ok((output.stdout, times))
 }
@@ -1804,7 +2077,15 @@ fn build_contact_sheet_args(
     let rate = if window > 0.0 { cells as f64 / window } else { 1.0 };
     // HDR sources are tone-mapped per cell, after the downscale, before the tile.
     let tone = tonemap.map(|t| format!("{t},")).unwrap_or_default();
-    let vf = format!("fps={rate},scale={cell_width}:-2:flags=bilinear,{tone}tile={columns}x{rows}");
+    // A head-padded proxy opens with a clone of its first frame, which the original has no
+    // counterpart for: read from the very start (a seek to 0.000 keeps it) it would take a
+    // slot of its own and push every cell one over. Any later seek has skipped it already.
+    let unpad = if start < 0.0005 && is_head_padded_proxy(path) {
+        "trim=start_frame=1,"
+    } else {
+        ""
+    };
+    let vf = format!("{unpad}fps={rate},scale={cell_width}:-2:flags=bilinear,{tone}tile={columns}x{rows}");
     let args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
@@ -3401,10 +3682,7 @@ impl Default for ExportOptions {
 /// The validated export range from `opts`, clamped to the timeline. `None`
 /// when absent or empty after clamping (which falls back to a full export).
 fn effective_range(timeline: &Timeline, opts: &ExportOptions) -> Option<(f64, f64)> {
-    let r = opts.range?;
-    let start = r.start.max(0.0);
-    let end = r.end.min(timeline.duration());
-    (end - start > 1e-9).then_some((start, end))
+    timeline.export_span(opts.range.map(|r| (r.start, r.end)))
 }
 
 /// Whether a bitrate token like "8M" / "2500k" / "800000" is well-formed.
@@ -4281,12 +4559,60 @@ pub struct PreviewFrame {
     pub time: f64,
     /// The frame as JPEG bytes.
     pub jpeg: Vec<u8>,
+    /// How far behind its slot on the wall-clock schedule the frame arrived, in seconds (0 when
+    /// it was early or on time). A stream that renders slower than it was asked to play grows
+    /// this frame by frame; a hiccup shows once and is gone.
+    pub late: f64,
 }
 
-/// Cap on the live preview's width. Playback has to composite, encode and ship a
-/// frame every ~40 ms, so it renders smaller than the drill-in still does — the
-/// preview pane is well under this on a normal window anyway.
+/// The width a playback stream renders at when the caller does not say.
 const PREVIEW_STREAM_WIDTH: u32 = 960;
+
+/// The widest and narrowest stream asked for. The top is the MCP frame tools' own cap and the
+/// preview's (`preview-size.ts`): the engine never scales a picture past its own width, so the
+/// bound is only on cost.
+pub const MAX_STREAM_WIDTH: u32 = 1920;
+pub const MIN_STREAM_WIDTH: u32 = 64;
+
+/// The fastest a stream plays. The webview paints at the display's rate, so frames past this
+/// are composited and shipped for nothing.
+pub const MAX_STREAM_FPS: f64 = 60.0;
+pub const MIN_STREAM_FPS: f64 = 1.0;
+
+/// What a playback stream is asked for. Both are optional: the caller that knows better (the
+/// preview, after the machine failed to keep up with the rate it was given) states them, and
+/// leaving them out means the timeline's own rate and the default width.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PlaybackRequest {
+    pub fps: Option<f64>,
+    pub max_width: Option<u32>,
+}
+
+/// What a stream really runs at, once [`PlaybackRequest`] is resolved.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlaybackParams {
+    pub fps: f64,
+    pub max_width: u32,
+}
+
+/// The frame rate and width a stream plays at.
+///
+/// An unstated rate is the timeline's own — the one the export would deliver, read from the
+/// cut as it renders (a muted track's footage does not set it) — held to
+/// [`MIN_STREAM_FPS`]`..=`[`MAX_STREAM_FPS`], so a 24 fps cut plays at 24 and a 60 fps one at 60
+/// instead of both at the 24 this once was. A stated rate is clamped to the same range, and an
+/// unusable one (not finite, not positive) is treated as unstated. An unstated width is
+/// [`PREVIEW_STREAM_WIDTH`]; a stated one is held to [`MIN_STREAM_WIDTH`]`..=`[`MAX_STREAM_WIDTH`].
+pub fn playback_params(timeline: &Timeline, assets: &[Asset], request: PlaybackRequest) -> PlaybackParams {
+    let stated = request.fps.filter(|f| f.is_finite() && *f > 0.0);
+    let fps = stated.unwrap_or_else(|| export_format(&timeline.for_render(), assets, &ExportOptions::default()).fps);
+    PlaybackParams {
+        fps: fps.clamp(MIN_STREAM_FPS, MAX_STREAM_FPS),
+        max_width: request
+            .max_width
+            .map_or(PREVIEW_STREAM_WIDTH, |w| w.clamp(MIN_STREAM_WIDTH, MAX_STREAM_WIDTH)),
+    }
+}
 
 /// JPEG quality (`-q:v`) for streamed frames: 2 is best, 31 worst. 6 is visually
 /// clean while keeping a 960px frame near 40 KB, so 30 fps costs ~1.2 MB/s over
@@ -4413,25 +4739,28 @@ fn next_jpeg(buf: &[u8]) -> Option<(usize, usize)> {
 /// is. One long-lived process decoding sequentially instead amortizes all of
 /// that, and the all-intra proxies keep each decode cheap.
 ///
-/// Frames are paced to `fps` against the wall clock rather than pushed as fast
+/// Frames are paced to the rate against the wall clock rather than pushed as fast
 /// as they render, which keeps the pipe (and so ffmpeg itself) throttled to real
 /// time instead of racing ahead and buffering the whole timeline. Each frame
 /// carries its timeline time so a caller following the audio clock can drop one
-/// that arrived too late to be worth showing.
-pub fn stream_preview(
+/// that arrived too late to be worth showing, and how late it was against the
+/// schedule, which is how a caller tells a hiccup from a stream that cannot keep
+/// up (see [`playback_params`] for what the rate and width default to).
+pub fn stream_preview_with(
     timeline: &Timeline,
     assets: &[Asset],
     start: f64,
-    fps: f64,
+    request: PlaybackRequest,
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
 ) -> Result<()> {
+    let params = playback_params(timeline, assets, request);
     // Whether the run that was spawned asked any input for hardware decode: none of a proxy's
     // inputs do, and a failure of a run that did not is not the hardware's.
     let mut hw = false;
     // `None` until ffmpeg is running: a timeline with nothing to play fails
     // before that, and says nothing about the hardware.
     let mut sent = None;
-    match stream_preview_once(timeline, assets, start, fps, on_frame, &mut sent, &mut hw) {
+    match stream_preview_once(timeline, assets, start, params, on_frame, &mut sent, &mut hw) {
         // A hardware decode that dies before the first frame is `-hwaccel`
         // being unusable here, not the graph: a static ffmpeg aborts outright
         // when `auto` probes a VAAPI whose libva isn't installed. Once frames
@@ -4440,10 +4769,25 @@ pub fn stream_preview(
         Err(e) if hw && sent == Some(0) => {
             HWACCEL_OK.store(false, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!("hardware decode failed starting playback; using software decode: {e}");
-            stream_preview_once(timeline, assets, start, fps, on_frame, &mut sent, &mut hw)
+            stream_preview_once(timeline, assets, start, params, on_frame, &mut sent, &mut hw)
         }
         r => r,
     }
+}
+
+/// [`stream_preview_with`] at a stated `fps` and the default width.
+pub fn stream_preview(
+    timeline: &Timeline,
+    assets: &[Asset],
+    start: f64,
+    fps: f64,
+    on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
+) -> Result<()> {
+    let request = PlaybackRequest {
+        fps: Some(fps),
+        max_width: None,
+    };
+    stream_preview_with(timeline, assets, start, request, on_frame)
 }
 
 /// How long a playback stream may go without producing a frame before it is
@@ -4469,13 +4813,13 @@ fn stream_preview_once(
     timeline: &Timeline,
     assets: &[Asset],
     start: f64,
-    fps: f64,
+    params: PlaybackParams,
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
     sent: &mut Option<u64>,
     hw_used: &mut bool,
 ) -> Result<()> {
-    let fps = fps.clamp(1.0, 60.0);
-    let mut args = build_preview_args(timeline, assets, start, fps, PREVIEW_STREAM_WIDTH, PREVIEW_STREAM_QUALITY)?;
+    let PlaybackParams { fps, max_width } = params;
+    let mut args = build_preview_args(timeline, assets, start, fps, max_width, PREVIEW_STREAM_QUALITY)?;
     // The composited graph outgrows argv just as the export's does.
     let _script = externalize_filter_complex(&mut args, "preview")?;
     // Hardware decode is per input, and a proxy (what the stream reads once one is ready) is
@@ -4486,7 +4830,7 @@ fn stream_preview_once(
     cpu::limit_args(&mut args, cpu::budget_threads());
 
     let bin = ffmpeg_bin();
-    tracing::debug!(start, fps, "starting preview stream");
+    tracing::debug!(start, fps, max_width, "starting preview stream");
     let child = command(&bin)
         .args(&args)
         .stdin(Stdio::null())
@@ -4560,12 +4904,19 @@ fn pump_preview(
             // look overdue and play the whole stream at a sprint.
             let t0 = *origin.get_or_insert_with(std::time::Instant::now);
             let due = std::time::Duration::from_secs_f64(index as f64 / fps);
-            if let Some(wait) = due.checked_sub(t0.elapsed()) {
-                std::thread::sleep(wait);
-            }
+            let late = match due.checked_sub(t0.elapsed()) {
+                Some(wait) => {
+                    std::thread::sleep(wait);
+                    0.0
+                }
+                // The first frame is the clock's origin, on time by definition.
+                None if index == 0 => 0.0,
+                None => (t0.elapsed() - due).as_secs_f64(),
+            };
             let frame = PreviewFrame {
                 time: start + index as f64 / fps,
                 jpeg,
+                late,
             };
             index += 1;
             *sent = Some(index);
@@ -7532,6 +7883,10 @@ mod keyed_zoom;
 #[cfg(test)]
 mod keyed_channels;
 
+/// Scene detection and contact sheets on a proxy against the original (`#[ignore]`d).
+#[cfg(test)]
+mod scenes_on_proxy;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7654,13 +8009,17 @@ mod tests {
 
     #[test]
     fn parses_scene_times() {
+        // `n:0` is frame 0, which the pass lets through to keep ffmpeg reporting: not a cut.
         let log = "\
-[Parsed_showinfo_1 @ 0x1] n:0 pts:0 pts_time:0 duration_time:0.04
-[Parsed_showinfo_1 @ 0x1] n:1 pts:720 pts_time:30.0 duration_time:0.04
-[Parsed_showinfo_1 @ 0x1] n:2 pts:1800 pts_time:75.5 duration_time:0.04
+[Parsed_showinfo_1 @ 0x1] n:   0 pts:0 pts_time:0 duration_time:0.04
+[Parsed_showinfo_1 @ 0x1] n:   1 pts:720 pts_time:30.0 duration_time:0.04
+[Parsed_showinfo_1 @ 0x1] n:   2 pts:1800 pts_time:75.5 duration_time:0.04
 ";
         let scenes = parse_scenes(log);
-        assert_eq!(scenes, vec![0.0, 30.0, 75.5]);
+        assert_eq!(scenes, vec![30.0, 75.5]);
+        // A log of frame 0 alone (a single take) has no cut; a run that logged nothing none either.
+        assert!(parse_scenes("[Parsed_showinfo_1 @ 0x1] n:0 pts:0 pts_time:0 duration_time:0.04\n").is_empty());
+        assert!(parse_scenes("").is_empty());
     }
 
     #[test]
@@ -7941,6 +8300,181 @@ mod tests {
         let ok = probe_source_traits(&script("ok", &format!("echo '{json}'")), file, limit).expect("an answer");
         assert_eq!((ok.hdr, ok.indexed), (Some(Hdr::Pq), true));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_proxy_stands_in_for_an_sdr_yuv_mp4_or_matroska_source_and_for_nothing_else() {
+        let traits_of = |format: &str, transfer: &str, pix_fmt: &str| {
+            parse_source_traits(&format!(
+                r#"{{"streams":[{{"color_transfer":"{transfer}","pix_fmt":"{pix_fmt}"}}],"format":{{"format_name":"{format}"}}}}"#
+            ))
+        };
+        let traits = |format: &str, transfer: &str| traits_of(format, transfer, "yuv420p");
+        let (yes, picture) = (
+            ProxyFidelity {
+                times: true,
+                scores: true,
+            },
+            ProxyFidelity {
+                times: true,
+                scores: false,
+            },
+        );
+        assert_eq!(fidelity_of(traits("mov,mp4,m4a,3gp,3g2,mj2", "bt709")), yes);
+        assert_eq!(fidelity_of(traits("matroska,webm", "")), yes);
+        // HDR: times hold, but the scores are taken in HLG / PQ code values and the proxy is SDR.
+        assert_eq!(fidelity_of(traits("mov,mp4,m4a,3gp,3g2,mj2", "arib-std-b67")), picture);
+        assert_eq!(fidelity_of(traits("matroska,webm", "smpte2084")), picture);
+        // Every YCbCr layout keeps its luma alone in plane 0, which is what the scene filter scores.
+        for pix_fmt in [
+            "yuv420p10le",
+            "yuvj420p",
+            "yuv422p10le",
+            "yuv444p12le",
+            "gray",
+            "gray10le",
+            "nv12",
+        ] {
+            assert_eq!(
+                fidelity_of(traits_of("mov,mp4,m4a,3gp,3g2,mj2", "bt709", pix_fmt)),
+                yes,
+                "{pix_fmt}"
+            );
+        }
+        // RGB (G plane, or every interleaved byte), packed YCbCr, a palette, alpha and a name nobody
+        // knows are scored on something else than the proxy's luma.
+        for pix_fmt in [
+            "gbrp", "gbrp10le", "rgb24", "bgr24", "bgr0", "rgb48le", "yuyv422", "uyvy422", "pal8", "yuva420p", "rgba", "",
+            "newfmt",
+        ] {
+            assert_eq!(
+                fidelity_of(traits_of("mov,mp4,m4a,3gp,3g2,mj2", "bt709", pix_fmt)),
+                picture,
+                "{pix_fmt}"
+            );
+            assert_eq!(fidelity_of(traits_of("matroska,webm", "", pix_fmt)), picture, "{pix_fmt}");
+        }
+        // A transport stream's proxy is `lead` off when its video starts late; the others are unproven.
+        for other in ["mpegts", "avi", "mpeg", "flv", "mxf", "h264"] {
+            assert_eq!(fidelity_of(traits(other, "bt709")), ProxyFidelity::default(), "{other}");
+        }
+        // A failed probe trusts nothing.
+        assert_eq!(fidelity_of(SourceTraits::default()), ProxyFidelity::default());
+    }
+
+    #[test]
+    fn the_progress_report_is_told_from_the_log() {
+        for line in [
+            "frame=120",
+            "fps=0.0",
+            "stream_0_0_q=-0.0",
+            "out_time_us=4000000",
+            "out_time=00:00:04.000000",
+            "progress=end",
+            "speed=N/A",
+        ] {
+            assert!(is_progress_line(line), "{line}");
+        }
+        for line in [
+            "[Parsed_showinfo_1 @ 0x1] n:   4 pts:  4 pts_time:4 fmt:yuv420p",
+            "Error opening input file x.mp4.",
+            "x.mp4: Invalid data found when processing input",
+            "key=value without being ffmpeg's",
+            "",
+        ] {
+            assert!(!is_progress_line(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_silence_a_read_may_keep_grows_with_the_work_between_a_floor_and_a_ceiling() {
+        use std::time::Duration as D;
+        let secs = |window: f64| sheet_stall(window).as_secs_f64();
+        // Start-up and a short window get the floor: a minute.
+        assert_eq!((secs(0.0), secs(1.0), secs(2.0)), (60.0, 60.0, 60.0));
+        // A longer window is decoded for longer before `tile` says anything: 30 s per second of footage.
+        assert_eq!((secs(10.0), secs(60.0)), (300.0, 1800.0));
+        // Wedged is still finite, and nonsense (a negative or unknown duration) falls back to the floor.
+        assert_eq!(secs(1e9), 2.0 * 3600.0);
+        assert_eq!((secs(-5.0), secs(f64::NAN)), (60.0, 60.0));
+        assert_eq!(secs(f64::INFINITY), 60.0);
+        assert_eq!(
+            stall_for_work(4.0, 0.5, D::from_millis(100), D::from_secs(10)),
+            D::from_secs(2)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_that_is_busy_and_silent_is_not_killed_within_its_bound() {
+        use std::time::Duration as D;
+        let busy = || {
+            let mut cmd = Command::new("sh");
+            // Silent for 1.2 s, then the whole answer on stdout: a contact sheet's shape.
+            cmd.args(["-c", "sleep 1.2; printf sheet"]);
+            cmd
+        };
+        // A 4 s window at half a second of silence per second of footage: two seconds is enough...
+        let bound = stall_for_work(4.0, 0.5, std::time::Duration::from_millis(100), D::from_secs(10));
+        let done = output_unless_stalled(busy(), bound).unwrap();
+        assert!(done.succeeded() && !done.stalled, "{:?}", done.stderr);
+        assert_eq!(done.stdout, b"sheet");
+        // ...and with no window to scale by, the floor alone kills the same child.
+        let floor_only = stall_for_work(0.0, 0.5, std::time::Duration::from_millis(100), D::from_secs(10));
+        let killed = output_unless_stalled(busy(), floor_only).unwrap();
+        assert!(killed.stalled && killed.stdout.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_that_goes_quiet_is_killed_and_one_that_reports_is_not() {
+        let sh = |script: &str| {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", script]);
+            cmd
+        };
+        // Quiet: a child that never writes (a wedged decoder) is killed at the bound, not waited for.
+        let started = Instant::now();
+        let quiet = output_unless_stalled(
+            sh("echo warming up >&2; echo frame=1 >&2; sleep 30"),
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap();
+        assert!(quiet.stalled && !quiet.succeeded());
+        // What it had said is kept for the error message (without the progress lines).
+        assert_eq!(quiet.stderr_tail(), "warming up");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // Reporting: each line of stderr is a word, so a long run that keeps talking is not cut off,
+        // and the progress lines are not in the text the caller reads errors from.
+        let talking = output_unless_stalled(
+            sh("for i in 1 2 3 4 5 6; do echo frame=$i >&2; sleep 0.1; done; echo oops >&2; printf out"),
+            std::time::Duration::from_millis(400),
+        )
+        .unwrap();
+        assert!(talking.succeeded(), "{:?}", talking.stderr);
+        assert_eq!((talking.stdout.as_slice(), talking.stderr.as_str()), (&b"out"[..], "oops\n"));
+        // A failure is a failure, not a stall.
+        let failed = output_unless_stalled(sh("echo bad >&2; exit 3"), std::time::Duration::from_secs(5)).unwrap();
+        assert!(!failed.stalled && !failed.succeeded());
+        assert_eq!(failed.stderr, "bad\n");
+    }
+
+    #[test]
+    fn a_contact_sheet_drops_the_head_pad_clone_when_it_reads_from_the_start_only() {
+        let padded = "/home/u/.cache/kerf/proxies/0123456789abcdef.lead.mp4";
+        let plain = "/home/u/.cache/kerf/proxies/0123456789abcdef.mp4";
+        let vf = |path: &str, start: f64| {
+            let (args, _) = build_contact_sheet_args(path, start, start + 8.0, 4, 2, 160, 3, None);
+            args[args.iter().position(|a| a == "-vf").unwrap() + 1].clone()
+        };
+        // A seek to 0.000 keeps pts 0, the clone with it: it would take a slot of its own.
+        assert!(vf(padded, 0.0).starts_with("trim=start_frame=1,fps="), "{}", vf(padded, 0.0));
+        assert!(vf(padded, 0.0004).starts_with("trim=start_frame=1,fps="));
+        // Any later seek has skipped it already, and dropping a frame there would drop a real one.
+        assert!(vf(padded, 0.5).starts_with("fps="));
+        // An ordinary proxy and an original have no clone: their argv is what it always was.
+        assert!(vf(plain, 0.0).starts_with("fps="));
+        assert!(vf("/media/clip.lead.mp4", 0.0).starts_with("fps="));
     }
 
     #[test]
@@ -13523,6 +14057,163 @@ mod tests {
         assert_eq!(frames, 1);
     }
 
+    /// A frame that arrives behind the wall-clock schedule says by how much; one that is early or
+    /// on time says nothing. A caller tells a stream that cannot keep up from a hiccup by whether
+    /// that number keeps growing.
+    #[cfg(unix)]
+    #[test]
+    fn a_frame_reports_how_far_behind_its_slot_it_arrived() {
+        let mut delays = Vec::new();
+        let mut sent = Some(0);
+        pump_preview(
+            fake_stream(r"printf '\377\330a\377\331'; sleep 0.3; printf '\377\330b\377\331'"),
+            0.0,
+            1000.0,
+            short_timeouts(),
+            &mut |f| {
+                delays.push(f.late);
+                true
+            },
+            &mut sent,
+        )
+        .expect("ends cleanly");
+        assert_eq!(delays.len(), 2);
+        assert_eq!(delays[0], 0.0, "the first frame sets the clock: {delays:?}");
+        assert!(
+            delays[1] > 0.2 && delays[1] < 2.0,
+            "the second was a third of a second behind a 1 ms slot: {delays:?}"
+        );
+
+        // Paced faster than it renders is not late: the pacing sleeps until the slot. The slots are
+        // long enough that a loaded runner oversleeping one cannot reach the next.
+        let mut delays = Vec::new();
+        pump_preview(
+            fake_stream(r"printf '\377\330a\377\331\377\330b\377\331\377\330c\377\331'"),
+            0.0,
+            4.0,
+            short_timeouts(),
+            &mut |f| {
+                delays.push(f.late);
+                true
+            },
+            &mut sent,
+        )
+        .expect("ends cleanly");
+        assert!(delays.iter().all(|l| *l < 0.05), "{delays:?}");
+    }
+
+    fn params_for(fps: f64, request: PlaybackRequest) -> PlaybackParams {
+        let asset = test_asset(vec![video_stream(1920, 1080, fps)]);
+        let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        playback_params(&timeline, &[asset], request)
+    }
+
+    #[test]
+    fn playback_runs_at_the_timelines_own_rate() {
+        for fps in [12.0, 23.976, 24.0, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0] {
+            let p = params_for(fps, PlaybackRequest::default());
+            assert_eq!(p.fps, fps, "a {fps} fps cut plays at {fps}");
+        }
+        // Past what a display paints there is nothing to gain: the cap.
+        assert_eq!(params_for(120.0, PlaybackRequest::default()).fps, MAX_STREAM_FPS);
+        assert_eq!(params_for(240.0, PlaybackRequest::default()).fps, MAX_STREAM_FPS);
+        // A cut with no footage to read a rate from plays at the engine's default, not at nothing.
+        let empty = timeline_of(vec![video_track(vec![])]);
+        assert_eq!(playback_params(&empty, &[], PlaybackRequest::default()).fps, 30.0);
+    }
+
+    #[test]
+    fn a_stated_rate_wins_within_bounds_and_an_unusable_one_is_not_stated() {
+        let say = |fps| {
+            params_for(
+                60.0,
+                PlaybackRequest {
+                    fps: Some(fps),
+                    max_width: None,
+                },
+            )
+            .fps
+        };
+        assert_eq!(say(30.0), 30.0);
+        assert_eq!(say(29.97), 29.97);
+        assert_eq!(say(15.0), 15.0);
+        assert_eq!(say(0.2), MIN_STREAM_FPS);
+        assert_eq!(say(500.0), MAX_STREAM_FPS);
+        // The cut's own rate stands in for a number that is not one.
+        let own = params_for(25.0, PlaybackRequest::default()).fps;
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -24.0] {
+            assert_eq!(
+                params_for(
+                    25.0,
+                    PlaybackRequest {
+                        fps: Some(bad),
+                        max_width: None
+                    }
+                )
+                .fps,
+                own,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_rate_is_the_cut_as_it_renders_not_a_muted_tracks_footage() {
+        let slow = test_asset(vec![video_stream(1920, 1080, 24.0)]);
+        let fast = test_asset(vec![video_stream(1920, 1080, 60.0)]);
+        let mut muted = video_track(vec![make_clip(slow.id, 0.0, 5.0, 0.0)]);
+        muted.muted = true;
+        let timeline = timeline_of(vec![muted, video_track(vec![make_clip(fast.id, 0.0, 5.0, 0.0)])]);
+        let p = playback_params(&timeline, &[slow, fast], PlaybackRequest::default());
+        assert_eq!(p.fps, 60.0);
+    }
+
+    #[test]
+    fn the_stream_width_is_the_one_asked_for_within_bounds() {
+        let width = |w| params_for(30.0, PlaybackRequest { fps: None, max_width: w }).max_width;
+        assert_eq!(width(None), PREVIEW_STREAM_WIDTH);
+        for w in [480, 960, 1280, 1440, 1920] {
+            assert_eq!(width(Some(w)), w);
+        }
+        assert_eq!(width(Some(0)), MIN_STREAM_WIDTH);
+        assert_eq!(width(Some(10)), MIN_STREAM_WIDTH);
+        assert_eq!(width(Some(100_000)), MAX_STREAM_WIDTH);
+        // What the page asks for is bucketed to the steps of `preview-size.ts`, and the top of
+        // them is the engine's own bound.
+        assert_eq!(MAX_STREAM_WIDTH, 1920);
+    }
+
+    #[test]
+    fn the_requested_width_and_rate_reach_the_stream_graph() {
+        let asset = av_asset(Uuid::new_v4(), 10.0);
+        let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        let assets = [asset];
+        let params = playback_params(
+            &timeline,
+            &assets,
+            PlaybackRequest {
+                fps: None,
+                max_width: Some(1440),
+            },
+        );
+        assert_eq!((params.fps, params.max_width), (30.0, 1440));
+        let args = build_preview_args(&timeline, &assets, 0.0, params.fps, params.max_width, PREVIEW_STREAM_QUALITY).unwrap();
+        let graph = flag_val(&args, "-filter_complex").unwrap();
+        assert!(graph.contains("1440") && graph.contains("fps=30"), "{graph}");
+        let slim = build_preview_args(&timeline, &assets, 0.0, 60.0, 960, PREVIEW_STREAM_QUALITY).unwrap();
+        let graph = flag_val(&slim, "-filter_complex").unwrap();
+        assert!(graph.contains("fps=60") && !graph.contains("1440"), "{graph}");
+        // A source narrower than the request is not scaled up to it.
+        let narrow = test_asset(vec![video_stream(640, 360, 30.0)]);
+        let tl = single(vec![make_clip(narrow.id, 0.0, 5.0, 0.0)]);
+        let args = build_preview_args(&tl, &[narrow], 0.0, 30.0, 1920, PREVIEW_STREAM_QUALITY).unwrap();
+        let graph = flag_val(&args, "-filter_complex").unwrap();
+        assert!(
+            graph.contains("640") && !graph.contains("1920"),
+            "narrow source keeps its width: {graph}"
+        );
+    }
+
     #[test]
     fn a_smart_cropped_clip_crops_before_the_fit_so_cover_has_nothing_left_to_take() {
         let asset = av_asset(Uuid::new_v4(), 30.0); // 1920x1080
@@ -13747,6 +14438,101 @@ mod tests {
         // Paced to real time rather than dumped as fast as it renders: a second
         // of frames takes about a second (with slack for the graph starting up).
         assert!(elapsed.as_secs_f64() > 0.8, "playback ran ahead of real time: {elapsed:?}");
+    }
+
+    /// The size a JPEG says it is: the first start-of-frame segment's height and width.
+    fn jpeg_size(jpeg: &[u8]) -> Option<(u32, u32)> {
+        let mut at = 2;
+        while at + 9 < jpeg.len() {
+            if jpeg[at] != 0xFF {
+                return None;
+            }
+            let marker = jpeg[at + 1];
+            let len = u16::from_be_bytes([jpeg[at + 2], jpeg[at + 3]]) as usize;
+            if matches!(marker, 0xC0..=0xC2) {
+                let h = u16::from_be_bytes([jpeg[at + 5], jpeg[at + 6]]) as u32;
+                let w = u16::from_be_bytes([jpeg[at + 7], jpeg[at + 8]]) as u32;
+                return Some((w, h));
+            }
+            at += 2 + len;
+        }
+        None
+    }
+
+    /// End to end against the real `ffmpeg` binary: a 60 fps cut plays at 60 fps and at the width
+    /// the preview asked for, a 30 fps cut at 30 and, with nothing asked, the default width.
+    /// `cargo test -p kerf-core --no-default-features -- --ignored streams_at_the_timelines_rate`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn streams_at_the_timelines_rate_and_the_requested_width() {
+        let dir = std::env::temp_dir().join(format!("kerf-preview-rate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let play = |fps: u32, request: PlaybackRequest, frames_wanted: usize| {
+            let media = dir.join(format!("src{fps}.mp4"));
+            let ok = command(&ffmpeg_bin())
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(["-f", "lavfi", "-i", &format!("testsrc2=size=1280x720:rate={fps}:duration=4")])
+                .args(["-c:v", "libx264", "-preset", "veryfast", "-g", "1", "-pix_fmt", "yuv420p"])
+                .arg(&media)
+                .status_bounded()
+                .expect("run ffmpeg");
+            assert!(ok.success(), "could not synthesize test media");
+            let mut asset = av_asset(Uuid::new_v4(), 4.0);
+            asset.path = media.to_string_lossy().into_owned();
+            asset.streams = vec![video_stream(1280, 720, fps as f64)];
+            let timeline = single(vec![make_clip(asset.id, 0.0, 4.0, 0.0)]);
+            let mut frames: Vec<PreviewFrame> = Vec::new();
+            let began = std::time::Instant::now();
+            let mut first = None;
+            stream_preview_with(&timeline, &[asset], 0.5, request, &mut |f| {
+                first.get_or_insert_with(|| began.elapsed());
+                frames.push(f);
+                frames.len() < frames_wanted
+            })
+            .expect("stream");
+            let span = (began.elapsed() - first.unwrap()).as_secs_f64();
+            (frames, span)
+        };
+
+        let (frames, span) = play(
+            60,
+            PlaybackRequest {
+                fps: None,
+                max_width: Some(640),
+            },
+            60,
+        );
+        assert_eq!(frames.len(), 60);
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(jpeg_size(&f.jpeg), Some((640, 360)), "frame {i}");
+            assert!((f.time - (0.5 + i as f64 / 60.0)).abs() < 1e-9, "frame {i} is at {}", f.time);
+        }
+        // 59 gaps of 1/60 s: a second of video takes about a second, not the 2.5 s it took at 24.
+        assert!(span > 0.85 && span < 1.4, "60 frames at 60 fps took {span:.2}s");
+
+        let (frames, span) = play(30, PlaybackRequest::default(), 30);
+        assert_eq!(frames.len(), 30);
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(jpeg_size(&f.jpeg), Some((960, 540)), "frame {i} at the default width");
+            assert!((f.time - (0.5 + i as f64 / 30.0)).abs() < 1e-9, "frame {i} is at {}", f.time);
+        }
+        assert!(span > 0.85 && span < 1.4, "30 frames at 30 fps took {span:.2}s");
+
+        // A request past the source's own width is not scaled up to it.
+        let (frames, _) = play(
+            30,
+            PlaybackRequest {
+                fps: Some(24.0),
+                max_width: Some(1920),
+            },
+            4,
+        );
+        assert_eq!(jpeg_size(&frames[0].jpeg), Some((1280, 720)));
+        assert!(
+            (frames[1].time - frames[0].time - 1.0 / 24.0).abs() < 1e-9,
+            "a stated rate overrides the cut's"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The graph features most likely to break only at runtime — a looped still

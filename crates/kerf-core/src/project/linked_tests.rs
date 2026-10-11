@@ -905,6 +905,69 @@ fn the_platform_check_does_not_hear_a_muted_picture() {
 }
 
 #[test]
+fn the_platform_check_of_a_range_describes_the_file_the_range_writes() {
+    let project = Project::open_in_memory().unwrap();
+    // A portrait picture with no sound, then a landscape one with sound, and a title over the second only.
+    let mut portrait = stream(StreamKind::Video);
+    portrait.width = Some(720);
+    portrait.height = Some(1280);
+    let silent = asset("/silent.mp4", 60.0, vec![portrait]);
+    let sound = asset("/sound.mp4", 60.0, vec![stream(StreamKind::Video), stream(StreamKind::Audio)]);
+    project.insert_asset(&silent).unwrap();
+    project.insert_asset(&sound).unwrap();
+    project.add_clip_to_timeline(silent.id, None, 0.0, 10.0, Some(0.0)).unwrap();
+    project.add_clip_to_timeline(sound.id, None, 0.0, 20.0, Some(10.0)).unwrap();
+    project.add_overlay("Title".into(), 15.0, 25.0).unwrap();
+
+    let whole = project.cut_summary(None).unwrap();
+    assert_eq!(whole.duration, 30.0);
+    assert!(whole.has_audio && whole.has_text);
+    assert_eq!(
+        (whole.width, whole.height),
+        (720, 1280),
+        "the first picture gives the footage's frame"
+    );
+
+    // The first ten seconds are the portrait picture alone: no sound, no title, its own frame.
+    let first = project.cut_summary_in(None, Some((0.0, 8.0))).unwrap();
+    assert_eq!(first.duration, 8.0);
+    assert!(
+        !first.has_audio && !first.has_text,
+        "audio {} text {}",
+        first.has_audio,
+        first.has_text
+    );
+    assert_eq!((first.width, first.height), (720, 1280));
+
+    // The tail is the landscape shot with its sound and the title: a different file altogether.
+    let tail = project.cut_summary_in(None, Some((12.0, 30.0))).unwrap();
+    assert_eq!(tail.duration, 18.0);
+    assert!(
+        tail.has_audio && tail.has_text,
+        "audio {} text {}",
+        tail.has_audio,
+        tail.has_text
+    );
+    assert_eq!(
+        (tail.width, tail.height),
+        (1920, 1080),
+        "the frame comes from what is in the span"
+    );
+
+    // An explicit frame still wins, and the range is clamped the way the export clamps it.
+    assert_eq!(
+        project
+            .cut_summary_in(Some((1080, 1920)), Some((20.0, 500.0)))
+            .unwrap()
+            .duration,
+        10.0
+    );
+    assert_eq!(project.cut_summary_in(None, Some((20.0, 10.0))).unwrap(), whole);
+    let report = project.platform_report(None, Some((0.0, 8.0))).unwrap();
+    assert_eq!(report.cut, first);
+}
+
+#[test]
 fn the_beat_snap_carries_each_retimed_clip_to_its_partner() {
     let project = Project::open_in_memory().unwrap();
     let video = asset(

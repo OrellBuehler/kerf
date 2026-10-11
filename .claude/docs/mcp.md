@@ -130,7 +130,8 @@ delivery: `formats` are shape names (`9:16` / `1:1` / `4:5` / `16:9`, or
 clip actually changed), renders through `render_variants` with progress on
 the client's token naming the file in flight, and reports each file with the
 platforms it is `ready_for` and its non-tip issues — judged at *that* file's
-frame via `cut_summary(Some(frame))`, so the agent does not run
+frame and over the span of the export's `range` (`variant_output` →
+`cut_summary_in(Some(frame), range)`), so the agent does not run
 `platform_check` per variant afterwards. `generate_captions` / `clear_captions` caption the
 cut; its `style` picks `lines` or `word_punch` and the `instructions` say to
 prefer the latter for a vertical cut, since nothing in a tool list tells an
@@ -178,7 +179,8 @@ test can pin them — send a social cut through it (-14 LUFS, true peak under -1
 the master tools or `loudnorm`). `set_master_limiter` names the ceiling the engine really
 defaults to (a test ties its text to `MASTER_DEFAULT_CEILING_DB`) and says that a true peak still
 over -1 dBTP with the limiter on is fixed by lowering the ceiling, not by switching it on again.
-`platform_check` tells it whether the cut is publishable where it is going
+`platform_check` (optional `range`, `{start, end}` timeline seconds: judge only the span an export of
+that range would write, on the sliced cut) tells it whether the cut is publishable where it is going
 (and the server `instructions` tell it to run that before reporting a cut
 finished — an agent that assembles a four-minute Reel has done the work and lost
 the audience), and `export_cover` writes the thumbnail.
@@ -198,7 +200,9 @@ failure, `failed: [{step, reason}]` (a run where every step failed is an error; 
 not stop the others). `get_asset_metadata` adds `analysis_status` and `proxy`. `proxy_status
 { asset_id? }` (one asset or all), `rebuild_proxy` and `delete_proxy` steer the preview cache — a proxy is
 a cache, not an edit, so none of them stage. A queued proxy goes before any analysis that is waiting for
-the machine.
+the machine, and a `scenes` step and the `skim_asset` sheet read a ready proxy instead of the original (an
+SDR YCbCr MP4 / MOV / Matroska source for scenes, any such container for the sheet; `core-project.md`); the zoomed `cell` is still
+a full-detail frame of the original.
 `analysis_status { asset_id? }` reads the per-kind state of one asset or all of them. The proxy and analysis
 tools take the project as the agent (`lock_agent`: activity stamped, edits attributed). Asking
 `analyze_asset` for nothing it can run — everything switched off and no `steps`, or only audio steps on

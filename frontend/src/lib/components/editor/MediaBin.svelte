@@ -21,6 +21,7 @@
 	import { thumbnails } from '$lib/thumbnails';
 	import { analysisFacts, audioExtraction, mediaInfo, shortPath, specLine, thumbTime, type MediaInfo } from '$lib/media-info';
 	import type { Asset } from '$lib/types';
+	import { tip } from '$lib/tip';
 
 	type BinAsset = { asset: Asset; info: MediaInfo };
 
@@ -293,7 +294,7 @@
 				void navigator.clipboard
 					.writeText(asset.path)
 					.then(() => toast.success('Path copied'))
-					.catch(() => toast.error('Could not copy the path'))
+					.catch(() => toast.error("Couldn't copy the path"))
 		});
 		items.push({
 			label: 'Show in folder',
@@ -345,13 +346,13 @@
 					<div>
 						<div style="font:var(--type-ui);color:var(--text-primary)">Drop media to start</div>
 						<div style="font-size:12px;color:var(--text-muted);margin-top:3px">
-							Kerf analyzes it locally on import — you choose what in Settings
+							Kerf analyzes new media on this computer. Choose what in Settings › Analysis.
 						</div>
 					</div>
-					<Btn variant="secondary" size="sm" icon="plus">Import files</Btn>
+					<Btn variant="secondary" size="sm" icon="plus">Import media…</Btn>
 				</div>
 				<div style="display:flex;justify-content:center;margin-top:8px">
-					<Btn variant="ghost" size="sm" icon="mic" onclick={() => ui.openVoiceover()}>Or write a voiceover</Btn>
+					<Btn variant="ghost" size="sm" icon="mic" onclick={() => ui.openVoiceover()}>or write a voiceover…</Btn>
 				</div>
 			{/if}
 		{:else}
@@ -367,7 +368,7 @@
 							{#if editor.importProgress !== null}
 								<span
 									style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)"
-									title="Stitching a 360 lens pair"
+									use:tip={'Stitching a 360 lens pair'}
 									>{Math.round(editor.importProgress * 100)}%</span
 								>
 							{/if}
@@ -375,7 +376,7 @@
 						</span>
 					{:else}
 						<span style="display:inline-flex;gap:2px">
-							<IconBtn title="Voiceover — speak a script onto the timeline" size={30} onclick={() => ui.openVoiceover()}
+							<IconBtn title={{ text: 'Write a voiceover…', detail: 'Speak a script onto the timeline.' }} size={30} onclick={() => ui.openVoiceover()}
 								><Icon n="mic" s={14} /></IconBtn
 							>
 							<IconBtn title="Import" size={30} onclick={onImport}><Icon n="plus" s={14} /></IconBtn>
@@ -394,7 +395,8 @@
 						oncontextmenu={(e) => onAssetContextMenu(e, a)}
 						onclick={() => onSelect(a.asset.id)}
 						onkeydown={(e) => e.key === 'Enter' && onSelect(a.asset.id)}
-						title="{a.asset.path}&#10;Drag onto a timeline track to add a clip · right-click for details"
+						use:tip={`${a.asset.path}
+Drag onto a timeline track to add a clip · right-click for details`}
 						style="display:flex;flex-direction:column;gap:6px;padding:7px;border-radius:var(--radius-sm);background:{sel ? 'var(--surface-hover)' : 'var(--surface-raised)'};border:var(--line-width) solid {sel ? 'var(--kerf-500)' : 'var(--border-subtle)'};cursor:grab"
 					>
 						<div style="display:flex;gap:9px;align-items:center">
@@ -427,7 +429,7 @@
 							{#if spec}
 								<div
 									style="font-size:12px;color:{sel ? 'var(--text-secondary)' : 'var(--text-muted)'};margin-top:3px;line-height:1.4;overflow-wrap:anywhere"
-									title={spec}
+									use:tip={spec}
 								>
 									{spec}
 								</div>
