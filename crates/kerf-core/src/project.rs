@@ -2282,8 +2282,9 @@ impl Project {
     }
 
     /// Append a new empty track of `kind`, keeping kinds grouped (video tracks
-    /// above audio tracks) and auto-naming it (`V2`, `A2`, …) when `name` is
-    /// omitted. Later video tracks composite **on top** at export.
+    /// before audio tracks, the order the project stores) and auto-naming it
+    /// (`V2`, `A2`, …) when `name` is omitted. Later video tracks composite **on
+    /// top** at export; the timeline draws them that way up, V2 above V1.
     pub fn add_track(&self, kind: StreamKind, name: Option<String>) -> Result<Track> {
         self.edit_timeline("Add track", |timeline| {
             let count = timeline.tracks.iter().filter(|t| t.kind == kind).count();
