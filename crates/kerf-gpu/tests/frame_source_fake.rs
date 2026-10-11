@@ -72,7 +72,7 @@ fn layer(a: &Asset, t: f64) -> kerf_core::PlanLayer {
 /// the files below, and a one-shot of `hang.mp4` / `die.mp4`. Installed once for the process.
 ///
 /// * `hang.mp4` sleeps without a word, `die.mp4` exits 1 at once.
-/// * `closed.mp4` writes three frames, closes its output and never exits.
+/// * `closed.mp4` writes three frames, closes its output, makes `closed.done` and never exits.
 /// * `bframe.mp4`: a run writes two I/P frames, then a B-frame, and sleeps.
 /// * `slow.mp4`: a run at the seek 1.99 s (past its end) takes a second and writes nothing.
 /// * `conflict.mp4`: its first run writes frames 3..10 of one picture, a later one frames 0..10 of
@@ -83,6 +83,7 @@ fn wrapper() -> &'static PathBuf {
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("frame-source-fake");
         std::fs::create_dir_all(&dir).unwrap();
         let _ = std::fs::remove_file(dir.join("conflict.count"));
+        let _ = std::fs::remove_file(dir.join("closed.done"));
         let real = real_ffmpeg();
         let wrapper = dir.join("ffmpeg-wrapper.sh");
         let script = r#"#!/bin/sh
@@ -100,6 +101,7 @@ case "$*" in
     printf 'YUV4MPEG2 W160 H90 F25:1 Ip A1:1 C420jpeg\n'
     frame 0 0 60; frame 1 1 60; frame 2 2 60
     exec >&-
+    : > "$dir/closed.done"
     exec sleep 600 ;;
   *bframe.mp4*showinfo*)
     echo '[Parsed_showinfo_0 @ 0x1] config in time_base: 1/25, frame_rate: 25/1' >&2
@@ -170,24 +172,37 @@ fn a_run_that_hangs_or_dies_fails_the_request_promptly() {
 
 /// A run that closes its output and never exits used to be waited for under its child's lock, so
 /// the `kill` of whoever stopped it — with the source's lock held — waited too, and every request
-/// to the source with it.
+/// to the source with it. The request waiting on the run when its file is released fails; it
+/// used to route to a new run of the released file (`spawned: 2`), which a `stats().runs` read
+/// right after `release` saw whenever the request's thread won the lock.
 #[test]
 #[ignore = "needs ffmpeg and sh"]
 fn a_run_that_closes_its_output_and_never_exits_blocks_nothing_that_stops_it() {
     let dir = wrapper();
     let closed = clip(dir, "closed.mp4");
-    let src = FrameSource::new(FrameSourceConfig::default());
+    let src = FrameSource::new(FrameSourceConfig {
+        request_timeout: Duration::from_secs(30),
+        ..FrameSourceConfig::default()
+    });
     assert!(src.runs_enabled());
     // The run delivers its three frames, then its output ends and its reader waits for the exit:
     // a request for a frame past them is what reads that far.
     let asking = std::thread::spawn({
         let src = std::sync::Arc::clone(&src);
         let l = layer(&closed, 0.4);
-        move || {
-            let _ = src.frame(&l, Hint::Scrub);
-        }
+        move || src.frame(&l, Hint::Scrub)
     });
-    std::thread::sleep(Duration::from_millis(1500));
+    // The wrapper says when it has closed the output. How long that takes is the machine's (the
+    // request probes the file with ffprobe first, and nothing here is quick on a loaded one).
+    let marker = dir.join("closed.done");
+    let until = Instant::now() + Duration::from_secs(60);
+    while !(marker.exists() && src.stats().runs == 1) {
+        assert!(Instant::now() < until, "the run never closed its output: {:?}", src.stats());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The reader's thread reaches the end of the pipe and its wait for the exit; whether it has
+    // yet only changes how much of the stop is exercised, not what must hold.
+    std::thread::sleep(Duration::from_millis(300));
 
     // `release` stops the file's runs with the source's lock held, and the next call needs it.
     let (tx, rx) = std::sync::mpsc::channel();
@@ -204,7 +219,19 @@ fn a_run_that_closes_its_output_and_never_exits_blocks_nothing_that_stops_it() {
         .expect("stopping a run that never exits must not wait for it");
     stopper.join().unwrap();
     assert_eq!(stats.runs, 0, "{stats:?}");
-    let _ = asking.join();
+
+    let err = asking.join().unwrap().expect_err("a request on a released file");
+    // Failed by the release itself, or by the run it was starting being stopped under it.
+    assert!(
+        matches!(&err, GpuError::Decode(why) if why.contains("released") || why.contains("stopped as it started")),
+        "the request should fail for the release, not wait out its deadline: {err}"
+    );
+    let stats = src.stats();
+    assert_eq!(
+        (stats.runs, stats.spawned),
+        (0, 1),
+        "the request started another run: {stats:?}"
+    );
 }
 
 /// The first B-frame a run shows ends the run and marks the file (B-frames are shown out of decode

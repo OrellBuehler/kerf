@@ -3,22 +3,93 @@
  * the cut (an hour at frame level is 100 000+) nor use a fixed ladder (a 2 s tick
  * at 2000 px/s is 4000 px of nothing between labels). So the step follows the
  * zoom — the smallest one that leaves a label room to be read — and only the
- * ticks inside the part of the lane that is on (or near) the screen exist. */
+ * ticks inside the part of the lane that is on (or near) the screen exist.
+ *
+ * A ruler is read against the timecode beside it, so its steps are *timecode*
+ * steps: a second is `nominal` frames (30 at 29.97 too, the non-drop count), and a
+ * step under a second is a whole number of frames. A label is then the project's
+ * own `HH:MM:SS` / `HH:MM:SS:FF` of its tick (`timecode.ts`) and never reads a frame
+ * off the one it is, whatever the rate. Between two labelled (major) ticks sit
+ * minor ticks, a taller one halfway when the division is even; once a frame is wide
+ * enough the frame ticks are the minors. */
+
+import { formatTimecode } from './timecode';
 
 /** The least room, px, between two labels. */
 export const MIN_LABEL_PX = 100;
 
-/** Label steps, seconds, finest first. Sub-second steps exist for frame-level
- *  zoom; past an hour the steps are whole multiples of one. */
-export const RULER_STEPS: readonly number[] = [
-	0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400, 36000
-];
+/** Label steps of a second and more, in timecode seconds, finest first; past an hour
+ *  they are whole multiples of one. */
+export const RULER_SECONDS: readonly number[] = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400, 36000];
 
-/** The label step for a zoom: the finest that leaves `minGapPx` between labels. */
-export function rulerStep(pxPerSec: number, minGapPx = MIN_LABEL_PX): number {
-	if (!(pxPerSec > 0)) return RULER_STEPS[RULER_STEPS.length - 1];
-	for (const s of RULER_STEPS) if (s * pxPerSec >= minGapPx - 1e-9) return s;
-	return RULER_STEPS[RULER_STEPS.length - 1];
+/** Minor ticks between two labelled ticks of each step (in timecode seconds): the
+ *  ones that divide it into round numbers. */
+const MINOR_DIVISIONS: ReadonlyMap<number, number> = new Map([
+	[1, 10],
+	[2, 10],
+	[5, 10],
+	[10, 10],
+	[15, 3],
+	[30, 6],
+	[60, 6],
+	[120, 4],
+	[300, 5],
+	[600, 10],
+	[900, 3],
+	[1800, 6],
+	[3600, 6],
+	[7200, 4],
+	[14400, 4],
+	[36000, 10]
+]);
+
+/** Minor ticks are drawn only when they are at least this far apart, px. */
+export const MIN_MINOR_PX = 6;
+
+/** The frames a timecode second holds at `fps`: 30 at 29.97, the non-drop count. */
+export const nominalRate = (fps: number): number => Math.max(1, Math.round(Number.isFinite(fps) && fps > 0 ? fps : 30));
+
+/** Where the ruler puts its ticks at a zoom. */
+export interface RulerGrid {
+	/** Seconds between two labelled (major) ticks. */
+	step: number;
+	/** The label carries a frame field: the step is under a timecode second. */
+	frames: boolean;
+	/** Minor ticks per step, the major included: 1 when there are none to draw. */
+	divisions: number;
+}
+
+/** Frame counts a sub-second step may be, finest first, for a rate: 1, 2, 5, 10 and the half second. */
+function frameSteps(fps: number): number[] {
+	const nominal = nominalRate(fps);
+	const steps = new Set([1, 2, 5, 10, Math.round(nominal / 2)].filter((f) => f >= 1 && f < nominal));
+	return [...steps].sort((a, b) => a - b);
+}
+
+function minorDivisions(seconds: number, stepPx: number): number {
+	const n = MINOR_DIVISIONS.get(seconds) ?? 1;
+	return stepPx / n >= MIN_MINOR_PX ? n : 1;
+}
+
+/** The ruler at a zoom: the finest step that leaves `minGapPx` between labels. */
+export function rulerGrid(pxPerSec: number, fps = 30, minGapPx = MIN_LABEL_PX): RulerGrid {
+	const rate = Number.isFinite(fps) && fps > 0 ? fps : 30;
+	const nominal = nominalRate(rate);
+	const room = (step: number) => pxPerSec > 0 && step * pxPerSec >= minGapPx - 1e-9;
+	for (const f of frameSteps(rate)) {
+		if (room(f / rate)) return { step: f / rate, frames: true, divisions: 1 };
+	}
+	for (const s of RULER_SECONDS) {
+		const step = (s * nominal) / rate;
+		if (room(step)) return { step, frames: false, divisions: minorDivisions(s, step * pxPerSec) };
+	}
+	const last = RULER_SECONDS[RULER_SECONDS.length - 1];
+	return { step: (last * nominal) / rate, frames: false, divisions: 1 };
+}
+
+/** The label step for a zoom, seconds (the grid's `step`). */
+export function rulerStep(pxPerSec: number, fps = 30, minGapPx = MIN_LABEL_PX): number {
+	return rulerGrid(pxPerSec, fps, minGapPx).step;
 }
 
 /** One tick: `k` is its index on the step grid (a stable key, and what the grid
@@ -40,22 +111,29 @@ export function ticksIn(loSec: number, hiSec: number, step: number, limit = 2000
 	return out;
 }
 
-/** Decimal places a label of this step needs: whole seconds, tenths, hundredths. */
-export const labelDecimals = (step: number): number => (step >= 1 ? 0 : step >= 0.1 ? 1 : 2);
+/** A minor tick: on the minor grid (`k` counts them from 0), taller when it is halfway. */
+export interface MinorTick extends Tick {
+	mid: boolean;
+}
 
-/** The label of tick `k` on a `step` grid: `mm:ss`, or `mm:ss.f` / `mm:ss.ff` for
- *  a sub-second step. Counts in whole units before splitting, so `0.3 s` never
- *  reads `00:00.2`. */
-export function tickLabel(k: number, step: number): string {
-	const d = labelDecimals(step);
-	const scale = 10 ** d;
-	const units = Math.round(k * step * scale);
-	const whole = Math.floor(units / scale);
-	const frac = units - whole * scale;
-	const m = Math.floor(whole / 60);
-	const s = whole % 60;
-	const base = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-	return d === 0 ? base : `${base}.${String(frac).padStart(d, '0')}`;
+/** The minor ticks of a grid in `[loSec, hiSec]`: every division of a step but the ones
+ *  a labelled tick already stands on. */
+export function minorTicksIn(loSec: number, hiSec: number, grid: RulerGrid, limit = 2000): MinorTick[] {
+	const n = grid.divisions;
+	if (n < 2) return [];
+	const out: MinorTick[] = [];
+	for (const t of ticksIn(loSec, hiSec, grid.step / n, limit * 2)) {
+		if (t.k % n === 0) continue;
+		out.push({ k: t.k, t: t.t, mid: n % 2 === 0 && t.k % n === n / 2 });
+		if (out.length >= limit) break;
+	}
+	return out;
+}
+
+/** The label of tick `k` on a grid: the project timecode of its time — `HH:MM:SS` for a
+ *  whole-second step, `HH:MM:SS:FF` below it. */
+export function tickLabel(k: number, grid: RulerGrid, fps: number): string {
+	return formatTimecode(k * grid.step, fps, { frames: grid.frames });
 }
 
 /** Frames are drawn on the ruler once one is at least this wide, px. */

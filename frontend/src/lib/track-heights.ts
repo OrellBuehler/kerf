@@ -67,6 +67,14 @@ export const titleLaneHeight = (preset: HeightPreset, rows: number): number => {
 	return Math.max(MIN_TITLE_LANE_PX, Math.max(1, rows) * m.row + m.pad * 2);
 };
 
+/** The titles lane while there is nothing on it: a strip that says what it is, not a row of its own
+ *  (a 27 px row of "Titles and captions appear here" over every empty cut). Its header is the add button. */
+export const COLLAPSED_TITLE_PX = 16;
+
+/** The titles lane's height: `titleLaneHeight` once there is a title, else the collapsed strip. */
+export const titleLaneHeightFor = (preset: HeightPreset, rows: number, titles: number): number =>
+	titles > 0 ? titleLaneHeight(preset, rows) : COLLAPSED_TITLE_PX;
+
 export const isPreset = (v: unknown): v is HeightPreset => v === 'compact' || v === 'medium' || v === 'large';
 
 export const presetPx = (p: HeightPreset): number => PRESET_PX[p];

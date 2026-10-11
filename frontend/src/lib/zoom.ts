@@ -112,6 +112,48 @@ export function fitZoom(duration: number, viewW: number): number | null {
 	return clampZoom(room / duration, duration);
 }
 
+/** The most opening a cut zooms to, px/s: a short cut sits in the window at a readable scale
+ *  (100 px/s is three pixels a frame) instead of being blown up to fill it. */
+export const AUTO_FIT_MAX = 100;
+
+/** The zoom a cut opens at: `fitZoom`, but never past `AUTO_FIT_MAX`; `null` when there is
+ *  nothing to fit. */
+export function autoFitZoom(duration: number, viewW: number): number | null {
+	const fit = fitZoom(duration, viewW);
+	return fit === null ? null : Math.min(fit, AUTO_FIT_MAX);
+}
+
+/** Narrower than this a window is not a window to fit a cut to, px. */
+export const MIN_FOLLOW_VIEW_PX = 160;
+
+/** What the timeline knows when it decides whether to fit again. */
+export interface FollowInput {
+	/** The visible lane width, px. */
+	viewW: number;
+	/** The cut's length, seconds (0 when empty). */
+	duration: number;
+	/** Counts project loads (launch, New, Open): a new one is a new cut to fit. */
+	generation: number;
+}
+
+/**
+ * The zoom a timeline that has not been zoomed by hand should take, or `null` to leave it. The
+ * zoom *follows the cut* until a person takes it: it fits when a cut opens, when the first clip
+ * arrives, when the window changes width, and when the cut grows past what is shown — and
+ * stays where it is when the cut gets shorter or a clip is trimmed, because rescaling the whole
+ * lane under every edit would move what the editor is looking at.
+ */
+export function followZoom(prev: FollowInput | null, now: FollowInput, zoom: number): number | null {
+	// A timeline in a hidden dock tab (or squeezed to nothing) measures no width worth fitting to.
+	if (!(now.viewW >= MIN_FOLLOW_VIEW_PX)) return null;
+	const target = autoFitZoom(now.duration, now.viewW);
+	if (target === null) return null;
+	const fresh = !prev || prev.generation !== now.generation || !(prev.duration > 0) || prev.viewW !== now.viewW;
+	if (fresh) return Math.abs(target - zoom) < 1e-9 ? null : target;
+	const fit = fitZoom(now.duration, now.viewW);
+	return fit !== null && zoom > fit + 1e-9 ? target : null;
+}
+
 // ---- the slider: logarithmic, so every decade gets the same travel -------------
 
 const SPAN = Math.log(ZOOM_MAX / ZOOM_MIN);
