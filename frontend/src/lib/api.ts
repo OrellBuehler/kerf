@@ -526,18 +526,11 @@ export async function projectPath(): Promise<string | null> {
 }
 
 /** Ask before something irreversible, with the two ends named as what they do (`labels`) — "Reset
- *  all" / "Cancel" rather than Yes / No. `window.confirm` is replaced by the dialog plugin in the
- *  desktop app and returns a promise there, so it can't be used synchronously — hence this. */
-export async function confirmAction(
-	message: string,
-	title = 'Kerf',
-	labels?: { ok: string; cancel: string }
-): Promise<boolean> {
+ *  all" / "Cancel" rather than Yes / No; there is no way to ask without naming them. `window.confirm`
+ *  is replaced by the dialog plugin in the desktop app and returns a promise there, so it can't be
+ *  used synchronously — hence this. */
+export async function confirmAction(message: string, title: string, labels: { ok: string; cancel: string }): Promise<boolean> {
 	if (!inTauri()) return window.confirm(message);
-	if (!labels) {
-		const { ask } = await import('@tauri-apps/plugin-dialog');
-		return ask(message, { title, kind: 'warning' });
-	}
 	const { message: show, ask } = await import('@tauri-apps/plugin-dialog');
 	try {
 		return (await show(message, { title, kind: 'warning', buttons: { ok: labels.ok, cancel: labels.cancel } })) === labels.ok;

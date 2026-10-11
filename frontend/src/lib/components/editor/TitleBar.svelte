@@ -49,7 +49,7 @@
 			>
 			{#if editor.saved}
 				<Badge tone="success" dot>Saved</Badge>
-			{:else}
+			{:else if editor.hasUnsavedWork}
 				<Badge tone="warning" dot>Unsaved</Badge>
 			{/if}
 		</div>

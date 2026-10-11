@@ -7,6 +7,7 @@
 	import ExportDialog from '$lib/components/editor/ExportDialog.svelte';
 	import SettingsDialog from '$lib/components/editor/SettingsDialog.svelte';
 	import UpdateDialog from '$lib/components/editor/UpdateDialog.svelte';
+	import AboutDialog from '$lib/components/editor/AboutDialog.svelte';
 	import VoiceoverDialog from '$lib/components/editor/VoiceoverDialog.svelte';
 	import FitMusicDialog from '$lib/components/editor/FitMusicDialog.svelte';
 	import StemsDialog from '$lib/components/editor/StemsDialog.svelte';
@@ -54,6 +55,7 @@
 	import { afterPaint, fontsReady, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
 	import { CONFIRM, UNSAVED, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
+	import { savedLine } from '$lib/failure-copy';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
@@ -63,6 +65,7 @@
 			settings.open ||
 			updater.dialogOpen ||
 			ui.voiceoverDialog !== null ||
+			ui.aboutDialog ||
 			ui.fitMusicDialog !== null ||
 			ui.stemsDialog !== null
 	);
@@ -287,7 +290,7 @@
 			return false;
 		}
 		const path = editor.currentPath;
-		toast.success(`Saved ${editor.projectName}`, {
+		toast.success(path ? savedLine(path) : `Saved ${editor.projectName}`, {
 			...(path ? { action: { label: 'Show in folder', onClick: () => void revealPath(path).catch(() => {}) } } : {})
 		});
 		return true;
@@ -328,9 +331,7 @@
 	}
 
 	function onAbout() {
-		toast.info(`Kerf ${updater.version || ''}`.trim(), {
-			description: 'Non-destructive, AI-assisted video editing. PolyForm Noncommercial 1.0.0 — github.com/OrellBuehler/kerf'
-		});
+		ui.openAbout();
 	}
 
 	async function onImport() {
@@ -679,6 +680,10 @@
 
 {#if updater.dialogOpen}
 	<UpdateDialog />
+{/if}
+
+{#if ui.aboutDialog}
+	<AboutDialog onClose={() => ui.closeAbout()} />
 {/if}
 
 <ContextMenu />

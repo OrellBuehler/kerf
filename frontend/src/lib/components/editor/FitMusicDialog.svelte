@@ -108,7 +108,7 @@
 	const valueCss = 'font-family:var(--font-mono);font-size:12px;color:var(--text-primary)';
 </script>
 
-<Modal title="Fit music to video" icon="music" width={460} busy={applying} rescue {onClose}>
+<Modal title="Fit to video" icon="music" width={460} busy={applying} rescue {onClose}>
 	<fieldset
 		disabled={applying}
 		style="flex:1;min-height:0;min-width:0;margin:0;border:0;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:10px"
@@ -204,7 +204,7 @@
 			<div style="display:flex;align-items:center;gap:8px">
 				<div style="flex:1"></div>
 				<Btn variant="ghost" size="md" disabled={applying} onclick={onClose}>Cancel</Btn>
-				<Btn variant="primary" size="md" icon="music" data-rescue disabled={!canApply} onclick={apply}>Fit music</Btn>
+				<Btn variant="primary" size="md" icon="music" data-rescue disabled={!canApply} onclick={apply}>Fit</Btn>
 			</div>
 		</div>
 	{/snippet}

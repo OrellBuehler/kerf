@@ -8,6 +8,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { cancelStems, onStemsProgress, stemsStatus } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
+	import { failure } from '$lib/failure-copy';
 	import { formatTime } from '$lib/diff';
 	import type { StemsProgress, StemsStatus } from '$lib/types';
 	import { STEM_NAMES, capitalized, describeStems, downloadNote, isStemsCancelled, stageLabel } from '$lib/stems';
@@ -66,7 +67,7 @@
 			onClose();
 		} catch (e) {
 			// A stop is the user's own doing — back to the form, no notice.
-			if (!isStemsCancelled(e)) toast.error(e instanceof Error ? e.message : String(e));
+			if (!isStemsCancelled(e)) toast.error(failure('Stem separation failed', e));
 		} finally {
 			unlisten();
 			running = false;
@@ -161,7 +162,7 @@
 				<div style="display:flex;align-items:center;gap:8px">
 					<div style="flex:1"></div>
 					<Btn variant="ghost" size="md" onclick={onClose}>Cancel</Btn>
-					<Btn variant="primary" size="md" icon="layers" data-rescue disabled={!canStart} onclick={start}>Separate</Btn>
+					<Btn variant="primary" size="md" icon="layers" data-rescue disabled={!canStart} onclick={start}>Separate stems</Btn>
 				</div>
 			{/if}
 		</div>

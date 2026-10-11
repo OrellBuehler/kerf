@@ -10,6 +10,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { cancelVoiceover, onVoiceoverProgress, voiceoverStatus } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
+	import { failure } from '$lib/failure-copy';
 	import { CAPTION_LOOKS } from '$lib/style-presets';
 	import { fmtDuration } from '$lib/media-info';
 	import { TIMES } from '$lib/slider-row';
@@ -108,7 +109,7 @@
 			onClose();
 		} catch (e) {
 			// A stop is the user's own doing — back to the form, no notice.
-			if (!isVoiceoverCancelled(e)) toast.error(e instanceof Error ? e.message : String(e));
+			if (!isVoiceoverCancelled(e)) toast.error(failure('Voiceover failed', e));
 		} finally {
 			unlisten();
 			generating = false;
@@ -134,7 +135,7 @@
 </script>
 
 <Modal
-	title="Voiceover"
+	title="Write a voiceover"
 	icon="mic"
 	width={560}
 	busy={generating}
@@ -270,7 +271,7 @@
 				<div style="display:flex;align-items:center;gap:8px">
 					<div style="flex:1"></div>
 					<Btn variant="ghost" size="md" onclick={onClose}>Cancel</Btn>
-					<Btn variant="primary" size="md" icon="mic" data-rescue disabled={!canGenerate} onclick={generate}>Generate</Btn>
+					<Btn variant="primary" size="md" icon="mic" data-rescue disabled={!canGenerate} onclick={generate}>Generate voiceover</Btn>
 				</div>
 			{/if}
 		</div>

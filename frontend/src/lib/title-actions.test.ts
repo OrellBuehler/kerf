@@ -83,7 +83,7 @@ describe('importCaptionFile', () => {
 			['Hello there', 1],
 			['General Kenobi', 4]
 		]);
-		expect(shown).toEqual([{ kind: 'success', text: 'Imported 2 captions from 2 of 2 cues' }]);
+		expect(shown).toEqual([{ kind: 'success', text: 'Imported 2 cues.' }]);
 	});
 
 	test('a cue that did not land makes the notice a warning', async () => {
@@ -91,7 +91,7 @@ describe('importCaptionFile', () => {
 		expect(await importCaptionFile()).toBe(true);
 		expect(shown).toHaveLength(1);
 		expect(shown[0].kind).toBe('warning');
-		expect(shown[0].text).toBe('Imported 2 captions from 2 of 3 cues (1 outside the cut, 1 unreadable)');
+		expect(shown[0].text).toBe('Imported 2 of 3 cues. 1 fell outside the cut. 1 unreadable line was skipped.');
 	});
 
 	test('asks before replacing captions, naming the count and the file', async () => {
@@ -106,7 +106,7 @@ describe('importCaptionFile', () => {
 			}
 		]);
 		expect(captions().map((o) => o.text)).toEqual(['Hello again', 'General Kenobi']);
-		expect(shown[0].text).toBe('Imported 2 captions from 2 of 2 cues · replaced 2');
+		expect(shown[0].text).toBe('Imported 2 cues. Replaced 2 captions.');
 	});
 
 	test('declining leaves the captions as they were, and says nothing', async () => {
@@ -211,7 +211,7 @@ describe('importCaptionFile', () => {
 	test('a cue too short to read is its own line in the notice', async () => {
 		pick = async () => text(`${CLEAN}\n3\n00:00:07,000 --> 00:00:07,050\nA blink\n`);
 		expect(await importCaptionFile()).toBe(true);
-		expect(shown).toEqual([{ kind: 'warning', text: 'Imported 2 captions from 2 of 3 cues (1 too short)' }]);
+		expect(shown).toEqual([{ kind: 'warning', text: 'Imported 2 of 3 cues. 1 was too short.' }]);
 	});
 
 	test('leaves the selection where it was', async () => {

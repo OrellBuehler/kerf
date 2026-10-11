@@ -13,7 +13,7 @@ const read = (path: string) => readFileSync(join(SRC, path), 'utf8');
 const EDITOR = 'lib/components/editor/';
 const code = (css: string) => css.replace(/\/\*[\s\S]*?\*\//g, '');
 
-const DIALOGS = ['ExportDialog', 'SettingsDialog', 'UpdateDialog', 'VoiceoverDialog', 'FitMusicDialog', 'StemsDialog'];
+const DIALOGS = ['ExportDialog', 'SettingsDialog', 'UpdateDialog', 'VoiceoverDialog', 'FitMusicDialog', 'StemsDialog', 'AboutDialog'];
 
 /** The opening `<Modal …>` tag of a dialog, whatever it spans. */
 function modalTag(name: string): string {

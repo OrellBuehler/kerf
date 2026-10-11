@@ -103,10 +103,4 @@ describe('confirmAction with named buttons', () => {
 		answer = '';
 		expect(await confirmAction('x', 't', { ok: 'Reset all', cancel: 'Cancel' })).toBe(false);
 	});
-
-	test('without names it is the plugin’s own question, as before', async () => {
-		expect(await confirmAction('Sure?', 'Kerf')).toBe(true);
-		expect(shown).toHaveLength(0);
-		expect(asked).toHaveLength(1);
-	});
 });

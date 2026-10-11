@@ -346,13 +346,13 @@
 					<div>
 						<div style="font:var(--type-ui);color:var(--text-primary)">Drop media to start</div>
 						<div style="font-size:12px;color:var(--text-muted);margin-top:3px">
-							Kerf analyzes it locally on import — you choose what in Settings
+							Kerf analyzes new media on this computer. Choose what in Settings › Analysis.
 						</div>
 					</div>
-					<Btn variant="secondary" size="sm" icon="plus">Import files</Btn>
+					<Btn variant="secondary" size="sm" icon="plus">Import media…</Btn>
 				</div>
 				<div style="display:flex;justify-content:center;margin-top:8px">
-					<Btn variant="ghost" size="sm" icon="mic" onclick={() => ui.openVoiceover()}>Or write a voiceover</Btn>
+					<Btn variant="ghost" size="sm" icon="mic" onclick={() => ui.openVoiceover()}>or write a voiceover…</Btn>
 				</div>
 			{/if}
 		{:else}
@@ -376,7 +376,7 @@
 						</span>
 					{:else}
 						<span style="display:inline-flex;gap:2px">
-							<IconBtn title="Voiceover — speak a script onto the timeline" size={30} onclick={() => ui.openVoiceover()}
+							<IconBtn title="Write a voiceover…\nSpeak a script onto the timeline." size={30} onclick={() => ui.openVoiceover()}
 								><Icon n="mic" s={14} /></IconBtn
 							>
 							<IconBtn title="Import" size={30} onclick={onImport}><Icon n="plus" s={14} /></IconBtn>

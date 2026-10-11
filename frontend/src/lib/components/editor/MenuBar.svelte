@@ -443,7 +443,7 @@
 
 	// Opening a dialog, or going to another window, puts the menus away; so does
 	// the bar changing shape under an open menu.
-	const modal = $derived(settings.open || ui.exportDialog || updater.dialogOpen || ui.voiceoverDialog !== null);
+	const modal = $derived(settings.open || ui.exportDialog || updater.dialogOpen || ui.voiceoverDialog !== null || ui.aboutDialog);
 	$effect(() => {
 		// `closeAll` reads what it writes; this must depend on the dialogs alone.
 		if (modal) untrack(() => closeAll());

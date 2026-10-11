@@ -147,7 +147,7 @@
 		<span style="width:1px;height:12px;background:var(--border-default)"></span>
 		<button
 			type="button"
-			use:tip={'Open the log folder — attach kerf.<date>.log when reporting an issue'}
+			use:tip={'Show log folder\nAttach kerf.<date>.log when reporting an issue.'}
 			onclick={() =>
 				revealLogs().catch((e) => toast.error(e instanceof Error ? e.message : String(e)))}
 			style="display:inline-flex;align-items:center;gap:5px;background:none;border:none;cursor:pointer;color:var(--text-muted);font-size:var(--text-xs);padding:0"

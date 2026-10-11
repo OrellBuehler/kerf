@@ -2430,7 +2430,7 @@
 				<div
 					style="position:absolute;left:0;right:0;top:var(--ruler-h);bottom:0;display:grid;place-items:center;color:var(--text-muted);font-size:12px"
 				>
-					Timeline empty — import media and queue a cut
+					Drop media here to start cutting.
 				</div>
 			{/if}
 

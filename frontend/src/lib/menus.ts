@@ -161,7 +161,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			act('tool.rippleMode', { role: 'check', checked: s.rippleMode, label: 'Ripple mode' }),
 			act('tool.snap', { role: 'check', checked: s.snap, label: 'Snapping' }),
 			sep,
-			act('app.keyboard', { label: 'Keyboard shortcuts…' })
+			act('app.keyboard')
 		]
 	};
 
@@ -292,7 +292,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			},
 			sep,
 			act('window.resetWorkspace', { label: `Reset ${label} workspace` }),
-			act('window.resetAllWorkspaces', { label: 'Reset all workspaces' })
+			act('window.resetAllWorkspaces')
 		]
 	};
 
@@ -300,7 +300,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 		id: 'help',
 		label: 'Help',
 		items: [
-			act('app.keyboard', { label: 'Keyboard shortcuts' }),
+			act('app.keyboard'),
 			sep,
 			act('app.checkUpdate'),
 			act('app.releases'),

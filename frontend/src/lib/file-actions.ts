@@ -4,6 +4,7 @@
 
 import { exportCover, inTauri, pickCoverPath, revealPath } from './api';
 import { toast } from './notifications.svelte';
+import { coverLine, failure } from './failure-copy';
 import { ui } from './editor-ui.svelte';
 
 /** Write the frame under the playhead as a cover image — the thumbnail a
@@ -19,10 +20,10 @@ export async function saveCoverFrame(): Promise<void> {
 	if (!path) return;
 	try {
 		const out = await exportCover(ui.time, path);
-		toast.success(`Cover saved → ${out}`, {
+		toast.success(coverLine(out), {
 			action: { label: 'Show in folder', onClick: () => void revealPath(out).catch(() => {}) }
 		});
 	} catch (e) {
-		toast.error(e instanceof Error ? e.message : String(e));
+		toast.error(failure("Couldn't save the cover frame", e));
 	}
 }

@@ -140,7 +140,7 @@
 		<Btn size="sm" variant="ghost" disabled={editor.busy} title={clearHint(captionCount)} onclick={() => void dropCaptions()}>Clear</Btn>
 	{/if}
 	<Btn size="sm" variant="ghost" icon="mic" disabled={editor.busy} title="Speak a script onto the timeline" onclick={() => ui.openVoiceover()}
-		>Voiceover…</Btn
+		>Write a voiceover…</Btn
 	>
 	<Btn
 		id="{uid}-toggle"

@@ -80,7 +80,7 @@ describe('File', () => {
 			'Import captions…',
 			'Export…',
 			'Save cover frame…',
-			'Settings',
+			'Settings…',
 			'Quit Kerf'
 		]);
 	});
@@ -312,7 +312,7 @@ describe('Window', () => {
 
 	test('resetting names the workspace on screen, and every workspace can be reset at once', () => {
 		expect(labels(menu('window', { workspace: 'color' }).items)).toEqual(
-			expect.arrayContaining(['Reset Color workspace', 'Reset all workspaces'])
+			expect.arrayContaining(['Reset Color workspace', 'Reset all workspaces…'])
 		);
 		expect(labels(menu('window', { workspace: 'deliver' }).items)).toContain('Reset Deliver workspace');
 	});
@@ -325,7 +325,7 @@ describe('Help', () => {
 	});
 
 	test('the log folder is a desktop thing, and says so elsewhere', () => {
-		const logs = find(menu('help', { desktop: false }).items, 'Open the log folder');
+		const logs = find(menu('help', { desktop: false }).items, 'Show log folder');
 		expect('disabled' in logs && logs.disabled).toBe(true);
 	});
 });

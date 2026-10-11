@@ -13,6 +13,7 @@
 	import { COLOR_GROUPS, PRESETS, PRESET_IDS, SHAPE_TOKENS, THUMB_STYLES } from '$lib/theme';
 	import { cancelVoiceover, onVoiceoverProgress, prepareVoiceover, voiceoverStatus } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
+	import { failure } from '$lib/failure-copy';
 	import { ANALYSIS_KINDS } from '$lib/analysis-steps';
 	import { PREVIEW_SOURCES, PROXY_SIZES } from '$lib/proxy-info';
 	import { approxMB, isVoiceoverCancelled, loadPrefs, stageLabel } from '$lib/voiceover';
@@ -66,7 +67,9 @@
 		);
 	});
 	const voLine = $derived(
-		voStatus
+		voPreparing
+			? 'Downloading the voice model…'
+			: voStatus
 			? !voStatus.available
 				? (voStatus.reason ?? 'Voiceover is not available.')
 				: voStatus.ready
@@ -89,7 +92,7 @@
 			voStatus = await prepareVoiceover(voice);
 			toast.success('Voice model ready');
 		} catch (e) {
-			if (!isVoiceoverCancelled(e)) toast.error(e instanceof Error ? e.message : String(e));
+			if (!isVoiceoverCancelled(e)) toast.error(failure('Voice model download failed', e));
 		} finally {
 			unlisten();
 			voPreparing = false;
@@ -263,8 +266,8 @@
 					{/each}
 				</div>
 				<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
-					With the switch above off nothing runs on import, but these still decide what an agent's analyze_asset
-					runs when it names no steps. A clip can always be analyzed by hand, whatever is switched off here.
+					With the switch above off, nothing runs on import. These choices still decide what a connected agent
+					analyzes when it doesn't ask for specific steps. You can always analyze a clip by hand.
 				</p>
 			{:else if section === 'speech'}
 				<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
@@ -324,16 +327,16 @@
 					</div>
 				{/if}
 				<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
-					Voiceover turns a script into speech on this machine, in English, with a voice model fetched once.
-					Without this it downloads the first time you generate one.
+					Voiceover turns a script into speech on this machine, in English, with a voice model fetched once.{#if !voStatus?.ready}
+						Without this it downloads the first time you generate one.{/if}
 				</p>
 			{:else if section === 'preview'}
 				<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
 					Preview proxies
 				</div>
 				<p style="margin:6px 0 10px;font-size:12px;line-height:1.55;color:var(--text-secondary)">
-					Kerf builds a light, all-intra copy of each video so scrubbing decodes one frame instead of a long GOP of
-					4K or 5K footage. Export always reads the original. A proxy is built before any analysis that is waiting.
+					Kerf makes a lightweight copy of each video so scrubbing stays smooth, even with 4K or 5K footage.
+					Exports always use your original files.
 				</p>
 				<div role="radiogroup" aria-label="Proxy size" use:roving style="display:flex;flex-wrap:wrap;gap:6px">
 					{#each PROXY_SIZES as p (p.size)}
@@ -349,8 +352,8 @@
 					{/each}
 				</div>
 				<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
-					{PROXY_SIZES.find((p) => p.size === settings.proxySize)?.hint} Pixels across; 360 footage keeps its larger
-					ratio. A proxy made at another size stays on disk until you delete it from the bin.
+					Width of the copy in pixels. 1280 is the default: sharp enough to judge framing, light enough to scrub. 360
+					footage keeps its wider ratio. Copies made at another size stay on disk until you delete them from the bin.
 				</p>
 
 				<div
@@ -420,10 +423,9 @@
 					<span style="display:flex;flex-direction:column;gap:3px">
 						<span style="font-size:12px;color:var(--text-primary)">Draw the preview on the GPU</span>
 						<span style="font-size:12px;line-height:1.55;color:var(--text-secondary)">
-							Frames the GPU compositor draws exactly are shown from a native surface instead of FFmpeg's
-							JPEG. Every other frame — a transition in progress, an effect it does not draw yet, anything
-							that fails — is FFmpeg's, as before. Playback still uses FFmpeg. The status bar says which
-							renderer made the frame you are looking at.
+							Draws frames the GPU compositor can render exactly in a native surface instead of FFmpeg's JPEG.
+							Anything it can't draw, such as a transition in progress or an unsupported effect, is still drawn by
+							FFmpeg. Playback still uses FFmpeg. The status bar shows which renderer made the frame you're looking at.
 						</span>
 					</span>
 				</label>
