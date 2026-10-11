@@ -29,8 +29,12 @@ export interface FramePumpDeps {
 	hasClips(): boolean;
 	/** Playback is streaming frames into the pane: no frame is fetched meanwhile. */
 	streaming(): boolean;
-	timelineFrame(time: number): Promise<string | null>;
-	previewFrame(time: number, overlays: boolean): Promise<PreviewFrameResult>;
+	/** How wide a picture is asked for, px — the frame's box at the screen's pixel ratio, in the
+	 *  steps of `preview-size.ts` — or null until the frame has been measured: nothing is asked
+	 *  for before that, so a first frame is not decoded at a guess and again at the real size. */
+	width(): number | null;
+	timelineFrame(time: number, width: number): Promise<string | null>;
+	previewFrame(time: number, overlays: boolean, width: number): Promise<PreviewFrameResult>;
 	/** What the backend answered (the status bar names the renderer). */
 	answered(result: PreviewFrameResult): void;
 	/** The GPU path failed outright (the command rejected): the frame is the JPEG and the surface goes. */
@@ -44,7 +48,7 @@ export function createFramePump(deps: FramePumpDeps) {
 	/** The aspect of the picture on show (the canvas the compositor drew, or the JPEG). */
 	let imgAspect = $state<number | null>(null);
 	let inFlight = false;
-	let queued: { time: number; via: 'gpu' | 'jpeg'; overlays: boolean } | null = null;
+	let queued: { time: number; via: 'gpu' | 'jpeg'; overlays: boolean; width: number } | null = null;
 
 	// Single-flight decode: only ever one composite in flight, and `queued` always holds the
 	// *latest* wanted frame. Scrubbing collapses to one render + one pending target instead of a
@@ -60,7 +64,7 @@ export function createFramePump(deps: FramePumpDeps) {
 				// allows it (and says so), else it hands back FFmpeg's JPEG for this frame.
 				let result: PreviewFrameResult | null = null;
 				try {
-					result = await deps.previewFrame(want.time, want.overlays);
+					result = await deps.previewFrame(want.time, want.overlays, want.width);
 				} catch (error) {
 					// Under "Proxy only" the backend refuses a frame whose proxy is still building. That is
 					// the preview waiting, not the GPU path failing: the picture on show (and the surface,
@@ -73,7 +77,7 @@ export function createFramePump(deps: FramePumpDeps) {
 					// The command itself failed (a panic in the GPU path, an error building the inputs): this
 					// frame is the JPEG, and the surface must not stay over it.
 					deps.gpuFailed(error);
-					const url = await deps.timelineFrame(want.time);
+					const url = await deps.timelineFrame(want.time, want.width);
 					if (url && !deps.streaming()) {
 						frameUrl = url;
 						gpuShown = false;
@@ -95,7 +99,7 @@ export function createFramePump(deps: FramePumpDeps) {
 				// The *composited* timeline still — every visible clip with its color, effects, transform
 				// and overlays applied, so Inspector edits show up live. (Desktop only — null in the
 				// browser.)
-				const url = await deps.timelineFrame(want.time);
+				const url = await deps.timelineFrame(want.time, want.width);
 				// Playback may have taken over while this was decoding; a still landing on top of live
 				// frames would show as a stutter.
 				if (url && !deps.streaming()) {
@@ -148,14 +152,17 @@ export function createFramePump(deps: FramePumpDeps) {
 			// setting off, a dialog over the frame) it is not read, so it cannot bring a frame back.
 			const overlays = via === 'gpu' && deps.routeOverlays();
 			void deps.boundsEpoch();
+			// A picture of a different size is a different frame: a wider box (a panel dragged, a
+			// window moved to another screen) asks again, at the new width.
+			const width = deps.width();
 			if (!deps.hasClips()) {
 				frameUrl = null;
 				gpuShown = false;
 				queued = null;
 				return;
 			}
-			if (deps.streaming()) return;
-			queued = { time, via, overlays };
+			if (deps.streaming() || width === null) return;
+			queued = { time, via, overlays, width };
 			void pump();
 		}
 	};

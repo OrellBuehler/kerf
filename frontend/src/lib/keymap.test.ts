@@ -1083,6 +1083,7 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/components/editor/MixSlider.svelte',
 			'lib/components/editor/NotificationCenter.svelte',
 			'lib/components/editor/Preview.svelte',
+			'lib/components/editor/ScrubBar.svelte',
 			'lib/components/editor/SettingsDialog.svelte',
 			'lib/components/editor/StemsDialog.svelte',
 			'lib/components/editor/Timeline.svelte',

@@ -91,6 +91,12 @@ describe('color literals', () => {
 		expect(offenders).toEqual([]);
 	});
 
+	test('the scrub rail is the disabled color, so the 3:1 it is held to below covers it', () => {
+		const css = readFileSync(join(SRC, 'lib/styles/kerf-tokens.css'), 'utf8');
+		expect(css).toMatch(/--scrub-rail:\s*var\(--text-disabled\)/);
+		expect(readFileSync(join(SRC, 'lib/components/editor/ScrubBar.svelte'), 'utf8')).toContain('var(--scrub-rail)');
+	});
+
 	test('every exception is still needed', () => {
 		// A stale entry would quietly let literals back into a file that no longer
 		// has any reason to hold them.
