@@ -8,7 +8,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { workspace } from '$lib/workspace.svelte';
-	import { proposalIndicator } from '$lib/agent-status';
+	import { proposalIndicator, reviewChipText } from '$lib/agent-status';
 	import { updater } from '$lib/updater.svelte';
 	import { notifications } from '$lib/notifications.svelte';
 	import { settings } from '$lib/settings.svelte';
@@ -27,9 +27,7 @@
 
 	// The right cell holds the project's name and badge, a review chip, Export, the gear, the bell and the
 	// version; narrower than this the chip is its icon and count (the name has the least to give up).
-	const REVIEW_FULL_PX = 510;
 	let rightWidth = $state(0);
-	const shortReview = $derived(rightWidth > 0 && rightWidth < REVIEW_FULL_PX);
 
 	// An available update stays offered here after the dialog is dismissed;
 	// otherwise the version label doubles as a manual "check for updates".
@@ -79,7 +77,7 @@
 				style="-webkit-app-region:no-drag;flex:none;gap:6px;height:28px;padding:0 9px;font:var(--type-ui);white-space:nowrap"
 			>
 				<Icon n="git-pull-request-arrow" s={13} />
-				{shortReview ? proposal.count || 'Review' : proposal.label}
+				{reviewChipText(proposal, rightWidth)}
 			</button>
 		{/if}
 		<!-- The app's goal had no button outside the Deliver workspace; it is File › Export… and Ctrl+E too. A

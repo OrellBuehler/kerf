@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { ago, agentLine, COMPOSER_HINT_MIN_HEIGHT, proposalIndicator, showComposerHint } from './agent-status';
+import { ago, agentLine, COMPOSER_HINT_MIN_HEIGHT, proposalIndicator, REVIEW_CHIP_FULL_WIDTH, reviewChipText, showComposerHint } from './agent-status';
 import { STATUS_MAP } from './components/editor/data';
 import type { StagedEdit, TimelineDiff } from './types';
 
@@ -78,5 +78,20 @@ describe('a task’s badge', () => {
 		expect(STATUS_MAP.failed.icon).toBe('circle-alert');
 		const tones = Object.values(STATUS_MAP).map((s) => s.tone);
 		expect(new Set(tones).size).toBeGreaterThanOrEqual(4);
+	});
+});
+
+describe('the title bar chip', () => {
+	const four = proposalIndicator(staged(4))!;
+
+	test('is the whole label while the cell has room, or is not measured yet', () => {
+		expect(reviewChipText(four, 0)).toBe('Review 4 changes');
+		expect(reviewChipText(four, REVIEW_CHIP_FULL_WIDTH)).toBe('Review 4 changes');
+		expect(reviewChipText(four, 1366 / 2 - 150)).toBe('Review 4 changes');
+	});
+
+	test('is the count alone in a narrow cell, and a word when there is no count', () => {
+		expect(reviewChipText(four, REVIEW_CHIP_FULL_WIDTH - 1)).toBe('4');
+		expect(reviewChipText(proposalIndicator(staged(0))!, 300)).toBe('Review');
 	});
 });

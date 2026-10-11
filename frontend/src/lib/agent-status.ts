@@ -71,3 +71,14 @@ export const COMPOSER_HINT_MIN_HEIGHT = 520;
 export function showComposerHint(panelHeight: number): boolean {
 	return panelHeight >= COMPOSER_HINT_MIN_HEIGHT;
 }
+
+/** The title bar's right cell, px, below which the review chip is its icon and count: with the project's
+ *  name and badge, Export, the gear, the bell and the version beside it, the full label leaves the name
+ *  nothing (at 960 px the badge itself went). */
+export const REVIEW_CHIP_FULL_WIDTH = 510;
+
+/** What the title bar's chip says in a cell `cellWidth` wide (0 while it is not measured yet: the full label). */
+export function reviewChipText(indicator: ProposalIndicator, cellWidth: number): string {
+	const narrow = cellWidth > 0 && cellWidth < REVIEW_CHIP_FULL_WIDTH;
+	return narrow ? String(indicator.count || 'Review') : indicator.label;
+}
