@@ -59,6 +59,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, ChildStderr, ChildStdout, Stdio};
+use std::sync::atomic::{self, AtomicU64};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -243,6 +244,32 @@ struct State {
     oneshots: usize,
     stats: SourceStats,
     closed: bool,
+    /// Which files were released, and when: a request fails on a file released after it began,
+    /// instead of routing to a fresh run of it as it does when a *router* stopped its run.
+    released: Releases,
+}
+
+/// When each file was last released: the number of releases so far including that one
+/// (`Shared::releases`), and the time (to forget it once no request that began before it can still
+/// be waiting).
+#[derive(Default)]
+struct Releases(HashMap<SourceId, (u64, Instant)>);
+
+impl Releases {
+    fn note(&mut self, source: SourceId, count: u64, at: Instant) {
+        self.0.insert(source, (count, at));
+    }
+
+    /// Whether `source` was released after a request began, which read `born` releases then: a
+    /// request that began after the release (`born` is its count or more) is an ordinary one.
+    fn since(&self, source: SourceId, born: u64) -> bool {
+        self.0.get(&source).is_some_and(|&(count, _)| count > born)
+    }
+
+    /// Forget the releases `memory` or more before `now`.
+    fn forget(&mut self, now: Instant, memory: Duration) {
+        self.0.retain(|_, (_, at)| now.saturating_duration_since(*at) < memory);
+    }
 }
 
 struct Shared {
@@ -250,6 +277,10 @@ struct Shared {
     changed: Condvar,
     config: FrameSourceConfig,
     epoch: Instant,
+    /// The calls of [`FrameSource::release`] so far. A request reads it before anything else it
+    /// does (the probes that come before its first lock take seconds on a loaded machine), and
+    /// `release` bumps it under the state lock.
+    releases: AtomicU64,
 }
 
 impl Shared {
@@ -519,10 +550,12 @@ impl FrameSource {
                 oneshots: 0,
                 stats: SourceStats::default(),
                 closed: false,
+                released: Releases::default(),
             }),
             changed: Condvar::new(),
             config,
             epoch: Instant::now(),
+            releases: AtomicU64::new(0),
         });
         let weak = Arc::downgrade(&shared);
         let _ = std::thread::Builder::new()
@@ -574,6 +607,7 @@ impl FrameSource {
 
     /// The frame one layer shows.
     pub fn frame(&self, layer: &PlanLayer, hint: Hint) -> Result<Option<Arc<YuvFrame>>, GpuError> {
+        let born = self.shared.releases.load(atomic::Ordering::Acquire);
         let (w, h) = (layer.stream.width, layer.stream.height);
         if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
             return Err(GpuError::Unsupported(format!(
@@ -627,6 +661,9 @@ impl FrameSource {
         loop {
             if st.closed {
                 return Err(GpuError::Decode("the frame source was released".into()));
+            }
+            if st.released.since(source, born) {
+                return Err(GpuError::Decode(format!("{}: the file was released", layer.path)));
             }
             let info = st.files.get(&source).copied();
             if st.distrusted.contains_key(&source) {
@@ -1076,8 +1113,14 @@ impl FrameSource {
     }
 
     /// Stop every run of `source` and forget its frames (and what was learned about the file).
+    /// A request for the file that is waiting on a run fails (`GpuError::Decode`): it would
+    /// otherwise start a new run of a file nobody wants any more as soon as this one's was stopped.
     pub fn release(&self, source: SourceId) {
         let mut st = self.shared.lock();
+        let count = self.shared.releases.fetch_add(1, atomic::Ordering::AcqRel) + 1;
+        if !st.closed {
+            st.released.note(source, count, Instant::now());
+        }
         let ids: Vec<RunId> = st.runs.iter().filter(|r| r.file == source).map(|r| r.id).collect();
         for id in ids {
             stop(&mut st, id);
@@ -1500,6 +1543,10 @@ fn reaper(shared: &Weak<Shared>) {
             // A finished run's record is kept a moment for the requests reading its outcome.
             st.runs
                 .retain(|r| r.alive() || r.waiters > 0 || r.ended_at.is_none_or(|e| e.elapsed() < Duration::from_secs(5)));
+            // A release matters to the requests that began before it, and none outlives its
+            // deadline (the longest of them, twice over).
+            st.released
+                .forget(Instant::now(), cfg.request_timeout.max(DECODE_TIMEOUT).saturating_mul(2));
             st.cache.trim();
         }
         if !doomed.is_empty() {
@@ -1680,6 +1727,75 @@ mod tests {
             let (late, frame) = (late_ticks(Some(fps), ms), frame_ticks(Some(fps), ms));
             assert!(late == frame || late == frame + 1, "{fps}: {late} against {frame}");
         }
+    }
+
+    fn file(n: u64) -> SourceId {
+        SourceId {
+            file: n,
+            format: crate::frame_cache::DecodeFormat::Yuv420p8,
+        }
+    }
+
+    /// A request is failed by a release of its file that came after it began: `since` is true for
+    /// a `born` below the release's count, and only for it, so a request that began at the count
+    /// (after the release) is an ordinary one, and so is every later one.
+    #[test]
+    fn a_release_is_seen_by_the_requests_that_began_before_it_and_only_by_them() {
+        let (a, b) = (file(1), file(2));
+        let t0 = Instant::now();
+        let mut released = Releases::default();
+        assert!(!released.since(a, 0), "nothing was released");
+        released.note(a, 3, t0);
+        for (born, seen) in [(0, true), (2, true), (3, false), (4, false)] {
+            assert_eq!(released.since(a, born), seen, "a request that read {born} releases");
+        }
+        assert!(!released.since(b, 0), "another file");
+        released.note(a, 5, t0);
+        assert!(released.since(a, 4), "released again since");
+        assert!(!released.since(a, 5));
+    }
+
+    #[test]
+    fn a_release_is_forgotten_when_no_request_can_have_begun_before_it() {
+        let (a, b) = (file(1), file(2));
+        let memory = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let mut released = Releases::default();
+        released.note(a, 1, t0);
+        released.note(b, 2, t0 + Duration::from_secs(30));
+        released.forget(t0 + memory - Duration::from_millis(1), memory);
+        assert!(
+            released.since(a, 0) && released.since(b, 0),
+            "both are younger than the memory"
+        );
+        released.forget(t0 + memory, memory);
+        assert!(!released.since(a, 0), "a memory old");
+        assert!(released.since(b, 0));
+        released.forget(t0, memory);
+        assert!(released.since(b, 0), "a clock behind the release forgets nothing");
+        released.forget(t0 + memory + Duration::from_secs(30), memory);
+        assert!(!released.since(b, 0));
+    }
+
+    /// `release` counts itself before the file is noted, so a request that read the count earlier
+    /// is failed by it and one that read it after is not; a closed source notes nothing.
+    #[test]
+    fn release_notes_the_file_under_its_own_count() {
+        let src = FrameSource::new(FrameSourceConfig::default());
+        let a = file(1);
+        let born = src.shared.releases.load(atomic::Ordering::Acquire);
+        src.release(a);
+        let after = src.shared.releases.load(atomic::Ordering::Acquire);
+        assert_eq!(after, born + 1);
+        assert!(src.shared.lock().released.since(a, born));
+        assert!(!src.shared.lock().released.since(a, after));
+        src.release_all();
+        src.release(file(2));
+        assert_eq!(src.shared.releases.load(atomic::Ordering::Acquire), after + 1);
+        assert!(
+            !src.shared.lock().released.since(file(2), 0),
+            "a closed source remembers nothing"
+        );
     }
 
     #[test]

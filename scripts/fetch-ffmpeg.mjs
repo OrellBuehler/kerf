@@ -133,6 +133,28 @@ async function download(url) {
   }
 }
 
+// `KERF_FFMPEG_ARCHIVES` names a directory that keeps verified archives between
+// runs (CI caches it), so a pin already fetched is never asked of a mirror again.
+// The digest is checked either way; a stale or damaged copy is fetched afresh.
+async function fetchPinned(url, sha256) {
+  const keep = process.env.KERF_FFMPEG_ARCHIVES;
+  const kept = keep && join(keep, `${sha256}-${url.split("/").pop().replace(/[^\w.-]/g, "_")}`);
+  if (kept && (await Bun.file(kept).exists())) {
+    const bytes = new Uint8Array(await Bun.file(kept).arrayBuffer());
+    const digest = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+    if (digest === sha256) {
+      console.log(`\u2713 kept ${url}`);
+      return { bytes, digest };
+    }
+  }
+  const got = await download(url);
+  if (kept && got.digest === sha256) {
+    await mkdir(keep, { recursive: true });
+    await Bun.write(kept, got.bytes);
+  }
+  return got;
+}
+
 async function backoff(attempt, retryAfter, why) {
   const asked = Number(retryAfter);
   const ms = Number.isFinite(asked) && asked > 0 ? Math.min(asked, 120) * 1000 : Math.min(2 ** attempt * 2500, 120_000);
@@ -238,7 +260,7 @@ const work = await mkdtemp(join(tmpdir(), "kerf-ffmpeg-"));
 let licenseWritten = false;
 try {
   for (const { url, wants, sha256 } of source.archives) {
-    const { bytes, digest } = await download(url);
+    const { bytes, digest } = await fetchPinned(url, sha256);
     // Verified before anything unpacks it — a tampered archive is never handed
     // to `tar`, let alone bundled into a signed installer.
     if (digest !== sha256) {

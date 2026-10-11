@@ -35,6 +35,83 @@ export function snapToFrame(t: number, fps: number): number {
 	return usable(fps) && Number.isFinite(t) ? frameTime(frameIndex(t, fps), fps) : t;
 }
 
+/** How a seek rounds. `nearest` is for the playhead being *pointed* at (a scrub, a click, a step):
+ *  the frame the pointer is on. `up` is for a programmatic "go to the start of X" — a title, a
+ *  changed clip, a transcript line: the first frame at or after the time, so the playhead is inside X
+ *  and not up to half a frame before it, where X is not yet visible. `end` caps `up` at the end of the
+ *  span being gone to, for one shorter than a frame. */
+export interface SeekOptions {
+	/** `exact` is for a time that is already the point being gone to and is not a frame — a keyframe's:
+	 *  held to the cut and nothing else, so the playhead is *at* the key and a check against it matches. */
+	snap?: 'nearest' | 'up' | 'exact';
+	end?: number;
+}
+
+/** The first frame at or after `t` (a time already on a frame, within float noise, is that frame). */
+export function ceilToFrame(t: number, fps: number): number {
+	return usable(fps) && Number.isFinite(t) ? frameTime(Math.ceil(t * fps - 1e-7), fps) : t;
+}
+
+/** Where the playhead goes for a seek to `t`: the frame `t` falls on (`SeekOptions`), held to the cut
+ *  (`0..duration`). The end of the cut itself is kept as it is — it is where the cut ends, frame or
+ *  not — so "go to end" and a play that runs out land on exactly `duration`. */
+export function seekTime(t: number, fps: number, duration: number, o: SeekOptions = {}): number {
+	const end = Math.max(0, duration);
+	if (t >= end) return end;
+	if (o.snap === 'exact') return Number.isFinite(t) ? Math.max(0, t) : 0;
+	let on = o.snap === 'up' ? ceilToFrame(t, fps) : snapToFrame(t, fps);
+	// Never past the span being gone to, and never before the time asked for.
+	if (o.snap === 'up' && o.end !== undefined && on > o.end) on = Math.max(t, o.end);
+	return Math.min(Math.max(0, on), end);
+}
+
+/** The frame the playhead *shows* at `time`: the one it is inside (what the timecode and the picture
+ *  say), which is the floor — a playhead left mid-frame by playback is showing that frame. */
+export function shownFrame(time: number, fps: number): number {
+	return usable(fps) && Number.isFinite(time) ? Math.floor(time * fps + 1e-7) : 0;
+}
+
+/** Where a step of `frames` frames from `time` lands. It steps from the frame being shown, not from
+ *  the time: after a pause the playhead is mid-frame, and a step measured from there would round back
+ *  onto the frame already shown (back) or skip one (forward). */
+export function stepFrames(time: number, frames: number, fps: number, duration: number): number {
+	if (!usable(fps)) return seekTime(time + frames / 30, fps, duration);
+	return seekTime(frameTime(shownFrame(time, fps) + frames, fps), fps, duration);
+}
+
+/** A second of the cut in frames, as the timecode counts it (30 at 29.97). */
+export const secondFrames = (fps: number): number => Math.max(1, Math.round(usable(fps) ? fps : 30));
+
+/** Where a step from `time` toward `dir` goes among `points` (markers, the changes of a proposal) as the
+ *  playhead will stand on them: each point is compared where `seekTime` puts it (`snap`: `up` for the
+ *  start of something), so a point between frames is not "ahead" of a playhead that is already on it —
+ *  stepping would otherwise stick on it for ever. The nearest such point in that direction, or null
+ *  when there is none. */
+export function stepPoint(
+	points: readonly number[],
+	time: number,
+	dir: 1 | -1,
+	fps: number,
+	duration: number,
+	snap: 'nearest' | 'up' = 'nearest'
+): number | null {
+	const eps = 1e-4;
+	let best: number | null = null;
+	for (const p of points) {
+		const at = seekTime(p, fps, duration, { snap });
+		if (!(dir > 0 ? at > time + eps : at < time - eps)) continue;
+		if (best === null || (dir > 0 ? at < best : at > best)) best = at;
+	}
+	return best;
+}
+
+/** Where the playhead goes when an edit has left it past the end of the cut — the new end — or null
+ *  when it is still inside. */
+export function clampPlayhead(time: number, duration: number): number | null {
+	const end = Math.max(0, duration);
+	return time > end + 1e-6 ? end : null;
+}
+
 /** Whether `t` sits on a frame boundary (within float noise). */
 export function onFrame(t: number, fps: number): boolean {
 	if (!usable(fps)) return false;

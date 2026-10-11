@@ -206,6 +206,14 @@ pub enum CompositeColorPolicy {
 /// frame goes through FFmpeg.
 pub const MAX_SHRINK: u32 = 40;
 
+/// The smallest font a text pass is held to, in pixels (`drawtext`'s `fontsize`, the frame's height
+/// times the overlay's `size`, rounded). `drawtext` blends each glyph's bitmap in turn and a mask
+/// holds all of them at once; the two agree to rounding where glyphs do not share a pixel, and
+/// small text is all shared pixels: measured against `drawtext`'s own planes, 3 to 11 px text
+/// reads up to 7 levels off in chroma at a dozen samples, 12 px and up at most 2
+/// (`the_reference_blend_is_drawtexts_own_for_small_text`). A frame with smaller text goes through FFmpeg.
+pub const MIN_TEXT_PX: u32 = 12;
+
 /// Which graph a plan describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanMode {
@@ -483,8 +491,10 @@ pub struct PlanText {
     pub color: String,
     /// The box behind the text; `None` when there is none or its colour is invalid.
     pub bg: Option<String>,
-    /// The font file `drawtext` would use, resolved on this machine. `None` is FFmpeg's
-    /// default font, which no other renderer can reproduce: never drawn.
+    /// The font file `drawtext` is given: the family the overlay names if it is installed, else the
+    /// shipped default (`fonts::resolve_text_font`, the graph's own resolution). `None` only when
+    /// the default could not be written to disk, which leaves `drawtext` FFmpeg's own default font,
+    /// which no other renderer can reproduce: never drawn.
     pub font_file: Option<std::path::PathBuf>,
     /// No bold face was found for a bold request, and `drawtext` thickens the glyphs
     /// with a same-colour border instead.
@@ -689,6 +699,17 @@ impl RenderPlan {
                 ));
             }
         }
+        // `drawtext`'s `fontsize` is the frame's height times the overlay's size, rounded.
+        if caps.text {
+            let smallest = self
+                .overlays
+                .iter()
+                .map(|o| (f64::from(size.1) * o.size).round().max(1.0) as u32)
+                .min();
+            if let Some(px) = smallest.filter(|px| *px < MIN_TEXT_PX) {
+                reasons.push(Unsupported::TextTooSmall(px));
+            }
+        }
         reasons
     }
 
@@ -814,8 +835,13 @@ impl RenderPlan {
         if !self.overlays.is_empty() {
             if !caps.text {
                 out.push(Unsupported::Text);
-            } else if self.overlays.iter().any(|o| o.font_file.is_none()) {
-                out.push(Unsupported::TextWithoutFont);
+            } else {
+                if self.overlays.iter().any(|o| o.font_file.is_none()) {
+                    out.push(Unsupported::TextWithoutFont);
+                }
+                if self.overlays.iter().any(|o| o.synthetic_bold) {
+                    out.push(Unsupported::TextBorder);
+                }
             }
         }
         // The compositor implements swscale's default (bicubic) only.

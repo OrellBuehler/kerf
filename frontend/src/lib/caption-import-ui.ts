@@ -232,9 +232,6 @@ export function importMenuEntries(offered: readonly ImportAsset[]): { entries: I
 
 // ---- words around the import -------------------------------------------------
 
-/** Dialog title of the replace confirmation. */
-export const IMPORT_CONFIRM_TITLE = 'Import captions';
-
 /** How many captions on the cut an import (or a recaption) would replace: the
  *  generated ones, which includes an earlier import — captions are one lane, and
  *  an imported set is the caption set. */
@@ -242,16 +239,12 @@ export function generatedCount(overlays: readonly TextOverlay[] | undefined): nu
 	return (overlays ?? []).filter((o) => o.generated).length;
 }
 
-/** Dialog title of the confirmation before captioning the cut from transcripts
- *  replaces an existing set. */
-export const CAPTION_CONFIRM_TITLE = 'Caption the cut';
-
 /** The question asked before captions are written over ones already there — an
  *  import (`fileName` names what is coming in) or a recaption from transcripts. */
 export function replaceConfirm(existing: number, fileName?: string): string {
 	const what = existing === 1 ? 'the caption' : `the ${existing} captions`;
 	const from = fileName ? ` with those in ${fileName}` : '';
-	return `Replace ${what} already on the cut${from}? Titles you added by hand are kept.`;
+	return `Replace ${what} on the cut${from}? Titles you added by hand are kept.`;
 }
 
 /** Whether the toast after an import is good news or has something to read: any

@@ -1,7 +1,13 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
+	import EmptyState from './EmptyState.svelte';
+	import Btn from './Btn.svelte';
+	import Chip from './Chip.svelte';
 	import { windows } from '$lib/windows.svelte';
-	import { notifications, type Notice, type NoticeKind } from '$lib/notifications.svelte';
+	import { documentOf } from '$lib/realm';
+	import { notifications, type Notice } from '$lib/notifications.svelte';
+	import { STATUS_LOOK as look } from '$lib/status-look';
+	import { tip } from '$lib/tip';
 
 	let el = $state<HTMLDivElement | null>(null);
 	let filter = $state<'all' | 'unread' | 'errors'>('all');
@@ -21,14 +27,6 @@
 		)
 	);
 
-	const look: Record<NoticeKind, { icon: string; color: string }> = {
-		success: { icon: 'check', color: 'var(--success)' },
-		error: { icon: 'alert-triangle', color: 'var(--danger)' },
-		warning: { icon: 'alert-triangle', color: 'var(--warning)' },
-		info: { icon: 'lightbulb', color: 'var(--kerf-400)' },
-		note: { icon: 'bell', color: 'var(--text-disabled)' }
-	};
-
 	function age(n: Notice): string {
 		const s = Math.max(0, Math.round((now - n.at) / 1000));
 		if (s < 60) return 'just now';
@@ -39,10 +37,17 @@
 
 	const clock = (n: Notice) => new Date(n.at).toLocaleTimeString();
 
+	// The panel takes focus when it opens, so the keys start inside it, and Escape gives it back to
+	// the bell that opened it.
+	$effect(() => {
+		if (notifications.open && el) el.focus({ preventScroll: true });
+	});
+
 	function onEscape(e: KeyboardEvent) {
 		if (notifications.open && e.key === 'Escape') {
 			e.preventDefault();
 			notifications.open = false;
+			documentOf(el).querySelector<HTMLElement>('[data-notification-bell]')?.focus({ preventScroll: true });
 		}
 	}
 
@@ -69,6 +74,7 @@
 		bind:this={el}
 		role="dialog"
 		aria-label="Notifications"
+		tabindex="-1"
 		style="position:fixed;top:calc(var(--titlebar-h) + 4px);right:10px;z-index:70;width:380px;max-width:calc(100vw - 20px);max-height:min(60vh,520px);display:flex;flex-direction:column;background:var(--surface-panel);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-md);box-shadow:var(--shadow-lg);overflow:hidden;font-family:var(--font-sans)"
 	>
 		<div
@@ -82,55 +88,37 @@
 				>
 			{/if}
 			<div style="flex:1"></div>
-			<button
-				onclick={() => notifications.markAllRead()}
+			<Btn
+				size="sm"
 				disabled={notifications.unread === 0}
 				title="Mark every notification as read"
-				style="height:22px;padding:0 8px;border-radius:var(--radius-full);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:{notifications.unread
-					? 'var(--text-secondary)'
-					: 'var(--text-disabled)'};font-size:11px;opacity:1;cursor:{notifications.unread ? 'pointer' : 'default'}"
-				>Mark all read</button
+				onclick={() => notifications.markAllRead()}>Mark all read</Btn
 			>
-			<button
-				onclick={() => notifications.clear()}
+			<Btn
+				size="sm"
 				disabled={notifications.items.length === 0}
 				title="Clear the log"
-				style="height:22px;padding:0 8px;border-radius:var(--radius-full);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:{notifications
-					.items.length
-					? 'var(--text-secondary)'
-					: 'var(--text-disabled)'};font-size:11px;opacity:1;cursor:{notifications.items.length ? 'pointer' : 'default'}"
-				>Clear</button
+				onclick={() => notifications.clear()}>Clear</Btn
 			>
 		</div>
 
-		<div style="flex:none;display:flex;gap:5px;padding:8px 12px;border-bottom:var(--line-width) solid var(--border-subtle)">
+		<div role="group" aria-label="Show" style="flex:none;display:flex;gap:5px;padding:8px 12px;border-bottom:var(--line-width) solid var(--border-subtle)">
 			{#each [['all', 'All'], ['unread', 'Unread'], ['errors', 'Problems']] as const as [k, label] (k)}
-				<button
-					onclick={() => (filter = k)}
-					style="height:22px;padding:0 9px;border-radius:var(--radius-full);font-size:11px;cursor:pointer;border:var(--line-width) solid {filter ===
-					k
-						? 'var(--border-strong)'
-						: 'transparent'};background:{filter === k ? 'var(--surface-active)' : 'transparent'};color:{filter === k
-						? 'var(--text-primary)'
-						: 'var(--text-secondary)'}">{label}</button
-				>
+				<Chip pressed={filter === k} onclick={() => (filter = k)}>{label}</Chip>
 			{/each}
 		</div>
 
 		<div style="flex:1;overflow-y:auto;min-height:0">
 			{#if shown.length === 0}
-				<div
-					style="display:flex;flex-direction:column;align-items:center;gap:8px;padding:34px 16px;color:var(--text-muted);text-align:center"
-				>
-					<Icon n="bell" s={20} />
-					<span style="font-size:var(--text-sm)"
-						>{notifications.items.length === 0
-							? 'Nothing has been reported yet.'
-							: filter === 'unread'
-								? 'Everything here has been read.'
-								: 'No errors or warnings.'}</span
-					>
-				</div>
+				<EmptyState
+					icon="bell"
+					pad={34}
+					title={notifications.items.length === 0
+						? 'Nothing has been reported yet.'
+						: filter === 'unread'
+							? 'Everything here has been read.'
+							: 'No errors or warnings.'}
+				/>
 			{:else}
 				{#each shown as n (n.id)}
 					<div
@@ -146,30 +134,37 @@
 									? 'var(--text-secondary)'
 									: 'var(--text-primary)'};overflow-wrap:anywhere;user-select:text">{n.text}</span
 							>
+							{#if n.description}
+								<span
+									data-selectable
+									style="font-size:12px;line-height:1.45;color:var(--text-secondary);overflow-wrap:anywhere;user-select:text"
+									>{n.description}</span
+								>
+							{/if}
 							<span
-								title={clock(n)}
+								use:tip={clock(n)}
 								style="font-family:var(--font-mono);font-size:var(--text-2xs);color:var(--text-muted)">{age(n)}</span
 							>
 						</div>
 						<button
 							onclick={() => notifications.markRead(n.id, !n.read)}
-							title={n.read ? 'Mark as unread' : 'Mark as read'}
+							use:tip={n.read ? 'Mark as unread' : 'Mark as read'}
 							aria-label={n.read ? 'Mark as unread' : 'Mark as read'}
-							style="flex:none;width:20px;height:20px;display:grid;place-items:center;border:none;background:none;cursor:pointer;color:{n.read
+							style="flex:none;width:24px;height:24px;display:grid;place-items:center;border:none;background:none;cursor:pointer;color:{n.read
 								? 'var(--text-disabled)'
 								: look[n.kind].color}"
 						>
 							{#if n.read}
-								<span style="width:7px;height:7px;border-radius:50%;border:var(--line-width) solid currentColor"></span>
+								<span style="width:8px;height:8px;border-radius:50%;border:var(--line-width) solid currentColor"></span>
 							{:else}
-								<span style="width:7px;height:7px;border-radius:50%;background:currentColor"></span>
+								<span style="width:8px;height:8px;border-radius:50%;background:currentColor"></span>
 							{/if}
 						</button>
 						<button
 							onclick={() => notifications.remove(n.id)}
-							title="Remove"
-							aria-label="Remove"
-							style="flex:none;width:20px;height:20px;display:grid;place-items:center;border:none;background:none;cursor:pointer;color:var(--text-muted)"
+							use:tip={'Remove'}
+							aria-label="Remove notification"
+							style="flex:none;width:24px;height:24px;display:grid;place-items:center;border:none;background:none;cursor:pointer;color:var(--text-muted)"
 						>
 							<Icon n="x" s={12} color="currentColor" />
 						</button>

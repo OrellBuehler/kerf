@@ -244,7 +244,8 @@
   change (`DiffKind` distinguishes an add from a cut from a *move* from a
   *retrim*, because those are different things to review), each already phrased
   for a human (`Trimmed clip on V1 at 0:04.0 — 4.0s → 2.5s (-1.5s)`) and
-  carrying the clip/track/time so a UI can jump there. Everything is matched by
+  carrying the clip/track/time (and, for an `Overlay*` entry, the `overlay_id`)
+  so a UI can jump there or mark it on the timeline. Everything is matched by
   **id**, so a reordered track reads as the handful of moves it is rather than as
   every clip having been replaced, and a removed track is one entry instead of one
   per orphaned clip. `StagedEdit` is a pending proposal (base seq, the edit

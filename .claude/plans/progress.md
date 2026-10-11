@@ -701,6 +701,16 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   front of the book — `#failed` now claims it unless dockview refused the URL; (4) a bun test pins
   `POPOUT_URL` to `POPOUT_PATH`; (5) the last editor-window panel is greyed out in *Panel windows*
   with the rule's reason instead of refusing with a toast.
+- **2026-10-11 — A2 macOS (WP-8): the private-API premise was wrong; macOS stays "none" by default.**
+  Reading tauri-runtime-wry 2.12 / wry 0.57 / wgpu-hal 30 / raw-window-metal 1.1: `macos-private-api`
+  gates only the `transparent` option, which the design does not use (wry itself clears the
+  WKWebView's private `drawsBackground` key because the window has a `backgroundColor`). The real obstacles are
+  that wgpu's surface creation asserts the main thread (so `KERF_GPU_SURFACE=window` could only fail
+  from `kerf-gpu-build`; now hopped, `on_main_thread`), that its `CAMetalLayer` sublayer is added
+  after the WKWebView's and so is expected to be *above* the page, and that nothing removes it when
+  the backend drops. A layer over the page would hide the UI with no way to turn the setting off in
+  the app, so the default is not flipped without a Mac run; the findings are in `app.md` (*macOS
+  presenter*), the plan in `.claude/plans/macos-presenter.md`.
 
 ## Needs a real machine
 
@@ -721,10 +731,13 @@ Plan: `.claude/plans/gpu-compositor-and-roadmap.md`. One row per work package.
   setting on (the runtime `set_background_color` alpha 0 / back to `#0f1318`). If the surface is
   black or the page corrupted: `KERF_GPU_SURFACE=off`, and the child-window route is the fallback
   (a native child HWND is not written).
-- A2 (macOS): no technique; the path is Tauri's `macos-private-api` (feature + `app.macOSPrivateApi`,
-  then `transparent: true` at window creation, only when the setting is on at launch) and the same
-  `window` technique; Metal's `CAMetalLayer` replaces the content view's layer and the WKWebView is a
-  subview, as in wry's `wgpu` example. Needs a Mac, and a decision about shipping the private API.
+- A2 (macOS): no technique by default. Step 1 is `KERF_GPU_SURFACE=window` with the setting on (the
+  surface is now made on the main thread; it may cover the window, relaunch without the variable):
+  is the Metal layer under or over the page, is it gone when the setting goes off. Step 2 (an
+  app-owned layer in an `NSView` below the WKWebView, `gpu_preview/macos.rs`, a third `Technique`),
+  the measurements and the acceptance list are in `.claude/plans/macos-presenter.md`. Kerf adds no
+  private-API feature flag and no `tauri.conf.json` change (wry itself sets the private
+  `drawsBackground` key).
 - A2 (Linux): a Wayland session (the default on most distributions) has no technique and says so in
   the status; X11 on a **real GPU** (Mesa radeonsi/iris, NVIDIA) was not run — Vulkan on an Xlib
   child window, `GDK_SCALE=2`, a compositing manager that stacks windows differently from Xwayland's.

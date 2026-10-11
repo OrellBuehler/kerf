@@ -26,7 +26,8 @@ const LITERALS_ALLOWED: Record<string, string> = {
 	'lib/styles/kerf-tokens.css': 'the token stylesheet: the defaults the Kerf Dark preset must equal',
 	'app.html': 'the paint before the app loads; checked below to equal Kerf Dark',
 	'lib/sample-frame.ts': 'the browser harness\'s stand-in for a decoded frame: picture content, not interface',
-	'lib/sample-filmstrip.ts': 'the browser harness\'s stand-in for a filmstrip: picture content, not interface'
+	'lib/sample-filmstrip.ts': 'the browser harness\'s stand-in for a filmstrip: picture content, not interface',
+	'lib/title-color.ts': 'the engine\'s colour names and their values: what a title is drawn in is picture content, not interface'
 };
 
 /** Hex colors (3, 4, 6 or 8 digits; not `&#123;` entities or `a#b` anchors) and
@@ -140,8 +141,7 @@ const DISABLED_INK_ALLOWED: Record<string, string> = {
 	'lib/styles/controls.css': 'the label of a disabled Btn / IconBtn',
 	'lib/components/editor/MenuBar.svelte': 'the rows of a menu that are off',
 	'lib/components/editor/ContextMenu.svelte': 'the rows of a menu that are off',
-	'lib/components/editor/NotificationCenter.svelte': 'a note\'s icon, a read mark, and the buttons that have nothing to act on',
-	'lib/components/editor/AgentPanel.svelte': 'the empty queue\'s decorative icon'
+	'lib/components/editor/NotificationCenter.svelte': 'a note\'s icon, a read mark, and the buttons that have nothing to act on'
 };
 
 describe('the disabled color', () => {
@@ -353,6 +353,12 @@ describe('contrast', () => {
 		{ fg: 'kerf-300', tint: tintOf('selection-fill'), min: READING, what: 'lit toggle in the timeline toolbar', on: PANELS },
 		// Written inline in the dialogs' error blocks: `color-mix(in srgb,var(--red-600) 14%,transparent)`.
 		{ fg: 'red-400', tint: { hue: 'red-600', weight: 0.14 }, min: READING, what: 'error block in a dialog' },
+		// Toasts: the kind's 12 % wash over the toast's own surface (`routes/layout.css`), its line, its
+		// description, and its glyph and edge in the `-400` shade.
+		{ fg: 'text-primary', tint: tintOf('success-surface'), min: READING, what: 'success toast', on: ['surface-raised'] },
+		{ fg: 'text-secondary', tint: tintOf('success-surface'), min: READING, what: 'success toast description', on: ['surface-raised'] },
+		{ fg: 'text-secondary', tint: tintOf('danger-surface'), min: READING, what: 'error toast description', on: ['surface-raised'] },
+		{ fg: 'text-secondary', tint: tintOf('warning-surface'), min: READING, what: 'warning toast description', on: ['surface-raised'] },
 		{ fg: 'text-primary', tint: tintOf('danger-surface'), min: READING, what: 'agent connection banner' },
 		{ fg: 'text-primary', tint: tintOf('warning-surface'), min: READING, what: 'keyboard conflict prompt' },
 		{ fg: 'text-secondary', tint: tintOf('diff-remove-surface'), min: READING, what: 'stale proposal note' },

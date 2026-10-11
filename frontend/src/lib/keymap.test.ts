@@ -12,6 +12,7 @@ import {
 	conflictsFor,
 	detectPlatform,
 	isLinux,
+	isWindows,
 	differsFromDefault,
 	displayChord,
 	emptyOverrides,
@@ -19,6 +20,7 @@ import {
 	findCollisions,
 	formatChord,
 	matchAction,
+	modLabel,
 	parseChord,
 	parseKeyOverrides,
 	rebindConflicts,
@@ -82,6 +84,14 @@ describe('platform', () => {
 		expect(isLinux({ platform: 'Win32' })).toBe(false);
 		expect(isLinux({ platform: 'Linux armv81', userAgent: 'Mozilla/5.0 (Linux; Android 14)' })).toBe(false);
 		expect(isLinux({})).toBe(false);
+	});
+
+	test('Windows is what is neither a Mac nor a Linux desktop: the one platform whose installer exits the app', () => {
+		expect(isWindows({ platform: 'Win32' })).toBe(true);
+		expect(isWindows({ userAgentData: { platform: 'Windows' } })).toBe(true);
+		expect(isWindows({ platform: 'MacIntel' })).toBe(false);
+		expect(isWindows({ platform: 'Linux x86_64' })).toBe(false);
+		expect(isWindows({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64)' })).toBe(false);
 	});
 });
 
@@ -294,6 +304,9 @@ function legacyAction(e: KeyEventLike): string | null {
 	if (k === 'm') return 'marker.add';
 	if (e.key === ',') return 'marker.prev';
 	if (e.key === '.') return 'marker.next';
+	// Added with the proposal review (the symbol keys, like , and ., answer whatever Shift says).
+	if (e.key === '[') return 'review.prevChange';
+	if (e.key === ']') return 'review.nextChange';
 	if (k === 'j') return 'playback.shuttleBack';
 	if (k === 'k') return 'playback.pause';
 	if (k === 'l') return 'playback.shuttleForward';
@@ -320,7 +333,11 @@ const ADDED: Record<string, string> = {
 	u: 'tool.slide',
 	q: 'edit.trimStart',
 	w: 'edit.trimEnd',
-	s: 'tool.snap'
+	s: 'tool.snap',
+	// The previous / next change of a proposal on the timeline. Page Up / Down, not the arrows: a focused
+	// button (the Preview button just clicked) keeps the arrows, and these types on every layout.
+	PageUp: 'review.prevChange',
+	PageDown: 'review.nextChange'
 };
 
 /** The chords with a modifier that were given an action after the registry existed (linked
@@ -336,7 +353,7 @@ function expectedAction(e: KeyEventLike): string | null {
 	const k = e.key.toLowerCase();
 	const mod = e.metaKey || e.ctrlKey;
 	if (!e.altKey) {
-		const added = mod && e.shiftKey ? ADDED_MOD_SHIFT[k] : mod ? ADDED_MOD[k] : e.shiftKey ? ADDED_SHIFT[k] : ADDED[k];
+		const added = mod && e.shiftKey ? ADDED_MOD_SHIFT[k] : mod ? ADDED_MOD[k] : e.shiftKey ? ADDED_SHIFT[k] : (ADDED[e.key] ?? ADDED[k]);
 		if (added) return added;
 	}
 	return legacyAction(e);
@@ -1049,15 +1066,17 @@ describe('no key is hard-coded outside the registry', () => {
 	});
 
 	test('tooltips and labels do not spell one either', () => {
-		// A modifier glyph, or a `(R)` / `(Space)` hint inside a string, in code
-		// that is not a comment is a key being printed by hand. (A pointer gesture
-		// — wheel, click — is not a binding and may say ⌘.)
-		const printed = /[⌘⇧⌥⌃]|['"`][^'"`\n]*\((?:[A-Z]|Space|Del|Esc|Enter)\)/;
+		// A modifier glyph, a `Ctrl +` / `Cmd +` / `Alt +` hint, or a `(R)` / `(Space)` hint inside a string,
+		// in code that is not a comment, is a key being printed by hand. A pointer gesture (a wheel turn, a
+		// click) is no exception: its modifier is `settings.modLabel`, which says Command on a Mac and Ctrl
+		// elsewhere — "⌘/Ctrl + wheel" printed a Mac glyph on Windows.
+		const printed =
+			/[⌘⇧⌥⌃]|['"`][^'"`\n]*\((?:[A-Z]|Space|Del|Esc|Enter)\)|['"`][^'"`\n]*\b(?:Ctrl|Cmd|Command|Option|Alt)\s*\+/;
 		const offenders = files.flatMap((f) =>
 			readFileSync(f, 'utf8')
 				.split('\n')
 				.map((line, i) => ({ line, at: `${f.slice(SRC.length + 1)}:${i + 1}` }))
-				.filter(({ line }) => !/^\s*(\/\/|\*|\/\*|<!--)/.test(line) && printed.test(line) && !/wheel|click/i.test(line))
+				.filter(({ line }) => !/^\s*(\/\/|\*|\/\*|<!--)/.test(line) && printed.test(line))
 				.map(({ at }) => at)
 		);
 		expect(offenders).toEqual([]);
@@ -1074,25 +1093,25 @@ describe('no key is hard-coded outside the registry', () => {
 		expect(handlers).toEqual([
 			'lib/components/editor/AgentPanel.svelte',
 			'lib/components/editor/ContextMenu.svelte',
-			'lib/components/editor/ExportDialog.svelte',
 			'lib/components/editor/FitMusicDialog.svelte',
 			'lib/components/editor/KeyboardSettings.svelte',
 			'lib/components/editor/LibraryPanel.svelte',
 			'lib/components/editor/MediaBin.svelte',
 			'lib/components/editor/MenuBar.svelte',
 			'lib/components/editor/MixSlider.svelte',
+			'lib/components/editor/Modal.svelte',
 			'lib/components/editor/NotificationCenter.svelte',
 			'lib/components/editor/Preview.svelte',
 			'lib/components/editor/ScrubBar.svelte',
-			'lib/components/editor/SettingsDialog.svelte',
-			'lib/components/editor/StemsDialog.svelte',
+			'lib/components/editor/SliderRow.svelte',
 			'lib/components/editor/Timeline.svelte',
 			'lib/components/editor/TitlesControls.svelte',
-			'lib/components/editor/UpdateDialog.svelte',
 			'lib/components/editor/VoiceoverDialog.svelte',
 			'lib/components/editor/WorkspaceTabs.svelte',
 			'lib/drag.ts',
 			'lib/modal.ts',
+			'lib/roving.ts',
+			'lib/tip.ts',
 			'routes/+page.svelte'
 		]);
 	});
@@ -1104,4 +1123,23 @@ test('sameChord compares all five parts', () => {
 	expect(sameChord(chord('Mod+Z'), chord('Z'))).toBe(false);
 	expect(sameChord(chord('Alt+Z'), chord('Z'))).toBe(false);
 	expect(sameChord(chord('Mod+Z'), chord('Mod+Y'))).toBe(false);
+});
+
+describe('modifiers in prose', () => {
+	test('a Mac says Option and Command, everywhere else Alt and Ctrl, and Shift is Shift', () => {
+		expect(modLabel('mac', 'alt')).toBe('Option');
+		expect(modLabel('other', 'alt')).toBe('Alt');
+		expect(modLabel('mac', 'primary')).toBe('Command');
+		expect(modLabel('other', 'primary')).toBe('Ctrl');
+		expect(modLabel('mac', 'shift')).toBe('Shift');
+		expect(modLabel('other', 'shift')).toBe('Shift');
+	});
+
+	test('the mixer’s tooltips take theirs from the platform instead of printing Alt', () => {
+		for (const f of ['MasterStrip', 'FaderMeter', 'MixerStrip']) {
+			const source = readFileSync(join(import.meta.dir, `components/editor/${f}.svelte`), 'utf8');
+			expect(source, f).toContain("settings.modLabel('alt')");
+			expect(source, f).not.toMatch(/[,(]\s*Alt\s/);
+		}
+	});
 });

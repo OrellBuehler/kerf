@@ -15,6 +15,8 @@
 	import { readingText } from '$lib/levels-view';
 	import type { SliderKey } from '$lib/slider-gesture';
 	import type { LevelReading } from '$lib/types';
+	import { settings } from '$lib/settings.svelte';
+	import { tip } from '$lib/tip';
 
 	let {
 		strip,
@@ -102,10 +104,10 @@
 
 <section class="strip" class:quiet={strip.state !== 'live'} aria-label="{strip.name} channel strip">
 	<header>
-		<span class="name" title="{strip.name} — {strip.clips} clip{strip.clips === 1 ? '' : 's'}{note ? ` · ${note}` : ''}"
+		<span class="name" use:tip={`${strip.name} — ${strip.clips} clip${strip.clips === 1 ? '' : 's'}${note ? ` · ${note}` : ''}`}
 			>{strip.name}</span
 		>
-		{#if note}<span class="state" title={note}>{strip.state === 'muted' ? 'muted' : 'off'}</span>{/if}
+		{#if note}<span class="state" use:tip={note}>{strip.state === 'muted' ? 'muted' : 'off'}</span>{/if}
 	</header>
 
 	<div class="toggles">
@@ -114,7 +116,7 @@
 			class="tog mute {flag(strip.muted)}"
 			aria-pressed={strip.muted}
 			aria-label="{strip.name} mute"
-			title={strip.muted
+			use:tip={strip.muted
 				? strip.kind === 'video'
 					? 'Hidden — its sound is off too. Click to show'
 					: 'Muted — click to unmute'
@@ -128,7 +130,7 @@
 			class="tog solo {flag(strip.solo)}"
 			aria-pressed={strip.solo}
 			aria-label="{strip.name} solo"
-			title={strip.solo ? 'Soloed — click to clear' : `Solo — play only the soloed ${strip.kind} tracks`}
+			use:tip={strip.solo ? 'Soloed — click to clear' : `Solo — play only the soloed ${strip.kind} tracks`}
 			onclick={() => void editor.setTrackSolo(strip.id, !strip.solo).catch(err)}>S</button
 		>
 		{#if strip.kind === 'audio'}
@@ -137,10 +139,10 @@
 				class="tog duck {flag(strip.duck)}"
 				aria-pressed={strip.duck}
 				aria-label="{strip.name} duck"
-				title={strip.duck
+				use:tip={strip.duck
 					? 'Ducking on — this track dips under the rest of the mix when you export. The preview plays it at its fader.'
 					: 'Duck this track under the rest of the mix. Applied on export only: the preview plays it at its fader.'}
-				onclick={() => void editor.setTrackDuck(strip.id, !strip.duck).catch(err)}>D</button
+				onclick={() => void editor.setTrackDuck(strip.id, !strip.duck).catch(err)}>DUCK</button
 			>
 		{/if}
 	</div>
@@ -156,7 +158,7 @@
 			label="{strip.name} pan"
 			valueText={panLabel}
 			tip="Pan {panLabel(pan)} — left {sideLabel(sides.left)}, right {sideLabel(sides.right)}. Drag, or ← → to nudge {PAN_STEP.normal *
-				100}% (Shift {PAN_STEP.coarse * 100}%, Alt {PAN_STEP.fine * 100}%); double-click to centre"
+				100}% ({settings.modLabel('shift')} {PAN_STEP.coarse * 100}%, {settings.modLabel('alt')} {PAN_STEP.fine * 100}%); double-click to centre"
 			detent={0.5}
 			fillFrom={0.5}
 			accent="var(--text-muted)"
@@ -180,7 +182,7 @@
 	/>
 
 	{#if read}
-		<dl class="read" class:stale title={stale ? 'Measured before the last edit' : 'What the last measurement read for this track'}>
+		<dl class="read" class:stale use:tip={stale ? 'Measured before the last edit' : 'What the last measurement read for this track'}>
 			<div><dt>LUFS</dt><dd>{read.lufs}</dd></div>
 			<div><dt>TP</dt><dd>{read.truePeak}</dd></div>
 			<div><dt>LRA</dt><dd>{read.range}</dd></div>
@@ -191,7 +193,7 @@
 <style>
 	.strip {
 		flex: none;
-		width: 92px;
+		width: 108px;
 		display: flex;
 		flex-direction: column;
 		gap: 5px;
@@ -204,7 +206,10 @@
 		border-radius: var(--radius-md);
 		transition: opacity var(--dur-normal) var(--ease-out);
 	}
-	.strip.quiet {
+	/* A muted or empty strip dims what it shows, not what it offers: the M / S / D buttons — the way back — and
+	   the name's own red "muted" stay at full strength. */
+	.strip.quiet > :global(:not(header):not(.toggles)),
+	.strip.quiet .name {
 		opacity: 0.6;
 	}
 	header {
@@ -237,7 +242,8 @@
 	}
 	.tog {
 		flex: 1;
-		min-width: 0;
+		/* A hit target is 24 px at least: M and S never go narrower, whatever DUCK is given. */
+		min-width: 24px;
 		height: 24px;
 		padding: 0;
 		cursor: pointer;
@@ -252,6 +258,14 @@
 	}
 	.tog:hover {
 		color: var(--text-primary);
+	}
+	/* Duck is spelled out, as it is in the timeline's track header. The strip is wide enough for 24 + 24 + 36 and the
+	   gaps (108 less its padding and edges), so this takes what is left after M and S, never what they need. */
+	.tog.duck {
+		flex: 1.6;
+		min-width: 36px;
+		font-size: var(--text-xs);
+		letter-spacing: 0.02em;
 	}
 	.tog.on.mute {
 		color: var(--red-400);

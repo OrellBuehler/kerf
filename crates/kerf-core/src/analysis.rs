@@ -135,7 +135,9 @@ impl SilenceDetector for FfmpegSilenceDetector {
     }
 }
 
-/// Scene-change detection backed by FFmpeg's `select='gt(scene,t)'` filter.
+/// Scene-change detection backed by FFmpeg's `select='gt(scene,t)'` filter. It reads the
+/// asset's preview proxy when one is ready (and the original when not, or when it cannot be
+/// read), see [`crate::project::Project::scoring_proxy`].
 pub struct FfmpegSceneDetector {
     /// Scene-score threshold in `0.0..=1.0`; higher = fewer, stronger cuts.
     pub threshold: f64,
@@ -149,7 +151,8 @@ impl Default for FfmpegSceneDetector {
 
 impl SceneDetector for FfmpegSceneDetector {
     fn detect_scenes(&self, asset: &Asset) -> Result<Vec<f64>> {
-        crate::engine::detect_scenes(std::path::Path::new(&asset.path), self.threshold)
+        let proxy = crate::project::Project::scoring_proxy(asset);
+        crate::engine::detect_scenes_preferring(std::path::Path::new(&asset.path), proxy.as_deref(), self.threshold)
     }
 }
 

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
+	import PreviewEmpty from './PreviewEmpty.svelte';
 	import { formatTimecode } from '$lib/timecode';
 	import ScrubBar from './ScrubBar.svelte';
 	import TrimMonitor from './TrimMonitor.svelte';
@@ -41,7 +42,8 @@
 	import { logFrontend } from '$lib/log';
 	import { clipDuration } from '$lib/types';
 	import type { TextOverlay } from '$lib/types';
-	import { LINE_HEIGHT, boxPadding, containRect, dragPosition, isVisibleAt, sampleOverlay, scaledSize } from '$lib/titles';
+	import { boxPadding, containRect, dragPosition, inkBox, isVisibleAt, sampleOverlay, scaledSize, titleFamily } from '$lib/titles';
+	import { tip } from '$lib/tip';
 
 	const duration = $derived(Math.max(editor.duration, 0.001));
 	/** The transport bar's own width, or undefined until it has been measured (and while it
@@ -806,6 +808,7 @@
 
 <div
 	bind:this={rootEl}
+	data-editor-surface
 	{@attach onWindow({
 		// Abandoning a drag is all Escape does then — not also "clear the selection". These
 		// listen to the window the panel is in, which is a detached window's when it is in one.
@@ -832,9 +835,7 @@
 			<div bind:this={surroundEl} aria-hidden="true" style="position:absolute;inset:0;background:var(--surface-void);pointer-events:none"></div>
 		{/if}
 		{#if empty}
-			<div style="display:flex;flex-direction:column;align-items:center;gap:12px;color:var(--text-muted)">
-				<Icon n="clapperboard" s={30} /><span style="font-size:13px">No media loaded</span>
-			</div>
+			<PreviewEmpty />
 		{:else}
 			<div
 				bind:this={frameEl}
@@ -904,18 +905,19 @@
 							{@const pose = sampleOverlay(o, ui.time)}
 							{@const selected = editor.selectedOverlayId === o.id}
 							{@const pad = boxPadding(o, delivery?.height) * 100}
+							{@const ink = inkBox(o)}
 							<div
 								role="presentation"
 								data-title-box
-								title={selected ? undefined : `Select “${o.text}”`}
+								use:tip={selected ? undefined : `Select “${o.text}”`}
 								onpointerdown={(e) => onTitleDown(e, o, 'move')}
 								onpointermove={onTitleMove}
 								onpointerup={onTitleUp}
 								onpointercancel={cancelTitleDrag}
 								onlostpointercapture={onTitleLostCapture}
-								style="position:absolute;left:{(live?.x ?? pose.x) * 100}%;top:{(live?.y ?? pose.y) * 100}%;transform:translate(-50%,-50%);padding:{pad}cqh;font-size:{(live?.size ?? o.size) * 100}cqh;line-height:{LINE_HEIGHT};font-weight:{o.bold ? 700 : 400};font-family:{o.font ? `'${o.font.replace(/['\\]/g, '')}', ` : ''}sans-serif;white-space:nowrap;color:{live?.moved ? ghostColor(o.color) : 'transparent'};pointer-events:auto;touch-action:none;cursor:{live ? 'grabbing' : 'move'};user-select:none;outline:{selected ? '1.5px solid var(--kerf-400)' : '1px dashed color-mix(in srgb,var(--text-on-video) 35%,transparent)'};outline-offset:0;background:{live?.moved ? 'color-mix(in srgb,var(--scrim) 25%,transparent)' : 'transparent'}"
+								style="position:absolute;left:{(live?.x ?? pose.x) * 100}%;top:{(live?.y ?? pose.y) * 100}%;transform:translate(-50%,-50%);padding:{pad}cqh;font-size:{(live?.size ?? o.size) * 100}cqh;line-height:{ink.height};font-weight:{o.bold ? 700 : 400};font-family:{titleFamily(o)};white-space:nowrap;color:{live?.moved ? ghostColor(o.color) : 'transparent'};pointer-events:auto;touch-action:none;cursor:{live ? 'grabbing' : 'move'};user-select:none;outline:{selected ? '1.5px solid var(--kerf-400)' : '1px dashed color-mix(in srgb,var(--text-on-video) 35%,transparent)'};outline-offset:0;background:{live?.moved ? 'color-mix(in srgb,var(--scrim) 25%,transparent)' : 'transparent'}"
 							>
-								{o.text}
+								<span style="position:relative;top:{ink.shift}em">{o.text}</span>
 								{#if selected}
 									{#each HANDLES as h (h.at)}
 										<span
@@ -941,11 +943,11 @@
 					style="position:absolute;left:12px;right:12px;top:10px;display:flex;align-items:flex-start;justify-content:space-between;gap:8px;pointer-events:none"
 				>
 					<div style="display:flex;flex-wrap:wrap;gap:6px;min-width:0;max-width:62%">
-						<span data-hud="name" class="hud" style="pointer-events:auto" title={previewAsset?.name}>{previewAsset?.name ?? 'preview'}</span>
-						{#if playbackWaiting}<span class="hud" style="pointer-events:auto" title={playbackWaiting} data-testid="playback-waiting"
+						<span data-hud="name" class="hud" style="pointer-events:auto" use:tip={previewAsset?.name}>{previewAsset?.name ?? 'preview'}</span>
+						{#if playbackWaiting}<span class="hud" style="pointer-events:auto" use:tip={playbackWaiting} data-testid="playback-waiting"
 								><i class="dot" style="background:var(--orange-500)"></i>playback waits for the proxy</span
 							>{/if}
-						{#if waitingOnProxy}<span class="hud" style="pointer-events:auto" title={waitingOnProxy.title}
+						{#if waitingOnProxy}<span class="hud" style="pointer-events:auto" use:tip={waitingOnProxy.title}
 								><i class="dot" style="background:var(--orange-500)"></i>{waitingOnProxy.text.replace('preview: ', '')}</span
 							>{/if}
 						{#if ui.analyzing}<span class="hud"><i class="dot" style="background:var(--agent-400)"></i>{ui.analysisLabel ?? 'analyzing'}</span>{/if}
@@ -966,7 +968,7 @@
 		style="height:40px;flex:none;display:flex;align-items:center;gap:{parts.tight ? 6 : 10}px;padding:0 {parts.tight ? 8 : 14}px;border-top:var(--line-width) solid var(--border-default);background:var(--surface-app)"
 	>
 		<button
-			title={settings.withShortcut('Go to start', 'playback.toStart')}
+			use:tip={settings.tip('Go to start', 'playback.toStart')}
 			aria-label="Go to start"
 			disabled={empty}
 			onclick={() => ui.seek(0)}
@@ -975,7 +977,7 @@
 			<Icon n="skip-back" s={14} />
 		</button>
 		<button
-			title={settings.withShortcut(ui.playing ? 'Pause' : 'Play', 'playback.toggle')}
+			use:tip={settings.tip(ui.playing ? 'Pause' : 'Play', 'playback.toggle')}
 			aria-label={ui.playing ? 'Pause' : 'Play'}
 			onclick={() => ui.togglePlay()}
 			style="background:var(--surface-hover);border:none;border-radius:var(--radius-sm);cursor:pointer;color:var(--text-primary);display:grid;place-items:center;padding:4px 6px"
@@ -983,7 +985,7 @@
 			<Icon n={ui.playing ? 'pause' : 'play'} s={16} />
 		</button>
 		<button
-			title={settings.withShortcut('Go to end', 'playback.toEnd')}
+			use:tip={settings.tip('Go to end', 'playback.toEnd')}
 			aria-label="Go to end"
 			disabled={empty}
 			onclick={() => ui.seek(editor.duration)}
@@ -992,7 +994,7 @@
 			<Icon n="skip-forward" s={14} />
 		</button>
 		<span
-			title="Timeline timecode · {editor.fps.toFixed(3)} fps · non-drop"
+			use:tip={`Timeline timecode · ${editor.fps.toFixed(3)} fps · non-drop`}
 			style="font-family:var(--font-mono);font-size:12px;color:var(--kerf-300);font-weight:500;white-space:nowrap">{tc(ui.time)}</span
 		>
 		<ScrubBar {duration} {empty} />
@@ -1001,7 +1003,7 @@
 		{/if}
 		{#if parts.rate}
 			<span
-				title="Timeline frame rate; non-drop timecode"
+				use:tip={'Timeline frame rate; non-drop timecode'}
 				style="font-size:11px;color:var(--text-muted);white-space:nowrap">{Number(editor.fps.toFixed(3))} fps</span
 			>
 		{/if}

@@ -1,7 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
 	CAPTION_EXTENSIONS,
-	CAPTION_CONFIRM_TITLE,
 	CAPTION_HINT,
 	IMPORT_BASES,
 	KEEP_LINES,
@@ -241,7 +240,6 @@ describe('the choice and the request', () => {
 		expect(keepLinesHint('lines', true, wide)).toContain('stays one caption');
 		expect(keepLinesHint('lines', false, tall)).toContain('tall frame');
 		expect(keepLinesHint('lines', false, wide)).toContain('split into short lines');
-		expect(CAPTION_CONFIRM_TITLE).toBe('Caption the cut');
 	});
 
 	test('the two timings are named for what they mean', () => {
@@ -300,11 +298,11 @@ describe('words around the import', () => {
 	});
 
 	test('the replace question counts the captions and names the file', () => {
-		expect(replaceConfirm(12)).toBe('Replace the 12 captions already on the cut? Titles you added by hand are kept.');
+		expect(replaceConfirm(12)).toBe('Replace the 12 captions on the cut? Titles you added by hand are kept.');
 		expect(replaceConfirm(1, 'movie.srt')).toBe(
-			'Replace the caption already on the cut with those in movie.srt? Titles you added by hand are kept.'
+			'Replace the caption on the cut with those in movie.srt? Titles you added by hand are kept.'
 		);
-		expect(replaceConfirm(3, 'movie.srt')).toContain('Replace the 3 captions already on the cut with those in movie.srt?');
+		expect(replaceConfirm(3, 'movie.srt')).toContain('Replace the 3 captions on the cut with those in movie.srt?');
 	});
 
 	const summary: CaptionImportSummary = {

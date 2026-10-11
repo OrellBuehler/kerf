@@ -11,7 +11,7 @@ Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is 
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
 `Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
-draws, `GpuCaps::A0` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
+draws, `GpuCaps::A0` plus `text` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
 
@@ -265,7 +265,17 @@ a real file's probe makes of it), plus six threads at once. The rules it holds t
   within a tick of being asked again. A `Scrub` / `Forward` request gives up after
   `request_timeout` (5 s), `Exact` after the one-shot's 30 s; a run blocks once it is past what
   was asked (plus `Forward`'s read-ahead, 48 MiB of frames, at most 24), so the pipe fills and
-  ffmpeg idles; `release(source)`, `release_all()` and `Drop` kill every child. A run that closes
+  ffmpeg idles; `release(source)`, `release_all()` and `Drop` kill every child. **A request waiting
+  on a file that is released fails** (`GpuError::Decode`): a run the *router* stops sends its
+  request to route afresh, which for a released file started a new run of it right after `release`
+  returned (`spawned: 2`; a test reading `stats().runs` failed whenever that request won the lock).
+  `Shared::releases` counts the releases (an atomic, bumped under the state lock) and `frame()`
+  reads it **before anything else, the probes included** (an ffprobe before the first lock takes
+  seconds on a loaded machine, and a release then is one the request began before);
+  `State::released` (`Releases`) holds each file's count and time, and a request fails on a file whose
+  count is above the one it read; the reaper forgets a release after twice the longest deadline. A
+  request that read the count after the release is an ordinary one and starts a run (a closed source
+  notes nothing). A run that closes
   its stdout and does not exit is killed after `EXIT_GRACE` (5 s; `wait_until`, a `try_wait` loop
   that holds the child's lock only for a poll — the reader used to `wait()` under it, so every
   `kill` and, through `stop` under the state lock, every request waited too). **No process is
@@ -288,8 +298,10 @@ a real file's probe makes of it), plus six threads at once. The rules it holds t
   render uses.
 - `tests/frame_source_fake.rs` (unix, its own binary: it points `KERF_FFMPEG` at a wrapper)
   holds a run that hangs and one that dies to a prompt `GpuError::Decode`, a run that closes its
-  output and never exits (`release` must not wait on it) and a second run whose pictures differ
-  from the first's at the same pts (the file goes one-shot, no panic).
+  output and never exits (`release` must not wait on it, and the request that waited on it fails
+  rather than starts another run; the test polls for the wrapper's `closed.done` marker, as a loaded
+  machine takes seconds to get a run that far) and a second run whose pictures differ from the
+  first's at the same pts (the file goes one-shot, no panic).
   `bench_frame_source_decode_vs_one_shot` (`KERF_BENCH=1`) times both paths: here, release, software
   decode, 1x playback is 4.9 / 4.4 / 27 ms a frame at 720p / 1080p / 4K against 102 / 133 / 314
   one-shot, and a scrub (jumps of about a second) 23 / 65 / 217 against 101 / 139 / 314.
@@ -424,6 +436,48 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   centres, chroma outside a rotated picture is clamped to its edge (FFmpeg leaves a few
   green pixels there; the GPU does not copy them).
 
+**Text: FFmpeg rasterises, the compositor blends** (`text.rs`, `shaders/text.wgsl`, `GpuCaps::text`).
+
+*Design.* `drawtext` is layout (shaping, kerning, hinting, the quarter-pixel phase of each glyph bitmap) and a blend; only
+the blend is arithmetic a shader can copy, so the layout is never redone. For each distinct overlay state `rasterize` runs
+**one `ffmpeg`** (`kerf_core::text_raster_graph`, `limit_frame_args`, killed at `RASTER_TIMEOUT` 5 s) that draws the overlay's own
+`drawtext` (the still's options and `x=(w*px-text_w/2)` expressions) **at the render size and the sampled position**, since a glyph
+is rendered at the quarter-pixel phase of a fractional position. It draws white on black in `rgb24` (255 over 0 at coverage `m` is
+exactly `m`; a gray or YUV canvas writes 235 on 6.1), once for the glyphs and once, fontcolor `@0`, for the box, and reads the red
+planes. A mask is trimmed and cached in `TextAtlas` (key: graph text, font file length + mtime, `ffmpeg` path; 256 states /
+48 MiB, LRU; a state wanted by several frames runs once; a failure is not remembered; textures are made by the first frame that
+draws one). `prepare_text` blocks on that process for a first-seen state, so a caller's render lock (the app's `RenderState`) is
+held that long; no project lock is. The pass is `drawutils.c`'s integer arithmetic (the same in 6.1.1 and 9.0.2), in u32:
+`((K - a) * d + a * s) >> 24` (`K = 0x1010101`), `a` = coverage x `(0x10307 * alpha + 3) >> 8` for luma and the 2x2 coverage sum
+`>> 2` for 4:2:0 chroma (a block sticking out of the mask counts only what is in it), `0x10203 * alpha + 2` for the box (half per
+missing row or column at an odd edge); `s` is `ff_draw_color` in the composite's matrix (`PlanCanvas.matrix`: 9.0's `drawtext` reads it
+off its link, 6.1's uses BT.601, which `FixedBt601` already says; limited range, `+ 0.5`, truncated) and the colour's alpha is
+`(a * 256·opacity) / 255`. Colours are parsed as `av_parse_color` does (`parse_color`: 140 names, `#` / `0x` hex with alpha, `@alpha`
+truncated), not asked of FFmpeg. Passes ping-pong between two canvases that agree outside the region the overlays can touch
+(box, then glyphs, one scissored pass each). **A frame with no layer is drawn in RGB** (FFmpeg never makes the black base YUV), so
+the same shader blends on the RGB picture and `composite_yuv` refuses such a plan rather than return planes without its text.
+
+*Verification.* `tests/text.rs` holds the scalar reference (`blend_coverage` / `blend_rect`) to `drawtext`'s own `yuv420p` planes
+**sample for sample** on both FFmpegs (plain, boxed, odd offsets, edges, corners, wholly outside, opacity 0 to 0.99, hex / named /
+translucent colours, BT.709 and BT.2020, escapes, Cyrillic, missing glyphs); `the_text_pass_is_the_reference_blend_plane_by_plane`
+holds the shader to the reference on the compositor's own planes (0 differing samples, 9 frames, 4 overlays); the `text/` parity
+cases hold the whole picture to the still, each against the same picture without the text: no allowance, but two glyph-edge
+pixels of the lower third at 0.1 s (+1, YUV -> RGB error near the gamut edge over saturated green), 12 px text (+2) and
+full-range pictures on 9.0 (+2, a known model difference: text drawn in full range, converted last), each with its reason at the case.
+
+*Refusals* (the plan, `Unsupported::Text*`). A **font under 12 px** (`MIN_TEXT_PX`): `drawtext` blends each glyph bitmap in turn
+and the mask is all of them, so a pixel two glyphs share is one blend here and two there. Ordinary text is exact (Latin kerned
+pairs 0 samples, a missing glyph's box 1 to 2 samples by a level), but 3 to 11 px text is all shared pixels (up to 7 levels of
+chroma). A **bold request in a font with no bold face** (`TextBorder`): `drawtext` thickens it with a same-colour border whose
+bitmaps overlap along every letter gap (33 levels of chroma there); the shipped default has a real bold, so neither a title nor a
+caption in it is ever refused for it. A rasterisation that fails (or a colour FFmpeg cannot read) is `GpuError::Unsupported` for the
+frame. **Colour fonts**: `drawtext` loads glyphs without `FT_LOAD_COLOR` and has no BGRA path — a CBDT font (Noto Color Emoji) is a hard
+error on 6.1.1 (a segfault) and 9.0.2 at every size, so there is no colour glyph to draw as a silhouette; a COLR font is drawn by
+`drawtext` itself as monochrome outlines and the mask is exactly that (sbix and COLR were not available to test). Known costs, not fixed:
+the atlas key holds the sampled position at full precision, so a **keyframed slide-in rasterises per frame** (quantising it risks
+exactness); a Windows profile path with non-ASCII characters reaches `fontfile` through FreeType's narrow open (not run on Windows).
+Over a full-range picture on 9.0 (text drawn in full range, converted last) the picture is within 2 levels of the control: drawn.
+
 **`tests/parity.rs`** (`#[ignore]`d; CI job `parity`, a **matrix of the distro FFmpeg and
 the pinned one** — the two compose colour differently, so a green run on one proves
 nothing about the other) renders each case at several times through `export_still` (a
@@ -463,14 +517,21 @@ the **full-range grading** cases (a graded `yuvj` clip, and a graded layer in a 
 one, refused; ungraded and limited-range controls drawn),
 and **refusals** (an EXIF-oriented JPEG, FFV1 `yuva420p`, the same with the pixel
 format unrecorded, a translucent odd layer, a moving zoom behind a rotation or a grade) —
-each of which FFmpeg still renders. 160
-renders in the table on FFmpeg 6.1.1 (150 compared and 10 asserted refused on the pinned
-9.0.2 the Windows and macOS bundles ship) plus the plane-level scaler runs, all passing
+each of which FFmpeg still renders, and **text** (the `text/` family: the app's title and
+caption styles, positions and edges, boxes, colours, sizes, keyframed and overlapping overlays, escapes, installed fonts,
+over every kind of picture, with no layer, and the text it must refuse, each held to the same picture without the text; see
+"Text" above). 238
+renders in the table on FFmpeg 6.1.1 (228 compared and 10 asserted refused on the pinned
+9.0.2 the Windows and macOS bundles ship; 76 of them are `text/`) plus the plane-level scaler runs, all passing
 strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
 (`KERF_PARITY_KEEP=1` keeps them for passing ones; `KERF_PARITY_EXPLORE=1` prints
 everything and fails nothing); every run writes `target/parity/report.txt`.
 `tests/bench.rs` times a still on the GPU against FFmpeg at 1080p / 4K and 1 / 3 / 6
-layers, decode apart from composite (`KERF_BENCH=1`). **The readback is bounded**: the
+layers, decode apart from composite (`KERF_BENCH=1`), and a captioned frame cold (FFmpeg rasterises the caption: one
+process, +30 to +95 ms on lavapipe by FFmpeg and size) and warm (the atlas: a few ms, inside the noise).
+`tests/coverage.rs` plans the review's four archetypes (no decode, no adapter) and tells how many frames a
+compositor draws before and after text (the captioned 9:16 talking head: 12.7% to 96.0%, 13.3% to 100% with hard cuts; the rest
+is the clip fades). **The readback is bounded**: the
 wait for the GPU to finish is `READBACK_TIMEOUT` (30 s), a `GpuError::Readback` rather
 than a caller blocked forever on a wedged device.
 
@@ -478,4 +539,5 @@ than a caller blocked forever on a wedged device.
 cargo test -p kerf-gpu --no-default-features -- --ignored        # needs ffmpeg + an adapter
 KERF_GPU_ADAPTER=hardware cargo test -p kerf-gpu --no-default-features -- --ignored   # the machine's GPU
 KERF_BENCH=1 cargo test -p kerf-gpu --no-default-features --release -- --ignored --nocapture bench
+cargo test -p kerf-gpu --no-default-features --test coverage -- --ignored --nocapture   # frames drawn vs refused, per archetype
 ```

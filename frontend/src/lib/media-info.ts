@@ -26,7 +26,7 @@ export interface MediaInfo {
 	duration: string;
 	/** True when this is a derived file (a stitched Insta360 pair). */
 	stitched: boolean;
-	/** `Heart · 1.0×` for a synthesized voiceover, else `null`. */
+	/** `Heart · 1.00×` for a synthesized voiceover, else `null`. */
 	voiceover: string | null;
 }
 
@@ -167,7 +167,7 @@ export function audioExtraction(a: Pick<Asset, 'id' | 'streams'>, timeline: Pick
 	return {
 		mode: 'append',
 		clips: 0,
-		label: audio ? `Add audio to ${where}${already ? ' again' : ''}` : 'Add audio on a new track A1',
+		label: audio ? `Add audio to ${where}${already ? ' (a second copy)' : ''}` : 'Add audio on a new track A1',
 		detail: already
 			? `This file’s sound is already on the timeline; this adds another copy of all of it to ${where}.`
 			: audio

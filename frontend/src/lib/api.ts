@@ -27,7 +27,7 @@ import type {
 	Mask,
 	Color,
 	Delivery,
-	DeliveryCheck,
+	PlatformReport,
 	EditSource,
 	ExportOptions,
 	ExportProgress,
@@ -75,6 +75,7 @@ import type {
 	VoiceoverStatus,
 	WaveformRange
 } from './types';
+import { unsavedChoice, type UnsavedChoice, type UnsavedCopy } from './confirm-copy';
 import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
 import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
 import { fileTooLarge, importCaptionsInto, MAX_CAPTION_FILE_BYTES, parseFormat, resolveBase } from './caption-import';
@@ -109,7 +110,7 @@ import { clampCeiling, clampDuckDepth, clampMasterVolume, DEFAULT_MASTER, estima
 import { toFixedEven } from './format-fixed';
 import { fitMusicOnto, musicFitInputs, type FitSources } from './music-fit';
 import { sampleMusicAnalysis, SAMPLE_MUSIC_DURATION } from './sample-music';
-import { checkAll } from './platforms';
+import { exportSpan, report as platformReport } from './platforms';
 import { centeredCrop } from './smart-crop';
 import { synthWaveformRange } from './sample-waveform';
 import { analysisKindDone, ALL_KINDS } from './analysis-steps';
@@ -527,13 +528,38 @@ export async function projectPath(): Promise<string | null> {
 	return (await invoke<string | null>('project_path')) ?? null;
 }
 
-/** Ask a yes/no question before something irreversible. `window.confirm` is
- *  replaced by the dialog plugin in the desktop app and returns a promise
- *  there, so it can't be used synchronously — hence this. */
-export async function confirmAction(message: string, title = 'Kerf'): Promise<boolean> {
+/** Ask before something irreversible, with the two ends named as what they do (`labels`) — "Reset
+ *  all" / "Cancel" rather than Yes / No; there is no way to ask without naming them. `window.confirm`
+ *  is replaced by the dialog plugin in the desktop app and returns a promise there, so it can't be
+ *  used synchronously — hence this. */
+export async function confirmAction(message: string, title: string, labels: { ok: string; cancel: string }): Promise<boolean> {
 	if (!inTauri()) return window.confirm(message);
-	const { ask } = await import('@tauri-apps/plugin-dialog');
-	return ask(message, { title, kind: 'warning' });
+	const { message: show, ask } = await import('@tauri-apps/plugin-dialog');
+	try {
+		return (await show(message, { title, kind: 'warning', buttons: { ok: labels.ok, cancel: labels.cancel } })) === labels.ok;
+	} catch {
+		// A platform without custom buttons still gets the question, with the plugin's own.
+		return ask(message, { title, kind: 'warning', okLabel: labels.ok, cancelLabel: labels.cancel });
+	}
+}
+
+/** The unsaved-project prompt: Save…, Don't save and Cancel (`confirm-copy.ts`). Where the native
+ *  dialog cannot show three named buttons it asks the two-button question and Save is not on offer;
+ *  closing the dialog is always Cancel. The browser harness has `window.confirm`, which can only
+ *  discard or cancel. */
+export async function askUnsaved(copy: UnsavedCopy): Promise<UnsavedChoice> {
+	if (!inTauri()) return window.confirm(copy.message) ? 'discard' : 'cancel';
+	const { message: show } = await import('@tauri-apps/plugin-dialog');
+	try {
+		const answer = await show(copy.message, {
+			title: copy.title,
+			kind: 'warning',
+			buttons: { yes: copy.save, no: copy.discard, cancel: copy.cancel }
+		});
+		return unsavedChoice(answer, copy);
+	} catch {
+		return (await confirmAction(copy.message, copy.title, { ok: copy.discard, cancel: copy.cancel })) ? 'discard' : 'cancel';
+	}
 }
 
 /** When the window is asked to close and `needsConfirm()` says there is
@@ -558,6 +584,18 @@ export async function onWindowCloseRequested(
 		}
 		if (close) await win.destroy();
 	});
+}
+
+/** Set the OS window's title (the taskbar and the window switcher read it; Kerf's own title bar is drawn
+ *  under the native caption). In the browser harness it is the tab's title. A failure is not worth a toast:
+ *  the title is a courtesy, not state. */
+export async function setWindowTitle(title: string): Promise<void> {
+	if (!inTauri()) {
+		if (typeof document !== 'undefined') document.title = title;
+		return;
+	}
+	const { getCurrentWindow } = await import('@tauri-apps/api/window');
+	await getCurrentWindow().setTitle(title);
 }
 
 /** Quit Kerf from a menu. The window's own close button is guarded by
@@ -2788,8 +2826,22 @@ function seedDevStaged() {
 	entries.push({
 		kind: 'overlay_added',
 		summary: `Added text “${overlay.text}” at ${fmtTime(overlay.start)}–${fmtTime(overlay.end)}`,
+		overlay_id: overlay.id,
 		at: overlay.start
 	});
+	// With the sample song on a track of its own (`?music=1`), the proposal also drops it, so the
+	// review has a removal to draw.
+	const bedTrack = proposed.tracks.find((t) => t.kind === 'audio' && t !== audio && t.clips.length > 0);
+	if (bedTrack) {
+		const [gone] = bedTrack.clips.splice(0, 1);
+		entries.push({
+			kind: 'clip_removed',
+			summary: `Removed clip from ${bedTrack.name} at ${fmtTime(gone.timeline_start)} (${clipDuration(gone).toFixed(1)}s)`,
+			track_id: bedTrack.id,
+			clip_id: gone.id,
+			at: gone.timeline_start
+		});
+	}
 
 	const countClips = (tl: Timeline) => tl.tracks.reduce((n, t) => n + t.clips.length, 0);
 	devStaged = {
@@ -2798,7 +2850,7 @@ function seedDevStaged() {
 			base_seq: devHead,
 			task_id: devTasks.find((t) => t.status === 'ready')?.id ?? null,
 			note: 'Tighten the intro',
-			edits: ['Trim clip', 'Move clip', 'Trim clip', 'Add overlay'],
+			edits: ['Trim clip', 'Move clip', 'Trim clip', 'Add overlay', ...(bedTrack ? ['Remove clip'] : [])],
 			created_at: now(),
 			updated_at: now(),
 			stale: false,
@@ -3196,26 +3248,37 @@ export async function revealPath(path: string): Promise<void> {
 	await invoke('reveal_path', { path });
 }
 
-/** How ready the current cut is for each publishing target. `frame` overrides
- *  the shape it is judged at — the export dialog passes the resolution it is
- *  about to render when that differs from the project frame.
+/** How ready the current cut is for each publishing target, with the cut it was judged on (its
+ *  frame and length, in words). `frame` overrides the shape it is judged at and `range` the span —
+ *  the export dialog passes the resolution it is about to render when that differs from the
+ *  project frame, and the In → out it is about to write.
  *
  *  `kerf_core::platform` decides this in the app. The browser harness runs the
  *  mirror in `platforms.ts` over the dev timeline so the panel is explorable
  *  under `bun run dev`. */
-export async function platformCheck(frame?: [number, number] | null): Promise<DeliveryCheck[]> {
+export async function platformCheck(
+	frame?: [number, number] | null,
+	range?: { start: number; end: number } | null
+): Promise<PlatformReport> {
 	if (!inTauri()) {
 		const fmt = devTimeline.format;
 		const first = sampleAssets[0];
-		return checkAll({
-			duration: timelineDuration(devTimeline),
+		const full = timelineDuration(devTimeline);
+		const span = exportSpan(full, range);
+		// A title counts when it is on screen somewhere in the span, as it is in the sliced cut the export builds.
+		return platformReport({
+			duration: span ? span[1] - span[0] : full,
 			width: frame?.[0] ?? fmt?.width ?? first.streams[0]?.width ?? 1920,
 			height: frame?.[1] ?? fmt?.height ?? first.streams[0]?.height ?? 1080,
 			has_audio: true,
-			has_text: (devTimeline.overlays ?? []).length > 0
+			has_text: (devTimeline.overlays ?? []).some((o) => !span || (o.end > span[0] && o.start < span[1]))
 		});
 	}
-	return invoke<DeliveryCheck[]>('platform_check', { width: frame?.[0] ?? null, height: frame?.[1] ?? null });
+	return invoke<PlatformReport>('platform_check', {
+		width: frame?.[0] ?? null,
+		height: frame?.[1] ?? null,
+		range: range ?? null
+	});
 }
 
 // ---- agent connection (MCP endpoint) ---------------------------------------
