@@ -15,7 +15,7 @@
 | UI-5 Timeline gestures | ui-5 | #135 | merged | timeline H3–H5, H12, H13, H15 + medium; + playhead past the end after the cut shrinks; clip arrow-key nudge (M18 rest); scrub rail hover chip + marker ticks (H6 rest) | wave 3 |
 | UI-7 Panels polish | ui-7 | #140 | merged | panels/shell medium + polish; shell H6 | wave 3 |
 | UI-8 Export dialog logic | ui-8 | #139 | merged | dialogs 3 | wave 3 |
-| PERF-4 Still cache and prefetch | perf-4 (on perf-3 + gpu-3) | | r1 fixes (no blockers) | gpu-media WP6, WP9; gpu-compositor Hint::Prefetch | dev done: 20-step 60 Hz scrub drag 990–1419 → 317 ms (1 layer, 9.0.2), 1872–2386 → 317–396 ms (3 layers); marginal window frame ~0.05–9 ms vs 50–119 ms per spawn; cut stall 145–183 ms → 0.22 ms with Hint::Prefetch; golden unchanged |
+| PERF-4 Still cache and prefetch | perf-4 | | review r2 | gpu-media WP6, WP9; gpu-compositor Hint::Prefetch | dev done: 20-step 60 Hz scrub drag 990–1419 → 317 ms (1 layer, 9.0.2), 1872–2386 → 317–396 ms (3 layers); marginal window frame ~0.05–9 ms vs 50–119 ms per spawn; cut stall 145–183 ms → 0.22 ms with Hint::Prefetch; golden unchanged |
 | GPU-2 Text on the GPU | gpu-2 | #138 | merged | gpu-compositor | dev done: T1 captioned 12.7%→96.0% GPU frames, T1b 13.3%→100%, T2 69.5%→78.8%, T3 65.6%→83.3%; 76 text parity cases pass on 6.1.1 + 9.0.2; also fixes drawtext escaping of ' : \ (pre-existing export bug) |
 | GPU-4 Motion fades/transitions | gpu-4 | | r2 fixes + merge main (r1 blockers closed; r2: full-range clip changes the whole 9.0.2 export but only its own frames are refused — Motion only) | gpu-compositor WP-4 | dev done: still-plan GPU frames T1 96.0→100%, T2 78.8→100%, T3 83.3% (WP-6 refusals); Motion export frames 0→100% (T3 16.6%); motion parity plane-exact where unscaled, 1–2 levels where scaled, dip-to-white 2 levels; golden unchanged |
 | PERF-5 AMF/VAAPI export encode | perf-5 | | verified; merging main (golden + export dialog conflicts) | gpu-media WP4, WP5, WP11 | wave 4 |
@@ -92,7 +92,10 @@
 
 - Merging main into ui-7: the status bar keeps UI-7's `Cut m:ss.d` (its time-format decision) over UI-4's timecode; two disabled-ink exceptions (AgentPanel icon, Timeline ruler ticks) dropped because neither file uses the token any more.
 
+- PERF-4 round 2: a scrub window over an original (non-proxy) input has no lead frame; backward misses keep the reverse window — the reviewer's short-window alternative measured −160 ms on one step back but +1.2–1.4 s on a backward drag (README Round 2). Proxy queue runs 2 workers only where the GPU lane can qualify.
+
 ## Needs a real machine
+- PERF-4: 2 proxy workers by default where the GPU lane can qualify (Windows) — confirm with a hardware proxy beside a software one on Windows/AMD; H.264 High10 / HEVC Main10 classification on real decoders.
 - macOS presenter: `KERF_GPU_SURFACE=window` on a Mac — is the CAMetalLayer sublayer over or under the WKWebView (source predicts over, covering a clickable UI) and is it left behind after off / device loss (source predicts yes); if so, step 2 = app-owned CAMetalLayer in an NSView below the webview; Metal start-up vs BUILD_DEADLINE, present/composite ms, nextDrawable timeouts, sRGB layer colour vs JPEG; parity suite on Metal; display-scale moves, zoom, full screen, minimized.
 - PERF-5: proxies no longer hardware-encode on NVENC / QSV / VideoToolbox either (WP5 was measured on AMD RX 7900 XT only): confirm proxy CPU cost on NVIDIA and Apple Silicon with long 4K footage.
 - PERF-5: VMAF on real footage for AMF H.264/HEVC/AV1 at the new QPs (+6, AV1 ×4) vs x264, and `-quality quality` timing — only then change any default; `av1_amf` on RX 7000+; Linux radeonsi/iHD VAAPI probe + `-vaapi_device`/`hwupload` encode (with `-hwaccel auto` decode), CQP acceptance, `av1_vaapi`; distro FFmpeg without VAAPI, AppImage/Flatpak `/dev/dri`, missing libva; NVENC/QSV/VideoToolbox QP calibration.
@@ -135,6 +138,7 @@
 - UI-3: dialog focus return, `inert` timing and the focus rescue checked in Chromium only; confirm in WebView2, WebKitGTK and WKWebView.
 
 ## Needs a decision
+- CLAUDE.md line ~126 says UI-facing work is "ungated but thread-capped and niced"; interactive stills, scrub windows and the playback stream are not niced (`bg_command` is the only user of `cpu::background`). engine-cli.md is corrected; CLAUDE.md edits are out of bounds for this run.
 - PERF-5 (r2 nit, unfixed): the VAAPI device wait covers the whole hardware probe, so a slow NVENC wake on a hybrid laptop can make an agent's first VAAPI export fall back to the renderD128 stand-in; publishing the VAAPI result to its own cell would decouple it.
 - macOS presenter: make `window` the macOS default if the Mac test passes? Build step 2 (own NSView/CAMetalLayer) at all, or let the WP-2 canvas presenter cover macOS?
 - PERF-5: retry an export once in x264 when a hardware *encoder* fails (decode failures already retry)? Calibrate NVENC/QSV/VT the same way once measured? Make "Fast (GPU)" the default where an encoder is verified, after VMAF?
