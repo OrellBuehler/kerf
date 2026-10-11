@@ -151,12 +151,15 @@ overlay-percent \\%
 overlay-quote \'\''
 overlay-colon a\: b
 overlay-backslash back\\\\slash
+overlay-linebreak one two three four five
 still-overlay-quote \'\''
 still-overlay-colon a\: b
 still-overlay-backslash back\\\\slash
+still-overlay-linebreak one two three four five
 preview-overlay-quote \'\''
 preview-overlay-colon a\: b
 preview-overlay-backslash back\\\\slash
+preview-overlay-linebreak one two three four five
 overlay-bold borderw=2
 overlay-box box=1
 overlay-default-font fontfile='/kerf-test/fonts/Geist-Regular.ttf'
@@ -718,6 +721,10 @@ fn clip(r: &mut Rng, a: &Asset, start: f64, earlier: &[Clip]) -> Clip {
 fn overlay(r: &mut Rng) -> TextOverlay {
     let text = r.pick(&["Hello", "50% off", "It's \"quoted\"", "back\\slash", "two\nlines", "a: b, c; [d] =e", "日本語 ünï", "", "%{pts}"]);
     let start = r.real(0.0, 20.0);
+    // Half of the draws of "two\nlines" break the line with every other kind of break as well (a CR, a CRLF,
+    // the Unicode separators), so the oracle pins that they are all one space; from draws already made, so no
+    // other case moves.
+    let text = if text == "two\nlines" && start.fract() >= 0.5 { "one\rtwo\r\nthree\u{2028}four\u{2029}five" } else { text };
     let mut o = TextOverlay::new(text, start, start + r.real(0.2, 6.0));
     o.id = r.id();
     (o.pos_x, o.pos_y, o.size) = (r.real(0.0, 1.0), r.real(0.0, 1.0), r.real(0.02, 0.2));
