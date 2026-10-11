@@ -18,8 +18,8 @@ struct P {
     csize: vec2<i32>, // ... and its chroma planes
     channel: i32,     // fs_chroma_v: 0 = U, 1 = V
     taps: i32,        // fs_chroma_v: taps per output row
-    pad0: i32,
-    pad1: i32,
+    white_in: i32,    // fs_rgb: a dip to white's `fade` factors in the RGB (65535: not running)
+    white_out: i32,
 }
 
 @group(0) @binding(0) var<uniform> p: P;
@@ -55,10 +55,25 @@ fn fs_rgb(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let cgu = p.k.z;
     let cgv = p.k.w;
     let base = p.m.z + y;
-    let r = ytab(base - (crv >> 9u) + ((v * crv) >> 16u));
-    let g = ytab(base - (cgu >> 9u) + ((u * cgu) >> 16u) - (cgv >> 9u) + ((v * cgv) >> 16u));
-    let b = ytab(base - (cbu >> 9u) + ((u * cbu) >> 16u));
-    return vec4<f32>(f32(r) / 255.0, f32(g) / 255.0, f32(b) / 255.0, 1.0);
+    var rgb = vec3<i32>(
+        ytab(base - (crv >> 9u) + ((v * crv) >> 16u)),
+        ytab(base - (cgu >> 9u) + ((u * cgu) >> 16u) - (cgv >> 9u) + ((v * cgv) >> 16u)),
+        ytab(base - (cbu >> 9u) + ((u * cbu) >> 16u)),
+    );
+    // A dip to white is a `fade c=white`, which only takes RGB: it runs here, between the two
+    // conversions, one filter for the fade-in and one for the fade-out.
+    if (p.white_in < 65535) {
+        rgb = fade_white(rgb, p.white_in);
+    }
+    if (p.white_out < 65535) {
+        rgb = fade_white(rgb, p.white_out);
+    }
+    return vec4<f32>(vec3<f32>(rgb) / 255.0, 1.0);
+}
+
+// `vf_fade.c`'s `filter_slice_rgb` toward white: `((c - 255) * factor + (255 << 16) + 32768) >> 16`.
+fn fade_white(c: vec3<i32>, f: i32) -> vec3<i32> {
+    return clamp(((c - vec3<i32>(255)) * f + vec3<i32>((255 << 16u) + 32768)) >> vec3<u32>(16u), vec3<i32>(0), vec3<i32>(255));
 }
 
 @fragment
