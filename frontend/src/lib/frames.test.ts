@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
 	clampEdge,
+	clampPlayhead,
 	frameIndex,
 	frameTime,
 	nearestWithin,
@@ -9,9 +10,11 @@ import {
 	quantizeFade,
 	quantizeSpanStart,
 	quantizeTime,
+	seekTime,
 	snapToFrame,
 	splitPoint,
 	startBefore,
+	stepPoint,
 	trimEdit,
 	WELD_EPS
 } from './frames';
@@ -401,5 +404,75 @@ describe('nearestWithin', () => {
 		expect(nearestWithin(1, [1.4, 1.2, 0.95], 0.5)).toBe(0.95);
 		expect(nearestWithin(1, [], 5)).toBeNull();
 		expect(nearestWithin(1, [1], 0)).toBeNull();
+	});
+});
+
+describe('seekTime', () => {
+	test('lands on the frame the time falls on, for every common rate', () => {
+		const rand = rng(7);
+		for (const fps of RATES) {
+			for (let i = 0; i < 300; i++) {
+				const t = rand() * 300;
+				const s = seekTime(t, fps, 600);
+				expect(onFrame(s, fps)).toBe(true);
+				expect(Math.abs(s - t)).toBeLessThanOrEqual(0.5 / fps + 1e-12);
+			}
+		}
+	});
+
+	test('a step of a frame from a seek is a whole frame, with no sub-frame offset left over', () => {
+		for (const fps of RATES) {
+			const at = seekTime(12.3456, fps, 600);
+			const next = seekTime(at + 1 / fps, fps, 600);
+			expect(frameIndex(next, fps) - frameIndex(at, fps)).toBe(1);
+			expect(onFrame(next, fps)).toBe(true);
+		}
+	});
+
+	test('is held to the cut, and the end of the cut is exactly the end', () => {
+		expect(seekTime(-4, 30, 20)).toBe(0);
+		expect(seekTime(25, 30, 20.51)).toBe(20.51);
+		expect(seekTime(20.51, 30, 20.51)).toBe(20.51);
+		expect(seekTime(20.49, 30, 20.51)).toBe(frameTime(615, 30));
+	});
+
+	test('an empty cut parks the playhead at 0', () => {
+		expect(seekTime(6.2, 30, 0)).toBe(0);
+	});
+});
+
+describe('stepPoint', () => {
+	test('goes to the nearest point ahead or behind, as the playhead will stand on it', () => {
+		const marks = [3, 9.5, 14.25];
+		expect(stepPoint(marks, 0, 1, 30, 60)).toBe(3);
+		expect(stepPoint(marks, 3, 1, 30, 60)).toBe(frameTime(285, 30));
+		expect(stepPoint(marks, 14.25, -1, 30, 60)).toBe(frameTime(285, 30));
+		expect(stepPoint(marks, 20, 1, 30, 60)).toBeNull();
+		expect(stepPoint(marks, 3, -1, 30, 60)).toBeNull();
+	});
+
+	test('a point between frames is passed once, not stepped to for ever', () => {
+		// the playhead on frame 154 (5.133 s) is already on the marker at 5.1234
+		const marks = [5.1234, 9];
+		const here = seekTime(5.1234, 30, 60);
+		expect(stepPoint(marks, here, 1, 30, 60)).toBe(9);
+		expect(stepPoint(marks, here, -1, 30, 60)).toBeNull();
+	});
+
+	test('a point past the end of the cut is the end', () => {
+		expect(stepPoint([100], 0, 1, 30, 20.51)).toBe(20.51);
+	});
+});
+
+describe('clampPlayhead', () => {
+	test('takes a playhead left past the end of a shortened cut back to its new end', () => {
+		expect(clampPlayhead(6.2, 0)).toBe(0);
+		expect(clampPlayhead(30, 20.5)).toBe(20.5);
+	});
+
+	test('leaves one that is inside, or exactly at the end', () => {
+		expect(clampPlayhead(6.2, 20)).toBeNull();
+		expect(clampPlayhead(20.5, 20.5)).toBeNull();
+		expect(clampPlayhead(0, 0)).toBeNull();
 	});
 });

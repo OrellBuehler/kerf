@@ -35,6 +35,37 @@ export function snapToFrame(t: number, fps: number): number {
 	return usable(fps) && Number.isFinite(t) ? frameTime(frameIndex(t, fps), fps) : t;
 }
 
+/** Where the playhead goes for a seek to `t`: the frame `t` falls on, held to the cut (`0..duration`).
+ *  The end of the cut itself is kept as it is — it is where the cut ends, frame or not — so "go to
+ *  end" and a play that runs out land on exactly `duration`. */
+export function seekTime(t: number, fps: number, duration: number): number {
+	const end = Math.max(0, duration);
+	if (t >= end) return end;
+	return Math.min(Math.max(0, snapToFrame(t, fps)), end);
+}
+
+/** Where a step from `time` toward `dir` goes among `points` (markers, the changes of a proposal) as the
+ *  playhead will stand on them: each point is compared where `seekTime` puts it, so a point between
+ *  frames is not "ahead" of a playhead that is already on it — stepping would otherwise stick on it
+ *  for ever. The nearest such point in that direction, or null when there is none. */
+export function stepPoint(points: readonly number[], time: number, dir: 1 | -1, fps: number, duration: number): number | null {
+	const eps = 1e-4;
+	let best: number | null = null;
+	for (const p of points) {
+		const at = seekTime(p, fps, duration);
+		if (!(dir > 0 ? at > time + eps : at < time - eps)) continue;
+		if (best === null || (dir > 0 ? at < best : at > best)) best = at;
+	}
+	return best;
+}
+
+/** Where the playhead goes when an edit has left it past the end of the cut — the new end — or null
+ *  when it is still inside. */
+export function clampPlayhead(time: number, duration: number): number | null {
+	const end = Math.max(0, duration);
+	return time > end + 1e-6 ? end : null;
+}
+
 /** Whether `t` sits on a frame boundary (within float noise). */
 export function onFrame(t: number, fps: number): boolean {
 	if (!usable(fps)) return false;
