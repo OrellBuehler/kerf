@@ -65,8 +65,9 @@
   are placed on; the same for every rate with small terms, different for `29.970029`),
   `pix_fmt`, gif and composite colour policy.
   **Two modes.** `Still` is the contract the GPU path started with (`build_still_args`:
-  one sampled transform, fades and transitions left out of the picture, half-open spans,
-  text drawn statically). `Motion` is the export graph at output frame `k`: every
+  one sampled transform, half-open spans, text drawn statically; the FFmpeg still also draws
+  the fades, tails and travel of a frame inside a transition — `engine/cli/still_fx.rs` — which
+  a still plan does not hold). `Motion` is the export graph at output frame `k`: every
   expression the graph evaluates (`enable`, keyframes, the overlay position, `drawtext`) is
   read at `ffmpeg_frame_time(k)`, the slot boundary is `exact_time(k)`; an outgoing clip
   plays on its tail; a keyframed clip is never padded and always scales again
@@ -80,12 +81,13 @@
   frame (read at `t` and at `ffmpeg_frame_time(frame)`) and `reasons` refuses it
   (`Unsupported::StillTail`), as it refuses a still inside a fade step or a travel,
   **whatever the caps**: `fades`, `transitions`, `keyed_*` and `motion` are about Motion
-  plans (the FFmpeg still draws no fades), `mask` / `text` / `effects` / `reframe` / `hdr`
+  plans (a still plan holds none of it; the FFmpeg still draws it, so the fallback is the
+  export's frame), `mask` / `text` / `effects` / `reframe` / `hdr`
   hold for both. `frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn`
   (kerf-gpu parity: dissolve / slide / push / dip, covering and partial incoming clip,
-  frames before / inside / after, both FFmpegs) holds every listed frame to "refused, or
-  the still it draws like is the export's frame and the GPU matches it", so the second half
-  of a dip is a drawn frame by measurement. A Motion plan holds **candidates** at a clip's closing edge
+  frames before / inside / after, both FFmpegs) holds every listed frame's FFmpeg still to the
+  export's frame (>= 35 dB, the tail-only frame included) and the drawn ones to the GPU, so the
+  second half of a dip is a drawn frame by measurement. A Motion plan holds **candidates** at a clip's closing edge
   (the layers whose `enable` window contains the frame time, end included) and **`fps_pick`
   resolves them**: a candidate is drawn exactly when its pick names a frame
   (`rendered.rs` holds that to the pixels at five rates, and every drawn clip is planned).

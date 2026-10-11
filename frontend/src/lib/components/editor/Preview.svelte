@@ -2,7 +2,7 @@
 	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
 	import { formatTimecode } from '$lib/timecode';
-	import Badge from './Badge.svelte';
+	import ScrubBar from './ScrubBar.svelte';
 	import TrimMonitor from './TrimMonitor.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { settings } from '$lib/settings.svelte';
@@ -15,7 +15,7 @@
 	import { saveCoverFrame } from '$lib/file-actions';
 	import { gpuPreview } from '$lib/gpu-preview.svelte';
 	import { mediaStatus } from '$lib/media-status.svelte';
-	import { isProxyWaitMessage, previewSourceNote } from '$lib/proxy-info';
+	import { isProxyWaitMessage, previewSourceNote, previewSourceWidth } from '$lib/proxy-info';
 	import {
 		anyCovered,
 		boundsReport,
@@ -31,6 +31,7 @@
 	import { createFramePump } from '$lib/frame-pump.svelte';
 	import { singleFlight } from '$lib/single-flight';
 	import { measuredWidth, transportParts } from '$lib/transport-bar';
+	import { RESIZE_SETTLE_MS, capToSource, dprQuery, requestWidth } from '$lib/preview-size';
 	import type { PreviewBoundsReport } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
 	import { createFrameGate, PLAYBACK_FPS } from '$lib/playback-sync';
@@ -97,9 +98,10 @@
 		const v = previewAsset?.streams.find((s) => s.kind === 'video');
 		return v?.width && v?.height ? `${v.width}×${v.height}` : '—';
 	});
+	/** The rate the way the transport's reads (`30 fps`, `29.97 fps`), not `30.000`. */
 	const fpsLabel = $derived.by(() => {
 		const v = previewAsset?.streams.find((s) => s.kind === 'video');
-		return v?.fps ? v.fps.toFixed(3) : '';
+		return v?.fps ? `${Number(v.fps.toFixed(3))} fps` : '';
 	});
 
 	function tc(s: number): string {
@@ -118,8 +120,9 @@
 		boundsEpoch: () => boundsEpoch,
 		hasClips: () => hasClips,
 		streaming: () => streaming,
-		timelineFrame: (t) => getTimelineFrame(t, 960),
-		previewFrame: (t, overlays) => getPreviewFrame(t, 960, overlays),
+		width: () => frameWidth,
+		timelineFrame: (t, width) => getTimelineFrame(t, width),
+		previewFrame: (t, overlays, width) => getPreviewFrame(t, width, overlays),
 		answered: (result) => gpuPreview.note(result),
 		gpuFailed: (error) => {
 			gpuPreview.noteJpeg(`the GPU preview failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -244,12 +247,6 @@
 		};
 	});
 
-	function scrub(e: MouseEvent) {
-		const el = e.currentTarget as HTMLElement;
-		const x = e.clientX - el.getBoundingClientRect().left;
-		ui.seek((x / el.clientWidth) * duration);
-	}
-
 	// The preview pane is the delivery frame, not a fixed 16:9 window: cutting a
 	// Reel against a landscape box would hide the very crop that decides the shot.
 	const delivery = $derived(editor.timeline.format ?? null);
@@ -258,8 +255,9 @@
 	// frame is height-bound in a wide pane, and choosing by `aspect < 1` alone
 	// squashed it to the pane's height at full width. `100cqh` reads the pane's
 	// own height (it declares `container-type:size`), so one rule covers every
-	// orientation: never wider than the pane or 720px, never taller than the pane.
-	const frameBox = $derived(`width:min(100%, 720px, calc(100cqh * ${aspect}))`);
+	// orientation: never wider than the pane, never taller than the pane. (A 720 px cap used to sit
+	// here: 62 % of the pane at 1920×1080, a postage stamp at 2560×1440.)
+	const frameBox = $derived(`width:min(100%, calc(100cqh * ${aspect}))`);
 
 	// Roughly where a phone's UI covers a vertical video: the top status strip,
 	// the caption / button rail along the bottom, and the action column on the
@@ -335,6 +333,62 @@
 	let matteEl = $state<HTMLElement | null>(null);
 	let backdropEl = $state<HTMLElement | null>(null);
 	let surroundEl = $state<HTMLElement | null>(null);
+
+	// How wide a frame to ask for: the picture's box as it is drawn (CSS px, at this window's pixel
+	// ratio — a detached window may be on another screen), in the steps of `preview-size.ts`. Null
+	// until the box has been measured, so the pump asks nothing at a guess; a box with no width (the
+	// panel is in a hidden tab) is not a measurement, and keeps the last one or waits. A change settles
+	// first (`RESIZE_SETTLE_MS`): dragging a panel edge is a stream of sizes, and each width asked for
+	// is an FFmpeg composite. A window moved to a monitor of another pixel ratio fires neither the
+	// observer nor `resize`, so the ratio is watched through its own media query.
+	let boxWidth = $state<number | null>(null);
+	$effect(() => {
+		const el = frameEl;
+		if (!el) return;
+		void windows.version;
+		const win = windowOf(el);
+		const measure = () => {
+			if (el.clientWidth > 0) boxWidth = requestWidth(el.clientWidth, win.devicePixelRatio);
+		};
+		measure();
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const settle = () => {
+			clearTimeout(timer);
+			timer = setTimeout(measure, RESIZE_SETTLE_MS);
+		};
+		const observer = resizeObserverFor(el, settle);
+		observer.observe(el);
+		win.addEventListener('resize', settle);
+		let ratio: MediaQueryList | null = null;
+		const onRatio = () => {
+			settle();
+			watchRatio();
+		};
+		const watchRatio = () => {
+			ratio?.removeEventListener('change', onRatio);
+			ratio = win.matchMedia(dprQuery(win.devicePixelRatio));
+			ratio.addEventListener('change', onRatio);
+		};
+		watchRatio();
+		return () => {
+			clearTimeout(timer);
+			observer.disconnect();
+			win.removeEventListener('resize', settle);
+			ratio?.removeEventListener('change', onRatio);
+		};
+	});
+	// What is asked is the box's width, held to the widest source the preview actually reads: the default
+	// proxy is 1280 px wide, and a 1440 or 1920 px frame composited from it is the same picture upscaled, at
+	// several times the decode cost on every scrub frame. With a delivery frame set the canvas is not the
+	// source's shape (a 16:9 proxy under a 9:16 canvas is cropped and scaled by the fit), so the source's
+	// width says nothing about the canvas's and the box's is asked as it is — the backend never goes past
+	// the frame's own width.
+	const sourceWidth = $derived(
+		editor.timeline.format
+			? null
+			: previewSourceWidth(editor.timeline, editor.assets, mediaStatus.proxies, settings.previewSource, settings.proxySize, ui.time)
+	);
+	const frameWidth = $derived(boxWidth === null ? null : capToSource(boxWidth, sourceWidth));
 	/** Bumped when the backend has taken a new place for the surface: the frame is drawn again. */
 	let boundsEpoch = $state(0);
 	let wantedBounds: PreviewBoundsReport | null = null;
@@ -674,6 +728,7 @@
 
 <div
 	bind:this={rootEl}
+	data-editor-surface
 	{@attach onWindow({
 		// Abandoning a drag is all Escape does then — not also "clear the selection". These
 		// listen to the window the panel is in, which is a detached window's when it is in one.
@@ -707,7 +762,8 @@
 			<div
 				bind:this={frameEl}
 				data-gpu-frame={onSurface ? 'surface' : undefined}
-				style="position:relative;aspect-ratio:{aspect};{frameBox};border-radius:4px;background:{gpuShown ? 'transparent' : 'radial-gradient(120% 120% at 30% 20%, var(--surface-active) 0%, var(--surface-raised) 55%, var(--surface-void) 100%)'};border:var(--line-width) solid var(--border-default);box-shadow:var(--shadow-md)"
+				data-request-width={frameWidth ?? undefined}
+				style="position:relative;aspect-ratio:{aspect};{frameBox};border-radius:4px;background:{gpuShown ? 'transparent' : 'radial-gradient(120% 120% at 30% 20%, var(--surface-active) 0%, var(--surface-raised) 55%, var(--surface-void) 100%)'};border:var(--line-width) solid var(--border-strong);box-shadow:var(--shadow-md)"
 			>
 				{#if settings.gpuPreview}
 					<!-- Colour probes: what the backend paints around the picture and behind the page. -->
@@ -717,7 +773,7 @@
 				{#if gpuShown}
 					<!-- Drawn by the GPU in the native surface: nothing here covers it. -->
 				{:else if frameUrl}
-					<img src={frameUrl} alt="preview frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:var(--frame-matte)"
+					<img src={frameUrl} alt="preview frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:var(--frame-matte);border-radius:3px"
 						onload={(e) => {
 							const im = e.currentTarget as HTMLImageElement;
 							if (im.naturalWidth && im.naturalHeight) frames.pictureAspect(im.naturalWidth / im.naturalHeight);
@@ -787,25 +843,25 @@
 				{#if ui.trimMonitor}
 					<TrimMonitor monitor={ui.trimMonitor} />
 				{/if}
-				<div style="position:absolute;left:14px;top:12px;display:flex;gap:6px">
-					<Badge tone="kerf">{previewAsset?.name ?? 'preview'}</Badge>
-					{#if playbackWaiting}<span use:tip={playbackWaiting} data-testid="playback-waiting"
-							><Badge tone="warning" dot>playback waits for the proxy</Badge></span
-						>{/if}
-					{#if waitingOnProxy}<span use:tip={waitingOnProxy.title}
-							><Badge tone="warning" dot>{waitingOnProxy.text.replace('preview: ', '')}</Badge></span
-						>{/if}
-					{#if ui.analyzing}<Badge tone="agent" dot>{ui.analysisLabel ?? 'analyzing'}</Badge>{/if}
-				</div>
+				<!-- The HUD: what is on screen and where it is decoded from. Every chip is on a scrim with the
+				     on-video text colour, never bare text on the picture (a snow scene or the Light theme's pale
+				     placeholder swallowed it), and the timecode is the transport's, not a second copy here. -->
 				<div
-					style="position:absolute;right:14px;top:12px;font-family:var(--font-mono);font-size:11px;color:color-mix(in srgb,var(--text-on-video) 55%,transparent)"
+					style="position:absolute;left:12px;right:12px;top:10px;display:flex;align-items:flex-start;justify-content:space-between;gap:8px;pointer-events:none"
 				>
-					{resolution}{fpsLabel ? ` · ${fpsLabel}` : ''}
-				</div>
-				<div
-					style="position:absolute;left:14px;bottom:12px;font-family:var(--font-mono);font-size:12px;color:var(--kerf-200)"
-				>
-					{tc(ui.time)}
+					<div style="display:flex;flex-wrap:wrap;gap:6px;min-width:0;max-width:62%">
+						<span data-hud="name" class="hud" style="pointer-events:auto" use:tip={previewAsset?.name}>{previewAsset?.name ?? 'preview'}</span>
+						{#if playbackWaiting}<span class="hud" style="pointer-events:auto" use:tip={playbackWaiting} data-testid="playback-waiting"
+								><i class="dot" style="background:var(--orange-500)"></i>playback waits for the proxy</span
+							>{/if}
+						{#if waitingOnProxy}<span class="hud" style="pointer-events:auto" use:tip={waitingOnProxy.title}
+								><i class="dot" style="background:var(--orange-500)"></i>{waitingOnProxy.text.replace('preview: ', '')}</span
+							>{/if}
+						{#if ui.analyzing}<span class="hud"><i class="dot" style="background:var(--agent-400)"></i>{ui.analysisLabel ?? 'analyzing'}</span>{/if}
+					</div>
+					<span data-hud="format" class="hud" style="flex:none;font-family:var(--font-mono);font-weight:500"
+						>{resolution}{fpsLabel ? ` · ${fpsLabel}` : ''}</span
+					>
 				</div>
 			</div>
 		{/if}
@@ -848,18 +904,7 @@
 			use:tip={`Timeline timecode · ${editor.fps.toFixed(3)} fps · non-drop`}
 			style="font-family:var(--font-mono);font-size:12px;color:var(--kerf-300);font-weight:500;white-space:nowrap">{tc(ui.time)}</span
 		>
-		<div
-			role="presentation"
-			onclick={scrub}
-			style="flex:1;min-width:24px;height:4px;border-radius:999px;background:var(--surface-inset);position:relative;cursor:pointer"
-		>
-			<div
-				style="position:absolute;inset:0 auto 0 0;width:{empty ? 0 : (ui.time / duration) * 100}%;background:var(--kerf-500);border-radius:999px"
-			></div>
-			<div
-				style="position:absolute;left:{empty ? 0 : (ui.time / duration) * 100}%;top:50%;width:11px;height:11px;border-radius:50%;background:var(--kerf-400);transform:translate(-50%,-50%);box-shadow:0 0 0 3px var(--surface-app)"
-			></div>
-		</div>
+		<ScrubBar {duration} {empty} />
 		{#if parts.duration}
 			<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);white-space:nowrap">{tc(duration)}</span>
 		{/if}
@@ -871,3 +916,34 @@
 		{/if}
 	</div>
 </div>
+
+<style>
+	/* A HUD chip: on the picture, so on a scrim with the on-video text — legible over a snow field and
+	   over the Light theme's pale placeholder alike. */
+	.hud {
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+		min-width: 0;
+		max-width: 100%;
+		height: 19px;
+		padding: 0 7px;
+		box-sizing: border-box;
+		border-radius: var(--radius-sm);
+		font-size: 10px;
+		font-weight: 600;
+		line-height: 1;
+		letter-spacing: 0.02em;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		color: var(--text-on-video);
+		background: color-mix(in srgb, var(--scrim) 60%, transparent);
+	}
+	.hud .dot {
+		flex: none;
+		width: 5px;
+		height: 5px;
+		border-radius: 50%;
+	}
+</style>

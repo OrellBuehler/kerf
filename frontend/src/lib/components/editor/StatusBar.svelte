@@ -9,6 +9,7 @@
 	import { inTauri, revealLogs } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 	import { tip } from '$lib/tip';
+	import { formatTimecode } from '$lib/timecode';
 
 	const showLogs = inTauri();
 
@@ -41,14 +42,7 @@
 		)
 	);
 
-	function tc(s: number): string {
-		const total = Math.max(0, s);
-		const h = Math.floor(total / 3600);
-		const m = Math.floor((total % 3600) / 60);
-		const sec = Math.floor(total % 60);
-		const mm = `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
-		return h > 0 ? `${h}:${mm}` : mm;
-	}
+	const tc = (s: number): string => formatTimecode(s, editor.fps);
 </script>
 
 <div
@@ -57,7 +51,7 @@
 	{#if meta}
 		<span style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted)">{meta}</span>
 	{/if}
-	<span style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted)">
+	<span use:tip={'Length of the cut'} style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted)">
 		{tc(editor.duration)}
 	</span>
 	<div style="flex:1"></div>

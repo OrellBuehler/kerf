@@ -99,6 +99,39 @@ so the feature is **only** activated through these forwards — which is what ma
   probe is added: `generate_proxy`'s own argv, and every argv in the golden oracle, is
   unchanged. `proxy_path` still costs the one cached `source_traits` probe of the *original*
   (it keys the file on HDR and the lead), as it did before.
+  **Whole-file analysis reads the proxy when one is ready** (never waited for: no file yet, "Always
+  original" or size Off, or a proxy that fails to read, and the original is read). Scene detection
+  (`detect_scenes_preferring(original, proxy, threshold)`, fed by `Project::scoring_proxy`) and a
+  contact sheet (`Project::sheet_proxy`) swap the path and nothing else, so no golden argv moves.
+  **The gate** is `proxy_fidelity`, from the cached `source_traits` of the original. *Times* (the
+  sheet): an MP4 / MOV / Matroska / WebM source (a transport stream's pad is not fixed and every
+  other container is unproven). *Scores* (scene detection): also SDR (no HLG / PQ transfer) and
+  `luma_plane` — a planar or semi-planar YCbCr or gray picture, whose plane 0 is the luma that
+  `select='scene'` scores and that a yuv420p proxy has; RGB (`gbrp`: the G plane; `rgb24`, `bgr0`:
+  every interleaved byte), packed YCbCr, a palette, alpha, an unknown or unprobed `pix_fmt` read the
+  original. Measured on the pinned 9.0.2 (`cli/scenes_on_proxy.rs`, `#[ignore]`d), through the software
+  (libx264) proxy — a hardware-encoded one is unmeasured: cut lists frame-exact for H.264, 10-bit
+  HEVC, 4:2:2 HEVC, a late video in MP4 and Matroska (the `.lead` pad's clone scores 0, and so does
+  the real first frame it duplicates), a display-matrix portrait clip and variable-rate Matroska;
+  the unpadded proxy of a late video is `lead` early. What a proxy does move is a frame's *score*,
+  by at most ~0.02 on SDR YCbCr (grain, compression), so a cut scored within that of the threshold
+  can flip; each fixture asserts its scores keep clear of it. HLG moves it by 0.20 to 0.21 (the
+  original is scored in its code values, the proxy is tone-mapped) and RGB by 0.53 (cuts lost), so
+  those read the original for scenes; a sheet only looks, so it takes the proxy (tone-mapped once).
+  FFmpeg 6 and older write a constant-rate proxy, so a variable-rate source's cuts are within half
+  a frame there. A sheet from a `.lead` proxy prefixes `trim=start_frame=1` when it starts at 0.000
+  (a later seek has skipped the clone), or the clone takes a slot and every cell shows its
+  neighbour's frame. Both reads are bounded: `-progress pipe:2` is added at spawn time and
+  `output_unless_stalled` kills ffmpeg after a stretch of stderr silence, so a hung proxy read
+  falls back to the original (a stalled original read is an error, not a short list of cuts).
+  ffmpeg reports **nothing until a frame has reached the output**, so the bound has to fit the
+  read: the scene pass selects frame 0 too (`eq(n,0)`, dropped again by `parse_scenes`, which
+  skips showinfo's `n:0`; never a cut) and reports every second from the start, 60 s
+  (`READ_STALL`) of silence being a wedge; a contact sheet's `tile` outputs only when the window
+  is decoded, so its bound is `sheet_stall` = 30 s per second of window, between 60 s and 2 h
+  (a 4:2:2 4K sheet is silent for the whole decode: 29 to 39 s measured).
+  `salience_map` (smart crop, framing) stays on the original: its crop moved by up to 4.6 % of the
+  frame width between original and proxy.
   **A proxy reports, can be abandoned, and cannot hang.** `generate_proxy_with(src, width,
   ProxyRun { reservation, duration, progress, cancel })` is `generate_proxy` with hooks (the
   latter is it with none): the encode runs through `run_ffmpeg_streamed`, which writes
@@ -127,12 +160,58 @@ so the feature is **only** activated through these forwards — which is what ma
   into its codec choices. Proxy generation uses the first verified h264 HW
   encoder and stitching the first hevc one (both fall back to libx264 on any
   failure, and one such failure disables HW encode for the process). Background
-  decodes (proxy, stitch, scene detection, the composited still) use the same
+  decodes (proxy, stitch, scene detection of an original, the composited still) use the same
   `-hwaccel` (default `auto`, `KERF_HWACCEL=none` to disable) with a learned
   software fallback shared with the preview path (`disable_decode_hwaccel()` is how a
   decoder outside the engine, `kerf-gpu`'s runs, teaches it one); the GUI defaults export
   `hwaccel` to `auto` too, and `render_with_progress` retries a failed
   hardware-decode export once in software so the default can never lose a render.
+  **What each input is actually asked for** is `engine/decode_policy.rs`, applied to the
+  built argv at **spawn** (`tune_inputs`; the builders still emit `-hwaccel` as the options
+  say, which is what the golden oracle pins) from what is known of the file behind each
+  `-i` — an asset's recorded codec / `pix_fmt`, or for a bare path the cached
+  `source_traits` probe (taken only where the answer can depend on it, `facts_matter`: not on
+  Linux / macOS for a long read). Rules, all pure and unit-tested (`resolve_hwaccel`): **a preview
+  proxy (`is_cache_proxy`, by its `kerf/proxies/<hash>.mp4` name) is never decoded in
+  hardware** — the session costs 70-80 ms a process against a 3 ms intra frame, and a
+  sustained stream from it is faster in software too; **a one-frame read of proxies runs on
+  one thread** (`-threads 1` ahead of each such `-i`, `cpu::single_frame_args` for the graph
+  and the encoder; a still that also reads an original keeps the budget's caps, a 4K
+  long-GOP seek needs them: one thread was 77 % slower); on **Windows `auto` becomes
+  `d3d11va`** for H.264 / HEVC (`auto` picks DXVA2: slower, 4x the CPU), any other codec stays
+  `auto` so one with no D3D11VA decoder is not handed a named one; a one-frame read of a
+  **non-4:2:0 original (4:2:2, 4:4:4, 12 bit) asks for none** on Windows and Linux (AMD and
+  most NVIDIA decoders lack it, the attempt is all cost; macOS is exempt, Intel iGPUs lose the
+  attempt — name `KERF_HWACCEL=qsv`/`vaapi` to force it, a named accelerator always goes
+  through verbatim); a long read (stream, export, proxy, scenes, filmstrip) still tries.
+  There is **no size threshold** (the review's "hardware only above 1080p" is not
+  implemented): a small original still asks. **A named accelerator exits non-zero with no
+  device where `auto` fell back quietly** (ffmpeg 9.0.2 ends with `No device available for
+  decoder` and `Hardware device setup failed`), so what a rerun in software teaches the process
+  differs by path. **Unclassified, as before** — any rescue clears `disable_decode_hwaccel`'s
+  flag, which the previews read: stills, frame grabs, the stream (before its first frame), scenes,
+  salience, filmstrips. **Classified** — only a failure whose text names an unobtainable decoder
+  (`looks_like_hardware_decode_failure`: those two phrases, `Unrecognized hwaccel`, a bad
+  `hwaccel` option, `requires hwaccel`, and the pinned build's `implib-gen: ... failed to load library` abort (SIGABRT) for a hardware library — `libva-drm.so.2` missing makes every `auto` and `vaapi` run die on a Linux box without libva; *not* `Device creation failed`, `Using auto hwaccel` or
+  `Failed setup for format`, which a successful `auto` run prints too, so a missing output
+  directory or a full disk is not the hardware's) convicts, through `convict_hardware_decode`
+  (which also sets the separate `HWACCEL_PROVEN_BAD`): `render_with_progress`
+  (`retry_export_in_software`) and `generate_proxy_with` when only a decoder was in use (with an
+  encoder too the encoder is blamed, as it always was, and the next proxy finds out about the
+  decoder — `blame_after_software_success`; a *stall* still convicts both before the rerun, via
+  the unclassified flag only). **An export drops its symbolic `auto` before the argv is built
+  (`export_hwaccel_request`) under `KERF_HWACCEL=none` or once `HWACCEL_PROVEN_BAD` is set** — not
+  on the previews' flag, so one spurious preview rescue does not send every export to software;
+  the GUI's "GPU decode" toggle still shows on meanwhile, and the first export after only a
+  preview learned the device is missing still launches and reruns once. A named accelerator is
+  never dropped — it fails and reruns once per export on a machine without the device. Stream and
+  export decide whether a failed run may blame hardware at all from the rewritten argv (an input
+  really handed `-hwaccel`), not from the request: **an export whose tuned argv has no
+  `-hwaccel` (a proxy or image-only timeline) gets no software rerun**, because the rerun would
+  be byte-identical (pinned by a test). Call sites: `tune_still_args` (`run_still`),
+  `stream_preview_once`, `tune_export_args`, `decode_frame` / `decode_hwaccel_for`;
+  `limit_frame_args` is the same for `kerf-gpu`'s per-layer decodes. **The Insta360 stitch is
+  not tuned**: it keeps the plain request (`auto`, never `d3d11va`).
   **How much of the machine any of this may take** is `engine/cpu.rs`. FFmpeg is
   written to finish as fast as it can — every run grabs every core and nothing
   coordinates one run with the next — so an agent analyzing eight sources over
@@ -315,6 +394,41 @@ so the feature is **only** activated through these forwards — which is what ma
   dissolve) starts at `timeline_start + …` — timed from 0 they blacked out any
   later clip with a fade-out and dropped its fade-in and transitions. Audio is
   re-based to the clip before `adelay`, so its `afade`s stay clip-local.
+  **The scrubbed still draws fades, dips, dissolves, slides and pushes as the file does**
+  (`engine/cli/still_fx.rs`; it used to show each clip's own span unfaded — the incoming clip alone
+  inside a dissolve, 176 levels off the export's frame — and the agent's `timeline_frame`, the cover
+  and the preview fallback all went through that). `still_layers` takes the clips from
+  `active_video_clips_with_tails` (an outgoing clip stays a layer for its `ClipFx::tail`, read from
+  the source it borrows) and, per layer, the `ClipTiming::fades` still changing the picture at output
+  frame `k = Rational::frame_containing(t)` and the slide / push travel at `ffmpeg_frame_time(k)`
+  (added to the overlay position; `overlay` truncates it to pixels as it does in the file). A fade
+  is the export's own `fade` filter, run where the export runs it (after the rotation, ahead of a
+  moving zoom) on the frame restamped as frame `k` of a `1/fps` stream
+  (`settb=expr=den/num,setpts=k,fade=…,setpts=PTS-STARTPTS`: a `fade` counts frames of its input
+  time base, and `overlay` shows a secondary frame only from its timestamp on). A chain with no alpha
+  plane ends `format=yuv420p` after the fades (`yuva420p` for an alpha source), as the export's does:
+  left to negotiation `fade` runs on the `yuva420p` the overlay asks for, where black is 0 and not
+  the limited-range 16, up to 17 levels off on the way to black. A clip that entered through a
+  dissolve is on an alpha plane for good in the export (`xfade_in > 0`), so a later fade of its own
+  or a dip out runs on `yuva420p` too: the alpha decision is made from the clip's whole `fades()`
+  list whenever a fade is in progress (`StillFades::alpha_chain`), not from the ramp alone. A tail
+  is open for the frames whose slot starts inside its window (`active_video_clips_with_tails`'s
+  `tail_at`: the exact slot start plus a nanosecond), not for the still's raw `t`: a window of
+  18.3 frames closes inside one, and that frame still draws the tail (on the grid the frame that
+  starts at the window's end has none). A fade that is not changing the
+  picture is left out, so every still outside a transition keeps its argv (golden: 1581 of 5600
+  still cases moved, exactly the new `still-fade` / `still-tail` / `still-travel` families; export
+  and preview 0). **Everything that renders a still now returns the export's frame inside a
+  transition**: `timeline_frame` / `preview_timeline`, the preview fallback and `export_cover`, so a
+  cover at `t = 0` of a clip with a fade-in is black (or mid-fade at a later `t`), as the video's
+  frame is. Measured (`still_rendered.rs`, `#[ignore]`d, 6.1 and 9.0, 24 to 60 fps): every
+  pixel of every frame of a dissolve (also from black, from a still image, with a reversed or 2x
+  outgoing clip, a transformed, graded, translucent or zooming incoming one, over another track,
+  with the clips' own fades, one that fades or dips out after its dissolve, and a 0.61 s transition
+  at 30 fps asked for at the start, middle and end of every frame), a dip to black, a fade-in / out
+  and the eight slides and pushes is equal to the export's; a dip to white is up to 2 levels off outside its fade, where the file's
+  `fade c=white` at full strength still rounds. The still's frame *pick* is unchanged (`-ss`, not
+  the `fps` filter's), so moving footage can differ from the file by a source frame as ever.
   **What a clip does in time is `clip_timing.rs`** (pure, `pub(crate)`, no dependency
   on the engine): `ClipFx` (what its transitions gave it: tail, dissolve, dips, travel,
   HDR, head pad), `transition_fx` (indexed by flat clip *storage* index over the
@@ -577,7 +691,9 @@ so the feature is **only** activated through these forwards — which is what ma
   (a view of `source_traits`, one cached ffprobe per file) and append the chain
   after their own downscale.
   Salience and scene detection are analysis, not picture, and read the raw
-  frames. **The proxy is where preview footage is converted**: `generate_proxy`
+  frames of the original; scene detection reads the proxy's instead only where
+  `proxy_fidelity` says its scores are the same (SDR YCbCr in MP4 / MOV / Matroska, see
+  above). **The proxy is where preview footage is converted**: `generate_proxy`
   tone-maps while it downsizes, `Project::preview_assets` hands the graph the
   proxy-swapped asset as `Asset::as_sdr_proxy` (same geometry, no HDR tags), and
   a file's proxy key gains `|sdr` when it is HDR, so a proxy cached before this

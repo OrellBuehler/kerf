@@ -1,15 +1,26 @@
 import { describe, expect, test } from 'bun:test';
 import {
 	MIN_LABEL_PX,
-	RULER_STEPS,
+	MIN_MINOR_PX,
+	RULER_SECONDS,
 	frameTicksIn,
-	labelDecimals,
+	minorTicksIn,
+	nominalRate,
+	rulerGrid,
 	rulerStep,
 	showsFrameTicks,
 	tickLabel,
 	ticksIn
 } from './ruler';
+import { formatTimecode } from './timecode';
 import { ZOOM_MAX, ZOOM_MIN } from './zoom';
+
+const RATES = [24, 25, 30, 60, 30000 / 1001, 24000 / 1001];
+const zooms = (from = ZOOM_MIN, to = ZOOM_MAX, by = 1.07) => {
+	const out: number[] = [];
+	for (let z = from; z <= to; z *= by) out.push(z);
+	return out;
+};
 
 describe('rulerStep', () => {
 	test('keeps labels at the spacing the old ladder gave at the common zooms', () => {
@@ -18,43 +29,131 @@ describe('rulerStep', () => {
 		expect(rulerStep(8)).toBe(15);
 	});
 
-	test('always leaves a label its room, across the whole zoom range', () => {
-		for (let z = ZOOM_MIN; z <= ZOOM_MAX; z *= 1.07) {
-			const step = rulerStep(z);
-			// The last rung is the coarsest there is; every other zoom must fit.
-			if (step < RULER_STEPS[RULER_STEPS.length - 1]) expect(step * z).toBeGreaterThanOrEqual(MIN_LABEL_PX - 1e-6);
+	test('always leaves a label its room, across the whole zoom range and every rate', () => {
+		for (const fps of RATES) {
+			for (const z of zooms()) {
+				const step = rulerStep(z, fps);
+				const coarsest = (RULER_SECONDS[RULER_SECONDS.length - 1] * nominalRate(fps)) / fps;
+				// The last rung is the coarsest there is; every other zoom must fit.
+				if (step < coarsest) expect(step * z).toBeGreaterThanOrEqual(MIN_LABEL_PX - 1e-6);
+			}
 		}
 	});
 
 	test('picks the finest step that does, never a coarser one than needed', () => {
-		for (let z = ZOOM_MIN; z <= ZOOM_MAX; z *= 1.13) {
-			const step = rulerStep(z);
-			const i = RULER_STEPS.indexOf(step);
-			if (i > 0) expect(RULER_STEPS[i - 1] * z).toBeLessThan(MIN_LABEL_PX);
+		for (const fps of RATES) {
+			let last = 0;
+			const seen: number[] = [];
+			for (const z of zooms(ZOOM_MIN, ZOOM_MAX, 1.013)) {
+				const step = rulerStep(z, fps);
+				if (step !== last) seen.push(step);
+				last = step;
+			}
+			// A step is dropped for a finer one only when the finer fits: so the one left
+			// behind, at the zoom it was left, did not.
+			for (let i = 1; i < seen.length; i++) expect(seen[i]).toBeLessThan(seen[i - 1]);
 		}
 	});
 
 	test('gets finer as the zoom goes in', () => {
-		let last = Infinity;
-		for (let z = ZOOM_MIN; z <= ZOOM_MAX; z *= 1.2) {
-			const s = rulerStep(z);
-			expect(s).toBeLessThanOrEqual(last);
-			last = s;
+		for (const fps of RATES) {
+			let last = Infinity;
+			for (const z of zooms(ZOOM_MIN, ZOOM_MAX, 1.2)) {
+				const s = rulerStep(z, fps);
+				expect(s).toBeLessThanOrEqual(last);
+				last = s;
+			}
 		}
 	});
 
-	test('reaches sub-second steps at frame-level zoom and hour-scale steps when fully out', () => {
-		expect(rulerStep(ZOOM_MAX)).toBeLessThan(0.1);
+	test('reaches single frames at frame-level zoom and hour-scale steps when fully out', () => {
+		expect(rulerStep(ZOOM_MAX, 30)).toBeLessThan(0.1);
 		expect(rulerStep(ZOOM_MIN)).toBeGreaterThanOrEqual(900);
 	});
 
 	test('a zoom that is not a number gets the coarsest step rather than a loop', () => {
-		expect(rulerStep(NaN)).toBe(RULER_STEPS[RULER_STEPS.length - 1]);
-		expect(rulerStep(0)).toBe(RULER_STEPS[RULER_STEPS.length - 1]);
+		expect(rulerStep(NaN)).toBe(RULER_SECONDS[RULER_SECONDS.length - 1]);
+		expect(rulerStep(0)).toBe(RULER_SECONDS[RULER_SECONDS.length - 1]);
 	});
 
 	test('the ladder is ascending', () => {
-		for (let i = 1; i < RULER_STEPS.length; i++) expect(RULER_STEPS[i]).toBeGreaterThan(RULER_STEPS[i - 1]);
+		for (let i = 1; i < RULER_SECONDS.length; i++) expect(RULER_SECONDS[i]).toBeGreaterThan(RULER_SECONDS[i - 1]);
+	});
+
+	test('a step under a second is a whole number of frames, and a second step is whole timecode seconds', () => {
+		for (const fps of RATES) {
+			const nominal = nominalRate(fps);
+			for (const z of zooms(10, ZOOM_MAX, 1.05)) {
+				const g = rulerGrid(z, fps);
+				const frames = g.step * fps;
+				expect(Math.abs(frames - Math.round(frames))).toBeLessThan(1e-6);
+				expect(g.frames).toBe(Math.round(frames) < nominal);
+				if (!g.frames) expect(Math.round(frames) % nominal).toBe(0);
+			}
+		}
+	});
+
+	test('at a fractional rate a labelled second is on a frame, not a hair off it', () => {
+		const fps = 30000 / 1001;
+		const g = rulerGrid(36, fps);
+		expect(g.step).toBeCloseTo((5 * 30) / fps, 12);
+		expect(g.step).toBeGreaterThan(5);
+		for (let k = 0; k < 500; k++) expect(tickLabel(k, g, fps)).toBe(hms(k * 5));
+	});
+});
+
+/** `HH:MM:SS` of whole seconds. */
+const hms = (sec: number) =>
+	[Math.floor(sec / 3600), Math.floor(sec / 60) % 60, sec % 60].map((n) => String(n).padStart(2, '0')).join(':');
+
+describe('rulerGrid minors', () => {
+	test('divide a step into round parts, never closer than the minimum', () => {
+		for (const fps of RATES) {
+			for (const z of zooms()) {
+				const g = rulerGrid(z, fps);
+				if (g.divisions > 1) expect((g.step * z) / g.divisions).toBeGreaterThanOrEqual(MIN_MINOR_PX - 1e-6);
+				if (g.frames) expect(g.divisions).toBe(1);
+			}
+		}
+	});
+
+	test('a five-second step has ten minors, one every half second', () => {
+		const g = rulerGrid(36);
+		expect([g.step, g.divisions]).toEqual([5, 10]);
+		const minors = minorTicksIn(0, 10, g);
+		expect(minors.map((m) => m.t)).toEqual([0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5.5, 6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5]);
+	});
+
+	test('skips the ticks a label stands on and marks the middle one', () => {
+		const g = rulerGrid(36);
+		const minors = minorTicksIn(0, 15, g);
+		for (const m of minors) expect(m.k % g.divisions).not.toBe(0);
+		expect(minors.filter((m) => m.mid).map((m) => m.t)).toEqual([2.5, 7.5, 12.5]);
+	});
+
+	test('an odd division has no middle', () => {
+		const g = rulerGrid(8);
+		expect([g.step, g.divisions]).toEqual([15, 3]);
+		expect(minorTicksIn(0, 45, g).some((m) => m.mid)).toBe(false);
+		expect(minorTicksIn(0, 45, g).map((m) => m.t)).toEqual([5, 10, 20, 25, 35, 40]);
+	});
+
+	test('are none when the step has no room for them, or is a frame count', () => {
+		expect(minorTicksIn(0, 100, { step: 1, frames: false, divisions: 1 })).toEqual([]);
+		expect(minorTicksIn(0, 10, rulerGrid(ZOOM_MAX, 30))).toEqual([]);
+	});
+
+	test('a window the width of a screen holds a bounded number of them at every zoom', () => {
+		for (const z of zooms(ZOOM_MIN, ZOOM_MAX, 1.3)) {
+			const g = rulerGrid(z, 30);
+			expect(minorTicksIn(5000 / z, 7000 / z, g).length).toBeLessThanOrEqual(2000 / MIN_MINOR_PX + 12);
+		}
+	});
+
+	test('never start before zero and are bounded', () => {
+		const g = rulerGrid(36);
+		expect(minorTicksIn(-30, 10, g)[0].t).toBe(0.5);
+		expect(minorTicksIn(0, 1e9, g, 300).length).toBe(300);
 	});
 });
 
@@ -102,41 +201,39 @@ describe('ticksIn', () => {
 });
 
 describe('tickLabel', () => {
-	test('whole-second steps read mm:ss', () => {
-		expect(tickLabel(0, 5)).toBe('00:00');
-		expect(tickLabel(3, 5)).toBe('00:15');
-		expect(tickLabel(13, 5)).toBe('01:05');
+	test('a whole-second step reads HH:MM:SS, the project timecode without its frames', () => {
+		const g = rulerGrid(36);
+		expect(tickLabel(0, g, 30)).toBe('00:00:00');
+		expect(tickLabel(3, g, 30)).toBe('00:00:15');
+		expect(tickLabel(13, g, 30)).toBe('00:01:05');
 	});
 
-	test('minutes carry past 59, as the old ruler did', () => {
-		expect(tickLabel(75, 60)).toBe('75:00');
+	test('hours carry, so an hour is not 60:00', () => {
+		const g = rulerGrid(0.5);
+		expect(g.step).toBe(300);
+		expect(tickLabel(12, g, 30)).toBe('01:00:00');
+		expect(tickLabel(13, g, 30)).toBe('01:05:00');
 	});
 
-	test('sub-second steps carry the fraction they need', () => {
-		expect(labelDecimals(1)).toBe(0);
-		expect(labelDecimals(0.5)).toBe(1);
-		expect(labelDecimals(0.1)).toBe(1);
-		expect(labelDecimals(0.05)).toBe(2);
-		expect(tickLabel(3, 0.5)).toBe('00:01.5');
-		expect(tickLabel(13, 0.05)).toBe('00:00.65');
-	});
-
-	test('a tenth reads as a tenth, not one off through float noise', () => {
-		for (let k = 0; k < 700; k++) {
-			const label = tickLabel(k, 0.1);
-			const [mmss, f] = label.split('.');
-			const [m, s] = mmss.split(':').map(Number);
-			expect(m * 600 + s * 10 + Number(f)).toBe(k);
+	test('a sub-second step reads HH:MM:SS:FF and lands on the frame it names', () => {
+		for (const fps of RATES) {
+			const g = rulerGrid(ZOOM_MAX, fps);
+			expect(g.frames).toBe(true);
+			const nominal = nominalRate(fps);
+			const f = Math.round(g.step * fps);
+			for (let k = 0; k < 400; k++) {
+				const [, , s, ff] = tickLabel(k, g, fps).split(':').map(Number);
+				const frame = (Math.floor((k * f) / nominal) % 60) * nominal + ((k * f) % nominal);
+				expect(s * nominal + ff).toBe(frame);
+			}
 		}
 	});
 
-	test('hundredths too', () => {
-		for (let k = 0; k < 2500; k += 7) {
-			const label = tickLabel(k, 0.05);
-			const [mmss, f] = label.split('.');
-			const [m, s] = mmss.split(':').map(Number);
-			expect(m * 6000 + s * 100 + Number(f)).toBe(k * 5);
-		}
+	test('the label of a tick is the transport timecode of its time', () => {
+		const g = rulerGrid(500, 24);
+		expect(g.step).toBeCloseTo(5 / 24, 12);
+		expect(tickLabel(7, g, 24)).toBe('00:00:01:11');
+		expect(tickLabel(7, g, 24)).toBe(formatTimecode(7 * g.step, 24));
 	});
 });
 
