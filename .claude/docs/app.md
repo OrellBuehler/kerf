@@ -71,6 +71,7 @@ JPEG added as a base64 `data:` URL (`FilmstripPayload` — the CSP admits `data:
 and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**, since
 `skim_asset` is how an agent looks at footage,
 `get_preview_frame` / `set_preview_bounds` / `gpu_preview_status` (the GPU preview, below; GUI-only),
+`get_timeline_frame` (the composited still at a time; see Scrubbed frames below),
 detached panels (`popout_expect` / `popout_cancel` / `popout_focus` / `popout_move` / `close_popout`, see Detached panels below; GUI-only, no MCP tool),
 `start_playback { playback_id, start, fps?, max_width?, on_frame }` / `stop_playback` — streamed
 composited frames over a `tauri::ipc::Channel<InvokeResponseBody>`, **raw bytes** (`playback_message`:
@@ -191,6 +192,14 @@ separate permission), so it is listed in object form with an `allow` entry for
 `https://github.com/OrellBuehler/kerf/*` — without a scope every `openUrl` call
 comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 
+**Scrubbed frames.** `get_timeline_frame` and the GPU preview's JPEG route go through `AppState.scrub`, one
+`kerf_core::ScrubFrames` per process: the frame of the cut's grid that holds the time, from a bounded cache or from
+the window of neighbours one process draws for it (`engine-cli.md`, "Scrubbed frames"). `start_playback` stops the
+window (`scrub.stop()`), `new_project` / `open_project` clear it (`scrub.clear()`). The MCP `preview_timeline`
+stays the one-shot still on purpose: an agent asks for exactly that time and the staged cut. Environment:
+`KERF_SCRUB_CACHE_MB` (64), `KERF_SCRUB_WINDOW` (frames per window, 24; `off` / `0` = one cached still per miss);
+`KERF_GPU_LANE=off` keeps every job on the cores' slot (`engine-cli.md`, `cpu.rs`).
+
 **GPU preview (A2, `gpu_preview.rs`, opt-in).** *Settings › Preview › GPU preview (experimental)*
 (`Settings.gpu_preview`, default off, persisted beside `safe_areas`) draws the Preview
 panel's frame with `kerf-gpu`'s compositor in a native surface. Off, none of it runs and the
@@ -198,7 +207,8 @@ webview sends no extra command: the JPEG path is what it was. On, `get_preview_f
 { time_secs, max_width, overlays }` takes the plan's inputs under the project lock
 (`plan_inputs`: the working timeline, the assets as imported and the proxy-swapped ones the
 FFmpeg graph reads), **releases it**, plans the frame (`Planner` over `ProxyMedia`, the
-measured colour policy) and answers `{renderer: 'gpu' | 'ffmpeg', frame?, reasons,
+measured colour policy, at the start of the output frame whose slot holds the time, `plan_at_grid`, as the JPEG route's
+`ScrubFrames` counts it, so the two show one frame between two frames) and answers `{renderer: 'gpu' | 'ffmpeg', frame?, reasons,
 timings?}`: the GPU when `RenderPlan::reasons(caps, size)` is empty and everything works,
 else FFmpeg's JPEG **of that frame, in the same call**, with the plan's reasons (a refusal
 is not an error). Titles and captions are part of what the compositor draws (`caps.text`: FFmpeg rasterises each distinct
@@ -207,7 +217,14 @@ the first frame that wants them and dropped together (`Backend`); a build failur
 remembered with a backoff (5 s doubling to 5 min, `Backoff`), a `DeviceLost` or any error
 that says the device or surface is gone (`react`) drops the backend and rebuilds it on the
 next use — the first loss at once, as `kerf-gpu` documents: the owner builds a new `Gpu` —
-and a refused plan, a busy decode or an occluded window is only that frame's fallback. **Nothing
+and a refused plan, a busy decode or an occluded window is only that frame's fallback. **A frame that was
+presented asks the frame source for the clips past the next cut** (`prefetch_ahead`): the clips of video
+tracks that render and start within 2 s of the playhead (`upcoming_clip_starts`, at most 3, each moment
+once) are planned at their start and their layers handed to `FrameSource::frames(.., Hint::Prefetch)` on a
+thread of its own (one at a time, the same clips not again within a second, after the render lock is
+released; a moment the GPU would refuse at this size is skipped, and a panic clears the in-flight flag), so a run is waiting and the file's two probes are done when the playhead crosses the cut
+instead of the first frame there costing a process start. It never takes a run another layer is reading
+and a failure is nothing: the frame is decoded when asked. **Nothing
 here may freeze the preview**: a backend is built **off the render lock** and with a deadline
 (`BUILD_DEADLINE`, 10 s, on a thread of its own; a frame that finds a build under way is the
 JPEG at once, "the GPU preview is starting", and one that outlives the deadline is left to finish

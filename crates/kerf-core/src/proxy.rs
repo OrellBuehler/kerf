@@ -440,8 +440,8 @@ struct Queued {
 }
 
 /// How many proxy encodes may be taken off the queue at once. The heavy-job gate lets
-/// one run at a time whatever this says, so more workers only means more queued
-/// encodes already past their ffprobe.
+/// one run at a time whatever this says (the encode is x264 on the cores, always), so more
+/// workers only means more queued encodes already past their ffprobe.
 fn workers() -> usize {
     std::env::var("KERF_PROXY_WORKERS")
         .ok()

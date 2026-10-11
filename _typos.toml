@@ -12,6 +12,8 @@ seeked = "seeked"
 # per-input audio/video counters and fade in/out locals
 acount = "acount"
 fo = "fo"
+# ffmpeg's pass-through audio filter
+anull = "anull"
 # "mis-remembers", "mis-animates"
 mis = "mis"
 # "PNGs" splits as PN + Gs

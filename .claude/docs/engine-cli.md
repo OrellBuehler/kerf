@@ -274,7 +274,8 @@ so the feature is **only** activated through these forwards — which is what ma
   preview stream, a contact sheet) and the timeline's per-asset drawings — the
   waveform pyramid and the filmstrip — which do read the whole file, once, and cache
   it, but are what an opened project's clips are painted from. Ungated is not free:
-  those are still thread-capped and niced and run a couple at a time, and the
+  those are still thread-capped and run a couple at a time (the waveform and filmstrip decodes are niced
+  too; a scrubbed still, a scrub window and the preview stream keep normal priority, being what the user waits on), and the
   filmstrip, a *video* decode that runs beside the proxy encode of the very file it
   samples, holds its own tighter cap (below).
   The share becomes `-threads` / `-filter_threads` / `-filter_complex_threads`,
@@ -291,6 +292,29 @@ so the feature is **only** activated through these forwards — which is what ma
   / `cpu::background_always`, which hold at every budget, because "at 100% leave
   ffmpeg alone" is for the job that owns the machine, and the filmstrip is the side
   job that must stay out of that job's way.
+  **The hardware's slot** (`cpu::Resource::Gpu`, `MAX_GPU_JOBS` 2) is the one exception to one job at a time, and
+  only an **export** can take it. An export that is hardware from end to end feeds the decoder and the encoder with
+  0.3 to 0.7 of a core, so it neither waits for the cores' job nor holds it up, and two together finish about a third
+  sooner than one after the other (a third gains nothing). Same three lanes (foreground, proxy, background; arrival
+  order within one), though an export is foreground. **A preview proxy never takes it**: its encode is x264 on the
+  cores whatever decodes it (`proxy_encode_args`: a hardware H.264 intra pass costs the same wall time, writes proxies
+  a third larger, and one refusal used to turn hardware encoding off for the process), and hardware decode alone is
+  the light part; so `generate_proxy_with` always leases the cores' slot, in the proxy lane, and the queue has one
+  worker (`KERF_PROXY_WORKERS` overrides). The caller decides what qualifies and every doubt is the cores.
+  `export_resource` (judged on the tuned argv): the lane on, a hardware `-c:v` (`enc_family`: NVENC, QSV, AMF,
+  VideoToolbox, VAAPI), every input an image or a video with a **named** `-hwaccel` that decodes it (`auto` is never
+  named: it falls back to software without a word, so on Linux and macOS only an explicitly named accelerator
+  qualifies, and on Windows `decode_policy` makes `auto` `d3d11va`) and a stream the decoder has
+  (`InputFacts::hardware_decodes`: H.264 4:2:0 at **8 bit**, since High10 has no D3D11VA, DXVA2 or VAAPI decoder and
+  ffmpeg decodes it in software without a word, or HEVC 4:2:0 at 8 or 10 bit; an H.264 stream whose depth was not
+  recorded is not assumed to be 8), and a graph whose filters are all in `HARDWARE_GRAPH_FILTERS` (scale, pad,
+  overlay, fps, the VAAPI tail `format=nv12,hwupload`, ... and the sound ones; none of `zscale` / `geq` / `rotate` /
+  `v360` / `drawtext` / a blur / a grade). `-vaapi_device` is a global option written ahead of the inputs and is not looked at (the
+  encoder name and the upload carry the VAAPI export), and `tune_export_args` swaps in the render node the probe
+  verified before the argv is judged. The rerun after a hardware decode failure asks no input for hardware, so it is
+  the cores' and is a fresh attempt that asks for the cores' slot. `KERF_GPU_LANE=off` / `cpu::set_gpu_lane(false)`
+  keeps every job on the cores' slot. Not measured on a GPU (none here): the gate and the classification are
+  unit-tested, and the 0.3 to 0.7 core and +32 % figures are the review's, from an RX 7900 XT.
   Export is a **positional, multi-track** `filter_complex`
   (`build_export_args` / `build_filter_complex`, both pure + unit-tested): a black
   canvas with every video clip `overlay`'d at its `timeline_start` (later tracks on
@@ -451,6 +475,42 @@ so the feature is **only** activated through these forwards — which is what ma
   and the eight slides and pushes is equal to the export's; a dip to white is up to 2 levels off outside its fade, where the file's
   `fade c=white` at full strength still rounds. The still's frame *pick* is unchanged (`-ss`, not
   the `fps` filter's), so moving footage can differ from the file by a source frame as ever.
+  **Scrubbed frames (`engine/cli/scrub.rs`, `still_cache.rs`).** A still is one process (55 to 150 ms, of which 3 to
+  10 is the frame), so `ScrubFrames` (one per process, in `AppState`) pays the process once per **window**. `frame()`
+  quantises `t` to the cut's frame grid (`Rational::frame_containing`, drawn at the slot's start as the export draws
+  it; the raw `-ss` landed a source frame late) and serves it from a bounded LRU (`KERF_SCRUB_CACHE_MB` 64, 2048
+  entries). **The key is the still's own argv** (`StillKey`: a hash of `build_still_args_rendered` at that frame
+  plus the size and mtime of every `-i`), so nothing is invalidated: an edit that changes the frame, a landed proxy
+  or a replaced file is another key, an edit elsewhere leaves it, an undo is a hit.
+  - **A miss starts one window**: the export graph over `Timeline::slice`, `-frames:v n` (24, `KERF_SCRUB_WINDOW`),
+    its reader filing each JPEG under the key of the still it stands for; the request returns when *its* frame is
+    out. A request the running window will draw (its own cut says so, asked off the lock) waits, any other kills it
+    ("latest wins"). A scrub within 8 frames of the end of a finished window starts the next (`read_ahead_frames`).
+  - **Lead.** A window starts 1 frame before the one asked for (2 after it going back), so the step the other way is
+    a hit. That holds over an original too: reaching `k` the process decodes every frame from the keyframe, so `k - 1`
+    costs a filter and a JPEG, and without it a click then a step back is a miss that starts a window of its own (870 ms
+    against 0.1 on a 1080p long-GOP original, 370 for the one-shot). A drag back is one window behind the frame:
+    over originals a short window at the frame for the first step back saved 160 ms on that step and cost 1.2 s on the
+    drag, and a short first window doubled a forward drag from a cold start, so neither is used.
+  - **Lifecycle.** Spawned off the lock (`Reading::Window`, one thread when every input is cheap: 192 to 109 ms for
+    three proxy layers). Killed by `stop()` (playback), `clear()` (project opened), an edit or jump, a reaper (10 s
+    with nothing drawn, 5 s between frames; parked on the condvar when idle) and `Drop`. `stop` / `clear` bump an
+    epoch, so a request already waiting or a read-ahead already planned starts nothing after. A window that died or
+    stalled by itself is not restarted for the same request (the one-shot answers); one another request replaced is.
+  - **Window frame = the still, or the export where the still is off** (`scrub_rendered.rs`, `#[ignore]`d, 6.1 and
+    9.0, 20 cases): byte for byte on 9.0 for plain cuts (30, 29.97 and 23.976 cuts, 60 or 2x sources, offsets, titles
+    incl. an animated one over a box, captions), the export's frame on a reversed clip, the still's picture to the
+    encoder's rounding over another track, an image, Cover, a grade. **On 6.1 the still is the odd one out on every
+    cut**: its bare `color` base (the window's has `format=yuv420p`) lets `overlay` settle on another pixel format,
+    14 levels off on one-pixel chroma lines; the window is the export. `Snapshot::plain` refuses (the one-shot draws
+    it) a fade, dissolve, slide, push or tail, a source that is not a whole multiple of the cut's rate (24 or 25 in 30,
+    1.5x, 0.5x: the `fps` pick follows where the slice starts), the last frame of a title (`drawtext`'s `between`
+    includes `end`), 360 and HDR.
+  - **Measured** (`tests/scrub_bench.rs`, release, 1280x720 proxies at 960 px, 4 shared cores, 3 runs;
+    `docs/review-2026-10-10/after/perf-4/`), 1 layer / 3, FFmpeg 9.0.2: one-shot 50-71 / 94-119 ms; first frame of a
+    window 71-89 / 104-132 (10 to 20 ms *more* than a still); next frames of a 60 Hz drag 0.0-0.1 / 4.8-9.0 ms; a held
+    frame 0.01 ms; twenty steps 1.0-1.4 s / 1.9-2.4 s against the drag's own 0.32 s. Originals, backward drags and
+    jumps: the README there.
   **What a clip does in time is `clip_timing.rs`** (pure, `pub(crate)`, no dependency
   on the engine): `ClipFx` (what its transitions gave it: tail, dissolve, dips, travel,
   HDR, head pad), `transition_fx` (indexed by flat clip *storage* index over the

@@ -26,6 +26,11 @@
 //!   scheduling priority ([`background`]) so the rest of the desktop always
 //!   preempts it.
 //!
+//! A job that is hardware from end to end (decode, encode and nothing heavy between) spends
+//! little of the cores and takes a slot of its own instead ([`Resource::Gpu`], [`MAX_GPU_JOBS`]
+//! beside the one CPU job), with the same three lanes. Only an export can be one: a preview proxy
+//! is an x264 encode on the cores whatever decodes it, so it takes the cores' slot.
+//!
 //! At **100%** the second half is off entirely: no thread flags are added and
 //! priority is untouched, so a full-speed render produces byte-identical ffmpeg
 //! invocations to the ones Kerf has always issued. The percentage is seeded from
@@ -106,10 +111,32 @@ fn limited() -> bool {
     cpu_percent() < 100
 }
 
-// ---- the one-heavy-job-at-a-time gate --------------------------------------
+// ---- the heavy-job gate -----------------------------------------------------
 
-/// Which lane of the queue a heavy job waits in. One job runs at a time; when it ends the
-/// next comes from the highest lane that has anyone waiting, in arrival order within it.
+/// Which of the machine's resources a heavy job spends, and so which slot it takes. The cores
+/// are one slot: a software job uses as many as it is given, so a second beside it is two shares of
+/// the machine where `cpu_percent` says one. The graphics hardware's decoder and encoder are
+/// another: a job that is **hardware from end to end** (decode, scale on the way through, encode:
+/// no tone-map, no per-pixel filter, no software encoder) uses 0.3 to 0.7 of a core to feed them,
+/// does not slow a software job and is not slowed by one, and two of them together finish about a
+/// third sooner than one after the other (measured; a third adds nothing). Whether a job is one is
+/// the caller's to decide from what it is about to run, and it is conservative: a job that fell
+/// back to software while holding only a hardware slot would be a second software job on the
+/// cores, which is why an export's software rerun is a new attempt that asks for the cores' slot
+/// (judged again on its own argv).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Resource {
+    /// The cores: one job at a time, whatever it runs.
+    Cpu,
+    /// The hardware's decoder and encoder: up to [`MAX_GPU_JOBS`] together, beside the one CPU job.
+    Gpu,
+}
+
+/// Hardware jobs that may run together: a third gains nothing (measured on one machine).
+pub const MAX_GPU_JOBS: usize = 2;
+
+/// Which lane of the queue a heavy job waits in. One job runs at a time per resource; when it ends
+/// the next comes from the highest lane that has anyone waiting, in arrival order within it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Priority {
     /// Anything a user is actively waiting on: an export (and each variant of one), a
@@ -126,10 +153,12 @@ pub enum Priority {
     Background,
 }
 
-struct GateState {
-    busy: bool,
-    /// The lane of the job that holds the slot — for saying what a waiter waits for.
-    running: Option<Priority>,
+/// The queue for one resource: the three lanes, and the jobs that hold its slots.
+struct Class {
+    /// How many jobs may hold a slot at once.
+    capacity: usize,
+    /// The lane of each job holding a slot — for saying what a waiter waits for.
+    running: Vec<Priority>,
     /// Tickets of the `Foreground` / `Background` jobs waiting, in arrival order: each lane
     /// takes the slot first-come first-served, so a long queue of analyses runs in the order
     /// it was asked for rather than whichever thread the scheduler wakes.
@@ -138,13 +167,26 @@ struct GateState {
     /// `Proxy` jobs that have asked for the slot or [reserved](reserve) one and not got it
     /// yet. While any exist, no `Background` job takes the slot.
     proxy: usize,
-    next_ticket: u64,
 }
 
-impl GateState {
-    /// Whether the waiter `ticket` of lane `prio` may take the slot now.
+impl Class {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            running: Vec::new(),
+            foreground: std::collections::VecDeque::new(),
+            background: std::collections::VecDeque::new(),
+            proxy: 0,
+        }
+    }
+
+    fn full(&self) -> bool {
+        self.running.len() >= self.capacity
+    }
+
+    /// Whether the waiter `ticket` of lane `prio` may take a slot now.
     fn may_go(&self, prio: Priority, ticket: u64) -> bool {
-        !self.busy
+        !self.full()
             && match prio {
                 Priority::Foreground => self.foreground.front() == Some(&ticket),
                 Priority::Proxy => self.foreground.is_empty(),
@@ -152,7 +194,7 @@ impl GateState {
             }
     }
 
-    /// The waiter leaves its queue and holds the slot.
+    /// The waiter leaves its queue and holds a slot.
     fn take(&mut self, prio: Priority) {
         match prio {
             Priority::Foreground => {
@@ -163,11 +205,17 @@ impl GateState {
             }
             Priority::Proxy => self.proxy = self.proxy.saturating_sub(1),
         }
-        self.busy = true;
-        self.running = Some(prio);
+        self.running.push(prio);
     }
 
-    /// The waiter gives its place up without having held the slot.
+    /// A job of lane `prio` gives its slot back.
+    fn release(&mut self, prio: Priority) {
+        if let Some(at) = self.running.iter().position(|p| *p == prio) {
+            self.running.remove(at);
+        }
+    }
+
+    /// The waiter gives its place up without having held a slot.
     fn forget(&mut self, prio: Priority, ticket: u64) {
         match prio {
             Priority::Foreground => self.foreground.retain(|t| *t != ticket),
@@ -178,11 +226,26 @@ impl GateState {
 
     /// What a waiter of lane `prio` is waiting for.
     fn reason(&self, prio: Priority) -> Wait {
-        let proxy_ahead = self.running == Some(Priority::Proxy) || (prio == Priority::Background && self.proxy > 0);
+        let proxy_ahead = self.running.contains(&Priority::Proxy) || (prio == Priority::Background && self.proxy > 0);
         if proxy_ahead && prio != Priority::Proxy {
             Wait::Proxy
         } else {
             Wait::Job
+        }
+    }
+}
+
+struct GateState {
+    cpu: Class,
+    gpu: Class,
+    next_ticket: u64,
+}
+
+impl GateState {
+    fn class(&mut self, resource: Resource) -> &mut Class {
+        match resource {
+            Resource::Cpu => &mut self.cpu,
+            Resource::Gpu => &mut self.gpu,
         }
     }
 }
@@ -196,11 +259,8 @@ fn gate() -> &'static Gate {
     static GATE: OnceLock<Gate> = OnceLock::new();
     GATE.get_or_init(|| Gate {
         state: Mutex::new(GateState {
-            busy: false,
-            running: None,
-            foreground: std::collections::VecDeque::new(),
-            background: std::collections::VecDeque::new(),
-            proxy: 0,
+            cpu: Class::new(1),
+            gpu: Class::new(MAX_GPU_JOBS),
             next_ticket: 0,
         }),
         free: Condvar::new(),
@@ -247,17 +307,24 @@ pub fn in_background<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// The heavy-job slot, held until dropped.
+/// A heavy-job slot, held until dropped.
 pub struct Lease {
     threads: usize,
     /// A nested lease owns no slot; only the outermost releases it.
     nested: bool,
+    resource: Resource,
+    priority: Priority,
 }
 
 impl Lease {
     /// How many CPU threads this job may use.
     pub fn threads(&self) -> usize {
         self.threads
+    }
+
+    /// Which resource's slot this holds.
+    pub fn resource(&self) -> Resource {
+        self.resource
     }
 }
 
@@ -268,11 +335,7 @@ impl Drop for Lease {
             return;
         }
         let gate = gate();
-        {
-            let mut s = state(gate);
-            s.busy = false;
-            s.running = None;
-        }
+        state(gate).class(self.resource).release(self.priority);
         // Everyone re-checks: which waiter is next depends on the lanes, and a
         // single wake-up could land on one that has to keep waiting.
         gate.free.notify_all();
@@ -313,7 +376,7 @@ pub struct Reservation {
 /// Put a proxy in front of the background lane now, and take the slot with
 /// [`Reservation::lease`] when it is its turn.
 pub fn reserve() -> Reservation {
-    state(gate()).proxy += 1;
+    state(gate()).cpu.proxy += 1;
     Reservation { held: true }
 }
 
@@ -323,14 +386,14 @@ impl Reservation {
     #[cfg(test)]
     pub fn lease(mut self) -> Lease {
         self.held = false;
-        settled(acquire(Priority::Proxy, true, &mut |_| {}, &|| false))
+        settled(acquire(Resource::Cpu, Priority::Proxy, true, &mut |_| {}, &|| false))
     }
 
     /// [`Reservation::lease`] that says why it waits and gives up when `cancel` turns true
     /// — the place is released either way.
     pub fn lease_waiting(mut self, on_wait: &mut dyn FnMut(Wait), cancel: &dyn Fn() -> bool) -> Result<Lease> {
         self.held = false;
-        acquire(Priority::Proxy, true, on_wait, cancel)
+        acquire(Resource::Cpu, Priority::Proxy, true, on_wait, cancel)
     }
 }
 
@@ -339,7 +402,7 @@ impl Drop for Reservation {
         if self.held {
             let gate = gate();
             let mut s = state(gate);
-            s.proxy = s.proxy.saturating_sub(1);
+            s.cpu.proxy = s.cpu.proxy.saturating_sub(1);
             drop(s);
             gate.free.notify_all();
         }
@@ -349,8 +412,32 @@ impl Drop for Reservation {
 /// Whether a proxy is queued or waiting — what a background job that is about to
 /// ask for the slot would be made to wait behind.
 pub fn high_pending() -> bool {
-    state(gate()).proxy > 0
+    state(gate()).cpu.proxy > 0
 }
+
+/// Whether jobs that are hardware from end to end may take the hardware's slot instead of the
+/// cores': on unless `KERF_GPU_LANE` is `off` / `0` / `false`, or [`set_gpu_lane`] turned it off.
+pub fn gpu_lane() -> bool {
+    match GPU_LANE.load(Ordering::Relaxed) {
+        0 => {
+            let on = !std::env::var("KERF_GPU_LANE")
+                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no"));
+            GPU_LANE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+        1 => true,
+        _ => false,
+    }
+}
+
+/// Turn the hardware lane on or off at runtime. Takes effect on the next job to ask which
+/// resource it spends; a job running keeps its slot.
+pub fn set_gpu_lane(on: bool) {
+    GPU_LANE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+}
+
+/// 0: not resolved yet (the first read seeds it from the environment), 1: on, 2: off.
+static GPU_LANE: AtomicU8 = AtomicU8::new(0);
 
 /// Wait for the heavy-job slot and take it, in this thread's lane ([`lane`]).
 ///
@@ -366,7 +453,7 @@ pub fn lease() -> Lease {
 
 /// [`lease`] in the given lane.
 pub fn lease_priority(priority: Priority) -> Lease {
-    settled(acquire(priority, false, &mut |_| {}, &|| false))
+    settled(acquire(Resource::Cpu, priority, false, &mut |_| {}, &|| false))
 }
 
 /// [`lease`] that says why it is waiting (`on_wait`, called when it first has to wait and
@@ -374,12 +461,26 @@ pub fn lease_priority(priority: Priority) -> Lease {
 /// true — polled four times a second while it waits. Stop and Cancel must work on a job that
 /// is still in the queue.
 pub fn lease_waiting(on_wait: &mut dyn FnMut(Wait), cancel: &dyn Fn() -> bool) -> Result<Lease> {
-    acquire(lane(), false, on_wait, cancel)
+    acquire(Resource::Cpu, lane(), false, on_wait, cancel)
 }
 
 /// [`lease_waiting`] in the given lane.
 pub fn lease_priority_waiting(priority: Priority, on_wait: &mut dyn FnMut(Wait), cancel: &dyn Fn() -> bool) -> Result<Lease> {
-    acquire(priority, false, on_wait, cancel)
+    acquire(Resource::Cpu, priority, false, on_wait, cancel)
+}
+
+/// [`lease_waiting`] for a job that is hardware from end to end: the hardware's slot
+/// ([`Resource::Gpu`]), in this thread's lane. See [`Resource`] for what qualifies; a job that
+/// might not should take the cores' slot.
+pub fn lease_gpu_waiting(on_wait: &mut dyn FnMut(Wait), cancel: &dyn Fn() -> bool) -> Result<Lease> {
+    acquire(Resource::Gpu, lane(), false, on_wait, cancel)
+}
+
+/// [`lease_gpu_waiting`] in the given lane (the gate's tests: an export is the only hardware job,
+/// and it is foreground).
+#[cfg(test)]
+pub fn lease_gpu_priority_waiting(priority: Priority, on_wait: &mut dyn FnMut(Wait), cancel: &dyn Fn() -> bool) -> Result<Lease> {
+    acquire(Resource::Gpu, priority, false, on_wait, cancel)
 }
 
 /// An acquisition that cannot be cancelled has no `Err` to report.
@@ -391,23 +492,31 @@ fn settled(lease: Result<Lease>) -> Lease {
 }
 
 /// A lease for a thread that already holds one: owns no slot, so it cannot wait.
-fn nested_lease() -> Option<Lease> {
+fn nested_lease(resource: Resource, priority: Priority) -> Option<Lease> {
     let depth = HELD.with(|h| h.get());
     HELD.with(|h| h.set(depth + 1));
     (depth > 0).then(|| Lease {
         threads: budget_threads(),
         nested: true,
+        resource,
+        priority,
     })
 }
 
-/// The one place the slot is taken. `reserved`: the caller already counts in `proxy` (a
+/// The one place a slot is taken. `reserved`: the caller already counts in the cores' `proxy` (a
 /// [`Reservation`]).
-fn acquire(priority: Priority, reserved: bool, on_wait: &mut dyn FnMut(Wait), cancel: &dyn Fn() -> bool) -> Result<Lease> {
+fn acquire(
+    resource: Resource,
+    priority: Priority,
+    reserved: bool,
+    on_wait: &mut dyn FnMut(Wait),
+    cancel: &dyn Fn() -> bool,
+) -> Result<Lease> {
     let gate = gate();
-    if let Some(nested) = nested_lease() {
+    if let Some(nested) = nested_lease(resource, priority) {
         if reserved {
             let mut s = state(gate);
-            s.proxy = s.proxy.saturating_sub(1);
+            s.cpu.proxy = s.cpu.proxy.saturating_sub(1);
             drop(s);
             gate.free.notify_all();
         }
@@ -417,26 +526,29 @@ fn acquire(priority: Priority, reserved: bool, on_wait: &mut dyn FnMut(Wait), ca
     let mut s = state(gate);
     let ticket = s.next_ticket;
     s.next_ticket += 1;
-    match priority {
-        Priority::Foreground => s.foreground.push_back(ticket),
-        Priority::Background => s.background.push_back(ticket),
-        Priority::Proxy if !reserved => s.proxy += 1,
-        Priority::Proxy => {}
+    {
+        let class = s.class(resource);
+        match priority {
+            Priority::Foreground => class.foreground.push_back(ticket),
+            Priority::Background => class.background.push_back(ticket),
+            Priority::Proxy if !reserved => class.proxy += 1,
+            Priority::Proxy => {}
+        }
     }
     let mut said: Option<Wait> = None;
     loop {
-        if s.may_go(priority, ticket) {
-            s.take(priority);
+        if s.class(resource).may_go(priority, ticket) {
+            s.class(resource).take(priority);
             break;
         }
         if cancel() {
-            s.forget(priority, ticket);
+            s.class(resource).forget(priority, ticket);
             drop(s);
             gate.free.notify_all();
             HELD.with(|h| h.set(depth));
             return Err(Error::Cancelled);
         }
-        let reason = s.reason(priority);
+        let reason = s.class(resource).reason(priority);
         if said != Some(reason) {
             said = Some(reason);
             // Not under the gate's lock: the callback is the caller's.
@@ -454,6 +566,8 @@ fn acquire(priority: Priority, reserved: bool, on_wait: &mut dyn FnMut(Wait), ca
     Ok(Lease {
         threads: budget_threads(),
         nested: false,
+        resource,
+        priority,
     })
 }
 
@@ -799,7 +913,7 @@ mod tests {
     /// How many foreground and background jobs are waiting for the slot.
     fn queued() -> (usize, usize) {
         let s = state(gate());
-        (s.foreground.len(), s.background.len())
+        (s.cpu.foreground.len(), s.cpu.background.len())
     }
 
     fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
@@ -1023,5 +1137,189 @@ mod tests {
         drop(reservation);
         assert_eq!(said(Priority::Background, lease_priority(Priority::Foreground)), [Wait::Job]);
         assert!(Wait::Proxy.message().contains("proxy"));
+    }
+
+    // ---- the hardware's slot -----------------------------------------------------------------
+    //
+    // A lease taken on a thread that already holds one is nested (it owns no slot and cannot
+    // wait: see `a_nested_lease_does_not_wait_for_itself`), so a test that needs two slots held
+    // holds each on a thread of its own.
+
+    /// How many foreground and background jobs are waiting for a hardware slot.
+    fn gpu_queued() -> (usize, usize) {
+        let s = state(gate());
+        (s.gpu.foreground.len(), s.gpu.background.len())
+    }
+
+    fn gpu_lease(priority: Priority) -> Lease {
+        settled(lease_gpu_priority_waiting(priority, &mut |_| {}, &|| false))
+    }
+
+    /// A slot of `resource` held on a thread of its own until [`Held::release`].
+    struct Held {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    fn hold(resource: Resource, priority: Priority) -> Held {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (ready, ready_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let _lease = match resource {
+                Resource::Cpu => lease_priority(priority),
+                Resource::Gpu => gpu_lease(priority),
+            };
+            ready.send(()).unwrap();
+            let _ = wait.recv();
+        });
+        ready_rx.recv().unwrap();
+        Held {
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+
+    impl Held {
+        fn release(mut self) {
+            drop(self.release.take());
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            drop(self.release.take());
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// Whether a lease of `resource` is to be had within a second: a test that expects a slot
+    /// must fail, not hang, when it is not there. Taken on a thread of its own.
+    fn can_have(resource: Resource, priority: Priority) -> bool {
+        std::thread::spawn(move || {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let cancel = || std::time::Instant::now() >= until;
+            match resource {
+                Resource::Cpu => lease_priority_waiting(priority, &mut |_| {}, &cancel).is_ok(),
+                Resource::Gpu => lease_gpu_priority_waiting(priority, &mut |_| {}, &cancel).is_ok(),
+            }
+        })
+        .join()
+        .unwrap()
+    }
+
+    fn gpu_waiter(
+        label: &'static str,
+        priority: Priority,
+        order: &std::sync::Arc<Mutex<Vec<&'static str>>>,
+    ) -> std::thread::JoinHandle<()> {
+        let order = order.clone();
+        std::thread::spawn(move || {
+            let _lease = gpu_lease(priority);
+            order.lock().unwrap().push(label);
+        })
+    }
+
+    #[test]
+    fn a_hardware_job_runs_beside_the_one_cpu_job_and_does_not_take_its_slot() {
+        let _serial = exclusive();
+        let cores = hold(Resource::Cpu, Priority::Foreground);
+        assert!(
+            can_have(Resource::Gpu, Priority::Foreground),
+            "the hardware is free while the cores are busy"
+        );
+        // The cores are still one job's: another software job waits behind the first.
+        assert!(!can_have(Resource::Cpu, Priority::Foreground));
+        cores.release();
+        assert!(can_have(Resource::Cpu, Priority::Foreground));
+    }
+
+    #[test]
+    fn a_software_job_does_not_wait_for_the_hardware_either() {
+        let _serial = exclusive();
+        let (a, b) = (
+            hold(Resource::Gpu, Priority::Foreground),
+            hold(Resource::Gpu, Priority::Foreground),
+        );
+        assert!(
+            !can_have(Resource::Gpu, Priority::Foreground),
+            "both hardware slots are taken"
+        );
+        assert!(can_have(Resource::Cpu, Priority::Foreground), "the cores' is free");
+        a.release();
+        b.release();
+    }
+
+    #[test]
+    fn no_more_than_the_limit_of_hardware_jobs_run_together() {
+        let _serial = exclusive();
+        assert_eq!(MAX_GPU_JOBS, 2);
+        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (a, b) = (
+            hold(Resource::Gpu, Priority::Foreground),
+            hold(Resource::Gpu, Priority::Foreground),
+        );
+        let third = gpu_waiter("third", Priority::Foreground, &order);
+        wait_until("the third to queue", || gpu_queued() == (1, 0));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(order.lock().unwrap().is_empty(), "a third ran beside two");
+        a.release();
+        third.join().unwrap();
+        assert_eq!(*order.lock().unwrap(), ["third"]);
+        b.release();
+    }
+
+    #[test]
+    fn the_hardware_slot_has_the_same_three_lanes() {
+        let _serial = exclusive();
+        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (a, b) = (
+            hold(Resource::Gpu, Priority::Foreground),
+            hold(Resource::Gpu, Priority::Foreground),
+        );
+        // Arrival order: background, proxy, foreground. The foreground arrived last and goes first;
+        // the proxy goes before the background. One slot is freed, so they go one at a time.
+        let background = gpu_waiter("background", Priority::Background, &order);
+        wait_until("the background job to queue", || gpu_queued() == (0, 1));
+        let proxy = gpu_waiter("proxy", Priority::Proxy, &order);
+        wait_until("the proxy to queue", || state(gate()).gpu.proxy == 1);
+        let foreground = gpu_waiter("foreground", Priority::Foreground, &order);
+        wait_until("the foreground job to queue", || gpu_queued() == (1, 1));
+        a.release();
+        for t in [background, proxy, foreground] {
+            t.join().unwrap();
+        }
+        assert_eq!(*order.lock().unwrap(), ["foreground", "proxy", "background"]);
+        b.release();
+    }
+
+    #[test]
+    fn a_lease_taken_inside_a_lease_never_waits_whichever_slot_it_asks_for() {
+        let _serial = exclusive();
+        let (a, b) = (
+            hold(Resource::Gpu, Priority::Foreground),
+            hold(Resource::Gpu, Priority::Foreground),
+        );
+        // Both hardware slots are held elsewhere. A thread that already holds a lease is nested in
+        // it, and does not queue behind itself or anyone: an export's second pass, a stitch.
+        let outer = lease();
+        let inner = gpu_lease(Priority::Foreground);
+        assert_eq!(inner.threads(), outer.threads());
+        drop((inner, outer));
+        a.release();
+        b.release();
+    }
+
+    #[test]
+    fn the_hardware_lane_can_be_turned_off() {
+        let _serial = exclusive();
+        let was = gpu_lane();
+        set_gpu_lane(false);
+        assert!(!gpu_lane());
+        set_gpu_lane(true);
+        assert!(gpu_lane());
+        set_gpu_lane(was);
     }
 }
