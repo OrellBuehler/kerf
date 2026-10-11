@@ -1896,7 +1896,7 @@ pub struct TextOverlay {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bg: Option<String>,
     /// Optional system font family name (see `fonts::list_system_fonts`);
-    /// `None` = FFmpeg's `drawtext` default.
+    /// `None` (or a family that is not installed) = the font Kerf ships (`fonts::DEFAULT_FAMILY`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font: Option<String>,
     #[serde(default)]
@@ -2169,9 +2169,11 @@ impl CaptionOptions {
 }
 
 /// Roughly how wide one character is as a fraction of the font size, measured
-/// off `drawtext`'s default face. Real caption text runs 0.44–0.75 depending on
-/// the word; 0.6 sits above the 0.52–0.55 that *long* text averages, and long
-/// text is the only kind that ever reaches the cap.
+/// off `drawtext`'s default face (first DejaVu Sans, now the shipped Geist, which
+/// is narrower: 0.44–0.5 for a sentence in the regular face and 0.47–0.53 in the
+/// bold, against DejaVu's 0.49–0.52 and 0.56–0.6). Real caption text runs
+/// 0.44–0.75 depending on the word; 0.6 sits above the 0.52–0.55 that *long* text
+/// averages, and long text is the only kind that ever reaches the cap.
 const CHAR_ADVANCE: f64 = 0.6;
 
 /// How much of the frame width a caption may take.
@@ -4038,6 +4040,16 @@ impl Timeline {
             // The same mix at every frame: a variant changes the picture only.
             master: self.master,
         }
+    }
+
+    /// The span a range export of `range` writes: `range` clamped to the cut, or `None` when there is
+    /// none or it is empty after clamping — an inverted, empty or wholly-past-the-end range falls back
+    /// to exporting everything. The one clamp the export and the platform check both read.
+    pub fn export_span(&self, range: Option<(f64, f64)>) -> Option<(f64, f64)> {
+        let (start, end) = range?;
+        let start = start.max(0.0);
+        let end = end.min(self.duration());
+        (end - start > 1e-9).then_some((start, end))
     }
 
     /// A copy containing only `[start, end)`, shifted so `start` lands at 0 —
@@ -7006,6 +7018,24 @@ mod tests {
         clip.insert_keyframe(eased(1.0000004, 9.0, Easing::Linear));
         assert_eq!((clip.keyframes[1].scale, clip.keyframes[1].easing), (9.0, Easing::EaseIn));
         assert_eq!(clip.keyframes.len(), 4);
+    }
+
+    #[test]
+    fn export_span_clamps_to_the_cut_and_falls_back_to_everything_when_empty() {
+        let tl = Timeline {
+            tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 60.0)])],
+            overlays: Vec::new(),
+            markers: Vec::new(),
+            format: None,
+            master: Default::default(),
+        };
+        assert_eq!(tl.export_span(None), None);
+        assert_eq!(tl.export_span(Some((10.0, 30.0))), Some((10.0, 30.0)));
+        assert_eq!(tl.export_span(Some((-5.0, 20.0))), Some((0.0, 20.0)));
+        assert_eq!(tl.export_span(Some((40.0, 500.0))), Some((40.0, 60.0)));
+        assert_eq!(tl.export_span(Some((10.0, 10.0))), None);
+        assert_eq!(tl.export_span(Some((30.0, 10.0))), None);
+        assert_eq!(tl.export_span(Some((90.0, 120.0))), None);
     }
 
     #[test]

@@ -89,7 +89,7 @@ out of order and a late stop must not kill the stream that replaced it —
 `get_audio` → a clip window as **raw mono s16le PCM via `tauri::ipc::Response`**, the
 only non-JSON command — the preview's Web Audio playback decodes it),
 delivery (`export_cover` → a cover image at the full delivery frame,
-`platform_targets` / `platform_check` → the readiness verdict, `reveal_path` →
+`platform_targets` / `platform_check` (frame, range → a `PlatformReport`: the checks and the cut they judged) → the platform check, `reveal_path` →
 show a rendered file in the OS file manager, opening its *containing folder*
 rather than the file, since "show me where it went" is not a request to launch a
 player), the
@@ -200,7 +200,8 @@ FFmpeg graph reads), **releases it**, plans the frame (`Planner` over `ProxyMedi
 measured colour policy) and answers `{renderer: 'gpu' | 'ffmpeg', frame?, reasons,
 timings?}`: the GPU when `RenderPlan::reasons(caps, size)` is empty and everything works,
 else FFmpeg's JPEG **of that frame, in the same call**, with the plan's reasons (a refusal
-is not an error). The device, compositor, `FrameSource` and presenter are built lazily by
+is not an error). Titles and captions are part of what the compositor draws (`caps.text`: FFmpeg rasterises each distinct
+overlay once and the GPU blends it, `gpu.md`); a frame is refused for text only under 12 px or in a named font with no bold face. The device, compositor, `FrameSource` and presenter are built lazily by
 the first frame that wants them and dropped together (`Backend`); a build failure is
 remembered with a backoff (5 s doubling to 5 min, `Backoff`), a `DeviceLost` or any error
 that says the device or surface is gone (`react`) drops the backend and rebuilds it on the

@@ -138,6 +138,7 @@ pub mod router;
 pub mod showinfo;
 pub mod source;
 pub mod sws;
+pub mod text;
 pub mod y4m;
 
 pub use compositor::{Compositor, RenderTimings, RenderedFrame, RgbaFrame};

@@ -1,14 +1,18 @@
 import { describe, expect, test } from 'bun:test';
 import {
+	FALLBACK_INK,
 	boxPadding,
 	containRect,
 	retimeKeyframes,
 	dragPosition,
+	inkBox,
+	inkFromContext,
 	packRows,
 	sampleOverlay,
 	scaledSize,
 	snapSpanStart,
 	snapTime,
+	titleFamily,
 	trimSpan,
 	withKeyframeAt
 } from './titles';
@@ -174,5 +178,95 @@ describe('retimeKeyframes', () => {
 		expect(times).toEqual([...times].sort((a, b) => a - b));
 		expect(Math.max(...times)).toBeLessThanOrEqual(0.5);
 		expect(times.at(-1)).toBeCloseTo(0.4);
+	});
+});
+
+describe('the title handle is the ink of the text, as drawtext boxes it', () => {
+	// What `drawtext` boxed at fontsize 100 with the shipped Geist (measured): the height of the string's
+	// ink, not the font's 1.30 line height. The canvas reports the same ink; these are its numbers for it.
+	const GEIST = { fontAscent: 1.005, fontDescent: 0.295 };
+	const ink = (ascent: number, descent: number) => () => ({ ascent, descent, ...GEIST });
+
+	test('the height is the ink above plus below the baseline, not the line height', () => {
+		expect(inkBox(overlay({ text: 'H' }), ink(0.71, 0)).height).toBeCloseTo(0.71);
+		expect(inkBox(overlay({ text: 'x' }), ink(0.53, 0)).height).toBeCloseTo(0.53);
+		expect(inkBox(overlay({ text: 'Hxg' }), ink(0.71, 0.16)).height).toBeCloseTo(0.87);
+		expect(inkBox(overlay({ text: '.' }), ink(0.11, 0)).height).toBeCloseTo(0.11);
+		for (const text of ['H', 'x', 'Hxg']) {
+			expect(inkBox(overlay({ text }), ink(0.7, 0.1)).height).toBeLessThan(GEIST.fontAscent + GEIST.fontDescent);
+		}
+	});
+
+	test('the glyphs move from the line box centre to the ink centre', () => {
+		// Caps only: the ink centre (0.355 above the baseline) is where Geist's own content centre is.
+		expect(inkBox(overlay(), ink(0.71, 0)).shift).toBeCloseTo(0);
+		// A descender moves the ink centre down towards the baseline, so the glyphs go up (negative) to be centred as the engine centres them.
+		expect(inkBox(overlay(), ink(0.71, 0.2)).shift).toBeCloseTo(0.255 - 0.355);
+		// Without the font's own metrics the line box is taken to be the ink.
+		expect(inkBox(overlay(), () => ({ ascent: 0.7, descent: 0.2 })).shift).toBeCloseTo(0);
+	});
+
+	test('what cannot be measured is the fallback height', () => {
+		expect(inkBox(overlay(), () => null)).toEqual({ height: FALLBACK_INK, shift: 0 });
+		expect(inkBox(overlay({ text: '' }), ink(0, 0))).toEqual({ height: FALLBACK_INK, shift: 0 });
+		expect(FALLBACK_INK).toBeCloseTo(0.9);
+		// No canvas in bun: the default measure answers null, so the handle still has a height.
+		expect(inkBox(overlay())).toEqual({ height: FALLBACK_INK, shift: 0 });
+	});
+
+	test('it is measured in the family the engine draws, bold or not', () => {
+		const seen: [string, boolean, string][] = [];
+		const spy = (text: string, bold: boolean, family: string) => {
+			seen.push([text, bold, family]);
+			return null;
+		};
+		inkBox(overlay({ text: 'Hi', bold: true }), spy);
+		inkBox(overlay({ text: 'Hi', font: "Arial 'x" }), spy);
+		expect(seen).toEqual([
+			['Hi', true, "'Geist Variable', sans-serif"],
+			['Hi', false, "'Arial x', 'Geist Variable', sans-serif"]
+		]);
+		expect(titleFamily({})).toBe("'Geist Variable', sans-serif");
+	});
+
+	test('a 2D context is read at 100 px, in em, and one that cannot say is null', () => {
+		const fonts: string[] = [];
+		const ctx = {
+			set font(v: string) {
+				fonts.push(v);
+			},
+			measureText: () => ({
+				actualBoundingBoxAscent: 71,
+				actualBoundingBoxDescent: 16,
+				fontBoundingBoxAscent: 100.5,
+				fontBoundingBoxDescent: 29.5
+			})
+		};
+		expect(inkFromContext(ctx as never, 'Hxg', true, "'Geist Variable'")).toEqual({
+			ascent: 0.71,
+			descent: 0.16,
+			fontAscent: 1.005,
+			fontDescent: 0.295
+		});
+		expect(fonts).toEqual(["700 100px 'Geist Variable'"]);
+		const old = { font: '', measureText: () => ({ actualBoundingBoxAscent: 71, actualBoundingBoxDescent: 16 }) };
+		expect(inkFromContext(old as never, 'x', false, 'sans-serif')).toEqual({
+			ascent: 0.71,
+			descent: 0.16,
+			fontAscent: undefined,
+			fontDescent: undefined
+		});
+		const none = { font: '', measureText: () => ({}) };
+		expect(inkFromContext(none as never, 'x', false, 'sans-serif')).toBeNull();
+	});
+});
+
+describe('the title box in the preview', () => {
+	test('is sized by its line height, so the box padding adds to the ink as boxborderw does', async () => {
+		const { readFileSync } = await import('node:fs');
+		const src = readFileSync(new URL('./components/editor/Preview.svelte', import.meta.url), 'utf8');
+		const style = src.slice(src.indexOf('\t\t\t\t\t\t\t\tdata-title-box\n'), src.indexOf('</span>', src.indexOf('\t\t\t\t\t\t\t\tdata-title-box\n')));
+		expect(style).toContain('line-height:{ink.height}');
+		expect(style).not.toMatch(/[;"]height:/);
 	});
 });

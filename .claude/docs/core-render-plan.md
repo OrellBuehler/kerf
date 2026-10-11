@@ -14,10 +14,21 @@
   ("0:20 over", "cutting 1:00 would keep it in the feed"); aspect is compared as
   a **ratio**, so 720x1280 reads as the right shape and merely soft. The numbers
   are other companies' product decisions, verified 2026-08-25 and **advisory** —
-  nothing here ever blocks an export. `Project::platform_check(frame)` resolves
+  nothing here ever blocks an export. `Project::platform_report(frame, range)` resolves
   the summary from `working_timeline` (so an agent is judged on its own
   proposal) with an optional frame override, which the export dialog passes when
-  a render resizes away from the project frame.
+  a render resizes away from the project frame, and an optional `range`: the span an
+  export of that range writes. `Project::cut_summary_in` summarises it on the *sliced*
+  timeline (`Timeline::export_span` — the one clamp the export's `effective_range` also
+  reads, so an empty or inverted span is the whole cut — then `Timeline::slice`), so the
+  length, the footage-derived frame, whether the span has sound and whether a title is on
+  screen in it all describe the file, and a Reel cut from the middle of a long timeline is
+  judged as the Reel. The MCP `platform_check` takes the same optional `range`, and
+  `export_variants` judges each file over the range it was exported with. It answers a
+  `PlatformReport`: every
+  target's check *and* the `CutSummary` they judged, so a UI can state the file's
+  frame and length without reading the project a second time. Messages say
+  `Instagram Reels'` / `TikTok's` (`possessive`); `platforms.ts` mirrors it.
 - `render_plan.rs` + `planner.rs` + `plan_caps.rs` — **what one frame is made of**,
   shared by every renderer. `RenderPlan::at(timeline, assets, opts, t, color)` is the
   canvas (the same `export_format` the still uses, through `render_geometry`) plus the
@@ -221,10 +232,21 @@
   **`gpu_supported_at(size)` is the per-frame fallback switch** (`gpu_supported()` is
   its size-free half; `unsupported_reasons_at(size)` says *no, with reasons*) for
   anything the compositor does not render exactly: video effects, masks, 360 reframe,
-  HDR, a live text overlay, a fade or transition in progress, a non-bicubic scaler, a
+  HDR, a text overlay it cannot reproduce (below), a fade or transition in progress, a non-bicubic scaler, a
   layer with no known picture size, a shrink steeper than `MAX_SHRINK` (40:1, the
   steepest the scaler comparison measures), and the classes below. Pure + unit-tested
   like the rest of the timeline math.
+  - **Text** (`caps.text`, which `kerf-gpu`'s compositor sets: FFmpeg rasterises `drawtext`, the compositor blends it —
+    `gpu.md`). The font is **always a file the plan can name**: `fonts::resolve_text_font` (the installed family the overlay
+    names, else the shipped Geist, `Regular` or `Bold`, written to `<cache>/kerf/fonts/`, checked on each call) is called by the graph
+    (`drawtext_common`) and the planner alike, so `PlanText.font_file` is exactly what the still / export pass as
+    `fontfile=` — `TextWithoutFont` is only the case where the default could not be written. `kerf_core::text_still_filter(&PlanText, h)`
+    is the `drawtext` the still draws for a plan's overlay (a test holds it byte-equal to `drawtext_still` over the
+    timeline's overlay at the same time) and `text_raster_graph` the graph the compositor rasterises it with (same options and
+    position, white on black in `rgb24`, parts `Glyphs` and `Box`). Refused: `Text` (no `caps.text`), `TextWithoutFont`,
+    **`TextBorder`** (`synthetic_bold`: a bold request in a font with no bold face — only a *named* family; the default has one) and
+    **`TextTooSmall(px)`** (the smallest overlay's `fontsize`, `round(height * size)`, under `MIN_TEXT_PX` = 12, judged at the
+    render size by `reasons`, not the size-free half).
   - **Pixel format is judged from a positive allow-list** (`pix_fmt_layout` in
     `model.rs` → `PixLayout { Yuv420, Gray, OtherYuv, Rgb }`): a format that is not
     known to be opaque is refused, so a name a deny-list never thought of (`ayuv`,
