@@ -15,7 +15,7 @@
 | UI-5 Timeline gestures | ui-5 (on ui-4, pushed) | | ready (PR after #130) | timeline H3–H5, H12, H13, H15 + medium; + playhead past the end after the cut shrinks; clip arrow-key nudge (M18 rest); scrub rail hover chip + marker ticks (H6 rest) | wave 3 |
 | UI-7 Panels polish | ui-7 (on ui-8) | | pushed (awaits ui-8 merge for PR) | panels/shell medium + polish; shell H6 | wave 3 |
 | UI-8 Export dialog logic | ui-8 (on ui-6, pushed) | | ready (PR after UI-6) | dialogs 3 | wave 3 |
-| PERF-4 Still cache and prefetch | perf-4 (on perf-3 + gpu-3) | | review | gpu-media WP6, WP9; gpu-compositor Hint::Prefetch | dev done: 20-step 60 Hz scrub drag 990–1419 → 317 ms (1 layer, 9.0.2), 1872–2386 → 317–396 ms (3 layers); marginal window frame ~0.05–9 ms vs 50–119 ms per spawn; cut stall 145–183 ms → 0.22 ms with Hint::Prefetch; golden unchanged |
+| PERF-4 Still cache and prefetch | perf-4 (on perf-3 + gpu-3) | | r1 fixes (no blockers) | gpu-media WP6, WP9; gpu-compositor Hint::Prefetch | dev done: 20-step 60 Hz scrub drag 990–1419 → 317 ms (1 layer, 9.0.2), 1872–2386 → 317–396 ms (3 layers); marginal window frame ~0.05–9 ms vs 50–119 ms per spawn; cut stall 145–183 ms → 0.22 ms with Hint::Prefetch; golden unchanged |
 | GPU-2 Text on the GPU | gpu-2 (on gpu-3, pushed) | | ready (PR after #129) | gpu-compositor | dev done: T1 captioned 12.7%→96.0% GPU frames, T1b 13.3%→100%, T2 69.5%→78.8%, T3 65.6%→83.3%; 76 text parity cases pass on 6.1.1 + 9.0.2; also fixes drawtext escaping of ' : \ (pre-existing export bug) |
 | GPU-4 Motion fades/transitions | gpu-4 (on gpu-2) | | review | gpu-compositor WP-4 | dev done: still-plan GPU frames T1 96.0→100%, T2 78.8→100%, T3 83.3% (WP-6 refusals); Motion export frames 0→100% (T3 16.6%); motion parity plane-exact where unscaled, 1–2 levels where scaled, dip-to-white 2 levels; golden unchanged |
 | PERF-5 AMF/VAAPI export encode | perf-5 | | in-progress | gpu-media WP4, WP5, WP11 | wave 4 |
@@ -74,6 +74,8 @@
 - PERF-4: the playhead is quantised to the cut's frame grid (preview shows the export's frame; the old `-ss` landed one source frame late). A scrub window refuses (one-shot still serves) frames with fades/transitions/tails, non-integer source/cut rate ratios, a title's last frame, 360, HDR and missing assets. MCP `preview_timeline` stays a one-shot still. GPU lane on by default but only Windows `d3d11va` qualifies; `KERF_GPU_LANE=off` disables.
 
 - #131's per-archive ffmpeg cache (e0bc839) ported into gpu-3 / ui-4 / ui-2 (a3c660e / 1d4d136 / d3e275e) after #129 hit evermeet 429 again at 10:01 UTC: each PR branch now keeps whichever archive it verified, so successive runs converge even while evermeet throttles.
+
+- The FrameSource release race fix (gpu-3 40295bb + ec41f1c) is also on main's code: ported into ui-4 (#130, 59a52b5 + 8c7d7e4) after its gpu parity job hit it; other main-based PRs get it if they hit it.
 
 ## Needs a real machine
 - PERF-4: the GPU lane (`Resource::Gpu`, MAX_GPU_JOBS=2) and its software fall-back on a real Windows/AMD driver; the GPU-preview prefetch driver against a real surface (cut-stall numbers are debug-build lavapipe).
