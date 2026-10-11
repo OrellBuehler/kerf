@@ -1,5 +1,6 @@
-//! The golden argv oracle: 5600 seeded timelines (4000, then 800 with a master bus, then 800
-//! with per-property channels) whose ffmpeg argv must not move.
+//! The golden argv oracle: 6000 seeded timelines (4000, then 800 with a master bus, then 800
+//! with per-property channels, then 400 with an AMF or VAAPI encoder) whose ffmpeg argv must
+//! not move.
 //!
 //! `build_export_args_phase`, `build_still_args` and `build_preview_args_with` are
 //! built for every case and their argv reduced to a digest, checked against three
@@ -21,6 +22,11 @@
 //! are untouched): colour numbers, a volume, some transform numbers keyed beside the others,
 //! and a legacy bundle with one number taken off it. The first 4800 per-case digests are the
 //! ones the commit before channels existed gave.
+//! **The hardware-encoder family is appended the same way**: the [`HW_CASES`] after those draw
+//! from the same generator and then have their `video_codec` replaced by one of six AMF / VAAPI
+//! encoders ([`hw_encoder_for`], no dice of its own); `av1_amf` and the three VAAPI encoders
+//! are in none of the first 5600. What moved among those is only the export of a case already
+//! holding `h264_amf` or `hevc_amf` (the recalibrated QP and `-quality quality`).
 //!
 //! **Machine-independent by construction.** The builders read the machine in five
 //! places, each pinned: the preview's decode acceleration (the
@@ -72,7 +78,9 @@ const CASES: usize = 4000;
 const MASTER_CASES: usize = 800;
 /// The channel cases appended after the master-bus ones (see the module docs).
 const CHANNEL_CASES: usize = 800;
-const TOTAL: usize = CASES + MASTER_CASES + CHANNEL_CASES;
+/// The AMF / VAAPI encoder cases appended after the channel ones (see the module docs).
+const HW_CASES: usize = 400;
+const TOTAL: usize = CASES + MASTER_CASES + CHANNEL_CASES + HW_CASES;
 const BLOCK: usize = 100;
 const MIN_PER_FAMILY: usize = 20;
 const KINDS: [&str; 3] = ["export", "still", "preview"];
@@ -227,15 +235,25 @@ codec-gif -c:v gif
 codec-nvenc -c:v h264_nvenc
 codec-qsv -c:v hevc_qsv
 codec-videotoolbox -c:v h264_videotoolbox
+codec-amf-h264 -c:v h264_amf
 codec-amf -c:v hevc_amf
+codec-amf-av1 -c:v av1_amf
+codec-vaapi-h264 -c:v h264_vaapi
+codec-vaapi-hevc -c:v hevc_vaapi
+codec-vaapi-av1 -c:v av1_vaapi
 codec-unknown -c:v libfoo
 rate-crf -crf
 rate-vp9-constant-quality -b:v 0
 rate-nvenc-vbr -rc vbr
 rate-nvenc-cq -cq
-rate-qsv -global_quality
+rate-qsv _qsv -global_quality
 rate-videotoolbox -q:v
 rate-amf-cqp -qp_i
+rate-amf-quality -quality quality
+rate-vaapi-cqp -rc_mode CQP
+rate-vaapi-quality -rc_mode CQP -global_quality
+vaapi-device -vaapi_device
+vaapi-upload [vhw]format=nv12,hwupload[outv]
 rate-bitrate -b:v 8M
 rate-bitrate-k -b:v 2500k
 rate-maxrate -maxrate
@@ -819,6 +837,12 @@ fn options(r: &mut Rng, dur: f64) -> ExportOptions {
     o
 }
 
+/// The encoder case `n` of the hardware family is built for: the AMF and VAAPI encoders in
+/// turn, no dice (so the generator's draws are the ones it always made).
+fn hw_encoder_for(n: usize) -> &'static str {
+    ["h264_amf", "hevc_amf", "av1_amf", "h264_vaapi", "hevc_vaapi", "av1_vaapi"][n % 6]
+}
+
 struct Case {
     timeline: Timeline,
     opts: ExportOptions,
@@ -865,7 +889,10 @@ fn case(i: usize, assets: &[Asset]) -> Case {
         2 => StillOutput::File { path: "/golden/cover.jpg".into(), format: ImageFormat::Jpeg, quality: r.pick(&[2, 15, 31]) },
         _ => StillOutput::RgbPipe,
     };
-    let opts = options(&mut r, dur);
+    let mut opts = options(&mut r, dur);
+    if i >= CASES + MASTER_CASES + CHANNEL_CASES {
+        opts.video_codec = Some(hw_encoder_for(i - CASES - MASTER_CASES - CHANNEL_CASES).into());
+    }
     let pass = match r.below(20) { 0..=11 => PassPhase::Single, 12..=15 => PassPhase::First, _ => PassPhase::Second };
     Case {
         stills: [(time(&mut r), sink(&mut r)), (time(&mut r), sink(&mut r))],
