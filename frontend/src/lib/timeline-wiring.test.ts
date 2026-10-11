@@ -54,3 +54,18 @@ describe('gestures hand autoscroll the pointer, not an event', () => {
 		}
 	});
 });
+
+describe('the playhead goes exactly where it is asked to, or is put back exactly', () => {
+	test('a keyframe diamond seeks to the key, not the nearest frame', () => {
+		expect(src).toContain("onseek={(time) => ui.seek(time, { snap: 'exact' })}");
+	});
+
+	test('a scrub given up restores the time it began at', () => {
+		expect(bodyOf('resetDragState')).toContain('ui.restoreTime(scrubFrom)');
+	});
+
+	test('autoscroll stops when the pointer loses its capture', () => {
+		expect(src).toContain("win.addEventListener('lostpointercapture', lost);");
+		expect(src).toContain("win.removeEventListener('lostpointercapture', lost);");
+	});
+});

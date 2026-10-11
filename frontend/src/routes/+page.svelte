@@ -53,6 +53,7 @@
 	import { missingProjectMessage } from '$lib/launch';
 	import { changeIndex, changePoints, stepChange } from '$lib/staged-diff';
 	import { clampPlayhead, secondFrames, stepFrames } from '$lib/frames';
+	import { isPagingKey, onEditorSurface } from '$lib/focus-area';
 	import type { AnalysisProgress, ModelProgress } from '$lib/types';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
@@ -595,6 +596,9 @@
 		// shorter chord (⌘C is not the razor's bare C).
 		const id = settings.actionFor(e);
 		if (!id) return;
+		// Page Up / Page Down scroll whichever panel has the keyboard; a proposal's review takes them only
+		// from the editor surface (the timeline, the preview, nothing in particular).
+		if (id.startsWith('review.') && isPagingKey(e.key) && !onEditorSurface(target)) return;
 		// One press, one action: a held ⌘V must not paste a dozen copies. The repeat
 		// is consumed, so the browser does not scroll or click on it either.
 		if (e.repeat && !allowsRepeat(id)) {

@@ -801,7 +801,7 @@
 	 *  is gone and whatever position it last reported is not trustworthy. */
 	function resetDragState() {
 		// A scrub and a mark drag change the view and the marks as they go; given up, they go back.
-		if (scrubbing && scrubFrom !== null) ui.seek(scrubFrom);
+		if (scrubbing && scrubFrom !== null) ui.restoreTime(scrubFrom);
 		if (markDrag) {
 			ui.markIn = markFrom.in;
 			ui.markOut = markFrom.out;
@@ -909,7 +909,13 @@
 			{ x: true, y: untrack(() => gestureTall) }
 		);
 		loop.start(press);
-		return () => loop.stop();
+		// A pointer that lost its capture can no longer be trusted to report its release: stop scrolling.
+		const lost = () => loop.stop();
+		win.addEventListener('lostpointercapture', lost);
+		return () => {
+			win.removeEventListener('lostpointercapture', lost);
+			loop.stop();
+		};
 	});
 
 	/** Every clip edge of the cut, for a title's snap. */
@@ -2391,6 +2397,7 @@
 			}
 		}
 	})}
+	data-editor-surface
 	style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden;position:relative"
 >
 
@@ -3268,7 +3275,7 @@
 								onvolume={(v) => editor.setVolume(c.id, v).catch(err)}
 								onfade={(which, v) =>
 									(which === 'in' ? editor.setFade(c.id, v) : editor.setFade(c.id, undefined, v)).catch(err)}
-								onseek={(time) => ui.seek(time)}
+								onseek={(time) => ui.seek(time, { snap: 'exact' })}
 								onedge={(e, edge) => onEdgePointerDown(e, c, t, edge)}
 							/>
 						</button>
@@ -3478,7 +3485,7 @@
 		content: '';
 		position: absolute;
 		inset: 0;
-		z-index: 3;
+		z-index: 1;
 		box-sizing: border-box;
 		border: 2px solid var(--diff-add);
 		border-radius: inherit;

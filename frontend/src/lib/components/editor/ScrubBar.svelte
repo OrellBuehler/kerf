@@ -78,7 +78,7 @@
 			},
 			abandon: () => {
 				seek.cancel();
-				ui.seek(from);
+				ui.restoreTime(from);
 				done();
 			}
 		});

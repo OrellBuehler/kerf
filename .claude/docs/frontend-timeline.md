@@ -226,8 +226,9 @@ proportional to its depth — a rate in px/s over real frame time with the sub-p
 (`rereadPointer`: the handlers take a `PointerLike`, so they do not need an event). A press that began inside the band waits
 until the pointer has been in the interior or moved 16 px toward the edge, so a clip grabbed near the window's edge does not
 run away on its first pixel. A slip counts the scroll as travel. The lane box **widens with the gesture** (`liveEnd`), so
-there is room to scroll into past the end of the cut. Escape / pointercancel / blur stop it with the gesture — a ruler scrub puts the
-playhead back where it was and an in / out mark drag puts the marks back (`scrubFrom` / `markFrom`), a marker drag writes nothing. The playhead's
+there is room to scroll into past the end of the cut. Escape / pointercancel / blur / a lost pointer capture stop it with the gesture — a ruler scrub puts the
+playhead back exactly where it was (`ui.restoreTime`, not re-rounded to a frame) and an in / out mark drag puts the marks back
+(`scrubFrom` / `markFrom`), a marker drag writes nothing. The playhead's
 *follow* is the same module (`followScroll`): while playing the view moves with it, pinned inside the edge it runs toward
 (no 75 % page flip); a jump off screen scrolls there smoothly (instantly under `prefers-reduced-motion`); never while a gesture
 is held.
@@ -241,7 +242,9 @@ start, a changed clip in the review card, a transcript line, `[` / `]` / Page Up
 frame at or after it, capped at the span's end for one shorter than a frame): rounding to nearest could stand up to half a
 frame *before* a title, where it is not yet on screen to select or drag. A **step** (← →, ⇧ a second, the scrub bar's keys) is
 `stepFrames`, measured from the frame being *shown* (`shownFrame`, the timecode's floor): a playhead left mid-frame by playback
-would otherwise round back onto the frame it shows, or skip one. A scrub bar's hover chip says the frame a click would land on. It also **cannot stand past the end of the cut**: an effect in
+would otherwise round back onto the frame it shows, or skip one. A keyframe diamond seeks to the key exactly (`{ snap: 'exact' }`: keyframes are in seconds, and the Inspector's
+keyframe-at-playhead check has a tolerance that assumes the playhead is *at* the key). A scrub bar's hover chip says the frame a
+click would land on. It also **cannot stand past the end of the cut**: an effect in
 `+page.svelte` takes it back to the new end when an edit shortens the cut (an empty cut reads `00:00:00:00 / 00:00:00:00`).
 The playhead's *head* lives in the sticky ruler, so it stays when the tracks scroll vertically.
 **A clip with the keyboard focus nudges**: ← / → move it (and the selection it is part of) a frame, ⇧ a second, Alt leaves its
@@ -265,8 +268,11 @@ its header, and a clip or title it removes is a hatched `--diff-remove` ghost wh
 with a strip along the lane's top that stays visible). The page's banner carries `‹ place 2/3 › · 5 changes` (places are the distinct times the
 changes sit at, `changePoints`; changes are the entries, so the two counts are not mixed) and a legend. Page Up / Page Down (and `[` / `]`, which
 need a layout that types them without AltGr or Option; not the arrows, which a focused button keeps) — `review.prevChange` / `review.nextChange`, rebindable, only while a
-proposal is on the timeline — step the playhead from place to place (`stepChange`, `snap: 'up'`). The mark is a frame drawn just
-inside the clip (`::after`), not an outline, so the partner highlight and the focus ring still show on a marked clip.
+proposal is on the timeline — step the playhead from place to place (`stepChange`, `snap: 'up'`). Page Up / Page Down scroll whichever panel has the keyboard, so the review takes
+them only from the editor surface (`focus-area.ts`: the page, the timeline or the preview — panels mark `data-editor-surface` — or
+the dock container around one); `[` / `]` work from anywhere. The mark is a frame drawn just
+inside the clip's border (`::after`, under `ClipOverlays` — handles, edges and the link badge draw over it — and
+`pointer-events: none`), not an outline, so the partner highlight and the focus ring still show on a marked clip.
 **One timecode** (`timecode.ts`): `HH:MM:SS:FF`, non-drop, hours always there so `00:00:20:15` is not read as
 minutes:seconds:frames — the transport, the timeline's clock, the status bar, the ruler (`HH:MM:SS` for a whole-second
 step), the mark and marker tooltips, the trim readouts, the keyframe tooltips and the export range. `mm:ss.cc`

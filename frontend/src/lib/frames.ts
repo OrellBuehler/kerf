@@ -41,7 +41,9 @@ export function snapToFrame(t: number, fps: number): number {
  *  and not up to half a frame before it, where X is not yet visible. `end` caps `up` at the end of the
  *  span being gone to, for one shorter than a frame. */
 export interface SeekOptions {
-	snap?: 'nearest' | 'up';
+	/** `exact` is for a time that is already the point being gone to and is not a frame — a keyframe's:
+	 *  held to the cut and nothing else, so the playhead is *at* the key and a check against it matches. */
+	snap?: 'nearest' | 'up' | 'exact';
 	end?: number;
 }
 
@@ -56,6 +58,7 @@ export function ceilToFrame(t: number, fps: number): number {
 export function seekTime(t: number, fps: number, duration: number, o: SeekOptions = {}): number {
 	const end = Math.max(0, duration);
 	if (t >= end) return end;
+	if (o.snap === 'exact') return Number.isFinite(t) ? Math.max(0, t) : 0;
 	let on = o.snap === 'up' ? ceilToFrame(t, fps) : snapToFrame(t, fps);
 	// Never past the span being gone to, and never before the time asked for.
 	if (o.snap === 'up' && o.end !== undefined && on > o.end) on = Math.max(t, o.end);

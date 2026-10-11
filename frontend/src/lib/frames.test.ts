@@ -531,6 +531,18 @@ describe('seekTime — going to the start of something', () => {
 	});
 });
 
+describe('seekTime — exactly', () => {
+	test('exact keeps the time as it is: a keyframe is not on a frame, and the playhead is at it', () => {
+		for (const t of [1.2345, 7.0001, 0.0166, 12.5]) expect(seekTime(t, 30, 60, { snap: 'exact' })).toBe(t);
+	});
+
+	test('exact is still held to the cut, and the end of the cut is the end', () => {
+		expect(seekTime(-2, 30, 20, { snap: 'exact' })).toBe(0);
+		expect(seekTime(25, 30, 20.51, { snap: 'exact' })).toBe(20.51);
+		expect(seekTime(Number.NaN, 30, 20, { snap: 'exact' })).toBe(0);
+	});
+});
+
 describe('stepFrames — steps from the frame being shown', () => {
 	test('shownFrame is the floor the timecode counts', () => {
 		expect(shownFrame(12.49, 30)).toBe(374);

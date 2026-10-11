@@ -498,6 +498,14 @@ class EditorUi {
 		if (this.playing) this.#startAudio();
 	}
 
+	/** Put the playhead back exactly where it was (a scrub given up): the time as it stood, not
+	 *  re-rounded to a frame — it may be mid-frame after playback — held to the cut as it is now. */
+	restoreTime(t: number) {
+		this.time = Math.min(Math.max(0, Number.isFinite(t) ? t : 0), Math.max(0, editor.duration));
+		this.seekEpoch++;
+		if (this.playing) this.#startAudio();
+	}
+
 	/** Jump to the nearest marker before (-1) or after (+1) the playhead. */
 	gotoMarker(dir: 1 | -1) {
 		// Compared where the playhead will stand on them (it lands on a frame): a marker between frames
