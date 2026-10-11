@@ -17,8 +17,9 @@
 | UI-8 Export dialog logic | ui-8 (on ui-6, pushed) | | ready (PR after UI-6) | dialogs 3 | wave 3 |
 | PERF-4 Still cache and prefetch | perf-4 (on perf-3 + gpu-3) | | in-progress | gpu-media WP6, WP9; gpu-compositor Hint::Prefetch | wave 3 |
 | GPU-2 Text on the GPU | gpu-2 (on gpu-3, pushed) | | ready (PR after #129) | gpu-compositor | dev done: T1 captioned 12.7%→96.0% GPU frames, T1b 13.3%→100%, T2 69.5%→78.8%, T3 65.6%→83.3%; 76 text parity cases pass on 6.1.1 + 9.0.2; also fixes drawtext escaping of ' : \ (pre-existing export bug) |
-| GPU-4 Motion fades/transitions | gpu-4 (on gpu-2) | | in-progress | gpu-compositor WP-4 | wave 4 |
-| GPU-5 … GPU-7, PERF-5, macOS presenter | | | todo | | wave 4 |
+| GPU-4 Motion fades/transitions | gpu-4 (on gpu-2) | | review | gpu-compositor WP-4 | dev done: still-plan GPU frames T1 96.0→100%, T2 78.8→100%, T3 83.3% (WP-6 refusals); Motion export frames 0→100% (T3 16.6%); motion parity plane-exact where unscaled, 1–2 levels where scaled, dip-to-white 2 levels; golden unchanged |
+| PERF-5 AMF/VAAPI export encode | perf-5 | | in-progress | gpu-media WP4, WP5, WP11 | wave 4 |
+| GPU-5 … GPU-7, macOS presenter | | | todo | | wave 4 |
 | CI: retry + cache ffmpeg download | ci-fetch-retry | #131 | blocked (evermeet 429) | not a review finding | evermeet.cx throttles the macOS pinned-ffmpeg fetch (ffprobe 429 for 6.5+ min); retry + actions/cache ported into #129, #130, #132; cache fills only after one successful run |
 
 ## Decisions
@@ -67,7 +68,11 @@
 
 - GPU-2 r3 blocker (preflight `border-box` collapsed every boxed title's handle to its padding) was a one-line CSS fix; the orchestrator applied it directly (c3c6bf6, with a source guard test) rather than spend a fourth review round.
 
+- GPU-4: still plans carry transition state (fades, travel, tails as `still_fx.rs` draws them) instead of moving the preview to Motion plans; `RenderPlan.tails` / `Unsupported::StillTail` removed. Fades use vf_fade's integer arithmetic; layers with alpha < 255 blend with overlay's FAST_DIV255 in the shader, opaque layers keep the hardware blend. Fades on translucent layers, dip-to-white on alpha planes or beside a black fade, and still picks whose rate rationals disagree are refused.
+- The gpu-3 flake fix (ec41f1c) is not yet merged into gpu-2/gpu-4; it rides in when #129 merges and they are rebased via merge.
+
 ## Needs a real machine
+- GPU-4: fade/blend integer math bit-identical on real Metal / DX12 / Vulkan and WARP (lavapipe only); dip-to-white 2-level bound measured on x86 swscale only (macOS arm64 NEON unmeasured); a paused frame inside a dissolve in the real GPU preview.
 - GPU-2: the private 0700 temp font dir + ownership check (Linux only exercised); sbix/COLR colour fonts (only CBDT tested: drawtext errors on it in both FFmpegs, 6.1.1 segfaults).
 - GPU-2: default font lives under the user profile on Windows; drawtext opens `fontfile` via FreeType's narrow open, so a non-ASCII profile name may fail every title export.
 
@@ -105,6 +110,7 @@
 - UI-3: dialog focus return, `inert` timing and the focus rescue checked in Chromium only; confirm in WebView2, WebKitGTK and WKWebView.
 
 ## Needs a decision
+- GPU-4: keep `Compositor::CAPS.dip_white` on (drawn within 2 levels: x86 yuv→rgb24 kernel vs C tables) or off to hold "match exactly" strictly? Draw black fades on translucent layers exactly (fade inside the RGB stage, alpha included) or keep refusing? `MotionFrames` decodes clips sequentially, no prefetch (WP-7 needs parallel cursors).
 - GPU-2 (r3 nits, unfixed): the title handle is not re-measured when Geist finishes loading (stays on the fallback measure until the next render); the atlas position key is full precision, so a keyframed slide-in rasterises once per frame.
 
 - GPU-2: Greek/CJK titles draw missing-glyph boxes with bundled Geist (Latin/Cyrillic only), identically in FFmpeg and GPU — per-text system-font fallback or a second bundled font (Noto, large)? Frontend `titlesShown` gating may still route titled frames off the GPU. Synthetic-bold and sub-12 px text stay refused (needs per-glyph masks).

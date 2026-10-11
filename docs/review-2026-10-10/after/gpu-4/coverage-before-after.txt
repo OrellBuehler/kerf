@@ -1,0 +1,22 @@
+composite colour policy: BottomLayerTag
+cut (render 540 px wide), plan                                                       before          after   reasons left
+T1  talking head 9:16, clip fades, captions ~85% [still]                      96.0% 1440/1500 100.0% 1500/1500   
+                                                                             refused before: Fade 60
+T1  talking head 9:16, clip fades, captions ~85% [motion]                      0.0%    0/1500 100.0% 1500/1500   
+                                                                             refused before: Fade 60, Motion 1500
+T1b same, hard cuts, captions [still]                                        100.0% 1500/1500 100.0% 1500/1500   
+                                                                             refused before: 
+T1b same, hard cuts, captions [motion]                                         0.0%    0/1500 100.0% 1500/1500   
+                                                                             refused before: Motion 1500
+T1c same, clip fades, no captions [still]                                     96.0% 1440/1500 100.0% 1500/1500   
+                                                                             refused before: Fade 60
+T1c same, clip fades, no captions [motion]                                     0.0%    0/1500 100.0% 1500/1500   
+                                                                             refused before: Fade 60, Motion 1500
+T2  montage 16:9, dissolves / dips / slides, graded, 2 titles [still]         78.8%  887/1125 100.0% 1125/1125   
+                                                                             refused before: Fade 228, Tail 147, Travel 10
+T2  montage 16:9, dissolves / dips / slides, graded, 2 titles [motion]         0.0%    0/1125 100.0% 1125/1125   
+                                                                             refused before: Fade 228, Motion 1125, Tail 153, Travel 10
+T3  tutorial 16:9, webcam PiP, 5 lower thirds, keyed push-ins, 1 mask + blur [still]  83.3% 1875/2250  83.3% 1875/2250   Effects 375, Mask 375, ZoomBehind 375
+                                                                             refused before: Effects 375, Mask 375, ZoomBehind 375
+T3  tutorial 16:9, webcam PiP, 5 lower thirds, keyed push-ins, 1 mask + blur [motion]   0.0%    0/2250  16.6%  374/2250   Effects 376, KeyedZoom 1876, Mask 376
+                                                                             refused before: Effects 376, KeyedZoom 1876, Mask 376, Motion 2250

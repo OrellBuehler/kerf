@@ -1,0 +1,15 @@
+adapter: llvmpipe (LLVM 20.1.2, 256 bits) (Vulkan, Cpu); ffmpeg: /home/user/kerf/crates/kerf-app/binaries/ffmpeg-x86_64-unknown-linux-gnu; min of 7 runs after a warm-up (median in brackets)
+frame                  render        ffmpeg ms    gpu decode ms    gpu composite ms  layers drawn
+plain cut              960 px         79 (104)          75 (79)           108 (153)             1
+dissolve, half way     960 px        144 (178)          75 (90)           223 (276)             2
+dip to black           960 px          76 (91)          57 (66)            96 (109)             1
+slide left             960 px        115 (137)          63 (77)           186 (223)             2
+dip to white           960 px         92 (115)          60 (68)           122 (152)             1
+plain cut              1080p           73 (79)          59 (65)             33 (46)             1
+dissolve, half way     1080p         112 (117)          65 (80)             65 (70)             2
+dip to black           1080p           75 (83)          57 (63)             34 (35)             1
+slide left             1080p         116 (124)          64 (70)             38 (45)             2
+dip to white           1080p          84 (100)          56 (65)           113 (135)             1
+export frames 0..9 of a dissolve at 960 px, forward: 183.3 ms a frame (decode 36.1, composite 147.2), first frame included
+
+host: 4 cores, load average 10 to 14 during the run (other builds); lavapipe (a CPU rasteriser): GPU time here is CPU time, only the relative cost of the passes and the shape of the table mean anything. 960 px renders scale the 1080p source (two swscale-emulation passes per plane per layer), 1080p renders draw it at its own size (no scale stage).
