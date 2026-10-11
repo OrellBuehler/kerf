@@ -73,9 +73,32 @@ pub struct GpuOptions {
     /// What the parity harness uses, so its numbers do not depend on which GPU
     /// (or driver) the machine happens to have.
     pub force_fallback_adapter: bool,
+    /// Turn down a CPU rasteriser that wgpu falls back to when it is the only adapter there
+    /// is ([`Gpu::new`] is then [`GpuError::NoAdapter`]). It draws a preview frame in about the
+    /// time an FFmpeg still takes, on three or four cores, so for a live preview it is a
+    /// loss; `force_fallback_adapter` asks for it by name and is never refused.
+    pub refuse_cpu: bool,
 }
 
 impl GpuOptions {
+    /// What the preview takes, from `KERF_GPU_ADAPTER` (`choice`): `software` forces the CPU
+    /// adapter (lavapipe, WARP), `auto` / `any` takes whatever wgpu prefers, CPU rasteriser
+    /// included, and anything else (`hardware`, unset) takes the machine's GPU and **turns a
+    /// CPU rasteriser down**.
+    pub fn for_preview(choice: Option<&str>) -> Self {
+        match choice {
+            Some("software") => Self {
+                force_fallback_adapter: true,
+                refuse_cpu: false,
+            },
+            Some("auto" | "any") => Self::default(),
+            _ => Self {
+                force_fallback_adapter: false,
+                refuse_cpu: true,
+            },
+        }
+    }
+
     /// The software adapter, unless `KERF_GPU_ADAPTER` says `hardware`
     /// (use the machine's own GPU) or `auto` (whatever wgpu prefers). macOS has no
     /// software adapter — Metal is the only one — so run the tests there with
@@ -85,6 +108,7 @@ impl GpuOptions {
             Ok("hardware") | Ok("auto") => Self::default(),
             _ => Self {
                 force_fallback_adapter: true,
+                refuse_cpu: false,
             },
         }
     }
@@ -168,6 +192,13 @@ impl Gpu {
             .await
             .map_err(|e| GpuError::NoAdapter(e.to_string()))?;
         let info = adapter.get_info();
+        if options.refuse_cpu && !options.force_fallback_adapter && info.device_type == wgpu::DeviceType::Cpu {
+            return Err(GpuError::NoAdapter(format!(
+                "the only adapter is a CPU rasteriser ({}), which draws a preview frame no faster than FFmpeg and on several cores \
+                 (KERF_GPU_ADAPTER=software takes it anyway)",
+                info.name
+            )));
+        }
         // Defaults, not the adapter's maximums: a compositor that needs only the
         // baseline limits (and no optional feature) runs on every adapter, which
         // is what makes the software one a faithful test target.
@@ -332,6 +363,53 @@ mod tests {
             .expect("an error");
         assert!(matches!(err, GpuError::Surface(_)), "{err:?}");
         assert!(err.to_string().contains("surface"), "{err}");
+    }
+
+    #[test]
+    fn the_preview_turns_a_cpu_rasteriser_down_unless_the_variable_asks_for_it() {
+        let refuses = |o: GpuOptions| o.refuse_cpu && !o.force_fallback_adapter;
+        for unset_or_other in [None, Some("hardware"), Some(""), Some("lavapipe")] {
+            assert!(refuses(GpuOptions::for_preview(unset_or_other)), "{unset_or_other:?}");
+        }
+        let software = GpuOptions::for_preview(Some("software"));
+        assert!(software.force_fallback_adapter && !software.refuse_cpu);
+        for any in [Some("auto"), Some("any")] {
+            assert_eq!(GpuOptions::for_preview(any), GpuOptions::default(), "{any:?}");
+        }
+        assert!(!GpuOptions::default().refuse_cpu, "a plain Gpu::new takes what wgpu gives");
+        assert!(
+            GpuOptions::for_tests().force_fallback_adapter,
+            "the harness still asks for lavapipe by name"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a software adapter as the only one (lavapipe, VK_ICD_FILENAMES=lvp_icd.json)"]
+    fn a_machine_whose_only_adapter_is_a_cpu_rasteriser_gets_none_for_the_preview_unless_forced() {
+        let Ok(plain) = Gpu::new(GpuOptions::default()) else {
+            return;
+        };
+        if !plain.is_software() {
+            return;
+        }
+        let name = plain.adapter_info().name.clone();
+        let refused = Gpu::new(GpuOptions::for_preview(None)).err().expect("turned down");
+        assert!(
+            matches!(&refused, GpuError::NoAdapter(why) if why.contains(&name) && why.contains("KERF_GPU_ADAPTER")),
+            "{refused}"
+        );
+        for choice in [Some("software"), Some("any"), Some("auto")] {
+            let gpu = Gpu::new(GpuOptions::for_preview(choice)).unwrap_or_else(|e| panic!("{choice:?}: {e}"));
+            assert!(gpu.is_software(), "{choice:?}");
+        }
+        let both = GpuOptions {
+            force_fallback_adapter: true,
+            refuse_cpu: true,
+        };
+        assert!(
+            Gpu::new(both).is_ok(),
+            "asking for the CPU adapter by name outranks refusing it"
+        );
     }
 
     #[test]

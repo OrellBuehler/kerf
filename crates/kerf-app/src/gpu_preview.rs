@@ -1446,9 +1446,8 @@ fn build_backend(app: &tauri::AppHandle, technique: Technique) -> Result<Backend
     use tauri::Manager as _;
 
     let window = app.get_webview_window("main").ok_or("the main window does not exist")?;
-    let options = GpuOptions {
-        force_fallback_adapter: std::env::var("KERF_GPU_ADAPTER").is_ok_and(|v| v == "software"),
-    };
+    // The machine's GPU; a CPU rasteriser (lavapipe, WARP) only when `KERF_GPU_ADAPTER` asks for it.
+    let options = GpuOptions::for_preview(std::env::var("KERF_GPU_ADAPTER").ok().as_deref());
     let e = |what: &str| {
         let what = what.to_string();
         move |err: GpuError| format!("{what}: {err}")
