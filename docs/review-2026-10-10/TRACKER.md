@@ -12,9 +12,9 @@
 | PERF-2 Scene detection on proxy | perf-2 (pushed) | | ready (PR after #131) | gpu-media WP3 (scenes + contact sheet; salience not swapped) | cut lists identical to the original in every case (H.264, HEVC 10-bit, 4:2:2, late-start .lead, rotated, VFR MKV). 4K, CPU-s: H.264 21.1→3.0; HEVC 10-bit 29.1→3.2; 4:2:2 36.1→3.3 (7–11x) |
 | PERF-3 Playback | perf-3 (on ui-4) | | in-progress | gpu-compositor WP-0(a)(c); gpu-media WP7; + playback stream width follows the preview request width (fixed PREVIEW_STREAM_WIDTH makes playing frames softer than paused, found in UI-4) | wave 2 |
 | GPU-1 Proxy colour normalisation | gpu-1 (pushed, no PR) | | blocked (needs a decision) | gpu-compositor WP-3 (partial: untagged HD labelled bt709; SD/601/2020/RGB not converted) | stacks refused on 9.0.2 (15 cases): 11 → 5; untagged HD colour vs source 28.0 dB → 43.3 dB on 9.0.2; nothing moves on 6.1.1 |
-| UI-5 Timeline gestures | | | todo | timeline H3–H5, H12, H13, H15 + medium; + playhead past the end after the cut shrinks; clip arrow-key nudge (M18 rest); scrub rail hover chip + marker ticks (H6 rest) | wave 3 |
+| UI-5 Timeline gestures | ui-5 (on ui-4) | | in-progress | timeline H3–H5, H12, H13, H15 + medium; + playhead past the end after the cut shrinks; clip arrow-key nudge (M18 rest); scrub rail hover chip + marker ticks (H6 rest) | wave 3 |
 | UI-7 Panels polish | | | todo | panels/shell medium + polish; shell H6 | wave 3 |
-| UI-8 Export dialog logic | | | todo | dialogs 3 | wave 3 |
+| UI-8 Export dialog logic | ui-8 (on ui-6) | | in-progress | dialogs 3 | wave 3 |
 | PERF-4 Still cache and prefetch | | | todo | gpu-media WP6, WP9 | wave 3 |
 | GPU-2 Text on the GPU | | | todo | gpu-compositor | wave 3 |
 | GPU-4 … GPU-7, PERF-5, macOS presenter | | | todo | | wave 4 |
@@ -29,6 +29,7 @@
 - PERF-2 is verified and pushed. Its PR waits for #131, because every PR run fetches from evermeet and adds to the throttling.
 - UI-6 is stacked on ui-2 and PERF-3 on ui-4 while those PRs wait on CI. Each merges main once its base lands.
 - UI-6: the themed tooltip is not hoverable (`pointer-events:none`), so it can't swallow a click on the next toolbar row. Escape is consumed only when keyboard focus raised the tip. `confirmAction` requires named buttons. The Update dialog stays busy while downloading: on Windows the updater exits the process when the download ends, which would lose unsaved work, so Hide was reverted. Failure copy is one line, `X failed — Reason`. Toast glyphs use the -400 hues for contrast.
+- Wave 3 starts before wave 2 merges: the merges are blocked only by the external CI outage. UI-5 is stacked on ui-4 (Timeline) and UI-8 on ui-6 (ExportDialog), the branches they overlap most. PERF-4 and GPU-2 wait for GPU-3 and PERF-3 (still path, stream).
 - CI: wrote the small ffmpeg-download retry myself (#131) instead of starting a dev agent: it is CI plumbing, not feature code, and two PRs were blocked on it.
 - Commits are authored as the repo owner (the container's default git identity names the assistant, which the commit rules forbid).
 - The tracker and `after/` artifacts are force-added (docs/ is git-ignored) and pushed to `docs/review-2026-10-10` so they survive the container. That commit skips the hooks, since whitespace fixers would corrupt the prototype .patch files and typos flags hash fragments in them. Earlier note: the tracker and the `after/` screenshots live on the `docs/review-2026-10-10` branch, since work-package branches start from main, which does not carry this folder.
