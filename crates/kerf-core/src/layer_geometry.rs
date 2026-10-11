@@ -163,6 +163,11 @@ impl Placement {
     };
 }
 
+/// A scale below this is one a picture can be truncated to nothing by: `scale` reads a width or
+/// height that evaluates to 0 as "unset" and keeps the *input's* size, so the graph writes
+/// `max(1, ...)` for it (`engine::cli::zoom_scale`) and the picture keeps a pixel.
+pub(crate) const TINY_SCALE: f64 = 0.01;
+
 fn lrint(d: f64) -> i64 {
     d.round_ties_even() as i64
 }
@@ -405,18 +410,17 @@ impl LayerGeometry {
         if zoom_keyed || (tf.scale - 1.0).abs() > 1e-9 {
             let w = (f64::from(picture.0) * tf.scale) as i64;
             let h = (f64::from(picture.1) * tf.scale) as i64;
-            let (w, h) = (
-                if w == 0 {
-                    picture.0
-                } else {
-                    w.min(i64::from(u16::MAX) * 4) as u32
-                },
-                if h == 0 {
-                    picture.1
-                } else {
-                    h.min(i64::from(u16::MAX) * 4) as u32
-                },
-            );
+            // A side that evaluates to 0 is "unset" to `scale`, which keeps the input's — except below
+            // `TINY_SCALE`, where the graph says `max(1, ...)` and the picture keeps a pixel.
+            let tiny = tf.scale < TINY_SCALE;
+            let side = |v: i64, whole: u32| -> u32 {
+                match (v, tiny) {
+                    (0, true) => 1,
+                    (0, false) => whole,
+                    (v, _) => v.min(i64::from(u16::MAX) * 4) as u32,
+                }
+            };
+            let (w, h) = (side(w, picture.0), side(h, picture.1));
             stages.push(ScaleStage {
                 src: Rect::whole(picture.0, picture.1),
                 scaled: (w, h),
@@ -710,6 +714,19 @@ mod tests {
         assert_eq!(ffmpeg_alpha(0.0), 0);
         assert_eq!(ffmpeg_alpha(1.0), 255);
         assert_eq!(ffmpeg_alpha(-3.0), 0);
+    }
+
+    #[test]
+    fn a_tiny_scale_keeps_a_pixel_and_a_larger_one_that_truncates_to_nothing_keeps_the_picture() {
+        // 0.0004 of 640x360 is 0.26 x 0.14 px: the graph clamps to 1 px.
+        let tiny = Transform { scale: 0.0004, ..t() };
+        let g = r420((640, 360), (640, 360), Fit::Contain, &tiny).unwrap();
+        assert_eq!(g.picture, (1, 1));
+        // Above the threshold a side that still truncates to 0 is "unset": the input's size (a 60 px
+        // wide picture at 0.015 is 0.9 px).
+        let small = Transform { scale: 0.015, ..t() };
+        let g = r420((60, 40), (60, 40), Fit::Contain, &small).unwrap();
+        assert_eq!(g.picture, (60, 40));
     }
 
     #[test]

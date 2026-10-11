@@ -43,11 +43,11 @@ impl EffectKinds {
         }
     }
 
-    pub fn contains(self, other: Self) -> bool {
+    pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
-    pub fn union(self, other: Self) -> Self {
+    pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 }
@@ -90,14 +90,18 @@ pub struct GpuCaps {
     /// trip a constant opacity takes).
     pub keyed_opacity: bool,
     /// Keyframed zoom: FFmpeg runs it as the last stage of the clip's chain (see
-    /// `Animated`), so a compositor that sets this draws the effects, mask, rotation and
-    /// grade at the fit size first and the zoom after them.
+    /// `Animated`), so a compositor that sets this draws the grade, the effects, the mask and the
+    /// fades at the fit size first and the zoom after them. A rotation, or an opacity below 1,
+    /// in front of a moving zoom is refused whatever the caps (`ZoomBehind`): both would have to
+    /// be scaled with it.
     pub keyed_zoom: bool,
     /// Keyframed colour: FFmpeg writes the clip's `eq` per frame (`eval=frame`, an expression
     /// of the frame's time for each keyed number), which a compositor that sets this draws
     /// as the colour sampled at the frame's time. Export frames only: a still plan samples
     /// the colour and draws it like a static one.
     pub keyed_color: bool,
+    /// A mask (`geq` rewriting the alpha plane): drawn as a per-sample alpha. Still refused on a
+    /// rotated layer, on one below full opacity (`MaskWith`) and on a letterboxed picture (`Matte`).
     pub mask: bool,
     pub text: bool,
     pub reframe: bool,
@@ -159,8 +163,16 @@ pub enum Unsupported {
     TranslucentMatrix(LayerRef, String),
     /// Colour correction on a picture that may be full range (the detail says what is known).
     GradedFullRange(LayerRef, String),
-    Effects(LayerRef),
+    /// A video effect the compositor does not draw (the detail names it and says why), or one
+    /// whose value FFmpeg's own filter refuses.
+    Effects(LayerRef, &'static str),
     Mask(LayerRef),
+    /// A mask in a chain the compositor draws no mask in: the detail says which.
+    MaskWith(LayerRef, &'static str),
+    /// An effect or a mask on a letterboxed picture: FFmpeg's `pad` hands the filter the whole
+    /// padded frame, black bars included, and the compositor draws the picture and the bars
+    /// apart (the detail names what runs on the frame).
+    Matte(LayerRef, &'static str),
     Reframe(LayerRef),
     /// A fade step is in progress: `true` when it is a dissolve's ramp.
     Fade(LayerRef, FadeEdge, bool),
@@ -180,9 +192,10 @@ pub enum Unsupported {
     KeyedColor(LayerRef),
     /// A keyframed zoom in an export frame, which FFmpeg draws as the last stage of the chain.
     KeyedZoom(LayerRef),
-    /// A moving zoom in a still, with a grade, a rotation or a fade of opacity in front of it:
-    /// FFmpeg applies those to the picture at its fit size and magnifies the result.
-    ZoomBehind(LayerRef),
+    /// A moving zoom with something in front of it that the compositor does not draw in FFmpeg's
+    /// order (the detail says what): FFmpeg applies those to the picture at its fit size and
+    /// magnifies the result.
+    ZoomBehind(LayerRef, &'static str),
     /// A text overlay is live.
     Text,
     /// A live text overlay names no font file the compositor can draw with (the shipped default font
@@ -239,8 +252,13 @@ impl fmt::Display for Unsupported {
                 write!(f, "{l}: opacity below 1 on a picture whose colour matrix is {detail}")
             }
             Self::GradedFullRange(l, detail) => write!(f, "{l}: colour correction on {detail}"),
-            Self::Effects(l) => write!(f, "{l}: video effects"),
+            Self::Effects(l, what) => write!(f, "{l}: video effects ({what})"),
             Self::Mask(l) => write!(f, "{l}: mask"),
+            Self::MaskWith(l, what) => write!(f, "{l}: a mask {what}, which the compositor does not draw"),
+            Self::Matte(l, what) => write!(
+                f,
+                "{l}: {what} on a letterboxed picture (FFmpeg runs it on the padded frame, black bars included)"
+            ),
             Self::Reframe(l) => write!(f, "{l}: 360 reframe"),
             Self::Fade(l, _, true) => write!(f, "{l}: inside a dissolve"),
             Self::Fade(l, FadeEdge::In, false) => write!(f, "{l}: inside its fade-in"),
@@ -261,9 +279,9 @@ impl fmt::Display for Unsupported {
                 f,
                 "{l}: keyframed zoom (FFmpeg draws it as the last stage of the clip's chain, after the effects, mask and rotation)"
             ),
-            Self::ZoomBehind(l) => write!(
+            Self::ZoomBehind(l, what) => write!(
                 f,
-                "{l}: a moving zoom with a grade, rotation or opacity ahead of it (FFmpeg applies those at the fit size and magnifies the result)"
+                "{l}: a moving zoom with {what} ahead of it (FFmpeg applies it at the fit size and magnifies the result)"
             ),
             Self::Text => f.write_str("a text overlay is live"),
             Self::TextWithoutFont => f.write_str("a text overlay names no font file to draw with"),

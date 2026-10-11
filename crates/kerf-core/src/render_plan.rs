@@ -644,6 +644,32 @@ pub(crate) fn composite_matrix(layers: &[PlanLayer], policy: CompositeColorPolic
     (matrix, unsupported)
 }
 
+/// Why a compositor with `caps` does not draw `effect`: it is not one it draws (the detail says
+/// what it is, and why that one is hard), or its value is one FFmpeg's own filter refuses (`gblur`
+/// takes a sigma of 0 to 1024, `unsharp` an amount of -2 to 5), so the frame goes to FFmpeg, which
+/// fails it the same way.
+fn effect_refusal(effect: &VideoEffect, caps: &GpuCaps) -> Option<&'static str> {
+    if !caps.effects.contains(EffectKinds::of(effect)) {
+        return Some(match effect {
+            VideoEffect::Blur { .. } => "a blur",
+            VideoEffect::Sharpen { .. } => "a sharpen",
+            VideoEffect::Grayscale => "grayscale",
+            VideoEffect::Invert => "invert",
+            VideoEffect::Vignette => "a vignette, whose dither is a counter that runs on from one frame to the next",
+            VideoEffect::ChromaKey { .. } => "a chroma key, whose alpha is a float colour distance",
+        });
+    }
+    match effect {
+        VideoEffect::Blur { sigma } if !(sigma.is_finite() && (0.0..=1024.0).contains(sigma)) => {
+            Some("a blur sigma outside 0 to 1024, which gblur refuses")
+        }
+        VideoEffect::Sharpen { amount } if !(amount.is_finite() && (-2.0..=5.0).contains(amount)) => {
+            Some("a sharpen amount outside -2 to 5, which unsharp refuses")
+        }
+        _ => None,
+    }
+}
+
 impl RenderPlan {
     /// The plan for timeline time `t`: what `timeline_frame` / `export_still`
     /// would draw ([`PlanMode::Still`]). Like them it renders the cut as
@@ -678,6 +704,21 @@ impl RenderPlan {
                     continue;
                 }
             };
+            // `pad` hands everything after it the whole padded frame, bars included. A pointwise
+            // effect (a grade, grayscale, invert) is a table, and the bars go through it like the
+            // picture; a blur, a sharpen and a mask see the bars as picture.
+            if geom.matte {
+                if layer.mask.is_some() {
+                    reasons.push(Unsupported::Matte(self.layer_ref(n, layer), "a mask"));
+                }
+                if let Some(what) = layer.effects.iter().find_map(|e| match e {
+                    VideoEffect::Blur { .. } => Some("a blur"),
+                    VideoEffect::Sharpen { .. } => Some("a sharpen"),
+                    _ => None,
+                }) {
+                    reasons.push(Unsupported::Matte(self.layer_ref(n, layer), what));
+                }
+            }
             // FFmpeg scales a picture in the format it has; the compositor scales the
             // 8-bit 4:2:0 a decode reduces it to, which is the same picture only when
             // that is what it already was (or gray, which has no chroma). For anything
@@ -795,11 +836,15 @@ impl RenderPlan {
                 };
                 out.push(Unsupported::GradedFullRange(at(), detail));
             }
-            if layer.effects.iter().any(|e| !caps.effects.contains(EffectKinds::of(e))) {
-                out.push(Unsupported::Effects(at()));
+            if let Some(what) = layer.effects.iter().find_map(|e| effect_refusal(e, caps)) {
+                out.push(Unsupported::Effects(at(), what));
             }
-            if layer.mask.is_some() && !caps.mask {
-                out.push(Unsupported::Mask(at()));
+            if layer.mask.is_some() {
+                if !caps.mask {
+                    out.push(Unsupported::Mask(at()));
+                } else if let Some(what) = self.mask_refusal(layer) {
+                    out.push(Unsupported::MaskWith(at(), what));
+                }
             }
             if (layer.reframe.is_some() || layer.projection.is_some()) && !caps.reframe {
                 out.push(Unsupported::Reframe(at()));
@@ -861,8 +906,16 @@ impl RenderPlan {
             if self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.color) && !caps.keyed_color {
                 out.push(Unsupported::KeyedColor(at()));
             }
-            if layer.animated.is_some_and(|a| a.zooms) && !caps.keyed_zoom {
-                if keyed {
+            if layer.animated.is_some_and(|a| a.zooms) {
+                if caps.keyed_zoom {
+                    // The compositor draws a grade, the effects and the mask it draws, and the fades
+                    // at the fit size and zooms after them. A rotation and an opacity below 1 are
+                    // the two it does not order that way: the rotated picture's alpha and the RGB
+                    // round trip would both have to be scaled with the zoom.
+                    if let Some(what) = self.zoom_order_refusal(layer) {
+                        out.push(Unsupported::ZoomBehind(at(), what));
+                    }
+                } else if keyed {
                     out.push(Unsupported::KeyedZoom(at()));
                 } else if !layer.color.is_identity()
                     || layer.transform.rotation != 0.0
@@ -871,7 +924,7 @@ impl RenderPlan {
                     || !layer.effects.is_empty()
                 {
                     // A still's moving zoom is only the one stage when nothing follows it.
-                    out.push(Unsupported::ZoomBehind(at()));
+                    out.push(Unsupported::ZoomBehind(at(), "a grade, rotation, opacity, mask or effect"));
                 }
             }
         }
@@ -906,6 +959,42 @@ impl RenderPlan {
             }
         }
         out
+    }
+
+    fn layer_ref(&self, index: usize, layer: &PlanLayer) -> LayerRef {
+        LayerRef {
+            index,
+            name: layer.name.clone(),
+        }
+    }
+
+    /// Why a compositor that draws masks still does not draw this layer's: the mask is `geq`
+    /// rewriting the alpha plane, ahead of `colorchannelmixer` (the RGB round trip an opacity below 1
+    /// takes, which is arithmetic on that alpha) and `rotate` (which turns the alpha plane with
+    /// the picture, a partly transparent edge included).
+    fn mask_refusal(&self, layer: &PlanLayer) -> Option<&'static str> {
+        let rotated =
+            layer.transform.rotation != 0.0 || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.rotates));
+        if rotated {
+            Some("on a rotated layer")
+        } else if layer.transform.opacity < 1.0 || layer.animated.is_some_and(|a| a.opacity) {
+            Some("on a layer below full opacity")
+        } else {
+            None
+        }
+    }
+
+    /// What is ahead of a moving zoom that a compositor with `keyed_zoom` still does not draw.
+    fn zoom_order_refusal(&self, layer: &PlanLayer) -> Option<&'static str> {
+        let rotated =
+            layer.transform.rotation != 0.0 || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.rotates));
+        if rotated {
+            Some("a rotation")
+        } else if layer.transform.opacity < 1.0 {
+            Some("an opacity below 1")
+        } else {
+            None
+        }
     }
 
     /// Whether the A0 compositor draws this frame exactly, **judged without the render

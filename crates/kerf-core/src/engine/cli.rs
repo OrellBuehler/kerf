@@ -5830,7 +5830,7 @@ fn mask_keep_expr(mask: &Mask) -> String {
 /// width or height that evaluates to 0 as "unset" and keeps the *input's* size, so a clip
 /// zoomed to 0.0004 of a frame would snap to full size instead of vanishing. The scale
 /// expressions only say `max(1, ...)` below it, so every ordinary graph is as it was.
-const TINY_SCALE: f64 = 0.01;
+const TINY_SCALE: f64 = crate::layer_geometry::TINY_SCALE;
 
 /// The `scale` that zooms a clip's picture by `factor`: a plain number for a constant zoom,
 /// else (`keyed`) an expression in `t` that is re-evaluated every frame.

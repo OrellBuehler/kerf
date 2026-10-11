@@ -12,6 +12,7 @@ pub mod error;
 pub mod fonts;
 pub mod frame_pick;
 pub mod layer_geometry;
+pub mod mask_plane;
 pub mod media;
 pub mod model;
 pub mod plan_caps;
@@ -58,6 +59,7 @@ pub use engine::{
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;
 pub use frame_pick::{fps_pick, seek_ticks, FpsPick, Pick, PickProgress, SourceFrames};
+pub use mask_plane::mask_alpha_plane;
 pub use media::{MediaResolver, OriginalMedia, ProxyMedia, SourceMedia};
 pub use model::{
     AnalysisKind, Asset, AssetAnalysis, AudioEffect, CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle,
