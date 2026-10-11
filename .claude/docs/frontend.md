@@ -508,12 +508,14 @@ export of a cut with a picture* and says nothing otherwise: `judgeable` is false
 containers, a GIF and a cut with no video clip, and the verdict is `null` for a cut with
 no length (the dialog and the Deliver panel both gate on it). With **no shape ticked** it is
 one neutral line stating the file and where it already fits — "1920×1080, 16:9, 0:20. Fine for
-YouTube and the web. Tick a shape under Deliver to for Reels, Shorts or TikTok." (the length floored
-like the timeline's clock; the platforms are the ones whose check had no `shape` issue at that
+YouTube and the web. Tick a shape under Deliver to for Reels, Shorts or TikTok." (the length rounded
+exactly as the platform messages round it, so "3:01" never sits beside "3:01 is over …" for a 180.6 s cut;
+the platforms are the ones whose check had no `shape` issue at that
 frame, so a 1:1 cut is "fine for YouTube Shorts and Instagram feed" and never told it is
 letterboxed) — and amber / red appear only for a *length* limit of a platform that frame is made for
-(the reach warning, the hard cap, the minimum). A low resolution and the muted-feed captions tip
-are folded tips, never amber (the captions tip is not given for YouTube). With **shapes ticked**
+(the reach warning, the hard cap, the minimum). A low resolution (one tip for the frame, naming every
+platform that would upscale it) and the muted-feed captions tip are folded tips, never amber (the
+captions tip is not given for YouTube). With **shapes ticked**
 each file is a row ("9:16 · Ready for Instagram Reels · YouTube Shorts · TikTok", then its length
 problems), judged only for the platforms that take that shape, and the single-file line is gone.
 The one shape sentence — "Instagram Reels, YouTube Shorts and TikTok are vertical (9:16). This 16:9
@@ -524,6 +526,9 @@ a reframe the user asked for and says nothing. The check is judged at the frame 
 will produce (`opts.resolution`, else the project's) and the length it will write (the marked In → out
 when chosen): `platform_check(width, height, range)` answers a `PlatformReport` — the targets *and*
 the `CutSummary` they judged, so the line states the file's real frame and length, not a second reading.
+Rust summarises the range on the *sliced* timeline the export builds (`Project::cut_summary_in`), so the
+frame, sound and titles are those of the span; the harness mirror (`exportSpan`, `api.ts`) clamps the
+span and re-reads the titles over it, and keeps the sample's frame and sound.
 There are no size rules: `kerf_core::platform` has length and shape limits only (TikTok's 500 MB / 2 GB
 caps are prose in its `notes`), so a size warning would need an engine estimate first.
 `kerf_core::platform` decides what each platform accepts; `platform-verdict.ts` only decides which of

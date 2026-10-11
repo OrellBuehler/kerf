@@ -51,16 +51,13 @@
 
 		{#if !hasClips}
 			<div style="margin-top:14px;font-size:12px;color:var(--text-muted);line-height:1.45">
-				Nothing to deliver yet — add a clip to the timeline and this panel checks it for the platforms you deliver to.
+				Nothing to deliver yet — add a clip to the timeline and this panel shows where it fits.
 			</div>
 		{/if}
 
 		{#if picture}
 			<SectionHead label="Deliver to" />
 			<DeliverTo where="named by shape beside the file you choose when you export, as" />
-		{/if}
-
-		{#if picture}
 			<Readiness />
 		{/if}
 	</div>

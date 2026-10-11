@@ -162,13 +162,13 @@ export function checkAll(cut: CutSummary): DeliveryCheck[] {
 	return TARGETS.map((t) => check(t, cut));
 }
 
-/** What an export of only `range` of the cut writes: the same cut, as long as the span, clamped the
- *  way the export clamps it — an empty or inverted span is the whole cut. */
-export function within(cut: CutSummary, range: { start: number; end: number } | null | undefined): CutSummary {
-	if (!range) return cut;
+/** `Timeline::export_span`: the span a range export writes — the range clamped to the cut, or `null`
+ *  when there is none or it is empty after clamping (the export then writes everything). */
+export function exportSpan(duration: number, range: { start: number; end: number } | null | undefined): [number, number] | null {
+	if (!range) return null;
 	const start = Math.max(0, range.start);
-	const end = Math.min(range.end, cut.duration);
-	return end - start > 1e-9 ? { ...cut, duration: end - start } : cut;
+	const end = Math.min(range.end, duration);
+	return end - start > 1e-9 ? [start, end] : null;
 }
 
 /** Every target's check with the cut it judged (`kerf_core::platform::report`). */

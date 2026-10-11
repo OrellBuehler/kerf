@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { check, checkAll, fmtDur, report, TARGETS, within } from './platforms';
+import { check, checkAll, exportSpan, fmtDur, report, TARGETS } from './platforms';
 import type { CutSummary } from './platforms';
 
 const target = (id: string) => TARGETS.find((t) => t.id === id)!;
@@ -80,25 +80,26 @@ describe('check', () => {
 	});
 });
 
-describe('within', () => {
-	// Mirrors the Rust tests of `CutSummary::within`.
-	test('a range is judged at its own length', () => {
-		const cut = vertical(4 * 60);
-		const span = within(cut, { start: 10, end: 30 });
-		expect(span.duration).toBe(20);
-		expect([span.width, span.height]).toEqual([cut.width, cut.height]);
-		expect(check(target('reels'), span).issues).toEqual([]);
-		expect(check(target('reels'), cut).issues).not.toEqual([]);
+describe('exportSpan', () => {
+	// Mirrors the Rust test of `Timeline::export_span`.
+	test('a range is the span the export writes, clamped to the cut', () => {
+		expect(exportSpan(60, null)).toBeNull();
+		expect(exportSpan(60, { start: 10, end: 30 })).toEqual([10, 30]);
+		expect(exportSpan(60, { start: -5, end: 20 })).toEqual([0, 20]);
+		expect(exportSpan(60, { start: 40, end: 500 })).toEqual([40, 60]);
 	});
 
-	test('a range is clamped to the cut the way the export clamps it', () => {
-		const cut = vertical(60);
-		expect(within(cut, { start: -5, end: 20 }).duration).toBe(20);
-		expect(within(cut, { start: 40, end: 500 }).duration).toBe(20);
-		expect(within(cut, { start: 10, end: 10 }).duration).toBe(60);
-		expect(within(cut, { start: 30, end: 10 }).duration).toBe(60);
-		expect(within(cut, { start: 90, end: 120 }).duration).toBe(60);
-		expect(within(cut, null).duration).toBe(60);
+	test('an empty, inverted or wholly-past-the-end range falls back to everything', () => {
+		expect(exportSpan(60, { start: 10, end: 10 })).toBeNull();
+		expect(exportSpan(60, { start: 30, end: 10 })).toBeNull();
+		expect(exportSpan(60, { start: 90, end: 120 })).toBeNull();
+	});
+
+	test('a span is judged at its own length', () => {
+		const span = exportSpan(4 * 60, { start: 10, end: 30 })!;
+		const cut = { ...vertical(span[1] - span[0]) };
+		expect(check(target('reels'), cut).issues).toEqual([]);
+		expect(check(target('reels'), vertical(4 * 60)).issues).not.toEqual([]);
 	});
 });
 

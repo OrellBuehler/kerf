@@ -110,7 +110,7 @@ import { clampCeiling, clampDuckDepth, clampMasterVolume, DEFAULT_MASTER, estima
 import { toFixedEven } from './format-fixed';
 import { fitMusicOnto, musicFitInputs, type FitSources } from './music-fit';
 import { sampleMusicAnalysis, SAMPLE_MUSIC_DURATION } from './sample-music';
-import { report as platformReport, within } from './platforms';
+import { exportSpan, report as platformReport } from './platforms';
 import { centeredCrop } from './smart-crop';
 import { synthWaveformRange } from './sample-waveform';
 import { analysisKindDone, ALL_KINDS } from './analysis-steps';
@@ -3199,18 +3199,16 @@ export async function platformCheck(
 	if (!inTauri()) {
 		const fmt = devTimeline.format;
 		const first = sampleAssets[0];
-		return platformReport(
-			within(
-				{
-					duration: timelineDuration(devTimeline),
-					width: frame?.[0] ?? fmt?.width ?? first.streams[0]?.width ?? 1920,
-					height: frame?.[1] ?? fmt?.height ?? first.streams[0]?.height ?? 1080,
-					has_audio: true,
-					has_text: (devTimeline.overlays ?? []).length > 0
-				},
-				range
-			)
-		);
+		const full = timelineDuration(devTimeline);
+		const span = exportSpan(full, range);
+		// A title counts when it is on screen somewhere in the span, as it is in the sliced cut the export builds.
+		return platformReport({
+			duration: span ? span[1] - span[0] : full,
+			width: frame?.[0] ?? fmt?.width ?? first.streams[0]?.width ?? 1920,
+			height: frame?.[1] ?? fmt?.height ?? first.streams[0]?.height ?? 1080,
+			has_audio: true,
+			has_text: (devTimeline.overlays ?? []).some((o) => !span || (o.end > span[0] && o.start < span[1]))
+		});
 	}
 	return invoke<PlatformReport>('platform_check', {
 		width: frame?.[0] ?? null,

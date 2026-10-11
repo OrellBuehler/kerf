@@ -86,10 +86,21 @@ describe('the default 16:9 export, no shape ticked', () => {
 		]);
 	});
 
-	test('states the length as the timeline’s clock does: floored, so 20.5 s is 0:20', () => {
-		expect(texts(verdict({ file: rep(1920, 1080, 20.5) }))[0]).toContain('16:9, 0:20.');
-		expect(texts(verdict({ file: rep(1920, 1080, 59.9) }))[0]).toContain('16:9, 0:59.');
+	test('states the length rounded like the platform messages, so the two agree', () => {
+		expect(texts(verdict({ file: rep(1920, 1080, 20.5) }))[0]).toContain('16:9, 0:21.');
+		expect(texts(verdict({ file: rep(1920, 1080, 59.4) }))[0]).toContain('16:9, 0:59.');
 		expect(texts(verdict({ file: rep(1920, 1080, 3725) }))[0]).toContain('16:9, 62:05.');
+	});
+
+	test('a cut just over a limit names the same length in the line and in the limit message', () => {
+		// 180.6 s: the neutral line and "… is over YouTube Shorts' 3:00 limit" must both say 3:01.
+		const v = verdict({ file: rep(1080, 1920, 180.6) });
+		const [head, ...limits] = texts(v);
+		expect(head).toContain('9:16, 3:01.');
+		expect(limits.some((t) => t.startsWith('3:01 is over YouTube Shorts'))).toBe(true);
+		for (const t of limits) expect(t).not.toContain('3:00 is');
+		const ticked = verdict({ shapes: [shape('9:16', 180.6)] });
+		expect(texts(ticked).some((t) => t.startsWith('3:01 is over YouTube Shorts'))).toBe(true);
 	});
 
 	test('carries no amber, no red and no tip: nothing about platforms nobody picked', () => {
@@ -119,12 +130,24 @@ describe('the default 16:9 export, no shape ticked', () => {
 		}
 	});
 
+	test('a low resolution that several platforms would upscale is one tip, not one each', () => {
+		const v = verdict({ file: rep(720, 1280) });
+		expect(levels(v)).toEqual(['note']);
+		const soft = v.tips.filter((t) => t.includes('upscale'));
+		expect(soft).toEqual([
+			'720×1280 is below the size Instagram Reels, YouTube Shorts and TikTok are made for; they will upscale it and it will look soft.'
+		]);
+		const ticked = verdict({ shapes: [{ label: '9:16', report: rep(720, 1280) }, { label: '9:16', report: rep(720, 1280) }] });
+		expect(ticked.tips.filter((t) => t.includes('upscale'))).toHaveLength(1);
+	});
+
 	test('a low resolution is a folded tip, not a warning', () => {
 		const v = verdict({ file: rep(1280, 720) });
 		expect(levels(v)).toEqual(['note']);
 		expect(texts(v)[0]).toBe('1280×720, 16:9, 0:20. Fine for YouTube and the web. Tick a shape under Deliver to for Reels, Shorts or TikTok.');
-		expect(v.tips).toHaveLength(1);
-		expect(v.tips[0]).toContain('upscale');
+		expect(v.tips).toEqual([
+			'1280×720 is below the size YouTube is made for; the platform will upscale it and it will look soft.'
+		]);
 	});
 });
 
@@ -330,7 +353,9 @@ describe('where the check is wired', () => {
 		expect(dialog).toContain("judgeable(opts, editor.timeline)");
 		expect(dialog.match(/<Readiness/g)).toHaveLength(1);
 		expect(dialog).toMatch(/\{#if judged\}\s*<Readiness/);
-		expect(read('DeliverPanel.svelte')).toMatch(/\{#if picture\}\s*<Readiness/);
+		const panel = read('DeliverPanel.svelte');
+		expect(panel.match(/\{#if picture\}/g)).toHaveLength(1);
+		expect(panel).toMatch(/\{#if picture\}[\s\S]*<Readiness \/>[\s\S]*\{\/if\}/);
 	});
 
 	test('the dialog hands it the frame and the range it will write', () => {

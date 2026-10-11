@@ -66,7 +66,7 @@ export function judgeable(opts: Pick<ExportOptions, 'container' | 'video_codec'>
 /** The platforms worth suggesting a shape for when the file is not one, in the order shown. */
 const SUGGEST = ['reels', 'shorts', 'tiktok'];
 
-/** How each platform is named in a short list; the label stands for anything not here. */
+/** How each platform is named in the "Tick a shape for …" hint; the check's own label stands for any not here. */
 const SHORT: Record<string, string> = {
 	reels: 'Reels',
 	shorts: 'Shorts',
@@ -84,9 +84,10 @@ const LONG_FORM = new Set(['youtube']);
 /** What a shape is called when naming the version to tick. */
 const SHAPE_NOUN: Record<string, string> = { '9:16': 'vertical', '1:1': 'square', '4:5': 'portrait' };
 
-/** `m:ss`, floored like the timeline's own clock (a 20.5 s cut reads 0:20 here and 00:20 there). */
+/** `m:ss`, rounded like the platform messages (`fmtDur`), so the length this line states and the one a
+ *  limit message names agree: a 180.6 s cut is 3:01 in both, never "3:00" beside "3:01 is over". */
 function clock(secs: number): string {
-	const s = Math.max(0, Math.floor(secs));
+	const s = Math.max(0, Math.round(secs));
 	return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
@@ -110,15 +111,26 @@ function nothingToJudge(report: PlatformReport): boolean {
 }
 
 /** Advice for the platforms a file is made for: captions for a feed that plays muted, softness for
- *  a frame below what the platform shows. Neither is a limit, so neither is amber. */
+ *  a frame below what the platforms show. Neither is a limit, so neither is amber. The softness is one
+ *  tip for the frame however many platforms would upscale it, not one per platform. */
 function tipsFor(reports: PlatformReport[]): string[] {
 	const out = new Set<string>();
-	for (const r of reports)
-		for (const c of r.targets.filter(takes))
-			for (const i of c.issues) {
-				if (i.kind === 'resolution') out.add(i.message);
-				if (i.kind === 'captions' && !LONG_FORM.has(c.target)) out.add(i.message);
-			}
+	for (const r of reports) {
+		const aimed = r.targets.filter(takes);
+		const soft = aimed.filter((c) => c.issues.some((i) => i.kind === 'resolution'));
+		if (soft.length) {
+			const many = soft.length > 1;
+			const names = list(
+				soft.map((c) => c.label),
+				'and'
+			);
+			out.add(
+				`${r.cut.width}×${r.cut.height} is below the size ${names} ${many ? 'are' : 'is'} made for; ${many ? 'they' : 'the platform'} will upscale it and it will look soft.`
+			);
+		}
+		for (const c of aimed)
+			for (const i of c.issues) if (i.kind === 'captions' && !LONG_FORM.has(c.target)) out.add(i.message);
+	}
 	return [...out];
 }
 
@@ -152,9 +164,9 @@ function singleFile(file: PlatformReport, project: PlatformReport | null): Verdi
 	const aimed = file.targets.filter(takes);
 	const ready = aimed.filter((c) => limits(c).length === 0);
 	const bars = barsLine(file, project);
-	const unmet = SUGGEST.filter((id) => {
+	const unmet = SUGGEST.flatMap((id) => {
 		const c = file.targets.find((t) => t.target === id);
-		return c !== undefined && !takes(c);
+		return c && !takes(c) ? [SHORT[id] ?? c.label] : [];
 	});
 
 	let text = `${width}×${height}, ${ratioLabel(width, height)}, ${clock(duration)}.`;
@@ -165,10 +177,7 @@ function singleFile(file: PlatformReport, project: PlatformReport | null): Verdi
 		)}.`;
 	else if (!aimed.length) text += ' No platform here takes this shape without bars.';
 	if (unmet.length && !bars)
-		text += ` Tick a shape under Deliver to for ${list(
-			unmet.map((id) => SHORT[id] ?? id),
-			'or'
-		)}.`;
+		text += ` Tick a shape under Deliver to for ${list(unmet, 'or')}.`;
 
 	return {
 		shape: null,
