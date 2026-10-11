@@ -405,3 +405,45 @@ button:disabled {
 	cursor: default;
 	color: var(--text-disabled);
 }
+
+/* ---------- Progress bars ---------- */
+
+/* `ProgressBar`: a track and a fill. Known progress fills to its width; unknown progress sweeps a
+   segment along the track (`data-indeterminate`) — and under reduced motion tints the whole track
+   instead, since a bar parked at some fraction would claim a progress it does not have. */
+.k-progress {
+	position: relative;
+	flex: 1;
+	min-width: 0;
+	height: var(--k-progress-h, 6px);
+	border-radius: calc(var(--k-progress-h, 6px) / 2);
+	background: var(--surface-inset);
+	overflow: hidden;
+}
+.k-progress > i {
+	display: block;
+	height: 100%;
+	background: var(--kerf-500);
+	transition: width var(--dur-fast) linear;
+}
+.k-progress[data-indeterminate] > i {
+	position: absolute;
+	left: 0;
+	width: 35%;
+	animation: k-progress-sweep 1.4s var(--ease-in-out) infinite;
+}
+@keyframes k-progress-sweep {
+	from {
+		transform: translateX(-100%);
+	}
+	to {
+		transform: translateX(290%);
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	.k-progress[data-indeterminate] > i {
+		animation: none;
+		width: 100%;
+		opacity: 0.4;
+	}
+}

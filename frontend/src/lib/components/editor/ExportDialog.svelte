@@ -2,6 +2,7 @@
 	import { onDestroy } from 'svelte';
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
+	import ProgressBar from './ProgressBar.svelte';
 	import SliderRow from './SliderRow.svelte';
 	import SectionHead from './SectionHead.svelte';
 	import DeliverTo from './DeliverTo.svelte';
@@ -656,13 +657,7 @@
 		<div style="display:flex;align-items:center;gap:8px;padding:12px 16px">
 			{#if rendering}
 				<div style="flex:1;display:flex;align-items:center;gap:10px">
-					<div style="flex:1;height:6px;border-radius:3px;background:var(--surface-inset);overflow:hidden">
-						<div
-							style="height:100%;width:{Math.round(
-								(progress?.fraction ?? 0) * 100
-							)}%;background:var(--kerf-500);transition:width var(--dur-fast) linear"
-						></div>
-					</div>
+					<ProgressBar value={progress?.waiting ? null : (progress?.fraction ?? 0)} label="Exporting" />
 					<span
 						data-testid="export-progress-text"
 						style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);min-width:104px;text-align:right"

@@ -5,6 +5,7 @@
 	import { untrack } from 'svelte';
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
+	import ProgressBar from './ProgressBar.svelte';
 	import SliderRow from './SliderRow.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
@@ -257,11 +258,7 @@
 								<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">{pct}%</span>
 							{/if}
 						</div>
-						<div style="height:6px;border-radius:3px;background:var(--surface-inset);overflow:hidden">
-							<div
-								style="height:100%;width:{pct ?? 30}%;background:var(--kerf-500);transition:width var(--dur-fast) linear"
-							></div>
-						</div>
+						<ProgressBar value={progress?.fraction ?? null} label="Generating the voiceover" />
 					</div>
 					<Btn variant="destructive" size="md" data-rescue disabled={cancelling} onclick={stop}>
 						{cancelling ? 'Stopping…' : 'Cancel'}

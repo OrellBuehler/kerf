@@ -7,6 +7,7 @@
 	import Icon from './Icon.svelte';
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
+	import ProgressBar from './ProgressBar.svelte';
 	import KeyboardSettings from './KeyboardSettings.svelte';
 	import { settings, CPU_PRESETS } from '$lib/settings.svelte';
 	import { gpuPreview } from '$lib/gpu-preview.svelte';
@@ -319,11 +320,7 @@
 								>{voProgress?.detail ?? ''}{voPct !== null ? ` · ${voPct}%` : ''}</span
 							>
 						</div>
-						<div style="height:6px;border-radius:3px;background:var(--surface-inset);overflow:hidden">
-							<div
-								style="height:100%;width:{voPct ?? 30}%;background:var(--kerf-500);transition:width var(--dur-fast) linear"
-							></div>
-						</div>
+						<ProgressBar value={voProgress?.fraction ?? null} label="Downloading the voice model" />
 					</div>
 				{/if}
 				<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">

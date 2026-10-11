@@ -6,6 +6,7 @@
 	// The render itself still goes through the full dialog (preset, destination,
 	// quality, range), which one button opens.
 	import Btn from './Btn.svelte';
+	import ProgressBar from './ProgressBar.svelte';
 	import SectionHead from './SectionHead.svelte';
 	import DeliverTo from './DeliverTo.svelte';
 	import Readiness from './Readiness.svelte';
@@ -69,11 +70,7 @@
 	>
 		{#if rendering}
 			<div style="flex:1;display:flex;align-items:center;gap:10px;min-width:0">
-				<div style="flex:1;height:6px;border-radius:3px;background:var(--surface-inset);overflow:hidden">
-					<div
-						style="height:100%;width:{Math.round((progress?.fraction ?? 0) * 100)}%;background:var(--kerf-500);transition:width var(--dur-fast) linear"
-					></div>
-				</div>
+				<ProgressBar value={progress?.waiting ? null : (progress?.fraction ?? 0)} label="Exporting" />
 				<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)"
 					>{#if progress?.total != null && progress.total > 1}{(progress.variant ?? 0) + 1}/{progress.total} · {/if}{Math.round(
 						(progress?.fraction ?? 0) * 100

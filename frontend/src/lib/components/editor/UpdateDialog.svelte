@@ -1,6 +1,7 @@
 <script lang="ts">
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
+	import ProgressBar from './ProgressBar.svelte';
 	import { updater } from '$lib/updater.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { confirmAction } from '$lib/api';
@@ -53,11 +54,7 @@
 			{/if}
 		{:else if u.phase === 'downloading'}
 			<div style="display:flex;align-items:center;gap:10px">
-				<div style="flex:1;height:6px;border-radius:3px;background:var(--surface-inset);overflow:hidden">
-					<div
-						style="height:100%;width:{pct ?? 30}%;background:var(--kerf-500);transition:width var(--dur-fast) linear"
-					></div>
-				</div>
+				<ProgressBar value={u.fraction} label="Downloading the update" />
 				<span
 					style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);min-width:110px;text-align:right"
 				>

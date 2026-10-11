@@ -5,6 +5,7 @@
 	// dialog says so up front, then names each stage as it runs — the voiceover dialog's arrangement.
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
+	import ProgressBar from './ProgressBar.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { cancelStems, onStemsProgress, stemsStatus } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
@@ -141,18 +142,7 @@
 								<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">{pct}%</span>
 							{/if}
 						</div>
-						<div
-							role="progressbar"
-							aria-label="Separating stems"
-							aria-valuemin="0"
-							aria-valuemax="100"
-							aria-valuenow={pct ?? undefined}
-							style="height:6px;border-radius:3px;background:var(--surface-inset);overflow:hidden"
-						>
-							<div
-								style="height:100%;width:{pct ?? 30}%;background:var(--kerf-500);transition:width var(--dur-fast) linear"
-							></div>
-						</div>
+						<ProgressBar value={progress?.fraction ?? null} label="Separating stems" />
 					</div>
 					<Btn variant="destructive" size="md" data-rescue disabled={cancelling} onclick={stop}>
 						{cancelling ? 'Stopping…' : 'Cancel'}
