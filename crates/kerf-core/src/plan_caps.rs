@@ -132,6 +132,55 @@ pub struct LayerRef {
     pub name: String,
 }
 
+/// How a dip to white is not drawn ([`Unsupported::DipToWhite`]). `Display` finishes the sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DipWhy {
+    /// The compositor has no round trip for it (`GpuCaps::dip_white`).
+    NoRoundTrip,
+    /// The chain is on an alpha plane (a rotation, an opacity, a dissolve or a mask): FFmpeg converts through
+    /// another RGB format.
+    AlphaPlane,
+    /// A black fade of the same clip runs ahead of it, a filter of its own in the YUV.
+    BlackFade,
+    /// The picture is not 8-bit limited-range `yuv420p`.
+    Format,
+    /// The picture's colour matrix has no measured round trip.
+    Matrix,
+    /// The layer is letterboxed: FFmpeg pads before the round trip, so the bars whiten too.
+    Letterboxed,
+    /// The picture has an odd side `(w, h)`: the round trip reads past it.
+    OddSize(u32, u32),
+    /// The scaler resizes the layer: the `scale` filter converts to RGB itself.
+    Resized,
+}
+
+impl fmt::Display for DipWhy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoRoundTrip => write!(f, "(fade through an RGB round trip)"),
+            Self::AlphaPlane => write!(
+                f,
+                "on an alpha plane (a rotation, an opacity, a dissolve or a mask in the same chain), where FFmpeg converts through another RGB format"
+            ),
+            Self::BlackFade => write!(f, "while a black fade of the same clip runs ahead of it"),
+            Self::Format => write!(
+                f,
+                "from a picture that is not 8-bit limited-range `yuv420p`, which FFmpeg converts to RGB from its own chroma grid and range (9 to 21 levels off the round trip the compositor draws on 9.0.2)"
+            ),
+            Self::Matrix => write!(f, "from a picture whose colour matrix has no measured round trip"),
+            Self::Letterboxed => write!(
+                f,
+                "on a letterboxed picture, whose black bars FFmpeg pads in before the round trip and so whitens too"
+            ),
+            Self::OddSize(w, h) => write!(f, "on a picture of odd size {w}x{h} (FFmpeg's RGB round trip reads past it)"),
+            Self::Resized => write!(
+                f,
+                "on a layer the scaler resizes (the scale filter converts to RGB itself, from chroma the compositor has already scaled)"
+            ),
+        }
+    }
+}
+
 /// Why a compositor cannot draw a frame exactly. `Display` is the message.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Unsupported {
@@ -171,12 +220,17 @@ pub enum Unsupported {
     /// A slide or push is moving the layer.
     Travel(LayerRef),
     /// A dip to white is in the layer's chain (`fade c=white`, through an RGB round trip) in a way the
-    /// compositor does not draw: the detail says how.
-    DipToWhite(LayerRef, String),
-    /// A full-range picture where FFmpeg 9 works on its raw values and converts the range later
-    /// (the detail says where): the composite colour policy is not the one that matches the
-    /// compositor's order (range first).
-    FullRangeNegotiated(LayerRef, &'static str),
+    /// compositor does not draw: [`DipWhy`] says how.
+    DipToWhite(LayerRef, DipWhy),
+    /// A full-range picture inside a fade, a dip or a dissolve where FFmpeg 9 works on its raw values
+    /// and converts the range afterwards (the composite colour policy is not the one that matches the
+    /// compositor's order, range first). A still's refusal; an export frame's is [`Unsupported::FullRangeCut`].
+    FullRangeNegotiated(LayerRef),
+    /// The cut holds a full-range picture where FFmpeg 9 works on raw values: the export as a whole is
+    /// flagged full range, every limited-range frame of it converted, and the full-range clip's own
+    /// kept raw. No frame of the cut, whatever it shows (a gap and a clip before the picture included),
+    /// is the compositor's limited-range one. An export frame's refusal; a plan-level one, not a layer's.
+    FullRangeCut,
     /// A full-range picture the scaler resizes, in an export frame or inside a fade (the detail says
     /// which): swscale converts the range inside the resize, from chroma the compositor has already
     /// converted and scaled, which reads up to 15 levels of chroma off (FFmpeg 6 as well as 9).
@@ -259,13 +313,17 @@ impl fmt::Display for Unsupported {
             ),
             Self::Travel(l) => write!(f, "{l}: moving through a slide or push transition"),
             Self::DipToWhite(l, why) => write!(f, "{l}: a dip to white {why}"),
+            Self::FullRangeNegotiated(l) => write!(
+                f,
+                "{l}: a full-range picture inside a fade, a dip or a dissolve, where FFmpeg 9 works on its raw values and converts the range afterwards"
+            ),
+            Self::FullRangeCut => write!(
+                f,
+                "the cut holds a full-range picture: FFmpeg 9 exports the whole stream as full range (its raw values kept, every limited-range frame converted), so no frame of it reads as drawn"
+            ),
             Self::FullRangeResized(l, where_) => write!(
                 f,
                 "{l}: a full-range picture {where_} that the scaler resizes (swscale converts its range inside the resize: chroma up to 15 levels off)"
-            ),
-            Self::FullRangeNegotiated(l, where_) => write!(
-                f,
-                "{l}: a full-range picture {where_}, where FFmpeg 9 works on its raw values and converts the range afterwards"
             ),
             Self::Tail(l) => write!(f, "{l}: playing on past its end under a transition"),
             Self::KeyedOpacity(l) => write!(f, "{l}: keyframed opacity (a geq alpha, whose rounding is not measured)"),

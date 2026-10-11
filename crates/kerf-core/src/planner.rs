@@ -333,6 +333,12 @@ impl Planner {
             })
             .collect();
 
+        let full_range_cut = clips.iter().any(|c| {
+            c.asset
+                .as_ref()
+                .and_then(|a| a.stream.as_ref())
+                .is_some_and(PlanStream::maybe_full_range)
+        });
         Ok(Self {
             mode: req.mode,
             canvas: PlanCanvas {
@@ -346,6 +352,7 @@ impl Planner {
                 pick_fps,
                 pix_fmt: geom.pix_fmt,
                 gif: opts.container == Container::Gif,
+                full_range_cut,
             },
             rendered,
             clips,
@@ -727,7 +734,7 @@ mod tests {
     use super::*;
     use crate::clip_timing::FadeTint;
     use crate::engine::test_support::{make_clip, single, test_asset, timeline_of, video_stream, video_track};
-    use crate::model::{Delivery, Fit, Framing, Keyframe, Mask, Track, Transform, Transition, TransitionKind};
+    use crate::model::{Clip, Delivery, Fit, Framing, Keyframe, Mask, Track, Transform, Transition, TransitionKind};
     use crate::plan_caps::{EffectKinds, GpuCaps, Unsupported};
     use crate::render_plan::active_video_clips;
     use crate::render_plan::RenderPlan;
@@ -1134,10 +1141,7 @@ mod tests {
         // A full-range clip is the raw values FFmpeg 9 exports; FFmpeg 6 converts at the decode.
         assert!(frame("yuvj420p", (640, 360), Fit::Contain, black, plain).is_empty());
         let why = frame("yuvj420p", (640, 360), Fit::Contain, black, bt);
-        assert!(
-            why.iter().any(|w| w.contains("full-range") && w.contains("export frame")),
-            "{why:?}"
-        );
+        assert!(why.iter().any(|w| w.contains("cut holds a full-range picture")), "{why:?}");
         assert!(frame("yuv420p", (1920, 1080), Fit::Contain, black, bt).is_empty());
         // A full-range clip the scaler resizes is refused in an export frame under FFmpeg 6 too.
         let why = frame("yuvj420p", (1920, 1080), Fit::Contain, black, plain);
@@ -1145,6 +1149,91 @@ mod tests {
             why.iter().any(|w| w.contains("scaler resizes") && w.contains("full-range")),
             "{why:?}"
         );
+    }
+
+    #[test]
+    fn a_full_range_clip_anywhere_in_the_cut_refuses_every_export_frame_where_ffmpeg_9_flags_the_export_full_range() {
+        let caps = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            ..GpuCaps::A0
+        };
+        let limited = asset();
+        let mut full = asset();
+        full.streams[0].pix_fmt = Some("yuvj420p".into());
+        let assets = [limited.clone(), full.clone()];
+        let cut = |clips: Vec<Vec<Clip>>, policy: CompositeColorPolicy, k: u64| {
+            let mut tl = single(Vec::new());
+            tl.tracks = clips
+                .into_iter()
+                .map(|c| {
+                    let mut t = Track::new(crate::model::StreamKind::Video, "V");
+                    t.clips = c;
+                    t
+                })
+                .collect();
+            let plan = Planner::new(
+                &tl,
+                &assets,
+                &opts(30.0),
+                PlanRequest {
+                    mode: PlanMode::Motion,
+                    ..PlanRequest::still(policy)
+                },
+            )
+            .unwrap()
+            .at_frame(k)
+            .unwrap();
+            (plan.layers.len(), plan.reasons(&caps, plan.size(u32::MAX)))
+        };
+        let (plain, bt) = (CompositeColorPolicy::FixedBt601, CompositeColorPolicy::BottomLayerTag);
+        let first = 30;
+        let cases: [(&str, Vec<Vec<Clip>>, u64); 5] = [
+            (
+                "black, then the full-range clip: a frame of the black clip",
+                vec![vec![make_clip(limited.id, 0.0, 4.0, 0.0), make_clip(full.id, 0.0, 4.0, 4.0)]],
+                first,
+            ),
+            (
+                "the full-range clip, then limited range: a frame of the limited clip",
+                vec![vec![make_clip(full.id, 0.0, 4.0, 0.0), make_clip(limited.id, 0.0, 4.0, 4.0)]],
+                30 * 6,
+            ),
+            (
+                "a full-range clip on another track, later: a frame before it",
+                vec![
+                    vec![make_clip(limited.id, 0.0, 8.0, 0.0)],
+                    vec![make_clip(full.id, 0.0, 2.0, 5.0)],
+                ],
+                first,
+            ),
+            (
+                "a gap before the full-range clip",
+                vec![vec![make_clip(full.id, 0.0, 2.0, 5.0)]],
+                first,
+            ),
+            (
+                "the full-range clip alone",
+                vec![vec![make_clip(full.id, 0.0, 2.0, 0.0)]],
+                first,
+            ),
+        ];
+        for (name, clips, k) in cases {
+            let (_, why) = cut(clips.clone(), bt, k);
+            assert!(why.contains(&Unsupported::FullRangeCut), "{name}: {why:?}");
+            assert!(
+                !why.iter().any(|w| matches!(w, Unsupported::FullRangeNegotiated(_))),
+                "{name}: a layer's own reason is a still's: {why:?}"
+            );
+            // FFmpeg 6 converts the range at the decode, as the compositor does.
+            let (_, why) = cut(clips, plain, k);
+            assert!(!why.contains(&Unsupported::FullRangeCut), "{name}: {why:?}");
+        }
+        // A cut of limited-range clips only is not the cut's business.
+        let (_, why) = cut(vec![vec![make_clip(limited.id, 0.0, 4.0, 0.0)]], bt, first);
+        assert!(!why.contains(&Unsupported::FullRangeCut), "{why:?}");
     }
 
     #[test]

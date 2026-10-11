@@ -69,7 +69,7 @@ pub use model::{
     VideoEffect, Voiceover, ADJACENT_EPS, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB,
     MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_CHANNEL_VOLUME, MIN_EDIT_CLIP,
 };
-pub use plan_caps::{EffectKinds, GpuCaps, LayerRef, Unsupported};
+pub use plan_caps::{DipWhy, EffectKinds, GpuCaps, LayerRef, Unsupported};
 pub use planner::{Handover, PlanRequest, Planner, SpanPlan, SpanRun};
 pub use platform::{
     check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind, PlatformTarget, Severity,
