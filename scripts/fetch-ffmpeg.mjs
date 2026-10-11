@@ -107,8 +107,9 @@ function sources({ btbn: BTBN, build: BTBN_BUILD, branch: BTBN_BRANCH, evermeet:
 
 // Mirrors rate-limit CI runners (evermeet answers 429 or refuses the connection
 // when several jobs fetch at once), so a refused or throttled request is retried
-// with backoff, honouring Retry-After. The digest check still guards the bytes.
-const ATTEMPTS = 6;
+// with backoff (about six and a half minutes in all), honouring Retry-After.
+// The digest check still guards the bytes.
+const ATTEMPTS = 8;
 
 async function download(url) {
   for (let attempt = 1; ; attempt++) {
@@ -134,7 +135,7 @@ async function download(url) {
 
 async function backoff(attempt, retryAfter, why) {
   const asked = Number(retryAfter);
-  const ms = Number.isFinite(asked) && asked > 0 ? Math.min(asked, 120) * 1000 : Math.min(2 ** attempt * 2500, 60_000);
+  const ms = Number.isFinite(asked) && asked > 0 ? Math.min(asked, 120) * 1000 : Math.min(2 ** attempt * 2500, 120_000);
   console.log(`  ${why}; retrying in ${Math.round(ms / 1000)}s`);
   await Bun.sleep(ms);
 }
