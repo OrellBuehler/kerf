@@ -49,12 +49,22 @@ pub(crate) const HEAD_PADDED_SUFFIX: &str = ".lead.mp4";
 /// trims (see `video_clip_chain`). An original, or any proxy that was not padded,
 /// does not match, and its argv and graph are what they always were.
 pub(crate) fn is_head_padded_proxy(path: &str) -> bool {
+    is_proxy_named(path, HEAD_PADDED_SUFFIX)
+}
+
+/// Whether `path` is a preview proxy of either kind (pure, unit-tested):
+/// `.../kerf/proxies/<16 hex digits>.mp4` or its head-padded `.lead.mp4`. That a
+/// file is a proxy is, like the pad, a fact about the file that travels in its
+/// name: whatever decodes it (a scrubbed still, the playback stream) is reading a
+/// small all-intra H.264 where a hardware decoder's start-up costs more than the
+/// decode, and has only the path in its argv.
+pub(crate) fn is_cache_proxy(path: &str) -> bool {
+    is_proxy_named(path, HEAD_PADDED_SUFFIX) || is_proxy_named(path, ".mp4")
+}
+
+fn is_proxy_named(path: &str, suffix: &str) -> bool {
     let path = Path::new(path);
-    let Some(hash) = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .and_then(|n| n.strip_suffix(HEAD_PADDED_SUFFIX))
-    else {
+    let Some(hash) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(suffix)) else {
         return false;
     };
     let dir = |p: Option<&Path>| p.and_then(|p| p.file_name()).and_then(|n| n.to_str()).map(str::to_owned);
@@ -981,6 +991,23 @@ mod tests {
         assert!(!is_head_padded_proxy(&format!("/cache/proxies/{hash}.lead.mp4")));
         assert!(!is_head_padded_proxy("/cache/kerf/proxies/short.lead.mp4"));
         assert!(!is_head_padded_proxy("/media/clip.lead.mp4"));
+    }
+
+    #[test]
+    fn a_cache_proxy_is_told_by_its_path_alone() {
+        let hash = "0123456789abcdef";
+        assert!(is_cache_proxy(&format!("/cache/kerf/proxies/{hash}.mp4")));
+        assert!(is_cache_proxy(&format!("/cache/kerf/proxies/{hash}{HEAD_PADDED_SUFFIX}")));
+        assert!(is_cache_proxy(&format!("/cache/kerf/proxies/{}.mp4", hash.to_uppercase())));
+        assert!(!is_cache_proxy(&format!("/cache/kerf/elsewhere/{hash}.mp4")));
+        assert!(!is_cache_proxy(&format!("/cache/proxies/{hash}.mp4")));
+        assert!(!is_cache_proxy(&format!("/cache/kerf/proxies/{hash}.mov")));
+        assert!(!is_cache_proxy(&format!("/cache/kerf/proxies/{hash}.mp4.part")));
+        assert!(!is_cache_proxy("/cache/kerf/proxies/short.mp4"));
+        assert!(!is_cache_proxy("/media/clip.mp4"));
+        assert!(!is_cache_proxy(""));
+        assert!(is_head_padded_proxy(&format!("/cache/kerf/proxies/{hash}.lead.mp4")));
+        assert!(!is_head_padded_proxy(&format!("/cache/kerf/proxies/{hash}.mp4")));
     }
 
     #[test]

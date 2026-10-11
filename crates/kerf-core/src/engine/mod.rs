@@ -52,6 +52,12 @@ pub(crate) mod test_support;
 // and the thread / priority caps every ffmpeg run is launched under.
 pub mod cpu;
 
+// Which hardware decoder each input of a run is asked for, and what a one-frame read of a
+// preview proxy is capped to: decided at spawn from what is known of the file, never in the
+// argv builders.
+mod decode_policy;
+pub use decode_policy::limit_frame_args;
+
 // Audio analysis (loudness, energy, onsets, tempo, classification): CLI/PCM
 // based, available in every build like the rest of `cli`.
 mod audio;
