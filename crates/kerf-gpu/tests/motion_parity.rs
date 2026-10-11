@@ -1811,6 +1811,43 @@ fn a_dissolve_into_a_moving_zoom_ramps_the_alpha_at_the_fit_size() {
     }
 }
 
+/// The outgoing clip zooms while the incoming one comes over it: the tail of a zooming clip (its keys run
+/// on past its end under the transition), a dissolve's ramp on the other layer, a slide's travel over a
+/// layer that is itself being scaled, and a mask on the zoomer.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_moving_zoom_on_the_outgoing_clip_under_a_transition() {
+    let m = media();
+    let assets = [m.testsrc.clone(), m.bars.clone()];
+    for (name, kind, mask) in [
+        ("dissolve", TransitionKind::Crossfade, None),
+        ("dip", TransitionKind::DipToBlack, None),
+        ("slide", TransitionKind::SlideLeft, None),
+        ("push", TransitionKind::PushRight, None),
+        (
+            "dissolve, masked",
+            TransitionKind::Crossfade,
+            Some(mask_of(kerf_core::MaskShape::Rect, 0.15, false)),
+        ),
+    ] {
+        let mut out = zooming(&m.testsrc, 1.0, 1.4, (0.0, 0.0));
+        out.mask = mask;
+        let mut inc = clip(&m.bars, 0.5, 1.5, 1.0);
+        inc.transition_in = Some(Transition { kind, duration: 0.5 });
+        let tl = timeline(vec![vec![out, inc]], None);
+        check_motion(Check {
+            case: &format!("zoom out/{name}"),
+            tl: &tl,
+            assets: &assets,
+            opts: at_fps(30.0),
+            frames: upto(2.0, 30.0),
+            limits: if mask.is_some() { ZOOMED_MASK } else { SCALED },
+            look: &[33, 40],
+            rotated: false,
+        });
+    }
+}
+
 /// A rotation, an opacity below 1 or a dip to white in front of a moving zoom is the order the compositor
 /// does not have: the rotated picture's alpha (or the RGB round trip) would have to be scaled with the zoom,
 /// and the zoom's `scale` takes the RGB frame `fade c=white` leaves and converts it in the same pass (up to
