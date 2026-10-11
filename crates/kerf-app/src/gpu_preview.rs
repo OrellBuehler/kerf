@@ -1267,36 +1267,55 @@ const ABANDONED: u8 = 2;
 ///
 /// A task that reaches the main thread after the deadline does **not** run `work`: what it makes
 /// (a layer on the content view) would outlive everything that could remove it, and every retry
-/// would add another. A task that has already started when the deadline passes is waited for once
-/// more instead, since it cannot be called back and its result is the only handle on what it made.
+/// would add another. The same goes for a task `post` queued and then reported as failed. A task
+/// that has already started when the deadline passes is waited for for half a deadline more, since
+/// it cannot be called back and its result is the only handle on what it made; the two waits add up
+/// to one and a half deadlines, which is why the app's 5 s fits inside [`BUILD_DEADLINE`].
 fn on_main_thread<T: Send + 'static>(
     post: impl FnOnce(Box<dyn FnOnce() + Send>) -> Result<(), String>,
     deadline: Duration,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, String> {
+    on_main_thread_with_grace(post, deadline, deadline / 2, work)
+}
+
+/// [`on_main_thread`] with the extra wait for a task that has started given, so a test can make
+/// it generous without making the deadline long.
+fn on_main_thread_with_grace<T: Send + 'static>(
+    post: impl FnOnce(Box<dyn FnOnce() + Send>) -> Result<(), String>,
+    deadline: Duration,
+    grace: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
     let (tx, rx) = mpsc::channel();
     let state = Arc::new(AtomicU8::new(PENDING));
     let claim = Arc::clone(&state);
-    post(Box::new(move || {
+    let posted = post(Box::new(move || {
         if claim
             .compare_exchange(PENDING, RUNNING, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
             let _ = tx.send(catch_unwind(AssertUnwindSafe(work)));
         }
-    }))?;
+    }));
+    if let Err(refused) = posted {
+        state.store(ABANDONED, Ordering::SeqCst);
+        return Err(refused);
+    }
+    let mut waited = deadline;
     let mut answer = rx.recv_timeout(deadline);
     if matches!(answer, Err(RecvTimeoutError::Timeout))
         && state
             .compare_exchange(PENDING, ABANDONED, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
     {
-        answer = rx.recv_timeout(deadline);
+        waited += grace;
+        answer = rx.recv_timeout(grace);
     }
     match answer {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(payload)) => Err(format!("panicked on the main thread: {}", panic_text(payload.as_ref()))),
-        Err(RecvTimeoutError::Timeout) => Err(format!("the main thread did not answer within {} s", deadline.as_secs_f64())),
+        Err(RecvTimeoutError::Timeout) => Err(format!("the main thread did not answer within {} s", waited.as_secs_f64())),
         Err(RecvTimeoutError::Disconnected) => Err("the main thread dropped the task".into()),
     }
 }
@@ -1486,37 +1505,69 @@ mod tests {
         let late = on_main_thread(
             move |task| {
                 std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(400));
+                    std::thread::sleep(Duration::from_millis(1500));
                     task();
                     let _ = finished_tx.send(());
                 });
                 Ok(())
             },
-            Duration::from_millis(100),
+            Duration::from_millis(300),
             move || flag.store(true, Ordering::SeqCst),
         )
         .unwrap_err();
-        assert!(late.contains("did not answer within 0.1 s"), "{late}");
-        assert!(started.elapsed() < Duration::from_millis(350), "waited past the deadline");
+        assert!(late.contains("did not answer within 0.3 s"), "{late}");
+        assert!(started.elapsed() < Duration::from_millis(1000), "waited past the deadline");
         finished_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(30))
             .expect("the late task never ran at all");
         assert!(!ran.load(Ordering::SeqCst), "a layer made now would never be removed");
     }
 
     #[test]
+    fn a_task_that_was_queued_and_then_reported_as_failed_does_not_run_its_work() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        let queued = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&queued);
+        let err = on_main_thread(
+            move |task| {
+                *lock(&slot) = Some(task);
+                Err("the loop refused it after queueing".to_string())
+            },
+            Duration::from_secs(1),
+            move || flag.store(true, Ordering::SeqCst),
+        )
+        .unwrap_err();
+        assert_eq!(err, "the loop refused it after queueing");
+        let task = lock(&queued).take().expect("the task was queued");
+        task();
+        assert!(!ran.load(Ordering::SeqCst), "nobody waits for what this would make");
+    }
+
+    #[test]
     fn a_task_already_running_at_the_deadline_is_waited_for_once_more() {
-        let got = on_main_thread(loop_thread, Duration::from_millis(300), || {
-            std::thread::sleep(Duration::from_millis(500));
+        let got = on_main_thread_with_grace(loop_thread, Duration::from_secs(1), Duration::from_secs(20), || {
+            std::thread::sleep(Duration::from_millis(1500));
             "made"
         });
         assert_eq!(got, Ok("made"));
-        // But not for ever: a second deadline ends the wait.
-        let stuck = on_main_thread(loop_thread, Duration::from_millis(100), || {
-            std::thread::sleep(Duration::from_millis(800));
+    }
+
+    #[test]
+    fn the_wait_for_a_running_task_is_bounded_and_the_message_gives_the_total() {
+        let started = Instant::now();
+        let stuck = on_main_thread_with_grace(loop_thread, Duration::from_millis(300), Duration::from_millis(200), || {
+            std::thread::sleep(Duration::from_secs(4));
         })
         .unwrap_err();
-        assert!(stuck.contains("did not answer"), "{stuck}");
+        assert!(stuck.contains("did not answer within 0.5 s"), "{stuck}");
+        assert!(started.elapsed() < Duration::from_secs(3), "waited for the whole task");
+        // The default grace is half a deadline: 1.5 deadlines in all.
+        let stuck = on_main_thread(loop_thread, Duration::from_millis(400), || {
+            std::thread::sleep(Duration::from_secs(4));
+        })
+        .unwrap_err();
+        assert!(stuck.contains("did not answer within 0.6 s"), "{stuck}");
     }
 
     #[test]
