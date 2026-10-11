@@ -190,7 +190,8 @@ FFmpeg graph reads), **releases it**, plans the frame (`Planner` over `ProxyMedi
 measured colour policy) and answers `{renderer: 'gpu' | 'ffmpeg', frame?, reasons,
 timings?}`: the GPU when `RenderPlan::reasons(caps, size)` is empty and everything works,
 else FFmpeg's JPEG **of that frame, in the same call**, with the plan's reasons (a refusal
-is not an error). The device, compositor, `FrameSource` and presenter are built lazily by
+is not an error). Titles and captions are part of what the compositor draws (`caps.text`: FFmpeg rasterises each distinct
+overlay once and the GPU blends it, `gpu.md`); a frame is refused for text only under 12 px or in a named font with no bold face. The device, compositor, `FrameSource` and presenter are built lazily by
 the first frame that wants them and dropped together (`Backend`); a build failure is
 remembered with a backoff (5 s doubling to 5 min, `Backoff`), a `DeviceLost` or any error
 that says the device or surface is gone (`react`) drops the backend and rebuilds it on the
