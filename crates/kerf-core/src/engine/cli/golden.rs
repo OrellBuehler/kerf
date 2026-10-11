@@ -221,7 +221,7 @@ rate-crf -crf
 rate-vp9-constant-quality -b:v 0
 rate-nvenc-vbr -rc vbr
 rate-nvenc-cq -cq
-rate-qsv -global_quality
+rate-qsv _qsv -global_quality
 rate-videotoolbox -q:v
 rate-amf-cqp -qp_i
 rate-amf-quality -quality quality

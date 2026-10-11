@@ -282,15 +282,39 @@ const VAAPI_DEVICES_TRIED: usize = 4;
 /// How long one candidate gets to encode a single frame.
 const HW_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long the `-encoders` listing gets. Longer than a test encode: the first launch of a
+/// freshly installed ffmpeg can sit under a virus scan, and an answer given up on is cached for
+/// the whole process as "no hardware encoders".
+const HW_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long an export waits for the probe to name the VAAPI device when nothing has probed yet.
+const VAAPI_DEVICE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// What the one-per-process hardware encoder probe found.
 struct HwProbe {
     encoders: Vec<String>,
     vaapi_device: Option<String>,
 }
 
+static HW_PROBE: OnceLock<HwProbe> = OnceLock::new();
+
 fn hw_probe() -> &'static HwProbe {
-    static PROBE: OnceLock<HwProbe> = OnceLock::new();
-    PROBE.get_or_init(detect_hw_encoders)
+    HW_PROBE.get_or_init(detect_hw_encoders)
+}
+
+/// The value of `cell` once something has set it, waiting up to `limit` (unit-tested over a
+/// local cell).
+fn wait_for<T>(cell: &OnceLock<T>, limit: std::time::Duration) -> Option<&T> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(value) = cell.get() {
+            return Some(value);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// The hardware video encoders this machine's ffmpeg can actually use, probed
@@ -304,9 +328,18 @@ pub fn hw_encoders() -> &'static [String] {
     &hw_probe().encoders
 }
 
-/// The render node the VAAPI encoders in [`hw_encoders`] were verified on.
-fn vaapi_device() -> Option<&'static str> {
-    hw_probe().vaapi_device.as_deref()
+/// The render node the VAAPI encoders in [`hw_encoders`] were verified on. An export that is
+/// the first to ask starts the probe on its own thread and waits [`VAAPI_DEVICE_WAIT`] for it,
+/// not for its worst case (a hung driver is minutes): `None` leaves the builder's stand-in node
+/// in the argv, and the probe goes on for the exports after.
+fn vaapi_device_within(limit: std::time::Duration) -> Option<&'static str> {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        std::thread::spawn(|| {
+            hw_probe();
+        });
+    });
+    wait_for(&HW_PROBE, limit)?.vaapi_device.as_deref()
 }
 
 fn detect_hw_encoders() -> HwProbe {
@@ -320,7 +353,7 @@ fn detect_hw_encoders() -> HwProbe {
     let bin = ffmpeg_bin();
     let mut list = command(&bin);
     list.args(["-hide_banner", "-v", "error", "-encoders"]);
-    let Some(listed) = run_piped_until(&mut list, Vec::new(), Instant::now() + HW_PROBE_TIMEOUT) else {
+    let Some(listed) = run_piped_until(&mut list, Vec::new(), Instant::now() + HW_LIST_TIMEOUT) else {
         return nothing();
     };
     let listed = String::from_utf8_lossy(&listed).into_owned();
@@ -2239,8 +2272,8 @@ pub fn set_proxy_base_width(width: u32) {
 
 /// The proxy width for an asset when flat proxies are `base` wide (pure,
 /// unit-tested): `base` itself, or for a spherical source the same ratio the
-/// default has (3072 for 1280), never past [`PROXY_MAX_WIDTH_SPHERICAL`] — the
-/// hardware H.264 encoders stop at 4096 across and one refusal turns them all off.
+/// default has (3072 for 1280), never past [`PROXY_MAX_WIDTH_SPHERICAL`]. (The cap dates from
+/// proxies that were hardware-encoded, which stops at 4096 across; it stays.)
 pub fn proxy_width_for(projection: Option<Projection>, base: u32) -> u32 {
     if projection.is_some_and(|p| p.is_spherical()) {
         (base.saturating_mul(PROXY_MAX_WIDTH_SPHERICAL) / PROXY_MAX_WIDTH).min(PROXY_MAX_WIDTH_SPHERICAL)
@@ -2421,19 +2454,35 @@ fn quality_args(vc: &str, crf: u32) -> Vec<String> {
             let qp = crf.to_string();
             vec![s("-rc"), s("cqp"), s("-qp_i"), qp.clone(), s("-qp_p"), qp]
         }
-        EncFamily::Vaapi => vec![s("-rc_mode"), s("CQP"), s("-global_quality"), crf.to_string()],
+        EncFamily::Vaapi => unreachable!("a stitch or a proxy has no upload for a VAAPI encoder"),
     }
 }
 
 /// Encoder input pixel format: the hardware encoders all take `nv12` (some take
 /// nothing else), the software path keeps its historical `yuv420p`. Both are
-/// 4:2:0, so the decoded proxy looks the same either way.
+/// 4:2:0, so the decoded proxy looks the same either way. (A VAAPI encoder is fed by an
+/// upload the export graph ends in, which a stitch and a proxy do not have.)
 fn encode_pix_fmt(vc: &str) -> &'static str {
-    if enc_family(vc) == EncFamily::Software {
-        "yuv420p"
-    } else {
-        "nv12"
+    match enc_family(vc) {
+        EncFamily::Software => "yuv420p",
+        EncFamily::Vaapi => unreachable!("a stitch or a proxy has no upload for a VAAPI encoder"),
+        _ => "nv12",
     }
+}
+
+/// The proxy's argv as [`generate_proxy_with`] runs it: [`build_proxy_args`] with the encoder
+/// fixed to `libx264`. A proxy is never hardware-encoded, whatever encoders the machine has
+/// (pinned by a test over every combination of the other inputs).
+fn proxy_encode_args(
+    src: &str,
+    dst: &str,
+    threads: usize,
+    width: u32,
+    hw_decode: Option<&str>,
+    tonemap: Option<&str>,
+    head_pad: Option<&str>,
+) -> Vec<String> {
+    build_proxy_args(src, dst, threads, width, "libx264", hw_decode, tonemap, head_pad)
 }
 
 /// Build the ffmpeg argument list (pure, unit-tested) that transcodes `src` into
@@ -2633,17 +2682,8 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
     let traits = source_traits(src).unwrap_or_default();
     let tonemap = traits.hdr.map(tonemap_filter);
     let head_pad = needs_head_pad(traits.lead).then(fps_mode_flag);
-    let mut run = |encoder: &str, hw_decode: Option<&str>| -> Result<Streamed> {
-        let mut args = build_proxy_args(
-            src_str,
-            tmp_str,
-            threads,
-            width,
-            encoder,
-            hw_decode,
-            tonemap.as_deref(),
-            head_pad,
-        );
+    let mut run = |hw_decode: Option<&str>| -> Result<Streamed> {
+        let mut args = proxy_encode_args(src_str, tmp_str, threads, width, hw_decode, tonemap.as_deref(), head_pad);
         cpu::limit_args(&mut args, threads);
         run_ffmpeg_streamed(&bin, &args, duration, EXPORT_STALL, &mut *progress, cancel)
     };
@@ -2652,7 +2692,7 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
     // about 0.4 CPU-s, writes proxies a third larger, and one refusal used to turn hardware
     // encoding off for the whole process. A decode failure falls back to software once.
     let hw_dec = decode_hwaccel_for(src, Reading::Whole);
-    let mut output = run("libx264", hw_dec.as_deref())?;
+    let mut output = run(hw_dec.as_deref())?;
     if output.outcome == StreamOutcome::Cancelled {
         let _ = std::fs::remove_file(&tmp);
         return Err(Error::Cancelled);
@@ -2668,7 +2708,7 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         } else {
             output.stderr.trim().to_string()
         };
-        output = run("libx264", None)?;
+        output = run(None)?;
         if output.outcome == StreamOutcome::Cancelled {
             let _ = std::fs::remove_file(&tmp);
             return Err(Error::Cancelled);
@@ -4899,7 +4939,7 @@ fn retry_export_in_software(
 /// still asks for hardware decode.
 fn tune_export_args(args: &mut Vec<String>, assets: &[Asset], os: HostOs) -> bool {
     if args.iter().any(|a| a == "-vaapi_device") {
-        set_vaapi_device(args, vaapi_device());
+        set_vaapi_device(args, vaapi_device_within(VAAPI_DEVICE_WAIT));
     }
     tune_inputs(args, os, Reading::Whole, &facts_from_assets(assets)).hw
 }
@@ -12605,7 +12645,7 @@ mod tests {
     #[test]
     fn a_probe_that_refuses_aborts_or_hangs_is_told_apart_and_a_hang_is_killed() {
         let scratch = Scratch::new("probe");
-        let limit = std::time::Duration::from_millis(600);
+        let limit = std::time::Duration::from_secs(3);
         let probe = |body: &str| run_probe(&probe_script(&scratch, "p.sh", body), &[], limit);
         assert_eq!(probe("exit 0"), Probe::Works);
         assert_eq!(probe("exit 234"), Probe::Refused);
@@ -12614,7 +12654,7 @@ mod tests {
         let started = Instant::now();
         assert_eq!(probe("exec sleep 30"), Probe::Hung);
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
+            started.elapsed() < std::time::Duration::from_secs(20),
             "it waited for the driver"
         );
         assert_eq!(
@@ -12628,7 +12668,7 @@ mod tests {
     #[test]
     fn vaapi_takes_the_first_render_node_that_encodes_and_gives_up_a_hung_one() {
         let scratch = Scratch::new("vaapi-nodes");
-        let limit = std::time::Duration::from_millis(600);
+        let limit = std::time::Duration::from_secs(3);
         let all = ["h264_vaapi", "hevc_vaapi", "av1_vaapi", "h264_amf"];
         let compiled: std::collections::HashSet<&str> = all.into_iter().collect();
         let nodes = |names: &[&str]| names.iter().map(|n| format!("/dev/dri/{n}")).collect::<Vec<_>>();
@@ -12666,7 +12706,7 @@ mod tests {
         assert_eq!(device.as_deref(), Some("/dev/dri/renderD129"));
         assert_eq!(found.len(), 3);
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
+            started.elapsed() < std::time::Duration::from_secs(20),
             "the hung node held the probe"
         );
     }
@@ -12675,7 +12715,7 @@ mod tests {
     #[test]
     fn a_family_is_asked_one_encoder_at_a_time_and_stops_at_a_hang() {
         let scratch = Scratch::new("family");
-        let limit = std::time::Duration::from_millis(600);
+        let limit = std::time::Duration::from_secs(3);
         let compiled: std::collections::HashSet<&str> = ["h264_amf", "hevc_amf", "av1_amf", "h264_nvenc"].into_iter().collect();
         let works_but_hevc = probe_script(&scratch, "amf.sh", "case \"$*\" in *hevc_amf*) exit 1;; *) exit 0;; esac");
         // Only AMF's own encoders are asked, in candidate order.
@@ -12687,9 +12727,57 @@ mod tests {
         let hangs = probe_script(&scratch, "hang.sh", "exec sleep 30");
         assert!(probe_family(&hangs, EncFamily::Amf, &compiled, limit).is_empty());
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed() < std::time::Duration::from_secs(7),
             "three hung probes would take three limits"
         );
+    }
+
+    #[test]
+    fn a_wait_for_a_probe_that_is_still_running_gives_up_and_one_that_finishes_is_read() {
+        let late: OnceLock<u32> = OnceLock::new();
+        let never: OnceLock<u32> = OnceLock::new();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let _ = late.set(7);
+            });
+            assert_eq!(wait_for(&late, std::time::Duration::from_secs(30)), Some(&7));
+        });
+        assert_eq!(
+            wait_for(&late, std::time::Duration::ZERO),
+            Some(&7),
+            "already set: no waiting"
+        );
+        let started = Instant::now();
+        assert_eq!(wait_for(&never, std::time::Duration::from_millis(100)), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn only_encoders_that_take_system_memory_frames_are_candidates_for_a_stitch() {
+        for encoder in HW_ENCODER_CANDIDATES {
+            assert_ne!(enc_family(encoder), EncFamily::Vaapi, "{encoder}");
+            assert_ne!(enc_family(encoder), EncFamily::Software, "{encoder}");
+        }
+        assert!(VAAPI_ENCODER_CANDIDATES.iter().all(|e| enc_family(e) == EncFamily::Vaapi));
+        assert!(!HW_ENCODER_CANDIDATES.iter().any(|e| VAAPI_ENCODER_CANDIDATES.contains(e)));
+    }
+
+    #[test]
+    fn a_proxy_is_never_hardware_encoded_whatever_else_it_asks_for() {
+        let hardware = ["_nvenc", "_qsv", "_videotoolbox", "_amf", "_vaapi"];
+        for hw_decode in [None, Some("auto"), Some("d3d11va"), Some("vaapi")] {
+            for tonemap in [None, Some("zscale=t=linear")] {
+                for head_pad in [None, Some("-fps_mode")] {
+                    let args = proxy_encode_args("/in.mov", "/out.mp4", 3, 1280, hw_decode, tonemap, head_pad);
+                    let at = args.iter().position(|a| a == "-c:v").expect("an encoder");
+                    assert_eq!(args[at + 1], "libx264", "{hw_decode:?} {tonemap:?} {head_pad:?}");
+                    assert!(!args.iter().any(|a| hardware.iter().any(|h| a.ends_with(h))), "{args:?}");
+                    assert_eq!(args.contains(&"-hwaccel".to_string()), hw_decode.is_some(), "decode stays");
+                    assert_eq!(flag_val(&args, "-g"), Some("1"));
+                }
+            }
+        }
     }
 
     #[test]
@@ -14309,7 +14397,7 @@ mod tests {
         let vaapi = found.iter().any(|e| enc_family(e) == EncFamily::Vaapi);
         assert_eq!(
             vaapi,
-            vaapi_device().is_some(),
+            hw_probe().vaapi_device.is_some(),
             "a VAAPI encoder is verified on a device, and only then"
         );
         if !Path::new("/dev/dri").exists() {

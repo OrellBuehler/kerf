@@ -1107,7 +1107,9 @@ struct ExportParams {
                        (libx264/libx265/libvpx-vp9/libsvtav1/prores_ks/gif, plus GPU encoders \
                        h264_nvenc/hevc_nvenc/av1_nvenc/h264_qsv/hevc_qsv/av1_qsv/h264_videotoolbox/\
                        hevc_videotoolbox/h264_amf/hevc_amf/av1_amf/h264_vaapi/hevc_vaapi/av1_vaapi — \
-                       far faster, crf still applies; use only the ones export_capabilities lists); \
+                       far faster, crf still applies; use only the ones export_capabilities lists — \
+                       a VAAPI codec on a machine nothing has probed yet waits up to 10 s for the probe \
+                       to find the render node); \
                        audio_codec (aac/libmp3lame/libopus/flac/alac/pcm_s16le/pcm_s24le); \
                        rate_control (crf/bitrate/two_pass/lossless); crf; video_bitrate (\"8M\"); \
                        preset; hwaccel (\"auto\"/\"cuda\"/\"vaapi\"/\"videotoolbox\"/\"qsv\" — GPU \
