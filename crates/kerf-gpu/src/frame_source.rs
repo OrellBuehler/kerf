@@ -232,6 +232,12 @@ struct State {
     oneshots: usize,
     stats: SourceStats,
     closed: bool,
+    /// Counts the calls of [`FrameSource::release`].
+    epoch: u64,
+    /// When each file was last released: the epoch, and the time (to forget it when no request
+    /// that began before it can still be waiting). A request fails on a file released after it
+    /// began, instead of routing to a fresh run of it as it does when a *router* stopped its run.
+    released: HashMap<SourceId, (u64, Instant)>,
 }
 
 struct Shared {
@@ -508,6 +514,8 @@ impl FrameSource {
                 oneshots: 0,
                 stats: SourceStats::default(),
                 closed: false,
+                epoch: 0,
+                released: HashMap::new(),
             }),
             changed: Condvar::new(),
             config,
@@ -604,6 +612,7 @@ impl FrameSource {
                 self.shared.config.request_timeout
             };
         let mut st = self.shared.lock();
+        let born = st.epoch;
         let mut starts = 0;
         // The run this request started or is reading, to read its outcome.
         let mut mine: Option<RunId> = None;
@@ -613,6 +622,9 @@ impl FrameSource {
         loop {
             if st.closed {
                 return Err(GpuError::Decode("the frame source was released".into()));
+            }
+            if st.released.get(&source).is_some_and(|&(epoch, _)| epoch > born) {
+                return Err(GpuError::Decode(format!("{}: the file was released", layer.path)));
             }
             let info = st.files.get(&source).copied();
             if st.distrusted.contains_key(&source) {
@@ -989,8 +1001,13 @@ impl FrameSource {
     }
 
     /// Stop every run of `source` and forget its frames (and what was learned about the file).
+    /// A request for the file that is waiting on a run fails (`GpuError::Decode`): it would
+    /// otherwise start a new run of a file nobody wants any more as soon as this one's was stopped.
     pub fn release(&self, source: SourceId) {
         let mut st = self.shared.lock();
+        st.epoch += 1;
+        let epoch = st.epoch;
+        st.released.insert(source, (epoch, Instant::now()));
         let ids: Vec<RunId> = st.runs.iter().filter(|r| r.file == source).map(|r| r.id).collect();
         for id in ids {
             stop(&mut st, id);
@@ -1413,6 +1430,10 @@ fn reaper(shared: &Weak<Shared>) {
             // A finished run's record is kept a moment for the requests reading its outcome.
             st.runs
                 .retain(|r| r.alive() || r.waiters > 0 || r.ended_at.is_none_or(|e| e.elapsed() < Duration::from_secs(5)));
+            // A release matters to the requests that began before it, and none outlives its
+            // deadline (the longest of them, twice over).
+            let memory = cfg.request_timeout.max(DECODE_TIMEOUT) * 2;
+            st.released.retain(|_, (_, at)| at.elapsed() < memory);
             st.cache.trim();
         }
         if !doomed.is_empty() {
