@@ -309,7 +309,7 @@ so the feature is **only** activated through these forwards — which is what ma
   ffmpeg decodes it in software without a word, or HEVC 4:2:0 at 8 or 10 bit; an H.264 stream whose depth was not
   recorded is not assumed to be 8), and a graph whose filters are all in `HARDWARE_GRAPH_FILTERS` (scale, pad,
   overlay, fps, the VAAPI tail `format=nv12,hwupload`, ... and the sound ones; none of `zscale` / `geq` / `rotate` /
-  `v360` / `drawtext` / a blur / a grade). `-vaapi_device` is an option of the input group and is not looked at (the
+  `v360` / `drawtext` / a blur / a grade). `-vaapi_device` is a global option written ahead of the inputs and is not looked at (the
   encoder name and the upload carry the VAAPI export), and `tune_export_args` swaps in the render node the probe
   verified before the argv is judged. The rerun after a hardware decode failure asks no input for hardware, so it is
   the cores' and is a fresh attempt that asks for the cores' slot. `KERF_GPU_LANE=off` / `cpu::set_gpu_lane(false)`
