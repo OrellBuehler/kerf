@@ -20,7 +20,7 @@
 | GPU-4 Motion fades/transitions | gpu-4 | | review r3 (r2 blocker fixed: FullRangeCut refuses the whole Motion cut; main merged) | gpu-compositor WP-4 | dev done: still-plan GPU frames T1 96.0→100%, T2 78.8→100%, T3 83.3% (WP-6 refusals); Motion export frames 0→100% (T3 16.6%); motion parity plane-exact where unscaled, 1–2 levels where scaled, dip-to-white 2 levels; golden unchanged |
 | PERF-5 AMF/VAAPI export encode | perf-5 | #142 | review (CI) | gpu-media WP4, WP5, WP11 | wave 4 |
 | macOS presenter (WP-8) | macos-presenter | #141 | merged | gpu-compositor WP-8 | dev done: main-thread surface hop on macOS (step 1 could never work: raw-window-metal needs the main thread), plan + acceptance list in app.md; macOS default unchanged |
-| GPU-6 Keyed zoom, masks, blur | gpu-6 (on gpu-4) | | in-progress | gpu-compositor WP-6 | wave 4 |
+| GPU-6 Keyed zoom, masks, blur | gpu-6 (on gpu-4 ea0d186) | | review | gpu-compositor WP-6 | dev done: T3 Still 83.3→100%, Motion 16.6→100%; masks exact (geq f64 plane, cached), grayscale/invert/sharpen exact, blur ≤1 level; found FFmpeg 6.1 geq edge read (probed); mask still 847→371 ms at 960 px on CPU adapter |
 | GPU-5, GPU-7 | | | todo | | wave 4; GPU-5 overlaps PERF-4 (gpu_preview / frame_source), GPU-7 needs GPU-4/5 |
 | CI: retry + cache ffmpeg download | ci-fetch-retry | #131 | closed (landed via #130) | not a review finding | evermeet.cx throttles the macOS pinned-ffmpeg fetch (ffprobe 429 for 6.5+ min); retry + actions/cache ported into #129, #130, #132; cache fills only after one successful run |
 
@@ -95,6 +95,7 @@
 - PERF-4 round 2: a scrub window over an original (non-proxy) input has no lead frame; backward misses keep the reverse window — the reviewer's short-window alternative measured −160 ms on one step back but +1.2–1.4 s on a backward drag (README Round 2). Proxy queue runs 2 workers only where the GPU lane can qualify.
 
 ## Needs a real machine
+- GPU-6: compute/storage-buffer passes on Metal, DX12, hardware Vulkan (FMA changes blur's last bits); real-GPU timings; Windows `hypot` vs Linux for ellipse masks; the geq edge probe on non-pinned macOS/Windows FFmpegs.
 - PERF-4: 2 proxy workers by default where the GPU lane can qualify (Windows) — confirm with a hardware proxy beside a software one on Windows/AMD; H.264 High10 / HEVC Main10 classification on real decoders.
 - macOS presenter: `KERF_GPU_SURFACE=window` on a Mac — is the CAMetalLayer sublayer over or under the WKWebView (source predicts over, covering a clickable UI) and is it left behind after off / device loss (source predicts yes); if so, step 2 = app-owned CAMetalLayer in an NSView below the webview; Metal start-up vs BUILD_DEADLINE, present/composite ms, nextDrawable timeouts, sRGB layer colour vs JPEG; parity suite on Metal; display-scale moves, zoom, full screen, minimized.
 - PERF-5: proxies no longer hardware-encode on NVENC / QSV / VideoToolbox either (WP5 was measured on AMD RX 7900 XT only): confirm proxy CPU cost on NVIDIA and Apple Silicon with long 4K footage.
@@ -138,6 +139,7 @@
 - UI-3: dialog focus return, `inert` timing and the focus rescue checked in Chromium only; confirm in WebView2, WebKitGTK and WKWebView.
 
 ## Needs a decision
+- GPU-6: vignette (exact in stills at frame 0; Motion needs a per-clip frame ordinal); mask + opacity<1 and zoom + rotation/opacity<1 (alpha through the RGB round trip); blur/sharpen on a letterbox (pad pass); is blur's 1-level tolerance "exact"; effects on full-range pictures (MJPEG webcams are yuvj422p) fall back to FFmpeg; CI gpu parity job timeout 20 → 30 min as the motion suite grows.
 - GPU-4: a cut that holds any full-range (`yuvj`) clip refuses every Motion frame on 9.0.2-style builds (FFmpeg 9 flags the whole export full range) — one JPEG still anywhere sends the whole GPU export to FFmpeg. Modelling the full-range conversion of limited frames would lift it.
 - CLAUDE.md line ~126 says UI-facing work is "ungated but thread-capped and niced"; interactive stills, scrub windows and the playback stream are not niced (`bg_command` is the only user of `cpu::background`). engine-cli.md is corrected; CLAUDE.md edits are out of bounds for this run.
 - PERF-5 (r2 nit, unfixed): the VAAPI device wait covers the whole hardware probe, so a slow NVENC wake on a hybrid laptop can make an agent's first VAAPI export fall back to the renderD128 stand-in; publishing the VAAPI result to its own cell would decouple it.

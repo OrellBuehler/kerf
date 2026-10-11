@@ -1,0 +1,27 @@
+adapter: llvmpipe (LLVM 20.1.2, 256 bits) (Vulkan, Cpu); ffmpeg: /home/user/kerf/crates/kerf-app/binaries/ffmpeg-x86_64-unknown-linux-gnu; a 1920x1080 30 fps source, min of 7 runs after a warm-up (median in brackets)
+mask plane 960x540: 1.5 ms, once (518400 bytes)
+mask plane 1920x1080: 8.8 ms, once (2073600 bytes)
+
+still of                   render        ffmpeg ms    gpu decode ms    gpu composite ms
+plain cut                  960 px        192 (220)        141 (258)           280 (345)
+ellipse mask, feathered    960 px        847 (917)        186 (223)           371 (462)
+blur sigma 6               960 px        213 (400)        154 (184)           327 (373)
+sharpen 1.5                960 px        238 (357)        189 (255)           353 (459)
+moving zoom 1 -> 1.25      960 px        246 (300)        177 (225)           477 (545)
+zoom + mask + blur         960 px       985 (1127)        163 (227)           570 (677)
+plain cut                  1080p         220 (306)        171 (228)            98 (124)
+ellipse mask, feathered    1080p        884 (1007)        176 (237)           191 (229)
+blur sigma 6               1080p         207 (274)        160 (192)           164 (221)
+sharpen 1.5                1080p         276 (340)        149 (224)           396 (420)
+moving zoom 1 -> 1.25      1080p         228 (276)        152 (228)           639 (682)
+zoom + mask + blur         1080p        844 (1115)        160 (220)         1229 (1594)
+
+export of a second, 960x540          ffmpeg ms a frame gpu ms a frame (decode + composite)
+plain cut                                     25 (39)                  325 (398)
+ellipse mask, feathered                     175 (205)                  359 (385)
+blur sigma 6                                  32 (33)                  396 (420)
+sharpen 1.5                                   30 (37)                  477 (505)
+moving zoom 1 -> 1.25                         41 (43)                  534 (541)
+zoom + mask + blur                          214 (230)                  556 (569)
+
+host: 4 cores, load average 20 to 23 during the run (other builds, 5x oversubscribed); lavapipe (a CPU rasteriser): GPU time here is CPU time on the same cores FFmpeg uses, so only the relative cost of the passes means anything, not GPU against FFmpeg. What the table shows: FFmpeg pays about 650 ms more a still (and 150 ms more a frame of an export) for a feathered ellipse mask, because geq evaluates the expression for every sample of every frame; the compositor pays the plane once (1.5 ms at 960x540, 8.8 ms at 1080p) and a mask adds about 90 ms of blend on lavapipe (the per-sample alpha in the blend). 960 px renders scale the 1080p source (two swscale passes). The compositor is slower than FFmpeg on a CPU adapter for blur, sharpen and the moving zoom (a four-plane second stage, per-row compute passes); a real adapter is needed for the verdict.

@@ -1,0 +1,31 @@
+   Compiling kerf-gpu v0.24.0 (/home/user/kerf-gpu-6/crates/kerf-gpu)
+    Finished `test` profile [unoptimized] target(s) in 2.41s
+     Running tests/coverage.rs (target/debug/deps/coverage-4d21c0736382f3ef)
+
+running 1 test
+composite colour policy: BottomLayerTag
+cut (render 540 px wide), plan                                                        GPU-2          GPU-4          GPU-6   reasons left
+T1  talking head 9:16, clip fades, captions ~85% [still]                      96.0% 1440/1500 100.0% 1500/1500 100.0% 1500/1500   
+                                                                             refused by GPU-4's caps: 
+T1  talking head 9:16, clip fades, captions ~85% [motion]                      0.0%    0/1500 100.0% 1500/1500 100.0% 1500/1500   
+                                                                             refused by GPU-4's caps: 
+T1b same, hard cuts, captions [still]                                        100.0% 1500/1500 100.0% 1500/1500 100.0% 1500/1500   
+                                                                             refused by GPU-4's caps: 
+T1b same, hard cuts, captions [motion]                                         0.0%    0/1500 100.0% 1500/1500 100.0% 1500/1500   
+                                                                             refused by GPU-4's caps: 
+T1c same, clip fades, no captions [still]                                     96.0% 1440/1500 100.0% 1500/1500 100.0% 1500/1500   
+                                                                             refused by GPU-4's caps: 
+T1c same, clip fades, no captions [motion]                                     0.0%    0/1500 100.0% 1500/1500 100.0% 1500/1500   
+                                                                             refused by GPU-4's caps: 
+T2  montage 16:9, dissolves / dips / slides, graded, 2 titles [still]         78.8%  887/1125 100.0% 1125/1125 100.0% 1125/1125   
+                                                                             refused by GPU-4's caps: 
+T2  montage 16:9, dissolves / dips / slides, graded, 2 titles [motion]         0.0%    0/1125 100.0% 1125/1125 100.0% 1125/1125   
+                                                                             refused by GPU-4's caps: 
+T3  tutorial 16:9, webcam PiP, 5 lower thirds, keyed push-ins, 1 mask + blur [still]  83.3% 1875/2250  83.3% 1875/2250 100.0% 2250/2250   
+                                                                             refused by GPU-4's caps: Effects 375, Mask 375, ZoomBehind 375
+T3  tutorial 16:9, webcam PiP, 5 lower thirds, keyed push-ins, 1 mask + blur [motion]   0.0%    0/2250  16.6%  374/2250 100.0% 2250/2250   
+                                                                             refused by GPU-4's caps: Effects 376, KeyedZoom 1876, Mask 376
+test captioned_cuts_and_transitions_are_drawn_by_the_compositor_where_they_were_refused ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.72s
+
