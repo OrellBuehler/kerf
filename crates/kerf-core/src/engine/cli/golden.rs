@@ -28,8 +28,9 @@
 //! holding HDR footage is built *both* ways), `alimiter_latency_available()`
 //! (`with_alimiter_latency`; every case is built with the option, and a case with the
 //! limiter on has its export argv appended once more without it), `drawtext`'s
-//! font path (no overlay names a font, so no system font is looked up; the shipped
-//! default every overlay then gets is pinned to a fixed path, `with_pinned_default_font`),
+//! font path (`with_pinned_default_font`: the shipped default that an overlay with no
+//! family gets, and the one family an overlay names, `PINNED_FAMILY`, are fixed paths, so
+//! neither this machine's cache directory nor its installed fonts reach the argv),
 //! and libm: the
 //! compressor and gate thresholds go through `powf`, whose last digits differ between
 //! glibc builds (FMA or not), macOS, Windows and arm, so [`round_libm`] compares those
