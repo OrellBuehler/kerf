@@ -227,7 +227,7 @@
   like the rest of the timeline math.
   - **Text** (`caps.text`, which `kerf-gpu`'s compositor sets: FFmpeg rasterises `drawtext`, the compositor blends it —
     `gpu.md`). The font is **always a file the plan can name**: `fonts::resolve_text_font` (the installed family the overlay
-    names, else the shipped Geist, `Regular` or `Bold`, written to `<cache>/kerf/fonts/`) is called by the graph
+    names, else the shipped Geist, `Regular` or `Bold`, written to `<cache>/kerf/fonts/`, checked on each call) is called by the graph
     (`drawtext_common`) and the planner alike, so `PlanText.font_file` is exactly what the still / export pass as
     `fontfile=` — `TextWithoutFont` is only the case where the default could not be written. `kerf_core::text_still_filter(&PlanText, h)`
     is the `drawtext` the still draws for a plan's overlay (a test holds it byte-equal to `drawtext_still` over the
