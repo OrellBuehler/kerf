@@ -4,6 +4,8 @@
 	import { VIDEO_THUMB_BG } from './data';
 	import Badge from './Badge.svelte';
 	import Btn from './Btn.svelte';
+	import IconBtn from './IconBtn.svelte';
+	import SliderRow from './SliderRow.svelte';
 	import TitlesControls from './TitlesControls.svelte';
 	import MediaChips from './MediaChips.svelte';
 	import { analyzeMenuItems } from '$lib/analyze-menu';
@@ -38,6 +40,7 @@
 	import { settings } from '$lib/settings.svelte';
 	import { linkBadge, selectionUnits } from '$lib/link-ui';
 	import { fitOffer, musicSummary } from '$lib/music-ui';
+	import { DEGREES, PERCENT, SECONDS, TIMES, type RowSpec } from '$lib/slider-row';
 
 	const clip = $derived(editor.selectedClip);
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);
@@ -90,18 +93,18 @@
 		const animatable = Object.keys(patch).every((k) => ANIM_KEYS.has(k));
 		if (keyframes.length && animatable) {
 			const time = Math.max(0, ui.time - c.timeline_start);
-			void run(() => editor.addKeyframe(c.id, Math.round(time * 1000) / 1000, patch as Record<string, number>));
+			return run(() => editor.addKeyframe(c.id, Math.round(time * 1000) / 1000, patch as Record<string, number>));
 		} else if (animatable && transformAnimated(c)) {
 			// Numbers keyed on their own (no whole-transform keys): a key at the playhead for each
 			// of those, the static transform for the rest.
 			const keyed = (Object.keys(patch) as (keyof Transform)[]).filter((k) => isKeyed(c, k as Property));
 			const rest = Object.fromEntries(Object.entries(patch).filter(([k]) => !keyed.includes(k as keyof Transform)));
-			void run(async () => {
+			return run(async () => {
 				for (const k of keyed) await keyAtPlayhead(c, k as Property, patch[k] as number);
 				if (Object.keys(rest).length) await editor.setTransform(c.id, rest);
 			});
 		} else {
-			void run(() => editor.setTransform(c.id, patch));
+			return run(() => editor.setTransform(c.id, patch));
 		}
 	}
 	/** A key for `prop` at the playhead (clip-local, to the millisecond), put in as the backend does:
@@ -128,13 +131,10 @@
 	function setCol(patch: Partial<Color>) {
 		const c = clip;
 		if (!c) return;
-		if (!colorAnimated(c)) {
-			void run(() => editor.setColor(c.id, patch));
-			return;
-		}
+		if (!colorAnimated(c)) return run(() => editor.setColor(c.id, patch));
 		const keyed = (Object.keys(patch) as (keyof Color)[]).filter((k) => isKeyed(c, k));
 		const rest = Object.fromEntries(Object.entries(patch).filter(([k]) => !keyed.includes(k as keyof Color)));
-		void run(async () => {
+		return run(async () => {
 			for (const k of keyed) await keyAtPlayhead(c, k, patch[k] as number);
 			if (Object.keys(rest).length) await editor.setColor(c.id, rest);
 		});
@@ -144,8 +144,7 @@
 	function setGain(v: number) {
 		const c = clip;
 		if (!c) return;
-		if (volumeAnimated(c)) void run(() => keyAtPlayhead(c, 'volume', v));
-		else void run(() => editor.setVolume(c.id, v));
+		return volumeAnimated(c) ? run(() => keyAtPlayhead(c, 'volume', v)) : run(() => editor.setVolume(c.id, v));
 	}
 	// ---- 360 reframe --------------------------------------------------------
 	const reframe = $derived(clip?.reframe ?? null);
@@ -194,11 +193,11 @@
 		const animatable = Object.keys(patch).every((k) => CAM_KEYS.has(k));
 		if (reframeKeys.length && animatable) {
 			const time = Math.max(0, ui.time - c.timeline_start);
-			void run(() =>
+			return run(() =>
 				editor.addReframeKeyframe(c.id, Math.round(time * 1000) / 1000, patch as Record<string, number>)
 			);
 		} else {
-			void run(() => editor.setReframe(c.id, patch));
+			return run(() => editor.setReframe(c.id, patch));
 		}
 	}
 	const CAM_KEYS = new Set(['yaw', 'pitch', 'roll', 'fov']);
@@ -268,13 +267,6 @@
 		void run(() => editor.setOverlayKeyframes(o.id, left));
 	}
 	const hasCaptions = $derived(overlays.some((o) => o.generated));
-
-	// While a slider is being dragged, show its live value (keyed by row label)
-	// without committing to the backend on every input event — commit happens on
-	// release (`onchange`). Otherwise the readout would sit frozen until release.
-	let liveDrag = $state<{ label: string; value: number } | null>(null);
-	const shown = (label: string, value: number) =>
-		liveDrag?.label === label ? liveDrag.value : value;
 
 	function tc(s: number): string {
 		const t = Math.max(0, s);
@@ -370,6 +362,18 @@
 		'width:70px;background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:12px;padding:4px 5px';
 	const xBtn =
 		'margin-left:auto;background:transparent;border:none;color:var(--text-muted);cursor:pointer;font-size:16px;line-height:1;min-width:28px;min-height:28px;padding:2px 5px';
+	/** A fade is a second or two: the slider covers the first FADE_TRAVEL seconds and a typed entry the whole clip. */
+	const FADE_TRAVEL = 5;
+	const fadeSpec = (c: Clip): RowSpec => ({
+		min: 0,
+		max: Math.min(Math.max(clipDuration(c), 0.1), FADE_TRAVEL),
+		step: 0.1,
+		neutral: 0,
+		...SECONDS,
+		limit: { max: clipDuration(c) }
+	});
+	/** The rows that are not sliders share the sliders' grid, so every value in the panel ends at the same x. */
+	const ROW_GRID = 'display:grid;grid-template-columns:72px minmax(0,1fr) 52px 24px;align-items:center;column-gap:8px;padding:3px 0';
 	const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
 	const chip = (active: boolean) =>
 		`padding:4px 9px;font-size:12px;cursor:pointer;border-radius:var(--radius-sm);border:var(--line-width) solid ${
@@ -380,15 +384,15 @@
 </script>
 
 {#snippet readRow(label: string, value: string)}
-	<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
-		<span style="font-size:12px;color:var(--text-muted)">{label}</span>
-		<span data-selectable style="font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)">{value}</span>
+	<div style={ROW_GRID}>
+		<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">{label}</span>
+		<span data-selectable style="grid-column:2 / 4;justify-self:end;font-family:var(--font-mono);font-size:12px;color:var(--text-secondary)">{value}</span>
 	</div>
 {/snippet}
 
 {#snippet numRow(label: string, value: number, step: number, onCommit: (v: number) => void)}
-	<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
-		<span style="font-size:12px;color:var(--text-muted)">{label}</span>
+	<label style={ROW_GRID}>
+		<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">{label}</span>
 		<input
 			type="number"
 			{value}
@@ -403,7 +407,7 @@
 				e.currentTarget.value = String(value);
 				if (Number.isFinite(v) && v >= 0) onCommit(v);
 			}}
-			style={inputCss}
+			style="{inputCss};grid-column:2 / 4;justify-self:end"
 		/>
 	</label>
 {/snippet}
@@ -412,8 +416,9 @@
 	{@const c = clip}
 	{@const keyed = c ? isKeyed(c, prop) : false}
 	{@const here = c ? propertyKeys(c, prop).some((k) => Math.abs(k.time - localTime) <= 0.02) : false}
-	<button
-		type="button"
+	<IconBtn
+		size={24}
+		active={here}
 		disabled={editor.busy}
 		title={here
 			? `Remove the ${prop} keyframe at the playhead`
@@ -421,55 +426,28 @@
 				? `Add a ${prop} keyframe at the playhead`
 				: `Animate ${prop}: key it at the playhead`}
 		aria-label={`${here ? 'Remove' : 'Add'} a ${prop} keyframe at the playhead`}
-		aria-pressed={here}
-		onclick={(e) => {
+		onclick={(e: MouseEvent) => {
 			e.preventDefault();
 			toggleKey(prop);
 		}}
-		style={`flex:none;border:0;background:none;padding:0 2px;cursor:pointer;font-size:12px;line-height:1;color:${here ? 'var(--playhead)' : keyed ? 'var(--text-secondary)' : 'var(--text-muted)'}`}
-		>{here ? '◆' : '◇'}</button
+		style="--k-ink:{keyed ? 'var(--text-secondary)' : 'var(--text-muted)'};--k-on-ink:var(--playhead)"
 	>
+		<Icon n="diamond" s={12} style={here ? 'fill:currentColor' : ''} />
+	</IconBtn>
 {/snippet}
 
 {#snippet rangeRow(
 	label: string,
 	value: number,
-	min: number,
-	max: number,
-	step: number,
-	format: (v: number) => string,
-	onCommit: (v: number) => void,
+	spec: RowSpec,
+	onCommit: (v: number) => unknown,
 	animate?: Property
 )}
-	<label style="display:flex;align-items:center;gap:10px;padding:3px 0">
-		<span style="font-size:12px;color:var(--text-secondary);width:72px;flex:none">{label}</span>
-		<input
-			type="range"
-			{min}
-			{max}
-			{step}
-			{value}
-			disabled={editor.busy}
-			oninput={(e) => {
-				const v = parseFloat(e.currentTarget.value);
-				if (Number.isFinite(v)) liveDrag = { label, value: v };
-			}}
-			onchange={(e) => {
-				const v = parseFloat(e.currentTarget.value);
-				liveDrag = null;
-				if (Number.isFinite(v)) onCommit(v);
-			}}
-			style="flex:1"
-		/>
-		<span
-			style="font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);width:46px;text-align:right"
-			>{format(shown(label, value))}</span
-		>
-		<!-- After the slider: a label's control is its first labelable descendant. -->
-		{#if animate}
-			{@render keyToggle(animate)}
-		{/if}
-	</label>
+	<SliderRow {label} {value} {spec} disabled={editor.busy} {onCommit}>
+		{#snippet keyframe()}
+			{#if animate}{@render keyToggle(animate)}{/if}
+		{/snippet}
+	</SliderRow>
 {/snippet}
 
 {#snippet fxBlock(
@@ -560,7 +538,7 @@
 
 	<InspectorSection title="Text" summary={`${tc(o.start)} – ${tc(o.end)}`} open>
 		<label style="display:flex;align-items:center;gap:8px;padding:3px 0">
-			<span style="font-size:12px;color:var(--text-muted);width:46px;flex:none">Text</span>
+			<span style="font-size:12px;color:var(--text-muted);width:72px;flex:none">Text</span>
 			<input
 				type="text"
 				value={o.text}
@@ -575,17 +553,14 @@
 		{@render numRow('End', o.end, 0.1, (v) =>
 			run(() => editor.retimeOverlay(o.id, o.start, Math.max(v, o.start + MIN_TITLE)))
 		)}
-		{@render rangeRow('Pos X', pose.x, 0, 1, 0.01, (v) => v.toFixed(2), (v) =>
-			run(() => editor.moveOverlay(o.id, v, pose.y, ui.time))
-		)}
-		{@render rangeRow('Pos Y', pose.y, 0, 1, 0.01, (v) => v.toFixed(2), (v) =>
-			run(() => editor.moveOverlay(o.id, pose.x, v, ui.time))
-		)}
-		{@render rangeRow('Size', o.size, TITLE_SIZE_MIN, Math.max(0.2, TITLE_SIZE_MAX, o.size), 0.005, (v) => `${Math.round(v * 100)}%`, (v) =>
-			run(() => editor.updateOverlay(o.id, { size: v }))
-		)}
+		{@render rangeRow('Pos X', pose.x, { min: 0, max: 1, step: 0.01 }, (v) =>
+			run(() => editor.moveOverlay(o.id, v, pose.y, ui.time)))}
+		{@render rangeRow('Pos Y', pose.y, { min: 0, max: 1, step: 0.01 }, (v) =>
+			run(() => editor.moveOverlay(o.id, pose.x, v, ui.time)))}
+		{@render rangeRow('Size', o.size, { min: TITLE_SIZE_MIN, max: Math.max(0.2, TITLE_SIZE_MAX, o.size), step: 0.005, ...PERCENT }, (v) =>
+			run(() => editor.updateOverlay(o.id, { size: v })))}
 		<label style="display:flex;align-items:center;gap:8px;padding:3px 0">
-			<span style="font-size:12px;color:var(--text-muted);width:46px;flex:none">Color</span>
+			<span style="font-size:12px;color:var(--text-muted);width:72px;flex:none">Color</span>
 			<input
 				type="text"
 				value={o.color}
@@ -604,7 +579,7 @@
 			/>
 		</label>
 		<label style="display:flex;align-items:center;gap:8px;padding:3px 0">
-			<span style="font-size:12px;color:var(--text-muted);width:46px;flex:none">Font</span>
+			<span style="font-size:12px;color:var(--text-muted);width:72px;flex:none">Font</span>
 			<select
 				value={o.font ?? ''}
 				disabled={editor.busy}
@@ -774,31 +749,7 @@
 					summary={volumeAnimated(clip) ? `Animated · ${Math.round(gain * 100)}%` : `${Math.round(clip.volume * 100)}%`}
 					open
 				>
-				<label style="display:flex;align-items:center;gap:10px;padding:3px 0">
-					<input
-						type="range"
-						min="0"
-						max={MAX_GAIN}
-						step="0.05"
-						value={gain}
-						disabled={editor.busy}
-						oninput={(e) => {
-							const v = parseFloat(e.currentTarget.value);
-							if (Number.isFinite(v)) liveDrag = { label: 'Volume', value: v };
-						}}
-						onchange={(e) => {
-							const v = parseFloat(e.currentTarget.value);
-							liveDrag = null;
-							if (Number.isFinite(v)) setGain(v);
-						}}
-						style="flex:1"
-					/>
-					<span
-						style="font-family:var(--font-mono);font-size:12px;color:var(--text-secondary);width:46px;text-align:right"
-						>{Math.round(shown('Volume', gain) * 100)}%</span
-					>
-					{@render keyToggle('volume')}
-				</label>
+				{@render rangeRow('Level', gain, { min: 0, max: MAX_GAIN, step: 0.05, neutral: 1, ...PERCENT }, setGain, 'volume')}
 				</InspectorSection>
 
 			{/if}
@@ -821,18 +772,17 @@
 			{/if}
 
 			<InspectorSection title="Fades" summary={`${clip.fade_in}s in · ${clip.fade_out}s out`}>
-			{@render numRow('Fade in', clip.fade_in, 0.1, (v) =>
+			{@render rangeRow('Fade in', clip.fade_in, fadeSpec(clip), (v) =>
 				run(() => editor.setFade(clip.id, Math.min(v, clipDuration(clip)), undefined))
 			)}
-			{@render numRow('Fade out', clip.fade_out, 0.1, (v) =>
+			{@render rangeRow('Fade out', clip.fade_out, fadeSpec(clip), (v) =>
 				run(() => editor.setFade(clip.id, undefined, Math.min(v, clipDuration(clip))))
 			)}
 			</InspectorSection>
 
 			<InspectorSection title="Speed" summary={`${Math.abs(speed).toFixed(2)}×${speed < 0 ? ' · reverse' : ''}`}>
-			{@render rangeRow('Rate', Math.abs(speed), 0.25, 4, 0.25, (v) => `${v.toFixed(2)}×`, (v) =>
-				run(() => editor.setSpeed(clip.id, speed < 0 ? -v : v))
-			)}
+			{@render rangeRow('Rate', Math.abs(speed), { min: 0.25, max: 4, step: 0.25, neutral: 1, ...TIMES }, (v) =>
+				run(() => editor.setSpeed(clip.id, speed < 0 ? -v : v)))}
 			<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
 				<span style="font-size:12px;color:var(--text-muted)">Reverse</span>
 				<input
@@ -848,22 +798,17 @@
 			{#if picture}
 				<InspectorSection title="360 reframe" summary={reframe ? (reframeKeys.length ? `Animated · ${count(reframeKeys.length, 'key')}` : 'On') : 'Off'}>
 				{#if reframe}
-					{@render rangeRow('Yaw', cam.yaw, -180, 180, 1, (v) => `${Math.round(v)}°`, (v) =>
-						setCam({ yaw: v })
-					)}
-					{@render rangeRow('Pitch', cam.pitch, -90, 90, 1, (v) => `${Math.round(v)}°`, (v) =>
-						setCam({ pitch: v })
-					)}
-					{@render rangeRow('Roll', cam.roll, -180, 180, 1, (v) => `${Math.round(v)}°`, (v) =>
-						setCam({ roll: v })
-					)}
-					{@render rangeRow('FOV', cam.fov, 20, 180, 1, (v) => `${Math.round(v)}°`, (v) =>
-						setCam({ fov: v })
-					)}
+					{@render rangeRow('Yaw', cam.yaw, { min: -180, max: 180, step: 1, ...DEGREES }, (v) =>
+						setCam({ yaw: v }))}
+					{@render rangeRow('Pitch', cam.pitch, { min: -90, max: 90, step: 1, ...DEGREES }, (v) =>
+						setCam({ pitch: v }))}
+					{@render rangeRow('Roll', cam.roll, { min: -180, max: 180, step: 1, ...DEGREES }, (v) =>
+						setCam({ roll: v }))}
+					{@render rangeRow('FOV', cam.fov, { min: 20, max: 180, step: 1, neutral: 100, ...DEGREES }, (v) =>
+						setCam({ fov: v }))}
 					{#if reframe.input === 'dual_fisheye'}
-						{@render rangeRow('Lens FOV', cam.lens_fov, 170, 220, 1, (v) => `${Math.round(v)}°`, (v) =>
-							run(() => editor.setReframe(clip.id, { lens_fov: v }))
-						)}
+						{@render rangeRow('Lens FOV', cam.lens_fov, { min: 170, max: 220, step: 1, neutral: 190, ...DEGREES }, (v) =>
+							run(() => editor.setReframe(clip.id, { lens_fov: v })))}
 						<p style="font-size:12px;color:var(--text-muted);margin:4px 0 0;line-height:1.4">
 							Approximate stitch — the seam is a hard blend, not Insta360's optical-flow
 							one. Tune Lens FOV to move it, or use a Studio equirect export for a clean
@@ -939,21 +884,16 @@
 
 			{#if picture}
 				<InspectorSection title="Transform" summary={keyframes.length ? `Animated · ${count(keyframes.length, 'key')}` : `${Math.round(tf.scale * 100)}% · ${Math.round(tf.rotation)}°`}>
-				{@render rangeRow('Scale', tf.scale, 0.1, 2, 0.05, (v) => `${Math.round(v * 100)}%`, (v) =>
-					setTf({ scale: v })
-				)}
-				{@render rangeRow('Position X', tf.pos_x, -0.5, 0.5, 0.01, (v) => v.toFixed(2), (v) =>
-					setTf({ pos_x: v })
-				)}
-				{@render rangeRow('Position Y', tf.pos_y, -0.5, 0.5, 0.01, (v) => v.toFixed(2), (v) =>
-					setTf({ pos_y: v })
-				)}
-				{@render rangeRow('Rotation', tf.rotation, -180, 180, 1, (v) => `${Math.round(v)}°`, (v) =>
-					setTf({ rotation: v })
-				)}
-				{@render rangeRow('Opacity', tf.opacity, 0, 1, 0.05, (v) => `${Math.round(v * 100)}%`, (v) =>
-					setTf({ opacity: v })
-				)}
+				{@render rangeRow('Scale', tf.scale, { min: 0.1, max: 2, step: 0.05, neutral: 1, ...PERCENT }, (v) =>
+					setTf({ scale: v }))}
+				{@render rangeRow('Position X', tf.pos_x, { min: -0.5, max: 0.5, step: 0.01 }, (v) =>
+					setTf({ pos_x: v }))}
+				{@render rangeRow('Position Y', tf.pos_y, { min: -0.5, max: 0.5, step: 0.01 }, (v) =>
+					setTf({ pos_y: v }))}
+				{@render rangeRow('Rotation', tf.rotation, { min: -180, max: 180, step: 1, ...DEGREES }, (v) =>
+					setTf({ rotation: v }))}
+				{@render rangeRow('Opacity', tf.opacity, { min: 0, max: 1, step: 0.05, neutral: 1, ...PERCENT }, (v) =>
+					setTf({ opacity: v }))}
 				</InspectorSection>
 
 				<InspectorSection title="Framing" summary={hasCrop ? 'Cropped' : 'Full frame'}>
@@ -988,18 +928,14 @@
 							: 'This shot already matches the delivery frame.'}
 					</div>
 				{/if}
-				{@render rangeRow('Crop L', tf.crop_left, 0, 0.9, 0.01, (v) => v.toFixed(2), (v) =>
-					run(() => editor.setTransform(clip.id, { crop_left: v }))
-				)}
-				{@render rangeRow('Crop R', tf.crop_right, 0, 0.9, 0.01, (v) => v.toFixed(2), (v) =>
-					run(() => editor.setTransform(clip.id, { crop_right: v }))
-				)}
-				{@render rangeRow('Crop T', tf.crop_top, 0, 0.9, 0.01, (v) => v.toFixed(2), (v) =>
-					run(() => editor.setTransform(clip.id, { crop_top: v }))
-				)}
-				{@render rangeRow('Crop B', tf.crop_bottom, 0, 0.9, 0.01, (v) => v.toFixed(2), (v) =>
-					run(() => editor.setTransform(clip.id, { crop_bottom: v }))
-				)}
+				{@render rangeRow('Crop L', tf.crop_left, { min: 0, max: 0.9, step: 0.01, neutral: 0 }, (v) =>
+					run(() => editor.setTransform(clip.id, { crop_left: v })))}
+				{@render rangeRow('Crop R', tf.crop_right, { min: 0, max: 0.9, step: 0.01, neutral: 0 }, (v) =>
+					run(() => editor.setTransform(clip.id, { crop_right: v })))}
+				{@render rangeRow('Crop T', tf.crop_top, { min: 0, max: 0.9, step: 0.01, neutral: 0 }, (v) =>
+					run(() => editor.setTransform(clip.id, { crop_top: v })))}
+				{@render rangeRow('Crop B', tf.crop_bottom, { min: 0, max: 0.9, step: 0.01, neutral: 0 }, (v) =>
+					run(() => editor.setTransform(clip.id, { crop_bottom: v })))}
 				</InspectorSection>
 
 				<InspectorSection title="Color" summary={activeLook(col)?.label ?? 'Custom'}>
@@ -1018,11 +954,11 @@
 						onclick={() => setCol(DEFAULT_COLOR)}>Reset</button
 					>
 				</div>
-				{@render rangeRow('Brightness', col.brightness, -1, 1, 0.05, (v) => v.toFixed(2), (v) => setCol({ brightness: v }), 'brightness')}
-				{@render rangeRow('Contrast', col.contrast, 0, 4, 0.05, (v) => v.toFixed(2), (v) => setCol({ contrast: v }), 'contrast')}
-				{@render rangeRow('Saturation', col.saturation, 0, 3, 0.05, (v) => v.toFixed(2), (v) => setCol({ saturation: v }), 'saturation')}
-				{@render rangeRow('Warmth', col.temperature ?? 0, -1, 1, 0.05, (v) => v.toFixed(2), (v) => setCol({ temperature: v }), 'temperature')}
-				{@render rangeRow('Gamma', col.gamma, 0.1, 3, 0.05, (v) => v.toFixed(2), (v) => setCol({ gamma: v }), 'gamma')}
+				{@render rangeRow('Brightness', col.brightness, { min: -1, max: 1, step: 0.05 }, (v) => setCol({ brightness: v }), 'brightness')}
+				{@render rangeRow('Contrast', col.contrast, { min: 0, max: 4, step: 0.05, neutral: 1 }, (v) => setCol({ contrast: v }), 'contrast')}
+				{@render rangeRow('Saturation', col.saturation, { min: 0, max: 3, step: 0.05, neutral: 1 }, (v) => setCol({ saturation: v }), 'saturation')}
+				{@render rangeRow('Warmth', col.temperature ?? 0, { min: -1, max: 1, step: 0.05 }, (v) => setCol({ temperature: v }), 'temperature')}
+				{@render rangeRow('Gamma', col.gamma, { min: 0.1, max: 3, step: 0.05, neutral: 1 }, (v) => setCol({ gamma: v }), 'gamma')}
 				</InspectorSection>
 
 			<InspectorSection title="Mask" summary={mask ? (mask.shape === 'rect' ? 'Rectangle' : 'Ellipse') : 'None'}>
@@ -1047,17 +983,14 @@
 				>
 			</div>
 			{#if mask}
-				{@render rangeRow('Centre X', mask.x, 0, 1, 0.01, (v) => v.toFixed(2), (v) => patchMask({ x: v }))}
-				{@render rangeRow('Centre Y', mask.y, 0, 1, 0.01, (v) => v.toFixed(2), (v) => patchMask({ y: v }))}
-				{@render rangeRow('Width', mask.width, 0.02, 1.5, 0.01, (v) => v.toFixed(2), (v) =>
-					patchMask({ width: v })
-				)}
-				{@render rangeRow('Height', mask.height, 0.02, 1.5, 0.01, (v) => v.toFixed(2), (v) =>
-					patchMask({ height: v })
-				)}
-				{@render rangeRow('Feather', mask.feather, 0, 1, 0.01, (v) => v.toFixed(2), (v) =>
-					patchMask({ feather: v })
-				)}
+				{@render rangeRow('Centre X', mask.x, { min: 0, max: 1, step: 0.01, neutral: 0.5, bipolar: true }, (v) => patchMask({ x: v }))}
+				{@render rangeRow('Centre Y', mask.y, { min: 0, max: 1, step: 0.01, neutral: 0.5, bipolar: true }, (v) => patchMask({ y: v }))}
+				{@render rangeRow('Width', mask.width, { min: 0.02, max: 1.5, step: 0.01, neutral: 0.5 }, (v) =>
+					patchMask({ width: v }))}
+				{@render rangeRow('Height', mask.height, { min: 0.02, max: 1.5, step: 0.01, neutral: 0.5 }, (v) =>
+					patchMask({ height: v }))}
+				{@render rangeRow('Feather', mask.feather, { min: 0, max: 1, step: 0.01, neutral: 0.15 }, (v) =>
+					patchMask({ feather: v }))}
 				<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 0">
 					<span style="font-size:12px;color:var(--text-muted)">Invert</span>
 					<input
