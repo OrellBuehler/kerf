@@ -299,7 +299,7 @@ audible track plus a `MasterStrip`. Which tracks are audible is `mixer-strips.ts
 `trackHasSound`, which the track header uses too. It mirrors the export graph's
 `clip_sounds`: `Clip.source_audio`, written only when false, marks a picture whose sound
 was detached, and a video track made only of those has no strip. Each strip has a dB-tapered fader,
-pan, M / S / DUCK (spelled out, as in the track header; M and S are the narrow ones) and a meter. The taper (`gainToFader` / `faderToGain` in `mixer.ts`:
+pan, M / S / DUCK (spelled out, as in the track header; M and S are 24 px wide at least, which is why a strip is 108 px — `panels-polish.test.ts` does the sum) and a meter. The taper (`gainToFader` / `faderToGain` in `mixer.ts`:
 unity at 0.75, floor −60 dB) is shared with the header's level slider, so a level sits
 at the same place on both. `MixSlider` gives every fader and pan the same gesture, from
 `slider-gesture.ts`: one edit per drag, written on release, and a run of arrow-key

@@ -286,7 +286,7 @@ are a possible follow-up and not this change. `TitleBar` is three cells (so the
 workspace tabs stay on the centre line): the logo and the **menu bar** on the left;
 the workspaces in the middle; the project's name with its Saved / Unsaved badge, an
 **Export** button (a primary `Btn`, `file.export`'s key in its tooltip: the app's goal had no button outside the Deliver
-workspace; off, with the reason in its tooltip, while the cut has no clips — `exportButtonState`; while a render runs it shows `42%` with a spinner and reopens the dialog, and is on), the settings gear, the
+workspace; off, with the reason as its tooltip, while the cut has no clips — `exportButtonState`, and `aria-disabled` rather than `disabled` so it stays focusable and the keyboard reaches the reason; File › Export… is greyed with the same reason and Ctrl+E answers it in a toast; while a render runs the button shows `42%` with a spinner, reopens the dialog and is on), the settings gear, the
 notification bell and the version chip on the right. A pending agent proposal adds a cyan **Review 4 changes** chip
 left of Export (`proposalIndicator`, `agent-status.ts`; it is its icon and count in a right cell narrower than 560 px — `reviewChipText`, 1366×768 has 513 — so the project's name keeps its room) that raises the Agent panel, and a count on the Agent dock tab
 (`Workspace.svelte` sets `data-pending` on the tab's label, `dockview-kerf.css` draws it; the tab's `aria-label` becomes `Agent, 4 changes to review`: `agentTabLabel`) — in

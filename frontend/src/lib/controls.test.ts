@@ -154,7 +154,7 @@ describe('the old rules are gone', () => {
 	test('a control drawn in the disabled color is not also dimmed by the blanket opacity', () => {
 		// "Mark all read" and "Clear" go `text-disabled` when they have nothing to act on; the blanket
 		// `button:disabled` 50 % on top made them dimmer than a disabled control is meant to be. They are
-		// `Btn`s now, whose off look is `.k-btn:disabled` (the disabled ink at `opacity: 1`, tested above).
+		// `Btn`s now, whose off look is `.k-btn:disabled` (the disabled ink at `opacity: 1`, asserted below).
 		const log = read(`${EDITOR}NotificationCenter.svelte`);
 		const buttons = [...log.matchAll(/<Btn\b[\s\S]*?>\s*(?:Mark all read|Clear)\s*<\/Btn/g)].map((m) => m[0]);
 		expect(buttons.length).toBe(2);
