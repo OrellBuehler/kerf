@@ -482,6 +482,9 @@ enum Host {
     },
     #[cfg(target_os = "linux")]
     Child(Box<x11::Child>),
+    /// Nothing at all, for tests that draw without a window.
+    #[cfg(test)]
+    Null,
 }
 
 impl Host {
@@ -497,6 +500,8 @@ impl Host {
             Host::Window { .. } => Technique::Window,
             #[cfg(target_os = "linux")]
             Host::Child(_) => Technique::Child,
+            #[cfg(test)]
+            Host::Null => Technique::Child,
         }
     }
 
@@ -521,6 +526,8 @@ impl Host {
             }
             #[cfg(target_os = "linux")]
             Host::Child(_) => Ok(()),
+            #[cfg(test)]
+            Host::Null => Ok(()),
         }
     }
 
@@ -530,6 +537,8 @@ impl Host {
             Host::Window { window, .. } => window.inner_size().ok().map(|s| (s.width, s.height)),
             #[cfg(target_os = "linux")]
             Host::Child(_) => None,
+            #[cfg(test)]
+            Host::Null => None,
         }
     }
 
@@ -544,6 +553,8 @@ impl Host {
                 let r = layout.window.ok_or("a child window layout has a rectangle")?;
                 child.place(r.x as i32, r.y as i32, r.width, r.height)
             }
+            #[cfg(test)]
+            Host::Null => Ok(()),
         }
     }
 
@@ -552,6 +563,8 @@ impl Host {
         let _ = layout;
         match self {
             Host::Window { .. } => {}
+            #[cfg(test)]
+            Host::Null => {}
             #[cfg(target_os = "linux")]
             Host::Child(child) => {
                 if let Some(r) = layout.window {
@@ -567,6 +580,8 @@ impl Host {
     fn hide(&mut self) {
         match self {
             Host::Window { .. } => {}
+            #[cfg(test)]
+            Host::Null => {}
             #[cfg(target_os = "linux")]
             Host::Child(child) => child.hide(),
         }
@@ -576,6 +591,8 @@ impl Host {
         match self {
             // Dropping the guard restores the background.
             Host::Window { restore, .. } => drop(restore.take()),
+            #[cfg(test)]
+            Host::Null => {}
             #[cfg(target_os = "linux")]
             Host::Child(child) => child.hide(),
         }
@@ -989,6 +1006,9 @@ pub struct GpuPreview {
     render: Mutex<RenderState>,
     building: Mutex<()>,
     info: Arc<Mutex<Info>>,
+    /// Test seam: runs just before a frame decodes, with the render lock free.
+    #[cfg(test)]
+    before_decode: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// Runs the parity self-test on a device (injected so the gate is testable without an FFmpeg).
@@ -1043,6 +1063,8 @@ impl GpuPreview {
                 reason: technique.note.clone(),
                 ..Info::default()
             })),
+            #[cfg(test)]
+            before_decode: Mutex::new(None),
             technique,
             factory,
             bounds: Mutex::new(BoundsState::default()),
@@ -1561,6 +1583,10 @@ impl GpuPreview {
             return Attempt::Fallback(vec![reason]);
         }
 
+        #[cfg(test)]
+        if let Some(stall) = lock(&self.before_decode).clone() {
+            stall();
+        }
         let rendered = drawing
             .compositor
             .render_plan_texture_with(&plan, size, &drawing.source, Hint::Scrub);
@@ -1954,6 +1980,11 @@ fn build_backend(app: &tauri::AppHandle, technique: Technique) -> Result<Backend
 }
 
 #[cfg(test)]
+mod bench_tests;
+#[cfg(test)]
+mod drive_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use kerf_gpu::{Gpu, GpuOptions};
@@ -2165,7 +2196,7 @@ mod tests {
         assert!(upcoming_clip_starts(&tl, 0.0, -1.0, 3).is_empty());
     }
 
-    fn report() -> BoundsReport {
+    pub(super) fn report() -> BoundsReport {
         BoundsReport {
             x: 10.4,
             y: 20.6,
@@ -2591,13 +2622,13 @@ mod tests {
 
     /// A preview whose backend never starts, with the colour policy pinned (the real probe
     /// would run an FFmpeg).
-    fn with(technique: Resolution, factory: Box<Factory>) -> GpuPreview {
+    pub(super) fn with(technique: Resolution, factory: Box<Factory>) -> GpuPreview {
         let mut preview = GpuPreview::with_factory(technique, Arc::from(factory));
         preview.policy = || CompositeColorPolicy::FixedBt601;
         preview
     }
 
-    fn failing(counter: Arc<std::sync::atomic::AtomicUsize>, why: &'static str) -> GpuPreview {
+    pub(super) fn failing(counter: Arc<std::sync::atomic::AtomicUsize>, why: &'static str) -> GpuPreview {
         with(
             Resolution {
                 technique: Some(Technique::Child),
@@ -2612,12 +2643,12 @@ mod tests {
 
     /// A project with a clip on it, as the plan sees it (the file never has to exist: planning
     /// does not decode).
-    fn inputs() -> PlanInputs {
+    pub(super) fn inputs() -> PlanInputs {
         let project = Project::sample().expect("the sample project");
         PlanInputs::of(&project).expect("inputs")
     }
 
-    fn visible(preview: &GpuPreview) {
+    pub(super) fn visible(preview: &GpuPreview) {
         preview.set_bounds(&report()).expect("bounds");
     }
 
