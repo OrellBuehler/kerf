@@ -9105,9 +9105,12 @@ mod tests {
         };
         let (tmp, dst) = (dir.join("0000000000000abc.1.part"), dir.join("0000000000000abc.mp4"));
         std::fs::write(&tmp, b"ours").unwrap();
-        let epoch = crate::plan_epoch();
+        let bumps = crate::plan_epoch::bumps_here();
         assert_eq!(finalize_proxy(&tmp, &dst, || Some(video(1280))).unwrap(), dst);
-        assert!(crate::plan_epoch() > epoch, "a proxy that lands moves the plan epoch");
+        assert!(
+            crate::plan_epoch::bumps_here() > bumps,
+            "a proxy that lands moves the plan epoch"
+        );
         assert!(!tmp.exists());
         assert_eq!(std::fs::read(&dst).unwrap(), b"ours");
         assert_eq!(read_proxy_sidecar(&dst), Some(video(1280)));
