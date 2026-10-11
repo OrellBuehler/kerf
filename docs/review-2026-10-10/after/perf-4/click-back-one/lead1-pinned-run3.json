@@ -1,0 +1,1 @@
+{"ffmpeg":"n9.0.2-25-g67b60c310b-20261010","source":"1280x720 30 fps all-intra x264 (proxy shape)","preview_width":960,"cases":[{"case":"1 layer original 1080p","per_frame_spawn":{"n":8,"min_ms":221.45,"median_ms":289.62,"p95_ms":381.58},"click_then_back_one":{"n":10,"min_ms":0.11,"median_ms":0.14,"p95_ms":0.18}}]}

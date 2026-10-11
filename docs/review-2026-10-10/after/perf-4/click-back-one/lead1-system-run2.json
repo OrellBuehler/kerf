@@ -1,0 +1,1 @@
+{"ffmpeg":"6.1.1-3ubuntu5","source":"1280x720 30 fps all-intra x264 (proxy shape)","preview_width":960,"cases":[{"case":"1 layer original 1080p","per_frame_spawn":{"n":8,"min_ms":247.96,"median_ms":341.74,"p95_ms":418.54},"click_then_back_one":{"n":10,"min_ms":0.11,"median_ms":0.12,"p95_ms":0.17}}]}

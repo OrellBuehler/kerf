@@ -61,33 +61,48 @@ number, the source side is.
 
 Review asked whether a backward miss (a window with 22 frames of lead) or a jump (a full window for one frame) is
 slow when the inputs are originals and not proxies. `tests/scrub_bench.rs` now has a 1080p long-GOP original
-(`-g 250`, B-frames, outside `kerf/proxies`) beside the proxy cases, and three new scenarios: **twenty steps back at
-60 Hz**, **one step back** out of a drawn window (24 frames before it), and **twelve jumps** on one cache. Before is the
-previous commit's engine, built from a worktree; before and after were run interleaved, 3 runs per build, at a load
-average of 13 to 15, so the one-shot (the control: it did not change) moved by 10 to 25 % between runs. Medians of the
-three runs' medians, in ms (`round2/`):
+(`-g 250`, B-frames, outside `kerf/proxies`) beside the proxy cases, and four new scenarios: **twenty steps back at
+60 Hz**, **one step back** out of a drawn window (24 frames before it), **twelve jumps** on one cache, and **click,
+then step back one**. `KERF_BENCH_ONLY=<case substring>` and `KERF_BENCH_CLICK_ONLY=1` run less. Runs are interleaved
+at a load average of 13 to 15, so the one-shot (the control, unchanged) moves by 10 to 25 % between runs.
 
-| 1080p original | 9.0.2 before | 9.0.2 after | 6.1.1 before | 6.1.1 after |
+**Result: nothing was changed over originals.** The engine still starts a window one frame before the one asked for, a
+step back still gets the window behind it, and a jump still gets the full window. Two changes were tried and rejected on
+the numbers.
+
+**Lead 0 over originals (rejected).** Reaching frame k the process decodes every frame from the keyframe, so a window
+with no lead frame would have the asked frame first out. Round 2 first committed that (`e7c7042`). Measured against
+the previous engine, 3 runs per build, medians of the runs' medians in ms (`round2/`), it looked like a gain on 9.0.2
+and was not on 6.1.1, inside the noise either way:
+
+| 1080p original | 9.0.2 lead 1 | 9.0.2 lead 0 | 6.1.1 lead 1 | 6.1.1 lead 0 |
 | --- | --- | --- | --- | --- |
 | one-shot per frame (control) | 770 | 782 | 862 | 921 |
 | first frame of a window | 805 | 728 | 886 | 876 |
 | 20 steps forward at 60 Hz | 1126 | 1020 | 1475 | 1232 |
 | 20 steps back at 60 Hz | 2071 | 1690 | 2228 | 2450 |
-| one step back | 1241 | 1370 | 1388 | 1436 |
 | jumps, median | 874 | 672 | 855 | 822 |
 
-What changed in the engine is one thing: a window over an original has **no lead frame**, so the frame asked for is
-the first one out (a proxy keeps its lead of 1: the frame behind is nearly free and a hit on the step back). That is
-worth about 10 % on a first frame or a jump on 9.0.2 and nothing measurable on 6.1.1; the proxy cases (code path
-unchanged) differ by -23 to +30 % between before and after (steps of a few ms aside), which is the noise.
+What the scenarios did not cover is the commonest one after a click: **click on frame k, then step back one**. With a
+lead of 1 that frame is already drawn, a hit. With none it is a miss that starts a reverse window. Added as a scenario
+and measured, lead 1 against lead 0 interleaved (`click-back-one/`, 8 rounds on 9.0.2, 4 on 6.1.1, medians of each
+round's median):
 
-**What was not adopted, with the numbers.** The review suggested, for a backward miss or no direction, a short window
-starting at the frame. Tried as an experiment (an interleaved A/B on the 1080p original, 4 to 5 rounds, load ~14, the
-toggles were temporary and are not in the tree, `window-variants/`): A the old engine, B lead-free windows with the
-reverse window kept for steps back (what is committed), C B plus a short window at the frame for the first step back
-and the reverse window from the second step, D C plus a short first window for a first request or a jump.
+| click, then step back one, 1080p original | lead 1 | lead 0 | one-shot |
+| --- | --- | --- | --- |
+| 9.0.2 | 0.13 ms | 866 ms (692 to 1211) | 368 ms |
+| 6.1.1 | 0.12 ms | 925 ms (871 to 1127) | 355 ms |
 
-| 1080p original, 9.0.2, medians | A old | B committed | C | D |
+A step back that costs 2.4 times the one-shot, against a first-frame gain inside the noise: lead 1 is restored (the
+reverted commit is `e7c7042`'s `window_range`; the epoch, retry, off-lock and reaper changes in it stay).
+
+**A short window at the frame for a step back or a jump (rejected).** The review suggested it for a backward miss or no
+direction. Tried as an interleaved A/B on the 1080p original (4 to 5 rounds, load ~14, toggles temporary and not in the
+tree, `window-variants/`): A the old engine, B lead 0 with the reverse window kept for steps back, C B plus a short
+window at the frame for the first step back and the reverse window from the second, D C plus a short first window for a
+first request or a jump.
+
+| 1080p original, 9.0.2, medians | A old | B | C | D |
 | --- | --- | --- | --- | --- |
 | first frame | 824 | 717 | 744 | 725 |
 | jumps | 697 | 618 | 794 | 726 |
@@ -95,12 +110,11 @@ and the reverse window from the second step, D C plus a short first window for a
 | 20 steps back | 1916 | 1660 | 3044 | 2988 |
 | one step back (4 rounds, A B C) | 1283 | 1338 | 1121 | |
 
-C saves about 160 ms on an *isolated* step back and costs 1.2 to 1.4 s on a drag back (two processes, each with its own start
-and seek, where one window behind the frame serves the whole drag). D doubles a forward drag from a cold start, since
-the short first window is outrun and the next process pays a start. So: the window behind stays, and a jump keeps
-the full window. A jump still leaves the process decoding up to 23 frames after its frame is out, until the next
-request kills it: that is CPU and not latency (the request returned), and it is what makes the first steps of a
-forward drag hits.
+C saves about 160 ms on an *isolated* step back and costs 1.2 to 1.4 s on a drag back (two processes, each with its own
+start and seek, where one window behind the frame serves the whole drag). D doubles a forward drag from a cold start,
+since the short first window is outrun and the next process pays a start. A jump still leaves the process decoding up
+to 23 frames after its frame is out, until the next request kills it: that is CPU and not latency (the request
+returned), and it is what makes the first steps of a forward drag hits.
 
 ## What the rendered tests hold
 
