@@ -636,12 +636,7 @@ so the feature is **only** activated through these forwards — which is what ma
   box / chroma-key colours pass `valid_color` (else a safe default — a `.kerf` file
   never goes through `validate_export`), `pix_fmt` / `scaler` / `gif_dither` are
   allow-listed, and overlay text escapes `%` as `\\%` (a bare `%` makes
-  `drawtext` render nothing while ffmpeg exits 0). **Not escaped enough, found by the scrub render
-  tests and not fixed here:** the text sits in single quotes, but the filtergraph parser removes them before the
-  filter's own option parser sees the value, so a `:` in a title or caption ("Chapter 1: Intro") aborts the whole
-  export on FFmpeg 9.0.2 (`No option name near ...`; 6.1.1 accepts it), and an `'` (escaped as `'\''`) opens a quote
-  at the second level that swallows the options after it: the text is drawn black at the default size, at the top
-  left, on both builds. Both want one more level of escaping (`\:`, `\\\'`) and a render test. **Text overlays** (`Timeline.overlays`) are
+  `drawtext` render nothing while ffmpeg exits 0). **Text overlays** (`Timeline.overlays`) are
   `drawtext`'d onto the final composite (animated x/y/alpha exprs when keyframed); the
   still / preview path samples `Clip::transform_at` and draws overlays statically.
   **A `drawtext` value is read by three parsers, and `escape_drawtext` writes for all three**: the text *expansion*

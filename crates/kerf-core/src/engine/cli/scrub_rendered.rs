@@ -485,7 +485,7 @@ fn cases() -> Vec<Case> {
             "title-animated",
             |r| {
                 let (mut tl, assets) = plain_cut(r);
-                let mut title = TextOverlay::new("slide in", 0.5, 2.5);
+                let mut title = TextOverlay::new("Slide: it's in", 0.5, 2.5);
                 title.size = 0.08;
                 title.bg = Some("black@0.6".to_string());
                 title.keyframes = vec![
@@ -517,7 +517,7 @@ fn cases() -> Vec<Case> {
             "captions",
             |r| {
                 let (mut tl, assets) = plain_cut(r);
-                for (text, start, end) in [("Fifty 50% done, nearly there", 0.2, 1.8), ("the second line", 1.8, 3.0)] {
+                for (text, start, end) in [("It's 50% done: nearly there", 0.2, 1.8), ("the second line", 1.8, 3.0)] {
                     let mut caption = TextOverlay::new(text, start, end);
                     caption.generated = true;
                     caption.bg = Some("black@0.5".to_string());
