@@ -102,3 +102,23 @@
 	position: absolute;
 	inset: -2px 0;
 }
+
+/* A proposal waiting on the Agent tab: the number of changes, in the agent's hue (`agent-fg` on `agent-500`,
+   a pair the contrast guard holds to 4.5:1). The attribute is set by `Workspace.svelte`. */
+.dockview-theme-kerf .dv-default-tab-content[data-pending]::after {
+	content: attr(data-pending);
+	display: inline-block;
+	min-width: 14px;
+	height: 14px;
+	margin-left: 6px;
+	padding: 0 4px;
+	box-sizing: border-box;
+	border-radius: var(--radius-full);
+	vertical-align: 1px;
+	text-align: center;
+	font: var(--type-overline);
+	line-height: 14px;
+	letter-spacing: 0;
+	background: var(--agent-500);
+	color: var(--agent-fg);
+}

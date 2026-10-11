@@ -135,8 +135,7 @@ const DISABLED_INK_ALLOWED: Record<string, string> = {
 	'lib/components/editor/MenuBar.svelte': 'the rows of a menu that are off',
 	'lib/components/editor/ContextMenu.svelte': 'the rows of a menu that are off',
 	'lib/components/editor/NotificationCenter.svelte': 'a note\'s icon, a read mark, and the buttons that have nothing to act on',
-	'lib/components/editor/Timeline.svelte': 'the ruler\'s minor ticks, a mark and not text',
-	'lib/components/editor/AgentPanel.svelte': 'the empty queue\'s decorative icon'
+	'lib/components/editor/Timeline.svelte': 'the ruler\'s minor ticks, a mark and not text'
 };
 
 describe('the disabled color', () => {
