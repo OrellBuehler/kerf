@@ -40,7 +40,7 @@
 	import { settings } from '$lib/settings.svelte';
 	import { linkBadge, selectionUnits } from '$lib/link-ui';
 	import { fitOffer, musicSummary } from '$lib/music-ui';
-	import { DEGREES, PERCENT, SECONDS, TIMES, readout, type RowSpec } from '$lib/slider-row';
+	import { DEGREES, NUMBER_COL, PERCENT, SECONDS, TIMES, readout, type RowSpec } from '$lib/slider-row';
 	import { FieldEdits } from '$lib/field-edit';
 
 	const clip = $derived(editor.selectedClip);
@@ -430,7 +430,7 @@
 		limit: { max: clipDuration(c) }
 	});
 	/** The rows that are not sliders share the sliders' label column; their value runs to the panel's edge, over the keyframe slot, which a long one (a source range) needs at the panel's minimum width. */
-	const ROW_GRID = 'display:grid;grid-template-columns:72px minmax(0,1fr) 52px 24px;align-items:center;column-gap:8px;padding:3px 0';
+	const ROW_GRID = `display:grid;grid-template-columns:72px minmax(0,1fr) ${NUMBER_COL}px 24px;align-items:center;column-gap:8px;padding:3px 0`;
 	/** What a fade reads as in its row, so the section's summary says the same. */
 	const SECONDS_SPEC: RowSpec = { min: 0, max: 0, step: 0.1, ...SECONDS };
 	const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
@@ -460,6 +460,7 @@
 			disabled={editor.busy}
 			onfocus={noteFocus}
 			oninput={noteTyped}
+			oncompositionend={noteTyped}
 			onchange={(e) => {
 				const { scope: at, text } = endEdit(e.currentTarget);
 				const v = parseFloat(text);
@@ -536,6 +537,7 @@
 						disabled={editor.busy}
 						onfocus={noteFocus}
 						oninput={noteTyped}
+						oncompositionend={noteTyped}
 						onchange={(ev) => {
 							const { scope: at, text } = endEdit(ev.currentTarget);
 							onParam(i, k, text, at);
@@ -551,6 +553,7 @@
 						disabled={editor.busy}
 						onfocus={noteFocus}
 						oninput={noteTyped}
+						oncompositionend={noteTyped}
 						onchange={(ev) => {
 							const { scope: at, text } = endEdit(ev.currentTarget);
 							const n = parseFloat(text);
@@ -615,6 +618,7 @@
 				disabled={editor.busy}
 				onfocus={noteFocus}
 				oninput={noteTyped}
+				oncompositionend={noteTyped}
 				onchange={(e) => patchTitle(e.currentTarget, (typed) => ({ text: typed }))}
 				style={inputCss + ';flex:1;width:auto;text-align:left'}
 			/>
@@ -641,6 +645,7 @@
 				disabled={editor.busy}
 				onfocus={noteFocus}
 				oninput={noteTyped}
+				oncompositionend={noteTyped}
 				onchange={(e) => patchTitle(e.currentTarget, (typed) => ({ color: typed }))}
 				style={fxTxt}
 			/>
@@ -652,6 +657,7 @@
 				disabled={editor.busy}
 				onfocus={noteFocus}
 				oninput={noteTyped}
+				oncompositionend={noteTyped}
 				onchange={(e) => patchTitle(e.currentTarget, (typed) => ({ bg: typed }))}
 				style={fxTxt}
 			/>

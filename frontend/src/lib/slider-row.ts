@@ -27,25 +27,37 @@ export interface RowSpec {
 	limit?: { min?: number; max?: number };
 }
 
+/** Width of a row's number column, px: `10.00s` and `-1.00×` in the row's mono type, with room for `100.00s`. */
+export const NUMBER_COL = 60;
+
 /** The units rows are shown in, to spread into a spec: a fraction as a percentage, an angle, a rate, a time. */
 export const PERCENT = { scale: 100, digits: 0, unit: '%' } as const;
 export const DEGREES = { digits: 0, unit: '°' } as const;
 export const TIMES = { digits: 2, unit: '×' } as const;
 export const SECONDS = { digits: 2, unit: 's' } as const;
 
+/** What an edit was on when it began: the scope, the value it started from and the row's spec,
+ *  which depends on the scope (a fade's limit is its clip's length). */
+export interface Began<S> {
+	scope: S;
+	value: number;
+	spec: RowSpec;
+}
+
 /** What an edit was on when it began, held until it ends, so a write lands where the edit was
  *  started even when the selection has moved on in between: a typed entry that is written by the
- *  very click that selects another clip, a run of arrow keys written when focus leaves. */
+ *  very click that selects another clip, a run of arrow keys written when focus leaves. The entry
+ *  is parsed with the spec it began with, not the one the new selection has. */
 export class Pending<S> {
-	#began: { scope: S; value: number } | null = null;
+	#began: Began<S> | null = null;
 
 	/** Note what the edit is on, unless one is already under way. */
-	begin(scope: S, value: number): void {
-		this.#began ??= { scope, value };
+	begin(scope: S, value: number, spec: RowSpec): void {
+		this.#began ??= { scope, value, spec };
 	}
 
 	/** What the edit began on, or `now` when it did not begin anywhere (a double-click); ends it. */
-	end(now: { scope: S; value: number }): { scope: S; value: number } {
+	end(now: Began<S>): Began<S> {
 		const began = this.#began ?? now;
 		this.#began = null;
 		return began;
@@ -140,7 +152,7 @@ const ENTRY = /^([+-]?(?:\d+\.?\d*|\.\d+))\s*(%|°|×|x|s)?$/i;
  *  left off or written; it is shown units that are typed (50 in a percentage field is 50 %), and
  *  the result is held to the row's limits and its displayed precision. */
 export function parseEntry(text: string, s: RowSpec): number | null {
-	const m = ENTRY.exec(text.trim().replace(',', '.'));
+	const m = ENTRY.exec(text.normalize('NFKC').trim().replace(',', '.'));
 	if (!m) return null;
 	const shown = Number(m[1]);
 	if (!Number.isFinite(shown)) return null;

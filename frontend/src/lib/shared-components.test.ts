@@ -105,7 +105,10 @@ describe('SliderRow', () => {
 	});
 
 	test('every Inspector slider row is on the one grid, with the keyframe slot kept', () => {
-		expect(row).toMatch(/grid-template-columns:\s*var\(--label-w\) minmax\(0, 1fr\) 52px 24px/);
+		expect(row).toMatch(/grid-template-columns:\s*var\(--label-w\) minmax\(0, 1fr\) var\(--num-w\) 24px/);
+		expect(row).toContain('--num-w:{NUMBER_COL}px');
+		// The rows that are not sliders keep the same columns.
+		expect(inspector).toContain('minmax(0,1fr) ${NUMBER_COL}px 24px');
 		expect(row).toContain('reserve = true');
 		expect(row).toMatch(/\.slot\s*\{[^}]*width: 24px;[^}]*height: 24px/);
 	});
@@ -179,12 +182,14 @@ describe('SliderRow', () => {
 	test('a plain field commits what was typed into it, to what it took focus on', () => {
 		// By the blur the selection is the other clip's and the field has been re-rendered with that
 		// clip's value: reading either writes the other clip's number onto this one.
-		const inputs = (inspector.match(/<input\b[\s\S]*?\n\s*\/>/g) ?? []).filter((tag) => /type="(text|number)"/.test(tag));
+		const inputs = (inspector.match(/<input\b[\s\S]*?\/>/g) ?? []).filter((tag) => /type="(text|number)"/.test(tag));
 		expect(inputs.length).toBeGreaterThanOrEqual(6);
 		for (const tag of inputs) {
 			const name = tag.replace(/\s+/g, ' ').slice(0, 70);
 			expect(tag, name).toContain('onfocus={noteFocus}');
 			expect(tag, name).toContain('oninput={noteTyped}');
+			// An IME's last composition may not end in an `input` event.
+			expect(tag, name).toContain('oncompositionend={noteTyped}');
 			expect(tag, name).toMatch(/endEdit\(|patchTitle\(/);
 			expect(tag, name).not.toMatch(/currentTarget\.value(?!\s*=[^=])/);
 			expect(tag, name).not.toMatch(/\bclip[.!]|\bo\.id|selectedClip|\boverlay\b/);
@@ -201,6 +206,7 @@ describe('SliderRow', () => {
 		const tab = read(`${EDITOR}TransitionsTab.svelte`);
 		const field = tab.slice(tab.indexOf('onfocus={(e) => length.focus('), tab.indexOf('style="width:58px'));
 		expect(field).toContain('length.input(');
+		expect(field).toContain('oncompositionend=');
 		expect(field).toContain('length.end(');
 		expect(field).not.toMatch(/\bclip[.!?]|current\.kind/);
 	});

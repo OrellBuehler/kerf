@@ -667,7 +667,7 @@ too, so selecting text in a field and letting go over the dark no longer closes 
 `dismissOnScrim={false}` and never `busy` (closing mid-render leaves it running); Voiceover `busy={generating}`,
 `dismissOnScrim={scrimCloses(text, generating)}`, `initial="textarea"`; Fit / Stems / Update `busy` while they run; Settings none.
 **`SliderRow`** is one numeric property: label, slider, number field, and a 24 px slot for the keyframe button, on one grid
-(`72px 1fr 52px 24px`, the slot kept when empty so every slider in the panel is the same length; `reserve={false}` in
+(`72px 1fr 60px 24px` — `NUMBER_COL`, room for `100.00s` in the 12 px mono type — the slot kept when empty so every slider in the panel is the same length; `reserve={false}` in
 a dialog; `minmax(0, 1fr)` so the row shrinks to the Inspector's 260 px minimum without clipping a value). The slider is
 `MixSlider` (`solid`: drawn like the plain range) so a drag writes **one edit on release**, Escape / pointercancel / blur
 abandon it, a run of arrow keys is one edit and a double-click puts the property back to its rest value. **Only the thumb
@@ -676,16 +676,17 @@ replaced, as in the mixer: a jump on the first click would make a double-click t
 tick on the travel, and a property that goes both ways (`bipolar`, by default a travel across zero) fills from it instead of
 from the left. The number is a field (click, type, Enter or Tab to write, Escape to put it back; `1.1` on a 0.25 step is fine):
 what is shown is `value × scale` with `digits` decimals and a `unit` (`PERCENT`, `DEGREES`, `TIMES`, `SECONDS`), and the geometry,
-snapping, readout, entry parsing and key steps are the pure, bun-tested `slider-row.ts` (a typed entry is held to `limit`, a fade
+snapping, readout, entry parsing and key steps are the pure, bun-tested `slider-row.ts` (a typed entry is NFKC-normalised, so full-width digits parse, and held to `limit`, a fade
 as long as its clip on a 5 s slider, and to the digits shown: a fade is 0.01 s, a title's size 0.1 %). A value is *at rest* only when it
 is exactly there — a 0.4° rotation reads 0° and can still be reset or typed to 0. **A write goes to what the edit began on**: a typed
 entry is written when the field blurs, and the click that selects another clip blurs it after the selection has moved, so the row
 reads its `scope` (clip, title, playhead time; `Pending` in `slider-row.ts`) when a drag, a key run or a typed entry *starts* and hands it
-back with the value (`at`); the Inspector's helpers (`setTf`, `setCol`, `setCam`, `patchMask`, `setFade`, `moveTitle`, and a keyed
+back with the value (`at`); the entry is parsed with the **spec it began with** too (a fade typed on a 20 s clip and committed by the click on a 3 s one is not
+clamped to 3 s), and focusing the number field starts a fresh `Pending`, so one left behind by a row that was disabled mid-focus is not inherited; the Inspector's helpers (`setTf`, `setCol`, `setCam`, `patchMask`, `setFade`, `moveTitle`, and a keyed
 number's `keyAtPlayhead`) read that clip. **A plain field** (`numRow`, a title's Text / Color / Box / Font / Bold, an effect's parameters, the
 Transitions tab's length) is no different: its `change` comes with the blur, by when the selection has moved *and the field has been
 re-rendered with the new selection's value*, so reading either writes the other clip's number onto this one. `FieldEdits`
-(`field-edit.ts`) notes the scope on `focus` and the typed text on `input`, and the commit takes both from there (`noteFocus` /
+(`field-edit.ts`) notes the scope on `focus` and the typed text on `input` and `compositionend`, and the commit takes both from there (`noteFocus` /
 `noteTyped` / `endEdit` in the Inspector); a select or a checkbox changes at once and only needs the scope. A bun test holds every
 text and number input of the Inspector to this. Rest values are the model's
 `DEFAULT_TRANSFORM` / `DEFAULT_COLOR` / `DEFAULT_REFRAME` / `DEFAULT_MASK`. The Inspector's other rows (read-only values, plain number

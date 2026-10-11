@@ -54,6 +54,7 @@
 						aria-label="Transition length in seconds"
 						onfocus={(e) => length.focus(e.currentTarget, editor.selectedClipId)}
 						oninput={(e) => length.input(e.currentTarget, e.currentTarget.value)}
+						oncompositionend={(e) => length.input(e.currentTarget, e.currentTarget.value)}
 						onchange={(e) => {
 							const { scope: id, text } = length.end(e.currentTarget, { scope: editor.selectedClipId, text: e.currentTarget.value });
 							const v = parseFloat(text);

@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
 	DEGREES,
+	NUMBER_COL,
 	Pending,
 	PERCENT,
 	SECONDS,
@@ -146,6 +147,14 @@ describe('readout', () => {
 });
 
 describe('parseEntry', () => {
+	test('full-width digits, point and units, as an IME writes them, parse', () => {
+		expect(parseEntry('５５', SCALE)).toBe(0.55);
+		expect(parseEntry('１．２５', RATE)).toBe(1.25);
+		expect(parseEntry('５０％', SCALE)).toBe(0.5);
+		expect(parseEntry('－４５', ROTATION)).toBe(-45);
+		expect(parseEntry('１２ｓ', FADE)).toBe(12);
+	});
+
 	test('reads a number with or without its unit, in shown units', () => {
 		expect(parseEntry('55', SCALE)).toBe(0.55);
 		expect(parseEntry('55%', SCALE)).toBe(0.55);
@@ -249,13 +258,22 @@ describe('the unit presets', () => {
 	});
 });
 
+describe('NUMBER_COL', () => {
+	test('the number column fits what a row reads, in 12 px mono (0.6 em a character) with its 3 px padding and 1 px border', () => {
+		const room = (NUMBER_COL - 2 * (3 + 1)) / 7.2;
+		const longest = [readout(10, FADE), readout(100, FADE), readout(-10, FADE), readout(-1, RATE), readout(-180, ROTATION), readout(4, SCALE)];
+		expect(longest).toContain('100.00s');
+		for (const text of longest) expect(text.length, text).toBeLessThanOrEqual(room);
+	});
+});
+
 describe('Pending', () => {
-	const A = { scope: 'clip A', value: 1 };
-	const B = { scope: 'clip B', value: 2 };
+	const A = { scope: 'clip A', value: 1, spec: FADE };
+	const B = { scope: 'clip B', value: 2, spec: { ...FADE, limit: { max: 3 } } };
 
 	test('an edit ends on what it began on, not on what is selected by then', () => {
 		const edit = new Pending<string>();
-		edit.begin(A.scope, A.value);
+		edit.begin(A.scope, A.value, A.spec);
 		expect(edit.end(B)).toEqual(A);
 	});
 
@@ -265,28 +283,40 @@ describe('Pending', () => {
 
 	test('the first beginning stands: a drag does not move the target it started on', () => {
 		const edit = new Pending<string>();
-		edit.begin(A.scope, A.value);
-		edit.begin(B.scope, B.value);
+		edit.begin(A.scope, A.value, A.spec);
+		edit.begin(B.scope, B.value, B.spec);
 		expect(edit.end(B)).toEqual(A);
 	});
 
 	test('it ends once: the next edit begins afresh', () => {
 		const edit = new Pending<string>();
-		edit.begin(A.scope, A.value);
+		edit.begin(A.scope, A.value, A.spec);
 		edit.end(A);
 		expect(edit.end(B)).toEqual(B);
 	});
 
 	test('a given-up edit leaves nothing behind', () => {
 		const edit = new Pending<string>();
-		edit.begin(A.scope, A.value);
+		edit.begin(A.scope, A.value, A.spec);
 		edit.drop();
 		expect(edit.end(B)).toEqual(B);
 	});
 
 	test('a clip and a playhead time travel together', () => {
 		const edit = new Pending<{ clip: string; time: number }>();
-		edit.begin({ clip: 'c1', time: 1.5 }, 0.4);
-		expect(edit.end({ scope: { clip: 'c2', time: 9 }, value: 1 })).toEqual({ scope: { clip: 'c1', time: 1.5 }, value: 0.4 });
+		edit.begin({ clip: 'c1', time: 1.5 }, 0.4, FADE);
+		expect(edit.end({ scope: { clip: 'c2', time: 9 }, value: 1, spec: FADE })).toEqual({ scope: { clip: 'c1', time: 1.5 }, value: 0.4, spec: FADE });
+	});
+
+	test('a typed entry is held to the limit it began with, not the new selection’s', () => {
+		// A fade typed on a 20 s clip and committed by the click that selects a 3 s clip.
+		const onA: RowSpec = { ...FADE, limit: { max: 20 } };
+		const onB: RowSpec = { ...FADE, limit: { max: 3 } };
+		const edit = new Pending<string>();
+		edit.begin('clip A', 0, onA);
+		const from = edit.end({ scope: 'clip B', value: 0, spec: onB });
+		expect(parseEntry('12', from.spec)).toBe(12);
+		expect(parseEntry('12', onB)).toBe(3);
+		expect(entryFor('12', from.value, from.spec)).toEqual({ kind: 'commit', value: 12 });
 	});
 });

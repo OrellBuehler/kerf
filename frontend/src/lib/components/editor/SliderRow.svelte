@@ -17,6 +17,7 @@
 		fillOrigin,
 		fromPos,
 		neutralOf,
+		NUMBER_COL,
 		Pending,
 		readout,
 		resetTo,
@@ -57,10 +58,10 @@
 	let preview = $state<number | null>(null);
 	const shown = $derived(preview ?? value);
 	const pending = new Pending<S>();
-	const now = () => ({ scope: scope as S, value });
+	const now = () => ({ scope: scope as S, value, spec });
 
 	function move(v: number) {
-		pending.begin(scope as S, value);
+		pending.begin(scope as S, value, spec);
 		preview = v;
 	}
 	/** The slider keeps showing where it was let go until the write has landed, so it does not
@@ -92,7 +93,9 @@
 	function enter(e: FocusEvent & { currentTarget: HTMLInputElement }) {
 		editing = true;
 		dirty = false;
-		pending.begin(scope as S, value);
+		// A fresh edit: one left over (the row was disabled while it had focus, and never blurred) is not this one's.
+		pending.drop();
+		pending.begin(scope as S, value, spec);
 		text = editable(shown, spec);
 		e.currentTarget.value = text;
 		e.currentTarget.select();
@@ -100,7 +103,7 @@
 	function leave(e: FocusEvent & { currentTarget: HTMLInputElement }) {
 		editing = false;
 		const from = pending.end(now());
-		const entry = dirty ? entryFor(e.currentTarget.value, from.value, spec) : ({ kind: 'revert' } as const);
+		const entry = dirty ? entryFor(e.currentTarget.value, from.value, from.spec) : ({ kind: 'revert' } as const);
 		dirty = false;
 		if (entry.kind === 'commit') void write(entry.value, from.scope);
 	}
@@ -117,7 +120,7 @@
 	}
 </script>
 
-<div class="row" class:slotless={!reserve && !keyframe} style="--label-w:{labelWidth}px">
+<div class="row" class:slotless={!reserve && !keyframe} style="--label-w:{labelWidth}px;--num-w:{NUMBER_COL}px">
 	<span class="label" title={label}>{label}</span>
 	<MixSlider
 		orientation="horizontal"
@@ -163,14 +166,14 @@
 <style>
 	.row {
 		display: grid;
-		grid-template-columns: var(--label-w) minmax(0, 1fr) 52px 24px;
+		grid-template-columns: var(--label-w) minmax(0, 1fr) var(--num-w) 24px;
 		align-items: center;
 		column-gap: 8px;
 		padding: 2px 0;
 		min-width: 0;
 	}
 	.row.slotless {
-		grid-template-columns: var(--label-w) minmax(0, 1fr) 52px;
+		grid-template-columns: var(--label-w) minmax(0, 1fr) var(--num-w);
 	}
 	.label {
 		font-size: var(--text-sm);
@@ -185,7 +188,7 @@
 		width: 100%;
 		min-width: 0;
 		height: 24px;
-		padding: 0 5px;
+		padding: 0 3px;
 		text-align: right;
 		font-family: var(--font-mono);
 		font-size: var(--text-sm);
