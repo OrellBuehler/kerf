@@ -86,19 +86,22 @@ pub(crate) fn clip_source_time(clip: &Clip, asset_duration: f64, t: f64) -> f64 
 ///
 /// This is the computation `build_still_args` always made inline; it lives here
 /// so the GPU plan shares it instead of copying it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn active_video_clips<'a>(timeline: &'a Timeline, assets: &[Asset], t: f64) -> Vec<ActiveClip<'a>> {
-    active_video_clips_with_tails(timeline, assets, t, &[])
+    active_video_clips_with_tails(timeline, assets, t, &[], t)
 }
 
 /// [`active_video_clips`] with a clip kept on screen for `tails[flat]` seconds past its end
-/// (an outgoing clip playing on under a transition: `ClipFx::tail`). A `flat` past the end of
-/// `tails` has none, so an empty slice is `active_video_clips` itself.
+/// (an outgoing clip playing on under a transition: `ClipFx::tail`), its tail window judged at
+/// `tail_at` instead of `t`. The export decides a frame's tail from the frame's own time, which
+/// is the start of its slot and so can be before the `t` a still is asked for: a window that
+/// closes inside a frame is still open for that frame. A `flat` past the end of `tails` has no
+/// tail, so an empty slice is `active_video_clips` itself.
 pub(crate) fn active_video_clips_with_tails<'a>(
     timeline: &'a Timeline,
     assets: &[Asset],
     t: f64,
     tails: &[f64],
+    tail_at: f64,
 ) -> Vec<ActiveClip<'a>> {
     let asset_of = |id| assets.iter().find(|a: &&Asset| a.id == id);
     let mut active = Vec::new();
@@ -114,7 +117,9 @@ pub(crate) fn active_video_clips_with_tails<'a>(
         for &ci in &order {
             let clip = &track.clips[ci];
             let tail = tails.get(first + ci).copied().unwrap_or(0.0);
-            if t < clip.timeline_start || t >= clip.timeline_end() + tail {
+            let on =
+                t >= clip.timeline_start && (t < clip.timeline_end() || (tail > 0.0 && tail_at < clip.timeline_end() + tail));
+            if !on {
                 continue;
             }
             let dur = asset_of(clip.asset_id).map(|a| a.duration).unwrap_or(clip.source_out);
@@ -1004,7 +1009,7 @@ mod tests {
         let assets = std::slice::from_ref(&a);
         let tails = [0.0, 1.5, 0.0];
         let at = |t: f64| {
-            active_video_clips_with_tails(&tl, assets, t, &tails)
+            active_video_clips_with_tails(&tl, assets, t, &tails, t)
                 .iter()
                 .map(|c| (c.flat, (c.source_time * 1000.0).round() as i64))
                 .collect::<Vec<_>>()
@@ -1018,7 +1023,10 @@ mod tests {
         // Without tails (or with a table that stops short) it is `active_video_clips`.
         let plain = active_video_clips(&tl, assets, 4.5);
         assert_eq!(plain.len(), 1);
-        assert_eq!(active_video_clips_with_tails(&tl, assets, 4.5, &[0.0]).len(), 1);
+        assert_eq!(active_video_clips_with_tails(&tl, assets, 4.5, &[0.0], 4.5).len(), 1);
+        // The tail is judged at `tail_at`: a window that closes inside a frame is open for it.
+        let at = |t, tail_at| active_video_clips_with_tails(&tl, assets, t, &tails, tail_at).len();
+        assert_eq!((at(5.52, 5.5), at(5.52, 5.49)), (1, 2));
     }
 
     #[test]

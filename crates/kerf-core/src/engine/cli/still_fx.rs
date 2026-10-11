@@ -33,6 +33,10 @@ pub(super) struct StillFades {
     moment: Option<(i64, Rational)>,
     /// The source has an alpha channel of its own, which the picture keeps to the overlay.
     alpha_source: bool,
+    /// The export runs this clip's whole chain on an alpha plane because it enters through a
+    /// dissolve (`ClipFx::xfade_in`), whether or not the ramp is still running: a later fade
+    /// of its own, or a dip out, then runs on `yuva420p`, where black is 0 and not 16.
+    alpha_chain: bool,
 }
 
 impl StillFades {
@@ -54,9 +58,10 @@ impl StillFades {
         }
     }
 
-    /// A dissolve's ramp is the alpha plane, which the chain has to have established.
+    /// The chain has to establish an alpha plane before the fades, as the export's does for a
+    /// clip that enters through a dissolve (the ramp itself, or a fade after it is over).
     pub(super) fn needs_alpha(&self) -> bool {
-        self.steps.iter().any(|s| s.tint == FadeTint::Alpha)
+        self.alpha_chain
     }
 
     /// The filters to run at the end of the chain, where the export's fades are: the frame
@@ -104,16 +109,22 @@ pub(super) fn still_layers<'a>(timeline: &'a Timeline, assets: &[Asset], fps: f6
     let tails: Vec<f64> = fx.iter().map(|f| f.tail).collect();
     let frame = canvas.frame_containing(t);
     let graph_time = canvas.frame_time(frame);
+    // A tail is open for the frames whose slot starts inside its window: judged at the slot, not
+    // at `t` (a window can close inside the frame), and a nanosecond late so that a window that
+    // ends on a frame boundary is closed for the frame that starts there, as the source has no
+    // frame to show then.
+    let tail_at = canvas.exact_time(frame) + 1e-9;
     let frame = i64::try_from(frame).unwrap_or(i64::MAX);
-    active_video_clips_with_tails(timeline, assets, t, &tails)
+    active_video_clips_with_tails(timeline, assets, t, &tails, tail_at)
         .into_iter()
         .map(|active| {
             let timing = ClipTiming::new(active.clip, &fx[active.flat]);
             // Which fades are in progress is the still plan's own question (`LayerFx::in_progress`,
             // on the canvas rate), so the frames the plan refuses are the frames drawn here.
-            let steps: Vec<FadeStep> = timing
-                .fades()
-                .into_iter()
+            let all = timing.fades();
+            let steps: Vec<FadeStep> = all
+                .iter()
+                .copied()
                 .filter(|s| s.progress_at_frame(frame, canvas.num, canvas.den) < 1.0)
                 .collect();
             // The graph's time for the frame, not `t`: the overlay truncates the travel to whole
@@ -125,6 +136,7 @@ pub(super) fn still_layers<'a>(timeline: &'a Timeline, assets: &[Asset], fps: f6
                 active,
                 fades: StillFades {
                     moment: (!steps.is_empty()).then_some((frame, pick)),
+                    alpha_chain: !steps.is_empty() && all.iter().any(|s| s.tint == FadeTint::Alpha),
                     steps,
                     alpha_source: fx[active.flat].alpha,
                 },
@@ -262,6 +274,40 @@ mod tests {
         // Once the travel is done, nothing moves and the outgoing clip is gone.
         let done = layers_of(&push, &asset, 12.5);
         assert_eq!((done.len(), done[0].motion), (1, (0.0, 0.0)));
+    }
+
+    #[test]
+    fn a_fade_after_a_dissolve_runs_on_the_alpha_plane_the_dissolve_established() {
+        let asset = asset();
+        let mut tl = pair(&asset, TransitionKind::Crossfade, 1.0);
+        tl.tracks[0].clips[1].fade_out = 1.0;
+        let late = layers_of(&tl, &asset, 19.5);
+        assert_eq!(late.len(), 1);
+        // The ramp is long over, but the export's chain for this clip is on `yuva420p` from
+        // the dissolve on, and so is the fade out.
+        assert!(late[0].fades.needs_alpha());
+        assert_eq!(late[0].fades.filters()[2], "fade=t=out:st=19:d=1");
+        // With no fade in progress the chain is the one a still always had.
+        let plain = layers_of(&tl, &asset, 15.0);
+        assert!(!plain[0].fades.needs_alpha() && plain[0].fades.filters().is_empty());
+        // A clip that did not enter through a dissolve fades on its own pixel format.
+        let mut own = pair(&asset, TransitionKind::SlideLeft, 1.0);
+        own.tracks[0].clips[1].fade_out = 1.0;
+        assert!(!layers_of(&own, &asset, 19.5)[0].fades.needs_alpha());
+    }
+
+    #[test]
+    fn a_tail_is_open_for_every_frame_that_starts_inside_its_window() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        // 0.61 s is 18.3 frames: the window closes at 10.61, inside frame 318 (10.6 to 10.6333).
+        let tl = pair(&asset, TransitionKind::Crossfade, 0.61);
+        let count = |t: f64| still_layers(&tl, std::slice::from_ref(&asset), 30.0, t).len();
+        assert_eq!((count(10.6), count(10.6167), count(10.6299)), (2, 2, 2));
+        assert_eq!(count(10.6334), 1, "frame 319 starts after the window");
+        // On the grid the window ends on a frame boundary, and that frame has no tail.
+        let grid = pair(&asset, TransitionKind::Crossfade, 0.5);
+        let count = |t: f64| still_layers(&grid, std::slice::from_ref(&asset), 30.0, t).len();
+        assert_eq!((count(10.0 + 14.0 / 30.0), count(10.5), count(10.5 + 0.5 / 30.0)), (2, 1, 1));
     }
 
     #[test]

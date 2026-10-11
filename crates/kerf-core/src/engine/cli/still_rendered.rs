@@ -10,12 +10,16 @@
 //!
 //! * a dissolve (the outgoing clip on its tail under the incoming one's alpha ramp), also with the
 //!   outgoing clip reversed and sped up, with the incoming one transformed, and out of black;
-//! * a dip to black and to white, a clip's own fade-in and fade-out;
+//! * a dip to black and to white, a clip's own fade-in and fade-out, and an incoming clip that fades
+//!   or dips out again after its dissolve (its chain stays on an alpha plane, where black is 0);
 //! * every slide and push;
-//! * each at 24 / 25 / 29.97 / 30 / 60 fps (the transition is counted in output frames).
+//! * each at 24 / 25 / 29.97 / 30 / 60 fps (the transition is counted in output frames);
+//! * a transition 18.3 frames long at 30 fps, the still asked for at the start, the middle and the
+//!   end of every frame (the frame it shows is the one its time falls in, and the outgoing tail's
+//!   window closes inside one of them).
 //!
 //! The rendered pictures are compared pixel by pixel after the same conversion to rgb24. Set
-//! `KERF_STILL_DUMP=<dir>` to keep the raw frames of both (`<case>-<k>-export.rgb` / `-still.rgb`)
+//! `KERF_STILL_DUMP=<dir>` to keep the raw frames of both (`<case>-<fps>-<k>-<phase>-export.rgb` / `-still.rgb`)
 //! and `KERF_STILL_VERBOSE=1` to print every case's worst frame.
 //!
 //! `cargo test -p kerf-core --no-default-features -- --ignored still_rendered`
@@ -147,6 +151,9 @@ struct Case {
     tolerance: (u8, f64),
     /// The least the export itself changes over the span (worst channel): the case does something.
     moves: u8,
+    /// Where in each output frame the still is asked for, in frames after its start: a still is
+    /// asked for any time, and the frame it shows is the one the time falls in.
+    phases: &'static [f64],
 }
 
 impl Case {
@@ -158,7 +165,12 @@ impl Case {
             span,
             tolerance: (1, 0.1),
             moves: 40,
+            phases: &[0.0],
         }
+    }
+
+    fn sampled_at(self, phases: &'static [f64]) -> Self {
+        Self { phases, ..self }
     }
 
     fn at(self, rate: Rate) -> Self {
@@ -240,6 +252,43 @@ fn fade_out(ids: Ids) -> Timeline {
     let mut clip = make_clip(ids.video, 0.0, 2.0, 0.0);
     clip.fade_out = 0.5;
     timeline_of(vec![video_track(vec![clip])])
+}
+
+/// A dissolve whose incoming clip then fades out on its own: the export's chain for that clip is on
+/// an alpha plane from the dissolve on, and so is the fade, long after the ramp is over.
+fn crossfade_then_fade_out(ids: Ids) -> Timeline {
+    let a = make_clip(ids.video, 0.0, 1.0, 0.0);
+    let mut b = make_clip(ids.video, 2.0, 4.0, 1.0);
+    entering(&mut b, TransitionKind::Crossfade, 0.5);
+    b.fade_out = 1.0;
+    timeline_of(vec![video_track(vec![a, b])])
+}
+
+/// The same incoming clip dipping out to the clip after it.
+fn crossfade_then_dip_out(ids: Ids) -> Timeline {
+    let a = make_clip(ids.video, 0.0, 1.0, 0.0);
+    let mut b = make_clip(ids.video, 2.0, 4.0, 1.0);
+    entering(&mut b, TransitionKind::Crossfade, 0.5);
+    let mut c = make_clip(ids.video, 0.0, 1.0, 3.0);
+    entering(&mut c, TransitionKind::DipToBlack, 2.0);
+    timeline_of(vec![video_track(vec![a, b, c])])
+}
+
+/// A transition whose length is not a whole number of frames at 30 fps (18.3), over an incoming
+/// clip that leaves a border: the outgoing clip's tail window closes inside a frame, and that frame
+/// still draws it.
+fn off_grid(ids: Ids, kind: TransitionKind) -> Timeline {
+    let mut tl = then(ids, kind, 0.61);
+    tl.tracks[0].clips[1].transform.scale = 0.5;
+    tl
+}
+
+fn dissolve_off_grid(ids: Ids) -> Timeline {
+    off_grid(ids, TransitionKind::Crossfade)
+}
+
+fn slide_off_grid(ids: Ids) -> Timeline {
+    off_grid(ids, TransitionKind::SlideLeft)
 }
 
 fn dissolve_from_black(ids: Ids) -> Timeline {
@@ -358,6 +407,16 @@ fn cases() -> Vec<Case> {
         Case::new("dissolve-over-a-track", dissolve_over_a_track, (0.9, 1.7)),
         Case::new("dissolve-own-fades", dissolve_with_own_fades, (0.2, 1.7)),
         Case::new("dissolve-from-an-image", dissolve_from_an_image, (0.9, 1.7)),
+        Case::new("crossfade-then-fade-out", crossfade_then_fade_out, (1.9, 3.1)),
+        Case::new("crossfade-then-fade-out", crossfade_then_fade_out, (1.9, 3.1)).at(RATES[3]),
+        Case::new("crossfade-then-dip-out", crossfade_then_dip_out, (1.9, 3.9)),
+        Case::new("crossfade-then-dip-out", crossfade_then_dip_out, (1.9, 3.9)).at(RATES[3]),
+        Case::new("dissolve-off-grid", dissolve_off_grid, (1.4, 1.75))
+            .at(RATES[3])
+            .sampled_at(&[0.0, 0.5, 0.95]),
+        Case::new("slide-off-grid", slide_off_grid, (1.4, 1.75))
+            .at(RATES[3])
+            .sampled_at(&[0.0, 0.5, 0.95]),
         Case::new("dissolve-into-a-zoom", dissolve_into_a_zoom, (0.9, 1.7)),
     ];
     for rate in &RATES[1..] {
@@ -399,24 +458,27 @@ fn run(dir: &Path, case: &Case, dump: Option<&Path>) -> Worst {
     };
     let mut first: Option<&Vec<u8>> = None;
     for (k, exported) in frames.iter().enumerate() {
-        let t = ffmpeg_frame_time(k as u64, num, den);
-        if t < case.span.0 || t > case.span.1 {
+        let slot = ffmpeg_frame_time(k as u64, num, den);
+        if slot < case.span.0 || slot > case.span.1 {
             continue;
         }
-        let still = still_frame(&timeline, &assets, &opts, t);
-        let (channel, mean) = distance(exported, &still);
         if let Some(f) = first {
             worst.moved = worst.moved.max(distance(f, exported).0);
         }
         first.get_or_insert(exported);
-        worst.frames += 1;
-        if channel > worst.channel || (channel == worst.channel && mean > worst.mean) {
-            (worst.channel, worst.mean, worst.at) = (channel, mean, t);
-        }
-        if let Some(out) = dump {
-            let stem = format!("{}-{fps}-{k:03}", case.name);
-            std::fs::write(out.join(format!("{stem}-export.rgb")), exported).unwrap();
-            std::fs::write(out.join(format!("{stem}-still.rgb")), &still).unwrap();
+        for &phase in case.phases {
+            let t = slot + phase * f64::from(den) / f64::from(num);
+            let still = still_frame(&timeline, &assets, &opts, t);
+            let (channel, mean) = distance(exported, &still);
+            worst.frames += 1;
+            if channel > worst.channel || (channel == worst.channel && mean > worst.mean) {
+                (worst.channel, worst.mean, worst.at) = (channel, mean, t);
+            }
+            if let Some(out) = dump {
+                let stem = format!("{}-{fps}-{k:03}-{phase}", case.name);
+                std::fs::write(out.join(format!("{stem}-export.rgb")), exported).unwrap();
+                std::fs::write(out.join(format!("{stem}-still.rgb")), &still).unwrap();
+            }
         }
     }
     worst
@@ -474,6 +536,9 @@ fn a_still_inside_a_dissolve_is_the_exports_frame() {
         "dissolve-own-fades",
         "dissolve-from-an-image",
         "dissolve-into-a-zoom",
+        "dissolve-off-grid",
+        "crossfade-then-fade-out",
+        "crossfade-then-dip-out",
     ]);
 }
 
@@ -495,5 +560,6 @@ fn a_still_inside_a_slide_or_a_push_is_the_exports_frame() {
         "push-right",
         "push-up",
         "push-down",
+        "slide-off-grid",
     ]);
 }

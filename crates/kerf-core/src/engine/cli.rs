@@ -9536,6 +9536,24 @@ mod tests {
             .contains("fade=t=out:st=9:d=1,setpts=PTS-STARTPTS,format=yuva420p[v0]"));
     }
 
+    /// A clip that entered through a dissolve has its whole chain on an alpha plane in the export,
+    /// so a fade of its own after the ramp is over runs on `yuva420p` (where black is 0), and the
+    /// still's chain ends in no `yuv420p` that would run it on another format.
+    #[test]
+    fn a_fade_after_a_dissolve_runs_on_yuva420p_like_the_exports() {
+        let (mut tl, assets) = transition_cut(TransitionKind::Crossfade, 1.0);
+        tl.tracks[0].clips[1].fade_out = 1.0;
+        let graph = still_args_at(&tl, &assets, 19.5).join(" ");
+        assert!(
+            graph.contains("setsar=1,format=yuva420p,settb=expr=1/30,setpts=585,fade=t=out:st=19:d=1,setpts=PTS-STARTPTS[v0]"),
+            "{graph}"
+        );
+        assert!(!graph.contains("format=yuv420p"), "{graph}");
+        // Outside the fade it is the plain chain.
+        let plain = still_args_at(&tl, &assets, 15.0).join(" ");
+        assert!(!plain.contains("yuva420p") && !plain.contains("fade"), "{plain}");
+    }
+
     /// A clip's own fade-in is drawn until it is done, and then the still is what it always was.
     #[test]
     fn a_still_inside_a_clips_own_fade_runs_the_fade_until_it_is_over() {
