@@ -38,7 +38,7 @@ use super::rendered::export_frames_sized;
 use super::scrub::Snapshot;
 use super::*;
 use crate::engine::test_support::{image_stream, make_clip, test_asset, timeline_of, video_stream, video_track, StatusBounded};
-use crate::model::{Asset, Clip, Delivery, Keyframe, TextOverlay};
+use crate::model::{Asset, Clip, Delivery, Keyframe, TextKeyframe, TextOverlay};
 
 const W: u32 = 320;
 const H: u32 = 180;
@@ -68,6 +68,7 @@ fn source(dir: &Path, name: &str, fps: &str, secs: u32) -> Asset {
     }
     let rate: f64 = match fps {
         "30000/1001" => 30000.0 / 1001.0,
+        "24000/1001" => 24000.0 / 1001.0,
         other => other.parse().unwrap(),
     };
     let mut asset = test_asset(vec![video_stream(W, H, rate)]);
@@ -210,6 +211,7 @@ struct Rig {
     a25: Asset,
     a60: Asset,
     a2997: Asset,
+    a23976: Asset,
     image: Asset,
 }
 
@@ -236,6 +238,7 @@ impl Rig {
             a25: source(&dir, "testsrc", "25", 6),
             a60: source(&dir, "testsrc", "60", 6),
             a2997: source(&dir, "testsrc", "30000/1001", 6),
+            a23976: source(&dir, "testsrc", "24000/1001", 6),
             a30,
             image,
             dir,
@@ -353,6 +356,13 @@ fn one(rig: &Rig, src_in: f64, src_out: f64, start: f64, edit: impl FnOnce(&mut 
     (timeline_of(vec![video_track(vec![clip])]), vec![rig.a30.clone()])
 }
 
+/// One clip of `asset`, `edit`ed: a cut that runs at the asset's own rate.
+fn one_of(asset: &Asset, src_in: f64, src_out: f64, start: f64, edit: impl FnOnce(&mut Clip)) -> (Timeline, Vec<Asset>) {
+    let mut clip = make_clip(asset.id, src_in, src_out, start);
+    edit(&mut clip);
+    (timeline_of(vec![video_track(vec![clip])]), vec![asset.clone()])
+}
+
 /// A fraction of a 30 fps frame, in seconds.
 fn frac(f: f64) -> f64 {
     f / 30.0
@@ -454,6 +464,71 @@ fn cases() -> Vec<Case> {
             &[(1, 25), (40, 64)],
         )
         .delivered_at(180, 320),
+        // A cut that is itself 29.97 or 23.976: frame k is at k * 1001 / 30000, or k * 1001 / 24000.
+        Case::new(
+            "cut-29.97",
+            |r| one_of(&r.a2997, 0.5, 5.0, 0.0, |_| {}),
+            &[(0, 12), (7, 31), (61, 85), (108, 134)],
+        ),
+        Case::new(
+            "cut-23.976",
+            |r| one_of(&r.a23976, 0.5, 5.0, 0.0, |_| {}),
+            &[(0, 12), (7, 31), (61, 85), (82, 107)],
+        ),
+        Case::new(
+            "cut-23.976-in+.5f",
+            |r| one_of(&r.a23976, 0.5 + 0.5 * 1001.0 / 24000.0, 5.0, 0.0, |_| {}),
+            &[(1, 25), (61, 85)],
+        ),
+        // Titles: one that moves and fades, over a box, and two captions that meet at a frame.
+        Case::new(
+            "title-animated",
+            |r| {
+                let (mut tl, assets) = plain_cut(r);
+                let mut title = TextOverlay::new("slide in", 0.5, 2.5);
+                title.size = 0.08;
+                title.bg = Some("black@0.6".to_string());
+                title.keyframes = vec![
+                    TextKeyframe {
+                        time: 0.0,
+                        pos_x: 0.2,
+                        pos_y: 0.9,
+                        opacity: 0.0,
+                    },
+                    TextKeyframe {
+                        time: 1.0,
+                        pos_x: 0.5,
+                        pos_y: 0.8,
+                        opacity: 1.0,
+                    },
+                    TextKeyframe {
+                        time: 2.0,
+                        pos_x: 0.8,
+                        pos_y: 0.3,
+                        opacity: 0.5,
+                    },
+                ];
+                tl.overlays.push(title);
+                (tl, assets)
+            },
+            &[(10, 34), (40, 64), (61, 75)],
+        ),
+        Case::new(
+            "captions",
+            |r| {
+                let (mut tl, assets) = plain_cut(r);
+                for (text, start, end) in [("Fifty 50% done, nearly there", 0.2, 1.8), ("the second line", 1.8, 3.0)] {
+                    let mut caption = TextOverlay::new(text, start, end);
+                    caption.generated = true;
+                    caption.bg = Some("black@0.5".to_string());
+                    caption.pos_y = 0.9;
+                    caption.size = 0.07;
+                    tl.overlays.push(caption);
+                }
+                (tl, assets)
+            },
+            &[(7, 31), (40, 54), (55, 79)],
+        ),
         Case::new(
             "image",
             |r| {
