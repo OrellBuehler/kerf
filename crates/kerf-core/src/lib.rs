@@ -18,6 +18,7 @@ pub mod plan_caps;
 pub mod plan_epoch;
 pub mod planner;
 pub mod platform;
+pub mod play_plan;
 pub mod project;
 pub mod proxy;
 pub mod render_plan;
@@ -78,6 +79,7 @@ pub use platform::{
     check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind, PlatformReport, PlatformTarget, Severity,
     TARGETS as PLATFORM_TARGETS,
 };
+pub use play_plan::{PlayAhead, PlayCut, PlayRefusal};
 pub use project::{FramingPlan, Project, SmartCropJob, SmartCropPlan, StemsPlaced, MAX_CHANNEL_KEYS, VOICEOVER_TRACK};
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use render_plan::{

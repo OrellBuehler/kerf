@@ -195,6 +195,21 @@
   `Planner::new` / `at_frame` / `span` / `first_unsupported` over a 500-clip, five-track cut
   (print-only; here 0.8 ms to plan the cut, 3 µs a frame with five layers on screen and 5 µs
   a frame for `span` / `first_unsupported` with `reasons` at 1080p).
+  **`PlayCut`** (`play_plan.rs`, pure) is the cut a compositor that **plays** draws, which is what
+  `stream_preview` plays: a `PlanMode::Motion` planner over `Timeline::slice(start, ..)`, so the clips'
+  `fps` picks, fades and dissolves are the export's of that slice. `start` is a frame of the project's
+  grid (slice frame `j` is frame `k0 + j` of the cut, so a page counting frames agrees), or the latest grid
+  frame before a transition window `SpanPlan::handover` says a slice there would cut off (the caller
+  draws nothing before the time it was asked for; the clips are read through). The slice is taken a
+  nanosecond early (`SLICE_BIAS`): a clip placed after others sums their lengths and can start a float's
+  width under the frame, and a slice that "cuts" it by that width drops its fade-in and its transition.
+  The frame and the rate are the **whole** cut's, pinned in the slice's options (a slice that drops the
+  first clip would derive another canvas), and a cut outside 1 to 60 fps is refused as the stream's rate
+  is. `PlayCut::ahead(from, horizon, size, caps)` is the lazy scan: the first frame the compositor does
+  not draw — `PlayRefusal::Plan(Unsupported)` — or draws exactly but **not in time** (`Reversed`: the cursor
+  reads the clip's whole window before its first frame; `MovingText`: a title whose position is keyed
+  is a new `drawtext` rasterisation per frame), with `handover`, the time a stream that carries on must
+  start at (`SpanPlan::handover` of the slice's windows, in the cut's time).
   `engine/cli/sweep.rs` holds
   the Motion plan against the **evaluated** graph (a ~50-line evaluator for
   `keyframe_expr`'s grammar: zoom / rotate / opacity, the overlay's x/y against the
