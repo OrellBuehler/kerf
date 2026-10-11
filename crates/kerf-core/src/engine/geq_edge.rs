@@ -13,7 +13,8 @@
 //! [`GeqEdge::Unknown`], not a guess, and is retried after a backoff.
 //!
 //! **The first call blocks** for the length of one short ffmpeg run (tens of milliseconds, bounded
-//! by [`PROBE_TIMEOUT`]): call it from a blocking thread.
+//! by [`PROBE_TIMEOUT`]) and holds no lock while it does: call it from a blocking thread, ahead of the
+//! frame that needs it (`kerf_gpu::prepare`).
 
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -62,14 +63,24 @@ fn backoff(failures: u32) -> Duration {
 }
 
 fn cached(state: &Mutex<State>, now: Instant, measure: impl FnOnce() -> Option<GeqEdge>) -> GeqEdge {
+    {
+        let s = state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(edge) = s.measured {
+            return edge;
+        }
+        if s.retry_at.is_some_and(|t| now < t) {
+            return GeqEdge::Unknown;
+        }
+    }
+    // Measured with no lock held: a probe is a child process, and nothing else (the answer for another
+    // thread that already has it) waits behind it. Callers that arrive meanwhile measure too, boundedly;
+    // the first answer stored wins.
+    let measured = measure();
     let mut s = state.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(edge) = s.measured {
         return edge;
     }
-    if s.retry_at.is_some_and(|t| now < t) {
-        return GeqEdge::Unknown;
-    }
-    match measure() {
+    match measured {
         Some(edge) => {
             tracing::debug!(?edge, "probed how ffmpeg's geq reads a plane's last column and row");
             s.measured = Some(edge);
@@ -200,6 +211,37 @@ mod tests {
         assert_eq!(geq_edge(), edge.unwrap());
         // A binary that is not one answers nothing.
         assert_eq!(measure("/nonexistent/ffmpeg", Duration::from_secs(2)), None);
+    }
+
+    #[test]
+    fn the_probe_runs_with_no_lock_held_and_the_first_answer_stored_wins() {
+        let state = Mutex::new(State {
+            measured: None,
+            failures: 0,
+            retry_at: None,
+        });
+        let now = Instant::now();
+        // While the probe runs another caller is not queued behind it: it can take the lock, and its own
+        // answer (here the whole nested call) is stored first.
+        let got = cached(&state, now, || {
+            assert!(state.try_lock().is_ok(), "the state is locked while the probe runs");
+            assert_eq!(cached(&state, now, || Some(GeqEdge::Penultimate)), GeqEdge::Penultimate);
+            Some(GeqEdge::Exact)
+        });
+        assert_eq!(got, GeqEdge::Penultimate, "the first writer wins");
+        assert_eq!(cached(&state, now, || panic!("measured twice")), GeqEdge::Penultimate);
+        // A failure that lost the race to an answer changes nothing.
+        let state = Mutex::new(State {
+            measured: None,
+            failures: 0,
+            retry_at: None,
+        });
+        let got = cached(&state, now, || {
+            cached(&state, now, || Some(GeqEdge::Exact));
+            None
+        });
+        assert_eq!(got, GeqEdge::Exact);
+        assert_eq!(state.lock().unwrap().failures, 0);
     }
 
     #[test]

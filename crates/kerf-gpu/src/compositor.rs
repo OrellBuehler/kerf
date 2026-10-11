@@ -612,6 +612,16 @@ fn extent(w: u32, h: u32) -> wgpu::Extent3d {
     }
 }
 
+/// Do ahead of a frame what a plan needs measured and what takes a while: today FFmpeg's `geq`, for a
+/// masked plan (one short child process, once per process). Call it from a blocking thread **off the
+/// render lock**, with the plan in hand, so the first masked frame does not pay for it under the
+/// lock; a compositor pinned with [`Compositor::with_geq_edge`] needs none of it.
+pub fn prepare(plan: &RenderPlan) {
+    if plan.layers.iter().any(|l| l.mask.is_some()) {
+        let _ = kerf_core::geq_edge();
+    }
+}
+
 impl Compositor {
     /// What this compositor draws exactly, as data: the plan refuses (through
     /// [`RenderPlan::reasons`]) whatever is not in it. That is [`GpuCaps::A0`] — layers,
@@ -644,8 +654,8 @@ impl Compositor {
     };
 
     /// Pin what FFmpeg's `geq` does at a plane's last column and row, instead of measuring the
-    /// ffmpeg this process runs ([`kerf_core::geq_edge`], probed on the first masked frame): for a
-    /// host that knows its ffmpeg, and for tests.
+    /// ffmpeg this process runs ([`kerf_core::geq_edge`], one child process, on the first masked
+    /// frame unless [`prepare`] ran ahead of it): for a host that knows its ffmpeg, and for tests.
     #[must_use]
     pub fn with_geq_edge(mut self, edge: GeqEdge) -> Self {
         self.geq_edge = Some(edge);
@@ -1616,23 +1626,28 @@ impl Compositor {
             }
             None => None,
         };
-        let mask_edge = match (&mask, self.geq_edge()) {
-            (None, _) | (_, GeqEdge::Exact) => false,
-            (Some(_), GeqEdge::Penultimate) => {
-                // A frame one chroma sample wide or high has nothing to read one in from (`geq` reads
-                // outside the plane there).
-                let (mw, mh) = if geom.matte { geom.layer } else { (pw, ph) };
-                if mw.div_ceil(2) < 2 || mh.div_ceil(2) < 2 {
-                    return Err(unsupported(format!(
-                        "a mask on a {mw}x{mh} frame, on an FFmpeg whose geq reads a plane's last column and row one in"
-                    )));
+        // (Only a masked layer asks: the first answer is a child process.)
+        let mask_edge = if mask.is_none() {
+            false
+        } else {
+            match self.geq_edge() {
+                GeqEdge::Exact => false,
+                GeqEdge::Penultimate => {
+                    // A frame one chroma sample wide or high has nothing to read one in from (`geq` reads
+                    // outside the plane there).
+                    let (mw, mh) = if geom.matte { geom.layer } else { (pw, ph) };
+                    if mw.div_ceil(2) < 2 || mh.div_ceil(2) < 2 {
+                        return Err(unsupported(format!(
+                            "a mask on a {mw}x{mh} frame, on an FFmpeg whose geq reads a plane's last column and row one in"
+                        )));
+                    }
+                    true
                 }
-                true
-            }
-            (Some(_), GeqEdge::Unknown) => {
-                return Err(unsupported(
-                    "a mask, until FFmpeg's geq can be measured (it reads a plane's last column and row differently on some builds)".into(),
-                ));
+                GeqEdge::Unknown => {
+                    return Err(unsupported(
+                        "a mask, until FFmpeg's geq can be measured (it reads a plane's last column and row differently on some builds)".into(),
+                    ));
+                }
             }
         };
         Ok(LayerLook {
