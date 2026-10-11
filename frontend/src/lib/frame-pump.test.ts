@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { compileModule } from 'svelte/compiler';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { PreviewFrameResult } from './types';
+import type { PreviewFrameResult, PreviewOrder } from './types';
 
 // The Preview's frame fetching is the one place a stray reactive read costs an FFmpeg composite,
 // so its reactivity is tested for real: the module is compiled with Svelte's own compiler and run
@@ -95,7 +95,7 @@ interface Env {
 	overlaysCapable?: boolean;
 	width?: number | null;
 	timelineFrame: (t: number, width: number) => Promise<string | null>;
-	previewFrame: (t: number, overlays: boolean, width: number) => Promise<PreviewFrameResult>;
+	previewFrame: (t: number, overlays: boolean, width: number, order: PreviewOrder) => Promise<PreviewFrameResult>;
 	answered?: (r: PreviewFrameResult) => void;
 	gpuFailed?: (e: unknown) => void;
 }
@@ -141,17 +141,20 @@ const tick = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 function recorder(opts: { jpeg?: (t: number) => Promise<string | null>; gpu?: (t: number, o: boolean) => Promise<PreviewFrameResult> } = {}) {
 	const asked: string[] = [];
 	const widths: number[] = [];
+	const orders: PreviewOrder[] = [];
 	return {
 		asked,
 		widths,
+		orders,
 		timelineFrame: async (t: number, width: number) => {
 			asked.push(`jpeg@${t}`);
 			widths.push(width);
 			return opts.jpeg ? opts.jpeg(t) : `data:jpeg-${t}`;
 		},
-		previewFrame: async (t: number, overlays: boolean, width: number) => {
+		previewFrame: async (t: number, overlays: boolean, width: number, order: PreviewOrder) => {
 			asked.push(`gpu@${t}${overlays ? '+overlays' : ''}`);
 			widths.push(width);
+			orders.push(order);
 			return opts.gpu
 				? opts.gpu(t, overlays)
 				: { renderer: 'ffmpeg' as const, frame: `data:ffmpeg-${t}`, reasons: ['a refusal'], timings: null };
@@ -243,6 +246,24 @@ describe('with the GPU preview on', () => {
 		await settle();
 		expect(h.frames.frameUrl).toBe('data:ffmpeg-3');
 		expect(answered).toEqual(['ffmpeg', 'ffmpeg']);
+		h.stop();
+	});
+
+	test('every GPU request says which of the pump\'s it is, so the backend can drop one that arrives late', async () => {
+		const r = recorder();
+		const h = harness({ enabled: true, overlaysCapable: true, ...r });
+		await settle();
+		h.time = 1;
+		await settle();
+		h.time = 2;
+		await settle();
+		expect(r.orders).toHaveLength(3);
+		const [first, second, third] = r.orders;
+		expect(second.client, 'one name for the life of the pump').toBe(first.client);
+		expect(third.client).toBe(first.client);
+		expect(first.client.length).toBeGreaterThan(4);
+		expect(second.seq).toBeGreaterThan(first.seq);
+		expect(third.seq).toBeGreaterThan(second.seq);
 		h.stop();
 	});
 

@@ -1267,6 +1267,14 @@ export interface GpuTimings {
 	present_ms: number;
 }
 
+/** Which request of which pump a `get_preview_frame` is. IPC calls can reach the backend in the
+ *  other order than they were made; the backend draws only the newest number of a `client`
+ *  and answers `superseded` to an older one that arrives after it. */
+export interface PreviewOrder {
+	client: string;
+	seq: number;
+}
+
 /** The answer of `get_preview_frame` (`PreviewFrameResult`): which renderer made the
  *  frame, and the JPEG when it was FFmpeg. */
 export interface PreviewFrameResult {

@@ -13,7 +13,7 @@
 // to `pump` as values.
 
 import { isProxyWaitMessage } from './proxy-wait';
-import type { PreviewFrameResult } from './types';
+import type { PreviewFrameResult, PreviewOrder } from './types';
 
 export interface FramePumpDeps {
 	/** The playhead. */
@@ -37,7 +37,9 @@ export interface FramePumpDeps {
 	 *  for before that, so a first frame is not decoded at a guess and again at the real size. */
 	width(): number | null;
 	timelineFrame(time: number, width: number): Promise<string | null>;
-	previewFrame(time: number, overlays: boolean, width: number): Promise<PreviewFrameResult>;
+	/** `order` says which request of this pump it is, so the backend can tell a request that arrived
+	 *  after a newer one (the calls are separate tasks over the IPC) and not draw it. */
+	previewFrame(time: number, overlays: boolean, width: number, order: PreviewOrder): Promise<PreviewFrameResult>;
 	/** What the backend answered (the status bar names the renderer). */
 	answered(result: PreviewFrameResult): void;
 	/** The GPU path failed outright (the command rejected): the frame is the JPEG and the surface goes. */
@@ -59,6 +61,9 @@ export function createFramePump(deps: FramePumpDeps) {
 	 *  dropped (the GPU route has several in flight, and the JPEG route may have one beside them). */
 	let asked = 0;
 	let shown = 0;
+	/** This pump's name to the backend, which numbers by it: a reloaded page or a second window starts
+	 *  counting again from zero without being behind the first. */
+	const client = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
 	/** Show a JPEG that is the newest answer so far. */
 	function showUrl(url: string | null, seq: number) {
@@ -76,7 +81,7 @@ export function createFramePump(deps: FramePumpDeps) {
 	async function askGpu(want: { time: number; overlays: boolean; width: number }, seq: number) {
 		let result: PreviewFrameResult | null = null;
 		try {
-			result = await deps.previewFrame(want.time, want.overlays, want.width);
+			result = await deps.previewFrame(want.time, want.overlays, want.width, { client, seq });
 		} catch (error) {
 			// Under "Proxy only" the backend refuses a frame whose proxy is still building. That is
 			// the preview waiting, not the GPU path failing: the picture on show (and the surface,

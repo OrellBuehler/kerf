@@ -2028,6 +2028,10 @@ async fn get_timeline_frame(state: State<'_, AppState>, time_secs: f64, max_widt
 /// frame in hand is done, so a drag can post a request per playhead move without queueing them. The
 /// frame's inputs are a snapshot of the project (`gpu_preview::snapshot`): the project lock is taken
 /// only when the plan epoch says something changed, never per frame.
+///
+/// `client` and `seq` say which request of which page this is: Tauri runs each call as a task of
+/// its own, so two can arrive in the other order than they were made, and one that arrives after a
+/// newer request of the same `client` answers `superseded` instead of replacing it.
 #[tauri::command]
 async fn get_preview_frame(
     state: State<'_, AppState>,
@@ -2035,9 +2039,11 @@ async fn get_preview_frame(
     time_secs: f64,
     max_width: Option<u32>,
     overlays: Option<bool>,
+    client: Option<String>,
+    seq: Option<u64>,
 ) -> CmdResult<gpu_preview::PreviewFrameResult> {
     let shared = state.project.clone();
-    let request = gpu_preview::FrameRequest::new(
+    let mut request = gpu_preview::FrameRequest::new(
         Arc::new(move || {
             let project = lock_user(&shared);
             gpu_preview::take_inputs(&project)
@@ -2046,6 +2052,9 @@ async fn get_preview_frame(
         max_width.unwrap_or(960),
         overlays.unwrap_or(false),
     );
+    if let (Some(client), Some(seq)) = (client, seq) {
+        request = request.ordered(client, seq);
+    }
     let answer = gpu.post(request, |job| {
         // The worker waits for FFmpeg and the GPU: the blocking pool's, never a runtime thread.
         tauri::async_runtime::spawn_blocking(job);

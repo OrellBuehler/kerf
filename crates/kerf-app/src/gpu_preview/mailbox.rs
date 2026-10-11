@@ -8,6 +8,12 @@
 //! worker, when it finishes a frame, takes whatever is waiting then. The last request of a drag is
 //! therefore always drawn; the ones in between are drawn when they happen to be the newest.
 //!
+//! "Newest" is the page's own order, not the order of arrival: Tauri runs each async command as a task
+//! of its own, so two requests can reach the mailbox the other way round, and the older one would then
+//! replace the newer and be the last frame drawn. A request carries the page's running number
+//! ([`Order`]); one that is older than the newest number seen from that page is answered
+//! [`Delivery::Superseded`] at once, whether or not the newer one is still waiting.
+//!
 //! The mailbox starts no thread: [`Mailbox::post`] says whether the caller has to start the worker
 //! (it is idle), and the worker loops on [`Mailbox::next`] until it returns `None`, at which point it
 //! is idle again. A worker that dies on the way ([`Worker`] dropped by a panic) hands the mailbox back
@@ -28,12 +34,39 @@ pub enum Delivery<T> {
     Abandoned,
 }
 
+/// Where a request stands among those of the page that asked: the page (a token it made up for the
+/// life of its pump) and its running number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Order {
+    pub client: String,
+    pub seq: u64,
+}
+
 struct State<R, T> {
     /// A worker is running (or about to be started by the `post` that made this true).
     busy: bool,
     waiting: Option<(R, oneshot::Sender<Delivery<T>>)>,
+    /// The newest order seen, drawn or not. Another page's request replaces it: pages take turns.
+    newest: Option<Order>,
     posted: u64,
     superseded: u64,
+}
+
+impl<R, T> State<R, T> {
+    /// Note `order` as seen; whether a newer one of the same page was seen before it.
+    fn outdated(&mut self, order: Option<Order>) -> bool {
+        let Some(order) = order else { return false };
+        match self.newest.as_mut() {
+            Some(newest) if newest.client == order.client => {
+                if order.seq < newest.seq {
+                    return true;
+                }
+                newest.seq = order.seq;
+            }
+            _ => self.newest = Some(order),
+        }
+        false
+    }
 }
 
 /// See the module docs.
@@ -47,6 +80,7 @@ impl<R, T> Default for Mailbox<R, T> {
             state: Mutex::new(State {
                 busy: false,
                 waiting: None,
+                newest: None,
                 posted: 0,
                 superseded: 0,
             }),
@@ -66,13 +100,19 @@ impl<R, T> Mailbox<R, T> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Post `request`. The receiver gets its [`Delivery`]; the flag is whether the caller must start
-    /// the worker, which is so exactly when none is running (and then one is, as far as the mailbox
-    /// is concerned: `post` has marked it busy).
-    pub fn post(&self, request: R) -> (oneshot::Receiver<Delivery<T>>, bool) {
+    /// Post `request`, which `order` places among its page's (`None`: by arrival). The receiver gets
+    /// its [`Delivery`]; the flag is whether the caller must start the worker, which is so exactly
+    /// when none is running (and then one is, as far as the mailbox is concerned: `post` has marked
+    /// it busy). A request older than the newest of its page is answered at once and starts nothing.
+    pub fn post(&self, request: R, order: Option<Order>) -> (oneshot::Receiver<Delivery<T>>, bool) {
         let (tx, rx) = oneshot::channel();
         let mut st = self.state();
         st.posted += 1;
+        if st.outdated(order) {
+            st.superseded += 1;
+            let _ = tx.send(Delivery::Superseded);
+            return (rx, false);
+        }
         if let Some((_, older)) = st.waiting.replace((request, tx)) {
             st.superseded += 1;
             // A caller that gave up has dropped its receiver; nobody to tell.
@@ -182,26 +222,26 @@ mod tests {
     #[test]
     fn the_first_post_starts_the_worker_and_one_that_arrives_while_it_runs_does_not() {
         let mail = Mailbox::<u32, u32>::default();
-        let (_a, start) = mail.post(1);
+        let (_a, start) = mail.post(1, None);
         assert!(start);
-        let (_b, start) = mail.post(2);
+        let (_b, start) = mail.post(2, None);
         assert!(!start, "a worker is already on its way");
         assert!(drain(&mail, |r| r).len() == 1);
-        let (_c, start) = mail.post(3);
+        let (_c, start) = mail.post(3, None);
         assert!(start, "idle again once the mailbox ran dry");
     }
 
     #[test]
     fn of_the_requests_that_wait_only_the_newest_is_drawn_and_the_rest_are_told_so() {
         let mail = Mailbox::<u32, u32>::default();
-        let (mut first, start) = mail.post(1);
+        let (mut first, start) = mail.post(1, None);
         assert!(start);
         // The worker takes request 1 and is drawing it while 2, 3 and 4 arrive.
         let (one, reply) = mail.next().expect("a request");
         assert_eq!(one, 1);
-        let (mut two, _) = mail.post(2);
-        let (mut three, _) = mail.post(3);
-        let (mut four, _) = mail.post(4);
+        let (mut two, _) = mail.post(2, None);
+        let (mut three, _) = mail.post(3, None);
+        let (mut four, _) = mail.post(4, None);
         assert_eq!(
             two.try_recv().unwrap(),
             Delivery::Superseded,
@@ -222,19 +262,77 @@ mod tests {
         );
     }
 
+    fn order(client: &str, seq: u64) -> Option<Order> {
+        Some(Order {
+            client: client.into(),
+            seq,
+        })
+    }
+
+    #[test]
+    fn a_request_that_arrives_after_a_newer_one_of_its_page_is_superseded_at_once() {
+        let mail = Mailbox::<u32, u32>::default();
+        // The page asked for 1, 2 and 3; 3 got here first, then 1 and 2 on the way in.
+        let (mut three, start) = mail.post(3, order("page", 3));
+        assert!(start);
+        let (mut one, start) = mail.post(1, order("page", 1));
+        assert!(!start);
+        assert_eq!(one.try_recv().unwrap(), Delivery::Superseded, "told at once");
+        let (mut two, _) = mail.post(2, order("page", 2));
+        assert_eq!(two.try_recv().unwrap(), Delivery::Superseded);
+        assert!(three.try_recv().is_err(), "the newer one was not replaced by them");
+        assert_eq!(drain(&mail, |r| r * 10), vec![3]);
+        assert_eq!(three.try_recv().unwrap(), Delivery::Done(30));
+        assert_eq!(
+            mail.stats(),
+            MailboxStats {
+                posted: 3,
+                superseded: 2
+            }
+        );
+    }
+
+    #[test]
+    fn a_late_request_is_still_superseded_after_the_newer_one_was_drawn_and_the_mailbox_is_idle() {
+        let mail = Mailbox::<u32, u32>::default();
+        let (_five, start) = mail.post(5, order("page", 5));
+        assert!(start);
+        assert_eq!(drain(&mail, |r| r), vec![5]);
+        let (mut four, start) = mail.post(4, order("page", 4));
+        assert!(!start, "no worker for a frame nobody wants any more");
+        assert_eq!(four.try_recv().unwrap(), Delivery::Superseded);
+        // The mailbox is still idle: the next fresh request starts the worker.
+        let (_six, start) = mail.post(6, order("page", 6));
+        assert!(start);
+    }
+
+    #[test]
+    fn requests_without_an_order_go_by_arrival_and_another_page_does_not_inherit_a_number() {
+        let mail = Mailbox::<u32, u32>::default();
+        let (_a, _) = mail.post(1, order("main", 100));
+        let (mut b, _) = mail.post(2, None);
+        assert!(b.try_recv().is_err(), "no order, no judgment: it replaced the waiting one");
+        // A page that started counting at zero (another window, a reload) is not behind the first.
+        let (mut c, _) = mail.post(3, order("popout", 1));
+        assert!(c.try_recv().is_err());
+        let (mut d, _) = mail.post(4, order("popout", 0));
+        assert_eq!(d.try_recv().unwrap(), Delivery::Superseded, "but it is ordered among its own");
+        assert_eq!(drain(&mail, |r| r), vec![3]);
+    }
+
     #[test]
     fn a_worker_that_dies_hands_the_mailbox_back_and_tells_what_it_never_answered() {
         let mail = Arc::new(Mailbox::<u32, u32>::default());
-        let (mut first, start) = mail.post(1);
+        let (mut first, start) = mail.post(1, None);
         assert!(start);
-        let (mut second, _) = mail.post(2);
+        let (mut second, _) = mail.post(2, None);
         // The worker takes request 2... and panics drawing it.
         let panicked = {
             let mail = Arc::clone(&mail);
             std::thread::spawn(move || {
                 let mut worker = Worker::new(&mail);
                 let (_request, _reply) = worker.next().expect("a request");
-                let (_later, _) = mail.post(3);
+                let (_later, _) = mail.post(3, None);
                 panic!("a panic in the drawing");
             })
             .join()
@@ -244,21 +342,21 @@ mod tests {
         assert_eq!(first.try_recv().unwrap(), Delivery::Superseded);
         assert_eq!(second.try_recv().unwrap(), Delivery::Abandoned);
         // And a request posted now starts a new worker instead of waiting for a dead one.
-        let (_next, start) = mail.post(4);
+        let (_next, start) = mail.post(4, None);
         assert!(start);
     }
 
     #[test]
     fn a_worker_that_ends_normally_leaves_a_request_posted_just_after_for_the_next_one() {
         let mail = Mailbox::<u32, u32>::default();
-        let (_a, start) = mail.post(1);
+        let (_a, start) = mail.post(1, None);
         assert!(start);
         let mut worker = Worker::new(&mail);
         let (_, reply) = worker.next().expect("a request");
         reply.send(1);
         assert!(worker.next().is_none(), "ran dry");
         // The new request finds an idle mailbox and starts the next worker before this one is gone.
-        let (mut b, start) = mail.post(2);
+        let (mut b, start) = mail.post(2, None);
         assert!(start);
         drop(worker);
         assert!(b.try_recv().is_err(), "it was not told anything: it waits for its worker");
@@ -272,7 +370,7 @@ mod tests {
         let mut workers = Vec::new();
         let mut receivers = Vec::new();
         for n in 0..200u32 {
-            let (rx, start) = mail.post(n);
+            let (rx, start) = mail.post(n, None);
             receivers.push(rx);
             if start {
                 let (mail, drawn) = (Arc::clone(&mail), Arc::clone(&drawn));

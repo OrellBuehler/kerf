@@ -46,6 +46,7 @@ import type {
 	MusicFitted,
 	PreviewBoundsReport,
 	PreviewFrameResult,
+	PreviewOrder,
 	Projection,
 	Reframe,
 	ReframeKeyframe,
@@ -3005,7 +3006,12 @@ export async function getTimelineFrame(timeSecs: number, maxWidth = 960): Promis
  * safe-area guides), which a surface above the page cannot show. In the browser harness
  * there is no backend: the answer is "FFmpeg, no frame", as `getTimelineFrame` is `null`.
  */
-export async function getPreviewFrame(timeSecs: number, maxWidth = 960, overlays = false): Promise<PreviewFrameResult> {
+export async function getPreviewFrame(
+	timeSecs: number,
+	maxWidth = 960,
+	overlays = false,
+	order?: PreviewOrder
+): Promise<PreviewFrameResult> {
 	if (!inTauri()) {
 		// `?gpusurface=1` pretends a surface under a transparent webview drew the frame, so the
 		// page's side of it (the hole in the pane, nothing painted over the surface) can be looked
@@ -3020,7 +3026,13 @@ export async function getPreviewFrame(timeSecs: number, maxWidth = 960, overlays
 		}
 		return { renderer: 'ffmpeg', frame: null, reasons: ['the browser harness has no GPU'], timings: null };
 	}
-	return invoke<PreviewFrameResult>('get_preview_frame', { timeSecs, maxWidth, overlays });
+	return invoke<PreviewFrameResult>('get_preview_frame', {
+		timeSecs,
+		maxWidth,
+		overlays,
+		client: order?.client,
+		seq: order?.seq
+	});
 }
 
 /** The browser harness was opened with `?gpusurface=1`. */

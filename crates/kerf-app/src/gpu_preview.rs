@@ -72,7 +72,7 @@ use tokio::sync::oneshot;
 use check::{AdapterKey, Check, Gate, Verdict};
 use diagnostics::{Counters, Reason, Tally};
 pub use mailbox::Delivery;
-use mailbox::{Mailbox, MailboxStats, Worker};
+use mailbox::{Mailbox, MailboxStats, Order, Worker};
 use pace::Pace;
 pub use snapshot::Taken;
 use snapshot::{PlanInputs, PlanSnapshots, SnapshotStats};
@@ -887,6 +887,8 @@ pub struct FrameRequest {
     arrived: Instant,
     /// Frames are being dragged (how fast requests arrive): set by [`GpuPreview::post`].
     scrubbing: bool,
+    /// Which of the page's requests this is, when it says.
+    order: Option<Order>,
 }
 
 impl FrameRequest {
@@ -898,7 +900,18 @@ impl FrameRequest {
             overlays,
             arrived: Instant::now(),
             scrubbing: false,
+            order: None,
         }
+    }
+
+    /// This is request `seq` of the page `client`: one that arrives after a newer request of the
+    /// same page is not drawn.
+    pub fn ordered(mut self, client: impl Into<String>, seq: u64) -> Self {
+        self.order = Some(Order {
+            client: client.into(),
+            seq,
+        });
+        self
     }
 }
 
@@ -1222,7 +1235,8 @@ impl GpuPreview {
         run: impl FnOnce(Box<dyn FnOnce() + Send>),
     ) -> oneshot::Receiver<Answer> {
         request.scrubbing = lock(&self.pace).observe(request.arrived);
-        let (answer, start) = self.mail.post(request);
+        let order = request.order.clone();
+        let (answer, start) = self.mail.post(request, order);
         if start {
             let me = Arc::clone(self);
             run(Box::new(move || me.drain()));
@@ -2650,6 +2664,24 @@ mod tests {
 
     pub(super) fn visible(preview: &GpuPreview) {
         preview.set_bounds(&report()).expect("bounds");
+    }
+
+    fn no_inputs() -> TakeInputs {
+        Arc::new(|| Err("no project in this test".to_string()))
+    }
+
+    #[test]
+    fn a_request_older_than_one_the_preview_has_seen_is_superseded_without_a_worker() {
+        let preview = Arc::new(failing(Arc::new(std::sync::atomic::AtomicUsize::new(0)), "no adapter"));
+        let newer = FrameRequest::new(no_inputs(), 2.0, 320, false).ordered("page", 7);
+        assert!(matches!(preview.post(newer, |job| job()).try_recv(), Ok(Delivery::Done(_))));
+        // The older request of the same page, arriving second over the IPC.
+        let older = FrameRequest::new(no_inputs(), 1.0, 320, false).ordered("page", 6);
+        let started = std::cell::Cell::new(false);
+        let mut late = preview.post(older, |_job| started.set(true));
+        assert!(matches!(late.try_recv(), Ok(Delivery::Superseded)));
+        assert!(!started.get(), "no worker for a frame nobody wants");
+        assert_eq!(preview.diagnostics().requests.superseded, 1);
     }
 
     #[test]
