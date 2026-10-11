@@ -107,7 +107,7 @@
 			disabled={editor.exportRun.cancelling}
 			use:tip={'Stop the export and delete the partial file'}
 			onclick={() => void editor.stopExport()}
-			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);padding:1px 6px"
+			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);height:24px;padding:0 8px"
 		>
 			{editor.exportRun.cancelling ? 'Stopping…' : 'Stop'}
 		</button>
@@ -124,7 +124,7 @@
 			disabled={ui.stoppingAnalysis}
 			use:tip={'Stop analyzing — it gives up between steps, and within about a second during transcription'}
 			onclick={() => ui.stopAnalysis()}
-			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);padding:1px 6px"
+			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);height:24px;padding:0 8px"
 		>
 			{ui.stoppingAnalysis ? 'Stopping…' : 'Stop'}
 		</button>
@@ -150,7 +150,7 @@
 			use:tip={'Show log folder\nAttach kerf.<date>.log when reporting an issue.'}
 			onclick={() =>
 				revealLogs().catch((e) => toast.error(e instanceof Error ? e.message : String(e)))}
-			style="display:inline-flex;align-items:center;gap:5px;background:none;border:none;cursor:pointer;color:var(--text-muted);font-size:var(--text-xs);padding:0"
+			style="display:inline-flex;align-items:center;gap:5px;background:none;border:none;cursor:pointer;color:var(--text-muted);font-size:var(--text-xs);height:24px;padding:0 6px"
 		>
 			<Icon n="folder-open" s={11} />
 			Logs

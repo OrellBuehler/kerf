@@ -152,3 +152,43 @@ describe('keyboard focus is drawn on a text area too', () => {
 		expect(area).not.toMatch(/outline/);
 	});
 });
+
+describe('hit targets are 24 px at least', () => {
+	const px = (css: string, selector: string, prop: string): number => {
+		const at = css.indexOf(selector + ' {');
+		expect(at, `${selector} is not in the stylesheet`).toBeGreaterThan(-1);
+		const block = css.slice(css.indexOf('{', at) + 1, css.indexOf('}', at));
+		const m = new RegExp(`(?:^|[\\s;])${prop}:\\s*(\\d+)px`).exec(block);
+		expect(m, `${selector} has no ${prop}`).not.toBeNull();
+		return Number(m![1]);
+	};
+
+	test('the workspace tabs, the dock tab’s close X and the sash grip', () => {
+		expect(px(read('lib/styles/controls.css'), '.k-tab', 'height')).toBeGreaterThanOrEqual(24);
+		const dock = read('lib/styles/dockview-kerf.css');
+		const close = '.dockview-theme-kerf .dv-tab .dv-default-tab .dv-default-tab-action';
+		expect(px(dock, close, 'width')).toBeGreaterThanOrEqual(22);
+		expect(px(dock, close, 'height')).toBeGreaterThanOrEqual(22);
+		// 4 px of line, 8 px to grab: the pseudo-element reaches 2 px past each side
+		expect(dock).toContain('.dv-split-view-container.dv-horizontal > .dv-sash-container > .dv-sash::after');
+		expect(dock).toContain('inset: 0 -2px');
+		expect(dock).toContain('inset: -2px 0');
+	});
+
+	test('the title bar’s gear, bell and version chip are 28 px, in line with each other', () => {
+		const bar = read(`${EDITOR}TitleBar.svelte`);
+		expect(bar.match(/width:28px;height:28px/g)?.length).toBe(2);
+		expect(bar).toMatch(/gap:5px;height:28px;padding:0 10px/);
+	});
+
+	test('the status bar’s Stop and Logs buttons fit the 26 px bar at 24 px', () => {
+		const status = read(`${EDITOR}StatusBar.svelte`);
+		expect(status.match(/height:24px;padding:0 [68]px/g)?.length).toBe(3);
+	});
+
+	test('the notification log’s row buttons are 24 px', () => {
+		const log = read(`${EDITOR}NotificationCenter.svelte`);
+		expect(log.match(/width:24px;height:24px/g)?.length).toBe(2);
+		expect(log).not.toContain('width:20px;height:20px');
+	});
+});

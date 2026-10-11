@@ -60,7 +60,7 @@
 			onclick={() => settings.toggle()}
 			use:tip={settings.tip('Settings', 'app.settings', 'Performance, appearance and keyboard shortcuts')}
 			aria-label="Settings"
-			style="-webkit-app-region:no-drag;width:26px;height:22px"
+			style="-webkit-app-region:no-drag;width:28px;height:28px"
 		>
 			<Icon n="settings" s={13} color="currentColor" />
 		</button>
@@ -75,8 +75,8 @@
 			use:tip={notifications.unread
 				? `${notifications.unread} unread notification${notifications.unread === 1 ? '' : 's'}`
 				: 'Notifications'}
-			aria-label="Notifications"
-			style="-webkit-app-region:no-drag;position:relative;width:26px;height:22px"
+			aria-label={notifications.unread ? `Notifications, ${notifications.unread} unread` : 'Notifications'}
+			style="-webkit-app-region:no-drag;position:relative;width:28px;height:28px"
 		>
 			<Icon n="bell" s={13} color="currentColor" />
 			{#if notifications.unread}
@@ -94,7 +94,7 @@
 			use:tip={available
 				? `Kerf ${updater.update?.version} is available — click to install`
 				: `Kerf ${updater.version} — click to check for updates`}
-			style="-webkit-app-region:no-drag;gap:5px;padding:2px 8px;border-radius:999px;font-family:var(--font-mono);font-size:var(--text-xs)"
+			style="-webkit-app-region:no-drag;gap:5px;height:28px;padding:0 10px;border-radius:999px;font-family:var(--font-mono);font-size:var(--text-xs)"
 		>
 			{#if available}
 				<Icon n="download" s={12} />
