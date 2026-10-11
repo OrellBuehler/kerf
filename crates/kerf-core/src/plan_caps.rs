@@ -57,11 +57,12 @@ impl EffectKinds {
 /// transform, crop, fit, `eq`, opacity, stills and sampled keyframes — and nothing
 /// below.
 ///
-/// **Which plans an ability applies to.** `fades`, `transitions`, `keyed_opacity`,
-/// `keyed_zoom` and `keyed_color` are about the export graph and apply to [`PlanMode::Motion`] plans only:
-/// a still plan has no fades or tail layers (the FFmpeg still draws them, the plan does not
-/// hold them), so a *still* plan inside a fade, a travel or a tail is refused whatever these
-/// say. (`keyed_zoom` also holds for a still's moving zoom, which the FFmpeg still runs as the last stage like the
+/// **Which plans an ability applies to.** `motion`, `keyed_opacity` and `keyed_color` are about
+/// the export graph and apply to [`PlanMode::Motion`] plans only. `fades` and `transitions` hold for
+/// both: a still plan holds the fades still changing the picture, the slide / push travel and the
+/// outgoing clip on its tail exactly as the FFmpeg still draws them (`engine::cli::still_fx`), so a
+/// compositor that sets them draws a paused frame inside a transition as the file shows it.
+/// (`keyed_zoom` also holds for a still's moving zoom, which the FFmpeg still runs as the last stage like the
 /// export does: with a grade, rotation, opacity, mask or effect in front of it the still is
 /// refused unless the compositor says it orders them that way.) `mask`, `text`,
 /// `reframe`, `hdr` and `effects` hold for both, since both graphs draw them.
@@ -79,8 +80,12 @@ pub struct GpuCaps {
     pub motion: bool,
     /// `fade` steps in progress: a clip's own fades, the dips and a dissolve's ramp.
     pub fades: bool,
-    /// A slide or push's travel, and a clip playing on past its end under one.
+    /// A slide or push's travel, and a clip playing on past its end under one (the outgoing side of
+    /// a dissolve, a slide or a push).
     pub transitions: bool,
+    /// A dip to white: `fade c=white` takes only RGB, so FFmpeg converts the picture to `rgb24`
+    /// and back around it, in every frame of the clip in an export (and in a still while the fade runs).
+    pub dip_white: bool,
     /// Keyframed opacity (a `geq` alpha, a different arithmetic from the RGB round
     /// trip a constant opacity takes).
     pub keyed_opacity: bool,
@@ -106,6 +111,7 @@ impl GpuCaps {
         motion: false,
         fades: false,
         transitions: false,
+        dip_white: false,
         keyed_opacity: false,
         keyed_zoom: false,
         keyed_color: false,
@@ -158,12 +164,17 @@ pub enum Unsupported {
     Reframe(LayerRef),
     /// A fade step is in progress: `true` when it is a dissolve's ramp.
     Fade(LayerRef, FadeEdge, bool),
+    /// A black or white fade is running on a layer whose opacity is below 1: `colorchannelmixer` leaves the
+    /// picture in RGBA and `fade` runs on that, alpha plane included, ahead of the conversion back to
+    /// `yuva420p` (a dissolve's ramp is drawn: it touches the alpha alone).
+    FadeOnTranslucent(LayerRef),
     /// A slide or push is moving the layer.
     Travel(LayerRef),
+    /// A dip to white is in the layer's chain (`fade c=white`, through an RGB round trip) in a way the
+    /// compositor does not draw: the detail says how.
+    DipToWhite(LayerRef, &'static str),
     /// The layer plays on past its end, under the clip that replaces it.
     Tail(LayerRef),
-    /// A still plan's clip whose tail window is open: the export draws it, the plan has no layer.
-    StillTail(LayerRef),
     KeyedOpacity(LayerRef),
     /// Keyframed colour correction in an export frame (`eq` with `eval=frame`).
     KeyedColor(LayerRef),
@@ -234,13 +245,13 @@ impl fmt::Display for Unsupported {
             Self::Fade(l, _, true) => write!(f, "{l}: inside a dissolve"),
             Self::Fade(l, FadeEdge::In, false) => write!(f, "{l}: inside its fade-in"),
             Self::Fade(l, FadeEdge::Out, false) => write!(f, "{l}: inside its fade-out"),
-            Self::Travel(l) => write!(f, "{l}: moving through a slide or push transition"),
-            Self::Tail(l) => write!(f, "{l}: playing on past its end under a transition"),
-            Self::StillTail(l) => write!(
+            Self::FadeOnTranslucent(l) => write!(
                 f,
-                "{}: playing on past its end under a transition, which a still plan does not draw",
-                l.name
+                "{l}: a fade to black or white on a layer below full opacity (FFmpeg runs it on the RGBA picture the opacity leaves, alpha included)"
             ),
+            Self::Travel(l) => write!(f, "{l}: moving through a slide or push transition"),
+            Self::DipToWhite(l, why) => write!(f, "{l}: a dip to white {why}"),
+            Self::Tail(l) => write!(f, "{l}: playing on past its end under a transition"),
             Self::KeyedOpacity(l) => write!(f, "{l}: keyframed opacity (a geq alpha, whose rounding is not measured)"),
             Self::KeyedColor(l) => write!(
                 f,
