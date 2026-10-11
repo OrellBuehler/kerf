@@ -100,6 +100,8 @@ pub struct PlayAhead {
 pub struct PlayCut {
     planner: Planner,
     fps: Rational,
+    /// The rate as the graph prints it (what the slice's options pin).
+    rate: f64,
     /// The timeline time of slice frame 0: a frame of the cut's grid.
     start: f64,
     frame: (u32, u32),
@@ -185,6 +187,7 @@ impl PlayCut {
         Ok(Self {
             planner,
             fps,
+            rate: geom.fps,
             start,
             frame,
             windows,
@@ -203,6 +206,11 @@ impl PlayCut {
 
     pub fn fps(&self) -> Rational {
         self.fps
+    }
+
+    /// The cut's rate in frames a second, as the graph prints it (`ExportOptions::fps`).
+    pub fn rate(&self) -> f64 {
+        self.rate
     }
 
     /// The delivery frame of the whole cut.

@@ -370,6 +370,27 @@ of the file, 24 / 29.97 / 30 / 60 fps) against `select`: 4290 frames on 9.0.2. `
 lines) holds what needs no FFmpeg — skipped output frames are not held, a run that closes its output
 and never exits is killed, a wrong-sized picture is `Unsupported`, `Before` spawns nothing.
 
+**Playing** (A4) is a loop over a `kerf_core::PlayCut` (`core-render-plan.md`: the Motion plan of the slice `stream_preview` plays) and
+the cursors above, not over the router's runs: the router serves `Pick::AtOrAfter` from a shared cache, and a playing frame has to be the
+export's `fps` pick, which only a cursor reads. `MotionFrames::frames(plan)` reads a frame's layers **side by side** (scoped threads, one per
+cursor: three layers cost the slowest decode, not the sum), `Compositor::render_motion_texture(plan, size, &mut motion)` is
+`render_plan_texture_with` over it (the texture stays on the GPU for the presenter), and `Compositor::warm_text(plan, size)` rasterises a
+plan's titles into the atlas without drawing, so a caption that comes on screen costs its `ffmpeg` on a prefetch thread and not on the frame.
+**`MotionFrames::feed()` is a `CursorFeed`**: `open(layer)` checks the clip as `FrameSource::cursor` does (`FrameSource::check_cursor`, the same
+gates split out: the self-test, a recorded opaque pixel format, an indexed container, seek points on keyframes, no run has marked the file) and
+starts its `ffmpeg`, which fills the pipe and waits (at most 6 waiting, 10 s each); the frame that first needs the clip takes the waiting
+cursor instead of paying the file's two probes (50 ms) and the process start. Called from a thread that is not drawing, and a clip it refuses is
+known *before* the cut, when the caller can still choose what to play instead. A cursor opens at the clip's own seek, so what it reads from there
+to the frame is decode work: a play session starts its slice at the playhead (`PlayCut`), which puts that seek at the playhead and not at the
+clip's in point. `tests/playback.rs` (`#[ignore]`d; both FFmpegs) holds the played frames to the export, **plane for plane, 0 levels in every
+case**: from the start (a hard cut, a clip's fades, a dissolve), from the middle of a clip on the grid and between two frames, from deep in a
+long clip, from inside a dissolve (the session starts before it and the frames from the requested time on are the whole cut's, dissolve
+included), a dip, slides and a push entered inside the transition, a 25 fps clip in a 30 fps cut and a 2x clip (the slice's export, the graph
+the stream plays), and every n-th frame asked for (n = 2, 3, 7, 30: a frame a newer request replaced changes no other). A slide's travel is
+truncated to whole pixels, and the slice's clock is not the whole cut's by a float's width, so a travel that lands exactly on a pixel can fall
+either side of it: slides are held to the slice's export. It also holds the feed (a cursor opened ahead is the one the cut uses and the first
+clip's goes with it; a transport stream is refused when opened ahead), and the texture a session presents to be the composite's picture.
+
 What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
 
 - **Composite in YUV, convert once.** FFmpeg's `overlay` blends the encoded planes and

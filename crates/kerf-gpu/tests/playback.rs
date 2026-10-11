@@ -1,0 +1,595 @@
+//! Playback parity: the frames a play session draws against the export's.
+//!
+//! `tests/motion_parity.rs` holds the compositor to the export of a whole cut. A play session draws
+//! the cut a [`PlayCut`] plans — `Timeline::slice` from the playhead, planned as the export plans it,
+//! one forward-only cursor per clip — for the frames the page asks for, **skipping** the ones a newer
+//! request replaced. This holds *that* to the export, plane for plane (the planes `overlay` blended,
+//! no colour conversion between), with a stated bound per case:
+//!
+//! * the slice's own export, which is the graph `stream_preview` plays (all of them);
+//! * where the content is aligned so that the slice and the whole cut pick the same source frames
+//!   (same rates, a start on the grid), the **whole cut's export** from the start frame on — which is
+//!   what a play that starts mid-clip or inside a dissolve has to be, or the playing picture would
+//!   disagree with the file.
+//!
+//! Needs `ffmpeg` and an adapter (lavapipe is enough); `#[ignore]`d.
+//!
+//! ```text
+//! cargo test -p kerf-gpu --no-default-features --test playback -- --ignored --nocapture
+//! ```
+
+#![allow(clippy::print_stderr)]
+
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use kerf_core::{
+    Asset, Clip, CompositeColorPolicy, Container, ExportOptions, OriginalMedia, PlayCut, Project, RateControl, StreamKind,
+    Timeline, Track, Transition, TransitionKind,
+};
+use kerf_gpu::{Compositor, FrameSource, FrameSourceConfig, Gpu, GpuError, GpuOptions, MotionFrames};
+
+// ---- the machinery -------------------------------------------------------------------
+
+fn gpu() -> Arc<Gpu> {
+    static GPU: OnceLock<Arc<Gpu>> = OnceLock::new();
+    GPU.get_or_init(|| Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter (install mesa-vulkan-drivers for lavapipe)"))
+        .clone()
+}
+
+fn compositor() -> &'static Compositor {
+    static C: OnceLock<Compositor> = OnceLock::new();
+    C.get_or_init(|| Compositor::new(gpu()).expect("a compositor"))
+}
+
+fn frame_source() -> Arc<FrameSource> {
+    static S: OnceLock<Arc<FrameSource>> = OnceLock::new();
+    S.get_or_init(|| FrameSource::new(FrameSourceConfig::default())).clone()
+}
+
+fn policy() -> CompositeColorPolicy {
+    let measured = kerf_core::composite_color_policy();
+    assert_ne!(
+        measured,
+        CompositeColorPolicy::Unknown,
+        "the colour probe could not read this FFmpeg"
+    );
+    measured
+}
+
+fn ffmpeg(args: &[&str]) -> Vec<u8> {
+    let out = Command::new(kerf_core::ffmpeg_path())
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run ffmpeg");
+    assert!(
+        out.status.success(),
+        "ffmpeg {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+fn probed(path: &Path) -> Asset {
+    Project::probe_asset(path).unwrap_or_else(|e| panic!("probe {}: {e}", path.display()))
+}
+
+struct Media {
+    testsrc: Asset,
+    bars: Asset,
+    testsrc25: Asset,
+    /// The same pictures as `testsrc` in a transport stream, which runs are not trusted for.
+    transport: PathBuf,
+}
+
+fn media() -> &'static Media {
+    static M: OnceLock<Media> = OnceLock::new();
+    M.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("playback-media");
+        std::fs::create_dir_all(&dir).unwrap();
+        let untagged = "setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown";
+        let video = |name: &str, lavfi: &str| -> PathBuf {
+            let p = dir.join(name);
+            ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                lavfi,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-qp",
+                "0",
+                "-g",
+                "10",
+                "-pix_fmt",
+                "yuv420p",
+                p.to_str().unwrap(),
+            ]);
+            p
+        };
+        let testsrc = video("testsrc.mp4", &format!("testsrc2=size=640x360:rate=30:duration=6,{untagged}"));
+        let bars = video("bars.mp4", &format!("smptehdbars=size=640x360:rate=30:duration=6,{untagged}"));
+        let testsrc25 = video(
+            "testsrc25.mp4",
+            &format!("testsrc2=size=640x360:rate=25:duration=6,{untagged}"),
+        );
+        let transport = dir.join("testsrc.ts");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc2=size=640x360:rate=30:duration=3,{untagged}"),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "mpegts",
+            transport.to_str().unwrap(),
+        ]);
+        Media {
+            testsrc: probed(&testsrc),
+            bars: probed(&bars),
+            testsrc25: probed(&testsrc25),
+            transport,
+        }
+    })
+}
+
+fn timeline(clips: Vec<Clip>) -> Timeline {
+    Timeline {
+        tracks: vec![Track {
+            clips,
+            ..Track::new(StreamKind::Video, "V1")
+        }],
+        overlays: Vec::new(),
+        markers: Vec::new(),
+        format: None,
+        master: Default::default(),
+    }
+}
+
+/// Two one-second clips, the second entering through `kind` over `secs`.
+fn pair(m: &Media, kind: Option<TransitionKind>, secs: f64) -> (Timeline, Vec<Asset>) {
+    let out = Clip::new(m.bars.id, 0.5, 1.5, 0.0);
+    let mut inc = Clip::new(m.testsrc.id, 0.5, 1.5, 1.0);
+    inc.transition_in = kind.map(|kind| Transition { kind, duration: secs });
+    (timeline(vec![out, inc]), vec![m.bars.clone(), m.testsrc.clone()])
+}
+
+// ---- the export, read back as planes --------------------------------------------------
+
+struct Played {
+    w: usize,
+    h: usize,
+    yuv: Vec<u8>,
+}
+
+impl Played {
+    fn frame_len(&self) -> usize {
+        self.w * self.h * 3 / 2
+    }
+
+    fn count(&self) -> usize {
+        self.yuv.len() / self.frame_len()
+    }
+
+    fn planes(&self, k: usize) -> [&[u8]; 3] {
+        let f = &self.yuv[k * self.frame_len()..(k + 1) * self.frame_len()];
+        let (y, uv) = f.split_at(self.w * self.h);
+        let (u, v) = uv.split_at(self.w * self.h / 4);
+        [y, u, v]
+    }
+}
+
+fn export(slug: &str, tl: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Played {
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("playback-ref");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let file = scratch.join(format!("{slug}.mkv"));
+    let lossless = ExportOptions {
+        container: Container::Mkv,
+        video_codec: Some("libx264".into()),
+        rate_control: RateControl::Lossless,
+        ..opts.clone()
+    };
+    kerf_core::render_with(tl, assets, &file, &lossless).expect("export");
+    let yuv = ffmpeg(&[
+        "-i",
+        file.to_str().unwrap(),
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "yuv420p",
+        "pipe:1",
+    ]);
+    let info = Project::probe_asset(&file).expect("probe the export");
+    let video = info
+        .streams
+        .iter()
+        .find(|s| s.kind == StreamKind::Video)
+        .expect("a video stream");
+    let _ = std::fs::remove_file(&file);
+    Played {
+        w: video.width.unwrap() as usize,
+        h: video.height.unwrap() as usize,
+        yuv,
+    }
+}
+
+fn report() -> &'static Mutex<Vec<String>> {
+    static R: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn write_report() {
+    let mut text = String::new();
+    for line in report().lock().unwrap().iter() {
+        let _ = writeln!(text, "{line}");
+    }
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .parent()
+        .expect("target/")
+        .join("parity");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("playback-report.txt"), text);
+}
+
+// ---- the comparison ------------------------------------------------------------------------
+
+/// Which export a played frame is held to.
+#[derive(Clone, Copy, PartialEq)]
+enum Against {
+    /// The export of the slice the session plays: the graph `stream_preview` runs.
+    Slice,
+    /// The export of the whole cut, frame `k0 + j`: for content that picks the same source frames
+    /// from the slice as from the whole.
+    Whole,
+}
+
+struct Case<'a> {
+    name: &'a str,
+    tl: &'a Timeline,
+    assets: &'a [Asset],
+    /// Where the session starts, timeline seconds.
+    at: f64,
+    /// Seconds played.
+    secs: f64,
+    /// Every n-th frame is asked for (a newer request replaced the ones between).
+    every: usize,
+    against: Against,
+    /// The bound in levels of 255: how far a plane may be from the export's.
+    bound: i32,
+}
+
+/// Play `case` and compare; returns `(frames compared, worst error, the session's start)`.
+fn play(case: Case) -> (usize, i32, f64) {
+    let Case {
+        name,
+        tl,
+        assets,
+        at,
+        secs,
+        every,
+        against,
+        bound,
+    } = case;
+    let cut = PlayCut::new(tl, assets, at, policy(), &OriginalMedia).expect("a cut");
+    let fps = cut.rate();
+    let opts = ExportOptions {
+        fps: Some(fps),
+        resolution: Some(cut.frame()),
+        ..ExportOptions::default()
+    };
+    let rendered = tl.for_render();
+    let k0 = (cut.start() * fps).round() as usize;
+    let reference = match against {
+        Against::Slice => rendered.slice((cut.start() - 1e-9).max(0.0), rendered.duration()),
+        Against::Whole => rendered,
+    };
+    let slug: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let played = export(&slug, &reference, assets, &opts);
+    let size = (played.w as u32, played.h as u32);
+    let mut motion = MotionFrames::new(frame_source());
+    let first = cut.frame_at(at);
+    let last = first + (secs * fps) as u64 - 1;
+    let (mut compared, mut worst, mut differing) = (0usize, 0i32, 0usize);
+    let mut over: Vec<(u64, i32)> = Vec::new();
+    let mut j = first;
+    while j <= last {
+        let plan = cut.at_frame(j).unwrap_or_else(|e| panic!("{name}: frame {j}: {e}"));
+        let why = plan.reasons(&compositor().caps(), size);
+        assert!(why.is_empty(), "{name}: frame {j}: the plan is refused: {why:?}");
+        let pictures = motion.frames(&plan).unwrap_or_else(|e| panic!("{name}: frame {j}: {e}"));
+        let drawn = compositor()
+            .composite_yuv_shared(&plan, &pictures, size)
+            .unwrap_or_else(|e| panic!("{name}: frame {j}: {e}"));
+        let index = match against {
+            Against::Slice => j as usize,
+            Against::Whole => k0 + j as usize,
+        };
+        assert!(
+            index < played.count(),
+            "{name}: the export has {} frames, frame {index} was asked",
+            played.count()
+        );
+        let want = played.planes(index);
+        let mut frame_worst = 0;
+        for (plane, (w, g)) in want.iter().zip([&drawn.y, &drawn.u, &drawn.v]).enumerate() {
+            assert_eq!(w.len(), g.len(), "{name}: plane {plane} of frame {j}");
+            for (a, b) in w.iter().zip(g.iter()) {
+                let d = (i32::from(*a) - i32::from(*b)).abs();
+                frame_worst = frame_worst.max(d);
+                differing += usize::from(d != 0);
+            }
+        }
+        if std::env::var_os("KERF_PARITY_EXPLORE").is_some() {
+            let mut near = Vec::new();
+            for other in index.saturating_sub(3)..(index + 4).min(played.count()) {
+                let w = played.planes(other);
+                let d = w[0]
+                    .iter()
+                    .zip(drawn.y.iter())
+                    .map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
+                    .max()
+                    .unwrap_or(0);
+                near.push((other, d));
+            }
+            eprintln!("  frame {j}: worst {frame_worst} layers {} near {near:?}", plan.layers.len());
+        }
+        if frame_worst > bound && over.len() < 6 {
+            over.push((j, frame_worst));
+        }
+        worst = worst.max(frame_worst);
+        compared += 1;
+        j += every as u64;
+    }
+    let line = format!(
+        "{name:<52} start {:>7.4} s | {compared:>3} frames (every {every}) vs {} | worst {worst} levels, {differing} samples differ",
+        cut.start(),
+        if against == Against::Slice { "slice" } else { "whole" },
+    );
+    eprintln!("{line}");
+    report().lock().unwrap().push(line);
+    write_report();
+    assert!(
+        worst <= bound || std::env::var_os("KERF_PARITY_EXPLORE").is_some(),
+        "{name}: a played frame is {worst} levels from the export's (bound {bound}); frames over it: {over:?}"
+    );
+    (compared, worst, cut.start())
+}
+
+fn case<'a>(name: &'a str, tl: &'a Timeline, assets: &'a [Asset], at: f64, secs: f64, against: Against) -> Case<'a> {
+    Case {
+        name,
+        tl,
+        assets,
+        at,
+        secs,
+        every: 1,
+        against,
+        bound: 0,
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_session_from_the_start_draws_the_exports_cut_a_dissolve_included() {
+    let m = media();
+    let (tl, assets) = pair(m, Some(TransitionKind::Crossfade), 0.61);
+    let (n, worst, _) = play(case("play/from-the-start/dissolve", &tl, &assets, 0.0, 2.0, Against::Whole));
+    assert!(n >= 60 && worst == 0);
+    let (tl, assets) = pair(m, None, 0.0);
+    play(case("play/from-the-start/hard-cut", &tl, &assets, 0.0, 2.0, Against::Whole));
+    // A clip's own fades.
+    let mut c = Clip::new(m.testsrc.id, 0.5, 1.5, 0.0);
+    c.fade_in = 0.4;
+    c.fade_out = 0.4;
+    let tl = timeline(vec![c]);
+    play(case(
+        "play/from-the-start/fades",
+        &tl,
+        std::slice::from_ref(&m.testsrc),
+        0.0,
+        1.0,
+        Against::Whole,
+    ));
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_session_from_the_middle_of_a_clip_draws_the_exports_frames_from_there() {
+    let m = media();
+    let (tl, assets) = pair(m, Some(TransitionKind::Crossfade), 0.61);
+    // Mid-clip on the grid, a start that is between two frames, and one just past the first clip's tail.
+    for at in [0.2, 0.2 + 0.4 / 30.0, 0.3] {
+        play(case(
+            &format!("play/mid-clip/dissolve pair @{at:.4}"),
+            &tl,
+            &assets,
+            at,
+            0.3,
+            Against::Whole,
+        ));
+    }
+    // A long clip played from deep inside it: the cursor starts at the slice, not at the clip's start.
+    let long = timeline(vec![Clip::new(m.testsrc.id, 0.0, 5.0, 0.0)]);
+    let (n, _, start) = play(case(
+        "play/mid-clip/deep in a long clip",
+        &long,
+        std::slice::from_ref(&m.testsrc),
+        3.5,
+        1.0,
+        Against::Whole,
+    ));
+    assert!(n > 20 && (start - 3.5).abs() < 1.0 / 30.0);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_session_started_inside_a_dissolve_has_the_dissolve() {
+    let m = media();
+    let (tl, assets) = pair(m, Some(TransitionKind::Crossfade), 0.61);
+    // 1.2 s is deep inside it: a slice started there would have neither the outgoing clip nor the ramp.
+    let (_, worst, start) = play(case("play/in-a-dissolve", &tl, &assets, 1.2, 0.6, Against::Whole));
+    assert!(start < 0.5, "the session starts before the dissolve: {start}");
+    assert_eq!(worst, 0);
+    // Other kinds, entered at a frame inside them. A dip is the whole cut's frames to the level. A slide
+    // or a push is a position the overlay truncates to whole pixels (`overlay x`), and the slice's
+    // clock is not the whole cut's by a float's width: a travel that lands exactly on a pixel
+    // (0.3 s of a 0.5 s slide of 640 px is 256.0) falls either side of it, so a slide is held to the
+    // slice's own export, which is the graph the stream plays.
+    let (tl, assets) = pair(m, Some(TransitionKind::DipToBlack), 0.5);
+    play(case(
+        "play/in-a-transition/DipToBlack",
+        &tl,
+        &assets,
+        1.15,
+        0.5,
+        Against::Whole,
+    ));
+    for kind in [TransitionKind::SlideLeft, TransitionKind::PushUp, TransitionKind::SlideDown] {
+        let (tl, assets) = pair(m, Some(kind), 0.5);
+        let name = format!("play/in-a-transition/{kind:?}");
+        play(case(&name, &tl, &assets, 1.15, 0.5, Against::Slice));
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_frames_a_newer_request_replaced_change_no_frame() {
+    let m = media();
+    let (tl, assets) = pair(m, Some(TransitionKind::Crossfade), 0.61);
+    for every in [2, 3, 7, 30] {
+        let name = format!("play/skipping/every {every}");
+        let mut c = case(&name, &tl, &assets, 0.0, 2.0, Against::Whole);
+        c.every = every;
+        play(c);
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_clip_of_another_rate_is_drawn_as_the_slice_the_stream_plays_is() {
+    let m = media();
+    // A 25 fps clip in a 30 fps cut: the `fps` filter drops and repeats, and where it does depends on
+    // the phase of the slice's first frame to the grid. The slice's own export is the reference.
+    let tl = timeline(vec![
+        Clip::new(m.testsrc.id, 0.5, 1.5, 0.0),
+        Clip::new(m.testsrc25.id, 0.5, 3.5, 1.0),
+    ]);
+    let assets = [m.testsrc.clone(), m.testsrc25.clone()];
+    for at in [0.0, 1.0, 1.7, 2.5 + 0.3 / 30.0] {
+        play(case(
+            &format!("play/25-in-30/@{at:.3}"),
+            &tl,
+            &assets,
+            at,
+            1.0,
+            Against::Slice,
+        ));
+    }
+    // And a speed change.
+    let mut fast = Clip::new(m.testsrc.id, 0.5, 4.5, 0.0);
+    fast.speed = 2.0;
+    let tl = timeline(vec![fast]);
+    play(case(
+        "play/speed-2",
+        &tl,
+        std::slice::from_ref(&m.testsrc),
+        0.6,
+        1.0,
+        Against::Slice,
+    ));
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_cursor_opened_ahead_is_the_one_the_cut_uses() {
+    let m = media();
+    let (tl, assets) = pair(m, None, 0.0);
+    let cut = PlayCut::new(&tl, &assets, 0.0, policy(), &OriginalMedia).expect("a cut");
+    let mut motion = MotionFrames::new(frame_source());
+    let feed = motion.feed();
+    // The second clip starts at frame 30; the first is still a candidate there (its closing edge).
+    let second = cut.at_frame(31).unwrap();
+    assert_eq!(second.layers.len(), 1);
+    let layer = &second.layers[0];
+    feed.open(layer).expect("opened ahead");
+    feed.open(layer).expect("and again: nothing new");
+    assert!(feed.has(layer.clip_id));
+    assert_eq!(feed.waiting(), 1);
+    // Playing the first clip leaves it waiting; the cut takes it over at its first frame, and the
+    // first clip's own cursor goes once the plan has no layer of it.
+    for k in 0..30 {
+        motion.frames(&cut.at_frame(k).unwrap()).expect("a frame");
+    }
+    assert_eq!((motion.cursors(), feed.waiting()), (1, 1));
+    let at_the_cut = motion.frames(&cut.at_frame(30).unwrap()).expect("the cut");
+    assert_eq!(
+        at_the_cut.len(),
+        2,
+        "the closing edge of the first clip, and the first of the second"
+    );
+    assert!(at_the_cut[1].is_some(), "the second clip's first frame");
+    assert_eq!(
+        (motion.cursors(), feed.waiting()),
+        (2, 0),
+        "the cut used the one opened ahead"
+    );
+    let after = motion.frames(&second).expect("the frame after it");
+    assert!(after[0].is_some());
+    assert_eq!((motion.cursors(), feed.waiting()), (1, 0), "and the first clip's went");
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_file_runs_are_not_trusted_for_is_refused_when_it_is_opened_ahead() {
+    let m = media();
+    let transport = probed(&m.transport);
+    let tl = timeline(vec![
+        Clip::new(m.testsrc.id, 0.5, 1.5, 0.0),
+        Clip::new(transport.id, 0.0, 1.0, 1.0),
+    ]);
+    let assets = [m.testsrc.clone(), transport];
+    let cut = PlayCut::new(&tl, &assets, 0.0, policy(), &OriginalMedia).expect("a cut");
+    let motion = MotionFrames::new(frame_source());
+    let feed = motion.feed();
+    let plan = cut.at_frame(35).unwrap();
+    let err = feed.open(&plan.layers[0]).expect_err("refused");
+    assert!(matches!(err, GpuError::Unsupported(_)), "{err}");
+    assert!(err.to_string().contains("testsrc.ts"), "{err}");
+    assert_eq!(feed.waiting(), 0);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_texture_a_session_presents_is_the_picture_the_compositor_composites() {
+    let m = media();
+    let (tl, assets) = pair(m, Some(TransitionKind::Crossfade), 0.61);
+    let cut = PlayCut::new(&tl, &assets, 0.0, policy(), &OriginalMedia).expect("a cut");
+    let size = cut.frame();
+    let size = (size.0 / 2, size.1 / 2);
+    let mut motion = MotionFrames::new(frame_source());
+    for k in [5u64, 29, 33, 40, 45] {
+        let plan = cut.at_frame(k).unwrap();
+        let (texture, timings) = compositor().render_motion_texture(&plan, size, &mut motion).expect("a frame");
+        let drawn = texture.read_back(&gpu()).expect("read back");
+        // The same pictures through the readback path (the cursors have moved on: a second motion).
+        let mut again = MotionFrames::new(frame_source());
+        let pictures = again.frames(&plan).expect("pictures");
+        let reference = compositor().composite_shared(&plan, &pictures, size).expect("the composite");
+        assert_eq!(drawn.data, reference.data, "frame {k}");
+        assert!(timings.decode.as_secs_f64() >= 0.0);
+    }
+}
