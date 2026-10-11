@@ -77,6 +77,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::print_stderr)]
     fn the_proxy_settings_and_the_deleting_of_a_proxy_move_the_epoch() {
         use crate::proxy::{preview_source_setting, proxy_size, set_preview_source_setting, set_proxy_size};
         let before = bumps_here();
@@ -86,11 +87,13 @@ mod tests {
         set_preview_source_setting(preview_source_setting());
         assert!(bumps_here() > before, "the preview source");
         let source = std::path::Path::new("/nonexistent/kerf-plan-epoch-test.mp4");
-        if crate::engine::proxy_path(source, 640).is_some() {
-            let before = bumps_here();
-            assert_eq!(crate::engine::remove_proxy_files(source, 640), 0);
-            assert!(bumps_here() > before, "a proxy deleted (or looked for)");
+        if crate::engine::proxy_path(source, 640).is_none() {
+            eprintln!("skipped: this platform has no cache directory, so there is no proxy to delete");
+            return;
         }
+        let before = bumps_here();
+        assert_eq!(crate::engine::remove_proxy_files(source, 640), 0);
+        assert!(bumps_here() > before, "a proxy deleted (or looked for)");
     }
 
     #[test]
