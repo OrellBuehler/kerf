@@ -483,8 +483,10 @@ pub struct PlanText {
     pub color: String,
     /// The box behind the text; `None` when there is none or its colour is invalid.
     pub bg: Option<String>,
-    /// The font file `drawtext` would use, resolved on this machine. `None` is FFmpeg's
-    /// default font, which no other renderer can reproduce: never drawn.
+    /// The font file `drawtext` is given: the family the overlay names if it is installed, else the
+    /// shipped default (`fonts::resolve_text_font`, the graph's own resolution). `None` only when
+    /// the default could not be written to disk, which leaves `drawtext` FFmpeg's own default font,
+    /// which no other renderer can reproduce: never drawn.
     pub font_file: Option<std::path::PathBuf>,
     /// No bold face was found for a bold request, and `drawtext` thickens the glyphs
     /// with a same-colour border instead.

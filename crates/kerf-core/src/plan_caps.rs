@@ -174,7 +174,8 @@ pub enum Unsupported {
     ZoomBehind(LayerRef),
     /// A text overlay is live.
     Text,
-    /// A live text overlay names no font file the compositor can draw with.
+    /// A live text overlay names no font file the compositor can draw with (the shipped default font
+    /// could not be written to disk).
     TextWithoutFont,
     Scaler(String),
     /// The layer's colour matrix is unknown while the composite takes its matrix from the tags.

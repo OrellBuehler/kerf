@@ -6169,42 +6169,160 @@ fn escape_drawtext_path(s: &str) -> String {
     escape_drawtext(s)
 }
 
-/// `drawtext` options shared by the export and still paths (text, size, color,
-/// font, bold approximation, box) — everything except position / alpha /
-/// enable. `frame_h` is the target canvas height (export height, or the
-/// still's height).
-fn drawtext_common(o: &TextOverlay, frame_h: f64) -> Vec<String> {
-    let fontsize = (frame_h * o.size).round().max(1.0);
-    let color = safe_color(&o.color, "white");
-    let mut parts = vec![
-        format!("text='{}'", escape_drawtext_text(&o.text)),
-        format!("fontsize={}", fnum(fontsize)),
-        format!("fontcolor={color}"),
-    ];
-    // Resolve a chosen system font to its file on disk; falls through to
-    // FFmpeg's drawtext default if unset or no longer installed.
-    let resolved_bold = o
-        .font
-        .as_deref()
-        .and_then(|family| crate::fonts::resolve_font_file(family, o.bold))
-        .map(|(path, matched_bold)| {
+/// How an overlay looks, as `drawtext` is told it: what the export, the still and the
+/// compositor's rasteriser ([`text_raster_graph`]) all spell the same way. Every field is already
+/// safe to splice (`safe_color`, `valid_color`, a resolved font).
+struct TextLook<'a> {
+    text: &'a str,
+    /// Font height as a fraction of the frame height.
+    size: f64,
+    color: &'a str,
+    /// Whether there is a box, and its colour.
+    bg: Option<&'a str>,
+    /// The font file; `None` leaves `drawtext` its own default (the shipped font could not be written).
+    font_file: Option<&'a Path>,
+    /// No bold face was found for a bold request: a same-colour border thickens the glyphs.
+    border: bool,
+}
+
+/// The width of the border [`TextLook::border`] draws, and the padding of a box, in pixels.
+const TEXT_BORDER_W: u32 = 2;
+const TEXT_BOX_BORDER_W: u32 = 12;
+
+impl TextLook<'_> {
+    /// `drawtext` options shared by the export and still paths (text, size, color,
+    /// font, bold approximation, box) — everything except position / alpha /
+    /// enable. `frame_h` is the target canvas height (export height, or the
+    /// still's height).
+    fn options(&self, frame_h: f64) -> Vec<String> {
+        self.options_coloured(frame_h, self.color, self.color, self.bg)
+    }
+
+    /// [`TextLook::options`] with the colours of the glyphs, the border and the box named: the
+    /// rasteriser draws each part white and the others invisible.
+    fn options_coloured(&self, frame_h: f64, font: &str, border: &str, boxed: Option<&str>) -> Vec<String> {
+        let fontsize = (frame_h * self.size).round().max(1.0);
+        let mut parts = vec![
+            format!("text='{}'", escape_drawtext_text(self.text)),
+            format!("fontsize={}", fnum(fontsize)),
+            format!("fontcolor={font}"),
+        ];
+        if let Some(path) = self.font_file {
             parts.push(format!("fontfile='{}'", escape_drawtext_path(&path.to_string_lossy())));
-            matched_bold
-        });
-    if o.bold && resolved_bold != Some(true) {
-        // No real bold face available: a same-color border thickens the glyphs.
-        parts.push("borderw=2".to_string());
-        parts.push(format!("bordercolor={color}"));
+        }
+        if self.border {
+            parts.push(format!("borderw={TEXT_BORDER_W}"));
+            parts.push(format!("bordercolor={border}"));
+        }
+        // An invalid box colour drops the box entirely rather than falling back to
+        // a visible default — a caller that asked for no readable box colour gets
+        // no box, not a random one.
+        if let Some(bg) = self.bg.and(boxed) {
+            parts.push("box=1".to_string());
+            parts.push(format!("boxcolor={bg}"));
+            parts.push(format!("boxborderw={TEXT_BOX_BORDER_W}"));
+        }
+        parts
     }
-    // An invalid box colour drops the box entirely rather than falling back to
-    // a visible default — a caller that asked for no readable box colour gets
-    // no box, not a random one.
-    if let Some(bg) = o.bg.as_deref().filter(|bg| valid_color(bg)) {
-        parts.push("box=1".to_string());
-        parts.push(format!("boxcolor={bg}"));
-        parts.push("boxborderw=12".to_string());
+}
+
+/// `drawtext` options for an overlay of the timeline (see [`TextLook::options`]). The font is the
+/// family it names if that is installed, else the shipped default (`crate::fonts`); a bold
+/// request the face cannot satisfy is a same-colour border.
+fn drawtext_common(o: &TextOverlay, frame_h: f64) -> Vec<String> {
+    let font = crate::fonts::resolve_text_font(o.font.as_deref(), o.bold);
+    TextLook {
+        text: &o.text,
+        size: o.size,
+        color: safe_color(&o.color, "white"),
+        bg: o.bg.as_deref().filter(|bg| valid_color(bg)),
+        font_file: font.as_ref().map(|f| f.path.as_path()),
+        border: o.bold && !font.as_ref().is_some_and(|f| f.bold),
     }
-    parts
+    .options(frame_h)
+}
+
+/// The parts [`text_raster_graph`] draws, in the order they are stacked in its one output picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TextPart {
+    /// The glyphs, as coverage.
+    Glyphs,
+    /// The same-colour border a bold request without a bold face draws under the glyphs.
+    Border,
+    /// The box behind the text: 255 where it is.
+    Box,
+}
+
+/// The `ffmpeg` graph that makes an overlay's coverage masks. The compositor draws text by
+/// blending what FFmpeg's own `drawtext` rasterised (layout, hinting, shaping and sub-pixel
+/// placement are FFmpeg's, on whatever build this machine has), so it cannot differ from the still.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextRasterGraph {
+    /// The `-filter_complex` text: its output `[o]` is the `parts` stacked top to bottom, each
+    /// `size` big, as 8-bit gray (`rawvideo`).
+    pub filter_complex: String,
+    pub parts: Vec<TextPart>,
+    pub size: (u32, u32),
+}
+
+/// The graph that rasterises `t` on a black `size` canvas, **at the position and in the pixel
+/// format the still draws it**: the same `drawtext` options and the same `x` / `y` expressions
+/// ([`drawtext_still`]), so every pixel of coverage is where the still puts it (glyph bitmaps are
+/// rendered at the quarter-pixel phase of a fractional position, so the position is part of the
+/// picture, not something to move afterwards).
+///
+/// Each part is drawn white on black in `rgb24` and its red plane kept: full coverage is 255 and
+/// the blend of 255 over 0 at coverage `m` is exactly `m` (a gray or YUV canvas would write 235 on
+/// an FFmpeg that ignores the range tag, as 6.1 does). What a part leaves out is drawn invisibly
+/// (`@0`), never omitted, so `drawtext` clips to the region the still does: its clip rectangle
+/// grows with the box and with the border.
+pub fn text_raster_graph(t: &crate::render_plan::PlanText, size: (u32, u32)) -> TextRasterGraph {
+    let (w, h) = size;
+    let look = TextLook {
+        text: &t.text,
+        size: t.size,
+        color: "white",
+        bg: t.bg.as_deref(),
+        font_file: t.font_file.as_deref(),
+        border: t.synthetic_bold,
+    };
+    let at = format!("x=(w*{}-text_w/2):y=(h*{}-text_h/2)", fnum(t.pos.0), fnum(t.pos.1));
+    let mut parts = vec![TextPart::Glyphs];
+    if t.synthetic_bold {
+        parts.push(TextPart::Border);
+    }
+    if t.bg.is_some() {
+        parts.push(TextPart::Box);
+    }
+    const SHOWN: &str = "white";
+    const HIDDEN: &str = "white@0";
+    let draws: Vec<String> = parts
+        .iter()
+        .map(|part| {
+            let (font, border, boxed) = match part {
+                TextPart::Glyphs => (SHOWN, HIDDEN, HIDDEN),
+                TextPart::Border => (HIDDEN, SHOWN, HIDDEN),
+                TextPart::Box => (HIDDEN, HIDDEN, SHOWN),
+            };
+            let options = look.options_coloured(f64::from(h), font, border, Some(boxed));
+            format!("drawtext={}:{at},extractplanes=r", options.join(":"))
+        })
+        .collect();
+    let base = format!("color=c=black:s={w}x{h}:r=1:d=1,format=rgb24");
+    let filter_complex = if let [only] = draws.as_slice() {
+        format!("{base},{only}[o]")
+    } else {
+        let n = draws.len();
+        let outs: String = (0..n).map(|i| format!("[a{i}]")).collect();
+        let branches: Vec<String> = draws.iter().enumerate().map(|(i, d)| format!("[a{i}]{d}[p{i}]")).collect();
+        let stacked: String = (0..n).map(|i| format!("[p{i}]")).collect();
+        format!("{base},split={n}{outs};{};{stacked}vstack=inputs={n}[o]", branches.join(";"))
+    };
+    TextRasterGraph {
+        filter_complex,
+        parts,
+        size,
+    }
 }
 
 /// The export-path `drawtext` for an overlay: `enable`-gated to its lifetime,
@@ -10160,22 +10278,91 @@ mod tests {
     }
 
     #[test]
-    fn drawtext_falls_back_when_font_unknown() {
-        let mut o = TextOverlay::new("Hi", 0.0, 1.0);
-        o.font = Some("Definitely Not An Installed Font XYZ123".to_string());
-        let f = drawtext_export(&o, &ExportFormat::default());
-        assert!(!f.contains("fontfile="), "unresolvable font omits fontfile: {f}");
+    fn drawtext_always_names_a_font_file() {
+        // Every overlay is drawn with a file the plan can name: with no family, or one that is not
+        // installed, the shipped default (a bare `drawtext` asks its own build for "Sans", which a
+        // build without fontconfig does not have).
+        let regular = crate::fonts::default_font_file(false).expect("a writable cache directory");
+        for family in [None, Some("Definitely Not An Installed Font XYZ123")] {
+            let mut o = TextOverlay::new("Hi", 0.0, 1.0);
+            o.font = family.map(String::from);
+            let f = drawtext_export(&o, &ExportFormat::default());
+            assert!(
+                f.contains(&format!("fontfile='{}'", escape_drawtext_path(&regular.to_string_lossy()))),
+                "{family:?}: {f}"
+            );
+            assert!(!f.contains("borderw"), "{f}");
+        }
     }
 
     #[test]
-    fn drawtext_bold_without_font_uses_border_fallback() {
+    fn drawtext_bold_uses_the_bold_face_and_only_a_face_without_one_gets_the_border() {
         let mut o = TextOverlay::new("Hi", 0.0, 1.0);
         o.bold = true;
+        let bold = crate::fonts::default_font_file(true).expect("a writable cache directory");
         let f = drawtext_export(&o, &ExportFormat::default());
         assert!(
-            f.contains("borderw=2"),
-            "bold with no font resolved approximates via border: {f}"
+            f.contains(&format!("fontfile='{}'", escape_drawtext_path(&bold.to_string_lossy()))) && !f.contains("borderw"),
+            "the default has a bold face: {f}"
         );
+        // A family with no bold face is thickened with a same-colour border instead.
+        o.font = Some(crate::fonts::PINNED_FAMILY.into());
+        let f = crate::fonts::with_pinned_default_font(|| drawtext_export(&o, &ExportFormat::default()));
+        assert!(
+            f.contains("fontfile='/kerf-test/fonts/PinnedSans-Regular.ttf'") && f.contains("borderw=2:bordercolor=white"),
+            "{f}"
+        );
+    }
+
+    #[test]
+    fn the_raster_graph_is_the_stills_drawtext_with_each_part_in_white() {
+        use crate::render_plan::PlanText;
+        let mut t = PlanText {
+            id: uuid::Uuid::nil(),
+            text: "50% it's".into(),
+            size: 0.06,
+            pos: (0.5, 0.82),
+            alpha: 0.4,
+            color: "yellow@0.9".into(),
+            bg: None,
+            font_file: Some("/fonts/A b.ttf".into()),
+            synthetic_bold: false,
+        };
+        // The still's own text for the same overlay, to compare the shared options with.
+        let mut o = TextOverlay::new(t.text.clone(), 0.0, 1.0);
+        o.size = t.size;
+        o.color = t.color.clone();
+        let still = drawtext_still(&o, 960, 0.5);
+
+        let plain = text_raster_graph(&t, (540, 960));
+        assert_eq!(plain.parts, vec![TextPart::Glyphs]);
+        assert_eq!(
+            plain.filter_complex,
+            "color=c=black:s=540x960:r=1:d=1,format=rgb24,drawtext=text='50\\\\% it'\\''s':fontsize=58:fontcolor=white:fontfile='/fonts/A b.ttf':x=(w*0.5-text_w/2):y=(h*0.82-text_h/2),extractplanes=r[o]"
+        );
+        assert!(still.contains("text='50\\\\% it'\\''s':fontsize=58"), "{still}");
+        // A box and a synthetic bold add a part each; the colours that are not the part's are invisible
+        // (their geometry still counts: drawtext's clip rectangle grows with the box and the border).
+        t.bg = Some("black@0.5".into());
+        t.synthetic_bold = true;
+        let full = text_raster_graph(&t, (540, 960));
+        assert_eq!(full.parts, vec![TextPart::Glyphs, TextPart::Border, TextPart::Box]);
+        let f = &full.filter_complex;
+        assert!(
+            f.contains("split=3[a0][a1][a2];") && f.ends_with("[p0][p1][p2]vstack=inputs=3[o]"),
+            "{f}"
+        );
+        for (branch, font, border, boxed) in [
+            ("[a0]", "white", "white@0", "white@0"),
+            ("[a1]", "white@0", "white", "white@0"),
+            ("[a2]", "white@0", "white@0", "white"),
+        ] {
+            let want = format!(
+                "fontcolor={font}:fontfile='/fonts/A b.ttf':borderw=2:bordercolor={border}:box=1:boxcolor={boxed}:boxborderw=12:x="
+            );
+            let part = f.split(';').find(|p| p.starts_with(branch)).unwrap();
+            assert!(part.contains(&want), "{part}");
+        }
     }
 
     #[test]

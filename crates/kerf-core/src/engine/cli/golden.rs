@@ -28,7 +28,9 @@
 //! holding HDR footage is built *both* ways), `alimiter_latency_available()`
 //! (`with_alimiter_latency`; every case is built with the option, and a case with the
 //! limiter on has its export argv appended once more without it), `drawtext`'s
-//! resolved font path (no overlay names a font, so none is looked up), and libm: the
+//! font path (no overlay names a font, so no system font is looked up; the shipped
+//! default every overlay then gets is pinned to a fixed path, `with_pinned_default_font`),
+//! and libm: the
 //! compressor and gate thresholds go through `powf`, whose last digits differ between
 //! glibc builds (FMA or not), macOS, Windows and arm, so [`round_libm`] compares those
 //! numbers to 10 significant digits, which still pins the dB mapping. The digest files are
@@ -148,6 +150,13 @@ overlay-percent \\%
 overlay-quote '\''
 overlay-bold borderw=2
 overlay-box box=1
+overlay-default-font fontfile='/kerf-test/fonts/Geist-Regular.ttf'
+overlay-default-font-bold fontfile='/kerf-test/fonts/Geist-Bold.ttf'
+overlay-named-font fontfile='/kerf-test/fonts/PinnedSans-Regular.ttf'
+still-overlay-default-font fontfile='/kerf-test/fonts/Geist-
+still-overlay-named-font fontfile='/kerf-test/fonts/PinnedSans-Regular.ttf'
+preview-overlay-default-font fontfile='/kerf-test/fonts/Geist-
+preview-overlay-named-font fontfile='/kerf-test/fonts/PinnedSans-Regular.ttf'
 cover-fit force_original_aspect_ratio=increase
 scaler-flag :flags=lanczos
 pix-fmt format=yuv422p10le
@@ -706,6 +715,11 @@ fn overlay(r: &mut Rng) -> TextOverlay {
     o.color = r.pick(&["white", "yellow@0.9", "#ffcc00", "0xFF00FF80", "not a colour!", "a,b"]).into();
     o.bg = r.pick(&[None, None, Some("black@0.5"), Some("#00000080"), Some("bad:colour")]).map(String::from);
     (o.bold, o.generated) = (r.chance(0.2), r.chance(0.2));
+    // The shipped default has a bold face, so a bold overlay no longer carries a border; one font with
+    // none keeps the border branch covered. Chosen from draws already made, so no other case moves.
+    if o.bold && !o.generated {
+        o.font = Some(crate::fonts::PINNED_FAMILY.into());
+    }
     for _ in 0..maybe(r, 0.3, |r| 1 + r.below(3)).unwrap_or(0) {
         let (time, pos_x, pos_y) = (r.real(0.0, 5.0), r.real(0.0, 1.0), r.real(0.0, 1.0));
         o.keyframes.push(TextKeyframe { time, pos_x, pos_y, opacity: r.real(0.0, 1.0) });
@@ -931,9 +945,12 @@ fn build(c: &Case, assets: &[Asset]) -> ([String; 3], Vec<String>) {
     (text, transitions(c, assets))
 }
 
-/// `f` as if this ffmpeg did (or did not) have `zscale` and an `alimiter` with `latency`.
+/// `f` as if this ffmpeg did (or did not) have `zscale` and an `alimiter` with `latency`, and the
+/// shipped default font were at a fixed path.
 fn pinned<R>(zscale: bool, latency: bool, f: impl FnOnce() -> R) -> R {
-    with_zscale(zscale, || with_alimiter_latency(latency, f))
+    with_zscale(zscale, || {
+        with_alimiter_latency(latency, || crate::fonts::with_pinned_default_font(f))
+    })
 }
 
 /// Which way each transition went, from what `transition_fx` did with it: a dip

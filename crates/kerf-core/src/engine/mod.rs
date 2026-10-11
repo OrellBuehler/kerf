@@ -109,7 +109,7 @@ pub(crate) use cli::proxy_video_info;
 pub(crate) use cli::render_geometry;
 pub use cli::{
     composite_color_policy, export_seek_arg, ffmpeg_command, ffmpeg_path, fps_mode_flag, limit_ffmpeg_args,
-    source_is_indexed_container,
+    source_is_indexed_container, text_raster_graph, TextPart, TextRasterGraph,
 };
 pub(crate) use cli::{safe_color, valid_color};
 
