@@ -128,6 +128,7 @@
 
 pub mod compositor;
 pub mod cursor;
+pub mod effects;
 pub mod eq;
 pub mod frame_cache;
 pub mod frame_source;
