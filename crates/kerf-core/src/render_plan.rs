@@ -2389,8 +2389,10 @@ mod tests {
             },
             dip.size(u32::MAX),
         );
+        // (A zoom resizes the picture, which the dip to white refuses on its own account too.)
         assert!(
-            matches!(why.as_slice(), [Unsupported::ZoomBehind(_, w)] if w.contains("dip to white")),
+            why.iter()
+                .any(|u| matches!(u, Unsupported::ZoomBehind(_, w) if w.contains("dip to white"))),
             "{why:?}"
         );
         // On a letterbox (a 640x360 picture in a vertical frame) the padded frame is what a blur sees; a
