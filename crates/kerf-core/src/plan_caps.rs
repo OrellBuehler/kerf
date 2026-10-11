@@ -201,6 +201,49 @@ pub enum Unsupported {
     Geometry(usize, String),
 }
 
+impl Unsupported {
+    /// What kind of refusal this is, without the layer names and numbers its message carries: a
+    /// stable key to count refusals by (`mixed_matrices`, `text_too_small`, …).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::NoPicture(_) => "no_picture",
+            Self::Motion => "motion",
+            Self::Delivery(_) => "delivery",
+            Self::Gif => "gif",
+            Self::PickRate { .. } => "pick_rate",
+            Self::Hdr(_) => "hdr",
+            Self::AlphaPicture(..) => "alpha_picture",
+            Self::NotKnownOpaque(..) => "not_known_opaque",
+            Self::TranslucentMatrix(..) => "translucent_matrix",
+            Self::GradedFullRange(..) => "graded_full_range",
+            Self::Effects(_) => "effects",
+            Self::Mask(_) => "mask",
+            Self::Reframe(_) => "reframe",
+            Self::Fade(..) => "fade",
+            Self::Travel(_) => "travel",
+            Self::Tail(_) => "tail",
+            Self::StillTail(_) => "still_tail",
+            Self::KeyedOpacity(_) => "keyed_opacity",
+            Self::KeyedColor(_) => "keyed_color",
+            Self::KeyedZoom(_) => "keyed_zoom",
+            Self::ZoomBehind(_) => "zoom_behind",
+            Self::Text => "text",
+            Self::TextWithoutFont => "text_without_font",
+            Self::TextBorder => "text_border",
+            Self::TextTooSmall(_) => "text_too_small",
+            Self::Scaler(_) => "scaler",
+            Self::MatrixUnknown(_) => "matrix_unknown",
+            Self::MixedMatrices => "mixed_matrices",
+            Self::UnmeasuredPolicy(_) => "unmeasured_policy",
+            Self::RgbInStack(_) => "rgb_in_stack",
+            Self::GradedInFullRangeStack(_) => "graded_in_full_range_stack",
+            Self::Shrink(..) => "shrink",
+            Self::FormatResize(..) => "format_resize",
+            Self::Geometry(..) => "geometry",
+        }
+    }
+}
+
 impl fmt::Display for LayerRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "layer {} ({})", self.index, self.name)
@@ -294,6 +337,45 @@ impl fmt::Display for Unsupported {
                 from.0, from.1, to.0, to.1
             ),
             Self::Geometry(n, why) => write!(f, "layer {n}: {why}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layer(index: usize, name: &str) -> LayerRef {
+        LayerRef {
+            index,
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn a_kind_names_the_refusal_and_not_the_layer_or_the_numbers() {
+        assert_eq!(
+            Unsupported::Mask(layer(0, "a.mp4")).kind(),
+            Unsupported::Mask(layer(3, "b.mov")).kind()
+        );
+        assert_eq!(Unsupported::TextTooSmall(8).kind(), Unsupported::TextTooSmall(11).kind());
+        assert_eq!(Unsupported::Shrink(0, (4000, 2000), (50, 20)).kind(), "shrink");
+        assert_ne!(Unsupported::Text.kind(), Unsupported::TextBorder.kind());
+        assert_eq!(Unsupported::MixedMatrices.kind(), "mixed_matrices");
+        let kinds = [
+            Unsupported::Motion.kind(),
+            Unsupported::Gif.kind(),
+            Unsupported::Text.kind(),
+            Unsupported::TextWithoutFont.kind(),
+            Unsupported::TextBorder.kind(),
+            Unsupported::Hdr(layer(0, "")).kind(),
+            Unsupported::Effects(layer(0, "")).kind(),
+        ];
+        for kind in kinds {
+            assert!(
+                kind.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "{kind} is a key, not a sentence"
+            );
         }
     }
 }
