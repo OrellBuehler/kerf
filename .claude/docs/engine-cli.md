@@ -355,7 +355,8 @@ so the feature is **only** activated through these forwards — which is what ma
   only the alpha plane — no branch in the graph): one expression covers both
   shapes, each axis scaled so the edge is at distance 1, `max` for a rectangle
   and `hypot` for an ellipse. `geq` is per-pixel and slow, the cost keyframed
-  opacity already pays.
+  opacity already pays. Its alpha plane is also computed without FFmpeg (`mask_alpha_plane`, sample for sample the `geq`'s: `f64`
+  arithmetic, truncated into 8 bits), which the GPU compositor draws once per `(mask, size)`. **`geq` is not the identity on the colour planes on every build**: 6.1's bilinear read clamps to `w - 2` / `h - 2`, so the masked picture's last column and row are the ones before them (9.0 copies); `geq_edge()` (`engine/geq_edge.rs`) measures it.
   **Video fades are timed on the timeline**: `video_clip_chain`'s `setpts` has
   already moved the frames to `timeline_start`, so every `fade` (in / out, dip,
   dissolve) starts at `timeline_start + …` — timed from 0 they blacked out any
@@ -487,10 +488,11 @@ so the feature is **only** activated through these forwards — which is what ma
   playback stream (`KERF_ZOOM_KEEP` keeps what they rendered, `KERF_ZOOM_VERBOSE` prints
   the frames worth a look); `rendered.rs`'s `a_keyframed_zoom_is_read_at_the_output_frame_…`
   is the mechanism, straight off the filter. The plan (`render_plan`) mirrors the order by
-  refusing: a Motion plan refuses a moving zoom (`Unsupported::KeyedZoom`, until
-  `GpuCaps::keyed_zoom`), and a Still plan refuses one with a grade, rotation, fade of opacity,
+  refusing what a compositor does not order that way: a Motion plan refuses a moving zoom (`Unsupported::KeyedZoom`, until
+  `GpuCaps::keyed_zoom`, which `kerf-gpu` sets: it draws the grade, effects, mask and fades at the fit size and zooms after
+  them), and a Still plan without the cap refuses one with a grade, rotation, fade of opacity,
   mask or effect in front of it (`Unsupported::ZoomBehind`) — a pure zoom, whose two orders are
-  one chain, is still drawn; `Animated.zooms` is `Clip::zoom_animated()` itself, which holds every
+  one chain, is always drawn; with the cap a rotation, an opacity below 1 and a dip to white in front of the zoom are still refused; `Animated.zooms` is `Clip::zoom_animated()` itself, which holds every
   key against the first one *in time*. Three more graph bugs of the same shape are fixed beside
   it. **A tiny scale snapped to full size**: `scale` reads a width or height that evaluates to 0
   as "unset" and keeps the input's, so 0.0004 of a frame drew at 100%; below `TINY_SCALE` (0.01,
