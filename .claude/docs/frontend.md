@@ -595,20 +595,98 @@ export and a saved cover offer **Show in folder** in their toast.
 — per-frame `get_timeline_frame` decodes stay for scrubbing, shuttle and the
 settled frame, where you want *one* frame rather than all of them. Its effect keys
 off `ui.seekEpoch` (bumped only by a deliberate seek or a fresh play) and never off
-`ui.time`, which ticks every animation frame and would respawn ffmpeg 60×/sec.
+`ui.time`, which ticks every animation frame and would respawn ffmpeg 60×/sec; it
+also restarts for the pane's request width (`boxWidth`, which moves a few times in a
+session) but not for the source cap, which changes as the playhead crosses clips.
+**The stream plays at the cut's own frame rate and at the width the pane asks for.** The rate is
+`renderedFps(timeline, assets)` (`timecode.ts`, held to 1..60 by `playbackFps`): the first clip with
+video **in the cut as it renders**, the way the engine reads it (`export_format` of `for_render()`:
+muted and solo-shadowed tracks, `trackRenders`, and disabled clips do not set it), where
+`timelineFps` — what timecode counts frames in — scans every track and clip as edited. The page
+leaves `fps` out at the top of the ladder and the engine reads the same number (`playback_params`),
+so the ladder and the gate start from the rate the stream really runs at; the twin of the engine's
+`the_rate_is_the_cut_as_it_renders_not_a_muted_tracks_footage` is in `timecode.test.ts`. The width
+is `frameWidth` (the pane's, held to the source at the playhead) and is always sent, so a playing
+frame is as sharp as the paused one.
+**Its frames are raw JPEG bytes**, not data URLs: `api.ts` `startPlayback` parses each channel
+message (`frame-transport.ts` `parsePlaybackMessage`: an `f64` time, then the JPEG, a view into the
+message; the handler cannot throw into the channel's own ordering) into `{ time, jpeg }`, and only a
+frame the gate lets through is turned into anything: `jpegDataUrl` (`Uint8Array.toBase64` where the
+webview has it, a chunked `btoa` otherwise) goes to `frames.showStreamed`, into the pane's **one
+persistent `<img decoding="async">`** — which the settled still then replaces the `src` of, so
+pausing swaps no element. `CANVAS_PAINTER` (`frame-transport.ts`, **off**) is the alternative: a
+stream painter (`createStreamPainter`: two decodes in flight at most, the newest waiting frame wins,
+a frame that finishes after a newer one is dropped, nothing is drawn after `stop`) decodes with
+`createImageBitmap` (`frame-canvas.ts`, with a data-URL `Image` fallback it only commits to after
+five bad frames in a row) onto a `<canvas>` over the still, and `streamShown` says it holds the
+picture until a fetched frame clears it. Turn it on per engine only after measuring there. In the
+browser harness `startPlayback` **synthesizes** JPEG bytes (`sampleFrameJpeg`) at the rate and width
+asked for (the cut's own rate when none is) behind a deliberate 90 ms lag, through the same route,
+so playback moves under `bun run dev` and the failure modes are reproducible without a desktop build.
 Which frames survive is `playback-sync.ts`'s `createFrameGate` (`show`/`skip`/
-`resync`, unit-tested — the one piece of frontend logic with tests): every frame
-arrives late by a *constant* transport cost (ffmpeg's spawn, then base64 + JSON +
-IPC) that on its own exceeds the two-frame `STALE_AFTER` budget, so lag is judged
-against the smallest this stream has managed rather than against zero — measuring
-from zero dropped every frame forever and froze the pane. Only growth past that
-floor is drift: `STALE_AFTER` skips the frame, `RESYNC_AFTER` restarts the stream
-from the playhead rather than playing it out in slow motion against the sound.
-`start_playback` logs `frames` / `first_frame_ms` per run, which is what separates
-"never started" from "sent but dropped"; in the browser harness `startPlayback`
-**synthesizes** frames at the requested fps behind a deliberate 90 ms lag, so
-playback moves under `bun run dev` and that failure mode is reproducible without a
-desktop build. `ExportDialog` (⌘E) drives
+`resync`/`degrade`, unit-tested): every frame
+arrives late by a *constant* transport cost (ffmpeg's spawn, then IPC and the decode)
+that on its own exceeds the two-frame `staleAfter` budget (not less than 75 ms: `ui.time` is written
+once per animation frame, 17 ms of jitter in every lag, so 50 ms at 60 fps left 33 ms for the rest), so
+lag is judged against the smallest this stream has managed (its `floor()`) rather
+than against zero — measuring from zero dropped every frame forever and froze the pane.
+Only growth past that floor is drift: `staleAfter` skips the frame, `RESYNC_AFTER` restarts
+the stream from the playhead rather than playing it out in slow motion against the sound.
+**A stream that renders slower than it plays** (60 fps asked of a machine that does 50: the
+frames are a sixth of a second further behind every second) would be skipped to a frozen
+pane for the six seconds it takes to drift a second behind, so the gate counts a run of skips
+whose drift is still growing and after `OVERLOAD_AFTER` (0.4 s of frames) says `degrade` (a
+burst after a hiccup is a run of skips too, but its drift shrinks). **A stream that catches up
+slowly** is the same freeze the other way round (a 600 ms stall caught up at 1.1x real time heals at
+a ninth of a second per second: six seconds of skips under the one-second resync): once a run of skips
+has been watched for `HEAL_WATCH` (0.2 s, timed by the `at` the page passes), the gate projects how long
+the pane stays frozen until the drift is back inside the budget and says `resync` when that is more
+than a restart costs (`RESTART_COST` 0.5 s, or the stream's own floor when longer; only when the drift
+is `HEAL_MARGIN` past the budget, since it is only as good as `ui.time`'s 17 ms). A quick catch-up (the
+burst after a hiccup; four times real time) is waited out. `degrade` — and a `resync`
+that follows another within 10 s — restarts the stream from the playhead one rung cheaper
+(`stepDown`): **frames are dropped from the source, not from the stream** — ffmpeg has no
+wall clock, so dropping the ones it already rendered saves nothing — halving a rate above 30
+first (60 → 30), then narrowing the width a step at a time to 960 (1920 → 1440 → 960), then
+halving again (30 → 15), then the narrowest step; smooth motion before a sharp picture that is
+moving. **A stream starts the cut's usual start-up ahead of the playhead** (`startAt`): the sound goes on
+while ffmpeg spawns, and a stream started at the playhead would show its first frame that long behind it
+for good, since the gate judges lag against its own floor. The ladder remembers, per key (cut, proxy epoch,
+pane width), the **least** start-up any of its streams has taken — a stream is in step by its floor, so its
+start-up is the floor plus the head start it was given — and starts every later stream, a Play, a seek or a
+lag restart, that far ahead, capped at `MAX_LEAD` (0.25 s: a longer one is a stall that landed in a start-up,
+not one to make up for) and at the end of the cut **as it renders** (`renderedDuration`: the engine refuses a
+start at or past it). The first Play of a cut has nothing to lead by. The minimum, not the latest, because a
+start that comes in quicker than the last one would put the picture ahead of the sound, which is worse than
+behind it. (Replayed on the recorded traces, the restarted stream's first frame was 294 ms behind the sound
+without a head start and 54 ms with it, and never ahead.) The ladder is `createLadder` (`playback-sync.ts`,
+tested): the steps down this cut is at (remembered for a minute after the last restart, `stepsToStart`: a stream
+that met a busy moment finds out; one that cannot is stepped down again within a second), that start-up, and
+**whether the next stream may be restarted to heal a slow catch-up**: not for `REPEAT_RESYNC_WINDOW_MS` (10 s)
+after a lag restart (`heal`; the gate is built with `healWatch: Infinity`), because a stall that comes with
+every start (a decoder's first second) would be restarted into itself over and over (a simulation of a 0.6 s
+stall a second into every stream, caught up at 1.1x: 20 restarts and 21 s of frozen picture in 40 s with the
+ladder stepping to the floor; with the breaker, one restart). The gate adds the head start a stream was given to
+its floor for what a restart costs. It is a counter read when the stream starts, not state; an explicit `fps`
+goes to the backend only from the first step down. At the cheapest rung the gate is built without `degrade` (a
+restart is an ffmpeg spawn on a machine that is already short): it skips to the resync, as it did before. A
+stream that dropped anything leaves a line in the log when it ends (rate, width, frames shown and skipped, why it
+restarted).
+`start_playback` logs `frames` / `first_frame_ms` / `late_frames` per run, which is what separates
+"never started" from "sent but dropped" from "could not keep up".
+**What the transport measured** (headless Chromium, software rendering, 4 shared cores, 300
+unique JPEG frames per size, medians): raw bytes are 25% fewer through the channel (76 → 57 KB at
+1080p) and no base64 / JSON at the backend's end, but **not** the 2-4x decode win the review expected.
+The old path's `JSON.parse` of the message is 0.1 ms and `img.src =` 0.1-0.3 ms — Chromium decodes
+a data-URL image lazily and off the main thread — and its `decode()` took 3.5 / 5.9 / 9.3 ms at 960 /
+1280 / 1920 px, where header + `Blob` + `createImageBitmap` + canvas draw took 5.2 / 7.2 / 12.2 ms; the
+browser's CPU per painted frame at 30 and 60 fps was within 10% either way, and the canvas path
+keeps the main thread busier (a software `drawImage`; `bitmaprenderer` was no better). So the page
+keeps the `<img>`: building the data URL in JS from the raw bytes costs the same per frame as the old
+`JSON.parse` + `img.src =` (0.1 / 0.2 / 0.2 ms synchronous with `toBase64`, 0.3 / 0.5 / 0.7 ms with the
+chunked `btoa` fallback, at 960 / 1280 / 1920 px; load time and paced CPU unchanged). WebKit and WebView2
+are unmeasured.
+`ExportDialog` (⌘E) drives
 the full `ExportOptions` surface — presets, containers/codecs, rate control, resolution,
 a loudness target, and a **Range: In → out** choice when marks are set. It **opens on
 the frame the project is cut for** (`initialExport`): the preset whose resolution is
@@ -680,7 +758,7 @@ else the original's; `capToSource`), since the default proxy is 1280 px wide and
 same picture upscaled at several times the decode cost on every scrub frame — not under a delivery frame, whose canvas is
 not the source's shape (`data-request-width` on the frame says what it asked). The pump (`frame-pump.svelte.ts`) takes it as `width()`, reads it in `run()` — a different
 step is a new frame — and asks nothing until the box has been measured, so a first frame is not decoded at a guess
-and again at the real size. (Playback's streamed frames keep the backend's fixed stream width.) The picture is clipped to the
+and again at the real size. (Playback's streamed frames ask for the same width, read when the stream starts.) The picture is clipped to the
 frame's radius and the frame's border is `border-strong`, since a black matte is 1.05:1 on the pane. **The HUD** over the
 picture is scrim chips with `text-on-video` (the name, ellipsised at 62 % of the width so a long file name never reaches the
 format, then `1920×1080 · 30 fps` in the transport's own rate format, and the proxy / analysis status chips with a dot) — bare
