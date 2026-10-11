@@ -14,8 +14,9 @@
 //!   caps at the size it would render. Nothing is decided here that the plan does not know,
 //!   except what the *surface* adds: the panel has no place yet, it is hidden, or the page has
 //!   to draw over the picture on a surface that sits above the page ([`Technique::overlays`]).
-//! * **Lock-free**: the plan's inputs are taken under the project lock, which is released before
-//!   anything is decoded, planned from files or rendered ([`GpuPreview::frame`]).
+//! * **Lock-free**: the plan's inputs are an `Arc` snapshot ([`snapshot`]) taken under the project
+//!   lock only when the plan epoch says the project or its proxies changed, and the lock is released
+//!   before anything is decoded, planned from files or rendered; a scrubbed frame takes none.
 //! * **Lazy and rebuildable**: the device, compositor, frame source and surface are made on the
 //!   first frame that wants them ([`Backend`]); a failure is remembered with a backoff
 //!   ([`Backoff`]) and a lost device is dropped and rebuilt on the next use, as `kerf-gpu`
@@ -35,6 +36,7 @@
 //! This is a GUI-only surface: it has no MCP tool, because the agent already has
 //! `preview_timeline` (a JPEG of the cut) and nothing here is an edit.
 
+mod snapshot;
 #[cfg(target_os = "linux")]
 mod x11;
 
@@ -48,11 +50,14 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use kerf_core::{
-    composite_color_policy, Asset, CompositeColorPolicy, ExportOptions, GpuCaps, PlanLayer, PlanRequest, Planner, Project,
-    ProxyMedia, RenderPlan, ScrubConfig, ScrubFrames, StreamKind, Timeline,
+    composite_color_policy, CompositeColorPolicy, ExportOptions, GpuCaps, PlanLayer, PlanRequest, Planner, Project, ProxyMedia,
+    RenderPlan, ScrubConfig, ScrubFrames, StreamKind, Timeline,
 };
 use kerf_gpu::{Compositor, FrameSource, FrameSourceConfig, Gpu, GpuError, GpuOptions, Hint, PixelRect, Presenter, Surround};
 use serde::{Deserialize, Serialize};
+
+pub use snapshot::Taken;
+use snapshot::{PlanInputs, PlanSnapshots};
 
 /// The widest frame the GPU preview renders; a bigger panel is drawn from this, scaled up.
 pub const MAX_RENDER_WIDTH: u32 = 1920;
@@ -715,25 +720,15 @@ pub struct PreviewFrameResult {
     pub timings: Option<GpuTimings>,
 }
 
-/// The inputs of one frame, taken under the project lock.
-pub struct PlanInputs {
-    timeline: Timeline,
-    /// The assets as imported: the plan resolves the proxies itself.
-    assets: Vec<Asset>,
-    /// The proxy-swapped assets the FFmpeg preview graph reads.
-    preview_assets: Vec<Asset>,
+/// Take the inputs of a frame: what needs the project lock, in one pass. Call under the lock;
+/// nothing slow happens here, and [`Taken::resolve`] does the rest without it.
+pub fn take_inputs(project: &Project) -> Result<Taken, String> {
+    Taken::from(project)
 }
 
-/// Take the inputs of a frame. Call under the project lock; nothing slow happens here.
-pub fn plan_inputs(project: &Project) -> Result<PlanInputs, String> {
-    let (timeline, preview_assets) = project.timeline_frame_inputs().map_err(|e| e.to_string())?;
-    let assets = project.list_assets().map_err(|e| e.to_string())?;
-    Ok(PlanInputs {
-        timeline,
-        assets,
-        preview_assets,
-    })
-}
+/// Takes the inputs of a frame from the project (the app's: under `lock_user`), called only when
+/// the held snapshot is stale.
+pub type TakeInputs = Arc<dyn Fn() -> Result<Taken, String> + Send + Sync>;
 
 enum Attempt {
     Presented(GpuTimings),
@@ -780,6 +775,8 @@ pub struct GpuPreview {
     prefetched: Mutex<(Vec<u64>, Option<Instant>)>,
     /// A prefetch is under way: the next is not started on top of it.
     prefetching: Arc<AtomicBool>,
+    /// The inputs of the frames being drawn, held between frames (see [`snapshot`]).
+    snapshots: PlanSnapshots,
     bounds: Mutex<BoundsState>,
     /// The live host, outside the render lock so hiding the surface never waits for a render.
     host: Mutex<Option<Arc<Mutex<Host>>>>,
@@ -815,6 +812,7 @@ impl GpuPreview {
             scrub: Arc::new(ScrubFrames::new(ScrubConfig::default())),
             prefetched: Mutex::new((Vec::new(), None)),
             prefetching: Arc::new(AtomicBool::new(false)),
+            snapshots: PlanSnapshots::default(),
             enabled: AtomicBool::new(false),
             reset_backoff: AtomicBool::new(false),
             info: Mutex::new(Info {
@@ -939,6 +937,7 @@ impl GpuPreview {
 
     /// Drop the backend (device, surface, decodes). The window host goes back to normal.
     fn teardown(&self) {
+        self.snapshots.forget();
         *lock(&self.host) = None;
         let backend = lock(&self.render).backend.take();
         // A panic while dropping a broken backend must not take the caller with it.
@@ -964,22 +963,49 @@ impl GpuPreview {
         }
     }
 
+    /// The inputs frames are planned from: the held snapshot while it is fresh, else taken from the
+    /// project again (`take` is where the project lock is, and it is gone by the time this
+    /// returns).
+    fn inputs(&self, take: &TakeInputs) -> Result<Arc<PlanInputs>, String> {
+        if let Some(held) = self.snapshots.fresh(Instant::now()) {
+            return Ok(held);
+        }
+        let taken = take()?;
+        Ok(self.snapshots.keep(taken.resolve()))
+    }
+
     /// A frame for `t`: drawn by the GPU when the plan allows it and everything works, else
     /// FFmpeg's JPEG of `ffmpeg_width`. `overlays_needed` is the page saying it must draw over
     /// the picture (a title box, the trim monitor, safe-area guides).
     ///
-    /// The project lock is taken only inside `inputs`, and not held after it returns. A panic in
-    /// the GPU path (wgpu, the X connection) is caught here: the backend is dropped and rebuilt
-    /// behind the backoff, the surface hidden, and the frame is FFmpeg's like any other fallback.
+    /// The project lock is taken only inside `take`, and only when the held snapshot of the
+    /// inputs is stale. Under Proxy only a frame whose proxy is still building is refused from the
+    /// snapshot, as it was from the project.
     pub fn frame(
         &self,
-        inputs: impl FnOnce() -> Result<PlanInputs, String>,
+        take: &TakeInputs,
         t: f64,
         ffmpeg_width: u32,
         overlays_needed: bool,
     ) -> Result<PreviewFrameResult, String> {
-        let inputs = inputs()?;
-        let attempt = catch_unwind(AssertUnwindSafe(|| self.attempt(&inputs, t, overlays_needed, Instant::now())));
+        let inputs = self.inputs(take)?;
+        if let Some(wait) = inputs.proxy_wait(t)? {
+            return Err(wait);
+        }
+        self.frame_with(&inputs, t, ffmpeg_width, overlays_needed)
+    }
+
+    /// [`GpuPreview::frame`] over inputs in hand. A panic in the GPU path (wgpu, the X connection)
+    /// is caught here: the backend is dropped and rebuilt behind the backoff, the surface hidden,
+    /// and the frame is FFmpeg's like any other fallback.
+    fn frame_with(
+        &self,
+        inputs: &PlanInputs,
+        t: f64,
+        ffmpeg_width: u32,
+        overlays_needed: bool,
+    ) -> Result<PreviewFrameResult, String> {
+        let attempt = catch_unwind(AssertUnwindSafe(|| self.attempt(inputs, t, overlays_needed, Instant::now())));
         let reasons = match attempt {
             Ok(Attempt::Presented(timings)) => {
                 return Ok(PreviewFrameResult {
@@ -2086,7 +2112,7 @@ mod tests {
     /// does not decode).
     fn inputs() -> PlanInputs {
         let project = Project::sample().expect("the sample project");
-        plan_inputs(&project).expect("inputs")
+        PlanInputs::of(&project).expect("inputs")
     }
 
     fn visible(preview: &GpuPreview) {
@@ -2448,7 +2474,7 @@ mod tests {
         preview.policy = || panic!("wgpu panicked");
         preview.set_enabled(true);
         visible(&preview);
-        let result = catch_unwind(AssertUnwindSafe(|| preview.frame(|| Ok(inputs()), 0.5, 320, false)));
+        let result = catch_unwind(AssertUnwindSafe(|| preview.frame_with(&inputs(), 0.5, 320, false)));
         let result = result.expect("the panic reached the caller");
         // The FFmpeg half has nothing to read here, so it is its own error: what matters is that it was
         // reached, instead of the command dying with the panic.

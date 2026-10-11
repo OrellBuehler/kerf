@@ -2022,6 +2022,9 @@ async fn get_timeline_frame(state: State<'_, AppState>, time_secs: f64, max_widt
 /// `overlays` is the page saying it has something to draw over the picture (a title box, the trim
 /// monitor, safe-area guides): a surface that sits above the page cannot show those, so such a
 /// frame is the JPEG. See [`gpu_preview`]; GUI-only, so there is no MCP tool.
+///
+/// The frame's inputs are a snapshot of the project (`gpu_preview::snapshot`): the project lock is
+/// taken only when the plan epoch says something changed, never per frame.
 #[tauri::command]
 async fn get_preview_frame(
     state: State<'_, AppState>,
@@ -2033,18 +2036,11 @@ async fn get_preview_frame(
     let shared = state.project.clone();
     let gpu = gpu.inner().clone();
     blocking(move || {
-        // The inputs are taken under the lock and the guard is gone before anything is
-        // planned from files, decoded, rendered or presented.
-        gpu.frame(
-            || {
-                let project = lock_user(&shared);
-                refuse_unless_proxied(&project, time_secs, Some(time_secs))?;
-                gpu_preview::plan_inputs(&project)
-            },
-            time_secs,
-            max_width.unwrap_or(960),
-            overlays.unwrap_or(false),
-        )
+        let take: gpu_preview::TakeInputs = Arc::new(move || {
+            let project = lock_user(&shared);
+            gpu_preview::take_inputs(&project)
+        });
+        gpu.frame(&take, time_secs, max_width.unwrap_or(960), overlays.unwrap_or(false))
     })
     .await
 }
