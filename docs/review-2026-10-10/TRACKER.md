@@ -15,9 +15,10 @@
 | UI-5 Timeline gestures | ui-5 (on ui-4, pushed) | | ready (PR after #130) | timeline H3–H5, H12, H13, H15 + medium; + playhead past the end after the cut shrinks; clip arrow-key nudge (M18 rest); scrub rail hover chip + marker ticks (H6 rest) | wave 3 |
 | UI-7 Panels polish | ui-7 (on ui-8) | | pushed (awaits ui-8 merge for PR) | panels/shell medium + polish; shell H6 | wave 3 |
 | UI-8 Export dialog logic | ui-8 (on ui-6, pushed) | | ready (PR after UI-6) | dialogs 3 | wave 3 |
-| PERF-4 Still cache and prefetch | | | todo | gpu-media WP6, WP9 | wave 3 |
-| GPU-2 Text on the GPU | gpu-2 (on gpu-3) | | in-progress | gpu-compositor | wave 3 |
-| GPU-4 … GPU-7, PERF-5, macOS presenter | | | todo | | wave 4 |
+| PERF-4 Still cache and prefetch | perf-4 (on perf-3 + gpu-3) | | in-progress | gpu-media WP6, WP9; gpu-compositor Hint::Prefetch | wave 3 |
+| GPU-2 Text on the GPU | gpu-2 (on gpu-3) | | review | gpu-compositor | dev done: T1 captioned 12.7%→96.0% GPU frames, T1b 13.3%→100%, T2 69.5%→78.8%, T3 65.6%→83.3%; 76 text parity cases pass on 6.1.1 + 9.0.2; also fixes drawtext escaping of ' : \ (pre-existing export bug) |
+| GPU-4 Motion fades/transitions | gpu-4 (on gpu-2) | | in-progress | gpu-compositor WP-4 | wave 4 |
+| GPU-5 … GPU-7, PERF-5, macOS presenter | | | todo | | wave 4 |
 | CI: retry + cache ffmpeg download | ci-fetch-retry | #131 | blocked (evermeet 429) | not a review finding | evermeet.cx throttles the macOS pinned-ffmpeg fetch (ffprobe 429 for 6.5+ min); retry + actions/cache ported into #129, #130, #132; cache fills only after one successful run |
 
 ## Decisions
@@ -61,8 +62,12 @@
 - Leftovers from UI-1 go to UI-6: dialogs M13 (indeterminate progress bars; the other half of dialogs item 10) and shell M9's toast icon parity with NotificationCenter, since UI-6 already owns toasts tinted by kind.
 - zizmor fails here only because its online audits get a 401 without a GitHub token; CI's `workflow audit (zizmor)` job covers it.
 
+- GPU-2: bundle Geist Regular+Bold (OFL, ~255 KB) as the default text font instead of resolving a platform font: same pixels on every machine, the plan can name the file, and the Windows/macOS FFmpeg bundles have no fontconfig. Text <12 px and synthetic-bold borders are refused (drawtext blends per glyph; a combined mask rounds differently). Full-range pictures are drawn; layerless frames blend in RGB like FFmpeg.
+- PERF-4 and GPU-4 start stacked (perf-4 on perf-3 + gpu-3; gpu-4 on gpu-2) rather than waiting for the CI-blocked merges.
+
 ## Needs a real machine
 
+- GPU-2: Windows `drive\:` font-path escaping; real-GPU / WARP / Metal text parity (lavapipe only); FFmpeg 7/8 drawtext blend; bundled-font write on a read-only cache dir.
 - UI-7: setTitle + capability in a Tauri build; native <input type=color> in all webviews; overflow:clip + sticky on older WKWebView; hover-only dock close X with real pointer/touch.
 
 - UI-5: autoscroll feel (trackpad, pointer capture) in all webviews; sticky snap-label chip in WebKit; smooth scrollTo + reduced motion; `[`/`]` on non-US layouts.
@@ -97,6 +102,7 @@
 
 ## Needs a decision
 
+- GPU-2: Greek/CJK titles draw missing-glyph boxes with bundled Geist (Latin/Cyrillic only), identically in FFmpeg and GPU — per-text system-font fallback or a second bundled font (Noto, large)? Frontend `titlesShown` gating may still route titled frames off the GPU. Synthetic-bold and sub-12 px text stay refused (needs per-glyph masks).
 - UI-7: bin double-click/Enter to add at the playhead, search, sort and a compact list (panels polish 4, M10); visible ◀ ▶ key-step buttons; rename the project on double-click; a shared .kmenu stylesheet; icon-size and spacing tokens; shell P9, P10, P19.
 
 - UI-5/UI-3: add a one-revision batch split engine op (+ Tauri/MCP/harness), which would give the razor Shift = cut all tracks and an `edit.split` key?
