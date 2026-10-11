@@ -73,6 +73,8 @@
 
 - PERF-4: the playhead is quantised to the cut's frame grid (preview shows the export's frame; the old `-ss` landed one source frame late). A scrub window refuses (one-shot still serves) frames with fades/transitions/tails, non-integer source/cut rate ratios, a title's last frame, 360, HDR and missing assets. MCP `preview_timeline` stays a one-shot still. GPU lane on by default but only Windows `d3d11va` qualifies; `KERF_GPU_LANE=off` disables.
 
+- #131's per-archive ffmpeg cache (e0bc839) ported into gpu-3 / ui-4 / ui-2 (a3c660e / 1d4d136 / d3e275e) after #129 hit evermeet 429 again at 10:01 UTC: each PR branch now keeps whichever archive it verified, so successive runs converge even while evermeet throttles.
+
 ## Needs a real machine
 - PERF-4: the GPU lane (`Resource::Gpu`, MAX_GPU_JOBS=2) and its software fall-back on a real Windows/AMD driver; the GPU-preview prefetch driver against a real surface (cut-stall numbers are debug-build lavapipe).
 - GPU-4: fade/blend integer math bit-identical on real Metal / DX12 / Vulkan and WARP (lavapipe only); dip-to-white 2-level bound measured on x86 swscale only (macOS arm64 NEON unmeasured); a paused frame inside a dissolve in the real GPU preview.
