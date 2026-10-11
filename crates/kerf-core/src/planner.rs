@@ -1152,8 +1152,8 @@ mod tests {
             assert!(!has(&now, gone), "{now:?}");
             assert_eq!(now.len(), why.len() - 1 + usize::from(caps.text), "{now:?}");
         }
-        // Fades are the export's: the FFmpeg still draws none, so a *still* plan inside one is
-        // refused whatever the caps say, and a Motion plan (frame 15 of 30 fps is 0.5 s) by `caps.fades`.
+        // Fades are the export's: a *still* plan holds none (the FFmpeg still draws them), so one
+        // inside a fade is refused whatever the caps say, and a Motion plan (frame 15 of 30 fps is 0.5 s) by `caps.fades`.
         let fading = GpuCaps {
             fades: true,
             transitions: true,

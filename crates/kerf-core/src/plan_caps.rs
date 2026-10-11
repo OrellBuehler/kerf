@@ -59,9 +59,9 @@ impl EffectKinds {
 ///
 /// **Which plans an ability applies to.** `fades`, `transitions`, `keyed_opacity`,
 /// `keyed_zoom` and `keyed_color` are about the export graph and apply to [`PlanMode::Motion`] plans only:
-/// the FFmpeg still draws no fades and a still plan has no tail layers, so a *still* plan
-/// inside a fade, a travel or a tail is refused whatever these say. (`keyed_zoom` also
-/// holds for a still's moving zoom, which the FFmpeg still runs as the last stage like the
+/// a still plan has no fades or tail layers (the FFmpeg still draws them, the plan does not
+/// hold them), so a *still* plan inside a fade, a travel or a tail is refused whatever these
+/// say. (`keyed_zoom` also holds for a still's moving zoom, which the FFmpeg still runs as the last stage like the
 /// export does: with a grade, rotation, opacity, mask or effect in front of it the still is
 /// refused unless the compositor says it orders them that way.) `mask`, `text`,
 /// `reframe`, `hdr` and `effects` hold for both, since both graphs draw them.
