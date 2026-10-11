@@ -786,6 +786,10 @@ so the feature is **only** activated through these forwards — which is what ma
   (three layers) — 60 fps costs about 1.7x the CPU of the 24 it used to be for 2.5x the frames. On
   one pinned core at a 25% budget, 3 layers at 60 fps hold at 960 px (0.89 of the core) and not at
   1280 (~50 fps) or 1920 (25), which is the overload the page steps down from.
+  **With the GPU preview on, the GPU may play a session instead** (`app.md`, *GPU playback*): the same Motion plan of the same
+  `Timeline::slice` (`PlayCut`, `core-render-plan.md`), drawn by the compositor from one forward-only `FrameCursor` per clip, and `stream_preview` is
+  what it hands over to (`SpanPlan::handover`) when a frame ahead is one the compositor does not draw. The stream is unchanged and is still the
+  default and the fallback for every session the GPU does not take.
   **Phone and camera footage** needs two things the container says rather than
   the pixels. *Rotation*: an iPhone portrait clip is a landscape frame plus a
   `Display Matrix`, and every FFmpeg decode autorotates it (nothing here passes
