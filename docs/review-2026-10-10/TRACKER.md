@@ -98,8 +98,8 @@
 - PERF-4 lead frame over originals restored: "click frame k, then step back one" is a 0.13 ms cache hit with lead 1 vs 866–925 ms with lead 0 (one-shot 355–368 ms); lead 0's first-frame gain was inside the noise.
 
 - PERF-4 reconciled with PERF-5 (proxies never hardware-encode): every proxy is the cores' job, so proxy GPU-lane classification, the 2-worker Windows proxy queue and `Lease::fall_back_to_cpu` are removed; the GPU slot remains for hardware exports only (AMF/NVENC/QSV/VT/VAAPI with a named decode accelerator and light graph; `hwupload` counts as light).
-
 - GPU-6: a sharpen on a scaled layer amplifies the scaler's 1-level approximation by 1 + 2 x amount (Y 3 / 7 / 11 at 1.5 / 3 / 5). Refused above amount 0.5 (bound > 2) rather than accepted as drawn, per "refuse rather than approximate". Blur and table effects on a scaled layer stay within 2. The CI gpu parity timeout is raised 20 → 30 min, because the suite alone takes 9–12 min on 4 cores.
+
 ## Needs a real machine
 - GPU-6: compute/storage-buffer passes on Metal, DX12, hardware Vulkan (FMA changes blur's last bits); real-GPU timings; Windows `hypot` vs Linux for ellipse masks; the geq edge probe on non-pinned macOS/Windows FFmpegs.
 - PERF-4: 2 proxy workers by default where the GPU lane can qualify (Windows) — confirm with a hardware proxy beside a software one on Windows/AMD; H.264 High10 / HEVC Main10 classification on real decoders.
