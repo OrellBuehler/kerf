@@ -13,10 +13,7 @@ const read = (path: string) => readFileSync(join(SRC, path), 'utf8');
 const EDITOR = 'lib/components/editor/';
 
 /** Plain elements that may carry a native `title`, by file, and why. Nothing today. */
-const NATIVE_TITLE_ALLOWED: Record<string, string> = {
-	'lib/components/editor/Timeline.svelte': 'TEMP',
-	'lib/components/editor/Preview.svelte': 'TEMP'
-};
+const NATIVE_TITLE_ALLOWED: Record<string, string> = {};
 
 /** Components that take a `title` and route it to `use:tip` (or, for the last two, mean something
  *  else by it: a dialog's heading, a section's heading). A component not listed would spread it

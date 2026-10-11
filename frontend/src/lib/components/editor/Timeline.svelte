@@ -96,6 +96,7 @@
 		zoomLabel,
 		zoomToSlider
 	} from '$lib/zoom';
+	import { tip, type TipInput } from '$lib/tip';
 
 	const pxPerSec = $derived(ui.zoom);
 	const duration = $derived(Math.max(editor.duration, 8));
@@ -1897,7 +1898,7 @@
 
 
 
-{#snippet toolBtn(title: string, label: string, icon: string, on: boolean | null, click: () => void, off = false)}
+{#snippet toolBtn(title: TipInput, label: string, icon: string, on: boolean | null, click: () => void, off = false)}
 	<ToolbarToggle {title} {label} {icon} bare pressed={on} disabled={off} onclick={click} />
 {/snippet}
 
@@ -1937,12 +1938,12 @@
 	>
 		<div role="toolbar" aria-label="Edit tools" style="display:inline-flex;align-items:center;gap:2px">
 			{#each TOOLS as [id, ic, name, action] (id)}
-				{@render toolBtn(settings.withShortcut(name, action), name, ic, ui.tool === id, () => (ui.tool = id))}
+				{@render toolBtn(settings.tip(name, action), name, ic, ui.tool === id, () => (ui.tool = id))}
 			{/each}
 			<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
 			{#each TRIM_TOOLS as [id, ic, name, action] (id)}
 				{@render toolBtn(
-					`${settings.withShortcut(`${name} tool`, action)} — ${TOOL_HINT[id]}`,
+					settings.tip(`${name} tool`, action, TOOL_HINT[id]),
 					`${name} tool`,
 					ic,
 					ui.tool === id,
@@ -1950,14 +1951,22 @@
 				)}
 			{/each}
 			<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
-			{@render toolBtn(settings.withShortcut('Undo', 'edit.undo'), 'Undo', 'undo', null, () => void editor.undo(), !editor.canUndo)}
-			{@render toolBtn(settings.withShortcut('Redo', 'edit.redo'), 'Redo', 'redo', null, () => void editor.redo(), !editor.canRedo)}
+			{@render toolBtn(settings.tip('Undo', 'edit.undo'), 'Undo', 'undo', null, () => void editor.undo(), !editor.canUndo)}
+			{@render toolBtn(settings.tip('Redo', 'edit.redo'), 'Redo', 'redo', null, () => void editor.redo(), !editor.canRedo)}
 		</div>
 		{#if editor.busy}<Badge tone="agent" dot>working…</Badge>{/if}
-		<span title="Length of the cut" style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)">{fmt(duration)}</span>
+		<span use:tip={'Length of the cut'} style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)">{fmt(duration)}</span>
 		{#if editor.selectedClips.length > 1}
 			<span
-				title="Drag any of them to move them all{settings.shortcut('edit.delete') ? `; ${settings.shortcut('edit.delete')} removes them all` : ''}{hasLinkedClips ? `. ${ALT_HINT}` : ''}"
+				use:tip={{
+					text: 'Drag any of them to move them all',
+					detail: [
+						settings.shortcut('edit.delete') ? `${settings.shortcut('edit.delete')} removes them all` : '',
+						hasLinkedClips ? ALT_HINT : ''
+					]
+						.filter(Boolean)
+						.join('\n')
+				}}
 				style="font-size:10px;color:var(--kerf-300)">{editor.selectedClips.length} selected</span
 			>
 		{/if}
@@ -1965,7 +1974,7 @@
 			<!-- Alt is down: whatever is dragged, trimmed or cut now leaves linked clips where they are. -->
 			<span
 				data-alt-chip
-				title={ALT_HINT}
+				use:tip={ALT_HINT}
 				style="display:inline-flex;align-items:center;gap:4px;font-size:10px;padding:1px 6px;border-radius:4px;border:var(--line-width) solid var(--warning);color:var(--orange-400);background:var(--warning-surface)"
 				><Icon n="unlink" s={10} />links off</span
 			>
@@ -1995,7 +2004,7 @@
 		<div style="display:inline-flex;align-items:center;flex-wrap:wrap;gap:8px;row-gap:2px">
 			<span style="display:inline-flex;align-items:center;gap:2px">
 				<ToolbarToggle
-					title={settings.withShortcut('Zoom out', 'view.zoomOut')}
+					title={settings.tip('Zoom out', 'view.zoomOut')}
 					label="Zoom out"
 					icon="zoom-out"
 					bare
@@ -2008,19 +2017,19 @@
 					step="0.001"
 					value={zoomToSlider(ui.zoom)}
 					oninput={(e) => (ui.zoom = clampZoom(sliderToZoom(+e.currentTarget.value), editor.duration))}
-					title="Zoom — {zoomLabel(ui.zoom)} (⌘/Ctrl + wheel zooms at the cursor)"
+					use:tip={{ text: `Zoom — ${zoomLabel(ui.zoom)}`, detail: '⌘/Ctrl + wheel zooms at the cursor' }}
 					aria-label="Timeline zoom"
 					style="width:90px;height:24px;margin:0 4px"
 				/>
 				<ToolbarToggle
-					title={settings.withShortcut('Zoom in', 'view.zoomIn')}
+					title={settings.tip('Zoom in', 'view.zoomIn')}
 					label="Zoom in"
 					icon="zoom-in"
 					bare
 					onclick={() => ui.zoomBy(1)}
 				/>
 				<ToolbarToggle
-					title={settings.withShortcut('Zoom to fit the whole cut', 'view.zoomFit')}
+					title={settings.tip('Zoom to fit the whole cut', 'view.zoomFit')}
 					label="Zoom to fit"
 					icon="fold-horizontal"
 					bare
@@ -2031,7 +2040,7 @@
 			<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
 			<span style="display:inline-flex;align-items:center;gap:6px">
 				<ToolbarToggle
-					title={settings.withShortcut(ui.snap ? 'Snapping on — click to disable' : 'Snapping off — click to enable', 'tool.snap')}
+					title={settings.tip(ui.snap ? 'Snapping on' : 'Snapping off', 'tool.snap', ui.snap ? 'Click to turn it off.' : 'Click to turn it on.')}
 					label="Snapping"
 					icon="magnet"
 					pressed={ui.snap}
@@ -2041,9 +2050,13 @@
 				     delete and a speed change do everywhere (and an agent can flip it). So it is
 				     lit while on, with a second cue in the ruler corner. -->
 				<ToolbarToggle
-					title={editor.rippleMode
-						? `${settings.withShortcut('Ripple on', 'tool.rippleMode')} — a trim, delete or speed change pulls the later clips on that track along, keeping their gaps. Each track ripples on its own, but a clip it moves takes its linked partners along (a picture's detached sound stays with it).`
-						: `${settings.withShortcut('Ripple off', 'tool.rippleMode')} — edits leave a gap. Turn on to have a trim, delete or speed change pull the later clips on that track along. Each track ripples on its own; linked clips follow their partners.`}
+					title={settings.tip(
+						editor.rippleMode ? 'Ripple on' : 'Ripple off',
+						'tool.rippleMode',
+						editor.rippleMode
+							? 'A trim, delete or speed change pulls the later clips on that track along, keeping their gaps. Each track ripples on its own; a clip it moves takes its linked partners along.'
+							: 'Edits leave a gap. Turn it on to have a trim, delete or speed change pull the later clips on that track along. Each track ripples on its own; linked clips follow their partners.'
+					)}
 					label="Ripple"
 					icon="between-horizontal-start"
 					iconSize={12}
@@ -2154,7 +2167,7 @@
 			>
 				{#if editor.rippleMode}
 					<span
-						title="Ripple mode is on — edits pull the later clips on their track along"
+						use:tip={'Ripple mode is on — edits pull the later clips on their track along'}
 						style="font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--kerf-300)"
 						>Ripple</span
 					>
@@ -2168,7 +2181,7 @@
 					>Titles · {editor.overlays.length}</span
 				>
 				<button
-					title="Add a title at the playhead"
+					use:tip={'Add a title at the playhead'}
 					aria-label="Add a title"
 					disabled={editor.busy}
 					onclick={addTitleHere}
@@ -2185,7 +2198,7 @@
 				<div style="display:flex;align-items:center;gap:5px">
 					<!-- The name is the track's height menu (so is the header's right-click). -->
 					<button
-						title="{t.name} — {PRESET_LABEL[ui.trackPreset(t.id)]} height ({ui.trackPx(t.id)} px). Click to change."
+						use:tip={`${t.name} — ${PRESET_LABEL[ui.trackPreset(t.id)]} height (${ui.trackPx(t.id)} px). Click to change.`}
 						aria-label="Track {t.name} height"
 						aria-haspopup="menu"
 						onclick={(e) => openHeightMenu(e, t)}
@@ -2198,7 +2211,7 @@
 					<span style="flex:1;min-width:0"></span>
 					{#if t.kind === 'audio'}
 						<button
-							title={t.duck
+							use:tip={t.duck
 								? 'Ducking on — this track dips under the rest of the mix on export (the preview plays it at its fader)'
 								: 'Duck this track under the rest of the mix on export (the preview plays it at its fader)'}
 							aria-label="Toggle ducking"
@@ -2212,7 +2225,7 @@
 						>
 					{/if}
 					<button
-						title={t.muted
+						use:tip={t.muted
 							? t.kind === 'video'
 								? 'Hidden — click to show'
 								: 'Muted — click to unmute'
@@ -2228,21 +2241,21 @@
 						><Icon n={t.kind === 'video' ? (t.muted ? 'eye-off' : 'eye') : t.muted ? 'volume-x' : 'volume-2'} s={12} /></button
 					>
 					<button
-						title={t.solo ? 'Soloed — click to clear' : 'Solo this track'}
+						use:tip={t.solo ? 'Soloed — click to clear' : 'Solo this track'}
 						aria-label="Toggle solo"
 						aria-pressed={!!t.solo}
 						onclick={() => void editor.setTrackSolo(t.id, !t.solo).catch(err)}
 						style={flagBtn(!!t.solo, 'var(--kerf-400)')}>S</button
 					>
 					<button
-						title={t.locked ? 'Locked — click to unlock' : 'Lock this track against edits'}
+						use:tip={t.locked ? 'Locked — click to unlock' : 'Lock this track against edits'}
 						aria-label="Toggle lock"
 						aria-pressed={!!t.locked}
 						onclick={() => void editor.setTrackLocked(t.id, !t.locked).catch(err)}
 						style={flagBtn(!!t.locked, 'var(--kerf-300)')}>L</button
 					>
 					<button
-						title="Remove track"
+						use:tip={'Remove track'}
 						aria-label="Remove track"
 						onclick={() => onRemoveTrack(t)}
 						style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center;padding:0;min-width:26px;min-height:26px;flex:none"
@@ -2265,7 +2278,7 @@
 								value={gainToFader(t.volume ?? 1)}
 								disabled={editor.busy}
 								aria-label="{t.name} level"
-								title="Level {gainLabel(t.volume ?? 1)} — double-click for unity"
+								use:tip={`Level ${gainLabel(t.volume ?? 1)} — double-click for unity`}
 								onchange={(e) => void editor.setTrackVolume(t.id, faderToGain(+e.currentTarget.value)).catch(err)}
 								ondblclick={() => void editor.setTrackVolume(t.id, 1).catch(err)}
 								style="flex:1;min-width:0;height:20px;--slider-accent:var(--kerf-400);cursor:pointer"
@@ -2278,7 +2291,7 @@
 								value={t.pan ?? 0}
 								disabled={editor.busy}
 								aria-label="{t.name} pan"
-								title="Pan {panLabel(t.pan ?? 0)} — double-click to centre"
+								use:tip={`Pan ${panLabel(t.pan ?? 0)} — double-click to centre`}
 								onchange={(e) => void editor.setTrackPan(t.id, +e.currentTarget.value).catch(err)}
 								ondblclick={() => void editor.setTrackPan(t.id, 0).catch(err)}
 								style="width:48px;flex:none;height:20px;--slider-accent:var(--text-muted);cursor:pointer"
@@ -2319,19 +2332,17 @@
 				{/each}
 				{#each sceneXs as x (x)}
 					<span
-						title="Detected scene cut"
+						use:tip={'Detected scene cut'}
 						style="position:absolute;left:{x}px;bottom:0;width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid var(--scene-marker);transform:translateX(-50%)"
 					></span>
 				{/each}
 				{#each beatTimes as b (b)}
 					<span
-						title="Beat"
 						style="position:absolute;left:{b * pxPerSec}px;bottom:0;width:var(--line-width);height:5px;background:var(--beat-marker);opacity:.75;pointer-events:none"
 					></span>
 				{/each}
 				{#each barTimes as b (b)}
 					<span
-						title="Bar"
 						style="position:absolute;left:{b * pxPerSec}px;bottom:0;width:calc(var(--line-width) * 2);height:11px;background:var(--beat-marker);pointer-events:none"
 					></span>
 				{/each}
@@ -2341,7 +2352,7 @@
 					{@const accent = m.color || 'var(--agent-400)'}
 					<span
 						role="presentation"
-						title="{m.name} — {fmt(mt)}"
+						use:tip={`${m.name} — ${fmt(mt)}`}
 						onpointerdown={(e) => onMarkerPointerDown(e, m)}
 						ondblclick={() => (renaming = m.id)}
 						oncontextmenu={(e) => onMarkerContextMenu(e, m)}
@@ -2379,7 +2390,7 @@
 				{#if ui.markIn !== null}
 					<span
 						role="presentation"
-						title="Mark in {fmt(ui.markIn)} — drag to move{clearHint('range.clearIn')}"
+						use:tip={`Mark in ${fmt(ui.markIn)} — drag to move${clearHint('range.clearIn')}`}
 						onpointerdown={(e) => onMarkPointerDown(e, 'in')}
 						style="position:absolute;left:{ui.markIn * pxPerSec -
 							3}px;top:0;bottom:0;width:12px;z-index:28;cursor:ew-resize;touch-action:none"
@@ -2393,7 +2404,7 @@
 				{#if ui.markOut !== null}
 					<span
 						role="presentation"
-						title="Mark out {fmt(ui.markOut)} — drag to move{clearHint('range.clearOut')}"
+						use:tip={`Mark out ${fmt(ui.markOut)} — drag to move${clearHint('range.clearOut')}`}
 						onpointerdown={(e) => onMarkPointerDown(e, 'out')}
 						style="position:absolute;left:{ui.markOut * pxPerSec -
 							9}px;top:0;bottom:0;width:12px;z-index:28;cursor:ew-resize;touch-action:none"
@@ -2449,7 +2460,7 @@
 						onpointerdown={(e) => onTitlePointerDown(e, o, 'move')}
 						oncontextmenu={(e) => onTitleContextMenu(e, o)}
 						onclick={(e) => e.stopPropagation()}
-						title="{o.generated ? 'Caption' : 'Title'}: {o.text}"
+						use:tip={`${o.generated ? 'Caption' : 'Title'}: ${o.text}`}
 						style="position:absolute;left:{o.start * pxPerSec}px;top:{titleMetrics.pad + row * titleMetrics.row}px;height:{titleMetrics.row - 3}px;width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;opacity:{live ? 0.4 : 1};cursor:{titleDrag ? 'grabbing' : 'grab'};text-align:left;background:{o.generated ? GENERATED_TITLE_FILL : 'var(--track-text)'};border:{selected ? '1.5px solid var(--kerf-400)' : `1px ${o.generated ? 'dashed' : 'solid'} var(--track-text-edge)`};box-shadow:{selected ? '0 0 0 1px var(--kerf-500)' : 'none'}"
 					>
 						<span
@@ -2550,7 +2561,7 @@
 								/>
 								{#each silenceRegions(shown) as r (r.left)}
 									<span
-										title="Detected silence"
+										use:tip={'Detected silence'}
 										style="position:absolute;left:{r.left - left}px;top:3px;bottom:3px;width:{Math.max(2, r.width)}px;background:var(--silence-region);border:var(--line-width) solid color-mix(in srgb,var(--red-500) 30%,transparent);border-radius:2px"
 									></span>
 								{/each}
@@ -2570,7 +2581,7 @@
 							{/if}
 							{#if c.transition_in}
 								<span
-									title="{transitionLabel(c.transition_in.kind)} {c.transition_in.duration.toFixed(2)}s"
+									use:tip={`${transitionLabel(c.transition_in.kind)} ${c.transition_in.duration.toFixed(2)}s`}
 									style="position:absolute;left:0;top:0;bottom:0;width:{Math.min(
 										c.transition_in.duration * pxPerSec,
 										width
@@ -2593,7 +2604,7 @@
 							{#if (c.speed ?? 1) !== 1}
 								{@const sp = c.speed ?? 1}
 								<span
-									title="Speed {sp}×"
+									use:tip={`Speed ${sp}×`}
 									style="position:absolute;right:3px;top:3px;font-size:var(--text-2xs);font-weight:700;color:var(--text-on-video);background:color-mix(in srgb,var(--scrim) 55%,transparent);border-radius:3px;padding:1px 4px;pointer-events:none"
 									>{sp < 0 ? `${Math.abs(sp)}× ⟲` : `${sp}×`}</span
 								>
@@ -2604,7 +2615,7 @@
 								     (the clip's own hover does that too); the tooltip says what Alt does. -->
 								<span
 									data-link-badge
-									title={badge.title}
+									use:tip={badge.title}
 									style="position:absolute;right:8px;bottom:3px;z-index:3;display:inline-flex;align-items:center;gap:3px;padding:1px 4px;border-radius:3px;background:color-mix(in srgb,var(--scrim) 60%,transparent);color:{lit
 										? 'var(--kerf-200)'
 										: 'var(--text-on-video)'};box-shadow:{lit ? '0 0 0 1px var(--kerf-400)' : 'none'}"

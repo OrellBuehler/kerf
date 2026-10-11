@@ -37,6 +37,7 @@
 	import { clipDuration } from '$lib/types';
 	import type { TextOverlay } from '$lib/types';
 	import { LINE_HEIGHT, boxPadding, containRect, dragPosition, isVisibleAt, sampleOverlay, scaledSize } from '$lib/titles';
+	import { tip } from '$lib/tip';
 
 	const duration = $derived(Math.max(editor.duration, 0.001));
 	/** The transport bar's own width, or undefined until it has been measured (and while it
@@ -759,7 +760,7 @@
 							<div
 								role="presentation"
 								data-title-box
-								title={selected ? undefined : `Select “${o.text}”`}
+								use:tip={selected ? undefined : `Select “${o.text}”`}
 								onpointerdown={(e) => onTitleDown(e, o, 'move')}
 								onpointermove={onTitleMove}
 								onpointerup={onTitleUp}
@@ -788,10 +789,10 @@
 				{/if}
 				<div style="position:absolute;left:14px;top:12px;display:flex;gap:6px">
 					<Badge tone="kerf">{previewAsset?.name ?? 'preview'}</Badge>
-					{#if playbackWaiting}<span title={playbackWaiting} data-testid="playback-waiting"
+					{#if playbackWaiting}<span use:tip={playbackWaiting} data-testid="playback-waiting"
 							><Badge tone="warning" dot>playback waits for the proxy</Badge></span
 						>{/if}
-					{#if waitingOnProxy}<span title={waitingOnProxy.title}
+					{#if waitingOnProxy}<span use:tip={waitingOnProxy.title}
 							><Badge tone="warning" dot>{waitingOnProxy.text.replace('preview: ', '')}</Badge></span
 						>{/if}
 					{#if ui.analyzing}<Badge tone="agent" dot>{ui.analysisLabel ?? 'analyzing'}</Badge>{/if}
@@ -818,7 +819,7 @@
 		style="height:40px;flex:none;display:flex;align-items:center;gap:{parts.tight ? 6 : 10}px;padding:0 {parts.tight ? 8 : 14}px;border-top:var(--line-width) solid var(--border-default);background:var(--surface-app)"
 	>
 		<button
-			title={settings.withShortcut('Go to start', 'playback.toStart')}
+			use:tip={settings.tip('Go to start', 'playback.toStart')}
 			aria-label="Go to start"
 			disabled={empty}
 			onclick={() => ui.seek(0)}
@@ -827,7 +828,7 @@
 			<Icon n="skip-back" s={14} />
 		</button>
 		<button
-			title={settings.withShortcut(ui.playing ? 'Pause' : 'Play', 'playback.toggle')}
+			use:tip={settings.tip(ui.playing ? 'Pause' : 'Play', 'playback.toggle')}
 			aria-label={ui.playing ? 'Pause' : 'Play'}
 			onclick={() => ui.togglePlay()}
 			style="background:var(--surface-hover);border:none;border-radius:var(--radius-sm);cursor:pointer;color:var(--text-primary);display:grid;place-items:center;padding:4px 6px"
@@ -835,7 +836,7 @@
 			<Icon n={ui.playing ? 'pause' : 'play'} s={16} />
 		</button>
 		<button
-			title={settings.withShortcut('Go to end', 'playback.toEnd')}
+			use:tip={settings.tip('Go to end', 'playback.toEnd')}
 			aria-label="Go to end"
 			disabled={empty}
 			onclick={() => ui.seek(editor.duration)}
@@ -844,7 +845,7 @@
 			<Icon n="skip-forward" s={14} />
 		</button>
 		<span
-			title="Timeline timecode · {editor.fps.toFixed(3)} fps · non-drop"
+			use:tip={`Timeline timecode · ${editor.fps.toFixed(3)} fps · non-drop`}
 			style="font-family:var(--font-mono);font-size:12px;color:var(--kerf-300);font-weight:500;white-space:nowrap">{tc(ui.time)}</span
 		>
 		<div
@@ -864,7 +865,7 @@
 		{/if}
 		{#if parts.rate}
 			<span
-				title="Timeline frame rate; non-drop timecode"
+				use:tip={'Timeline frame rate; non-drop timecode'}
 				style="font-size:11px;color:var(--text-muted);white-space:nowrap">{Number(editor.fps.toFixed(3))} fps</span
 			>
 		{/if}
