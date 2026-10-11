@@ -377,3 +377,123 @@ fn bench_a_captioned_frame_cold_and_warm() {
     let _ = std::fs::create_dir_all(&out);
     let _ = std::fs::write(out.join("bench-text.txt"), &report);
 }
+
+/// A frame inside a transition: FFmpeg's still (which draws it with `fade`, `overlay` and a second input)
+/// against the compositor — the plan's decode (two files' frames) and the passes (the exact blend reads a
+/// copy of the canvas) — at a 960 px preview and at 1080p, with the cost of a plain frame beside it, and an
+/// export frame through one cursor per clip (`MotionFrames`, forward: the cost per frame of a playback).
+/// Same gate as the still benchmark.
+#[test]
+#[ignore = "benchmark: set KERF_BENCH=1; needs ffmpeg and a GPU adapter"]
+fn bench_a_frame_inside_a_transition() {
+    if std::env::var_os("KERF_BENCH").is_none() {
+        eprintln!("skipped: set KERF_BENCH=1 to run the benchmark");
+        return;
+    }
+    use kerf_core::{Transition, TransitionKind};
+    let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter");
+    let info = gpu.adapter_info().clone();
+    let comp = Compositor::new(gpu).expect("compositor");
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let scratch = dir.join(format!("bench-transition-{}.jpg", std::process::id()));
+    let asset = source(dir, 1920, 1080);
+    let assets = std::slice::from_ref(&asset);
+    let opts = ExportOptions::default();
+    let policy = kerf_core::composite_color_policy();
+    // Two clips of the one second of footage, the second entering through `kind`: the outgoing one keeps
+    // playing on its tail, so the dissolve has two frames to decode.
+    let cut = |kind: Option<(TransitionKind, f64)>| {
+        let mut tl = timeline(&asset, 1);
+        let mut second = Clip::new(asset.id, 0.4, 0.9, 0.4);
+        second.transition_in = kind.map(|(kind, duration)| Transition { kind, duration });
+        tl.tracks[0].clips = vec![Clip::new(asset.id, 0.0, 0.4, 0.0), second];
+        tl
+    };
+    let mut report = format!(
+        "adapter: {} ({:?}, {:?}); ffmpeg: {}; min of 7 runs after a warm-up (median in brackets)\n{:<22} {:<8} {:>14} {:>16} {:>19} {:>13}\n",
+        info.name,
+        info.backend,
+        info.device_type,
+        kerf_core::ffmpeg_path(),
+        "frame",
+        "render",
+        "ffmpeg ms",
+        "gpu decode ms",
+        "gpu composite ms",
+        "layers drawn"
+    );
+    type Kind = Option<(TransitionKind, f64)>;
+    let frames: [(&str, Kind, f64); 5] = [
+        ("plain cut", None, 0.5),
+        ("dissolve, half way", Some((TransitionKind::Crossfade, 0.3)), 0.5),
+        ("dip to black", Some((TransitionKind::DipToBlack, 0.3)), 0.45),
+        ("slide left", Some((TransitionKind::SlideLeft, 0.3)), 0.5),
+        ("dip to white", Some((TransitionKind::DipToWhite, 0.3)), 0.45),
+    ];
+    for (name, width) in [("960 px", 960u32), ("1080p", u32::MAX)] {
+        for (label, kind, t) in frames {
+            let tl = cut(kind);
+            let plan = RenderPlan::at(&tl, assets, &opts, t, policy).expect("plan");
+            let size = plan.size(width);
+            assert!(plan.reasons(&Compositor::CAPS, size).is_empty(), "{label}");
+            let (mut ff, mut dec, mut comp_t) = (Vec::new(), Vec::new(), Vec::new());
+            for run in 0..8 {
+                let t0 = Instant::now();
+                export_still(&tl, assets, &opts, t, &scratch, ImageFormat::Jpeg, 4).expect("ffmpeg still");
+                let ffmpeg_time = t0.elapsed();
+                let (_, timings) = comp.render_plan(&plan, size).expect("gpu render");
+                if run > 0 {
+                    ff.push(ffmpeg_time);
+                    dec.push(timings.decode);
+                    comp_t.push(timings.composite);
+                }
+            }
+            let both = |v: Vec<Duration>| {
+                let min = v.iter().min().copied().unwrap_or_default();
+                format!("{:>6.0} ({:.0})", ms(min), ms(median(v)))
+            };
+            let line = format!(
+                "{:<22} {:<8} {:>14} {:>16} {:>19} {:>13}\n",
+                label,
+                name,
+                both(ff),
+                both(dec),
+                both(comp_t),
+                plan.layers.len()
+            );
+            eprint!("{line}");
+            report.push_str(&line);
+        }
+    }
+    // An export frame: the frames of a dissolve through one cursor per clip, composited one after the
+    // other (forward, as a playback or an export reads them).
+    let tl = cut(Some((TransitionKind::Crossfade, 0.3)));
+    let planner = kerf_core::Planner::new(&tl, assets, &opts, kerf_core::PlanRequest::motion(policy)).expect("planner");
+    let size = planner.at_frame(0).expect("plan").size(960);
+    let source = kerf_gpu::FrameSource::new(kerf_gpu::FrameSourceConfig::default());
+    let mut motion = kerf_gpu::MotionFrames::new(source);
+    let t0 = Instant::now();
+    let (mut decode, mut composite, mut count) = (Duration::ZERO, Duration::ZERO, 0u32);
+    for k in 0..9 {
+        let plan = planner.at_frame(k).expect("plan");
+        let a = Instant::now();
+        let frames = motion.frames(&plan).expect("cursor frames");
+        let b = Instant::now();
+        comp.composite_shared(&plan, &frames, size).expect("composite");
+        decode += b - a;
+        composite += b.elapsed();
+        count += 1;
+    }
+    let line = format!(
+        "export frames 0..9 of a dissolve at 960 px, forward: {:.1} ms a frame (decode {:.1}, composite {:.1}), first frame included\n",
+        ms(t0.elapsed()) / f64::from(count),
+        ms(decode) / f64::from(count),
+        ms(composite) / f64::from(count)
+    );
+    eprint!("{line}");
+    report.push_str(&line);
+    let _ = std::fs::remove_file(&scratch);
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).parent().unwrap().join("parity");
+    let _ = std::fs::create_dir_all(&out);
+    let _ = std::fs::write(out.join("bench-transitions.txt"), &report);
+}

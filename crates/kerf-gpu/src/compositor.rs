@@ -18,11 +18,15 @@
 //!    [`crate::roundtrip`]): FFmpeg's `colorchannelmixer` only takes RGB, so a clip
 //!    below full opacity is converted `yuva420p -> argb -> yuva420p` before it is
 //!    overlaid, clipping out-of-gamut colour and rebuilding the chroma.
-//! 4. **Compose**: rotate (bilinear, as `rotate`), place at FFmpeg's integer
+//! 4. **Compose**: rotate (bilinear, as `rotate`), run the clip's `fade` filters on the
+//!    8-bit picture (their own integer arithmetic, [`kerf_core::fade_luma`]; a dip to
+//!    white goes through the RGB round trip of step 3 instead), place at FFmpeg's integer
 //!    position and blend onto the canvas — which holds **Y, U, V and alpha**, not
 //!    RGB, because `overlay` blends the encoded YUV planes. (Converting each layer
 //!    to RGB first would clamp it before the blend, and legal-but-out-of-gamut
-//!    footage then composites differently.) A letterboxed layer is the whole frame
+//!    footage then composites differently.) A layer whose alpha is below 255 (an
+//!    opacity, a dissolve's ramp) is blended by `overlay`'s own integer formula over a
+//!    copy of the canvas, not by the hardware's blend. A letterboxed layer is the whole frame
 //!    with black bars (`pad`'s output), and an odd layer's last chroma block
 //!    reaches the pixel past it — both reproduced.
 //! 5. **Convert once**: the finished composite goes YUV -> RGB with the plan's
@@ -39,7 +43,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
-use kerf_core::{GpuCaps, RenderPlan, YuvMatrix};
+use kerf_core::{FadeEdge, FadeTint, GpuCaps, RenderPlan, YuvMatrix, FADE_FULL};
 use wgpu::util::DeviceExt;
 
 use crate::eq;
@@ -162,6 +166,12 @@ struct ComposeParams {
     rotate: u32,
     tail: u32,
     pad: [u32; 2],
+    fade_in: u32,
+    fade_out: u32,
+    black: u32,
+    alpha: u32,
+    ramp: u32,
+    pad2: [u32; 3],
 }
 
 #[repr(C)]
@@ -184,7 +194,8 @@ struct RoundTripParams {
     csize: [i32; 2],
     channel: i32,
     taps: i32,
-    pad: [i32; 2],
+    /// A dip to white's `fade` factors, run in the RGB between the conversions.
+    white: [i32; 2],
 }
 
 /// `text.wgsl`'s uniform: one blend of an overlay.
@@ -233,6 +244,11 @@ pub struct Compositor {
     /// The same shader writing only U and V: the chroma an odd layer's last
     /// half block puts on the pixel just past it.
     compose_chroma: wgpu::RenderPipeline,
+    /// A layer with an alpha below 255 (opacity, a dissolve's ramp): FFmpeg's blend in integers,
+    /// over a copy of the canvas, instead of the hardware's.
+    compose_exact_layout: wgpu::BindGroupLayout,
+    compose_exact: wgpu::RenderPipeline,
+    compose_exact_chroma: wgpu::RenderPipeline,
     convert: wgpu::RenderPipeline,
     /// The RGB round trip of a translucent layer (`roundtrip.wgsl`).
     rt_rgb: wgpu::RenderPipeline,
@@ -309,6 +325,106 @@ struct Drawn<'a> {
     geom: LayerGeometry,
     /// Per stage, per plane (Y, U, V): the scaler's tables.
     filters: Vec<[PlaneFilters; 3]>,
+    fades: LayerFades,
+}
+
+/// What the `fade` filters of a layer's chain do at this frame, as the passes take them:
+/// the integer factors of the clip's own fade-in and fade-out (a dip to black's halves are those),
+/// a dissolve's alpha ramp ([`FADE_FULL`]: not running), the black level the filter takes for the
+/// chain's pixel format and the layer's alpha before the ramp, and a dip to white: `fade c=white`
+/// only takes RGB, so the picture goes `yuv420p -> rgb24 -> yuv420p` around it (`white_round_trip`),
+/// in every frame of the clip in an export and while the fade runs in a still.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LayerFades {
+    fade_in: u32,
+    fade_out: u32,
+    black: u32,
+    alpha: u32,
+    ramp: u32,
+    white_in: u32,
+    white_out: u32,
+    white_round_trip: bool,
+}
+
+impl LayerFades {
+    fn of(plan: &RenderPlan, layer: &kerf_core::PlanLayer, geom: &LayerGeometry) -> Result<Self, GpuError> {
+        let mut fades = Self {
+            fade_in: FADE_FULL,
+            fade_out: FADE_FULL,
+            black: if plan.on_alpha_plane(layer) { 0 } else { 16 },
+            alpha: (geom.opacity * 255.0).round().clamp(0.0, 255.0) as u32,
+            ramp: FADE_FULL,
+            white_in: FADE_FULL,
+            white_out: FADE_FULL,
+            white_round_trip: false,
+        };
+        let motion = plan.mode == kerf_core::PlanMode::Motion;
+        let mut seen = [false; 5];
+        for op in plan.fade_ops(layer) {
+            let (slot, which) = match (op.tint, op.edge) {
+                (FadeTint::Black, FadeEdge::In) => (&mut fades.fade_in, 0),
+                (FadeTint::Black, FadeEdge::Out) => (&mut fades.fade_out, 1),
+                (FadeTint::Alpha, FadeEdge::In) => (&mut fades.ramp, 2),
+                (FadeTint::White, FadeEdge::In) => (&mut fades.white_in, 3),
+                (FadeTint::White, FadeEdge::Out) => (&mut fades.white_out, 4),
+                (tint, edge) => {
+                    return Err(GpuError::Unsupported(format!(
+                        "layer {}: a {tint:?} fade-{edge:?}, which the compositor does not draw",
+                        layer.name
+                    )))
+                }
+            };
+            if std::mem::replace(&mut seen[which], true) {
+                return Err(GpuError::Unsupported(format!(
+                    "layer {}: two {:?} fades on one side",
+                    layer.name, op.tint
+                )));
+            }
+            *slot = op.factor;
+            // The filter is in the chain for every frame in an export, and for the frames it runs in a still.
+            if op.tint == FadeTint::White && (motion || op.factor < FADE_FULL) {
+                fades.white_round_trip = true;
+            }
+        }
+        if plan.through_rgba(layer) {
+            // `colorchannelmixer` writes the alpha in an RGBA picture, a dissolve's ramp runs on that
+            // alpha there, and the conversion to `yuva420p` that follows scales it by 256/255: the ramp
+            // comes ahead of that scale, not after it. (A black or white fade there would fade the
+            // colours too, which the plan refuses.)
+            if fades.fade_in < FADE_FULL || fades.fade_out < FADE_FULL || fades.white_round_trip {
+                return Err(GpuError::Unsupported(format!(
+                    "layer {}: a fade to black or white on a layer below full opacity",
+                    layer.name
+                )));
+            }
+            let mixed = (layer.transform.opacity.clamp(0.0, 1.0) * 255.0).round_ties_even() as u32;
+            let ramped = if fades.ramp < FADE_FULL {
+                (mixed * fades.ramp + 32768) >> 16
+            } else {
+                mixed
+            };
+            fades.alpha = ((ramped * 256 + 127) / 255).min(255);
+            fades.ramp = FADE_FULL;
+        }
+        if fades.white_round_trip {
+            let why = if plan.on_alpha_plane(layer) {
+                Some("on an alpha plane (a rotation, an opacity, a dissolve or a mask in the same chain), where FFmpeg converts it through another RGB format")
+            } else if fades.fade_in < FADE_FULL || fades.fade_out < FADE_FULL {
+                Some("while a black fade of the same clip runs ahead of it")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                return Err(GpuError::Unsupported(format!("layer {}: a dip to white {why}", layer.name)));
+            }
+        }
+        Ok(fades)
+    }
+
+    /// The layer's alpha is below 255 somewhere: the hardware's blend is not FFmpeg's, the integer one is.
+    fn blends(&self) -> bool {
+        self.alpha < 255 || self.ramp < FADE_FULL
+    }
 }
 
 fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -351,7 +467,9 @@ impl Compositor {
     /// What this compositor draws exactly, as data: the plan refuses (through
     /// [`RenderPlan::reasons`]) whatever is not in it. That is [`GpuCaps::A0`] — layers,
     /// transform, crop, fit, `eq`, opacity, stills and sampled keyframes — and **text**: titles and
-    /// captions, FFmpeg's own `drawtext` rasterised once and blended here (see [`crate::text`]).
+    /// captions, FFmpeg's own `drawtext` rasterised once and blended here (see [`crate::text`]) —
+    /// and **fades, dips, dissolves, slides and pushes** in still plans and in export frames
+    /// (`motion`, `fades`, `transitions`, `dip_white`; `tests/motion_parity.rs`).
     /// Each later pass flips its bit beside the pass and its parity cases.
     pub fn caps(&self) -> GpuCaps {
         Self::CAPS
@@ -361,6 +479,10 @@ impl Compositor {
     pub const CAPS: GpuCaps = {
         let mut caps = GpuCaps::A0;
         caps.text = true;
+        caps.motion = true;
+        caps.fades = true;
+        caps.transitions = true;
+        caps.dip_white = true;
         caps
     };
 
@@ -381,6 +503,16 @@ impl Compositor {
             let compose_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("compose"),
                 entries: &[uniform_entry(0), texture_entry(1), texture_entry(2), texture_entry(3)],
+            });
+            let compose_exact_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("compose exact"),
+                entries: &[
+                    uniform_entry(0),
+                    texture_entry(1),
+                    texture_entry(2),
+                    texture_entry(3),
+                    texture_entry(4),
+                ],
             });
             let convert_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("convert"),
@@ -441,6 +573,22 @@ impl Compositor {
                 "fs_compose",
                 CANVAS_FORMAT,
                 Some(over),
+                chroma_only,
+            );
+            let compose_exact = pipeline(
+                "compose exact",
+                &compose_exact_layout,
+                "fs_compose_exact",
+                CANVAS_FORMAT,
+                None,
+                all,
+            );
+            let compose_exact_chroma = pipeline(
+                "compose exact chroma",
+                &compose_exact_layout,
+                "fs_compose_exact",
+                CANVAS_FORMAT,
+                None,
                 chroma_only,
             );
             let convert = pipeline("convert", &convert_layout, "fs_convert", CANVAS_FORMAT, None, all);
@@ -560,6 +708,9 @@ impl Compositor {
                 resample_v,
                 compose,
                 compose_chroma,
+                compose_exact_layout,
+                compose_exact,
+                compose_exact_chroma,
                 convert,
                 rt_rgb,
                 rt_luma,
@@ -698,6 +849,7 @@ impl Compositor {
         input: &[Plane; 3],
         forward: YuvMatrix,
         back: YuvMatrix,
+        white: [u32; 2],
     ) -> Result<[Plane; 3], GpuError> {
         let [py, pu, pv] = input;
         let (w, h) = (py.w, py.h);
@@ -714,7 +866,7 @@ impl Compositor {
             csize: [cw as i32, ch as i32],
             channel: 0,
             taps: 0,
-            pad: [0; 2],
+            white: white.map(|f| f as i32),
         };
         let rgb = self.plane("rt rgb", w, h, CANVAS_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
         let bind = self.rt_bind(&self.compose_layout, &params, &[&py.view, &pu.view, &pv.view]);
@@ -890,6 +1042,25 @@ impl Compositor {
     /// A plan with overlays and no layer is `Unsupported`: its text is blended in RGB, and
     /// returning the black planes without it would be a frame that silently lacks its text.
     pub fn composite_yuv(&self, plan: &RenderPlan, frames: &[Option<YuvFrame>], size: (u32, u32)) -> Result<YuvFrame, GpuError> {
+        self.yuv_planes(plan, frames, size)
+    }
+
+    /// [`Compositor::composite_yuv`] over shared frames (a [`crate::MotionFrames`]'s or a [`FrameSource`]'s).
+    pub fn composite_yuv_shared(
+        &self,
+        plan: &RenderPlan,
+        frames: &[Option<Arc<YuvFrame>>],
+        size: (u32, u32),
+    ) -> Result<YuvFrame, GpuError> {
+        self.yuv_planes(plan, frames, size)
+    }
+
+    fn yuv_planes<F: Borrow<YuvFrame>>(
+        &self,
+        plan: &RenderPlan,
+        frames: &[Option<F>],
+        size: (u32, u32),
+    ) -> Result<YuvFrame, GpuError> {
         let canvas = self.composite_as(plan, frames, size, Output::Yuv)?.pixels()?;
         let (w, h) = (canvas.width as usize, canvas.height as usize);
         let at = |x: usize, y: usize, c: usize| canvas.data[(y * w + x) * 4 + c];
@@ -999,11 +1170,13 @@ impl Compositor {
                 };
                 filters.push([table(false)?, table(true)?, table(true)?]);
             }
+            let fades = LayerFades::of(plan, layer, &geom)?;
             drawn.push(Drawn {
                 layer,
                 frame,
                 geom,
                 filters,
+                fades,
             });
         }
         // FFmpeg rasterises what text there is, here, before the GPU is touched. No project lock is
@@ -1092,11 +1265,14 @@ impl Compositor {
 
         let (coef, gv) = matrix_coefs(plan.canvas.matrix);
 
+        // The canvas as it was before a layer that blends, made once the first one needs it.
+        let mut before: Option<Plane> = None;
         for Drawn {
             layer,
             frame,
             geom,
             filters,
+            fades,
         } in drawn
         {
             let (cw, ch) = frame.chroma_size();
@@ -1144,11 +1320,12 @@ impl Compositor {
             // Below full opacity FFmpeg takes the layer through RGB and back before
             // `overlay` sees it (see `roundtrip.rs`); that happens to the scaled
             // picture, ahead of the rotation. An opaque layer never leaves YUV.
-            if geom.translucent {
+            if geom.translucent || fades.white_round_trip {
                 // Out of YCbCr with the layer's own matrix; back with the
                 // composite's (BT.601 under a fixed policy, the negotiated one else).
                 let forward = layer.stream.matrix().unwrap_or(YuvMatrix::Bt601);
-                current = self.translucent_planes(&mut enc, &current, forward, plan.canvas.matrix)?;
+                let white = [fades.white_in, fades.white_out];
+                current = self.translucent_planes(&mut enc, &current, forward, plan.canvas.matrix, white)?;
             }
             let [py, pu, pv] = &current;
 
@@ -1173,6 +1350,12 @@ impl Compositor {
                 rotate,
                 tail: 0,
                 pad: [0; 2],
+                fade_in: fades.fade_in,
+                fade_out: fades.fade_out,
+                black: fades.black,
+                alpha: fades.alpha,
+                ramp: fades.ramp,
+                pad2: [0; 3],
             };
             // Only the part of the canvas the layer can touch.
             let x0 = i64::from(geom.origin.0).max(0);
@@ -1183,16 +1366,6 @@ impl Compositor {
                 continue; // entirely off the canvas
             }
             let views = [&py.view, &pu.view, &pv.view];
-            let bind = self.compose_bind(&params, views);
-            self.pass(
-                &mut enc,
-                &self.compose,
-                &canvas.view,
-                &bind,
-                None,
-                Some((x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)),
-            );
-
             // `overlay` blends whole chroma samples: the half block an odd layer
             // ends in reaches one pixel past it, carrying the layer's chroma onto
             // the base's luma. Reproduced for a layer that is not rotated (a
@@ -1200,14 +1373,65 @@ impl Compositor {
             let odd = (lw % 2 == 1, lh % 2 == 1);
             let past_x = i64::from(geom.origin.0) + i64::from(lw);
             let past_y = i64::from(geom.origin.1) + i64::from(lh);
-            if rotate == 0 && (odd.0 || odd.1) {
+            let tail = rotate == 0 && (odd.0 || odd.1);
+            let tx1 = (past_x + i64::from(odd.0)).min(i64::from(ow));
+            let ty1 = (past_y + i64::from(odd.1)).min(i64::from(oh));
+            let (rx1, ry1) = if tail { (tx1.max(x1), ty1.max(y1)) } else { (x1, y1) };
+
+            // A layer that blends reads the canvas as it stands, and a pass cannot read what it writes:
+            // the region it touches is copied aside first.
+            let canvas_before = if fades.blends() {
+                let copy = before
+                    .get_or_insert_with(|| self.plane("canvas before", ow, oh, CANVAS_FORMAT, wgpu::TextureUsages::COPY_DST));
+                enc.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &canvas.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: x0 as u32,
+                            y: y0 as u32,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &copy.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: x0 as u32,
+                            y: y0 as u32,
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    extent((rx1 - x0) as u32, (ry1 - y0) as u32),
+                );
+                Some(copy.view.clone())
+            } else {
+                None
+            };
+            let (bind, pipeline) = match &canvas_before {
+                Some(prev) => (self.compose_bind_exact(&params, views, prev), &self.compose_exact),
+                None => (self.compose_bind(&params, views), &self.compose),
+            };
+            self.pass(
+                &mut enc,
+                pipeline,
+                &canvas.view,
+                &bind,
+                None,
+                Some((x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)),
+            );
+
+            if tail {
                 params.tail = 1;
-                let bind = self.compose_bind(&params, views);
-                let tx1 = (past_x + i64::from(odd.0)).min(i64::from(ow));
-                let ty1 = (past_y + i64::from(odd.1)).min(i64::from(oh));
+                let (bind, pipeline) = match &canvas_before {
+                    Some(prev) => (self.compose_bind_exact(&params, views, prev), &self.compose_exact_chroma),
+                    None => (self.compose_bind(&params, views), &self.compose_chroma),
+                };
                 self.pass(
                     &mut enc,
-                    &self.compose_chroma,
+                    pipeline,
                     &canvas.view,
                     &bind,
                     None,
@@ -1391,6 +1615,39 @@ impl Compositor {
             }
         }
         Ok(from)
+    }
+
+    /// [`Compositor::compose_bind`] for a layer that blends: the canvas as it stood before it is the fifth binding.
+    fn compose_bind_exact(
+        &self,
+        params: &ComposeParams,
+        planes: [&wgpu::TextureView; 3],
+        before: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        let device = &self.gpu.device;
+        let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("compose params"),
+            contents: bytemuck::bytes_of(params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let texture = |binding: u32, view| wgpu::BindGroupEntry {
+            binding,
+            resource: wgpu::BindingResource::TextureView(view),
+        };
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("compose exact"),
+            layout: &self.compose_exact_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buf.as_entire_binding(),
+                },
+                texture(1, planes[0]),
+                texture(2, planes[1]),
+                texture(3, planes[2]),
+                texture(4, before),
+            ],
+        })
     }
 
     fn compose_bind(&self, params: &ComposeParams, planes: [&wgpu::TextureView; 3]) -> wgpu::BindGroup {

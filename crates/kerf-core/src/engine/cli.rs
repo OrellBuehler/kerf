@@ -7958,9 +7958,9 @@ fn build_still_args_rendered(
     let asset_of = |id| assets.iter().find(|a: &&Asset| a.id == id);
 
     // Active video clips at `t`, in composite order (tracks in list order, clips
-    // within a track in timeline order), paired with their source time. The GPU
-    // compositor's `RenderPlan` is built from the same list, less the clips a
-    // transition keeps on screen past their end (which it refuses).
+    // within a track in timeline order), paired with their source time, the clips a
+    // transition keeps on screen past their end included. The `RenderPlan` a compositor
+    // draws from is built from the same list.
     let active = still_layers(timeline, assets, fmt.fps, t);
 
     let mut args: Vec<String> = vec!["-hide_banner".to_string(), "-loglevel".to_string(), "error".to_string()];

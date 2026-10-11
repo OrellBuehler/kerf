@@ -11,7 +11,7 @@ Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is 
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
 `Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
-draws, `GpuCaps::A0` plus `text` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
+draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions` and `dip_white` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
 
@@ -478,6 +478,74 @@ the atlas key holds the sampled position at full precision, so a **keyframed sli
 exactness); a Windows profile path with non-ASCII characters reaches `fontfile` through FreeType's narrow open (not run on Windows).
 Over a full-range picture on 9.0 (text drawn in full range, converted last) the picture is within 2 levels of the control: drawn.
 
+**Fades, dips, dissolves, slides and pushes** (`composite.wgsl`, `roundtrip.wgsl`, `motion.rs`; `GpuCaps::{motion, fades,
+transitions, dip_white}`). The plan hands each layer's `fade` steps as integers (`RenderPlan::fade_ops`: tint, edge and the
+factor `65535 * i / N` the filter multiplies by; `65535` is "does not run", not even a rounding) and the compositor applies **`vf_fade`'s own
+arithmetic** (`kerf_core::fade_luma` / `fade_chroma` / `fade_alpha`, the shader's copies): luma `((Y - bl) * f + (bl << 16) + 32768) >> 16`,
+with the black level `bl` **16 on `yuv420p` and 0 on `yuva420p`** (`RenderPlan::on_alpha_plane`: a rotation, an opacity, a mask, the dissolve the
+clip entered through), chroma `((C - 128) * f + 8421367) >> 16` (the constant is nine short of the obvious one, and a plain `+ 32768`
+is a level off at a few factors), alpha `(A * f + 32768) >> 16`. `fade_arithmetic_is_ffmpegs` checks it against the filter on
+every sample value of every factor of eight rates / starts / lengths, in and out, `yuv420p`, `yuva420p` and `alpha=1` (1566 frames): the *filter* is identical on 6.1.1 and 9.0.2 (what 9.0.2 does to a full-range picture around it is not, below). The fades run in
+`fs_compose`, **after** the rotation and the letterbox matte (they are part of the picture the filter sees) and on the 8-bit picture,
+the clip's own fade-in and fade-out in turn (a dip to black's halves are those). A **dissolve is two ordinary layers**: the outgoing clip on its tail
+(a plain layer, from the handle it borrows) and the incoming one on an alpha ramp, which `overlay` blends as `FAST_DIV255(d * (255 - a) + s * a)`
+(`(x + 128) * 257 >> 16`, measured exact on all three planes for a uniform alpha, both builds). A layer whose alpha is below 255 is
+therefore blended **in integers** (`fs_compose_exact`, over a copy of the region it touches, since a pass cannot read what it
+writes) instead of by the hardware's blend, whose rounding is the device's own (so the same plan would differ from FFmpeg's by a
+different amount on every GPU); an opaque layer keeps the hardware's, which is exactly the source. The translucent layers of `parity.rs` take the
+integer blend too and stayed inside their bounds (44 to 50 dB flat, 3 to 6 levels). A slide or a push is a position (the geometry already
+adds the travel to the overlay's, truncated and rounded to even as `overlay` does) and the outgoing side of a push is a tail
+that travels. **The alpha ramp of a translucent incoming clip comes ahead of the 256/255 scale** (an opacity below 1 leaves
+RGBA, `fade alpha=1` runs on it there): `((a * f + 32768) >> 16) * 256 / 255`, not the ramp of the scaled alpha. **A dip to white** is a filter
+that takes RGB only, so FFmpeg converts `yuv420p -> rgb24 -> yuv420p` around it (in every frame of the clip in an export, in a still while the fade
+runs): the translucent round trip's passes with the RGB fade (`((c - 255) * f + (255 << 16) + 32768) >> 16`, exact against `rgb24`)
+between them, and the one thing here that is **not exact**: `yuv420p -> rgb24` is an x86 kernel whose 13-bit
+coefficients land up to two levels from the C tables the round trip follows (2189 of 6144 random samples differ, none by more than 2), so a dip to white
+is within **two levels in every plane (three of Y on BT.709)**, a per-effect bound recorded beside the case, `caps.dip_white` turns it off, and it is
+**measured on x86-64 only, on 8-bit limited-range 4:2:0 test patterns and noise (untagged and BT.709-tagged): the arm64 kernel the macOS bundle runs is
+untested**. **Where it is refused** (specific reasons, `Unsupported::FadeOnTranslucent` / `DipToWhite` / `FullRangeNegotiated`): a black or white fade
+running on a layer below full opacity (`colorchannelmixer` leaves RGBA and `rotate` and `fade` run on that, **alpha plane included**: Y 153 levels off the
+first time it was drawn like a plain fade — the harness found it); a dip to white on an alpha plane (FFmpeg picks another RGB format) or beside a running black
+fade of the same clip; on any picture that is not `yuv420p` (RGB, 10-bit, 4:4:4, 4:2:2, gray, `yuvj`: 9 to 21 levels off **in an export's planes on 9.0.2**) or whose matrix is not BT.601 / BT.709;
+on a **letterboxed** layer (FFmpeg pads before the round trip, so its bars whiten: Y 126 against 16 at half way, where the compositor's matte stays black); on a picture
+with an **odd** side (the round trip reads past the line); and on a layer the **scaler resizes** (a layer that is only cropped is exact): the `scale` filter is handed
+`rgb24` by the fade's negotiation and scales and converts in one pass, chroma interpolated from other samples than the compositor's scale-then-convert (a half-size layer
+Y 19, UV 28 off at sharp edges, an enlargement 11 / 10) — found by the harness comparing the frames beside a refusal. **A full-range (`yuvj`) picture is refused
+whenever the composite policy is not `FixedBt601`** (FFmpeg 9; `PlanStream::maybe_full_range_in(policy)`, which also counts **every deeper-than-8-bit YCbCr or gray format** there, because the
+name is only a heuristic and the range *tag* is the truth, which `StreamInfo` does not record: a 10-bit file tagged `pc` probes as `yuv420p10le` like the limited one, and 9.0.2 handles it as it does `yuvj` —
+Y 16 off in an export's planes, flat 16 / 15 / 11 under a still's fade — so the **limited 10-bit picture is refused with it**; FFmpeg 6.1.1 draws both exactly: Y 0 / UV 0 in Motion, 3 in a still's fade, so the name alone decides there, as before): in a still, while a fade, dip or dissolve runs on it (`fade` darkens the *raw* values toward the
+limited-range black 16 and converts the range afterwards: frame 0 of a fade-in reads Y 30 where black is 16, 15 to 19 levels off over the fade), and **every export frame of a cut that holds one**
+(`Unsupported::FullRangeCut`, from `PlanCanvas::full_range_cut`, which the `Planner` sets from the cut's clips): FFmpeg 9 flags the whole export full range, keeps the full-range
+clip's raw values (Y 17 / UV 16 off a compositor that converts first) and **converts every limited-range frame of the cut to full range** (a black frame reads Y 0 where the compositor draws 16, a test pattern
+76 against 81, a gap too), before the clip, after it and on another track alike, so no frame of such a cut is drawn, not only the full-range layer's. **The policy is a proxy for the behaviour, measured on
+FFmpeg 6.1.1 and 9.0.2 only: 5.x, 7.x, 8.x and distro builds are unmeasured** (`composite_color_policy()` probes the composite's colour, not the range handling; a build that negotiates the colour but
+not the range would be refused needlessly, one that does the reverse would be drawn wrong). FFmpeg 6 converts
+at the decode, as the compositor does, and draws all of it to the level — **unless the scaler resizes the picture** (`FullRangeResized`, both FFmpegs): swscale converts the range inside
+the resize, and an export's chroma reads up to 15 levels off (a fade on a 1.5x enlargement: flat 14), so a resized full-range picture is refused in an export frame and inside a fade (plain, in a still, it is
+drawn inside the strict bounds, 5 flat). **The dip-to-white refusals follow the Motion plane bound (2 levels) and are conservative in stills on purpose**: with
+them bypassed, RGB, 10-bit, 4:4:4, 4:2:2, gray, BT.2020, full-range and half-size layers all pass the still's STRICT bounds, but `reasons()` is one function for both plan modes and a refusal
+is not drawn approximately. **Export frames** (`PlanMode::Motion`, `caps.motion`) pick source frames with the `fps` filter
+(`Pick::Fps`), which a `FrameCursor` serves; `MotionFrames` (`motion.rs`) is the per-clip bookkeeping: a cursor opened the first
+time a clip is on screen, handed the pick of each later frame in order, dropped when the clip leaves the plan, reopened for a frame earlier than
+the last it answered. A still plan (what the app's preview and `FrameSource` serve) holds the same fades, travel and tails with the still's `-ss` picks, so
+a paused frame inside a transition is drawn like the file shows it — where the FFmpeg *still* used to be the only thing that did.
+
+**`tests/motion_parity.rs`** (`#[ignore]`d; both FFmpegs in CI's parity job) holds the compositor to the **export**, frame by frame: each case builds a short
+cut, renders it through `render_with` (the real graph) losslessly, reads **every frame back as `yuv420p` planes** (no colour conversion between: the planes `overlay`
+blended) and draws the same frames from a Motion plan through `MotionFrames`, comparing plane for plane with a stated bound per case, **every frame of the range, the last
+included** (`target/parity/motion-report.txt`; montages `FFmpeg | GPU | diff x8` of frames worth a look and of any over the bound in `target/parity/motion/`). The sources are lossless
+(testsrc2 with a frame counter, colour bars, a 25 fps clip, a still, a portrait one for a letterbox, noise in all three planes, a gradient for the rotated cases) and, for the
+format and range cases, `variants()` (10-bit, 4:4:4, 4:2:2, gray, an RGB PNG, MJPEG and a JPEG still, BT.709-tagged). Families: plain cuts and speeds at five rates, clip fades,
+dips, dissolves, the eight slides and pushes, keyed position / rotation, rotated and translucent layers on an alpha plane, and the coverage archetypes' montage and talking-head
+shapes. **Every sample equals the export's wherever a picture is drawn at its own size on 9.0.2 and 6.1.1 (max error 0)**; one level where the compositor scales a layer (the
+scaler's, `parity.rs`), two where it scales **and** grades, two inside a rotated layer (the band within 3 px of its edge, from the plan's geometry, is left out), and a dip to
+white at two (`WHITE`; three of Y on BT.709, `WHITE_709`). **A refusal case** (`run_refusing`) skips the frames the plan refuses for its reason, requires at least one, and
+holds **every other frame to the export** (a refusal wider than it has to be shows): the letterboxed / odd / resized / not-`yuv420p` dips to white, the fades on a translucent layer,
+the full-range pictures (`run_full_range`: drawn exactly under `FixedBt601`, refused under the negotiating policies). A mutation of the chroma constant by nine in 65536 fails the dips
+at once. The Still-plan side is `parity.rs`: `frames_inside_a_transition_are_drawn_as_ffmpegs_still_draws_them` (the plan holds the frame and the GPU is held strictly to the still, the still to
+the export), `every_kind_of_transition_and_the_clips_own_fades_are_drawn_in_a_still`, `a_dip_to_white_is_drawn_where_its_round_trip_was_measured_and_refused_elsewhere` and
+`a_full_range_picture_fades_as_the_ffmpeg_in_use_converts_its_range` (the `check_refused` cases, with FFmpeg rendering each fallback).
+
 **`tests/parity.rs`** (`#[ignore]`d; CI job `parity`, a **matrix of the distro FFmpeg and
 the pinned one** — the two compose colour differently, so a green run on one proves
 nothing about the other) renders each case at several times through `export_still` (a
@@ -517,21 +585,22 @@ the **full-range grading** cases (a graded `yuvj` clip, and a graded layer in a 
 one, refused; ungraded and limited-range controls drawn),
 and **refusals** (an EXIF-oriented JPEG, FFV1 `yuva420p`, the same with the pixel
 format unrecorded, a translucent odd layer, a moving zoom behind a rotation or a grade) —
-each of which FFmpeg still renders, and **text** (the `text/` family: the app's title and
+each of which FFmpeg still renders (and a fade to black or white on a translucent layer, a dip to white on a rotated, letterboxed, odd, resized or non-`yuv420p` layer or beside a black fade, a fade on a full-range picture under FFmpeg 9), **transitions** (`transition/`, `transition-kind/`, `fade/`: every kind and a clip's own fades in a still, see
+above), and **text** (the `text/` family: the app's title and
 caption styles, positions and edges, boxes, colours, sizes, keyframed and overlapping overlays, escapes, installed fonts,
 over every kind of picture, with no layer, and the text it must refuse, each held to the same picture without the text; see
-"Text" above). 238
-renders in the table on FFmpeg 6.1.1 (228 compared and 10 asserted refused on the pinned
-9.0.2 the Windows and macOS bundles ship; 76 of them are `text/`) plus the plane-level scaler runs, all passing
-strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
+"Text" above). The table
+holds 555 rows on FFmpeg 6.1.1 and 545 on the pinned 9.0.2 the Windows and macOS bundles ship (where the mixed-tag stacks are asserted refused instead of compared; 152 rows are `text/`, its
+controls included, and 165 the transitions and fades) plus the plane-level scaler runs, all passing strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
 (`KERF_PARITY_KEEP=1` keeps them for passing ones; `KERF_PARITY_EXPLORE=1` prints
 everything and fails nothing); every run writes `target/parity/report.txt`.
 `tests/bench.rs` times a still on the GPU against FFmpeg at 1080p / 4K and 1 / 3 / 6
 layers, decode apart from composite (`KERF_BENCH=1`), and a captioned frame cold (FFmpeg rasterises the caption: one
 process, +30 to +95 ms on lavapipe by FFmpeg and size) and warm (the atlas: a few ms, inside the noise).
-`tests/coverage.rs` plans the review's four archetypes (no decode, no adapter) and tells how many frames a
-compositor draws before and after text (the captioned 9:16 talking head: 12.7% to 96.0%, 13.3% to 100% with hard cuts; the rest
-is the clip fades). **The readback is bounded**: the
+`tests/coverage.rs` plans the review's archetypes (no decode, no adapter), still plans and export frames, and tells how many
+frames a compositor draws before and after fades and transitions (still plans: the captioned 9:16 talking head 96.0% to 100%, the
+same without captions 96.0% to 100%, the 16:9 montage with dissolves, dips and a slide 78.8% to 100%; export frames: 0% to 100% for those, since a Motion plan was
+refused whole; the tutorial with a webcam picture-in-picture is 83.3% as a still, and 0% to 16.6% as export frames, where its keyed push-ins, the mask and the blur are what is left). **The readback is bounded**: the
 wait for the GPU to finish is `READBACK_TIMEOUT` (30 s), a `GpuError::Readback` rather
 than a caller blocked forever on a wedged device.
 
@@ -540,4 +609,5 @@ cargo test -p kerf-gpu --no-default-features -- --ignored        # needs ffmpeg 
 KERF_GPU_ADAPTER=hardware cargo test -p kerf-gpu --no-default-features -- --ignored   # the machine's GPU
 KERF_BENCH=1 cargo test -p kerf-gpu --no-default-features --release -- --ignored --nocapture bench
 cargo test -p kerf-gpu --no-default-features --test coverage -- --ignored --nocapture   # frames drawn vs refused, per archetype
+cargo test -p kerf-gpu --no-default-features --test motion_parity -- --ignored --nocapture   # the export's frames vs the compositor's, plane for plane
 ```

@@ -37,7 +37,7 @@ pub use captions_import::{
     CaptionImportRequest, ImportSummary, ImportedCue, ParsedCaptions, MAX_CAPTION_CUES, MAX_CAPTION_FILE_BYTES,
     MAX_CAPTION_OFFSET, MAX_CAPTION_WORDS, MAX_CUE_CHARS, MAX_IMPORTED_CAPTIONS, MAX_LINE_CHARS,
 };
-pub use clip_timing::{FadeEdge, FadeStep, FadeTint, MotionKeys, Rational};
+pub use clip_timing::{fade_alpha, fade_chroma, fade_luma, FadeEdge, FadeStep, FadeTint, MotionKeys, Rational, FADE_FULL};
 pub use engine::cpu::{
     budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, gpu_lane, high_pending as proxy_jobs_pending,
     set_cpu_percent, set_gpu_lane, DEFAULT_CPU_PERCENT, MAX_GPU_JOBS, MIN_CPU_PERCENT,
@@ -70,7 +70,7 @@ pub use model::{
     VideoEffect, Voiceover, ADJACENT_EPS, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB,
     MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_CHANNEL_VOLUME, MIN_EDIT_CLIP,
 };
-pub use plan_caps::{EffectKinds, GpuCaps, LayerRef, Unsupported};
+pub use plan_caps::{DipWhy, EffectKinds, GpuCaps, LayerRef, Unsupported};
 pub use planner::{Handover, PlanRequest, Planner, SpanPlan, SpanRun};
 pub use platform::{
     check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind, PlatformReport, PlatformTarget, Severity,
@@ -79,6 +79,6 @@ pub use platform::{
 pub use project::{FramingPlan, Project, SmartCropJob, SmartCropPlan, StemsPlaced, MAX_CHANNEL_KEYS, VOICEOVER_TRACK};
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use render_plan::{
-    Animated, CompositeColorPolicy, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream, PlanText,
-    PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_SHRINK, MIN_TEXT_PX,
+    Animated, CompositeColorPolicy, FadeOp, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream,
+    PlanText, PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_SHRINK, MIN_TEXT_PX,
 };

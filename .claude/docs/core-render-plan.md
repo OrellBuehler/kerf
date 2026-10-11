@@ -65,29 +65,36 @@
   are placed on; the same for every rate with small terms, different for `29.970029`),
   `pix_fmt`, gif and composite colour policy.
   **Two modes.** `Still` is the contract the GPU path started with (`build_still_args`:
-  one sampled transform, half-open spans, text drawn statically; the FFmpeg still also draws
-  the fades, tails and travel of a frame inside a transition — `engine/cli/still_fx.rs` — which
-  a still plan does not hold). `Motion` is the export graph at output frame `k`: every
+  one sampled transform, half-open spans, text drawn statically) **and the FFmpeg still's own frame
+  inside a transition** (`engine/cli/still_fx.rs`): the fades still changing the picture, counted at the
+  output frame `k = frame_containing(t)`, the slide / push travel read at `ffmpeg_frame_time(k)` and an
+  outgoing clip on its tail, judged at the slot's start (`exact_time(k)` plus a nanosecond: a window that
+  closes inside a frame is open for it, one that ends on a boundary is closed for the frame that starts
+  there; `candidates_between` looks from there, which can be before the `t` asked for).
+  `the_still_plan_holds_the_layers_the_still_draws_at_every_time_of_every_transition` holds the plan's
+  layers, source times, travel and running fades to `still_layers` over every kind, four rates and
+  windows that close inside a frame. `Motion` is the export graph at output frame `k`: every
   expression the graph evaluates (`enable`, keyframes, the overlay position, `drawtext`) is
   read at `ffmpeg_frame_time(k)`, the slot boundary is `exact_time(k)`; an outgoing clip
   plays on its tail; a keyframed clip is never padded and always scales again
   (`LayerGeometry::resolve_with` and its `Placement`, which `resolve` defaults to
   `Placement::STILL`; a slide's travel joins the position in every branch); text is on
-  `between(t,start,end)`. **A still plan is never drawn inside a transition**: it has no
-  layer for the outgoing clip playing on its tail — the export keeps drawing it until its
-  window closes, which is *after* the alpha ramp (the fade counts frames and rounds) and
-  around an incoming clip that does not cover it (6.9 dB, max 255 at 24 fps, 0.6 s dissolve,
-  frame 62) — so `RenderPlan.tails` records every clip whose tail window is open at the
-  frame (read at `t` and at `ffmpeg_frame_time(frame)`) and `reasons` refuses it
-  (`Unsupported::StillTail`), as it refuses a still inside a fade step or a travel,
-  **whatever the caps**: `fades`, `transitions`, `keyed_*` and `motion` are about Motion
-  plans (a still plan holds none of it; the FFmpeg still draws it, so the fallback is the
-  export's frame), `mask` / `text` / `effects` / `reframe` / `hdr`
-  hold for both. `frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn`
-  (kerf-gpu parity: dissolve / slide / push / dip, covering and partial incoming clip,
-  frames before / inside / after, both FFmpegs) holds every listed frame's FFmpeg still to the
-  export's frame (>= 35 dB, the tail-only frame included) and the drawn ones to the GPU, so the
-  second half of a dip is a drawn frame by measurement. A Motion plan holds **candidates** at a clip's closing edge
+  `between(t,start,end)`. **Fades, tails and travel are in both plans** and a compositor says whether it
+  draws them (`caps.fades`, `caps.transitions`, `caps.dip_white`); `reasons` refuses a frame inside one
+  otherwise (`Unsupported::Fade` / `Tail` / `Travel` / `DipToWhite`). A fade is its **integer factor**
+  (`FadeStep::factor_at_frame`: `65535 * i / N` truncated, `65535 -` that for a fade-out; `FADE_FULL` is
+  "the filter does not run"), `RenderPlan::fade_ops(layer)` lists a layer's steps in chain order with
+  their factors, `on_alpha_plane(layer)` says whether the chain is on `yuva420p` (a rotation, an opacity
+  below 1, a mask, a chroma key, the dissolve the clip entered through, a keyed rotation or opacity in an
+  export frame: `fade` takes black 0 there and 16 on `yuv420p`) and `through_rgba(layer)` whether an
+  opacity below 1 left it in RGBA (`colorchannelmixer`, then `rotate` and `fade` on RGBA, alpha plane
+  included). Where the still's `fade` runs on the `fps=` timebase and the canvas parses the rate
+  differently, a still inside a fade is `PickRate`, as an export frame always is.
+  `frames_inside_a_transition_are_drawn_as_ffmpegs_still_draws_them` (kerf-gpu parity: dissolve / slide /
+  push / dip, covering and partial incoming clip, frames before / inside / after, both FFmpegs) holds every
+  listed frame's FFmpeg still to the export's frame (>= 35 dB, the tail-only frame included) and the GPU to
+  the still; `tests/motion_parity.rs` holds the export's own frames to a Motion plan, plane for plane
+  (`gpu.md`). A Motion plan holds **candidates** at a clip's closing edge
   (the layers whose `enable` window contains the frame time, end included) and **`fps_pick`
   resolves them**: a candidate is drawn exactly when its pick names a frame
   (`rendered.rs` holds that to the pixels at five rates, and every drawn clip is planned).
@@ -215,7 +222,8 @@
   placed as a static one, and the sweep holds origin, zoom, turn, opacity and grade of the new cuts to the
   evaluated graph.
   **What the compositor may draw is data**: `GpuCaps` (`Compositor::caps()`, today
-  `GpuCaps::A0`: `motion`, `fades`, `transitions`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`,
+  `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions` and `dip_white`: `motion`, `fades`, `transitions`,
+  `dip_white`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`,
   `text`, `reframe`, `hdr` and an `EffectKinds` bitset), and **`RenderPlan::reasons(&caps,
   size)` is a pure function of the plan's fields** returning `Unsupported` values whose
   `Display` is the message the plan has always given — nothing is decided while planning,
@@ -226,9 +234,35 @@
   keyed opacity (a `geq` alpha, not the RGB round trip), a non-`yuv420p` delivery and a
   gif are refused. The old API stays: `gpu_supported()` / `unsupported_reasons()` (an owned
   `Vec<String>`) / `unsupported_reasons_at(size)` / `gpu_supported_at(size)` are
-  `reasons(&GpuCaps::A0, ..)`. A still is refused while a fade step is live, a layer
+  `reasons(&GpuCaps::A0, ..)`: a plan is refused while a fade step is live, a layer
   travels or a tail window is open — exactly, where A0 refused the whole
-  `[start - d/2, start + d)` of a transition and missed the tail after the ramp.
+  `[start - d/2, start + d)` of a transition and missed the tail after the ramp. **What a compositor that
+  draws fades still refuses** (specific reasons, whatever the caps): `FadeOnTranslucent` (a black or white fade running on a
+  layer whose opacity is below 1: FFmpeg fades the RGBA picture `colorchannelmixer` leaves, alpha plane
+  included, ahead of the conversion back to `yuva420p`; a dissolve's ramp touches the alpha alone and is
+  drawn) and, with `caps.dip_white`, `DipToWhite(layer, why)`: a dip to white is `yuv420p -> rgb24 -> yuv420p` around
+  the fade (a filter of every frame of the clip in an export, of the frames the fade runs in a still), measured within 2
+  levels (3 on BT.709) of the compositor's tables on x86-64 (arm64 NEON untested), and only on **8-bit limited-range
+  untagged / BT.601 / BT.709 `yuv420p`**. Refused, each with its own `why`: an alpha plane (FFmpeg picks another RGB
+  format), a black fade of the clip running ahead of it, any other pixel format (RGB 11 / 12 levels of Y / UV off,
+  10-bit 9 / 16, 4:4:4 16 / 17, 4:2:2 9 / 13, full range up to 21 — in an export's planes on 9.0.2 — or an unrecorded format) or matrix, and, from `reasons(size)`
+  (the geometry): a letterboxed layer (`pad` runs before the round trip, so FFmpeg's bars whiten; Y 126 against 16 at half
+  way), a picture with an odd side (the round trip reads past it), and any layer the scaler resizes (the `scale` filter hands
+  the fade its `rgb24` itself, scaling and converting in one pass: Y up to 19, UV 28 off, a crop that leaves the size is exact).
+  The dip-to-white refusals are the **Motion** plane bound's and are conservative in stills on purpose: bypassed, RGB, 10-bit, 4:4:4,
+  4:2:2, gray, BT.2020, full-range and half-size layers all pass a still's strict bounds, but `reasons()` is one function for both modes.
+  `FullRangeNegotiated(layer)` (a still): a `yuvj` (or unrecorded-format) picture inside a running fade, dip or dissolve where FFmpeg 9 works on its raw
+  values and converts the range afterwards (`fade` darkens toward the limited-range 16 first: frame 0 of a fade-in reads Y 30 where black is 16).
+  **`FullRangeCut`** (an export frame; a plan-level reason, from `PlanCanvas::full_range_cut`, which the `Planner` sets when any clip of the cut
+  `maybe_full_range()`): FFmpeg 9 flags the whole export full range and converts every limited-range frame of it (a black frame reads Y 0, not 16), so under any policy
+  but `FixedBt601` **no frame of a cut that holds a full-range clip** is drawn — before it, after it, on another track or a gap. FFmpeg 6 converts at the decode, as the
+  compositor does, and draws it all to the level, except that **`FullRangeResized`** (under either FFmpeg, from `reasons(size)`) refuses a full-range
+  picture the scaler resizes in an export frame and inside a fade (swscale converts the range inside the resize: chroma up to 15 levels off).
+  `maybe_full_range()` is a name heuristic (`yuvj…`, or no recorded format): the range tag (`color_range`) is the truth and `StreamInfo` does not record it. Under a policy that is not
+  `FixedBt601`, `maybe_full_range_in(policy)` therefore also counts any deeper-than-8-bit YCbCr / gray format (`pix_fmt_is_high_bit`): a `pc`-tagged 10-bit file probes as `yuv420p10le`, 9.0.2 handles it as `yuvj`, and the
+  limited 10-bit picture is refused with it (it is what the cut flag, `FullRangeNegotiated` and the grading refusals use; 6.1.1 draws both exactly, so the name alone decides there). Only a clip the export holds sets the cut flag (not a muted track, a
+  disabled clip, a track a solo shadows, or an audio track's use of the asset).
+  The policy condition is a **proxy measured only on FFmpeg 6.1.1 and 9.0.2** (5.x, 7.x, 8.x and distro builds are unmeasured).
   **`gpu_supported_at(size)` is the per-frame fallback switch** (`gpu_supported()` is
   its size-free half; `unsupported_reasons_at(size)` says *no, with reasons*) for
   anything the compositor does not render exactly: video effects, masks, 360 reframe,

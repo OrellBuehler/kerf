@@ -1,5 +1,6 @@
-//! How much of a cut the compositor draws, frame by frame, before and after text: constructed cuts (not
-//! measured projects), planned with the real planner and judged by what a compositor says it draws
+//! How much of a cut the compositor draws, frame by frame, before and after fades, dips, dissolves, slides
+//! and pushes (in still plans and in export frames): constructed cuts (not measured projects), planned
+//! with the real planner and judged by what a compositor says it draws
 //! ([`kerf_gpu::Compositor::CAPS`]). No adapter and no decode — one short source file is made so the
 //! assets are probed like an import's. `#[ignore]`d (needs `ffmpeg`); run with
 //!
@@ -220,9 +221,17 @@ fn drawn(planner: &Planner, caps: &GpuCaps, frames: u64, size: (u32, u32), end: 
     (100.0 * ok as f64 / total as f64, ok, total)
 }
 
+/// What the compositor drew before fades, dips, dissolves, slides and pushes: layers, transform,
+/// crop, fit, `eq`, opacity, stills, sampled keyframes and text.
+fn before_transitions() -> GpuCaps {
+    let mut caps = GpuCaps::A0;
+    caps.text = true;
+    caps
+}
+
 #[test]
 #[ignore = "needs ffmpeg"]
-fn captioned_cuts_are_drawn_by_the_compositor_where_they_were_all_refused() {
+fn captioned_cuts_and_transitions_are_drawn_by_the_compositor_where_they_were_refused() {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("coverage-media");
     std::fs::create_dir_all(&dir).unwrap();
     let base = source(&dir, "base.mp4", "1280x720");
@@ -232,63 +241,93 @@ fn captioned_cuts_are_drawn_by_the_compositor_where_they_were_all_refused() {
     eprintln!("composite colour policy: {policy:?}");
     eprintln!(
         "{:<76} {:>14} {:>14}   reasons left",
-        "cut (still plans, render 540 px wide)", "before", "after"
+        "cut (render 540 px wide), plan", "before", "after"
     );
     let mut table = vec![];
     for (name, tl) in archetypes(&base, &side) {
-        let planner = Planner::new(
-            &tl,
-            &assets,
-            &ExportOptions::default(),
-            PlanRequest::still(policy).with_media(&OriginalMedia),
-        )
-        .expect("planner");
-        let first = planner.at_frame(0).expect("a plan");
-        let fps = first.canvas.fps;
-        let end = tl.duration();
-        let frames = (end * f64::from(fps.num) / f64::from(fps.den)).floor() as u64;
-        let size = first.size(540);
-        // Before: the compositor A0 was (text refused whatever the font, which was none).
-        let before = drawn(&planner, &GpuCaps::A0, frames, size, end);
-        let after = drawn(&planner, &Compositor::CAPS, frames, size, end);
-        // What still refuses the frames after.
-        let mut left: std::collections::BTreeMap<String, u64> = Default::default();
-        for k in 0..frames {
-            if let Ok(plan) = planner.at_frame(k) {
-                let reasons = plan.reasons(&Compositor::CAPS, size);
-                let mut seen: Vec<String> = reasons
-                    .iter()
-                    .map(|r| {
-                        format!("{r:?}")
-                            .split(|c: char| !c.is_alphanumeric())
-                            .next()
-                            .unwrap_or("")
-                            .to_string()
-                    })
-                    .collect();
-                seen.sort();
-                seen.dedup();
-                for s in seen {
-                    *left.entry(s).or_default() += 1;
+        for (mode, request) in [("still", PlanRequest::still(policy)), ("motion", PlanRequest::motion(policy))] {
+            let planner =
+                Planner::new(&tl, &assets, &ExportOptions::default(), request.with_media(&OriginalMedia)).expect("planner");
+            let first = planner.at_frame(0).expect("a plan");
+            let fps = first.canvas.fps;
+            let end = tl.duration();
+            let frames = (end * f64::from(fps.num) / f64::from(fps.den)).floor() as u64;
+            let size = first.size(540);
+            // Before: the compositor GPU-2 left (text drawn, no fades, travel or tails, no export frames).
+            let before = drawn(&planner, &before_transitions(), frames, size, end);
+            let after = drawn(&planner, &Compositor::CAPS, frames, size, end);
+            // What refuses the frames, before and after: the reasons' kinds and the frames each is a reason for.
+            let reasons_left = |caps: &GpuCaps| {
+                let mut left: std::collections::BTreeMap<String, u64> = Default::default();
+                for k in 0..frames {
+                    if let Ok(plan) = planner.at_frame(k) {
+                        let mut seen: Vec<String> = plan
+                            .reasons(caps, size)
+                            .iter()
+                            .map(|r| {
+                                format!("{r:?}")
+                                    .split(|c: char| !c.is_alphanumeric())
+                                    .next()
+                                    .unwrap_or("")
+                                    .to_string()
+                            })
+                            .collect();
+                        seen.sort();
+                        seen.dedup();
+                        for s in seen {
+                            *left.entry(s).or_default() += 1;
+                        }
+                    }
                 }
-            }
+                left.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ")
+            };
+            let (was, left) = (reasons_left(&before_transitions()), reasons_left(&Compositor::CAPS));
+            eprintln!(
+                "{:<76} {:>5.1}% {:>4}/{:<4} {:>5.1}% {:>4}/{:<4}   {}",
+                format!("{name} [{mode}]"),
+                before.0,
+                before.1,
+                before.2,
+                after.0,
+                after.1,
+                after.2,
+                left
+            );
+            eprintln!("{:<76} refused before: {was}", "");
+            table.push((name, mode, before.0, after.0));
         }
-        let left: Vec<String> = left.iter().map(|(k, v)| format!("{k} {v}")).collect();
-        eprintln!(
-            "{name:<76} {:>5.1}% {:>4}/{:<4} {:>5.1}% {:>4}/{:<4}   {}",
-            before.0,
-            before.1,
-            before.2,
-            after.0,
-            after.1,
-            after.2,
-            left.join(", ")
-        );
-        table.push((name, before.0, after.0));
     }
-    // The captioned talking head: refused almost throughout, then drawn but for its clip fades.
-    let (t1, hard, bare) = (&table[0], &table[1], &table[2]);
-    assert!(t1.1 < 20.0 && t1.2 > 95.0, "{t1:?}");
-    assert!(hard.1 < 20.0 && hard.2 > 99.9, "{hard:?}");
-    assert!((bare.1 - bare.2).abs() < 1e-9, "no text: nothing changes: {bare:?}");
+    let at = |name: &str, mode: &str| {
+        table
+            .iter()
+            .find(|(n, m, ..)| n.starts_with(name) && *m == mode)
+            .map(|(_, _, before, after)| (*before, *after))
+            .expect("an archetype")
+    };
+    // A talking head with clip fades: drawn throughout once fades are.
+    for mode in ["still", "motion"] {
+        let (before, after) = at("T1  ", mode);
+        assert!(
+            before < 100.0 && (after - 100.0).abs() < 1e-9,
+            "T1 {mode}: {before} -> {after}"
+        );
+        let (before, after) = at("T1c", mode);
+        assert!(
+            before < 100.0 && (after - 100.0).abs() < 1e-9,
+            "T1c {mode}: {before} -> {after}"
+        );
+        let (before, after) = at("T1b", mode);
+        assert!(
+            (after - 100.0).abs() < 1e-9 && after >= before,
+            "T1b {mode}: {before} -> {after}"
+        );
+    }
+    // The montage: dissolves, dips and a slide, drawn but for what is not a transition (the titles are).
+    for mode in ["still", "motion"] {
+        let (before, after) = at("T2", mode);
+        assert!(
+            after > before + 20.0 && (after - 100.0).abs() < 1e-9,
+            "T2 {mode}: {before} -> {after}"
+        );
+    }
 }
