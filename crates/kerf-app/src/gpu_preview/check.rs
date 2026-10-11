@@ -167,6 +167,16 @@ impl Check {
         }
     }
 
+    /// Why the gate is closed on `key`'s adapter, if it is: what Settings keeps showing when a
+    /// backend is rebuilt on the same adapter after the verdict.
+    pub fn closed(&self, key: &AdapterKey) -> Option<String> {
+        let slot = self.slot();
+        match (&slot.phase, slot.key.as_ref()) {
+            (Phase::Failed(reason), Some(held)) if held == key => Some(reason.clone()),
+            _ => None,
+        }
+    }
+
     /// The summary of the passed check, if there is one, or the reason it is closed.
     pub fn standing(&self) -> Option<String> {
         match &self.slot().phase {
@@ -218,8 +228,11 @@ mod tests {
             panic!("failed")
         };
         assert!(reason.contains("turned off and on again"), "{reason}");
-        assert_eq!(check.gate(&key), Gate::Closed(reason));
+        assert_eq!(check.gate(&key), Gate::Closed(reason.clone()));
+        assert_eq!(check.closed(&key), Some(reason), "what Settings keeps showing");
+        assert_eq!(check.closed(&AdapterKey::named("another")), None);
         check.retry();
+        assert_eq!(check.closed(&key), None);
         assert!(matches!(check.gate(&key), Gate::Begin(_)), "the check runs again");
         // And a mismatch that is still there is found again.
         assert!(matches!(check.finish(&key, Err(mismatch())), Verdict::Failed(_)));

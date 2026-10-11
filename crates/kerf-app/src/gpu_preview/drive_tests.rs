@@ -249,6 +249,23 @@ fn a_self_test_that_fails_keeps_every_frame_on_ffmpeg_with_its_reason_until_the_
     assert!(preview.diagnostics().self_test.unwrap().starts_with("closed"));
     assert_eq!(calls.load(Ordering::SeqCst), 1, "the verdict stands for the frames after it");
 
+    // A device lost and rebuilt on the same adapter keeps the verdict, and Settings the reason.
+    preview.drop_backend("the device was lost (a test)", true, Instant::now(), None);
+    assert_eq!(
+        preview.frame(&inputs, Want::at(0.5), 320).expect("a frame").renderer,
+        "ffmpeg"
+    );
+    let status = preview.status();
+    assert!(status.ready, "{status:?}");
+    assert!(
+        status
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("turned off and on again")),
+        "the reason is not blanked by the rebuild: {status:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
     // Turning the setting off and on runs the check again, a mismatch or not, and logs its verdict.
     preview.set_enabled(false);
     preview.teardown_if_off();

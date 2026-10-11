@@ -1797,7 +1797,8 @@ impl GpuPreview {
                 info.adapter = Some(backend.gpu.adapter_info().name.clone());
                 info.software = backend.gpu.is_software();
                 info.overlays = technique.overlays();
-                info.reason = None;
+                // A verdict that stands for this adapter (a device lost and rebuilt) is still the reason.
+                info.reason = self.check.closed(&backend.adapter);
                 state.retry_at = None;
                 // The marker stays down until a frame has reached the screen.
                 state.unproven = true;
