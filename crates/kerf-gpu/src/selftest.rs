@@ -23,9 +23,11 @@
 //! something else than this FFmpeg: switch the GPU path off) or [`SelfTestError::Inconclusive`] (it
 //! could not be checked: an FFmpeg that would not make the fixtures, a colour policy that could not
 //! be measured, a deadline; the GPU path stays off). What the caller does about either, and whether
-//! it asks again, is its business (the app asks again when the setting is turned off and on). Nothing here touches a project, a window or the preview's device state: it
-//! makes its own compositor and frame source on the `Gpu` it is given, runs FFmpeg the way the
-//! interactive paths do (a thread-capped child, no machine-budget slot), and takes about a second.
+//! it asks again, is its business.
+//!
+//! Nothing here touches a project, a window or the preview's device state: it makes its own
+//! compositor and frame source on the `Gpu` it is given, runs FFmpeg the way the interactive paths
+//! do (a thread-capped child, no machine-budget slot), and takes about a second.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
