@@ -191,7 +191,7 @@ class WorkspaceState {
 					// Neither took: say so rather than leave a dock that looks as if
 					// nothing was asked of it.
 					console.error('could not build the preset either', again);
-					toast.error(`Could not arrange the ${workspaceSpec(id).label} workspace`, { description: String(again) });
+					toast.error(`Couldn't arrange the ${workspaceSpec(id).label} workspace`, { description: String(again) });
 				}
 			}
 			// A layout is built at the size it was saved at; the dock only learns its

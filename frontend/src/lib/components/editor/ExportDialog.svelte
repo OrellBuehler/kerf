@@ -2,6 +2,7 @@
 	import { onDestroy } from 'svelte';
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
+	import ProgressBar from './ProgressBar.svelte';
 	import SliderRow from './SliderRow.svelte';
 	import SectionHead from './SectionHead.svelte';
 	import DeliverTo from './DeliverTo.svelte';
@@ -15,8 +16,10 @@
 	import { frameKey, restoreDraft } from '$lib/export-draft';
 	import type { RowSpec } from '$lib/slider-row';
 	import type { Container, ExportOptions, Fit, RateControl } from '$lib/types';
+	import { exportedLine, failure } from '$lib/failure-copy';
 	import {
 		PRESETS,
+		presetsByGroup,
 		CONTAINERS,
 		VIDEO_CODECS,
 		AUDIO_CODECS,
@@ -224,7 +227,7 @@
 			if (variantFormats.length) {
 				const outs = await editor.exportVariants(outputPath, variantFormats, ui.deliverSmartCrop, finalOpts);
 				const first = outs[0];
-				toast.success(`Exported ${outs.length} files → ${outs.map((o) => o.split(/[\\/]/).pop()).join(', ')}`, {
+				toast.success(exportedLine(outs), {
 					action: { label: 'Show in folder', onClick: () => void revealPath(first).catch(() => {}) }
 				});
 				onClose();
@@ -232,7 +235,7 @@
 			}
 			const out = await editor.export(outputPath, finalOpts);
 			// A path in a toast is not much use on its own — offer the folder.
-			toast.success(`Exported → ${out}`, {
+			toast.success(exportedLine([out]), {
 				action: { label: 'Show in folder', onClick: () => void revealPath(out).catch(() => {}) }
 			});
 			onClose();
@@ -240,7 +243,7 @@
 			const m = msg(e);
 			// A user-requested stop is not a failure — keep the dialog open quietly.
 			if (m === 'export cancelled') toast.info('Export cancelled');
-			else toast.error(m);
+			else toast.error(failure('Export failed', e));
 		}
 	}
 	const stop = () => editor.stopExport();
@@ -250,12 +253,19 @@
 	<SectionHead {label} />
 {/snippet}
 
-{#snippet selectRow(label: string, value: string, items: { value: string; label: string }[], onChange: (v: string) => void, disabled = false)}
+{#snippet selectRow(label: string, value: string, items: { value: string; label: string }[], onChange: (v: string) => void, disabled = false, groups: { group: string; items: { value: string; label: string }[] }[] = [])}
 	<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 0">
 		<span style="font-size:12px;color:var(--text-muted)">{label}</span>
 		<select {value} {disabled} onchange={(e) => onChange(e.currentTarget.value)} style={selectCss}>
 			{#each items as it (it.value)}
 				<option value={it.value}>{it.label}</option>
+			{/each}
+			{#each groups as g (g.group)}
+				<optgroup label={g.group}>
+					{#each g.items as it (it.value)}
+						<option value={it.value}>{it.label}</option>
+					{/each}
+				</optgroup>
 			{/each}
 		</select>
 	</label>
@@ -296,11 +306,10 @@
 		{@render selectRow(
 			'Preset',
 			activePreset,
-			[
-				...(activePreset === 'custom' ? [{ value: 'custom', label: 'Custom settings' }] : []),
-				...PRESETS.map((p) => ({ value: p.id, label: p.label }))
-			],
-			choosePreset
+			activePreset === 'custom' ? [{ value: 'custom', label: 'Custom settings' }] : [],
+			choosePreset,
+			false,
+			presetsByGroup().map((g) => ({ group: g.group, items: g.presets.map((p) => ({ value: p.id, label: p.label })) }))
 		)}
 		<p style="font-size:12px;color:var(--text-muted);margin:2px 0 4px;line-height:1.45">
 			{PRESETS.find((p) => p.id === activePreset)?.description ?? 'Your own settings — pick a preset to start over from one.'}
@@ -316,7 +325,7 @@
 				placeholder="Choose a file…"
 				style="{inputCss};flex:1;text-align:left;color:var(--text-secondary)"
 			/>
-			<Btn variant="secondary" size="sm" icon="folder-open" onclick={browse}>Browse</Btn>
+			<Btn variant="secondary" size="sm" icon="folder-open" onclick={browse}>Browse…</Btn>
 		</div>
 		{#if marks}
 			{@render selectRow(
@@ -645,13 +654,7 @@
 		<div style="display:flex;align-items:center;gap:8px;padding:12px 16px">
 			{#if rendering}
 				<div style="flex:1;display:flex;align-items:center;gap:10px">
-					<div style="flex:1;height:6px;border-radius:3px;background:var(--surface-inset);overflow:hidden">
-						<div
-							style="height:100%;width:{Math.round(
-								(progress?.fraction ?? 0) * 100
-							)}%;background:var(--kerf-500);transition:width var(--dur-fast) linear"
-						></div>
-					</div>
+					<ProgressBar value={progress?.waiting ? null : (progress?.fraction ?? 0)} label="Exporting" />
 					<span
 						data-testid="export-progress-text"
 						style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);min-width:104px;text-align:right"

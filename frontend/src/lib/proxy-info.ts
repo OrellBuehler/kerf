@@ -162,7 +162,7 @@ export const PREVIEW_SOURCES: readonly { source: PreviewSource; label: string; h
 	{
 		source: 'original',
 		label: 'Always original',
-		hint: 'Full resolution, always. Proxies are not built, and scrubbing long-GOP 4K and 5K footage is slow.'
+		hint: 'Full resolution, always. Proxies are not built, and scrubbing 4K and 5K footage is slow.'
 	},
 	{
 		source: 'proxy_only',
@@ -263,7 +263,7 @@ export function previewSourceNote(
 		return {
 			text: `preview: proxy${width ? ` ${width} px` : ''}`,
 			tone: 'proxy',
-			title: 'The frame is decoded from the all-intra preview proxy. Export reads the original.'
+			title: 'The frame comes from the lightweight preview copy. Export reads the original.'
 		};
 	}
 	const first = notReady[0];

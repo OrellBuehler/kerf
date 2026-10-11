@@ -7,16 +7,21 @@
 	import Icon from './Icon.svelte';
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
+	import ProgressBar from './ProgressBar.svelte';
 	import KeyboardSettings from './KeyboardSettings.svelte';
 	import { settings, CPU_PRESETS } from '$lib/settings.svelte';
 	import { gpuPreview } from '$lib/gpu-preview.svelte';
 	import { COLOR_GROUPS, PRESETS, PRESET_IDS, SHAPE_TOKENS, THUMB_STYLES } from '$lib/theme';
 	import { cancelVoiceover, onVoiceoverProgress, prepareVoiceover, voiceoverStatus } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
+	import { failure } from '$lib/failure-copy';
 	import { ANALYSIS_KINDS } from '$lib/analysis-steps';
 	import { PREVIEW_SOURCES, PROXY_SIZES } from '$lib/proxy-info';
 	import { approxMB, isVoiceoverCancelled, loadPrefs, stageLabel } from '$lib/voiceover';
+	import { roving } from '$lib/roving';
+	import { tabStop } from '$lib/menu-nav';
 	import type { VoiceoverProgress, VoiceoverStatus } from '$lib/types';
+	import { tip } from '$lib/tip';
 
 	let { onClose }: { onClose: () => void } = $props();
 
@@ -44,6 +49,18 @@
 
 	const themePreset = $derived(settings.themePreset);
 
+	// Each radio group has one tab stop: the chosen chip, or — while proxies are off and every source but
+	// "Always original" is disabled — the first one that can take focus.
+	const proxyStop = $derived(tabStop(PROXY_SIZES.map((p) => ({ checked: settings.proxySize === p.size, enabled: true }))));
+	const sourceStop = $derived(
+		tabStop(
+			PREVIEW_SOURCES.map((p) => ({
+				checked: settings.previewSource === p.source,
+				enabled: !(settings.proxySize === 0 && p.source !== 'original')
+			}))
+		)
+	);
+
 	// What the GPU preview is doing on this machine; read when its section opens.
 	const gpuStatus = $derived(gpuPreview.status);
 	$effect(() => {
@@ -64,7 +81,9 @@
 		);
 	});
 	const voLine = $derived(
-		voStatus
+		voPreparing
+			? 'Downloading the voice model…'
+			: voStatus
 			? !voStatus.available
 				? (voStatus.reason ?? 'Voiceover is not available.')
 				: voStatus.ready
@@ -87,7 +106,7 @@
 			voStatus = await prepareVoiceover(voice);
 			toast.success('Voice model ready');
 		} catch (e) {
-			if (!isVoiceoverCancelled(e)) toast.error(e instanceof Error ? e.message : String(e));
+			if (!isVoiceoverCancelled(e)) toast.error(failure('Voice model download failed', e));
 		} finally {
 			unlisten();
 			voPreparing = false;
@@ -121,12 +140,14 @@
 <Modal title="Settings" icon="settings" width={620} height={640} onClose={onClose}>
 	<div style="flex:1;display:flex;min-height:0">
 		<!-- section rail -->
-		<div
+		<nav
+			aria-label="Settings sections"
 			style="flex:none;width:150px;padding:10px 8px;border-right:var(--line-width) solid var(--border-default);display:flex;flex-direction:column;gap:2px"
 		>
 			{#each SECTIONS as s (s.id)}
 				<button
 					onclick={() => (section = s.id)}
+					aria-current={section === s.id ? 'page' : undefined}
 					style="display:flex;align-items:center;gap:7px;padding:6px 9px;border-radius:var(--radius-sm);cursor:pointer;text-align:left;font-size:12px;border:var(--line-width) solid {section ===
 					s.id
 						? 'var(--border-strong)'
@@ -138,7 +159,7 @@
 					{s.label}
 				</button>
 			{/each}
-		</div>
+		</nav>
 
 		<!-- The keyboard list has its own search and scroll, so it gets the panel whole. -->
 		<div
@@ -157,7 +178,12 @@
 
 				<div style="display:flex;flex-wrap:wrap;gap:6px">
 					{#each CPU_PRESETS as p (p.id)}
-						<button title={p.hint} onclick={() => settings.setCpuPercent(p.percent)} style={chip(percent === p.percent)}>
+						<button
+							use:tip={p.hint}
+							aria-pressed={percent === p.percent}
+							onclick={() => settings.setCpuPercent(p.percent)}
+							style={chip(percent === p.percent)}
+						>
 							{p.label}
 						</button>
 					{/each}
@@ -254,8 +280,8 @@
 					{/each}
 				</div>
 				<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
-					With the switch above off nothing runs on import, but these still decide what an agent's analyze_asset
-					runs when it names no steps. A clip can always be analyzed by hand, whatever is switched off here.
+					With the switch above off, nothing runs on import. These choices still decide what a connected agent
+					analyzes when it doesn't ask for specific steps. You can always analyze a clip by hand.
 				</p>
 			{:else if section === 'speech'}
 				<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
@@ -307,40 +333,37 @@
 								>{voProgress?.detail ?? ''}{voPct !== null ? ` · ${voPct}%` : ''}</span
 							>
 						</div>
-						<div style="height:6px;border-radius:3px;background:var(--surface-inset);overflow:hidden">
-							<div
-								style="height:100%;width:{voPct ?? 30}%;background:var(--kerf-500);transition:width var(--dur-fast) linear"
-							></div>
-						</div>
+						<ProgressBar value={voProgress?.fraction ?? null} label="Downloading the voice model" />
 					</div>
 				{/if}
 				<p style="margin:12px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
-					Voiceover turns a script into speech on this machine, in English, with a voice model fetched once.
-					Without this it downloads the first time you generate one.
+					Voiceover turns a script into speech on this machine, in English, with a voice model fetched once.{#if !voStatus?.ready}
+						Without this it downloads the first time you generate one.{/if}
 				</p>
 			{:else if section === 'preview'}
 				<div style="font:var(--type-label);color:var(--text-secondary);text-transform:uppercase;letter-spacing:.06em">
 					Preview proxies
 				</div>
 				<p style="margin:6px 0 10px;font-size:12px;line-height:1.55;color:var(--text-secondary)">
-					Kerf builds a light, all-intra copy of each video so scrubbing decodes one frame instead of a long GOP of
-					4K or 5K footage. Export always reads the original. A proxy is built before any analysis that is waiting.
+					Kerf makes a lightweight copy of each video so scrubbing stays smooth, even with 4K or 5K footage.
+					Exports always use your original files.
 				</p>
-				<div role="radiogroup" aria-label="Proxy size" style="display:flex;flex-wrap:wrap;gap:6px">
+				<div role="radiogroup" aria-label="Proxy size" use:roving={{ follow: false }} style="display:flex;flex-wrap:wrap;gap:6px">
 					{#each PROXY_SIZES as p (p.size)}
 						<button
 							role="radio"
 							aria-checked={settings.proxySize === p.size}
+							tabindex={PROXY_SIZES.indexOf(p) === proxyStop ? 0 : -1}
 							data-testid="proxy-size-{p.size}"
-							title={p.hint}
+							use:tip={p.hint}
 							onclick={() => settings.setProxySize(p.size)}
 							style={chip(settings.proxySize === p.size)}>{p.label}</button
 						>
 					{/each}
 				</div>
 				<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
-					{PROXY_SIZES.find((p) => p.size === settings.proxySize)?.hint} Pixels across; 360 footage keeps its larger
-					ratio. A proxy made at another size stays on disk until you delete it from the bin.
+					Width of the copy in pixels. 1280 is the default: sharp enough to judge framing, light enough to scrub. 360
+					footage keeps its wider ratio. Copies made at another size stay on disk until you delete them from the bin.
 				</p>
 
 				<div
@@ -348,13 +371,14 @@
 				>
 					Preview source
 				</div>
-				<div role="radiogroup" aria-label="Preview source" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px">
+				<div role="radiogroup" aria-label="Preview source" use:roving style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px">
 					{#each PREVIEW_SOURCES as p (p.source)}
 						<button
 							role="radio"
 							aria-checked={settings.previewSource === p.source}
+							tabindex={PREVIEW_SOURCES.indexOf(p) === sourceStop ? 0 : -1}
 							data-testid="preview-source-{p.source}"
-							title={p.hint}
+							use:tip={p.hint}
 							disabled={settings.proxySize === 0 && p.source !== 'original'}
 							onclick={() => settings.setPreviewSource(p.source)}
 							style="{chip(settings.previewSource === p.source)};{settings.proxySize === 0 && p.source !== 'original'
@@ -409,10 +433,9 @@
 					<span style="display:flex;flex-direction:column;gap:3px">
 						<span style="font-size:12px;color:var(--text-primary)">Draw the preview on the GPU</span>
 						<span style="font-size:12px;line-height:1.55;color:var(--text-secondary)">
-							Frames the GPU compositor draws exactly are shown from a native surface instead of FFmpeg's
-							JPEG. Every other frame — a transition in progress, an effect it does not draw yet, anything
-							that fails — is FFmpeg's, as before. Playback still uses FFmpeg. The status bar says which
-							renderer made the frame you are looking at.
+							Draws frames the GPU compositor can render exactly in a native surface instead of FFmpeg's JPEG.
+							Anything it can't draw, such as a transition in progress or an unsupported effect, is still drawn by
+							FFmpeg. Playback still uses FFmpeg. The status bar shows which renderer made the frame you're looking at.
 						</span>
 					</span>
 				</label>
@@ -448,7 +471,7 @@
 				</div>
 				<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px;align-items:center">
 					{#each PRESET_IDS as id (id)}
-						<button onclick={() => settings.applyPreset(id)} style={chip(themePreset === id)}>
+						<button onclick={() => settings.applyPreset(id)} aria-pressed={themePreset === id} style={chip(themePreset === id)}>
 							{PRESETS[id].name}
 						</button>
 					{/each}
@@ -468,9 +491,15 @@
 						onchange={(e) => settings.setThemeName(e.currentTarget.value)}
 						style="flex:1;min-width:0;height:28px;padding:0 8px;background:var(--surface-inset);color:var(--text-primary);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-sm);font-size:12px"
 					/>
-					<button onclick={() => settings.setScheme('dark')} style={chip(settings.theme.scheme === 'dark')}>Dark</button>
-					<button onclick={() => settings.setScheme('light')} style={chip(settings.theme.scheme === 'light')}
-						>Light</button
+					<button
+						onclick={() => settings.setScheme('dark')}
+						aria-pressed={settings.theme.scheme === 'dark'}
+						style={chip(settings.theme.scheme === 'dark')}>Dark</button
+					>
+					<button
+						onclick={() => settings.setScheme('light')}
+						aria-pressed={settings.theme.scheme === 'light'}
+						style={chip(settings.theme.scheme === 'light')}>Light</button
 					>
 				</div>
 				<p style="margin:8px 0 0;font-size:12px;line-height:1.55;color:var(--text-muted)">
@@ -485,7 +514,7 @@
 				</div>
 				<div style="margin-top:6px;display:flex;flex-direction:column;gap:2px">
 					{#each SHAPE_TOKENS as t (t.name)}
-						<label title={t.hint} style="display:flex;align-items:center;gap:10px;height:28px;font-size:12px;color:var(--text-secondary)">
+						<label use:tip={t.hint} style="display:flex;align-items:center;gap:10px;height:28px;font-size:12px;color:var(--text-secondary)">
 							<span style="width:130px;flex:none">{t.label}</span>
 							<input
 								type="range"
@@ -505,8 +534,10 @@
 					<div style="display:flex;align-items:center;gap:10px;height:32px;font-size:12px;color:var(--text-secondary)">
 						<span style="width:130px;flex:none">Thumb style</span>
 						{#each THUMB_STYLES as ts (ts.id)}
-							<button onclick={() => settings.setThumbStyle(ts.id)} style={chip(settings.theme.shape['slider-thumb-style'] === ts.id)}
-								>{ts.label}</button
+							<button
+								onclick={() => settings.setThumbStyle(ts.id)}
+								aria-pressed={settings.theme.shape['slider-thumb-style'] === ts.id}
+								style={chip(settings.theme.shape['slider-thumb-style'] === ts.id)}>{ts.label}</button
 							>
 						{/each}
 					</div>

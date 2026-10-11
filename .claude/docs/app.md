@@ -178,7 +178,7 @@ confirms) + `opener:allow-open-url`. That last
 one enables the command **with no scope of its own** (`allow-default-urls` is a
 separate permission), so it is listed in object form with an `allow` entry for
 `https://github.com/OrellBuehler/kerf/*` — without a scope every `openUrl` call
-comes back `ForbiddenUrl` and the "Release page" button silently does nothing.
+comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 
 **GPU preview (A2, `gpu_preview.rs`, opt-in).** *Settings › Preview › GPU preview (experimental)*
 (`Settings.gpu_preview`, default off, persisted beside `safe_areas`) draws the Preview

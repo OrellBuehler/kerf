@@ -98,6 +98,8 @@ class EditorUi {
 	fitMusicDialog = $state<{ clipId: string } | null>(null);
 	/** The export dialog. Opened from the toolbar, ⌘E and the Deliver panel. */
 	exportDialog = $state(false);
+	/** The About dialog (Help › About Kerf). */
+	aboutDialog = $state(false);
 	/** The options the export dialog was last closed on, for the session (`export-draft.ts`). */
 	exportDraft = $state.raw<ExportDraft | null>(null);
 	/** The delivery shapes (ids from `DELIVERY_PRESETS`) ticked for a multi-format
@@ -224,6 +226,14 @@ class EditorUi {
 
 	closeVoiceover() {
 		this.voiceoverDialog = null;
+	}
+
+	openAbout() {
+		this.aboutDialog = true;
+	}
+
+	closeAbout() {
+		this.aboutDialog = false;
 	}
 
 	openStems(assetId: string, clipId: string | null = null) {

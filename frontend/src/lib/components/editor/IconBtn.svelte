@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
+	import { tip, tipText, type TipInput } from '$lib/tip';
 
 	let {
 		active = undefined,
@@ -11,7 +12,8 @@
 		...rest
 	}: {
 		active?: boolean;
-		title?: string;
+		/** The tooltip, and the button's name: a string, or `{ text, keys, detail }` (see `tip.ts`). */
+		title?: TipInput;
 		size?: number;
 		style?: string;
 		class?: string;
@@ -24,8 +26,8 @@
      "not pressed" reads as a switch. Colors and states are `styles/controls.css`. -->
 <button
 	class={['k-ibtn', klass]}
-	{title}
-	aria-label={title}
+	use:tip={title}
+	aria-label={tipText(title) || undefined}
 	aria-pressed={active}
 	style="width:{size}px;height:{size}px;{style}"
 	{...rest}

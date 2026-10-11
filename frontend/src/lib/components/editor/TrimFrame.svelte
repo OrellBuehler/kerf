@@ -16,6 +16,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { singleFlight } from '$lib/single-flight';
 	import type { MonitorCell } from '$lib/trim-tools';
+	import { tip } from '$lib/tip';
 
 	let { cell }: { cell: MonitorCell } = $props();
 
@@ -69,6 +70,6 @@
 		<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-secondary)"
 			>{editor.assetName(cell.assetId)}</span
 		>
-		<span style="flex:none;font-family:var(--font-mono);color:var(--kerf-300)" title="Source timecode">{cell.timecode}</span>
+		<span style="flex:none;font-family:var(--font-mono);color:var(--kerf-300)" use:tip={'Source timecode'}>{cell.timecode}</span>
 	</div>
 </div>

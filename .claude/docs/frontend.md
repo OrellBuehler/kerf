@@ -289,8 +289,14 @@ workspace, Reset all workspaces — which asks first when any arrangement is sto
 *Playback* (Play / pause, Go to start / end, back and forward a frame and a second,
 Shuttle J / K / L, Set / Clear in and out, markers — the transport lives in the Preview
 panel and a panel can be closed, so the whole of it is here as registry actions with
-their bindings), *Help* (Keyboard shortcuts, Check for updates…, Release page, Open the
-log folder, About). **Every entry names a keymap action**
+their bindings), *Help* (Keyboard shortcuts…, Check for updates…, Release notes, Show log folder,
+About). **An ellipsis promises a dialog or a picker and nothing else** — `Settings…`, `Keyboard
+shortcuts…`, `Reset all workspaces…` (it asks), `Import media…`; an action's name in a sentence is
+`plainLabel()` (`keymap.ts`), so the shortcut recorder says "already used by Open project", not
+"Open project…." (`copy-guard.test.ts` holds both rules). A menu bar is text-first: **no entry carries
+an icon** (a ragged icon column read as a rendering bug), only the check column of ticks and radios; the
+key beside an entry is `Kbd` (`.k-kbd`, `accel.ts`: 11 px mono, muted, a punctuation key in a small
+keycap, an arrow a size larger) — the same look as the context menus and the tooltips. **Every entry names a keymap action**
 (`file.importCaptions`, `file.saveCover`, `app.quit`, `tool.snap` — default `S` —,
 `view.minimap`, `view.safeAreas`, `workspace.<id>`, `window.resetWorkspace` /
 `resetAllWorkspaces`, `app.keyboard` / `checkUpdate` / `releases` / `logs` / `about`
@@ -444,7 +450,7 @@ tabs — dockview's own was a 1 px outline in the divider colour, invisible), an
 same colour and width as a ring (`--focus-ring`); `outline-ring/50` is gone from the base layer. **Toasts
 are in the theme** (`ui/sonner`): Kerf's scheme (not the OS's, since `ModeWatcher` is not mounted), an
 offset above the status bar, the menu's surface / shadow / radius, a ghost accent action instead of
-sonner's inverse pill, and status-coloured icons (`layout.css`). **Titles are their own items, not part of a clip.** `Timeline.overlays` has always
+sonner's inverse pill, and — one list shared with the notification log, `status-look.ts`: a circle-check, circle-x, triangle, info — a glyph and a 3 px edge in the kind's `-400` hue, with a 12 % wash of it over the toast for success / error / warning (`layout.css`; `status-look.test.ts` holds the stylesheet and both components to the list, and the contrast guard holds the text on those washes to 4.5:1). **Titles are their own items, not part of a clip.** `Timeline.overlays` has always
 been timeline-level, and the UI now says so: the Timeline has a **titles lane**
 (`T`, above V1; `data-title-lane`) where every title / lower-third / caption is a
 block from `start` to `end` (generated captions dashed and dimmer; overlapping
@@ -481,7 +487,7 @@ Settings › Preview or the preview context menu, which both write the same
 persisted `Settings.safe_areas` — it is held process-wide in `settings.rs`
 rather than in the engine, since nothing in kerf-core cares about it). The export dialog's "Source" resolution relabels to
 **Project frame (WxH)** so the two surfaces cannot silently disagree. The dialog
-is **preset → destination → picture → sound → where it is going**, with a
+is **preset → destination → picture → sound → where it is going** (the preset select is grouped Video / Social / Master / Audio, each described in a plain sentence of what you get and what it costs — `presetsByGroup`), with a
 `Quality` select of three named CRF points (Smaller file / Balanced / Higher
 quality, derived from the codec's CRF range) standing in for the encoder; the
 codec, rate control, tune/profile/pixel format, audio codec and container knobs
@@ -733,6 +739,40 @@ whether it is a tool, a mode (snapping is a pressed magnet, not a word that chan
 `pressed` is a toggle (announced as one), `on` lights without announcing, neither is an action; `bare` is no outline while idle (tools,
 zoom), `square` a picture-only button. Its states are `.k-tt` in `controls.css`, which the veil leaves alone.
 
+**Tooltips are `use:tip`, not `title=`** (`tip.ts`; `tip-guard.test.ts` fails on a native `title` on any plain element, on a
+component that would pass one on to a plain element, and on one set from script — `Btn`, `IconBtn` and `ToolbarToggle` take a `title`
+prop and route it to the action). `use:tip={'Razor'}`, or `{ text, keys, detail }` — `settings.tip(label, actionId, detail?)` makes
+one with the user's key (`keys`, drawn as keycaps by `accel.ts`) and a muted second line, so a long hint is a noun plus a sentence
+instead of a paragraph in one line (a string's lines after the first are its detail). One tip is up at a time: it shows after 400 ms
+(60 ms right after another has gone, so a row of buttons reads as one sweep, and at once when the keyboard focuses a control —
+`:focus-visible` only, a click that focuses is not asking, and never a field you type in — `raisesFocusTip`: it would cover the next one),
+and goes on a press, a scroll, leaving or Escape. **Escape only dismisses; it is never consumed**, so a slider's Escape-to-abandon and a dialog's Close
+work with a tip showing. It is dismissible and
+persistent but **not hoverable by design** — a tip that took the pointer would sit over the next toolbar row and eat the click meant for
+it. It is the menu's surface (`--surface-raised`, `--shadow-md`, `--radius-sm`), `role=tooltip`, and `aria-describedby` points at it
+while it shows — the whole tip when it says more than the element's name, only its detail when the name *is* the tip's text
+(`describeTarget`: a screen reader would say the label twice); an element with no name of its own (an icon button) takes the tip's text as its
+`aria-label`, since the `title` that used to name it is gone. One element per *document* (`realm.ts`), so a detached panel window draws its own; no fade under
+`prefers-reduced-motion`. The timing (`createTipController`), placement (`placeTip`) and the rest are pure and bun-tested; the tip
+does not appear on a disabled control in engines that drop its pointer events (Chromium delivers them; WebKit untested).
+**Context menus are keyboard menus** (`ContextMenu.svelte` over `menu-nav.ts`, shared with the menu bar's `stepFocus` / `typeahead`): it
+takes focus when it opens — the panel for a pointer, the first row when it was opened from the keyboard (the Menu key, Shift+F10, Enter
+on a button; judged from the invoker's `:focus-visible`) — ↓ ↑ wrap, Home / End jump, Enter / Space run, a letter jumps to the next row
+that starts with it, Escape closes and gives focus back to the invoker, Tab closes and goes on. Rows are roving-tabindex `menuitem`s; a disabled
+row is `aria-disabled`, not `disabled`, so it takes focus and says why; the lit row is one at a time (`:hover` and the keys' `:focus-visible`, the
+pointer moving focus to the row it is over). The capture-phase key handler keeps a menu's keys from reaching the page's shortcuts. An action that
+opens a dialog finds focus on the invoker, so the dialog's own focus return works. At 1366×768 an ArrowDown used to scroll the page and
+close the menu. A menu opened from the keyboard starts on its first *runnable* row (`startRow`). A group of radio chips (Settings' proxy size and preview
+source) is one tab stop (`tabStop`: the chosen chip if it can take focus, else the first that can — Preview source disables all but "Always original"
+while proxies are off) the arrows move through (`roving.ts`; selection follows focus, except Proxy size, where a choice rebuilds every proxy, so its
+arrows only move focus and Space / Enter choose); a chip that is on or off carries `aria-pressed`, the Settings rail `aria-current="page"`, and a button that is a picture or a glyph has a name
+(`a11y-guard.test.ts` scans the markup for each, and that the one focus rule lists `textarea`).
+**Progress bars say what they know** (`ProgressBar.svelte`, `.k-progress` in `controls.css`): a `progressbar` with an accessible name that fills to its
+value, or — with none (a download of unknown size, a stage that reports nothing, an export waiting on its proxy) — sweeps a segment along the track
+rather than parking it at 30 %; under `prefers-reduced-motion` the whole track is tinted instead (`progress-guard.test.ts`).
+**About Kerf** is a dialog (`AboutDialog`, `ui.aboutDialog`; `about.ts`): version, platform, build, licence, and *Copy version info* — the text a bug
+report needs, the same lines that are on screen.
+
 **Modals are modal.** Every dialog is a `Modal` (above), which uses the
 `trapFocus` action (`src/lib/modal.ts`: takes focus, wraps Tab, restores focus on
 close; Voiceover starts on its textarea via `initial`), and `+page.svelte` makes the app behind them `inert` and returns early from its global key handler while
@@ -755,8 +795,14 @@ regenerated from an existing voiceover); Settings / Update / Fit / Stems still c
 SQLite file and every edit is committed as it happens, so only a never-saved,
 non-empty project (`editor.hasUnsavedWork`) can be lost — New, Open, the window's
 close request (`onWindowCloseRequested`) and the updater's *Restart now* all
-confirm first through `confirmAction` (the dialog plugin's `ask`; the plugin
-replaces `window.confirm` with an async one, so it cannot be used as a guard). A
+confirm first (the plugin replaces `window.confirm` with an async one, so it cannot be used as a
+guard). **A confirm names its buttons as verbs** (`confirm-copy.ts` is the copy deck as data): the
+unsaved-project prompts are `askUnsaved` — a native three-button dialog, **Save… · Don't save ·
+Cancel** (Discard on New / Open), "Save…" opening the save dialog and going ahead only once a file was
+written (`proceedAfter`), and a dismissed or unrecognised answer always Cancel so nothing is lost; the
+rest are `confirmAction(message, title, { ok, cancel })` — *Restart anyway*, *Reset all*, *Apply and
+replace*, *Replace* — where `labels` is a required argument, so a Yes / No prompt cannot be asked. A platform that cannot show
+named buttons falls back to the plugin's own two-button `ask` with the same labels (without Save); the browser harness has `window.confirm`. A
 render is `editor.exportRun` (progress + cancelling), not dialog state: closing
 the export dialog mid-render leaves it running, the status bar shows it with a
 **Stop**, and reopening the dialog shows the same bar. The `invoke` wrapper
@@ -772,7 +818,12 @@ gone in four seconds, which is fine for "Clip copied" and useless for the model
 download that failed with a reason worth reading. The title bar's bell opens
 `NotificationCenter.svelte` (All / Unread / Problems, per-row read toggle, mark all
 read, clear) and badges the unread count, red when anything unread actually failed.
-Errors and warnings also linger longer on screen than sonner's default. The log is
+Errors and warnings also linger longer on screen than sonner's default. **The log keeps a notice's
+`description`** (the reason under a failure — "permission denied (os error 13)") and shows it under the
+line; the panel takes focus when it opens and Escape gives it back to the bell. A failure toast leads with what was being done
+and then says why — `Export failed — Permission denied (os error 13)` (`failure-copy.ts`: the backend's
+`invalid argument:` / `media engine error:` layer off, the first letter up; `Couldn't …`, never `Could
+not`) — and a finished file is named by its file, `Exported cut-1x1.mp4` with *Show in folder*. The log is
 deliberately *not* replayable — a toast's "Undo" action is dropped rather than kept,
 since an hour later it would undo whatever the newest revision is, not the edit the
 notice was about. It is also why the failure paths that used to reject into nothing
@@ -858,7 +909,14 @@ alongside `editor`/`ui`/`agent`): it runs a *silent* check at startup and every
 `idle → checking → { current | available → downloading → ready } | error`. The
 title bar's version chip turns into an amber "⬇ 0.18.0" button when something is
 available and opens `UpdateDialog` (release notes, download progress, then
-**Restart now** — which warns first when the project has unsaved changes; a failed *check* is titled
+**Restart now** — which warns first when the project has unsaved changes (the same fact in the dialog's
+banner). The download **holds the dialog still** (`busy`, no Hide): on Windows the plugin's `downloadAndInstall` launches the
+installer and exits the app when it is done, past every close guard, so a hidden download could take unsaved work and a running
+export with it, silently. **Install asks first, on Windows only** (`installPrompt(risk, isWindows())`, `confirm-copy.ts`; macOS and Linux do not exit after the
+download — the update waits for *Restart now*, which asks about unsaved work itself — so they keep the plain flow and the neutral footer
+`downloadingNote`): with an unsaved project the three-button *Save… · Install anyway · Cancel*, with only an export, an analysis or an import
+(or 360 stitch) running a two-button one saying it will be stopped, and nothing at stake no question; `install()` itself ignores a second press while one runs. The line over the body reads `Current 0.24.0 → 0.25.0 · 1 Oct 2026`
+(`versionLine`, not "Installed … →"); a failed *check* is titled
 "Couldn't check for updates", never "up to date", says so in a sentence with the raw error under a
 *Details* disclosure, and the AppImage fallback note shows only for a failed install on Linux
 (`isLinux`, `keymap.ts`) — `update-copy.ts`); the

@@ -10,11 +10,12 @@
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { diffHeadline, groupEntries, polarity } from '$lib/diff';
-	import { CAPTION_CONFIRM_TITLE } from '$lib/caption-import-ui';
 	import { confirmReplaceCaptions } from '$lib/title-actions';
+	import { CONFIRM } from '$lib/confirm-copy';
 	import { QUICK_EDIT_STEPS } from '$lib/analysis-steps';
 	import { STATUS_MAP, PRESETS } from './data';
 	import type { DiffEntry, EditSource, Task, TaskStatus, TimelineDiff } from '$lib/types';
+	import { tip } from '$lib/tip';
 
 	const working = $derived(agent.working);
 	const disabled = $derived(editor.assets.length === 0 || editor.busy);
@@ -78,7 +79,7 @@
 				if (copied === key) copied = null;
 			}, 1400);
 		} catch {
-			toast.error('Could not copy — select the text and copy manually');
+			toast.error("Couldn't copy — select the text and copy manually");
 		}
 	}
 
@@ -136,10 +137,7 @@
 		if (!staged) return;
 		if (
 			staged.stale &&
-			!(await confirmAction(
-				'You have edited the timeline since these changes were staged. Applying replaces your newer cut. Continue?',
-				'Apply stale changes'
-			))
+			!(await confirmAction(CONFIRM.staleApply.message, CONFIRM.staleApply.title, CONFIRM.staleApply))
 		)
 			return;
 		applying = true;
@@ -232,7 +230,7 @@
 		// The one preset that writes over something the user may care about: captions
 		// from transcripts replace a set already on the cut, an imported one included.
 		// Asked before the task is queued, so declining leaves nothing behind.
-		if (p === 'Caption the cut' && !(await confirmReplaceCaptions(CAPTION_CONFIRM_TITLE))) return;
+		if (p === 'Caption the cut' && !(await confirmReplaceCaptions())) return;
 		let task: Task | null = null;
 		try {
 			task = await agent.add(p);
@@ -337,7 +335,7 @@
 			>{value}</code
 		>
 		<button
-			title="Copy to clipboard"
+			use:tip={'Copy to clipboard'}
 			onclick={() => copy(value, key)}
 			style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;flex:none;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:{copied ===
 			key
@@ -362,11 +360,11 @@
 			<Icon n={s.icon} s={13} color={iconColor(t.status)} />
 			<span
 				style="flex:1;min-width:0;font-size:13px;font-weight:500;color:var(--text-primary);line-height:1.45;overflow-wrap:anywhere"
-				title={t.prompt}>{t.prompt}</span
+				use:tip={t.prompt}>{t.prompt}</span
 			>
 			{#if t.status !== 'ready'}
 				<button
-					title="Remove from queue"
+					use:tip={'Remove from queue'}
 					onclick={() => dismissTask(t.id)}
 					style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;flex:none;border-radius:var(--radius-sm);border:var(--line-width) solid transparent;background:transparent;color:var(--text-muted);cursor:pointer"
 				>
@@ -492,7 +490,7 @@
 									<button
 										onclick={() => inspect(e)}
 										disabled={e.at == null}
-										title={e.at == null ? e.summary : `Jump to ${e.summary}`}
+										use:tip={e.at == null ? e.summary : `Jump to ${e.summary}`}
 										style="display:flex;gap:7px;align-items:baseline;width:100%;text-align:left;padding:3px 4px;border:none;border-radius:var(--radius-sm);background:transparent;color:inherit;cursor:{e.at ==
 										null
 											? 'default'
@@ -522,7 +520,7 @@
 					>
 					<button
 						onclick={togglePreview}
-						title="Show the proposed cut in the editor"
+						use:tip={'Show the proposed cut in the editor'}
 						style="height:30px;padding:0 10px;border-radius:var(--radius-sm);border:var(--line-width) solid {editor.previewingStaged
 							? 'var(--agent-500)'
 							: 'var(--border-strong)'};background:{editor.previewingStaged
@@ -618,7 +616,7 @@
 						<button
 							{disabled}
 							onclick={() => runPreset(p)}
-							title={local ? `Run now: ${p}` : `Queue for agent: ${p}`}
+							use:tip={local ? `Run now: ${p}` : `Queue for agent: ${p}`}
 							style="display:inline-flex;align-items:center;gap:5px;min-height:30px;padding:5px 10px;border-radius:var(--radius-full);background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);color:var(--text-secondary);font-size:12px;cursor:pointer;text-align:left"
 						>
 							<Icon n={local ? 'play' : 'list-plus'} s={12} />{p}
@@ -641,7 +639,7 @@
 						<Icon n={sourceIcon[rev.source]} s={13} color={sourceTint[rev.source]} style="flex:none" />
 						<button
 							onclick={() => toggleRevision(rev.seq)}
-							title="What this edit changed"
+							use:tip={'What this edit changed'}
 							style="flex:1;min-width:0;text-align:left;background:none;border:none;padding:0;cursor:pointer"
 						>
 							<div
@@ -661,7 +659,7 @@
 							</span>
 						{:else}
 							<button
-								title="Revert the timeline to this point"
+								use:tip={'Revert the timeline to this point'}
 								onclick={() => editor.revertTo(rev.seq)}
 								style="display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:var(--radius-full);background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);color:var(--text-secondary);font-size:10px;cursor:pointer"
 							>
@@ -724,7 +722,7 @@
 				style="flex:1;min-width:0;background:none;border:none;outline:none;color:var(--text-primary);font-family:var(--font-sans);font-size:13px"
 			/>
 			<button
-				title="Queue task for agent"
+				use:tip={'Queue task for agent'}
 				aria-label="Queue task for agent"
 				disabled={disabled || !draft.trim()}
 				onclick={submit}

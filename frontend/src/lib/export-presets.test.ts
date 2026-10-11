@@ -7,6 +7,7 @@ import {
 	frameRateOptions,
 	LOUDNESS_TARGETS,
 	loudnessChoice,
+	presetsByGroup,
 	withLoudness
 } from './export-presets';
 import type { LoudnessPreset } from './types';
@@ -86,5 +87,39 @@ describe('the frame-rate select', () => {
 		expect(frameRateOptions(30)).toBe(FRAME_RATES);
 		expect(frameRateOptions(null)).toBe(FRAME_RATES);
 		expect(frameRateOptions(undefined)).toBe(FRAME_RATES);
+	});
+});
+
+describe('the preset select', () => {
+	test('names and describes each preset the way the copy deck does', () => {
+		const label = (id: string) => PRESETS.find((p) => p.id === id)!;
+		expect(label('web_1080p').description).toBe('H.264 MP4 at 1080p. Plays everywhere; the safe default.');
+		expect(label('av1_web').description).toBe("AV1 in MKV at 1080p. Smallest files and slowest to encode; some devices can't play it.");
+		expect(label('gif').description).toBe('Looping GIF at 480p, 15 fps, no sound.');
+		expect(label('audio_mp3').label).toBe('MP3 audio (320 kbps)');
+		expect(label('audio_wav').label).toBe('WAV audio (24-bit)');
+		for (const p of PRESETS) {
+			expect(p.description, p.id).not.toMatch(/via |Next-gen|intermediate/);
+			expect(p.description.endsWith('.'), p.id).toBe(true);
+		}
+	});
+
+	test('what a description says matches what the preset does', () => {
+		const get = (id: string) => PRESETS.find((p) => p.id === id)!.opts;
+		expect(get('gif').fps).toBe(15);
+		expect(get('gif').resolution).toEqual([854, 480]);
+		expect(get('vertical_reel').resolution).toEqual([1080, 1920]);
+		expect(get('vertical_reel').fps).toBe(30);
+		expect(get('square_social').fps).toBe(30);
+		expect(get('target_size_2pass').video_bitrate).toBe('8M');
+		expect(get('web_720p').resolution).toEqual([1280, 720]);
+		expect(get('audio_mp3').audio_bitrate).toBe('320k');
+	});
+
+	test('every preset is in a group, the groups come in the deck’s order, and none is lost', () => {
+		const groups = presetsByGroup();
+		expect(groups.map((g) => g.group)).toEqual(['Video', 'Social', 'Master', 'Audio']);
+		expect(groups.flatMap((g) => g.presets.map((p) => p.id)).sort()).toEqual(PRESETS.map((p) => p.id).sort());
+		expect(groups.find((g) => g.group === 'Audio')!.presets.map((p) => p.id)).toEqual(['audio_mp3', 'audio_wav']);
 	});
 });

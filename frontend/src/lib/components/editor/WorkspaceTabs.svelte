@@ -4,7 +4,10 @@
 	// toggle buttons rather than a tablist — there is no tabpanel to point at, the
 	// panels are the whole window — with the arrow keys as a shortcut along it.
 	import { workspace } from '$lib/workspace.svelte';
+	import { settings } from '$lib/settings.svelte';
+	import type { ActionId } from '$lib/keymap';
 	import { WORKSPACE_SPECS, type WorkspaceId } from '$lib/workspaces';
+	import { tip } from '$lib/tip';
 
 	let list = $state<HTMLElement | null>(null);
 
@@ -43,7 +46,7 @@
 			class="k-tab"
 			data-workspace={w.id}
 			aria-pressed={on}
-			title="{w.label} workspace — {w.hint}"
+			use:tip={settings.tip(`${w.label} workspace`, `workspace.${w.id}` as ActionId, w.hint)}
 			onclick={(e) => choose(e, w.id)}
 			onkeydown={onKey}
 			>{w.label}</button

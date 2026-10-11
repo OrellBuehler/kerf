@@ -8,6 +8,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { AUDIO_EFFECT_PRESETS, effectLabel, freshEffect } from '$lib/effect-presets';
 	import { attempt } from '$lib/ops';
+	import { tip } from '$lib/tip';
 
 	const clip = $derived(editor.selectedClip);
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);
@@ -46,7 +47,7 @@
 			<button
 				style="{tile};{off ? 'opacity:.5;cursor:default' : ''}"
 				disabled={off}
-				title={reason ?? p.hint}
+				use:tip={reason ?? p.hint}
 				onclick={() => clip && void attempt(() => editor.setAudioEffects(clip.id, [...effects, freshEffect(p)]))}
 			>
 				{p.label}
@@ -65,10 +66,10 @@
 				<button
 					onclick={() => void attempt(() => editor.setAudioEffects(clip.id, effects.filter((_, j) => j !== i)))}
 					disabled={editor.busy}
-					title="Remove {effectLabel(e)}"
+					use:tip={`Remove ${effectLabel(e)}`}
 					aria-label="Remove {effectLabel(e)}"
 					style="background:transparent;border:none;color:var(--text-muted);cursor:pointer;font-size:16px;line-height:1;min-width:28px;min-height:28px;padding:2px 5px"
-					>×</button
+					><Icon n="x" s={14} /></button
 				>
 			</div>
 		{/each}

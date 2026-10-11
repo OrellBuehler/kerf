@@ -12,6 +12,7 @@ import {
 	conflictsFor,
 	detectPlatform,
 	isLinux,
+	isWindows,
 	differsFromDefault,
 	displayChord,
 	emptyOverrides,
@@ -82,6 +83,14 @@ describe('platform', () => {
 		expect(isLinux({ platform: 'Win32' })).toBe(false);
 		expect(isLinux({ platform: 'Linux armv81', userAgent: 'Mozilla/5.0 (Linux; Android 14)' })).toBe(false);
 		expect(isLinux({})).toBe(false);
+	});
+
+	test('Windows is what is neither a Mac nor a Linux desktop: the one platform whose installer exits the app', () => {
+		expect(isWindows({ platform: 'Win32' })).toBe(true);
+		expect(isWindows({ userAgentData: { platform: 'Windows' } })).toBe(true);
+		expect(isWindows({ platform: 'MacIntel' })).toBe(false);
+		expect(isWindows({ platform: 'Linux x86_64' })).toBe(false);
+		expect(isWindows({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64)' })).toBe(false);
 	});
 });
 
@@ -1098,6 +1107,8 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/components/editor/WorkspaceTabs.svelte',
 			'lib/drag.ts',
 			'lib/modal.ts',
+			'lib/roving.ts',
+			'lib/tip.ts',
 			'routes/+page.svelte'
 		]);
 	});

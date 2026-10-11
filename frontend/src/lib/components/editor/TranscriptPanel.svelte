@@ -11,6 +11,7 @@
 	import { mediaStatus } from '$lib/media-status.svelte';
 	import { toast } from '$lib/notifications.svelte';
 	import { activeLineIndex, srcToTimeline, transcriptLines, type TxLine } from '$lib/transcript';
+	import { tip } from '$lib/tip';
 
 	const txLines = $derived(
 		transcriptLines(editor.selectedMetadata?.analysis?.transcript ?? [], editor.selectedAssetId, editor.timeline.tracks)
@@ -145,7 +146,7 @@
 					<button
 						onclick={() => seekLine(l)}
 						disabled={!l.clip}
-						title={l.clip ? 'Jump to this line on the timeline' : 'Not on the timeline (cut)'}
+						use:tip={l.clip ? 'Jump to this line on the timeline' : 'Not on the timeline (cut)'}
 						style="display:flex;gap:8px;flex:1;background:none;border:none;padding:0;text-align:left;opacity:1;cursor:{l.clip
 							? 'pointer'
 							: 'default'}"

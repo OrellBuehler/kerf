@@ -240,7 +240,7 @@ class PopoutState {
 				label = announced?.label ?? null;
 				this.#note(announced);
 			} catch (e) {
-				toast.error('Could not open a window for the panel', { description: e instanceof Error ? e.message : String(e) });
+				toast.error("Couldn't open a window for the panel", { description: e instanceof Error ? e.message : String(e) });
 				return false;
 			}
 			let ok = false;

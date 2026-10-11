@@ -95,7 +95,8 @@ class Updater {
 
 	/** Download and install the pending update, then wait for the user to restart. */
 	async install(): Promise<void> {
-		if (!this.update) return;
+		// A second press while the first download runs would start another over it.
+		if (!this.update || this.phase === 'downloading') return;
 		this.phase = 'downloading';
 		this.progress = { downloaded: 0, total: null };
 		this.error = null;
