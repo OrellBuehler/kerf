@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use kerf_core::{
@@ -49,8 +49,11 @@ fn dir() -> &'static Path {
 
 /// `name`: 1280x720, 30 fps, `secs` long, every frame a keyframe (what a preview proxy is).
 fn proxy(name: &str, secs: u32) -> Asset {
+    static MAKING: Mutex<()> = Mutex::new(());
     let path = dir().join(name);
+    let making = MAKING.lock().unwrap_or_else(|e| e.into_inner());
     if !path.exists() {
+        let part = dir().join(format!("part-{name}"));
         ffmpeg(&[
             "-f",
             "lavfi",
@@ -66,9 +69,11 @@ fn proxy(name: &str, secs: u32) -> Asset {
             "1",
             "-pix_fmt",
             "yuv420p",
-            path.to_str().unwrap(),
+            part.to_str().unwrap(),
         ]);
+        std::fs::rename(&part, &path).unwrap();
     }
+    drop(making);
     Project::probe_asset(&path).expect("probe")
 }
 
