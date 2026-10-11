@@ -2701,13 +2701,15 @@ pub fn remove_proxy_files(src: &Path, width: u32) -> u64 {
     let Some(proxy) = proxy_path(src, width) else {
         return 0;
     };
-    [proxy.clone(), proxy_sidecar_path(&proxy)]
+    let freed: u64 = [proxy.clone(), proxy_sidecar_path(&proxy)]
         .iter()
         .filter_map(|file| {
             let bytes = std::fs::metadata(file).ok()?.len();
             std::fs::remove_file(file).ok().map(|()| bytes)
         })
-        .sum()
+        .sum();
+    crate::plan_epoch::bump_plan_epoch();
+    freed
 }
 
 /// How many CPU threads a single preview-proxy encode may use. Follows the
@@ -3151,6 +3153,7 @@ fn finalize_proxy(tmp: &Path, dst: &Path, probe: impl FnOnce() -> Option<StreamI
         write_proxy_sidecar(dst, tmp, video);
     }
     std::fs::rename(tmp, dst).map_err(|e| Error::Engine(format!("could not finalize preview proxy: {e}")))?;
+    crate::plan_epoch::bump_plan_epoch();
     Ok(dst.to_path_buf())
 }
 
@@ -9102,7 +9105,12 @@ mod tests {
         };
         let (tmp, dst) = (dir.join("0000000000000abc.1.part"), dir.join("0000000000000abc.mp4"));
         std::fs::write(&tmp, b"ours").unwrap();
+        let bumps = crate::plan_epoch::bumps_here();
         assert_eq!(finalize_proxy(&tmp, &dst, || Some(video(1280))).unwrap(), dst);
+        assert!(
+            crate::plan_epoch::bumps_here() > bumps,
+            "a proxy that lands moves the plan epoch"
+        );
         assert!(!tmp.exists());
         assert_eq!(std::fs::read(&dst).unwrap(), b"ours");
         assert_eq!(read_proxy_sidecar(&dst), Some(video(1280)));
@@ -14987,13 +14995,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_frame_reports_how_far_behind_its_slot_it_arrived() {
+        let timeouts = PreviewTimeouts {
+            first: std::time::Duration::from_secs(5),
+            stall: std::time::Duration::from_secs(5),
+        };
         let mut delays = Vec::new();
         let mut sent = Some(0);
         pump_preview(
             fake_stream(r"printf '\377\330a\377\331'; sleep 0.3; printf '\377\330b\377\331'"),
             0.0,
             1000.0,
-            short_timeouts(),
+            timeouts,
             &mut |f| {
                 delays.push(f.late);
                 true
@@ -15015,7 +15027,7 @@ mod tests {
             fake_stream(r"printf '\377\330a\377\331\377\330b\377\331\377\330c\377\331'"),
             0.0,
             4.0,
-            short_timeouts(),
+            timeouts,
             &mut |f| {
                 delays.push(f.late);
                 true

@@ -212,6 +212,9 @@
 				unlisteners.push(
 					await listen('project-changed', () => void onProjectChanged()),
 					await listen('proxy-ready', () => ui.refreshPreview()),
+					// The GPU preview's first-use self-test has its verdict: the frame that waited for it
+					// went through FFmpeg, so ask for it again.
+					await listen('gpu-preview-checked', () => ui.refreshPreview()),
 					// A second launch with a `.kerf` argument: the running app opens it.
 					await listen<string>('open-project-file', (e) => void openProjectAt(e.payload)),
 					// …or one naming a file that is not there, which is never created.

@@ -1,5 +1,7 @@
-// The Preview panel's frame fetching, out of the component so its reactivity can be tested: one
-// frame in flight at a time, the latest wanted time waiting, and the answer shown as a picture
+// The Preview panel's frame fetching, out of the component so its reactivity can be tested: on the
+// JPEG route one frame in flight at a time with the latest wanted time waiting, on the GPU route a
+// request per wanted time (the backend keeps only the newest: `get_preview_frame` is latest-wins and
+// answers `superseded` for the ones it replaced), and the answer shown as a picture
 // (`frameUrl`), as nothing at all (`gpuShown`: the native surface is what is seen) or, with the canvas
 // painter on (`CANVAS_PAINTER`), as the last frame of the playback stream on a canvas of its own (`streamShown`).
 //
@@ -11,7 +13,7 @@
 // to `pump` as values.
 
 import { isProxyWaitMessage } from './proxy-wait';
-import type { PreviewFrameResult } from './types';
+import type { PreviewFrameResult, PreviewOrder } from './types';
 
 export interface FramePumpDeps {
 	/** The playhead. */
@@ -35,7 +37,9 @@ export interface FramePumpDeps {
 	 *  for before that, so a first frame is not decoded at a guess and again at the real size. */
 	width(): number | null;
 	timelineFrame(time: number, width: number): Promise<string | null>;
-	previewFrame(time: number, overlays: boolean, width: number): Promise<PreviewFrameResult>;
+	/** `order` says which request of this pump it is, so the backend can tell a request that arrived
+	 *  after a newer one (the calls are separate tasks over the IPC) and not draw it. */
+	previewFrame(time: number, overlays: boolean, width: number, order: PreviewOrder): Promise<PreviewFrameResult>;
 	/** What the backend answered (the status bar names the renderer). */
 	answered(result: PreviewFrameResult): void;
 	/** The GPU path failed outright (the command rejected): the frame is the JPEG and the surface goes. */
@@ -53,68 +57,91 @@ export function createFramePump(deps: FramePumpDeps) {
 	let imgAspect = $state<number | null>(null);
 	let inFlight = false;
 	let queued: { time: number; via: 'gpu' | 'jpeg'; overlays: boolean; width: number } | null = null;
+	/** Requests made so far, and the newest one whose answer is on show: an answer older than that is
+	 *  dropped (the GPU route has several in flight, and the JPEG route may have one beside them). */
+	let asked = 0;
+	let shown = 0;
+	/** This pump's name to the backend, which numbers by it: a reloaded page or a second window starts
+	 *  counting again from zero without being behind the first. */
+	const client = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
-	// Single-flight decode: only ever one composite in flight, and `queued` always holds the
+	/** Show a JPEG that is the newest answer so far. */
+	function showUrl(url: string | null, seq: number) {
+		if (!url || deps.streaming() || seq < shown) return;
+		shown = seq;
+		frameUrl = url;
+		gpuShown = false;
+		streamShown = false;
+	}
+
+	// The GPU route is not single-flight: the backend draws the newest request and tells the ones it
+	// replaced (`superseded`), so a drag asks for every position the playhead passes and the renderer
+	// never waits for a round trip between two frames. The backend draws in the native surface when the
+	// plan allows it (and says so), else it hands back FFmpeg's JPEG for the frame.
+	async function askGpu(want: { time: number; overlays: boolean; width: number }, seq: number) {
+		let result: PreviewFrameResult | null = null;
+		try {
+			result = await deps.previewFrame(want.time, want.overlays, want.width, { client, seq });
+		} catch (error) {
+			// Under "Proxy only" the backend refuses a frame whose proxy is still building. That is
+			// the preview waiting, not the GPU path failing: the picture on show (and the surface,
+			// if it is up) stays as it is until the proxy lands and the frame is asked for again.
+			if (isProxyWaitMessage(error)) return;
+			// The command itself failed (a panic in the GPU path, an error building the inputs): this
+			// frame is the JPEG, and the surface must not stay over it.
+			deps.gpuFailed(error);
+			try {
+				showUrl(await deps.timelineFrame(want.time, want.width), seq);
+			} catch {
+				/* keep the last good frame */
+			}
+			return;
+		}
+		// A newer request took this one's place before it was drawn: that request's answer is the
+		// one to show.
+		if (result.renderer === 'superseded') return;
+		// Playback may have taken over while this was decoding, or a newer frame is already on show.
+		if (deps.streaming() || seq < shown) return;
+		shown = seq;
+		deps.answered(result);
+		if (result.renderer === 'gpu') {
+			gpuShown = true;
+			streamShown = false;
+			// The canvas the compositor drew has the delivery's shape.
+			if (result.timings?.width && result.timings.height) imgAspect = result.timings.width / result.timings.height;
+		} else if (result.frame) {
+			gpuShown = false;
+			streamShown = false;
+			frameUrl = result.frame;
+		}
+	}
+
+	// Single-flight on the JPEG route: only ever one composite in flight, and `queued` always holds the
 	// *latest* wanted frame. Scrubbing collapses to one render + one pending target instead of a
 	// backlog of stale frames that must all drain before the frame under the cursor appears.
 	async function pump() {
-		if (inFlight || queued === null) return;
+		if (queued === null) return;
+		if (queued.via === 'gpu') {
+			const { time, overlays, width } = queued;
+			queued = null;
+			try {
+				await askGpu({ time, overlays, width }, ++asked);
+			} catch {
+				/* ignore decode errors — keep the last good frame */
+			}
+			return;
+		}
+		if (inFlight) return;
 		const want = queued;
 		queued = null;
 		inFlight = true;
+		const seq = ++asked;
 		try {
-			if (want.via === 'gpu') {
-				// The GPU preview is on: the backend draws the frame in the native surface when the plan
-				// allows it (and says so), else it hands back FFmpeg's JPEG for this frame.
-				let result: PreviewFrameResult | null = null;
-				try {
-					result = await deps.previewFrame(want.time, want.overlays, want.width);
-				} catch (error) {
-					// Under "Proxy only" the backend refuses a frame whose proxy is still building. That is
-					// the preview waiting, not the GPU path failing: the picture on show (and the surface,
-					// if it is up) stays as it is until the proxy lands and the frame is asked for again.
-					if (isProxyWaitMessage(error)) {
-						inFlight = false;
-						if (queued !== null) void pump();
-						return;
-					}
-					// The command itself failed (a panic in the GPU path, an error building the inputs): this
-					// frame is the JPEG, and the surface must not stay over it.
-					deps.gpuFailed(error);
-					const url = await deps.timelineFrame(want.time, want.width);
-					if (url && !deps.streaming()) {
-						frameUrl = url;
-						gpuShown = false;
-						streamShown = false;
-					}
-				}
-				// Playback may have taken over while this was decoding.
-				if (result && !deps.streaming()) {
-					deps.answered(result);
-					if (result.renderer === 'gpu') {
-						gpuShown = true;
-						streamShown = false;
-						// The canvas the compositor drew has the delivery's shape.
-						if (result.timings?.width && result.timings.height) imgAspect = result.timings.width / result.timings.height;
-					} else if (result.frame) {
-						gpuShown = false;
-						streamShown = false;
-						frameUrl = result.frame;
-					}
-				}
-			} else {
-				// The *composited* timeline still — every visible clip with its color, effects, transform
-				// and overlays applied, so Inspector edits show up live. (Desktop only — null in the
-				// browser.)
-				const url = await deps.timelineFrame(want.time, want.width);
-				// Playback may have taken over while this was decoding; a still landing on top of live
-				// frames would show as a stutter.
-				if (url && !deps.streaming()) {
-					frameUrl = url;
-					gpuShown = false;
-					streamShown = false;
-				}
-			}
+			// The *composited* timeline still — every visible clip with its color, effects, transform
+			// and overlays applied, so Inspector edits show up live. (Desktop only — null in the
+			// browser.) Playback may have taken over while this was decoding; a still landing on top of
+			// live frames would show as a stutter.
+			showUrl(await deps.timelineFrame(want.time, want.width), seq);
 		} catch {
 			/* ignore decode errors — keep the last good frame */
 		}

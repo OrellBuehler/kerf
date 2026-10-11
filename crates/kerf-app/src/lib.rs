@@ -206,7 +206,7 @@ fn project_path(state: State<'_, AppState>) -> CmdResult<Option<String>> {
 #[tauri::command(async)]
 fn new_project(state: State<'_, AppState>) -> CmdResult<Option<String>> {
     let mut project = state.project();
-    *project = Project::open_in_memory().map_err(|e| e.to_string())?;
+    project.replace_with(Project::open_in_memory().map_err(|e| e.to_string())?);
     state.scrub.clear();
     Ok(project.path().map(|p| p.display().to_string()))
 }
@@ -223,7 +223,7 @@ async fn open_project(app: AppHandle, state: State<'_, AppState>, path: String) 
         // hold the shared lock, and a failed open leaves the current project intact.
         let opened = Project::open(&path).map_err(|e| e.to_string())?;
         let mut project = lock_user(&shared);
-        *project = opened;
+        project.replace_with(opened);
         let result = project.path().map(|p| p.display().to_string());
         drop(project);
         // The frames of the project that was open are of no use to this one.
@@ -275,13 +275,13 @@ async fn save_project_as(state: State<'_, AppState>, path: String) -> CmdResult<
         let opened = Project::open(&path).map_err(|e| e.to_string())?;
         let mut project = lock_user(&shared);
         if project_fingerprint(&project)? == before {
-            *project = opened;
+            project.replace_with(opened);
         } else {
             // Close the stale copy first: `save_as` deletes the file it replaces,
             // which Windows refuses while it is open.
             drop(opened);
             project.save_as(&path).map_err(|e| e.to_string())?;
-            *project = Project::open(&path).map_err(|e| e.to_string())?;
+            project.replace_with(Project::open(&path).map_err(|e| e.to_string())?);
         }
         Ok(project.path().map(|p| p.display().to_string()))
     })
@@ -2022,6 +2022,16 @@ async fn get_timeline_frame(state: State<'_, AppState>, time_secs: f64, max_widt
 /// `overlays` is the page saying it has something to draw over the picture (a title box, the trim
 /// monitor, safe-area guides): a surface that sits above the page cannot show those, so such a
 /// frame is the JPEG. See [`gpu_preview`]; GUI-only, so there is no MCP tool.
+///
+/// **Latest wins**: a request does not wait behind the ones before it. It replaces the one waiting
+/// (that call answers `renderer: "superseded"` at once, with nothing drawn) and is drawn when the
+/// frame in hand is done, so a drag can post a request per playhead move without queueing them. The
+/// frame's inputs are a snapshot of the project (`gpu_preview::snapshot`): the project lock is taken
+/// only when the plan epoch says something changed, never per frame.
+///
+/// `client` and `seq` say which request of which page this is: Tauri runs each call as a task of
+/// its own, so two can arrive in the other order than they were made, and one that arrives after a
+/// newer request of the same `client` answers `superseded` instead of replacing it.
 #[tauri::command]
 async fn get_preview_frame(
     state: State<'_, AppState>,
@@ -2029,24 +2039,31 @@ async fn get_preview_frame(
     time_secs: f64,
     max_width: Option<u32>,
     overlays: Option<bool>,
+    client: Option<String>,
+    seq: Option<u64>,
 ) -> CmdResult<gpu_preview::PreviewFrameResult> {
     let shared = state.project.clone();
-    let gpu = gpu.inner().clone();
-    blocking(move || {
-        // The inputs are taken under the lock and the guard is gone before anything is
-        // planned from files, decoded, rendered or presented.
-        gpu.frame(
-            || {
-                let project = lock_user(&shared);
-                refuse_unless_proxied(&project, time_secs, Some(time_secs))?;
-                gpu_preview::plan_inputs(&project)
-            },
-            time_secs,
-            max_width.unwrap_or(960),
-            overlays.unwrap_or(false),
-        )
-    })
-    .await
+    let mut request = gpu_preview::FrameRequest::new(
+        Arc::new(move || {
+            let project = lock_user(&shared);
+            gpu_preview::take_inputs(&project)
+        }),
+        time_secs,
+        max_width.unwrap_or(960),
+        overlays.unwrap_or(false),
+    );
+    if let (Some(client), Some(seq)) = (client, seq) {
+        request = request.ordered(client, seq);
+    }
+    let answer = gpu.post(request, |job| {
+        // The worker waits for FFmpeg and the GPU: the blocking pool's, never a runtime thread.
+        tauri::async_runtime::spawn_blocking(job);
+    });
+    match answer.await {
+        Ok(gpu_preview::Delivery::Done(result)) => result,
+        Ok(gpu_preview::Delivery::Superseded) => Ok(gpu_preview::PreviewFrameResult::superseded()),
+        Ok(gpu_preview::Delivery::Abandoned) | Err(_) => Err("the GPU preview's frame worker stopped".to_string()),
+    }
 }
 
 /// Where the Preview frame is in the window (device pixels, relative to the webview) and whether
@@ -2062,6 +2079,16 @@ fn set_preview_bounds(gpu: State<'_, Arc<gpu_preview::GpuPreview>>, bounds: gpu_
 #[tauri::command(async)]
 fn gpu_preview_status(gpu: State<'_, Arc<gpu_preview::GpuPreview>>) -> gpu_preview::GpuPreviewStatus {
     gpu.status()
+}
+
+/// What this session's preview frames did, for diagnostics: how many the GPU drew and how many went
+/// through FFmpeg and for which kind of reason (the plan's refusals counted by kind, with the first
+/// message as an example), how often the frames' inputs were served from the held snapshot, how many
+/// requests a newer one replaced, and where the parity self-test stands. Local and in memory; also
+/// logged when the preview is torn down.
+#[tauri::command(async)]
+fn gpu_preview_diagnostics(gpu: State<'_, Arc<gpu_preview::GpuPreview>>) -> gpu_preview::GpuDiagnostics {
+    gpu.diagnostics()
 }
 
 /// Bytes in front of the JPEG in a playback message: the frame's timeline time as an `f64`, little
@@ -3480,6 +3507,7 @@ pub fn run() {
             get_preview_frame,
             set_preview_bounds,
             gpu_preview_status,
+            gpu_preview_diagnostics,
             start_playback,
             stop_playback,
             get_waveform,

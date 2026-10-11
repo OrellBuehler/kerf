@@ -1205,6 +1205,37 @@ export interface GpuPreviewStatus {
 	reason: string | null;
 }
 
+/** One kind of reason a preview frame went through FFmpeg, counted over the session
+ *  (`RefusalCount` in `gpu_preview/diagnostics.rs`). */
+export interface GpuRefusalCount {
+	/** A stable key (`mask`, `mixed_matrices`, `text_too_small`, `self_test_pending`, …). */
+	kind: string;
+	count: number;
+	/** The first message of this kind seen this session. */
+	example: string;
+}
+
+/** What this session's preview frames did (`GpuDiagnostics` in `gpu_preview.rs`): local,
+ *  in memory, for finding out which refusals matter on real projects. */
+export interface GpuPreviewDiagnostics {
+	tally: {
+		gpu_frames: number;
+		ffmpeg_frames: number;
+		/** Frame requests a newer one replaced before they were drawn. */
+		superseded: number;
+		/** Most frequent first. */
+		refusals: GpuRefusalCount[];
+	};
+	/** How often the frames' inputs came from the held snapshot, and how often they were taken
+	 *  from the project (its lock, its timeline parsed). */
+	snapshots: { served: number; taken: number };
+	requests: { posted: number; superseded: number };
+	/** The parity self-test against this machine's FFmpeg: running, passed or closed (and why). */
+	self_test: string | null;
+	adapter: string | null;
+	software: boolean;
+}
+
 /** Where the Preview frame is in the window, in device pixels relative to the
  *  webview's top-left corner (`BoundsReport` in `gpu_preview.rs`). */
 export interface PreviewBoundsReport {
@@ -1236,12 +1267,22 @@ export interface GpuTimings {
 	present_ms: number;
 }
 
+/** Which request of which pump a `get_preview_frame` is. IPC calls can reach the backend in the
+ *  other order than they were made; the backend draws only the newest number of a `client`
+ *  and answers `superseded` to an older one that arrives after it. */
+export interface PreviewOrder {
+	client: string;
+	seq: number;
+}
+
 /** The answer of `get_preview_frame` (`PreviewFrameResult`): which renderer made the
  *  frame, and the JPEG when it was FFmpeg. */
 export interface PreviewFrameResult {
 	/** `gpu`: drawn in the native surface (the webview shows it by showing nothing
-	 *  over it). `ffmpeg`: the `frame` data URL. */
-	renderer: 'gpu' | 'ffmpeg';
+	 *  over it). `ffmpeg`: the `frame` data URL. `superseded`: a newer request took this
+	 *  one's place before it was drawn (the backend keeps only the newest); nothing was
+	 *  drawn and the answer is ignored. */
+	renderer: 'gpu' | 'ffmpeg' | 'superseded';
 	frame: string | null;
 	/** Why the GPU did not draw it (empty when it did). */
 	reasons: string[];

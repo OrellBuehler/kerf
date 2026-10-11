@@ -127,7 +127,7 @@
 		streaming: () => streaming,
 		width: () => frameWidth,
 		timelineFrame: (t, width) => getTimelineFrame(t, width),
-		previewFrame: (t, overlays, width) => getPreviewFrame(t, width, overlays),
+		previewFrame: (t, overlays, width, order) => getPreviewFrame(t, width, overlays, order),
 		answered: (result) => gpuPreview.note(result),
 		gpuFailed: (error) => {
 			gpuPreview.noteJpeg(`the GPU preview failed: ${error instanceof Error ? error.message : String(error)}`);

@@ -820,6 +820,54 @@ fn write_png(path: &Path, rgb: &[u8], w: usize, h: usize) {
     assert!(child.wait().unwrap().success());
 }
 
+/// The runtime self-test (`kerf_gpu::selftest`, run on a user's machine at the GPU path's first
+/// use) judges by these limits and by this file's comparison; a number changed here and not
+/// there would make it stricter or looser than the suite it stands in for.
+#[test]
+fn the_runtime_self_test_judges_by_the_limits_and_the_comparison_of_this_harness() {
+    use kerf_gpu::selftest as st;
+    assert_eq!((st::BAND, st::EDGE_STEP, st::MAX_FLAT), (BAND, EDGE_STEP, MAX_FLAT));
+    assert_eq!(
+        (st::PSNR_FLAT_MIN, st::PSNR_ALL_MIN, st::FLAT_SHARE_MIN),
+        (STRICT.psnr_flat, STRICT.psnr_all, STRICT.flat_share)
+    );
+    assert_eq!(
+        (STRICT.max_flat, STRICT.edge_step, STRICT.max_all),
+        (MAX_FLAT, EDGE_STEP, None)
+    );
+    // The same picture pair, judged by both.
+    let (w, h) = (97, 61);
+    let mut seed = 0x9e37_79b9_u32;
+    let mut next = move || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (seed >> 24) as u8
+    };
+    let reference: Vec<u8> = (0..w * h * 3)
+        .map(|i| if (i / 3 % w) < w / 3 { 40 } else { 40 + (i % 5) as u8 * 30 })
+        .collect();
+    let gpu: Vec<u8> = reference.iter().map(|v| v.saturating_add(next() % 4)).collect();
+    let (mine, _) = compare(&reference, &gpu, w, h, STRICT.edge_step);
+    let theirs = st::compare(&reference, &gpu, w, h);
+    assert_eq!(
+        (
+            mine.psnr_flat,
+            mine.max_flat,
+            mine.mean_flat,
+            mine.psnr_all,
+            mine.max_all,
+            mine.edge_fraction
+        ),
+        (
+            theirs.psnr_flat,
+            theirs.max_flat,
+            theirs.mean_flat,
+            theirs.psnr_all,
+            theirs.max_all,
+            theirs.edge_fraction
+        )
+    );
+}
+
 // ---- the check ----------------------------------------------------------------
 
 fn report() -> &'static Mutex<BTreeMap<String, String>> {
