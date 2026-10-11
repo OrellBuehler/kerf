@@ -13,6 +13,7 @@
 	import AgentPanel from './AgentPanel.svelte';
 	import DeliverPanel from './DeliverPanel.svelte';
 	import Mixer from './Mixer.svelte';
+	import DockEmpty from './DockEmpty.svelte';
 	import ContextMenu from './ContextMenu.svelte';
 	import { POPOUT_URL, isPanelId, type PanelId } from '$lib/layout';
 	import { workspace } from '$lib/workspace.svelte';
@@ -98,12 +99,21 @@
 		};
 	}
 
+	/** What the dock shows with every panel closed (`DockEmpty`): how to get one back. */
 	function createWatermarkComponent() {
 		const element = document.createElement('div');
-		element.style.cssText =
-			'display:grid;place-items:center;height:100%;font-size:12px;color:var(--text-muted)';
-		element.textContent = 'Open a panel from the Window menu';
-		return { element, init() {} };
+		element.style.cssText = 'height:100%';
+		let instance: Record<string, unknown> | null = null;
+		return {
+			element,
+			init() {
+				instance = mount(DockEmpty, { target: element });
+			},
+			dispose() {
+				if (instance) void unmount(instance);
+				instance = null;
+			}
+		};
 	}
 
 	onMount(() => {

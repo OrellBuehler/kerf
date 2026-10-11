@@ -4,6 +4,8 @@
 	// from the timeline. Empty, it says which of the five reasons applies.
 	import Icon from './Icon.svelte';
 	import Btn from './Btn.svelte';
+	import EmptyState from './EmptyState.svelte';
+	import ProgressBar from './ProgressBar.svelte';
 	import IconBtn from './IconBtn.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { settings } from '$lib/settings.svelte';
@@ -76,21 +78,10 @@
 <div style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden">
 	<div style="flex:1;overflow-y:auto;padding:12px">
 	{#if txLines.length === 0}
-		<div
-			style="display:flex;flex-direction:column;align-items:center;gap:12px;padding:36px 16px;color:var(--text-muted);text-align:center"
-		>
-			<Icon n="captions" s={22} />
-			<span style="font-size:12px;color:var(--text-secondary)">{tx.title}</span>
-			{#if tx.body}
-				<span style="font-size:12px;line-height:1.5;max-width:240px">{tx.body}</span>
-			{/if}
+		<EmptyState icon="captions" title={tx.title} hint={tx.body}>
 			{#if ui.analyzing}
-				<div style="width:200px;height:3px;border-radius:999px;background:var(--surface-inset);overflow:hidden">
-					<div
-						style="height:100%;width:{Math.round(
-							(ui.analysisStage?.fraction ?? 0) * 100
-						)}%;background:var(--kerf-500);transition:width .2s"
-					></div>
+				<div style="width:200px">
+					<ProgressBar value={ui.analysisStage?.fraction ?? null} label="Transcribing" height={3} />
 				</div>
 			{:else if tx.action === 'download'}
 				<div style="display:flex;flex-direction:column;gap:8px;align-items:center">
@@ -98,6 +89,7 @@
 						value={ui.transcription?.model ?? ''}
 						onchange={(e) => void ui.chooseSpeechModel((e.currentTarget as HTMLSelectElement).value)}
 						disabled={!!ui.downloadingModel}
+						aria-label="Speech model"
 						class="k-select"
 						style="color:var(--text-secondary)"
 					>
@@ -110,12 +102,8 @@
 						{/each}
 					</select>
 					{#if ui.downloadingModel}
-						<div style="width:200px;height:3px;border-radius:999px;background:var(--surface-inset);overflow:hidden">
-							<div
-								style="height:100%;width:{Math.round(
-									ui.modelFraction * 100
-								)}%;background:var(--kerf-500);transition:width .2s"
-							></div>
+						<div style="width:200px">
+							<ProgressBar value={ui.modelFraction} label="Downloading the speech model" height={3} />
 						</div>
 					{:else}
 						<Btn size="sm" onclick={() => void ui.fetchSpeechModel(ui.transcription?.model ?? 'base')}
@@ -126,12 +114,15 @@
 			{:else if tx.action === 'settings'}
 				<Btn size="sm" onclick={() => settings.toggle()}>Open Settings</Btn>
 			{:else if tx.action === 'analyze' && editor.selectedAssetId}
-				<Btn size="sm" onclick={() =>
+				<Btn
+					size="sm"
+					onclick={() =>
 						void ui
 							.runAnalysis(editor.selectedAssetId!, ['transcript'])
-							.catch((err) => toast.error(err instanceof Error ? err.message : String(err)))}>Transcribe</Btn>
+							.catch((err) => toast.error(err instanceof Error ? err.message : String(err)))}>Transcribe</Btn
+				>
 			{/if}
-		</div>
+		</EmptyState>
 	{:else}
 		<div data-selectable style="display:flex;flex-direction:column;gap:2px">
 			{#each txLines as l, i (i)}

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
+	import EmptyState from './EmptyState.svelte';
 	import { windows } from '$lib/windows.svelte';
 	import { documentOf } from '$lib/realm';
 	import { notifications, type Notice } from '$lib/notifications.svelte';
@@ -122,18 +123,15 @@
 
 		<div style="flex:1;overflow-y:auto;min-height:0">
 			{#if shown.length === 0}
-				<div
-					style="display:flex;flex-direction:column;align-items:center;gap:8px;padding:34px 16px;color:var(--text-muted);text-align:center"
-				>
-					<Icon n="bell" s={20} />
-					<span style="font-size:var(--text-sm)"
-						>{notifications.items.length === 0
-							? 'Nothing has been reported yet.'
-							: filter === 'unread'
-								? 'Everything here has been read.'
-								: 'No errors or warnings.'}</span
-					>
-				</div>
+				<EmptyState
+					icon="bell"
+					pad={34}
+					title={notifications.items.length === 0
+						? 'Nothing has been reported yet.'
+						: filter === 'unread'
+							? 'Everything here has been read.'
+							: 'No errors or warnings.'}
+				/>
 			{:else}
 				{#each shown as n (n.id)}
 					<div
