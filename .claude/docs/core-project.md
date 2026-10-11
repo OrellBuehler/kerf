@@ -116,7 +116,8 @@
   now exist:
   `FfmpegSilenceDetector` / `FfmpegSceneDetector` (CLI engine, always available —
   scene detection decodes hardware-accelerated and scores at 640px, the metric
-  being resolution-normalized), `FfmpegRhythmAnalyzer` (onsets + tempo +
+  being resolution-normalized; **from the asset's ready proxy** instead when
+  `Project::scoring_proxy` finds one, see below), `FfmpegRhythmAnalyzer` (onsets + tempo +
   speech/music class from **one** PCM decode — they used to be three traits, each
   re-decoding the whole file), `WhisperFilterTranscriber` (the ffmpeg `whisper`
   filter, always compiled) and
@@ -173,5 +174,12 @@
   again; a rebuild forgives it. Under **Proxy only** `Project::proxy_waits(from, to)` names the clips
   in range with no ready proxy; the GUI preview commands refuse to decode the original for them, an
   agent's reads do not ask. Export never reads a proxy whatever any of this says.
+  **Analysis takes a ready proxy too** (`Project::scoring_proxy` for `FfmpegSceneDetector`,
+  `Project::sheet_proxy` for `decode_contact_sheet` / the `skim_asset` sheet; pure
+  `resolve_analysis_proxy`): the same `preview_source` rule (Always original, or size Off, reads
+  the original; a proxy still building is not waited for, analysis already queues behind the proxy
+  lane) plus `engine::proxy_fidelity` — an MP4 / MOV / Matroska source for times, also SDR for
+  scene scores (`engine-cli.md` has why and the measured limits). A proxy that fails to read falls
+  back to the original. Smart crop's `salience_map` is not swapped.
 - `error.rs` — `Error`/`Result`; the `Ffmpeg(#[from] ffmpeg_next::Error)` variant is
   itself `#[cfg(feature = "ffmpeg")]`.

@@ -210,6 +210,20 @@ fn resolve_preview_source(asset: &Asset, mode: crate::proxy::PreviewSource, read
     PathBuf::from(&asset.path)
 }
 
+/// The ready proxy a whole-file analysis read of an asset may decode in place of the original, or
+/// `None` to read the original: [`resolve_preview_source`] when it picks a proxy, and only when
+/// `faithful` says the proxy stands in for the file for what the read is after
+/// ([`engine::ProxyFidelity`]). The proxy is a faster way to the same answer or it is not used.
+fn resolve_analysis_proxy(
+    asset: &Asset,
+    mode: crate::proxy::PreviewSource,
+    ready: impl FnOnce() -> Option<PathBuf>,
+    faithful: impl FnOnce() -> bool,
+) -> Option<PathBuf> {
+    let source = resolve_preview_source(asset, mode, ready);
+    (source != Path::new(&asset.path) && faithful()).then_some(source)
+}
+
 impl Project {
     /// Create (or overwrite the schema of) a `.kerf` file on disk.
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
@@ -761,6 +775,34 @@ impl Project {
         })
     }
 
+    /// The proxy a whole-file analysis read of `asset` decodes instead of its original, when one
+    /// is **already on disk** (never waited for), the preview source setting allows proxies and
+    /// `faithful` accepts the file's [`engine::ProxyFidelity`]; `None` reads the original. A proxy
+    /// answers `-ss T` with the frame the original does, so what a read finds *when* comes out
+    /// the same, from a small all-intra decode in place of a 4K long-GOP one. Probes the file
+    /// (cached), so not under a lock that other work waits on.
+    fn analysis_proxy(asset: &Asset, faithful: impl FnOnce(engine::ProxyFidelity) -> bool) -> Option<PathBuf> {
+        let original = Path::new(&asset.path);
+        resolve_analysis_proxy(
+            asset,
+            crate::proxy::effective_preview_source(),
+            || engine::ready_proxy(original, engine::proxy_width(asset.projection())),
+            || faithful(engine::proxy_fidelity(original)),
+        )
+    }
+
+    /// [`Project::analysis_proxy`] for scene detection, which scores frames: only where the
+    /// proxy's scores are the original's (an SDR MP4 / MOV / Matroska source).
+    pub(crate) fn scoring_proxy(asset: &Asset) -> Option<PathBuf> {
+        Self::analysis_proxy(asset, |f| f.scores)
+    }
+
+    /// [`Project::analysis_proxy`] for a contact sheet, which picks frames by time: any source
+    /// whose proxy keeps the original's times (an HDR one is tone-mapped the same either way).
+    pub(crate) fn sheet_proxy(asset: &Asset) -> Option<PathBuf> {
+        Self::analysis_proxy(asset, |f| f.times)
+    }
+
     // ---- proxies ------------------------------------------------------------
 
     /// Whether the user deleted `asset_id`'s proxy on purpose (so it is not built
@@ -877,7 +919,9 @@ impl Project {
 
     /// Build the contact sheet for an already-resolved [`Asset`], *without*
     /// `&self` — so the caller can release the project lock before the
-    /// (many-seek) ffmpeg sampling runs. See [`Project::skim_asset`].
+    /// (many-seek) ffmpeg sampling runs. See [`Project::skim_asset`]. Reads the asset's
+    /// ready proxy when it has one ([`Project::sheet_proxy`]): the same moments, from a
+    /// small all-intra decode instead of a 4K long-GOP one.
     #[allow(clippy::too_many_arguments)]
     pub fn decode_contact_sheet(
         asset: &Asset,
@@ -890,6 +934,12 @@ impl Project {
     ) -> Result<(Vec<u8>, Vec<f64>)> {
         let start = start.unwrap_or(0.0).max(0.0);
         let end = end.unwrap_or(asset.duration).min(asset.duration).max(start);
+        if let Some(proxy) = Self::sheet_proxy(asset) {
+            match engine::contact_sheet(&proxy, start, end, columns, rows, cell_width, quality) {
+                Ok(sheet) => return Ok(sheet),
+                Err(e) => tracing::warn!(error = %e, "contact sheet could not read the proxy; reading the original"),
+            }
+        }
         engine::contact_sheet(Path::new(&asset.path), start, end, columns, rows, cell_width, quality)
     }
 
@@ -5627,6 +5677,36 @@ mod tests {
             resolve_preview_source(&still, PreviewSource::Auto, || panic!("a still has no proxy")),
             PathBuf::from(&still.path)
         );
+    }
+
+    #[test]
+    fn an_analysis_read_takes_a_ready_proxy_only_where_it_stands_in_for_the_file() {
+        use crate::proxy::PreviewSource;
+        let asset = asset_with("/kerf-analysis-proxy.mp4", vec![vid_stream(false)]);
+        let proxy = PathBuf::from("/cache/proxy.mp4");
+        let ready = || Some(proxy.clone());
+        let take = |mode, faithful: bool| resolve_analysis_proxy(&asset, mode, ready, || faithful);
+        // Auto and Proxy only read a ready, faithful proxy; Always original never looks for one.
+        assert_eq!(take(PreviewSource::Auto, true), Some(proxy.clone()));
+        assert_eq!(take(PreviewSource::ProxyOnly, true), Some(proxy.clone()));
+        assert_eq!(take(PreviewSource::Original, true), None);
+        // A proxy that does not stand in for the file (an HDR source's scores, a transport
+        // stream's times) is left alone.
+        assert_eq!(take(PreviewSource::Auto, false), None);
+        // Never waited for: no proxy yet reads the original, and the fidelity is not even probed.
+        assert_eq!(
+            resolve_analysis_proxy(&asset, PreviewSource::Auto, || None, || panic!("probed a file with no proxy")),
+            None
+        );
+        // A still, or a file with no picture, has none.
+        let still = asset_with("/kerf-analysis-proxy.png", vec![vid_stream(true)]);
+        let audio = asset_with("/kerf-analysis-proxy.wav", vec![aud_stream()]);
+        for asset in [still, audio] {
+            assert_eq!(
+                resolve_analysis_proxy(&asset, PreviewSource::Auto, || panic!("no proxy exists"), || true),
+                None
+            );
+        }
     }
 
     #[test]

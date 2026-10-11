@@ -21,8 +21,8 @@ use super::decode_policy::{
 use super::source_probe::{ProbeCache, SOURCE_PROBE_TIMEOUT};
 use super::ProbeResult;
 use crate::clip_timing::{
-    clip_seek, clip_source_window, is_cache_proxy, transition_fx, ClipFx, ClipTiming, FadeEdge, FadeStep, FadeTint,
-    HEAD_PADDED_SUFFIX,
+    clip_seek, clip_source_window, is_cache_proxy, is_head_padded_proxy, transition_fx, ClipFx, ClipTiming, FadeEdge, FadeStep,
+    FadeTint, HEAD_PADDED_SUFFIX,
 };
 use crate::error::{Error, Result};
 use crate::model::{
@@ -1227,6 +1227,37 @@ pub fn source_is_indexed_container(path: &Path) -> bool {
     source_traits(path).is_some_and(|t| t.indexed)
 }
 
+/// What a whole-file *analysis* read can take from the preview proxy of a file in place of the
+/// file itself (see [`proxy_fidelity`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProxyFidelity {
+    /// A frame sits at the time it does in the original, so a read that picks frames by time
+    /// (a contact sheet) or reports a time (a cut) says the same: an MP4 / MOV or Matroska / WebM
+    /// source, the containers the proxy's timing is verified for. A transport stream's proxy is
+    /// `lead` seconds off whenever its video starts late (`engine-cli.md`), and the rest are
+    /// unproven.
+    pub times: bool,
+    /// ...and a frame's *scene score* comes out within a few hundredths of the original's, so
+    /// the cuts found are the same: also an SDR source. A proxy is tone-mapped at encode, and
+    /// the original is scored in its HLG / PQ code values, which the tone curve moves by a quarter
+    /// of the scale.
+    pub scores: bool,
+}
+
+/// [`ProxyFidelity`] of the file at `path`. One cached `ffprobe` (the one the proxy's own name
+/// already cost); nothing is trusted when the probe fails. Spawns a process: not under a lock.
+pub fn proxy_fidelity(path: &Path) -> ProxyFidelity {
+    fidelity_of(source_traits(path).unwrap_or_default())
+}
+
+/// The pure half of [`proxy_fidelity`].
+fn fidelity_of(traits: SourceTraits) -> ProxyFidelity {
+    ProxyFidelity {
+        times: traits.indexed,
+        scores: traits.indexed && traits.hdr.is_none(),
+    }
+}
+
 /// The HDR transfer of the first video stream of the file at `path`, for the
 /// decodes that are handed a bare path rather than an [`Asset`] (a scrubbed
 /// frame, a contact sheet, a proxy). Probed once per file and cached against the
@@ -1290,6 +1321,32 @@ const SCENE_DETECT_WIDTH: u32 = 640;
 /// the expensive part for 4K sources); a failed accelerated run retries in
 /// software, mirroring [`decode_frame`]'s fallback.
 pub fn detect_scenes(path: &Path, threshold: f64) -> Result<Vec<f64>> {
+    scene_pass(path, threshold).map(|(times, _)| times)
+}
+
+/// [`detect_scenes`] for the file at `original`, reading its preview `proxy` instead when one
+/// is given: a small all-intra decode in place of a whole 4K long-GOP one.
+///
+/// The proxy is only ever a faster way to the *same answer*, so a proxy that does not read
+/// (a truncated or foreign file, a decoder that dies on it) is not a failed analysis: the
+/// original is read instead, as if there had been none. The cut times themselves come out
+/// the same because a proxy answers `-ss T` with the frame the original does (see
+/// [`build_proxy_args`]; a late-starting video is padded so its frames keep their
+/// timestamps), and the detector scores at [`SCENE_DETECT_WIDTH`] either way.
+pub fn detect_scenes_preferring(original: &Path, proxy: Option<&Path>, threshold: f64) -> Result<Vec<f64>> {
+    if let Some(proxy) = proxy {
+        if let Ok((times, true)) = scene_pass(proxy, threshold) {
+            return Ok(times);
+        }
+        tracing::warn!(proxy = %proxy.display(), "scene detection could not read the proxy; reading the original");
+    }
+    detect_scenes(original, threshold)
+}
+
+/// One scene-detection pass over `path`: the cut times and whether ffmpeg ended cleanly.
+/// [`detect_scenes`] has always answered with whatever the log held, so a run that failed
+/// reads as "no cuts"; the flag is what lets a caller with somewhere else to read tell.
+fn scene_pass(path: &Path, threshold: f64) -> Result<(Vec<f64>, bool)> {
     use std::sync::atomic::Ordering;
 
     let bin = ffmpeg_bin();
@@ -1328,7 +1385,10 @@ pub fn detect_scenes(path: &Path, threshold: f64) -> Result<Vec<f64>> {
         }
         None => run(None)?,
     };
-    Ok(parse_scenes(&String::from_utf8_lossy(&output.stderr)))
+    Ok((
+        parse_scenes(&String::from_utf8_lossy(&output.stderr)),
+        output.status.success(),
+    ))
 }
 
 fn parse_scenes(stderr: &str) -> Vec<f64> {
@@ -1804,7 +1864,15 @@ fn build_contact_sheet_args(
     let rate = if window > 0.0 { cells as f64 / window } else { 1.0 };
     // HDR sources are tone-mapped per cell, after the downscale, before the tile.
     let tone = tonemap.map(|t| format!("{t},")).unwrap_or_default();
-    let vf = format!("fps={rate},scale={cell_width}:-2:flags=bilinear,{tone}tile={columns}x{rows}");
+    // A head-padded proxy opens with a clone of its first frame, which the original has no
+    // counterpart for: read from the very start (a seek to 0.000 keeps it) it would take a
+    // slot of its own and push every cell one over. Any later seek has skipped it already.
+    let unpad = if start < 0.0005 && is_head_padded_proxy(path) {
+        "trim=start_frame=1,"
+    } else {
+        ""
+    };
+    let vf = format!("{unpad}fps={rate},scale={cell_width}:-2:flags=bilinear,{tone}tile={columns}x{rows}");
     let args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
@@ -7337,6 +7405,10 @@ mod keyed_zoom;
 #[cfg(test)]
 mod keyed_channels;
 
+/// Scene detection and contact sheets on a proxy against the original (`#[ignore]`d).
+#[cfg(test)]
+mod scenes_on_proxy;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7746,6 +7818,54 @@ mod tests {
         let ok = probe_source_traits(&script("ok", &format!("echo '{json}'")), file, limit).expect("an answer");
         assert_eq!((ok.hdr, ok.indexed), (Some(Hdr::Pq), true));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_proxy_stands_in_for_an_sdr_mp4_or_matroska_source_and_for_nothing_else() {
+        let traits = |format: &str, transfer: &str| {
+            parse_source_traits(&format!(
+                r#"{{"streams":[{{"color_transfer":"{transfer}"}}],"format":{{"format_name":"{format}"}}}}"#
+            ))
+        };
+        let (yes, picture) = (
+            ProxyFidelity {
+                times: true,
+                scores: true,
+            },
+            ProxyFidelity {
+                times: true,
+                scores: false,
+            },
+        );
+        assert_eq!(fidelity_of(traits("mov,mp4,m4a,3gp,3g2,mj2", "bt709")), yes);
+        assert_eq!(fidelity_of(traits("matroska,webm", "")), yes);
+        // HDR: times hold, but the scores are taken in HLG / PQ code values and the proxy is SDR.
+        assert_eq!(fidelity_of(traits("mov,mp4,m4a,3gp,3g2,mj2", "arib-std-b67")), picture);
+        assert_eq!(fidelity_of(traits("matroska,webm", "smpte2084")), picture);
+        // A transport stream's proxy is `lead` off when its video starts late; the others are unproven.
+        for other in ["mpegts", "avi", "mpeg", "flv", "mxf", "h264"] {
+            assert_eq!(fidelity_of(traits(other, "bt709")), ProxyFidelity::default(), "{other}");
+        }
+        // A failed probe trusts nothing.
+        assert_eq!(fidelity_of(SourceTraits::default()), ProxyFidelity::default());
+    }
+
+    #[test]
+    fn a_contact_sheet_drops_the_head_pad_clone_when_it_reads_from_the_start_only() {
+        let padded = "/home/u/.cache/kerf/proxies/0123456789abcdef.lead.mp4";
+        let plain = "/home/u/.cache/kerf/proxies/0123456789abcdef.mp4";
+        let vf = |path: &str, start: f64| {
+            let (args, _) = build_contact_sheet_args(path, start, start + 8.0, 4, 2, 160, 3, None);
+            args[args.iter().position(|a| a == "-vf").unwrap() + 1].clone()
+        };
+        // A seek to 0.000 keeps pts 0, the clone with it: it would take a slot of its own.
+        assert!(vf(padded, 0.0).starts_with("trim=start_frame=1,fps="), "{}", vf(padded, 0.0));
+        assert!(vf(padded, 0.0004).starts_with("trim=start_frame=1,fps="));
+        // Any later seek has skipped it already, and dropping a frame there would drop a real one.
+        assert!(vf(padded, 0.5).starts_with("fps="));
+        // An ordinary proxy and an original have no clone: their argv is what it always was.
+        assert!(vf(plain, 0.0).starts_with("fps="));
+        assert!(vf("/media/clip.lead.mp4", 0.0).starts_with("fps="));
     }
 
     #[test]

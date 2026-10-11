@@ -99,6 +99,26 @@ so the feature is **only** activated through these forwards — which is what ma
   probe is added: `generate_proxy`'s own argv, and every argv in the golden oracle, is
   unchanged. `proxy_path` still costs the one cached `source_traits` probe of the *original*
   (it keys the file on HDR and the lead), as it did before.
+  **Whole-file analysis reads the proxy when one is ready** (never waited for: no file yet, "Always
+  original" or size Off, or a proxy that fails to read, and the original is read). Scene detection
+  (`detect_scenes_preferring(original, proxy, threshold)`, fed by `Project::scoring_proxy`) and a
+  contact sheet (`Project::sheet_proxy`) swap the path and nothing else, so no golden argv moves.
+  A proxy stands in for the file only where `proxy_fidelity` (the cached `source_traits`) says so:
+  **times** for an MP4 / MOV / Matroska / WebM source (a transport stream's pad is not fixed and
+  the rest are unproven), **scores** also for an SDR one. Measured on the pinned 9.0.2
+  (`cli/scenes_on_proxy.rs`, `#[ignore]`d): cut lists frame-exact for H.264, 10-bit HEVC, 4:2:2
+  HEVC, a late video (the `.lead` pad's clone scores 0, and so does the real first frame it
+  duplicates), a display-matrix portrait clip and variable-rate Matroska; the unpadded proxy of a
+  late video is `lead` early. What a proxy does move is a frame's *score*, by at most ~0.02 on SDR
+  (grain, compression), so a cut scored within that of the threshold can flip; each fixture asserts
+  its scores keep clear of it. HLG / PQ moves a score by 0.2 and more (the original is scored in
+  its code values, the proxy is tone-mapped), so an HDR source reads the original for scenes; a
+  sheet only looks, so it takes the proxy (tone-mapped once). FFmpeg 6 and older write a
+  constant-rate proxy, so a variable-rate source's cuts are within half a frame there. A sheet from
+  a `.lead` proxy prefixes `trim=start_frame=1` when it starts at 0.000 (a later seek has skipped the
+  clone), or the clone takes a slot and every cell shows its neighbour's frame. `salience_map`
+  (smart crop, framing) stays on the original: its crop moved by up to 4.6 % of the frame width
+  between original and proxy.
   **A proxy reports, can be abandoned, and cannot hang.** `generate_proxy_with(src, width,
   ProxyRun { reservation, duration, progress, cancel })` is `generate_proxy` with hooks (the
   latter is it with none): the encode runs through `run_ffmpeg_streamed`, which writes
@@ -623,7 +643,7 @@ so the feature is **only** activated through these forwards — which is what ma
   (a view of `source_traits`, one cached ffprobe per file) and append the chain
   after their own downscale.
   Salience and scene detection are analysis, not picture, and read the raw
-  frames. **The proxy is where preview footage is converted**: `generate_proxy`
+  frames of the original (scene detection reads an SDR source's proxy). **The proxy is where preview footage is converted**: `generate_proxy`
   tone-maps while it downsizes, `Project::preview_assets` hands the graph the
   proxy-swapped asset as `Asset::as_sdr_proxy` (same geometry, no HDR tags), and
   a file's proxy key gains `|sdr` when it is HDR, so a proxy cached before this
