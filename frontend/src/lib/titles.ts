@@ -5,8 +5,13 @@ export const MIN_TITLE = 0.1;
 /** Bounds a title's font height may be dragged between (the Inspector slider's range, widened). */
 export const TITLE_SIZE_MIN = 0.02;
 export const TITLE_SIZE_MAX = 0.3;
-/** `drawtext` lays a line out about this tall, as a multiple of `fontsize`. */
-export const LINE_HEIGHT = 1.17;
+/** The shipped default font's line height (Geist: ascender 1005 + descender 295 over 1000 units), as a
+ *  multiple of `fontsize`. The title handle and ghost use it when the title names no family: the
+ *  engine draws that with Geist, which the page has loaded as `'Geist Variable'`. A named family
+ *  takes its own (`line-height: normal`). */
+export const LINE_HEIGHT = 1.3;
+/** The family the engine draws a title with when it names none, or names one that is not installed. */
+export const DEFAULT_TITLE_FONT = "'Geist Variable'";
 /** `drawtext`'s `boxborderw`, in output pixels, drawn around the text when a box colour is set. */
 export const BOX_BORDER_PX = 12;
 /** Height the box padding is taken against when the project has no delivery frame. */

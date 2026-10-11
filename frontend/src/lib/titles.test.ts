@@ -1,5 +1,8 @@
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
+	LINE_HEIGHT,
 	boxPadding,
 	containRect,
 	retimeKeyframes,
@@ -12,6 +15,7 @@ import {
 	trimSpan,
 	withKeyframeAt
 } from './titles';
+import { SRC } from './test-sources';
 import type { TextOverlay } from './types';
 
 function overlay(patch: Partial<TextOverlay> = {}): TextOverlay {
@@ -174,5 +178,27 @@ describe('retimeKeyframes', () => {
 		expect(times).toEqual([...times].sort((a, b) => a - b));
 		expect(Math.max(...times)).toBeLessThanOrEqual(0.5);
 		expect(times.at(-1)).toBeCloseTo(0.4);
+	});
+});
+
+describe('the title handle follows the font the engine draws with', () => {
+	/** The line height the font file itself declares: (ascender - descender + lineGap) / unitsPerEm. */
+	function hheaLineHeight(file: string): number {
+		const d = readFileSync(join(SRC, '..', '..', 'crates/kerf-core/assets/fonts', file));
+		const v = new DataView(d.buffer, d.byteOffset, d.byteLength);
+		const tables = new Map<string, number>();
+		for (let i = 0; i < v.getUint16(4); i++) {
+			const at = 12 + 16 * i;
+			tables.set(String.fromCharCode(...d.subarray(at, at + 4)), v.getUint32(at + 8));
+		}
+		const head = tables.get('head')!;
+		const hhea = tables.get('hhea')!;
+		const upm = v.getUint16(head + 18);
+		return (v.getInt16(hhea + 4) - v.getInt16(hhea + 6) + v.getInt16(hhea + 8)) / upm;
+	}
+
+	test('LINE_HEIGHT is the shipped default font line height, regular and bold', () => {
+		expect(hheaLineHeight('Geist-Regular.ttf')).toBeCloseTo(LINE_HEIGHT, 6);
+		expect(hheaLineHeight('Geist-Bold.ttf')).toBeCloseTo(LINE_HEIGHT, 6);
 	});
 });
