@@ -926,6 +926,22 @@ export interface DeliveryCheck {
 	issues: DeliveryIssue[];
 }
 
+/** What a readiness check read off the cut (`kerf_core::CutSummary`): the frame and length the
+ *  file would have, which is not always the project's. */
+export interface CutSummary {
+	duration: number;
+	width: number;
+	height: number;
+	has_audio: boolean;
+	has_text: boolean;
+}
+
+/** `kerf_core::PlatformReport`: every target's check, with the cut they judged. */
+export interface PlatformReport {
+	cut: CutSummary;
+	targets: DeliveryCheck[];
+}
+
 /** Payload of the `export-progress` event streamed during a render. */
 export interface ExportProgress {
 	fraction: number;

@@ -1,105 +1,99 @@
 <script lang="ts">
-	// Where this cut is going: the platform limits it meets or misses. Judged at
-	// the frame a render will actually produce, which is not always the project's
-	// — a 9:16 project exported at 1920×1080 is a landscape file, and the panel
-	// has to say so — and re-judged as the cut changes, because the Deliver panel
-	// stays docked beside a timeline that is being edited.
+	// The platform check: whether the file about to be written will do where it is going. It is
+	// judged at the frame and length a render will actually produce — which are not always the
+	// project's: a 9:16 project exported at 1920×1080 is a landscape file, and a marked In → out
+	// is only that long — and re-judged as the cut changes, because the Deliver panel stays docked
+	// beside a timeline that is being edited. What it says, and when it says nothing, is
+	// `platform-verdict.ts`; the caller decides whether the export is one it speaks about at all.
 	//
 	// Renders nothing until the backend has answered, heading included.
 	import Icon from './Icon.svelte';
 	import SectionHead from './SectionHead.svelte';
 	import { editor } from '$lib/state.svelte';
+	import { ui } from '$lib/editor-ui.svelte';
 	import { platformCheck } from '$lib/api';
-	import { ratioLabel } from '$lib/delivery-formats';
-	import type { DeliveryCheck } from '$lib/types';
+	import { VARIANT_PRESETS } from '$lib/delivery-formats';
+	import { platformVerdict, type Verdict, type VerdictLevel } from '$lib/platform-verdict';
 
-	/** The frame the render will produce; `null` is the project's own. */
-	let { frame = null, heading = 'Where it is going' }: { frame?: [number, number] | null; heading?: string } =
-		$props();
+	/** The frame the render will produce, `null` for the project's own; `range` the span it writes. */
+	let {
+		frame = null,
+		range = null,
+		heading = 'Platform check'
+	}: { frame?: [number, number] | null; range?: { start: number; end: number } | null; heading?: string } = $props();
 
-	let checks = $state<DeliveryCheck[]>([]);
+	let verdict = $state<Verdict | null>(null);
 	let seq = 0;
 	$effect(() => {
 		void editor.timeline;
-		const f = frame ?? null;
+		const f: [number, number] | null = frame ? [frame[0], frame[1]] : null;
+		const r = range ? { start: range.start, end: range.end } : null;
+		const ticked = VARIANT_PRESETS.filter((p) => ui.deliverShapes.includes(p.id));
+		const format = editor.timeline.format;
+		const own = f === null || (format != null && format.width === f[0] && format.height === f[1]);
 		const mine = ++seq;
-		platformCheck(f)
-			.then((c) => {
-				if (mine === seq) checks = c;
+		const answers = ticked.length
+			? Promise.all(
+					ticked.map(async (p) => ({
+						label: p.label,
+						report: await platformCheck([p.format!.width, p.format!.height], r)
+					}))
+				).then((shapes) => ({ file: null, project: null, shapes }))
+			: Promise.all([platformCheck(f, r), own || !format ? null : platformCheck(null, r)]).then(([file, project]) => ({
+					file,
+					project,
+					shapes: []
+				}));
+		answers
+			.then((input) => {
+				if (mine === seq) verdict = platformVerdict(input);
 			})
 			.catch(() => {
-				if (mine === seq) checks = [];
+				if (mine === seq) verdict = null;
 			});
 	});
 
-	/** Targets with nothing but tips against them. */
-	const readyFor = $derived(checks.filter((c) => !c.issues.some((i) => i.severity !== 'tip')));
-	/** Everything specific enough to be worth its own line — which is everything
-	 *  except the shape complaint, since a landscape cut earns one of those from
-	 *  every vertical feed and four near-identical lines say nothing four times. */
-	const notes = $derived(
-		checks.flatMap((c) =>
-			c.issues.filter((i) => i.severity !== 'tip' && i.kind !== 'shape').map((i) => ({ label: c.label, ...i }))
-		)
-	);
-	/** The targets this frame would be letterboxed on, collapsed to one line. */
-	const wrongShape = $derived(checks.filter((c) => c.issues.some((i) => i.kind === 'shape')).map((c) => c.label));
-	/** The frame this render will actually produce, as a ratio. */
-	const cutRatio = $derived.by(() => {
-		const r = frame ?? (editor.timeline.format ? [editor.timeline.format.width, editor.timeline.format.height] : null);
-		return r ? ratioLabel(r[0], r[1]) : null;
-	});
-	/** The tips, deduplicated — the same advice lands on every target. */
-	const tips = $derived([
-		...new Set(checks.flatMap((c) => c.issues.filter((i) => i.severity === 'tip').map((i) => i.message)))
-	]);
-
-	function listLabels(labels: string[]): string {
-		if (labels.length < 2) return labels.join('');
-		return `${labels.slice(0, -1).join(', ')} and ${labels[labels.length - 1]}`;
-	}
+	const ICON: Record<VerdictLevel, string> = { ok: 'check', note: 'info', warning: 'alert-triangle', error: 'x' };
+	const COLOR: Record<VerdictLevel, string> = {
+		ok: 'var(--success)',
+		note: 'var(--text-muted)',
+		warning: 'var(--warning)',
+		error: 'var(--danger)'
+	};
 </script>
 
-{#if checks.length}
+{#if verdict}
 	<SectionHead label={heading} />
 	<div
-		style="padding:8px 10px;border-radius:var(--radius-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-subtle);display:flex;flex-direction:column;gap:6px"
+		style="padding:8px 10px;border-radius:var(--radius-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-subtle);display:flex;flex-direction:column;gap:8px"
 	>
-		{#if readyFor.length}
-			<div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--success)">
-				<Icon n="check" s={13} color="var(--success)" />
-				<span>Ready for {readyFor.map((c) => c.label).join(' · ')}</span>
-			</div>
-		{/if}
-		{#each notes as note, i (i)}
-			<div style="display:flex;align-items:flex-start;gap:6px;font-size:12px;line-height:1.45">
-				<span style="flex:none;margin-top:1px">
-					<Icon
-						n={note.severity === 'error' ? 'x' : 'alert-triangle'}
-						s={13}
-						color={note.severity === 'error' ? 'var(--danger)' : 'var(--warning)'}
-					/>
-				</span>
-				<span style="color:var(--text-secondary)">
-					<span style="color:var(--text-primary);font-weight:600">{note.label}</span>
-					— {note.message}
-				</span>
+		{#each verdict.groups as group, g (g)}
+			<div style="display:flex;align-items:flex-start;gap:8px">
+				{#if group.shape}
+					<span
+						style="flex:none;width:36px;font-family:var(--font-mono);font-size:12px;line-height:1.45;color:var(--text-secondary)"
+						>{group.shape}</span
+					>
+				{/if}
+				<div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:5px">
+					{#each group.lines as line, l (l)}
+						<div style="display:flex;align-items:flex-start;gap:6px;font-size:12px;line-height:1.45">
+							<span style="flex:none;margin-top:1px"><Icon n={ICON[line.level]} s={13} color={COLOR[line.level]} /></span>
+							<span style="color:{line.level === 'ok' ? 'var(--success)' : 'var(--text-secondary)'}">{line.text}</span>
+						</div>
+					{/each}
+				</div>
 			</div>
 		{/each}
-		{#if wrongShape.length}
-			<div style="display:flex;align-items:flex-start;gap:6px;font-size:12px;line-height:1.45">
-				<span style="flex:none;margin-top:1px"><Icon n="alert-triangle" s={13} color="var(--warning)" /></span>
-				<span style="color:var(--text-secondary)">
-					{#if cutRatio}A {cutRatio} cut is letterboxed on{:else}This frame is letterboxed on{/if}
-					{listLabels(wrongShape)}. Pick a delivery frame in the toolbar to cut for one of them.
-				</span>
-			</div>
-		{/if}
-		{#if tips.length}
+		{#if verdict.tips.length}
 			<details>
-				<summary style="cursor:pointer;font-size:12px;color:var(--text-muted)">{tips.length} tip{tips.length === 1 ? '' : 's'}</summary>
-				{#each tips as tip (tip)}
-					<div style="display:flex;align-items:flex-start;gap:6px;margin-top:6px;font-size:12px;line-height:1.45;color:var(--text-muted)">
+				<summary style="cursor:pointer;font-size:12px;color:var(--text-muted)"
+					>{verdict.tips.length} tip{verdict.tips.length === 1 ? '' : 's'}</summary
+				>
+				{#each verdict.tips as tip (tip)}
+					<div
+						style="display:flex;align-items:flex-start;gap:6px;margin-top:6px;font-size:12px;line-height:1.45;color:var(--text-muted)"
+					>
 						<span style="flex:none;margin-top:1px"><Icon n="lightbulb" s={13} color="var(--text-muted)" /></span>
 						<span>{tip}</span>
 					</div>

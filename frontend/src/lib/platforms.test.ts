@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { check, checkAll, fmtDur, TARGETS } from './platforms';
+import { check, checkAll, fmtDur, report, TARGETS, within } from './platforms';
 import type { CutSummary } from './platforms';
 
 const target = (id: string) => TARGETS.find((t) => t.id === id)!;
@@ -33,6 +33,12 @@ describe('check', () => {
 		expect(c.issues[0].severity).toBe('error');
 		expect(c.issues[0].message).toContain('3:00');
 		expect(c.issues[0].message).toContain('0:20');
+	});
+
+	test('a name ending in s takes a bare apostrophe', () => {
+		expect(check(target('shorts'), vertical(200)).issues[0].message).toContain("YouTube Shorts' 3:00 limit");
+		expect(check(target('reels'), vertical(2)).issues[0].message).toContain("Instagram Reels' 3s minimum");
+		expect(check(target('tiktok'), vertical(70 * 60)).issues[0].message).toContain("TikTok's 60:00 limit");
 	});
 
 	test('over the reach limit is a warning, not a rejection', () => {
@@ -71,5 +77,36 @@ describe('check', () => {
 
 	test('an empty timeline is rejected everywhere', () => {
 		expect(checkAll({ ...vertical(0), duration: 0 }).every((c) => !c.ok)).toBe(true);
+	});
+});
+
+describe('within', () => {
+	// Mirrors the Rust tests of `CutSummary::within`.
+	test('a range is judged at its own length', () => {
+		const cut = vertical(4 * 60);
+		const span = within(cut, { start: 10, end: 30 });
+		expect(span.duration).toBe(20);
+		expect([span.width, span.height]).toEqual([cut.width, cut.height]);
+		expect(check(target('reels'), span).issues).toEqual([]);
+		expect(check(target('reels'), cut).issues).not.toEqual([]);
+	});
+
+	test('a range is clamped to the cut the way the export clamps it', () => {
+		const cut = vertical(60);
+		expect(within(cut, { start: -5, end: 20 }).duration).toBe(20);
+		expect(within(cut, { start: 40, end: 500 }).duration).toBe(20);
+		expect(within(cut, { start: 10, end: 10 }).duration).toBe(60);
+		expect(within(cut, { start: 30, end: 10 }).duration).toBe(60);
+		expect(within(cut, { start: 90, end: 120 }).duration).toBe(60);
+		expect(within(cut, null).duration).toBe(60);
+	});
+});
+
+describe('report', () => {
+	test('carries the cut it judged beside every target', () => {
+		const r = report(vertical(45));
+		expect([r.cut.width, r.cut.height, r.cut.duration]).toEqual([1080, 1920, 45]);
+		expect(r.targets).toHaveLength(TARGETS.length);
+		expect(r.targets[0].target).toBe('reels');
 	});
 });

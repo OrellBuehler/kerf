@@ -13,6 +13,7 @@
 	import { toast } from '$lib/notifications.svelte';
 	import { formatsFor, hasPicture } from '$lib/delivery-formats';
 	import { frameKey, restoreDraft } from '$lib/export-draft';
+	import { judgeable } from '$lib/platform-verdict';
 	import type { RowSpec } from '$lib/slider-row';
 	import type { Container, ExportOptions, Fit, RateControl } from '$lib/types';
 	import { exportedLine, failure } from '$lib/failure-copy';
@@ -143,6 +144,7 @@
 	const summary = $derived(buildSummary(opts, hasVideo, hasAudio));
 	const command = $derived(buildCommandPreview(opts, hasVideo, hasAudio, outputPath || undefined));
 	const showVideo = $derived(!info.audioOnly && hasVideo);
+	const judged = $derived(judgeable(opts, editor.timeline));
 	// Shapes only mean something for a picture: an audio-only render ignores
 	// whatever the Deliver panel had ticked.
 	const variantFormats = $derived(showVideo ? formatsFor(ui.deliverShapes) : []);
@@ -445,9 +447,9 @@
 			<DeliverTo {outputPath} ext={info.ext} />
 		{/if}
 
-		<!-- where this is going (per file when several are being written) -->
-		{#if !variantFormats.length}
-			<Readiness frame={opts.resolution ?? null} />
+		<!-- the platform check: a video export's only (not audio, a GIF or an empty cut), per file when several are written -->
+		{#if judged}
+			<Readiness frame={opts.resolution ?? null} range={useRange ? marks : null} />
 		{/if}
 
 		<details bind:open={showAdvanced} style="margin-top:12px;border-top:var(--line-width) solid var(--border-default)">

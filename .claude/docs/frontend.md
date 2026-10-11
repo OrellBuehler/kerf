@@ -348,14 +348,14 @@ second row rather than clip
 (its "Timeline" caption is gone — the dock tab says it); New / Open / Save / Export and
 Panels are the File and Window menus. `menus.test.ts` holds each of those paths, and
 that no entry of the old toolbar lost its place.
-The **Deliver panel** (`DeliverPanel.svelte`) docks the export dialog's readiness
-verdict and *Deliver to* shapes, extracted into `Readiness` / `DeliverTo` /
+The **Deliver panel** (`DeliverPanel.svelte`) docks the export dialog's platform
+check and *Deliver to* shapes, extracted into `Readiness` / `DeliverTo` /
 `SectionHead` which the dialog uses too — no fork. The shape choice and the
 smart-crop toggle live on `ui` (`deliverShapes`, `deliverSmartCrop`) because both
 places edit them (session-global, so a shape ticked in the panel is ticked when the
-dialog opens), and both components re-judge on every `editor.timeline` change
+dialog opens), and `Readiness` re-judges on every `editor.timeline` change
 (docked beside a timeline being edited, a verdict cached at tick time goes
-stale), keeping the newest answer. Shapes are for a picture, so the panel hides
+stale), keeping the newest answer. Shapes and the platform check are for a picture, so the panel hides
 them, and the button never says "Export N files", for a cut with no video clip
 (`hasPicture`, the same gate the dialog uses). The render still goes through the full dialog
 (`ui.openExport()`); the panel shows its progress and Stop while one runs.
@@ -484,7 +484,7 @@ Settings › Preview or the preview context menu, which both write the same
 persisted `Settings.safe_areas` — it is held process-wide in `settings.rs`
 rather than in the engine, since nothing in kerf-core cares about it). The export dialog's "Source" resolution relabels to
 **Project frame (WxH)** so the two surfaces cannot silently disagree. The dialog
-is **preset → destination → picture → sound → where it is going** (the preset select is grouped Video / Social / Master / Audio, each described in a plain sentence of what you get and what it costs — `presetsByGroup`), with a
+is **preset → destination → picture → sound → deliver to → platform check** (the preset select is grouped Video / Social / Master / Audio, each described in a plain sentence of what you get and what it costs — `presetsByGroup`), with a
 `Quality` select of three named CRF points (Smaller file / Balanced / Higher
 quality, derived from the codec's CRF range) standing in for the encoder; the
 codec, rate control, tune/profile/pixel format, audio codec and container knobs
@@ -503,14 +503,31 @@ a remembered 9:16 preset must not open on a 16:9 cut — and dropped by `ui.proj
 project is opened or created), and a click on the scrim does not close the
 dialog (Esc, Cancel and ✕ do). The frame-rate select is `frameRateOptions(fps)`: `FRAME_RATES`
 (15 / 12 / 10 are the GIF's) plus the current value when the list lacks it, never a blank select.
-The **readiness panel** stays visible
-(only its tips fold): "Ready for Instagram Reels · YouTube Shorts ·
-TikTok", then any length errors / reach warnings one line each, then a *single*
-collapsed line for shape ("A 16:9 cut is letterboxed on … Pick a delivery frame
-in the toolbar") — grouped by `IssueKind`, because otherwise four vertical feeds
-each say the same thing. It re-checks against `opts.resolution`, so a 9:16
-project exported at 1920×1080 is judged as the landscape file it will be.
-`kerf_core::platform` decides all of it; `src/lib/platforms.ts` is a bun-tested
+The **Platform check** (`Readiness`, over the pure `platform-verdict.ts`) is for a *video
+export of a cut with a picture* and says nothing otherwise: `judgeable` is false for audio
+containers, a GIF and a cut with no video clip, and the verdict is `null` for a cut with
+no length (the dialog and the Deliver panel both gate on it). With **no shape ticked** it is
+one neutral line stating the file and where it already fits — "1920×1080, 16:9, 0:20. Fine for
+YouTube and the web. Tick a shape under Deliver to for Reels, Shorts or TikTok." (the length floored
+like the timeline's clock; the platforms are the ones whose check had no `shape` issue at that
+frame, so a 1:1 cut is "fine for YouTube Shorts and Instagram feed" and never told it is
+letterboxed) — and amber / red appear only for a *length* limit of a platform that frame is made for
+(the reach warning, the hard cap, the minimum). A low resolution and the muted-feed captions tip
+are folded tips, never amber (the captions tip is not given for YouTube). With **shapes ticked**
+each file is a row ("9:16 · Ready for Instagram Reels · YouTube Shorts · TikTok", then its length
+problems), judged only for the platforms that take that shape, and the single-file line is gone.
+The one shape sentence — "Instagram Reels, YouTube Shorts and TikTok are vertical (9:16). This 16:9
+cut would be letterboxed. Tick 9:16 under Deliver to to export a vertical version." — appears only
+when the *project* is cut for a shape and the file the options write is wider (a 9:16 project sent
+through "Web 1080p"), naming the platforms that frame is for; a landscape project exported 9:16 is
+a reframe the user asked for and says nothing. The check is judged at the frame the render
+will produce (`opts.resolution`, else the project's) and the length it will write (the marked In → out
+when chosen): `platform_check(width, height, range)` answers a `PlatformReport` — the targets *and*
+the `CutSummary` they judged, so the line states the file's real frame and length, not a second reading.
+There are no size rules: `kerf_core::platform` has length and shape limits only (TikTok's 500 MB / 2 GB
+caps are prose in its `notes`), so a size warning would need an engine estimate first.
+`kerf_core::platform` decides what each platform accepts; `platform-verdict.ts` only decides which of
+its answers to show. `src/lib/platforms.ts` is a bun-tested
 mirror used **only** by the browser harness, so the panel is drivable under
 `bun run dev`. `src/lib/smart-crop.ts` is the same arrangement for smart crop: only
 the *shape* arithmetic is mirrored (bun-tested), because the harness has no decoder
@@ -589,13 +606,13 @@ a loudness target, and a **Range: In → out** choice when marks are set. It **o
 the frame the project is cut for** (`initialExport`): the preset whose resolution is
 that frame when one matches, else the default preset with its resolution cleared so
 "Project frame" renders — otherwise a 9:16 project opened its export already
-landscape and the readiness panel warned about the shape the user had just chosen.
+landscape and the platform check warned about the shape the user had just chosen.
 Its **Deliver to** section is the multi-format export: shape chips (the
 `DELIVERY_PRESETS` minus Source) that each add a file beside the chosen path
 named by shape (`variantPath`, the bun-tested mirror of
 `ExportVariant::beside`), a *Smart crop each shot for every shape* toggle, and a
-per-file readiness line judged at that file's frame (`platformCheck([w, h])`),
-in place of the single panel — with shapes picked, the Scaling rows hide (each
+per-file row in the platform check judged at that file's frame (`platformCheck([w, h])`),
+in place of the single-file line — with shapes picked, the Scaling rows hide (each
 delivery brings its own resolution and fit) and the button reads `Export N
 files`; `export-progress` then carries `variant` / `total`. The
 **Transcript tab** of the library (`TranscriptPanel.svelte`, over the pure, bun-tested

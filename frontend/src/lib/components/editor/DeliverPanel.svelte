@@ -1,6 +1,6 @@
 <script lang="ts">
 	// The Deliver workspace's panel: where the cut is going, and the shapes to
-	// write it in. It is the export dialog's readiness verdict and its "Deliver
+	// write it in. It is the export dialog's platform check and its "Deliver
 	// to" choice, docked beside the preview — the same components, reading the
 	// same `ui.deliverShapes`, so a shape ticked here is ticked in the dialog.
 	// The render itself still goes through the full dialog (preset, destination,
@@ -51,7 +51,7 @@
 
 		{#if !hasClips}
 			<div style="margin-top:14px;font-size:12px;color:var(--text-muted);line-height:1.45">
-				Nothing to deliver yet — add a clip to the timeline and this panel judges the cut against each platform.
+				Nothing to deliver yet — add a clip to the timeline and this panel checks it for the platforms you deliver to.
 			</div>
 		{/if}
 
@@ -60,7 +60,7 @@
 			<DeliverTo where="named by shape beside the file you choose when you export, as" />
 		{/if}
 
-		{#if !shapes.length}
+		{#if picture}
 			<Readiness />
 		{/if}
 	</div>
