@@ -21,7 +21,8 @@
 | PERF-5 AMF/VAAPI export encode | perf-5 | #142 | merged | gpu-media WP4, WP5, WP11 | wave 4 |
 | macOS presenter (WP-8) | macos-presenter | #141 | merged | gpu-compositor WP-8 | dev done: main-thread surface hop on macOS (step 1 could never work: raw-window-metal needs the main thread), plan + acceptance list in app.md; macOS default unchanged |
 | GPU-6 Keyed zoom, masks, blur | gpu-6 (on gpu-4 ea0d186) | | r1 fixes (no blockers) | gpu-compositor WP-6 | dev done: T3 Still 83.3→100%, Motion 16.6→100%; masks exact (geq f64 plane, cached), grayscale/invert/sharpen exact, blur ≤1 level; found FFmpeg 6.1 geq edge read (probed); mask still 847→371 ms at 960 px on CPU adapter |
-| GPU-5, GPU-7 | | | todo | | wave 4; GPU-5 overlaps PERF-4 (gpu_preview / frame_source), GPU-7 needs GPU-4/5 |
+| GPU-5 Scrub at GPU speed + hardening | gpu-5 (on main fec0368) | | dev | gpu-compositor WP-5 | |
+| GPU-7 | | | todo | | wave 4; GPU-5 overlaps PERF-4 (gpu_preview / frame_source), GPU-7 needs GPU-4/5 |
 | CI: retry + cache ffmpeg download | ci-fetch-retry | #131 | closed (landed via #130) | not a review finding | evermeet.cx throttles the macOS pinned-ffmpeg fetch (ffprobe 429 for 6.5+ min); retry + actions/cache ported into #129, #130, #132; cache fills only after one successful run |
 
 ## Decisions
