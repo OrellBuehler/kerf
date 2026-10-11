@@ -731,6 +731,8 @@ struct Backend {
     compositor: Arc<Compositor>,
     source: Arc<FrameSource>,
     gpu: Arc<Gpu>,
+    /// What the self-test's verdict is about, made when the backend is.
+    adapter: AdapterKey,
     host: Arc<Mutex<Host>>,
 }
 
@@ -740,6 +742,7 @@ struct Drawing {
     compositor: Arc<Compositor>,
     source: Arc<FrameSource>,
     gpu: Arc<Gpu>,
+    adapter: AdapterKey,
     host: Arc<Mutex<Host>>,
 }
 
@@ -1472,14 +1475,13 @@ impl GpuPreview {
 
     /// May the GPU draw on `gpu`'s adapter? The first frame that asks starts the parity self-test on
     /// a thread of its own and is FFmpeg's, as is every frame until the verdict.
-    fn gate(&self, gpu: &Arc<Gpu>) -> Result<(), Reason> {
-        let key = AdapterKey::of(gpu);
-        match self.check.gate(&key) {
+    fn gate(&self, gpu: &Arc<Gpu>, key: &AdapterKey) -> Result<(), Reason> {
+        match self.check.gate(key) {
             Gate::Open => Ok(()),
             Gate::Wait(why) => Err(Reason::new("self_test_pending", why)),
             Gate::Closed(why) => Err(Reason::new("self_test_failed", why)),
             Gate::Begin(why) => {
-                self.begin_check(key, Arc::clone(gpu));
+                self.begin_check(key.clone(), Arc::clone(gpu));
                 Err(Reason::new("self_test_pending", why))
             }
         }
@@ -1581,6 +1583,7 @@ impl GpuPreview {
                     compositor: Arc::clone(&b.compositor),
                     source: Arc::clone(&b.source),
                     gpu: Arc::clone(&b.gpu),
+                    adapter: b.adapter.clone(),
                     host: Arc::clone(&b.host),
                 },
                 None => {
@@ -1612,7 +1615,7 @@ impl GpuPreview {
             return Attempt::Fallback(reasons.iter().map(|r| Reason::new(r.kind(), r.to_string())).collect());
         }
         // The GPU draws nothing the user looks at before it has been checked against this FFmpeg.
-        if let Err(reason) = self.gate(&drawing.gpu) {
+        if let Err(reason) = self.gate(&drawing.gpu, &drawing.adapter) {
             self.hide();
             return Attempt::Fallback(vec![reason]);
         }
@@ -2008,6 +2011,7 @@ fn build_backend(app: &tauri::AppHandle, technique: Technique) -> Result<Backend
         screen: Box::new(presenter),
         compositor: Arc::new(compositor),
         source,
+        adapter: AdapterKey::of(&gpu),
         gpu,
         host: Arc::new(Mutex::new(host)),
     })

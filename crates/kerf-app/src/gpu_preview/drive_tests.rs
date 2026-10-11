@@ -156,6 +156,7 @@ pub(super) fn preview_on(log: &Arc<Mutex<ScreenLog>>, gpu: Arc<Gpu>) -> GpuPrevi
             screen: Box::new(NullScreen { log: Arc::clone(&log) }),
             compositor: Arc::new(Compositor::new(Arc::clone(&gpu)).map_err(|e| e.to_string())?),
             source: FrameSource::new(FrameSourceConfig::default()),
+            adapter: AdapterKey::of(&gpu),
             gpu: Arc::clone(&gpu),
             host: Arc::new(Mutex::new(Host::Null)),
         })

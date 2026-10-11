@@ -14,29 +14,33 @@
 //! device after a loss keeps it, one rebuilt on another adapter is checked again.
 //! `KERF_GPU_SELFTEST=off` skips the check (a developer's escape hatch; it is logged).
 
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use kerf_gpu::{Gpu, SelfTestError, SelfTestReport};
 
 /// The adapter and the FFmpeg a verdict is about.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdapterKey(String);
+pub struct AdapterKey(Arc<str>);
 
 impl AdapterKey {
+    /// Built once per backend and carried with it: a frame only clones the handle.
     pub fn of(gpu: &Gpu) -> Self {
         let info = gpu.adapter_info();
-        Self(format!(
-            "{} | {:?} | {} | {}",
-            info.name,
-            info.backend,
-            info.driver_info,
-            kerf_core::ffmpeg_path()
-        ))
+        Self(
+            format!(
+                "{} | {:?} | {} | {}",
+                info.name,
+                info.backend,
+                info.driver_info,
+                kerf_core::ffmpeg_path()
+            )
+            .into(),
+        )
     }
 
     #[cfg(test)]
     pub fn named(name: &str) -> Self {
-        Self(name.to_string())
+        Self(name.into())
     }
 }
 
