@@ -53,11 +53,11 @@ performs, step 2 is not needed.
   (`follow`; `hide` = `setHidden`; `release` = `removeFromSuperview` and drop the layer).
 * **Scale:** `contentsScale` = `backingScaleFactor` at creation and on
   `NSWindowDidChangeBackingPropertiesNotification`; `drawableSize` through `Presenter::resize`.
-* **Occlusion:** wgpu's guard finds the window through the layer's delegate. A layer in a
-  layer-hosting view has none up its chain, so the guard is skipped and `nextDrawable` can stall
-  (wgpu issue 8309). Own it: observe `NSWindowDidChangeOcclusionStateNotification` and hide /
-  skip frames, and put a watchdog on the present (`attempt` holds the render lock while
-  presenting).
+* **Occlusion:** wgpu's guard finds the window by walking `superlayer()` up to the first ancestor
+  with a delegate. A layer in a layer-hosting view may have none up its chain, so the guard may be
+  skipped and `nextDrawable` can stall (wgpu issue 8309). Own it: observe
+  `NSWindowDidChangeOcclusionStateNotification` and hide / skip frames, and put a watchdog on the
+  present (`attempt` holds the render lock while presenting).
 * **Frame math (pure; write it first, with its table, beside `layout_for`).** The rectangle is
   webview device pixels, top-left origin. `r = scaled(rect, viewport, inner_size)` (as
   `Technique::Window` does), then `frame_pt = (r.x/s, H_pt - (r.y + r.h)/s, r.w/s, r.h/s)` with
