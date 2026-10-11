@@ -117,18 +117,47 @@ so the feature is **only** activated through these forwards — which is what ma
   proxies were hardware-encoded, which stops at 4096 across; the cap stays). The width is in the
   key, so each size is its own file. `remove_proxy_files(src, width)` deletes a proxy and its sidecar.
   **GPU acceleration**: `hw_encoders()` probes once per process which hardware
-  encoders (NVENC / QSV / VideoToolbox / AMF) this ffmpeg can *actually* use —
-  each compiled-in candidate is verified with a one-frame test encode, because
-  `-encoders` listing alone is not proof (`KERF_HW_ENCODE=none` disables). The
-  list is surfaced as the `hw_encoders` Tauri command and the
-  `export_capabilities` MCP tool, and the export dialog merges the verified ones
-  into its codec choices. **Proxies never encode in hardware**: `generate_proxy_with` always
-  runs `libx264 -g 1`, with hardware *decode* only. Measured on a 7900 XT, 4K HEVC10 to 720p
-  all-intra, 8 s: `d3d11va` + x264 1.90 s / 1.0 CPU-s against `d3d11va` + AMF 1.85 s / 0.56 CPU-s —
-  the same wall time — while AMF proxies were a third larger (7.35 vs 5.54 MB) and one refusal
-  turned hardware encode off for every later proxy and stitch. Stitching takes the first verified
-  hevc encoder and falls back to libx264 on any failure (one such failure disables HW encode for
-  the process, `HW_ENCODE_OK`, which only a stitch now sets). Background
+  encoders this ffmpeg can *actually* use — each compiled-in candidate is verified with a one-frame
+  test encode, because `-encoders` listing alone is not proof (`KERF_HW_ENCODE=none` disables).
+  Candidates are `HW_ENCODER_CANDIDATES` (NVENC, QSV, VideoToolbox, AMF incl. `av1_amf`; they take
+  system-memory frames) then `VAAPI_ENCODER_CANDIDATES`. One thread probes each vendor, its
+  encoders one at a time (consumer NVENC counts sessions), and a probe still running at 20 s is
+  killed and ends its family or render node (`run_probe`, `Probe::Hung`). The list is surfaced as
+  the `hw_encoders` Tauri command and the `export_capabilities` MCP tool, and the export dialog
+  merges the verified ones into its codec choices (plus a **Fast (GPU)** preset, frontend.md).
+  **Proxies never encode in hardware**: `generate_proxy_with` always runs `libx264 -g 1`, with
+  hardware *decode* only. Measured on a 7900 XT, 4K HEVC10 to 720p all-intra, 8 s: `d3d11va` + x264
+  1.90 s / 1.0 CPU-s against `d3d11va` + AMF 1.85 s / 0.56 CPU-s — the same wall time — while AMF
+  proxies were a third larger (7.35 vs 5.54 MB) and one refusal turned hardware encode off for every
+  later proxy and stitch. `HW_ENCODE_OK` is now the Insta360 stitch's alone, which still takes the
+  first verified HEVC hardware encoder (the frame is too wide for H.264 NVENC) and falls back to
+  libx264.
+  **Export on AMF** (`push_video_opts`): the constant QP is `hw_qp(vc, crf)` — CRF + 6 clamped to
+  `qp_i`'s 0..51 for H.264 / HEVC, CRF x 4 clamped to 255 for `av1_amf` — and `-quality quality`
+  is always asked for. Source: the media review's 4K HEVC10 to 1080p30, 8 s SDR render on a Radeon RX
+  7900 XT, scored against a lossless render of the same graph (PSNR of noisy synthetic content, not
+  perception): x264 medium CRF 20 5.59 MB / 45.1 dB; `h264_amf` QP 20 (the old 1:1 spelling)
+  10.7 MB / 48.9 dB (1.9x the bytes); QP 26 5.31 MB / 45.5 dB, 5.21 MB with `-quality quality`;
+  `hevc_amf` QP 26 5.56 MB / 46.1 dB; `av1_amf` QP 90 6.41 MB / 46.4 dB. The AV1 slope (4 per CRF step:
+  the SVT-AV1 0..63 scale on 0..255) is one measured point plus the scale, and **unconfirmed**; so
+  is the H.264 / HEVC offset on real footage (VMAF), which is why x264 stays every default and
+  "Fast (GPU)" is opt-in. NVENC (`-cq`), QSV (`-global_quality`) and VideoToolbox (`-q:v`) are
+  unchanged and unmeasured. The stitch's `quality_args` keeps AMF 1:1 (a source that is decoded
+  again). `-profile:v baseline` is not an AMF name (the dialog offered it): the list is
+  `constrained_baseline`, `main`, `high`.
+  **VAAPI export** (`h264/hevc/av1_vaapi`; Linux AMD / Intel): VAAPI encoders take only frames on
+  the device, so `build_export_args` names `-vaapi_device` (the stand-in `VAAPI_DEFAULT_DEVICE`; the
+  builder stays pure) and `build_filter_complex` ends the picture in
+  `[vhw]format=nv12,hwupload[outv]` (after the titles; no `-pix_fmt`; validation refuses anything
+  but 8-bit 4:2:0). At **spawn** `tune_export_args` swaps in the render node the probe verified
+  (`set_vaapi_device`; `/dev/dri/renderD*`, up to four, or `KERF_VAAPI_DEVICE`; the first node on
+  which any VAAPI encoder encodes a frame wins). Rate control is `-rc_mode CQP -global_quality
+  hw_qp(crf)` (`-qp` does not exist on `av1_vaapi`), lossless `global_quality 1`; the offset is the
+  AMD one, unmeasured on VAAPI. Stitching and proxies never see VAAPI (their graphs have no upload).
+  Unconfirmed without a GPU: that the upload and an encode run at all (the graph is rendered with
+  the upload taken out, `#[ignore]`d), the `/dev/dri` access of an AppImage or Flatpak, and the
+  distro's `libva` / driver packages — a build without `libva` aborts the probe, which reads as no
+  VAAPI. Background
   decodes (proxy, stitch, scene detection, the composited still) use the same
   `-hwaccel` (default `auto`, `KERF_HWACCEL=none` to disable) with a learned
   software fallback shared with the preview path (`disable_decode_hwaccel()` is how a

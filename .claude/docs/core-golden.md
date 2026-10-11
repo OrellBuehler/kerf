@@ -10,9 +10,12 @@
   per-property channels (`channels_for`: colour numbers, a volume, some transform numbers keyed beside
   the rest, a number taken off a legacy bundle or held static by an empty track — on its own dice
   seeded by case and clip, so `0..4800` are the digests the commit before channels gave; coverage
-  families `colour-keyed-*`, `volume-keyed*`, `channel-*`), have their
+  families `colour-keyed-*`, `volume-keyed*`, `channel-*`) and **400 more** with an AMF or VAAPI
+  encoder (`hw_encoder_for`, by index: `h264/hevc/av1_amf` and `h264/hevc/av1_vaapi`, which exist
+  nowhere in the first 5600; families `codec-amf-av1`, `codec-vaapi-*`, `rate-amf-quality`,
+  `rate-vaapi-*`, `vaapi-device`, `vaapi-upload`), have their
   `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
-  FNV-1a digests, committed as 56 block digests each in
+  FNV-1a digests, committed as 60 block digests each in
   `engine/cli/golden/{export,still,preview}.txt` (LF: `.gitattributes`, and the comparison
   ignores `\r`). A refactor of the graph builders must leave all three untouched; an
   intended argv change moves the files of the builders it touched. (`build_proxy_args` and
@@ -73,3 +76,10 @@
 - **Sample-exact `adelay`** (a clip starting between milliseconds is delayed by samples)
   re-blessed `export.txt` alone: 2718 of 4800 cases moved, exactly the new
   `audio-delay-samples` family (`S:all=1`); still and preview carry no sound.
+- **The hardware-encoder round** (AMF recalibrated, `-quality quality`, VAAPI): `export.txt`
+  re-blessed, `still.txt` / `preview.txt` only gained the four appended block lines. Of the first
+  5600 cases exactly 282 export digests moved (`KERF_GOLDEN_CASES` before / after) — every case whose
+  argv holds `-c:v h264_amf` (140) or `hevc_amf` (142), the families `codec-amf-h264` / `codec-amf`
+  (`KERF_GOLDEN_FAMILIES`) — and no other: no still, no preview, no case of any other encoder. All 56
+  old export *blocks* differ only because each holds AMF cases. The appended cases' codec swap has no
+  dice, so the generator's draws are untouched.
