@@ -114,7 +114,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::cli::{
-    command, decode_hwaccel, disable_hwaccel, ffmpeg_bin, ffprobe_bin, fnv1a, launch_err, source_hdr, source_key, tonemap_filter,
+    command, decode_hwaccel_for_asset, disable_hwaccel, ffmpeg_bin, ffprobe_bin, fnv1a, launch_err, source_hdr, source_key,
+    tonemap_filter,
 };
 use super::cpu;
 use super::peaks::drain_tail;
@@ -971,7 +972,7 @@ fn decode_thumbs(asset: &Asset, plan: &Plan, proxy: Option<&Path>, allow_keyfram
         proxy,
         plan.still,
         plan.interval,
-        decode_hwaccel(),
+        decode_hwaccel_for_asset(asset),
         allow_keyframes,
     );
 

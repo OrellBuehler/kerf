@@ -31,6 +31,7 @@ export function harness(env) {
 	let trimMonitor = $state(false);
 	let titles = $state.raw([]);
 	let covered = $state(false);
+	let width = $state(env.width === undefined ? 960 : env.width);
 	let status = $state.raw({ supported: true, overlays: env.overlaysCapable ?? false });
 	const route = $derived(
 		routePreview({
@@ -57,6 +58,7 @@ export function harness(env) {
 		boundsEpoch: () => boundsEpoch,
 		hasClips: () => true,
 		streaming: () => streaming,
+		width: () => width,
 		timelineFrame: env.timelineFrame,
 		previewFrame: env.previewFrame,
 		answered: (result) => {
@@ -80,6 +82,7 @@ export function harness(env) {
 		set trim(v) { trimMonitor = v; },
 		set titles(v) { titles = v; },
 		set covered(v) { covered = v; },
+		set width(v) { width = v; },
 		set status(v) { status = v; }
 	};
 }
@@ -90,8 +93,9 @@ let harness: (env: Env) => Harness;
 interface Env {
 	enabled: boolean;
 	overlaysCapable?: boolean;
-	timelineFrame: (t: number) => Promise<string | null>;
-	previewFrame: (t: number, overlays: boolean) => Promise<PreviewFrameResult>;
+	width?: number | null;
+	timelineFrame: (t: number, width: number) => Promise<string | null>;
+	previewFrame: (t: number, overlays: boolean, width: number) => Promise<PreviewFrameResult>;
 	answered?: (r: PreviewFrameResult) => void;
 	gpuFailed?: (e: unknown) => void;
 }
@@ -107,6 +111,7 @@ interface Harness {
 	trim: boolean;
 	titles: unknown[];
 	covered: boolean;
+	width: number | null;
 	status: unknown;
 }
 
@@ -128,14 +133,18 @@ const tick = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 /** A recorder of what the pump asked for. */
 function recorder(opts: { jpeg?: (t: number) => Promise<string | null>; gpu?: (t: number, o: boolean) => Promise<PreviewFrameResult> } = {}) {
 	const asked: string[] = [];
+	const widths: number[] = [];
 	return {
 		asked,
-		timelineFrame: async (t: number) => {
+		widths,
+		timelineFrame: async (t: number, width: number) => {
 			asked.push(`jpeg@${t}`);
+			widths.push(width);
 			return opts.jpeg ? opts.jpeg(t) : `data:jpeg-${t}`;
 		},
-		previewFrame: async (t: number, overlays: boolean) => {
+		previewFrame: async (t: number, overlays: boolean, width: number) => {
 			asked.push(`gpu@${t}${overlays ? '+overlays' : ''}`);
+			widths.push(width);
 			return opts.gpu
 				? opts.gpu(t, overlays)
 				: { renderer: 'ffmpeg' as const, frame: `data:ffmpeg-${t}`, reasons: ['a refusal'], timings: null };
@@ -382,6 +391,50 @@ describe('either way', () => {
 		await settle();
 		await settle();
 		expect(r.asked).toEqual(['gpu@0', 'gpu@2']);
+		h.stop();
+	});
+});
+
+describe('the width a frame is asked at', () => {
+	test('is the measured one, on the JPEG path and on the GPU path', async () => {
+		const jpeg = recorder();
+		const a = harness({ enabled: false, width: 1440, ...jpeg });
+		await settle();
+		expect(jpeg.widths).toEqual([1440]);
+		a.stop();
+
+		const gpu = recorder();
+		const b = harness({ enabled: true, width: 1920, ...gpu });
+		await settle();
+		expect(gpu.widths).toEqual([1920]);
+		b.stop();
+	});
+
+	test('a different width asks for the frame again, at the new width, and the same width does not', async () => {
+		const r = recorder();
+		const h = harness({ enabled: false, ...r });
+		await settle();
+		h.width = 960;
+		await settle();
+		expect(r.asked).toEqual(['jpeg@0']);
+		h.width = 1440;
+		await settle();
+		expect(r.asked).toEqual(['jpeg@0', 'jpeg@0']);
+		expect(r.widths).toEqual([960, 1440]);
+		h.stop();
+	});
+
+	test('asks nothing before the frame has been measured, then the real width once it has', async () => {
+		const r = recorder();
+		const h = harness({ enabled: false, width: null, ...r });
+		await settle();
+		h.time = 3;
+		await settle();
+		expect(r.asked).toEqual([]);
+		h.width = 1440;
+		await settle();
+		expect(r.asked).toEqual(['jpeg@3']);
+		expect(r.widths).toEqual([1440]);
 		h.stop();
 	});
 });

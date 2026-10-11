@@ -133,6 +133,52 @@ so the feature is **only** activated through these forwards — which is what ma
   decoder outside the engine, `kerf-gpu`'s runs, teaches it one); the GUI defaults export
   `hwaccel` to `auto` too, and `render_with_progress` retries a failed
   hardware-decode export once in software so the default can never lose a render.
+  **What each input is actually asked for** is `engine/decode_policy.rs`, applied to the
+  built argv at **spawn** (`tune_inputs`; the builders still emit `-hwaccel` as the options
+  say, which is what the golden oracle pins) from what is known of the file behind each
+  `-i` — an asset's recorded codec / `pix_fmt`, or for a bare path the cached
+  `source_traits` probe (taken only where the answer can depend on it, `facts_matter`: not on
+  Linux / macOS for a long read). Rules, all pure and unit-tested (`resolve_hwaccel`): **a preview
+  proxy (`is_cache_proxy`, by its `kerf/proxies/<hash>.mp4` name) is never decoded in
+  hardware** — the session costs 70-80 ms a process against a 3 ms intra frame, and a
+  sustained stream from it is faster in software too; **a one-frame read of proxies runs on
+  one thread** (`-threads 1` ahead of each such `-i`, `cpu::single_frame_args` for the graph
+  and the encoder; a still that also reads an original keeps the budget's caps, a 4K
+  long-GOP seek needs them: one thread was 77 % slower); on **Windows `auto` becomes
+  `d3d11va`** for H.264 / HEVC (`auto` picks DXVA2: slower, 4x the CPU), any other codec stays
+  `auto` so one with no D3D11VA decoder is not handed a named one; a one-frame read of a
+  **non-4:2:0 original (4:2:2, 4:4:4, 12 bit) asks for none** on Windows and Linux (AMD and
+  most NVIDIA decoders lack it, the attempt is all cost; macOS is exempt, Intel iGPUs lose the
+  attempt — name `KERF_HWACCEL=qsv`/`vaapi` to force it, a named accelerator always goes
+  through verbatim); a long read (stream, export, proxy, scenes, filmstrip) still tries.
+  There is **no size threshold** (the review's "hardware only above 1080p" is not
+  implemented): a small original still asks. **A named accelerator exits non-zero with no
+  device where `auto` fell back quietly** (ffmpeg 9.0.2 ends with `No device available for
+  decoder` and `Hardware device setup failed`), so what a rerun in software teaches the process
+  differs by path. **Unclassified, as before** — any rescue clears `disable_decode_hwaccel`'s
+  flag, which the previews read: stills, frame grabs, the stream (before its first frame), scenes,
+  salience, filmstrips. **Classified** — only a failure whose text names an unobtainable decoder
+  (`looks_like_hardware_decode_failure`: those two phrases, `Unrecognized hwaccel`, a bad
+  `hwaccel` option, `requires hwaccel`, and the pinned build's `implib-gen: ... failed to load library` abort (SIGABRT) for a hardware library — `libva-drm.so.2` missing makes every `auto` and `vaapi` run die on a Linux box without libva; *not* `Device creation failed`, `Using auto hwaccel` or
+  `Failed setup for format`, which a successful `auto` run prints too, so a missing output
+  directory or a full disk is not the hardware's) convicts, through `convict_hardware_decode`
+  (which also sets the separate `HWACCEL_PROVEN_BAD`): `render_with_progress`
+  (`retry_export_in_software`) and `generate_proxy_with` when only a decoder was in use (with an
+  encoder too the encoder is blamed, as it always was, and the next proxy finds out about the
+  decoder — `blame_after_software_success`; a *stall* still convicts both before the rerun, via
+  the unclassified flag only). **An export drops its symbolic `auto` before the argv is built
+  (`export_hwaccel_request`) under `KERF_HWACCEL=none` or once `HWACCEL_PROVEN_BAD` is set** — not
+  on the previews' flag, so one spurious preview rescue does not send every export to software;
+  the GUI's "GPU decode" toggle still shows on meanwhile, and the first export after only a
+  preview learned the device is missing still launches and reruns once. A named accelerator is
+  never dropped — it fails and reruns once per export on a machine without the device. Stream and
+  export decide whether a failed run may blame hardware at all from the rewritten argv (an input
+  really handed `-hwaccel`), not from the request: **an export whose tuned argv has no
+  `-hwaccel` (a proxy or image-only timeline) gets no software rerun**, because the rerun would
+  be byte-identical (pinned by a test). Call sites: `tune_still_args` (`run_still`),
+  `stream_preview_once`, `tune_export_args`, `decode_frame` / `decode_hwaccel_for`;
+  `limit_frame_args` is the same for `kerf-gpu`'s per-layer decodes. **The Insta360 stitch is
+  not tuned**: it keeps the plain request (`auto`, never `d3d11va`).
   **How much of the machine any of this may take** is `engine/cpu.rs`. FFmpeg is
   written to finish as fast as it can — every run grabs every core and nothing
   coordinates one run with the next — so an agent analyzing eight sources over

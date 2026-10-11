@@ -11,6 +11,7 @@
 	import { inTauri, pickExportPath, hwEncoders, revealPath } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 	import { formatsFor, hasPicture } from '$lib/delivery-formats';
+	import { formatTimecode } from '$lib/timecode';
 	import { frameKey, restoreDraft } from '$lib/export-draft';
 	import type { RowSpec } from '$lib/slider-row';
 	import type { Container, ExportOptions, Fit, RateControl } from '$lib/types';
@@ -104,11 +105,7 @@
 			: null
 	);
 
-	function fmtTime(s: number): string {
-		const m = Math.floor(s / 60);
-		const sec = (s % 60).toFixed(1).padStart(4, '0');
-		return `${m}:${sec}`;
-	}
+	const fmtTime = (s: number): string => formatTimecode(s, editor.fps);
 
 	function fmtEta(s: number | null | undefined): string {
 		if (s == null || !isFinite(s)) return '';
