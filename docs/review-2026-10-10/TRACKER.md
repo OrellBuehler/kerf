@@ -20,7 +20,7 @@
 | GPU-4 Motion fades/transitions | gpu-4 | | PR #144 (CI); verified, main fec0368 merged | gpu-compositor WP-4 | dev done: still-plan GPU frames T1 96.0→100%, T2 78.8→100%, T3 83.3% (WP-6 refusals); Motion export frames 0→100% (T3 16.6%); motion parity plane-exact where unscaled, 1–2 levels where scaled, dip-to-white 2 levels; golden unchanged |
 | PERF-5 AMF/VAAPI export encode | perf-5 | #142 | merged | gpu-media WP4, WP5, WP11 | wave 4 |
 | macOS presenter (WP-8) | macos-presenter | #141 | merged | gpu-compositor WP-8 | dev done: main-thread surface hop on macOS (step 1 could never work: raw-window-metal needs the main thread), plan + acceptance list in app.md; macOS default unchanged |
-| GPU-6 Keyed zoom, masks, blur | gpu-6 (on gpu-4 ea0d186) | | r1 fixes (no blockers) | gpu-compositor WP-6 | dev done: T3 Still 83.3→100%, Motion 16.6→100%; masks exact (geq f64 plane, cached), grayscale/invert/sharpen exact, blur ≤1 level; found FFmpeg 6.1 geq edge read (probed); mask still 847→371 ms at 960 px on CPU adapter |
+| GPU-6 Keyed zoom, masks, blur | gpu-6 (on gpu-4 ea0d186) | | r1 fixed, gpu-4 4b50e41 merged; refusing scaled sharpen >0.5 | gpu-compositor WP-6 | dev done: T3 Still 83.3→100%, Motion 16.6→100%; masks exact (geq f64 plane, cached), grayscale/invert/sharpen exact, blur ≤1 level; found FFmpeg 6.1 geq edge read (probed); mask still 847→371 ms at 960 px on CPU adapter |
 | GPU-5 Scrub at GPU speed + hardening | gpu-5 (on main fec0368) | | dev | gpu-compositor WP-5 | |
 | GPU-7 | | | todo | | wave 4; GPU-5 overlaps PERF-4 (gpu_preview / frame_source), GPU-7 needs GPU-4/5 |
 | CI: retry + cache ffmpeg download | ci-fetch-retry | #131 | closed (landed via #130) | not a review finding | evermeet.cx throttles the macOS pinned-ffmpeg fetch (ffprobe 429 for 6.5+ min); retry + actions/cache ported into #129, #130, #132; cache fills only after one successful run |
@@ -99,6 +99,7 @@
 
 - PERF-4 reconciled with PERF-5 (proxies never hardware-encode): every proxy is the cores' job, so proxy GPU-lane classification, the 2-worker Windows proxy queue and `Lease::fall_back_to_cpu` are removed; the GPU slot remains for hardware exports only (AMF/NVENC/QSV/VT/VAAPI with a named decode accelerator and light graph; `hwupload` counts as light).
 
+- GPU-6: a sharpen on a scaled layer amplifies the scaler's 1-level approximation by 1 + 2 x amount (Y 3 / 7 / 11 at 1.5 / 3 / 5). Refused above amount 0.5 (bound > 2) rather than accepted as drawn, per "refuse rather than approximate". Blur and table effects on a scaled layer stay within 2. The CI gpu parity timeout is raised 20 → 30 min, because the suite alone takes 9–12 min on 4 cores.
 ## Needs a real machine
 - GPU-6: compute/storage-buffer passes on Metal, DX12, hardware Vulkan (FMA changes blur's last bits); real-GPU timings; Windows `hypot` vs Linux for ellipse masks; the geq edge probe on non-pinned macOS/Windows FFmpegs.
 - PERF-4: 2 proxy workers by default where the GPU lane can qualify (Windows) — confirm with a hardware proxy beside a software one on Windows/AMD; H.264 High10 / HEVC Main10 classification on real decoders.
