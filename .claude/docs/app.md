@@ -285,7 +285,11 @@ the inputs of a frame were 45 / 215 / 735 µs for 8 / 120 / 480 clips and are 0.
 same time the old path took: 40 / 200 / 690 µs). *Latest wins*: `get_preview_frame` posts
 a request into a `Mailbox`; the one waiting is replaced and answers `renderer: "superseded"` at once, the frame in hand
 is finished and the newest waiting request drawn next, by a worker on the blocking pool that exists while there is work
-(a worker that dies tells what it never answered, an error and not a skipped frame). The page's GPU route is therefore not
+(a worker that dies, or a job the executor drops without running it, tells what it never answered: an error and not a skipped
+frame, and the next request starts a worker). "Newest" is the page's order, not the order of arrival: Tauri runs each
+`get_preview_frame` as a task of its own, so two can arrive reversed. A request carries `client` (the pump's name for its
+life) and `seq` (its running number, the pump's `asked`); one older than the newest seen from that client answers `superseded`
+at once and starts nothing, a request with neither goes by arrival. The page's GPU route is therefore not
 single-flight (`frame-pump.svelte.ts`: a request per wanted time, an answer older than the one on show is dropped, a
 `superseded` one ignored); the JPEG route is as it was. *The render lock is not held across the decode*: a frame takes
 what it draws with (`Drawing`: the compositor, frame source, device and host as `Arc`s) under the lock, lets go, decodes and
@@ -293,14 +297,19 @@ composites, and takes the lock again to show the result if the backend is still 
 its identity; a restarted one is a fallback frame, and a failure of the old one does not take the new one down), so
 turning the setting off, a lost device or a build no longer waits up to a decode's timeout for a frame. *Present mode*:
 `Pace` (`pace.rs`) calls requests under 120 ms apart a drag and two gaps of 600 ms or more in a row the end of one;
-frames of a drag are presented with `Presenter::skip_vsync(true)` (`AutoNoVsync`) where the surface has
-`Immediate` or `Mailbox`, the settled ones with vsync, the mode changed just before the frame that is presented into the
-reconfigured surface. *Self-test* (`check.rs`): the first frame the GPU would draw starts `kerf_gpu::parity_self_test`
+frames of a request that arrives in a drag are presented with `Presenter::skip_vsync(true)` (`AutoNoVsync`) where the surface
+has `Immediate` or `Mailbox`. The mode is decided **by a request, not by a timer**: nothing runs when a drag stops, so
+the last frame of a drag is presented as the drag's were (without vsync), and the surface goes back to vsync only with the
+request that makes a second lull in a row (a request 600 ms or more after the one before, twice: the second click after a
+drag). The mode changes just before the frame that is presented into the reconfigured surface. *Self-test* (`check.rs`): the first frame the GPU would draw starts `kerf_gpu::parity_self_test`
 (`gpu.md`) on a thread of its own and is FFmpeg's, as is every frame until the verdict (`gpu-preview-checked` is
-emitted then, and the page asks for the frame again). Passed opens the GPU path; a **mismatch** closes it for the session
-(turning the setting off and on does not argue) and a check that **could not be made** closes it until the setting is turned
-on again; either way the reason is the Settings status line and every frame's reason. A verdict belongs to an adapter and
-an FFmpeg (`AdapterKey`): a backend rebuilt on the same device keeps it, another adapter is checked again. *Counters*
+emitted then, and the page asks for the frame again). Passed opens the GPU path for the session. A **mismatch** and a check
+that **could not be made** both close it, and **turning the setting off and on runs the check again** for either (a driver, an
+FFmpeg or a machine under load may not be what it was; a mismatch that is real is found again for a couple of seconds of
+work); every verdict is logged (`info` for a pass, `warn` for a failure). The reason is the Settings status line and every
+frame's reason, and it stays there when a backend is rebuilt on the same adapter (`Check::closed`). A verdict belongs to an
+adapter and an FFmpeg (`AdapterKey`, made once per backend): a backend rebuilt on the same device keeps it, another adapter is
+checked again. The gate is deliberately no looser than the parity contract: the limits are the harness's own. *Counters*
 (`diagnostics.rs`): every frame that went through FFmpeg counts its reasons by kind (`Unsupported::kind()` for the plan's;
 `self_test_pending`, `overlays`, `hidden`, `backend`, `decode_busy`, … for the rest) with the first message as an example,
 logged once per new kind (`info`) and as a one-line session summary at teardown; `gpu_preview_diagnostics` answers

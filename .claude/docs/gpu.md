@@ -511,7 +511,10 @@ the preview's own), and everything runs the way interactive reads do: thread-cap
 no machine-budget slot, nothing under a project lock; it takes 1.9 to 2.7 s on FFmpeg 6.1.1 and 1.0 to 1.2 s on 9.0.2
 on lavapipe (release build, a loaded 4-core box; `docs/review-2026-10-10/after/gpu-5`). The answer is `Ok(report)`, **`SelfTestError::Mismatch`** (the GPU draws something else than this
 FFmpeg) or **`Inconclusive`** (an FFmpeg that would not make the clips, a colour policy that could not be
-measured, the plan refusing its own frame, the GPU failing on it, the 90 s deadline). Measured on lavapipe, both
+measured, the plan refusing its own frame, the GPU failing on it, the 90 s deadline). **The deadline is looked at between
+steps** (before the clips and before each case), not inside one: a case begun just before it still runs its reference
+(`export_still`, a 120 s timeout of its own) and a conversion (30 s), so the worst case is about four minutes, during which
+every frame goes through FFmpeg as before. What the app does with the answer is in `app.md`. Measured on lavapipe, both
 FFmpegs: fit 48.8 dB / max 4, pip 46.4 dB / max 6, bt709 49.4 / max 5 on 6.1.1 and 48.6 / 5 on 9.0.2; the same GPU
 drawn under the *other* colour policy fails the bt709 frame at 24 dB / 40 to 42 levels (that is the 6-versus-9
 drift the test is for; `a_gpu_drawn_under_the_wrong_colour_policy_fails_it`).
