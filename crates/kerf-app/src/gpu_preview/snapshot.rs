@@ -83,17 +83,29 @@ impl PlanInputs {
         Taken::from(project).map(Taken::resolve)
     }
 
+    /// The plan epoch these inputs were taken at: a session planned from them is stale once
+    /// [`kerf_core::plan_epoch`] has moved.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// Under **Proxy only**, what the preview says about a frame at `t` whose clips have no proxy
     /// yet (`None`: nothing to wait for, and always `None` under any other source). Answered from
     /// the snapshot: the status is read from the proxy queue now, the project not at all.
     pub fn proxy_wait(&self, t: f64) -> Result<Option<String>, String> {
-        let waits = Project::proxy_waits_in(
-            &self.timeline,
-            kerf_core::proxy::effective_preview_source(),
-            t,
-            Some(t),
-            |id| self.proxy_inputs.get(&id).cloned().ok_or(Error::AssetNotFound(id)),
-        )
+        self.waits(t, Some(t))
+    }
+
+    /// [`PlanInputs::proxy_wait`] for playing from `t` to the end of the cut: the stream refuses
+    /// the same way, since a clip without a proxy would be read from its original.
+    pub fn proxy_wait_from(&self, t: f64) -> Result<Option<String>, String> {
+        self.waits(t, None)
+    }
+
+    fn waits(&self, from: f64, to: Option<f64>) -> Result<Option<String>, String> {
+        let waits = Project::proxy_waits_in(&self.timeline, kerf_core::proxy::effective_preview_source(), from, to, |id| {
+            self.proxy_inputs.get(&id).cloned().ok_or(Error::AssetNotFound(id))
+        })
         .map_err(|e| e.to_string())?;
         Ok(kerf_core::proxy::waits_message(&waits))
     }

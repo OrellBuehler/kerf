@@ -271,14 +271,22 @@ impl PlayCut {
         let last = self.frame_at(from + horizon.max(0.0)).max(first);
         (first..=last).find_map(|k| {
             let why = self.refusal(k, size, caps)?;
-            let slice_at = self.fps.exact_time(k);
-            let handover = self.start + self.windows.handover(slice_at).stream_start;
             Some(PlayAhead {
                 at: self.time_of(k),
-                handover,
+                handover: self.handover_in_slice(self.fps.exact_time(k)),
                 why,
             })
         })
+    }
+
+    /// Where a stream that carries on from the compositor at timeline time `t` has to start:
+    /// [`SpanPlan::handover`] of this slice's windows, at or before `t`.
+    pub fn handover_at(&self, t: f64) -> f64 {
+        self.handover_in_slice((t - self.start).max(0.0))
+    }
+
+    fn handover_in_slice(&self, slice_at: f64) -> f64 {
+        self.start + self.windows.handover(slice_at).stream_start
     }
 }
 

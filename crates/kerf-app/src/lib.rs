@@ -2032,7 +2032,14 @@ async fn get_timeline_frame(state: State<'_, AppState>, time_secs: f64, max_widt
 /// `client` and `seq` say which request of which page this is: Tauri runs each call as a task of
 /// its own, so two can arrive in the other order than they were made, and one that arrives after a
 /// newer request of the same `client` answers `superseded` instead of replacing it.
+///
+/// `hint: "forward"` (with `client` and a `session` number) is a frame of **GPU playback**: the page
+/// asks for the time the picture should show, once per animation frame while the cut plays at 1x,
+/// and the first request of a session decides whether the GPU plays it (`renderer: "gpu"`) or the
+/// stream does (`renderer: "stream"`, with the reasons); every answer says in `play.ahead` where the
+/// GPU will stop drawing, if it will. See [`gpu_preview::play`]'s module docs; no other hint is known.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn get_preview_frame(
     state: State<'_, AppState>,
     gpu: State<'_, Arc<gpu_preview::GpuPreview>>,
@@ -2041,6 +2048,8 @@ async fn get_preview_frame(
     overlays: Option<bool>,
     client: Option<String>,
     seq: Option<u64>,
+    hint: Option<String>,
+    session: Option<u64>,
 ) -> CmdResult<gpu_preview::PreviewFrameResult> {
     let shared = state.project.clone();
     let mut request = gpu_preview::FrameRequest::new(
@@ -2052,6 +2061,16 @@ async fn get_preview_frame(
         max_width.unwrap_or(960),
         overlays.unwrap_or(false),
     );
+    match hint.as_deref() {
+        None => {}
+        Some("forward") => {
+            let (Some(client), Some(session)) = (client.clone(), session) else {
+                return Err("a forward frame names its client and session".to_string());
+            };
+            request = request.forward(client, session);
+        }
+        Some(other) => return Err(format!("unknown preview frame hint {other:?}")),
+    }
     if let (Some(client), Some(seq)) = (client, seq) {
         request = request.ordered(client, seq);
     }
