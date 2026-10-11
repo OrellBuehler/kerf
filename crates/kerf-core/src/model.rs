@@ -4042,6 +4042,16 @@ impl Timeline {
         }
     }
 
+    /// The span a range export of `range` writes: `range` clamped to the cut, or `None` when there is
+    /// none or it is empty after clamping — an inverted, empty or wholly-past-the-end range falls back
+    /// to exporting everything. The one clamp the export and the platform check both read.
+    pub fn export_span(&self, range: Option<(f64, f64)>) -> Option<(f64, f64)> {
+        let (start, end) = range?;
+        let start = start.max(0.0);
+        let end = end.min(self.duration());
+        (end - start > 1e-9).then_some((start, end))
+    }
+
     /// A copy containing only `[start, end)`, shifted so `start` lands at 0 —
     /// the sub-timeline a range export renders. Clips overlapping the window
     /// edges are cut down (source window and keyframes adjusted, honoring speed
@@ -7008,6 +7018,24 @@ mod tests {
         clip.insert_keyframe(eased(1.0000004, 9.0, Easing::Linear));
         assert_eq!((clip.keyframes[1].scale, clip.keyframes[1].easing), (9.0, Easing::EaseIn));
         assert_eq!(clip.keyframes.len(), 4);
+    }
+
+    #[test]
+    fn export_span_clamps_to_the_cut_and_falls_back_to_everything_when_empty() {
+        let tl = Timeline {
+            tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 60.0)])],
+            overlays: Vec::new(),
+            markers: Vec::new(),
+            format: None,
+            master: Default::default(),
+        };
+        assert_eq!(tl.export_span(None), None);
+        assert_eq!(tl.export_span(Some((10.0, 30.0))), Some((10.0, 30.0)));
+        assert_eq!(tl.export_span(Some((-5.0, 20.0))), Some((0.0, 20.0)));
+        assert_eq!(tl.export_span(Some((40.0, 500.0))), Some((40.0, 60.0)));
+        assert_eq!(tl.export_span(Some((10.0, 10.0))), None);
+        assert_eq!(tl.export_span(Some((30.0, 10.0))), None);
+        assert_eq!(tl.export_span(Some((90.0, 120.0))), None);
     }
 
     #[test]

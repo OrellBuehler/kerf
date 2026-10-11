@@ -27,7 +27,7 @@ import type {
 	Mask,
 	Color,
 	Delivery,
-	DeliveryCheck,
+	PlatformReport,
 	EditSource,
 	ExportOptions,
 	ExportProgress,
@@ -110,7 +110,7 @@ import { clampCeiling, clampDuckDepth, clampMasterVolume, DEFAULT_MASTER, estima
 import { toFixedEven } from './format-fixed';
 import { fitMusicOnto, musicFitInputs, type FitSources } from './music-fit';
 import { sampleMusicAnalysis, SAMPLE_MUSIC_DURATION } from './sample-music';
-import { checkAll } from './platforms';
+import { exportSpan, report as platformReport } from './platforms';
 import { centeredCrop } from './smart-crop';
 import { synthWaveformRange } from './sample-waveform';
 import { analysisKindDone, ALL_KINDS } from './analysis-steps';
@@ -3236,26 +3236,37 @@ export async function revealPath(path: string): Promise<void> {
 	await invoke('reveal_path', { path });
 }
 
-/** How ready the current cut is for each publishing target. `frame` overrides
- *  the shape it is judged at — the export dialog passes the resolution it is
- *  about to render when that differs from the project frame.
+/** How ready the current cut is for each publishing target, with the cut it was judged on (its
+ *  frame and length, in words). `frame` overrides the shape it is judged at and `range` the span —
+ *  the export dialog passes the resolution it is about to render when that differs from the
+ *  project frame, and the In → out it is about to write.
  *
  *  `kerf_core::platform` decides this in the app. The browser harness runs the
  *  mirror in `platforms.ts` over the dev timeline so the panel is explorable
  *  under `bun run dev`. */
-export async function platformCheck(frame?: [number, number] | null): Promise<DeliveryCheck[]> {
+export async function platformCheck(
+	frame?: [number, number] | null,
+	range?: { start: number; end: number } | null
+): Promise<PlatformReport> {
 	if (!inTauri()) {
 		const fmt = devTimeline.format;
 		const first = sampleAssets[0];
-		return checkAll({
-			duration: timelineDuration(devTimeline),
+		const full = timelineDuration(devTimeline);
+		const span = exportSpan(full, range);
+		// A title counts when it is on screen somewhere in the span, as it is in the sliced cut the export builds.
+		return platformReport({
+			duration: span ? span[1] - span[0] : full,
 			width: frame?.[0] ?? fmt?.width ?? first.streams[0]?.width ?? 1920,
 			height: frame?.[1] ?? fmt?.height ?? first.streams[0]?.height ?? 1080,
 			has_audio: true,
-			has_text: (devTimeline.overlays ?? []).length > 0
+			has_text: (devTimeline.overlays ?? []).some((o) => !span || (o.end > span[0] && o.start < span[1]))
 		});
 	}
-	return invoke<DeliveryCheck[]>('platform_check', { width: frame?.[0] ?? null, height: frame?.[1] ?? null });
+	return invoke<PlatformReport>('platform_check', {
+		width: frame?.[0] ?? null,
+		height: frame?.[1] ?? null,
+		range: range ?? null
+	});
 }
 
 // ---- agent connection (MCP endpoint) ---------------------------------------

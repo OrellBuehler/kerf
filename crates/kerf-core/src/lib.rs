@@ -73,7 +73,7 @@ pub use model::{
 pub use plan_caps::{EffectKinds, GpuCaps, LayerRef, Unsupported};
 pub use planner::{Handover, PlanRequest, Planner, SpanPlan, SpanRun};
 pub use platform::{
-    check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind, PlatformTarget, Severity,
+    check_all as check_platforms, CutSummary, DeliveryCheck, DeliveryIssue, IssueKind, PlatformReport, PlatformTarget, Severity,
     TARGETS as PLATFORM_TARGETS,
 };
 pub use project::{FramingPlan, Project, SmartCropJob, SmartCropPlan, StemsPlaced, MAX_CHANNEL_KEYS, VOICEOVER_TRACK};

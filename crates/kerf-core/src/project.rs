@@ -1001,23 +1001,42 @@ impl Project {
 
     /// How ready the current cut is for each publishing target — what a platform
     /// would reject, what it would accept and then quietly under-distribute, and
-    /// what would simply be better.
+    /// what would simply be better — with the cut it was judged on.
     ///
     /// Reads the **working** timeline, so an agent assembling a cut sees the
     /// verdict on its own proposal rather than on the user's live one.
     /// `frame` overrides the shape the cut is judged at — what the export dialog
-    /// passes when a render is about to resize away from the project frame.
-    pub fn platform_check(&self, frame: Option<(u32, u32)>) -> Result<Vec<crate::platform::DeliveryCheck>> {
-        Ok(crate::platform::check_all(&self.cut_summary(frame)?))
+    /// passes when a render is about to resize away from the project frame — and
+    /// `range` the span an export would write (the dialog's In → out), so a Reel
+    /// cut from the middle of a long timeline is judged at the Reel's length.
+    pub fn platform_report(
+        &self,
+        frame: Option<(u32, u32)>,
+        range: Option<(f64, f64)>,
+    ) -> Result<crate::platform::PlatformReport> {
+        Ok(crate::platform::report(&self.cut_summary_in(frame, range)?))
     }
 
     /// What the readiness check needs to know about the current cut.
     pub fn cut_summary(&self, frame: Option<(u32, u32)>) -> Result<crate::platform::CutSummary> {
+        self.cut_summary_in(frame, None)
+    }
+
+    /// [`Project::cut_summary`] of only `range` of the cut — the span an export of that range writes.
+    /// Summarised on the sliced timeline the export builds its graph from (`Timeline::slice` over the
+    /// same clamp, `Timeline::export_span`), so the length, the footage-derived frame, whether anything
+    /// in the span has sound and whether a title is on screen in it all describe the file, not the cut
+    /// around it.
+    pub fn cut_summary_in(&self, frame: Option<(u32, u32)>, range: Option<(f64, f64)>) -> Result<crate::platform::CutSummary> {
         let timeline = self.working_timeline()?;
         let assets = self.list_assets()?;
         // The same gate the export applies, so a muted track is as absent here
         // as it will be in the file.
         let rendered = timeline.for_render();
+        let rendered = match rendered.export_span(range) {
+            Some((start, end)) => rendered.slice(start, end),
+            None => rendered,
+        };
         let (width, height) = frame.unwrap_or_else(|| engine::delivery_frame(&rendered, &assets));
         // Audio-bearing means what the export means by it: any clip whose asset
         // carries an audio stream, on a video track as much as an audio one.
@@ -5133,7 +5152,10 @@ mod tests {
         assert!(summary.duration > 0.0);
         assert!(summary.has_audio, "the sample has audio-bearing clips");
 
-        let checks = project.platform_check(None).unwrap();
+        let report = project.platform_report(None, None).unwrap();
+        assert_eq!((report.cut.width, report.cut.height), (1080, 1920));
+        assert_eq!(report.cut.duration, summary.duration);
+        let checks = report.targets;
         assert_eq!(checks.len(), crate::platform::TARGETS.len());
         let reels = checks.iter().find(|c| c.target == "reels").unwrap();
         assert!(reels.ok, "a short vertical cut is publishable: {:?}", reels.issues);
