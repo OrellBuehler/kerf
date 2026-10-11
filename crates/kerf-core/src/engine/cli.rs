@@ -3284,10 +3284,7 @@ impl Default for ExportOptions {
 /// The validated export range from `opts`, clamped to the timeline. `None`
 /// when absent or empty after clamping (which falls back to a full export).
 fn effective_range(timeline: &Timeline, opts: &ExportOptions) -> Option<(f64, f64)> {
-    let r = opts.range?;
-    let start = r.start.max(0.0);
-    let end = r.end.min(timeline.duration());
-    (end - start > 1e-9).then_some((start, end))
+    timeline.export_span(opts.range.map(|r| (r.start, r.end)))
 }
 
 /// Whether a bitrate token like "8M" / "2500k" / "800000" is well-formed.

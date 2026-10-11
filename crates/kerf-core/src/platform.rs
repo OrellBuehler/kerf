@@ -160,7 +160,7 @@ pub struct DeliveryCheck {
 }
 
 /// What a readiness check needs to know about a cut. Resolved by the caller
-/// (`Project::platform_check`) so the check itself stays pure.
+/// (`Project::cut_summary_in`) so the check itself stays pure.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CutSummary {
     pub duration: f64,
@@ -174,21 +174,6 @@ pub struct CutSummary {
 }
 
 impl CutSummary {
-    /// What an export of only `range` of this cut writes: the same cut, as long as the span. Clamped
-    /// the way the export clamps it (`effective_range`) — an empty or inverted span is the whole cut.
-    pub fn within(self, range: Option<(f64, f64)>) -> Self {
-        let Some((start, end)) = range else { return self };
-        let (start, end) = (start.max(0.0), end.min(self.duration));
-        if end - start > 1e-9 {
-            Self {
-                duration: end - start,
-                ..self
-            }
-        } else {
-            self
-        }
-    }
-
     /// The cut's frame as a [`Delivery`]-shaped pair, for comparing aspects.
     fn aspect(&self) -> f64 {
         if self.height == 0 {
@@ -512,29 +497,6 @@ mod tests {
             ..vertical_cut(0.0)
         };
         assert!(check_all(&cut).iter().all(|c| !c.ok));
-    }
-
-    #[test]
-    fn a_range_is_judged_at_its_own_length() {
-        // A 4 min timeline with a 20 s span marked: the Reel is 20 s, not 4 min.
-        let cut = vertical_cut(4.0 * 60.0);
-        let span = cut.within(Some((10.0, 30.0)));
-        assert_eq!(span.duration, 20.0);
-        assert_eq!((span.width, span.height), (cut.width, cut.height));
-        assert!(check(target("reels").unwrap(), &span).issues.is_empty());
-        assert!(!check(target("reels").unwrap(), &cut).issues.is_empty());
-    }
-
-    #[test]
-    fn a_range_is_clamped_to_the_cut_like_the_export_clamps_it() {
-        let cut = vertical_cut(60.0);
-        assert_eq!(cut.within(Some((-5.0, 20.0))).duration, 20.0);
-        assert_eq!(cut.within(Some((40.0, 500.0))).duration, 20.0);
-        // Empty, inverted or wholly past the end: the export falls back to the whole cut.
-        assert_eq!(cut.within(Some((10.0, 10.0))).duration, 60.0);
-        assert_eq!(cut.within(Some((30.0, 10.0))).duration, 60.0);
-        assert_eq!(cut.within(Some((90.0, 120.0))).duration, 60.0);
-        assert_eq!(cut.within(None).duration, 60.0);
     }
 
     #[test]

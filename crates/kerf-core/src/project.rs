@@ -964,16 +964,29 @@ impl Project {
         frame: Option<(u32, u32)>,
         range: Option<(f64, f64)>,
     ) -> Result<crate::platform::PlatformReport> {
-        Ok(crate::platform::report(&self.cut_summary(frame)?.within(range)))
+        Ok(crate::platform::report(&self.cut_summary_in(frame, range)?))
     }
 
     /// What the readiness check needs to know about the current cut.
     pub fn cut_summary(&self, frame: Option<(u32, u32)>) -> Result<crate::platform::CutSummary> {
+        self.cut_summary_in(frame, None)
+    }
+
+    /// [`Project::cut_summary`] of only `range` of the cut — the span an export of that range writes.
+    /// Summarised on the sliced timeline the export builds its graph from (`Timeline::slice` over the
+    /// same clamp, `Timeline::export_span`), so the length, the footage-derived frame, whether anything
+    /// in the span has sound and whether a title is on screen in it all describe the file, not the cut
+    /// around it.
+    pub fn cut_summary_in(&self, frame: Option<(u32, u32)>, range: Option<(f64, f64)>) -> Result<crate::platform::CutSummary> {
         let timeline = self.working_timeline()?;
         let assets = self.list_assets()?;
         // The same gate the export applies, so a muted track is as absent here
         // as it will be in the file.
         let rendered = timeline.for_render();
+        let rendered = match rendered.export_span(range) {
+            Some((start, end)) => rendered.slice(start, end),
+            None => rendered,
+        };
         let (width, height) = frame.unwrap_or_else(|| engine::delivery_frame(&rendered, &assets));
         // Audio-bearing means what the export means by it: any clip whose asset
         // carries an audio stream, on a video track as much as an audio one.

@@ -17,10 +17,15 @@
   nothing here ever blocks an export. `Project::platform_report(frame, range)` resolves
   the summary from `working_timeline` (so an agent is judged on its own
   proposal) with an optional frame override, which the export dialog passes when
-  a render resizes away from the project frame, and an optional `range` that
-  `CutSummary::within` clamps the way the export clamps `ExportOptions.range` (an
-  empty or inverted span is the whole cut), so a Reel cut from the middle of a long
-  timeline is judged at the Reel's length. It answers a `PlatformReport`: every
+  a render resizes away from the project frame, and an optional `range`: the span an
+  export of that range writes. `Project::cut_summary_in` summarises it on the *sliced*
+  timeline (`Timeline::export_span` — the one clamp the export's `effective_range` also
+  reads, so an empty or inverted span is the whole cut — then `Timeline::slice`), so the
+  length, the footage-derived frame, whether the span has sound and whether a title is on
+  screen in it all describe the file, and a Reel cut from the middle of a long timeline is
+  judged as the Reel. The MCP `platform_check` takes the same optional `range`, and
+  `export_variants` judges each file over the range it was exported with. It answers a
+  `PlatformReport`: every
   target's check *and* the `CutSummary` they judged, so a UI can state the file's
   frame and length without reading the project a second time. Messages say
   `Instagram Reels'` / `TikTok's` (`possessive`); `platforms.ts` mirrors it.
