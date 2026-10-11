@@ -657,6 +657,55 @@ pub fn upcoming_clip_starts(timeline: &Timeline, t: f64, horizon: f64, limit: us
     starts
 }
 
+/// The times, in `[t - horizon, t)`, at which a clip of the cut has just ended on a video track that
+/// renders: the moment is the clip's **last frame** (half a frame before its end), the picture a
+/// playhead dragged back across the cut brings next. Nearest first, at most `limit`, each once.
+/// A clip the playhead is inside (its end is ahead) or sits exactly at the end of is not behind it.
+pub fn passed_clip_ends(timeline: &Timeline, t: f64, horizon: f64, frame: f64, limit: usize) -> Vec<f64> {
+    if !t.is_finite() || !horizon.is_finite() || horizon <= 0.0 || !frame.is_finite() || frame <= 0.0 {
+        return Vec::new();
+    }
+    let mut ends: Vec<f64> = timeline
+        .tracks
+        .iter()
+        .filter(|track| track.kind == StreamKind::Video && timeline.track_renders(track))
+        .flat_map(|track| track.clips.iter())
+        .filter(|clip| clip.enabled)
+        .map(|clip| clip.timeline_end())
+        .filter(|&end| end < t - 1e-5 && end >= t - horizon)
+        .collect();
+    ends.sort_by(|a, b| b.total_cmp(a));
+    ends.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+    ends.truncate(limit);
+    ends.into_iter().map(|end| end - frame * 0.5).collect()
+}
+
+/// A moment a playhead near `t` is about to reach a cut: the first frame of a clip ahead of it, or the
+/// last frame of one just behind it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CutMoment {
+    pub t: f64,
+    pub behind: bool,
+}
+
+/// The cuts around the playhead, nearest first and at most `limit` in all: a clip that starts
+/// within `horizon` ahead ([`upcoming_clip_starts`]) and one that ended within `horizon` behind
+/// ([`passed_clip_ends`]). A drag goes either way.
+pub fn cut_moments(timeline: &Timeline, t: f64, horizon: f64, frame: f64, limit: usize) -> Vec<CutMoment> {
+    let mut moments: Vec<CutMoment> = upcoming_clip_starts(timeline, t, horizon, limit)
+        .into_iter()
+        .map(|t| CutMoment { t, behind: false })
+        .chain(
+            passed_clip_ends(timeline, t, horizon, frame, limit)
+                .into_iter()
+                .map(|t| CutMoment { t, behind: true }),
+        )
+        .collect();
+    moments.sort_by(|a, b| (a.t - t).abs().total_cmp(&(b.t - t).abs()));
+    moments.truncate(limit);
+    moments
+}
+
 /// Everything a GPU frame needs, built together and dropped together.
 struct Backend {
     // Field order is drop order: the presenter (and its surface) go before the window host.
@@ -1278,15 +1327,17 @@ impl GpuPreview {
         why
     }
 
-    /// Have the frame source ready for the clips that start within [`PREFETCH_HORIZON`] seconds past
-    /// `t`: their first frames are asked for with [`Hint::Prefetch`], so a run is waiting (and the
-    /// file's probes are done) by the time the playhead crosses the cut, instead of the first frame
-    /// there costing a process start. Called after a frame was shown, with the render lock released;
-    /// the asking is on a thread of its own (the probes block), at most one at a time, and not again
-    /// for the same clips within a second. It never takes a run another layer is reading (a spare
-    /// slot, `Hint::Prefetch`), and a failure to prefetch is nothing: the frame is decoded when asked.
-    /// A moment the GPU will refuse at this size (`caps`) is not prefetched: its frame goes through
-    /// FFmpeg, and a run waiting for it would be a decode nobody reads.
+    /// Have the frame source ready for the cuts around the playhead: the first frame of a clip that
+    /// starts within [`PREFETCH_HORIZON`] seconds ahead of `t` and the last of one that ended within
+    /// that behind it ([`cut_moments`]; a drag goes either way) are asked for with
+    /// [`Hint::Prefetch`], so a run is waiting (and the file's probes are done) by the time the
+    /// playhead crosses the cut instead of the first frame there costing a process start. Called
+    /// after a frame was shown, with the render lock released; the asking is on a thread of its own
+    /// (the probes block), at most one at a time, and not again for the same moments within a second.
+    /// It never takes a run another layer is reading (a spare slot, `Hint::Prefetch`), and a failure to
+    /// prefetch is nothing: the frame is decoded when asked. A moment the GPU will refuse at this size
+    /// (`caps`) is not prefetched: its frame goes through FFmpeg, and a run waiting for it would be a
+    /// decode nobody reads.
     fn prefetch_ahead(
         &self,
         planner: &Planner,
@@ -1296,21 +1347,30 @@ impl GpuPreview {
         caps: &GpuCaps,
         source: Arc<FrameSource>,
     ) {
-        let starts = upcoming_clip_starts(timeline, t, PREFETCH_HORIZON, PREFETCH_CLIPS);
-        if starts.is_empty() {
+        let fps = planner.canvas().fps;
+        let frame = f64::from(fps.den) / f64::from(fps.num.max(1));
+        let moments = cut_moments(timeline, t, PREFETCH_HORIZON, frame, PREFETCH_CLIPS);
+        if moments.is_empty() {
             return;
         }
         {
-            let key: Vec<u64> = starts.iter().map(|s| s.to_bits()).collect();
+            let key: Vec<u64> = moments.iter().map(|m| m.t.to_bits()).collect();
             let mut last = lock(&self.prefetched);
             if last.0 == key && last.1.is_some_and(|at| at.elapsed() < PREFETCH_REPEAT) {
                 return;
             }
             *last = (key, Some(Instant::now()));
         }
-        let layers: Vec<PlanLayer> = starts
+        let layers: Vec<PlanLayer> = moments
             .iter()
-            .filter_map(|&start| planner.at(start).ok())
+            .filter_map(|m| {
+                if m.behind {
+                    plan_at_grid(planner, m.t)
+                } else {
+                    planner.at(m.t)
+                }
+                .ok()
+            })
             .filter(|plan| plan.reasons(caps, size).is_empty())
             .flat_map(|plan| plan.layers)
             .collect();
@@ -2018,6 +2078,82 @@ mod tests {
             (StreamKind::Video, "V2", vec![1.0]),
         ]);
         assert_eq!(upcoming_clip_starts(&tl, 0.0, 2.0, 5), vec![1.0]);
+    }
+
+    #[test]
+    fn the_clips_that_ended_within_the_horizon_behind_the_playhead_are_passed_ones_with_their_last_frame() {
+        // Clips of a second at 0, 1, 2, 3.5 and 6: they end at 1, 2, 3, 4.5 and 7.
+        let tl = cut(vec![(StreamKind::Video, "V1", vec![0.0, 1.0, 2.0, 3.5, 6.0])]);
+        let frame = 1.0 / 30.0;
+        let last = |end: f64| end - frame / 2.0;
+        // From 3.2 s, two seconds back: the clips that ended at 2 and 3 (nearest first); the one
+        // ending at 1 is further than the horizon, and the one ending at 4.5 is ahead.
+        assert_eq!(passed_clip_ends(&tl, 3.2, 2.0, frame, 5), vec![last(3.0), last(2.0)]);
+        assert_eq!(
+            passed_clip_ends(&tl, 3.2, 2.0, frame, 1),
+            vec![last(3.0)],
+            "at most the limit, the nearest"
+        );
+        // A clip the playhead is inside, or sits exactly at the end of, is not behind it.
+        assert_eq!(passed_clip_ends(&tl, 3.0, 2.0, frame, 5), vec![last(2.0), last(1.0)]);
+        assert!(
+            passed_clip_ends(&tl, 0.5, 2.0, frame, 5).is_empty(),
+            "nothing behind the first clip"
+        );
+        assert!(passed_clip_ends(&tl, 3.2, 2.0, 0.0, 5).is_empty() && passed_clip_ends(&tl, f64::NAN, 2.0, frame, 5).is_empty());
+        // Tracks that do not render and clips that are off are not the picture.
+        let mut two = cut(vec![
+            (StreamKind::Video, "V1", vec![0.0]),
+            (StreamKind::Audio, "A1", vec![0.0]),
+            (StreamKind::Video, "V2", vec![0.0]),
+        ]);
+        assert_eq!(
+            passed_clip_ends(&two, 1.5, 2.0, frame, 5),
+            vec![last(1.0)],
+            "two tracks ending together are one moment"
+        );
+        two.tracks[2].muted = true;
+        two.tracks[0].clips[0].enabled = false;
+        assert!(passed_clip_ends(&two, 1.5, 2.0, frame, 5).is_empty());
+    }
+
+    #[test]
+    fn a_drag_prefetches_the_cuts_on_both_sides_of_the_playhead_nearest_first() {
+        let tl = cut(vec![(StreamKind::Video, "V1", vec![0.0, 1.0, 2.0, 3.5, 6.0])]);
+        let frame = 1.0 / 30.0;
+        // At 2.2 s: clips end at 2.0 (0.2 s back) and 1.0 (1.2 s back), and the next starts at 3.5
+        // (1.3 s ahead).
+        let moments = cut_moments(&tl, 2.2, 2.0, frame, 3);
+        assert_eq!(
+            moments,
+            vec![
+                CutMoment {
+                    t: 2.0 - frame / 2.0,
+                    behind: true
+                },
+                CutMoment {
+                    t: 1.0 - frame / 2.0,
+                    behind: true
+                },
+                CutMoment { t: 3.5, behind: false },
+            ]
+        );
+        assert_eq!(
+            cut_moments(&tl, 2.2, 2.0, frame, 1),
+            vec![CutMoment {
+                t: 2.0 - frame / 2.0,
+                behind: true
+            }]
+        );
+        // Nothing near: nothing.
+        assert!(cut_moments(&tl, 5.0, 0.2, frame, 3).is_empty());
+        // The old forward-only answer is still what is ahead.
+        let ahead: Vec<f64> = cut_moments(&tl, 0.5, 2.0, frame, 5)
+            .iter()
+            .filter(|m| !m.behind)
+            .map(|m| m.t)
+            .collect();
+        assert_eq!(ahead, upcoming_clip_starts(&tl, 0.5, 2.0, 5));
     }
 
     #[test]
