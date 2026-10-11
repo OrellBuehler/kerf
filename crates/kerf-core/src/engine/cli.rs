@@ -2478,13 +2478,45 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         .to_str()
         .ok_or_else(|| Error::Engine("proxy temp path is not valid UTF-8".to_string()))?;
     let bin = ffmpeg_bin();
+    // One cached probe answers both: whether to tone-map and whether the video
+    // starts late (the same one `proxy_path` keyed this proxy on). It is the probe `proxy_path`
+    // just ran, so it costs nothing here, before the wait.
+    let traits = source_traits(src).unwrap_or_default();
+    let tonemap = traits.hdr.map(tonemap_filter);
+    let head_pad = needs_head_pad(traits.lead).then(fps_mode_flag);
+    // GPU encode (and decode) when available — a background proxy transcode
+    // then costs the CPU almost nothing. A failure falls back to the software
+    // pipeline once, and a hardware-*encoder* failure whose software retry
+    // succeeds disables hardware encodes for the rest of the process.
+    // A padded proxy is encoded from a graph whose output has no frame rate (its
+    // `interleave` hands the encoder microsecond timestamps), which a hardware
+    // encoder may refuse — and one refusal turns hardware encoding off for the
+    // whole process. These sources are rare and the encode is the same all-intra
+    // x264 pass, so they never ask.
+    let hw_enc = if head_pad.is_some() { None } else { proxy_hw_encoder() };
+    let hw_dec = decode_hwaccel_for(src, Reading::Whole);
+    let resource = proxy_resource(
+        hw_enc,
+        hw_dec.as_deref(),
+        tonemap.is_some(),
+        InputFacts {
+            codec: traits.codec,
+            chroma: traits.chroma,
+            ..InputFacts::default()
+        },
+        cpu::gpu_lane(),
+    );
     // A full-file re-encode. Importing a folder queues them one behind the next
     // rather than starting one per file at once; they wait in the proxy lane, behind
     // anything a user is waiting on and ahead of analysis. A proxy that is deleted, rebuilt
-    // or switched off while it waits gives up its place without having started.
-    let cpu = match reservation {
-        Some(reserved) => reserved.lease_waiting(&mut |_| {}, cancel)?,
-        None => cpu::lease_priority_waiting(cpu::Priority::Proxy, &mut |_| {}, cancel)?,
+    // or switched off while it waits gives up its place without having started. One that is
+    // hardware from end to end queues for the hardware's slot instead, in the same lane, and
+    // does not hold analysis back or wait for a software job.
+    let cpu = match (resource, reservation) {
+        (cpu::Resource::Cpu, Some(reserved)) => reserved.lease_waiting(&mut |_| {}, cancel)?,
+        (cpu::Resource::Cpu, None) => cpu::lease_priority_waiting(cpu::Priority::Proxy, &mut |_| {}, cancel)?,
+        (cpu::Resource::Gpu, Some(reserved)) => reserved.lease_gpu_waiting(&mut |_| {}, cancel)?,
+        (cpu::Resource::Gpu, None) => cpu::lease_gpu_priority_waiting(cpu::Priority::Proxy, &mut |_| {}, cancel)?,
     };
     // Cancelled in the instant it got the slot: do not start the encode.
     if cancel() {
@@ -2495,11 +2527,7 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         progress(0.0);
     }
     let threads = proxy_threads(cpu.threads());
-    // One cached probe answers both: whether to tone-map and whether the video
-    // starts late (the same one `proxy_path` keyed this proxy on).
-    let traits = source_traits(src).unwrap_or_default();
-    let tonemap = traits.hdr.map(tonemap_filter);
-    let head_pad = needs_head_pad(traits.lead).then(fps_mode_flag);
+    tracing::debug!(resource = ?cpu.resource(), source = %src.display(), "proxy encode holds its slot");
     let mut run = |encoder: &str, hw_decode: Option<&str>| -> Result<Streamed> {
         let mut args = build_proxy_args(
             src_str,
@@ -2514,17 +2542,6 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         cpu::limit_args(&mut args, threads);
         run_ffmpeg_streamed(&bin, &args, duration, EXPORT_STALL, &mut *progress, cancel)
     };
-    // GPU encode (and decode) when available — a background proxy transcode
-    // then costs the CPU almost nothing. A failure falls back to the software
-    // pipeline once, and a hardware-*encoder* failure whose software retry
-    // succeeds disables hardware encodes for the rest of the process.
-    // A padded proxy is encoded from a graph whose output has no frame rate (its
-    // `interleave` hands the encoder microsecond timestamps), which a hardware
-    // encoder may refuse — and one refusal turns hardware encoding off for the
-    // whole process. These sources are rare and the encode is the same all-intra
-    // x264 pass, so they never ask.
-    let hw_enc = if head_pad.is_some() { None } else { proxy_hw_encoder() };
-    let hw_dec = decode_hwaccel_for(src, Reading::Whole);
     let mut output = run(hw_enc.unwrap_or("libx264"), hw_dec.as_deref())?;
     if output.outcome == StreamOutcome::Cancelled {
         let _ = std::fs::remove_file(&tmp);
@@ -2546,6 +2563,9 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         } else {
             output.stderr.trim().to_string()
         };
+        // The rerun is software on the cores: a hardware job's slot is not the one for it. It
+        // gives that slot up and queues for the cores' (in its lane, and it can be stopped there).
+        let _software_slot = cpu.fall_back_to_cpu(&mut |_| {}, cancel)?;
         output = run("libx264", None)?;
         if output.outcome == StreamOutcome::Cancelled {
             let _ = std::fs::remove_file(&tmp);
@@ -2614,6 +2634,29 @@ struct Blame {
 /// and an encode that was software already has nothing to fall back to.
 fn retry_proxy_in_software(outcome: StreamOutcome, success: bool, hw_encode: bool, hw_decode: bool) -> bool {
     !success && matches!(outcome, StreamOutcome::Ended | StreamOutcome::Stalled) && (hw_encode || hw_decode)
+}
+
+/// Which resource a proxy encode spends (pure, unit-tested): the hardware's slot only when it
+/// is hardware from end to end, and the cores' for everything else, doubts included. That is: the
+/// lane is on; a verified hardware encoder (`hw_encoder`) takes it; the source is handed a **named**
+/// decoder (`d3d11va`, which exits non-zero without a device, where `auto` falls back to software
+/// without a word — on Linux and macOS the request stays `auto`, so those stay the cores' until
+/// a decoder is probed); that decoder decodes this source (H.264 or HEVC in 4:2:0, by what the
+/// probe says); and nothing is tone-mapped (that is `zscale` on the cores, about two of them).
+fn proxy_resource(
+    hw_encoder: Option<&str>,
+    hw_decoder: Option<&str>,
+    tone_mapped: bool,
+    source: InputFacts,
+    lane_on: bool,
+) -> cpu::Resource {
+    let named = hw_decoder.is_some_and(|d| !d.trim().is_empty() && !d.trim().eq_ignore_ascii_case("auto"));
+    let decodes = matches!(source.codec, Codec::H264 | Codec::Hevc) && source.chroma == Chroma::Yuv420;
+    if lane_on && hw_encoder.is_some() && named && decodes && !tone_mapped {
+        cpu::Resource::Gpu
+    } else {
+        cpu::Resource::Cpu
+    }
 }
 
 /// How a streamed ffmpeg run ended.
@@ -4801,6 +4844,144 @@ fn tune_export_args(args: &mut Vec<String>, assets: &[Asset], os: HostOs) -> boo
     tune_inputs(args, os, Reading::Whole, &facts_from_assets(assets)).hw
 }
 
+/// The filters a graph may hold and still be hardware from end to end: the picture goes through
+/// the cores only to be scaled, laid over a canvas and handed to the encoder (about 5 % of a
+/// hardware export's wall time, measured), and the sound through filters that cost next to nothing
+/// beside a video encode. Anything else (`zscale` and the tone-map, `geq`, `rotate`, `v360`,
+/// `drawtext`, a blur, a grade, a chroma key, a keyed opacity) is per-pixel work on the cores, and
+/// a name nobody here has judged is such work until it is.
+const HARDWARE_GRAPH_FILTERS: [&str; 33] = [
+    // picture
+    "color",
+    "format",
+    "trim",
+    "setpts",
+    "scale",
+    "pad",
+    "setsar",
+    "fps",
+    "overlay",
+    "null",
+    "split",
+    "crop",
+    "settb",
+    "fade",
+    // sound
+    "anullsrc",
+    "atrim",
+    "asetpts",
+    "atempo",
+    "volume",
+    "afade",
+    "aformat",
+    "adelay",
+    "amix",
+    "apad",
+    "pan",
+    "alimiter",
+    "aresample",
+    "asplit",
+    "anull",
+    "loudnorm",
+    "acompressor",
+    "agate",
+    "asetnsamples",
+];
+
+/// The filter names of a `-filter_complex` value, in order (pure, unit-tested): what follows each
+/// run of `[label]`s at the start of a filter, up to its `=` or `[`. Commas and semicolons inside
+/// single quotes or after a backslash are the filter's own (an expression), not the next filter.
+fn filter_names(graph: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    let bytes = graph.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Labels and spaces in front of a filter.
+        while i < bytes.len() && (bytes[i] == b'[' || bytes[i].is_ascii_whitespace()) {
+            if bytes[i] == b'[' {
+                while i < bytes.len() && bytes[i] != b']' {
+                    i += 1;
+                }
+            }
+            i += 1;
+        }
+        let from = i;
+        while i < bytes.len() && !matches!(bytes[i], b'=' | b'[' | b',' | b';') && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i > from {
+            names.push(&graph[from..i]);
+        }
+        // The rest of this filter: to the next `,` or `;` that is not quoted or escaped.
+        let mut quoted = false;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 1,
+                b'\'' => quoted = !quoted,
+                b',' | b';' if !quoted => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        i += 1;
+    }
+    names
+}
+
+/// Which resource a built export argv (after `tune_inputs`, before the graph is spilled to a file)
+/// spends (pure, unit-tested): the hardware's slot ([`cpu::Resource::Gpu`]) only when the run is
+/// hardware from end to end, and the cores' for everything else, which includes every doubt.
+///
+/// Hardware from end to end means all of: the lane is on; the video encoder is a hardware one
+/// (`h264_amf`, `hevc_nvenc`, ...); every input is either a still image or a video that is
+/// handed a **named** accelerator (`d3d11va`: it exits non-zero without a device where `auto`
+/// falls back to software without a word, and a run that does that is a software run holding a
+/// hardware slot) and that accelerator decodes (H.264 or HEVC, 4:2:0, by what the asset records);
+/// and the graph holds only [`HARDWARE_GRAPH_FILTERS`]. A run asked for no hardware decode at all,
+/// as the rerun after a failure is, fails the second test and is the cores'.
+fn export_resource(args: &[String], facts_of: &dyn Fn(&str) -> InputFacts, lane_on: bool) -> cpu::Resource {
+    if !lane_on {
+        return cpu::Resource::Cpu;
+    }
+    let value_of = |flag: &str| args.iter().position(|a| a == flag).and_then(|at| args.get(at + 1));
+    if !value_of("-c:v").is_some_and(|enc| enc_family(enc) != EncFamily::Software) {
+        return cpu::Resource::Cpu;
+    }
+    // Inputs, in groups: everything up to and including each `-i <path>`.
+    let mut group_hwaccel: Option<&str> = None;
+    let mut graph: Option<&str> = None;
+    let mut inputs = 0;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "-hwaccel" => group_hwaccel = rest.next().map(String::as_str),
+            "-i" => {
+                inputs += 1;
+                let Some(path) = rest.next() else { return cpu::Resource::Cpu };
+                let facts = facts_of(path);
+                let video = matches!(facts.codec, Codec::H264 | Codec::Hevc) && facts.chroma == Chroma::Yuv420;
+                let named = group_hwaccel.is_some_and(|h| {
+                    !h.trim().is_empty() && !h.trim().eq_ignore_ascii_case("auto") && !h.trim().eq_ignore_ascii_case("none")
+                });
+                if !(facts.image || (video && named)) {
+                    return cpu::Resource::Cpu;
+                }
+                group_hwaccel = None;
+            }
+            "-filter_complex" => graph = rest.next().map(String::as_str),
+            _ => {}
+        }
+    }
+    let Some(graph) = graph.filter(|_| inputs > 0) else {
+        return cpu::Resource::Cpu;
+    };
+    if filter_names(graph).iter().all(|name| HARDWARE_GRAPH_FILTERS.contains(name)) {
+        cpu::Resource::Gpu
+    } else {
+        cpu::Resource::Cpu
+    }
+}
+
 /// One delivery of a multi-format export: the frame and where its file goes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExportVariant {
@@ -4987,8 +5168,11 @@ fn render_attempt(
     } else {
         let mut args = build_export_args(timeline, assets, output_str, opts)?;
         hw_used.set(tune_export_args(&mut args, assets, HostOs::CURRENT));
+        // Judged on the argv as it will run, before a long graph is spilled to a file: a run
+        // that asks no input for hardware (the rerun after a hardware failure) is the cores'.
+        let resource = export_resource(&args, &facts_from_assets(assets), cpu::gpu_lane());
         let _g = externalize_filter_complex(&mut args, "s")?;
-        run_ffmpeg_progress(
+        run_ffmpeg_progress_as(
             &args,
             output,
             Bar {
@@ -4997,6 +5181,7 @@ fn render_attempt(
                 width: 1.0,
                 start,
             },
+            resource,
             progress,
             cancel,
         )
@@ -5165,6 +5350,19 @@ fn run_ffmpeg_progress(
     progress: &mut dyn FnMut(ExportProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<RenderStatus> {
+    run_ffmpeg_progress_as(args, output, bar, cpu::Resource::Cpu, progress, cancel)
+}
+
+/// [`run_ffmpeg_progress`] for a run that spends `resource`: the cores' slot for any software
+/// run, the hardware's for one that is hardware from end to end ([`export_resource`]).
+fn run_ffmpeg_progress_as(
+    args: &[String],
+    output: &Path,
+    bar: Bar,
+    resource: cpu::Resource,
+    progress: &mut dyn FnMut(ExportProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<RenderStatus> {
     use std::io::{BufRead, BufReader, Read};
     use std::process::Stdio;
 
@@ -5173,17 +5371,19 @@ fn run_ffmpeg_progress(
     // second pass and a stitch inside an import do not queue behind themselves. It is the
     // foreground lane — ahead of any proxy still queued — and a render that has to wait says
     // so through `progress` and can be cancelled while it does.
-    let cpu = match cpu::lease_waiting(
-        &mut |wait| {
-            progress(ExportProgress {
-                fraction: bar.offset,
-                elapsed_secs: bar.start.elapsed().as_secs_f64(),
-                eta_secs: None,
-                waiting: Some(wait.message()),
-            });
-        },
-        cancel,
-    ) {
+    let mut on_wait = |wait: cpu::Wait| {
+        progress(ExportProgress {
+            fraction: bar.offset,
+            elapsed_secs: bar.start.elapsed().as_secs_f64(),
+            eta_secs: None,
+            waiting: Some(wait.message()),
+        });
+    };
+    let leased = match resource {
+        cpu::Resource::Cpu => cpu::lease_waiting(&mut on_wait, cancel),
+        cpu::Resource::Gpu => cpu::lease_gpu_waiting(&mut on_wait, cancel),
+    };
+    let cpu = match leased {
         Ok(lease) => lease,
         Err(Error::Cancelled) => return Ok(RenderStatus::Cancelled),
         Err(e) => return Err(e),
@@ -5191,7 +5391,7 @@ fn run_ffmpeg_progress(
     let mut args = args.to_vec();
     cpu::limit_args(&mut args, cpu.threads());
     let args = &args[..];
-    tracing::info!(output = %output.display(), "exporting timeline");
+    tracing::info!(output = %output.display(), resource = ?cpu.resource(), "exporting timeline");
     tracing::debug!(command = %format!("{bin} {}", args.join(" ")), "ffmpeg export command");
 
     // `-progress pipe:1` writes machine-readable key=value blocks to stdout;
@@ -7413,6 +7613,10 @@ mod rendered;
 /// The still inside a fade, a dip, a dissolve, a slide or a push: its layers and their fades.
 mod still_fx;
 use still_fx::{still_layers, StillFades};
+
+/// Which slot a job takes, the cores' or the hardware's.
+#[cfg(test)]
+mod lane_tests;
 
 /// The scrubbed still held to the export's frame at the same moment (`#[ignore]`d).
 #[cfg(test)]

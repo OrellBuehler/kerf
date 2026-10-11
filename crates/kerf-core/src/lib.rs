@@ -39,8 +39,8 @@ pub use captions_import::{
 };
 pub use clip_timing::{FadeEdge, FadeStep, FadeTint, MotionKeys, Rational};
 pub use engine::cpu::{
-    budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, high_pending as proxy_jobs_pending, set_cpu_percent,
-    DEFAULT_CPU_PERCENT, MIN_CPU_PERCENT,
+    budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, gpu_lane, high_pending as proxy_jobs_pending,
+    set_cpu_percent, set_gpu_lane, DEFAULT_CPU_PERCENT, MAX_GPU_JOBS, MIN_CPU_PERCENT,
 };
 pub use engine::{
     composite_color_policy, contact_sheet_times, decode_audio, decode_hwaccel, disable_decode_hwaccel, download_speech_model,
