@@ -8,7 +8,7 @@
 | GPU-3 Still fallback fades/transitions | gpu-3 | #129 | review (CI) | gpu-compositor still path | reproduced: still vs export worst channel 160–223 inside dissolve/dip/fade/slide/push; after: 0 levels (white dip ≤2 outside its fade). GPU parity refused transition frames 3–31 dB → 99 dB. Golden still family blessed: 1581/5600 cases, all in the new still-fade*/still-tail/still-travel families. Review r2: no blocking. Fuzz (40 random timelines/rate): frames >24 levels off 814/1008/1136 → 12/10/15 (24/29.97/30 fps) |
 | UI-2 Shared components | ui-2 | #132 | review (CI) | dialogs M31 + structural; panels H3, H4, M1, M3; timeline H14 (toolbar), M9 | dev done: check/test (2193)/build green; Modal adopted by all 6 dialogs, SliderRow across inspector |
 | UI-4 Timeline and preview layout | ui-4 | #130 | review (CI) | timeline H1, H2, H6 (partial), H7–H10, M11, M12 (partial), M20; + M4, M5, M6, M18 (focus ring), P2, P7, P8, P9, P12, P14; Light clip-overlay strokes | dev done: check/test (2193)/build green |
-| UI-6 Copy and accessibility | ui-6 (on ui-2) | | in-progress | dialogs 5–7, 9 + copy deck; shell M3, M4 + tooltip/hit targets; timeline context-menu keyboard; + dialogs M13 (indeterminate progress) and shell M9 leftover (toast icons shared with NotificationCenter) | wave 2 |
+| UI-6 Copy and accessibility | ui-6 (on ui-2) | | review | dialogs 5–7, 9 + copy deck; shell M3, M4 + tooltip/hit targets; timeline context-menu keyboard; + dialogs M13 (indeterminate progress) and shell M9 leftover (toast icons shared with NotificationCenter) | wave 2 |
 | PERF-2 Scene detection on proxy | perf-2 (pushed) | | ready (PR after #131) | gpu-media WP3 (scenes + contact sheet; salience not swapped) | cut lists identical to the original in every case (H.264, HEVC 10-bit, 4:2:2, late-start .lead, rotated, VFR MKV). 4K, CPU-s: H.264 21.1→3.0; HEVC 10-bit 29.1→3.2; 4:2:2 36.1→3.3 (7–11x) |
 | PERF-3 Playback | perf-3 (on ui-4) | | in-progress | gpu-compositor WP-0(a)(c); gpu-media WP7; + playback stream width follows the preview request width (fixed PREVIEW_STREAM_WIDTH makes playing frames softer than paused, found in UI-4) | wave 2 |
 | GPU-1 Proxy colour normalisation | gpu-1 (pushed, no PR) | | blocked (needs a decision) | gpu-compositor WP-3 (partial: untagged HD labelled bt709; SD/601/2020/RGB not converted) | stacks refused on 9.0.2 (15 cases): 11 → 5; untagged HD colour vs source 28.0 dB → 43.3 dB on 9.0.2; nothing moves on 6.1.1 |
@@ -28,6 +28,7 @@
 - CI: evermeet serves ffmpeg, then 429s ffprobe for longer than a job can wait. Verified archives are now cached one at a time and saved even when the fetch fails, so progress accumulates across runs. Only #131 is pushed while this settles, to keep evermeet traffic down; the other PRs pick it up from main.
 - PERF-2 is verified and pushed. Its PR waits for #131, because every PR run fetches from evermeet and adds to the throttling.
 - UI-6 is stacked on ui-2 and PERF-3 on ui-4 while those PRs wait on CI. Each merges main once its base lands.
+- UI-6: the themed tooltip is not hoverable (`pointer-events:none`), so it can't swallow a click on the next toolbar row. Escape is consumed only when keyboard focus raised the tip. `confirmAction` requires named buttons. The Update dialog isn't busy while downloading (Hide continues it). Failure copy is one line, `X failed — Reason`. Toast glyphs use the -400 hues for contrast.
 - CI: wrote the small ffmpeg-download retry myself (#131) instead of starting a dev agent: it is CI plumbing, not feature code, and two PRs were blocked on it.
 - Commits are authored as the repo owner (the container's default git identity names the assistant, which the commit rules forbid).
 - The tracker and `after/` artifacts are force-added (docs/ is git-ignored) and pushed to `docs/review-2026-10-10` so they survive the container. That commit skips the hooks, since whitespace fixers would corrupt the prototype .patch files and typos flags hash fragments in them. Earlier note: the tracker and the `after/` screenshots live on the `docs/review-2026-10-10` branch, since work-package branches start from main, which does not carry this folder.
@@ -56,6 +57,8 @@
 
 ## Needs a real machine
 
+- UI-6: native three-button Save/Don't save/Cancel via plugin-dialog on WebView2/WebKitGTK/WKWebView; tooltips on disabled controls in WebKit; keyboard-opened context menu (Menu key, Shift+F10), its focus return and coordinates.
+
 - PERF-2: score shift with hardware-encoded proxies is unmeasured (figures are libx264). Scene scores of hardware-decoded originals (nv12/p010 download on Windows) are unverified.
 - PERF-2: GPU-decode timings (Windows/NVIDIA/macOS) shrink the speedup; real HDR iPhone and Canon R5 II footage (are C-Log3/PQ files tagged HDR?).
 
@@ -78,6 +81,10 @@
 - UI-3: dialog focus return, `inert` timing and the focus rescue checked in Chromium only; confirm in WebView2, WebKitGTK and WKWebView.
 
 ## Needs a decision
+
+- UI-6: make the tooltip hoverable (WCAG 1.4.13)? It's a one-line change.
+- UI-6: keep Hide on the Update dialog while downloading?
+- UI-6: show "Step n of m" on multi-stage progress?
 
 - CI: evermeet.cx has throttled the macOS pinned-ffmpeg fetch since ~00:58 UTC, so #129–#132 can't go green. The jobs can't be re-run from here (403). Options: re-run the macOS engine job by hand later; or change the macOS x86 ffmpeg source (a new pin and hashes, a supply-chain choice).
 
