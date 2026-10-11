@@ -18,7 +18,7 @@
 | PERF-4 Still cache and prefetch | | | todo | gpu-media WP6, WP9 | wave 3 |
 | GPU-2 Text on the GPU | | | todo | gpu-compositor | wave 3 |
 | GPU-4 … GPU-7, PERF-5, macOS presenter | | | todo | | wave 4 |
-| CI: retry ffmpeg download | ci-fetch-retry | #131 | review (CI) | not a review finding | evermeet.cx refused/throttled the macOS pinned-ffmpeg fetch on #129 and #130; ported into both |
+| CI: retry + cache ffmpeg download | ci-fetch-retry | #131 | blocked (evermeet 429) | not a review finding | evermeet.cx throttles the macOS pinned-ffmpeg fetch (ffprobe 429 for 6.5+ min); retry + actions/cache ported into #129, #130, #132; cache fills only after one successful run |
 
 ## Decisions
 
@@ -74,6 +74,8 @@
 - UI-3: dialog focus return, `inert` timing and the focus rescue checked in Chromium only; confirm in WebView2, WebKitGTK and WKWebView.
 
 ## Needs a decision
+
+- CI: evermeet.cx has throttled the macOS pinned-ffmpeg fetch since ~00:58 UTC, so #129–#132 can't go green. The jobs can't be re-run from here (403). Options: re-run the macOS engine job by hand later; or change the macOS x86 ffmpeg source (a new pin and hashes, a supply-chain choice).
 
 - GPU-1 (blocked): how to stack untagged HD with BT.709 on the GPU without the preview diverging from the export. (A) keep the proxy label and label the export/still/stream graphs too: golden moves 2921/2075/628, plus a planner mirror, and the translucent/caption divergences remain. (B, the dev agent's recommendation) drop the proxy label and label in the graphs only where a tagged layer shares the graph: preview equals export by construction, single clips unchanged, similar golden move. (C) drop it: mixed stacks stay refused on 9.0.2 and render through FFmpeg as today. Prototype patches and full tables: after/gpu-1/label-export-prototype/ and after/gpu-1/label-export-findings.txt.
 
