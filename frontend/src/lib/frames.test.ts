@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
 	clampEdge,
+	ceilToFrame,
+	clampPlayhead,
 	frameIndex,
 	frameTime,
 	nearestWithin,
@@ -9,9 +11,14 @@ import {
 	quantizeFade,
 	quantizeSpanStart,
 	quantizeTime,
+	secondFrames,
+	seekTime,
+	shownFrame,
 	snapToFrame,
 	splitPoint,
 	startBefore,
+	stepFrames,
+	stepPoint,
 	trimEdit,
 	WELD_EPS
 } from './frames';
@@ -401,5 +408,201 @@ describe('nearestWithin', () => {
 		expect(nearestWithin(1, [1.4, 1.2, 0.95], 0.5)).toBe(0.95);
 		expect(nearestWithin(1, [], 5)).toBeNull();
 		expect(nearestWithin(1, [1], 0)).toBeNull();
+	});
+});
+
+describe('seekTime', () => {
+	test('lands on the frame the time falls on, for every common rate', () => {
+		const rand = rng(7);
+		for (const fps of RATES) {
+			for (let i = 0; i < 300; i++) {
+				const t = rand() * 300;
+				const s = seekTime(t, fps, 600);
+				expect(onFrame(s, fps)).toBe(true);
+				expect(Math.abs(s - t)).toBeLessThanOrEqual(0.5 / fps + 1e-12);
+			}
+		}
+	});
+
+	test('a step of a frame from a seek is a whole frame, with no sub-frame offset left over', () => {
+		for (const fps of RATES) {
+			const at = seekTime(12.3456, fps, 600);
+			const next = seekTime(at + 1 / fps, fps, 600);
+			expect(frameIndex(next, fps) - frameIndex(at, fps)).toBe(1);
+			expect(onFrame(next, fps)).toBe(true);
+		}
+	});
+
+	test('is held to the cut, and the end of the cut is exactly the end', () => {
+		expect(seekTime(-4, 30, 20)).toBe(0);
+		expect(seekTime(25, 30, 20.51)).toBe(20.51);
+		expect(seekTime(20.51, 30, 20.51)).toBe(20.51);
+		expect(seekTime(20.49, 30, 20.51)).toBe(frameTime(615, 30));
+	});
+
+	test('an empty cut parks the playhead at 0', () => {
+		expect(seekTime(6.2, 30, 0)).toBe(0);
+	});
+});
+
+describe('stepPoint', () => {
+	test('goes to the nearest point ahead or behind, as the playhead will stand on it', () => {
+		const marks = [3, 9.5, 14.25];
+		expect(stepPoint(marks, 0, 1, 30, 60)).toBe(3);
+		expect(stepPoint(marks, 3, 1, 30, 60)).toBe(frameTime(285, 30));
+		expect(stepPoint(marks, 14.25, -1, 30, 60)).toBe(frameTime(285, 30));
+		expect(stepPoint(marks, 20, 1, 30, 60)).toBeNull();
+		expect(stepPoint(marks, 3, -1, 30, 60)).toBeNull();
+	});
+
+	test('a point between frames is passed once, not stepped to for ever', () => {
+		// the playhead on frame 154 (5.133 s) is already on the marker at 5.1234
+		const marks = [5.1234, 9];
+		const here = seekTime(5.1234, 30, 60);
+		expect(stepPoint(marks, here, 1, 30, 60)).toBe(9);
+		expect(stepPoint(marks, here, -1, 30, 60)).toBeNull();
+	});
+
+	test('a point past the end of the cut is the end', () => {
+		expect(stepPoint([100], 0, 1, 30, 20.51)).toBe(20.51);
+	});
+});
+
+describe('clampPlayhead', () => {
+	test('takes a playhead left past the end of a shortened cut back to its new end', () => {
+		expect(clampPlayhead(6.2, 0)).toBe(0);
+		expect(clampPlayhead(30, 20.5)).toBe(20.5);
+	});
+
+	test('leaves one that is inside, or exactly at the end', () => {
+		expect(clampPlayhead(6.2, 20)).toBeNull();
+		expect(clampPlayhead(20.5, 20.5)).toBeNull();
+		expect(clampPlayhead(0, 0)).toBeNull();
+	});
+});
+
+describe('seekTime — going to the start of something', () => {
+	test('up lands on the first frame at or after the time, never before it', () => {
+		const rand = rng(11);
+		for (const fps of RATES) {
+			for (let i = 0; i < 300; i++) {
+				const t = rand() * 300;
+				const up = seekTime(t, fps, 600, { snap: 'up' });
+				expect(onFrame(up, fps)).toBe(true);
+				expect(up).toBeGreaterThanOrEqual(t - 1e-9);
+				expect(up - t).toBeLessThan(1 / fps + 1e-9);
+			}
+		}
+	});
+
+	test('nearest can land before the start of a title, up cannot', () => {
+		// a title at 1.01 s on a 30 fps cut: frame 30 is 1.0 s (before it, so it is not on screen), 31 is 1.0333 s
+		expect(seekTime(1.01, 30, 60)).toBe(frameTime(30, 30));
+		expect(seekTime(1.01, 30, 60, { snap: 'up' })).toBe(frameTime(31, 30));
+	});
+
+	test('a time already on a frame stays there, float noise or not', () => {
+		for (const fps of RATES) {
+			const t = frameTime(1234, fps);
+			expect(seekTime(t, fps, 600, { snap: 'up' })).toBe(t);
+			expect(seekTime(t + 1e-9, fps, 600, { snap: 'up' })).toBe(t);
+			expect(ceilToFrame(t - 1e-9, fps)).toBe(t);
+		}
+	});
+
+	test('is capped at the end of the span gone to, for one shorter than a frame', () => {
+		// 1.01 .. 1.02 holds no frame boundary: the playhead goes to its end, inside it
+		expect(seekTime(1.01, 30, 60, { snap: 'up', end: 1.02 })).toBe(1.02);
+		// and is not capped when the next frame is inside it
+		expect(seekTime(1.01, 30, 60, { snap: 'up', end: 3 })).toBe(frameTime(31, 30));
+		// an end before the start asked for does not drag it back
+		expect(seekTime(1.01, 30, 60, { snap: 'up', end: 0.5 })).toBe(1.01);
+	});
+
+	test('is still held to the cut, and the end of the cut is the end', () => {
+		expect(seekTime(25, 30, 20.51, { snap: 'up' })).toBe(20.51);
+		expect(seekTime(20.505, 30, 20.51, { snap: 'up' })).toBe(20.51);
+		expect(seekTime(-3, 30, 20, { snap: 'up' })).toBe(0);
+	});
+
+	test('the default is still nearest', () => {
+		expect(seekTime(1.0167, 30, 60, {})).toBe(seekTime(1.0167, 30, 60));
+		expect(seekTime(1.0167, 30, 60, { snap: 'nearest' })).toBe(frameTime(31, 30));
+	});
+});
+
+describe('seekTime — exactly', () => {
+	test('exact keeps the time as it is: a keyframe is not on a frame, and the playhead is at it', () => {
+		for (const t of [1.2345, 7.0001, 0.0166, 12.5]) expect(seekTime(t, 30, 60, { snap: 'exact' })).toBe(t);
+	});
+
+	test('exact is still held to the cut, and the end of the cut is the end', () => {
+		expect(seekTime(-2, 30, 20, { snap: 'exact' })).toBe(0);
+		expect(seekTime(25, 30, 20.51, { snap: 'exact' })).toBe(20.51);
+		expect(seekTime(Number.NaN, 30, 20, { snap: 'exact' })).toBe(0);
+	});
+});
+
+describe('stepFrames — steps from the frame being shown', () => {
+	test('shownFrame is the floor the timecode counts', () => {
+		expect(shownFrame(12.49, 30)).toBe(374);
+		expect(shownFrame(frameTime(375, 30), 30)).toBe(375);
+		expect(shownFrame(frameTime(375, 30) - 1e-9, 30)).toBe(375);
+		expect(shownFrame(Number.NaN, 30)).toBe(0);
+	});
+
+	test('a playhead paused mid-frame steps by exactly one shown frame, either way', () => {
+		const rand = rng(23);
+		for (const fps of RATES) {
+			for (let i = 0; i < 300; i++) {
+				const t = 1 + rand() * 300;
+				const k = shownFrame(t, fps);
+				const fwd = stepFrames(t, 1, fps, 600);
+				const back = stepFrames(t, -1, fps, 600);
+				expect(shownFrame(fwd, fps)).toBe(k + 1);
+				expect(shownFrame(back, fps)).toBe(k - 1);
+				expect(onFrame(fwd, fps) && onFrame(back, fps)).toBe(true);
+			}
+		}
+	});
+
+	test('the first step after a pause neither skips a frame nor does nothing', () => {
+		// 12.49 s shows frame 374; rounding the time would put "back" on 374 again and "forward" on 375
+		expect(stepFrames(12.49, -1, 30, 60)).toBe(frameTime(373, 30));
+		expect(stepFrames(12.49, 1, 30, 60)).toBe(frameTime(375, 30));
+		// 12.51 s shows 375; the old +1/fps then rounding landed on 376 after skipping, or 375 again going back
+		expect(stepFrames(12.51, 1, 30, 60)).toBe(frameTime(376, 30));
+		expect(stepFrames(12.51, -1, 30, 60)).toBe(frameTime(374, 30));
+	});
+
+	test('a second is the rate\'s nominal frame count', () => {
+		expect(secondFrames(30)).toBe(30);
+		expect(secondFrames(30000 / 1001)).toBe(30);
+		expect(secondFrames(24000 / 1001)).toBe(24);
+		expect(secondFrames(0)).toBe(30);
+		expect(stepFrames(frameTime(100, 24), secondFrames(24), 24, 60)).toBe(frameTime(124, 24));
+	});
+
+	test('is held to the cut: 0 at the start, the end at the end', () => {
+		expect(stepFrames(0, -1, 30, 20)).toBe(0);
+		expect(stepFrames(20.51, 1, 30, 20.51)).toBe(20.51);
+		// from the end of a cut that does not end on a frame, back is a frame from the one shown there
+		expect(stepFrames(20.51, -1, 30, 20.51)).toBe(frameTime(614, 30));
+	});
+
+	test('with no usable rate it still moves, by thirtieths', () => {
+		expect(stepFrames(1, 1, 0, 60)).toBeCloseTo(1 + 1 / 30, 9);
+	});
+});
+
+describe('stepPoint — the start of something', () => {
+	test('up steps to the first frame inside each point, and does not stick', () => {
+		const marks = [1.01, 5.1234];
+		const first = stepPoint(marks, 0, 1, 30, 60, 'up')!;
+		expect(first).toBe(frameTime(31, 30));
+		const second = stepPoint(marks, first, 1, 30, 60, 'up')!;
+		expect(second).toBe(frameTime(154, 30));
+		expect(stepPoint(marks, second, 1, 30, 60, 'up')).toBeNull();
+		expect(stepPoint(marks, second, -1, 30, 60, 'up')).toBe(first);
 	});
 });

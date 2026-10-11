@@ -27,6 +27,29 @@ export function focusLost(active: unknown, body: unknown, root: unknown, parked 
 	return !active || active === body || (parked && active === root);
 }
 
+export type CloseVia = 'escape' | 'scrim' | 'button';
+
+export interface CloseRules {
+	/** A run that cannot be walked away from: nothing closes the dialog but its own Cancel. */
+	busy?: boolean;
+	/** A click on the scrim closes it. Off for a dialog that holds work: typed input, chosen options. */
+	dismissOnScrim?: boolean;
+}
+
+/** Whether a way of closing a dialog works right now. Escape and the close button are
+ *  deliberate; the scrim is where a stray click lands, so a dialog can set it aside. */
+export function mayClose(via: CloseVia, { busy = false, dismissOnScrim = true }: CloseRules = {}): boolean {
+	if (busy) return false;
+	return via === 'scrim' ? dismissOnScrim : true;
+}
+
+/** A click on the scrim is one that began there too: a press inside the dialog that is
+ *  released outside it (selecting text in a field, then letting go over the dark) lands its
+ *  click on the scrim as well, and must not close what the user was typing in. */
+export function scrimClick(pressedOnScrim: boolean, target: unknown, scrim: unknown): boolean {
+	return pressedOnScrim && target === scrim;
+}
+
 export interface TrapOptions {
 	/** What takes focus on open instead of the dialog itself: a selector for a field. */
 	initial?: string;

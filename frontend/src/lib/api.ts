@@ -2788,8 +2788,22 @@ function seedDevStaged() {
 	entries.push({
 		kind: 'overlay_added',
 		summary: `Added text “${overlay.text}” at ${fmtTime(overlay.start)}–${fmtTime(overlay.end)}`,
+		overlay_id: overlay.id,
 		at: overlay.start
 	});
+	// With the sample song on a track of its own (`?music=1`), the proposal also drops it, so the
+	// review has a removal to draw.
+	const bedTrack = proposed.tracks.find((t) => t.kind === 'audio' && t !== audio && t.clips.length > 0);
+	if (bedTrack) {
+		const [gone] = bedTrack.clips.splice(0, 1);
+		entries.push({
+			kind: 'clip_removed',
+			summary: `Removed clip from ${bedTrack.name} at ${fmtTime(gone.timeline_start)} (${clipDuration(gone).toFixed(1)}s)`,
+			track_id: bedTrack.id,
+			clip_id: gone.id,
+			at: gone.timeline_start
+		});
+	}
 
 	const countClips = (tl: Timeline) => tl.tracks.reduce((n, t) => n + t.clips.length, 0);
 	devStaged = {
@@ -2798,7 +2812,7 @@ function seedDevStaged() {
 			base_seq: devHead,
 			task_id: devTasks.find((t) => t.status === 'ready')?.id ?? null,
 			note: 'Tighten the intro',
-			edits: ['Trim clip', 'Move clip', 'Trim clip', 'Add overlay'],
+			edits: ['Trim clip', 'Move clip', 'Trim clip', 'Add overlay', ...(bedTrack ? ['Remove clip'] : [])],
 			created_at: now(),
 			updated_at: now(),
 			stale: false,

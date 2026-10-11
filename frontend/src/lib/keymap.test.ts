@@ -294,6 +294,9 @@ function legacyAction(e: KeyEventLike): string | null {
 	if (k === 'm') return 'marker.add';
 	if (e.key === ',') return 'marker.prev';
 	if (e.key === '.') return 'marker.next';
+	// Added with the proposal review (the symbol keys, like , and ., answer whatever Shift says).
+	if (e.key === '[') return 'review.prevChange';
+	if (e.key === ']') return 'review.nextChange';
 	if (k === 'j') return 'playback.shuttleBack';
 	if (k === 'k') return 'playback.pause';
 	if (k === 'l') return 'playback.shuttleForward';
@@ -320,7 +323,11 @@ const ADDED: Record<string, string> = {
 	u: 'tool.slide',
 	q: 'edit.trimStart',
 	w: 'edit.trimEnd',
-	s: 'tool.snap'
+	s: 'tool.snap',
+	// The previous / next change of a proposal on the timeline. Page Up / Down, not the arrows: a focused
+	// button (the Preview button just clicked) keeps the arrows, and these types on every layout.
+	PageUp: 'review.prevChange',
+	PageDown: 'review.nextChange'
 };
 
 /** The chords with a modifier that were given an action after the registry existed (linked
@@ -336,7 +343,7 @@ function expectedAction(e: KeyEventLike): string | null {
 	const k = e.key.toLowerCase();
 	const mod = e.metaKey || e.ctrlKey;
 	if (!e.altKey) {
-		const added = mod && e.shiftKey ? ADDED_MOD_SHIFT[k] : mod ? ADDED_MOD[k] : e.shiftKey ? ADDED_SHIFT[k] : ADDED[k];
+		const added = mod && e.shiftKey ? ADDED_MOD_SHIFT[k] : mod ? ADDED_MOD[k] : e.shiftKey ? ADDED_SHIFT[k] : (ADDED[e.key] ?? ADDED[k]);
 		if (added) return added;
 	}
 	return legacyAction(e);
@@ -1074,21 +1081,19 @@ describe('no key is hard-coded outside the registry', () => {
 		expect(handlers).toEqual([
 			'lib/components/editor/AgentPanel.svelte',
 			'lib/components/editor/ContextMenu.svelte',
-			'lib/components/editor/ExportDialog.svelte',
 			'lib/components/editor/FitMusicDialog.svelte',
 			'lib/components/editor/KeyboardSettings.svelte',
 			'lib/components/editor/LibraryPanel.svelte',
 			'lib/components/editor/MediaBin.svelte',
 			'lib/components/editor/MenuBar.svelte',
 			'lib/components/editor/MixSlider.svelte',
+			'lib/components/editor/Modal.svelte',
 			'lib/components/editor/NotificationCenter.svelte',
 			'lib/components/editor/Preview.svelte',
 			'lib/components/editor/ScrubBar.svelte',
-			'lib/components/editor/SettingsDialog.svelte',
-			'lib/components/editor/StemsDialog.svelte',
+			'lib/components/editor/SliderRow.svelte',
 			'lib/components/editor/Timeline.svelte',
 			'lib/components/editor/TitlesControls.svelte',
-			'lib/components/editor/UpdateDialog.svelte',
 			'lib/components/editor/VoiceoverDialog.svelte',
 			'lib/components/editor/WorkspaceTabs.svelte',
 			'lib/drag.ts',

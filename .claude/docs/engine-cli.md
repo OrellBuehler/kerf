@@ -99,6 +99,39 @@ so the feature is **only** activated through these forwards — which is what ma
   probe is added: `generate_proxy`'s own argv, and every argv in the golden oracle, is
   unchanged. `proxy_path` still costs the one cached `source_traits` probe of the *original*
   (it keys the file on HDR and the lead), as it did before.
+  **Whole-file analysis reads the proxy when one is ready** (never waited for: no file yet, "Always
+  original" or size Off, or a proxy that fails to read, and the original is read). Scene detection
+  (`detect_scenes_preferring(original, proxy, threshold)`, fed by `Project::scoring_proxy`) and a
+  contact sheet (`Project::sheet_proxy`) swap the path and nothing else, so no golden argv moves.
+  **The gate** is `proxy_fidelity`, from the cached `source_traits` of the original. *Times* (the
+  sheet): an MP4 / MOV / Matroska / WebM source (a transport stream's pad is not fixed and every
+  other container is unproven). *Scores* (scene detection): also SDR (no HLG / PQ transfer) and
+  `luma_plane` — a planar or semi-planar YCbCr or gray picture, whose plane 0 is the luma that
+  `select='scene'` scores and that a yuv420p proxy has; RGB (`gbrp`: the G plane; `rgb24`, `bgr0`:
+  every interleaved byte), packed YCbCr, a palette, alpha, an unknown or unprobed `pix_fmt` read the
+  original. Measured on the pinned 9.0.2 (`cli/scenes_on_proxy.rs`, `#[ignore]`d), through the software
+  (libx264) proxy — a hardware-encoded one is unmeasured: cut lists frame-exact for H.264, 10-bit
+  HEVC, 4:2:2 HEVC, a late video in MP4 and Matroska (the `.lead` pad's clone scores 0, and so does
+  the real first frame it duplicates), a display-matrix portrait clip and variable-rate Matroska;
+  the unpadded proxy of a late video is `lead` early. What a proxy does move is a frame's *score*,
+  by at most ~0.02 on SDR YCbCr (grain, compression), so a cut scored within that of the threshold
+  can flip; each fixture asserts its scores keep clear of it. HLG moves it by 0.20 to 0.21 (the
+  original is scored in its code values, the proxy is tone-mapped) and RGB by 0.53 (cuts lost), so
+  those read the original for scenes; a sheet only looks, so it takes the proxy (tone-mapped once).
+  FFmpeg 6 and older write a constant-rate proxy, so a variable-rate source's cuts are within half
+  a frame there. A sheet from a `.lead` proxy prefixes `trim=start_frame=1` when it starts at 0.000
+  (a later seek has skipped the clone), or the clone takes a slot and every cell shows its
+  neighbour's frame. Both reads are bounded: `-progress pipe:2` is added at spawn time and
+  `output_unless_stalled` kills ffmpeg after a stretch of stderr silence, so a hung proxy read
+  falls back to the original (a stalled original read is an error, not a short list of cuts).
+  ffmpeg reports **nothing until a frame has reached the output**, so the bound has to fit the
+  read: the scene pass selects frame 0 too (`eq(n,0)`, dropped again by `parse_scenes`, which
+  skips showinfo's `n:0`; never a cut) and reports every second from the start, 60 s
+  (`READ_STALL`) of silence being a wedge; a contact sheet's `tile` outputs only when the window
+  is decoded, so its bound is `sheet_stall` = 30 s per second of window, between 60 s and 2 h
+  (a 4:2:2 4K sheet is silent for the whole decode: 29 to 39 s measured).
+  `salience_map` (smart crop, framing) stays on the original: its crop moved by up to 4.6 % of the
+  frame width between original and proxy.
   **A proxy reports, can be abandoned, and cannot hang.** `generate_proxy_with(src, width,
   ProxyRun { reservation, duration, progress, cancel })` is `generate_proxy` with hooks (the
   latter is it with none): the encode runs through `run_ffmpeg_streamed`, which writes
@@ -127,7 +160,7 @@ so the feature is **only** activated through these forwards — which is what ma
   into its codec choices. Proxy generation uses the first verified h264 HW
   encoder and stitching the first hevc one (both fall back to libx264 on any
   failure, and one such failure disables HW encode for the process). Background
-  decodes (proxy, stitch, scene detection, the composited still) use the same
+  decodes (proxy, stitch, scene detection of an original, the composited still) use the same
   `-hwaccel` (default `auto`, `KERF_HWACCEL=none` to disable) with a learned
   software fallback shared with the preview path (`disable_decode_hwaccel()` is how a
   decoder outside the engine, `kerf-gpu`'s runs, teaches it one); the GUI defaults export
@@ -361,6 +394,41 @@ so the feature is **only** activated through these forwards — which is what ma
   dissolve) starts at `timeline_start + …` — timed from 0 they blacked out any
   later clip with a fade-out and dropped its fade-in and transitions. Audio is
   re-based to the clip before `adelay`, so its `afade`s stay clip-local.
+  **The scrubbed still draws fades, dips, dissolves, slides and pushes as the file does**
+  (`engine/cli/still_fx.rs`; it used to show each clip's own span unfaded — the incoming clip alone
+  inside a dissolve, 176 levels off the export's frame — and the agent's `timeline_frame`, the cover
+  and the preview fallback all went through that). `still_layers` takes the clips from
+  `active_video_clips_with_tails` (an outgoing clip stays a layer for its `ClipFx::tail`, read from
+  the source it borrows) and, per layer, the `ClipTiming::fades` still changing the picture at output
+  frame `k = Rational::frame_containing(t)` and the slide / push travel at `ffmpeg_frame_time(k)`
+  (added to the overlay position; `overlay` truncates it to pixels as it does in the file). A fade
+  is the export's own `fade` filter, run where the export runs it (after the rotation, ahead of a
+  moving zoom) on the frame restamped as frame `k` of a `1/fps` stream
+  (`settb=expr=den/num,setpts=k,fade=…,setpts=PTS-STARTPTS`: a `fade` counts frames of its input
+  time base, and `overlay` shows a secondary frame only from its timestamp on). A chain with no alpha
+  plane ends `format=yuv420p` after the fades (`yuva420p` for an alpha source), as the export's does:
+  left to negotiation `fade` runs on the `yuva420p` the overlay asks for, where black is 0 and not
+  the limited-range 16, up to 17 levels off on the way to black. A clip that entered through a
+  dissolve is on an alpha plane for good in the export (`xfade_in > 0`), so a later fade of its own
+  or a dip out runs on `yuva420p` too: the alpha decision is made from the clip's whole `fades()`
+  list whenever a fade is in progress (`StillFades::alpha_chain`), not from the ramp alone. A tail
+  is open for the frames whose slot starts inside its window (`active_video_clips_with_tails`'s
+  `tail_at`: the exact slot start plus a nanosecond), not for the still's raw `t`: a window of
+  18.3 frames closes inside one, and that frame still draws the tail (on the grid the frame that
+  starts at the window's end has none). A fade that is not changing the
+  picture is left out, so every still outside a transition keeps its argv (golden: 1581 of 5600
+  still cases moved, exactly the new `still-fade` / `still-tail` / `still-travel` families; export
+  and preview 0). **Everything that renders a still now returns the export's frame inside a
+  transition**: `timeline_frame` / `preview_timeline`, the preview fallback and `export_cover`, so a
+  cover at `t = 0` of a clip with a fade-in is black (or mid-fade at a later `t`), as the video's
+  frame is. Measured (`still_rendered.rs`, `#[ignore]`d, 6.1 and 9.0, 24 to 60 fps): every
+  pixel of every frame of a dissolve (also from black, from a still image, with a reversed or 2x
+  outgoing clip, a transformed, graded, translucent or zooming incoming one, over another track,
+  with the clips' own fades, one that fades or dips out after its dissolve, and a 0.61 s transition
+  at 30 fps asked for at the start, middle and end of every frame), a dip to black, a fade-in / out
+  and the eight slides and pushes is equal to the export's; a dip to white is up to 2 levels off outside its fade, where the file's
+  `fade c=white` at full strength still rounds. The still's frame *pick* is unchanged (`-ss`, not
+  the `fps` filter's), so moving footage can differ from the file by a source frame as ever.
   **What a clip does in time is `clip_timing.rs`** (pure, `pub(crate)`, no dependency
   on the engine): `ClipFx` (what its transitions gave it: tail, dissolve, dips, travel,
   HDR, head pad), `transition_fx` (indexed by flat clip *storage* index over the
@@ -645,7 +713,9 @@ so the feature is **only** activated through these forwards — which is what ma
   (a view of `source_traits`, one cached ffprobe per file) and append the chain
   after their own downscale.
   Salience and scene detection are analysis, not picture, and read the raw
-  frames. **The proxy is where preview footage is converted**: `generate_proxy`
+  frames of the original; scene detection reads the proxy's instead only where
+  `proxy_fidelity` says its scores are the same (SDR YCbCr in MP4 / MOV / Matroska, see
+  above). **The proxy is where preview footage is converted**: `generate_proxy`
   tone-maps while it downsizes, `Project::preview_assets` hands the graph the
   proxy-swapped asset as `Asset::as_sdr_proxy` (same geometry, no HDR tags), and
   a file's proxy key gains `|sdr` when it is HDR, so a proxy cached before this

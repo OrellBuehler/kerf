@@ -166,6 +166,10 @@ input[type='range'] {
 	background: transparent;
 	cursor: pointer;
 	--slider-accent: var(--kerf-500);
+	/* The track is 4 px: the box is what a pointer has to hit, and a native range has an intrinsic
+	   width that keeps a row from shrinking, so a value beside it clipped at the panel's minimum. */
+	height: 18px;
+	min-width: 0;
 }
 input[type='range']:disabled {
 	cursor: default;

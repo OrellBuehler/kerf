@@ -2018,21 +2018,19 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
 /// through `kind` over `secs`, the incoming clip `scale` of the frame (1 covers it, 0.5 leaves a
 /// border).
 ///
-/// What FFmpeg's still draws is the frame each *clip's own span* contributes: no fades, and no
-/// clip past its end. What the **export** draws is what plays, and a transition differs from the
-/// still in more places than where it is visibly mid-way: the outgoing clip's `enable` window
-/// runs on after the ramp (or the travel) is over, and it is drawn around an incoming clip that
-/// does not cover it. So the contract tested here is the one that matters — for every frame
-/// listed, either the plan refuses it, or the still it draws like is the export's frame (and the
-/// GPU matches that still strictly) — plus the expectations written out per frame: before the
-/// transition and after it frames are drawn, inside it (and on the frame after the ramp where
-/// only the tail is left) they are refused, and the second half of a dip, which has neither a
-/// tail nor a fade left, is drawn. Both FFmpegs.
+/// FFmpeg's still draws a frame inside a transition as the export does (the outgoing clip on its
+/// tail under the incoming one's ramp, the dips, the slide and push travel), and the compositor
+/// does not: a *still* plan has no tail layer and no fade, so a plan is refused wherever a fade
+/// is changing the picture, a travel moves a clip or a tail is open, and the frame goes to
+/// FFmpeg. So the contract tested here is that for every frame listed the still it draws like
+/// is the export's frame, and that the plan refuses exactly the frames expected — before the
+/// transition and after it frames are drawn (and the GPU matches that still strictly), inside it
+/// (and on the frame after the ramp where only the tail is left) they are refused, and the second
+/// half of a dip, which has neither a tail nor a fade left, is drawn. Both FFmpegs.
 ///
 /// A dissolve of 0.61 s is chosen so that a frame with *only* the tail left exists at 30 fps:
-/// the fade counts 18 frames (it is over at frame 48) and the window covers 18.3 of them. (A
-/// slide or a push cannot part from the still there: its travel ends when its window does, and
-/// an equal-rate outgoing clip has no frame at the very end; those frames are refused anyway.)
+/// the fade counts 18 frames (it is over at frame 48) and the window covers 18.3 of them. The
+/// still used to part from the export on that frame (a tail it did not draw); it draws it now.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn() {
@@ -2094,7 +2092,6 @@ fn frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn() {
             None,
         ),
     ];
-    let mut parted = 0;
     for (name, kind, secs, frames, tail_only) in cases {
         let assets = [m.bars.clone(), m.testsrc.clone()];
         for (cover, scale) in [("covering", 1.0), ("partial", 0.5)] {
@@ -2134,35 +2131,25 @@ fn frames_inside_a_transition_are_refused_and_the_ones_around_it_are_drawn() {
                     if refused { "refused" } else { "drawn  " },
                     apart.psnr_all
                 );
+                assert!(
+                    apart.psnr_all >= 35.0,
+                    "{case}: frame {k}: the FFmpeg still draws the transition differently from the export ({:.1} dB)",
+                    apart.psnr_all
+                );
                 if refused {
-                    // Only the tail is left on this frame; a border around the incoming clip shows it.
+                    // Only the tail is left on this frame: the plan says so, and the still draws it.
                     if scale < 1.0 && tail_only == Some(k) {
-                        assert!(
-                            apart.psnr_all < 25.0,
-                            "{case}: frame {k} is refused for a tail the export draws, yet the still agrees ({:.1} dB)",
-                            apart.psnr_all
-                        );
                         assert!(
                             why.iter().any(|r| r.contains("past its end")) && !why.iter().any(|r| r.contains("inside")),
                             "{case}: frame {k}: {why:?}"
                         );
-                        parted += 1;
                     }
                 } else {
-                    assert!(
-                        apart.psnr_all >= 35.0,
-                        "{case}: frame {k} is drawn like the still, but the export draws it differently ({:.1} dB)",
-                        apart.psnr_all
-                    );
                     check_with(&case, &tl, &assets, &[t], STRICT, &opts);
                 }
             }
         }
     }
-    assert_eq!(
-        parted, 1,
-        "the dissolve parts from the export on the frame only its tail is left on"
-    );
 }
 
 #[test]
