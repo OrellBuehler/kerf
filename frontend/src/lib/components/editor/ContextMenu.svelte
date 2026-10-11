@@ -1,7 +1,11 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
+	import Kbd from './Kbd.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
+	import { contextRows } from '$lib/menu-items';
+	import { firstRow, menuKey, rowFor } from '$lib/menu-nav';
 	import { tip } from '$lib/tip';
 
 	/** The window this instance draws in. One is mounted in the editor window and one in
@@ -13,6 +17,13 @@
 
 	let el = $state<HTMLDivElement | null>(null);
 	let pos = $state({ x: 0, y: 0 });
+	/** The row that holds the tab stop and, once the keys are in use, focus: an index into
+	 *  `contextMenu.items`, -1 while none does. */
+	let active = $state(-1);
+	/** What had focus when the menu opened, to give it back when the menu closes without a
+	 *  press elsewhere having moved it. */
+	let returnTo: HTMLElement | null = null;
+	const rows = $derived(contextRows(contextMenu.items));
 
 	// Clamp the menu into the viewport once it's measured. Runs after the element
 	// mounts (so offsetWidth/Height are real) and whenever the open position moves.
@@ -28,8 +39,30 @@
 		pos = { x: Math.max(margin, x), y: Math.max(margin, y) };
 	});
 
-	// Dismiss on a press outside the menu, on Esc, on scroll (any scroller, hence
-	// capture), on resize and when the window loses focus — in the window it is open in.
+	function rowEl(i: number): HTMLElement | null {
+		return el?.querySelector<HTMLElement>(`[data-row="${i}"]`) ?? null;
+	}
+
+	// The menu takes focus when it opens, so the keys have somewhere to start. Opened with the
+	// keyboard (the Menu key, Shift+F10, Enter on a button that opens one) the first row is lit and
+	// ready; opened with the pointer it is the panel that has focus, so nothing is lit until a key
+	// or the pointer picks a row.
+	$effect(() => {
+		void contextMenu.items;
+		if (!here || !el) return;
+		const menu = el;
+		untrack(() => {
+			const was = own.document.activeElement;
+			if (was instanceof HTMLElement && was !== own.document.body && !menu.contains(was)) returnTo = was;
+			const keys = !!returnTo?.matches(':focus-visible');
+			active = keys ? firstRow(rows) : -1;
+			(keys && active >= 0 ? rowEl(active) : menu)?.focus({ preventScroll: true });
+		});
+	});
+
+	// Dismiss on a press outside the menu, on scroll (any scroller, hence capture), on resize and
+	// when the window loses focus — in the window it is open in. Keys are heard in the capture phase,
+	// before the page's shortcuts: a menu is modal for them.
 	$effect(() => {
 		if (!here) return;
 		const w = own;
@@ -42,13 +75,13 @@
 		const onBlur = () => contextMenu.close();
 		w.addEventListener('scroll', onScroll, true);
 		w.addEventListener('pointerdown', onWindowPointerDown);
-		w.addEventListener('keydown', onKey);
+		w.addEventListener('keydown', onKey, true);
 		w.addEventListener('resize', onResize);
 		w.addEventListener('blur', onBlur);
 		return () => {
 			w.removeEventListener('scroll', onScroll, true);
 			w.removeEventListener('pointerdown', onWindowPointerDown);
-			w.removeEventListener('keydown', onKey);
+			w.removeEventListener('keydown', onKey, true);
 			w.removeEventListener('resize', onResize);
 			w.removeEventListener('blur', onBlur);
 		};
@@ -62,17 +95,56 @@
 		contextMenu.close();
 	}
 
+	/** Close, and put focus back where it was. */
+	function dismiss() {
+		const back = returnTo;
+		returnTo = null;
+		contextMenu.close();
+		if (back?.isConnected) back.focus({ preventScroll: true });
+	}
+
+	function focusRow(i: number) {
+		active = i;
+		rowEl(i)?.focus();
+	}
+
 	function onKey(e: KeyboardEvent) {
-		if (contextMenu.visible && e.key === 'Escape') {
+		if (!contextMenu.visible || !here) return;
+		const k = menuKey(e);
+		if (!k) return;
+		// A key that is typed while focus is elsewhere is not the menu's — except the one that
+		// closes it.
+		const inside = !!el && e.target instanceof Node && el.contains(e.target);
+		if (!inside && k.do !== 'close') return;
+		if (k.do === 'close') {
 			e.preventDefault();
-			contextMenu.close();
+			e.stopPropagation();
+			dismiss();
+		} else if (k.do === 'leave') {
+			// Tab goes on from where focus was, not from the menu that is about to go.
+			dismiss();
+		} else if (k.do === 'run') {
+			e.preventDefault();
+			e.stopPropagation();
+			const item = contextMenu.items[active];
+			if (item) run(item);
+		} else {
+			if (k.do !== 'type') e.preventDefault();
+			e.stopPropagation();
+			const to = rowFor(rows, active, k);
+			if (to !== null) focusRow(to);
 		}
 	}
 
 	function run(item: MenuItem) {
 		if (item.type !== undefined && item.type !== 'item') return;
 		if (item.disabled) return;
+		const back = returnTo;
+		returnTo = null;
 		contextMenu.close();
+		// Whatever the action opens (a dialog) then finds focus where the menu was opened from,
+		// and gives it back there.
+		if (back?.isConnected) back.focus({ preventScroll: true });
 		item.action();
 	}
 </script>
@@ -118,21 +190,18 @@
 				</div>
 			{:else}
 				<button
+					type="button"
 					role="menuitem"
-					disabled={item.disabled}
-					use:tip={item.disabled ? item.reason : undefined}
+					class="k-mrow"
+					data-row={i}
+					data-danger={item.danger || undefined}
+					aria-disabled={item.disabled || undefined}
+					tabindex={active === i ? 0 : -1}
 					onclick={() => run(item)}
-					style="display:flex;align-items:center;gap:9px;width:100%;padding:6px 8px;border:none;border-radius:var(--radius-sm);background:none;cursor:{item.disabled
-						? 'default'
-						: 'pointer'};text-align:left;font-size:var(--text-sm);color:{item.disabled
-						? 'var(--text-disabled)'
-						: item.danger
-							? 'var(--red-400)'
-							: 'var(--text-primary)'};opacity:1"
-					onpointerenter={(e) => {
-						if (!item.disabled) (e.currentTarget as HTMLElement).style.background = 'var(--surface-hover)';
+					onfocus={() => (active = i)}
+					onpointermove={(e) => {
+						if ((e.movementX !== 0 || e.movementY !== 0) && !e.currentTarget.matches(':focus')) e.currentTarget.focus({ preventScroll: true });
 					}}
-					onpointerleave={(e) => ((e.currentTarget as HTMLElement).style.background = 'none')}
 				>
 					<span style="width:15px;display:grid;place-items:center;flex:none;color:inherit">
 						{#if item.icon}<Icon n={item.icon} s={14} color="currentColor" />{/if}
@@ -149,8 +218,8 @@
 						{/if}
 					</span>
 					{#if item.shortcut}
-						<span style="font-family:var(--font-mono);font-size:var(--text-xs);color:{item.disabled ? 'var(--text-disabled)' : 'var(--text-muted)'};flex:none"
-							>{item.shortcut}</span
+						<span style="flex:none;color:{item.disabled ? 'var(--text-disabled)' : 'var(--text-muted)'}"
+							><Kbd keys={item.shortcut} inherit /></span
 						>
 					{/if}
 				</button>

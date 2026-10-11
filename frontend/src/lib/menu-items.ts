@@ -3,6 +3,7 @@
 
 import type { MenuItem } from './context-menu.svelte';
 import type { Track } from './types';
+import type { NavRow } from './menu-nav';
 
 /** A menu with its separators made tidy: none leading, none trailing, never two in a row.
  *  A menu is assembled from optional groups (the Analyze rows, the Fit / Stems offers), and
@@ -67,4 +68,12 @@ export function removeRows(o: RemoveRows): MenuItem[] {
 		{ label: 'Remove only this clip', danger: true, disabled: o.locked, reason, action: () => o.removeAlone(false) },
 		{ label: 'Ripple delete only this clip', danger: true, disabled: o.locked, reason, action: () => o.removeAlone(true) }
 	];
+}
+
+/** The context menu's rows as keyboard navigation sees them: only an action row takes focus (a
+ *  header, a fact and a rule are not controls), and a disabled one still does so it can say why. */
+export function contextRows(items: readonly MenuItem[]): NavRow[] {
+	return items.map((i) =>
+		i.type === undefined || i.type === 'item' ? { focusable: true, label: i.label } : { focusable: false, label: '' }
+	);
 }

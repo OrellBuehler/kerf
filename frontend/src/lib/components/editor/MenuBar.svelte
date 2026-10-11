@@ -20,6 +20,7 @@
 	// whose entries are the five menus as submenus.
 	import { tick, untrack } from 'svelte';
 	import Icon from './Icon.svelte';
+	import Kbd from './Kbd.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
@@ -66,7 +67,6 @@
 		safeAreas: settings.safeAreas,
 		hasFrame: !!editor.timeline.format,
 		tool: ui.tool,
-		playing: ui.playing,
 		delivery: presetFor(editor.timeline.format).id,
 		allHeight: uniformPreset(
 			ui.heights,
@@ -520,17 +520,11 @@
 							: 'transparent'};color:{off ? 'var(--text-disabled)' : 'var(--text-primary)'}"
 					>
 						<span style="display:grid;place-items:center;color:{off ? 'var(--text-disabled)' : 'var(--kerf-400)'}">
-							{#if role !== 'item'}
-								{#if item.kind !== 'submenu' && item.checked}<Icon n="check" s={13} color="currentColor" />{/if}
-							{:else if item.icon}
-								<Icon n={item.icon} s={13} color={off ? 'var(--text-disabled)' : 'var(--text-muted)'} />
-							{/if}
+							{#if role !== 'item' && item.kind !== 'submenu' && item.checked}<Icon n="check" s={13} color="currentColor" />{/if}
 						</span>
 						<span style="overflow:hidden;text-overflow:ellipsis">{entryLabel(item)}</span>
-						<span
-							style="font-family:var(--font-mono);font-size:var(--text-xs);padding-left:18px;color:{off
-								? 'var(--text-disabled)'
-								: 'var(--text-muted)'}">{accel(item)}</span
+						<span style="min-width:4.5em;padding-left:18px;text-align:right;color:{off ? 'var(--text-disabled)' : 'var(--text-muted)'}"
+							>{#if accel(item)}<Kbd keys={accel(item)} inherit />{/if}</span
 						>
 						<span style="display:grid;place-items:center;color:{off ? 'var(--text-disabled)' : 'var(--text-muted)'}">
 							{#if item.kind === 'submenu'}<Icon n="chevron-right" s={12} color="currentColor" />{/if}

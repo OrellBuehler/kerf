@@ -370,3 +370,38 @@ button:disabled {
 .k-arrow {
 	font-size: var(--text-sm);
 }
+
+/* ---------- Context-menu rows ---------- */
+
+/* A row is lit by the pointer (`:hover`) and by the keys (`:focus-visible`, which the menu moves with
+   the arrows and with the pointer, so there is only ever one). An off row takes focus — it says why —
+   but is never lit. The disabled ink is `text-disabled`: it is what is off. */
+.k-mrow {
+	display: flex;
+	align-items: center;
+	gap: 9px;
+	width: 100%;
+	padding: 6px 8px;
+	border: none;
+	border-radius: var(--radius-sm);
+	background: none;
+	cursor: pointer;
+	text-align: left;
+	font-size: var(--text-sm);
+	color: var(--text-primary);
+}
+.k-mrow[data-danger] {
+	color: var(--red-400);
+}
+.k-mrow:hover:not([aria-disabled='true']),
+.k-mrow:focus-visible:not([aria-disabled='true']) {
+	background: var(--surface-hover);
+}
+.k-mrow:focus-visible {
+	outline: var(--focus-outline);
+	outline-offset: calc(var(--focus-offset) * -1);
+}
+.k-mrow[aria-disabled='true'] {
+	cursor: default;
+	color: var(--text-disabled);
+}
