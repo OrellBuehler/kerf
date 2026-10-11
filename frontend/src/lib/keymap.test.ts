@@ -1059,15 +1059,17 @@ describe('no key is hard-coded outside the registry', () => {
 	});
 
 	test('tooltips and labels do not spell one either', () => {
-		// A modifier glyph, or a `(R)` / `(Space)` hint inside a string, in code
-		// that is not a comment is a key being printed by hand. (A pointer gesture
-		// — wheel, click — is not a binding and may say ⌘.)
-		const printed = /[⌘⇧⌥⌃]|['"`][^'"`\n]*\((?:[A-Z]|Space|Del|Esc|Enter)\)/;
+		// A modifier glyph, a `Ctrl +` / `Cmd +` / `Alt +` hint, or a `(R)` / `(Space)` hint inside a string,
+		// in code that is not a comment, is a key being printed by hand. A pointer gesture (a wheel turn, a
+		// click) is no exception: its modifier is `settings.modLabel`, which says Command on a Mac and Ctrl
+		// elsewhere — "⌘/Ctrl + wheel" printed a Mac glyph on Windows.
+		const printed =
+			/[⌘⇧⌥⌃]|['"`][^'"`\n]*\((?:[A-Z]|Space|Del|Esc|Enter)\)|['"`][^'"`\n]*\b(?:Ctrl|Cmd|Command|Option|Alt)\s*\+/;
 		const offenders = files.flatMap((f) =>
 			readFileSync(f, 'utf8')
 				.split('\n')
 				.map((line, i) => ({ line, at: `${f.slice(SRC.length + 1)}:${i + 1}` }))
-				.filter(({ line }) => !/^\s*(\/\/|\*|\/\*|<!--)/.test(line) && printed.test(line) && !/wheel|click/i.test(line))
+				.filter(({ line }) => !/^\s*(\/\/|\*|\/\*|<!--)/.test(line) && printed.test(line))
 				.map(({ at }) => at)
 		);
 		expect(offenders).toEqual([]);

@@ -2017,7 +2017,7 @@
 					step="0.001"
 					value={zoomToSlider(ui.zoom)}
 					oninput={(e) => (ui.zoom = clampZoom(sliderToZoom(+e.currentTarget.value), editor.duration))}
-					use:tip={{ text: `Zoom — ${zoomLabel(ui.zoom)}`, detail: '⌘/Ctrl + wheel zooms at the cursor' }}
+					use:tip={{ text: `Zoom — ${zoomLabel(ui.zoom)}`, detail: `${settings.modLabel('primary')} + wheel zooms at the cursor` }}
 					aria-label="Timeline zoom"
 					style="width:90px;height:24px;margin:0 4px"
 				/>
