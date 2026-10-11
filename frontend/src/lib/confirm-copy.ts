@@ -77,24 +77,30 @@ export interface InstallRisk {
 	unsaved: boolean;
 	exporting: boolean;
 	analyzing: boolean;
+	/** A file import, or a 360 lens stitch, is running. */
+	importing: boolean;
 }
 
 /** The prompt before an update is installed. On Windows the installer takes the app down when the
  *  download is done, past every close guard, so the question is asked *before* it starts: with
  *  unsaved work it is the three-button Save… / Install anyway / Cancel, with only a job running a
- *  two-button one, and with nothing at stake `null`. */
-export function installPrompt(risk: InstallRisk):
+ *  two-button one, and with nothing at stake `null`. Elsewhere the app is not taken down — the
+ *  update waits for "Restart now", which asks about unsaved work itself — so there is no question
+ *  and the old flow stands: `null`. */
+export function installPrompt(risk: InstallRisk, windows: boolean):
 	| { kind: 'unsaved'; copy: UnsavedCopy }
 	| { kind: 'jobs'; copy: ConfirmCopy }
 	| null {
+	if (!windows) return null;
 	const lines = ['Kerf will close to install the update.'];
 	if (risk.unsaved) lines.push(`${UNSAVED_FACT} If you install now it will be lost.`);
 	if (risk.exporting) lines.push('The export in progress will be stopped.');
 	if (risk.analyzing) lines.push('The analysis in progress will be stopped.');
+	if (risk.importing) lines.push('The import in progress will be stopped.');
 	const message = lines.join(' ');
 	if (risk.unsaved)
 		return { kind: 'unsaved', copy: { title: 'Install the update?', message, save: 'Save…', discard: 'Install anyway', cancel: 'Cancel' } };
-	if (risk.exporting || risk.analyzing)
+	if (risk.exporting || risk.analyzing || risk.importing)
 		return { kind: 'jobs', copy: { title: 'Install the update?', message, ok: 'Install anyway', cancel: 'Cancel' } };
 	return null;
 }

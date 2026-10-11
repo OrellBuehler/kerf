@@ -7,9 +7,9 @@
 	import { askUnsaved, confirmAction } from '$lib/api';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { saveProject } from '$lib/file-actions';
-	import { CURRENT_LINE, DOWNLOADING_NOTE, errorView, installNote, updateTitle, versionLine } from '$lib/update-copy';
+	import { CURRENT_LINE, downloadingNote, errorView, installNote, updateTitle, versionLine } from '$lib/update-copy';
 	import { CONFIRM, UPDATE_UNSAVED_NOTE, installPrompt, proceedAfter } from '$lib/confirm-copy';
-	import { isLinux } from '$lib/keymap';
+	import { isLinux, isWindows } from '$lib/keymap';
 
 	const u = updater;
 
@@ -33,7 +33,10 @@
 	/** Installing can take the app down when the download is done (on Windows the installer exits it past
 	 *  every close guard), so what that would cost is asked about first, with named buttons. */
 	async function install() {
-		const prompt = installPrompt({ unsaved, exporting: !!editor.exportRun, analyzing: ui.analyzing });
+		const prompt = installPrompt(
+			{ unsaved, exporting: !!editor.exportRun, analyzing: ui.analyzing, importing: editor.importing },
+			windows
+		);
 		if (prompt?.kind === 'unsaved') {
 			if (!(await proceedAfter(await askUnsaved(prompt.copy), saveProject))) return;
 		} else if (prompt && !(await confirmAction(prompt.copy.message, prompt.copy.title, prompt.copy))) return;
@@ -42,6 +45,7 @@
 
 	const title = $derived(updateTitle(u.phase, u.update));
 	const note = $derived(installNote(u.errorKind, isLinux()));
+	const windows = isWindows();
 	const failure = $derived(u.error ? errorView(u.errorKind, u.error) : null);
 </script>
 
@@ -104,7 +108,7 @@
 				<Btn variant="ghost" size="md" onclick={() => u.close()}>Later</Btn>
 				<Btn variant="primary" size="md" icon="refresh-cw" data-rescue onclick={restart}>Restart now</Btn>
 			{:else if u.phase === 'downloading'}
-				<span style="font-size:12px;color:var(--text-muted)">{DOWNLOADING_NOTE}</span>
+				<span style="font-size:12px;color:var(--text-muted)">{downloadingNote(windows)}</span>
 			{:else if u.update}
 				<Btn variant="ghost" size="md" onclick={() => u.close()}>Later</Btn>
 				<Btn variant="primary" size="md" icon="download" data-rescue onclick={install}>

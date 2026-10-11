@@ -877,9 +877,10 @@ available and opens `UpdateDialog` (release notes, download progress, then
 **Restart now** — which warns first when the project has unsaved changes (the same fact in the dialog's
 banner). The download **holds the dialog still** (`busy`, no Hide): on Windows the plugin's `downloadAndInstall` launches the
 installer and exits the app when it is done, past every close guard, so a hidden download could take unsaved work and a running
-export with it, silently. **Install asks first** (`installPrompt`, `confirm-copy.ts`): with an unsaved project the three-button
-*Save… · Install anyway · Cancel*, with only an export or an analysis running a two-button one saying it will be stopped, and
-nothing at stake no question; `install()` itself ignores a second press while one runs. The line over the body reads `Current 0.24.0 → 0.25.0 · 1 Oct 2026`
+export with it, silently. **Install asks first, on Windows only** (`installPrompt(risk, isWindows())`, `confirm-copy.ts`; macOS and Linux do not exit after the
+download — the update waits for *Restart now*, which asks about unsaved work itself — so they keep the plain flow and the neutral footer
+`downloadingNote`): with an unsaved project the three-button *Save… · Install anyway · Cancel*, with only an export, an analysis or an import
+(or 360 stitch) running a two-button one saying it will be stopped, and nothing at stake no question; `install()` itself ignores a second press while one runs. The line over the body reads `Current 0.24.0 → 0.25.0 · 1 Oct 2026`
 (`versionLine`, not "Installed … →"); a failed *check* is titled
 "Couldn't check for updates", never "up to date", says so in a sentence with the raw error under a
 *Details* disclosure, and the AppImage fallback note shows only for a failed install on Linux

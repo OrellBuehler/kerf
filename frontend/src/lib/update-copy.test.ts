@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { CURRENT_LINE, DOWNLOADING_NOTE, errorView, installNote, releaseDate, updateTitle, versionLine } from './update-copy';
+import { CURRENT_LINE, downloadingNote, errorView, installNote, releaseDate, updateTitle, versionLine } from './update-copy';
 
 const found = { version: '0.25.0' };
 
@@ -91,7 +91,11 @@ describe('the version line', () => {
 describe('what the dialog says while it works', () => {
 	test('the quiet and the busy lines', () => {
 		expect(CURRENT_LINE).toBe("You're on the latest version.");
-		expect(DOWNLOADING_NOTE).toBe('Downloading the update. Kerf may close when it is done.');
-		expect(DOWNLOADING_NOTE).not.toMatch(/background/);
+		expect(downloadingNote(true)).toBe('Downloading the update. Kerf may close when it is done.');
+		expect(downloadingNote(false)).toBe('Downloading the update…');
+		for (const windows of [true, false]) expect(downloadingNote(windows)).not.toMatch(/background/);
+	});
+	test('"Kerf may close" is said only where the installer really closes it', () => {
+		expect(downloadingNote(false)).not.toMatch(/close/);
 	});
 });

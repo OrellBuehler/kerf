@@ -56,7 +56,9 @@ export function versionLine(current: string, update: { version: string; date?: s
  *  is not something to walk away from — on Windows the installer takes the app down when it is
  *  done — so the dialog holds still and says so, instead of claiming to work "in the background". */
 export const CURRENT_LINE = "You're on the latest version.";
-export const DOWNLOADING_NOTE = 'Downloading the update. Kerf may close when it is done.';
+export function downloadingNote(windows: boolean): string {
+	return windows ? 'Downloading the update. Kerf may close when it is done.' : 'Downloading the update…';
+}
 
 /** The fallback offered under a failed install. Only the AppImage build updates in place, so
  *  only on Linux is there a build that cannot — elsewhere the error says all there is to say. */

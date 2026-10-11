@@ -48,6 +48,12 @@ export function detectPlatform(nav: NavigatorLike | undefined = typeof navigator
 	return /mac|iphone|ipad|ipod/i.test(platformText(nav)) ? 'mac' : 'other';
 }
 
+/** Whether this is Windows, or at least neither a Mac nor a Linux desktop: the one platform where the
+ *  updater's installer takes the app down itself when the download is done. */
+export function isWindows(nav: NavigatorLike | undefined = typeof navigator === 'undefined' ? undefined : navigator): boolean {
+	return detectPlatform(nav) !== 'mac' && !isLinux(nav);
+}
+
 /** Whether this is a Linux desktop (Android's webview says "Linux" too, and is not one). */
 export function isLinux(nav: NavigatorLike | undefined = typeof navigator === 'undefined' ? undefined : navigator): boolean {
 	return /linux/i.test(platformText(nav)) && !/android/i.test(nav?.userAgent ?? '');

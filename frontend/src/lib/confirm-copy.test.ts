@@ -69,14 +69,15 @@ describe('going ahead', () => {
 });
 
 describe('before an update is installed', () => {
-	const none = { unsaved: false, exporting: false, analyzing: false };
+	const none = { unsaved: false, exporting: false, analyzing: false, importing: false };
+	const win = (risk: Parameters<typeof installPrompt>[0]) => installPrompt(risk, true);
 
 	test('with nothing at stake there is nothing to ask', () => {
-		expect(installPrompt(none)).toBeNull();
+		expect(win(none)).toBeNull();
 	});
 
 	test('unsaved work gets the three-button prompt, naming what installing does', () => {
-		const p = installPrompt({ ...none, unsaved: true })!;
+		const p = win({ ...none, unsaved: true })!;
 		expect(p.kind).toBe('unsaved');
 		expect(p.copy).toEqual({
 			title: 'Install the update?',
@@ -88,24 +89,37 @@ describe('before an update is installed', () => {
 	});
 
 	test('a running job alone gets a two-button prompt that says it will be stopped', () => {
-		const p = installPrompt({ ...none, exporting: true })!;
+		const p = win({ ...none, exporting: true })!;
 		expect(p.kind).toBe('jobs');
 		expect(p.copy).toMatchObject({ ok: 'Install anyway', cancel: 'Cancel' });
 		expect(p.copy.message).toBe('Kerf will close to install the update. The export in progress will be stopped.');
-		expect(installPrompt({ ...none, analyzing: true })!.copy.message).toContain('The analysis in progress will be stopped.');
+		expect(win({ ...none, analyzing: true })!.copy.message).toContain('The analysis in progress will be stopped.');
 	});
 
 	test('everything at once is one message, the unsaved project first', () => {
-		const p = installPrompt({ unsaved: true, exporting: true, analyzing: true })!;
+		const p = win({ unsaved: true, exporting: true, analyzing: true, importing: true })!;
 		expect(p.kind).toBe('unsaved');
 		expect(p.copy.message).toBe(
-			"Kerf will close to install the update. This project hasn't been saved. If you install now it will be lost. The export in progress will be stopped. The analysis in progress will be stopped."
+			"Kerf will close to install the update. This project hasn't been saved. If you install now it will be lost. The export in progress will be stopped. The analysis in progress will be stopped. The import in progress will be stopped."
 		);
 	});
 
 	test('no button is Yes or No, and Save is only offered with something to save', () => {
-		const p = installPrompt({ ...none, unsaved: true })!;
+		const p = win({ ...none, unsaved: true })!;
 		expect(p.kind === 'unsaved' && p.copy.save.endsWith('…')).toBe(true);
-		expect(installPrompt({ ...none, exporting: true })!.copy).not.toHaveProperty('save');
+		expect(win({ ...none, exporting: true })!.copy).not.toHaveProperty('save');
+	});
+
+	test('a running import is a job at stake', () => {
+		const p = win({ ...none, importing: true })!;
+		expect(p.kind).toBe('jobs');
+		expect(p.copy.message).toBe('Kerf will close to install the update. The import in progress will be stopped.');
+	});
+
+	test('off Windows the app is not taken down, so there is no question — Restart now asks about unsaved work itself', () => {
+		const everything = { unsaved: true, exporting: true, analyzing: true, importing: true };
+		expect(installPrompt(everything, false)).toBeNull();
+		expect(installPrompt(none, false)).toBeNull();
+		expect(installPrompt(everything, true)).not.toBeNull();
 	});
 });
