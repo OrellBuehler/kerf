@@ -10,7 +10,7 @@
 | UI-4 Timeline and preview layout | ui-4 | #130 | review (CI) | timeline H1, H2, H6 (partial), H7–H10, M11, M12 (partial), M20; + M4, M5, M6, M18 (focus ring), P2, P7, P8, P9, P12, P14; Light clip-overlay strokes | dev done: check/test (2193)/build green |
 | UI-6 Copy and accessibility | ui-6 (on ui-2, pushed) | | ready (PR after #132) | dialogs 5–7, 9 + copy deck; shell M3, M4 + tooltip/hit targets; timeline context-menu keyboard; + dialogs M13 (indeterminate progress) and shell M9 leftover (toast icons shared with NotificationCenter) | wave 2 |
 | PERF-2 Scene detection on proxy | perf-2 (pushed) | | ready (PR after #131) | gpu-media WP3 (scenes + contact sheet; salience not swapped) | cut lists identical to the original in every case (H.264, HEVC 10-bit, 4:2:2, late-start .lead, rotated, VFR MKV). 4K, CPU-s: H.264 21.1→3.0; HEVC 10-bit 29.1→3.2; 4:2:2 36.1→3.3 (7–11x) |
-| PERF-3 Playback | perf-3 (on ui-4) | | in-progress | gpu-compositor WP-0(a)(c); gpu-media WP7; + playback stream width follows the preview request width (fixed PREVIEW_STREAM_WIDTH makes playing frames softer than paused, found in UI-4) | wave 2 |
+| PERF-3 Playback | perf-3 (on ui-4) | | review | gpu-compositor WP-0(a)(c); gpu-media WP7; + playback stream width follows the preview request width (fixed PREVIEW_STREAM_WIDTH makes playing frames softer than paused, found in UI-4) | delivered 24.1/30.1/60.1 fps at 24/30/60 cuts (was 24 always); CPU 60 fps 0.68 core (1 layer). Overload (1 core, 60 fps, 3 layers, 1280 px): frozen 5.0 s → longest freeze 0.79 s via step-down. Webview decode in headless Chromium: canvas path slower (960 px 3.6→5.2 ms), bytes −25% |
 | GPU-1 Proxy colour normalisation | gpu-1 (pushed, no PR) | | blocked (needs a decision) | gpu-compositor WP-3 (partial: untagged HD labelled bt709; SD/601/2020/RGB not converted) | stacks refused on 9.0.2 (15 cases): 11 → 5; untagged HD colour vs source 28.0 dB → 43.3 dB on 9.0.2; nothing moves on 6.1.1 |
 | UI-5 Timeline gestures | ui-5 (on ui-4) | | in-progress | timeline H3–H5, H12, H13, H15 + medium; + playhead past the end after the cut shrinks; clip arrow-key nudge (M18 rest); scrub rail hover chip + marker ticks (H6 rest) | wave 3 |
 | UI-7 Panels polish | | | todo | panels/shell medium + polish; shell H6 | wave 3 |
@@ -58,6 +58,8 @@
 
 ## Needs a real machine
 
+- PERF-3: createImageBitmap(Blob) vs data-URL <img> decode in WebView2/WKWebView/WebKitGTK; Tauri channel raw-payload throughput/order at 60 fps × ~60 KB; OVERLOAD_AFTER tuning vs stream start-up; 60 fps CPU on real HEVC/4K proxies.
+
 - UI-6: reason tooltips on disabled controls in WebKitGTK/WKWebView (they may not receive pointer events; ~31 sites).
 - UI-6: native three-button Save/Don't save/Cancel via plugin-dialog on WebView2/WebKitGTK/WKWebView; tooltips on disabled controls in WebKit; keyboard-opened context menu (Menu key, Shift+F10), its focus return and coordinates.
 
@@ -83,6 +85,8 @@
 - UI-3: dialog focus return, `inert` timing and the focus rescue checked in Chromium only; confirm in WebView2, WebKitGTK and WKWebView.
 
 ## Needs a decision
+
+- PERF-3: the picture trails the sound by the stream's first-frame latency (~110–200 ms). Starting the stream ahead risks leading the audio; left as is.
 
 - UI-6: make the tooltip hoverable (WCAG 1.4.13)? It's a one-line change.
 - UI-6: show "Step n of m" on multi-stage progress?
