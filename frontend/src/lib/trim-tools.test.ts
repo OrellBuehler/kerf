@@ -461,11 +461,11 @@ describe('words', () => {
 	test('the readout names the new cut, the new window, the new position', () => {
 		const { t, edit } = cutPair();
 		const roll = readoutFor(previewEdit(t, edit, 1, footage(60)), 30);
-		expect(roll).toEqual({ title: 'Roll +30 f · +1.00 s · cut 00:05:00', detail: null, tone: 'ok' });
+		expect(roll).toEqual({ title: 'Roll +30 f · +1.00 s · cut 00:00:05:00', detail: null, tone: 'ok' });
 
 		const c = sclip(10, 14, 3);
 		const slip = readoutFor(previewEdit(lane([c]), { tool: 'slip', clipId: c.id }, 2, footage(60)), 30);
-		expect(slip.title).toBe('Slip +60 f · +2.00 s · in 00:12:00 → out 00:16:00');
+		expect(slip.title).toBe('Slip +60 f · +2.00 s · in 00:00:12:00 → out 00:00:16:00');
 
 		// At 2× a 2 s source slip is one second of screen.
 		const fast = sclip(10, 18, 0, { speed: 2 });
@@ -474,7 +474,7 @@ describe('words', () => {
 
 		const [a, b] = [sclip(0, 4, 0), sclip(0, 4, 4)];
 		const slide = readoutFor(previewEdit(lane([a, b]), { tool: 'slide', clipId: b.id }, 1, footage(60)), 30);
-		expect(slide.title).toBe('Slide +30 f · +1.00 s · now at 00:05:00');
+		expect(slide.title).toBe('Slide +30 f · +1.00 s · now at 00:00:05:00');
 	});
 
 	test('a limit is a second line in the limit tone; a refusal is red', () => {
@@ -547,8 +547,8 @@ describe('the monitor', () => {
 		]);
 		near(m.cells[0].time, 15 - 1 / 30); // a's window now ends at 15
 		near(m.cells[1].time, 21); // b opens on 21
-		expect(m.cells[1].timecode).toBe('00:21:00');
-		expect(m.title).toBe('Roll +30 f · +1.00 s · cut 00:05:00');
+		expect(m.cells[1].timecode).toBe('00:00:21:00');
+		expect(m.title).toBe('Roll +30 f · +1.00 s · cut 00:00:05:00');
 	});
 
 	test('a slip shows the new first and last frame of the same clip', () => {
@@ -708,7 +708,7 @@ describe('previewEdit — linked', () => {
 			[pb.id, 'partner', 'A1', 5, 3]
 		]);
 		expect(p.ghosts[2].trackId).toBe('track-A1');
-		expect(readoutFor(p, 30).title).toBe('Roll +30 f · +1.00 s · cut 0:00:05:00 · with A1'.replace('0:00:05:00', formatTc(5)));
+		expect(readoutFor(p, 30).title).toBe(`Roll +30 f · +1.00 s · cut ${formatTc(5)} · with A1`);
 	});
 
 	test('with links off the partners are not part of it', () => {

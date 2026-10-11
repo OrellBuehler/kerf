@@ -63,13 +63,14 @@
 		PRESET_LABEL,
 		PRESET_PX,
 		TITLE_METRICS,
-		titleLaneHeight,
+		titleLaneHeightFor,
 		uniformPreset
 	} from '$lib/track-heights';
-	import type { Target } from '$lib/minimap';
+	import { viewCoversCut, type Target } from '$lib/minimap';
 	import { visibleLaneRange } from '$lib/waveform-view';
 	import { clipDuration } from '$lib/types';
 	import { barGrid, beatGrid, beatPeriod, gridMagnets, sourceToTimeline } from '$lib/beats';
+	import { NAME_CHIP_PCT, showsLabel } from '$lib/clip-label';
 	import { fitOffer } from '$lib/music-ui';
 	import { stemsOffer } from '$lib/stems';
 	import { transitionLabel } from '$lib/transitions';
@@ -83,23 +84,25 @@
 	import { linkedTrimBounds, linkedTrimPreview } from '$lib/linked-trim';
 	import { marqueeHits, normalizeRect, type LaneBox, type SpanClip } from '$lib/marquee';
 	import { moveTracks, planMove, type Ghost, type MovePlan } from '$lib/multi-move';
-	import { frameTicksIn, rulerStep, tickLabel, ticksIn } from '$lib/ruler';
+	import { frameTicksIn, minorTicksIn, rulerGrid, showsFrameTicks, tickLabel, ticksIn } from '$lib/ruler';
+	import { formatTimecode } from '$lib/timecode';
 	import { MIN_CLIP, trimBounds, type TrimBounds } from '$lib/ripple-trim';
 	import {
 		clampZoom,
 		fitZoom,
+		followZoom,
 		laneWidth,
 		scrollFor,
 		sliderToZoom,
 		wheelZoomFactor,
 		zoomAround,
 		zoomLabel,
-		zoomToSlider
+		zoomToSlider,
+		type FollowInput
 	} from '$lib/zoom';
 	import { tip, type TipInput } from '$lib/tip';
 
 	const pxPerSec = $derived(ui.zoom);
-	const duration = $derived(Math.max(editor.duration, 8));
 	const contentW = $derived(laneWidth(editor.duration, pxPerSec));
 	const hasClips = $derived(editor.timeline.tracks.some((t) => t.clips.length > 0));
 
@@ -120,11 +123,8 @@
 	/** The clip under the pointer, so its partners can light up. */
 	let hoverId = $state<string | null>(null);
 
-	function fmt(s: number): string {
-		const m = Math.floor(s / 60);
-		const sec = Math.floor(s % 60);
-		return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
-	}
+	/** The project timecode: what the transport, the status bar and the ruler read in. */
+	const tc = (s: number): string => formatTimecode(s, editor.fps);
 
 	/** A track's lane height: its preset's pixels (`track-heights.ts`). The waveform's
 	 *  lane count and whether a clip shows thumbnails both follow from what they
@@ -234,6 +234,12 @@
 	let viewW = $state(1200);
 	let dpr = $state(typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1);
 
+	/** The lane box fills the window when the cut is shorter than it: the ruler, the row borders and
+	 *  the grid run to the edge, and what is past the end of the cut is drawn as such. */
+	const laneW = $derived(Math.max(contentW, viewW));
+	/** Where the cut ends in the lane, px. */
+	const cutEndX = $derived(editor.duration * pxPerSec);
+
 	function syncView() {
 		const v = viewport();
 		if (!v) return;
@@ -267,11 +273,16 @@
 	// part of the lane exist: at the deep end of the zoom range an hour of cut is
 	// far too many to draw, and at the shallow end a fixed step is all gap.
 
-	const tickStep = $derived(rulerStep(pxPerSec));
-	const visibleSec = $derived([viewLo / pxPerSec, Math.min(viewHi, contentW) / pxPerSec] as const);
-	const ticks = $derived(ticksIn(visibleSec[0], visibleSec[1], tickStep));
-	/** A mark per frame, once a frame is wide enough to tell apart. */
+	const grid = $derived(rulerGrid(pxPerSec, editor.fps));
+	const visibleSec = $derived([viewLo / pxPerSec, Math.min(viewHi, laneW) / pxPerSec] as const);
+	/** The labelled (major) ticks. */
+	const ticks = $derived(ticksIn(visibleSec[0], visibleSec[1], grid.step));
+	/** A mark per frame, once a frame is wide enough to tell apart; they are then the minor ticks. */
 	const frameTicks = $derived(frameTicksIn(visibleSec[0], visibleSec[1], editor.fps, pxPerSec));
+	/** The minor ticks between two labels, unless the frames are drawn. */
+	const minorTicks = $derived(
+		showsFrameTicks(pxPerSec, editor.fps) ? [] : minorTicksIn(visibleSec[0], visibleSec[1], grid)
+	);
 
 	/** A canvas cannot read `var(--waveform)`, so the tokens are resolved here, once
 	 *  per theme change: every theme edit replaces `settings.theme`, and does so
@@ -1635,6 +1646,9 @@
 		const v = viewport();
 		const next = v ? fitZoom(editor.duration, v.viewW) : null;
 		if (!v || next === null) return;
+		// Asked for by a person: from here the zoom is theirs, so a later resize does not swap
+		// this uncapped fit for the capped one the follow takes.
+		ui.zoomFollowsCut = false;
 		if (next === ui.zoom) {
 			v.el.scrollLeft = 0;
 			return;
@@ -1642,6 +1656,38 @@
 		pendingScroll = 0;
 		ui.zoom = next;
 	}
+
+	// Until anyone sets the zoom it follows the cut (`followZoom`, `zoom.ts`): fitted when a project
+	// opens or its first clip lands, when the window changes width (once it has stopped changing: a
+	// panel being dragged would otherwise rescale the lane every frame) and when the cut outgrows the
+	// window. The scroller has to exist first, or the width is the placeholder's.
+	let followPrev: FollowInput | null = null;
+	$effect(() => {
+		if (!scroller || !ui.zoomFollowsCut) {
+			followPrev = null;
+			return;
+		}
+		const now: FollowInput = { viewW, duration: editor.duration, generation: editor.loadEpoch };
+		const resizeOnly =
+			!!followPrev &&
+			followPrev.generation === now.generation &&
+			followPrev.duration === now.duration &&
+			followPrev.viewW !== now.viewW;
+		const apply = () =>
+			untrack(() => {
+				const z = followZoom(followPrev, now, ui.zoom);
+				followPrev = now;
+				if (z === null) return;
+				pendingScroll = 0;
+				ui.fitZoomTo(z);
+			});
+		if (!resizeOnly) {
+			apply();
+			return;
+		}
+		const timer = setTimeout(apply, 150);
+		return () => clearTimeout(timer);
+	});
 
 	// The shortcut lives in the page's key handler, which cannot know how wide the
 	// timeline is, so it asks by bumping a counter. The first run is not an ask.
@@ -1662,8 +1708,14 @@
 	// The titles lane is not a track, so it follows the global height choice.
 	const titleMetrics = $derived(TITLE_METRICS[ui.heights.all]);
 	const titleRows = $derived(packRows(editor.overlays));
+	/** No title or caption on the cut: the lane is a strip (`track-heights.ts`). */
+	const titlesEmpty = $derived(editor.overlays.length === 0);
 	const titleLaneH = $derived(
-		titleLaneHeight(ui.heights.all, Math.max(1, ...[...titleRows.values()].map((r) => r + 1)))
+		titleLaneHeightFor(
+			ui.heights.all,
+			Math.max(1, ...[...titleRows.values()].map((r) => r + 1)),
+			editor.overlays.length
+		)
 	);
 
 	type TitleDrag = {
@@ -1955,7 +2007,6 @@
 			{@render toolBtn(settings.tip('Redo', 'edit.redo'), 'Redo', 'redo', null, () => void editor.redo(), !editor.canRedo)}
 		</div>
 		{#if editor.busy}<Badge tone="agent" dot>working…</Badge>{/if}
-		<span use:tip={'Length of the cut'} style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)">{fmt(duration)}</span>
 		{#if editor.selectedClips.length > 1}
 			<span
 				use:tip={{
@@ -2113,7 +2164,7 @@
 	     buttons and the zoom / fit / shuttle keys, and the playhead's follow) — a
 	     second focusable widget with partial parity would be more to learn than
 	     to use. Its toggle in the toolbar stays labelled. -->
-	{#if ui.minimap && hasClips}
+	{#if ui.minimap && hasClips && !viewCoversCut({ scrollLeft: scrollX, viewW, pxPerSec }, editor.duration)}
 		<div
 			aria-hidden="true"
 			style="display:flex;flex:none;border-bottom:var(--line-width) solid var(--border-subtle);background:var(--surface-app)"
@@ -2161,18 +2212,48 @@
 			style="width:var(--track-header-w);flex:none;min-height:100%;position:sticky;left:0;z-index:40;border-right:var(--line-width) solid var(--border-default);background:var(--surface-app)"
 		>
 			<div
-				style="height:var(--ruler-h);border-bottom:var(--line-width) solid {editor.rippleMode
+				style="height:var(--ruler-h);box-sizing:border-box;border-bottom:var(--line-width) solid {editor.rippleMode
 					? 'var(--kerf-500)'
-					: 'var(--border-subtle)'};position:sticky;top:0;z-index:50;background:var(--surface-app);display:flex;align-items:center;padding:0 8px"
+					: 'var(--border-subtle)'};position:sticky;top:0;z-index:50;background:var(--surface-app);display:flex;align-items:center;gap:6px;padding:0 8px;font-family:var(--font-mono);font-variant-numeric:tabular-nums;white-space:nowrap"
 			>
+				<!-- Where the playhead is, and how long the cut is: the timeline's own clock, so a scrub or a
+				     drag here does not need the Preview on screen to say what time it is. -->
+				<span
+					data-timeline-time
+					role="timer"
+					aria-label="Playhead {tc(ui.time)} of {tc(editor.duration)}"
+					use:tip={`Playhead timecode, then the length of the cut · ${editor.fps.toFixed(3)} fps · non-drop`}
+					style="display:inline-flex;align-items:baseline;gap:6px"
+				>
+					<span style="font-size:12px;font-weight:600;color:var(--kerf-300)">{tc(ui.time)}</span>
+					<span aria-hidden="true" style="font-size:11px;color:var(--text-muted)">/</span>
+					<span style="font-size:11px;color:var(--text-muted)">{tc(editor.duration)}</span>
+				</span>
+				<span style="flex:1"></span>
 				{#if editor.rippleMode}
 					<span
+						role="img"
+						aria-label="Ripple mode is on"
 						use:tip={'Ripple mode is on — edits pull the later clips on their track along'}
-						style="font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--kerf-300)"
-						>Ripple</span
+						style="display:inline-flex;color:var(--kerf-300)"><Icon n="between-horizontal-start" s={12} /></span
 					>
 				{/if}
 			</div>
+			{#if titlesEmpty}
+				<!-- Nothing on the titles lane: a strip, and the whole of its header adds a title. -->
+				<button
+					data-title-add
+					use:tip={'Add a title at the playhead'}
+					aria-label="Add a title"
+					disabled={editor.busy}
+					onclick={addTitleHere}
+					style="display:flex;align-items:center;gap:6px;width:100%;height:{titleLaneH}px;box-sizing:border-box;padding:0 8px;border:none;border-bottom:1px solid var(--border-subtle);background:none;cursor:pointer;text-align:left;color:var(--text-muted);font-size:10px"
+				>
+					<span style="font-family:var(--font-mono);font-weight:600;color:var(--text-secondary);flex:none">T</span>
+					<span style="flex:1;min-width:0">Titles</span>
+					<Icon n="plus" s={10} />
+				</button>
+			{:else}
 			<div
 				style="height:{titleLaneH}px;border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;gap:6px;padding:0 8px;overflow:hidden"
 			>
@@ -2189,6 +2270,7 @@
 					><Icon n="plus" s={12} /></button
 				>
 			</div>
+			{/if}
 			{#each editor.timeline.tracks as t (t.id)}
 				<div
 					role="presentation"
@@ -2252,7 +2334,12 @@
 						aria-label="Toggle lock"
 						aria-pressed={!!t.locked}
 						onclick={() => void editor.setTrackLocked(t.id, !t.locked).catch(err)}
-						style={flagBtn(!!t.locked, 'var(--kerf-300)')}>L</button
+						style="flex:none;display:grid;place-items:center;min-width:26px;min-height:26px;padding:3px;border-radius:3px;cursor:pointer;border:var(--line-width) solid {t.locked
+							? 'var(--text-secondary)'
+							: 'var(--border-strong)'};background:{t.locked ? 'var(--surface-active)' : 'transparent'};color:{t.locked
+							? 'var(--text-primary)'
+							: 'var(--text-muted)'}"
+						><Icon n={t.locked ? 'lock' : 'lock-open'} s={12} /></button
 					>
 					<button
 						use:tip={'Remove track'}
@@ -2308,42 +2395,72 @@
 			role="presentation"
 			oncontextmenu={onTimelineContextMenu}
 			onpointerdown={(e) => onCanvasPointerDown(e, 'canvas')}
-			style="width:{contentW}px;flex:none;min-height:100%;position:relative"
+			style="width:{contentW}px;min-width:calc(100% - var(--track-header-w));flex:none;min-height:100%;position:relative"
 		>
-			<!-- ruler — sticky under the playhead (z 30) but over the drag ghosts (z 25) -->
+			<!-- Past the end of the cut: the lane runs to the window's edge, and what lies beyond the last
+			     clip is dimmed behind a line, so a short cut is not mistaken for a short timeline. -->
+			{#if hasClips && cutEndX < laneW}
+				<div
+					data-cut-end
+					aria-hidden="true"
+					style="position:absolute;left:{cutEndX}px;right:0;top:var(--ruler-h);bottom:0;z-index:0;pointer-events:none;box-sizing:border-box;border-left:var(--line-width) solid var(--border-strong);background:color-mix(in srgb,var(--surface-void) 55%,transparent)"
+				></div>
+			{/if}
+			<!-- ruler — sticky under the playhead (z 30) but over the drag ghosts (z 25). Three rows: what the
+			     analysis found hangs from the top edge (scene cuts, beats, bars), the label sits under it
+			     beside its own tick, and the ticks stand on the bottom edge — a major one at every label,
+			     minors between, the frames themselves once they are wide enough. -->
 			<div
 				bind:this={rulerEl}
 				role="presentation"
 				onpointerdown={onRulerPointerDown}
 				style="height:var(--ruler-h);border-bottom:var(--line-width) solid {editor.rippleMode
 					? 'var(--kerf-500)'
-					: 'var(--border-subtle)'};position:sticky;top:0;z-index:26;background:var(--surface-app);cursor:ew-resize;touch-action:none"
+					: 'var(--border-subtle)'};position:sticky;top:0;z-index:26;background:var(--surface-app);cursor:pointer;touch-action:none"
 			>
-				{#each ticks as t (t.k)}
+				{#if hasClips && cutEndX < laneW}
 					<span
-						style="position:absolute;left:{t.t * pxPerSec + 4}px;top:7px;font-family:var(--font-mono);font-size:10px;color:var(--text-muted);pointer-events:none"
-						>{tickLabel(t.k, tickStep)}</span
-					>
+						aria-hidden="true"
+						style="position:absolute;left:{cutEndX}px;right:0;top:0;bottom:0;pointer-events:none;box-sizing:border-box;border-left:var(--line-width) solid var(--border-strong);background:color-mix(in srgb,var(--surface-void) 55%,transparent)"
+					></span>
+				{/if}
+				{#each minorTicks as m (m.k)}
+					<span
+						data-tick={m.mid ? 'mid' : 'minor'}
+						style="position:absolute;left:{m.t * pxPerSec}px;bottom:0;width:var(--line-width);height:{m.mid ? 7 : 4}px;background:color-mix(in srgb,var(--text-muted) {m.mid ? 70 : 45}%,transparent);pointer-events:none"
+					></span>
 				{/each}
 				{#each frameTicks as f (f.k)}
 					<span
-						style="position:absolute;left:{f.t * pxPerSec}px;bottom:0;width:var(--line-width);height:4px;background:var(--text-disabled);opacity:.45;pointer-events:none"
+						data-tick="frame"
+						style="position:absolute;left:{f.t * pxPerSec}px;bottom:0;width:var(--line-width);height:6px;background:color-mix(in srgb,var(--text-muted) 70%,transparent);pointer-events:none"
 					></span>
+				{/each}
+				{#each ticks as t (t.k)}
+					<span
+						data-tick="major"
+						style="position:absolute;left:{t.t * pxPerSec}px;bottom:0;width:var(--line-width);height:12px;background:var(--text-muted);pointer-events:none"
+					></span>
+					<span
+						data-tick-label
+						style="position:absolute;left:{t.t * pxPerSec + 4}px;top:5px;font-family:var(--font-mono);font-size:10px;line-height:12px;color:var(--text-muted);pointer-events:none;white-space:nowrap"
+						>{tickLabel(t.k, grid, editor.fps)}</span
+					>
 				{/each}
 				{#each sceneXs as x (x)}
 					<span
 						use:tip={'Detected scene cut'}
-						style="position:absolute;left:{x}px;bottom:0;width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid var(--scene-marker);transform:translateX(-50%)"
+						style="position:absolute;left:{x}px;top:0;width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid var(--scene-marker);transform:translateX(-50%)"
 					></span>
 				{/each}
 				{#each beatTimes as b (b)}
 					<span
-						style="position:absolute;left:{b * pxPerSec}px;bottom:0;width:var(--line-width);height:5px;background:var(--beat-marker);opacity:.75;pointer-events:none"
+						style="position:absolute;left:{b * pxPerSec}px;top:0;width:var(--line-width);height:3px;background:var(--beat-marker);opacity:.75;pointer-events:none"
 					></span>
 				{/each}
 				{#each barTimes as b (b)}
 					<span
-						style="position:absolute;left:{b * pxPerSec}px;bottom:0;width:calc(var(--line-width) * 2);height:11px;background:var(--beat-marker);pointer-events:none"
+						style="position:absolute;left:{b * pxPerSec}px;top:0;width:calc(var(--line-width) * 2);height:5px;background:var(--beat-marker);pointer-events:none"
 					></span>
 				{/each}
 				<!-- user markers: click seeks, drag moves, double-click renames -->
@@ -2352,7 +2469,7 @@
 					{@const accent = m.color || 'var(--agent-400)'}
 					<span
 						role="presentation"
-						use:tip={`${m.name} — ${fmt(mt)}`}
+						use:tip={`${m.name} — ${tc(mt)}`}
 						onpointerdown={(e) => onMarkerPointerDown(e, m)}
 						ondblclick={() => (renaming = m.id)}
 						oncontextmenu={(e) => onMarkerContextMenu(e, m)}
@@ -2390,7 +2507,7 @@
 				{#if ui.markIn !== null}
 					<span
 						role="presentation"
-						use:tip={`Mark in ${fmt(ui.markIn)} — drag to move${clearHint('range.clearIn')}`}
+						use:tip={`Mark in ${tc(ui.markIn)} — drag to move${clearHint('range.clearIn')}`}
 						onpointerdown={(e) => onMarkPointerDown(e, 'in')}
 						style="position:absolute;left:{ui.markIn * pxPerSec -
 							3}px;top:0;bottom:0;width:12px;z-index:28;cursor:ew-resize;touch-action:none"
@@ -2404,7 +2521,7 @@
 				{#if ui.markOut !== null}
 					<span
 						role="presentation"
-						use:tip={`Mark out ${fmt(ui.markOut)} — drag to move${clearHint('range.clearOut')}`}
+						use:tip={`Mark out ${tc(ui.markOut)} — drag to move${clearHint('range.clearOut')}`}
 						onpointerdown={(e) => onMarkPointerDown(e, 'out')}
 						style="position:absolute;left:{ui.markOut * pxPerSec -
 							9}px;top:0;bottom:0;width:12px;z-index:28;cursor:ew-resize;touch-action:none"
@@ -2445,12 +2562,6 @@
 				oncontextmenu={onTitleLaneContextMenu}
 				style="height:{titleLaneH}px;border-bottom:1px solid var(--border-subtle);position:relative"
 			>
-				{#if editor.overlays.length === 0}
-					<span
-						style="position:absolute;left:8px;top:0;bottom:0;display:flex;align-items:center;font-size:11px;color:var(--text-muted);pointer-events:none;white-space:nowrap"
-						>Titles and captions appear here</span
-					>
-				{/if}
 				{#each editor.overlays as o (o.id)}
 					{@const live = titleDrag?.moved && titleDrag.id === o.id ? titleDrag : null}
 					{@const row = titleRows.get(o.id) ?? 0}
@@ -2498,6 +2609,7 @@
 					data-lane
 					data-track-id={t.id}
 					data-kind={t.kind}
+					data-locked={t.locked ? '' : undefined}
 					onclick={onLaneSeek}
 					onpointerdown={(e) => onCanvasPointerDown(e, 'lane')}
 					onpointermove={(e) => onLaneHover(e, t)}
@@ -2508,6 +2620,16 @@
 					ondrop={(e) => onLaneDrop(e, t)}
 					style="height:{trackHeight(t)};border-bottom:var(--line-width) solid var(--border-subtle);position:relative"
 				>
+					{#if t.locked}
+						<!-- A locked track refuses every edit, so it looks it: hatched lane, and a padlock that
+						     stays at the left edge of the window as the lane scrolls. -->
+						<span
+							data-lock-badge
+							use:tip={`${t.name} is locked — unlock it to edit`}
+							style="position:sticky;left:calc(var(--track-header-w) + 6px);top:0;z-index:20;display:inline-flex;align-items:center;margin:2px 0 0 6px;padding:2px 4px;border-radius:3px;pointer-events:none;color:var(--text-on-video);background:color-mix(in srgb,var(--scrim) {NAME_CHIP_PCT}%,transparent)"
+							><Icon n="lock" s={10} /></span
+						>
+					{/if}
 					{#each t.clips as c (c.id)}
 						{@const left = c.timeline_start * pxPerSec}
 						{@const width = Math.max(6, clipDuration(c) * pxPerSec)}
@@ -2528,23 +2650,40 @@
 						{@const off = c.enabled === false || !renders(t)}
 						{@const badge = badges.get(c.id)}
 						{@const lit = hoverPartners.has(c.id)}
+						{@const name = editor.assetName(c.asset_id)}
 						<button
 							class="kclip"
 							data-clip-id={c.id}
+							data-lit={lit ? '' : undefined}
+							use:tip={showsLabel(width) ? undefined : name}
 							data-linked={badge && badge.partners.length > 0 ? '' : undefined}
 							data-sound-detached={c.source_audio === false ? '' : undefined}
 							onpointerdown={(e) => onClipPointerDown(e, c, t)}
 							onpointerenter={() => (hoverId = c.id)}
 							onpointerleave={() => (hoverId = hoverId === c.id ? null : hoverId)}
 							oncontextmenu={(e) => onClipContextMenu(e, c, t)}
-							onclick={(e) => e.stopPropagation()}
-							style="--bw:{selected ? 'var(--line-emphasis)' : 'var(--line-width)'};position:absolute;left:{left}px;top:5px;height:calc(100% - 10px);width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;padding:0 7px;touch-action:none;filter:{off
+							onclick={(e) => {
+								e.stopPropagation();
+								if (e.detail > 0) {
+									// A pointer click: the clip is not left holding the keyboard, or Space (play) would
+									// press it — and replace a multi-selection with it — instead of reaching the page.
+									(e.currentTarget as HTMLElement).blur();
+								} else if (!selected) {
+									// Enter or Space on a focused clip: a click has no pointer position. A clip that is
+									// already selected leaves the selection (a group, a linked pair) as it is.
+									editor.selectClip(c.id);
+									void editor.select(c.asset_id);
+								}
+							}}
+							style="--bw:{selected ? 'var(--line-emphasis)' : 'var(--line-width)'};position:absolute;left:{left}px;top:5px;height:calc(100% - 10px);width:{width}px;border-radius:2px;overflow:clip;display:flex;align-items:center;padding:0 7px;touch-action:none;filter:{off
 								? 'grayscale(1)'
-								: 'none'};opacity:{dragging ? 0.4 : off ? 0.4 : 1};cursor:{clipCursor(t)};text-align:left;background:{t.kind === 'audio' ? 'var(--track-audio)' : 'var(--track-video)'};border:{selected ? 'var(--line-emphasis) solid var(--kerf-400)' : `var(--line-width) solid ${t.kind === 'audio' ? 'var(--track-audio-edge)' : 'var(--track-video-edge)'}`};box-shadow:{primary
+								: t.locked
+									? 'saturate(0.45)'
+									: 'none'};opacity:{dragging ? 0.4 : off ? 0.4 : 1};cursor:{clipCursor(t)};text-align:left;background:{t.kind === 'audio' ? 'var(--track-audio)' : 'var(--track-video)'};border:{selected ? 'var(--line-emphasis) solid var(--kerf-400)' : `var(--line-width) solid ${t.kind === 'audio' ? 'var(--track-audio-edge)' : 'var(--track-video-edge)'}`};box-shadow:{primary
 								? '0 0 0 1px var(--kerf-500)'
 								: selected
 									? '0 0 0 1px var(--kerf-600)'
-									: 'none'};outline:{lit ? '1.5px solid var(--kerf-300)' : 'none'};outline-offset:1px"
+									: 'none'}"
 						>
 							{#if t.kind === 'audio'}
 								<ClipWaveform
@@ -2585,22 +2724,24 @@
 									style="position:absolute;left:0;top:0;bottom:0;width:{Math.min(
 										c.transition_in.duration * pxPerSec,
 										width
-									)}px;background:linear-gradient(to right, color-mix(in srgb,var(--drag-ghost) 55%,transparent), transparent);border-left:2px solid var(--kerf-400);pointer-events:none"
+									)}px;background:linear-gradient(to right, color-mix(in srgb,var(--drag-ghost) 55%,transparent), transparent);border-left:2px solid var(--clip-accent);pointer-events:none"
 								></span>
 							{/if}
-							<!-- An audio clip's name sits at its foot: the middle belongs to the
-							     waveform (and the line between a stereo clip's lanes). A video clip's
-							     does too once it has thumbnails, on a backing — a bright frame under
-							     white text is unreadable otherwise. -->
-							<span
-								style="position:relative;font-size:10px;font-weight:600;color:var(--text-on-video);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;{t.kind ===
-								'audio'
-									? 'align-self:flex-end;margin-bottom:3px;text-shadow:0 1px 2px color-mix(in srgb,var(--scrim) 85%,transparent);'
-									: filmReady[c.id]
-										? 'align-self:flex-end;margin:0 0 3px -4px;padding:1px 5px;border-radius:3px;background:color-mix(in srgb,var(--scrim) 55%,transparent);text-shadow:0 1px 2px color-mix(in srgb,var(--scrim) 85%,transparent);'
-										: ''}"
-								>{editor.assetName(c.asset_id)}</span
-							>
+							<!-- The name. An audio clip's sits at its foot — the middle belongs to the waveform (and
+							     the line between a stereo clip's lanes) — and so does a video clip's once it has
+							     thumbnails; both on a backing, since a bright frame or a loud wave under white text
+							     is unreadable otherwise. It is sticky: scrolled until the clip's start is off the
+							     window, the name stays at the window's left edge for as long as any of the clip is
+							     in it, and a clip too narrow for a name has none (its tooltip says it). -->
+							{#if showsLabel(width)}
+								{@const chip = t.kind === 'audio' || !!filmReady[c.id]}
+								<span
+									class="kname"
+									data-chip={chip ? '' : undefined}
+									data-foot={chip ? '' : undefined}
+									style="--chip:{NAME_CHIP_PCT}%">{name}</span
+								>
+							{/if}
 							{#if (c.speed ?? 1) !== 1}
 								{@const sp = c.speed ?? 1}
 								<span
@@ -2805,3 +2946,51 @@
 		</div>
 	</div>
 </div>
+
+<style>
+	/* A locked lane is hatched: the track header says so too, but a lane that looks like any other is
+	   how an edit gets lost. The lines are the muted text colour at a whisper, so any theme draws them. */
+	[data-lane][data-locked] {
+		background-image: repeating-linear-gradient(
+			135deg,
+			color-mix(in srgb, var(--text-muted) 22%, transparent) 0 1px,
+			transparent 1px 7px
+		);
+	}
+
+	/* The clips draw their own outline: a partner of the clip under the pointer lights up, and the one
+	   with keyboard focus rings in the one focus colour (an inline `outline: none` used to beat it). */
+	.kclip[data-lit] {
+		outline: 1.5px solid var(--kerf-300);
+		outline-offset: 1px;
+	}
+	.kclip:focus-visible {
+		outline: var(--focus-outline);
+		outline-offset: 1px;
+		z-index: 4;
+	}
+
+	.kname {
+		position: sticky;
+		left: calc(var(--track-header-w) + 7px);
+		min-width: 0;
+		font-size: 10px;
+		font-weight: 600;
+		color: var(--text-on-video);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.kname[data-foot] {
+		align-self: flex-end;
+		margin-bottom: 3px;
+	}
+	.kname[data-chip] {
+		left: calc(var(--track-header-w) + 3px);
+		margin-left: -4px;
+		padding: 1px 5px;
+		border-radius: 3px;
+		background: color-mix(in srgb, var(--scrim) var(--chip), transparent);
+		text-shadow: 0 1px 2px color-mix(in srgb, var(--scrim) 85%, transparent);
+	}
+</style>

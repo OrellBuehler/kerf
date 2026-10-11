@@ -148,8 +148,25 @@ class EditorUi {
 	 *  bracket the working range; export can render just this span. */
 	markIn = $state<number | null>(null);
 	markOut = $state<number | null>(null);
-	/** Timeline zoom, pixels per second (`zoom.ts` owns the range and the maths). */
-	zoom = $state(ZOOM_DEFAULT);
+	#zoom = $state(ZOOM_DEFAULT);
+	/** Timeline zoom, pixels per second (`zoom.ts` owns the range and the maths). Setting it is a
+	 *  person taking the zoom, so the timeline stops fitting the cut to its window
+	 *  (`zoomFollowsCut`); the timeline's own fit goes through `fitZoomTo`. */
+	get zoom(): number {
+		return this.#zoom;
+	}
+	set zoom(z: number) {
+		this.#zoom = z;
+		this.zoomFollowsCut = false;
+	}
+	/** Whether the zoom is still the timeline's own: fitted to the cut when it opens and as it
+	 *  outgrows the window (`followZoom`), until anyone sets `zoom`. A new project starts it again. */
+	zoomFollowsCut = $state(true);
+	/** The timeline following the cut (`followZoom`): not a person's choice, so it keeps following. An
+	 *  explicit Fit (⇧Z, the button) is one, and goes through the setter. */
+	fitZoomTo(z: number) {
+		this.#zoom = z;
+	}
 	/** Bumped to ask the timeline to fit the whole cut in its window. Only the
 	 *  timeline knows how wide that is, so the shortcut (which lives in the page's
 	 *  key handler) asks rather than computes. A counter, like `seekEpoch`: a
@@ -246,6 +263,7 @@ class EditorUi {
 	 *  (the export options — a title, a codec — are not the new project's) is forgotten. */
 	projectReplaced() {
 		this.exportDraft = null;
+		this.zoomFollowsCut = true;
 	}
 
 	toggleDeliverShape(id: string) {

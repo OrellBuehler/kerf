@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { drawWaveform, type Ctx2D, type WavePalette } from './waveform-draw';
+import { CLIP_TIP_PX, drawWaveform, type Ctx2D, type WavePalette } from './waveform-draw';
 import type { Columns } from './waveform-view';
 
 /** A canvas context that writes down what it was asked to do. */
@@ -116,7 +116,7 @@ describe('drawWaveform', () => {
 		}
 	});
 
-	test('peaks at full scale are repainted in the clip colour, one shape per run', () => {
+	test('peaks at full scale are marked at the tips in the clip colour, two shapes per run', () => {
 		const { ctx, fills } = recorder();
 		const cols = columns(1, 100, (_, d) => (d >= 10 && d < 20) || d === 50 || (d >= 90 && d < 100) ? [-1, 1] : [-0.3, 0.3]);
 		const clipped = drawWaveform(ctx, cols, opts());
@@ -124,13 +124,43 @@ describe('drawWaveform', () => {
 		const wave = fills.filter((f) => f.style === 'wave-colour');
 		const hot = fills.filter((f) => f.style === 'clip-colour');
 		expect(wave).toHaveLength(1);
-		expect(hot).toHaveLength(3); // three runs, not twenty-one columns
-		// the first run spans exactly columns 10..20
+		expect(hot).toHaveLength(6); // an upper and a lower tip for each of three runs, not twenty-one columns
+		// the first run's tips span exactly columns 10..20
 		const xs = hot[0].points.map((p) => p[0]);
 		expect(Math.min(...xs)).toBe(10);
 		expect(Math.max(...xs)).toBe(20);
-		// painted after the waveform, so it ends up on top
+		// painted after the waveform, so they end up on top
 		expect(fills.indexOf(hot[0])).toBeGreaterThan(fills.indexOf(wave[0]));
+	});
+
+	test('a clipped column keeps its body: the marker is a few pixels at each tip, not the whole lane', () => {
+		for (const dpr of [1, 2]) {
+			const { ctx, fills } = recorder();
+			drawWaveform(ctx, columns(1, 30, () => [-1, 1]), opts({ width: 30, height: 40 * dpr, dpr }));
+			const [upper, lower] = fills.filter((f) => f.style === 'clip-colour');
+			const span = (f: (typeof fills)[0]) => {
+				const ys = f.points.map((p) => p[1]);
+				return [Math.min(...ys), Math.max(...ys)];
+			};
+			const [uTop, uBottom] = span(upper);
+			const [lTop, lBottom] = span(lower);
+			const laneTop = Math.min(...fills[0].points.map((p) => p[1]));
+			const laneBottom = Math.max(...fills[0].points.map((p) => p[1]));
+			expect(uTop).toBeCloseTo(laneTop, 5);
+			expect(lBottom).toBeCloseTo(laneBottom, 5);
+			expect(uBottom - uTop).toBeCloseTo(CLIP_TIP_PX * dpr, 5);
+			expect(lBottom - lTop).toBeCloseTo(CLIP_TIP_PX * dpr, 5);
+			// what lies between the tips is still the wave colour
+			expect(lTop - uBottom).toBeGreaterThan((laneBottom - laneTop) / 2);
+		}
+	});
+
+	test('a lane too short for two tips shares what it has', () => {
+		const { ctx, fills } = recorder();
+		drawWaveform(ctx, columns(1, 10, () => [-1, 1]), opts({ width: 10, height: 6 }));
+		const [upper, lower] = fills.filter((f) => f.style === 'clip-colour');
+		const ys = (f: (typeof fills)[0]) => f.points.map((p) => p[1]);
+		expect(Math.max(...ys(upper))).toBeLessThanOrEqual(Math.min(...ys(lower)) + 1e-6);
 	});
 
 	test('a clean clip paints no clip colour', () => {
