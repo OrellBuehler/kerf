@@ -13,6 +13,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { formatsFor, hasPicture, presetFor, ratioLabel } from '$lib/delivery-formats';
 	import { formatTimecode } from '$lib/timecode';
+	import { tip } from '$lib/tip';
 
 	const hasClips = $derived(editor.timeline.tracks.some((t) => t.clips.length > 0));
 	// Shapes are for a picture: the dialog ignores them for an audio-only cut, so
@@ -31,7 +32,7 @@
 		<div style="display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--text-secondary)">
 			<div style="display:flex;justify-content:space-between;gap:8px">
 				<span style="color:var(--text-muted)">Length</span>
-				<span style="font-family:var(--font-mono)" title="Non-drop timecode"
+				<span style="font-family:var(--font-mono)" use:tip={'Non-drop timecode'}
 					>{formatTimecode(editor.duration, editor.fps)}</span
 				>
 			</div>

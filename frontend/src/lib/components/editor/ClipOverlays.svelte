@@ -32,6 +32,7 @@
 	import { quantizeFade } from '$lib/frames';
 	import { gainLabel } from '$lib/mixer';
 	import { dragGain, lineTravel, lineY } from '$lib/volume-line';
+	import { tip } from '$lib/tip';
 
 	let {
 		clip,
@@ -260,7 +261,7 @@
 		<div
 			role="presentation"
 			class="grab vgrab"
-			title="Volume {gainLabel(volume)} — drag to change, double-click for 0 dB"
+			use:tip={`Volume ${gainLabel(volume)} — drag to change, double-click for 0 dB`}
 			onpointerdown={onVolumeDown}
 			ondblclick={onVolumeReset}
 			onclick={stop}
@@ -272,7 +273,7 @@
 		<div
 			role="presentation"
 			class="grab fgrab"
-			title="Fade in {fmtSeconds(fadeIn)} — drag to change, double-click to clear"
+			use:tip={`Fade in ${fmtSeconds(fadeIn)} — drag to change, double-click to clear`}
 			onpointerdown={(e) => onFadeDown(e, 'in')}
 			ondblclick={(e) => onFadeClear(e, 'in')}
 			onclick={stop}
@@ -283,7 +284,7 @@
 		<div
 			role="presentation"
 			class="grab fgrab"
-			title="Fade out {fmtSeconds(fadeOut)} — drag to change, double-click to clear"
+			use:tip={`Fade out ${fmtSeconds(fadeOut)} — drag to change, double-click to clear`}
 			onpointerdown={(e) => onFadeDown(e, 'out')}
 			ondblclick={(e) => onFadeClear(e, 'out')}
 			onclick={stop}
@@ -298,7 +299,7 @@
 			role="presentation"
 			class="kf"
 			class:blocked={tooled}
-			title="Keyframe at {stamp(k.time)} — click to go there"
+			use:tip={`Keyframe at ${stamp(k.time)} — click to go there`}
 			onpointerdown={stop}
 			onclick={(e) => onKeyframeClick(e, k)}
 			style="left:{Math.min(Math.max(k.time * pxPerSec, HANDLE / 2), Math.max(HANDLE / 2, width - HANDLE / 2)) - HANDLE / 2}px;top:{Math.max(0, height - HANDLE - 2)}px"

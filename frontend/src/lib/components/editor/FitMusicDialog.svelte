@@ -12,6 +12,7 @@
 	import { formatTime } from '$lib/diff';
 	import { describeFit, describeRemainder, fitVerdict, musicSummary, parseTarget } from '$lib/music-ui';
 	import type { MusicFit } from '$lib/types';
+	import { tip } from '$lib/tip';
 
 	let { clipId, onClose }: { clipId: string; onClose: () => void } = $props();
 
@@ -115,7 +116,7 @@
 		<div style="display:flex;flex-direction:column;gap:2px">
 			<span
 				style="font-size:13px;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-				title={clip ? editor.assetName(clip.asset_id) : ''}>{clip ? editor.assetName(clip.asset_id) : ''}</span
+				use:tip={clip ? editor.assetName(clip.asset_id) : ''}>{clip ? editor.assetName(clip.asset_id) : ''}</span
 			>
 			{#if music}
 				<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">{musicSummary(music)}</span>
@@ -177,7 +178,7 @@
 			style="display:flex;align-items:center;gap:8px;padding:2px 0;cursor:{overruns ? 'pointer' : 'default'};opacity:{overruns
 				? 1
 				: 0.6}"
-			title={overruns
+			use:tip={overruns
 				? 'Cut the music at the target and fade it out over its last two seconds.'
 				: 'Only matters when the arrangement runs past the target.'}
 		>

@@ -21,6 +21,7 @@
 	import { thumbnails } from '$lib/thumbnails';
 	import { analysisFacts, audioExtraction, mediaInfo, shortPath, specLine, thumbTime, type MediaInfo } from '$lib/media-info';
 	import type { Asset } from '$lib/types';
+	import { tip } from '$lib/tip';
 
 	type BinAsset = { asset: Asset; info: MediaInfo };
 
@@ -367,7 +368,7 @@
 							{#if editor.importProgress !== null}
 								<span
 									style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)"
-									title="Stitching a 360 lens pair"
+									use:tip={'Stitching a 360 lens pair'}
 									>{Math.round(editor.importProgress * 100)}%</span
 								>
 							{/if}
@@ -394,7 +395,8 @@
 						oncontextmenu={(e) => onAssetContextMenu(e, a)}
 						onclick={() => onSelect(a.asset.id)}
 						onkeydown={(e) => e.key === 'Enter' && onSelect(a.asset.id)}
-						title="{a.asset.path}&#10;Drag onto a timeline track to add a clip · right-click for details"
+						use:tip={`${a.asset.path}
+Drag onto a timeline track to add a clip · right-click for details`}
 						style="display:flex;flex-direction:column;gap:6px;padding:7px;border-radius:var(--radius-sm);background:{sel ? 'var(--surface-hover)' : 'var(--surface-raised)'};border:var(--line-width) solid {sel ? 'var(--kerf-500)' : 'var(--border-subtle)'};cursor:grab"
 					>
 						<div style="display:flex;gap:9px;align-items:center">
@@ -427,7 +429,7 @@
 							{#if spec}
 								<div
 									style="font-size:12px;color:{sel ? 'var(--text-secondary)' : 'var(--text-muted)'};margin-top:3px;line-height:1.4;overflow-wrap:anywhere"
-									title={spec}
+									use:tip={spec}
 								>
 									{spec}
 								</div>

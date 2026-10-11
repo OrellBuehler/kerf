@@ -10,6 +10,7 @@
 	import { settings } from '$lib/settings.svelte';
 	import type { ActionId } from '$lib/keymap';
 	import type { MenuCommand } from '$lib/menus';
+	import { tip } from '$lib/tip';
 
 	let { onAction, onCommand }: { onAction: (id: ActionId) => void; onCommand: (command: MenuCommand) => void } = $props();
 
@@ -42,7 +43,7 @@
 		     when the window is narrow. -->
 		<div style="min-width:0;flex:0 1 auto;display:flex;align-items:center;gap:8px;overflow:hidden">
 			<span
-				title={editor.currentPath ?? 'In-memory project — not yet saved'}
+				use:tip={editor.currentPath ?? 'In-memory project — not yet saved'}
 				style="min-width:0;font:var(--type-label);color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 				>{editor.projectName}</span
 			>
@@ -57,7 +58,7 @@
 			data-on={settings.open ? '' : undefined}
 			data-on-ink="primary"
 			onclick={() => settings.toggle()}
-			title={settings.withShortcut('Settings — performance, appearance and keyboard shortcuts', 'app.settings')}
+			use:tip={settings.tip('Settings', 'app.settings', 'Performance, appearance and keyboard shortcuts')}
 			aria-label="Settings"
 			style="-webkit-app-region:no-drag;width:26px;height:22px"
 		>
@@ -71,7 +72,7 @@
 			data-on={notifications.open ? '' : undefined}
 			data-on-ink="primary"
 			onclick={() => notifications.toggle()}
-			title={notifications.unread
+			use:tip={notifications.unread
 				? `${notifications.unread} unread notification${notifications.unread === 1 ? '' : 's'}`
 				: 'Notifications'}
 			aria-label="Notifications"
@@ -90,7 +91,7 @@
 			class="k-ibtn"
 			data-accent={available ? '' : undefined}
 			onclick={() => updater.open()}
-			title={available
+			use:tip={available
 				? `Kerf ${updater.update?.version} is available — click to install`
 				: `Kerf ${updater.version} — click to check for updates`}
 			style="-webkit-app-region:no-drag;gap:5px;padding:2px 8px;border-radius:999px;font-family:var(--font-mono);font-size:var(--text-xs)"

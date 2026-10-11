@@ -56,6 +56,7 @@ import {
 	type Resolution
 } from './keymap';
 import type { AnalysisKind, AppSettings, AutoAnalysis, PreviewSource, ProxySize, SettingsView } from './types';
+import type { TipSpec } from './tip';
 
 /** The named budgets. The slider still offers everything in between; these are
  *  the three answers people actually have to "how much of my computer?". */
@@ -366,6 +367,13 @@ class SettingsStore {
 	withShortcut(label: string, id: ActionId): string {
 		const k = this.shortcut(id);
 		return k ? `${label} (${k})` : label;
+	}
+
+	/** A tooltip for an action: its label, the key as keycaps (nothing when unbound) and a muted
+	 *  second line for what the label cannot hold (`tip.ts`). */
+	tip(label: string, id: ActionId, detail?: string): TipSpec {
+		const keys = this.shortcut(id);
+		return { text: label, ...(keys ? { keys } : {}), ...(detail ? { detail } : {}) };
 	}
 
 	/** The other actions that already use this chord where `rebind` would put it. */

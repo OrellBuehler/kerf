@@ -17,6 +17,7 @@
 	import { PREVIEW_SOURCES, PROXY_SIZES } from '$lib/proxy-info';
 	import { approxMB, isVoiceoverCancelled, loadPrefs, stageLabel } from '$lib/voiceover';
 	import type { VoiceoverProgress, VoiceoverStatus } from '$lib/types';
+	import { tip } from '$lib/tip';
 
 	let { onClose }: { onClose: () => void } = $props();
 
@@ -157,7 +158,7 @@
 
 				<div style="display:flex;flex-wrap:wrap;gap:6px">
 					{#each CPU_PRESETS as p (p.id)}
-						<button title={p.hint} onclick={() => settings.setCpuPercent(p.percent)} style={chip(percent === p.percent)}>
+						<button use:tip={p.hint} onclick={() => settings.setCpuPercent(p.percent)} style={chip(percent === p.percent)}>
 							{p.label}
 						</button>
 					{/each}
@@ -332,7 +333,7 @@
 							role="radio"
 							aria-checked={settings.proxySize === p.size}
 							data-testid="proxy-size-{p.size}"
-							title={p.hint}
+							use:tip={p.hint}
 							onclick={() => settings.setProxySize(p.size)}
 							style={chip(settings.proxySize === p.size)}>{p.label}</button
 						>
@@ -354,7 +355,7 @@
 							role="radio"
 							aria-checked={settings.previewSource === p.source}
 							data-testid="preview-source-{p.source}"
-							title={p.hint}
+							use:tip={p.hint}
 							disabled={settings.proxySize === 0 && p.source !== 'original'}
 							onclick={() => settings.setPreviewSource(p.source)}
 							style="{chip(settings.previewSource === p.source)};{settings.proxySize === 0 && p.source !== 'original'
@@ -485,7 +486,7 @@
 				</div>
 				<div style="margin-top:6px;display:flex;flex-direction:column;gap:2px">
 					{#each SHAPE_TOKENS as t (t.name)}
-						<label title={t.hint} style="display:flex;align-items:center;gap:10px;height:28px;font-size:12px;color:var(--text-secondary)">
+						<label use:tip={t.hint} style="display:flex;align-items:center;gap:10px;height:28px;font-size:12px;color:var(--text-secondary)">
 							<span style="width:130px;flex:none">{t.label}</span>
 							<input
 								type="range"

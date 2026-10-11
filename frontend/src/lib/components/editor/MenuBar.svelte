@@ -42,6 +42,7 @@
 	} from '$lib/menus';
 	import type { ActionId } from '$lib/keymap';
 	import { createAltTap } from '$lib/alt-tap';
+	import { tip } from '$lib/tip';
 
 	let {
 		compact = false,
@@ -503,7 +504,7 @@
 						aria-haspopup={item.kind === 'submenu' ? 'menu' : undefined}
 						aria-expanded={item.kind === 'submenu' ? isOpen(p) : undefined}
 						aria-disabled={off || undefined}
-						title={off ? (item.kind !== 'submenu' ? item.reason : undefined) : undefined}
+						use:tip={off ? (item.kind !== 'submenu' ? item.reason : undefined) : undefined}
 						tabindex="-1"
 						class="kerf-menu-item"
 						onclick={() => entryClick(p, item)}

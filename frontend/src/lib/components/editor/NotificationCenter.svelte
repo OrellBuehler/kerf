@@ -2,6 +2,7 @@
 	import Icon from './Icon.svelte';
 	import { windows } from '$lib/windows.svelte';
 	import { notifications, type Notice, type NoticeKind } from '$lib/notifications.svelte';
+	import { tip } from '$lib/tip';
 
 	let el = $state<HTMLDivElement | null>(null);
 	let filter = $state<'all' | 'unread' | 'errors'>('all');
@@ -85,7 +86,7 @@
 			<button
 				onclick={() => notifications.markAllRead()}
 				disabled={notifications.unread === 0}
-				title="Mark every notification as read"
+				use:tip={'Mark every notification as read'}
 				style="height:22px;padding:0 8px;border-radius:var(--radius-full);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:{notifications.unread
 					? 'var(--text-secondary)'
 					: 'var(--text-disabled)'};font-size:11px;opacity:1;cursor:{notifications.unread ? 'pointer' : 'default'}"
@@ -94,7 +95,7 @@
 			<button
 				onclick={() => notifications.clear()}
 				disabled={notifications.items.length === 0}
-				title="Clear the log"
+				use:tip={'Clear the log'}
 				style="height:22px;padding:0 8px;border-radius:var(--radius-full);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:{notifications
 					.items.length
 					? 'var(--text-secondary)'
@@ -147,13 +148,13 @@
 									: 'var(--text-primary)'};overflow-wrap:anywhere;user-select:text">{n.text}</span
 							>
 							<span
-								title={clock(n)}
+								use:tip={clock(n)}
 								style="font-family:var(--font-mono);font-size:var(--text-2xs);color:var(--text-muted)">{age(n)}</span
 							>
 						</div>
 						<button
 							onclick={() => notifications.markRead(n.id, !n.read)}
-							title={n.read ? 'Mark as unread' : 'Mark as read'}
+							use:tip={n.read ? 'Mark as unread' : 'Mark as read'}
 							aria-label={n.read ? 'Mark as unread' : 'Mark as read'}
 							style="flex:none;width:20px;height:20px;display:grid;place-items:center;border:none;background:none;cursor:pointer;color:{n.read
 								? 'var(--text-disabled)'
@@ -167,7 +168,7 @@
 						</button>
 						<button
 							onclick={() => notifications.remove(n.id)}
-							title="Remove"
+							use:tip={'Remove'}
 							aria-label="Remove"
 							style="flex:none;width:20px;height:20px;display:grid;place-items:center;border:none;background:none;cursor:pointer;color:var(--text-muted)"
 						>

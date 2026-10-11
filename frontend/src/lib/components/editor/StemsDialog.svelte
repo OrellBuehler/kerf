@@ -11,6 +11,7 @@
 	import { formatTime } from '$lib/diff';
 	import type { StemsProgress, StemsStatus } from '$lib/types';
 	import { STEM_NAMES, capitalized, describeStems, downloadNote, isStemsCancelled, stageLabel } from '$lib/stems';
+	import { tip } from '$lib/tip';
 
 	let { assetId, clipId = null, onClose }: { assetId: string; clipId?: string | null; onClose: () => void } = $props();
 
@@ -89,7 +90,7 @@
 		<div style="display:flex;flex-direction:column;gap:2px">
 			<span
 				style="font-size:13px;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-				title={asset?.name ?? ''}>{asset?.name ?? ''}</span
+				use:tip={asset?.name ?? ''}>{asset?.name ?? ''}</span
 			>
 			{#if placement}
 				<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)"

@@ -32,6 +32,7 @@
 		wordCount,
 		type VoiceoverPrefill
 	} from '$lib/voiceover';
+	import { tip } from '$lib/tip';
 
 	let { onClose, prefill = null }: { onClose: () => void; prefill?: VoiceoverPrefill | null } = $props();
 
@@ -225,7 +226,7 @@
 			</label>
 			{#if caption}
 				{#each CAPTION_LOOKS as c (c.id)}
-					<button type="button" style={chip(captionStyle === c.id)} title={c.hint} onclick={() => (styleChoice = c.id)}>
+					<button type="button" style={chip(captionStyle === c.id)} use:tip={c.hint} onclick={() => (styleChoice = c.id)}>
 						{c.label}
 					</button>
 				{/each}

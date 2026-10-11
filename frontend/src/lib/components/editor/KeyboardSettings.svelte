@@ -21,6 +21,7 @@
 		type Chord,
 		type Rebind
 	} from '$lib/keymap';
+	import { tip } from '$lib/tip';
 
 	const platform = settings.platform;
 
@@ -280,7 +281,7 @@
 									{a.label}
 									{#if custom}
 										<span
-											title="Not the default"
+											use:tip={'Not the default'}
 											role="img"
 											aria-label="Not the default"
 											style="width:6px;height:6px;border-radius:50%;background:var(--kerf-400);flex:none"
@@ -307,7 +308,7 @@
 										<button
 											data-key-row={a.id}
 											onclick={() => startRecording(a.id, c)}
-											title="Change this shortcut"
+											use:tip={'Change this shortcut'}
 											aria-label="{a.label}: {show(c)}. Change this shortcut"
 											style={chip()}>{show(c)}</button
 										>
@@ -334,7 +335,7 @@
 									<button
 										data-key-row={a.id}
 										onclick={() => startRecording(a.id, null)}
-										title="Add another shortcut"
+										use:tip={'Add another shortcut'}
 										aria-label="Add another shortcut to {a.label}"
 										style={iconBtn}><Icon n="plus" s={12} color="currentColor" /></button
 									>
@@ -344,7 +345,7 @@
 									<button
 										data-key-row={a.id}
 										onclick={() => reset(a.id)}
-										title="Back to the default"
+										use:tip={'Back to the default'}
 										aria-label="Reset {a.label} to its default"
 										style={iconBtn}><Icon n="rotate-ccw" s={12} color="currentColor" /></button
 									>

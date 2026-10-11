@@ -2,6 +2,7 @@
 	import Icon from './Icon.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
+	import { tip } from '$lib/tip';
 
 	/** The window this instance draws in. One is mounted in the editor window and one in
 	 *  each detached window (`popout.svelte.ts`): a menu belongs to the window it was
@@ -91,14 +92,14 @@
 				<div style="padding:5px 8px 4px;min-width:0;max-width:300px">
 					<div
 						style="font-size:12px;font-weight:600;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-						title={item.label}
+						use:tip={item.label}
 					>
 						{item.label}
 					</div>
 					{#if item.sub}
 						<div
 							style="font-size:var(--text-xs);color:var(--text-muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-							title={item.sub}
+							use:tip={item.sub}
 						>
 							{item.sub}
 						</div>
@@ -107,7 +108,7 @@
 			{:else if item.type === 'info'}
 				<div
 					style="display:flex;align-items:baseline;gap:12px;padding:2px 8px;font-size:11px;line-height:16px;max-width:300px"
-					title={item.title ?? item.value}
+					use:tip={item.title ?? item.value}
 				>
 					<span style="flex:none;color:var(--text-muted)">{item.label}</span>
 					<span
@@ -119,7 +120,7 @@
 				<button
 					role="menuitem"
 					disabled={item.disabled}
-					title={item.disabled ? item.reason : undefined}
+					use:tip={item.disabled ? item.reason : undefined}
 					onclick={() => run(item)}
 					style="display:flex;align-items:center;gap:9px;width:100%;padding:6px 8px;border:none;border-radius:var(--radius-sm);background:none;cursor:{item.disabled
 						? 'default'

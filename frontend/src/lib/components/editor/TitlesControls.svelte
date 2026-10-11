@@ -27,6 +27,7 @@
 	} from '$lib/caption-import-ui';
 	import { attempt } from '$lib/ops';
 	import { chip } from '$lib/chip';
+	import { tip } from '$lib/tip';
 
 	const uid = $props.id();
 	/** The options row: where its window (the panel may be in a detached one) is read from. */
@@ -115,7 +116,7 @@
 	{#each CAPTION_LOOKS as c (c.id)}
 		<button
 			style={chip(ui.captionStyle === c.id)}
-			title={c.hint}
+			use:tip={c.hint}
 			aria-pressed={ui.captionStyle === c.id}
 			onclick={() => (ui.captionStyle = c.id)}
 		>
@@ -259,7 +260,7 @@
 			>
 			<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">{tc(o.start)}</span>
 		</button>
-		<button onclick={() => void attempt(() => editor.removeOverlay(o.id))} disabled={editor.busy} title="Remove" aria-label="Remove" style={xBtn}
+		<button onclick={() => void attempt(() => editor.removeOverlay(o.id))} disabled={editor.busy} use:tip={'Remove'} aria-label="Remove" style={xBtn}
 			>×</button
 		>
 	</div>

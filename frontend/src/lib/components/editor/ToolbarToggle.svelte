@@ -6,6 +6,7 @@
 	// neither. Colors and states are `styles/controls.css` (`.k-tt`), so every theme gets them.
 	import type { Snippet } from 'svelte';
 	import Icon from './Icon.svelte';
+	import { tip, tipText, type TipInput } from '$lib/tip';
 
 	let {
 		title,
@@ -22,7 +23,7 @@
 		...rest
 	}: {
 		/** The tooltip: what it does, with its shortcut. */
-		title: string;
+		title: TipInput;
 		/** The accessible name when the tooltip is longer than a name should be; defaults to the title. */
 		label?: string;
 		icon?: string;
@@ -48,8 +49,8 @@
 <button
 	type="button"
 	class="k-tt"
-	{title}
-	aria-label={children ? label : (label ?? title)}
+	use:tip={title}
+	aria-label={children ? label : (label ?? (tipText(title) || undefined))}
 	aria-pressed={pressed ?? undefined}
 	data-on={lit || undefined}
 	data-bare={bare || undefined}
