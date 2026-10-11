@@ -670,13 +670,21 @@ too, so selecting text in a field and letting go over the dark no longer closes 
 (`72px 1fr 52px 24px`, the slot kept when empty so every slider in the panel is the same length; `reserve={false}` in
 a dialog; `minmax(0, 1fr)` so the row shrinks to the Inspector's 260 px minimum without clipping a value). The slider is
 `MixSlider` (`solid`: drawn like the plain range) so a drag writes **one edit on release**, Escape / pointercancel / blur
-abandon it, a run of arrow keys is one edit and a double-click puts the property back to its rest value; only the thumb
-takes hold, so a click on the track no longer jumps (it would make a double-click three edits). The rest value (`neutral`) is a
+abandon it, a run of arrow keys is one edit and a double-click puts the property back to its rest value. **Only the thumb
+takes hold, so a click elsewhere on the track no longer jumps the value** — a deliberate change from the native range it
+replaced, as in the mixer: a jump on the first click would make a double-click three edits (jump, jump, reset). The rest value (`neutral`) is a
 tick on the travel, and a property that goes both ways (`bipolar`, by default a travel across zero) fills from it instead of
 from the left. The number is a field (click, type, Enter or Tab to write, Escape to put it back; `1.1` on a 0.25 step is fine):
 what is shown is `value × scale` with `digits` decimals and a `unit` (`PERCENT`, `DEGREES`, `TIMES`, `SECONDS`), and the geometry,
 snapping, readout, entry parsing and key steps are the pure, bun-tested `slider-row.ts` (a typed entry is held to `limit`, a fade
-as long as its clip on a 5 s slider). The ◇ is a 24 px `IconBtn` with a `diamond` icon (filled while a key sits at the playhead).
+as long as its clip on a 5 s slider, and to the digits shown: a fade is 0.01 s, a title's size 0.1 %). A value is *at rest* only when it
+is exactly there — a 0.4° rotation reads 0° and can still be reset or typed to 0. **A write goes to what the edit began on**: a typed
+entry is written when the field blurs, and the click that selects another clip blurs it after the selection has moved, so the row
+reads its `scope` (clip, title, playhead time; `Pending` in `slider-row.ts`) when a drag, a key run or a typed entry *starts* and hands it
+back with the value (`at`); the Inspector's helpers (`setTf`, `setCol`, `setCam`, `patchMask`, `setFade`, `moveTitle`, and a keyed
+number's `keyAtPlayhead`) read that clip, and its plain number fields (`numRow`) note theirs on focus. Rest values are the model's
+`DEFAULT_TRANSFORM` / `DEFAULT_COLOR` / `DEFAULT_REFRAME` / `DEFAULT_MASK`. The Inspector's other rows (read-only values, plain number
+fields) share the label column and run to the panel's edge over the keyframe slot, which a source range needs at the 250 px minimum. The ◇ is a 24 px `IconBtn` with a `diamond` icon (filled while a key sits at the playhead).
 A plain `<input type=range>` (Settings, the timeline zoom) gets an 18 px hit box and `min-width:0` from `layout.css`.
 **`ToolbarToggle`** is a button of the timeline toolbar: 24 px high and at least 24 px wide, one radius, and one "on" for every kind
 of button — the amber outline and wash (`kerf-400` border, `kerf-300` on `selection-fill`, a pair the contrast guard holds to 4.5:1)
