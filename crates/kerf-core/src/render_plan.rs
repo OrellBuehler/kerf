@@ -688,10 +688,9 @@ fn effect_refusal(effect: &VideoEffect, caps: &GpuCaps) -> Option<&'static str> 
     }
 }
 
-/// The most the sharpens after a scale or a blur may amplify its one-level difference from FFmpeg's, as the
-/// product of their `1 + 2 * amount` gains: two levels of luma, the bound of a scaled blur. One sharpen of
-/// 0.5 reaches it exactly.
-const MAX_SHARPEN_GAIN: f64 = 2.0;
+/// The worst-case luma error, in levels, the plan allows through the sharpens after a scale or a blur (which
+/// start it at one): two, the bound of a scaled blur. One sharpen of 0.5 reaches it exactly.
+const MAX_SHARPEN_ERROR: f64 = 2.0;
 
 /// What an effect does to this kind of picture that the compositor, which works on the 4:2:0 limited-range
 /// planes the decode hands it, does not: FFmpeg runs the filter on the picture as it is in the graph, and the
@@ -763,28 +762,36 @@ impl RenderPlan {
             }
             // A sharpen is exact, but what it sharpens is not exactly FFmpeg's: the compositor's scaler is a
             // level off swscale's, and its blur a level off `gblur`'s SIMD on a sample that sits on a half.
-            // `unsharp` amplifies that level, at worst `1 + 2 * amount` levels of luma at an edge sample
-            // (measured 3 at 1.5 after a scale, 7 at 3, 11 at 5; after a blur 2-3, 3-4 and 5-6), and a
-            // second sharpen amplifies the first's result again. So from the first source of difference on
-            // (a scale ahead of the effects: every stage, or the fit scale when a moving zoom comes last;
-            // or a blur) the gains of the sharpens that follow multiply, and the frame is drawn only while
-            // their product stays within the two levels a scaled blur does. With no source upstream a
-            // sharpen is exact at any amount.
+            // `unsharp` (`s + (((s - blur) * amount) >> 16)`) carries that level through at worst
+            // `1 + 2 * amount` levels of luma at an edge sample (after a scale: 3 at 1.5, 7 at 3, 11 at 5;
+            // after a blur: 2 at 1, 3 at 1.5, 5-6 at 5), and the `>> 16` floors, so every sharpen after
+            // the first adds up to a level of its own however small its amount (two of 0.2 reach 3, three
+            // of 0.1 reach 4). From the first source of difference on (a scale ahead of the effects: every
+            // stage, or the fit scale when a moving zoom comes last; or a blur with a sigma) the worst case
+            // is followed through the sharpens that count, `err += ceil(2 * err * |amount|)` from 1, and the
+            // frame is drawn only while it stays within the two levels a scaled blur does: one sharpen of
+            // at most 0.5, and no second one. A sharpen of nothing at `unsharp`'s 16-bit precision counts
+            // for nothing; with no source upstream a sharpen is exact at any amount.
             let zoom_last = layer.animated.is_some_and(|a| a.zooms) && geom.stages.len() == 2;
             let before_effects = if zoom_last { 1 } else { geom.stages.len() };
-            let mut inexact = geom.stages[..before_effects].iter().any(|s| s.scaled != (s.src.w, s.src.h));
-            let mut gain = 1.0;
+            let mut err = if geom.stages[..before_effects].iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
+                1.0
+            } else {
+                0.0
+            };
             for effect in &layer.effects {
                 match effect {
-                    VideoEffect::Blur { sigma } if *sigma > 0.0 => inexact = true,
-                    VideoEffect::Sharpen { amount } if inexact => gain *= 1.0 + 2.0 * amount.abs(),
+                    VideoEffect::Blur { sigma } if *sigma > 0.0 && err == 0.0 => err = 1.0,
+                    VideoEffect::Sharpen { amount } if err > 0.0 && (f64::from(*amount as f32) * 65536.0) as i32 != 0 => {
+                        err += (2.0 * err * amount.abs()).ceil();
+                    }
                     _ => {}
                 }
             }
-            if gain > MAX_SHARPEN_GAIN {
+            if err > MAX_SHARPEN_ERROR {
                 reasons.push(Unsupported::Effects(
                     self.layer_ref(n, layer),
-                    "a sharpen after a scale or a blur: it amplifies their one-level difference from FFmpeg's by 1 + 2 x amount, compounding over chained sharpens, past two levels",
+                    "a sharpen after a scale or a blur: it amplifies their one-level difference from FFmpeg's by 1 + 2|amount| and rounds up a level more with each further sharpen, past two levels",
                 ));
             }
             // FFmpeg scales a picture in the format it has; the compositor scales the
@@ -2483,12 +2490,24 @@ mod tests {
             assert!(why.is_empty(), "{amount}: {why:?}");
         }
         assert!(reasons(&pip(vec![blur()]), u32::MAX).is_empty());
-        // Sharpens compound: two of 0.5 are a gain of 4, and a table beside them changes nothing.
-        let why = reasons(&pip(vec![sharp(0.5), sharp(0.5)]), u32::MAX);
-        assert!(refused(&why), "{why:?}");
+        // Sharpens compound, and each one after the first rounds up a level of its own however small: two
+        // of 0.5, two of 0.2 or of 0.001, three of 0.1. A table beside them changes nothing.
+        for amounts in [vec![0.5, 0.5], vec![0.2, 0.2], vec![0.001, 0.001], vec![0.1, 0.1, 0.1]] {
+            let effects: Vec<VideoEffect> = amounts.iter().map(|a| sharp(*a)).collect();
+            let why = reasons(&pip(effects.clone()), u32::MAX);
+            assert!(refused(&why), "pip {amounts:?}: {why:?}");
+            let blurred: Vec<VideoEffect> = std::iter::once(blur()).chain(effects).collect();
+            let why = reasons(&plain(blurred), u32::MAX);
+            assert!(refused(&why), "blur then {amounts:?}: {why:?}");
+        }
         let why = reasons(&pip(vec![sharp(0.5), VideoEffect::Invert, sharp(0.5)]), u32::MAX);
         assert!(refused(&why), "{why:?}");
+        // A sharpen of nothing counts for nothing: zero, or less than `unsharp`'s 16 bits hold (1/65536 is its step).
         assert!(reasons(&pip(vec![sharp(0.5), sharp(0.0)]), u32::MAX).is_empty());
+        assert!(reasons(&pip(vec![sharp(0.0), sharp(0.5)]), u32::MAX).is_empty());
+        assert!(reasons(&pip(vec![sharp(0.5), sharp(0.00001), sharp(-0.00001)]), u32::MAX).is_empty());
+        assert!(reasons(&pip(vec![sharp(0.001)]), u32::MAX).is_empty());
+        assert!(reasons(&plain(vec![blur(), sharp(0.0), sharp(0.5)]), u32::MAX).is_empty());
         // A blur is a source of difference too: a sharpen after one, scaled or not.
         for (amount, ok) in [(0.5, true), (0.6, false), (1.0, false), (5.0, false)] {
             let why = reasons(&plain(vec![blur(), sharp(amount)]), u32::MAX);
@@ -2504,6 +2523,7 @@ mod tests {
         // The other way round, or with nothing upstream, the sharpens are exact: any amount, chained.
         assert!(reasons(&plain(vec![sharp(5.0)]), u32::MAX).is_empty());
         assert!(reasons(&plain(vec![sharp(0.5), sharp(0.5)]), u32::MAX).is_empty());
+        assert!(reasons(&plain(vec![sharp(0.2), sharp(0.2), sharp(0.001)]), u32::MAX).is_empty());
         assert!(reasons(&plain(vec![sharp(3.0), blur()]), u32::MAX).is_empty());
         assert!(reasons(&plain(vec![sharp(2.0), VideoEffect::Invert, sharp(2.0), blur()]), u32::MAX).is_empty());
         // Rendered smaller the fit scale is a real one, and the picture is no longer exact.

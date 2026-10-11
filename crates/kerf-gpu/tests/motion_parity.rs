@@ -2706,6 +2706,15 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             "sharpen 0.5 twice",
             vec![E::Sharpen { amount: 0.5 }, E::Sharpen { amount: 0.5 }],
         ),
+        // Each further sharpen rounds up a level of its own, however small its amount.
+        (
+            "sharpen 0.2 twice",
+            vec![E::Sharpen { amount: 0.2 }, E::Sharpen { amount: 0.2 }],
+        ),
+        (
+            "sharpen 0.001 twice",
+            vec![E::Sharpen { amount: 0.001 }, E::Sharpen { amount: 0.001 }],
+        ),
         ("sharpen 1.5", vec![E::Sharpen { amount: 1.5 }]),
         ("sharpen 3", vec![E::Sharpen { amount: 3.0 }]),
         ("sharpen 5", vec![E::Sharpen { amount: 5.0 }]),
@@ -2746,6 +2755,10 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         (
             "blur then sharpen 5",
             vec![E::Blur { sigma: 2.0 }, E::Sharpen { amount: 5.0 }],
+        ),
+        (
+            "blur then sharpen 0.2 twice",
+            vec![E::Blur { sigma: 2.0 }, E::Sharpen { amount: 0.2 }, E::Sharpen { amount: 0.2 }],
         ),
         (
             "blur then sharpen 0.5 twice",

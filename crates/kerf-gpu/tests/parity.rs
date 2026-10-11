@@ -4452,6 +4452,10 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             "sharpen-0.5-twice",
             vec![E::Sharpen { amount: 0.5 }, E::Sharpen { amount: 0.5 }],
         ),
+        (
+            "sharpen-0.2-twice",
+            vec![E::Sharpen { amount: 0.2 }, E::Sharpen { amount: 0.2 }],
+        ),
     ] {
         let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
         c.transform.scale = 0.6;
