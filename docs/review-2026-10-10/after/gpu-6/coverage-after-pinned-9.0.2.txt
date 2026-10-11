@@ -1,4 +1,4 @@
-    Finished `test` profile [unoptimized] target(s) in 0.20s
+    Finished `test` profile [unoptimized] target(s) in 0.23s
      Running tests/coverage.rs (target/debug/deps/coverage-4d21c0736382f3ef)
 
 running 1 test
@@ -26,5 +26,5 @@ T3  tutorial 16:9, webcam PiP, 5 lower thirds, keyed push-ins, 1 mask + blur [mo
                                                                              refused by GPU-4's caps: Effects 376, KeyedZoom 1876, Mask 376
 test captioned_cuts_and_transitions_are_drawn_by_the_compositor_where_they_were_refused ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.94s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.46s
 
