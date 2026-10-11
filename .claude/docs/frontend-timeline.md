@@ -235,6 +235,11 @@ three glyph buttons set all tracks (lit when every track agrees; View › Track 
 menu (so is the header's right-click). Marquee hit-testing and lane `offsetTop` read the DOM,
 so they follow the heights. The compact titles lane is 27 px (`MIN_TITLE_LANE_PX`: the 26 px
 add button plus the lane's border).
+The **toolbar** is `ToolbarToggle`s (`frontend.md`, Shared components): tools | Undo / Redo on the left, then
+zoom | snapping and Ripple | the three track heights and the overview | `+ V` / `+ A` and the delivery frame on the right,
+a rule between each group. Every one is 24 px high with a 24 px target at least, and lit the same way (amber outline
+and wash) — a tool, snapping (a magnet, `aria-pressed`), Ripple, the heights, the overview, a fade that is set, and the delivery
+frame once one is chosen. The track header's own S / L / DUCK toggles are not part of it.
 The **minimap** (`Minimap.svelte` over the pure `minimap.ts`; toolbar toggle, remembered) is
 the whole cut on a 36 px strip: a block per clip per track row (runs too fine to tell apart
 merge, so blocks are bounded by the strip's width), the playhead, the in / out marks, and the
