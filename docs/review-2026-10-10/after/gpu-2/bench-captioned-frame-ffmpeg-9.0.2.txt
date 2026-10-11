@@ -1,0 +1,4 @@
+adapter: llvmpipe (LLVM 20.1.2, 256 bits) (Vulkan, Cpu); ffmpeg: /home/user/kerf/crates/kerf-app/binaries/ffmpeg-x86_64-unknown-linux-gnu
+render            ffmpeg ms  gpu, no text ms gpu, new caption  gpu, again ms  text cost, cold
+960 px                   78               73              104             82               31
+1920 px                  71               24               74             29               50

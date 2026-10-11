@@ -1,0 +1,4 @@
+adapter: llvmpipe (LLVM 20.1.2, 256 bits) (Vulkan, Cpu); ffmpeg: /usr/bin/ffmpeg
+render            ffmpeg ms  gpu, no text ms gpu, new caption  gpu, again ms  text cost, cold
+960 px                  150              118              201            142               83
+1920 px                 143               40              136             41               96
