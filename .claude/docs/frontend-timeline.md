@@ -279,6 +279,11 @@ strip** (`COLLAPSED_TITLE_PX`, `titleLaneHeightFor`): its header is one button (
 at the playhead, and the lane still takes a right-click and a marquee; the first title expands it to the full
 lane. (It does not open on hover: a lane that grows under the pointer on its way to a track moves the clip it
 was aiming at.)
+The **toolbar** is `ToolbarToggle`s (`frontend.md`, Shared components): tools | Undo / Redo on the left, then
+zoom | snapping and Ripple | the three track heights and the overview | `+ V` / `+ A` and the delivery frame on the right,
+a rule between each group. Every one is 24 px high with a 24 px target at least, and lit the same way (amber outline
+and wash) — a tool, snapping (a magnet, `aria-pressed`), Ripple, the heights, the overview, a fade that is set, and the delivery
+frame once one is chosen. The track header's own S / L / DUCK toggles are not part of it.
 The **minimap** (`Minimap.svelte` over the pure `minimap.ts`; toolbar toggle, remembered; **hidden while
 the view already takes in 98 % of the cut** — `viewCoversCut`, so it costs its 37 px only once you are zoomed
 in, and the window fitted at open never shows it) is the whole cut on a 36 px strip: a block per clip per track row (runs too fine to tell apart

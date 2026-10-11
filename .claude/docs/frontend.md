@@ -340,7 +340,7 @@ the keyboard) is the **Preview**'s own bar, which sheds the duration and the rat
 ~380 px of its *measured* width (`transport-bar.ts`, bun-tested: an unknown or 0 width is the
 full bar, and the buttons, timecode and scrub bar never go) — see **the Preview frame and its
 scrub bar** below; the tools, Ripple, Snapping,
-Undo / Redo and the delivery-frame picker are the **Timeline**'s toolbar, which wraps to a
+Undo / Redo and the delivery-frame picker are the **Timeline**'s toolbar (every button a `ToolbarToggle`), which wraps to a
 second row rather than clip
 (its "Timeline" caption is gone — the dock tab says it); New / Open / Save / Export and
 Panels are the File and Window menus. `menus.test.ts` holds each of those paths, and
@@ -378,7 +378,7 @@ animate from the same panel**: a ◇ beside each colour number and the volume ke
 the value it has there (◆ when a key sits there, and clicking it takes the key out; the last one makes
 the number static), and once a number is keyed its slider shows the curve at the playhead and an edit
 writes a key there — `setCol` / `setGain` / `keyAtPlayhead` over `set_property_keyframes` with the
-mirror's `upsertKey`, so a drag is one edit. The Transform sliders do the same for numbers keyed on
+mirror's `upsertKey`, so a drag is one edit (every number row is a `SliderRow`, below). The Transform sliders do the same for numbers keyed on
 their own; the Animation list is still the legacy bundle's, and the per-number rows, dope sheet and easing
 popover are the next slice. The preview's Web Audio gain follows a keyed volume — `gainAutomation`
 ramps linearly through the curve's points and the fade edges, and **steps where the curve does** (a hold
@@ -687,15 +687,58 @@ background shows the hole. The status bar names the renderer of the frame on scr
 430×240 · 23 ms · llvmpipe`, or `FFmpeg · <why>`), only while the setting is on, and the
 Settings dialog's Preview section carries the toggle and the machine's status line.
 
-**Modals are modal.** `ExportDialog` / `SettingsDialog` / `UpdateDialog` /
-`FitMusicDialog` / `StemsDialog` use the
+**Shared components** (`components/editor/`; `shared-components.test.ts` keeps the dialogs, the Inspector's rows and the toolbar on them).
+**`Modal`** is the shell of every dialog: the scrim (`--scrim` at 55 %, one `z-index` of 50 — a later sibling, the
+update dialog, stacks over an earlier), the panel (`--line-width` border, `--shadow-lg`), a header with an icon, the title (the
+dialog's accessible name, `aria-labelledby`) and a named close button (an `IconBtn`, `title="Close"`, an `x` icon), `trapFocus`,
+Escape, and an optional `footer` snippet drawn under a rule; the body is the dialog's own. What differs is props:
+`width` / `height` (px, never wider than the window), `busy` (a run that cannot be walked away from: Escape, the scrim *and* the
+close button are off, and the button is gone), `dismissOnScrim` (off for a dialog holding typed input or chosen options),
+`initial` (a selector for the field that takes focus on open) and `rescue` (see below). The close rules are the pure
+`mayClose(via, {busy, dismissOnScrim})` and `scrimClick` in `modal.ts`: a click closes only if the *press* began on the scrim
+too, so selecting text in a field and letting go over the dark no longer closes the dialog. Policy per dialog: Export
+`dismissOnScrim={false}` and never `busy` (closing mid-render leaves it running); Voiceover `busy={generating}`,
+`dismissOnScrim={scrimCloses(text, generating)}`, `initial="textarea"`; Fit / Stems / Update `busy` while they run; Settings none.
+**`SliderRow`** is one numeric property: label, slider, number field, and a 24 px slot for the keyframe button, on one grid
+(`72px 1fr 60px 24px` — `NUMBER_COL`, room for `100.00s` in the 12 px mono type — the slot kept when empty so every slider in the panel is the same length; `reserve={false}` in
+a dialog; `minmax(0, 1fr)` so the row shrinks to the Inspector's 260 px minimum without clipping a value). The slider is
+`MixSlider` (`solid`: drawn like the plain range) so a drag writes **one edit on release**, Escape / pointercancel / blur
+abandon it, a run of arrow keys is one edit and a double-click puts the property back to its rest value. **Only the thumb
+takes hold, so a click elsewhere on the track no longer jumps the value** — a deliberate change from the native range it
+replaced, as in the mixer: a jump on the first click would make a double-click three edits (jump, jump, reset). The rest value (`neutral`) is a
+tick on the travel, and a property that goes both ways (`bipolar`, by default a travel across zero) fills from it instead of
+from the left. The number is a field (click, type, Enter or Tab to write, Escape to put it back; `1.1` on a 0.25 step is fine):
+what is shown is `value × scale` with `digits` decimals and a `unit` (`PERCENT`, `DEGREES`, `TIMES`, `SECONDS`), and the geometry,
+snapping, readout, entry parsing and key steps are the pure, bun-tested `slider-row.ts` (a typed entry is NFKC-normalised, so full-width digits parse, and held to `limit`, a fade
+as long as its clip on a 5 s slider, and to the digits shown: a fade is 0.01 s, a title's size 0.1 %). A value is *at rest* only when it
+is exactly there — a 0.4° rotation reads 0° and can still be reset or typed to 0. **A write goes to what the edit began on**: a typed
+entry is written when the field blurs, and the click that selects another clip blurs it after the selection has moved, so the row
+reads its `scope` (clip, title, playhead time; `Pending` in `slider-row.ts`) when a drag, a key run or a typed entry *starts* and hands it
+back with the value (`at`); the entry is parsed with the **spec it began with** too (a fade typed on a 20 s clip and committed by the click on a 3 s one is not
+clamped to 3 s), and focusing the number field starts a fresh `Pending`, so one left behind by a row that was disabled mid-focus is not inherited; the Inspector's helpers (`setTf`, `setCol`, `setCam`, `patchMask`, `setFade`, `moveTitle`, and a keyed
+number's `keyAtPlayhead`) read that clip. **A plain field** (`numRow`, a title's Text / Color / Box / Font / Bold, an effect's parameters, the
+Transitions tab's length) is no different: its `change` comes with the blur, by when the selection has moved *and the field has been
+re-rendered with the new selection's value*, so reading either writes the other clip's number onto this one. `FieldEdits`
+(`field-edit.ts`) notes the scope on `focus` and the typed text on `input` and `compositionend`, and the commit takes both from there (`noteFocus` /
+`noteTyped` / `endEdit` in the Inspector); a select or a checkbox changes at once and only needs the scope. A bun test holds every
+text and number input of the Inspector to this. Rest values are the model's
+`DEFAULT_TRANSFORM` / `DEFAULT_COLOR` / `DEFAULT_REFRAME` / `DEFAULT_MASK`. The Inspector's other rows (read-only values, plain number
+fields) share the label column and run to the panel's edge over the keyframe slot, which a source range needs at the 250 px minimum. The ◇ is a 24 px `IconBtn` with a `diamond` icon (filled while a key sits at the playhead).
+A plain `<input type=range>` (Settings, the timeline zoom) gets an 18 px hit box and `min-width:0` from `layout.css`.
+**`ToolbarToggle`** is a button of the timeline toolbar: 24 px high and at least 24 px wide, one radius, and one "on" for every kind
+of button — the amber outline and wash (`kerf-400` border, `kerf-300` on `selection-fill`, a pair the contrast guard holds to 4.5:1)
+whether it is a tool, a mode (snapping is a pressed magnet, not a word that changes width), a view or a menu with something chosen.
+`pressed` is a toggle (announced as one), `on` lights without announcing, neither is an action; `bare` is no outline while idle (tools,
+zoom), `square` a picture-only button. Its states are `.k-tt` in `controls.css`, which the veil leaves alone.
+
+**Modals are modal.** Every dialog is a `Modal` (above), which uses the
 `trapFocus` action (`src/lib/modal.ts`: takes focus, wraps Tab, restores focus on
-close; `VoiceoverDialog` too, with `initial: 'textarea'`), and `+page.svelte` makes the app behind them `inert` and returns early from its global key handler while
+close; Voiceover starts on its textarea via `initial`), and `+page.svelte` makes the app behind them `inert` and returns early from its global key handler while
 any is open — Space / Delete / J-K-L / ⌘Z would
 otherwise edit the live project under a dialog; a file drop is ignored then too.
 Every shortcut — bare keys and ⌘ chords alike — stands down inside any text input /
 textarea / select / contenteditable. **Focus survives a run and a menu.** A dialog whose footer
-swaps for a run (Export, Voiceover, Stems, Fit) passes `rescue: true` and marks its footer actions
+swaps for a run (Export, Voiceover, Stems, Fit, Update) passes `rescue` and marks its footer actions
 `data-rescue`: when the button that had focus is replaced or disabled a `MutationObserver` moves it to
 the live action (Generate → Cancel, and back to Generate when the run ends) or to the dialog root,
 not `<body>` (`focusLost`, pure). On close focus goes back to the control that had it; if that is

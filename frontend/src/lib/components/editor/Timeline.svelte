@@ -6,6 +6,7 @@
 	import ClipFilmstrip from './ClipFilmstrip.svelte';
 	import ClipWaveform from './ClipWaveform.svelte';
 	import HeightGlyph from './HeightGlyph.svelte';
+	import ToolbarToggle from './ToolbarToggle.svelte';
 	import Minimap from './Minimap.svelte';
 	import { toast } from '$lib/notifications.svelte';
 	import { ui, type Tool } from '$lib/editor-ui.svelte';
@@ -1949,20 +1950,7 @@
 
 
 {#snippet toolBtn(title: string, label: string, icon: string, on: boolean | null, click: () => void, off = false)}
-	<button
-		{title}
-		aria-label={label}
-		aria-pressed={on === null ? undefined : on}
-		disabled={off}
-		onclick={click}
-		style="display:inline-flex;align-items:center;justify-content:center;width:26px;height:24px;border-radius:var(--radius-sm);cursor:{off
-			? 'default'
-			: 'pointer'};border:var(--line-width) solid {on ? 'var(--border-strong)' : 'transparent'};background:{on
-			? 'var(--surface-active)'
-			: 'transparent'};color:{on ? 'var(--kerf-400)' : 'var(--text-secondary)'};opacity:{off ? 0.4 : 1}"
-	>
-		<Icon n={icon} s={14} />
-	</button>
+	<ToolbarToggle {title} {label} {icon} bare pressed={on} disabled={off} onclick={click} />
 {/snippet}
 
 <div
@@ -2040,34 +2028,30 @@
 					style="font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted)"
 					>Fade</span
 				>
-				<button
+				<ToolbarToggle
 					title="Toggle a {FADE_DEFAULT}s fade-in on the selected clip"
-					onclick={toggleFadeIn}
-					style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:{sc.fade_in >
-					0
-						? 'var(--surface-hover)'
-						: 'transparent'};color:{sc.fade_in > 0 ? 'var(--kerf-300)' : 'var(--text-muted)'}">in</button
+					label="Fade in"
+					pressed={sc.fade_in > 0}
+					onclick={toggleFadeIn}>in</ToolbarToggle
 				>
-				<button
+				<ToolbarToggle
 					title="Toggle a {FADE_DEFAULT}s fade-out on the selected clip"
-					onclick={toggleFadeOut}
-					style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:{sc.fade_out >
-					0
-						? 'var(--surface-hover)'
-						: 'transparent'};color:{sc.fade_out > 0 ? 'var(--kerf-300)' : 'var(--text-muted)'}">out</button
+					label="Fade out"
+					pressed={sc.fade_out > 0}
+					onclick={toggleFadeOut}>out</ToolbarToggle
 				>
 			</span>
 		{/if}
 		<div style="flex:1;min-width:0"></div>
 		<div style="display:inline-flex;align-items:center;flex-wrap:wrap;gap:8px;row-gap:2px">
-			<span style="display:inline-flex;align-items:center;gap:6px">
-				<button
+			<span style="display:inline-flex;align-items:center;gap:2px">
+				<ToolbarToggle
 					title={settings.withShortcut('Zoom out', 'view.zoomOut')}
-					aria-label="Zoom out"
+					label="Zoom out"
+					icon="zoom-out"
+					bare
 					onclick={() => ui.zoomBy(-1)}
-					style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center"
-					><Icon n="zoom-out" s={14} /></button
-				>
+				/>
 				<input
 					type="range"
 					min="0"
@@ -2077,105 +2061,85 @@
 					oninput={(e) => (ui.zoom = clampZoom(sliderToZoom(+e.currentTarget.value), editor.duration))}
 					title="Zoom — {zoomLabel(ui.zoom)} (⌘/Ctrl + wheel zooms at the cursor)"
 					aria-label="Timeline zoom"
-					style="width:90px;height:24px;"
+					style="width:90px;height:24px;margin:0 4px"
 				/>
-				<button
+				<ToolbarToggle
 					title={settings.withShortcut('Zoom in', 'view.zoomIn')}
-					aria-label="Zoom in"
+					label="Zoom in"
+					icon="zoom-in"
+					bare
 					onclick={() => ui.zoomBy(1)}
-					style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center"
-					><Icon n="zoom-in" s={14} /></button
-				>
-				<button
+				/>
+				<ToolbarToggle
 					title={settings.withShortcut('Zoom to fit the whole cut', 'view.zoomFit')}
-					aria-label="Zoom to fit"
+					label="Zoom to fit"
+					icon="fold-horizontal"
+					bare
 					disabled={!hasClips}
 					onclick={() => ui.zoomToFit()}
-					style="background:none;border:none;cursor:{hasClips ? 'pointer' : 'default'};color:var(--text-muted);opacity:{hasClips ? 1 : 0.4};display:grid;place-items:center"
-					><Icon n="fold-horizontal" s={14} /></button
+				/>
+			</span>
+			<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
+			<span style="display:inline-flex;align-items:center;gap:6px">
+				<ToolbarToggle
+					title={settings.withShortcut(ui.snap ? 'Snapping on — click to disable' : 'Snapping off — click to enable', 'tool.snap')}
+					label="Snapping"
+					icon="magnet"
+					pressed={ui.snap}
+					onclick={() => (ui.snap = !ui.snap)}
+				/>
+				<!-- Ripple mode is the project's, not this panel's: it changes what a trim, a
+				     delete and a speed change do everywhere (and an agent can flip it). So it is
+				     lit while on, with a second cue in the ruler corner. -->
+				<ToolbarToggle
+					title={editor.rippleMode
+						? `${settings.withShortcut('Ripple on', 'tool.rippleMode')} — a trim, delete or speed change pulls the later clips on that track along, keeping their gaps. Each track ripples on its own, but a clip it moves takes its linked partners along (a picture's detached sound stays with it).`
+						: `${settings.withShortcut('Ripple off', 'tool.rippleMode')} — edits leave a gap. Turn on to have a trim, delete or speed change pull the later clips on that track along. Each track ripples on its own; linked clips follow their partners.`}
+					label="Ripple"
+					icon="between-horizontal-start"
+					iconSize={12}
+					pressed={editor.rippleMode}
+					onclick={() => void editor.setRippleMode(!editor.rippleMode).catch(err)}>Ripple</ToolbarToggle
 				>
 			</span>
-			<button
-				title={settings.withShortcut(ui.snap ? 'Snapping on — click to disable' : 'Snapping off — click to enable', 'tool.snap')}
-				aria-pressed={ui.snap}
-				onclick={() => (ui.snap = !ui.snap)}
-				style="font-family:var(--font-mono);font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:{ui.snap
-					? 'var(--surface-hover)'
-					: 'transparent'};color:{ui.snap ? 'var(--kerf-300)' : 'var(--text-muted)'}"
-				>{ui.snap ? 'snap on' : 'snap off'}</button
-			>
-			<!-- Ripple mode is the project's, not this panel's: it changes what a trim, a
-			     delete and a speed change do everywhere (and an agent can flip it). So it
-			     is lit while on, with a second cue in the ruler corner. -->
-			<button
-				title={editor.rippleMode
-					? `${settings.withShortcut('Ripple on', 'tool.rippleMode')} — a trim, delete or speed change pulls the later clips on that track along, keeping their gaps. Each track ripples on its own, but a clip it moves takes its linked partners along (a picture's detached sound stays with it).`
-					: `${settings.withShortcut('Ripple off', 'tool.rippleMode')} — edits leave a gap. Turn on to have a trim, delete or speed change pull the later clips on that track along. Each track ripples on its own; linked clips follow their partners.`}
-				aria-pressed={editor.rippleMode}
-				onclick={() => void editor.setRippleMode(!editor.rippleMode).catch(err)}
-				style="display:inline-flex;align-items:center;gap:5px;font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid {editor.rippleMode
-					? 'var(--kerf-400)'
-					: 'var(--border-strong)'};background:{editor.rippleMode
-					? 'var(--selection-fill)'
-					: 'transparent'};color:{editor.rippleMode ? 'var(--kerf-300)' : 'var(--text-muted)'}"
-				><Icon n="between-horizontal-start" s={12} />Ripple</button
-			>
+			<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
 			<span style="display:inline-flex;align-items:center;gap:6px">
 				<!-- Track height, every track at once (each track's own name button sets just
 				     that one). Lit when every track is at that height. -->
 				<div role="group" aria-label="Track height, all tracks" style="display:inline-flex;align-items:center;gap:2px">
 					{#each HEIGHT_PRESETS as p (p)}
-						<button
+						<ToolbarToggle
 							title="All tracks {PRESET_LABEL[p].toLowerCase()} — {PRESET_PX[p]} px"
-							aria-label="All tracks {PRESET_LABEL[p].toLowerCase()}"
-							aria-pressed={allHeight === p}
-							onclick={() => ui.setAllHeights(p)}
-							style="display:grid;place-items:center;min-width:24px;min-height:24px;padding:0;border-radius:4px;cursor:pointer;border:var(--line-width) solid {allHeight ===
-							p
-								? 'var(--kerf-400)'
-								: 'var(--border-strong)'};background:{allHeight === p ? 'var(--selection-fill)' : 'transparent'};color:{allHeight ===
-							p
-								? 'var(--kerf-300)'
-								: 'var(--text-muted)'}"><HeightGlyph preset={p} /></button
+							label="All tracks {PRESET_LABEL[p].toLowerCase()}"
+							pressed={allHeight === p}
+							square
+							onclick={() => ui.setAllHeights(p)}><HeightGlyph preset={p} /></ToolbarToggle
 						>
 					{/each}
 				</div>
-				<button
+				<ToolbarToggle
 					title={ui.minimap ? 'Hide the overview strip' : 'Show the overview strip of the whole cut'}
-					aria-label="Toggle overview"
-					aria-pressed={ui.minimap}
+					label="Toggle overview"
+					icon="chart-no-axes-gantt"
+					iconSize={13}
+					pressed={ui.minimap}
 					onclick={() => ui.toggleMinimap()}
-					style="display:grid;place-items:center;min-width:24px;min-height:24px;padding:0;border-radius:4px;cursor:pointer;border:var(--line-width) solid {ui.minimap
-						? 'var(--kerf-400)'
-						: 'var(--border-strong)'};background:{ui.minimap ? 'var(--selection-fill)' : 'transparent'};color:{ui.minimap
-						? 'var(--kerf-300)'
-						: 'var(--text-muted)'}"><Icon n="chart-no-axes-gantt" s={13} /></button
-				>
+				/>
 			</span>
+			<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
 			<span style="display:inline-flex;align-items:center;gap:6px">
-				<button
-					title="Add a video track"
-					onclick={() => onAddTrack('video')}
-					style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:transparent;color:var(--text-muted)"
-					>+ V</button
-				>
-				<button
-					title="Add an audio track"
-					onclick={() => onAddTrack('audio')}
-					style="font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid var(--border-strong);background:transparent;color:var(--text-muted)"
-					>+ A</button
-				>
+				<ToolbarToggle title="Add a video track" onclick={() => onAddTrack('video')}>+ V</ToolbarToggle>
+				<ToolbarToggle title="Add an audio track" onclick={() => onAddTrack('audio')}>+ A</ToolbarToggle>
 				<!-- The frame the cut is made for: the preview is this shape, and so is the export. -->
-				<button
+				<ToolbarToggle
 					title={delivery.format
 						? `Delivering ${delivery.format.width}\u00d7${delivery.format.height} — ${fitLabel(delivery.format.fit)}. Click to change.`
 						: 'The frame follows the footage. Click to cut for a delivery shape.'}
+					icon="crop"
+					iconSize={12}
+					on={!!delivery.format}
 					aria-haspopup="menu"
-					onclick={pickDelivery}
-					style="display:inline-flex;align-items:center;gap:5px;font-size:10px;padding:2px 7px;border-radius:4px;cursor:pointer;border:var(--line-width) solid {delivery.format
-						? 'var(--kerf-400)'
-						: 'var(--border-strong)'};background:transparent;color:{delivery.format ? 'var(--kerf-300)' : 'var(--text-muted)'}"
-					><Icon n="crop" s={12} />{delivery.label}</button
+					onclick={pickDelivery}>{delivery.label}</ToolbarToggle
 				>
 			</span>
 		</div>
