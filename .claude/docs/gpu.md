@@ -46,7 +46,22 @@ and bilinear otherwise) with a `Surround`: a matte inside the frame where the pi
 smaller, a backdrop beyond it. An acquire that says `Outdated` / `Lost` is reconfigured once
 and retried; `Timeout` / `Occluded` are a `GpuError::Surface` for the caller to skip.
 `present.rs`' tests (`#[ignore]`d, an adapter) hold the blit pixel-exact against an offscreen
-target in RGBA, BGRA and sRGB formats.
+target in RGBA, BGRA and sRGB formats. **`Presenter::skip_vsync(on)`** switches the surface between
+`AutoVsync` and `AutoNoVsync` (wgpu's own fallback chain: `Immediate`, `Mailbox`, `Fifo`), reconfiguring
+only on a change and not at all where the surface has neither `Immediate` nor `Mailbox`
+(`present_mode_for`, pure, tested over the mode lists); the contents of a reconfigured surface are
+not guaranteed, so the caller changes the mode just before the frame it presents. The app asks for
+it while frames of a drag follow each other (`app.md`).
+
+**Which adapter.** `GpuOptions::refuse_cpu` makes a device request that wgpu answers with a CPU
+rasteriser (lavapipe, WARP: wgpu ranks `Cpu` last but still returns it when it is the only adapter) a
+`GpuError::NoAdapter` that names the adapter and `KERF_GPU_ADAPTER`; `force_fallback_adapter` asks for it by
+name and is never refused. `GpuOptions::for_preview(KERF_GPU_ADAPTER)` is the app's choice: unset or
+`hardware` takes the machine's GPU and **refuses a CPU rasteriser**, `software` forces the CPU adapter, `auto` /
+`any` takes whatever wgpu prefers. `Default` and `for_tests()` (lavapipe, unless `KERF_GPU_ADAPTER=hardware|auto`)
+are unchanged, so the parity harness and CI still run on it. Measured (the review, lavapipe, 960x540): a
+software adapter draws one layer in about the time of an FFmpeg still on three or four cores, so it is not a
+win for a live preview; nothing here has been run on WARP.
 
 **A1's frame source, the pure pieces** (A1b-1: design `.claude/plans/a1-design.md` §1; none
 of these spawns a process, `FrameSource` itself is A1b-2). All unit-tested, all pure:
@@ -224,7 +239,9 @@ the process's 6 it is a `Skip`), and leaves a file the runs are not proved equal
 decode for a frame nobody asked for). A still image is decoded once and cached. The run reads to the frame and
 parks (`want` = the target), is idle to the router from then on and ages out like any run. Counted in
 `SourceStats::prefetched`. `render_plan_with` / `_texture_with` refuse it (`Unsupported`): it returns no
-frames to draw. `kerf-app` drives it past the playhead (`app.md`, "GPU preview").
+frames to draw. `kerf-app` drives it around the playhead (`app.md`, "GPU preview"): the first frame of the
+clips that start within 2 s ahead and the last frame of the ones that ended within 2 s behind, since a drag goes
+either way.
 `tests/prefetch.rs` (`#[ignore]`d, real ffmpeg): the run is waiting and the request that follows starts
 nothing, a covered or heading-for frame starts nothing, the file's cap is respected, an unproven container
 is left alone, dropping the source kills the prefetched run; with `KERF_BENCH=1` the first frame past a cut
@@ -446,8 +463,8 @@ is rendered at the quarter-pixel phase of a fractional position. It draws white 
 exactly `m`; a gray or YUV canvas writes 235 on 6.1), once for the glyphs and once, fontcolor `@0`, for the box, and reads the red
 planes. A mask is trimmed and cached in `TextAtlas` (key: graph text, font file length + mtime, `ffmpeg` path; 256 states /
 48 MiB, LRU; a state wanted by several frames runs once; a failure is not remembered; textures are made by the first frame that
-draws one). `prepare_text` blocks on that process for a first-seen state, so a caller's render lock (the app's `RenderState`) is
-held that long; no project lock is. The pass is `drawutils.c`'s integer arithmetic (the same in 6.1.1 and 9.0.2), in u32:
+draws one). `prepare_text` blocks on that process for a first-seen state, so the caller must hold no lock the UI needs while it renders
+(the app's frame holds neither the project lock nor its render lock then, `app.md`). The pass is `drawutils.c`'s integer arithmetic (the same in 6.1.1 and 9.0.2), in u32:
 `((K - a) * d + a * s) >> 24` (`K = 0x1010101`), `a` = coverage x `(0x10307 * alpha + 3) >> 8` for luma and the 2x2 coverage sum
 `>> 2` for 4:2:0 chroma (a block sticking out of the mask counts only what is in it), `0x10203 * alpha + 2` for the box (half per
 missing row or column at an odd edge); `s` is `ff_draw_color` in the composite's matrix (`PlanCanvas.matrix`: 9.0's `drawtext` reads it
@@ -477,6 +494,27 @@ error on 6.1.1 (a segfault) and 9.0.2 at every size, so there is no colour glyph
 the atlas key holds the sampled position at full precision, so a **keyframed slide-in rasterises per frame** (quantising it risks
 exactness); a Windows profile path with non-ASCII characters reaches `fontfile` through FreeType's narrow open (not run on Windows).
 Over a full-range picture on 9.0 (text drawn in full range, converted last) the picture is within 2 levels of the control: drawn.
+
+**The runtime self-test** (`selftest.rs`, `parity_self_test(&Arc<Gpu>)`). Parity is proven in CI on two FFmpeg
+builds and one software adapter; a user has a third FFmpeg and a real GPU, so the first use of the GPU path
+(the app: `app.md`) draws three small frames on the compositor and through that machine's own FFmpeg and holds
+them to the harness's **strict limits** (`PSNR_FLAT_MIN` 40 dB, `MAX_FLAT` 8, `PSNR_ALL_MIN` 40, `FLAT_SHARE_MIN`
+0.5, the same edge band: constants and `compare` are copies of `tests/parity.rs`', and
+`the_runtime_self_test_judges_by_the_limits_and_the_comparison_of_this_harness` holds them equal). The frames:
+`fit` (one untagged layer enlarged 4:3: swscale's tables, the final conversion), `pip` (a gradient with a shrunk,
+cropped, 80%-opaque, graded picture-in-picture: the scaler down, `eq`, the opacity round trip, `overlay`) and
+`bt709` (a BT.709-tagged stack: the composite colour policy the plan was given, which is how 6 and 9 differ).
+No rotation: its float sampling can differ by a level between GPUs for reasons that are not drift. The clips are
+made by that FFmpeg itself (FFV1 in Matroska, three of them in parallel, 480x270, 0.4 s, probed as an import
+probes), the references are `export_still`, the GPU frames come through a private `FrameSource` (`Hint::Scrub`,
+the preview's own), and everything runs the way interactive reads do: thread-capped children (`limit_frame_args`),
+no machine-budget slot, nothing under a project lock; it takes 1.9 to 2.7 s on FFmpeg 6.1.1 and 1.0 to 1.2 s on 9.0.2
+on lavapipe (release build, a loaded 4-core box; `docs/review-2026-10-10/after/gpu-5`). The answer is `Ok(report)`, **`SelfTestError::Mismatch`** (the GPU draws something else than this
+FFmpeg) or **`Inconclusive`** (an FFmpeg that would not make the clips, a colour policy that could not be
+measured, the plan refusing its own frame, the GPU failing on it, the 90 s deadline). Measured on lavapipe, both
+FFmpegs: fit 48.8 dB / max 4, pip 46.4 dB / max 6, bt709 49.4 / max 5 on 6.1.1 and 48.6 / 5 on 9.0.2; the same GPU
+drawn under the *other* colour policy fails the bt709 frame at 24 dB / 40 to 42 levels (that is the 6-versus-9
+drift the test is for; `a_gpu_drawn_under_the_wrong_colour_policy_fails_it`).
 
 **`tests/parity.rs`** (`#[ignore]`d; CI job `parity`, a **matrix of the distro FFmpeg and
 the pinned one** — the two compose colour differently, so a green run on one proves

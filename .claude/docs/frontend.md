@@ -833,7 +833,11 @@ else the original's; `capToSource`), since the default proxy is 1280 px wide and
 same picture upscaled at several times the decode cost on every scrub frame — not under a delivery frame, whose canvas is
 not the source's shape (`data-request-width` on the frame says what it asked). The pump (`frame-pump.svelte.ts`) takes it as `width()`, reads it in `run()` — a different
 step is a new frame — and asks nothing until the box has been measured, so a first frame is not decoded at a guess
-and again at the real size. (Playback's streamed frames ask for the same width, read when the stream starts.) The picture is clipped to the
+and again at the real size. **On the GPU route the pump is not single-flight** (the JPEG route is: one fetch, the latest wanted frame
+waiting): the backend's `get_preview_frame` is latest-wins (`app.md`), so a request goes out for every wanted time, an
+answer `superseded` is ignored, and an answer older than the one on show (`asked` / `shown` counters) is dropped, which keeps a
+slow JPEG from landing over a newer picture across a route change. `gpu-preview-checked` (the backend's first-use self-test has a
+verdict) refreshes the preview like `proxy-ready`. (Playback's streamed frames ask for the same width, read when the stream starts.) The picture is clipped to the
 frame's radius and the frame's border is `border-strong`, since a black matte is 1.05:1 on the pane. **The HUD** over the
 picture is scrim chips with `text-on-video` (the name, ellipsised at 62 % of the width so a long file name never reaches the
 format, then `1920×1080 · 30 fps` in the transport's own rate format, and the proxy / analysis status chips with a dot) — bare

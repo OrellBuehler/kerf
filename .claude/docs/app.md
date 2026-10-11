@@ -70,7 +70,7 @@ returns the refreshed `Timeline`; every edit that carries linked clips takes an 
 JPEG added as a base64 `data:` URL (`FilmstripPayload` — the CSP admits `data:` images
 and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**, since
 `skim_asset` is how an agent looks at footage,
-`get_preview_frame` / `set_preview_bounds` / `gpu_preview_status` (the GPU preview, below; GUI-only),
+`get_preview_frame` / `set_preview_bounds` / `gpu_preview_status` / `gpu_preview_diagnostics` (the GPU preview, below; GUI-only),
 `get_timeline_frame` (the composited still at a time; see Scrubbed frames below),
 detached panels (`popout_expect` / `popout_cancel` / `popout_focus` / `popout_move` / `close_popout`, see Detached panels below; GUI-only, no MCP tool),
 `start_playback { playback_id, start, fps?, max_width?, on_frame }` / `stop_playback` — streamed
@@ -204,11 +204,11 @@ stays the one-shot still on purpose: an agent asks for exactly that time and the
 (`Settings.gpu_preview`, default off, persisted beside `safe_areas`) draws the Preview
 panel's frame with `kerf-gpu`'s compositor in a native surface. Off, none of it runs and the
 webview sends no extra command: the JPEG path is what it was. On, `get_preview_frame
-{ time_secs, max_width, overlays }` takes the plan's inputs under the project lock
-(`plan_inputs`: the working timeline, the assets as imported and the proxy-swapped ones the
-FFmpeg graph reads), **releases it**, plans the frame (`Planner` over `ProxyMedia`, the
+{ time_secs, max_width, overlays }` plans the frame from a **snapshot of the plan's inputs**
+(`gpu_preview/snapshot.rs`: the working timeline, the assets as imported, the proxy-swapped ones the
+FFmpeg graph reads and every asset's proxy input, in an `Arc`), plans it (`Planner` over `ProxyMedia`, the
 measured colour policy, at the start of the output frame whose slot holds the time, `plan_at_grid`, as the JPEG route's
-`ScrubFrames` counts it, so the two show one frame between two frames) and answers `{renderer: 'gpu' | 'ffmpeg', frame?, reasons,
+`ScrubFrames` counts it, so the two show one frame between two frames) and answers `{renderer: 'gpu' | 'ffmpeg' | 'superseded', frame?, reasons,
 timings?}`: the GPU when `RenderPlan::reasons(caps, size)` is empty and everything works,
 else FFmpeg's JPEG **of that frame, in the same call**, with the plan's reasons (a refusal
 is not an error). Titles and captions are part of what the compositor draws (`caps.text`: FFmpeg rasterises each distinct
@@ -218,10 +218,12 @@ remembered with a backoff (5 s doubling to 5 min, `Backoff`), a `DeviceLost` or 
 that says the device or surface is gone (`react`) drops the backend and rebuilds it on the
 next use — the first loss at once, as `kerf-gpu` documents: the owner builds a new `Gpu` —
 and a refused plan, a busy decode or an occluded window is only that frame's fallback. **A frame that was
-presented asks the frame source for the clips past the next cut** (`prefetch_ahead`): the clips of video
-tracks that render and start within 2 s of the playhead (`upcoming_clip_starts`, at most 3, each moment
-once) are planned at their start and their layers handed to `FrameSource::frames(.., Hint::Prefetch)` on a
-thread of its own (one at a time, the same clips not again within a second, after the render lock is
+presented asks the frame source for the cuts around the playhead** (`prefetch_ahead`, `cut_moments`): the clips of video
+tracks that render and **start** within 2 s ahead of it (`upcoming_clip_starts`, planned at their start) and the ones that
+**ended** within 2 s behind it (`passed_clip_ends`, planned at their last frame, half a frame before the end), nearest first,
+at most 3 in all, each moment once, so a drag in either direction finds a run waiting: their layers are
+handed to `FrameSource::frames(.., Hint::Prefetch)` on a
+thread of its own (one at a time, the same moments not again within a second, after the render lock is
 released; a moment the GPU would refuse at this size is skipped, and a panic clears the in-flight flag), so a run is waiting and the file's two probes are done when the playhead crosses the cut
 instead of the first frame there costing a process start. It never takes a run another layer is reading
 and a failure is nothing: the frame is decoded when asked. **Nothing
@@ -271,6 +273,42 @@ hidden with `backgroundColor`, the reveal (`reveal.ts`, the Rust failsafe) is ex
 before, and the one transparency there is (technique `window`, below) is applied at runtime
 after the user turned the setting on and a frame asked for it, and undone with the backend.
 
+**Scrubbing and hardening (WP-5).** *Snapshot*: a frame's inputs used to be the project lock, the working timeline
+parsed from its JSON, every asset read and the disk asked for each one's proxy — per frame of a drag. They are an
+`Arc<PlanInputs>` held between frames (`PlanSnapshots`) and fresh while `kerf_core::plan_epoch()` is the number it was
+taken at (`core-render-plan.md`: every project write, a project opened, a proxy landing or deleted, a proxy-size or preview-source
+change) and for under 2 s; a stale one is taken again from `lock_user` (`Taken::from` reads the epoch first, under the
+lock; `Taken::resolve` stats the proxies after it is gone). It is `working_timeline()` as the GUI sees it (the user's view:
+a staged agent edit is in it once accepted, which writes the timeline). The Proxy-only refusal is answered from it
+(`PlanInputs::proxy_wait`, the status read from the proxy queue, not the project). Measured (release, `docs/review-2026-10-10/after/gpu-5`):
+the inputs of a frame were 45 / 215 / 735 µs for 8 / 120 / 480 clips and are 0.1 to 0.3 µs from the snapshot (a stale one is rebuilt in the
+same time the old path took: 40 / 200 / 690 µs). *Latest wins*: `get_preview_frame` posts
+a request into a `Mailbox`; the one waiting is replaced and answers `renderer: "superseded"` at once, the frame in hand
+is finished and the newest waiting request drawn next, by a worker on the blocking pool that exists while there is work
+(a worker that dies tells what it never answered, an error and not a skipped frame). The page's GPU route is therefore not
+single-flight (`frame-pump.svelte.ts`: a request per wanted time, an answer older than the one on show is dropped, a
+`superseded` one ignored); the JPEG route is as it was. *The render lock is not held across the decode*: a frame takes
+what it draws with (`Drawing`: the compositor, frame source, device and host as `Arc`s) under the lock, lets go, decodes and
+composites, and takes the lock again to show the result if the backend is still the one that drew it (the frame source is
+its identity; a restarted one is a fallback frame, and a failure of the old one does not take the new one down), so
+turning the setting off, a lost device or a build no longer waits up to a decode's timeout for a frame. *Present mode*:
+`Pace` (`pace.rs`) calls requests under 120 ms apart a drag and two gaps of 600 ms or more in a row the end of one;
+frames of a drag are presented with `Presenter::skip_vsync(true)` (`AutoNoVsync`) where the surface has
+`Immediate` or `Mailbox`, the settled ones with vsync, the mode changed just before the frame that is presented into the
+reconfigured surface. *Self-test* (`check.rs`): the first frame the GPU would draw starts `kerf_gpu::parity_self_test`
+(`gpu.md`) on a thread of its own and is FFmpeg's, as is every frame until the verdict (`gpu-preview-checked` is
+emitted then, and the page asks for the frame again). Passed opens the GPU path; a **mismatch** closes it for the session
+(turning the setting off and on does not argue) and a check that **could not be made** closes it until the setting is turned
+on again; either way the reason is the Settings status line and every frame's reason. A verdict belongs to an adapter and
+an FFmpeg (`AdapterKey`): a backend rebuilt on the same device keeps it, another adapter is checked again. *Counters*
+(`diagnostics.rs`): every frame that went through FFmpeg counts its reasons by kind (`Unsupported::kind()` for the plan's;
+`self_test_pending`, `overlays`, `hidden`, `backend`, `decode_busy`, … for the rest) with the first message as an example,
+logged once per new kind (`info`) and as a one-line session summary at teardown; `gpu_preview_diagnostics` answers
+`{tally: {gpu_frames, ffmpeg_frames, superseded, refusals[]}, snapshots: {served, taken}, requests, self_test, adapter,
+software}`. Local and in memory; no MCP tool (nothing here is an edit). `gpu_preview/drive_tests.rs` drives the whole frame path
+without a window (a real device, compositor and frame source over real clips, a screen that records; `#[ignore]`d), and
+`bench_tests.rs` times it (`KERF_BENCH=1`).
+
 **Two surface techniques, picked per platform** (`resolve_technique`;
 `KERF_GPU_SURFACE=off|window|child` overrides). *`window`*: wgpu draws to the **main
 window's own surface** and the webview over it is transparent
@@ -298,10 +336,12 @@ Settings dialog opened *under* the picture before this existed); the in-frame HU
 no technique by default** (nothing here has run on a Mac, and the status line says so);
 `KERF_GPU_SURFACE=window` forces the attempt for a developer, and may cover the window (relaunch
 without it). Tauri's `macos-private-api` is *not* what is missing: see *macOS presenter* below.
-`KERF_GPU_ADAPTER=software` takes the CPU adapter (lavapipe, WARP) instead of the machine's GPU.
+`KERF_GPU_ADAPTER` picks the adapter (`GpuOptions::for_preview`): unset or `hardware` is the machine's GPU
+and **a CPU rasteriser (lavapipe, WARP) is refused** (the status says the only adapter is one, and why it is not used), `software`
+forces the CPU adapter, `auto` / `any` takes whatever wgpu prefers, CPU included; `KERF_GPU_SELFTEST=off` skips the
+first-use check below.
 Playback (forward 1×) is still the FFmpeg stream: `streaming` is a JPEG route, the surface
-is hidden while it runs and shown again on the settled frame (A4; scrubbing at GPU speed and
-live drags are A3's). `x11.rs`' ignored tests present to a real child window and read the
+is hidden while it runs and shown again on the settled frame (A4). `x11.rs`' ignored tests present to a real child window and read the
 pixels back **from the X server**, destroy the device and draw again on a new one, and reach a
 server that listens on the **abstract socket only** (an `Xvfb` where `/tmp/.X11-unix` is not
 writable, WSL's case) at once: `RustConnection::connect` tries the filesystem socket and then TCP
