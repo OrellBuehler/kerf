@@ -60,6 +60,7 @@
 		canUndo: editor.canUndo,
 		canRedo: editor.canRedo,
 		hasClips: editor.timeline.tracks.some((t) => t.clips.length > 0),
+		exporting: editor.exportRun !== null,
 		hasSelection: editor.selectedClipIds.length > 0 || editor.selectedOverlayId !== null,
 		rippleMode: editor.rippleMode,
 		snap: ui.snap,

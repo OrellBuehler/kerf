@@ -222,6 +222,16 @@ input[type='range']:focus-visible::-moz-range-thumb {
 	box-shadow: var(--focus-ring);
 }
 
+/* A number field's spin buttons are the browser's grey block, which appeared on hover and shouted over the
+   dark field. Dimmed, and lit only when the field is. */
+input[type='number']::-webkit-inner-spin-button {
+	opacity: 0;
+}
+input[type='number']:hover::-webkit-inner-spin-button,
+input[type='number']:focus::-webkit-inner-spin-button {
+	opacity: 0.5;
+}
+
 /* The GPU preview under a transparent webview: every element that paints behind the Preview frame
    is tagged by `Preview.svelte` while the native surface is on show, and must not paint, so the
    surface behind the page is what the frame shows. The pane's surround is repainted by a layer

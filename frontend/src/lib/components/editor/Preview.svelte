@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
+	import PreviewEmpty from './PreviewEmpty.svelte';
 	import { formatTimecode } from '$lib/timecode';
 	import ScrubBar from './ScrubBar.svelte';
 	import TrimMonitor from './TrimMonitor.svelte';
@@ -834,9 +835,7 @@
 			<div bind:this={surroundEl} aria-hidden="true" style="position:absolute;inset:0;background:var(--surface-void);pointer-events:none"></div>
 		{/if}
 		{#if empty}
-			<div style="display:flex;flex-direction:column;align-items:center;gap:12px;color:var(--text-muted)">
-				<Icon n="clapperboard" s={30} /><span style="font-size:13px">No media loaded</span>
-			</div>
+			<PreviewEmpty />
 		{:else}
 			<div
 				bind:this={frameEl}

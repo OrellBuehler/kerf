@@ -167,7 +167,7 @@ export function audioExtraction(a: Pick<Asset, 'id' | 'streams'>, timeline: Pick
 	return {
 		mode: 'append',
 		clips: 0,
-		label: audio ? `Add audio to ${where}${already ? ' again' : ''}` : 'Add audio on a new track A1',
+		label: audio ? `Add audio to ${where}${already ? ' (a second copy)' : ''}` : 'Add audio on a new track A1',
 		detail: already
 			? `This file’s sound is already on the timeline; this adds another copy of all of it to ${where}.`
 			: audio

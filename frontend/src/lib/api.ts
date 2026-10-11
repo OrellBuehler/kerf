@@ -466,10 +466,28 @@ export async function listFonts(): Promise<string[]> {
 	return invoke<string[]>('list_fonts');
 }
 
-/** GPU video encoders the backend verified usable (empty in the browser). */
+let hwEncodersKnown: string[] | null = null;
+
+/** `?hw=h264_amf,hevc_amf` makes the browser harness answer as a machine with those encoders. */
+function harnessHwEncoders(): string[] {
+	try {
+		return (new URLSearchParams(location.search).get('hw') ?? '').split(',').filter(Boolean);
+	} catch {
+		return [];
+	}
+}
+
+/** GPU video encoders the backend verified usable (none in the browser harness, unless `?hw=`
+ *  names some). The backend probes once per process, so the answer is kept: a reopened export
+ *  dialog starts with it. */
 export async function hwEncoders(): Promise<string[]> {
-	if (!inTauri()) return [];
-	return invoke<string[]>('hw_encoders');
+	hwEncodersKnown = inTauri() ? await invoke<string[]>('hw_encoders') : harnessHwEncoders();
+	return hwEncodersKnown;
+}
+
+/** What [`hwEncoders`] last answered, `[]` before it has. */
+export function knownHwEncoders(): string[] {
+	return hwEncodersKnown ?? [];
 }
 
 export async function getTimeline(): Promise<Timeline> {
@@ -584,6 +602,18 @@ export async function onWindowCloseRequested(
 		}
 		if (close) await win.destroy();
 	});
+}
+
+/** Set the OS window's title (the taskbar and the window switcher read it; Kerf's own title bar is drawn
+ *  under the native caption). In the browser harness it is the tab's title. A failure is not worth a toast:
+ *  the title is a courtesy, not state. */
+export async function setWindowTitle(title: string): Promise<void> {
+	if (!inTauri()) {
+		if (typeof document !== 'undefined') document.title = title;
+		return;
+	}
+	const { getCurrentWindow } = await import('@tauri-apps/api/window');
+	await getCurrentWindow().setTitle(title);
 }
 
 /** Quit Kerf from a menu. The window's own close button is guarded by

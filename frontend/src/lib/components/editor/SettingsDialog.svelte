@@ -130,7 +130,7 @@
 	};
 
 	const chip = (active: boolean) =>
-		`padding:5px 10px;border-radius:999px;font-size:12px;cursor:pointer;white-space:nowrap;border:var(--line-width) solid ${
+		`padding:5px 10px;border-radius:var(--radius-sm);font-size:12px;cursor:pointer;white-space:nowrap;border:var(--line-width) solid ${
 			active ? 'var(--kerf-500)' : 'var(--border-strong)'
 		};background:${
 			active ? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)' : 'var(--surface-inset)'

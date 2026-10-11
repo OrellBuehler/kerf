@@ -192,14 +192,14 @@
 	<!-- the view: the box is the part of the cut the timeline is showing -->
 	<div
 		data-minimap-window
-		style="position:absolute;left:{rect.x}px;width:{rect.w}px;top:0;bottom:0;box-sizing:border-box;border:var(--line-emphasis) solid var(--kerf-400);border-radius:2px;background:color-mix(in srgb,var(--kerf-400) 14%,transparent);pointer-events:none"
+		style="position:absolute;left:{rect.x}px;width:{rect.w}px;top:0;bottom:0;box-sizing:border-box;border:var(--line-emphasis) solid var(--kerf-400);border-radius:var(--radius-xs);background:color-mix(in srgb,var(--kerf-400) 14%,transparent);pointer-events:none"
 	>
 		{#if rect.w > EDGE_PX * 3}
 			<span
-				style="position:absolute;left:1px;top:50%;width:2px;height:12px;margin-top:-6px;border-radius:1px;background:var(--kerf-300)"
+				style="position:absolute;left:1px;top:50%;width:2px;height:12px;margin-top:-6px;border-radius:var(--radius-full);background:var(--kerf-300)"
 			></span>
 			<span
-				style="position:absolute;right:1px;top:50%;width:2px;height:12px;margin-top:-6px;border-radius:1px;background:var(--kerf-300)"
+				style="position:absolute;right:1px;top:50%;width:2px;height:12px;margin-top:-6px;border-radius:var(--radius-full);background:var(--kerf-300)"
 			></span>
 		{/if}
 	</div>

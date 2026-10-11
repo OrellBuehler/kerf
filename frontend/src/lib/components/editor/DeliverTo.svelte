@@ -5,9 +5,10 @@
 	// a shape ticked in one has to be there when the other opens. What each
 	// shape is judged for is the platform check's (`Readiness`), which reads the
 	// same choice.
+	import Chip from './Chip.svelte';
+	import CheckRow from './CheckRow.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { VARIANT_PRESETS, formatsFor, variantPath } from '$lib/delivery-formats';
-	import { tip } from '$lib/tip';
 
 	/** `where` finishes "One file per shape, …": the dialog has a destination
 	 *  field of its own to point at, the Deliver panel does not. */
@@ -23,17 +24,7 @@
 <div style="display:flex;flex-wrap:wrap;gap:6px;padding:2px 0">
 	{#each VARIANT_PRESETS as p (p.id)}
 		{@const on = ui.deliverShapes.includes(p.id)}
-		<button
-			use:tip={p.hint}
-			aria-pressed={on}
-			onclick={() => ui.toggleDeliverShape(p.id)}
-			style="padding:5px 10px;border-radius:999px;font-size:12px;cursor:pointer;white-space:nowrap;border:var(--line-width) solid {on
-				? 'var(--kerf-500)'
-				: 'var(--border-strong)'};background:{on
-				? 'color-mix(in srgb,var(--kerf-500) 22%,transparent)'
-				: 'var(--surface-inset)'};color:{on ? 'var(--text-primary)' : 'var(--text-secondary)'}"
-			>{p.label}</button
-		>
+		<Chip pressed={on} title={p.hint} onclick={() => ui.toggleDeliverShape(p.id)}>{p.label}</Chip>
 	{/each}
 </div>
 {#if formats.length}
@@ -44,15 +35,9 @@
 				>{variantPath(outputPath || 'cut.' + ext, f).split(/[\\/]/).pop()}</span
 			>{/each}.
 	</div>
-	<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 0">
-		<span style="font-size:12px;color:var(--text-muted)">Smart crop each shot for every shape</span>
-		<input
-			type="checkbox"
-			checked={ui.deliverSmartCrop}
-			onchange={(e) => (ui.deliverSmartCrop = e.currentTarget.checked)}
-			style="accent-color:var(--kerf-500);width:15px;height:15px"
-		/>
-	</label>
+	<CheckRow checked={ui.deliverSmartCrop} onchange={(e) => (ui.deliverSmartCrop = e.currentTarget.checked)}>
+		Smart crop each shot for every shape
+	</CheckRow>
 {:else}
 	<div style="font-size:11px;color:var(--text-muted);padding:4px 0 2px">
 		Pick shapes to write one file each — a Reel, a feed post and a YouTube upload from this one cut.

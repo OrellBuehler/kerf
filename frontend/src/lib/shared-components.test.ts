@@ -190,7 +190,7 @@ describe('SliderRow', () => {
 		// By the blur the selection is the other clip's and the field has been re-rendered with that
 		// clip's value: reading either writes the other clip's number onto this one.
 		const inputs = (inspector.match(/<input\b[\s\S]*?\/>/g) ?? []).filter((tag) => /type="(text|number)"/.test(tag));
-		expect(inputs.length).toBeGreaterThanOrEqual(6);
+		expect(inputs.length).toBeGreaterThanOrEqual(5);
 		for (const tag of inputs) {
 			const name = tag.replace(/\s+/g, ' ').slice(0, 70);
 			expect(tag, name).toContain('onfocus={noteFocus}');
@@ -201,7 +201,11 @@ describe('SliderRow', () => {
 			expect(tag, name).not.toMatch(/currentTarget\.value(?!\s*=[^=])/);
 			expect(tag, name).not.toMatch(/\bclip[.!]|\bo\.id|selectedClip|\boverlay\b/);
 		}
-		// The title's select and checkbox change at once, but go through the same door.
+		// The title's colour pickers, select and checkbox change at once, but go through the same door.
+		const pickers = (inspector.match(/<input\b[\s\S]*?\/>/g) ?? []).filter((tag) => /type="color"/.test(tag));
+		expect(pickers.length).toBe(1);
+		expect(pickers[0]).toContain('onfocus={noteFocus}');
+		expect(pickers[0]).toContain('patchTitle(e.currentTarget');
 		expect(inspector).not.toMatch(/updateOverlay\(o\.id/);
 		expect(inspector.match(/patchTitle\(e\.currentTarget/g)?.length).toBe(5);
 		for (const helper of ['setVideoFxParam', 'setAudioFxParam'])

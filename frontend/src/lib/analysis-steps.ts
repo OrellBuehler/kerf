@@ -121,11 +121,65 @@ export interface MediaTraits {
 	audio: boolean;
 	/** A still image: nothing to analyze at all. */
 	image: boolean;
+	/** Has a picture to look at: without one there are no scenes. Unknown (absent) reads as a picture. */
+	video?: boolean;
 }
 
 /** Whether a kind reads the audio (everything but scene detection — `AnalysisKind::needs_audio`). */
 export function needsAudio(kind: AnalysisKind): boolean {
 	return kind !== 'scenes';
+}
+
+/** Whether a kind has anything to find in a file of this kind: nothing in a still, no scenes in a
+ *  song, no silence or speech in footage without sound. */
+export function applicable(kind: AnalysisKind, media: MediaTraits): boolean {
+	if (media.image) return false;
+	if (needsAudio(kind) && !media.audio) return false;
+	if (!needsAudio(kind) && media.video === false) return false;
+	return true;
+}
+
+/** The chips worth drawing for an asset: one per kind it can give, in pass order. A kind it cannot give
+ *  is not drawn — an mp3 carried a permanent outlined "not run" for scenes — unless something happened to it
+ *  (it ran, it is running, it failed), which is never hidden. */
+export function chipsFor(chips: Chip[], media: MediaTraits): Chip[] {
+	return chips.filter((c) => applicable(c.kind, media) || c.state === 'done' || c.state === 'running' || c.state === 'failed');
+}
+
+export interface AnalysisMeter {
+	done: number;
+	total: number;
+	/** What to draw it as: everything done, a pass running, something failed, or still to do. */
+	tone: 'done' | 'running' | 'failed' | 'todo';
+	/** The pill's words. */
+	text: string;
+	/** The tooltip: the headline, then one line per kind. */
+	title: string;
+}
+
+/** The five chips as one summary — `3 of 5 analyzed` — for a row with no room for five tags. A kind the
+ *  user switched off is counted as neither done nor to do: it is not waiting for anything. */
+export function analysisMeter(chips: Chip[]): AnalysisMeter | null {
+	if (chips.length === 0) return null;
+	const wanted = chips.filter((c) => c.state !== 'off');
+	const done = chips.filter((c) => c.state === 'done').length;
+	const total = Math.max(wanted.length, done);
+	const running = chips.some((c) => c.state === 'running');
+	const failed = chips.filter((c) => c.state === 'failed').length;
+	const tone = running ? 'running' : failed > 0 ? 'failed' : total > 0 && done === total ? 'done' : 'todo';
+	const text = running
+		? 'analyzing…'
+		: failed > 0
+			? `${failed} failed`
+			: total === 0
+				? 'analysis off'
+				: done === total
+					? 'analyzed'
+					: done === 0
+						? 'not analyzed'
+						: `${done} of ${total} analyzed`;
+	const head = total === 0 ? 'Analysis — switched off' : `Analysis — ${done} of ${total} done`;
+	return { done, total, tone, text, title: [head, ...chips.map((c) => c.title)].join('\n') };
 }
 
 /**

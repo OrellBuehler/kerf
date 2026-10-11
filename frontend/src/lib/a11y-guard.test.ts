@@ -120,6 +120,20 @@ describe('a chip that is on or off says which', () => {
 		expect(offenders).toEqual([]);
 	});
 
+	test('every <Chip> is given `pressed`, so a toggle never reads as an action', () => {
+		const offenders: string[] = [];
+		let seen = 0;
+		for (const file of svelteFiles) {
+			for (const { node, at } of elements(file)) {
+				if (node.type !== 'Component' || node.name !== 'Chip') continue;
+				seen++;
+				if (!attr(node, 'pressed')) offenders.push(`${at}  <Chip> without pressed`);
+			}
+		}
+		expect(seen).toBeGreaterThanOrEqual(8);
+		expect(offenders).toEqual([]);
+	});
+
 	test('a group of radio chips is one tab stop that the arrows move through', () => {
 		const settings = read(`${EDITOR}SettingsDialog.svelte`);
 		const groups = [...settings.matchAll(/role="radiogroup"[^>]*>/g)].map((m) => m[0]);

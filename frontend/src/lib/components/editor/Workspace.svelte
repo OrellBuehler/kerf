@@ -13,10 +13,13 @@
 	import AgentPanel from './AgentPanel.svelte';
 	import DeliverPanel from './DeliverPanel.svelte';
 	import Mixer from './Mixer.svelte';
+	import DockEmpty from './DockEmpty.svelte';
 	import ContextMenu from './ContextMenu.svelte';
 	import { POPOUT_URL, isPanelId, type PanelId } from '$lib/layout';
 	import { workspace } from '$lib/workspace.svelte';
 	import { popout } from '$lib/popout.svelte';
+	import { editor } from '$lib/state.svelte';
+	import { agentTabLabel, proposalIndicator } from '$lib/agent-status';
 
 	const COMPONENTS: Record<PanelId, Component<any>> = {
 		library: LibraryPanel,
@@ -29,6 +32,34 @@
 	};
 
 	let el = $state<HTMLDivElement | null>(null);
+
+	// A proposal the agent staged shows on the Agent tab: in the Audio and Deliver workspaces the agent is only a
+	// tab, and a proposal that landed there was invisible. The tab is dockview's own element, so the count is a
+	// data attribute the stylesheet draws (`dockview-kerf.css`) and the tab's name says what it holds.
+	const pending = $derived(proposalIndicator(editor.staged));
+	$effect(() => {
+		const host = el;
+		const badge = pending;
+		// The panels are rebuilt on a workspace switch and on opening one: look again when they change.
+		void workspace.open;
+		void workspace.active;
+		if (!host) return;
+		const apply = () => {
+			for (const tab of host.querySelectorAll<HTMLElement>('.dv-tab[data-tab-panel-id="agent"]')) {
+				const label = tab.querySelector<HTMLElement>('.dv-default-tab-content');
+				if (badge) {
+					label?.setAttribute('data-pending', badge.count > 0 ? String(badge.count) : '•');
+					tab.setAttribute('aria-label', agentTabLabel(badge));
+				} else {
+					label?.removeAttribute('data-pending');
+					tab.setAttribute('aria-label', agentTabLabel(null));
+				}
+			}
+		};
+		apply();
+		const again = requestAnimationFrame(apply);
+		return () => cancelAnimationFrame(again);
+	});
 
 	/** A detached window needs a context menu of its own: it is drawn in the document of
 	 *  the window that was clicked, and a Svelte root registers its delegated event
@@ -68,12 +99,21 @@
 		};
 	}
 
+	/** What the dock shows with every panel closed (`DockEmpty`): how to get one back. */
 	function createWatermarkComponent() {
 		const element = document.createElement('div');
-		element.style.cssText =
-			'display:grid;place-items:center;height:100%;font-size:12px;color:var(--text-muted)';
-		element.textContent = 'Open a panel from the Window menu';
-		return { element, init() {} };
+		element.style.cssText = 'height:100%';
+		let instance: Record<string, unknown> | null = null;
+		return {
+			element,
+			init() {
+				instance = mount(DockEmpty, { target: element });
+			},
+			dispose() {
+				if (instance) void unmount(instance);
+				instance = null;
+			}
+		};
 	}
 
 	onMount(() => {

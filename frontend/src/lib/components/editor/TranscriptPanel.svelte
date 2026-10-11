@@ -4,6 +4,8 @@
 	// from the timeline. Empty, it says which of the five reasons applies.
 	import Icon from './Icon.svelte';
 	import Btn from './Btn.svelte';
+	import EmptyState from './EmptyState.svelte';
+	import ProgressBar from './ProgressBar.svelte';
 	import IconBtn from './IconBtn.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { settings } from '$lib/settings.svelte';
@@ -79,21 +81,10 @@
 <div style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden">
 	<div style="flex:1;overflow-y:auto;padding:12px">
 	{#if txLines.length === 0}
-		<div
-			style="display:flex;flex-direction:column;align-items:center;gap:12px;padding:36px 16px;color:var(--text-muted);text-align:center"
-		>
-			<Icon n="captions" s={22} />
-			<span style="font-size:12px;color:var(--text-secondary)">{tx.title}</span>
-			{#if tx.body}
-				<span style="font-size:11px;line-height:1.5;max-width:240px">{tx.body}</span>
-			{/if}
+		<EmptyState icon="captions" title={tx.title} hint={tx.body}>
 			{#if ui.analyzing}
-				<div style="width:200px;height:3px;border-radius:999px;background:var(--surface-inset);overflow:hidden">
-					<div
-						style="height:100%;width:{Math.round(
-							(ui.analysisStage?.fraction ?? 0) * 100
-						)}%;background:var(--kerf-500);transition:width .2s"
-					></div>
+				<div style="width:200px">
+					<ProgressBar value={ui.analysisStage?.fraction ?? null} label="Transcribing" height={3} />
 				</div>
 			{:else if tx.action === 'download'}
 				<div style="display:flex;flex-direction:column;gap:8px;align-items:center">
@@ -101,7 +92,9 @@
 						value={ui.transcription?.model ?? ''}
 						onchange={(e) => void ui.chooseSpeechModel((e.currentTarget as HTMLSelectElement).value)}
 						disabled={!!ui.downloadingModel}
-						style="background:var(--surface-inset);color:var(--text-secondary);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-sm);font-size:11px;padding:4px 6px"
+						aria-label="Speech model"
+						class="k-select"
+						style="color:var(--text-secondary)"
 					>
 						{#each ui.transcription?.models ?? [] as m (m.name)}
 							<option value={m.name}
@@ -112,12 +105,8 @@
 						{/each}
 					</select>
 					{#if ui.downloadingModel}
-						<div style="width:200px;height:3px;border-radius:999px;background:var(--surface-inset);overflow:hidden">
-							<div
-								style="height:100%;width:{Math.round(
-									ui.modelFraction * 100
-								)}%;background:var(--kerf-500);transition:width .2s"
-							></div>
+						<div style="width:200px">
+							<ProgressBar value={ui.modelFraction} label="Downloading the speech model" height={3} />
 						</div>
 					{:else}
 						<Btn size="sm" onclick={() => void ui.fetchSpeechModel(ui.transcription?.model ?? 'base')}
@@ -128,21 +117,19 @@
 			{:else if tx.action === 'settings'}
 				<Btn size="sm" onclick={() => settings.toggle()}>Open Settings</Btn>
 			{:else if tx.action === 'analyze' && editor.selectedAssetId}
-				<Btn size="sm" onclick={() =>
+				<Btn
+					size="sm"
+					onclick={() =>
 						void ui
 							.runAnalysis(editor.selectedAssetId!, ['transcript'])
-							.catch((err) => toast.error(err instanceof Error ? err.message : String(err)))}>Transcribe</Btn>
+							.catch((err) => toast.error(err instanceof Error ? err.message : String(err)))}>Transcribe</Btn
+				>
 			{/if}
-		</div>
+		</EmptyState>
 	{:else}
 		<div data-selectable style="display:flex;flex-direction:column;gap:2px">
 			{#each txLines as l, i (i)}
-				<div
-					style="display:flex;gap:8px;padding:7px 8px;border-radius:var(--radius-sm);align-items:flex-start;background:{i ===
-					activeTx
-						? 'var(--surface-inset)'
-						: 'transparent'}"
-				>
+				<div class="line" data-active={i === activeTx ? '' : undefined}>
 					<button
 						onclick={() => seekLine(l)}
 						disabled={!l.clip}
@@ -156,9 +143,8 @@
 							>{l.t}</span
 						>
 						<span
-							style="font-size:12px;line-height:1.45;color:{l.clip
-								? 'var(--text-secondary)'
-								: 'var(--text-muted)'};text-decoration:{l.clip ? 'none' : 'line-through'}">{l.s}</span
+							class="words"
+							style="text-decoration:{l.clip ? 'none' : 'line-through'};color:{l.clip ? '' : 'var(--text-muted)'}">{l.s}</span
 						>
 					</button>
 					{#if l.clip}
@@ -177,3 +163,31 @@
 	{/if}
 	</div>
 </div>
+
+<style>
+	/* A line is lit by the pointer, and the one the playhead is in carries the accent bar: the old
+	   darker block alone was easy to miss. Text on `surface-hover` is held to 4.5:1 by the contrast guard. */
+	.line {
+		display: flex;
+		gap: 8px;
+		align-items: flex-start;
+		padding: 7px 8px 7px 6px;
+		border-left: 2px solid transparent;
+		border-radius: var(--radius-sm);
+	}
+	.line:hover {
+		background: color-mix(in srgb, var(--surface-hover) 60%, transparent);
+	}
+	.line[data-active] {
+		background: var(--surface-hover);
+		border-left-color: var(--kerf-500);
+	}
+	.words {
+		font-size: var(--text-sm);
+		line-height: 1.45;
+		color: var(--text-secondary);
+	}
+	.line[data-active] .words {
+		color: var(--text-primary);
+	}
+</style>

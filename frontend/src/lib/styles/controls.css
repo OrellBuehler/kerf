@@ -41,7 +41,7 @@
 		box-shadow var(--dur-fast) var(--ease-out);
 }
 .k-btn[data-size='sm'] {
-	--k-h: 30px;
+	--k-h: var(--control-sm);
 	--k-px: 10px;
 	font-size: var(--text-sm);
 }
@@ -94,22 +94,37 @@
 	--k-fill-hover: var(--danger-surface);
 	--k-fill-press: color-mix(in srgb, var(--red-500) 22%, transparent);
 }
-.k-btn:hover:not(:disabled) {
+/* A removal that is not the page's main act (Remove clip in the Inspector): the red is the ink, and the edge is
+   the neutral one, so a row of controls is not outlined in alarm. `data-quiet` on a destructive `Btn`. */
+.k-btn[data-variant='destructive'][data-quiet] {
+	--k-edge: var(--border-strong);
+}
+.k-btn:hover:not(:disabled):not([aria-disabled='true']) {
 	background: var(--k-fill-hover, var(--k-fill));
 	border-color: var(--k-edge-hover, var(--k-edge));
 	color: var(--k-ink-hover, var(--k-ink));
 }
-.k-btn:active:not(:disabled) {
+.k-btn:active:not(:disabled):not([aria-disabled='true']) {
 	background: var(--k-fill-press, var(--k-fill-hover, var(--k-fill)));
 	border-color: var(--k-edge-press, var(--k-edge-hover, var(--k-edge)));
 	color: var(--k-ink-press, var(--k-ink-hover, var(--k-ink)));
 }
-.k-btn[data-variant='secondary']:active:not(:disabled) {
+.k-btn[data-variant='secondary']:active:not(:disabled):not([aria-disabled='true']) {
 	box-shadow: inset 0 1px 2px color-mix(in srgb, var(--shadow-color) calc(var(--shadow-strength) * 0.5), transparent);
 }
 /* Off is a plain outline in the disabled ink, not a dimmed copy of the live look: the old blanket
    50 % made a secondary label 2.7:1 and an amber button a washed-out amber. */
 .k-btn:disabled {
+	background: transparent;
+	border-color: var(--k-edge-off);
+	color: var(--text-disabled);
+	box-shadow: none;
+	cursor: default;
+	opacity: 1;
+}
+/* Off but still focusable (`aria-disabled`): a button that explains itself — its tooltip is the reason, and a keyboard
+   user reaches it, which a `disabled` button cannot be. The same look; the click is the handler's to refuse. */
+.k-btn[aria-disabled='true'] {
 	background: transparent;
 	border-color: var(--k-edge-off);
 	color: var(--text-disabled);
@@ -188,6 +203,21 @@
 }
 .k-ibtn[data-accent]:active:not(:disabled) {
 	background: color-mix(in srgb, var(--kerf-500) 44%, transparent);
+}
+/* The agent has a proposal waiting: a chip in the agent's own hue (`agent-300` on `agent-surface`, the
+   badge's pair, which the contrast guard holds to 4.5:1). */
+.k-ibtn[data-agent] {
+	border-color: var(--agent-border);
+	background: var(--agent-surface);
+	color: var(--agent-300);
+}
+.k-ibtn[data-agent]:hover:not(:disabled) {
+	background: var(--agent-surface);
+	box-shadow: var(--hover-fill);
+}
+.k-ibtn[data-agent]:active:not(:disabled) {
+	background: var(--agent-surface);
+	box-shadow: var(--press-fill);
 }
 .k-ibtn:disabled {
 	background: transparent;
@@ -276,9 +306,176 @@
 	border-color: transparent;
 }
 
+/* ---------- Chip: a toggle in a row of choices ---------- */
+
+/* One height, one radius: a chip is for what is on or off (a look, a style, a shape); an action is a
+   `Btn`. `aria-pressed` is the on state, so the theme and the screen reader agree on it. */
+.k-chip {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 5px;
+	flex: none;
+	box-sizing: border-box;
+	height: var(--control-sm);
+	padding: 0 10px;
+	font-family: var(--font-sans);
+	font-size: var(--text-sm);
+	font-weight: 500;
+	line-height: 1;
+	white-space: nowrap;
+	cursor: pointer;
+	border: var(--line-width) solid var(--border-strong);
+	border-radius: var(--radius-sm);
+	background: var(--surface-inset);
+	color: var(--text-secondary);
+	transition:
+		background-color var(--dur-fast) var(--ease-out),
+		border-color var(--dur-fast) var(--ease-out),
+		color var(--dur-fast) var(--ease-out);
+}
+.k-chip:hover:not(:disabled) {
+	background: var(--surface-hover);
+	color: var(--text-primary);
+}
+.k-chip:active:not(:disabled) {
+	background: var(--surface-active);
+	color: var(--text-primary);
+}
+.k-chip[aria-pressed='true'] {
+	border-color: var(--kerf-500);
+	background: color-mix(in srgb, var(--kerf-500) 22%, transparent);
+	color: var(--text-primary);
+}
+.k-chip[aria-pressed='true']:hover:not(:disabled) {
+	background: color-mix(in srgb, var(--kerf-500) 32%, transparent);
+}
+.k-chip[aria-pressed='true']:active:not(:disabled) {
+	background: color-mix(in srgb, var(--kerf-500) 42%, transparent);
+}
+.k-chip:disabled {
+	background: transparent;
+	border-color: var(--border-subtle);
+	color: var(--text-disabled);
+	cursor: default;
+	opacity: 1;
+}
+
+/* ---------- Tile: a preset in a grid ---------- */
+
+/* A name that has to fit its cell on one line: it ends in an ellipsis (the tooltip has the rest)
+   rather than running into the border, as "Compressor" did at 76 px. */
+.k-tile {
+	display: flex;
+	align-items: center;
+	box-sizing: border-box;
+	min-width: 0;
+	height: var(--control-sm);
+	padding: 0 9px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	text-align: left;
+	font-family: var(--font-sans);
+	font-size: var(--text-sm);
+	font-weight: 500;
+	cursor: pointer;
+	border: var(--line-width) solid var(--border-default);
+	border-radius: var(--radius-sm);
+	background: var(--surface-raised);
+	color: var(--text-primary);
+	transition:
+		background-color var(--dur-fast) var(--ease-out),
+		border-color var(--dur-fast) var(--ease-out),
+		color var(--dur-fast) var(--ease-out);
+}
+.k-tile:hover:not(:disabled) {
+	background: var(--surface-hover);
+	border-color: var(--border-strong);
+}
+.k-tile:active:not(:disabled) {
+	background: var(--surface-active);
+}
+.k-tile:disabled {
+	background: transparent;
+	border-color: var(--border-subtle);
+	color: var(--text-disabled);
+	cursor: default;
+	opacity: 1;
+}
+
+/* ---------- Select, checkbox, overline ---------- */
+
+/* A native select drawn as a field: the chevron is two gradients of the muted ink, so it follows the
+   theme (an image could not take a token). `background-color`, never the `background` shorthand, in any
+   inline style that sits beside it, or the chevron is reset. */
+.k-select {
+	appearance: none;
+	box-sizing: border-box;
+	height: var(--control-sm);
+	min-width: 0;
+	padding: 0 24px 0 8px;
+	font-family: var(--font-sans);
+	font-size: var(--text-sm);
+	cursor: pointer;
+	border: var(--line-width) solid var(--border-strong);
+	border-radius: var(--radius-sm);
+	background-color: var(--surface-inset);
+	background-image:
+		linear-gradient(45deg, transparent 50%, var(--text-muted) 50%),
+		linear-gradient(135deg, var(--text-muted) 50%, transparent 50%);
+	background-position:
+		calc(100% - 12px) 50%,
+		calc(100% - 8px) 50%;
+	background-size: 4px 4px;
+	background-repeat: no-repeat;
+	color: var(--text-primary);
+}
+.k-select:hover:not(:disabled) {
+	background-color: var(--surface-hover);
+}
+.k-select:disabled {
+	cursor: default;
+	color: var(--text-disabled);
+	border-color: var(--border-subtle);
+}
+
+/* A checkbox with its words: the whole row is the target, and the box comes first so the eye does not
+   cross a wide gap to find what it switches. */
+.k-check {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	min-height: var(--control-sm);
+	font-size: var(--text-sm);
+	color: var(--text-secondary);
+	cursor: pointer;
+}
+.k-check input {
+	flex: none;
+	width: 16px;
+	height: 16px;
+	margin: 0;
+	accent-color: var(--kerf-500);
+	cursor: inherit;
+}
+.k-check:has(input:disabled) {
+	color: var(--text-disabled);
+	cursor: default;
+}
+
+/* The small caps label over a group of controls. */
+.k-overline {
+	font: var(--type-overline);
+	letter-spacing: var(--tracking-caps);
+	text-transform: uppercase;
+	color: var(--text-muted);
+}
+
 /* ---------- Workspace tabs ---------- */
 
 .k-tab {
+	position: relative;
 	height: 24px;
 	padding: 0 11px;
 	cursor: pointer;
@@ -304,7 +501,18 @@
 	background: var(--surface-active);
 	border-color: var(--border-strong);
 	color: var(--text-primary);
-	box-shadow: inset 0 -2px 0 var(--kerf-500);
+}
+/* The marker is a bar inset from the corners, not an inset shadow, which followed the radius and curled up
+   the pill's sides. */
+.k-tab[aria-pressed='true']::after {
+	content: '';
+	position: absolute;
+	left: 6px;
+	right: 6px;
+	bottom: -1px;
+	height: 2px;
+	border-radius: 1px;
+	background: var(--kerf-500);
 }
 
 /* ---------- Text fields drawn as a wrapper ---------- */
@@ -323,15 +531,15 @@
    timeline (they are the picture, and carry their own hover), nor menu rows (which light
    themselves from the pointer and the keys alike), nor dockview's own controls (the tab's close
    X, the overflow menu), which have a hover of theirs. */
-button:not(:disabled):not(.k-btn):not(.k-ibtn):not(.k-tab):not(.k-tt):not(.kclip):not([role^='menuitem']):not([class^='dv-']):not([class*=' dv-']):hover,
+button:not(:disabled):not(.k-btn):not(.k-ibtn):not(.k-tab):not(.k-tt):not(.k-chip):not(.k-tile):not(.kclip):not([role^='menuitem']):not([class^='dv-']):not([class*=' dv-']):hover,
 [role='button']:not([aria-disabled='true']):not([class^='dv-']):not([class*=' dv-']):hover {
 	box-shadow: var(--hover-fill);
 }
-button:not(:disabled):not(.k-btn):not(.k-ibtn):not(.k-tab):not(.k-tt):not(.kclip):not([role^='menuitem']):not([class^='dv-']):not([class*=' dv-']):active,
+button:not(:disabled):not(.k-btn):not(.k-ibtn):not(.k-tab):not(.k-tt):not(.k-chip):not(.k-tile):not(.kclip):not([role^='menuitem']):not([class^='dv-']):not([class*=' dv-']):active,
 [role='button']:not([aria-disabled='true']):not([class^='dv-']):not([class*=' dv-']):active {
 	box-shadow: var(--press-fill);
 }
-button:not(.k-btn):not(.k-ibtn):not(.k-tab):not(.k-tt):not(.kclip):not([role^='menuitem']):not([class^='dv-']):not([class*=' dv-']),
+button:not(.k-btn):not(.k-ibtn):not(.k-tab):not(.k-tt):not(.k-chip):not(.k-tile):not(.kclip):not([role^='menuitem']):not([class^='dv-']):not([class*=' dv-']),
 [role='button']:not([class^='dv-']):not([class*=' dv-']) {
 	transition: box-shadow var(--dur-fast) var(--ease-out);
 }
@@ -381,7 +589,9 @@ button:disabled {
 	align-items: center;
 	gap: 9px;
 	width: 100%;
-	padding: 6px 8px;
+	min-height: 26px;
+	box-sizing: border-box;
+	padding: 4px 8px;
 	border: none;
 	border-radius: var(--radius-sm);
 	background: none;

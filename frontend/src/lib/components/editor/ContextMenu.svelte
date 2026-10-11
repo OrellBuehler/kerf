@@ -161,11 +161,11 @@
 		role="menu"
 		tabindex="-1"
 		oncontextmenu={(e) => e.preventDefault()}
-		style="position:fixed;left:{pos.x}px;top:{pos.y}px;z-index:1000;min-width:188px;max-height:{own.innerHeight - 12}px;overflow-y:auto;padding:5px;border-radius:var(--radius-md);background:var(--surface-raised);border:var(--line-width) solid var(--border-strong);box-shadow:var(--shadow-lg);font-family:var(--font-sans)"
+		style="position:fixed;left:{pos.x}px;top:{pos.y}px;z-index:1000;min-width:188px;max-height:{own.innerHeight - 12}px;overflow-y:auto;padding:4px;border-radius:var(--radius-md);background:var(--surface-raised);border:var(--line-width) solid var(--border-strong);box-shadow:var(--shadow-lg);font-family:var(--font-sans)"
 	>
 		{#each contextMenu.items as item, i (i)}
 			{#if item.type === 'separator'}
-				<div style="height:1px;margin:5px 4px;background:var(--border-subtle)"></div>
+				<div role="separator" style="height:var(--line-width);margin:4px 6px;background:var(--border-default)"></div>
 			{:else if item.type === 'header'}
 				<div style="padding:5px 8px 4px;min-width:0;max-width:300px">
 					<div

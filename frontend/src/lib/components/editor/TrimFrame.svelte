@@ -52,7 +52,7 @@
 
 <div style="flex:1;min-width:0;min-height:0;display:flex;flex-direction:column;gap:5px">
 	<div
-		style="flex:1;min-height:0;position:relative;display:grid;place-items:center;background:var(--frame-matte);border:var(--line-width) solid var(--border-default);border-radius:3px;overflow:hidden"
+		style="flex:1;min-height:0;position:relative;display:grid;place-items:center;background:var(--frame-matte);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-sm);overflow:hidden"
 	>
 		{#if url}
 			<img src={url} alt="{cell.label} frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain" />
