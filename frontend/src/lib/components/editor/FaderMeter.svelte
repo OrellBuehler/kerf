@@ -18,6 +18,7 @@
 	} from '$lib/mixer';
 	import { clippedAny, peakLabel, strongest, type StereoMeter } from '$lib/meter';
 	import type { SliderKey } from '$lib/slider-gesture';
+	import { tip as tooltip } from '$lib/tip';
 
 	let {
 		value,
@@ -84,13 +85,13 @@
 	<LevelMeter {meter} {maxDb} label="{name} level meter" />
 </div>
 <div class="readouts">
-	<span class="db" title="The fader, in dB">{gainLabel(value)}</span>
+	<span class="db" use:tooltip={'The fader, in dB'}>{gainLabel(value)}</span>
 	<button
 		type="button"
 		class="peak"
 		class:clipped
 		disabled={!onclear}
-		title={clipped
+		use:tooltip={clipped
 			? `${name} reached full scale — click to clear`
 			: 'Highest sample peak since playback started (the Measure button reads the true peak) — click to clear'}
 		aria-label="{name} highest peak{clipped ? ', clipped' : ''}: {peakLabel(peak)} dBFS. Click to clear."

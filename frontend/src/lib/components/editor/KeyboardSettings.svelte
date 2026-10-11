@@ -16,11 +16,13 @@
 		chordFromEvent,
 		displayChord,
 		filterActions,
+		plainLabel,
 		sameChord,
 		type ActionDef,
 		type Chord,
 		type Rebind
 	} from '$lib/keymap';
+	import { tip } from '$lib/tip';
 
 	const platform = settings.platform;
 
@@ -49,7 +51,7 @@
 	const changed = $derived(Object.keys(settings.keyOverrides.bindings).length);
 
 	const show = (c: Chord) => displayChord(c, platform);
-	const nameOf = (id: string) => actionDef(id)?.label ?? id;
+	const nameOf = (id: string) => plainLabel(actionDef(id)?.label ?? id);
 
 	/** Put focus on something once the list has settled. A recording, a reset or a
 	 *  confirmation removes the button that had it, and focus left on the page
@@ -90,7 +92,7 @@
 		}
 		recording = null;
 		pending = { id, chord, rebind, conflicts, gives: replacing };
-		announcement = `${show(chord)} is already used by ${conflicts.map((c) => c.label).join(' and ')}.`;
+		announcement = `${show(chord)} is already used by ${conflicts.map((c) => plainLabel(c.label)).join(' and ')}.`;
 	}
 
 	function onRecordKey(e: KeyboardEvent) {
@@ -123,7 +125,7 @@
 		if (how) {
 			if (rebind) settings.rebind(rebind, how);
 			else settings.resetKey(id, how);
-			const others = conflicts.map((c) => c.label).join(' and ');
+			const others = conflicts.map((c) => plainLabel(c.label)).join(' and ');
 			const now = rebind ? `${nameOf(id)} is now ${show(chord)}` : `${nameOf(id)} is back to its default`;
 			announcement = how === 'swap' ? `Swapped: ${now}.` : `${now}; ${others} unbound.`;
 		}
@@ -137,7 +139,7 @@
 		if (plan.conflicts.length > 0 && plan.chord) {
 			recording = null;
 			pending = { id, chord: plan.chord, rebind: null, conflicts: plan.conflicts, gives: plan.gives };
-			announcement = `${show(plan.chord)} is ${nameOf(id)}'s default, but ${plan.conflicts.map((c) => c.label).join(' and ')} uses it.`;
+			announcement = `${show(plan.chord)} is ${nameOf(id)}'s default, but ${plan.conflicts.map((c) => plainLabel(c.label)).join(' and ')} uses it.`;
 			return;
 		}
 		settings.resetKey(id);
@@ -230,7 +232,11 @@
 				icon="rotate-ccw"
 				data-key-reset-all
 				disabled={changed === 0 || confirmingReset}
-				title={changed === 0 ? 'Every shortcut is at its default' : `Put all ${changed} changed shortcuts back to their defaults`}
+				title={changed === 0
+					? 'Every shortcut is at its default'
+					: changed === 1
+						? 'Put the changed shortcut back to its default'
+						: `Put all ${changed} changed shortcuts back to their defaults`}
 				onclick={() => (confirmingReset = true)}>Reset all</Btn
 			>
 		</div>
@@ -280,7 +286,7 @@
 									{a.label}
 									{#if custom}
 										<span
-											title="Not the default"
+											use:tip={'Not the default'}
 											role="img"
 											aria-label="Not the default"
 											style="width:6px;height:6px;border-radius:50%;background:var(--kerf-400);flex:none"
@@ -300,15 +306,15 @@
 											onkeydown={onRecordKey}
 											onblur={() => (recording = null)}
 											data-key-row={a.id}
-											aria-label="Recording a shortcut for {a.label}. Press the keys, Escape to cancel, Backspace to remove."
+											aria-label="Recording a shortcut for {plainLabel(a.label)}. Press the keys, Escape to cancel, Backspace to remove."
 											style={chip(true)}>Press keys…</button
 										>
 									{:else}
 										<button
 											data-key-row={a.id}
 											onclick={() => startRecording(a.id, c)}
-											title="Change this shortcut"
-											aria-label="{a.label}: {show(c)}. Change this shortcut"
+											use:tip={'Change this shortcut'}
+											aria-label="{plainLabel(a.label)}: {show(c)}. Change this shortcut"
 											style={chip()}>{show(c)}</button
 										>
 									{/if}
@@ -320,22 +326,22 @@
 										onkeydown={onRecordKey}
 										onblur={() => (recording = null)}
 										data-key-row={a.id}
-										aria-label="Recording a shortcut for {a.label}. Press the keys, Escape to cancel."
+										aria-label="Recording a shortcut for {plainLabel(a.label)}. Press the keys, Escape to cancel."
 										style={chip(true)}>Press keys…</button
 									>
 								{:else if chords.length === 0}
 									<button
 										data-key-row={a.id}
 										onclick={() => startRecording(a.id, null)}
-										aria-label="{a.label} has no shortcut. Assign one"
+										aria-label="{plainLabel(a.label)} has no shortcut. Assign one"
 										style="{chip()};border-style:dashed;color:var(--text-muted)">Unassigned</button
 									>
 								{:else}
 									<button
 										data-key-row={a.id}
 										onclick={() => startRecording(a.id, null)}
-										title="Add another shortcut"
-										aria-label="Add another shortcut to {a.label}"
+										use:tip={'Add another shortcut'}
+										aria-label="Add another shortcut to {plainLabel(a.label)}"
 										style={iconBtn}><Icon n="plus" s={12} color="currentColor" /></button
 									>
 								{/if}
@@ -344,8 +350,8 @@
 									<button
 										data-key-row={a.id}
 										onclick={() => reset(a.id)}
-										title="Back to the default"
-										aria-label="Reset {a.label} to its default"
+										use:tip={'Back to the default'}
+										aria-label="Reset {plainLabel(a.label)} to its default"
 										style={iconBtn}><Icon n="rotate-ccw" s={12} color="currentColor" /></button
 									>
 								{/if}
@@ -354,7 +360,7 @@
 
 						{#if pending?.id === a.id}
 							{@const p = pending}
-							{@const names = p.conflicts.map((c) => c.label)}
+							{@const names = p.conflicts.map((c) => plainLabel(c.label))}
 							<!-- Escape here answers the question (Cancel); the keydown is a shortcut for the
 							     Cancel button, which is the real control. -->
 							<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
@@ -372,7 +378,7 @@
 									>
 									<span
 										><strong style="font-family:var(--font-mono);font-weight:600">{show(p.chord)}</strong>
-										{#if p.rebind}is already used by{:else}is {a.label}'s default, but{/if}
+										{#if p.rebind}is already used by{:else}is {plainLabel(a.label)}'s default, but{/if}
 										<strong style="font-weight:600">{names.join(' and ')}</strong>{p.rebind ? '' : ' uses it'}.</span
 									>
 								</div>
@@ -381,7 +387,7 @@
 										<Btn
 											variant="secondary"
 											size="sm"
-											title="{names[0]} takes {show(p.gives)}, which {a.label} is giving up"
+											title="{names[0]} takes {show(p.gives)}, which {plainLabel(a.label)} is giving up"
 											onclick={() => settle('swap')}>Swap</Btn
 										>
 									{/if}

@@ -5,12 +5,15 @@
 	// dialog says so up front, then names each stage as it runs — the voiceover dialog's arrangement.
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
+	import ProgressBar from './ProgressBar.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { cancelStems, onStemsProgress, stemsStatus } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
+	import { failure } from '$lib/failure-copy';
 	import { formatTime } from '$lib/diff';
 	import type { StemsProgress, StemsStatus } from '$lib/types';
 	import { STEM_NAMES, capitalized, describeStems, downloadNote, isStemsCancelled, stageLabel } from '$lib/stems';
+	import { tip } from '$lib/tip';
 
 	let { assetId, clipId = null, onClose }: { assetId: string; clipId?: string | null; onClose: () => void } = $props();
 
@@ -65,7 +68,7 @@
 			onClose();
 		} catch (e) {
 			// A stop is the user's own doing — back to the form, no notice.
-			if (!isStemsCancelled(e)) toast.error(e instanceof Error ? e.message : String(e));
+			if (!isStemsCancelled(e)) toast.error(failure('Stem separation failed', e));
 		} finally {
 			unlisten();
 			running = false;
@@ -89,7 +92,7 @@
 		<div style="display:flex;flex-direction:column;gap:2px">
 			<span
 				style="font-size:13px;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-				title={asset?.name ?? ''}>{asset?.name ?? ''}</span
+				use:tip={asset?.name ?? ''}>{asset?.name ?? ''}</span
 			>
 			{#if placement}
 				<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)"
@@ -139,18 +142,7 @@
 								<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">{pct}%</span>
 							{/if}
 						</div>
-						<div
-							role="progressbar"
-							aria-label="Separating stems"
-							aria-valuemin="0"
-							aria-valuemax="100"
-							aria-valuenow={pct ?? undefined}
-							style="height:6px;border-radius:3px;background:var(--surface-inset);overflow:hidden"
-						>
-							<div
-								style="height:100%;width:{pct ?? 30}%;background:var(--kerf-500);transition:width var(--dur-fast) linear"
-							></div>
-						</div>
+						<ProgressBar value={progress?.fraction ?? null} label="Separating stems" />
 					</div>
 					<Btn variant="destructive" size="md" data-rescue disabled={cancelling} onclick={stop}>
 						{cancelling ? 'Stopping…' : 'Cancel'}
@@ -160,7 +152,7 @@
 				<div style="display:flex;align-items:center;gap:8px">
 					<div style="flex:1"></div>
 					<Btn variant="ghost" size="md" onclick={onClose}>Cancel</Btn>
-					<Btn variant="primary" size="md" icon="layers" data-rescue disabled={!canStart} onclick={start}>Separate</Btn>
+					<Btn variant="primary" size="md" icon="layers" data-rescue disabled={!canStart} onclick={start}>Separate stems</Btn>
 				</div>
 			{/if}
 		</div>

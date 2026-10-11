@@ -5,11 +5,13 @@
 	import { untrack } from 'svelte';
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
+	import ProgressBar from './ProgressBar.svelte';
 	import SliderRow from './SliderRow.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { cancelVoiceover, onVoiceoverProgress, voiceoverStatus } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
+	import { failure } from '$lib/failure-copy';
 	import { CAPTION_LOOKS } from '$lib/style-presets';
 	import { fmtDuration } from '$lib/media-info';
 	import { TIMES } from '$lib/slider-row';
@@ -32,6 +34,7 @@
 		wordCount,
 		type VoiceoverPrefill
 	} from '$lib/voiceover';
+	import { tip } from '$lib/tip';
 
 	let { onClose, prefill = null }: { onClose: () => void; prefill?: VoiceoverPrefill | null } = $props();
 
@@ -107,7 +110,7 @@
 			onClose();
 		} catch (e) {
 			// A stop is the user's own doing — back to the form, no notice.
-			if (!isVoiceoverCancelled(e)) toast.error(e instanceof Error ? e.message : String(e));
+			if (!isVoiceoverCancelled(e)) toast.error(failure('Voiceover failed', e));
 		} finally {
 			unlisten();
 			generating = false;
@@ -133,7 +136,7 @@
 </script>
 
 <Modal
-	title="Voiceover"
+	title="Write a voiceover"
 	icon="mic"
 	width={560}
 	busy={generating}
@@ -210,10 +213,10 @@
 
 		<div style="display:flex;align-items:center;gap:5px;padding:4px 0">
 			<span style="{labelCss};width:90px;flex:none">Place</span>
-			<button type="button" style={chip(place === 'playhead')} onclick={() => (place = 'playhead')}>
+			<button type="button" style={chip(place === 'playhead')} aria-pressed={place === 'playhead'} onclick={() => (place = 'playhead')}>
 				At playhead ({fmtDuration(ui.time)})
 			</button>
-			<button type="button" style={chip(place === 'append')} onclick={() => (place = 'append')}>
+			<button type="button" style={chip(place === 'append')} aria-pressed={place === 'append'} onclick={() => (place = 'append')}>
 				Append to VO track
 			</button>
 		</div>
@@ -225,7 +228,13 @@
 			</label>
 			{#if caption}
 				{#each CAPTION_LOOKS as c (c.id)}
-					<button type="button" style={chip(captionStyle === c.id)} title={c.hint} onclick={() => (styleChoice = c.id)}>
+					<button
+						type="button"
+						style={chip(captionStyle === c.id)}
+						aria-pressed={captionStyle === c.id}
+						use:tip={c.hint}
+						onclick={() => (styleChoice = c.id)}
+					>
 						{c.label}
 					</button>
 				{/each}
@@ -249,11 +258,7 @@
 								<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)">{pct}%</span>
 							{/if}
 						</div>
-						<div style="height:6px;border-radius:3px;background:var(--surface-inset);overflow:hidden">
-							<div
-								style="height:100%;width:{pct ?? 30}%;background:var(--kerf-500);transition:width var(--dur-fast) linear"
-							></div>
-						</div>
+						<ProgressBar value={progress?.fraction ?? null} label="Generating the voiceover" />
 					</div>
 					<Btn variant="destructive" size="md" data-rescue disabled={cancelling} onclick={stop}>
 						{cancelling ? 'Stopping…' : 'Cancel'}
@@ -263,7 +268,7 @@
 				<div style="display:flex;align-items:center;gap:8px">
 					<div style="flex:1"></div>
 					<Btn variant="ghost" size="md" onclick={onClose}>Cancel</Btn>
-					<Btn variant="primary" size="md" icon="mic" data-rescue disabled={!canGenerate} onclick={generate}>Generate</Btn>
+					<Btn variant="primary" size="md" icon="mic" data-rescue disabled={!canGenerate} onclick={generate}>Generate voiceover</Btn>
 				</div>
 			{/if}
 		</div>

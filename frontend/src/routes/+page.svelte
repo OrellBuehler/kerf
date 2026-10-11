@@ -7,6 +7,7 @@
 	import ExportDialog from '$lib/components/editor/ExportDialog.svelte';
 	import SettingsDialog from '$lib/components/editor/SettingsDialog.svelte';
 	import UpdateDialog from '$lib/components/editor/UpdateDialog.svelte';
+	import AboutDialog from '$lib/components/editor/AboutDialog.svelte';
 	import VoiceoverDialog from '$lib/components/editor/VoiceoverDialog.svelte';
 	import FitMusicDialog from '$lib/components/editor/FitMusicDialog.svelte';
 	import StemsDialog from '$lib/components/editor/StemsDialog.svelte';
@@ -34,9 +35,10 @@
 	} from '$lib/ops';
 	import { allowsRepeat, type ActionId } from '$lib/keymap';
 	import { runMenuCommand } from '$lib/menu-commands';
-	import { saveCoverFrame } from '$lib/file-actions';
+	import { saveCoverFrame, saveProject } from '$lib/file-actions';
 	import { importCaptionFile } from '$lib/title-actions';
 	import {
+		askUnsaved,
 		inTauri,
 		isMediaPath,
 		confirmAction,
@@ -51,6 +53,8 @@
 	} from '$lib/api';
 	import { afterPaint, fontsReady, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
+	import { tip } from '$lib/tip';
+	import { CONFIRM, UNSAVED, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
 	import { changeIndex, changePoints, stepChange } from '$lib/staged-diff';
 	import { clampPlayhead, secondFrames, stepFrames } from '$lib/frames';
 	import { isPagingKey, onEditorSurface } from '$lib/focus-area';
@@ -63,6 +67,7 @@
 			settings.open ||
 			updater.dialogOpen ||
 			ui.voiceoverDialog !== null ||
+			ui.aboutDialog ||
 			ui.fitMusicDialog !== null ||
 			ui.stemsDialog !== null
 	);
@@ -127,7 +132,7 @@
 		// would drop it without a word, so ask first.
 		void onWindowCloseRequested(
 			() => editor.hasUnsavedWork,
-			() => confirmAction('This project has never been saved. Close Kerf and lose it?', 'Close Kerf')
+			() => proceedUnsaved(UNSAVED.close)
 		).then((un) => unlisteners.push(un));
 
 		// Each asset's preview proxy and per-kind analysis, kept current by the backend's events
@@ -245,10 +250,13 @@
 
 	/** New / Open replace the project; one that was never saved would be gone. */
 	async function okToReplace(): Promise<boolean> {
-		return (
-			!editor.hasUnsavedWork ||
-			confirmAction('This project has never been saved and will be lost. Continue?', 'Unsaved project')
-		);
+		return !editor.hasUnsavedWork || proceedUnsaved(UNSAVED.replace);
+	}
+
+	/** The unsaved-project prompt and what its answer means: whether to go ahead. "Save…" opens
+	 *  the save dialog and goes ahead only once the project is on disk. */
+	async function proceedUnsaved(copy: UnsavedCopy): Promise<boolean> {
+		return proceedAfter(await askUnsaved(copy), saveProject);
 	}
 
 	async function onNew() {
@@ -291,11 +299,7 @@
 			toast.info('Saving a project file is available in the desktop app.');
 			return;
 		}
-		try {
-			if (await editor.saveProjectAs()) toast.success(`Saved → ${editor.currentPath}`);
-		} catch (e) {
-			toast.error(e instanceof Error ? e.message : String(e));
-		}
+		await saveProject();
 	}
 
 	function onExport() {
@@ -310,7 +314,7 @@
 		}
 		await quitApp(
 			() => editor.hasUnsavedWork,
-			() => confirmAction('This project has never been saved. Quit Kerf and lose it?', 'Quit Kerf')
+			() => proceedUnsaved(UNSAVED.quit)
 		);
 	}
 
@@ -319,16 +323,13 @@
 	async function resetAllWorkspaces() {
 		const w = settings.workspaces;
 		const stored = Object.keys(w.layouts).length > 0 || Object.keys(w.library.tabs).length > 0;
-		if (stored && !(await confirmAction('Reset every workspace to its default arrangement? The arrangements you made are lost.', 'Reset all workspaces'))) {
-			return;
-		}
+		const reset = CONFIRM.resetWorkspaces;
+		if (stored && !(await confirmAction(reset.message, reset.title, reset))) return;
 		workspace.resetAll();
 	}
 
 	function onAbout() {
-		toast.info(`Kerf ${updater.version || ''}`.trim(), {
-			description: 'Non-destructive, AI-assisted video editing. PolyForm Noncommercial 1.0.0 — github.com/OrellBuehler/kerf'
-		});
+		ui.openAbout();
 	}
 
 	async function onImport() {
@@ -631,7 +632,7 @@
 					style="display:inline-flex;align-items:center;gap:4px;margin-left:6px;color:var(--text-secondary);font-size:11px"
 				>
 					<button
-						title={settings.withShortcut('Previous change', 'review.prevChange')}
+						use:tip={settings.tip('Previous change', 'review.prevChange')}
 						aria-label="Previous change"
 						disabled={reviewPoints.length === 0}
 						onclick={() => void stepReview(-1)}
@@ -641,11 +642,11 @@
 					<span
 						style="font-family:var(--font-mono);min-width:8ch;text-align:center"
 						aria-live="polite"
-						title="The proposal changes the cut at {reviewPoints.length} place{reviewPoints.length === 1 ? '' : 's'}; {editor.staged.diff.entries.length} change{editor.staged.diff.entries.length === 1 ? '' : 's'} in all"
+						use:tip={`The proposal changes the cut at ${reviewPoints.length} place${reviewPoints.length === 1 ? '' : 's'}; ${editor.staged.diff.entries.length} change${editor.staged.diff.entries.length === 1 ? '' : 's'} in all`}
 						>{reviewPoints.length > 0 ? `place ${changeIndex(reviewPoints, ui.time, editor.fps, editor.duration)}/${reviewPoints.length}` : 'no places'}</span
 					>
 					<button
-						title={settings.withShortcut('Next change', 'review.nextChange')}
+						use:tip={settings.tip('Next change', 'review.nextChange')}
 						aria-label="Next change"
 						disabled={reviewPoints.length === 0}
 						onclick={() => void stepReview(1)}
@@ -740,6 +741,10 @@
 
 {#if updater.dialogOpen}
 	<UpdateDialog />
+{/if}
+
+{#if ui.aboutDialog}
+	<AboutDialog onClose={() => ui.closeAbout()} />
 {/if}
 
 <ContextMenu />

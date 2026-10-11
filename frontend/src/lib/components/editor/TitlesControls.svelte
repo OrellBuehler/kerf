@@ -5,6 +5,7 @@
 	// Inspector's "Titles lane" section and of the library's Titles tab — one
 	// component, so the two cannot drift.
 	import Btn from './Btn.svelte';
+	import Icon from './Icon.svelte';
 	import { documentOf } from '$lib/realm';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
@@ -27,6 +28,7 @@
 	} from '$lib/caption-import-ui';
 	import { attempt } from '$lib/ops';
 	import { chip } from '$lib/chip';
+	import { tip } from '$lib/tip';
 
 	const uid = $props.id();
 	/** The options row: where its window (the panel may be in a detached one) is read from. */
@@ -115,7 +117,7 @@
 	{#each CAPTION_LOOKS as c (c.id)}
 		<button
 			style={chip(ui.captionStyle === c.id)}
-			title={c.hint}
+			use:tip={c.hint}
 			aria-pressed={ui.captionStyle === c.id}
 			onclick={() => (ui.captionStyle = c.id)}
 		>
@@ -138,7 +140,7 @@
 		<Btn size="sm" variant="ghost" disabled={editor.busy} title={clearHint(captionCount)} onclick={() => void dropCaptions()}>Clear</Btn>
 	{/if}
 	<Btn size="sm" variant="ghost" icon="mic" disabled={editor.busy} title="Speak a script onto the timeline" onclick={() => ui.openVoiceover()}
-		>Voiceover…</Btn
+		>Write a voiceover…</Btn
 	>
 	<Btn
 		id="{uid}-toggle"
@@ -259,8 +261,8 @@
 			>
 			<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">{tc(o.start)}</span>
 		</button>
-		<button onclick={() => void attempt(() => editor.removeOverlay(o.id))} disabled={editor.busy} title="Remove" aria-label="Remove" style={xBtn}
-			>×</button
+		<button onclick={() => void attempt(() => editor.removeOverlay(o.id))} disabled={editor.busy} use:tip={'Remove'} aria-label="Remove {o.text ? `“${o.text}”` : 'this title'}" style={xBtn}
+			><Icon n="x" s={14} /></button
 		>
 	</div>
 {/each}

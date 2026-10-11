@@ -681,7 +681,29 @@ so the feature is **only** activated through these forwards — which is what ma
   used to delete each other's script. Frames are **paced to the requested fps against the wall clock**, which
   throttles ffmpeg through pipe backpressure instead of letting it race ahead and
   buffer the whole timeline, and each carries its timeline time so the webview can
-  drop one the audio clock has already passed.
+  drop one the audio clock has already passed, and `late` (seconds behind its slot on
+  that schedule; 0 when early) so a caller can tell a hiccup from a stream that renders
+  slower than it plays — late grows frame by frame in the second case. **Rate and
+  width are `playback_params`** (pure, unit-tested; `stream_preview_with` takes a
+  `PlaybackRequest { fps, max_width }`, `stream_preview` is a stated rate at the default
+  width): an unstated rate is **the cut's own** — `export_format` of `for_render()`, so a
+  muted track's footage does not set it — clamped to `MIN_STREAM_FPS..=MAX_STREAM_FPS`
+  (1..60: a display paints no more), and a stated one is clamped the same, a NaN /
+  zero / negative one counting as unstated; an unstated width is 960
+  (`PREVIEW_STREAM_WIDTH`), a stated one is clamped to 64..=1920 (the frame tools' own
+  cap), and `preview_resolution` still never renders wider than the footage. The preview
+  asks for its pane's width (`preview-size.ts`) so a playing frame is as sharp as the paused
+  one. Neither moves a golden: the builders take them as arguments. **A stream that cannot
+  keep up is restarted cheaper by the page, not caught up by the engine** — see
+  `frontend.md`: ffmpeg has no wall clock, so frames dropped after it rendered them save
+  nothing, and a stream at 50 of 60 fps is a sixth of a second further behind per second.
+  Measured here (4 shared cores, no GPU, ffmpeg 6.1, a 1280x720 all-intra proxy, JPEG q6, 3
+  threads): unpaced, one clip renders ~200 fps at 960 px (~12 ms CPU a frame), 160 at 1440, 80 at
+  1920; three layers 130 / 85 / 45. Paced at the cut's rate it delivers 24.1 / 30.1 / 60.1 fps with a
+  p99 lateness under 6 ms, for 0.40 / 0.43 / 0.68 cores (one layer, 1280 px) and 0.56 / 0.65 / 1.07
+  (three layers) — 60 fps costs about 1.7x the CPU of the 24 it used to be for 2.5x the frames. On
+  one pinned core at a 25% budget, 3 layers at 60 fps hold at 960 px (0.89 of the core) and not at
+  1280 (~50 fps) or 1920 (25), which is the overload the page steps down from.
   **Phone and camera footage** needs two things the container says rather than
   the pixels. *Rotation*: an iPhone portrait clip is a landscape frame plus a
   `Display Matrix`, and every FFmpeg decode autorotates it (nothing here passes

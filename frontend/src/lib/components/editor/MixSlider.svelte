@@ -14,6 +14,7 @@
 	import { windowOf } from '$lib/realm';
 	import { windows } from '$lib/windows.svelte';
 	import { grabOffset, KEY_COMMIT_MS, moved, positionAt, sliderKey, type SliderKey } from '$lib/slider-gesture';
+	import { tip as tooltip } from '$lib/tip';
 
 	let {
 		orientation = 'vertical',
@@ -240,7 +241,7 @@
 	aria-valuenow={Number(pos.toFixed(3))}
 	aria-valuetext={valueText(value)}
 	aria-disabled={disabled}
-	title={tip}
+	use:tooltip={tip}
 	{onpointerdown}
 	{onpointermove}
 	onpointerup={end}

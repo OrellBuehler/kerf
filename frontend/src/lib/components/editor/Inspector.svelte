@@ -42,6 +42,7 @@
 	import { fitOffer, musicSummary } from '$lib/music-ui';
 	import { DEGREES, NUMBER_COL, PERCENT, SECONDS, TIMES, readout, type RowSpec } from '$lib/slider-row';
 	import { FieldEdits } from '$lib/field-edit';
+	import { tip } from '$lib/tip';
 
 	const clip = $derived(editor.selectedClip);
 	/** What a number row is editing: the clip or title and the playhead, as they are when an edit
@@ -533,7 +534,7 @@
 					<input
 						type="text"
 						value={v}
-						title={k}
+						use:tip={k}
 						disabled={editor.busy}
 						onfocus={noteFocus}
 						oninput={noteTyped}
@@ -548,7 +549,7 @@
 					<input
 						type="number"
 						value={v as number}
-						title={k}
+						use:tip={k}
 						step="0.1"
 						disabled={editor.busy}
 						onfocus={noteFocus}
@@ -563,7 +564,7 @@
 					/>
 				{/if}
 			{/each}
-			<button onclick={() => onRemove(i)} disabled={editor.busy} title="Remove" style={xBtn}>×</button>
+			<button onclick={() => onRemove(i)} disabled={editor.busy} use:tip={'Remove'} aria-label="Remove {String(e.type).replace('_', ' ')}" style={xBtn}><Icon n="x" s={14} /></button>
 		</div>
 	{/each}
 	<select
@@ -598,7 +599,7 @@
 		<div style="flex:1;min-width:0">
 			<div
 				style="font-size:13px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-				title={o.text}
+				use:tip={o.text}
 			>
 				{o.text || '(empty)'}
 			</div>
@@ -700,7 +701,7 @@
 					<span style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 						>({k.pos_x.toFixed(2)},{k.pos_y.toFixed(2)}) · {Math.round(k.opacity * 100)}%</span
 					>
-					<button onclick={() => removeOverlayKeyframe(o, i)} disabled={editor.busy} title="Remove" style={xBtn}>×</button>
+					<button onclick={() => removeOverlayKeyframe(o, i)} disabled={editor.busy} use:tip={'Remove'} aria-label="Remove keyframe at {k.time.toFixed(2)}s" style={xBtn}><Icon n="x" s={14} /></button>
 				</div>
 			{/each}
 			<Btn
@@ -772,14 +773,14 @@
 				<div style="flex:1;min-width:0">
 					<div
 						style="font-size:13px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-						title={asset?.name ?? 'clip'}
+						use:tip={asset?.name ?? 'clip'}
 					>
 						{asset?.name ?? 'clip'}
 					</div>
 					<div style="margin-top:3px;display:flex;align-items:center;gap:5px;flex-wrap:wrap">
 						<Badge tone="neutral">{track?.name ?? (picture ? 'video' : 'audio')}</Badge>
 						{#if linkedTo.length > 0}
-							<span title={linkInfo?.title}>
+							<span use:tip={linkInfo?.title}>
 								<Badge tone="neutral"><Icon n="link" s={10} />Linked to {linkedTo.join(', ')}</Badge>
 							</span>
 						{/if}
@@ -848,7 +849,7 @@
 					<button
 						style={chip(false)}
 						disabled={editor.busy || musicOffer.reason !== null}
-						title="Make this music last as long as the picture, repeating or dropping whole phrases"
+						use:tip={'Make this music last as long as the picture, repeating or dropping whole phrases'}
 						onclick={() => ui.openFitMusic(clip.id)}>Fit to video…</button
 					>
 				</div>
@@ -923,8 +924,8 @@
 								>Clear {reframeKeys.length} key{reframeKeys.length === 1 ? '' : 's'}</Btn
 							>
 						{/if}
-						<button style={xBtn} title="Stop reframing" disabled={editor.busy}
-							onclick={() => run(() => editor.clearReframe(clip.id))}>×</button
+						<button style={xBtn} use:tip={'Stop reframing'} aria-label="Stop reframing" disabled={editor.busy}
+							onclick={() => run(() => editor.clearReframe(clip.id))}><Icon n="x" s={14} /></button
 						>
 					</div>
 				{:else if sourceProjection}
@@ -989,7 +990,7 @@
 					<button
 						style={chip(false)}
 						disabled={editor.busy || !reframable}
-						title="Sample where this shot's content is and crop to the delivery frame around it"
+						use:tip={"Sample where this shot's content is and crop to the delivery frame around it"}
 						onclick={() =>
 							runUndoable('Framed for the delivery frame', () => editor.smartCrop(clip.id))}
 						>Smart crop</button
@@ -997,7 +998,7 @@
 					<button
 						style={chip(false)}
 						disabled={editor.busy || !hasCrop}
-						title="Clear the crop"
+						use:tip={'Clear the crop'}
 						onclick={() =>
 							run(() =>
 								editor.setTransform(clip.id, {
@@ -1025,7 +1026,7 @@
 				<InspectorSection title="Color" summary={activeLook(col)?.label ?? 'Custom'}>
 				<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:6px">
 					{#each COLOR_LOOKS as look (look.id)}
-						<button
+						<button aria-pressed={activeLook(col)?.id === look.id}
 							style={chip(activeLook(col)?.id === look.id)}
 							disabled={editor.busy}
 							onclick={() => setCol(look.color)}>{look.label}</button
@@ -1034,7 +1035,7 @@
 					<button
 						style={chip(false)}
 						disabled={editor.busy}
-						title="Reset color"
+						use:tip={'Reset color'}
 						onclick={() => setCol(DEFAULT_COLOR)}>Reset</button
 					>
 				</div>
@@ -1047,22 +1048,22 @@
 
 			<InspectorSection title="Mask" summary={mask ? (mask.shape === 'rect' ? 'Rectangle' : 'Ellipse') : 'None'}>
 			<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
-				<button
+				<button aria-pressed={!mask}
 					style={chip(!mask)}
 					disabled={editor.busy}
-					title="No mask — the whole frame"
+					use:tip={'No mask — the whole frame'}
 					onclick={() => run(() => editor.setMask(clip.id, null))}>None</button
 				>
-				<button
+				<button aria-pressed={mask?.shape === 'rect'}
 					style={chip(mask?.shape === 'rect')}
 					disabled={editor.busy}
-					title="Cut this clip to a rectangle"
+					use:tip={'Cut this clip to a rectangle'}
 					onclick={() => patchMask({ shape: 'rect' })}>Rectangle</button
 				>
-				<button
+				<button aria-pressed={mask?.shape === 'ellipse'}
 					style={chip(mask?.shape === 'ellipse')}
 					disabled={editor.busy}
-					title="Cut this clip to an ellipse"
+					use:tip={'Cut this clip to an ellipse'}
 					onclick={() => patchMask({ shape: 'ellipse' })}>Ellipse</button
 				>
 			</div>
@@ -1161,7 +1162,7 @@
 									<select
 										value={current}
 										disabled={editor.busy}
-										title="How the clip moves from this keyframe to the next"
+										use:tip={'How the clip moves from this keyframe to the next'}
 										aria-label={`Easing after the keyframe at ${k.time.toFixed(2)} seconds`}
 										onchange={(e) => setEasing(k, e.currentTarget.value)}
 										style={selectCss + ';flex:none;width:96px'}
@@ -1174,7 +1175,7 @@
 										{/if}
 									</select>
 								{/if}
-								<button onclick={() => removeKeyframe(i)} disabled={editor.busy} title="Remove" style={xBtn}>×</button>
+								<button onclick={() => removeKeyframe(i)} disabled={editor.busy} use:tip={'Remove'} aria-label="Remove keyframe {i + 1}" style={xBtn}><Icon n="x" s={14} /></button>
 							</div>
 						{/each}
 						<div style="font-size:12px;color:var(--text-muted);margin-top:4px;line-height:1.4">

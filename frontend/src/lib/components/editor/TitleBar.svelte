@@ -10,6 +10,7 @@
 	import { settings } from '$lib/settings.svelte';
 	import type { ActionId } from '$lib/keymap';
 	import type { MenuCommand } from '$lib/menus';
+	import { tip } from '$lib/tip';
 
 	let { onAction, onCommand }: { onAction: (id: ActionId) => void; onCommand: (command: MenuCommand) => void } = $props();
 
@@ -42,13 +43,13 @@
 		     when the window is narrow. -->
 		<div style="min-width:0;flex:0 1 auto;display:flex;align-items:center;gap:8px;overflow:hidden">
 			<span
-				title={editor.currentPath ?? 'In-memory project — not yet saved'}
+				use:tip={editor.currentPath ?? 'In-memory project — not yet saved'}
 				style="min-width:0;font:var(--type-label);color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 				>{editor.projectName}</span
 			>
 			{#if editor.saved}
 				<Badge tone="success" dot>Saved</Badge>
-			{:else}
+			{:else if editor.hasUnsavedWork}
 				<Badge tone="warning" dot>Unsaved</Badge>
 			{/if}
 		</div>
@@ -57,9 +58,9 @@
 			data-on={settings.open ? '' : undefined}
 			data-on-ink="primary"
 			onclick={() => settings.toggle()}
-			title={settings.withShortcut('Settings — performance, appearance and keyboard shortcuts', 'app.settings')}
+			use:tip={settings.tip('Settings', 'app.settings', 'Performance, appearance and keyboard shortcuts')}
 			aria-label="Settings"
-			style="-webkit-app-region:no-drag;width:26px;height:22px"
+			style="-webkit-app-region:no-drag;width:28px;height:28px"
 		>
 			<Icon n="settings" s={13} color="currentColor" />
 		</button>
@@ -71,11 +72,11 @@
 			data-on={notifications.open ? '' : undefined}
 			data-on-ink="primary"
 			onclick={() => notifications.toggle()}
-			title={notifications.unread
+			use:tip={notifications.unread
 				? `${notifications.unread} unread notification${notifications.unread === 1 ? '' : 's'}`
 				: 'Notifications'}
-			aria-label="Notifications"
-			style="-webkit-app-region:no-drag;position:relative;width:26px;height:22px"
+			aria-label={notifications.unread ? `Notifications, ${notifications.unread} unread` : 'Notifications'}
+			style="-webkit-app-region:no-drag;position:relative;width:28px;height:28px"
 		>
 			<Icon n="bell" s={13} color="currentColor" />
 			{#if notifications.unread}
@@ -90,10 +91,10 @@
 			class="k-ibtn"
 			data-accent={available ? '' : undefined}
 			onclick={() => updater.open()}
-			title={available
+			use:tip={available
 				? `Kerf ${updater.update?.version} is available — click to install`
 				: `Kerf ${updater.version} — click to check for updates`}
-			style="-webkit-app-region:no-drag;gap:5px;padding:2px 8px;border-radius:999px;font-family:var(--font-mono);font-size:var(--text-xs)"
+			style="-webkit-app-region:no-drag;gap:5px;height:28px;padding:0 10px;border-radius:999px;font-family:var(--font-mono);font-size:var(--text-xs)"
 		>
 			{#if available}
 				<Icon n="download" s={12} />

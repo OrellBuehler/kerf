@@ -10,6 +10,7 @@
 	import { platformCheck } from '$lib/api';
 	import { VARIANT_PRESETS, formatsFor, variantPath } from '$lib/delivery-formats';
 	import type { Delivery, DeliveryCheck } from '$lib/types';
+	import { tip } from '$lib/tip';
 
 	/** `where` finishes "One file per shape, …": the dialog has a destination
 	 *  field of its own to point at, the Deliver panel does not. */
@@ -55,7 +56,7 @@
 	{#each VARIANT_PRESETS as p (p.id)}
 		{@const on = ui.deliverShapes.includes(p.id)}
 		<button
-			title={p.hint}
+			use:tip={p.hint}
 			aria-pressed={on}
 			onclick={() => ui.toggleDeliverShape(p.id)}
 			style="padding:5px 10px;border-radius:999px;font-size:12px;cursor:pointer;white-space:nowrap;border:var(--line-width) solid {on
