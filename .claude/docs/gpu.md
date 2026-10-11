@@ -565,7 +565,7 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   in AVX2 / AVX-512 with another association of the same sums and an FMA, so its answer depends on the CPU by the last bits of a `float`, which `lrintf`
   turns into a level where a value sits on a half. Measured on 9.0.2: 0 to 59 samples in 3.2 million a level off, none more.
 * Refused (`Effects`): a vignette (its dither is an LCG counter that runs on across frames), a chroma key (a float colour distance), a sigma outside 0 to 1024
-  or an amount outside -2 to 5 (FFmpeg's options refuse them too), a blur over the device's storage-buffer limit. `Matte`: a blur or a sharpen on a
+  or an amount outside -2 to 5 (FFmpeg's options refuse them too), a blur over the device's storage-buffer limit, and (judged with the geometry, so by render size) a sharpen of more than 0.5 either way on a picture scaled ahead of it: every scale stage before the effects, or the fit scale when a zoom comes last, with or without a blur beside it. Unscaled it is drawn at any amount. `Matte`: a blur or a sharpen on a
   letterbox (they would see the bars as picture; tables and a grade carry the bars through). By the picture (`effect_on_picture_refusal`): an invert,
   blur or sharpen on a **full-range** picture or one whose format was never recorded (`maybe_full_range_in(policy)`: where FFmpeg 9 negotiates the range this
   holds a deeper-than-8-bit one too, which may carry a `pc` tag; FFmpeg runs the filter on the raw values and converts the range afterwards: an invert is 8
@@ -599,8 +599,9 @@ a dissolve, dip, slide or push into a zooming clip and out of one) hold the boun
 | 0 | a mask at the picture's size (20 of 27 mask rows), grayscale, invert, sharpen at the picture's size | integer arithmetic, reproduced |
 | 1 (`SCALED`) | a layer the compositor scales, a mask on it, a one-stage zoom | swscale's x86 scaler is not bit-exact with the C arithmetic the shader follows |
 | 1 (`EFFECT`) | a blur at the picture's size | `gblur`'s SIMD summation order (above) |
-| 2 | `EFFECT_SCALED`: a blur on a scaled or translucent layer. `CASCADED`: a zoom (the fit scale, then the zoom's). `ZOOMED_MASK`: a soft mask edge on a zoomed picture. Rotated, graded and scaled, dip to white (Y three on BT.709, `WHITE_709`) | two of the causes above on one sample; the RGB kernel for white |
-| luma `1 + 2 * amount`, UV 2 | a sharpen after a scale (`sharpened`): 3 measured at amount 1.5 after a blur, 7 at 3, 11 at 5 | `unsharp` is exact; it amplifies the scaler's level (the sample a level off one way, its neighbours the other) |
+| 2 | `EFFECT_SCALED`: a blur, grayscale or invert, or a sharpen of at most 0.5, on a scaled or translucent layer. `CASCADED`: a zoom (the fit scale, then the zoom's). `ZOOMED_MASK`: a soft mask edge on a zoomed picture. Rotated, graded and scaled, dip to white (Y three on BT.709, `WHITE_709`) | two of the causes above on one sample; the RGB kernel for white |
+
+A **sharpen after a scale has no row: it is refused above half strength.** `unsharp` is exact, but it amplifies the scaler's one-level difference to `1 + 2 * amount` levels of luma at an edge sample (measured on a pip: 3 at 1.5 after a blur, 7 at 3, 11 at 5), and the GPU refuses rather than approximates; up to 0.5 that is the two levels of a scaled blur.
 
 **`tests/parity.rs`** (`#[ignore]`d; CI job `parity`, a **matrix of the distro FFmpeg and
 the pinned one** — the two compose colour differently, so a green run on one proves

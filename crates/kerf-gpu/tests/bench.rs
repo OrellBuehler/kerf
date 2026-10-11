@@ -547,8 +547,8 @@ fn bench_a_mask_a_blur_and_a_moving_zoom() {
             Box::new(|c| c.effects = vec![VideoEffect::Blur { sigma: 6.0 }]),
         ),
         (
-            "sharpen 1.5",
-            Box::new(|c| c.effects = vec![VideoEffect::Sharpen { amount: 1.5 }]),
+            "sharpen 0.5",
+            Box::new(|c| c.effects = vec![VideoEffect::Sharpen { amount: 0.5 }]),
         ),
         (
             "moving zoom 1 -> 1.25",

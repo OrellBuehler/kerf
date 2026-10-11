@@ -4427,7 +4427,8 @@ fn effects_are_drawn_as_their_filters_draw_them() {
     ] {
         let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
         edit(&mut c);
-        c.effects = vec![E::Blur { sigma: 3.0 }, E::Sharpen { amount: 1.0 }];
+        // (A sharpen after a scale is drawn to half strength: past it the scaler's level is amplified.)
+        c.effects = vec![E::Blur { sigma: 3.0 }, E::Sharpen { amount: 0.5 }];
         let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
         let limits = if name == "rotated" { ROTATED } else { STRICT };
         check(
@@ -4436,6 +4437,27 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             &[m.bars.clone(), m.testsrc.clone()],
             &[0.5],
             limits,
+        );
+    }
+    // A sharpen past half strength on a picture scaled ahead of it is FFmpeg's, with or without a blur.
+    for (name, effects) in [
+        ("sharpen-1.5", vec![E::Sharpen { amount: 1.5 }]),
+        ("sharpen-5", vec![E::Sharpen { amount: 5.0 }]),
+        (
+            "blur-then-sharpen-1.5",
+            vec![E::Blur { sigma: 3.0 }, E::Sharpen { amount: 1.5 }],
+        ),
+    ] {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.transform.scale = 0.6;
+        c.effects = effects;
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
+        check_refused(
+            &format!("refused/effect-{name}-after-a-scale"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            0.5,
+            Refusal::Plan("sharpen above 0.5"),
         );
     }
     // A table on a letterbox: the bars are part of the frame `pad` hands the effect, so they go through it.
