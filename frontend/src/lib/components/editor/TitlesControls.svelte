@@ -123,7 +123,7 @@
 			{hasCaptions ? 'Recaption' : 'Captions'}
 		</Btn>
 		{#if hasCaptions}
-			<IconBtn size={30} title={clearHint(captionCount)} disabled={editor.busy} onclick={() => void dropCaptions()}>
+			<IconBtn size={28} title={clearHint(captionCount)} disabled={editor.busy} onclick={() => void dropCaptions()}>
 				<Icon n="trash" s={14} />
 			</IconBtn>
 		{/if}

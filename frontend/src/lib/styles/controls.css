@@ -94,6 +94,11 @@
 	--k-fill-hover: var(--danger-surface);
 	--k-fill-press: color-mix(in srgb, var(--red-500) 22%, transparent);
 }
+/* A removal that is not the page's main act (Remove clip in the Inspector): the red is the ink, and the edge is
+   the neutral one, so a row of controls is not outlined in alarm. `data-quiet` on a destructive `Btn`. */
+.k-btn[data-variant='destructive'][data-quiet] {
+	--k-edge: var(--border-strong);
+}
 .k-btn:hover:not(:disabled) {
 	background: var(--k-fill-hover, var(--k-fill));
 	border-color: var(--k-edge-hover, var(--k-edge));

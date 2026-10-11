@@ -123,13 +123,18 @@
 	color: var(--agent-fg);
 }
 
-/* A tab's close X shows when the pointer is on the tab (or something in it has focus), not on the one showing
-   all the time: Preview, Timeline and Library were one mis-click from gone, and each one's way back is the
-   Window menu. Right-click on a tab still offers Close. */
+/* A tab's close X shows when the pointer is on the tab or keyboard focus is (`:focus-visible`: a click on a tab
+   must not light it), not on the one showing all the time: Preview, Timeline and Library were one mis-click from
+   gone, and each one's way back is the Window menu. Right-click on a tab still offers Close. It is dimmed to
+   nothing rather than hidden, so it stays in the accessibility tree, and it takes no pointer until it shows: a tap
+   on the right edge of a tab must not close it unseen. */
 .dockview-theme-kerf .dv-tab .dv-default-tab .dv-default-tab-action {
-	visibility: hidden;
+	opacity: 0;
+	pointer-events: none;
 }
 .dockview-theme-kerf .dv-tab:hover .dv-default-tab .dv-default-tab-action,
-.dockview-theme-kerf .dv-tab:focus-within .dv-default-tab .dv-default-tab-action {
-	visibility: visible;
+.dockview-theme-kerf .dv-tab:focus-visible .dv-default-tab .dv-default-tab-action,
+.dockview-theme-kerf .dv-tab:has(:focus-visible) .dv-default-tab .dv-default-tab-action {
+	opacity: 1;
+	pointer-events: auto;
 }

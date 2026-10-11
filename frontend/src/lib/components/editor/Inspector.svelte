@@ -765,6 +765,7 @@
 	<div style="margin-top:18px">
 		<Btn
 			variant="destructive"
+			data-quiet
 			size="sm"
 			icon="trash"
 			iconSize={13}
@@ -1231,6 +1232,7 @@
 				<div style="margin-top:18px;display:grid;grid-template-columns:1fr 1fr;gap:6px">
 				<Btn
 					variant="destructive"
+					data-quiet
 					size="sm"
 					icon="trash"
 					iconSize={13}

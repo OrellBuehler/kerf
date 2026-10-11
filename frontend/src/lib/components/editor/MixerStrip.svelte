@@ -142,7 +142,7 @@
 				use:tip={strip.duck
 					? 'Ducking on — this track dips under the rest of the mix when you export. The preview plays it at its fader.'
 					: 'Duck this track under the rest of the mix. Applied on export only: the preview plays it at its fader.'}
-				onclick={() => void editor.setTrackDuck(strip.id, !strip.duck).catch(err)}>D</button
+				onclick={() => void editor.setTrackDuck(strip.id, !strip.duck).catch(err)}>DUCK</button
 			>
 		{/if}
 	</div>
@@ -193,7 +193,7 @@
 <style>
 	.strip {
 		flex: none;
-		width: 92px;
+		width: 100px;
 		display: flex;
 		flex-direction: column;
 		gap: 5px;
@@ -257,6 +257,12 @@
 	}
 	.tog:hover {
 		color: var(--text-primary);
+	}
+	/* Duck is spelled out, as it is in the timeline's track header: M and S are the narrow ones. */
+	.tog.duck {
+		flex: 2.1;
+		font-size: var(--text-xs);
+		letter-spacing: 0.02em;
 	}
 	.tog.on.mute {
 		color: var(--red-400);

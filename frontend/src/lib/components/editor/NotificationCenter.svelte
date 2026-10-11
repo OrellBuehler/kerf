@@ -1,6 +1,8 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
 	import EmptyState from './EmptyState.svelte';
+	import Btn from './Btn.svelte';
+	import Chip from './Chip.svelte';
 	import { windows } from '$lib/windows.svelte';
 	import { documentOf } from '$lib/realm';
 	import { notifications, type Notice } from '$lib/notifications.svelte';
@@ -86,38 +88,23 @@
 				>
 			{/if}
 			<div style="flex:1"></div>
-			<button
-				onclick={() => notifications.markAllRead()}
+			<Btn
+				size="sm"
 				disabled={notifications.unread === 0}
-				use:tip={'Mark every notification as read'}
-				style="height:22px;padding:0 8px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:{notifications.unread
-					? 'var(--text-secondary)'
-					: 'var(--text-disabled)'};font-size:11px;opacity:1;cursor:{notifications.unread ? 'pointer' : 'default'}"
-				>Mark all read</button
+				title="Mark every notification as read"
+				onclick={() => notifications.markAllRead()}>Mark all read</Btn
 			>
-			<button
-				onclick={() => notifications.clear()}
+			<Btn
+				size="sm"
 				disabled={notifications.items.length === 0}
-				use:tip={'Clear the log'}
-				style="height:22px;padding:0 8px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:{notifications
-					.items.length
-					? 'var(--text-secondary)'
-					: 'var(--text-disabled)'};font-size:11px;opacity:1;cursor:{notifications.items.length ? 'pointer' : 'default'}"
-				>Clear</button
+				title="Clear the log"
+				onclick={() => notifications.clear()}>Clear</Btn
 			>
 		</div>
 
-		<div style="flex:none;display:flex;gap:5px;padding:8px 12px;border-bottom:var(--line-width) solid var(--border-subtle)">
+		<div role="group" aria-label="Show" style="flex:none;display:flex;gap:5px;padding:8px 12px;border-bottom:var(--line-width) solid var(--border-subtle)">
 			{#each [['all', 'All'], ['unread', 'Unread'], ['errors', 'Problems']] as const as [k, label] (k)}
-				<button
-					onclick={() => (filter = k)}
-					style="height:22px;padding:0 9px;border-radius:var(--radius-sm);font-size:11px;cursor:pointer;border:var(--line-width) solid {filter ===
-					k
-						? 'var(--border-strong)'
-						: 'transparent'};background:{filter === k ? 'var(--surface-active)' : 'transparent'};color:{filter === k
-						? 'var(--text-primary)'
-						: 'var(--text-secondary)'}">{label}</button
-				>
+				<Chip pressed={filter === k} onclick={() => (filter = k)}>{label}</Chip>
 			{/each}
 		</div>
 
