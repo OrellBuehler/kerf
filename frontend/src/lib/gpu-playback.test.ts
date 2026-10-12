@@ -6,7 +6,8 @@ import {
 	Median,
 	OVERLOAD_AFTER,
 	frameIndex,
-	pictureTime
+	pictureTime,
+	playStart
 } from './gpu-playback';
 import { MAX_OUTPUT_LATENCY } from './output-latency';
 import type { PlayAhead, PlayInfo, PreviewFrameResult } from './types';
@@ -229,6 +230,32 @@ describe('a play from a playhead', () => {
 		expect(p.next(5, 0)).toEqual({ time: 5, frame: 150 });
 		p.answer(drew(), 0, 5);
 		expect(p.next(5.1, 0)?.time).toBeCloseTo(5.1, 9);
+	});
+});
+
+describe('where a play session is held', () => {
+	test('from rest it is the playhead, and in a running play that is rebuilt it is the picture that is audible', () => {
+		expect(playStart(30, 0.2, false)).toBe(30);
+		expect(playStart(30, 0.2, true)).toBeCloseTo(29.8, 9);
+		expect(playStart(0.1, 0.2, true)).toBe(0);
+		expect(playStart(30, Number.NaN, true)).toBe(30);
+		expect(playStart(30, 9, true)).toBeCloseTo(30 - MAX_OUTPUT_LATENCY, 9);
+		// Rebuilt mid-play, the first request is the audible frame, not one the sound is still L short of.
+		const p = new GpuPlayback(30, playStart(30, 0.2, true));
+		expect(p.next(30, 0.2)?.time).toBeCloseTo(29.8, 9);
+	});
+
+	test('what the takeover reads the clock less is the latency, once a frame was drawn and not before the start', () => {
+		const p = new GpuPlayback(30, 5);
+		p.next(5, 0.3);
+		// A session the GPU declined drew nothing for a stream to carry on from: the clock as it is.
+		expect(p.offsetAt(5.1)).toBe(0);
+		p.answer(drew(), 0.02, 5);
+		// Held at the playhead the play began at until the sound gets there.
+		expect(p.offsetAt(5.1)).toBeCloseTo(0.1, 9);
+		expect(p.offsetAt(5.3)).toBeCloseTo(0.3, 9);
+		expect(p.offsetAt(9)).toBeCloseTo(0.3, 9);
+		expect(p.offsetAt(4)).toBe(0);
 	});
 });
 

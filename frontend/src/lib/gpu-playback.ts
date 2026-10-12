@@ -76,6 +76,18 @@ export function frameIndex(t: number, fps: number): number {
 	return Math.floor(Math.max(0, t) * fps + 1e-6);
 }
 
+/**
+ * The playhead a GPU play session is held at until the audible time reaches it. From rest (Play pressed on a
+ * paused frame, a seek) that is the playhead: the picture on the screen is there and the sound of it is
+ * heard `outputLatency` later. When a running play is rebuilt (an edit, a resize: the effect ran again) the
+ * picture on the screen is the audible one already, so the session is held at that and not ahead of it.
+ */
+export function playStart(playhead: number, outputLatency: number, running: boolean): number {
+	if (!running) return playhead;
+	const heard = Math.min(MAX_OUTPUT_LATENCY, Math.max(0, Number.isFinite(outputLatency) ? outputLatency : 0));
+	return Math.max(0, playhead - heard);
+}
+
 /** What an answer means for the page. */
 export type PlayVerdict =
 	/** Draw nothing over the surface: the GPU drew a new frame. */
@@ -134,6 +146,16 @@ export class GpuPlayback {
 	/** The output latency of the sound the picture is held to, seconds (0 before any is read). */
 	get latency(): number {
 		return Math.min(MAX_OUTPUT_LATENCY, Math.max(0, this.heard.value ?? 0));
+	}
+
+	/**
+	 * What the clock is read less to be the time the picture on the screen is: the latency, but not before the
+	 * playhead the play started from (the picture is held there until the sound gets to it), and nothing at all
+	 * until a frame was drawn — a session the GPU declined has drawn nothing for a stream to carry on from.
+	 */
+	offsetAt(clock: number): number {
+		if (this.drawn === 0) return 0;
+		return Math.max(0, Math.min(this.latency, clock - this.from));
 	}
 
 	/** The smoothed round trip of the requests that drew a frame, seconds (0 before any). */
@@ -233,7 +255,7 @@ export class GpuPlayback {
 	handoverDue(clock: number, startup: number = DEFAULT_STARTUP): PlayAhead | null {
 		if (this.over || this.handing || !this.ahead) return null;
 		// In the time that is heard, which the GPU's picture and the stream that takes over from it are in.
-		return clock - this.latency >= this.ahead.handover - Math.max(0, startup) ? this.ahead : null;
+		return clock - this.offsetAt(clock) >= this.ahead.handover - Math.max(0, startup) ? this.ahead : null;
 	}
 
 	/** The stream has been started to take the session over (see {@link GpuPlayback.handOver}). */

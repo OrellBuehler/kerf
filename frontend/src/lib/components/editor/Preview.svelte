@@ -35,8 +35,8 @@
 	import { RESIZE_SETTLE_MS, capToSource, dprQuery, requestWidth } from '$lib/preview-size';
 	import type { PlayAhead, PreviewBoundsReport } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
-	import { createFrameGate, createLadder, playbackFps } from '$lib/playback-sync';
-	import { GpuPlayback } from '$lib/gpu-playback';
+	import { createFrameGate, createLadder, playbackFps, takeoverAhead } from '$lib/playback-sync';
+	import { GpuPlayback, playStart } from '$lib/gpu-playback';
 	import { audio } from '$lib/audio';
 	import { CANVAS_PAINTER, createStreamPainter, jpegDataUrl } from '$lib/frame-transport';
 	import { decodeJpeg, paintPicture } from '$lib/frame-canvas';
@@ -196,6 +196,10 @@
 	/** The output latency the stream that took a GPU session over reads the clock less (the audible time the GPU
 	 *  drew in), for the restarts of that stream in the same play; 0 for a stream that never was one. */
 	let takeoverLatency = 0;
+	/** A play was going when the playback effect last ran, and the seek epoch it ran at: an edit or a resize re-runs
+	 *  the effect mid-play (its GPU session is rebuilt from the audible picture), a seek or a Play from rest does not. */
+	let playRunning = false;
+	let playSeekEpoch = -1;
 
 	// Every seek or edit restarts the stream, so a timeline that cannot render
 	// would raise the same failure on each restart; say it once per spell.
@@ -231,9 +235,12 @@
 			'playback'
 		);
 		gpuBarred = { seek: ui.seekEpoch, timeline: editor.timeline };
+		// What the stream is told about where the GPU stops: an at-once hand-over has no use for a refusal that
+		// is still ahead (the pane would hold the GPU's last picture until the stream got there).
+		const stops = takeoverAhead(ahead, now, ui.time - pb.offsetAt(ui.time), pb.roundTrip, playFps);
 		if (now) pb.end();
 		pb.handOver();
-		beginStream(ahead, true);
+		beginStream(stops, true);
 	}
 
 	$effect(() => {
@@ -252,12 +259,18 @@
 		if (!play || !hasClips) {
 			endStream();
 			takeoverLatency = 0;
+			playRunning = false;
 			return;
 		}
+		const midPlay = untrack(() => playRunning && playSeekEpoch === ui.seekEpoch);
+		playRunning = true;
+		playSeekEpoch = untrack(() => ui.seekEpoch);
 		// Whether the GPU plays this session is decided here, once: the route as it is now (the setting, a
 		// surface, nothing over the frame that the surface cannot show) and no earlier give-up of this play.
 		const gpu = untrack(() => {
 			const barred = gpuBarred !== null && gpuBarred.seek === ui.seekEpoch && gpuBarred.timeline === timeline;
+			// A stream that is not the continuation of a takeover of this play reads the clock as it always did.
+			if (!barred) takeoverLatency = 0;
 			return settings.gpuPreview && route.via === 'gpu' && !barred;
 		});
 		let active = true;
@@ -280,8 +293,8 @@
 						width: frameWidth,
 						playhead: ui.time,
 						duration: renderedDuration(editor.timeline),
-						latency: takeover ? (gpuPlay?.latency ?? 0) : takeoverLatency,
-						earliest: takeover ? (handover?.handover ?? null) : null
+						latency: takeover ? (gpuPlay?.offsetAt(ui.time) ?? 0) : takeoverLatency,
+						ahead: takeover ? handover : null
 					}
 				)
 			);
@@ -386,8 +399,10 @@
 		if (gpu) {
 			// The pump takes it from here: its first request decides, and a `stream` answer comes back as `handOverToStream`.
 			playFps = untrack(() => playbackFps(renderedFps(editor.timeline, editor.assets)));
-			takeoverLatency = 0;
-			gpuPlay = new GpuPlayback(playFps, untrack(() => ui.time));
+			gpuPlay = new GpuPlayback(
+				playFps,
+				untrack(() => playStart(ui.time, audio.outputLatency(), midPlay))
+			);
 		} else {
 			beginStream(null, false);
 		}

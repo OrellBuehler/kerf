@@ -6,6 +6,7 @@
  *  could otherwise exercise, and it froze the preview once already. */
 
 import { DEFAULT_FRAME_PX, FRAME_STEPS } from './preview-size';
+import type { PlayAhead } from './types';
 
 /** The fastest a stream plays: a display paints no more than this, so frames past it are composited
  *  and shipped for nothing. Mirrors `MAX_STREAM_FPS` in kerf-core. */
@@ -229,26 +230,56 @@ export function startAt(playhead: number, startup: number | null, duration: numb
 	return Math.min(playhead + lead, Math.max(playhead, duration - 1 / playbackFps(fps)));
 }
 
+/** How far behind where a plain start-up puts it a takeover stream may begin, seconds, to start at the engine's
+ *  hand-over: a rAF or two of lateness in the page's trigger. More is a hand-over that was found late, and the
+ *  stream's frames would land that far behind the sound for the rest of the play: the paced stream keeps the offset
+ *  it starts with, and the gate judges drift against its own floor, so it never notices a constant one. */
+export const MAX_BEHIND = 0.05;
+
 /**
  * Where a stream that takes a session over from the GPU starts. The sound the viewer hears is the
  * clock less the output latency, and the GPU draws that picture, so the stream carries on in the same
- * time (`heard`), and from `start` ahead of it as any stream does. When the engine said where the GPU stops
- * (`earliest`: `SpanPlan::handover`, at or before the first frame it does not draw, with no fade or
- * transition window open at it), the stream starts no later: a slice that began inside a window would drop
- * the fade or the transition, and the clip would pop in. The frames before the one the GPU stops at are not
- * shown (the page's show-gate), so starting early costs only the stream's start-up; what it costs the sync
- * is `from` behind where it would have been, which is never more than a frame when the hand-over is
- * started on time.
+ * time (`heard`), and from `startup` ahead of it as any stream does.
+ *
+ * When the refused frame sits in a fade or a transition (`ahead.handover` is before `ahead.at`: the engine's
+ * `SpanPlan::handover` is where no window is open, and is the frame itself when none is), the stream starts no
+ * later than that, or a slice that began inside the window would drop it and the clip would pop in. That is
+ * honoured only when the hand-over is on time, within [`MAX_BEHIND`] of where the start-up puts the stream:
+ * **synchronisation wins over the transition when it is late** — a hand-over found late is a stream that
+ * starts at the playhead and shows the window cut, not one that trails the sound by the lateness for good. With
+ * no window the hand-over is the frame itself (an answer to a request is a round trip old), and starting at
+ * it would only be early for nothing.
  */
 export function takeoverStart(
 	heard: number,
 	startup: number | null,
 	duration: number,
 	fps: number,
-	earliest: number | null
+	ahead: { at: number; handover: number } | null
 ): number {
 	const from = startAt(heard, startup, duration, fps);
-	return earliest !== null && Number.isFinite(earliest) ? Math.min(from, Math.max(0, earliest)) : from;
+	if (!ahead || !Number.isFinite(ahead.at) || !Number.isFinite(ahead.handover)) return from;
+	if (ahead.handover >= ahead.at - 0.5 / playbackFps(fps)) return from;
+	const early = Math.max(0, ahead.handover);
+	return from - early <= MAX_BEHIND ? Math.min(from, early) : from;
+}
+
+/**
+ * What a takeover stream is told about where the GPU stops. A hand-over **at once** (the GPU was given up on:
+ * overloaded, silent) says nothing about a refusal that is still seconds ahead — the stream must show from
+ * the start, not wait for frames before it — so that is dropped; one whose refusal is due (a frame that
+ * failed, a session that ended, a refusal the hand-over came late for: at or before the time last asked
+ * for, a frame on) is kept, and the surface holds the GPU's last picture until the stream reaches it.
+ */
+export function takeoverAhead(
+	ahead: PlayAhead | null,
+	now: boolean,
+	heard: number,
+	roundTrip: number,
+	fps: number
+): PlayAhead | null {
+	if (!ahead || !now) return ahead;
+	return ahead.at <= heard + Math.max(0, roundTrip) + 1 / playbackFps(fps) ? ahead : null;
 }
 
 /** What the ladder says about a stream about to start. */
@@ -314,8 +345,8 @@ export function createLadder(clock: () => number = () => performance.now()) {
 				duration: number;
 				/** The sound's output latency, for a stream that takes a GPU session over; default 0. */
 				latency?: number;
-				/** The earliest the stream may begin, for the same: `ahead.handover`. */
-				earliest?: number | null;
+				/** Where the GPU stops, for the same: the stream starts at its hand-over when a window is open there. */
+				ahead?: { at: number; handover: number } | null;
 			}
 		): StreamStart {
 			if (!key || key.timeline !== next.timeline || key.epoch !== next.epoch || key.width !== next.width) {
@@ -330,7 +361,7 @@ export function createLadder(clock: () => number = () => performance.now()) {
 			const rung = rungAfter(startRung(cut.fps, cut.width), steps);
 			const offset = Number.isFinite(cut.latency) ? Math.max(0, cut.latency ?? 0) : 0;
 			const heard = Math.max(0, cut.playhead - offset);
-			const from = takeoverStart(heard, startup, cut.duration, rung.fps, cut.earliest ?? null);
+			const from = takeoverStart(heard, startup, cut.duration, rung.fps, cut.ahead ?? null);
 			applied = from - heard;
 			return {
 				rung,

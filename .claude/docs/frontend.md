@@ -892,14 +892,22 @@ failed and the surface hidden), or a GPU whose median round trip is over **three
 **hands the session to the stream at once** (`handOverToStream(now)`), as does a request the backend has not answered at all for 1.5 s (5 s before the first
 answer; `STALL_AFTER`, `GpuPlayback.stalled`: only a request *waiting* counts, a clock that stands still asks for nothing) — a decode that hangs blocks the one worker that draws; an answer's **`play.ahead`** (the first frame the GPU will not draw and the
 time a stream must start at) hands over **when the time that is heard is within the stream's start-up of it** (`handoverDue`; the ladder's
-measured start-up, else 0.15 s). **The takeover stream is in the GPU's time and starts no later than the engine's hand-over**
-(`takeoverStart`, `ladder.start({latency, earliest})`): it reads the clock less the same median output latency the GPU's pictures do (so the picture
-does not jump forward by the latency at the hand-over: `ui.time - offset - f.time` in the gate), and `from = min(playhead + start-up, ahead.handover)`,
-because a slice that began inside a fade, a dissolve or a slide (`SpanPlan::handover` is where none is open) would lose it and the clip would pop. The
-show-gate already drops its frames before `ahead.at`; what the earlier start costs is the stream's picture trailing the sound by the difference (at most a
-frame when the hand-over is started on time; the elapsed part of the window for a frame that fails inside one). **A play holds the picture at the playhead it
-started from** (`new GpuPlayback(fps, ui.time)`) until the audible time reaches it: the first requests are not for the clock less the latency, which is
-before the paused frame (up to nine frames replayed with a Bluetooth headset). A hand-over starts the stream through the same ladder (`takeover`): the stream is *not* `streaming` (so the route stays `gpu` and the
+measured start-up, else 0.15 s). **The takeover stream is in the GPU's time** (`ladder.start({latency, ahead})`): it reads the clock less the same median output latency the GPU's pictures
+do (`GpuPlayback.offsetAt`: zero until a frame was drawn, never before the playhead the play started from), so the picture does not jump forward by the
+latency at the hand-over (`ui.time - offset - f.time` in the gate), and the same latency carries over the restarts of that stream in the same play
+(`takeoverLatency`, reset wherever a stream that is not its continuation begins). **It starts at the engine's hand-over only when a window is open and the
+page was on time** (`takeoverStart`): `ahead.handover` is before `ahead.at` only when the refused frame sits in a fade, a dissolve or a slide
+(`SpanPlan::handover` is the frame itself when none is open, and an answer to a request is a round trip old, so starting there would be early for
+nothing), and a slice that began inside the window would drop it and pop the clip in. The paced stream keeps the offset it starts with and the gate judges
+drift against its own floor, so a stream started `d` before where the start-up puts it trails the sound by `d` for the rest of the play, unseen:
+**synchronisation wins over the transition when the hand-over is late**. The hand-over is honoured within `MAX_BEHIND` (50 ms, a frame or two of the
+trigger's lateness) of the plain start, and past that the stream starts at the playhead and the window is cut. An **at-once** hand-over (the GPU gave up:
+overload, silence) is told nothing about a refusal that is still ahead (`takeoverAhead`; one that is due is kept): otherwise the pane would hold the GPU's last
+picture until the stream reached it, up to five seconds. `playback-sync.test.ts` runs a takeover through the real ladder and gate for no window, a window on
+time and a window late, and holds the steady lag to a frame. **A play holds the picture at the playhead it
+started from** (`new GpuPlayback(fps, playStart(ui.time, outputLatency, midPlay))`) until the audible time reaches it: the first requests are not for the clock
+less the latency, which is before the paused frame (up to nine frames replayed with a Bluetooth headset). Rebuilt in a running play (an edit, a resize: the
+effect ran again without a seek) the session starts at the audible picture instead, `ui.time - latency`, which is what is on the screen. A hand-over starts the stream through the same ladder (`takeover`): the stream is *not* `streaming` (so the route stays `gpu` and the
 surface stays up) until its first frame **at or past where the GPU stops** is shown, and only then does the GPU's session end and the surface go. A
 session that was given up on is **barred** for the rest of that play (`gpuBarred`: until a deliberate seek or an edit, not for a stream restart for
 lag), so the renderers never flip back and forth. Under Proxy only the first request is rejected as the stream is (`playWaiting` →
