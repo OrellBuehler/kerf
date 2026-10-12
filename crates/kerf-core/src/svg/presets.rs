@@ -25,6 +25,7 @@ pub const DEFAULT_FRAME: (u32, u32) = (1920, 1080);
 
 const MAX_TEXT_CHARS: usize = 200;
 const MAX_FONT_CHARS: usize = 100;
+const MAX_COLOR_CHARS: usize = 64;
 const EASE_OUT: &str = "0.16 1 0.3 1";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -97,8 +98,13 @@ pub fn check_params(params: &SvgPresetParams) -> Result<()> {
         }
     }
     for (what, color) in [("color", &params.color), ("accent", &params.accent)] {
-        if svgtypes::Color::from_str(color.trim()).is_err() {
-            return Err(invalid(format!("{what} \"{color}\" is not an SVG colour like #ffffff")));
+        // A colour is a few characters; a long one is not a colour, and is not echoed back whole.
+        let shown: String = color.chars().take(MAX_COLOR_CHARS).collect();
+        if color.chars().count() > MAX_COLOR_CHARS
+            || color.chars().any(char::is_control)
+            || svgtypes::Color::from_str(color.trim()).is_err()
+        {
+            return Err(invalid(format!("{what} \"{shown}\" is not an SVG colour like #ffffff")));
         }
     }
     if params.font.as_ref().is_some_and(|f| f.chars().count() > MAX_FONT_CHARS) {
@@ -458,6 +464,31 @@ mod tests {
 
     fn ink(svg: &str) -> usize {
         draw(svg).pixels().iter().filter(|p| p.alpha() > 0).count()
+    }
+
+    #[test]
+    fn colours_are_short_and_plain() {
+        let with = |color: &str, accent: &str| SvgPresetParams {
+            color: color.to_string(),
+            accent: accent.to_string(),
+            ..SvgPresetParams::new("Hi")
+        };
+        for ok in ["#fff", "#ffffff", "white", "rgb(10, 20, 30)", "rgba(0,0,0,0.5)", "  #abc  "] {
+            assert!(check_params(&with(ok, "#e0a020")).is_ok(), "{ok}");
+        }
+        // Sixty-four characters is the most a colour may be; one more is refused, however it parses.
+        let spaced = format!("#fff{}", " ".repeat(MAX_COLOR_CHARS - 4));
+        assert_eq!(spaced.chars().count(), MAX_COLOR_CHARS);
+        assert!(check_params(&with(&spaced, "#fff")).is_ok());
+        let long = format!("{spaced} ");
+        for (color, accent) in [(long.as_str(), "#fff"), ("#fff", long.as_str())] {
+            let e = check_params(&with(color, accent)).unwrap_err().to_string();
+            assert!(e.contains("is not an SVG colour"), "{e}");
+            assert!(e.len() < 200, "a long value is not echoed whole: {} bytes", e.len());
+        }
+        for bad in ["#ff\u{0}f", "#fff\n", "red\u{7}", "not a colour", "url(#a)", "", "#ggg"] {
+            assert!(check_params(&with(bad, "#fff")).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

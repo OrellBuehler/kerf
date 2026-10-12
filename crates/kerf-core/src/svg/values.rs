@@ -150,6 +150,39 @@ pub(super) fn is_css_property(attr: &str) -> bool {
     )
 }
 
+/// The CSS properties an element takes from its parent when it does not set them. (`opacity`, `display`,
+/// `stop-color`, the filter and mask references and `text-decoration` are not inherited.)
+pub(super) fn is_inherited(attr: &str) -> bool {
+    matches!(
+        attr,
+        "fill"
+            | "fill-opacity"
+            | "fill-rule"
+            | "stroke"
+            | "stroke-width"
+            | "stroke-opacity"
+            | "stroke-dasharray"
+            | "stroke-dashoffset"
+            | "stroke-linecap"
+            | "stroke-linejoin"
+            | "stroke-miterlimit"
+            | "color"
+            | "font-size"
+            | "font-family"
+            | "font-weight"
+            | "font-style"
+            | "letter-spacing"
+            | "word-spacing"
+            | "text-anchor"
+            | "visibility"
+            | "clip-rule"
+            | "paint-order"
+            | "marker-start"
+            | "marker-mid"
+            | "marker-end"
+    )
+}
+
 /// What an attribute is when the element does not say.
 pub(super) fn default_text(attr: &str) -> Option<&'static str> {
     Some(match attr {

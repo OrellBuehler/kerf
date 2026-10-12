@@ -85,8 +85,8 @@ pub use platform::{
 };
 pub use play_plan::{PlayAhead, PlayCut, PlayRefusal};
 pub use project::{
-    FramingPlan, Project, SmartCropJob, SmartCropPlan, StemsPlaced, SvgLayout, SvgOverlayResult, SvgSource, MAX_CHANNEL_KEYS,
-    VOICEOVER_TRACK,
+    FramingPlan, Project, SmartCropJob, SmartCropPlan, StemsPlaced, SvgChecked, SvgLayout, SvgOverlayResult, SvgSource,
+    MAX_CHANNEL_KEYS, VOICEOVER_TRACK,
 };
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use render_plan::{

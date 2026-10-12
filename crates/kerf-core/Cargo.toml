@@ -53,11 +53,12 @@ tar = "0.4"
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 # STFT for the music analysis (onset flux, chroma; see engine::music).
 realfft = "3.5"
-# Animated SVG overlays (see svg): roxmltree reads the source, resvg draws each frame. Text,
-# system fonts only; no raster-image codecs (a data: PNG is all an overlay may embed).
+# Animated SVG overlays (see svg): roxmltree reads the source, resvg draws each frame. Text and
+# system fonts, and the raster codecs (PNG, JPEG, GIF, WebP) an `<image>` with a `data:` URL needs
+# (a logo in a lower third); nothing is ever read from a path or a URL.
 roxmltree = "0.21"
 svgtypes = "0.16"
-resvg = { version = "0.48.1", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+resvg = { version = "0.48.1", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
 tiny-skia = "0.12"
 ffmpeg-next = { workspace = true, optional = true }
 whisper-rs = { version = "0.16.0", optional = true }

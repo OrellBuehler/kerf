@@ -114,6 +114,13 @@
   **Animated SVG titles** (`add_svg_overlay(SvgSource, start, end?, SvgLayout)`,
   `update_svg_overlay(id, SvgOverlayPatch)`, `remove_svg_overlay(id)` — each one
   `edit_timeline` revision, so an agent's stage; see `core-model.md` for the model).
+  **Parsing costs up to ~1.7 s, so a surface does it before it takes the project lock**:
+  `SvgSource::check() -> Result<SvgChecked>` (`Custom(SvgDoc)` / `Preset`, params checked) then
+  `Project::add_svg_overlay_parsed(SvgChecked, start, end?, SvgLayout)`, and `SvgOverlayPatch::check() ->
+  Result<Option<SvgDoc>>` (exclusivity, params, finite times, the artwork parsed) then
+  `Project::update_svg_overlay_parsed(id, patch, doc)` (a `doc` replaces the artwork and `patch.svg` is not
+  parsed again; with `None` a `patch.svg` is still parsed, which is all `update_svg_overlay` is). The plain
+  methods are the check plus the parsed one, so they keep working but parse under whatever lock the caller holds.
   `SvgSource` is `Custom(String)` (parsed through `SvgDoc::parse` *before* the edit closure, so a
   bad document, a root that is not `<svg>`, no size or a cap exceeded is an `InvalidArgument` and
   writes no revision) or `Preset(SvgPreset)` (`svg::check_params`, then generated inside the

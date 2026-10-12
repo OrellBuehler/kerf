@@ -207,24 +207,37 @@ impl<'a> Resolver<'a> {
         out
     }
 
-    fn times(&mut self, items: &[TimeItem], depth: usize) -> Vec<f64> {
+    /// The resolved times of a begin / end list, and whether any item of it is **unresolved**: an event,
+    /// `repeat()`, `accessKey()` or wallclock value, or a syncbase that gives no time (its animation is
+    /// not there, never begins or never ends). An unresolved end leaves the interval open — it runs its
+    /// natural length — where a list whose every time is *before* the begin makes no interval at all.
+    fn times(&mut self, items: &[TimeItem], depth: usize) -> (Vec<f64>, bool) {
         let mut out = Vec::new();
+        let mut unresolved = false;
         for item in items {
             match item {
                 TimeItem::Offset(o) => out.push(*o),
                 TimeItem::Indefinite => {}
-                TimeItem::Unresolved(s) => self.warn(format!(
-                    "timing \"{s}\" is not evaluated (events, repeat(), accessKey() and wallclock never fire)"
-                )),
+                TimeItem::Unresolved(s) => {
+                    unresolved = true;
+                    self.warn(format!(
+                        "timing \"{s}\" is not evaluated (events, repeat(), accessKey() and wallclock never fire)"
+                    ));
+                }
                 TimeItem::Sync { id, end, offset } => match self.ids.get(id).copied() {
-                    None => self.warn(format!("timing refers to \"{id}\", which is not an animation")),
+                    None => {
+                        unresolved = true;
+                        self.warn(format!("timing refers to \"{id}\", which is not an animation"));
+                    }
                     Some(j) => {
+                        let before = out.len();
                         for iv in self.intervals(j, depth + 1) {
                             let t = if *end { iv.end } else { iv.begin };
                             if t.is_finite() {
                                 out.push(t + offset);
                             }
                         }
+                        unresolved |= out.len() == before;
                     }
                 },
             }
@@ -232,22 +245,18 @@ impl<'a> Resolver<'a> {
         out.sort_by(f64::total_cmp);
         out.dedup_by(|a, b| (*a - *b).abs() < EPS);
         out.truncate(MAX_TIMES);
-        out
+        (out, unresolved)
     }
 
     fn compute(&mut self, i: usize, depth: usize) -> Vec<Interval> {
         let spec = self.specs[i].clone();
-        let begins = self.times(&spec.begin, depth);
-        let ends = if spec.has_end {
+        let (begins, _) = self.times(&spec.begin, depth);
+        let (ends, end_unresolved) = if spec.has_end {
             self.times(&spec.end, depth)
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
-        let open_end = !spec.has_end
-            || spec
-                .end
-                .iter()
-                .any(|e| matches!(e, TimeItem::Indefinite | TimeItem::Unresolved(_)));
+        let open_end = !spec.has_end || end_unresolved || spec.end.iter().any(|e| matches!(e, TimeItem::Indefinite));
         let natural = spec.repeated();
         let mut out: Vec<Interval> = Vec::new();
         for (k, &b) in begins.iter().enumerate() {
@@ -290,7 +299,8 @@ impl<'a> Resolver<'a> {
 pub(super) struct Sample {
     /// When the interval it is in began, for the sandwich order.
     pub begin: f64,
-    pub iter: u32,
+    /// Which repeat it is in (0 for the first): a float, so a repeat count past `u32` does not wrap.
+    pub iter: f64,
     pub frac: f64,
 }
 
@@ -340,7 +350,7 @@ impl Timing {
         let Some(d) = self.dur else {
             return Sample {
                 begin,
-                iter: 0,
+                iter: 0.0,
                 frac: 0.0,
             };
         };
@@ -357,14 +367,14 @@ impl Timing {
         if held && q >= 1.0 && q == r {
             return Sample {
                 begin,
-                iter: (q - 1.0) as u32,
+                iter: q - 1.0,
                 frac: 1.0,
             };
         }
         let iter = q.floor();
         Sample {
             begin,
-            iter: iter as u32,
+            iter,
             frac: q - iter,
         }
     }
@@ -560,12 +570,12 @@ mod tests {
         let t = timing(&s);
         assert_eq!(t.sample(0.5), None);
         let a = t.sample(2.0).unwrap();
-        assert_eq!((a.iter, a.frac), (0, 0.5));
+        assert_eq!((a.iter, a.frac), (0.0, 0.5));
         assert_eq!(t.sample(3.0), None, "removed once over");
         s.freeze = true;
         let t = timing(&s);
         let held = t.sample(10.0).unwrap();
-        assert_eq!((held.iter, held.frac), (0, 1.0), "freeze holds the last value");
+        assert_eq!((held.iter, held.frac), (0.0, 1.0), "freeze holds the last value");
     }
 
     #[test]
@@ -575,17 +585,17 @@ mod tests {
         s.freeze = true;
         let t = timing(&s);
         let a = t.sample(4.5).unwrap();
-        assert_eq!(a.iter, 2);
+        assert_eq!(a.iter, 2.0);
         assert!((a.frac - 0.25).abs() < 1e-9);
         let held = t.sample(100.0).unwrap();
-        assert_eq!(held.iter, 2);
+        assert_eq!(held.iter, 2.0);
         assert!((held.frac - 0.5).abs() < 1e-9, "frozen mid-iteration at AD mod dur");
         s.repeat_count = Some(2.0);
         let held = timing(&s).sample(100.0).unwrap();
-        assert_eq!((held.iter, held.frac), (1, 1.0), "an exact multiple holds the last value");
+        assert_eq!((held.iter, held.frac), (1.0, 1.0), "an exact multiple holds the last value");
         s.repeat_count = Some(INF);
         let t = timing(&s);
-        assert_eq!(t.sample(1001.0).unwrap().iter, 500);
+        assert_eq!(t.sample(1001.0).unwrap().iter, 500.0);
         assert!(s.loops_forever());
     }
 
@@ -595,13 +605,13 @@ mod tests {
         s.repeat_dur = Some(3.0);
         s.freeze = true;
         let t = timing(&s);
-        assert_eq!(t.sample(2.5).unwrap().iter, 1);
+        assert_eq!(t.sample(2.5).unwrap().iter, 1.0);
         let held = t.sample(50.0).unwrap();
-        assert_eq!(held.iter, 1);
+        assert_eq!(held.iter, 1.0);
         assert!((held.frac - 0.5).abs() < 1e-9);
         s.dur = None;
         let t = timing(&s);
-        assert_eq!(t.sample(1.0).map(|x| (x.iter, x.frac)), Some((0, 0.0)));
+        assert_eq!(t.sample(1.0).map(|x| (x.iter, x.frac)), Some((0.0, 0.0)));
         assert_eq!(timing(&s).intervals[0].end, 3.0);
     }
 
@@ -611,7 +621,7 @@ mod tests {
         s.dur = Some(0.2);
         s.repeat_count = Some(INF);
         let t = timing(&s).sample(0.6).unwrap();
-        assert_eq!((t.iter, t.frac), (3, 0.0));
+        assert_eq!((t.iter, t.frac), (3.0, 0.0));
     }
 
     #[test]

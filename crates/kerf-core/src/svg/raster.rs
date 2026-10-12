@@ -53,9 +53,16 @@ fn options() -> usvg::Options<'static> {
     };
     // Only an image the document carries itself is read: a path or a URL in `href` is nothing, so
     // a title can neither read a file off the disk nor reach for the network.
+    // ...and of those only the four raster kinds the sanitiser allows: no nested SVG document.
     opts.image_href_resolver = ImageHrefResolver {
+        resolve_data: Box::new(|mime, data, _| match mime {
+            "image/png" => Some(usvg::ImageKind::PNG(data)),
+            "image/jpeg" | "image/jpg" => Some(usvg::ImageKind::JPEG(data)),
+            "image/gif" => Some(usvg::ImageKind::GIF(data)),
+            "image/webp" => Some(usvg::ImageKind::WEBP(data)),
+            _ => None,
+        }),
         resolve_string: Box::new(|_, _| None),
-        ..ImageHrefResolver::default()
     };
     opts
 }
@@ -597,6 +604,35 @@ mod tests {
             assert!(p.pixels().iter().all(|c| c.alpha() == 0), "{href}");
         }
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_image_the_document_carries_is_drawn() {
+        // A 4 x 4 red PNG, base64: a logo in a lower third is this, larger.
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAEklEQVR4nGP4z8DwHxkzkC4AADxAH+HggXe0AAAAAElFTkSuQmCC";
+        let src = svg(&format!(
+            "<image href=\"data:image/png;base64,{png}\" x=\"0\" y=\"0\" width=\"50\" height=\"50\"/>"
+        ));
+        // Through the sanitiser, as a stored title goes.
+        let doc = SvgDoc::parse(&src).unwrap();
+        assert!(doc.sanitized().contains("data:image/png"), "the sanitiser keeps it");
+        let p = render(&doc.at(0.0), 100, 50, 1.0).unwrap();
+        let [r, g, b, a] = pixel(&p, 20, 25);
+        assert!(r > 240 && g < 15 && b < 15 && a > 240, "{r} {g} {b} {a}");
+        assert_eq!(pixel(&p, 80, 25)[3], 0, "and only where it was put");
+    }
+
+    #[test]
+    fn a_nested_svg_in_a_data_url_is_not_drawn() {
+        let nested = "data:image/svg+xml;utf8,&lt;svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 4'&gt;&lt;rect width='4' height='4' fill='red'/&gt;&lt;/svg&gt;";
+        let p = render(
+            &svg(&format!("<image href=\"{nested}\" width=\"100\" height=\"50\"/>")),
+            100,
+            50,
+            1.0,
+        )
+        .unwrap();
+        assert!(p.pixels().iter().all(|c| c.alpha() == 0));
     }
 
     #[test]

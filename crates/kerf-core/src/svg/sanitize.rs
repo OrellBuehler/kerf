@@ -123,6 +123,12 @@ pub(super) fn sanitize(src: &str) -> Result<Sanitized> {
     }
     let src = src.strip_prefix('\u{feff}').unwrap_or(src);
     let src = strip_doctype(src)?;
+    // roxmltree recurses once per open element and has no depth limit of its own: a few thousand
+    // nested `<g>` (a few KB) overflow the stack of a thread and abort the process, long before
+    // the walk below could count them. So the nesting is read off the bytes first.
+    if nesting_exceeds(&src, MAX_DEPTH) {
+        return Err(invalid(format!("the SVG is nested deeper than {MAX_DEPTH} elements")));
+    }
     let doc = Document::parse_with_options(&src, super::xml_options()).map_err(|e| invalid(format!("not valid XML: {e}")))?;
     let root = doc.root_element();
     if root.tag_name().name() != "svg" || root.tag_name().namespace() != Some(SVG_NS) {
@@ -166,6 +172,100 @@ pub(super) fn sanitize(src: &str) -> Result<Sanitized> {
         text: apply(&src, edits.cuts),
         warnings: edits.warnings,
     })
+}
+
+/// Whether elements nest deeper than `limit` in `src` (the root is depth 1), read off the bytes
+/// without building anything: comments, CDATA, processing instructions and declarations are
+/// skipped whole, quoted attribute values are skipped so a `>` or `<` in one is not a tag, and a
+/// `/>` closes the element it opens. It is not a parser — text it cannot make sense of ends the
+/// scan with "not too deep", and the real parser then says what is wrong — but it never recurses
+/// and reads each byte once, so it is safe to run on anything before roxmltree is.
+pub(super) fn nesting_exceeds(src: &str, limit: usize) -> bool {
+    let b = src.as_bytes();
+    let find = |from: usize, pat: &[u8]| {
+        b[from.min(b.len())..]
+            .windows(pat.len())
+            .position(|w| w == pat)
+            .map(|i| from + i)
+    };
+    let (mut i, mut depth) = (0usize, 0usize);
+    while i < b.len() {
+        if b[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let rest = &b[i..];
+        if rest.starts_with(b"<!--") {
+            let Some(end) = find(i + 4, b"-->") else { return false };
+            i = end + 3;
+        } else if rest.starts_with(b"<![CDATA[") {
+            let Some(end) = find(i + 9, b"]]>") else { return false };
+            i = end + 3;
+        } else if rest.starts_with(b"<?") {
+            let Some(end) = find(i + 2, b"?>") else { return false };
+            i = end + 2;
+        } else if rest.starts_with(b"<!") {
+            let Some(end) = find(i + 2, b">") else { return false };
+            i = end + 1;
+        } else if rest.starts_with(b"</") {
+            depth = depth.saturating_sub(1);
+            let Some(end) = find(i + 2, b">") else { return false };
+            i = end + 1;
+        } else {
+            depth += 1;
+            if depth > limit {
+                return true;
+            }
+            let mut quote = None;
+            let mut j = i + 1;
+            let mut closed = false;
+            while j < b.len() {
+                match (quote, b[j]) {
+                    (Some(q), c) if c == q => quote = None,
+                    (Some(_), _) => {}
+                    (None, q @ (b'"' | b'\'')) => quote = Some(q),
+                    (None, b'>') => {
+                        closed = true;
+                        break;
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            if !closed {
+                return false;
+            }
+            if b[j - 1] == b'/' {
+                depth -= 1;
+            }
+            i = j + 1;
+        }
+    }
+    false
+}
+
+/// The value of the attribute `name` that has **no namespace**. roxmltree's `node.attribute("x")` with
+/// a bare name matches the local name in any namespace, so `xlink:href` answers for `href` — and which
+/// of the two a reader meant is exactly what a link can hide behind.
+pub(super) fn plain_attribute<'a>(node: &Node<'a, '_>, name: &str) -> Option<&'a str> {
+    node.attributes()
+        .find(|a| a.namespace().is_none() && a.name() == name)
+        .map(|a| a.value())
+}
+
+/// An attribute name an animation may target: an XML name with at most one prefix
+/// (`[A-Za-z_][A-Za-z0-9_.-]*`, optionally `prefix:` of the same shape). Anything else is spliced
+/// into the document as markup by `SvgDoc::at`, so anything else is not a name.
+pub(super) fn is_attribute_name(name: &str) -> bool {
+    let ncname = |s: &str| {
+        let mut chars = s.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    };
+    match name.split_once(':') {
+        Some((prefix, local)) => ncname(prefix) && ncname(local),
+        None => ncname(name),
+    }
 }
 
 /// Splice `cuts` (any order, disjoint) into `src`.
@@ -232,6 +332,12 @@ fn cut_element(node: &Node) -> Option<Option<String>> {
         "animate" | "set" | "animateColor" | "animateTransform" | "animateMotion"
     ) {
         if let Some(attr) = node.attribute("attributeName") {
+            if !is_attribute_name(attr.trim()) {
+                return Some(Some(format!(
+                    "animating \"{}\" was removed: it is not an attribute name",
+                    attr.chars().take(40).collect::<String>()
+                )));
+            }
             let local = attr.rsplit(':').next().unwrap_or(attr).trim();
             let lower = local.to_ascii_lowercase();
             if lower.starts_with("on") || lower == "href" || lower == "style" {
@@ -275,11 +381,23 @@ fn attributes(node: &Node, src: &str, edits: &mut Edits) {
             cut(edits, None);
             continue;
         }
-        if ns.is_none() && name.len() > 2 && name[..2].eq_ignore_ascii_case("on") {
+        // resvg reads `xlink:width` as `width`, and roxmltree answers a bare-name lookup with it: the
+        // only XLink attribute that means something is the link itself (the rest is XLink 1.0 furniture).
+        if ns == Some(XLINK_NS) && name != "href" {
+            cut(edits, None);
+            continue;
+        }
+        if ns.is_none() && name.len() > 2 && name.as_bytes().get(..2).is_some_and(|b| b.eq_ignore_ascii_case(b"on")) {
             cut(edits, Some(format!("event attribute \"{name}\" was removed")));
             continue;
         }
         let value = attr.value();
+        // SVG 2 and resvg both read the unprefixed `href` and ignore the `xlink:` one beside it; the
+        // text stored must not hold a second, different link for any other reader to prefer.
+        if name == "href" && ns == Some(XLINK_NS) && plain_attribute(node, "href").is_some() {
+            cut(edits, None);
+            continue;
+        }
         if name == "href" && ns != Some(XML_NS) {
             if !href_allowed(tag, value) {
                 cut(
@@ -834,5 +952,152 @@ mod tests {
     fn escaping_matches_the_quote() {
         assert_eq!(escape_attr("a&b<\"c'", '"'), "a&amp;b&lt;&quot;c'");
         assert_eq!(escape_attr("a\"c'", '\''), "a\"c&apos;");
+    }
+
+    // ---- review fixes -------------------------------------------------------------------------
+
+    /// Run `f` on a thread with a 2 MiB stack, as small as any a caller may have: a stack overflow
+    /// aborts the whole process, so these tests prove "refused" by still being alive.
+    fn on_a_small_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .expect("the thread did not panic")
+    }
+
+    #[test]
+    fn deep_nesting_is_refused_before_the_parser_can_overflow_its_stack() {
+        for depth in [65usize, 5_000, 20_000] {
+            let src = format!(
+                "<svg xmlns=\"{SVG_NS}\" viewBox=\"0 0 10 10\">{}{}</svg>",
+                "<g>".repeat(depth),
+                "</g>".repeat(depth)
+            );
+            let err = on_a_small_stack(move || sanitize(&src).unwrap_err().to_string());
+            // Past the byte cap the size is what is said first; below it, the nesting.
+            assert!(err.contains("nested deeper") || err.contains("larger than"), "{depth}: {err}");
+        }
+        let in_a_doc = format!(
+            "<svg xmlns=\"{SVG_NS}\" viewBox=\"0 0 10 10\">{}</svg>",
+            "<g>".repeat(5_000) + &"</g>".repeat(5_000)
+        );
+        assert!(in_a_doc.len() < MAX_BYTES);
+        let e = on_a_small_stack(move || crate::svg::SvgDoc::parse(&in_a_doc).unwrap_err().to_string());
+        assert!(e.contains("nested deeper"), "{e}");
+        // Unclosed nesting is refused as deep too, rather than left for the parser to recurse into.
+        let open = format!("<svg xmlns=\"{SVG_NS}\" viewBox=\"0 0 10 10\">{}", "<g>".repeat(5_000));
+        assert!(on_a_small_stack(move || sanitize(&open).is_err()));
+    }
+
+    #[test]
+    fn the_depth_scan_counts_elements_and_nothing_else() {
+        let nest = |n: usize| format!("{}{}", "<g>".repeat(n), "</g>".repeat(n));
+        assert!(!nesting_exceeds(&nest(64), 64), "exactly the limit is allowed");
+        assert!(nesting_exceeds(&nest(65), 64));
+        // Self-closing elements are not open; siblings do not add up.
+        assert!(!nesting_exceeds(
+            &format!("{}{}", "<g/>".repeat(500), "<g></g>".repeat(500)),
+            3
+        ));
+        // A comment, CDATA, a processing instruction and a declaration hide what is inside them.
+        let hidden = format!(
+            "<!--{}--><![CDATA[{}]]><?pi {} ?><!X {}>",
+            "<g>".repeat(99),
+            "<g>".repeat(99),
+            "<g>".repeat(99),
+            "<g>"
+        );
+        assert!(!nesting_exceeds(&hidden, 1), "{hidden}");
+        // A quoted attribute value hides its `>` and `/`, and a tag with a `/>` after one closes.
+        assert!(!nesting_exceeds("<a t=\"/>\"><b/></a>", 2));
+        assert!(!nesting_exceeds("<a t='>'/><a t='>'/><a/>", 1));
+        assert!(nesting_exceeds("<a t=\">\"><a t='>'><a/></a></a>", 2));
+        // Text it cannot make sense of is the parser's to refuse.
+        assert!(!nesting_exceeds("<a><b", 2));
+        assert!(!nesting_exceeds("<!-- never closed <a><a><a>", 1));
+        assert!(!nesting_exceeds("</a></a></a><a>", 1));
+    }
+
+    #[test]
+    fn a_multibyte_attribute_name_does_not_panic() {
+        for name in ["日本", "o日", "on日", "\u{1F600}x", "ö"] {
+            let src = svg(&format!("<rect {name}=\"1\" width=\"2\" height=\"2\"/>"));
+            let out = on_a_small_stack(move || sanitize(&src));
+            assert!(out.is_ok(), "{name}");
+        }
+        // The event attributes still go, whatever their case.
+        let out = clean(&svg("<rect OnClick=\"x()\" onload=\"y()\" width=\"2\" height=\"2\"/>"));
+        assert_eq!(out.text, svg("<rect width=\"2\" height=\"2\"/>"));
+    }
+
+    #[test]
+    fn an_animation_may_only_target_a_name() {
+        for ok in ["x", "stroke-width", "xlink:foo", "_a.b-c", "fill-opacity", "viewBox"] {
+            assert!(is_attribute_name(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            " ",
+            "x=\"1\" href=\"/etc/passwd\" onload=\"a\" y",
+            "a b",
+            "a\"b",
+            "a'b",
+            "a<b",
+            "a&lt;b",
+            "a;b",
+            "1x",
+            "-x",
+            ":x",
+            "x:",
+            "a:b:c",
+            "x/",
+            "日本",
+        ] {
+            assert!(!is_attribute_name(bad), "{bad:?}");
+        }
+        let inject = "<rect width=\"2\" height=\"2\"><animate attributeName='x=&quot;1&quot; href=&quot;/etc/passwd&quot; onload=&quot;a&quot; y' to=\"5\" dur=\"1s\"/><set attributeName=\"a;b\" to=\"1\"/><animate attributeName=\"fill\" to=\"red\" dur=\"1s\"/></rect>";
+        let out = clean(&svg(inject));
+        assert_eq!(
+            out.text,
+            svg("<rect width=\"2\" height=\"2\"><animate attributeName=\"fill\" to=\"red\" dur=\"1s\"/></rect>")
+        );
+        assert!(
+            out.warnings.iter().any(|w| w.contains("not an attribute name")),
+            "{:?}",
+            out.warnings
+        );
+        assert_eq!(clean(&out.text).text, out.text, "and the result is its own fixed point");
+    }
+
+    #[test]
+    fn animated_values_cannot_leave_the_document() {
+        let out = clean(&svg(
+            "<rect width=\"2\" height=\"2\"><animate attributeName=\"fill\" values=\"red;url(http://evil/x)\" dur=\"1s\"/><set attributeName=\"xlink:href\" to=\"http://evil\"/><animate attributeName=\"fill\" to=\"url( 'file:///etc/passwd' )\" dur=\"1s\"/><animate attributeName=\"mask\" from=\"url(#a)\" to=\"url(#b)\" dur=\"1s\"/></rect>",
+        ));
+        assert!(!out.text.contains("evil") && !out.text.contains("passwd"), "{}", out.text);
+        assert!(out.text.contains("url(#a)") && out.text.contains("url(#b)"), "{}", out.text);
+        assert!(!out.text.contains("xlink:href"), "{}", out.text);
+    }
+
+    #[test]
+    fn the_unprefixed_href_is_the_only_one_that_stays_beside_an_xlink_one() {
+        let out = clean(&svg(
+            "<use xlink:href=\"#cheap\" href=\"#big\"/><use href=\"#a\" xlink:href=\"#b\"/><use xlink:href=\"#only\"/>",
+        ));
+        assert_eq!(
+            out.text,
+            svg("<use href=\"#big\"/><use href=\"#a\"/><use xlink:href=\"#only\"/>")
+        );
+    }
+
+    #[test]
+    fn an_xlink_attribute_that_is_not_the_link_is_dropped() {
+        // resvg would read `xlink:width` as `width`, and a bare-name lookup in roxmltree finds it too.
+        let out = clean(&svg(
+            "<rect xlink:width=\"900\" xlink:title=\"t\" width=\"2\" height=\"2\" xml:space=\"preserve\"/>",
+        ));
+        assert_eq!(out.text, svg("<rect width=\"2\" height=\"2\" xml:space=\"preserve\"/>"));
     }
 }

@@ -734,7 +734,7 @@ so the feature is **only** activated through these forwards — which is what ma
     (offset), a translucent title partly off the frame equals its still, a two-pass export draws once (and a second export finds
     the sequence drawn), gif and 10-bit exports, a `%` in the cache path, a cancel, and the stream (from the playhead mid-title the
     box is already across). A 10 s text-heavy lower third at 960 px: 301 frames in 3.0 s on 4 shared cores (10 ms a frame).
-    **Not drawn**: an embedded `<image>` (resvg is built without codecs), `animateMotion`, CSS animation.
+    **Not drawn**: `animateMotion`, CSS animation, an `<image>` whose `href` is not a `data:` URL of PNG / JPEG / GIF / WebP.
   **360 footage** is reprojected by `v360`: `StreamInfo.projection` is detected at
   probe time (`detect_projection` — a `Spherical Mapping` side-data entry, or an
   Insta360 `.insv` whose frame is two squares side by side; deliberately *no*

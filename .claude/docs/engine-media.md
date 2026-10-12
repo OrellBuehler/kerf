@@ -219,9 +219,10 @@ also sets `MACOSX_DEPLOYMENT_TARGET` to `bundle.macOS.minimumSystemVersion`
 what the feature costs — and a job compiling against the runner's own SDK would
 never see it.
 
-`resvg` (pure Rust, `text` + `system-fonts`, no raster codecs) draws animated SVG titles: kerf-core's `svg/`
-evaluates the SMIL to a static document per moment and resvg rasterises it, so no build needs a system
-library for it (`core-model.md` has the model; the frame paths come with the engine work package).
+`resvg` (pure Rust, `text` + `system-fonts` + `raster-images`: PNG, JPEG, GIF, WebP for an `<image>` with a `data:`
+URL) draws animated SVG titles: kerf-core's `svg/` evaluates the SMIL to a static document per moment and
+resvg rasterises it, so no build needs a system library for it (`core-model.md` has the model, `engine-cli.md`
+the frame paths).
 
 - **With FFmpeg dev libs** (full build): `cargo build` / `cargo run -p kerf-app`.
 - **Without them** (CI, UI work): pass `--no-default-features`; everything but the

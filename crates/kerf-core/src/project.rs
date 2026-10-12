@@ -37,6 +37,28 @@ pub enum SvgSource {
     Preset(SvgPreset),
 }
 
+impl SvgSource {
+    /// Read the artwork: sanitise and parse custom SVG (up to a second and a half for a heavy
+    /// document) or check a preset's parameters. Pure, so a surface does it **before it takes the
+    /// project lock** and hands the result to [`Project::add_svg_overlay_parsed`].
+    pub fn check(self) -> Result<SvgChecked> {
+        match self {
+            SvgSource::Custom(src) => SvgDoc::parse(&src).map(SvgChecked::Custom),
+            SvgSource::Preset(p) => {
+                check_params(&p.params)?;
+                Ok(SvgChecked::Preset(p))
+            }
+        }
+    }
+}
+
+/// An [`SvgSource`] that has been read: custom SVG already parsed, preset parameters already checked.
+#[derive(Debug, Clone)]
+pub enum SvgChecked {
+    Custom(SvgDoc),
+    Preset(SvgPreset),
+}
+
 /// Name and placement of a new animated title; each `None` takes the default (full frame, opaque).
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct SvgLayout {
@@ -4572,6 +4594,19 @@ impl Project {
         end: Option<f64>,
         layout: SvgLayout,
     ) -> Result<SvgOverlayResult> {
+        self.add_svg_overlay_parsed(source.check()?, start, end, layout)
+    }
+
+    /// [`Project::add_svg_overlay`] for artwork that has been read already ([`SvgSource::check`]):
+    /// nothing in it parses, so it is cheap to run under the project lock. A surface checks the
+    /// source first and takes the lock after.
+    pub fn add_svg_overlay_parsed(
+        &self,
+        source: SvgChecked,
+        start: f64,
+        end: Option<f64>,
+        layout: SvgLayout,
+    ) -> Result<SvgOverlayResult> {
         if !start.is_finite() {
             return Err(Error::InvalidArgument("start must be a number of seconds".to_string()));
         }
@@ -4580,19 +4615,13 @@ impl Project {
             return Err(Error::InvalidArgument("overlay end must be after start".to_string()));
         }
         let (svg, preset, warnings, natural) = match source {
-            SvgSource::Custom(src) => {
-                let doc = SvgDoc::parse(&src)?;
-                (
-                    doc.sanitized().to_string(),
-                    None,
-                    doc.warnings().to_vec(),
-                    doc.natural_duration(),
-                )
-            }
-            SvgSource::Preset(p) => {
-                check_params(&p.params)?;
-                (String::new(), Some(p), Vec::new(), None)
-            }
+            SvgChecked::Custom(doc) => (
+                doc.sanitized().to_string(),
+                None,
+                doc.warnings().to_vec(),
+                doc.natural_duration(),
+            ),
+            SvgChecked::Preset(p) => (String::new(), Some(p), Vec::new(), None),
         };
         let end = end.unwrap_or_else(|| start + natural.map_or(4.0, |n| n.clamp(2.0, 30.0)));
         let (x, y, width, height, opacity) = (
@@ -4637,18 +4666,26 @@ impl Project {
     /// scheduled against the span), so trimming or stretching one in the timeline retimes the effect
     /// instead of cutting it off.
     pub fn update_svg_overlay(&self, overlay_id: Uuid, patch: SvgOverlayPatch) -> Result<SvgOverlayResult> {
-        if patch.svg.is_some() && patch.preset_params.is_some() {
-            return Err(Error::InvalidArgument(
-                "pass either svg or preset_params, not both".to_string(),
-            ));
-        }
-        let doc = patch.svg.as_deref().map(SvgDoc::parse).transpose()?;
-        if let Some(params) = &patch.preset_params {
-            check_params(params)?;
-        }
-        if [patch.start, patch.end].iter().flatten().any(|v| !v.is_finite()) {
-            return Err(Error::InvalidArgument("start and end must be numbers of seconds".to_string()));
-        }
+        self.update_svg_overlay_parsed(overlay_id, patch, None)
+    }
+
+    /// [`Project::update_svg_overlay`] with the artwork read already: `doc` is [`SvgOverlayPatch::check`]'s
+    /// answer for `patch.svg` and replaces the artwork (`patch.svg` itself is not looked at again), so
+    /// nothing here parses and it is cheap to run under the project lock. With `doc` `None` a
+    /// `patch.svg` is still parsed here, as `update_svg_overlay` always has.
+    pub fn update_svg_overlay_parsed(
+        &self,
+        overlay_id: Uuid,
+        patch: SvgOverlayPatch,
+        doc: Option<SvgDoc>,
+    ) -> Result<SvgOverlayResult> {
+        let doc = match doc {
+            Some(doc) => {
+                patch.check_cheap()?;
+                Some(doc)
+            }
+            None => patch.check()?,
+        };
         self.edit_timeline("Update animated title", move |timeline| {
             let frame = timeline.preset_frame();
             let o = timeline
@@ -6571,6 +6608,104 @@ mod tests {
             project.update_svg_overlay(o.id, SvgOverlayPatch::default()),
             Err(Error::SvgOverlayNotFound(_))
         ));
+    }
+
+    #[test]
+    fn a_checked_source_adds_and_updates_what_the_plain_methods_do() {
+        let direct = Project::open_in_memory().unwrap();
+        let split = Project::open_in_memory().unwrap();
+        let layout = SvgLayout {
+            name: Some(" Logo ".into()),
+            x: Some(0.25),
+            ..SvgLayout::default()
+        };
+        let a = direct
+            .add_svg_overlay(SvgSource::Custom(svg_fixture("3s")), 1.0, None, layout.clone())
+            .unwrap();
+        // The check is the part that parses; what takes the project's lock after it does not.
+        let checked = SvgSource::Custom(svg_fixture("3s")).check().unwrap();
+        assert!(matches!(&checked, SvgChecked::Custom(doc) if doc.natural_duration() == Some(3.0)));
+        let b = split.add_svg_overlay_parsed(checked, 1.0, None, layout).unwrap();
+        let same = |x: &SvgOverlay, y: &SvgOverlay| SvgOverlay { id: y.id, ..x.clone() } == *y;
+        assert!(same(&a.overlay, &b.overlay), "{:?} vs {:?}", a.overlay, b.overlay);
+        assert_eq!(a.warnings, b.warnings);
+        assert_eq!(split.history().unwrap().last().unwrap().label, "Add animated title");
+
+        // Bad sources are refused by the check, with the lock not yet taken.
+        assert!(matches!(
+            SvgSource::Custom("<nope/>".into()).check(),
+            Err(Error::InvalidArgument(_))
+        ));
+        let mut preset = SvgPreset {
+            kind: crate::model::SvgPresetKind::FadeUp,
+            params: SvgPresetParams::new("Hi"),
+        };
+        assert!(matches!(SvgSource::Preset(preset.clone()).check(), Ok(SvgChecked::Preset(_))));
+        preset.params.color = "not a colour".into();
+        assert!(matches!(SvgSource::Preset(preset).check(), Err(Error::InvalidArgument(_))));
+
+        // An update: the patch is checked first, and its answer is the artwork.
+        let id = b.overlay.id;
+        let patch = SvgOverlayPatch {
+            svg: Some(svg_fixture("1s")),
+            end: Some(9.0),
+            ..Default::default()
+        };
+        let doc = patch.check().unwrap();
+        assert!(doc.as_ref().is_some_and(|d| d.natural_duration() == Some(1.0)));
+        let updated = split.update_svg_overlay_parsed(id, patch.clone(), doc).unwrap();
+        let plain = direct.update_svg_overlay(a.overlay.id, patch).unwrap();
+        assert!(same(&plain.overlay, &updated.overlay));
+        assert!(updated.overlay.svg.contains("dur=\"1s\""));
+        // A patch with no artwork has nothing to check; a bad one is refused before the lock.
+        assert!(SvgOverlayPatch::default().check().unwrap().is_none());
+        for bad in [
+            SvgOverlayPatch {
+                svg: Some("<nope/>".into()),
+                ..Default::default()
+            },
+            SvgOverlayPatch {
+                svg: Some(svg_fixture("1s")),
+                preset_params: Some(SvgPresetParams::new("x")),
+                ..Default::default()
+            },
+            SvgOverlayPatch {
+                start: Some(f64::NAN),
+                ..Default::default()
+            },
+            SvgOverlayPatch {
+                preset_params: Some(SvgPresetParams {
+                    accent: "x".repeat(100),
+                    ..SvgPresetParams::new("x")
+                }),
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(bad.check(), Err(Error::InvalidArgument(_))), "{bad:?}");
+            assert!(matches!(
+                split.update_svg_overlay_parsed(id, bad.clone(), None),
+                Err(Error::InvalidArgument(_))
+            ));
+        }
+        // With a doc in hand the cheap checks still run, and the patch's own svg is not parsed again.
+        let with_doc = SvgOverlayPatch {
+            svg: Some("<not even xml".into()),
+            ..Default::default()
+        };
+        let doc = SvgDoc::parse(&svg_fixture("2s")).unwrap();
+        let swapped = split.update_svg_overlay_parsed(id, with_doc, Some(doc)).unwrap();
+        assert!(swapped.overlay.svg.contains("dur=\"2s\""));
+        assert!(split
+            .update_svg_overlay_parsed(
+                id,
+                SvgOverlayPatch {
+                    svg: Some(svg_fixture("1s")),
+                    preset_params: Some(SvgPresetParams::new("x")),
+                    ..Default::default()
+                },
+                Some(SvgDoc::parse(&svg_fixture("1s")).unwrap())
+            )
+            .is_err());
     }
 
     #[test]

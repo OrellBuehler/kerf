@@ -347,23 +347,38 @@
   `@import`, `@keyframes` and `animation*` / `transition*` (warning "CSS animations are not
   rendered — use SMIL"); a plain DOCTYPE is cut, one with an internal subset is refused; caps
   128 KiB, 20,000 elements, depth 64, 2,000 animations, 1,000 values each, `MAX_SVG_OVERLAYS` =
-  50 a timeline. **It is a splice, not a re-serialisation** (byte ranges of the original, so the
+  50 a timeline. **Depth is read off the bytes before roxmltree sees the text** (`nesting_exceeds`: it
+  recurses per open element with no limit of its own, and ~3,500 nested `<g>` — 25 KB — abort a 2 MiB
+  thread's stack; comments / CDATA / PIs and quoted values are skipped); an animation's `attributeName`
+  must be an XML name with at most one prefix (`is_attribute_name`) because `at` writes it into the
+  document as markup (`x="1" href="/etc/passwd" onload="a" y` was an injection), and only `xlink:href` of
+  the XLink attributes survives, **and only when no unprefixed `href` is beside it** — resvg reads
+  `xlink:width` as `width` and the unprefixed `href` over the XLink one, and **roxmltree's bare-name
+  `node.attribute("href")` matches `xlink:href` too** (use `sanitize::plain_attribute` for "no namespace"). **It is a splice, not a re-serialisation** (byte ranges of the original, so the
   second pass over its own output changes nothing — a test sweeps nasty inputs for exactly
   that). **`SvgDoc::parse` + `SvgDoc::at(doc_t)`** are the evaluator: the document is read once
   (roxmltree, then a usvg parse to refuse what resvg cannot size — a `viewBox` or pixel
   `width`/`height` is required, since resvg sizes a bare document to its content and an
   animation would change that per frame; `<use>` / `feImage` expansion is counted from the XML
   *first* — more than 100,000 drawn nodes, 128 levels or a reference cycle is refused, since usvg
-  expands a cycle to its million-node limit before it notices), and `at` returns a *static* SVG for one moment —
+  expands a cycle to its million-node limit before it notices; the target of a `use` is its unprefixed
+  `href`, else `xlink:href`, as resvg's, and a `url(#id)` in `fill` / `stroke` / `mask` / `clip-path` /
+  `filter` / `marker-*` (attribute or `style`) counts the target again for every element that draws it), and `at` returns a *static* SVG for one moment —
   animation elements cut out, animated attributes spliced in — which is what every renderer is
   handed, so a still, a stream and an export of the same moment are one picture. A CSS property
   (`opacity`, `fill`, `visibility`…) is written by appending `;prop:value` to `style` (a rule in
-  `<style>` beats a presentation attribute, an inline declaration beats the rule); geometry is a
-  replaced / inserted attribute. **The subset**: `animate`, `animateColor`, `set`,
+  `<style>` beats a presentation attribute, an inline declaration beats the rule; no leading `;` after an
+  empty or `;`-ended style, where resvg's CSS reader would drop it); geometry is a replaced / inserted
+  attribute. The value an animation starts from is the element's own, else for an **inherited** property
+  (`values::is_inherited`: fill, stroke*, font-*, letter-spacing, visibility, …) the nearest ancestor's
+  `style` declaration or attribute, else the initial one (`opacity`, `display`, `stop-color` are not inherited) **The subset**: `animate`, `animateColor`, `set`,
   `animateTransform`; `begin` / `end` clock values, `id.begin|end ± offset` syncbases (resolved
-  once, memoised, 32 deep, a cycle is unresolved), `indefinite`; `dur`, `repeatCount` /
+  once, memoised, 32 deep, a cycle is unresolved), `indefinite`; an `end` list with an **unresolved** item (an event, a syncbase on nothing or on an animation that
+  never begins / ends) leaves the interval open — its natural length — where one whose times all precede the begin
+  makes no interval; `dur`, `repeatCount` /
   `repeatDur`, `min` / `max`, `fill`, `restart`, `values` / `from` / `to` / `by`, `keyTimes`,
   `calcMode` linear / discrete / paced / spline (Newton + bisection), `additive`, `accumulate`
+  (ignored for a `to`-only animation, as in SMIL; the repeat index is an `f64`, not a saturating `u32`)
   and the sandwich (begin time, then document order; a transform sum post-multiplies onto the
   base transform). A frozen value is the last one when the active duration is an exact multiple
   of `dur`, else the value at `AD mod dur`. Colours blend per sRGB channel, paths blend only on

@@ -2141,6 +2141,35 @@ pub struct SvgOverlayPatch {
     pub opacity: Option<f64>,
 }
 
+impl SvgOverlayPatch {
+    /// What a patch can be refused for without the timeline and without parsing: the artwork and the
+    /// preset parameters are exclusive, the parameters are valid, the times are numbers.
+    pub fn check_cheap(&self) -> crate::error::Result<()> {
+        use crate::error::Error;
+        if self.svg.is_some() && self.preset_params.is_some() {
+            return Err(Error::InvalidArgument(
+                "pass either svg or preset_params, not both".to_string(),
+            ));
+        }
+        if let Some(params) = &self.preset_params {
+            crate::svg::check_params(params)?;
+        }
+        if [self.start, self.end].iter().flatten().any(|v| !v.is_finite()) {
+            return Err(Error::InvalidArgument("start and end must be numbers of seconds".to_string()));
+        }
+        Ok(())
+    }
+
+    /// Everything about the patch that costs time: [`SvgOverlayPatch::check_cheap`], then the custom
+    /// artwork sanitised and parsed (up to a second and a half for a heavy document). A surface calls
+    /// this **before it takes the project lock** and gives the result to
+    /// `Project::update_svg_overlay_parsed`.
+    pub fn check(&self) -> crate::error::Result<Option<crate::svg::SvgDoc>> {
+        self.check_cheap()?;
+        self.svg.as_deref().map(crate::svg::SvgDoc::parse).transpose()
+    }
+}
+
 /// Linearly interpolate a channel of `(time, value)` keyframes at `at`, holding
 /// the end values flat beyond the first / last keyframe. Empty input → `None`.
 pub fn interpolate(points: &[(f64, f64)], at: f64) -> Option<f64> {

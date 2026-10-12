@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use anim::{Calc, Resolver, Restart, Sample, Spec, TimeItem, Timing, INF};
-use sanitize::{escape_attr, value_range, SVG_NS, XLINK_NS};
+use sanitize::{escape_attr, is_attribute_name, plain_attribute, value_range, SVG_NS, XLINK_NS};
 use values::{TransformType, Value};
 
 pub use presets::{check_params, preset_infos, render_preset, SvgPresetInfo, SvgPresetParamInfo, DEFAULT_FRAME};
@@ -151,10 +151,11 @@ impl Anim {
             self.calc,
             s.frac,
         );
-        if self.accumulate && s.iter > 0 {
+        // SMIL: accumulate is ignored for an animation with only a `to`.
+        if self.accumulate && !self.to_only && s.iter > 0.0 {
             if let Some(sum) = vals
                 .last()
-                .and_then(|last| values::scale(last, f64::from(s.iter)))
+                .and_then(|last| values::scale(last, s.iter))
                 .and_then(|more| values::add(&v, &more))
             {
                 v = sum;
@@ -320,7 +321,17 @@ impl SvgDoc {
             let target = &self.targets[i];
             if !style.is_empty() {
                 match &target.style {
-                    Some((range, quote)) => cuts.push((range.end..range.end, escape_attr(style, *quote))),
+                    Some((range, quote)) => {
+                        // ";opacity:.5" after nothing (or after a declaration that already ended in
+                        // one) is an empty declaration, which resvg's CSS reader drops with the rest.
+                        let before = &self.src[range.clone()];
+                        let add = if before.trim().is_empty() || before.trim_end().ends_with(';') {
+                            style.trim_start_matches(';')
+                        } else {
+                            style.as_str()
+                        };
+                        cuts.push((range.end..range.end, escape_attr(add, *quote)));
+                    }
                     None => attrs.push_str(&format!(" style=\"{}\"", escape_attr(style.trim_start_matches(';'), '"'))),
                 }
             }
@@ -363,8 +374,59 @@ fn has_size(root: &Node) -> bool {
     matches!((root.attribute("width"), root.attribute("height")), (Some(w), Some(h)) if positive(w, false) && positive(h, false))
 }
 
+/// The link of an element the way resvg reads it: the unprefixed `href`, then `xlink:href` (SVG 2
+/// lets the first win whatever their order; reading them the other way round let a cheap target
+/// stand in for an expensive one here and be drawn as the expensive one).
 fn href_of<'a>(node: &Node<'a, '_>) -> Option<&'a str> {
-    node.attribute((XLINK_NS, "href")).or_else(|| node.attribute("href"))
+    plain_attribute(node, "href").or_else(|| node.attribute((XLINK_NS, "href")))
+}
+
+/// The ids a property value points at with `url(#id)` (a `filter` may name several).
+fn url_ids(value: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = value;
+    while let Some(i) = rest.find("url(") {
+        let after = &rest[i + 4..];
+        let end = after.find(')').unwrap_or(after.len());
+        let arg = after[..end].trim().trim_matches(['"', '\'']).trim();
+        if let Some(id) = arg.strip_prefix('#') {
+            out.push(id);
+        }
+        rest = &after[end..];
+    }
+    out
+}
+
+/// The properties whose `url(#id)` makes the element draw another one (a paint server, a mask, a
+/// clip, a filter, a marker): each use costs what the target does, which the expansion guard counts.
+const REFERENCING: [&str; 8] = [
+    "fill",
+    "stroke",
+    "mask",
+    "clip-path",
+    "filter",
+    "marker-start",
+    "marker-mid",
+    "marker-end",
+];
+
+/// The elements `node` draws through `url(#id)` properties, in an attribute or in `style`.
+fn referenced(node: &Node, by_id: &HashMap<String, NodeId>) -> Vec<NodeId> {
+    let style = node.attribute("style").unwrap_or("");
+    let mut ids: Vec<&str> = Vec::new();
+    for prop in REFERENCING {
+        if let Some(v) = node.attribute(prop) {
+            ids.extend(url_ids(v));
+        }
+        if let Some((_, v)) = style
+            .split(';')
+            .filter_map(|d| d.split_once(':'))
+            .find(|(p, _)| p.trim().eq_ignore_ascii_case(prop))
+        {
+            ids.extend(url_ids(v));
+        }
+    }
+    ids.into_iter().filter_map(|id| by_id.get(id).copied()).collect()
 }
 
 /// What a document costs once its `<use>` (and `feImage`) references are expanded — the way
@@ -399,6 +461,11 @@ fn check_expansion(doc: &Document, by_id: &HashMap<String, NodeId>) -> Result<()
                     .and_then(|id| self.doc.get_node(*id));
                 next.extend(target);
             }
+            next.extend(
+                referenced(&node, self.by_id)
+                    .into_iter()
+                    .filter_map(|id| self.doc.get_node(id)),
+            );
             for n in next {
                 let (w, d) = self.visit(n, nest + 1)?;
                 weight = weight.saturating_add(w);
@@ -469,8 +536,19 @@ fn slot_for(src: &str, node: &Node, target: usize, attr: &str) -> Slot {
     } else {
         None
     };
+    // What an inherited property (a fill, a font size, a visibility) is when the element does not
+    // say: the nearest ancestor's, as a browser would — the animation's `from` / `by` and its
+    // additive sum start from that, not from the initial value.
+    let inherited = || {
+        node.ancestors().skip(1).filter(Node::is_element).find_map(|a| {
+            a.attribute("style")
+                .and_then(|s| style_declaration(s, attr))
+                .or_else(|| a.attribute(attr).map(str::to_string))
+        })
+    };
     let text = declared
         .or_else(|| node.attribute(attr).map(str::to_string))
+        .or_else(|| (css && values::is_inherited(attr)).then(inherited).flatten())
         .or_else(|| values::default_text(attr).map(str::to_string));
     let base = if transform {
         Value::Transform(text.unwrap_or_default().trim().to_string())
@@ -521,13 +599,20 @@ impl Reader<'_> {
             self.warn(format!("<{name}> has no element to animate and was dropped"));
             return Ok(());
         };
-        let Some(attr) = node
-            .attribute("attributeName")
-            .map(|a| a.rsplit(':').next().unwrap_or(a).trim())
-        else {
+        let Some(raw) = node.attribute("attributeName") else {
             self.warn(format!("<{name}> without attributeName was dropped"));
             return Ok(());
         };
+        // The name is written into the document as markup when a frame is made, so it must be a
+        // name and nothing else (the sanitiser drops these too; this is for a document read as is).
+        if !is_attribute_name(raw.trim()) {
+            self.warn(format!(
+                "<{name}> animates \"{}\", which is not an attribute name, and was dropped",
+                raw.chars().take(40).collect::<String>()
+            ));
+            return Ok(());
+        }
+        let attr = raw.rsplit(':').next().unwrap_or(raw).trim();
         if attr.is_empty() {
             self.warn(format!("<{name}> without attributeName was dropped"));
             return Ok(());
@@ -1334,5 +1419,204 @@ mod tests {
                 t += 0.37;
             }
         }
+    }
+
+    // ---- review fixes -------------------------------------------------------------------------
+
+    #[test]
+    fn an_attribute_name_cannot_inject_markup_into_a_frame() {
+        let inner = "<rect id=\"r\" width=\"2\" height=\"2\"><animate attributeName='x=&quot;1&quot; href=&quot;/etc/passwd&quot; onload=&quot;a&quot; y' to=\"5\" dur=\"1s\" fill=\"freeze\"/><set attributeName=\"a&lt;b\" to=\"1\"/><set attributeName=\"a;b\" to=\"1\"/></rect>";
+        let d = doc(inner);
+        for t in [0.0, 0.5, 2.0] {
+            let out = d.at(t);
+            assert!(!out.contains("passwd") && !out.contains("onload"), "{out}");
+            Document::parse(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+        }
+        assert!(
+            d.warnings().iter().any(|w| w.contains("not an attribute name")),
+            "{:?}",
+            d.warnings()
+        );
+        assert!(!d.is_animated());
+    }
+
+    #[test]
+    fn a_use_with_two_links_is_counted_as_the_one_resvg_draws() {
+        // 5 * 2^12 - 3 nodes under g12: fine once defined, more than the limit drawn four times.
+        let mut defs = String::from("<defs><g id=\"g0\"><rect width=\"1\" height=\"1\"/></g>");
+        for i in 1..=12 {
+            defs.push_str(&format!(
+                "<g id=\"g{i}\"><use href=\"#g{}\"/><use href=\"#g{}\"/></g>",
+                i - 1,
+                i - 1
+            ));
+        }
+        defs.push_str("</defs>");
+        assert!(SvgDoc::parse(&svg(&format!("{defs}<use href=\"#g12\"/>"))).is_ok());
+        for each in [
+            "<use xlink:href=\"#g0\" href=\"#g12\"/>",
+            "<use href=\"#g12\" xlink:href=\"#g0\"/>",
+            "<use href=\"#g12\"/>",
+        ] {
+            let e = SvgDoc::parse(&svg(&format!("{defs}{}", each.repeat(4))))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("more than 100000 nodes"), "{each}: {e}");
+        }
+        // The cheap target alone is cheap, and so is a cheap `href` beside an `xlink:href` to the heavy one.
+        for each in ["<use xlink:href=\"#g0\"/>", "<use href=\"#g0\" xlink:href=\"#g12\"/>"] {
+            assert!(SvgDoc::parse(&svg(&format!("{defs}{}", each.repeat(4)))).is_ok(), "{each}");
+        }
+    }
+
+    #[test]
+    fn a_mask_or_a_paint_used_many_times_costs_what_it_holds_each_time() {
+        // 5 * 2^11 - 3 nodes in a mask: fine once, over the limit when eight shapes draw it, from a few hundred bytes.
+        let mut heavy = String::from("<g id=\"g0\"><rect width=\"1\" height=\"1\"/></g>");
+        for i in 1..=11 {
+            heavy.push_str(&format!(
+                "<g id=\"g{i}\"><use href=\"#g{}\"/><use href=\"#g{}\"/></g>",
+                i - 1,
+                i - 1
+            ));
+        }
+        for (prop, def) in [
+            ("mask", "mask id=\"m\""),
+            ("clip-path", "clipPath id=\"m\""),
+            ("filter", "filter id=\"m\""),
+            (
+                "fill",
+                "pattern id=\"m\" width=\"4\" height=\"4\" patternUnits=\"userSpaceOnUse\"",
+            ),
+            ("marker-end", "marker id=\"m\""),
+        ] {
+            let close = def.split(' ').next().unwrap();
+            let doc = |users: &str| {
+                svg(&format!("<defs>{heavy}<{def}><use href=\"#g11\"/></{def}></defs>{users}")
+                    .replace(&format!("</{def}>"), &format!("</{close}>")))
+            };
+            let user = format!("<rect width=\"9\" height=\"9\" {prop}=\"url(#m)\"/>");
+            let styled = format!("<rect width=\"9\" height=\"9\" style=\"{prop}: url(#m)\"/>");
+            assert!(SvgDoc::parse(&doc(&user)).is_ok(), "{prop}: once is fine");
+            for each in [&user, &styled] {
+                let e = SvgDoc::parse(&doc(&each.repeat(8))).unwrap_err().to_string();
+                assert!(e.contains("more than 100000 nodes"), "{prop}: {e}");
+            }
+        }
+        // An ordinary gradient used a hundred times is nothing.
+        let grad = "<defs><linearGradient id=\"g\"><stop offset=\"0\"/><stop offset=\"1\"/></linearGradient></defs>";
+        let many = "<rect width=\"1\" height=\"1\" fill=\"url(#g)\" stroke=\"url(#g)\"/>".repeat(100);
+        assert!(SvgDoc::parse(&svg(&format!("{grad}{many}"))).is_ok());
+    }
+
+    #[test]
+    fn a_style_that_is_empty_or_already_ends_in_a_semicolon_gets_no_empty_declaration() {
+        let anim = "<animate attributeName=\"opacity\" from=\"0\" to=\"1\" dur=\"2s\" fill=\"freeze\"/>";
+        for (style, want) in [
+            ("", "<rect style=\"opacity:0.5\"></rect>"),
+            ("  ", "<rect style=\"  opacity:0.5\"></rect>"),
+            ("fill:red", "<rect style=\"fill:red;opacity:0.5\"></rect>"),
+            ("fill:red;", "<rect style=\"fill:red;opacity:0.5\"></rect>"),
+            ("fill:red; ", "<rect style=\"fill:red; opacity:0.5\"></rect>"),
+        ] {
+            let got = at(&format!("<rect style=\"{style}\">{anim}</rect>"), 1.0);
+            assert_eq!(got, want, "style = {style:?}");
+        }
+        // The frame reads: resvg keeps the declaration (it is the group's opacity).
+        let out = doc(&format!("<rect style=\"\" width=\"9\" height=\"9\">{anim}</rect>")).at(1.0);
+        let parsed = Document::parse(&out).unwrap();
+        let tree = resvg::usvg::Tree::from_xmltree(&parsed, &resvg::usvg::Options::default()).unwrap();
+        assert!(
+            tree.root()
+                .children()
+                .iter()
+                .any(|n| matches!(n, resvg::usvg::Node::Group(g) if (g.opacity().get() - 0.5).abs() < 1e-6)),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn an_end_that_never_resolves_leaves_the_interval_open() {
+        let rect = |anim: &str| format!("<rect x=\"0\">{anim}</rect>");
+        // A syncbase on nothing, on an animation that never begins, and an event: all "unresolved".
+        for end in [
+            "nothing.end",
+            "never.begin",
+            "click",
+            "nothing.end; click",
+            "nothing.begin+1s",
+        ] {
+            let inner = rect(&format!(
+                "<animate id=\"never\" begin=\"indefinite\" attributeName=\"y\" to=\"1\" dur=\"1s\"/>\
+                 <animate attributeName=\"x\" from=\"0\" to=\"10\" dur=\"2s\" end=\"{end}\" fill=\"freeze\"/>"
+            ));
+            let d = doc(&inner);
+            assert_eq!(at(&inner, 1.0), "<rect x=\"5\"></rect>", "end = {end}");
+            assert_eq!(d.natural_duration(), Some(2.0), "end = {end}");
+        }
+        // A list with a time before the begin is "no interval", as ever; so is an end at the begin.
+        for end in ["1s", "2s", "0s"] {
+            let inner = rect(&format!(
+                "<animate attributeName=\"x\" from=\"0\" to=\"10\" begin=\"2s\" dur=\"4s\" end=\"{end}\" fill=\"freeze\"/>"
+            ));
+            assert_eq!(at(&inner, 4.0), "<rect x=\"0\"></rect>", "end = {end}");
+        }
+        // A resolved end still ends it: a syncbase on an animation that does end.
+        let inner = rect(
+            "<animate id=\"a\" attributeName=\"y\" to=\"1\" dur=\"1s\"/>\
+             <animate attributeName=\"x\" from=\"0\" to=\"10\" dur=\"4s\" end=\"a.end\"/>",
+        );
+        let early = at(&inner, 0.5);
+        assert!(early.contains("x=\"1.25\"") && early.contains("y=\"0.5\""), "{early}");
+        assert_eq!(at(&inner, 2.0), "<rect x=\"0\"></rect>");
+    }
+
+    #[test]
+    fn accumulate_means_nothing_to_a_to_only_animation() {
+        let rect = |anim: &str| format!("<rect x=\"0\">{anim}</rect>");
+        let to_only = rect("<animate attributeName=\"x\" to=\"10\" dur=\"1s\" repeatCount=\"3\" accumulate=\"sum\"/>");
+        let plain = rect("<animate attributeName=\"x\" to=\"10\" dur=\"1s\" repeatCount=\"3\"/>");
+        for t in [0.5, 1.5, 2.5] {
+            assert_eq!(at(&to_only, t), at(&plain, t), "t = {t}");
+        }
+        assert_eq!(at(&to_only, 2.5), "<rect x=\"5\"></rect>");
+        // With a from it does add up.
+        let from_to = rect("<animate attributeName=\"x\" from=\"0\" to=\"10\" dur=\"1s\" repeatCount=\"3\" accumulate=\"sum\"/>");
+        assert_eq!(at(&from_to, 2.5), "<rect x=\"25\"></rect>");
+    }
+
+    #[test]
+    fn an_animation_starts_from_what_an_inherited_property_is_here() {
+        // The font size comes from the group, so `by` adds to 20, not to the default.
+        let by = "<g font-size=\"20\"><text><animate attributeName=\"font-size\" by=\"10\" additive=\"sum\" dur=\"2s\" fill=\"freeze\"/>t</text></g>";
+        assert!(at(by, 2.0).contains("font-size:30"), "{}", at(by, 2.0));
+        // A `to` animation of a colour starts from the ancestor's fill, midway between red and blue.
+        let to = "<g fill=\"#ff0000\"><rect width=\"9\" height=\"9\"><animate attributeName=\"fill\" to=\"#0000ff\" dur=\"2s\" fill=\"freeze\"/></rect></g>";
+        let mid = at(to, 1.0);
+        assert!(mid.contains("fill:#800080") || mid.contains("fill:#7f007f"), "{mid}");
+        // The nearest ancestor wins, a style declaration beats its attribute, and the element's own beats both.
+        let nearest = "<g fill=\"#00ff00\"><g style=\"fill:#ff0000\" fill=\"#0000ff\"><rect width=\"9\" height=\"9\"><animate attributeName=\"fill\" to=\"#0000ff\" dur=\"2s\" fill=\"freeze\"/></rect></g></g>";
+        assert!(
+            at(nearest, 1.0).contains("fill:#800080") || at(nearest, 1.0).contains("fill:#7f007f"),
+            "{}",
+            at(nearest, 1.0)
+        );
+        let own = "<g fill=\"#00ff00\"><rect fill=\"#ff0000\" width=\"9\" height=\"9\"><animate attributeName=\"fill\" to=\"#0000ff\" dur=\"2s\" fill=\"freeze\"/></rect></g>";
+        assert!(
+            at(own, 1.0).contains("fill:#800080") || at(own, 1.0).contains("fill:#7f007f"),
+            "{}",
+            at(own, 1.0)
+        );
+        // A property that is not inherited starts from its own initial value whatever the group says.
+        let opacity = "<g opacity=\"0.2\"><rect width=\"9\" height=\"9\"><animate attributeName=\"opacity\" to=\"0\" dur=\"2s\" fill=\"freeze\"/></rect></g>";
+        assert!(at(opacity, 1.0).contains("opacity:0.5"), "{}", at(opacity, 1.0));
+    }
+
+    #[test]
+    fn a_repeat_count_past_what_a_u32_holds_still_counts_repeats() {
+        let inner = "<rect x=\"0\"><animate attributeName=\"x\" from=\"0\" to=\"1\" dur=\"1s\" repeatCount=\"indefinite\" accumulate=\"sum\"/></rect>";
+        // 5e9 repeats in: more than u32::MAX (4.29e9), which `as u32` used to clamp to.
+        assert_eq!(at(inner, 5_000_000_000.5), "<rect x=\"5000000000.5\"></rect>");
+        assert_eq!(at(inner, 3.5), "<rect x=\"3.5\"></rect>");
     }
 }
