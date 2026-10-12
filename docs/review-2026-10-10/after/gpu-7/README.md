@@ -140,6 +140,18 @@ after the teardown commit, and 30 consecutive runs on 9.0.2 and 20 on 6.1.1 with
 and warnings, `bun run test` 2878 passed, `bun run build` ok. The golden argv oracle is untouched
 (`git diff --name-only origin/main HEAD | grep golden` is empty).
 
+## 5b. Round 1 review fixes (commits 4fcdf12, 177b00c, 8b0daa7, 8a80e45)
+
+Merged tree + the fixes, both FFmpegs (`ignored-suites-round2.txt`, `play-tests-x10-round2.txt`): kerf-core 1289, kerf-gpu `--lib` 123 and
+kerf-app 172 unit tests pass; `--ignored` on 6.1.1 and 9.0.2: `--lib` self-test 11, `frame_source` 17, `prefetch` 7, `motion_parity` 23, `parity` 44,
+`playback` 12 (was 8), `cursor` 4, `compositor` 16, `coverage` 1, `text` 6, kerf-app `drive_tests` + `play_tests` 16 (was 11); `play_tests` 10 runs on each
+FFmpeg without a failure or an exit crash. `playback-report-ffmpeg-*.txt` now has 30 rows: the 21 before are still 0 levels; the new ones are a still image
+(0), a title (0, before it, into it and inside it), a placed layer over another track (1 level, the scaler's) and a scaled translucent one (2: the scaler's
+level and the round trip's); a dissolve out of a still image is held to the slice's export (a PNG is a 25 fps stream, so the cut is 25 fps with a 30 fps
+clip in it, and the whole cut's picks differ from the slice's in the frames the conversion drops). Frontend: `bun run check` 0/0, `bun run test` 2890
+pass, `bun run build` ok. The start-latency table above was measured before these commits; they change how a session ends and what is checked before its first frame
+(one `check_cursor` per layer on screen, the probes the first cursor opened would have paid), not the draw path.
+
 ## 6. Not verified here (needs a real machine)
 
 - The sound's output latency and the A/V offset (section 3), per OS and output; WebKit's `getOutputTimestamp()`
