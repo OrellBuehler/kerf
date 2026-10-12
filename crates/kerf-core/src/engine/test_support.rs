@@ -132,6 +132,31 @@ pub(crate) fn image_stream(w: u32, h: u32) -> StreamInfo {
     }
 }
 
+/// Pictures of the shapes `Project::probe_asset` really gives for files whose tag is **the
+/// decoder's default, not the file's word** (probed with ffprobe on FFmpeg 6.1.1 and 9.0.2): a PNG
+/// is tagged `gbr` whatever its layout, so is RGB video, a JPEG or a WebP is `bt470bg`, and so is
+/// MJPEG video (`yuvj420p`). None of them names a matrix to a graph.
+pub(crate) fn decoder_default_pictures(w: u32, h: u32) -> Vec<(&'static str, StreamInfo)> {
+    let make = |codec: &str, pix_fmt: &str, tag: &str, image: bool| {
+        let mut s = if image { image_stream(w, h) } else { video_stream(w, h, 30.0) };
+        s.codec = codec.into();
+        s.pix_fmt = Some(pix_fmt.into());
+        s.color_space = Some(tag.into());
+        s
+    };
+    vec![
+        ("png rgb24 gbr", make("png", "rgb24", "gbr", true)),
+        ("png rgba gbr", make("png", "rgba", "gbr", true)),
+        ("png gray gbr", make("png", "gray", "gbr", true)),
+        ("jpeg yuvj420p bt470bg", make("mjpeg", "yuvj420p", "bt470bg", true)),
+        ("webp yuv420p bt470bg", make("webp", "yuv420p", "bt470bg", true)),
+        ("mjpeg video yuvj420p bt470bg", make("mjpeg", "yuvj420p", "bt470bg", false)),
+        ("mjpeg video yuvj422p bt470bg", make("mjpeg", "yuvj422p", "bt470bg", false)),
+        ("ffv1 bgr0 gbr", make("ffv1", "bgr0", "gbr", false)),
+        ("h264 gbrp gbr", make("h264", "gbrp", "gbr", false)),
+    ]
+}
+
 /// A clip of `asset_id`'s `source_in..source_out` placed at `timeline_start`.
 pub(crate) fn make_clip(asset_id: Uuid, source_in: f64, source_out: f64, timeline_start: f64) -> Clip {
     Clip::new(asset_id, source_in, source_out, timeline_start)

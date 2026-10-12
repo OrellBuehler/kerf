@@ -1459,3 +1459,127 @@ fn the_argv_builders_still_produce_the_golden_digests() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// What the BT.709 label may be asked of: pictures standing where the corpus' HDR clips stand.
+/// The corpus names a matrix only with HDR, and its stills carry no tag, so the digests cannot
+/// tell a decoder's default tag (a PNG's `gbr`, a JPEG's or WebP's or an MJPEG webcam's `bt470bg`,
+/// all probed) from the file's word. Every case that holds an HDR clip is therefore built again with
+/// that clip replaced by one of these, same size and place, and the label must appear in exactly the
+/// graphs the stand-in names a matrix for: nowhere for the shapes that name nothing (a project of
+/// untagged HD footage and a logo or a photo is as it always was), where HDR was for the shapes
+/// that do.
+const STAND_INS: [(&str, bool, bool, &str, &str, &str); 8] = [
+    // (name, names a matrix, still image, codec, pix_fmt, tag)
+    ("png rgba gbr", false, true, "png", "rgba", "gbr"),
+    ("png gray gbr", false, true, "png", "gray", "gbr"),
+    ("jpeg bt470bg", false, true, "mjpeg", "yuvj420p", "bt470bg"),
+    ("webp bt470bg", false, true, "webp", "yuv420p", "bt470bg"),
+    ("mjpeg video bt470bg", false, false, "mjpeg", "yuvj420p", "bt470bg"),
+    ("rgb video gbr", false, false, "ffv1", "bgr0", "gbr"),
+    ("h264 bt709", true, false, "h264", "yuv420p", "bt709"),
+    ("h264 smpte170m", true, false, "h264", "yuv420p", "smpte170m"),
+];
+
+#[test]
+fn a_decoders_default_tag_names_no_matrix_in_any_graph_of_the_corpus() {
+    const LABEL: &str = "setparams=colorspace=bt709";
+    let assets = pool();
+    let hdr_ids: Vec<Uuid> = assets.iter().filter(|a| a.hdr().is_some()).map(|a| a.id).collect();
+    assert!(!hdr_ids.is_empty());
+    let stand_in = |shape: usize| -> Vec<Asset> {
+        let (_, _, image, codec, pix_fmt, tag) = STAND_INS[shape];
+        assets
+            .iter()
+            .map(|a| {
+                let mut a = a.clone();
+                if hdr_ids.contains(&a.id) {
+                    for s in a.streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
+                        *s = StreamInfo {
+                            image,
+                            fps: (!image).then_some(s.fps.unwrap_or(30.0)),
+                            codec: codec.into(),
+                            pix_fmt: Some(pix_fmt.into()),
+                            color_space: Some(tag.into()),
+                            color_transfer: None,
+                            color_primaries: None,
+                            ..s.clone()
+                        };
+                    }
+                }
+                a
+            })
+            .collect()
+    };
+    let swapped: Vec<Vec<Asset>> = (0..STAND_INS.len()).map(stand_in).collect();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    // (shape, case, kind) triples that disagree, and how many cases each shape covered / labelled.
+    type Found = (Vec<String>, [usize; 8], [usize; 8]);
+    let results: Vec<Found> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|w| {
+                let (assets, swapped, hdr_ids) = (&assets, &swapped, &hdr_ids);
+                s.spawn(move || {
+                    let (mut bad, mut covered, mut labelled) = (Vec::new(), [0usize; 8], [0usize; 8]);
+                    for i in (w..TOTAL).step_by(threads) {
+                        let c = case(i, assets);
+                        let holds_hdr = c
+                            .timeline
+                            .for_render()
+                            .tracks
+                            .iter()
+                            .filter(|t| t.kind == StreamKind::Video)
+                            .flat_map(|t| &t.clips)
+                            .any(|k| hdr_ids.contains(&k.asset_id));
+                        if !holds_hdr {
+                            continue;
+                        }
+                        let shape = i % STAND_INS.len();
+                        let (text, _) = build(&c, &swapped[shape]);
+                        covered[shape] += 1;
+                        let named = STAND_INS[shape].1;
+                        let before = named.then(|| build(&c, assets).0);
+                        for (k, kind) in KINDS.iter().enumerate() {
+                            let has = text[k].contains(LABEL);
+                            // A shape that names a matrix labels exactly where HDR did.
+                            let want = before.as_ref().is_some_and(|b| b[k].contains(LABEL));
+                            labelled[shape] += usize::from(has);
+                            if has != want {
+                                bad.push(format!(
+                                    "case {i}, {kind}, {}: label {has}, wanted {want}",
+                                    STAND_INS[shape].0
+                                ));
+                            }
+                        }
+                    }
+                    (bad, covered, labelled)
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
+    });
+    let (mut covered, mut labelled) = ([0usize; 8], [0usize; 8]);
+    let mut bad = Vec::new();
+    for (b, c, l) in results {
+        bad.extend(b);
+        for n in 0..8 {
+            covered[n] += c[n];
+            labelled[n] += l[n];
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "{} disagreements, first: {:?}",
+        bad.len(),
+        &bad[..bad.len().min(6)]
+    );
+    for (n, (name, named, ..)) in STAND_INS.iter().enumerate() {
+        assert!(covered[n] >= MIN_PER_FAMILY, "{name}: only {} cases", covered[n]);
+        // The controls are not empty: a shape that names a matrix does label.
+        assert_eq!(
+            labelled[n] >= MIN_PER_FAMILY,
+            *named,
+            "{name}: {} labelled graphs",
+            labelled[n]
+        );
+    }
+}

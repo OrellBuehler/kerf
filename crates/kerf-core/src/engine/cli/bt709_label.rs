@@ -51,17 +51,33 @@ struct Kit {
     sd: Asset,
     sd601: Asset,
     hd601: Asset,
-    /// Untagged HD that is JFIF (`yuvj`), RGB, with alpha, and a PNG logo.
-    mjpeg: Asset,
-    rgb: Asset,
+    /// HD with alpha (FFV1 `yuva420p`, untagged).
     alpha: Asset,
-    png: Asset,
+    /// The pictures whose tag is the decoder's default, in the shapes the probe really gives
+    /// (`test_support::decoder_default_pictures`): PNGs (`rgb24`, `rgba`, `gray`, `gbr`), a JPEG and a
+    /// WebP (`bt470bg`), MJPEG video, RGB video. They name no matrix and are never labelled.
+    defaults: Vec<Asset>,
+}
+
+impl Kit {
+    /// The kinds that are not untagged HD YCbCr, whatever their tag says.
+    fn others(&self) -> Vec<&Asset> {
+        let mut others = vec![&self.sd, &self.alpha];
+        others.extend(&self.defaults);
+        others
+    }
 }
 
 fn kit() -> Kit {
-    let mut png = picture("logo", 1920, 1080, "rgb24", None);
-    png.streams[0].image = true;
-    png.streams[0].codec = "png".into();
+    let defaults = crate::engine::test_support::decoder_default_pictures(1920, 1080)
+        .into_iter()
+        .map(|(what, stream)| {
+            let mut asset = test_asset(vec![stream]);
+            asset.name = what.into();
+            asset.path = format!("/m/{}.bin", what.replace(' ', "-"));
+            asset
+        })
+        .collect();
     Kit {
         hd: picture("hd", 1920, 1080, "yuv420p", None),
         hd2: picture("hd2", 1280, 720, "yuv420p", Some("unknown")),
@@ -70,10 +86,8 @@ fn kit() -> Kit {
         sd: picture("sd", 720, 576, "yuv420p", None),
         sd601: picture("sd601", 720, 576, "yuv420p", Some("smpte170m")),
         hd601: picture("hd601", 1920, 1080, "yuv420p", Some("smpte170m")),
-        mjpeg: picture("mjpeg", 1920, 1080, "yuvj420p", None),
-        rgb: picture("rgb", 1920, 1080, "bgr0", None),
         alpha: picture("alpha", 1920, 1080, "yuva420p", None),
-        png,
+        defaults,
     }
 }
 
@@ -236,38 +250,49 @@ fn the_label_sits_after_the_geometry_and_ahead_of_everything_that_reads_the_matr
 fn nothing_is_labelled_without_a_matrix_named_in_the_graph() {
     let k = kit();
     // A single clip of every kind, in every builder.
-    for a in [
-        &k.hd, &k.hd2, &k.phone, &k.hlg, &k.sd, &k.sd601, &k.mjpeg, &k.rgb, &k.alpha, &k.png,
-    ] {
+    let mut every = vec![&k.hd, &k.hd2, &k.phone, &k.hlg, &k.sd, &k.sd601];
+    every.extend(k.others());
+    for a in every {
         let tl = timeline_of(vec![video_track(vec![make_clip(a.id, 0.0, 1.0, 0.0)])]);
         for (builder, graph) in graphs(&tl, std::slice::from_ref(a)) {
             assert_eq!(labelled(&graph), 0, "{} alone, {builder}: {graph}", a.name);
         }
     }
-    // Untagged footage only: HD with HD, with SD, with MJPEG, RGB, alpha and a PNG logo.
-    for other in [&k.hd2, &k.sd, &k.mjpeg, &k.rgb, &k.alpha, &k.png] {
-        for (top, base) in [(&k.hd, other), (other, &k.hd)] {
+    // Untagged footage only, and footage whose only tag is its decoder's default (a PNG logo's `gbr`, a
+    // JPEG's or WebP's or an MJPEG webcam's `bt470bg`): HD with HD, with SD, with alpha, with every one
+    // of the shapes the probe gives, each way round. Nothing here names a matrix: the graph is the one
+    // it always was.
+    let mut beside = vec![&k.hd2];
+    beside.extend(k.others());
+    for other in &beside {
+        for (top, base) in [(&k.hd, *other), (*other, &k.hd)] {
             let tl = stack(base, top);
             for (builder, graph) in graphs(&tl, &[top.clone(), base.clone()]) {
                 assert_eq!(labelled(&graph), 0, "{} with {}, {builder}: {graph}", top.name, base.name);
             }
         }
     }
+    // The same with two HD clips and a shape between them, and a translucent shape on top: the decoder's
+    // tag of a logo or a photo moves no HD graph (the export's VUI included: nothing is tagged).
+    for other in k.defaults.iter().chain([&k.alpha]) {
+        let mut tl = stack(&k.hd, &k.hd2);
+        tl.tracks[1].clips[0].transform.opacity = 0.5;
+        tl.tracks.push(crate::model::Track {
+            clips: vec![pip(other, 0.0)],
+            ..crate::model::Track::new(StreamKind::Video, "V3")
+        });
+        for (builder, graph) in graphs(&tl, &[k.hd.clone(), k.hd2.clone(), other.clone()]) {
+            assert_eq!(labelled(&graph), 0, "{} on two HD clips, {builder}: {graph}", other.name);
+        }
+    }
     // Beside a named matrix, the kinds that are not untagged HD YCbCr are left as they are.
-    for other in [&k.sd, &k.mjpeg, &k.rgb, &k.alpha, &k.png] {
+    for other in k.others() {
         for (top, base) in [(&k.phone, other), (other, &k.phone)] {
             let tl = stack(base, top);
             for (builder, graph) in graphs(&tl, &[top.clone(), base.clone()]) {
                 assert_eq!(labelled(&graph), 0, "{} beside a BT.709 clip, {builder}: {graph}", other.name);
             }
         }
-    }
-    // An RGB picture whose container writes `gbr` names no YCbCr matrix.
-    let mut tagged_rgb = k.rgb.clone();
-    tagged_rgb.streams[0].color_space = Some("gbr".into());
-    let tl = stack(&k.hd, &tagged_rgb);
-    for (builder, graph) in graphs(&tl, &[k.hd.clone(), tagged_rgb]) {
-        assert_eq!(labelled(&graph), 0, "{builder}: {graph}");
     }
     // A clip of a probe that never recorded the pixel format is not known to be YCbCr.
     let mut unrecorded = k.hd.clone();
@@ -359,12 +384,11 @@ fn graph_labels(tl: &Timeline, graph: &str) -> Vec<(uuid::Uuid, bool)> {
 
 /// Every pairing of two kinds of footage, each way round, with and without a third that names nothing.
 fn pairings(k: &Kit) -> Vec<(String, Timeline, Vec<Asset>)> {
-    let all = [
-        &k.hd, &k.hd2, &k.phone, &k.hlg, &k.sd, &k.sd601, &k.hd601, &k.mjpeg, &k.rgb, &k.alpha, &k.png,
-    ];
+    let mut all = vec![&k.hd, &k.hd2, &k.phone, &k.hlg, &k.sd, &k.sd601, &k.hd601];
+    all.extend(k.others());
     let mut out = Vec::new();
-    for base in all {
-        for top in all {
+    for base in all.iter().copied() {
+        for top in all.iter().copied() {
             if base.id != top.id {
                 out.push((
                     format!("{} over {}", top.name, base.name),
@@ -916,5 +940,74 @@ fn a_mixed_stack_of_proxies_is_the_stack_of_the_originals() {
         assert!(stream.0 > 42.0, "{what}: stream {stream:?}");
     }
     drop(proxies);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Real files whose only tag is their decoder's default, probed (on 6.1.1 and 9.0.2 alike): a JPEG
+/// and a WebP say `bt470bg`, a PNG of any layout and RGB video say `gbr`, MJPEG video says `bt470bg`.
+/// Beside untagged HD they name no matrix: no builder labels anything, and the argv is the one the
+/// same file without the tag gives.
+///
+/// `cargo test -p kerf-core --no-default-features -- --ignored real_files_whose_tag`
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+fn real_files_whose_tag_is_the_decoders_default_name_no_matrix_beside_untagged_hd() {
+    let dir = scratch("defaults");
+    let hd = footage(&dir, "hd", GRADIENT, "bt709", UNTAGGED);
+    // (file, the pixel format it is made in, the encoder's arguments)
+    let files: [(&str, &str, &[&str]); 8] = [
+        ("photo.jpg", "yuvj420p", &["-frames:v", "1"]),
+        ("photo.webp", "yuv420p", &["-frames:v", "1", "-c:v", "libwebp"]),
+        ("logo-rgb24.png", "rgb24", &["-frames:v", "1"]),
+        ("logo-rgba.png", "rgba", &["-frames:v", "1"]),
+        ("grey.png", "gray", &["-frames:v", "1"]),
+        ("webcam.mkv", "yuvj420p", &["-c:v", "mjpeg", "-q:v", "3"]),
+        ("webcam-422.avi", "yuvj422p", &["-c:v", "mjpeg", "-q:v", "3"]),
+        ("capture.mkv", "bgr0", &["-c:v", "ffv1"]),
+    ];
+    let mut checked = 0;
+    for (name, pix_fmt, encoder) in files {
+        let path = dir.join(name);
+        let made = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(format!("{DETAIL},format={pix_fmt}"))
+            .args(encoder)
+            .args(["-pix_fmt", pix_fmt])
+            .arg(&path)
+            .status_bounded()
+            .expect("run ffmpeg");
+        if !made.success() {
+            eprintln!("skipped {name}: this ffmpeg cannot make it");
+            continue;
+        }
+        let shape = Project::probe_asset(&path).expect("probe");
+        let video = &shape.streams[0];
+        eprintln!(
+            "{name}: {} {} tag {:?} image {}",
+            video.codec,
+            video.pix_fmt.as_deref().unwrap_or("?"),
+            video.color_space,
+            video.image
+        );
+        assert!(!video.names_a_matrix(), "{name}: the probe's tag is the decoder's default");
+        let mut twin = shape.clone();
+        twin.streams[0].color_space = None;
+        for (top, base) in [(&hd, &shape), (&shape, &hd)] {
+            let (stacked, twinned) = (
+                stack_of(base, top, 1.0),
+                stack_of(
+                    if base.id == shape.id { &twin } else { base },
+                    if top.id == shape.id { &twin } else { top },
+                    1.0,
+                ),
+            );
+            for ((builder, graph), (_, bare)) in graphs(&stacked.0, &stacked.1).into_iter().zip(graphs(&twinned.0, &twinned.1)) {
+                assert_eq!(labelled(&graph), 0, "{name} beside untagged HD, {builder}");
+                assert_eq!(graph, bare, "{name}: its tag changed the {builder} graph");
+            }
+        }
+        checked += 1;
+    }
+    assert!(checked >= 6, "only {checked} files could be made");
     let _ = std::fs::remove_dir_all(&dir);
 }
