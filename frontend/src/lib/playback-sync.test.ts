@@ -481,7 +481,7 @@ describe('the Preview\u2019s hand-over to the stream', () => {
 	test('starts the stream no later than the engine\u2019s hand-over, in the time that is heard', () => {
 		// The pieces `createLadder`'s tests above hold: where the stream starts and what the clock is read less.
 		expect(source).toContain('earliest: takeover ? (handover?.handover ?? null) : null');
-		expect(source).toContain('latency: takeover ? (gpuPlay?.latency ?? 0) : 0');
+		expect(source).toContain('latency: takeover ? (gpuPlay?.latency ?? 0) : takeoverLatency');
 		expect(source).toContain('verdict(ui.time - offset - f.time');
 	});
 

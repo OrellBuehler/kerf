@@ -193,6 +193,9 @@
 	let gpuBarred: { seek: number; timeline: unknown } | null = null;
 	/** The rate the GPU's session was asked for at: the cut's own. */
 	let playFps = 30;
+	/** The output latency the stream that took a GPU session over reads the clock less (the audible time the GPU
+	 *  drew in), for the restarts of that stream in the same play; 0 for a stream that never was one. */
+	let takeoverLatency = 0;
 
 	// Every seek or edit restarts the stream, so a timeline that cannot render
 	// would raise the same failure on each restart; say it once per spell.
@@ -248,6 +251,7 @@
 		playbackWaiting = null;
 		if (!play || !hasClips) {
 			endStream();
+			takeoverLatency = 0;
 			return;
 		}
 		// Whether the GPU plays this session is decided here, once: the route as it is now (the setting, a
@@ -276,11 +280,12 @@
 						width: frameWidth,
 						playhead: ui.time,
 						duration: renderedDuration(editor.timeline),
-						latency: takeover ? (gpuPlay?.latency ?? 0) : 0,
+						latency: takeover ? (gpuPlay?.latency ?? 0) : takeoverLatency,
 						earliest: takeover ? (handover?.handover ?? null) : null
 					}
 				)
 			);
+			if (takeover) takeoverLatency = offset;
 			let live = true;
 			let taken = !takeover;
 			// At the cheapest rung there is nothing to restart into, and a restart costs an ffmpeg spawn on a
@@ -381,6 +386,7 @@
 		if (gpu) {
 			// The pump takes it from here: its first request decides, and a `stream` answer comes back as `handOverToStream`.
 			playFps = untrack(() => playbackFps(renderedFps(editor.timeline, editor.assets)));
+			takeoverLatency = 0;
 			gpuPlay = new GpuPlayback(playFps, untrack(() => ui.time));
 		} else {
 			beginStream(null, false);
