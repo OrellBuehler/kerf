@@ -280,8 +280,10 @@ struct Case<'a> {
     /// Every n-th frame is asked for (a newer request replaced the ones between).
     every: usize,
     against: Against,
-    /// The bound in levels of 255: how far a plane may be from the export's.
+    /// The bound in levels of 255: how far luma may be from the export's.
     bound: i32,
+    /// ... and chroma (a layer the compositor scales *and* makes translucent is a level further in chroma).
+    uv_bound: i32,
 }
 
 /// Play `case` and compare; returns `(frames compared, worst error, the session's start)`.
@@ -295,6 +297,7 @@ fn play(case: Case) -> (usize, i32, f64) {
         every,
         against,
         bound,
+        uv_bound,
     } = case;
     let cut = PlayCut::new(tl, assets, at, policy(), &OriginalMedia).expect("a cut");
     let fps = cut.rate();
@@ -319,6 +322,7 @@ fn play(case: Case) -> (usize, i32, f64) {
     let first = cut.frame_at(at);
     let last = first + (secs * fps) as u64 - 1;
     let (mut compared, mut worst, mut differing) = (0usize, 0i32, 0usize);
+    let (mut worst_y, mut worst_uv) = (0i32, 0i32);
     let mut over: Vec<(u64, i32)> = Vec::new();
     let mut j = first;
     while j <= last {
@@ -339,15 +343,22 @@ fn play(case: Case) -> (usize, i32, f64) {
             played.count()
         );
         let want = played.planes(index);
-        let mut frame_worst = 0;
+        let (mut frame_y, mut frame_uv) = (0, 0);
         for (plane, (w, g)) in want.iter().zip([&drawn.y, &drawn.u, &drawn.v]).enumerate() {
             assert_eq!(w.len(), g.len(), "{name}: plane {plane} of frame {j}");
             for (a, b) in w.iter().zip(g.iter()) {
                 let d = (i32::from(*a) - i32::from(*b)).abs();
-                frame_worst = frame_worst.max(d);
+                if plane == 0 {
+                    frame_y = frame_y.max(d);
+                } else {
+                    frame_uv = frame_uv.max(d);
+                }
                 differing += usize::from(d != 0);
             }
         }
+        let frame_worst = frame_y.max(frame_uv);
+        worst_y = worst_y.max(frame_y);
+        worst_uv = worst_uv.max(frame_uv);
         if std::env::var_os("KERF_PARITY_EXPLORE").is_some() {
             let mut near = Vec::new();
             for other in index.saturating_sub(3)..(index + 4).min(played.count()) {
@@ -362,7 +373,7 @@ fn play(case: Case) -> (usize, i32, f64) {
             }
             eprintln!("  frame {j}: worst {frame_worst} layers {} near {near:?}", plan.layers.len());
         }
-        if frame_worst > bound && over.len() < 6 {
+        if (frame_y > bound || frame_uv > uv_bound) && over.len() < 6 {
             over.push((j, frame_worst));
         }
         worst = worst.max(frame_worst);
@@ -370,7 +381,7 @@ fn play(case: Case) -> (usize, i32, f64) {
         j += every as u64;
     }
     let line = format!(
-        "{name:<52} start {:>7.4} s | {compared:>3} frames (every {every}) vs {} | worst {worst} levels, {differing} samples differ",
+        "{name:<52} start {:>7.4} s | {compared:>3} frames (every {every}) vs {} | worst {worst} levels (Y {worst_y}, UV {worst_uv}), {differing} samples differ",
         cut.start(),
         if against == Against::Slice { "slice" } else { "whole" },
     );
@@ -378,8 +389,8 @@ fn play(case: Case) -> (usize, i32, f64) {
     report().lock().unwrap().push(line);
     write_report();
     assert!(
-        worst <= bound || std::env::var_os("KERF_PARITY_EXPLORE").is_some(),
-        "{name}: a played frame is {worst} levels from the export's (bound {bound}); frames over it: {over:?}"
+        (worst_y <= bound && worst_uv <= uv_bound) || std::env::var_os("KERF_PARITY_EXPLORE").is_some(),
+        "{name}: a played frame is {worst_y} (Y) / {worst_uv} (UV) levels from the export's (bound {bound} / {uv_bound}); frames over it: {over:?}"
     );
     (compared, worst, cut.start())
 }
@@ -394,6 +405,7 @@ fn case<'a>(name: &'a str, tl: &'a Timeline, assets: &'a [Asset], at: f64, secs:
         every: 1,
         against,
         bound: 0,
+        uv_bound: 0,
     }
 }
 
@@ -596,17 +608,19 @@ fn a_layer_over_another_track_with_a_transform_and_an_opacity_is_drawn_through_c
     for at in [0.0, 0.5] {
         let name = format!("play/pip/transform @{at:.1}");
         let mut c = case(&name, &tl, &assets, at, 0.6, Against::Whole);
-        c.bound = 1;
+        (c.bound, c.uv_bound) = (1, 1);
         play(c);
     }
-    // A translucent one, scaled too: the scaler's level and the RGB round trip's (`TRANSLUCENT`: chroma one
-    // level, luma exact) on top of it, as `effect/blur on a translucent layer` records for the same layer.
+    // A translucent one, scaled too: the scaler's level (`SCALED`: 1 in every plane) and the RGB round trip's
+    // (`TRANSLUCENT`: chroma one level, luma exact) on top of it. Measured: two in luma as well as chroma, the
+    // scaler's level crossing into luma through the round trip's conversion (not the one and two the sum of the
+    // two bounds says).
     let mut glass = Clip::new(m.testsrc.id, 0.5, 1.5, 0.2);
     glass.transform.scale = 0.6;
     glass.transform.opacity = 0.7;
     let tl = two_tracks(glass);
     let mut c = case("play/pip/translucent and scaled", &tl, &assets, 0.0, 0.6, Against::Whole);
-    c.bound = 2;
+    (c.bound, c.uv_bound) = (2, 2);
     play(c);
 }
 
