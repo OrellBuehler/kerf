@@ -307,7 +307,7 @@ impl PlanStream {
     /// The matrix FFmpeg converts this picture with *inside* a graph (the frame's
     /// own, which `scale` takes from its colourspace tag): BT.709 and BT.2020 as
     /// tagged, BT.601 for the SMPTE 170M / BT.470 BG tags **and for none at all**
-    /// (swscale's default) — and for an RGB picture, which is converted to YCbCr
+    /// (swscale's default; a `reserved` value is read as none) — and for an RGB picture, which is converted to YCbCr
     /// with that default.
     ///
     /// `None` when it cannot be known: a matrix the compositor has no coefficients
@@ -320,7 +320,7 @@ impl PlanStream {
             return Some(YuvMatrix::Bt601);
         }
         match self.color_space.as_deref() {
-            None | Some("smpte170m") | Some("bt470bg") => Some(YuvMatrix::Bt601),
+            None | Some("smpte170m") | Some("bt470bg") | Some("reserved") => Some(YuvMatrix::Bt601),
             Some("bt709") => Some(YuvMatrix::Bt709),
             Some("bt2020nc") => Some(YuvMatrix::Bt2020),
             Some(_) => None,
@@ -1680,6 +1680,7 @@ mod tests {
             (Some("bt709"), false),
             (Some("smpte170m"), false),
             (Some("bt470bg"), false),
+            (Some("reserved"), false),
             (Some("bt2020nc"), false),
             (Some("bt2020c"), true),
             (Some("smpte240m"), true),
@@ -1731,6 +1732,7 @@ mod tests {
             (None, YuvMatrix::Bt601),
             (Some("smpte170m"), YuvMatrix::Bt601),
             (Some("bt470bg"), YuvMatrix::Bt601),
+            (Some("reserved"), YuvMatrix::Bt601),
             (Some("bt709"), YuvMatrix::Bt709),
             (Some("bt2020nc"), YuvMatrix::Bt2020),
         ] {
@@ -2060,6 +2062,7 @@ mod tests {
         assert_eq!(of(None), Some(YuvMatrix::Bt601));
         assert_eq!(of(Some("bt709")), Some(YuvMatrix::Bt709));
         assert_eq!(of(Some("bt2020nc")), Some(YuvMatrix::Bt2020));
+        assert_eq!(of(Some("reserved")), Some(YuvMatrix::Bt601));
         assert_eq!(of(Some("smpte240m")), None);
     }
 

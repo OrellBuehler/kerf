@@ -765,9 +765,10 @@ pub(crate) fn displayed_size(width: Option<u32>, height: Option<u32>, rotation: 
 }
 
 /// A colour tag as the engine stores it: `None` when the file does not say,
-/// rather than ffprobe's literal `"unknown"`.
+/// rather than ffprobe's literal `"unknown"` — or `"reserved"`, a value no matrix has, which
+/// FFmpeg reads as it reads none.
 pub(crate) fn known_color(tag: Option<&str>) -> Option<String> {
-    tag.filter(|t| !t.is_empty() && *t != "unknown" && *t != "unspecified")
+    tag.filter(|t| !t.is_empty() && !matches!(*t, "unknown" | "unspecified" | "reserved"))
         .map(str::to_string)
 }
 
@@ -2669,8 +2670,15 @@ fn proxy_key(source_key: &str, width: u32, tonemapped: bool, head_padded: bool) 
 /// frame-sync mode of its day. Only these sources are rebuilt, and their proxy is
 /// named `<hash>.lead.mp4` (`is_head_padded_proxy`, in `clip_timing`).
 pub fn proxy_path(src: &Path, width: u32) -> Option<PathBuf> {
+    proxy_path_for(src, width, source_traits(src).unwrap_or_default())
+}
+
+/// [`proxy_path`] for traits already read: an encode takes **one** reading for its destination and
+/// for its filters, because a probe that failed is remembered only for a minute and an encode that
+/// waited for the machine's slot can read again, and answer differently, before it starts — a
+/// tone-mapped or head-padded picture would then be written to the plain proxy's name.
+fn proxy_path_for(src: &Path, width: u32, traits: SourceTraits) -> Option<PathBuf> {
     let dir = dirs::cache_dir()?.join("kerf").join("proxies");
-    let traits = source_traits(src).unwrap_or_default();
     let padded = needs_head_pad(traits.lead);
     let key = proxy_key(&source_key(src), width, traits.hdr.is_some(), padded);
     Some(dir.join(proxy_file_name(fnv1a(&key), padded)))
@@ -2924,8 +2932,11 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         progress,
         cancel,
     } = run;
-    let dst =
-        proxy_path(src, width).ok_or_else(|| Error::Engine("no cache directory available for preview proxies".to_string()))?;
+    // One reading of the source answers everything below: where the proxy goes, whether to tone-map
+    // it and whether its video starts late.
+    let traits = source_traits(src).unwrap_or_default();
+    let dst = proxy_path_for(src, width, traits)
+        .ok_or_else(|| Error::Engine("no cache directory available for preview proxies".to_string()))?;
     if dst.is_file() {
         return Ok(dst);
     }
@@ -2964,9 +2975,6 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         progress(0.0);
     }
     let threads = proxy_threads(cpu.threads());
-    // One cached probe answers both: whether to tone-map and whether the video
-    // starts late (the same one `proxy_path` keyed this proxy on).
-    let traits = source_traits(src).unwrap_or_default();
     let tonemap = traits.hdr.map(tonemap_filter);
     let head_pad = needs_head_pad(traits.lead).then(fps_mode_flag);
     let mut run = |hw_decode: Option<&str>| -> Result<Streamed> {
@@ -9991,6 +9999,31 @@ mod tests {
     }
 
     #[test]
+    fn an_encode_names_its_proxy_from_the_traits_it_was_given() {
+        // One reading answers the destination, the tone-map and the pad: what the destination is
+        // follows from those traits alone, and a source that cannot be probed is the plain one.
+        let src = Path::new("/media/never-imported.mov");
+        let plain = SourceTraits::default();
+        let hlg = SourceTraits {
+            hdr: Some(Hdr::Hlg),
+            ..plain
+        };
+        let late = SourceTraits { lead: 0.5, ..plain };
+        let (Some(a), Some(b), Some(c), Some(unreadable)) = (
+            proxy_path_for(src, PROXY_MAX_WIDTH, plain),
+            proxy_path_for(src, PROXY_MAX_WIDTH, hlg),
+            proxy_path_for(src, PROXY_MAX_WIDTH, late),
+            proxy_path(src, PROXY_MAX_WIDTH),
+        ) else {
+            return; // no cache dir on this platform
+        };
+        assert_eq!(a, unreadable);
+        assert!(a != b && a != c && b != c);
+        assert!(is_head_padded_proxy(&c.to_string_lossy()) && !is_head_padded_proxy(&a.to_string_lossy()));
+        assert_eq!(Some(&b), proxy_path_for(src, PROXY_MAX_WIDTH, hlg).as_ref());
+    }
+
+    #[test]
     fn spherical_sources_proxy_larger_and_under_their_own_key() {
         // Reframing crops ~100° out of 360, so a 360 proxy keeps more pixels.
         assert_eq!(proxy_width(None), PROXY_MAX_WIDTH);
@@ -16731,6 +16764,11 @@ mod tests {
         let untagged = probe_json(r#""width":1280,"height":720,"color_space":"unknown""#);
         assert_eq!(untagged.streams[0].color_space, None);
         assert_eq!(probe_json(r#""width":1280,"height":720"#).streams[0].color_space, None);
+        // `reserved` (a value no matrix has) and `unspecified` are read by FFmpeg as no tag at all.
+        for none in ["reserved", "unspecified", ""] {
+            let probed = probe_json(&format!(r#""width":1280,"height":720,"color_space":"{none}""#));
+            assert_eq!(probed.streams[0].color_space, None, "{none:?}");
+        }
     }
 
     #[test]
