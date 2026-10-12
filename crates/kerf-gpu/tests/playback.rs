@@ -29,7 +29,7 @@ use kerf_core::{
     Asset, Clip, CompositeColorPolicy, Container, ExportOptions, OriginalMedia, PlayCut, Project, RateControl, StreamKind,
     Timeline, Track, Transition, TransitionKind,
 };
-use kerf_gpu::{Compositor, FrameSource, FrameSourceConfig, Gpu, GpuError, GpuOptions, MotionFrames};
+use kerf_gpu::{Compositor, FrameSource, FrameSourceConfig, Gpu, GpuError, GpuOptions, MotionFrames, Opened};
 
 // ---- the machinery -------------------------------------------------------------------
 
@@ -82,6 +82,8 @@ struct Media {
     testsrc: Asset,
     bars: Asset,
     testsrc25: Asset,
+    /// A 640x360 still image (RGB).
+    image: Asset,
     /// The same pictures as `testsrc` in a transport stream, which runs are not trusted for.
     transport: PathBuf,
 }
@@ -119,6 +121,18 @@ fn media() -> &'static Media {
             "testsrc25.mp4",
             &format!("testsrc2=size=640x360:rate=25:duration=6,{untagged}"),
         );
+        let image = dir.join("image.png");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "gradients=size=640x360:rate=1:duration=1:c0=0x20a040:c1=0xc04080:nb_colors=2:seed=3:speed=0.00001",
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "rgb24",
+            image.to_str().unwrap(),
+        ]);
         let transport = dir.join("testsrc.ts");
         ffmpeg(&[
             "-f",
@@ -139,6 +153,7 @@ fn media() -> &'static Media {
             testsrc: probed(&testsrc),
             bars: probed(&bars),
             testsrc25: probed(&testsrc25),
+            image: probed(&image),
             transport,
         }
     })
@@ -515,6 +530,103 @@ fn a_clip_of_another_rate_is_drawn_as_the_slice_the_stream_plays_is() {
 
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_still_image_is_drawn_through_a_session_as_the_export_draws_it() {
+    let m = media();
+    let mut inc = Clip::new(m.testsrc.id, 0.5, 1.5, 1.0);
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.5,
+    });
+    let tl = timeline(vec![Clip::new(m.image.id, 0.0, 1.0, 0.0), inc]);
+    let assets = [m.image.clone(), m.testsrc.clone()];
+    // From the start of the image and from inside it: its own frames, to the level.
+    for at in [0.0, 0.4] {
+        play(case(
+            &format!("play/still-image/@{at:.1}"),
+            &tl,
+            &assets,
+            at,
+            0.6,
+            Against::Whole,
+        ));
+    }
+    // From inside the dissolve out of it. A PNG is a 25 fps stream, so the cut is a 25 fps one with a 30 fps
+    // clip in it, and which source frame each output frame picks depends on where the slice starts: the
+    // session is held to the slice's export, which is the graph the stream plays (the whole cut's picks
+    // differ from it in the frames the 30 to 25 conversion drops, as with any mix of rates).
+    let (n, worst, start) = play(case(
+        "play/still-image/@1.2 (mixed rates)",
+        &tl,
+        &assets,
+        1.2,
+        0.6,
+        Against::Slice,
+    ));
+    assert!(n >= 15 && worst == 0 && start < 0.5, "{n} {worst} {start}");
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_layer_over_another_track_with_a_transform_and_an_opacity_is_drawn_through_cursors_as_the_export_draws_it() {
+    let m = media();
+    let base = Clip::new(m.bars.id, 0.5, 1.5, 0.0);
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let two_tracks = |layer: Clip| Timeline {
+        tracks: vec![
+            Track {
+                clips: vec![base.clone()],
+                ..Track::new(StreamKind::Video, "V1")
+            },
+            Track {
+                clips: vec![layer],
+                ..Track::new(StreamKind::Video, "V2")
+            },
+        ],
+        overlays: Vec::new(),
+        markers: Vec::new(),
+        format: None,
+        master: Default::default(),
+    };
+    // A smaller layer, placed: the scaler's one level, as the export's (`SCALED` in `motion_parity.rs`).
+    let mut pip = Clip::new(m.testsrc.id, 0.5, 1.5, 0.2);
+    pip.transform.scale = 0.4;
+    pip.transform.pos_x = 0.25;
+    pip.transform.pos_y = -0.2;
+    let tl = two_tracks(pip);
+    for at in [0.0, 0.5] {
+        let name = format!("play/pip/transform @{at:.1}");
+        let mut c = case(&name, &tl, &assets, at, 0.6, Against::Whole);
+        c.bound = 1;
+        play(c);
+    }
+    // A translucent one, scaled too: the scaler's level and the RGB round trip's (`TRANSLUCENT`: chroma one
+    // level, luma exact) on top of it, as `effect/blur on a translucent layer` records for the same layer.
+    let mut glass = Clip::new(m.testsrc.id, 0.5, 1.5, 0.2);
+    glass.transform.scale = 0.6;
+    glass.transform.opacity = 0.7;
+    let tl = two_tracks(glass);
+    let mut c = case("play/pip/translucent and scaled", &tl, &assets, 0.0, 0.6, Against::Whole);
+    c.bound = 2;
+    play(c);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_title_is_drawn_during_a_session_as_the_export_draws_it() {
+    let m = media();
+    let mut tl = timeline(vec![Clip::new(m.testsrc.id, 0.0, 2.0, 0.0)]);
+    let mut title = kerf_core::TextOverlay::new("Summer 2026", 0.4, 1.4);
+    title.bg = Some("black@0.5".into());
+    tl.overlays.push(title);
+    let assets = [m.testsrc.clone()];
+    // Before it, into it, and from inside it; the titles of the frames are the compositor's own text.
+    for at in [0.0, 0.5, 1.0] {
+        play(case(&format!("play/title/@{at:.1}"), &tl, &assets, at, 0.7, Against::Whole));
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_cursor_opened_ahead_is_the_one_the_cut_uses() {
     let m = media();
     let (tl, assets) = pair(m, None, 0.0);
@@ -525,8 +637,9 @@ fn a_cursor_opened_ahead_is_the_one_the_cut_uses() {
     let second = cut.at_frame(31).unwrap();
     assert_eq!(second.layers.len(), 1);
     let layer = &second.layers[0];
-    feed.open(layer).expect("opened ahead");
-    feed.open(layer).expect("and again: nothing new");
+    let wanted = cut.time_of(31);
+    feed.open(layer, wanted).expect("opened ahead");
+    feed.open(layer, wanted).expect("and again: nothing new");
     assert!(feed.has(layer.clip_id));
     assert_eq!(feed.waiting(), 1);
     // Playing the first clip leaves it waiting; the cut takes it over at its first frame, and the
@@ -554,6 +667,45 @@ fn a_cursor_opened_ahead_is_the_one_the_cut_uses() {
 
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_feed_with_more_clips_in_the_window_than_it_holds_keeps_the_ones_wanted_first() {
+    let m = media();
+    // Nine half-second clips one after the other: the window ahead has more clips than the feed holds.
+    let clips: Vec<Clip> = (0..9).map(|k| Clip::new(m.testsrc.id, 0.5, 1.0, k as f64 * 0.5)).collect();
+    let ids: Vec<_> = clips.iter().map(|c| c.id).collect();
+    let tl = timeline(clips);
+    let assets = [m.testsrc.clone()];
+    let cut = PlayCut::new(&tl, &assets, 0.0, policy(), &OriginalMedia).expect("a cut");
+    let motion = MotionFrames::new(frame_source());
+    let feed = motion.feed();
+    // The first frame after clip k's start (the frame on its start has the closing edge of the clip before).
+    let frame_of = |k: usize| 15 * k as u64 + 1;
+    let open = |k: usize| {
+        let plan = cut.at_frame(frame_of(k)).unwrap();
+        let layer = plan.layers.iter().find(|l| l.clip_id == ids[k]).expect("the clip's layer");
+        feed.open(layer, cut.time_of(frame_of(k))).expect("open")
+    };
+    // Clips 3 to 8 fill it.
+    for k in 3..9 {
+        assert_eq!(open(k), Opened::Waiting { evicted: None }, "clip {k}");
+    }
+    assert_eq!(feed.waiting(), 6);
+    // A clip wanted sooner than all of them takes the place of the one wanted last, which is the one that goes.
+    assert_eq!(open(1), Opened::Waiting { evicted: Some(ids[8]) });
+    assert!(feed.has(ids[1]) && !feed.has(ids[8]));
+    assert_eq!(feed.waiting(), 6);
+    // One wanted after every one of them is not opened at all.
+    assert_eq!(open(8), Opened::Full);
+    assert!(!feed.has(ids[8]));
+    // The ones wanted first are still there when their clips come on screen.
+    assert!((1..=7).filter(|k| *k != 2).all(|k| feed.has(ids[k])));
+    feed.close();
+    assert_eq!(feed.waiting(), 0);
+    assert_eq!(open(2), Opened::Closed, "a closed feed starts nothing");
+    assert_eq!(feed.waiting(), 0);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_file_runs_are_not_trusted_for_is_refused_when_it_is_opened_ahead() {
     let m = media();
     let transport = probed(&m.transport);
@@ -566,7 +718,7 @@ fn a_file_runs_are_not_trusted_for_is_refused_when_it_is_opened_ahead() {
     let motion = MotionFrames::new(frame_source());
     let feed = motion.feed();
     let plan = cut.at_frame(35).unwrap();
-    let err = feed.open(&plan.layers[0]).expect_err("refused");
+    let err = feed.open(&plan.layers[0], cut.time_of(35)).expect_err("refused");
     assert!(matches!(err, GpuError::Unsupported(_)), "{err}");
     assert!(err.to_string().contains("testsrc.ts"), "{err}");
     assert_eq!(feed.waiting(), 0);

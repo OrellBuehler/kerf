@@ -376,20 +376,25 @@ export's `fps` pick, which only a cursor reads. `MotionFrames::frames(plan)` rea
 cursor: three layers cost the slowest decode, not the sum), `Compositor::render_motion_texture(plan, size, &mut motion)` is
 `render_plan_texture_with` over it (the texture stays on the GPU for the presenter), and `Compositor::warm_text(plan, size)` rasterises a
 plan's titles into the atlas without drawing, so a caption that comes on screen costs its `ffmpeg` on a prefetch thread and not on the frame (and `render_motion_texture` warms the frame's own titles *while* its cursors read, the two waits being independent).
-**`MotionFrames::feed()` is a `CursorFeed`**: `open(layer)` checks the clip as `FrameSource::cursor` does (`FrameSource::check_cursor`, the same
+**`MotionFrames::feed()` is a `CursorFeed`**: `open(layer, needed_at)` checks the clip as `FrameSource::cursor` does (`FrameSource::check_cursor`, the same
 gates split out: the self-test, a recorded opaque pixel format, an indexed container, seek points on keyframes, no run has marked the file) and
-starts its `ffmpeg`, which fills the pipe and waits (at most 6 waiting, 10 s each); the frame that first needs the clip takes the waiting
+starts its `ffmpeg`, which fills the pipe and waits (at most 6 waiting, 10 s each; `needed_at` is when the clip comes on screen, and with 6 waiting the
+one wanted **last** is dropped for a nearer clip, while a clip wanted after all of them is not opened: `Opened::Full`, the caller asks again; `close()` ends the feed
+and a cursor that was being opened is dropped when it is ready); the frame that first needs the clip takes the waiting
 cursor instead of paying the file's two probes (50 ms) and the process start. Called from a thread that is not drawing, and a clip it refuses is
 known *before* the cut, when the caller can still choose what to play instead. A cursor opens at the clip's own seek, so what it reads from there
 to the frame is decode work: a play session starts its slice at the playhead (`PlayCut`), which puts that seek at the playhead and not at the
 clip's in point. `tests/playback.rs` (`#[ignore]`d; both FFmpegs) holds the played frames to the export, **plane for plane, 0 levels in every
-case**: from the start (a hard cut, a clip's fades, a dissolve), from the middle of a clip on the grid and between two frames, from deep in a
+case but the layers the compositor scales**: from the start (a hard cut, a clip's fades, a dissolve, a still image, a title), from the middle of a clip on the grid and between two frames, from deep in a
 long clip, from inside a dissolve (the session starts before it and the frames from the requested time on are the whole cut's, dissolve
 included), a dip, slides and a push entered inside the transition, a 25 fps clip in a 30 fps cut and a 2x clip (the slice's export, the graph
 the stream plays), and every n-th frame asked for (n = 2, 3, 7, 30: a frame a newer request replaced changes no other). A slide's travel is
 truncated to whole pixels, and the slice's clock is not the whole cut's by a float's width, so a travel that lands exactly on a pixel can fall
-either side of it: slides are held to the slice's export. It also holds the feed (a cursor opened ahead is the one the cut uses and the first
-clip's goes with it; a transport stream is refused when opened ahead), and the texture a session presents to be the composite's picture.
+either side of it: slides are held to the slice's export, and so is a dissolve out of a still image (a PNG is a 25 fps stream, so the cut is a 25 fps one
+with a 30 fps clip in it, and which source frame an output frame picks depends on where the slice starts). A layer over another track is held to the
+export within the scaler's level (placed: 1) and the scaler's plus the translucent round trip's (scaled and translucent: 2, as `effect/blur on a translucent
+layer` records). It also holds the feed (a cursor opened ahead is the one the cut uses and the first
+clip's goes with it; a transport stream is refused when opened ahead; with more clips in the window than it holds it keeps the ones wanted first), and the texture a session presents to be the composite's picture.
 
 What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
 

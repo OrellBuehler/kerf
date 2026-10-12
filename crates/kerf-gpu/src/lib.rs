@@ -150,7 +150,7 @@ pub use frame_source::{FrameSource, FrameSourceConfig, Hint, SourceStats};
 pub use gpu::{Gpu, GpuError, GpuOptions};
 /// FFmpeg's integer layer geometry (it lives in kerf-core: the plan needs it too).
 pub use kerf_core::layer_geometry as geometry;
-pub use motion::{CursorFeed, MotionFrames};
+pub use motion::{CursorFeed, MotionFrames, Opened};
 pub use present::{PixelRect, Presenter, Surround};
 pub use selftest::{parity_self_test, SelfTestError, SelfTestReport};
 pub use source::{decode_args, decode_layer, decode_layers, YuvFrame};

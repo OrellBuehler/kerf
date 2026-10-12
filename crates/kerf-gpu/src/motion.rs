@@ -20,6 +20,7 @@
 //! file untrusted says so then, when the caller can still decide what to play instead.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -47,10 +48,24 @@ struct Open {
 struct Ready {
     cursor: FrameCursor,
     since: Instant,
+    /// When the clip is wanted on screen, timeline seconds: the order cursors are kept in when there are too many.
+    needed: f64,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What [`CursorFeed::open`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opened {
+    /// A cursor is waiting for the clip (it was, or it was just opened); `evicted` is the clip whose waiting
+    /// cursor was dropped to make room for it, the one wanted last.
+    Waiting { evicted: Option<Uuid> },
+    /// [`READY_MAX`] cursors are waiting for clips wanted sooner: nothing was started, ask again later.
+    Full,
+    /// The feed is closed ([`CursorFeed::close`]): its session is over and nothing is started.
+    Closed,
 }
 
 /// Opens cursors for clips that are not on screen yet; see the [module](self). Cheap to clone: every
@@ -60,37 +75,72 @@ pub struct CursorFeed {
     source: Arc<FrameSource>,
     config: CursorConfig,
     ready: Arc<Mutex<HashMap<Uuid, Ready>>>,
+    closed: Arc<AtomicBool>,
 }
 
 impl CursorFeed {
-    /// Have a cursor for `layer`'s clip waiting: the file is checked as [`FrameSource::cursor`]
-    /// checks it (so `Err(Unsupported)` says *now* that the clip cannot be played from runs) and
-    /// its `ffmpeg` started, which decodes the first frames into the pipe and waits. Does nothing
-    /// for a clip that already has one. **Blocks** for the file's probes the first time it is seen
-    /// (tens of milliseconds a probe) and for the process start: call it from a thread that is not
-    /// drawing a frame.
-    pub fn open(&self, layer: &PlanLayer) -> Result<(), GpuError> {
+    /// Have a cursor for `layer`'s clip waiting, which is wanted on screen at `needed_at` (timeline
+    /// seconds): the file is checked as [`FrameSource::cursor`] checks it (so `Err(Unsupported)` says *now*
+    /// that the clip cannot be played from runs) and its `ffmpeg` started, which decodes the first frames
+    /// into the pipe and waits. Does nothing for a clip that already has one. With [`READY_MAX`] waiting
+    /// the one wanted **last** is dropped for a clip wanted sooner, and a clip wanted after all of them is
+    /// not opened ([`Opened::Full`]): the cursor that is kept is the one that comes on screen first. **Blocks** for the
+    /// file's probes the first time it is seen (tens of milliseconds a probe) and for the process start:
+    /// call it from a thread that is not drawing a frame.
+    pub fn open(&self, layer: &PlanLayer, needed_at: f64) -> Result<Opened, GpuError> {
         if !matches!(layer.pick, Pick::Fps(_)) {
             return Err(GpuError::Unsupported(format!(
                 "{}: a still plan's pick is the still's `-ss`, not the export's `fps` filter",
                 layer.name
             )));
         }
-        if lock(&self.ready).contains_key(&layer.clip_id) {
-            return Ok(());
+        if self.closed.load(Ordering::SeqCst) {
+            return Ok(Opened::Closed);
+        }
+        {
+            let mut ready = lock(&self.ready);
+            let now = Instant::now();
+            ready.retain(|_, r| now.duration_since(r.since) < READY_TTL);
+            if ready.contains_key(&layer.clip_id) {
+                return Ok(Opened::Waiting { evicted: None });
+            }
+            // Nothing is started for a clip that would not be kept.
+            if ready.len() >= READY_MAX && ready.values().all(|r| r.needed <= needed_at) {
+                return Ok(Opened::Full);
+            }
         }
         let cursor = self.source.cursor(layer, self.config.clone())?;
         let mut ready = lock(&self.ready);
-        let now = Instant::now();
-        ready.retain(|_, r| now.duration_since(r.since) < READY_TTL);
-        if ready.len() >= READY_MAX && !ready.contains_key(&layer.clip_id) {
-            // The oldest is the one least likely to be wanted.
-            if let Some(oldest) = ready.iter().min_by_key(|(_, r)| r.since).map(|(id, _)| *id) {
-                ready.remove(&oldest);
+        if self.closed.load(Ordering::SeqCst) {
+            // Dropped here, killed: the session ended while the file was being probed.
+            return Ok(Opened::Closed);
+        }
+        if ready.contains_key(&layer.clip_id) {
+            return Ok(Opened::Waiting { evicted: None });
+        }
+        let mut evicted = None;
+        if ready.len() >= READY_MAX {
+            let farthest = ready
+                .iter()
+                .max_by(|a, b| a.1.needed.total_cmp(&b.1.needed))
+                .map(|(id, r)| (*id, r.needed));
+            match farthest {
+                Some((id, needed)) if needed > needed_at => {
+                    ready.remove(&id);
+                    evicted = Some(id);
+                }
+                _ => return Ok(Opened::Full),
             }
         }
-        ready.entry(layer.clip_id).or_insert(Ready { cursor, since: now });
-        Ok(())
+        ready.insert(
+            layer.clip_id,
+            Ready {
+                cursor,
+                since: Instant::now(),
+                needed: needed_at,
+            },
+        );
+        Ok(Opened::Waiting { evicted })
     }
 
     /// Whether `layer`'s clip could have a cursor, without starting one ([`FrameSource::check_cursor`]).
@@ -116,6 +166,13 @@ impl CursorFeed {
     pub fn clear(&self) {
         lock(&self.ready).clear();
     }
+
+    /// The feed is done: every waiting cursor is dropped (killed), and one that is being opened as this is
+    /// called is dropped when it is ready, not kept for a session that is gone. Nothing is opened after.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        lock(&self.ready).clear();
+    }
 }
 
 /// See the [module](self).
@@ -137,6 +194,7 @@ impl MotionFrames {
             source: Arc::clone(&source),
             config: config.clone(),
             ready: Arc::new(Mutex::new(HashMap::new())),
+            closed: Arc::new(AtomicBool::new(false)),
         };
         Self {
             source,
