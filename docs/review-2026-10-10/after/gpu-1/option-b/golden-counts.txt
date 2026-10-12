@@ -12,8 +12,13 @@ Verification, per case, for every kind of builder (a test that stays in the orac
     broll, phone, wide, sphere, lenses and their padded twins) beside an HDR clip (hdr-pq, hdr-hlg, hdr-hlg-43), in the
     export's graph (the range's slice; none for an audio-only container), the preview's (the cut from the playhead)
     or the still's (the layers on screen)
-  - a one-off check (not kept): removing `,setparams=colorspace=bt709` from the new argv gives the old digest of every
-    one of the 18000 (case, builder) pairs, so the label is the only change
+  - a one-off check (not kept; a temporary strip in `repr`, reverted): removing `setparams=colorspace=bt709,` (the label is
+    the first filter of its chain) from the new argv gives the old digest of every one of the 18000 (case, builder) pairs,
+    so the label is the only change
   - so no single-clip case, no case of untagged footage only, no HDR-only case and no audio-only export moved
 The corpus holds HDR as its only matrix-naming footage; tagged SDR, SD, MJPEG, RGB, alpha and stills are covered by the
 builders' unit tests (engine/cli/bt709_label.rs).
+Round 2 (the label moved from behind the geometry to the head of the chain, after a dip to white showed a label behind the
+fit `scale` is not a tag): blessed once more; new digests against the previous blessing moved 3054 / 644 / 2139, exactly the
+cases the previous blessing had moved against main (the same set, no other), and the stripped argv equals main's digest for all
+6000 x 3 (cmp of the per-case files: identical).

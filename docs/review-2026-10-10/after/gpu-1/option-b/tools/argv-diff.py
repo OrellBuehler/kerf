@@ -16,7 +16,7 @@ for key in sorted(a):
     # the policy probe and proxy encodes are not part of a case's argv: compare the runs that write to OUT or to a pipe (stream, scrub)
     keep = lambda x: 'OUT' in x or 'image2pipe' in x
     ra = [x for x in la if keep(x)]; rb = [x for x in lb if keep(x)]
-    LABEL = ',setparams=colorspace=bt709'
+    LABEL = 'setparams=colorspace=bt709,'  # the first filter of the clip's chain: `[i:v]setparams=colorspace=bt709,trim=...`
     if ra != rb and [y.replace(LABEL, '') for y in rb] == ra:
         diff += 1; print(f"{key[0]:28} {key[1]:5} label only ({sum(LABEL in y for y in rb)} of {len(rb)} runs carry it)"); continue
     if ra == rb:

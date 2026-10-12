@@ -4,8 +4,8 @@ The untagged HD picture-in-picture region of the export_still PNG against the co
   over a BT.709 clip: label                                                                            mean abs err   1.68  max   6  PSNR  42.7 dB
   over a BT.709 clip: footage tagged bt709 in the file                                                 mean abs err   1.68  max   6  PSNR  42.7 dB
   over SD tagged smpte170m: main                                                                       mean abs err   7.99  max  21  PSNR  28.0 dB
-  over SD tagged smpte170m: label (after the geometry)                                                 mean abs err   1.68  max   6  PSNR  42.7 dB
-  over SD tagged smpte170m: the footage tagged bt709 in the file (= label at the head of the chain)    mean abs err   2.80  max   7  PSNR  38.7 dB
+  over SD tagged smpte170m: label (the first filter of the chain)                                      mean abs err   2.80  max   7  PSNR  38.7 dB
+  over SD tagged smpte170m: the footage tagged bt709 in the file                                       mean abs err   2.80  max   7  PSNR  38.7 dB
   alone (not labelled, unchanged)                                                                      mean abs err   7.99  max  21  PSNR  28.0 dB
   over a real JPEG (decoder-default tag: not labelled, unchanged)                                      mean abs err   8.30  max  23  PSNR  27.4 dB
   over a real JPEG: main                                                                               mean abs err   8.30  max  23  PSNR  27.4 dB

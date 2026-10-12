@@ -1,12 +1,13 @@
 FFmpeg 9.0.2 (pinned, policy BottomLayerTag). PSNR dB / worst level error between two renders of the same timeline.
-'main' = origin/main 255ac36 built and run; 'label' = branch gpu-1b. Subject: an untagged 1280x720 HD gradient (BT.709 values), 640x360 canvas, frame 5 / 0.5 s.
+'main' = origin/main 255ac36 built and run; 'label' = branch gpu-1b (the label is the first filter of the clip chain). Subject: an untagged 1280x720 HD gradient (BT.709 values), 640x360 canvas, frame 5 / 0.5 s.
 Columns: still = export_still PNG (RGB); export = lossless x264 export, yuv420p planes; stream = first frame of stream_preview (JPEG); scrub = Project::composite_timeline_frame (JPEG).
 99.0 / 0 = byte-identical pixels. Real-file cases (jpeg, webp, png-rgba, png-gray, png-rgb, mjpeg) are made by tools/mkshapes.sh; their argv is identical too (argv-identity-ffmpeg-*.txt).
+mixed-dip-white's still / stream / scrub frames are taken at 0.5 s / frame 0, outside the dip's white or on a lone HD layer (not labelled in a still); its export (every frame) is where the label applies.
 
 == main vs label (what the label moves)
 case                              still png       export yuv       stream jpg        scrub jpg
 alpha-over-709                   99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
-hd-over-hd601                    32.7 /  32       34.0 /  17       33.1 /  27       28.4 /  47
+hd-over-hd601                    33.1 /  25       34.0 /  17       33.1 /  27       32.4 /  28
 hd-over-jpeg                     99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 hd-over-mjpeg                    99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 hd-over-png                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
@@ -15,12 +16,12 @@ hd-over-png-rgb                  99.0 /   0       99.0 /   0       99.0 /   0   
 hd-over-png-rgba                 99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 hd-over-rgb                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 hd-over-sd-untagged              99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
-hd-over-sd601                    32.9 /  27       34.0 /  17       33.1 /  30       30.1 /  50
+hd-over-sd601                    33.1 /  25       34.0 /  17       33.1 /  30       32.4 /  28
 hd-over-webp                     99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 hd-under-sd-untagged             99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 jpeg-over-hd                     99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 mixed-709-opacity-over           28.9 /  22       34.4 /  17       32.6 /  39       32.6 /  33
-mixed-dip-white                  99.0 /   0       44.1 /   3       99.0 /   0       99.0 /   0
+mixed-dip-white                  99.0 /   0       31.9 /  11       99.0 /   0       99.0 /   0
 mixed-dissolve                   99.0 /   0       23.6 /  37       27.8 /  46       99.0 /   0
 mixed-fade                       38.3 /  13       39.3 /  10       56.4 /   7       37.9 /  16
 mixed-grade                      33.7 /  25       31.6 /  21       33.4 /  36       36.3 /  26
@@ -46,11 +47,13 @@ single-pip                       99.0 /   0       99.0 /   0       99.0 /   0   
 single-text                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 webp-over-hd                     99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 
-== label vs the same footage tagged bt709 in the file (the label is the tag, bit for bit, in every graph the GPU draws)
+== label vs the same footage tagged bt709 in the file (the label is the tag, bit for bit, in every graph that is labelled)
+Columns that compare a layer alone on screen (mixed-dip-white's still and scrub, sequential-709-then-hd's still) are not labelled by the one-shot builders (a still decides over the layers on screen) and so differ from the tagged file by design.
 case                              still png       export yuv       stream jpg        scrub jpg
-hd-over-hd601                    40.4 /  32       99.0 /   0       99.0 /   0       26.9 /  47
-hd-over-sd601                    42.4 /  27       99.0 /   0       99.0 /   0       28.1 /  50
+hd-over-hd601                    99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+hd-over-sd601                    99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 mixed-709-opacity-over           99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-dip-white                  30.2 /  18       99.0 /   0       99.0 /   0       47.6 /   7
 mixed-dissolve                   99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 mixed-fade                       99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 mixed-grade                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0

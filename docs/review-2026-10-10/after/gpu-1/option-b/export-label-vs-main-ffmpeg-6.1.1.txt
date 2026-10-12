@@ -1,7 +1,7 @@
 FFmpeg 6.1.1 (system, policy FixedBt601). Same method as export-label-vs-main-ffmpeg-9.0.2.txt.
-mixed-dip-white's still / stream / scrub frames are taken at 0.5 s / frame 0, outside the dip's white; its export (every frame) is where it moves.
+mixed-dip-white's still / stream / scrub frames are taken at 0.5 s / frame 0, outside the dip's white or on a lone HD layer (not labelled in a still); its export (every frame) is where the label applies.
 
-== main vs label
+== main vs label (what the label moves)
 case                              still png       export yuv       stream jpg        scrub jpg
 alpha-over-709                   99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 hd-over-hd601                    99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
@@ -18,7 +18,7 @@ hd-over-webp                     99.0 /   0       99.0 /   0       99.0 /   0   
 hd-under-sd-untagged             99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 jpeg-over-hd                     99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 mixed-709-opacity-over           99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
-mixed-dip-white                  99.0 /   0       31.5 /  11       99.0 /   0       99.0 /   0
+mixed-dip-white                  99.0 /   0       32.3 /  11       99.0 /   0       99.0 /   0
 mixed-dissolve                   99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 mixed-fade                       99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 mixed-grade                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
@@ -44,11 +44,13 @@ single-pip                       99.0 /   0       99.0 /   0       99.0 /   0   
 single-text                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 webp-over-hd                     99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 
-== label vs the same footage tagged bt709 in the file
+== label vs the same footage tagged bt709 in the file (the label is the tag, bit for bit, in every graph that is labelled)
+Columns that compare a layer alone on screen (mixed-dip-white's still and scrub, sequential-709-then-hd's still) are not labelled by the one-shot builders (a still decides over the layers on screen) and so differ from the tagged file by design.
 case                              still png       export yuv       stream jpg        scrub jpg
 hd-over-hd601                    99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 hd-over-sd601                    99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 mixed-709-opacity-over           99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-dip-white                  30.2 /  17       99.0 /   0       99.0 /   0       31.9 /  15
 mixed-dissolve                   99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 mixed-fade                       99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
 mixed-grade                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
