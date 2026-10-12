@@ -5253,6 +5253,63 @@ fn footage_that_is_not_untagged_hd_is_left_as_it_is_and_the_other_matrices_stay_
     );
 }
 
+/// A photo and a webcam clip are tagged `bt470bg` by their decoders and say nothing of the file: a JPEG, a
+/// WebP and MJPEG video (probed on both FFmpegs) are no matrix beside untagged HD. The stack is read as BT.601
+/// throughout, as it always was, and drawn exactly where the plan drew it before the label.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_decoders_default_tag_labels_nothing_beside_untagged_hd() {
+    let h = hd_media();
+    eprintln!("composite colour policy of this FFmpeg: {:?}", policy());
+    let untagged = h.get("grad/hd-untagged");
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-media-hd");
+    let source = "testsrc2=size=640x360:rate=10:duration=1";
+    let mut made = 0;
+    for (name, encoder, still) in [
+        ("photo.jpg", &["-pix_fmt", "yuvj420p"][..], true),
+        ("photo.webp", &["-c:v", "libwebp", "-pix_fmt", "yuv420p"][..], true),
+        (
+            "webcam.mkv",
+            &["-c:v", "mjpeg", "-q:v", "3", "-pix_fmt", "yuvj420p"][..],
+            false,
+        ),
+    ] {
+        let path = dir.join(name);
+        let ok = Command::new(kerf_core::ffmpeg_path())
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", source])
+            .args(if still { &["-frames:v", "1"][..] } else { &[][..] })
+            .args(encoder)
+            .arg(&path)
+            .stdin(Stdio::null())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("skipped {name}: this FFmpeg cannot make it");
+            continue;
+        }
+        let file = probed(&path);
+        let tag = file.streams[0].color_space.clone();
+        eprintln!(
+            "{name}: probed {} {:?} tag {tag:?}",
+            file.streams[0].codec, file.streams[0].pix_fmt
+        );
+        // Under it (the canvas's own size: nothing is resized), and in a stack of two HD clips.
+        let mut base = clip(&file, 0.0, 1.0, 0.0);
+        base.source_out = 1.0;
+        let tl = timeline(vec![vec![base], vec![pip_clip(untagged, 1.0)]], hd_canvas());
+        let assets = [file.clone(), untagged.clone()];
+        assert_eq!(
+            labelled_layers(&tl, &assets, 0.5),
+            [false, false],
+            "{name}: its tag is not a matrix"
+        );
+        check(&format!("label/{name}-under-untagged-hd"), &tl, &assets, &[0.5], STRICT);
+        made += 1;
+    }
+    assert!(made >= 2, "only {made} of the three files could be made");
+}
+
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn the_previews_proxies_stack_as_their_originals_do() {
