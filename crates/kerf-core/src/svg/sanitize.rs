@@ -13,8 +13,11 @@
 //! What the expansion guard counts is the document **as stored**, so the sanitiser also removes what
 //! would change it afterwards or cannot be counted from the XML: an embedded image over the pixel cap
 //! (or unreadable), an animation of a reference or of the cost of a filter primitive
-//! ([`NOT_ANIMATED`]) or one that sets a `url()`, and a `url(#id)` in a `<style>` rule that is not a
-//! gradient fill or stroke (a rule applies to whatever its selector matches).
+//! ([`NOT_ANIMATED`]), one that sets a `url()` other than a gradient as a `fill` or `stroke` (a paint
+//! server is a handful of stops, however often it is used), and the `id` of an element whose id an
+//! earlier one has already (usvg resolves a reference to the *last* element of an id and a `<use>` to
+//! the first; the guard reads one, so there is only ever one to read). A `url(#id)` in a `<style>`
+//! rule is not removed: the guard counts it on every element the rule could apply to (`rules`).
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -145,11 +148,24 @@ pub(super) fn sanitize(src: &str) -> Result<Sanitized> {
         cuts: Vec::new(),
         warnings: Vec::new(),
     };
-    let gradients: HashSet<String> = doc
-        .descendants()
-        .filter(|n| n.is_element() && matches!(n.tag_name().name(), "linearGradient" | "radialGradient"))
-        .filter_map(|n| n.attribute("id").map(str::to_string))
+    // The gradients an animation may name: those whose id nothing else has, so that there is no doubt
+    // which element a `url(#id)` reaches (a later element repeating it loses its id, below, but this
+    // does not depend on which of the two is kept).
+    let mut by_id: std::collections::HashMap<&str, (usize, bool)> = std::collections::HashMap::new();
+    for node in doc.descendants().filter(Node::is_element) {
+        if let Some(id) = node.attribute("id") {
+            let entry = by_id.entry(id).or_insert((0, false));
+            entry.0 += 1;
+            entry.1 = node.tag_name().namespace() == Some(SVG_NS)
+                && matches!(node.tag_name().name(), "linearGradient" | "radialGradient");
+        }
+    }
+    let gradients: HashSet<String> = by_id
+        .into_iter()
+        .filter(|(_, (count, gradient))| *count == 1 && *gradient)
+        .map(|(id, _)| id.to_string())
         .collect();
+    let mut ids: HashSet<String> = HashSet::new();
     let mut elements = 0usize;
     let mut skip_to = 0usize;
     for node in doc.descendants() {
@@ -167,7 +183,7 @@ pub(super) fn sanitize(src: &str) -> Result<Sanitized> {
         if node.ancestors().take(MAX_DEPTH + 2).count() > MAX_DEPTH + 1 {
             return Err(invalid(format!("the SVG is nested deeper than {MAX_DEPTH} elements")));
         }
-        if let Some(why) = cut_element(&node) {
+        if let Some(why) = cut_element(&node, &gradients) {
             skip_to = range.end;
             edits.cuts.push((range, String::new()));
             if let Some(why) = why {
@@ -175,9 +191,9 @@ pub(super) fn sanitize(src: &str) -> Result<Sanitized> {
             }
             continue;
         }
-        attributes(&node, &src, &mut edits);
+        attributes(&node, &src, &mut edits, &mut ids);
         if node.tag_name().name() == "style" {
-            style_element(&node, &src, &mut edits, &gradients);
+            style_element(&node, &src, &mut edits);
         }
     }
     Ok(Sanitized {
@@ -322,7 +338,7 @@ fn strip_doctype(src: &str) -> Result<String> {
 }
 
 /// `Some(warning)` when the element is cut (the warning may be empty for editor furniture).
-fn cut_element(node: &Node) -> Option<Option<String>> {
+fn cut_element(node: &Node, gradients: &HashSet<String>) -> Option<Option<String>> {
     let name = node.tag_name().name();
     let in_svg = node.tag_name().namespace() == Some(SVG_NS);
     if in_svg && NOTABLE.contains(&name) {
@@ -363,19 +379,34 @@ fn cut_element(node: &Node) -> Option<Option<String>> {
                 )));
             }
         }
-        // A paint server in a value (`fill` going from `url(#a)` to `url(#b)`) is a reference the
-        // expansion guard read once, in the document as stored, and could not see move.
+        // A reference in a value (`mask` going from `url(#a)` to `url(#b)`) is one the expansion guard
+        // read once, in the document as stored, and could not see move. A gradient as a `fill` or
+        // `stroke` is the exception: it is a handful of stops however often it is used, and a chain of
+        // them is counted from the XML whichever one a frame names.
         let carries_url = ["values", "from", "to", "by"]
             .iter()
             .filter_map(|a| node.attribute(*a))
             .any(|v| v.to_ascii_lowercase().contains("url("));
-        if carries_url {
+        if carries_url && !only_gradient_paints(node, gradients) {
             return Some(Some(
-                "an animation that sets a url() reference was removed (references do not animate)".to_string(),
+                "an animation that sets a url() reference was removed (only a gradient fill or stroke animates between references)"
+                    .to_string(),
             ));
         }
     }
     None
+}
+
+/// Whether an animation of `fill` or `stroke` names nothing but gradients of this document in the
+/// `url()`s of its values.
+fn only_gradient_paints(node: &Node, gradients: &HashSet<String>) -> bool {
+    if !matches!(node.attribute("attributeName").map(str::trim), Some("fill" | "stroke")) {
+        return false;
+    }
+    ["values", "from", "to", "by"]
+        .iter()
+        .filter_map(|a| node.attribute(*a))
+        .all(|v| !has_external_url(v) && super::url_ids(v).iter().all(|id| gradients.contains(*id)))
 }
 
 /// Attributes no animation may drive. Each either **changes what a property points at** — `mask`,
@@ -412,8 +443,11 @@ pub(super) fn value_range(src: &str, attr_range: Range<usize>) -> Option<(Range<
     (end >= start && src[end..].starts_with(quote)).then_some((start..end, quote))
 }
 
-fn attributes(node: &Node, src: &str, edits: &mut Edits) {
+fn attributes(node: &Node, src: &str, edits: &mut Edits, ids: &mut HashSet<String>) {
     let tag = node.tag_name().name();
+    // What every reader takes this element's id to be is the first attribute called `id`; when an
+    // element before it had that id, this one's is dropped (and any other spelling of it with it).
+    let repeated = node.attribute("id").is_some_and(|id| !ids.insert(id.to_string()));
     for attr in node.attributes() {
         let ns = attr.namespace();
         let name = attr.name();
@@ -441,6 +475,16 @@ fn attributes(node: &Node, src: &str, edits: &mut Edits) {
             cut(edits, Some(format!("event attribute \"{name}\" was removed")));
             continue;
         }
+        if name == "id" && repeated && matches!(ns, None | Some(XML_NS)) {
+            cut(
+                edits,
+                Some(format!(
+                    "the id \"{}\" was removed from a later element that repeated it (a reference reaches the first one)",
+                    attr.value().chars().take(40).collect::<String>()
+                )),
+            );
+            continue;
+        }
         let value = attr.value();
         // SVG 2 and resvg both read the unprefixed `href` and ignore the `xlink:` one beside it; the
         // text stored must not hold a second, different link for any other reader to prefer.
@@ -464,7 +508,7 @@ fn attributes(node: &Node, src: &str, edits: &mut Edits) {
             continue;
         }
         if name == "style" && ns.is_none() {
-            let (clean, notes) = declarations(value, None);
+            let (clean, notes) = declarations(value);
             for n in notes {
                 edits.warn(n);
             }
@@ -533,7 +577,7 @@ fn escape_text(value: &str) -> String {
     value.replace('&', "&amp;").replace('<', "&lt;")
 }
 
-fn style_element(node: &Node, src: &str, edits: &mut Edits, gradients: &HashSet<String>) {
+fn style_element(node: &Node, src: &str, edits: &mut Edits) {
     let range = node.range();
     let Some(open_end) = start_tag_end(src, range.start) else {
         return;
@@ -549,7 +593,7 @@ fn style_element(node: &Node, src: &str, edits: &mut Edits, gradients: &HashSet<
         .filter(|c| matches!(c.node_type(), NodeType::Text))
         .filter_map(|c| c.text())
         .collect();
-    let (clean, notes) = sheet(&css, 0, Some(gradients));
+    let (clean, notes) = sheet(&css, 0);
     for n in notes {
         edits.warn(n);
     }
@@ -577,7 +621,7 @@ pub(super) fn start_tag_end(src: &str, from: usize) -> Option<usize> {
 
 const CSS_NOTE: &str = "CSS animations are not rendered — use SMIL";
 
-fn unprefixed(name: &str) -> String {
+pub(super) fn unprefixed(name: &str) -> String {
     let lower = name.trim().to_ascii_lowercase();
     match lower.strip_prefix('-').and_then(|r| r.split_once('-')) {
         Some((_, rest)) => rest.to_string(),
@@ -586,7 +630,7 @@ fn unprefixed(name: &str) -> String {
 }
 
 /// Skip a CSS string or comment starting at `i`; returns the index after it.
-fn skip_quoted(b: &[u8], i: usize) -> usize {
+pub(super) fn skip_quoted(b: &[u8], i: usize) -> usize {
     match b[i] {
         q @ (b'"' | b'\'') => {
             let mut j = i + 1;
@@ -613,12 +657,12 @@ fn skip_quoted(b: &[u8], i: usize) -> usize {
     }
 }
 
-fn starts_quoted(b: &[u8], i: usize) -> bool {
+pub(super) fn starts_quoted(b: &[u8], i: usize) -> bool {
     matches!(b[i], b'"' | b'\'') || (b[i] == b'/' && b.get(i + 1) == Some(&b'*'))
 }
 
 /// A style sheet with the parts SMIL replaces, and the external fetches, left out.
-fn sheet(css: &str, depth: usize, gradients: Gradients) -> (String, Vec<String>) {
+fn sheet(css: &str, depth: usize) -> (String, Vec<String>) {
     let b = css.as_bytes();
     let mut out = String::with_capacity(css.len());
     let mut notes = Vec::new();
@@ -694,7 +738,7 @@ fn sheet(css: &str, depth: usize, gradients: Gradients) -> (String, Vec<String>)
                 }
             }
             Some(n) if matches!(n.as_str(), "media" | "supports" | "layer" | "container" | "document") && depth < 8 => {
-                let (inner, sub) = sheet(body, depth + 1, gradients);
+                let (inner, sub) = sheet(body, depth + 1);
                 notes.extend(sub);
                 out.push_str(prelude);
                 out.push('{');
@@ -705,7 +749,7 @@ fn sheet(css: &str, depth: usize, gradients: Gradients) -> (String, Vec<String>)
             }
             Some(_) => out.push_str(&css[item_start..if closed { k } else { body_end }]),
             None => {
-                let (decls, sub) = declarations(body, gradients);
+                let (decls, sub) = declarations(body);
                 notes.extend(sub);
                 out.push_str(prelude);
                 out.push('{');
@@ -721,7 +765,7 @@ fn sheet(css: &str, depth: usize, gradients: Gradients) -> (String, Vec<String>)
     (out, notes)
 }
 
-fn at_name(s: &str) -> Option<&str> {
+pub(super) fn at_name(s: &str) -> Option<&str> {
     let rest = s.strip_prefix('@')?;
     let end = rest
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
@@ -734,7 +778,7 @@ fn has_url(s: &str) -> bool {
 }
 
 /// Whether a declaration (`prop: value`) stays, noting why when it does not.
-fn keeps(declaration: &str, notes: &mut Vec<String>, gradients: Gradients) -> bool {
+fn keeps(declaration: &str, notes: &mut Vec<String>) -> bool {
     let prop = declaration.split_once(':').map_or("", |(p, _)| p);
     let prop = unprefixed(prop);
     if prop.starts_with("animation") || prop.starts_with("transition") {
@@ -743,42 +787,14 @@ fn keeps(declaration: &str, notes: &mut Vec<String>, gradients: Gradients) -> bo
     } else if has_external_url(declaration) {
         notes.push("links and references outside the document were removed".to_string());
         false
-    } else if style_points_elsewhere(&prop, declaration, gradients) {
-        notes.push(STYLE_REFERENCE_NOTE.to_string());
-        false
     } else {
         true
     }
 }
 
-/// Who may be a `url(#id)` in a `<style>` rule, when `gradients` says the rule is read (`None` for an
-/// inline `style` attribute, whose references the expansion guard counts on the element itself): a
-/// gradient as a `fill` or `stroke`, and nothing else. A rule applies to every element its selector
-/// matches and the guard reads no selectors, so it cannot count what such a rule draws — a
-/// `.a { mask: url(#m) }` over a thousand elements is a thousand masks. A gradient is a handful of
-/// stops, however often it is used.
-type Gradients<'a> = Option<&'a HashSet<String>>;
-
-const STYLE_REFERENCE_NOTE: &str = "a url() in a <style> rule is only read for a gradient fill or stroke; put pattern, mask, clip-path, filter and marker references on the element and the declaration was removed";
-
-fn style_points_elsewhere(prop: &str, declaration: &str, gradients: Gradients) -> bool {
-    let Some(gradients) = gradients else { return false };
-    let Some((_, value)) = declaration.split_once(':') else {
-        return false;
-    };
-    if !has_url(value) {
-        return false;
-    }
-    match prop {
-        "fill" | "stroke" => super::url_ids(value).iter().any(|id| !gradients.contains(*id)),
-        "mask" | "clip-path" | "filter" | "marker" | "marker-start" | "marker-mid" | "marker-end" => true,
-        _ => false,
-    }
-}
-
 /// A declaration list with `animation*` / `transition*` and external `url()` left out. Each kept
 /// declaration is its original text, so a second pass keeps exactly the same ones.
-fn declarations(body: &str, gradients: Gradients) -> (String, Vec<String>) {
+fn declarations(body: &str) -> (String, Vec<String>) {
     let b = body.as_bytes();
     let mut kept: Vec<&str> = Vec::new();
     let mut notes = Vec::new();
@@ -794,7 +810,7 @@ fn declarations(body: &str, gradients: Gradients) -> (String, Vec<String>) {
             b'{' => level += 1,
             b'}' => level = level.saturating_sub(1),
             b';' if paren == 0 && level == 0 => {
-                if keeps(&body[start..i], &mut notes, gradients) {
+                if keeps(&body[start..i], &mut notes) {
                     kept.push(&body[start..i]);
                 }
                 start = i + 1;
@@ -804,7 +820,7 @@ fn declarations(body: &str, gradients: Gradients) -> (String, Vec<String>) {
         i += 1;
     }
     let tail = &body[start.min(body.len())..];
-    if tail.trim().is_empty() || keeps(tail, &mut notes, gradients) {
+    if tail.trim().is_empty() || keeps(tail, &mut notes) {
         kept.push(tail);
     }
     notes.dedup();
@@ -1014,8 +1030,8 @@ mod tests {
             "@font-face{",
             "@keyframes",
         ] {
-            let (out, _) = sheet(css, 0, None);
-            let (again, _) = sheet(&out, 0, None);
+            let (out, _) = sheet(css, 0);
+            let (again, _) = sheet(&out, 0);
             assert_eq!(again, out, "{css:?}");
         }
     }
@@ -1199,19 +1215,26 @@ mod tests {
     }
 
     #[test]
-    fn an_animation_may_not_set_a_url() {
+    fn an_animation_may_not_set_a_url_unless_it_is_a_gradient_fill_or_stroke() {
+        let defs = "<linearGradient id=\"g\"/><radialGradient id=\"r\"/><pattern id=\"p\" width=\"1\" height=\"1\"/>";
         for (attr, extra) in [
-            ("fill", "values=\"red;url(#g)\""),
-            ("stroke", "from=\"url(#a)\" to=\"url(#b)\""),
-            ("fill", "to=\"URL(#g)\""),
-            ("fill", "by=\"url( '#g' )\""),
+            // not a gradient of this document: a pattern, a missing id, a mask
+            ("fill", "values=\"red;url(#p)\""),
+            ("stroke", "from=\"url(#g)\" to=\"url(#nobody)\""),
+            ("fill", "to=\"URL(#p)\""),
+            ("fill", "by=\"url( '#p' )\""),
+            // a gradient, but not of a paint
             ("color", "values=\"red;url(#g)\""),
+            ("stop-color", "to=\"url(#g)\""),
+            ("fill-opacity", "to=\"url(#g)\""),
+            // a paint that leaves the document
+            ("fill", "values=\"url(#g);url(http://evil/x)\""),
         ] {
             let src = svg(&format!(
-                "<rect width=\"2\" height=\"2\"><animate attributeName=\"{attr}\" {extra} dur=\"1s\"/></rect>"
+                "{defs}<rect width=\"2\" height=\"2\"><animate attributeName=\"{attr}\" {extra} dur=\"1s\"/></rect>"
             ));
             let out = clean(&src);
-            assert!(!out.text.contains("animate"), "{extra}: {}", out.text);
+            assert!(!out.text.contains("<animate"), "{extra}: {}", out.text);
             assert!(
                 out.warnings.iter().any(|w| w.contains("sets a url()")),
                 "{extra}: {:?}",
@@ -1219,27 +1242,98 @@ mod tests {
             );
         }
         let set = clean(&svg(
-            "<rect width=\"2\" height=\"2\"><set attributeName=\"fill\" to=\"url(#g)\" begin=\"1s\"/></rect>",
+            "<rect width=\"2\" height=\"2\"><set attributeName=\"fill\" to=\"url(#nobody)\" begin=\"1s\"/></rect>",
         ));
         assert!(!set.text.contains("<set"), "{}", set.text);
+        // A gradient is a handful of stops however often it is used: a fill or stroke may change
+        // between gradients (and colours), as Illustrator and After Effects exports do.
+        for (attr, extra) in [
+            ("fill", "values=\"url(#g);url(#r);red\""),
+            ("stroke", "from=\"url(#g)\" to=\"url(#r)\""),
+            ("fill", "to=\"url( '#g' )\""),
+            ("fill", "by=\"URL(#g)\""),
+        ] {
+            let src = svg(&format!(
+                "{defs}<rect width=\"2\" height=\"2\"><animate attributeName=\"{attr}\" {extra} dur=\"1s\"/></rect>"
+            ));
+            let out = clean(&src);
+            assert_eq!(out.text, src, "{extra}");
+            assert!(out.warnings.is_empty(), "{extra}: {:?}", out.warnings);
+        }
+        let set = svg(&format!(
+            "{defs}<rect width=\"2\" height=\"2\"><set attributeName=\"fill\" to=\"url(#g)\" begin=\"1s\"/></rect>"
+        ));
+        assert_eq!(clean(&set).text, set);
+        // Mask, filter and clip-path never animate, a gradient or not.
+        let mask = clean(&svg(&format!(
+            "{defs}<rect width=\"2\" height=\"2\"><animate attributeName=\"mask\" values=\"url(#g);url(#r)\" dur=\"1s\"/></rect>"
+        )));
+        assert!(!mask.text.contains("<animate"), "{}", mask.text);
     }
 
     #[test]
-    fn a_style_rule_may_point_a_fill_or_stroke_at_a_gradient_and_nothing_else_at_anything() {
+    fn a_gradient_whose_id_is_shared_is_not_one_an_animation_may_name() {
+        // Which element `url(#g)` reaches is the question the guard cannot leave open: the pattern is
+        // first, so it is the one that stays; the gradient (and so the animation's right to name `g`)
+        // is not what is drawn.
+        let src = svg(
+            "<pattern id=\"g\" width=\"1\" height=\"1\"/><linearGradient id=\"g\"/><rect width=\"2\" height=\"2\"><animate attributeName=\"fill\" values=\"red;url(#g)\" dur=\"1s\"/></rect>",
+        );
+        let out = clean(&src);
+        assert!(!out.text.contains("<animate"), "{}", out.text);
+        let swapped = svg(
+            "<linearGradient id=\"g\"/><pattern id=\"g\" width=\"1\" height=\"1\"/><rect width=\"2\" height=\"2\"><animate attributeName=\"fill\" values=\"red;url(#g)\" dur=\"1s\"/></rect>",
+        );
+        assert!(!clean(&swapped).text.contains("<animate"), "either way round");
+    }
+
+    #[test]
+    fn a_later_element_repeating_an_id_loses_it() {
+        // usvg reaches the last element of an id through `url(#id)` and an href chain, and the first
+        // through `<use>`; the guard counts one. So there is only ever one: the first, which is also
+        // the one a browser reaches.
+        let out = clean(&svg(
+            "<linearGradient id=\"g\"><stop offset=\"0\"/></linearGradient><linearGradient id=\"g\"/><rect id=\"g\" width=\"2\" height=\"2\"/><g id=\"h\"><rect id=\"h\" xml:id=\"h\"/></g><rect id=\"k\"/><use href=\"#k\" id=\"u\"/>",
+        ));
+        assert_eq!(
+            out.text,
+            svg("<linearGradient id=\"g\"><stop offset=\"0\"/></linearGradient><linearGradient/><rect width=\"2\" height=\"2\"/><g id=\"h\"><rect/></g><rect id=\"k\"/><use href=\"#k\" id=\"u\"/>")
+        );
+        assert!(
+            out.warnings.iter().any(|w| w.contains("\"g\"") && w.contains("repeated")),
+            "{:?}",
+            out.warnings
+        );
+        assert_eq!(
+            clean(&out.text).text,
+            out.text,
+            "and the pass over its own output changes nothing"
+        );
+        assert!(clean(&out.text).warnings.is_empty());
+        // An id on something that is cut was never in the document: it does not take the id from a
+        // kept element after it.
+        let cut = clean(&svg("<script id=\"s\"/><rect id=\"s\" width=\"1\" height=\"1\"/>"));
+        assert!(cut.text.contains("<rect id=\"s\""), "{}", cut.text);
+    }
+
+    #[test]
+    fn a_style_rule_keeps_its_references_for_the_guard_to_count() {
+        // Illustrator's "Internal CSS" writes its clips this way: they stay, and the expansion guard
+        // counts them on every element the rule could apply to (`rules`).
         let defs =
-            "<linearGradient id=\"g\"/><radialGradient id=\"r\"/><pattern id=\"p\" width=\"1\" height=\"1\"/><mask id=\"m\"/>";
-        let css = ".a { fill: url(#g); stroke: url(#r) } .b { fill: url(#p) } .c { mask: url(#m) } .d { clip-path: url(#x); filter: url(#f); marker-end: url(#k) } .e { opacity: .5; fill: URL(#p) }";
-        let out = clean(&svg(&format!("<style>{css}</style>{defs}<rect class=\"a\"/>")));
-        let kept = svg(&format!(
-            "<style>.a {{ fill: url(#g); stroke: url(#r) }} .b {{}} .c {{}} .d {{}} .e {{ opacity: .5}}</style>{defs}<rect class=\"a\"/>"
+            "<linearGradient id=\"g\"/><radialGradient id=\"r\"/><pattern id=\"p\" width=\"1\" height=\"1\"/><mask id=\"m\"/><clipPath id=\"SVGID_1_\"/>";
+        let css = ".st0 { clip-path: url(#SVGID_1_) } .a { fill: url(#g); stroke: url(#r) } .b { fill: url(#p) } .c { mask: url(#m) } .d { clip-path: url(#x); filter: url(#f); marker-end: url(#k) } .e { opacity: .5; fill: URL(#p) }";
+        let src = svg(&format!("<style>{css}</style>{defs}<rect class=\"a\"/>"));
+        let out = clean(&src);
+        assert_eq!(out.text, src);
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        // An external reference in a rule still goes.
+        let ext = clean(&svg(".x{}").replace(
+            ".x{}",
+            "<style>.x { filter: url(http://evil/f.svg#f); mask: url(#m) }</style>",
         ));
-        assert_eq!(out.text, kept);
-        assert!(out.warnings.contains(&STYLE_REFERENCE_NOTE.to_string()), "{:?}", out.warnings);
-        // An attribute or an inline style says the same on the element, where the guard counts it.
-        let inline = svg(&format!(
-            "{defs}<rect fill=\"url(#p)\" style=\"mask:url(#m);filter:url(#f)\" width=\"2\" height=\"2\"/>"
-        ));
-        assert_eq!(clean(&inline).text, inline);
+        assert_eq!(ext.text, svg("<style>.x { mask: url(#m) }</style>"));
+        assert!(ext.warnings.iter().any(|w| w.contains("outside the document")));
         // The pass over its own output changes nothing.
         assert_eq!(clean(&out.text).text, out.text);
     }

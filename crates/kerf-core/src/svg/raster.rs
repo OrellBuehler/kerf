@@ -98,13 +98,13 @@ pub fn render(svg: &str, pw: u32, ph: u32, opacity: f64) -> Result<Pixmap> {
     }
     let tree = usvg::Tree::from_str(svg, &options()).map_err(|e| invalid(format!("not a drawable SVG: {e}")))?;
     let (w, h) = (tree.size().width(), tree.size().height());
-    let scale = (pw as f32 / w).min(ph as f32 / h);
-    let fit = |v: f32, max: u32| ((v * scale).round() as u32).clamp(1, max);
-    let (fw, fh) = (fit(w, pw), fit(h, ph));
-    if cost::frame_ops(&tree, f64::from(scale), (f64::from(pw), f64::from(ph))) > cost::MAX_FRAME_OPS {
+    let (fw, fh) = fit_contain(w, h, pw, ph);
+    let into = Transform::from_scale(fw as f32 / w, fh as f32 / h);
+    // On this very tree (the document of this moment, animations spliced in) and the transform
+    // resvg is given: the estimate follows every group's transform down, as resvg does.
+    if cost::frame_ops(&tree, into, (f64::from(fw), f64::from(fh))) > cost::MAX_FRAME_OPS {
         return Err(invalid(cost::TOO_SLOW));
     }
-    let into = Transform::from_scale(fw as f32 / w, fh as f32 / h);
     let alloc = |w, h| Pixmap::new(w, h).ok_or_else(|| Error::Engine(format!("cannot allocate a {w} x {h} picture")));
     let mut out = alloc(pw, ph)?;
     if (fw, fh) == (pw, ph) {
@@ -123,6 +123,14 @@ pub fn render(svg: &str, pw: u32, ph: u32, opacity: f64) -> Result<Pixmap> {
     }
     apply_opacity(&mut out, opacity);
     Ok(out)
+}
+
+/// The size, in pixels, a document of `w` x `h` user units is drawn at inside a `pw` x `ph` picture
+/// (fit "contain": the largest size that keeps its shape inside).
+pub(super) fn fit_contain(w: f32, h: f32, pw: u32, ph: u32) -> (u32, u32) {
+    let scale = (pw as f32 / w).min(ph as f32 / h);
+    let fit = |v: f32, max: u32| ((v * scale).round() as u32).clamp(1, max);
+    (fit(w, pw), fit(h, ph))
 }
 
 fn apply_opacity(pixmap: &mut Pixmap, opacity: f64) {
@@ -582,32 +590,38 @@ const TOMBSTONE: &str = ".gone-";
 /// out of the namespace happen under the pins' lock, so a [`Pin::new`] cannot slip between them: a
 /// preparer either pinned first and the entry stays, or pins after and finds it gone (and draws it
 /// again) — never a "complete" sequence whose frames vanish under ffmpeg.
+///
+/// An entry that will not be renamed (a handle open on it on Windows) is **left alone**, whole and
+/// still finished, and tried again at the next trim: the only other way to empty it is to delete its
+/// files, which has to happen where nobody can pin it — under the lock, and so with every pin and
+/// trim waiting on a directory's worth of unlinks — or after the lock, where a preparer that pins it
+/// meanwhile finds a marker and a first and last picture over frames that are being deleted.
 fn evict(path: &Path, also_pinned: &dyn Fn(&Path) -> bool) -> bool {
+    evict_by(path, also_pinned, &|from, to| std::fs::rename(from, to))
+}
+
+/// [`evict`], with the rename given (a test makes it fail, as a handle open on Windows does).
+fn evict_by(path: &Path, also_pinned: &dyn Fn(&Path) -> bool, rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>) -> bool {
     static N: AtomicU64 = AtomicU64::new(0);
     let tomb = path.with_file_name(format!(
         "{TOMBSTONE}{}-{}",
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
-    let renamed = {
+    {
         let held = pins().lock().unwrap_or_else(PoisonError::into_inner);
         if held.contains_key(path) || also_pinned(path) {
             return false;
         }
-        if std::fs::rename(path, &tomb).is_err() {
-            // A file system that will not rename it (a handle open on Windows): the marker goes
-            // first, still under the lock, so nobody is told it is finished while it is emptied.
-            let _ = std::fs::remove_file(path.join(MARKER));
-            false
-        } else {
-            true
+        if rename(path, &tomb).is_err() {
+            return false;
         }
-    };
-    let target = if renamed { &tomb } else { path };
-    let gone = if target.is_dir() {
-        std::fs::remove_dir_all(target)
+    }
+    // Nothing can reach the tombstone: it has a name nobody asks for.
+    let gone = if tomb.is_dir() {
+        std::fs::remove_dir_all(&tomb)
     } else {
-        std::fs::remove_file(target)
+        std::fs::remove_file(&tomb)
     };
     gone.is_ok()
 }
@@ -797,6 +811,57 @@ mod tests {
         assert!(e.contains("feMorphology"), "{e}");
     }
 
+    fn svg_with(attrs: &str, inner: &str) -> String {
+        format!("<svg xmlns=\"http://www.w3.org/2000/svg\" {attrs}>{inner}</svg>")
+    }
+
+    const MORPH: &str = "<filter id=\"f\" x=\"0\" y=\"0\" width=\"1\" height=\"1\"><feMorphology radius=\"1\"/></filter>";
+
+    #[test]
+    fn a_documents_own_scale_is_part_of_what_a_filter_costs() {
+        // A radius of 1 unit in a 96 x 54 document drawn at 1920 x 1080 is 20 px, whether the scale
+        // is the caller's (viewBox alone, or width and height alone) or usvg's own (a viewBox in a
+        // 1920 x 1080 document is a transform on the root group).
+        let rect = "<rect width=\"96\" height=\"54\" filter=\"url(#f)\"/>";
+        for attrs in [
+            "viewBox=\"0 0 96 54\"",
+            "width=\"96\" height=\"54\"",
+            "width=\"1920\" height=\"1080\" viewBox=\"0 0 96 54\"",
+        ] {
+            let doc = svg_with(attrs, &format!("{MORPH}{rect}"));
+            let e = render(&doc, 1920, 1080, 1.0).unwrap_err().to_string();
+            assert!(e.contains("feMorphology"), "{attrs}: {e}");
+            assert!(SvgDoc::parse(&doc).is_err(), "{attrs}: refused when the document is read");
+            assert!(render(&doc, 96, 54, 1.0).is_ok(), "{attrs}: and fine at its own size");
+        }
+    }
+
+    #[test]
+    fn a_group_scaled_up_round_a_tiny_filtered_rect_is_refused() {
+        // Nothing in the rect, the filter or the radius is large; the group's scale(1000) makes the
+        // region as large as resvg will take (five canvases a side) and the radius 19 px.
+        let doc = svg(
+            "<g transform=\"scale(1000)\"><filter id=\"f\" x=\"-100\" y=\"-100\" width=\"300\" height=\"300\"><feMorphology radius=\"0.001\"/></filter><rect width=\"0.01\" height=\"0.01\" filter=\"url(#f)\"/></g>",
+        );
+        assert!(render(&doc, 1920, 1080, 1.0).is_err());
+        assert!(SvgDoc::parse(&doc).is_err());
+        // The same without the scale is a speck.
+        assert!(render(&doc.replace("scale(1000)", "scale(1)"), 1920, 1080, 1.0).is_ok());
+    }
+
+    #[test]
+    fn a_title_that_grows_into_a_heavy_filter_is_refused_at_the_frame_where_it_does() {
+        // The stored document is cheap (its group has no transform), so reading it passes; the
+        // animation scales the filtered group to 40x, region and radius with it.
+        let doc = SvgDoc::parse(&svg(
+            "<filter id=\"f\" x=\"0\" y=\"0\" width=\"1\" height=\"1\"><feMorphology radius=\"0.05\"/></filter><g filter=\"url(#f)\"><rect width=\"10\" height=\"5\"/><animateTransform attributeName=\"transform\" type=\"scale\" from=\"1\" to=\"40\" dur=\"2s\" fill=\"freeze\"/></g>",
+        ))
+        .unwrap();
+        assert!(render(&doc.at(0.0), 1920, 960, 1.0).is_ok());
+        let e = render(&doc.at(2.0), 1920, 960, 1.0).unwrap_err().to_string();
+        assert!(e.contains("feMorphology"), "{e}");
+    }
+
     #[test]
     fn a_picture_too_large_to_hold_is_refused() {
         assert!(render(&svg(""), 10_000, 10_000, 1.0).is_err());
@@ -942,6 +1007,23 @@ mod tests {
         let late = Pin::new(&kept);
         assert!(!is_complete(&kept), "a pin taken after the eviction sees an empty place");
         drop(late);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_entry_that_will_not_be_renamed_is_left_whole_not_emptied_behind_a_pin() {
+        let root = scratch("no-rename");
+        let stuck = sequence(&root, "aa", 1000, 300);
+        let fails = |_: &Path, _: &Path| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!evict_by(&stuck, &|_| false, &fails));
+        // Nothing of it was deleted, marker included: a preparer that pins it now finds what it
+        // found before, finished, and ffmpeg reads frames that are all there.
+        assert!(is_complete(&stuck) && has_frames(&stuck, 0..1));
+        let names: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(names.len(), 1, "and no tombstone: {names:?}");
+        // The next trim, with a file system that renames, takes it.
+        assert!(evict(&stuck, &|_| false));
+        assert!(!stuck.exists());
         let _ = std::fs::remove_dir_all(root);
     }
 

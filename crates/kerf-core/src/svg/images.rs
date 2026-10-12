@@ -80,8 +80,13 @@ pub(crate) fn check(mime: &str, data: &[u8]) -> Result<u64, Refused> {
     if !format.has_magic(data) {
         return Err(Refused::Unreadable);
     }
-    let size = imagesize::blob_size(data).map_err(|_| Refused::Unreadable)?;
-    let (w, h) = (size.width as u64, size.height as u64);
+    let (w, h) = match format {
+        Format::Jpeg => jpeg_size(data).ok_or(Refused::Unreadable)?,
+        _ => {
+            let size = imagesize::blob_size(data).map_err(|_| Refused::Unreadable)?;
+            (size.width as u64, size.height as u64)
+        }
+    };
     if w == 0 || h == 0 {
         return Err(Refused::Unreadable);
     }
@@ -90,6 +95,56 @@ pub(crate) fn check(mime: &str, data: &[u8]) -> Result<u64, Refused> {
         return Err(Refused::TooLarge(w, h));
     }
     Ok(pixels)
+}
+
+/// The size a JPEG's frame headers declare, read the way a decoder walks the file: marker by marker,
+/// over the `0xFF` fill bytes the format allows before any marker (and which [`imagesize`] takes for a
+/// marker of its own, so it skips the wrong length and can land on a decoy frame header while the
+/// decoder allocates for the real one), by each segment's length, and through the entropy-coded data
+/// to the end of the image. **The largest** frame header found is the size, so an image with two says
+/// the worse of them. `None` for a file whose headers do not parse or that has none.
+fn jpeg_size(data: &[u8]) -> Option<(u64, u64)> {
+    let mut best: Option<(u64, u64)> = None;
+    let mut i = 2;
+    while i < data.len() {
+        if data[i] != 0xFF {
+            // Entropy-coded data, or padding: the next marker is the next 0xFF.
+            i += 1;
+            continue;
+        }
+        while data.get(i) == Some(&0xFF) {
+            i += 1;
+        }
+        let Some(&marker) = data.get(i) else { break };
+        i += 1;
+        match marker {
+            // A stuffed 0xFF in the data, TEM, RSTn and SOI: markers with no segment after them.
+            0x00 | 0x01 | 0xD0..=0xD8 => {}
+            // EOI: whatever follows (a second picture, a trailer) is not the one that is drawn.
+            0xD9 => break,
+            _ => {
+                let len = usize::from(u16::from_be_bytes([*data.get(i)?, *data.get(i + 1)?]));
+                if len < 2 {
+                    return None;
+                }
+                // SOF0-3, 5-7, 9-11 and 13-15: not DHT (C4), JPG (C8) or DAC (CC).
+                if matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF) {
+                    let frame = data.get(i + 2..i + len)?;
+                    // Precision (1), lines (2), samples per line (2), components...
+                    if frame.len() < 6 {
+                        return None;
+                    }
+                    let h = u64::from(u16::from_be_bytes([frame[1], frame[2]]));
+                    let w = u64::from(u16::from_be_bytes([frame[3], frame[4]]));
+                    if best.is_none_or(|(bw, bh)| w * h > bw * bh) {
+                        best = Some((w, h));
+                    }
+                }
+                i += len;
+            }
+        }
+    }
+    best
 }
 
 /// The mime type and bytes of a `data:` URL, decoded the way usvg decodes one (so what is checked
@@ -173,6 +228,73 @@ pub(crate) mod tests {
         assert_eq!(check("image/png", b""), Err(Refused::Unreadable));
         assert_eq!(check("image/gif", &png_claiming(4, 4)), Err(Refused::Unreadable));
         assert_eq!(check("image/webp", &png_claiming(4, 4)), Err(Refused::Unreadable));
+    }
+
+    /// A JPEG of `w` x `h` as a decoder walks it, with `fill` 0xFF fill bytes before the frame header
+    /// (the format allows any number before any marker).
+    fn jpeg(w: u16, h: u16, fill: usize) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        v.extend_from_slice(b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0");
+        v.extend(std::iter::repeat_n(0xFF, fill));
+        v.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 8]);
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&[1, 1, 0x11, 0]);
+        v.extend_from_slice(&[
+            0xFF, 0xDA, 0x00, 0x08, 1, 1, 0, 0, 0x3F, 0, 0x12, 0xFF, 0x00, 0x34, 0xFF, 0xD9,
+        ]);
+        v
+    }
+
+    #[test]
+    fn a_jpeg_is_read_over_its_fill_bytes() {
+        for fill in [0, 1, 2, 7, 300] {
+            assert_eq!(check("image/jpeg", &jpeg(640, 480, fill)), Ok(307_200), "{fill} fill bytes");
+            assert_eq!(
+                check("image/jpeg", &jpeg(5000, 4000, fill)),
+                Err(Refused::TooLarge(5000, 4000)),
+                "{fill} fill bytes"
+            );
+        }
+        // Fill bytes before the first marker too, and between segments.
+        let mut early = jpeg(640, 480, 0);
+        early.splice(2..2, [0xFF, 0xFF, 0xFF]);
+        assert_eq!(check("image/jpeg", &early), Ok(307_200));
+        // Truncated, empty of frames or with a segment that lies about its length: unreadable.
+        let whole = jpeg(640, 480, 0);
+        for cut in [2, 5, 20, 24, 28] {
+            assert_eq!(check("image/jpeg", &whole[..cut]), Err(Refused::Unreadable), "cut at {cut}");
+        }
+        assert_eq!(
+            check("image/jpeg", &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x01]),
+            Err(Refused::Unreadable)
+        );
+        assert_eq!(check("image/jpeg", &jpeg(0, 480, 0)), Err(Refused::Unreadable));
+    }
+
+    #[test]
+    fn a_jpeg_with_two_frame_headers_is_the_larger_of_them() {
+        // A small decoy first, the real header after it (or the other way round): never the smaller.
+        let small = jpeg(64, 64, 0);
+        let big = jpeg(6000, 6000, 0);
+        let frame = |v: &[u8]| v[20..33].to_vec();
+        let mut decoy_first = small.clone();
+        decoy_first.splice(33..33, frame(&big));
+        assert_eq!(check("image/jpeg", &decoy_first), Err(Refused::TooLarge(6000, 6000)));
+        let mut real_first = big.clone();
+        real_first.splice(33..33, frame(&small));
+        assert_eq!(check("image/jpeg", &real_first), Err(Refused::TooLarge(6000, 6000)));
+        // A second picture after the end of the first is not looked at.
+        let mut trailer = small.clone();
+        trailer.extend_from_slice(&big);
+        assert_eq!(check("image/jpeg", &trailer), Ok(4096));
+        // A frame header inside an EXIF thumbnail is inside a segment, which is skipped by its length.
+        let mut thumb = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        let inner = jpeg(6000, 6000, 0);
+        thumb.extend_from_slice(&u16::try_from(inner.len() + 2).unwrap().to_be_bytes());
+        thumb.extend_from_slice(&inner);
+        thumb.extend_from_slice(&small[2..]);
+        assert_eq!(check("image/jpeg", &thumb), Ok(4096));
     }
 
     #[test]

@@ -27,6 +27,7 @@ mod cost;
 mod images;
 mod presets;
 pub mod raster;
+mod rules;
 mod sanitize;
 mod values;
 
@@ -209,6 +210,7 @@ impl SvgDoc {
         }
         let mut by_id: HashMap<String, NodeId> = HashMap::new();
         for node in doc.descendants().filter(|n| n.node_type() == NodeType::Element) {
+            // The sanitiser leaves each id on one element, so first and only are the same.
             if let Some(id) = node.attribute("id") {
                 by_id.entry(id.to_string()).or_insert(node.id());
             }
@@ -444,22 +446,25 @@ const REFERENCING: [&str; 9] = [
     "marker-end",
 ];
 
-/// The elements `node` draws through `url(#id)` properties, in an attribute or in `style`.
-fn referenced(node: &Node, by_id: &HashMap<String, NodeId>) -> Vec<NodeId> {
+/// The elements `node` draws through `url(#id)` properties: in an attribute, in `style` (every
+/// declaration of it: the last wins in resvg, and the first is not the one to count), and in the
+/// `<style>` rules that could apply to it (`rules`).
+fn referenced(node: &Node, by_id: &HashMap<String, NodeId>, rules: &rules::Rules) -> Vec<NodeId> {
     let style = node.attribute("style").unwrap_or("");
     let mut ids: Vec<&str> = Vec::new();
     for prop in REFERENCING {
         if let Some(v) = node.attribute(prop) {
             ids.extend(url_ids(v));
         }
-        if let Some((_, v)) = style
+        for (_, v) in style
             .split(';')
             .filter_map(|d| d.split_once(':'))
-            .find(|(p, _)| p.trim().eq_ignore_ascii_case(prop))
+            .filter(|(p, _)| p.trim().eq_ignore_ascii_case(prop))
         {
             ids.extend(url_ids(v));
         }
     }
+    ids.extend(rules.refs_for(node));
     ids.into_iter().filter_map(|id| by_id.get(id).copied()).collect()
 }
 
@@ -472,12 +477,14 @@ fn referenced(node: &Node, by_id: &HashMap<String, NodeId>) -> Vec<NodeId> {
 ///
 /// This reads the document **as stored**: the properties that make an element draw another one are
 /// kept out of everything that could change them afterwards — an animation may not drive
-/// `mask` / `filter` / `clip-path` / `marker*` / `id` / `class` or set a `url()`, and a `<style>`
-/// rule may point only a `fill` or `stroke` at a gradient (`sanitize`).
+/// `mask` / `filter` / `clip-path` / `marker*` / `id` / `class` or set a `url()` but a gradient
+/// `fill` / `stroke` (`sanitize`) — and what a `<style>` rule points an element at is counted on
+/// every element the rule could apply to (`rules`).
 fn check_expansion(doc: &Document, by_id: &HashMap<String, NodeId>) -> Result<u64> {
     struct Walk<'a, 'input> {
         doc: &'a Document<'input>,
         by_id: &'a HashMap<String, NodeId>,
+        rules: rules::Rules,
         /// (nodes drawn, nesting, image pixels decoded) of the subtree, each reference expanded.
         memo: HashMap<NodeId, (usize, usize, u64)>,
         busy: HashSet<NodeId>,
@@ -507,18 +514,22 @@ fn check_expansion(doc: &Document, by_id: &HashMap<String, NodeId>) -> Result<u6
             let mut next: Vec<Node> = node.children().filter(Node::is_element).collect();
             // A paint server or filter may take its content from another (`href`); a gradient or
             // pattern chain is as cheap as it looks, but a pattern that borrows a heavy one is not.
+            let name = node.tag_name().name();
             if matches!(
-                node.tag_name().name(),
+                name,
                 "use" | "feImage" | "pattern" | "linearGradient" | "radialGradient" | "filter"
             ) {
                 let target = href_of(&node)
                     .and_then(|h| h.trim().strip_prefix('#'))
                     .and_then(|id| self.by_id.get(id))
-                    .and_then(|id| self.doc.get_node(*id));
+                    .and_then(|id| self.doc.get_node(*id))
+                    // usvg breaks a loop of gradients (each only ever lends its stops, so a ring of
+                    // them is as cheap as it looks); every other loop it draws is one that grows.
+                    .filter(|t| !(matches!(name, "linearGradient" | "radialGradient") && self.busy.contains(&t.id())));
                 next.extend(target);
             }
             next.extend(
-                referenced(&node, self.by_id)
+                referenced(&node, self.by_id, &self.rules)
                     .into_iter()
                     .filter_map(|id| self.doc.get_node(id)),
             );
@@ -527,6 +538,11 @@ fn check_expansion(doc: &Document, by_id: &HashMap<String, NodeId>) -> Result<u6
                 weight = weight.saturating_add(w);
                 depth = depth.max(d + 1);
                 pixels = pixels.saturating_add(p);
+                // Stop at the first excess: a rule that points every element at a few hundred more
+                // would otherwise be added up in full before it is refused.
+                if weight > MAX_EXPANDED {
+                    break;
+                }
             }
             self.busy.remove(&node.id());
             if weight > MAX_EXPANDED {
@@ -547,6 +563,7 @@ fn check_expansion(doc: &Document, by_id: &HashMap<String, NodeId>) -> Result<u6
     let mut walk = Walk {
         doc,
         by_id,
+        rules: rules::Rules::read(doc),
         memo: HashMap::new(),
         busy: HashSet::new(),
         widest: 0,
@@ -1113,6 +1130,26 @@ mod tests {
     }
 
     #[test]
+    fn a_fill_steps_between_gradients_and_colours_and_a_pattern_is_not_among_them() {
+        let defs = "<linearGradient id=\"g\"/><radialGradient id=\"h\"/><pattern id=\"p\" width=\"1\" height=\"1\"/>";
+        let c = |from: &str, to: &str| {
+            format!("{defs}<rect><animate attributeName=\"fill\" from=\"{from}\" to=\"{to}\" dur=\"2s\"/></rect>")
+        };
+        let rect = |style: &str| format!("{defs}<rect style=\"{style}\"></rect>");
+        assert_eq!(at(&c("url(#g)", "url(#h)"), 0.5), rect("fill:url(#g)"));
+        assert_eq!(at(&c("url(#g)", "url(#h)"), 1.5), rect("fill:url(#h)"));
+        assert_eq!(at(&c("red", "url(#h)"), 1.5), rect("fill:url(#h)"));
+        assert_eq!(at(&c("url(#g)", "red"), 1.5), rect("fill:#ff0000"));
+        // A pattern is another matter: the animation is dropped, the rect keeps what it had.
+        let d = doc(&c("red", "url(#p)"));
+        assert!(
+            !d.is_animated() && d.warnings().iter().any(|w| w.contains("url()")),
+            "{:?}",
+            d.warnings()
+        );
+    }
+
+    #[test]
     fn set_switches_a_value_for_a_while() {
         let show =
             "<rect style=\"visibility:hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"1s\" dur=\"2s\"/></rect>";
@@ -1670,22 +1707,51 @@ mod tests {
             !SvgDoc::parse(&svg(&fills)).unwrap().is_animated(),
             "a url() in a value is dropped"
         );
-        // A <style> rule may point a fill at a gradient and nothing else at anything, so a class
-        // cannot spend a mask a thousand times over.
+        // A gradient in a value is allowed to animate, a pattern is not.
+        let gradient_fills = format!(
+            "<linearGradient id=\"g\"><stop offset=\"0\"/></linearGradient><linearGradient id=\"h\"/>{}",
+            "<rect width=\"9\" height=\"9\" fill=\"url(#g)\"><animate attributeName=\"fill\" values=\"url(#g);url(#h)\" dur=\"1s\"/></rect>".repeat(8)
+        );
+        let d = SvgDoc::parse(&svg(&gradient_fills)).unwrap();
+        assert!(d.is_animated() && d.warnings().is_empty(), "{:?}", d.warnings());
+        // A <style> rule is counted on everything it could apply to, so a class cannot spend a mask
+        // a thousand times over without the guard seeing it...
         let ruled = format!(
             "{defs}<style>.a {{ mask: url(#m); filter: url(#f) }}</style>{}",
             "<rect class=\"a\" width=\"9\" height=\"9\"/>".repeat(8)
         );
-        let d = SvgDoc::parse(&svg(&ruled)).expect("the rule is cut, so the eight rects draw nothing heavy");
-        assert!(!d.sanitized().contains("mask: url"), "{}", d.sanitized());
-        assert!(d.warnings().iter().any(|w| w.contains("<style>")), "{:?}", d.warnings());
-        // ...while the same references written on the elements are counted and refused.
-        let attributes = format!("{defs}{}", "<rect width=\"9\" height=\"9\" mask=\"url(#m)\"/>".repeat(8));
-        assert!(SvgDoc::parse(&svg(&attributes))
-            .unwrap_err()
-            .to_string()
-            .contains("more than 100000 nodes"));
-        // A gradient in a rule is still fine.
+        let e = SvgDoc::parse(&svg(&ruled)).unwrap_err().to_string();
+        assert!(e.contains("more than 100000 nodes"), "{e}");
+        // ...whichever way it names them: a type, an id, a list, one with an ancestor or a
+        // pseudo-class, a rule inside @media, and a property spelled with a vendor prefix. (A rule that
+        // also reaches the elements inside the mask it points at -- `*`, `[width]` -- makes the mask
+        // refer to itself, which is refused as any loop is.)
+        let circles = "<circle class=\"a\" id=\"r1\" r=\"9\"/>".repeat(8);
+        for selector in [
+            "circle",
+            "#r1, circle.a",
+            "g circle.a:first-child",
+            "svg > circle",
+            ".a",
+            "circle.a[r]",
+            "@media screen { circle",
+        ] {
+            let close = if selector.starts_with('@') { "}" } else { "" };
+            let doc = format!("{defs}<style>{selector} {{ -webkit-mask: url(#m) }}{close}</style>{circles}");
+            let e = SvgDoc::parse(&svg(&doc)).unwrap_err().to_string();
+            assert!(e.contains("more than 100000 nodes"), "{selector}: {e}");
+        }
+        for selector in ["*", "[r]", ":not(.zzz)"] {
+            let doc = format!("{defs}<style>{selector} {{ mask: url(#m) }}</style>{circles}");
+            assert!(SvgDoc::parse(&svg(&doc)).is_err(), "{selector}");
+        }
+        // A rule no element could match costs nothing, and neither does one that points at a gradient or
+        // at a clip that is small.
+        let idle = format!(
+            "{defs}<style>.nobody {{ mask: url(#m) }} circle {{ filter: url(#f) }}</style>{}",
+            "<rect class=\"a\" width=\"9\" height=\"9\"/>".repeat(8)
+        );
+        assert!(SvgDoc::parse(&svg(&idle)).is_ok());
         let grad = "<linearGradient id=\"g\"><stop offset=\"0\"/></linearGradient><style>.a { fill: url(#g) }</style>";
         let d = SvgDoc::parse(&svg(&format!(
             "{grad}{}",
@@ -1693,6 +1759,67 @@ mod tests {
         )))
         .unwrap();
         assert!(d.sanitized().contains("fill: url(#g)"));
+        // Illustrator's internal CSS: a clip per class, each used by a few elements.
+        let clips = "<clipPath id=\"SVGID_1_\"><rect width=\"4\" height=\"4\"/></clipPath><style>.st0 { clip-path: url(#SVGID_1_) } .st1 { fill: #fff }</style>";
+        let d = SvgDoc::parse(&svg(&format!(
+            "{clips}{}",
+            "<g class=\"st0\"><rect class=\"st1\" width=\"9\" height=\"9\"/></g>".repeat(20)
+        )))
+        .unwrap();
+        assert!(d.sanitized().contains(".st0 { clip-path: url(#SVGID_1_) }"), "kept");
+        assert!(d.warnings().is_empty(), "{:?}", d.warnings());
+        // The last `mask` of a `style` attribute is the one resvg draws, and every one is counted.
+        let last = format!(
+            "{defs}{}",
+            "<rect width=\"9\" height=\"9\" style=\"mask:none;mask:url(#m)\"/>".repeat(8)
+        );
+        assert!(SvgDoc::parse(&svg(&last)).is_err());
+        // ...while the same references written on the elements are counted and refused.
+        let attributes = format!("{defs}{}", "<rect width=\"9\" height=\"9\" mask=\"url(#m)\"/>".repeat(8));
+        assert!(SvgDoc::parse(&svg(&attributes))
+            .unwrap_err()
+            .to_string()
+            .contains("more than 100000 nodes"));
+    }
+
+    #[test]
+    fn an_id_a_later_element_repeats_cannot_hide_a_heavier_target_from_the_guard() {
+        fn drawn(group: &resvg::usvg::Group) -> usize {
+            use resvg::usvg::Node;
+            1 + group.mask().map_or(0, |m| drawn(m.root()))
+                + group
+                    .children()
+                    .iter()
+                    .map(|n| match n {
+                        Node::Group(g) => drawn(g),
+                        _ => 1,
+                    })
+                    .sum::<usize>()
+        }
+        // usvg reaches the last element of an id through `url(#id)`, the guard counted the first: with a
+        // cheap mask first and the heavy one after it, eight rects looked like eight cheap masks and
+        // were drawn as eight heavy ones. Now the heavy one has no id to be reached by.
+        let cheap_first = format!(
+            "<mask id=\"m\"><rect width=\"1\" height=\"1\"/></mask>{}{}",
+            heavy_mask(),
+            "<rect width=\"9\" height=\"9\" mask=\"url(#m)\"/>".repeat(8)
+        );
+        let d = SvgDoc::parse(&svg(&cheap_first)).unwrap();
+        assert_eq!(d.sanitized().matches("id=\"m\"").count(), 1, "{}", d.sanitized());
+        assert!(d.warnings().iter().any(|w| w.contains("repeated")), "{:?}", d.warnings());
+        let tree = resvg::usvg::Tree::from_str(d.sanitized(), &resvg::usvg::Options::default()).unwrap();
+        assert!(
+            drawn(tree.root()) < 1000,
+            "what is drawn is what was counted: {}",
+            drawn(tree.root())
+        );
+        // The other way round, the heavy one is the one that stays, and is counted and refused.
+        let heavy_first = format!(
+            "{}<mask id=\"m\"><rect width=\"1\" height=\"1\"/></mask>{}",
+            heavy_mask(),
+            "<rect width=\"9\" height=\"9\" mask=\"url(#m)\"/>".repeat(8)
+        );
+        assert!(SvgDoc::parse(&svg(&heavy_first)).is_err());
     }
 
     #[test]
@@ -1708,12 +1835,19 @@ mod tests {
         let many = format!("{chain}{}", "<rect width=\"9\" height=\"9\" fill=\"url(#p)\"/>".repeat(8));
         let e = SvgDoc::parse(&svg(&many)).unwrap_err().to_string();
         assert!(e.contains("more than 100000 nodes"), "{e}");
-        // A cycle of hrefs is refused like one of <use>s.
-        let cyclic = "<linearGradient id=\"a\" href=\"#b\"/><linearGradient id=\"b\" href=\"#a\"/><rect fill=\"url(#a)\" width=\"1\" height=\"1\"/>";
+        // A ring of gradients is tolerated as usvg tolerates it (each only lends its stops, so it is as
+        // cheap as it looks); a loop of anything that draws more than stops is refused like one of
+        // <use>s.
+        let ring = "<linearGradient id=\"a\" href=\"#b\"/><linearGradient id=\"b\" href=\"#a\"/><linearGradient id=\"c\" href=\"#c\"/><rect fill=\"url(#a)\" width=\"1\" height=\"1\"/><rect fill=\"url(#c)\" width=\"1\" height=\"1\"/>";
+        assert!(SvgDoc::parse(&svg(ring)).is_ok());
+        let cyclic =
+            "<pattern id=\"a\" href=\"#b\"/><pattern id=\"b\" href=\"#a\"/><rect fill=\"url(#a)\" width=\"1\" height=\"1\"/>";
         assert!(SvgDoc::parse(&svg(cyclic))
             .unwrap_err()
             .to_string()
             .contains("refers back to itself"));
+        let uses = "<use id=\"a\" href=\"#b\"/><use id=\"b\" href=\"#a\"/>";
+        assert!(SvgDoc::parse(&svg(uses)).is_err());
         // A chain of gradients is what Illustrator writes, and is fine.
         let gradients = "<linearGradient id=\"a\" href=\"#b\"/><linearGradient id=\"b\"><stop offset=\"0\"/></linearGradient><rect fill=\"url(#a)\" width=\"1\" height=\"1\"/>";
         assert!(SvgDoc::parse(&svg(gradients)).is_ok());

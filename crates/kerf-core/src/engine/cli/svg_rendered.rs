@@ -33,6 +33,14 @@ use crate::svg::raster::with_pinned_dir;
 const W: u32 = 64;
 const H: u32 = 36;
 
+/// Held by the tests that run a two-pass export: its pass log is named for the process
+/// (`kerf-2pass-{pid}`, one export at a time in the app), so two of them side by side delete each
+/// other's log between the passes.
+fn one_two_pass_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("kerf-svg-rendered-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -392,6 +400,7 @@ fn a_title_that_cannot_move_is_one_looped_picture_and_the_export_ends_with_the_c
 #[test]
 #[ignore = "drives the real ffmpeg"]
 fn a_held_title_is_in_the_stream_and_in_a_two_pass_export() {
+    let _one = one_two_pass_at_a_time();
     let dir = scratch("held-stream");
     with_pinned_dir(dir.join("cache").to_str().unwrap(), || {
         let bg = background(&dir, "24");
@@ -504,6 +513,7 @@ fn sequences_in(root: &Path) -> usize {
 #[test]
 #[ignore = "drives the real ffmpeg"]
 fn a_two_pass_export_draws_its_titles_once_and_both_passes_read_them() {
+    let _one = one_two_pass_at_a_time();
     let dir = scratch("twopass");
     let cache = dir.join("cache");
     with_pinned_dir(cache.to_str().unwrap(), || {

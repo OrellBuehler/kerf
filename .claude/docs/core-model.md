@@ -344,7 +344,10 @@
   allow-list run once on the way in — scripts, `foreignObject` / `iframe` / `audio` / `video`,
   elements outside resvg's vocabulary, `on*` and foreign-namespace attributes, anything but
   `#fragment` links (an `<image>` may carry `data:image/png|jpeg|gif|webp`, **whose header says at most 16 Mpx** — the
-  decoder allocates what the header claims — else its `href` is cut with a warning; `svg/images.rs`), external `url()`,
+  decoder allocates what the header claims — else its `href` is cut with a warning; `svg/images.rs`: PNG / GIF / WebP by
+  `imagesize`, **JPEG by our own marker walk** (`jpeg_size`: it skips the `0xFF` fill bytes the format allows before a marker, which
+  `imagesize` takes for a marker and so errors on or lands on a decoy frame header; the largest frame header before the end of the image
+  is the size)), external `url()`,
   `@import`, `@keyframes` and `animation*` / `transition*` (warning "CSS animations are not
   rendered — use SMIL"); a plain DOCTYPE is cut, one with an internal subset is refused; caps
   128 KiB, 20,000 elements, depth 64, 2,000 animations, 1,000 values each, `MAX_SVG_OVERLAYS` =
@@ -361,10 +364,11 @@
   (roxmltree, then a usvg parse to refuse what resvg cannot size — a `viewBox` or pixel
   `width`/`height` is required, since resvg sizes a bare document to its content and an
   animation would change that per frame; `<use>` / `feImage` expansion is counted from the XML
-  *first* — more than 100,000 drawn nodes, 128 levels or a reference cycle is refused, since usvg
+  *first* — more than 100,000 drawn nodes, 128 levels or a reference cycle is refused (a ring of
+  **gradients** by `href` is not: each only lends its stops, and usvg breaks the loop), since usvg
   expands a cycle to its million-node limit before it notices; the target of a `use` is its unprefixed
   `href`, else `xlink:href`, as resvg's, and a `url(#id)` in `fill` / `stroke` / `mask` / `clip-path` /
-  `filter` / `marker-*` (attribute or `style`) counts the target again for every element that draws it; a `pattern` /
+  `filter` / `marker-*` (attribute, **every declaration of `style`**, or a `<style>` rule — see below) counts the target again for every element that draws it; a `pattern` /
   gradient / `filter` `href` is followed too, and `<image>` pixels are summed the same way — more than 64 Mpx decoded in a frame,
   each `<use>` of an image decoding it again, is refused — and `SvgDoc::widest_image_pixels` is what a frame's decode must hold),
   and `at` returns a *static* SVG for one moment —
@@ -391,12 +395,21 @@
   fire; `animateMotion`, `animate` on `transform`, animating `href` / `style` / `on*` and a base value that comes
   from a `<style>` rule is not seen (the default is used) — all dropped or ignored with a warning. **Dropped too is anything that
   would make the guard (which reads the document as stored) wrong afterwards**: an animation of `mask` / `filter` / `clip-path` / `clip` / `marker*` / `id` / `class`, one whose `values` / `from` / `to` / `by` hold a
-  `url(`, and one of `radius` / `order` / `numOctaves` (they set the cost of a filter primitive); and a `<style>` rule may point
-  a `fill` or `stroke` at a **gradient** and nothing else at anything (`STYLE_REFERENCE_NOTE`; the guard reads no selectors, so a
-  class could spend a mask a thousand times — put pattern, mask, clip-path, filter and marker references on the element, where
-  they are counted; an inline `style` is read). A document whose filters would take seconds a frame is refused when it is read
-  (`svg/cost.rs`: `feMorphology` radius, `feConvolveMatrix` order and `feTurbulence` octaves times the region, at a nominal
-  1080p; the rasteriser makes the same estimate at the real size).
+  `url(` **unless it animates `fill` or `stroke` between gradients** (a paint server is a handful of stops however often it
+  is used; "gradient" = an element that is the only one with its id, so there is no doubt which element `url(#g)` reaches), and one of `radius` / `order` / `numOctaves`
+  (they set the cost of a filter primitive). **A `<style>` rule keeps its `url(#id)`** (Illustrator's "Internal CSS" writes
+  `.stN{clip-path:url(#SVGID_n_)}`): `svg/rules.rs` reads every rule's *subject* (its last compound selector) and counts the
+  reference on each element that subject could match — the name, classes and id it spells out, nothing else (an ancestor, a
+  pseudo-class or an attribute test only narrows, so ignoring them over-counts), and **every** element when it cannot read the
+  selector (`*`, `svg|rect`, an escape). A rule that reaches the elements inside what it points at (`rect { mask: url(#m) }` over a
+  mask holding a rect) makes that mask refer to itself and is refused like any loop. **A later element repeating an `id` loses it**
+  (warning): usvg reaches the *last* element of an id through `url(#id)` and an href chain and the first through `<use>`, the guard
+  one, so the sanitiser leaves one — the first, which is also the browser's. A document whose filters, layers or overdraw
+  would take seconds a frame is refused when it is read
+  (`svg/cost.rs`: `feMorphology` radius, `feConvolveMatrix` order and `feTurbulence` octaves times the region, plus a pixmap per
+  isolated group and the pixels each path covers, all **at the scale resvg really draws with — every group's `transform`
+  multiplied on the way down, the `viewBox` one usvg puts on the root and an animated one included — and a region held to
+  resvg's own 5x canvas**; at a nominal 1080p when read, and again by the rasteriser on each moment's tree at the real size).
   `svg::may_animate(src)` is false when the sanitised text has no animation element (a text test; `true` is only "maybe"), which is
   what lets the engine keep such a title as one picture. Start and end are held to 24 h (`MAX_SVG_SECONDS`).
   `natural_duration` (all animations settled; `None` for a still or an endless loop) is what

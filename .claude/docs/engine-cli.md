@@ -695,9 +695,17 @@ so the feature is **only** activated through these forwards — which is what ma
   nothing (no file read, no network), `resources_dir` is `None`, and a `data:` image is decoded only after its **header** says it
   is within 16 Mpx (`svg/images.rs`: `imagesize`, the crate usvg sizes with; the decoders allocate what the header claims, so
   60,000 x 60,000 bytes-of-header aborted the process) — the resolver answers "nothing" for one that is not, whatever the
-  document says. `render` also refuses a picture whose filters would cost more than `cost::MAX_FRAME_OPS` (2e9 per-pixel operations:
-  `feMorphology` is `(2r)^2` a pixel, `feConvolveMatrix` its order, `feTurbulence` its octaves, estimated from usvg's tree at the
-  scale it is drawn at; the same estimate is made at a nominal 1080p when a document is read). **Draw order**: clips, then SVG overlays in list order, then text
+  document says. `render` also refuses a picture that would cost more than `cost::MAX_FRAME_OPS` (2e9 per-pixel operations:
+  `feMorphology` is `(2r)^2` a pixel, `feConvolveMatrix` its order, `feTurbulence` its octaves, plus a pixmap per isolated group and
+  the pixels each path covers). **The estimate walks usvg's tree as resvg draws it**: the transform carried down is the root
+  transform given to `resvg::render` times every group's own `transform` (a `viewBox` bigger or smaller than the size is a transform
+  on usvg's root group; `<g transform="scale(1000)">` and an `animateTransform` count), a mask / pattern / `feImage` restarts from
+  the transform resvg gives it, and a region or layer is held to `max_filter_bbox` (5W x 5H of the pixmap, the region itself in an
+  `feImage`), not to the canvas. It runs on the static document of *that moment* (`at(t)`) at the size drawn, so a title that grows
+  into a heavy filter is refused at the frame where it does, before that frame is drawn; the same walk runs at a nominal 1080p when a
+  document is read. A pattern tile larger than a layer may be is refused (the allocation would abort). **Bounded, not interruptible**:
+  resvg cannot be stopped half way through a picture, so what keeps `prepare` (the `PREVIEW_DRAWING` slot, the foreground lease) from
+  being held for minutes is that one picture is held to seconds, and a cancel or the deadline is looked at between pictures. **Draw order**: clips, then SVG overlays in list order, then text
   (captions on top): the clips land on `vsvg`, and the titles end on `vtext` / `vcomp` (gif) / the final pad, so a graph without
   titles is byte-identical (golden `0..6000` unmoved).
   - **An export or a stream reads a numbered sequence**: `-f image2 -framerate {fps} -i {dir}/%06d.png` after the clips' inputs
@@ -735,13 +743,16 @@ so the feature is **only** activated through these forwards — which is what ma
     (`export_preflight`: no clips, `validate_export`), before a title is drawn. The stream (`stream_preview_once`: `preview_cut` →
     `prepare_preview` → `preview_args`; `build_preview_args[_with]` are the test/golden seam over the same two) draws its titles
     on the budget's threads, ungated, for at most 10 s counted from the call (`animated title too heavy to preview`), **one
-    preparation at a time** (`PreviewSlot`: a seek that supersedes a stream waits for it to notice, not beside it) and **with a
+    preparation at a time** (`PreviewSlot` on a `PreviewGate`: a seek that supersedes a stream waits for it to notice, not beside it;
+    the process has one gate and a test the calling thread's own, so stream tests do not wait for or cancel each other —
+    `prepare_preview_in` takes a named one for a test that puts two threads on it) and **with a
     cancel**: `stream_preview_until(.., cancel, on_frame)` (`stream_preview_with` is it with `|| false`; `start_playback` passes
     "superseded or stopped"), looked at 40 times a second, before each document is read and every 16 frames of the compare. A
     picture in flight is finished first. **Memory and priority**: `prepare` runs no more threads than
     `RENDER_MEMORY` (1 GiB) allows (12 bytes a pixel of the picture + 8 a pixel of the widest embedded image, per thread), each
-    thread `cpu::background_thread()` (below normal when the budget is under 100%: `setpriority` on the thread on Linux, the
-    background class on macOS, **Windows left alone** — no binding for `SetThreadPriority` in the tree), and the parsed
+    thread `cpu::background_thread()` (below normal when the budget is under 100%: `nice(10)` on the thread on Linux, relative to what
+    it has like `cpu::background`; the *utility* QoS class on macOS, not `PRIO_DARWIN_BG`, whose I/O throttling is hard on a
+    picture a user is waiting for; **Windows left alone** — no binding for `SetThreadPriority` in the tree), and the parsed
     documents are kept (`DocCache`, last 6 by digest of the source) so a scrub or a replay reads a title once.
   - **The cache** (`<cache>/kerf/svg/<pid>/<key>/NNNNNN.png` + a `complete` marker, else a private `kerf-svg-<uid>` directory in the
     temp one, else a unique `0700` `kerf-svg-<pid>-<nanos>-<n>` made with a plain `mkdir`): `key` = SHA-256 of `RASTER_VERSION`, the
@@ -755,7 +766,7 @@ so the feature is **only** activated through these forwards — which is what ma
     (Windows: untouched for a day); within the process `raster::trim` holds the total to `KERF_SVG_CACHE_MB` (1024), dropping the
     least recently used sequence or `still-*.png`, **never a pinned one** (`raster::Pin`, taken before the marker is looked at).
     **The check and the removal are one step**: `evict` takes the pins' lock, and renames the entry to `.gone-*` before it deletes
-    it (marker first where a rename fails), so a pin taken during a trim either stops it or finds the place empty. Trim runs only
+    it, so a pin taken during a trim either stops it or finds the place empty; **an entry that will not rename (a handle open on it on Windows) is left whole and tried at the next trim**, never emptied: deleting its files after the lock lets a preparer pin and re-mark a directory whose frames are going, and under the lock stalls every pin. Trim runs only
     after something was written. `raster::with_pinned_dir` (tests, per thread) fixes the directory so the builders stay pure and
     the golden oracle machine-independent.
   - **A still reads one PNG** (`still_svgs`: the overlays with `start <= t < end` at the still's own size; `still-{key}.png`, the

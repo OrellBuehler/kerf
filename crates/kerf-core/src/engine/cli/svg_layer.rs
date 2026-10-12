@@ -805,18 +805,46 @@ pub(super) fn prepare_export(
 /// The one preparation of the playback stream that may be drawing at a time. A seek, or a second
 /// Play, supersedes the stream before it, and that one's `cancel` fires; until it has noticed, the
 /// new one waits here instead of starting a second set of threads beside it.
-static PREVIEW_DRAWING: AtomicBool = AtomicBool::new(false);
+///
+/// A value rather than a bare static so a test can have a gate of its own: the process has one
+/// ([`preview_gate`]), and every test that went through it would wait for, or be cancelled by, the
+/// others running beside it.
+pub(super) struct PreviewGate(AtomicBool);
 
-struct PreviewSlot;
+impl PreviewGate {
+    pub(super) const fn new() -> Self {
+        PreviewGate(AtomicBool::new(false))
+    }
+}
 
-impl PreviewSlot {
-    fn take(ctl: &Control<'_>) -> Result<Self> {
+/// The gate a stream's preparation goes through: the process's, and in a test the calling thread's own
+/// (a test that wants two threads on one gate names it: [`prepare_preview_in`]).
+fn preview_gate() -> &'static PreviewGate {
+    #[cfg(test)]
+    {
+        thread_local! {
+            static OWN: &'static PreviewGate = Box::leak(Box::new(PreviewGate::new()));
+        }
+        OWN.with(|gate| *gate)
+    }
+    #[cfg(not(test))]
+    {
+        static GATE: PreviewGate = PreviewGate::new();
+        &GATE
+    }
+}
+
+struct PreviewSlot<'a>(&'a PreviewGate);
+
+impl<'a> PreviewSlot<'a> {
+    fn take(gate: &'a PreviewGate, ctl: &Control<'_>) -> Result<Self> {
         loop {
-            if PREVIEW_DRAWING
+            if gate
+                .0
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Ok(PreviewSlot);
+                return Ok(PreviewSlot(gate));
             }
             ctl.check()?;
             std::thread::sleep(POLL);
@@ -824,9 +852,9 @@ impl PreviewSlot {
     }
 }
 
-impl Drop for PreviewSlot {
+impl Drop for PreviewSlot<'_> {
     fn drop(&mut self) {
-        PREVIEW_DRAWING.store(false, Ordering::Release);
+        self.0 .0.store(false, Ordering::Release);
     }
 }
 
@@ -835,6 +863,11 @@ impl Drop for PreviewSlot {
 /// [`PREVIEW_PREPARE_LIMIT`] from now (waiting for an earlier preparation counts), one preparation
 /// at a time, and ended at once by `cancel` (the stream was stopped or superseded).
 pub(super) fn prepare_preview(seqs: &[SvgSeq<'_>], cancel: &dyn Fn() -> bool) -> Result<Vec<Pin>> {
+    prepare_preview_in(preview_gate(), seqs, cancel)
+}
+
+/// [`prepare_preview`] through the given gate.
+pub(super) fn prepare_preview_in(gate: &PreviewGate, seqs: &[SvgSeq<'_>], cancel: &dyn Fn() -> bool) -> Result<Vec<Pin>> {
     if seqs.is_empty() {
         return Ok(Vec::new());
     }
@@ -843,7 +876,7 @@ pub(super) fn prepare_preview(seqs: &[SvgSeq<'_>], cancel: &dyn Fn() -> bool) ->
         cancel,
         deadline: Some(deadline),
     };
-    let _slot = PreviewSlot::take(&ctl)?;
+    let _slot = PreviewSlot::take(gate, &ctl)?;
     prepare(seqs, cpu::budget_threads(), Some(deadline), cancel)
 }
 
@@ -1818,35 +1851,46 @@ mod tests {
         let f = fmt(320, 180, 10.0);
         let (tl, _) = titled(&sliding(), 0.0, 1.0);
         let root_str = root.to_str().unwrap().to_string();
+        // A gate of this test's own: the process's is the one every stream test goes through.
+        let gate = PreviewGate::new();
         crate::svg::raster::with_pinned_dir(&root_str, || {
             let seqs = svg_sequences(&tl, &f);
             let never = Control {
                 cancel: &|| false,
                 deadline: None,
             };
-            let held = PreviewSlot::take(&never).unwrap();
+            let held = PreviewSlot::take(&gate, &never).unwrap();
             // Stopped while it waits: it gives up at once, without having drawn anything.
-            let err = prepare_preview(&seqs, &|| true).unwrap_err();
+            let err = prepare_preview_in(&gate, &seqs, &|| true).unwrap_err();
             assert!(matches!(err, Error::Cancelled), "{err}");
             assert!(!seqs[0].dir.exists());
             // One that is not stopped waits, and goes when the first lets go.
-            let waiter = {
-                let (root_str, tl, f) = (root_str.clone(), tl.clone(), f.clone());
-                std::thread::spawn(move || {
+            std::thread::scope(|scope| {
+                let waiter = scope.spawn(|| {
                     crate::svg::raster::with_pinned_dir(&root_str, || {
                         let seqs = svg_sequences(&tl, &f);
-                        prepare_preview(&seqs, &|| false).map(|pins| pins.len())
+                        prepare_preview_in(&gate, &seqs, &|| false).map(|pins| pins.len())
                     })
-                })
-            };
-            std::thread::sleep(Duration::from_millis(250));
-            assert!(!waiter.is_finished(), "it waits for the slot");
-            drop(held);
-            assert_eq!(waiter.join().unwrap().unwrap(), 1);
+                });
+                std::thread::sleep(Duration::from_millis(250));
+                assert!(!waiter.is_finished(), "it waits for the slot");
+                drop(held);
+                assert_eq!(waiter.join().unwrap().unwrap(), 1);
+            });
             // And the slot is free again afterwards.
-            drop(PreviewSlot::take(&never).unwrap());
+            drop(PreviewSlot::take(&gate, &never).unwrap());
         });
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn each_test_thread_has_a_gate_of_its_own_so_the_stream_tests_do_not_wait_for_each_other() {
+        let a = preview_gate() as *const PreviewGate;
+        assert_eq!(a, preview_gate() as *const PreviewGate, "one per thread");
+        let other = std::thread::spawn(|| preview_gate() as *const PreviewGate as usize)
+            .join()
+            .unwrap();
+        assert_ne!(a as usize, other);
     }
 
     #[test]
