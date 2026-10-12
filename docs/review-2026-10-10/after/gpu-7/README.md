@@ -161,6 +161,13 @@ audible picture. Locks are taken `render` before the play slot (documented). `pl
 translucent layer measures Y 2 / UV 2 on both FFmpegs (the sum of the two bounds would say Y 1 / UV 2). Results in `round3-results.txt`: `playback` 12 and kerf-app
 `drive_tests` + `play_tests` 16 on 6.1.1 and 9.0.2, the latter five times each, no failure and no exit crash; frontend check 0/0, 2899 tests, build ok.
 
+## 5d. Round 3 closing fixes (commit 28d2553)
+
+A takeover with no start-up measured (the usual first stream after an edit) is started the default 150 ms ahead, as the hand-over trigger assumes; the limit that
+remains is a first start-up slower than that, which trails the sound by the difference until one has been seen. A GPU session rebuilt in a running play carries the
+audible picture even if it is declined, and is never started before the playhead the play began at (`playSession`). Frontend only: `prek run --all-files` passes,
+`bun run check` 0/0, `bun run test` 2902 pass, `bun run build` ok; no Rust changed.
+
 ## 6. Not verified here (needs a real machine)
 
 - The sound's output latency and the A/V offset (section 3), per OS and output; WebKit's `getOutputTimestamp()`
