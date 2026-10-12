@@ -337,3 +337,70 @@ impl GpuPreview {
         drop(primed);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < until, "gave up waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_play_deadline_is_set_once_and_cleared_by_reset_and_unwatch() {
+        let primer = Primer::new();
+        let gone = Weak::<GpuPreview>::new();
+        let first = Instant::now() + Duration::from_secs(3600);
+        primer.watch_play(&gone, first);
+        assert_eq!(lock(&primer.state).play_due, Some(first));
+        // One already set is left: the thread looks at the session when it comes, and sets the next.
+        primer.watch_play(&gone, first + Duration::from_secs(5));
+        assert_eq!(lock(&primer.state).play_due, Some(first));
+        primer.unwatch_play();
+        assert_eq!(lock(&primer.state).play_due, None);
+        primer.watch_play(&gone, first);
+        {
+            let mut state = lock(&primer.state);
+            state.expire = Some(first);
+        }
+        primer.reset();
+        {
+            let state = lock(&primer.state);
+            assert!((state.play_due, state.expire, state.next.is_some()) == (None, None, false));
+        }
+        primer.stop();
+    }
+
+    #[test]
+    fn the_thread_waits_for_its_deadline_and_ends_with_the_preview() {
+        let primer = Primer::new();
+        let gone = Weak::<GpuPreview>::new();
+        primer.watch_play(&gone, Instant::now() + Duration::from_secs(3600));
+        wait_until("the thread to start", || lock(&primer.state).running);
+        // Nothing to do for an hour: it is asleep, not polling, and the preview going ends it.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(lock(&primer.state).running);
+        primer.stop();
+        wait_until("the thread to end", || !lock(&primer.state).running);
+        // Nothing is waited for after that, and no thread is started for it.
+        primer.reset();
+        primer.watch_play(&gone, Instant::now());
+        let state = lock(&primer.state);
+        assert!(state.play_due.is_none() && !state.running);
+    }
+
+    #[test]
+    fn a_deadline_that_comes_after_the_preview_is_gone_ends_the_thread_and_is_not_kept() {
+        let primer = Primer::new();
+        let gone = Weak::<GpuPreview>::new();
+        primer.watch_play(&gone, Instant::now());
+        wait_until("the thread to end", || {
+            let state = lock(&primer.state);
+            !state.running && state.play_due.is_none()
+        });
+    }
+}

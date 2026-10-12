@@ -472,22 +472,26 @@ impl GpuPreview {
     /// Hold the session for the next request, unless the setting went off or the backend was
     /// replaced while its frame was drawn. Decided with the session's slot held: a teardown that ran
     /// meanwhile ended nothing (the slot was empty), and the setting it had turned off is seen here, so a
-    /// session is never stored after the end that was meant for it.
+    /// session is never stored after the end that was meant for it. Locks in the order the preview
+    /// documents: `render`, then the slot.
     fn keep_play(&self, session: PlaySession) {
+        let state = lock(&self.render);
         let mut slot = lock(&self.play);
         let current = self.is_enabled()
-            && lock(&self.render)
+            && state
                 .backend
                 .as_ref()
                 .is_some_and(|b| Arc::ptr_eq(&b.source, &session.source));
         if !current {
             drop(slot);
+            drop(state);
             self.retire(Some(session));
             return;
         }
         let due = session.last_used + self.idle();
         *slot = Some(session);
         drop(slot);
+        drop(state);
         // Nobody may ask for it again (the page handed over, gave up, or was refused): it is ended then.
         if let Some(me) = self.me.get() {
             self.primer.watch_play(me, due);

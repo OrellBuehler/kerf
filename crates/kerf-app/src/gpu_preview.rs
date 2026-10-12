@@ -1053,6 +1053,10 @@ fn panic_text(payload: &(dyn Any + Send)) -> String {
 /// `render` (a frame in flight; the backend) → `bounds` (where the page says the frame is; held
 /// while a picture is shown, so a hide cannot land in the middle) → `host` (the option) → the
 /// host's own mutex. `building` (one backend build at a time) is taken alone, never under `render`.
+/// `render` → `info` (the build's note) → `play_tally` / `play` (the play session's slot: `keep_play` stores
+/// under `render`, `diagnostics` reads `play` under `info`), and `primed` → `play` (priming stores under the
+/// lock a play takes its primed session from, after looking at the slot). `play` is never held while
+/// taking any other of these, and the primer's own state is a leaf.
 pub struct GpuPreview {
     enabled: AtomicBool,
     /// Turning it on is a retry: the next frame forgets the backoff.
