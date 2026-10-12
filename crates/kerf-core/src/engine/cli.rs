@@ -10040,7 +10040,8 @@ mod tests {
             proxy_path_for(src, PROXY_MAX_WIDTH, late),
             proxy_path(src, PROXY_MAX_WIDTH),
         ) else {
-            return; // no cache dir on this platform
+            skip("skipped: this platform has no cache directory for proxies");
+            return;
         };
         assert_eq!(a, unreadable);
         assert!(a != b && a != c && b != c);
