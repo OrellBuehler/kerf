@@ -16,13 +16,16 @@
 //! `ffmpeg`s killed) by anything that is not a play from the playhead it was made for: another paused
 //! frame, a change to the project, the backend going, the setting off, and [`PRIME_TTL`] unplayed.
 //! One thread (`kerf-gpu-prime`) does the work, off every lock the frames use, and ends with the
-//! preview.
+//! preview. It is also the clock of a play session that nobody asks for any more ([`IDLE`](super::play::IDLE)):
+//! the page that handed over to the stream, gave the GPU up or was refused stops asking, and the session's
+//! idle cursors and prefetch thread are released when it passes, not when a next request that never comes
+//! would have noticed. It waits for the nearest of its three deadlines and for nothing when it has none.
 
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use kerf_core::{PlayCut, ProxyMedia};
-use kerf_gpu::{FrameSource, MotionFrames};
+use kerf_gpu::{FrameSource, MotionFrames, Opened};
 
 use super::play::{play_config, HORIZON};
 use super::snapshot::PlanInputs;
@@ -76,6 +79,10 @@ struct State {
     running: bool,
     /// When the session primed last is dropped if it was not played.
     expire: Option<Instant>,
+    /// When the play session held now is over if nobody has asked for it by then.
+    play_due: Option<Instant>,
+    /// The preview is gone: the thread ends.
+    stopped: bool,
 }
 
 /// The thread that primes, and what it is waiting for.
@@ -92,6 +99,22 @@ impl Primer {
         })
     }
 
+    /// Start the thread if it is not running. `state` is the guard of the lock; a thread that could not
+    /// be started is retried by the next call.
+    fn ensure_thread(self: &Arc<Self>, state: &mut State, preview: &Weak<GpuPreview>) {
+        if state.running || state.stopped {
+            return;
+        }
+        let (primer, weak) = (Arc::clone(self), preview.clone());
+        match std::thread::Builder::new()
+            .name("kerf-gpu-prime".into())
+            .spawn(move || primer_loop(&primer, &weak))
+        {
+            Ok(_) => state.running = true,
+            Err(e) => tracing::debug!(error = %e, "could not start the thread that primes a play"),
+        }
+    }
+
     /// Prime the cut from `t` once the playhead has rested [`PRIME_AFTER`]; a later call replaces this one.
     fn schedule(self: &Arc<Self>, preview: &Weak<GpuPreview>, inputs: Arc<PlanInputs>, t: f64) {
         let mut state = lock(&self.state);
@@ -100,16 +123,20 @@ impl Primer {
             inputs,
             t,
         });
-        if !state.running {
-            let (primer, weak) = (Arc::clone(self), preview.clone());
-            match std::thread::Builder::new()
-                .name("kerf-gpu-prime".into())
-                .spawn(move || primer_loop(&primer, &weak))
-            {
-                Ok(_) => state.running = true,
-                Err(e) => tracing::debug!(error = %e, "could not start the thread that primes a play"),
-            }
+        self.ensure_thread(&mut state, preview);
+        drop(state);
+        self.wake.notify_all();
+    }
+
+    /// The play session held now is over at `due` unless it is asked for by then (a deadline already set
+    /// is left: the thread looks at the session when it comes, and sets the next).
+    pub(super) fn watch_play(self: &Arc<Self>, preview: &Weak<GpuPreview>, due: Instant) {
+        let mut state = lock(&self.state);
+        if state.stopped || state.play_due.is_some() {
+            return;
         }
+        state.play_due = Some(due);
+        self.ensure_thread(&mut state, preview);
         drop(state);
         self.wake.notify_all();
     }
@@ -117,6 +144,25 @@ impl Primer {
     /// Nothing is primed after all (a play began, the setting went off).
     pub(super) fn cancel(&self) {
         lock(&self.state).next = None;
+    }
+
+    /// Nothing is primed, nothing is waited for: the thread sleeps until it is given something again.
+    pub(super) fn reset(&self) {
+        let mut state = lock(&self.state);
+        state.next = None;
+        state.expire = None;
+        state.play_due = None;
+    }
+
+    /// The play session is over: no deadline for it.
+    pub(super) fn unwatch_play(&self) {
+        lock(&self.state).play_due = None;
+    }
+
+    /// The preview is gone: the thread ends.
+    pub(super) fn stop(&self) {
+        lock(&self.state).stopped = true;
+        self.wake.notify_all();
     }
 
     fn pending(&self) -> bool {
@@ -127,6 +173,7 @@ impl Primer {
 enum Work {
     Prime(Pending),
     Expire,
+    Reap,
 }
 
 fn primer_loop(primer: &Primer, preview: &Weak<GpuPreview>) {
@@ -134,6 +181,10 @@ fn primer_loop(primer: &Primer, preview: &Weak<GpuPreview>) {
         let work = {
             let mut state = lock(&primer.state);
             loop {
+                if state.stopped {
+                    state.running = false;
+                    return;
+                }
                 let now = Instant::now();
                 if state.next.as_ref().is_some_and(|p| p.due <= now) {
                     match state.next.take() {
@@ -145,40 +196,48 @@ fn primer_loop(primer: &Primer, preview: &Weak<GpuPreview>) {
                     state.expire = None;
                     break Work::Expire;
                 }
-                if preview.strong_count() == 0 {
-                    state.running = false;
-                    return;
+                if state.play_due.is_some_and(|at| at <= now) {
+                    state.play_due = None;
+                    break Work::Reap;
                 }
-                // The nearest thing waited for, and at most a second so that a preview that is gone is noticed.
-                let soonest = [state.next.as_ref().map(|p| p.due), state.expire]
+                // The nearest thing waited for; with none, until something is given or the preview is gone.
+                let soonest = [state.next.as_ref().map(|p| p.due), state.expire, state.play_due]
                     .into_iter()
                     .flatten()
-                    .min()
-                    .map_or(Duration::from_secs(1), |at| at.saturating_duration_since(now));
-                let wait = soonest.min(Duration::from_secs(1)).max(Duration::from_millis(1));
-                state = primer
-                    .wake
-                    .wait_timeout(state, wait)
-                    .map(|(guard, _)| guard)
-                    .unwrap_or_else(|poisoned| poisoned.into_inner().0);
+                    .min();
+                state = match soonest {
+                    Some(at) => primer
+                        .wake
+                        .wait_timeout(state, at.saturating_duration_since(now).max(Duration::from_millis(1)))
+                        .map(|(guard, _)| guard)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner().0),
+                    None => primer.wake.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner()),
+                };
             }
         };
         #[cfg(test)]
-        let _busy = busy::Busy::enter();
+        let _busy = super::busy::Busy::enter();
         let Some(preview) = preview.upgrade() else {
             lock(&primer.state).running = false;
             return;
         };
         let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match work {
-            Work::Prime(pending) => preview.prime(&pending.inputs, pending.t),
+            Work::Prime(pending) => preview.prime(&pending.inputs, pending.t).then_some(PRIME_TTL),
             Work::Expire => {
                 preview.expire_primed();
-                false
+                None
+            }
+            Work::Reap => {
+                if let Some(due) = preview.reap_play() {
+                    let mut state = lock(&primer.state);
+                    state.play_due = Some(due);
+                }
+                None
             }
         }));
         match done {
-            Ok(true) => lock(&primer.state).expire = Some(Instant::now() + PRIME_TTL),
-            Ok(false) => {}
+            Ok(Some(ttl)) => lock(&primer.state).expire = Some(Instant::now() + ttl),
+            Ok(None) => {}
             Err(_) => tracing::warn!("priming a play panicked"),
         }
     }
@@ -196,8 +255,8 @@ impl GpuPreview {
     }
 
     /// Make the session from `t` ready; whether one was.
-    fn prime(&self, inputs: &PlanInputs, t: f64) -> bool {
-        if !self.is_enabled() || lock(&self.play).is_some() {
+    pub(super) fn prime(&self, inputs: &PlanInputs, t: f64) -> bool {
+        if !self.is_enabled() || self.playing() {
             return false;
         }
         let Some(technique) = self.technique.technique else {
@@ -231,13 +290,9 @@ impl GpuPreview {
         for layer in &first.layers {
             // Opens the file's probes and starts its `ffmpeg`, here and not on a frame; a clip that cannot be
             // opened ends the priming (what was opened is killed with `motion`).
-            if feed.open(layer).is_err() {
+            if !matches!(feed.open(layer, t), Ok(Opened::Waiting { .. })) {
                 return false;
             }
-        }
-        // A newer paused frame arrived while the probes ran, or a play began: this is not the playhead any more.
-        if self.primer.pending() || lock(&self.play).is_some() || !self.is_enabled() {
-            return false;
         }
         let primed = Primed {
             epoch: inputs.epoch(),
@@ -250,8 +305,16 @@ impl GpuPreview {
         if !still_there {
             return false;
         }
+        // A newer paused frame arrived while the probes ran, or a play began: this is not the playhead any
+        // more. Decided under the lock a play takes its primed session from (`take_primed`): a play that has
+        // started is seen here (`playing` counts a request being served as well as a session held, and a
+        // session is out of its slot while a frame is drawn), and one that starts after this has the session.
+        let mut slot = lock(&self.primed);
+        if self.primer.pending() || self.playing() || !self.is_enabled() {
+            return false;
+        }
         tracing::debug!(start = primed.cut.start(), layers = first.layers.len(), "a play is primed");
-        *lock(&self.primed) = Some(primed);
+        *slot = Some(primed);
         true
     }
 
@@ -261,9 +324,10 @@ impl GpuPreview {
         lock(&self.primed).take().filter(|p| p.fits(epoch, t, source, now))
     }
 
-    /// Drop the primed session and the work waiting to make one (its `ffmpeg`s are killed).
+    /// Drop the primed session and the work waiting to make one (its `ffmpeg`s are killed). The priming
+    /// thread has nothing left to wait for.
     pub(super) fn drop_primed(&self) {
-        self.primer.cancel();
+        self.primer.reset();
         self.expire_primed();
     }
 
@@ -271,38 +335,5 @@ impl GpuPreview {
     fn expire_primed(&self) {
         let primed = lock(&self.primed).take();
         drop(primed);
-    }
-}
-
-/// What a test waits for before its process may exit: the priming thread holds a strong reference to the
-/// preview while it works, and may be the one that drops the last, device and all. A process that exits
-/// while a device is being torn down on another thread crashes in the driver (lavapipe's shader compiler).
-#[cfg(test)]
-pub(super) mod busy {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
-
-    static WORKING: AtomicUsize = AtomicUsize::new(0);
-
-    pub struct Busy;
-
-    impl Busy {
-        pub fn enter() -> Self {
-            WORKING.fetch_add(1, Ordering::SeqCst);
-            Busy
-        }
-    }
-
-    impl Drop for Busy {
-        fn drop(&mut self) {
-            WORKING.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
-    pub fn wait_idle(limit: Duration) {
-        let until = Instant::now() + limit;
-        while WORKING.load(Ordering::SeqCst) > 0 && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(5));
-        }
     }
 }

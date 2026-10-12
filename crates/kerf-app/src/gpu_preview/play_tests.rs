@@ -395,3 +395,192 @@ fn a_playhead_that_rests_primes_the_play_from_it_and_play_starts_from_cursors_th
     preview.teardown_if_off();
     assert!(lock(&preview.primed).is_none());
 }
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_session_nobody_asks_for_any_more_frees_its_cursors_and_its_thread() {
+    let _turn = exclusive();
+    let log = Arc::new(Mutex::new(ScreenLog::default()));
+    let (take, shared) = super::drive_tests::taker(project());
+    let preview = Arc::new(preview(&log));
+    // The page's requests set this; the direct calls of a test do not.
+    let _ = preview.me.set(Arc::downgrade(&preview));
+    preview.idle_ms.store(500, Ordering::SeqCst);
+    let inputs = PlanInputs::of(&lock(&shared)).expect("inputs");
+    let _ = preview.play(&inputs, &key(1), 0.0, false);
+    wait_open(&preview);
+    let _ = take;
+
+    assert_eq!(preview.play(&inputs, &key(1), 0.0, false).expect("an answer").renderer, "gpu");
+    asked(&preview, &inputs, 1, 5);
+    wait_for("the next clip's cursor to be waiting", || {
+        lock(&preview.play).as_ref().is_some_and(|s| s.waiting() == 1)
+    });
+    let feed = lock(&preview.play).as_ref().map(PlaySession::feed).expect("a session");
+    assert!(super::busy::working() >= 1, "the session's prefetch thread is running");
+
+    // The page hands over to the stream (or is refused, or gives the GPU up) and asks for nothing more.
+    wait_for("the idle session to be ended", || lock(&preview.play).is_none());
+    assert_eq!(feed.waiting(), 0, "its idle cursors were killed");
+    wait_for("the prefetch thread to end", || super::busy::working() == 0);
+    assert_eq!(preview.diagnostics().play.frames, 2, "what it did is counted");
+
+    // A page that asks again after that begins another session.
+    let again = preview.play(&inputs, &key(1), 0.4, false).expect("an answer");
+    assert_eq!(again.renderer, "gpu", "{:?}", again.reasons);
+    assert_eq!(preview.diagnostics().play.sessions, 2);
+    // A session that is asked for is not ended: the deadline moves with its requests.
+    for frame in 13..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(asked(&preview, &inputs, 1, frame).renderer, "gpu");
+    }
+    assert!(lock(&preview.play).is_some());
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_clip_runs_are_not_trusted_for_under_the_playhead_is_the_streams_from_the_first_request() {
+    let _turn = exclusive();
+    let log = Arc::new(Mutex::new(ScreenLog::default()));
+    let project = Project::open_in_memory().expect("a project");
+    let ts = project.insert_or_get_asset(&probed(transport())).expect("asset");
+    project.cut_clip(ts.id, 0.0, 1.0).expect("a clip");
+    let a = project.insert_or_get_asset(&probed(&media()[0])).expect("asset");
+    project.cut_clip(a.id, 0.0, 1.0).expect("a clip");
+    let inputs = PlanInputs::of(&project).expect("inputs");
+    // A session the clip refuses never reaches the check, so a paused frame (of the other clip) starts it.
+    let preview = super::drive_tests::preview(&log);
+    let _ = preview.frame(&inputs, Want::at(1.5), 320);
+    wait_open(&preview);
+
+    let hides = super::HIDES.load(Ordering::SeqCst);
+    let declined = preview.diagnostics().play.declined;
+    // The plan draws it (it cannot know what the file is); the frame source says no before a frame is tried.
+    let r = preview.play(&inputs, &key(2), 0.0, false).expect("an answer");
+    assert_eq!(r.renderer, "stream", "{:?}", r.reasons);
+    assert!(r.reasons[0].contains("c.ts"), "{:?}", r.reasons);
+    assert!(r.play.is_none(), "the page plays the stream from its playhead");
+    assert!(lock(&log).presented.is_empty(), "nothing was drawn");
+    assert!(lock(&preview.play).is_none());
+    assert_eq!(preview.diagnostics().play.declined, declined + 1);
+    assert_eq!(super::HIDES.load(Ordering::SeqCst), hides, "the surface was not touched");
+    // The other clip, past the first, is the GPU's.
+    let past = preview.play(&inputs, &key(3), 1.2, false).expect("an answer");
+    assert_eq!(past.renderer, "gpu", "{:?}", past.reasons);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_play_frame_that_fails_leaves_the_surface_up_for_the_stream_to_take_over() {
+    let _turn = exclusive();
+    let log = Arc::new(Mutex::new(ScreenLog::default()));
+    let dir = std::env::temp_dir().join(format!("kerf-app-play-gone-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (here, gone) = (dir.join("here.mkv"), dir.join("gone.mkv"));
+    std::fs::copy(&media()[0], &here).unwrap();
+    let project = Project::open_in_memory().expect("a project");
+    let asset = project.insert_or_get_asset(&probed(&here)).expect("asset");
+    project.cut_clip(asset.id, 0.0, 2.0).expect("a clip");
+    let inputs = PlanInputs::of(&project).expect("inputs");
+    let preview = ready(&log, &inputs);
+
+    // The file is taken away after the session has been looked at and before its first frame opens it.
+    let moved = (here, gone);
+    *lock(&preview.before_decode) = Some(Arc::new(move || {
+        let _ = std::fs::rename(&moved.0, &moved.1);
+    }));
+    let hides = super::HIDES.load(Ordering::SeqCst);
+    let r = preview.play(&inputs, &key(2), 0.0, false).expect("an answer");
+    assert_eq!(r.renderer, "stream", "{:?}", r.reasons);
+    let at = r.play.and_then(|p| p.ahead).expect("where the stream starts");
+    assert!(at.handover <= 0.001, "{}", at.handover);
+    assert_eq!(
+        super::HIDES.load(Ordering::SeqCst),
+        hides,
+        "a play frame that fails does not hide the picture the stream takes over from"
+    );
+    // A still frame that fails does: the page then shows FFmpeg's picture.
+    *lock(&preview.before_decode) = None;
+    let _ = preview.frame(&inputs, Want::at(0.5), 320);
+    assert!(
+        super::HIDES.load(Ordering::SeqCst) > hides,
+        "a failed still hides the surface"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_frame_at_or_after_the_first_one_the_gpu_does_not_draw_is_not_attempted() {
+    let _turn = exclusive();
+    let log = Arc::new(Mutex::new(ScreenLog::default()));
+    // Eight seconds, and a title that moves from 6 s: beyond the five seconds a session looks ahead at the start.
+    let project = Project::open_in_memory().expect("a project");
+    let a = project.insert_or_get_asset(&probed(&media()[0])).expect("asset");
+    let b = project.insert_or_get_asset(&probed(&media()[1])).expect("asset");
+    project.cut_clip(a.id, 0.0, 3.0).expect("a clip");
+    project.cut_clip(b.id, 0.0, 3.0).expect("a clip");
+    project.cut_clip(a.id, 0.0, 2.0).expect("a clip");
+    let title = project.add_overlay("Sliding".into(), 6.0, 7.0).expect("a title");
+    let key_at = |time: f64, pos_x: f64| TextKeyframe {
+        time,
+        pos_x,
+        pos_y: 0.8,
+        opacity: 1.0,
+    };
+    project
+        .set_overlay_keyframes(title.id, vec![key_at(0.0, 0.2), key_at(1.0, 0.8)])
+        .expect("keyframes");
+    let inputs = PlanInputs::of(&project).expect("inputs");
+    let preview = ready(&log, &inputs);
+
+    let begin = preview.play(&inputs, &key(2), 0.0, false).expect("an answer");
+    assert_eq!(begin.renderer, "gpu", "{:?}", begin.reasons);
+    // The title comes into the five seconds ahead as the playhead moves: the answers say so.
+    let mid = asked(&preview, &inputs, 2, 45);
+    let ahead = mid.play.and_then(|p| p.ahead).expect("the title is in view");
+    assert_eq!(ahead.kind, "moving_text");
+    assert!((ahead.at - 6.0).abs() < 1.0 / FPS, "{}", ahead.at);
+    // A frame before it is the GPU's.
+    assert_eq!(asked(&preview, &inputs, 2, 120).renderer, "gpu");
+    let presented = lock(&log).presented.len();
+    // A frame inside the title (the page's hand-over was late) is not attempted: nothing is drawn.
+    let late = asked(&preview, &inputs, 2, 190);
+    assert_eq!(late.renderer, "stream", "{:?}", late.reasons);
+    assert!(late.reasons[0].contains("Sliding"), "{:?}", late.reasons);
+    let info = late.play.and_then(|p| p.ahead).expect("where the stream starts");
+    assert_eq!(info.kind, "moving_text");
+    assert!(info.handover <= info.at);
+    assert_eq!(lock(&log).presented.len(), presented, "no frame was drawn for it");
+    assert!(lock(&preview.play).is_none(), "the session is over");
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_play_being_served_or_held_is_not_primed_over() {
+    let _turn = exclusive();
+    let log = Arc::new(Mutex::new(ScreenLog::default()));
+    let (take, shared) = super::drive_tests::taker(project());
+    let preview = Arc::new(preview(&log));
+    let inputs = PlanInputs::of(&lock(&shared)).expect("inputs");
+    let _ = preview.play(&inputs, &key(1), 0.0, false);
+    wait_open(&preview);
+    let _ = take;
+    assert!(matches!(
+        preview.frame(&inputs, Want::at(0.2), 320).map(|r| r.renderer),
+        Ok("gpu")
+    ));
+    // Priming from the playhead the paused frame rests at works...
+    assert!(preview.prime(&inputs, 0.2));
+    *lock(&preview.primed) = None;
+    // ...but not while a request of a play is being served (the session is out of its slot while a
+    // frame is drawn, which is when a priming that was already under way would have stored its own)...
+    preview.serving.fetch_add(1, Ordering::SeqCst);
+    assert!(!preview.prime(&inputs, 0.2));
+    assert!(lock(&preview.primed).is_none());
+    preview.serving.fetch_sub(1, Ordering::SeqCst);
+    // ...nor with a session held.
+    assert_eq!(preview.play(&inputs, &key(2), 0.2, false).expect("an answer").renderer, "gpu");
+    assert!(!preview.prime(&inputs, 0.2));
+    assert!(lock(&preview.primed).is_none());
+}

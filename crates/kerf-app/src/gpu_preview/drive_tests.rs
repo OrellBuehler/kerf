@@ -121,13 +121,13 @@ pub(super) fn exclusive() -> Turn {
     Turn(lock(&TURN))
 }
 
-/// A test's turn. Ending it waits for the priming thread to let go of the preview: the last test of a
-/// process otherwise exits while a thread tears the device down.
+/// A test's turn. Ending it waits for the threads of a preview that can hold the device (`busy`): the last
+/// test of a process otherwise exits while one tears the device down.
 pub(super) struct Turn(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
 
 impl Drop for Turn {
     fn drop(&mut self) {
-        super::prime::busy::wait_idle(Duration::from_secs(10));
+        super::busy::wait_idle(Duration::from_secs(10));
     }
 }
 

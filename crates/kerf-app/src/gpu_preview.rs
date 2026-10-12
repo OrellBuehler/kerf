@@ -41,6 +41,8 @@
 //! This is a GUI-only surface: it has no MCP tool, because the agent already has
 //! `preview_timeline` (a JPEG of the cut) and nothing here is an edit.
 
+#[cfg(test)]
+mod busy;
 mod check;
 mod diagnostics;
 mod mailbox;
@@ -54,7 +56,7 @@ mod x11;
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak};
 use std::time::{Duration, Instant};
@@ -586,7 +588,9 @@ impl Host {
         match self {
             Host::Window { .. } => {}
             #[cfg(test)]
-            Host::Null => {}
+            Host::Null => {
+                HIDES.fetch_add(1, Ordering::SeqCst);
+            }
             #[cfg(target_os = "linux")]
             Host::Child(child) => child.hide(),
         }
@@ -603,6 +607,10 @@ impl Host {
         }
     }
 }
+
+/// How many times a test host was asked to hide the surface.
+#[cfg(test)]
+static HIDES: AtomicUsize = AtomicUsize::new(0);
 
 /// What a frame is shown with: the presenter and its surface. A trait so the frame path can be
 /// driven without a window (the tests' screen records what it was asked to do).
@@ -1066,6 +1074,10 @@ pub struct GpuPreview {
     snapshots: PlanSnapshots,
     /// The play session, between its frames (taken out while one is drawn): see [`play`].
     play: Mutex<Option<PlaySession>>,
+    /// Forward requests being served: with a held session, a play that priming leaves the playhead to.
+    serving: AtomicUsize,
+    /// How long a session may go unasked for, milliseconds ([`play::IDLE`]; a field so a test can shorten it).
+    idle_ms: AtomicU64,
     /// What the sessions that ended did.
     play_tally: Mutex<PlayTally>,
     /// The session from the playhead the paused frame is at, made ready (see [`prime`]).
@@ -1098,6 +1110,12 @@ pub struct GpuPreview {
 
 /// Runs the parity self-test on a device (injected so the gate is testable without an FFmpeg).
 type Checker = dyn Fn(Arc<Gpu>) -> Result<SelfTestReport, SelfTestError> + Send + Sync;
+
+impl Drop for GpuPreview {
+    fn drop(&mut self) {
+        self.primer.stop();
+    }
+}
 
 impl GpuPreview {
     /// The app's: `app`'s main window is the host. `crashed` is [`take_crash_marker_in`]'s answer.
@@ -1137,6 +1155,8 @@ impl GpuPreview {
             prefetching: Arc::new(AtomicBool::new(false)),
             snapshots: PlanSnapshots::default(),
             play: Mutex::new(None),
+            serving: AtomicUsize::new(0),
+            idle_ms: AtomicU64::new(play::IDLE.as_millis() as u64),
             play_tally: Mutex::new(PlayTally::default()),
             primed: Mutex::new(None),
             primer: Primer::new(),
@@ -1692,6 +1712,7 @@ impl GpuPreview {
             rendered,
             now,
             "this frame goes through FFmpeg",
+            true,
         ) {
             Concluded::Shown(timings, _) => {
                 tracing::debug!(?timings, t, "GPU preview frame presented");
@@ -1754,7 +1775,8 @@ impl GpuPreview {
     /// still the one that drew it, and settle what the backend makes of the outcome — the backoff
     /// forgives a shown frame, the crash marker goes once one has reached the screen, a device or
     /// surface that is gone is dropped to be rebuilt, and a surface that was hidden meanwhile stays
-    /// hidden. `declined` ends the log line of a frame the GPU did not draw.
+    /// hidden. `declined` ends the log line of a frame the GPU did not draw; a failure hides the surface
+    /// (the page shows FFmpeg's picture instead) unless `hide_on_failure` is off, as a play session's is.
     #[allow(clippy::too_many_arguments)]
     fn conclude(
         &self,
@@ -1765,6 +1787,7 @@ impl GpuPreview {
         rendered: Result<(RenderedFrame, RenderTimings), GpuError>,
         now: Instant,
         declined: &str,
+        hide_on_failure: bool,
     ) -> Concluded {
         let mut state = lock(&self.render);
         let same = state
@@ -1814,7 +1837,11 @@ impl GpuPreview {
                         Some(&drawing.source),
                     );
                 }
-                self.hide();
+                // A frame of a play session that fails leaves the surface as it is: the stream takes the
+                // session over and the GPU's last picture stays until the stream's first frame is shown.
+                if hide_on_failure || reaction == Reaction::Rebuild {
+                    self.hide();
+                }
                 Concluded::Failed(error)
             }
         }

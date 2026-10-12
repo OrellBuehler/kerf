@@ -36,12 +36,13 @@
 //! request, and with the backend.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kerf_core::{PlayAhead, PlayCut, ProxyMedia};
-use kerf_gpu::{Compositor, CursorConfig, CursorFeed, MotionFrames};
+use kerf_gpu::{Compositor, CursorConfig, CursorFeed, MotionFrames, Opened};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -62,8 +63,9 @@ const PREFETCH: f64 = 2.0;
 /// comes due is not waited for on the frame, so it must have had time to run).
 const WARM: f64 = 1.5;
 
-/// The longest a session's end waits for its prefetch thread to finish what it is doing.
-const FEEDER_JOIN: Duration = Duration::from_secs(1);
+/// The longest a session's end waits for its prefetch thread to finish the one thing it is doing (a clip
+/// opened, a title rasterised: the thread looks at its cancel flag between them).
+const FEEDER_JOIN: Duration = Duration::from_millis(150);
 
 /// How often the prefetch is told where the playhead is.
 const FEED_EVERY: Duration = Duration::from_millis(250);
@@ -149,6 +151,8 @@ struct Feeder {
     failures: Arc<Mutex<Vec<(f64, String)>>>,
     told: Option<Instant>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Set when the session is over: the thread stops between two clips and two frames.
+    cancel: Arc<AtomicBool>,
 }
 
 impl Feeder {
@@ -156,15 +160,27 @@ impl Feeder {
         let (tx, rx) = mpsc::channel();
         let failures = Arc::new(Mutex::new(Vec::new()));
         let shared = Arc::clone(&failures);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        #[cfg(test)]
+        let busy = super::busy::Busy::enter();
         std::thread::Builder::new()
             .name("kerf-gpu-play-prefetch".into())
-            .spawn(move || feeder_loop(&rx, &cut, &feed, &compositor, &shared))
+            .spawn(move || {
+                feeder_loop(&rx, &cut, &feed, &compositor, &shared, &flag);
+                // What the thread holds is let go in this order, the device last: the tests wait for it.
+                drop(feed);
+                drop(compositor);
+                #[cfg(test)]
+                drop(busy);
+            })
             .ok()
             .map(|thread| Self {
                 tx: Some(tx),
                 failures,
                 told: None,
                 thread: Some(thread),
+                cancel,
             })
     }
 
@@ -181,11 +197,13 @@ impl Feeder {
 }
 
 impl Drop for Feeder {
-    /// The thread ends with its sender, and what it holds (the compositor, so possibly the device) is
-    /// released before the session is gone — not on a thread nobody waits for, which would be the last
-    /// to use the device as the process exits. It is waited for [`FEEDER_JOIN`] at most: a clip being
-    /// opened is a probe with a timeout, and a frame that ends a session does not wait longer for it.
+    /// The thread stops at the next clip or frame it comes to, and what it holds (the compositor, so
+    /// possibly the device) is released before the session is gone and not on a thread nobody waits for,
+    /// which would be the last to use the device as the process exits. It is waited for [`FEEDER_JOIN`] at
+    /// most: the one clip it may be opening is a probe with a timeout, and a frame that ends a session
+    /// must not wait longer for it. (What it opens after the feed was closed is dropped on the spot.)
     fn drop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
         self.tx = None;
         let Some(thread) = self.thread.take() else { return };
         let until = Instant::now() + FEEDER_JOIN;
@@ -195,19 +213,21 @@ impl Drop for Feeder {
         if thread.is_finished() {
             let _ = thread.join();
         } else {
-            tracing::debug!("the prefetch thread of a play session is still opening a clip");
+            tracing::debug!("the prefetch thread of a play session is still at a clip; it stops there");
         }
     }
 }
 
-/// The prefetch thread: it ends when the session drops its sender.
+/// The prefetch thread: it ends when the session drops its sender or sets `cancel`.
 fn feeder_loop(
     rx: &Receiver<(f64, (u32, u32))>,
     cut: &PlayCut,
     feed: &CursorFeed,
     compositor: &Compositor,
     failures: &Mutex<Vec<(f64, String)>>,
+    cancel: &AtomicBool,
 ) {
+    let cancelled = || cancel.load(Ordering::SeqCst);
     // Clips a cursor was asked for (the ones on screen now are the frame's own to open).
     let mut asked: HashSet<Uuid> = HashSet::new();
     let mut warmed_to = 0u64;
@@ -224,12 +244,28 @@ fn feeder_loop(
         for k in from + 1..=cut.frame_at(t + PREFETCH) {
             let Ok(plan) = cut.at_frame(k) else { continue };
             for layer in &plan.layers {
-                if !asked.insert(layer.clip_id) {
+                if cancelled() {
+                    return;
+                }
+                if asked.contains(&layer.clip_id) {
                     continue;
                 }
-                if let Err(error) = feed.open(layer) {
-                    tracing::debug!(%error, clip = %layer.name, "a clip ahead cannot be opened for playback");
-                    lock(failures).push((cut.time_of(k), error.to_string()));
+                match feed.open(layer, cut.time_of(k)) {
+                    Ok(Opened::Waiting { evicted }) => {
+                        asked.insert(layer.clip_id);
+                        // The clip wanted last gave its place up: it is asked for again when there is room.
+                        if let Some(clip) = evicted {
+                            asked.remove(&clip);
+                        }
+                    }
+                    // Waiting cursors are all wanted sooner: not asked for, so this is tried again.
+                    Ok(Opened::Full) => {}
+                    Ok(Opened::Closed) => return,
+                    Err(error) => {
+                        asked.insert(layer.clip_id);
+                        tracing::debug!(%error, clip = %layer.name, "a clip ahead cannot be opened for playback");
+                        lock(failures).push((cut.time_of(k), error.to_string()));
+                    }
                 }
             }
         }
@@ -239,6 +275,9 @@ fn feeder_loop(
         }
         let warm_to = cut.frame_at(t + WARM);
         for k in warmed_to.max(from) + 1..=warm_to {
+            if cancelled() {
+                return;
+            }
             let Ok(plan) = cut.at_frame(k) else { continue };
             if plan.overlays.is_empty() {
                 continue;
@@ -283,7 +322,7 @@ impl Drop for PlaySession {
     fn drop(&mut self) {
         // The cursors waiting for clips that did not come are the feed's; the thread holding the
         // other end of it would keep them alive until it notices that nobody is listening.
-        self.motion.feed().clear();
+        self.motion.feed().close();
         let s = self.stats;
         let frames = s.frames.max(1) as f64;
         tracing::info!(
@@ -307,14 +346,19 @@ impl PlaySession {
     pub(super) fn waiting(&self) -> usize {
         self.motion.feed().waiting()
     }
+
+    /// The handle that opens cursors for the session.
+    pub(super) fn feed(&self) -> CursorFeed {
+        self.motion.feed()
+    }
 }
 
 impl PlaySession {
     /// Whether this session still answers `key`'s request for time `t`.
-    fn fits(&self, key: &PlayKey, epoch: u64, t: f64, now: Instant) -> bool {
+    fn fits(&self, key: &PlayKey, epoch: u64, t: f64, now: Instant, idle: Duration) -> bool {
         self.key == *key
             && self.epoch == epoch
-            && now.duration_since(self.last_used) < IDLE
+            && now.duration_since(self.last_used) < idle
             && self.shown.is_none_or(|(_, last)| t >= last - BACK)
     }
 
@@ -370,8 +414,12 @@ impl GpuPreview {
     /// is drawn, so turning the setting off or losing the device never waits for one.
     pub(super) fn play(&self, inputs: &PlanInputs, key: &PlayKey, t: f64, overlays: bool) -> Result<PreviewFrameResult, String> {
         let now = Instant::now();
+        let _serving = Serving::enter(&self.serving);
         let mut held = lock(&self.play).take();
-        if held.as_ref().is_some_and(|s| !s.fits(key, inputs.epoch(), t, now)) {
+        if held
+            .as_ref()
+            .is_some_and(|s| !s.fits(key, inputs.epoch(), t, now, self.idle()))
+        {
             tracing::debug!(
                 session = key.session,
                 "a play session is over: another request, a change or a seek"
@@ -422,21 +470,55 @@ impl GpuPreview {
     }
 
     /// Hold the session for the next request, unless the setting went off or the backend was
-    /// replaced while its frame was drawn.
+    /// replaced while its frame was drawn. Decided with the session's slot held: a teardown that ran
+    /// meanwhile ended nothing (the slot was empty), and the setting it had turned off is seen here, so a
+    /// session is never stored after the end that was meant for it.
     fn keep_play(&self, session: PlaySession) {
-        let current = {
-            let state = lock(&self.render);
-            self.is_enabled()
-                && state
-                    .backend
-                    .as_ref()
-                    .is_some_and(|b| Arc::ptr_eq(&b.source, &session.source))
-        };
-        if current {
-            *lock(&self.play) = Some(session);
-        } else {
+        let mut slot = lock(&self.play);
+        let current = self.is_enabled()
+            && lock(&self.render)
+                .backend
+                .as_ref()
+                .is_some_and(|b| Arc::ptr_eq(&b.source, &session.source));
+        if !current {
+            drop(slot);
             self.retire(Some(session));
+            return;
         }
+        let due = session.last_used + self.idle();
+        *slot = Some(session);
+        drop(slot);
+        // Nobody may ask for it again (the page handed over, gave up, or was refused): it is ended then.
+        if let Some(me) = self.me.get() {
+            self.primer.watch_play(me, due);
+        }
+    }
+
+    /// How long a session may go unasked for.
+    pub(super) fn idle(&self) -> Duration {
+        Duration::from_millis(self.idle_ms.load(Ordering::SeqCst))
+    }
+
+    /// Whether a forward request is being served or a session is held: a play has the playhead.
+    pub(super) fn playing(&self) -> bool {
+        self.serving.load(Ordering::SeqCst) > 0 || lock(&self.play).is_some()
+    }
+
+    /// The session nobody asked for in [`GpuPreview::idle`] is over (its cursors killed, its thread
+    /// ended); `Some(when)` is when to look again, for a session that was asked for since.
+    pub(super) fn reap_play(&self) -> Option<Instant> {
+        let idle = self.idle();
+        let mut held = lock(&self.play);
+        let session = held.as_ref()?;
+        let due = session.last_used + idle;
+        if Instant::now() < due {
+            return Some(due);
+        }
+        let session = held.take();
+        drop(held);
+        tracing::debug!("a play session nobody asks for is over");
+        self.retire(session);
+        None
     }
 
     /// A session is over: what it did joins the tally, and its cursors are killed.
@@ -452,6 +534,7 @@ impl GpuPreview {
     /// End the session, if there is one (the page asked for something that is not part of it, or the
     /// backend is going).
     pub(super) fn end_play(&self) {
+        self.primer.unwatch_play();
         let session = lock(&self.play).take();
         self.retire(session);
     }
@@ -550,6 +633,15 @@ impl GpuPreview {
         if let Some(ahead) = cut.ahead(t, HORIZON, size, &caps) {
             return Err(one(ahead.why.kind(), format!("{} (at {:.2} s)", ahead.why, ahead.at)));
         }
+        // The clips on screen at the playhead are looked at now, off the frame's path, for what only the
+        // frame source can see (a container whose seeks are not trusted, a format of unknown layout): the
+        // session is the stream's from the start rather than a first frame that fails with the surface up.
+        let feed = motion.feed();
+        for layer in &first.layers {
+            if let Err(error) = feed.check(layer) {
+                return Err(one(super::error_kind(&error), error.to_string()));
+            }
+        }
         // Nothing the user looks at before the GPU has been checked against this FFmpeg.
         self.gate(&drawing.gpu, &drawing.adapter).map_err(|r| vec![r])?;
         let feeder = Feeder::start(Arc::clone(&cut), motion.feed(), Arc::clone(&drawing.compositor));
@@ -634,6 +726,11 @@ impl GpuPreview {
         };
         let caps = drawing.compositor.caps();
         let ahead = session.ahead(t, size, &caps);
+        // The frame asked for is at or past the first one the GPU does not draw (the page's hand-over was
+        // late, or this is a frame of a reversed clip or a moving title): it is not attempted.
+        if let Some(refused) = ahead.as_ref().filter(|a| session.cut.frame_at(a.at) <= j) {
+            return Step::Handover(vec![Reason::new(refused.kind, refused.why.clone())], refused.clone());
+        }
         if let Some(feeder) = session.feeder.as_mut() {
             feeder.at(t, size, now);
         }
@@ -671,6 +768,7 @@ impl GpuPreview {
             rendered,
             now,
             "the session goes to the stream",
+            false,
         ) {
             super::Concluded::Shown(timings, _frame) => {
                 lock(&self.counters).presented();
@@ -704,6 +802,22 @@ impl GpuPreview {
             ),
             super::Concluded::Failed(error) => stream(Reason::new(super::error_kind(&error), error.to_string()), session),
         }
+    }
+}
+
+/// A forward request being served, counted while it is ([`GpuPreview::playing`]).
+struct Serving<'a>(&'a AtomicUsize);
+
+impl<'a> Serving<'a> {
+    fn enter(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for Serving<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -753,6 +867,7 @@ mod tests {
                 failures: Arc::new(Mutex::new(failures)),
                 told: None,
                 thread: None,
+                cancel: Arc::new(AtomicBool::new(false)),
             }),
             scan: None,
             shown: None,
@@ -780,16 +895,16 @@ mod tests {
     fn a_session_answers_its_own_page_epoch_and_a_request_that_is_not_far_behind() {
         let now = Instant::now();
         let mut s = session(Vec::new(), now);
-        assert!(s.fits(&key(1), 7, 3.0, now), "its own, before anything was shown");
+        assert!(s.fits(&key(1), 7, 3.0, now, IDLE), "its own, before anything was shown");
         s.shown = Some((90, 3.0));
-        assert!(s.fits(&key(1), 7, 3.2, now));
-        assert!(s.fits(&key(1), 7, 2.9, now), "a step back is the clock's jitter");
-        assert!(s.fits(&key(1), 7, 2.1, now));
+        assert!(s.fits(&key(1), 7, 3.2, now, IDLE));
+        assert!(s.fits(&key(1), 7, 2.9, now, IDLE), "a step back is the clock's jitter");
+        assert!(s.fits(&key(1), 7, 2.1, now, IDLE));
         assert!(
-            !s.fits(&key(1), 7, 1.9, now),
+            !s.fits(&key(1), 7, 1.9, now, IDLE),
             "more than a second back is a seek the page did not announce"
         );
-        assert!(!s.fits(&key(2), 7, 3.2, now), "another session of the page");
+        assert!(!s.fits(&key(2), 7, 3.2, now, IDLE), "another session of the page");
         assert!(
             !s.fits(
                 &PlayKey {
@@ -798,13 +913,14 @@ mod tests {
                 },
                 7,
                 3.2,
-                now
+                now,
+                IDLE
             ),
             "another page"
         );
-        assert!(!s.fits(&key(1), 8, 3.2, now), "the project changed under it");
-        assert!(s.fits(&key(1), 7, 3.2, now + IDLE - Duration::from_millis(1)));
-        assert!(!s.fits(&key(1), 7, 3.2, now + IDLE), "nobody asked for it in a while");
+        assert!(!s.fits(&key(1), 8, 3.2, now, IDLE), "the project changed under it");
+        assert!(s.fits(&key(1), 7, 3.2, now + IDLE - Duration::from_millis(1), IDLE));
+        assert!(!s.fits(&key(1), 7, 3.2, now + IDLE, IDLE), "nobody asked for it in a while");
     }
 
     #[test]

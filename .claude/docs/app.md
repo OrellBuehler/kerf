@@ -337,11 +337,26 @@ in the cut's time), so the page hands over before it gets there. A request in th
 a step back of under a second too); a request more than a second behind the last starts the session over from there; the session also
 ends with a project change (the plan epoch), another session of the page or of another page, a request that is not part of it (the paused
 frame, a scrub), a backend that was replaced, the setting turned off and `IDLE` (5 s) without a request, and a frame that cannot be drawn
-ends it with `renderer: "stream"` and `play.ahead` (a cursor that died, a surface hidden mid-frame). The session is out of its lock while
-a frame is drawn (teardown never waits for one), a panic in a step is caught and is the stream's too, and its prefetch thread
+ends it with `renderer: "stream"` and `play.ahead` (a cursor that died, a surface hidden mid-frame). **A failed play frame leaves the surface up**
+(`conclude(.., hide_on_failure: false)`: the stream takes over beside it and the GPU's last picture stays until the stream's first frame is shown; a scrub's
+failed frame still hides it for the JPEG, and a lost device is rebuilt as ever). The session is out of its lock while
+a frame is drawn (teardown never waits for one), a panic in a step is caught and is the stream's too. **Before the first frame** the clips on screen at the
+playhead are checked with `CursorFeed::check` (a container whose seeks are not trusted, a format of unknown layout), so a clip that cannot be run is the
+stream's from the first request with the surface untouched, not a first frame that fails. **A frame at or after the first one the GPU does not draw** (the
+scan's or a clip the prefetch could not open: `play.ahead.at`) is never attempted, whatever the page asks: it is answered `stream` with that `ahead`, so a
+late hand-over cannot run a reversed clip or a moving title. **A session nobody asks for is ended**: the page that handed over, gave the GPU up or was
+refused stops asking, so the `kerf-gpu-prime` thread (which waits for its nearest deadline and for nothing when it has none, and ends with the preview)
+reaps the session `idle()` (`IDLE`, 5 s) after its last request, killing its idle cursors and ending its prefetch thread; a request after that begins a new
+session. `keep_play` stores a session with its slot held and the setting and backend re-read there, so a teardown that ran while a frame was drawn is not
+undone by the frame, and priming (`prime`) stores under the lock `take_primed` reads, refusing while a forward request is being served (`serving`) or a
+session is held, so a priming that was in flight when Play landed cannot leave a duplicate. The prefetch thread
 (`kerf-gpu-play-prefetch`) looks 2 s ahead: it opens the cursor of every clip about to come on screen (the file's probes and the process
-start are paid before the cut) and has the titles of the next 1.5 s rasterised (`Compositor::warm_text`), neither on the frame's path. A session's end waits for that thread
-(at most `FEEDER_JOIN`, 1 s, for a clip it is opening) so that what it holds, the device included, is released before the next frame and not by a detached thread as a process exits (the lavapipe shader compiler crashed such an exit about one drive-test run in ten; the tests' `Turn` also waits for the priming thread).
+start are paid before the cut) and has the titles of the next 1.5 s rasterised (`Compositor::warm_text`), neither on the frame's path. It stops at a
+cancel flag between two clips and two frames, and a feed closed with the session starts nothing and drops a cursor it was opening; with more than six clips
+in the window the feed keeps the ones wanted **first** (`CursorFeed::open(layer, needed_at)` drops the one wanted last for a nearer one, and opens nothing
+for a clip wanted after all of them: `Opened::Full`, asked again later). A session's end waits for that thread (at most `FEEDER_JOIN`, 150 ms, for the one
+clip or title it is at) so that what it holds, the device included, is released before the next frame and not by a detached thread as a process exits (the
+lavapipe shader compiler crashed such an exit about one drive-test run in ten; the tests' `Turn` also waits for these threads: `busy.rs`).
 **Priming** (`gpu_preview/prime.rs`): the start of a session is mostly `ffmpeg` starting (50 to 70 ms for one clip, more for several), and the playhead
 it will play from is known long before Play, so when a **paused** GPU frame has been the last request for 300 ms (`PRIME_AFTER`) the thread
 `kerf-gpu-prime` makes the `PlayCut` from it and opens the cursors of the frame on screen (each `ffmpeg` decodes its first frames into the pipe and
