@@ -1,0 +1,63 @@
+// Temporary test appended to crates/kerf-core/src/engine/cli/bt709_label.rs (not committed). Run it twice per FFmpeg:
+// KERF_MEASURE_OUT=<dir> cargo test -p kerf-core --no-default-features -- --ignored zz_measure
+// once as is, once with KERF_FFMPEG=tools/strip-label-ffmpeg.sh (REAL_FFMPEG=<the ffmpeg>), then tools/label-on-off-compare.py.
+#[test]
+#[ignore = "temporary measurement"]
+fn zz_measure_label_on_off() {
+    use crate::model::{Transition, TransitionKind};
+    let out = PathBuf::from(std::env::var("KERF_MEASURE_OUT").expect("KERF_MEASURE_OUT"));
+    std::fs::create_dir_all(&out).unwrap();
+    let dir = scratch("measure");
+    let untagged = footage(&dir, "untagged", GRADIENT, "bt709", UNTAGGED);
+    let phone = footage(&dir, "phone", DETAIL, "bt709", BT709);
+    for (what, hd_first) in [("dip-into-hd", false), ("dip-out-of-hd", true)] {
+        let mut tl = if hd_first { sequence(&untagged, &phone) } else { sequence(&phone, &untagged) };
+        tl.tracks[0].clips[1].transition_in = Some(Transition { kind: TransitionKind::DipToWhite, duration: 0.6 });
+        let assets = vec![phone.clone(), untagged.clone()];
+        std::fs::write(out.join(format!("{what}-export.yuv")), export_yuv(&tl, &assets, &dir, what)).unwrap();
+    }
+    for (what, dress) in [("opaque", plain as fn(&mut Clip)), ("translucent", translucent)] {
+        let (tl, assets) = stack_of(&phone, &untagged, dress);
+        std::fs::write(out.join(format!("{what}-export.yuv")), export_yuv(&tl, &assets, &dir, what)).unwrap();
+        std::fs::write(out.join(format!("{what}-still.rgb")), still_rgb(&tl, &assets, 0.5, &dir, what)).unwrap();
+        std::fs::write(out.join(format!("{what}-stream.rgb")), stream_rgb(&tl, &assets, &dir, what)).unwrap();
+        std::fs::write(out.join(format!("{what}-scrub.rgb")), window_rgb(&tl, &assets, &dir, what)).unwrap();
+    }
+    // The slice case: the HD clip alone, untagged against the same footage tagged (= labelled).
+    let tagged = footage(&dir, "tagged", GRADIENT, "bt709", BT709);
+    for (name, hd) in [("u", &untagged), ("t", &tagged)] {
+        for (what, kind) in [("alone-translucent", 0), ("alone-text", 1), ("alone-dip", 2)] {
+            let tl = match kind {
+                0 => {
+                    let mut tl = timeline_of(vec![video_track(vec![make_clip(hd.id, 0.0, 1.0, 0.0)])]);
+                    tl.tracks[0].clips[0].transform.opacity = 0.5;
+                    tl.format = Some(Delivery::new(640, 360, Fit::Contain));
+                    tl
+                }
+                1 => {
+                    let mut tl = timeline_of(vec![video_track(vec![make_clip(hd.id, 0.0, 1.0, 0.0)])]);
+                    let mut o = crate::model::TextOverlay::new("Colour", 0.0, 1.0);
+                    o.color = "#ff2010".into();
+                    o.pos_y = 0.5;
+                    tl.overlays = vec![o];
+                    tl.format = Some(Delivery::new(640, 360, Fit::Contain));
+                    tl
+                }
+                _ => {
+                    let mut tl = sequence(hd, hd);
+                    tl.tracks[0].clips[1].transition_in = Some(Transition { kind: TransitionKind::DipToWhite, duration: 0.6 });
+                    tl
+                }
+            };
+            let assets = vec![hd.clone()];
+            let tag = format!("{what}-{name}");
+            std::fs::write(out.join(format!("{tag}-export.yuv")), export_yuv(&tl, &assets, &dir, &tag)).unwrap();
+            if kind != 2 {
+                std::fs::write(out.join(format!("{tag}-still.rgb")), still_rgb(&tl, &assets, 0.5, &dir, &tag)).unwrap();
+                std::fs::write(out.join(format!("{tag}-stream.rgb")), stream_rgb(&tl, &assets, &dir, &tag)).unwrap();
+                std::fs::write(out.join(format!("{tag}-scrub.rgb")), window_rgb(&tl, &assets, &dir, &tag)).unwrap();
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

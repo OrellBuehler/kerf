@@ -1,6 +1,6 @@
 # GPU-1, option B: the BT.709 label in the graph builders (rule R)
 
-Branch `gpu-1b` in `/home/user/kerf-gpu-1`, from origin/main 255ac36, eleven commits, not pushed:
+Branch `gpu-1b` in `/home/user/kerf-gpu-1`, from origin/main 255ac36, thirteen commits, not pushed:
 
 ```
 d281c40 read a proxy's source once per encode and treat a reserved matrix as none      (ported from gpu-1: 9dc9625, the part that is not the label)
@@ -16,6 +16,9 @@ a9da70b document decoder default tags and the handover slice difference         
 4c783d0 key the naming exclusion on the decoder and cover each rule alone                (S1, N2 to N5: model.rs, test_support.rs, golden.rs, bt709_label.rs, parity.rs)
 15f495c put the bt709 label first in the chain so a dip to white reads it                (found while testing S2: cli.rs, golden/*.txt re-blessed, tests)
 06d2880 document the decoder-keyed exclusion, the label's place and the dip result        (S2, N1, N4, cosmetic, and the label's place: the four docs)
+        review round 3
+864608f exclude every decoder that tags what it decodes from naming a matrix              (jpegls grey and the decode-only mjpeg relatives: model.rs, test_support.rs, golden.rs, bt709_label.rs)
+f1a910f state the dip and translucent figures by builder and by method                   (the dip / translucent numbers, re-measured over whole exports; decoder lists)
 ```
 
 ## The rule
@@ -68,7 +71,7 @@ The `layout != Rgb` clause of `has_a_yuv_tag` has its own assert (`rgb24` + `bt4
 The rule is documented as the principle "a tag a decoder writes by default is not the file's word", not as a mirror (grey, alpha and SD are never labelled but do name a matrix when tagged; intended asymmetry), and the "RGB video is tagged `gbr`" sentence says it depends on the encoder (FFV1 `bgr0` on 9.0.2 only).
 Real files (`probe-shapes.txt`, now 13 in the rendered test): `ndi.mov` (speedhq 422), `jpegls.avi` (`rgb24` `bt470bg`), `capture-alpha.mkv` (ffv1 `bgra` `gbr`), `obs-full-range.mp4` (`h264 yuvj420p` `bt709`: labels 1 chain per builder).
 
-**S2.** The 6.1 dip-to-white result is in the 6.1 paragraph of `engine-cli.md`, and the accepted-difference notes of `core-render-plan.md` and `gpu.md`. **The number moved**: the 31.5 dB / 11 levels of round 1's table was the label-behind-the-geometry figure; with the label first it is **32.3 dB / 11 on 6.1.1** (31.9 dB / 11 on 9.0.2, where the matrix fix dominates).
+**S2.** The 6.1 dip-to-white result is in the 6.1 paragraph of `engine-cli.md`, and the accepted-difference notes of `core-render-plan.md` and `gpu.md`. **The numbers were re-measured in the closing fixes** (below): the 31.5 dB / 11 levels of round 1's table, and the 32.3 dB / 11 I gave in round 2, were *one frame (frame 5)* of a 0.3 s + 0.7 s harness case, because `cmp.py`'s export column compares a single frame.
 
 ## The dip to white found a flaw in the label's place (15f495c)
 
@@ -82,6 +85,25 @@ My GPU motion test for a labelled HD clip dipping through white failed on both F
 * **No plan change was needed**: the plan treated a labelled layer as BT.709 for the round trip; the export now agrees with it. (I considered refusing a labelled layer's dip in the plan instead; that would have left the export dip reading BT.601 in and BT.709 out.)
 * **Cost, now measured** (`colour-vs-the-footage-ffmpeg-9.0.2.txt`): over SD tagged `smpte170m`, the one stack where the position mattered for the pixels, the label is 38.7 dB from the footage's colours (the tag's figure) where the old place gave 42.7; main 28.0.
   Beside a BT.709 clip nothing changed (42.7). The GPU refuses the `smpte170m` stack on 9.0.2 either way.
+
+## Review round 3 (the closing fixes)
+
+**1. `DEFAULT_TAG_CODECS` was incomplete (864608f).** `jpegls` writes `bt470bg` on `gray` and `gray16le` as well (probed on both FFmpegs: a real JPEG-LS grey file, `jpegls,gray,bt470bg`; grey is not the RGB layout, so only its `rgb24` was caught). The list is now `mjpeg`, `amv`, `speedhq`, `jpegls`, `mjpegb`, `sp5x`, `thp`, `smvjpeg` and `mxpeg`.
+`mjpegb`, `sp5x`, `thp` and `smvjpeg` are decode-only (no encoder: no file to probe) and share `ff_mjpeg_decode_init`; **`mxpeg` is mine, not on the review's list**, listed on the same assumption (harmless if wrong: a codec that writes no tag has nothing to exclude). Say if you would rather drop it.
+Tests: unit rows for all nine beside untagged HD (plus `jpegls` at `gray16le` / `yuv420p`, upper-case codec names), the probe-shape kit gains `jpegls gray` and `jpegls gray16le`, the metamorphic test gains `jpegls gray`, `thp` and an `rgb24` + `bt470bg` from FFV1 (the layout rule alone now that `jpegls` is on the list), the rendered real-files test makes two JPEG-LS grey files (15 files; both name nothing on both FFmpegs). With the old three-codec list the unit test, the kit-driven `nothing_is_labelled...` test and the metamorphic test (662 disagreements) all fail. No golden digest moves; the metamorphic test passes.
+
+**2 and 3. The dip and translucent numbers (f1a910f).** They reproduce, and my 32.3 dB / 11 was a *single frame*: the export column of `tools/cmp.py` (and so every "export" figure in the older tables) compares frame 5 of the export. Re-measured over **every frame of the lossless export, all planes, worst level on any plane**, in the committed render scenario (1 s of BT.709 footage, 1 s of untagged HD, 640x360 at 10 fps, a 0.6 s dip), label on against the same argv with `setparams=colorspace=bt709,` removed (`tools/strip-label-ffmpeg.sh` as `KERF_FFMPEG`; `label-on-off-whole-export-ffmpeg-both.txt`):
+
+| 6.1.1, label on against off | dB / worst level |
+| --- | --- |
+| dip into the HD clip (20 frames) | 33.0 / 15 |
+| dip out of the HD clip | 32.5 / 15 |
+| translucent HD, export (10 frames) / still / stream / scrub window | 40.7 / 8, 39.2 / 14, 39.7 / 21, 38.6 / 23 |
+
+These are the review's numbers to the digit. The round trip is in the chain for every frame of the HD clip, so the 15 is on every frame where the picture is fully visible; the ramp's own frames read 0, 5, 11 (into) and 15, 11, 5 (out of). 9.0.2, same scenarios: dip into 33.1 / 16, out of 27.9 / 32, translucent 39.5 / 9, 38.2 / 14, 37.9 / 23, 38.1 / 24 (mostly the matrix negotiation the label settles, which moves the stack's other frames too).
+The same numbers are in `engine-cli.md` (6.1 paragraph, with the method), `core-render-plan.md` and `gpu.md`. The stream-slice "accepted difference" is restated from the clip alone labelled against not (an untagged against the same footage tagged): translucent 1 level in the export on 9.0.2 and 8 to 14 on 6.1.1 (export 8, still 14, stream 11, scrub window 14), a dip 2 on 9.0.2 and 15 on 6.1.1, and **coloured text 16 levels on its own pixels on 9.0.2 and none on 6.1.1** (the old text of "2 / 10 to 16" was not reproducible and, for text, looks reversed; `label-on-off-whole-export-ffmpeg-both.txt`, second section).
+
+**4.** The `names_a_matrix` doc comment is rewrapped.
 
 ## Decisions
 
@@ -112,7 +134,7 @@ Of 6000 cases the label moves **3054 export, 644 still, 2139 preview** digests (
 reproduced exactly for export and preview by labelling still images too). The moved set equals the label's argv set equals an independent by-name oracle's set; stripping
 `setparams=colorspace=bt709,` from the new argv gives the old digest of all 18000 (case, builder) pairs.
 
-### What the label moves (`export-label-vs-main-ffmpeg-{9.0.2,6.1.1}.txt`), export yuv, PSNR dB / worst level
+### What the label moves (`export-label-vs-main-ffmpeg-{9.0.2,6.1.1}.txt`), export yuv **at frame 5 (0.5 s)**, PSNR dB / worst level
 | stack (subject = untagged HD) | 9.0.2 | 6.1.1 |
 | --- | --- | --- |
 | single clip: opaque, pip, translucent, coloured text | 99 / 0 | 99 / 0 |
@@ -120,8 +142,8 @@ reproduced exactly for export and preview by labelling still images too). The mo
 | HD over / under a BT.709 clip | 35.3 / 14, 29.7 / 36 | 99 / 0 |
 | ... with a coloured caption / a vignette / a rotated pip | 35.3 / 14, 37.3 / 14, 24.8 / 37 | 99 / 0 |
 | ... a masked pip / a grade / a dissolve into the HD clip | 24.0 / 37, 31.6 / 21, 23.6 / 37 | 99 / 0 |
-| ... HD translucent over BT.709 | 38.0 / 11 | **39.2 / 10** |
-| ... a dip to white into the HD clip | **31.9 / 11** (was 44.1 / 3 with the label behind the geometry) | **32.3 / 11** (was 31.5 / 11) |
+| ... HD translucent over BT.709 | 38.0 / 11 | **39.2 / 10** (frame 5; whole export 40.7 / 8, see below) |
+| ... a dip to white into the HD clip | **31.9 / 11** (frame 5 of the harness case; was 44.1 / 3 with the label behind the geometry) | **32.3 / 11** (frame 5; the whole-export figures are below) |
 | HD with an HLG clip (over, under) | 35.3 / 14, 32.0 / 26 | 99 / 0 |
 | HD over SD / HD tagged smpte170m | 34.0 / 17 | 99 / 0 |
 | BT.709 clip then HD, never on screen together (graph-wide) | 29.3 / 14 (the still: 99 / 0) | 99 / 0 |
@@ -149,13 +171,12 @@ The 35-case battery of stacks (untagged HD over / under BT.709, HLG, SD, SD tagg
 **The 14 real decoder-default cases (JPEG, WebP, rgba / grey / rgb PNG, MJPEG, both orders) have the same verdict as main under every policy, orig and prev.**
 New parity rows: 29 on 9.0.2 (641 → 670), 36 on 6.1.1 (681 → 717); drawn ones 43.6 to 49 dB flat, worst level 5 (the labelled-dip still: 99 / 0, 45.5 and 47.8 dB, worst 4, identical to the same footage tagged). Motion: 4 cases (three translucent, the dip), Y ≤ 2 / UV ≤ 2 on both FFmpegs.
 
-## Test results (Mesa lavapipe, `KERF_HWACCEL=none`, `KERF_HW_ENCODE=none`), on the committed tree (06d2880)
-* `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets --no-default-features --locked --color never -- -D warnings`: exit 0 (the exit code, not a grep of the coloured output).
-* `cargo test -p kerf-core --no-default-features`: **1310 passed**, 116 ignored (main 1289 passed); the golden oracle (re-blessed once for the label's place) and `a_decoders_default_tag_names_no_matrix_in_any_graph_of_the_corpus` pass.
-* kerf-core `-- --ignored --skip downloads_a_real_model --skip synthesizes_a_script_end_to_end` (the latter is the sandbox's certificate error downloading the ONNX runtime, unrelated): **114 passed, 0 failed on 9.0.2 (267 s) and on 6.1.1 (489 s)**, the four `bt709_label` rendered tests included (label = tag to the bit, the dip into and out of untagged HD, the proxies, 13 real files).
-* kerf-gpu `-- --ignored`, all targets, on 9.0.2 and on 6.1.1: **everything passes** (parity 50, motion_parity 25, frame_source 17, compositor 16, playback 12, ...).
-* kerf-app `--no-default-features`: 175 passed. No frontend file changed.
-* A trap worth knowing: a tree restored from a `tar` keeps old mtimes, so cargo reuses the previous build of every restored file; I touched the sources and rebuilt before the numbers above (an earlier, stale run of the same suites was discarded).
+## Test results (Mesa lavapipe, `KERF_HWACCEL=none`, `KERF_HW_ENCODE=none`), on the committed tree (f1a910f)
+* `cargo fmt --all --check` clean; `cargo clippy --workspace --all-targets --no-default-features --locked --color never -- -D warnings`: exit 0.
+* `cargo test -p kerf-core --no-default-features`: **1310 passed**, 116 ignored (main 1289 passed); the golden oracle and `a_decoders_default_tag_names_no_matrix_in_any_graph_of_the_corpus` pass.
+* `bt709_label` `-- --ignored` (closing fixes): 4 passed, 0 failed on 9.0.2 and on 6.1.1 (15 real files, the dips, the proxies, label = tag).
+* The full suites of the previous round (06d2880), before the closing fixes: kerf-core `-- --ignored --skip downloads_a_real_model --skip synthesizes_a_script_end_to_end` 114 passed on both FFmpegs; kerf-gpu `-- --ignored`, all targets, both FFmpegs: all pass (parity 50, motion_parity 25, frame_source 17, compositor 16, playback 12, ...); kerf-app 175 passed. The closing fixes touch a codec list and docs, not a graph, so I did not re-run the GPU suites.
+* A trap worth knowing: a tree restored from a `tar` keeps old mtimes, so cargo reuses the previous build; touch the sources before trusting a run.
 
 ## Needs a real machine
 * A real GPU adapter and arm64 / macOS (all numbers are lavapipe, x86-64). FFmpeg builds other than 6.1.1 and 9.0.2.
@@ -164,12 +185,12 @@ New parity rows: 29 on 9.0.2 (641 → 670), 36 on 6.1.1 (681 → 717); drawn one
 
 ## Needs a maintainer decision
 1. **Untagged HD beside explicitly tagged `smpte170m` / `bt470bg` / `bt2020nc` footage** (a DVD rip, an SD camera that tags itself; not a JPEG, WebP, MJPEG or PNG any more) is a mixed stack: the export moves (34 dB; the HD clip's colours become right, 28.0 → 42.7 dB) and the GPU refuses it on 9.0.2, where main drew it as BT.601 throughout. Rule R as given; restricting the naming input to `bt709` / HDR would keep those exports byte-identical and drawn.
-2. The 6.1 uniform label (S2): confirm, or thread the policy into the builders (and give the probe a policy-free still builder). On 6.1 it moves only an HD layer that takes the RGB round trip in a mixed stack: translucent (39.2 dB / 10) or a dip to white (32.3 dB / 11, export).
+2. The 6.1 uniform label (S2): confirm, or thread the policy into the builders (and give the probe a policy-free still builder). On 6.1 it moves only an HD layer that takes the RGB round trip in a mixed stack: translucent (export 40.7 dB / 8, still 39.2 / 14, stream 39.7 / 21, scrub window 38.6 / 23) or a dip to white (33.0 dB / 15 into the HD clip, 32.5 / 15 out of it, whole export).
 3. Slices (stream, scrub window, ranged export, the handover stream) decide over their own graph: accepted (S1).
 4. The label's place changed in round 2 (first in the chain, equal to the tag; 38.7 instead of 42.7 dB beside a `smpte170m` neighbour, a stack the GPU refuses on 9.0.2 either way). Confirm, or choose the old place and refuse a labelled layer's dip to white in the plan (the export dip would then stay BT.601 in / BT.709 out).
 5. Tracker: the old `origin/gpu-1` branch can go; GPU-1's items on hardware proxy encoders and a Windows delete retry are moot; "untagged HD originals still read as BT.601 on 9.0.2 until their proxy lands" now applies only to a lone untagged HD clip.
 
 ## Files
-`golden-counts.txt`, `export-label-vs-main-ffmpeg-{9.0.2,6.1.1}.txt`, `argv-identity-ffmpeg-{9.0.2,6.1.1}.txt`, `preview-assets-vs-originals.txt`, `colour-vs-the-footage-ffmpeg-9.0.2.txt`,
+`golden-counts.txt`, `label-on-off-whole-export-ffmpeg-both.txt`, `export-label-vs-main-ffmpeg-{9.0.2,6.1.1}.txt`, `argv-identity-ffmpeg-{9.0.2,6.1.1}.txt`, `preview-assets-vs-originals.txt`, `colour-vs-the-footage-ffmpeg-9.0.2.txt`,
 `gpu-plan-verdicts-before-after.txt`, `parity-new-cases.txt`, `probe-shapes.txt`; `tools/`: `mkmedia.sh`, `mkshapes.sh` (the files), `gpu1b_explore.rs` (the harness; copy into
-`crates/kerf-core/examples/`, once per checkout, each with its own target dir), `ffwrap.sh` + `argv-diff.py` (argv logging and comparison), `cmp.py` (the tables), `probe_shapes.rs` (the probe survey), `dip-chain-experiment.py` and `dip-chain-all-frames.py` (the label-position experiment on single chains).
+`crates/kerf-core/examples/`, once per checkout, each with its own target dir), `ffwrap.sh` + `argv-diff.py` (argv logging and comparison), `cmp.py` (the tables), `probe_shapes.rs` (the probe survey), `dip-chain-experiment.py` and `dip-chain-all-frames.py` (the label-position experiment on single chains), `label-on-off-measure.rs.txt` + `strip-label-ffmpeg.sh` + `label-on-off-compare.py` + `label-alone-untagged-vs-tagged-compare.py` (the whole-export label on / off measurement of the closing fixes).
