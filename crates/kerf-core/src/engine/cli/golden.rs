@@ -1478,12 +1478,16 @@ const STAND_INS: &[(&str, bool, bool, &str, &str, &str)] = &[
     ("rgb video gbr", false, false, "ffv1", "bgr0", "gbr"),
     // Each of these is kept off by one rule alone: `gbr` on a layout that is not RGB (a moving
     // picture with alpha), a decoder that tags everything it decodes with no `yuvj` to give it away
-    // (MJPEG at 4:2:2, SpeedHQ), AMV, and an RGB picture whose tag is not `gbr` (`jpegls` on 6.1.1).
+    // (MJPEG at 4:2:2, SpeedHQ, JPEG-LS grey, a decode-only one of the list), AMV, and an RGB picture
+    // whose tag is not `gbr` from a codec that is not on the list.
     ("rgba video gbr", false, false, "ffv1", "bgra", "gbr"),
     ("mjpeg video yuv422p bt470bg", false, false, "mjpeg", "yuv422p", "bt470bg"),
     ("speedhq yuv422p bt470bg", false, false, "speedhq", "yuv422p", "bt470bg"),
     ("amv yuvj420p bt470bg", false, false, "amv", "yuvj420p", "bt470bg"),
     ("jpegls rgb24 bt470bg", false, false, "jpegls", "rgb24", "bt470bg"),
+    ("jpegls gray bt470bg", false, false, "jpegls", "gray", "bt470bg"),
+    ("thp yuv420p bt470bg", false, false, "thp", "yuv420p", "bt470bg"),
+    ("ffv1 rgb24 bt470bg", false, false, "ffv1", "rgb24", "bt470bg"),
     // The controls: a tag that is the file's word, `yuvj420p` full-range H.264 (OBS, drones) included.
     ("h264 bt709", true, false, "h264", "yuv420p", "bt709"),
     ("h264 smpte170m", true, false, "h264", "yuv420p", "smpte170m"),

@@ -234,10 +234,16 @@ pub fn matrix_tag_is_stated(tag: Option<&str>) -> bool {
     tag.is_some_and(|t| !matches!(t.trim(), "" | "unknown" | "unspecified" | "reserved"))
 }
 
-/// The codecs whose decoders write `bt470bg` on everything they decode, whatever the file says (probed
-/// on FFmpeg 6.1.1 and 9.0.2 with ~100 encoder / pixel-format pairs: no other decoder did): MJPEG, AMV and
-/// SpeedHQ. A tag from one of them is the decoder's default, not the file's word.
-pub(crate) const DEFAULT_TAG_CODECS: [&str; 3] = ["mjpeg", "amv", "speedhq"];
+/// The codecs whose decoders write `bt470bg` on everything they decode, whatever the file says. A tag
+/// from one of them is the decoder's default, not the file's word. `mjpeg`, `amv`, `speedhq` and
+/// `jpegls` (`rgb24`, `gray` and `gray16le` alike) were probed on FFmpeg 6.1.1 and 9.0.2 with ~100
+/// encoder / pixel-format pairs, and no other encodable codec did. `mjpegb`, `sp5x`, `thp` and
+/// `smvjpeg` are decode-only, so there is no file to probe: they share MJPEG's `ff_mjpeg_decode_init`,
+/// which sets the tag. `mxpeg` (decode-only too) is listed on the same assumption, which costs nothing
+/// if it is wrong: a codec that writes no tag has nothing to exclude.
+pub(crate) const DEFAULT_TAG_CODECS: [&str; 9] = [
+    "mjpeg", "amv", "speedhq", "jpegls", "mjpegb", "sp5x", "thp", "smvjpeg", "mxpeg",
+];
 
 /// Whether a picture is **untagged HD YCbCr**: HD (mpv's rule, `width >= 1280 || height > 576`, on
 /// the source's displayed size), YCbCr on the pixel-format allow-list (alpha, grey and RGB are not),
@@ -417,11 +423,11 @@ impl StreamInfo {
     ///
     /// The principle: **a tag a decoder writes by default is not the file's word.** Probed on both
     /// FFmpegs, those are `gbr` on any PNG (`rgb24`, `rgba`, `gray`) and, depending on the encoder that
-    /// made it, on RGB video; `bt470bg` on a JPEG and a WebP; and `bt470bg` from the `mjpeg`, `amv` and
-    /// `speedhq` decoders (MJPEG video, an AMV player's clips, NDI's SpeedHQ), whatever their pixel
-    /// format. An explicit tag on any other
-    /// codec is the file's, `yuvj…` full-range H.264 included (FFmpeg's h264 decoder names every
-    /// full-range stream `yuvj420p`, and a camera's `pc` + `bt709` is a matrix).
+    /// made it, on RGB video; `bt470bg` on a JPEG and a WebP; and `bt470bg` from the decoders of
+    /// [`DEFAULT_TAG_CODECS`] (MJPEG video and its relatives, an AMV player's clips, NDI's SpeedHQ,
+    /// JPEG-LS), whatever their pixel format. An explicit tag on any other codec is the file's,
+    /// `yuvj…` full-range H.264 included (FFmpeg's h264 decoder names every full-range stream
+    /// `yuvj420p`, and a camera's `pc` + `bt709` is a matrix).
     ///
     /// This is *not* the mirror of [`StreamInfo::is_untagged_hd_yuv`]'s exclusions: grey, alpha and SD
     /// pictures are never labelled but do name a matrix when tagged, and that asymmetry is intended
@@ -432,7 +438,7 @@ impl StreamInfo {
     }
 
     /// The tag is a matrix a YCbCr picture states: not `gbr` (RGB, "identity"), and not on an RGB
-    /// picture (`jpegls` writes `bt470bg` on `rgb24` on FFmpeg 6.1.1).
+    /// picture, which has no YCbCr matrix to name whoever tagged it.
     fn has_a_yuv_tag(&self) -> bool {
         matrix_tag_is_stated(self.color_space.as_deref())
             && self.color_space.as_deref().map(str::trim) != Some("gbr")
@@ -6313,8 +6319,9 @@ mod tests {
         // ProRes clip tagged `bt470bg` names it (and so does SD tagged `smpte170m`).
         assert!(picture(1920, 1080, "yuv420p", Some("bt470bg")).names_a_matrix());
         assert!(picture(1920, 1080, "yuv422p10le", Some("bt470bg")).names_a_matrix());
-        // …but not on a still image, nor from a decoder that tags everything it decodes (MJPEG, AMV and
-        // SpeedHQ), whatever the pixel format: `yuv422p` MJPEG is no more the file's word than `yuvj420p`.
+        // …but not on a still image, nor from a decoder that tags everything it decodes (`DEFAULT_TAG_CODECS`),
+        // whatever the pixel format: `yuv422p` MJPEG is no more the file's word than `yuvj420p`, and a
+        // JPEG-LS grey picture (not RGB, so the layout rule does not catch it) is not either.
         let mut jpeg = picture(1920, 1080, "yuv420p", Some("bt470bg"));
         jpeg.image = true;
         assert!(!jpeg.names_a_matrix());
@@ -6323,6 +6330,14 @@ mod tests {
             ("mjpeg", "yuvj422p"),
             ("amv", "yuvj420p"),
             ("speedhq", "yuv422p"),
+            ("jpegls", "gray"),
+            ("jpegls", "gray16le"),
+            ("jpegls", "yuv420p"),
+            ("mjpegb", "yuvj420p"),
+            ("sp5x", "yuvj420p"),
+            ("thp", "yuvj420p"),
+            ("smvjpeg", "yuvj420p"),
+            ("mxpeg", "yuvj420p"),
         ] {
             let mut s = picture(1920, 1080, fmt, Some("bt470bg"));
             s.codec = codec.into();
@@ -6340,13 +6355,16 @@ mod tests {
         let untagged_full_range = picture(1920, 1080, "yuvj420p", None);
         assert!(!untagged_full_range.is_untagged_hd_yuv() && !untagged_full_range.names_a_matrix());
         assert_eq!(bt709_labels(&[Some(&phone), Some(&untagged_full_range)]), [false, false]);
-        // An RGB picture has no YCbCr matrix to name even when its tag is not `gbr`: `jpegls` writes
-        // `bt470bg` on `rgb24` on FFmpeg 6.1.1 (and not a still image or one of the codecs above).
-        let mut jpegls = picture(1920, 1080, "rgb24", Some("bt470bg"));
-        jpegls.codec = "jpegls".into();
-        assert!(!jpegls.names_a_matrix());
-        jpegls.pix_fmt = Some("yuv420p".into());
-        assert!(jpegls.names_a_matrix(), "the same tag on a YCbCr picture is a matrix");
+        // An RGB picture has no YCbCr matrix to name even when its tag is not `gbr`, from a codec the
+        // list above does not hold (the layout rule alone: `jpegls` is on the list).
+        let mut rgb = picture(1920, 1080, "rgb24", Some("bt470bg"));
+        rgb.codec = "ffv1".into();
+        assert!(!rgb.names_a_matrix());
+        rgb.pix_fmt = Some("yuv420p".into());
+        assert!(rgb.names_a_matrix(), "the same tag on a YCbCr picture is a matrix");
+        // A grey picture is not RGB: from any other codec its tag is the file's word.
+        rgb.pix_fmt = Some("gray".into());
+        assert!(rgb.names_a_matrix(), "a tagged grey picture names a matrix");
         // A second video stream (cover art) does not tone-map or tag the first.
         let mut asset = crate::engine::test_support::test_asset(vec![
             picture(1920, 1080, "yuv420p", None),

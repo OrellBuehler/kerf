@@ -135,10 +135,9 @@ pub(crate) fn image_stream(w: u32, h: u32) -> StreamInfo {
 /// Pictures of the shapes `Project::probe_asset` really gives (ffprobe on FFmpeg 6.1.1 and 9.0.2) for
 /// files whose tag is **the decoder's default, not the file's word**: a PNG is tagged `gbr` whatever
 /// its layout, RGB video made by some encoders is too, a JPEG or a WebP is `bt470bg`, and so is
-/// everything the `mjpeg`, `amv` and `speedhq` decoders produce (whatever the pixel format), and
-/// `jpegls` writes `bt470bg` on `rgb24`. Several name no matrix for one rule of their own (a
-/// non-image `rgba` with `gbr`, MJPEG and SpeedHQ at `yuv422p`, `jpegls`). None of them names a
-/// matrix to a graph.
+/// everything the `mjpeg`, `amv`, `speedhq` and `jpegls` decoders produce (whatever the pixel format,
+/// `rgb24` and grey included). Several name no matrix for one rule of their own (a non-image `rgba`
+/// with `gbr`, MJPEG and SpeedHQ at `yuv422p`, JPEG-LS grey). None of them names a matrix to a graph.
 pub(crate) fn decoder_default_pictures(w: u32, h: u32) -> Vec<(&'static str, StreamInfo)> {
     let make = |codec: &str, pix_fmt: &str, tag: &str, image: bool| {
         let mut s = if image { image_stream(w, h) } else { video_stream(w, h, 30.0) };
@@ -162,6 +161,8 @@ pub(crate) fn decoder_default_pictures(w: u32, h: u32) -> Vec<(&'static str, Str
         ("ffv1 bgra gbr", make("ffv1", "bgra", "gbr", false)),
         ("h264 gbrp gbr", make("h264", "gbrp", "gbr", false)),
         ("jpegls rgb24 bt470bg", make("jpegls", "rgb24", "bt470bg", false)),
+        ("jpegls gray bt470bg", make("jpegls", "gray", "bt470bg", false)),
+        ("jpegls gray16le bt470bg", make("jpegls", "gray16le", "bt470bg", false)),
     ]
 }
 

@@ -1009,7 +1009,7 @@ fn a_mixed_stack_of_proxies_is_the_stack_of_the_originals() {
 
 /// Real files, probed (on 6.1.1 and 9.0.2 alike), whose only tag is their decoder's default: a JPEG and
 /// a WebP say `bt470bg`, a PNG of any layout and RGB video say `gbr`, and the `mjpeg`, `speedhq` and
-/// `amv` decoders say `bt470bg` of everything (`jpegls` does of `rgb24`). Beside untagged HD they name
+/// `amv` and `jpegls` decoders say `bt470bg` of everything (`rgb24` and grey included). Beside untagged HD they name
 /// no matrix: no builder labels anything, and the argv is the one the same file without the tag gives.
 /// A full-range H.264 clip with a stated BT.709 (`h264 yuvj420p pc bt709`, what OBS and drones write) is
 /// the file's word and does label the HD beside it: `yuvj` is not the decoder.
@@ -1032,7 +1032,7 @@ fn real_files_whose_tag_is_the_decoders_default_name_no_matrix_beside_untagged_h
         "bt709",
     ];
     // (file, the pixel format it is made in, the encoder's arguments, whether its tag is the file's word)
-    let files: [(&str, &str, Vec<&str>, bool); 13] = [
+    let files: [(&str, &str, Vec<&str>, bool); 15] = [
         ("photo.jpg", "yuvj420p", vec!["-frames:v", "1"], false),
         ("photo.webp", "yuv420p", vec!["-frames:v", "1", "-c:v", "libwebp"], false),
         ("logo-rgb24.png", "rgb24", vec!["-frames:v", "1"], false),
@@ -1048,6 +1048,8 @@ fn real_files_whose_tag_is_the_decoders_default_name_no_matrix_beside_untagged_h
         ),
         ("ndi.mov", "yuv422p", vec!["-c:v", "speedhq"], false),
         ("jpegls.avi", "rgb24", vec!["-c:v", "jpegls"], false),
+        ("jpegls-gray.avi", "gray", vec!["-c:v", "jpegls"], false),
+        ("jpegls-gray16.avi", "gray16le", vec!["-c:v", "jpegls"], false),
         ("capture.mkv", "bgr0", vec!["-c:v", "ffv1"], false),
         ("capture-alpha.mkv", "bgra", vec!["-c:v", "ffv1"], false),
         (
