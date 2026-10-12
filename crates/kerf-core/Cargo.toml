@@ -50,7 +50,7 @@ misaki-rs = { version = "0.6", default-features = false }
 sha2 = "0.10"
 flate2 = "1"
 tar = "0.4"
-zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 # STFT for the music analysis (onset flux, chroma; see engine::music).
 realfft = "3.5"
 ffmpeg-next = { workspace = true, optional = true }
