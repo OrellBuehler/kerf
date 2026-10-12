@@ -5,8 +5,10 @@ import {
 	MAX_ROUND_TRIP,
 	Median,
 	OVERLOAD_AFTER,
+	NO_PLAY,
 	frameIndex,
 	pictureTime,
+	playSession,
 	playStart
 } from './gpu-playback';
 import { MAX_OUTPUT_LATENCY } from './output-latency';
@@ -256,6 +258,39 @@ describe('where a play session is held', () => {
 		expect(p.offsetAt(5.3)).toBeCloseTo(0.3, 9);
 		expect(p.offsetAt(9)).toBeCloseTo(0.3, 9);
 		expect(p.offsetAt(4)).toBe(0);
+	});
+});
+
+describe('a play that is rebuilt while it runs', () => {
+	test('a session begun from the audible picture hands the stream that picture even if the GPU declines it', () => {
+		// The playhead is at 30 and the sound at 29.8: the screen shows 29.8, and the rebuilt session is held there.
+		const p = new GpuPlayback(30, playStart(30, 0.2, true), true);
+		p.next(30, 0.2);
+		// Declined at the first answer: nothing drawn, but the stream carries on from the picture on the screen.
+		expect(p.drawn).toBe(0);
+		expect(p.offsetAt(30)).toBeCloseTo(0.2, 9);
+		// A play from rest has no such picture to carry on from, and offsets nothing until it has drawn.
+		const fresh = new GpuPlayback(30, 30);
+		fresh.next(30, 0.2);
+		expect(fresh.offsetAt(30.3)).toBe(0);
+	});
+
+	test('is the audible picture of the same play, never before the playhead the play began at', () => {
+		const rest = playSession(NO_PLAY, 30, 4, 0.2);
+		expect(rest).toEqual({ run: { running: true, seekEpoch: 4, floor: 30 }, running: false, from: 30 });
+		// An edit a second in: the same play, rebuilt at the picture on the screen.
+		const edit = playSession(rest.run, 31, 4, 0.2);
+		expect(edit.running).toBe(true);
+		expect(edit.from).toBeCloseTo(30.8, 9);
+		// An edit within the latency of Play: the audible time is still before the playhead the play began at.
+		const early = playSession(rest.run, 30.1, 4, 0.2);
+		expect(early.running).toBe(true);
+		expect(early.from).toBe(30);
+		expect(early.run.floor).toBe(30);
+		// A seek is a play from rest at the new playhead, and a pause forgets the play.
+		const seeked = playSession(edit.run, 12, 5, 0.2);
+		expect(seeked).toMatchObject({ running: false, from: 12, run: { floor: 12, seekEpoch: 5 } });
+		expect(playSession(NO_PLAY, 31, 4, 0.2).running).toBe(false);
 	});
 });
 

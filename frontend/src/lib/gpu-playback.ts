@@ -88,6 +88,41 @@ export function playStart(playhead: number, outputLatency: number, running: bool
 	return Math.max(0, playhead - heard);
 }
 
+/** What the page remembers of the play it is in, for the next time the playback effect runs. */
+export interface PlayRun {
+	/** A play was going the last time. */
+	running: boolean;
+	/** The seek epoch it went at. */
+	seekEpoch: number;
+	/** The playhead it began at (Play pressed on a paused frame, or a seek): no session of it starts before. */
+	floor: number;
+}
+
+/** No play going: the next run is from rest. */
+export const NO_PLAY: PlayRun = { running: false, seekEpoch: -1, floor: 0 };
+
+/**
+ * The playback effect ran with a play going at `playhead`: whether it is the same play rebuilt (an edit, a
+ * resize; no seek, no pause between) or a new one from rest, where a session starts, and what to remember. A
+ * rebuilt session starts at the audible picture ([`playStart`]) but never before the playhead the play began at:
+ * rebuilt within the output latency of Play or a seek, the audible time is still before it, and the picture on the
+ * screen (held there) must not rewind.
+ */
+export function playSession(
+	last: PlayRun,
+	playhead: number,
+	seekEpoch: number,
+	outputLatency: number
+): { run: PlayRun; running: boolean; from: number } {
+	const running = last.running && last.seekEpoch === seekEpoch;
+	const floor = running ? last.floor : playhead;
+	return {
+		run: { running: true, seekEpoch, floor },
+		running,
+		from: Math.max(floor, playStart(playhead, outputLatency, running))
+	};
+}
+
 /** What an answer means for the page. */
 export type PlayVerdict =
 	/** Draw nothing over the surface: the GPU drew a new frame. */
@@ -140,7 +175,10 @@ export class GpuPlayback {
 	 */
 	constructor(
 		private readonly fps: number,
-		private readonly from = 0
+		readonly from = 0,
+		/** The picture on the screen when the session began was the audible one already (a running play rebuilt),
+		 *  so a session the GPU declines still hands the stream a picture that is in the audible time. */
+		private readonly carriesAudible = false
 	) {}
 
 	/** The output latency of the sound the picture is held to, seconds (0 before any is read). */
@@ -151,10 +189,11 @@ export class GpuPlayback {
 	/**
 	 * What the clock is read less to be the time the picture on the screen is: the latency, but not before the
 	 * playhead the play started from (the picture is held there until the sound gets to it), and nothing at all
-	 * until a frame was drawn — a session the GPU declined has drawn nothing for a stream to carry on from.
+	 * until a frame was drawn — a session the GPU declined has drawn nothing for a stream to carry on from — unless
+	 * the session was begun from the audible picture (a running play rebuilt: the screen already shows it).
 	 */
 	offsetAt(clock: number): number {
-		if (this.drawn === 0) return 0;
+		if (this.drawn === 0 && !this.carriesAudible) return 0;
 		return Math.max(0, Math.min(this.latency, clock - this.from));
 	}
 

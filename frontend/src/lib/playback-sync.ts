@@ -6,6 +6,7 @@
  *  could otherwise exercise, and it froze the preview once already. */
 
 import { DEFAULT_FRAME_PX, FRAME_STEPS } from './preview-size';
+import { DEFAULT_STARTUP } from './gpu-playback';
 import type { PlayAhead } from './types';
 
 /** The fastest a stream plays: a display paints no more than this, so frames past it are composited
@@ -347,6 +348,9 @@ export function createLadder(clock: () => number = () => performance.now()) {
 				latency?: number;
 				/** Where the GPU stops, for the same: the stream starts at its hand-over when a window is open there. */
 				ahead?: { at: number; handover: number } | null;
+				/** The stream takes a GPU session over: with no start-up measured it is started [`DEFAULT_STARTUP`] ahead,
+				 *  as the page's trigger assumes, not at the playhead. */
+				takeover?: boolean;
 			}
 		): StreamStart {
 			if (!key || key.timeline !== next.timeline || key.epoch !== next.epoch || key.width !== next.width) {
@@ -361,7 +365,8 @@ export function createLadder(clock: () => number = () => performance.now()) {
 			const rung = rungAfter(startRung(cut.fps, cut.width), steps);
 			const offset = Number.isFinite(cut.latency) ? Math.max(0, cut.latency ?? 0) : 0;
 			const heard = Math.max(0, cut.playhead - offset);
-			const from = takeoverStart(heard, startup, cut.duration, rung.fps, cut.ahead ?? null);
+			const lead = cut.takeover ? (startup ?? DEFAULT_STARTUP) : startup;
+			const from = takeoverStart(heard, lead, cut.duration, rung.fps, cut.ahead ?? null);
 			applied = from - heard;
 			return {
 				rung,

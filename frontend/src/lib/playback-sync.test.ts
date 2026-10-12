@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { SRC } from './test-sources';
+import { DEFAULT_STARTUP } from './gpu-playback';
 import { FRAME_STEPS, MIN_FRAME_PX } from './preview-size';
 import {
 	createFrameGate,
@@ -524,6 +525,8 @@ function takeover(o: {
 	ahead: { at: number; handover: number } | null;
 	spawn?: number;
 	fps?: number;
+	/** The ladder has seen a stream of this cut start (how long it took); false: the first stream after an edit. */
+	measured?: boolean;
 }) {
 	const fps = o.fps ?? 30;
 	const spawn = o.spawn ?? 0.15;
@@ -531,9 +534,17 @@ function takeover(o: {
 	const cut = { fps, width: 960 as number | null, playhead: 0, duration: 120 };
 	const ladder = createLadder(() => 0);
 	// An earlier stream of this cut took `spawn` to start: that is how far ahead the next one is started.
-	ladder.start(key, cut);
-	ladder.ended(spawn);
-	const start = ladder.start(key, { ...cut, playhead: o.playhead, latency: o.latency, ahead: o.ahead });
+	if (o.measured ?? true) {
+		ladder.start(key, cut);
+		ladder.ended(spawn);
+	}
+	const start = ladder.start(key, {
+		...cut,
+		playhead: o.playhead,
+		latency: o.latency,
+		ahead: o.ahead,
+		takeover: true
+	});
 	const gate = createFrameGate({ fps: start.rung.fps, lead: start.lead });
 	const lags: number[] = [];
 	const verdicts: FrameVerdict[] = [];
@@ -568,6 +579,27 @@ describe('a takeover stream through the real ladder and gate', () => {
 		for (const r of [a, b]) expect(r.verdicts.filter((v) => v === 'resync' || v === 'degrade')).toEqual([]);
 	});
 
+	test('the first takeover after an edit, with no start-up measured, is started the default start-up ahead like the trigger assumes', () => {
+		// An edit resets the ladder's key, so a GPU play's takeover is usually the first stream it sees.
+		const heard = 30;
+		const ahead = { at: heard + 0.06, handover: heard + 0.06 };
+		const r = takeover({ playhead: heard + latency, latency, ahead, measured: false });
+		expect(r.start.from).toBeCloseTo(heard + DEFAULT_STARTUP, 9);
+		expect(Math.abs(r.lag)).toBeLessThanOrEqual(r.frame);
+		expect(r.verdicts.filter((v) => v === 'resync' || v === 'degrade')).toEqual([]);
+		// A machine whose first stream takes longer than the default trails the sound by the difference until a
+		// stream has been seen to start (the ladder records it when one ends); the gate cannot see a constant lag.
+		const slow = takeover({ playhead: heard + latency, latency, ahead, measured: false, spawn: 0.25 });
+		expect(slow.lag).toBeCloseTo(0.1, 9);
+		expect(slow.lag).toBeLessThanOrEqual(3 * slow.frame + 1e-9);
+		// A plain stream (not a takeover) is unchanged: the playhead itself until a start-up is measured.
+		const plain = createLadder(() => 0).start(
+			{ timeline: {}, epoch: 0, width: 960 },
+			{ fps: 30, width: 960, playhead: 30, duration: 120 }
+		);
+		expect(plain.from).toBe(30);
+	});
+
 	test('in a window and on time it starts at the hand-over, within a frame of the sound', () => {
 		const ahead = { at: 20, handover: 19.5 };
 		const r = takeover(planned(ahead));
@@ -592,7 +624,7 @@ describe('the Preview\u2019s hand-over to the stream', () => {
 
 	test('starts the stream by the engine\u2019s hand-over, in the time that is heard, told only what is due', () => {
 		// The pieces the tests above hold: where the stream starts, what the clock is read less, what it is told.
-		expect(source).toContain('ahead: takeover ? handover : null');
+		expect(source).toContain('ahead: takeover ? handover : null,\n\t\t\t\t\t\ttakeover');
 		expect(source).toContain('latency: takeover ? (gpuPlay?.offsetAt(ui.time) ?? 0) : takeoverLatency');
 		expect(source).toContain('verdict(ui.time - offset - f.time');
 		expect(source).toContain('takeoverAhead(ahead, now, ui.time - pb.offsetAt(ui.time), pb.roundTrip, playFps)');
@@ -600,8 +632,8 @@ describe('the Preview\u2019s hand-over to the stream', () => {
 	});
 
 	test('starts the GPU\u2019s session at the audible picture when the play is already running', () => {
-		expect(source).toContain('playStart(ui.time, audio.outputLatency(), midPlay)');
-		expect(source).toContain('const midPlay = untrack(() => playRunning && playSeekEpoch === ui.seekEpoch);');
+		expect(source).toContain('playSession(playRun, ui.time, ui.seekEpoch, audio.outputLatency())');
+		expect(source).toContain('new GpuPlayback(playFps, session.from, session.running)');
 	});
 
 	test('reads the clock as it always did in a stream that does not continue a takeover', () => {
