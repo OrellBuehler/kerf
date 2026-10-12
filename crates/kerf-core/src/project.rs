@@ -20,10 +20,69 @@ use crate::model::{
     Delivery, Easing, EditOutcome, EditSource, Framing, Keyframe, Levels, Marker, Mask, MasterBus, Projection, Reframe,
     ReframeKeyframe, Revision, SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo,
     TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TrackLevels, TranscriptSegment, Transition, VideoEffect,
-    Voiceover, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_FOV, MIN_FOV,
+    Voiceover, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_FOV, MAX_SVG_OVERLAYS, MIN_FOV,
 };
 use crate::model::{Detached, DetachedMany};
 use crate::model::{Property, PropertyKey};
+use crate::model::{SvgOverlay, SvgOverlayPatch, SvgPreset};
+use crate::svg::{check_params, SvgDoc};
+
+/// Where an animated title's artwork comes from.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SvgSource {
+    /// SVG source; it is sanitised before it is stored.
+    Custom(String),
+    /// One of the generated presets.
+    Preset(SvgPreset),
+}
+
+/// Name and placement of a new animated title; each `None` takes the default (full frame, opaque).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct SvgLayout {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f64>,
+}
+
+/// An animated title as written, with what the sanitiser or the SMIL reader could not honour.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SvgOverlayResult {
+    pub overlay: SvgOverlay,
+    pub warnings: Vec<String>,
+}
+
+/// A placement the compositor can draw: finite numbers, a real size, an opacity.
+fn check_svg_rect(x: f64, y: f64, width: f64, height: f64, opacity: f64) -> Result<()> {
+    if ![x, y, width, height, opacity].iter().all(|v| v.is_finite()) {
+        return Err(Error::InvalidArgument(
+            "x, y, width, height and opacity must be numbers".to_string(),
+        ));
+    }
+    if !(-5.0..=5.0).contains(&x) || !(-5.0..=5.0).contains(&y) {
+        return Err(Error::InvalidArgument(
+            "x and y are fractions of the frame, within -5..=5".to_string(),
+        ));
+    }
+    if width <= 0.0 || height <= 0.0 || width > 10.0 || height > 10.0 {
+        return Err(Error::InvalidArgument(
+            "width and height are fractions of the frame, > 0 and <= 10".to_string(),
+        ));
+    }
+    if !(0.0..=1.0).contains(&opacity) {
+        return Err(Error::InvalidArgument("opacity must be within 0.0..=1.0".to_string()));
+    }
+    Ok(())
+}
 
 /// One clip queued for smart-crop sampling: which media to look at, over which
 /// source window, and the shape it was shot in.
@@ -2527,6 +2586,9 @@ impl Project {
         };
         self.edit_timeline(&label, |timeline| {
             timeline.format = format.map(|d| Delivery::new(d.width, d.height, d.fit));
+            // Preset titles are drawn for the frame they were made at.
+            let frame = timeline.preset_frame();
+            timeline.regenerate_svg_presets(frame);
             Ok(())
         })?;
         self.working_timeline()
@@ -4494,6 +4556,161 @@ impl Project {
         })
     }
 
+    // ---- animated SVG titles ----------------------------------------------
+
+    /// Add an animated SVG title, returning it with what could not be honoured.
+    ///
+    /// `source` is custom SVG (sanitised and read first: bad XML, a root that is not `<svg>`, no size
+    /// or a cap exceeded is an `InvalidArgument`) or a preset (its parameters checked, its artwork
+    /// generated for the project's delivery frame and the title's length). `end` defaults to when the
+    /// animation has finished — [`SvgDoc::natural_duration`] held to 2–30 s — and to four seconds for
+    /// a still, a loop and a preset. One `Add animated title` edit, staged for an agent.
+    pub fn add_svg_overlay(
+        &self,
+        source: SvgSource,
+        start: f64,
+        end: Option<f64>,
+        layout: SvgLayout,
+    ) -> Result<SvgOverlayResult> {
+        if !start.is_finite() {
+            return Err(Error::InvalidArgument("start must be a number of seconds".to_string()));
+        }
+        let start = start.max(0.0);
+        if end.is_some_and(|e| !e.is_finite() || e <= start) {
+            return Err(Error::InvalidArgument("overlay end must be after start".to_string()));
+        }
+        let (svg, preset, warnings, natural) = match source {
+            SvgSource::Custom(src) => {
+                let doc = SvgDoc::parse(&src)?;
+                (
+                    doc.sanitized().to_string(),
+                    None,
+                    doc.warnings().to_vec(),
+                    doc.natural_duration(),
+                )
+            }
+            SvgSource::Preset(p) => {
+                check_params(&p.params)?;
+                (String::new(), Some(p), Vec::new(), None)
+            }
+        };
+        let end = end.unwrap_or_else(|| start + natural.map_or(4.0, |n| n.clamp(2.0, 30.0)));
+        let (x, y, width, height, opacity) = (
+            layout.x.unwrap_or(0.0),
+            layout.y.unwrap_or(0.0),
+            layout.width.unwrap_or(1.0),
+            layout.height.unwrap_or(1.0),
+            layout.opacity.unwrap_or(1.0),
+        );
+        check_svg_rect(x, y, width, height, opacity)?;
+        let mut overlay = SvgOverlay {
+            id: Uuid::new_v4(),
+            name: layout.name.map(|n| n.trim().to_string()).unwrap_or_default(),
+            svg,
+            start,
+            end,
+            x,
+            y,
+            width,
+            height,
+            opacity,
+            offset: 0.0,
+            preset,
+        };
+        self.edit_timeline("Add animated title", move |timeline| {
+            if timeline.svg_overlays.len() >= MAX_SVG_OVERLAYS {
+                return Err(Error::InvalidArgument(format!(
+                    "a timeline holds at most {MAX_SVG_OVERLAYS} animated titles"
+                )));
+            }
+            overlay.regenerate(timeline.preset_frame());
+            timeline.svg_overlays.push(overlay.clone());
+            Ok(SvgOverlayResult { overlay, warnings })
+        })
+    }
+
+    /// Change an animated title; each `None` in `patch` leaves a field alone.
+    ///
+    /// `svg` replaces the artwork with custom source (sanitised as on add; the title stops being a
+    /// preset), `preset_params` re-fills a preset title (refused on a custom one), and the two are
+    /// exclusive. **A preset's artwork is re-made whenever its length changes** (its animations are
+    /// scheduled against the span), so trimming or stretching one in the timeline retimes the effect
+    /// instead of cutting it off.
+    pub fn update_svg_overlay(&self, overlay_id: Uuid, patch: SvgOverlayPatch) -> Result<SvgOverlayResult> {
+        if patch.svg.is_some() && patch.preset_params.is_some() {
+            return Err(Error::InvalidArgument(
+                "pass either svg or preset_params, not both".to_string(),
+            ));
+        }
+        let doc = patch.svg.as_deref().map(SvgDoc::parse).transpose()?;
+        if let Some(params) = &patch.preset_params {
+            check_params(params)?;
+        }
+        if [patch.start, patch.end].iter().flatten().any(|v| !v.is_finite()) {
+            return Err(Error::InvalidArgument("start and end must be numbers of seconds".to_string()));
+        }
+        self.edit_timeline("Update animated title", move |timeline| {
+            let frame = timeline.preset_frame();
+            let o = timeline
+                .svg_overlays
+                .iter_mut()
+                .find(|o| o.id == overlay_id)
+                .ok_or(Error::SvgOverlayNotFound(overlay_id))?;
+            let length = o.doc_duration();
+            if let Some(v) = patch.name {
+                o.name = v.trim().to_string();
+            }
+            if let Some(v) = patch.start {
+                o.start = v.max(0.0);
+            }
+            if let Some(v) = patch.end {
+                o.end = v;
+            }
+            o.x = patch.x.unwrap_or(o.x);
+            o.y = patch.y.unwrap_or(o.y);
+            o.width = patch.width.unwrap_or(o.width);
+            o.height = patch.height.unwrap_or(o.height);
+            o.opacity = patch.opacity.unwrap_or(o.opacity);
+            if o.end <= o.start {
+                return Err(Error::InvalidArgument("overlay end must be after start".to_string()));
+            }
+            check_svg_rect(o.x, o.y, o.width, o.height, o.opacity)?;
+            let mut warnings = Vec::new();
+            let mut regenerate = o.preset.is_some() && (o.doc_duration() - length).abs() > 1e-6;
+            if let Some(doc) = &doc {
+                o.svg = doc.sanitized().to_string();
+                o.preset = None;
+                warnings = doc.warnings().to_vec();
+                regenerate = false;
+            } else if let Some(params) = patch.preset_params {
+                let preset = o.preset.as_mut().ok_or_else(|| {
+                    Error::InvalidArgument("this title is custom SVG, not a preset; pass svg to change it".to_string())
+                })?;
+                preset.params = params;
+                regenerate = true;
+            }
+            if regenerate {
+                o.regenerate(frame);
+            }
+            Ok(SvgOverlayResult {
+                overlay: o.clone(),
+                warnings,
+            })
+        })
+    }
+
+    /// Remove an animated title.
+    pub fn remove_svg_overlay(&self, overlay_id: Uuid) -> Result<()> {
+        self.edit_timeline("Remove animated title", move |timeline| {
+            let before = timeline.svg_overlays.len();
+            timeline.svg_overlays.retain(|o| o.id != overlay_id);
+            if timeline.svg_overlays.len() == before {
+                return Err(Error::SvgOverlayNotFound(overlay_id));
+            }
+            Ok(())
+        })
+    }
+
     /// Set (or clear, with an empty list) an overlay's position/opacity keyframes.
     pub fn set_overlay_keyframes(&self, overlay_id: Uuid, mut keyframes: Vec<TextKeyframe>) -> Result<TextOverlay> {
         for k in &keyframes {
@@ -5168,6 +5385,7 @@ mod tests {
     use super::*;
     use crate::captions_import::{parse_captions, CaptionFormat, CaptionImportRequest, ImportSummary, MAX_IMPORTED_CAPTIONS};
     use crate::engine::test_support::{remove_proxy, ProxyGuard};
+    use crate::model::SvgPresetParams;
     use crate::model::{ClipMove, DiffKind, Fit};
 
     #[test]
@@ -6223,6 +6441,493 @@ mod tests {
         project.remove_overlay(o.id).unwrap();
         assert!(project.timeline().unwrap().overlays.is_empty());
         assert!(project.remove_overlay(o.id).is_err());
+    }
+
+    fn svg_fixture(dur: &str) -> String {
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 50\"><rect width=\"10\" height=\"10\"><animate attributeName=\"x\" from=\"0\" to=\"90\" dur=\"{dur}\" fill=\"freeze\"/></rect></svg>"
+        )
+    }
+
+    fn svg_layout() -> SvgLayout {
+        SvgLayout::default()
+    }
+
+    #[test]
+    fn svg_overlay_add_update_remove_roundtrip() {
+        let project = Project::open_in_memory().unwrap();
+        let added = project
+            .add_svg_overlay(SvgSource::Custom(svg_fixture("3s")), 1.0, None, svg_layout())
+            .unwrap();
+        assert!(added.warnings.is_empty(), "{:?}", added.warnings);
+        let o = added.overlay;
+        assert_eq!((o.start, o.end), (1.0, 4.0), "the end is when the animation has finished");
+        assert_eq!(
+            (o.x, o.y, o.width, o.height, o.opacity, o.offset),
+            (0.0, 0.0, 1.0, 1.0, 1.0, 0.0)
+        );
+        assert!(o.preset.is_none() && o.name.is_empty());
+        assert_eq!(
+            project.timeline().unwrap().svg_overlays,
+            vec![o.clone()],
+            "stored with the timeline"
+        );
+        assert_eq!(project.history().unwrap().last().unwrap().label, "Add animated title");
+
+        let updated = project
+            .update_svg_overlay(
+                o.id,
+                SvgOverlayPatch {
+                    name: Some("  Logo  ".into()),
+                    start: Some(2.0),
+                    end: Some(6.5),
+                    x: Some(0.1),
+                    y: Some(0.2),
+                    width: Some(0.5),
+                    height: Some(0.25),
+                    opacity: Some(0.8),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .overlay;
+        assert_eq!(updated.name, "Logo");
+        assert_eq!((updated.start, updated.end), (2.0, 6.5));
+        assert_eq!(
+            (updated.x, updated.y, updated.width, updated.height, updated.opacity),
+            (0.1, 0.2, 0.5, 0.25, 0.8)
+        );
+        assert_eq!(updated.svg, o.svg, "the artwork is untouched by a retime");
+        assert_eq!(project.timeline().unwrap().svg_overlay(o.id), Some(&updated));
+
+        let revisions = project.history().unwrap().len();
+        for bad in [
+            SvgOverlayPatch {
+                end: Some(1.0),
+                ..Default::default()
+            },
+            SvgOverlayPatch {
+                opacity: Some(2.0),
+                ..Default::default()
+            },
+            SvgOverlayPatch {
+                width: Some(0.0),
+                ..Default::default()
+            },
+            SvgOverlayPatch {
+                x: Some(f64::NAN),
+                ..Default::default()
+            },
+            SvgOverlayPatch {
+                start: Some(f64::INFINITY),
+                ..Default::default()
+            },
+            SvgOverlayPatch {
+                svg: Some("<nope/>".into()),
+                ..Default::default()
+            },
+            SvgOverlayPatch {
+                preset_params: Some(SvgPresetParams::new("x")),
+                ..Default::default()
+            },
+            SvgOverlayPatch {
+                svg: Some(svg_fixture("1s")),
+                preset_params: Some(SvgPresetParams::new("x")),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                matches!(project.update_svg_overlay(o.id, bad.clone()), Err(Error::InvalidArgument(_))),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            project.history().unwrap().len(),
+            revisions,
+            "a refused edit writes no revision"
+        );
+        assert_eq!(project.timeline().unwrap().svg_overlay(o.id), Some(&updated));
+
+        let swapped = project
+            .update_svg_overlay(
+                o.id,
+                SvgOverlayPatch {
+                    svg: Some(format!("{}<script>x</script>", svg_fixture("1s").trim_end_matches("</svg>")) + "</svg>"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!swapped.overlay.svg.contains("script") && swapped.overlay.svg.contains("dur=\"1s\""));
+        assert!(
+            swapped.warnings.iter().any(|w| w.contains("script")),
+            "{:?}",
+            swapped.warnings
+        );
+
+        project.remove_svg_overlay(o.id).unwrap();
+        assert!(project.timeline().unwrap().svg_overlays.is_empty());
+        assert!(matches!(project.remove_svg_overlay(o.id), Err(Error::SvgOverlayNotFound(id)) if id == o.id));
+        assert!(matches!(
+            project.update_svg_overlay(o.id, SvgOverlayPatch::default()),
+            Err(Error::SvgOverlayNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn svg_overlay_end_defaults_to_the_natural_duration_held_to_two_to_thirty_seconds() {
+        let project = Project::open_in_memory().unwrap();
+        let still = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect width=\"5\" height=\"5\"/></svg>";
+        let looping = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><rect><animate attributeName=\"x\" to=\"5\" dur=\"1s\" repeatCount=\"indefinite\"/></rect></svg>";
+        for (src, want) in [
+            (svg_fixture("3.5s"), 3.5),
+            (svg_fixture("0.5s"), 2.0),
+            (svg_fixture("100s"), 30.0),
+            (still.to_string(), 4.0),
+            (looping.to_string(), 4.0),
+        ] {
+            let o = project
+                .add_svg_overlay(SvgSource::Custom(src), 10.0, None, svg_layout())
+                .unwrap()
+                .overlay;
+            assert!((o.end - 10.0 - want).abs() < 1e-9, "{} for {want}", o.end - 10.0);
+        }
+        let explicit = project
+            .add_svg_overlay(SvgSource::Custom(svg_fixture("3s")), 0.0, Some(9.0), svg_layout())
+            .unwrap()
+            .overlay;
+        assert_eq!(explicit.end, 9.0);
+        for (start, end) in [(1.0, Some(1.0)), (1.0, Some(0.5)), (f64::NAN, None), (0.0, Some(f64::NAN))] {
+            assert!(
+                matches!(
+                    project.add_svg_overlay(SvgSource::Custom(svg_fixture("3s")), start, end, svg_layout()),
+                    Err(Error::InvalidArgument(_))
+                ),
+                "{start} {end:?}"
+            );
+        }
+        let early = project
+            .add_svg_overlay(SvgSource::Custom(svg_fixture("3s")), -5.0, None, svg_layout())
+            .unwrap();
+        assert_eq!(early.overlay.start, 0.0, "a negative start is clamped like a text overlay's");
+    }
+
+    #[test]
+    fn svg_overlay_refuses_what_cannot_be_drawn_and_writes_nothing() {
+        let project = Project::open_in_memory().unwrap();
+        let revisions = project.history().unwrap().len();
+        for src in [
+            "",
+            "not xml",
+            "<html/>",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+            "<svg viewBox=\"0 0 1 1\"/>",
+        ] {
+            let r = project.add_svg_overlay(SvgSource::Custom(src.into()), 0.0, None, svg_layout());
+            assert!(matches!(r, Err(Error::InvalidArgument(_))), "{src:?}");
+        }
+        for layout in [
+            SvgLayout {
+                width: Some(-1.0),
+                ..Default::default()
+            },
+            SvgLayout {
+                opacity: Some(1.5),
+                ..Default::default()
+            },
+            SvgLayout {
+                x: Some(f64::INFINITY),
+                ..Default::default()
+            },
+            SvgLayout {
+                height: Some(f64::NAN),
+                ..Default::default()
+            },
+        ] {
+            let r = project.add_svg_overlay(SvgSource::Custom(svg_fixture("1s")), 0.0, None, layout);
+            assert!(matches!(r, Err(Error::InvalidArgument(_))));
+        }
+        assert!(project.timeline().unwrap().svg_overlays.is_empty());
+        assert_eq!(project.history().unwrap().len(), revisions);
+    }
+
+    #[test]
+    fn svg_overlay_count_is_capped() {
+        let project = Project::open_in_memory().unwrap();
+        for _ in 0..MAX_SVG_OVERLAYS {
+            project
+                .add_svg_overlay(SvgSource::Custom(svg_fixture("1s")), 0.0, None, svg_layout())
+                .unwrap();
+        }
+        let err = project
+            .add_svg_overlay(SvgSource::Custom(svg_fixture("1s")), 0.0, None, svg_layout())
+            .unwrap_err();
+        assert!(matches!(&err, Error::InvalidArgument(m) if m.contains("50")), "{err}");
+        assert_eq!(project.timeline().unwrap().svg_overlays.len(), MAX_SVG_OVERLAYS);
+    }
+
+    #[test]
+    fn preset_titles_follow_their_length_params_and_frame() {
+        use crate::model::SvgPresetKind;
+        let project = Project::open_in_memory().unwrap();
+        let preset = SvgPreset {
+            kind: SvgPresetKind::FadeUp,
+            params: SvgPresetParams::new("Hello"),
+        };
+        let added = project
+            .add_svg_overlay(SvgSource::Preset(preset.clone()), 0.0, None, svg_layout())
+            .unwrap();
+        let o = added.overlay;
+        assert!(added.warnings.is_empty());
+        assert_eq!((o.start, o.end), (0.0, 4.0));
+        assert_eq!(o.preset.as_ref(), Some(&preset));
+        assert!(
+            o.svg.contains("viewBox=\"0 0 1920 1080\"") && o.svg.contains(">Hello</text>"),
+            "{}",
+            o.svg
+        );
+        assert!(
+            o.svg.contains("begin=\"3.6s\""),
+            "the exit is timed against the span: {}",
+            o.svg
+        );
+
+        let longer = project
+            .update_svg_overlay(
+                o.id,
+                SvgOverlayPatch {
+                    end: Some(8.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .overlay;
+        assert!(
+            longer.svg.contains("begin=\"7.6s\"") && !longer.svg.contains("begin=\"3.6s\""),
+            "{}",
+            longer.svg
+        );
+        let moved = project
+            .update_svg_overlay(
+                o.id,
+                SvgOverlayPatch {
+                    start: Some(5.0),
+                    end: Some(13.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .overlay;
+        assert_eq!(moved.svg, longer.svg, "a move that keeps the length keeps the artwork");
+
+        let reworded = project
+            .update_svg_overlay(
+                o.id,
+                SvgOverlayPatch {
+                    preset_params: Some(SvgPresetParams {
+                        subtitle: Some("World".into()),
+                        ..SvgPresetParams::new("Bye")
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .overlay;
+        assert!(
+            reworded.svg.contains(">Bye</text>") && reworded.svg.contains(">World</text>") && !reworded.svg.contains("Hello")
+        );
+        assert_eq!(reworded.preset.as_ref().unwrap().params.text, "Bye");
+
+        project
+            .set_delivery_format(Some(Delivery::new(1080, 1920, crate::engine::Fit::Cover)))
+            .unwrap();
+        let vertical = project.timeline().unwrap().svg_overlay(o.id).unwrap().clone();
+        assert!(vertical.svg.contains("viewBox=\"0 0 1080 1920\""), "{}", vertical.svg);
+        project.set_delivery_format(None).unwrap();
+        assert_eq!(project.timeline().unwrap().svg_overlay(o.id).unwrap().svg, reworded.svg);
+
+        project
+            .set_delivery_format(Some(Delivery::new(1080, 1080, crate::engine::Fit::Cover)))
+            .unwrap();
+        let square = project
+            .add_svg_overlay(SvgSource::Preset(preset), 0.0, None, svg_layout())
+            .unwrap()
+            .overlay;
+        assert!(
+            square.svg.contains("viewBox=\"0 0 1080 1080\""),
+            "a new preset is drawn for the delivery frame"
+        );
+
+        let custom = project
+            .update_svg_overlay(
+                o.id,
+                SvgOverlayPatch {
+                    svg: Some(svg_fixture("2s")),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .overlay;
+        assert!(custom.preset.is_none(), "replacing the artwork converts it to custom");
+        assert!(matches!(
+            project.update_svg_overlay(
+                o.id,
+                SvgOverlayPatch {
+                    preset_params: Some(SvgPresetParams::new("x")),
+                    ..Default::default()
+                }
+            ),
+            Err(Error::InvalidArgument(_))
+        ));
+        project
+            .set_delivery_format(Some(Delivery::new(1080, 1920, crate::engine::Fit::Cover)))
+            .unwrap();
+        assert_eq!(
+            project.timeline().unwrap().svg_overlay(o.id).unwrap().svg,
+            custom.svg,
+            "custom artwork is never re-made"
+        );
+    }
+
+    #[test]
+    fn preset_params_are_checked_on_add_and_update() {
+        use crate::model::SvgPresetKind;
+        let project = Project::open_in_memory().unwrap();
+        let bad = |params: SvgPresetParams| {
+            SvgSource::Preset(SvgPreset {
+                kind: SvgPresetKind::Typewriter,
+                params,
+            })
+        };
+        for params in [
+            SvgPresetParams::new("  "),
+            SvgPresetParams {
+                color: "nope".into(),
+                ..SvgPresetParams::new("x")
+            },
+            SvgPresetParams::new("x".repeat(201)),
+        ] {
+            assert!(matches!(
+                project.add_svg_overlay(bad(params), 0.0, None, svg_layout()),
+                Err(Error::InvalidArgument(_))
+            ));
+        }
+        let o = project
+            .add_svg_overlay(bad(SvgPresetParams::new("ok")), 0.0, None, svg_layout())
+            .unwrap()
+            .overlay;
+        let r = project.update_svg_overlay(
+            o.id,
+            SvgOverlayPatch {
+                preset_params: Some(SvgPresetParams::new("")),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(r, Err(Error::InvalidArgument(_))));
+        assert!(project.timeline().unwrap().svg_overlays.len() == 1);
+    }
+
+    #[test]
+    fn svg_overlay_edits_stage_for_an_agent() {
+        let project = agent_project();
+        let revisions = project.history().unwrap().len();
+        project.begin_staging(None, None).unwrap();
+        let added = project
+            .add_svg_overlay(
+                SvgSource::Custom(svg_fixture("3s")),
+                1.0,
+                Some(5.0),
+                SvgLayout {
+                    name: Some("Logo".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .overlay;
+        assert!(
+            project.timeline().unwrap().svg_overlays.is_empty(),
+            "the live cut has not moved"
+        );
+        assert_eq!(
+            project.working_timeline().unwrap().svg_overlays.len(),
+            1,
+            "the agent sees its work"
+        );
+        let staged = project.staged().unwrap().unwrap();
+        let entry = staged
+            .diff
+            .entries
+            .iter()
+            .find(|e| e.kind == DiffKind::OverlayAdded)
+            .expect("the diff names it");
+        assert_eq!(entry.overlay_id, Some(added.id));
+        assert_eq!(entry.summary, "Added animated title “Logo” at 0:01.0–0:05.0");
+
+        project
+            .update_svg_overlay(
+                added.id,
+                SvgOverlayPatch {
+                    end: Some(6.0),
+                    opacity: Some(0.5),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let entries = project.staged().unwrap().unwrap().diff.entries;
+        assert_eq!(
+            entries.iter().filter(|e| e.overlay_id == Some(added.id)).count(),
+            1,
+            "still one entry for it"
+        );
+        assert_eq!(project.history().unwrap().len(), revisions);
+
+        let landed = project.apply_staged(false).unwrap();
+        assert_eq!(landed.svg_overlays.len(), 1);
+        assert_eq!((landed.svg_overlays[0].end, landed.svg_overlays[0].opacity), (6.0, 0.5));
+        assert_eq!(project.timeline().unwrap().svg_overlays, landed.svg_overlays);
+        let history = project.history().unwrap();
+        assert_eq!(history.len(), revisions + 1);
+        assert_eq!(history.last().unwrap().source, EditSource::Agent);
+    }
+
+    #[test]
+    fn an_animated_title_is_not_text_for_the_platform_check() {
+        let project = Project::open_in_memory().unwrap();
+        project
+            .add_svg_overlay(SvgSource::Custom(svg_fixture("3s")), 0.0, None, svg_layout())
+            .unwrap();
+        let summary = project.cut_summary_in(Some((1920, 1080)), None).unwrap();
+        assert!(!summary.has_text, "has_text stays about drawtext overlays");
+        project.add_overlay("Title".into(), 0.0, 2.0).unwrap();
+        assert!(project.cut_summary_in(Some((1920, 1080)), None).unwrap().has_text);
+    }
+
+    #[test]
+    fn svg_overlays_survive_undo_redo_and_a_save_and_reload() {
+        let project = Project::open_in_memory().unwrap();
+        let o = project
+            .add_svg_overlay(SvgSource::Custom(svg_fixture("3s")), 0.0, None, svg_layout())
+            .unwrap()
+            .overlay;
+        project.remove_svg_overlay(o.id).unwrap();
+        project.undo().unwrap();
+        assert_eq!(project.timeline().unwrap().svg_overlays, vec![o.clone()]);
+        project.undo().unwrap();
+        assert!(project.timeline().unwrap().svg_overlays.is_empty());
+        project.redo().unwrap();
+        assert_eq!(project.timeline().unwrap().svg_overlays, vec![o]);
+
+        let dir = std::env::temp_dir().join(format!("kerf-svg-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("svg.kerf");
+        let file = Project::open(&path).unwrap();
+        let saved = file
+            .add_svg_overlay(SvgSource::Custom(svg_fixture("3s")), 0.5, None, svg_layout())
+            .unwrap()
+            .overlay;
+        drop(file);
+        let reopened = Project::open(&path).unwrap();
+        assert_eq!(reopened.timeline().unwrap().svg_overlays, vec![saved]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

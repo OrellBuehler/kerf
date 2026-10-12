@@ -1399,6 +1399,7 @@ fn probe_composite_red(ffmpeg: &str, ffprobe: &str, tag_bt709: bool, deadline: I
             ..crate::model::Track::new(StreamKind::Video, "V1")
         }],
         overlays: Vec::new(),
+        svg_overlays: Vec::new(),
         markers: Vec::new(),
         format: None,
         master: Default::default(),
@@ -10401,6 +10402,7 @@ mod tests {
         let timeline = Timeline {
             tracks: Vec::new(),
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -16708,6 +16710,7 @@ mod tests {
                     ..crate::model::Track::new(StreamKind::Video, "V1")
                 }],
                 overlays: Vec::new(),
+                svg_overlays: Vec::new(),
                 markers: Vec::new(),
                 format: None,
                 master: Default::default(),

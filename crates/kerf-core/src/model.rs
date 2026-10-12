@@ -1970,6 +1970,177 @@ impl TextOverlay {
     }
 }
 
+/// Most animated SVG overlays one timeline holds.
+pub const MAX_SVG_OVERLAYS: usize = 50;
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
+}
+
+fn white_hex() -> String {
+    "#ffffff".to_string()
+}
+
+fn accent_hex() -> String {
+    "#ffb000".to_string()
+}
+
+/// The ready-made animated titles; each is generated as SVG with SMIL, so a preset overlay is an
+/// ordinary SVG overlay that remembers how it was made (and is re-made when its timing or frame
+/// changes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SvgPresetKind {
+    FadeUp,
+    Typewriter,
+    LowerThird,
+    WordPop,
+}
+
+impl SvgPresetKind {
+    pub const ALL: [SvgPresetKind; 4] = [Self::FadeUp, Self::Typewriter, Self::LowerThird, Self::WordPop];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FadeUp => "fade_up",
+            Self::Typewriter => "typewriter",
+            Self::LowerThird => "lower_third",
+            Self::WordPop => "word_pop",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FadeUp => "Fade up",
+            Self::Typewriter => "Typewriter",
+            Self::LowerThird => "Lower third",
+            Self::WordPop => "Word pop",
+        }
+    }
+}
+
+/// What a preset is filled with.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SvgPresetParams {
+    pub text: String,
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    /// Any SVG colour (`#ffffff`, `white`, `rgb(...)`).
+    #[serde(default = "white_hex")]
+    pub color: String,
+    #[serde(default = "accent_hex")]
+    pub accent: String,
+    /// A font family; `None` is the font Kerf ships.
+    #[serde(default)]
+    pub font: Option<String>,
+}
+
+impl SvgPresetParams {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            subtitle: None,
+            color: white_hex(),
+            accent: accent_hex(),
+            font: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SvgPreset {
+    pub kind: SvgPresetKind,
+    pub params: SvgPresetParams,
+}
+
+/// An animated SVG title on the timeline: SMIL-animated vector artwork, drawn over the picture
+/// (above clips, below text overlays) between `start` and `end`. `svg` is the **sanitised** source
+/// (what is stored is what is rendered; see [`crate::svg`]). It is fit "contain", centred, into the
+/// rectangle `x, y, width, height` (fractions of the frame, top-left origin).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SvgOverlay {
+    pub id: Uuid,
+    #[serde(default)]
+    pub name: String,
+    pub svg: String,
+    pub start: f64,
+    pub end: f64,
+    #[serde(default)]
+    pub x: f64,
+    #[serde(default)]
+    pub y: f64,
+    #[serde(default = "one")]
+    pub width: f64,
+    #[serde(default = "one")]
+    pub height: f64,
+    #[serde(default = "one")]
+    pub opacity: f64,
+    /// Seconds of the document's own clock already elapsed at `start`: a slice or range export that
+    /// cuts into the overlay starts it part-way through its animation instead of replaying it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub offset: f64,
+    /// How the SVG was made when it came from a preset; `None` for custom artwork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<SvgPreset>,
+}
+
+impl SvgOverlay {
+    /// The overlay's own clock at timeline time `t`.
+    pub fn doc_time(&self, t: f64) -> f64 {
+        (t - self.start).max(0.0) + self.offset
+    }
+
+    /// How long the document is meant to run: the visible span plus what a slice cut off the front.
+    pub fn doc_duration(&self) -> f64 {
+        (self.end - self.start).max(0.0) + self.offset
+    }
+
+    /// A name to show: the given one, else the preset's text, else a placeholder.
+    pub fn display_name(&self) -> String {
+        if !self.name.trim().is_empty() {
+            self.name.trim().to_string()
+        } else if let Some(p) = &self.preset {
+            p.params.text.clone()
+        } else {
+            "SVG".to_string()
+        }
+    }
+
+    /// Re-make a preset's artwork for `frame` and the current length. Custom artwork is untouched.
+    pub fn regenerate(&mut self, frame: (u32, u32)) {
+        if let Some(p) = &self.preset {
+            self.svg = crate::svg::render_preset(p.kind, &p.params, self.doc_duration(), frame);
+        }
+    }
+}
+
+/// Fields of an [`SvgOverlay`] to change; `None` leaves one alone. `svg` replaces the artwork with
+/// custom source (and so drops the preset); `preset_params` re-fills a preset overlay (the two are
+/// exclusive).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SvgOverlayPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_params: Option<SvgPresetParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f64>,
+}
+
 /// Linearly interpolate a channel of `(time, value)` keyframes at `at`, holding
 /// the end values flat beyond the first / last keyframe. Empty input → `None`.
 pub fn interpolate(points: &[(f64, f64)], at: f64) -> Option<f64> {
@@ -3843,6 +4014,10 @@ pub struct Timeline {
     pub tracks: Vec<Track>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overlays: Vec<TextOverlay>,
+    /// Animated SVG titles, drawn above the clips and below `overlays` (so captions stay on top), in
+    /// list order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub svg_overlays: Vec<SvgOverlay>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub markers: Vec<Marker>,
     /// The frame this cut is being made for. `None` (the default, and every
@@ -3868,6 +4043,7 @@ impl Timeline {
         Self {
             tracks: vec![Track::new(StreamKind::Video, "V1"), Track::new(StreamKind::Audio, "A1")],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: MasterBus::default(),
@@ -3876,6 +4052,23 @@ impl Timeline {
 
     pub fn overlay(&self, id: Uuid) -> Option<&TextOverlay> {
         self.overlays.iter().find(|o| o.id == id)
+    }
+
+    pub fn svg_overlay(&self, id: Uuid) -> Option<&SvgOverlay> {
+        self.svg_overlays.iter().find(|o| o.id == id)
+    }
+
+    /// The frame preset artwork is drawn for: the delivery format, else full HD.
+    pub fn preset_frame(&self) -> (u32, u32) {
+        self.format.map_or(crate::svg::DEFAULT_FRAME, |f| (f.width, f.height))
+    }
+
+    /// Re-make every preset overlay's artwork for `frame` (the delivery frame changed) and the
+    /// length it now has.
+    pub fn regenerate_svg_presets(&mut self, frame: (u32, u32)) {
+        for o in &mut self.svg_overlays {
+            o.regenerate(frame);
+        }
     }
 
     pub fn track(&self, id: Uuid) -> Option<&Track> {
@@ -3998,6 +4191,7 @@ impl Timeline {
                 })
                 .collect(),
             overlays: self.overlays.clone(),
+            svg_overlays: self.svg_overlays.clone(),
             markers: self.markers.clone(),
             format: self.format,
             master: self.master,
@@ -4053,6 +4247,19 @@ impl Timeline {
                     o
                 })
                 .collect(),
+            // Preset artwork is drawn for a frame (its viewBox is the frame), so it is re-made for
+            // the new shape; custom artwork is the author's and is only ever scaled.
+            svg_overlays: self
+                .svg_overlays
+                .iter()
+                .map(|o| {
+                    let mut o = o.clone();
+                    if !same_shape {
+                        o.regenerate((delivery.width, delivery.height));
+                    }
+                    o
+                })
+                .collect(),
             markers: self.markers.clone(),
             format: Some(delivery),
             // The same mix at every frame: a variant changes the picture only.
@@ -4081,6 +4288,7 @@ impl Timeline {
         let mut out = Timeline {
             tracks: Vec::with_capacity(self.tracks.len()),
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             // Markers inside the window come along, shifted like everything else;
             // without this a range export would desync every one of them.
             markers: self
@@ -4160,6 +4368,18 @@ impl Timeline {
             ov.start = (o.start - start).max(0.0);
             ov.end = (o.end.min(end) - start).max(ov.start);
             out.overlays.push(ov);
+        }
+        for o in &self.svg_overlays {
+            if o.end <= start || o.start >= end {
+                continue;
+            }
+            let mut ov = o.clone();
+            // The animation is not replayed from its first frame: the part that was cut off the
+            // front has already elapsed on the document's clock.
+            ov.offset += (start - o.start).max(0.0);
+            ov.start = (o.start - start).max(0.0);
+            ov.end = (o.end.min(end) - start).max(ov.start);
+            out.svg_overlays.push(ov);
         }
         out
     }
@@ -5735,6 +5955,64 @@ fn overlay_changes(before: &TextOverlay, after: &TextOverlay) -> Option<String> 
     joined(parts)
 }
 
+fn svg_overlay_changes(before: &SvgOverlay, after: &SvgOverlay) -> Option<String> {
+    let mut parts = Vec::new();
+    if before.name != after.name {
+        parts.push(format!("name “{}” → “{}”", before.name, after.name));
+    }
+    match (&before.preset, &after.preset) {
+        (Some(a), Some(b)) => {
+            if a.kind != b.kind {
+                parts.push(format!("style {} → {}", a.kind.label(), b.kind.label()));
+            }
+            if a.params.text != b.params.text {
+                parts.push(format!("text “{}” → “{}”", a.params.text, b.params.text));
+            }
+            if a.params != b.params && a.params.text == b.params.text {
+                parts.push("preset look changed".to_string());
+            }
+        }
+        (Some(_), None) => parts.push("converted to custom SVG".to_string()),
+        (None, Some(_)) => parts.push("replaced by a preset".to_string()),
+        (None, None) => {
+            if before.svg != after.svg {
+                parts.push("artwork changed".to_string());
+            }
+        }
+    }
+    if num_changed(before.start, after.start) || num_changed(before.end, after.end) {
+        parts.push(format!(
+            "timing {}–{} → {}–{}",
+            fmt_time(before.start),
+            fmt_time(before.end),
+            fmt_time(after.start),
+            fmt_time(after.end)
+        ));
+    }
+    if [
+        (before.x, after.x),
+        (before.y, after.y),
+        (before.width, after.width),
+        (before.height, after.height),
+    ]
+    .iter()
+    .any(|(a, b)| num_changed(*a, *b))
+    {
+        parts.push(format!(
+            "placement {:.2},{:.2} {:.2}x{:.2} → {:.2},{:.2} {:.2}x{:.2}",
+            before.x, before.y, before.width, before.height, after.x, after.y, after.width, after.height
+        ));
+    }
+    if num_changed(before.opacity, after.opacity) {
+        parts.push(format!(
+            "opacity {:.0}% → {:.0}%",
+            before.opacity * 100.0,
+            after.opacity * 100.0
+        ));
+    }
+    joined(parts)
+}
+
 /// What differs between two master buses, phrased like the track strip's
 /// (`level 100% → 70%`), or `None` when the mix would come out the same. The
 /// ceiling only counts while the limiter is on afterwards — a stored ceiling
@@ -6006,6 +6284,53 @@ impl Timeline {
                     DiffEntry::new(
                         DiffKind::OverlayRemoved,
                         format!("Removed text “{}” at {}", overlay.text, fmt_time(overlay.start)),
+                    )
+                    .on_overlay(overlay.id)
+                    .at(overlay.start),
+                );
+            }
+        }
+
+        for overlay in &after.svg_overlays {
+            match self.svg_overlay(overlay.id) {
+                None => rest.push(
+                    DiffEntry::new(
+                        DiffKind::OverlayAdded,
+                        format!(
+                            "Added animated title “{}” at {}–{}",
+                            overlay.display_name(),
+                            fmt_time(overlay.start),
+                            fmt_time(overlay.end)
+                        ),
+                    )
+                    .on_overlay(overlay.id)
+                    .at(overlay.start),
+                ),
+                Some(before) => {
+                    if let Some(detail) = svg_overlay_changes(before, overlay) {
+                        rest.push(
+                            DiffEntry::new(
+                                DiffKind::OverlayChanged,
+                                format!("Changed animated title “{}”", overlay.display_name()),
+                            )
+                            .detail(detail)
+                            .on_overlay(overlay.id)
+                            .at(overlay.start),
+                        );
+                    }
+                }
+            }
+        }
+        for overlay in &self.svg_overlays {
+            if after.svg_overlay(overlay.id).is_none() {
+                rest.push(
+                    DiffEntry::new(
+                        DiffKind::OverlayRemoved,
+                        format!(
+                            "Removed animated title “{}” at {}",
+                            overlay.display_name(),
+                            fmt_time(overlay.start)
+                        ),
                     )
                     .on_overlay(overlay.id)
                     .at(overlay.start),
@@ -6453,6 +6778,7 @@ mod tests {
                 },
             ],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -6479,6 +6805,7 @@ mod tests {
                 track(StreamKind::Audio, "A1", vec![clip_at(0.0, 2.0)]),
             ],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -6499,6 +6826,7 @@ mod tests {
                 ..track(StreamKind::Audio, "A1", vec![clip_at(0.0, 2.0)])
             }],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -6556,6 +6884,7 @@ mod tests {
         let tl = Timeline {
             tracks: vec![track(StreamKind::Video, "V1", vec![clip])],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: Some(Delivery::new(1080, 1920, Fit::Cover)),
             master: Default::default(),
@@ -6591,6 +6920,7 @@ mod tests {
         let tl = Timeline {
             tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 2.0)])],
             overlays: vec![caption, title],
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: Some(Delivery::new(1920, 1080, Fit::Contain)),
             master: Default::default(),
@@ -6610,6 +6940,7 @@ mod tests {
         let before = Timeline {
             tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 2.0)])],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -6632,6 +6963,7 @@ mod tests {
                 track(StreamKind::Audio, "A1", vec![clip_at(0.0, 3.0)]),
             ],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -6803,6 +7135,7 @@ mod tests {
             let tl = Timeline {
                 tracks: vec![track(StreamKind::Video, "V1", vec![original.clone()])],
                 overlays: Vec::new(),
+                svg_overlays: Vec::new(),
                 markers: Vec::new(),
                 format: None,
                 master: Default::default(),
@@ -6839,6 +7172,7 @@ mod tests {
             let tl = Timeline {
                 tracks: vec![track(StreamKind::Video, "V1", vec![original.clone()])],
                 overlays: Vec::new(),
+                svg_overlays: Vec::new(),
                 markers: Vec::new(),
                 format: None,
                 master: Default::default(),
@@ -7043,6 +7377,7 @@ mod tests {
         let tl = Timeline {
             tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 60.0)])],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -7067,6 +7402,7 @@ mod tests {
         let tl = Timeline {
             tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 20.0)])],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: vec![mk(1.0, "before"), mk(4.0, "inside"), mk(9.0, "after")],
             format: None,
             master: Default::default(),
@@ -7088,6 +7424,7 @@ mod tests {
                 ..track(StreamKind::Audio, "A1", vec![clip_at(0.0, 10.0)])
             }],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -7456,6 +7793,7 @@ mod tests {
         Timeline {
             tracks: vec![track],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -7898,6 +8236,7 @@ mod tests {
         let timeline = Timeline {
             tracks: vec![track],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -7921,6 +8260,7 @@ mod tests {
         let timeline = Timeline {
             tracks: vec![track],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -8061,6 +8401,7 @@ mod tests {
         let timeline = Timeline {
             tracks: vec![video, audio],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -10338,5 +10679,258 @@ mod tests {
         let mut rolled = t.clone();
         rolled.roll_edit(a, t.tracks[0].clips[1].id, 1.0, &footage(60.0)).unwrap();
         assert!(t.diff(&rolled).entries.iter().any(|e| e.summary.starts_with("Trimmed clip")));
+    }
+
+    // ---- animated SVG overlays ----------------------------------------------
+
+    fn svg_title(start: f64, end: f64) -> SvgOverlay {
+        SvgOverlay {
+            id: Uuid::new_v4(),
+            name: "Logo".to_string(),
+            svg: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"/>".to_string(),
+            start,
+            end,
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            opacity: 1.0,
+            offset: 0.0,
+            preset: None,
+        }
+    }
+
+    fn preset_title(start: f64, end: f64) -> SvgOverlay {
+        let mut o = svg_title(start, end);
+        o.name = String::new();
+        o.preset = Some(SvgPreset {
+            kind: SvgPresetKind::FadeUp,
+            params: SvgPresetParams::new("Hello"),
+        });
+        o.regenerate((1920, 1080));
+        o
+    }
+
+    #[test]
+    fn a_timeline_without_svg_overlays_serialises_as_it_always_did() {
+        let json = serde_json::to_string(&Timeline::new()).unwrap();
+        assert!(!json.contains("svg_overlays"), "{json}");
+        let old = r#"{"tracks":[]}"#;
+        let tl: Timeline = serde_json::from_str(old).unwrap();
+        assert!(tl.svg_overlays.is_empty());
+        assert_eq!(
+            serde_json::to_string(&tl).unwrap(),
+            old,
+            "an old project round-trips byte for byte"
+        );
+        let mut with = Timeline::new();
+        with.svg_overlays.push(svg_title(0.0, 2.0));
+        let back: Timeline = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(back.svg_overlays, with.svg_overlays);
+    }
+
+    #[test]
+    fn svg_overlay_json_defaults_and_omissions() {
+        let id = Uuid::new_v4();
+        let minimal = format!(r#"{{"id":"{id}","svg":"<svg/>","start":1.0,"end":2.5}}"#);
+        let o: SvgOverlay = serde_json::from_str(&minimal).unwrap();
+        assert_eq!(
+            (o.x, o.y, o.width, o.height, o.opacity, o.offset, o.name.as_str()),
+            (0.0, 0.0, 1.0, 1.0, 1.0, 0.0, "")
+        );
+        assert!(o.preset.is_none());
+        let json = serde_json::to_value(&o).unwrap();
+        assert!(json.get("offset").is_none() && json.get("preset").is_none(), "{json}");
+        assert_eq!(json["width"], 1.0);
+        let sliced = SvgOverlay { offset: 1.5, ..o };
+        assert_eq!(serde_json::to_value(&sliced).unwrap()["offset"], 1.5);
+
+        let p: SvgPreset = serde_json::from_str(r#"{"kind":"lower_third","params":{"text":"Jane"}}"#).unwrap();
+        assert_eq!(p.kind, SvgPresetKind::LowerThird);
+        assert_eq!(
+            (
+                p.params.color.as_str(),
+                p.params.accent.as_str(),
+                p.params.subtitle.clone(),
+                p.params.font.clone()
+            ),
+            ("#ffffff", "#ffb000", None, None)
+        );
+        for kind in SvgPresetKind::ALL {
+            assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
+        }
+        let patch: SvgOverlayPatch = serde_json::from_str(r#"{"opacity":0.5}"#).unwrap();
+        assert_eq!(
+            patch,
+            SvgOverlayPatch {
+                opacity: Some(0.5),
+                ..Default::default()
+            }
+        );
+        assert_eq!(serde_json::to_string(&SvgOverlayPatch::default()).unwrap(), "{}");
+    }
+
+    #[test]
+    fn svg_overlay_clock_and_names() {
+        let mut o = svg_title(2.0, 6.0);
+        assert_eq!(
+            (o.doc_time(1.0), o.doc_time(2.0), o.doc_time(3.5), o.doc_duration()),
+            (0.0, 0.0, 1.5, 4.0)
+        );
+        o.offset = 1.0;
+        assert_eq!((o.doc_time(3.5), o.doc_duration()), (2.5, 5.0));
+        assert_eq!(o.display_name(), "Logo");
+        assert_eq!(preset_title(0.0, 3.0).display_name(), "Hello");
+        let mut anon = svg_title(0.0, 1.0);
+        anon.name = "  ".to_string();
+        assert_eq!(anon.display_name(), "SVG");
+    }
+
+    #[test]
+    fn slice_clips_and_shifts_svg_overlays_and_keeps_their_clock() {
+        let mut tl = Timeline::new();
+        tl.svg_overlays = vec![
+            svg_title(2.0, 8.0),
+            svg_title(0.0, 3.0),
+            svg_title(9.0, 12.0),
+            svg_title(5.0, 6.0),
+        ];
+        let ids: Vec<Uuid> = tl.svg_overlays.iter().map(|o| o.id).collect();
+        let s = tl.slice(4.0, 10.0);
+        let got: Vec<(Uuid, f64, f64, f64)> = s.svg_overlays.iter().map(|o| (o.id, o.start, o.end, o.offset)).collect();
+        assert_eq!(
+            got,
+            vec![(ids[0], 0.0, 4.0, 2.0), (ids[2], 5.0, 6.0, 0.0), (ids[3], 1.0, 2.0, 0.0),],
+            "cut at the front, clipped at the back, shifted; one wholly before is gone"
+        );
+        assert!(tl.slice(20.0, 30.0).svg_overlays.is_empty());
+        assert!(tl.slice(0.0, 2.0).svg_overlays.iter().all(|o| o.offset == 0.0));
+        // slicing a slice keeps counting from the document's start
+        let again = s.slice(1.0, 3.0);
+        let first = &again.svg_overlays[0];
+        assert_eq!((first.id, first.start, first.end, first.offset), (ids[0], 0.0, 2.0, 3.0));
+        assert_eq!(
+            first.doc_time(first.start),
+            3.0,
+            "the animation is already 3 s in where the cut begins"
+        );
+        // the whole span keeps its offset untouched
+        let whole = tl.slice(0.0, 100.0);
+        assert!(whole.svg_overlays.iter().all(|o| o.offset == 0.0));
+        assert_eq!(whole.svg_overlays.len(), 4);
+    }
+
+    #[test]
+    fn for_render_keeps_svg_overlays_and_ripple_never_moves_them() {
+        let (mut before, [a, ..]) = gapped();
+        before.svg_overlays.push(svg_title(6.0, 9.0));
+        assert_eq!(before.for_render().svg_overlays, before.svg_overlays);
+        let (_, out) = rippled(&before, |t| clip_mut(t, a).source_out = 3.0);
+        assert_eq!((out.svg_overlays[0].start, out.svg_overlays[0].end), (6.0, 9.0));
+        assert_eq!(spans_of(&out, 0)[1], (4.0, 7.0), "while the clips did move");
+    }
+
+    #[test]
+    fn for_delivery_remakes_presets_for_a_new_shape_and_leaves_custom_art_alone() {
+        let mut tl = Timeline::new();
+        let custom = svg_title(0.0, 4.0);
+        let preset = preset_title(0.0, 4.0);
+        tl.svg_overlays = vec![custom.clone(), preset.clone()];
+        let vertical = tl.for_delivery(Delivery::new(1080, 1920, Fit::Cover));
+        assert_eq!(vertical.svg_overlays[0], custom, "custom artwork is only ever scaled");
+        assert!(vertical.svg_overlays[1].svg.contains("viewBox=\"0 0 1080 1920\""));
+        assert_ne!(vertical.svg_overlays[1].svg, preset.svg);
+        assert_eq!(vertical.svg_overlays[1].preset, preset.preset);
+        assert_eq!(tl.svg_overlays[1], preset, "the cut itself is not touched");
+
+        tl.format = Some(Delivery::new(1920, 1080, Fit::Contain));
+        let same = tl.for_delivery(Delivery::new(1280, 720, Fit::Contain));
+        assert_eq!(
+            same.svg_overlays, tl.svg_overlays,
+            "the same shape at another size changes only the size"
+        );
+        let square = tl.for_delivery(Delivery::new(1080, 1080, Fit::Cover));
+        assert!(square.svg_overlays[1].svg.contains("viewBox=\"0 0 1080 1080\""));
+
+        let mut cut = Timeline::new();
+        let mut sliced = preset_title(0.0, 4.0);
+        sliced.offset = 1.0;
+        cut.svg_overlays = vec![sliced];
+        let remade = cut.for_delivery(Delivery::new(1080, 1920, Fit::Cover)).svg_overlays.remove(0);
+        assert!(
+            remade.svg.contains("begin=\"4.6s\""),
+            "the preset is re-made for its whole document: {}",
+            remade.svg
+        );
+    }
+
+    #[test]
+    fn diff_names_animated_titles_added_changed_and_removed() {
+        let mut before = Timeline::new();
+        let kept = svg_title(0.0, 2.0);
+        let gone = preset_title(5.0, 7.0);
+        before.svg_overlays = vec![kept.clone(), gone.clone()];
+
+        let mut after = before.clone();
+        let mut moved = kept.clone();
+        moved.start = 0.5;
+        moved.x = 0.25;
+        moved.opacity = 0.5;
+        let fresh = svg_title(1.0, 5.0);
+        after.svg_overlays = vec![moved, fresh.clone()];
+
+        let diff = before.diff(&after);
+        let by = |kind: DiffKind| diff.entries.iter().find(|e| e.kind == kind).unwrap();
+        let added = by(DiffKind::OverlayAdded);
+        assert_eq!(added.summary, "Added animated title “Logo” at 0:01.0–0:05.0");
+        assert_eq!((added.overlay_id, added.at), (Some(fresh.id), Some(1.0)));
+        let changed = by(DiffKind::OverlayChanged);
+        assert_eq!(changed.summary, "Changed animated title “Logo”");
+        assert_eq!(changed.overlay_id, Some(kept.id));
+        let detail = changed.detail.as_deref().unwrap();
+        assert!(detail.contains("timing 0:00.0–0:02.0 → 0:00.5–0:02.0"), "{detail}");
+        assert!(
+            detail.contains("placement 0.00,0.00 1.00x1.00 → 0.25,0.00 1.00x1.00"),
+            "{detail}"
+        );
+        assert!(detail.contains("opacity 100% → 50%"), "{detail}");
+        let removed = by(DiffKind::OverlayRemoved);
+        assert_eq!(removed.summary, "Removed animated title “Hello” at 0:05.0");
+        assert_eq!(removed.overlay_id, Some(gone.id));
+        assert_eq!(diff.entries.len(), 3);
+        assert!(before.diff(&before).is_empty());
+    }
+
+    #[test]
+    fn diff_reads_a_preset_retime_as_timing_and_a_conversion_as_a_conversion() {
+        let mut before = Timeline::new();
+        let p = preset_title(0.0, 4.0);
+        before.svg_overlays = vec![p];
+        let mut after = before.clone();
+        after.svg_overlays[0].end = 8.0;
+        after.svg_overlays[0].regenerate((1920, 1080));
+        let detail = before.diff(&after).entries[0].detail.clone().unwrap();
+        assert_eq!(
+            detail, "timing 0:00.0–0:04.0 → 0:00.0–0:08.0",
+            "the re-made artwork is not a separate change"
+        );
+
+        let mut reworded = before.clone();
+        reworded.svg_overlays[0].preset.as_mut().unwrap().params.text = "Bye".to_string();
+        let detail = before.diff(&reworded).entries[0].detail.clone().unwrap();
+        assert_eq!(detail, "text “Hello” → “Bye”");
+
+        let mut custom = before.clone();
+        custom.svg_overlays[0].preset = None;
+        assert_eq!(
+            before.diff(&custom).entries[0].detail.as_deref(),
+            Some("converted to custom SVG")
+        );
+
+        let mut edited = Timeline::new();
+        edited.svg_overlays = vec![svg_title(0.0, 1.0)];
+        let mut after = edited.clone();
+        after.svg_overlays[0].svg.push(' ');
+        assert_eq!(edited.diff(&after).entries[0].detail.as_deref(), Some("artwork changed"));
     }
 }

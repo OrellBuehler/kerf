@@ -336,3 +336,50 @@
   a full window makes the export's tail and fade-in cover the same samples (offset windows
   played both copies at full gain — +65 % peak in the Python prototype). An overrun with
   `fade_out` is cut at the target and faded over `FIT_FADE_S`.
+- **Animated SVG overlays** (`Timeline.svg_overlays: Vec<SvgOverlay>`, `svg/`, pure +
+  unit-tested; the engine side is a later work package). An overlay is SMIL-animated vector art
+  drawn between `start` and `end`, fit *contain* and centred into the rect `x, y, width, height`
+  (frame fractions), above the clips and below text overlays (list order; captions stay on
+  top). **`svg` stores the sanitised source, so stored == rendered**: `svg::sanitize` is an
+  allow-list run once on the way in — scripts, `foreignObject` / `iframe` / `audio` / `video`,
+  elements outside resvg's vocabulary, `on*` and foreign-namespace attributes, anything but
+  `#fragment` links (an `<image>` may carry `data:image/png|jpeg|gif|webp`), external `url()`,
+  `@import`, `@keyframes` and `animation*` / `transition*` (warning "CSS animations are not
+  rendered — use SMIL"); a plain DOCTYPE is cut, one with an internal subset is refused; caps
+  128 KiB, 20,000 elements, depth 64, 2,000 animations, 1,000 values each, `MAX_SVG_OVERLAYS` =
+  50 a timeline. **It is a splice, not a re-serialisation** (byte ranges of the original, so the
+  second pass over its own output changes nothing — a test sweeps nasty inputs for exactly
+  that). **`SvgDoc::parse` + `SvgDoc::at(doc_t)`** are the evaluator: the document is read once
+  (roxmltree, then a usvg parse to refuse what resvg cannot size — a `viewBox` or pixel
+  `width`/`height` is required, since resvg sizes a bare document to its content and an
+  animation would change that per frame; `<use>` / `feImage` expansion is counted from the XML
+  *first* — more than 100,000 drawn nodes, 128 levels or a reference cycle is refused, since usvg
+  expands a cycle to its million-node limit before it notices), and `at` returns a *static* SVG for one moment —
+  animation elements cut out, animated attributes spliced in — which is what every renderer is
+  handed, so a still, a stream and an export of the same moment are one picture. A CSS property
+  (`opacity`, `fill`, `visibility`…) is written by appending `;prop:value` to `style` (a rule in
+  `<style>` beats a presentation attribute, an inline declaration beats the rule); geometry is a
+  replaced / inserted attribute. **The subset**: `animate`, `animateColor`, `set`,
+  `animateTransform`; `begin` / `end` clock values, `id.begin|end ± offset` syncbases (resolved
+  once, memoised, 32 deep, a cycle is unresolved), `indefinite`; `dur`, `repeatCount` /
+  `repeatDur`, `min` / `max`, `fill`, `restart`, `values` / `from` / `to` / `by`, `keyTimes`,
+  `calcMode` linear / discrete / paced / spline (Newton + bisection), `additive`, `accumulate`
+  and the sandwich (begin time, then document order; a transform sum post-multiplies onto the
+  base transform). A frozen value is the last one when the active duration is an exact multiple
+  of `dur`, else the value at `AD mod dur`. Colours blend per sRGB channel, paths blend only on
+  one command sequence, mixed units and keywords step. **Anything else is a warning, never a
+  failure** (`SvgDoc::warnings` / `check_svg`): events, `repeat()`, `accessKey`, wallclock never
+  fire; `animateMotion`, `animate` on `transform`, animating `href` / `style` / `on*` are
+  dropped; a base value that comes from a `<style>` rule is not seen (the default is used).
+  `natural_duration` (all animations settled; `None` for a still or an endless loop) is what
+  `add_svg_overlay` defaults the end to, held to 2–30 s (else 4 s). **Presets** (`SvgPresetKind`
+  `fade_up` / `typewriter` / `lower_third` / `word_pop`, `svg::render_preset`) are only SVG the
+  subset understands, drawn for a viewBox equal to the delivery frame (`Timeline::preset_frame`:
+  `format`, else 1920x1080), blank and static at their duration. `SvgOverlay.preset` remembers
+  how they were made, and **the artwork is re-made** when the span changes length, the params
+  change, the delivery format changes (`set_delivery_format`) and in `for_delivery` for a new
+  shape (custom art is only scaled). `slice` clips and shifts like text but adds the cut-off
+  front to `offset` (`SvgOverlay::doc_time(t)` = `t - start + offset`), so a range export or the
+  playback hand-over joins the animation part-way instead of replaying it. Ripple never moves
+  overlays; the diff reuses `OverlayAdded` / `Changed` / `Removed` with `overlay_id`
+  ("Added animated title “X” at 0:01.0–0:04.0"); `CutSummary.has_text` stays text-only.

@@ -23,6 +23,7 @@ pub mod play_plan;
 pub mod project;
 pub mod proxy;
 pub mod render_plan;
+pub mod svg;
 
 mod engine;
 
@@ -69,10 +70,11 @@ pub use model::{
     CaptionTimeBase, Clip, ClipCut, ClipMove, Color, CropFrame, Delivery, DeltaRange, Detached, DetachedMany, DiffEntry,
     DiffKind, Easing, EditOutcome, EditSource, Framing, Keyframe, LevelReading, Levels, Marker, Mask, MaskShape, MasterBus,
     Projection, Property, PropertyKey, PropertyTrack, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap,
-    SkippedDetach, SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Subsampling, Task, TaskStatus, TextKeyframe,
-    TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TrackLevels, TranscriptSegment, Transform, Transition, TransitionKind,
-    VideoEffect, Voiceover, ADJACENT_EPS, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB,
-    MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_CHANNEL_VOLUME, MIN_EDIT_CLIP,
+    SkippedDetach, SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Subsampling, SvgOverlay, SvgOverlayPatch,
+    SvgPreset, SvgPresetKind, SvgPresetParams, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff,
+    Track, TrackLevels, TranscriptSegment, Transform, Transition, TransitionKind, VideoEffect, Voiceover, ADJACENT_EPS,
+    LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB,
+    MAX_CHANNEL_VOLUME, MAX_SVG_OVERLAYS, MIN_EDIT_CLIP,
 };
 pub use plan_caps::{DipWhy, EffectKinds, GpuCaps, LayerRef, Unsupported};
 pub use plan_epoch::{bump_plan_epoch, plan_epoch};
@@ -82,9 +84,13 @@ pub use platform::{
     TARGETS as PLATFORM_TARGETS,
 };
 pub use play_plan::{PlayAhead, PlayCut, PlayRefusal};
-pub use project::{FramingPlan, Project, SmartCropJob, SmartCropPlan, StemsPlaced, MAX_CHANNEL_KEYS, VOICEOVER_TRACK};
+pub use project::{
+    FramingPlan, Project, SmartCropJob, SmartCropPlan, StemsPlaced, SvgLayout, SvgOverlayResult, SvgSource, MAX_CHANNEL_KEYS,
+    VOICEOVER_TRACK,
+};
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use render_plan::{
     Animated, CompositeColorPolicy, FadeOp, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream,
     PlanText, PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_SHRINK, MIN_TEXT_PX,
 };
+pub use svg::{check_svg, render_preset, SvgCheck, SvgDoc, SvgPresetInfo, SvgPresetParamInfo, MAX_ANIMATIONS, MAX_VALUES};

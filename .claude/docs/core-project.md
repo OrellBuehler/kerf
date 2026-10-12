@@ -111,6 +111,19 @@
   imported ones) and, with a clip, lays each on a new audio track named after it at the
   clip's span/speed/gain and switches the clip's own sound off (audio clip disabled,
   picture `source_audio` off; a picture whose sound is on a linked clip is refused).
+  **Animated SVG titles** (`add_svg_overlay(SvgSource, start, end?, SvgLayout)`,
+  `update_svg_overlay(id, SvgOverlayPatch)`, `remove_svg_overlay(id)` — each one
+  `edit_timeline` revision, so an agent's stage; see `core-model.md` for the model).
+  `SvgSource` is `Custom(String)` (parsed through `SvgDoc::parse` *before* the edit closure, so a
+  bad document, a root that is not `<svg>`, no size or a cap exceeded is an `InvalidArgument` and
+  writes no revision) or `Preset(SvgPreset)` (`svg::check_params`, then generated inside the
+  closure for the *working* timeline's `preset_frame()`). Both return `SvgOverlayResult {overlay,
+  warnings}` (what the sanitiser / SMIL reader could not honour). The end defaults to the
+  document's `natural_duration` held to 2–30 s, else four seconds; placement is checked finite
+  and sane (`check_svg_rect`; opacity 0..=1); a 51st title is refused; `Error::SvgOverlayNotFound`.
+  An update's `svg` converts a preset to custom, its `preset_params` re-fills a preset (refused on
+  custom art), and **a preset is re-made whenever its length changes** — a move that keeps the
+  length keeps the artwork. `set_delivery_format` re-makes every preset for the new frame.
 - `analysis.rs` — transcription / scene / silence / rhythm are **pluggable traits**
   (`Transcriber`, `SceneDetector`, `SilenceDetector`, `RhythmAnalyzer`). Real impls
   now exist:
