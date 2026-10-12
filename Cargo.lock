@@ -2475,10 +2475,12 @@ name = "kerf-core"
 version = "0.24.0"
 dependencies = [
  "chrono",
+ "data-url",
  "dirs 7.0.0",
  "ffmpeg-next",
  "flate2",
  "fontdb",
+ "imagesize",
  "libc",
  "misaki-rs",
  "ort",

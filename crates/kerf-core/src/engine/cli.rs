@@ -4902,6 +4902,18 @@ struct PreviewCut {
     sliced: Timeline,
     opts: ExportOptions,
     fmt: ExportFormat,
+    /// The animated titles of the cut before it was sliced, how long that cut is, and the playhead
+    /// the slice starts at: a title's pictures are named for the title, not for the playhead.
+    titles: Vec<crate::model::SvgOverlay>,
+    total: f64,
+    start: f64,
+}
+
+impl PreviewCut {
+    /// The animated titles' pictures the stream reads (named, not drawn).
+    fn svg(&self) -> Vec<svg_layer::SvgSeq<'_>> {
+        svg_layer::stream_sequences(&self.titles, self.total, &self.sliced, self.start, &self.fmt)
+    }
 }
 
 fn preview_cut(
@@ -4944,19 +4956,38 @@ fn preview_cut(
         ..ExportOptions::default()
     };
     let fmt = export_format(&sliced, assets, &opts);
-    Ok(PreviewCut { sliced, opts, fmt })
+    Ok(PreviewCut {
+        sliced,
+        opts,
+        fmt,
+        titles: timeline.svg_overlays.clone(),
+        total: end,
+        start,
+    })
 }
 
 /// The argv that plays a [`PreviewCut`] as JPEGs on stdout.
 fn preview_args(cut: &PreviewCut, assets: &[Asset], quality: u8) -> Result<Vec<String>> {
-    let PreviewCut { sliced, opts, fmt } = cut;
+    let PreviewCut { sliced, opts, fmt, .. } = cut;
     let mut args: Vec<String> = ["-hide_banner", "-nostats", "-nostdin", "-loglevel", "error"]
         .iter()
         .map(|s| s.to_string())
         .collect();
     let plan = push_inputs(sliced, assets, fmt, opts, &mut args)?;
-    svg_layer::push_inputs(&svg_layer::svg_sequences(sliced, fmt), fmt, &mut args);
-    let graph = build_filter_complex(sliced, assets, fmt, sliced.duration(), opts, true, false, &plan);
+    let titles = cut.svg();
+    svg_layer::push_inputs(&titles, fmt, &mut args);
+    let graph = build_filter_complex_with(
+        sliced,
+        assets,
+        fmt,
+        sliced.duration(),
+        opts,
+        true,
+        false,
+        &plan,
+        false,
+        Some(&titles),
+    );
     args.push("-filter_complex".to_string());
     args.push(graph.filter);
     args.push("-map".to_string());
@@ -5008,6 +5039,22 @@ pub fn stream_preview_with(
     request: PlaybackRequest,
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
 ) -> Result<()> {
+    stream_preview_until(timeline, assets, start, request, &|| false, on_frame)
+}
+
+/// [`stream_preview_with`] that can be told to stop **before the first frame**: `cancel` is looked
+/// at while the animated titles' pictures are being drawn (about forty times a second, and between
+/// the steps that come before the drawing), which `on_frame` — called only once there are frames —
+/// cannot interrupt. A stream cancelled then ends with [`Error::Cancelled`]; one that has started
+/// is stopped by `on_frame` returning `false`, as ever.
+pub fn stream_preview_until(
+    timeline: &Timeline,
+    assets: &[Asset],
+    start: f64,
+    request: PlaybackRequest,
+    cancel: &dyn Fn() -> bool,
+    on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
+) -> Result<()> {
     let params = playback_params(timeline, assets, request);
     // Whether the run that was spawned asked any input for hardware decode: none of a proxy's
     // inputs do, and a failure of a run that did not is not the hardware's.
@@ -5015,7 +5062,7 @@ pub fn stream_preview_with(
     // `None` until ffmpeg is running: a timeline with nothing to play fails
     // before that, and says nothing about the hardware.
     let mut sent = None;
-    match stream_preview_once(timeline, assets, start, params, on_frame, &mut sent, &mut hw) {
+    match stream_preview_once(timeline, assets, start, params, cancel, on_frame, &mut sent, &mut hw) {
         // A hardware decode that dies before the first frame is `-hwaccel`
         // being unusable here, not the graph: a static ffmpeg aborts outright
         // when `auto` probes a VAAPI whose libva isn't installed. Once frames
@@ -5024,7 +5071,7 @@ pub fn stream_preview_with(
         Err(e) if hw && sent == Some(0) => {
             HWACCEL_OK.store(false, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!("hardware decode failed starting playback; using software decode: {e}");
-            stream_preview_once(timeline, assets, start, params, on_frame, &mut sent, &mut hw)
+            stream_preview_once(timeline, assets, start, params, cancel, on_frame, &mut sent, &mut hw)
         }
         r => r,
     }
@@ -5064,11 +5111,13 @@ const PREVIEW_TIMEOUTS: PreviewTimeouts = PreviewTimeouts {
     stall: std::time::Duration::from_secs(15),
 };
 
+#[allow(clippy::too_many_arguments)]
 fn stream_preview_once(
     timeline: &Timeline,
     assets: &[Asset],
     start: f64,
     params: PlaybackParams,
+    cancel: &dyn Fn() -> bool,
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
     sent: &mut Option<u64>,
     hw_used: &mut bool,
@@ -5077,7 +5126,7 @@ fn stream_preview_once(
     let cut = preview_cut(timeline, assets, start, fps, max_width, decode_hwaccel())?;
     // Animated titles are pictures on disk by now (a few seconds' work at most); held until the
     // stream is over so the cache cannot take them away mid-play.
-    let _titles = svg_layer::prepare_preview(&cut.sliced, &cut.fmt)?;
+    let _titles = svg_layer::prepare_preview(&cut.svg(), cancel)?;
     let mut args = preview_args(&cut, assets, PREVIEW_STREAM_QUALITY)?;
     // The composited graph outgrows argv just as the export's does.
     let _script = externalize_filter_complex(&mut args, "preview")?;
@@ -5292,6 +5341,8 @@ pub fn render_with_progress(
         ),
         ..opts.clone()
     };
+    // A request that would be refused anyway is refused before the titles are drawn.
+    export_preflight(timeline, assets, opts)?;
     // The animated titles are pictures on disk before any ffmpeg is spawned: drawn once for this
     // export — a second pass and the software retry read the same files — and kept until it is over.
     let Some(_titles) = svg_layer::prepare_export(timeline, assets, opts, progress, cancel)? else {
@@ -5590,16 +5641,11 @@ pub fn render_variants(
     Ok((RenderStatus::Completed, total))
 }
 
-/// One export run with `opts` exactly as given (no fallback).
-fn render_attempt(
-    timeline: &Timeline,
-    assets: &[Asset],
-    output: &Path,
-    opts: &ExportOptions,
-    progress: &mut dyn FnMut(ExportProgress),
-    cancel: &dyn Fn() -> bool,
-    hw_used: &std::cell::Cell<bool>,
-) -> Result<RenderStatus> {
+/// What an export is refused for before anything is drawn or spawned — an empty timeline, options
+/// that would export nothing or that the container cannot hold — and whether it has picture and
+/// sound. Asked ahead of the animated titles' drawing so a bad request does not spend seconds of the
+/// cores on pictures nobody will use.
+fn export_preflight(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Result<(bool, bool)> {
     if !timeline.tracks.iter().any(|t| !t.clips.is_empty()) {
         return Err(Error::InvalidArgument("timeline has no clips to export".to_string()));
     }
@@ -5617,6 +5663,20 @@ fn render_attempt(
     if !issues.is_empty() {
         return Err(Error::InvalidArgument(issues.join(" ")));
     }
+    Ok((has_video, has_audio))
+}
+
+/// One export run with `opts` exactly as given (no fallback).
+fn render_attempt(
+    timeline: &Timeline,
+    assets: &[Asset],
+    output: &Path,
+    opts: &ExportOptions,
+    progress: &mut dyn FnMut(ExportProgress),
+    cancel: &dyn Fn() -> bool,
+    hw_used: &std::cell::Cell<bool>,
+) -> Result<RenderStatus> {
+    let (has_video, _) = export_preflight(timeline, assets, opts)?;
 
     let output_str = output
         .to_str()
@@ -6122,6 +6182,26 @@ fn build_filter_complex_metered(
     plan: &InputPlan,
     meter: bool,
 ) -> FilterGraph {
+    build_filter_complex_with(timeline, assets, fmt, total, opts, want_video, want_audio, plan, meter, None)
+}
+
+/// [`build_filter_complex_metered`] with the animated titles' sequences given: the playback stream
+/// reads the ones named for a title, not for the playhead ([`svg_layer::stream_sequences`]), and the
+/// graph must index the very inputs its argv carries. `None` is the cut's own
+/// ([`svg_layer::svg_sequences`]).
+#[allow(clippy::too_many_arguments)]
+fn build_filter_complex_with(
+    timeline: &Timeline,
+    assets: &[Asset],
+    fmt: &ExportFormat,
+    total: f64,
+    opts: &ExportOptions,
+    want_video: bool,
+    want_audio: bool,
+    plan: &InputPlan,
+    meter: bool,
+    titles: Option<&[svg_layer::SvgSeq<'_>]>,
+) -> FilterGraph {
     let has_audio = |clip: &crate::model::Clip| clip_sounds(clip, assets);
     let is_image = |clip: &crate::model::Clip| assets.iter().find(|a| a.id == clip.asset_id).is_some_and(|a| a.is_image());
     let layout = fmt.channel_layout();
@@ -6229,7 +6309,14 @@ fn build_filter_complex_metered(
         let draw = !timeline.overlays.is_empty();
         // Animated titles: PNG sequences read as inputs after the clips'. They go over the whole
         // composite and under the text.
-        let svg = svg_layer::svg_sequences(timeline, fmt);
+        let own;
+        let svg: &[svg_layer::SvgSeq<'_>] = match titles {
+            Some(given) => given,
+            None => {
+                own = svg_layer::svg_sequences(timeline, fmt);
+                &own
+            }
+        };
         // The picture ends on `[outv]`, or on `vhw` when a VAAPI encoder's upload follows.
         let vaapi = uploads_to_vaapi(opts);
         let final_pad = if vaapi { "vhw" } else { "outv" };
@@ -6307,7 +6394,7 @@ fn build_filter_complex_metered(
             cur = out;
         }
         if !svg.is_empty() {
-            svg_layer::push_chains(&svg, n_inputs, composite_pad, after_svg, &mut chains);
+            svg_layer::push_chains(svg, n_inputs, composite_pad, after_svg, &mut chains);
         }
         // Text overlays (titles / lower-thirds / captions) drawn on the composited
         // picture in order; the last produces the gif source `vcomp` or `[outv]`.

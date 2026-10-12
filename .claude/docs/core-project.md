@@ -120,7 +120,9 @@
   Result<Option<SvgDoc>>` (exclusivity, params, finite times, the artwork parsed) then
   `Project::update_svg_overlay_parsed(id, patch, doc)` (a `doc` replaces the artwork and `patch.svg` is not
   parsed again; with `None` a `patch.svg` is still parsed, which is all `update_svg_overlay` is). The plain
-  methods are the check plus the parsed one, so they keep working but parse under whatever lock the caller holds.
+  `add_svg_overlay` / `update_svg_overlay` are the check plus the parsed one and are `#[cfg(test)]`: no surface may
+  parse under the lock, and none does (`lib.rs` and `mcp.rs` call the `_parsed` pair). `start` and `end` are held
+  to `MAX_SVG_SECONDS` (24 h) on add and update (`check_svg_span`; `SvgOverlayPatch::check_cheap` refuses it before the lock).
   `SvgSource` is `Custom(String)` (parsed through `SvgDoc::parse` *before* the edit closure, so a
   bad document, a root that is not `<svg>`, no size or a cap exceeded is an `InvalidArgument` and
   writes no revision) or `Preset(SvgPreset)` (`svg::check_params`, then generated inside the

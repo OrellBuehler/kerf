@@ -337,13 +337,14 @@
   played both copies at full gain — +65 % peak in the Python prototype). An overrun with
   `fade_out` is cut at the target and faded over `FIT_FADE_S`.
 - **Animated SVG overlays** (`Timeline.svg_overlays: Vec<SvgOverlay>`, `svg/`, pure +
-  unit-tested; the engine side is a later work package). An overlay is SMIL-animated vector art
+  unit-tested; the engine side is `engine-cli.md`). An overlay is SMIL-animated vector art
   drawn between `start` and `end`, fit *contain* and centred into the rect `x, y, width, height`
   (frame fractions), above the clips and below text overlays (list order; captions stay on
   top). **`svg` stores the sanitised source, so stored == rendered**: `svg::sanitize` is an
   allow-list run once on the way in — scripts, `foreignObject` / `iframe` / `audio` / `video`,
   elements outside resvg's vocabulary, `on*` and foreign-namespace attributes, anything but
-  `#fragment` links (an `<image>` may carry `data:image/png|jpeg|gif|webp`), external `url()`,
+  `#fragment` links (an `<image>` may carry `data:image/png|jpeg|gif|webp`, **whose header says at most 16 Mpx** — the
+  decoder allocates what the header claims — else its `href` is cut with a warning; `svg/images.rs`), external `url()`,
   `@import`, `@keyframes` and `animation*` / `transition*` (warning "CSS animations are not
   rendered — use SMIL"); a plain DOCTYPE is cut, one with an internal subset is refused; caps
   128 KiB, 20,000 elements, depth 64, 2,000 animations, 1,000 values each, `MAX_SVG_OVERLAYS` =
@@ -363,7 +364,10 @@
   *first* — more than 100,000 drawn nodes, 128 levels or a reference cycle is refused, since usvg
   expands a cycle to its million-node limit before it notices; the target of a `use` is its unprefixed
   `href`, else `xlink:href`, as resvg's, and a `url(#id)` in `fill` / `stroke` / `mask` / `clip-path` /
-  `filter` / `marker-*` (attribute or `style`) counts the target again for every element that draws it), and `at` returns a *static* SVG for one moment —
+  `filter` / `marker-*` (attribute or `style`) counts the target again for every element that draws it; a `pattern` /
+  gradient / `filter` `href` is followed too, and `<image>` pixels are summed the same way — more than 64 Mpx decoded in a frame,
+  each `<use>` of an image decoding it again, is refused — and `SvgDoc::widest_image_pixels` is what a frame's decode must hold),
+  and `at` returns a *static* SVG for one moment —
   animation elements cut out, animated attributes spliced in — which is what every renderer is
   handed, so a still, a stream and an export of the same moment are one picture. A CSS property
   (`opacity`, `fill`, `visibility`…) is written by appending `;prop:value` to `style` (a rule in
@@ -384,8 +388,17 @@
   of `dur`, else the value at `AD mod dur`. Colours blend per sRGB channel, paths blend only on
   one command sequence, mixed units and keywords step. **Anything else is a warning, never a
   failure** (`SvgDoc::warnings` / `check_svg`): events, `repeat()`, `accessKey`, wallclock never
-  fire; `animateMotion`, `animate` on `transform`, animating `href` / `style` / `on*` are
-  dropped; a base value that comes from a `<style>` rule is not seen (the default is used).
+  fire; `animateMotion`, `animate` on `transform`, animating `href` / `style` / `on*` and a base value that comes
+  from a `<style>` rule is not seen (the default is used) — all dropped or ignored with a warning. **Dropped too is anything that
+  would make the guard (which reads the document as stored) wrong afterwards**: an animation of `mask` / `filter` / `clip-path` / `clip` / `marker*` / `id` / `class`, one whose `values` / `from` / `to` / `by` hold a
+  `url(`, and one of `radius` / `order` / `numOctaves` (they set the cost of a filter primitive); and a `<style>` rule may point
+  a `fill` or `stroke` at a **gradient** and nothing else at anything (`STYLE_REFERENCE_NOTE`; the guard reads no selectors, so a
+  class could spend a mask a thousand times — put pattern, mask, clip-path, filter and marker references on the element, where
+  they are counted; an inline `style` is read). A document whose filters would take seconds a frame is refused when it is read
+  (`svg/cost.rs`: `feMorphology` radius, `feConvolveMatrix` order and `feTurbulence` octaves times the region, at a nominal
+  1080p; the rasteriser makes the same estimate at the real size).
+  `svg::may_animate(src)` is false when the sanitised text has no animation element (a text test; `true` is only "maybe"), which is
+  what lets the engine keep such a title as one picture. Start and end are held to 24 h (`MAX_SVG_SECONDS`).
   `natural_duration` (all animations settled; `None` for a still or an endless loop) is what
   `add_svg_overlay` defaults the end to, held to 2–30 s (else 4 s; `SvgDoc::default_span`).
   `SvgOverlayPatch` has `svg` (custom artwork), `preset_params` (re-fill) and `preset_kind` (another

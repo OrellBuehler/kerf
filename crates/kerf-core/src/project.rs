@@ -20,7 +20,7 @@ use crate::model::{
     Delivery, Easing, EditOutcome, EditSource, Framing, Keyframe, Levels, Marker, Mask, MasterBus, Projection, Reframe,
     ReframeKeyframe, Revision, SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo,
     TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TrackLevels, TranscriptSegment, Transition, VideoEffect,
-    Voiceover, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_FOV, MAX_SVG_OVERLAYS, MIN_FOV,
+    Voiceover, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_FOV, MAX_SVG_OVERLAYS, MAX_SVG_SECONDS, MIN_FOV,
 };
 use crate::model::{Detached, DetachedMany};
 use crate::model::{Property, PropertyKey};
@@ -81,6 +81,24 @@ pub struct SvgLayout {
 pub struct SvgOverlayResult {
     pub overlay: SvgOverlay,
     pub warnings: Vec<String>,
+}
+
+/// When an animated title may be on screen: it starts before it ends, and neither is further out
+/// than [`MAX_SVG_SECONDS`].
+fn check_svg_span(start: f64, end: f64) -> Result<()> {
+    if !(start.is_finite() && end.is_finite()) {
+        return Err(Error::InvalidArgument("start and end must be numbers of seconds".to_string()));
+    }
+    if end <= start {
+        return Err(Error::InvalidArgument("overlay end must be after start".to_string()));
+    }
+    if end > MAX_SVG_SECONDS {
+        return Err(Error::InvalidArgument(format!(
+            "an animated title ends within the first {} hours",
+            MAX_SVG_SECONDS / 3600.0
+        )));
+    }
+    Ok(())
 }
 
 /// A placement the compositor can draw: finite numbers, a real size, an opacity.
@@ -4587,6 +4605,11 @@ impl Project {
     /// generated for the project's delivery frame and the title's length). `end` defaults to when the
     /// animation has finished — [`SvgDoc::natural_duration`] held to 2–30 s — and to four seconds for
     /// a still, a loop and a preset. One `Add animated title` edit, staged for an agent.
+    ///
+    /// **Tests only.** This reads the artwork (up to a second and a half) wherever the caller is, which
+    /// for a surface is under the project lock; surfaces read first ([`SvgSource::check`]) and take
+    /// the lock for [`Project::add_svg_overlay_parsed`].
+    #[cfg(test)]
     pub fn add_svg_overlay(
         &self,
         source: SvgSource,
@@ -4597,7 +4620,7 @@ impl Project {
         self.add_svg_overlay_parsed(source.check()?, start, end, layout)
     }
 
-    /// [`Project::add_svg_overlay`] for artwork that has been read already ([`SvgSource::check`]):
+    /// `add_svg_overlay` for artwork that has been read already ([`SvgSource::check`]):
     /// nothing in it parses, so it is cheap to run under the project lock. A surface checks the
     /// source first and takes the lock after.
     pub fn add_svg_overlay_parsed(
@@ -4619,6 +4642,7 @@ impl Project {
             SvgChecked::Preset(p) => (String::new(), Some(p), Vec::new(), 4.0),
         };
         let end = end.unwrap_or(start + span);
+        check_svg_span(start, end)?;
         let (x, y, width, height, opacity) = (
             layout.x.unwrap_or(0.0),
             layout.y.unwrap_or(0.0),
@@ -4661,11 +4685,15 @@ impl Project {
     /// `svg` is exclusive with either. **A preset's artwork is re-made whenever its length changes**
     /// (its animations are scheduled against the span), so trimming or stretching one in the timeline
     /// retimes the effect instead of cutting it off.
+    ///
+    /// **Tests only**, like `add_svg_overlay`: a surface reads first
+    /// ([`SvgOverlayPatch::check`]) and takes the lock for [`Project::update_svg_overlay_parsed`].
+    #[cfg(test)]
     pub fn update_svg_overlay(&self, overlay_id: Uuid, patch: SvgOverlayPatch) -> Result<SvgOverlayResult> {
         self.update_svg_overlay_parsed(overlay_id, patch, None)
     }
 
-    /// [`Project::update_svg_overlay`] with the artwork read already: `doc` is [`SvgOverlayPatch::check`]'s
+    /// `update_svg_overlay` with the artwork read already: `doc` is [`SvgOverlayPatch::check`]'s
     /// answer for `patch.svg` and replaces the artwork (`patch.svg` itself is not looked at again), so
     /// nothing here parses and it is cheap to run under the project lock. With `doc` `None` a
     /// `patch.svg` is still parsed here, as `update_svg_overlay` always has.
@@ -4704,9 +4732,7 @@ impl Project {
             o.width = patch.width.unwrap_or(o.width);
             o.height = patch.height.unwrap_or(o.height);
             o.opacity = patch.opacity.unwrap_or(o.opacity);
-            if o.end <= o.start {
-                return Err(Error::InvalidArgument("overlay end must be after start".to_string()));
-            }
+            check_svg_span(o.start, o.end)?;
             check_svg_rect(o.x, o.y, o.width, o.height, o.opacity)?;
             let mut warnings = Vec::new();
             let mut regenerate = o.preset.is_some() && (o.doc_duration() - length).abs() > 1e-6;
@@ -6489,6 +6515,57 @@ mod tests {
 
     fn svg_layout() -> SvgLayout {
         SvgLayout::default()
+    }
+
+    #[test]
+    fn an_animated_title_starts_and_ends_within_a_day() {
+        let project = Project::open_in_memory().unwrap();
+        let add = |start: f64, end: Option<f64>| {
+            project.add_svg_overlay(SvgSource::Custom(svg_fixture("1s")), start, end, svg_layout())
+        };
+        for (start, end) in [
+            (1e300, None),
+            (86_401.0, None),
+            (0.0, Some(86_400.5)),
+            (0.0, Some(1e300)),
+            (86_400.0, Some(86_401.0)),
+            (f64::INFINITY, None),
+        ] {
+            assert!(
+                matches!(add(start, end), Err(Error::InvalidArgument(_))),
+                "{start} .. {end:?}"
+            );
+        }
+        assert!(project.timeline().unwrap().svg_overlays.is_empty(), "nothing was written");
+        let last = add(86_399.0, Some(86_400.0)).unwrap().overlay;
+        assert_eq!((last.start, last.end), (86_399.0, 86_400.0));
+        // An update is held to the same, and a refused one writes nothing.
+        let before = project.history().unwrap().len();
+        for patch in [
+            SvgOverlayPatch {
+                end: Some(86_400.5),
+                ..Default::default()
+            },
+            SvgOverlayPatch {
+                start: Some(1e300),
+                end: Some(2e300),
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                project.update_svg_overlay(last.id, patch),
+                Err(Error::InvalidArgument(_))
+            ));
+        }
+        assert_eq!(project.history().unwrap().len(), before);
+        assert!(matches!(
+            SvgOverlayPatch {
+                end: Some(1e18),
+                ..Default::default()
+            }
+            .check_cheap(),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 
     #[test]

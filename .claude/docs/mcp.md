@@ -181,7 +181,9 @@ resolved under the lock from `working_timeline()` (so the proposal, staged edits
 after the title appears (an overlay's slice `offset` is added for the document clock; the labels in the image are that
 clock, the caption says so), `count` (default 6, clamped to 1..=36) spreads cells from the first frame to the end; both
 together, neither source or both sources are `invalid_params`, and a `times` list the sheet cannot hold is refused rather than
-cut short. `max_width` is the width of **one cell** (default 480, 64..=960). It shows the title alone over dark grey, not over
+cut short. `max_width` is the width of **one cell** (default 480, 64..=960); a sheet over 16 Mpx in all
+(`raster::MAX_SHEET_PIXELS`: 36 cells at 1920 px would be 100) is `invalid_params` telling to ask for smaller cells or fewer
+moments. It shows the title alone over dark grey, not over
 the footage — `preview_timeline` is for that. `get_timeline_state` returns the source, but one over 4 KiB
 (`SVG_INLINE_LIMIT`; a title can be 128 KiB and a timeline holds 50) is replaced by a note with its size unless
 `full_svg: true` (`elide_large_svg` edits the owned working copy, so nothing is lost and field order is unchanged).

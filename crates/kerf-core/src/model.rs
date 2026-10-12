@@ -1973,6 +1973,10 @@ impl TextOverlay {
 /// Most animated SVG overlays one timeline holds.
 pub const MAX_SVG_OVERLAYS: usize = 50;
 
+/// The latest second an animated title may start or end at (24 hours). A position far out is a
+/// mistake, not an edit, and the engine looks for the frame at it.
+pub const MAX_SVG_SECONDS: f64 = 24.0 * 3600.0;
+
 fn is_zero(v: &f64) -> bool {
     *v == 0.0
 }
@@ -2159,6 +2163,12 @@ impl SvgOverlayPatch {
         }
         if [self.start, self.end].iter().flatten().any(|v| !v.is_finite()) {
             return Err(Error::InvalidArgument("start and end must be numbers of seconds".to_string()));
+        }
+        if [self.start, self.end].iter().flatten().any(|v| *v > MAX_SVG_SECONDS) {
+            return Err(Error::InvalidArgument(format!(
+                "start and end must be within the first {} hours",
+                MAX_SVG_SECONDS / 3600.0
+            )));
         }
         Ok(())
     }

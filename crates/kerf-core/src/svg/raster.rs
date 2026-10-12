@@ -12,9 +12,15 @@
 //! sequence in a directory named by a digest of everything that decides its pixels. A sequence is
 //! usable once its `complete` marker is there; a frame is written under a temporary name and
 //! renamed, so an interrupted run leaves nothing ffmpeg could read half-written. A directory whose
-//! process is gone is removed on the next start; within a process the total is held under
-//! `KERF_SVG_CACHE_MB` (1024) by dropping the least recently used sequence, never one a [`Pin`]
-//! holds (an export's sequences are pinned from the moment they are prepared until ffmpeg is done).
+//! process is gone is removed on the next start, and this process's own is emptied at its first use
+//! (a pid is reused: what an earlier run with the same one left is not trusted); within a process the
+//! total is held under `KERF_SVG_CACHE_MB` (1024) by dropping the least recently used sequence, never
+//! one a [`Pin`] holds (an export's sequences are pinned from the moment they are prepared until
+//! ffmpeg is done) — the check and the removal are one step against a new pin.
+//!
+//! **The fonts are not in the key** because they cannot change under it: the font database is built
+//! once per process (`fonts::svg_fontdb`) and so is this directory, which is emptied when the
+//! process starts. A font installed while Kerf runs is seen by neither until the next run.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,10 +28,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::SystemTime;
 
-use resvg::usvg::{self, ImageHrefResolver};
+use resvg::usvg::{self, ImageHrefResolver, ImageKind};
 use tiny_skia::{Color, Pixmap, PixmapPaint, Transform};
 
-use super::{invalid, SvgDoc};
+use super::images::{self, Format};
+use super::{cost, invalid, SvgDoc};
 use crate::error::{Error, Result};
 use crate::fonts;
 
@@ -44,27 +51,38 @@ const MARKER: &str = "complete";
 // ---- drawing ----------------------------------------------------------------------------------
 
 fn options() -> usvg::Options<'static> {
-    let mut opts = usvg::Options {
+    usvg::Options {
         // The face text gets when it names none: the shipped one, on every machine.
         font_family: fonts::DEFAULT_FAMILY.to_string(),
         fontdb: fonts::svg_fontdb(),
         resources_dir: None,
+        image_href_resolver: image_resolver(),
         ..usvg::Options::default()
-    };
-    // Only an image the document carries itself is read: a path or a URL in `href` is nothing, so
-    // a title can neither read a file off the disk nor reach for the network.
-    // ...and of those only the four raster kinds the sanitiser allows: no nested SVG document.
-    opts.image_href_resolver = ImageHrefResolver {
-        resolve_data: Box::new(|mime, data, _| match mime {
-            "image/png" => Some(usvg::ImageKind::PNG(data)),
-            "image/jpeg" | "image/jpg" => Some(usvg::ImageKind::JPEG(data)),
-            "image/gif" => Some(usvg::ImageKind::GIF(data)),
-            "image/webp" => Some(usvg::ImageKind::WEBP(data)),
-            _ => None,
+    }
+}
+
+/// Which images a title may draw. Only one the document carries itself is read: a path or a URL in
+/// `href` is nothing, so a title can neither read a file off the disk nor reach for the network;
+/// of those only the four raster kinds the sanitiser allows (no nested SVG document), and only one
+/// whose header says it fits in [`images::MAX_IMAGE_PIXELS`] — the decoder allocates what the header
+/// claims, so a stored document from before that limit existed is held to it here too.
+pub(super) fn image_resolver() -> ImageHrefResolver<'static> {
+    ImageHrefResolver {
+        resolve_data: Box::new(|mime, data, _| {
+            let format = Format::of_mime(mime)?;
+            if let Err(why) = images::check(mime, &data) {
+                tracing::warn!("an embedded image was not drawn: {why}");
+                return None;
+            }
+            Some(match format {
+                Format::Png => ImageKind::PNG(data),
+                Format::Jpeg => ImageKind::JPEG(data),
+                Format::Gif => ImageKind::GIF(data),
+                Format::Webp => ImageKind::WEBP(data),
+            })
         }),
         resolve_string: Box::new(|_, _| None),
-    };
-    opts
+    }
 }
 
 /// Draw the static document `svg` into a transparent `pw` x `ph` picture, fit "contain": scaled to
@@ -83,6 +101,9 @@ pub fn render(svg: &str, pw: u32, ph: u32, opacity: f64) -> Result<Pixmap> {
     let scale = (pw as f32 / w).min(ph as f32 / h);
     let fit = |v: f32, max: u32| ((v * scale).round() as u32).clamp(1, max);
     let (fw, fh) = (fit(w, pw), fit(h, ph));
+    if cost::frame_ops(&tree, f64::from(scale), (f64::from(pw), f64::from(ph))) > cost::MAX_FRAME_OPS {
+        return Err(invalid(cost::TOO_SLOW));
+    }
     let into = Transform::from_scale(fw as f32 / w, fh as f32 / h);
     let alloc = |w, h| Pixmap::new(w, h).ok_or_else(|| Error::Engine(format!("cannot allocate a {w} x {h} picture")));
     let mut out = alloc(pw, ph)?;
@@ -129,13 +150,15 @@ const SHEET_GAP: u32 = 6;
 pub const MAX_SHEET_CELLS: usize = 36;
 /// The widest sheet, in pixels.
 const MAX_SHEET_WIDTH: u32 = 8192;
+/// The most pixels a sheet may have (a 16 MP sheet is 64 MB, drawn into and then encoded).
+pub const MAX_SHEET_PIXELS: u64 = 16_000_000;
 
 /// A contact sheet of `doc` at the given moments of its own clock (`times`, document seconds): a
 /// PNG of a grid of cells over dark grey, each cell the document drawn into a `frame`-shaped
 /// picture `cell_w` px wide (fit "contain", so a document with another shape letterboxes inside its
 /// cell) with its time written under it. For an agent to *see* an animation without rendering the
-/// cut. `cell_w` is clamped to 32..=1920; at most [`MAX_SHEET_CELLS`] moments and
-/// [`MAX_SHEET_WIDTH`] px across.
+/// cut. `cell_w` is clamped to 32..=1920; at most [`MAX_SHEET_CELLS`] moments, [`MAX_SHEET_WIDTH`] px
+/// across and [`MAX_SHEET_PIXELS`] in all.
 pub fn contact_sheet(doc: &SvgDoc, times: &[f64], cell_w: u32, frame: (u32, u32)) -> Result<Vec<u8>> {
     if times.is_empty() || times.len() > MAX_SHEET_CELLS {
         return Err(invalid(format!("a contact sheet shows 1 to {MAX_SHEET_CELLS} moments")));
@@ -159,6 +182,14 @@ pub fn contact_sheet(doc: &SvgDoc, times: &[f64], cell_w: u32, frame: (u32, u32)
     let height = rows as u32 * (cell_h + label_h + SHEET_GAP) + SHEET_GAP;
     if width > MAX_SHEET_WIDTH {
         return Err(invalid("the contact sheet would be too wide"));
+    }
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > MAX_SHEET_PIXELS {
+        return Err(invalid(format!(
+            "the contact sheet would be {} megapixels (at most {}): ask for smaller cells or fewer moments",
+            pixels.div_ceil(1_000_000),
+            MAX_SHEET_PIXELS / 1_000_000
+        )));
     }
     let mut sheet = Pixmap::new(width, height).ok_or_else(|| Error::Engine("cannot allocate the contact sheet".into()))?;
     let (r, g, b) = SHEET_BACKGROUND;
@@ -244,12 +275,50 @@ fn resolve_root() -> PathBuf {
         .chain(std::iter::once_with(|| fonts::private_dir_named(&std::env::temp_dir(), "kerf-svg")).flatten());
     for base in bases {
         let dir = base.join(pid.to_string());
-        if std::fs::create_dir_all(&dir).is_ok() {
+        if claim_dir(&dir) {
             prune_stale(&base, pid);
             return dir;
         }
     }
-    std::env::temp_dir().join(format!("kerf-svg-{pid}"))
+    unique_private_dir()
+}
+
+/// Make `dir` an empty directory that is ours. A pid is reused (after a reboot, or by the next
+/// process in a crash loop), so whatever a process of the same number left there is not ours and not
+/// trusted: a `complete` marker in it vouches for a run that may have been cut off.
+fn claim_dir(dir: &Path) -> bool {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).is_ok()
+}
+
+/// A directory of this process alone in the temp one, for when neither the cache directory nor the
+/// per-user one can be made: a name nobody can guess, made with a plain `mkdir` (which fails rather
+/// than follow a link or reuse a directory that is already there) and mode 0700.
+fn unique_private_dir() -> PathBuf {
+    let pid = std::process::id();
+    let mut dir = PathBuf::new();
+    for attempt in 0..8u32 {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        dir = std::env::temp_dir().join(format!("kerf-svg-{pid}-{nanos:x}-{attempt}"));
+        if create_private(&dir) {
+            break;
+        }
+    }
+    dir
+}
+
+fn create_private(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(dir).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(dir).is_ok()
+    }
 }
 
 /// Remove the sibling directories of `base` named for a process that is gone.
@@ -335,6 +404,7 @@ impl Drop for Pin {
     }
 }
 
+#[cfg(test)]
 fn is_pinned(path: &Path) -> bool {
     pins().lock().unwrap_or_else(PoisonError::into_inner).contains_key(path)
 }
@@ -351,30 +421,54 @@ pub fn is_complete(dir: &Path) -> bool {
     dir.join(MARKER).is_file()
 }
 
-/// Mark the sequence in `dir` finished.
+/// Mark the sequence in `dir` finished. The directory must be there: a marker written into one the
+/// cache has since lost would make an empty sequence look drawn, so it is an error and the caller
+/// draws again.
 pub fn mark_complete(dir: &Path) -> Result<()> {
-    write_atomic(&dir.join(MARKER), b"ok")
+    write_atomic_in(&dir.join(MARKER), b"ok", false)
+}
+
+/// Whether every frame of `range` is in `dir`.
+pub fn has_frames(dir: &Path, range: std::ops::Range<u64>) -> bool {
+    range.into_iter().all(|j| frame_path(dir, j).is_file())
 }
 
 /// Count `path` (a sequence directory or a still) as used just now, for the least-recently-used
 /// order.
 pub fn touch(path: &Path) {
+    let now = SystemTime::now();
     let target = if path.is_dir() {
         path.join(MARKER)
     } else {
         path.to_path_buf()
     };
-    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(target) {
-        let _ = file.set_modified(SystemTime::now());
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&target) {
+        let _ = file.set_modified(now);
+    } else if path.is_dir() {
+        // A sequence that is only partly drawn has no marker: its directory stands in for it
+        // (`last_used` reads the same). Windows cannot open a directory to stamp it, and goes by
+        // the time its last file was added.
+        #[cfg(unix)]
+        if let Ok(file) = std::fs::File::open(path) {
+            let _ = file.set_modified(now);
+        }
     }
 }
 
 /// `bytes` at `path`, written whole or not at all: under a name of its own, then renamed. Makes the
 /// parent directories (the cache may have been cleared since the last call).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_in(path, bytes, true)
+}
+
+/// [`write_atomic`], with `make_parents` saying whether a missing directory is made (a frame) or an
+/// error (the marker).
+fn write_atomic_in(path: &Path, bytes: &[u8], make_parents: bool) -> Result<()> {
     static N: AtomicU64 = AtomicU64::new(0);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    if make_parents {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
     }
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("frame");
     let tmp = path.with_file_name(format!(
@@ -448,15 +542,18 @@ fn last_used(path: &Path) -> SystemTime {
 }
 
 /// Remove the least recently used entries of `dir` (sequence directories and `still-*.png` files)
-/// until what is left fits in `cap` bytes, sparing anything `pinned` says is in use. Returns the
-/// bytes left.
-pub fn trim_to(dir: &Path, cap: u64, pinned: &dyn Fn(&Path) -> bool) -> u64 {
+/// until what is left fits in `cap` bytes, sparing every pinned entry and anything `also_pinned`
+/// says is in use. Returns the bytes left.
+pub fn trim_to(dir: &Path, cap: u64, also_pinned: &dyn Fn(&Path) -> bool) -> u64 {
     let Ok(read) = std::fs::read_dir(dir) else { return 0 };
     let mut entries: Vec<(PathBuf, u64, SystemTime)> = read
         .flatten()
         .filter_map(|e| {
             let name = e.file_name();
             let name = name.to_str()?;
+            if name.starts_with(TOMBSTONE) {
+                return None;
+            }
             let is_still = name.starts_with("still-") && name.ends_with(".png");
             (is_still || e.path().is_dir()).then(|| {
                 let path = e.path();
@@ -471,19 +568,48 @@ pub fn trim_to(dir: &Path, cap: u64, pinned: &dyn Fn(&Path) -> bool) -> u64 {
         if total <= cap {
             break;
         }
-        if pinned(&path) {
-            continue;
-        }
-        let gone = if path.is_dir() {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        if gone.is_ok() {
+        if evict(&path, also_pinned) {
             total = total.saturating_sub(size);
         }
     }
     total
+}
+
+/// What an entry being removed is renamed to first (and skipped by [`trim_to`]).
+const TOMBSTONE: &str = ".gone-";
+
+/// Remove `path` unless a [`Pin`] (or `also_pinned`) holds it. The pin check and taking the entry
+/// out of the namespace happen under the pins' lock, so a [`Pin::new`] cannot slip between them: a
+/// preparer either pinned first and the entry stays, or pins after and finds it gone (and draws it
+/// again) — never a "complete" sequence whose frames vanish under ffmpeg.
+fn evict(path: &Path, also_pinned: &dyn Fn(&Path) -> bool) -> bool {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let tomb = path.with_file_name(format!(
+        "{TOMBSTONE}{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let renamed = {
+        let held = pins().lock().unwrap_or_else(PoisonError::into_inner);
+        if held.contains_key(path) || also_pinned(path) {
+            return false;
+        }
+        if std::fs::rename(path, &tomb).is_err() {
+            // A file system that will not rename it (a handle open on Windows): the marker goes
+            // first, still under the lock, so nobody is told it is finished while it is emptied.
+            let _ = std::fs::remove_file(path.join(MARKER));
+            false
+        } else {
+            true
+        }
+    };
+    let target = if renamed { &tomb } else { path };
+    let gone = if target.is_dir() {
+        std::fs::remove_dir_all(target)
+    } else {
+        std::fs::remove_file(target)
+    };
+    gone.is_ok()
 }
 
 /// Hold this process's directory to [`cache_cap`], sparing every pinned entry.
@@ -492,7 +618,7 @@ pub fn trim() {
     if PINNED.with(|p| p.borrow().is_some()) {
         return;
     }
-    trim_to(&root(), cache_cap(), &is_pinned);
+    trim_to(&root(), cache_cap(), &|_| false);
 }
 
 #[cfg(test)]
@@ -636,6 +762,42 @@ mod tests {
     }
 
     #[test]
+    fn an_image_whose_header_claims_more_than_a_title_may_draw_is_not_decoded() {
+        // 60,000 x 60,000 pixels is 14 GB of RGBA: the decoder would ask for all of it and abort the
+        // process. The resolver reads the header first and draws nothing, whatever the document says.
+        let huge = images::tests::data_url("image/png", &images::tests::png_claiming(60_000, 60_000));
+        let p = render(
+            &svg(&format!("<image href=\"{huge}\" width=\"100\" height=\"50\"/>")),
+            100,
+            50,
+            1.0,
+        )
+        .unwrap();
+        assert!(p.pixels().iter().all(|c| c.alpha() == 0));
+        // The same for the other formats, and for bytes that are not the image the mime type says.
+        for mime in ["image/jpeg", "image/gif", "image/webp", "image/png"] {
+            let href = images::tests::data_url(mime, b"RIFF....WEBPVP8L garbage");
+            let p = render(
+                &svg(&format!("<image href=\"{href}\" width=\"100\" height=\"50\"/>")),
+                100,
+                50,
+                1.0,
+            )
+            .unwrap();
+            assert!(p.pixels().iter().all(|c| c.alpha() == 0), "{mime}");
+        }
+    }
+
+    #[test]
+    fn a_filter_too_slow_to_draw_is_an_error_at_the_size_it_is_drawn_at() {
+        let doc = svg("<filter id=\"f\" x=\"0\" y=\"0\" width=\"1\" height=\"1\"><feMorphology radius=\"1\"/></filter><rect width=\"100\" height=\"50\" filter=\"url(#f)\"/>");
+        // Small, a radius of 1 unit is a few pixels: fine. At 4K it is a 100 px window.
+        assert!(render(&doc, 100, 50, 1.0).is_ok());
+        let e = render(&doc, 3840, 1920, 1.0).unwrap_err().to_string();
+        assert!(e.contains("feMorphology"), "{e}");
+    }
+
+    #[test]
     fn a_picture_too_large_to_hold_is_refused() {
         assert!(render(&svg(""), 10_000, 10_000, 1.0).is_err());
         assert!(render("<not svg", 10, 10, 1.0).is_err());
@@ -686,6 +848,16 @@ mod tests {
         assert!(contact_sheet(&doc, &[0.0], 160, (0, 1080)).is_err());
     }
 
+    #[test]
+    fn a_contact_sheet_is_held_to_a_pixel_budget() {
+        let doc = SvgDoc::parse(&svg("<rect width=\"100\" height=\"50\" fill=\"#ff0000\"/>")).unwrap();
+        // 36 cells of 1920 x 1080 would be a 100-megapixel picture.
+        let e = contact_sheet(&doc, &[0.0; 36], 1920, (1920, 1080)).unwrap_err().to_string();
+        assert!(e.contains("megapixels") && e.contains("smaller cells"), "{e}");
+        // Six at a size an agent can read are fine.
+        assert!(contact_sheet(&doc, &[0.0; 6], 480, (1920, 1080)).is_ok());
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("kerf-svg-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -722,7 +894,7 @@ mod tests {
         // The oldest is pinned: the next one in line goes instead.
         let oldest = sequence(&root, "aa", 1000, 300);
         let pin = Pin::new(&oldest);
-        trim_to(&root, 2600, &is_pinned);
+        trim_to(&root, 2600, &|_| false);
         assert!(oldest.exists() && !middle.exists() && newest.exists());
         drop(pin);
         assert!(!is_pinned(&oldest));
@@ -733,6 +905,109 @@ mod tests {
         trim_to(&root, 2600, &|_| false);
         assert!(oldest.exists() && extra.exists() && !newest.exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_marker_is_never_written_into_a_directory_that_is_gone() {
+        let root = scratch("marker");
+        let dir = root.join("cc");
+        write_atomic(&frame_path(&dir, 0), &[1u8; 10]).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        // The cache lost it while it was being drawn: finishing it is an error, not an empty sequence
+        // that reads as complete.
+        assert!(mark_complete(&dir).is_err());
+        assert!(!dir.exists() && !is_complete(&dir));
+        write_atomic(&frame_path(&dir, 0), &[1u8; 10]).unwrap();
+        mark_complete(&dir).unwrap();
+        assert!(is_complete(&dir) && has_frames(&dir, 0..1) && !has_frames(&dir, 0..2));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_evicted_sequence_is_gone_whole_and_leaves_no_trace_and_a_pinned_one_is_not_touched() {
+        let root = scratch("evict");
+        let kept = sequence(&root, "aa", 1000, 300);
+        let dropped = sequence(&root, "bb", 1000, 200);
+        let pin = Pin::new(&kept);
+        let left = trim_to(&root, 0, &|_| false);
+        assert!(kept.exists() && is_complete(&kept) && has_frames(&kept, 0..1));
+        assert!(!dropped.exists());
+        assert!((900..=1100).contains(&left), "{left}");
+        let names: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(names.len(), 1, "no tombstone is left behind: {names:?}");
+        // Once the pin is gone it is the next to go; a pin taken after finds nothing and has to draw.
+        drop(pin);
+        trim_to(&root, 0, &|_| false);
+        assert!(!kept.exists());
+        let late = Pin::new(&kept);
+        assert!(!is_complete(&kept), "a pin taken after the eviction sees an empty place");
+        drop(late);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_pin_taken_while_the_cache_trims_is_never_lost_to_it() {
+        // The check and the removal are one step against Pin::new: hammer both and require that
+        // whenever a pin was held across the trim, the sequence it covered was still whole.
+        let root = scratch("race");
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let broken = std::sync::atomic::AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    trim_to(&root, 0, &|_| false);
+                }
+            });
+            for t in 0..2 {
+                let (root, stop, broken) = (&root, &stop, &broken);
+                scope.spawn(move || {
+                    let dir = root.join(format!("seq{t}"));
+                    for _ in 0..300 {
+                        let pin = Pin::new(&dir);
+                        if !is_complete(&dir) {
+                            let _ = write_atomic(&frame_path(&dir, 0), &[1u8; 64]);
+                            let _ = mark_complete(&dir);
+                        }
+                        // While the pin is held a finished sequence has its frame.
+                        if is_complete(&dir) && !frame_path(&dir, 0).is_file() {
+                            broken.fetch_add(1, Ordering::Relaxed);
+                        }
+                        drop(pin);
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                });
+            }
+        });
+        assert_eq!(broken.load(Ordering::Relaxed), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_directory_left_by_an_earlier_process_with_this_pid_is_emptied() {
+        let base = scratch("claim");
+        let dir = base.join(std::process::id().to_string());
+        write_atomic(&frame_path(&dir.join("old"), 0), b"stale").unwrap();
+        mark_complete(&dir.join("old")).unwrap();
+        assert!(claim_dir(&dir));
+        assert!(dir.is_dir() && std::fs::read_dir(&dir).unwrap().next().is_none());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_last_resort_directory_is_private_unique_and_never_a_name_somebody_made_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let a = unique_private_dir();
+        let b = unique_private_dir();
+        assert_ne!(a, b);
+        for dir in [&a, &b] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{dir:?}");
+        }
+        // A directory that is already there is refused (a plain mkdir), not reused.
+        assert!(!create_private(&a));
+        let _ = std::fs::remove_dir_all(a);
+        let _ = std::fs::remove_dir_all(b);
     }
 
     #[test]

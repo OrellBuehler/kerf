@@ -222,7 +222,8 @@ never see it.
 `resvg` (pure Rust, `text` + `system-fonts` + `raster-images`: PNG, JPEG, GIF, WebP for an `<image>` with a `data:`
 URL) draws animated SVG titles: kerf-core's `svg/` evaluates the SMIL to a static document per moment and
 resvg rasterises it, so no build needs a system library for it (`core-model.md` has the model, `engine-cli.md`
-the frame paths).
+the frame paths). `imagesize` and `data-url` are direct dependencies only because resvg already carries them: an embedded
+image's size is read from its header and held to 16 Mpx before any decoder (which allocates what the header claims) sees it.
 
 - **With FFmpeg dev libs** (full build): `cargo build` / `cargo run -p kerf-app`.
 - **Without them** (CI, UI work): pass `--no-default-features`; everything but the

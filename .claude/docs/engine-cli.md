@@ -692,7 +692,12 @@ so the feature is **only** activated through these forwards — which is what ma
   own viewport (a slide-in from outside the `viewBox` is not seen in the margin), with the alpha already multiplied by the
   opacity (the graph has no `colorchannelmixer` for it); fonts are `fonts::svg_fontdb()` (system + shipped Geist, Geist standing
   for serif and sans-serif and for the family nothing has, so text never vanishes); an `<image>` `href` that is not `data:` is
-  nothing (no file read, no network), `resources_dir` is `None`. **Draw order**: clips, then SVG overlays in list order, then text
+  nothing (no file read, no network), `resources_dir` is `None`, and a `data:` image is decoded only after its **header** says it
+  is within 16 Mpx (`svg/images.rs`: `imagesize`, the crate usvg sizes with; the decoders allocate what the header claims, so
+  60,000 x 60,000 bytes-of-header aborted the process) — the resolver answers "nothing" for one that is not, whatever the
+  document says. `render` also refuses a picture whose filters would cost more than `cost::MAX_FRAME_OPS` (2e9 per-pixel operations:
+  `feMorphology` is `(2r)^2` a pixel, `feConvolveMatrix` its order, `feTurbulence` its octaves, estimated from usvg's tree at the
+  scale it is drawn at; the same estimate is made at a nominal 1080p when a document is read). **Draw order**: clips, then SVG overlays in list order, then text
   (captions on top): the clips land on `vsvg`, and the titles end on `vtext` / `vcomp` (gif) / the final pad, so a graph without
   titles is byte-identical (golden `0..6000` unmoved).
   - **An export or a stream reads a numbered sequence**: `-f image2 -framerate {fps} -i {dir}/%06d.png` after the clips' inputs
@@ -703,28 +708,60 @@ so the feature is **only** activated through these forwards — which is what ma
     frames, not seconds** (`PTS-STARTPTS+k0*den/num/TB` truncates in doubles and puts a picture a frame off; a mutation to `N+k0+1`
     fails two rendered tests). `x`/`y` are the rectangle's pixel corner (`round(x*W)`, may be negative; a rectangle off the frame or
     over 50 Mpx is left out). The image2 input needs no `-hwaccel`; `export_resource` sees an input that is no asset and
-    keeps such an export on the cores' slot.
+    keeps such an export on the cores' slot. A title at or past the end of the cut, or at a position that is not a time, is left
+    out before its frame is searched for (`window`; the helpers clamp at 1e9 s — a start of 1e300 used to loop or overflow), and
+    a title's `start` / `end` are held to 24 h on add and update (`MAX_SVG_SECONDS`).
+  - **A document that cannot move is one picture** (`Kind::Held`; `svg::may_animate(src)` is false when the sanitised text has no
+    animation element — a text test, so the builders stay pure): `-f image2 -pattern_type none -loop 1 -framerate {fps} -i
+    {dir}/000000.png`, the same `settb,setpts=N+k` chain, one PNG instead of a link a frame, keyed by artwork, size and opacity only
+    (not by when, how long, rate or clock, so trimming a held title keeps its picture). The loop is infinite and ends with the main
+    input (measured, ffmpeg 6.1.1, two-pass and the stream included). A text that mentions an animation the reader dropped is
+    still a sequence of links.
+  - **The stream's pictures are named for the title, not the playhead** (`stream_sequences(titles, total, sliced, start, fmt)`;
+    `PreviewCut` keeps the unsliced titles): a title is drawn once on the output's frame grid, keyed exactly as an export of that
+    cut at that size and rate would, and a stream from any playhead **on a frame of its grid** (to a millionth of a frame) reads
+    the directory from picture `j0` (`-start_number j0`, omitted at 0) landing on the sliced frame `first + j0 - frame_at(start)`
+    (`setpts=N+k`); one between frames keeps the exact per-playhead sequence (the title would be a fraction of a frame off the
+    picture under it). `build_filter_complex_with` takes those sequences so the graph indexes the inputs the argv carries.
+    `prepare` draws only `SvgSeq::needed()` (the rest of the title from the playhead), writes `complete` only when every picture
+    is there, and later streams draw only what is missing — a replay or a seek back draws nothing.
   - **The pictures are on disk before ffmpeg is spawned** (no spawn has a stdin; two-pass and the software retry re-run ffmpeg):
     `render_with_progress` calls `svg_layer::prepare_export` before `retry_export_in_software`, once for the lot, and holds the pins
     until the render is over; a cut whose titles are drawn already never leases. Otherwise it takes its own foreground
     `cpu::lease_waiting` (saying so through `ExportProgress.waiting`, then `"rendering animated titles"`), draws on
     `lease.threads()` threads and releases the lease before ffmpeg asks for its own; a cancel is polled 40 times a second and is
     `RenderStatus::Cancelled`. `export_timeline` (for_render + range slice) is what the builder and `prepare_export` both start
-    from, and a variant (`render_variants`) prepares its own size. The stream (`stream_preview_once`: `preview_cut` →
+    from, and a variant (`render_variants`) prepares its own size. **A request that would be refused is refused first**
+    (`export_preflight`: no clips, `validate_export`), before a title is drawn. The stream (`stream_preview_once`: `preview_cut` →
     `prepare_preview` → `preview_args`; `build_preview_args[_with]` are the test/golden seam over the same two) draws its titles
-    on the budget's threads, ungated, for at most 10 s (`animated title too heavy to preview`).
+    on the budget's threads, ungated, for at most 10 s counted from the call (`animated title too heavy to preview`), **one
+    preparation at a time** (`PreviewSlot`: a seek that supersedes a stream waits for it to notice, not beside it) and **with a
+    cancel**: `stream_preview_until(.., cancel, on_frame)` (`stream_preview_with` is it with `|| false`; `start_playback` passes
+    "superseded or stopped"), looked at 40 times a second, before each document is read and every 16 frames of the compare. A
+    picture in flight is finished first. **Memory and priority**: `prepare` runs no more threads than
+    `RENDER_MEMORY` (1 GiB) allows (12 bytes a pixel of the picture + 8 a pixel of the widest embedded image, per thread), each
+    thread `cpu::background_thread()` (below normal when the budget is under 100%: `setpriority` on the thread on Linux, the
+    background class on macOS, **Windows left alone** — no binding for `SetThreadPriority` in the tree), and the parsed
+    documents are kept (`DocCache`, last 6 by digest of the source) so a scrub or a replay reads a title once.
   - **The cache** (`<cache>/kerf/svg/<pid>/<key>/NNNNNN.png` + a `complete` marker, else a private `kerf-svg-<uid>` directory in the
-    temp one): `key` = SHA-256 of `RASTER_VERSION`, the sanitised source, the document clock at the first picture, the rate, the
-    picture count, the pixel size and the opacity — **not the position** (moving a title keeps its frames). A frame is renamed
-    into place whole, so one that exists is right and an interrupted run resumes; the marker is last. Consecutive frames whose
-    `at()` text is the same are one render and hard links (copy where links fail; a static title is one render). Directories of
-    dead pids are removed at the first use (Windows: untouched for a day); within the process `raster::trim` holds the total to
-    `KERF_SVG_CACHE_MB` (1024), dropping the least recently used sequence or `still-*.png`, **never a pinned one** (`raster::Pin`,
-    taken before the marker is looked at). `raster::with_pinned_dir` (tests, per thread) fixes the directory so the builders stay
-    pure and the golden oracle machine-independent.
+    temp one, else a unique `0700` `kerf-svg-<pid>-<nanos>-<n>` made with a plain `mkdir`): `key` = SHA-256 of `RASTER_VERSION`, the
+    sanitised source, the document clock at the first picture, the rate, the picture count, the pixel size and the opacity —
+    **not the position** (moving a title keeps its frames) and **not the fonts**: the font database and this directory are both
+    built once per process and the directory is emptied at the first use (`claim_dir`: a pid is reused, and a marker left by an
+    earlier run is not trusted). A frame is renamed into place whole, so one that exists is right and an interrupted run resumes;
+    the marker is last, and `mark_complete` refuses a directory that is gone (it used to recreate it empty, "complete"). A
+    sequence is **ready** when the marker is there and so are its first and last picture. Consecutive missing frames whose `at()`
+    text is the same are one render and hard links (copy where links fail). Directories of dead pids are removed at the first use
+    (Windows: untouched for a day); within the process `raster::trim` holds the total to `KERF_SVG_CACHE_MB` (1024), dropping the
+    least recently used sequence or `still-*.png`, **never a pinned one** (`raster::Pin`, taken before the marker is looked at).
+    **The check and the removal are one step**: `evict` takes the pins' lock, and renames the entry to `.gone-*` before it deletes
+    it (marker first where a rename fails), so a pin taken during a trim either stops it or finds the place empty. Trim runs only
+    after something was written. `raster::with_pinned_dir` (tests, per thread) fixes the directory so the builders stay pure and
+    the golden oracle machine-independent.
   - **A still reads one PNG** (`still_svgs`: the overlays with `start <= t < end` at the still's own size; `still-{key}.png`, the
-    key over the document clock at `t`): `run_still` calls `still_titles` (drawn on the calling thread, ungated, pinned) before
-    spawning, so `timeline_frame`, `timeline_frame_region`, `export_still` and the MCP `preview_timeline` get it. The scrub cache
+    key over the document clock at `t`; `-f image2 -pattern_type none -i path`, so a `%d`, `[` or `*` in the cache path is a
+    character of it — ffmpeg 6.1 otherwise looks for `a1 [1]/still-….png` and a glob): `run_still` calls `still_titles` (drawn on the
+    calling thread, ungated, pinned) before spawning, so `timeline_frame`, `timeline_frame_region`, `export_still` and the MCP `preview_timeline` get it. The scrub cache
     needs no `stat` of such a file (`file_stamp`: its name is its content, and it may not exist yet when the key is asked for);
     `Snapshot::plain` is false from a title's first frame to its last (the one-shot draws it), and `window_args` cuts the titles
     out of its slice so a window never names a picture that is not there.
@@ -732,7 +769,9 @@ so the feature is **only** activated through these forwards — which is what ma
     export frame equals the scrubbed still of its moment within 2 levels at 24 / 25 / 29.97 / 30 / 60 fps, frames outside the
     title are the plain cut exactly, both ends are drawn and the frame after is not; a range export continues the animation
     (offset), a translucent title partly off the frame equals its still, a two-pass export draws once (and a second export finds
-    the sequence drawn), gif and 10-bit exports, a `%` in the cache path, a cancel, and the stream (from the playhead mid-title the
+    the sequence drawn), gif and 10-bit exports, a `%` in the cache path (and `%d [1]*?` for stills and held pictures), a cancel, a
+    held title (export frames equal the still, the export ends with the cut, stream and two-pass), a stream replayed or started
+    elsewhere reading the one directory, and the stream (from the playhead mid-title the
     box is already across). A 10 s text-heavy lower third at 960 px: 301 frames in 3.0 s on 4 shared cores (10 ms a frame).
     **Not drawn**: `animateMotion`, CSS animation, an `<image>` whose `href` is not a `data:` URL of PNG / JPEG / GIF / WebP.
   **360 footage** is reprojected by `v360`: `StreamInfo.projection` is detected at

@@ -17,7 +17,10 @@
   one to three overlays of four fixed artworks — never a preset, whose text would put the machine's libm in the cache key — half in a box
   that may hang off the frame, a third translucent, a fifth part-way into their animation; every eighth case forced to the gif container,
   no dice; the cache directory pinned at `/kerf-test/svg` by `pinned`, and a still or the playhead may land on a title's edge (the edge
-  list gains the titles' edges, a different pick from the same single draw); families `svg-input`, `svg-overlay`, `svg-two`, `svg-partly-off`, `svg-restamp`, `still-svg`, `preview-svg-*` and
+  list gains the titles' edges, a different pick from the same single draw; every third case plays from a frame of the stream's own grid
+  in the middle of its first title, `svg_playhead`, no dice, because the drawn playhead is between frames and a stream from one never reads
+  `-start_number`); families `svg-input`, `svg-held`, `svg-overlay`, `svg-two`, `svg-partly-off`, `svg-restamp`, `still-svg`,
+  `still-svg-one-file`, `preview-svg-*` (`input`, `held`, `seek`, `overlay`) and
   the structural `svg-under-text`, `svg-gif`, `svg-offset`, which gave 28 to hundreds of cases each), have their
   `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
   FNV-1a digests, committed as 64 block digests each in
@@ -56,6 +59,9 @@
   dice of its own — so all three files re-blessed but only 428 of the 4000 per-case digests
   moved (`KERF_GOLDEN_CASES` before / after) and the rest are byte-identical. Raising
   `LIBRARY` (a new generated asset) moves the draws of every case; a new twin moves none.
+  Reading an animated title differently (a document that cannot move as one looped file, a stream
+  reading the title's sequence from `-start_number`, a still as `-f image2 -pattern_type none`) re-blessed
+  all three files and moved **only blocks 60..63** (the title cases): the diff is four lines a file.
   The **keyed-zoom fix** (zoom last in the chain, `rotate` filling `black@0` when keyed)
   re-blessed `export.txt` and `preview.txt` and left `still.txt` alone: 2027 export and 1507
   preview of 4000 cases moved, exactly the ones whose graph holds a moving zoom (1814 / 1298,

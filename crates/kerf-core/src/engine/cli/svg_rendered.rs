@@ -330,6 +330,127 @@ fn a_percent_in_the_cache_directory_is_escaped_for_the_image_demuxer() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A box that does not move: the same picture at every moment.
+fn held_box() -> String {
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {W} {H}\"><rect x=\"20\" y=\"12\" width=\"12\" height=\"12\" fill=\"#ff2040\"/></svg>"
+    )
+}
+
+#[test]
+#[ignore = "drives the real ffmpeg"]
+fn a_title_that_cannot_move_is_one_looped_picture_and_the_export_ends_with_the_cut() {
+    let dir = scratch("held");
+    let cache = dir.join("cache");
+    with_pinned_dir(cache.to_str().unwrap(), || {
+        for (text, fps) in [("24", 24.0), ("29.97", 29.97)] {
+            let bg = background(&dir, text);
+            let assets = [bg.clone()];
+            let with = cut(&bg, vec![title(held_box(), 0.5, 2.5)]);
+            let mut without = with.clone();
+            without.svg_overlays.clear();
+            let opts = options(fps);
+            let rate = Rational::from_fps(fps).unwrap();
+            let titled = export_rgb(&with, &assets, &opts, &dir, &format!("held-{text}"));
+            let plain = export_rgb(&without, &assets, &opts, &dir, &format!("plain-{text}"));
+            // The loop is infinite and the cut is not: the export ends where the cut does.
+            assert_eq!(titled.len(), plain.len(), "{text}: the looped picture adds no frame");
+            let mut on = 0;
+            for (k, (a, b)) in titled.iter().zip(&plain).enumerate() {
+                let time = rate.frame_time(k as u64);
+                if (0.5..=2.5).contains(&time) {
+                    on += 1;
+                    assert_eq!(box_left(a), Some(20), "{text}: frame {k} ({time:.4} s)");
+                    if time < 2.5 {
+                        let still = still_rgb(&with, &assets, &opts, rate.exact_time(k as u64));
+                        assert!(distance(a, &still) <= 2, "{text}: frame {k} is not the still");
+                    }
+                } else {
+                    assert_eq!(a, b, "{text}: frame {k} ({time:.4} s) is outside the title");
+                }
+            }
+            assert!(on > 40, "{text}: {on}");
+        }
+        // One picture per fps-independent title, not one a frame.
+        let files: usize = std::fs::read_dir(&cache)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|d| {
+                std::fs::read_dir(d.path())
+                    .unwrap()
+                    .flatten()
+                    .filter(|f| f.path().extension().is_some())
+                    .count()
+            })
+            .sum();
+        assert_eq!(files, 1, "both rates read the one picture");
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[ignore = "drives the real ffmpeg"]
+fn a_held_title_is_in_the_stream_and_in_a_two_pass_export() {
+    let dir = scratch("held-stream");
+    with_pinned_dir(dir.join("cache").to_str().unwrap(), || {
+        let bg = background(&dir, "24");
+        let assets = [bg.clone()];
+        let with = cut(&bg, vec![title(held_box(), 0.5, 2.5)]);
+        // From half a second before the title ends: it is on for the first twelve frames (and the
+        // thirteenth, `between` being closed), then gone.
+        let frames = play(&with, &assets, 2.0, 24);
+        assert_eq!(frames.len(), 24);
+        assert!(frames[..12].iter().all(|f| box_left(f) == Some(20)), "the rest of the window");
+        assert!(
+            frames[14..].iter().all(|f| box_left(f).is_none()),
+            "and nothing after it ends"
+        );
+        let early = play(&with, &assets, 0.0, 18);
+        assert!(early[..11].iter().all(|f| box_left(f).is_none()), "nothing before it starts");
+        assert!(
+            early[13..].iter().all(|f| box_left(f) == Some(20)),
+            "and the looped picture from its first frame"
+        );
+        let out = dir.join("two-pass.mp4");
+        let opts = ExportOptions {
+            container: Container::Mp4,
+            video_codec: Some("libx264".to_string()),
+            rate_control: RateControl::TwoPass,
+            video_bitrate: Some("2M".to_string()),
+            include_audio: false,
+            ..options(24.0)
+        };
+        render_with_progress(&with, &assets, &out, &opts, &mut |_| {}, &|| false).unwrap();
+        let decoded = decode(&out);
+        assert_eq!(decoded.len(), 96);
+        assert!(decoded[14..58].iter().all(|f| box_left(f).is_some()));
+        assert!(decoded[..10].iter().all(|f| box_left(f).is_none()) && decoded[62..].iter().all(|f| box_left(f).is_none()));
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[ignore = "drives the real ffmpeg"]
+fn a_cache_path_with_pattern_characters_is_one_file_for_stills_and_held_pictures() {
+    let dir = scratch("oddpath");
+    // `%d` is a frame number to the image demuxer, `[` `]` `*` `?` a glob: none is in the path of a file.
+    let cache = dir.join("a%d [1]*? cache");
+    with_pinned_dir(cache.to_str().unwrap(), || {
+        let bg = background(&dir, "24");
+        let assets = [bg.clone()];
+        let moving = cut(&bg, vec![title(sliding_box(), 0.5, 3.5)]);
+        let opts = options(24.0);
+        let still = still_rgb(&moving, &assets, &opts, 1.5);
+        assert!(box_left(&still).is_some(), "the scrubbed still has its title");
+        let held = cut(&bg, vec![title(held_box(), 0.5, 2.5)]);
+        let frames = export_rgb(&held, &assets, &opts, &dir, "oddpath");
+        assert_eq!(box_left(&frames[24]), Some(20), "and so does the looped picture");
+        assert_eq!(box_left(&still_rgb(&held, &assets, &opts, 1.0)), Some(20));
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 #[ignore = "drives the real ffmpeg"]
 fn a_ten_bit_export_takes_the_titles_too() {
@@ -471,6 +592,51 @@ fn a_gif_export_puts_the_titles_ahead_of_the_palette() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `frames` frames of the playback stream of `with` from `from` at 24 fps, decoded to rgb24.
+fn play(with: &Timeline, assets: &[Asset], from: f64, frames: usize) -> Vec<Vec<u8>> {
+    let mut jpegs = Vec::new();
+    let request = PlaybackRequest {
+        fps: Some(24.0),
+        max_width: Some(W),
+    };
+    stream_preview_with(with, assets, from, request, &mut |f| {
+        jpegs.push(f.jpeg);
+        jpegs.len() < frames
+    })
+    .unwrap();
+    // Decode the pictures through ffmpeg: concatenated JPEGs are an image2pipe stream.
+    let mut child = command(&ffmpeg_bin())
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "image2pipe",
+            "-c:v",
+            "mjpeg",
+            "-i",
+            "-",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let feeder = std::thread::spawn(move || {
+        for j in jpegs {
+            stdin.write_all(&j).unwrap();
+        }
+    });
+    let out = child.wait_with_output().unwrap();
+    feeder.join().unwrap();
+    out.stdout.chunks((W * H * 3) as usize).map(<[u8]>::to_vec).collect()
+}
+
 #[test]
 #[ignore = "drives the real ffmpeg"]
 fn the_playback_stream_shows_the_titles_and_carries_the_animation_on_from_the_playhead() {
@@ -479,63 +645,66 @@ fn the_playback_stream_shows_the_titles_and_carries_the_animation_on_from_the_pl
         let bg = background(&dir, "24");
         let assets = [bg.clone()];
         let with = cut(&bg, vec![title(sliding_box(), 0.5, 3.5)]);
-        let play = |from: f64, frames: usize| -> Vec<Vec<u8>> {
-            let mut jpegs = Vec::new();
-            let request = PlaybackRequest {
-                fps: Some(24.0),
-                max_width: Some(W),
-            };
-            stream_preview_with(&with, &assets, from, request, &mut |f| {
-                jpegs.push(f.jpeg);
-                jpegs.len() < frames
-            })
-            .unwrap();
-            // Decode the pictures through ffmpeg: concatenated JPEGs are an image2pipe stream.
-            let mut child = command(&ffmpeg_bin())
-                .args([
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-f",
-                    "image2pipe",
-                    "-c:v",
-                    "mjpeg",
-                    "-i",
-                    "-",
-                    "-f",
-                    "rawvideo",
-                    "-pix_fmt",
-                    "rgb24",
-                    "-",
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let mut stdin = child.stdin.take().unwrap();
-            let feeder = std::thread::spawn(move || {
-                for j in jpegs {
-                    stdin.write_all(&j).unwrap();
-                }
-            });
-            let out = child.wait_with_output().unwrap();
-            feeder.join().unwrap();
-            out.stdout.chunks((W * H * 3) as usize).map(<[u8]>::to_vec).collect()
-        };
-        let from_start = play(0.0, 72);
+        let from_start = play(&with, &assets, 0.0, 72);
         assert_eq!(from_start.len(), 72);
         assert!(box_left(&from_start[6]).is_none(), "before the start");
         let xs: Vec<u32> = from_start[13..70].iter().flat_map(|f| box_left(f)).collect();
         assert!(xs.len() > 50, "the box is there through its window: {}", xs.len());
         assert!(xs.windows(2).all(|w| w[0] <= w[1] + 1), "and moves right: {xs:?}");
         // From the middle of the title: it is already part-way across, not back at the edge.
-        let from_middle = play(1.5, 12);
+        let from_middle = play(&with, &assets, 1.5, 12);
         assert_eq!(
             box_left(&from_middle[0]).map(|x| x / 4),
             Some(26 / 4),
             "{:?}",
             box_left(&from_middle[0])
         );
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[ignore = "drives the real ffmpeg"]
+fn streams_from_other_playheads_read_the_pictures_one_stream_drew() {
+    let dir = scratch("replay");
+    let cache = dir.join("cache");
+    with_pinned_dir(cache.to_str().unwrap(), || {
+        let bg = background(&dir, "24");
+        let assets = [bg.clone()];
+        let with = cut(&bg, vec![title(sliding_box(), 0.5, 3.5)]);
+        // From the middle first: only the rest of the title is drawn, and no sequence is whole.
+        let middle = play(&with, &assets, 1.5, 24);
+        assert_eq!(sequences_in(&cache), 0, "a part of the title is not a finished sequence");
+        let dirs = |root: &Path| {
+            std::fs::read_dir(root)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .count()
+        };
+        assert_eq!(dirs(&cache), 1);
+        // From before the title: the rest of the same directory is drawn, and it is whole.
+        let early = play(&with, &assets, 0.0, 72);
+        assert_eq!(
+            (dirs(&cache), sequences_in(&cache)),
+            (1, 1),
+            "one sequence for the title, whatever the playhead"
+        );
+        // The same moment from either start: the same place for the box.
+        for i in 0..24 {
+            let (a, b) = (box_left(&middle[i]), box_left(&early[36 + i]));
+            assert!(
+                a.zip(b).is_some_and(|(a, b)| a.abs_diff(b) <= 1),
+                "frame {i} of the stream from 1.5 s is {a:?}, the same moment of the one from 0 is {b:?}"
+            );
+        }
+        // And from the middle again, from a frame of the title's second half: still the one directory.
+        let _ = play(&with, &assets, 2.5, 6);
+        assert_eq!((dirs(&cache), sequences_in(&cache)), (1, 1));
+        // A playhead between frames has the exact sequence of its own.
+        let off = play(&with, &assets, 1.51, 6);
+        assert_eq!(dirs(&cache), 2);
+        assert!(box_left(&off[0]).is_some());
     });
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -566,7 +735,8 @@ fn a_text_heavy_title_is_drawn_inside_the_streams_budget() {
             ..ExportFormat::default()
         };
         let started = std::time::Instant::now();
-        let pins = svg_layer::prepare_preview(&tl, &fmt).unwrap();
+        let seqs = svg_layer::svg_sequences(&tl, &fmt);
+        let pins = svg_layer::prepare_preview(&seqs, &|| false).unwrap();
         let took = started.elapsed();
         eprintln_timing(took, 301);
         assert!(took < std::time::Duration::from_secs(10), "{took:?} for 301 frames at 960 px");

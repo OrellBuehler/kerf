@@ -12,15 +12,22 @@
 //!   ffmpeg twice for two-pass and again for the software retry, and a sequence on disk serves all
 //!   of those. The directory is named by a digest of everything that decides the pixels, so a
 //!   cut that did not change finds its titles already drawn.
+//! * **A document that cannot move is one picture** (`Kind::Held`: `-loop 1 -framerate fps -i file`),
+//!   not a file per frame.
+//! * **The stream's sequences do not depend on the playhead** ([`stream_sequences`]): a title is drawn
+//!   once on the output's own frame grid, keyed by the title, and a stream from any frame of it starts
+//!   reading at the right picture (`-start_number`), so a replay, or a seek back, finds it drawn.
 //! * **A still reads one PNG** ([`still_svgs`], [`ensure_stills`]): the document at the still's
 //!   own time, at the still's size.
 //!
 //! Nothing here changes a graph without an SVG overlay: every function answers "nothing" for an
 //! empty `svg_overlays`, and the builders add nothing for that.
 
+use std::collections::VecDeque;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -43,6 +50,21 @@ const TOO_HEAVY: &str = "animated title too heavy to preview: drawing its frames
 
 /// How often a preparing thread looks at its cancel and its deadline.
 const POLL: Duration = Duration::from_millis(25);
+
+/// The most memory the drawing threads of one preparation may hold between them, estimated from
+/// the picture's size and the widest image the document decodes (a thread draws into a picture,
+/// a second one when the document is fit inside the rectangle, and encodes the PNG).
+const RENDER_MEMORY: u64 = 1 << 30;
+
+/// Frames between two looks at the cancel while the frames are being compared.
+const SCAN_STRIDE: u64 = 16;
+
+/// Documents kept parsed (reading one takes up to a second and a half).
+const DOC_CACHE: usize = 6;
+
+/// A time past which nothing is looked for: a position this far out is a mistake, and the search
+/// for its frame must not run away with it.
+const MAX_SECONDS: f64 = 1.0e9;
 
 /// Where an overlay lands on a frame, in pixels: its rectangle's top-left corner (which may lie
 /// off the frame) and size.
@@ -81,6 +103,7 @@ fn rect_px(o: &SvgOverlay, frame_w: u32, frame_h: u32) -> Option<Rect> {
 
 /// The first output frame whose graph time is at or after `t`.
 fn first_frame_from(fps: Rational, t: f64) -> u64 {
+    let t = if t.is_finite() { t.clamp(0.0, MAX_SECONDS) } else { 0.0 };
     let mut k = fps.frame_containing(t).saturating_sub(1);
     while fps.frame_time(k) < t {
         k += 1;
@@ -94,6 +117,10 @@ fn first_frame_from(fps: Rational, t: f64) -> u64 {
 /// The last output frame whose graph time is at or before `t` (before it when `strict`); `None`
 /// when not even frame 0 is.
 fn last_frame_to(fps: Rational, t: f64, strict: bool) -> Option<u64> {
+    if t.is_nan() {
+        return None;
+    }
+    let t = t.min(MAX_SECONDS);
     let before = |k: u64| {
         let ft = fps.frame_time(k);
         if strict {
@@ -107,6 +134,28 @@ fn last_frame_to(fps: Rational, t: f64, strict: bool) -> Option<u64> {
         k = k.checked_sub(1)?;
     }
     Some(k)
+}
+
+/// The output frames `o` is on screen for on a cut `total` seconds long whose last frame is
+/// `last_output`: the first frame at or after its start to the last at or before its end, closed at
+/// both ends like the graph's `between`. `None` when it is on none of them. A title that starts at
+/// or after the end of the cut is left out before anything is searched for (a start of 1e300 is a
+/// mistake, and no frame is at it).
+fn window(o: &SvgOverlay, fps: Rational, total: f64, last_output: u64) -> Option<(u64, u64)> {
+    if !(o.start.is_finite() && o.end.is_finite() && o.end > o.start) || o.start >= total {
+        return None;
+    }
+    let first = first_frame_from(fps, o.start);
+    let last = last_frame_to(fps, o.end.min(total), false)?.min(last_output);
+    (last >= first).then_some((first, last))
+}
+
+fn clamped_opacity(o: &SvgOverlay) -> f64 {
+    if o.opacity.is_finite() {
+        o.opacity.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
 }
 
 /// A digest of what decides a picture, as 32 hex digits.
@@ -124,19 +173,34 @@ fn hash_svg(hash: &mut Sha256, svg: &str) {
 
 // ---- a sequence for an export or the stream ------------------------------------------------------
 
-/// One overlay as a numbered PNG sequence on disk.
+/// How a title's pictures are laid out on disk and read by ffmpeg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Kind {
+    /// One PNG a frame (`dir/%06d.png`), hard-linked where consecutive frames are the same.
+    Frames,
+    /// A document with nothing in it that moves: one PNG (`dir/000000.png`), looped by ffmpeg.
+    Held,
+}
+
+/// One overlay as pictures on disk.
 #[derive(Debug, Clone)]
 pub(super) struct SvgSeq<'a> {
     /// The sanitised source.
     pub svg: &'a str,
-    /// The directory the frames are in (named by a digest of everything that decides them).
+    /// The directory the pictures are in (named by a digest of everything that decides them).
     pub dir: PathBuf,
-    /// `dir/%06d.png`, for `-i` (a `%` in the path is `%%`).
-    pub pattern: String,
-    /// The output frame the first picture lands on, and how many pictures there are.
+    /// What follows `-i`: `dir/%06d.png` (a `%` in the path is `%%`), or the one file.
+    pub input: String,
+    pub kind: Kind,
+    /// The output frame the first picture read lands on.
     pub first_frame: u64,
+    /// The pictures in the sequence `dir` holds (named by the key) ...
     pub frames: u64,
-    /// The document's own clock at the first picture; the next is one frame later.
+    /// ... and the ones this run reads: `first_picture..first_picture + pictures`. An export reads
+    /// all of them; a stream from the middle of a title reads the rest of it.
+    pub first_picture: u64,
+    pub pictures: u64,
+    /// The document's own clock at picture 0; picture `j` is one frame after picture `j - 1`.
     pub doc_t0: f64,
     pub fps: Rational,
     pub rect: Rect,
@@ -144,6 +208,105 @@ pub(super) struct SvgSeq<'a> {
     /// The overlay's window, for `enable`.
     pub start: f64,
     pub end: f64,
+}
+
+impl SvgSeq<'_> {
+    /// The pictures this run needs on disk.
+    fn needed(&self) -> Range<u64> {
+        self.first_picture..self.first_picture + self.pictures
+    }
+
+    /// Whether the run needs every picture of the sequence.
+    fn needs_all(&self) -> bool {
+        self.first_picture == 0 && self.pictures == self.frames
+    }
+}
+
+/// A sequence the document's own frames make: `layout.frames` pictures from the clock at
+/// `layout.doc_t0`, at `fps`, drawn `rect` big, for the overlay `o` (the title the directory is
+/// named for) — or, when the sanitised source has nothing that could move, the one picture
+/// [`Kind::Held`] is.
+struct Layout {
+    /// The output frame the first picture read lands on, and the first frame the title is on at all
+    /// (the one a held picture starts at).
+    lands_on: u64,
+    window_start: u64,
+    /// The pictures this run reads: `first_picture..first_picture + pictures`.
+    first_picture: u64,
+    pictures: u64,
+    /// The sequence the directory holds: the clock at picture 0 and how many pictures.
+    doc_t0: f64,
+    frames: u64,
+}
+
+fn seq_of<'a>(o: &'a SvgOverlay, root: &std::path::Path, fps: Rational, rect: Rect, layout: Layout) -> SvgSeq<'a> {
+    let Layout {
+        lands_on,
+        window_start,
+        first_picture,
+        pictures,
+        doc_t0,
+        frames,
+    } = layout;
+    let opacity = clamped_opacity(o);
+    if !crate::svg::may_animate(&o.svg) {
+        // Nothing moves, so the picture is the same at every moment, and what decides it is the
+        // artwork, its size and its opacity: not when the title starts, how long it runs, or the
+        // rate, so trimming a held title keeps its picture.
+        let key = digest(|h| {
+            h.update(b"held");
+            hash_svg(h, &o.svg);
+            h.update([rect.w.to_le_bytes(), rect.h.to_le_bytes()].concat());
+            h.update(opacity.to_bits().to_le_bytes());
+        });
+        let dir = root.join(key);
+        let input = raster::frame_path(&dir, 0).to_string_lossy().into_owned();
+        return SvgSeq {
+            svg: &o.svg,
+            dir,
+            input,
+            kind: Kind::Held,
+            first_frame: window_start,
+            frames: 1,
+            first_picture: 0,
+            pictures: 1,
+            doc_t0: 0.0,
+            fps,
+            rect,
+            opacity,
+            start: o.start,
+            end: o.end,
+        };
+    }
+    // The rectangle's position is where the picture is laid, not what it shows, so a title that is
+    // only moved keeps its frames.
+    let key = digest(|h| {
+        h.update(b"sequence");
+        hash_svg(h, &o.svg);
+        h.update(doc_t0.to_bits().to_le_bytes());
+        h.update([fps.num.to_le_bytes(), fps.den.to_le_bytes()].concat());
+        h.update(frames.to_le_bytes());
+        h.update([rect.w.to_le_bytes(), rect.h.to_le_bytes()].concat());
+        h.update(opacity.to_bits().to_le_bytes());
+    });
+    let dir = root.join(key);
+    let input = format!("{}/%06d.png", dir.to_string_lossy().replace('%', "%%"));
+    SvgSeq {
+        svg: &o.svg,
+        dir,
+        input,
+        kind: Kind::Frames,
+        first_frame: lands_on,
+        frames,
+        first_picture,
+        pictures,
+        doc_t0,
+        fps,
+        rect,
+        opacity,
+        start: o.start,
+        end: o.end,
+    }
 }
 
 /// The sequences `timeline` (already `for_render`ed and sliced, as the builders have it) draws on a
@@ -169,47 +332,88 @@ pub(super) fn svg_sequences<'a>(timeline: &'a Timeline, fmt: &ExportFormat) -> V
     timeline
         .svg_overlays
         .iter()
-        .filter(|o| o.start.is_finite() && o.end.is_finite() && o.end > o.start)
         .filter_map(|o| {
             let rect = rect_px(o, fmt.width, fmt.height)?;
-            let first_frame = first_frame_from(fps, o.start);
-            let last = last_frame_to(fps, o.end, false)?.min(last_output);
-            if last < first_frame {
+            let (first, last) = window(o, fps, total, last_output)?;
+            let frames = last - first + 1;
+            let doc_t0 = (o.offset + fps.exact_time(first) - o.start).max(0.0);
+            let layout = Layout {
+                lands_on: first,
+                window_start: first,
+                first_picture: 0,
+                pictures: frames,
+                doc_t0,
+                frames,
+            };
+            Some(seq_of(o, &root, fps, rect, layout))
+        })
+        .collect()
+}
+
+/// The sequences the playback stream reads: `sliced` is the cut from the playhead `start`, and
+/// `full` the titles of the cut before it was sliced (`full_total` seconds long).
+///
+/// A title is drawn **once on the output's own frame grid and named for the title**, not for where
+/// the playhead is: the stream from any frame of it reads the same directory, starting at the
+/// picture that frame needs (`-start_number`), so playing it again, or from just before, finds it
+/// drawn. That holds when the playhead is on a frame of the stream (it is, to a millionth of a
+/// frame, wherever the page quantises it); one between frames keeps the sequence of its own — the
+/// cut's frames are then half a slot from the title's, and the title would be a fraction of a frame
+/// out of step with the picture under it.
+pub(super) fn stream_sequences<'a>(
+    full: &[SvgOverlay],
+    full_total: f64,
+    sliced: &'a Timeline,
+    start: f64,
+    fmt: &ExportFormat,
+) -> Vec<SvgSeq<'a>> {
+    if sliced.svg_overlays.is_empty() {
+        return Vec::new();
+    }
+    let Some(fps) = Rational::from_fps(fmt.fps) else {
+        return Vec::new();
+    };
+    let ahead = start * f64::from(fps.num) / f64::from(fps.den);
+    let on_grid = ahead.is_finite() && ahead >= 0.0 && (ahead - ahead.round()).abs() < 1e-6;
+    if !on_grid {
+        return svg_sequences(sliced, fmt);
+    }
+    let shift = fps.frame_at(start);
+    let (Some(last_sliced), Some(last_full)) = (
+        last_frame_to(fps, sliced.duration(), true),
+        last_frame_to(fps, full_total, true),
+    ) else {
+        return Vec::new();
+    };
+    let root = raster::root();
+    sliced
+        .svg_overlays
+        .iter()
+        .filter_map(|o| {
+            let rect = rect_px(o, fmt.width, fmt.height)?;
+            let whole = full.iter().find(|f| f.id == o.id)?;
+            // Frames of the stream the title is on, and frames of the whole cut it is drawn on.
+            let (on_first, on_last) = window(o, fps, sliced.duration(), last_sliced)?;
+            let (first, last) = window(whole, fps, full_total, last_full)?;
+            let frames = last - first + 1;
+            // Picture j is on frame `first + j` of the cut, and on frame `first + j - shift` of the stream.
+            let lo = (i128::from(on_first) + i128::from(shift) - i128::from(first)).max(0);
+            let hi = (i128::from(on_last) + i128::from(shift) - i128::from(first)).min(i128::from(frames) - 1);
+            if hi < lo {
                 return None;
             }
-            let frames = last - first_frame + 1;
-            let doc_t0 = (o.offset + fps.exact_time(first_frame) - o.start).max(0.0);
-            let opacity = if o.opacity.is_finite() {
-                o.opacity.clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
-            // The rectangle's position is where the picture is laid, not what it shows, so a
-            // title that is only moved keeps its frames.
-            let key = digest(|h| {
-                h.update(b"sequence");
-                hash_svg(h, &o.svg);
-                h.update(doc_t0.to_bits().to_le_bytes());
-                h.update([fps.num.to_le_bytes(), fps.den.to_le_bytes()].concat());
-                h.update(frames.to_le_bytes());
-                h.update([rect.w.to_le_bytes(), rect.h.to_le_bytes()].concat());
-                h.update(opacity.to_bits().to_le_bytes());
-            });
-            let dir = root.join(key);
-            let pattern = format!("{}/%06d.png", dir.to_string_lossy().replace('%', "%%"));
-            Some(SvgSeq {
-                svg: &o.svg,
-                dir,
-                pattern,
-                first_frame,
-                frames,
+            let (from, to) = (u64::try_from(lo).ok()?, u64::try_from(hi).ok()?);
+            let lands_on = u64::try_from(i128::from(first) + lo - i128::from(shift)).ok()?;
+            let doc_t0 = (whole.offset + fps.exact_time(first) - whole.start).max(0.0);
+            let layout = Layout {
+                lands_on,
+                window_start: on_first,
+                first_picture: from,
+                pictures: to - from + 1,
                 doc_t0,
-                fps,
-                rect,
-                opacity,
-                start: o.start,
-                end: o.end,
-            })
+                frames,
+            };
+            Some(seq_of(o, &root, fps, rect, layout))
         })
         .collect()
 }
@@ -217,10 +421,24 @@ pub(super) fn svg_sequences<'a>(timeline: &'a Timeline, fmt: &ExportFormat) -> V
 /// The `-i` of each sequence, after the clips' inputs.
 pub(super) fn push_inputs(seqs: &[SvgSeq<'_>], fmt: &ExportFormat, args: &mut Vec<String>) {
     for s in seqs {
-        args.extend(["-f", "image2", "-framerate"].map(String::from));
-        args.push(format!("{}", fmt.fps));
+        match s.kind {
+            Kind::Frames => {
+                args.extend(["-f", "image2", "-framerate"].map(String::from));
+                args.push(format!("{}", fmt.fps));
+                if s.first_picture > 0 {
+                    args.push("-start_number".to_string());
+                    args.push(s.first_picture.to_string());
+                }
+            }
+            // One file, read again and again at the output's rate: `-pattern_type none` makes a `%`
+            // or a `[` in the path a character of it, not a pattern.
+            Kind::Held => {
+                args.extend(["-f", "image2", "-pattern_type", "none", "-loop", "1", "-framerate"].map(String::from));
+                args.push(format!("{}", fmt.fps));
+            }
+        }
         args.push("-i".to_string());
-        args.push(s.pattern.clone());
+        args.push(s.input.clone());
     }
 }
 
@@ -256,40 +474,119 @@ pub(super) fn push_chains(seqs: &[SvgSeq<'_>], first_input: usize, from: &str, t
     }
 }
 
+// ---- drawing -------------------------------------------------------------------------------------
+
+/// The cancel and the deadline of a preparation, looked at between every step that can take a while.
+struct Control<'a> {
+    cancel: &'a dyn Fn() -> bool,
+    deadline: Option<Instant>,
+}
+
+impl Control<'_> {
+    fn check(&self) -> Result<()> {
+        if (self.cancel)() {
+            return Err(Error::Cancelled);
+        }
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(Error::Engine(TOO_HEAVY.to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// The last few documents read, most recent first, by a digest of their source.
+struct DocCache(Mutex<VecDeque<(String, Arc<SvgDoc>)>>);
+
+impl DocCache {
+    const fn new() -> Self {
+        DocCache(Mutex::new(VecDeque::new()))
+    }
+
+    /// `svg` read, or the read kept from before. The lock is not held while it is read.
+    fn get(&self, svg: &str) -> Result<Arc<SvgDoc>> {
+        let key = digest(|h| hash_svg(h, svg));
+        {
+            let mut cache = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(at) = cache.iter().position(|(k, _)| *k == key) {
+                let hit = cache.remove(at).expect("just found");
+                let doc = hit.1.clone();
+                cache.push_front(hit);
+                return Ok(doc);
+            }
+        }
+        let doc = Arc::new(SvgDoc::parse(svg).map_err(|e| Error::Engine(format!("an animated title cannot be drawn: {e}")))?);
+        let mut cache = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        cache.retain(|(k, _)| *k != key);
+        cache.push_front((key, doc.clone()));
+        cache.truncate(DOC_CACHE);
+        Ok(doc)
+    }
+}
+
+/// `svg` read, from the few documents kept (a scrub draws one title again and again, and reading
+/// a heavy one takes up to a second and a half).
+fn parsed(svg: &str) -> Result<Arc<SvgDoc>> {
+    static CACHE: DocCache = DocCache::new();
+    CACHE.get(svg)
+}
+
 /// One stretch of consecutive frames that are the same picture.
+#[derive(Debug)]
 struct Run {
     first: u64,
     len: u64,
     doc_t: f64,
 }
 
-/// `seq`'s frames grouped into runs of identical documents: a title that holds still between its
-/// moves is drawn once per hold, and the frames after the first are links to it.
-fn runs(seq: &SvgSeq<'_>, doc: &SvgDoc) -> Vec<Run> {
-    if !doc.is_animated() {
-        return vec![Run {
-            first: 0,
-            len: seq.frames,
-            doc_t: seq.doc_t0,
-        }];
+/// The pictures of `seq` that are not on disk, grouped into runs of identical documents: a title
+/// that holds still between its moves is drawn once per hold, and the frames after the first are
+/// links to it. A picture that is there already (a run cut short earlier, or another preparation of
+/// the same title) breaks a run and is not looked at again.
+fn runs(seq: &SvgSeq<'_>, doc: &SvgDoc, ctl: &Control<'_>) -> Result<Vec<Run>> {
+    if seq.kind == Kind::Held {
+        return Ok(if raster::frame_path(&seq.dir, 0).is_file() {
+            Vec::new()
+        } else {
+            vec![Run {
+                first: 0,
+                len: 1,
+                doc_t: 0.0,
+            }]
+        });
     }
+    let animated = doc.is_animated();
     let mut out: Vec<Run> = Vec::new();
-    let mut previous: Option<String> = None;
-    for j in 0..seq.frames {
+    let mut previous: Option<(u64, String)> = None;
+    let needed = seq.needed();
+    for j in needed.clone() {
+        if (j - needed.start).is_multiple_of(SCAN_STRIDE) {
+            ctl.check()?;
+        }
+        if raster::frame_path(&seq.dir, j).is_file() {
+            previous = None;
+            continue;
+        }
         let doc_t = seq.doc_t0 + seq.fps.exact_time(j);
-        let now = doc.at(doc_t);
+        let text = if animated { doc.at(doc_t) } else { String::new() };
         match (&previous, out.last_mut()) {
-            (Some(before), Some(run)) if *before == now => run.len += 1,
+            (Some((before_j, before)), Some(run)) if *before_j + 1 == j && *before == text => run.len += 1,
             _ => out.push(Run { first: j, len: 1, doc_t }),
         }
-        previous = Some(now);
+        previous = Some((j, text));
     }
-    out
+    Ok(out)
+}
+
+/// What a worker needs to draw a run of one sequence.
+struct Job<'a> {
+    seq: &'a SvgSeq<'a>,
+    doc: Arc<SvgDoc>,
 }
 
 /// Draw one run: its first frame is rendered (unless a previous, interrupted attempt left it —
 /// a frame is renamed into place whole, so one that is there is right), the rest linked to it.
-fn draw_run(seq: &SvgSeq<'_>, doc: &SvgDoc, run: &Run, stop: &AtomicBool) -> Result<()> {
+fn draw_run(job: &Job<'_>, run: &Run, stop: &AtomicBool) -> Result<()> {
+    let (seq, doc) = (job.seq, &job.doc);
     let first = raster::frame_path(&seq.dir, run.first);
     if !first.exists() {
         let picture = raster::render(&doc.at(run.doc_t), seq.rect.w, seq.rect.h, seq.opacity)?;
@@ -307,14 +604,39 @@ fn draw_run(seq: &SvgSeq<'_>, doc: &SvgDoc, run: &Run, stop: &AtomicBool) -> Res
     Ok(())
 }
 
+/// How many drawing threads the memory allows: each holds a picture of its sequence's size three
+/// times over and, per draw, the widest image of its document decoded twice.
+fn workers_for(threads: usize, jobs: &[Job<'_>], units: usize) -> usize {
+    let per_worker = jobs
+        .iter()
+        .map(|j| 12 * u64::from(j.seq.rect.w) * u64::from(j.seq.rect.h) + 8 * j.doc.widest_image_pixels())
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let by_memory = usize::try_from(RENDER_MEMORY / per_worker).unwrap_or(usize::MAX).max(1);
+    threads.min(by_memory).clamp(1, units.max(1))
+}
+
+/// Whether `seq` is on disk and finished: the marker, and the first and last picture it needs (a
+/// marker is a promise made once, and the cache can lose a file under it).
+fn is_ready(seq: &SvgSeq<'_>) -> bool {
+    let needed = seq.needed();
+    raster::is_complete(&seq.dir)
+        && raster::frame_path(&seq.dir, needed.start).is_file()
+        && raster::frame_path(&seq.dir, needed.end - 1).is_file()
+}
+
 /// Have every sequence in `seqs` on disk, drawing what is missing on `threads` threads, and return
 /// a [`Pin`] on each so the cache keeps them until the caller (ffmpeg) is done.
 ///
-/// `cancel` is polled about forty times a second and ends the work with [`Error::Cancelled`];
-/// `deadline` ends it with an error (the stream's "too heavy to preview"). A sequence is usable
-/// only once its marker is written, which is last, so a stopped run leaves nothing that looks
-/// finished — and what it did draw is kept, because a frame is only ever renamed into place whole
-/// and its content is fixed by the directory's name, so the next attempt carries on from it.
+/// `cancel` is looked at about forty times a second, and between the steps that come before the
+/// drawing (reading each document, comparing its frames) as well: it ends the work with
+/// [`Error::Cancelled`]. A picture being drawn when it fires is finished first. `deadline` ends it with
+/// an error (the stream's "too heavy to preview"). A sequence is marked finished only when the
+/// pictures it needs are all there, last, so a stopped run leaves nothing that looks complete — and
+/// what it did draw is kept, because a frame is only ever renamed into place whole and its content is
+/// fixed by the directory's name, so the next attempt carries on from it. The drawing threads run
+/// below normal priority when the budget is under 100%, and no more of them than memory allows.
 pub(super) fn prepare(
     seqs: &[SvgSeq<'_>],
     threads: usize,
@@ -323,9 +645,17 @@ pub(super) fn prepare(
 ) -> Result<Vec<Pin>> {
     // Pinned first: a sequence found finished must not be evicted before ffmpeg reads it.
     let pins: Vec<Pin> = seqs.iter().map(|s| Pin::new(&s.dir)).collect();
+    let ctl = Control { cancel, deadline };
     let mut todo: Vec<&SvgSeq<'_>> = Vec::new();
     for s in seqs {
-        if raster::is_complete(&s.dir) {
+        if is_ready(s) {
+            raster::touch(&s.dir);
+        } else if !raster::is_complete(&s.dir) && raster::has_frames(&s.dir, s.needed()) {
+            // Drawn by an earlier stream (from the middle of the title) and never marked: it is all
+            // there, and it is the whole of it, or the marker waits for the rest.
+            if s.needs_all() {
+                raster::mark_complete(&s.dir)?;
+            }
             raster::touch(&s.dir);
         } else {
             todo.push(s);
@@ -334,21 +664,25 @@ pub(super) fn prepare(
     if todo.is_empty() {
         return Ok(pins);
     }
-    let docs = todo
-        .iter()
-        .map(|s| SvgDoc::parse(s.svg).map_err(|e| Error::Engine(format!("an animated title cannot be drawn: {e}"))))
-        .collect::<Result<Vec<_>>>()?;
-    let units: Vec<(usize, Run)> = todo
-        .iter()
-        .zip(&docs)
-        .enumerate()
-        .flat_map(|(i, (s, doc))| runs(s, doc).into_iter().map(move |r| (i, r)))
-        .collect();
+    let mut jobs: Vec<Job<'_>> = Vec::new();
+    for s in &todo {
+        ctl.check()?;
+        jobs.push(Job {
+            seq: s,
+            doc: parsed(s.svg)?,
+        });
+    }
+    let mut units: Vec<(usize, Run)> = Vec::new();
+    for (i, job) in jobs.iter().enumerate() {
+        units.extend(runs(job.seq, &job.doc, &ctl)?.into_iter().map(|r| (i, r)));
+    }
+    let workers = workers_for(threads, &jobs, units.len());
     tracing::debug!(
         sequences = todo.len(),
         pictures = units.len(),
-        frames = todo.iter().map(|s| s.frames).sum::<u64>(),
+        frames = todo.iter().map(|s| s.pictures).sum::<u64>(),
         threads,
+        workers,
         "drawing animated titles"
     );
 
@@ -356,16 +690,17 @@ pub(super) fn prepare(
     let stop = AtomicBool::new(false);
     let failure: Mutex<Option<Error>> = Mutex::new(None);
     let drawn = AtomicU64::new(0);
-    let (mut cancelled, mut timed_out) = (false, false);
+    let mut halted: Option<Error> = None;
     std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..threads.clamp(1, units.len().max(1)))
+        let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
+                    cpu::background_thread();
                     while !stop.load(Ordering::Relaxed) {
                         let Some((i, run)) = units.get(next.fetch_add(1, Ordering::Relaxed)) else {
                             break;
                         };
-                        match draw_run(todo[*i], &docs[*i], run, &stop) {
+                        match draw_run(&jobs[*i], run, &stop) {
                             Ok(()) => {
                                 drawn.fetch_add(run.len, Ordering::Relaxed);
                             }
@@ -378,33 +713,38 @@ pub(super) fn prepare(
                 })
             })
             .collect();
-        while !workers.iter().all(|w| w.is_finished()) {
+        while !handles.iter().all(|w| w.is_finished()) {
             std::thread::sleep(POLL);
-            if stop.load(Ordering::Relaxed) {
-                continue;
-            }
-            if cancel() {
-                cancelled = true;
-                stop.store(true, Ordering::Relaxed);
-            } else if deadline.is_some_and(|d| Instant::now() >= d) {
-                timed_out = true;
-                stop.store(true, Ordering::Relaxed);
+            if halted.is_none() && !stop.load(Ordering::Relaxed) {
+                if let Err(e) = ctl.check() {
+                    halted = Some(e);
+                    stop.store(true, Ordering::Relaxed);
+                }
             }
         }
     });
     if let Some(e) = failure.into_inner().unwrap_or_else(PoisonError::into_inner) {
         return Err(e);
     }
-    if cancelled {
-        return Err(Error::Cancelled);
-    }
-    if timed_out {
-        return Err(Error::Engine(TOO_HEAVY.to_string()));
+    if let Some(e) = halted {
+        return Err(e);
     }
     for s in &todo {
-        raster::mark_complete(&s.dir)?;
+        let needed = s.needed();
+        let there = raster::has_frames(&s.dir, needed.clone());
+        if !there {
+            return Err(Error::Engine(
+                "an animated title's pictures were removed while they were being drawn".to_string(),
+            ));
+        }
+        // A stream from the middle of a title draws the rest of it; the marker is the whole of it.
+        if s.needs_all() || raster::has_frames(&s.dir, 0..s.frames) {
+            raster::mark_complete(&s.dir)?;
+        }
     }
-    raster::trim();
+    if drawn.load(Ordering::Relaxed) > 0 {
+        raster::trim();
+    }
     Ok(pins)
 }
 
@@ -443,7 +783,7 @@ pub(super) fn prepare_export(
             waiting: Some(waiting),
         });
     };
-    if seqs.iter().all(|s| raster::is_complete(&s.dir)) {
+    if seqs.iter().all(is_ready) {
         return prepare(&seqs, 1, None, cancel).map(Some);
     }
     let lease = {
@@ -462,20 +802,49 @@ pub(super) fn prepare_export(
     }
 }
 
-/// Have the titles of the playback stream's cut (`sliced` at the preview's `fmt`) on disk: on the
-/// budget's threads, no queue — what the user is waiting to see is never gated — and for at most
-/// [`PREVIEW_PREPARE_LIMIT`].
-pub(super) fn prepare_preview(sliced: &Timeline, fmt: &ExportFormat) -> Result<Vec<Pin>> {
-    let seqs = svg_sequences(sliced, fmt);
+/// The one preparation of the playback stream that may be drawing at a time. A seek, or a second
+/// Play, supersedes the stream before it, and that one's `cancel` fires; until it has noticed, the
+/// new one waits here instead of starting a second set of threads beside it.
+static PREVIEW_DRAWING: AtomicBool = AtomicBool::new(false);
+
+struct PreviewSlot;
+
+impl PreviewSlot {
+    fn take(ctl: &Control<'_>) -> Result<Self> {
+        loop {
+            if PREVIEW_DRAWING
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(PreviewSlot);
+            }
+            ctl.check()?;
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+impl Drop for PreviewSlot {
+    fn drop(&mut self) {
+        PREVIEW_DRAWING.store(false, Ordering::Release);
+    }
+}
+
+/// Have the titles of the playback stream (`seqs`, from [`stream_sequences`]) on disk: on the
+/// budget's threads, no queue — what the user is waiting to see is never gated — for at most
+/// [`PREVIEW_PREPARE_LIMIT`] from now (waiting for an earlier preparation counts), one preparation
+/// at a time, and ended at once by `cancel` (the stream was stopped or superseded).
+pub(super) fn prepare_preview(seqs: &[SvgSeq<'_>], cancel: &dyn Fn() -> bool) -> Result<Vec<Pin>> {
     if seqs.is_empty() {
         return Ok(Vec::new());
     }
-    prepare(
-        &seqs,
-        cpu::budget_threads(),
-        Some(Instant::now() + PREVIEW_PREPARE_LIMIT),
-        &|| false,
-    )
+    let deadline = Instant::now() + PREVIEW_PREPARE_LIMIT;
+    let ctl = Control {
+        cancel,
+        deadline: Some(deadline),
+    };
+    let _slot = PreviewSlot::take(&ctl)?;
+    prepare(seqs, cpu::budget_threads(), Some(deadline), cancel)
 }
 
 // ---- a picture for a still ------------------------------------------------------------------------
@@ -505,11 +874,7 @@ pub(super) fn still_svgs<'a>(timeline: &'a Timeline, w: u32, h: u32, t: f64) -> 
         .filter_map(|o| {
             let rect = rect_px(o, w, h)?;
             let doc_t = o.doc_time(t);
-            let opacity = if o.opacity.is_finite() {
-                o.opacity.clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
+            let opacity = clamped_opacity(o);
             let key = digest(|hash| {
                 hash.update(b"still");
                 hash_svg(hash, &o.svg);
@@ -528,10 +893,11 @@ pub(super) fn still_svgs<'a>(timeline: &'a Timeline, w: u32, h: u32, t: f64) -> 
         .collect()
 }
 
-/// The `-i` of each picture, after the clips' inputs.
+/// The `-i` of each picture, after the clips' inputs. `-pattern_type none` makes the path one file
+/// whatever it holds: a `%d`, or a `[` or `*` that the image demuxer would take for a pattern.
 pub(super) fn push_still_inputs(live: &[StillSvg<'_>], args: &mut Vec<String>) {
     for s in live {
-        args.push("-i".to_string());
+        args.extend(["-f", "image2", "-pattern_type", "none", "-i"].map(String::from));
         args.push(s.path.to_string_lossy().into_owned());
     }
 }
@@ -554,20 +920,28 @@ pub(super) fn push_still_chains(live: &[StillSvg<'_>], first_input: usize, from:
 }
 
 /// Have the pictures of a still on disk (drawn here, on this thread: a moment read is never gated)
-/// and pinned until the returned pins are dropped.
+/// and pinned until the returned pins are dropped. The cache is trimmed only when a picture was
+/// written (a scrub that finds everything drawn does not walk the directory), and after it.
 pub(super) fn ensure_stills(live: &[StillSvg<'_>]) -> Result<Vec<Pin>> {
+    ensure_stills_with(live, &raster::trim)
+}
+
+/// [`ensure_stills`] with the cache's trim given (a test counts the calls).
+fn ensure_stills_with(live: &[StillSvg<'_>], trim: &dyn Fn()) -> Result<Vec<Pin>> {
     let pins: Vec<Pin> = live.iter().map(|s| Pin::new(&s.path)).collect();
+    let mut wrote = false;
     for s in live {
         if s.path.is_file() {
             raster::touch(&s.path);
             continue;
         }
-        let doc = SvgDoc::parse(s.svg).map_err(|e| Error::Engine(format!("an animated title cannot be drawn: {e}")))?;
+        let doc = parsed(s.svg)?;
         let picture = raster::render(&doc.at(s.doc_t), s.rect.w, s.rect.h, s.opacity)?;
         raster::write_atomic(&s.path, &raster::encode_png(&picture)?)?;
+        wrote = true;
     }
-    if !live.is_empty() {
-        raster::trim();
+    if wrote {
+        trim();
     }
     Ok(pins)
 }
@@ -645,10 +1019,11 @@ mod tests {
             assert_eq!(s.doc_t0, 0.0);
             assert_eq!((s.rect.x, s.rect.y, s.rect.w, s.rect.h), (0, 0, 1920, 1080));
             assert!(
-                s.pattern.starts_with("/kerf-test/svg/") && s.pattern.ends_with("/%06d.png"),
+                s.input.starts_with("/kerf-test/svg/") && s.input.ends_with("/%06d.png"),
                 "{}",
-                s.pattern
+                s.input
             );
+            assert_eq!((s.kind, s.first_picture, s.pictures, s.frames), (Kind::Frames, 0, 61, 61));
 
             // Between two frames: the first frame at or after the start, the last at or before the end.
             tl.svg_overlays[0].start = 1.01;
@@ -728,9 +1103,9 @@ mod tests {
         crate::svg::raster::with_pinned_dir("/home/a%b/svg", || {
             let (tl, _) = cut(vec![overlay(sliding(), 0.0, 1.0)]);
             let s = &svg_sequences(&tl, &fmt(1920, 1080, 30.0))[0];
-            assert!(s.pattern.starts_with("/home/a%%b/svg/"), "{}", s.pattern);
-            assert!(s.pattern.ends_with("/%06d.png"));
-            assert_eq!(s.pattern.matches('%').count(), 3, "one escaped pair and one frame number");
+            assert!(s.input.starts_with("/home/a%%b/svg/"), "{}", s.input);
+            assert!(s.input.ends_with("/%06d.png"));
+            assert_eq!(s.input.matches('%').count(), 3, "one escaped pair and one frame number");
         });
     }
 
@@ -974,8 +1349,13 @@ mod tests {
     fn a_title_that_holds_still_is_drawn_once_and_linked() {
         let root = scratch("links");
         let f = fmt(320, 180, 10.0);
-        // Static: one picture, nine links.
-        let (tl, _) = titled(&doc("<rect width=\"192\" height=\"108\" fill=\"#123456\"/>"), 0.0, 0.9);
+        // Text that mentions an animation the reader dropped (animateMotion is not supported) cannot be
+        // told from one that moves without reading it, so it is a sequence: one picture, nine links.
+        let (tl, _) = titled(
+            &doc("<rect width=\"192\" height=\"108\" fill=\"#123456\"><animateMotion dur=\"1s\" path=\"M0,0 L1,1\"/></rect>"),
+            0.0,
+            0.9,
+        );
         crate::svg::raster::with_pinned_dir(root.to_str().unwrap(), || {
             let seqs = svg_sequences(&tl, &f);
             let _pins = prepare(&seqs, 4, None, &|| false).unwrap();
@@ -1002,7 +1382,11 @@ mod tests {
         crate::svg::raster::with_pinned_dir(root.to_str().unwrap(), || {
             let seqs = svg_sequences(&tl, &f);
             let doc = SvgDoc::parse(seqs[0].svg).unwrap();
-            let r = runs(&seqs[0], &doc);
+            let ctl = Control {
+                cancel: &|| false,
+                deadline: None,
+            };
+            let r = runs(&seqs[0], &doc, &ctl).unwrap();
             assert_eq!(r.len(), 6, "frames 0..=4 differ, 5..=9 are the same");
             assert_eq!((r[5].first, r[5].len), (5, 5));
         });
@@ -1071,8 +1455,9 @@ mod tests {
         crate::svg::raster::with_pinned_dir(root.to_str().unwrap(), || {
             let seqs = svg_sequences(&tl, &f);
             let pins = prepare(&seqs, 2, None, &|| false).unwrap();
-            raster::trim_to(&root, 0, &|p| pins.iter().any(|_| p == seqs[0].dir));
-            assert!(raster::is_complete(&seqs[0].dir));
+            raster::trim_to(&root, 0, &|_| false);
+            assert!(raster::is_complete(&seqs[0].dir), "the pins the preparation returned hold it");
+            drop(pins);
             raster::trim_to(&root, 0, &|_| false);
             assert!(!seqs[0].dir.exists());
         });
@@ -1115,5 +1500,538 @@ mod tests {
             assert!(err.to_string().contains("cannot be drawn"), "{err}");
         });
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ---- a document that cannot move ------------------------------------------------------------
+
+    /// Artwork with nothing in it that moves.
+    fn still_art() -> String {
+        doc("<rect width=\"192\" height=\"108\" fill=\"#123456\"/>")
+    }
+
+    #[test]
+    fn a_document_that_cannot_move_is_one_picture_ffmpeg_loops() {
+        crate::svg::raster::with_pinned_dir(PIN, || {
+            let (mut tl, _) = cut(vec![overlay(still_art(), 1.0, 3.0)]);
+            let f = fmt(1920, 1080, 30.0);
+            let s = svg_sequences(&tl, &f).remove(0);
+            assert_eq!(
+                (s.kind, s.frames, s.first_picture, s.pictures, s.first_frame),
+                (Kind::Held, 1, 0, 1, 30)
+            );
+            assert!(
+                s.input.starts_with("/kerf-test/svg/") && s.input.ends_with("/000000.png"),
+                "{}",
+                s.input
+            );
+            let mut args = Vec::new();
+            push_inputs(std::slice::from_ref(&s), &f, &mut args);
+            assert_eq!(
+                args.join(" "),
+                format!("-f image2 -pattern_type none -loop 1 -framerate 30 -i {}", s.input)
+            );
+            // Counted into the output the same way as a sequence's first picture.
+            let mut chains = Vec::new();
+            push_chains(std::slice::from_ref(&s), 1, "vsvg", "outv", &mut chains);
+            assert_eq!(chains[0], "[1:v]settb=expr=1/30,setpts=N+30[svg0]");
+            assert!(chains[1].ends_with("enable='between(t,1,3)'[outv]"), "{chains:?}");
+
+            // What decides the picture is the artwork, its size and its opacity: not when the title
+            // starts, how long it runs, where in its clock it starts, or the rate.
+            let key = |tl: &Timeline, f: &ExportFormat| svg_sequences(tl, f)[0].dir.clone();
+            let base = key(&tl, &f);
+            tl.svg_overlays[0].start = 2.0;
+            tl.svg_overlays[0].end = 9.0;
+            tl.svg_overlays[0].offset = 0.7;
+            tl.svg_overlays[0].x = 0.3;
+            assert_eq!(key(&tl, &f), base);
+            assert_eq!(key(&tl, &fmt(1920, 1080, 25.0)), base);
+            assert_ne!(key(&tl, &fmt(960, 540, 30.0)), base, "size");
+            let mut other = tl.clone();
+            other.svg_overlays[0].opacity = 0.5;
+            assert_ne!(key(&other, &f), base, "opacity");
+            other.svg_overlays[0].opacity = 1.0;
+            other.svg_overlays[0].svg = still_art().replace("#123456", "#123457");
+            assert_ne!(key(&other, &f), base, "artwork");
+            // A title that moves is a sequence, as ever.
+            let (moving, _) = cut(vec![overlay(sliding(), 1.0, 3.0)]);
+            assert_eq!(svg_sequences(&moving, &f)[0].kind, Kind::Frames);
+        });
+    }
+
+    #[test]
+    fn a_percent_in_the_path_of_a_held_picture_is_not_doubled() {
+        // `-pattern_type none` reads the path as it is: it is the sequence's `%06d` that needs `%%`.
+        crate::svg::raster::with_pinned_dir("/home/a%b/svg", || {
+            let (tl, _) = cut(vec![overlay(still_art(), 0.0, 1.0)]);
+            let s = &svg_sequences(&tl, &fmt(1920, 1080, 30.0))[0];
+            assert!(
+                s.input.starts_with("/home/a%b/svg/") && !s.input.contains("%%"),
+                "{}",
+                s.input
+            );
+        });
+    }
+
+    #[test]
+    fn a_held_title_is_one_file_and_found_drawn_the_next_time() {
+        let root = scratch("held");
+        let f = fmt(320, 180, 10.0);
+        let (tl, _) = titled(&still_art(), 0.0, 0.9);
+        crate::svg::raster::with_pinned_dir(root.to_str().unwrap(), || {
+            let seqs = svg_sequences(&tl, &f);
+            let dir = seqs[0].dir.clone();
+            let pins = prepare(&seqs, 3, None, &|| false).unwrap();
+            let mut files: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            files.sort();
+            assert_eq!(files, ["000000.png", "complete"], "one picture, not one a frame");
+            let p = tiny_skia::Pixmap::decode_png(&std::fs::read(raster::frame_path(&dir, 0)).unwrap()).unwrap();
+            assert_eq!((p.width(), p.height()), (32, 18));
+            assert!(p.pixels().iter().all(|c| c.alpha() == 255));
+            drop(pins);
+            // Trimmed to half a second later and shifted: the same picture, found drawn.
+            let (later, _) = titled(&still_art(), 0.4, 0.5);
+            let again = svg_sequences(&later, &f);
+            assert_eq!(again[0].dir, dir);
+            assert!(is_ready(&again[0]));
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ---- positions that are not on the timeline ------------------------------------------------
+
+    #[test]
+    fn a_title_at_a_position_nowhere_near_the_cut_is_left_out_without_a_search_for_its_frame() {
+        crate::svg::raster::with_pinned_dir(PIN, || {
+            let f = fmt(1920, 1080, 30.0);
+            for (start, end, drawn) in [
+                (1e300, 1e301, false),
+                (f64::MAX, f64::MAX, false),
+                (1e18, 1e19, false),
+                (20.0, 1e300, false),
+                (10.0, 11.0, false),
+                (-1e300, 3.0, true),
+                (1.0, 1e300, true),
+                (1.0, f64::MAX, true),
+                (f64::NEG_INFINITY, 3.0, false),
+                (1.0, f64::INFINITY, false),
+                (f64::NAN, 3.0, false),
+            ] {
+                let (tl, _) = cut(vec![overlay(sliding(), start, end)]);
+                let seqs = svg_sequences(&tl, &f);
+                assert_eq!(!seqs.is_empty(), drawn, "{start} .. {end}");
+            }
+            // A title that runs on past the cut is drawn up to the cut's last frame.
+            let (tl, _) = cut(vec![overlay(sliding(), 9.0, 1e300)]);
+            let s = &svg_sequences(&tl, &f)[0];
+            assert_eq!(s.first_frame + s.frames, 300);
+            // The helpers hold on their own too: nothing loops, nothing overflows.
+            let fps = Rational::from_fps(30.0).unwrap();
+            assert_eq!(first_frame_from(fps, f64::NAN), 0);
+            assert_eq!(first_frame_from(fps, -5.0), 0);
+            assert!(first_frame_from(fps, f64::MAX) > 0);
+            assert_eq!(last_frame_to(fps, f64::NAN, false), None);
+            assert_eq!(last_frame_to(fps, -1.0, false), None);
+            assert!(last_frame_to(fps, f64::INFINITY, true).is_some());
+            assert!(last_frame_to(fps, 1e300, false).is_some());
+        });
+    }
+
+    // ---- the playback stream -----------------------------------------------------------------------
+
+    /// What the stream from `start` reads of `tl`'s first title: the directory, the output frame the
+    /// first picture lands on, the pictures read and the sequence's length.
+    fn streamed(tl: &Timeline, start: f64, f: &ExportFormat) -> Vec<(PathBuf, u64, Range<u64>, u64)> {
+        let sliced = tl.slice(start, tl.duration());
+        stream_sequences(&tl.svg_overlays, tl.duration(), &sliced, start, f)
+            .into_iter()
+            .map(|s| (s.dir.clone(), s.first_frame, s.needed(), s.frames))
+            .collect()
+    }
+
+    #[test]
+    fn the_stream_reads_the_titles_own_sequence_from_wherever_the_playhead_is() {
+        crate::svg::raster::with_pinned_dir(PIN, || {
+            let (tl, _) = cut(vec![overlay(sliding(), 1.0, 3.0)]);
+            let f = fmt(1920, 1080, 30.0);
+            // Frames 30..=90 of the cut are the title: 61 pictures, the export's.
+            let whole = svg_sequences(&tl, &f).remove(0);
+            assert_eq!((whole.first_frame, whole.frames), (30, 61));
+
+            // From the start the stream is the export.
+            assert_eq!(streamed(&tl, 0.0, &f), [(whole.dir.clone(), 30, 0..61, 61)]);
+            // From the middle (2 s is frame 60): the same directory, the rest of it, from the first frame.
+            assert_eq!(streamed(&tl, 2.0, &f), [(whole.dir.clone(), 0, 30..61, 61)]);
+            // From before the title: all of it, landing 15 frames in.
+            assert_eq!(streamed(&tl, 0.5, &f), [(whole.dir.clone(), 15, 0..61, 61)]);
+            // From a tenth of a second before it ends: the last four pictures (the end is closed).
+            assert_eq!(streamed(&tl, 2.9, &f), [(whole.dir, 0, 57..61, 61)]);
+            // Once it is over there is nothing to read.
+            assert!(streamed(&tl, 3.5, &f).is_empty());
+            assert!(streamed(&tl, 9.5, &f).is_empty());
+
+            // The graph: `-start_number` names the first picture, and the first one is counted onto
+            // the output's frame it lands on.
+            let sliced = tl.slice(2.0, tl.duration());
+            let seqs = stream_sequences(&tl.svg_overlays, tl.duration(), &sliced, 2.0, &f);
+            let mut args = Vec::new();
+            push_inputs(&seqs, &f, &mut args);
+            assert_eq!(
+                args.join(" "),
+                format!("-f image2 -framerate 30 -start_number 30 -i {}", seqs[0].input)
+            );
+            let mut chains = Vec::new();
+            push_chains(&seqs, 1, "vsvg", "outv", &mut chains);
+            assert_eq!(chains[0], "[1:v]settb=expr=1/30,setpts=N+0[svg0]");
+            assert!(chains[1].contains("between(t,0,1)"), "the sliced window: {chains:?}");
+            // The start of the title has no `-start_number` (neutral values are left out).
+            let sliced = tl.slice(0.0, tl.duration());
+            let seqs = stream_sequences(&tl.svg_overlays, tl.duration(), &sliced, 0.0, &f);
+            let mut args = Vec::new();
+            push_inputs(&seqs, &f, &mut args);
+            assert!(!args.contains(&"-start_number".to_string()), "{args:?}");
+        });
+    }
+
+    #[test]
+    fn a_playhead_between_frames_keeps_the_exact_sequence_of_its_own() {
+        crate::svg::raster::with_pinned_dir(PIN, || {
+            let (tl, _) = cut(vec![overlay(sliding(), 1.0, 3.0)]);
+            let f = fmt(1920, 1080, 30.0);
+            let whole = svg_sequences(&tl, &f).remove(0);
+            // 2.01 s is a third of a frame past frame 60: the cut's frames are not the title's.
+            let off = streamed(&tl, 2.01, &f);
+            assert_eq!(off.len(), 1);
+            assert_ne!(off[0].0, whole.dir);
+            assert_eq!(off[0].2.start, 0, "all of its own pictures, read from the first");
+            // And it is exactly what the cut's own sequence is.
+            let sliced = tl.slice(2.01, tl.duration());
+            let exact = svg_sequences(&sliced, &f);
+            assert_eq!(off[0].0, exact[0].dir);
+            // A playhead a millionth of a frame off a frame is on it.
+            let near = streamed(&tl, 2.0 + 1e-9, &f);
+            assert_eq!(near[0].0, whole.dir);
+            // A frame rate that is not whole: playheads on its frames share a directory too.
+            let f = fmt(1920, 1080, 29.97);
+            let whole = svg_sequences(&tl, &f).remove(0);
+            for k in [0u64, 31, 45, 60] {
+                let start = k as f64 * 100.0 / 2997.0;
+                assert_eq!(streamed(&tl, start, &f)[0].0, whole.dir, "frame {k}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_held_title_in_the_stream_covers_the_window_it_is_on() {
+        crate::svg::raster::with_pinned_dir(PIN, || {
+            let (tl, _) = cut(vec![overlay(still_art(), 1.0, 3.0)]);
+            let f = fmt(1920, 1080, 30.0);
+            let sliced = tl.slice(2.0, tl.duration());
+            let seqs = stream_sequences(&tl.svg_overlays, tl.duration(), &sliced, 2.0, &f);
+            assert_eq!(seqs[0].kind, Kind::Held);
+            assert_eq!(seqs[0].first_frame, 0, "from the first frame of the window");
+            let mut args = Vec::new();
+            push_inputs(&seqs, &f, &mut args);
+            assert!(
+                !args.contains(&"-start_number".to_string()) && args.contains(&"-loop".to_string()),
+                "{args:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_stream_from_the_middle_draws_the_rest_and_one_from_earlier_draws_only_the_difference() {
+        let root = scratch("suffix");
+        let f = fmt(320, 180, 10.0);
+        // Frames 10..=30 of the cut: 21 pictures.
+        let (tl, _) = titled(&sliding(), 1.0, 3.0);
+        crate::svg::raster::with_pinned_dir(root.to_str().unwrap(), || {
+            let sliced = tl.slice(2.0, tl.duration());
+            let seqs = stream_sequences(&tl.svg_overlays, tl.duration(), &sliced, 2.0, &f);
+            assert_eq!((seqs[0].needed(), seqs[0].frames), (10..21, 21));
+            let dir = seqs[0].dir.clone();
+            let pins = prepare(&seqs, 2, None, &|| false).unwrap();
+            assert!(!raster::is_complete(&dir), "a part is not the whole");
+            assert!(raster::has_frames(&dir, 10..21) && !raster::frame_path(&dir, 9).exists());
+            // Played again: nothing to do (and nothing is drawn).
+            let stamps: Vec<_> = (10..21)
+                .map(|j| std::fs::metadata(raster::frame_path(&dir, j)).unwrap().modified().unwrap())
+                .collect();
+            drop(prepare(&seqs, 2, None, &|| false).unwrap());
+            drop(pins);
+
+            // From the start of the title: the first half is drawn, the rest kept, and it is whole.
+            let sliced = tl.slice(0.0, tl.duration());
+            let all = stream_sequences(&tl.svg_overlays, tl.duration(), &sliced, 0.0, &f);
+            assert_eq!(all[0].dir, dir);
+            let pins = prepare(&all, 2, None, &|| false).unwrap();
+            assert!(raster::is_complete(&dir) && raster::has_frames(&dir, 0..21));
+            for (n, j) in (10..21).enumerate() {
+                let kept = std::fs::metadata(raster::frame_path(&dir, j)).unwrap().modified().unwrap();
+                assert_eq!(kept, stamps[n], "frame {j} was not drawn again");
+            }
+            drop(pins);
+
+            // And the middle again: finished, found at once.
+            let sliced = tl.slice(2.0, tl.duration());
+            let again = stream_sequences(&tl.svg_overlays, tl.duration(), &sliced, 2.0, &f);
+            assert!(is_ready(&again[0]));
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ---- stopping, waiting and not stacking ------------------------------------------------------
+
+    #[test]
+    fn cancelling_stops_a_preparation_between_its_steps_not_only_once_it_is_drawing() {
+        let root = scratch("cancel-scan");
+        let f = fmt(320, 180, 60.0);
+        // 541 frames to compare before the first one is drawn.
+        let (tl, _) = titled(&sliding(), 0.0, 9.0);
+        crate::svg::raster::with_pinned_dir(root.to_str().unwrap(), || {
+            let seqs = svg_sequences(&tl, &f);
+            let polls = AtomicUsize::new(0);
+            // Fires on the fourth look: before the document is read, then in the scan of its frames.
+            let err = prepare(&seqs, 2, None, &|| polls.fetch_add(1, Ordering::Relaxed) >= 3).unwrap_err();
+            assert!(matches!(err, Error::Cancelled), "{err}");
+            assert_eq!(
+                polls.load(Ordering::Relaxed),
+                4,
+                "the scan looks every few frames and stops at once"
+            );
+            let drawn = std::fs::read_dir(&seqs[0].dir).map_or(0, |d| d.count());
+            assert_eq!(drawn, 0, "nothing was drawn");
+            // A deadline stops the scan the same way.
+            let late = prepare(&seqs, 2, Some(Instant::now()), &|| false).unwrap_err();
+            assert!(late.to_string().contains("too heavy to preview"), "{late}");
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn one_stream_preparation_draws_at_a_time_and_a_cancelled_one_does_not_wait_for_it() {
+        let root = scratch("slot");
+        let f = fmt(320, 180, 10.0);
+        let (tl, _) = titled(&sliding(), 0.0, 1.0);
+        let root_str = root.to_str().unwrap().to_string();
+        crate::svg::raster::with_pinned_dir(&root_str, || {
+            let seqs = svg_sequences(&tl, &f);
+            let never = Control {
+                cancel: &|| false,
+                deadline: None,
+            };
+            let held = PreviewSlot::take(&never).unwrap();
+            // Stopped while it waits: it gives up at once, without having drawn anything.
+            let err = prepare_preview(&seqs, &|| true).unwrap_err();
+            assert!(matches!(err, Error::Cancelled), "{err}");
+            assert!(!seqs[0].dir.exists());
+            // One that is not stopped waits, and goes when the first lets go.
+            let waiter = {
+                let (root_str, tl, f) = (root_str.clone(), tl.clone(), f.clone());
+                std::thread::spawn(move || {
+                    crate::svg::raster::with_pinned_dir(&root_str, || {
+                        let seqs = svg_sequences(&tl, &f);
+                        prepare_preview(&seqs, &|| false).map(|pins| pins.len())
+                    })
+                })
+            };
+            std::thread::sleep(Duration::from_millis(250));
+            assert!(!waiter.is_finished(), "it waits for the slot");
+            drop(held);
+            assert_eq!(waiter.join().unwrap().unwrap(), 1);
+            // And the slot is free again afterwards.
+            drop(PreviewSlot::take(&never).unwrap());
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_stream_told_to_stop_while_its_titles_are_drawn_ends_before_ffmpeg_is_asked_for_anything() {
+        let root = scratch("stream-cancel");
+        crate::svg::raster::with_pinned_dir(root.to_str().unwrap(), || {
+            // The clip's file does not exist: reaching ffmpeg would be an error of another kind.
+            let (tl, assets) = titled(&sliding(), 0.0, 9.0);
+            let request = super::super::PlaybackRequest {
+                fps: Some(30.0),
+                max_width: Some(640),
+            };
+            let mut frames = 0;
+            let polls = AtomicUsize::new(0);
+            let err = super::super::stream_preview_until(
+                &tl,
+                &assets,
+                0.0,
+                request,
+                &|| polls.fetch_add(1, Ordering::Relaxed) >= 2,
+                &mut |_| {
+                    frames += 1;
+                    true
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(err, Error::Cancelled), "{err}");
+            assert_eq!(frames, 0);
+            assert!(polls.load(Ordering::Relaxed) >= 3, "it was asked again and again");
+            // Never asked, it goes on to draw the pictures (and then fails on the missing file).
+            let err = super::super::stream_preview_with(&tl, &assets, 0.0, request, &mut |_| true).unwrap_err();
+            assert!(!matches!(err, Error::Cancelled), "{err}");
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_marker_does_not_vouch_for_a_sequence_that_lost_a_frame_at_either_end() {
+        let root = scratch("edges");
+        let f = fmt(320, 180, 10.0);
+        let (tl, _) = titled(&sliding(), 0.0, 1.0);
+        crate::svg::raster::with_pinned_dir(root.to_str().unwrap(), || {
+            let seqs = svg_sequences(&tl, &f);
+            let s = &seqs[0];
+            drop(prepare(&seqs, 2, None, &|| false).unwrap());
+            assert!(is_ready(s));
+            for j in [0, s.frames - 1] {
+                std::fs::remove_file(raster::frame_path(&s.dir, j)).unwrap();
+                assert!(raster::is_complete(&s.dir) && !is_ready(s), "frame {j}");
+                drop(prepare(&seqs, 2, None, &|| false).unwrap());
+                assert!(
+                    is_ready(s) && raster::has_frames(&s.dir, 0..s.frames),
+                    "frame {j} was drawn again"
+                );
+            }
+            // The whole directory gone (the cache was cleared): drawn again, and finished.
+            std::fs::remove_dir_all(&s.dir).unwrap();
+            assert!(!is_ready(s));
+            drop(prepare(&seqs, 2, None, &|| false).unwrap());
+            assert!(is_ready(s));
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn memory_caps_the_drawing_threads() {
+        crate::svg::raster::with_pinned_dir(PIN, || {
+            let f = fmt(1920, 1080, 30.0);
+            let big = |w: f64| {
+                let mut o = overlay(sliding(), 0.0, 1.0);
+                o.width = w;
+                o.height = w;
+                cut(vec![o]).0
+            };
+            fn jobs_of<'a>(tl: &'a Timeline, f: &ExportFormat) -> Vec<(SvgSeq<'a>, Arc<SvgDoc>)> {
+                svg_sequences(tl, f)
+                    .into_iter()
+                    .map(|s| {
+                        let doc = Arc::new(SvgDoc::parse(s.svg).unwrap());
+                        (s, doc)
+                    })
+                    .collect()
+            }
+            // 7680 x 4320 is 33 million pixels: 400 MB a thread, so two.
+            let tl = big(4.0);
+            let owned = jobs_of(&tl, &f);
+            let jobs: Vec<Job<'_>> = owned.iter().map(|(s, d)| Job { seq: s, doc: d.clone() }).collect();
+            assert_eq!(workers_for(8, &jobs, 100), 2);
+            assert_eq!(workers_for(1, &jobs, 100), 1);
+            // A title the size of a frame, and a handful of pictures to draw.
+            let tl = big(1.0);
+            let owned = jobs_of(&tl, &f);
+            let jobs: Vec<Job<'_>> = owned.iter().map(|(s, d)| Job { seq: s, doc: d.clone() }).collect();
+            assert_eq!(workers_for(8, &jobs, 100), 8);
+            assert_eq!(workers_for(8, &jobs, 3), 3, "no more threads than pictures");
+            assert_eq!(workers_for(0, &jobs, 3), 1);
+        });
+    }
+
+    // ---- a request that is refused ---------------------------------------------------------------
+
+    #[test]
+    fn a_request_that_would_be_refused_is_refused_before_a_title_is_drawn() {
+        let root = scratch("preflight");
+        let cache = root.join("cache");
+        crate::svg::raster::with_pinned_dir(cache.to_str().unwrap(), || {
+            let (tl, assets) = titled(&sliding(), 0.0, 1.0);
+            let out = root.join("never.mp4");
+            let refused = |tl: &Timeline, assets: &[Asset], opts: &ExportOptions| {
+                let mut said = false;
+                let result = super::super::render_with_progress(tl, assets, &out, opts, &mut |_| said = true, &|| false);
+                assert!(!said, "nothing was reported: no wait for the slot, no drawing");
+                result.unwrap_err()
+            };
+            // Options that would export nothing: a sound-only file of a picture's worth, with no sound asked for.
+            let silent = ExportOptions {
+                container: crate::engine::Container::Mp3,
+                include_audio: false,
+                ..ExportOptions::default()
+            };
+            assert!(matches!(refused(&tl, &assets, &silent), Error::InvalidArgument(_)));
+            // A container that cannot hold the codec.
+            let wrong = ExportOptions {
+                container: crate::engine::Container::Webm,
+                video_codec: Some("libx264".into()),
+                ..ExportOptions::default()
+            };
+            assert!(matches!(refused(&tl, &assets, &wrong), Error::InvalidArgument(_)));
+            // No clips at all (a title alone is not a cut).
+            let mut empty = tl;
+            empty.tracks.iter_mut().for_each(|t| t.clips.clear());
+            let e = refused(&empty, &assets, &ExportOptions::default());
+            assert!(e.to_string().contains("no clips"), "{e}");
+            assert!(!cache.exists(), "no picture was drawn for any of them");
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ---- stills --------------------------------------------------------------------------------------
+
+    #[test]
+    fn documents_are_read_once_and_the_last_few_are_kept() {
+        let cache = DocCache::new();
+        let a = cache.get(&sliding()).unwrap();
+        assert!(Arc::ptr_eq(&a, &cache.get(&sliding()).unwrap()), "the same read");
+        for i in 0..DOC_CACHE {
+            cache.get(&doc(&format!("<rect width=\"{}\" height=\"5\"/>", i + 1))).unwrap();
+        }
+        assert!(!Arc::ptr_eq(&a, &cache.get(&sliding()).unwrap()), "the oldest went");
+        assert!(cache.0.lock().unwrap().len() <= DOC_CACHE);
+        let err = cache.get("<svg").unwrap_err();
+        assert!(err.to_string().contains("cannot be drawn"), "{err}");
+    }
+
+    #[test]
+    fn a_scrub_over_titles_that_are_drawn_does_not_walk_the_cache() {
+        let root = scratch("stills-trim");
+        crate::svg::raster::with_pinned_dir(root.to_str().unwrap(), || {
+            let (tl, _) = cut(vec![overlay(sliding(), 1.0, 3.0)]);
+            let trims = std::cell::Cell::new(0);
+            let count = || trims.set(trims.get() + 1);
+            let live = still_svgs(&tl, 192, 108, 1.5);
+            drop(ensure_stills_with(&live, &count).unwrap());
+            assert_eq!(trims.get(), 1, "a picture was written");
+            drop(ensure_stills_with(&live, &count).unwrap());
+            drop(ensure_stills_with(&live, &count).unwrap());
+            assert_eq!(trims.get(), 1, "everything was drawn already: the directory is not walked");
+            drop(ensure_stills_with(&still_svgs(&tl, 192, 108, 2.0), &count).unwrap());
+            assert_eq!(trims.get(), 2);
+            drop(ensure_stills_with(&still_svgs(&tl, 192, 108, 0.5), &count).unwrap());
+            assert_eq!(trims.get(), 2, "nothing is live at 0.5 s");
+        });
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_still_names_its_picture_as_one_file_whatever_the_path_holds() {
+        crate::svg::raster::with_pinned_dir("/home/a%d[1]*/svg", || {
+            let (tl, _) = cut(vec![overlay(sliding(), 1.0, 3.0)]);
+            let live = still_svgs(&tl, 192, 108, 1.5);
+            let mut args = Vec::new();
+            push_still_inputs(&live, &mut args);
+            assert_eq!(&args[..5], ["-f", "image2", "-pattern_type", "none", "-i"]);
+            assert_eq!(args[5], live[0].path.to_string_lossy());
+            assert!(args[5].starts_with("/home/a%d[1]*/svg/still-"), "{}", args[5]);
+        });
     }
 }

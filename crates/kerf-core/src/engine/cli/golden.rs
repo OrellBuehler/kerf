@@ -34,7 +34,9 @@
 //! in the key — and the cache directory pinned at `/kerf-test/svg`, `raster::with_pinned_dir`).
 //! A few are forced to the gif container ([`svg_container_for`], no dice either). The first 6000
 //! per-case digests are the ones the commit before titles existed gave; only 4 block lines were
-//! appended to each file.
+//! appended to each file. Changing how a title is read (a document that cannot move is one looped
+//! picture, a stream reads the title's own sequence from `-start_number`, a still is `-f image2
+//! -pattern_type none`) moved those four lines (blocks 60..63) and nothing else.
 //!
 //! **Machine-independent by construction.** The builders read the machine in five
 //! places, each pinned: the preview's decode acceleration (the
@@ -189,12 +191,16 @@ still-overlay-named-font fontfile='/kerf-test/fonts/PinnedSans-Regular.ttf'
 preview-overlay-default-font fontfile='/kerf-test/fonts/Geist-
 preview-overlay-named-font fontfile='/kerf-test/fonts/PinnedSans-Regular.ttf'
 svg-input -f image2 -framerate
+svg-held -f image2 -pattern_type none -loop 1 -framerate
 svg-overlay ][svg0]overlay=x=
 svg-two ][svg1]overlay=x=
 svg-partly-off ][svg0]overlay=x=-
 svg-restamp settb=expr=1/
 still-svg /kerf-test/svg/still-
+still-svg-one-file -f image2 -pattern_type none -i /kerf-test/svg/still-
 preview-svg-input -f image2 -framerate
+preview-svg-held -f image2 -pattern_type none -loop 1 -framerate
+preview-svg-seek -start_number
 preview-svg-overlay ][svg0]overlay=x=
 cover-fit force_original_aspect_ratio=increase
 scaler-flag :flags=lanczos
@@ -973,7 +979,7 @@ fn case(i: usize, assets: &[Asset]) -> Case {
         opts.container = svg_container_for(i - SVG_FIRST).unwrap_or(opts.container);
     }
     let pass = match r.below(20) { 0..=11 => PassPhase::Single, 12..=15 => PassPhase::First, _ => PassPhase::Second };
-    Case {
+    let mut c = Case {
         stills: [(time(&mut r), sink(&mut r)), (time(&mut r), sink(&mut r))],
         region: maybe(&mut r, 0.2, |r| Region { left: r.real(-0.1, 0.8), top: r.real(-0.1, 0.8), width: r.real(0.0, 1.2), height: r.real(0.0, 1.2) }),
         still_width: r.pick(&[320, 640, 960, 1280, 1920, u32::MAX]),
@@ -982,7 +988,24 @@ fn case(i: usize, assets: &[Asset]) -> Case {
         pass: (pass, r.pick(&["/dev/null", "NUL"]), r.pick(&["", "/golden/pass"])),
         timeline,
         opts,
+    };
+    if i >= SVG_FIRST {
+        svg_playhead(&mut c, i - SVG_FIRST);
     }
+    c
+}
+
+/// Every third animated-title case plays from a frame of the stream's own grid in the middle of its
+/// first title, with no dice of its own (the playhead the generator drew is replaced, and nothing
+/// after it moves): the stream then reads the title's sequence from the picture that frame needs,
+/// `-start_number`, which a playhead between frames (nearly all the drawn ones) never does.
+fn svg_playhead(c: &mut Case, j: usize) {
+    if !j.is_multiple_of(3) {
+        return;
+    }
+    let Some(o) = c.timeline.svg_overlays.first() else { return };
+    let fps = c.preview.1;
+    c.preview.0 = ((o.start + o.end) / 2.0 * fps).round() / fps;
 }
 
 // ---- digests and coverage ------------------------------------------------------

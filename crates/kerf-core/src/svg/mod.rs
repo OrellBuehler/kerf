@@ -23,6 +23,8 @@
 //! warning, as is `animate` on `transform` and CSS `@keyframes`.
 
 mod anim;
+mod cost;
+mod images;
 mod presets;
 pub mod raster;
 mod sanitize;
@@ -40,6 +42,15 @@ use sanitize::{escape_attr, is_attribute_name, plain_attribute, value_range, SVG
 use values::{TransformType, Value};
 
 pub use presets::{check_params, preset_infos, render_preset, SvgPresetInfo, SvgPresetParamInfo, DEFAULT_FRAME};
+
+/// Whether sanitised source could move at all: whether it holds an animation element (`animate`,
+/// `animateColor`, `animateTransform`, `animateMotion` or `set`, with or without a prefix). A cheap
+/// text test that needs no parse, and that errs on the side of "yes" (a comment that says
+/// "animate" counts): **`false` is a promise** that [`SvgDoc::at`] gives the same picture at every
+/// moment, which is what lets the engine keep such a title as one PNG instead of one a frame.
+pub fn may_animate(src: &str) -> bool {
+    src.contains("animate") || src.contains("<set") || src.contains(":set")
+}
 
 pub(crate) const MAX_BYTES: usize = 128 * 1024;
 pub(crate) const MAX_ELEMENTS: usize = 20_000;
@@ -93,6 +104,8 @@ pub struct SvgDoc {
     targets: Vec<Target>,
     slots: Vec<Slot>,
     natural: Option<f64>,
+    /// The most pixels any one embedded image has (what a frame's decode has to hold at once).
+    widest_image: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -200,10 +213,13 @@ impl SvgDoc {
                 by_id.entry(id.to_string()).or_insert(node.id());
             }
         }
-        check_expansion(&doc, &by_id)?;
-        let mut usvg_opts = resvg::usvg::Options::default();
-        usvg_opts.image_href_resolver.resolve_string = Box::new(|_, _| None);
-        resvg::usvg::Tree::from_xmltree(&doc, &usvg_opts).map_err(|e| invalid(format!("not a drawable SVG: {e}")))?;
+        let widest_image = check_expansion(&doc, &by_id)?;
+        let usvg_opts = resvg::usvg::Options {
+            image_href_resolver: raster::image_resolver(),
+            ..resvg::usvg::Options::default()
+        };
+        let tree = resvg::usvg::Tree::from_xmltree(&doc, &usvg_opts).map_err(|e| invalid(format!("not a drawable SVG: {e}")))?;
+        cost::check_nominal(&tree)?;
 
         let mut reader = Reader {
             warnings: &mut warnings,
@@ -272,6 +288,7 @@ impl SvgDoc {
             targets,
             slots,
             natural,
+            widest_image,
         })
     }
 
@@ -300,6 +317,12 @@ impl SvgDoc {
     /// Whether anything in the document moves.
     pub fn is_animated(&self) -> bool {
         !self.slots.is_empty()
+    }
+
+    /// The most pixels any one embedded image of the document has: with a frame, what one draw
+    /// has to hold at once (decoded, four bytes a pixel, twice while it is converted).
+    pub fn widest_image_pixels(&self) -> u64 {
+        self.widest_image
     }
 
     /// The document as a static SVG at `doc_t` seconds of its own clock: animation elements removed,
@@ -389,28 +412,33 @@ fn href_of<'a>(node: &Node<'a, '_>) -> Option<&'a str> {
 
 /// The ids a property value points at with `url(#id)` (a `filter` may name several).
 fn url_ids(value: &str) -> Vec<&str> {
+    // `URL(#a)` is as much a reference as `url(#a)`: found in a lower-cased copy (same byte offsets),
+    // read from the original (an id is case-sensitive).
+    let lower = value.to_ascii_lowercase();
     let mut out = Vec::new();
-    let mut rest = value;
-    while let Some(i) = rest.find("url(") {
-        let after = &rest[i + 4..];
-        let end = after.find(')').unwrap_or(after.len());
-        let arg = after[..end].trim().trim_matches(['"', '\'']).trim();
+    let mut at = 0;
+    while let Some(i) = lower[at..].find("url(") {
+        let from = at + i + 4;
+        let end = value[from..].find(')').map_or(value.len(), |e| from + e);
+        let arg = value[from..end].trim().trim_matches(['"', '\'']).trim();
         if let Some(id) = arg.strip_prefix('#') {
             out.push(id);
         }
-        rest = &after[end..];
+        at = end;
     }
     out
 }
 
 /// The properties whose `url(#id)` makes the element draw another one (a paint server, a mask, a
 /// clip, a filter, a marker): each use costs what the target does, which the expansion guard counts.
-const REFERENCING: [&str; 8] = [
+const REFERENCING: [&str; 9] = [
     "fill",
     "stroke",
     "mask",
     "clip-path",
     "filter",
+    // The `marker` shorthand is read by usvg in CSS (a `style` attribute, a rule) as the three below.
+    "marker",
     "marker-start",
     "marker-mid",
     "marker-end",
@@ -438,29 +466,51 @@ fn referenced(node: &Node, by_id: &HashMap<String, NodeId>) -> Vec<NodeId> {
 /// What a document costs once its `<use>` (and `feImage`) references are expanded — the way
 /// resvg draws it. A chain of `<use>`s that each reference the next twice is a few hundred bytes
 /// that draw a million nodes (usvg stops at a million, per frame is far too late), so the
-/// expanded size and nesting are counted from the XML first and a bomb is refused.
-fn check_expansion(doc: &Document, by_id: &HashMap<String, NodeId>) -> Result<()> {
+/// expanded size and nesting are counted from the XML first and a bomb is refused. Embedded image
+/// pixels are counted the same way (each draw decodes the file again). Returns the pixels of the
+/// widest single image.
+///
+/// This reads the document **as stored**: the properties that make an element draw another one are
+/// kept out of everything that could change them afterwards — an animation may not drive
+/// `mask` / `filter` / `clip-path` / `marker*` / `id` / `class` or set a `url()`, and a `<style>`
+/// rule may point only a `fill` or `stroke` at a gradient (`sanitize`).
+fn check_expansion(doc: &Document, by_id: &HashMap<String, NodeId>) -> Result<u64> {
     struct Walk<'a, 'input> {
         doc: &'a Document<'input>,
         by_id: &'a HashMap<String, NodeId>,
-        memo: HashMap<NodeId, (usize, usize)>,
+        /// (nodes drawn, nesting, image pixels decoded) of the subtree, each reference expanded.
+        memo: HashMap<NodeId, (usize, usize, u64)>,
         busy: HashSet<NodeId>,
+        widest: u64,
     }
     impl Walk<'_, '_> {
-        fn visit(&mut self, node: Node, nest: usize) -> Result<(usize, usize)> {
+        fn visit(&mut self, node: Node, nest: usize) -> Result<(usize, usize, u64)> {
             let too_deep = || invalid(format!("the SVG nests deeper than {MAX_NEST} levels once <use> is expanded"));
-            if let Some(&(w, d)) = self.memo.get(&node.id()) {
-                return if nest + d > MAX_NEST { Err(too_deep()) } else { Ok((w, d)) };
+            if let Some(&(w, d, p)) = self.memo.get(&node.id()) {
+                return if nest + d > MAX_NEST { Err(too_deep()) } else { Ok((w, d, p)) };
             }
             if nest > MAX_NEST {
                 return Err(too_deep());
             }
             if !self.busy.insert(node.id()) {
-                return Err(invalid("a <use> (or feImage) refers back to itself"));
+                return Err(invalid("an href (or url()) refers back to itself"));
             }
             let (mut weight, mut depth) = (1usize, 1usize);
+            let mut pixels = 0u64;
+            if matches!(node.tag_name().name(), "image" | "feImage") {
+                pixels = href_of(&node)
+                    .filter(|h| !h.trim_start().starts_with('#'))
+                    .and_then(|h| images::check_href(h).ok())
+                    .unwrap_or(0);
+                self.widest = self.widest.max(pixels);
+            }
             let mut next: Vec<Node> = node.children().filter(Node::is_element).collect();
-            if matches!(node.tag_name().name(), "use" | "feImage") {
+            // A paint server or filter may take its content from another (`href`); a gradient or
+            // pattern chain is as cheap as it looks, but a pattern that borrows a heavy one is not.
+            if matches!(
+                node.tag_name().name(),
+                "use" | "feImage" | "pattern" | "linearGradient" | "radialGradient" | "filter"
+            ) {
                 let target = href_of(&node)
                     .and_then(|h| h.trim().strip_prefix('#'))
                     .and_then(|id| self.by_id.get(id))
@@ -473,9 +523,10 @@ fn check_expansion(doc: &Document, by_id: &HashMap<String, NodeId>) -> Result<()
                     .filter_map(|id| self.doc.get_node(id)),
             );
             for n in next {
-                let (w, d) = self.visit(n, nest + 1)?;
+                let (w, d, p) = self.visit(n, nest + 1)?;
                 weight = weight.saturating_add(w);
                 depth = depth.max(d + 1);
+                pixels = pixels.saturating_add(p);
             }
             self.busy.remove(&node.id());
             if weight > MAX_EXPANDED {
@@ -483,8 +534,14 @@ fn check_expansion(doc: &Document, by_id: &HashMap<String, NodeId>) -> Result<()
                     "the SVG draws more than {MAX_EXPANDED} nodes once <use> is expanded"
                 )));
             }
-            self.memo.insert(node.id(), (weight, depth));
-            Ok((weight, depth))
+            if pixels > images::MAX_FRAME_IMAGE_PIXELS {
+                return Err(invalid(format!(
+                    "the SVG draws more than {} megapixels of embedded images once <use> is expanded",
+                    images::MAX_FRAME_IMAGE_PIXELS / 1_000_000
+                )));
+            }
+            self.memo.insert(node.id(), (weight, depth, pixels));
+            Ok((weight, depth, pixels))
         }
     }
     let mut walk = Walk {
@@ -492,8 +549,10 @@ fn check_expansion(doc: &Document, by_id: &HashMap<String, NodeId>) -> Result<()
         by_id,
         memo: HashMap::new(),
         busy: HashSet::new(),
+        widest: 0,
     };
-    walk.visit(doc.root_element(), 0).map(|_| ())
+    walk.visit(doc.root_element(), 0)?;
+    Ok(walk.widest)
 }
 
 fn is_animation(node: &Node) -> bool {
@@ -1507,6 +1566,7 @@ mod tests {
                 "pattern id=\"m\" width=\"4\" height=\"4\" patternUnits=\"userSpaceOnUse\"",
             ),
             ("marker-end", "marker id=\"m\""),
+            ("marker", "marker id=\"m\""),
         ] {
             let close = def.split(' ').next().unwrap();
             let doc = |users: &str| {
@@ -1525,6 +1585,182 @@ mod tests {
         let grad = "<defs><linearGradient id=\"g\"><stop offset=\"0\"/><stop offset=\"1\"/></linearGradient></defs>";
         let many = "<rect width=\"1\" height=\"1\" fill=\"url(#g)\" stroke=\"url(#g)\"/>".repeat(100);
         assert!(SvgDoc::parse(&svg(&format!("{grad}{many}"))).is_ok());
+    }
+
+    #[test]
+    fn source_with_no_animation_element_in_it_cannot_move() {
+        let still =
+            svg("<defs><linearGradient id=\"g\"/></defs><rect width=\"5\" height=\"5\" fill=\"url(#g)\" style=\"opacity:.5\"/>");
+        assert!(!may_animate(&still));
+        let d = SvgDoc::parse(&still).unwrap();
+        assert!(!d.is_animated());
+        for t in [0.0, 0.3, 7.0, 1e6] {
+            assert_eq!(d.at(t), still, "t = {t}");
+        }
+        // Every spelling of an animation element is "maybe": a document that does move says so.
+        for element in [
+            "animate",
+            "animateColor",
+            "animateTransform type=\"rotate\"",
+            "animateMotion",
+            "set",
+            "x:animate xmlns:x=\"http://www.w3.org/2000/svg\"",
+            "x:set xmlns:x=\"http://www.w3.org/2000/svg\"",
+        ] {
+            let moving = svg(&format!(
+                "<rect width=\"5\" height=\"5\"><{element} attributeName=\"{}\" to=\"3\" dur=\"1s\"/></rect>",
+                if element.starts_with("animateTransform") {
+                    "transform"
+                } else {
+                    "x"
+                }
+            ));
+            assert!(may_animate(&moving), "{element}");
+        }
+        // ...and what the reader says moves is always among them.
+        for inner in [
+            "<rect width=\"5\"><animate attributeName=\"x\" to=\"3\" dur=\"1s\"/></rect>",
+            "<rect width=\"5\"><set attributeName=\"fill\" to=\"red\" begin=\"1s\"/></rect>",
+            "<rect width=\"5\"><animateTransform attributeName=\"transform\" type=\"rotate\" to=\"90\" dur=\"1s\"/></rect>",
+        ] {
+            let d = SvgDoc::parse(&svg(inner)).unwrap();
+            assert!(d.is_animated() && may_animate(d.sanitized()), "{inner}");
+        }
+    }
+
+    /// A bomb: `copies` references of a heavy mask, none of them written as an attribute the guard
+    /// reads from the document as it is stored.
+    fn heavy_mask() -> String {
+        let mut heavy = String::from("<g id=\"g0\"><rect width=\"1\" height=\"1\"/></g>");
+        for i in 1..=11 {
+            heavy.push_str(&format!(
+                "<g id=\"g{i}\"><use href=\"#g{}\"/><use href=\"#g{}\"/></g>",
+                i - 1,
+                i - 1
+            ));
+        }
+        format!(
+            "<defs>{heavy}<mask id=\"m\"><use href=\"#g11\"/></mask><filter id=\"f\"><feImage href=\"#g11\"/></filter></defs>"
+        )
+    }
+
+    #[test]
+    fn nothing_a_document_animates_or_styles_can_reach_a_reference_the_guard_did_not_count() {
+        let defs = heavy_mask();
+        // SMIL driving the reference properties (or the id / class that selects them) is dropped, so
+        // the document that was counted is the document that is drawn.
+        for attr in ["mask", "filter", "clip-path", "marker-start", "id", "class"] {
+            let rects = format!(
+                "<rect width=\"9\" height=\"9\" id=\"r\"><animate attributeName=\"{attr}\" values=\"url(#m);url(#m)\" dur=\"1s\"/><set attributeName=\"{attr}\" to=\"m\"/></rect>"
+            )
+            .repeat(8);
+            let d = SvgDoc::parse(&svg(&format!("{defs}{rects}"))).unwrap_or_else(|e| panic!("{attr}: {e}"));
+            assert!(!d.is_animated(), "{attr}: {:?}", d.warnings());
+            assert!(
+                d.warnings().iter().any(|w| w.contains("animation was removed")),
+                "{attr}: {:?}",
+                d.warnings()
+            );
+        }
+        let fills = format!(
+            "{defs}{}",
+            "<rect width=\"9\" height=\"9\" fill=\"red\"><animate attributeName=\"fill\" values=\"red;url(#m)\" dur=\"1s\"/></rect>".repeat(8)
+        );
+        assert!(
+            !SvgDoc::parse(&svg(&fills)).unwrap().is_animated(),
+            "a url() in a value is dropped"
+        );
+        // A <style> rule may point a fill at a gradient and nothing else at anything, so a class
+        // cannot spend a mask a thousand times over.
+        let ruled = format!(
+            "{defs}<style>.a {{ mask: url(#m); filter: url(#f) }}</style>{}",
+            "<rect class=\"a\" width=\"9\" height=\"9\"/>".repeat(8)
+        );
+        let d = SvgDoc::parse(&svg(&ruled)).expect("the rule is cut, so the eight rects draw nothing heavy");
+        assert!(!d.sanitized().contains("mask: url"), "{}", d.sanitized());
+        assert!(d.warnings().iter().any(|w| w.contains("<style>")), "{:?}", d.warnings());
+        // ...while the same references written on the elements are counted and refused.
+        let attributes = format!("{defs}{}", "<rect width=\"9\" height=\"9\" mask=\"url(#m)\"/>".repeat(8));
+        assert!(SvgDoc::parse(&svg(&attributes))
+            .unwrap_err()
+            .to_string()
+            .contains("more than 100000 nodes"));
+        // A gradient in a rule is still fine.
+        let grad = "<linearGradient id=\"g\"><stop offset=\"0\"/></linearGradient><style>.a { fill: url(#g) }</style>";
+        let d = SvgDoc::parse(&svg(&format!(
+            "{grad}{}",
+            "<rect class=\"a\" width=\"9\" height=\"9\"/>".repeat(50)
+        )))
+        .unwrap();
+        assert!(d.sanitized().contains("fill: url(#g)"));
+    }
+
+    #[test]
+    fn a_pattern_or_filter_that_borrows_content_by_href_costs_what_it_borrows() {
+        let defs = heavy_mask();
+        // `p` has no children of its own: it takes the heavy ones from the mask's group through `href`... a
+        // pattern may only inherit from a pattern, so the chain ends in a real one holding the bomb.
+        let chain = format!(
+            "{defs}<pattern id=\"base\" width=\"4\" height=\"4\" patternUnits=\"userSpaceOnUse\"><use href=\"#g11\"/></pattern><pattern id=\"p\" href=\"#base\"/>"
+        );
+        let once = format!("{chain}<rect width=\"9\" height=\"9\" fill=\"url(#p)\"/>");
+        assert!(SvgDoc::parse(&svg(&once)).is_ok());
+        let many = format!("{chain}{}", "<rect width=\"9\" height=\"9\" fill=\"url(#p)\"/>".repeat(8));
+        let e = SvgDoc::parse(&svg(&many)).unwrap_err().to_string();
+        assert!(e.contains("more than 100000 nodes"), "{e}");
+        // A cycle of hrefs is refused like one of <use>s.
+        let cyclic = "<linearGradient id=\"a\" href=\"#b\"/><linearGradient id=\"b\" href=\"#a\"/><rect fill=\"url(#a)\" width=\"1\" height=\"1\"/>";
+        assert!(SvgDoc::parse(&svg(cyclic))
+            .unwrap_err()
+            .to_string()
+            .contains("refers back to itself"));
+        // A chain of gradients is what Illustrator writes, and is fine.
+        let gradients = "<linearGradient id=\"a\" href=\"#b\"/><linearGradient id=\"b\"><stop offset=\"0\"/></linearGradient><rect fill=\"url(#a)\" width=\"1\" height=\"1\"/>";
+        assert!(SvgDoc::parse(&svg(gradients)).is_ok());
+    }
+
+    #[test]
+    fn embedded_images_are_counted_by_the_pixels_each_draw_decodes() {
+        let image = |w: u32, h: u32| images::tests::data_url("image/png", &images::tests::png_claiming(w, h));
+        let ten_mp = image(4000, 2500);
+        // One image: fine, and the document knows its widest.
+        let one = format!("<image id=\"i\" href=\"{ten_mp}\" width=\"9\" height=\"9\"/>");
+        let d = SvgDoc::parse(&svg(&one)).unwrap();
+        assert_eq!(d.widest_image_pixels(), 10_000_000);
+        assert_eq!(
+            SvgDoc::parse(&svg("<rect width=\"1\" height=\"1\"/>"))
+                .unwrap()
+                .widest_image_pixels(),
+            0
+        );
+        // Four draws of 10 MP are 40 MP, seven are 70 MP: <use> draws the file again each time.
+        let uses = |n: usize| format!("<defs>{one}</defs>{}", "<use href=\"#i\"/>".repeat(n));
+        assert!(SvgDoc::parse(&svg(&uses(3))).is_ok(), "30 MP");
+        let e = SvgDoc::parse(&svg(&uses(7))).unwrap_err().to_string();
+        assert!(e.contains("megapixels of embedded images"), "{e}");
+        // The same uses of a 4 x 4 logo cost nothing.
+        let small = format!(
+            "<defs><image id=\"i\" href=\"data:image/png;base64,{}\" width=\"9\" height=\"9\"/></defs>",
+            images::tests::RED_4X4
+        );
+        assert!(SvgDoc::parse(&svg(&format!("{small}{}", "<use href=\"#i\"/>".repeat(500)))).is_ok());
+        // One over the per-image cap is cut by the sanitiser and so never counted.
+        let d = SvgDoc::parse(&svg(&format!(
+            "<image href=\"{}\" width=\"9\" height=\"9\"/>",
+            image(5000, 5000)
+        )))
+        .unwrap();
+        assert!(!d.sanitized().contains("data:"), "{}", d.sanitized());
+        assert!(d.warnings().iter().any(|w| w.contains("5000 x 5000")), "{:?}", d.warnings());
+    }
+
+    #[test]
+    fn a_filter_too_slow_to_draw_a_frame_is_refused_when_the_document_is_read() {
+        let heavy = "<filter id=\"f\" x=\"0\" y=\"0\" width=\"1\" height=\"1\"><feMorphology radius=\"2\"/></filter><rect width=\"100\" height=\"100\" filter=\"url(#f)\"/>";
+        let e = SvgDoc::parse(&svg(heavy)).unwrap_err().to_string();
+        assert!(e.contains("feMorphology"), "{e}");
+        let light = "<filter id=\"f\"><feGaussianBlur stdDeviation=\"4\"/><feMorphology radius=\"0.05\"/></filter><rect width=\"100\" height=\"100\" filter=\"url(#f)\"/>";
+        assert!(SvgDoc::parse(&svg(light)).is_ok());
     }
 
     #[test]

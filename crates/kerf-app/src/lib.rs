@@ -2278,10 +2278,14 @@ async fn start_playback(
         let mut late_frames: u64 = 0;
         let mut worst_late = 0.0_f64;
         let mut first_frame: Option<std::time::Duration> = None;
-        let result = kerf_core::stream_preview_with(&timeline, &assets, start, request, &mut |f| {
-            // Superseded by a newer playback, or explicitly stopped — including by
-            // a stop that arrived before this stream even started.
-            if ACTIVE_PLAYBACK.load(Ordering::SeqCst) != playback_id || STOPPED_PLAYBACK.load(Ordering::SeqCst) == playback_id {
+        // Superseded by a newer playback, or explicitly stopped — including by a stop that arrived
+        // before this stream even started.
+        let ended =
+            || ACTIVE_PLAYBACK.load(Ordering::SeqCst) != playback_id || STOPPED_PLAYBACK.load(Ordering::SeqCst) == playback_id;
+        // `ended` is also the cancel of the animated titles' drawing, which can take seconds before
+        // the first frame exists for the callback below to decline.
+        let result = kerf_core::stream_preview_until(&timeline, &assets, start, request, &ended, &mut |f| {
+            if ended() {
                 return false;
             }
             let sent = on_frame
