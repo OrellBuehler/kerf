@@ -152,6 +152,15 @@ clip in it, and the whole cut's picks differ from the slice's in the frames the 
 pass, `bun run build` ok. The start-latency table above was measured before these commits; they change how a session ends and what is checked before its first frame
 (one `check_cursor` per layer on screen, the probes the first cursor opened would have paid), not the draw path.
 
+## 5c. Round 2 review fixes (commits d085c55, 1232d99, 7270cc3)
+
+A takeover stream starts at the engine's hand-over only when a window is open and the page was on time (within 50 ms); a late one starts at the playhead and
+the window is cut (sync wins), and one with no window ignores the hand-over (it is the frame itself, a round trip old). An at-once hand-over is told nothing about
+a refusal still ahead. The offset is zero until the GPU drew a frame and never before the playhead the play started from, and a rebuilt running play starts at the
+audible picture. Locks are taken `render` before the play slot (documented). `playback-report-ffmpeg-*.txt` now prints Y and UV worst separately; the scaled
+translucent layer measures Y 2 / UV 2 on both FFmpegs (the sum of the two bounds would say Y 1 / UV 2). Results in `round3-results.txt`: `playback` 12 and kerf-app
+`drive_tests` + `play_tests` 16 on 6.1.1 and 9.0.2, the latter five times each, no failure and no exit crash; frontend check 0/0, 2899 tests, build ok.
+
 ## 6. Not verified here (needs a real machine)
 
 - The sound's output latency and the A/V offset (section 3), per OS and output; WebKit's `getOutputTimestamp()`
