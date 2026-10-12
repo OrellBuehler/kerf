@@ -197,7 +197,52 @@ describe('the answers', () => {
 	});
 });
 
+describe('a play from a playhead', () => {
+	test('holds the picture there until what is audible reaches it, instead of replaying the frames before', () => {
+		// 300 ms of Bluetooth: the clock leaves 5.0 and the sound of it is heard 300 ms later.
+		const p = new GpuPlayback(30, 5);
+		expect(p.next(5, 0.3)).toEqual({ time: 5, frame: 150 });
+		p.answer(drew(), 0.02, 5);
+		// The audible time is 4.8 to 5.0: still the playhead's own frame, which is on the screen.
+		expect(p.next(5.1, 0.3)).toBeNull();
+		expect(p.next(5.29, 0.3)).toBeNull();
+		// Past it, the picture follows the sound.
+		const step = p.next(5.5, 0.3);
+		expect(step?.time).toBeCloseTo(5.5 - 0.3 + 0.02, 9);
+		expect(step?.frame).toBe(156);
+	});
+
+	test('is never asked for a time before the playhead it started from, whatever the latency says', () => {
+		const p = new GpuPlayback(60, 12);
+		const times: number[] = [];
+		for (let i = 0; i < 40; i++) {
+			const step = p.next(12 + i / 60, 0.5);
+			if (step) times.push(step.time);
+			p.answer(drew(), 0.01, i);
+		}
+		expect(times.length).toBeGreaterThan(0);
+		expect(Math.min(...times)).toBe(12);
+	});
+
+	test('with no latency reads exactly as before', () => {
+		const p = new GpuPlayback(30, 5);
+		expect(p.next(5, 0)).toEqual({ time: 5, frame: 150 });
+		p.answer(drew(), 0, 5);
+		expect(p.next(5.1, 0)?.time).toBeCloseTo(5.1, 9);
+	});
+});
+
 describe('the hand-over', () => {
+	test('is due by the time that is heard, which the GPU draws and the stream carries on in', () => {
+		const p = new GpuPlayback(30);
+		p.next(0, 0.2);
+		p.answer(drew({ ahead: ahead(6, 5.5) }), 0.02, 0);
+		expect(p.latency).toBeCloseTo(0.2, 9);
+		// The clock is at the handover less the start-up, but the sound is 200 ms short of it.
+		expect(p.handoverDue(5.5 - 0.15 + 0.1, 0.15)).toBeNull();
+		expect(p.handoverDue(5.5 - 0.15 + 0.2 + 0.001, 0.15)?.handover).toBe(5.5);
+	});
+
 	test('is due when the playhead is a start-up short of where the stream has to start', () => {
 		const p = new GpuPlayback(30);
 		p.next(0, 0);

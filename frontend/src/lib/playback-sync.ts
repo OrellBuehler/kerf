@@ -229,6 +229,28 @@ export function startAt(playhead: number, startup: number | null, duration: numb
 	return Math.min(playhead + lead, Math.max(playhead, duration - 1 / playbackFps(fps)));
 }
 
+/**
+ * Where a stream that takes a session over from the GPU starts. The sound the viewer hears is the
+ * clock less the output latency, and the GPU draws that picture, so the stream carries on in the same
+ * time (`heard`), and from `start` ahead of it as any stream does. When the engine said where the GPU stops
+ * (`earliest`: `SpanPlan::handover`, at or before the first frame it does not draw, with no fade or
+ * transition window open at it), the stream starts no later: a slice that began inside a window would drop
+ * the fade or the transition, and the clip would pop in. The frames before the one the GPU stops at are not
+ * shown (the page's show-gate), so starting early costs only the stream's start-up; what it costs the sync
+ * is `from` behind where it would have been, which is never more than a frame when the hand-over is
+ * started on time.
+ */
+export function takeoverStart(
+	heard: number,
+	startup: number | null,
+	duration: number,
+	fps: number,
+	earliest: number | null
+): number {
+	const from = startAt(heard, startup, duration, fps);
+	return earliest !== null && Number.isFinite(earliest) ? Math.min(from, Math.max(0, earliest)) : from;
+}
+
 /** What the ladder says about a stream about to start. */
 export interface StreamStart {
 	/** The cost it plays at. */
@@ -237,6 +259,9 @@ export interface StreamStart {
 	request: { fps: number | null; width: number | null };
 	/** The timeline time it starts at. */
 	from: number;
+	/** What the clock is read less, seconds, to be the time that is heard: the output latency of a stream
+	 *  that takes over from the GPU (which draws the audible picture), else 0. */
+	offset: number;
 	/** How far ahead of the playhead that is, seconds: the gate adds it to its floor for what a restart costs. */
 	lead: number;
 	/** Whether a restart has anywhere cheaper to go: the gate is built without `degrade` when not. */
@@ -282,7 +307,16 @@ export function createLadder(clock: () => number = () => performance.now()) {
 	return {
 		start(
 			next: LadderKey,
-			cut: { fps: number; width: number | null; playhead: number; duration: number }
+			cut: {
+				fps: number;
+				width: number | null;
+				playhead: number;
+				duration: number;
+				/** The sound's output latency, for a stream that takes a GPU session over; default 0. */
+				latency?: number;
+				/** The earliest the stream may begin, for the same: `ahead.handover`. */
+				earliest?: number | null;
+			}
 		): StreamStart {
 			if (!key || key.timeline !== next.timeline || key.epoch !== next.epoch || key.width !== next.width) {
 				key = next;
@@ -294,13 +328,16 @@ export function createLadder(clock: () => number = () => performance.now()) {
 			const now = clock();
 			steps = stepsToStart(steps, now - lastRestart);
 			const rung = rungAfter(startRung(cut.fps, cut.width), steps);
-			const from = startAt(cut.playhead, startup, cut.duration, rung.fps);
-			applied = from - cut.playhead;
+			const offset = Number.isFinite(cut.latency) ? Math.max(0, cut.latency ?? 0) : 0;
+			const heard = Math.max(0, cut.playhead - offset);
+			const from = takeoverStart(heard, startup, cut.duration, rung.fps, cut.earliest ?? null);
+			applied = from - heard;
 			return {
 				rung,
 				request: steps > 0 ? { fps: rung.fps, width: rung.width } : { fps: null, width: cut.width },
 				from,
-				lead: applied,
+				offset,
+				lead: Math.max(0, applied),
 				cheaper: stepDown(rung) !== null,
 				heal: now - lastRestart >= REPEAT_RESYNC_WINDOW_MS
 			};

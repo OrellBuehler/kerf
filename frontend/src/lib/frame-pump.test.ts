@@ -864,6 +864,31 @@ describe('GPU playback', () => {
 		h.stop();
 	});
 
+	test('a play with a slow output holds the picture at the playhead until the sound gets there', async () => {
+		const r = recorder({ gpu: async () => drew() });
+		const h = harness({ enabled: true, overlaysCapable: true, latency: 0.3, ...r });
+		await settle();
+		h.time = 5;
+		await settle();
+		const pb = new GpuPlayback(30, 5);
+		h.playback = pb;
+		await settle();
+		expect(r.asked.at(-1)).toBe('play@5');
+		const plays = () => r.asked.filter((a) => a.startsWith('play'));
+		const first = plays().length;
+		// 200 ms on: the audible time is 4.9, before the playhead the picture is already at.
+		h.time = 5.2;
+		await settle();
+		expect(plays().length).toBe(first);
+		// Once the sound has got past it, the picture follows it, 0.3 s behind the clock.
+		h.time = 5.6;
+		await settle();
+		const asked = Number(plays().at(-1)?.slice('play@'.length));
+		expect(asked).toBeGreaterThan(5.29);
+		expect(asked).toBeLessThan(5.32);
+		h.stop();
+	});
+
 	test('a backend that stops answering is given up on: the session goes to the stream and the GPU is marked failed', async () => {
 		let clock = 0;
 		const failed: string[] = [];

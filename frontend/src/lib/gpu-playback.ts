@@ -120,7 +120,21 @@ export class GpuPlayback {
 	private trips = new Median();
 	private heard = new Median();
 
-	constructor(private readonly fps: number) {}
+	/**
+	 * `from` is the playhead the play was started from. The picture is held there until what is audible
+	 * reaches it: the sound of a position is heard `outputLatency` after the clock gets there, so for that
+	 * long the clock less the latency is *before* the playhead, and asking for it would replay the frames
+	 * just before (up to nine of them with a Bluetooth headset) the picture on the screen is already at.
+	 */
+	constructor(
+		private readonly fps: number,
+		private readonly from = 0
+	) {}
+
+	/** The output latency of the sound the picture is held to, seconds (0 before any is read). */
+	get latency(): number {
+		return Math.min(MAX_OUTPUT_LATENCY, Math.max(0, this.heard.value ?? 0));
+	}
 
 	/** The smoothed round trip of the requests that drew a frame, seconds (0 before any). */
 	get roundTrip(): number {
@@ -139,7 +153,7 @@ export class GpuPlayback {
 	next(clock: number, outputLatency: number, fps = this.fps): PlayStep | null {
 		if (this.over || (this.decided === 'pending' && this.deciding)) return null;
 		this.heard.add(outputLatency);
-		const time = pictureTime(clock, this.heard.value ?? 0, this.roundTrip);
+		const time = Math.max(this.from, pictureTime(clock, this.heard.value ?? 0, this.roundTrip));
 		const frame = frameIndex(time, fps);
 		if (frame <= this.lastAsked) return null;
 		this.lastAsked = frame;
@@ -218,7 +232,8 @@ export class GpuPlayback {
 	 */
 	handoverDue(clock: number, startup: number = DEFAULT_STARTUP): PlayAhead | null {
 		if (this.over || this.handing || !this.ahead) return null;
-		return clock >= this.ahead.handover - Math.max(0, startup) ? this.ahead : null;
+		// In the time that is heard, which the GPU's picture and the stream that takes over from it are in.
+		return clock - this.latency >= this.ahead.handover - Math.max(0, startup) ? this.ahead : null;
 	}
 
 	/** The stream has been started to take the session over (see {@link GpuPlayback.handOver}). */

@@ -23,6 +23,7 @@ import {
 	stepDown,
 	stepsAfter,
 	stepsToStart,
+	takeoverStart,
 	type FrameVerdict,
 	type Rung
 } from './playback-sync';
@@ -447,6 +448,85 @@ describe('startAt', () => {
 		const arrives = playhead + startup;
 		expect(arrives - from).toBeCloseTo(0, 10);
 		expect(arrives - startAt(playhead, null, 100, 30)).toBeCloseTo(startup, 10);
+	});
+});
+
+describe('where a stream that takes a GPU session over starts', () => {
+	const fps = 30;
+
+	test('is the playhead and the start-up ahead of it, as any stream, with no hand-over to respect', () => {
+		expect(takeoverStart(10, 0.15, 60, fps, null)).toBeCloseTo(10.15, 9);
+		expect(takeoverStart(10, null, 60, fps, null)).toBe(10);
+	});
+
+	test('is never after the hand-over the engine named: a slice that began inside a window would lose the fade', () => {
+		// The page starts the stream a start-up before the hand-over, one animation frame late at worst.
+		const handover = 20;
+		for (const late of [0, 1 / 120, 1 / 60, 0.05]) {
+			const heard = handover - 0.15 + late;
+			expect(takeoverStart(heard, 0.15, 60, fps, handover)).toBeLessThanOrEqual(handover);
+		}
+		// A hand-over still ahead of where the start-up lands is not moved.
+		expect(takeoverStart(10, 0.15, 60, fps, 30)).toBeCloseTo(10.15, 9);
+		// One in the past (a frame failed inside a dissolve): the slice starts where the dissolve does.
+		expect(takeoverStart(21, 0.15, 60, fps, 20.4)).toBe(20.4);
+		expect(takeoverStart(1, 0.15, 60, fps, -3)).toBe(0);
+		expect(takeoverStart(21, 0.15, 60, fps, Number.NaN)).toBeCloseTo(21.15, 9);
+	});
+});
+
+describe('the Preview\u2019s hand-over to the stream', () => {
+	const source = readFileSync(join(SRC, 'lib/components/editor/Preview.svelte'), 'utf8');
+
+	test('starts the stream no later than the engine\u2019s hand-over, in the time that is heard', () => {
+		// The pieces `createLadder`'s tests above hold: where the stream starts and what the clock is read less.
+		expect(source).toContain('earliest: takeover ? (handover?.handover ?? null) : null');
+		expect(source).toContain('latency: takeover ? (gpuPlay?.latency ?? 0) : 0');
+		expect(source).toContain('verdict(ui.time - offset - f.time');
+	});
+
+	test('starts the GPU\u2019s session at the playhead it was started from', () => {
+		expect(source).toContain('new GpuPlayback(playFps, untrack(() => ui.time))');
+	});
+});
+
+describe('createLadder for a stream that takes a GPU session over', () => {
+	const cut = { fps: 30, width: 960 as number | null, playhead: 20, duration: 60 };
+	const key = { timeline: {}, epoch: 0, width: 960 };
+
+	test('starts at or before ahead.handover, in the time that is heard, and tells the gate what it is behind', () => {
+		let now = 0;
+		const ladder = createLadder(() => now);
+		// A first stream that took 0.15 s to start teaches the ladder its start-up.
+		ladder.start(key, cut);
+		ladder.ended(0.15);
+		const handover = 20.1;
+		// The page triggers at heard >= handover - startup, so the clock is 0.2 s of latency past that, plus a frame.
+		const playhead = handover - 0.15 + 0.2 + 1 / 60;
+		const start = ladder.start(key, { ...cut, playhead, latency: 0.2, earliest: handover });
+		expect(start.offset).toBeCloseTo(0.2, 9);
+		expect(start.from).toBeLessThanOrEqual(handover);
+		expect(start.from).toBeGreaterThanOrEqual(handover - 1 / 30);
+		// It starts behind where a plain start-up would put it by at most a frame, never ahead of the hand-over.
+		expect(start.lead).toBeLessThan(0.15);
+	});
+
+	test('a hand-over found late starts the slice where its window starts, and the lead the gate adds is not negative', () => {
+		const ladder = createLadder(() => 0);
+		const start = ladder.start(key, { ...cut, playhead: 20.6, latency: 0, earliest: 20 });
+		expect(start.from).toBe(20);
+		expect(start.lead).toBe(0);
+		// Its floor was 0.7 s, 0.6 of which was the time it was started behind the clock: the start-up it took
+		// was 0.1 s, and the next stream is started that far ahead.
+		ladder.ended(0.7);
+		const next = ladder.start(key, { ...cut, playhead: 30 });
+		expect(next.from).toBeCloseTo(30.1, 9);
+	});
+
+	test('a stream that is not a takeover is unchanged: the clock itself, no limit', () => {
+		const start = createLadder(() => 0).start(key, cut);
+		expect(start.offset).toBe(0);
+		expect(start.from).toBe(20);
 	});
 });
 

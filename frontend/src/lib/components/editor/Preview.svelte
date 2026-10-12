@@ -36,8 +36,8 @@
 	import type { PlayAhead, PreviewBoundsReport } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
 	import { createFrameGate, createLadder, playbackFps } from '$lib/playback-sync';
-import { GpuPlayback } from '$lib/gpu-playback';
-import { audio } from '$lib/audio';
+	import { GpuPlayback } from '$lib/gpu-playback';
+	import { audio } from '$lib/audio';
 	import { CANVAS_PAINTER, createStreamPainter, jpegDataUrl } from '$lib/frame-transport';
 	import { decodeJpeg, paintPicture } from '$lib/frame-canvas';
 	import { renderedDuration, renderedFps } from '$lib/timecode';
@@ -265,14 +265,19 @@ import { audio } from '$lib/audio';
 			// The width is the one the still is asked at, held to the source at the playhead; read
 			// untracked, since that source changes as the playhead crosses clips and the stream
 			// is not restarted for it.
-			const { rung, request, from, lead, cheaper, heal } = untrack(() =>
+			// A stream that takes a session over from the GPU carries on in the time the GPU draws: the audible
+			// one (the clock less the sound's output latency), and from where the engine said it may start
+			// (`handover`), or the fade or transition the refused frame sits in is cut off.
+			const { rung, request, from, offset, lead, cheaper, heal } = untrack(() =>
 				ladder.start(
 					{ timeline, epoch, width: box },
 					{
 						fps: renderedFps(editor.timeline, editor.assets),
 						width: frameWidth,
 						playhead: ui.time,
-						duration: renderedDuration(editor.timeline)
+						duration: renderedDuration(editor.timeline),
+						latency: takeover ? (gpuPlay?.latency ?? 0) : 0,
+						earliest: takeover ? (handover?.handover ?? null) : null
 					}
 				)
 			);
@@ -308,7 +313,7 @@ import { audio } from '$lib/audio';
 				(f) => {
 					if (!live) return;
 					// The audio clock owns time; picture chases it.
-					const call = verdict(ui.time - f.time, performance.now() / 1000);
+					const call = verdict(ui.time - offset - f.time, performance.now() / 1000);
 					switch (call) {
 						case 'resync':
 						case 'degrade': {
@@ -376,7 +381,7 @@ import { audio } from '$lib/audio';
 		if (gpu) {
 			// The pump takes it from here: its first request decides, and a `stream` answer comes back as `handOverToStream`.
 			playFps = untrack(() => playbackFps(renderedFps(editor.timeline, editor.assets)));
-			gpuPlay = new GpuPlayback(playFps);
+			gpuPlay = new GpuPlayback(playFps, untrack(() => ui.time));
 		} else {
 			beginStream(null, false);
 		}
