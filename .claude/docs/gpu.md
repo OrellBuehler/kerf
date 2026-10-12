@@ -422,10 +422,10 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   labelled BT.709 by the export graph itself (`engine-cli.md`, *The BT.709 label*; the plan mirrors it,
   `core-render-plan.md`), so the stack is one matrix and is drawn on 9.0.2 (it was a mixed stack there, refused); untagged HD beside `smpte170m` footage became BT.709 against BT.601 and is refused there. A lone
   untagged HD clip is still read as BT.601 by FFmpeg and drawn that way (27.3 dB against a player on 9.0.2). A logo or a photo beside HD
-  (a PNG's `gbr`, a JPEG's or WebP's or MJPEG video's `bt470bg` are decoders' defaults, not matrices) is not a stack that is labelled and is
+  (a PNG's `gbr`, the `bt470bg` of a JPEG, a WebP and the `mjpeg`, `amv` and `speedhq` decoders are decoders' defaults, not matrices) is not a stack that is labelled and is
   drawn or refused as before. **Accepted difference**: the playback stream that takes over from the compositor (`SpanPlan::handover`) is a
   slice of the cut and labels over its own clips, where the Motion plan labels over the cut's graph; when the slice has dropped the
-  matrix-naming clip a translucent HD layer or a dip to white differs by up to 2 levels on 9.0.2 (10 to 16 on 6.1), opaque pictures not at all. The stream's own matrix
+  matrix-naming clip a translucent HD layer differs by up to 2 levels on 9.0.2 (10 to 16 on 6.1) and a dip to white by 2 on 9.0.2 and by 15 on 6.1 (the RGB round trip reads the label; the label is what moves an HD clip's dip in the export on 6.1, 32.3 dB and 11 levels over main), opaque pictures not at all. The stream's own matrix
   (`PlanStream::matrix`, from the probed `color_space`) is used for taking a translucent
   layer out of YUV in the round trip below and for choosing the composite's matrix.
 - **`eq` is a YUV operation**, not an RGB one: `eq.rs` builds vf_eq's own per-plane
@@ -668,6 +668,9 @@ the export), `every_kind_of_transition_and_the_clips_own_fades_are_drawn_in_a_st
 **The BT.709 label's case** (`untagged_hd_is_labelled_for_the_whole_graph_that_holds_a_matrix`): a 1280x720 untagged HD clip made translucent (2 levels of Y / UV, the scaler's and the round trip's:
 `HD_TRANSLUCENT`) alone in the first second of a cut whose second second holds a BT.709 clip, and over a BT.709 clip, plus the same frames with no BT.709 clip in the graph; the Motion plan labels by the cut's graph where a
 Still plan labels by the layers on screen. Reading the labelled layer as BT.601 again fails it on both FFmpegs (9.0.2 refuses the frames as mixed matrices, 6.1.1 draws them 8 levels off).
+**The label's dip case** (`a_labelled_hd_clip_dips_through_white_with_the_bt709_round_trip`, `WHITE_709`; the Still side `a_labelled_hd_layer_in_a_dip_to_white_is_drawn_as_the_layer_tagged_in_the_file`):
+a labelled HD clip dipping through white is drawn as the file tagged BT.709 is, which is what the export renders because the label is the first filter of the chain. Behind the fit `scale` (the filter FFmpeg has convert the picture
+to the `rgb24` the white `fade` needs) it was BT.601 out of YUV and BT.709 back, and the compositor was Y 17 / UV 9 off the export on 9.0.2, Y 30 / UV 16 on 6.1.1, on every frame of the clip.
 
 **GPU-6's cases** (zoom in, out, from small, with a position, eased, three keys, late, speed 2, reversed, Cover into 960x540 and 9:16; masks
 shapes x feather x invert, off-centre, larger than the frame, thin, the shape's edge on the picture's border, over noise; the effects and their chains;
@@ -709,7 +712,7 @@ tagged clips, translucent layers over tagged ones in both orders), **the BT.709 
 untagged footage and beside a BT.709 clip, plain and translucent in both orders, strictly on both FFmpegs; beside an HLG proxy, which the
 tone-map tags BT.709; untagged SD and PNG logos, which are not labelled; `smpte170m` and `bt2020nc` footage beside it, refused on 9.0.2; the previews'
 own proxies from `generate_proxy`; a real JPEG, WebP and MJPEG clip, whose `bt470bg` tags are decoders' defaults and label nothing; and `tests/motion_parity.rs`, a translucent HD clip alone in its second of a cut whose
-other second holds a BT.709 clip, where the Motion plan labels by the cut's graph), colour (all four knobs,
+other second holds a BT.709 clip, where the Motion plan labels by the cut's graph; a labelled HD clip's dip to white in a still and in motion), colour (all four knobs,
 contrast + saturation only, warm / cool), PNG and JPEG stills, speed / reverse / keyframes (a zoom
 and a position moving; a rotation and an opacity moving over a held zoom),
 10-bit / 4:2:2 / 4:4:4 / BGR0 / gray / full-range / odd-sized / metadata-rotated sources

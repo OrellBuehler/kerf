@@ -847,17 +847,21 @@ so the feature is **only** activated through these forwards — which is what ma
   against 42.7 dB labelled) and the GPU compositor refuses the stack. So an **untagged HD YCbCr input is labelled
   BT.709 when another input of the same graph names a matrix** (HDR, which the graph tone-maps to a tagged BT.709 picture,
   or a tag that is the *file's* word: not `unknown` / `unspecified` / `reserved`, and **not a decoder's default** —
-  probed on 6.1.1 and 9.0.2, a PNG of any layout (`rgb24`, `rgba`, `gray`) and RGB video are tagged `gbr`, a JPEG, a WebP and
-  MJPEG video `bt470bg`, so a logo, a photo or a webcam clip beside HD names nothing; `StreamInfo::names_a_matrix`), and only
-  then. HD is mpv's rule, `width >= 1280 ||
+  probed on 6.1.1 and 9.0.2, a PNG of any layout (`rgb24`, `rgba`, `gray`) is tagged `gbr` (so is RGB video, depending on the
+  encoder: FFV1 `bgr0` on 9.0.2 and not on 6.1.1), a JPEG and a WebP `bt470bg`, and the `mjpeg`, `amv` and `speedhq` decoders
+  (MJPEG video, AMV, NDI's SpeedHQ) tag **everything** they decode `bt470bg`, whatever the pixel format (`jpegls` does it on
+  `rgb24`), so a logo, a photo or a webcam clip beside HD names nothing; `StreamInfo::names_a_matrix`), and only then. HD is mpv's rule, `width >= 1280 ||
   height > 576`, on the **original's** displayed size (a proxy at a small size in Settings is still labelled as its
   original is: the preview's assets keep the original's metadata and the plan reads it, `PlanStream::label_bt709`);
   YCbCr on the `pix_fmt_layout` allow-list; never `yuvj…` (JFIF, a webcam's MJPEG), RGB, grey, alpha or a still image.
-  What is never labelled never labels (the rule is symmetric: a still image, MJPEG or `yuvj…` footage, `gbr` and RGB name
-  nothing; the cost is an HD clip beside a camera's explicitly tagged full-range H.264 left as FFmpeg reads it, which is what
-  it always was). The golden oracle holds it over the whole corpus by metamorphosis
+  **The principle is "a tag a decoder writes by default is not the file's word", not a mirror of those exclusions**: the
+  naming exclusion is by decoder (`DEFAULT_TAG_CODECS`), by `gbr`, by RGB and by still image. Grey, alpha and SD pictures are
+  never labelled but do name a matrix when tagged, and so does `yuvj…` footage from any other codec: FFmpeg's h264 decoder
+  calls every full-range stream `yuvj420p`, and OBS's, a drone's or a phone's `h264 yuvj420p pc bt709` is a stated matrix that
+  labels the untagged HD beside it (an *untagged* `yuvj` clip is still never labelled itself). The golden oracle holds it over
+  the whole corpus by metamorphosis
   (`a_decoders_default_tag_names_no_matrix_in_any_graph_of_the_corpus`: every case with an HDR clip is built again with that
-  clip replaced by each of those shapes, and by an explicitly tagged H.264 clip as the control). `Asset::hdr()` is the first video
+  clip replaced by each of those shapes, one rule at a time, and by explicitly tagged H.264 clips as the control). `Asset::hdr()` is the first video
   stream's, like every graph input (`[i:v]`) and the label. **A single clip, and any graph with no
   input naming a matrix, is byte-identical** (the golden oracle holds it for all 6000 cases: stripping the label from
   the new argv gives the old one). It is not a proxy label: proxies of untagged HD stay untagged, so no proxy key
@@ -868,16 +872,28 @@ so the feature is **only** activated through these forwards — which is what ma
   (`StillLayer.label_bt709`). **The decision is the graph's, not the frame's**: a BT.709 clip anywhere in the cut labels
   an HD clip that is never on screen with it (negotiation is per graph), and a stream, a scrub window or a ranged
   export that starts past it, being a graph of its own, does not hold it (opaque pictures are the same either way; a
-  translucent HD layer or coloured text differs by up to 2 levels on 9.0.2, 10 to 16 on 6.1: a window frame is the
-  export's or the still's picture, as `scrub.rs` says, and the one-shot still of a frame decides over the layers on screen). The filter sits right after `setsar=1`, after the fit `scale` and
-  the clip's own zoom and ahead of `fps`, the grade, the opacity round trip and the terminal format; **never** the
-  `-colorspace` output option, which FFmpeg 9 takes as an order to convert (22 levels). For a graph the compositor draws
-  (everything BT.709) it equals a file tagged BT.709 to the bit in all four builders; beside a BT.601 neighbour it is
-  closer to the footage's colours than the tag would be (42.7 against 38.7 dB). It also makes **untagged HD beside
+  translucent HD layer or coloured text differs by up to 2 levels on 9.0.2, 10 to 16 on 6.1, a dip to white by 2 and 15: a window frame is the
+  export's or the still's picture, as `scrub.rs` says, and the one-shot still of a frame decides over the layers on screen).
+  The filter is **the first of the clip's chain**, ahead of `trim` and every scaler; **never** the
+  `-colorspace` output option, which FFmpeg 9 takes as an order to convert (22 levels). It is a tag, not a conversion: the
+  picture is then what a file tagged BT.709 would be, to the bit in all four builders and in every chain
+  (`a_labelled_input_renders_as_a_file_tagged_bt709_is_in_all_four_builders` renders opaque, translucent, graded, rotated,
+  vignetted and fading layers; `a_labelled_clip_dips_through_white_as_a_file_tagged_bt709_does` the dip). **Why first, and not
+  after the geometry** (the first design, measured closer to the footage beside a BT.601 neighbour, 42.7 against 38.7 dB): FFmpeg
+  has the nearest scaler convert the picture for a filter that only takes another pixel format, and the fit `scale` is that scaler
+  for a dip to white's `fade` (RGB only). A label behind it states the matrix of a picture already read as BT.601: the round trip
+  went BT.601 out of YUV and BT.709 back, 8 to 15 levels off the same footage tagged in the file on every frame of the clip
+  (9.0.2 32 dB / 17 levels, 6.1.1 27 dB / 31 in the render test), and the GPU, which draws the labelled clip as BT.709, was that far off
+  the export. Ahead of everything there is nothing it can miss. The cost is exactly the tag's: beside a BT.601 neighbour, the stack
+  FFmpeg 9 converts and the GPU refuses, the HD clip lands 38.7 dB from the footage's colours where it would have been 42.7 dB
+  (the unlabelled 28.0). It also makes **untagged HD beside
   footage tagged `smpte170m` / `bt470bg` a mixed stack** where FFmpeg read both as BT.601: the export converts the HD
   into the neighbour's matrix (the colours become right, the argv moves) and the GPU now refuses it on 9.0.2.
-  **FFmpeg 6.1 (`FixedBt601`)**: the label negotiates nothing there and only changes a translucent HD layer of a mixed
-  stack (37 to 39 dB, up to 16 levels, towards the BT.709 reading a tagged layer already has). It is applied under
+  **FFmpeg 6.1 (`FixedBt601`)**: the label negotiates nothing there and only changes an HD layer that takes the RGB round
+  trip in a mixed stack: a translucent one (37 to 39 dB, up to 16 levels, towards the BT.709 reading a tagged layer already
+  has) or an HD clip dipping through white (the export 32.3 dB, up to 11 levels; the dip is `yuv420p -> rgb24 -> yuv420p`, and
+  that conversion reads the matrix the label states).
+  Opaque pictures, text, fades to black, grades, rotations, masks, vignettes and dissolves are byte-identical there. It is applied under
   every policy because the builders cannot ask for the policy: `composite_color_policy()` is measured *by running
   `build_still_args`* under its own mutex, so a builder that asked would deadlock, and a non-probing read would
   answer differently before and after the first probe. The plan mirrors it (`PlanStream::matrix()` is BT.709 for a
