@@ -358,7 +358,13 @@
     clip at a small Settings size is 640x360 and still labelled. So stacks of untagged HD with BT.709 or HDR footage are
     one matrix and are drawn on 9.0.2 (they were refused), and untagged HD beside `smpte170m` / `bt470bg` / `bt2020nc`
     footage is BT.709 against BT.601 / BT.2020 and refused (it was drawn as BT.601 throughout). `Unknown` still
-    refuses any stack that is not BT.601. `reserved` reads as no tag (`PlanStream::matrix`, `known_color`).
+    refuses any stack that is not BT.601. `reserved` reads as no tag (`PlanStream::matrix`, `known_color`). A PNG's `gbr` and a
+    JPEG's, WebP's or MJPEG video's `bt470bg` are decoders' defaults and name no matrix, so a logo or a photo beside HD labels
+    nothing and the plan reads those stacks as it did.
+    **An accepted difference**: the plan's decision is the cut's (a Motion plan) or the layers' on screen (a Still), while the
+    FFmpeg stream a handover starts (`SpanPlan::handover`, a `Timeline::slice` from `stream_start`) decides over its own
+    clips; where the slice drops the matrix-naming clip, a translucent HD layer or a dip to white in the stream is read as
+    BT.601 where the plan drew it as BT.709 (up to 2 levels on 9.0.2, 10 to 16 on 6.1). Opaque pictures are identical.
   - **What depends on the render size** is decided in the plan, before any decode
     (`LayerGeometry` lives in kerf-core as `layer_geometry.rs` for this reason): a
     translucent layer of odd size, **resizing a picture that is not 8/10-bit

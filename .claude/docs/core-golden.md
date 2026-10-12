@@ -113,4 +113,8 @@
   export's graph is the range's slice, the preview's the cut from the playhead, a still's the layers on screen), and the
   test fails unless the label is in an argv exactly when it says so: no single-clip case, no case of untagged footage
   only and no audio-only export moved. Tagged SDR footage, SD, MJPEG, RGB and alpha are covered by the builders' unit
-  tests (`engine/cli/bt709_label.rs`), not the corpus.
+  tests (`engine/cli/bt709_label.rs`), and the corpus' blind spot, its stills carrying no tag, by a **metamorphic test**
+  (`a_decoders_default_tag_names_no_matrix_in_any_graph_of_the_corpus`, no digests): each case that holds an HDR clip is built
+  again with that clip replaced, same size and place, by a shape the probe really gives (a PNG with alpha or grey, `gbr`; a JPEG
+  and MJPEG video, `bt470bg`; a WebP; RGB video) and the label must be in no argv, and by an explicitly tagged H.264 clip
+  (`bt709`, `smpte170m`) and must then be exactly where the HDR clip's was. It moves no digest.

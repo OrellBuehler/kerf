@@ -845,12 +845,20 @@ so the feature is **only** activated through these forwards — which is what ma
   that names no matrix as BT.601, every player shows untagged HD as BT.709, and FFmpeg 9 negotiates the matrix along
   the graph: untagged HD beside a BT.709 clip is *converted* from the BT.601 it was read as (its colours 28 dB off the footage's,
   against 42.7 dB labelled) and the GPU compositor refuses the stack. So an **untagged HD YCbCr input is labelled
-  BT.709 when another input of the same graph names a matrix** (a tag other than `unknown` / `unspecified` / `reserved`,
-  or HDR, which the graph tone-maps to a tagged BT.709 picture), and only then. HD is mpv's rule, `width >= 1280 ||
+  BT.709 when another input of the same graph names a matrix** (HDR, which the graph tone-maps to a tagged BT.709 picture,
+  or a tag that is the *file's* word: not `unknown` / `unspecified` / `reserved`, and **not a decoder's default** —
+  probed on 6.1.1 and 9.0.2, a PNG of any layout (`rgb24`, `rgba`, `gray`) and RGB video are tagged `gbr`, a JPEG, a WebP and
+  MJPEG video `bt470bg`, so a logo, a photo or a webcam clip beside HD names nothing; `StreamInfo::names_a_matrix`), and only
+  then. HD is mpv's rule, `width >= 1280 ||
   height > 576`, on the **original's** displayed size (a proxy at a small size in Settings is still labelled as its
   original is: the preview's assets keep the original's metadata and the plan reads it, `PlanStream::label_bt709`);
-  YCbCr on the `pix_fmt_layout` allow-list; never `yuvj…` (JFIF, a webcam's MJPEG), RGB (an RGB picture names no matrix
-  whatever the container writes: `gbr`), grey, alpha or a still image. **A single clip, and any graph with no
+  YCbCr on the `pix_fmt_layout` allow-list; never `yuvj…` (JFIF, a webcam's MJPEG), RGB, grey, alpha or a still image.
+  What is never labelled never labels (the rule is symmetric: a still image, MJPEG or `yuvj…` footage, `gbr` and RGB name
+  nothing; the cost is an HD clip beside a camera's explicitly tagged full-range H.264 left as FFmpeg reads it, which is what
+  it always was). The golden oracle holds it over the whole corpus by metamorphosis
+  (`a_decoders_default_tag_names_no_matrix_in_any_graph_of_the_corpus`: every case with an HDR clip is built again with that
+  clip replaced by each of those shapes, and by an explicitly tagged H.264 clip as the control). `Asset::hdr()` is the first video
+  stream's, like every graph input (`[i:v]`) and the label. **A single clip, and any graph with no
   input naming a matrix, is byte-identical** (the golden oracle holds it for all 6000 cases: stripping the label from
   the new argv gives the old one). It is not a proxy label: proxies of untagged HD stay untagged, so no proxy key
   moves and nothing is re-encoded, and the preview's graph (original metadata, proxy pixels) labels exactly as the

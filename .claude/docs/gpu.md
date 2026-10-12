@@ -421,7 +421,11 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   the GPU path replaces the FFmpeg preview. **One graph is settled**: untagged HD beside footage that names a matrix is
   labelled BT.709 by the export graph itself (`engine-cli.md`, *The BT.709 label*; the plan mirrors it,
   `core-render-plan.md`), so the stack is one matrix and is drawn on 9.0.2 (it was a mixed stack there, refused); untagged HD beside `smpte170m` footage became BT.709 against BT.601 and is refused there. A lone
-  untagged HD clip is still read as BT.601 by FFmpeg and drawn that way (27.3 dB against a player on 9.0.2). The stream's own matrix
+  untagged HD clip is still read as BT.601 by FFmpeg and drawn that way (27.3 dB against a player on 9.0.2). A logo or a photo beside HD
+  (a PNG's `gbr`, a JPEG's or WebP's or MJPEG video's `bt470bg` are decoders' defaults, not matrices) is not a stack that is labelled and is
+  drawn or refused as before. **Accepted difference**: the playback stream that takes over from the compositor (`SpanPlan::handover`) is a
+  slice of the cut and labels over its own clips, where the Motion plan labels over the cut's graph; when the slice has dropped the
+  matrix-naming clip a translucent HD layer or a dip to white differs by up to 2 levels on 9.0.2 (10 to 16 on 6.1), opaque pictures not at all. The stream's own matrix
   (`PlanStream::matrix`, from the probed `color_space`) is used for taking a translucent
   layer out of YUV in the round trip below and for choosing the composite's matrix.
 - **`eq` is a YUV operation**, not an RGB one: `eq.rs` builds vf_eq's own per-plane
@@ -704,7 +708,7 @@ cover, graded bars), **opacity** (several sources and roles, a graded fade),
 tagged clips, translucent layers over tagged ones in both orders), **the BT.709 label** (`label/` and `proxy/`: untagged HD alone, among
 untagged footage and beside a BT.709 clip, plain and translucent in both orders, strictly on both FFmpegs; beside an HLG proxy, which the
 tone-map tags BT.709; untagged SD and PNG logos, which are not labelled; `smpte170m` and `bt2020nc` footage beside it, refused on 9.0.2; the previews'
-own proxies from `generate_proxy`; and `tests/motion_parity.rs`, a translucent HD clip alone in its second of a cut whose
+own proxies from `generate_proxy`; a real JPEG, WebP and MJPEG clip, whose `bt470bg` tags are decoders' defaults and label nothing; and `tests/motion_parity.rs`, a translucent HD clip alone in its second of a cut whose
 other second holds a BT.709 clip, where the Motion plan labels by the cut's graph), colour (all four knobs,
 contrast + saturation only, warm / cool), PNG and JPEG stills, speed / reverse / keyframes (a zoom
 and a position moving; a rotation and an opacity moving over a held zoom),
@@ -726,7 +730,7 @@ above), **a moving zoom last, masks and effects** (`zoom/`, `zoom+mask/`, `mask/
 caption styles, positions and edges, boxes, colours, sizes, keyframed and overlapping overlays, escapes, installed fonts,
 over every kind of picture, with no layer, and the text it must refuse, each held to the same picture without the text; see
 "Text" above). The table
-holds 706 rows on FFmpeg 6.1.1 and 659 on the pinned 9.0.2 the Windows and macOS bundles ship (where the mixed-tag stacks are asserted refused instead of compared; 152 rows are `text/`, its
+holds 709 rows on FFmpeg 6.1.1 and 662 on the pinned 9.0.2 the Windows and macOS bundles ship (where the mixed-tag stacks are asserted refused instead of compared; 152 rows are `text/`, its
 controls included, 161 the transitions and fades and 143 the zoom, mask and effect cases) plus the plane-level scaler (75) and effect (99) runs, all passing strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
 (`KERF_PARITY_KEEP=1` keeps them for passing ones; `KERF_PARITY_EXPLORE=1` prints
 everything and fails nothing); every run writes `target/parity/report.txt`.
