@@ -2362,7 +2362,7 @@ dependencies = [
  "gtk",
  "kerf-core",
  "kerf-gpu",
- "libloading 0.8.9",
+ "libloading 0.9.0",
  "raw-window-handle",
  "rmcp",
  "schemars 1.2.2",
