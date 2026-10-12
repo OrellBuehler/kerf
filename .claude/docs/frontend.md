@@ -1309,3 +1309,16 @@ compiled alone in its test). The pump treats that as the preview waiting — the
 stay, nothing falls back to the JPEG — and `Preview.svelte` shows `playback waits for the proxy` instead of
 a `Playback preview failed:` toast, restarting the stream when a proxy lands. A queued export reads
 `Export waiting for the preview proxy…` (`ExportProgress.waiting`) instead of a stuck 0%.
+
+**Animated SVG titles in `api.ts`.** `addSvgOverlay(source, start, end?, layout?)` / `updateSvgOverlay(id, patch)` /
+`removeSvgOverlay(id)` (each answers the refreshed `Timeline`), `validateSvg(svg)` → `SvgCheck`, `listSvgPresets()` and
+`svgPresetPreview(kind, params, duration?)` → SVG text, which the page may only show through an `<img>` data URL.
+The harness stand-in is `svg-dev.ts`: kerf-core's refusals (placement ranges, `end > start`, fifty titles, empty
+preset text, `svg` xor `preset_params`, a refused update changes nothing) over the dev timeline, with
+`svg_overlays` absent again when it empties. Preset artwork is **kerf-core's own**, written down in
+`fixtures/svg-presets.json` (each preset drawn once for 1920×1080 and four seconds with placeholder text; the
+harness swaps in text, colours and font and does not re-time it, and custom SVG is not sanitised —
+`validateSvg` only drops and reports scripts, foreign objects and `animateMotion`). A preset change in
+`kerf-core/src/svg/presets.rs` fails `svg_preset_fixture_is_what_this_engine_does` until
+`KERF_BLESS_SVG_PRESETS=1 cargo test -p kerf-core --no-default-features -- svg_preset_fixture` rewrites it;
+`api-svg.test.ts` drives the harness.

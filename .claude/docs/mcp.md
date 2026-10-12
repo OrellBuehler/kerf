@@ -154,6 +154,20 @@ cut in the same call), forwarding synthesis progress to the client's token and
 re-emitting `voiceover-progress` so the GUI shows an agent's voiceover too; like an
 import, the generated asset lands for the user at once, while its placement and
 captions stage. `voiceover_status` is its read side.
+**Animated SVG titles over MCP**: `add_svg_overlay { svg | preset + params, start, end?, x?, y?, width?, height?,
+opacity?, name? }` (exactly one source: `svg_source` refuses both, neither, a preset without `params` and `params`
+without a preset as `invalid_params`), `update_svg_overlay { overlay_id, name?, svg?, preset_params?, start?, end?, x?,
+y?, width?, height?, opacity? }`, `remove_svg_overlay { overlay_id }` and `list_svg_presets` (the catalogue:
+`kind`, `label`, `params: [{name, required, default?}]`). The mutating three go through `edit()`, so they stage like
+any agent edit; `Error::SvgOverlayNotFound` is `invalid_params` in `core_err`. They answer `{overlay, warnings}` with
+the overlay as an `SvgOverlaySummary` — **no source** (it can be 128 KiB, and a preset's is generated; `svg_bytes`
+says how big), which `timeline_summary` lists the same way under `svg_overlays` (absent when none) — and
+`warnings` are what the sanitiser or the SMIL reader dropped, so an agent that wrote CSS animations or
+`animateMotion` is told rather than left with a title that does not move. `get_timeline_state` is the one read
+that returns the source (its description says so). The tool description and the server `instructions` carry the
+subset: SMIL only (`animate` / `set` / `animateTransform` / `animateColor`), times **relative to the overlay's start**,
+a `viewBox` (or width and height) required, the viewBox = the delivery frame for full-frame artwork, and what is
+dropped (CSS animations, scripts, external images, `animateMotion`); a test pins both texts and the schemas.
 `import_asset` is the one write that does **not** stage — a file on disk is not
 an edit to the user's cut, so imported media (and its background proxy) lands for
 them immediately, reporting on the same `import-progress` event a lens-pair

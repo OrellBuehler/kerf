@@ -382,4 +382,7 @@
   front to `offset` (`SvgOverlay::doc_time(t)` = `t - start + offset`), so a range export or the
   playback hand-over joins the animation part-way instead of replaying it. Ripple never moves
   overlays; the diff reuses `OverlayAdded` / `Changed` / `Removed` with `overlay_id`
-  ("Added animated title “X” at 0:01.0–0:04.0"); `CutSummary.has_text` stays text-only.
+  ("Added animated title “X” at 0:01.0–0:04.0"); `CutSummary.has_text` stays text-only. The catalogue and one
+  drawing of each preset are written to `frontend/src/lib/fixtures/svg-presets.json` for the browser harness
+  (`svg_preset_fixture_is_what_this_engine_does`; after an intended preset change run
+  `KERF_BLESS_SVG_PRESETS=1 cargo test -p kerf-core --no-default-features -- svg_preset_fixture`).

@@ -25,8 +25,9 @@ use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
     ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, ImportSummary, Keyframe, Levels,
-    Mask, Project, Projection, Property, PropertyKey, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, Task,
-    TextKeyframe, TimeRange, Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
+    Mask, Project, Projection, Property, PropertyKey, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, SvgCheck,
+    SvgLayout, SvgOverlayPatch, SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, Task, TextKeyframe, TimeRange,
+    Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -1683,6 +1684,64 @@ fn set_overlay_keyframes(state: State<'_, AppState>, overlay_id: String, keyfram
     let project = state.project();
     project.set_overlay_keyframes(oid, keyframes).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn add_svg_overlay(
+    state: State<'_, AppState>,
+    source: SvgSource,
+    start: f64,
+    end: Option<f64>,
+    layout: Option<SvgLayout>,
+) -> CmdResult<Timeline> {
+    let project = state.project();
+    project
+        .add_svg_overlay(source, start, end, layout.unwrap_or_default())
+        .map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn update_svg_overlay(state: State<'_, AppState>, overlay_id: String, patch: SvgOverlayPatch) -> CmdResult<Timeline> {
+    let oid = id(&overlay_id)?;
+    let project = state.project();
+    project.update_svg_overlay(oid, patch).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn remove_svg_overlay(state: State<'_, AppState>, overlay_id: String) -> CmdResult<Timeline> {
+    let oid = id(&overlay_id)?;
+    let project = state.project();
+    project.remove_svg_overlay(oid).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// What `add_svg_overlay` / `update_svg_overlay` would make of this source: the sanitised
+/// document, what the sanitiser or the SMIL reader could not honour, and how long it runs.
+/// Needs no project, so it never waits for the lock.
+#[tauri::command(async)]
+fn validate_svg(svg: String) -> CmdResult<SvgCheck> {
+    kerf_core::check_svg(&svg).map_err(|e| e.to_string())
+}
+
+#[tauri::command(async)]
+fn list_svg_presets() -> Vec<SvgPresetInfo> {
+    kerf_core::svg::preset_infos()
+}
+
+/// The artwork a preset would make for the project's delivery frame, as SVG text (the page shows
+/// it through an `<img>` data URL, never inline). `duration` defaults to 4 s.
+#[tauri::command(async)]
+fn svg_preset_preview(
+    state: State<'_, AppState>,
+    kind: SvgPresetKind,
+    params: SvgPresetParams,
+    duration: Option<f64>,
+) -> CmdResult<String> {
+    kerf_core::svg::check_params(&params).map_err(|e| e.to_string())?;
+    let frame = state.project().timeline().map_err(|e| e.to_string())?.preset_frame();
+    Ok(kerf_core::render_preset(kind, &params, duration.unwrap_or(4.0), frame))
 }
 
 #[tauri::command(async)]
@@ -3495,6 +3554,12 @@ pub fn run() {
             update_overlay,
             remove_overlay,
             set_overlay_keyframes,
+            add_svg_overlay,
+            update_svg_overlay,
+            remove_svg_overlay,
+            validate_svg,
+            list_svg_presets,
+            svg_preset_preview,
             generate_captions,
             clear_captions,
             import_captions,

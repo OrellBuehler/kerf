@@ -53,6 +53,13 @@ static) / `copy_keyframes { fromClipId, toClipId, props?, offset? }`,
 `set_reframe` / `clear_reframe` / `set_reframe_keyframes` / `add_reframe_keyframe`,
 `set_asset_projection` (asset-level 360 mark; returns the `Asset`),
 `add_overlay` / `update_overlay` / `remove_overlay` / `set_overlay_keyframes`,
+`add_svg_overlay { source, start, end?, layout? }` (`source` is `{custom: svg}` or `{preset: {kind, params}}`) /
+`update_svg_overlay { overlayId, patch }` / `remove_svg_overlay { overlayId }` (the animated titles; each returns the
+refreshed `Timeline`, and the new title is the one that was not there before), `validate_svg { svg }` → `SvgCheck`
+(`check_svg`: the sanitised source, warnings, natural duration; needs no project, so no lock),
+`list_svg_presets` → `SvgPresetInfo[]` and `svg_preset_preview { kind, params, duration? }` → the preset's SVG text
+for the project's delivery frame (the page shows it through an `<img>` data URL, never inline — the sanitiser, not
+the webview, decides what an SVG may do; `check_params` refuses empty text first),
 `generate_captions` / `clear_captions` (caption the whole cut, in timeline
 time), `import_captions` / `import_captions_text` (a subtitle file by path / by text —
 the text variant is what an `<input type=file>` or a paste uses; both return

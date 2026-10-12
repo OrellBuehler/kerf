@@ -680,4 +680,55 @@ mod tests {
             }
         }
     }
+
+    const FIXTURE_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../frontend/src/lib/fixtures/svg-presets.json"
+    );
+
+    /// What the browser harness serves for the preset commands: each preset drawn once for the
+    /// default frame and length with placeholder text, and the catalogue.
+    fn fixture() -> serde_json::Value {
+        let (text, subtitle) = ("Your title", "Your subtitle");
+        let mut presets = serde_json::Map::new();
+        for kind in SvgPresetKind::ALL {
+            let mut params = SvgPresetParams::new(text);
+            let mut entry = serde_json::Map::new();
+            entry.insert("plain".into(), render_preset(kind, &params, 4.0, DEFAULT_FRAME).into());
+            if kind != SvgPresetKind::WordPop {
+                params.subtitle = Some(subtitle.to_string());
+                entry.insert("subtitled".into(), render_preset(kind, &params, 4.0, DEFAULT_FRAME).into());
+            }
+            presets.insert(kind.as_str().into(), entry.into());
+        }
+        let defaults = SvgPresetParams::new("");
+        serde_json::json!({
+            "about": "Written by kerf-core (svg/presets.rs); served by the browser harness. Regenerate: KERF_BLESS_SVG_PRESETS=1 cargo test -p kerf-core --no-default-features -- svg_preset_fixture",
+            "frame": [DEFAULT_FRAME.0, DEFAULT_FRAME.1],
+            "duration": 4.0,
+            "text": text,
+            "subtitle": subtitle,
+            "defaults": {"color": defaults.color, "accent": defaults.accent, "font": DEFAULT_FAMILY},
+            "infos": preset_infos(),
+            "presets": presets,
+        })
+    }
+
+    #[test]
+    fn svg_preset_fixture_is_what_this_engine_does() {
+        let fresh = format!("{}\n", serde_json::to_string_pretty(&fixture()).expect("serializes"));
+        if std::env::var_os("KERF_BLESS_SVG_PRESETS").is_some() {
+            std::fs::create_dir_all(std::path::Path::new(FIXTURE_PATH).parent().expect("a directory")).expect("fixtures dir");
+            std::fs::write(FIXTURE_PATH, &fresh).expect("writes the fixture");
+            return;
+        }
+        let on_disk = std::fs::read_to_string(FIXTURE_PATH)
+            .expect("frontend/src/lib/fixtures/svg-presets.json — generate it with KERF_BLESS_SVG_PRESETS=1")
+            .replace("\r\n", "\n");
+        assert!(
+            on_disk == fresh,
+            "the preset fixture is stale: regenerate with KERF_BLESS_SVG_PRESETS=1 cargo test -p kerf-core \
+             --no-default-features -- svg_preset_fixture, then run `bun test` in frontend/"
+        );
+    }
 }
