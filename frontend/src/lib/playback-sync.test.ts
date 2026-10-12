@@ -2,12 +2,14 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { SRC } from './test-sources';
+import { DEFAULT_STARTUP } from './gpu-playback';
 import { FRAME_STEPS, MIN_FRAME_PX } from './preview-size';
 import {
 	createFrameGate,
 	createLadder,
 	DEGRADE_MEMORY_MS,
 	HEAL_WATCH,
+	MAX_BEHIND,
 	MAX_LEAD,
 	MAX_PLAYBACK_FPS,
 	MIN_PLAYBACK_FPS,
@@ -23,6 +25,8 @@ import {
 	stepDown,
 	stepsAfter,
 	stepsToStart,
+	takeoverAhead,
+	takeoverStart,
 	type FrameVerdict,
 	type Rung
 } from './playback-sync';
@@ -450,6 +454,202 @@ describe('startAt', () => {
 	});
 });
 
+describe('where a stream that takes a GPU session over starts', () => {
+	const fps = 30;
+	const window = { at: 20, handover: 19.6 };
+	const frame = { at: 20, handover: 20 };
+
+	test('is the playhead and the start-up ahead of it, as any stream, with no hand-over to respect', () => {
+		expect(takeoverStart(10, 0.15, 60, fps, null)).toBeCloseTo(10.15, 9);
+		expect(takeoverStart(10, null, 60, fps, null)).toBe(10);
+		expect(takeoverStart(21, 0.15, 60, fps, { at: Number.NaN, handover: 20 })).toBeCloseTo(21.15, 9);
+	});
+
+	test('starts at the hand-over of a window that is open at the refused frame, when the page was on time', () => {
+		// The page starts the stream a start-up before the hand-over, an animation frame or two late at worst.
+		for (const late of [0, 1 / 120, 1 / 60, 0.04]) {
+			const heard = window.handover - 0.15 + late;
+			const from = takeoverStart(heard, 0.15, 60, fps, window);
+			expect(from).toBe(window.handover);
+		}
+		// A hand-over still ahead of where the start-up lands is not moved.
+		expect(takeoverStart(10, 0.15, 60, fps, { at: 30, handover: 29.5 })).toBeCloseTo(10.15, 9);
+	});
+
+	test('is the plain start when the hand-over is late: synchronisation wins over the window', () => {
+		// 0.35 s past the hand-over (a frame failed inside the dissolve): the stream starts at the playhead and the
+		// window is cut, rather than trailing the sound by 0.35 s for the rest of the play.
+		expect(takeoverStart(19.8, 0.15, 60, fps, window)).toBeCloseTo(19.95, 9);
+		expect(takeoverStart(21, 0.15, 60, fps, window)).toBeCloseTo(21.15, 9);
+		expect(takeoverStart(19.6 - 0.15 + MAX_BEHIND + 0.01, 0.15, 60, fps, window)).toBeCloseTo(
+			19.6 + MAX_BEHIND + 0.01,
+			9
+		);
+	});
+
+	test('ignores a hand-over where no window is open: it is the frame itself, a round trip old', () => {
+		// `handover_at(t) == t` with no window; the answer is the time that was asked for, ahead of what is heard.
+		for (const heard of [19.5, 19.87, 19.9, 21]) {
+			expect(takeoverStart(heard, 0.15, 60, fps, frame)).toBeCloseTo(heard + 0.15, 9);
+			expect(takeoverStart(heard, 0.15, 60, fps, { at: 20, handover: 19.99 })).toBeCloseTo(heard + 0.15, 9);
+		}
+	});
+});
+
+describe('what a takeover stream is told about where the GPU stops', () => {
+	const refusal = { at: 25, handover: 24.5, kind: 'mask', why: 'a mask' };
+
+	test('an at-once hand-over drops a refusal that is still seconds ahead, or the pane waits for it', () => {
+		// The GPU was overloaded or silent with a refusal five seconds ahead: the stream shows from its first frame.
+		expect(takeoverAhead(refusal, true, 20, 0.06, 30)).toBeNull();
+		expect(takeoverAhead(refusal, true, 24.8, 0.06, 30)).toBeNull();
+	});
+
+	test('keeps one that is due: the frame that failed, the session that ended, a refusal found late', () => {
+		const failed = { ...refusal, at: 20.06, handover: 19.8 };
+		expect(takeoverAhead(failed, true, 20, 0.06, 30)).toBe(failed);
+		expect(takeoverAhead({ ...refusal, at: 19 }, true, 20, 0.06, 30)).not.toBeNull();
+	});
+
+	test('a planned hand-over is unchanged, and nothing stays nothing', () => {
+		expect(takeoverAhead(refusal, false, 20, 0.06, 30)).toBe(refusal);
+		expect(takeoverAhead(null, true, 20, 0.06, 30)).toBeNull();
+	});
+});
+
+/** A takeover stream through the real ladder and gate: the picture's steady lag behind the audible time, and
+ *  what the gate said. The stream takes `spawn` seconds to start and then runs at the rate against the clock. */
+function takeover(o: {
+	playhead: number;
+	latency: number;
+	ahead: { at: number; handover: number } | null;
+	spawn?: number;
+	fps?: number;
+	/** The ladder has seen a stream of this cut start (how long it took); false: the first stream after an edit. */
+	measured?: boolean;
+}) {
+	const fps = o.fps ?? 30;
+	const spawn = o.spawn ?? 0.15;
+	const key = { timeline: {}, epoch: 0, width: 960 };
+	const cut = { fps, width: 960 as number | null, playhead: 0, duration: 120 };
+	const ladder = createLadder(() => 0);
+	// An earlier stream of this cut took `spawn` to start: that is how far ahead the next one is started.
+	if (o.measured ?? true) {
+		ladder.start(key, cut);
+		ladder.ended(spawn);
+	}
+	const start = ladder.start(key, {
+		...cut,
+		playhead: o.playhead,
+		latency: o.latency,
+		ahead: o.ahead,
+		takeover: true
+	});
+	const gate = createFrameGate({ fps: start.rung.fps, lead: start.lead });
+	const lags: number[] = [];
+	const verdicts: FrameVerdict[] = [];
+	for (let i = 0; i < 300; i++) {
+		const clock = o.playhead + spawn + i / start.rung.fps;
+		const lag = clock - start.offset - (start.from + i / start.rung.fps);
+		lags.push(lag);
+		verdicts.push(gate(lag, clock));
+	}
+	return { start, lag: lags[lags.length - 1], verdicts, frame: 1 / fps };
+}
+
+describe('a takeover stream through the real ladder and gate', () => {
+	const latency = 0.2;
+	const planned = (ahead: { at: number; handover: number }, late = 1 / 60) => ({
+		// The page starts the stream when the time that is heard gets to the hand-over less the start-up.
+		playhead: ahead.handover - 0.15 + late + latency,
+		latency,
+		ahead
+	});
+
+	test('with no window it is in step with the sound, whether the hand-over was planned or a frame failed', () => {
+		// Planned: the refusal at 20 s, the stream started a start-up before it.
+		const a = takeover(planned({ at: 20, handover: 20 }));
+		expect(Math.abs(a.lag)).toBeLessThanOrEqual(a.frame);
+		// Unplanned: a frame failed, and the answer says `handover == at == the time that was asked for`, a round
+		// trip (60 ms) ahead of what is heard. Starting there would trail the sound by that for good.
+		const heard = 30;
+		const b = takeover({ playhead: heard + latency, latency, ahead: { at: heard + 0.06, handover: heard + 0.06 } });
+		expect(Math.abs(b.lag)).toBeLessThanOrEqual(b.frame);
+		expect(b.start.from).toBeCloseTo(heard + 0.15, 9);
+		for (const r of [a, b]) expect(r.verdicts.filter((v) => v === 'resync' || v === 'degrade')).toEqual([]);
+	});
+
+	test('the first takeover after an edit, with no start-up measured, is started the default start-up ahead like the trigger assumes', () => {
+		// An edit resets the ladder's key, so a GPU play's takeover is usually the first stream it sees.
+		const heard = 30;
+		const ahead = { at: heard + 0.06, handover: heard + 0.06 };
+		const r = takeover({ playhead: heard + latency, latency, ahead, measured: false });
+		expect(r.start.from).toBeCloseTo(heard + DEFAULT_STARTUP, 9);
+		expect(Math.abs(r.lag)).toBeLessThanOrEqual(r.frame);
+		expect(r.verdicts.filter((v) => v === 'resync' || v === 'degrade')).toEqual([]);
+		// A machine whose first stream takes longer than the default trails the sound by the difference until a
+		// stream has been seen to start (the ladder records it when one ends); the gate cannot see a constant lag.
+		const slow = takeover({ playhead: heard + latency, latency, ahead, measured: false, spawn: 0.25 });
+		expect(slow.lag).toBeCloseTo(0.1, 9);
+		expect(slow.lag).toBeLessThanOrEqual(3 * slow.frame + 1e-9);
+		// A plain stream (not a takeover) is unchanged: the playhead itself until a start-up is measured.
+		const plain = createLadder(() => 0).start(
+			{ timeline: {}, epoch: 0, width: 960 },
+			{ fps: 30, width: 960, playhead: 30, duration: 120 }
+		);
+		expect(plain.from).toBe(30);
+	});
+
+	test('in a window and on time it starts at the hand-over, within a frame of the sound', () => {
+		const ahead = { at: 20, handover: 19.5 };
+		const r = takeover(planned(ahead));
+		expect(r.start.from).toBe(19.5);
+		expect(Math.abs(r.lag)).toBeLessThanOrEqual(r.frame);
+		expect(r.verdicts.filter((v) => v === 'resync' || v === 'degrade')).toEqual([]);
+	});
+
+	test('in a window and late it starts at the playhead and is in step with the sound, the window cut', () => {
+		// A frame failed 0.4 s into a 0.6 s dissolve: the engine says the window starts 0.4 s ago.
+		const heard = 30;
+		const ahead = { at: heard + 0.06, handover: heard - 0.4 };
+		const r = takeover({ playhead: heard + latency, latency, ahead });
+		expect(r.start.from).toBeGreaterThan(ahead.handover + MAX_BEHIND);
+		expect(Math.abs(r.lag)).toBeLessThanOrEqual(r.frame);
+		expect(r.verdicts.filter((v) => v === 'resync' || v === 'degrade')).toEqual([]);
+	});
+});
+
+describe('the Preview\u2019s hand-over to the stream', () => {
+	const source = readFileSync(join(SRC, 'lib/components/editor/Preview.svelte'), 'utf8');
+
+	test('starts the stream by the engine\u2019s hand-over, in the time that is heard, told only what is due', () => {
+		// The pieces the tests above hold: where the stream starts, what the clock is read less, what it is told.
+		expect(source).toContain('ahead: takeover ? handover : null,\n\t\t\t\t\t\ttakeover');
+		expect(source).toContain('latency: takeover ? (gpuPlay?.offsetAt(ui.time) ?? 0) : takeoverLatency');
+		expect(source).toContain('verdict(ui.time - offset - f.time');
+		expect(source).toContain('takeoverAhead(ahead, now, ui.time - pb.offsetAt(ui.time), pb.roundTrip, playFps)');
+		expect(source).toContain('beginStream(stops, true)');
+	});
+
+	test('starts the GPU\u2019s session at the audible picture when the play is already running', () => {
+		expect(source).toContain('playSession(playRun, ui.time, ui.seekEpoch, audio.outputLatency())');
+		expect(source).toContain('new GpuPlayback(playFps, session.from, session.running)');
+	});
+
+	test('reads the clock as it always did in a stream that does not continue a takeover', () => {
+		expect(source).toContain('if (!barred) takeoverLatency = 0;');
+	});
+
+	test('a plain stream is the clock itself, with no limit on where it starts', () => {
+		const start = createLadder(() => 0).start(
+			{ timeline: {}, epoch: 0, width: 960 },
+			{ fps: 30, width: 960, playhead: 20, duration: 60 }
+		);
+		expect(start.offset).toBe(0);
+		expect(start.from).toBe(20);
+	});
+});
+
 describe('createLadder', () => {
 	const cut = { fps: 60, width: 1920 as number | null, playhead: 5, duration: 60 };
 	const key = (timeline: unknown = {}, epoch = 0, width: number | null = 1920) => ({ timeline, epoch, width });
@@ -512,6 +712,21 @@ describe('createLadder', () => {
 		ladder.start(k, cut);
 		ladder.ended(null);
 		expect(ladder.start(k, cut).from).toBe(5);
+		expect(ladder.startup).toBeNull();
+	});
+
+	test('says what a start-up costs, held to the most a stream is led by (the hand-over from the GPU reads it)', () => {
+		const ladder = fresh();
+		const k = key();
+		expect(ladder.startup).toBeNull();
+		ladder.start(k, cut);
+		ladder.ended(0.18);
+		expect(ladder.startup).toBeCloseTo(0.18, 10);
+		// A stall that landed in a start-up is not one to start ahead by.
+		const slow = fresh();
+		slow.start(k, cut);
+		slow.ended(2);
+		expect(slow.startup).toBe(MAX_LEAD);
 	});
 
 	test('the least start-up seen is what the next one is led by: nothing that comes in under it puts the picture ahead', () => {

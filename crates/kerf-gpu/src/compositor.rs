@@ -52,6 +52,7 @@ use crate::effects::{self, Gaussian};
 use crate::eq;
 use crate::frame_source::{FrameSource, Hint};
 use crate::gpu::{Gpu, GpuError};
+use crate::motion::MotionFrames;
 use crate::roundtrip::{Rgb2Yuv, Yuv2Rgb};
 use crate::source::{chroma_size, decode_layers, YuvFrame};
 use crate::sws::{self, Filter};
@@ -2472,6 +2473,61 @@ impl Compositor {
                 composite: t1.elapsed(),
             },
         ))
+    }
+}
+
+impl Compositor {
+    /// A frame of a [`PlanMode::Motion`](kerf_core::PlanMode) plan, played: every layer's picture
+    /// from `motion` (one forward-only cursor per clip, read side by side), composited at `size`
+    /// and left on the GPU as a [`RenderedFrame`] for [`crate::Presenter::present`]. The plan is
+    /// asked of this compositor's caps first, as [`Compositor::render_plan_texture_with`] asks it.
+    /// An error is for that frame only (a cursor refused or failed): the caller plays what it can
+    /// from FFmpeg's stream instead. The decode time in the timings is the wait for the cursors,
+    /// the composite time the recording and submission of the passes (nothing waits for the GPU).
+    pub fn render_motion_texture(
+        &self,
+        plan: &RenderPlan,
+        size: (u32, u32),
+        motion: &mut MotionFrames,
+    ) -> Result<(RenderedFrame, RenderTimings), GpuError> {
+        let reasons = plan.reasons(&self.caps(), size);
+        if !reasons.is_empty() {
+            return Err(GpuError::Unsupported(join_reasons(&reasons)));
+        }
+        let t0 = Instant::now();
+        // The titles of a frame are rasterised (a first-seen one costs an `ffmpeg`) while its cursors
+        // read, not after them: the two waits are independent, and the composite below finds the text
+        // in the atlas. A failure here is the composite's to report.
+        let frames = std::thread::scope(|scope| {
+            let text = (!plan.overlays.is_empty()).then(|| scope.spawn(|| self.warm_text(plan, size)));
+            let frames = motion.frames(plan);
+            if let Some(text) = text {
+                let _ = text.join();
+            }
+            frames
+        })?;
+        let decode = t0.elapsed();
+        let t1 = Instant::now();
+        let rendered = match self.composite_as(plan, &frames, size, Output::Texture)? {
+            Rendered::Texture(texture) => texture,
+            Rendered::Pixels(_) => return Err(GpuError::Gpu("pixels were rendered where a texture was asked for".into())),
+        };
+        Ok((
+            rendered,
+            RenderTimings {
+                decode,
+                composite: t1.elapsed(),
+            },
+        ))
+    }
+
+    /// Have the text of `plan` rasterised and held, drawing nothing: a title that comes on screen
+    /// costs one `ffmpeg` (tens of milliseconds) the first time its state is seen, which a playing
+    /// frame must not wait for. Called for the frames a second ahead from a thread that is not
+    /// drawing; the frame that draws the title then finds it in the atlas. A plan with no text
+    /// costs nothing.
+    pub fn warm_text(&self, plan: &RenderPlan, size: (u32, u32)) -> Result<(), GpuError> {
+        self.prepare_text(plan, size).map(|_| ())
     }
 }
 

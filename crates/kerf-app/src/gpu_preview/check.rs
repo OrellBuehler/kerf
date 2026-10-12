@@ -133,6 +133,17 @@ impl Check {
         }
     }
 
+    /// Whether the check has passed on `key`'s adapter (or is off), **without** starting one: a
+    /// caller that only wants to know whether the GPU would be allowed to draw. [`Check::gate`] is
+    /// the one that begins a check, once.
+    pub fn is_open(&self, key: &AdapterKey) -> bool {
+        if self.skipped {
+            return true;
+        }
+        let slot = self.slot();
+        slot.key.as_ref() == Some(key) && matches!(slot.phase, Phase::Passed(_))
+    }
+
     /// The check on `key` ended with `result`.
     pub fn finish(&self, key: &AdapterKey, result: Result<SelfTestReport, SelfTestError>) -> Verdict {
         let mut slot = self.slot();
@@ -217,6 +228,24 @@ mod tests {
         assert_eq!(check.gate(&key), Gate::Open);
         assert_eq!(check.gate(&key), Gate::Open);
         assert!(check.standing().unwrap().starts_with("passed"));
+    }
+
+    #[test]
+    fn asking_whether_the_gate_is_open_never_begins_a_check() {
+        let check = Check::new(false);
+        let key = AdapterKey::named("lavapipe");
+        assert!(!check.is_open(&key));
+        assert!(!check.is_open(&key));
+        // Nothing was begun by asking: the first frame that wants the GPU still begins it, once.
+        assert!(matches!(check.gate(&key), Gate::Begin(_)));
+        assert!(!check.is_open(&key), "running is not open");
+        check.finish(&key, Ok(report()));
+        assert!(check.is_open(&key));
+        assert!(
+            !check.is_open(&AdapterKey::named("another")),
+            "a verdict belongs to its adapter"
+        );
+        assert!(Check::new(true).is_open(&key), "a check that is off is open");
     }
 
     #[test]

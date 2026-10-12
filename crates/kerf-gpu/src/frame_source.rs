@@ -1076,9 +1076,19 @@ impl FrameSource {
     /// A [`FrameCursor`](crate::FrameCursor) for `layer`'s clip: an exclusive run from where its
     /// pick needs it, for the export's picks (`Pick::Fps`) output frame after output frame. It is
     /// not registered with the router and shares no cache: an export reads every frame once.
-    /// `Unsupported` where frames from runs are not trusted (the self-test failed, the pixel format
-    /// was never recorded or is not known to be opaque, the file's seeks land late).
+    /// `Unsupported` where frames from runs are not trusted ([`FrameSource::check_cursor`]).
     pub fn cursor(&self, layer: &PlanLayer, config: crate::CursorConfig) -> Result<crate::FrameCursor, GpuError> {
+        self.check_cursor(layer)?;
+        crate::FrameCursor::for_layer(layer, config)
+    }
+
+    /// Whether [`FrameSource::cursor`] would open a cursor for `layer`, without opening one:
+    /// `Unsupported` where frames from runs are not trusted (the self-test failed, the pixel format
+    /// was never recorded or is not known to be opaque, the file's container is not indexed, its
+    /// seeks do not land on keyframes or a run has marked it). It answers from what is cached about
+    /// the file, and for a file not seen yet runs its two probes (`ffprobe`, tens of milliseconds
+    /// each, once a file): a caller that is drawing a frame asks it from another thread first.
+    pub fn check_cursor(&self, layer: &PlanLayer) -> Result<(), GpuError> {
         if !path_enabled() {
             return Err(GpuError::Unsupported(
                 "decode runs are off in this process (the self-test failed)".into(),
@@ -1109,7 +1119,7 @@ impl FrameSource {
                 return Err(GpuError::Unsupported(format!("{}: {why}", layer.path)));
             }
         }
-        crate::FrameCursor::for_layer(layer, config)
+        Ok(())
     }
 
     /// Stop every run of `source` and forget its frames (and what was learned about the file).

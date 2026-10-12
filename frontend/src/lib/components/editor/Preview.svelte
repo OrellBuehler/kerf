@@ -33,9 +33,11 @@
 	import { singleFlight } from '$lib/single-flight';
 	import { measuredWidth, transportParts } from '$lib/transport-bar';
 	import { RESIZE_SETTLE_MS, capToSource, dprQuery, requestWidth } from '$lib/preview-size';
-	import type { PreviewBoundsReport } from '$lib/types';
+	import type { PlayAhead, PreviewBoundsReport } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
-	import { createFrameGate, createLadder } from '$lib/playback-sync';
+	import { createFrameGate, createLadder, playbackFps, takeoverAhead } from '$lib/playback-sync';
+	import { GpuPlayback, NO_PLAY, playSession, type PlayRun } from '$lib/gpu-playback';
+	import { audio } from '$lib/audio';
 	import { CANVAS_PAINTER, createStreamPainter, jpegDataUrl } from '$lib/frame-transport';
 	import { decodeJpeg, paintPicture } from '$lib/frame-canvas';
 	import { renderedDuration, renderedFps } from '$lib/timecode';
@@ -127,11 +129,21 @@
 		streaming: () => streaming,
 		width: () => frameWidth,
 		timelineFrame: (t, width) => getTimelineFrame(t, width),
-		previewFrame: (t, overlays, width, order) => getPreviewFrame(t, width, overlays, order),
+		previewFrame: (t, overlays, width, order, play) => getPreviewFrame(t, width, overlays, order, play),
 		answered: (result) => gpuPreview.note(result),
 		gpuFailed: (error) => {
 			gpuPreview.noteJpeg(`the GPU preview failed: ${error instanceof Error ? error.message : String(error)}`);
 			hideSurface();
+		},
+		playback: () => gpuPlay,
+		playClock: () => ({ clock: ui.time, latency: audio.outputLatency(), fps: playFps }),
+		startup: () => ladder.startup ?? undefined,
+		playHandover: (pb, ahead, now, why) => handOverToStream(pb, ahead, now, why),
+		playWaiting: (pb, message) => {
+			if (gpuPlay !== pb) return;
+			pb.end();
+			gpuPlay = null;
+			playbackWaiting = message;
 		}
 	});
 	const frameUrl = $derived(frames.frameUrl);
@@ -153,6 +165,15 @@
 	// the rate is not played behind the sound: the gate says so and the stream restarts from the
 	// playhead one rung cheaper (`createLadder`, `playback-sync.ts`), halving the rate before it
 	// narrows the picture.
+	//
+	// **With the GPU preview on, the GPU may play the session instead** (`gpu-playback.ts`): the frame
+	// pump (`frame-pump.svelte.ts`) asks the backend for the picture of the time that is audible now,
+	// once per animation frame, and the first answer decides the session — `gpu`, or `stream` with the
+	// reasons, in which case the stream below starts as it always did. Once the GPU has the session it
+	// keeps it until the engine says where it will stop drawing (`ahead`), and the stream is started
+	// just early enough to carry on from there; the GPU's last frame stays on the surface until the
+	// stream's first one is shown. No flipping back: a session given up on stays the stream's until
+	// the playhead is moved on purpose or the cut is edited.
 	let streaming = $state(false);
 	let stopStream: (() => void) | null = null;
 	let canvasEl = $state<HTMLCanvasElement | null>(null);
@@ -162,6 +183,23 @@
 	/** How far down the ladder the stream is for this cut at this width, and where the next one starts.
 	 *  Not reactive: it is read when the stream (re)starts, not watched. */
 	const ladder = createLadder();
+	/** The GPU's play session, being decided or played (null: the stream's, or not playing). The pump reads it. */
+	let gpuPlay = $state.raw<GpuPlayback | null>(null);
+	/** Starts the stream beside the GPU's session (`takeover`: that session stays on the screen until the
+	 *  stream's first frame, from `handover.at` on, is shown); set by the playback effect while it runs. */
+	let beginStream: ((handover: PlayAhead | null, takeover: boolean) => void) | null = null;
+	/** The play the GPU was given up on in: not tried again until the playhead is moved on purpose or the
+	 *  cut is edited (a restart of the stream for lag is neither). */
+	let gpuBarred: { seek: number; timeline: unknown } | null = null;
+	/** The rate the GPU's session was asked for at: the cut's own. */
+	let playFps = 30;
+	/** The output latency the stream that took a GPU session over reads the clock less (the audible time the GPU
+	 *  drew in), for the restarts of that stream in the same play; 0 for a stream that never was one. */
+	let takeoverLatency = 0;
+	/** What the playback effect last saw of the play: an edit or a resize re-runs it mid-play (its GPU session is
+	 *  rebuilt from the audible picture, no earlier than the playhead the play began at), a seek or a Play from rest
+	 *  does not (`playSession`). */
+	let playRun: PlayRun = NO_PLAY;
 
 	// Every seek or edit restarts the stream, so a timeline that cannot render
 	// would raise the same failure on each restart; say it once per spell.
@@ -187,6 +225,24 @@
 		streaming = false;
 	}
 
+	/** The GPU's session goes to the stream: at once (`now`), or when the playhead has got to where the GPU stops. */
+	function handOverToStream(pb: GpuPlayback, ahead: PlayAhead | null, now: boolean, why: string) {
+		if (gpuPlay !== pb || !beginStream || pb.handingOver) return;
+		logFrontend(
+			'info',
+			`GPU playback hands over to the stream${now ? ' at once' : ` at ${ahead?.handover.toFixed(2)} s`}: ${why}` +
+				` (${pb.drawn} frames drawn, ${pb.repeated} repeated, round trip ${Math.round(pb.roundTrip * 1000)} ms)`,
+			'playback'
+		);
+		gpuBarred = { seek: ui.seekEpoch, timeline: editor.timeline };
+		// What the stream is told about where the GPU stops: an at-once hand-over has no use for a refusal that
+		// is still ahead (the pane would hold the GPU's last picture until the stream got there).
+		const stops = takeoverAhead(ahead, now, ui.time - pb.offsetAt(ui.time), pb.roundTrip, playFps);
+		if (now) pb.end();
+		pb.handOver();
+		beginStream(stops, true);
+	}
+
 	$effect(() => {
 		// Restart the stream whenever what it is rendering changes: play/pause,
 		// shuttle rate, a deliberate seek, an edit to the timeline it composited
@@ -202,96 +258,163 @@
 		playbackWaiting = null;
 		if (!play || !hasClips) {
 			endStream();
+			takeoverLatency = 0;
+			playRun = NO_PLAY;
 			return;
 		}
-		// The width is the one the still is asked at, held to the source at the playhead; read
-		// untracked, since that source changes as the playhead crosses clips and the stream
-		// is not restarted for it.
-		const { rung, request, from, lead, cheaper, heal } = untrack(() =>
-			ladder.start(
-				{ timeline, epoch, width: box },
-				{
-					fps: renderedFps(editor.timeline, editor.assets),
-					width: frameWidth,
-					playhead: ui.time,
-					duration: renderedDuration(editor.timeline)
-				}
-			)
-		);
-		let live = true;
-		// At the cheapest rung there is nothing to restart into, and a restart costs an ffmpeg spawn on a
-		// machine that is already short: the frames are skipped to the resync, as they were before.
-		// A stream a lag restart started a moment ago is not offered a restart for healing either: a stall that
-		// comes with every start would be restarted over and over, paying itself again each time.
-		const verdict = createFrameGate({
-			fps: rung.fps,
-			overloadAfter: cheaper ? undefined : Infinity,
-			healWatch: heal ? undefined : Infinity,
-			lead
+		const session = untrack(() => playSession(playRun, ui.time, ui.seekEpoch, audio.outputLatency()));
+		playRun = session.run;
+		// Whether the GPU plays this session is decided here, once: the route as it is now (the setting, a
+		// surface, nothing over the frame that the surface cannot show) and no earlier give-up of this play.
+		const gpu = untrack(() => {
+			const barred = gpuBarred !== null && gpuBarred.seek === ui.seekEpoch && gpuBarred.timeline === timeline;
+			// A stream that is not the continuation of a takeover of this play reads the clock as it always did.
+			if (!barred) takeoverLatency = 0;
+			return settings.gpuPreview && route.via === 'gpu' && !barred;
 		});
-		const painter = CANVAS_PAINTER
-			? createStreamPainter({
-					decode: decodeJpeg,
-					paint: (picture) => {
-						if (!canvasEl) return;
-						paintPicture(canvasEl, picture);
-						frames.streamDrawn(picture.width / picture.height);
+		let active = true;
+		let stopped: (() => void) | null = null;
+
+		/** Start the stream; returns what stops it. With `takeover` the GPU's session is still on the screen
+		 *  and the stream does not take the pane until its first frame at or past where the GPU stops. */
+		const startStream = (handover: PlayAhead | null, takeover: boolean): (() => void) => {
+			// The width is the one the still is asked at, held to the source at the playhead; read
+			// untracked, since that source changes as the playhead crosses clips and the stream
+			// is not restarted for it.
+			// A stream that takes a session over from the GPU carries on in the time the GPU draws: the audible
+			// one (the clock less the sound's output latency), and from where the engine said it may start
+			// (`handover`), or the fade or transition the refused frame sits in is cut off.
+			const { rung, request, from, offset, lead, cheaper, heal } = untrack(() =>
+				ladder.start(
+					{ timeline, epoch, width: box },
+					{
+						fps: renderedFps(editor.timeline, editor.assets),
+						width: frameWidth,
+						playhead: ui.time,
+						duration: renderedDuration(editor.timeline),
+						latency: takeover ? (gpuPlay?.offsetAt(ui.time) ?? 0) : takeoverLatency,
+						ahead: takeover ? handover : null,
+						takeover
 					}
-				})
-			: null;
-		let restarted = '';
-		streaming = true;
-		const stop = startPlayback(
-			from,
-			request,
-			(f) => {
-				if (!live) return;
-				// The audio clock owns time; picture chases it.
-				const call = verdict(ui.time - f.time, performance.now() / 1000);
-				switch (call) {
-					case 'resync':
-					case 'degrade': {
-						// Compositing can't keep up with real time on this timeline. Playing
-						// the backlog out would run the picture in slow motion against the
-						// sound, and dropping it forever would freeze the pane — so jump the
-						// stream forward to where playback has actually got to, and when it
-						// is slow rather than stalled, at a cost the machine can carry.
-						live = false;
-						restarted = call;
-						ladder.restarted(call, verdict.floor());
-						resyncs++;
-						return;
+				)
+			);
+			if (takeover) takeoverLatency = offset;
+			let live = true;
+			let taken = !takeover;
+			// At the cheapest rung there is nothing to restart into, and a restart costs an ffmpeg spawn on a
+			// machine that is already short: the frames are skipped to the resync, as they were before.
+			// A stream a lag restart started a moment ago is not offered a restart for healing either: a stall that
+			// comes with every start would be restarted over and over, paying itself again each time.
+			const verdict = createFrameGate({
+				fps: rung.fps,
+				overloadAfter: cheaper ? undefined : Infinity,
+				healWatch: heal ? undefined : Infinity,
+				lead
+			});
+			const painter = CANVAS_PAINTER
+				? createStreamPainter({
+						decode: decodeJpeg,
+						paint: (picture) => {
+							if (!canvasEl) return;
+							paintPicture(canvasEl, picture);
+							frames.streamDrawn(picture.width / picture.height);
+						}
+					})
+				: null;
+			let restarted = '';
+			// A stream that takes the pane over from the GPU is not `streaming` (the route is still the
+			// surface's) until its first frame is shown.
+			streaming = !takeover;
+			const stop = startPlayback(
+				from,
+				request,
+				(f) => {
+					if (!live) return;
+					// The audio clock owns time; picture chases it.
+					const call = verdict(ui.time - offset - f.time, performance.now() / 1000);
+					switch (call) {
+						case 'resync':
+						case 'degrade': {
+							// Compositing can't keep up with real time on this timeline. Playing
+							// the backlog out would run the picture in slow motion against the
+							// sound, and dropping it forever would freeze the pane — so jump the
+							// stream forward to where playback has actually got to, and when it
+							// is slow rather than stalled, at a cost the machine can carry.
+							live = false;
+							restarted = call;
+							ladder.restarted(call, verdict.floor());
+							resyncs++;
+							return;
+						}
+						case 'skip':
+							// A frame the clock has moved past would drag the picture behind the
+							// sound, so wait for one that still applies.
+							return;
+						case 'show':
+							if (!taken) {
+								// The GPU draws up to where the engine said it stops: the stream's frames before that
+								// are not the pane's, and the GPU's last one stays until one at or past it is here.
+								if (handover && f.time < handover.at - 0.5 / rung.fps) return;
+								taken = true;
+								streaming = true;
+								const pb = gpuPlay;
+								gpuPlay = null;
+								pb?.end();
+							}
+							// Only a frame that is shown is turned into anything: the data URL is built here, not
+							// before the gate has had its say.
+							if (painter) painter.push(f.jpeg);
+							else frames.showStreamed(jpegDataUrl(f.jpeg));
 					}
-					case 'skip':
-						// A frame the clock has moved past would drag the picture behind the
-						// sound, so wait for one that still applies.
-						return;
-					case 'show':
-						// Only a frame that is shown is turned into anything: the data URL is built here, not
-						// before the gate has had its say.
-						if (painter) painter.push(f.jpeg);
-						else frames.showStreamed(jpegDataUrl(f.jpeg));
+				},
+				reportPlaybackError
+			);
+			stopStream = stop;
+			return () => {
+				live = false;
+				painter?.stop();
+				stop();
+				if (stopStream === stop) stopStream = null;
+				streaming = false;
+				// What the gate dropped is the one number that says whether this stream was smooth, so a stream
+				// that dropped anything leaves a line in the log (a clean one would only be noise).
+				ladder.ended(verdict.floor());
+				const seen = verdict.stats();
+				const painted = painter?.stats();
+				if (seen.skipped > 0 || restarted || (painted && painted.failed + painted.discarded + painted.replaced > 0)) {
+					logFrontend(
+						'info',
+						`playback stream ended: ${rung.fps} fps at ${rung.width} px, shown ${seen.shown}, skipped ${seen.skipped}` +
+							`${restarted ? `, restarted (${restarted})` : ''}${painted ? `, painter ${JSON.stringify(painted)}` : ''}`,
+						'playback'
+					);
 				}
-			},
-			reportPlaybackError
-		);
-		stopStream = stop;
+			};
+		};
+
+		beginStream = (handover, takeover) => {
+			if (!active || stopped) return;
+			stopped = startStream(handover, takeover);
+		};
+		if (gpu) {
+			// The pump takes it from here: its first request decides, and a `stream` answer comes back as `handOverToStream`.
+			playFps = untrack(() => playbackFps(renderedFps(editor.timeline, editor.assets)));
+			gpuPlay = new GpuPlayback(playFps, session.from, session.running);
+		} else {
+			beginStream(null, false);
+		}
 		return () => {
-			live = false;
-			painter?.stop();
-			stop();
-			if (stopStream === stop) stopStream = null;
-			streaming = false;
-			// What the gate dropped is the one number that says whether this stream was smooth, so a stream
-			// that dropped anything leaves a line in the log (a clean one would only be noise).
-			ladder.ended(verdict.floor());
-			const seen = verdict.stats();
-			const painted = painter?.stats();
-			if (seen.skipped > 0 || restarted || (painted && painted.failed + painted.discarded + painted.replaced > 0)) {
+			active = false;
+			beginStream = null;
+			const pb = gpuPlay;
+			gpuPlay = null;
+			pb?.end();
+			stopped?.();
+			stopped = null;
+			if (pb && (pb.drawn > 0 || pb.repeated > 0) && !pb.handingOver) {
 				logFrontend(
 					'info',
-					`playback stream ended: ${rung.fps} fps at ${rung.width} px, shown ${seen.shown}, skipped ${seen.skipped}` +
-						`${restarted ? `, restarted (${restarted})` : ''}${painted ? `, painter ${JSON.stringify(painted)}` : ''}`,
+					`GPU playback ended: ${pb.drawn} frames drawn, ${pb.repeated} repeated, round trip ${Math.round(pb.roundTrip * 1000)} ms`,
 					'playback'
 				);
 			}

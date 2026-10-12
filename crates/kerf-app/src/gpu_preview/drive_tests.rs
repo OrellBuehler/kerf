@@ -116,9 +116,19 @@ pub(super) fn project() -> Project {
 
 /// These tests move the process's plan epoch (every project they open does) and one of them reads
 /// it, so they take turns.
-pub(super) fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+pub(super) fn exclusive() -> Turn {
     static TURN: Mutex<()> = Mutex::new(());
-    lock(&TURN)
+    Turn(lock(&TURN))
+}
+
+/// A test's turn. Ending it waits for the threads of a preview that can hold the device (`busy`): the last
+/// test of a process otherwise exits while one tears the device down.
+pub(super) struct Turn(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        super::busy::wait_idle(Duration::from_secs(10));
+    }
 }
 
 /// An epoch of this file's own, for the tests that must not see the bumps of the other tests of the

@@ -275,6 +275,11 @@ struct View {
     big: bool,
 }
 
+type Answer = (u64, Instant, Delivery<Result<PreviewFrameResult, String>>);
+
+/// How long the playhead rests after a play is primed before Play is pressed in the bench's "rested" start.
+const RESTED: Duration = Duration::from_millis(600);
+
 const STEPS: usize = 60;
 const STEP: f64 = 1.0 / 30.0;
 
@@ -511,4 +516,442 @@ fn a_drag_through_the_frame_path() {
     }
     let _ = std::fs::remove_dir_all(&dir);
     report_to("bench-drag.txt", &out);
+}
+
+// ---- GPU playback ---------------------------------------------------------------------------------
+
+/// CPU seconds (user + system) used by this process and by the children it has waited for
+/// (`/proc/self/stat`; Linux, `CLK_TCK` 100): the cursors' `ffmpeg`s are counted when they are reaped.
+fn cpu_seconds() -> (f64, f64) {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    // Fields 14 to 17 (utime, stime, cutime, cstime), after the `(comm)` that may hold spaces.
+    let fields: Vec<f64> = stat
+        .rsplit(')')
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .skip(11)
+        .take(4)
+        .filter_map(|f| f.parse::<f64>().ok())
+        .map(|ticks| ticks / 100.0)
+        .collect();
+    match fields.as_slice() {
+        [u, s, cu, cs] => (u + s, cu + cs),
+        _ => (0.0, 0.0),
+    }
+}
+
+/// The project a play bench plays: the two proxies (5 s each) as a hard cut with one layer on screen at a
+/// time (`heavy` false) or, `heavy`, as a 0.6 s dissolve with a translucent picture-in-picture, a rotated one
+/// and a title over them for the whole of it.
+fn play_project(clips: &[PathBuf; 2], heavy: bool) -> Project {
+    use kerf_core::{Clip, TextOverlay, Transition, TransitionKind};
+    let project = Project::open_in_memory().expect("a project");
+    let a = project.insert_or_get_asset(&drive_tests::probed(&clips[0])).expect("asset");
+    let b = project.insert_or_get_asset(&drive_tests::probed(&clips[1])).expect("asset");
+    let video = |clips: Vec<Clip>, name: &str| Track {
+        clips,
+        ..Track::new(StreamKind::Video, name)
+    };
+    let mut second = Clip::new(b.id, 0.0, 5.0, 5.0);
+    let mut tracks = Vec::new();
+    let mut overlays = Vec::new();
+    if heavy {
+        second.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.6,
+        });
+        let mut pip = Clip::new(b.id, 0.5, 6.0, 0.0);
+        pip.transform.scale = 0.4;
+        pip.transform.pos_x = 0.25;
+        pip.transform.pos_y = -0.2;
+        pip.transform.opacity = 0.8;
+        let mut turned = Clip::new(a.id, 1.0, 6.0, 0.0);
+        turned.transform.scale = 0.3;
+        turned.transform.pos_x = -0.3;
+        turned.transform.pos_y = 0.25;
+        turned.transform.rotation = 8.0;
+        tracks.push(video(vec![Clip::new(a.id, 0.0, 5.0, 0.0), second], "V1"));
+        tracks.push(video(vec![pip], "V2"));
+        tracks.push(video(vec![turned], "V3"));
+        overlays.push(TextOverlay::new("A heavy cut", 0.5, 9.5));
+    } else {
+        tracks.push(video(vec![Clip::new(a.id, 0.0, 5.0, 0.0), second], "V1"));
+    }
+    let timeline = Timeline {
+        tracks,
+        overlays,
+        markers: Vec::new(),
+        format: None,
+        master: Default::default(),
+    };
+    project.save_timeline(&timeline).expect("a timeline");
+    project
+}
+
+/// What one simulated play of a cut came to.
+struct Played {
+    name: String,
+    /// Seconds of the cut played.
+    seconds: f64,
+    drawn: usize,
+    repeats: usize,
+    superseded: usize,
+    /// How far from the frame's own time it reached the screen, ms (positive: late).
+    offsets: Vec<f64>,
+    /// The first frame, from the first request to its answer.
+    first_ms: f64,
+    trips: Vec<f64>,
+    /// CPU seconds: this process, and the cursors.
+    process_cpu: f64,
+    children_cpu: f64,
+    /// Where the GPU path's own parts of a frame went, ms (medians).
+    decode_ms: f64,
+    record_ms: f64,
+    present_ms: f64,
+}
+
+impl Played {
+    fn line(&mut self) -> String {
+        let within = self.offsets.iter().filter(|o| (0.0..=33.4).contains(*o)).count();
+        let frames = self.drawn.max(1) as f64;
+        format!(
+            "{:<34} {:>2.0} s: {:>3} drawn {:>3} repeats {:>3} replaced | first frame {:>6.1} ms | frame time to screen p50 {:>6.1} p95 {:>6.1} max {:>6.1} ms ({:>3.0}% inside the frame's own slot) | round trip p50 {:>5.1} ms | CPU per drawn frame: process {:>5.1} ms, cursors {:>5.1} ms | decode wait {:>4.1} record {:>4.1} present {:>5.1} ms",
+            self.name,
+            self.seconds,
+            self.drawn,
+            self.repeats,
+            self.superseded,
+            self.first_ms,
+            median(&mut self.offsets.clone()),
+            percentile(&mut self.offsets.clone(), 0.95),
+            self.offsets.iter().copied().fold(f64::MIN, f64::max),
+            100.0 * within as f64 / self.offsets.len().max(1) as f64,
+            median(&mut self.trips.clone()),
+            self.process_cpu / frames * 1e3,
+            self.children_cpu / frames * 1e3,
+            self.decode_ms,
+            self.record_ms,
+            self.present_ms,
+        )
+    }
+}
+
+/// The page, simulated: a 60 Hz tick reads a clock that runs from `from` at the moment the session starts, asks
+/// for the picture of `clock + median round trip` once per frame of the cut (the first request alone until it is
+/// answered), through the real mailbox, and every answer is timed against the frame's own time.
+fn play_through(name: &str, preview: &Arc<GpuPreview>, take: &TakeInputs, from: f64, seconds: f64, width: u32) -> Played {
+    const FPS: f64 = 30.0;
+    let (cpu0, kids0) = cpu_seconds();
+    let (tx, rx) = mpsc::channel::<Answer>();
+    let session = 77;
+    let started = Instant::now();
+    let tick = Duration::from_micros(16_667);
+    let mut next = started;
+    let mut seq = 0u64;
+    let (mut last_asked, mut decided, mut sent_at) = (None::<u64>, false, std::collections::HashMap::new());
+    let mut trips: Vec<f64> = Vec::new();
+    let (mut drawn, mut repeats, mut superseded) = (0usize, 0usize, 0usize);
+    let (mut offsets, mut first_ms) = (Vec::new(), 0.0);
+    let (mut decode, mut record, mut present) = (Vec::new(), Vec::new(), Vec::new());
+    let mut answers = |rx: &mpsc::Receiver<Answer>,
+                       decided: &mut bool,
+                       trips: &mut Vec<f64>,
+                       sent_at: &std::collections::HashMap<u64, Instant>| {
+        while let Ok((n, at, delivery)) = rx.try_recv() {
+            match delivery {
+                Delivery::Superseded => superseded += 1,
+                Delivery::Abandoned => panic!("the worker died"),
+                Delivery::Done(result) => {
+                    let result = result.expect("an answer");
+                    assert_eq!(result.renderer, "gpu", "{:?}", result.reasons);
+                    let play = result.play.expect("play");
+                    *decided = true;
+                    if play.repeat {
+                        repeats += 1;
+                        continue;
+                    }
+                    drawn += 1;
+                    let trip = ms(at.saturating_duration_since(sent_at[&n]));
+                    if first_ms == 0.0 {
+                        first_ms = trip;
+                    }
+                    trips.push(trip);
+                    // The frame's own time, on the clock that ran from `from` when the session started.
+                    let own = play.start + play.frame as f64 / FPS - from;
+                    offsets.push(ms(at.saturating_duration_since(started)) - own * 1e3);
+                    if let Some(t) = result.timings {
+                        decode.push(t.decode_ms);
+                        record.push(t.composite_ms);
+                        present.push(t.present_ms);
+                    }
+                }
+            }
+        }
+    };
+    loop {
+        next += tick;
+        let now = Instant::now();
+        if next > now {
+            std::thread::sleep(next - now);
+        }
+        answers(&rx, &mut decided, &mut trips, &sent_at);
+        let clock = from + started.elapsed().as_secs_f64();
+        if clock - from > seconds {
+            break;
+        }
+        let recent: Vec<f64> = trips.iter().rev().take(9).copied().collect();
+        let trip = if recent.is_empty() {
+            0.0
+        } else {
+            median(&mut recent.clone()) / 1e3
+        };
+        let want = clock + trip.min(0.25);
+        let frame = (want * FPS + 1e-6).floor() as u64;
+        if last_asked.is_some_and(|l| frame <= l) || (!decided && last_asked.is_some()) {
+            continue;
+        }
+        last_asked = Some(frame);
+        seq += 1;
+        let request = FrameRequest::new(Arc::clone(take), want, width, false)
+            .ordered("page", seq)
+            .forward("page", session);
+        let sent = Instant::now();
+        sent_at.insert(seq, sent);
+        let answer = preview.post(request, |job| {
+            std::thread::spawn(job);
+        });
+        let tx = tx.clone();
+        let n = seq;
+        std::thread::spawn(move || {
+            if let Ok(delivery) = answer.blocking_recv() {
+                let _ = tx.send((n, Instant::now(), delivery));
+            }
+        });
+    }
+    // Let the last answers in.
+    std::thread::sleep(Duration::from_millis(400));
+    answers(&rx, &mut decided, &mut trips, &sent_at);
+    preview.end_play();
+    let (cpu1, kids1) = cpu_seconds();
+    Played {
+        name: name.to_string(),
+        seconds,
+        drawn,
+        repeats,
+        superseded,
+        offsets,
+        first_ms,
+        trips,
+        process_cpu: cpu1 - cpu0,
+        children_cpu: kids1 - kids0,
+        decode_ms: median(&mut decode),
+        record_ms: median(&mut record),
+        present_ms: median(&mut present),
+    }
+}
+
+/// `stream_preview` for `seconds`, as `start_playback` runs it: the time to the first frame, and what the
+/// `ffmpeg` it ran cost per frame.
+fn stream_through(name: &str, inputs: &PlanInputs, from: f64, seconds: f64, width: u32) -> (f64, usize, f64, String) {
+    let (_, kids0) = cpu_seconds();
+    let started = Instant::now();
+    let mut first = None;
+    let mut frames = 0usize;
+    let request = kerf_core::PlaybackRequest {
+        fps: None,
+        max_width: Some(width),
+    };
+    kerf_core::stream_preview_with(&inputs.timeline, &inputs.preview_assets, from, request, &mut |_| {
+        first.get_or_insert_with(|| started.elapsed());
+        frames += 1;
+        started.elapsed().as_secs_f64() < seconds
+    })
+    .expect("the stream");
+    let (_, kids1) = cpu_seconds();
+    let per_frame = (kids1 - kids0) / frames.max(1) as f64 * 1e3;
+    (
+        first.map_or(0.0, ms),
+        frames,
+        per_frame,
+        format!(
+            "{name}: {frames} frames in {seconds:.0} s, first frame {:.1} ms, ffmpeg CPU per frame {per_frame:.1} ms",
+            first.map_or(0.0, ms)
+        ),
+    )
+}
+
+#[test]
+#[ignore = "timings; KERF_BENCH=1; needs ffmpeg and a GPU adapter"]
+fn a_play_session_through_the_frame_path() {
+    let _turn = drive_tests::exclusive();
+    if !bench_on() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kerf-app-bench-play-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let clips = proxy_clips(&dir);
+    let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter");
+    let mut out = format!(
+        "# GPU playback over 1280x720 all-intra clips on {} (a software adapter: its raster is the frame time, so GPU timings here are not a real GPU's)\n\
+         # first frame: the first request of a session to its answer. start: Play to the first frame on the screen, warm backend (no IPC: add 1 to 3 ms).\n\
+         # A/V: how far from the frame's own time the frame reached the screen, on a clock that runs from the start of the play; the sound's output latency is not in it.\n",
+        gpu.adapter_info().name
+    );
+    for (title, heavy, from, width) in [
+        ("light: one layer, a hard cut at 5 s", false, 3.5, 960u32),
+        (
+            "heavy: base + dissolve + a translucent PiP + a rotated PiP + a title",
+            true,
+            3.5,
+            960,
+        ),
+    ] {
+        let _ = writeln!(out, "\n## {title}");
+        let (take, _shared) = drive_tests::taker(play_project(&clips, heavy));
+        let log = Arc::new(Mutex::new(ScreenLog::default()));
+        lock(&log).complete_with = Some(Arc::clone(&gpu));
+        let preview = Arc::new(drive_tests::preview_on(&log, Arc::clone(&gpu)));
+        let inputs = preview.inputs(&take).expect("inputs");
+        // Backend, check and shaders warm (the first session of a run is the stream's: the check is pending).
+        let key = |n| PlayKey {
+            client: "page".into(),
+            session: n,
+        };
+        let _ = preview.play(&inputs, &key(1), 0.0, false);
+        drive_tests::wait_open(&preview);
+        for n in 0..3 {
+            let answer = preview.play(&inputs, &key(2 + n), 0.2, false).expect("an answer");
+            assert_eq!(answer.renderer, "gpu", "{:?}", answer.reasons);
+        }
+        preview.end_play();
+
+        // Start latency: a play from a playhead nothing was made ready for (cold), from one that rested on a paused
+        // frame long enough to be primed and then for `RESTED` more (the pointer going to the Play button), from
+        // one played the moment the priming was done (no head start for the `ffmpeg`s), and the stream's first
+        // JPEG for the same start. The GPU's own wait (`present`: a CPU rasteriser's raster) is kept apart, as
+        // what a start costs on a device whose frames are not the CPU's.
+        let (mut gpu_starts, mut primed_starts, mut quick_starts, mut stream_starts) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut gpu_decode, mut primed_decode, mut quick_decode) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut gpu_wait, mut primed_wait, mut quick_wait) = (Vec::new(), Vec::new(), Vec::new());
+        let primed_play = |at: f64, n: u64, dwell: Duration| {
+            // The playhead rests on the paused frame at `at`; the play from it is made ready.
+            let rest = FrameRequest::new(Arc::clone(&take), at, width, false);
+            let _ = preview
+                .post(rest, |job| {
+                    std::thread::spawn(job);
+                })
+                .blocking_recv();
+            let until = Instant::now() + Duration::from_secs(10);
+            while lock(&preview.primed).is_none() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(lock(&preview.primed).is_some(), "the play was not primed");
+            std::thread::sleep(dwell);
+            let current = preview.inputs(&take).expect("inputs");
+            let began = Instant::now();
+            // The picture is asked for what is audible: a little before the playhead.
+            let answer = preview.play(&current, &key(n), at - 0.04, false).expect("an answer");
+            assert_eq!(answer.renderer, "gpu", "{:?}", answer.reasons);
+            let started = ms(began.elapsed());
+            preview.end_play();
+            std::thread::sleep(Duration::from_millis(150));
+            (started, answer.timings)
+        };
+        for n in 0..8u64 {
+            let at = 0.4 + n as f64 * 0.37;
+            let began = Instant::now();
+            let answer = preview.play(&inputs, &key(10 + n), at, false).expect("an answer");
+            assert_eq!(answer.renderer, "gpu", "{:?}", answer.reasons);
+            gpu_starts.push(ms(began.elapsed()));
+            gpu_decode.extend(answer.timings.map(|t| t.decode_ms));
+            gpu_wait.extend(answer.timings.map(|t| t.present_ms));
+            preview.end_play();
+            std::thread::sleep(Duration::from_millis(150));
+
+            let (started, timings) = primed_play(at, 100 + n, RESTED);
+            primed_starts.push(started);
+            primed_decode.extend(timings.map(|t| t.decode_ms));
+            primed_wait.extend(timings.map(|t| t.present_ms));
+            let (started, timings) = primed_play(at, 200 + n, Duration::ZERO);
+            quick_starts.push(started);
+            quick_decode.extend(timings.map(|t| t.decode_ms));
+            quick_wait.extend(timings.map(|t| t.present_ms));
+
+            let began = Instant::now();
+            let mut first = None;
+            let request = kerf_core::PlaybackRequest {
+                fps: None,
+                max_width: Some(width),
+            };
+            kerf_core::stream_preview_with(&inputs.timeline, &inputs.preview_assets, at, request, &mut |_| {
+                first = Some(began.elapsed());
+                false
+            })
+            .expect("the stream");
+            stream_starts.push(first.map_or(0.0, ms));
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        let row = |label: &str, v: &mut Vec<f64>| {
+            format!(
+                "{label}: min {:>6.1} p50 {:>6.1} p95 {:>6.1} ms",
+                v.iter().copied().fold(f64::MAX, f64::min),
+                median(&mut v.clone()),
+                percentile(v, 0.95)
+            )
+        };
+        let net = |starts: &[f64], wait: &[f64]| -> Vec<f64> { starts.iter().zip(wait).map(|(s, w)| s - w).collect() };
+        for (label, starts, decode, wait) in [
+            ("cold   ", &gpu_starts, &mut gpu_decode, &gpu_wait),
+            ("rested ", &primed_starts, &mut primed_decode, &primed_wait),
+            ("instant", &quick_starts, &mut quick_decode, &quick_wait),
+        ] {
+            let _ = writeln!(
+                out,
+                "start latency, GPU session {label} (Play to first frame): {}",
+                row("", &mut starts.clone())
+            );
+            let _ = writeln!(
+                out,
+                "  ...of which the wait for the cursors' first frames:      {}",
+                row("", decode)
+            );
+            let _ = writeln!(
+                out,
+                "  ...without the screen's wait for the GPU:                {}",
+                row("", &mut net(starts, wait))
+            );
+        }
+        let _ = writeln!(
+            out,
+            "start latency, stream_preview         (start to first JPEG): {}",
+            row("", &mut stream_starts)
+        );
+
+        // A play across the cut (5 s) with the page simulated, and the stream for the same span.
+        let mut played = play_through(
+            if heavy { "GPU session, heavy" } else { "GPU session, light" },
+            &preview,
+            &take,
+            from,
+            4.0,
+            width,
+        );
+        let _ = writeln!(out, "{}", played.line());
+        let (_, _, _, line) = stream_through(
+            if heavy {
+                "stream_preview, heavy"
+            } else {
+                "stream_preview, light"
+            },
+            &inputs,
+            from,
+            4.0,
+            width,
+        );
+        let _ = writeln!(out, "{line}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    report_to("bench-play.txt", &out);
 }

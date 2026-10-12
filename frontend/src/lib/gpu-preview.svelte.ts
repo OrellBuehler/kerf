@@ -33,12 +33,13 @@ class GpuPreviewStore {
 	note(result: PreviewFrameResult) {
 		if (result.renderer === 'superseded') return;
 		const before = this.renderer;
-		this.renderer = result.renderer;
+		// A session the stream plays is FFmpeg's, with the reasons the GPU gave.
+		this.renderer = result.renderer === 'stream' ? 'ffmpeg' : result.renderer;
 		this.reasons = result.reasons;
 		this.timings = result.timings;
 		// A frame the GPU did not draw may be a failure that changed the device's state; the
 		// dialog's "why not" line should follow, without a command per frame.
-		if ((result.renderer === 'ffmpeg' && Date.now() - this.refreshedAt > REFRESH_EVERY_MS) || before === null) {
+		if ((this.renderer === 'ffmpeg' && Date.now() - this.refreshedAt > REFRESH_EVERY_MS) || before === null) {
 			void this.refresh();
 		}
 	}

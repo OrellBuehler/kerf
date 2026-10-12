@@ -5,6 +5,14 @@
 // (`frameUrl`), as nothing at all (`gpuShown`: the native surface is what is seen) or, with the canvas
 // painter on (`CANVAS_PAINTER`), as the last frame of the playback stream on a canvas of its own (`streamShown`).
 //
+// **GPU playback** (`playback` set) is a third route: while the cut plays forward at 1x and the
+// session is the GPU's, `run` runs once per animation frame (the playhead moves) and asks the backend
+// for the picture of the time that is audible now (`GpuPlayback.next`: the clock less the sound's output
+// latency plus the smoothed round trip, one request per frame of the cut), with `hint = forward`. The
+// first answer decides the session; one that says `stream` (or a frame that fails, or a GPU that cannot
+// hold the rate) hands it to the stream through `playHandover`, and so does the hand-over the answers
+// announce (`ahead`) when the playhead gets to it.
+//
 // The one rule that matters: **what the effect depends on is what it reads in `run`**, and `pump`
 // reads nothing reactive before its first await. A frame fetch is expensive (an FFmpeg composite),
 // so an effect that re-ran because something unrelated changed (the trim monitor, the GPU status
@@ -13,7 +21,8 @@
 // to `pump` as values.
 
 import { isProxyWaitMessage } from './proxy-wait';
-import type { PreviewFrameResult, PreviewOrder } from './types';
+import type { GpuPlayback } from './gpu-playback';
+import type { PlayAhead, PlayAsk, PreviewFrameResult, PreviewOrder } from './types';
 
 export interface FramePumpDeps {
 	/** The playhead. */
@@ -39,11 +48,33 @@ export interface FramePumpDeps {
 	timelineFrame(time: number, width: number): Promise<string | null>;
 	/** `order` says which request of this pump it is, so the backend can tell a request that arrived
 	 *  after a newer one (the calls are separate tasks over the IPC) and not draw it. */
-	previewFrame(time: number, overlays: boolean, width: number, order: PreviewOrder): Promise<PreviewFrameResult>;
+	previewFrame(
+		time: number,
+		overlays: boolean,
+		width: number,
+		order: PreviewOrder,
+		play?: PlayAsk
+	): Promise<PreviewFrameResult>;
 	/** What the backend answered (the status bar names the renderer). */
 	answered(result: PreviewFrameResult): void;
 	/** The GPU path failed outright (the command rejected): the frame is the JPEG and the surface goes. */
 	gpuFailed(error: unknown): void;
+	/** GPU playback: the session being decided or played, or null. Read in `run`, so a session that
+	 *  starts or ends brings a frame back (the settled one, at a pause). */
+	playback?(): GpuPlayback | null;
+	/** What a forward request reads: the playhead (the audio clock), how late the sound is, and the
+	 *  rate the cut plays at. */
+	playClock?(): { clock: number; latency: number; fps: number };
+	/** Seconds a stream takes to start, for knowing how early to hand over to it. */
+	startup?(): number | undefined;
+	/** The session goes to the stream: at once (`now`: the engine said so, a frame failed, the GPU
+	 *  cannot hold the rate) or when the playhead has got to where the GPU stops. `ahead` says where
+	 *  from, when the engine knew. */
+	playHandover?(playback: GpuPlayback, ahead: PlayAhead | null, now: boolean, why: string): void;
+	/** Under "Proxy only" the backend refused to start the session: the preview waits for a proxy. */
+	playWaiting?(playback: GpuPlayback, message: string): void;
+	/** A clock in seconds (any origin) the round trips are timed by; `performance.now() / 1000`. */
+	now?(): number;
 }
 
 export function createFramePump(deps: FramePumpDeps) {
@@ -114,6 +145,59 @@ export function createFramePump(deps: FramePumpDeps) {
 			streamShown = false;
 			frameUrl = result.frame;
 		}
+	}
+
+	// A frame of GPU playback: see the header. Not single-flight either; the session says what to ask.
+	async function forward(playback: GpuPlayback, overlays: boolean, width: number) {
+		const clock = deps.playClock?.();
+		if (!clock) return;
+		const now = deps.now ?? (() => performance.now() / 1000);
+		const due = playback.handoverDue(clock.clock, deps.startup?.());
+		if (due) {
+			deps.playHandover?.(playback, due, false, due.why);
+			return;
+		}
+		if (playback.stalled(now())) {
+			deps.gpuFailed(new Error('the GPU preview stopped answering during playback'));
+			deps.playHandover?.(playback, playback.ahead, true, 'the GPU stopped answering');
+			return;
+		}
+		const step = playback.next(clock.clock, clock.latency, clock.fps);
+		if (!step) return;
+		const seq = ++asked;
+		const sent = now();
+		playback.noteSent(sent);
+		let result: PreviewFrameResult;
+		try {
+			result = await deps.previewFrame(step.time, overlays, width, { client, seq }, { session: playback.session });
+		} catch (error) {
+			if (deps.playback?.() !== playback) return;
+			if (isProxyWaitMessage(error)) {
+				deps.playWaiting?.(playback, error instanceof Error ? error.message : String(error));
+				return;
+			}
+			// The command itself failed: the stream plays on from the playhead, and the surface must not stay over it.
+			deps.gpuFailed(error);
+			deps.playHandover?.(playback, null, true, error instanceof Error ? error.message : String(error));
+			return;
+		}
+		if (deps.playback?.() !== playback) return;
+		const verdict = playback.answer(result, now() - sent, now());
+		if (verdict === 'ignore' || verdict === 'repeat') return;
+		if (verdict === 'stream') {
+			deps.answered(result);
+			const why = playback.overloaded
+				? 'the GPU cannot hold the rate'
+				: (result.reasons[0] ?? playback.ahead?.why ?? 'the stream plays from here');
+			deps.playHandover?.(playback, playback.ahead, true, why);
+			return;
+		}
+		if (seq < shown) return;
+		shown = seq;
+		deps.answered(result);
+		gpuShown = true;
+		streamShown = false;
+		if (result.timings?.width && result.timings.height) imgAspect = result.timings.width / result.timings.height;
 	}
 
 	// Single-flight on the JPEG route: only ever one composite in flight, and `queued` always holds the
@@ -210,6 +294,11 @@ export function createFramePump(deps: FramePumpDeps) {
 				return;
 			}
 			if (deps.streaming() || width === null) return;
+			const playback = deps.playback?.() ?? null;
+			if (playback) {
+				void forward(playback, overlays, width);
+				return;
+			}
 			queued = { time, via, overlays, width };
 			void pump();
 		}

@@ -370,6 +370,32 @@ of the file, 24 / 29.97 / 30 / 60 fps) against `select`: 4290 frames on 9.0.2. `
 lines) holds what needs no FFmpeg — skipped output frames are not held, a run that closes its output
 and never exits is killed, a wrong-sized picture is `Unsupported`, `Before` spawns nothing.
 
+**Playing** (A4) is a loop over a `kerf_core::PlayCut` (`core-render-plan.md`: the Motion plan of the slice `stream_preview` plays) and
+the cursors above, not over the router's runs: the router serves `Pick::AtOrAfter` from a shared cache, and a playing frame has to be the
+export's `fps` pick, which only a cursor reads. `MotionFrames::frames(plan)` reads a frame's layers **side by side** (scoped threads, one per
+cursor: three layers cost the slowest decode, not the sum), `Compositor::render_motion_texture(plan, size, &mut motion)` is
+`render_plan_texture_with` over it (the texture stays on the GPU for the presenter), and `Compositor::warm_text(plan, size)` rasterises a
+plan's titles into the atlas without drawing, so a caption that comes on screen costs its `ffmpeg` on a prefetch thread and not on the frame (and `render_motion_texture` warms the frame's own titles *while* its cursors read, the two waits being independent).
+**`MotionFrames::feed()` is a `CursorFeed`**: `open(layer, needed_at)` checks the clip as `FrameSource::cursor` does (`FrameSource::check_cursor`, the same
+gates split out: the self-test, a recorded opaque pixel format, an indexed container, seek points on keyframes, no run has marked the file) and
+starts its `ffmpeg`, which fills the pipe and waits (at most 6 waiting, 10 s each; `needed_at` is when the clip comes on screen, and with 6 waiting the
+one wanted **last** is dropped for a nearer clip, while a clip wanted after all of them is not opened: `Opened::Full`, the caller asks again; `close()` ends the feed
+and a cursor that was being opened is dropped when it is ready); the frame that first needs the clip takes the waiting
+cursor instead of paying the file's two probes (50 ms) and the process start. Called from a thread that is not drawing, and a clip it refuses is
+known *before* the cut, when the caller can still choose what to play instead. A cursor opens at the clip's own seek, so what it reads from there
+to the frame is decode work: a play session starts its slice at the playhead (`PlayCut`), which puts that seek at the playhead and not at the
+clip's in point. `tests/playback.rs` (`#[ignore]`d; both FFmpegs) holds the played frames to the export, **plane for plane, 0 levels in every
+case but the layers the compositor scales**: from the start (a hard cut, a clip's fades, a dissolve, a still image, a title), from the middle of a clip on the grid and between two frames, from deep in a
+long clip, from inside a dissolve (the session starts before it and the frames from the requested time on are the whole cut's, dissolve
+included), a dip, slides and a push entered inside the transition, a 25 fps clip in a 30 fps cut and a 2x clip (the slice's export, the graph
+the stream plays), and every n-th frame asked for (n = 2, 3, 7, 30: a frame a newer request replaced changes no other). A slide's travel is
+truncated to whole pixels, and the slice's clock is not the whole cut's by a float's width, so a travel that lands exactly on a pixel can fall
+either side of it: slides are held to the slice's export, and so is a dissolve out of a still image (a PNG is a 25 fps stream, so the cut is a 25 fps one
+with a 30 fps clip in it, and which source frame an output frame picks depends on where the slice starts). A layer over another track is held to the
+export within the scaler's level (placed: 1) and the scaler's plus the translucent round trip's (scaled and translucent: 2 in every plane, the `2` row of the ladder
+above: `SCALED` plus `TRANSLUCENT` would say luma 1 and chroma 2, but the scaler's level crosses into luma through the round trip's conversion). It also holds the feed (a cursor opened ahead is the one the cut uses and the first
+clip's goes with it; a transport stream is refused when opened ahead; with more clips in the window than it holds it keeps the ones wanted first), and the texture a session presents to be the composite's picture.
+
 What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
 
 - **Composite in YUV, convert once.** FFmpeg's `overlay` blends the encoded planes and
@@ -642,7 +668,7 @@ a dissolve, dip, slide or push into a zooming clip and out of one) hold the boun
 | 0 | a mask at the picture's size (20 of 27 mask rows), grayscale, invert, sharpen at the picture's size | integer arithmetic, reproduced |
 | 1 (`SCALED`) | a layer the compositor scales, a mask on it, a one-stage zoom | swscale's x86 scaler is not bit-exact with the C arithmetic the shader follows |
 | 1 (`EFFECT`) | a blur at the picture's size | `gblur`'s SIMD summation order (above) |
-| 2 | `EFFECT_SCALED`: a blur, grayscale or invert on a scaled or translucent layer; a blur then a sharpen of at most 0.5 even unscaled and opaque (the blur's level times the gain); a sharpen of at most 0.5 after a scale. `CASCADED`: a zoom (the fit scale, then the zoom's). `ZOOMED_MASK`: a soft mask edge on a zoomed picture. Rotated, graded and scaled, dip to white (Y three on BT.709, `WHITE_709`) | two of the causes above on one sample; the RGB kernel for white |
+| 2 | a layer the compositor scales *and* makes translucent, no effect (`tests/playback.rs`, `play/pip/translucent and scaled`, measured Y 2 / UV 2 on both FFmpegs); `EFFECT_SCALED`: a blur, grayscale or invert on a scaled or translucent layer; a blur then a sharpen of at most 0.5 even unscaled and opaque (the blur's level times the gain); a sharpen of at most 0.5 after a scale. `CASCADED`: a zoom (the fit scale, then the zoom's). `ZOOMED_MASK`: a soft mask edge on a zoomed picture. Rotated, graded and scaled, dip to white (Y three on BT.709, `WHITE_709`) | two of the causes above on one sample; the RGB kernel for white |
 
 A **sharpen after a scale or a blur has no row beyond that: it is refused past a worst-case error of 2.** `unsharp` is exact, but it carries the one-level difference upstream (the scaler's, or `gblur`'s SIMD order) through at worst `1 + 2|amount|` levels of luma at an edge sample (measured after a scale: 3 at 1.5, 7 at 3, 11 at 5; after a blur on 6.1.1: 2 at 1, 3 at 1.5, 5-6 at 5), and its `>> 16` floors, so each further sharpen adds at least a level (measured on 6.1.1: two of 0.2 reach 3, three of 0.1 reach 4), and the GPU refuses rather than approximates. One sharpen of 0.5 is the two levels of a scaled blur. (A grade between a scale and a sharpen amplifies too: `GRADED_SCALED` already accepts two.)
 

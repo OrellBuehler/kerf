@@ -41,10 +41,14 @@
 //! This is a GUI-only surface: it has no MCP tool, because the agent already has
 //! `preview_timeline` (a JPEG of the cut) and nothing here is an edit.
 
+#[cfg(test)]
+mod busy;
 mod check;
 mod diagnostics;
 mod mailbox;
 mod pace;
+mod play;
+mod prime;
 mod snapshot;
 #[cfg(target_os = "linux")]
 mod x11;
@@ -52,9 +56,9 @@ mod x11;
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -74,6 +78,9 @@ use diagnostics::{Counters, Reason, Tally};
 pub use mailbox::Delivery;
 use mailbox::{Mailbox, MailboxStats, Order, Worker};
 use pace::Pace;
+use play::PlaySession;
+pub use play::{PlayInfo, PlayKey, PlayTally};
+use prime::{Primed, Primer};
 pub use snapshot::Taken;
 use snapshot::{PlanInputs, PlanSnapshots, SnapshotStats};
 
@@ -581,7 +588,9 @@ impl Host {
         match self {
             Host::Window { .. } => {}
             #[cfg(test)]
-            Host::Null => {}
+            Host::Null => {
+                HIDES.fetch_add(1, Ordering::SeqCst);
+            }
             #[cfg(target_os = "linux")]
             Host::Child(child) => child.hide(),
         }
@@ -598,6 +607,10 @@ impl Host {
         }
     }
 }
+
+/// How many times a test host was asked to hide the surface.
+#[cfg(test)]
+static HIDES: AtomicUsize = AtomicUsize::new(0);
 
 /// What a frame is shown with: the presenter and its surface. A trait so the frame path can be
 /// driven without a window (the tests' screen records what it was asked to do).
@@ -850,13 +863,17 @@ pub struct GpuTimings {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PreviewFrameResult {
     /// `"gpu"` (drawn in the native surface; the webview shows it by showing nothing over it),
-    /// `"ffmpeg"` (the `frame` data URL) or `"superseded"` (a newer request replaced this one before
-    /// it was drawn: nothing was, and the page ignores the answer).
+    /// `"ffmpeg"` (the `frame` data URL), `"superseded"` (a newer request replaced this one before
+    /// it was drawn: nothing was, and the page ignores the answer) or, to a forward request, `"stream"`
+    /// (the GPU does not play this session, or no longer: the page plays the stream from
+    /// `play.ahead.handover`, or from the playhead when there is none).
     pub renderer: &'static str,
     pub frame: Option<String>,
     /// Why the GPU did not draw it (empty when it did).
     pub reasons: Vec<String>,
     pub timings: Option<GpuTimings>,
+    /// To a forward request: the session's state (`None` for every other answer).
+    pub play: Option<PlayInfo>,
 }
 
 impl PreviewFrameResult {
@@ -867,6 +884,7 @@ impl PreviewFrameResult {
             frame: None,
             reasons: Vec::new(),
             timings: None,
+            play: None,
         }
     }
 }
@@ -892,6 +910,8 @@ pub struct FrameRequest {
     scrubbing: bool,
     /// Which of the page's requests this is, when it says.
     order: Option<Order>,
+    /// The play session this is a frame of (`hint = forward`), when it is.
+    play: Option<PlayKey>,
 }
 
 impl FrameRequest {
@@ -904,7 +924,18 @@ impl FrameRequest {
             arrived: Instant::now(),
             scrubbing: false,
             order: None,
+            play: None,
         }
+    }
+
+    /// This is a frame of play session `session` of the page `client`: the GPU plays the cut forward
+    /// from the first of them, or says that the stream does ([`play`]).
+    pub fn forward(mut self, client: impl Into<String>, session: u64) -> Self {
+        self.play = Some(PlayKey {
+            client: client.into(),
+            session,
+        });
+        self
     }
 
     /// This is request `seq` of the page `client`: one that arrives after a newer request of the
@@ -975,11 +1006,28 @@ pub struct GpuDiagnostics {
     pub self_test: Option<String>,
     pub adapter: Option<String>,
     pub software: bool,
+    /// What the play sessions did: how many the GPU played and how many the stream did.
+    pub play: PlayTally,
 }
 
 enum Attempt {
     Presented(GpuTimings),
     Fallback(Vec<Reason>),
+}
+
+/// A width and a height, pixels.
+type Dims = (u32, u32);
+
+/// How a drawn frame ended ([`GpuPreview::conclude`]).
+enum Concluded {
+    /// On the screen, drawn in `frame` (still on the GPU).
+    Shown(GpuTimings, RenderedFrame),
+    /// The surface was hidden (or the setting went off) while the frame was drawn.
+    Hidden,
+    /// The backend was replaced while the frame was drawn.
+    Restarted,
+    /// The frame was not drawn or not shown; a device or surface that is gone has been dropped.
+    Failed(GpuError),
 }
 
 /// Why a backend did not come up.
@@ -1005,6 +1053,10 @@ fn panic_text(payload: &(dyn Any + Send)) -> String {
 /// `render` (a frame in flight; the backend) → `bounds` (where the page says the frame is; held
 /// while a picture is shown, so a hide cannot land in the middle) → `host` (the option) → the
 /// host's own mutex. `building` (one backend build at a time) is taken alone, never under `render`.
+/// `render` → `info` (the build's note) → `play_tally` / `play` (the play session's slot: `keep_play` stores
+/// under `render`, `diagnostics` reads `play` under `info`), and `primed` → `play` (priming stores under the
+/// lock a play takes its primed session from, after looking at the slot). `play` is never held while
+/// taking any other of these, and the primer's own state is a leaf.
 pub struct GpuPreview {
     enabled: AtomicBool,
     /// Turning it on is a retry: the next frame forgets the backoff.
@@ -1024,6 +1076,19 @@ pub struct GpuPreview {
     prefetching: Arc<AtomicBool>,
     /// The inputs of the frames being drawn, held between frames (see [`snapshot`]).
     snapshots: PlanSnapshots,
+    /// The play session, between its frames (taken out while one is drawn): see [`play`].
+    play: Mutex<Option<PlaySession>>,
+    /// Forward requests being served: with a held session, a play that priming leaves the playhead to.
+    serving: AtomicUsize,
+    /// How long a session may go unasked for, milliseconds ([`play::IDLE`]; a field so a test can shorten it).
+    idle_ms: AtomicU64,
+    /// What the sessions that ended did.
+    play_tally: Mutex<PlayTally>,
+    /// The session from the playhead the paused frame is at, made ready (see [`prime`]).
+    primed: Mutex<Option<Primed>>,
+    primer: Arc<Primer>,
+    /// This preview, for the thread that primes (set by the first [`GpuPreview::post`]).
+    me: OnceLock<Weak<GpuPreview>>,
     /// Frame requests: only the newest is drawn.
     mail: Mailbox<FrameRequest, Result<PreviewFrameResult, String>>,
     /// Whether requests are arriving like a drag.
@@ -1049,6 +1114,12 @@ pub struct GpuPreview {
 
 /// Runs the parity self-test on a device (injected so the gate is testable without an FFmpeg).
 type Checker = dyn Fn(Arc<Gpu>) -> Result<SelfTestReport, SelfTestError> + Send + Sync;
+
+impl Drop for GpuPreview {
+    fn drop(&mut self) {
+        self.primer.stop();
+    }
+}
 
 impl GpuPreview {
     /// The app's: `app`'s main window is the host. `crashed` is [`take_crash_marker_in`]'s answer.
@@ -1087,6 +1158,13 @@ impl GpuPreview {
             prefetched: Mutex::new((Vec::new(), None)),
             prefetching: Arc::new(AtomicBool::new(false)),
             snapshots: PlanSnapshots::default(),
+            play: Mutex::new(None),
+            serving: AtomicUsize::new(0),
+            idle_ms: AtomicU64::new(play::IDLE.as_millis() as u64),
+            play_tally: Mutex::new(PlayTally::default()),
+            primed: Mutex::new(None),
+            primer: Primer::new(),
+            me: OnceLock::new(),
             mail: Mailbox::default(),
             pace: Mutex::new(Pace::default()),
             counters: Mutex::new(Counters::default()),
@@ -1223,6 +1301,8 @@ impl GpuPreview {
     fn teardown(&self) {
         tracing::info!(session = %lock(&self.counters).tally(self.mail.stats().superseded).line(), "the GPU preview's frames so far");
         self.snapshots.forget();
+        self.end_play();
+        self.drop_primed();
         *lock(&self.host) = None;
         let backend = lock(&self.render).backend.take();
         // A panic while dropping a broken backend must not take the caller with it.
@@ -1257,7 +1337,12 @@ impl GpuPreview {
         mut request: FrameRequest,
         run: impl FnOnce(Box<dyn FnOnce() + Send>),
     ) -> oneshot::Receiver<Answer> {
-        request.scrubbing = lock(&self.pace).observe(request.arrived);
+        let _ = self.me.set(Arc::downgrade(self));
+        // Frames of a play session are not a drag: they are shown with the refresh, and do not
+        // teach the pace what a click after them is.
+        if request.play.is_none() {
+            request.scrubbing = lock(&self.pace).observe(request.arrived);
+        }
         let order = request.order.take();
         let (answer, start) = self.mail.post(request, order);
         if start {
@@ -1285,10 +1370,16 @@ impl GpuPreview {
     /// the Proxy-only refusal, then the frame.
     fn serve(&self, request: &FrameRequest) -> Result<PreviewFrameResult, String> {
         let inputs = self.inputs(&request.take)?;
+        if let Some(key) = &request.play {
+            return self.play(&inputs, key, request.t, request.overlays);
+        }
+        self.end_play();
+        // A primed play was made for the playhead of an earlier paused frame; this is another.
+        self.drop_primed();
         if let Some(wait) = inputs.proxy_wait(request.t)? {
             return Err(wait);
         }
-        self.frame(
+        let result = self.frame(
             &inputs,
             Want {
                 t: request.t,
@@ -1296,7 +1387,12 @@ impl GpuPreview {
                 scrubbing: request.scrubbing,
             },
             request.ffmpeg_width,
-        )
+        )?;
+        // The playhead rests on a frame the GPU drew: the cut from here is made ready for Play.
+        if result.renderer == "gpu" && !request.overlays {
+            self.prime_soon(&inputs, request.t);
+        }
+        Ok(result)
     }
 
     /// The inputs frames are planned from: the held snapshot while it is fresh, else taken from the
@@ -1318,6 +1414,8 @@ impl GpuPreview {
     /// caught here: the backend is dropped and rebuilt behind the backoff, the surface hidden, and the
     /// frame is FFmpeg's like any other fallback.
     fn frame(&self, inputs: &PlanInputs, want: Want, ffmpeg_width: u32) -> Result<PreviewFrameResult, String> {
+        // Whatever else is asked for (the paused frame, a scrub) is not part of a play session.
+        self.end_play();
         let attempt = catch_unwind(AssertUnwindSafe(|| self.attempt(inputs, want, Instant::now())));
         let reasons = match attempt {
             Ok(Attempt::Presented(timings)) => {
@@ -1327,6 +1425,7 @@ impl GpuPreview {
                     frame: None,
                     reasons: Vec::new(),
                     timings: Some(timings),
+                    play: None,
                 });
             }
             Ok(Attempt::Fallback(reasons)) => reasons,
@@ -1356,6 +1455,7 @@ impl GpuPreview {
             frame: Some(format!("data:image/jpeg;base64,{b64}")),
             reasons: texts,
             timings: None,
+            play: None,
         })
     }
 
@@ -1370,6 +1470,7 @@ impl GpuPreview {
             self_test: self.check.standing(),
             adapter: info.adapter.clone(),
             software: info.software,
+            play: self.play_diagnostics(),
         }
     }
 
@@ -1466,6 +1567,8 @@ impl GpuPreview {
             state.backend.take()
         };
         *lock(&self.host) = None;
+        self.end_play();
+        self.drop_primed();
         let _ = catch_unwind(AssertUnwindSafe(move || drop(backend)));
         self.clear_marker();
         let mut info = lock(&self.info);
@@ -1575,43 +1678,16 @@ impl GpuPreview {
         // What the frame draws with is taken under the render lock and kept without it: the lock is
         // not held while the frame decodes (which waits for FFmpeg) or renders, so turning the setting
         // off, a lost device or a build never waits for a frame.
-        let drawing = {
-            let state = lock(&self.render);
-            // Looked at again under the lock: the setting may have gone off while this frame was planned.
-            if !self.is_enabled() {
-                drop(state);
-                return fallback("preview_off", "the GPU preview was turned off".into());
-            }
-            match state.backend.as_ref() {
-                Some(b) => Drawing {
-                    compositor: Arc::clone(&b.compositor),
-                    source: Arc::clone(&b.source),
-                    gpu: Arc::clone(&b.gpu),
-                    adapter: b.adapter.clone(),
-                    host: Arc::clone(&b.host),
-                },
-                None => {
-                    drop(state);
-                    return fallback("backend", "the GPU preview is not up".into());
-                }
-            }
+        let drawing = match self.drawing() {
+            Ok(drawing) => drawing,
+            Err(reason) => return fallback(reason.kind, reason.text),
         };
         let host = Arc::clone(&drawing.host);
 
-        // A child window's surface is the frame itself; the window's covers the window.
-        let window_size = match technique {
-            Technique::Window => lock(&host).window_size(),
-            Technique::Child => Some((0, 0)),
+        let (canvas, size) = match self.sized(technique, &bounds, &host, &plan) {
+            Ok(sized) => sized,
+            Err(reason) => return fallback(reason.kind, reason.text),
         };
-        let Some(window_size) = window_size else {
-            return fallback("no_window", "the window has no size".into());
-        };
-        let Some(layout) = layout_for(technique, &bounds, window_size) else {
-            return fallback("outside_window", "the preview frame is outside the window".into());
-        };
-        let canvas = (plan.canvas.width, plan.canvas.height);
-        let (width, _) = place_frame(canvas, layout.area, |w| plan.size(w));
-        let size = plan.size(width);
         let caps = drawing.compositor.caps();
         let reasons = plan.reasons(&caps, size);
         if !reasons.is_empty() {
@@ -1632,7 +1708,91 @@ impl GpuPreview {
             .compositor
             .render_plan_texture_with(&plan, size, &drawing.source, Hint::Scrub);
 
-        // Back under the render lock to show it, if the backend is still the one that drew it.
+        match self.conclude(
+            &drawing,
+            technique,
+            canvas,
+            want,
+            rendered,
+            now,
+            "this frame goes through FFmpeg",
+            true,
+        ) {
+            Concluded::Shown(timings, _) => {
+                tracing::debug!(?timings, t, "GPU preview frame presented");
+                self.prefetch_ahead(&planner, &inputs.timeline, t, size, &caps, Arc::clone(&drawing.source));
+                Attempt::Presented(timings)
+            }
+            Concluded::Restarted => fallback("backend", "the GPU preview was restarted while the frame was drawn".into()),
+            Concluded::Hidden => fallback("hidden", "the preview surface was hidden while the frame was drawn".into()),
+            Concluded::Failed(error) => Attempt::Fallback(vec![Reason::new(error_kind(&error), error.to_string())]),
+        }
+    }
+
+    /// What a frame draws with, taken under the render lock: `Err` when the setting went off since the
+    /// frame was planned, or no backend is up.
+    fn drawing(&self) -> Result<Drawing, Reason> {
+        let state = lock(&self.render);
+        // Looked at again under the lock: the setting may have gone off while this frame was planned.
+        if !self.is_enabled() {
+            return Err(Reason::new("preview_off", "the GPU preview was turned off"));
+        }
+        match state.backend.as_ref() {
+            Some(b) => Ok(Drawing {
+                compositor: Arc::clone(&b.compositor),
+                source: Arc::clone(&b.source),
+                gpu: Arc::clone(&b.gpu),
+                adapter: b.adapter.clone(),
+                host: Arc::clone(&b.host),
+            }),
+            None => Err(Reason::new("backend", "the GPU preview is not up")),
+        }
+    }
+
+    /// Where a frame goes and how big it is drawn: the frame the plan's canvas is, the width
+    /// nearest the panel's ([`place_frame`]) and the size that comes out at it. `Err` for a window
+    /// with no size or a frame outside it.
+    fn sized(
+        &self,
+        technique: Technique,
+        bounds: &Bounds,
+        host: &Arc<Mutex<Host>>,
+        plan: &RenderPlan,
+    ) -> Result<(Dims, Dims), Reason> {
+        // A child window's surface is the frame itself; the window's covers the window.
+        let window_size = match technique {
+            Technique::Window => lock(host).window_size(),
+            Technique::Child => Some((0, 0)),
+        };
+        let Some(window_size) = window_size else {
+            return Err(Reason::new("no_window", "the window has no size"));
+        };
+        let Some(layout) = layout_for(technique, bounds, window_size) else {
+            return Err(Reason::new("outside_window", "the preview frame is outside the window"));
+        };
+        let canvas = (plan.canvas.width, plan.canvas.height);
+        let (width, _) = place_frame(canvas, layout.area, |w| plan.size(w));
+        Ok((canvas, plan.size(width)))
+    }
+
+    /// A frame was drawn (or failed to be): back under the render lock, show it if the backend is
+    /// still the one that drew it, and settle what the backend makes of the outcome — the backoff
+    /// forgives a shown frame, the crash marker goes once one has reached the screen, a device or
+    /// surface that is gone is dropped to be rebuilt, and a surface that was hidden meanwhile stays
+    /// hidden. `declined` ends the log line of a frame the GPU did not draw; a failure hides the surface
+    /// (the page shows FFmpeg's picture instead) unless `hide_on_failure` is off, as a play session's is.
+    #[allow(clippy::too_many_arguments)]
+    fn conclude(
+        &self,
+        drawing: &Drawing,
+        technique: Technique,
+        canvas: (u32, u32),
+        want: Want,
+        rendered: Result<(RenderedFrame, RenderTimings), GpuError>,
+        now: Instant,
+        declined: &str,
+        hide_on_failure: bool,
+    ) -> Concluded {
         let mut state = lock(&self.render);
         let same = state
             .backend
@@ -1642,35 +1802,35 @@ impl GpuPreview {
             (Err(error), _) => Err(error),
             (Ok(_), None) => {
                 drop(state);
-                return fallback("backend", "the GPU preview was restarted while the frame was drawn".into());
+                return Concluded::Restarted;
             }
             // `None`: the surface was hidden (or the setting turned off) while the frame was drawn.
-            (Ok((frame, timings)), Some(backend)) => self.show(backend, &host, technique, canvas, want, &frame, timings),
+            (Ok((frame, timings)), Some(backend)) => self
+                .show(backend, &drawing.host, technique, canvas, want, &frame, timings)
+                .map(|shown| shown.map(|timings| (timings, frame))),
         };
         match outcome {
-            Ok(Some(timings)) => {
+            Ok(Some((timings, frame))) => {
                 state.backoff.succeeded();
                 if std::mem::take(&mut state.unproven) {
                     // A frame reached the screen: whatever the first start risked, it survived.
                     self.clear_marker();
                 }
-                tracing::debug!(?timings, t, "GPU preview frame presented");
                 drop(state);
-                self.prefetch_ahead(&planner, &inputs.timeline, t, size, &caps, Arc::clone(&drawing.source));
-                Attempt::Presented(timings)
+                Concluded::Shown(timings, frame)
             }
             Ok(None) => {
                 drop(state);
-                fallback("hidden", "the preview surface was hidden while the frame was drawn".into())
+                Concluded::Hidden
             }
             Err(error) => {
                 let reaction = react(&error);
                 // A frame the GPU declines (a busy decode, a plan it refuses at this size) is the
                 // ordinary fallback; a device or surface that is gone is news.
                 if reaction == Reaction::Frame {
-                    tracing::debug!(%error, "GPU preview frame declined; this frame goes through FFmpeg");
+                    tracing::debug!(%error, "GPU preview frame declined; {declined}");
                 } else {
-                    tracing::warn!(%error, "GPU preview failed; rebuilding it, and this frame goes through FFmpeg");
+                    tracing::warn!(%error, "GPU preview failed; rebuilding it, and {declined}");
                 }
                 drop(state);
                 if reaction == Reaction::Rebuild {
@@ -1681,8 +1841,12 @@ impl GpuPreview {
                         Some(&drawing.source),
                     );
                 }
-                self.hide();
-                Attempt::Fallback(vec![Reason::new(error_kind(&error), error.to_string())])
+                // A frame of a play session that fails leaves the surface as it is: the stream takes the
+                // session over and the GPU's last picture stays until the stream's first frame is shown.
+                if hide_on_failure || reaction == Reaction::Rebuild {
+                    self.hide();
+                }
+                Concluded::Failed(error)
             }
         }
     }
@@ -2026,6 +2190,8 @@ fn build_backend(app: &tauri::AppHandle, technique: Technique) -> Result<Backend
 mod bench_tests;
 #[cfg(test)]
 mod drive_tests;
+#[cfg(test)]
+mod play_tests;
 
 #[cfg(test)]
 mod tests {
