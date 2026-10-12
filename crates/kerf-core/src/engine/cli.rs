@@ -7366,6 +7366,13 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     });
 
     let mut p: Vec<String> = Vec::new();
+    // The label is the first filter of the chain, so that all of it reads what a file tagged BT.709
+    // would give. Later, a scaler may have converted the picture already: the fit `scale` is the
+    // filter FFmpeg has do the RGB conversion a dip to white's `fade` needs, as BT.601 in and
+    // BT.709 out (8 to 15 levels off the footage tagged in the file).
+    if fx.label_bt709 {
+        p.push(BT709_LABEL.to_string());
+    }
     // A head-padded proxy opens with one clone of its first frame at time zero (see
     // [`build_proxy_args`]), which a seek skips — and a read from the start does
     // not. The original has no such frame: its first one is the real one, and the
@@ -7476,13 +7483,6 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
         }
     }
     p.push("setsar=1".to_string());
-    // The label goes after the geometry, so the fit and the zoom resize the picture as it arrived
-    // (measured closer to the footage's colours beside a BT.601 neighbour than a tag at the head of
-    // the chain); for the grade, the opacity round trip and the terminal format that follow it
-    // states what the picture is, as a file tagged BT.709 would.
-    if fx.label_bt709 {
-        p.push(BT709_LABEL.to_string());
-    }
     if reframe.is_none() {
         p.push(format!("fps={}", fmt.fps));
     }
@@ -8105,7 +8105,7 @@ struct StillCanvas {
 /// outside any fade, and then the chain is what it was.
 ///
 /// `label_bt709` is the graph's BT.709 label for this layer ([`BT709_LABEL`]): the still decides
-/// it over the layers on screen, and puts it where [`video_clip_chain`] does, after `setsar`.
+/// it over the layers on screen, and puts it where [`video_clip_chain`] does, ahead of everything.
 #[allow(clippy::too_many_arguments)]
 fn still_clip_chain(
     tf: &Transform,
@@ -8122,7 +8122,11 @@ fn still_clip_chain(
     let (ow, oh, fit) = (*ow, *oh, *fit);
     let chroma = effects.iter().any(|e| e.produces_alpha());
     let needs_alpha = (!tf.is_identity() && tf.needs_alpha()) || chroma || mask.is_some() || fades.needs_alpha();
-    let mut p: Vec<String> = vec!["trim=end_frame=1".to_string(), "setpts=PTS-STARTPTS".to_string()];
+    let mut p: Vec<String> = Vec::new();
+    if label_bt709 {
+        p.push(BT709_LABEL.to_string());
+    }
+    p.extend(["trim=end_frame=1".to_string(), "setpts=PTS-STARTPTS".to_string()]);
     let crop = tf.has_crop().then(|| {
         let cw = (1.0 - tf.crop_left - tf.crop_right).max(0.0);
         let ch = (1.0 - tf.crop_top - tf.crop_bottom).max(0.0);
@@ -8165,9 +8169,6 @@ fn still_clip_chain(
         }
     }
     p.push("setsar=1".to_string());
-    if label_bt709 {
-        p.push(BT709_LABEL.to_string());
-    }
     if !color.is_identity() {
         p.push(eq_filter(color));
     }

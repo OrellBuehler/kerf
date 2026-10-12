@@ -5165,6 +5165,44 @@ fn untagged_hd_is_labelled_bt709_beside_footage_that_names_a_matrix_and_stacks_w
     check("label/untagged-hd-before-709-still", &late, &assets, &[0.5], STRICT);
 }
 
+/// The dip to white takes the clip through `rgb24` and back, out of YUV with the clip's matrix, so a label
+/// that came after the fit `scale` (the filter FFmpeg has convert the picture for the fade) was read as BT.601
+/// there and BT.709 on the way back: the still of a labelled HD layer mid-dip differs from the layer tagged
+/// in the file by 8 to 15 levels. The label is the first filter of the chain; the layer is drawn as BT.709.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_labelled_hd_layer_in_a_dip_to_white_is_drawn_as_the_layer_tagged_in_the_file() {
+    let h = hd_media();
+    let (untagged, tagged) = (h.get("grad/hd-untagged"), h.get("grad/hd-709"));
+    let phone = h.get("detail/hd-709");
+    let canvas = Some(Delivery::new(1280, 720, Fit::Contain));
+    let dipping = |a: &Asset| {
+        let mut incoming = clip(a, 0.0, 1.0, 1.0);
+        incoming.transition_in = Some(Transition {
+            kind: TransitionKind::DipToWhite,
+            duration: 0.6,
+        });
+        timeline(
+            vec![vec![clip(phone, 0.0, 1.0, 0.6)], vec![clip(phone, 0.0, 1.0, 0.0), incoming]],
+            canvas,
+        )
+    };
+    let (tl, assets) = (dipping(untagged), [untagged.clone(), phone.clone()]);
+    assert_eq!(
+        labelled_layers(&tl, &assets, 1.15),
+        [false, true],
+        "the BT.709 clip is on screen with it"
+    );
+    check("label/dip-white-labelled-hd-still", &tl, &assets, &[1.05, 1.15, 1.25], STRICT);
+    let (twin, assets) = (dipping(tagged), [tagged.clone(), phone.clone()]);
+    assert_eq!(
+        labelled_layers(&twin, &assets, 1.15),
+        [false, false],
+        "the tagged file needs no label"
+    );
+    check("label/dip-white-tagged-hd-still", &twin, &assets, &[1.05, 1.15, 1.25], STRICT);
+}
+
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn footage_that_is_not_untagged_hd_is_left_as_it_is_and_the_other_matrices_stay_mixed() {

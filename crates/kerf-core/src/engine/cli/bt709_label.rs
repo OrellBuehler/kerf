@@ -220,7 +220,7 @@ fn an_untagged_hd_clip_is_labelled_beside_a_tagged_one_in_all_four_builders() {
 }
 
 #[test]
-fn the_label_sits_after_the_geometry_and_ahead_of_everything_that_reads_the_matrix() {
+fn the_label_is_the_first_filter_of_the_chain_so_nothing_converts_the_picture_ahead_of_it() {
     let k = kit();
     let mut over = pip(&k.hd, 0.0);
     over.transform.opacity = 0.6;
@@ -235,23 +235,16 @@ fn the_label_sits_after_the_geometry_and_ahead_of_everything_that_reads_the_matr
             .find(|(_, c)| c.contains(LABEL))
             .expect("labelled")
             .1;
-        let label = at(&chain, LABEL);
-        // After the fit scale and the clip's own zoom (the scalers), where no scaler downstream is
-        // handed a tag to convert by; ahead of the grade, the opacity round trip and the terminal format.
-        assert!(at(&chain, "scale=") < label, "{builder}: {chain}");
-        assert!(at(&chain, "scale=iw*0.5") < label, "{builder}: {chain}");
-        assert!(at(&chain, "setsar=1") < label, "{builder}: {chain}");
-        assert!(label < at(&chain, "eq="), "{builder}: {chain}");
-        assert!(label < at(&chain, "colorchannelmixer="), "{builder}: {chain}");
-        assert!(label < at(&chain, "format="), "{builder}: {chain}");
+        // Ahead of every scaler: the fit `scale` is the filter FFmpeg asks for the RGB a dip to
+        // white's `fade` needs, so a label behind it states the matrix of a picture already converted.
+        assert!(chain.starts_with(&format!("{LABEL},trim=")), "{builder}: {chain}");
+        assert!(at(&chain, LABEL) < at(&chain, "scale="), "{builder}: {chain}");
+        assert!(at(&chain, LABEL) < at(&chain, "eq="), "{builder}: {chain}");
+        assert!(at(&chain, LABEL) < at(&chain, "colorchannelmixer="), "{builder}: {chain}");
+        assert!(at(&chain, LABEL) < at(&chain, "format="), "{builder}: {chain}");
         // Once, and as `setparams` states it: never the output option that converts on FFmpeg 9.
         assert_eq!(chain.matches("setparams").count(), 1, "{builder}: {chain}");
         assert!(!graph.contains("-colorspace"), "{builder}");
-    }
-    // In the clip chains of the export and the stream, `fps` follows the label.
-    for graph in [export_graph(&tl, &assets), preview_graph(&tl, &assets, 0.0)] {
-        let chain = chains(&graph).into_iter().find(|(_, c)| c.contains(LABEL)).unwrap().1;
-        assert!(at(&chain, LABEL) < at(&chain, "fps="), "{chain}");
     }
 }
 
@@ -906,6 +899,49 @@ fn a_labelled_input_renders_as_a_file_tagged_bt709_is_in_all_four_builders() {
         for (builder, (db, worst)) in figures {
             assert_eq!((db, worst), (99.0, 0), "{what}: {builder} differs from the tagged twin");
         }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `cargo test -p kerf-core --no-default-features -- --ignored a_labelled_clip_dips`
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+fn a_labelled_clip_dips_through_white_as_a_file_tagged_bt709_does() {
+    // A dip to white is a `fade` that only takes RGB, so FFmpeg has the nearest scaler of the chain
+    // convert the picture there: a label behind the fit `scale` left that conversion BT.601 and the
+    // one back BT.709 (8 to 15 levels off the tagged file, every frame of the clip).
+    use crate::model::{Transition, TransitionKind};
+    let dir = scratch("dip");
+    let untagged = footage(&dir, "untagged", GRADIENT, "bt709", UNTAGGED);
+    let tagged = footage(&dir, "tagged", GRADIENT, "bt709", BT709);
+    let phone = footage(&dir, "phone", DETAIL, "bt709", BT709);
+    for (what, hd_first) in [("a dip into untagged HD", false), ("a dip out of untagged HD", true)] {
+        let build = |hd: &Asset| {
+            let mut tl = if hd_first {
+                sequence(hd, &phone)
+            } else {
+                sequence(&phone, hd)
+            };
+            tl.tracks[0].clips[1].transition_in = Some(Transition {
+                kind: TransitionKind::DipToWhite,
+                duration: 0.6,
+            });
+            (tl, vec![phone.clone(), hd.clone()])
+        };
+        let ((a_tl, a_assets), (b_tl, b_assets)) = (build(&untagged), build(&tagged));
+        assert_eq!(labelled(&export_graph(&a_tl, &a_assets)), 1, "{what}: the engine labels it");
+        assert_eq!(
+            labelled(&export_graph(&b_tl, &b_assets)),
+            0,
+            "{what}: the tagged file needs no label"
+        );
+        let tag = what.replace(' ', "-");
+        let (db, worst) = psnr(
+            &export_yuv(&a_tl, &a_assets, &dir, &format!("{tag}-a")),
+            &export_yuv(&b_tl, &b_assets, &dir, &format!("{tag}-b")),
+        );
+        eprintln!("{what}: export {db:.1} dB, worst {worst}");
+        assert_eq!((db, worst), (99.0, 0), "{what}: the export differs from the tagged twin");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

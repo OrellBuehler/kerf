@@ -112,7 +112,7 @@ pub struct ClipFx {
     /// first frame, which the original it stands for has no frame for.
     pub head_pad: bool,
     /// The clip's picture is untagged HD YCbCr and shares the graph with an input that names a
-    /// matrix, so the chain labels it BT.709 (`setparams=colorspace=bt709`, after the geometry):
+    /// matrix, so the chain labels it BT.709 (`setparams=colorspace=bt709`, the first filter of its chain):
     /// FFmpeg 9 would otherwise read it as BT.601 and convert it into its neighbour's matrix.
     /// Decided over the clips of the graph this table is for ([`graph_bt709_labels`]).
     pub label_bt709: bool,
