@@ -144,6 +144,9 @@ hdr-zscale zscale=tin=
 hdr-colorspace colorspace=all=bt709:iall=bt2020
 hdr-pq tin=smpte2084
 hdr-hlg tin=arib-std-b67
+bt709-label setparams=colorspace=bt709
+still-bt709-label setparams=colorspace=bt709
+preview-bt709-label setparams=colorspace=bt709
 reframe v360@c
 reframe-animated sendcmd=c='
 reframe-equirect-out output=e:
@@ -1030,7 +1033,7 @@ fn transitions(c: &Case, assets: &[Asset]) -> Vec<String> {
 }
 
 /// The families that come from the case's structure rather than from argv text.
-const STRUCTURAL: [&str; 27] = [
+const STRUCTURAL: [&str; 30] = [
     "muted-track",
     "solo-track",
     "disabled-clip",
@@ -1058,6 +1061,9 @@ const STRUCTURAL: [&str; 27] = [
     "channel-opacity-alone",
     "still-tail",
     "still-travel",
+    "bt709-mix",
+    "still-bt709-mix",
+    "preview-bt709-mix",
 ];
 
 fn expected(table: &[(&str, &str)]) -> Vec<String> {
@@ -1167,6 +1173,46 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
             travel || layers.iter().any(|l| l.motion != (0.0, 0.0)),
         )
     });
+    // Which graphs hold untagged HD footage beside an input that names a matrix (the pool's HDR
+    // clips; it holds no tagged SDR one): the BT.709 label's oracle, by asset *name* so it does not
+    // read the facts the builders decide from. The export's graph is the range's slice, the
+    // preview's the cut from the playhead, a still's the layers on screen.
+    let untagged_hd = |name: &str| {
+        matches!(
+            name.strip_suffix("-padded").unwrap_or(name),
+            "interview" | "broll" | "phone" | "wide" | "sphere" | "lenses"
+        )
+    };
+    let mixes = |ids: Vec<Uuid>| {
+        let names: Vec<&str> = ids
+            .iter()
+            .filter_map(|id| assets.iter().find(|a| a.id == *id))
+            .map(|a| a.name.as_str())
+            .collect();
+        names.iter().any(|n| untagged_hd(n)) && names.iter().any(|n| n.starts_with("hdr-"))
+    };
+    let ids_of = |tl: &Timeline| -> Vec<Uuid> {
+        tl.tracks
+            .iter()
+            .filter(|t| t.kind == StreamKind::Video)
+            .flat_map(|t| t.clips.iter().map(|k| k.asset_id))
+            .collect()
+    };
+    let export_graph = match effective_range(&rendered, &c.opts) {
+        Some((from, to)) => rendered.slice(from, to),
+        None => rendered.clone(),
+    };
+    let preview_graph = {
+        let start = c.preview.0;
+        (start.is_finite() && start < rendered.duration()).then(|| rendered.slice(start, rendered.duration()))
+    };
+    let (bt709_export, bt709_preview, bt709_still) = (
+        !c.opts.container.is_audio_only() && mixes(ids_of(&export_graph)),
+        preview_graph.as_ref().is_some_and(|g| mixes(ids_of(g))),
+        c.stills
+            .iter()
+            .any(|(t, _)| mixes(layers(*t).iter().map(|l| l.active.clip.asset_id).collect())),
+    );
     let channels = |rf: &Reframe| {
         let k = &rf.keyframes;
         [
@@ -1231,6 +1277,9 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
             clips().any(|k| k.is_keyed(Property::Opacity) && !k.is_keyed(Property::Scale)),
             "channel-opacity-alone",
         ),
+        (bt709_export, "bt709-mix"),
+        (bt709_still, "still-bt709-mix"),
+        (bt709_preview, "preview-bt709-mix"),
         (still_transitions.0, "still-tail"),
         (still_transitions.1, "still-travel"),
         (chain_tails(&flat[0]).0, "zoom-keyed-last"),
@@ -1382,6 +1431,25 @@ fn the_argv_builders_still_produce_the_golden_digests() {
         let mut by_count: Vec<_> = seen.iter().collect();
         by_count.sort_by_key(|(_, n)| **n);
         eprintln!("golden: the {} thinnest families: {:?}", 12, &by_count[..12]);
+    }
+    // The BT.709 label appears in a graph exactly when it holds untagged HD beside an input that names
+    // a matrix: every other case, single clips and graphs of untagged footage among them, is unmoved.
+    let wrong: Vec<String> = results
+        .iter()
+        .flat_map(|(i, (_, hit))| {
+            let has = |f: &str| hit.iter().any(|h| h == f);
+            [("bt709", ""), ("bt709", "still-"), ("bt709", "preview-")]
+                .into_iter()
+                .filter(move |(name, scope)| has(&format!("{scope}{name}-label")) != has(&format!("{scope}{name}-mix")))
+                .map(move |(name, scope)| format!("case {i}: {scope}{name}-label differs from {scope}{name}-mix"))
+        })
+        .collect();
+    if !wrong.is_empty() {
+        failures.push(format!(
+            "the BT.709 label is not where untagged HD meets a matrix-naming input ({} cases): {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(8)]
+        ));
     }
     let thin: Vec<_> = seen.iter().filter(|(_, n)| **n < MIN_PER_FAMILY).collect();
     if !thin.is_empty() {

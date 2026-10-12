@@ -1459,6 +1459,12 @@ pub(super) fn tonemap_filter(hdr: Hdr) -> String {
     tonemap_chain(hdr, zscale_available())
 }
 
+/// The filter that labels a picture BT.709 without touching a pixel (`setparams`), for an untagged
+/// HD input that shares a graph with one naming a matrix ([`crate::model::bt709_labels`]). Not the
+/// `-colorspace` output option, which FFmpeg 9 takes as an order to convert into that matrix on the
+/// way (up to 22 levels moved, measured).
+const BT709_LABEL: &str = "setparams=colorspace=bt709";
+
 /// What the decodes that are handed a bare path rather than an [`Asset`] need to
 /// know about a file's first video stream, from one `ffprobe`.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -7470,6 +7476,13 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
         }
     }
     p.push("setsar=1".to_string());
+    // The label goes after the geometry, so the fit and the zoom resize the picture as it arrived
+    // (measured closer to the footage's colours beside a BT.601 neighbour than a tag at the head of
+    // the chain); for the grade, the opacity round trip and the terminal format that follow it
+    // states what the picture is, as a file tagged BT.709 would.
+    if fx.label_bt709 {
+        p.push(BT709_LABEL.to_string());
+    }
     if reframe.is_none() {
         p.push(format!("fps={}", fmt.fps));
     }
@@ -8026,7 +8039,8 @@ fn build_still_args_rendered(
                 &canvas,
                 clip.mask.as_ref(),
                 clip.zoom_animated(),
-                &layer.fades
+                &layer.fades,
+                layer.label_bt709
             )
         ));
         let out = format!("ov{n}");
@@ -8089,6 +8103,9 @@ struct StillCanvas {
 /// ([`still_fx`]): where the export's chain applies its `fade` steps, after the rotation and
 /// ahead of a moving zoom, the same filters run on the frame. None at all for a still
 /// outside any fade, and then the chain is what it was.
+///
+/// `label_bt709` is the graph's BT.709 label for this layer ([`BT709_LABEL`]): the still decides
+/// it over the layers on screen, and puts it where [`video_clip_chain`] does, after `setsar`.
 #[allow(clippy::too_many_arguments)]
 fn still_clip_chain(
     tf: &Transform,
@@ -8099,6 +8116,7 @@ fn still_clip_chain(
     mask: Option<&Mask>,
     zoom_last: bool,
     fades: &StillFades,
+    label_bt709: bool,
 ) -> String {
     let StillCanvas { w: ow, h: oh, fit, sf } = canvas;
     let (ow, oh, fit) = (*ow, *oh, *fit);
@@ -8147,6 +8165,9 @@ fn still_clip_chain(
         }
     }
     p.push("setsar=1".to_string());
+    if label_bt709 {
+        p.push(BT709_LABEL.to_string());
+    }
     if !color.is_identity() {
         p.push(eq_filter(color));
     }
@@ -8346,6 +8367,10 @@ pub use levels::mix_levels;
 /// private builders.
 #[cfg(test)]
 mod golden;
+
+/// The BT.709 label on the four builders, and the plan's mirror of it.
+#[cfg(test)]
+mod bt709_label;
 
 /// What the export graph draws, pinned against rendered pixels (`#[ignore]`d).
 #[cfg(test)]
@@ -10967,6 +10992,7 @@ mod tests {
             Some(&mask),
             true,
             &StillFades::default(),
+            false,
         );
         let first = still_clip_chain(
             &tf,
@@ -10977,6 +11003,7 @@ mod tests {
             Some(&mask),
             false,
             &StillFades::default(),
+            false,
         );
         let zoom = "scale=iw*1.4:ih*1.4";
         // Last: after the rotation, with nothing behind it, and only once.
@@ -10993,8 +11020,28 @@ mod tests {
         // A moving zoom that has no zoom at the sampled instant has none to move.
         let at_rest = Transform { scale: 1.0, ..tf };
         assert_eq!(
-            still_clip_chain(&at_rest, &color, &effects, None, &canvas, None, true, &StillFades::default()),
-            still_clip_chain(&at_rest, &color, &effects, None, &canvas, None, false, &StillFades::default())
+            still_clip_chain(
+                &at_rest,
+                &color,
+                &effects,
+                None,
+                &canvas,
+                None,
+                true,
+                &StillFades::default(),
+                false
+            ),
+            still_clip_chain(
+                &at_rest,
+                &color,
+                &effects,
+                None,
+                &canvas,
+                None,
+                false,
+                &StillFades::default(),
+                false
+            )
         );
     }
 
@@ -11075,6 +11122,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(c.contains("scale=w='max(1,iw*0.0004)':h='max(1,ih*0.0004)'"), "{c}");
         let c = still_clip_chain(
@@ -11086,6 +11134,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(c.contains("scale=iw*0.5:ih*0.5"), "{c}");
     }
@@ -11141,6 +11190,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(!still.contains("force_divisible_by") && !still.contains("trunc("), "{still}");
     }
@@ -14780,6 +14830,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(contained.contains("force_original_aspect_ratio=decrease"));
         assert!(contained.contains("pad=1080:1920"), "contain letterboxes: {contained}");
@@ -14793,6 +14844,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(covered.contains("force_original_aspect_ratio=increase"));
         assert!(covered.contains("crop=1080:1920"), "cover crops: {covered}");

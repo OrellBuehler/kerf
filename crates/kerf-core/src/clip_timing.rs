@@ -34,7 +34,7 @@
 
 use std::path::Path;
 
-use crate::model::{interpolate, Asset, Clip, Hdr, Timeline};
+use crate::model::{bt709_labels, interpolate, Asset, Clip, Hdr, StreamInfo, StreamKind, Timeline};
 
 /// The marker a head-padded proxy carries in its file name, ahead of `.mp4`.
 pub(crate) const HEAD_PADDED_SUFFIX: &str = ".lead.mp4";
@@ -111,6 +111,29 @@ pub struct ClipFx {
     /// from the start with no seek, such an input opens with the pad's clone of the
     /// first frame, which the original it stands for has no frame for.
     pub head_pad: bool,
+    /// The clip's picture is untagged HD YCbCr and shares the graph with an input that names a
+    /// matrix, so the chain labels it BT.709 (`setparams=colorspace=bt709`, after the geometry):
+    /// FFmpeg 9 would otherwise read it as BT.601 and convert it into its neighbour's matrix.
+    /// Decided over the clips of the graph this table is for ([`graph_bt709_labels`]).
+    pub label_bt709: bool,
+}
+
+/// Which clips of `timeline` the graph built from it labels BT.709, indexed like [`transition_fx`]
+/// (flat storage order): [`bt709_labels`] over the first video stream of every video-track clip's
+/// asset. A clip of an audio track, or whose asset is missing or holds no picture, is no input.
+pub fn graph_bt709_labels(timeline: &Timeline, assets: &[Asset]) -> Vec<bool> {
+    let inputs: Vec<Option<&StreamInfo>> = timeline
+        .tracks
+        .iter()
+        .flat_map(|track| track.clips.iter().map(move |clip| (track.kind, clip)))
+        .map(|(kind, clip)| {
+            (kind == StreamKind::Video)
+                .then(|| assets.iter().find(|a| a.id == clip.asset_id))
+                .flatten()
+                .and_then(|a| a.streams.iter().find(|s| s.kind == StreamKind::Video))
+        })
+        .collect();
+    bt709_labels(&inputs)
 }
 
 /// Compute the [`ClipFx`] for every clip, resolving each `transition_in` against the
@@ -131,6 +154,9 @@ pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
         fx[flat].hdr = asset.and_then(|a| a.hdr());
         fx[flat].alpha = asset.is_some_and(|a| a.has_alpha());
         fx[flat].head_pad = asset.is_some_and(|a| is_head_padded_proxy(&a.path));
+    }
+    for (fx, label) in fx.iter_mut().zip(graph_bt709_labels(timeline, assets)) {
+        fx.label_bt709 = label;
     }
     let asset_dur = |id| assets.iter().find(|a| a.id == id).map(|a| a.duration);
     let is_still = |id| assets.iter().find(|a| a.id == id).is_some_and(|a| a.is_image());
@@ -692,8 +718,11 @@ impl<'a> ClipTiming<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::test_support::{img_asset, make_clip, single, test_asset, video_stream};
+    use crate::engine::test_support::{
+        audio_track, img_asset, make_clip, single, test_asset, timeline_of, video_stream, video_track,
+    };
     use crate::model::{Transition, TransitionKind};
+    use uuid::Uuid;
 
     fn asset() -> Asset {
         test_asset(vec![video_stream(1920, 1080, 30.0)])
@@ -708,6 +737,65 @@ mod tests {
         let timeline = single(vec![a, b]);
         let fx = transition_fx(&timeline, std::slice::from_ref(asset));
         (timeline, fx)
+    }
+
+    fn picture(w: u32, h: u32, tag: Option<&str>) -> Asset {
+        let mut stream = video_stream(w, h, 30.0);
+        stream.pix_fmt = Some("yuv420p".into());
+        stream.color_space = tag.map(Into::into);
+        test_asset(vec![stream])
+    }
+
+    #[test]
+    fn the_graphs_clips_are_labelled_by_the_table_the_chains_are_built_from() {
+        let (hd, phone, sd) = (
+            picture(1920, 1080, None),
+            picture(1920, 1080, Some("bt709")),
+            picture(720, 576, None),
+        );
+        let assets = [hd.clone(), phone.clone(), sd.clone()];
+        let clip = |a: &Asset, at| make_clip(a.id, 0.0, 1.0, at);
+        // Stored order is the table's order: V1 holds an HD clip then the phone's, V2 an SD clip and an HD.
+        let tl = timeline_of(vec![
+            video_track(vec![clip(&hd, 0.0), clip(&phone, 1.0)]),
+            video_track(vec![clip(&sd, 0.0), clip(&hd, 1.0)]),
+        ]);
+        let labels: Vec<bool> = transition_fx(&tl, &assets).iter().map(|f| f.label_bt709).collect();
+        assert_eq!(labels, [true, false, false, true]);
+        assert_eq!(graph_bt709_labels(&tl, &assets), labels);
+        // Nothing else of a clip's fx moves with it.
+        assert!(transition_fx(&tl, &assets).iter().all(|f| ClipFx {
+            label_bt709: false,
+            ..*f
+        } == ClipFx::default()));
+
+        // Untagged footage alone, a single clip, and an HD clip beside SD: unlabelled.
+        for tracks in [
+            vec![video_track(vec![clip(&hd, 0.0)])],
+            vec![video_track(vec![clip(&hd, 0.0), clip(&hd, 1.0)])],
+            vec![video_track(vec![clip(&hd, 0.0)]), video_track(vec![clip(&sd, 0.0)])],
+        ] {
+            let tl = timeline_of(tracks);
+            assert!(transition_fx(&tl, &assets).iter().all(|f| !f.label_bt709));
+        }
+
+        // A tagged clip on an audio track is not a picture in the graph; one that is muted or
+        // disabled is gone before the graph is built (`for_render`), which is what the table is for.
+        let tl = timeline_of(vec![video_track(vec![clip(&hd, 0.0)]), audio_track(vec![clip(&phone, 0.0)])]);
+        assert_eq!(graph_bt709_labels(&tl, &assets), [false, false]);
+        let mut muted = video_track(vec![clip(&phone, 0.0)]);
+        muted.muted = true;
+        let tl = timeline_of(vec![video_track(vec![clip(&hd, 0.0)]), muted]);
+        assert_eq!(graph_bt709_labels(&tl, &assets), [true, false]);
+        assert_eq!(graph_bt709_labels(&tl.for_render(), &assets), [false]);
+
+        // A clip whose asset is not in the list is no input.
+        let tl = single(vec![
+            make_clip(Uuid::new_v4(), 0.0, 1.0, 0.0),
+            clip(&hd, 1.0),
+            clip(&phone, 2.0),
+        ]);
+        assert_eq!(graph_bt709_labels(&tl, &assets), [false, true, false]);
     }
 
     fn timing<'a>(tl: &'a Timeline, fx: &'a [ClipFx], i: usize) -> ClipTiming<'a> {
