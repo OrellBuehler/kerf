@@ -59,7 +59,10 @@ so the feature is **only** activated through these forwards — which is what ma
   path. `source_traits` is the one cached ffprobe per file that answers HDR, the
   lead and the container — killed after 20 s, one probe however many threads ask, a failure
   remembered 60 s like `proxy_video_info`'s (`engine/source_probe.rs`'s `ProbeCache`, which the
-  GPU frame source's seek-point probe sits behind too). The clone is a frame the original has no counterpart
+  GPU frame source's seek-point probe sits behind too). **An encode reads it once**
+  (`generate_proxy_with` takes the traits first and gives them to `proxy_path_for`, the tone-map and the pad): a
+  second reading, after a wait in the proxy lane, could answer otherwise once a failed probe's minute had passed,
+  and write a plain picture under the tone-mapped or padded name (or the other way round) and keep it for good. The clone is a frame the original has no counterpart
   for, so a clip read from the proxy's start with no `-ss` (`clip_seek` 0 — a cut
   from the very head of the source) would hold it for `lead` while the export
   starts on the real first frame: `transition_fx` sets `ClipFx.head_pad` from the
@@ -838,3 +841,36 @@ so the feature is **only** activated through these forwards — which is what ma
   a stripped-tag phone file does not abort the graph with "no path between
   colorspaces". Assets saved before these fields existed deserialize as SDR with
   the coded size; re-importing the file re-probes it.
+  **The BT.709 label** (`model::bt709_labels`, `BT709_LABEL` = `setparams=colorspace=bt709`). FFmpeg reads a picture
+  that names no matrix as BT.601, every player shows untagged HD as BT.709, and FFmpeg 9 negotiates the matrix along
+  the graph: untagged HD beside a BT.709 clip is *converted* from the BT.601 it was read as (its colours 28 dB off the footage's,
+  against 42.7 dB labelled) and the GPU compositor refuses the stack. So an **untagged HD YCbCr input is labelled
+  BT.709 when another input of the same graph names a matrix** (a tag other than `unknown` / `unspecified` / `reserved`,
+  or HDR, which the graph tone-maps to a tagged BT.709 picture), and only then. HD is mpv's rule, `width >= 1280 ||
+  height > 576`, on the **original's** displayed size (a proxy at a small size in Settings is still labelled as its
+  original is: the preview's assets keep the original's metadata and the plan reads it, `PlanStream::label_bt709`);
+  YCbCr on the `pix_fmt_layout` allow-list; never `yuvj…` (JFIF, a webcam's MJPEG), RGB (an RGB picture names no matrix
+  whatever the container writes: `gbr`), grey, alpha or a still image. **A single clip, and any graph with no
+  input naming a matrix, is byte-identical** (the golden oracle holds it for all 6000 cases: stripping the label from
+  the new argv gives the old one). It is not a proxy label: proxies of untagged HD stay untagged, so no proxy key
+  moves and nothing is re-encoded, and the preview's graph (original metadata, proxy pixels) labels exactly as the
+  export's does. One table decides it, `ClipFx.label_bt709` (`transition_fx` → `graph_bt709_labels`, indexed like the
+  rest of `fx`), so `build_filter_complex` (the export, the levels meter, the playback stream, the scrub window) and
+  the planner read the same answer; the still decides over its own inputs, the layers on screen
+  (`StillLayer.label_bt709`). **The decision is the graph's, not the frame's**: a BT.709 clip anywhere in the cut labels
+  an HD clip that is never on screen with it (negotiation is per graph), and a stream, a scrub window or a ranged
+  export that starts past it, being a graph of its own, does not hold it (opaque pictures are the same either way; a
+  translucent HD layer or coloured text differs by up to 2 levels on 9.0.2, 10 to 16 on 6.1: a window frame is the
+  export's or the still's picture, as `scrub.rs` says, and the one-shot still of a frame decides over the layers on screen). The filter sits right after `setsar=1`, after the fit `scale` and
+  the clip's own zoom and ahead of `fps`, the grade, the opacity round trip and the terminal format; **never** the
+  `-colorspace` output option, which FFmpeg 9 takes as an order to convert (22 levels). For a graph the compositor draws
+  (everything BT.709) it equals a file tagged BT.709 to the bit in all four builders; beside a BT.601 neighbour it is
+  closer to the footage's colours than the tag would be (42.7 against 38.7 dB). It also makes **untagged HD beside
+  footage tagged `smpte170m` / `bt470bg` a mixed stack** where FFmpeg read both as BT.601: the export converts the HD
+  into the neighbour's matrix (the colours become right, the argv moves) and the GPU now refuses it on 9.0.2.
+  **FFmpeg 6.1 (`FixedBt601`)**: the label negotiates nothing there and only changes a translucent HD layer of a mixed
+  stack (37 to 39 dB, up to 16 levels, towards the BT.709 reading a tagged layer already has). It is applied under
+  every policy because the builders cannot ask for the policy: `composite_color_policy()` is measured *by running
+  `build_still_args`* under its own mutex, so a builder that asked would deadlock, and a non-probing read would
+  answer differently before and after the first probe. The plan mirrors it (`PlanStream::matrix()` is BT.709 for a
+  labelled layer under any policy, which a translucent round trip reads).

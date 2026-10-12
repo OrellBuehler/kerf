@@ -102,3 +102,15 @@
   (`KERF_GOLDEN_FAMILIES`) — and no other: no still, no preview, no case of any other encoder. All 56
   old export *blocks* differ only because each holds AMF cases. The appended cases' codec swap has no
   dice, so the generator's draws are untouched.
+- **The BT.709 label** (`setparams=colorspace=bt709` on an untagged HD clip that shares its graph with an input naming a
+  matrix; `engine-cli.md`) re-blessed all three files as one new family: `bt709-label`, `still-bt709-label`,
+  `preview-bt709-label` (the needle in the argv). Of 6000 cases 3054 export, 644 still and 2139 preview digests moved
+  (2852 / 610 / 1993 of the first 5600), exactly the cases hitting those families, and `KERF_GOLDEN_CASES` before / after
+  with the label text stripped from the new argv gives the old digest of every case in all three kinds, so the label is
+  the only change. The corpus holds HDR as its only matrix-naming footage, so the cases are the ones that put an untagged
+  HD clip (`interview`, `broll`, `phone`, `wide`, `sphere`, `lenses` and their padded twins) in a graph with an HLG or PQ
+  one. The structural families `bt709-mix`, `still-bt709-mix` and `preview-bt709-mix` are an oracle by asset *name* (the
+  export's graph is the range's slice, the preview's the cut from the playhead, a still's the layers on screen), and the
+  test fails unless the label is in an argv exactly when it says so: no single-clip case, no case of untagged footage
+  only and no audio-only export moved. Tagged SDR footage, SD, MJPEG, RGB and alpha are covered by the builders' unit
+  tests (`engine/cli/bt709_label.rs`), not the corpus.
