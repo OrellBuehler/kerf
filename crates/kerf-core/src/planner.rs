@@ -30,7 +30,8 @@
 //! 5. keyframed opacity is a `geq` alpha rather than the RGB round trip, and a keyframed
 //!    zoom is the **last** stage of the clip's chain, after `fps` and after every effect,
 //!    mask and rotation ([`Animated`]);
-//! 6. a text overlay is on `between(t,start,end)`, end included;
+//! 6. a text overlay is on `between(t,start,end)`, end included (so is an animated SVG title,
+//!    which the plan only names: [`RenderPlan::svg`]);
 //! 7. the source frame is the `fps` filter's pick ([`Pick::Fps`], reproduced by
 //!    [`fps_pick`](crate::frame_pick::fps_pick)): a Motion plan holds **candidates** at a
 //!    clip's closing edge (the layers whose `enable` window contains the frame time), and
@@ -172,6 +173,9 @@ pub struct Planner {
     clips: Vec<PlannedClip>,
     tracks: Vec<TrackIndex>,
     overlays: Vec<PlannedText>,
+    /// The animated SVG titles' windows: a compositor draws none of them, so the plan only says
+    /// which are on screen (`RenderPlan::svg`).
+    svg: Vec<(Uuid, f64, f64)>,
 }
 
 impl Planner {
@@ -333,6 +337,8 @@ impl Planner {
             })
             .collect();
 
+        let svg = rendered.svg_overlays.iter().map(|o| (o.id, o.start, o.end)).collect();
+
         let full_range_cut = clips.iter().any(|c| {
             c.asset
                 .as_ref()
@@ -358,6 +364,7 @@ impl Planner {
             clips,
             tracks,
             overlays,
+            svg,
         })
     }
 
@@ -631,6 +638,14 @@ impl Planner {
                 }
             })
             .collect();
+        // An animated title is on `between(t,start,end)` in an export frame and `start <= t < end`
+        // in a still, as a text overlay is.
+        let svg = self
+            .svg
+            .iter()
+            .filter(|(_, start, end)| eval >= *start && if motion { eval <= *end } else { eval < *end })
+            .map(|(id, ..)| *id)
+            .collect();
         Ok(RenderPlan {
             time: slot,
             mode: self.mode,
@@ -641,6 +656,7 @@ impl Planner {
             },
             layers,
             overlays,
+            svg,
             pictureless,
         })
     }
@@ -1745,6 +1761,84 @@ mod tests {
         let half = |k: Keyframe| Keyframe { opacity: 0.5, ..k };
         bundle.keyframes = vec![half(keyed(0.0, 1.0, 0.0)), half(keyed(4.0, 1.5, 0.0))];
         assert!(!refused(bundle));
+    }
+
+    #[test]
+    fn an_animated_title_is_named_by_the_plan_and_refused_whatever_the_caps() {
+        let a = asset();
+        let mut tl = single(vec![make_clip(a.id, 0.0, 5.0, 0.0)]);
+        let mut title = crate::model::SvgOverlay {
+            id: Uuid::new_v4(),
+            name: String::new(),
+            svg: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"/>".to_string(),
+            start: 1.0,
+            end: 2.0,
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            opacity: 1.0,
+            offset: 0.0,
+            preset: None,
+        };
+        let id = title.id;
+        let assets = [a];
+        let size = (1920, 1080);
+        // Without one nothing is named and nothing is refused on its account.
+        let none = planner(&tl, &assets, PlanMode::Motion, &opts(25.0)).at_frame(30).unwrap();
+        assert!(none.svg.is_empty() && !has(&none.reasons(&GpuCaps::A0, size), |u| matches!(u, Unsupported::Svg)));
+        let rate = planner(&tl, &assets, PlanMode::Motion, &opts(25.0)).canvas().fps;
+        title.end = rate.frame_time(50);
+        tl.svg_overlays.push(title);
+        let export = planner(&tl, &assets, PlanMode::Motion, &opts(25.0));
+        let still = planner(&tl, &assets, PlanMode::Still, &opts(25.0));
+        // As a text overlay is: through its end in an export frame, up to it in a still.
+        assert!(export.at_frame(24).unwrap().svg.is_empty());
+        assert_eq!(export.at_frame(25).unwrap().svg, vec![id]);
+        assert_eq!(export.at_frame(50).unwrap().svg, vec![id]);
+        assert!(export.at_frame(51).unwrap().svg.is_empty());
+        assert_eq!(still.at(rate.frame_time(30)).unwrap().svg, vec![id]);
+        assert!(still.at(rate.frame_time(50)).unwrap().svg.is_empty());
+        // No cap draws it: not the one A0 has, not one that draws everything a plan can hold.
+        let live = export.at_frame(30).unwrap();
+        let everything = GpuCaps {
+            motion: true,
+            text: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            keyed_opacity: true,
+            keyed_zoom: true,
+            keyed_color: true,
+            mask: true,
+            reframe: true,
+            hdr: true,
+            ..GpuCaps::A0
+        };
+        for caps in [GpuCaps::A0, everything] {
+            assert_eq!(
+                live.reasons(&caps, size)
+                    .iter()
+                    .filter(|u| matches!(u, Unsupported::Svg))
+                    .count(),
+                1
+            );
+        }
+        assert!(live.reasons(&everything, size).contains(&Unsupported::Svg));
+        assert_eq!(Unsupported::Svg.kind(), "svg");
+        assert_eq!(Unsupported::Svg.to_string(), "an animated SVG title is on screen");
+        assert!(!live.gpu_supported_at(size));
+        // The frames around it are drawn as ever.
+        assert!(export.at_frame(24).unwrap().reasons(&everything, size).is_empty());
+        // A span says where it starts and stops being drawn.
+        let span = export.span(0.0, 4.0, size, &everything);
+        let refused: Vec<_> = span
+            .runs()
+            .iter()
+            .filter(|r| !r.supported)
+            .map(|r| r.frames.clone())
+            .collect();
+        assert_eq!(refused, vec![25..51]);
     }
 
     #[test]

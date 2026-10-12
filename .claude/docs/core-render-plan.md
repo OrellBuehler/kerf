@@ -310,6 +310,11 @@
     **`TextBorder`** (`synthetic_bold`: a bold request in a font with no bold face — only a *named* family; the default has one) and
     **`TextTooSmall(px)`** (the smallest overlay's `fontsize`, `round(height * size)`, under `MIN_TEXT_PX` = 12, judged at the
     render size by `reasons`, not the size-free half).
+  - **Animated SVG titles** (`Timeline.svg_overlays`): resvg draws them and FFmpeg overlays the pictures, so no compositor pass draws one and
+    none ever will without a parity case. The `Planner` keeps their windows and `RenderPlan.svg` (`Vec<Uuid>`) names the ones on screen at a frame,
+    live like a text overlay (`start <= t < end` in a Still, `<= end` in Motion: the graph's `between`); `reasons` pushes **`Unsupported::Svg`**
+    (`kind` `svg`, "an animated SVG title is on screen") for any plan that names one, whatever the caps, so the frame — and a `PlayCut` scan
+    that reaches it — falls back to FFmpeg. The plan carries no geometry or artwork: nothing draws from it.
   - **Pixel format is judged from a positive allow-list** (`pix_fmt_layout` in
     `model.rs` → `PixLayout { Yuv420, Gray, OtherYuv, Rgb }`): a format that is not
     known to be opaque is refused, so a name a deny-list never thought of (`ayuv`,

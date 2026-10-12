@@ -13,9 +13,14 @@
   families `colour-keyed-*`, `volume-keyed*`, `channel-*`) and **400 more** with an AMF or VAAPI
   encoder (`hw_encoder_for`, by index: `h264/hevc/av1_amf` and `h264/hevc/av1_vaapi`, which exist
   nowhere in the first 5600; families `codec-amf-av1`, `codec-vaapi-*`, `rate-amf-quality`,
-  `rate-vaapi-*`, `vaapi-device`, `vaapi-upload`), have their
+  `rate-vaapi-*`, `vaapi-device`, `vaapi-upload`) and **400 more** with animated SVG titles (`svg_for`, on dice seeded by the case:
+  one to three overlays of four fixed artworks — never a preset, whose text would put the machine's libm in the cache key — half in a box
+  that may hang off the frame, a third translucent, a fifth part-way into their animation; every eighth case forced to the gif container,
+  no dice; the cache directory pinned at `/kerf-test/svg` by `pinned`, and a still or the playhead may land on a title's edge (the edge
+  list gains the titles' edges, a different pick from the same single draw); families `svg-input`, `svg-overlay`, `svg-two`, `svg-partly-off`, `svg-restamp`, `still-svg`, `preview-svg-*` and
+  the structural `svg-under-text`, `svg-gif`, `svg-offset`, which gave 28 to hundreds of cases each), have their
   `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
-  FNV-1a digests, committed as 60 block digests each in
+  FNV-1a digests, committed as 64 block digests each in
   `engine/cli/golden/{export,still,preview}.txt` (LF: `.gitattributes`, and the comparison
   ignores `\r`). A refactor of the graph builders must leave all three untouched; an
   intended argv change moves the files of the builders it touched. (`build_proxy_args` and
@@ -24,7 +29,8 @@
   `KERF_GOLDEN_BLESS=1 cargo test -p kerf-core --no-default-features golden -- --nocapture`
   (exactly `1`): it rewrites **all three** files and says so, and `git diff` is the guard —
   only the files you meant to change should move. It is **machine-independent**: the
-  builders read the machine in five places and each is pinned — the preview's
+  builders read the machine in six places and each is pinned (the sixth is the animated titles' cache
+  directory, `svg::raster::with_pinned_dir`) — the preview's
   `decode_hwaccel()` (through `build_preview_args_with`), `zscale_available()` (a `cfg(test)`
   thread-local override; every HDR case is built both ways), `alimiter_latency_available()`
   (the same kind of override, `with_alimiter_latency`; every case is built with the option,
@@ -95,6 +101,9 @@
 - **Sample-exact `adelay`** (a clip starting between milliseconds is delayed by samples)
   re-blessed `export.txt` alone: 2718 of 4800 cases moved, exactly the new
   `audio-delay-samples` family (`S:all=1`); still and preview carry no sound.
+- **The animated-title round** (appended, nothing re-blessed): the three files gained exactly four block lines each (`60`..`63`, 12 insertions,
+  0 deletions in `git diff`), so every one of the 6000 earlier per-case digests is the one the commit before gave. The HW swap is now restricted
+  to its own range (`5600..6000`) so it does not reach the title cases, and the time draws take the titles' edges only where titles exist.
 - **The hardware-encoder round** (AMF recalibrated, `-quality quality`, VAAPI): `export.txt`
   re-blessed, `still.txt` / `preview.txt` only gained the four appended block lines. Of the first
   5600 cases exactly 282 export digests moved (`KERF_GOLDEN_CASES` before / after) — every case whose

@@ -1,0 +1,786 @@
+//! Drawing an animated title: resvg over the static document [`SvgDoc::at`] gives for a moment,
+//! and the on-disk cache those pictures are written to for ffmpeg to read.
+//!
+//! **One rasteriser for every frame path.** An export, the scrubbed still, the playback stream and
+//! an agent's contact sheet all come through [`render`], so a title looks the same wherever it is
+//! seen. ffmpeg never draws SVG: it reads PNGs (a numbered sequence for an export or a stream, one
+//! file for a still) and `overlay`s them, which is why nothing in the graph has to know what an
+//! animation is.
+//!
+//! **The cache is content-addressed and per process.** Files live under
+//! `<cache>/kerf/svg/<pid>/` (else a private directory in the temp one, like the fonts), each
+//! sequence in a directory named by a digest of everything that decides its pixels. A sequence is
+//! usable once its `complete` marker is there; a frame is written under a temporary name and
+//! renamed, so an interrupted run leaves nothing ffmpeg could read half-written. A directory whose
+//! process is gone is removed on the next start; within a process the total is held under
+//! `KERF_SVG_CACHE_MB` (1024) by dropping the least recently used sequence, never one a [`Pin`]
+//! holds (an export's sequences are pinned from the moment they are prepared until ffmpeg is done).
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::SystemTime;
+
+use resvg::usvg::{self, ImageHrefResolver};
+use tiny_skia::{Color, Pixmap, PixmapPaint, Transform};
+
+use super::{invalid, SvgDoc};
+use crate::error::{Error, Result};
+use crate::fonts;
+
+/// Bumped whenever the pixels a document draws to could change (a resvg upgrade that moves
+/// anti-aliasing, a change to the fit or the opacity): it is part of every cache key.
+pub const RASTER_VERSION: u32 = 1;
+
+/// The most pixels one rendered picture may have (an 8K frame is 33 million).
+pub const MAX_PIXELS: u64 = 50_000_000;
+
+/// What the cache may hold, in MiB, when `KERF_SVG_CACHE_MB` does not say.
+const DEFAULT_CACHE_MB: u64 = 1024;
+
+const MARKER: &str = "complete";
+
+// ---- drawing ----------------------------------------------------------------------------------
+
+fn options() -> usvg::Options<'static> {
+    let mut opts = usvg::Options {
+        // The face text gets when it names none: the shipped one, on every machine.
+        font_family: fonts::DEFAULT_FAMILY.to_string(),
+        fontdb: fonts::svg_fontdb(),
+        resources_dir: None,
+        ..usvg::Options::default()
+    };
+    // Only an image the document carries itself is read: a path or a URL in `href` is nothing, so
+    // a title can neither read a file off the disk nor reach for the network.
+    opts.image_href_resolver = ImageHrefResolver {
+        resolve_string: Box::new(|_, _| None),
+        ..ImageHrefResolver::default()
+    };
+    opts
+}
+
+/// Draw the static document `svg` into a transparent `pw` x `ph` picture, fit "contain": scaled to
+/// the largest size that keeps its shape inside, centred, and clipped to its own viewport (what
+/// slides in from outside the `viewBox` is not seen in the margin). `opacity` multiplies every
+/// channel of the premultiplied result, so the alpha is already the overlay's.
+pub fn render(svg: &str, pw: u32, ph: u32, opacity: f64) -> Result<Pixmap> {
+    let (pw, ph) = (pw.max(1), ph.max(1));
+    if u64::from(pw) * u64::from(ph) > MAX_PIXELS {
+        return Err(Error::InvalidArgument(format!(
+            "an animated title of {pw} x {ph} pixels is too large to draw"
+        )));
+    }
+    let tree = usvg::Tree::from_str(svg, &options()).map_err(|e| invalid(format!("not a drawable SVG: {e}")))?;
+    let (w, h) = (tree.size().width(), tree.size().height());
+    let scale = (pw as f32 / w).min(ph as f32 / h);
+    let fit = |v: f32, max: u32| ((v * scale).round() as u32).clamp(1, max);
+    let (fw, fh) = (fit(w, pw), fit(h, ph));
+    let into = Transform::from_scale(fw as f32 / w, fh as f32 / h);
+    let alloc = |w, h| Pixmap::new(w, h).ok_or_else(|| Error::Engine(format!("cannot allocate a {w} x {h} picture")));
+    let mut out = alloc(pw, ph)?;
+    if (fw, fh) == (pw, ph) {
+        resvg::render(&tree, into, &mut out.as_mut());
+    } else {
+        let mut inner = alloc(fw, fh)?;
+        resvg::render(&tree, into, &mut inner.as_mut());
+        out.draw_pixmap(
+            ((pw - fw) / 2) as i32,
+            ((ph - fh) / 2) as i32,
+            inner.as_ref(),
+            &PixmapPaint::default(),
+            Transform::identity(),
+            None,
+        );
+    }
+    apply_opacity(&mut out, opacity);
+    Ok(out)
+}
+
+fn apply_opacity(pixmap: &mut Pixmap, opacity: f64) {
+    let opacity = if opacity.is_finite() { opacity.clamp(0.0, 1.0) } else { 1.0 };
+    if opacity >= 1.0 {
+        return;
+    }
+    let k = opacity as f32;
+    for byte in pixmap.data_mut() {
+        *byte = (f32::from(*byte) * k).round() as u8;
+    }
+}
+
+/// `pixmap` as PNG bytes (straight alpha, as ffmpeg's `overlay` reads it).
+pub fn encode_png(pixmap: &Pixmap) -> Result<Vec<u8>> {
+    pixmap
+        .encode_png()
+        .map_err(|e| Error::Engine(format!("could not encode an animated title frame: {e}")))
+}
+
+const SHEET_BACKGROUND: (u8, u8, u8) = (28, 28, 28);
+const CELL_BACKGROUND: (u8, u8, u8) = (46, 46, 46);
+const SHEET_GAP: u32 = 6;
+/// The most moments one sheet shows.
+pub const MAX_SHEET_CELLS: usize = 36;
+/// The widest sheet, in pixels.
+const MAX_SHEET_WIDTH: u32 = 8192;
+
+/// A contact sheet of `doc` at the given moments of its own clock (`times`, document seconds): a
+/// PNG of a grid of cells over dark grey, each cell the document drawn into a `frame`-shaped
+/// picture `cell_w` px wide (fit "contain", so a document with another shape letterboxes inside its
+/// cell) with its time written under it. For an agent to *see* an animation without rendering the
+/// cut. `cell_w` is clamped to 32..=1920; at most [`MAX_SHEET_CELLS`] moments and
+/// [`MAX_SHEET_WIDTH`] px across.
+pub fn contact_sheet(doc: &SvgDoc, times: &[f64], cell_w: u32, frame: (u32, u32)) -> Result<Vec<u8>> {
+    if times.is_empty() || times.len() > MAX_SHEET_CELLS {
+        return Err(invalid(format!("a contact sheet shows 1 to {MAX_SHEET_CELLS} moments")));
+    }
+    if frame.0 == 0 || frame.1 == 0 {
+        return Err(invalid("the frame has no size"));
+    }
+    let cell_w = cell_w.clamp(32, 1920);
+    let cell_h = ((f64::from(cell_w) * f64::from(frame.1) / f64::from(frame.0)).round() as u32).max(1);
+    let label_h = (cell_w / 12).clamp(12, 28);
+    let mut cols = match times.len() {
+        1 => 1,
+        2 | 4 => 2,
+        _ => 3,
+    };
+    while cols > 1 && cols as u32 * (cell_w + SHEET_GAP) + SHEET_GAP > MAX_SHEET_WIDTH {
+        cols -= 1;
+    }
+    let rows = times.len().div_ceil(cols);
+    let width = cols as u32 * (cell_w + SHEET_GAP) + SHEET_GAP;
+    let height = rows as u32 * (cell_h + label_h + SHEET_GAP) + SHEET_GAP;
+    if width > MAX_SHEET_WIDTH {
+        return Err(invalid("the contact sheet would be too wide"));
+    }
+    let mut sheet = Pixmap::new(width, height).ok_or_else(|| Error::Engine("cannot allocate the contact sheet".into()))?;
+    let (r, g, b) = SHEET_BACKGROUND;
+    sheet.fill(Color::from_rgba8(r, g, b, 255));
+    let mut cell = Pixmap::new(cell_w, cell_h).ok_or_else(|| Error::Engine("cannot allocate a contact sheet cell".into()))?;
+    for (n, &t) in times.iter().enumerate() {
+        let (col, row) = ((n % cols) as u32, (n / cols) as u32);
+        let (x, y) = (
+            SHEET_GAP + col * (cell_w + SHEET_GAP),
+            SHEET_GAP + row * (cell_h + label_h + SHEET_GAP),
+        );
+        let (r, g, b) = CELL_BACKGROUND;
+        cell.fill(Color::from_rgba8(r, g, b, 255));
+        let picture = render(&doc.at(t), cell_w, cell_h, 1.0)?;
+        cell.draw_pixmap(0, 0, picture.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        sheet.draw_pixmap(
+            x as i32,
+            y as i32,
+            cell.as_ref(),
+            &PixmapPaint::default(),
+            Transform::identity(),
+            None,
+        );
+        // The label is a tiny SVG of its own, so it is set in the same face as the titles.
+        let label = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {cell_w} {label_h}\"><text x=\"2\" y=\"{base}\" font-size=\"{size}\" fill=\"#d0d0d0\">{t:.2}s</text></svg>",
+            base = f64::from(label_h) * 0.78,
+            size = f64::from(label_h) * 0.7,
+        );
+        if let Ok(label) = render(&label, cell_w, label_h, 1.0) {
+            sheet.draw_pixmap(
+                x as i32,
+                (y + cell_h) as i32,
+                label.as_ref(),
+                &PixmapPaint::default(),
+                Transform::identity(),
+                None,
+            );
+        }
+    }
+    encode_png(&sheet)
+}
+
+// ---- where the pictures live --------------------------------------------------------------------
+
+#[cfg(test)]
+thread_local! {
+    static PINNED: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with the cache directory at a fixed path that is never created or written, so an argv
+/// oracle does not hold this machine's cache directory (see `golden`). Per thread.
+#[cfg(test)]
+pub(crate) fn with_pinned_dir<R>(dir: &str, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<PathBuf>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PINNED.with(|p| *p.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(PINNED.with(|p| p.borrow_mut().replace(PathBuf::from(dir))));
+    f()
+}
+
+/// This process's directory: `<cache>/kerf/svg/<pid>`, else `kerf-svg-<uid>/<pid>` in the temp
+/// directory (owner-only, as the fonts'). Made on first use and, with it, the directories of
+/// processes that are gone removed. Not the place a path is trusted to *exist*: the cache may be
+/// cleared while the app runs, so whoever writes makes its own parents.
+pub fn root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = PINNED.with(|p| p.borrow().clone()) {
+        return dir;
+    }
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(resolve_root).clone()
+}
+
+fn resolve_root() -> PathBuf {
+    let pid = std::process::id();
+    let bases = dirs::cache_dir()
+        .map(|d| d.join("kerf").join("svg"))
+        .into_iter()
+        .chain(std::iter::once_with(|| fonts::private_dir_named(&std::env::temp_dir(), "kerf-svg")).flatten());
+    for base in bases {
+        let dir = base.join(pid.to_string());
+        if std::fs::create_dir_all(&dir).is_ok() {
+            prune_stale(&base, pid);
+            return dir;
+        }
+    }
+    std::env::temp_dir().join(format!("kerf-svg-{pid}"))
+}
+
+/// Remove the sibling directories of `base` named for a process that is gone.
+fn prune_stale(base: &Path, own: u32) {
+    let Ok(entries) = std::fs::read_dir(base) else { return };
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        let stale = pid != own
+            && if cfg!(unix) {
+                !process_alive(pid)
+            } else {
+                // No cheap liveness check: a directory nothing has written to for a day is stale.
+                entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|m| m.elapsed().ok())
+                    .is_some_and(|age| age > std::time::Duration::from_secs(24 * 3600))
+            };
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else { return false };
+    // SAFETY: signal 0 only checks that the process exists and may be signalled; it sends nothing.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    true
+}
+
+/// The cache's budget, in bytes (`KERF_SVG_CACHE_MB`).
+pub fn cache_cap() -> u64 {
+    std::env::var("KERF_SVG_CACHE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CACHE_MB)
+        .saturating_mul(1 << 20)
+}
+
+// ---- pins ---------------------------------------------------------------------------------------
+
+fn pins() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static PINS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    PINS.get_or_init(Mutex::default)
+}
+
+/// A claim on a sequence directory or a still file: while it is held the cache will not remove it.
+/// Held by whoever is preparing or reading it (an export, a stream), dropped when ffmpeg is done.
+#[derive(Debug)]
+#[must_use = "a dropped pin lets the cache remove what it protected"]
+pub struct Pin(PathBuf);
+
+impl Pin {
+    pub fn new(path: &Path) -> Self {
+        *pins()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(path.to_path_buf())
+            .or_insert(0) += 1;
+        Pin(path.to_path_buf())
+    }
+}
+
+impl Drop for Pin {
+    fn drop(&mut self) {
+        let mut pins = pins().lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(n) = pins.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                pins.remove(&self.0);
+            }
+        }
+    }
+}
+
+fn is_pinned(path: &Path) -> bool {
+    pins().lock().unwrap_or_else(PoisonError::into_inner).contains_key(path)
+}
+
+// ---- the files ----------------------------------------------------------------------------------
+
+/// Frame `j` of the sequence in `dir`.
+pub fn frame_path(dir: &Path, j: u64) -> PathBuf {
+    dir.join(format!("{j:06}.png"))
+}
+
+/// Whether the sequence in `dir` was finished.
+pub fn is_complete(dir: &Path) -> bool {
+    dir.join(MARKER).is_file()
+}
+
+/// Mark the sequence in `dir` finished.
+pub fn mark_complete(dir: &Path) -> Result<()> {
+    write_atomic(&dir.join(MARKER), b"ok")
+}
+
+/// Count `path` (a sequence directory or a still) as used just now, for the least-recently-used
+/// order.
+pub fn touch(path: &Path) {
+    let target = if path.is_dir() {
+        path.join(MARKER)
+    } else {
+        path.to_path_buf()
+    };
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(target) {
+        let _ = file.set_modified(SystemTime::now());
+    }
+}
+
+/// `bytes` at `path`, written whole or not at all: under a name of its own, then renamed. Makes the
+/// parent directories (the cache may have been cleared since the last call).
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    static N: AtomicU64 = AtomicU64::new(0);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("frame");
+    let tmp = path.with_file_name(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// `to` as another name for `from`: a hard link, else (a file system without them) a copy, put in
+/// place by a rename so that a reader never finds `to` half there. Both give a file of its own
+/// that survives the removal of the other.
+pub fn link_or_copy(from: &Path, to: &Path) -> Result<()> {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let name = to.file_name().and_then(|n| n.to_str()).unwrap_or("frame");
+    let tmp = to.with_file_name(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&tmp);
+    let made = std::fs::hard_link(from, &tmp)
+        .or_else(|_| std::fs::copy(from, &tmp).map(|_| ()))
+        .and_then(|()| std::fs::rename(&tmp, to));
+    if let Err(e) = made {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+// ---- the budget ---------------------------------------------------------------------------------
+
+fn size_of(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.is_dir() {
+        return std::fs::read_dir(path)
+            .map(|rd| rd.flatten().map(|e| size_of(&e.path())).sum())
+            .unwrap_or(0);
+    }
+    // A hard link is the same bytes under another name: each of n names counts 1/n of the file.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.len() / meta.nlink().max(1)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
+}
+
+fn last_used(path: &Path) -> SystemTime {
+    let stamp = if path.is_dir() {
+        path.join(MARKER)
+    } else {
+        path.to_path_buf()
+    };
+    std::fs::metadata(&stamp)
+        .or_else(|_| std::fs::metadata(path))
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+/// Remove the least recently used entries of `dir` (sequence directories and `still-*.png` files)
+/// until what is left fits in `cap` bytes, sparing anything `pinned` says is in use. Returns the
+/// bytes left.
+pub fn trim_to(dir: &Path, cap: u64, pinned: &dyn Fn(&Path) -> bool) -> u64 {
+    let Ok(read) = std::fs::read_dir(dir) else { return 0 };
+    let mut entries: Vec<(PathBuf, u64, SystemTime)> = read
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let name = name.to_str()?;
+            let is_still = name.starts_with("still-") && name.ends_with(".png");
+            (is_still || e.path().is_dir()).then(|| {
+                let path = e.path();
+                let (size, used) = (size_of(&path), last_used(&path));
+                (path, size, used)
+            })
+        })
+        .collect();
+    let mut total: u64 = entries.iter().map(|(_, size, _)| size).sum();
+    entries.sort_by_key(|(_, _, used)| *used);
+    for (path, size, _) in entries {
+        if total <= cap {
+            break;
+        }
+        if pinned(&path) {
+            continue;
+        }
+        let gone = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if gone.is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+    total
+}
+
+/// Hold this process's directory to [`cache_cap`], sparing every pinned entry.
+pub fn trim() {
+    #[cfg(test)]
+    if PINNED.with(|p| p.borrow().is_some()) {
+        return;
+    }
+    trim_to(&root(), cache_cap(), &is_pinned);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::svg::SvgDoc;
+
+    fn svg(inner: &str) -> String {
+        format!("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 50\">{inner}</svg>")
+    }
+
+    fn pixel(p: &Pixmap, x: u32, y: u32) -> [u8; 4] {
+        let c = p.pixel(x, y).expect("inside the picture");
+        [c.red(), c.green(), c.blue(), c.alpha()]
+    }
+
+    #[test]
+    fn a_document_is_fit_contain_and_centred_in_its_rectangle() {
+        // 2:1 into a square: the document fills the width and the middle half of the height.
+        let p = render(&svg("<rect width=\"100\" height=\"50\" fill=\"#ff0000\"/>"), 200, 200, 1.0).unwrap();
+        assert_eq!((p.width(), p.height()), (200, 200));
+        assert_eq!(pixel(&p, 100, 100), [255, 0, 0, 255]);
+        assert_eq!(pixel(&p, 100, 20)[3], 0, "the bar above is empty");
+        assert_eq!(pixel(&p, 100, 180)[3], 0, "and the bar below");
+        assert_eq!(pixel(&p, 2, 100), [255, 0, 0, 255], "the width is filled");
+        assert_eq!(pixel(&p, 100, 49)[3], 0, "the top bar ends at y = 50");
+        assert_eq!(pixel(&p, 100, 51), [255, 0, 0, 255], "and the document starts there");
+    }
+
+    #[test]
+    fn what_is_outside_the_viewbox_is_not_drawn_in_the_margin() {
+        let p = render(
+            &svg("<rect x=\"-500\" y=\"-500\" width=\"2000\" height=\"2000\" fill=\"#00ff00\"/>"),
+            200,
+            200,
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(pixel(&p, 100, 100), [0, 255, 0, 255]);
+        assert_eq!(
+            pixel(&p, 100, 10)[3],
+            0,
+            "the viewport is clipped to the document, not the rectangle"
+        );
+        assert_eq!(pixel(&p, 100, 190)[3], 0);
+    }
+
+    #[test]
+    fn opacity_multiplies_every_channel() {
+        let doc = svg("<rect width=\"100\" height=\"50\" fill=\"#ff0000\"/>");
+        let half = render(&doc, 100, 50, 0.5).unwrap();
+        let [r, g, b, a] = pixel(&half, 50, 25);
+        assert!((127..=128).contains(&a), "alpha {a}");
+        assert!(
+            (127..=128).contains(&r) && g == 0 && b == 0,
+            "premultiplied, so red scales too: {r} {g} {b}"
+        );
+        assert_eq!(pixel(&render(&doc, 100, 50, 0.0).unwrap(), 50, 25), [0, 0, 0, 0]);
+        assert_eq!(
+            pixel(&render(&doc, 100, 50, 7.0).unwrap(), 50, 25),
+            [255, 0, 0, 255],
+            "clamped"
+        );
+        assert_eq!(pixel(&render(&doc, 100, 50, f64::NAN).unwrap(), 50, 25), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn text_is_drawn_in_the_shipped_face_even_for_a_family_nobody_has() {
+        let named = render(
+            &svg("<text x=\"4\" y=\"36\" font-size=\"40\" font-family=\"No Such Family 9\" fill=\"#fff\">Hi</text>"),
+            400,
+            200,
+            1.0,
+        )
+        .unwrap();
+        let plain = render(
+            &svg("<text x=\"4\" y=\"36\" font-size=\"40\" fill=\"#fff\">Hi</text>"),
+            400,
+            200,
+            1.0,
+        )
+        .unwrap();
+        let ink = |p: &Pixmap| p.pixels().iter().filter(|c| c.alpha() > 0).count();
+        assert!(ink(&named) > 200, "text appeared: {}", ink(&named));
+        assert!(ink(&plain) > 200);
+        assert_eq!(named.data(), plain.data(), "an unknown family and none are the same face");
+    }
+
+    #[test]
+    fn an_image_that_is_not_in_the_document_is_not_read() {
+        let path = std::env::temp_dir().join(format!("kerf-svg-secret-{}.png", std::process::id()));
+        let red = Pixmap::new(8, 8).map(|mut p| {
+            p.fill(Color::from_rgba8(255, 0, 0, 255));
+            p.encode_png().unwrap()
+        });
+        std::fs::write(&path, red.unwrap()).unwrap();
+        for href in [
+            path.to_string_lossy().into_owned(),
+            format!("file://{}", path.display()),
+            "http://127.0.0.1:9/x.png".into(),
+        ] {
+            let p = render(
+                &svg(&format!("<image href=\"{href}\" width=\"100\" height=\"50\"/>")),
+                100,
+                50,
+                1.0,
+            )
+            .unwrap();
+            assert!(p.pixels().iter().all(|c| c.alpha() == 0), "{href}");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_picture_too_large_to_hold_is_refused() {
+        assert!(render(&svg(""), 10_000, 10_000, 1.0).is_err());
+        assert!(render("<not svg", 10, 10, 1.0).is_err());
+    }
+
+    #[test]
+    fn png_bytes_decode_to_the_same_picture() {
+        let p = render(
+            &svg("<rect width=\"50\" height=\"50\" fill=\"#3366ff\" fill-opacity=\"0.5\"/>"),
+            100,
+            50,
+            1.0,
+        )
+        .unwrap();
+        let back = Pixmap::decode_png(&encode_png(&p).unwrap()).unwrap();
+        assert_eq!((back.width(), back.height()), (100, 50));
+        for (x, y) in [(10, 10), (60, 10), (99, 49)] {
+            let (a, b) = (pixel(&p, x, y), pixel(&back, x, y));
+            for c in 0..4 {
+                assert!(a[c].abs_diff(b[c]) <= 2, "{x},{y}: {a:?} vs {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_contact_sheet_shows_each_moment_on_dark_grey() {
+        let doc = SvgDoc::parse(&svg(
+            "<rect width=\"100\" height=\"50\" fill=\"#ff0000\"><animate attributeName=\"opacity\" from=\"0\" to=\"1\" dur=\"2s\" fill=\"freeze\"/></rect>",
+        ))
+        .unwrap();
+        let png = contact_sheet(&doc, &[0.0, 1.0, 2.0, 3.0], 160, (1920, 1080)).unwrap();
+        let sheet = Pixmap::decode_png(&png).unwrap();
+        // Two columns, two rows of 160 x 90 cells with a 6 px gap and a label under each.
+        assert_eq!(sheet.width(), 2 * (160 + 6) + 6);
+        assert!(sheet.height() > 2 * (90 + 6));
+        assert_eq!(pixel(&sheet, 1, 1), [28, 28, 28, 255], "the sheet is dark grey");
+        let cell = |n: u32| {
+            let (col, row) = (n % 2, n / 2);
+            pixel(&sheet, 6 + col * 166 + 80, 6 + row * (90 + 6 + 13) + 45)
+        };
+        // The document is 2:1 in a 16:9 cell, so its middle is red where it has faded in.
+        assert_eq!(cell(0), [46, 46, 46, 255], "at 0 s it is invisible: the cell shows");
+        assert!(cell(1)[0] > cell(0)[0] + 40, "at 1 s it is half there: {:?}", cell(1));
+        assert_eq!(cell(2), [255, 0, 0, 255], "done at 2 s");
+        assert_eq!(cell(3), [255, 0, 0, 255]);
+        assert!(contact_sheet(&doc, &[], 160, (1920, 1080)).is_err());
+        assert!(contact_sheet(&doc, &[0.0; 37], 160, (1920, 1080)).is_err());
+        assert!(contact_sheet(&doc, &[0.0], 160, (0, 1080)).is_err());
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kerf-svg-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sequence(root: &Path, key: &str, bytes: usize, age_secs: u64) -> PathBuf {
+        let dir = root.join(key);
+        write_atomic(&frame_path(&dir, 0), &vec![7u8; bytes]).unwrap();
+        mark_complete(&dir).unwrap();
+        let old = SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(MARKER))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_least_recently_used_sequence_goes_first_and_a_pinned_one_never() {
+        let root = scratch("lru");
+        let oldest = sequence(&root, "aa", 1000, 300);
+        let middle = sequence(&root, "bb", 1000, 200);
+        let newest = sequence(&root, "cc", 1000, 100);
+        let still = root.join("still-dd.png");
+        write_atomic(&still, &[1u8; 500]).unwrap();
+        let kept = trim_to(&root, 2600, &|_| false);
+        assert!(!oldest.exists() && middle.exists() && newest.exists() && still.exists());
+        assert!((2500..=2600).contains(&kept), "{kept}");
+
+        // The oldest is pinned: the next one in line goes instead.
+        let oldest = sequence(&root, "aa", 1000, 300);
+        let pin = Pin::new(&oldest);
+        trim_to(&root, 2600, &is_pinned);
+        assert!(oldest.exists() && !middle.exists() && newest.exists());
+        drop(pin);
+        assert!(!is_pinned(&oldest));
+
+        // Touching a sequence makes it the newest.
+        touch(&oldest);
+        let extra = sequence(&root, "ee", 1000, 50);
+        trim_to(&root, 2600, &|_| false);
+        assert!(oldest.exists() && extra.exists() && !newest.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hard_links_are_one_file_in_the_budget() {
+        let root = scratch("links");
+        let dir = root.join("ff");
+        write_atomic(&frame_path(&dir, 0), &[3u8; 4000]).unwrap();
+        for j in 1..4 {
+            link_or_copy(&frame_path(&dir, 0), &frame_path(&dir, j)).unwrap();
+        }
+        mark_complete(&dir).unwrap();
+        let size = size_of(&dir);
+        if cfg!(unix) {
+            assert!(size < 4100, "four names for 4000 bytes counted as {size}");
+        }
+        assert_eq!(std::fs::read(frame_path(&dir, 3)).unwrap(), vec![3u8; 4000]);
+        std::fs::remove_file(frame_path(&dir, 0)).unwrap();
+        assert_eq!(
+            std::fs::read(frame_path(&dir, 3)).unwrap().len(),
+            4000,
+            "a link outlives the name it came from"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_frame_is_written_whole_or_not_at_all() {
+        let root = scratch("atomic");
+        let path = root.join("deep").join("000000.png");
+        write_atomic(&path, b"abc").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1,
+            "no temporary file is left"
+        );
+        assert!(
+            write_atomic(&path.join("child"), b"x").is_err(),
+            "a child of a file cannot be made"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_directories_of_processes_that_are_gone_are_pruned() {
+        let base = scratch("prune");
+        let ours = std::process::id();
+        // Far above any pid_max: never a live process.
+        let gone = 4_000_000_000u32;
+        for pid in [ours, gone] {
+            std::fs::create_dir_all(base.join(pid.to_string()).join("key")).unwrap();
+        }
+        std::fs::create_dir_all(base.join("not-a-pid")).unwrap();
+        // Our parent is certainly alive and is not ours.
+        let parent = std::os::unix::process::parent_id();
+        std::fs::create_dir_all(base.join(parent.to_string())).unwrap();
+        prune_stale(&base, ours);
+        assert!(base.join(ours.to_string()).exists());
+        assert!(!base.join(gone.to_string()).exists());
+        assert!(base.join(parent.to_string()).exists(), "a live process's directory stays");
+        assert!(
+            base.join("not-a-pid").exists(),
+            "and anything that is not a pid is left alone"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn the_cache_cap_reads_the_environment() {
+        // Not set here (a test must not set process-wide variables): the default is a gibibyte.
+        if std::env::var_os("KERF_SVG_CACHE_MB").is_none() {
+            assert_eq!(cache_cap(), 1 << 30);
+        }
+    }
+
+    #[test]
+    fn a_pinned_directory_is_a_pure_path() {
+        with_pinned_dir("/kerf-test/svg", || {
+            assert_eq!(root(), PathBuf::from("/kerf-test/svg"));
+            trim();
+            with_pinned_dir("/kerf-test/other", || assert_eq!(root(), PathBuf::from("/kerf-test/other")));
+            assert_eq!(root(), PathBuf::from("/kerf-test/svg"), "the outer pin comes back");
+        });
+        assert!(!PINNED.with(|p| p.borrow().is_some()));
+    }
+}

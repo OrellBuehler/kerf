@@ -4408,6 +4408,18 @@ fn push_inputs(
     Ok(plan)
 }
 
+/// The timeline an export draws: [`Timeline::for_render`] (muted / solo-shadowed tracks and
+/// disabled clips gone), and for a range export the sliced sub-timeline, so trims, fades,
+/// keyframes and overlays all see the same shifted geometry. The builder and whatever has to know
+/// what the builder will ask for before it is spawned (the titles' pictures) both start here.
+fn export_timeline(timeline: &Timeline, opts: &ExportOptions) -> Timeline {
+    let rendered = timeline.for_render();
+    match effective_range(&rendered, opts) {
+        Some((s, e)) => rendered.slice(s, e),
+        None => rendered,
+    }
+}
+
 /// [`build_export_args`] parameterised by the two-pass [`PassPhase`]. `null_sink`
 /// is the platform null device (`/dev/null` / `NUL`) used as the first-pass
 /// output, and `passlog` is the shared `-passlogfile` prefix — both injected by
@@ -4422,21 +4434,10 @@ fn build_export_args_phase(
     null_sink: &str,
     passlog: &str,
 ) -> Result<Vec<String>> {
-    // Drop muted / solo-shadowed tracks and disabled clips up front, so the rest
-    // of the builder never has to reason about them.
-    let rendered = timeline.for_render();
-    let timeline = &rendered;
-
-    // Range export: build the graph against the sliced sub-timeline, so trims,
-    // fades, keyframes and overlays all see the same shifted geometry.
-    let sliced;
-    let timeline = match effective_range(timeline, opts) {
-        Some((s, e)) => {
-            sliced = timeline.slice(s, e);
-            &sliced
-        }
-        None => timeline,
-    };
+    // Drop muted / solo-shadowed tracks and disabled clips up front, and cut the range an export
+    // of one span draws, so the rest of the builder never has to reason about either.
+    let cut = export_timeline(timeline, opts);
+    let timeline = &cut;
 
     // Stream gating: decide what the graph emits and what we `-map`, in lockstep.
     let timeline_has_video = timeline
@@ -4470,6 +4471,11 @@ fn build_export_args_phase(
     // `build_filter_complex` indexes them and how `fx` is indexed.
     let fmt = export_format(timeline, assets, opts);
     let plan = push_inputs(timeline, assets, &fmt, opts, &mut args)?;
+    // The animated titles' picture sequences follow the clips' inputs (the graph indexes them from
+    // there); a cut with none adds nothing.
+    if want_video {
+        svg_layer::push_inputs(&svg_layer::svg_sequences(timeline, &fmt), &fmt, &mut args);
+    }
 
     let total = timeline.duration();
     let graph = build_filter_complex(timeline, assets, &fmt, total, opts, want_video, want_audio, &plan);
@@ -4859,6 +4865,7 @@ fn preview_resolution(timeline: &Timeline, assets: &[Asset], max_width: u32) -> 
 /// every track, effect, transform, keyframe and overlay, not just the raw clip
 /// under the playhead. Only the two ends differ from an export: proxy sources go
 /// in (the caller substitutes those paths) and MJPEG comes out on a pipe.
+#[cfg(test)]
 fn build_preview_args(
     timeline: &Timeline,
     assets: &[Asset],
@@ -4874,6 +4881,7 @@ fn build_preview_args(
 /// the machine (`KERF_HWACCEL`, and whether an earlier hardware failure turned it
 /// off). The one seam the golden argv oracle needs to be independent of the machine
 /// it runs on; the argv it builds is exactly what `build_preview_args` always did.
+#[cfg(test)]
 fn build_preview_args_with(
     timeline: &Timeline,
     assets: &[Asset],
@@ -4883,6 +4891,27 @@ fn build_preview_args_with(
     quality: u8,
     hwaccel: Option<String>,
 ) -> Result<Vec<String>> {
+    let cut = preview_cut(timeline, assets, start, fps, max_width, hwaccel)?;
+    preview_args(&cut, assets, quality)
+}
+
+/// What the playback stream plays: the cut from the playhead, how it is rendered and the frame it
+/// is drawn in. Worked out apart from the argv so that what the argv will ask for — the animated
+/// titles' pictures — can be on disk before ffmpeg is spawned.
+struct PreviewCut {
+    sliced: Timeline,
+    opts: ExportOptions,
+    fmt: ExportFormat,
+}
+
+fn preview_cut(
+    timeline: &Timeline,
+    assets: &[Asset],
+    start: f64,
+    fps: f64,
+    max_width: u32,
+    hwaccel: Option<String>,
+) -> Result<PreviewCut> {
     // Same gate as the export: muted / solo-shadowed tracks and disabled clips
     // never reach the graph, so what plays is what would render.
     let timeline = &timeline.for_render();
@@ -4915,13 +4944,19 @@ fn build_preview_args_with(
         ..ExportOptions::default()
     };
     let fmt = export_format(&sliced, assets, &opts);
+    Ok(PreviewCut { sliced, opts, fmt })
+}
 
+/// The argv that plays a [`PreviewCut`] as JPEGs on stdout.
+fn preview_args(cut: &PreviewCut, assets: &[Asset], quality: u8) -> Result<Vec<String>> {
+    let PreviewCut { sliced, opts, fmt } = cut;
     let mut args: Vec<String> = ["-hide_banner", "-nostats", "-nostdin", "-loglevel", "error"]
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let plan = push_inputs(&sliced, assets, &fmt, &opts, &mut args)?;
-    let graph = build_filter_complex(&sliced, assets, &fmt, sliced.duration(), &opts, true, false, &plan);
+    let plan = push_inputs(sliced, assets, fmt, opts, &mut args)?;
+    svg_layer::push_inputs(&svg_layer::svg_sequences(sliced, fmt), fmt, &mut args);
+    let graph = build_filter_complex(sliced, assets, fmt, sliced.duration(), opts, true, false, &plan);
     args.push("-filter_complex".to_string());
     args.push(graph.filter);
     args.push("-map".to_string());
@@ -5039,7 +5074,11 @@ fn stream_preview_once(
     hw_used: &mut bool,
 ) -> Result<()> {
     let PlaybackParams { fps, max_width } = params;
-    let mut args = build_preview_args(timeline, assets, start, fps, max_width, PREVIEW_STREAM_QUALITY)?;
+    let cut = preview_cut(timeline, assets, start, fps, max_width, decode_hwaccel())?;
+    // Animated titles are pictures on disk by now (a few seconds' work at most); held until the
+    // stream is over so the cache cannot take them away mid-play.
+    let _titles = svg_layer::prepare_preview(&cut.sliced, &cut.fmt)?;
+    let mut args = preview_args(&cut, assets, PREVIEW_STREAM_QUALITY)?;
     // The composited graph outgrows argv just as the export's does.
     let _script = externalize_filter_complex(&mut args, "preview")?;
     // Hardware decode is per input, and a proxy (what the stream reads once one is ready) is
@@ -5252,6 +5291,11 @@ pub fn render_with_progress(
             HWACCEL_PROVEN_BAD.load(std::sync::atomic::Ordering::Relaxed),
         ),
         ..opts.clone()
+    };
+    // The animated titles are pictures on disk before any ffmpeg is spawned: drawn once for this
+    // export — a second pass and the software retry read the same files — and kept until it is over.
+    let Some(_titles) = svg_layer::prepare_export(timeline, assets, opts, progress, cancel)? else {
+        return Ok(RenderStatus::Cancelled);
     };
     retry_export_in_software(
         opts,
@@ -6183,18 +6227,23 @@ fn build_filter_complex_metered(
         ));
         let mut cur = "vbase".to_string();
         let draw = !timeline.overlays.is_empty();
+        // Animated titles: PNG sequences read as inputs after the clips'. They go over the whole
+        // composite and under the text.
+        let svg = svg_layer::svg_sequences(timeline, fmt);
         // The picture ends on `[outv]`, or on `vhw` when a VAAPI encoder's upload follows.
         let vaapi = uploads_to_vaapi(opts);
         let final_pad = if vaapi { "vhw" } else { "outv" };
-        // The composite lands on `vcomp` for gif (palettegen follows), on `vtext`
+        // What comes after the titles: `vcomp` for gif (palettegen follows), `vtext`
         // when text overlays will be drawn on top, else directly on `final_pad`.
-        let composite_pad = if draw {
+        let after_svg = if draw {
             "vtext"
         } else if gif {
             "vcomp"
         } else {
             final_pad
         };
+        // The clips land on `vsvg` when titles follow, else where the titles would have gone.
+        let composite_pad = if svg.is_empty() { after_svg } else { "vsvg" };
         let last = video.len() - 1;
         for (n, (flat, input, clip)) in video.iter().enumerate() {
             let src = if vcount[*input] > 1 {
@@ -6257,10 +6306,13 @@ fn build_filter_complex_metered(
             chains.push(format!("[{cur}][v{flat}]{overlay}[{out}]"));
             cur = out;
         }
+        if !svg.is_empty() {
+            svg_layer::push_chains(&svg, n_inputs, composite_pad, after_svg, &mut chains);
+        }
         // Text overlays (titles / lower-thirds / captions) drawn on the composited
         // picture in order; the last produces the gif source `vcomp` or `[outv]`.
         if draw {
-            let mut tcur = composite_pad.to_string();
+            let mut tcur = after_svg.to_string();
             let last_o = timeline.overlays.len() - 1;
             let text_final = if gif { "vcomp" } else { final_pad };
             for (oi, ov) in timeline.overlays.iter().enumerate() {
@@ -7656,6 +7708,8 @@ fn run_still(
 ) -> Result<Vec<u8>> {
     let piping = matches!(out, StillOutput::JpegPipe { .. });
     let hw_used = std::cell::Cell::new(false);
+    // The titles' pictures, on disk and kept for the run (and its software retry).
+    let _titles = still_titles(timeline, assets, opts, t, max_width, region)?;
     let run = |o: &ExportOptions| -> Result<Vec<u8>> {
         let mut args = build_still_args(timeline, assets, o, t, max_width, region, out)?;
         hw_used.set(tune_still_args(&mut args, assets, HostOs::CURRENT));
@@ -7936,6 +7990,45 @@ fn build_still_args(
     build_still_args_rendered(&rendered, assets, opts, t, max_width, region, out)
 }
 
+/// The frame a still is composited on: the export's format, the region normalised, and the output
+/// canvas (`ow` x `oh`: the export's aspect capped to `max_width`, even). A region zoom composites a
+/// canvas wide enough that the region alone is `max_width` — the delivery frame caps it, so a zoom
+/// never upscales. The builder and whatever draws the still's titles first both ask this.
+fn still_canvas(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    max_width: u32,
+    region: Option<Region>,
+) -> (ExportFormat, Option<Region>, u32, u32) {
+    let fmt = export_format(timeline, assets, opts);
+    let region = region.map(Region::normalized);
+    let canvas_width = match region {
+        Some(r) => ((max_width as f64 / r.width).ceil() as u32).min(fmt.width),
+        None => max_width,
+    };
+    let (ow, oh) = still_size(fmt.width, fmt.height, canvas_width);
+    (fmt, region, ow, oh)
+}
+
+/// Have the animated titles a still at `t` shows drawn and kept (until the pins drop), before its
+/// ffmpeg is spawned. Nothing for a cut without any.
+fn still_titles(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    max_width: u32,
+    region: Option<Region>,
+) -> Result<Vec<crate::svg::raster::Pin>> {
+    if timeline.svg_overlays.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rendered = timeline.for_render();
+    let (_, _, ow, oh) = still_canvas(&rendered, assets, opts, max_width, region);
+    svg_layer::ensure_stills(&svg_layer::still_svgs(&rendered, ow, oh, t.max(0.0)))
+}
+
 /// [`build_still_args`] over a timeline that has already been through [`Timeline::for_render`]:
 /// what a caller asking for many frames of one cut (the scrub cache keys every frame of a
 /// window) does once instead of per frame.
@@ -7948,18 +8041,11 @@ fn build_still_args_rendered(
     region: Option<Region>,
     out: &StillOutput,
 ) -> Result<Vec<String>> {
-    let fmt = export_format(timeline, assets, opts);
-    // A region zoom composites a canvas wide enough that the region alone is
-    // `max_width` — the delivery frame caps it, so a zoom never upscales.
-    let region = region.map(Region::normalized);
-    let canvas_width = match region {
-        Some(r) => ((max_width as f64 / r.width).ceil() as u32).min(fmt.width),
-        None => max_width,
-    };
-    // Output canvas: export aspect ratio, capped to `max_width`, even dimensions.
-    let (ow, oh) = still_size(fmt.width, fmt.height, canvas_width);
+    let (fmt, region, ow, oh) = still_canvas(timeline, assets, opts, max_width, region);
     let t = t.max(0.0);
     let asset_of = |id| assets.iter().find(|a: &&Asset| a.id == id);
+    // The animated titles on screen at `t`: one picture each (`run_still` draws them first).
+    let svg = svg_layer::still_svgs(timeline, ow, oh, t);
 
     // Active video clips at `t`, in composite order (tracks in list order, clips
     // within a track in timeline order), paired with their source time, the clips a
@@ -7989,6 +8075,7 @@ fn build_still_args_rendered(
         args.push("-i".to_string());
         args.push(asset.path.clone());
     }
+    svg_layer::push_still_inputs(&svg, &mut args);
 
     // Black base + each active clip's still chain (its transform sampled at `t`,
     // so a keyframed clip shows its pose), overlaid in order, then the text
@@ -8029,6 +8116,8 @@ fn build_still_args_rendered(
         ));
         cur = out;
     }
+    // Titles over the clips, under the text, as in the export.
+    cur = svg_layer::push_still_chains(&svg, active.len(), &cur, &mut chains);
     for (oi, ov) in live.iter().enumerate() {
         let out = format!("txt{oi}");
         chains.push(format!("[{cur}]{f}[{out}]", f = drawtext_still(ov, oh, t)));
@@ -8347,6 +8436,13 @@ mod rendered;
 /// The still inside a fade, a dip, a dissolve, a slide or a push: its layers and their fades.
 mod still_fx;
 use still_fx::{still_layers, StillFades};
+
+/// Animated SVG titles as PNG sequences and stills: drawn before ffmpeg is spawned, overlaid by it.
+mod svg_layer;
+
+/// Titles through the real ffmpeg (`#[ignore]`d).
+#[cfg(test)]
+mod svg_rendered;
 
 /// Which slot a job takes, the cores' or the hardware's.
 #[cfg(test)]

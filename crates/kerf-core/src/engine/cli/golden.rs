@@ -1,6 +1,6 @@
-//! The golden argv oracle: 6000 seeded timelines (4000, then 800 with a master bus, then 800
-//! with per-property channels, then 400 with an AMF or VAAPI encoder) whose ffmpeg argv must
-//! not move.
+//! The golden argv oracle: 6400 seeded timelines (4000, then 800 with a master bus, then 800
+//! with per-property channels, then 400 with an AMF or VAAPI encoder, then 400 with animated SVG
+//! titles) whose ffmpeg argv must not move.
 //!
 //! `build_export_args_phase`, `build_still_args` and `build_preview_args_with` are
 //! built for every case and their argv reduced to a digest, checked against three
@@ -27,6 +27,14 @@
 //! encoders ([`hw_encoder_for`], no dice of its own); `av1_amf` and the three VAAPI encoders
 //! are in none of the first 5600. What moved among those is only the export of a case already
 //! holding `h264_amf` or `hevc_amf` (the recalibrated QP and `-quality quality`).
+//!
+//! **The animated-title family is appended the same way**: the [`SVG_CASES`] after those draw
+//! their timelines from the same generator and then get SVG overlays ([`svg_for`], on dice of its
+//! own seeded by the case, with the artwork fixed strings — a preset would put the machine's libm
+//! in the key — and the cache directory pinned at `/kerf-test/svg`, `raster::with_pinned_dir`).
+//! A few are forced to the gif container ([`svg_container_for`], no dice either). The first 6000
+//! per-case digests are the ones the commit before titles existed gave; only 4 block lines were
+//! appended to each file.
 //!
 //! **Machine-independent by construction.** The builders read the machine in five
 //! places, each pinned: the preview's decode acceleration (the
@@ -80,7 +88,10 @@ const MASTER_CASES: usize = 800;
 const CHANNEL_CASES: usize = 800;
 /// The AMF / VAAPI encoder cases appended after the channel ones (see the module docs).
 const HW_CASES: usize = 400;
-const TOTAL: usize = CASES + MASTER_CASES + CHANNEL_CASES + HW_CASES;
+/// The animated-title cases appended after the hardware-encoder ones (see the module docs).
+const SVG_CASES: usize = 400;
+const SVG_FIRST: usize = CASES + MASTER_CASES + CHANNEL_CASES + HW_CASES;
+const TOTAL: usize = SVG_FIRST + SVG_CASES;
 const BLOCK: usize = 100;
 const MIN_PER_FAMILY: usize = 20;
 const KINDS: [&str; 3] = ["export", "still", "preview"];
@@ -177,6 +188,14 @@ still-overlay-default-font fontfile='/kerf-test/fonts/Geist-
 still-overlay-named-font fontfile='/kerf-test/fonts/PinnedSans-Regular.ttf'
 preview-overlay-default-font fontfile='/kerf-test/fonts/Geist-
 preview-overlay-named-font fontfile='/kerf-test/fonts/PinnedSans-Regular.ttf'
+svg-input -f image2 -framerate
+svg-overlay ][svg0]overlay=x=
+svg-two ][svg1]overlay=x=
+svg-partly-off ][svg0]overlay=x=-
+svg-restamp settb=expr=1/
+still-svg /kerf-test/svg/still-
+preview-svg-input -f image2 -framerate
+preview-svg-overlay ][svg0]overlay=x=
 cover-fit force_original_aspect_ratio=increase
 scaler-flag :flags=lanczos
 pix-fmt format=yuv422p10le
@@ -837,6 +856,58 @@ fn options(r: &mut Rng, dur: f64) -> ExportOptions {
     o
 }
 
+/// The artwork of the animated-title cases: fixed strings, so nothing a library computes is in the
+/// key. A box that slides, a fade that then holds, a title with text, and a still picture.
+const SVG_DOCS: [&str; 4] = [
+    "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 192 108\"><rect y=\"40\" width=\"40\" height=\"28\" fill=\"#ff3355\"><animate attributeName=\"x\" from=\"0\" to=\"152\" dur=\"2s\" fill=\"freeze\"/></rect></svg>",
+    "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1920 1080\"><rect width=\"1920\" height=\"1080\" fill=\"#102030\" opacity=\"0\"><animate attributeName=\"opacity\" from=\"0\" to=\"0.8\" dur=\"0.5s\" fill=\"freeze\"/></rect></svg>",
+    "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 800 200\"><text x=\"20\" y=\"120\" font-size=\"90\" fill=\"#fff\"><animate attributeName=\"opacity\" values=\"0;1;1;0\" keyTimes=\"0;0.2;0.8;1\" dur=\"3s\" fill=\"freeze\"/>Kerf</text></svg>",
+    "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 100\"><circle cx=\"50\" cy=\"50\" r=\"40\" fill=\"#00ccaa\"/></svg>",
+];
+
+/// The animated titles of the `j`-th title case: one to three, on dice of their own (seeded by the
+/// case, so the generator's draws are untouched and the cases before it cannot move). Half cover the
+/// frame and half sit in a box that may hang off its edge; a third are translucent, a fifth start
+/// part-way into their animation (as a slice leaves them).
+fn svg_for(tl: &mut Timeline, j: usize) {
+    let mut r = Rng::new(0x5356_4700_0000 + j as u64);
+    let dur = tl.duration().max(1.0);
+    for _ in 0..r.pick(&[1, 1, 1, 2, 2, 3]) {
+        let start = r.real(0.0, dur * 0.8);
+        let end = start + r.real(0.4, 8.0);
+        let mut o = crate::model::SvgOverlay {
+            id: r.id(),
+            name: String::new(),
+            svg: r.pick(&SVG_DOCS).into(),
+            start,
+            end,
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            opacity: 1.0,
+            offset: 0.0,
+            preset: None,
+        };
+        if r.chance(0.5) {
+            (o.x, o.y, o.width, o.height) = (r.real(-0.3, 0.7), r.real(-0.3, 0.7), r.real(0.05, 0.6), r.real(0.05, 0.6));
+        }
+        if r.chance(0.35) {
+            o.opacity = r.real(0.1, 0.95);
+        }
+        if r.chance(0.2) {
+            o.offset = r.real(0.1, 3.0);
+        }
+        tl.svg_overlays.push(o);
+    }
+}
+
+/// Every eighth title case is exported as a gif (no dice): the titles end on `vcomp`, ahead of the
+/// palette, which the text overlay's and the plain cut's graphs never do.
+fn svg_container_for(j: usize) -> Option<Container> {
+    (j % 8 == 3).then_some(Container::Gif)
+}
+
 /// The encoder case `n` of the hardware family is built for: the AMF and VAAPI encoders in
 /// turn, no dice (so the generator's draws are the ones it always made).
 fn hw_encoder_for(n: usize) -> &'static str {
@@ -870,11 +941,16 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     if i >= CASES + MASTER_CASES {
         channels_for(&mut timeline, i - CASES - MASTER_CASES);
     }
+    if i >= SVG_FIRST {
+        svg_for(&mut timeline, i - SVG_FIRST);
+    }
     let dur = timeline.duration();
     let edges: Vec<f64> = (timeline.tracks.iter().flat_map(|t| &t.clips))
         .flat_map(|c| [c.timeline_start, c.timeline_end(), c.timeline_end() - 1e-3, c.timeline_start + 1e-4])
         .collect();
-    let overlay_edges: Vec<f64> = timeline.overlays.iter().flat_map(|o| [o.start, o.end]).collect();
+    let overlay_edges: Vec<f64> = (timeline.overlays.iter().flat_map(|o| [o.start, o.end]))
+        .chain(timeline.svg_overlays.iter().flat_map(|o| [o.start, o.end]))
+        .collect();
     let time = |r: &mut Rng| match r.below(20) {
         0..=2 => 0.0,
         3 | 4 => dur,
@@ -890,8 +966,11 @@ fn case(i: usize, assets: &[Asset]) -> Case {
         _ => StillOutput::RgbPipe,
     };
     let mut opts = options(&mut r, dur);
-    if i >= CASES + MASTER_CASES + CHANNEL_CASES {
+    if (CASES + MASTER_CASES + CHANNEL_CASES..SVG_FIRST).contains(&i) {
         opts.video_codec = Some(hw_encoder_for(i - CASES - MASTER_CASES - CHANNEL_CASES).into());
+    }
+    if i >= SVG_FIRST {
+        opts.container = svg_container_for(i - SVG_FIRST).unwrap_or(opts.container);
     }
     let pass = match r.below(20) { 0..=11 => PassPhase::Single, 12..=15 => PassPhase::First, _ => PassPhase::Second };
     Case {
@@ -992,7 +1071,9 @@ fn build(c: &Case, assets: &[Asset]) -> ([String; 3], Vec<String>) {
 /// shipped default font were at a fixed path.
 fn pinned<R>(zscale: bool, latency: bool, f: impl FnOnce() -> R) -> R {
     with_zscale(zscale, || {
-        with_alimiter_latency(latency, || crate::fonts::with_pinned_default_font(f))
+        with_alimiter_latency(latency, || {
+            crate::fonts::with_pinned_default_font(|| crate::svg::raster::with_pinned_dir("/kerf-test/svg", f))
+        })
     })
 }
 
@@ -1030,7 +1111,7 @@ fn transitions(c: &Case, assets: &[Asset]) -> Vec<String> {
 }
 
 /// The families that come from the case's structure rather than from argv text.
-const STRUCTURAL: [&str; 27] = [
+const STRUCTURAL: [&str; 30] = [
     "muted-track",
     "solo-track",
     "disabled-clip",
@@ -1058,6 +1139,9 @@ const STRUCTURAL: [&str; 27] = [
     "channel-opacity-alone",
     "still-tail",
     "still-travel",
+    "svg-under-text",
+    "svg-gif",
+    "svg-offset",
 ];
 
 fn expected(table: &[(&str, &str)]) -> Vec<String> {
@@ -1230,6 +1314,20 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
         (
             clips().any(|k| k.is_keyed(Property::Opacity) && !k.is_keyed(Property::Scale)),
             "channel-opacity-alone",
+        ),
+        // Titles laid under a text overlay, ahead of a gif's palette, and started part-way into
+        // their animation (a range export slices them; some are drawn so).
+        (
+            flat[0].contains("][svg0]overlay=") && flat[0].contains("drawtext="),
+            "svg-under-text",
+        ),
+        (
+            flat[0].contains("][svg0]overlay=") && flat[0].contains("paletteuse="),
+            "svg-gif",
+        ),
+        (
+            flat[0].contains("][svg0]overlay=") && export_timeline(tl, &c.opts).svg_overlays.iter().any(|o| o.offset > 0.0),
+            "svg-offset",
         ),
         (still_transitions.0, "still-tail"),
         (still_transitions.1, "still-travel"),

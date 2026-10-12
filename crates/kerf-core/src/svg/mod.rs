@@ -24,6 +24,7 @@
 
 mod anim;
 mod presets;
+pub mod raster;
 mod sanitize;
 mod values;
 
