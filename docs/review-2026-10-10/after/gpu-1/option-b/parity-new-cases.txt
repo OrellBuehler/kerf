@@ -1,9 +1,12 @@
 New parity rows (tests/parity.rs, GPU against FFmpeg's still of the same files; flat PSNR / flat max error | whole-image PSNR / max | edge band). 640x360 canvas, the HD clips are 1280x720 shrunk 2:1, the top layer a 0.5 picture-in-picture.
-Cases not listed are asserted REFUSED by the plan under the negotiating policy (FFmpeg 9.0.2) and compared strictly under FFmpeg 6.1.1; the row counts below say which.
+Cases not listed are asserted REFUSED by the plan under the negotiating policy (FFmpeg 9.0.2) and compared strictly under FFmpeg 6.1.1; the row counts say which: 662 rows on 9.0.2 (main 641), 709 on 6.1.1 (main 681).
+label/photo.jpg, photo.webp and webcam.mkv are real files whose bt470bg tag is a decoder's default: not labelled, drawn strictly.
 
-== FFmpeg 9.0.2 (BottomLayerTag)
+== FFmpeg 9.0.2 (BottomLayerTag): 21 rows
 label/709-over-untagged-hd   t=0.5     640x360 layers=2 flat: PSNR  44.3 dB  max  5  mean 1.30 | all: PSNR  44.4 dB  max   5 | edge band  9.4%
 label/709-translucent-over-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  43.7 dB  max  5  mean 1.44 | all: PSNR  43.7 dB  max   6 | edge band  8.9%
+label/photo.jpg-under-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  49.0 dB  max  5  mean 0.53 | all: PSNR  48.8 dB  max   5 | edge band 12.9%
+label/photo.webp-under-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  46.5 dB  max  5  mean 0.86 | all: PSNR  46.6 dB  max   5 | edge band 12.9%
 label/png-logo-translucent-over-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  44.3 dB  max  5  mean 1.42 | all: PSNR  44.3 dB  max   5 | edge band  2.1%
 label/png-logo-under-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  43.6 dB  max  5  mean 1.56 | all: PSNR  43.6 dB  max   5 | edge band  4.7%
 label/sd-untagged-under-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  47.6 dB  max  5  mean 0.61 | all: PSNR  47.7 dB  max   5 | edge band 15.7%
@@ -14,6 +17,7 @@ label/untagged-hd-over-709   t=0.5     640x360 layers=2 flat: PSNR  46.2 dB  max
 label/untagged-hd-over-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  46.9 dB  max  5  mean 0.85 | all: PSNR  46.8 dB  max   5 | edge band 16.6%
 label/untagged-hd-translucent-over-709 t=0.5     640x360 layers=2 flat: PSNR  47.0 dB  max  5  mean 0.90 | all: PSNR  46.8 dB  max   7 | edge band 19.8%
 label/untagged-hd-under-sd-untagged t=0.5     640x360 layers=2 flat: PSNR  44.5 dB  max  5  mean 1.27 | all: PSNR  44.6 dB  max   5 | edge band  8.2%
+label/webcam.mkv-under-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  48.8 dB  max  5  mean 0.55 | all: PSNR  48.6 dB  max   5 | edge band 14.8%
 proxy/709-over-untagged-hd   t=0.5     640x360 layers=2 flat: PSNR  44.3 dB  max  5  mean 1.31 | all: PSNR  44.4 dB  max   5 | edge band  9.4%
 proxy/hlg-tone-mapped-over-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  43.8 dB  max  5  mean 1.42 | all: PSNR  43.8 dB  max   5 | edge band  9.4%
 proxy/sd-untagged-over-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  44.5 dB  max  5  mean 1.26 | all: PSNR  44.6 dB  max   5 | edge band  8.1%
@@ -21,11 +25,13 @@ proxy/untagged-hd-over-709   t=0.5     640x360 layers=2 flat: PSNR  46.2 dB  max
 proxy/untagged-hd-over-hlg-tone-mapped t=0.5     640x360 layers=2 flat: PSNR  44.4 dB  max  5  mean 1.33 | all: PSNR  44.4 dB  max   5 | edge band 17.2%
 proxy/untagged-hd-translucent-over-709 t=0.5     640x360 layers=2 flat: PSNR  47.0 dB  max  5  mean 0.90 | all: PSNR  46.8 dB  max   5 | edge band 19.9%
 
-== FFmpeg 6.1.1 (FixedBt601)
+== FFmpeg 6.1.1 (FixedBt601): 28 rows
 label/709-over-sd-untagged   t=0.5     640x360 layers=2 flat: PSNR  51.0 dB  max  5  mean 0.36 | all: PSNR  50.0 dB  max   5 | edge band 22.5%
 label/709-over-untagged-hd   t=0.5     640x360 layers=2 flat: PSNR  44.8 dB  max  5  mean 1.22 | all: PSNR  44.8 dB  max   5 | edge band  9.4%
 label/709-translucent-over-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  44.3 dB  max  5  mean 1.34 | all: PSNR  44.3 dB  max   5 | edge band  8.9%
 label/hd-2020-over-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  44.8 dB  max  5  mean 1.23 | all: PSNR  44.9 dB  max   5 | edge band  9.4%
+label/photo.jpg-under-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  46.6 dB  max  5  mean 0.86 | all: PSNR  46.6 dB  max   5 | edge band 12.9%
+label/photo.webp-under-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  46.5 dB  max  5  mean 0.86 | all: PSNR  46.6 dB  max   5 | edge band 12.9%
 label/png-logo-translucent-over-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  44.3 dB  max  5  mean 1.42 | all: PSNR  44.3 dB  max   5 | edge band  2.1%
 label/png-logo-under-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  43.6 dB  max  5  mean 1.56 | all: PSNR  43.6 dB  max   5 | edge band  4.7%
 label/png-logo-under-untagged-hd-and-709 t=0.5     640x360 layers=3 flat: PSNR  44.1 dB  max  5  mean 1.42 | all: PSNR  44.2 dB  max   5 | edge band 11.6%
@@ -40,6 +46,7 @@ label/untagged-hd-over-sd-601 t=0.5     640x360 layers=2 flat: PSNR  47.6 dB  ma
 label/untagged-hd-over-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  46.9 dB  max  5  mean 0.85 | all: PSNR  46.8 dB  max   5 | edge band 16.6%
 label/untagged-hd-translucent-over-709 t=0.5     640x360 layers=2 flat: PSNR  47.9 dB  max  6  mean 0.79 | all: PSNR  47.4 dB  max   6 | edge band 19.7%
 label/untagged-hd-under-sd-untagged t=0.5     640x360 layers=2 flat: PSNR  44.5 dB  max  5  mean 1.27 | all: PSNR  44.6 dB  max   5 | edge band  8.2%
+label/webcam.mkv-under-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  46.5 dB  max  5  mean 0.87 | all: PSNR  46.6 dB  max   5 | edge band 14.9%
 proxy/709-over-untagged-hd   t=0.5     640x360 layers=2 flat: PSNR  44.8 dB  max  5  mean 1.22 | all: PSNR  44.8 dB  max   5 | edge band  9.4%
 proxy/hlg-tone-mapped-over-untagged-hd t=0.5     640x360 layers=2 flat: PSNR  44.6 dB  max  5  mean 1.25 | all: PSNR  44.6 dB  max   5 | edge band  9.5%
 proxy/sd-untagged-over-709   t=0.5     640x360 layers=2 flat: PSNR  49.7 dB  max  4  mean 0.60 | all: PSNR  48.8 dB  max   5 | edge band 22.7%
@@ -49,13 +56,13 @@ proxy/untagged-hd-over-hlg-tone-mapped t=0.5     640x360 layers=2 flat: PSNR  46
 proxy/untagged-hd-translucent-over-709 t=0.5     640x360 layers=2 flat: PSNR  47.9 dB  max  5  mean 0.79 | all: PSNR  47.4 dB  max   6 | edge band 19.8%
 
 == tests/motion_parity.rs (the Motion plan against the export's own frames, planes in levels of 255; bound Y 2 / UV 2 for the scaled translucent HD layer)
+FFmpeg 9.0.2:
+  label/translucent-untagged-hd-alone          frames   0..30  layers<=1 | Y: max  1 differing  150446 PSNR  64.8 dB | UV: max  2 differing  827253 PSNR  54.3 dB
+  label/translucent-untagged-hd-before-a-709-clip frames   0..60  layers<=2 | Y: max  2 differing  311802 PSNR  64.6 dB | UV: max  2 differing  389890 PSNR  60.6 dB
+  label/translucent-untagged-hd-over-a-709-clip frames   0..60  layers<=2 | Y: max  2 differing  417820 PSNR  63.3 dB | UV: max  2 differing  493392 PSNR  59.6 dB
 FFmpeg 6.1.1:
   label/translucent-untagged-hd-alone          frames   0..30  layers<=1 | Y: max  1 differing  150467 PSNR  64.8 dB | UV: max  2 differing  827277 PSNR  54.3 dB
   label/translucent-untagged-hd-before-a-709-clip frames   0..60  layers<=2 | Y: max  1 differing  268876 PSNR  65.2 dB | UV: max  2 differing 1069895 PSNR  56.2 dB
   label/translucent-untagged-hd-over-a-709-clip frames   0..60  layers<=2 | Y: max  2 differing  386824 PSNR  63.6 dB | UV: max  2 differing  578594 PSNR  58.9 dB
-FFmpeg 9.0.2:
-  label/translucent-untagged-hd-before-a-709-clip frames   0..60  layers<=2 | Y: max  2 differing  311802 PSNR  64.6 dB | UV: max  2 differing  389890 PSNR  60.6 dB
-  label/translucent-untagged-hd-over-a-709-clip frames   0..60  layers<=2 | Y: max  2 differing  417820 PSNR  63.3 dB | UV: max  2 differing  493392 PSNR  59.6 dB
-  label/translucent-untagged-hd-alone          frames   0..30  layers<=1 | Y: max  1 differing  150446 PSNR  64.8 dB | UV: max  2 differing  827253 PSNR  54.3 dB
 
-Negative controls (done by hand, not kept): the plan's labelled layer read as BT.601 again -> 9.0.2 refuses the frames as MixedMatrices; 6.1.1 draws them 8 levels of Y / 5 of UV off (translucent-untagged-hd-over-709 as a Still: 37.4 dB, max 15).
+Negative controls (by hand, not kept): the plan's labelled layer read as BT.601 again -> 9.0.2 refuses the frames as MixedMatrices; 6.1.1 draws them 8 levels of Y / 5 of UV off (translucent HD over a BT.709 clip as a Still: 37.4 dB, max 15). The old tag rule (a decoder's default counted) fails the unit kit, the golden metamorphic test (3698 disagreements over the corpus) and a_decoders_default_tag_labels_nothing_beside_untagged_hd.

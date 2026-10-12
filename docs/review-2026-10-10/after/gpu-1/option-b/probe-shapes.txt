@@ -1,0 +1,50 @@
+What Project::probe_asset gives for real files (tools/mkshapes.sh, 1280x720; DV is 720x576). Identical on FFmpeg 9.0.2 and 6.1.1 except ffv1-rgb.mkv's tag (gbr on 9.0.2, none on 6.1.1).
+Tags that are the decoder's default, not the file's word: gbr on every PNG (rgb24, rgba, gray) and on RGB video; bt470bg on JPEG, WebP and MJPEG video.
+
+== FFmpeg 9.0.2
+alpha.mkv                codec=ffv1       pix_fmt=yuva420p       color_space=-            image=false 1280x720 transfer=None
+dv.dv                    codec=dvvideo    pix_fmt=yuv420p        color_space=-            image=false 720x576 transfer=None
+ffv1-rgb.mkv             codec=ffv1       pix_fmt=bgr0           color_space=gbr          image=false 1280x720 transfer=None
+ffv1.mkv                 codec=ffv1       pix_fmt=yuv420p        color_space=-            image=false 1280x720 transfer=None
+grey.png                 codec=png        pix_fmt=gray           color_space=gbr          image=true  1280x720 transfer=None
+h264-rgb.mp4             codec=h264       pix_fmt=gbrp           color_space=gbr          image=false 1280x720 transfer=None
+h264-yuvj.mp4            codec=h264       pix_fmt=yuvj420p       color_space=-            image=false 1280x720 transfer=None
+h264.mp4                 codec=h264       pix_fmt=yuv420p        color_space=-            image=false 1280x720 transfer=None
+image.bmp                codec=bmp        pix_fmt=bgr24          color_space=-            image=true  1280x720 transfer=None
+image.tiff               codec=tiff       pix_fmt=rgb24          color_space=-            image=true  1280x720 transfer=None
+logo-rgb24.png           codec=png        pix_fmt=rgb24          color_space=gbr          image=true  1280x720 transfer=None
+logo-rgba.png            codec=png        pix_fmt=rgba           color_space=gbr          image=true  1280x720 transfer=None
+mpeg2.mpg                codec=mpeg2video pix_fmt=yuv420p        color_space=-            image=false 1280x720 transfer=None
+pal8.gif                 codec=gif        pix_fmt=bgra           color_space=-            image=true  1280x720 transfer=None
+photo.avif               codec=av1        pix_fmt=yuv420p        color_space=-            image=false 1280x720 transfer=None
+photo.jpg                codec=mjpeg      pix_fmt=yuvj420p       color_space=bt470bg      image=true  1280x720 transfer=None
+photo.webp               codec=webp       pix_fmt=yuv420p        color_space=bt470bg      image=true  1280x720 transfer=None
+prores.mov               codec=prores     pix_fmt=yuv422p10le    color_space=-            image=false 1280x720 transfer=None
+raw.avi                  codec=rawvideo   pix_fmt=yuyv422        color_space=-            image=false 1280x720 transfer=None
+vp9.webm                 codec=vp9        pix_fmt=yuv420p        color_space=-            image=false 1280x720 transfer=None
+webcam.mkv               codec=mjpeg      pix_fmt=yuvj420p       color_space=bt470bg      image=false 1280x720 transfer=None
+webcam422.avi            codec=mjpeg      pix_fmt=yuvj422p       color_space=bt470bg      image=false 1280x720 transfer=None
+
+== FFmpeg 6.1.1
+alpha.mkv                codec=ffv1       pix_fmt=yuva420p       color_space=-            image=false 1280x720 transfer=None
+dv.dv                    codec=dvvideo    pix_fmt=yuv420p        color_space=-            image=false 720x576 transfer=None
+ffv1-rgb.mkv             codec=ffv1       pix_fmt=bgr0           color_space=gbr          image=false 1280x720 transfer=None
+ffv1.mkv                 codec=ffv1       pix_fmt=yuv420p        color_space=-            image=false 1280x720 transfer=None
+grey.png                 codec=png        pix_fmt=gray           color_space=gbr          image=true  1280x720 transfer=None
+h264-rgb.mp4             codec=h264       pix_fmt=gbrp           color_space=gbr          image=false 1280x720 transfer=None
+h264-yuvj.mp4            codec=h264       pix_fmt=yuvj420p       color_space=-            image=false 1280x720 transfer=None
+h264.mp4                 codec=h264       pix_fmt=yuv420p        color_space=-            image=false 1280x720 transfer=None
+image.bmp                codec=bmp        pix_fmt=bgr24          color_space=-            image=true  1280x720 transfer=None
+image.tiff               codec=tiff       pix_fmt=rgb24          color_space=-            image=true  1280x720 transfer=None
+logo-rgb24.png           codec=png        pix_fmt=rgb24          color_space=gbr          image=true  1280x720 transfer=None
+logo-rgba.png            codec=png        pix_fmt=rgba           color_space=gbr          image=true  1280x720 transfer=None
+mpeg2.mpg                codec=mpeg2video pix_fmt=yuv420p        color_space=-            image=false 1280x720 transfer=None
+pal8.gif                 codec=gif        pix_fmt=bgra           color_space=-            image=true  1280x720 transfer=None
+photo.avif               codec=av1        pix_fmt=yuv420p        color_space=-            image=false 1280x720 transfer=None
+photo.jpg                codec=mjpeg      pix_fmt=yuvj420p       color_space=bt470bg      image=true  1280x720 transfer=None
+photo.webp               codec=webp       pix_fmt=yuv420p        color_space=bt470bg      image=true  1280x720 transfer=None
+prores.mov               codec=prores     pix_fmt=yuv422p10le    color_space=-            image=false 1280x720 transfer=None
+raw.avi                  codec=rawvideo   pix_fmt=yuyv422        color_space=-            image=false 1280x720 transfer=None
+vp9.webm                 codec=vp9        pix_fmt=yuv420p        color_space=-            image=false 1280x720 transfer=None
+webcam.mkv               codec=mjpeg      pix_fmt=yuvj420p       color_space=bt470bg      image=false 1280x720 transfer=None
+webcam422.avi            codec=mjpeg      pix_fmt=yuvj422p       color_space=bt470bg      image=false 1280x720 transfer=None

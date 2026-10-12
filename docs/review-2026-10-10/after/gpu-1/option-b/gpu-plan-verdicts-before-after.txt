@@ -1,45 +1,88 @@
-Would the GPU compositor draw this stack? RenderPlan::at (a Still plan, 640x360 canvas, t = 0.5, GpuCaps::A0 refusals), 'main' = origin/main 255ac36's plan, 'label' = rule R.
+Would the GPU compositor draw this stack? RenderPlan::at (a Still plan, 640x360 canvas, t = 0.5, GpuCaps::A0 refusals), 'main' = origin/main 255ac36 built and run, 'label' = branch gpu-1b.
 'orig' = the originals; 'prev' = the preview's assets (proxy path, original metadata). Stacks are two clips, the subject (untagged 1280x720 HD) over / under another kind; 'single-*' are the subject alone.
-Refusals unrelated to the matrix (a text overlay, alpha, an RGB picture that has to be resized, an HDR original) are the same before and after.
+The real-file kinds (jpeg, webp, png-rgba, png-gray, png-rgb, mjpeg) are files from tools/mkshapes.sh probed by Project::probe_asset: their tags are the decoders' defaults and the verdict does not move.
+Refusals unrelated to the matrix (a text overlay, alpha, an RGB picture that has to be resized, full-range pictures, an HDR original) are the same before and after.
+The plan reads asset facts only, so the 9.0.2 and 6.1.1 runs of the harness give the same lines (checked).
 
-== policy BottomLayerTag  (FFmpeg 9.0.2)
+== policy BottomLayerTag  (FFmpeg 9.0.2): cases whose verdict moved
   orig hd-over-hd601              drawn                                        -> refused: layers tagged with different YCbCr matr
   orig hd-over-sd601              drawn                                        -> refused: layers tagged with different YCbCr matr
   orig mixed-709-opacity-over     refused: layers tagged with different YCbCr  -> drawn
+  orig mixed-dissolve             refused: layer 1 (u.mp4): inside a dissolve; -> refused: layer 1 (u.mp4): inside a dissolve
+  orig mixed-fade                 refused: layer 1 (u.mp4): inside its fade-in -> refused: layer 1 (u.mp4): inside its fade-in
+  orig mixed-grade                refused: layers tagged with different YCbCr  -> drawn
+  orig mixed-mask                 refused: layer 1 (u.mp4): mask; layers tagge -> refused: layer 1 (u.mp4): mask
   orig mixed-over-709             refused: layers tagged with different YCbCr  -> drawn
   orig mixed-over-709-opacity     refused: layers tagged with different YCbCr  -> drawn
+  orig mixed-rotate               refused: layers tagged with different YCbCr  -> drawn
+  orig mixed-text                 refused: a text overlay is live; layers tagg -> refused: a text overlay is live
   orig mixed-under-709            refused: layers tagged with different YCbCr  -> drawn
   prev hd-over-hd601              drawn                                        -> refused: layers tagged with different YCbCr matr
   prev hd-over-sd601              drawn                                        -> refused: layers tagged with different YCbCr matr
   prev mixed-709-opacity-over     refused: layers tagged with different YCbCr  -> drawn
+  prev mixed-dissolve             refused: layer 1 (u.mp4): inside a dissolve; -> refused: layer 1 (u.mp4): inside a dissolve
+  prev mixed-fade                 refused: layer 1 (u.mp4): inside its fade-in -> refused: layer 1 (u.mp4): inside its fade-in
+  prev mixed-grade                refused: layers tagged with different YCbCr  -> drawn
+  prev mixed-mask                 refused: layer 1 (u.mp4): mask; layers tagge -> refused: layer 1 (u.mp4): mask
   prev mixed-over-709             refused: layers tagged with different YCbCr  -> drawn
   prev mixed-over-709-opacity     refused: layers tagged with different YCbCr  -> drawn
   prev mixed-over-hlg             refused: layers tagged with different YCbCr  -> drawn
+  prev mixed-rotate               refused: layers tagged with different YCbCr  -> drawn
+  prev mixed-text                 refused: a text overlay is live; layers tagg -> refused: a text overlay is live
   prev mixed-under-709            refused: layers tagged with different YCbCr  -> drawn
   prev mixed-under-hlg            refused: layers tagged with different YCbCr  -> drawn
 
-== policy FixedBt601  (FFmpeg 6.1.1)
+== policy FixedBt601  (FFmpeg 6.1.1): cases whose verdict moved
 
-== policy Unknown  (a probe that could not tell)
+== policy Unknown  (a probe that could not tell): cases whose verdict moved
   orig hd-over-hd601              drawn                                        -> refused: layers tagged with different YCbCr matr
   orig hd-over-sd601              drawn                                        -> refused: layers tagged with different YCbCr matr
   orig mixed-709-opacity-over     refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
+  orig mixed-dissolve             refused: layer 1 (u.mp4): inside a dissolve; -> refused: layer 1 (u.mp4): inside a dissolve; a B
+  orig mixed-fade                 refused: layer 1 (u.mp4): inside its fade-in -> refused: layer 1 (u.mp4): inside its fade-in; a 
+  orig mixed-grade                refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
+  orig mixed-mask                 refused: layer 1 (u.mp4): mask; layers tagge -> refused: layer 1 (u.mp4): mask; a Bt709 stack, a
   orig mixed-over-709             refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
   orig mixed-over-709-opacity     refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
+  orig mixed-rotate               refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
+  orig mixed-text                 refused: a text overlay is live; layers tagg -> refused: a text overlay is live; a Bt709 stack, 
   orig mixed-under-709            refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
   prev hd-over-hd601              drawn                                        -> refused: layers tagged with different YCbCr matr
   prev hd-over-sd601              drawn                                        -> refused: layers tagged with different YCbCr matr
   prev mixed-709-opacity-over     refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
+  prev mixed-dissolve             refused: layer 1 (u.mp4): inside a dissolve; -> refused: layer 1 (u.mp4): inside a dissolve; a B
+  prev mixed-fade                 refused: layer 1 (u.mp4): inside its fade-in -> refused: layer 1 (u.mp4): inside its fade-in; a 
+  prev mixed-grade                refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
+  prev mixed-mask                 refused: layer 1 (u.mp4): mask; layers tagge -> refused: layer 1 (u.mp4): mask; a Bt709 stack, a
   prev mixed-over-709             refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
   prev mixed-over-709-opacity     refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
   prev mixed-over-hlg             refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
+  prev mixed-rotate               refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
+  prev mixed-text                 refused: a text overlay is live; layers tagg -> refused: a text overlay is live; a Bt709 stack, 
   prev mixed-under-709            refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
   prev mixed-under-hlg            refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
 
-Drawn among the 16 non-single cases (before -> after):
-  orig BottomLayerTag   5 ->  7   refused->drawn 4, drawn->refused 2
-  orig FixedBt601      10 -> 10   refused->drawn 0, drawn->refused 0
-  orig Unknown          5 ->  3   refused->drawn 0, drawn->refused 2
-  prev BottomLayerTag   5 ->  9   refused->drawn 6, drawn->refused 2
-  prev FixedBt601      12 -> 12   refused->drawn 0, drawn->refused 0
-  prev Unknown          5 ->  3   refused->drawn 0, drawn->refused 2
+Drawn among the 35 non-single cases (before -> after):
+  orig BottomLayerTag  11 -> 15   refused->drawn 6, drawn->refused 2
+  orig FixedBt601      20 -> 20   refused->drawn 0, drawn->refused 0
+  orig Unknown         11 ->  9   refused->drawn 0, drawn->refused 2
+  prev BottomLayerTag  11 -> 17   refused->drawn 8, drawn->refused 2
+  prev FixedBt601      22 -> 22   refused->drawn 0, drawn->refused 0
+  prev Unknown         11 ->  9   refused->drawn 0, drawn->refused 2
+
+Real decoder-default shapes (14 cases: hd-over-jpeg, hd-over-mjpeg, hd-over-png-gray, hd-over-png-rgb, hd-over-png-rgba, hd-over-webp, jpeg-over-hd, mjpeg-over-709, mjpeg-over-hd, png-gray-over-hd, png-over-hd, png-rgb-over-hd, png-rgba-over-hd, webp-over-hd):
+  verdict unchanged under every policy, orig and prev: True
+    hd-over-jpeg         Bottom=drawn  FixedB=drawn  Unknow=drawn
+    hd-over-mjpeg        Bottom=drawn  FixedB=drawn  Unknow=drawn
+    hd-over-png-gray     Bottom=refused  FixedB=drawn  Unknow=refused
+    hd-over-png-rgb      Bottom=refused  FixedB=refused  Unknow=refused
+    hd-over-png-rgba     Bottom=refused  FixedB=refused  Unknow=refused
+    hd-over-webp         Bottom=drawn  FixedB=drawn  Unknow=drawn
+    jpeg-over-hd         Bottom=drawn  FixedB=drawn  Unknow=drawn
+    mjpeg-over-709       Bottom=refused  FixedB=drawn  Unknow=refused
+    mjpeg-over-hd        Bottom=drawn  FixedB=drawn  Unknow=drawn
+    png-gray-over-hd     Bottom=refused  FixedB=drawn  Unknow=refused
+    png-over-hd          Bottom=refused  FixedB=refused  Unknow=refused
+    png-rgb-over-hd      Bottom=refused  FixedB=refused  Unknow=refused
+    png-rgba-over-hd     Bottom=refused  FixedB=refused  Unknow=refused
+    webp-over-hd         Bottom=drawn  FixedB=drawn  Unknow=drawn

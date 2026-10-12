@@ -2,6 +2,8 @@
 //   cargo build -p kerf-core --no-default-features --example gpu1b_explore
 //   gpu1b_explore <media dir from mkmedia.sh> <out dir> <subject: u.mp4 (untagged) | t.mp4 (tagged bt709)>
 // PLANONLY=1 prints only the GPU plan's verdicts ("PLAN case orig|prev policy drawn|refused: why") per policy.
+// KERF_ARGV_LOG=<file> appends a "#CASE name kind" marker before each case; point KERF_FFMPEG at ffwrap.sh to have every
+// ffmpeg argv logged beneath it (argv-diff.py then compares two builds' argv, case by case).
 // Compare two builds (main and the label) by running it from each; `cmp.py` tabulates PSNR / worst level error.
 use kerf_core::*;
 use std::path::{Path, PathBuf};
@@ -57,6 +59,19 @@ fn main() {
     let rgb = probe("rgb.mkv");
     let mjpeg = probe("mjpeg.mkv");
     let alpha = probe("alpha.mkv");
+    // Real files whose tag is the decoder's default (mkshapes.sh; copy them next to the clips).
+    let shapes: Vec<(&str, Asset)> = [
+        ("jpeg", "photo.jpg"),
+        ("webp", "photo.webp"),
+        ("png-rgba", "logo-rgba.png"),
+        ("png-gray", "grey.png"),
+        ("png-rgb", "logo-rgb24.png"),
+        ("mjpeg", "webcam.mkv"),
+    ]
+    .into_iter()
+    .filter(|(_, f)| dir.join(f).exists())
+    .map(|(n, f)| (n, probe(f)))
+    .collect();
     let mut cases: Vec<(&str, Build)> = Vec::new();
     cases.push(("single-opaque", Box::new(|t| (tl(vec![vec![clip(t, |_| {})]], vec![]), vec![t.clone()]))));
     cases.push(("single-pip", Box::new(|t| (tl(vec![vec![clip(t, pip)]], vec![]), vec![t.clone()]))));
@@ -105,12 +120,68 @@ fn main() {
         let second = clip(t, |c| { c.source_in = 0.3; c.source_out = 1.0; c.timeline_start = 0.3; });
         (tl(vec![vec![first, second]], vec![]), vec![b1.clone(), t.clone()])
     })));
+    for (name, shape) in &shapes {
+        let image = shape.is_image();
+        let name: &'static str = Box::leak(name.to_string().into_boxed_str());
+        let (over, under): (&'static str, &'static str) = (
+            Box::leak(format!("hd-over-{name}").into_boxed_str()),
+            Box::leak(format!("{name}-over-hd").into_boxed_str()),
+        );
+        let (a, b) = (shape.clone(), shape.clone());
+        cases.push((over, Box::new(move |t| (tl(vec![vec![clip(&a, |c| if image { c.source_out = 1.0 })], vec![clip(t, pip)]], vec![]), vec![a.clone(), t.clone()]))));
+        cases.push((under, Box::new(move |t| (tl(vec![vec![clip(t, |_| {})], vec![clip(&b, |c| { pip(c); if image { c.source_out = 1.0 } })]], vec![]), vec![t.clone(), b.clone()]))));
+    }
+    // What a mixed stack's label does to the rest of a clip's chain (the FFmpeg 6.1 question).
+    let b1 = b.clone();
+    cases.push(("mixed-text", Box::new(move |t| {
+        let mut o = TextOverlay::new("Colour", 0.0, 1.0);
+        o.color = "#ff2010".into();
+        o.pos_y = 0.5;
+        (tl(vec![vec![clip(&b1, |_| {})], vec![clip(t, pip)]], vec![o]), vec![b1.clone(), t.clone()])
+    })));
+    let b1 = b.clone();
+    cases.push(("mixed-fade", Box::new(move |t| (tl(vec![vec![clip(&b1, |_| {})], vec![clip(t, |c| { pip(c); c.fade_in = 0.8 })]], vec![]), vec![b1.clone(), t.clone()]))));
+    let b1 = b.clone();
+    cases.push(("mixed-grade", Box::new(move |t| (tl(vec![vec![clip(&b1, |_| {})], vec![clip(t, |c| { pip(c); c.color = Color { saturation: 1.4, brightness: 0.05, ..Color::default() } })]], vec![]), vec![b1.clone(), t.clone()]))));
+    let b1 = b.clone();
+    cases.push(("mixed-rotate", Box::new(move |t| (tl(vec![vec![clip(&b1, |_| {})], vec![clip(t, |c| { pip(c); c.transform.rotation = 12.0 })]], vec![]), vec![b1.clone(), t.clone()]))));
+    let b1 = b.clone();
+    cases.push(("mixed-mask", Box::new(move |t| (tl(vec![vec![clip(&b1, |_| {})], vec![clip(t, |c| { pip(c); c.mask = Some(serde_json::from_str::<Mask>("{}").unwrap()) })]], vec![]), vec![b1.clone(), t.clone()]))));
+    let b1 = b.clone();
+    cases.push(("mixed-vignette", Box::new(move |t| (tl(vec![vec![clip(&b1, |_| {})], vec![clip(t, |c| { pip(c); c.effects.push(VideoEffect::Vignette) })]], vec![]), vec![b1.clone(), t.clone()]))));
+    let b1 = b.clone();
+    cases.push(("mixed-dissolve", Box::new(move |t| {
+        let first = clip(&b1, |c| { c.source_in = 0.0; c.source_out = 0.6; });
+        let second = clip(t, |c| {
+            c.source_in = 0.0;
+            c.source_out = 0.6;
+            c.timeline_start = 0.5;
+            c.transition_in = Some(Transition { kind: TransitionKind::Crossfade, duration: 0.4 });
+        });
+        (tl(vec![vec![first, second]], vec![]), vec![b1.clone(), t.clone()])
+    })));
+    let b1 = b.clone();
+    cases.push(("mixed-dip-white", Box::new(move |t| {
+        let first = clip(&b1, |c| { c.source_in = 0.0; c.source_out = 0.3; });
+        let second = clip(t, |c| {
+            c.source_in = 0.0;
+            c.source_out = 0.7;
+            c.timeline_start = 0.3;
+            c.transition_in = Some(Transition { kind: TransitionKind::DipToWhite, duration: 0.6 });
+        });
+        (tl(vec![vec![first, second]], vec![]), vec![b1.clone(), t.clone()])
+    })));
     let only = std::env::var("ONLY").ok();
     for (name, build) in &cases {
         if only.as_deref().is_some_and(|o| !name.contains(o)) {
             continue;
         }
         for kind in ["orig", "prev"] {
+            if let Some(log) = std::env::var_os("KERF_ARGV_LOG") {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap();
+                writeln!(f, "#CASE {name} {kind}").unwrap();
+            }
             let (timeline, mut assets) = build(&top);
             if kind == "prev" {
                 assets = assets.iter().map(proxied).collect();
