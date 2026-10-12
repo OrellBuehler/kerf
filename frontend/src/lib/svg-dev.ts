@@ -166,10 +166,7 @@ function checkRect(o: Pick<SvgOverlay, 'x' | 'y' | 'width' | 'height' | 'opacity
 	if (opacity < 0 || opacity > 1) throw new Error('opacity must be within 0.0..=1.0');
 }
 
-/** A title's name to show: its own, else a preset's text, else a placeholder. */
-export function svgDisplayName(o: Pick<SvgOverlay, 'name' | 'preset'>): string {
-	return o.name.trim() || o.preset?.params.text || 'SVG';
-}
+export { svgDisplayName } from './svg-titles';
 
 /** `add_svg_overlay` over a timeline object. A title with no `end` runs four seconds. */
 export function addSvgOverlayTo(

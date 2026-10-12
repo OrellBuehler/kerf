@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { contrastRatio, mixSrgb } from './contrast';
 import { posix, SRC, uiSources } from './test-sources';
 import { PRESET_IDS, PRESETS, SUPERSEDED_KERF_LIGHT, type ColorToken } from './theme';
-import { GENERATED_TITLE_FILL } from './titles';
+import { GENERATED_TITLE_FILL, SVG_TITLE_FILL } from './titles';
 import { NAME_CHIP_PCT } from './clip-label';
 
 // Two guards that keep "every color is themable" and "every theme is readable"
@@ -439,6 +439,15 @@ describe('contrast', () => {
 			const fill = resolveMix(GENERATED_TITLE_FILL, c);
 			const ratio = contrastRatio(c['text-on-video'], fill);
 			expect(ratio, `text-on-video ${c['text-on-video']} on the generated fill ${fill}`).toBeGreaterThanOrEqual(READING);
+		});
+	}
+
+	for (const id of PRESET_IDS) {
+		test(`${PRESETS[id].name}: an animated title's block keeps its label readable`, () => {
+			const c = PRESETS[id].colors;
+			const fill = resolveMix(SVG_TITLE_FILL, c);
+			const ratio = contrastRatio(c['text-on-video'], fill);
+			expect(ratio, `text-on-video ${c['text-on-video']} on the animated title fill ${fill}`).toBeGreaterThanOrEqual(READING);
 		});
 	}
 

@@ -1322,3 +1322,33 @@ harness swaps in text, colours and font and does not re-time it, and custom SVG 
 `kerf-core/src/svg/presets.rs` fails `svg_preset_fixture_is_what_this_engine_does` until
 `KERF_BLESS_SVG_PRESETS=1 cargo test -p kerf-core --no-default-features -- svg_preset_fixture` rewrites it;
 `api-svg.test.ts` drives the harness.
+
+**Animated SVG titles in the editor.** The engine draws the artwork (resvg, into every preview and export frame), so the
+page **never inlines the SVG** — `svg-titles.test.ts` fails on any `{@html}` / `innerHTML` in `src/` — and shows it only as an
+`<img>` data URL (`svgDataUrl`; the CSP's `img-src` has `data:`) for a preset's thumbnail. `svg-titles.ts` is the pure side
+(bun-tested): the four presets' labels / hints / sample text (held to `fixtures/svg-presets.json`), `svgDisplayName`, the sample
+document a new custom title starts from (`sampleSvg`: a gold plate sliding in, viewBox = the delivery frame, named colours only),
+and the placement box maths (`dragRect` / `roundRect` / `rectPatch`). **State**: `editor.svgOverlays` (a getter over
+`timeline.svg_overlays`, so it is live under the bun runes stand-in), `selectedSvgOverlayId` — exclusive with the clip and text-title
+selections (`selectSvgOverlay` / `selectOverlay` / `selectClip` … each clear the others), pruned in `#setTimeline` when an undo or
+agent edit removes it — and `addSvgOverlay` / `addSvgTitle` (selects what it made) / `updateSvgOverlay` / `removeSvgOverlay`. **Add**:
+the Titles controls' `ANIMATED` section (also the Inspector's *Titles lane*) is a `+ Animated` button that opens tiles of the four
+presets with thumbnails (`presetThumbnail`: `svg_preset_preview` drawn for 600 s so the browser's own SMIL player plays the entrance
+and holds it, replayed on hover; cached per frame shape; the thumbnail span is `pointer-events:none` — replacing the `<img>` under a
+pressed pointer swallowed the click) and `Custom SVG…` (`addCustomSvgTitle`: the sample, selected, and `ui.svgSourceFocus` makes the
+Inspector open and focus its source box). Every new one starts at the playhead; the lane's right-click menu offers the same. **Inspector**
+(a selected animated title replaces the clip sections, like a text title): Timing (name, start, end), Placement (x / y / width /
+height / opacity — fractions of the frame, shown as percentages; the artwork is fitted "contain" and centred inside), then a **Preset**
+section — kind chips, text, subtitle / colour / accent / font only for the parameters `list_svg_presets` says that kind takes, and
+*Convert to custom* (`update_svg_overlay` with the title's own `svg`, which drops the preset) — or, for custom artwork, a monospace **SVG
+source** textarea with Apply / Revert: Apply asks `validate_svg` first (a refusal is shown under the box and nothing is written), writes
+one `update_svg_overlay`, and lists the warnings the engine could not honour (mutating commands do not return them). **A preset patch
+always carries every parameter** (the backend fills a missing one with its default, so `{text}` alone would reset the colours), and
+a refused field edit puts the field back. The patch has no preset *kind*, so the chips make a new title with the same text / timing /
+placement / name and remove the old (`changePreset`: two revisions, a new id) — a `preset_kind` in the patch would make it one edit.
+**Preview**: the selected animated title at the playhead (paused) gets a placement box over its rectangle in the same layer as the
+title boxes (drag to move, corner handles to resize with the opposite corner held, one `update_svg_overlay` on release, Escape /
+pointercancel / lost capture / blur abandon; `data-svg-box`, never the artwork), and counts toward `titlesShown`, so it routes the
+preview like a title. Delete removes it with an Undo toast. **Review**: `staged-diff.ts` marks an animated title by its
+`overlay_id` like a text title, and resolves an `overlay_removed` against `svg_overlays` too (the ghost's `svg` flag, named by
+`svgDisplayName`). Wiring is held by `svg-wiring.test.ts`, the actions by `title-actions-svg.test.ts`, the state by `state-svg.test.ts`.
