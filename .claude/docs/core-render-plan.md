@@ -359,16 +359,18 @@
     one matrix and are drawn on 9.0.2 (they were refused), and untagged HD beside `smpte170m` / `bt470bg` / `bt2020nc`
     footage is BT.709 against BT.601 / BT.2020 and refused (it was drawn as BT.601 throughout). `Unknown` still
     refuses any stack that is not BT.601. `reserved` reads as no tag (`PlanStream::matrix`, `known_color`). A PNG's `gbr` and the
-    `bt470bg` of a JPEG, a WebP and the `mjpeg`, `amv` and `speedhq` decoders are decoders' defaults and name no matrix, so a logo,
+    `bt470bg` of a JPEG, a WebP and the `mjpeg`, `amv`, `speedhq`, `jpegls` (and their decode-only relatives) decoders are decoders' defaults and name no matrix, so a logo,
     a photo or a webcam clip beside HD labels nothing and the plan reads those stacks as it did (a full-range H.264 clip's
     stated `bt709` is the file's word and does label).
     **An accepted difference**: the plan's decision is the cut's (a Motion plan) or the layers' on screen (a Still), while the
     FFmpeg stream a handover starts (`SpanPlan::handover`, a `Timeline::slice` from `stream_start`) decides over its own
     clips; where the slice drops the matrix-naming clip, a translucent HD layer or a dip to white in the stream is read as
-    BT.601 where the plan drew it as BT.709 (the label's own effect on such a layer: a translucent one up to 2 levels on 9.0.2 and
-    10 to 16 on 6.1, a dip to white 2 on 9.0.2 and 15 on 6.1: the dip is `yuv420p -> rgb24 -> yuv420p`, which reads the matrix the label
-    states). The same label is what moves an HD clip's dip in the export on FFmpeg 6.1 (32.3 dB, 11 levels over main); it equals the file
-    tagged BT.709, which the plan draws (`a_labelled_hd_clip_dips_through_white_with_the_bt709_round_trip`). Opaque pictures are identical.
+    BT.601 where the plan drew it as BT.709 (the label's own effect on such a layer, the clip alone labelled against not: a translucent
+    one 1 level in the export on 9.0.2 and 8 to 14 on 6.1.1 (export 8, still 14, stream 11, scrub window 14), coloured text 16 levels on its
+    pixels on 9.0.2 and none on 6.1.1, a dip to white 2 levels on 9.0.2 and 15 on 6.1.1 in the export: the dip is
+    `yuv420p -> rgb24 -> yuv420p`, which reads the matrix the label states). The same label is what moves an HD clip's dip in a mixed
+    stack on FFmpeg 6.1.1 (33.0 dB / 15 levels into the HD clip, 32.5 / 15 out of it, over all frames of the export; method in
+    `engine-cli.md`); it equals the file tagged BT.709, which the plan draws (`a_labelled_hd_clip_dips_through_white_with_the_bt709_round_trip`). Opaque pictures are identical.
   - **What depends on the render size** is decided in the plan, before any decode
     (`LayerGeometry` lives in kerf-core as `layer_geometry.rs` for this reason): a
     translucent layer of odd size, **resizing a picture that is not 8/10-bit

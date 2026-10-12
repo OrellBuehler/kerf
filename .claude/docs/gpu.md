@@ -422,10 +422,10 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   labelled BT.709 by the export graph itself (`engine-cli.md`, *The BT.709 label*; the plan mirrors it,
   `core-render-plan.md`), so the stack is one matrix and is drawn on 9.0.2 (it was a mixed stack there, refused); untagged HD beside `smpte170m` footage became BT.709 against BT.601 and is refused there. A lone
   untagged HD clip is still read as BT.601 by FFmpeg and drawn that way (27.3 dB against a player on 9.0.2). A logo or a photo beside HD
-  (a PNG's `gbr`, the `bt470bg` of a JPEG, a WebP and the `mjpeg`, `amv` and `speedhq` decoders are decoders' defaults, not matrices) is not a stack that is labelled and is
+  (a PNG's `gbr`, the `bt470bg` of a JPEG, a WebP and the `mjpeg`, `amv`, `speedhq`, `jpegls` (and their decode-only relatives) decoders are decoders' defaults, not matrices) is not a stack that is labelled and is
   drawn or refused as before. **Accepted difference**: the playback stream that takes over from the compositor (`SpanPlan::handover`) is a
   slice of the cut and labels over its own clips, where the Motion plan labels over the cut's graph; when the slice has dropped the
-  matrix-naming clip a translucent HD layer differs by up to 2 levels on 9.0.2 (10 to 16 on 6.1) and a dip to white by 2 on 9.0.2 and by 15 on 6.1 (the RGB round trip reads the label; the label is what moves an HD clip's dip in the export on 6.1, 32.3 dB and 11 levels over main), opaque pictures not at all. The stream's own matrix
+  matrix-naming clip a translucent HD layer differs by 1 level in the export on 9.0.2 and 8 to 14 on 6.1.1 (export 8, still 14, stream 11, scrub window 14), coloured text by 16 levels on its pixels on 9.0.2 and not at all on 6.1.1, and a dip to white by 2 levels on 9.0.2 and 15 on 6.1.1 in the export (the RGB round trip reads the label; labelled against not, the clip alone; in a mixed stack on 6.1.1 the label moves an HD clip's dip by 33.0 dB / 15 levels into it and 32.5 / 15 out of it over all frames, method in `engine-cli.md`), opaque pictures not at all. The stream's own matrix
   (`PlanStream::matrix`, from the probed `color_space`) is used for taking a translucent
   layer out of YUV in the round trip below and for choosing the composite's matrix.
 - **`eq` is a YUV operation**, not an RGB one: `eq.rs` builds vf_eq's own per-plane

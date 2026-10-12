@@ -119,5 +119,5 @@
   (`a_decoders_default_tag_names_no_matrix_in_any_graph_of_the_corpus`, no digests): each case that holds an HDR clip is built
   again with that clip replaced, same size and place, by a shape the probe really gives (a PNG with alpha or grey, `gbr`; a JPEG,
   a WebP and MJPEG video, `bt470bg`; RGB video; and one shape per rule, each kept off by that rule alone: a moving `rgba` with `gbr`,
-  MJPEG and SpeedHQ at `yuv422p`, AMV, an `rgb24` with `bt470bg`) and the label must be in no argv, and by explicitly tagged H.264
+  MJPEG and SpeedHQ at `yuv422p`, JPEG-LS grey, a decode-only `thp`, AMV, an `rgb24` with `bt470bg` from FFV1) and the label must be in no argv, and by explicitly tagged H.264
   clips (`bt709`, `smpte170m`, full-range `yuvj420p` `bt709`) and must then be exactly where the HDR clip's was. It moves no digest.
