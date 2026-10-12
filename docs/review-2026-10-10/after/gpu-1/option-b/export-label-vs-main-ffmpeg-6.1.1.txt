@@ -1,0 +1,45 @@
+FFmpeg 6.1.1 (system, policy FixedBt601). Same method as export-label-vs-main-ffmpeg-9.0.2.txt.
+
+== main vs label
+case                              still png       export yuv       stream jpg        scrub jpg
+alpha-over-709                   99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+hd-over-hd601                    99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+hd-over-png                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+hd-over-rgb                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+hd-over-sd-untagged              99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+hd-over-sd601                    99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+hd-under-sd-untagged             99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-709-opacity-over           99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-over-709                   99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-over-709-opacity           37.3 /  16       39.2 /  10       38.5 /  17       38.6 /  16
+mixed-over-hlg                   99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-under-709                  99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-under-hlg                  99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mjpeg-over-709                   99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+png-over-hd                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+sequential-709-then-hd           99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+single-opacity                   99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+single-opaque                    99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+single-pip                       99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+single-text                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+
+== label vs the same footage tagged bt709 in the file
+case                              still png       export yuv       stream jpg        scrub jpg
+hd-over-hd601                    99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+hd-over-png                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+hd-over-rgb                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+hd-over-sd-untagged              99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+hd-over-sd601                    99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+hd-under-sd-untagged             99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-709-opacity-over           99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-over-709                   99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-over-709-opacity           99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-over-hlg                   99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-under-709                  99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-under-hlg                  99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+png-over-hd                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+sequential-709-then-hd           99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+single-opacity                   31.1 /  15       33.2 /  10       32.5 /  13       32.5 /  14
+single-opaque                    99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+single-pip                       99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+single-text                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0

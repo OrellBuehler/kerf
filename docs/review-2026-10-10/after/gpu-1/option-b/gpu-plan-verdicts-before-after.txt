@@ -1,0 +1,45 @@
+Would the GPU compositor draw this stack? RenderPlan::at (a Still plan, 640x360 canvas, t = 0.5, GpuCaps::A0 refusals), 'main' = origin/main 255ac36's plan, 'label' = rule R.
+'orig' = the originals; 'prev' = the preview's assets (proxy path, original metadata). Stacks are two clips, the subject (untagged 1280x720 HD) over / under another kind; 'single-*' are the subject alone.
+Refusals unrelated to the matrix (a text overlay, alpha, an RGB picture that has to be resized, an HDR original) are the same before and after.
+
+== policy BottomLayerTag  (FFmpeg 9.0.2)
+  orig hd-over-hd601              drawn                                        -> refused: layers tagged with different YCbCr matr
+  orig hd-over-sd601              drawn                                        -> refused: layers tagged with different YCbCr matr
+  orig mixed-709-opacity-over     refused: layers tagged with different YCbCr  -> drawn
+  orig mixed-over-709             refused: layers tagged with different YCbCr  -> drawn
+  orig mixed-over-709-opacity     refused: layers tagged with different YCbCr  -> drawn
+  orig mixed-under-709            refused: layers tagged with different YCbCr  -> drawn
+  prev hd-over-hd601              drawn                                        -> refused: layers tagged with different YCbCr matr
+  prev hd-over-sd601              drawn                                        -> refused: layers tagged with different YCbCr matr
+  prev mixed-709-opacity-over     refused: layers tagged with different YCbCr  -> drawn
+  prev mixed-over-709             refused: layers tagged with different YCbCr  -> drawn
+  prev mixed-over-709-opacity     refused: layers tagged with different YCbCr  -> drawn
+  prev mixed-over-hlg             refused: layers tagged with different YCbCr  -> drawn
+  prev mixed-under-709            refused: layers tagged with different YCbCr  -> drawn
+  prev mixed-under-hlg            refused: layers tagged with different YCbCr  -> drawn
+
+== policy FixedBt601  (FFmpeg 6.1.1)
+
+== policy Unknown  (a probe that could not tell)
+  orig hd-over-hd601              drawn                                        -> refused: layers tagged with different YCbCr matr
+  orig hd-over-sd601              drawn                                        -> refused: layers tagged with different YCbCr matr
+  orig mixed-709-opacity-over     refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
+  orig mixed-over-709             refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
+  orig mixed-over-709-opacity     refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
+  orig mixed-under-709            refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
+  prev hd-over-hd601              drawn                                        -> refused: layers tagged with different YCbCr matr
+  prev hd-over-sd601              drawn                                        -> refused: layers tagged with different YCbCr matr
+  prev mixed-709-opacity-over     refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
+  prev mixed-over-709             refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
+  prev mixed-over-709-opacity     refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
+  prev mixed-over-hlg             refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
+  prev mixed-under-709            refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
+  prev mixed-under-hlg            refused: layers tagged with different YCbCr  -> refused: a Bt709 stack, and this FFmpeg's compos
+
+Drawn among the 16 non-single cases (before -> after):
+  orig BottomLayerTag   5 ->  7   refused->drawn 4, drawn->refused 2
+  orig FixedBt601      10 -> 10   refused->drawn 0, drawn->refused 0
+  orig Unknown          5 ->  3   refused->drawn 0, drawn->refused 2
+  prev BottomLayerTag   5 ->  9   refused->drawn 6, drawn->refused 2
+  prev FixedBt601      12 -> 12   refused->drawn 0, drawn->refused 0
+  prev Unknown          5 ->  3   refused->drawn 0, drawn->refused 2

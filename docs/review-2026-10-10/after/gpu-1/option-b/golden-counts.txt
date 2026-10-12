@@ -1,0 +1,19 @@
+Golden argv oracle (engine/cli/golden.rs), 6000 cases (4000 + 800 master + 800 channels + 400 hardware encoders), rule R.
+Moved digests, before (origin/main 255ac36) against after:                 export   still  preview
+  all 6000 cases                                                             3054     644     2139
+  first 5600 (the corpus of the prototype)                                   2852     610     1993
+  prototype rule R on the older 5600-case corpus (label-export-findings)     2879     613     2026
+The prototype's export 2879 and preview 2026 are reproduced exactly by also labelling still images (the corpus' `still`
+asset is a yuv420p image); option B never labels one (a lossy WebP is BT.601 by its format), which is the 27 / 33
+difference (its still figure, 613, was counted over other layers: 646 with images, 610 without).
+Verification, per case, for every kind of builder (a test that stays in the oracle):
+  - the moved set equals the set of cases whose argv holds `setparams=colorspace=bt709`  (3054 / 644 / 2139)
+  - that set equals the set of cases an independent oracle, by asset *name*, says hold an untagged HD clip (interview,
+    broll, phone, wide, sphere, lenses and their padded twins) beside an HDR clip (hdr-pq, hdr-hlg, hdr-hlg-43), in the
+    export's graph (the range's slice; none for an audio-only container), the preview's (the cut from the playhead)
+    or the still's (the layers on screen)
+  - a one-off check (not kept): removing `,setparams=colorspace=bt709` from the new argv gives the old digest of every
+    one of the 18000 (case, builder) pairs, so the label is the only change
+  - so no single-clip case, no case of untagged footage only, no HDR-only case and no audio-only export moved
+The corpus holds HDR as its only matrix-naming footage; tagged SDR, SD, MJPEG, RGB, alpha and stills are covered by the
+builders' unit tests (engine/cli/bt709_label.rs).

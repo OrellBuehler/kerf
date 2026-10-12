@@ -1,0 +1,43 @@
+FFmpeg 9.0.2 (pinned, policy BottomLayerTag). PSNR dB / worst level error between two renders of the same timeline.
+'main' = the build without the label (origin/main 255ac36 graphs); 'label' = rule R. Subject: an untagged 1280x720 HD gradient (BT.709 values), 640x360 canvas, frame 5 / 0.5 s.
+Columns: still = export_still PNG (RGB); export = lossless x264 export, yuv420p planes; stream = first frame of stream_preview (JPEG); scrub = Project::composite_timeline_frame (JPEG).
+
+== main vs label (what the label moves)
+case                              still png       export yuv       stream jpg        scrub jpg
+alpha-over-709                   99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+hd-over-hd601                    32.7 /  32       34.0 /  17       33.1 /  27       28.4 /  47
+hd-over-png                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+hd-over-rgb                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+hd-over-sd-untagged              99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+hd-over-sd601                    32.9 /  27       34.0 /  17       33.1 /  30       30.1 /  50
+hd-under-sd-untagged             99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-709-opacity-over           28.9 /  22       34.4 /  17       32.6 /  39       32.6 /  33
+mixed-over-709                   33.5 /  23       35.3 /  14       32.8 /  30       33.5 /  25
+mixed-over-709-opacity           37.3 /  17       38.0 /  11       36.5 /  22       36.6 /  20
+mixed-over-hlg                   33.5 /  23       35.3 /  14       32.7 /  29       33.5 /  27
+mixed-under-709                  29.1 /  35       29.7 /  36       33.3 /  53       33.1 /  50
+mixed-under-hlg                  29.2 /  22       32.0 /  26       30.2 /  45       30.0 /  43
+mjpeg-over-709                   99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+png-over-hd                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+sequential-709-then-hd           99.0 /   0       29.3 /  14       99.0 /   0       99.0 /   0
+single-opacity                   99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+single-opaque                    99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+single-pip                       99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+single-text                      99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+
+== label vs the same footage tagged bt709 in the file (the label is the tag, bit for bit, in every graph the GPU draws)
+case                              still png       export yuv       stream jpg        scrub jpg
+hd-over-hd601                    40.4 /  32       99.0 /   0       99.0 /   0       26.9 /  47
+hd-over-png                      33.3 /  22       40.0 /   4       34.3 /  23       34.3 /  14
+hd-over-rgb                      32.8 /  30       25.2 /  32       28.2 /  52       28.5 /  45
+hd-over-sd-untagged              33.1 /  25       34.0 /  17       33.1 /  30       32.4 /  28
+hd-over-sd601                    42.4 /  27       99.0 /   0       99.0 /   0       28.1 /  50
+hd-under-sd-untagged             28.6 /  40       31.3 /  70       32.4 / 100       34.5 /  43
+mixed-709-opacity-over           99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-over-709                   99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-over-709-opacity           99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-over-hlg                   99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-under-709                  99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+mixed-under-hlg                  99.0 /   0       99.0 /   0       99.0 /   0       99.0 /   0
+png-over-hd                      29.3 /  22       44.4 /   5       39.0 /  32       39.2 /  15
+sequential-709-then-hd           27.3 /  22       99.0 /   0       99.0 /   0       99.0 /   0

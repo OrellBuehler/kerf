@@ -1,0 +1,95 @@
+Preview assets (proxy files made by generate_proxy, the original's metadata: Project::preview_assets_of) against the originals, same timeline.
+FFmpeg 9.0.2.   Option B changes no proxy, so 'main' and 'label' differ only where the graph labels.
+
+== main
+case                              still png       export yuv       stream jpg        scrub jpg
+alpha-over-709                   45.0 /  35       53.5 /  14       45.4 /  30       45.7 /  21
+hd-over-hd601                    48.7 /  16       54.1 /  11       47.1 /  24       47.1 /  19
+hd-over-png                      56.9 /   5       64.3 /   2       56.4 /   7       55.7 /   6
+hd-over-rgb                      46.3 /  23       51.1 /  13       45.5 /  25       45.9 /  18
+hd-over-sd-untagged              47.4 /  37       52.7 /  22       46.8 /  24       46.3 /  30
+hd-over-sd601                    47.4 /  37       52.7 /  22       46.8 /  24       46.3 /  30
+hd-under-sd-untagged             50.1 /  15       56.9 /  10       46.0 /  17       49.0 /  16
+mixed-709-opacity-over           50.5 /   8       57.8 /   4       46.2 /  16       49.3 /  10
+mixed-over-709                   47.2 /  22       52.8 /  14       45.2 /  27       46.0 /  21
+mixed-over-709-opacity           47.4 /  22       52.9 /  14       45.0 /  27       45.8 /  21
+mixed-over-hlg                   45.1 /  18       41.2 /  39       36.7 /  60       43.5 /  23
+mixed-under-709                  50.3 /  14       57.3 /   6       46.0 /  21       49.0 /  15
+mixed-under-hlg                  48.4 /  12       40.8 /  44       35.7 /  85       47.4 /  14
+mjpeg-over-709                   47.7 /  22       53.0 /  14       45.0 /  27       45.7 /  21
+png-over-hd                      51.4 /   6       58.9 /   2       47.1 /  15       51.3 /   5
+sequential-709-then-hd           50.7 /   6       55.4 /   3       45.0 /  27       50.6 /   5
+single-opacity                   51.6 /   5       58.6 /   2       54.1 /   5       52.0 /   5
+single-opaque                    50.7 /   6       58.2 /   2       46.5 /   9       50.6 /   5
+single-pip                       56.9 /   5       64.3 /   2       57.0 /   6       56.0 /   7
+single-text                      50.7 /   6       58.2 /   2       46.4 /  14       50.5 /   8
+
+== label
+case                              still png       export yuv       stream jpg        scrub jpg
+alpha-over-709                   45.0 /  35       53.5 /  14       45.4 /  30       45.7 /  21
+hd-over-hd601                    48.5 /  20       53.8 /  11       47.1 /  24       46.6 /  20
+hd-over-png                      56.9 /   5       64.3 /   2       56.4 /   7       55.7 /   6
+hd-over-rgb                      46.3 /  23       51.1 /  13       45.5 /  25       45.9 /  18
+hd-over-sd-untagged              47.4 /  37       52.7 /  22       46.8 /  24       46.3 /  30
+hd-over-sd601                    47.4 /  35       52.5 /  22       46.9 /  24       46.2 /  29
+hd-under-sd-untagged             50.1 /  15       56.9 /  10       46.0 /  17       49.0 /  16
+mixed-709-opacity-over           50.3 /   7       57.9 /   4       46.2 /  14       49.2 /  12
+mixed-over-709                   47.5 /  22       53.1 /  14       45.6 /  27       46.0 /  21
+mixed-over-709-opacity           47.3 /  22       52.9 /  14       45.0 /  27       45.9 /  21
+mixed-over-hlg                   45.3 /  18       41.2 /  39       36.8 /  60       43.5 /  23
+mixed-under-709                  50.1 /  14       57.3 /   7       46.1 /  16       49.1 /  16
+mixed-under-hlg                  48.8 /  10       40.3 /  45       35.7 /  84       47.2 /  14
+mjpeg-over-709                   47.7 /  22       53.0 /  14       45.0 /  27       45.7 /  21
+png-over-hd                      51.4 /   6       58.9 /   2       47.1 /  15       51.3 /   5
+sequential-709-then-hd           50.7 /   6       58.2 /   2       45.0 /  27       50.6 /   5
+single-opacity                   51.6 /   5       58.6 /   2       54.1 /   5       52.0 /   5
+single-opaque                    50.7 /   6       58.2 /   2       46.5 /   9       50.6 /   5
+single-pip                       56.9 /   5       64.3 /   2       57.0 /   6       56.0 /   7
+single-text                      50.7 /   6       58.2 /   2       46.4 /  14       50.5 /   8
+
+FFmpeg 6.1.1
+== main
+case                              still png       export yuv       stream jpg        scrub jpg
+alpha-over-709                   47.4 /  22       53.0 /  14       45.7 /  23       45.6 /  21
+hd-over-hd601                    48.7 /  16       54.1 /  11       46.5 /  22       46.5 /  16
+hd-over-png                      56.9 /   5       64.3 /   2       56.0 /   9       57.2 /   6
+hd-over-rgb                      46.3 /  23       51.1 /  13       44.9 /  25       45.2 /  19
+hd-over-sd-untagged              47.4 /  37       52.7 /  22       45.6 /  29       46.0 /  27
+hd-over-sd601                    47.4 /  37       52.7 /  22       45.6 /  29       46.0 /  27
+hd-under-sd-untagged             50.1 /  15       56.9 /  10       47.8 /  17       48.3 /  17
+mixed-709-opacity-over           50.5 /   8       57.8 /   4       49.1 /  13       49.1 /  12
+mixed-over-709                   47.3 /  22       53.1 /  14       46.3 /  23       46.2 /  21
+mixed-over-709-opacity           47.1 /  22       52.9 /  14       45.9 /  23       45.9 /  21
+mixed-over-hlg                   45.2 /  20       39.4 /  54       36.8 /  59       44.6 /  20
+mixed-under-709                  50.3 /  14       57.3 /   7       48.1 /  16       48.8 /  14
+mixed-under-hlg                  49.0 /  10       39.0 /  55       35.7 /  85       47.5 /  13
+mjpeg-over-709                   46.7 /  22       52.2 /  14       45.3 /  23       44.8 /  21
+png-over-hd                      51.4 /   6       58.9 /   2       50.4 /   8       51.0 /   6
+sequential-709-then-hd           50.7 /   6       58.2 /   2       45.7 /  23       50.2 /   6
+single-opacity                   51.6 /   5       58.6 /   2       53.3 /   6       53.3 /   5
+single-opaque                    50.7 /   6       58.2 /   2       49.8 /   8       50.2 /   6
+single-pip                       56.9 /   5       64.3 /   2       56.1 /   9       57.4 /   6
+single-text                      50.7 /   6       58.2 /   2       49.6 /  13       50.1 /   9
+
+== label
+case                              still png       export yuv       stream jpg        scrub jpg
+alpha-over-709                   47.4 /  22       53.0 /  14       45.7 /  23       45.6 /  21
+hd-over-hd601                    48.7 /  16       54.1 /  11       46.5 /  22       46.5 /  16
+hd-over-png                      56.9 /   5       64.3 /   2       56.0 /   9       57.2 /   6
+hd-over-rgb                      46.3 /  23       51.1 /  13       44.9 /  25       45.2 /  19
+hd-over-sd-untagged              47.4 /  37       52.7 /  22       45.6 /  29       46.0 /  27
+hd-over-sd601                    47.4 /  37       52.7 /  22       45.6 /  29       46.0 /  27
+hd-under-sd-untagged             50.1 /  15       56.9 /  10       47.8 /  17       48.3 /  17
+mixed-709-opacity-over           50.5 /   8       57.8 /   4       49.1 /  13       49.1 /  12
+mixed-over-709                   47.3 /  22       53.1 /  14       46.3 /  23       46.2 /  21
+mixed-over-709-opacity           47.2 /  22       52.9 /  14       45.9 /  23       45.8 /  21
+mixed-over-hlg                   45.2 /  20       39.4 /  54       36.8 /  59       44.6 /  20
+mixed-under-709                  50.3 /  14       57.3 /   7       48.1 /  16       48.8 /  14
+mixed-under-hlg                  49.0 /  10       39.0 /  55       35.7 /  85       47.5 /  13
+mjpeg-over-709                   46.7 /  22       52.2 /  14       45.3 /  23       44.8 /  21
+png-over-hd                      51.4 /   6       58.9 /   2       50.4 /   8       51.0 /   6
+sequential-709-then-hd           50.7 /   6       58.2 /   2       45.7 /  23       50.2 /   6
+single-opacity                   51.6 /   5       58.6 /   2       53.3 /   6       53.3 /   5
+single-opaque                    50.7 /   6       58.2 /   2       49.8 /   8       50.2 /   6
+single-pip                       56.9 /   5       64.3 /   2       56.1 /   9       57.4 /   6
+single-text                      50.7 /   6       58.2 /   2       49.6 /  13       50.1 /   9
