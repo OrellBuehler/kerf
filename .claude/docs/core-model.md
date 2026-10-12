@@ -387,7 +387,9 @@
   fire; `animateMotion`, `animate` on `transform`, animating `href` / `style` / `on*` are
   dropped; a base value that comes from a `<style>` rule is not seen (the default is used).
   `natural_duration` (all animations settled; `None` for a still or an endless loop) is what
-  `add_svg_overlay` defaults the end to, held to 2–30 s (else 4 s). **Presets** (`SvgPresetKind`
+  `add_svg_overlay` defaults the end to, held to 2–30 s (else 4 s; `SvgDoc::default_span`).
+  `SvgOverlayPatch` has `svg` (custom artwork), `preset_params` (re-fill) and `preset_kind` (another
+  preset, same id and draw order; `svg` excludes both, custom art refuses both). **Presets** (`SvgPresetKind`
   `fade_up` / `typewriter` / `lower_third` / `word_pop`, `svg::render_preset`) are only SVG the
   subset understands, drawn for a viewBox equal to the delivery frame (`Timeline::preset_frame`:
   `format`, else 1920x1080), blank and static at their duration. `SvgOverlay.preset` remembers

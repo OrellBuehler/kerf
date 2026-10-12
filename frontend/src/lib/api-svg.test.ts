@@ -106,6 +106,48 @@ describe('validating an SVG (browser harness)', () => {
 		await expect(validateSvg('')).rejects.toThrow('<svg');
 		await expect(validateSvg(CUSTOM + ' '.repeat(128 * 1024))).rejects.toThrow('larger than 128 KiB');
 	});
+
+	test('refuses a root without the SVG namespace, or without a size to fit', async () => {
+		const bare = '<svg viewBox="0 0 10 10"><rect width="5" height="5"/></svg>';
+		await expect(validateSvg(bare)).rejects.toThrow('xmlns="http://www.w3.org/2000/svg"');
+		await expect(validateSvg(bare.replace('<svg', '<svg xmlns="http://example.com/other"'))).rejects.toThrow('xmlns');
+		const ns = 'xmlns="http://www.w3.org/2000/svg"';
+		for (const root of [`<svg ${ns}>`, `<svg ${ns} width="100">`, `<svg ${ns} width="100%" height="50%">`, `<svg ${ns} viewBox="0 0 0 10">`, `<svg ${ns} viewBox="0 0 10">`]) {
+			await expect(validateSvg(`${root}<rect/></svg>`)).rejects.toThrow('viewBox');
+		}
+		for (const root of [`<svg ${ns} viewBox="0 0 10 5">`, `<svg ${ns} viewBox="0,0,10,5">`, `<svg ${ns} width="10" height="5px">`, `<svg ${ns} width="10" height="5" viewBox="x">`]) {
+			expect((await validateSvg(`<?xml version="1.0"?><!-- c -->${root}<rect/></svg>`)).warnings).toEqual([]);
+		}
+	});
+
+	test('asks the browser to read it as XML when there is one, and says what it complained of', async () => {
+		const real = globalThis.DOMParser;
+		const seen: string[] = [];
+		globalThis.DOMParser = class {
+			parseFromString(src: string, type: string) {
+				seen.push(type);
+				const broken = src.includes('&nbsp;');
+				return { getElementsByTagName: () => (broken ? [{ textContent: 'Entity \'nbsp\' not defined\nLine 1' }] : []) };
+			}
+		} as unknown as typeof DOMParser;
+		try {
+			expect((await validateSvg(CUSTOM)).warnings).toEqual([]);
+			await expect(validateSvg(CUSTOM.replace('<rect', '&nbsp;<rect'))).rejects.toThrow("not valid XML: Entity 'nbsp' not defined");
+			expect(seen).toEqual(['image/svg+xml', 'image/svg+xml']);
+		} finally {
+			globalThis.DOMParser = real;
+		}
+	});
+
+	test('reads colours the way the engine does', async () => {
+		const colour = (color: string) => svgPresetPreview('fade_up', { text: 'x', color });
+		for (const ok of ['teal', 'RED', ' white ', 'transparent', '#abc', '#abcd', '#aabbcc', '#aabbccdd', 'rgb(1,2,3)', 'rgb(1 2 3)', 'rgba(1, 2, 3, 0.5)', 'rgb(10%, 20%, 30%)', 'rgb(10%, 20, 30)', 'hsl(120, 50%, 50%)', 'hsla(120 50% 50% 0.5)']) {
+			expect(await colour(ok)).toContain('<svg');
+		}
+		for (const bad of ['', 'tealish', '#ab', '#abcde', '#abcdefg', 'rgb(1,2)', 'rgb(1,2,3,4,5)', 'rgb(1,2,3', 'rgb (1,2,3)', 'rgb(1, 2%, 3)', 'rgb(a,b,c)', 'rgb(1,,3)', 'url(#x)', 'a" onload="x', 'red;blue', 'x'.repeat(65)]) {
+			await expect(colour(bad)).rejects.toThrow('colour');
+		}
+	});
 });
 
 describe('adding an animated title (browser harness)', () => {
@@ -191,17 +233,35 @@ describe('updating an animated title (browser harness)', () => {
 		expect(u.svg).not.toContain('>Hello<');
 	});
 
+	test('switches a preset to another kind in one edit, keeping its place and params', async () => {
+		const first = await addPreset('Hello', 1, 6);
+		const second = await addPreset('Second', 2);
+		const head = (await getHistory()).find((h) => h.current)!.seq;
+		const t = await updateSvgOverlay(first.id, { preset_kind: 'lower_third' });
+		expect(titles(t).map((o) => o.id)).toEqual([first.id, second.id]);
+		const u = titles(t)[0];
+		expect(u).toMatchObject({ id: first.id, start: 1, end: 6 });
+		expect(u.preset).toEqual({ kind: 'lower_third', params: first.preset!.params });
+		expect(u.svg).not.toBe(first.svg);
+		expect(u.svg).toContain('>Hello<');
+		expect((await getHistory()).find((h) => h.current)!.seq).toBe(head + 1);
+		const both = titles(await updateSvgOverlay(first.id, { preset_kind: 'word_pop', preset_params: { text: 'New' } }))[0];
+		expect(both.preset).toMatchObject({ kind: 'word_pop', params: { text: 'New' } });
+	});
+
 	test('swapping in artwork makes it custom, and a custom title cannot be re-filled', async () => {
 		const o = await addPreset();
 		const custom = titles(await updateSvgOverlay(o.id, { svg: CUSTOM }))[0];
 		expect(custom.svg).toBe(CUSTOM);
 		expect(custom.preset).toBeUndefined();
 		await expect(updateSvgOverlay(o.id, { preset_params: { text: 'x' } })).rejects.toThrow('custom SVG');
+		await expect(updateSvgOverlay(o.id, { preset_kind: 'typewriter' })).rejects.toThrow('custom SVG');
 	});
 
 	test('refuses both at once, a bad length or placement, and a title that is not there', async () => {
 		const o = await addPreset('Hello', 1, 5);
 		await expect(updateSvgOverlay(o.id, { svg: CUSTOM, preset_params: { text: 'x' } })).rejects.toThrow('not both');
+		await expect(updateSvgOverlay(o.id, { svg: CUSTOM, preset_kind: 'typewriter' })).rejects.toThrow('not both');
 		await expect(updateSvgOverlay(o.id, { end: 1 })).rejects.toThrow('end must be after start');
 		await expect(updateSvgOverlay(o.id, { start: 9 })).rejects.toThrow('end must be after start');
 		await expect(updateSvgOverlay(o.id, { opacity: 2 })).rejects.toThrow('opacity');

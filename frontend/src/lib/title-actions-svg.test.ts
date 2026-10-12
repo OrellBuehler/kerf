@@ -152,7 +152,7 @@ describe('a preset made custom', () => {
 });
 
 describe('changing the preset', () => {
-	test('is a new title with the same text, timing, placement and name, in place of the old one', async () => {
+	test('is one edit that keeps the id, text, timing, placement, name and draw order', async () => {
 		await editor.addSvgOverlay({ preset: { kind: 'fade_up', params: { text: 'Hello', color: 'teal', accent: 'gold' } } }, 2, 7, {
 			name: 'Opener',
 			x: 0.1,
@@ -161,14 +161,18 @@ describe('changing the preset', () => {
 			height: 0.4,
 			opacity: 0.8
 		});
-		const [old] = editor.svgOverlays;
+		await editor.addSvgOverlay({ preset: { kind: 'word_pop', params: { text: 'Second' } } }, 3, 6);
+		const [old, other] = editor.svgOverlays;
+		editor.selectSvgOverlay(old.id);
+		const before = await revision();
 		await actions.changePreset(old, 'typewriter');
-		expect(editor.svgOverlays).toHaveLength(1);
+		expect(await revision()).toBe(before + 1);
+		expect(editor.svgOverlays.map((o) => o.id)).toEqual([old.id, other.id]);
 		const [o] = editor.svgOverlays;
-		expect(o.id).not.toBe(old.id);
-		expect(o).toMatchObject({ name: 'Opener', start: 2, end: 7, x: 0.1, y: 0.2, width: 0.5, height: 0.4, opacity: 0.8 });
+		expect(o).toMatchObject({ id: old.id, name: 'Opener', start: 2, end: 7, x: 0.1, y: 0.2, width: 0.5, height: 0.4, opacity: 0.8 });
 		expect(o.preset).toMatchObject({ kind: 'typewriter', params: { text: 'Hello', color: 'teal', accent: 'gold' } });
-		expect(editor.selectedSvgOverlayId).toBe(o.id);
+		expect(o.svg).not.toBe(old.svg);
+		expect(editor.selectedSvgOverlayId).toBe(old.id);
 	});
 
 	test('the same preset, or a custom title, changes nothing', async () => {

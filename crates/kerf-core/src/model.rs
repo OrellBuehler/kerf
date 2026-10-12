@@ -2115,8 +2115,9 @@ impl SvgOverlay {
 }
 
 /// Fields of an [`SvgOverlay`] to change; `None` leaves one alone. `svg` replaces the artwork with
-/// custom source (and so drops the preset); `preset_params` re-fills a preset overlay (the two are
-/// exclusive).
+/// custom source (and so drops the preset); `preset_params` re-fills a preset overlay and
+/// `preset_kind` switches it to another kind (both refused on custom artwork, and either one is
+/// exclusive with `svg`; together they re-make the preset in one edit).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SvgOverlayPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2125,6 +2126,8 @@ pub struct SvgOverlayPatch {
     pub svg: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset_params: Option<SvgPresetParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_kind: Option<SvgPresetKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2143,12 +2146,12 @@ pub struct SvgOverlayPatch {
 
 impl SvgOverlayPatch {
     /// What a patch can be refused for without the timeline and without parsing: the artwork and the
-    /// preset parameters are exclusive, the parameters are valid, the times are numbers.
+    /// preset's parameters or kind are exclusive, the parameters are valid, the times are numbers.
     pub fn check_cheap(&self) -> crate::error::Result<()> {
         use crate::error::Error;
-        if self.svg.is_some() && self.preset_params.is_some() {
+        if self.svg.is_some() && (self.preset_params.is_some() || self.preset_kind.is_some()) {
             return Err(Error::InvalidArgument(
-                "pass either svg or preset_params, not both".to_string(),
+                "pass either svg or preset_params / preset_kind, not both".to_string(),
             ));
         }
         if let Some(params) = &self.preset_params {
@@ -10797,6 +10800,9 @@ mod tests {
             }
         );
         assert_eq!(serde_json::to_string(&SvgOverlayPatch::default()).unwrap(), "{}");
+        let kind: SvgOverlayPatch = serde_json::from_str(r#"{"preset_kind":"word_pop"}"#).unwrap();
+        assert_eq!(kind.preset_kind, Some(SvgPresetKind::WordPop));
+        assert_eq!(serde_json::to_string(&kind).unwrap(), r#"{"preset_kind":"word_pop"}"#);
     }
 
     #[test]

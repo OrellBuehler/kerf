@@ -1314,11 +1314,14 @@ a `Playback preview failed:` toast, restarting the stream when a proxy lands. A 
 `removeSvgOverlay(id)` (each answers the refreshed `Timeline`), `validateSvg(svg)` → `SvgCheck`, `listSvgPresets()` and
 `svgPresetPreview(kind, params, duration?)` → SVG text, which the page may only show through an `<img>` data URL.
 The harness stand-in is `svg-dev.ts`: kerf-core's refusals (placement ranges, `end > start`, fifty titles, empty
-preset text, `svg` xor `preset_params`, a refused update changes nothing) over the dev timeline, with
+preset text, `svg` xor `preset_params` / `preset_kind`, a refused update changes nothing) over the dev timeline, with
 `svg_overlays` absent again when it empties. Preset artwork is **kerf-core's own**, written down in
 `fixtures/svg-presets.json` (each preset drawn once for 1920×1080 and four seconds with placeholder text; the
 harness swaps in text, colours and font and does not re-time it, and custom SVG is not sanitised —
-`validateSvg` only drops and reports scripts, foreign objects and `animateMotion`). A preset change in
+`validateSvg` only drops and reports scripts, foreign objects and `animateMotion`, but refuses at a glance what the engine
+does: over 128 KiB, not XML (the browser's `DOMParser`, guarded because bun has none), a root without
+`xmlns="http://www.w3.org/2000/svg"`, no `viewBox` / pixel `width` + `height`; preset colours go through `isSvgColour`, which
+reads names, `#rgb[a]` / `#rrggbb[aa]` and `rgb[a]()` / `hsl[a]()` as `svgtypes` does). A preset change in
 `kerf-core/src/svg/presets.rs` fails `svg_preset_fixture_is_what_this_engine_does` until
 `KERF_BLESS_SVG_PRESETS=1 cargo test -p kerf-core --no-default-features -- svg_preset_fixture` rewrites it;
 `api-svg.test.ts` drives the harness.
@@ -1344,8 +1347,8 @@ section — kind chips, text, subtitle / colour / accent / font only for the par
 source** textarea with Apply / Revert: Apply asks `validate_svg` first (a refusal is shown under the box and nothing is written), writes
 one `update_svg_overlay`, and lists the warnings the engine could not honour (mutating commands do not return them). **A preset patch
 always carries every parameter** (the backend fills a missing one with its default, so `{text}` alone would reset the colours), and
-a refused field edit puts the field back. The patch has no preset *kind*, so the chips make a new title with the same text / timing /
-placement / name and remove the old (`changePreset`: two revisions, a new id) — a `preset_kind` in the patch would make it one edit.
+a refused field edit puts the field back. The kind chips are `changePreset`: one `update_svg_overlay` with `preset_kind` (one
+revision; the title keeps its id, name, params, timing, placement and place in the draw order, and stays selected).
 **Preview**: the selected animated title at the playhead (paused) gets a placement box over its rectangle in the same layer as the
 title boxes (drag to move, corner handles to resize with the opposite corner held, one `update_svg_overlay` on release, Escape /
 pointercancel / lost capture / blur abandon; `data-svg-box`, never the artwork), and counts toward `titlesShown`, so it routes the

@@ -291,6 +291,12 @@ impl SvgDoc {
         self.natural
     }
 
+    /// How long a title made from this document runs when nobody says: until its animations have
+    /// finished, held to 2-30 s, and four seconds for a still or something that loops forever.
+    pub fn default_span(&self) -> f64 {
+        self.natural.map_or(4.0, |n| n.clamp(2.0, 30.0))
+    }
+
     /// Whether anything in the document moves.
     pub fn is_animated(&self) -> bool {
         !self.slots.is_empty()
@@ -1255,6 +1261,18 @@ mod tests {
             );
         }
         assert!(doc("<rect/>").warnings().is_empty());
+    }
+
+    #[test]
+    fn a_title_runs_for_its_natural_duration_held_to_two_to_thirty_seconds() {
+        let span = |dur: &str| doc(&format!("<rect><animate attributeName=\"x\" to=\"1\" dur=\"{dur}\"/></rect>")).default_span();
+        assert_eq!((span("0.5s"), span("3.5s"), span("100s")), (2.0, 3.5, 30.0));
+        assert_eq!(doc("<rect/>").default_span(), 4.0, "a still");
+        assert_eq!(
+            doc("<rect><animate attributeName=\"x\" to=\"1\" dur=\"1s\" repeatCount=\"indefinite\"/></rect>").default_span(),
+            4.0,
+            "a loop"
+        );
     }
 
     #[test]

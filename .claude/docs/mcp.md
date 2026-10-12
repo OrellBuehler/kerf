@@ -24,10 +24,12 @@ The routes are fixed at compile time, so it is built once and
 then mutates fields — including `server_info` (`server_identity`), because that
 default is filled from **rmcp's own** crate identity and left alone the server
 introduces itself to every client as "rmcp". Most tools return `Result<String, McpError>` (pretty JSON), but the
-three **visual** tools — `get_frame` (a single drill-in frame), `skim_asset` (a
+four **visual** tools — `get_frame` (a single drill-in frame), `skim_asset` (a
 contact-sheet montage of an asset + a text index of cell→timestamp, for finding good
-parts) and `preview_timeline` (the composited cut at a timeline time) — return
-`Result<CallToolResult, McpError>` built by the `image_result` helper: a caption
+parts), `preview_timeline` (the composited cut at a timeline time) and
+`preview_svg_overlay` (below) — return
+`Result<CallToolResult, McpError>` built by the `image_result` helper (`png_result` for the
+SVG sheet, a drawing JPEG would smear): a caption
 `Content::text` plus a `Content::image(bare_base64, "image/jpeg")` block the LLM can
 actually *see* (rmcp wants bare base64 + MIME, **not** a `data:` URL). `preview_timeline` stays the one-shot
 still (`composite_timeline_frame`, the working cut, the exact time asked): the scrub cache and its windows
@@ -156,18 +158,39 @@ import, the generated asset lands for the user at once, while its placement and
 captions stage. `voiceover_status` is its read side.
 **Animated SVG titles over MCP**: `add_svg_overlay { svg | preset + params, start, end?, x?, y?, width?, height?,
 opacity?, name? }` (exactly one source: `svg_source` refuses both, neither, a preset without `params` and `params`
-without a preset as `invalid_params`), `update_svg_overlay { overlay_id, name?, svg?, preset_params?, start?, end?, x?,
-y?, width?, height?, opacity? }`, `remove_svg_overlay { overlay_id }` and `list_svg_presets` (the catalogue:
+without a preset as `invalid_params`), `update_svg_overlay { overlay_id, name?, svg?, preset_params?, preset_kind?, start?,
+end?, x?, y?, width?, height?, opacity? }` (`preset_kind` switches a preset title to another kind in **one edit** that
+keeps its id, name, timing and draw order; a custom title refuses it, and `svg` is exclusive with it and `preset_params`),
+`remove_svg_overlay { overlay_id }` and `list_svg_presets` (the catalogue:
 `kind`, `label`, `params: [{name, required, default?}]`). The mutating three go through `edit()`, so they stage like
-any agent edit; `Error::SvgOverlayNotFound` is `invalid_params` in `core_err`. They answer `{overlay, warnings}` with
+any agent edit; `Error::SvgOverlayNotFound` is `invalid_params` in `core_err`. **The document is read before the lock**:
+the add and update tools are `async`, read the source on `blocking` (`SvgSource::check` / `SvgOverlayPatch::check`, up to
+~1.7 s for a heavy document), and only then `edit()` runs `add_svg_overlay_parsed` / `update_svg_overlay_parsed` under the
+lock. They answer `{overlay, warnings}` with
 the overlay as an `SvgOverlaySummary` — **no source** (it can be 128 KiB, and a preset's is generated; `svg_bytes`
 says how big), which `timeline_summary` lists the same way under `svg_overlays` (absent when none) — and
 `warnings` are what the sanitiser or the SMIL reader dropped, so an agent that wrote CSS animations or
-`animateMotion` is told rather than left with a title that does not move. `get_timeline_state` is the one read
-that returns the source (its description says so). The tool description and the server `instructions` carry the
+`animateMotion` is told rather than left with a title that does not move. **Writing one is a loop**: `validate_svg { svg }`
+(read-only, no lock, on `blocking`) answers `{svg_bytes, warnings, natural_duration}` — the size of the sanitised
+document, what would be dropped, and when the animation settles (null for a still or an endless loop) — and never echoes the
+source; `preview_svg_overlay { overlay_id | svg, times? | count?, max_width? }` answers a **PNG contact sheet** from
+`kerf_core::svg::raster::contact_sheet` plus a text index (cell → seconds after the title appears). `overlay_id` is
+resolved under the lock from `working_timeline()` (so the proposal, staged edits included), together with the timeline's
+`preset_frame()`, the lock is released, and only then is the document read and drawn (`svg_preview`, pure and unit-tested);
+`svg` is a draft (its sanitiser warnings come back in the caption; its length is `SvgDoc::default_span`). `times` are seconds
+after the title appears (an overlay's slice `offset` is added for the document clock; the labels in the image are that
+clock, the caption says so), `count` (default 6, clamped to 1..=36) spreads cells from the first frame to the end; both
+together, neither source or both sources are `invalid_params`, and a `times` list the sheet cannot hold is refused rather than
+cut short. `max_width` is the width of **one cell** (default 480, 64..=960). It shows the title alone over dark grey, not over
+the footage — `preview_timeline` is for that. `get_timeline_state` returns the source, but one over 4 KiB
+(`SVG_INLINE_LIMIT`; a title can be 128 KiB and a timeline holds 50) is replaced by a note with its size unless
+`full_svg: true` (`elide_large_svg` edits the owned working copy, so nothing is lost and field order is unchanged).
+The tool descriptions and the server `instructions` carry the
 subset: SMIL only (`animate` / `set` / `animateTransform` / `animateColor`), times **relative to the overlay's start**,
-a `viewBox` (or width and height) required, the viewBox = the delivery frame for full-frame artwork, and what is
-dropped (CSS animations, scripts, external images, `animateMotion`); a test pins both texts and the schemas.
+a `viewBox` (or width and height) required, the viewBox = the delivery frame for full-frame artwork, what is
+dropped (CSS animations, scripts, links and external images or fonts, `animateMotion`; the only image kept is an `<image>`
+whose href is a `data:image/png|jpeg|gif|webp` URI) and the loop validate_svg → preview_svg_overlay → add_svg_overlay →
+preview_timeline; tests pin the texts (including the order of that loop) and the schemas.
 `import_asset` is the one write that does **not** stage — a file on disk is not
 an edit to the user's cut, so imported media (and its background proxy) lands for
 them immediately, reporting on the same `import-progress` event a lens-pair

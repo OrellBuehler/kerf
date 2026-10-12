@@ -4614,16 +4614,11 @@ impl Project {
         if end.is_some_and(|e| !e.is_finite() || e <= start) {
             return Err(Error::InvalidArgument("overlay end must be after start".to_string()));
         }
-        let (svg, preset, warnings, natural) = match source {
-            SvgChecked::Custom(doc) => (
-                doc.sanitized().to_string(),
-                None,
-                doc.warnings().to_vec(),
-                doc.natural_duration(),
-            ),
-            SvgChecked::Preset(p) => (String::new(), Some(p), Vec::new(), None),
+        let (svg, preset, warnings, span) = match source {
+            SvgChecked::Custom(doc) => (doc.sanitized().to_string(), None, doc.warnings().to_vec(), doc.default_span()),
+            SvgChecked::Preset(p) => (String::new(), Some(p), Vec::new(), 4.0),
         };
-        let end = end.unwrap_or_else(|| start + natural.map_or(4.0, |n| n.clamp(2.0, 30.0)));
+        let end = end.unwrap_or(start + span);
         let (x, y, width, height, opacity) = (
             layout.x.unwrap_or(0.0),
             layout.y.unwrap_or(0.0),
@@ -4661,10 +4656,11 @@ impl Project {
     /// Change an animated title; each `None` in `patch` leaves a field alone.
     ///
     /// `svg` replaces the artwork with custom source (sanitised as on add; the title stops being a
-    /// preset), `preset_params` re-fills a preset title (refused on a custom one), and the two are
-    /// exclusive. **A preset's artwork is re-made whenever its length changes** (its animations are
-    /// scheduled against the span), so trimming or stretching one in the timeline retimes the effect
-    /// instead of cutting it off.
+    /// preset); `preset_params` re-fills a preset title and `preset_kind` switches it to another kind,
+    /// keeping its id, name, timing and place in the draw order (both refused on a custom one), and
+    /// `svg` is exclusive with either. **A preset's artwork is re-made whenever its length changes**
+    /// (its animations are scheduled against the span), so trimming or stretching one in the timeline
+    /// retimes the effect instead of cutting it off.
     pub fn update_svg_overlay(&self, overlay_id: Uuid, patch: SvgOverlayPatch) -> Result<SvgOverlayResult> {
         self.update_svg_overlay_parsed(overlay_id, patch, None)
     }
@@ -4719,11 +4715,16 @@ impl Project {
                 o.preset = None;
                 warnings = doc.warnings().to_vec();
                 regenerate = false;
-            } else if let Some(params) = patch.preset_params {
+            } else if patch.preset_params.is_some() || patch.preset_kind.is_some() {
                 let preset = o.preset.as_mut().ok_or_else(|| {
                     Error::InvalidArgument("this title is custom SVG, not a preset; pass svg to change it".to_string())
                 })?;
-                preset.params = params;
+                if let Some(kind) = patch.preset_kind {
+                    preset.kind = kind;
+                }
+                if let Some(params) = patch.preset_params {
+                    preset.params = params;
+                }
                 regenerate = true;
             }
             if regenerate {
@@ -6921,6 +6922,110 @@ mod tests {
             custom.svg,
             "custom artwork is never re-made"
         );
+    }
+
+    #[test]
+    fn switching_a_preset_kind_is_one_edit_that_keeps_the_title_in_place() {
+        use crate::model::SvgPresetKind;
+        let project = Project::open_in_memory().unwrap();
+        let add = |text: &str| {
+            let layout = SvgLayout {
+                name: Some(format!("name {text}")),
+                x: Some(0.1),
+                ..SvgLayout::default()
+            };
+            project
+                .add_svg_overlay(
+                    SvgSource::Preset(SvgPreset {
+                        kind: SvgPresetKind::FadeUp,
+                        params: SvgPresetParams::new(text),
+                    }),
+                    2.0,
+                    Some(7.0),
+                    layout,
+                )
+                .unwrap()
+                .overlay
+        };
+        let (first, second) = (add("A"), add("B"));
+        let revisions = project.history().unwrap().len();
+
+        let switched = project
+            .update_svg_overlay(
+                first.id,
+                SvgOverlayPatch {
+                    preset_kind: Some(SvgPresetKind::LowerThird),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .overlay;
+        assert_eq!(project.history().unwrap().len(), revisions + 1, "one edit");
+        assert_eq!(project.history().unwrap().last().unwrap().label, "Update animated title");
+        assert_eq!(
+            switched.preset.as_ref().map(|p| (p.kind, p.params.text.as_str())),
+            Some((SvgPresetKind::LowerThird, "A")),
+            "the kind changes, the params stay"
+        );
+        assert_eq!(
+            (switched.id, switched.name.as_str(), switched.start, switched.end, switched.x),
+            (first.id, "name A", 2.0, 7.0, 0.1)
+        );
+        let frame = project.timeline().unwrap().preset_frame();
+        assert_eq!(
+            switched.svg,
+            crate::svg::render_preset(SvgPresetKind::LowerThird, &SvgPresetParams::new("A"), 5.0, frame),
+            "the artwork is re-made for the new kind and the same span"
+        );
+        assert_ne!(switched.svg, first.svg);
+        let order: Vec<_> = project.timeline().unwrap().svg_overlays.iter().map(|o| o.id).collect();
+        assert_eq!(order, [first.id, second.id], "the draw order is kept");
+
+        // The kind and the params together are one edit as well.
+        let both = project
+            .update_svg_overlay(
+                first.id,
+                SvgOverlayPatch {
+                    preset_kind: Some(SvgPresetKind::WordPop),
+                    preset_params: Some(SvgPresetParams::new("C")),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .overlay;
+        assert_eq!(
+            both.preset.as_ref().map(|p| (p.kind, p.params.text.as_str())),
+            Some((SvgPresetKind::WordPop, "C"))
+        );
+        assert_eq!(project.history().unwrap().len(), revisions + 2);
+
+        // Refused: a custom title has no kind, and artwork of your own is not a kind.
+        let custom = project
+            .add_svg_overlay(SvgSource::Custom(svg_fixture("1s")), 0.0, None, svg_layout())
+            .unwrap()
+            .overlay;
+        let revisions = project.history().unwrap().len();
+        let on_custom = SvgOverlayPatch {
+            preset_kind: Some(SvgPresetKind::Typewriter),
+            ..Default::default()
+        };
+        assert!(matches!(
+            project.update_svg_overlay(custom.id, on_custom),
+            Err(Error::InvalidArgument(m)) if m.contains("custom")
+        ));
+        let with_svg = SvgOverlayPatch {
+            svg: Some(svg_fixture("1s")),
+            preset_kind: Some(SvgPresetKind::Typewriter),
+            ..Default::default()
+        };
+        assert!(matches!(with_svg.check(), Err(Error::InvalidArgument(_))));
+        assert!(matches!(
+            project.update_svg_overlay_parsed(first.id, with_svg, Some(SvgDoc::parse(&svg_fixture("1s")).unwrap())),
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(project.history().unwrap().len(), revisions, "a refused switch writes nothing");
+        assert_eq!(project.timeline().unwrap().svg_overlay(first.id), Some(&both));
+        assert_eq!(project.timeline().unwrap().svg_overlay(custom.id), Some(&custom));
     }
 
     #[test]

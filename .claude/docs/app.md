@@ -54,9 +54,13 @@ static) / `copy_keyframes { fromClipId, toClipId, props?, offset? }`,
 `set_asset_projection` (asset-level 360 mark; returns the `Asset`),
 `add_overlay` / `update_overlay` / `remove_overlay` / `set_overlay_keyframes`,
 `add_svg_overlay { source, start, end?, layout? }` (`source` is `{custom: svg}` or `{preset: {kind, params}}`) /
-`update_svg_overlay { overlayId, patch }` / `remove_svg_overlay { overlayId }` (the animated titles; each returns the
+`update_svg_overlay { overlayId, patch }` (the patch's `preset_kind` switches a preset title's kind in one edit, keeping
+its id and draw order) / `remove_svg_overlay { overlayId }` (the animated titles; each returns the
 refreshed `Timeline`, and the new title is the one that was not there before), `validate_svg { svg }` → `SvgCheck`
-(`check_svg`: the sanitised source, warnings, natural duration; needs no project, so no lock),
+(`check_svg`: the sanitised source, warnings, natural duration; needs no project, so no lock). **Reading an SVG takes
+up to ~1.7 s, so these three are `async` + `blocking`**: the add and update parse (`SvgSource::check` /
+`SvgOverlayPatch::check`) on the blocking pool *before* `lock_user`, and the lock only runs `add_svg_overlay_parsed` /
+`update_svg_overlay_parsed`,
 `list_svg_presets` → `SvgPresetInfo[]` and `svg_preset_preview { kind, params, duration? }` → the preset's SVG text
 for the project's delivery frame (the page shows it through an `<img>` data URL, never inline — the sanitiser, not
 the webview, decides what an SVG may do; `check_params` refuses empty text first),

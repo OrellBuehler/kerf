@@ -476,12 +476,14 @@ export interface SvgLayout {
 }
 
 /** Fields of an animated title to change; one left out stays. `svg` replaces the artwork with
- *  custom source (and so drops the preset); `preset_params` re-fills a preset title; the two are
- *  exclusive. */
+ *  custom source (and so drops the preset); `preset_params` re-fills a preset title and `preset_kind`
+ *  switches it to another kind, keeping its id and place in the draw order (a custom title refuses
+ *  both); `svg` is exclusive with either. */
 export interface SvgOverlayPatch {
 	name?: string;
 	svg?: string;
 	preset_params?: SvgPresetParamsInput;
+	preset_kind?: SvgPresetKind;
 	start?: number;
 	end?: number;
 	x?: number;

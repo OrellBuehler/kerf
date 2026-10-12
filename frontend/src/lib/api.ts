@@ -2417,8 +2417,9 @@ export async function addSvgOverlay(
 }
 
 /** Change an animated title; only provided fields change. `patch.svg` swaps in custom artwork (the title
- *  stops being a preset), `patch.preset_params` re-fills a preset title; a preset re-times itself when
- *  `start` / `end` change its length. */
+ *  stops being a preset), `patch.preset_params` re-fills a preset title and `patch.preset_kind` makes it another
+ *  preset (one edit; it keeps its id and place in the draw order); a preset re-times itself when `start` / `end`
+ *  change its length. */
 export async function updateSvgOverlay(overlayId: string, patch: SvgOverlayPatch): Promise<Timeline> {
 	if (!inTauri()) {
 		updateSvgOverlayIn(devTimeline, overlayId, patch);

@@ -1686,27 +1686,41 @@ fn set_overlay_keyframes(state: State<'_, AppState>, overlay_id: String, keyfram
     project.timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command(async)]
-fn add_svg_overlay(
+/// Reading the artwork (sanitise + parse) takes up to a second and a half for a heavy document, so
+/// it runs on the blocking pool *before* the project lock is taken; the lock then only places it.
+#[tauri::command]
+async fn add_svg_overlay(
     state: State<'_, AppState>,
     source: SvgSource,
     start: f64,
     end: Option<f64>,
     layout: Option<SvgLayout>,
 ) -> CmdResult<Timeline> {
-    let project = state.project();
-    project
-        .add_svg_overlay(source, start, end, layout.unwrap_or_default())
-        .map_err(|e| e.to_string())?;
-    project.timeline().map_err(|e| e.to_string())
+    let shared = state.project.clone();
+    blocking(move || {
+        let checked = source.check().map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        project
+            .add_svg_overlay_parsed(checked, start, end, layout.unwrap_or_default())
+            .map_err(|e| e.to_string())?;
+        project.timeline().map_err(|e| e.to_string())
+    })
+    .await
 }
 
-#[tauri::command(async)]
-fn update_svg_overlay(state: State<'_, AppState>, overlay_id: String, patch: SvgOverlayPatch) -> CmdResult<Timeline> {
+#[tauri::command]
+async fn update_svg_overlay(state: State<'_, AppState>, overlay_id: String, patch: SvgOverlayPatch) -> CmdResult<Timeline> {
     let oid = id(&overlay_id)?;
-    let project = state.project();
-    project.update_svg_overlay(oid, patch).map_err(|e| e.to_string())?;
-    project.timeline().map_err(|e| e.to_string())
+    let shared = state.project.clone();
+    blocking(move || {
+        let doc = patch.check().map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        project
+            .update_svg_overlay_parsed(oid, patch, doc)
+            .map_err(|e| e.to_string())?;
+        project.timeline().map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command(async)]
@@ -1719,10 +1733,10 @@ fn remove_svg_overlay(state: State<'_, AppState>, overlay_id: String) -> CmdResu
 
 /// What `add_svg_overlay` / `update_svg_overlay` would make of this source: the sanitised
 /// document, what the sanitiser or the SMIL reader could not honour, and how long it runs.
-/// Needs no project, so it never waits for the lock.
-#[tauri::command(async)]
-fn validate_svg(svg: String) -> CmdResult<SvgCheck> {
-    kerf_core::check_svg(&svg).map_err(|e| e.to_string())
+/// Needs no project, so it never waits for the lock, and parses on the blocking pool.
+#[tauri::command]
+async fn validate_svg(svg: String) -> CmdResult<SvgCheck> {
+    blocking(move || kerf_core::check_svg(&svg).map_err(|e| e.to_string())).await
 }
 
 #[tauri::command(async)]

@@ -128,9 +128,12 @@
   warnings}` (what the sanitiser / SMIL reader could not honour). The end defaults to the
   document's `natural_duration` held to 2–30 s, else four seconds; placement is checked finite
   and sane (`check_svg_rect`; opacity 0..=1); a 51st title is refused; `Error::SvgOverlayNotFound`.
-  An update's `svg` converts a preset to custom, its `preset_params` re-fills a preset (refused on
-  custom art), and **a preset is re-made whenever its length changes** — a move that keeps the
-  length keeps the artwork. `set_delivery_format` re-makes every preset for the new frame.
+  An update's `svg` converts a preset to custom, its `preset_params` re-fills a preset and its
+  `preset_kind` makes it another kind (both refused on custom art; `svg` is exclusive with either;
+  both together are one edit; the id, name, timing, placement and draw order stay), and **a preset
+  is re-made whenever its length changes** — a move that keeps the length keeps the artwork.
+  `SvgDoc::default_span` (natural duration held to 2–30 s, else 4 s) is the end an add defaults to,
+  also what `preview_svg_overlay` takes as a draft's length. `set_delivery_format` re-makes every preset for the new frame.
 - `analysis.rs` — transcription / scene / silence / rhythm are **pluggable traits**
   (`Transcriber`, `SceneDetector`, `SilenceDetector`, `RhythmAnalyzer`). Real impls
   now exist:

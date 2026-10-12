@@ -20,7 +20,7 @@ import {
 } from './caption-import-ui';
 import { attempt, errorMessage } from './ops';
 import type { TextStyle } from './style-presets';
-import { rectOf, sampleSvg, svgDataUrl, svgFrame, svgPresetChoice } from './svg-titles';
+import { sampleSvg, svgDataUrl, svgFrame, svgPresetChoice } from './svg-titles';
 import type { SvgCheck, SvgOverlay, SvgPresetInfo, SvgPresetKind, TextOverlay } from './types';
 
 /** A plain title at the playhead. */
@@ -223,14 +223,9 @@ export function convertToCustom(o: SvgOverlay): Promise<void> {
 	});
 }
 
-/** Change which preset a title is. The backend's update re-fills a preset's parameters but cannot change its kind, so
- *  this is a new title with the same text, colours, timing and placement, then the old one removed — two edits, and the
- *  new title is the selected one. */
+/** Change which preset a title is: one edit that keeps the title's id, name, text, colours, timing, placement and place
+ *  in the draw order, and leaves it selected if it was. */
 export function changePreset(o: SvgOverlay, kind: SvgPresetKind): Promise<void> {
-	const preset = o.preset;
-	if (!preset || preset.kind === kind) return Promise.resolve();
-	return attempt(async () => {
-		await editor.addSvgTitle({ preset: { kind, params: preset.params } }, o.start, o.end, { name: o.name, ...rectOf(o), opacity: o.opacity });
-		await editor.removeSvgOverlay(o.id);
-	});
+	if (!o.preset || o.preset.kind === kind) return Promise.resolve();
+	return attempt(() => editor.updateSvgOverlay(o.id, { preset_kind: kind }));
 }

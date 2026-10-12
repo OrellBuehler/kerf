@@ -5,7 +5,10 @@
 // kerf-core writes down (`svg/presets.rs`, `KERF_BLESS_SVG_PRESETS=1`): each preset drawn once
 // for the 1920x1080 frame and four seconds, with placeholder text. The harness swaps the text,
 // colours and font into those documents; it does not re-time them to another length or frame, and
-// custom SVG is neither sanitised nor evaluated (the page never inlines it either way).
+// custom SVG is neither sanitised nor evaluated (the page never inlines it either way). It does
+// refuse what the engine refuses at a glance: a document that is not XML (the browser's own
+// `DOMParser`; absent under bun), a root that is not `<svg xmlns="http://www.w3.org/2000/svg">`, and
+// one without a size to fit.
 import fixture from './fixtures/svg-presets.json';
 import type {
 	SvgCheck,
@@ -26,6 +29,8 @@ export const MAX_SVG_OVERLAYS = 50;
 const MAX_BYTES = 128 * 1024;
 const MAX_TEXT_CHARS = 200;
 const MAX_FONT_CHARS = 100;
+const MAX_COLOR_CHARS = 64;
+const SVG_NS = 'http://www.w3.org/2000/svg';
 
 type Art = { plain: string; subtitled?: string };
 const ART = fixture.presets as Record<SvgPresetKind, Art>;
@@ -50,9 +55,50 @@ function esc(s: string): string {
 
 const regexSafe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-/** A colour that can sit in an attribute: the engine reads the real syntax. */
+// The colour names SVG knows (the engine's `svgtypes` list).
+const COLOUR_NAMES = new Set(
+	`aliceblue antiquewhite aqua aquamarine azure beige bisque black blanchedalmond blue blueviolet brown burlywood cadetblue
+chartreuse chocolate coral cornflowerblue cornsilk crimson cyan darkblue darkcyan darkgoldenrod darkgray darkgreen darkgrey
+darkkhaki darkmagenta darkolivegreen darkorange darkorchid darkred darksalmon darkseagreen darkslateblue darkslategray
+darkslategrey darkturquoise darkviolet deeppink deepskyblue dimgray dimgrey dodgerblue firebrick floralwhite forestgreen
+fuchsia gainsboro ghostwhite gold goldenrod gray green greenyellow grey honeydew hotpink indianred indigo ivory khaki lavender
+lavenderblush lawngreen lemonchiffon lightblue lightcoral lightcyan lightgoldenrodyellow lightgray lightgreen lightgrey
+lightpink lightsalmon lightseagreen lightskyblue lightslategray lightslategrey lightsteelblue lightyellow lime limegreen linen
+magenta maroon mediumaquamarine mediumblue mediumorchid mediumpurple mediumseagreen mediumslateblue mediumspringgreen
+mediumturquoise mediumvioletred midnightblue mintcream mistyrose moccasin navajowhite navy oldlace olive olivedrab orange
+orangered orchid palegoldenrod palegreen paleturquoise palevioletred papayawhip peachpuff peru pink plum powderblue purple red
+rosybrown royalblue saddlebrown salmon sandybrown seagreen seashell sienna silver skyblue slateblue slategray slategrey snow
+springgreen steelblue tan teal thistle tomato transparent turquoise violet wheat white whitesmoke yellow yellowgreen`.split(/\s+/)
+);
+
+const NUMBER = String.raw`[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?`;
+const isNumber = (s: string) => new RegExp(`^${NUMBER}$`).test(s);
+const isPercent = (s: string) => new RegExp(`^${NUMBER}%$`).test(s);
+
+/** Whether the engine's colour reader (`svgtypes`) takes `value`: a name, `#rgb` `#rgba` `#rrggbb` `#rrggbbaa`, or
+ *  `rgb()` `rgba()` `hsl()` `hsla()` with three or four numbers (percentages where it allows them). */
+export function isSvgColour(value: string): boolean {
+	const s = value.trim();
+	if (/^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(s)) return true;
+	if (COLOUR_NAMES.has(s.toLowerCase())) return true;
+	const fn = /^(rgba?|hsla?)\(\s*(.*?)\s*\)$/i.exec(s);
+	if (!fn) return false;
+	const args = fn[2].split(/\s*,\s*|\s+/);
+	if (args.length !== 3 && args.length !== 4) return false;
+	const [a, b, c, alpha] = args;
+	const either = (v: string) => isNumber(v) || isPercent(v);
+	const channels = fn[1].toLowerCase().startsWith('hsl')
+		? isNumber(a) && either(b) && either(c)
+		: isPercent(a)
+			? either(b) && either(c)
+			: isNumber(a) && isNumber(b) && isNumber(c);
+	return channels && (alpha === undefined || isNumber(alpha));
+}
+
+/** A colour the engine reads: not a long string, no control characters, and one `svgtypes` takes. */
 function colourProblem(what: string, value: string): string | null {
-	return /^[#\w(),.%\s-]{1,40}$/.test(value.trim()) ? null : `${what} "${value}" is not an SVG colour like ${fixture.defaults.color}`;
+	const ok = [...value].length <= MAX_COLOR_CHARS && !/\p{Cc}/u.test(value) && isSvgColour(value);
+	return ok ? null : `${what} "${[...value].slice(0, MAX_COLOR_CHARS).join('')}" is not an SVG colour like ${fixture.defaults.color}`;
 }
 
 /** What `check_params` refuses: no text, a text or font too long, a colour that is not one. */
@@ -132,13 +178,48 @@ export function svgPresetArt(kind: SvgPresetKind, params: SvgPresetParamsInput):
 	return family ? svg.replaceAll(`font-family="${font}"`, `font-family="${esc(family)}"`) : svg;
 }
 
+const ROOT_NAMESPACE = `the root element must be <svg xmlns="${SVG_NS}">`;
+const NO_SIZE = 'the <svg> needs a viewBox (or a width and height in pixels) so it has a shape to fit';
+
+/** The attribute text of the root `<svg ...>` tag, after any XML declaration and comments; `null` for any other root. */
+const ROOT_TAG = /^\s*(?:<\?xml[^>]*\?>\s*)?(?:<!--[\s\S]*?-->\s*)*<svg(?=[\s/>])((?:"[^"]*"|'[^']*'|[^>"'])*)>/;
+
+function rootAttributes(text: string): Map<string, string> {
+	const attrs = new Map<string, string>();
+	for (const m of text.matchAll(/([^\s=/]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g)) attrs.set(m[1], m[2] ?? m[3] ?? '');
+	return attrs;
+}
+
+/** The `viewBox`, or a pixel `width` and `height`: the shape the engine fits the artwork by. */
+function hasSize(attrs: Map<string, string>): boolean {
+	const box = attrs.get('viewBox')?.trim();
+	if (box !== undefined) {
+		const n = box.split(/[\s,]+/);
+		if (n.every(isNumber)) return n.length === 4 && Number(n[2]) > 0 && Number(n[3]) > 0;
+	}
+	const positive = (v: string | undefined) => !!v && /^\s*(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?[a-z]*\s*$/i.test(v) && parseFloat(v) > 0;
+	return positive(attrs.get('width')) && positive(attrs.get('height'));
+}
+
+/** The browser's reading of `src` as XML, when there is one (not under bun): what it complains of, else `null`. */
+function xmlProblem(src: string): string | null {
+	if (typeof DOMParser === 'undefined') return null;
+	const failed = new DOMParser().parseFromString(src, 'image/svg+xml').getElementsByTagName('parsererror')[0];
+	return failed ? `not valid XML: ${(failed.textContent ?? '').trim().split('\n')[0].slice(0, 200)}` : null;
+}
+
 /** `validate_svg`: what the engine would store, and what it could not honour. The harness has no
- *  sanitiser: it drops scripts, foreign objects and animateMotion and says so, and leaves the rest. */
+ *  sanitiser: it refuses a document the engine would refuse at a glance (not XML, the wrong root or
+ *  namespace, no size), drops scripts, foreign objects and animateMotion and says so, and leaves the rest. */
 export function validateSvgSource(src: string): SvgCheck {
 	if (new TextEncoder().encode(src).length > MAX_BYTES) throw new Error(`the SVG is larger than ${MAX_BYTES / 1024} KiB`);
-	if (!/^\s*(?:<\?xml[^>]*\?>\s*)?(?:<!--[\s\S]*?-->\s*)*<svg[\s>]/.test(src)) {
-		throw new Error('the root element must be <svg xmlns="http://www.w3.org/2000/svg">');
-	}
+	const problem = xmlProblem(src);
+	if (problem) throw new Error(problem);
+	const root = ROOT_TAG.exec(src);
+	if (!root) throw new Error(ROOT_NAMESPACE);
+	const attrs = rootAttributes(root[1]);
+	if (attrs.get('xmlns') !== SVG_NS) throw new Error(ROOT_NAMESPACE);
+	if (!hasSize(attrs)) throw new Error(NO_SIZE);
 	const warnings: string[] = [];
 	let svg = src;
 	const strip = (tag: string, message: string) => {
@@ -212,8 +293,8 @@ export function addSvgOverlayTo(
 
 /** `update_svg_overlay` over a timeline object: all of it or nothing. */
 export function updateSvgOverlayIn(timeline: Timeline, overlayId: string, patch: SvgOverlayPatch): string[] {
-	if (patch.svg !== undefined && patch.preset_params !== undefined) {
-		throw new Error('pass either svg or preset_params, not both');
+	if (patch.svg !== undefined && (patch.preset_params !== undefined || patch.preset_kind !== undefined)) {
+		throw new Error('pass either svg or preset_params / preset_kind, not both');
 	}
 	let warnings: string[] = [];
 	let svg: string | undefined;
@@ -241,9 +322,12 @@ export function updateSvgOverlayIn(timeline: Timeline, overlayId: string, patch:
 		o.svg = svg;
 		delete o.preset;
 		regenerate = false;
-	} else if (patch.preset_params) {
+	} else if (patch.preset_params || patch.preset_kind) {
 		if (!o.preset) throw new Error('this title is custom SVG, not a preset; pass svg to change it');
-		o.preset = { kind: o.preset.kind, params: fillPresetParams(patch.preset_params) };
+		o.preset = {
+			kind: patch.preset_kind ?? o.preset.kind,
+			params: patch.preset_params ? fillPresetParams(patch.preset_params) : o.preset.params
+		};
 		regenerate = true;
 	}
 	if (regenerate && o.preset) o.svg = svgPresetArt(o.preset.kind, o.preset.params);
