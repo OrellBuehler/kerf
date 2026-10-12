@@ -49,7 +49,7 @@ describe('status look', () => {
 		const toaster = read('lib/components/ui/sonner/sonner.svelte');
 		const log = read('lib/components/editor/NotificationCenter.svelte');
 		for (const kind of KINDS) expect(toaster, kind).toContain(`STATUS_LOOK.${kind}.icon`);
-		expect(log).toContain("from '$lib/status-look'");
+		expect(log).toContain("from '#lib/status-look'");
 		for (const own of ["'alert-triangle'", "'lightbulb'", "'circle-x'", "'circle-check'"]) {
 			expect(log, `the log names ${own} itself`).not.toContain(own);
 			expect(toaster, `the toaster names ${own} itself`).not.toContain(own);

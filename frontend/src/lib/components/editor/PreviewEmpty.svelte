@@ -3,13 +3,13 @@
 	// agent as the other way in. It was a clapperboard icon and "No media loaded".
 	import Icon from './Icon.svelte';
 	import Btn from './Btn.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { workspace } from '$lib/workspace.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { importMedia } from '$lib/import-media';
-	import { firstRunSteps } from '$lib/first-run';
-	import { clipsIn, exportButtonState } from '$lib/export-button';
+	import { editor } from '#lib/state.svelte';
+	import { settings } from '#lib/settings.svelte';
+	import { workspace } from '#lib/workspace.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { importMedia } from '#lib/import-media';
+	import { firstRunSteps } from '#lib/first-run';
+	import { clipsIn, exportButtonState } from '#lib/export-button';
 
 	const steps = $derived(
 		firstRunSteps({

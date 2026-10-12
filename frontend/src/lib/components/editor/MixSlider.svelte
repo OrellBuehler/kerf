@@ -11,10 +11,10 @@
 	// and Escape drops whatever is in flight. Double-click resets. Only the thumb
 	// takes hold of a drag — a click elsewhere on the travel just focuses the slider —
 	// so a double-click to reset is never also a jump.
-	import { windowOf } from '$lib/realm';
-	import { windows } from '$lib/windows.svelte';
-	import { grabOffset, KEY_COMMIT_MS, moved, positionAt, sliderKey, type SliderKey } from '$lib/slider-gesture';
-	import { tip as tooltip } from '$lib/tip';
+	import { windowOf } from '#lib/realm';
+	import { windows } from '#lib/windows.svelte';
+	import { grabOffset, KEY_COMMIT_MS, moved, positionAt, sliderKey, type SliderKey } from '#lib/slider-gesture';
+	import { tip as tooltip } from '#lib/tip';
 
 	let {
 		orientation = 'vertical',

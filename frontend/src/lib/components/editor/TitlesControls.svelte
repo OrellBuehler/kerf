@@ -9,11 +9,11 @@
 	import Chip from './Chip.svelte';
 	import CheckRow from './CheckRow.svelte';
 	import Icon from './Icon.svelte';
-	import { documentOf } from '$lib/realm';
-	import { editor } from '$lib/state.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { CAPTION_LOOKS, TEXT_STYLES } from '$lib/style-presets';
-	import { addStyledTitle, addTextHere, dropCaptions, importCaptionFile, makeCaptions, pickTitle } from '$lib/title-actions';
+	import { documentOf } from '#lib/realm';
+	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { CAPTION_LOOKS, TEXT_STYLES } from '#lib/style-presets';
+	import { addStyledTitle, addTextHere, dropCaptions, importCaptionFile, makeCaptions, pickTitle } from '#lib/title-actions';
 	import {
 		CAPTION_EXTENSIONS,
 		CAPTION_HINT,
@@ -28,9 +28,9 @@
 		keepLinesOn,
 		recaptionHint,
 		resolveChoice
-	} from '$lib/caption-import-ui';
-	import { attempt } from '$lib/ops';
-	import { clock } from '$lib/clock';
+	} from '#lib/caption-import-ui';
+	import { attempt } from '#lib/ops';
+	import { clock } from '#lib/clock';
 
 	const uid = $props.id();
 	/** The options row: where its window (the panel may be in a detached one) is read from. */

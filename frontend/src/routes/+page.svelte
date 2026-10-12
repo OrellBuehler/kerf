@@ -1,29 +1,29 @@
 <script lang="ts">
 	import { onMount, tick, untrack } from 'svelte';
-	import { toast, notifications } from '$lib/notifications.svelte';
-	import TitleBar from '$lib/components/editor/TitleBar.svelte';
-	import Workspace from '$lib/components/editor/Workspace.svelte';
-	import StatusBar from '$lib/components/editor/StatusBar.svelte';
-	import ExportDialog from '$lib/components/editor/ExportDialog.svelte';
-	import SettingsDialog from '$lib/components/editor/SettingsDialog.svelte';
-	import UpdateDialog from '$lib/components/editor/UpdateDialog.svelte';
-	import AboutDialog from '$lib/components/editor/AboutDialog.svelte';
-	import VoiceoverDialog from '$lib/components/editor/VoiceoverDialog.svelte';
-	import FitMusicDialog from '$lib/components/editor/FitMusicDialog.svelte';
-	import StemsDialog from '$lib/components/editor/StemsDialog.svelte';
-	import ContextMenu from '$lib/components/editor/ContextMenu.svelte';
-	import NotificationCenter from '$lib/components/editor/NotificationCenter.svelte';
-	import Icon from '$lib/components/editor/Icon.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { agent } from '$lib/agent.svelte';
-	import { updater } from '$lib/updater.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { mediaStatus } from '$lib/media-status.svelte';
-	import { workspace } from '$lib/workspace.svelte';
-	import { popout } from '$lib/popout.svelte';
-	import { windows } from '$lib/windows.svelte';
-	import { contextMenu } from '$lib/context-menu.svelte';
+	import { toast, notifications } from '#lib/notifications.svelte';
+	import TitleBar from '#lib/components/editor/TitleBar.svelte';
+	import Workspace from '#lib/components/editor/Workspace.svelte';
+	import StatusBar from '#lib/components/editor/StatusBar.svelte';
+	import ExportDialog from '#lib/components/editor/ExportDialog.svelte';
+	import SettingsDialog from '#lib/components/editor/SettingsDialog.svelte';
+	import UpdateDialog from '#lib/components/editor/UpdateDialog.svelte';
+	import AboutDialog from '#lib/components/editor/AboutDialog.svelte';
+	import VoiceoverDialog from '#lib/components/editor/VoiceoverDialog.svelte';
+	import FitMusicDialog from '#lib/components/editor/FitMusicDialog.svelte';
+	import StemsDialog from '#lib/components/editor/StemsDialog.svelte';
+	import ContextMenu from '#lib/components/editor/ContextMenu.svelte';
+	import NotificationCenter from '#lib/components/editor/NotificationCenter.svelte';
+	import Icon from '#lib/components/editor/Icon.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { editor } from '#lib/state.svelte';
+	import { agent } from '#lib/agent.svelte';
+	import { updater } from '#lib/updater.svelte';
+	import { settings } from '#lib/settings.svelte';
+	import { mediaStatus } from '#lib/media-status.svelte';
+	import { workspace } from '#lib/workspace.svelte';
+	import { popout } from '#lib/popout.svelte';
+	import { windows } from '#lib/windows.svelte';
+	import { contextMenu } from '#lib/context-menu.svelte';
 	import {
 		cutSelection,
 		deleteSelection,
@@ -32,11 +32,11 @@
 		reattachSelection,
 		trimSelection,
 		unlinkSelection
-	} from '$lib/ops';
-	import { allowsRepeat, type ActionId } from '$lib/keymap';
-	import { runMenuCommand } from '$lib/menu-commands';
-	import { saveCoverFrame, saveProject } from '$lib/file-actions';
-	import { importCaptionFile } from '$lib/title-actions';
+	} from '#lib/ops';
+	import { allowsRepeat, type ActionId } from '#lib/keymap';
+	import { runMenuCommand } from '#lib/menu-commands';
+	import { saveCoverFrame, saveProject } from '#lib/file-actions';
+	import { importCaptionFile } from '#lib/title-actions';
 	import {
 		askUnsaved,
 		inTauri,
@@ -51,18 +51,18 @@
 		setWindowTitle,
 		showMainWindow,
 		takeLaunchProject
-	} from '$lib/api';
-	import { windowTitle } from '$lib/window-title';
-	import { finishImport, importMedia } from '$lib/import-media';
-	import { clipsIn, exportButtonState } from '$lib/export-button';
-	import { afterPaint, fontsReady, revealWindow } from '$lib/reveal';
-	import { missingProjectMessage } from '$lib/launch';
-	import { tip } from '$lib/tip';
-	import { CONFIRM, UNSAVED, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
-	import { changeIndex, changePoints, stepChange } from '$lib/staged-diff';
-	import { clampPlayhead, secondFrames, stepFrames } from '$lib/frames';
-	import { isPagingKey, onEditorSurface } from '$lib/focus-area';
-	import type { AnalysisProgress, ModelProgress } from '$lib/types';
+	} from '#lib/api';
+	import { windowTitle } from '#lib/window-title';
+	import { finishImport, importMedia } from '#lib/import-media';
+	import { clipsIn, exportButtonState } from '#lib/export-button';
+	import { afterPaint, fontsReady, revealWindow } from '#lib/reveal';
+	import { missingProjectMessage } from '#lib/launch';
+	import { tip } from '#lib/tip';
+	import { CONFIRM, UNSAVED, proceedAfter, type UnsavedCopy } from '#lib/confirm-copy';
+	import { changeIndex, changePoints, stepChange } from '#lib/staged-diff';
+	import { clampPlayhead, secondFrames, stepFrames } from '#lib/frames';
+	import { isPagingKey, onEditorSurface } from '#lib/focus-area';
+	import type { AnalysisProgress, ModelProgress } from '#lib/types';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
 	 *  may fire: Space / Delete / J-K-L would edit the live project under it. */

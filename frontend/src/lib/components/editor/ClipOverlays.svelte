@@ -26,14 +26,14 @@
 	 * gets fade handles; only a clip that plays an audio stream of its own gets a volume
 	 * line — a picture whose sound was detached does not (its volume is inert, the audio
 	 * clip linked to it carries the level), and its fades are the picture's alone. */
-	import type { Keyframe, Clip } from '$lib/types';
-	import { clipDuration } from '$lib/types';
-	import { formatTimecode } from '$lib/timecode';
-	import { beginDrag } from '$lib/drag';
-	import { quantizeFade } from '$lib/frames';
-	import { gainLabel } from '$lib/mixer';
-	import { dragGain, lineTravel, lineY } from '$lib/volume-line';
-	import { tip } from '$lib/tip';
+	import type { Keyframe, Clip } from '#lib/types';
+	import { clipDuration } from '#lib/types';
+	import { formatTimecode } from '#lib/timecode';
+	import { beginDrag } from '#lib/drag';
+	import { quantizeFade } from '#lib/frames';
+	import { gainLabel } from '#lib/mixer';
+	import { dragGain, lineTravel, lineY } from '#lib/volume-line';
+	import { tip } from '#lib/tip';
 
 	let {
 		clip,

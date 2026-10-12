@@ -7,10 +7,10 @@
 	import IconBtn from './IconBtn.svelte';
 	import Tile from './Tile.svelte';
 	import Hint from './Hint.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { AUDIO_EFFECT_PRESETS, effectLabel, freshEffect } from '$lib/effect-presets';
-	import { attempt } from '$lib/ops';
+	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { AUDIO_EFFECT_PRESETS, effectLabel, freshEffect } from '#lib/effect-presets';
+	import { attempt } from '#lib/ops';
 
 	const clip = $derived(editor.selectedClip);
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);

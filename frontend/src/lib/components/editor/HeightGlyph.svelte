@@ -1,7 +1,7 @@
 <script lang="ts">
 	/* A track-height preset drawn as what it does: the same box cut into more,
 	 * thinner rows (compact), the usual three (medium), or two fat ones (large). */
-	import type { HeightPreset } from '$lib/track-heights';
+	import type { HeightPreset } from '#lib/track-heights';
 
 	let { preset, s = 14 }: { preset: HeightPreset; s?: number } = $props();
 

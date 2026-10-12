@@ -6,13 +6,13 @@
 	import { tick } from 'svelte';
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { planMusicFit } from '$lib/api';
-	import { toast } from '$lib/notifications.svelte';
-	import { formatTime } from '$lib/diff';
-	import { describeFit, describeRemainder, fitVerdict, musicSummary, parseTarget } from '$lib/music-ui';
-	import type { MusicFit } from '$lib/types';
-	import { tip } from '$lib/tip';
+	import { editor } from '#lib/state.svelte';
+	import { planMusicFit } from '#lib/api';
+	import { toast } from '#lib/notifications.svelte';
+	import { formatTime } from '#lib/diff';
+	import { describeFit, describeRemainder, fitVerdict, musicSummary, parseTarget } from '#lib/music-ui';
+	import type { MusicFit } from '#lib/types';
+	import { tip } from '#lib/tip';
 
 	let { clipId, onClose }: { clipId: string; onClose: () => void } = $props();
 

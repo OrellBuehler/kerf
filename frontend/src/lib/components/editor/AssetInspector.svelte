@@ -8,19 +8,19 @@
 	import MediaChips from './MediaChips.svelte';
 	import InspectorSection from './InspectorSection.svelte';
 	import { VIDEO_THUMB_BG } from './data';
-	import { editor } from '$lib/state.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { mediaStatus } from '$lib/media-status.svelte';
-	import { contextMenu } from '$lib/context-menu.svelte';
-	import { analyzeMenuItems } from '$lib/analyze-menu';
-	import { assetFacts, type Fact } from '$lib/asset-facts';
-	import { doneCount } from '$lib/analysis-steps';
-	import { mediaInfo, specLine } from '$lib/media-info';
-	import { proxyActions } from '$lib/proxy-info';
-	import { deleteProxy, rebuildProxy } from '$lib/api';
-	import { toast } from '$lib/notifications.svelte';
-	import { tip } from '$lib/tip';
-	import type { Asset } from '$lib/types';
+	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { mediaStatus } from '#lib/media-status.svelte';
+	import { contextMenu } from '#lib/context-menu.svelte';
+	import { analyzeMenuItems } from '#lib/analyze-menu';
+	import { assetFacts, type Fact } from '#lib/asset-facts';
+	import { doneCount } from '#lib/analysis-steps';
+	import { mediaInfo, specLine } from '#lib/media-info';
+	import { proxyActions } from '#lib/proxy-info';
+	import { deleteProxy, rebuildProxy } from '#lib/api';
+	import { toast } from '#lib/notifications.svelte';
+	import { tip } from '#lib/tip';
+	import type { Asset } from '#lib/types';
 
 	let { asset }: { asset: Asset } = $props();
 

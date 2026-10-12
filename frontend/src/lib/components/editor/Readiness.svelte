@@ -9,11 +9,11 @@
 	// Renders nothing until the backend has answered, heading included.
 	import Icon from './Icon.svelte';
 	import SectionHead from './SectionHead.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { platformCheck } from '$lib/api';
-	import { VARIANT_PRESETS } from '$lib/delivery-formats';
-	import { platformVerdict, type Verdict, type VerdictLevel } from '$lib/platform-verdict';
+	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { platformCheck } from '#lib/api';
+	import { VARIANT_PRESETS } from '#lib/delivery-formats';
+	import { platformVerdict, type Verdict, type VerdictLevel } from '#lib/platform-verdict';
 
 	/** The frame the render will produce, `null` for the project's own; `range` the span it writes. */
 	let {

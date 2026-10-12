@@ -6,17 +6,17 @@
 	// on release, so a drag is one entry in the history and Escape leaves no trace.
 	import MixSlider from './MixSlider.svelte';
 	import FaderMeter from './FaderMeter.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { audio } from '$lib/audio';
-	import { toast } from '$lib/notifications.svelte';
-	import { nudgePan, PAN_STEP, panLabel, panSides, panToPos, posToPan, sideLabel } from '$lib/mixer';
-	import type { StereoMeter } from '$lib/meter';
-	import { stateNote, type MixStrip } from '$lib/mixer-strips';
-	import { readingText } from '$lib/levels-view';
-	import type { SliderKey } from '$lib/slider-gesture';
-	import type { LevelReading } from '$lib/types';
-	import { settings } from '$lib/settings.svelte';
-	import { tip } from '$lib/tip';
+	import { editor } from '#lib/state.svelte';
+	import { audio } from '#lib/audio';
+	import { toast } from '#lib/notifications.svelte';
+	import { nudgePan, PAN_STEP, panLabel, panSides, panToPos, posToPan, sideLabel } from '#lib/mixer';
+	import type { StereoMeter } from '#lib/meter';
+	import { stateNote, type MixStrip } from '#lib/mixer-strips';
+	import { readingText } from '#lib/levels-view';
+	import type { SliderKey } from '#lib/slider-gesture';
+	import type { LevelReading } from '#lib/types';
+	import { settings } from '#lib/settings.svelte';
+	import { tip } from '#lib/tip';
 
 	let {
 		strip,

@@ -17,9 +17,9 @@
 	import FaderMeter from './FaderMeter.svelte';
 	import Badge from './Badge.svelte';
 	import Icon from './Icon.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { audio } from '$lib/audio';
-	import { toast } from '$lib/notifications.svelte';
+	import { editor } from '#lib/state.svelte';
+	import { audio } from '#lib/audio';
+	import { toast } from '#lib/notifications.svelte';
 	import {
 		CEILING_STEP,
 		ceilingLabel,
@@ -34,15 +34,15 @@
 		nudgeDuck,
 		posToCeiling,
 		posToDuck
-	} from '$lib/levels';
-	import type { StereoMeter } from '$lib/meter';
-	import type { SliderKey } from '$lib/slider-gesture';
-	import { readingText, scopeLabel } from '$lib/levels-view';
-	import type { MasterBus } from '$lib/types';
-	import type { MeasureResult } from '$lib/editor-ui.svelte';
-	import { fxSummary, loadMasterFxOpen, saveMasterFxOpen } from '$lib/master-fx';
-	import { settings } from '$lib/settings.svelte';
-	import { tip } from '$lib/tip';
+	} from '#lib/levels';
+	import type { StereoMeter } from '#lib/meter';
+	import type { SliderKey } from '#lib/slider-gesture';
+	import { readingText, scopeLabel } from '#lib/levels-view';
+	import type { MasterBus } from '#lib/types';
+	import type { MeasureResult } from '#lib/editor-ui.svelte';
+	import { fxSummary, loadMasterFxOpen, saveMasterFxOpen } from '#lib/master-fx';
+	import { settings } from '#lib/settings.svelte';
+	import { tip } from '#lib/tip';
 
 	let {
 		master,

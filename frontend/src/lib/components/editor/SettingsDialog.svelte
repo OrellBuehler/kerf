@@ -9,19 +9,19 @@
 	import Btn from './Btn.svelte';
 	import ProgressBar from './ProgressBar.svelte';
 	import KeyboardSettings from './KeyboardSettings.svelte';
-	import { settings, CPU_PRESETS } from '$lib/settings.svelte';
-	import { gpuPreview } from '$lib/gpu-preview.svelte';
-	import { COLOR_GROUPS, PRESETS, PRESET_IDS, SHAPE_TOKENS, THUMB_STYLES } from '$lib/theme';
-	import { cancelVoiceover, onVoiceoverProgress, prepareVoiceover, voiceoverStatus } from '$lib/api';
-	import { toast } from '$lib/notifications.svelte';
-	import { failure } from '$lib/failure-copy';
-	import { ANALYSIS_KINDS } from '$lib/analysis-steps';
-	import { PREVIEW_SOURCES, PROXY_SIZES } from '$lib/proxy-info';
-	import { approxMB, isVoiceoverCancelled, loadPrefs, stageLabel } from '$lib/voiceover';
-	import { roving } from '$lib/roving';
-	import { tabStop } from '$lib/menu-nav';
-	import type { VoiceoverProgress, VoiceoverStatus } from '$lib/types';
-	import { tip } from '$lib/tip';
+	import { settings, CPU_PRESETS } from '#lib/settings.svelte';
+	import { gpuPreview } from '#lib/gpu-preview.svelte';
+	import { COLOR_GROUPS, PRESETS, PRESET_IDS, SHAPE_TOKENS, THUMB_STYLES } from '#lib/theme';
+	import { cancelVoiceover, onVoiceoverProgress, prepareVoiceover, voiceoverStatus } from '#lib/api';
+	import { toast } from '#lib/notifications.svelte';
+	import { failure } from '#lib/failure-copy';
+	import { ANALYSIS_KINDS } from '#lib/analysis-steps';
+	import { PREVIEW_SOURCES, PROXY_SIZES } from '#lib/proxy-info';
+	import { approxMB, isVoiceoverCancelled, loadPrefs, stageLabel } from '#lib/voiceover';
+	import { roving } from '#lib/roving';
+	import { tabStop } from '#lib/menu-nav';
+	import type { VoiceoverProgress, VoiceoverStatus } from '#lib/types';
+	import { tip } from '#lib/tip';
 
 	let { onClose }: { onClose: () => void } = $props();
 

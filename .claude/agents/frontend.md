@@ -18,7 +18,7 @@ timeline) first.
   `settings`, `workspace`, `updater`, notifications. Don't add stores.
 - Style with the CSS-variable tokens (`kerf-tokens.css`) inline — **no color
   literals** in components; every color is themable. Not Tailwind utilities.
-- Toasts come from `$lib/notifications.svelte`, not `svelte-sonner`.
+- Toasts come from `#lib/notifications.svelte`, not `svelte-sonner`.
 - `api.ts` is the only backend bridge. Every call has an `inTauri()` branch; a
   new command needs a working browser-harness fallback so `bun run dev` stays
   explorable (frames may return `null` there).

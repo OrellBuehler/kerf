@@ -10,11 +10,11 @@
 	import Chip from './Chip.svelte';
 	import Tile from './Tile.svelte';
 	import Hint from './Hint.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { COLOR_LOOKS, activeLook } from '$lib/style-presets';
-	import { VIDEO_EFFECT_PRESETS, effectLabel, freshEffect } from '$lib/effect-presets';
-	import { DEFAULT_COLOR } from '$lib/types';
-	import { attempt } from '$lib/ops';
+	import { editor } from '#lib/state.svelte';
+	import { COLOR_LOOKS, activeLook } from '#lib/style-presets';
+	import { VIDEO_EFFECT_PRESETS, effectLabel, freshEffect } from '#lib/effect-presets';
+	import { DEFAULT_COLOR } from '#lib/types';
+	import { attempt } from '#lib/ops';
 
 	const clip = $derived(editor.selectedClip);
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);

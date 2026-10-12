@@ -16,11 +16,11 @@
 	 * its whole backing store otherwise); a redraw only assigns the canvas size when
 	 * it changed, since that reallocates the backing store even for the same size. */
 	import { untrack } from 'svelte';
-	import type { Clip } from '$lib/types';
-	import { drawFilmstrip } from '$lib/filmstrip-draw';
-	import { filmVisible, planSlots } from '$lib/filmstrip-view';
-	import { filmstrips } from '$lib/filmstrips';
-	import { canvasScale, capDpr, clipCanvasRect } from '$lib/waveform-view';
+	import type { Clip } from '#lib/types';
+	import { drawFilmstrip } from '#lib/filmstrip-draw';
+	import { filmVisible, planSlots } from '#lib/filmstrip-view';
+	import { filmstrips } from '#lib/filmstrips';
+	import { canvasScale, capDpr, clipCanvasRect } from '#lib/waveform-view';
 
 	let {
 		clip,

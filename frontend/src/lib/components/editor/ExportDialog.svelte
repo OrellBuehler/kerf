@@ -7,17 +7,17 @@
 	import SectionHead from './SectionHead.svelte';
 	import DeliverTo from './DeliverTo.svelte';
 	import Readiness from './Readiness.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { inTauri, pickExportPath, hwEncoders, knownHwEncoders, revealPath } from '$lib/api';
-	import { toast } from '$lib/notifications.svelte';
-	import { formatsFor, hasPicture } from '$lib/delivery-formats';
-	import { formatTimecode } from '$lib/timecode';
-	import { frameKey, restoreDraft } from '$lib/export-draft';
-	import { judgeable } from '$lib/platform-verdict';
-	import type { RowSpec } from '$lib/slider-row';
-	import type { Container, ExportOptions, Fit, RateControl } from '$lib/types';
-	import { exportedLine, failure } from '$lib/failure-copy';
+	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { inTauri, pickExportPath, hwEncoders, knownHwEncoders, revealPath } from '#lib/api';
+	import { toast } from '#lib/notifications.svelte';
+	import { formatsFor, hasPicture } from '#lib/delivery-formats';
+	import { formatTimecode } from '#lib/timecode';
+	import { frameKey, restoreDraft } from '#lib/export-draft';
+	import { judgeable } from '#lib/platform-verdict';
+	import type { RowSpec } from '#lib/slider-row';
+	import type { Container, ExportOptions, Fit, RateControl } from '#lib/types';
+	import { exportedLine, failure } from '#lib/failure-copy';
 	import {
 		PRESETS,
 		presetsByGroup,
@@ -46,7 +46,7 @@
 		buildCommandPreview,
 		withLoudness,
 		type LoudnessChoice
-	} from '$lib/export-presets';
+	} from '#lib/export-presets';
 
 	let { onClose }: { onClose: () => void } = $props();
 

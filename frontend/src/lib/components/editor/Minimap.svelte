@@ -12,8 +12,8 @@
 	 * scroller, so a gesture ends in `onview` with the scroll and zoom it wants and
 	 * the timeline applies them (a zoom change needs the lane re-widened first).
 	 * Escape / pointercancel / blur put the view back as the press found it. */
-	import { beginDrag } from '$lib/drag';
-	import { clipDuration, type Track } from '$lib/types';
+	import { beginDrag } from '#lib/drag';
+	import { clipDuration, type Track } from '#lib/types';
 	import {
 		EDGE_PX,
 		centerOn,
@@ -31,8 +31,8 @@
 		type MapGeo,
 		type Target,
 		type View
-	} from '$lib/minimap';
-	import { tip } from '$lib/tip';
+	} from '#lib/minimap';
+	import { tip } from '#lib/tip';
 
 	let {
 		tracks,

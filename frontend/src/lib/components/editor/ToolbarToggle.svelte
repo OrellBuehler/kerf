@@ -6,7 +6,7 @@
 	// neither. Colors and states are `styles/controls.css` (`.k-tt`), so every theme gets them.
 	import type { Snippet } from 'svelte';
 	import Icon from './Icon.svelte';
-	import { tip, tipText, type TipInput } from '$lib/tip';
+	import { tip, tipText, type TipInput } from '#lib/tip';
 
 	let {
 		title,
