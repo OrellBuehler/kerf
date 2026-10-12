@@ -5310,6 +5310,69 @@ fn a_decoders_default_tag_labels_nothing_beside_untagged_hd() {
     assert!(made >= 2, "only {made} of the three files could be made");
 }
 
+/// FFmpeg's h264 decoder calls every full-range stream `yuvj420p`, and what OBS, a drone or a phone writes with
+/// `-color_range pc -colorspace bt709` probes `h264 yuvj420p bt709`: the file's own word, a matrix. `yuvj` is not the
+/// decoder, so the untagged HD beside such a clip is labelled BT.709 like any other, and the stack is one matrix.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_full_range_clip_with_a_stated_matrix_labels_the_untagged_hd_beside_it() {
+    let h = hd_media();
+    eprintln!("composite colour policy of this FFmpeg: {:?}", policy());
+    let untagged = h.get("grad/hd-untagged");
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("parity-media-hd")
+        .join("obs-full-range.mp4");
+    ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("{DETAIL},format=yuv420p"),
+        "-c:v",
+        "libx264",
+        "-qp",
+        "0",
+        "-g",
+        "10",
+        "-pix_fmt",
+        "yuv420p",
+        "-color_range",
+        "pc",
+        "-colorspace",
+        "bt709",
+        "-color_primaries",
+        "bt709",
+        "-color_trc",
+        "bt709",
+        path.to_str().unwrap(),
+    ]);
+    let obs = probed(&path);
+    eprintln!(
+        "obs-full-range.mp4: probed {} {:?} tag {:?}",
+        obs.streams[0].codec, obs.streams[0].pix_fmt, obs.streams[0].color_space
+    );
+    assert_eq!(
+        obs.streams[0].pix_fmt.as_deref(),
+        Some("yuvj420p"),
+        "FFmpeg calls a full-range stream yuvj420p"
+    );
+    assert_eq!(obs.streams[0].color_space.as_deref(), Some("bt709"));
+    for (name, base, top) in [
+        ("label/untagged-hd-over-full-range-709", &obs, untagged),
+        ("label/full-range-709-over-untagged-hd", untagged, &obs),
+    ] {
+        let (tl, assets) = hd_stack(base, top, 1.0);
+        let labels = labelled_layers(&tl, &assets, 0.5);
+        assert_eq!(
+            labels.iter().filter(|l| **l).count(),
+            1,
+            "{name}: the untagged HD clip is labelled, {labels:?}"
+        );
+        assert!(labels[usize::from(top.id == untagged.id)], "{name}");
+        eprintln!("{name}: {}", plan_matrices(&tl, &assets));
+        check(name, &tl, &assets, &[0.5], STRICT);
+    }
+}
+
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn the_previews_proxies_stack_as_their_originals_do() {

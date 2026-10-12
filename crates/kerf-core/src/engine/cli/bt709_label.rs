@@ -46,6 +46,8 @@ struct Kit {
     hd2: Asset,
     /// A phone's clip: BT.709, tagged.
     phone: Asset,
+    /// A full-range BT.709 H.264 clip (OBS, a drone): probed `h264 yuvj420p pc bt709`, a stated matrix.
+    obs: Asset,
     hlg: Asset,
     /// Untagged SD, SD tagged `smpte170m`, HD tagged `smpte170m`.
     sd: Asset,
@@ -82,6 +84,7 @@ fn kit() -> Kit {
         hd: picture("hd", 1920, 1080, "yuv420p", None),
         hd2: picture("hd2", 1280, 720, "yuv420p", Some("unknown")),
         phone: picture("phone", 1920, 1080, "yuv420p", Some("bt709")),
+        obs: picture("obs", 1920, 1080, "yuvj420p", Some("bt709")),
         hlg: hdr(picture("hlg", 3840, 2160, "yuv420p10le", None), "arib-std-b67"),
         sd: picture("sd", 720, 576, "yuv420p", None),
         sd601: picture("sd601", 720, 576, "yuv420p", Some("smpte170m")),
@@ -189,6 +192,12 @@ fn an_untagged_hd_clip_is_labelled_beside_a_tagged_one_in_all_four_builders() {
         (&k.hd, &k.phone, "untagged HD over a phone's BT.709 clip"),
         (&k.phone, &k.hd, "a BT.709 clip over untagged HD"),
         (&k.hd, &k.hlg, "untagged HD over HLG"),
+        (
+            &k.hd,
+            &k.obs,
+            "untagged HD over a full-range BT.709 H.264 clip (yuvj420p, stated bt709)",
+        ),
+        (&k.obs, &k.hd, "a full-range BT.709 H.264 clip over untagged HD"),
         (&k.hd, &k.hd601, "untagged HD over HD tagged smpte170m"),
         (&k.hd, &k.sd601, "untagged HD over SD tagged smpte170m"),
     ] {
@@ -250,7 +259,7 @@ fn the_label_sits_after_the_geometry_and_ahead_of_everything_that_reads_the_matr
 fn nothing_is_labelled_without_a_matrix_named_in_the_graph() {
     let k = kit();
     // A single clip of every kind, in every builder.
-    let mut every = vec![&k.hd, &k.hd2, &k.phone, &k.hlg, &k.sd, &k.sd601];
+    let mut every = vec![&k.hd, &k.hd2, &k.phone, &k.obs, &k.hlg, &k.sd, &k.sd601];
     every.extend(k.others());
     for a in every {
         let tl = timeline_of(vec![video_track(vec![make_clip(a.id, 0.0, 1.0, 0.0)])]);
@@ -384,7 +393,7 @@ fn graph_labels(tl: &Timeline, graph: &str) -> Vec<(uuid::Uuid, bool)> {
 
 /// Every pairing of two kinds of footage, each way round, with and without a third that names nothing.
 fn pairings(k: &Kit) -> Vec<(String, Timeline, Vec<Asset>)> {
-    let mut all = vec![&k.hd, &k.hd2, &k.phone, &k.hlg, &k.sd, &k.sd601, &k.hd601];
+    let mut all = vec![&k.hd, &k.hd2, &k.phone, &k.obs, &k.hlg, &k.sd, &k.sd601, &k.hd601];
     all.extend(k.others());
     let mut out = Vec::new();
     for base in all.iter().copied() {
@@ -804,11 +813,17 @@ fn psnr(a: &[u8], b: &[u8]) -> (f64, u8) {
     (10.0 * (255.0 * 255.0 / (se / a.len() as f64)).log10(), worst)
 }
 
-fn stack_of(base: &Asset, top: &Asset, opacity: f64) -> (Timeline, Vec<Asset>) {
+fn plain(_: &mut Clip) {}
+
+fn translucent(c: &mut Clip) {
+    c.transform.opacity = 0.5;
+}
+
+fn stack_of(base: &Asset, top: &Asset, dress: fn(&mut Clip)) -> (Timeline, Vec<Asset>) {
     let mut tl = stack(base, top);
     tl.tracks[0].clips[0].source_out = 1.0;
     tl.tracks[1].clips[0].source_out = 1.0;
-    tl.tracks[1].clips[0].transform.opacity = opacity;
+    dress(&mut tl.tracks[1].clips[0]);
     (tl, vec![base.clone(), top.clone()])
 }
 
@@ -821,18 +836,31 @@ fn a_labelled_input_renders_as_a_file_tagged_bt709_is_in_all_four_builders() {
     let tagged = footage(&dir, "tagged", GRADIENT, "bt709", BT709);
     let phone = footage(&dir, "phone", DETAIL, "bt709", BT709);
     eprintln!("composite colour policy: {:?}", composite_color_policy());
-    for (what, opacity, top_first) in [
-        ("untagged HD over a BT.709 clip", 1.0, true),
-        ("a translucent untagged HD clip over a BT.709 clip", 0.5, true),
-        ("a BT.709 clip over untagged HD", 1.0, false),
-        ("a translucent BT.709 clip over untagged HD", 0.5, false),
+    // What the chain does after the label, one at a time: each is a filter that may ask a scaler for
+    // another pixel format, which is why the label comes first.
+    let graded: fn(&mut Clip) = |c| {
+        c.color.saturation = 1.4;
+        c.color.brightness = 0.05;
+    };
+    let rotated: fn(&mut Clip) = |c| c.transform.rotation = 12.0;
+    let vignetted: fn(&mut Clip) = |c| c.effects.push(crate::model::VideoEffect::Vignette);
+    let faded: fn(&mut Clip) = |c| c.fade_in = 0.8;
+    for (what, dress, top_first) in [
+        ("untagged HD over a BT.709 clip", plain as fn(&mut Clip), true),
+        ("a translucent untagged HD clip over a BT.709 clip", translucent, true),
+        ("a graded untagged HD clip over a BT.709 clip", graded, true),
+        ("a rotated untagged HD clip over a BT.709 clip", rotated, true),
+        ("a vignetted untagged HD clip over a BT.709 clip", vignetted, true),
+        ("a fading untagged HD clip over a BT.709 clip", faded, true),
+        ("a BT.709 clip over untagged HD", plain, false),
+        ("a translucent BT.709 clip over untagged HD", translucent, false),
     ] {
         // The labelled stack, and the same stack with the footage tagged in the file.
         let build = |hd: &Asset| {
             if top_first {
-                stack_of(&phone, hd, opacity)
+                stack_of(&phone, hd, dress)
             } else {
-                stack_of(hd, &phone, opacity)
+                stack_of(hd, &phone, dress)
             }
         };
         let ((a_tl, a_assets), (b_tl, b_assets)) = (build(&untagged), build(&tagged));
@@ -897,16 +925,16 @@ fn a_mixed_stack_of_proxies_is_the_stack_of_the_originals() {
         .collect();
     assert!(proxies.iter().all(|p| p.0.is_file()));
     let preview = |assets: &[Asset]| Project::preview_assets_of(assets.to_vec());
-    for (what, opacity, hd_on_top, other) in [
-        ("untagged HD over a BT.709 clip", 1.0, true, &phone),
-        ("a translucent untagged HD clip over a BT.709 clip", 0.5, true, &phone),
-        ("a BT.709 clip over untagged HD", 1.0, false, &phone),
-        ("untagged HD over untagged SD", 1.0, true, &sd),
+    for (what, dress, hd_on_top, other) in [
+        ("untagged HD over a BT.709 clip", plain as fn(&mut Clip), true, &phone),
+        ("a translucent untagged HD clip over a BT.709 clip", translucent, true, &phone),
+        ("a BT.709 clip over untagged HD", plain, false, &phone),
+        ("untagged HD over untagged SD", plain, true, &sd),
     ] {
         let (tl, assets) = if hd_on_top {
-            stack_of(other, &untagged, opacity)
+            stack_of(other, &untagged, dress)
         } else {
-            stack_of(&untagged, other, opacity)
+            stack_of(&untagged, other, dress)
         };
         let seen = preview(&assets);
         assert!(
@@ -943,10 +971,12 @@ fn a_mixed_stack_of_proxies_is_the_stack_of_the_originals() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Real files whose only tag is their decoder's default, probed (on 6.1.1 and 9.0.2 alike): a JPEG
-/// and a WebP say `bt470bg`, a PNG of any layout and RGB video say `gbr`, MJPEG video says `bt470bg`.
-/// Beside untagged HD they name no matrix: no builder labels anything, and the argv is the one the
-/// same file without the tag gives.
+/// Real files, probed (on 6.1.1 and 9.0.2 alike), whose only tag is their decoder's default: a JPEG and
+/// a WebP say `bt470bg`, a PNG of any layout and RGB video say `gbr`, and the `mjpeg`, `speedhq` and
+/// `amv` decoders say `bt470bg` of everything (`jpegls` does of `rgb24`). Beside untagged HD they name
+/// no matrix: no builder labels anything, and the argv is the one the same file without the tag gives.
+/// A full-range H.264 clip with a stated BT.709 (`h264 yuvj420p pc bt709`, what OBS and drones write) is
+/// the file's word and does label the HD beside it: `yuvj` is not the decoder.
 ///
 /// `cargo test -p kerf-core --no-default-features -- --ignored real_files_whose_tag`
 #[test]
@@ -954,24 +984,50 @@ fn a_mixed_stack_of_proxies_is_the_stack_of_the_originals() {
 fn real_files_whose_tag_is_the_decoders_default_name_no_matrix_beside_untagged_hd() {
     let dir = scratch("defaults");
     let hd = footage(&dir, "hd", GRADIENT, "bt709", UNTAGGED);
-    // (file, the pixel format it is made in, the encoder's arguments)
-    let files: [(&str, &str, &[&str]); 8] = [
-        ("photo.jpg", "yuvj420p", &["-frames:v", "1"]),
-        ("photo.webp", "yuv420p", &["-frames:v", "1", "-c:v", "libwebp"]),
-        ("logo-rgb24.png", "rgb24", &["-frames:v", "1"]),
-        ("logo-rgba.png", "rgba", &["-frames:v", "1"]),
-        ("grey.png", "gray", &["-frames:v", "1"]),
-        ("webcam.mkv", "yuvj420p", &["-c:v", "mjpeg", "-q:v", "3"]),
-        ("webcam-422.avi", "yuvj422p", &["-c:v", "mjpeg", "-q:v", "3"]),
-        ("capture.mkv", "bgr0", &["-c:v", "ffv1"]),
+    let h264 = ["-c:v", "libx264", "-qp", "18"];
+    let full_709 = [
+        "-color_range",
+        "pc",
+        "-colorspace",
+        "bt709",
+        "-color_primaries",
+        "bt709",
+        "-color_trc",
+        "bt709",
     ];
-    let mut checked = 0;
-    for (name, pix_fmt, encoder) in files {
+    // (file, the pixel format it is made in, the encoder's arguments, whether its tag is the file's word)
+    let files: [(&str, &str, Vec<&str>, bool); 13] = [
+        ("photo.jpg", "yuvj420p", vec!["-frames:v", "1"], false),
+        ("photo.webp", "yuv420p", vec!["-frames:v", "1", "-c:v", "libwebp"], false),
+        ("logo-rgb24.png", "rgb24", vec!["-frames:v", "1"], false),
+        ("logo-rgba.png", "rgba", vec!["-frames:v", "1"], false),
+        ("grey.png", "gray", vec!["-frames:v", "1"], false),
+        ("webcam.mkv", "yuvj420p", vec!["-c:v", "mjpeg", "-q:v", "3"], false),
+        ("webcam-422.avi", "yuvj422p", vec!["-c:v", "mjpeg", "-q:v", "3"], false),
+        (
+            "webcam-422-limited.mkv",
+            "yuv422p",
+            vec!["-c:v", "mjpeg", "-q:v", "3", "-strict", "unofficial"],
+            false,
+        ),
+        ("ndi.mov", "yuv422p", vec!["-c:v", "speedhq"], false),
+        ("jpegls.avi", "rgb24", vec!["-c:v", "jpegls"], false),
+        ("capture.mkv", "bgr0", vec!["-c:v", "ffv1"], false),
+        ("capture-alpha.mkv", "bgra", vec!["-c:v", "ffv1"], false),
+        (
+            "obs-full-range.mp4",
+            "yuv420p",
+            h264.iter().chain(&full_709).copied().collect(),
+            true,
+        ),
+    ];
+    let (mut checked, mut named) = (0, 0);
+    for (name, pix_fmt, encoder, names) in files {
         let path = dir.join(name);
         let made = command(&ffmpeg_bin())
             .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
             .arg(format!("{DETAIL},format={pix_fmt}"))
-            .args(encoder)
+            .args(&encoder)
             .args(["-pix_fmt", pix_fmt])
             .arg(&path)
             .status_bounded()
@@ -989,16 +1045,31 @@ fn real_files_whose_tag_is_the_decoders_default_name_no_matrix_beside_untagged_h
             video.color_space,
             video.image
         );
+        if names {
+            // The file's word: the untagged HD beside it is labelled, in every builder, whichever way round.
+            assert!(
+                video.names_a_matrix(),
+                "{name}: a stated matrix on a full-range clip is the file's word"
+            );
+            for (top, base) in [(&hd, &shape), (&shape, &hd)] {
+                let (tl, assets) = stack_of(base, top, plain);
+                for (builder, graph) in graphs(&tl, &assets) {
+                    assert_eq!(labelled(&graph), 1, "{name} beside untagged HD, {builder}");
+                }
+            }
+            named += 1;
+            continue;
+        }
         assert!(!video.names_a_matrix(), "{name}: the probe's tag is the decoder's default");
         let mut twin = shape.clone();
         twin.streams[0].color_space = None;
         for (top, base) in [(&hd, &shape), (&shape, &hd)] {
             let (stacked, twinned) = (
-                stack_of(base, top, 1.0),
+                stack_of(base, top, plain),
                 stack_of(
                     if base.id == shape.id { &twin } else { base },
                     if top.id == shape.id { &twin } else { top },
-                    1.0,
+                    plain,
                 ),
             );
             for ((builder, graph), (_, bare)) in graphs(&stacked.0, &stacked.1).into_iter().zip(graphs(&twinned.0, &twinned.1)) {
@@ -1008,6 +1079,7 @@ fn real_files_whose_tag_is_the_decoders_default_name_no_matrix_beside_untagged_h
         }
         checked += 1;
     }
-    assert!(checked >= 6, "only {checked} files could be made");
+    assert!(checked >= 8, "only {checked} files could be made");
+    assert_eq!(named, 1, "the full-range BT.709 clip could not be made");
     let _ = std::fs::remove_dir_all(&dir);
 }

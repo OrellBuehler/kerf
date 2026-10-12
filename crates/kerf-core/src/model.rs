@@ -234,6 +234,11 @@ pub fn matrix_tag_is_stated(tag: Option<&str>) -> bool {
     tag.is_some_and(|t| !matches!(t.trim(), "" | "unknown" | "unspecified" | "reserved"))
 }
 
+/// The codecs whose decoders write `bt470bg` on everything they decode, whatever the file says (probed
+/// on FFmpeg 6.1.1 and 9.0.2 with ~100 encoder / pixel-format pairs: no other decoder did): MJPEG, AMV and
+/// SpeedHQ. A tag from one of them is the decoder's default, not the file's word.
+pub(crate) const DEFAULT_TAG_CODECS: [&str; 3] = ["mjpeg", "amv", "speedhq"];
+
 /// Whether a picture is **untagged HD YCbCr**: HD (mpv's rule, `width >= 1280 || height > 576`, on
 /// the source's displayed size), YCbCr on the pixel-format allow-list (alpha, grey and RGB are not),
 /// not `yuvj…` (JFIF and a webcam's MJPEG are BT.601 by definition), naming no matrix and not HDR
@@ -410,33 +415,34 @@ impl StreamInfo {
     /// Whether this video stream **names a YCbCr matrix** to a graph that holds it: HDR (tone-mapped to
     /// a tagged BT.709 picture) or a tag that is the *file's* word ([`matrix_tag_is_stated`]).
     ///
-    /// Many tags are the decoder's default and say nothing of the file, so they name nothing; probed
-    /// on both FFmpegs: a PNG (`gbr`, whatever its layout: `rgb24`, `rgba`, `gray`), RGB video
-    /// (`gbr`), a JPEG or a WebP (`bt470bg`) and MJPEG video (`bt470bg`). That is the mirror of
-    /// [`StreamInfo::is_untagged_hd_yuv`]'s exclusions (a still image, `yuvj…`/MJPEG, RGB, grey,
-    /// alpha are never labelled): what is never labelled never labels. An explicit tag on
-    /// `yuvj…` footage (a camera's full-range BT.709 H.264) is passed over with it; the cost is only
-    /// an HD clip beside it left as FFmpeg reads it, which is what it has always been.
+    /// The principle: **a tag a decoder writes by default is not the file's word.** Probed on both
+    /// FFmpegs, those are `gbr` on any PNG (`rgb24`, `rgba`, `gray`) and, depending on the encoder that
+    /// made it, on RGB video; `bt470bg` on a JPEG and a WebP; and `bt470bg` from the `mjpeg`, `amv` and
+    /// `speedhq` decoders (MJPEG video, an AMV player's clips, NDI's SpeedHQ), whatever their pixel
+    /// format. An explicit tag on any other
+    /// codec is the file's, `yuvj…` full-range H.264 included (FFmpeg's h264 decoder names every
+    /// full-range stream `yuvj420p`, and a camera's `pc` + `bt709` is a matrix).
+    ///
+    /// This is *not* the mirror of [`StreamInfo::is_untagged_hd_yuv`]'s exclusions: grey, alpha and SD
+    /// pictures are never labelled but do name a matrix when tagged, and that asymmetry is intended
+    /// (a tagged SD clip is a stated matrix; it just is not HD). What the two share is only that a
+    /// still image, RGB and a decoder's default are nobody's word.
     pub fn names_a_matrix(&self) -> bool {
         self.kind == StreamKind::Video && (self.hdr().is_some() || (self.tag_is_the_files() && self.has_a_yuv_tag()))
     }
 
-    /// The tag is a matrix a YCbCr picture states: not `gbr`, not on an RGB picture.
+    /// The tag is a matrix a YCbCr picture states: not `gbr` (RGB, "identity"), and not on an RGB
+    /// picture (`jpegls` writes `bt470bg` on `rgb24` on FFmpeg 6.1.1).
     fn has_a_yuv_tag(&self) -> bool {
         matrix_tag_is_stated(self.color_space.as_deref())
             && self.color_space.as_deref().map(str::trim) != Some("gbr")
             && self.pix_fmt.as_deref().and_then(pix_fmt_layout) != Some(PixLayout::Rgb)
     }
 
-    /// Whether the tag can be the file's own: not a still image's, not full-range (`yuvj…`) or MJPEG
-    /// footage's, whose decoders write theirs.
+    /// Whether the tag can be the file's own: not a still image's and not written by one of the
+    /// decoders that tag everything they decode ([`DEFAULT_TAG_CODECS`]).
     fn tag_is_the_files(&self) -> bool {
-        !self.image
-            && !self.codec.eq_ignore_ascii_case("mjpeg")
-            && !self
-                .pix_fmt
-                .as_deref()
-                .is_some_and(|f| f.to_ascii_lowercase().starts_with("yuvj"))
+        !self.image && !DEFAULT_TAG_CODECS.iter().any(|c| self.codec.eq_ignore_ascii_case(c))
     }
 
     /// Whether this video stream is **untagged HD YCbCr** ([`untagged_hd_yuv`]) and a moving
@@ -6307,14 +6313,40 @@ mod tests {
         // ProRes clip tagged `bt470bg` names it (and so does SD tagged `smpte170m`).
         assert!(picture(1920, 1080, "yuv420p", Some("bt470bg")).names_a_matrix());
         assert!(picture(1920, 1080, "yuv422p10le", Some("bt470bg")).names_a_matrix());
-        // …but not on a still image, MJPEG or `yuvj…` footage, whose decoders write theirs.
+        // …but not on a still image, nor from a decoder that tags everything it decodes (MJPEG, AMV and
+        // SpeedHQ), whatever the pixel format: `yuv422p` MJPEG is no more the file's word than `yuvj420p`.
         let mut jpeg = picture(1920, 1080, "yuv420p", Some("bt470bg"));
         jpeg.image = true;
         assert!(!jpeg.names_a_matrix());
-        let mut mjpeg = picture(1920, 1080, "yuv422p", Some("bt470bg"));
-        mjpeg.codec = "mjpeg".into();
-        assert!(!mjpeg.names_a_matrix());
-        assert!(!picture(1920, 1080, "yuvj420p", Some("bt709")).names_a_matrix());
+        for (codec, fmt) in [
+            ("mjpeg", "yuv422p"),
+            ("mjpeg", "yuvj422p"),
+            ("amv", "yuvj420p"),
+            ("speedhq", "yuv422p"),
+        ] {
+            let mut s = picture(1920, 1080, fmt, Some("bt470bg"));
+            s.codec = codec.into();
+            assert!(!s.names_a_matrix(), "{codec} {fmt}");
+            s.codec = codec.to_ascii_uppercase();
+            assert!(!s.names_a_matrix(), "{codec} {fmt}: the codec is matched whatever its case");
+        }
+        // The pixel format is not the decoder: FFmpeg's h264 decoder reports every full-range stream as
+        // `yuvj420p`, and a camera's full-range BT.709 (libx264 `-color_range pc -colorspace bt709`
+        // probes `h264 yuvj420p pc bt709`) states a matrix, which labels the untagged HD beside it.
+        let full_range = picture(1920, 1080, "yuvj420p", Some("bt709"));
+        assert!(full_range.names_a_matrix());
+        assert_eq!(bt709_labels(&[Some(&hd), Some(&full_range)]), [true, false]);
+        // …while an untagged full-range clip is still never labelled itself.
+        let untagged_full_range = picture(1920, 1080, "yuvj420p", None);
+        assert!(!untagged_full_range.is_untagged_hd_yuv() && !untagged_full_range.names_a_matrix());
+        assert_eq!(bt709_labels(&[Some(&phone), Some(&untagged_full_range)]), [false, false]);
+        // An RGB picture has no YCbCr matrix to name even when its tag is not `gbr`: `jpegls` writes
+        // `bt470bg` on `rgb24` on FFmpeg 6.1.1 (and not a still image or one of the codecs above).
+        let mut jpegls = picture(1920, 1080, "rgb24", Some("bt470bg"));
+        jpegls.codec = "jpegls".into();
+        assert!(!jpegls.names_a_matrix());
+        jpegls.pix_fmt = Some("yuv420p".into());
+        assert!(jpegls.names_a_matrix(), "the same tag on a YCbCr picture is a matrix");
         // A second video stream (cover art) does not tone-map or tag the first.
         let mut asset = crate::engine::test_support::test_asset(vec![
             picture(1920, 1080, "yuv420p", None),

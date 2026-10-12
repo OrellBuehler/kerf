@@ -1468,7 +1468,7 @@ fn the_argv_builders_still_produce_the_golden_digests() {
 /// graphs the stand-in names a matrix for: nowhere for the shapes that name nothing (a project of
 /// untagged HD footage and a logo or a photo is as it always was), where HDR was for the shapes
 /// that do.
-const STAND_INS: [(&str, bool, bool, &str, &str, &str); 8] = [
+const STAND_INS: &[(&str, bool, bool, &str, &str, &str)] = &[
     // (name, names a matrix, still image, codec, pix_fmt, tag)
     ("png rgba gbr", false, true, "png", "rgba", "gbr"),
     ("png gray gbr", false, true, "png", "gray", "gbr"),
@@ -1476,9 +1476,22 @@ const STAND_INS: [(&str, bool, bool, &str, &str, &str); 8] = [
     ("webp bt470bg", false, true, "webp", "yuv420p", "bt470bg"),
     ("mjpeg video bt470bg", false, false, "mjpeg", "yuvj420p", "bt470bg"),
     ("rgb video gbr", false, false, "ffv1", "bgr0", "gbr"),
+    // Each of these is kept off by one rule alone: `gbr` on a layout that is not RGB (a moving
+    // picture with alpha), a decoder that tags everything it decodes with no `yuvj` to give it away
+    // (MJPEG at 4:2:2, SpeedHQ), AMV, and an RGB picture whose tag is not `gbr` (`jpegls` on 6.1.1).
+    ("rgba video gbr", false, false, "ffv1", "bgra", "gbr"),
+    ("mjpeg video yuv422p bt470bg", false, false, "mjpeg", "yuv422p", "bt470bg"),
+    ("speedhq yuv422p bt470bg", false, false, "speedhq", "yuv422p", "bt470bg"),
+    ("amv yuvj420p bt470bg", false, false, "amv", "yuvj420p", "bt470bg"),
+    ("jpegls rgb24 bt470bg", false, false, "jpegls", "rgb24", "bt470bg"),
+    // The controls: a tag that is the file's word, `yuvj420p` full-range H.264 (OBS, drones) included.
     ("h264 bt709", true, false, "h264", "yuv420p", "bt709"),
     ("h264 smpte170m", true, false, "h264", "yuv420p", "smpte170m"),
+    ("h264 yuvj420p bt709", true, false, "h264", "yuvj420p", "bt709"),
 ];
+
+/// How many stand-ins there are.
+const SHAPES: usize = STAND_INS.len();
 
 #[test]
 fn a_decoders_default_tag_names_no_matrix_in_any_graph_of_the_corpus() {
@@ -1510,16 +1523,16 @@ fn a_decoders_default_tag_names_no_matrix_in_any_graph_of_the_corpus() {
             })
             .collect()
     };
-    let swapped: Vec<Vec<Asset>> = (0..STAND_INS.len()).map(stand_in).collect();
+    let swapped: Vec<Vec<Asset>> = (0..SHAPES).map(stand_in).collect();
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
     // (shape, case, kind) triples that disagree, and how many cases each shape covered / labelled.
-    type Found = (Vec<String>, [usize; 8], [usize; 8]);
+    type Found = (Vec<String>, [usize; SHAPES], [usize; SHAPES]);
     let results: Vec<Found> = std::thread::scope(|s| {
         let workers: Vec<_> = (0..threads)
             .map(|w| {
                 let (assets, swapped, hdr_ids) = (&assets, &swapped, &hdr_ids);
                 s.spawn(move || {
-                    let (mut bad, mut covered, mut labelled) = (Vec::new(), [0usize; 8], [0usize; 8]);
+                    let (mut bad, mut covered, mut labelled) = (Vec::new(), [0usize; SHAPES], [0usize; SHAPES]);
                     for i in (w..TOTAL).step_by(threads) {
                         let c = case(i, assets);
                         let holds_hdr = c
@@ -1533,7 +1546,7 @@ fn a_decoders_default_tag_names_no_matrix_in_any_graph_of_the_corpus() {
                         if !holds_hdr {
                             continue;
                         }
-                        let shape = i % STAND_INS.len();
+                        let shape = i % SHAPES;
                         let (text, _) = build(&c, &swapped[shape]);
                         covered[shape] += 1;
                         let named = STAND_INS[shape].1;
@@ -1557,11 +1570,11 @@ fn a_decoders_default_tag_names_no_matrix_in_any_graph_of_the_corpus() {
             .collect();
         workers.into_iter().map(|w| w.join().unwrap()).collect()
     });
-    let (mut covered, mut labelled) = ([0usize; 8], [0usize; 8]);
+    let (mut covered, mut labelled) = ([0usize; SHAPES], [0usize; SHAPES]);
     let mut bad = Vec::new();
     for (b, c, l) in results {
         bad.extend(b);
-        for n in 0..8 {
+        for n in 0..SHAPES {
             covered[n] += c[n];
             labelled[n] += l[n];
         }

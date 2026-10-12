@@ -132,10 +132,13 @@ pub(crate) fn image_stream(w: u32, h: u32) -> StreamInfo {
     }
 }
 
-/// Pictures of the shapes `Project::probe_asset` really gives for files whose tag is **the
-/// decoder's default, not the file's word** (probed with ffprobe on FFmpeg 6.1.1 and 9.0.2): a PNG
-/// is tagged `gbr` whatever its layout, so is RGB video, a JPEG or a WebP is `bt470bg`, and so is
-/// MJPEG video (`yuvj420p`). None of them names a matrix to a graph.
+/// Pictures of the shapes `Project::probe_asset` really gives (ffprobe on FFmpeg 6.1.1 and 9.0.2) for
+/// files whose tag is **the decoder's default, not the file's word**: a PNG is tagged `gbr` whatever
+/// its layout, RGB video made by some encoders is too, a JPEG or a WebP is `bt470bg`, and so is
+/// everything the `mjpeg`, `amv` and `speedhq` decoders produce (whatever the pixel format), and
+/// `jpegls` writes `bt470bg` on `rgb24`. Several name no matrix for one rule of their own (a
+/// non-image `rgba` with `gbr`, MJPEG and SpeedHQ at `yuv422p`, `jpegls`). None of them names a
+/// matrix to a graph.
 pub(crate) fn decoder_default_pictures(w: u32, h: u32) -> Vec<(&'static str, StreamInfo)> {
     let make = |codec: &str, pix_fmt: &str, tag: &str, image: bool| {
         let mut s = if image { image_stream(w, h) } else { video_stream(w, h, 30.0) };
@@ -152,8 +155,13 @@ pub(crate) fn decoder_default_pictures(w: u32, h: u32) -> Vec<(&'static str, Str
         ("webp yuv420p bt470bg", make("webp", "yuv420p", "bt470bg", true)),
         ("mjpeg video yuvj420p bt470bg", make("mjpeg", "yuvj420p", "bt470bg", false)),
         ("mjpeg video yuvj422p bt470bg", make("mjpeg", "yuvj422p", "bt470bg", false)),
+        ("mjpeg video yuv422p bt470bg", make("mjpeg", "yuv422p", "bt470bg", false)),
+        ("speedhq yuv422p bt470bg", make("speedhq", "yuv422p", "bt470bg", false)),
+        ("amv yuvj420p bt470bg", make("amv", "yuvj420p", "bt470bg", false)),
         ("ffv1 bgr0 gbr", make("ffv1", "bgr0", "gbr", false)),
+        ("ffv1 bgra gbr", make("ffv1", "bgra", "gbr", false)),
         ("h264 gbrp gbr", make("h264", "gbrp", "gbr", false)),
+        ("jpegls rgb24 bt470bg", make("jpegls", "rgb24", "bt470bg", false)),
     ]
 }
 
