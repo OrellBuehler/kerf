@@ -6,8 +6,8 @@
 	//
 	// It only draws. The levels are the analysers' (`audio.meters()`), stepped by the
 	// panel's frame loop.
-	import { dbToFader, faderTicks, labelTicks } from '$lib/mixer';
-	import { METER_FLOOR_DB, type StereoMeter } from '$lib/meter';
+	import { dbToFader, faderTicks, labelTicks } from '#lib/mixer';
+	import { METER_FLOOR_DB, type StereoMeter } from '#lib/meter';
 
 	let {
 		meter,

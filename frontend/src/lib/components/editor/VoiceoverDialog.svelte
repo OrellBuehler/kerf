@@ -7,15 +7,15 @@
 	import Btn from './Btn.svelte';
 	import ProgressBar from './ProgressBar.svelte';
 	import SliderRow from './SliderRow.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { cancelVoiceover, onVoiceoverProgress, voiceoverStatus } from '$lib/api';
-	import { toast } from '$lib/notifications.svelte';
-	import { failure } from '$lib/failure-copy';
-	import { CAPTION_LOOKS } from '$lib/style-presets';
-	import { fmtDuration } from '$lib/media-info';
-	import { TIMES } from '$lib/slider-row';
-	import type { CaptionStyle, VoiceoverProgress, VoiceoverStatus } from '$lib/types';
+	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { cancelVoiceover, onVoiceoverProgress, voiceoverStatus } from '#lib/api';
+	import { toast } from '#lib/notifications.svelte';
+	import { failure } from '#lib/failure-copy';
+	import { CAPTION_LOOKS } from '#lib/style-presets';
+	import { fmtDuration } from '#lib/media-info';
+	import { TIMES } from '#lib/slider-row';
+	import type { CaptionStyle, VoiceoverProgress, VoiceoverStatus } from '#lib/types';
 	import {
 		DEFAULT_SPEED,
 		MAX_SPEED,
@@ -33,8 +33,8 @@
 		stageLabel,
 		wordCount,
 		type VoiceoverPrefill
-	} from '$lib/voiceover';
-	import { tip } from '$lib/tip';
+	} from '#lib/voiceover';
+	import { tip } from '#lib/tip';
 
 	let { onClose, prefill = null }: { onClose: () => void; prefill?: VoiceoverPrefill | null } = $props();
 

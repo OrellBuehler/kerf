@@ -5,13 +5,13 @@
 	// draw this, from the same statuses (`mediaStatus`), so they cannot disagree. The tooltip
 	// of each carries the reason; state is never colour alone (a mark and a border style too).
 	import Badge from './Badge.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { mediaStatus } from '$lib/media-status.svelte';
-	import { analysisChips, analysisMeter, chipsFor, type MediaTraits } from '$lib/analysis-steps';
-	import { proxyBadge } from '$lib/proxy-info';
-	import type { AnalysisState } from '$lib/types';
-	import { tip } from '$lib/tip';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { editor } from '#lib/state.svelte';
+	import { mediaStatus } from '#lib/media-status.svelte';
+	import { analysisChips, analysisMeter, chipsFor, type MediaTraits } from '#lib/analysis-steps';
+	import { proxyBadge } from '#lib/proxy-info';
+	import type { AnalysisState } from '#lib/types';
+	import { tip } from '#lib/tip';
 
 	let {
 		assetId,

@@ -5,21 +5,21 @@
 	import Badge from './Badge.svelte';
 	import MediaChips from './MediaChips.svelte';
 	import Btn from './Btn.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { mediaStatus } from '$lib/media-status.svelte';
-	import { analyzeSubmenuItem } from '$lib/analyze-menu';
-		import { proxyActions } from '$lib/proxy-info';
-	import { deleteProxy, rebuildProxy } from '$lib/api';
-	import { contextMenu } from '$lib/context-menu.svelte';
-	import type { MenuItem } from '$lib/context-menu.svelte';
-	import { getFrame, inTauri, revealPath } from '$lib/api';
-	import { importMedia } from '$lib/import-media';
-	import { toast } from '$lib/notifications.svelte';
-	import { thumbnails } from '$lib/thumbnails';
-	import { audioExtraction, mediaInfo, shortPath, specLine, thumbTime, type MediaInfo } from '$lib/media-info';
-	import type { Asset } from '$lib/types';
-	import { tip } from '$lib/tip';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { editor } from '#lib/state.svelte';
+	import { mediaStatus } from '#lib/media-status.svelte';
+	import { analyzeSubmenuItem } from '#lib/analyze-menu';
+		import { proxyActions } from '#lib/proxy-info';
+	import { deleteProxy, rebuildProxy } from '#lib/api';
+	import { contextMenu } from '#lib/context-menu.svelte';
+	import type { MenuItem } from '#lib/context-menu.svelte';
+	import { getFrame, inTauri, revealPath } from '#lib/api';
+	import { importMedia } from '#lib/import-media';
+	import { toast } from '#lib/notifications.svelte';
+	import { thumbnails } from '#lib/thumbnails';
+	import { audioExtraction, mediaInfo, shortPath, specLine, thumbTime, type MediaInfo } from '#lib/media-info';
+	import type { Asset } from '#lib/types';
+	import { tip } from '#lib/tip';
 
 	type BinAsset = { asset: Asset; info: MediaInfo };
 

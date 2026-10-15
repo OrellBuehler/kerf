@@ -11,12 +11,12 @@
 	 * harness draws the same stand-in frame its playback does, stamped with the source
 	 * time — which makes the monitor explorable under `bun run dev`. */
 	import Icon from './Icon.svelte';
-	import { getFrame, inTauri } from '$lib/api';
-	import { sampleFrameUrl } from '$lib/sample-frame';
-	import { editor } from '$lib/state.svelte';
-	import { singleFlight } from '$lib/single-flight';
-	import type { MonitorCell } from '$lib/trim-tools';
-	import { tip } from '$lib/tip';
+	import { getFrame, inTauri } from '#lib/api';
+	import { sampleFrameUrl } from '#lib/sample-frame';
+	import { editor } from '#lib/state.svelte';
+	import { singleFlight } from '#lib/single-flight';
+	import type { MonitorCell } from '#lib/trim-tools';
+	import { tip } from '#lib/tip';
 
 	let { cell }: { cell: MonitorCell } = $props();
 

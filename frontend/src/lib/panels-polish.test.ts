@@ -233,7 +233,7 @@ describe('smaller things the review asked for', () => {
 
 	test('the page imports through the library’s one import, not a copy of it', () => {
 		const page = read('routes/+page.svelte');
-		expect(page).toContain("from '$lib/import-media'");
+		expect(page).toContain("from '#lib/import-media'");
 		expect(page).not.toContain('async function finishImport');
 		expect(page).not.toContain('async function onImport');
 	});

@@ -2,14 +2,14 @@
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
 	import ProgressBar from './ProgressBar.svelte';
-	import { updater } from '$lib/updater.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { askUnsaved, confirmAction } from '$lib/api';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { saveProject } from '$lib/file-actions';
-	import { CURRENT_LINE, downloadingNote, errorView, installNote, updateTitle, versionLine } from '$lib/update-copy';
-	import { CONFIRM, UPDATE_UNSAVED_NOTE, installPrompt, proceedAfter } from '$lib/confirm-copy';
-	import { isLinux, isWindows } from '$lib/keymap';
+	import { updater } from '#lib/updater.svelte';
+	import { editor } from '#lib/state.svelte';
+	import { askUnsaved, confirmAction } from '#lib/api';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { saveProject } from '#lib/file-actions';
+	import { CURRENT_LINE, downloadingNote, errorView, installNote, updateTitle, versionLine } from '#lib/update-copy';
+	import { CONFIRM, UPDATE_UNSAVED_NOTE, installPrompt, proceedAfter } from '#lib/confirm-copy';
+	import { isLinux, isWindows } from '#lib/keymap';
 
 	const u = updater;
 

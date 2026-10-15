@@ -7,7 +7,7 @@
 	import type { Snippet } from 'svelte';
 	import Icon from './Icon.svelte';
 	import IconBtn from './IconBtn.svelte';
-	import { mayClose, scrimClick, trapFocus, type CloseVia } from '$lib/modal';
+	import { mayClose, scrimClick, trapFocus, type CloseVia } from '#lib/modal';
 
 	let {
 		title,

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
-	import { tip } from '$lib/tip';
+	import { tip } from '#lib/tip';
 	let { title, summary = '', open = false, children }: {
 		title: string; summary?: string; open?: boolean; children: Snippet;
 	} = $props();

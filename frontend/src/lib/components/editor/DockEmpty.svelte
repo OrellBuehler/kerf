@@ -3,7 +3,7 @@
 	// Window menu" in a bare grey line.
 	import Btn from './Btn.svelte';
 	import EmptyState from './EmptyState.svelte';
-	import { workspace } from '$lib/workspace.svelte';
+	import { workspace } from '#lib/workspace.svelte';
 </script>
 
 <div style="height:100%;display:grid;place-items:center">

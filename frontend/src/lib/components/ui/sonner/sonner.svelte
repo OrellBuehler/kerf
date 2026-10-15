@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { Toaster as Sonner, type ToasterProps as SonnerProps } from "svelte-sonner";
-	import { settings } from '$lib/settings.svelte';
-	import { STATUS_LOOK } from '$lib/status-look';
+	import { settings } from '#lib/settings.svelte';
+	import { STATUS_LOOK } from '#lib/status-look';
 	import Icon from '../../editor/Icon.svelte';
 
 	let { ...restProps }: SonnerProps = $props();

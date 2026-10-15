@@ -6,14 +6,14 @@
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
 	import ProgressBar from './ProgressBar.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { cancelStems, onStemsProgress, stemsStatus } from '$lib/api';
-	import { toast } from '$lib/notifications.svelte';
-	import { failure } from '$lib/failure-copy';
-	import { formatTime } from '$lib/diff';
-	import type { StemsProgress, StemsStatus } from '$lib/types';
-	import { STEM_NAMES, capitalized, describeStems, downloadNote, isStemsCancelled, stageLabel } from '$lib/stems';
-	import { tip } from '$lib/tip';
+	import { editor } from '#lib/state.svelte';
+	import { cancelStems, onStemsProgress, stemsStatus } from '#lib/api';
+	import { toast } from '#lib/notifications.svelte';
+	import { failure } from '#lib/failure-copy';
+	import { formatTime } from '#lib/diff';
+	import type { StemsProgress, StemsStatus } from '#lib/types';
+	import { STEM_NAMES, capitalized, describeStems, downloadNote, isStemsCancelled, stageLabel } from '#lib/stems';
+	import { tip } from '#lib/tip';
 
 	let { assetId, clipId = null, onClose }: { assetId: string; clipId?: string | null; onClose: () => void } = $props();
 

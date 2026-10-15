@@ -15,11 +15,11 @@
 		gainToFader,
 		MAX_GAIN,
 		nudgeGain
-	} from '$lib/mixer';
-	import { clippedAny, peakLabel, strongest, type StereoMeter } from '$lib/meter';
-	import type { SliderKey } from '$lib/slider-gesture';
-	import { settings } from '$lib/settings.svelte';
-	import { tip as tooltip } from '$lib/tip';
+	} from '#lib/mixer';
+	import { clippedAny, peakLabel, strongest, type StereoMeter } from '#lib/meter';
+	import type { SliderKey } from '#lib/slider-gesture';
+	import { settings } from '#lib/settings.svelte';
+	import { tip as tooltip } from '#lib/tip';
 
 	let {
 		value,

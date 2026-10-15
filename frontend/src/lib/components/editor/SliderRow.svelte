@@ -25,8 +25,8 @@
 		tickPos,
 		toPos,
 		type RowSpec
-	} from '$lib/slider-row';
-	import { tip } from '$lib/tip';
+	} from '#lib/slider-row';
+	import { tip } from '#lib/tip';
 
 	let {
 		label,

@@ -15,11 +15,11 @@
 	import Mixer from './Mixer.svelte';
 	import DockEmpty from './DockEmpty.svelte';
 	import ContextMenu from './ContextMenu.svelte';
-	import { POPOUT_URL, isPanelId, type PanelId } from '$lib/layout';
-	import { workspace } from '$lib/workspace.svelte';
-	import { popout } from '$lib/popout.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { agentTabLabel, proposalIndicator } from '$lib/agent-status';
+	import { POPOUT_URL, isPanelId, type PanelId } from '#lib/layout';
+	import { workspace } from '#lib/workspace.svelte';
+	import { popout } from '#lib/popout.svelte';
+	import { editor } from '#lib/state.svelte';
+	import { agentTabLabel, proposalIndicator } from '#lib/agent-status';
 
 	const COMPONENTS: Record<PanelId, Component<any>> = {
 		library: LibraryPanel,

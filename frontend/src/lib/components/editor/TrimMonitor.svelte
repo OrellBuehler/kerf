@@ -7,7 +7,7 @@
 	 * playhead has not moved, and the picture there is not what is being decided) and
 	 * is gone the moment the gesture ends, however it ends (`ui.trimMonitor` is null). */
 	import TrimFrame from './TrimFrame.svelte';
-	import type { TrimMonitor } from '$lib/trim-tools';
+	import type { TrimMonitor } from '#lib/trim-tools';
 
 	let { monitor }: { monitor: TrimMonitor } = $props();
 
