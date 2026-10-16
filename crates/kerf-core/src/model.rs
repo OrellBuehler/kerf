@@ -225,6 +225,62 @@ pub fn pix_fmt_is_high_bit(name: &str) -> bool {
         && (stem == "gray" || (stem.starts_with("yuv") && stem.ends_with('p')))
 }
 
+/// Whether a colour-matrix tag **states** one: `unknown`, `unspecified` and `reserved` (a value no
+/// matrix has, which FFmpeg reads as it reads none) do not, and neither does no tag at all. Every
+/// other name does, `gbr` (RGB, "identity") included: a file that says anything about its matrix is
+/// not untagged. Whether a stream's tag is the *file's* word to a graph is
+/// [`StreamInfo::names_a_matrix`]'s question.
+pub fn matrix_tag_is_stated(tag: Option<&str>) -> bool {
+    tag.is_some_and(|t| !matches!(t.trim(), "" | "unknown" | "unspecified" | "reserved"))
+}
+
+/// The codecs whose decoders write `bt470bg` on everything they decode, whatever the file says. A tag
+/// from one of them is the decoder's default, not the file's word. `mjpeg`, `amv`, `speedhq` and
+/// `jpegls` (`rgb24`, `gray` and `gray16le` alike) were probed on FFmpeg 6.1.1 and 9.0.2 with ~100
+/// encoder / pixel-format pairs, and no other encodable codec did. `mjpegb`, `sp5x`, `thp` and
+/// `smvjpeg` are decode-only, so there is no file to probe: they share MJPEG's `ff_mjpeg_decode_init`,
+/// which sets the tag. `mxpeg` (decode-only too) is listed on the same assumption, which costs nothing
+/// if it is wrong: a codec that writes no tag has nothing to exclude.
+pub(crate) const DEFAULT_TAG_CODECS: [&str; 9] = [
+    "mjpeg", "amv", "speedhq", "jpegls", "mjpegb", "sp5x", "thp", "smvjpeg", "mxpeg",
+];
+
+/// Whether a picture is **untagged HD YCbCr**: HD (mpv's rule, `width >= 1280 || height > 576`, on
+/// the source's displayed size), YCbCr on the pixel-format allow-list (alpha, grey and RGB are not),
+/// not `yuvj…` (JFIF and a webcam's MJPEG are BT.601 by definition), naming no matrix and not HDR
+/// (which is tone-mapped to a BT.709 picture). What every player shows as BT.709 and FFmpeg reads as
+/// BT.601 — see [`bt709_labels`].
+pub fn untagged_hd_yuv(color_space: Option<&str>, pix_fmt: &str, width: u32, height: u32, hdr: bool) -> bool {
+    if hdr || matrix_tag_is_stated(color_space) || pix_fmt.to_ascii_lowercase().starts_with("yuvj") {
+        return false;
+    }
+    matches!(pix_fmt_layout(pix_fmt), Some(PixLayout::Yuv420 | PixLayout::OtherYuv)) && (width >= 1280 || height > 576)
+}
+
+/// Which inputs of one filter graph the export labels **BT.709** (`setparams=colorspace=bt709`),
+/// given each input's first video stream (`None` for an input with no picture).
+///
+/// FFmpeg 9 negotiates the colour matrix along the graph and converts every layer that is tagged
+/// otherwise into the bottom layer's, and it reads a picture that names no matrix as BT.601. An
+/// untagged HD clip beside a BT.709 one is therefore *converted* (28 dB off), though every player
+/// shows it as BT.709 like its neighbour. So an untagged HD input is labelled BT.709 **when another
+/// input in the graph names a matrix** (a tag, or HDR, which the graph tone-maps to a BT.709
+/// picture), and only then: a graph with no such input, a single clip, and everything that is not
+/// untagged HD YCbCr (an SD picture, MJPEG, RGB, grey, alpha, a still image) is built as it always
+/// was. The label moves no pixel by itself; it states what the picture is.
+///
+/// The decision is the **graph's**, not a frame's: the export, the scrub window and the playback
+/// stream decide over the clips of their own cut, a still over the layers on screen. The preview
+/// decodes proxies but is decided from the **original's** stream, so a proxy smaller than HD (a
+/// small proxy size in Settings) is labelled as its original is.
+pub fn bt709_labels(inputs: &[Option<&StreamInfo>]) -> Vec<bool> {
+    let named = inputs.iter().flatten().any(|s| s.names_a_matrix());
+    inputs
+        .iter()
+        .map(|s| named && s.is_some_and(|s| s.is_untagged_hd_yuv()))
+        .collect()
+}
+
 /// The layout of a **known-opaque** pixel format, from an allow-list; `None` for
 /// anything else — alpha-carrying, palettised, or simply not on the list. A
 /// renderer that cannot draw alpha should refuse what is not here rather than
@@ -362,6 +418,53 @@ impl StreamInfo {
         }
     }
 
+    /// Whether this video stream **names a YCbCr matrix** to a graph that holds it: HDR (tone-mapped to
+    /// a tagged BT.709 picture) or a tag that is the *file's* word ([`matrix_tag_is_stated`]).
+    ///
+    /// The principle: **a tag a decoder writes by default is not the file's word.** Probed on both
+    /// FFmpegs, those are `gbr` on any PNG (`rgb24`, `rgba`, `gray`) and, depending on the encoder that
+    /// made it, on RGB video; `bt470bg` on a JPEG and a WebP; and `bt470bg` from the decoders of
+    /// [`DEFAULT_TAG_CODECS`] (MJPEG video and its relatives, an AMV player's clips, NDI's SpeedHQ,
+    /// JPEG-LS), whatever their pixel format. An explicit tag on any other codec is the file's,
+    /// `yuvj…` full-range H.264 included (FFmpeg's h264 decoder names every full-range stream
+    /// `yuvj420p`, and a camera's `pc` + `bt709` is a matrix).
+    ///
+    /// This is *not* the mirror of [`StreamInfo::is_untagged_hd_yuv`]'s exclusions: grey, alpha and SD
+    /// pictures are never labelled but do name a matrix when tagged, and that asymmetry is intended
+    /// (a tagged SD clip is a stated matrix; it just is not HD). What the two share is only that a
+    /// still image, RGB and a decoder's default are nobody's word.
+    pub fn names_a_matrix(&self) -> bool {
+        self.kind == StreamKind::Video && (self.hdr().is_some() || (self.tag_is_the_files() && self.has_a_yuv_tag()))
+    }
+
+    /// The tag is a matrix a YCbCr picture states: not `gbr` (RGB, "identity"), and not on an RGB
+    /// picture, which has no YCbCr matrix to name whoever tagged it.
+    fn has_a_yuv_tag(&self) -> bool {
+        matrix_tag_is_stated(self.color_space.as_deref())
+            && self.color_space.as_deref().map(str::trim) != Some("gbr")
+            && self.pix_fmt.as_deref().and_then(pix_fmt_layout) != Some(PixLayout::Rgb)
+    }
+
+    /// Whether the tag can be the file's own: not a still image's and not written by one of the
+    /// decoders that tag everything they decode ([`DEFAULT_TAG_CODECS`]).
+    fn tag_is_the_files(&self) -> bool {
+        !self.image && !DEFAULT_TAG_CODECS.iter().any(|c| self.codec.eq_ignore_ascii_case(c))
+    }
+
+    /// Whether this video stream is **untagged HD YCbCr** ([`untagged_hd_yuv`]) and a moving
+    /// picture: a still image is not (a lossy WebP is BT.601 by its format, not by a convention).
+    pub fn is_untagged_hd_yuv(&self) -> bool {
+        self.kind == StreamKind::Video
+            && !self.image
+            && untagged_hd_yuv(
+                self.color_space.as_deref(),
+                self.pix_fmt.as_deref().unwrap_or(""),
+                self.width.unwrap_or(0),
+                self.height.unwrap_or(0),
+                self.hdr().is_some(),
+            )
+    }
+
     /// The HDR transfer this video stream is encoded in, or `None` for SDR and
     /// for anything that is not video.
     pub fn hdr(&self) -> Option<Hdr> {
@@ -459,9 +562,14 @@ impl Asset {
     }
 
     /// The HDR transfer of this asset's video, if it is HDR footage that must be
-    /// tone-mapped to SDR wherever it is decoded.
+    /// tone-mapped to SDR wherever it is decoded. Of the **first** video stream, the one every
+    /// graph input (`[i:v]`) and the BT.709 label ([`bt709_labels`]) read: a second video stream
+    /// (cover art, a thumbnail) neither tone-maps the first nor names a matrix for it.
     pub fn hdr(&self) -> Option<Hdr> {
-        self.streams.iter().find_map(|s| s.hdr())
+        self.streams
+            .iter()
+            .find(|s| s.kind == StreamKind::Video)
+            .and_then(StreamInfo::hdr)
     }
 
     /// Whether this asset's picture carries an alpha channel, by the probed pixel format of
@@ -6454,6 +6562,247 @@ impl Timeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn picture(w: u32, h: u32, pix_fmt: &str, tag: Option<&str>) -> StreamInfo {
+        StreamInfo {
+            index: 0,
+            kind: StreamKind::Video,
+            codec: "h264".into(),
+            width: Some(w),
+            height: Some(h),
+            fps: Some(30.0),
+            sample_rate: None,
+            channels: None,
+            image: false,
+            projection: None,
+            rotation: 0,
+            color_transfer: None,
+            color_primaries: None,
+            pix_fmt: Some(pix_fmt.into()),
+            color_space: tag.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn a_tag_states_a_matrix_unless_it_says_nothing() {
+        for tag in [
+            "bt709",
+            "smpte170m",
+            "bt470bg",
+            "bt2020nc",
+            "bt2020c",
+            "smpte240m",
+            "fcc",
+            "ycgco",
+            "gbr",
+        ] {
+            assert!(matrix_tag_is_stated(Some(tag)), "{tag}");
+        }
+        // `reserved` is a value no matrix has: FFmpeg reads it as it reads no tag.
+        for tag in ["", "unknown", "unspecified", "reserved", " reserved "] {
+            assert!(!matrix_tag_is_stated(Some(tag)), "{tag:?}");
+        }
+        assert!(!matrix_tag_is_stated(None));
+    }
+
+    #[test]
+    fn untagged_hd_is_hd_ycbcr_that_names_nothing_and_is_not_hdr() {
+        let hd = |tag, fmt, w, h| untagged_hd_yuv(tag, fmt, w, h, false);
+        // mpv's rule: wide enough, or tall enough.
+        assert!(hd(None, "yuv420p", 1280, 720));
+        assert!(hd(None, "yuv420p", 1920, 1080));
+        assert!(hd(None, "yuv420p", 1024, 768));
+        assert!(hd(None, "yuv420p", 720, 1280), "a portrait phone clip is taller than 576");
+        assert!(hd(Some("unknown"), "yuv420p10le", 3840, 2160));
+        assert!(hd(Some("reserved"), "yuv422p", 1920, 1080));
+        assert!(hd(None, "nv12", 1920, 1080));
+        assert!(!hd(None, "yuv420p", 720, 576), "PAL is SD");
+        assert!(!hd(None, "yuv420p", 1279, 576));
+        assert!(!hd(None, "yuv420p", 854, 480));
+        assert!(hd(None, "yuv420p", 1280, 100), "wide enough");
+        // A tag of any kind is the file's word.
+        for tag in ["bt709", "smpte170m", "bt470bg", "bt2020nc"] {
+            assert!(!hd(Some(tag), "yuv420p", 1920, 1080), "{tag}");
+        }
+        // JFIF and a webcam's MJPEG are BT.601 by definition.
+        assert!(!hd(None, "yuvj420p", 1920, 1080));
+        assert!(!hd(None, "yuvj444p", 1920, 1080));
+        // RGB, grey, alpha, packed and unknown formats are not YCbCr on the list.
+        for fmt in [
+            "bgr0",
+            "rgb24",
+            "gbrp",
+            "gray",
+            "gray10le",
+            "yuva420p",
+            "rgba",
+            "yuva444p10le",
+            "pal8",
+            "",
+            "nonsense",
+        ] {
+            assert!(!hd(None, fmt, 1920, 1080), "{fmt:?}");
+        }
+        // HDR is tone-mapped to a tagged BT.709 picture.
+        assert!(!untagged_hd_yuv(None, "yuv420p10le", 3840, 2160, true));
+        // No size recorded is not HD.
+        assert!(!hd(None, "yuv420p", 0, 0));
+    }
+
+    #[test]
+    fn a_stream_names_a_matrix_by_tag_or_hdr_and_is_untagged_hd_only_as_a_moving_picture() {
+        assert!(picture(640, 360, "yuv420p", Some("bt709")).names_a_matrix());
+        assert!(picture(1920, 1080, "yuv420p", Some("smpte170m")).names_a_matrix());
+        assert!(!picture(1920, 1080, "yuv420p", None).names_a_matrix());
+        assert!(!picture(1920, 1080, "yuv420p", Some("reserved")).names_a_matrix());
+        let mut hlg = picture(1920, 1080, "yuv420p10le", Some("bt2020nc"));
+        hlg.color_transfer = Some("arib-std-b67".into());
+        assert!(hlg.names_a_matrix() && !hlg.is_untagged_hd_yuv());
+        // HDR names a matrix even when the file's tag is missing: the graph tone-maps it to BT.709.
+        hlg.color_space = None;
+        assert!(hlg.names_a_matrix() && !hlg.is_untagged_hd_yuv());
+        // An RGB picture has no YCbCr matrix to name, whatever the container writes.
+        assert!(!picture(1920, 1080, "gbrp", Some("gbr")).names_a_matrix());
+        assert!(!picture(1920, 1080, "bgr0", Some("gbr")).names_a_matrix());
+        // …and `gbr` is nobody's matrix on any layout: a PNG with alpha or a grey one carries it too.
+        assert!(!picture(1920, 1080, "rgba", Some("gbr")).names_a_matrix());
+        assert!(!picture(1920, 1080, "gray", Some("gbr")).names_a_matrix());
+        assert!(!picture(1920, 1080, "yuv420p", Some("gbr")).names_a_matrix());
+        // The tags decoders write on their own (probed): a JPEG's, a WebP's and MJPEG video's `bt470bg`,
+        // a PNG's `gbr`, RGB video's `gbr`. None names a matrix, so nothing beside them is labelled.
+        let hd = picture(1920, 1080, "yuv420p", None);
+        let phone = picture(1920, 1080, "yuv420p", Some("bt709"));
+        for (what, shape) in crate::engine::test_support::decoder_default_pictures(1920, 1080) {
+            assert!(!shape.names_a_matrix(), "{what}");
+            assert_eq!(bt709_labels(&[Some(&hd), Some(&shape)]), [false, false], "{what}");
+            assert_eq!(bt709_labels(&[Some(&shape), Some(&hd)]), [false, false], "{what}");
+            assert_eq!(
+                bt709_labels(&[Some(&phone), Some(&shape), Some(&hd)]),
+                [false, false, true],
+                "{what}"
+            );
+        }
+        // The same tag on footage that is not the decoder's default is the file's word: an H.264 or
+        // ProRes clip tagged `bt470bg` names it (and so does SD tagged `smpte170m`).
+        assert!(picture(1920, 1080, "yuv420p", Some("bt470bg")).names_a_matrix());
+        assert!(picture(1920, 1080, "yuv422p10le", Some("bt470bg")).names_a_matrix());
+        // …but not on a still image, nor from a decoder that tags everything it decodes (`DEFAULT_TAG_CODECS`),
+        // whatever the pixel format: `yuv422p` MJPEG is no more the file's word than `yuvj420p`, and a
+        // JPEG-LS grey picture (not RGB, so the layout rule does not catch it) is not either.
+        let mut jpeg = picture(1920, 1080, "yuv420p", Some("bt470bg"));
+        jpeg.image = true;
+        assert!(!jpeg.names_a_matrix());
+        for (codec, fmt) in [
+            ("mjpeg", "yuv422p"),
+            ("mjpeg", "yuvj422p"),
+            ("amv", "yuvj420p"),
+            ("speedhq", "yuv422p"),
+            ("jpegls", "gray"),
+            ("jpegls", "gray16le"),
+            ("jpegls", "yuv420p"),
+            ("mjpegb", "yuvj420p"),
+            ("sp5x", "yuvj420p"),
+            ("thp", "yuvj420p"),
+            ("smvjpeg", "yuvj420p"),
+            ("mxpeg", "yuvj420p"),
+        ] {
+            let mut s = picture(1920, 1080, fmt, Some("bt470bg"));
+            s.codec = codec.into();
+            assert!(!s.names_a_matrix(), "{codec} {fmt}");
+            s.codec = codec.to_ascii_uppercase();
+            assert!(!s.names_a_matrix(), "{codec} {fmt}: the codec is matched whatever its case");
+        }
+        // The pixel format is not the decoder: FFmpeg's h264 decoder reports every full-range stream as
+        // `yuvj420p`, and a camera's full-range BT.709 (libx264 `-color_range pc -colorspace bt709`
+        // probes `h264 yuvj420p pc bt709`) states a matrix, which labels the untagged HD beside it.
+        let full_range = picture(1920, 1080, "yuvj420p", Some("bt709"));
+        assert!(full_range.names_a_matrix());
+        assert_eq!(bt709_labels(&[Some(&hd), Some(&full_range)]), [true, false]);
+        // …while an untagged full-range clip is still never labelled itself.
+        let untagged_full_range = picture(1920, 1080, "yuvj420p", None);
+        assert!(!untagged_full_range.is_untagged_hd_yuv() && !untagged_full_range.names_a_matrix());
+        assert_eq!(bt709_labels(&[Some(&phone), Some(&untagged_full_range)]), [false, false]);
+        // An RGB picture has no YCbCr matrix to name even when its tag is not `gbr`, from a codec the
+        // list above does not hold (the layout rule alone: `jpegls` is on the list).
+        let mut rgb = picture(1920, 1080, "rgb24", Some("bt470bg"));
+        rgb.codec = "ffv1".into();
+        assert!(!rgb.names_a_matrix());
+        rgb.pix_fmt = Some("yuv420p".into());
+        assert!(rgb.names_a_matrix(), "the same tag on a YCbCr picture is a matrix");
+        // A grey picture is not RGB: from any other codec its tag is the file's word.
+        rgb.pix_fmt = Some("gray".into());
+        assert!(rgb.names_a_matrix(), "a tagged grey picture names a matrix");
+        // A second video stream (cover art) does not tone-map or tag the first.
+        let mut asset = crate::engine::test_support::test_asset(vec![
+            picture(1920, 1080, "yuv420p", None),
+            picture(640, 640, "yuvj420p", None),
+        ]);
+        asset.streams[1].color_transfer = Some("smpte2084".into());
+        assert_eq!(asset.hdr(), None);
+        asset.streams.swap(0, 1);
+        assert_eq!(asset.hdr(), Some(Hdr::Pq));
+        // A still image is not given a convention (a lossy WebP is BT.601 by its format).
+        let mut webp = picture(1920, 1080, "yuv420p", None);
+        assert!(webp.is_untagged_hd_yuv());
+        webp.image = true;
+        assert!(!webp.is_untagged_hd_yuv());
+        // A stream that is not video names nothing and is nothing.
+        let mut audio = picture(1920, 1080, "yuv420p", Some("bt709"));
+        audio.kind = StreamKind::Audio;
+        assert!(!audio.names_a_matrix() && !audio.is_untagged_hd_yuv());
+    }
+
+    #[test]
+    fn untagged_hd_is_labelled_only_beside_an_input_that_names_a_matrix() {
+        let hd = picture(1920, 1080, "yuv420p", None);
+        let hd2 = picture(1280, 720, "yuv420p", Some("unknown"));
+        let phone = picture(1920, 1080, "yuv420p", Some("bt709"));
+        let mut hlg = picture(3840, 2160, "yuv420p10le", Some("bt2020nc"));
+        hlg.color_transfer = Some("smpte2084".into());
+        let sd = picture(720, 576, "yuv420p", None);
+        let sd_tagged = picture(720, 576, "yuv420p", Some("smpte170m"));
+        let mjpeg = picture(1920, 1080, "yuvj420p", None);
+        let rgb = picture(1920, 1080, "bgr0", None);
+        let alpha = picture(1920, 1080, "yuva420p", None);
+        let mut png = picture(1920, 1080, "rgb24", None);
+        png.image = true;
+        let labels = |inputs: &[Option<&StreamInfo>]| bt709_labels(inputs);
+
+        // A single clip, and a graph of untagged footage, are never labelled.
+        assert_eq!(labels(&[Some(&hd)]), [false]);
+        assert_eq!(labels(&[Some(&hd), Some(&hd2)]), [false, false]);
+        assert_eq!(
+            labels(&[Some(&hd), Some(&sd), Some(&mjpeg), Some(&rgb), Some(&alpha), Some(&png)]),
+            [false; 6]
+        );
+        assert_eq!(labels(&[]), Vec::<bool>::new());
+        assert_eq!(labels(&[None, Some(&hd)]), [false, false]);
+        // Beside an explicit tag or HDR the untagged HD input is labelled, and nothing else is.
+        assert_eq!(labels(&[Some(&phone), Some(&hd)]), [false, true]);
+        assert_eq!(labels(&[Some(&hd), Some(&phone), Some(&hd2)]), [true, false, true]);
+        assert_eq!(labels(&[Some(&hlg), Some(&hd)]), [false, true]);
+        assert_eq!(labels(&[Some(&sd_tagged), Some(&hd)]), [false, true]);
+        // …and never SD, MJPEG, RGB, grey, alpha or a still image, whatever they sit beside.
+        assert_eq!(
+            labels(&[
+                Some(&phone),
+                Some(&sd),
+                Some(&mjpeg),
+                Some(&rgb),
+                Some(&alpha),
+                Some(&png),
+                None,
+                Some(&hd)
+            ]),
+            [false, false, false, false, false, false, false, true]
+        );
+        // An RGB picture tagged `gbr` does not name a matrix: it moves nothing.
+        let tagged_rgb = picture(1920, 1080, "gbrp", Some("gbr"));
+        assert_eq!(labels(&[Some(&tagged_rgb), Some(&hd)]), [false, false]);
+        // A tagged input that is not on screen is still an input of the graph: the label is the
+        // graph's, not the frame's.
+        assert_eq!(labels(&[Some(&phone), Some(&hd), Some(&hd)]), [false, true, true]);
+    }
 
     #[test]
     fn the_chroma_grid_follows_the_pixel_format() {
