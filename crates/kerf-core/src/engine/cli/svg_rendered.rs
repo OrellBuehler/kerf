@@ -444,7 +444,8 @@ fn a_held_title_is_in_the_stream_and_in_a_two_pass_export() {
 fn a_cache_path_with_pattern_characters_is_one_file_for_stills_and_held_pictures() {
     let dir = scratch("oddpath");
     // `%d` is a frame number to the image demuxer, `[` `]` `*` `?` a glob: none is in the path of a file.
-    let cache = dir.join("a%d [1]*? cache");
+    // Windows has no file named with `*` or `?`, so there the glob is the `[1]` alone.
+    let cache = dir.join(if cfg!(windows) { "a%d [1] cache" } else { "a%d [1]*? cache" });
     with_pinned_dir(cache.to_str().unwrap(), || {
         let bg = background(&dir, "24");
         let assets = [bg.clone()];

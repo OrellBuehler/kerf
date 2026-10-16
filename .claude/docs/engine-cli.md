@@ -749,10 +749,21 @@ so the feature is **only** activated through these forwards — which is what ma
     cancel**: `stream_preview_until(.., cancel, on_frame)` (`stream_preview_with` is it with `|| false`; `start_playback` passes
     "superseded or stopped"), looked at 40 times a second, before each document is read and every 16 frames of the compare. A
     picture in flight is finished first. **Memory and priority**: `prepare` runs no more threads than
-    `RENDER_MEMORY` (1 GiB) allows (12 bytes a pixel of the picture + 8 a pixel of the widest embedded image, per thread), each
-    thread `cpu::background_thread()` (below normal when the budget is under 100%: `nice(10)` on the thread on Linux, relative to what
-    it has like `cpu::background`; the *utility* QoS class on macOS, not `PRIO_DARWIN_BG`, whose I/O throttling is hard on a
-    picture a user is waiting for; **Windows left alone** — no binding for `SetThreadPriority` in the tree), and the parsed
+    `RENDER_MEMORY` (1 GiB) allows (12 bytes a pixel of the picture + 8 a pixel of the widest embedded image, per thread). **An
+    export's titles (`prepare`, `Priority::Behind`) draw with `cpu::background_thread()`** (below normal when the budget is under 100%:
+    `nice(10)` on the thread on Linux, relative to what it has like `cpu::background`; the *utility* QoS class on macOS, not
+    `PRIO_DARWIN_BG`, whose I/O throttling is hard; **Windows left alone** — no binding for `SetThreadPriority` in the tree), **the
+    stream's (`prepare_as(.., Priority::Normal)`) do not**: Play is waiting for them, with 10 s, and a thread at utility QoS / nice 10
+    beside a running ffmpeg or a test suite gets a fraction of a core (the macOS CI run of `a_text_heavy_title_is_drawn_inside_the_streams_budget`
+    went past 10 s where Linux took 3.9; not reproducible off a Mac, so the three changes here are the measured and the
+    reasoned causes together); the budget still caps how many. **The fonts are read before the drawing, outside the deadline**
+    (`fonts::warm()` in `prepare_as` once there is something to draw; the deadline is moved by the time it took, and Setup warms
+    them at launch): the first picture of a process loads every installed face, hundreds on a Mac, from a cold disk. **A picture
+    of the cache is `raster::encode_frame_png`** (`png` `Fast` + `Sub`, clear and opaque pixels passed through, the rest
+    un-multiplied by tiny-skia's own rule; a test pins the decoded pixels equal to `encode_png`'s): the default level was most of
+    a picture's cost (release, 960 x 540: 13.7 ms -> 1.2), and unoptimised it was 195 ms (a debug build runs the stream's 10 s too:
+    the workspace `Cargo.toml` optimises `png`, `fdeflate`, `crc32fast` and `simd-adler32` in the dev profile, which with the quick level took the ignored
+    budget test from 3.9 s to 0.7 s on 4 cores). `encode_png` stays for the agent's contact sheet, where size matters. The parsed
     documents are kept (`DocCache`, last 6 by digest of the source) so a scrub or a replay reads a title once.
   - **The cache** (`<cache>/kerf/svg/<pid>/<key>/NNNNNN.png` + a `complete` marker, else a private `kerf-svg-<uid>` directory in the
     temp one, else a unique `0700` `kerf-svg-<pid>-<nanos>-<n>` made with a plain `mkdir`): `key` = SHA-256 of `RASTER_VERSION`, the

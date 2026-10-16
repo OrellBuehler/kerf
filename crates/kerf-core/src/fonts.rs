@@ -54,6 +54,13 @@ pub fn svg_fontdb() -> Arc<Database> {
     .clone()
 }
 
+/// Read the machine's fonts now if they have not been, so the first animated title (or font list)
+/// finds them: a macOS install has some hundreds of faces, and a cold disk takes seconds to read
+/// them. Idempotent and quick once done; the app calls it from a thread at launch.
+pub fn warm() {
+    let _ = svg_fontdb();
+}
+
 /// Distinct family names of every font installed on this machine, sorted.
 pub fn list_system_fonts() -> Vec<String> {
     let mut names: Vec<String> = db()

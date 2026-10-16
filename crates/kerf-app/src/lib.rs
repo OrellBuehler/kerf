@@ -3468,6 +3468,8 @@ pub fn run() {
                 LaunchProject::Missing(path) => tracing::warn!(path, "this launch named a project file that does not exist"),
                 LaunchProject::Nothing => {}
             }
+            // Read the machine's fonts off the first Play of an animated title.
+            std::thread::spawn(kerf_core::fonts::warm);
             // The window is created hidden; if the webview never asks for it
             // (`show_main_window`), this does.
             spawn_reveal_failsafe(app.handle().clone(), main_window_shown, REVEAL_FAILSAFE);

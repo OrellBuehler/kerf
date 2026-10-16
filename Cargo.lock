@@ -2500,6 +2500,7 @@ dependencies = [
  "libc",
  "misaki-rs",
  "ort",
+ "png 0.18.1",
  "realfft",
  "resvg",
  "roxmltree 0.21.1",

@@ -35,6 +35,7 @@ use sha2::{Digest, Sha256};
 use super::{cpu, export_format, export_timeline, ExportFormat, ExportOptions, ExportProgress};
 use crate::clip_timing::Rational;
 use crate::error::{Error, Result};
+use crate::fonts;
 use crate::model::{Asset, StreamKind, SvgOverlay, Timeline};
 use crate::svg::raster::{self, Pin, MAX_PIXELS, RASTER_VERSION};
 use crate::svg::SvgDoc;
@@ -599,7 +600,7 @@ fn draw_run(job: &Job<'_>, run: &Run, stop: &AtomicBool) -> Result<()> {
     let first = raster::frame_path(&seq.dir, run.first);
     if !first.exists() {
         let picture = raster::render(&doc.at(run.doc_t), seq.rect.w, seq.rect.h, seq.opacity)?;
-        raster::write_atomic(&first, &raster::encode_png(&picture)?)?;
+        raster::write_atomic(&first, &raster::encode_frame_png(&picture)?)?;
     }
     for j in run.first + 1..run.first + run.len {
         if stop.load(Ordering::Relaxed) {
@@ -645,16 +646,46 @@ fn is_ready(seq: &SvgSeq<'_>) -> bool {
 /// pictures it needs are all there, last, so a stopped run leaves nothing that looks complete — and
 /// what it did draw is kept, because a frame is only ever renamed into place whole and its content is
 /// fixed by the directory's name, so the next attempt carries on from it. The drawing threads run
-/// below normal priority when the budget is under 100%, and no more of them than memory allows.
+/// at the given [`Priority`], and no more of them than memory allows.
 pub(super) fn prepare(
     seqs: &[SvgSeq<'_>],
     threads: usize,
     deadline: Option<Instant>,
     cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<Pin>> {
+    prepare_as(seqs, threads, deadline, cancel, Priority::Behind)
+}
+
+/// Whether the drawing threads give way to the rest of the machine's work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Priority {
+    /// Below normal while the budget is under 100% ([`cpu::background_thread`]): an export's titles,
+    /// drawn before ffmpeg starts, step aside for the interface and for what the user is doing.
+    Behind,
+    /// As any thread of the process: the playback stream's titles, which Play is waiting for and
+    /// which have 10 s to be on disk. The budget still caps how many threads draw.
+    Normal,
+}
+
+impl Priority {
+    /// Call first thing in a drawing thread.
+    fn apply_to_this_thread(self) {
+        if self == Priority::Behind {
+            cpu::background_thread();
+        }
+    }
+}
+
+/// [`prepare`] at the given `priority`.
+fn prepare_as(
+    seqs: &[SvgSeq<'_>],
+    threads: usize,
+    deadline: Option<Instant>,
+    cancel: &dyn Fn() -> bool,
+    priority: Priority,
+) -> Result<Vec<Pin>> {
     // Pinned first: a sequence found finished must not be evicted before ffmpeg reads it.
     let pins: Vec<Pin> = seqs.iter().map(|s| Pin::new(&s.dir)).collect();
-    let ctl = Control { cancel, deadline };
     let mut todo: Vec<&SvgSeq<'_>> = Vec::new();
     for s in seqs {
         if is_ready(s) {
@@ -673,6 +704,14 @@ pub(super) fn prepare(
     if todo.is_empty() {
         return Ok(pins);
     }
+    // The first picture of the process reads every font the machine has (a macOS install has some
+    // hundreds): once, and not the drawing the deadline is for, so it is not counted in it.
+    let warming = Instant::now();
+    fonts::warm();
+    let ctl = Control {
+        cancel,
+        deadline: deadline.map(|d| d + warming.elapsed()),
+    };
     let mut jobs: Vec<Job<'_>> = Vec::new();
     for s in &todo {
         ctl.check()?;
@@ -704,7 +743,7 @@ pub(super) fn prepare(
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
-                    cpu::background_thread();
+                    priority.apply_to_this_thread();
                     while !stop.load(Ordering::Relaxed) {
                         let Some((i, run)) = units.get(next.fetch_add(1, Ordering::Relaxed)) else {
                             break;
@@ -868,9 +907,10 @@ impl Drop for PreviewSlot<'_> {
 }
 
 /// Have the titles of the playback stream (`seqs`, from [`stream_sequences`]) on disk: on the
-/// budget's threads, no queue — what the user is waiting to see is never gated — for at most
-/// [`PREVIEW_PREPARE_LIMIT`] from now (waiting for an earlier preparation counts), one preparation
-/// at a time, and ended at once by `cancel` (the stream was stopped or superseded).
+/// budget's threads at normal priority, no queue — what the user is waiting to see is never gated
+/// or stepped aside for — for at most [`PREVIEW_PREPARE_LIMIT`] from now (waiting for an earlier
+/// preparation counts; reading the machine's fonts for the first time does not), one preparation at
+/// a time, and ended at once by `cancel` (the stream was stopped or superseded).
 pub(super) fn prepare_preview(seqs: &[SvgSeq<'_>], cancel: &dyn Fn() -> bool) -> Result<Vec<Pin>> {
     prepare_preview_in(preview_gate(), seqs, cancel)
 }
@@ -886,7 +926,7 @@ pub(super) fn prepare_preview_in(gate: &PreviewGate, seqs: &[SvgSeq<'_>], cancel
         deadline: Some(deadline),
     };
     let _slot = PreviewSlot::take(gate, &ctl)?;
-    prepare(seqs, cpu::budget_threads(), Some(deadline), cancel)
+    prepare_as(seqs, cpu::budget_threads(), Some(deadline), cancel, Priority::Normal)
 }
 
 // ---- a picture for a still ------------------------------------------------------------------------
@@ -982,7 +1022,7 @@ fn ensure_stills_with(live: &[StillSvg<'_>], trim: &dyn Fn()) -> Result<Vec<Pin>
         }
         let doc = parsed(s.svg)?;
         let picture = raster::render(&doc.at(s.doc_t), s.rect.w, s.rect.h, s.opacity)?;
-        raster::write_atomic(&s.path, &raster::encode_png(&picture)?)?;
+        raster::write_atomic(&s.path, &raster::encode_frame_png(&picture)?)?;
         wrote = true;
     }
     if wrote {
@@ -2094,6 +2134,33 @@ mod tests {
             let live = still_svgs(&tl, 192, 108, 0.5);
             assert!(live[0].input.starts_with("/kerf-test/svg/still-") && !live[0].input.contains('\\'));
         });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stream_draws_at_normal_priority_and_an_export_behind_the_rest() {
+        let _serial = cpu::test_lock();
+        let restore = cpu::cpu_percent();
+        cpu::set_cpu_percent(cpu::MIN_CPU_PERCENT);
+        let nice_after = |priority: Option<Priority>| {
+            std::thread::spawn(move || {
+                if let Some(priority) = priority {
+                    priority.apply_to_this_thread();
+                }
+                // SAFETY: reads the scheduling priority of our own task id.
+                unsafe { libc::getpriority(libc::PRIO_PROCESS as _, libc::gettid() as libc::id_t) }
+            })
+            .join()
+            .unwrap()
+        };
+        let (start, normal, behind) = (
+            nice_after(None),
+            nice_after(Some(Priority::Normal)),
+            nice_after(Some(Priority::Behind)),
+        );
+        cpu::set_cpu_percent(restore);
+        assert_eq!(normal, start, "the stream's threads are not lowered");
+        assert_eq!(behind, (start + 10).min(19), "an export's are, from {start}");
     }
 
     #[test]

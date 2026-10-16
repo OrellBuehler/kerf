@@ -29,7 +29,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::SystemTime;
 
 use resvg::usvg::{self, ImageHrefResolver, ImageKind};
-use tiny_skia::{Color, Pixmap, PixmapPaint, Transform};
+use tiny_skia::{Color, Pixmap, PixmapPaint, PremultipliedColorU8, Transform};
 
 use super::images::{self, Format};
 use super::{cost, invalid, SvgDoc};
@@ -144,11 +144,44 @@ fn apply_opacity(pixmap: &mut Pixmap, opacity: f64) {
     }
 }
 
-/// `pixmap` as PNG bytes (straight alpha, as ffmpeg's `overlay` reads it).
+/// `pixmap` as PNG bytes (straight alpha, as ffmpeg's `overlay` reads it), small: for what an
+/// agent is shown. A picture of the cache is [`encode_frame_png`].
 pub fn encode_png(pixmap: &Pixmap) -> Result<Vec<u8>> {
     pixmap
         .encode_png()
         .map_err(|e| Error::Engine(format!("could not encode an animated title frame: {e}")))
+}
+
+/// `pixmap` as the PNG the cache keeps for ffmpeg to read: the same pixels as [`encode_png`], made
+/// to be quick rather than small. A sequence is hundreds of these, drawn while Play waits, and the
+/// encoder's default level was most of a picture's cost. `Fast` deflate with the `Sub` filter takes
+/// a 960 x 540 picture from 13.7 ms to 1.2 ms in a release build, and a picture that is mostly
+/// clear stays a few kilobytes. The
+/// premultiplied pixels are un-multiplied with `tiny-skia`'s own rule (what `encode_png` does), the
+/// clear and opaque ones, nearly every pixel of a title, passing through unchanged.
+pub fn encode_frame_png(pixmap: &Pixmap) -> Result<Vec<u8>> {
+    let failed = |e: png::EncodingError| Error::Engine(format!("could not encode an animated title frame: {e}"));
+    let mut straight = pixmap.data().to_vec();
+    for px in straight.as_chunks_mut::<4>().0 {
+        // Clear and opaque pixels are the same either way: only the ones between need the rule.
+        if matches!(px[3], 0 | 255) {
+            continue;
+        }
+        if let Some(c) = PremultipliedColorU8::from_rgba(px[0], px[1], px[2], px[3]).map(|p| p.demultiply()) {
+            px.copy_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
+        }
+    }
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, pixmap.width(), pixmap.height());
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        encoder.set_filter(png::Filter::Sub);
+        let mut writer = encoder.write_header().map_err(failed)?;
+        writer.write_image_data(&straight).map_err(failed)?;
+    }
+    Ok(out)
 }
 
 const SHEET_BACKGROUND: (u8, u8, u8) = (28, 28, 28);
@@ -890,6 +923,30 @@ mod tests {
                 assert!(a[c].abs_diff(b[c]) <= 2, "{x},{y}: {a:?} vs {b:?}");
             }
         }
+    }
+
+    #[test]
+    fn the_quick_png_holds_the_pixels_the_small_one_does() {
+        // Clear, opaque and every partial alpha, with gradients, edges and a soft shadow: the
+        // un-multiplying must be the library's own for each of them.
+        let p = render(
+            &svg(
+                "<defs><linearGradient id=\"g\"><stop offset=\"0\" stop-color=\"#ff3355\" stop-opacity=\"0.1\"/><stop offset=\"1\" stop-color=\"#33ccff\"/></linearGradient>\
+                 <filter id=\"b\"><feGaussianBlur stdDeviation=\"3\"/></filter></defs>\
+                 <rect x=\"10\" y=\"10\" width=\"90\" height=\"60\" rx=\"12\" fill=\"url(#g)\" filter=\"url(#b)\"/>\
+                 <circle cx=\"140\" cy=\"60\" r=\"30\" fill=\"#ffffff\" fill-opacity=\"0.37\"/>",
+            ),
+            192,
+            108,
+            0.8,
+        )
+        .unwrap();
+        let alphas: std::collections::BTreeSet<u8> = p.pixels().iter().map(|c| c.alpha()).collect();
+        assert!(alphas.contains(&0) && alphas.len() > 20, "{} distinct alphas", alphas.len());
+        let (quick, small) = (encode_frame_png(&p).unwrap(), encode_png(&p).unwrap());
+        let (quick, small) = (Pixmap::decode_png(&quick).unwrap(), Pixmap::decode_png(&small).unwrap());
+        assert_eq!((quick.width(), quick.height()), (192, 108));
+        assert_eq!(quick.data(), small.data());
     }
 
     #[test]
