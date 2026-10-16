@@ -181,8 +181,25 @@ export function svgPresetArt(kind: SvgPresetKind, params: SvgPresetParamsInput):
 const ROOT_NAMESPACE = `the root element must be <svg xmlns="${SVG_NS}">`;
 const NO_SIZE = 'the <svg> needs a viewBox (or a width and height in pixels) so it has a shape to fit';
 
+const ROOT_TAG = /^<svg(?=[\s/>])((?:"[^"]*"|'[^']*'|[^>"'])*)>/;
+
 /** The attribute text of the root `<svg ...>` tag, after any XML declaration and comments; `null` for any other root. */
-const ROOT_TAG = /^\s*(?:<\?xml[^>]*\?>\s*)?(?:<!--[\s\S]*?-->\s*)*<svg(?=[\s/>])((?:"[^"]*"|'[^']*'|[^>"'])*)>/;
+function rootTag(src: string): RegExpExecArray | null {
+	let i = src.length - src.trimStart().length;
+	if (src.startsWith('<?xml', i)) {
+		const end = src.indexOf('?>', i);
+		if (end < 0) return null;
+		i = end + 2;
+	}
+	for (;;) {
+		while (i < src.length && /\s/.test(src[i])) i++;
+		if (!src.startsWith('<!--', i)) break;
+		const end = src.indexOf('-->', i + 4);
+		if (end < 0) return null;
+		i = end + 3;
+	}
+	return ROOT_TAG.exec(src.slice(i));
+}
 
 function rootAttributes(text: string): Map<string, string> {
 	const attrs = new Map<string, string>();
@@ -215,7 +232,7 @@ export function validateSvgSource(src: string): SvgCheck {
 	if (new TextEncoder().encode(src).length > MAX_BYTES) throw new Error(`the SVG is larger than ${MAX_BYTES / 1024} KiB`);
 	const problem = xmlProblem(src);
 	if (problem) throw new Error(problem);
-	const root = ROOT_TAG.exec(src);
+	const root = rootTag(src);
 	if (!root) throw new Error(ROOT_NAMESPACE);
 	const attrs = rootAttributes(root[1]);
 	if (attrs.get('xmlns') !== SVG_NS) throw new Error(ROOT_NAMESPACE);
