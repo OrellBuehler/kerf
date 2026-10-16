@@ -189,7 +189,8 @@ pub(super) struct SvgSeq<'a> {
     pub svg: &'a str,
     /// The directory the pictures are in (named by a digest of everything that decides them).
     pub dir: PathBuf,
-    /// What follows `-i`: `dir/%06d.png` (a `%` in the path is `%%`), or the one file.
+    /// What follows `-i`: `dir/%06d.png` (a `%` in the path is `%%`), or the one file, joined with
+    /// `/` on every OS (see [`argv_root`]).
     pub input: String,
     pub kind: Kind,
     /// The output frame the first picture read lands on.
@@ -239,6 +240,14 @@ struct Layout {
     frames: u64,
 }
 
+/// `root` as the text of an argv path, with no separator at its end. A path in the argv is the
+/// cache directory's text, then `/` and the names below it, never `Path::join`: that would put a
+/// `\` before them on Windows (which ffmpeg reads as `/`), and the argv would differ by OS, as
+/// would the golden digests. The directories and files themselves are still [`PathBuf`]s.
+fn argv_root(root: &std::path::Path) -> String {
+    root.to_string_lossy().trim_end_matches(std::path::is_separator).to_string()
+}
+
 fn seq_of<'a>(o: &'a SvgOverlay, root: &std::path::Path, fps: Rational, rect: Rect, layout: Layout) -> SvgSeq<'a> {
     let Layout {
         lands_on,
@@ -259,8 +268,8 @@ fn seq_of<'a>(o: &'a SvgOverlay, root: &std::path::Path, fps: Rational, rect: Re
             h.update([rect.w.to_le_bytes(), rect.h.to_le_bytes()].concat());
             h.update(opacity.to_bits().to_le_bytes());
         });
-        let dir = root.join(key);
-        let input = raster::frame_path(&dir, 0).to_string_lossy().into_owned();
+        let dir = root.join(&key);
+        let input = format!("{}/{key}/{}", argv_root(root), raster::frame_name(0));
         return SvgSeq {
             svg: &o.svg,
             dir,
@@ -289,8 +298,8 @@ fn seq_of<'a>(o: &'a SvgOverlay, root: &std::path::Path, fps: Rational, rect: Re
         h.update([rect.w.to_le_bytes(), rect.h.to_le_bytes()].concat());
         h.update(opacity.to_bits().to_le_bytes());
     });
-    let dir = root.join(key);
-    let input = format!("{}/%06d.png", dir.to_string_lossy().replace('%', "%%"));
+    let dir = root.join(&key);
+    let input = format!("{}/{key}/%06d.png", argv_root(root).replace('%', "%%"));
     SvgSeq {
         svg: &o.svg,
         dir,
@@ -887,6 +896,8 @@ pub(super) fn prepare_preview_in(gate: &PreviewGate, seqs: &[SvgSeq<'_>], cancel
 pub(super) struct StillSvg<'a> {
     pub svg: &'a str,
     pub path: PathBuf,
+    /// What follows `-i`: `path` as the argv spells it (see [`argv_root`]).
+    pub input: String,
     pub rect: Rect,
     /// The document's clock at the still's time.
     pub doc_t: f64,
@@ -918,6 +929,7 @@ pub(super) fn still_svgs<'a>(timeline: &'a Timeline, w: u32, h: u32, t: f64) -> 
             Some(StillSvg {
                 svg: &o.svg,
                 path: root.join(format!("still-{key}.png")),
+                input: format!("{}/still-{key}.png", argv_root(&root)),
                 rect,
                 doc_t,
                 opacity,
@@ -931,7 +943,7 @@ pub(super) fn still_svgs<'a>(timeline: &'a Timeline, w: u32, h: u32, t: f64) -> 
 pub(super) fn push_still_inputs(live: &[StillSvg<'_>], args: &mut Vec<String>) {
     for s in live {
         args.extend(["-f", "image2", "-pattern_type", "none", "-i"].map(String::from));
-        args.push(s.path.to_string_lossy().into_owned());
+        args.push(s.input.clone());
     }
 }
 
@@ -1506,6 +1518,7 @@ mod tests {
             let args = build_still_args(&tl, &assets, &ExportOptions::default(), 2.0, 192, None, &out).unwrap();
             let path = args.iter().find(|a| a.contains("still-")).unwrap().clone();
             let live = still_svgs(&tl, 192, 108, 2.0);
+            assert_eq!(live[0].input, path);
             assert_eq!(live[0].path, PathBuf::from(&path));
             assert!(!live[0].path.exists());
             let pins = ensure_stills(&live).unwrap();
@@ -2067,6 +2080,23 @@ mod tests {
     }
 
     #[test]
+    fn an_argv_path_is_the_roots_text_then_slashes_on_every_os() {
+        assert_eq!(argv_root(std::path::Path::new("/kerf-test/svg")), "/kerf-test/svg");
+        assert_eq!(argv_root(std::path::Path::new("/kerf-test/svg/")), "/kerf-test/svg");
+        // The root's own separators are the OS's, and stay: only what is added below it is `/`.
+        assert_eq!(argv_root(std::path::Path::new("C:\\Users\\a\\svg")), "C:\\Users\\a\\svg");
+        crate::svg::raster::with_pinned_dir("/kerf-test/svg/", || {
+            let (tl, _) = cut(vec![overlay(sliding(), 0.0, 1.0), overlay(still_art(), 0.0, 1.0)]);
+            let seqs = svg_sequences(&tl, &fmt(1920, 1080, 30.0));
+            let dir = |s: &SvgSeq<'_>| s.dir.file_name().unwrap().to_string_lossy().into_owned();
+            assert_eq!(seqs[0].input, format!("/kerf-test/svg/{}/%06d.png", dir(&seqs[0])));
+            assert_eq!(seqs[1].input, format!("/kerf-test/svg/{}/000000.png", dir(&seqs[1])));
+            let live = still_svgs(&tl, 192, 108, 0.5);
+            assert!(live[0].input.starts_with("/kerf-test/svg/still-") && !live[0].input.contains('\\'));
+        });
+    }
+
+    #[test]
     fn a_still_names_its_picture_as_one_file_whatever_the_path_holds() {
         crate::svg::raster::with_pinned_dir("/home/a%d[1]*/svg", || {
             let (tl, _) = cut(vec![overlay(sliding(), 1.0, 3.0)]);
@@ -2074,7 +2104,7 @@ mod tests {
             let mut args = Vec::new();
             push_still_inputs(&live, &mut args);
             assert_eq!(&args[..5], ["-f", "image2", "-pattern_type", "none", "-i"]);
-            assert_eq!(args[5], live[0].path.to_string_lossy());
+            assert_eq!(args[5], live[0].input);
             assert!(args[5].starts_with("/home/a%d[1]*/svg/still-"), "{}", args[5]);
         });
     }

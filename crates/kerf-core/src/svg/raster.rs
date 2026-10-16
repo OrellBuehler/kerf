@@ -419,9 +419,14 @@ fn is_pinned(path: &Path) -> bool {
 
 // ---- the files ----------------------------------------------------------------------------------
 
+/// The file name of frame `j`; ffmpeg reads a sequence as `%06d.png`.
+pub fn frame_name(j: u64) -> String {
+    format!("{j:06}.png")
+}
+
 /// Frame `j` of the sequence in `dir`.
 pub fn frame_path(dir: &Path, j: u64) -> PathBuf {
-    dir.join(format!("{j:06}.png"))
+    dir.join(frame_name(j))
 }
 
 /// Whether the sequence in `dir` was finished.

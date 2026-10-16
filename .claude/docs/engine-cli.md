@@ -768,7 +768,10 @@ so the feature is **only** activated through these forwards — which is what ma
     **The check and the removal are one step**: `evict` takes the pins' lock, and renames the entry to `.gone-*` before it deletes
     it, so a pin taken during a trim either stops it or finds the place empty; **an entry that will not rename (a handle open on it on Windows) is left whole and tried at the next trim**, never emptied: deleting its files after the lock lets a preparer pin and re-mark a directory whose frames are going, and under the lock stalls every pin. Trim runs only
     after something was written. `raster::with_pinned_dir` (tests, per thread) fixes the directory so the builders stay pure and
-    the golden oracle machine-independent.
+    the golden oracle machine-independent. **An argv path is the cache directory's text, then `/` and the names below it**
+    (`svg_layer::argv_root`; `SvgSeq.input`, `StillSvg.input`), never `Path::join`: on Windows `join` puts a `\` before the key
+    (`/kerf-test/svg\<key>/%06d.png`), so the argv, the path assertions and the golden digests would differ by OS. The `PathBuf`s
+    (`dir`, `path`) stay for the file system, and only the directory's `%` is doubled for the sequence.
   - **A still reads one PNG** (`still_svgs`: the overlays with `start <= t < end` at the still's own size; `still-{key}.png`, the
     key over the document clock at `t`; `-f image2 -pattern_type none -i path`, so a `%d`, `[` or `*` in the cache path is a
     character of it — ffmpeg 6.1 otherwise looks for `a1 [1]/still-….png` and a glob): `run_still` calls `still_titles` (drawn on the
