@@ -765,9 +765,10 @@ pub(crate) fn displayed_size(width: Option<u32>, height: Option<u32>, rotation: 
 }
 
 /// A colour tag as the engine stores it: `None` when the file does not say,
-/// rather than ffprobe's literal `"unknown"`.
+/// rather than ffprobe's literal `"unknown"` — or `"reserved"`, a value no matrix has, which
+/// FFmpeg reads as it reads none.
 pub(crate) fn known_color(tag: Option<&str>) -> Option<String> {
-    tag.filter(|t| !t.is_empty() && *t != "unknown" && *t != "unspecified")
+    tag.filter(|t| !t.is_empty() && !matches!(*t, "unknown" | "unspecified" | "reserved"))
         .map(str::to_string)
 }
 
@@ -1457,6 +1458,12 @@ pub(crate) fn tonemap_chain(hdr: Hdr, zscale: bool) -> String {
 pub(super) fn tonemap_filter(hdr: Hdr) -> String {
     tonemap_chain(hdr, zscale_available())
 }
+
+/// The filter that labels a picture BT.709 without touching a pixel (`setparams`), for an untagged
+/// HD input that shares a graph with one naming a matrix ([`crate::model::bt709_labels`]). Not the
+/// `-colorspace` output option, which FFmpeg 9 takes as an order to convert into that matrix on the
+/// way (up to 22 levels moved, measured).
+const BT709_LABEL: &str = "setparams=colorspace=bt709";
 
 /// What the decodes that are handed a bare path rather than an [`Asset`] need to
 /// know about a file's first video stream, from one `ffprobe`.
@@ -2669,8 +2676,15 @@ fn proxy_key(source_key: &str, width: u32, tonemapped: bool, head_padded: bool) 
 /// frame-sync mode of its day. Only these sources are rebuilt, and their proxy is
 /// named `<hash>.lead.mp4` (`is_head_padded_proxy`, in `clip_timing`).
 pub fn proxy_path(src: &Path, width: u32) -> Option<PathBuf> {
+    proxy_path_for(src, width, source_traits(src).unwrap_or_default())
+}
+
+/// [`proxy_path`] for traits already read: an encode takes **one** reading for its destination and
+/// for its filters, because a probe that failed is remembered only for a minute and an encode that
+/// waited for the machine's slot can read again, and answer differently, before it starts — a
+/// tone-mapped or head-padded picture would then be written to the plain proxy's name.
+fn proxy_path_for(src: &Path, width: u32, traits: SourceTraits) -> Option<PathBuf> {
     let dir = dirs::cache_dir()?.join("kerf").join("proxies");
-    let traits = source_traits(src).unwrap_or_default();
     let padded = needs_head_pad(traits.lead);
     let key = proxy_key(&source_key(src), width, traits.hdr.is_some(), padded);
     Some(dir.join(proxy_file_name(fnv1a(&key), padded)))
@@ -2924,8 +2938,11 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         progress,
         cancel,
     } = run;
-    let dst =
-        proxy_path(src, width).ok_or_else(|| Error::Engine("no cache directory available for preview proxies".to_string()))?;
+    // One reading of the source answers everything below: where the proxy goes, whether to tone-map
+    // it and whether its video starts late.
+    let traits = source_traits(src).unwrap_or_default();
+    let dst = proxy_path_for(src, width, traits)
+        .ok_or_else(|| Error::Engine("no cache directory available for preview proxies".to_string()))?;
     if dst.is_file() {
         return Ok(dst);
     }
@@ -2964,9 +2981,6 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         progress(0.0);
     }
     let threads = proxy_threads(cpu.threads());
-    // One cached probe answers both: whether to tone-map and whether the video
-    // starts late (the same one `proxy_path` keyed this proxy on).
-    let traits = source_traits(src).unwrap_or_default();
     let tonemap = traits.hdr.map(tonemap_filter);
     let head_pad = needs_head_pad(traits.lead).then(fps_mode_flag);
     let mut run = |hw_decode: Option<&str>| -> Result<Streamed> {
@@ -7352,6 +7366,13 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     });
 
     let mut p: Vec<String> = Vec::new();
+    // The label is the first filter of the chain, so that all of it reads what a file tagged BT.709
+    // would give. Later, a scaler may have converted the picture already: the fit `scale` is the
+    // filter FFmpeg has do the RGB conversion a dip to white's `fade` needs, as BT.601 in and
+    // BT.709 out (8 to 15 levels off the footage tagged in the file).
+    if fx.label_bt709 {
+        p.push(BT709_LABEL.to_string());
+    }
     // A head-padded proxy opens with one clone of its first frame at time zero (see
     // [`build_proxy_args`]), which a seek skips — and a read from the start does
     // not. The original has no such frame: its first one is the real one, and the
@@ -8018,7 +8039,8 @@ fn build_still_args_rendered(
                 &canvas,
                 clip.mask.as_ref(),
                 clip.zoom_animated(),
-                &layer.fades
+                &layer.fades,
+                layer.label_bt709
             )
         ));
         let out = format!("ov{n}");
@@ -8081,6 +8103,9 @@ struct StillCanvas {
 /// ([`still_fx`]): where the export's chain applies its `fade` steps, after the rotation and
 /// ahead of a moving zoom, the same filters run on the frame. None at all for a still
 /// outside any fade, and then the chain is what it was.
+///
+/// `label_bt709` is the graph's BT.709 label for this layer ([`BT709_LABEL`]): the still decides
+/// it over the layers on screen, and puts it where [`video_clip_chain`] does, ahead of everything.
 #[allow(clippy::too_many_arguments)]
 fn still_clip_chain(
     tf: &Transform,
@@ -8091,12 +8116,17 @@ fn still_clip_chain(
     mask: Option<&Mask>,
     zoom_last: bool,
     fades: &StillFades,
+    label_bt709: bool,
 ) -> String {
     let StillCanvas { w: ow, h: oh, fit, sf } = canvas;
     let (ow, oh, fit) = (*ow, *oh, *fit);
     let chroma = effects.iter().any(|e| e.produces_alpha());
     let needs_alpha = (!tf.is_identity() && tf.needs_alpha()) || chroma || mask.is_some() || fades.needs_alpha();
-    let mut p: Vec<String> = vec!["trim=end_frame=1".to_string(), "setpts=PTS-STARTPTS".to_string()];
+    let mut p: Vec<String> = Vec::new();
+    if label_bt709 {
+        p.push(BT709_LABEL.to_string());
+    }
+    p.extend(["trim=end_frame=1".to_string(), "setpts=PTS-STARTPTS".to_string()]);
     let crop = tf.has_crop().then(|| {
         let cw = (1.0 - tf.crop_left - tf.crop_right).max(0.0);
         let ch = (1.0 - tf.crop_top - tf.crop_bottom).max(0.0);
@@ -8338,6 +8368,10 @@ pub use levels::mix_levels;
 /// private builders.
 #[cfg(test)]
 mod golden;
+
+/// The BT.709 label on the four builders, and the plan's mirror of it.
+#[cfg(test)]
+mod bt709_label;
 
 /// What the export graph draws, pinned against rendered pixels (`#[ignore]`d).
 #[cfg(test)]
@@ -9991,6 +10025,32 @@ mod tests {
     }
 
     #[test]
+    fn an_encode_names_its_proxy_from_the_traits_it_was_given() {
+        // One reading answers the destination, the tone-map and the pad: what the destination is
+        // follows from those traits alone, and a source that cannot be probed is the plain one.
+        let src = Path::new("/media/never-imported.mov");
+        let plain = SourceTraits::default();
+        let hlg = SourceTraits {
+            hdr: Some(Hdr::Hlg),
+            ..plain
+        };
+        let late = SourceTraits { lead: 0.5, ..plain };
+        let (Some(a), Some(b), Some(c), Some(unreadable)) = (
+            proxy_path_for(src, PROXY_MAX_WIDTH, plain),
+            proxy_path_for(src, PROXY_MAX_WIDTH, hlg),
+            proxy_path_for(src, PROXY_MAX_WIDTH, late),
+            proxy_path(src, PROXY_MAX_WIDTH),
+        ) else {
+            skip("skipped: this platform has no cache directory for proxies");
+            return;
+        };
+        assert_eq!(a, unreadable);
+        assert!(a != b && a != c && b != c);
+        assert!(is_head_padded_proxy(&c.to_string_lossy()) && !is_head_padded_proxy(&a.to_string_lossy()));
+        assert_eq!(Some(&b), proxy_path_for(src, PROXY_MAX_WIDTH, hlg).as_ref());
+    }
+
+    #[test]
     fn spherical_sources_proxy_larger_and_under_their_own_key() {
         // Reframing crops ~100° out of 360, so a 360 proxy keeps more pixels.
         assert_eq!(proxy_width(None), PROXY_MAX_WIDTH);
@@ -10934,6 +10994,7 @@ mod tests {
             Some(&mask),
             true,
             &StillFades::default(),
+            false,
         );
         let first = still_clip_chain(
             &tf,
@@ -10944,6 +11005,7 @@ mod tests {
             Some(&mask),
             false,
             &StillFades::default(),
+            false,
         );
         let zoom = "scale=iw*1.4:ih*1.4";
         // Last: after the rotation, with nothing behind it, and only once.
@@ -10960,8 +11022,28 @@ mod tests {
         // A moving zoom that has no zoom at the sampled instant has none to move.
         let at_rest = Transform { scale: 1.0, ..tf };
         assert_eq!(
-            still_clip_chain(&at_rest, &color, &effects, None, &canvas, None, true, &StillFades::default()),
-            still_clip_chain(&at_rest, &color, &effects, None, &canvas, None, false, &StillFades::default())
+            still_clip_chain(
+                &at_rest,
+                &color,
+                &effects,
+                None,
+                &canvas,
+                None,
+                true,
+                &StillFades::default(),
+                false
+            ),
+            still_clip_chain(
+                &at_rest,
+                &color,
+                &effects,
+                None,
+                &canvas,
+                None,
+                false,
+                &StillFades::default(),
+                false
+            )
         );
     }
 
@@ -11042,6 +11124,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(c.contains("scale=w='max(1,iw*0.0004)':h='max(1,ih*0.0004)'"), "{c}");
         let c = still_clip_chain(
@@ -11053,6 +11136,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(c.contains("scale=iw*0.5:ih*0.5"), "{c}");
     }
@@ -11108,6 +11192,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(!still.contains("force_divisible_by") && !still.contains("trunc("), "{still}");
     }
@@ -14747,6 +14832,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(contained.contains("force_original_aspect_ratio=decrease"));
         assert!(contained.contains("pad=1080:1920"), "contain letterboxes: {contained}");
@@ -14760,6 +14846,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(covered.contains("force_original_aspect_ratio=increase"));
         assert!(covered.contains("crop=1080:1920"), "cover crops: {covered}");
@@ -16731,6 +16818,11 @@ mod tests {
         let untagged = probe_json(r#""width":1280,"height":720,"color_space":"unknown""#);
         assert_eq!(untagged.streams[0].color_space, None);
         assert_eq!(probe_json(r#""width":1280,"height":720"#).streams[0].color_space, None);
+        // `reserved` (a value no matrix has) and `unspecified` are read by FFmpeg as no tag at all.
+        for none in ["reserved", "unspecified", ""] {
+            let probed = probe_json(&format!(r#""width":1280,"height":720,"color_space":"{none}""#));
+            assert_eq!(probed.streams[0].color_space, None, "{none:?}");
+        }
     }
 
     #[test]

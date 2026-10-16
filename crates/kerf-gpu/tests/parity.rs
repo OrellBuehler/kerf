@@ -4885,6 +4885,584 @@ fn the_eq_tables_match_ffmpegs_eq_filter() {
     }
 }
 
+// ---- the BT.709 label ------------------------------------------------------------
+
+/// Footage as it arrives: the **same pictures** encoded with a known matrix and labelled in each
+/// of the ways a camera or an encoder labels them, in the two sizes where the convention for an
+/// untagged picture differs (HD is read as BT.709, SD as BT.601). The pictures are made from RGB,
+/// so the file's real colours are known.
+struct HdMedia {
+    files: BTreeMap<&'static str, Asset>,
+}
+
+impl HdMedia {
+    fn get(&self, name: &str) -> &Asset {
+        self.files.get(name).unwrap_or_else(|| panic!("no media {name}"))
+    }
+}
+
+/// The smooth, saturated picture (`grad/…`) and the busy test card (`detail/…`).
+const GRADIENT: &str = "gradients=size=1280x720:rate=10:duration=1:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1=1280:y1=720:speed=0.00001";
+const GRADIENT_SD: &str = "gradients=size=720x576:rate=10:duration=1:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1=720:y1=576:speed=0.00001";
+const DETAIL: &str = "testsrc2=size=1280x720:rate=10:duration=1";
+const DETAIL_SD: &str = "testsrc2=size=720x576:rate=10:duration=1";
+
+fn hd_media() -> &'static HdMedia {
+    static M: OnceLock<HdMedia> = OnceLock::new();
+    M.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-media-hd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut files = BTreeMap::new();
+        let none = "setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown";
+        let bt709 = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709";
+        let bt601 = "setparams=colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m";
+        let bt2020 = "setparams=colorspace=bt2020nc:color_primaries=bt2020:color_trc=bt709";
+        // (matrix the values are encoded with, how the file labels itself)
+        let encode = |files: &mut BTreeMap<&'static str, Asset>, name: &'static str, source: &str, matrix: &str, label: &str| {
+            let p = dir.join(format!("{}.mp4", name.replace('/', "-")));
+            ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("{source},format=gbrp,scale=out_color_matrix={matrix}:out_range=tv,format=yuv420p,{label}"),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-qp",
+                "0",
+                "-g",
+                "10",
+                "-pix_fmt",
+                "yuv420p",
+                p.to_str().unwrap(),
+            ]);
+            files.insert(name, probed(&p));
+        };
+        for (picture, hd, sd) in [("grad", GRADIENT, GRADIENT_SD), ("detail", DETAIL, DETAIL_SD)] {
+            let n = |hd_or_sd: &str, label: &str| -> &'static str {
+                Box::leak(format!("{picture}/{hd_or_sd}-{label}").into_boxed_str())
+            };
+            encode(&mut files, n("hd", "untagged"), hd, "bt709", none);
+            encode(&mut files, n("hd", "709"), hd, "bt709", bt709);
+            encode(&mut files, n("hd", "601"), hd, "bt601", bt601);
+            encode(&mut files, n("hd", "2020"), hd, "bt2020", bt2020);
+            encode(&mut files, n("sd", "untagged"), sd, "bt601", none);
+            encode(&mut files, n("sd", "601"), sd, "bt601", bt601);
+        }
+        for (name, source) in [("grad/rgb", GRADIENT), ("detail/rgb", DETAIL)] {
+            let p = dir.join(format!("{}.mkv", name.replace('/', "-")));
+            ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                source,
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "bgr0",
+                p.to_str().unwrap(),
+            ]);
+            files.insert(name, probed(&p));
+        }
+        // A logo the size of the canvas: RGB, so it names nothing and is never labelled.
+        let logo = dir.join("logo.png");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=0xf0a020:s=640x360:d=1,drawbox=x=40:y=40:w=240:h=160:color=0x2060e0:t=fill,format=rgb24",
+            "-frames:v",
+            "1",
+            logo.to_str().unwrap(),
+        ]);
+        files.insert("logo", probed(&logo));
+        let hlg = dir.join("hlg.mp4");
+        let made = Command::new(kerf_core::ffmpeg_path())
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(format!(
+                "{DETAIL},format=yuv420p,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv,\
+                 zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt2020:t=arib-std-b67:m=bt2020nc:r=tv,format=yuv420p10le"
+            ))
+            .args([
+                "-c:v",
+                "libx265",
+                "-x265-params",
+                "log-level=error",
+                "-color_primaries",
+                "bt2020",
+                "-color_trc",
+                "arib-std-b67",
+                "-colorspace",
+                "bt2020nc",
+            ])
+            .arg(&hlg)
+            .stdin(Stdio::null())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if made {
+            files.insert("detail/hlg", probed(&hlg));
+        }
+        HdMedia { files }
+    })
+}
+
+/// Preview proxies generated for a test and removed when it ends (the cache is the user's: the
+/// engine's own tests do the same with `ProxyGuard`). A proxy's place is a function of its source,
+/// so two tests that proxy one file would delete each other's: the tests that hold proxies run one
+/// at a time.
+struct Proxies {
+    made: Vec<PathBuf>,
+    _one_at_a_time: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Proxies {
+    fn new() -> Self {
+        static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+        Proxies {
+            made: Vec::new(),
+            _one_at_a_time: ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        }
+    }
+
+    /// `a` as the preview decodes it: its proxy, made by the product's own `generate_proxy`, and
+    /// **the stream the proxy's sidecar describes** (what `ProxyMedia` hands the plan).
+    fn of(&mut self, a: &Asset) -> Asset {
+        let src = Path::new(&a.path);
+        let proxy = kerf_core::generate_proxy(src, kerf_core::proxy_width(a.projection()))
+            .unwrap_or_else(|e| panic!("proxy of {}: {e}", a.path));
+        self.made.push(proxy.clone());
+        let media = kerf_core::MediaResolver::resolve(&kerf_core::ProxyMedia, a);
+        assert!(
+            media.proxy && Path::new(&media.path) == proxy,
+            "{}: the preview does not resolve to the proxy that was just made",
+            a.path
+        );
+        let mut proxied = a.clone();
+        proxied.path = media.path;
+        let video = media.video.expect("the proxy has a video stream");
+        *proxied
+            .streams
+            .iter_mut()
+            .find(|s| s.kind == StreamKind::Video)
+            .expect("a video stream") = video;
+        proxied
+    }
+}
+
+impl Drop for Proxies {
+    fn drop(&mut self) {
+        for proxy in &self.made {
+            let _ = std::fs::remove_file(proxy);
+            let _ = std::fs::remove_file(proxy.with_extension("json"));
+        }
+    }
+}
+
+/// A picture-in-picture clip: the top layer of a stack.
+fn pip_clip(a: &Asset, opacity: f64) -> Clip {
+    let mut c = clip(a, 0.0, 1.0, 0.0);
+    c.transform = Transform {
+        scale: 0.5,
+        pos_x: 0.2,
+        pos_y: -0.1,
+        opacity,
+        ..Transform::default()
+    };
+    c
+}
+
+/// The delivery shape of these cases: half of 1280x720, so each render is cheap and the HD layers
+/// are shrunk 2:1 (the scaler's best-measured regime).
+fn hd_canvas() -> Option<Delivery> {
+    Some(Delivery::new(640, 360, Fit::Contain))
+}
+
+/// `base` full frame with `top` a picture-in-picture over it, `top` at `opacity`.
+fn hd_stack(base: &Asset, top: &Asset, opacity: f64) -> (Timeline, Vec<Asset>) {
+    let tl = timeline(
+        vec![vec![clip(base, 0.0, 1.0, 0.0)], vec![pip_clip(top, opacity)]],
+        hd_canvas(),
+    );
+    (tl, vec![base.clone(), top.clone()])
+}
+
+/// Which layers of the plan of `tl` at `t` the export graph labels BT.709, bottom first.
+fn labelled_layers(tl: &Timeline, assets: &[Asset], t: f64) -> Vec<bool> {
+    RenderPlan::at(tl, assets, &ExportOptions::default(), t, policy())
+        .expect("plan")
+        .layers
+        .iter()
+        .map(|l| l.stream.label_bt709)
+        .collect()
+}
+
+/// The matrix the plan draws the composite with, and the one of each layer.
+fn plan_matrices(tl: &Timeline, assets: &[Asset]) -> String {
+    let plan = RenderPlan::at(tl, assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
+    format!(
+        "composite {:?}, layers {:?}",
+        plan.canvas.matrix,
+        plan.layers.iter().map(|l| l.stream.matrix()).collect::<Vec<_>>()
+    )
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn untagged_hd_is_labelled_bt709_beside_footage_that_names_a_matrix_and_stacks_with_it() {
+    let h = hd_media();
+    eprintln!("composite colour policy of this FFmpeg: {:?}", policy());
+    let untagged = h.get("grad/hd-untagged");
+    let phone = h.get("detail/hd-709");
+    assert_eq!(untagged.streams[0].color_space, None, "the footage says nothing");
+
+    // Alone, or among footage that names nothing, it is read as BT.601 as it always was: not labelled,
+    // and drawn exactly as before.
+    let tl = timeline(vec![vec![clip(untagged, 0.0, 1.0, 0.0)]], hd_canvas());
+    assert_eq!(labelled_layers(&tl, std::slice::from_ref(untagged), 0.5), [false]);
+    check("label/untagged-hd-alone", &tl, std::slice::from_ref(untagged), &[0.5], STRICT);
+    let mut fade = clip(untagged, 0.0, 1.0, 0.0);
+    fade.transform.opacity = 0.5;
+    let tl = timeline(vec![vec![fade]], hd_canvas());
+    assert_eq!(labelled_layers(&tl, std::slice::from_ref(untagged), 0.5), [false]);
+    check(
+        "label/untagged-hd-alone-translucent",
+        &tl,
+        std::slice::from_ref(untagged),
+        &[0.5],
+        STRICT,
+    );
+    let (tl, assets) = hd_stack(h.get("detail/hd-untagged"), untagged, 1.0);
+    assert_eq!(labelled_layers(&tl, &assets, 0.5), [false, false]);
+    check("label/untagged-hd-over-untagged-hd", &tl, &assets, &[0.5], STRICT);
+
+    // Beside a BT.709 clip it is labelled, both are one matrix, and the stack is drawn under either
+    // policy: it was a mixed stack the plan refused on a negotiating FFmpeg.
+    for (name, base, top, opacity, want) in [
+        ("label/untagged-hd-over-709", phone, untagged, 1.0, [false, true]),
+        ("label/709-over-untagged-hd", untagged, phone, 1.0, [true, false]),
+        ("label/untagged-hd-translucent-over-709", phone, untagged, 0.5, [false, true]),
+        ("label/709-translucent-over-untagged-hd", untagged, phone, 0.5, [true, false]),
+    ] {
+        let (tl, assets) = hd_stack(base, top, opacity);
+        assert_eq!(labelled_layers(&tl, &assets, 0.5), want, "{name}");
+        eprintln!("{name}: {}", plan_matrices(&tl, &assets));
+        check(name, &tl, &assets, &[0.5], STRICT);
+    }
+    // The graph's decision, not the frame's: a BT.709 clip on another track that is not on screen yet
+    // still makes the cut one the export negotiates, and a still of a frame without it does not.
+    let late = timeline(
+        vec![vec![clip(untagged, 0.0, 1.0, 0.0)], vec![clip(phone, 0.0, 1.0, 1.0)]],
+        hd_canvas(),
+    );
+    let assets = [untagged.clone(), phone.clone()];
+    assert_eq!(
+        labelled_layers(&late, &assets, 0.5),
+        [false],
+        "the still holds the layers on screen"
+    );
+    check("label/untagged-hd-before-709-still", &late, &assets, &[0.5], STRICT);
+}
+
+/// The dip to white takes the clip through `rgb24` and back, out of YUV with the clip's matrix, so a label
+/// that came after the fit `scale` (the filter FFmpeg has convert the picture for the fade) was read as BT.601
+/// there and BT.709 on the way back: the still of a labelled HD layer mid-dip differs from the layer tagged
+/// in the file by 8 to 15 levels. The label is the first filter of the chain; the layer is drawn as BT.709.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_labelled_hd_layer_in_a_dip_to_white_is_drawn_as_the_layer_tagged_in_the_file() {
+    let h = hd_media();
+    let (untagged, tagged) = (h.get("grad/hd-untagged"), h.get("grad/hd-709"));
+    let phone = h.get("detail/hd-709");
+    let canvas = Some(Delivery::new(1280, 720, Fit::Contain));
+    let dipping = |a: &Asset| {
+        let mut incoming = clip(a, 0.0, 1.0, 1.0);
+        incoming.transition_in = Some(Transition {
+            kind: TransitionKind::DipToWhite,
+            duration: 0.6,
+        });
+        timeline(
+            vec![vec![clip(phone, 0.0, 1.0, 0.6)], vec![clip(phone, 0.0, 1.0, 0.0), incoming]],
+            canvas,
+        )
+    };
+    let (tl, assets) = (dipping(untagged), [untagged.clone(), phone.clone()]);
+    assert_eq!(
+        labelled_layers(&tl, &assets, 1.15),
+        [false, true],
+        "the BT.709 clip is on screen with it"
+    );
+    check("label/dip-white-labelled-hd-still", &tl, &assets, &[1.05, 1.15, 1.25], STRICT);
+    let (twin, assets) = (dipping(tagged), [tagged.clone(), phone.clone()]);
+    assert_eq!(
+        labelled_layers(&twin, &assets, 1.15),
+        [false, false],
+        "the tagged file needs no label"
+    );
+    check("label/dip-white-tagged-hd-still", &twin, &assets, &[1.05, 1.15, 1.25], STRICT);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn footage_that_is_not_untagged_hd_is_left_as_it_is_and_the_other_matrices_stay_mixed() {
+    let h = hd_media();
+    eprintln!("composite colour policy of this FFmpeg: {:?}", policy());
+    let untagged = h.get("grad/hd-untagged");
+    let phone = h.get("detail/hd-709");
+
+    // SD footage is BT.601 by the convention, and nothing is labelled beside it: untagged SD with
+    // untagged HD is one matrix (BT.601 throughout), drawn.
+    for (name, base, top) in [
+        (
+            "label/sd-untagged-under-untagged-hd",
+            "detail/sd-untagged",
+            "grad/hd-untagged",
+        ),
+        (
+            "label/untagged-hd-under-sd-untagged",
+            "grad/hd-untagged",
+            "detail/sd-untagged",
+        ),
+    ] {
+        let (tl, assets) = hd_stack(h.get(base), h.get(top), 1.0);
+        assert_eq!(labelled_layers(&tl, &assets, 0.5), [false, false], "{name}");
+        check(name, &tl, &assets, &[0.5], STRICT);
+    }
+    // …and against a BT.709 clip it is the other matrix, as it was: refused where FFmpeg negotiates.
+    for (name, base, top) in [
+        ("label/sd-untagged-over-709", phone, h.get("detail/sd-untagged")),
+        ("label/709-over-sd-untagged", h.get("detail/sd-untagged"), phone),
+    ] {
+        let (tl, assets) = hd_stack(base, top, 1.0);
+        assert!(labelled_layers(&tl, &assets, 0.5).iter().all(|l| !l), "{name}");
+        check_mixed(name, &tl, &assets, &[0.5], "different YCbCr matrices");
+    }
+    // Untagged HD beside footage tagged BT.601 is labelled BT.709 (a stated matrix is a matrix): the
+    // stack is mixed now, where FFmpeg read both alike before. It is drawn where the composite is fixed.
+    for (name, base, top) in [
+        ("label/untagged-hd-over-sd-601", h.get("detail/sd-601"), untagged),
+        ("label/untagged-hd-over-hd-601", h.get("detail/hd-601"), untagged),
+        ("label/hd-2020-over-untagged-hd", untagged, h.get("detail/hd-2020")),
+    ] {
+        let (tl, assets) = hd_stack(base, top, 1.0);
+        assert!(labelled_layers(&tl, &assets, 0.5).iter().any(|l| *l), "{name}");
+        check_mixed(name, &tl, &assets, &[0.5], "different YCbCr matrices");
+    }
+    // A PNG logo is RGB: never labelled, and it names no YCbCr matrix. At the canvas's own size (an RGB
+    // picture is not resized) it is BT.601 with untagged HD, under it or translucent over it: drawn. In a
+    // stack that holds a BT.709 clip the HD is labelled, and the logo is an RGB picture in a stack that
+    // is not BT.601: refused where the matrix is negotiated.
+    let logo = h.get("logo");
+    assert_eq!((logo.streams[0].width, logo.streams[0].height), (Some(640), Some(360)));
+    let tl = timeline(
+        vec![vec![clip(logo, 0.0, 1.0, 0.0)], vec![pip_clip(untagged, 1.0)]],
+        hd_canvas(),
+    );
+    let assets = [logo.clone(), untagged.clone()];
+    assert_eq!(labelled_layers(&tl, &assets, 0.5), [false, false]);
+    check("label/png-logo-under-untagged-hd", &tl, &assets, &[0.5], STRICT);
+    let mut veil = clip(logo, 0.0, 1.0, 0.0);
+    veil.transform.opacity = 0.5;
+    let tl = timeline(vec![vec![clip(untagged, 0.0, 1.0, 0.0)], vec![veil]], hd_canvas());
+    let assets = [untagged.clone(), logo.clone()];
+    assert_eq!(labelled_layers(&tl, &assets, 0.5), [false, false]);
+    check("label/png-logo-translucent-over-untagged-hd", &tl, &assets, &[0.5], STRICT);
+    let tl = timeline(
+        vec![
+            vec![clip(logo, 0.0, 1.0, 0.0)],
+            vec![pip_clip(untagged, 1.0)],
+            vec![{
+                let mut c = pip_clip(phone, 1.0);
+                c.transform.pos_x = -0.25;
+                c
+            }],
+        ],
+        hd_canvas(),
+    );
+    let assets = [logo.clone(), untagged.clone(), phone.clone()];
+    assert_eq!(labelled_layers(&tl, &assets, 0.5), [false, true, false]);
+    check_mixed(
+        "label/png-logo-under-untagged-hd-and-709",
+        &tl,
+        &assets,
+        &[0.5],
+        "RGB picture",
+    );
+}
+
+/// A photo and a webcam clip are tagged `bt470bg` by their decoders and say nothing of the file: a JPEG, a
+/// WebP and MJPEG video (probed on both FFmpegs) are no matrix beside untagged HD. The stack is read as BT.601
+/// throughout, as it always was, and drawn exactly where the plan drew it before the label.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_decoders_default_tag_labels_nothing_beside_untagged_hd() {
+    let h = hd_media();
+    eprintln!("composite colour policy of this FFmpeg: {:?}", policy());
+    let untagged = h.get("grad/hd-untagged");
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-media-hd");
+    let source = "testsrc2=size=640x360:rate=10:duration=1";
+    let mut made = 0;
+    for (name, encoder, still) in [
+        ("photo.jpg", &["-pix_fmt", "yuvj420p"][..], true),
+        ("photo.webp", &["-c:v", "libwebp", "-pix_fmt", "yuv420p"][..], true),
+        (
+            "webcam.mkv",
+            &["-c:v", "mjpeg", "-q:v", "3", "-pix_fmt", "yuvj420p"][..],
+            false,
+        ),
+    ] {
+        let path = dir.join(name);
+        let ok = Command::new(kerf_core::ffmpeg_path())
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", source])
+            .args(if still { &["-frames:v", "1"][..] } else { &[][..] })
+            .args(encoder)
+            .arg(&path)
+            .stdin(Stdio::null())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("skipped {name}: this FFmpeg cannot make it");
+            continue;
+        }
+        let file = probed(&path);
+        let tag = file.streams[0].color_space.clone();
+        eprintln!(
+            "{name}: probed {} {:?} tag {tag:?}",
+            file.streams[0].codec, file.streams[0].pix_fmt
+        );
+        // Under it (the canvas's own size: nothing is resized), and in a stack of two HD clips.
+        let mut base = clip(&file, 0.0, 1.0, 0.0);
+        base.source_out = 1.0;
+        let tl = timeline(vec![vec![base], vec![pip_clip(untagged, 1.0)]], hd_canvas());
+        let assets = [file.clone(), untagged.clone()];
+        assert_eq!(
+            labelled_layers(&tl, &assets, 0.5),
+            [false, false],
+            "{name}: its tag is not a matrix"
+        );
+        check(&format!("label/{name}-under-untagged-hd"), &tl, &assets, &[0.5], STRICT);
+        made += 1;
+    }
+    assert!(made >= 2, "only {made} of the three files could be made");
+}
+
+/// FFmpeg's h264 decoder calls every full-range stream `yuvj420p`, and what OBS, a drone or a phone writes with
+/// `-color_range pc -colorspace bt709` probes `h264 yuvj420p bt709`: the file's own word, a matrix. `yuvj` is not the
+/// decoder, so the untagged HD beside such a clip is labelled BT.709 like any other, and the stack is one matrix.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_full_range_clip_with_a_stated_matrix_labels_the_untagged_hd_beside_it() {
+    let h = hd_media();
+    eprintln!("composite colour policy of this FFmpeg: {:?}", policy());
+    let untagged = h.get("grad/hd-untagged");
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("parity-media-hd")
+        .join("obs-full-range.mp4");
+    ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("{DETAIL},format=yuv420p"),
+        "-c:v",
+        "libx264",
+        "-qp",
+        "0",
+        "-g",
+        "10",
+        "-pix_fmt",
+        "yuv420p",
+        "-color_range",
+        "pc",
+        "-colorspace",
+        "bt709",
+        "-color_primaries",
+        "bt709",
+        "-color_trc",
+        "bt709",
+        path.to_str().unwrap(),
+    ]);
+    let obs = probed(&path);
+    eprintln!(
+        "obs-full-range.mp4: probed {} {:?} tag {:?}",
+        obs.streams[0].codec, obs.streams[0].pix_fmt, obs.streams[0].color_space
+    );
+    assert_eq!(
+        obs.streams[0].pix_fmt.as_deref(),
+        Some("yuvj420p"),
+        "FFmpeg calls a full-range stream yuvj420p"
+    );
+    assert_eq!(obs.streams[0].color_space.as_deref(), Some("bt709"));
+    for (name, base, top) in [
+        ("label/untagged-hd-over-full-range-709", &obs, untagged),
+        ("label/full-range-709-over-untagged-hd", untagged, &obs),
+    ] {
+        let (tl, assets) = hd_stack(base, top, 1.0);
+        let labels = labelled_layers(&tl, &assets, 0.5);
+        assert_eq!(
+            labels.iter().filter(|l| **l).count(),
+            1,
+            "{name}: the untagged HD clip is labelled, {labels:?}"
+        );
+        assert!(labels[usize::from(top.id == untagged.id)], "{name}");
+        eprintln!("{name}: {}", plan_matrices(&tl, &assets));
+        check(name, &tl, &assets, &[0.5], STRICT);
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_previews_proxies_stack_as_their_originals_do() {
+    let h = hd_media();
+    let mut proxies = Proxies::new();
+    eprintln!("composite colour policy of this FFmpeg: {:?}", policy());
+    // A proxy keeps what its original says: nothing is added to the tags of untagged HD, so a proxy
+    // is the picture the original is, and the preview is decided from the same facts as the export.
+    let untagged = proxies.of(h.get("grad/hd-untagged"));
+    let phone = proxies.of(h.get("detail/hd-709"));
+    assert_eq!(
+        untagged.streams[0].color_space, None,
+        "the untagged HD proxy is as untagged as its source"
+    );
+    assert_eq!(phone.streams[0].color_space.as_deref(), Some("bt709"));
+    for (name, base, top, opacity) in [
+        ("proxy/untagged-hd-over-709", &phone, &untagged, 1.0),
+        ("proxy/709-over-untagged-hd", &untagged, &phone, 1.0),
+        ("proxy/untagged-hd-translucent-over-709", &phone, &untagged, 0.5),
+    ] {
+        let (tl, assets) = hd_stack(base, top, opacity);
+        assert!(labelled_layers(&tl, &assets, 0.5).iter().any(|l| *l), "{name}");
+        check(name, &tl, &assets, &[0.5], STRICT);
+    }
+    // A tone-mapped HLG proxy is tagged BT.709 by the tone-map: it names a matrix beside untagged HD.
+    match h.files.get("detail/hlg") {
+        Some(hlg) => {
+            let tone_mapped = proxies.of(hlg);
+            assert_eq!(
+                tone_mapped.streams[0].color_space.as_deref(),
+                Some("bt709"),
+                "the tone-map tags its picture"
+            );
+            for (name, base, top) in [
+                ("proxy/hlg-tone-mapped-over-untagged-hd", &untagged, &tone_mapped),
+                ("proxy/untagged-hd-over-hlg-tone-mapped", &tone_mapped, &untagged),
+            ] {
+                let (tl, assets) = hd_stack(base, top, 1.0);
+                assert!(labelled_layers(&tl, &assets, 0.5).iter().any(|l| *l), "{name}");
+                check(name, &tl, &assets, &[0.5], STRICT);
+            }
+        }
+        None => eprintln!("skipped: this FFmpeg cannot make the HLG test clip"),
+    }
+    // An SD proxy is as it was, and beside a BT.709 proxy is refused where the matrix is negotiated.
+    let sd = proxies.of(h.get("detail/sd-untagged"));
+    let (tl, assets) = hd_stack(&phone, &sd, 1.0);
+    check_mixed("proxy/sd-untagged-over-709", &tl, &assets, &[0.5], "different YCbCr matrices");
+    let (tl, assets) = hd_stack(&untagged, &sd, 1.0);
+    check("proxy/sd-untagged-over-untagged-hd", &tl, &assets, &[0.5], STRICT);
+}
+
 // ---- recorded numbers -----------------------------------------------------------
 //
 // Final limits (the constants at the top; no case relaxes the flat-region ones):

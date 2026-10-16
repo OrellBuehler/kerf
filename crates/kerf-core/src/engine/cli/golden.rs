@@ -144,6 +144,9 @@ hdr-zscale zscale=tin=
 hdr-colorspace colorspace=all=bt709:iall=bt2020
 hdr-pq tin=smpte2084
 hdr-hlg tin=arib-std-b67
+bt709-label setparams=colorspace=bt709
+still-bt709-label setparams=colorspace=bt709
+preview-bt709-label setparams=colorspace=bt709
 reframe v360@c
 reframe-animated sendcmd=c='
 reframe-equirect-out output=e:
@@ -1030,7 +1033,7 @@ fn transitions(c: &Case, assets: &[Asset]) -> Vec<String> {
 }
 
 /// The families that come from the case's structure rather than from argv text.
-const STRUCTURAL: [&str; 27] = [
+const STRUCTURAL: [&str; 30] = [
     "muted-track",
     "solo-track",
     "disabled-clip",
@@ -1058,6 +1061,9 @@ const STRUCTURAL: [&str; 27] = [
     "channel-opacity-alone",
     "still-tail",
     "still-travel",
+    "bt709-mix",
+    "still-bt709-mix",
+    "preview-bt709-mix",
 ];
 
 fn expected(table: &[(&str, &str)]) -> Vec<String> {
@@ -1167,6 +1173,46 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
             travel || layers.iter().any(|l| l.motion != (0.0, 0.0)),
         )
     });
+    // Which graphs hold untagged HD footage beside an input that names a matrix (the pool's HDR
+    // clips; it holds no tagged SDR one): the BT.709 label's oracle, by asset *name* so it does not
+    // read the facts the builders decide from. The export's graph is the range's slice, the
+    // preview's the cut from the playhead, a still's the layers on screen.
+    let untagged_hd = |name: &str| {
+        matches!(
+            name.strip_suffix("-padded").unwrap_or(name),
+            "interview" | "broll" | "phone" | "wide" | "sphere" | "lenses"
+        )
+    };
+    let mixes = |ids: Vec<Uuid>| {
+        let names: Vec<&str> = ids
+            .iter()
+            .filter_map(|id| assets.iter().find(|a| a.id == *id))
+            .map(|a| a.name.as_str())
+            .collect();
+        names.iter().any(|n| untagged_hd(n)) && names.iter().any(|n| n.starts_with("hdr-"))
+    };
+    let ids_of = |tl: &Timeline| -> Vec<Uuid> {
+        tl.tracks
+            .iter()
+            .filter(|t| t.kind == StreamKind::Video)
+            .flat_map(|t| t.clips.iter().map(|k| k.asset_id))
+            .collect()
+    };
+    let export_graph = match effective_range(&rendered, &c.opts) {
+        Some((from, to)) => rendered.slice(from, to),
+        None => rendered.clone(),
+    };
+    let preview_graph = {
+        let start = c.preview.0;
+        (start.is_finite() && start < rendered.duration()).then(|| rendered.slice(start, rendered.duration()))
+    };
+    let (bt709_export, bt709_preview, bt709_still) = (
+        !c.opts.container.is_audio_only() && mixes(ids_of(&export_graph)),
+        preview_graph.as_ref().is_some_and(|g| mixes(ids_of(g))),
+        c.stills
+            .iter()
+            .any(|(t, _)| mixes(layers(*t).iter().map(|l| l.active.clip.asset_id).collect())),
+    );
     let channels = |rf: &Reframe| {
         let k = &rf.keyframes;
         [
@@ -1231,6 +1277,9 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
             clips().any(|k| k.is_keyed(Property::Opacity) && !k.is_keyed(Property::Scale)),
             "channel-opacity-alone",
         ),
+        (bt709_export, "bt709-mix"),
+        (bt709_still, "still-bt709-mix"),
+        (bt709_preview, "preview-bt709-mix"),
         (still_transitions.0, "still-tail"),
         (still_transitions.1, "still-travel"),
         (chain_tails(&flat[0]).0, "zoom-keyed-last"),
@@ -1383,6 +1432,25 @@ fn the_argv_builders_still_produce_the_golden_digests() {
         by_count.sort_by_key(|(_, n)| **n);
         eprintln!("golden: the {} thinnest families: {:?}", 12, &by_count[..12]);
     }
+    // The BT.709 label appears in a graph exactly when it holds untagged HD beside an input that names
+    // a matrix: every other case, single clips and graphs of untagged footage among them, is unmoved.
+    let wrong: Vec<String> = results
+        .iter()
+        .flat_map(|(i, (_, hit))| {
+            let has = |f: &str| hit.iter().any(|h| h == f);
+            [("bt709", ""), ("bt709", "still-"), ("bt709", "preview-")]
+                .into_iter()
+                .filter(move |(name, scope)| has(&format!("{scope}{name}-label")) != has(&format!("{scope}{name}-mix")))
+                .map(move |(name, scope)| format!("case {i}: {scope}{name}-label differs from {scope}{name}-mix"))
+        })
+        .collect();
+    if !wrong.is_empty() {
+        failures.push(format!(
+            "the BT.709 label is not where untagged HD meets a matrix-naming input ({} cases): {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(8)]
+        ));
+    }
     let thin: Vec<_> = seen.iter().filter(|(_, n)| **n < MIN_PER_FAMILY).collect();
     if !thin.is_empty() {
         failures.push(format!(
@@ -1390,4 +1458,145 @@ fn the_argv_builders_still_produce_the_golden_digests() {
         ));
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// What the BT.709 label may be asked of: pictures standing where the corpus' HDR clips stand.
+/// The corpus names a matrix only with HDR, and its stills carry no tag, so the digests cannot
+/// tell a decoder's default tag (a PNG's `gbr`, a JPEG's or WebP's or an MJPEG webcam's `bt470bg`,
+/// all probed) from the file's word. Every case that holds an HDR clip is therefore built again with
+/// that clip replaced by one of these, same size and place, and the label must appear in exactly the
+/// graphs the stand-in names a matrix for: nowhere for the shapes that name nothing (a project of
+/// untagged HD footage and a logo or a photo is as it always was), where HDR was for the shapes
+/// that do.
+const STAND_INS: &[(&str, bool, bool, &str, &str, &str)] = &[
+    // (name, names a matrix, still image, codec, pix_fmt, tag)
+    ("png rgba gbr", false, true, "png", "rgba", "gbr"),
+    ("png gray gbr", false, true, "png", "gray", "gbr"),
+    ("jpeg bt470bg", false, true, "mjpeg", "yuvj420p", "bt470bg"),
+    ("webp bt470bg", false, true, "webp", "yuv420p", "bt470bg"),
+    ("mjpeg video bt470bg", false, false, "mjpeg", "yuvj420p", "bt470bg"),
+    ("rgb video gbr", false, false, "ffv1", "bgr0", "gbr"),
+    // Each of these is kept off by one rule alone: `gbr` on a layout that is not RGB (a moving
+    // picture with alpha), a decoder that tags everything it decodes with no `yuvj` to give it away
+    // (MJPEG at 4:2:2, SpeedHQ, JPEG-LS grey, a decode-only one of the list), AMV, and an RGB picture
+    // whose tag is not `gbr` from a codec that is not on the list.
+    ("rgba video gbr", false, false, "ffv1", "bgra", "gbr"),
+    ("mjpeg video yuv422p bt470bg", false, false, "mjpeg", "yuv422p", "bt470bg"),
+    ("speedhq yuv422p bt470bg", false, false, "speedhq", "yuv422p", "bt470bg"),
+    ("amv yuvj420p bt470bg", false, false, "amv", "yuvj420p", "bt470bg"),
+    ("jpegls rgb24 bt470bg", false, false, "jpegls", "rgb24", "bt470bg"),
+    ("jpegls gray bt470bg", false, false, "jpegls", "gray", "bt470bg"),
+    ("thp yuv420p bt470bg", false, false, "thp", "yuv420p", "bt470bg"),
+    ("ffv1 rgb24 bt470bg", false, false, "ffv1", "rgb24", "bt470bg"),
+    // The controls: a tag that is the file's word, `yuvj420p` full-range H.264 (OBS, drones) included.
+    ("h264 bt709", true, false, "h264", "yuv420p", "bt709"),
+    ("h264 smpte170m", true, false, "h264", "yuv420p", "smpte170m"),
+    ("h264 yuvj420p bt709", true, false, "h264", "yuvj420p", "bt709"),
+];
+
+/// How many stand-ins there are.
+const SHAPES: usize = STAND_INS.len();
+
+#[test]
+fn a_decoders_default_tag_names_no_matrix_in_any_graph_of_the_corpus() {
+    const LABEL: &str = "setparams=colorspace=bt709";
+    let assets = pool();
+    let hdr_ids: Vec<Uuid> = assets.iter().filter(|a| a.hdr().is_some()).map(|a| a.id).collect();
+    assert!(!hdr_ids.is_empty());
+    let stand_in = |shape: usize| -> Vec<Asset> {
+        let (_, _, image, codec, pix_fmt, tag) = STAND_INS[shape];
+        assets
+            .iter()
+            .map(|a| {
+                let mut a = a.clone();
+                if hdr_ids.contains(&a.id) {
+                    for s in a.streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
+                        *s = StreamInfo {
+                            image,
+                            fps: (!image).then_some(s.fps.unwrap_or(30.0)),
+                            codec: codec.into(),
+                            pix_fmt: Some(pix_fmt.into()),
+                            color_space: Some(tag.into()),
+                            color_transfer: None,
+                            color_primaries: None,
+                            ..s.clone()
+                        };
+                    }
+                }
+                a
+            })
+            .collect()
+    };
+    let swapped: Vec<Vec<Asset>> = (0..SHAPES).map(stand_in).collect();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    // (shape, case, kind) triples that disagree, and how many cases each shape covered / labelled.
+    type Found = (Vec<String>, [usize; SHAPES], [usize; SHAPES]);
+    let results: Vec<Found> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|w| {
+                let (assets, swapped, hdr_ids) = (&assets, &swapped, &hdr_ids);
+                s.spawn(move || {
+                    let (mut bad, mut covered, mut labelled) = (Vec::new(), [0usize; SHAPES], [0usize; SHAPES]);
+                    for i in (w..TOTAL).step_by(threads) {
+                        let c = case(i, assets);
+                        let holds_hdr = c
+                            .timeline
+                            .for_render()
+                            .tracks
+                            .iter()
+                            .filter(|t| t.kind == StreamKind::Video)
+                            .flat_map(|t| &t.clips)
+                            .any(|k| hdr_ids.contains(&k.asset_id));
+                        if !holds_hdr {
+                            continue;
+                        }
+                        let shape = i % SHAPES;
+                        let (text, _) = build(&c, &swapped[shape]);
+                        covered[shape] += 1;
+                        let named = STAND_INS[shape].1;
+                        let before = named.then(|| build(&c, assets).0);
+                        for (k, kind) in KINDS.iter().enumerate() {
+                            let has = text[k].contains(LABEL);
+                            // A shape that names a matrix labels exactly where HDR did.
+                            let want = before.as_ref().is_some_and(|b| b[k].contains(LABEL));
+                            labelled[shape] += usize::from(has);
+                            if has != want {
+                                bad.push(format!(
+                                    "case {i}, {kind}, {}: label {has}, wanted {want}",
+                                    STAND_INS[shape].0
+                                ));
+                            }
+                        }
+                    }
+                    (bad, covered, labelled)
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
+    });
+    let (mut covered, mut labelled) = ([0usize; SHAPES], [0usize; SHAPES]);
+    let mut bad = Vec::new();
+    for (b, c, l) in results {
+        bad.extend(b);
+        for n in 0..SHAPES {
+            covered[n] += c[n];
+            labelled[n] += l[n];
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "{} disagreements, first: {:?}",
+        bad.len(),
+        &bad[..bad.len().min(6)]
+    );
+    for (n, (name, named, ..)) in STAND_INS.iter().enumerate() {
+        assert!(covered[n] >= MIN_PER_FAMILY, "{name}: only {} cases", covered[n]);
+        // The controls are not empty: a shape that names a matrix does label.
+        assert_eq!(
+            labelled[n] >= MIN_PER_FAMILY,
+            *named,
+            "{name}: {} labelled graphs",
+            labelled[n]
+        );
+    }
 }

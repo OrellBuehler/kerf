@@ -53,14 +53,15 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::clip_timing::{
-    clip_seek, clip_source_window, clips_with_fx, ffmpeg_frame_time, ClipFx, ClipTiming, FadeEdge, FadeStep, MotionKeys, Rational,
+    clip_seek, clip_source_window, clips_with_fx, ffmpeg_frame_time, graph_bt709_labels, ClipFx, ClipTiming, FadeEdge, FadeStep,
+    MotionKeys, Rational,
 };
 use crate::engine::{render_geometry, safe_color, valid_color, Container, ExportOptions};
 use crate::error::{Error, Result};
 use crate::frame_pick::{FpsPick, Pick};
 use crate::layer_geometry::Keyed;
 use crate::media::{MediaResolver, OriginalMedia, SourceMedia};
-use crate::model::{Asset, Hdr, Projection, Property, StreamKind, TextOverlay, Timeline, VideoEffect};
+use crate::model::{bt709_labels, Asset, Hdr, Projection, Property, StreamInfo, StreamKind, TextOverlay, Timeline, VideoEffect};
 use crate::plan_caps::{GpuCaps, LayerRef};
 use crate::render_plan::{
     clip_source_time, composite_matrix, Animated, CompositeColorPolicy, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe,
@@ -125,6 +126,10 @@ struct AssetFacts {
     duration: f64,
     /// `None` when the asset has no video picture of a known size.
     stream: Option<PlanStream>,
+    /// The original's first video stream, which the graph's BT.709 label is decided from: the
+    /// graph builders see the original's metadata whichever file is decoded (a proxy may be
+    /// smaller than HD, or tagged differently by the tone-map).
+    original: Option<StreamInfo>,
     projection: Option<Projection>,
 }
 
@@ -211,6 +216,7 @@ impl Planner {
         } else {
             Cow::Borrowed(assets)
         };
+        let originals = assets;
         let assets: &[Asset] = &decoded;
         // A rate FFmpeg would not parse is an error in either mode: nothing sensible can be
         // said about frames of a graph that does not build.
@@ -224,7 +230,8 @@ impl Planner {
         let facts: HashMap<Uuid, AssetFacts> = assets
             .iter()
             .zip(&media)
-            .map(|(a, m)| {
+            .zip(originals)
+            .map(|((a, m), original)| {
                 let stream = a
                     .streams
                     .iter()
@@ -237,6 +244,7 @@ impl Planner {
                     is_image: a.is_image(),
                     duration: a.duration,
                     stream,
+                    original: original.streams.iter().find(|s| s.kind == StreamKind::Video).cloned(),
                     projection: a.projection(),
                 };
                 (a.id, facts)
@@ -245,10 +253,18 @@ impl Planner {
 
         let mut clips: Vec<PlannedClip> = Vec::new();
         let mut by_track: Vec<(usize, Vec<usize>)> = Vec::new();
-        for (ti, ci, clip, fx) in clips_with_fx(&rendered, assets) {
+        // The export labels an untagged HD input BT.709 when another input of its graph names a
+        // matrix: over every clip of this cut, decided from the originals (a Still plan decides
+        // over the layers on screen instead, in `plan`).
+        let labels = graph_bt709_labels(&rendered, originals);
+        for (flat, (ti, ci, clip, fx)) in clips_with_fx(&rendered, assets).enumerate() {
             if rendered.tracks[ti].kind != StreamKind::Video {
                 continue;
             }
+            let fx = ClipFx {
+                label_bt709: labels[flat],
+                ..fx
+            };
             let timing = ClipTiming::new(clip, &fx);
             let effects = clip
                 .effects
@@ -518,6 +534,7 @@ impl Planner {
         let graph_time = ffmpeg_frame_time(frame.max(0) as u64, fps.num, fps.den);
         let tail_at = fps.exact_time(frame.max(0) as u64) + 1e-9;
         let mut layers = Vec::new();
+        let mut originals: Vec<Option<&StreamInfo>> = Vec::new();
         let mut pictureless = Vec::new();
         // A still's tail window is judged at the slot's start, which can be before `eval` (the `t`
         // it was asked for, inside the frame): look from there.
@@ -544,6 +561,11 @@ impl Planner {
                         name: asset.name.clone(),
                     });
                     continue;
+                };
+                originals.push(asset.original.as_ref());
+                let stream = PlanStream {
+                    label_bt709: motion && planned.fx.label_bt709,
+                    ..stream
                 };
                 let local = (eval - clip.timeline_start).max(0.0);
                 let reframe = clip.reframe_at(local).map(|pose| PlanReframe {
@@ -605,6 +627,11 @@ impl Planner {
                         reversed: clip.is_reversed(),
                     },
                 });
+            }
+        }
+        if !motion {
+            for (layer, label) in layers.iter_mut().zip(bt709_labels(&originals)) {
+                layer.stream.label_bt709 = label;
             }
         }
         let matrix = composite_matrix(&layers, self.canvas.policy).0;

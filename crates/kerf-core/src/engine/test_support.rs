@@ -132,6 +132,40 @@ pub(crate) fn image_stream(w: u32, h: u32) -> StreamInfo {
     }
 }
 
+/// Pictures of the shapes `Project::probe_asset` really gives (ffprobe on FFmpeg 6.1.1 and 9.0.2) for
+/// files whose tag is **the decoder's default, not the file's word**: a PNG is tagged `gbr` whatever
+/// its layout, RGB video made by some encoders is too, a JPEG or a WebP is `bt470bg`, and so is
+/// everything the `mjpeg`, `amv`, `speedhq` and `jpegls` decoders produce (whatever the pixel format,
+/// `rgb24` and grey included). Several name no matrix for one rule of their own (a non-image `rgba`
+/// with `gbr`, MJPEG and SpeedHQ at `yuv422p`, JPEG-LS grey). None of them names a matrix to a graph.
+pub(crate) fn decoder_default_pictures(w: u32, h: u32) -> Vec<(&'static str, StreamInfo)> {
+    let make = |codec: &str, pix_fmt: &str, tag: &str, image: bool| {
+        let mut s = if image { image_stream(w, h) } else { video_stream(w, h, 30.0) };
+        s.codec = codec.into();
+        s.pix_fmt = Some(pix_fmt.into());
+        s.color_space = Some(tag.into());
+        s
+    };
+    vec![
+        ("png rgb24 gbr", make("png", "rgb24", "gbr", true)),
+        ("png rgba gbr", make("png", "rgba", "gbr", true)),
+        ("png gray gbr", make("png", "gray", "gbr", true)),
+        ("jpeg yuvj420p bt470bg", make("mjpeg", "yuvj420p", "bt470bg", true)),
+        ("webp yuv420p bt470bg", make("webp", "yuv420p", "bt470bg", true)),
+        ("mjpeg video yuvj420p bt470bg", make("mjpeg", "yuvj420p", "bt470bg", false)),
+        ("mjpeg video yuvj422p bt470bg", make("mjpeg", "yuvj422p", "bt470bg", false)),
+        ("mjpeg video yuv422p bt470bg", make("mjpeg", "yuv422p", "bt470bg", false)),
+        ("speedhq yuv422p bt470bg", make("speedhq", "yuv422p", "bt470bg", false)),
+        ("amv yuvj420p bt470bg", make("amv", "yuvj420p", "bt470bg", false)),
+        ("ffv1 bgr0 gbr", make("ffv1", "bgr0", "gbr", false)),
+        ("ffv1 bgra gbr", make("ffv1", "bgra", "gbr", false)),
+        ("h264 gbrp gbr", make("h264", "gbrp", "gbr", false)),
+        ("jpegls rgb24 bt470bg", make("jpegls", "rgb24", "bt470bg", false)),
+        ("jpegls gray bt470bg", make("jpegls", "gray", "bt470bg", false)),
+        ("jpegls gray16le bt470bg", make("jpegls", "gray16le", "bt470bg", false)),
+    ]
+}
+
 /// A clip of `asset_id`'s `source_in..source_out` placed at `timeline_start`.
 pub(crate) fn make_clip(asset_id: Uuid, source_in: f64, source_out: f64, timeline_start: f64) -> Clip {
     Clip::new(asset_id, source_in, source_out, timeline_start)
