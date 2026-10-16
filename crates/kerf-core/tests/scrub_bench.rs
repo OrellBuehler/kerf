@@ -106,6 +106,7 @@ fn timeline(tracks: Vec<Vec<Clip>>) -> Timeline {
             })
             .collect(),
         overlays: Vec::new(),
+        svg_overlays: Vec::new(),
         markers: Vec::new(),
         format: None,
         master: Default::default(),

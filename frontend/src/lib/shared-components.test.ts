@@ -197,15 +197,16 @@ describe('SliderRow', () => {
 			expect(tag, name).toContain('oninput={noteTyped}');
 			// An IME's last composition may not end in an `input` event.
 			expect(tag, name).toContain('oncompositionend={noteTyped}');
-			expect(tag, name).toMatch(/endEdit\(|patchTitle\(/);
+			expect(tag, name).toMatch(/endEdit\(|patchTitle\(|patchSvg\(/);
 			expect(tag, name).not.toMatch(/currentTarget\.value(?!\s*=[^=])/);
 			expect(tag, name).not.toMatch(/\bclip[.!]|\bo\.id|selectedClip|\boverlay\b/);
 		}
 		// The title's colour pickers, select and checkbox change at once, but go through the same door.
 		const pickers = (inspector.match(/<input\b[\s\S]*?\/>/g) ?? []).filter((tag) => /type="color"/.test(tag));
-		expect(pickers.length).toBe(1);
-		expect(pickers[0]).toContain('onfocus={noteFocus}');
-		expect(pickers[0]).toContain('patchTitle(e.currentTarget');
+		expect(pickers.length).toBe(2);
+		for (const picker of pickers) expect(picker).toContain('onfocus={noteFocus}');
+		expect(pickers.filter((tag) => tag.includes('patchTitle(e.currentTarget'))).toHaveLength(1);
+		expect(pickers.filter((tag) => tag.includes('patchSvg('))).toHaveLength(1);
 		expect(inspector).not.toMatch(/updateOverlay\(o\.id/);
 		expect(inspector.match(/patchTitle\(e\.currentTarget/g)?.length).toBe(5);
 		for (const helper of ['setVideoFxParam', 'setAudioFxParam'])

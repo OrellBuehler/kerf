@@ -1,5 +1,14 @@
 import { describe, expect, test } from 'bun:test';
-import { colorKeyCount, colorSummary, isNeutralColor, keyLabel, keyNeighbours, timingSummary } from './inspector-summary';
+import {
+	colorKeyCount,
+	colorSummary,
+	isNeutralColor,
+	keyLabel,
+	keyNeighbours,
+	svgPlacementSummary,
+	svgSourceSummary,
+	timingSummary
+} from './inspector-summary';
 import { COLOR_LOOKS } from './style-presets';
 import { DEFAULT_COLOR, type Clip, type Color } from './types';
 
@@ -67,5 +76,29 @@ describe('the keys around the playhead', () => {
 		expect(keyNeighbours([0, 2, 4], 2)).toEqual({ prev: 0, next: 4, here: true });
 		expect(keyNeighbours([0, 2, 4], 2.015)).toEqual({ prev: 0, next: 4, here: true });
 		expect(keyNeighbours([0, 2, 4], 2.03)).toEqual({ prev: 2, next: 4, here: false });
+	});
+});
+
+describe('an animated title’s summaries', () => {
+	const rect = { x: 0, y: 0, width: 1, height: 1, opacity: 1 };
+
+	test('the Placement line: the whole frame, else the size and the corner', () => {
+		expect(svgPlacementSummary(rect)).toBe('Full frame');
+		expect(svgPlacementSummary({ ...rect, x: 0.3, y: 0.42, width: 0.4, height: 0.16 })).toBe('40% × 16% at 30%, 42%');
+	});
+
+	test('a translucent title says how much', () => {
+		expect(svgPlacementSummary({ ...rect, opacity: 0.6 })).toBe('Full frame · 60% opaque');
+		expect(svgPlacementSummary({ x: 0.1, y: 0.1, width: 0.5, height: 0.5, opacity: 0.25 })).toBe('50% × 50% at 10%, 10% · 25% opaque');
+	});
+
+	test('the artwork line names the preset, else says custom', () => {
+		const preset = { kind: 'lower_third' as const, params: { text: 'Ann', color: 'white', accent: 'gold' } };
+		expect(svgSourceSummary({ preset })).toBe('Lower third');
+		expect(svgSourceSummary({})).toBe('Custom SVG');
+	});
+
+	test('the Timing line is the clip’s', () => {
+		expect(timingSummary(1, 4)).toBe('Start 0:01.0 · Dur 0:04.0');
 	});
 });

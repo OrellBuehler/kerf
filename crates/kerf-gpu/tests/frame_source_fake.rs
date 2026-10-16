@@ -52,6 +52,7 @@ fn layer(a: &Asset, t: f64) -> kerf_core::PlanLayer {
             ..Track::new(StreamKind::Video, "V1".to_string())
         }],
         overlays: Vec::new(),
+        svg_overlays: Vec::new(),
         markers: Vec::new(),
         format: None,
         master: Default::default(),

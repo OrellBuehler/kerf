@@ -612,6 +612,10 @@ pub struct RenderPlan {
     pub layers: Vec<PlanLayer>,
     /// The text overlays live at this frame, in the order they are drawn (on top).
     pub overlays: Vec<PlanText>,
+    /// The animated SVG titles on screen at this frame, in the order they are laid (under the
+    /// text). Only named: a compositor does not draw them, so a frame holding one is refused
+    /// ([`Unsupported::Svg`]) and FFmpeg draws it from the pictures resvg made.
+    pub svg: Vec<Uuid>,
     /// Clips that are on screen but whose source has no picture to draw. `index` is the
     /// number of drawn layers below it: the slot in `layers` it would have taken.
     pub pictureless: Vec<Pictureless>,
@@ -1109,6 +1113,10 @@ impl RenderPlan {
                     out.push(Unsupported::TextBorder);
                 }
             }
+        }
+        // resvg draws an animated title and FFmpeg overlays its pictures: no compositor pass does either.
+        if !self.svg.is_empty() {
+            out.push(Unsupported::Svg);
         }
         // The compositor implements swscale's default (bicubic) only.
         if let Some(s) = self.canvas.scaler.as_deref().filter(|s| !s.eq_ignore_ascii_case("bicubic")) {
