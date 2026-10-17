@@ -60,6 +60,13 @@ import type {
 	StemsResult,
 	StemsStatus,
 	StreamKind,
+	SvgCheck,
+	SvgLayout,
+	SvgOverlayPatch,
+	SvgPresetInfo,
+	SvgPresetKind,
+	SvgPresetParamsInput,
+	SvgSource,
 	Task,
 	TextKeyframe,
 	TextOverlay,
@@ -127,6 +134,14 @@ import { captionsForTimeline, resolveCaptions } from './captions';
 import { describeError, logFrontend } from './log';
 import { parseLaunchRequest } from './launch';
 import { DEV_MODEL_BYTES, STEM_NAMES, STEMS_CANCELLED, devStemAssets, placeStems } from './stems';
+import {
+	addSvgOverlayTo,
+	removeSvgOverlayFrom,
+	svgPresetArt,
+	svgPresetInfos,
+	updateSvgOverlayIn,
+	validateSvgSource
+} from './svg-dev';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
 
 export type { AudioDetached };
@@ -2378,6 +2393,73 @@ export async function setOverlayKeyframes(overlayId: string, keyframes: TextKeyf
 		return snapshot();
 	}
 	return invoke<Timeline>('set_overlay_keyframes', { overlayId, keyframes });
+}
+
+/**
+ * Add an animated SVG title between `start` and `end` (timeline seconds). `source` is custom SVG
+ * (`{ custom }`, sanitised by the backend) or a preset (`{ preset: { kind, params } }`). Without
+ * `end` it runs as long as the SVG's own animation (2–30 s), else four seconds; `layout` places it
+ * (frame fractions, default the whole frame, opaque). The new title is the one in the returned
+ * timeline that was not there before; `validateSvg` first shows what the backend could not honour.
+ */
+export async function addSvgOverlay(
+	source: SvgSource,
+	start: number,
+	end?: number | null,
+	layout: SvgLayout = {}
+): Promise<Timeline> {
+	if (!inTauri()) {
+		addSvgOverlayTo(devTimeline, source, start, end, layout);
+		recordDev('Add animated title');
+		return snapshot();
+	}
+	return invoke<Timeline>('add_svg_overlay', { source, start, end: end ?? null, layout });
+}
+
+/** Change an animated title; only provided fields change. `patch.svg` swaps in custom artwork (the title
+ *  stops being a preset), `patch.preset_params` re-fills a preset title and `patch.preset_kind` makes it another
+ *  preset (one edit; it keeps its id and place in the draw order); a preset re-times itself when `start` / `end`
+ *  change its length. */
+export async function updateSvgOverlay(overlayId: string, patch: SvgOverlayPatch): Promise<Timeline> {
+	if (!inTauri()) {
+		updateSvgOverlayIn(devTimeline, overlayId, patch);
+		recordDev('Update animated title');
+		return snapshot();
+	}
+	return invoke<Timeline>('update_svg_overlay', { overlayId, patch });
+}
+
+export async function removeSvgOverlay(overlayId: string): Promise<Timeline> {
+	if (!inTauri()) {
+		removeSvgOverlayFrom(devTimeline, overlayId);
+		recordDev('Remove animated title');
+		return snapshot();
+	}
+	return invoke<Timeline>('remove_svg_overlay', { overlayId });
+}
+
+/** What the backend would make of this SVG source: the sanitised document, what it could not honour
+ *  and when its animations end. Touches nothing; throws on a document it would refuse. */
+export async function validateSvg(svg: string): Promise<SvgCheck> {
+	if (!inTauri()) return validateSvgSource(svg);
+	return invoke<SvgCheck>('validate_svg', { svg });
+}
+
+/** The ready-made animated titles and the parameters each takes. */
+export async function listSvgPresets(): Promise<SvgPresetInfo[]> {
+	if (!inTauri()) return svgPresetInfos();
+	return invoke<SvgPresetInfo[]>('list_svg_presets');
+}
+
+/** A preset's artwork as SVG text, drawn for the project's delivery frame and `duration` seconds
+ *  (default 4). Show it through an `<img>` data URL, never inline. */
+export async function svgPresetPreview(
+	kind: SvgPresetKind,
+	params: SvgPresetParamsInput,
+	duration?: number
+): Promise<string> {
+	if (!inTauri()) return svgPresetArt(kind, params);
+	return invoke<string>('svg_preset_preview', { kind, params, duration: duration ?? null });
 }
 
 /** Caption the cut: project every clip's transcript through the current edit and

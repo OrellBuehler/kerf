@@ -97,6 +97,18 @@ tauri-plugin-single-instance = "2.5"
 tauri-plugin-updater = "2.10"
 tauri-plugin-process = "2.3"
 
+# The PNG encoder behind the animated titles' picture cache (svg::raster::encode_frame_png) is
+# ~10x slower unoptimised, and a debug build (tests, `tauri dev`) draws a stream's titles inside
+# the same 10 s as a release one. Only the four small crates of the quick level.
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.dev.package.simd-adler32]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = "thin"

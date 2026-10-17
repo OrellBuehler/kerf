@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { changeIndex, changePoints, diffView, isEmptyView, stepChange } from './staged-diff';
 import { frameTime } from './frames';
-import type { Clip, DiffEntry, TextOverlay, Timeline, Track } from './types';
+import type { Clip, DiffEntry, SvgOverlay, TextOverlay, Timeline, Track } from './types';
 
 const clip = (id: string, start: number, len = 4): Clip => ({
 	id,
@@ -176,5 +176,55 @@ describe('walking the changes', () => {
 	test('nothing to walk', () => {
 		expect(stepChange([], 3, 1, fps, dur)).toBeNull();
 		expect(stepChange([], 3, -1, fps, dur)).toBeNull();
+	});
+});
+
+describe('animated titles in a proposal', () => {
+	const svg = (id: string, start: number, end: number, name = '', text = 'Hello'): SvgOverlay => ({
+		id,
+		name,
+		svg: '<svg xmlns="http://www.w3.org/2000/svg"/>',
+		start,
+		end,
+		x: 0,
+		y: 0,
+		width: 1,
+		height: 1,
+		opacity: 1,
+		preset: name ? undefined : { kind: 'fade_up', params: { text, color: 'white', accent: 'gold' } }
+	});
+	const liveSvg: Timeline = { tracks: [], overlays: [overlay('t1', 1, 3)], svg_overlays: [svg('a1', 2, 5, 'Logo'), svg('a2', 6, 8)] };
+	const proposedSvg: Timeline = { tracks: [], overlays: [overlay('t1', 1, 3)], svg_overlays: [svg('a1', 3, 5, 'Logo'), svg('a3', 0, 2, '', 'Intro')] };
+	const svgEntries: DiffEntry[] = [
+		{ kind: 'overlay_added', summary: 'Added animated title “Intro” at 0:00.0–0:02.0', overlay_id: 'a3', at: 0 },
+		{ kind: 'overlay_changed', summary: 'Changed animated title “Logo”', overlay_id: 'a1', at: 3 },
+		{ kind: 'overlay_removed', summary: 'Removed animated title “Hello”', overlay_id: 'a2', at: 6 }
+	];
+	const v = diffView(svgEntries, proposedSvg, liveSvg);
+
+	test('an added or changed animated title is marked by its id, with the titles', () => {
+		expect(v.titles.get('a3')).toBe('added');
+		expect(v.titles.get('a1')).toBe('shifted');
+	});
+
+	test('a removed one is a ghost where it stood, named as the lane names it', () => {
+		expect(v.removedTitles).toEqual([{ id: 'a2', start: 6, end: 8, text: 'Hello', svg: true }]);
+	});
+
+	test('a removed text title is still one, and an id that is nowhere draws nothing', () => {
+		const mixed = diffView(
+			[
+				{ kind: 'overlay_removed', summary: '', overlay_id: 't1', at: 1 },
+				{ kind: 'overlay_removed', summary: '', overlay_id: 'ghost', at: 1 }
+			],
+			{ tracks: [] },
+			liveSvg
+		);
+		expect(mixed.removedTitles).toEqual([{ id: 't1', start: 1, end: 3, text: 't1' }]);
+	});
+
+	test('they count as a change, and as a place to step to', () => {
+		expect(isEmptyView(v)).toBe(false);
+		expect(changePoints(svgEntries)).toEqual([0, 3, 6]);
 	});
 });
