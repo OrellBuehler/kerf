@@ -16,10 +16,11 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use base64::Engine as _;
 use kerf_core::{
-    AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipMove, Delivery,
-    EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property, PropertyKey, ReframeKeyframe,
-    Region, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout, SvgOverlay, SvgOverlayPatch, SvgOverlayResult, SvgPreset,
-    SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange, Timeline, Transition, TransitionKind, VideoEffect,
+    AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipLut, ClipMove,
+    CurvePoint, Curves, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property,
+    PropertyKey, ReframeKeyframe, Region, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout, SvgOverlay, SvgOverlayPatch,
+    SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange, Timeline, Transition,
+    TransitionKind, VideoEffect, Wheel, Wheels,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities, ServerConfig};
@@ -29,8 +30,11 @@ use rmcp::transport::streamable_http_server::{
 };
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
+
+mod args;
+mod hints;
 
 /// Default localhost bind address for the MCP endpoint; override with `KERF_MCP_ADDR`.
 const DEFAULT_ADDR: &str = "127.0.0.1:7777";
@@ -163,14 +167,14 @@ struct CaptionParams {
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 struct ImportCaptionsParams {
     #[schemars(
-        description = "Absolute path of a .srt, .ass or .ssa subtitle file (at most 5 MiB). Give this or `text`, not both."
+        description = "Absolute path of a .srt, .vtt, .ass or .ssa subtitle file (at most 5 MiB). Give this or `text`, not both."
     )]
     path: Option<String>,
     #[schemars(
         description = "The subtitle file's text itself, for captions you wrote rather than found on disk (SubRip is the easy one to write). Give this or `path`, not both."
     )]
     text: Option<String>,
-    #[schemars(description = "`srt` or `ass`. Omit to detect it from the content, which is almost always right.")]
+    #[schemars(description = "`srt`, `vtt` or `ass`. Omit to detect it from the content, which is almost always right.")]
     format: Option<String>,
     #[schemars(
         description = "Which clock the cue times are on. `timeline` (default): the file is a subtitle track for the finished cut, so a cue at 0:12 shows at 0:12 of the timeline (cues after the cut ends are dropped). `source`: the file times one asset's own footage — a transcript, or subtitles for the uncut recording — and needs asset_id; each cue is projected through every clip of that asset, so it follows trims, reorders and speed changes and a cue whose footage was cut gets no caption. Giving asset_id alone implies `source`."
@@ -477,7 +481,7 @@ struct SetMasterDuckParams {
 struct CutClipRangeParams {
     #[schemars(description = "UUID of the clip to cut")]
     clip_id: String,
-    #[schemars(description = "Source-time start of the span to remove (seconds, e.g. a transcript segment's start)")]
+    #[schemars(description = "Source-time start of the span to remove (seconds, e.g. a transcript segment's or a word's start)")]
     from: f64,
     #[schemars(description = "Source-time end of the span to remove (seconds)")]
     to: f64,
@@ -650,6 +654,26 @@ struct SetMasterLimiterParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetMasterTruePeakParams {
+    #[schemars(
+        description = "true makes the master limiter hold the true peak (it runs 4x oversampled, so the peaks between samples stay under the ceiling too); false is the plain sample-peak limiter"
+    )]
+    enabled: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SyncByAudioParams {
+    #[schemars(description = "UUID of the clip that stays put: the timing reference")]
+    reference_clip_id: String,
+    #[schemars(description = "UUID of the clip to move into sync with the reference (its linked partners move with it)")]
+    clip_id: String,
+    #[schemars(
+        description = "Move the clip even when the match is not reliable (confidence under 8 or distinct under 1.5). Default false: an unreliable match is reported and nothing moves"
+    )]
+    force: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct GetLevelsParams {
     #[schemars(description = "Measure only this span of the cut, {start, end} in timeline seconds. Omit for the whole cut")]
     range: Option<TimeRange>,
@@ -688,6 +712,17 @@ struct AddMarkerParams {
     #[schemars(description = "Optional CSS color for the ruler chip")]
     #[serde(default)]
     color: Option<String>,
+    #[schemars(description = "How long the marked span runs from `time`, seconds; 0 is a point marker")]
+    #[serde(default)]
+    duration: Option<f64>,
+    #[schemars(description = "A free-form note (a review comment, a chapter description); an empty string clears it")]
+    #[serde(default)]
+    comment: Option<String>,
+    #[schemars(
+        description = "`comment` (the default: a note on the cut) or `chapter` (starts a chapter: written into the export's chapter list and the YouTube chapter text)"
+    )]
+    #[serde(default)]
+    kind: Option<kerf_core::MarkerKind>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -703,6 +738,17 @@ struct UpdateMarkerParams {
     #[schemars(description = "New CSS color, or an empty string to clear it")]
     #[serde(default)]
     color: Option<String>,
+    #[schemars(description = "How long the marked span runs from `time`, seconds; 0 is a point marker")]
+    #[serde(default)]
+    duration: Option<f64>,
+    #[schemars(description = "A free-form note (a review comment, a chapter description); an empty string clears it")]
+    #[serde(default)]
+    comment: Option<String>,
+    #[schemars(
+        description = "`comment` (the default: a note on the cut) or `chapter` (starts a chapter: written into the export's chapter list and the YouTube chapter text)"
+    )]
+    #[serde(default)]
+    kind: Option<kerf_core::MarkerKind>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -827,6 +873,104 @@ struct ColorParams {
         description = "Warm/cool shift -1.0–1.0 (0.0 = unchanged; positive warms, negative cools); omit to leave unchanged"
     )]
     temperature: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct GradeParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(
+        description = "Tone curves, replacing the clip's: `master`, `red`, `green`, `blue`, each a list of {x, y} points in 0..1 (input -> output, at most 16; a monotone cubic is drawn through them and held flat past the first and last point). A channel's curve runs first, then the master. [{x:0,y:1},{x:1,y:0}] inverts; [{x:0,y:0},{x:0.25,y:0.2},{x:0.75,y:0.8},{x:1,y:1}] is a gentle S. Pass {} to clear the curves; omit to leave them unchanged"
+    )]
+    curves: Option<CurvesArg>,
+    #[schemars(
+        description = "Colour wheels, replacing the clip's: `shadows`, `midtones`, `highlights`, each {x, y, lightness}. (x, y) is a point in the unit disc whose angle is the hue pushed into that range (0 deg red, 120 deg green, 240 deg blue, counter-clockwise; e.g. teal shadows are x -0.3, y 0) and whose distance is the strength; lightness (-1..1) lifts or lowers the range. 0.1 to 0.3 is a visible grade, 1 is extreme. Pass {} to clear; omit to leave them unchanged"
+    )]
+    wheels: Option<WheelsArg>,
+    #[schemars(
+        description = "Absolute path of a .cube 3D LUT file to look the clip up through (after the color numbers, before the curves). The file is checked now: a 3D table of size 2 to 65 with a 0..1 domain. Pass \"\" to remove the LUT; omit to leave it unchanged"
+    )]
+    lut_path: Option<String>,
+    #[schemars(
+        description = "How much of the LUT, 0..1 (1 = all of it, the default for a new LUT); alone, changes the current LUT's"
+    )]
+    lut_intensity: Option<f64>,
+}
+
+/// `set_grade`'s curves: the model's [`Curves`], refusing a key it does not name (`mastre`), which the
+/// persisted type quietly drops.
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CurvesArg {
+    #[serde(default)]
+    master: Vec<PointArg>,
+    #[serde(default)]
+    red: Vec<PointArg>,
+    #[serde(default)]
+    green: Vec<PointArg>,
+    #[serde(default)]
+    blue: Vec<PointArg>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PointArg {
+    x: f64,
+    y: f64,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WheelsArg {
+    #[serde(default)]
+    shadows: WheelArg,
+    #[serde(default)]
+    midtones: WheelArg,
+    #[serde(default)]
+    highlights: WheelArg,
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WheelArg {
+    #[serde(default)]
+    x: f64,
+    #[serde(default)]
+    y: f64,
+    #[serde(default)]
+    lightness: f64,
+}
+
+impl From<CurvesArg> for Curves {
+    fn from(c: CurvesArg) -> Self {
+        let points = |v: Vec<PointArg>| v.into_iter().map(|p| CurvePoint { x: p.x, y: p.y }).collect();
+        Self {
+            master: points(c.master),
+            red: points(c.red),
+            green: points(c.green),
+            blue: points(c.blue),
+        }
+    }
+}
+
+impl From<WheelArg> for Wheel {
+    fn from(w: WheelArg) -> Self {
+        Self {
+            x: w.x,
+            y: w.y,
+            lightness: w.lightness,
+        }
+    }
+}
+
+impl From<WheelsArg> for Wheels {
+    fn from(w: WheelsArg) -> Self {
+        Self {
+            shadows: w.shadows.into(),
+            midtones: w.midtones.into(),
+            highlights: w.highlights.into(),
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1187,6 +1331,48 @@ struct OverlayKeyframesParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ExportCaptionsParams {
+    #[schemars(description = "Absolute local .srt or .vtt file path to write — no URLs or ffmpeg protocol sinks")]
+    output_path: String,
+    #[schemars(description = "`srt` or `vtt`; omit to follow the path's extension")]
+    #[serde(default)]
+    format: Option<kerf_core::SubtitleFormat>,
+    #[schemars(
+        description = "Overwrite an existing file at output_path (default false — the call fails naming the path so you can pick a new one or opt in)"
+    )]
+    overwrite: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ExportInterchangeParams {
+    #[schemars(description = "Absolute local output path (.otio or .edl) — no URLs or ffmpeg protocol sinks")]
+    output_path: String,
+    #[schemars(description = "`otio` (OpenTimelineIO, every track) or `edl` (CMX 3600, one video track)")]
+    format: kerf_core::InterchangeFormat,
+    #[schemars(description = "EDL only: which video track to write, 0 = the first (V1). Default 0.")]
+    #[serde(default)]
+    video_track: Option<usize>,
+    #[schemars(
+        description = "Overwrite an existing file at output_path (default false — the call fails naming the path so you can pick a new one or opt in)"
+    )]
+    overwrite: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ExportMarkersParams {
+    #[schemars(description = "Absolute local output path (.csv or .txt) — no URLs or ffmpeg protocol sinks")]
+    output_path: String,
+    #[schemars(
+        description = "`csv` (every marker as a spreadsheet row, formula-safe) or `youtube` (chapter lines for a video description, from the chapter markers — every marker when none is a chapter)"
+    )]
+    format: kerf_core::MarkerListFormat,
+    #[schemars(
+        description = "Overwrite an existing file at output_path (default false — the call fails naming the path so you can pick a new one or opt in)"
+    )]
+    overwrite: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ExportSrtParams {
     #[schemars(description = "UUID of the asset whose transcript to export")]
     asset_id: String,
@@ -1196,6 +1382,114 @@ struct ExportSrtParams {
         description = "Overwrite an existing file at output_path (default false — the call fails naming the path so you can pick a new one or opt in)"
     )]
     overwrite: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct GetTranscriptParams {
+    #[schemars(description = "UUID of the asset whose transcript to read")]
+    asset_id: String,
+    #[schemars(
+        description = "Include each line's words with their own source times (default false: the lines alone, far fewer tokens). Ask for them over a from/to window."
+    )]
+    words: Option<bool>,
+    #[schemars(description = "Only the lines of this speaker (e.g. \"S2\"), when speakers were labelled")]
+    speaker: Option<String>,
+    #[schemars(description = "Only lines that end after this SOURCE time (seconds)")]
+    from: Option<f64>,
+    #[schemars(description = "Only lines that start before this SOURCE time (seconds)")]
+    to: Option<f64>,
+    #[schemars(
+        description = "At most this many lines (default 200, at most 2000); when more match, `next_from` is where to continue"
+    )]
+    limit: Option<usize>,
+}
+
+/// Lines `get_transcript` returns when no limit is given, and at most.
+const TRANSCRIPT_LINES: (usize, usize) = (200, 2000);
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SpeakerRangesParams {
+    #[schemars(description = "UUID of the asset")]
+    asset_id: String,
+    #[schemars(description = "Only this speaker's ranges (e.g. \"S1\"); omit for every speaker")]
+    speaker: Option<String>,
+    #[schemars(description = "Words of one speaker closer than this many seconds are one range (default 0.75, at most 10)")]
+    join_gap: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct FillerWordsParams {
+    #[schemars(description = "UUID of the asset")]
+    asset_id: String,
+    #[schemars(
+        description = "Words or short phrases to find, case and punctuation ignored (default: um, uh, umm, uhm, erm, er, ah, hmm, mm, you know, i mean). At most 100."
+    )]
+    fillers: Option<Vec<String>>,
+}
+
+/// What `get_transcript` returns.
+#[derive(serde::Serialize)]
+struct TranscriptReply {
+    asset_id: String,
+    /// The speaker labels in the transcript, in order of first appearance.
+    speakers: Vec<String>,
+    segments: Vec<kerf_core::TranscriptSegment>,
+    /// More lines matched than `limit`: pass this as `from` for the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_from: Option<f64>,
+}
+
+/// An analysis without its transcript's words — the bulk of a transcript, which
+/// get_transcript serves a window at a time.
+fn without_words(mut a: kerf_core::AssetAnalysis) -> kerf_core::AssetAnalysis {
+    a.transcript = kerf_core::transcript::without_words(&a.transcript);
+    a
+}
+
+/// `get_transcript`'s reply: the lines that match the speaker and the window, up to the limit.
+fn transcript_reply(
+    asset_id: String,
+    transcript: &[kerf_core::TranscriptSegment],
+    p: &GetTranscriptParams,
+) -> Result<TranscriptReply, McpError> {
+    let bad = |what: &str| McpError::invalid_params(what.to_string(), None);
+    let from = p.from.unwrap_or(f64::NEG_INFINITY);
+    let to = p.to.unwrap_or(f64::INFINITY);
+    if p.from.is_some_and(|f| !f.is_finite()) || p.to.is_some_and(|t| !t.is_finite()) {
+        return Err(bad("from / to must be finite seconds"));
+    }
+    if to <= from {
+        return Err(bad("to must be after from"));
+    }
+    let limit = p.limit.unwrap_or(TRANSCRIPT_LINES.0).clamp(1, TRANSCRIPT_LINES.1);
+    let mut speakers: Vec<String> = Vec::new();
+    for sp in transcript.iter().filter_map(|s| s.speaker.as_ref()) {
+        if !speakers.contains(sp) {
+            speakers.push(sp.clone());
+        }
+    }
+    let want = p.speaker.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let mut matching = transcript.iter().filter(|s| {
+        s.end > from && s.start < to && want.is_none_or(|w| s.speaker.as_deref().is_some_and(|sp| sp.eq_ignore_ascii_case(w)))
+    });
+    let segments = matching
+        .by_ref()
+        .take(limit)
+        .map(|s| kerf_core::TranscriptSegment {
+            words: if p.words.unwrap_or(false) {
+                kerf_core::transcript::words_of(s).into_owned()
+            } else {
+                Vec::new()
+            },
+            ..s.clone()
+        })
+        .collect();
+    Ok(TranscriptReply {
+        asset_id,
+        speakers,
+        segments,
+        next_from: matching.next().map(|s| s.start),
+    })
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1230,7 +1524,12 @@ struct ExportParams {
                        preset; hwaccel (\"auto\"/\"cuda\"/\"vaapi\"/\"videotoolbox\"/\"qsv\" — GPU \
                        decode, composes with any encoder); resolution ([w,h]); fps; audio_bitrate \
                        (\"192k\"); include_audio; faststart; range ({start,end} timeline seconds — \
-                       render only that span).")]
+                       render only that span); embed_captions (mux the cut's captions in as a soft \
+                       subtitle stream — mp4/mov/mkv/webm only, not shown by default); \
+                       skip_burned_captions (leave the captions out of the picture); caption_sidecars \
+                       ([\"srt\",\"vtt\"] — caption files beside the output, written once the render \
+                       completes; an existing one is refused unless overwrite is true). Chapter markers \
+                       become the file's chapters.")]
     #[serde(default)]
     options: Option<ExportOptions>,
     #[schemars(
@@ -1410,6 +1709,47 @@ struct TimelineFrameParams {
         description = "Zoom into part of the frame instead of seeing all of it: a rectangle in fractions of the full frame (0..1), `left`/`top` its top-left corner, `width`/`height` its size. The region is cropped out first and then scaled to max_width, so a quarter of the frame shows four times the detail for the same image cost — use it to check a face, on-screen text, a caption, a mask edge. Omit for the whole frame."
     )]
     region: Option<RegionParams>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ScopesParams {
+    #[schemars(description = "Timeline position to measure (seconds)")]
+    time_secs: f64,
+    #[schemars(
+        description = "Grids to return besides the numeric summary: any of `waveform` (luma), `parade` (red, green, blue), \
+                       `vectorscope`, `histogram`. Omit for the summary alone, which is usually all you need."
+    )]
+    grids: Option<Vec<kerf_core::scopes::ScopeKind>>,
+    #[schemars(
+        description = "Grid size, each field optional: `columns` / `rows` of the waveform and parade (default 64 x 64, \
+                       at most 512 x 256), `vector` the vectorscope's side (default 48, at most 256)"
+    )]
+    grid_size: Option<GridSizeParams>,
+    #[schemars(description = "Width to measure the frame at (default the delivery's, at most 3840)")]
+    max_width: Option<u32>,
+    #[schemars(
+        description = "The Y'CbCr matrix to read the frame with: `auto` (default: the delivery's, BT.709 for HD and up, \
+                       BT.601 for SD), `bt601`, `bt709`, `bt2020`"
+    )]
+    matrix: Option<kerf_core::scopes::ScopeMatrix>,
+}
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+struct GridSizeParams {
+    columns: Option<u32>,
+    rows: Option<u32>,
+    vector: Option<u32>,
+}
+
+impl GridSizeParams {
+    fn resolve(self) -> kerf_core::scopes::GridSize {
+        kerf_core::scopes::GridSize {
+            columns: self.columns.unwrap_or(64),
+            rows: self.rows.unwrap_or(64),
+            vector: self.vector.unwrap_or(48),
+        }
+        .clamped()
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1759,7 +2099,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Get an asset's probed metadata and cached analysis (silence, scenes, transcript, EBU R128 loudness, onset times, tempo/beat grid, speech/music class), \
+        description = "Get an asset's probed metadata and cached analysis (silence, scenes, transcript lines with their speakers — get_transcript has the words —, EBU R128 loudness, onset times, tempo/beat grid, speech/music class), \
                        `analysis_status` (per kind: done / not_run / running / failed with a reason / off) and `proxy` \
                        (the preview proxy: ready, building with a fraction, failed with a reason, off or not_needed)"
     )]
@@ -1779,7 +2119,7 @@ impl KerfMcp {
                 analysis_status: kerf_core::analysis_status(id, analysis.as_ref()),
                 proxy: kerf_core::proxy::status(&input),
                 asset: input.asset,
-                analysis,
+                analysis: analysis.map(without_words),
             })
         })
         .await?;
@@ -1877,6 +2217,24 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "What the user is looking at in the Kerf window: `playhead` (timeline seconds), \
+                       `selected_clip_ids`, `mark_in` / `mark_out` (the in/out marks, null when unset), \
+                       `visible_range` (the timeline seconds on screen), `focused_panel` (timeline, preview, \
+                       inspector, library, mixer, agent or deliver) and `selected_asset_id` (the library's \
+                       pick). Call it when the user says \"this clip\", \"here\" or \"the selection\". The ids \
+                       are the user's live timeline, which your staged edits may since have changed. \
+                       `age_secs` says how long ago the window last reported; `stale` is true when it has \
+                       stopped reporting, and `reported` is false when no window ever has (Kerf headless)."
+    )]
+    fn get_editor_context(&self) -> Result<String, McpError> {
+        use tauri::Manager;
+        match self.app.try_state::<crate::editor_context::EditorContextState>() {
+            Some(state) => json(&state.read()),
+            None => json(&crate::editor_context::EditorContextState::default().read()),
+        }
+    }
+
+    #[tool(
         description = "Which speech-to-text backend this build of Kerf will use for transcription, and whether its model is downloaded yet. Call this when an asset's transcript comes back empty: it says whether transcription is unavailable (and why), or simply that the first run still has to fetch a model."
     )]
     fn transcription_status(&self) -> Result<String, McpError> {
@@ -1903,7 +2261,8 @@ impl KerfMcp {
                        stop the others (see `failed` and `analysis_status` in the result). Transcribing downloads a \
                        speech model on first use (~148 MB) and then runs for a good fraction of the media's duration, so \
                        expect that step to be slow; see transcription_status if the transcript comes back empty. A \
-                       preview proxy that is queued is built first."
+                       preview proxy that is queued is built first. The transcript comes back as lines without their \
+                       words; read the words with get_transcript."
     )]
     async fn analyze_asset(&self, Parameters(p): Parameters<AnalyzeParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
@@ -1923,7 +2282,7 @@ impl KerfMcp {
         .await?;
         self.changed();
         json(&AnalyzeResult {
-            analysis: outcome.analysis,
+            analysis: without_words(outcome.analysis),
             analysis_status: outcome.status,
             failed: outcome
                 .failed
@@ -2096,7 +2455,7 @@ impl KerfMcp {
     #[tool(
         description = "Cut a source-time range out of a clip and close the gap (split + ripple in one edit) — \
                        the transcript-editing primitive: pass a transcript segment's start/end to delete that \
-                       sentence from the cut. Linked clips lose the same stretch of timeline (a picture's \
+                       sentence from the cut, or a word's (get_transcript, find_filler_words) to delete one word. Linked clips lose the same stretch of timeline (a picture's \
                        detached sound is cut with it); pass link=false to cut only this clip."
     )]
     fn cut_clip_range(&self, Parameters(p): Parameters<CutClipRangeParams>) -> Result<String, McpError> {
@@ -2342,16 +2701,31 @@ impl KerfMcp {
         description = "Switch the master limiter on or off, optionally moving its ceiling (dBFS, default -1.5). A \
                        lookahead limiter on the finished mix that holds the loudest peaks under the ceiling \
                        instead of letting them clip — turn it on for a cut destined for a platform, which asks for \
-                       a true peak under -1 dBTP. It is a sample-peak ceiling: the true peak between samples can \
-                       read above it (up to about 1 dB on a pure high tone), which is why the default sits half a \
-                       decibel under that line. Confirm the true peak with get_levels, and if it is still over \
-                       -1 dBTP with the limiter on, lower the ceiling by the overshoot plus half a decibel (the \
-                       notes say to what) instead of switching it on again. A limiter has nothing to do on a mix \
+                       a true peak under -1 dBTP. It is a sample-peak ceiling unless set_master_true_peak is on: the \
+                       true peak between samples can read above it (up to about 1 dB on a pure high tone), which is \
+                       why the default sits half a decibel under that line. Confirm the true peak with get_levels, and \
+                       if it is still over -1 dBTP with the limiter on, turn on set_master_true_peak or lower the \
+                       ceiling by the overshoot plus half a decibel (the notes say to what) instead of switching it on \
+                       again. A limiter has nothing to do on a mix \
                        already under its ceiling and leaves it alone. Returns the master bus."
     )]
     fn set_master_limiter(&self, Parameters(p): Parameters<SetMasterLimiterParams>) -> Result<String, McpError> {
         self.edit(|project| {
             let master = project.set_master_limiter(p.enabled, p.ceiling_db).map_err(core_err)?;
+            json(&master)
+        })
+    }
+
+    #[tool(
+        description = "Make the master limiter (set_master_limiter) hold the true peak instead of only the sample \
+                       peak: it then runs on the mix upsampled four times, so the peaks between samples — what \
+                       get_levels and the platforms measure as dBTP — stay under its ceiling too, and a ceiling of \
+                       -1 really means -1 dBTP. Costs a little render time; does nothing while the limiter is off \
+                       (the setting is kept). Returns the master bus."
+    )]
+    fn set_master_true_peak(&self, Parameters(p): Parameters<SetMasterTruePeakParams>) -> Result<String, McpError> {
+        self.edit(|project| {
+            let master = project.set_master_true_peak(p.enabled).map_err(core_err)?;
             json(&master)
         })
     }
@@ -2396,17 +2770,34 @@ impl KerfMcp {
                        the user can see and jump to. Good for reporting findings from skim_asset."
     )]
     fn add_marker(&self, Parameters(p): Parameters<AddMarkerParams>) -> Result<String, McpError> {
+        let patch = kerf_core::MarkerPatch {
+            color: p.color,
+            duration: p.duration,
+            comment: p.comment,
+            kind: p.kind,
+            ..kerf_core::MarkerPatch::default()
+        };
         self.edit(|project| {
-            let marker = project.add_marker(p.time, p.name, p.color).map_err(core_err)?;
+            let marker = project.add_marker_with(p.time, p.name, patch).map_err(core_err)?;
             json(&marker)
         })
     }
 
-    #[tool(description = "Move, rename or recolor a marker; omitted fields are left alone")]
+    #[tool(
+        description = "Move, rename, recolor or re-kind a marker, or set its duration or comment; omitted fields are left alone"
+    )]
     fn update_marker(&self, Parameters(p): Parameters<UpdateMarkerParams>) -> Result<String, McpError> {
         let marker_id = parse_id(&p.marker_id)?;
+        let patch = kerf_core::MarkerPatch {
+            time: p.time,
+            name: p.name,
+            color: p.color,
+            duration: p.duration,
+            comment: p.comment,
+            kind: p.kind,
+        };
         self.edit(|project| {
-            let marker = project.update_marker(marker_id, p.time, p.name, p.color).map_err(core_err)?;
+            let marker = project.edit_marker(marker_id, patch).map_err(core_err)?;
             json(&marker)
         })
     }
@@ -2654,6 +3045,50 @@ impl KerfMcp {
             let out = project
                 .set_color(clip_id, p.brightness, p.contrast, p.saturation, p.gamma, p.temperature)
                 .map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
+        description = "Grade a clip beyond set_color: tone curves (master and per channel), shadows / midtones / highlights colour wheels, and a .cube 3D LUT with an intensity. Each part is optional and omitted parts are left as they are. They apply after set_color's numbers, in the order LUT, curves, wheels. Check the result with preview_timeline."
+    )]
+    fn set_grade(&self, Parameters(p): Parameters<GradeParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        // A new LUT file is read before the project is locked.
+        if let Some(path) = p.lut_path.as_deref().filter(|s| !s.is_empty()) {
+            kerf_core::color_lut::inspect_lut(path).map_err(core_err)?;
+        }
+        self.edit(|project| {
+            let timeline = project.working_timeline().map_err(core_err)?;
+            let (ti, ci) = timeline
+                .locate(clip_id)
+                .ok_or_else(|| core_err(kerf_core::Error::ClipNotFound(clip_id)))?;
+            let mut grade = timeline.tracks[ti].clips[ci].grade.clone();
+            if let Some(curves) = p.curves.clone() {
+                grade.curves = Some(curves.into());
+            }
+            if let Some(wheels) = p.wheels {
+                grade.wheels = Some(wheels.into());
+            }
+            match (p.lut_path.as_deref(), p.lut_intensity) {
+                (Some(""), _) => grade.lut = None,
+                (Some(path), intensity) => {
+                    let kept = grade.lut.as_ref().filter(|l| l.path == path).map(|l| l.intensity);
+                    grade.lut = Some(ClipLut {
+                        path: path.to_string(),
+                        intensity: intensity.or(kept).unwrap_or(1.0),
+                    });
+                }
+                (None, Some(intensity)) => {
+                    let lut = grade
+                        .lut
+                        .as_mut()
+                        .ok_or_else(|| McpError::invalid_params("the clip has no LUT whose intensity to change", None))?;
+                    lut.intensity = intensity;
+                }
+                (None, None) => {}
+            }
+            let out = project.set_grade(clip_id, grade).map_err(core_err)?;
             json(&out)
         })
     }
@@ -3096,7 +3531,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Caption the cut from a subtitle file: SubRip (.srt) or ASS/SSA (.ass, .ssa), by path or as text you pass in. Cue times are taken as TIMELINE time by default (a subtitle track made for the finished cut); pass base=source with asset_id when the file instead times one asset's own footage (a transcript, subtitles for the uncut recording) and each cue is projected through that asset's clips like a transcript, following trims, reorders and speed changes. Long cues are split into readable lines, sized to fit the delivery frame, never two on screen at once — the same machinery as generate_captions, in the `style` you pick (`word_punch` for a vertical cut). Markup, styles and positions in the file are ignored; unreadable entries are skipped and counted. The captions REPLACE any previously generated or imported ones (a later generate_captions replaces these too — captions are one lane of text), and hand-made titles are left alone. Caption last, like generate_captions: a later edit does not move them. Pass offset (seconds, may be negative) when the file's clock does not start where the picture does. Returns a summary: cues read, placed, skipped_lines, dropped_outside (not on the cut at all: past its end or before its start, or footage that was cut out), dropped_short (on the cut but too brief to read), dropped_overlap (lost its slot to another cue), captions written and replaced. At most 10,000 cues / 100,000 words are read and 20,000 captions written per import — a refused import changes nothing."
+        description = "Caption the cut from a subtitle file: SubRip (.srt), WebVTT (.vtt) or ASS/SSA (.ass, .ssa), by path or as text you pass in. Cue times are taken as TIMELINE time by default (a subtitle track made for the finished cut); pass base=source with asset_id when the file instead times one asset's own footage (a transcript, subtitles for the uncut recording) and each cue is projected through that asset's clips like a transcript, following trims, reorders and speed changes. Long cues are split into readable lines, sized to fit the delivery frame, never two on screen at once — the same machinery as generate_captions, in the `style` you pick (`word_punch` for a vertical cut). Markup, styles and positions in the file are ignored; unreadable entries are skipped and counted. The captions REPLACE any previously generated or imported ones (a later generate_captions replaces these too — captions are one lane of text), and hand-made titles are left alone. Caption last, like generate_captions: a later edit does not move them. Pass offset (seconds, may be negative) when the file's clock does not start where the picture does. Returns a summary: cues read, placed, skipped_lines, dropped_outside (not on the cut at all: past its end or before its start, or footage that was cut out), dropped_short (on the cut but too brief to read), dropped_overlap (lost its slot to another cue), captions written and replaced. At most 10,000 cues / 100,000 words are read and 20,000 captions written per import — a refused import changes nothing."
     )]
     async fn import_captions(&self, Parameters(p): Parameters<ImportCaptionsParams>) -> Result<String, McpError> {
         let asset = p.asset_id.as_deref().map(parse_id).transpose()?;
@@ -3299,6 +3734,151 @@ impl KerfMcp {
         Ok(format!("wrote {}", p.output_path))
     }
 
+    #[tool(
+        description = "Write the cut's captions (the generated / imported caption overlays, timed as the export draws them) to a SubRip (.srt) or WebVTT (.vtt) file. Fails when the cut has no captions. Refuses to overwrite an existing file unless overwrite is true."
+    )]
+    async fn export_captions(&self, Parameters(p): Parameters<ExportCaptionsParams>) -> Result<String, McpError> {
+        crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
+        let path = std::path::PathBuf::from(&p.output_path);
+        refuse_overwrite(&path, p.overwrite.unwrap_or(false))?;
+        let format = match p.format {
+            Some(f) => f,
+            None => kerf_core::SubtitleFormat::from_path(&path).map_err(core_err)?,
+        };
+        let timeline = self.lock().working_timeline().map_err(core_err)?;
+        blocking(move || {
+            let text = Project::captions_document(&timeline, format).map_err(core_err)?;
+            Project::write_document(&path, &text).map_err(core_err)
+        })
+        .await?;
+        Ok(format!("wrote {}", p.output_path))
+    }
+
+    #[tool(
+        description = "Hand the cut to another editor: write it as OpenTimelineIO (.otio: every track, clips, gaps, transitions, speed as LinearTimeWarp, markers, media references to the original files, each clip's full Kerf state in metadata.kerf) or a CMX 3600 EDL (.edl: one video track, frame-quantized at the timeline rate, 8-character reels, dissolves, M2 speed lines, drop-frame timecode at 29.97/59.94). Returns the path and a report of everything the format dropped or approximated (merged, with counts). Refuses to overwrite an existing file unless overwrite is true."
+    )]
+    async fn export_interchange(&self, Parameters(p): Parameters<ExportInterchangeParams>) -> Result<String, McpError> {
+        crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
+        let path = std::path::PathBuf::from(&p.output_path);
+        refuse_overwrite(&path, p.overwrite.unwrap_or(false))?;
+        let inputs = self.lock().delivery_inputs().map_err(core_err)?;
+        let (format, track) = (p.format, p.video_track.unwrap_or(0));
+        let report = blocking(move || {
+            let (text, report) = Project::interchange_document(&inputs, format, track).map_err(core_err)?;
+            Project::write_document(&path, &text).map_err(core_err)?;
+            Ok(report)
+        })
+        .await?;
+        json(&kerf_core::ExportedFile {
+            path: p.output_path,
+            report,
+        })
+    }
+
+    #[tool(
+        description = "Write the markers as a CSV (every marker: name, kind, start/end timecode, seconds, comment, colour; cells that look like spreadsheet formulas are defused) or as YouTube chapter text (`0:00 Intro` lines from the chapter markers; the report says when YouTube would refuse them). Refuses to overwrite an existing file unless overwrite is true."
+    )]
+    async fn export_markers(&self, Parameters(p): Parameters<ExportMarkersParams>) -> Result<String, McpError> {
+        crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
+        let path = std::path::PathBuf::from(&p.output_path);
+        refuse_overwrite(&path, p.overwrite.unwrap_or(false))?;
+        let inputs = self.lock().delivery_inputs().map_err(core_err)?;
+        let format = p.format;
+        let report = blocking(move || {
+            let (text, report) = Project::markers_document(&inputs, format).map_err(core_err)?;
+            Project::write_document(&path, &text).map_err(core_err)?;
+            Ok(report)
+        })
+        .await?;
+        json(&kerf_core::ExportedFile {
+            path: p.output_path,
+            report,
+        })
+    }
+
+    #[tool(
+        description = "Read an asset's cached transcript (run analyze_asset with the transcript step first): each line \
+                       with its source-time start/end and its `speaker` (S1, S2, … when speakers were labelled — a \
+                       line's label is the speaker of most of its words). `speaker` keeps that speaker's lines only; \
+                       from/to keep the lines overlapping that SOURCE-time window; at most `limit` lines come back \
+                       (default 200), and `next_from` says where the next page starts. words=true adds each line's \
+                       `words` — each with its own source start/end, its speaker, a `confidence` when the recognizer \
+                       gave one, and `estimated: true` when its times were spread over the line by character share \
+                       and tightened to the speech energy rather than reported; they are most of the reply, so ask \
+                       for them over a window. Pass a word's start/end to cut_clip_range to cut one word."
+    )]
+    fn get_transcript(&self, Parameters(p): Parameters<GetTranscriptParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        let transcript = self.lock().transcript(id).map_err(core_err)?;
+        json(&transcript_reply(id.to_string(), &transcript, &p)?)
+    }
+
+    #[tool(
+        description = "When each speaker talks in an asset, from its speaker-labelled transcript: per speaker (S1, S2, … \
+                       in order of first appearance) the SOURCE-time ranges of their words, joined across pauses \
+                       shorter than join_gap, and their total speaking time. Use it to cut to one speaker (keep or \
+                       remove their ranges with cut_clip_range / add_clip, which take source times) or to find who \
+                       talks most. Ranges go by each word's own label, so a line get_transcript labels S1 (most of \
+                       its words) can still lend a word to S2's ranges. Labels come from clustering voices without a \
+                       model: distinct voices in clean turns separate well; overlapping speech or similar voices may \
+                       not. Errors if the transcript has no speaker labels (refine_transcript adds them)."
+    )]
+    fn speaker_ranges(&self, Parameters(p): Parameters<SpeakerRangesParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        let join_gap = p.join_gap.filter(|g| g.is_finite()).unwrap_or(0.75).clamp(0.0, 10.0);
+        let speaker = p.speaker.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let ranges = self.lock().speaker_ranges(id, speaker, join_gap).map_err(core_err)?;
+        json(&ranges)
+    }
+
+    #[tool(
+        description = "Find filler words in an asset's transcript by their word bounds: each hit's text, SOURCE-time \
+                       start/end, the index of its line, and `estimated: true` when the word times were estimated \
+                       rather than reported. Speech models often leave fillers out of a transcript, so few hits does \
+                       not prove the speech has none. Remove one with cut_clip_range (from/to = its start/end) on the \
+                       clip that shows it; cut the latest first so earlier times do not shift."
+    )]
+    fn find_filler_words(&self, Parameters(p): Parameters<FillerWordsParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        let fillers = p.fillers.unwrap_or_default();
+        if fillers.len() > 100 {
+            return Err(McpError::invalid_params("at most 100 fillers".to_string(), None));
+        }
+        let found = self.lock().filler_words(id, &fillers).map_err(core_err)?;
+        json(&found)
+    }
+
+    #[tool(
+        description = "Re-time the words of an asset's cached transcript to the speech energy and label its speakers \
+                       (S1, S2, …), without re-transcribing — for a transcript made before Kerf did this; a \
+                       transcription already does it. No model is involved: it decodes the asset's audio once, as \
+                       background work that waits behind exports and preview proxies, and the user can stop it like \
+                       an analysis. Refused if a newer transcript landed while it ran. Returns how many lines, words \
+                       and speakers the transcript has now."
+    )]
+    async fn refine_transcript(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        let (project, app) = (self.project.clone(), self.app.clone());
+        let summary = blocking(move || {
+            let cancel = app.state::<crate::AppState>().analysis_cancel.clone();
+            cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+            let stored = crate::run_refine(&app, &|| lock_agent(&project), id, &|| {
+                cancel.load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .map_err(|e| McpError::internal_error(e, None))?;
+            let mut speakers: Vec<&str> = stored.transcript.iter().filter_map(|s| s.speaker.as_deref()).collect();
+            speakers.sort_unstable();
+            speakers.dedup();
+            Ok(serde_json::json!({
+                "segments": stored.transcript.len(),
+                "words": stored.transcript.iter().map(|s| s.words.len()).sum::<usize>(),
+                "speakers": speakers,
+            }))
+        })
+        .await?;
+        json(&summary)
+    }
+
     #[tool(description = "Append the non-silent spans of an asset as clips, using cached analysis")]
     fn remove_silence(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
@@ -3328,6 +3908,65 @@ impl KerfMcp {
         .await?;
         self.changed();
         json(&serde_json::json!({ "clips_reframed": moved, "timeline": timeline }))
+    }
+
+    #[tool(
+        description = "Sync a clip to another by their sound: decodes both clips' audio, finds the offset where \
+                       they match (GCC-PHAT cross-correlation, to a fraction of a millisecond) and moves the clip \
+                       so the same moment lands at the same timeline time — a camera's scratch audio against the \
+                       recorder, two cameras on one stage. Only each clip's used source window (source_in..source_out, \
+                       at most 20 minutes) is compared, so trim both to the stretch they share for a fast, clean \
+                       match. Both clips need sound and normal forward speed, must not be linked to each other or \
+                       share a track, and the moving clip's track must be unlocked — checked before anything is \
+                       decoded. Send a `progressToken` to hear when it waits for another job; cancelling the request \
+                       stops it. Returns `offset` (seconds the clip moved; positive is later), \
+                       `timeline_start`, `confidence` (peak over noise, >= 8 is clear), `distinct` (peak over the \
+                       next-best match, >= 1.5 is unambiguous — music can match at several offsets; null when nothing \
+                       else matched at all), `reliable`, \
+                       `inverted` (one recording has flipped polarity) and `applied`. An unreliable match does not \
+                       move anything unless force is true."
+    )]
+    async fn sync_clips_by_audio(
+        &self,
+        Parameters(p): Parameters<SyncByAudioParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
+        let (reference, clip) = (parse_id(&p.reference_clip_id)?, parse_id(&p.clip_id)?);
+        let force = p.force.unwrap_or(false);
+        let project = self.project.clone();
+        let cancel = context.ct.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let forward = {
+            let peer = context.peer.clone();
+            let token = context.meta.get_progress_token();
+            tauri::async_runtime::spawn(async move {
+                while let Some(message) = rx.recv().await {
+                    let Some(token) = token.clone() else { continue };
+                    let param = ProgressNotificationParam::new(token, 0.0).with_total(1.0);
+                    let _ = peer.notify_progress(param.with_message(message)).await;
+                }
+            })
+        };
+        let sync = blocking(move || {
+            // Resolve under the lock, decode and correlate without it, move under it again.
+            let plan = lock_agent(&project).audio_sync_inputs(reference, clip).map_err(core_err)?;
+            let measured = Project::measure_audio_sync(
+                &plan,
+                &mut |w| {
+                    let _ = tx.send(w.message().to_string());
+                },
+                &|| cancel.is_cancelled(),
+            )
+            .map_err(core_err)?;
+            lock_agent(&project).apply_audio_sync(&measured, force).map_err(core_err)
+        })
+        .await;
+        let _ = forward.await;
+        let sync = sync?;
+        if sync.applied {
+            self.changed();
+        }
+        json(&sync)
     }
 
     #[tool(
@@ -3660,7 +4299,9 @@ impl KerfMcp {
         description = "Render the timeline to a file with full ffmpeg encode control (container, video/audio codec, \
                        rate control, resolution, fps, bitrate, faststart, gif, audio-only …). Omit `options` for the \
                        safe H.264/AAC MP4 default. `options.loudness` normalizes the mix to a platform target: \
-                       youtube / spotify (-14 LUFS), apple (-16), broadcast (EBU R128, -23), all at -1 dBTP. A render takes minutes: send a `progressToken` in the request's \
+                       youtube / spotify (-14 LUFS), apple (-16), broadcast (EBU R128, -23), all at -1 dBTP; add \
+                       `options.loudness_static: true` to get there with one measured gain and a true-peak limiter \
+                       (the mix's dynamics untouched; the render measures it first) instead of loudnorm's riding gain. A render takes minutes: send a `progressToken` in the request's \
                        `_meta` to receive progress notifications while it runs, and cancel the request \
                        (`notifications/cancelled`) to stop it — a cancelled render deletes its half-written file \
                        rather than leaving a broken one behind. Refuses to overwrite an existing file unless \
@@ -3673,7 +4314,10 @@ impl KerfMcp {
     ) -> Result<String, McpError> {
         crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
         refuse_overwrite(std::path::Path::new(&p.output_path), p.overwrite.unwrap_or(false))?;
-        let opts = p.options.unwrap_or_default();
+        let opts = ExportOptions {
+            overwrite_sidecars: p.overwrite.unwrap_or(false),
+            ..p.options.unwrap_or_default()
+        };
         let project = self.project.clone();
         let output_path = p.output_path;
 
@@ -3797,8 +4441,13 @@ impl KerfMcp {
             .map(|d| kerf_core::ExportVariant::beside(&base, *d))
             .collect();
         let overwrite = p.overwrite.unwrap_or(false);
+        let opts = ExportOptions {
+            overwrite_sidecars: overwrite,
+            ..opts
+        };
         for variant in &variants {
             refuse_overwrite(&variant.output, overwrite)?;
+            kerf_core::check_caption_sidecars(&variant.output, &opts).map_err(core_err)?;
         }
         let project = self.project.clone();
 
@@ -3814,12 +4463,15 @@ impl KerfMcp {
                 while let Some(progress) = rx.recv().await {
                     let Some(token) = token.clone() else { continue };
                     let param = ProgressNotificationParam::new(token, progress.fraction).with_total(1.0);
-                    let mut message = format!(
-                        "rendering {} of {} ({})",
-                        progress.variant + 1,
-                        progress.total,
-                        labels.get(progress.variant).cloned().unwrap_or_default()
-                    );
+                    let mut message = match progress.waiting {
+                        Some(why) => why.to_string(),
+                        None => format!(
+                            "rendering {} of {} ({})",
+                            progress.variant + 1,
+                            progress.total,
+                            labels.get(progress.variant).cloned().unwrap_or_default()
+                        ),
+                    };
                     if let Some(eta) = progress.eta_secs {
                         message.push_str(&format!(", {} to go", fmt_ts(eta)));
                     }
@@ -3931,6 +4583,39 @@ impl KerfMcp {
         })
         .await?;
         json(&serde_json::json!({ "output": written.to_string_lossy() }))
+    }
+
+    #[tool(
+        description = "Measure the picture at a timeline time without looking at it: video scopes of the composited \
+                       frame the export would write (originals, full delivery resolution). Returns a summary: per channel \
+                       (red, green, blue, luma) min / max / mean in 0..1 and how many pixels are clipped at 0 and at 1 \
+                       (`clipped_low` / `clipped_high`, counted over every pixel, so a single blown pixel shows), the mean \
+                       chroma (`cb`, `cr` in -0.5..0.5; `hue_deg` counter-clockwise from +Cb, so red is ~103, skin tones \
+                       ~123, blue ~355; `saturation` of the mean — a colour cast — and `mean_saturation`, how colourful \
+                       the frame is, both as |CbCr| / 0.5) and the densest vectorscope spots. Use it to check exposure, \
+                       clipping, a colour cast or a grade's effect after an edit. Grids are optional (counts, row 0 the \
+                       lowest level)."
+    )]
+    async fn get_scopes(&self, Parameters(p): Parameters<ScopesParams>) -> Result<String, McpError> {
+        if !p.time_secs.is_finite() {
+            return Err(McpError::invalid_params("time_secs must be a number", None));
+        }
+        let project = self.project.clone();
+        let req = kerf_core::scopes::ScopeRequest {
+            time_secs: p.time_secs,
+            max_width: p.max_width.map(|w| w.clamp(64, kerf_core::scopes::MAX_SCOPE_WIDTH)),
+            matrix: p.matrix.unwrap_or_default(),
+            options: kerf_core::scopes::ScopeOptions {
+                grids: p.grids.unwrap_or_default(),
+                size: p.grid_size.unwrap_or_default().resolve(),
+            },
+        };
+        let scopes = blocking(move || {
+            let (timeline, assets) = lock_agent(&project).export_still_inputs().map_err(core_err)?;
+            kerf_core::scopes::timeline_scopes(&timeline, &assets, &req).map_err(core_err)
+        })
+        .await?;
+        json(&scopes)
     }
 
     // ---- agent task queue --------------------------------------------------
@@ -4346,7 +5031,22 @@ async fn blocking<T: Send + 'static>(job: impl FnOnce() -> Result<T, McpError> +
 /// compile time, so build them once and hand out a borrow.
 fn router() -> &'static rmcp::handler::server::router::tool::ToolRouter<KerfMcp> {
     static ROUTER: OnceLock<rmcp::handler::server::router::tool::ToolRouter<KerfMcp>> = OnceLock::new();
-    ROUTER.get_or_init(KerfMcp::tool_router)
+    ROUTER.get_or_init(|| {
+        let mut router = KerfMcp::tool_router();
+        hints::annotate(&mut router);
+        router
+    })
+}
+
+/// Refuse a call naming an argument its tool does not take (`args`).
+fn reject_unknown_arguments(request: &rmcp::model::CallToolRequestParams) -> Result<(), McpError> {
+    let Some(tool) = router().get(&request.name) else {
+        return Ok(());
+    };
+    match args::unknown_argument(tool, request.arguments.as_ref()) {
+        Some(message) => Err(McpError::invalid_params(message, None)),
+        None => Ok(()),
+    }
 }
 
 /// How the server introduces itself to clients. `ServerConfig::default()` fills
@@ -4365,7 +5065,10 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              loads a file the user has not added yet), run \
              analyze_asset to populate silence / scene / transcript / loudness \
              (EBU R128 LUFS) / onset / tempo (BPM + beat grid) / speech-vs-music \
-             metadata. \
+             metadata. When the user points at something in the window — \
+             \"this clip\", \"here\", \"the selection\", \"between the marks\" — \
+             get_editor_context says what they have selected, where the playhead \
+             and the in/out marks are and which part of the timeline is on screen. \
              You can also SEE the footage: skim_asset returns a contact-sheet \
              image of a clip (survey it to find the good parts), get_frame shows \
              a single moment up close, and preview_timeline renders the cut you \
@@ -4455,12 +5158,17 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              are placed in timeline time, so a later trim or remove_silence moves \
              the words out from under them — re-run generate_captions after any \
              further edit and it replaces its own set, leaving typed titles \
-             alone. import_captions brings in a .srt / .ass / .ssa file instead \
+             alone. import_captions brings in a .srt / .vtt / .ass / .ssa file instead \
              (base=timeline for a subtitle track made for the finished cut, \
              base=source with asset_id for a file that times one asset's own \
              footage) and replaces that same caption set — so it is the caption \
              step too: do it last, and re-run it after further edits. export_srt \
-             writes a subtitle file. \
+             writes an asset's transcript as a subtitle file; export_captions writes \
+             the cut's captions (.srt / .vtt), and export's embed_captions / \
+             caption_sidecars carry them with the render. A marker of kind `chapter` \
+             becomes a chapter of the exported file; export_markers writes the \
+             markers as CSV or YouTube chapters, and export_interchange hands the \
+             cut to another editor as OTIO or a CMX 3600 EDL. \
              For motion graphics beyond a text overlay, add_svg_overlay puts an \
              animated SVG title on the cut: a ready-made preset (list_svg_presets: \
              fade_up, typewriter, lower_third, word_pop, filled in with `params`) \
@@ -4522,22 +5230,29 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              get_music_structure to look first), and set_track_duck plus \
              set_master_duck dips it under dialogue. Call export to render, and export_cover to \
              write the thumbnail the platform shows before anyone presses play. \
-             export / export_srt / export_cover / export_variants all take an \
+             export / export_srt / export_captions / export_interchange / \
+             export_markers / export_cover / export_variants all take an \
              absolute local output path and refuse to overwrite a file that's \
              already there unless you pass overwrite=true.";
 
 #[tool_handler(router = router())]
 impl ServerHandler for KerfMcp {
-    /// The `#[tool_handler]` default, plus the one place every failing tool
-    /// call — whichever helper built the error — reaches the logfile.
+    /// The `#[tool_handler]` default behind the strict-argument check, plus the
+    /// one place every failing tool call — whichever helper built the error —
+    /// reaches the logfile.
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, McpError> {
         let tool = request.name.to_string();
-        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let result = router().call(tcc).await;
+        let result = match reject_unknown_arguments(&request) {
+            Ok(()) => {
+                let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+                router().call(tcc).await
+            }
+            Err(e) => Err(e),
+        };
         if let Err(e) = &result {
             log_tool_error(&tool, e);
         }
@@ -4911,10 +5626,32 @@ fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
 mod tests {
     use super::{
         allowed_hosts, caption_source, clip_moves, core_err, describe_server_error, elide_large_svg, fmt_ts, image_result,
-        log_tool_error, png_result, refuse_overwrite, require_window, router, server_identity, svg_moments, svg_preview,
-        svg_sheet_caption, svg_sheet_times, svg_source, track_gaps, variant_output, ClipMoveParams, SvgMoments,
-        SvgOverlaySummary, SvgPreviewTitle, SvgValidation,
+        log_tool_error, png_result, refuse_overwrite, reject_unknown_arguments, require_window, router, server_identity,
+        svg_moments, svg_preview, svg_sheet_caption, svg_sheet_times, svg_source, track_gaps, variant_output, ClipMoveParams,
+        SvgMoments, SvgOverlaySummary, SvgPreviewTitle, SvgValidation,
     };
+
+    #[test]
+    fn set_grade_refuses_a_misspelt_key_inside_the_curves_or_wheels() {
+        let parse = |v: serde_json::Value| serde_json::from_value::<super::GradeParams>(v);
+        let ok = parse(serde_json::json!({
+            "clip_id": "c",
+            "curves": {"master": [{"x": 0, "y": 1}, {"x": 1, "y": 0}]},
+            "wheels": {"shadows": {"x": 0.2}}
+        }))
+        .unwrap();
+        let curves = kerf_core::Curves::from(ok.curves.unwrap());
+        assert_eq!(curves.master.len(), 2);
+        assert_eq!(kerf_core::Wheels::from(ok.wheels.unwrap()).shadows.x, 0.2);
+        for bad in [
+            serde_json::json!({"clip_id": "c", "curves": {"mastre": []}}),
+            serde_json::json!({"clip_id": "c", "curves": {"master": [{"x": 0, "y": 1, "z": 2}]}}),
+            serde_json::json!({"clip_id": "c", "wheels": {"midtone": {}}}),
+            serde_json::json!({"clip_id": "c", "wheels": {"shadows": {"lightnes": 0.1}}}),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn log_tool_error_handles_both_kinds() {
@@ -4988,7 +5725,7 @@ mod tests {
         assert!(caption_source(srt.to_str(), None).unwrap().contains("Hi"));
         let txt = dir.join("cues.txt");
         std::fs::write(&txt, "x").unwrap();
-        assert!(invalid(caption_source(txt.to_str(), None)).contains(".srt, .ass or .ssa"));
+        assert!(invalid(caption_source(txt.to_str(), None)).contains(".srt, .vtt, .ass or .ssa"));
         assert!(invalid(caption_source(dir.join("missing.srt").to_str(), None)).contains("cannot read"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -5013,6 +5750,85 @@ mod tests {
         for name in ["path", "text", "format", "base", "asset_id", "style"] {
             assert!(props.contains_key(name), "{name} is missing from the schema");
         }
+    }
+
+    /// The transcript tools are registered and need only the asset: words, speaker, gap and
+    /// fillers are all optional.
+    #[test]
+    fn transcript_tools_take_only_the_asset() {
+        let tools = router().list_all();
+        for name in ["get_transcript", "speaker_ranges", "find_filler_words", "refine_transcript"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("`{name}` is registered"));
+            let required: Vec<&str> = tool
+                .input_schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            assert_eq!(required, ["asset_id"], "{name}");
+        }
+    }
+
+    fn timed_lines() -> Vec<kerf_core::TranscriptSegment> {
+        (0..5)
+            .map(|i| kerf_core::TranscriptSegment {
+                start: i as f64 * 2.0,
+                end: i as f64 * 2.0 + 1.5,
+                text: "one two".into(),
+                speaker: Some(if i % 2 == 0 { "S1" } else { "S2" }.into()),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn transcript_params(extra: serde_json::Value) -> super::GetTranscriptParams {
+        let mut p = serde_json::json!({ "asset_id": "a" });
+        p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(p).unwrap()
+    }
+
+    /// Words only when asked for; a window and a speaker narrow the lines, and a limit pages
+    /// them with `next_from`.
+    #[test]
+    fn get_transcript_windows_pages_and_filters_its_lines() {
+        let lines = timed_lines();
+        let all = super::transcript_reply("a".into(), &lines, &transcript_params(serde_json::json!({}))).unwrap();
+        assert_eq!(all.segments.len(), 5);
+        assert!(all.segments.iter().all(|s| s.words.is_empty()));
+        assert_eq!(all.speakers, ["S1", "S2"]);
+        assert_eq!(all.next_from, None);
+
+        let p = transcript_params(serde_json::json!({ "from": 3.0, "to": 6.5, "words": true }));
+        let window = super::transcript_reply("a".into(), &lines, &p).unwrap();
+        assert_eq!(window.segments.iter().map(|s| s.start).collect::<Vec<_>>(), [2.0, 4.0, 6.0]);
+        assert!(window.segments.iter().all(|s| s.words.len() == 2));
+
+        let p = transcript_params(serde_json::json!({ "speaker": "s1", "limit": 2 }));
+        let page = super::transcript_reply("a".into(), &lines, &p).unwrap();
+        assert_eq!(page.segments.iter().map(|s| s.start).collect::<Vec<_>>(), [0.0, 4.0]);
+        assert_eq!(page.next_from, Some(8.0));
+
+        for bad in [
+            serde_json::json!({ "from": 5.0, "to": 5.0 }),
+            serde_json::json!({ "from": -1.0, "to": -2.0 }),
+        ] {
+            assert!(super::transcript_reply("a".into(), &lines, &transcript_params(bad)).is_err());
+        }
+    }
+
+    #[test]
+    fn an_agent_reads_an_analysis_without_its_words() {
+        let mut lines = timed_lines();
+        kerf_core::transcript::ensure_words(&mut lines);
+        let analysis = super::without_words(kerf_core::AssetAnalysis {
+            transcript: lines,
+            ..Default::default()
+        });
+        assert_eq!(analysis.transcript.len(), 5);
+        assert!(analysis.transcript.iter().all(|s| s.words.is_empty() && s.speaker.is_some()));
     }
 
     /// `analyze_asset` runs only the steps it is asked for, and an agent that names none gets
@@ -5727,6 +6543,137 @@ mod tests {
     }
 
     #[test]
+    fn the_server_instructions_point_at_the_editor_context() {
+        let text = super::INSTRUCTIONS;
+        assert!(text.contains("get_editor_context"), "{text}");
+        assert!(text.contains("\"this clip\""), "{text}");
+    }
+
+    fn call(name: &'static str, args: serde_json::Value) -> rmcp::model::CallToolRequestParams {
+        rmcp::model::CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone())
+    }
+
+    /// serde drops a key a parameter struct does not name, so a misspelt override
+    /// would run the edit without it and report success.
+    #[test]
+    fn an_unknown_argument_is_refused_naming_the_accepted_ones() {
+        use rmcp::model::ErrorCode;
+        let e = reject_unknown_arguments(&call("trim", serde_json::json!({"clip_id": "x", "rippel": false})))
+            .expect_err("a misspelt ripple must not be dropped silently");
+        assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(e.code.0, -32602);
+        for name in ["\"rippel\"", "trim", "ripple", "clip_id", "source_in", "link"] {
+            assert!(e.message.contains(name), "{name}: {}", e.message);
+        }
+
+        let e = reject_unknown_arguments(&call("list_assets", serde_json::json!({"verbose": true}))).unwrap_err();
+        assert!(e.message.contains("takes no arguments"), "{}", e.message);
+
+        assert!(reject_unknown_arguments(&call("trim", serde_json::json!({"clip_id": "x", "ripple": false}))).is_ok());
+        assert!(reject_unknown_arguments(&call("list_assets", serde_json::json!({}))).is_ok());
+        assert!(reject_unknown_arguments(&rmcp::model::CallToolRequestParams::new("list_assets")).is_ok());
+        assert!(
+            reject_unknown_arguments(&call("no_such_tool", serde_json::json!({"x": 1}))).is_ok(),
+            "an unknown tool is the router's to report"
+        );
+    }
+
+    /// The strict-argument check accepts what the schema lists, and schemars does not
+    /// list a `#[serde(alias)]` name, so an alias on a parameter would be refused.
+    #[test]
+    fn mcp_parameters_take_no_serde_alias() {
+        let source = include_str!("mcp.rs").replace(' ', "");
+        assert!(
+            !source.contains(concat!("alias", "=\"")),
+            "an MCP parameter uses #[serde(alias)]"
+        );
+    }
+
+    /// Every argument a tool's schema lists is accepted — the check reads the same
+    /// schema the client was given, so it can only refuse what the client was not offered —
+    /// and no tool admits a key it does not list.
+    #[test]
+    fn every_listed_argument_is_accepted_and_nothing_else() {
+        for tool in router().list_all() {
+            let props = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .cloned()
+                .unwrap_or_default();
+            let args: serde_json::Map<String, serde_json::Value> =
+                props.keys().map(|k| (k.clone(), serde_json::Value::Null)).collect();
+            let mut request = rmcp::model::CallToolRequestParams::new(tool.name.clone()).with_arguments(args);
+            assert!(reject_unknown_arguments(&request).is_ok(), "{}", tool.name);
+            request
+                .arguments
+                .as_mut()
+                .unwrap()
+                .insert("not_an_argument".into(), serde_json::Value::Null);
+            assert!(reject_unknown_arguments(&request).is_err(), "{} admits any key", tool.name);
+        }
+    }
+
+    /// A client decides from these hints what to run unasked and what to confirm,
+    /// so a tool without them is a tool it has to guess about.
+    #[test]
+    fn every_tool_is_titled_and_annotated() {
+        let tools = router().list_all();
+        for tool in &tools {
+            assert!(
+                tool.title.as_deref().is_some_and(|t| !t.is_empty()),
+                "{} has no title",
+                tool.name
+            );
+            let a = tool
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} has no annotations", tool.name));
+            for (hint, value) in [
+                ("readOnlyHint", a.read_only_hint),
+                ("destructiveHint", a.destructive_hint),
+                ("idempotentHint", a.idempotent_hint),
+                ("openWorldHint", a.open_world_hint),
+            ] {
+                assert!(value.is_some(), "{} lacks {hint}", tool.name);
+            }
+        }
+        for (name, ..) in super::hints::TOOLS {
+            assert!(tools.iter().any(|t| t.name == *name), "hints name {name}, which is no tool");
+        }
+        let hint = |name: &str| tools.iter().find(|t| t.name == name).unwrap().annotations.clone().unwrap();
+        for read in [
+            "get_timeline_state",
+            "preview_timeline",
+            "staged_diff",
+            "get_editor_context",
+            "get_levels",
+        ] {
+            assert_eq!(hint(read).read_only_hint, Some(true), "{read}");
+        }
+        for staged in ["trim", "remove_clips", "remove_track", "set_volume", "stage_edits"] {
+            let a = hint(staged);
+            assert_eq!((a.read_only_hint, a.destructive_hint), (Some(false), Some(false)), "{staged}");
+        }
+        for destructive in [
+            "apply_staged_edits",
+            "discard_staged_edits",
+            "revert_to",
+            "export",
+            "export_variants",
+            "export_cover",
+            "export_srt",
+            "delete_proxy",
+            "remove_task",
+        ] {
+            assert_eq!(hint(destructive).destructive_hint, Some(true), "{destructive}");
+        }
+        for downloads in ["download_speech_model", "generate_voiceover", "separate_stems"] {
+            assert_eq!(hint(downloads).open_world_hint, Some(true), "{downloads}");
+        }
+    }
+
+    #[test]
     fn the_server_instructions_send_a_social_cut_through_get_levels() {
         let text = super::INSTRUCTIONS;
         assert!(text.contains("get_levels"), "{text}");
@@ -5834,6 +6781,35 @@ mod tests {
         ] {
             assert!(tools.iter().any(|t| t.name == name), "`{name}` is registered");
         }
+    }
+
+    #[test]
+    fn get_scopes_asks_only_for_a_time() {
+        let tools = router().list_all();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "get_scopes")
+            .expect("`get_scopes` is registered");
+        let required = tool
+            .input_schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(required, [serde_json::json!("time_secs")]);
+        let description = tool.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("clipped_high") && description.contains("hue_deg"),
+            "{description}"
+        );
+        let p: crate::mcp::ScopesParams =
+            serde_json::from_value(serde_json::json!({ "time_secs": 1.0, "grid_size": { "vector": 4096 } })).unwrap();
+        let size = p.grid_size.unwrap().resolve();
+        assert_eq!((size.columns, size.rows), (64, 64));
+        assert_eq!(
+            size.vector,
+            kerf_core::scopes::GridSize { vector: 4096, ..size }.clamped().vector
+        );
     }
 
     #[test]

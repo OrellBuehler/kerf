@@ -26,10 +26,17 @@ import type {
 	ClipMove,
 	Mask,
 	Color,
+	Grade,
+	LutInfo,
 	Delivery,
 	PlatformReport,
 	EditSource,
 	ExportOptions,
+	ExportedFile,
+	InterchangeFormat,
+	MarkerListFormat,
+	MarkerPatch,
+	SubtitleFormat,
 	ExportProgress,
 	Filmstrip,
 	GpuPreviewDiagnostics,
@@ -40,6 +47,7 @@ import type {
 	Property,
 	PropertyKey,
 	LaunchRequest,
+	RecoveryInfo,
 	Levels,
 	MasterBus,
 	MusicFit,
@@ -51,13 +59,20 @@ import type {
 	Projection,
 	Reframe,
 	ReframeKeyframe,
+	RenderBar,
 	Revision,
+	ScopeGridSize,
+	ScopeKind,
+	ScopeMatrix,
+	Scopes,
 	AppSettings,
 	SettingsView,
 	SplitSide,
 	StagedEdit,
 	StemsProgress,
 	StemsResult,
+	SyncedByAudio,
+	AudioSyncProgress,
 	StemsStatus,
 	StreamKind,
 	SvgCheck,
@@ -77,6 +92,7 @@ import type {
 	Transition,
 	TranscriptionStatus,
 	TranscriptSegment,
+	UiContext,
 	UpdateInfo,
 	VideoEffect,
 	VoiceoverProgress,
@@ -85,6 +101,7 @@ import type {
 	VoiceoverStatus,
 	WaveformRange
 } from './types';
+import { normalizeGrade } from './grade';
 import { unsavedChoice, type UnsavedChoice, type UnsavedCopy } from './confirm-copy';
 import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
 import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
@@ -127,12 +144,16 @@ import { analysisKindDone, ALL_KINDS } from './analysis-steps';
 import { sampleFilmstrip } from './sample-filmstrip';
 import { synthPcm } from './sample-audio';
 import { sampleFrameJpeg } from './sample-frame';
+import { harnessScopes } from './scopes-view';
+import { harnessRenderBar } from './render-bar';
 import { renderedFps } from './timecode';
 import { playbackFps } from './playback-sync';
 import { parsePlaybackMessage } from './frame-transport';
 import { captionsForTimeline, resolveCaptions } from './captions';
+import { estimateWords } from './transcript';
 import { describeError, logFrontend } from './log';
 import { parseLaunchRequest } from './launch';
+import { recoveryChoice, type RecoveryChoice, type RecoveryCopy } from './recovery';
 import { DEV_MODEL_BYTES, STEM_NAMES, STEMS_CANCELLED, devStemAssets, placeStems } from './stems';
 import {
 	addSvgOverlayTo,
@@ -217,9 +238,9 @@ const sampleAnalysis: Record<string, AssetAnalysis> = {
 		],
 		scene_changes: [0, 30, 75, 110],
 		transcript: [
-			{ start: 0, end: 5.5, text: 'Welcome back to the channel.' },
-			{ start: 5.5, end: 12.5, text: 'Today we are talking about non-destructive editing.' },
-			{ start: 14, end: 22, text: 'The agent watches the footage with you and proposes a cut.' }
+			{ start: 0, end: 5.5, text: 'Welcome back to the channel.', speaker: 'S1' },
+			{ start: 5.5, end: 12.5, text: 'Today we are talking about non-destructive editing.', speaker: 'S1' },
+			{ start: 14, end: 22, text: 'The agent watches the footage with you and proposes a cut.', speaker: 'S2' }
 		],
 		loudness: { integrated_lufs: -16.2, loudness_range: 6.4, true_peak_dbtp: -1.5, threshold_lufs: -26.5 },
 		onsets: [0.5, 1.2, 2.0, 2.8, 3.6, 5.6],
@@ -744,6 +765,50 @@ export async function onPopoutClosed(cb: (label: string) => void): Promise<() =>
 export async function takeLaunchProject(): Promise<LaunchRequest | null> {
 	if (!inTauri()) return null;
 	return parseLaunchRequest(await invoke<unknown>('take_launch_project'));
+}
+
+/** Untitled projects a crashed Kerf left behind, newest first. The browser harness has none. */
+export async function listRecoveries(): Promise<RecoveryInfo[]> {
+	if (!inTauri()) return [];
+	return invoke<RecoveryInfo[]>('list_recoveries');
+}
+
+/** Make a left-behind project the open one (still untitled); `false` outside Tauri. */
+export async function recoverProject(id: string): Promise<boolean> {
+	if (!inTauri()) return false;
+	await invoke('recover_project', { id });
+	return true;
+}
+
+/** The user chose "Don't save" as the app closes: delete this project's recovery session at
+ *  exit instead of offering it at the next launch. */
+export async function discardRecoveryAtExit(): Promise<void> {
+	if (!inTauri()) return;
+	await invoke('discard_recovery_at_exit');
+}
+
+/** Delete a left-behind project. */
+export async function discardRecovery(id: string): Promise<void> {
+	if (!inTauri()) return;
+	await invoke('discard_recovery', { id });
+}
+
+/** The recovery prompt: Recover, Discard and Not now (`recovery.ts`). Where the native dialog
+ *  cannot show three named buttons it asks Recover / Not now, so Discard is never the fallback;
+ *  closing the dialog is Not now. The browser harness has `window.confirm`. */
+export async function askRecovery(copy: RecoveryCopy): Promise<RecoveryChoice> {
+	if (!inTauri()) return window.confirm(copy.message) ? 'recover' : 'later';
+	const { message: show } = await import('@tauri-apps/plugin-dialog');
+	try {
+		const answer = await show(copy.message, {
+			title: copy.title,
+			kind: 'info',
+			buttons: { yes: copy.recover, no: copy.discard, cancel: copy.later }
+		});
+		return recoveryChoice(answer, copy);
+	} catch {
+		return (await confirmAction(copy.message, copy.title, { ok: copy.recover, cancel: copy.later })) ? 'recover' : 'later';
+	}
 }
 
 /** Discard the open project for a fresh, empty one; `false` outside Tauri. */
@@ -1744,6 +1809,36 @@ export async function setMask(clipId: string, mask: Mask | null): Promise<Timeli
 	return invoke<Timeline>('set_mask', { clipId, mask });
 }
 
+/** Replace a clip's curves, colour wheels and LUT. The backend checks a LUT file before it is set. */
+export async function setGrade(clipId: string, grade: Grade): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) {
+			const g = normalizeGrade(grade);
+			const clip = found[0].clips[found[1]];
+			if (Object.keys(g).length) clip.grade = g;
+			else delete clip.grade;
+		}
+		recordDev('Set grade');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_grade', { clipId, grade });
+}
+
+/** What a `.cube` file holds, or why it is not a usable LUT (thrown). */
+export async function inspectLut(path: string): Promise<LutInfo> {
+	if (!inTauri()) return { path, size: 33, title: 'Harness look' };
+	return invoke<LutInfo>('inspect_lut', { path });
+}
+
+/** Pick a `.cube` LUT file; `null` if cancelled. The harness hands back a stand-in path. */
+export async function pickLutFile(): Promise<string | null> {
+	if (!inTauri()) return '/harness/looks/teal-orange.cube';
+	const { open } = await import('@tauri-apps/plugin-dialog');
+	const selected = await open({ multiple: false, filters: [{ name: 'Cube LUT', extensions: ['cube'] }] });
+	return typeof selected === 'string' ? selected : null;
+}
+
 /** Set a track's fader — the gain riding every clip on it. */
 export async function setTrackVolume(trackId: string, volume: number): Promise<Timeline> {
 	const v = Math.min(4, Math.max(0, volume));
@@ -1775,11 +1870,17 @@ function storeDevMaster(next: MasterBus) {
 		next = { ...next };
 		delete next.duck_depth_db;
 	}
+	// `true_peak` is not written while off.
+	if (!next.true_peak) {
+		next = { ...next };
+		delete next.true_peak;
+	}
 	const untouched =
 		next.volume === DEFAULT_MASTER.volume &&
 		next.limiter === DEFAULT_MASTER.limiter &&
 		next.ceiling_db === DEFAULT_MASTER.ceiling_db &&
-		next.duck_depth_db === undefined;
+		next.duck_depth_db === undefined &&
+		next.true_peak === undefined;
 	if (untouched) delete devTimeline.master;
 	else devTimeline.master = next;
 }
@@ -1813,6 +1914,17 @@ export async function setMasterLimiter(enabled: boolean, ceilingDb?: number | nu
 		return snapshot();
 	}
 	return invoke<Timeline>('set_master_limiter', { enabled, ceilingDb: ceiling });
+}
+
+/** Make the master limiter hold the true peak (4x oversampled on export) or only the sample
+ *  peak. Kept while the limiter is off. One revision; the preview's limiter is the same either way. */
+export async function setMasterTruePeak(enabled: boolean): Promise<Timeline> {
+	if (!inTauri()) {
+		storeDevMaster({ ...masterOf(devTimeline), true_peak: enabled });
+		recordDev(enabled ? 'Limit true peaks' : 'Limit sample peaks');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_master_true_peak', { enabled });
 }
 
 /**
@@ -2300,16 +2412,16 @@ export async function addMarker(time: number, name: string, color?: string): Pro
 	return invoke<Timeline>('add_marker', { time, name, color });
 }
 
-export async function updateMarker(
-	markerId: string,
-	patch: { time?: number; name?: string; color?: string }
-): Promise<Timeline> {
+export async function updateMarker(markerId: string, patch: MarkerPatch): Promise<Timeline> {
 	if (!inTauri()) {
 		const m = devTimeline.markers?.find((x) => x.id === markerId);
 		if (m) {
 			if (patch.time !== undefined) m.time = patch.time;
 			if (patch.name !== undefined) m.name = patch.name;
 			if (patch.color !== undefined) m.color = patch.color || null;
+			if (patch.duration !== undefined) m.duration = patch.duration || undefined;
+			if (patch.comment !== undefined) m.comment = patch.comment.trimEnd() || undefined;
+			if (patch.kind !== undefined) m.kind = patch.kind === 'comment' ? undefined : patch.kind;
 			devTimeline.markers = [...(devTimeline.markers ?? [])].sort((a, b) => a.time - b.time);
 		}
 		recordDev('Update marker');
@@ -2492,7 +2604,7 @@ export async function clearCaptions(): Promise<Timeline> {
 	return invoke<Timeline>('clear_captions');
 }
 
-/** Caption the cut from a `.srt` / `.ass` / `.ssa` file on disk. `base` is
+/** Caption the cut from a `.srt` / `.vtt` / `.ass` / `.ssa` file on disk. `base` is
  *  `timeline` (the file is a subtitle track for the finished cut — the default) or
  *  `source` with an `assetId` (the file times that asset's own footage and is
  *  projected through its clips like a transcript); `options` is the same look
@@ -2513,7 +2625,7 @@ export async function importCaptions(path: string, req: CaptionImportRequest = {
 }
 
 /** `importCaptions` for text the page already holds — a file read through an
- *  `<input type=file>`, or pasted. `format` is `srt` / `ass`; omitted, it is
+ *  `<input type=file>`, or pasted. `format` is `srt` / `vtt` / `ass`; omitted, it is
  *  guessed from the text. This is the variant the browser harness runs. */
 export async function importCaptionsText(
 	text: string,
@@ -2547,7 +2659,7 @@ export type CaptionFilePick =
 	| { kind: 'path'; path: string; name: string }
 	| { kind: 'text'; text: string; name: string; format: CaptionFormat | null };
 
-/** Pick a `.srt` / `.ass` / `.ssa` file; `null` if cancelled. Desktop: the native
+/** Pick a `.srt` / `.vtt` / `.ass` / `.ssa` file; `null` if cancelled. Desktop: the native
  *  dialog, answering with the path (`importCaptions` reads it, with its guards).
  *  Browser: an `<input type=file>` read as text, for `importCaptionsText`. In the
  *  browser the picker must be opened straight from the click, before any `await`,
@@ -2581,10 +2693,63 @@ export async function pickCaptionFile(): Promise<CaptionFilePick | null> {
 	return { kind: 'path', path: selected, name: baseName(selected) };
 }
 
+/** Re-time an asset's cached transcript to the speech energy and label its speakers (`S1`,
+ *  `S2`, …) without re-transcribing. The harness spreads each line's words by character share
+ *  and keeps the speakers it was seeded with. */
+export async function refineTranscript(assetId: string): Promise<AssetAnalysis> {
+	if (!inTauri()) {
+		const analysis = sampleAnalysis[assetId];
+		if (!analysis?.transcript.length) throw new Error('asset has no transcript; transcribe it first');
+		analysis.transcript = analysis.transcript.map((seg) => {
+			const speaker = seg.speaker ?? 'S1';
+			return { ...seg, speaker, words: seg.words?.length ? seg.words : estimateWords({ ...seg, speaker }) };
+		});
+		return { ...analysis };
+	}
+	return invoke<AssetAnalysis>('refine_transcript', { assetId });
+}
+
 /** Write an asset's transcript to a `.srt` file; returns the path. */
 export async function exportSrt(assetId: string, outputPath: string): Promise<string> {
 	if (!inTauri()) return outputPath;
 	return invoke<string>('export_srt', { assetId, outputPath });
+}
+
+/** What the browser harness answers for a side-file export: nothing is written there. */
+const harnessFile = (path: string): ExportedFile => ({
+	path,
+	report: { entries: [{ level: 'info', message: 'the browser harness writes no file; the desktop app does', count: 1 }] }
+});
+
+/** Write the cut's captions as SubRip or WebVTT (by `format`, else the path's extension). */
+export async function exportCaptions(outputPath: string, format?: SubtitleFormat): Promise<string> {
+	if (!inTauri()) return outputPath;
+	return invoke<string>('export_captions', { outputPath, format: format ?? null });
+}
+
+/** Write the cut as OpenTimelineIO or a CMX 3600 EDL (`videoTrack`: which video track an EDL holds). */
+export async function exportInterchange(
+	outputPath: string,
+	format: InterchangeFormat,
+	videoTrack?: number
+): Promise<ExportedFile> {
+	if (!inTauri()) return harnessFile(outputPath);
+	return invoke<ExportedFile>('export_interchange', { outputPath, format, videoTrack: videoTrack ?? null });
+}
+
+/** Write the markers as a formula-safe CSV or as YouTube chapter text. */
+export async function exportMarkers(outputPath: string, format: MarkerListFormat): Promise<ExportedFile> {
+	if (!inTauri()) return harnessFile(outputPath);
+	return invoke<ExportedFile>('export_markers', { outputPath, format });
+}
+
+/** Ask where to save a side-file; `null` if cancelled. The browser harness answers
+ *  `defaultPath`, so the export flow stays explorable there. */
+export async function pickSavePath(name: string, extensions: string[], defaultPath: string): Promise<string | null> {
+	if (!inTauri()) return defaultPath;
+	const { save } = await import('@tauri-apps/plugin-dialog');
+	const path = await save({ filters: [{ name, extensions }], defaultPath });
+	return typeof path === 'string' ? path : null;
 }
 
 export async function removeSilence(assetId: string): Promise<Timeline> {
@@ -2705,6 +2870,62 @@ export async function smartCrop(clipId?: string): Promise<Timeline> {
 		return snapshot();
 	}
 	return invoke<Timeline>('smart_crop', { clipId });
+}
+
+/** Move `clipId` so its sound lines up with `referenceId`'s (a camera's scratch audio against
+ *  the recorder): the backend decodes both clips' used source windows and cross-correlates them.
+ *  Linked partners move with it. A match that is not `reliable` is reported and nothing moves
+ *  unless `force` — which, for the pair just measured, applies that measurement without decoding
+ *  again. A wait for the heavy-job slot arrives as `audio-sync-progress` (`onAudioSyncProgress`);
+ *  `cancelAudioSync` stops it (`audio sync cancelled`). The harness has no sound to compare: it
+ *  answers as if both recordings started together (the same source second at the same timeline
+ *  time) with a clear match. */
+export async function syncClipsByAudio(referenceId: string, clipId: string, force = false): Promise<SyncedByAudio> {
+	if (!inTauri()) {
+		if (referenceId === clipId) throw new Error('a clip cannot be synced to itself');
+		const ref = locate(devTimeline, referenceId);
+		const own = locate(devTimeline, clipId);
+		if (!ref || !own) throw new Error('clip not found');
+		const partners = linkPartners(devTimeline, clipId);
+		if (partners.includes(referenceId)) {
+			throw new Error('the two clips are linked and move together; detach them first');
+		}
+		if (ref[0].id === own[0].id) {
+			throw new Error(`both clips are on track ${own[0].name}; in sync they would overlap, so move one to another track first`);
+		}
+		for (const id of [clipId, ...partners]) {
+			const track = locate(devTimeline, id)?.[0];
+			if (track?.locked) throw new Error(`track ${track.name} is locked`);
+		}
+		const [r, c] = [ref[0].clips[ref[1]], own[0].clips[own[1]]];
+		for (const x of [r, c]) {
+			if (!assetById(x.asset_id)?.streams.some((st) => st.kind === 'audio')) throw new Error(`clip ${x.id} has no sound to sync by`);
+			if ((x.speed ?? 1) !== 1) throw new Error(`clip ${x.id} plays at another speed or reversed; sync needs both at normal speed`);
+		}
+		const start = r.timeline_start - r.source_in + c.source_in;
+		if (start < 0) throw new Error(`in sync the clip would start ${(-start).toFixed(3)}s before the timeline does; move the reference later first`);
+		const offset = start - c.timeline_start;
+		const timeline = await moveClip(clipId, start);
+		return {
+			sync: { reference_id: referenceId, clip_id: clipId, offset, timeline_start: start, confidence: 24, distinct: 3, reliable: true, inverted: false, applied: true },
+			timeline
+		};
+	}
+	return invoke<SyncedByAudio>('sync_clips_by_audio', { referenceId, clipId, force });
+}
+
+/** Stop the sync by audio in flight; it then rejects with `audio sync cancelled`. */
+export async function cancelAudioSync(): Promise<void> {
+	if (!inTauri()) return;
+	return invoke<void>('cancel_audio_sync');
+}
+
+/** Subscribe to `audio-sync-progress` (a sync waiting for another job). Returns an unlisten fn;
+ *  the harness never waits. */
+export async function onAudioSyncProgress(cb: (p: AudioSyncProgress) => void): Promise<() => void> {
+	if (!inTauri()) return () => {};
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen<AudioSyncProgress>('audio-sync-progress', (e) => cb(e.payload));
 }
 
 /** Give an asset's sound its own clip on an audio track, for every use of the asset on a
@@ -3079,6 +3300,33 @@ export async function getFrame(
 export async function getTimelineFrame(timeSecs: number, maxWidth = 960): Promise<string | null> {
 	if (!inTauri()) return null;
 	return invoke<string>('get_timeline_frame', { timeSecs, maxWidth });
+}
+
+/**
+ * The video scopes of the composited frame at `timeSecs` (`get_scopes`): the export's still of
+ * the cut, from the originals, read with the delivery's matrix (or `matrix`). The numeric summary
+ * always; the `grids` asked for at `size`. A real decode, so callers throttle it. In the browser
+ * harness: the scopes of colour bars.
+ */
+export async function getScopes(
+	timeSecs: number,
+	grids: ScopeKind[] = [],
+	size?: ScopeGridSize,
+	matrix: ScopeMatrix = 'auto',
+	maxWidth?: number
+): Promise<Scopes> {
+	if (!inTauri()) return harnessScopes(grids, size);
+	return invoke<Scopes>('get_scopes', { timeSecs, grids, size: size ?? null, matrix, maxWidth: maxWidth ?? null });
+}
+
+/**
+ * How the Preview will play each span of the cut (`get_render_bar`): the GPU preview where it
+ * is on and draws it, the FFmpeg stream where it hands over, and the spans where playback stalls.
+ * `width` is the Preview's render width. In the browser harness: the reversed clips.
+ */
+export async function getRenderBar(width = 960): Promise<RenderBar> {
+	if (!inTauri()) return harnessRenderBar(devTimeline);
+	return invoke<RenderBar>('get_render_bar', { width });
 }
 
 /**
@@ -3488,6 +3736,13 @@ export async function mcpEndpoint(): Promise<string> {
 export async function agentStatus(): Promise<{ endpoint: string; last_seen_secs: number | null; error: string | null }> {
 	if (!inTauri()) return { endpoint: 'http://127.0.0.1:7777/mcp', last_seen_secs: null, error: null };
 	return invoke<{ endpoint: string; last_seen_secs: number | null; error: string | null }>('agent_status');
+}
+
+/** Tell the backend what the editor shows, for an agent's `get_editor_context`
+ *  (`editor-context.ts` throttles it). The browser harness has no agent to ask, so nothing is sent. */
+export async function reportUiContext(context: UiContext): Promise<void> {
+	if (!inTauri()) return;
+	await invoke('report_ui_context', { context });
 }
 
 // ---- app settings ----------------------------------------------------------

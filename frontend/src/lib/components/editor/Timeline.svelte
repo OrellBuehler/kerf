@@ -8,6 +8,9 @@
 	import HeightGlyph from './HeightGlyph.svelte';
 	import ToolbarToggle from './ToolbarToggle.svelte';
 	import Minimap from './Minimap.svelte';
+	import TimecodeField from './TimecodeField.svelte';
+	import MarkerDialog from './MarkerDialog.svelte';
+	import { markerTip } from '$lib/marker-edit';
 	import { toast } from '$lib/notifications.svelte';
 	import { ui, type Tool } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
@@ -81,6 +84,8 @@
 	import { NAME_CHIP_PCT, showsLabel } from '$lib/clip-label';
 	import { fitOffer } from '$lib/music-ui';
 	import { stemsOffer } from '$lib/stems';
+	import { describeSync, syncOffer, SYNC_CANCELLED } from '$lib/audio-sync';
+	import { cancelAudioSync, onAudioSyncProgress } from '$lib/api';
 	import { transitionLabel } from '$lib/transitions';
 	import { marqueeMode, pickMode, sameIds, type Selection } from '$lib/selection';
 	import { linkPartners } from '$lib/link-groups';
@@ -109,6 +114,7 @@
 		type FollowInput
 	} from '$lib/zoom';
 	import { tip, type TipInput } from '$lib/tip';
+	import RenderBar from './RenderBar.svelte';
 
 	const pxPerSec = $derived(ui.zoom);
 	/** The lane is as long as the cut, and while a gesture is held as far as the gesture has reached,
@@ -277,6 +283,11 @@
 		ro.observe(el);
 		return () => ro.disconnect();
 	});
+
+	$effect(() => {
+		ui.timelineView = { start: scrollX / pxPerSec, end: (scrollX + viewW) / pxPerSec };
+	});
+	$effect(() => () => (ui.timelineView = null));
 
 	// Two primitives rather than one object: a scroll tick that does not cross a
 	// quantum changes neither, so no clip's waveform is touched by it.
@@ -1669,6 +1680,47 @@
 			)
 			.catch(err);
 
+	// ---- sync by audio ------------------------------------------------------------
+
+	// A sync that has to queue behind another job says so, with a way to stop it.
+	const SYNC_TOAST = 'audio-sync-wait';
+	async function syncing<T>(run: () => Promise<T>): Promise<T> {
+		const unlisten = await onAudioSyncProgress((p) =>
+			toast(`Sync by audio: ${p.detail ?? 'waiting'}`, {
+				id: SYNC_TOAST,
+				duration: Infinity,
+				action: { label: 'Cancel', onClick: () => void cancelAudioSync() }
+			})
+		);
+		try {
+			return await run();
+		} finally {
+			unlisten();
+			toast.dismiss(SYNC_TOAST);
+		}
+	}
+	const syncErr = (e: unknown) => {
+		if (String(e instanceof Error ? e.message : e) !== SYNC_CANCELLED) err(e);
+	};
+
+	// "Move anyway" sends the same pair forced: the backend applies the measurement it just made.
+	const syncByAudio = (referenceId: string, clipId: string) =>
+		void syncing(() => editor.syncByAudio(referenceId, clipId))
+			.then((s) =>
+				s.applied
+					? toast(describeSync(s))
+					: toast(describeSync(s), {
+							action: {
+								label: 'Move anyway',
+								onClick: () =>
+									void syncing(() => editor.syncByAudio(referenceId, clipId, true))
+										.then((f) => toast(describeSync(f)))
+										.catch(syncErr)
+							}
+						})
+			)
+			.catch(syncErr);
+
 	// ---- fades (toggle a default 0.5s fade on the selected clip) --------------
 
 	const FADE_DEFAULT = 0.5;
@@ -1769,6 +1821,8 @@
 			c,
 			editor.assets.find((a) => a.id === c.asset_id)
 		);
+		// Two clips selected: the clicked one can be moved into sync with the other by their sound.
+		const sync = syncOffer(editor.timeline, editor.assets, editor.selectedClipIds, c.id);
 		contextMenu.show(e, [
 			{
 				label: 'Split at playhead',
@@ -1853,6 +1907,17 @@
 				reason: lp.unlink.reason ?? undefined,
 				action: () => void unlinkSelection()
 			},
+			...(sync.show
+				? [
+						{
+							label: 'Sync by audio',
+							icon: 'audio-waveform',
+							disabled: sync.reason !== null,
+							reason: sync.reason ?? undefined,
+							action: () => syncByAudio(sync.referenceId!, c.id)
+						} satisfies MenuItem
+					]
+				: []),
 			{ type: 'separator' },
 			...clipAnalysisItems(c, e),
 			{ type: 'separator' },
@@ -2289,6 +2354,8 @@
 	/** Marker being dragged along the ruler, and the id being renamed inline. */
 	let markerDrag: { id: string; time: number } | null = $state(null);
 	let renaming = $state<string | null>(null);
+	/** The marker whose name, kind, length and comment are open in the dialog. */
+	let editingMarker = $state<string | null>(null);
 
 	const addMarkerHere = () => void editor.addMarkerAtPlayhead(ui.time).catch(err);
 
@@ -2313,6 +2380,11 @@
 		contextMenu.show(e, [
 			{ label: 'Go to marker', icon: 'bookmark', action: () => ui.seek(m.time) },
 			{ label: 'Rename', action: () => (renaming = m.id) },
+			{ label: 'Edit marker…', icon: 'file-text', action: () => (editingMarker = m.id) },
+			{
+				label: m.kind === 'chapter' ? 'Make it a comment' : 'Make it a chapter',
+				action: () => void editor.updateMarker(m.id, { kind: m.kind === 'chapter' ? 'comment' : 'chapter' }).catch(err)
+			},
 			{ type: 'separator' },
 			{
 				label: 'Remove marker',
@@ -2672,17 +2744,19 @@
 					: 'var(--border-subtle)'};position:sticky;top:0;z-index:50;background:var(--surface-app);display:flex;align-items:center;gap:6px;padding:0 8px;font-family:var(--font-mono);font-variant-numeric:tabular-nums;white-space:nowrap"
 			>
 				<!-- Where the playhead is, and how long the cut is: the timeline's own clock, so a scrub or a
-				     drag here does not need the Preview on screen to say what time it is. -->
+				     drag here does not need the Preview on screen to say what time it is. The playhead's half is
+				     where a timecode is typed (`TimecodeField`). -->
 				<span
 					data-timeline-time
 					role="timer"
 					aria-label="Playhead {tc(ui.time)} of {tc(editor.duration)}"
-					use:tip={`Playhead timecode, then the length of the cut · ${editor.fps.toFixed(3)} fps · non-drop`}
 					style="display:inline-flex;align-items:baseline;gap:6px"
 				>
-					<span style="font-size:12px;font-weight:600;color:var(--kerf-300)">{tc(ui.time)}</span>
+					<TimecodeField entry="timeline" describedby="timeline-cut-length" />
 					<span aria-hidden="true" style="font-size:11px;color:var(--text-muted)">/</span>
-					<span style="font-size:11px;color:var(--text-muted)">{tc(editor.duration)}</span>
+					<span id="timeline-cut-length" use:tip={'The length of the cut'} style="font-size:11px;color:var(--text-muted)"
+						>{tc(editor.duration)}</span
+					>
 				</span>
 				<span style="flex:1"></span>
 				{#if editor.rippleMode}
@@ -2887,6 +2961,7 @@
 						style="position:absolute;left:{cutEndX}px;right:0;top:0;bottom:0;pointer-events:none;box-sizing:border-box;border-left:var(--line-width) solid var(--border-strong);background:color-mix(in srgb,var(--surface-void) 55%,transparent)"
 					></span>
 				{/if}
+				<RenderBar {pxPerSec} from={viewLo / pxPerSec} to={viewHi / pxPerSec} {tc} />
 				{#each minorTicks as m (m.k)}
 					<span
 						data-tick={m.mid ? 'mid' : 'minor'}
@@ -2932,7 +3007,7 @@
 					{@const accent = m.color || 'var(--agent-400)'}
 					<span
 						role="presentation"
-						use:tip={`${m.name} — ${tc(mt)}`}
+						use:tip={markerTip(m, tc(mt))}
 						onpointerdown={(e) => onMarkerPointerDown(e, m)}
 						ondblclick={() => (renaming = m.id)}
 						oncontextmenu={(e) => onMarkerContextMenu(e, m)}
@@ -2940,6 +3015,12 @@
 							pxPerSec}px;top:0;bottom:0;width:8px;z-index:29;cursor:ew-resize;touch-action:none;display:flex;align-items:center"
 					>
 						<span style="position:absolute;left:-1px;top:0;bottom:0;width:2px;background:{accent}"></span>
+						{#if m.duration}
+							<span
+								style="position:absolute;left:0;bottom:0;height:3px;width:{m.duration *
+									pxPerSec}px;background:{accent};opacity:.6;pointer-events:none"
+							></span>
+						{/if}
 						{#if renaming === m.id}
 							<!-- svelte-ignore a11y_autofocus -->
 							<input
@@ -3517,6 +3598,10 @@
 		</div>
 	</div>
 </div>
+
+{#if editingMarker}
+	<MarkerDialog markerId={editingMarker} onClose={() => (editingMarker = null)} />
+{/if}
 
 <style>
 	/* A locked lane is hatched: the track header says so too, but a lane that looks like any other is

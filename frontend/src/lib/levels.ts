@@ -144,20 +144,26 @@ export function levelNotes(master: LevelReading | null, tracks: TrackLevels[], b
 	if (tp !== null && tp > LEVELS_TRUE_PEAK_CEILING_DBTP) {
 		const over = `True peak ${f1(tp)} dBTP is over the ${f0(LEVELS_TRUE_PEAK_CEILING_DBTP)} dBTP platforms ask for and can clip when re-encoded.`;
 		if (bus.limiter) {
-			// The limiter holds the sample peak at its ceiling, so what is left over is the
-			// peak between samples: take the ceiling down by that, and a margin.
+			// A sample-peak limiter leaves the peak between samples over its ceiling: the fix is
+			// true-peak limiting, or the ceiling taken down by the overshoot and a margin. A
+			// true-peak limiter already holds it, so only a lower ceiling is left.
 			const ceiling = Number.isFinite(bus.ceiling_db) ? clampCeiling(bus.ceiling_db) : MASTER_DEFAULT_CEILING_DB;
 			const lower = Math.max(
 				ceiling - (tp - LEVELS_TRUE_PEAK_CEILING_DBTP) - LEVELS_CEILING_MARGIN_DB,
 				MASTER_MIN_CEILING_DB
 			);
+			const canLower = lower < ceiling;
 			notes.push(
-				lower < ceiling
-					? `${over} The master limiter is already on, but it holds the sample peak at ${f1(ceiling)} dBFS and the peak between samples runs above that. Lower its ceiling to about ${f1(lower)} dBFS (set_master_limiter).`
-					: `${over} The master limiter is already on at its lowest ceiling. Lower the master or the loudest track.`
+				bus.true_peak
+					? canLower
+						? `${over} The master limiter is already on and holds the true peak at ${f1(ceiling)} dBFS. Lower its ceiling to about ${f1(lower)} dBFS (set_master_limiter).`
+						: `${over} The master limiter is already on, holding the true peak at its lowest ceiling. Lower the master or the loudest track.`
+					: canLower
+						? `${over} The master limiter is already on, but it holds the sample peak at ${f1(ceiling)} dBFS and the peak between samples runs above that. Turn on true-peak limiting (set_master_true_peak), or lower its ceiling to about ${f1(lower)} dBFS (set_master_limiter).`
+						: `${over} The master limiter is already on at its lowest ceiling. Turn on true-peak limiting (set_master_true_peak), or lower the master or the loudest track.`
 			);
 		} else {
-			notes.push(`${over} Turn on the master limiter (set_master_limiter) or lower the master.`);
+			notes.push(`${over} Turn on the master limiter (set_master_limiter) with true-peak limiting (set_master_true_peak), or lower the master.`);
 		}
 	}
 	for (const t of tracks) {

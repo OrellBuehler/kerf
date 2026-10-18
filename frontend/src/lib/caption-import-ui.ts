@@ -21,7 +21,7 @@ import type {
 } from './types';
 
 /** The extensions the picker offers, and the ones `read_caption_file` reads. */
-export const CAPTION_EXTENSIONS = ['srt', 'ass', 'ssa'] as const;
+export const CAPTION_EXTENSIONS = ['srt', 'vtt', 'ass', 'ssa'] as const;
 
 /** The last segment of a path, whichever separator it uses (a Windows path
  *  reaches the webview with backslashes). Trailing separators are ignored. */

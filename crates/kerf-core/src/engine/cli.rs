@@ -26,8 +26,8 @@ use crate::clip_timing::{
 };
 use crate::error::{Error, Result};
 use crate::model::{
-    pix_fmt_layout, Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, PixLayout, Projection, Property, Reframe,
-    ReframeKeyframe, ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform,
+    pix_fmt_layout, Asset, AudioEffect, Clip, Color, Delivery, Grade, Hdr, Mask, MaskShape, PixLayout, Projection, Property,
+    Reframe, ReframeKeyframe, ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform,
     VideoEffect,
 };
 use crate::render_plan::{still_size, CompositeColorPolicy};
@@ -884,7 +884,7 @@ pub(crate) fn projection_from_shape(path: Option<&Path>, width: Option<u32>, hei
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("insv") || e.eq_ignore_ascii_case("insp"));
     match (insta360, width, height) {
-        (true, Some(w), Some(h)) if h > 0 && w == h * 2 => Some(Projection::DualFisheye),
+        (true, Some(w), Some(h)) if h > 0 && h.checked_mul(2) == Some(w) => Some(Projection::DualFisheye),
         _ => None,
     }
 }
@@ -3775,7 +3775,46 @@ pub struct ExportOptions {
     pub loudnorm: bool,
     /// Normalize the final mix to a platform's loudness target. Wins over `loudnorm`.
     pub loudness: Option<LoudnessPreset>,
+    /// Reach the loudness target with one static gain instead of `loudnorm`'s moving one:
+    /// the mix is measured first (the export's own graph, as `get_levels` reads it), then
+    /// raised or lowered by the difference and held under the target's true peak by an
+    /// oversampled limiter. The dynamics stay as mixed; only peaks the gain pushes over the
+    /// ceiling are limited. Read only with a target (`loudness` or `loudnorm`).
+    pub loudness_static: bool,
+    /// The gain static normalization applies, in dB: measured by the render itself before
+    /// it builds the graph, never taken from a caller.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub loudness_gain_db: Option<f64>,
+    /// Mux the cut's captions in as a soft subtitle stream (`mov_text` in mp4 / mov,
+    /// `webvtt` in webm, `srt` in mkv). Refused for a container that carries none.
+    pub embed_captions: bool,
+    /// Write the cut's captions beside the export, one file per format
+    /// (`cut.mp4` → `cut.srt` / `cut.vtt`).
+    pub caption_sidecars: Vec<crate::captions_export::SubtitleFormat>,
+    /// Replace caption files already beside the output (the MCP `export` tool's `overwrite`,
+    /// or the GUI's confirmation); otherwise an export that would is refused.
+    pub overwrite_sidecars: bool,
+    /// Leave the generated captions out of the picture (typed titles are still drawn), for
+    /// a delivery that carries them as a subtitle track or a file instead.
+    pub skip_burned_captions: bool,
+    /// Set by the render, never by a caller: the SubRip file of the cut's captions
+    /// to mux in (see `side_files`).
+    #[serde(skip)]
+    pub subtitle_input: Option<String>,
+    /// Set by the render, never by a caller: the FFMETADATA file of the cut's
+    /// chapter markers to mux in.
+    #[serde(skip)]
+    pub chapters_input: Option<String>,
 }
+
+/// The most static loudness normalization raises or lowers a mix, in dB: a near-silent
+/// cut is not lifted into a wall of noise.
+pub const LOUDNESS_MAX_GAIN_DB: f64 = 30.0;
+
+/// How far under the target's true-peak ceiling the static normalization's limiter is set:
+/// resampling the 4x limiter's output back down rings a little over what it held.
+const STATIC_TP_MARGIN_DB: f64 = 0.3;
 
 /// A delivery's loudness target: integrated loudness and the true-peak ceiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -3846,6 +3885,14 @@ impl Default for ExportOptions {
             range: None,
             loudnorm: false,
             loudness: None,
+            loudness_static: false,
+            loudness_gain_db: None,
+            embed_captions: false,
+            caption_sidecars: Vec::new(),
+            overwrite_sidecars: false,
+            skip_burned_captions: false,
+            subtitle_input: None,
+            chapters_input: None,
         }
     }
 }
@@ -4108,6 +4155,12 @@ pub fn validate_export(opts: &ExportOptions, has_video: bool, has_audio: bool) -
                 issues.push(format!("Invalid audio bitrate \"{b}\"."));
             }
         }
+    }
+    if opts.embed_captions && side_files::subtitle_codec(c).is_none() {
+        issues.push(format!(
+            "A .{} file can't carry subtitles; write them beside the export instead.",
+            c.ext()
+        ));
     }
     issues
 }
@@ -4450,7 +4503,10 @@ fn build_export_args_phase(
 ) -> Result<Vec<String>> {
     // Drop muted / solo-shadowed tracks and disabled clips up front, and cut the range an export
     // of one span draws, so the rest of the builder never has to reason about either.
-    let cut = export_timeline(timeline, opts);
+    let mut cut = export_timeline(timeline, opts);
+    if opts.skip_burned_captions {
+        cut.overlays.retain(|o| !o.generated);
+    }
     let timeline = &cut;
 
     // Stream gating: decide what the graph emits and what we `-map`, in lockstep.
@@ -4490,6 +4546,11 @@ fn build_export_args_phase(
     if want_video {
         svg_layer::push_inputs(&svg_layer::svg_sequences(timeline, &fmt), &fmt, &mut args);
     }
+    let side = if pass == PassPhase::First {
+        side_files::SideInputs::default()
+    } else {
+        side_files::push_inputs(opts, &mut args)
+    };
 
     let total = timeline.duration();
     let graph = build_filter_complex(timeline, assets, &fmt, total, opts, want_video, want_audio, &plan);
@@ -4503,6 +4564,7 @@ fn build_export_args_phase(
         args.push("-map".to_string());
         args.push("[outa]".to_string());
     }
+    side_files::push_maps(&side, &mut args);
 
     // ---- video output options (only when a codec is explicitly chosen; a bare
     // default still maps [outv] and lets ffmpeg pick the encoder, as before) ----
@@ -5302,11 +5364,15 @@ pub struct ExportProgress {
     pub fraction: f64,
     pub elapsed_secs: f64,
     pub eta_secs: Option<f64>,
-    /// Set while the render has not started because the machine is busy with another heavy job
-    /// — `waiting for the preview proxy` — so a queued export does not look hung at 0%.
+    /// Set while the render has not started: the machine is busy with another heavy job
+    /// (`waiting for the preview proxy`), or a static loudness normalization is metering the mix
+    /// first (`measuring the mix's loudness`) — so the export does not look hung at 0%.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting: Option<&'static str>,
 }
+
+/// What an export's `waiting` line says while a static loudness normalization meters the mix.
+const METERING_LOUDNESS: &str = "measuring the mix's loudness";
 
 /// Whether an export ran to completion or was stopped by the cancel callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5347,7 +5413,7 @@ pub fn render_with_progress(
     progress: &mut dyn FnMut(ExportProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<RenderStatus> {
-    let opts = &ExportOptions {
+    let mut opts = ExportOptions {
         hwaccel: export_hwaccel_request(
             opts.hwaccel.as_deref(),
             hwaccel().is_some(),
@@ -5355,18 +5421,66 @@ pub fn render_with_progress(
         ),
         ..opts.clone()
     };
-    // A request that would be refused anyway is refused before the titles are drawn.
-    export_preflight(timeline, assets, opts)?;
+    // A request that would be refused anyway is refused before the titles are drawn (and before
+    // a static loudness normalization spends a pass metering the mix).
+    let (_, has_audio) = export_preflight(timeline, assets, &opts)?;
+    match measure_static_loudness(timeline, assets, &mut opts, has_audio, progress, cancel) {
+        Err(Error::Cancelled) => return Ok(RenderStatus::Cancelled),
+        r => r?,
+    }
+    let opts = &opts;
     // The animated titles are pictures on disk before any ffmpeg is spawned: drawn once for this
     // export — a second pass and the software retry read the same files — and kept until it is over.
     let Some(_titles) = svg_layer::prepare_export(timeline, assets, opts, progress, cancel)? else {
         return Ok(RenderStatus::Cancelled);
     };
-    retry_export_in_software(
-        opts,
+    // The captions and chapters to mux in are files for the length of the export. The caption
+    // files beside it are checked first and written only once it has completed, so a cancelled or
+    // failed export never touches a file already there.
+    let (opts, _side) = side_files::prepare(timeline, opts)?;
+    side_files::check_sidecars(output, &opts)?;
+    let result = retry_export_in_software(
+        &opts,
         |o, hw_used| render_attempt(timeline, assets, output, o, progress, cancel, hw_used),
         convict_hardware_decode,
-    )
+    )?;
+    if result == RenderStatus::Completed {
+        side_files::write_sidecars(timeline, output, &opts)?;
+    }
+    Ok(result)
+}
+
+/// Fill in `opts.loudness_gain_db` for a static loudness normalization that has not been
+/// measured yet: one metering pass over the export's own mix, without the normalization
+/// (see [`ExportOptions::loudness_static`]). Nothing for any other export, nor for one that
+/// writes no sound (a cut without any, or a container that carries none). The pass shows in
+/// `progress` as the export's `waiting` line — queued for the slot, then metering.
+fn measure_static_loudness(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &mut ExportOptions,
+    has_audio: bool,
+    progress: &mut dyn FnMut(ExportProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<()> {
+    let target = opts.loudness.is_some() || opts.loudnorm;
+    let writes_sound = has_audio && opts.include_audio && !opts.container.is_video_only();
+    if !(opts.loudness_static && target && writes_sound) || opts.loudness_gain_db.is_some() {
+        return Ok(());
+    }
+    let started = Instant::now();
+    let mut status = |wait: Option<cpu::Wait>| {
+        progress(ExportProgress {
+            fraction: 0.0,
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            eta_secs: None,
+            waiting: Some(wait.map_or(METERING_LOUDNESS, cpu::Wait::message)),
+        });
+    };
+    // A mix too quiet to measure is left at its level (the limiter still holds the peaks).
+    opts.loudness_gain_db = Some(levels::static_loudness_gain(timeline, assets, opts, &mut status, cancel)?.unwrap_or(0.0));
+    tracing::debug!(gain_db = ?opts.loudness_gain_db, "measured the mix for static loudness normalization");
+    Ok(())
 }
 
 /// Run an export attempt, and once more in software when one that asked an input for hardware
@@ -5520,12 +5634,19 @@ fn export_resource(args: &[String], facts_of: &dyn Fn(&str) -> InputFacts, lane_
     }
     // Inputs, in groups: everything up to and including each `-i <path>`.
     let mut group_hwaccel: Option<&str> = None;
+    let mut side_input = false;
     let mut graph: Option<&str> = None;
     let mut inputs = 0;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "-hwaccel" => group_hwaccel = rest.next().map(String::as_str),
+            // The captions and chapters a render muxes in decode no picture.
+            "-f" => side_input = rest.next().is_some_and(|f| side_files::is_side_format(f)),
+            "-i" if side_input => {
+                side_input = false;
+                rest.next();
+            }
             "-i" => {
                 inputs += 1;
                 let Some(path) = rest.next() else { return cpu::Resource::Cpu };
@@ -5589,6 +5710,48 @@ impl ExportVariant {
     }
 }
 
+/// Check every variant of a multi-format export and measure what they share before any is
+/// rendered: each variant's preflight first (one that would be refused fails before anything
+/// runs), then a static loudness normalization's metering pass, once for all of them — the
+/// mix is the same in every shape. Returns the options to render every variant with (the
+/// measured gain filled in), or `None` when cancelled while metering. [`render_variants`]
+/// runs it; a caller rendering the variants one call at a time runs it first and passes its
+/// options on, so the mix is not measured once per file.
+pub fn prepare_variants(
+    timeline: &Timeline,
+    assets: &[Asset],
+    variants: &[ExportVariant],
+    opts: &ExportOptions,
+    progress: &mut dyn FnMut(VariantProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<ExportOptions>> {
+    let mut has_audio = false;
+    for variant in variants {
+        let per_variant = ExportOptions {
+            resolution: Some((variant.delivery.width, variant.delivery.height)),
+            fit: variant.delivery.fit,
+            ..opts.clone()
+        };
+        has_audio |= export_preflight(&timeline.for_delivery(variant.delivery), assets, &per_variant)?.1;
+    }
+    let mut opts = opts.clone();
+    let total = variants.len();
+    let mut on_meter = |p: ExportProgress| {
+        progress(VariantProgress {
+            variant: 0,
+            total,
+            fraction: 0.0,
+            elapsed_secs: p.elapsed_secs,
+            eta_secs: None,
+            waiting: p.waiting,
+        });
+    };
+    match measure_static_loudness(timeline, assets, &mut opts, has_audio, &mut on_meter, cancel) {
+        Err(Error::Cancelled) => Ok(None),
+        r => r.map(|()| Some(opts)),
+    }
+}
+
 /// Progress across a multi-format export: the overall [`ExportProgress`] plus
 /// which variant is rendering, so a bar can say "2 of 3 · 9:16".
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
@@ -5602,6 +5765,9 @@ pub struct VariantProgress {
     /// Time left across the remaining variants, estimated from how long the
     /// completed share has taken.
     pub eta_secs: Option<f64>,
+    /// [`ExportProgress::waiting`]: queued for the slot, or metering the mix's loudness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<&'static str>,
 }
 
 /// Render the same cut once per variant — one file per delivery frame, each
@@ -5614,6 +5780,12 @@ pub struct VariantProgress {
 /// not started never existed. `opts` is the encode shared by all of them; its
 /// `resolution` and `fit` are replaced per variant by the delivery. Returns the
 /// status and how many files were completed.
+/// Refuse an export whose caption files would replace ones already beside `output`, unless
+/// `opts.overwrite_sidecars` allows it. A multi-format export asks this of every variant first.
+pub fn check_caption_sidecars(output: &Path, opts: &ExportOptions) -> Result<()> {
+    side_files::check_sidecars(output, opts)
+}
+
 pub fn render_variants(
     timeline: &Timeline,
     assets: &[Asset],
@@ -5627,6 +5799,9 @@ pub fn render_variants(
     }
     let total = variants.len();
     let started = Instant::now();
+    let Some(opts) = prepare_variants(timeline, assets, variants, opts, progress, cancel)? else {
+        return Ok((RenderStatus::Cancelled, 0));
+    };
     for (i, variant) in variants.iter().enumerate() {
         let framed = timeline.for_delivery(variant.delivery);
         let per_variant = ExportOptions {
@@ -5644,6 +5819,7 @@ pub fn render_variants(
                 fraction,
                 elapsed_secs,
                 eta_secs,
+                waiting: p.waiting,
             });
         };
         let status = render_with_progress(&framed, assets, &variant.output, &per_variant, &mut on_progress, cancel)?;
@@ -5677,7 +5853,31 @@ fn export_preflight(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions)
     if !issues.is_empty() {
         return Err(Error::InvalidArgument(issues.join(" ")));
     }
+    check_export_luts(timeline)?;
     Ok((has_video, has_audio))
+}
+
+/// An export refuses a LUT it cannot apply (the preview and stills leave it out instead): the file
+/// would otherwise be silently missing from the delivered picture. Reads the disk, off the lock.
+fn check_export_luts(timeline: &Timeline) -> Result<()> {
+    let clips = timeline
+        .tracks
+        .iter()
+        .filter(|t| t.kind == StreamKind::Video)
+        .flat_map(|t| t.clips.iter())
+        .filter(|c| c.enabled);
+    for lut in clips.filter_map(|c| c.grade.lut()) {
+        let why = match crate::color_lut::inspect_lut(&lut.path) {
+            Err(e) => e.to_string(),
+            Ok(_) if crate::color_lut::lut_file(&lut).is_none() => "Kerf could not write its copy of it".to_string(),
+            Ok(_) => continue,
+        };
+        return Err(Error::InvalidArgument(format!(
+            "cannot export: the LUT {} cannot be applied ({why}); choose another file or clear it",
+            lut.path
+        )));
+    }
+    Ok(())
 }
 
 /// One export run with `opts` exactly as given (no fallback).
@@ -6505,15 +6705,14 @@ fn build_filter_complex_with(
         // the output rate. A neutral master adds nothing, so a graph from before
         // the master existed is unchanged.
         let loudness = opts.loudness.or(opts.loudnorm.then_some(LoudnessPreset::Youtube));
-        let mix_tail = if let Some(target) = loudness {
-            format!(
-                "{master},{norm},aresample={sr}",
-                master = master_filters(&timeline.master),
-                norm = target.filter(),
-                sr = fmt.sample_rate
-            )
-        } else {
-            master_filters(&timeline.master)
+        let master = master_filters(&timeline.master, fmt.sample_rate);
+        let mix_tail = match loudness {
+            Some(target) if opts.loudness_static => format!(
+                "{master}{norm}",
+                norm = static_loudness_filters(target, opts.loudness_gain_db, fmt.sample_rate)
+            ),
+            Some(target) => format!("{master},{norm},aresample={sr}", norm = target.filter(), sr = fmt.sample_rate),
+            None => master,
         };
         let pads = |names: &[&str]| names.iter().map(|n| format!("[{n}]")).collect::<String>();
         let ducked: Vec<&str> = sources.iter().filter(|(_, d)| *d).map(|(n, _)| n.as_str()).collect();
@@ -6638,18 +6837,54 @@ fn alimiter_latency_available() -> bool {
 /// 100 ms release is slow enough not to pump on low notes. The ceiling is
 /// rounded to six decimals, which is far below anything audible and keeps the
 /// text from depending on the last digit of a libm `pow`.
-fn master_filters(master: &crate::model::MasterBus) -> String {
+///
+/// With `true_peak` the limiter runs on the mix upsampled four times (`aresample` there and
+/// back around it), so it holds the peaks between the samples too: the true peak a
+/// platform measures, not only the sample peak.
+fn master_filters(master: &crate::model::MasterBus, sample_rate: u32) -> String {
     let mut out = String::new();
     let volume = master.safe_volume();
     if (volume - 1.0).abs() > f64::EPSILON {
         out += &format!(",volume={}", fnum(volume));
     }
     if master.limiter {
-        let limit = (master.limit_linear() * 1e6).round() / 1e6;
-        let latency = if alimiter_latency_available() { ":latency=1" } else { "" };
-        out += &format!(",alimiter=limit={}:attack=5:release=100:level=0{latency}", fnum(limit));
+        let limiter = limiter_filter(master.limit_linear());
+        if master.true_peak {
+            out += &oversampled(&limiter, sample_rate);
+        } else {
+            out += &format!(",{limiter}");
+        }
     }
     out
+}
+
+/// The master's `alimiter` holding `limit` (linear, rounded to six decimals), with
+/// `latency=1` where this ffmpeg has it (see [`master_filters`]).
+fn limiter_filter(limit: f64) -> String {
+    let limit = (limit * 1e6).round() / 1e6;
+    let latency = if alimiter_latency_available() { ":latency=1" } else { "" };
+    format!("alimiter=limit={}:attack=5:release=100:level=0{latency}", fnum(limit))
+}
+
+/// `filter` run at four times `sample_rate` and resampled back, led by its joining comma: a
+/// limiter there sees the peaks between the output's samples (BS.1770 reads the true peak
+/// off the same 4x oversampling).
+fn oversampled(filter: &str, sample_rate: u32) -> String {
+    format!(
+        ",aresample={},{filter},aresample={sample_rate}",
+        sample_rate.saturating_mul(4)
+    )
+}
+
+/// The static loudness normalization: the measured gain (omitted when there is none to
+/// apply) then a true-peak limiter just under the target's ceiling, led by its comma.
+fn static_loudness_filters(target: LoudnessPreset, gain_db: Option<f64>, sample_rate: u32) -> String {
+    let mut out = String::new();
+    if let Some(g) = gain_db.filter(|g| g.is_finite() && g.abs() >= 0.005) {
+        out += &format!(",volume={:.2}dB", g.clamp(-LOUDNESS_MAX_GAIN_DB, LOUDNESS_MAX_GAIN_DB));
+    }
+    let ceiling = 10f64.powf((target.true_peak_db() - STATIC_TP_MARGIN_DB) / 20.0);
+    out + &oversampled(&limiter_filter(ceiling), sample_rate)
 }
 
 /// The owning track's mix settings, carried alongside each of its audio clips.
@@ -7642,6 +7877,11 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     } else if !clip.color.is_identity() {
         p.push(eq_filter(&clip.color));
     }
+    // The LUT, the curves and the wheels, after the `eq` (see `grade`), before any alpha plane.
+    p.extend(grade_filters(
+        &clip.grade,
+        if fx.label_bt709 { Some("bt709") } else { fx.frame_matrix },
+    ));
     // Color-space video effects (blur / sharpen / grayscale / invert / vignette),
     // applied in author order, before any alpha plane.
     for e in &clip.effects {
@@ -7748,6 +7988,36 @@ pub fn timeline_frame(
     run_still(timeline, assets, opts, t, max_width, None, &StillOutput::JpegPipe { quality })
 }
 
+/// The composited still at `t` as its Y'CbCr samples: limited-range 4:4:4 planes (Y, then Cb,
+/// then Cr) of the frame [`timeline_frame`] would encode, with its size. The scopes read this
+/// rather than an RGB conversion, whose matrix is the composite's and not the delivery's.
+pub fn timeline_frame_yuv(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    max_width: u32,
+) -> Result<(u32, u32, Vec<u8>)> {
+    let fmt = export_format(&timeline.for_render(), assets, opts);
+    let (w, h) = still_size(fmt.width, fmt.height, max_width);
+    let planes = run_still(
+        timeline,
+        assets,
+        opts,
+        t,
+        max_width,
+        None,
+        &StillOutput::Yuv444Pipe { width: w, height: h },
+    )?;
+    if planes.len() != (w as usize) * (h as usize) * 3 {
+        return Err(Error::Engine(format!(
+            "could not render timeline frame at {t:.3}s: {} bytes for a {w}x{h} frame",
+            planes.len()
+        )));
+    }
+    Ok((w, h, planes))
+}
+
 /// [`timeline_frame`] of one `region` of the composited canvas. The canvas is
 /// rendered large enough that the region alone comes out `max_width` wide
 /// (capped at the delivery frame, so nothing is invented), then cropped — a
@@ -7815,14 +8085,22 @@ fn run_still(
     out: &StillOutput,
 ) -> Result<Vec<u8>> {
     let piping = matches!(out, StillOutput::JpegPipe { .. });
+    // The scopes are a measurement, not the frame the user is waiting to see: niced. Their output
+    // size is known, so the read buffer is allocated once instead of doubling through ~3 MB.
+    let (background, capacity) = match out {
+        StillOutput::Yuv444Pipe { width, height } => (true, (*width as usize) * (*height as usize) * 3),
+        _ => (false, 0),
+    };
     let hw_used = std::cell::Cell::new(false);
     // The titles' pictures, on disk and kept for the run (and its software retry).
     let _titles = still_titles(timeline, assets, opts, t, max_width, region)?;
     let run = |o: &ExportOptions| -> Result<Vec<u8>> {
         let mut args = build_still_args(timeline, assets, o, t, max_width, region, out)?;
         hw_used.set(tune_still_args(&mut args, assets, HostOs::CURRENT));
+        let _script = externalize_filter_complex(&mut args, "still")?;
         let bin = ffmpeg_bin();
-        let output = output_bounded(command(&bin).args(&args), STILL_TIMEOUT).map_err(|e| match e.kind() {
+        let mut cmd = if background { bg_command(&bin) } else { command(&bin) };
+        let output = output_bounded(cmd.args(&args), STILL_TIMEOUT, capacity).map_err(|e| match e.kind() {
             std::io::ErrorKind::TimedOut => Error::Engine(format!(
                 "could not render timeline frame at {t:.3}s: ffmpeg did not answer in {} s and was stopped",
                 STILL_TIMEOUT.as_secs()
@@ -7863,9 +8141,9 @@ const STILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// `Command::output()` with a deadline: run `cmd` with its stdin closed and both output pipes
 /// read, and kill it if it has not finished in `limit` (`ErrorKind::TimedOut`). The calling thread
-/// reads stdout to its end, a watchdog kills the process at the deadline (which ends that read),
+/// reads stdout to its end (into a buffer of `capacity` bytes up front), a watchdog kills the process at the deadline (which ends that read),
 /// and nothing waits on the child while the watchdog could need it.
-fn output_bounded(cmd: &mut Command, limit: std::time::Duration) -> std::io::Result<std::process::Output> {
+fn output_bounded(cmd: &mut Command, limit: std::time::Duration, capacity: usize) -> std::io::Result<std::process::Output> {
     use std::io::Read;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{channel, RecvTimeoutError};
@@ -7898,7 +8176,7 @@ fn output_bounded(cmd: &mut Command, limit: std::time::Duration) -> std::io::Res
         }
         text
     });
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(capacity);
     let read = match stdout.as_mut() {
         Some(o) => o.read_to_end(&mut out).map(|_| ()),
         None => Ok(()),
@@ -7978,6 +8256,9 @@ pub enum StillOutput {
     /// Raw `rgb24` on stdout — only for [`composite_color_policy`]'s probe, which
     /// wants the converted pixels themselves.
     RgbPipe,
+    /// Raw planar `yuv444p` on stdout — [`timeline_frame_yuv`], for the scopes. The frame's size
+    /// sizes the read buffer; the argv does not carry it (the graph scales to `max_width`).
+    Yuv444Pipe { width: u32, height: u32 },
 }
 
 /// The image formats a cover frame can be written as.
@@ -8033,6 +8314,9 @@ impl StillOutput {
             StillOutput::RgbPipe => {
                 a.extend(["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"].map(String::from));
             }
+            StillOutput::Yuv444Pipe { .. } => {
+                a.extend(["-f", "rawvideo", "-pix_fmt", "yuv444p", "pipe:1"].map(String::from));
+            }
             StillOutput::File { path, format, quality } => {
                 if *format == ImageFormat::Jpeg {
                     a.extend(["-q:v".to_string(), quality.to_string()]);
@@ -8076,7 +8360,7 @@ pub fn export_seek_arg(seconds: f64) -> String {
 ///
 /// Every video clip whose timeline span contains `t` is decoded at its
 /// corresponding source time (`-ss` input seek), put through the same geometry /
-/// color chain the export uses ([`still_clip_chain`] mirrors [`video_clip_chain`]
+/// color chain the export uses ([`still_clip_chain_graded`] mirrors [`video_clip_chain`]
 /// minus the time-domain `trim`/`setpts`/`fps` steps and the fades not changing
 /// the picture at `t`), then `overlay`d onto a black canvas in **track-then-timeline order** — so later tracks composite on
 /// top and gaps fall through to black, matching export framing. The output canvas
@@ -8204,11 +8488,19 @@ fn build_still_args_rendered(
         let rf = clip.reframe_at(ac.local_time);
         let hdr = asset_of(clip.asset_id).and_then(|a| a.hdr());
         let tone = hdr.map(|h| format!("{},", tonemap_filter(h))).unwrap_or_default();
+        let stream = asset_of(clip.asset_id).and_then(|a| a.streams.iter().find(|s| s.kind == StreamKind::Video));
+        let matrix = if layer.label_bt709 {
+            Some("bt709")
+        } else {
+            crate::model::frame_matrix(stream, hdr.is_some())
+        };
         chains.push(format!(
             "[{n}:v]{tone}{chain}[v{n}]",
-            chain = still_clip_chain(
+            chain = still_clip_chain_graded(
                 &tf,
                 &ac.color(),
+                &clip.grade,
+                matrix,
                 &clip.effects,
                 rf.as_ref(),
                 &canvas,
@@ -8283,10 +8575,14 @@ struct StillCanvas {
 ///
 /// `label_bt709` is the graph's BT.709 label for this layer ([`BT709_LABEL`]): the still decides
 /// it over the layers on screen, and puts it where [`video_clip_chain`] does, ahead of everything.
+///
+/// `grade` is the clip's curves, wheels and LUT, right after the `eq`, as `video_clip_chain` places them.
 #[allow(clippy::too_many_arguments)]
-fn still_clip_chain(
+fn still_clip_chain_graded(
     tf: &Transform,
     color: &Color,
+    grade: &Grade,
+    frame_matrix: Option<&str>,
     effects: &[VideoEffect],
     reframe: Option<&ResolvedReframe>,
     canvas: &StillCanvas,
@@ -8349,6 +8645,7 @@ fn still_clip_chain(
     if !color.is_identity() {
         p.push(eq_filter(color));
     }
+    p.extend(grade_filters(grade, frame_matrix));
     for e in effects {
         if let Some(f) = video_effect_filter(e) {
             p.push(f);
@@ -8378,6 +8675,35 @@ fn still_clip_chain(
     }
     p.extend(late_zoom);
     p.join(",")
+}
+
+/// [`still_clip_chain_graded`] with no grade.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn still_clip_chain(
+    tf: &Transform,
+    color: &Color,
+    effects: &[VideoEffect],
+    reframe: Option<&ResolvedReframe>,
+    canvas: &StillCanvas,
+    mask: Option<&Mask>,
+    zoom_last: bool,
+    fades: &StillFades,
+    label_bt709: bool,
+) -> String {
+    still_clip_chain_graded(
+        tf,
+        color,
+        &Grade::default(),
+        None,
+        effects,
+        reframe,
+        canvas,
+        mask,
+        zoom_last,
+        fades,
+        label_bt709,
+    )
 }
 
 /// The `overlay` placement for a clip in a [`timeline_frame`] composite: a full
@@ -8441,11 +8767,29 @@ fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, 
     for e in &clip.audio {
         p.push(audio_effect_filter(e));
     }
+    // A fade that is wholly one half of a real crossfade pair (`ClipFx::afade_in_power` /
+    // `tail_power`) is constant-power (`qsin`: sin in, cos out, so the summed power stays
+    // put) where linear ramps dip about 3 dB at the midpoint. A fade with a clip fade or a
+    // dip in it, a fade up from black, and a pair playing the same sound on both sides keep
+    // the linear ramp they always had.
+    let crossfade = |fade: f64, own: f64, power: bool| {
+        if fade > 0.0 && own <= 0.0 && power {
+            ":curve=qsin"
+        } else {
+            ""
+        }
+    };
     if fi > 0.0 {
-        p.push(format!("afade=t=in:st=0:d={}", fi.clamp(0.0, dur)));
+        let curve = crossfade(fx.afade_in, clip.fade_in + fx.black_in + fx.white_in, fx.afade_in_power);
+        p.push(format!("afade=t=in:st=0:d={}{curve}", fi.clamp(0.0, dur)));
     }
     if fo > 0.0 {
-        p.push(format!("afade=t=out:st={}:d={}", (dur - fo).max(0.0), fo.clamp(0.0, dur)));
+        let curve = crossfade(fx.tail, clip.fade_out + fx.black_out + fx.white_out, fx.tail_power);
+        p.push(format!(
+            "afade=t=out:st={}:d={}{curve}",
+            (dur - fo).max(0.0),
+            fo.clamp(0.0, dur)
+        ));
     }
     // The track fader, after the clip's own chain. Omitted at unity, so a
     // project that never touched a fader renders the graph it always did.
@@ -8554,12 +8898,20 @@ mod bt709_label;
 #[cfg(test)]
 mod rendered;
 
+/// A clip's curves, wheels and LUT as filters.
+mod grade;
+use grade::grade_filters;
+
 /// The still inside a fade, a dip, a dissolve, a slide or a push: its layers and their fades.
 mod still_fx;
 use still_fx::{still_layers, StillFades};
 
 /// Animated SVG titles as PNG sequences and stills: drawn before ffmpeg is spawned, overlaid by it.
 mod svg_layer;
+
+/// The cut's captions and chapter markers muxed into an export, and the caption
+/// files written beside it.
+mod side_files;
 
 /// Titles through the real ffmpeg (`#[ignore]`d).
 #[cfg(test)]
@@ -8568,6 +8920,10 @@ mod svg_rendered;
 /// Which slot a job takes, the cores' or the hardware's.
 #[cfg(test)]
 mod lane_tests;
+
+/// ffprobe's JSON and ffmpeg's logs, mutated: nothing panics.
+#[cfg(test)]
+mod hostile_tests;
 
 /// The deadline on a one-shot still's process.
 #[cfg(all(test, unix))]
@@ -8613,6 +8969,10 @@ mod keyed_zoom;
 /// the export renders (`#[ignore]`d).
 #[cfg(test)]
 mod keyed_channels;
+
+/// Curves, wheels and a LUT against the pictures the export and the still render (`#[ignore]`d).
+#[cfg(test)]
+mod grade_rendered;
 
 /// Scene detection and contact sheets on a proxy against the original (`#[ignore]`d).
 #[cfg(test)]
@@ -10055,6 +10415,27 @@ mod tests {
         let args = build_still_args(&timeline, &assets, &ExportOptions::default(), 1.0, u32::MAX, None, &out).unwrap();
         assert!(args.windows(2).any(|w| w[0] == "-vcodec" && w[1] == "png"));
         assert!(!args.contains(&"-q:v".to_string()), "-q:v is meaningless for png: {args:?}");
+    }
+
+    #[test]
+    fn the_scopes_still_pipes_raw_yuv444_and_is_otherwise_the_jpeg_still() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let assets = vec![asset.clone()];
+        let timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
+        let o = ExportOptions::default();
+        let yuv = StillOutput::Yuv444Pipe { width: 960, height: 540 };
+        let args = build_still_args(&timeline, &assets, &o, 1.0, 960, None, &yuv).unwrap();
+        let tail = ["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv444p", "pipe:1"];
+        assert_eq!(&args[args.len() - tail.len()..], tail.map(String::from).as_slice());
+        let jpeg = build_still_args(&timeline, &assets, &o, 1.0, 960, None, &StillOutput::JpegPipe { quality: 3 }).unwrap();
+        let head = |a: &[String]| a[..a.iter().position(|x| x == "-frames:v").unwrap()].to_vec();
+        assert_eq!(head(&args), head(&jpeg), "only the sink differs");
+        // The size only sizes the read buffer.
+        let other = StillOutput::Yuv444Pipe { width: 1, height: 1 };
+        assert_eq!(
+            build_still_args(&timeline, &assets, &o, 1.0, 960, None, &other).unwrap(),
+            args
+        );
     }
 
     #[test]
@@ -12067,11 +12448,13 @@ mod tests {
                 start: 1.5,
                 end: 3.0,
                 text: "first".into(),
+                ..Default::default()
             },
             TranscriptSegment {
                 start: 3.0,
                 end: 4.25,
                 text: "second".into(),
+                ..Default::default()
             },
         ]);
         assert!(srt.contains("1\n00:00:01,500 --> 00:00:03,000\nfirst"), "{srt}");
@@ -13520,6 +13903,7 @@ mod tests {
     fn the_master_runs_after_the_sum_and_before_loudnorm() {
         let (tl, assets) = master_cut(MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: 0.8,
             limiter: true,
             ceiling_db: -3.0,
@@ -13570,6 +13954,7 @@ mod tests {
         // every frame, only the picture changes.
         let (tl, assets) = master_cut(MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: 0.5,
             limiter: true,
             ceiling_db: -2.0,
@@ -13583,6 +13968,7 @@ mod tests {
     fn the_playback_stream_has_no_sound_for_the_master_to_touch() {
         let (tl, assets) = master_cut(MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: 0.5,
             limiter: true,
             ceiling_db: -1.0,
@@ -13597,11 +13983,12 @@ mod tests {
     fn master_filters_are_safe_for_a_file_that_never_went_through_the_op() {
         let bus = |volume, ceiling_db| MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume,
             limiter: true,
             ceiling_db,
         };
-        let filters = |bus| with_alimiter_latency(true, || master_filters(&bus));
+        let filters = |bus| with_alimiter_latency(true, || master_filters(&bus, 48_000));
         // Not a number: no fader, the default ceiling.
         assert_eq!(
             filters(bus(f64::NAN, f64::NAN)),
@@ -13620,6 +14007,127 @@ mod tests {
     }
 
     #[test]
+    fn a_true_peak_limiter_runs_oversampled_and_is_omitted_when_off() {
+        let (tl, assets) = master_cut(MasterBus {
+            limiter: true,
+            true_peak: true,
+            ..MasterBus::default()
+        });
+        let g = with_alimiter_latency(true, || mix_of(&tl, &assets, &ExportOptions::default()));
+        assert!(
+            g.contains(
+                "dropout_transition=0,aresample=192000,alimiter=limit=0.841395:attack=5:release=100:level=0:latency=1,aresample=48000[outa]"
+            ),
+            "{g}"
+        );
+        let opts = ExportOptions {
+            audio_sample_rate: Some(44_100),
+            ..ExportOptions::default()
+        };
+        let g = with_alimiter_latency(false, || mix_of(&tl, &assets, &opts));
+        assert!(
+            g.contains(",aresample=176400,alimiter=limit=0.841395:attack=5:release=100:level=0,aresample=44100[outa]"),
+            "{g}"
+        );
+
+        // Off, or with the limiter off, the graph is the sample-peak one / the neutral one.
+        let with = |master: MasterBus| {
+            let mut t = tl.clone();
+            t.master = master;
+            mix_of(&t, &assets, &ExportOptions::default())
+        };
+        let g = with(MasterBus {
+            limiter: true,
+            ..MasterBus::default()
+        });
+        assert!(!g.contains("aresample"), "{g}");
+        assert_eq!(
+            with(MasterBus {
+                true_peak: true,
+                ..MasterBus::default()
+            }),
+            with(MasterBus::default())
+        );
+    }
+
+    #[test]
+    fn static_loudness_applies_the_measured_gain_and_a_true_peak_limiter() {
+        let (tl, assets) = master_cut(MasterBus {
+            volume: 0.8,
+            ..MasterBus::default()
+        });
+        let opts = ExportOptions {
+            loudness: Some(LoudnessPreset::Apple),
+            loudness_static: true,
+            loudness_gain_db: Some(3.456),
+            ..ExportOptions::default()
+        };
+        let g = with_alimiter_latency(true, || mix_of(&tl, &assets, &opts));
+        // -1 dBTP less the margin, 4x oversampled; no loudnorm.
+        assert!(
+            g.contains(
+                "dropout_transition=0,volume=0.8,volume=3.46dB,aresample=192000,alimiter=limit=0.860994:attack=5:release=100:level=0:latency=1,aresample=48000[outa]"
+            ),
+            "{g}"
+        );
+        assert!(!g.contains("loudnorm"), "{g}");
+
+        // An unmeasured or negligible gain adds no `volume`; a wild one is clamped.
+        for (gain, volume) in [(None, None), (Some(0.001), None), (Some(80.0), Some("volume=30.00dB"))] {
+            let g = mix_of(
+                &tl,
+                &assets,
+                &ExportOptions {
+                    loudness_gain_db: gain,
+                    ..opts.clone()
+                },
+            );
+            assert_eq!(g.contains("dB,"), volume.is_some(), "{g}");
+            if let Some(v) = volume {
+                assert!(g.contains(v), "{g}");
+            }
+        }
+
+        // Without a target the flag changes nothing, and the dynamic path is the old one.
+        let plain = |static_: bool, loudness| {
+            mix_of(
+                &tl,
+                &assets,
+                &ExportOptions {
+                    loudness,
+                    loudness_static: static_,
+                    loudness_gain_db: Some(2.0),
+                    ..ExportOptions::default()
+                },
+            )
+        };
+        assert_eq!(plain(true, None), plain(false, None));
+        assert_eq!(
+            plain(false, Some(LoudnessPreset::Youtube)),
+            mix_of(
+                &tl,
+                &assets,
+                &ExportOptions {
+                    loudnorm: true,
+                    ..ExportOptions::default()
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn the_static_gain_is_the_distance_to_the_target_within_bounds() {
+        assert_eq!(levels::static_gain_db(LoudnessPreset::Youtube, Some(-20.0)), Some(6.0));
+        assert_eq!(levels::static_gain_db(LoudnessPreset::Broadcast, Some(-14.0)), Some(-9.0));
+        assert_eq!(
+            levels::static_gain_db(LoudnessPreset::Apple, Some(-60.0)),
+            Some(LOUDNESS_MAX_GAIN_DB)
+        );
+        assert_eq!(levels::static_gain_db(LoudnessPreset::Apple, None), None);
+        assert_eq!(levels::static_gain_db(LoudnessPreset::Apple, Some(f64::NEG_INFINITY)), None);
+    }
+
+    #[test]
     fn crossfade_extends_the_outgoing_tail_and_dissolves_the_incoming() {
         let asset = av_asset(Uuid::new_v4(), 20.0);
         let a = make_clip(asset.id, 0.0, 10.0, 0.0);
@@ -13633,6 +14141,60 @@ mod tests {
         assert!(g.contains("trim=start=0:end=11"), "{g}");
         // Incoming clip B fades up via alpha, from where it sits on the timeline.
         assert!(g.contains("fade=t=in:st=10:d=1:alpha=1"), "{g}");
+    }
+
+    #[test]
+    fn a_crossfade_is_constant_power_and_a_clip_fade_stays_linear() {
+        let (asset, other) = (av_asset(Uuid::new_v4(), 20.0), av_asset(Uuid::new_v4(), 20.0));
+        let both = [asset.clone(), other.clone()];
+        let a = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let mut b = make_clip(other.id, 0.0, 10.0, 10.0);
+        b.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 1.0,
+        });
+        let g = graph_of(&single(vec![a.clone(), b.clone()]), &both);
+        assert!(g.contains("afade=t=out:st=10:d=1:curve=qsin,"), "{g}");
+        assert!(g.contains("afade=t=in:st=0:d=1:curve=qsin,"), "{g}");
+
+        // A cut inside one take plays the same samples both sides: the linear pair keeps
+        // that correlated sound at unity. Elsewhere in the same take is two sounds again.
+        let mut same = b.clone();
+        same.asset_id = asset.id;
+        (same.source_in, same.source_out) = (10.0, 20.0);
+        let mut both_takes = vec![asset];
+        both_takes[0].duration = 40.0;
+        let g = graph_of(&single(vec![a.clone(), same.clone()]), &both_takes);
+        assert!(g.contains("afade=t=out:st=10:d=1,"), "{g}");
+        assert!(g.contains("afade=t=in:st=0:d=1,"), "{g}");
+        assert!(!g.contains("qsin"), "{g}");
+        (same.source_in, same.source_out) = (25.0, 35.0);
+        let g = graph_of(&single(vec![a.clone(), same]), &both_takes);
+        assert_eq!(g.matches("curve=qsin").count(), 2, "{g}");
+
+        // A dissolve up from black has no partner: a linear fade.
+        let g = graph_of(&single(vec![b.clone()]), &both);
+        assert!(g.contains("afade=t=in:st=0:d=1,"), "{g}");
+        assert!(!g.contains("qsin"), "{g}");
+
+        // A clip fade beside the transition keeps the one linear ramp it always had.
+        let (mut a2, mut b2) = (a.clone(), b.clone());
+        a2.fade_out = 0.5;
+        b2.fade_in = 0.25;
+        let g = graph_of(&single(vec![a2, b2]), &both);
+        assert!(g.contains("afade=t=out:st=9.5:d=1.5,"), "{g}");
+        assert!(g.contains("afade=t=in:st=0:d=1.25,"), "{g}");
+        assert!(!g.contains("qsin"), "{g}");
+
+        // A dip is not a crossfade: the sound dips through silence linearly.
+        let mut dip = b;
+        dip.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::DipToBlack,
+            duration: 1.0,
+        });
+        let g = graph_of(&single(vec![a, dip]), &both);
+        assert!(g.contains("afade=t=in:st=0:d=0.5,"), "{g}");
+        assert!(!g.contains("qsin"), "{g}");
     }
 
     #[test]

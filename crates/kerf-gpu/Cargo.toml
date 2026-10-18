@@ -29,3 +29,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true
+kerf-core = { workspace = true, features = ["test-support"] }

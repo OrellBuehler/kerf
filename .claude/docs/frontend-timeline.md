@@ -247,6 +247,20 @@ keyframe-at-playhead check has a tolerance that assumes the playhead is *at* the
 click would land on. It also **cannot stand past the end of the cut**: an effect in
 `+page.svelte` takes it back to the new end when an edit shortens the cut (an empty cut reads `00:00:00:00 / 00:00:00:00`).
 The playhead's *head* lives in the sticky ruler, so it stays when the tracks scroll vertically.
+**The render bar** (`RenderBar.svelte`, `render-bar.ts`) is a 3 px strip along the ruler's top edge saying how the
+Preview will play each span, from `get_render_bar` (`kerf_core::render_bar`: the cut planned as a play session from
+its start, `PlayCut`, every grid frame judged at the Preview's width (`ui.previewWidth`); asked again 400 ms after the
+cut, the media, the GPU setting or that width changes, one request in flight and one more after it):
+**red** (`stall`) where playback stalls whoever plays it — a reversed clip (the stream's `reverse` and the GPU cursor
+both read the whole window first), a clip waiting for its proxy under Proxy only, a frame with no plan; with the GPU
+preview **on**, **green** (`gpu`) where the compositor draws the frame exactly and in time at the Preview's size and
+**yellow** (`stream`) where it hands over to the FFmpeg stream (a plan refusal by `Compositor::CAPS`, a moving title, a
+cut whose rate the playing preview does not draw); where nothing is drawn (an audio-only cut, muted video, a gap) there
+is no span;
+with it **off** (the default) the stream plays everything else and the bar shows only the red. The tooltip names the
+state, the span and the first frame's reason. What only a running session knows (self-test, untrusted seeks, a
+backend that is down) is not in it; a cut over 25 000 frames (about a pixel each) is judged every n-th frame. A proxy
+wait names the clip, not the build's progress, which the bar is not asked again for.
 **A clip with the keyboard focus nudges**: ← / → move it (and the selection it is part of) a frame, ⇧ a second, Alt leaves its
 linked partners (`nudge.ts`). A run of presses is one edit, written once the keys go quiet (450 ms), on Enter or when focus
 leaves; until then the clip is drawn where it will land as a drag is (the plan is `planMove`'s, so overlaps, locks and links
@@ -273,13 +287,21 @@ them only from the editor surface (`focus-area.ts`: the page, the timeline or th
 the dock container around one); `[` / `]` work from anywhere. The mark is a frame drawn just
 inside the clip's border (`::after`, under `ClipOverlays` — handles, edges and the link badge draw over it — and
 `pointer-events: none`), not an outline, so the partner highlight and the focus ring still show on a marked clip.
-**One timecode** (`timecode.ts`): `HH:MM:SS:FF`, non-drop, hours always there so `00:00:20:15` is not read as
+**One timecode** (`timecode.ts`, the mirror of kerf-core `timecode.rs`; `timecode-entry.test.ts` replays its cases):
+`HH:MM:SS:FF`, **drop-frame `HH;MM;SS;FF` at 29.97 and 59.94** (told by closeness to `30000/1001` / `60000/1001`,
+since the rate is an `f64`), non-drop at every other rate, hours always there so `00:00:20:15` is not read as
 minutes:seconds:frames — the transport, the timeline's clock, the status bar, the ruler (`HH:MM:SS` for a whole-second
 step), the mark and marker tooltips, the trim readouts, the keyframe tooltips and the export range. `mm:ss.cc`
 survives only in the Inspector's editable seconds fields and in the prose that mirrors Rust (`diff.ts`
 `formatTime`). **The timeline's clock** is the ruler's corner (`data-timeline-time`: playhead in amber, `/`, the cut's length;
 an empty cut is `00:00:00:00`, not the lane's 8 s minimum); the toolbar's unlabelled length is gone, and ripple's cue there
-is its icon.
+is its icon. At a drop-frame rate the ruler labels are drop-frame too, frames and all (`tickLabel`), so a tick reads as the playhead would there; its ticks stay on whole frames of nominal seconds. **The playhead's timecode is typed into**
+(`TimecodeField.svelte`, in the clock and in the transport; **Go to timecode**, `playback.goToTimecode`, ⌘G by default,
+focuses the timeline's, else the transport's): `parseTimecode` reads Premiere-style entry — any of `:;.,` between
+fields, fewer fields filling from the right (`1.00` a second), bare digits as right-aligned pairs (`1000` is
+`00:00:10:00`), `+15` / `-1.00` relative to the frame shown, an overflowing field carried into the next first, a dropped drop-frame label as its minute's first frame, all-empty fields (`:`) refused.
+Enter seeks to the frame (`frameTime`); Escape, Tab or a click away leave the playhead alone; an unreadable entry
+turns red and stays.
 
 The transport's **scrub bar** (`ScrubBar.svelte`, `scrub.ts`) shows the time under the pointer on a chip above the rail
 (`chipLeft` keeps it inside the bar, and it follows the pointer while the bar is held) and a tick per marker (`markerTicks`:

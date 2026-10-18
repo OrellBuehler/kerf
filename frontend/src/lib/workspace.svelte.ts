@@ -17,10 +17,10 @@ import { toast } from './notifications.svelte';
 import { popout } from './popout.svelte';
 
 /** Where a panel opens when it is brought back from the Window menu: the
- *  library on the preview's left and the deliver panel and the mixer on its
+ *  library on the preview's left and the deliver panel, the mixer and the scopes on its
  *  right — that is where the presets put them — everything else beside whatever
  *  is active. */
-const BESIDE_PREVIEW: Partial<Record<PanelId, 'left' | 'right'>> = { library: 'left', deliver: 'right', mixer: 'right' };
+const BESIDE_PREVIEW: Partial<Record<PanelId, 'left' | 'right'>> = { library: 'left', deliver: 'right', mixer: 'right', scopes: 'right' };
 
 /** How long after the last layout change the arrangement is written. */
 const SAVE_DELAY_MS = 500;

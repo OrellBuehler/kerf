@@ -75,9 +75,17 @@ mod pcm;
 // pure DSP on decoded PCM, cached per file.
 pub mod music;
 
+// Word timing and speaker labels for transcripts: energy VAD, mel front end, diarization.
+pub(crate) mod diarize;
+pub(crate) mod mel;
+pub(crate) mod vad;
+
 // Stem separation (Demucs htdemucs on ONNX Runtime; STFT, chunking and overlap-add here).
 pub mod stems;
-pub use pcm::{decode_audio, wav_bytes, write_wav, AudioBuffer};
+pub use pcm::{decode_audio, decode_audio_window, wav_bytes, write_wav, AudioBuffer};
+
+// Lining two recordings up by their sound (GCC-PHAT-β, coarse then refined): pure DSP.
+pub mod audio_sync;
 pub use stems::{status as stems_status, StemsStatus, STEM_NAMES};
 
 // Speech model provisioning + transcription through the `ffmpeg` binary's
@@ -97,14 +105,15 @@ mod ffmpeg;
 // Analysis, frame and waveform extraction always go through the CLI backend —
 // they only need the FFmpeg binaries, never the dev libraries.
 pub use cli::{
-    audio_effects_filter, audio_pcm, contact_sheet, contact_sheet_times, decode_hwaccel, delivery_frame,
+    audio_effects_filter, audio_pcm, check_caption_sidecars, contact_sheet, contact_sheet_times, decode_hwaccel, delivery_frame,
     detect_scenes_preferring, detect_silence, disable_decode_hwaccel, export_still, frame_at, frame_jpeg, frame_jpeg_region,
     generate_proxy, generate_proxy_with, hw_encoders, insta360_pair, mix_levels, playback_params, proxy_base_width, proxy_path,
     proxy_width, proxy_width_for, ready_proxy, remove_proxy_files, salience_map, seek_arg, set_proxy_base_width, source_identity,
     stitch_insta360, stitched_path, stream_preview, stream_preview_until, stream_preview_with, timeline_frame,
-    timeline_frame_region, validate_export, waveform, Container, ExportOptions, ExportProgress, ExportVariant, Fit, ImageFormat,
-    LoudnessPreset, PlaybackParams, PlaybackRequest, PreviewFrame, ProxyRun, RateControl, Region, RenderStatus, ScrubConfig,
-    ScrubFrames, ScrubStats, VariantProgress, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
+    timeline_frame_region, timeline_frame_yuv, validate_export, waveform, Container, ExportOptions, ExportProgress,
+    ExportVariant, Fit, ImageFormat, LoudnessPreset, PlaybackParams, PlaybackRequest, PreviewFrame, ProxyRun, RateControl,
+    Region, RenderStatus, ScrubConfig, ScrubFrames, ScrubStats, VariantProgress, MAX_STREAM_FPS, MAX_STREAM_WIDTH,
+    MIN_STREAM_FPS, MIN_STREAM_WIDTH,
 };
 
 pub(crate) use cli::insta360_pair_name;
@@ -188,6 +197,18 @@ pub fn render_with_progress(
     cancel: &dyn Fn() -> bool,
 ) -> Result<RenderStatus> {
     cli::render_with_progress(timeline, assets, output, opts, progress, cancel)
+}
+
+/// Check every variant and measure what they share, once — see [`cli::prepare_variants`].
+pub fn prepare_variants(
+    timeline: &crate::model::Timeline,
+    assets: &[crate::model::Asset],
+    variants: &[ExportVariant],
+    opts: &ExportOptions,
+    progress: &mut dyn FnMut(VariantProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<ExportOptions>> {
+    cli::prepare_variants(timeline, assets, variants, opts, progress, cancel)
 }
 
 /// Render one file per delivery frame — see [`cli::render_variants`].

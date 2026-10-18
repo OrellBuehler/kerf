@@ -6,13 +6,17 @@
 //! which reuses the transcript-captioning code so an imported set looks like a
 //! generated one; [`Project::import_captions`] makes it one revision.
 //!
-//! Two formats, both read *tolerantly* — subtitle files in the wild are mostly
+//! Three formats, all read *tolerantly* — subtitle files in the wild are mostly
 //! hand-edited, re-muxed and machine-converted, and an importer that rejects a
 //! file for a missing blank line is an importer nobody uses:
 //!
 //! * **SubRip** (`.srt`): a BOM, CRLF or old-Mac CR line ends, missing or absurd
 //!   indices, `,` or `.` before the milliseconds, several text lines, `<i>` /
 //!   `<b>` / `<font>` markup, and `{\an8}`-style overrides some tools leave in.
+//! * **WebVTT** (`.vtt`): the `WEBVTT` header, `NOTE` / `STYLE` / `REGION`
+//!   blocks skipped, cue ids, optional hours, cue settings ignored, `<v Speaker>`
+//!   / `<b>` / `<c.class>` / inline `<00:01.000>` tags removed and `&amp;`-style
+//!   entities decoded. Captions have no speaker, so a voice's name is dropped.
 //! * **ASS / SSA** (`.ass`, `.ssa`): the `[Events]` `Format:` line decides which
 //!   column is which (so reordered fields work), `Dialogue:` lines carry the
 //!   cues, and `{…}` override blocks, drawing commands, `\N` / `\n` / `\h` are
@@ -79,23 +83,27 @@ pub enum CaptionFormat {
     Srt,
     /// Advanced / classic SubStation Alpha (`.ass`, `.ssa`).
     Ass,
+    /// WebVTT (`.vtt`).
+    Vtt,
 }
 
 impl CaptionFormat {
-    /// The wire name (`srt` / `ass`).
+    /// The wire name (`srt` / `ass` / `vtt`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Srt => "srt",
             Self::Ass => "ass",
+            Self::Vtt => "vtt",
         }
     }
 
-    /// A format by its name or file extension (`srt`, `ass`, `ssa`; any case,
-    /// with or without a leading dot).
+    /// A format by its name or file extension (`srt`, `ass`, `ssa`, `vtt`; any
+    /// case, with or without a leading dot).
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().trim_start_matches('.').to_ascii_lowercase().as_str() {
             "srt" | "subrip" => Some(Self::Srt),
             "ass" | "ssa" => Some(Self::Ass),
+            "vtt" | "webvtt" => Some(Self::Vtt),
             _ => None,
         }
     }
@@ -107,7 +115,7 @@ impl CaptionFormat {
             None => Ok(None),
             Some(n) => Self::parse(n).map(Some).ok_or_else(|| {
                 Error::InvalidArgument(format!(
-                    "unknown subtitle format {n:?}; expected \"srt\" or \"ass\" (\"ssa\" is read as ass)"
+                    "unknown subtitle format {n:?}; expected \"srt\", \"vtt\" or \"ass\" (\"ssa\" is read as ass)"
                 ))
             }),
         }
@@ -119,11 +127,16 @@ impl CaptionFormat {
     }
 
     /// Guess a format from the text itself, for a caller that has no file name
-    /// (the browser harness) or whose file name lies. An ASS / SSA file always
+    /// (the browser harness) or whose file name lies. A WebVTT file opens with
+    /// `WEBVTT`. An ASS / SSA file always
     /// has a `[Script Info]` or `[Events]` section; failing that, the `-->` of an
     /// SRT timing line wins over a bare `Dialogue:` line, which is the only
     /// thing a stripped ASS fragment has and also something a subtitle could say.
     pub fn detect(text: &str) -> Self {
+        let text = text.trim_start_matches('\u{feff}');
+        if is_vtt_signature(text.trim_start().split(['\r', '\n']).next().unwrap_or("")) {
+            return Self::Vtt;
+        }
         let mut arrow = false;
         let mut dialogue = false;
         // Split on either line end, not `lines()`: a CR-only file (an old Mac
@@ -626,6 +639,196 @@ pub fn parse_ass(text: &str) -> Result<ParsedCaptions> {
     Ok(out)
 }
 
+// ---- WebVTT -----------------------------------------------------------------
+
+/// `WEBVTT`, alone or followed by a space, a tab or a header text.
+fn is_vtt_signature(line: &str) -> bool {
+    line.strip_prefix("WEBVTT")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+}
+
+/// A block that is not a cue: `NOTE` (a comment), `STYLE` or `REGION`.
+fn is_vtt_meta_block(first: &str) -> bool {
+    !first.contains("-->")
+        && ["NOTE", "STYLE", "REGION"].iter().any(|k| {
+            first
+                .strip_prefix(k)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+        })
+}
+
+/// `00:01.000 --> 00:00:03.500 line:90% align:start` → `(start, end)`; the cue
+/// settings after the end time are ignored.
+fn parse_vtt_timing(line: &str) -> Option<(f64, f64)> {
+    let (left, right) = line.split_once("-->")?;
+    let start = parse_timestamp(left.trim())?;
+    let end = parse_timestamp(right.split_whitespace().next()?)?;
+    Some((start, end))
+}
+
+/// Remove inline `<00:00:01.000>` timestamp tags (karaoke timing). Linear: a
+/// tag's `>` is looked for only within a timestamp's length.
+fn strip_vtt_timestamps(line: &str) -> Cow<'_, str> {
+    if !line.contains('<') {
+        return Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let close = after.bytes().take(16).position(|b| b == b'>');
+        match close {
+            Some(close) if after.starts_with(|c: char| c.is_ascii_digit()) && parse_timestamp(&after[..close]).is_some() => {
+                rest = &after[close + 1..];
+            }
+            _ => {
+                out.push('<');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// The character a WebVTT reference names (`amp`, `#233`, `#xE9`), `Some(None)`
+/// for one that stands for nothing visible (`lrm` / `rlm`), `None` when it is not
+/// a reference.
+fn vtt_entity(name: &str) -> Option<Option<char>> {
+    Some(Some(match name {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "nbsp" => '\u{a0}',
+        "quot" => '"',
+        "apos" => '\'',
+        "lrm" | "rlm" => return Some(None),
+        _ => {
+            let num = name.strip_prefix('#')?;
+            let code = match num.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => num.parse::<u32>().ok()?,
+            };
+            char::from_u32(code)?
+        }
+    }))
+}
+
+/// Decode the character references WebVTT text uses (`&amp;`, `&lt;`, `&gt;`,
+/// `&nbsp;`, `&quot;`, `&apos;`, `&#…;`; `&lrm;` / `&rlm;` dropped). An unknown
+/// or unterminated `&` is text.
+fn decode_vtt_entities(line: &str) -> Cow<'_, str> {
+    if !line.contains('&') {
+        return Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        let decoded = after
+            .bytes()
+            .take(12)
+            .position(|b| b == b';')
+            .and_then(|semi| vtt_entity(&after[..semi]).map(|ch| (ch, semi)));
+        match decoded {
+            Some((ch, semi)) => {
+                out.extend(ch);
+                rest = &after[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// One WebVTT text line with its timestamps, markup and references resolved.
+/// References are decoded last, so `&lt;i&gt;` stays the text it spells.
+fn clean_vtt_line(line: &str) -> Cow<'_, str> {
+    let marked = strip_markup(&strip_vtt_timestamps(line)).into_owned();
+    Cow::Owned(decode_vtt_entities(&marked).into_owned())
+}
+
+/// One blank-line-separated block of a WebVTT file: a cue, or something that is
+/// not one (the header, `NOTE` / `STYLE` / `REGION`), which is not counted.
+fn finish_vtt_block(block: &[&str], oversized: bool, first: bool, out: &mut ParsedCaptions) {
+    let Some(&head) = block.first() else { return };
+    let block = if first && is_vtt_signature(head) {
+        // The header runs to the first blank line; a cue that follows it without
+        // one is still read.
+        match block.iter().position(|l| l.contains("-->")) {
+            Some(at) => &block[at..],
+            None => return,
+        }
+    } else {
+        block
+    };
+    if is_vtt_meta_block(block[0]) {
+        return;
+    }
+    // An optional cue id sits above the timing line.
+    let timing = if block[0].contains("-->") { 0 } else { 1 };
+    let Some((start, end)) = block.get(timing).and_then(|l| parse_vtt_timing(l)).filter(|_| !oversized) else {
+        out.skipped += 1;
+        return;
+    };
+    let text = join_cleaned(block[timing + 1..].iter().map(|l| clean_vtt_line(l)));
+    if text.is_empty() || end <= start || text.chars().count() > MAX_CUE_CHARS {
+        out.skipped += 1;
+        return;
+    }
+    out.cues.push(ImportedCue { start, end, text });
+}
+
+/// Read WebVTT text. Never fails: what is unusable is counted in
+/// [`ParsedCaptions::skipped`]. Stops once it holds more than
+/// [`MAX_CAPTION_CUES`] cues.
+///
+/// Blocks are separated by blank lines. The `WEBVTT` header and `NOTE`, `STYLE`
+/// and `REGION` blocks are not cues and are not counted; a cue is an optional id
+/// line, a timing line (`.` before the milliseconds, hours optional, cue settings
+/// ignored) and its text. A file without the signature is read the same way.
+pub fn parse_vtt(text: &str) -> ParsedCaptions {
+    let text = normalize_newlines(text);
+    let mut out = ParsedCaptions::default();
+    let mut block: Vec<&str> = Vec::new();
+    let mut oversized = false;
+    let mut first = true;
+    for raw in text.split('\n') {
+        if out.cues.len() > MAX_CAPTION_CUES {
+            break; // see `parse_srt`
+        }
+        // Refused before it is cleaned or even trimmed: see `MAX_LINE_CHARS`.
+        // It still holds its place, so it cannot turn a cue's text into its id.
+        if too_long(raw) {
+            oversized = true;
+            block.push("");
+            continue;
+        }
+        let line = raw.trim();
+        if line.is_empty() {
+            if !block.is_empty() {
+                finish_vtt_block(&block, oversized, first, &mut out);
+                first = false;
+            }
+            block.clear();
+            oversized = false;
+            continue;
+        }
+        block.push(line);
+    }
+    if !block.is_empty() {
+        finish_vtt_block(&block, oversized, first, &mut out);
+    }
+    out.cues.sort_by(|a, b| a.start.total_cmp(&b.start));
+    out
+}
+
 // ---- entry points -----------------------------------------------------------
 
 /// A subtitle file read and ready to import: the format it was read as, its
@@ -658,6 +861,7 @@ pub fn parse_captions(text: &str, format: Option<CaptionFormat>) -> Result<Capti
     let parsed = match format {
         CaptionFormat::Srt => parse_srt(text),
         CaptionFormat::Ass => parse_ass(text)?,
+        CaptionFormat::Vtt => parse_vtt(text),
     };
     if parsed.cues.len() > MAX_CAPTION_CUES {
         return Err(Error::InvalidArgument(format!(
@@ -756,7 +960,7 @@ fn too_large() -> Error {
 }
 
 /// Read a subtitle file a person or an agent pointed at. It must be a `.srt`,
-/// `.ass` or `.ssa` regular file of at most [`MAX_CAPTION_FILE_BYTES`] — the same
+/// `.vtt`, `.ass` or `.ssa` regular file of at most [`MAX_CAPTION_FILE_BYTES`] — the same
 /// guards `read_text_file` puts on a theme, since the path is not Kerf's own —
 /// and is decoded by [`decode_caption_bytes`]. Reading happens here, *before* the
 /// project lock is taken, so a slow disk never stalls an edit.
@@ -766,7 +970,7 @@ fn too_large() -> Error {
 pub fn read_caption_file(path: &Path) -> Result<String> {
     if CaptionFormat::from_extension(path).is_none() {
         return Err(Error::InvalidArgument(format!(
-            "{} is not a subtitle file (expected .srt, .ass or .ssa)",
+            "{} is not a subtitle file (expected .srt, .vtt, .ass or .ssa)",
             path.display()
         )));
     }
@@ -1097,6 +1301,57 @@ mod tests {
         assert_eq!(parsed.skipped, 4, "zero length, bad time, too few fields, empty text");
     }
 
+    // ---- WebVTT ----
+
+    const VTT: &str = "\u{feff}WEBVTT - a header\r\nKind: captions\r\n\r\nSTYLE\r\n::cue { color: yellow }\r\n\r\nREGION\r\nid:fred width:40%\r\n\r\nNOTE a comment\r\nspanning lines\r\n\r\nintro\r\n00:01.000 --> 00:00:03.500 line:90% align:start\r\n<v.loud Ann Smith>Hello <b>there</b>\r\nsecond line\r\n\r\n00:00:04.000 --> 00:00:05.000\r\n<i>plain</i> &amp; &lt;tags&gt;<00:00:04.500> late\r\n\r\nNOTE\r\nafter a cue\r\n\r\n1:00:06.250 --> 1:00:07.000 position:10%\r\n<c.yellow>an hour in</c>\r\n";
+
+    #[test]
+    fn a_webvtt_file_reads_with_its_header_blocks_ids_and_settings_dropped() {
+        let parsed = parse_vtt(VTT);
+        assert_eq!(parsed.skipped, 0);
+        assert_eq!(
+            parsed.cues,
+            vec![
+                cue(1.0, 3.5, "Hello there\nsecond line"),
+                cue(4.0, 5.0, "plain & <tags> late"),
+                cue(3606.25, 3607.0, "an hour in"),
+            ]
+        );
+    }
+
+    #[test]
+    fn webvtt_entities_and_timestamps_are_text_unless_they_are_markup() {
+        let parsed = parse_vtt("WEBVTT\n\n00:01.000 --> 00:02.000\na &unknown; b & c &#233;&#xE9; &lrm;d <3 <laughs> <0x>\n");
+        assert_eq!(texts(&parsed), vec!["a &unknown; b & c éé d <3 <laughs> <0x>"]);
+        let names = "&constructor; &toString; &__proto__; &hasOwnProperty;";
+        let parsed = parse_vtt(&format!("WEBVTT\n\n00:01.000 --> 00:02.000\n{names}\n"));
+        assert_eq!(texts(&parsed), vec![names]);
+    }
+
+    #[test]
+    fn broken_webvtt_cues_are_counted_and_a_signature_is_optional() {
+        let parsed = parse_vtt(
+            "00:01.000 --> 00:02.000\nno header\n\nid only\n\n00:03.000 --> 00:02.000\nbackwards\n\n00:04.000 --> 00:05.000\n\nWEBVTT\n00:06.000 --> 00:07.000\na late signature is only an id\n",
+        );
+        assert_eq!(texts(&parsed), vec!["no header", "a late signature is only an id"]);
+        assert_eq!(parsed.skipped, 3);
+        let header_then_cue = parse_vtt("WEBVTT\n00:01.000 --> 00:02.000\nno blank line\n");
+        assert_eq!(texts(&header_then_cue), vec!["no blank line"]);
+        assert_eq!(parse_vtt("WEBVTT\n").cues.len(), 0);
+    }
+
+    #[test]
+    fn a_webvtt_line_over_the_cap_refuses_its_cue() {
+        let long = "x".repeat(MAX_LINE_CHARS + 1);
+        let parsed = parse_vtt(&format!(
+            "WEBVTT\n\n00:01.000 --> 00:02.000\n{long}\n\n00:03.000 --> 00:04.000\nok\n"
+        ));
+        assert_eq!(texts(&parsed), vec!["ok"]);
+        assert_eq!(parsed.skipped, 1);
+        let file = parse_captions(VTT, None).unwrap();
+        assert_eq!((file.format, file.cues.len()), (CaptionFormat::Vtt, 3));
+    }
+
     // ---- detection and entry points ----
 
     #[test]
@@ -1118,7 +1373,16 @@ mod tests {
         );
         assert_eq!(CaptionFormat::detect(""), CaptionFormat::Srt);
         assert_eq!(CaptionFormat::parse(".SSA"), Some(CaptionFormat::Ass));
-        assert_eq!(CaptionFormat::parse("vtt"), None);
+        assert_eq!(CaptionFormat::parse("vtt"), Some(CaptionFormat::Vtt));
+        assert_eq!(CaptionFormat::parse("sub"), None);
+        assert_eq!(
+            CaptionFormat::detect("\u{feff}WEBVTT\n\n00:01.000 --> 00:02.000\nHi"),
+            CaptionFormat::Vtt
+        );
+        assert_eq!(
+            CaptionFormat::detect("WEBVTTX\n00:01.000 --> 00:02.000\nHi"),
+            CaptionFormat::Srt
+        );
         assert_eq!(
             CaptionFormat::from_extension(Path::new("/a/b/Movie.SRT")),
             Some(CaptionFormat::Srt)
@@ -1328,8 +1592,9 @@ mod tests {
         assert_eq!(CaptionFormat::from_arg(Some("  ")).unwrap(), None);
         assert_eq!(CaptionFormat::from_arg(Some("SSA")).unwrap(), Some(CaptionFormat::Ass));
         assert_eq!(CaptionFormat::from_arg(Some(".srt")).unwrap(), Some(CaptionFormat::Srt));
-        let err = CaptionFormat::from_arg(Some("vtt")).unwrap_err().to_string();
-        assert!(err.contains("\"srt\" or \"ass\""), "{err}");
+        assert_eq!(CaptionFormat::from_arg(Some("VTT")).unwrap(), Some(CaptionFormat::Vtt));
+        let err = CaptionFormat::from_arg(Some("sub")).unwrap_err().to_string();
+        assert!(err.contains("\"srt\", \"vtt\" or \"ass\""), "{err}");
     }
 
     #[test]
@@ -1359,7 +1624,7 @@ mod tests {
         let txt = dir.join("notes.txt");
         std::fs::write(&txt, "x").unwrap();
         let err = read_caption_file(&txt).unwrap_err();
-        assert!(err.to_string().contains(".srt, .ass or .ssa"), "{err}");
+        assert!(err.to_string().contains(".srt, .vtt, .ass or .ssa"), "{err}");
 
         let missing = dir.join("missing.srt");
         assert!(matches!(read_caption_file(&missing), Err(Error::InvalidArgument(_))));

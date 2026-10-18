@@ -8,7 +8,7 @@
  *  the same arrangement as `platforms.ts` and `smart-crop.ts`.
  */
 
-import type { CaptionOptions, CaptionStyle, Clip, TextOverlay, Timeline, TranscriptSegment } from './types';
+import type { CaptionOptions, CaptionStyle, Clip, TextOverlay, Timeline, TranscriptSegment, Word } from './types';
 
 /** Shortest a generated line stays on screen; below this it reads as a flicker. */
 export const MIN_CAPTION = 0.45;
@@ -19,6 +19,8 @@ export const MIN_CAPTION_VISIBLE = 0.15;
  *  into lines. */
 export const MIN_WORD_CAPTION = 0.12;
 export const MIN_WORD_VISIBLE = 0.06;
+/** How long a word-timed line stays up after its last word when a pause follows. */
+export const CAPTION_HOLD = 0.5;
 
 /** A style's numbers with any override applied — what captioning works from. */
 export interface CaptionOpts {
@@ -134,8 +136,9 @@ export function chunkWords(text: string, opts: CaptionOpts): string[] {
 }
 
 /** Spread a span across lines by character share, merging away any line too
- *  short to read. Character share is the approximation available: neither
- *  speech backend reports word timings.
+ *  short to read. Character share is the approximation for a line without word
+ *  timings (an imported cue, an older transcript); a line with words goes
+ *  through `wordChunks`.
  *
  *  The merge is repeated — join the first too-short line to its shorter
  *  neighbour, re-time, look again — and what that costs is the *scan*: weights
@@ -183,6 +186,67 @@ export function timeChunks(
 		at = to;
 	});
 	return timed;
+}
+
+type Span = { start: number; end: number };
+
+/** Caption lines of a transcript line whose words carry their own source times:
+ *  grouped like `chunkWords`, each line from its first word's start to the next
+ *  line's — or, across a pause, to its last word's end plus `CAPTION_HOLD` (the
+ *  last no further than the segment's end) — a line shorter than `min_line`
+ *  merged into its shorter neighbour. Each comes with the span its words are
+ *  spoken in, which is what has to survive a cut. Mirrors `word_chunks`. */
+export function wordChunks(
+	words: Word[],
+	segEnd: number,
+	opts: CaptionOpts
+): { shown: Span; spoken: Span; text: string }[] {
+	const ws = words.filter((w) => Number.isFinite(w.start) && Number.isFinite(w.end) && w.text.trim() !== '');
+	const groups: [number, number][] = [];
+	let chars = 0;
+	ws.forEach((w, i) => {
+		const len = w.text.trim().length;
+		const last = groups[groups.length - 1];
+		if (last && last[1] + 1 - last[0] < opts.max_words && chars + len + 1 <= opts.max_chars) {
+			last[1] = i;
+			chars += len + 1;
+		} else {
+			groups.push([i, i]);
+			chars = len;
+		}
+	});
+	const spanOf = (g: number): Span => {
+		const [first, last] = groups[g];
+		const start = ws[first].start;
+		const lastEnd = Math.max(ws[last].end, start);
+		const next = groups[g + 1];
+		const end = next
+			? Math.min(ws[next[0]].start, lastEnd + CAPTION_HOLD)
+			: Math.min(lastEnd + CAPTION_HOLD, Math.max(segEnd, lastEnd));
+		return { start, end: Math.max(end, start) };
+	};
+	const textOf = ([first, last]: [number, number]) =>
+		ws
+			.slice(first, last + 1)
+			.map((w) => w.text.trim())
+			.join(' ');
+	while (groups.length >= 2) {
+		const i = groups.findIndex((_, g) => {
+			const r = spanOf(g);
+			return r.end - r.start < opts.min_line;
+		});
+		if (i < 0) break;
+		const mergeBack =
+			i > 0 && (i + 1 === groups.length || textOf(groups[i - 1]).length <= textOf(groups[i + 1]).length);
+		const into = mergeBack ? i - 1 : i;
+		const [, last] = groups.splice(into + 1, 1)[0];
+		groups[into][1] = last;
+	}
+	return groups.map((g, i) => ({
+		shown: spanOf(i),
+		spoken: { start: ws[g[0]].start, end: Math.max(ws[g[1]].end, ws[g[0]].start) },
+		text: textOf(g)
+	}));
 }
 
 /** One caption line on its way to the screen: when, what, and which input it was
@@ -244,6 +308,22 @@ export function projectThroughClips(
 			const text = seg.text.trim();
 			const timed = Number.isFinite(seg.start) && Number.isFinite(seg.end) && seg.end > seg.start;
 			if (!text || !timed || !coversSource(clip, seg.start, seg.end)) return;
+			if (seg.words?.length) {
+				const toTimeline = (r: Span): Span => {
+					const x = sourceToTimeline(clip, r.start);
+					const y = sourceToTimeline(clip, r.end);
+					return { start: Math.min(x, y), end: Math.max(x, y) };
+				};
+				for (const chunk of wordChunks(seg.words, seg.end, opts)) {
+					const said = toTimeline(chunk.spoken);
+					const span = toTimeline(chunk.shown);
+					const start = Math.max(span.start, window.start);
+					const end = Math.min(span.end, window.end);
+					const heard = Math.min(said.end, window.end) > Math.max(said.start, window.start);
+					if (heard && end - start >= opts.min_visible) lines.push({ start, end, text: chunk.text, origin });
+				}
+				return;
+			}
 			const a = sourceToTimeline(clip, seg.start);
 			const b = sourceToTimeline(clip, seg.end);
 			pushCaptionLines(lines, text, { start: Math.min(a, b), end: Math.max(a, b) }, window, origin, opts);
