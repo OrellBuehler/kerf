@@ -423,6 +423,26 @@ class EditorUi {
 		}
 	}
 
+	/** Re-time an asset's transcript words and label its speakers, shown and stoppable like an
+	 *  analysis pass. Resolves the speaker count, or null when it was stopped. */
+	async refineTranscript(assetId: string): Promise<number | null> {
+		this.analyzing = true;
+		this.analyzingId = assetId;
+		this.analysisStage = null;
+		try {
+			const analysis = await editor.refineTranscript(assetId);
+			return new Set(analysis.transcript.map((s) => s.speaker).filter(Boolean)).size;
+		} catch (e) {
+			if (isCancelled(e)) return null;
+			throw e;
+		} finally {
+			this.analyzing = false;
+			this.analyzingId = null;
+			this.analysisStage = null;
+			this.stoppingAnalysis = false;
+		}
+	}
+
 	/** Say which steps of a run failed (the backend carries on without them, so the run itself
 	 *  succeeded). Only the kinds this run asked for — an earlier failure is not news. */
 	private reportFailedSteps(assetId: string, steps?: readonly AnalysisKind[]) {

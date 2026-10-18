@@ -7,6 +7,7 @@ import {
 	addReframeKeyframe,
 	addOverlay,
 	analyzeAsset,
+	refineTranscript,
 	generateCaptions,
 	clearCaptions,
 	importCaptions,
@@ -687,6 +688,17 @@ class EditorState {
 	 *  merge the result into local caches. */
 	async analyze(assetId: string, steps?: readonly AnalysisKind[]): Promise<AssetAnalysis> {
 		const analysis = await analyzeAsset(assetId, steps);
+		this.analyses[assetId] = analysis;
+		if (assetId === this.selectedAssetId && this.selectedMetadata) {
+			this.selectedMetadata = { ...this.selectedMetadata, analysis };
+		}
+		return analysis;
+	}
+
+	/** Re-time the selected asset's transcript words and label its speakers, keeping the
+	 *  local caches in step. */
+	async refineTranscript(assetId: string): Promise<AssetAnalysis> {
+		const analysis = await refineTranscript(assetId);
 		this.analyses[assetId] = analysis;
 		if (assetId === this.selectedAssetId && this.selectedMetadata) {
 			this.selectedMetadata = { ...this.selectedMetadata, analysis };

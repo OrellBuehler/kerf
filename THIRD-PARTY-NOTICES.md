@@ -7,6 +7,9 @@ used under the MIT License below. The adapted code is listed here.
 
 - `crates/kerf-app/src/mcp/args.rs` — from FilmCraft `crates/automation/src/server.rs` (the strict-argument check)
 - `crates/kerf-app/src/mcp.rs` (`every_tool_is_titled_and_annotated`) — from FilmCraft `crates/automation/src/server.rs` (`tools_are_titled_and_annotated`)
+- `crates/kerf-core/src/engine/vad.rs` — from FilmCraft `crates/speech/src/vad.rs`
+- `crates/kerf-core/src/engine/diarize.rs` — from FilmCraft `crates/speech/src/diarize.rs`
+- `crates/kerf-core/src/engine/mel.rs` — from FilmCraft `crates/speech/src/mel.rs`
 
 ## FilmCraft license
 

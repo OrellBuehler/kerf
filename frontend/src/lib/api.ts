@@ -132,6 +132,7 @@ import { renderedFps } from './timecode';
 import { playbackFps } from './playback-sync';
 import { parsePlaybackMessage } from './frame-transport';
 import { captionsForTimeline, resolveCaptions } from './captions';
+import { estimateWords } from './transcript';
 import { describeError, logFrontend } from './log';
 import { parseLaunchRequest } from './launch';
 import { DEV_MODEL_BYTES, STEM_NAMES, STEMS_CANCELLED, devStemAssets, placeStems } from './stems';
@@ -218,9 +219,9 @@ const sampleAnalysis: Record<string, AssetAnalysis> = {
 		],
 		scene_changes: [0, 30, 75, 110],
 		transcript: [
-			{ start: 0, end: 5.5, text: 'Welcome back to the channel.' },
-			{ start: 5.5, end: 12.5, text: 'Today we are talking about non-destructive editing.' },
-			{ start: 14, end: 22, text: 'The agent watches the footage with you and proposes a cut.' }
+			{ start: 0, end: 5.5, text: 'Welcome back to the channel.', speaker: 'S1' },
+			{ start: 5.5, end: 12.5, text: 'Today we are talking about non-destructive editing.', speaker: 'S1' },
+			{ start: 14, end: 22, text: 'The agent watches the footage with you and proposes a cut.', speaker: 'S2' }
 		],
 		loudness: { integrated_lufs: -16.2, loudness_range: 6.4, true_peak_dbtp: -1.5, threshold_lufs: -26.5 },
 		onsets: [0.5, 1.2, 2.0, 2.8, 3.6, 5.6],
@@ -2580,6 +2581,22 @@ export async function pickCaptionFile(): Promise<CaptionFilePick | null> {
 	});
 	if (typeof selected !== 'string') return null;
 	return { kind: 'path', path: selected, name: baseName(selected) };
+}
+
+/** Re-time an asset's cached transcript to the speech energy and label its speakers (`S1`,
+ *  `S2`, …) without re-transcribing. The harness spreads each line's words by character share
+ *  and keeps the speakers it was seeded with. */
+export async function refineTranscript(assetId: string): Promise<AssetAnalysis> {
+	if (!inTauri()) {
+		const analysis = sampleAnalysis[assetId];
+		if (!analysis?.transcript.length) throw new Error('asset has no transcript; transcribe it first');
+		analysis.transcript = analysis.transcript.map((seg) => {
+			const speaker = seg.speaker ?? 'S1';
+			return { ...seg, speaker, words: seg.words?.length ? seg.words : estimateWords({ ...seg, speaker }) };
+		});
+		return { ...analysis };
+	}
+	return invoke<AssetAnalysis>('refine_transcript', { assetId });
 }
 
 /** Write an asset's transcript to a `.srt` file; returns the path. */

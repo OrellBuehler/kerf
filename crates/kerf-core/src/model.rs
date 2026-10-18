@@ -614,11 +614,35 @@ pub struct TimeRange {
 }
 
 /// A transcript line with timecodes (seconds).
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TranscriptSegment {
     pub start: f64,
     pub end: f64,
     pub text: String,
+    /// The line's words with their own source times, when known (see [`crate::transcript`]).
+    /// Empty in a transcript made before words were recorded and in imported captions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<Word>,
+    /// Who speaks the line (`S1`, `S2`, …), when speakers were labelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+}
+
+/// One word of a [`TranscriptSegment`], in the asset's source time.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Word {
+    pub text: String,
+    pub start: f64,
+    pub end: f64,
+    /// The recognizer's confidence, 0..1, when it reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    /// The times were spread over the line by character share (the backend reports
+    /// none), then tightened to the speech energy.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub estimated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
 }
 
 /// EBU R128 loudness measurement of an asset's audio, from a single `loudnorm`
@@ -2393,6 +2417,10 @@ pub const MIN_CAPTION_VISIBLE: f64 = 0.15;
 pub const MIN_WORD_CAPTION: f64 = 0.12;
 pub const MIN_WORD_VISIBLE: f64 = 0.06;
 
+/// How long a word-timed caption line stays up after its last word when a pause follows
+/// (seconds): long enough to finish reading it, short enough that the pause reads as one.
+pub const CAPTION_HOLD: f64 = 0.5;
+
 /// The shape a generated caption set takes on screen.
 ///
 /// Two, because they are consumed differently. A subtitle line is *read*: it
@@ -2585,9 +2613,9 @@ fn chunk_words(text: &str, layout: CaptionLayout) -> Vec<String> {
 
 /// Spread `span` across `chunks` in proportion to how much text each carries,
 /// then merge away any line too short to read. Character share is the honest
-/// approximation available here: neither speech backend reports word timings
-/// (`TranscriptSegment` has only a start and an end), so within a segment the
-/// speaker is assumed to be at a steady pace.
+/// approximation for a line without word timings (an imported cue, or a
+/// transcript made before words were recorded): within it the speaker is
+/// assumed to be at a steady pace. A line with words goes through [`word_chunks`].
 ///
 /// The merge is repeated — join the first too-short line to its shorter
 /// neighbour, re-time everything, look again — because joining changes every
@@ -2642,6 +2670,79 @@ fn time_chunks(chunks: Vec<String>, span: TimeRange, min: f64) -> Vec<(TimeRange
         at = end;
     }
     timed
+}
+
+/// Caption lines of a transcript line whose words carry their own (source) times:
+/// grouped like [`chunk_words`], each line running from its first word's start to the
+/// next line's — or, across a pause, to its last word's end plus [`CAPTION_HOLD`] (the
+/// last line no further than the segment's end) — and a line shorter than `min` merged
+/// into its shorter neighbour, as [`time_chunks`] does. Each line comes with the span its
+/// words are spoken in (no hold), which is what has to survive a cut for it to show.
+fn word_chunks(words: &[Word], seg_end: f64, layout: CaptionLayout) -> Vec<(TimeRange, TimeRange, String)> {
+    let words: Vec<&Word> = words
+        .iter()
+        .filter(|w| w.start.is_finite() && w.end.is_finite() && !w.text.trim().is_empty())
+        .collect();
+    // Each group is the index of its first and last word.
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    let mut chars = 0usize;
+    for (i, w) in words.iter().enumerate() {
+        let len = w.text.trim().chars().count();
+        match groups.last_mut() {
+            Some((first, last)) if *last + 1 - *first < layout.max_words && chars + len < layout.max_chars => {
+                *last = i;
+                chars += len + 1;
+            }
+            _ => {
+                groups.push((i, i));
+                chars = len;
+            }
+        }
+    }
+    let span_of = |groups: &[(usize, usize)], g: usize| {
+        let (first, last) = groups[g];
+        let start = words[first].start;
+        let last_end = words[last].end.max(start);
+        let end = match groups.get(g + 1) {
+            Some(&(next, _)) => words[next].start.min(last_end + CAPTION_HOLD),
+            None => (last_end + CAPTION_HOLD).min(seg_end.max(last_end)),
+        };
+        TimeRange {
+            start,
+            end: end.max(start),
+        }
+    };
+    let text_of = |(first, last): (usize, usize)| {
+        words[first..=last]
+            .iter()
+            .map(|w| w.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let chars_of = |g: (usize, usize)| text_of(g).chars().count();
+    while groups.len() >= 2 {
+        let Some(i) = (0..groups.len()).find(|&g| {
+            let r = span_of(&groups, g);
+            r.end - r.start < layout.min_line
+        }) else {
+            break;
+        };
+        let merge_back = i > 0 && (i + 1 == groups.len() || chars_of(groups[i - 1]) <= chars_of(groups[i + 1]));
+        let into = if merge_back { i - 1 } else { i };
+        let (_, last) = groups.remove(into + 1);
+        groups[into].1 = last;
+    }
+    (0..groups.len())
+        .map(|g| {
+            let shown = span_of(&groups, g);
+            let (first, last) = groups[g];
+            let spoken = TimeRange {
+                start: words[first].start,
+                end: words[last].end.max(words[first].start),
+            };
+            (shown, spoken, text_of(groups[g]))
+        })
+        .collect()
 }
 
 /// One caption line on its way to the screen: when, what, and which input it
@@ -2700,6 +2801,22 @@ fn project_through_clips<'a>(
                 let text = seg.text.trim();
                 let timed = seg.start.is_finite() && seg.end.is_finite() && seg.end > seg.start;
                 if text.is_empty() || !timed || !clip.covers_source(seg.start, seg.end) {
+                    continue;
+                }
+                if !seg.words.is_empty() {
+                    for (shown, spoken, chunk) in word_chunks(&seg.words, seg.end, layout) {
+                        let said = clip.source_span_to_timeline(spoken.start, spoken.end);
+                        let span = clip.source_span_to_timeline(shown.start, shown.end);
+                        let start = span.start.max(window.0);
+                        let end = span.end.min(window.1);
+                        if said.end.min(window.1) > said.start.max(window.0) && end - start >= layout.min_visible {
+                            lines.push(CaptionLine {
+                                range: TimeRange { start, end },
+                                text: chunk,
+                                origin,
+                            });
+                        }
+                    }
                     continue;
                 }
                 let span = clip.source_span_to_timeline(seg.start, seg.end);
@@ -8165,6 +8282,7 @@ mod tests {
             start,
             end,
             text: text.to_string(),
+            ..Default::default()
         }
     }
 
@@ -8189,6 +8307,87 @@ mod tests {
             format: None,
             master: Default::default(),
         }
+    }
+
+    fn timed(text: &str, words: &[(&str, f64, f64)]) -> TranscriptSegment {
+        let (start, end) = (words[0].1, words[words.len() - 1].2);
+        TranscriptSegment {
+            start,
+            end: end + 1.0,
+            text: text.to_string(),
+            words: words
+                .iter()
+                .map(|(t, a, b)| Word {
+                    text: t.to_string(),
+                    start: *a,
+                    end: *b,
+                    ..Word::default()
+                })
+                .collect(),
+            speaker: None,
+        }
+    }
+
+    #[test]
+    fn word_timed_lines_follow_the_words_and_their_pauses() {
+        let asset = Uuid::new_v4();
+        let timeline = one_clip(Clip::new(asset, 0.0, 20.0, 0.0));
+        let line = timed(
+            "one two three four five six",
+            &[
+                ("one", 0.0, 0.3),
+                ("two", 0.3, 0.6),
+                ("three", 0.6, 1.0),
+                ("four", 1.0, 1.4),
+                ("five", 4.0, 4.4),
+                ("six", 4.4, 5.0),
+            ],
+        );
+        assert_eq!(
+            captioned(&timeline, asset, vec![line]),
+            vec![
+                ("one two three four".to_string(), 0.0, 1.9),
+                ("five six".to_string(), 4.0, 5.5)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_short_word_timed_line_merges_into_its_neighbour() {
+        let asset = Uuid::new_v4();
+        let timeline = one_clip(Clip::new(asset, 0.0, 20.0, 0.0));
+        let opts = CaptionOptions {
+            style: CaptionStyle::Lines,
+            max_words: Some(1),
+            ..CaptionOptions::default()
+        };
+        let line = timed("a long", &[("a", 0.0, 0.1), ("long", 0.1, 1.0)]);
+        let got: Vec<(String, f64, f64)> = timeline
+            .captions(&HashMap::from([(asset, vec![line])]), opts)
+            .into_iter()
+            .map(|o| (o.text, o.start, o.end))
+            .collect();
+        assert_eq!(got, vec![("a long".to_string(), 0.0, 1.5)]);
+    }
+
+    #[test]
+    fn word_timed_lines_project_through_trim_and_speed() {
+        let asset = Uuid::new_v4();
+        let mut clip = Clip::new(asset, 2.0, 10.0, 5.0);
+        clip.speed = 2.0;
+        let timeline = one_clip(clip);
+        let line = timed("cut kept", &[("cut", 1.0, 1.9), ("kept", 4.0, 5.0)]);
+        // `cut` is spoken before the in-point (its hold reaching past it shows nothing);
+        // `kept` lands at 5 + (4 - 2) / 2 = 6.
+        let got: Vec<(String, f64, f64)> = timeline
+            .captions(
+                &HashMap::from([(asset, vec![line])]),
+                CaptionOptions::styled(CaptionStyle::WordPunch),
+            )
+            .into_iter()
+            .map(|o| (o.text, o.start, o.end))
+            .collect();
+        assert_eq!(got, vec![("kept".to_string(), 6.0, 6.75)]);
     }
 
     #[test]

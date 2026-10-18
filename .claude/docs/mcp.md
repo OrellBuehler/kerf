@@ -234,6 +234,19 @@ the audience), and `export_cover` writes the thumbnail.
 out, since an agent that does not know its edits are held back would report a cut
 the user has not got.
 
+**Transcript reads.** Words are most of a transcript (~1.4 MB for two hours), so `analyze_asset` and
+`get_asset_metadata` strip them (`without_words`). `get_transcript { asset_id, words?, speaker?, from?,
+to?, limit? }` returns the lines overlapping the source window with their `speaker`, at most `limit`
+(default 200, ≤ 2000) with `next_from` to page on; `words: true` (default false) adds the words,
+estimated on the fly for a transcript cached before words were recorded. `speaker_ranges { asset_id,
+speaker?, join_gap? }` (gap clamped 0..10 s, default 0.75) is "cut to speaker": each speaker's
+source-time ranges (by each word's label, not the line's majority) and speaking time.
+`find_filler_words { asset_id, fillers? }` (≤ 100) returns fillers by word bounds for
+`cut_clip_range`. `refine_transcript { asset_id }` re-times words and labels speakers on a cached
+transcript through `crate::run_refine`, the Tauri command's body: background lane, `analysis-progress`,
+stopped by `analysis_cancel`, refused if a newer transcript landed meanwhile, `analysis-status` after
+(not `project-changed`: only analysis moved).
+
 **Proxies and analysis steps.** `analyze_asset { asset_id, steps? }` runs only the named kinds
 (`silence`, `scenes`, `loudness`, `rhythm`, `transcript`, `all`; aliases such as `tempo` / `transcription`
 parse) and merges them into the cache; omitted, it runs what the user left on in Settings ›

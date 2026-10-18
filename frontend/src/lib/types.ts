@@ -69,6 +69,23 @@ export interface TranscriptSegment {
 	start: number;
 	end: number;
 	text: string;
+	/** The line's words with their own source times, when known. Absent in a transcript
+	 *  made before words were recorded and in imported captions. */
+	words?: Word[];
+	/** Who speaks the line (`S1`, `S2`, …), when speakers were labelled. */
+	speaker?: string | null;
+}
+
+/** One word of a transcript line, in the asset's source time. */
+export interface Word {
+	text: string;
+	start: number;
+	end: number;
+	confidence?: number | null;
+	/** Spread over the line by character share (the backend reports no word times), then
+	 *  tightened to the speech energy. */
+	estimated?: boolean;
+	speaker?: string | null;
 }
 
 export interface Loudness {
