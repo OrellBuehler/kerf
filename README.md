@@ -113,11 +113,13 @@ and (for the default `ffmpeg` feature) the FFmpeg development libraries + `clang
 ## Driving Kerf from an LLM
 
 The desktop app hosts the MCP server over streamable HTTP at `127.0.0.1:7777/mcp`
-(override with `KERF_MCP_ADDR`). Start the app, then point an MCP client at it — e.g.
-with Claude Code:
+(change it in Settings › Agent, or with `KERF_MCP_ADDR`). Every request must carry the
+bearer token Kerf made on first start; Settings › Agent shows it with the exact commands
+below filled in. Start the app, then point an MCP client at it — e.g. with Claude Code:
 
 ```bash
-claude mcp add --transport http kerf http://127.0.0.1:7777/mcp
+claude mcp add --transport http kerf http://127.0.0.1:7777/mcp \
+  --header "Authorization: Bearer <token>"
 ```
 
 …or in any MCP client config that supports HTTP servers:
@@ -125,25 +127,32 @@ claude mcp add --transport http kerf http://127.0.0.1:7777/mcp
 ```json
 {
   "mcpServers": {
-    "kerf": { "type": "http", "url": "http://127.0.0.1:7777/mcp" }
+    "kerf": {
+      "type": "http",
+      "url": "http://127.0.0.1:7777/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
   }
 }
 ```
+
+An agent's edits wait in a proposal for you to accept (all of it, or only some changes)
+unless you switch review off in the same place.
 
 Now ask the agent to work on the project you have open — _"skim the interview clip, cut
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (87)
+### The tools (146)
 
 <details>
 <summary><b>See / analyze</b></summary>
 
-`list_assets` · `import_asset` · `get_asset_metadata` · `analyze_asset` ·
-`get_timeline_state` · `timeline_summary` · `get_waveform` · `get_energy` ·
+`list_assets` · `import_asset` · `get_asset_metadata` · `analyze_asset` · `get_transcript` ·
+`get_analysis_detail` · `get_timeline_state` · `timeline_summary` · `get_waveform` · `get_energy` ·
 **`get_frame`** (drill-in frame) · **`skim_asset`** (contact-sheet montage) ·
 **`preview_timeline`** (the composited cut) · **`preview_svg_overlay`** (an animated title
-as a contact sheet of moments) · `validate_svg` — the bold ones return images the model
+as a contact sheet of moments) · `preview_svg_preset` · `validate_svg` — the bold ones return images the model
 can see, and `get_frame` / `preview_timeline` take a `region` to **zoom** into a quarter of
 the frame at full source detail.
 </details>
@@ -181,6 +190,18 @@ the frame at full source detail.
 `list_tasks` · `add_task` · `claim_next_task` · `complete_task` · `fail_task` ·
 `resolve_task` · `remove_task` · `history` · `undo` · `redo` · `revert_to` ·
 `transcription_status` · `set_speech_model` · `download_speech_model`
+</details>
+
+<details>
+<summary><b>Project, review & background jobs</b></summary>
+
+`project_info` · `save_project` · `save_project_as` · `open_project` · `new_project` ·
+`get_settings` · `set_settings` · `undo_staged_edit` · `restore_discarded_edits` ·
+`apply_staged_subset` · `job_status` · `cancel_job` · `list_jobs` — the long tools
+(`export`, `export_variants`, `analyze_asset`, `generate_voiceover`, `separate_stems`,
+`download_speech_model`, `import_asset`, `smart_crop`) take `background: true` and answer a
+`job_id` at once. Applying a proposal is refused to an agent while you have review on;
+`undo`, `redo` and `revert_to` are too, since they would rewrite your live cut.
 </details>
 
 Every mutating tool emits a `project-changed` event, so the agent's proposal appears in
@@ -271,7 +292,7 @@ kerf/
 │   │   └── engine/           #   cli.rs (binaries, always on) + ffmpeg.rs (in-process libav)
 │   └── kerf-app/             # Tauri v2 shell
 │       ├── lib.rs            #   one Arc<Mutex<Project>> shared by both surfaces
-│       └── mcp.rs            #   embedded rmcp streamable-HTTP MCP server
+│       └── mcp.rs (+ mcp/)   #   embedded rmcp streamable-HTTP MCP server, auth, jobs
 ├── frontend/                 # SvelteKit 2 / Svelte 5 (runes) / Tailwind 4 / shadcn-svelte
 └── site/                     # Hugo landing site (deployed to GitHub Pages)
 ```

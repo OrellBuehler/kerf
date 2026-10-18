@@ -1536,3 +1536,42 @@ export interface MusicFitted {
 	timeline: Timeline;
 	report: MusicFitReport;
 }
+
+// ---- agent connection (MCP server): `crates/kerf-app/src/mcp_commands.rs` ---------
+
+/** What the Agent settings page shows and the user copies into an MCP client
+ *  (`McpConnectionInfo`). The token is a secret: show it on request, never log it. */
+export interface McpConnectionInfo {
+	/** Whether the server is switched on. */
+	enabled: boolean;
+	/** Where a client connects, e.g. `http://127.0.0.1:7777/mcp`. */
+	url: string;
+	/** Whether requests must carry `Authorization: Bearer <token>`. */
+	require_token: boolean;
+	/** The bearer token (made on the first start), even while it is not required. */
+	token: string | null;
+	/** Whether the listener is up now. */
+	running: boolean;
+	/** Why it is not, when it should be (the port is taken, the address is refused). */
+	error: string | null;
+	/** The stored address (`null` is the default `127.0.0.1:7777`); what the address field edits. */
+	configured_addr: string | null;
+	/** `KERF_MCP_ADDR` is set in the environment and wins over `configured_addr`. */
+	env_override: boolean;
+	/** Whether an agent's edits wait for the user's review (the default). */
+	agent_review: boolean;
+	/** The one-line command that adds Kerf to Claude Code. */
+	claude_code_command: string;
+	/** A `mcpServers` JSON snippet for any other MCP client. */
+	generic_json_config: string;
+}
+
+/** The agent switches `set_mcp_settings` takes — any of them. The server restarts by itself when
+ *  the address or the enabled switch moves; a token or requirement change applies at once. */
+export interface McpSettingsPatch {
+	mcp_enabled?: boolean;
+	/** `host:port`; `null` goes back to the default. A network address needs the token. */
+	mcp_addr?: string | null;
+	mcp_require_token?: boolean;
+	agent_review?: boolean;
+}

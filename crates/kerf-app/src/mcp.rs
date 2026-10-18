@@ -22,18 +22,24 @@ use kerf_core::{
     SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange, Timeline, Transition, TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities, ServerConfig};
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::service::{RequestContext, RoleServer};
-use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
-};
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
-/// Default localhost bind address for the MCP endpoint; override with `KERF_MCP_ADDR`.
-const DEFAULT_ADDR: &str = "127.0.0.1:7777";
+mod jobs;
+mod project_tools;
+mod reads;
+mod server;
+
+use jobs::Run;
+pub(crate) use server::bind_problem;
+pub use server::{
+    check_addr, check_token, connection_info, endpoint_url, generate_token, server_error, settings_changed, start,
+    ConnectionInfo, DEFAULT_ADDR,
+};
 
 /// Ceilings on the sizes a tool call may ask for. These numbers reach us from a
 /// model reading a schema description, not from a UI slider, so they are
@@ -56,6 +62,11 @@ const SVG_INLINE_LIMIT: usize = 4 * 1024;
 pub struct KerfMcp {
     project: Arc<Mutex<Project>>,
     app: AppHandle,
+    /// The rmcp session this server instance belongs to (the `Mcp-Session-Id` the client sends).
+    /// rmcp makes one instance per session, so this is the agent's identity: it owns the
+    /// proposal its edits open, and no other session may touch it. `None` for a client that
+    /// keeps no session.
+    session: Arc<Mutex<Option<String>>>,
 }
 
 // ---- tool parameter schemas ------------------------------------------------
@@ -75,6 +86,24 @@ struct ApplyStagedParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ApplySubsetParams {
+    #[schemars(
+        description = "The `id`s of the staged_diff entries to apply (for example `clip_added:<clip id>`); the rest stay in the proposal"
+    )]
+    entry_ids: Vec<String>,
+    #[schemars(description = "Apply even though the user has edited the timeline since these edits were staged. Default false.")]
+    force: Option<bool>,
+}
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+struct PageParams {
+    #[schemars(description = "Skip this many of the newest entries (default 0), to page back through older ones")]
+    offset: Option<usize>,
+    #[schemars(description = "Most entries to return (default 50, at most 500)")]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct RevisionDiffParams {
     #[schemars(description = "Revision seq to explain (see history); the diff is from the revision before it")]
     seq: i64,
@@ -86,6 +115,10 @@ struct RevisionDiffParams {
 struct ImportParams {
     #[schemars(description = "Absolute path to the media file to import")]
     path: String,
+    #[schemars(
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+    )]
+    background: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -108,6 +141,10 @@ struct AnalyzeParams {
                        before snap_to_beats, `transcript` before generate_captions."
     )]
     steps: Option<Vec<String>>,
+    #[schemars(
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+    )]
+    background: Option<bool>,
 }
 
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
@@ -142,6 +179,22 @@ struct VoiceoverParams {
         description = "Ripple override for placing the narration. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, narration placed over footage already on the track pushes that footage and everything after it later by its length; appending, or filling free space, moves nothing either way. false places it without moving anything. Tracks ripple independently. Ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
     )]
     ripple: Option<bool>,
+    #[schemars(
+        description = "With caption_style: most words on one caption line (lines: 4, word_punch: 1); see generate_captions"
+    )]
+    caption_max_words: Option<usize>,
+    #[schemars(description = "With caption_style: most characters on one caption line (default 28)")]
+    caption_max_chars: Option<usize>,
+    #[schemars(
+        description = "With caption_style: vertical position as a fraction of frame height, 0 = top (lines: 0.88, word_punch: 0.72)"
+    )]
+    caption_pos_y: Option<f64>,
+    #[schemars(description = "With caption_style: font height as a fraction of frame height (lines: 0.05, word_punch: 0.11)")]
+    caption_size: Option<f64>,
+    #[schemars(
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+    )]
+    background: Option<bool>,
 }
 
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
@@ -204,6 +257,18 @@ struct SpeechModelParams {
         description = "whisper.cpp model name (tiny, base, small, medium, large-v3-turbo, or an `.en` variant); omit for the default"
     )]
     name: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct DownloadModelParams {
+    #[schemars(
+        description = "whisper.cpp model name (tiny, base, small, medium, large-v3-turbo, or an `.en` variant); omit for the default"
+    )]
+    name: Option<String>,
+    #[schemars(
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+    )]
+    background: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -419,6 +484,10 @@ struct TrackIdParams {
 struct SmartCropParams {
     #[schemars(description = "UUID of the clip to reframe; every clip on an unlocked video track when omitted")]
     clip_id: Option<String>,
+    #[schemars(
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+    )]
+    background: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -439,6 +508,10 @@ struct SeparateStemsParams {
         description = "UUID of a clip of that asset to lay the stems under: each stem goes on its own new audio track at the clip's position and span, and the clip's own sound is switched off. Omit to only add the stems to the library"
     )]
     clip_id: Option<String>,
+    #[schemars(
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+    )]
+    background: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -665,6 +738,12 @@ struct PlatformCheckParams {
         description = "Judge only this span of the cut, {start, end} in timeline seconds — what an export with the same `range` would write. Omit for the whole cut"
     )]
     range: Option<TimeRange>,
+    #[schemars(
+        description = "Judge the cut at this frame width in pixels instead of the project's own — the size an export with `options.resolution` would write. Give it with `height`. Omit both to use the project's frame"
+    )]
+    width: Option<u32>,
+    #[schemars(description = "Frame height in pixels; see `width`")]
+    height: Option<u32>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1164,11 +1243,39 @@ struct PreviewSvgOverlayParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PreviewSvgPresetParams {
+    #[schemars(description = "The ready-made title to draw (see list_svg_presets)")]
+    preset: SvgPresetKind,
+    #[schemars(description = "What fills it, as for add_svg_overlay (`text` is required)")]
+    params: SvgPresetParams,
+    #[schemars(description = "How long the title would run, in seconds (default 4): a preset times its animation to its length")]
+    duration: Option<f64>,
+    #[schemars(description = "The moments to draw, in seconds after the title appears. At most 36. Not together with `count`")]
+    times: Option<Vec<f64>>,
+    #[schemars(
+        description = "How many moments to draw, spread evenly from the first frame to the end (default 6, at most 36). Not together with `times`"
+    )]
+    count: Option<u32>,
+    #[schemars(description = "Width in pixels of each cell of the sheet (default 480, 64 to 960)")]
+    max_width: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct TimelineStateParams {
     #[schemars(
         description = "Return every animated SVG title's source however long it is. By default a source over 4 KiB is replaced by a note with its size"
     )]
     full_svg: Option<bool>,
+    #[schemars(
+        description = "Return every overlay inline, generated captions included, and every SVG source whole. By default the generated captions (often hundreds) are left out of `overlays` and shown as a window under `captions`."
+    )]
+    full: Option<bool>,
+    #[schemars(
+        description = "Which generated caption the `captions` window starts at (default 0); `captions.next_offset` is the next page"
+    )]
+    captions_offset: Option<usize>,
+    #[schemars(description = "How many generated captions the window holds (default 20, at most 500)")]
+    captions_limit: Option<usize>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1237,6 +1344,10 @@ struct ExportParams {
         description = "Overwrite an existing file at output_path (default false — the call fails naming the path so you can pick a new one or opt in)"
     )]
     overwrite: Option<bool>,
+    #[schemars(
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+    )]
+    background: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1269,6 +1380,10 @@ struct ExportVariantsParams {
                               first existing path so you can pick a new base path or opt in)"
     )]
     overwrite: Option<bool>,
+    #[schemars(
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+    )]
+    background: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1427,22 +1542,12 @@ struct CoverParams {
     overwrite: Option<bool>,
 }
 
-#[derive(Serialize)]
-struct AssetMetadata {
-    asset: kerf_core::Asset,
-    analysis: Option<kerf_core::AssetAnalysis>,
-    /// Which analyses are done, running, failed or switched off.
-    analysis_status: kerf_core::AnalysisStatus,
-    /// The preview proxy: ready, building (with `fraction`), failed (with `reason`), …
-    proxy: kerf_core::ProxyStatus,
-}
-
-/// What `analyze_asset` returns: the cached analysis (as it always was) with what the run
-/// did beside it.
+/// What `analyze_asset` returns: a summary of the cached analysis (counts, not lists — see
+/// `get_transcript` / `get_analysis_detail`) with what the run did beside it.
 #[derive(Serialize)]
 struct AnalyzeResult {
     #[serde(flatten)]
-    analysis: kerf_core::AssetAnalysis,
+    analysis: reads::AnalysisSummary,
     analysis_status: kerf_core::AnalysisStatus,
     /// Steps that failed, with why; the others still landed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1483,6 +1588,11 @@ struct TrackSummary {
     /// sound lives on an audio clip). Omitted when none.
     #[serde(skip_serializing_if = "is_zero")]
     detached_sound_clips: usize,
+    /// How many clips here are cut from media whose preview proxy is not ready (queued, building,
+    /// failed, missing or switched off): previews of them decode the original and are slower.
+    /// Omitted when none are.
+    #[serde(skip_serializing_if = "is_zero")]
+    clips_without_proxy: usize,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -1706,6 +1816,10 @@ struct TimelineSummary {
     /// the cut the user is looking at. `staged_diff` spells out the difference.
     #[serde(skip_serializing_if = "Option::is_none")]
     staged_changes: Option<usize>,
+    /// The media this cut uses whose preview proxy is not ready, or whose source file is gone.
+    /// Absent when everything is ready.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    media_notes: Vec<reads::MediaNote>,
 }
 
 // ---- tools -----------------------------------------------------------------
@@ -1721,69 +1835,57 @@ impl KerfMcp {
 
     #[tool(
         description = "Import a media file into the project and return the Asset (probed streams, duration, \
-                       resolution, fps, codecs). Importing a file the project already holds resolves to that \
+                       resolution, fps, codecs). `path` must be an absolute path to a media file on this computer \
+                       (a URL, an ffmpeg protocol such as concat: or pipe:, a relative path or a missing file is \
+                       refused at once). Importing a file the project already holds resolves to that \
                        asset instead of duplicating it, so this is safe to re-run. One Insta360 lens file pulls \
                        in its sibling and stitches the pair into a single 360 asset — a full re-encode that can \
-                       run for minutes. An import is NOT part of your staged proposal: media lands for the user \
+                       run for minutes (send a `progressToken` for progress, cancel the request to stop it, or pass \
+                       `background: true` to run it as a background job). An import is NOT part of your staged proposal: media lands for the user \
                        immediately, because a file on disk is not an edit to their cut."
     )]
-    async fn import_asset(&self, Parameters(p): Parameters<ImportParams>) -> Result<String, McpError> {
-        let project = self.project.clone();
-        let app = self.app.clone();
-        let path = p.path;
-        let asset = blocking(move || {
-            // Probe (and, for a lens pair, stitch) with the lock released, taking
-            // it only for the quick insert — the same shape as the GUI's import,
-            // so a multi-minute stitch never freezes the user's editing.
-            let mut on_progress = |pr: kerf_core::ExportProgress| {
-                let _ = app.emit("import-progress", crate::ImportProgress::new(&path, pr));
-            };
-            let probed = Project::probe_import(std::path::Path::new(&path), &mut on_progress).map_err(core_err)?;
-            let asset = lock_agent(&project).insert_or_get_asset(&probed).map_err(core_err)?;
-            // Preview decodes come off a proxy; queue it now so the first frame anyone asks for
-            // is not a seek into a long GOP. It takes its place in front of any analysis the
-            // agent starts next (`kerf_core::proxy`), and may run a cached ffprobe, which is why
-            // it is here on the blocking pool and not in the async tool body.
-            crate::spawn_proxy(&app, &asset);
-            Ok(asset)
-        })
-        .await?;
-        self.changed();
-        json(&asset)
-    }
-
-    #[tool(description = "List all media assets in the project")]
-    fn list_assets(&self) -> Result<String, McpError> {
-        let project = self.lock();
-        json(&project.list_assets().map_err(core_err)?)
-    }
-
-    #[tool(
-        description = "Get an asset's probed metadata and cached analysis (silence, scenes, transcript, EBU R128 loudness, onset times, tempo/beat grid, speech/music class), \
-                       `analysis_status` (per kind: done / not_run / running / failed with a reason / off) and `proxy` \
-                       (the preview proxy: ready, building with a fraction, failed with a reason, off or not_needed)"
-    )]
-    async fn get_asset_metadata(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
-        let id = parse_id(&p.asset_id)?;
-        let project = self.project.clone();
-        let meta = blocking(move || {
-            let (input, analysis) = {
-                let project = lock_agent(&project);
-                (
-                    project.proxy_input(id).map_err(core_err)?,
-                    project.get_analysis(id).map_err(core_err)?,
-                )
-            };
-            // The proxy's state touches the disk (and, once per file, a cached ffprobe): lock released.
-            Ok(AssetMetadata {
-                analysis_status: kerf_core::analysis_status(id, analysis.as_ref()),
-                proxy: kerf_core::proxy::status(&input),
-                asset: input.asset,
-                analysis,
+    async fn import_asset(
+        &self,
+        Parameters(p): Parameters<ImportParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
+        // Absolute, an existing regular file, no URL or ffmpeg protocol: said now, on the call,
+        // not by a background job a moment later.
+        kerf_core::paths::validate_import_path(std::path::Path::new(&p.path)).map_err(core_err)?;
+        let me = self.clone();
+        let owner = self.owner();
+        let generation = self.lock().generation();
+        self.long_tool("import_asset", p.background, &context, move |run| async move {
+            let (project, app) = (me.project.clone(), me.app.clone());
+            let path = p.path;
+            let asset = blocking(move || {
+                // Probe (and, for a lens pair, stitch) with the lock released, taking
+                // it only for the quick insert — the same shape as the GUI's import,
+                // so a multi-minute stitch never freezes the user's editing.
+                let mut on_progress = |pr: kerf_core::ExportProgress| {
+                    let _ = app.emit("import-progress", crate::ImportProgress::new(&path, pr));
+                    run.progress(Some(pr.fraction), "stitching the 360 pair");
+                };
+                let probed = Project::probe_import_with(std::path::Path::new(&path), &mut on_progress, &|| run.cancelled())
+                    .map_err(core_err)?;
+                let asset = {
+                    let guard = lock_agent_as(&project, owner.as_deref());
+                    // Imported into the project it was asked of, or not at all.
+                    require_generation(&guard, generation, "it was being imported")?;
+                    guard.insert_or_get_asset(&probed).map_err(core_err)?
+                };
+                // Preview decodes come off a proxy; queue it now so the first frame anyone asks for
+                // is not a seek into a long GOP. It takes its place in front of any analysis the
+                // agent starts next (`kerf_core::proxy`), and may run a cached ffprobe, which is why
+                // it is here on the blocking pool and not in the async tool body.
+                crate::spawn_proxy(&app, &asset);
+                Ok(asset)
             })
+            .await?;
+            me.changed();
+            json(&asset)
         })
-        .await?;
-        json(&meta)
+        .await
     }
 
     #[tool(
@@ -1794,7 +1896,7 @@ impl KerfMcp {
                        the original. A proxy is built before any analysis waiting for the machine."
     )]
     async fn proxy_status(&self, Parameters(p): Parameters<ProxyStatusParams>) -> Result<String, McpError> {
-        let wanted = p.asset_id.as_deref().map(parse_id).transpose()?;
+        let wanted = p.asset_id.as_deref().map(|s| parse_arg("asset_id", s)).transpose()?;
         let project = self.project.clone();
         let statuses = blocking(move || {
             let mut inputs = lock_agent(&project).proxy_inputs().map_err(core_err)?;
@@ -1817,7 +1919,7 @@ impl KerfMcp {
                        analyze_asset still has to do before an edit that reads the result."
     )]
     fn analysis_status(&self, Parameters(p): Parameters<ProxyStatusParams>) -> Result<String, McpError> {
-        let wanted = p.asset_id.as_deref().map(parse_id).transpose()?;
+        let wanted = p.asset_id.as_deref().map(|s| parse_arg("asset_id", s)).transpose()?;
         let project = self.lock();
         match wanted {
             Some(id) => {
@@ -1835,7 +1937,7 @@ impl KerfMcp {
                        for its progress. Not part of your staged proposal — a proxy is a cache, not an edit."
     )]
     async fn rebuild_proxy(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
-        let id = parse_id(&p.asset_id)?;
+        let id = parse_arg("asset_id", &p.asset_id)?;
         let (project, app) = (self.project.clone(), self.app.clone());
         let status = blocking(move || {
             crate::rebuild_proxy_now(&app, &|| lock_agent(&project), id).map_err(|e| McpError::invalid_params(e, None))
@@ -1850,7 +1952,7 @@ impl KerfMcp {
                        built again by itself on a later open. Returns the bytes freed and the asset's new status."
     )]
     async fn delete_proxy(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
-        let id = parse_id(&p.asset_id)?;
+        let id = parse_arg("asset_id", &p.asset_id)?;
         let (project, app) = (self.project.clone(), self.app.clone());
         let (freed, status) = blocking(move || {
             crate::delete_proxy_now(&app, &|| lock_agent(&project), id).map_err(|e| McpError::invalid_params(e, None))
@@ -1860,20 +1962,29 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Get the full non-destructive timeline state (tracks and clips). A clip with `link_id` is \
+        description = "Get the non-destructive timeline state (tracks and clips). A clip with `link_id` is \
                        linked to the other clips sharing it (a picture and its detached sound); one with \
                        `source_audio: false` is a picture whose own sound was detached and is silent — its \
-                       sound is on the linked audio clip. Both fields are absent on an ordinary clip. Animated SVG titles \
+                       sound is on the linked audio clip. Both fields are absent on an ordinary clip. Typed titles \
+                       are in `overlays`; the GENERATED captions (generate_captions / import_captions — often hundreds) \
+                       are not: `captions` is a window of them (`total`, `returned`, `next_offset`, `items`), moved with \
+                       captions_offset / captions_limit, or pass `full: true` for everything inline. Animated SVG titles \
                        (`svg_overlays`) carry their SVG source here, but a source over 4 KiB is replaced by a note with \
-                       its size (a title can be 128 KiB): pass `full_svg: true` to get every source whole. \
-                       timeline_summary lists the titles without any source, and preview_svg_overlay shows how one looks."
+                       its size (a title can be 128 KiB): pass `full_svg: true` (or `full`) to get every source whole. \
+                       timeline_summary is much smaller (durations, gaps, proxies); preview_svg_overlay shows how a title looks."
     )]
     fn get_timeline_state(&self, Parameters(p): Parameters<TimelineStateParams>) -> Result<String, McpError> {
         let mut timeline = self.lock().working_timeline().map_err(core_err)?;
-        if !p.full_svg.unwrap_or(false) {
+        let full = p.full.unwrap_or(false);
+        if !(full || p.full_svg.unwrap_or(false)) {
             elide_large_svg(&mut timeline);
         }
-        json(&timeline)
+        let view = reads::StateView {
+            full,
+            captions_offset: p.captions_offset,
+            captions_limit: p.captions_limit,
+        };
+        json(&reads::timeline_state(&timeline, &view)?)
     }
 
     #[tool(
@@ -1884,14 +1995,55 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Download a speech-to-text model (whisper.cpp ggml) into Kerf's cache, so the next analyze_asset does not wait for it. Names, smallest first: tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v3-turbo — the plain names are multilingual, `.en` ones are English-only but more accurate on English. Bigger is slower and more accurate; `base` is the default. This only fills the cache: transcription keeps using whichever model is *selected*, so to transcribe with a model you name here, call set_speech_model too. Blocks for the length of the download (75 MB to 1.6 GB) and is a no-op if the model is already cached."
+        description = "Download a speech-to-text model (whisper.cpp ggml) into Kerf's cache, so the next analyze_asset does not wait for it. Names, smallest first: tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v3-turbo — the plain names are multilingual, `.en` ones are English-only but more accurate on English. Bigger is slower and more accurate; `base` is the default. This only fills the cache: transcription keeps using whichever model is *selected*, so to transcribe with a model you name here, call set_speech_model too. The download is 75 MB to 1.6 GB and a no-op if the model is already cached; send a `progressToken` for progress (Kerf's own download bar moves too), cancel the request to stop it, or pass `background: true` and poll job_status."
     )]
-    async fn download_speech_model(&self, Parameters(p): Parameters<SpeechModelParams>) -> Result<String, McpError> {
+    async fn download_speech_model(
+        &self,
+        Parameters(p): Parameters<DownloadModelParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
         let name = p.name.unwrap_or_else(|| kerf_core::DEFAULT_SPEECH_MODEL.to_string());
-        let path =
-            blocking(move || kerf_core::download_speech_model(&name, &mut |_: kerf_core::DownloadProgress| {}).map_err(core_err))
-                .await?;
-        Ok(format!("Speech model ready at {}", path.display()))
+        let known = kerf_core::transcription_status().models;
+        if !known.iter().any(|m| m.name == name) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "unknown speech model '{name}'; expected one of: {}",
+                    known.iter().map(|m| m.name).collect::<Vec<_>>().join(", ")
+                ),
+                None,
+            ));
+        }
+        let app = self.app.clone();
+        self.long_tool("download_speech_model", p.background, &context, move |run| async move {
+            let model = name.clone();
+            let path = blocking(move || {
+                let mut on_progress = |d: kerf_core::DownloadProgress| {
+                    let fraction = d.fraction();
+                    // The same event the GUI's own download streams, so its progress bar moves too.
+                    let _ = app.emit(
+                        "model-progress",
+                        serde_json::json!({
+                            "model": model,
+                            "downloaded_bytes": d.downloaded,
+                            "total_bytes": d.total,
+                            "fraction": fraction,
+                        }),
+                    );
+                    let mb = |bytes: u64| bytes as f64 / 1_048_576.0;
+                    run.progress(
+                        fraction,
+                        match d.total {
+                            Some(total) => format!("downloading {model}: {:.0} of {:.0} MB", mb(d.downloaded), mb(total)),
+                            None => format!("downloading {model}: {:.0} MB", mb(d.downloaded)),
+                        },
+                    );
+                };
+                kerf_core::download_speech_model_cancellable(&model, &mut on_progress, &|| run.cancelled()).map_err(core_err)
+            })
+            .await?;
+            json(&serde_json::json!({ "model": name, "path": path.to_string_lossy() }))
+        })
+        .await
     }
 
     #[tool(
@@ -1903,34 +2055,71 @@ impl KerfMcp {
                        stop the others (see `failed` and `analysis_status` in the result). Transcribing downloads a \
                        speech model on first use (~148 MB) and then runs for a good fraction of the media's duration, so \
                        expect that step to be slow; see transcription_status if the transcript comes back empty. A \
-                       preview proxy that is queued is built first."
+                       preview proxy that is queued is built first. Send a `progressToken` for progress (the step and how \
+                       far it is), cancel the request — or press Stop in Kerf — to stop it, or pass `background: true` and \
+                       poll job_status. The result is a SUMMARY (counts, durations, the head of the transcript), not the \
+                       lists: read those with get_transcript and get_analysis_detail."
     )]
-    async fn analyze_asset(&self, Parameters(p): Parameters<AnalyzeParams>) -> Result<String, McpError> {
-        let id = parse_id(&p.asset_id)?;
+    async fn analyze_asset(
+        &self,
+        Parameters(p): Parameters<AnalyzeParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
+        let id = parse_arg("asset_id", &p.asset_id)?;
         let steps = crate::parse_steps(p.steps).map_err(|e| McpError::invalid_params(e, None))?;
-        let (project, app) = (self.project.clone(), self.app.clone());
-        let outcome = blocking(move || {
-            // Resolve under the lock, run the heavy ffmpeg analysis with the lock released, then
-            // re-lock only to merge it into the cache (`run_analysis`) — so analysis doesn't
-            // freeze the GUI or stall other tools for its whole (multi-second) duration. Nothing
-            // to run (everything switched off, a silent file asked for its speech) is a bad
-            // request, said so before anything starts.
-            let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
+        // Nothing to run (everything switched off, a silent file asked for its speech) is a bad
+        // request, said so before anything starts.
+        let generation = {
+            let project = self.lock();
+            let asset = project.require_asset(id).map_err(core_err)?;
             kerf_core::resolve_steps(&asset, steps.as_deref()).map_err(core_err)?;
-            crate::run_analysis(&app, &|| lock_agent(&project), id, steps.as_deref(), &|| false)
-                .map_err(|e| McpError::internal_error(e, None))
+            project.generation()
+        };
+        // The GUI's Stop button stops an agent's analysis too: it trips this flag, which a new run
+        // clears (`begin_analysis`, as the GUI's own command does) and polls.
+        let gui_stop = self.app.state::<crate::AppState>().begin_analysis();
+        let (me, owner) = (self.clone(), self.owner());
+        self.long_tool("analyze_asset", p.background, &context, move |run| async move {
+            let run = run.also_cancelled_by({
+                let stop = gui_stop.clone();
+                move || stop.load(Ordering::SeqCst)
+            });
+            let (project, app) = (me.project.clone(), me.app.clone());
+            let outcome = blocking(move || {
+                // Heavy ffmpeg analysis with the lock released, re-locking only to merge each
+                // finished step into the cache (`run_analysis`) — so analysis doesn't freeze the
+                // GUI or stall other tools for its whole (multi-second) duration.
+                let _progress = AnalysisProgressRelay::new(&app, id, &run);
+                let outcome = crate::run_analysis(
+                    &app,
+                    &|| lock_agent_as(&project, owner.as_deref()),
+                    id,
+                    steps.as_deref(),
+                    &|| run.cancelled(),
+                )
+                .map_err(|e| McpError::internal_error(e, None))?;
+                // Whatever finished was merged as it did; a project swapped in meanwhile is not
+                // told it was analysed.
+                require_generation(
+                    &lock_agent_as(&project, owner.as_deref()),
+                    generation,
+                    "it was being analysed",
+                )?;
+                Ok(outcome)
+            })
+            .await?;
+            me.changed();
+            json(&AnalyzeResult {
+                analysis: reads::AnalysisSummary::of(&outcome.analysis),
+                analysis_status: outcome.status,
+                failed: outcome
+                    .failed
+                    .into_iter()
+                    .map(|(step, reason)| FailedStep { step, reason })
+                    .collect(),
+            })
         })
-        .await?;
-        self.changed();
-        json(&AnalyzeResult {
-            analysis: outcome.analysis,
-            analysis_status: outcome.status,
-            failed: outcome
-                .failed
-                .into_iter()
-                .map(|(step, reason)| FailedStep { step, reason })
-                .collect(),
-        })
+        .await
     }
 
     #[tool(
@@ -1956,9 +2145,11 @@ impl KerfMcp {
         json(&kerf_core::transcription_status())
     }
 
-    #[tool(description = "Cut [start, end) of an asset and append it to the matching track")]
+    #[tool(
+        description = "Cut [start, end) of an asset (SOURCE seconds) and append it to the first track of the asset's main kind — the first video track for footage, the first audio track for audio-only media — after the last clip already there. It does not take a track or a position: add_clip_to_timeline does. Returns the clip."
+    )]
     fn cut_clip(&self, Parameters(p): Parameters<CutClipParams>) -> Result<String, McpError> {
-        let id = parse_id(&p.asset_id)?;
+        let id = parse_arg("asset_id", &p.asset_id)?;
         self.edit(|project| {
             let out = project.cut_clip(id, p.start, p.end).map_err(core_err)?;
             json(&out)
@@ -1971,8 +2162,8 @@ impl KerfMcp {
                        pass `ripple`) a clip dropped onto footage that is already there pushes it later."
     )]
     fn add_clip_to_timeline(&self, Parameters(p): Parameters<AddClipParams>) -> Result<String, McpError> {
-        let asset_id = parse_id(&p.asset_id)?;
-        let track_id = p.track_id.as_deref().map(parse_id).transpose()?;
+        let asset_id = parse_arg("asset_id", &p.asset_id)?;
+        let track_id = p.track_id.as_deref().map(|s| parse_arg("track_id", s)).transpose()?;
         self.edit(|project| {
             let out = project
                 .with_ripple(p.ripple, |project| {
@@ -1989,7 +2180,7 @@ impl KerfMcp {
                        linked to each other); pass link=false to split only this clip."
     )]
     fn split_at(&self, Parameters(p): Parameters<SplitParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let (left, right) = project
                 .with_links(p.link, |project| {
@@ -2010,7 +2201,7 @@ impl KerfMcp {
                        trim only this clip. Returns the clip as it ended up."
     )]
     fn trim(&self, Parameters(p): Parameters<TrimParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project
                 .with_links(p.link, |project| {
@@ -2030,8 +2221,8 @@ impl KerfMcp {
                        link=false is not offered here — use move_clip to reposition one clip."
     )]
     fn reorder(&self, Parameters(p): Parameters<ReorderParams>) -> Result<String, McpError> {
-        let track_id = parse_id(&p.track_id)?;
-        let clip_id = parse_id(&p.clip_id)?;
+        let track_id = parse_arg("track_id", &p.track_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             project.reorder(track_id, clip_id, p.new_index).map_err(core_err)?;
             Ok("ok".to_string())
@@ -2046,8 +2237,8 @@ impl KerfMcp {
                        start before 0, land on another clip or sit on a locked track refuses the move."
     )]
     fn move_clip(&self, Parameters(p): Parameters<MoveClipParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
-        let track_id = p.track_id.as_deref().map(parse_id).transpose()?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
+        let track_id = p.track_id.as_deref().map(|s| parse_arg("track_id", s)).transpose()?;
         self.edit(|project| {
             let out = project
                 .with_links(p.link, |project| project.move_clip(clip_id, p.timeline_start, track_id))
@@ -2084,7 +2275,7 @@ impl KerfMcp {
                        link=false to remove only this clip."
     )]
     fn ripple_delete(&self, Parameters(p): Parameters<RippleDeleteParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             project
                 .with_links(p.link, |project| project.ripple_delete(clip_id))
@@ -2100,7 +2291,7 @@ impl KerfMcp {
                        detached sound is cut with it); pass link=false to cut only this clip."
     )]
     fn cut_clip_range(&self, Parameters(p): Parameters<CutClipRangeParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let pieces = project
                 .with_links(p.link, |project| project.cut_clip_range(clip_id, p.from, p.to))
@@ -2121,7 +2312,7 @@ impl KerfMcp {
                        linked partner pair that shares this one rolls too (clamped to the tightest) unless link=false."
     )]
     fn roll_edit(&self, Parameters(p): Parameters<RollEditParams>) -> Result<String, McpError> {
-        let (a, b) = (parse_id(&p.clip_a)?, parse_id(&p.clip_b)?);
+        let (a, b) = (parse_arg("clip_a", &p.clip_a)?, parse_arg("clip_b", &p.clip_b)?);
         self.edit(|project| {
             let out = project
                 .with_links(p.link, |project| project.roll_edit(a, b, p.delta))
@@ -2140,7 +2331,7 @@ impl KerfMcp {
                        ripples. Linked partners slip by the same moment of footage unless link=false."
     )]
     fn slip_clip(&self, Parameters(p): Parameters<SlipClipParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project
                 .with_links(p.link, |project| project.slip_clip(clip_id, p.delta))
@@ -2162,7 +2353,7 @@ impl KerfMcp {
                        giving way and the whole slide clamped to the tightest, unless link=false."
     )]
     fn slide_clip(&self, Parameters(p): Parameters<SlideClipParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project
                 .with_links(p.link, |project| project.slide_clip(clip_id, p.delta))
@@ -2183,7 +2374,7 @@ impl KerfMcp {
                        Errors if `at` is not inside the clip or would leave under 0.05s, or the track is locked."
     )]
     fn split_remove(&self, Parameters(p): Parameters<SplitRemoveParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project
                 .with_links(p.link, |project| {
@@ -2230,7 +2421,7 @@ impl KerfMcp {
 
     #[tool(description = "Remove a track and all of its clips (refuses to remove the last track)")]
     fn remove_track(&self, Parameters(p): Parameters<TrackIdParams>) -> Result<String, McpError> {
-        let track_id = parse_id(&p.track_id)?;
+        let track_id = parse_arg("track_id", &p.track_id)?;
         self.edit(|project| {
             project.remove_track(track_id).map_err(core_err)?;
             Ok("ok".to_string())
@@ -2242,7 +2433,7 @@ impl KerfMcp {
                        other tracks, so e.g. a music bed dips automatically whenever dialogue plays"
     )]
     fn set_track_duck(&self, Parameters(p): Parameters<SetTrackDuckParams>) -> Result<String, McpError> {
-        let track_id = parse_id(&p.track_id)?;
+        let track_id = parse_arg("track_id", &p.track_id)?;
         self.edit(|project| {
             let track = project.set_track_duck(track_id, p.duck).map_err(core_err)?;
             json(&track)
@@ -2259,7 +2450,7 @@ impl KerfMcp {
                        positions are fractions of the frame, so you have to look to know you covered \
                        the right thing.")]
     fn set_mask(&self, Parameters(p): Parameters<SetMaskParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let mask = match p.shape {
                 None => None,
@@ -2303,7 +2494,7 @@ impl KerfMcp {
                        level should simply sit lower rather than dip and recover."
     )]
     fn set_track_volume(&self, Parameters(p): Parameters<SetTrackVolumeParams>) -> Result<String, McpError> {
-        let track_id = parse_id(&p.track_id)?;
+        let track_id = parse_arg("track_id", &p.track_id)?;
         self.edit(|project| {
             let track = project.set_track_volume(track_id, p.volume).map_err(core_err)?;
             json(&track)
@@ -2317,7 +2508,7 @@ impl KerfMcp {
                        this footage is watched on."
     )]
     fn set_track_pan(&self, Parameters(p): Parameters<SetTrackPanParams>) -> Result<String, McpError> {
-        let track_id = parse_id(&p.track_id)?;
+        let track_id = parse_arg("track_id", &p.track_id)?;
         self.edit(|project| {
             let track = project.set_track_pan(track_id, p.pan).map_err(core_err)?;
             json(&track)
@@ -2404,7 +2595,7 @@ impl KerfMcp {
 
     #[tool(description = "Move, rename or recolor a marker; omitted fields are left alone")]
     fn update_marker(&self, Parameters(p): Parameters<UpdateMarkerParams>) -> Result<String, McpError> {
-        let marker_id = parse_id(&p.marker_id)?;
+        let marker_id = parse_arg("marker_id", &p.marker_id)?;
         self.edit(|project| {
             let marker = project.update_marker(marker_id, p.time, p.name, p.color).map_err(core_err)?;
             json(&marker)
@@ -2413,7 +2604,7 @@ impl KerfMcp {
 
     #[tool(description = "Remove a marker from the timeline")]
     fn remove_marker(&self, Parameters(p): Parameters<MarkerIdParams>) -> Result<String, McpError> {
-        let marker_id = parse_id(&p.marker_id)?;
+        let marker_id = parse_arg("marker_id", &p.marker_id)?;
         self.edit(|project| {
             project.remove_marker(marker_id).map_err(core_err)?;
             Ok("ok".to_string())
@@ -2426,7 +2617,7 @@ impl KerfMcp {
                        without a music bed, or to park B-roll without deleting it."
     )]
     fn set_track_muted(&self, Parameters(p): Parameters<SetTrackMutedParams>) -> Result<String, McpError> {
-        let track_id = parse_id(&p.track_id)?;
+        let track_id = parse_arg("track_id", &p.track_id)?;
         self.edit(|project| {
             let track = project.set_track_muted(track_id, p.muted).map_err(core_err)?;
             json(&track)
@@ -2439,7 +2630,7 @@ impl KerfMcp {
                        bed does not blank the picture. Several tracks may be soloed at once."
     )]
     fn set_track_solo(&self, Parameters(p): Parameters<SetTrackSoloParams>) -> Result<String, McpError> {
-        let track_id = parse_id(&p.track_id)?;
+        let track_id = parse_arg("track_id", &p.track_id)?;
         self.edit(|project| {
             let track = project.set_track_solo(track_id, p.solo).map_err(core_err)?;
             json(&track)
@@ -2451,7 +2642,7 @@ impl KerfMcp {
                        refuses to drag, trim or split its clips."
     )]
     fn set_track_locked(&self, Parameters(p): Parameters<SetTrackLockedParams>) -> Result<String, McpError> {
-        let track_id = parse_id(&p.track_id)?;
+        let track_id = parse_arg("track_id", &p.track_id)?;
         self.edit(|project| {
             let track = project.set_track_locked(track_id, p.locked).map_err(core_err)?;
             json(&track)
@@ -2465,7 +2656,7 @@ impl KerfMcp {
                        leaves its linked audio clip playing, so disable that clip too."
     )]
     fn set_clip_enabled(&self, Parameters(p): Parameters<SetClipEnabledParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let clip = project.set_clip_enabled(clip_id, p.enabled).map_err(core_err)?;
             json(&clip)
@@ -2480,7 +2671,11 @@ impl KerfMcp {
                        outright if any copy would overlap, so a partial paste never lands."
     )]
     fn duplicate_clips(&self, Parameters(p): Parameters<DuplicateClipsParams>) -> Result<String, McpError> {
-        let ids = p.clip_ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<_>, _>>()?;
+        let ids = p
+            .clip_ids
+            .iter()
+            .map(|s| parse_arg("clip_ids", s))
+            .collect::<Result<Vec<_>, _>>()?;
         self.edit(|project| {
             let clips = project.duplicate_clips(&ids, p.at).map_err(core_err)?;
             json(&clips)
@@ -2493,7 +2688,7 @@ impl KerfMcp {
                        it (a picture's detached sound goes too) unless link=false."
     )]
     fn remove(&self, Parameters(p): Parameters<RemoveClipParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             project
                 .with_links(p.link, |project| {
@@ -2515,7 +2710,11 @@ impl KerfMcp {
                        moved, and how many — ripple on with nothing after the removed clips moves nothing)."
     )]
     fn remove_clips(&self, Parameters(p): Parameters<RemoveClipsParams>) -> Result<String, McpError> {
-        let ids = p.clip_ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<_>, _>>()?;
+        let ids = p
+            .clip_ids
+            .iter()
+            .map(|s| parse_arg("clip_ids", s))
+            .collect::<Result<Vec<_>, _>>()?;
         self.edit(|project| {
             // What the agent sees is the cut it is building: the proposal while it has
             // one staged, the live timeline otherwise.
@@ -2585,7 +2784,7 @@ impl KerfMcp {
                        keys (pass []) for it to apply."
     )]
     fn set_volume(&self, Parameters(p): Parameters<VolumeParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project.set_volume(clip_id, p.volume).map_err(core_err)?;
             json(&out)
@@ -2599,7 +2798,7 @@ impl KerfMcp {
                        `link_id`) is a separate clip to fade."
     )]
     fn set_fade(&self, Parameters(p): Parameters<FadeParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project.set_fade(clip_id, p.fade_in, p.fade_out).map_err(core_err)?;
             json(&out)
@@ -2610,7 +2809,7 @@ impl KerfMcp {
         description = "Set a clip's playback speed (1.0 = unchanged, 2.0 = 2x faster, 0.5 = half, negative = reverse); this retimes the clip and changes its timeline duration. In ripple mode (get_ripple_mode, or pass `ripple`) the later clips on the track follow the change in duration. Linked partners are retimed by the same ratio so a picture and its sound stay in step (link=false: this clip only)."
     )]
     fn set_speed(&self, Parameters(p): Parameters<SpeedParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project
                 .with_links(p.link, |project| {
@@ -2625,7 +2824,7 @@ impl KerfMcp {
         description = "Set a clip's geometric transform — scale / position (pos_x, pos_y as fractions of the frame) / rotation / opacity / per-edge crop. Use a sub-1.0 scale with a position for picture-in-picture. Omit a field to leave it unchanged. A number that is animated (set_keyframes / add_keyframe, or set_property_keyframes) is read from its keys, not from this static value, which only applies once its keys are cleared; the crop edges are never animated."
     )]
     fn set_transform(&self, Parameters(p): Parameters<TransformParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project
                 .set_transform(
@@ -2649,7 +2848,7 @@ impl KerfMcp {
         description = "Set a clip's color correction — brightness / contrast / saturation / gamma / temperature (warm-cool). Omit a field to leave it unchanged. A number that is animated (set_property_keyframes) is read from its keys, not from this static value, which only applies once its keys are cleared (pass [])."
     )]
     fn set_color(&self, Parameters(p): Parameters<ColorParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project
                 .set_color(clip_id, p.brightness, p.contrast, p.saturation, p.gamma, p.temperature)
@@ -2662,7 +2861,7 @@ impl KerfMcp {
         description = "Set or clear the transition blending a clip's start with the clip before it on the same track, with a duration in seconds; omit kind to clear. A dissolve or a motion transition plays both shots at once, so it borrows the outgoing clip's unused source — a clip trimmed to the very end of its footage has none to lend and the transition falls back to a hard cut. Dips need no handle. Reach for a fade between scenes and a motion transition between shots in a montage; a cut needs no transition at all."
     )]
     fn set_transition(&self, Parameters(p): Parameters<TransitionParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         let transition = parse_transition(p.kind, p.duration)?;
         self.edit(|project| {
             let out = project.set_transition(clip_id, transition).map_err(core_err)?;
@@ -2674,7 +2873,7 @@ impl KerfMcp {
         description = "Replace a clip's video effect chain (applied in order at export): blur, sharpen, grayscale, invert, vignette, or chroma_key (key a color to transparency so footage on a lower track shows through). Pass an empty list to clear."
     )]
     fn set_video_effects(&self, Parameters(p): Parameters<VideoEffectsParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project.set_video_effects(clip_id, p.effects).map_err(core_err)?;
             json(&out)
@@ -2685,7 +2884,7 @@ impl KerfMcp {
         description = "Replace a clip's audio effect chain (applied in order at export): highpass, lowpass, equalizer (parametric band), compressor (dynamics) or gate (noise gate). Pass an empty list to clear."
     )]
     fn set_audio_effects(&self, Parameters(p): Parameters<AudioEffectsParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project.set_audio_effects(clip_id, p.effects).map_err(core_err)?;
             json(&out)
@@ -2696,7 +2895,7 @@ impl KerfMcp {
         description = "Replace a clip's whole-transform keyframes — the keys that animate scale / position / rotation / opacity together over time. Two or more keyframes animate the clip (e.g. a Ken Burns zoom, a moving picture-in-picture). An empty list clears these keyframes only: a number that has keys of its own (set_property_keyframes) keeps them, so the clip can still be animated afterwards — clear_keyframes makes the whole transform static. Colour and volume keys are never touched."
     )]
     fn set_keyframes(&self, Parameters(p): Parameters<KeyframesParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project.set_keyframes(clip_id, p.keyframes).map_err(core_err)?;
             json(&out)
@@ -2707,7 +2906,7 @@ impl KerfMcp {
         description = "Add (or replace) one transform keyframe at a time offset from the clip's start; unspecified channels capture the clip's current pose there. Use two calls to animate between two poses. A key added inside an eased segment splits it (a hold stays held, a curve stays the same curve); re-keying a moment keeps how it leaves."
     )]
     fn add_keyframe(&self, Parameters(p): Parameters<AddKeyframeParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project
                 .add_keyframe(clip_id, p.time, p.scale, p.pos_x, p.pos_y, p.rotation, p.opacity)
@@ -2723,7 +2922,7 @@ impl KerfMcp {
                        (a colour number, the volume, or a transform number). Returns the clip."
     )]
     fn set_keyframe_easing(&self, Parameters(p): Parameters<SetKeyframeEasingParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = match p.prop {
                 Some(prop) => project.set_property_easing(clip_id, prop, p.time, p.easing),
@@ -2747,7 +2946,7 @@ impl KerfMcp {
                        Returns the clip."
     )]
     fn set_property_keyframes(&self, Parameters(p): Parameters<PropertyKeyframesParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project.set_property_keyframes(clip_id, p.prop, p.keys).map_err(core_err)?;
             json(&out)
@@ -2761,7 +2960,10 @@ impl KerfMcp {
                        destination clip."
     )]
     fn copy_keyframes(&self, Parameters(p): Parameters<CopyKeyframesParams>) -> Result<String, McpError> {
-        let (from, to) = (parse_id(&p.from_clip_id)?, parse_id(&p.to_clip_id)?);
+        let (from, to) = (
+            parse_arg("from_clip_id", &p.from_clip_id)?,
+            parse_arg("to_clip_id", &p.to_clip_id)?,
+        );
         self.edit(|project| {
             let out = project
                 .copy_keyframes(from, to, &p.props.unwrap_or_default(), p.offset.unwrap_or(0.0))
@@ -2774,7 +2976,7 @@ impl KerfMcp {
         description = "Remove all transform keyframes from a clip (back to its static transform): the whole-transform keys and any scale / position / rotation / opacity keys of their own. Colour and volume keys stay — clear those with set_property_keyframes and an empty list."
     )]
     fn clear_keyframes(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project.clear_keyframes(clip_id).map_err(core_err)?;
             json(&out)
@@ -2788,7 +2990,7 @@ impl KerfMcp {
                        and decide where the subject is. Omit a field to leave it unchanged."
     )]
     fn set_reframe(&self, Parameters(p): Parameters<ReframeParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project
                 .set_reframe(clip_id, p.yaw, p.pitch, p.roll, p.fov, p.lens_fov, p.input, p.output)
@@ -2804,12 +3006,13 @@ impl KerfMcp {
                        remembered on the asset, so every clip cut from it afterwards is reframed automatically."
     )]
     async fn set_asset_projection(&self, Parameters(p): Parameters<AssetProjectionParams>) -> Result<String, McpError> {
-        let asset_id = parse_id(&p.asset_id)?;
-        let (project, app) = (self.project.clone(), self.app.clone());
+        let asset_id = parse_arg("asset_id", &p.asset_id)?;
+        let (project, app, owner) = (self.project.clone(), self.app.clone(), self.owner());
         // On the blocking pool: queueing the proxy at the new size runs the cached ffprobe that
-        // keys it, which must not stall an async worker.
+        // keys it, which must not stall an async worker. The change to the asset is held back
+        // with the agent's proposal (the core does that, for the session named here).
         let asset = blocking(move || {
-            let asset = lock_agent(&project)
+            let asset = lock_agent_as(&project, owner.as_deref())
                 .set_asset_projection(asset_id, p.projection)
                 .map_err(core_err)?;
             crate::spawn_proxy(&app, &asset);
@@ -2825,7 +3028,7 @@ impl KerfMcp {
                        the timeline."
     )]
     fn clear_reframe(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project.clear_reframe(clip_id).map_err(core_err)?;
             json(&out)
@@ -2838,7 +3041,7 @@ impl KerfMcp {
                        view. Pass an empty list to hold a static pose."
     )]
     fn set_reframe_keyframes(&self, Parameters(p): Parameters<ReframeKeyframesParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project.set_reframe_keyframes(clip_id, p.keyframes).map_err(core_err)?;
             json(&out)
@@ -2850,7 +3053,7 @@ impl KerfMcp {
                        channels capture the camera's current pose there. Two calls pan between two directions."
     )]
     fn add_reframe_keyframe(&self, Parameters(p): Parameters<AddReframeKeyframeParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project
                 .add_reframe_keyframe(clip_id, p.time, p.yaw, p.pitch, p.roll, p.fov)
@@ -2873,7 +3076,7 @@ impl KerfMcp {
         description = "Update a text overlay's text, timing, position (pos_x / pos_y as 0–1 frame fractions), size (font height fraction), color, box background (bg, empty string clears), font (system font family from list_fonts, empty string clears) or bold. Omit a field to leave it unchanged."
     )]
     fn update_overlay(&self, Parameters(p): Parameters<UpdateOverlayParams>) -> Result<String, McpError> {
-        let overlay_id = parse_id(&p.overlay_id)?;
+        let overlay_id = parse_arg("overlay_id", &p.overlay_id)?;
         self.edit(|project| {
             let out = project
                 .update_overlay(
@@ -2886,7 +3089,7 @@ impl KerfMcp {
 
     #[tool(description = "Remove a text overlay")]
     fn remove_overlay(&self, Parameters(p): Parameters<OverlayIdParams>) -> Result<String, McpError> {
-        let overlay_id = parse_id(&p.overlay_id)?;
+        let overlay_id = parse_arg("overlay_id", &p.overlay_id)?;
         self.edit(|project| {
             project.remove_overlay(overlay_id).map_err(core_err)?;
             Ok("ok".to_string())
@@ -2946,7 +3149,7 @@ impl KerfMcp {
                        (without its source) and `warnings`."
     )]
     async fn update_svg_overlay(&self, Parameters(p): Parameters<UpdateSvgOverlayParams>) -> Result<String, McpError> {
-        let overlay_id = parse_id(&p.overlay_id)?;
+        let overlay_id = parse_arg("overlay_id", &p.overlay_id)?;
         let patch = SvgOverlayPatch {
             name: p.name,
             svg: p.svg,
@@ -2974,7 +3177,7 @@ impl KerfMcp {
 
     #[tool(description = "Remove an animated SVG title (its id is in timeline_summary's `svg_overlays`)")]
     fn remove_svg_overlay(&self, Parameters(p): Parameters<OverlayIdParams>) -> Result<String, McpError> {
-        let overlay_id = parse_id(&p.overlay_id)?;
+        let overlay_id = parse_arg("overlay_id", &p.overlay_id)?;
         self.edit(|project| {
             project.remove_svg_overlay(overlay_id).map_err(core_err)?;
             Ok("ok".to_string())
@@ -3022,7 +3225,7 @@ impl KerfMcp {
                        picture, add it and use preview_timeline at a few times between its start and end."
     )]
     async fn preview_svg_overlay(&self, Parameters(p): Parameters<PreviewSvgOverlayParams>) -> Result<CallToolResult, McpError> {
-        let overlay_id = p.overlay_id.as_deref().map(parse_id).transpose()?;
+        let overlay_id = p.overlay_id.as_deref().map(|s| parse_arg("overlay_id", s)).transpose()?;
         if overlay_id.is_some() == p.svg.is_some() {
             return Err(McpError::invalid_params(
                 "pass either `overlay_id` (a title on the timeline) or `svg` (a draft), exactly one".to_string(),
@@ -3068,10 +3271,51 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "See a ready-made animated title (list_svg_presets) filled with your `params` before adding it: a PNG \
+                       contact sheet of it at several moments, drawn for the project's delivery frame, plus a text index \
+                       of cell -> seconds. Like preview_svg_overlay but for a preset that is not on the timeline yet; \
+                       nothing is added and nothing is staged. `duration` (default 4 s) is how long the title would run. \
+                       Then add_svg_overlay with the same `preset` and `params`."
+    )]
+    async fn preview_svg_preset(&self, Parameters(p): Parameters<PreviewSvgPresetParams>) -> Result<CallToolResult, McpError> {
+        kerf_core::svg::check_params(&p.params).map_err(core_err)?;
+        let moments = svg_moments(p.times, p.count)?;
+        let duration = p.duration.unwrap_or(4.0);
+        if !duration.is_finite() || duration <= 0.0 || duration > kerf_core::MAX_SVG_SECONDS {
+            return Err(McpError::invalid_params(
+                format!(
+                    "`duration` must be a positive number of seconds (at most {}), got {duration}",
+                    kerf_core::MAX_SVG_SECONDS
+                ),
+                None,
+            ));
+        }
+        let cell_w = p.max_width.unwrap_or(480).clamp(64, MAX_SVG_CELL_WIDTH);
+        let (project, owner) = (self.project.clone(), self.owner());
+        let (png, caption) = blocking(move || {
+            // The frame the title would be drawn for, under the lock; the drawing with it released.
+            let frame = lock_agent_as(&project, owner.as_deref())
+                .working_timeline()
+                .map_err(core_err)?
+                .preset_frame();
+            let title = SvgPreviewTitle {
+                svg: kerf_core::render_preset(p.preset, &p.params, duration, frame),
+                label: format!("preset {} (not on the timeline)", p.preset.as_str()),
+                span: Some(duration),
+                offset: 0.0,
+                report_warnings: true,
+            };
+            svg_preview(&title, &moments, cell_w, frame)
+        })
+        .await?;
+        Ok(png_result(caption, png))
+    }
+
+    #[tool(
         description = "Set or clear (empty list) a text overlay's position/opacity keyframes, to animate it over its lifetime (e.g. a title that slides in and fades out)"
     )]
     fn set_overlay_keyframes(&self, Parameters(p): Parameters<OverlayKeyframesParams>) -> Result<String, McpError> {
-        let overlay_id = parse_id(&p.overlay_id)?;
+        let overlay_id = parse_arg("overlay_id", &p.overlay_id)?;
         self.edit(|project| {
             let out = project.set_overlay_keyframes(overlay_id, p.keyframes).map_err(core_err)?;
             json(&out)
@@ -3079,7 +3323,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Caption the cut: project every clip's cached transcript (run analyze_asset first) through the current edit and write the result as text overlays, replacing any previously generated (or imported) set. Captions are placed in TIMELINE time, so they follow trims, reorders, speed changes and removed silences, and words that were cut out get no caption. Long sentences are split into readable lines. Pick the look with `style`: `lines` for subtitles, `word_punch` for one big word at a time (what social captions usually look like — prefer it for a vertical cut). Hand-made titles and lower-thirds are left alone. Returns the overlays created."
+        description = "Caption the cut: project every clip's cached transcript (run analyze_asset first) through the current edit and write the result as text overlays, replacing any previously generated (or imported) set. Captions are placed in TIMELINE time, so they follow trims, reorders, speed changes and removed silences, and words that were cut out get no caption. Long sentences are split into readable lines. Pick the look with `style`: `lines` for subtitles, `word_punch` for one big word at a time (what social captions usually look like — prefer it for a vertical cut). Hand-made titles and lower-thirds are left alone. Returns how many captions were written, the first few in full and the ids of the first hundred (get_timeline_state's `captions` window pages through all of them)."
     )]
     fn generate_captions(&self, Parameters(p): Parameters<CaptionParams>) -> Result<String, McpError> {
         let opts = CaptionOptions {
@@ -3091,7 +3335,7 @@ impl KerfMcp {
         };
         self.edit(|project| {
             let out = project.generate_captions(opts).map_err(core_err)?;
-            json(&out)
+            json(&reads::caption_result(&out))
         })
     }
 
@@ -3099,7 +3343,7 @@ impl KerfMcp {
         description = "Caption the cut from a subtitle file: SubRip (.srt) or ASS/SSA (.ass, .ssa), by path or as text you pass in. Cue times are taken as TIMELINE time by default (a subtitle track made for the finished cut); pass base=source with asset_id when the file instead times one asset's own footage (a transcript, subtitles for the uncut recording) and each cue is projected through that asset's clips like a transcript, following trims, reorders and speed changes. Long cues are split into readable lines, sized to fit the delivery frame, never two on screen at once — the same machinery as generate_captions, in the `style` you pick (`word_punch` for a vertical cut). Markup, styles and positions in the file are ignored; unreadable entries are skipped and counted. The captions REPLACE any previously generated or imported ones (a later generate_captions replaces these too — captions are one lane of text), and hand-made titles are left alone. Caption last, like generate_captions: a later edit does not move them. Pass offset (seconds, may be negative) when the file's clock does not start where the picture does. Returns a summary: cues read, placed, skipped_lines, dropped_outside (not on the cut at all: past its end or before its start, or footage that was cut out), dropped_short (on the cut but too brief to read), dropped_overlap (lost its slot to another cue), captions written and replaced. At most 10,000 cues / 100,000 words are read and 20,000 captions written per import — a refused import changes nothing."
     )]
     async fn import_captions(&self, Parameters(p): Parameters<ImportCaptionsParams>) -> Result<String, McpError> {
-        let asset = p.asset_id.as_deref().map(parse_id).transpose()?;
+        let asset = p.asset_id.as_deref().map(|s| parse_arg("asset_id", s)).transpose()?;
         let base = CaptionTimeBase::resolve(p.base.as_deref(), asset).map_err(core_err)?;
         let format = CaptionFormat::from_arg(p.format.as_deref()).map_err(core_err)?;
         let req = CaptionImportRequest {
@@ -3113,7 +3357,7 @@ impl KerfMcp {
             },
             offset: p.offset.unwrap_or(0.0),
         };
-        let project = self.project.clone();
+        let (project, owner) = (self.project.clone(), self.owner());
         let (path, text) = (p.path, p.text);
         let summary = blocking(move || {
             // Read, decode and parse with the project lock released — a few MB of
@@ -3121,7 +3365,9 @@ impl KerfMcp {
             // on — and take it only to place the result.
             let text = caption_source(path.as_deref(), text)?;
             let file = kerf_core::parse_captions(&text, format).map_err(core_err)?;
-            lock_agent(&project).import_captions(&file, req).map_err(core_err)
+            lock_agent_edit(&project, owner.as_deref())?
+                .import_captions(&file, req)
+                .map_err(core_err)
         })
         .await?;
         self.changed();
@@ -3136,74 +3382,101 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Read a script aloud with the Kokoro text-to-speech model and put the narration on the timeline: on the `VO` audio track unless track_id names another, appended after what is already there unless timeline_start says where. The audio is English only. The first call downloads the voice model (~100 MB) and each voice is fetched on first use; synthesis then takes a few seconds per sentence — send a `progressToken` for progress and cancel the request to stop it. Each sentence is synthesized on its own, so the voiceover's transcript is its script with exact timings: pass caption_style to caption the cut straight away (or run generate_captions later), and never analyze_asset it for a transcript. The generated audio lands for the user immediately like an import; placing it on the timeline (and the captions) is an ordinary staged edit. Returns the asset and the clip."
+        description = "Read a script aloud with the Kokoro text-to-speech model and put the narration on the timeline: on the `VO` audio track unless track_id names another, appended after what is already there unless timeline_start says where. The audio is English only. The first call downloads the voice model (~100 MB) and each voice is fetched on first use; synthesis then takes a few seconds per sentence — send a `progressToken` for progress and cancel the request to stop it. Each sentence is synthesized on its own, so the voiceover's transcript is its script with exact timings: pass caption_style to caption the cut straight away (or run generate_captions later), and never analyze_asset it for a transcript. The generated audio lands for the user immediately like an import; placing it on the timeline (and the captions) is an ordinary staged edit. `caption_style` plus `caption_max_words` / `caption_max_chars` / `caption_pos_y` / `caption_size` set the look of those captions as in generate_captions; if the narration is placed but the captions fail, the result still succeeds with a `warning`. `track_id` is checked before anything is synthesized. Pass `background: true` for a job_id. Returns the asset (without its per-sentence timings: get_transcript has them) and the clip."
     )]
     async fn generate_voiceover(
         &self,
         Parameters(p): Parameters<VoiceoverParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<String, McpError> {
-        let track = p.track_id.as_deref().map(parse_id).transpose()?;
-        let voice = p.voice.unwrap_or_else(|| kerf_core::DEFAULT_VOICE.to_string());
-        let project = self.project.clone();
-        let app = self.app.clone();
-        let cancel = context.ct.clone();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Option<f64>, String)>();
-        let forward = {
-            let peer = context.peer.clone();
-            let token = context.meta.get_progress_token();
-            tauri::async_runtime::spawn(async move {
-                while let Some((fraction, message)) = rx.recv().await {
-                    let Some(token) = token.clone() else { continue };
-                    let param = ProgressNotificationParam::new(token, fraction.unwrap_or(0.0)).with_total(1.0);
-                    let _ = peer.notify_progress(param.with_message(message)).await;
+        let track = p.track_id.as_deref().map(|s| parse_arg("track_id", s)).transpose()?;
+        let generation = {
+            let project = self.lock();
+            // Said before a minute of synthesis, not after it: the track the narration is for must
+            // exist, and be an audio track.
+            if let Some(t) = track {
+                let timeline = project.working_timeline().map_err(core_err)?;
+                match timeline.track(t) {
+                    None => return Err(core_err(kerf_core::Error::TrackNotFound(t))),
+                    Some(found) if found.kind != StreamKind::Audio => {
+                        return Err(McpError::invalid_params(
+                            format!("`track_id` {t} is a {:?} track; narration goes on an audio track", found.kind)
+                                .to_lowercase(),
+                            None,
+                        ))
+                    }
+                    Some(_) => {}
                 }
-            })
+            }
+            project.generation()
         };
-        let placed = blocking(move || {
-            let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
-                let message = match &detail {
-                    Some(d) => format!("{stage}: {d}"),
-                    None => stage.to_string(),
+        let voice = p.voice.unwrap_or_else(|| kerf_core::DEFAULT_VOICE.to_string());
+        // Any caption option asks for captions; the style alone is the shorthand.
+        let captioned = p.caption_style.is_some()
+            || p.caption_max_words.is_some()
+            || p.caption_max_chars.is_some()
+            || p.caption_pos_y.is_some()
+            || p.caption_size.is_some();
+        let captions = captioned.then(|| CaptionOptions {
+            style: p.caption_style.unwrap_or_default(),
+            max_words: p.caption_max_words,
+            max_chars: p.caption_max_chars,
+            pos_y: p.caption_pos_y,
+            size: p.caption_size,
+        });
+        let (me, owner) = (self.clone(), self.owner());
+        self.long_tool("generate_voiceover", p.background, &context, move |run| async move {
+            let (project, app) = (me.project.clone(), me.app.clone());
+            let placed = blocking(move || {
+                let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
+                    let message = match &detail {
+                        Some(d) => format!("{stage}: {d}"),
+                        None => stage.to_string(),
+                    };
+                    run.progress(fraction, message);
+                    // The GUI shows the same progress it shows for its own voiceovers.
+                    let _ = app.emit(
+                        "voiceover-progress",
+                        crate::VoiceoverProgressEvent {
+                            stage: stage.to_string(),
+                            fraction,
+                            detail,
+                        },
+                    );
                 };
-                let _ = tx.send((fraction, message));
-                // The GUI shows the same progress it shows for its own voiceovers.
-                let _ = app.emit(
-                    "voiceover-progress",
-                    crate::VoiceoverProgressEvent {
-                        stage: stage.to_string(),
-                        fraction,
-                        detail,
-                    },
-                );
-            };
-            let asset = Project::synthesize_voiceover(&p.text, &voice, p.speed.unwrap_or(1.0), &mut on_progress, &|| {
-                cancel.is_cancelled()
+                let asset =
+                    Project::synthesize_voiceover(&p.text, &voice, p.speed.unwrap_or(1.0), &mut on_progress, &|| run.cancelled())
+                        .map_err(core_err)?;
+                // Landing it is an edit of the cut, so it goes into the proposal.
+                let project = lock_agent_edit(&project, owner.as_deref())?;
+                require_generation(&project, generation, "the narration was being made")?;
+                let (asset, clip) = project
+                    .with_ripple(p.ripple, |project| project.place_voiceover(&asset, track, p.timeline_start))
+                    .map_err(core_err)?;
+                // The narration is down. Captions failing after that is a warning on a success,
+                // not an error that leaves the agent thinking nothing was placed.
+                let captions = captions.map(|opts| project.generate_captions(opts).map(|c| c.len()));
+                Ok((asset, clip, captions))
             })
-            .map_err(core_err)?;
-            let project = lock_agent(&project);
-            let (asset, clip) = project
-                .with_ripple(p.ripple, |project| project.place_voiceover(&asset, track, p.timeline_start))
-                .map_err(core_err)?;
-            let captions = match p.caption_style {
-                Some(style) => Some(
-                    project
-                        .generate_captions(CaptionOptions {
-                            style,
-                            ..CaptionOptions::default()
-                        })
-                        .map_err(core_err)?
-                        .len(),
-                ),
-                None => None,
-            };
-            Ok((asset, clip, captions))
+            .await;
+            // A synthesis that fails places nothing; one that got as far as placing it has
+            // changed the proposal whatever came after.
+            let (asset, clip, captions) = placed?;
+            me.changed();
+            let mut answer = serde_json::json!({ "asset": reads::compact_asset(&asset), "clip": clip });
+            match captions {
+                Some(Ok(count)) => answer["captions"] = serde_json::json!(count),
+                Some(Err(e)) => {
+                    answer["captions"] = serde_json::json!(0);
+                    answer["warning"] = serde_json::json!(format!(
+                        "the narration is on the timeline, but captioning it failed: {e}. Fix that and run generate_captions."
+                    ));
+                }
+                None => {}
+            }
+            json(&answer)
         })
-        .await;
-        let _ = forward.await;
-        let (asset, clip, captions) = placed?;
-        self.changed();
-        json(&serde_json::json!({ "asset": asset, "clip": clip, "captions": captions }))
+        .await
     }
 
     #[tool(
@@ -3221,55 +3494,59 @@ impl KerfMcp {
                        under a voiceover, or dialogue separated from the background of a clip (its speech lands in \
                        vocals). The first call downloads the runtime and model; separation takes a fraction of the audio's length on a \
                        modern CPU (minutes on an old one) — send a `progressToken` for progress and cancel the request to \
-                       stop it. Cached per file. Returns the stem assets and the placed clips."
+                       stop it, or pass `background: true` for a job_id. Cached per file. Returns the stem assets and the placed clips."
     )]
     async fn separate_stems(
         &self,
         Parameters(p): Parameters<SeparateStemsParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<String, McpError> {
-        let asset_id = parse_id(&p.asset_id)?;
-        let clip_id = p.clip_id.as_deref().map(parse_id).transpose()?;
-        let project = self.project.clone();
-        let app = self.app.clone();
-        let cancel = context.ct.clone();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(Option<f64>, String)>();
-        let forward = {
-            let peer = context.peer.clone();
-            let token = context.meta.get_progress_token();
-            tauri::async_runtime::spawn(async move {
-                while let Some((fraction, message)) = rx.recv().await {
-                    let Some(token) = token.clone() else { continue };
-                    let param = ProgressNotificationParam::new(token, fraction.unwrap_or(0.0)).with_total(1.0);
-                    let _ = peer.notify_progress(param.with_message(message)).await;
+        let asset_id = parse_arg("asset_id", &p.asset_id)?;
+        let clip_id = p.clip_id.as_deref().map(|s| parse_arg("clip_id", s)).transpose()?;
+        let (asset, generation) = {
+            let project = self.lock();
+            let asset = project.require_asset(asset_id).map_err(core_err)?;
+            if let Some(clip) = clip_id {
+                let timeline = project.working_timeline().map_err(core_err)?;
+                if !timeline.tracks.iter().any(|t| t.clips.iter().any(|c| c.id == clip)) {
+                    return Err(core_err(kerf_core::Error::ClipNotFound(clip)));
                 }
-            })
+            }
+            (asset, project.generation())
         };
-        let placed = blocking(move || {
-            let asset = lock_agent(&project).require_asset(asset_id).map_err(core_err)?;
-            let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
-                let message = match &detail {
-                    Some(d) => format!("{stage}: {d}"),
-                    None => stage.to_string(),
+        let (me, owner) = (self.clone(), self.owner());
+        self.long_tool("separate_stems", p.background, &context, move |run| async move {
+            let (project, app) = (me.project.clone(), me.app.clone());
+            let placed = blocking(move || {
+                let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
+                    let message = match &detail {
+                        Some(d) => format!("{stage}: {d}"),
+                        None => stage.to_string(),
+                    };
+                    run.progress(fraction, message);
+                    let _ = app.emit(
+                        "stems-progress",
+                        crate::VoiceoverProgressEvent {
+                            stage: stage.to_string(),
+                            fraction,
+                            detail,
+                        },
+                    );
                 };
-                let _ = tx.send((fraction, message));
-                let _ = app.emit(
-                    "stems-progress",
-                    crate::VoiceoverProgressEvent {
-                        stage: stage.to_string(),
-                        fraction,
-                        detail,
-                    },
-                );
-            };
-            let stems = Project::separate_stems_media(&asset, &mut on_progress, &|| cancel.is_cancelled()).map_err(core_err)?;
-            lock_agent(&project).place_stems(asset_id, &stems, clip_id).map_err(core_err)
+                let stems = Project::separate_stems_media(&asset, &mut on_progress, &|| run.cancelled()).map_err(core_err)?;
+                // The stems land in the library either way; laying them under a clip is an edit.
+                let project = match clip_id {
+                    Some(_) => lock_agent_edit(&project, owner.as_deref())?,
+                    None => lock_agent_as(&project, owner.as_deref()),
+                };
+                require_generation(&project, generation, "the stems were being made")?;
+                project.place_stems(asset_id, &stems, clip_id).map_err(core_err)
+            })
+            .await?;
+            me.changed();
+            json(&placed)
         })
-        .await;
-        let _ = forward.await;
-        let placed = placed?;
-        self.changed();
-        json(&placed)
+        .await
     }
 
     #[tool(
@@ -3286,22 +3563,23 @@ impl KerfMcp {
         description = "Write an asset's cached transcript to a SubRip (.srt) subtitle file (run analyze_asset first). \
                        Refuses to overwrite an existing file unless overwrite is true."
     )]
-    fn export_srt(&self, Parameters(p): Parameters<ExportSrtParams>) -> Result<String, McpError> {
-        let id = parse_id(&p.asset_id)?;
+    async fn export_srt(&self, Parameters(p): Parameters<ExportSrtParams>) -> Result<String, McpError> {
+        let id = parse_arg("asset_id", &p.asset_id)?;
         crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
-        let path = std::path::Path::new(&p.output_path);
-        refuse_overwrite(path, p.overwrite.unwrap_or(false))?;
-        let srt = {
-            let project = self.lock();
-            project.transcript_srt(id).map_err(core_err)?
-        };
-        std::fs::write(path, srt).map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let path = std::path::PathBuf::from(&p.output_path);
+        refuse_overwrite(&path, p.overwrite.unwrap_or(false))?;
+        // Not onto a file the project still needs (a source, a proxy, the project itself).
+        self.check_outputs(std::slice::from_ref(&path)).await?;
+        let srt = self.lock().transcript_srt(id).map_err(core_err)?;
+        blocking(move || std::fs::write(&path, srt).map_err(|e| McpError::internal_error(e.to_string(), None))).await?;
         Ok(format!("wrote {}", p.output_path))
     }
 
-    #[tool(description = "Append the non-silent spans of an asset as clips, using cached analysis")]
+    #[tool(
+        description = "Append the non-silent spans of an asset as clips, end to end after what the first track of the asset's main kind already holds (the first video track for footage, the first audio track for audio-only media), as one revision. It needs the asset's `silence` analysis (analyze_asset with steps [\"silence\"]): with no analysis at all it fails, and if the silence step was never run it keeps the whole file. The silent spans are dropped, not rippled: nothing already on the track moves. Returns the clips."
+    )]
     fn remove_silence(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
-        let id = parse_id(&p.asset_id)?;
+        let id = parse_arg("asset_id", &p.asset_id)?;
         self.edit(|project| {
             let out = project.remove_silence(id).map_err(core_err)?;
             json(&out)
@@ -3309,32 +3587,49 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Smart crop: frame each shot for the delivery frame instead of centring it. Samples where a clip's content actually sits and writes the crop that keeps it, per clip — so 16:9 footage delivered at 9:16 keeps the subject rather than whatever happened to be in the middle. Set the delivery frame first (set_delivery_format); clips already that shape are left alone. The result is an ordinary transform crop the user can adjust or undo"
+        description = "Smart crop: frame each shot for the delivery frame instead of centring it. Samples where a clip's content actually sits and writes the crop that keeps it, per clip — so 16:9 footage delivered at 9:16 keeps the subject rather than whatever happened to be in the middle. Set the delivery frame first (set_delivery_format); clips already that shape are left alone. The result is an ordinary transform crop the user can adjust or undo. Sampling takes a moment per clip (send a `progressToken`, cancel the request, or pass `background: true` to run it as a job). Returns how many clips were reframed and a summary of the timeline."
     )]
-    async fn smart_crop(&self, Parameters(p): Parameters<SmartCropParams>) -> Result<String, McpError> {
-        let clip = p.clip_id.as_deref().map(parse_id).transpose()?;
-        let project = self.project.clone();
-        let (moved, timeline) = blocking(move || {
-            // Plan under the lock, sample with it released (one short ffmpeg
-            // decode per clip), apply under it again — the same shape as
-            // analyze_asset, for the same reason.
-            let plan = lock_agent(&project).smart_crop_inputs(clip).map_err(core_err)?;
-            let crops = Project::sample_smart_crops(&plan).map_err(core_err)?;
-            let guard = lock_agent(&project);
-            let moved = guard.apply_smart_crops(&crops).map_err(core_err)?;
-            let timeline = guard.working_timeline().map_err(core_err)?;
-            Ok((moved, timeline))
+    async fn smart_crop(
+        &self,
+        Parameters(p): Parameters<SmartCropParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
+        let clip = p.clip_id.as_deref().map(|s| parse_arg("clip_id", s)).transpose()?;
+        let (me, owner) = (self.clone(), self.owner());
+        self.long_tool("smart_crop", p.background, &context, move |run| async move {
+            let project = me.project.clone();
+            let (moved, timeline) = blocking(move || {
+                // Plan under the lock, sample with it released (one short ffmpeg decode per
+                // clip), apply under it again — the same shape as analyze_asset, for the same
+                // reason.
+                let (plan, generation) = {
+                    let project = lock_agent_as(&project, owner.as_deref());
+                    (project.smart_crop_inputs(clip).map_err(core_err)?, project.generation())
+                };
+                let crops = Project::sample_smart_crops_with(
+                    &plan,
+                    &mut |f| run.progress(Some(f64::from(f)), "sampling where each shot's content sits"),
+                    &|| run.cancelled(),
+                )
+                .map_err(core_err)?;
+                let guard = lock_agent_edit(&project, owner.as_deref())?;
+                require_generation(&guard, generation, "the shots were being framed")?;
+                let moved = guard.apply_smart_crops(&crops).map_err(core_err)?;
+                let timeline = guard.working_timeline().map_err(core_err)?;
+                Ok((moved, timeline))
+            })
+            .await?;
+            me.changed();
+            json(&serde_json::json!({ "clips_reframed": moved, "timeline": reads::timeline_brief(&timeline) }))
         })
-        .await?;
-        self.changed();
-        json(&serde_json::json!({ "clips_reframed": moved, "timeline": timeline }))
+        .await
     }
 
     #[tool(
         description = "Cut to the beat: ripple a track's cuts onto the beat grid of the analyzed music on the audio tracks, retrimming each clip so its outgoing cut lands on a beat. Analyze the music asset first"
     )]
     fn snap_to_beats(&self, Parameters(p): Parameters<SnapToBeatsParams>) -> Result<String, McpError> {
-        let track = p.track_id.as_deref().map(parse_id).transpose()?;
+        let track = p.track_id.as_deref().map(|s| parse_arg("track_id", s)).transpose()?;
         self.edit(|project| {
             let aligned = project.snap_to_beats(track, p.tolerance).map_err(core_err)?;
             // The *working* timeline, like every other read here: inside a task the
@@ -3342,7 +3637,7 @@ impl KerfMcp {
             // back the user's untouched cut — a timeline with none of the moves the
             // `cuts_aligned` count beside it just reported.
             let timeline = project.working_timeline().map_err(core_err)?;
-            json(&serde_json::json!({ "cuts_aligned": aligned, "timeline": timeline }))
+            json(&serde_json::json!({ "cuts_aligned": aligned, "timeline": reads::timeline_brief(&timeline) }))
         })
     }
 
@@ -3353,7 +3648,7 @@ impl KerfMcp {
                        Analyze the asset first; `music` is null when it has no steady pulse."
     )]
     fn get_music_structure(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
-        let id = parse_id(&p.asset_id)?;
+        let id = parse_arg("asset_id", &p.asset_id)?;
         let analysis = self.lock().get_analysis(id).map_err(core_err)?;
         let Some(analysis) = analysis else {
             return Err(McpError::invalid_params(
@@ -3383,7 +3678,7 @@ impl KerfMcp {
                        and ending always play; only whole repeating phrases are repeated or dropped."
     )]
     fn plan_music_fit(&self, Parameters(p): Parameters<PlanMusicFitParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         let fit = self.lock().plan_music_fit(clip_id, p.target).map_err(core_err)?;
         json(&fit)
     }
@@ -3395,16 +3690,16 @@ impl KerfMcp {
                        non-destructive clips on the original file, nothing is rendered. Needs analyze_asset on the \
                        music first (a steady beat). If no arrangement hits the target on bar lines the nearest one is \
                        used and, with fade_out (default), cut at the target and faded. Check plan_music_fit first if \
-                       the remainder matters. Returns the new clip ids, the plan and the timeline."
+                       the remainder matters. Returns the new clip ids, the plan and a summary of the timeline (get_timeline_state has all of it)."
     )]
     fn fit_music(&self, Parameters(p): Parameters<FitMusicParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let report = project
                 .fit_music(clip_id, p.target, p.fade_out.unwrap_or(true))
                 .map_err(core_err)?;
             let timeline = project.working_timeline().map_err(core_err)?;
-            json(&serde_json::json!({ "fit": report, "timeline": timeline }))
+            json(&serde_json::json!({ "fit": report, "timeline": reads::timeline_brief(&timeline) }))
         })
     }
 
@@ -3419,7 +3714,7 @@ impl KerfMcp {
                        `detached` (each: the audio `clip`, its `track_id`, `created_track`) and `skipped`."
     )]
     fn extract_audio(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
-        let id = parse_id(&p.asset_id)?;
+        let id = parse_arg("asset_id", &p.asset_id)?;
         self.edit(|project| {
             let out = project.extract_audio(id).map_err(core_err)?;
             json(&out)
@@ -3434,7 +3729,7 @@ impl KerfMcp {
                        other audio-only assets this is how they reach the timeline. One revision. Returns the clip."
     )]
     fn add_asset_audio(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
-        let id = parse_id(&p.asset_id)?;
+        let id = parse_arg("asset_id", &p.asset_id)?;
         self.edit(|project| {
             let out = project.add_asset_audio(id).map_err(core_err)?;
             json(&out)
@@ -3459,7 +3754,7 @@ impl KerfMcp {
                        detach_audio_clips does several in one revision."
     )]
     fn detach_audio(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project.detach_audio(clip_id).map_err(core_err)?;
             json(&out)
@@ -3473,7 +3768,11 @@ impl KerfMcp {
                        `detached` (each: the audio `clip`, `track_id`, `created_track`) and `skipped`."
     )]
     fn detach_audio_clips(&self, Parameters(p): Parameters<DetachClipsParams>) -> Result<String, McpError> {
-        let ids = p.clip_ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<Uuid>, _>>()?;
+        let ids = p
+            .clip_ids
+            .iter()
+            .map(|s| parse_arg("clip_ids", s))
+            .collect::<Result<Vec<Uuid>, _>>()?;
         self.edit(|project| {
             let out = project.detach_audio_clips(&ids).map_err(core_err)?;
             json(&out)
@@ -3489,7 +3788,7 @@ impl KerfMcp {
                        reattach_audio_clips does several in one revision."
     )]
     fn reattach_audio(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
-        let clip_id = parse_id(&p.clip_id)?;
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project.reattach_audio(clip_id).map_err(core_err)?;
             json(&out)
@@ -3504,7 +3803,11 @@ impl KerfMcp {
                        error names the clip, changing nothing. Returns the picture clips."
     )]
     fn reattach_audio_clips(&self, Parameters(p): Parameters<ReattachClipsParams>) -> Result<String, McpError> {
-        let ids = p.clip_ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<Uuid>, _>>()?;
+        let ids = p
+            .clip_ids
+            .iter()
+            .map(|s| parse_arg("clip_ids", s))
+            .collect::<Result<Vec<Uuid>, _>>()?;
         self.edit(|project| {
             let out = project.reattach_audio_clips(&ids).map_err(core_err)?;
             json(&out)
@@ -3528,7 +3831,11 @@ impl KerfMcp {
                        At least two clips, on different tracks, none on a locked track. detach_audio links for you. One revision. Returns the group's `link_id`."
     )]
     fn link_clips(&self, Parameters(p): Parameters<LinkClipsParams>) -> Result<String, McpError> {
-        let ids = p.clip_ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<Uuid>, _>>()?;
+        let ids = p
+            .clip_ids
+            .iter()
+            .map(|s| parse_arg("clip_ids", s))
+            .collect::<Result<Vec<Uuid>, _>>()?;
         self.edit(|project| {
             let group = project.link_clips(&ids).map_err(core_err)?;
             json(&serde_json::json!({ "link_id": group, "clips": ids.len() }))
@@ -3541,16 +3848,26 @@ impl KerfMcp {
                        how many of the named clips were linked."
     )]
     fn unlink_clips(&self, Parameters(p): Parameters<UnlinkClipsParams>) -> Result<String, McpError> {
-        let ids = p.clip_ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<Uuid>, _>>()?;
+        let ids = p
+            .clip_ids
+            .iter()
+            .map(|s| parse_arg("clip_ids", s))
+            .collect::<Result<Vec<Uuid>, _>>()?;
         self.edit(|project| {
             let unlinked = project.unlink_clips(&ids).map_err(core_err)?;
             json(&serde_json::json!({ "unlinked": unlinked }))
         })
     }
 
-    #[tool(description = "Stitch the full length of several assets together in order")]
+    #[tool(
+        description = "Append the FULL length of each asset in `asset_ids`, in order, to the end of the first track of its kind (footage on the first video track, audio-only media on the first audio track), as one revision — so a video clip and an audio-only clip do not play in sequence with each other, each kind has its own run. For part of an asset use cut_clip or add_clip_to_timeline. Returns the clips."
+    )]
     fn concatenate(&self, Parameters(p): Parameters<ConcatParams>) -> Result<String, McpError> {
-        let ids = p.asset_ids.iter().map(|s| parse_id(s)).collect::<Result<Vec<Uuid>, _>>()?;
+        let ids = p
+            .asset_ids
+            .iter()
+            .map(|s| parse_arg("asset_ids", s))
+            .collect::<Result<Vec<Uuid>, _>>()?;
         self.edit(|project| {
             let out = project.concatenate(&ids).map_err(core_err)?;
             json(&out)
@@ -3561,18 +3878,26 @@ impl KerfMcp {
         description = "Begin a staged edit: from here on your edits are held back as a proposal the user reviews \
                        instead of changing the cut they are looking at. Your own reads (get_timeline_state, \
                        preview_timeline, timeline_summary, export) follow the proposal, so you can check your work \
-                       before handing it over. claim_next_task already does this for you."
+                       before handing it over. claim_next_task already does this for you, and while the user has \
+                       review switched on (the default) your first edit opens the proposal by itself, so you rarely \
+                       need this. The proposal belongs to your session: another agent connected at the same time is \
+                       refused while it is open."
     )]
     fn stage_edits(&self, Parameters(p): Parameters<StageEditsParams>) -> Result<String, McpError> {
-        self.edit(|project| {
-            let staged = project.begin_staging(None, p.note.as_deref(), None).map_err(core_err)?;
-            json(&staged)
+        let owner = self.owner();
+        self.act(|project| {
+            let staged = project
+                .begin_staging(None, p.note.as_deref(), owner.as_deref())
+                .map_err(core_err)?;
+            json(&reads::staged_brief(&staged))
         })
     }
 
     #[tool(
         description = "What your staged edits would change about the user's cut — every add, cut, move, retrim and \
-                       adjustment, plus the runtime before and after. Returns null when nothing is staged."
+                       adjustment (each entry has an `id`), plus the runtime before and after, `undo_depth` (how many \
+                       steps undo_staged_edit can take back) and any held-back library changes. Returns null when \
+                       nothing is staged."
     )]
     fn staged_diff(&self) -> Result<String, McpError> {
         let project = self.lock();
@@ -3586,22 +3911,84 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Apply your staged edits to the live timeline yourself, as one revision. Normally leave this to \
-                       the user — completing the task shows them the proposal to accept. Fails if they have edited \
-                       the timeline since you staged, unless `force`."
+        description = "Apply your staged edits to the live timeline, as one revision — ONLY while the user has agent \
+                       review switched off (Settings › Agent). With review on (the default) this is refused: the user \
+                       applies agent edits in Kerf, so finish with complete_task (or just tell them the proposal is \
+                       ready) and ask them to review it; `force` does not get round that. With review off it fails if \
+                       the user has edited the timeline since you staged, unless `force`. Returns a summary of the \
+                       timeline afterwards (get_timeline_state has all of it)."
     )]
     fn apply_staged_edits(&self, Parameters(p): Parameters<ApplyStagedParams>) -> Result<String, McpError> {
-        self.edit(|project| {
+        self.act(|project| {
             let timeline = project.apply_staged(p.force.unwrap_or(false)).map_err(core_err)?;
-            json(&timeline)
+            json(&reads::timeline_brief(&timeline))
         })
     }
 
-    #[tool(description = "Throw your staged edits away, leaving the user's timeline untouched")]
+    #[tool(
+        description = "Throw your staged edits away, leaving the user's timeline untouched. The proposal is kept aside, so \
+                       restore_discarded_edits can bring it back if this was a mistake (the user can also restore it in \
+                       Kerf). Returns a summary of the user's timeline."
+    )]
     fn discard_staged_edits(&self) -> Result<String, McpError> {
-        self.edit(|project| {
+        self.act(|project| {
             let timeline = project.discard_staged().map_err(core_err)?;
-            json(&timeline)
+            json(&reads::timeline_brief(&timeline))
+        })
+    }
+
+    #[tool(
+        description = "Take back the last step of your staged edits (the proposal remembers its last 20), leaving the \
+                       user's timeline alone. This is how to undo a mistake you made in the proposal; undo works on the \
+                       live cut instead. Returns the label of the step taken back and how the proposal stands."
+    )]
+    fn undo_staged_edit(&self) -> Result<String, McpError> {
+        self.act(|project| {
+            let (label, staged) = project.undo_staged().map_err(core_err)?;
+            json(&serde_json::json!({ "undone": label, "staged": reads::staged_brief(&staged) }))
+        })
+    }
+
+    #[tool(
+        description = "Bring back the proposal that was last discarded (by discard_staged_edits or by the user), once, and \
+                       only while no proposal is open. It returns as it was, without its undo history, and may be `stale` \
+                       if the user edited the timeline since."
+    )]
+    fn restore_discarded_edits(&self) -> Result<String, McpError> {
+        self.act(|project| {
+            let staged = project.restore_discarded().map_err(core_err)?;
+            json(&reads::staged_brief(&staged))
+        })
+    }
+
+    #[tool(
+        description = "Apply only some of your staged changes (the `id`s of staged_diff's entries) to the live timeline, \
+                       leaving the rest in the proposal — ONLY while agent review is switched off; with it on (the \
+                       default) the user picks which changes to accept in Kerf and this is refused. A linked partner of a \
+                       picked clip comes with it (the answer's `auto_included` says so); a pick that would collide with \
+                       other clips or break a link is refused with where. Fails if the timeline moved on since you staged, \
+                       unless `force`."
+    )]
+    fn apply_staged_subset(&self, Parameters(p): Parameters<ApplySubsetParams>) -> Result<String, McpError> {
+        if p.entry_ids.is_empty() {
+            return Err(McpError::invalid_params(
+                "`entry_ids` must name at least one change (the `id`s in staged_diff)",
+                None,
+            ));
+        }
+        self.act(|project| {
+            let applied = project
+                .apply_staged_subset(&p.entry_ids, p.force.unwrap_or(false))
+                .map_err(core_err)?;
+            json(&serde_json::json!({
+                "message": applied.message,
+                "applied": applied.applied,
+                "auto_included": applied.auto_included,
+                "skipped": applied.skipped,
+                "remaining": applied.remaining,
+                "closed": applied.closed,
+                "timeline": reads::timeline_brief(&applied.timeline),
+            }))
         })
     }
 
@@ -3616,33 +4003,65 @@ impl KerfMcp {
         json(&serde_json::json!({ "diff": diff, "summary": summary }))
     }
 
-    #[tool(description = "List the timeline edit history (revisions, newest changes have higher seq; the current one is marked)")]
-    fn history(&self) -> Result<String, McpError> {
-        let project = self.lock();
-        json(&project.history().map_err(core_err)?)
+    #[tool(
+        description = "List the timeline edit history, newest last: `revisions` (each with its `seq` — higher is newer — a \
+                       label, who made it, and `current` on the one the timeline is at) and the `total` count. Returns \
+                       the newest `limit` revisions (default 50, at most 500) after skipping `offset` of the newest; \
+                       `next_offset` pages back through older ones."
+    )]
+    fn history(&self, Parameters(p): Parameters<PageParams>) -> Result<String, McpError> {
+        let (offset, limit) = reads::page_of(p.offset, p.limit, 50, 500);
+        let (revisions, total) = self
+            .lock()
+            .history_page(kerf_core::Page {
+                limit: Some(limit),
+                offset,
+            })
+            .map_err(core_err)?;
+        let end = offset + revisions.len();
+        json(&serde_json::json!({
+            "total": total,
+            "offset": offset,
+            "returned": revisions.len(),
+            "next_offset": (end < total).then_some(end),
+            "revisions": revisions,
+        }))
     }
 
-    #[tool(description = "Undo the last timeline edit, returning the restored timeline")]
+    #[tool(
+        description = "Undo the last edit to the user's LIVE timeline, returning a summary of the restored timeline. Only \
+                       while agent review is off: with review on (the default) the live cut is the user's — take back your \
+                       own staged work with undo_staged_edit instead."
+    )]
     fn undo(&self) -> Result<String, McpError> {
-        self.edit(|project| {
+        self.refuse_live_history()?;
+        self.act(|project| {
             let out = project.undo().map_err(core_err)?;
-            json(&out)
+            json(&reads::timeline_brief(&out))
         })
     }
 
-    #[tool(description = "Redo the next timeline edit, returning the restored timeline")]
+    #[tool(
+        description = "Redo the next edit on the user's LIVE timeline, returning a summary of the restored timeline. Only \
+                       while agent review is off (see undo)."
+    )]
     fn redo(&self) -> Result<String, McpError> {
-        self.edit(|project| {
+        self.refuse_live_history()?;
+        self.act(|project| {
             let out = project.redo().map_err(core_err)?;
-            json(&out)
+            json(&reads::timeline_brief(&out))
         })
     }
 
-    #[tool(description = "Revert the timeline to a specific revision seq (see history), returning the restored timeline")]
+    #[tool(
+        description = "Revert the user's LIVE timeline to a specific revision seq (see history), returning a summary of the \
+                       restored timeline. Only while agent review is off (see undo)."
+    )]
     fn revert_to(&self, Parameters(p): Parameters<RevertParams>) -> Result<String, McpError> {
-        self.edit(|project| {
+        self.refuse_live_history()?;
+        self.act(|project| {
             let out = project.revert_to(p.seq).map_err(core_err)?;
-            json(&out)
+            json(&reads::timeline_brief(&out))
         })
     }
 
@@ -3663,8 +4082,10 @@ impl KerfMcp {
                        youtube / spotify (-14 LUFS), apple (-16), broadcast (EBU R128, -23), all at -1 dBTP. A render takes minutes: send a `progressToken` in the request's \
                        `_meta` to receive progress notifications while it runs, and cancel the request \
                        (`notifications/cancelled`) to stop it — a cancelled render deletes its half-written file \
-                       rather than leaving a broken one behind. Refuses to overwrite an existing file unless \
-                       overwrite is true."
+                       rather than leaving a broken one behind. Or pass `background: true` to get a job_id at once \
+                       and poll job_status (cancel_job stops it). Refuses to overwrite an existing file unless \
+                       overwrite is true, and refuses to write over a file the project still uses (a source, a \
+                       proxy, the project itself)."
     )]
     async fn export(
         &self,
@@ -3672,87 +4093,64 @@ impl KerfMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<String, McpError> {
         crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
-        refuse_overwrite(std::path::Path::new(&p.output_path), p.overwrite.unwrap_or(false))?;
+        let output = std::path::PathBuf::from(&p.output_path);
+        refuse_overwrite(&output, p.overwrite.unwrap_or(false))?;
+        // Not onto a file the project still needs (a source, a proxy, the project itself).
+        self.check_outputs(std::slice::from_ref(&output)).await?;
         let opts = p.options.unwrap_or_default();
-        let project = self.project.clone();
-        let output_path = p.output_path;
-
-        // A render runs for minutes. Without progress an agent cannot tell a slow
-        // export from a hung one, and without cancellation it cannot abandon a
-        // render whose settings it already knows are wrong — it can only wait for
-        // a file it does not want. Both ride the protocol rather than a Kerf-
-        // specific channel: the client's `progressToken`, and the cancellation
-        // token rmcp trips when `notifications/cancelled` arrives.
-        let cancel = context.ct.clone();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<kerf_core::ExportProgress>();
-        let forward = {
-            let peer = context.peer.clone();
-            let token = context.meta.get_progress_token();
-            // The task drains the channel either way, so a client that asked for
-            // no progress does not leave ffmpeg's ticks piling up in it.
-            tauri::async_runtime::spawn(async move {
-                while let Some(progress) = rx.recv().await {
-                    let Some(token) = token.clone() else { continue };
-                    let mut param = ProgressNotificationParam::new(token, progress.fraction).with_total(1.0);
-                    if let Some(eta) = progress.eta_secs {
-                        param = param.with_message(format!("rendering, {} to go", fmt_ts(eta)));
-                    }
-                    let _ = peer.notify_progress(param).await;
+        let (project, owner) = (self.project.clone(), self.owner());
+        // A render runs for minutes. Without progress an agent cannot tell a slow export from a
+        // hung one, and without cancellation it cannot abandon a render whose settings it already
+        // knows are wrong. Both ride the protocol (`progressToken`, `notifications/cancelled`) —
+        // or, as a background job, `job_status` and `cancel_job`.
+        self.long_tool("export", p.background, &context, move |run| async move {
+            let status = blocking(move || {
+                // Snapshot the timeline + assets under the lock, then render with the
+                // lock released so a long export doesn't freeze the GUI (or block other
+                // agent tools) for its whole duration.
+                let (timeline, assets) = {
+                    let project = lock_agent_as(&project, owner.as_deref());
+                    (
+                        project.working_timeline().map_err(core_err)?,
+                        project.list_assets().map_err(core_err)?,
+                    )
+                };
+                let mut on_progress = |progress: kerf_core::ExportProgress| {
+                    run.progress(
+                        Some(progress.fraction),
+                        match progress.eta_secs {
+                            Some(eta) => format!("rendering, {} to go", fmt_ts(eta)),
+                            None => "rendering".to_string(),
+                        },
+                    );
+                };
+                let before = kerf_core::file_mtime(&output);
+                let status =
+                    kerf_core::render_with_progress(&timeline, &assets, &output, &opts, &mut on_progress, &|| run.cancelled())
+                        .map_err(|e| {
+                            // A failed render must not leave a truncated file that reads as a
+                            // finished one — and must not touch an earlier export it never wrote over.
+                            kerf_core::discard_partial(&output, before);
+                            core_err(e)
+                        })?;
+                if status == kerf_core::RenderStatus::Cancelled {
+                    // Done *here*, not after the await — cancelling the request can drop this
+                    // handler's future, while a blocking job runs to completion whether or not
+                    // anyone is still holding its handle.
+                    kerf_core::discard_partial(&output, before);
                 }
+                Ok((status, output))
             })
-        };
-
-        let render_path = output_path.clone();
-        let status = blocking(move || {
-            // Snapshot the timeline + assets under the lock, then render with the
-            // lock released so a long export doesn't freeze the GUI (or block other
-            // agent tools) for its whole duration.
-            let (timeline, assets) = {
-                let project = lock_agent(&project);
-                (
-                    project.working_timeline().map_err(core_err)?,
-                    project.list_assets().map_err(core_err)?,
-                )
-            };
-            let mut on_progress = |progress: kerf_core::ExportProgress| {
-                let _ = tx.send(progress);
-            };
-            let before = crate::file_mtime(std::path::Path::new(&render_path));
-            let status = kerf_core::render_with_progress(
-                &timeline,
-                &assets,
-                std::path::Path::new(&render_path),
-                &opts,
-                &mut on_progress,
-                &|| cancel.is_cancelled(),
-            )
-            .map_err(|e| {
-                // A failed render must not leave a truncated file that reads
-                // as a finished one.
-                crate::discard_partial(std::path::Path::new(&render_path), before);
-                core_err(e)
-            })?;
-            if status == kerf_core::RenderStatus::Cancelled {
-                // Mirrors the GUI: a cancelled export leaves no debris, and in
-                // particular no truncated file that reads as a finished render.
-                // Done *here*, not after the await — cancelling the request can
-                // drop this handler's future, while a blocking job runs to
-                // completion whether or not anyone is still holding its handle.
-                let _ = std::fs::remove_file(&render_path);
+            .await?;
+            match status {
+                (kerf_core::RenderStatus::Completed, output) => json(&serde_json::json!({ "output": output })),
+                (kerf_core::RenderStatus::Cancelled, output) => Err(McpError::internal_error(
+                    format!("export cancelled; the partial file at {} was removed", output.display()),
+                    None,
+                )),
             }
-            Ok(status)
         })
-        .await;
-        // `tx` died with the closure, so the forwarder has already run dry.
-        let _ = forward.await;
-
-        match status? {
-            kerf_core::RenderStatus::Completed => json(&serde_json::json!({ "output": output_path })),
-            kerf_core::RenderStatus::Cancelled => Err(McpError::internal_error(
-                format!("export cancelled; {output_path} was removed"),
-                None,
-            )),
-        }
+        .await
     }
 
     #[tool(
@@ -3763,8 +4161,8 @@ impl KerfMcp {
                        project's own frame is untouched. Files land beside output_path named by shape \
                        (`cut-9x16.mp4`). Reports each file with the platforms it is ready for and any issue, so \
                        there is no need to run platform_check per variant afterwards. Progress and cancellation \
-                       work as in `export`; cancelling keeps the files already finished and deletes the one in \
-                       flight. Refuses to overwrite any existing variant file unless overwrite is true."
+                       work as in `export` (and `background: true` returns a job_id); cancelling keeps the files already \
+                       finished and deletes the one in flight. Refuses to overwrite any existing variant file unless overwrite is true."
     )]
     async fn export_variants(
         &self,
@@ -3800,20 +4198,46 @@ impl KerfMcp {
         for variant in &variants {
             refuse_overwrite(&variant.output, overwrite)?;
         }
-        let project = self.project.clone();
-
-        // Same protocol plumbing as `export`: progress on the client's token,
-        // cancellation off the request's token.
-        let cancel = context.ct.clone();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<kerf_core::VariantProgress>();
-        let forward = {
-            let peer = context.peer.clone();
-            let token = context.meta.get_progress_token();
+        self.check_outputs(&variants.iter().map(|v| v.output.clone()).collect::<Vec<_>>())
+            .await?;
+        let smart_crop = p.smart_crop.unwrap_or(true);
+        let (me, owner) = (self.clone(), self.owner());
+        let generation = self.lock().generation();
+        self.long_tool("export_variants", p.background, &context, move |run| async move {
+            let project = me.project.clone();
+            // The framing pass is the one write this tool makes. It is announced whether or not the
+            // render after it succeeds: the proposal changed either way.
+            let framed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let wrote = framed.clone();
             let labels: Vec<String> = deliveries.iter().map(Delivery::ratio_label).collect();
-            tauri::async_runtime::spawn(async move {
-                while let Some(progress) = rx.recv().await {
-                    let Some(token) = token.clone() else { continue };
-                    let param = ProgressNotificationParam::new(token, progress.fraction).with_total(1.0);
+            let render_variants = variants.clone();
+            let result = blocking(move || {
+                // Frame first: plan under the lock, sample with it released (one
+                // short decode per clip, shared by every shape), apply under it again.
+                if smart_crop {
+                    let plan = lock_agent_as(&project, owner.as_deref())
+                        .framing_inputs(&deliveries)
+                        .map_err(core_err)?;
+                    if !plan.jobs.is_empty() {
+                        let framings = Project::sample_framings_with(
+                            &plan,
+                            &mut |f| run.progress(Some(f64::from(f) * 0.1), "framing each shot"),
+                            &|| run.cancelled(),
+                        )
+                        .map_err(core_err)?;
+                        let guard = lock_agent_edit(&project, owner.as_deref())?;
+                        require_generation(&guard, generation, "the shots were being framed")?;
+                        wrote.store(guard.apply_framings(&framings).map_err(core_err)?, Ordering::SeqCst);
+                    }
+                }
+                let (timeline, assets) = {
+                    let project = lock_agent_as(&project, owner.as_deref());
+                    (
+                        project.working_timeline().map_err(core_err)?,
+                        project.list_assets().map_err(core_err)?,
+                    )
+                };
+                let mut on_progress = |progress: kerf_core::VariantProgress| {
                     let mut message = format!(
                         "rendering {} of {} ({})",
                         progress.variant + 1,
@@ -3823,66 +4247,42 @@ impl KerfMcp {
                     if let Some(eta) = progress.eta_secs {
                         message.push_str(&format!(", {} to go", fmt_ts(eta)));
                     }
-                    let _ = peer.notify_progress(param.with_message(message)).await;
+                    run.progress(Some(progress.fraction), message);
+                };
+                // Core removes the file of a variant that failed or was cancelled in flight.
+                let (status, done) =
+                    kerf_core::render_variants(&timeline, &assets, &render_variants, &opts, &mut on_progress, &|| {
+                        run.cancelled()
+                    })
+                    .map_err(core_err)?;
+                // Judged per file, at the frame that file actually is and over the span it writes.
+                let range = opts.range.map(|r| (r.start, r.end));
+                let mut outputs = Vec::new();
+                let project = lock_agent_as(&project, owner.as_deref());
+                for v in render_variants.iter().take(done) {
+                    outputs.push(variant_output(&project, v, range)?);
                 }
+                Ok((status, outputs))
             })
-        };
-
-        let smart_crop = p.smart_crop.unwrap_or(true);
-        let deliveries_for_plan = deliveries.clone();
-        let render_variants = variants.clone();
-        let result = blocking(move || {
-            // Frame first: plan under the lock, sample with it released (one
-            // short decode per clip, shared by every shape), apply under it again.
-            let mut framed = 0;
-            if smart_crop {
-                let plan = lock_agent(&project).framing_inputs(&deliveries_for_plan).map_err(core_err)?;
-                if !plan.jobs.is_empty() {
-                    let framings = Project::sample_framings(&plan).map_err(core_err)?;
-                    framed = lock_agent(&project).apply_framings(&framings).map_err(core_err)?;
-                }
+            .await;
+            let framed = framed.load(Ordering::SeqCst);
+            if framed > 0 {
+                me.changed();
             }
-            let (timeline, assets) = {
-                let project = lock_agent(&project);
-                (
-                    project.working_timeline().map_err(core_err)?,
-                    project.list_assets().map_err(core_err)?,
-                )
-            };
-            let mut on_progress = |progress: kerf_core::VariantProgress| {
-                let _ = tx.send(progress);
-            };
-            let (status, done) =
-                kerf_core::render_variants(&timeline, &assets, &render_variants, &opts, &mut on_progress, &|| {
-                    cancel.is_cancelled()
-                })
-                .map_err(core_err)?;
-            // Judged per file, at the frame that file actually is and over the span it writes.
-            let range = opts.range.map(|r| (r.start, r.end));
-            let mut outputs = Vec::new();
-            let project = lock_agent(&project);
-            for v in render_variants.iter().take(done) {
-                outputs.push(variant_output(&project, v, range)?);
+            let (status, outputs) = result?;
+            match status {
+                kerf_core::RenderStatus::Completed => json(&serde_json::json!({ "clips_framed": framed, "outputs": outputs })),
+                kerf_core::RenderStatus::Cancelled => Err(McpError::internal_error(
+                    format!(
+                        "export cancelled after {} of {} files; the one in flight was removed",
+                        outputs.len(),
+                        variants.len()
+                    ),
+                    None,
+                )),
             }
-            Ok((status, framed, outputs))
         })
-        .await;
-        let _ = forward.await;
-        let (status, framed, outputs) = result?;
-        if framed > 0 {
-            self.changed();
-        }
-        match status {
-            kerf_core::RenderStatus::Completed => json(&serde_json::json!({ "clips_framed": framed, "outputs": outputs })),
-            kerf_core::RenderStatus::Cancelled => Err(McpError::internal_error(
-                format!(
-                    "export cancelled after {} of {} files; the one in flight was removed",
-                    outputs.len(),
-                    variants.len()
-                ),
-                None,
-            )),
-        }
+        .await
     }
 
     #[tool(
@@ -3892,15 +4292,16 @@ impl KerfMcp {
                        followers. Returns errors (would be rejected), warnings (accepted but under-distributed or \
                        letterboxed) and tips. Advisory: export is never blocked. Pass `range` to judge only the span an \
                        export of that range would write (a Reel cut from the middle of a long timeline is judged at \
-                       the Reel's length, frame and sound, not the timeline's). Use before reporting a cut finished."
+                       the Reel's length, frame and sound, not the timeline's), and `width` + `height` to judge it at the frame an export with a different `options.resolution` would write. Use before reporting a cut finished."
     )]
     fn platform_check(&self, Parameters(p): Parameters<PlatformCheckParams>) -> Result<String, McpError> {
+        let frame = check_frame(p.width, p.height)?;
         // One summary, not two: `Project::platform_report` resolves its own, and
         // each resolve deserializes the whole timeline and re-reads every asset
         // row to answer the identical question.
         let summary = self
             .lock()
-            .cut_summary_in(None, p.range.map(|r| (r.start, r.end)))
+            .cut_summary_in(frame, p.range.map(|r| (r.start, r.end)))
             .map_err(core_err)?;
         let targets = kerf_core::platform::check_all(&summary);
         json(&serde_json::json!({
@@ -3920,14 +4321,24 @@ impl KerfMcp {
                        video at the shape the project is cut for. Refuses to overwrite an existing file unless \
                        overwrite is true."
     )]
-    async fn export_cover(&self, Parameters(p): Parameters<CoverParams>) -> Result<String, McpError> {
+    async fn export_cover(
+        &self,
+        Parameters(p): Parameters<CoverParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
         crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
-        refuse_overwrite(std::path::Path::new(&p.output_path), p.overwrite.unwrap_or(false))?;
-        let project = self.project.clone();
-        let (time_secs, output_path) = (p.time_secs, p.output_path);
+        let output = std::path::PathBuf::from(&p.output_path);
+        refuse_overwrite(&output, p.overwrite.unwrap_or(false))?;
+        self.check_outputs(std::slice::from_ref(&output)).await?;
+        let (project, owner) = (self.project.clone(), self.owner());
+        let cancel = context.ct.clone();
+        let time_secs = p.time_secs;
         let written = blocking(move || {
-            let (timeline, assets) = lock_agent(&project).export_still_inputs().map_err(core_err)?;
-            Project::render_still(&timeline, &assets, time_secs, &output_path, None).map_err(core_err)
+            let (timeline, assets) = lock_agent_as(&project, owner.as_deref())
+                .export_still_inputs()
+                .map_err(core_err)?;
+            Project::render_still_cancellable(&timeline, &assets, time_secs, &output, None, &|| cancel.is_cancelled())
+                .map_err(core_err)
         })
         .await?;
         json(&serde_json::json!({ "output": written.to_string_lossy() }))
@@ -3935,32 +4346,54 @@ impl KerfMcp {
 
     // ---- agent task queue --------------------------------------------------
 
-    #[tool(description = "List the agent task queue with each task's status (queued/working/ready/done/failed)")]
-    fn list_tasks(&self) -> Result<String, McpError> {
-        let project = self.lock();
-        json(&project.list_tasks().map_err(core_err)?)
+    #[tool(
+        description = "List the agent task queue with each task's status (queued/working/ready/done/failed), oldest first: \
+                       `tasks` and the `total` count. Returns the newest `limit` tasks (default 50, at most 500) after \
+                       skipping `offset` of the newest; `next_offset` pages back through older ones."
+    )]
+    fn list_tasks(&self, Parameters(p): Parameters<PageParams>) -> Result<String, McpError> {
+        let (offset, limit) = reads::page_of(p.offset, p.limit, 50, 500);
+        let (tasks, total) = self
+            .lock()
+            .list_tasks_page(kerf_core::Page {
+                limit: Some(limit),
+                offset,
+            })
+            .map_err(core_err)?;
+        let end = offset + tasks.len();
+        json(&serde_json::json!({
+            "total": total,
+            "offset": offset,
+            "returned": tasks.len(),
+            "next_offset": (end < total).then_some(end),
+            "tasks": tasks,
+        }))
     }
 
     #[tool(description = "Enqueue a new task (status: queued) for an agent to claim")]
     fn add_task(&self, Parameters(p): Parameters<AddTaskParams>) -> Result<String, McpError> {
-        self.edit(|project| {
+        self.act(|project| {
             let task = project.add_task(&p.prompt).map_err(core_err)?;
             json(&task)
         })
     }
 
-    #[tool(description = "Claim the oldest queued task (marks it working) and return it; returns null when the queue is empty")]
+    #[tool(
+        description = "Claim the oldest queued task (marks it working) and return it; returns null when the queue is empty. \
+                       Claiming opens a proposal for the task: every edit you make is held for the user's review."
+    )]
     fn claim_next_task(&self) -> Result<String, McpError> {
-        self.edit(|project| {
-            let task = project.claim_next_task(None).map_err(core_err)?;
+        let owner = self.owner();
+        self.act(|project| {
+            let task = project.claim_next_task(owner.as_deref()).map_err(core_err)?;
             json(&task)
         })
     }
 
     #[tool(description = "Mark a claimed task ready for the user to review, with a summary of the edits made")]
     fn complete_task(&self, Parameters(p): Parameters<CompleteTaskParams>) -> Result<String, McpError> {
-        let id = parse_id(&p.task_id)?;
-        self.edit(|project| {
+        let id = parse_arg("task_id", &p.task_id)?;
+        self.act(|project| {
             let task = project.complete_task(id, p.result).map_err(core_err)?;
             json(&task)
         })
@@ -3968,17 +4401,19 @@ impl KerfMcp {
 
     #[tool(description = "Mark a task failed with an error message")]
     fn fail_task(&self, Parameters(p): Parameters<FailTaskParams>) -> Result<String, McpError> {
-        let id = parse_id(&p.task_id)?;
-        self.edit(|project| {
+        let id = parse_arg("task_id", &p.task_id)?;
+        self.act(|project| {
             let task = project.fail_task(id, &p.error).map_err(core_err)?;
             json(&task)
         })
     }
 
-    #[tool(description = "Mark a task done (user accepted the staged edit), returning the updated task")]
+    #[tool(
+        description = "Mark a task done, returning it. This is what the user's accepting the proposal does; if the task still has a staged proposal it is applied with it, which an agent is refused while review is on (the user applies agent edits in Kerf), so do not call it to finish a task — complete_task is how you hand work over."
+    )]
     fn resolve_task(&self, Parameters(p): Parameters<TaskIdParams>) -> Result<String, McpError> {
-        let id = parse_id(&p.task_id)?;
-        self.edit(|project| {
+        let id = parse_arg("task_id", &p.task_id)?;
+        self.act(|project| {
             let task = project.resolve_task(id).map_err(core_err)?;
             json(&task)
         })
@@ -3986,16 +4421,18 @@ impl KerfMcp {
 
     #[tool(description = "Remove a task from the queue permanently, returning the updated task list")]
     fn remove_task(&self, Parameters(p): Parameters<TaskIdParams>) -> Result<String, McpError> {
-        let id = parse_id(&p.task_id)?;
-        self.edit(|project| {
+        let id = parse_arg("task_id", &p.task_id)?;
+        self.act(|project| {
             project.remove_task(id).map_err(core_err)?;
             json(&project.list_tasks().map_err(core_err)?)
         })
     }
 
-    #[tool(description = "Get peak-magnitude waveform data (0.0–1.0) for an asset's first audio stream")]
+    #[tool(
+        description = "Peak magnitude per bucket (0.0–1.0, unsigned) over the WHOLE of an asset's first audio stream, as a bare JSON array of `buckets` numbers (1–4096; a few hundred shows the shape). To look at a window, with a sign and per channel, use get_waveform_range; for how loud each slice FEELS use get_energy."
+    )]
     async fn get_waveform(&self, Parameters(p): Parameters<WaveformParams>) -> Result<String, McpError> {
-        let id = parse_id(&p.asset_id)?;
+        let id = parse_arg("asset_id", &p.asset_id)?;
         let count = p.buckets.clamp(1, MAX_WAVEFORM_BUCKETS);
         let project = self.project.clone();
         let buckets = blocking(move || {
@@ -4013,7 +4450,7 @@ impl KerfMcp {
         description = "Read what an asset's audio looks like over a window: the lowest and highest sample value in each of `buckets` equal slices of source time [start, end), per channel. Unlike get_waveform (one unsigned magnitude per bucket across the whole file) it is signed, one lane per channel (stereo gives two, mono one) and zoomable: ask for the whole asset in a few hundred buckets to find the loud, quiet and silent stretches, then ask again for a short window around one of them to find the exact moment a word, beat or click starts — the way to pick a cut point. Returns compact JSON {channels, buckets, duration, peaks_per_second, min, max}. `min` and `max` are each an array of `channels` arrays of `buckets` numbers in -1.0..1.0; bucket j covers source time start + j * (end - start) / buckets. `duration` is the length of the audio in seconds: a bucket before 0 or past it reads 0.0 / 0.0, so use `duration` to tell where the audio ends from silence. A value of exactly 1.0 or -1.0 is a clipped sample, and a run of them is distortion already baked into the source. `peaks_per_second` is the stored resolution the buckets were read from (10, 25, 100 or 500); when it is below buckets / (end - start) the request was finer than the stored 500 per second and neighbouring buckets repeat, so a shorter window will not reveal more. An asset with no audio stream (video-only footage, a still image) is rejected. The first call for a long file decodes it once, which can take seconds; every later window of that file is instant."
     )]
     async fn get_waveform_range(&self, Parameters(p): Parameters<WaveformRangeParams>) -> Result<String, McpError> {
-        let id = parse_id(&p.asset_id)?;
+        let id = parse_arg("asset_id", &p.asset_id)?;
         require_window(p.start, p.end)?;
         let (start, end) = (p.start, p.end);
         let count = p.buckets.clamp(1, MAX_WAVEFORM_BUCKETS);
@@ -4036,7 +4473,7 @@ impl KerfMcp {
         description = "Get an RMS energy envelope (0.0–1.0 per bucket) for an asset's first audio stream — a perceptual loudness-over-time curve. Unlike the peak waveform, it tracks how loud each slice feels, so use it to find quiet/loud passages and match cut pacing to musical energy."
     )]
     async fn get_energy(&self, Parameters(p): Parameters<WaveformParams>) -> Result<String, McpError> {
-        let id = parse_id(&p.asset_id)?;
+        let id = parse_arg("asset_id", &p.asset_id)?;
         let count = p.buckets.clamp(1, MAX_WAVEFORM_BUCKETS);
         let project = self.project.clone();
         let energy = blocking(move || {
@@ -4085,9 +4522,14 @@ impl KerfMcp {
     #[tool(
         description = "Decode a single frame from an asset at a source time and return it as a low-res image the model can actually see. Use to drill into a specific moment (e.g. one cell flagged by skim_asset) before cutting."
     )]
-    async fn get_frame(&self, Parameters(p): Parameters<FrameParams>) -> Result<CallToolResult, McpError> {
-        let id = parse_id(&p.asset_id)?;
+    async fn get_frame(
+        &self,
+        Parameters(p): Parameters<FrameParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = parse_arg("asset_id", &p.asset_id)?;
         let project = self.project.clone();
+        let cancel = context.ct.clone();
         let (time_secs, max_width) = (p.time_secs, p.max_width.unwrap_or(640).clamp(64, MAX_PREVIEW_WIDTH));
         let region = p.region;
         let jpeg = blocking(move || {
@@ -4097,8 +4539,14 @@ impl KerfMcp {
             match region {
                 // A zoom is a request for detail, so it decodes the original at
                 // the best JPEG quality rather than the proxy at the preview one.
-                Some(r) => Project::decode_preview_region(&asset, time_secs, r.region(), max_width, ZOOM_QUALITY),
-                None => Project::decode_preview_frame(&asset, time_secs, max_width, 4, true),
+                Some(r) => {
+                    Project::decode_preview_region_cancellable(&asset, time_secs, r.region(), max_width, ZOOM_QUALITY, &|| {
+                        cancel.is_cancelled()
+                    })
+                }
+                None => {
+                    Project::decode_preview_frame_cancellable(&asset, time_secs, max_width, 4, true, &|| cancel.is_cancelled())
+                }
             }
             .map_err(core_err)
         })
@@ -4113,14 +4561,18 @@ impl KerfMcp {
     #[tool(
         description = "Skim an asset: sample frames evenly across a time range (default the whole asset) into one contact-sheet image, plus a text index of which source timestamp each grid cell shows. The cheap way to survey footage and find the good parts; then pass `cell` (same range and grid) to see one cell at full detail, or call get_frame — with a `region` to zoom — to inspect a promising moment, and add_clip_to_timeline / cut_clip to use it."
     )]
-    async fn skim_asset(&self, Parameters(p): Parameters<SkimParams>) -> Result<CallToolResult, McpError> {
-        let id = parse_id(&p.asset_id)?;
+    async fn skim_asset(
+        &self,
+        Parameters(p): Parameters<SkimParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = parse_arg("asset_id", &p.asset_id)?;
         let columns = p.columns.unwrap_or(4).clamp(1, 8);
         let rows = p.rows.unwrap_or(4).clamp(1, 8);
         let cell_width = p.cell_width.unwrap_or(240).clamp(80, 640);
         let project = self.project.clone();
         if let Some(cell) = p.cell {
-            return self.skim_cell(id, &p, columns, rows, cell).await;
+            return self.skim_cell(id, &p, (columns, rows, cell), context).await;
         }
         let (jpeg, times) = blocking(move || {
             // Resolve under the lock, sample the (columns × rows) frames with it
@@ -4147,9 +4599,8 @@ impl KerfMcp {
         &self,
         id: uuid::Uuid,
         p: &SkimParams,
-        columns: u32,
-        rows: u32,
-        cell: u32,
+        (columns, rows, cell): (u32, u32, u32),
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let cells = columns * rows;
         if cell < 1 || cell > cells {
@@ -4161,6 +4612,7 @@ impl KerfMcp {
         let max_width = p.max_width.unwrap_or(640).clamp(64, MAX_PREVIEW_WIDTH);
         let (start, end) = (p.start, p.end);
         let project = self.project.clone();
+        let cancel = context.ct.clone();
         let (jpeg, time) = blocking(move || {
             let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
             // The same range defaults `decode_contact_sheet` applies, so the cell
@@ -4168,7 +4620,10 @@ impl KerfMcp {
             let start = start.unwrap_or(0.0).max(0.0);
             let end = end.unwrap_or(asset.duration).min(asset.duration).max(start);
             let time = kerf_core::contact_sheet_times(start, end, columns, rows)[(cell - 1) as usize];
-            let jpeg = Project::decode_preview_region(&asset, time, Region::FULL, max_width, ZOOM_QUALITY).map_err(core_err)?;
+            let jpeg = Project::decode_preview_region_cancellable(&asset, time, Region::FULL, max_width, ZOOM_QUALITY, &|| {
+                cancel.is_cancelled()
+            })
+            .map_err(core_err)?;
             Ok::<_, McpError>((jpeg, time))
         })
         .await?;
@@ -4211,62 +4666,129 @@ impl KerfMcp {
         description = "Summarise the timeline: total duration, track count, clips per track, any per-track gaps, \
                        and per track how many clips are linked to a partner (`linked_clips`) and how many pictures \
                        have had their own sound detached (`detached_sound_clips`), and the animated SVG titles \
-                       (`svg_overlays`: id, kind, timing, placement; no source)"
+                       (`svg_overlays`: id, kind, timing, placement; no source). `media_notes` lists the media the cut \
+                       uses whose preview proxy is not ready (`proxy` says queued / building / failed / missing / off, \
+                       `clips_without_proxy` counts the clips per track — previews of those decode the original and are \
+                       slower, export is not affected) or whose source file is gone (`source_missing`)"
     )]
-    fn timeline_summary(&self) -> Result<String, McpError> {
-        let project = self.lock();
-        let timeline = project.working_timeline().map_err(core_err)?;
-        let linked = timeline.linked_clip_ids();
-        let tracks: Vec<TrackSummary> = timeline
-            .tracks
-            .iter()
-            .map(|t| TrackSummary {
-                id: t.id.to_string(),
-                name: t.name.clone(),
-                kind: format!("{:?}", t.kind).to_lowercase(),
-                clip_count: t.clips.len(),
-                duration_secs: t.end(),
-                gaps: track_gaps(t),
-                linked_clips: t.clips.iter().filter(|c| linked.contains(&c.id)).count(),
-                detached_sound_clips: t.clips.iter().filter(|c| !c.source_audio).count(),
+    async fn timeline_summary(&self) -> Result<String, McpError> {
+        let (project, owner) = (self.project.clone(), self.owner());
+        let summary = blocking(move || {
+            let (timeline, staged_changes, inputs) = {
+                let project = lock_agent_as(&project, owner.as_deref());
+                (
+                    project.working_timeline().map_err(core_err)?,
+                    project.staged().map_err(core_err)?.map(|staged| staged.diff.entries.len()),
+                    project.proxy_inputs().map_err(core_err)?,
+                )
+            };
+            // The proxies' state and the sources' presence come from the disk: lock released.
+            let used: std::collections::HashSet<Uuid> = timeline
+                .tracks
+                .iter()
+                .flat_map(|t| t.clips.iter())
+                .map(|c| c.asset_id)
+                .collect();
+            let used_inputs: Vec<_> = inputs.into_iter().filter(|i| used.contains(&i.asset.id)).collect();
+            let proxies: std::collections::HashMap<Uuid, kerf_core::ProxyStatus> = kerf_core::proxy::statuses(&used_inputs)
+                .into_iter()
+                .map(|s| (s.asset_id, s))
+                .collect();
+            let assets: Vec<kerf_core::Asset> = used_inputs.into_iter().map(|i| i.asset).collect();
+            let missing: std::collections::HashSet<Uuid> = assets
+                .iter()
+                .filter(|a| !std::path::Path::new(&a.path).exists())
+                .map(|a| a.id)
+                .collect();
+            let media = reads::media_notes(&timeline, &assets, &proxies, &missing);
+            let linked = timeline.linked_clip_ids();
+            let tracks: Vec<TrackSummary> = timeline
+                .tracks
+                .iter()
+                .enumerate()
+                .map(|(i, t)| TrackSummary {
+                    id: t.id.to_string(),
+                    name: t.name.clone(),
+                    kind: format!("{:?}", t.kind).to_lowercase(),
+                    clip_count: t.clips.len(),
+                    duration_secs: t.end(),
+                    gaps: track_gaps(t),
+                    linked_clips: t.clips.iter().filter(|c| linked.contains(&c.id)).count(),
+                    detached_sound_clips: t.clips.iter().filter(|c| !c.source_audio).count(),
+                    clips_without_proxy: media.per_track.get(i).copied().unwrap_or(0),
+                })
+                .collect();
+            let total_clip_count = tracks.iter().map(|t| t.clip_count).sum();
+            Ok(TimelineSummary {
+                total_duration_secs: timeline.duration(),
+                track_count: tracks.len(),
+                total_clip_count,
+                tracks,
+                svg_overlays: timeline.svg_overlays.iter().map(SvgOverlaySummary::from).collect(),
+                delivery_format: timeline
+                    .format
+                    .map(|d| format!("{}x{} ({})", d.width, d.height, format!("{:?}", d.fit).to_lowercase())),
+                staged_changes,
+                media_notes: media.notes,
             })
-            .collect();
-        let total_clip_count = tracks.iter().map(|t| t.clip_count).sum();
-        let summary = TimelineSummary {
-            total_duration_secs: timeline.duration(),
-            track_count: tracks.len(),
-            total_clip_count,
-            tracks,
-            svg_overlays: timeline.svg_overlays.iter().map(SvgOverlaySummary::from).collect(),
-            delivery_format: timeline
-                .format
-                .map(|d| format!("{}x{} ({})", d.width, d.height, format!("{:?}", d.fit).to_lowercase())),
-            staged_changes: project.staged().map_err(core_err)?.map(|staged| staged.diff.entries.len()),
-        };
+        })
+        .await?;
         json(&summary)
     }
 }
 
 impl KerfMcp {
     fn new(project: Arc<Mutex<Project>>, app: AppHandle) -> Self {
-        Self { project, app }
+        Self {
+            project,
+            app,
+            session: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Note which rmcp session a call arrived on (called for every tool call, before it runs).
+    fn note_session(&self, context: &RequestContext<RoleServer>) {
+        *self.session.lock().unwrap_or_else(|e| e.into_inner()) = session_id_of(context);
+    }
+
+    /// The session this agent is, for the proposal ownership rules.
+    fn owner(&self) -> Option<String> {
+        self.session.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Lock the shared project, attributing any edits made under this guard to
-    /// the agent. The GUI sets `User` the same way, and the mutex keeps the two
-    /// from interleaving within a single operation.
+    /// the agent and saying which session it is. The GUI sets `User` the same way,
+    /// and the mutex keeps the two from interleaving within a single operation.
     fn lock(&self) -> MutexGuard<'_, Project> {
-        lock_agent(&self.project)
+        lock_agent_as(&self.project, self.owner().as_deref())
     }
 
-    /// Run one operation under the shared lock, release the lock, *then* tell the
+    /// Run one timeline edit under the shared lock, release the lock, *then* tell the
     /// webview. Every mutating tool is this shape, and the order matters: the
     /// event makes the GUI re-fetch, and that re-fetch takes the same lock. A
     /// failed operation notifies nothing, because nothing changed.
+    ///
+    /// Before the edit, the project is told which session is acting
+    /// ([`Project::ensure_agent_staging`]): a proposal another session owns refuses the edit
+    /// there and then. The edit itself, with review on, opens the proposal it goes into — for
+    /// this session, in its own transaction, so one that fails leaves nothing behind.
     fn edit<T>(&self, op: impl FnOnce(&Project) -> Result<T, McpError>) -> Result<T, McpError> {
+        let owner = self.owner();
         // The guard is a temporary of this statement, so it is dropped here —
         // before the emit, and before anything the emit wakes up comes asking
         // for the lock.
+        let out = {
+            let project = lock_agent_edit(&self.project, owner.as_deref())?;
+            op(&project)?
+        };
+        self.changed();
+        Ok(out)
+    }
+
+    /// [`KerfMcp::edit`] for a change that is not an edit of the cut — a task moving along, a
+    /// proposal being applied or discarded, the history stepping. It names the session but opens
+    /// no proposal.
+    fn act<T>(&self, op: impl FnOnce(&Project) -> Result<T, McpError>) -> Result<T, McpError> {
         let out = op(&self.lock())?;
         self.changed();
         Ok(out)
@@ -4286,6 +4808,93 @@ impl KerfMcp {
     }
 }
 
+impl KerfMcp {
+    /// Refuse any of `paths` as a place to write: the source of an asset, a capture file, a proxy,
+    /// the project's own file. What the project holds is read under the lock; canonicalising and
+    /// comparing the paths — filesystem calls, slow on a share that went away — happen on the
+    /// blocking pool with the lock released.
+    async fn check_outputs(&self, paths: &[std::path::PathBuf]) -> Result<(), McpError> {
+        check_output_paths(self.project.clone(), self.owner(), paths.to_vec()).await
+    }
+
+    /// The user's live timeline is theirs while their review of agent edits is on: an agent
+    /// stepping its history back or forward would change the cut with nothing to review.
+    fn refuse_live_history(&self) -> Result<(), McpError> {
+        if self.lock().agent_review() {
+            return Err(core_err(kerf_core::Error::AgentReviewRequired));
+        }
+        Ok(())
+    }
+}
+
+/// [`KerfMcp::check_outputs`] without the server around it.
+async fn check_output_paths(
+    project: Arc<Mutex<Project>>,
+    owner: Option<String>,
+    paths: Vec<std::path::PathBuf>,
+) -> Result<(), McpError> {
+    blocking(move || {
+        // What the project protects is read under the lock; comparing paths against it
+        // canonicalises and stats, which is done with the lock released.
+        let protected = lock_agent_as(&project, owner.as_deref())
+            .output_path_inputs()
+            .map_err(core_err)?;
+        for path in &paths {
+            Project::check_output_path_with(path, &protected).map_err(core_err)?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Forwards the `analysis-progress` events the GUI's bin listens to — for one asset — to a [`Run`],
+/// so an agent hears what the user sees: the step and how far it is. Stops listening when dropped.
+struct AnalysisProgressRelay {
+    app: AppHandle,
+    id: tauri::EventId,
+}
+
+impl AnalysisProgressRelay {
+    fn new(app: &AppHandle, asset: Uuid, run: &Run) -> Self {
+        use tauri::Listener;
+        let (run, asset) = (run.clone(), asset.to_string());
+        let id = app.listen("analysis-progress", move |event| {
+            let Ok(p) = serde_json::from_str::<serde_json::Value>(event.payload()) else {
+                return;
+            };
+            if p["asset_id"] != asset.as_str() {
+                return;
+            }
+            let stage = p["stage"].as_str().unwrap_or("analysing");
+            let message = match p["detail"].as_str() {
+                Some(detail) => format!("{stage}: {detail}"),
+                None => stage.to_string(),
+            };
+            run.progress(p["fraction"].as_f64(), message);
+        });
+        Self { app: app.clone(), id }
+    }
+}
+
+impl Drop for AnalysisProgressRelay {
+    fn drop(&mut self) {
+        use tauri::Listener;
+        self.app.unlisten(self.id);
+    }
+}
+
+/// The rmcp session a request belongs to: the `Mcp-Session-Id` header of the HTTP request it
+/// rode in on. `None` for a client that keeps no session, and for anything that did not come
+/// over HTTP.
+fn session_id_of(context: &RequestContext<RoleServer>) -> Option<String> {
+    session_from_parts(context.extensions.get::<axum::http::request::Parts>()?)
+}
+
+fn session_from_parts(parts: &axum::http::request::Parts) -> Option<String> {
+    let value = parts.headers.get("mcp-session-id")?.to_str().ok()?;
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 /// Lock the shared project outside `&self` (for closures moved onto the
 /// blocking pool), attributing edits to the agent. Recovers from a poisoned
 /// mutex (a panic while another op held the lock) rather than panicking here
@@ -4294,7 +4903,26 @@ fn lock_agent(project: &Mutex<Project>) -> MutexGuard<'_, Project> {
     note_agent_activity();
     let mut guard = project.lock().unwrap_or_else(|e| e.into_inner());
     guard.set_actor(EditSource::Agent);
+    // The user's setting, which a project that was opened or created since startup does not
+    // carry: read at every agent lock, so a change applies to the next call.
+    guard.set_agent_review(crate::settings::agent_review());
     guard
+}
+
+/// [`lock_agent`] for a particular agent session (`owner`, its rmcp session id) — what the
+/// proposal rules compare. Use it wherever a tool applies, discards or undoes staged work.
+fn lock_agent_as<'a>(project: &'a Mutex<Project>, owner: Option<&str>) -> MutexGuard<'a, Project> {
+    let guard = lock_agent(project);
+    guard.declare_agent(owner);
+    guard
+}
+
+/// [`lock_agent_as`] for an edit of the cut: it refuses at once a proposal another session owns.
+/// (The edit then stages into the session's own proposal, opening it when review is on.)
+fn lock_agent_edit<'a>(project: &'a Mutex<Project>, owner: Option<&str>) -> Result<MutexGuard<'a, Project>, McpError> {
+    let guard = lock_agent_as(project, owner);
+    guard.ensure_agent_staging(owner).map_err(core_err)?;
+    Ok(guard)
 }
 
 // ---- agent presence --------------------------------------------------------
@@ -4346,7 +4974,9 @@ async fn blocking<T: Send + 'static>(job: impl FnOnce() -> Result<T, McpError> +
 /// compile time, so build them once and hand out a borrow.
 fn router() -> &'static rmcp::handler::server::router::tool::ToolRouter<KerfMcp> {
     static ROUTER: OnceLock<rmcp::handler::server::router::tool::ToolRouter<KerfMcp>> = OnceLock::new();
-    ROUTER.get_or_init(KerfMcp::tool_router)
+    ROUTER.get_or_init(|| {
+        KerfMcp::tool_router() + KerfMcp::tool_router_jobs() + KerfMcp::tool_router_reads() + KerfMcp::tool_router_project()
+    })
 }
 
 /// How the server introduces itself to clients. `ServerConfig::default()` fills
@@ -4495,20 +5125,49 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              shape (9:16, 1:1, 4:5, 16:9) in one call, framing each shot for \
              each shape and reporting what each file is ready for — prefer it \
              to exporting three times by hand. \
-             Your task edits are STAGED, not applied: claiming a task opens a \
-             proposal, and every edit you make goes into it instead of changing \
-             the cut the user is looking at. Your own reads follow the proposal, \
-             so get_timeline_state / preview_timeline / timeline_summary show \
-             the cut you are building — check staged_diff to see exactly what you \
-             are about to hand over, and discard_staged_edits to abandon it. When \
-             finished call complete_task with a short summary (or fail_task on \
-             error); the user then accepts the proposal, which applies it as one \
-             revision, or dismisses it. Outside a task, stage_edits opens a \
-             proposal the same way and apply_staged_edits commits one yourself. \
+             Your edits are STAGED, not applied. While the user has review switched \
+             on (the default; get_settings shows `agent_review`), claiming a task — \
+             or simply making your first edit — opens a proposal that is yours \
+             alone, and every edit goes into it instead of changing the cut the \
+             user is looking at. Your own reads follow the proposal, so \
+             get_timeline_state / preview_timeline / timeline_summary show the cut \
+             you are building — check staged_diff to see exactly what you are about \
+             to hand over, undo_staged_edit to take back the last step, \
+             discard_staged_edits to abandon it (restore_discarded_edits brings the \
+             last discarded one back). When finished call complete_task with a \
+             short summary (or fail_task on error). Then the USER accepts the \
+             proposal in Kerf — all of it or only some changes — or dismisses it. \
+             You cannot accept it for them: apply_staged_edits, apply_staged_subset \
+             and resolve_task are refused while review is on (`force` does not get \
+             round that), and so are undo / redo / revert_to, which would rewrite \
+             their live cut; say the proposal is ready and ask them to review it. \
+             Review is the user's switch (Settings › Agent); with it off, those \
+             tools work and your edits land as you make them unless you opened a \
+             proposal with stage_edits. One agent's proposal is closed to another \
+             connected at the same time. Outside a task, stage_edits opens a \
+             proposal explicitly. \
+             Long tools (analyze_asset, export, export_variants, \
+             generate_voiceover, separate_stems, download_speech_model, \
+             import_asset, smart_crop) take `background: true`: they answer a \
+             `job_id` at once and keep working, and job_status reports progress \
+             and, at the end, the result (cancel_job stops one, list_jobs lists \
+             them). Without it the call stays open — send a progressToken for \
+             progress. Results are kept small: get_asset_metadata and analyze_asset \
+             summarise an analysis (counts, durations, the head of the transcript), \
+             and get_transcript / get_analysis_detail page through the rest; \
+             get_timeline_state shows generated captions as a window \
+             (captions_offset / captions_limit); history and list_tasks page with \
+             offset / limit. list_assets shows each asset's preview proxy (ready, \
+             queued, building with an ETA, failed, off) and which analyses have \
+             run, and timeline_summary's `media_notes` lists the cut's media whose \
+             proxy is not ready (previews of it are slower; export is unaffected) \
+             or whose source file is missing. project_info says whether the open \
+             project is saved; open_project / new_project refuse to throw away \
+             unsaved work unless told `discard_unsaved`. \
              Every applied edit is tracked: history lists the revisions, \
              revision_diff explains one of them, and undo / redo / revert_to roll \
-             changes back (they work on the live cut, so apply or discard your \
-             staged edits first). Before you report a cut finished, run \
+             the live cut back (only while review is off; your own staged steps \
+             are taken back with undo_staged_edit). Before you report a cut finished, run \
              platform_check: it says whether the length and frame shape suit \
              where it is going, including the reach limits a platform enforces \
              silently (a Reel over 3 minutes uploads fine and then reaches only \
@@ -4536,6 +5195,7 @@ impl ServerHandler for KerfMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, McpError> {
         let tool = request.name.to_string();
+        self.note_session(&context);
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let result = router().call(tcc).await;
         if let Err(e) = &result {
@@ -4556,110 +5216,17 @@ impl ServerHandler for KerfMcp {
     }
 }
 
-// ---- server ----------------------------------------------------------------
-
-/// The MCP bind address, honoring the `KERF_MCP_ADDR` override.
-fn bind_addr() -> String {
-    std::env::var("KERF_MCP_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string())
-}
-
-/// The full URL a client connects to (`http://<addr>/mcp`). The GUI shows this
-/// so the user knows where to point their agent.
-pub fn endpoint_url() -> String {
-    format!("http://{}/mcp", bind_addr())
-}
-
-/// The `Host` headers this server will accept.
-///
-/// rmcp validates the inbound `Host` against an allow-list that defaults to
-/// loopback, to blunt DNS-rebinding attacks against locally running servers.
-/// `KERF_MCP_ADDR` exists to move the server *off* loopback, so the bare
-/// default would make every such override reject its own clients. Extend the
-/// list with whatever the override names: a concrete address is added as-is,
-/// while a wildcard bind (`0.0.0.0` / `[::]`) cannot be enumerated at all —
-/// the client's `Host` is whichever of this machine's addresses it reached us
-/// on — so it yields an empty list, which is rmcp's documented "allow any".
-fn allowed_hosts(addr: &str) -> Vec<String> {
-    let defaults = ["localhost", "127.0.0.1", "::1"];
-    let mut hosts: Vec<String> = defaults.iter().map(|h| h.to_string()).collect();
-    let Some(host) = host_of(addr) else {
-        return hosts;
-    };
-    if host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_unspecified()) {
-        return Vec::new();
-    }
-    if !hosts.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
-        hosts.push(host);
-    }
-    hosts
-}
-
-/// The host part of a `host:port` bind address, tolerating a bracketed IPv6
-/// literal and a missing port.
-fn host_of(addr: &str) -> Option<String> {
-    if let Ok(sock) = addr.parse::<std::net::SocketAddr>() {
-        return Some(sock.ip().to_string());
-    }
-    let host = match addr.rsplit_once(':') {
-        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
-        _ => addr,
-    };
-    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
-    (!host.is_empty()).then(|| host.to_string())
-}
-
-/// Serve the MCP tools over streamable HTTP at `/mcp`, sharing `project` with
-/// the Tauri commands. Runs until the process exits.
-pub async fn serve(project: Arc<Mutex<Project>>, app: AppHandle) -> anyhow::Result<()> {
-    let result = run_server(project, app).await;
-    if let Err(e) = &result {
-        *SERVER_ERROR.lock().unwrap_or_else(|p| p.into_inner()) = Some(describe_server_error(&bind_addr(), e));
-    }
-    result
-}
-
-/// Why the server is not listening, if it is not. Set once by [`serve`] when it
-/// returns an error (the usual one: the port is taken by another Kerf or by
-/// something else), so `agent_status` can say so instead of showing an endpoint
-/// nothing answers on.
-static SERVER_ERROR: Mutex<Option<String>> = Mutex::new(None);
-
-pub fn server_error() -> Option<String> {
-    SERVER_ERROR.lock().unwrap_or_else(|p| p.into_inner()).clone()
-}
-
-/// The sentence the agent panel shows for a server that did not start.
-fn describe_server_error(addr: &str, error: &anyhow::Error) -> String {
-    let in_use = error
-        .downcast_ref::<std::io::Error>()
-        .is_some_and(|e| e.kind() == std::io::ErrorKind::AddrInUse);
-    if in_use {
-        format!("The agent endpoint could not start: {addr} is already in use, most likely by another Kerf. Close it, or set KERF_MCP_ADDR to a free address and restart.")
-    } else {
-        format!("The agent endpoint could not start on {addr}: {error}")
-    }
-}
-
-async fn run_server(project: Arc<Mutex<Project>>, app: AppHandle) -> anyhow::Result<()> {
-    let addr = bind_addr();
-
-    let service = StreamableHttpService::new(
-        move || Ok(KerfMcp::new(project.clone(), app.clone())),
-        LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts(&addr)),
-    );
-    let router = axum::Router::new().nest_service("/mcp", service);
-
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!(%addr, "kerf MCP server listening on http://{addr}/mcp");
-    axum::serve(listener, router).await?;
-    Ok(())
-}
-
 // ---- helpers ---------------------------------------------------------------
 
-fn parse_id(s: &str) -> Result<Uuid, McpError> {
-    Uuid::parse_str(s).map_err(|e| McpError::invalid_params(format!("invalid uuid '{s}': {e}"), None))
+/// An id argument, parsed. A model that mistypes one is told **which** argument it was, not only
+/// that "a uuid" is wrong: a call can carry half a dozen.
+fn parse_arg(name: &str, s: &str) -> Result<Uuid, McpError> {
+    Uuid::parse_str(s).map_err(|e| {
+        McpError::invalid_params(
+            format!("`{name}` must be a UUID as the tools return them (e.g. 3f2b8c1e-…), got '{s}': {e}"),
+            None,
+        )
+    })
 }
 
 /// The group move a tool call asked for, with its ids parsed: a mistyped uuid is
@@ -4669,9 +5236,9 @@ fn clip_moves(moves: &[ClipMoveParams]) -> Result<Vec<ClipMove>, McpError> {
         .iter()
         .map(|m| {
             Ok(ClipMove {
-                clip_id: parse_id(&m.clip_id)?,
+                clip_id: parse_arg("moves[].clip_id", &m.clip_id)?,
                 timeline_start: m.timeline_start,
-                track_id: m.track_id.as_deref().map(parse_id).transpose()?,
+                track_id: m.track_id.as_deref().map(|s| parse_arg("moves[].track_id", s)).transpose()?,
             })
         })
         .collect()
@@ -4683,7 +5250,7 @@ fn clip_cuts(cuts: &[ClipCutParams]) -> Result<Vec<ClipCut>, McpError> {
     cuts.iter()
         .map(|c| {
             Ok(ClipCut {
-                clip_id: parse_id(&c.clip_id)?,
+                clip_id: parse_arg("cuts[].clip_id", &c.clip_id)?,
                 at: c.at,
             })
         })
@@ -4741,10 +5308,22 @@ fn core_err(e: kerf_core::Error) -> McpError {
         | E::InvalidArgument(_)
         | E::NoStagedEdit
         | E::StagedEditPending
-        | E::StagedEditStale => McpError::invalid_params(e.to_string(), None),
+        | E::StagedEditStale
+        | E::StagedEditOwnedByOther
+        | E::AgentReviewRequired
+        | E::NoDiscardedEdit
+        | E::AssetInUse { .. } => McpError::invalid_params(e.to_string(), None),
         // A database, io, ffmpeg or engine failure is ours, not the caller's.
         other => McpError::internal_error(other.to_string(), None),
     }
+}
+
+/// The project the call was made on is gone: the user opened or started another while `doing`
+/// ran. The check is the one the GUI's jobs make (`crate::require_generation`); what a model
+/// needs on top of it is what to do next.
+fn require_generation(project: &Project, expected: u64, doing: &str) -> Result<(), McpError> {
+    crate::require_generation(project, expected, doing)
+        .map_err(|why| McpError::invalid_params(format!("{why}. Run it again on the project that is open now"), None))
 }
 
 /// A caller's mistake (a stale id, a bad argument) is a `warn`; anything else
@@ -4798,6 +5377,23 @@ fn track_gaps(track: &kerf_core::Track) -> Vec<Gap> {
         cursor = cursor.max(end);
     }
     gaps
+}
+
+/// The frame a `platform_check` is asked about: both sides or neither, each a sane size.
+fn check_frame(width: Option<u32>, height: Option<u32>) -> Result<Option<(u32, u32)>, McpError> {
+    const MAX_SIDE: u32 = 16_384;
+    match (width, height) {
+        (None, None) => Ok(None),
+        (Some(w), Some(h)) if (1..=MAX_SIDE).contains(&w) && (1..=MAX_SIDE).contains(&h) => Ok(Some((w, h))),
+        (Some(_), Some(_)) => Err(McpError::invalid_params(
+            format!("`width` and `height` must each be 1 to {MAX_SIDE} pixels"),
+            None,
+        )),
+        _ => Err(McpError::invalid_params(
+            "give `width` and `height` together, or neither for the project's own frame",
+            None,
+        )),
+    }
 }
 
 /// A window of source time a tool can read. The engine answers an empty,
@@ -4903,36 +5499,24 @@ fn caption_source(path: Option<&str>, text: Option<String>) -> Result<String, Mc
     }
 }
 
+/// A tool's answer as compact JSON: a model reads every byte, and indentation is a third of
+/// what a pretty-printed timeline weighs.
 fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
-    serde_json::to_string_pretty(value).map_err(|e| McpError::internal_error(e.to_string(), None))
+    serde_json::to_string(value).map_err(|e| McpError::internal_error(e.to_string(), None))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        allowed_hosts, caption_source, clip_moves, core_err, describe_server_error, elide_large_svg, fmt_ts, image_result,
-        log_tool_error, png_result, refuse_overwrite, require_window, router, server_identity, svg_moments, svg_preview,
-        svg_sheet_caption, svg_sheet_times, svg_source, track_gaps, variant_output, ClipMoveParams, SvgMoments,
-        SvgOverlaySummary, SvgPreviewTitle, SvgValidation,
+        caption_source, clip_moves, core_err, elide_large_svg, fmt_ts, image_result, log_tool_error, png_result,
+        refuse_overwrite, require_window, router, server_identity, svg_moments, svg_preview, svg_sheet_caption, svg_sheet_times,
+        svg_source, track_gaps, variant_output, ClipMoveParams, SvgMoments, SvgOverlaySummary, SvgPreviewTitle, SvgValidation,
     };
 
     #[test]
     fn log_tool_error_handles_both_kinds() {
         log_tool_error("t", &rmcp::ErrorData::invalid_params("bad id", None));
         log_tool_error("t", &rmcp::ErrorData::internal_error("boom", None));
-    }
-
-    #[test]
-    fn a_taken_port_is_named_as_such() {
-        let taken = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::AddrInUse));
-        let said = describe_server_error("127.0.0.1:7777", &taken);
-        assert!(said.contains("127.0.0.1:7777 is already in use"), "{said}");
-        assert!(said.contains("KERF_MCP_ADDR"), "{said}");
-        let other = anyhow::anyhow!("boom");
-        assert_eq!(
-            describe_server_error("127.0.0.1:7777", &other),
-            "The agent endpoint could not start on 127.0.0.1:7777: boom"
-        );
     }
 
     #[test]
@@ -5412,50 +5996,6 @@ mod tests {
         assert!(e.message.contains("not-a-uuid"), "{}", e.message);
     }
 
-    /// The default bind is loopback, which rmcp's own defaults already cover.
-    #[test]
-    fn loopback_binds_keep_the_default_allow_list() {
-        for addr in ["127.0.0.1:7777", "localhost:7777", "[::1]:7777"] {
-            let hosts = allowed_hosts(addr);
-            assert!(hosts.iter().any(|h| h == "127.0.0.1"), "{addr} -> {hosts:?}");
-            assert!(hosts.iter().any(|h| h == "localhost"), "{addr} -> {hosts:?}");
-            assert!(hosts.iter().any(|h| h == "::1"), "{addr} -> {hosts:?}");
-            // No duplicates from re-adding a host the defaults already list.
-            assert_eq!(hosts.len(), 3, "{addr} -> {hosts:?}");
-        }
-    }
-
-    /// `KERF_MCP_ADDR` pointed at a concrete non-loopback address has to allow
-    /// that address, or the override rejects every client it just enabled.
-    #[test]
-    fn a_concrete_override_is_allowed() {
-        let hosts = allowed_hosts("192.168.1.5:7777");
-        assert!(hosts.iter().any(|h| h == "192.168.1.5"), "{hosts:?}");
-        // The loopback defaults survive alongside it.
-        assert!(hosts.iter().any(|h| h == "127.0.0.1"), "{hosts:?}");
-
-        let named = allowed_hosts("kerf.local:7777");
-        assert!(named.iter().any(|h| h == "kerf.local"), "{named:?}");
-    }
-
-    /// A wildcard bind can be reached on any of this machine's addresses, so
-    /// there is no list to write: an empty list is rmcp's "allow any".
-    #[test]
-    fn a_wildcard_bind_disables_host_validation() {
-        for addr in ["0.0.0.0:7777", "[::]:7777"] {
-            assert!(allowed_hosts(addr).is_empty(), "{addr} should allow any host");
-        }
-    }
-
-    /// A malformed or port-less override must not silently drop the loopback
-    /// defaults and lock the user out of the default endpoint.
-    #[test]
-    fn odd_addresses_keep_loopback_reachable() {
-        for addr in ["", ":7777", "127.0.0.1", "not a host:port"] {
-            let hosts = allowed_hosts(addr);
-            assert!(hosts.iter().any(|h| h == "127.0.0.1"), "{addr} must keep loopback: {hosts:?}");
-        }
-    }
     /// Clients list a server by its `serverInfo`, and rmcp's default fills that
     /// in from its own crate identity — so the app has to name itself.
     #[test]
@@ -5582,7 +6122,8 @@ mod tests {
         assert!(properties.contains_key("output_path"), "{properties:?}");
         assert!(properties.contains_key("options"), "{properties:?}");
         assert!(properties.contains_key("overwrite"), "{properties:?}");
-        assert_eq!(properties.len(), 3, "only the declared params belong here: {properties:?}");
+        assert!(properties.contains_key("background"), "{properties:?}");
+        assert_eq!(properties.len(), 4, "only the declared params belong here: {properties:?}");
 
         let required: Vec<&str> = export
             .input_schema
@@ -5654,8 +6195,14 @@ mod tests {
             schema("get_levels"),
             (vec!["loudnorm".to_string(), "range".to_string()], Vec::<String>::new())
         );
-        // The check takes an optional range and nothing else: a bare call still judges the whole cut.
-        assert_eq!(schema("platform_check"), (vec!["range".to_string()], Vec::<String>::new()));
+        // The check takes an optional range and frame and nothing else: a bare call still judges the whole cut.
+        assert_eq!(
+            schema("platform_check"),
+            (
+                vec!["height".to_string(), "range".to_string(), "width".to_string()],
+                Vec::<String>::new()
+            )
+        );
     }
 
     /// The words an agent reads have to name the ceiling the engine actually defaults to
@@ -6142,5 +6689,429 @@ mod tests {
             assert!(add.contains(needle), "only these embedded images are kept: {add}");
         }
         assert!(!add.contains("`data:` images are fine"), "{add}");
+    }
+
+    // ---- review, ownership, jobs, paging: the surface this adapter adds ----------------------
+
+    fn tool_names() -> Vec<String> {
+        router().list_all().iter().map(|t| t.name.to_string()).collect()
+    }
+
+    #[test]
+    fn the_new_tools_are_on_the_surface() {
+        let names = tool_names();
+        for tool in [
+            "project_info",
+            "save_project",
+            "save_project_as",
+            "open_project",
+            "new_project",
+            "get_settings",
+            "set_settings",
+            "job_status",
+            "cancel_job",
+            "list_jobs",
+            "get_transcript",
+            "get_analysis_detail",
+            "preview_svg_preset",
+            "undo_staged_edit",
+            "restore_discarded_edits",
+            "apply_staged_subset",
+            "list_assets",
+            "get_asset_metadata",
+        ] {
+            assert!(names.iter().any(|n| n == tool), "`{tool}` is not registered");
+        }
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), names.len(), "a tool is registered twice");
+    }
+
+    #[test]
+    fn exactly_the_long_tools_take_background() {
+        let tools = router().list_all();
+        let mut with: Vec<String> = tools
+            .iter()
+            .filter(|t| t.input_schema["properties"].get("background").is_some())
+            .map(|t| t.name.to_string())
+            .collect();
+        with.sort();
+        let mut long = vec![
+            "analyze_asset",
+            "download_speech_model",
+            "export",
+            "export_variants",
+            "generate_voiceover",
+            "import_asset",
+            "separate_stems",
+            "smart_crop",
+        ];
+        long.sort_unstable();
+        assert_eq!(with, long);
+        for name in &with {
+            let tool = tools.iter().find(|t| t.name == name.as_str()).unwrap();
+            let required: Vec<&str> = tool
+                .input_schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            assert!(!required.contains(&"background"), "`background` is optional on {name}");
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains("background") && description.contains("job"),
+                "{name} should say a background job is possible: {description}"
+            );
+        }
+        let job = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name}"))
+                .input_schema
+                .clone()
+        };
+        for name in ["job_status", "cancel_job"] {
+            assert_eq!(job(name)["required"], serde_json::json!(["job_id"]), "{name}");
+        }
+        assert!(job("list_jobs")["properties"].as_object().is_none_or(|p| p.is_empty()));
+    }
+
+    #[test]
+    fn paging_arguments_are_optional_on_history_and_the_task_list() {
+        let tools = router().list_all();
+        for name in ["history", "list_tasks"] {
+            let tool = tools.iter().find(|t| t.name == name).unwrap();
+            for field in ["offset", "limit"] {
+                assert!(tool.input_schema["properties"].get(field).is_some(), "{name} takes {field}");
+            }
+            assert!(tool
+                .input_schema
+                .get("required")
+                .is_none_or(|r| r.as_array().is_some_and(Vec::is_empty)));
+        }
+        let transcript = tools.iter().find(|t| t.name == "get_transcript").unwrap();
+        for field in ["asset_id", "from", "to", "offset", "limit"] {
+            assert!(
+                transcript.input_schema["properties"].get(field).is_some(),
+                "get_transcript takes {field}"
+            );
+        }
+        assert_eq!(transcript.input_schema["required"], serde_json::json!(["asset_id"]));
+        let detail = tools.iter().find(|t| t.name == "get_analysis_detail").unwrap();
+        assert_eq!(detail.input_schema["required"], serde_json::json!(["asset_id", "kind"]));
+    }
+
+    #[test]
+    fn the_review_tools_say_what_the_user_alone_can_do() {
+        let tools = router().list_all();
+        let description = |name: &str| -> String {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .and_then(|t| t.description.as_deref())
+                .unwrap_or_default()
+                .to_string()
+        };
+        for name in ["apply_staged_edits", "apply_staged_subset"] {
+            let text = description(name);
+            assert!(text.contains("review") && text.contains("refused"), "{name}: {text}");
+        }
+        for name in ["undo", "redo", "revert_to"] {
+            let text = description(name);
+            assert!(text.contains("LIVE") && text.contains("review"), "{name}: {text}");
+        }
+        assert!(description("undo").contains("undo_staged_edit"));
+        assert!(description("discard_staged_edits").contains("restore_discarded_edits"));
+        assert!(description("resolve_task").contains("complete_task"));
+        assert!(description("claim_next_task").contains("proposal"));
+    }
+
+    #[test]
+    fn the_descriptions_the_review_called_thin_now_say_what_they_do() {
+        let tools = router().list_all();
+        let description = |name: &str| -> String {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .and_then(|t| t.description.as_deref())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let silence = description("remove_silence");
+        assert!(
+            silence.contains("analyze_asset") && silence.contains("silence") && silence.contains("first video track"),
+            "{silence}"
+        );
+        let cut = description("cut_clip");
+        assert!(
+            cut.contains("SOURCE") && cut.contains("add_clip_to_timeline") && cut.contains("first"),
+            "{cut}"
+        );
+        let concat = description("concatenate");
+        assert!(
+            concat.contains("FULL") && concat.contains("in order") && concat.contains("one revision"),
+            "{concat}"
+        );
+        let wave = description("get_waveform");
+        assert!(wave.contains("WHOLE") && wave.contains("get_waveform_range"), "{wave}");
+        assert!(description("analyze_asset").contains("SUMMARY"));
+        assert!(description("list_assets").contains("proxy") && description("list_assets").contains("source_missing"));
+        assert!(description("timeline_summary").contains("media_notes"));
+        assert!(description("platform_check").contains("width"));
+        assert!(description("generate_voiceover").contains("warning"));
+    }
+
+    #[test]
+    fn the_server_instructions_cover_review_jobs_paging_and_proxies() {
+        let text = super::INSTRUCTIONS;
+        for needle in [
+            "STAGED",
+            "agent_review",
+            "undo_staged_edit",
+            "restore_discarded_edits",
+            "apply_staged_subset",
+            "background: true",
+            "job_status",
+            "get_transcript",
+            "get_analysis_detail",
+            "captions_offset",
+            "media_notes",
+            "discard_unsaved",
+        ] {
+            assert!(text.contains(needle), "the instructions should mention {needle}");
+        }
+        assert!(text.find("complete_task").is_some());
+    }
+
+    #[test]
+    fn a_mistyped_id_names_the_argument() {
+        let e = super::parse_arg("clip_id", "not-a-uuid").unwrap_err();
+        assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            e.message.contains("`clip_id`") && e.message.contains("not-a-uuid"),
+            "{}",
+            e.message
+        );
+        assert!(super::parse_arg("clip_id", &uuid::Uuid::new_v4().to_string()).is_ok());
+        // Through the helpers that parse several ids, it is the field of the item that is named.
+        let item = |id: &str| ClipMoveParams {
+            clip_id: id.to_string(),
+            timeline_start: 0.0,
+            track_id: Some("nope".to_string()),
+        };
+        let e = clip_moves(&[item(&uuid::Uuid::new_v4().to_string())]).unwrap_err();
+        assert!(e.message.contains("track_id"), "{}", e.message);
+    }
+
+    #[test]
+    fn the_new_core_refusals_are_the_callers_to_fix() {
+        use rmcp::model::ErrorCode;
+        for e in [
+            kerf_core::Error::StagedEditOwnedByOther,
+            kerf_core::Error::AgentReviewRequired,
+            kerf_core::Error::NoDiscardedEdit,
+            kerf_core::Error::AssetInUse {
+                asset: uuid::Uuid::new_v4(),
+                clips: 2,
+            },
+        ] {
+            let rendered = e.to_string();
+            let mapped = core_err(e);
+            assert_eq!(mapped.code, ErrorCode::INVALID_PARAMS, "{rendered}");
+            assert_eq!(mapped.message, rendered, "the message reaches the model as the core wrote it");
+        }
+        assert!(core_err(kerf_core::Error::AgentReviewRequired)
+            .message
+            .contains("ask them to review"));
+    }
+
+    #[test]
+    fn an_import_path_is_refused_on_the_call_not_in_a_job() {
+        for bad in [
+            "clip.mp4",
+            "https://example.com/a.mp4",
+            "concat:a|b",
+            "/definitely/not/here.mp4",
+        ] {
+            let e = core_err(kerf_core::paths::validate_import_path(std::path::Path::new(bad)).unwrap_err());
+            assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_platform_check_frame_is_both_sides_or_neither() {
+        use super::check_frame;
+        assert_eq!(check_frame(None, None).unwrap(), None);
+        assert_eq!(check_frame(Some(1080), Some(1920)).unwrap(), Some((1080, 1920)));
+        for (w, h) in [
+            (Some(1080), None),
+            (None, Some(1920)),
+            (Some(0), Some(1920)),
+            (Some(1080), Some(99_999)),
+        ] {
+            assert_eq!(
+                check_frame(w, h).unwrap_err().code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{w:?} {h:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_session_is_the_header_rmcp_stamps_on_the_request() {
+        use super::session_from_parts;
+        let parts = |header: Option<&str>| {
+            let mut request = axum::http::Request::builder().uri("/mcp");
+            if let Some(h) = header {
+                request = request.header("mcp-session-id", h);
+            }
+            request.body(()).unwrap().into_parts().0
+        };
+        assert_eq!(session_from_parts(&parts(Some("abc-123"))), Some("abc-123".to_string()));
+        assert_eq!(
+            session_from_parts(&parts(None)),
+            None,
+            "a client with no session has no owner"
+        );
+        assert_eq!(session_from_parts(&parts(Some(""))), None);
+    }
+
+    #[test]
+    fn a_project_swapped_mid_job_is_noticed() {
+        let mut project = kerf_core::Project::open_in_memory().unwrap();
+        let before = project.generation();
+        assert!(super::require_generation(&project, before, "it ran").is_ok());
+        project.replace_with(kerf_core::Project::open_in_memory().unwrap());
+        let e = super::require_generation(&project, before, "it ran").unwrap_err();
+        assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            e.message.contains("replaced") && e.message.contains("Run it again"),
+            "{}",
+            e.message
+        );
+    }
+
+    /// One agent's proposal is closed to another connected at the same time, whichever door it
+    /// comes through — here the one every edit tool takes.
+    #[test]
+    fn a_second_session_is_refused_while_the_first_owns_the_proposal() {
+        let shared = std::sync::Mutex::new(kerf_core::Project::open_in_memory().unwrap());
+        {
+            let first = super::lock_agent_edit(&shared, Some("session-a")).expect("the first edit opens the proposal");
+            first
+                .add_overlay("Title".to_string(), 0.0, 2.0)
+                .expect("it goes into the proposal");
+            assert!(
+                first.staged().unwrap().is_some(),
+                "review is on by default, so the edit was staged"
+            );
+            assert!(first.timeline().unwrap().overlays.is_empty(), "the user's cut is untouched");
+        }
+        // The same session carries on.
+        assert!(super::lock_agent_edit(&shared, Some("session-a")).is_ok());
+        // Another is turned away, with words for the model.
+        let refused = super::lock_agent_edit(&shared, Some("session-b")).err().expect("refused");
+        assert_eq!(refused.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(refused.message.contains("another agent"), "{}", refused.message);
+        // So is a client that names no session at all.
+        assert!(super::lock_agent_edit(&shared, None).is_err());
+        // It cannot throw the proposal away either: a session that merely declares itself is
+        // checked against the owner.
+        let stranger = super::lock_agent_as(&shared, Some("session-b"));
+        let e = stranger.discard_staged().map(|_| ()).unwrap_err();
+        assert!(matches!(e, kerf_core::Error::StagedEditOwnedByOther), "{e}");
+        let e = stranger.undo_staged().map(|_| ()).unwrap_err();
+        assert!(matches!(e, kerf_core::Error::StagedEditOwnedByOther), "{e}");
+    }
+
+    /// With review on, an agent cannot accept its own proposal — `force` or not — nor step the
+    /// user's live history.
+    #[test]
+    fn an_agent_cannot_approve_its_own_work_while_review_is_on() {
+        let shared = std::sync::Mutex::new(kerf_core::Project::open_in_memory().unwrap());
+        {
+            let guard = super::lock_agent_edit(&shared, Some("session-a")).unwrap();
+            guard.add_overlay("Title".to_string(), 0.0, 2.0).unwrap();
+        }
+        let agent = super::lock_agent_as(&shared, Some("session-a"));
+        assert!(agent.agent_review(), "on by default");
+        for force in [false, true] {
+            let e = agent.apply_staged(force).map(|_| ()).unwrap_err();
+            assert!(matches!(e, kerf_core::Error::AgentReviewRequired), "force={force}: {e}");
+        }
+        let e = agent.apply_staged_subset(&["x".to_string()], true).map(|_| ()).unwrap_err();
+        assert!(matches!(e, kerf_core::Error::AgentReviewRequired), "{e}");
+        assert!(agent.staged().unwrap().is_some(), "nothing was applied");
+        // Its own steps it may take back, and bring a discarded proposal back.
+        let (label, _) = agent.undo_staged().unwrap();
+        assert!(!label.is_empty());
+        agent.discard_staged().unwrap();
+    }
+
+    /// `mcp.md` lists every tool by name; a tool added without a line there fails here, so the
+    /// index cannot fall behind the surface again.
+    #[test]
+    fn the_docs_name_every_tool() {
+        let docs = include_str!("../../../.claude/docs/mcp.md");
+        let missing: Vec<String> = tool_names()
+            .into_iter()
+            .filter(|name| !docs.contains(&format!("`{name}`")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "add these to the tool index in .claude/docs/mcp.md: {missing:?}"
+        );
+    }
+
+    /// An export, cover or subtitle file is never written over something the project still needs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_output_onto_a_source_file_is_refused_before_anything_renders() {
+        let dir = std::env::temp_dir().join(format!("kerf-mcp-out-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("clip.mp4");
+        std::fs::write(&source, b"not really a video").unwrap();
+        let project = kerf_core::Project::open_in_memory().unwrap();
+        let asset: kerf_core::Asset = serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(),
+            "path": source.to_string_lossy(),
+            "name": "clip.mp4",
+            "duration": 2.0,
+            "streams": [],
+            "imported_at": "2025-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        project.insert_or_get_asset(&asset).unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(project));
+
+        let refused = super::check_output_paths(shared.clone(), None, vec![dir.join("out.mp4"), source.clone()])
+            .await
+            .expect_err("the source is not a place to render to");
+        assert_eq!(refused.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(refused.message.contains("clip.mp4"), "{}", refused.message);
+        // The same file by another way in.
+        let detour = dir.join("..").join(dir.file_name().unwrap()).join("clip.mp4");
+        assert!(super::check_output_paths(shared.clone(), None, vec![detour]).await.is_err());
+        // Anywhere else is fine.
+        super::check_output_paths(shared, None, vec![dir.join("out.mp4")])
+            .await
+            .expect("a fresh path");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A call that fails leaves no empty proposal owned by the agent behind.
+    #[test]
+    fn a_failed_first_edit_opens_no_proposal() {
+        let shared = std::sync::Mutex::new(kerf_core::Project::open_in_memory().unwrap());
+        {
+            let guard = super::lock_agent_edit(&shared, Some("session-a")).unwrap();
+            assert!(guard.remove_overlay(uuid::Uuid::new_v4()).is_err(), "no such title");
+            assert!(guard.staged().unwrap().is_none(), "nothing was staged, so nothing is open");
+        }
+        // And so a second session is not locked out by a mistake of the first.
+        let second = super::lock_agent_edit(&shared, Some("session-b")).unwrap();
+        second.add_overlay("Title".to_string(), 0.0, 2.0).unwrap();
+        assert!(second.staged().unwrap().is_some());
     }
 }

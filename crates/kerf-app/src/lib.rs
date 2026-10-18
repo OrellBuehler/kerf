@@ -15,6 +15,7 @@
 
 mod gpu_preview;
 mod mcp;
+mod mcp_commands;
 mod popout;
 mod settings;
 
@@ -31,9 +32,6 @@ use kerf_core::{
     WaveformRange,
 };
 
-/// What `mcp.rs` still reaches for under these names; the cleanup itself is the engine's.
-#[allow(unused_imports)]
-pub(crate) use kerf_core::{discard_partial, file_mtime};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
@@ -4082,12 +4080,7 @@ pub fn run() {
             // The app *is* the MCP server: host the tools over HTTP, sharing the
             // same Project the GUI edits, so a connected LLM works on the open
             // project and its edits show up live.
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = mcp::serve(project, handle).await {
-                    tracing::error!(error = %e, "MCP server stopped");
-                }
-            });
+            mcp::start(app.handle(), project);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -4255,6 +4248,9 @@ pub fn run() {
             reveal_path,
             mcp_endpoint,
             agent_status,
+            mcp_commands::mcp_connection_info,
+            mcp_commands::regenerate_mcp_token,
+            mcp_commands::set_mcp_settings,
             get_settings,
             set_settings,
             reset_settings,

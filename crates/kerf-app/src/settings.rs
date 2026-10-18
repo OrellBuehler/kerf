@@ -93,6 +93,20 @@ pub struct Settings {
     /// frontend owns the action registry, the chord syntax and the migration
     /// between versions, so a new action or a renamed one needs no change here.
     pub keybindings: Option<serde_json::Value>,
+    // ---- agent / MCP server (owned by `mcp.rs`; keep together) ----
+    /// Whether an agent's edits are held back for the user to review before they reach the cut
+    /// (the default). The agent-facing `set_settings` tool cannot change it.
+    pub agent_review: bool,
+    /// Whether the embedded MCP server listens at all.
+    pub mcp_enabled: bool,
+    /// Where it listens (`host:port`); `None` is `127.0.0.1:7777`. `KERF_MCP_ADDR` in the
+    /// environment still overrides it.
+    pub mcp_addr: Option<String>,
+    /// Whether a request must carry `Authorization: Bearer <mcp_token>`.
+    pub mcp_require_token: bool,
+    /// The bearer token. Generated on the first start and kept here.
+    pub mcp_token: Option<String>,
+    // ---- end agent / MCP server ----
 }
 
 impl Default for Settings {
@@ -112,6 +126,11 @@ impl Default for Settings {
             theme: None,
             workspaces: None,
             keybindings: None,
+            agent_review: true,
+            mcp_enabled: true,
+            mcp_addr: None,
+            mcp_require_token: true,
+            mcp_token: None,
         }
     }
 }
@@ -126,6 +145,35 @@ pub fn safe_areas() -> bool {
 
 pub fn set_safe_areas(on: bool) {
     SAFE_AREAS.store(on, Ordering::Relaxed);
+}
+
+/// Whether an agent's edits wait for review. Every agent entry point reads it (and sets it on the
+/// project it locks), so a change applies to the very next agent call. On until a setting says
+/// otherwise: that is also what a call that races the startup sees.
+static AGENT_REVIEW: AtomicBool = AtomicBool::new(true);
+
+pub fn agent_review() -> bool {
+    AGENT_REVIEW.load(Ordering::Relaxed)
+}
+
+pub fn set_agent_review(on: bool) {
+    AGENT_REVIEW.store(on, Ordering::Relaxed);
+}
+
+/// What a settings patch must not do to the agent's door: a bad address or token, or a network
+/// address with no token to guard it.
+fn check_agent_fields(settings: &Settings) -> Result<(), String> {
+    if let Some(addr) = settings.mcp_addr.as_deref() {
+        crate::mcp::check_addr(addr)?;
+    }
+    if let Some(token) = settings.mcp_token.as_deref() {
+        crate::mcp::check_token(token)?;
+    }
+    let addr = settings.mcp_addr.as_deref().unwrap_or(crate::mcp::DEFAULT_ADDR);
+    match crate::mcp::bind_problem(addr, settings.mcp_require_token) {
+        Some(why) => Err(why),
+        None => Ok(()),
+    }
 }
 
 /// What the settings surface actually shows: the stored preference resolved
@@ -150,6 +198,10 @@ pub struct SettingsView {
     pub theme: Option<serde_json::Value>,
     pub workspaces: Option<serde_json::Value>,
     pub keybindings: Option<serde_json::Value>,
+    pub agent_review: bool,
+    pub mcp_enabled: bool,
+    pub mcp_addr: Option<String>,
+    pub mcp_require_token: bool,
 }
 
 impl SettingsView {
@@ -176,6 +228,10 @@ impl SettingsView {
             theme: stored.theme.clone(),
             workspaces: stored.workspaces.clone(),
             keybindings: stored.keybindings.clone(),
+            agent_review: stored.agent_review,
+            mcp_enabled: stored.mcp_enabled,
+            mcp_addr: stored.mcp_addr.clone(),
+            mcp_require_token: stored.mcp_require_token,
         }
     }
 }
@@ -188,7 +244,7 @@ static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 /// The keys a patch may carry — every field of [`Settings`] but `recent_projects`,
 /// which the app keeps itself.
-const KEYS: [&str; 12] = [
+const KEYS: [&str; 17] = [
     "cpu_percent",
     "auto_analysis",
     "proxy_size",
@@ -201,6 +257,11 @@ const KEYS: [&str; 12] = [
     "theme",
     "workspaces",
     "keybindings",
+    "agent_review",
+    "mcp_enabled",
+    "mcp_addr",
+    "mcp_require_token",
+    "mcp_token",
 ];
 
 fn path(app: &AppHandle) -> Option<PathBuf> {
@@ -224,6 +285,13 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = sibling(path, &format!("settings.tmp-{}", uuid::Uuid::new_v4().simple()));
     let result = (|| {
         let mut file = std::fs::File::create(&tmp)?;
+        // The file holds the agent token: readable by the user alone (a no-op on Windows, where the
+        // profile directory already is).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
@@ -307,7 +375,30 @@ fn parse(raw: &str) -> Result<Settings, serde_json::Error> {
     let has_auto_analysis = kept.contains_key("auto_analysis");
     let mut settings: Settings = serde_json::from_value(serde_json::Value::Object(kept))?;
     migrate(&mut settings, has_auto_analysis);
+    keep_agent_door_sound(&mut settings);
     Ok(settings)
+}
+
+/// A hand-edited file can hold a token too short to protect anything, or an address the server
+/// cannot listen on: the token is made again at the next start, and the address falls back to the
+/// default (the same two checks a patch goes through on its way in).
+fn keep_agent_door_sound(settings: &mut Settings) {
+    if settings
+        .mcp_token
+        .as_deref()
+        .is_some_and(|t| crate::mcp::check_token(t).is_err())
+    {
+        tracing::warn!("the stored MCP token is too weak to use; a new one is made at the next start");
+        settings.mcp_token = None;
+    }
+    if settings
+        .mcp_addr
+        .as_deref()
+        .is_some_and(|a| crate::mcp::check_addr(a).is_err())
+    {
+        tracing::warn!("the stored MCP address is not one the server can listen on; the default is used");
+        settings.mcp_addr = None;
+    }
 }
 
 /// The `transcribe` flag of a file written before `auto_analysis` existed becomes
@@ -343,7 +434,14 @@ fn merge(settings: &Settings, patch: &serde_json::Value) -> Result<Settings, Str
     for (key, value) in patch {
         merged.insert(key.clone(), value.clone());
     }
-    serde_json::from_value(serde_json::Value::Object(merged)).map_err(|e| format!("invalid settings: {e}"))
+    let merged: Settings =
+        serde_json::from_value(serde_json::Value::Object(merged)).map_err(|e| format!("invalid settings: {e}"))?;
+    // Only a patch that touches the agent's door is held to its rules: a stored file with an odd
+    // address in it must not stop the theme from being saved.
+    if patch.keys().any(|k| k.starts_with("mcp_")) {
+        check_agent_fields(&merged)?;
+    }
+    Ok(merged)
 }
 
 /// The stored preferences (see [`load_from`]).
@@ -394,6 +492,11 @@ fn update_file(file: &Path, patch: &serde_json::Value) -> Result<Settings, Strin
     if patch.get("cpu_percent").is_some() {
         kerf_core::set_cpu_percent(merged.cpu_percent);
     }
+    if patch.get("agent_review").is_some() {
+        set_agent_review(merged.agent_review);
+    }
+    // The MCP server follows its own fields (a new address restarts it, a new token applies at once).
+    crate::mcp::settings_changed(&merged, patch);
     Ok(merged)
 }
 
@@ -402,6 +505,13 @@ fn update_file(file: &Path, patch: &serde_json::Value) -> Result<Settings, Strin
 fn reset_keep(current: &Settings) -> Settings {
     Settings {
         recent_projects: current.recent_projects.clone(),
+        // The agent's door is not a preference to put back: a reset must not change where the
+        // server listens or lock out the clients that hold its token. (The review switch is a
+        // preference, and goes back on.)
+        mcp_enabled: current.mcp_enabled,
+        mcp_addr: current.mcp_addr.clone(),
+        mcp_require_token: current.mcp_require_token,
+        mcp_token: current.mcp_token.clone(),
         ..Settings::default()
     }
 }
@@ -431,6 +541,7 @@ fn reset_file(file: &Path) -> Result<Settings, String> {
     kerf_core::proxy::set_proxy_size(fresh.proxy_size);
     kerf_core::proxy::set_preview_source_setting(fresh.preview_source);
     set_safe_areas(fresh.safe_areas);
+    set_agent_review(fresh.agent_review);
     kerf_core::set_cpu_percent(fresh.cpu_percent);
     Ok(fresh)
 }
@@ -515,6 +626,7 @@ pub fn apply(settings: &Settings) {
     kerf_core::proxy::set_proxy_size(settings.proxy_size);
     kerf_core::proxy::set_preview_source_setting(settings.preview_source);
     set_safe_areas(settings.safe_areas);
+    set_agent_review(settings.agent_review);
     if std::env::var_os(CPU_ENV).is_some() {
         tracing::info!(percent = kerf_core::cpu_percent(), "CPU budget set from {CPU_ENV}");
         return;
@@ -700,6 +812,18 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn the_settings_file_is_readable_by_its_owner_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        save_to(&file, &Settings::default()).unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "it holds the MCP token");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn save_then_load_round_trips() {
         let dir = scratch();
@@ -816,6 +940,130 @@ mod tests {
         // A stored source this build has not heard of is Auto, not a corrupt file.
         let unknown = parse(r#"{"preview_source": "somewhere_else"}"#).unwrap();
         assert_eq!(unknown.preview_source, kerf_core::PreviewSource::Auto);
+    }
+
+    #[test]
+    fn the_agent_door_is_closed_by_default() {
+        let s = Settings::default();
+        assert!(s.agent_review, "an agent's edits wait for review");
+        assert!(s.mcp_enabled);
+        assert!(s.mcp_require_token, "a token is required");
+        assert_eq!(s.mcp_addr, None, "the default address is loopback");
+        assert_eq!(s.mcp_token, None, "the token is made on the first start");
+        let old: Settings = serde_json::from_str(r#"{"cpu_percent": 50}"#).unwrap();
+        assert!(
+            old.agent_review && old.mcp_require_token,
+            "an older file gets the safe values"
+        );
+    }
+
+    #[test]
+    fn every_stored_field_can_be_patched_and_nothing_else() {
+        let stored = serde_json::to_value(Settings::default()).unwrap();
+        for key in stored.as_object().unwrap().keys() {
+            // The recent-projects list is the app's own, kept as projects open and save.
+            if key == "recent_projects" {
+                continue;
+            }
+            assert!(KEYS.contains(&key.as_str()), "`{key}` is a setting but cannot be patched");
+        }
+        for key in KEYS {
+            assert!(stored.get(key).is_some(), "`{key}` can be patched but is not stored");
+        }
+    }
+
+    #[test]
+    fn the_view_shows_the_switches_but_never_the_token() {
+        let s = Settings {
+            mcp_token: Some("s".repeat(64)),
+            agent_review: false,
+            ..Settings::default()
+        };
+        let view = serde_json::to_value(SettingsView::current(&s)).unwrap();
+        assert_eq!(view["agent_review"], false);
+        assert_eq!(view["mcp_require_token"], true);
+        assert!(view.get("mcp_token").is_none(), "{view}");
+        assert!(!view.to_string().contains(&"s".repeat(64)));
+    }
+
+    #[test]
+    fn an_agent_patch_changes_only_its_own_fields() {
+        let base = Settings {
+            cpu_percent: 40,
+            theme: Some(serde_json::json!({"name": "Mine"})),
+            ..Settings::default()
+        };
+        let merged = merge(
+            &base,
+            &serde_json::json!({"agent_review": false, "mcp_addr": "127.0.0.1:9000"}),
+        )
+        .unwrap();
+        assert!(!merged.agent_review);
+        assert_eq!(merged.mcp_addr.as_deref(), Some("127.0.0.1:9000"));
+        assert_eq!(merged.cpu_percent, 40);
+        assert_eq!(merged.theme, base.theme);
+        assert!(merged.mcp_require_token);
+        let cleared = merge(&merged, &serde_json::json!({"mcp_addr": null})).unwrap();
+        assert_eq!(cleared.mcp_addr, None, "null goes back to the default");
+    }
+
+    #[test]
+    fn a_bad_address_or_token_is_refused() {
+        let base = Settings::default();
+        for bad in ["7777", "example.com:80", "", "127.0.0.1"] {
+            assert!(merge(&base, &serde_json::json!({ "mcp_addr": bad })).is_err(), "{bad:?}");
+        }
+        assert!(merge(&base, &serde_json::json!({"mcp_token": "short"})).is_err());
+        assert!(merge(&base, &serde_json::json!({"mcp_token": "a".repeat(40)})).is_ok());
+        assert!(merge(&base, &serde_json::json!({"mcp_enabled": "yes"})).is_err());
+    }
+
+    #[test]
+    fn the_server_cannot_be_opened_to_the_network_without_a_token() {
+        let base = Settings::default();
+        let err = merge(
+            &base,
+            &serde_json::json!({"mcp_addr": "0.0.0.0:7777", "mcp_require_token": false}),
+        )
+        .unwrap_err();
+        assert!(err.contains("0.0.0.0:7777") && err.contains("token"), "{err}");
+        assert!(
+            merge(&base, &serde_json::json!({"mcp_addr": "0.0.0.0:7777"})).is_ok(),
+            "with the token it may"
+        );
+        assert!(
+            merge(&base, &serde_json::json!({"mcp_require_token": false})).is_ok(),
+            "loopback needs none"
+        );
+        let open = Settings {
+            mcp_addr: Some("0.0.0.0:7777".to_string()),
+            ..Settings::default()
+        };
+        let err = merge(&open, &serde_json::json!({"mcp_require_token": false})).unwrap_err();
+        assert!(err.contains("token"), "{err}");
+    }
+
+    #[test]
+    fn a_stored_oddity_does_not_block_an_unrelated_patch() {
+        let odd = Settings {
+            mcp_addr: Some("not an address".to_string()),
+            ..Settings::default()
+        };
+        let merged = merge(&odd, &serde_json::json!({"safe_areas": true})).unwrap();
+        assert!(
+            merged.safe_areas,
+            "only a patch that touches the agent's door is held to its rules"
+        );
+    }
+
+    #[test]
+    fn the_agent_review_switch_is_one_the_agent_tools_read() {
+        let before = agent_review();
+        set_agent_review(false);
+        assert!(!agent_review());
+        set_agent_review(true);
+        assert!(agent_review());
+        set_agent_review(before);
     }
 
     #[test]
@@ -1045,5 +1293,39 @@ mod tests {
         assert_eq!(view["reopen_last_project"], true);
         assert_eq!(view["recent_projects"], serde_json::json!([]));
         assert!(merge(&base, &serde_json::json!({"time_display": "ticks"})).is_err());
+    }
+
+    #[test]
+    fn a_weak_stored_token_or_a_bad_stored_address_is_not_used() {
+        let loaded = parse(r#"{"mcp_token": "short", "mcp_addr": "not an address", "cpu_percent": 40}"#).unwrap();
+        assert_eq!(loaded.mcp_token, None, "a new token is made at the next start");
+        assert_eq!(loaded.mcp_addr, None, "the default address is used");
+        assert_eq!(loaded.cpu_percent, 40, "nothing else is lost");
+        let good = parse(&format!(
+            r#"{{"mcp_token": "{}", "mcp_addr": "127.0.0.1:9000"}}"#,
+            "a".repeat(40)
+        ))
+        .unwrap();
+        assert_eq!(good.mcp_token.as_deref(), Some("a".repeat(40).as_str()));
+        assert_eq!(good.mcp_addr.as_deref(), Some("127.0.0.1:9000"));
+    }
+
+    #[test]
+    fn a_reset_keeps_the_agents_door_and_turns_review_back_on() {
+        let current = Settings {
+            agent_review: false,
+            mcp_enabled: false,
+            mcp_addr: Some("127.0.0.1:9000".to_string()),
+            mcp_require_token: false,
+            mcp_token: Some("t".repeat(40)),
+            cpu_percent: 30,
+            ..Settings::default()
+        };
+        let fresh = reset_keep(&current);
+        assert!(!fresh.mcp_enabled && !fresh.mcp_require_token);
+        assert_eq!(fresh.mcp_addr.as_deref(), Some("127.0.0.1:9000"));
+        assert_eq!(fresh.mcp_token, current.mcp_token, "clients hold this token");
+        assert!(fresh.agent_review, "review is a preference, and goes back on");
+        assert_eq!(fresh.cpu_percent, Settings::default().cpu_percent);
     }
 }

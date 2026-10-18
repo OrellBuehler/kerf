@@ -1,29 +1,38 @@
 # Embedded MCP server (`crates/kerf-app/src/mcp.rs`)
 
-The app **is** the MCP server — there is no separate binary. `mcp::serve` hosts the
-tools over `rmcp` 3.1's **streamable-HTTP** transport (`StreamableHttpService` +
-`LocalSessionManager`, nested into an `axum` router) on `127.0.0.1:7777/mcp`
-(`KERF_MCP_ADDR` overrides). rmcp validates the inbound **`Host`** header against
-an allow-list that defaults to loopback (a DNS-rebinding guard), which would make
-every `KERF_MCP_ADDR` override reject its own clients — so `allowed_hosts` (pure +
-unit-tested) derives the list from the bind address: a concrete address is added to
-the loopback defaults, and a wildcard bind (`0.0.0.0` / `[::]`) can't be enumerated
-at all, so it yields an empty list, rmcp's "allow any".
-It is spawned from `lib.rs`'s Tauri `.setup` hook on
-`tauri::async_runtime` and shares the **same** `Arc<Mutex<Project>>` the Tauri commands
-hold, so the agent edits the project the user has open. Patterns that matter if you edit
+The app **is** the MCP server — there is no separate binary. `mcp::start` (called from `lib.rs`'s Tauri `.setup`
+hook) hosts the tools over `rmcp`'s **streamable-HTTP** transport (`StreamableHttpService` + `LocalSessionManager`, nested
+into an `axum` router) at `/mcp`, on `127.0.0.1:7777` by default. The server's whole lifecycle is `mcp/server.rs`; the
+tools are in `mcp.rs` and four submodules (`jobs.rs`, `reads.rs`, `project_tools.rs`, and `server.rs` itself), each
+with its own `#[tool_router(router = …)]` impl — `router()` adds them together once.
+
+**Connecting and auth** (`mcp/server.rs`, settings `mcp_enabled` / `mcp_addr` / `mcp_require_token` / `mcp_token`,
+`mcp_commands.rs` for the GUI). Every request needs `Authorization: Bearer <token>` (`mcp_require_token`, on by default;
+the token is 32 random bytes in hex, made on the first start and kept in the settings file, compared in constant time by an
+axum middleware that reads the *live* token — regenerating it applies to the next request). rmcp's
+`.enforce_origin_validation()` with an empty allow-list refuses any request that carries an `Origin` (native clients send
+none; a web page must not drive the editor through the loopback port), and rmcp validates the inbound **`Host`** against
+`allowed_hosts` (loopback plus whatever the bind address names; a wildcard bind yields an empty list = allow any). A bind
+beyond loopback is refused unless the token is required (`bind_problem`, also checked when settings are patched).
+`KERF_MCP_ADDR` still overrides the stored address. A supervisor task restarts the listener when the address or the enabled
+switch changes (`settings::update` → `settings_changed`; sessions on the old listener end), and reports a bind failure through
+`server_error()` instead of exiting. `mcp_connection_info` returns the URL, the token, `running` / `error` and the ready-made
+`claude mcp add --transport http kerf <url> --header "Authorization: Bearer <token>"` plus a generic `mcpServers` JSON snippet;
+`regenerate_mcp_token` and `set_mcp_settings` (only `mcp_*` and `agent_review`) are the other two commands.
+It shares the **same** `Arc<Mutex<Project>>` the Tauri commands hold, so the agent edits the project the user has open.
+Patterns that matter if you edit
 it: `#[tool_router]` on the impl + `#[tool_handler]` on `impl ServerHandler` — **no
 `tool_router` field on the struct** (the macro would call `Self::tool_router()`).
 That default is also the reason for the `router()` `OnceLock`: the generated
 `call_tool` / `list_tools` / `get_tool` each *evaluate* the router expression, so
-`Self::tool_router()` rebuilds all ~85 routes — a schema lookup, a boxed handler
+the sum of the routers rebuilds all ~140 routes — a schema lookup, a boxed handler
 and a map insert apiece, ~250 µs of release-build work — on **every request**.
 The routes are fixed at compile time, so it is built once and
 `#[tool_handler(router = router())]` hands out a borrow.
 `ServerInfo` is `#[non_exhaustive]`, so `get_info` builds it via `Default::default()`
 then mutates fields — including `server_info` (`server_identity`), because that
 default is filled from **rmcp's own** crate identity and left alone the server
-introduces itself to every client as "rmcp". Most tools return `Result<String, McpError>` (pretty JSON), but the
+introduces itself to every client as "rmcp". Most tools return `Result<String, McpError>` (**compact** JSON: `json()` no longer pretty-prints — indentation is a third of a timeline's weight), but the
 four **visual** tools — `get_frame` (a single drill-in frame), `skim_asset` (a
 contact-sheet montage of an asset + a text index of cell→timestamp, for finding good
 parts), `preview_timeline` (the composited cut at a timeline time) and
@@ -198,12 +207,15 @@ an edit to the user's cut, so imported media (and its background proxy) lands fo
 them immediately, reporting on the same `import-progress` event a lens-pair
 stitch drives for the GUI. `export` takes rmcp's `RequestContext` beside its
 `Parameters`: a render runs for minutes, so it forwards ffmpeg's progress to the
-client's `progressToken` and passes `context.ct` as the cancel callback, deleting
-the half-written file on cancel the way the GUI's export does. `export_capabilities` lists the
+client's `progressToken` and passes `context.ct` as the cancel callback (both through `jobs::Run`; `background: true`
+makes it a job instead). A failed or cancelled render removes only what *this run* wrote
+(`kerf_core::discard_partial` against the `file_mtime` taken before — core does it, the tool repeats it so a cancel can
+never leave debris), and the output is refused when it is a file the project still uses (`Project::check_output_path`:
+a source, a proxy, the project itself). `export_capabilities` lists the
 verified hardware encoders (it runs the probe); a `video_codec` from outside that list is the
 caller's risk, and a `*_vaapi` one on a machine nothing has probed yet waits up to 10 s for the
 probe to name the render node before the export starts (`vaapi_device_within`). Progress goes
-through an unbounded channel to a spawned forwarder because the render itself is
+through an unbounded channel to a spawned forwarder (`jobs::foreground`) because the render itself is
 on the blocking pool and `notify_progress` is async; the forwarder drains the
 channel even with no token, so a client that asked for no progress doesn't leave
 ticks piling up.
@@ -251,3 +263,97 @@ a full-detail frame of the original.
 tools take the project as the agent (`lock_agent`: activity stamped, edits attributed). Asking
 `analyze_asset` for nothing it can run — everything switched off and no `steps`, or only audio steps on
 a file with no audio — is an invalid-params error, not an empty result.
+
+## Review, ownership and the live cut
+
+Agent edits **stage** (`core-project.md`). The adapter's part:
+
+- **Identity.** rmcp makes one `KerfMcp` per session, and `call_tool` stores the request's `Mcp-Session-Id` in it
+  (`note_session`, read back by `owner()`; none for a client that keeps no session). `lock()` / `lock_agent_as` hand the
+  project that id (`Project::declare_agent`), and **`edit()`** — every timeline edit — also calls
+  `Project::ensure_agent_staging(owner)` first, which declares the session and refuses a proposal another session owns
+  (`StagedEditOwnedByOther`, `invalid_params`); the edit itself then opens the session's proposal when review is on
+  (lazily, in its own transaction — a failed edit leaves none behind). `staged_diff` / `StagedEdit` say only
+  `owned_by_agent`, never the session id. `act()` is `edit()` without that step, for what
+  is not an edit of the cut (tasks, apply / discard / undo of the proposal, history). The blocking-pool edits (voiceover
+  placement, stems, smart crop, framings, caption import) take `lock_agent_edit`.
+- **Review is the user's switch** (`agent_review`, default on, read at every agent lock from `settings::agent_review()`).
+  With it on `apply_staged_edits` (`force` included), `apply_staged_subset` and `resolve_task` of a task with a proposal
+  are refused by the core (`AgentReviewRequired`: "the user applies agent edits in Kerf"), and the adapter also refuses
+  `undo` / `redo` / `revert_to` (`refuse_live_history`) — they would rewrite the user's live cut with nothing to review.
+  `undo_staged_edit` (the last step of the proposal, up to 20), `discard_staged_edits` and `restore_discarded_edits` (the
+  last discarded proposal, once) work on the agent's own proposal at any time. `get_settings` shows `agent_review`;
+  `set_settings` cannot change it.
+- **Results are summaries.** `apply_staged_edits`, `discard_staged_edits`, `undo`, `redo`, `revert_to`, `smart_crop`,
+  `fit_music` and `snap_to_beats` answer `reads::timeline_brief` (durations, clip counts per track) instead of the whole
+  timeline; `staged_diff` has the entries (each with an `id`, the key `apply_staged_subset` takes).
+
+## Background jobs (`mcp/jobs.rs`)
+
+`analyze_asset`, `export`, `export_variants`, `generate_voiceover`, `separate_stems`, `download_speech_model`,
+`import_asset` and `smart_crop` take `background: true` and answer `{job_id}` at once; `job_status`, `cancel_job` and
+`list_jobs` read and stop them. Each is written once against `jobs::Run` (`cancelled()` + `progress(fraction, message)`):
+a foreground call builds it from the request (`foreground`: the `ct` cancellation token and the `progressToken`, with a relay
+task that keeps progress monotonic), a background one from its record in `Jobs` (bounded: 8 running, 48 records, a finished
+job forgotten after an hour). `KerfMcp::long_tool` does the branching, so **argument validation stays in the tool body,
+before it** — a bad path or id is an error on the call, not a job that fails later. `analyze_asset` also stops on the GUI's
+Stop (`AppState.analysis_cancel`, `Run::also_cancelled_by`) and forwards the GUI's `analysis-progress` events for its asset
+to the client (`AnalysisProgressRelay`); `download_speech_model` emits `model-progress` like the GUI's own download.
+Every job that resolves inputs under the lock notes `Project::generation()` and refuses to land its result in a project
+opened since (`require_generation`).
+
+## Small answers, paged reads (`mcp/reads.rs`)
+
+`list_assets` lists each asset with `source_missing` (stat, outside the lock), `proxy` (`ProxyBrief`: state, fraction, ETA,
+reason) and per-kind `analysis` states; `get_asset_metadata` and `analyze_asset` answer an `AnalysisSummary` (counts, totals,
+the first ~600 characters of the transcript); `get_transcript` and `get_analysis_detail` page the lists (`offset` / `limit`,
+`next_offset`, windows in source seconds); `get_timeline_state` moves the *generated* captions into a `captions` window
+(`captions_offset` / `captions_limit`; `full: true` for everything); `history` and `list_tasks` take `offset` / `limit` and
+answer `{total, next_offset, …}`; `generate_captions` answers a count, the first few overlays and the first hundred ids.
+`timeline_summary` carries `media_notes` (the media a cut uses whose proxy is not ready or whose file is gone) and
+`clips_without_proxy` per track.
+
+## Project and settings tools (`mcp/project_tools.rs`)
+
+`project_info`, `save_project`, `save_project_as` (absolute `.kerf`, `overwrite`, reopen guarded by `change_count`),
+`open_project`, `new_project`: replacing a project that exists only in memory needs `discard_unsaved`; a swap emits
+`project-replaced` (the page reloads like after its own open) and does what the GUI's open does (`restore_speech_model`,
+`respawn_proxies`, scrub cache). `get_settings` / `set_settings` are an allow-list (`READABLE` / `WRITABLE`): auto_analysis,
+cpu_percent, proxy_size, preview_source, time_display, plus `agent_review` read-only — never the theme, layout, workspaces,
+shortcuts, token, address or review switch.
+
+## Tool index
+
+Every tool, by purpose (a test pins that this list names each registered tool):
+
+- **Project and library**: `project_info`, `save_project`, `save_project_as`, `open_project`, `new_project`, `list_assets`,
+  `get_asset_metadata`, `import_asset`, `set_asset_projection`, `list_fonts`.
+- **Analysis and proxies**: `analyze_asset`, `analysis_status`, `get_transcript`, `get_analysis_detail`,
+  `transcription_status`, `download_speech_model`, `set_speech_model`, `proxy_status`, `rebuild_proxy`, `delete_proxy`,
+  `get_music_structure`.
+- **Looking and measuring**: `timeline_summary`, `get_timeline_state`, `skim_asset`, `get_frame`, `preview_timeline`,
+  `get_waveform`, `get_waveform_range`, `get_energy`, `get_levels`, `platform_check`.
+- **Editing the cut**: `cut_clip`, `add_clip_to_timeline`, `split_at`, `trim`, `reorder`, `move_clip`, `move_clips`,
+  `ripple_delete`, `cut_clip_range`, `roll_edit`, `slip_clip`, `slide_clip`, `split_remove`, `split_remove_clips`, `remove`,
+  `remove_clips`, `duplicate_clips`, `concatenate`, `remove_silence`, `snap_to_beats`, `smart_crop`, `add_track`,
+  `remove_track`, `get_ripple_mode`, `set_ripple_mode`.
+- **Linked picture and sound**: `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
+  `reattach_audio_clips`, `link_clips`, `unlink_clips`.
+- **Clip look and sound**: `set_volume`, `set_fade`, `set_speed`, `set_transform`, `set_color`, `set_transition`,
+  `set_video_effects`, `set_audio_effects`, `set_mask`, `set_clip_enabled`.
+- **Keyframes and 360**: `set_keyframes`, `add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`, `copy_keyframes`,
+  `clear_keyframes`, `set_reframe`, `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`.
+- **Mix and music**: `set_track_volume`, `set_track_pan`, `set_track_duck`, `set_track_muted`, `set_track_solo`,
+  `set_track_locked`, `set_master_volume`, `set_master_limiter`, `set_master_duck`, `plan_music_fit`, `fit_music`,
+  `separate_stems`, `stems_status`.
+- **Titles, captions, markers, frame**: `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
+  `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `list_svg_presets`, `validate_svg`, `preview_svg_overlay`,
+  `preview_svg_preset`, `generate_captions`, `import_captions`, `clear_captions`, `export_srt`, `add_marker`,
+  `update_marker`, `remove_marker`, `set_delivery_format`.
+- **Voiceover**: `generate_voiceover`, `voiceover_status`.
+- **Delivery**: `export`, `export_variants`, `export_cover`, `export_capabilities`.
+- **Review and history**: `stage_edits`, `staged_diff`, `apply_staged_edits`, `apply_staged_subset`, `discard_staged_edits`,
+  `undo_staged_edit`, `restore_discarded_edits`, `history`, `revision_diff`, `undo`, `redo`, `revert_to`.
+- **Task queue**: `list_tasks`, `add_task`, `claim_next_task`, `complete_task`, `fail_task`, `resolve_task`, `remove_task`.
+- **Background jobs**: `job_status`, `cancel_job`, `list_jobs`.
+- **Settings**: `get_settings`, `set_settings`.
