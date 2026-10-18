@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { Generation } from './generation';
+import { Generation, ReadOrder } from './generation';
 
 describe('Generation', () => {
 	test('starts at a value every snapshot agrees with until something advances', () => {
@@ -48,5 +48,52 @@ describe('Generation', () => {
 		g.advance(); // some fetch (or edit) commits first
 		expect(g.isCurrent(first)).toBe(false);
 		expect(g.isCurrent(second)).toBe(false);
+	});
+});
+
+describe('ReadOrder', () => {
+	test('of the reads that come back, the one that started last writes', () => {
+		const o = new ReadOrder();
+		const older = o.begin();
+		const newer = o.begin();
+		expect(o.land(newer)).toBe(true);
+		expect(o.land(older)).toBe(false);
+	});
+
+	test('a newer read that failed takes nobody’s place: the older answer still lands', () => {
+		const o = new ReadOrder();
+		const older = o.begin();
+		o.begin(); // started later, never landed — its read failed
+		expect(o.land(older)).toBe(true);
+	});
+
+	test('an older answer that comes first lands, and the newer one then replaces it', () => {
+		const o = new ReadOrder();
+		const older = o.begin();
+		const newer = o.begin();
+		expect(o.land(older)).toBe(true);
+		expect(o.isLatest(older)).toBe(true);
+		expect(o.land(newer)).toBe(true);
+		expect(o.isLatest(older)).toBe(false);
+		expect(o.isLatest(newer)).toBe(true);
+	});
+
+	test('an answer lands once', () => {
+		const o = new ReadOrder();
+		const t = o.begin();
+		expect(o.land(t)).toBe(true);
+		expect(o.land(t)).toBe(false);
+	});
+
+	test('invalidate makes every read in flight stale, the newest included, and not the next one', () => {
+		const o = new ReadOrder();
+		const a = o.begin();
+		const b = o.begin();
+		o.invalidate();
+		expect(o.land(a)).toBe(false);
+		expect(o.land(b)).toBe(false);
+		expect(o.isLatest(b)).toBe(false);
+		const next = o.begin();
+		expect(o.land(next)).toBe(true);
 	});
 });

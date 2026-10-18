@@ -156,7 +156,7 @@ import type {
 } from './types';
 import { clipDuration } from './types';
 import { timelineFps } from './timecode';
-import { Generation } from './generation';
+import { Generation, ReadOrder } from './generation';
 import { retimeKeyframes, withKeyframeAt } from './titles';
 import { normalize, pruneSelection, type PickMode } from './selection';
 import { clickSelectLinked } from './link-ui';
@@ -510,6 +510,8 @@ class EditorState {
 		try {
 			this.previewingStaged = false;
 			this.#liveTimeline = null;
+			// A read of the old project's proposal still in flight must not put it back.
+			this.#stagedOrder.invalidate();
 			this.staged = null;
 			this.keyframeSource = null;
 			this.#analysisAsked.clear();
@@ -608,21 +610,23 @@ class EditorState {
 
 	// ---- staged edits (the agent's pending proposal) ------------------------
 
-	/** Orders the reads of the proposal: only the newest one may write (`refreshStaged`, `previewStaged`). */
-	#stagedGen = new Generation();
+	/** Orders the reads of the proposal: of the ones that come back, the newest writes (`refreshStaged`); a project
+	 *  loaded or a proposal settled makes every read in flight stale. */
+	#stagedOrder = new ReadOrder();
 
 	async refreshStaged() {
-		const seq = this.#stagedGen.advance();
+		const ticket = this.#stagedOrder.begin();
 		let next: StagedEdit | null;
 		try {
 			next = await getStagedEdit();
 		} catch {
-			// A read that failed says nothing about the proposal: it is neither gone nor changed.
+			// A read that failed says nothing about the proposal: it is neither gone nor changed — and it
+			// takes nobody's place, so an older read that does come back still lands.
 			return;
 		}
-		// A newer read started while this one was out (the agent staged twice in a burst): its answer
-		// is the later one, and this one must not overwrite it.
-		if (!this.#stagedGen.isCurrent(seq)) return;
+		// A newer read has written while this one was out (the agent staged twice in a burst), or the project
+		// was loaded / the proposal settled: its answer is the later one, and this one must not overwrite it.
+		if (!this.#stagedOrder.land(ticket)) return;
 		this.staged = next;
 		if (!next) {
 			if (this.previewingStaged) await this.exitStagedPreview();
@@ -637,7 +641,7 @@ class EditorState {
 			return;
 		}
 		// The preview may have been left, or the proposal changed again, while that was out.
-		if (proposed && this.previewingStaged && this.#stagedGen.isCurrent(seq)) this.#setTimeline(proposed);
+		if (proposed && this.previewingStaged && this.#stagedOrder.isLatest(ticket)) this.#setTimeline(proposed);
 	}
 
 	/** Show the proposed cut in the editor instead of the live one. */
@@ -678,7 +682,7 @@ class EditorState {
 
 	/** The proposal is gone (applied or discarded): whatever a slower read still brings is older than that. */
 	#proposalSettled() {
-		this.#stagedGen.advance();
+		this.#stagedOrder.invalidate();
 		this.staged = null;
 	}
 

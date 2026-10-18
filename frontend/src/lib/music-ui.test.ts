@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { planMusicFit } from './music-fit';
 import { barLength, describeFit, describeRemainder, fitOffer, fitVerdict, musicSummary, parseTarget } from './music-ui';
 import { sampleMusic } from './sample-music';
+import { formatTime } from './time-format';
 import type { Clip, Track } from './types';
 
 const clip = (extra: Partial<Clip> = {}): Clip => ({
@@ -66,6 +67,14 @@ describe('the words', () => {
 		);
 		expect(describeFit({ duration: 34.5, faded: false, fit: { ...fit, splices: 0 } })).toBe('Music fitted to 0:34.5 · no splices');
 		expect(describeFit({ duration: 90, faded: false, fit: { ...fit, splices: 3 } })).toContain('3 splices');
+	});
+
+	test('and prints the length as the interface does when it is told how', () => {
+		const fit = planMusicFit(sampleMusic(), 30, 44100);
+		const timecode = (s: number) => formatTime(s, 30, 'timecode');
+		expect(describeFit({ duration: 34.5, faded: false, fit: { ...fit, splices: 0 } }, timecode)).toBe(
+			'Music fitted to 00:00:34:15 · no splices'
+		);
 	});
 
 	test('a custom length is a positive number of seconds', () => {

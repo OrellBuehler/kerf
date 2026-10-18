@@ -10,7 +10,7 @@
 	import { importMedia } from '$lib/import-media';
 	import { firstRunAction, firstRunSteps } from '$lib/first-run';
 	import { toast } from '$lib/notifications.svelte';
-	import { errorMessage } from '$lib/ops';
+	import { report } from '$lib/ops';
 	import { clipsIn, exportButtonState } from '$lib/export-button';
 
 	const steps = $derived(
@@ -34,7 +34,7 @@
 			await editor.add(a.id, 0, a.duration, undefined, 0);
 			toast.success(`Added ${a.name} to the timeline`);
 		} catch (e) {
-			toast.error(errorMessage(e));
+			report(e);
 		}
 	}
 	const exportState = $derived(

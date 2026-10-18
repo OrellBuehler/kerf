@@ -34,13 +34,13 @@
 	use:tip={title}
 	aria-label={tipText(title) || undefined}
 	aria-pressed={active}
-	aria-disabled={pending ? 'true' : undefined}
 	onclick={(e: MouseEvent) => {
 		if (pending) return;
 		(onclick as ((e: MouseEvent) => void) | undefined)?.(e);
 	}}
 	style="width:{size}px;height:{size}px;{style}"
 	{...rest}
+	aria-disabled={pending ? 'true' : (rest['aria-disabled'] as boolean | 'true' | 'false' | undefined)}
 >
 	{@render children?.()}
 </button>

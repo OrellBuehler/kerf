@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { badgeLabel, badgeTip, changeWord, discardNeedsConfirm, proposalLine, reviewTarget, touchedOnLive } from './proposal-ui';
+import { badgeTip, changeWord, discardNeedsConfirm, proposalLine, reviewStepTip, reviewTarget, touchedOnLive } from './proposal-ui';
 import { discardProposalCopy } from './confirm-copy';
 import type { DiffEntry, Timeline } from './types';
 
@@ -35,9 +35,8 @@ describe('naming a proposal', () => {
 		expect(proposalLine(1)).toBe('Agent proposes 1 change');
 	});
 
-	test('the badge says who the changes are from, and its tooltip says where to review them', () => {
-		expect(badgeLabel(4)).toBe('4 agent changes');
-		expect(badgeLabel(1)).toBe('1 agent change');
+	test('the chip’s tooltip says who the changes are from, and where to review them', () => {
+		expect(badgeTip(1)).toBe('The agent proposes 1 change — open the Agent panel to review them');
 		expect(badgeTip(4)).toBe('The agent proposes 4 changes — open the Agent panel to review them');
 	});
 });
@@ -97,5 +96,18 @@ describe('clicking a row of the proposal', () => {
 	test('a row with no place and no subject goes nowhere', () => {
 		expect(reviewTarget({}, { previewing: false, live, shown: live })).toEqual({ seek: null, preview: false, target: null });
 		expect(reviewTarget({ at: null, clip_id: 'c1' }, { previewing: false, live, shown: live }).seek).toBeNull();
+	});
+});
+
+describe('the banner counter’s tooltip', () => {
+	test('names the keys the user has bound, not the ones it shipped with', () => {
+		expect(reviewStepTip(3, 4, ['PgUp', '['], [`PgDn`, ']'])).toBe('The proposal changes the cut at 3 places; 4 changes in all. PgUp and PgDn step between them.');
+		expect(reviewStepTip(1, 1, ['F5'], ['F6'])).toBe('The proposal changes the cut at 1 place; 1 change in all. F5 and F6 step between them.');
+	});
+
+	test('says so when only one of them is bound, and nothing about keys when none is', () => {
+		expect(reviewStepTip(2, 2, ['F5'], [])).toContain('F5 steps back between them.');
+		expect(reviewStepTip(2, 2, [], ['F6'])).toContain('F6 steps forward between them.');
+		expect(reviewStepTip(2, 2, [], [])).toBe('The proposal changes the cut at 2 places; 2 changes in all.');
 	});
 });

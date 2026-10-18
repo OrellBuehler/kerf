@@ -33,3 +33,37 @@ export class Generation {
 		return snapshot === this.#v;
 	}
 }
+
+/* Orders overlapping reads of one thing the backend owns (`refreshStaged`): of the reads that *come back*, the one
+ * that started last wins, so a slow older answer never overwrites a newer one. That is not `Generation`'s sequence
+ * guard: it advances when a read *starts*, so a newer read that then fails would leave an older, successful one
+ * unable to land, and nothing would be written at all. Here only a read that has an answer takes its place.
+ * `invalidate()` is for an event that makes every read in flight older than the truth (a project loaded, the
+ * proposal applied or discarded). */
+export class ReadOrder {
+	#started = 0;
+	#landed = 0;
+
+	/** A read starts: its ticket is its place in line. */
+	begin(): number {
+		return ++this.#started;
+	}
+
+	/** A read has an answer: whether it may write it — no read that started later has already written, and nothing
+	 *  has been invalidated since it began. Taking the place is what makes an older answer lose afterwards. */
+	land(ticket: number): boolean {
+		if (ticket <= this.#landed) return false;
+		this.#landed = ticket;
+		return true;
+	}
+
+	/** Whether `ticket` is still the last read to have written (checked again after a second await). */
+	isLatest(ticket: number): boolean {
+		return this.#landed === ticket;
+	}
+
+	/** Every read started so far is now older than what happened: none of them may write. */
+	invalidate(): void {
+		this.#landed = ++this.#started;
+	}
+}

@@ -15,7 +15,8 @@
 	import { confirmReplaceCaptions } from '$lib/title-actions';
 	import { QUICK_EDIT_STEPS } from '$lib/analysis-steps';
 	import { applyProposal, discardProposal, inspectChange } from '$lib/proposal-actions';
-	import { cutSignature, isLocalPreset, quickTarget, silenceOutcome, targetNote } from '$lib/quick-edits';
+	import { QUICK_EDIT_HELD, cutSignature, heldWhilePreviewing, isLocalPreset, quickTarget, silenceOutcome, targetNote } from '$lib/quick-edits';
+	import { holdForPreview, report } from '$lib/ops';
 	import { STATUS_MAP, PRESETS } from './data';
 	import { agentLine, showComposerHint } from '$lib/agent-status';
 	import type { DiffEntry, EditSource, Task, TaskStatus, TimelineDiff } from '$lib/types';
@@ -231,6 +232,8 @@
 			}
 			return;
 		}
+		// Before anything is analyzed or read: the cut on screen is the proposal's, not the project's.
+		if (holdForPreview()) return;
 		if (editor.assets.length === 0) {
 			toast.error('Import media first');
 			return;
@@ -289,7 +292,7 @@
 				await record(p);
 			}
 		} catch (e) {
-			toast.error(e instanceof Error ? e.message : String(e));
+			report(e);
 		}
 	}
 
@@ -315,9 +318,16 @@
 			{ label: 'Copy MCP endpoint', icon: 'copy', action: () => void copy(endpoint, 'endpoint') },
 			{ label: 'Copy connect command', icon: 'copy', action: () => void copy(claudeCmd, 'cmd') },
 			{ type: 'separator' },
-			...PRESETS.map(
-				(p): MenuItem => ({ label: `${isLocalPreset(p) ? 'Run now' : 'Queue for agent'}: ${p}`, icon: 'list-plus', disabled, action: () => void runPreset(p) })
-			)
+			...PRESETS.map((p): MenuItem => {
+				const held = heldWhilePreviewing(p, editor.previewingStaged);
+				return {
+					label: `${isLocalPreset(p) ? 'Run now' : 'Queue for agent'}: ${p}`,
+					icon: 'list-plus',
+					disabled: disabled || held,
+					reason: held ? QUICK_EDIT_HELD : undefined,
+					action: () => void runPreset(p)
+				};
+			})
 		];
 		contextMenu.show(e, items);
 	}
@@ -570,14 +580,14 @@
 					<div style="display:flex;flex-wrap:wrap;gap:6px">
 						{#each [true, false] as local (local)}
 							{#each PRESETS.filter((p) => isLocalPreset(p) === local) as p (p)}
-								{@const held = local && editor.previewingStaged}
+								{@const held = heldWhilePreviewing(p, editor.previewingStaged)}
 								<Btn
 									size="sm"
 									disabled={disabled || held}
 									icon={local ? 'play' : 'list-plus'}
 									iconSize={12}
 									title={held
-										? 'Exit the preview first — this edits your cut'
+										? QUICK_EDIT_HELD
 										: { text: `${local ? 'Run now' : 'Queue for agent'}: ${p}`, detail: targetNote(p, target) }}
 									onclick={() => runPreset(p)}>{p}</Btn
 								>

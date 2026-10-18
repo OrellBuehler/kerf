@@ -26,6 +26,7 @@ const state = (over: Partial<MenuState> = {}): MenuState => ({
 	openPanels: ['library', 'preview', 'timeline', 'inspector', 'agent'],
 	detachedPanels: [],
 	desktop: true,
+	previewing: false,
 	...over
 });
 
@@ -151,6 +152,56 @@ describe('Edit', () => {
 			const e = find(m.items, label);
 			expect('disabled' in e && e.disabled, label).toBe(true);
 			expect('reason' in e && e.reason, label).toBe('Select a clip first');
+		}
+	});
+
+	test('every entry that edits the cut is off, with the one reason, while the proposal is previewed', () => {
+		const REASON = 'Exit the proposal preview to edit';
+		const m = menu('edit', { previewing: true });
+		const edits = [
+			'Undo',
+			'Redo',
+			'Cut',
+			'Paste at playhead',
+			'Duplicate',
+			'Split at playhead',
+			'Delete selection',
+			'Ripple delete selection'
+		];
+		for (const label of edits) {
+			const e = find(m.items, label);
+			expect('disabled' in e && e.disabled, label).toBe(true);
+			expect('reason' in e && e.reason, label).toBe(REASON);
+		}
+		for (const sub of ['Clip', 'Roll, slip, slide']) {
+			const items = (find(m.items, sub) as Extract<MenuEntry, { kind: 'submenu' }>).items.filter((e) => e.kind !== 'separator');
+			expect(items.length, sub).toBeGreaterThan(0);
+			for (const e of items) {
+				expect('disabled' in e && e.disabled, `${sub}: ${entryLabel(e)}`).toBe(true);
+				expect('reason' in e && e.reason, `${sub}: ${entryLabel(e)}`).toBe(REASON);
+			}
+		}
+		const frames = (find(menu('view', { previewing: true }).items, 'Delivery frame') as Extract<MenuEntry, { kind: 'submenu' }>).items;
+		for (const e of frames) expect(e.kind !== 'separator' && e.disabled, 'delivery frame').toBe(true);
+		const captions = find(menu('file', { previewing: true }).items, 'Import captions…');
+		expect('disabled' in captions && captions.disabled).toBe(true);
+	});
+
+	test('what only looks stays on while the proposal is previewed: copy, select all, the tools, ripple and snapping', () => {
+		const m = menu('edit', { previewing: true });
+		for (const label of ['Copy', 'Select all clips', 'Ripple mode', 'Snapping']) {
+			const e = find(m.items, label);
+			expect('disabled' in e && e.disabled, label).toBeFalsy();
+		}
+		const tool = find(m.items, 'Tool') as Extract<MenuEntry, { kind: 'submenu' }>;
+		for (const e of tool.items) expect(e.kind !== 'separator' && e.disabled, 'tool').toBeFalsy();
+	});
+
+	test('and nothing is held for the preview when there is none', () => {
+		for (const m of buildMenus(state())) {
+			for (const e of flatten(m.items)) {
+				if (e.kind !== 'separator' && 'reason' in e) expect(e.reason, `${m.label}: ${entryLabel(e)}`).not.toBe('Exit the proposal preview to edit');
+			}
 		}
 	});
 

@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { clock, fmtNumber, isStale, measureRange, noteTone, readingText, scopeLabel, verdict } from './levels-view';
 import { levelNotes } from './levels';
+import { formatTime } from './time-format';
 import type { LevelReading } from './types';
 
 const reading = (over: Partial<LevelReading> = {}): LevelReading => ({
@@ -89,6 +90,14 @@ describe('the range measured', () => {
 		expect(scopeLabel({ start: 10, end: 25 }, 120)).toBe('In → out · 0:10–0:25');
 		expect(clock(65.4)).toBe('1:05');
 		expect(clock(-3)).toBe('0:00');
+	});
+
+	test('prints its times the way the interface does — the marks are positions on the playhead’s timeline', () => {
+		const timecode = (s: number) => formatTime(s, 30, 'timecode');
+		expect(scopeLabel({ start: 10, end: 25 }, 120, timecode)).toBe('In → out · 00:00:10:00–00:00:25:00');
+		expect(scopeLabel(null, 120, timecode)).toBe('Whole cut · 00:02:00:00');
+		const seconds = (s: number) => formatTime(s, 30, 'seconds');
+		expect(scopeLabel({ start: 10, end: 25 }, 120, seconds)).toBe('In → out · 0:10.0–0:25.0');
 	});
 });
 

@@ -33,7 +33,7 @@
 		makeCaptions,
 		svgPresetInfos
 	} from '$lib/title-actions';
-	import { copyKeyframesOf, pasteKeyframesOnto } from '$lib/ops';
+	import { copyKeyframesOf, pasteKeyframesOnto, report } from '$lib/ops';
 	import { keyframeOffer } from '$lib/keyframe-copy';
 	import { SVG_PRESETS, svgDisplayName, takesParam } from '$lib/svg-titles';
 	import { untrack } from 'svelte';
@@ -125,10 +125,21 @@
 	const overlayOf = (at: Edit): TextOverlay | undefined => editor.overlays.find((o) => o.id === at.overlayId);
 	const svgOf = (at: Edit): SvgOverlay | undefined => editor.svgOverlays.find((o) => o.id === at.svgId);
 	/** Write a title field to the title it took focus on (see `fields`), with what was typed into it. */
-	function patchTitle(el: HTMLInputElement | HTMLSelectElement, patch: (typed: string) => Partial<Omit<TextOverlay, 'id' | 'keyframes'>>) {
+	function patchTitle(
+		el: HTMLInputElement | HTMLSelectElement,
+		patch: (typed: string) => Partial<Omit<TextOverlay, 'id' | 'keyframes'>>,
+		shown?: (o: TextOverlay) => string
+	) {
 		const { scope: at, text } = endEdit(el);
 		const ov = overlayOf(at);
-		if (ov) void run(() => editor.updateOverlay(ov.id, patch(text)));
+		if (!ov) return;
+		// A select changed from the keyboard while an edit is in flight or the proposal is on screen: its press is swallowed
+		// but its keys are not. Nothing is written, and it goes back to what the title has.
+		if (editor.locked) {
+			if (shown && el.isConnected) el.value = shown(ov);
+			return;
+		}
+		void run(() => editor.updateOverlay(ov.id, patch(text)));
 	}
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);
 	const kind = $derived(asset?.streams.some((s) => s.kind === 'video') ? 'video' : 'audio');
@@ -354,10 +365,14 @@
 		const { scope: at, text } = endEdit(el);
 		const o = svgOf(at);
 		if (!o) return;
+		if (editor.locked) {
+			if (el.isConnected) el.value = shown(o);
+			return;
+		}
 		try {
 			await editor.updateSvgOverlay(o.id, patch(text, o));
 		} catch (e) {
-			toast.error(e instanceof Error ? e.message : String(e));
+			report(e);
 			const now = svgOf(at);
 			if (now && el.isConnected) el.value = shown(now);
 		}
@@ -473,9 +488,14 @@
 		const time = Math.max(0, ui.time - c.timeline_start);
 		void run(() => editor.addKeyframe(c.id, Math.round(time * 1000) / 1000));
 	}
-	function setEasing(k: { time: number }, id: string) {
+	function setEasing(el: HTMLSelectElement, k: { time: number }, was: string) {
+		// Pending, not disabled, so the keys still reach the select: nothing is written, and it goes back.
+		if (editor.locked) {
+			el.value = was;
+			return;
+		}
 		const c = clip;
-		const choice = EASING_CHOICES.find((e) => e.id === id);
+		const choice = EASING_CHOICES.find((e) => e.id === el.value);
 		if (!c || !choice) return;
 		void run(() => editor.setKeyframeEasing(c.id, k.time, choice.easing));
 	}
@@ -518,7 +538,7 @@
 		try {
 			await op();
 		} catch (e) {
-			toast.error(e instanceof Error ? e.message : String(e));
+			report(e);
 		}
 	}
 
@@ -560,7 +580,7 @@
 			await op();
 			toast(message, { action: { label: 'Undo', onClick: () => void editor.undo() } });
 		} catch (e) {
-			toast.error(e instanceof Error ? e.message : String(e));
+			report(e);
 		}
 	}
 
@@ -656,7 +676,7 @@
 				// showing something that was ignored, while an accepted one re-renders over this.
 				e.currentTarget.value = timeDisplay.field(value, fps);
 				if (editor.locked) return;
-				if (v === null) toast.error(`“${text.trim()}” is not a time — try 12.5, 0:12.5 or 00:00:12:15`);
+				if (v === null) toast.error(`“${text.trim()}” is not a time — ${timeDisplay.hint()}`);
 				else onCommit(v, at);
 			}}
 			style="{inputCss};width:112px;grid-column:2 / 4;justify-self:end"
@@ -805,7 +825,7 @@
 				onclick={swallow}
 				aria-label="{name}: pick a color"
 				onfocus={noteFocus}
-				onchange={(e) => patchTitle(e.currentTarget, (picked) => patch(withPicked(value, picked, boxAlpha)))}
+				onchange={(e) => patchTitle(e.currentTarget, (picked) => patch(withPicked(value, picked, boxAlpha)), () => swatchHex(value))}
 			/>
 			<input
 				type="text"
@@ -886,7 +906,7 @@
 				aria-disabled={editor.locked || undefined}
 				onmousedown={swallow}
 				onfocus={noteFocus}
-				onchange={(e) => patchTitle(e.currentTarget, (typed) => ({ font: typed }))}
+				onchange={(e) => patchTitle(e.currentTarget, (typed) => ({ font: typed }), (t) => t.font ?? '')}
 				style="grid-column:2 / 5"
 			>
 				<option value="">Default</option>
@@ -1583,8 +1603,7 @@
 							icon="copy"
 							iconSize={12}
 							style="flex:1"
-							aria-disabled={offer.copy.disabled ? 'true' : undefined}
-							pending={editor.locked}
+							pending={editor.locked || offer.copy.disabled}
 							title={offer.copy.reason ?? 'Remember this clip’s animation, to paste onto another clip'}
 							onclick={() => {
 								if (!offer.copy.disabled) copyKeyframesOf(clip.id);
@@ -1595,8 +1614,7 @@
 							icon="clipboard"
 							iconSize={12}
 							style="flex:1"
-							aria-disabled={offer.paste.disabled ? 'true' : undefined}
-							pending={editor.locked}
+							pending={editor.locked || offer.paste.disabled}
 							title={offer.paste.reason ?? 'Give this clip the copied clip’s animation (replaces the numbers it keys)'}
 							onclick={() => {
 								if (!offer.paste.disabled) void pasteKeyframesOnto(clip.id);
@@ -1635,7 +1653,7 @@
 										onmousedown={swallow}
 																use:tip={'How the clip moves from this keyframe to the next'}
 										aria-label={`Easing after the keyframe at ${k.time.toFixed(2)} seconds`}
-										onchange={(e) => setEasing(k, e.currentTarget.value)}
+										onchange={(e) => setEasing(e.currentTarget, k, current)}
 										style="flex:none;width:104px"
 									>
 										{#each EASING_CHOICES as e (e.id)}
@@ -1676,7 +1694,10 @@
 								value={manualProjection}
 								aria-disabled={editor.locked || undefined}
 								onmousedown={swallow}
-												onchange={(e) => (manualProjection = e.currentTarget.value as Projection)}
+						onchange={(e) => {
+							if (editor.locked) e.currentTarget.value = manualProjection;
+							else manualProjection = e.currentTarget.value as Projection;
+						}}
 								style="grid-column:2 / 5"
 							>
 								<option value="equirect">Equirectangular</option>

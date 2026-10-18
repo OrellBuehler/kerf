@@ -12,7 +12,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { mediaStatus } from '$lib/media-status.svelte';
 	import { toast } from '$lib/notifications.svelte';
-	import { exportTranscriptSrt } from '$lib/ops';
+	import { exportTranscriptSrt, report } from '$lib/ops';
 	import { activeLineIndex, srcToTimeline, transcriptLines, type TxLine } from '$lib/transcript';
 	import { tip } from '$lib/tip';
 
@@ -36,7 +36,7 @@
 				action: { label: 'Undo', onClick: () => void editor.undo() }
 			});
 		} catch (e) {
-			toast.error(e instanceof Error ? e.message : String(e));
+			report(e);
 		}
 	}
 

@@ -20,7 +20,7 @@
 	import { editor, EditRefused, PreviewReadOnly } from '$lib/state.svelte';
 	import { agent } from '$lib/agent.svelte';
 	import { applyProposal, discardProposal } from '$lib/proposal-actions';
-	import { changeWord } from '$lib/proposal-ui';
+	import { changeWord, reviewStepTip } from '$lib/proposal-ui';
 	import { updater } from '$lib/updater.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { mediaStatus } from '$lib/media-status.svelte';
@@ -31,10 +31,15 @@
 	import {
 		cutSelection,
 		deleteSelection,
+		addMarker,
 		detachSelection,
+		duplicateClips,
+		holdForPreview,
 		linkSelection,
 		keyEdit,
+		pasteClips,
 		reattachSelection,
+		report,
 		splitSelection,
 		trimSelection,
 		unlinkSelection
@@ -459,23 +464,23 @@
 		e.preventDefault();
 	}
 
-	const clipErr = (err: unknown) => toast.error(err instanceof Error ? err.message : String(err));
-
 	/** Delete / Shift+Delete: a selected title or animated title goes first (whichever of the two it
 	 *  was — a title has no gap to close); else the selected clips as one edit,
 	 *  with `ripple` closing the gaps behind them (plain Delete leaves them,
 	 *  unless ripple mode is on). Nothing selected: not ours, so the key is left alone. */
 	function deleteKey(ripple: boolean): void | false {
 		if (editor.selectedOverlayId) {
+			if (holdForPreview()) return;
 			void editor
 				.removeOverlay(editor.selectedOverlayId)
 				.then(() => toast('Title removed', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
-				.catch(clipErr);
+				.catch(report);
 		} else if (editor.selectedSvgOverlayId) {
+			if (holdForPreview()) return;
 			void editor
 				.removeSvgOverlay(editor.selectedSvgOverlayId)
 				.then(() => toast('Animated title removed', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
-				.catch(clipErr);
+				.catch(report);
 		} else if (editor.selectedClipIds.length > 0) {
 			void deleteSelection(ripple);
 		} else {
@@ -499,9 +504,11 @@
 		'app.quit': () => void onQuit(),
 
 		'edit.undo': () => {
+			if (holdForPreview()) return;
 			if (editor.canUndo) void editor.undo();
 		},
 		'edit.redo': () => {
+			if (holdForPreview()) return;
 			if (editor.canRedo) void editor.redo();
 		},
 		'edit.selectAll': () => editor.selectAll(),
@@ -510,16 +517,8 @@
 			if (n) toast(n === 1 ? 'Clip copied' : `${n} clips copied`);
 		},
 		'edit.cut': () => void cutSelection(),
-		'edit.paste': () =>
-			void editor
-				.paste(ui.time)
-				.then((n) => n && toast(n === 1 ? 'Clip pasted' : `${n} clips pasted`))
-				.catch(clipErr),
-		'edit.duplicate': () =>
-			void editor
-				.duplicateSelection()
-				.then((n) => n && toast(n === 1 ? 'Clip duplicated' : `${n} clips duplicated`))
-				.catch(clipErr),
+		'edit.paste': () => void pasteClips(),
+		'edit.duplicate': () => void duplicateClips(),
 		'edit.split': () => void splitSelection(),
 		'edit.delete': () => deleteKey(false),
 		'edit.rippleDelete': () => deleteKey(true),
@@ -570,7 +569,7 @@
 		},
 		// A project setting: the registry marks it `repeat: false`, so a held key
 		// does not flip it back and forth.
-		'tool.rippleMode': () => void editor.setRippleMode(!editor.rippleMode).catch(clipErr),
+		'tool.rippleMode': () => void editor.setRippleMode(!editor.rippleMode).catch(report),
 
 		'playback.toggle': () => ui.togglePlay(),
 		'playback.shuttleBack': () => ui.shuttle(-1),
@@ -583,11 +582,7 @@
 		'playback.toStart': () => ui.seek(0),
 		'playback.toEnd': () => ui.seek(editor.duration),
 
-		'marker.add': () =>
-			void editor
-				.addMarkerAtPlayhead(ui.time)
-				.then(() => toast('Marker added', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
-				.catch(clipErr),
+		'marker.add': () => void addMarker(),
 		'marker.prev': () => ui.gotoMarker(-1),
 		'marker.next': () => ui.gotoMarker(1),
 		'review.prevChange': () => stepReview(-1),
@@ -631,7 +626,7 @@
 				toast.info('The log folder is available in the desktop app.');
 				return;
 			}
-			void revealLogs().catch(clipErr);
+			void revealLogs().catch(report);
 		},
 		'app.about': () => onAbout()
 	};
@@ -709,7 +704,7 @@
 					<span
 						style="font-family:var(--font-mono);min-width:12ch;text-align:center"
 						aria-live="polite"
-						use:tip={`The proposal changes the cut at ${reviewPoints.length} place${reviewPoints.length === 1 ? '' : 's'}; ${changeWord(editor.staged.diff.entries.length)} in all. Page Up / Page Down step between them.`}
+						use:tip={reviewStepTip(reviewPoints.length, editor.staged.diff.entries.length, settings.keysFor('review.prevChange'), settings.keysFor('review.nextChange'))}
 						>{reviewPoints.length > 0 ? `place ${changeIndex(reviewPoints, ui.time, editor.fps, editor.duration)} of ${reviewPoints.length}` : 'no places'}</span
 					>
 					<button
