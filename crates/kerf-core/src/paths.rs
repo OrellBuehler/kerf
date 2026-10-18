@@ -60,10 +60,18 @@ pub fn canonical(path: &Path) -> PathBuf {
     };
     // `..` and `.` that a missing directory kept the filesystem from resolving are folded textually.
     let absolute = fold_dots(&absolute);
-    match (absolute.parent(), absolute.file_name()) {
-        (Some(dir), Some(name)) => std::fs::canonicalize(dir).map_or(absolute.clone(), |dir| dir.join(name)),
-        _ => absolute,
+    // Resolve the deepest ancestor that exists and keep the missing tail as written, so
+    // `/var/x/missing/out.mp4` on macOS still reads as `/private/var/x/missing/out.mp4`.
+    let mut tail = Vec::new();
+    let mut dir = absolute.as_path();
+    while let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) {
+        tail.push(name);
+        if let Ok(real) = std::fs::canonicalize(parent) {
+            return tail.iter().rev().fold(real, |acc, part| acc.join(part));
+        }
+        dir = parent;
     }
+    absolute
 }
 
 /// `path` with its `.` and `..` components resolved textually.
@@ -197,6 +205,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_tail_under_a_symlinked_directory_resolves_through_the_link() {
+        let real = dir("real");
+        let link = real.with_file_name(format!("kerf-paths-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let resolved = canonical(&link.join("missing").join("deeper").join("out.mp4"));
+        assert_eq!(resolved, std::fs::canonicalize(&real).unwrap().join("missing/deeper/out.mp4"));
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&real);
     }
 
     #[test]
