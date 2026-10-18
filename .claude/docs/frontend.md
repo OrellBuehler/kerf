@@ -1363,7 +1363,8 @@ offered it like the mixer in Audio: `UNSTAMPED_OFFERED` leaves it out, `EARLIER_
 selector picks waveform / RGB parade / vectorscope / histogram (remembered in `localStorage`), drawn on a canvas from
 `get_scopes`' grids by `scopes-view.ts` (pure, bun-tested: log density, row 0 at the bottom, 75 % targets and the
 skin-tone line on the vectorscope), and the readout under it is the summary (`summaryLines`: a clipped channel is
-counted in pixels and warns). The frame is the export's still from the originals, so it is a real decode: one request
-in flight, the newest playhead and cut asked for once it lands, 150 ms after the last change while paused and once a
-second while playing, nothing while the panel is hidden. Colours are the `--scope-*` tokens (derived from the theme's
-bases in `kerf-tokens.css`), resolved again on a theme change. The harness answers colour bars (`harnessScopes`).
+counted in pixels and warns). The frame is the export's still from the originals at 960 wide, niced, so it is a real
+decode: one request in flight, the newest playhead and cut asked for once it lands, 150 ms after the last change while
+paused and every 2 s while playing, nothing while the panel is hidden. Colours are the `--scope-*` tokens (derived from
+the theme's bases in `kerf-tokens.css`; the parade's blue is the theme's own `blue-500`), resolved again on a theme
+change. The harness answers colour bars (`harnessScopes`).

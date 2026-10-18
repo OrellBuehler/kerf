@@ -132,8 +132,8 @@ export const PRESET_LAYOUTS: Record<WorkspaceId, SerializedDockview> = {
 	color: preset(
 		560,
 		[
-			leaf('library', ['library'], 220),
-			leaf('preview', ['preview'], 580),
+			leaf('library', ['library'], 240),
+			leaf('preview', ['preview'], 560),
 			leaf('scopes', ['scopes'], 320),
 			leaf('inspector', ['inspector', 'agent'], 320)
 		],

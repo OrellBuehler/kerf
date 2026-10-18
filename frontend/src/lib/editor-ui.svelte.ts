@@ -185,6 +185,9 @@ class EditorUi {
 	/** Bumped when a preview proxy finishes generating, to nudge the preview into
 	 *  re-decoding the current frame (now served from the fast all-intra proxy). */
 	previewEpoch = $state(0);
+	/** The width the Preview asks its frames at (`null` before it has a box): the render bar
+	 *  judges the cut at it. */
+	previewWidth = $state<number | null>(null);
 	/** System font family names available for the text overlay font picker. */
 	availableFonts = $state<string[]>([]);
 

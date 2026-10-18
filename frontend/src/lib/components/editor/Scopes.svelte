@@ -76,7 +76,13 @@
 
 	// ---- fetching ---------------------------------------------------------------
 
-	let scopes = $state<Scopes | null>(null);
+	/** The width the frame is measured at: enough for the grids and a fair clip count, a
+	 *  fraction of a 4K decode. */
+	const SCOPE_WIDTH = 960;
+	/** While playing, a measurement every this often: the decode is from the originals. */
+	const PLAYING_EVERY_MS = 2000;
+
+	let scopes = $state.raw<Scopes | null>(null);
 	let error = $state<string | null>(null);
 	let inFlight = false;
 	let timer: ReturnType<typeof setTimeout> | null = null;
@@ -98,7 +104,7 @@
 		const key = want;
 		const t = ui.time;
 		try {
-			scopes = await getScopes(t, [kind], PANEL_GRID);
+			scopes = await getScopes(t, [kind], PANEL_GRID, 'auto', SCOPE_WIDTH);
 			error = null;
 		} catch (e) {
 			error = describeError(e);
@@ -117,7 +123,7 @@
 				timer = null;
 				void fetchNow();
 			},
-			ui.playing ? 1000 : 150
+			ui.playing ? PLAYING_EVERY_MS : 150
 		);
 	}
 

@@ -2,10 +2,12 @@
 	// The render bar: a thin strip along the top of the ruler saying how the Preview will play each
 	// span (`render-bar.ts`, `get_render_bar`): green where the GPU preview draws it, yellow where it
 	// hands over to the FFmpeg stream, red where playback stalls. With the GPU preview off only the
-	// red spans show. Asked again a moment after the cut, the media or the setting changes.
+	// red spans show. Asked again a moment after the cut, the media, the setting or the Preview's
+	// width changes: one request in flight, the newest asked for once it lands.
 	import { untrack } from 'svelte';
 	import { editor } from '$lib/state.svelte';
 	import { settings } from '$lib/settings.svelte';
+	import { ui } from '$lib/editor-ui.svelte';
 	import { getRenderBar } from '$lib/api';
 	import { tip } from '$lib/tip';
 	import { barColor, barTip, spansIn } from '$lib/render-bar';
@@ -18,31 +20,49 @@
 		tc
 	}: { pxPerSec: number; from: number; to: number; tc: (t: number) => string } = $props();
 
-	let spans = $state<BarSpan[]>([]);
+	let spans = $state.raw<BarSpan[]>([]);
 	let timer: ReturnType<typeof setTimeout> | null = null;
-	let asked = 0;
+	let inFlight = false;
+	/** A change arrived while a request was out: ask once more when it lands. */
+	let again = false;
+	let alive = true;
+
+	async function ask() {
+		if (inFlight) {
+			again = true;
+			return;
+		}
+		inFlight = true;
+		again = false;
+		try {
+			const bar = await getRenderBar(ui.previewWidth ?? undefined);
+			if (alive) spans = bar.spans;
+		} catch {
+			if (alive) spans = [];
+		} finally {
+			inFlight = false;
+			if (again && alive) void ask();
+		}
+	}
 
 	$effect(() => {
 		void editor.timeline;
 		void editor.assets;
 		void settings.gpuPreview;
+		void ui.previewWidth;
 		untrack(() => {
 			if (timer) clearTimeout(timer);
 			timer = setTimeout(() => {
 				timer = null;
-				const n = ++asked;
-				getRenderBar()
-					.then((bar) => {
-						if (n === asked) spans = bar.spans;
-					})
-					.catch(() => {
-						if (n === asked) spans = [];
-					});
+				void ask();
 			}, 400);
 		});
 		return () => {
 			if (timer) clearTimeout(timer);
 		};
+	});
+	$effect(() => () => {
+		alive = false;
 	});
 
 	const shown = $derived(spansIn(spans, from, to));

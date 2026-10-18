@@ -14,6 +14,9 @@
 //!   the size the Preview renders) or a title that moves ([`PlayRefusal::MovingText`]).
 //! * With it off (the default) the stream plays everything else, and nothing is said about it.
 //!
+//! Where nothing is drawn — an audio-only cut, muted video, a gap with no title over it — there is
+//! no span. A cut at a rate the playing preview does not draw is the stream's throughout.
+//!
 //! What only the running GPU preview knows (the self-test, a container whose seeks are not
 //! trusted, a surface or backend that is down) is not here: a span shown green can still be the
 //! stream's in a session.
@@ -21,14 +24,16 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::engine::{render_geometry, ExportOptions, MAX_STREAM_FPS, MIN_STREAM_FPS};
 use crate::media::MediaResolver;
-use crate::model::{Asset, Timeline};
+use crate::model::{Asset, StreamKind, Timeline};
 use crate::plan_caps::GpuCaps;
 use crate::play_plan::{PlayCut, PlayRefusal};
 use crate::render_plan::{still_size, CompositeColorPolicy};
 
-/// Frames judged at most; a longer cut is judged every `n`th frame.
-pub const MAX_BAR_FRAMES: u64 = 200_000;
+/// Frames judged at most — about one per pixel of a timeline zoomed to fit; a longer cut is
+/// judged every `n`th frame.
+pub const MAX_BAR_FRAMES: u64 = 25_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,6 +87,9 @@ fn judge(cut: &PlayCut, k: u64, size: (u32, u32), req: &BarRequest<'_>) -> Optio
             return Some((BarState::Stall, why.kind().to_string(), why.to_string()));
         }
     };
+    if plan.layers.is_empty() && plan.overlays.is_empty() {
+        return None;
+    }
     if let Some((_, msg)) = req.waits.iter().find(|(id, _)| plan.layers.iter().any(|l| l.asset_id == *id)) {
         return Some((BarState::Stall, "proxy_wait".to_string(), msg.clone()));
     }
@@ -105,24 +113,32 @@ pub fn render_bar(timeline: &Timeline, assets: &[Asset], req: &BarRequest<'_>) -
         gpu_preview: req.caps.is_some(),
         spans: Vec::new(),
     };
-    let end = timeline.for_render().duration();
-    if end.is_nan() || end <= 0.0 {
+    let rendered = timeline.for_render();
+    let end = rendered.duration();
+    let video = rendered
+        .tracks
+        .iter()
+        .any(|t| t.kind == StreamKind::Video && !t.clips.is_empty());
+    if end.is_nan() || end <= 0.0 || !video {
         return bar;
     }
-    let cut = match PlayCut::new(timeline, assets, 0.0, req.color, req.media) {
-        Ok(cut) => cut,
-        Err(e) => {
-            if bar.gpu_preview {
-                bar.spans.push(BarSpan {
-                    start: 0.0,
-                    end,
-                    state: BarState::Stream,
-                    kind: "no_plan".to_string(),
-                    reason: e.to_string(),
-                });
-            }
-            return bar;
+    let fps = render_geometry(&rendered, assets, &ExportOptions::default()).fps;
+    if !(MIN_STREAM_FPS..=MAX_STREAM_FPS).contains(&fps) {
+        if bar.gpu_preview {
+            bar.spans.push(BarSpan {
+                start: 0.0,
+                end,
+                state: BarState::Stream,
+                kind: "rate".to_string(),
+                reason: format!("the cut's {fps} fps is outside the {MIN_STREAM_FPS} to {MAX_STREAM_FPS} the GPU preview plays"),
+            });
         }
+        return bar;
+    }
+    // Whatever else stops the cut from being planned whole is no span: a frame the planner cannot
+    // plan shows as a stall where it can say so.
+    let Ok(cut) = PlayCut::new(timeline, assets, 0.0, req.color, req.media) else {
+        return bar;
     };
     let size = still_size(cut.frame().0, cut.frame().1, req.width);
     let last = cut.frame_at(end - 1e-9);
@@ -305,15 +321,39 @@ mod tests {
     }
 
     #[test]
-    fn nothing_to_play_is_an_empty_bar_and_a_cut_the_gpu_cannot_plan_is_the_streams() {
+    fn nothing_to_play_is_an_empty_bar_and_a_rate_the_gpu_does_not_play_is_the_streams() {
         assert!(bar(&Timeline::default(), &[], Some(caps()), Vec::new()).spans.is_empty());
         let mut fast = test_asset(vec![video_stream(1280, 720, 120.0)]);
         fast.streams[0].pix_fmt = Some("yuv420p".into());
         let tl = timeline_of(vec![video_track(vec![make_clip(fast.id, 0.0, 1.0, 0.0)])]);
         let on = bar(&tl, std::slice::from_ref(&fast), Some(caps()), Vec::new());
-        assert_eq!(states(&on), vec![(BarState::Stream, "no_plan".to_string())]);
+        assert_eq!(states(&on), vec![(BarState::Stream, "rate".to_string())]);
         assert!(on.spans[0].reason.contains("120"), "{}", on.spans[0].reason);
         assert!(bar(&tl, &[fast], None, Vec::new()).spans.is_empty());
+    }
+
+    #[test]
+    fn what_shows_no_picture_has_no_span() {
+        let a = asset();
+        let mut muted = timeline_of(vec![video_track(vec![make_clip(a.id, 0.0, 2.0, 0.0)])]);
+        muted.tracks[0].muted = true;
+        assert!(bar(&muted, std::slice::from_ref(&a), Some(caps()), Vec::new())
+            .spans
+            .is_empty());
+        let mut sound = muted.clone();
+        sound.tracks[0].kind = StreamKind::Audio;
+        sound.tracks[0].muted = false;
+        assert!(bar(&sound, std::slice::from_ref(&a), Some(caps()), Vec::new())
+            .spans
+            .is_empty());
+        // A gap between two clips is no one's.
+        let gap = timeline_of(vec![video_track(vec![
+            make_clip(a.id, 0.0, 1.0, 0.0),
+            make_clip(a.id, 0.0, 1.0, 2.0),
+        ])]);
+        let on = bar(&gap, &[a], Some(caps()), Vec::new());
+        assert_eq!(on.spans.len(), 2, "{:?}", on.spans);
+        assert!(near(on.spans[0].end, 1.0) && near(on.spans[1].start, 2.0), "{:?}", on.spans);
     }
 
     #[test]

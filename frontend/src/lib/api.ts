@@ -3098,10 +3098,11 @@ export async function getScopes(
 	timeSecs: number,
 	grids: ScopeKind[] = [],
 	size?: ScopeGridSize,
-	matrix: ScopeMatrix = 'auto'
+	matrix: ScopeMatrix = 'auto',
+	maxWidth?: number
 ): Promise<Scopes> {
 	if (!inTauri()) return harnessScopes(grids, size);
-	return invoke<Scopes>('get_scopes', { timeSecs, grids, size: size ?? null, matrix });
+	return invoke<Scopes>('get_scopes', { timeSecs, grids, size: size ?? null, matrix, maxWidth: maxWidth ?? null });
 }
 
 /**

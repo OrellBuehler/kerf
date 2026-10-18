@@ -7760,7 +7760,15 @@ pub fn timeline_frame_yuv(
 ) -> Result<(u32, u32, Vec<u8>)> {
     let fmt = export_format(&timeline.for_render(), assets, opts);
     let (w, h) = still_size(fmt.width, fmt.height, max_width);
-    let planes = run_still(timeline, assets, opts, t, max_width, None, &StillOutput::Yuv444Pipe)?;
+    let planes = run_still(
+        timeline,
+        assets,
+        opts,
+        t,
+        max_width,
+        None,
+        &StillOutput::Yuv444Pipe { width: w, height: h },
+    )?;
     if planes.len() != (w as usize) * (h as usize) * 3 {
         return Err(Error::Engine(format!(
             "could not render timeline frame at {t:.3}s: {} bytes for a {w}x{h} frame",
@@ -7837,6 +7845,12 @@ fn run_still(
     out: &StillOutput,
 ) -> Result<Vec<u8>> {
     let piping = matches!(out, StillOutput::JpegPipe { .. });
+    // The scopes are a measurement, not the frame the user is waiting to see: niced. Their output
+    // size is known, so the read buffer is allocated once instead of doubling through ~3 MB.
+    let (background, capacity) = match out {
+        StillOutput::Yuv444Pipe { width, height } => (true, (*width as usize) * (*height as usize) * 3),
+        _ => (false, 0),
+    };
     let hw_used = std::cell::Cell::new(false);
     // The titles' pictures, on disk and kept for the run (and its software retry).
     let _titles = still_titles(timeline, assets, opts, t, max_width, region)?;
@@ -7844,7 +7858,8 @@ fn run_still(
         let mut args = build_still_args(timeline, assets, o, t, max_width, region, out)?;
         hw_used.set(tune_still_args(&mut args, assets, HostOs::CURRENT));
         let bin = ffmpeg_bin();
-        let output = output_bounded(command(&bin).args(&args), STILL_TIMEOUT).map_err(|e| match e.kind() {
+        let mut cmd = if background { bg_command(&bin) } else { command(&bin) };
+        let output = output_bounded(cmd.args(&args), STILL_TIMEOUT, capacity).map_err(|e| match e.kind() {
             std::io::ErrorKind::TimedOut => Error::Engine(format!(
                 "could not render timeline frame at {t:.3}s: ffmpeg did not answer in {} s and was stopped",
                 STILL_TIMEOUT.as_secs()
@@ -7885,9 +7900,9 @@ const STILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// `Command::output()` with a deadline: run `cmd` with its stdin closed and both output pipes
 /// read, and kill it if it has not finished in `limit` (`ErrorKind::TimedOut`). The calling thread
-/// reads stdout to its end, a watchdog kills the process at the deadline (which ends that read),
+/// reads stdout to its end (into a buffer of `capacity` bytes up front), a watchdog kills the process at the deadline (which ends that read),
 /// and nothing waits on the child while the watchdog could need it.
-fn output_bounded(cmd: &mut Command, limit: std::time::Duration) -> std::io::Result<std::process::Output> {
+fn output_bounded(cmd: &mut Command, limit: std::time::Duration, capacity: usize) -> std::io::Result<std::process::Output> {
     use std::io::Read;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{channel, RecvTimeoutError};
@@ -7920,7 +7935,7 @@ fn output_bounded(cmd: &mut Command, limit: std::time::Duration) -> std::io::Res
         }
         text
     });
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(capacity);
     let read = match stdout.as_mut() {
         Some(o) => o.read_to_end(&mut out).map(|_| ()),
         None => Ok(()),
@@ -8000,8 +8015,9 @@ pub enum StillOutput {
     /// Raw `rgb24` on stdout — only for [`composite_color_policy`]'s probe, which
     /// wants the converted pixels themselves.
     RgbPipe,
-    /// Raw planar `yuv444p` on stdout — [`timeline_frame_yuv`], for the scopes.
-    Yuv444Pipe,
+    /// Raw planar `yuv444p` on stdout — [`timeline_frame_yuv`], for the scopes. The frame's size
+    /// sizes the read buffer; the argv does not carry it (the graph scales to `max_width`).
+    Yuv444Pipe { width: u32, height: u32 },
 }
 
 /// The image formats a cover frame can be written as.
@@ -8057,7 +8073,7 @@ impl StillOutput {
             StillOutput::RgbPipe => {
                 a.extend(["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"].map(String::from));
             }
-            StillOutput::Yuv444Pipe => {
+            StillOutput::Yuv444Pipe { .. } => {
                 a.extend(["-f", "rawvideo", "-pix_fmt", "yuv444p", "pipe:1"].map(String::from));
             }
             StillOutput::File { path, format, quality } => {
@@ -10082,6 +10098,27 @@ mod tests {
         let args = build_still_args(&timeline, &assets, &ExportOptions::default(), 1.0, u32::MAX, None, &out).unwrap();
         assert!(args.windows(2).any(|w| w[0] == "-vcodec" && w[1] == "png"));
         assert!(!args.contains(&"-q:v".to_string()), "-q:v is meaningless for png: {args:?}");
+    }
+
+    #[test]
+    fn the_scopes_still_pipes_raw_yuv444_and_is_otherwise_the_jpeg_still() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let assets = vec![asset.clone()];
+        let timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
+        let o = ExportOptions::default();
+        let yuv = StillOutput::Yuv444Pipe { width: 960, height: 540 };
+        let args = build_still_args(&timeline, &assets, &o, 1.0, 960, None, &yuv).unwrap();
+        let tail = ["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv444p", "pipe:1"];
+        assert_eq!(&args[args.len() - tail.len()..], tail.map(String::from).as_slice());
+        let jpeg = build_still_args(&timeline, &assets, &o, 1.0, 960, None, &StillOutput::JpegPipe { quality: 3 }).unwrap();
+        let head = |a: &[String]| a[..a.iter().position(|x| x == "-frames:v").unwrap()].to_vec();
+        assert_eq!(head(&args), head(&jpeg), "only the sink differs");
+        // The size only sizes the read buffer.
+        let other = StillOutput::Yuv444Pipe { width: 1, height: 1 };
+        assert_eq!(
+            build_still_args(&timeline, &assets, &o, 1.0, 960, None, &other).unwrap(),
+            args
+        );
     }
 
     #[test]

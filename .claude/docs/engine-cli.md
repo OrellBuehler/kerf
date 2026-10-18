@@ -1034,5 +1034,6 @@ them limited-range with the delivery's matrix (`delivery_matrix`: BT.709 at 1280
 caller can name `bt601` / `bt709` / `bt2020`), clipping what the cube cannot hold, as a screen does. `analyze` reads every
 pixel for the summary and the histogram (min / max / mean, pixels at 0 and 255 — a single clipped pixel is counted, which a
 decimated read misses) and a decimated frame (at most 480 x 270 samples) for the waveform, parade and vectorscope grids and
-the peaks (a 64² vectorscope, cells with at least 1 % of the samples). A moment read: ungated by `cpu::lease`, thread-capped
-by the still's spawn-time tuning. `scopes_of_a_rendered_frame` (`#[ignore]`d) holds a one-pixel clip through the real graph.
+the peaks (a 64² vectorscope, cells with at least 1 % of the samples). A measurement, not a frame anyone waits to see:
+ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still's spawn-time tuning, at most
+`MAX_SCOPE_WIDTH` (3840) wide, the pipe read into a buffer sized from the frame (`output_bounded`'s `capacity`). `scopes_of_a_rendered_frame` (`#[ignore]`d) holds a one-pixel clip through the real graph.

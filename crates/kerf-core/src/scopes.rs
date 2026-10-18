@@ -20,6 +20,8 @@ use crate::error::{Error, Result};
 use crate::model::{Asset, Timeline};
 use crate::render_plan::YuvMatrix;
 
+/// The widest frame the scopes render: a 4K delivery is read whole, a larger one scaled to this.
+pub const MAX_SCOPE_WIDTH: u32 = 3840;
 /// The decimated frame the grids are binned from is at most this wide and tall.
 pub const MAX_SAMPLE_W: u32 = 480;
 pub const MAX_SAMPLE_H: u32 = 270;
@@ -470,7 +472,7 @@ fn vector_peaks(grid: &Grid, samples: u64) -> Vec<VectorPeak> {
 #[derive(Debug, Clone, Default)]
 pub struct ScopeRequest {
     pub time_secs: f64,
-    /// Render width; `None` is the delivery frame itself.
+    /// Render width (64..=[`MAX_SCOPE_WIDTH`]); `None` is the delivery frame, up to that.
     pub max_width: Option<u32>,
     pub matrix: ScopeMatrix,
     pub options: ScopeOptions,
@@ -490,7 +492,7 @@ pub fn timeline_scopes(timeline: &Timeline, assets: &[Asset], req: &ScopeRequest
         hwaccel: crate::engine::decode_hwaccel(),
         ..crate::engine::ExportOptions::default()
     };
-    let max_width = req.max_width.unwrap_or(u32::MAX);
+    let max_width = req.max_width.unwrap_or(MAX_SCOPE_WIDTH).clamp(64, MAX_SCOPE_WIDTH);
     let (w, h, planes) = crate::engine::timeline_frame_yuv(timeline, assets, &opts, req.time_secs.max(0.0), max_width)?;
     let rgba = yuv444_to_rgba(&planes, w, h, matrix);
     Ok(analyze(

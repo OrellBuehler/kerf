@@ -2747,7 +2747,7 @@ async fn get_scopes(
         let (timeline, assets) = lock_user(&shared).export_still_inputs().map_err(|e| e.to_string())?;
         let req = kerf_core::scopes::ScopeRequest {
             time_secs,
-            max_width: max_width.map(|w| w.max(64)),
+            max_width: max_width.map(|w| w.clamp(64, kerf_core::scopes::MAX_SCOPE_WIDTH)),
             matrix: matrix.unwrap_or_default(),
             options: kerf_core::scopes::ScopeOptions {
                 grids: grids.unwrap_or_default(),
@@ -2782,7 +2782,12 @@ async fn get_render_bar(
             width: width.unwrap_or(960).clamp(64, 1920),
             color: kerf_core::composite_color_policy(),
             media: &kerf_core::ProxyMedia,
-            waits: waits.iter().map(|w| (w.asset_id, w.message())).collect(),
+            // Named, not with the build's progress: the bar is asked again on an edit, not as a
+            // proxy builds, so a percentage would go stale under the pointer.
+            waits: waits
+                .iter()
+                .map(|w| (w.asset_id, format!("{} of {}", kerf_core::proxy::PROXY_WAIT_PREFIX, w.name)))
+                .collect(),
         };
         Ok(kerf_core::render_bar::render_bar(&timeline, &assets, &req))
     })
