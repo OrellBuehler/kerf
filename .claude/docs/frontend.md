@@ -1330,6 +1330,23 @@ reject as the backend does and leave nothing behind. `api-ripple.test.ts` drives
 `music-fit.ts` is the same arrangement for fit-to-length (`plan_music_fit`, `music_fit_clips` and
 `Project::fit_music`'s checks, messages included; `music-fit.test.ts` replays the Rust cases), behind
 `planMusicFit` / `fitMusic`.
+**Composed music and band balance** (bridge only so far; the Compose dialog and the clip inspector come
+next). `api.ts`: `musicStatus` / `prepareMusic` (the SoundFont, ~32 MB) / `composeMusic(ComposeRequest)` →
+`ComposeResult` (`Composed` + the refreshed `timeline`) / `cancelMusic` / `onMusicProgress` (`music-progress`:
+`download_soundfont`, `waiting`, `render`, an agent's runs included), `getBandBalance(BandBalanceRequest)` →
+`BandBalance` / `cancelBandBalance`; a stopped run rejects `music cancelled` (`MUSIC_CANCELLED`) /
+`band balance cancelled` (`BAND_BALANCE_CANCELLED`), which a dialog stays quiet on. The ids are snake_case
+inside the request (`track_id`, `replace_clip_id`), unlike the camelCase arguments of the older commands.
+`music-score.ts` is the faithful mirror of the score's pure half — `scoreDuration`, `sectionSpans`,
+`validateScore` (the engine's refusals, word for word, naming the section or chord), `chordError` /
+`keyError` (the grammar only) and `planScoreToPicture` — replayed from the Rust cases in
+`music-score.test.ts`, for the dialog's live length and errors and for the harness. Under `bun run dev`
+`composeMusic` fakes the SoundFont download and render ticks, lands an audio-only asset as long as the score
+on the `M` track (the same score is the same asset by path; its tempo and bar analysis written from the
+score), swaps the clip for `replace_clip_id`, aligns to the first video track's cuts or the markers, and
+refuses what the engine refuses; `getBandBalance` picks its windows as `project/music.rs` does and words its
+`notes` as `balance_notes` (`band-balance.ts`) but the measurement itself is made up. `api-compose.test.ts`
+drives the bridge.
 This browser sample is a **dev harness only** — the desktop app always
 uses the real backend and starts empty. State is two runes singletons: `src/lib/state.svelte.ts`
 (`export const editor` — assets, timeline, analyses, selection, and the editing actions that

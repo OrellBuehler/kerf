@@ -56,6 +56,17 @@ import type {
 	MasterBus,
 	MusicFit,
 	MusicFitted,
+	MusicProgress,
+	MusicStatus,
+	ComposeRequest,
+	ComposeResult,
+	AlignReport,
+	BandBalance,
+	BandBalanceRequest,
+	BandWindow,
+	MusicScore,
+	ScoreAlign,
+	SectionKind,
 	PreviewBoundsReport,
 	PlatformTarget,
 	PlayAsk,
@@ -150,7 +161,18 @@ import { runEdit } from './link-ops';
 import { sourceLimits } from './trim-tools';
 import { clampCeiling, clampDuckDepth, clampMasterVolume, DEFAULT_MASTER, estimateLevels, masterOf } from './levels';
 import { toFixedEven } from './format-fixed';
-import { fitMusicOnto, musicFitInputs, type FitSources } from './music-fit';
+import { fitMusicOnto, musicFitInputs, phraseMatches, tempoFromGrid, type FitSources } from './music-fit';
+import {
+	MUSIC_STYLES,
+	barSeconds,
+	planScoreToPicture,
+	scoreDuration,
+	scoreTitle,
+	sectionLabels,
+	sectionSpans,
+	validateScore
+} from './music-score';
+import { balanceNotes, checkSections, equalWindows, phraseWindows, clipWindows, synthBalance } from './band-balance';
 import { sampleMusicAnalysis, SAMPLE_MUSIC_DURATION } from './sample-music';
 import { exportSpan, report as platformReport, TARGETS } from './platforms';
 import { centeredCrop } from './smart-crop';
@@ -1710,6 +1732,376 @@ export async function onVoiceoverProgress(cb: (p: VoiceoverProgress) => void): P
 	}
 	const { listen } = await import('@tauri-apps/api/event');
 	return listen<VoiceoverProgress>('voiceover-progress', (e) => cb(e.payload));
+}
+
+// ---- composed music (SoundFont synthesizer) -----------------------------------
+
+// The browser harness has no synthesizer, so it fakes one: a SoundFont download on first use and a
+// few render ticks, then an audio-only asset as long as the score, with the tempo and bar analysis
+// written from the score exactly as `Project::place_music` does. What stays real is everything the
+// editor does with the result — the M track, replacing a clip, aligning to the cuts (the faithful
+// mirror in `music-score.ts`), and the refusals, worded as the engine words them.
+const devMusicListeners = new Set<(p: MusicProgress) => void>();
+let devMusicReady = false;
+let devMusicCancelled = false;
+let devMusicRendering = 0;
+const DEV_SOUNDFONT_BYTES = 32319396;
+
+/** What a cancelled composition rejects with, for a dialog to stay quiet on. */
+export const MUSIC_CANCELLED = 'music cancelled';
+/** What a stopped band-balance measurement rejects with. */
+export const BAND_BALANCE_CANCELLED = 'band balance cancelled';
+
+function devMusicStatus(): MusicStatus {
+	return {
+		soundfont_ready: devMusicReady,
+		soundfont: 'GeneralUser-GS-v2.0.3.sf2',
+		approx_download_bytes: devMusicReady ? 0 : DEV_SOUNDFONT_BYTES,
+		rendering: devMusicRendering,
+		sample_rate: 48000,
+		styles: MUSIC_STYLES.map((s) => ({ ...s }))
+	};
+}
+
+function devMusicEmit(p: MusicProgress) {
+	for (const cb of devMusicListeners) cb(p);
+}
+
+async function devMusicStage(stage: MusicProgress['stage'], steps: number, detail: (i: number) => string) {
+	for (let i = 1; i <= steps; i++) {
+		await new Promise((r) => setTimeout(r, 220));
+		if (devMusicCancelled) throw new Error(MUSIC_CANCELLED);
+		devMusicEmit({ stage, fraction: i / steps, detail: detail(i) });
+	}
+}
+
+async function devSoundfont() {
+	if (devMusicReady) return;
+	await devMusicStage('download_soundfont', 4, (i) => `${Math.round((i / 4) * 32)} MB / 32 MB`);
+	devMusicReady = true;
+}
+
+/** A stable short hex name for a score, so the same score is the same file and the same asset. */
+function devScoreHash(score: MusicScore): string {
+	let h = 0xcbf29ce484222325n;
+	for (const c of new TextEncoder().encode(JSON.stringify(score))) h = ((h ^ BigInt(c)) * 0x100000001b3n) & 0xffffffffffffffffn;
+	return h.toString(16).padStart(16, '0');
+}
+
+/** The timeline's cut times a score is fitted to (`cut_times` in `project/music.rs`). */
+function devAlignCuts(align: ScoreAlign): number[] {
+	if (align.to === 'markers') {
+		const markers = devTimeline.markers ?? [];
+		if (markers.length === 0) throw new Error('invalid argument: there are no markers to align the music to');
+		return markers.map((m) => m.time);
+	}
+	const track = align.track_id
+		? devTimeline.tracks.find((t) => t.id === align.track_id)
+		: devTimeline.tracks.find((t) => t.kind === 'video');
+	if (align.track_id && !track) throw new Error(`track not found: ${align.track_id}`);
+	if (!track) throw new Error('invalid argument: there is no video track to align the music to');
+	if (track.kind !== 'video') {
+		throw new Error("invalid argument: cuts are the boundaries of a video track's clips: pick a video track");
+	}
+	const edges = track.clips.flatMap((c) => [c.timeline_start, c.timeline_start + clipDuration(c)]).sort((a, b) => a - b);
+	const distinct = edges.filter((t, i) => i === 0 || Math.abs(t - edges[i - 1]) >= 1e-6);
+	if (distinct.length < 3) throw new Error('invalid argument: the video track has no cuts: it holds a single clip');
+	return distinct.slice(1, -1);
+}
+
+/** Check a compose request and make the placement definite (`Project::compose_music_inputs`). */
+function devComposePlan(request: ComposeRequest) {
+	const invalid = (why: string) => new Error(`invalid argument: ${why}`);
+	const bad = validateScore(request.score);
+	if (bad) throw invalid(bad);
+	if (request.at !== undefined && (!Number.isFinite(request.at) || request.at < 0)) {
+		throw invalid('at must be a time in seconds, 0 or later');
+	}
+	let start: number;
+	if (request.replace_clip_id) {
+		const found = locate(devTimeline, request.replace_clip_id);
+		if (!found) throw new Error(`clip not found: ${request.replace_clip_id}`);
+		const [track, i] = found;
+		if (track.kind !== 'audio') throw invalid('only music on an audio track can be replaced');
+		if (!assetById(track.clips[i].asset_id)?.music_score) {
+			throw invalid('that clip is not composed music: only a clip of a composed asset can be replaced');
+		}
+		start = track.clips[i].timeline_start;
+	} else {
+		let track: Track | undefined;
+		if (request.track_id) {
+			track = devTimeline.tracks.find((t) => t.id === request.track_id);
+			if (!track) throw new Error(`track not found: ${request.track_id}`);
+			if (track.kind !== 'audio') throw invalid('music goes on an audio track');
+		} else {
+			track = devTimeline.tracks.find((t) => t.kind === 'audio' && t.name === 'M');
+		}
+		start = request.at !== undefined ? Math.max(request.at, 0) : track ? trackEnd(track) : 0;
+	}
+	let score = request.score;
+	let align: AlignReport | null = null;
+	if (request.align) {
+		const max = request.align.max_tempo_change ?? 0.06;
+		if (!Number.isFinite(max) || max < 0 || max > 0.25) {
+			throw invalid('max_tempo_change is a fraction from 0 to 0.25 (0.06 is 6 %)');
+		}
+		const planned = planScoreToPicture(score, devAlignCuts(request.align), start, {
+			max_tempo_change: max,
+			tolerance_s: 0.04,
+			add_hits: true
+		});
+		score = planned.score;
+		align = planned.report;
+	}
+	return { score, align, start };
+}
+
+/** The asset a rendered score is, and the analysis `place_music` writes from it. */
+function devMusicAsset(score: MusicScore): Asset {
+	const path = `/music/music-${devScoreHash(score)}.wav`;
+	const known = sampleAssets.find((a) => a.path === path);
+	if (known) return known;
+	const asset: Asset = {
+		id: uid(),
+		path,
+		name: `Music: ${scoreTitle(score)}`,
+		duration: scoreDuration(score),
+		streams: [{ index: 0, kind: 'audio', codec: 'pcm_s16le', sample_rate: 48000, channels: 2 }],
+		imported_at: new Date().toISOString(),
+		music_score: structuredClone(score)
+	};
+	sampleAssets.push(asset);
+	const grid = { period_s: 60 / score.bpm, phase_s: 0, downbeat_offset: 0, beats_per_bar: 4 };
+	const bars = Math.floor((asset.duration + 1e-6) / barSeconds(score.bpm));
+	// One chroma per distinct chord, so a repeated chord is a repeated bar and the phrases are found.
+	const chords = score.sections.flatMap((sec) => Array.from({ length: sec.bars }, (_, b) => sec.chords[b % sec.chords.length]));
+	const chroma = (chord: string) => {
+		let h = 7;
+		for (const c of chord) h = Math.imul(h ^ c.charCodeAt(0), 0x01000193);
+		const v = Array.from({ length: 12 }, (_, pc) => ((Math.imul(h ^ pc, 0x9e3779b1) >>> 0) % 1000) / 1000 + (pc === (h >>> 0) % 12 ? 2 : 0));
+		const norm = Math.sqrt(v.reduce((a, x) => a + x * x, 0));
+		return v.map((x) => Math.fround(x / norm));
+	};
+	const bar_chroma = Array.from({ length: bars }, (_, k) => (chords[k] ? chroma(chords[k]) : new Array<number>(12).fill(0)));
+	const tempo = tempoFromGrid(grid, asset.duration, 1);
+	sampleAnalysis[asset.id] = {
+		asset_id: asset.id,
+		silence_segments: [],
+		scene_changes: [],
+		transcript: [],
+		loudness: null,
+		onsets: tempo.beats,
+		tempo,
+		audio_class: { class: 'music', confidence: 1 },
+		ran: ['rhythm'],
+		music: { grid, duration: asset.duration, bar_chroma, phrases: phraseMatches(bar_chroma) }
+	};
+	return asset;
+}
+
+/** Whether music can be composed here, whether the first composition still downloads the SoundFont,
+ *  and the styles on offer. */
+export async function musicStatus(): Promise<MusicStatus> {
+	if (!inTauri()) return devMusicStatus();
+	return invoke<MusicStatus>('music_status');
+}
+
+/** Download the SoundFont ahead of the first composition, streaming `music-progress`. */
+export async function prepareMusic(): Promise<MusicStatus> {
+	if (!inTauri()) {
+		devMusicCancelled = false;
+		await devSoundfont();
+		return devMusicStatus();
+	}
+	return invoke<MusicStatus>('prepare_music');
+}
+
+/** Render a score and put it on the timeline: on the "M" track unless `track_id` names another audio
+ *  track, at `at` or after what is there — or, with `replace_clip_id`, swapped into that composed
+ *  clip. `align` first fits the score to the picture's cuts (or markers). Streams `music-progress`;
+ *  rejects with `music cancelled` (`MUSIC_CANCELLED`) if stopped. */
+export async function composeMusic(request: ComposeRequest): Promise<ComposeResult> {
+	if (!inTauri()) {
+		devMusicCancelled = false;
+		const plan = devComposePlan(request);
+		devMusicRendering += 1;
+		try {
+			await devSoundfont();
+			const total = Math.round(scoreDuration(plan.score));
+			await devMusicStage('render', 4, (i) => `${Math.round((i / 4) * total)} of ${total} s`);
+		} finally {
+			devMusicRendering -= 1;
+		}
+		// The plan was made before the wait; landing it re-checks the clip, as the engine does under the lock.
+		const replacing = request.replace_clip_id ? locate(devTimeline, request.replace_clip_id) : null;
+		if (request.replace_clip_id && !replacing) throw new Error(`clip not found: ${request.replace_clip_id}`);
+		if (replacing?.[0].locked) throw new Error(`invalid argument: ${replacing[0].name} is locked`);
+		const asset = devMusicAsset(plan.score);
+		const clipId = request.replace_clip_id ?? uid();
+		devEdit(undefined, () => {
+			if (request.replace_clip_id) {
+				const [track, i] = locate(devTimeline, request.replace_clip_id)!;
+				const clip = track.clips[i];
+				clip.asset_id = asset.id;
+				clip.source_in = 0;
+				clip.source_out = asset.duration;
+				clip.speed = 1;
+				const duration = clipDuration(clip);
+				clip.fade_in = Math.min(clip.fade_in, duration);
+				clip.fade_out = Math.min(clip.fade_out, duration);
+				return;
+			}
+			let track = request.track_id ? devTimeline.tracks.find((t) => t.id === request.track_id) : undefined;
+			track ??= devTimeline.tracks.find((t) => t.kind === 'audio' && t.name === 'M');
+			if (!track) {
+				track = { id: uid(), kind: 'audio', name: 'M', clips: [] };
+				devTimeline.tracks.push(track);
+			}
+			track.clips.push({
+				id: clipId,
+				asset_id: asset.id,
+				source_in: 0,
+				source_out: asset.duration,
+				timeline_start: plan.start,
+				volume: 1,
+				fade_in: 0,
+				fade_out: 0
+			});
+		});
+		recordDev(request.replace_clip_id ? 'Recompose music' : 'Add music');
+		const timeline = snapshot();
+		const clip = timeline.tracks.flatMap((t) => t.clips).find((c) => c.id === clipId)!;
+		return {
+			asset: structuredClone(asset),
+			clip,
+			score: structuredClone(plan.score),
+			align: plan.align,
+			replaced: !!request.replace_clip_id,
+			timeline
+		};
+	}
+	return invoke<ComposeResult>('compose_music', { request });
+}
+
+/** Stop the SoundFont download or the render in flight; it then rejects with `music cancelled`. */
+export async function cancelMusic(): Promise<void> {
+	if (!inTauri()) {
+		devMusicCancelled = true;
+		return;
+	}
+	return invoke<void>('cancel_music');
+}
+
+/** Subscribe to `music-progress` events — the GUI's own and an agent's. Returns an unlisten fn. */
+export async function onMusicProgress(cb: (p: MusicProgress) => void): Promise<() => void> {
+	if (!inTauri()) {
+		devMusicListeners.add(cb);
+		return () => void devMusicListeners.delete(cb);
+	}
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen<MusicProgress>('music-progress', (e) => cb(e.payload));
+}
+
+// ---- band balance ---------------------------------------------------------------
+
+/** Where a stretch of sound keeps its energy: six bands per window, with RMS and loudness, for one
+ *  asset, one clip's source range or a range of the mix; exactly one of `asset_id`, `clip_id`, `range`.
+ *  Windows are the given `sections`, else a composed asset's score sections, else the music's
+ *  phrases, else eight equal parts. The harness has no audio: the numbers are made up, the windows
+ *  and notes are the engine's. Rejects with `band balance cancelled` if stopped. */
+export async function getBandBalance(request: BandBalanceRequest): Promise<BandBalance> {
+	if (!inTauri()) {
+		const invalid = (why: string) => new Error(`invalid argument: ${why}`);
+		const named = [request.asset_id, request.clip_id, request.range].filter((x) => x !== undefined).length;
+		if (named !== 1) throw invalid('name exactly one of asset_id, clip_id or range to measure');
+		let target: BandBalance['target'];
+		let name: string;
+		let origin = 0;
+		let span: number;
+		let asset: Asset | undefined;
+		if (request.range) {
+			const r = request.range;
+			if (!Number.isFinite(r.start) || !Number.isFinite(r.end) || r.start < 0 || r.end <= r.start) {
+				throw invalid('range needs 0 <= start < end, in seconds');
+			}
+			const cut = timelineDuration(devTimeline);
+			if (cut <= 0 || r.start >= cut) throw invalid(`range starts at ${r.start.toFixed(1)}s but the cut is ${cut.toFixed(1)}s long`);
+			target = 'mix';
+			name = 'mix';
+			origin = r.start;
+			span = Math.min(r.end, cut) - r.start;
+		} else {
+			let clip: Clip | undefined;
+			if (request.clip_id) {
+				clip = locate(devTimeline, request.clip_id)?.[0].clips.find((c) => c.id === request.clip_id);
+				if (!clip) throw new Error(`clip not found: ${request.clip_id}`);
+			}
+			asset = assetById(clip ? clip.asset_id : request.asset_id!);
+			if (!asset) throw new Error(`asset not found: ${clip ? clip.asset_id : request.asset_id}`);
+			if (!asset.streams.some((x) => x.kind === 'audio')) throw invalid(`${asset.name} has no audio stream to measure`);
+			target = clip ? 'clip' : 'asset';
+			name = asset.name;
+			origin = clip ? clip.source_in : 0;
+			span = clip ? Math.max(clip.source_out - clip.source_in, 0) : asset.duration;
+		}
+		if (span < 0.25) throw invalid(`the sound is ${span.toFixed(2)}s long: too short to measure`);
+		const lo = origin;
+		const hi = origin + span;
+		let windows: BandWindow[];
+		let kinds: (SectionKind | null)[] = [];
+		let windows_from: BandBalance['windows_from'];
+		if (request.sections) {
+			const checked = checkSections(request.sections, lo, hi);
+			if (typeof checked === 'string') throw invalid(checked);
+			windows = checked;
+			windows_from = 'sections';
+		} else {
+			const spans = asset?.music_score ? sectionSpans(asset.music_score) : [];
+			const labels = sectionLabels(spans.map((x) => x.kind));
+			const fromScore = clipWindows(
+				spans.map((x, i) => ({ start: x.start_s, end: x.end_s, label: labels[i] })),
+				lo,
+				hi
+			);
+			const grid = asset ? sampleAnalysis[asset.id]?.music : null;
+			const phrases = grid
+				? phraseWindows(
+						grid.grid.phase_s + grid.grid.downbeat_offset * grid.grid.period_s,
+						grid.grid.period_s * grid.grid.beats_per_bar,
+						lo,
+						Math.min(hi, grid.duration)
+					)
+				: [];
+			if (fromScore.length > 0) {
+				windows = fromScore;
+				windows_from = 'score';
+				kinds = spans.map((x) => x.kind);
+			} else if (phrases.length >= 2) {
+				windows = phrases;
+				windows_from = 'phrases';
+			} else {
+				windows = equalWindows(lo, hi);
+				windows_from = 'equal';
+			}
+		}
+		const measured = synthBalance(windows, kinds);
+		return {
+			target,
+			name,
+			start: origin,
+			end: origin + span,
+			...measured,
+			windows_from,
+			notes: balanceNotes(measured.overall, measured.windows)
+		};
+	}
+	return invoke<BandBalance>('get_band_balance', { request });
+}
+
+/** Ask the running band-balance measurement to give up; it then rejects with `band balance cancelled`. */
+export async function cancelBandBalance(): Promise<void> {
+	if (!inTauri()) return;
+	return invoke<void>('cancel_band_balance');
 }
 
 // ---- stem separation (Demucs) -----------------------------------------------

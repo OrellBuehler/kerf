@@ -92,8 +92,8 @@ clips_shifted}` — `rippled` is *measured* (`Timeline::clips_moved_since`, the 
 standing elsewhere afterwards, matched by id), not the mode echoed back: ripple is an
 attempt, skipped on a locked track and declined for a lane the shift would leave
 overlapping) are the one-revision group edits, and the edits that follow the mode — `trim`, `set_speed`, `remove`,
-`remove_clips`, `add_clip_to_timeline`, `split_at`, `split_remove`, `generate_voiceover`'s
-placement — take an optional `ripple` that is `project.with_ripple(p.ripple, …)`
+`remove_clips`, `add_clip_to_timeline`, `split_at`, `split_remove`, `generate_voiceover`'s and
+`compose_music`'s placement — take an optional `ripple` that is `project.with_ripple(p.ripple, …)`
 around the core call (omitted follows the project; `false` is the escape hatch); their
 descriptions say plainly that the push can be skipped, and an add *inside* a clip leaves
 the overlap.
@@ -258,6 +258,29 @@ speech gate; omitted = compressor), `stems_status` and `separate_stems { asset_i
 (async, progress through the token like `generate_voiceover`, cancel via `context.ct`, the
 GUI sees `stems-progress`; answers `StemsPlaced`), and `export`'s `options.loudness` preset. The server
 `instructions` route music under a cut through analyze → fit_music → duck.
+**Composed music**: `compose_music { score, track_id?, at?, align?, replace_clip_id?, ripple?, background? }` is
+`generate_voiceover`'s shape: `score` is the core `MusicScore` itself (its schema, with the doc comments as
+descriptions), `track_id` / `replace_clip_id` / `align.track_id` are strings parsed with `parse_arg` (so a bad id names
+its argument), `align` is `{to: cuts|markers, track_id?, max_tempo_change?}`. The request is checked, and the score
+fitted to the picture, **before anything renders** — `compose_music_inputs` under `lock_agent_edit` (a proposal
+another session owns refuses here, not after a minute of rendering; an invalid score, a bad track or a replaced clip
+that is not composed music is `invalid_params` naming the section / chord) and it reads the **working timeline**
+(staged cuts included). It then renders with the lock released (`synthesize_music` on `plan.score`, progress stages
+`download_soundfont` / `waiting` / `render` to the client's token **and** re-emitted as the GUI's `music-progress`;
+the GUI's `cancel_music` ends it too via `begin_music`, and so does a replaced project, `stop_or_replaced`) and
+lands it with `place_music(&asset, plan.track_id, plan.at, plan.replace_clip_id)` — `plan.at`, the **pinned** start
+the alignment was computed for, not the request's — under `lock_agent_edit` + `with_ripple(ripple)`: the asset and
+its score-written analysis land at once, the placement stages. `track_id` is not `M`-only: any audio track. The answer
+is `{asset, clip, score, align, replaced}` — `score` is the score **as rendered** (the aligned tempo and added hits),
+and the asset drops its own `music_score` copy (`list_assets` still shows it, which is how an agent finds the score
+to edit before a `replace_clip_id` call). `music_status` is its read side (SoundFont ready, bytes to fetch,
+compositions in flight, the styles). `get_band_balance { asset_id? | clip_id? | range?, sections? }` is
+`get_levels`' shape (read-only, resolve under `lock_agent_as`, decode with the lock released, `context.ct` and a
+replaced project stop it): exactly one target is checked by the core (`invalid_params` otherwise), and the answer is the
+core `BandBalance` (windows, `overall`, `windows_from`, `notes`). The descriptions carry everything a model needs to
+write a score — styles, section kinds and what each does to the arrangement, chord names and roman numerals, the hit
+kinds in **music** seconds, align's rules, recomposing — and a test pins that they do. The `instructions` route a music
+request compose_music (align to the cuts) → fit_music → duck → get_levels / get_band_balance.
 `set_master_volume` / `set_master_limiter` / `set_master_true_peak` are staged edits like any other;
 `get_levels` (`range?`, `loudnorm?`) measures the working timeline (the proposal) and takes
 `context.ct` as its cancel, and the server `instructions` — now a `const INSTRUCTIONS`, so a
@@ -375,7 +398,7 @@ Agent edits **stage** (`core-project.md`). The adapter's part:
 
 ## Background jobs (`mcp/jobs.rs`)
 
-`analyze_asset`, `export`, `export_variants`, `generate_voiceover`, `separate_stems`, `download_speech_model`,
+`analyze_asset`, `export`, `export_variants`, `generate_voiceover`, `compose_music`, `separate_stems`, `download_speech_model`,
 `import_asset`, `smart_crop`, `refine_transcript` and `sync_clips_by_audio` take `background: true` and answer `{job_id}` at once; `job_status`, `cancel_job` and
 `list_jobs` read and stop them. Each is written once against `jobs::Run` (`cancelled()` + `progress(fraction, message)`):
 a foreground call builds it from the request (`foreground`: the `ct` cancellation token and the `progressToken`, with a relay
@@ -383,10 +406,10 @@ task that keeps progress monotonic), a background one from its record in `Jobs` 
 job forgotten after an hour). `KerfMcp::long_tool` does the branching, so **argument validation stays in the tool body,
 before it** — a bad path or id is an error on the call, not a job that fails later. The GUI's Stop reaches the agent's run
 of the same job: `analyze_asset`, `refine_transcript` (the analysis Stop), `import_asset`, `download_speech_model`, `export_cover`, `generate_voiceover`,
-`separate_stems`, `smart_crop`, `export` and `export_variants` poll the `StopEpoch` the GUI's own button trips
+`compose_music`, `separate_stems`, `smart_crop`, `export` and `export_variants` poll the `StopEpoch` the GUI's own button trips
 (`Run::also_cancelled_by(begin_analysis() / begin_import() / begin_model_download() / begin_cover_export() /
-begin_voiceover() / begin_stems() / begin_smart_crop() / begin_export())`; a Stop pressed before a run began does not end
-it, and a run begun after is not wiped by one), and the voiceover, stems, smart-crop and framing jobs also stop when the
+begin_voiceover() / begin_music() / begin_stems() / begin_smart_crop() / begin_export())`; a Stop pressed before a run began does not end
+it, and a run begun after is not wiped by one), and the voiceover, music, stems, smart-crop and framing jobs also stop when the
 project is replaced (`stop_or_replaced`). `analyze_asset` also forwards the GUI's `analysis-progress` events for its asset
 to the client (`AnalysisProgressRelay`); `download_speech_model` emits `model-progress` like the GUI's own download.
 Every job that resolves inputs under the lock notes `Project::generation()` and refuses to land its result in a project
@@ -435,7 +458,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
   `transcription_status`, `download_speech_model`, `set_speech_model`, `proxy_status`, `rebuild_proxy`, `delete_proxy`,
   `get_music_structure`.
 - **Looking and measuring**: `timeline_summary`, `get_timeline_state`, `get_editor_context`, `get_scopes`, `skim_asset`, `get_frame`, `preview_timeline`,
-  `get_waveform`, `get_waveform_range`, `get_energy`, `get_levels`, `platform_check`.
+  `get_waveform`, `get_waveform_range`, `get_energy`, `get_levels`, `get_band_balance`, `platform_check`.
 - **Editing the cut**: `cut_clip`, `add_clip_to_timeline`, `split_at`, `trim`, `reorder`, `move_clip`, `move_clips`,
   `ripple_delete`, `cut_clip_range`, `roll_edit`, `slip_clip`, `slide_clip`, `split_remove`, `split_remove_clips`, `remove`,
   `remove_clips`, `duplicate_clips`, `concatenate`, `remove_silence`, `snap_to_beats`, `sync_clips_by_audio`, `smart_crop`, `add_track`,
@@ -448,7 +471,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
   `clear_keyframes`, `set_reframe`, `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`.
 - **Mix and music**: `set_track_volume`, `set_track_pan`, `set_track_duck`, `set_track_muted`, `set_track_solo`,
   `set_track_locked`, `set_master_volume`, `set_master_limiter`, `set_master_true_peak`, `set_master_duck`, `plan_music_fit`, `fit_music`,
-  `separate_stems`, `stems_status`.
+  `compose_music`, `music_status`, `separate_stems`, `stems_status`.
 - **Titles, captions, markers, frame**: `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
   `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `list_svg_presets`, `validate_svg`, `preview_svg_overlay`,
   `preview_svg_preset`, `generate_captions`, `import_captions`, `clear_captions`, `export_srt`, `export_captions`, `add_marker`,

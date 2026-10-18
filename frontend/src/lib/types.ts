@@ -49,6 +49,9 @@ export interface Asset {
 	source_paths?: string[];
 	/** Set on a synthesized voiceover: the script and settings it was made from. */
 	voiceover?: Voiceover;
+	/** Set on composed music: the score it was rendered from, which is what "edit and compose
+	 *  again" starts from. Absent for ordinary media. */
+	music_score?: MusicScore;
 }
 
 /** What a generated voiceover was made from, kept on its asset so it can be
@@ -1408,6 +1411,231 @@ export interface VoiceoverRequest {
 export interface VoiceoverResult {
 	asset: Asset;
 	timeline: Timeline;
+}
+
+// ---- composed music (kerf_core::MusicScore, `compose_music`) ------------------------------
+
+/** The sound of a piece (`kerf_core::MusicStyle`, snake_case on the wire). */
+export type MusicStyle = 'tropical_house' | 'pop' | 'lofi' | 'cinematic' | 'ambient' | 'rock';
+
+/** What a section is for; it decides which instruments play and how dense they are. */
+export type SectionKind = 'intro' | 'verse' | 'build' | 'drop' | 'breakdown' | 'outro';
+
+/** A moment the picture asks of the music. */
+export type HitKind = 'impact' | 'riser' | 'dropout' | 'whoosh';
+
+/** A run of whole bars with a chord per bar. */
+export interface ScoreSection {
+	kind: SectionKind;
+	/** 1 to 128. */
+	bars: number;
+	/** One chord per bar, as names (`C`, `Em`, `F#m7`, `Gsus4`, `D/F#`) or roman numerals in the
+	 *  score's key (`I`, `V`, `vi`, `IV`, `ii7`, `bVII`); a shorter list cycles. */
+	chords: string[];
+	/** 0 to 1: how loud and busy the section is. Absent: by kind (intro 0.3, verse 0.5, build 0.7,
+	 *  drop 1, breakdown 0.3, outro 0.3). */
+	energy?: number;
+}
+
+/** A sound effect placed at a time in the music. */
+export interface ScoreHit {
+	/** Seconds from the start of the music (not the timeline). */
+	at_s: number;
+	kind: HitKind;
+}
+
+/** General MIDI programs (0 to 127) that replace a style's instruments. `drums` is the kit's
+ *  program (0 standard, 8 room, 16 power, 24 electronic, 25 808/909, 32 jazz, 40 brush, 48
+ *  orchestral). */
+export interface InstrumentOverrides {
+	drums?: number;
+	bass?: number;
+	/** The sustained chords. */
+	pad?: number;
+	/** The rhythmic chords (stabs, arpeggios, power chords). */
+	keys?: number;
+	/** The hook. */
+	lead?: number;
+}
+
+/** A piece of music in 4/4. */
+export interface MusicScore {
+	/** 40 to 240. */
+	bpm: number;
+	/** A tonic and an optional `m`: `G`, `F#m`, `Bb`, `Ebm`. */
+	key: string;
+	style: MusicStyle;
+	sections: ScoreSection[];
+	/** Absent when there are none (the backend omits an empty list). */
+	hits?: ScoreHit[];
+	/** Varies the humanization and the hook; the same score and seed are the same audio. */
+	seed: number;
+	instruments?: InstrumentOverrides;
+}
+
+/** What to fit a score to: the cuts of a video track, or the timeline's markers. */
+export interface ScoreAlign {
+	to: 'cuts' | 'markers';
+	/** With `cuts`: the video track (absent: the first). */
+	track_id?: string;
+	/** The most the tempo may change, as a fraction: 0.06 (absent) is 6 %, 0 keeps it, 0.25 at most. */
+	max_tempo_change?: number;
+}
+
+/** The arguments of `compose_music` (`kerf_core::ComposeRequest`). */
+export interface ComposeRequest {
+	score: MusicScore;
+	/** The audio track to land on; absent, the "M" track (made on first use). */
+	track_id?: string;
+	/** Where it starts on the timeline, seconds; absent, after what the track holds. */
+	at?: number;
+	align?: ScoreAlign;
+	/** Swap this composed-music clip to the new render instead of adding a clip. */
+	replace_clip_id?: string;
+}
+
+/** Where one cut sits against the beat grid. */
+export interface BeatReading {
+	on_beat: boolean;
+	on_downbeat: boolean;
+	/** Seconds from the nearest beat; positive is late. */
+	offset_s: number;
+}
+
+/** One cut, before and after aligning. */
+export interface CutAlignment {
+	/** The time as given (timeline seconds). */
+	cut_s: number;
+	/** The same moment in the music's own time. */
+	music_s: number;
+	before: BeatReading;
+	after: BeatReading;
+}
+
+/** What fitting the score to the picture did (`kerf_core::AlignReport`). */
+export interface AlignReport {
+	/** The cuts that fall inside the music. */
+	cuts: number;
+	bpm_before: number;
+	bpm_after: number;
+	/** `bpm_after / bpm_before - 1`. */
+	tempo_change: number;
+	on_beat_before: number;
+	on_downbeat_before: number;
+	on_beat_after: number;
+	on_downbeat_after: number;
+	hits_added: ScoreHit[];
+	details: CutAlignment[];
+	notes: string[];
+}
+
+/** What `compose_music` made (`kerf_core::Composed`): the asset and clip, the score that was
+ *  rendered (aligned, when asked) and what aligning did. */
+export interface Composed {
+	asset: Asset;
+	clip: Clip;
+	score: MusicScore;
+	align: AlignReport | null;
+	/** An existing clip was swapped to the new render rather than a clip added. */
+	replaced: boolean;
+}
+
+export interface ComposeResult extends Composed {
+	timeline: Timeline;
+}
+
+/** One style, for a picker. */
+export interface MusicStyleInfo {
+	name: MusicStyle;
+	label: string;
+	default_bpm: number;
+}
+
+/** What composing has on disk and in flight (`kerf_core::MusicStatus`). */
+export interface MusicStatus {
+	/** The SoundFont is on disk: the next composition renders at once. */
+	soundfont_ready: boolean;
+	soundfont: string;
+	/** What the first composition downloads, bytes (0 when it is ready). */
+	approx_download_bytes: number;
+	/** Compositions rendering now. */
+	rendering: number;
+	sample_rate: number;
+	styles: MusicStyleInfo[];
+}
+
+/** Payload of the `music-progress` event, from the GUI or an agent. */
+export interface MusicProgress {
+	stage: 'download_soundfont' | 'waiting' | 'render';
+	fraction: number | null;
+	/** A short note, e.g. `12 MB / 32 MB`, `12 of 90 s`, or why a render is waiting. */
+	detail: string | null;
+}
+
+// ---- band balance (kerf_core::BandBalance, `get_band_balance`) -----------------------------
+
+export type BandName = 'sub' | 'bass' | 'low_mid' | 'mid' | 'high_mid' | 'air';
+
+/** A stretch of the measured sound, seconds in the target's own time. */
+export interface BandWindow {
+	start: number;
+	end: number;
+	label?: string;
+}
+
+/** Exactly one of `asset_id`, `clip_id` or `range` names the target. */
+export interface BandBalanceRequest {
+	/** An asset's whole sound; times are its own seconds. */
+	asset_id?: string;
+	/** A clip's source range at the clip's volume; times are source seconds. */
+	clip_id?: string;
+	/** The finished mix of the working timeline over this range (what `get_levels` measures);
+	 *  times are timeline seconds. */
+	range?: TimeRange;
+	/** The windows to compare. Absent: a composed asset's score sections, else the music's
+	 *  phrases, else eight equal windows. */
+	sections?: BandWindow[];
+}
+
+/** One band in one window. */
+export interface BandLevel {
+	name: BandName;
+	low_hz: number;
+	high_hz: number;
+	/** The band's energy as a level, dBFS; null when there is none. */
+	energy_dbfs: number | null;
+	/** The band's share of the window's energy across the six bands, percent. */
+	share_pct: number;
+}
+
+/** What one window sounds like. */
+export interface WindowBalance {
+	start: number;
+	end: number;
+	label: string | null;
+	/** The whole window's RMS, dBFS; null for silence. */
+	rms_dbfs: number | null;
+	/** Its K-weighted loudness, LUFS, ungated; null for silence. */
+	loudness_lufs: number | null;
+	/** The six bands, low to high; empty when the window held no frame to measure. */
+	bands: BandLevel[];
+	/** The band with the most energy. */
+	dominant: BandName | null;
+}
+
+export interface BandBalance {
+	target: 'asset' | 'clip' | 'mix';
+	name: string;
+	/** The measured stretch, in the target's seconds. */
+	start: number;
+	end: number;
+	windows: WindowBalance[];
+	/** The whole stretch as one window. */
+	overall: WindowBalance;
+	/** Where the windows came from. */
+	windows_from: 'sections' | 'score' | 'phrases' | 'equal';
+	/** What stands out, in words. */
+	notes: string[];
 }
 
 /** What stem separation has on disk (`kerf_core::StemsStatus`): whether its first use still
