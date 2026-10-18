@@ -35,7 +35,7 @@
 import { getAudio } from './api';
 import type { Clip, MasterBus, Timeline } from './types';
 import { panGains } from './mixer';
-import { clipGainAt, fadeInOf, fadeOutOf, gainAutomation, limiterParams } from './audio-mix';
+import { clipGainAt, crossfadePair, fadeInTimes, fadeOutOf, gainAutomation, type GainClip, limiterParams } from './audio-mix';
 import { clipSounds } from './mixer-strips';
 import { clampMasterVolume, masterOf, trackRenders } from './levels';
 import { readBlock, type Reading } from './meter';
@@ -182,7 +182,7 @@ export class AudioEngine {
 				void this.#buffer(clip)
 					.then((buf) => {
 						// Buffers resolve async; only schedule into the session that asked.
-						if (buf && this.#session === session) this.#schedule(clip, buf, session, bus);
+						if (buf && this.#session === session) this.#schedule(clip, buf, session, bus, crossfadePair(track.clips, clip));
 					})
 					.catch(() => {
 						// #buffer() already evicted the cache entry and reported the
@@ -340,7 +340,7 @@ export class AudioEngine {
 		return { master: readTap(m.tap), tracks };
 	}
 
-	#schedule(clip: Clip, buf: AudioBuffer, s: Session, bus: Bus) {
+	#schedule(clip: Clip, buf: AudioBuffer, s: Session, bus: Bus, powerPair = false) {
 		const ctx = this.#ctx!;
 		const mag = speedMag(clip);
 		const dur = (clip.source_out - clip.source_in) / mag;
@@ -368,12 +368,12 @@ export class AudioEngine {
 		// approximates as an extra fade-in (the export folds it in the same way).
 		// The track fader multiplies the clip's own gain, as it does on export — on the
 		// bus, which `clipGainAt` leaves out (its product with the clip's is the same).
-		const fi = fadeInOf(clip);
+		const shaped: GainClip = powerPair ? { ...clip, power_pair: true } : clip;
 		const fo = fadeOutOf(clip);
-		const env = (tl: number) => clipGainAt(clip, tl, clipStart, clipEnd);
+		const env = (tl: number) => clipGainAt(shaped, tl, clipStart, clipEnd);
 		const t0 = Math.max(clipStart, nowT);
 		gain.gain.setValueAtTime(env(t0), Math.max(at(t0), now));
-		const keyed = gainAutomation(clip, clipStart, clipEnd, t0);
+		const keyed = gainAutomation(shaped, clipStart, clipEnd, t0);
 		if (keyed.length) {
 			// A keyed volume: ramp through the curve's points and the fade edges, and jump where
 			// the curve steps (a hold) instead of ramping across the whole segment.
@@ -383,7 +383,8 @@ export class AudioEngine {
 			}
 			return;
 		}
-		if (fi > 0 && clipStart + fi > t0) gain.gain.linearRampToValueAtTime(env(clipStart + fi), at(clipStart + fi));
+		// A constant-power fade-in is drawn as a run of short ramps along its curve.
+		for (const t of fadeInTimes(shaped, clipStart).filter((t) => t > t0)) gain.gain.linearRampToValueAtTime(env(t), at(t));
 		const foStart = Math.max(clipEnd - fo, t0);
 		if (fo > 0 && clipEnd > t0) {
 			gain.gain.setValueAtTime(env(foStart), at(foStart));

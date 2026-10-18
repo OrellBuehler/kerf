@@ -48,6 +48,11 @@ struct AppState {
     /// Same, for the Mixer's loudness measurement. It holds the heavy-job lease for
     /// a whole-mix decode (minutes on a long cut), so it has to be stoppable.
     levels_cancel: Arc<AtomicBool>,
+    /// Flipped by `cancel_audio_sync` to stop the sync in flight.
+    sync_cancel: Arc<AtomicBool>,
+    /// The last sync measured and the decode it measured, so "Move anyway" applies that
+    /// answer instead of decoding the same sound again.
+    last_sync: Arc<Mutex<Option<(kerf_core::AudioSyncPlan, kerf_core::AudioSyncMeasure)>>>,
     /// Same, for a voiceover being synthesized (or its model downloading).
     voiceover_cancel: Arc<AtomicBool>,
     stems_cancel: Arc<AtomicBool>,
@@ -1158,6 +1163,14 @@ fn set_master_volume(state: State<'_, AppState>, volume: f64) -> CmdResult<Timel
 fn set_master_limiter(state: State<'_, AppState>, enabled: bool, ceiling_db: Option<f64>) -> CmdResult<Timeline> {
     let project = state.project();
     project.set_master_limiter(enabled, ceiling_db).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Make the master limiter hold the true peak (4x oversampled) or the sample peak.
+#[tauri::command(async)]
+fn set_master_true_peak(state: State<'_, AppState>, enabled: bool) -> CmdResult<Timeline> {
+    let project = state.project();
+    project.set_master_true_peak(enabled).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -2849,6 +2862,19 @@ async fn export_variants(
         // the file in flight: that one is removed, the finished ones stay.
         let total = variants.len();
         let started = std::time::Instant::now();
+        // Every variant is checked, and a static loudness gain measured, once for all of them.
+        let options = kerf_core::prepare_variants(
+            &timeline,
+            &assets,
+            &variants,
+            &options,
+            &mut |p| {
+                let _ = app.emit("export-progress", p);
+            },
+            &|| cancel.load(Ordering::SeqCst),
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "export cancelled".to_string())?;
         for (i, variant) in variants.iter().enumerate() {
             let mut on_progress = |p: kerf_core::VariantProgress| {
                 let fraction = (i as f64 + p.fraction.clamp(0.0, 1.0)) / total as f64;
@@ -2861,6 +2887,7 @@ async fn export_variants(
                         fraction,
                         elapsed_secs,
                         eta_secs: (fraction > 0.0).then(|| elapsed_secs / fraction - elapsed_secs),
+                        waiting: p.waiting,
                     },
                 );
             };
@@ -2991,6 +3018,85 @@ async fn smart_crop(state: State<'_, AppState>, clip_id: Option<String>) -> CmdR
         project.timeline().map_err(|e| e.to_string())
     })
     .await
+}
+
+/// What syncing a clip by its sound found, and the timeline after it.
+#[derive(serde::Serialize)]
+struct SyncedByAudio {
+    sync: kerf_core::AudioSync,
+    timeline: Timeline,
+}
+
+/// Move `clip_id` so its sound lines up with `reference_id`'s (linked partners follow).
+/// An unreliable match is reported without moving anything unless `force`; a forced sync of
+/// the pair just measured (the same decode) applies that measurement instead of decoding
+/// again. A wait for the heavy-job slot is told through `audio-sync-progress`;
+/// `cancel_audio_sync` stops it, which then rejects with `"audio sync cancelled"`.
+#[tauri::command]
+async fn sync_clips_by_audio(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    reference_id: String,
+    clip_id: String,
+    force: Option<bool>,
+) -> CmdResult<SyncedByAudio> {
+    let (reference, clip) = (id(&reference_id)?, id(&clip_id)?);
+    let force = force.unwrap_or(false);
+    let shared = state.project.clone();
+    let cancel = state.sync_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+    let last = state.last_sync.clone();
+    blocking(move || {
+        let plan = lock_user(&shared)
+            .audio_sync_inputs(reference, clip)
+            .map_err(|e| e.to_string())?;
+        let cached = last
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|(p, _)| force && *p == plan)
+            .map(|(_, m)| *m);
+        let measured = match cached {
+            Some(m) => m,
+            None => {
+                let m = Project::measure_audio_sync(
+                    &plan,
+                    &mut |w| {
+                        let _ = app.emit(
+                            "audio-sync-progress",
+                            VoiceoverProgressEvent {
+                                stage: "waiting".to_string(),
+                                fraction: None,
+                                detail: Some(w.message().to_string()),
+                            },
+                        );
+                    },
+                    &|| cancel.load(Ordering::SeqCst),
+                )
+                .map_err(|e| match e {
+                    kerf_core::Error::Cancelled => AUDIO_SYNC_CANCELLED.to_string(),
+                    other => other.to_string(),
+                })?;
+                *last.lock().unwrap_or_else(|e| e.into_inner()) = Some((plan, m));
+                m
+            }
+        };
+        let project = lock_user(&shared);
+        let sync = project.apply_audio_sync(&measured, force).map_err(|e| e.to_string())?;
+        let timeline = project.timeline().map_err(|e| e.to_string())?;
+        Ok(SyncedByAudio { sync, timeline })
+    })
+    .await
+}
+
+/// The error a stopped sync returns, for the webview to stay quiet on.
+const AUDIO_SYNC_CANCELLED: &str = "audio sync cancelled";
+
+/// Stop the sync by audio in flight (if any): it gives up while it waits for the slot or
+/// between its decodes, and [`sync_clips_by_audio`] rejects with `"audio sync cancelled"`.
+#[tauri::command(async)]
+fn cancel_audio_sync(state: State<'_, AppState>) {
+    state.sync_cancel.store(true, Ordering::SeqCst);
 }
 
 /// Every publishing target Kerf knows about, with its frame and length limits.
@@ -3667,6 +3773,8 @@ pub fn run() {
             export_cancel: Arc::new(AtomicBool::new(false)),
             analysis_cancel: Arc::new(AtomicBool::new(false)),
             levels_cancel: Arc::new(AtomicBool::new(false)),
+            sync_cancel: Arc::new(AtomicBool::new(false)),
+            last_sync: Arc::new(Mutex::new(None)),
             voiceover_cancel: Arc::new(AtomicBool::new(false)),
             stems_cancel: Arc::new(AtomicBool::new(false)),
             main_window_shown: main_window_shown.clone(),
@@ -3784,6 +3892,7 @@ pub fn run() {
             set_master_volume,
             set_master_limiter,
             set_master_duck,
+            set_master_true_peak,
             plan_music_fit,
             fit_music,
             stems_status,
@@ -3847,6 +3956,8 @@ pub fn run() {
             remove_silence,
             snap_to_beats,
             smart_crop,
+            sync_clips_by_audio,
+            cancel_audio_sync,
             extract_audio,
             add_asset_audio,
             detach_audio,

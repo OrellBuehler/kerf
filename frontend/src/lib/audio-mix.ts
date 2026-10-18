@@ -8,10 +8,13 @@
  *    gain. */
 
 import { propertyCurve, volumeAnimated, volumeAt } from './channels';
-import type { Clip } from './types';
+import { clipDuration, type Clip } from './types';
 
-/** What decides a clip's gain: its volume, fades and a transition into it. */
-export type GainClip = Pick<Clip, 'volume' | 'fade_in' | 'fade_out' | 'transition_in' | 'channels'>;
+/** What decides a clip's gain: its volume, fades and a transition into it. `power_pair` (the
+ *  preview's own, from `crossfadePair`) marks a transition that is a real pair of two sounds. */
+export type GainClip = Pick<Clip, 'volume' | 'fade_in' | 'fade_out' | 'transition_in' | 'channels'> & {
+	power_pair?: boolean;
+};
 
 /** A clip's fade-in length, seconds. A transition approximates as an extra fade-in
  *  (the export folds it in the same way). */
@@ -19,6 +22,54 @@ export const fadeInOf = (clip: GainClip): number => (clip.fade_in ?? 0) + (clip.
 
 /** A clip's fade-out length, seconds. */
 export const fadeOutOf = (clip: GainClip): number => clip.fade_out ?? 0;
+
+/** Whether the fade-in is wholly a dissolve or motion transition's overlap with a real partner
+ *  (`power_pair`) — half of a crossfade pair, which the export ramps constant-power (`afade`
+ *  `curve=qsin`: `sin(x·π/2)`). A fade with a clip fade in it, a dip, a fade up from black, or a pair
+ *  playing the same sound on both sides stays linear, as there. */
+export const crossfadeIn = (clip: GainClip): boolean =>
+	!!clip.power_pair &&
+	!(clip.fade_in ?? 0) &&
+	(clip.transition_in?.duration ?? 0) > 0 &&
+	!clip.transition_in!.kind.startsWith('dip_');
+
+const speedOf = (c: Clip): number => c.speed ?? 1;
+
+/** A music fit's de-click splice, seconds (`SPLICE_CROSSFADE_S`). */
+export const SPLICE_CROSSFADE_S = 0.01;
+
+/** Whether a crossfade of `overlap` seconds from `out` into `inn` carries correlated sound: one asset
+ *  at one speed and direction, picked up within the overlap of where the outgoing handle continues
+ *  (the same samples), or a de-click splice no longer than `SPLICE_CROSSFADE_S`. Mirrors
+ *  `clip_timing::same_sound`. */
+export function sameSound(out: Clip, inn: Clip, overlap: number): boolean {
+	if (out.asset_id !== inn.asset_id || Math.abs(speedOf(out) - speedOf(inn)) > 1e-9) return false;
+	const [continues, picksUp] = speedOf(out) < 0 ? [out.source_in, inn.source_out] : [out.source_out, inn.source_in];
+	return overlap <= SPLICE_CROSSFADE_S + 1e-9 || Math.abs(continues - picksUp) < overlap * Math.max(Math.abs(speedOf(out)), 0.01);
+}
+
+/** Whether `clip`'s transition is a real crossfade pair of two sounds, as `transition_fx` pairs it:
+ *  `clips` is its track as it renders (disabled clips left out), the partner the clip just before it,
+ *  touching it, and the pair not the same sound. No partner is a fade up from black. The overlap is
+ *  approximated without the outgoing handle, which only the export knows. */
+export function crossfadePair(clips: Clip[], clip: Clip): boolean {
+	const d = clip.transition_in?.duration ?? 0;
+	if (d <= 0 || clip.transition_in!.kind.startsWith('dip_')) return false;
+	const before = clips
+		.filter((c) => c.enabled !== false && c.id !== clip.id && c.timeline_start < clip.timeline_start)
+		.sort((a, b) => b.timeline_start - a.timeline_start)[0];
+	if (!before || Math.abs(before.timeline_start + clipDuration(before) - clip.timeline_start) >= 1e-3) return false;
+	return !sameSound(before, clip, Math.min(d, clipDuration(before), clipDuration(clip)));
+}
+
+/** The gain a fade-in leaves at `x` of the way through it (0..1). */
+export const fadeInGain = (clip: GainClip, x: number): number => {
+	const p = Math.max(0, x);
+	return crossfadeIn(clip) ? Math.sin((Math.min(1, p) * Math.PI) / 2) : p;
+};
+
+/** How many straight ramps the preview draws a constant-power fade-in with. */
+export const CROSSFADE_STEPS = 16;
 
 /**
  * The gain of a clip at timeline time `t`, for a clip that spans `[start, end]`:
@@ -31,9 +82,18 @@ export function clipGainAt(clip: GainClip, t: number, start: number, end: number
 	let v = volumeAt(clip, t - start) * level;
 	const fi = fadeInOf(clip);
 	const fo = fadeOutOf(clip);
-	if (fi > 0 && t < start + fi) v *= Math.max(0, (t - start) / fi);
+	if (fi > 0 && t < start + fi) v *= fadeInGain(clip, (t - start) / fi);
 	if (fo > 0 && t > end - fo) v *= Math.max(0, (end - t) / fo);
 	return v;
+}
+
+/** The times inside a fade-in the preview ramps through: its end alone for a linear fade,
+ *  every step of the curve for a constant-power one. */
+export function fadeInTimes(clip: GainClip, start: number): number[] {
+	const fi = fadeInOf(clip);
+	if (fi <= 0) return [];
+	const n = crossfadeIn(clip) ? CROSSFADE_STEPS : 1;
+	return Array.from({ length: n }, (_, k) => start + (fi * (k + 1)) / n);
 }
 
 /** One command of a keyed clip's gain automation: ramp to `value` by `time`, or — `jump` — set
@@ -71,9 +131,8 @@ export function gainAutomation(clip: GainClip, start: number, end: number, from:
 		times.add(start + t);
 		if (i > 0 && polyline[i - 1][0] === t && polyline[i - 1][1] !== v) steps.add(start + t);
 	});
-	const fi = fadeInOf(clip);
 	const fo = fadeOutOf(clip);
-	if (fi > 0) times.add(start + fi);
+	for (const t of fadeInTimes(clip, start)) times.add(t);
 	if (fo > 0) times.add(end - fo);
 	times.add(end);
 	const out: GainPoint[] = [];

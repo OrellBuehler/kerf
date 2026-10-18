@@ -857,6 +857,9 @@ export interface MasterBus {
 	 *  bus drops by exactly that many dB (negative, clamped to -40..-1) while the rest speaks.
 	 *  The backend omits it when unset. */
 	duck_depth_db?: number | null;
+	/** The limiter holds the true peak (runs 4x oversampled). Absent / false is the sample-peak
+	 *  limiter; the backend omits it when off. */
+	true_peak?: boolean;
 }
 
 export interface Timeline {
@@ -1096,6 +1099,9 @@ export interface ExportOptions {
 	loudnorm?: boolean;
 	/** Normalize the final mix to a platform's loudness target. Wins over `loudnorm`. */
 	loudness?: LoudnessPreset | null;
+	/** Reach the target with one measured static gain and a true-peak limiter instead of
+	 *  `loudnorm` (the export measures the mix first; dynamics stay as mixed). */
+	loudness_static?: boolean;
 	/** Mux the cut's captions in as a soft subtitle stream (mp4 / mov / mkv / webm). */
 	embed_captions?: boolean;
 	/** Caption files written beside the export (`cut.srt`, `cut.vtt`), once it completes. */
@@ -1104,6 +1110,32 @@ export interface ExportOptions {
 	overwrite_sidecars?: boolean;
 	/** Leave the generated captions out of the picture (typed titles are still drawn). */
 	skip_burned_captions?: boolean;
+}
+
+/** What syncing a clip to another by their sound found (`kerf_core::AudioSync`). */
+export interface AudioSync {
+	reference_id: string;
+	clip_id: string;
+	/** Seconds the clip moves on the timeline; positive is later. */
+	offset: number;
+	/** Where the clip starts in sync. */
+	timeline_start: number;
+	/** Correlation peak over its RMS; 8 or more is a clear match. */
+	confidence: number;
+	/** Peak over the next-best match more than 50 ms away; 1.5 or more is unambiguous. `null` when
+	 *  nothing else matched at all. */
+	distinct: number | null;
+	reliable: boolean;
+	/** One recording has inverted polarity. */
+	inverted: boolean;
+	/** The clip was moved (an unreliable match is only reported unless forced). */
+	applied: boolean;
+}
+
+/** `sync_clips_by_audio`'s answer: the sync and the timeline after it. */
+export interface SyncedByAudio {
+	sync: AudioSync;
+	timeline: Timeline;
 }
 
 /** A delivery's loudness target (`kerf_core::LoudnessPreset`): YouTube and Spotify -14 LUFS,
@@ -1169,8 +1201,10 @@ export interface ExportProgress {
 	fraction: number;
 	elapsed_secs: number;
 	eta_secs?: number | null;
-	/** Set while the render has not started because the machine is busy with another heavy job
-	 *  (`waiting for the preview proxy`): a queued export is not hung at 0%. */
+	/** Set while the render has not started: the machine is busy with another heavy job
+	 *  (`waiting for the preview proxy`), or a static loudness normalization is metering the mix
+	 *  (`measuring the mix's loudness`) — so the export is not hung at 0%. A multi-format export
+	 *  sets it too. */
 	waiting?: string | null;
 	/** Set by a multi-format export: which file is rendering, of how many.
 	 *  `fraction` then spans all of them. */
@@ -1286,6 +1320,13 @@ export interface StemsStatus {
 }
 
 /** Payload of the `stems-progress` event, the same shape as `voiceover-progress`. */
+/** `audio-sync-progress`: a sync by audio waiting for the heavy-job slot (`detail` says why). */
+export interface AudioSyncProgress {
+	stage: 'waiting';
+	fraction: null;
+	detail: string | null;
+}
+
 export interface StemsProgress {
 	stage: 'download_runtime' | 'download_model' | 'separate' | 'encode';
 	fraction: number | null;

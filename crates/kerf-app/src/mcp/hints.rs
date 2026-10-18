@@ -92,6 +92,8 @@ pub(super) const TOOLS: &[(&str, &str, Effect)] = &[
     ("set_master_volume", "Master volume", Set),
     ("set_master_limiter", "Master limiter", Set),
     ("set_master_duck", "Master duck", Set),
+    ("set_master_true_peak", "Master true peak", Set),
+    ("sync_clips_by_audio", "Sync clips by audio", Set),
     ("set_delivery_format", "Delivery format", Set),
     ("add_marker", "Add marker", Edit),
     ("update_marker", "Update marker", Set),

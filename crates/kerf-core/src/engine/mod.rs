@@ -82,7 +82,10 @@ pub(crate) mod vad;
 
 // Stem separation (Demucs htdemucs on ONNX Runtime; STFT, chunking and overlap-add here).
 pub mod stems;
-pub use pcm::{decode_audio, wav_bytes, write_wav, AudioBuffer};
+pub use pcm::{decode_audio, decode_audio_window, wav_bytes, write_wav, AudioBuffer};
+
+// Lining two recordings up by their sound (GCC-PHAT-β, coarse then refined): pure DSP.
+pub mod audio_sync;
 pub use stems::{status as stems_status, StemsStatus, STEM_NAMES};
 
 // Speech model provisioning + transcription through the `ffmpeg` binary's
@@ -194,6 +197,18 @@ pub fn render_with_progress(
     cancel: &dyn Fn() -> bool,
 ) -> Result<RenderStatus> {
     cli::render_with_progress(timeline, assets, output, opts, progress, cancel)
+}
+
+/// Check every variant and measure what they share, once — see [`cli::prepare_variants`].
+pub fn prepare_variants(
+    timeline: &crate::model::Timeline,
+    assets: &[crate::model::Asset],
+    variants: &[ExportVariant],
+    opts: &ExportOptions,
+    progress: &mut dyn FnMut(VariantProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<ExportOptions>> {
+    cli::prepare_variants(timeline, assets, variants, opts, progress, cancel)
 }
 
 /// Render one file per delivery frame — see [`cli::render_variants`].
