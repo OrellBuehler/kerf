@@ -44,7 +44,8 @@
 	import { renderedDuration, renderedFps, timecodeRate } from '$lib/timecode';
 	import { logFrontend } from '$lib/log';
 	import { clipDuration } from '$lib/types';
-	import type { TextOverlay } from '$lib/types';
+	import type { SvgOverlay, TextOverlay } from '$lib/types';
+	import { dragRect, rectOf, rectPatch, roundRect, svgDisplayName, type Rect, type RectHandle } from '$lib/svg-titles';
 	import { boxPadding, containRect, dragPosition, inkBox, isVisibleAt, sampleOverlay, scaledSize, titleFamily } from '$lib/titles';
 	import { tip } from '$lib/tip';
 
@@ -493,6 +494,14 @@
 		return here.sort((a, b) => Number(a.id === editor.selectedOverlayId) - Number(b.id === editor.selectedOverlayId));
 	});
 
+	// The selected animated SVG title, as a placement box over the rectangle the engine fits its artwork into
+	// (fractions of the same frame the titles are laid out in). The artwork itself is in the picture the engine
+	// rendered: the page draws only the box, never the SVG. Like the title boxes it is out of the way while playing.
+	const svgBox = $derived.by(() => {
+		const o = editor.selectedSvgOverlay;
+		return o && !ui.playing && !empty && isVisibleAt(o, ui.time) ? o : null;
+	});
+
 	// ---- the GPU preview: how the frame is produced, and where the surface is ------------
 	//
 	// With the setting off none of this runs: the route is the JPEG path, nothing is observed and
@@ -517,7 +526,7 @@
 			overlaysCapable: gpuPreview.status?.overlays ?? false,
 			streaming,
 			empty,
-			titlesShown: titlesHere.length > 0,
+			titlesShown: titlesHere.length > 0 || svgBox !== null,
 			trimMonitor: !!ui.trimMonitor,
 			guides: showGuides,
 			covered
@@ -779,6 +788,19 @@
 		committing: boolean;
 	};
 	let tdrag = $state<TitleDrag | null>(null);
+	type SvgDrag = {
+		id: string;
+		handle: RectHandle;
+		startX: number;
+		startY: number;
+		w: number;
+		h: number;
+		from: Rect;
+		rect: Rect;
+		moved: boolean;
+		committing: boolean;
+	};
+	let sdrag = $state<SvgDrag | null>(null);
 	let layerEl = $state<HTMLElement | null>(null);
 	let capture: { el: Element; id: number } | null = null;
 
@@ -801,8 +823,72 @@
 		releaseTitleCapture();
 	}
 
+	/** Abandon an animated title's box gesture without writing anything. */
+	function cancelSvgDrag() {
+		if (!sdrag || sdrag.committing) return;
+		sdrag = null;
+		releaseTitleCapture();
+	}
+
+	function onSvgDown(e: PointerEvent, o: SvgOverlay, handle: RectHandle) {
+		if (e.button !== 0 || tdrag || sdrag || !layerEl) return;
+		e.stopPropagation();
+		e.preventDefault();
+		ui.pause();
+		const box = layerEl.getBoundingClientRect();
+		const from = rectOf(o);
+		sdrag = { id: o.id, handle, startX: e.clientX, startY: e.clientY, w: box.width, h: box.height, from, rect: from, moved: false, committing: false };
+		try {
+			(e.currentTarget as Element).setPointerCapture(e.pointerId);
+			capture = { el: e.currentTarget as Element, id: e.pointerId };
+		} catch {
+			// best-effort: the window blur and buttons checks are the fallback
+		}
+	}
+
+	function onSvgMove(e: PointerEvent) {
+		const d = sdrag;
+		if (!d || d.committing) return;
+		if ((e.buttons & 1) === 0) {
+			cancelSvgDrag();
+			return;
+		}
+		const dx = e.clientX - d.startX;
+		const dy = e.clientY - d.startY;
+		sdrag = { ...d, rect: dragRect(d.from, d.handle, dx, dy, d.w, d.h), moved: d.moved || Math.hypot(dx, dy) >= 3 };
+	}
+
+	/** One backend edit per gesture, as for titles: the box keeps the pose it was let go at until the edit has landed. */
+	async function onSvgUp() {
+		const d = sdrag;
+		if (!d || d.committing) return;
+		releaseTitleCapture();
+		const patch = d.moved ? rectPatch(d.from, roundRect(d.rect)) : {};
+		if (Object.keys(patch).length === 0) {
+			sdrag = null;
+			return;
+		}
+		sdrag = { ...d, committing: true };
+		try {
+			await editor.updateSvgOverlay(d.id, patch);
+		} catch (err) {
+			toast.error(err instanceof Error ? err.message : String(err));
+		} finally {
+			sdrag = null;
+		}
+	}
+
+	function onSvgLostCapture() {
+		if (sdrag && !sdrag.committing) cancelSvgDrag();
+	}
+
+	function cancelDrags() {
+		cancelTitleDrag();
+		cancelSvgDrag();
+	}
+
 	function onTitleDown(e: PointerEvent, o: TextOverlay, mode: 'move' | 'resize') {
-		if (e.button !== 0 || tdrag || !layerEl) return;
+		if (e.button !== 0 || tdrag || sdrag || !layerEl) return;
 		e.stopPropagation();
 		e.preventDefault();
 		editor.selectOverlay(o.id);
@@ -888,10 +974,10 @@
 		typeof CSS !== 'undefined' && CSS.supports('color', c) ? c : 'var(--text-on-video)';
 
 	const HANDLES = [
-		{ at: 'left:0;top:0', cursor: 'nwse-resize' },
-		{ at: 'left:100%;top:0', cursor: 'nesw-resize' },
-		{ at: 'left:0;top:100%', cursor: 'nesw-resize' },
-		{ at: 'left:100%;top:100%', cursor: 'nwse-resize' }
+		{ at: 'left:0;top:0', cursor: 'nwse-resize', corner: 'nw' as const },
+		{ at: 'left:100%;top:0', cursor: 'nesw-resize', corner: 'ne' as const },
+		{ at: 'left:0;top:100%', cursor: 'nesw-resize', corner: 'sw' as const },
+		{ at: 'left:100%;top:100%', cursor: 'nwse-resize', corner: 'se' as const }
 	];
 
 	function onPreviewContextMenu(e: MouseEvent) {
@@ -937,12 +1023,12 @@
 		// Abandoning a drag is all Escape does then — not also "clear the selection". These
 		// listen to the window the panel is in, which is a detached window's when it is in one.
 		keydowncapture: (e: KeyboardEvent) => {
-			if (e.key === 'Escape' && tdrag && !tdrag.committing) {
-				cancelTitleDrag();
+			if (e.key === 'Escape' && ((tdrag && !tdrag.committing) || (sdrag && !sdrag.committing))) {
+				cancelDrags();
 				e.stopPropagation();
 			}
 		},
-		blur: cancelTitleDrag
+		blur: cancelDrags
 	})}
 	style="flex:1;min-height:0;display:flex;flex-direction:column;background:{onSurface && technique === 'window' ? 'transparent' : 'var(--surface-void)'}"
 >
@@ -1019,11 +1105,40 @@
 				<!-- Titles under the playhead, as boxes over where the engine draws them.
 				     The text is transparent (the picture already has it) except while
 				     it is being dragged, when the box carries a ghost of it. -->
-				{#if titlesHere.length}
+				{#if titlesHere.length || svgBox}
 					<div
 						bind:this={layerEl}
 						style="position:absolute;{layerBox};container-type:size;pointer-events:none"
 					>
+						{#if svgBox}
+							<!-- The selected animated title's placement rectangle: the engine fits the artwork into it, centred.
+							     Drag it to move, a corner to resize; one edit on release, Escape abandons. -->
+							{@const r = sdrag?.id === svgBox.id ? sdrag.rect : rectOf(svgBox)}
+							{@const live = sdrag?.id === svgBox.id ? sdrag : null}
+							<div
+								role="presentation"
+								data-svg-box
+								use:tip={'Drag to move the animated title, a corner to resize it'}
+								onpointerdown={(e) => onSvgDown(e, svgBox, 'move')}
+								onpointermove={onSvgMove}
+								onpointerup={onSvgUp}
+								onpointercancel={cancelSvgDrag}
+								onlostpointercapture={onSvgLostCapture}
+								style="position:absolute;left:{r.x * 100}%;top:{r.y * 100}%;width:{r.width * 100}%;height:{r.height * 100}%;box-sizing:border-box;pointer-events:auto;touch-action:none;cursor:{live ? 'grabbing' : 'move'};user-select:none;outline:1.5px solid var(--kerf-400);outline-offset:0;background:{live?.moved ? 'color-mix(in srgb,var(--kerf-400) 14%,transparent)' : 'color-mix(in srgb,var(--kerf-400) 6%,transparent)'}"
+							>
+								<span
+									style="position:absolute;left:0;bottom:0;max-width:100%;padding:1px 6px;box-sizing:border-box;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;font-weight:600;color:var(--text-on-video);background:color-mix(in srgb,var(--scrim) 55%,transparent);pointer-events:none"
+									>{svgDisplayName(svgBox)}</span
+								>
+								{#each HANDLES as h (h.at)}
+									<span
+										role="presentation"
+										onpointerdown={(e) => onSvgDown(e, svgBox, h.corner)}
+										style="position:absolute;{h.at};width:10px;height:10px;transform:translate(-50%,-50%);background:var(--kerf-400);border:1.5px solid var(--surface-app);border-radius:2px;cursor:{h.cursor};touch-action:none;font-size:0"
+									></span>
+								{/each}
+							</div>
+						{/if}
 						{#each titlesHere as o (o.id)}
 							{@const live = tdrag?.id === o.id ? tdrag : null}
 							{@const pose = sampleOverlay(o, ui.time)}

@@ -12,6 +12,13 @@ ignore = [
     # the path is Tauri's build-time Info.plist handling.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # zip < 9 `extract()` follows symlinks / keeps SUID bits, reached only via
+    # `tauri-plugin-updater`, which requires `zip ^4` (2.14.0 included). It
+    # extracts only on Windows, and only a bundle whose minisign signature has
+    # already verified against the embedded key. kerf-core is on zip 9.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
 ]
 
 # `unmaintained` and `unsound` are reported but do not fail the build: the Linux
