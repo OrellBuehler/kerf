@@ -249,6 +249,13 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = sibling(path, &format!("settings.tmp-{}", uuid::Uuid::new_v4().simple()));
     let result = (|| {
         let mut file = std::fs::File::create(&tmp)?;
+        // The file holds the agent token: readable by the user alone (a no-op on Windows, where the
+        // profile directory already is).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
@@ -584,6 +591,18 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "two");
         let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(names, vec![std::ffi::OsString::from("settings.json")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_settings_file_is_readable_by_its_owner_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        save_to(&file, &Settings::default()).unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "it holds the MCP token");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
