@@ -159,6 +159,7 @@ impl Rig {
                 ..Track::new(StreamKind::Video, "V1".to_string())
             }],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -388,6 +389,7 @@ fn an_edit_that_does_not_touch_a_frame_leaves_it_cached() {
             ..Track::new(StreamKind::Video, "V1".to_string())
         }],
         overlays: Vec::new(),
+        svg_overlays: Vec::new(),
         markers: Vec::new(),
         format: None,
         master: Default::default(),

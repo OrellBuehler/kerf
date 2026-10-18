@@ -47,12 +47,26 @@ ureq = "3.4"
 # linked at build time. misaki-rs without its GPL espeak-ng fallback.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic"] }
 misaki-rs = { version = "0.6", default-features = false }
-sha2 = "0.10"
+sha2 = "0.11"
 flate2 = "1"
 tar = "0.4"
-zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 # STFT for the music analysis (onset flux, chroma; see engine::music).
 realfft = "3.5"
+# Animated SVG overlays (see svg): roxmltree reads the source, resvg draws each frame. Text and
+# system fonts, and the raster codecs (PNG, JPEG, GIF, WebP) an `<image>` with a `data:` URL needs
+# (a logo in a lower third); nothing is ever read from a path or a URL.
+roxmltree = "0.21"
+svgtypes = "0.16"
+resvg = { version = "0.48.1", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
+tiny-skia = "0.12"
+# The pictures of the cache are written with `png` directly, at a quick level (svg::raster::encode_frame_png);
+# it is the encoder `tiny-skia` already links.
+png = "0.18"
+# The size of an embedded image is read from its header before anything decodes it (svg::images),
+# and a `data:` URL is decoded the way usvg decodes it; both crates are resvg's own.
+imagesize = "0.15"
+data-url = "0.3"
 ffmpeg-next = { workspace = true, optional = true }
 whisper-rs = { version = "0.16.0", optional = true }
 

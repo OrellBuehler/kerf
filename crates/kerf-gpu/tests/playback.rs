@@ -166,6 +166,7 @@ fn timeline(clips: Vec<Clip>) -> Timeline {
             ..Track::new(StreamKind::Video, "V1")
         }],
         overlays: Vec::new(),
+        svg_overlays: Vec::new(),
         markers: Vec::new(),
         format: None,
         master: Default::default(),
@@ -595,6 +596,7 @@ fn a_layer_over_another_track_with_a_transform_and_an_opacity_is_drawn_through_c
             },
         ],
         overlays: Vec::new(),
+        svg_overlays: Vec::new(),
         markers: Vec::new(),
         format: None,
         master: Default::default(),
