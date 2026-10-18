@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
+	import Btn from './Btn.svelte';
 	import Badge from './Badge.svelte';
 	import ClipOverlays from './ClipOverlays.svelte';
 	import ClipFilmstrip from './ClipFilmstrip.svelte';
@@ -8,6 +9,9 @@
 	import HeightGlyph from './HeightGlyph.svelte';
 	import ToolbarToggle from './ToolbarToggle.svelte';
 	import Minimap from './Minimap.svelte';
+	import TimecodeField from './TimecodeField.svelte';
+	import MarkerDialog from './MarkerDialog.svelte';
+	import { markerTip } from '#lib/marker-edit';
 	import { toast } from '#lib/notifications.svelte';
 	import { ui, type Tool } from '#lib/editor-ui.svelte';
 	import { editor } from '#lib/state.svelte';
@@ -18,21 +22,31 @@
 	import { windows } from '#lib/windows.svelte';
 	import type { MenuItem } from '#lib/context-menu.svelte';
 	import {
+		addMarker,
 		deleteSelection,
 		detachSelection,
+		duplicateClips,
+		holdForPreview,
 		linkSelection,
+		pasteClips,
 		reattachSelection,
+		copyKeyframesOf,
+		pasteKeyframesOnto,
+		report,
 		selectionLinkPlans,
+		splitSelection,
 		trimSelection,
 		unlinkSelection
 	} from '#lib/ops';
-	import { importCaptionFile } from '#lib/title-actions';
+	import { addAnimatedTitle, addCustomSvgTitle, importCaptionFile } from '#lib/title-actions';
+	import { keyframeOffer } from '#lib/keyframe-copy';
 	import type { ActionId } from '#lib/keymap';
 	import { DELIVERY_PRESETS, fitLabel, presetFor } from '#lib/delivery-formats';
 	import { setDeliveryPreset } from '#lib/menu-commands';
 	import { importMenuEntries, importableAssets } from '#lib/caption-import-ui';
-	import type { Clip, Marker, StreamKind, TextOverlay, Track } from '#lib/types';
-	import { GENERATED_TITLE_FILL, packRows, snapSpanStart, snapTime, trimSpan } from '#lib/titles';
+	import type { Clip, Marker, StreamKind, SvgOverlay, TextOverlay, Track } from '#lib/types';
+	import { GENERATED_TITLE_FILL, SVG_TITLE_FILL, packRows, snapSpanStart, snapTime, trimSpan } from '#lib/titles';
+	import { SVG_PRESETS, svgDisplayName, svgTooltip } from '#lib/svg-titles';
 	import { faderToGain, gainLabel, gainToFader, panLabel } from '#lib/mixer';
 	import { trackHasSound } from '#lib/mixer-strips';
 	import { clampEdge, quantizeSpanStart, quantizeTime, splitPoint, startBefore, trimEdit } from '#lib/frames';
@@ -41,6 +55,8 @@
 	import { magnetList, markAt, snapLines, type Magnet, type SnapLine } from '#lib/snap';
 	import { cutReadout, moveReadout, trimEdgeMonitor, trimEdgeReadout, trimLimitWhy } from '#lib/gesture-readout';
 	import { diffView, type DiffView } from '#lib/staged-diff';
+	import { applyProposal, discardProposal } from '#lib/proposal-actions';
+	import { PREVIEW_READ_ONLY_REASON, proposalLine, touchedOnLive } from '#lib/proposal-ui';
 	import { displayTracks, opensAudioGroup } from '#lib/track-order';
 	import { NUDGE_QUIET_MS, nudgeFrames, nudgedStart } from '#lib/nudge';
 	import {
@@ -80,19 +96,21 @@
 	import { NAME_CHIP_PCT, showsLabel } from '#lib/clip-label';
 	import { fitOffer } from '#lib/music-ui';
 	import { stemsOffer } from '#lib/stems';
+	import { describeSync, syncOffer, SYNC_CANCELLED } from '#lib/audio-sync';
+	import { cancelAudioSync, onAudioSyncProgress } from '#lib/api';
 	import { transitionLabel } from '#lib/transitions';
 	import { marqueeMode, pickMode, sameIds, type Selection } from '#lib/selection';
 	import { linkPartners } from '#lib/link-groups';
 	import { ALT_HINT, linkBadges, marqueeSelectLinked, onlyPartners } from '#lib/link-ui';
 	import { analyzeSubmenuItem } from '#lib/analyze-menu';
-	import { muteItem, removeRows } from '#lib/menu-items';
+	import { heldForPreview, muteItem, removeRows } from '#lib/menu-items';
 	import { doneCount, doneSummary } from '#lib/analysis-steps';
 	import { mediaStatus } from '#lib/media-status.svelte';
 	import { linkedTrimBounds, linkedTrimPreview } from '#lib/linked-trim';
 	import { marqueeHits, normalizeRect, type LaneBox, type SpanClip } from '#lib/marquee';
 	import { drawnMoveTracks, planMove, type Ghost, type MovePlan } from '#lib/multi-move';
 	import { frameTicksIn, minorTicksIn, rulerGrid, showsFrameTicks, tickLabel, ticksIn } from '#lib/ruler';
-	import { formatTimecode } from '#lib/timecode';
+	import { timeDisplay } from '#lib/time-display.svelte';
 	import { MIN_CLIP, trimBounds, type TrimBounds } from '#lib/ripple-trim';
 	import {
 		clampZoom,
@@ -108,6 +126,7 @@
 		type FollowInput
 	} from '#lib/zoom';
 	import { tip, type TipInput } from '#lib/tip';
+	import RenderBar from './RenderBar.svelte';
 
 	const pxPerSec = $derived(ui.zoom);
 	/** The lane is as long as the cut, and while a gesture is held as far as the gesture has reached,
@@ -120,6 +139,29 @@
 	const diff = $derived.by((): DiffView | null =>
 		editor.previewingStaged && editor.staged ? diffView(editor.staged.diff.entries, editor.timeline, editor.liveTimeline) : null
 	);
+
+	/** What the proposal touches on the *live* cut, for the faint marks shown before it is previewed. */
+	const touched = $derived(
+		editor.staged && !editor.previewingStaged ? touchedOnLive(editor.staged.diff.entries, editor.liveTimeline) : null
+	);
+	let reviewBusy = $state(false);
+	async function reviewAct(answer: () => Promise<boolean>) {
+		reviewBusy = true;
+		try {
+			await answer();
+		} finally {
+			reviewBusy = false;
+		}
+	}
+
+	/** A press that would start a gesture while the proposal is on screen: the cut is read-only then, so no
+	 *  gesture starts — it is remembered, and the first move past the slop (or a razor click) says why. */
+	let previewPress = $state<{ x: number; y: number } | null>(null);
+	function holdForReview(e: PointerEvent): boolean {
+		if (!editor.previewingStaged) return false;
+		previewPress = { x: e.clientX, y: e.clientY };
+		return true;
+	}
 
 	// ---- linked A/V ----------------------------------------------------------------
 	//
@@ -139,7 +181,7 @@
 	let hoverId = $state<string | null>(null);
 
 	/** The project timecode: what the transport, the status bar and the ruler read in. */
-	const tc = (s: number): string => formatTimecode(s, editor.fps);
+	const tc = (s: number): string => timeDisplay.fmt(s);
 
 	/** A track's lane height: its preset's pixels (`track-heights.ts`). The waveform's
 	 *  lane count and whether a clip shows thumbnails both follow from what they
@@ -276,6 +318,11 @@
 		ro.observe(el);
 		return () => ro.disconnect();
 	});
+
+	$effect(() => {
+		ui.timelineView = { start: scrollX / pxPerSec, end: (scrollX + viewW) / pxPerSec };
+	});
+	$effect(() => () => (ui.timelineView = null));
 
 	// Two primitives rather than one object: a scroll tick that does not cross a
 	// quantum changes neither, so no clip's waveform is touched by it.
@@ -499,6 +546,7 @@
 		alt = e.altKey;
 		editor.selectClip(c.id, 'replace', e.altKey);
 		void editor.select(c.asset_id);
+		if (holdForReview(e)) return;
 		const laneLeft =
 			((e.currentTarget as HTMLElement).closest('[data-lane]') as HTMLElement | null)?.getBoundingClientRect().left ?? 0;
 		const asset = editor.assets.find((a) => a.id === c.asset_id);
@@ -621,9 +669,9 @@
 
 	const laneTime = (clientX: number, laneLeft: number) => (clientX - laneLeft) / pxPerSec;
 
-	function err(e: unknown) {
-		toast.error(e instanceof Error ? e.message : String(e));
-	}
+	const err = report;
+	/** The rows of a menu that edit the cut, off while the proposal is previewed. */
+	const held = (items: MenuItem[]): MenuItem[] => heldForPreview(items, editor.previewingStaged);
 
 	// The tools, now that the toolbar row is gone: [tool, icon, name, the action whose
 	// key selects it] — the tooltip is read from the keymap, so it shows the key the user
@@ -675,6 +723,7 @@
 		}
 		if (ui.tool === 'razor') {
 			e.stopPropagation();
+			if (holdForPreview()) return;
 			// Snapped like any other placement, then held half a frame inside the clip.
 			const at = splitPoint(
 				snapPoint(laneTime(e.clientX, laneLeft), t.id, ''),
@@ -697,6 +746,7 @@
 				e.stopPropagation();
 				return;
 			}
+			if (holdForReview(e)) return;
 			beginTrimTool(e, c, t, laneLeft);
 			return;
 		}
@@ -718,6 +768,7 @@
 			e.stopPropagation();
 			return;
 		}
+		if (holdForReview(e)) return;
 		drag = {
 			clipId: c.id,
 			kind: t.kind,
@@ -815,6 +866,7 @@
 		scrubbing = false;
 		markDrag = null;
 		markerDrag = null;
+		previewPress = null;
 		// A marquee abandoned gives the selection back as it found it — and the click
 		// that still follows when the button comes up is not a click on the lane
 		// (it would seek, and clear what was just restored).
@@ -943,7 +995,7 @@
 		if (t?.moved) return snapLines([t.pos], magnetsOn(t.trackId, t.clipId));
 		const td = titleDrag;
 		if (td?.moved) {
-			const others = editor.overlays.filter((o) => o.id !== td.id).flatMap((o) => [o.start, o.end]);
+			const others = otherTitleEdges(td.id);
 			const marks = magnetList({ playhead: ui.time, beats: beatTimes, bars: barTimes, edges: allClipEdges(), titles: others });
 			return snapLines(td.mode === 'move' ? [td.start, td.end] : td.mode === 'l' ? [td.start] : [td.end], marks);
 		}
@@ -998,7 +1050,8 @@
 					track: track?.name ?? '',
 					fps,
 					count: d.members.size,
-					refused: dropRefused ? dragPlan.reason || 'that drop would not fit' : null
+					refused: dropRefused ? dragPlan.reason || 'that drop would not fit' : null,
+					mode: timeDisplay.mode
 				}),
 				x: d.nx,
 				y: d.ny
@@ -1006,7 +1059,7 @@
 		}
 		const t = trimDrag;
 		if (t?.moved) {
-			let r = trimEdgeReadout({ edge: t.edge, start: t.origStart, end: t.origEnd, pos: t.pos, fps, limit: t.limit });
+			let r = trimEdgeReadout({ edge: t.edge, start: t.origStart, end: t.origEnd, pos: t.pos, fps, limit: t.limit, mode: timeDisplay.mode });
 			// A trim the backend would turn down, or one that cuts a partner's sound back, says so here.
 			if (trimView && !trimView.ok && trimView.reason) r = { ...r, detail: trimView.reason, tone: 'refused' };
 			else if (trimView?.ok && trimView.trimmed.length > 0) {
@@ -1017,7 +1070,7 @@
 		const z = razor;
 		if (z && ui.tool === 'razor' && !drag && !tg) {
 			const along = [...razorLanes].filter(([id]) => id !== z.trackId).map(([, name]) => name);
-			const r = cutReadout({ at: z.at, fps, along });
+			const r = cutReadout({ at: z.at, fps, along, mode: timeDisplay.mode });
 			return { r: razorMagnet ? { ...r, title: `${r.title} · ${razorMagnet.label}` } : r, x: z.nx, y: z.ny };
 		}
 		return null;
@@ -1031,7 +1084,7 @@
 		const track = d ? editor.timeline.tracks.find((t) => t.id === d.trackId) : undefined;
 		const clip = d ? track?.clips.find((x) => x.id === d.clipId) : undefined;
 		if (d?.moved && c && track && clip) {
-			ui.trimMonitor = trimEdgeMonitor(clip, d.edge, d.pos, fps, track.kind, c.r);
+			ui.trimMonitor = trimEdgeMonitor(clip, d.edge, d.pos, fps, track.kind, c.r, timeDisplay.mode);
 			edgeMonitorOn = true;
 		} else if (edgeMonitorOn) {
 			ui.trimMonitor = null;
@@ -1087,6 +1140,12 @@
 		}
 		const k = nudgeFrames(e.key, e.shiftKey, fps);
 		if (k === null || t.locked || ui.tool !== 'pointer' || drag || trimDrag || tg) return;
+		// The proposal on screen is read-only: say so rather than start a nudge that cannot be written.
+		if (holdForPreview()) {
+			e.preventDefault();
+			e.stopPropagation();
+			return;
+		}
 		// The arrows are this clip's while it has the keyboard; the playhead's keys stand down for it.
 		e.preventDefault();
 		e.stopPropagation();
@@ -1119,6 +1178,16 @@
 		alt = e.altKey;
 		pointer = { x: e.clientX, y: e.clientY };
 		heldButtons = e.buttons;
+		if (previewPress) {
+			// Released, or moved far enough to be a drag: either way the press is over, and a drag says why nothing moved.
+			const p = previewPress;
+			if ((e.buttons & 1) === 0) previewPress = null;
+			else if (Math.hypot(e.clientX - p.x, e.clientY - p.y) >= DRAG_SLOP) {
+				previewPress = null;
+				holdForPreview();
+			}
+			return;
+		}
 		// The primary button is up but we never saw pointerup for it — treat
 		// exactly like a cancel rather than trust a move that outran its release.
 		if ((drag || trimDrag || titleDrag || marquee || scrubbing || markDrag || markerDrag) && (e.buttons & 1) === 0) {
@@ -1182,6 +1251,7 @@
 
 	function onPointerUp(e: PointerEvent) {
 		alt = e.altKey;
+		previewPress = null;
 		releaseCapture();
 		if (scrubbing) {
 			scrubbing = false;
@@ -1289,7 +1359,7 @@
 		const p = tgPreview;
 		if (!g) return;
 		const track = editor.timeline.tracks.find((t) => t.id === g.trackId);
-		ui.trimMonitor = p && track ? monitorFor(p, fps, track.kind) : null;
+		ui.trimMonitor = p && track ? monitorFor(p, fps, track.kind, timeDisplay.mode) : null;
 	});
 	let cancelTrimTool: (() => void) | null = null;
 	// The panel closing gives a gesture up (this cleanup runs once, at teardown)…
@@ -1584,7 +1654,7 @@
 			return;
 		}
 		const plain = !e.shiftKey && !e.ctrlKey && !e.metaKey;
-		if (plain && (editor.selectedClipIds.length > 0 || editor.selectedOverlayId)) {
+		if (plain && (editor.selectedClipIds.length > 0 || editor.selectedOverlayId || editor.selectedSvgOverlayId)) {
 			editor.clearSelection();
 			return;
 		}
@@ -1617,7 +1687,7 @@
 
 	function onLaneDragOver(e: DragEvent, t: Track) {
 		const a = ui.dndAsset;
-		if (!a || a.kind !== t.kind || t.locked) {
+		if (!a || a.kind !== t.kind || t.locked || editor.previewingStaged) {
 			dropGhost = null; // wrong-kind track: not a drop target
 			return;
 		}
@@ -1642,6 +1712,11 @@
 		dropGhost = null;
 		ui.dndAsset = null;
 		if (!a || a.kind !== t.kind) return;
+		if (editor.previewingStaged) {
+			e.preventDefault();
+			holdForPreview();
+			return;
+		}
 		if (t.locked) {
 			toast.error(`Track ${t.name} is locked`);
 			return;
@@ -1668,16 +1743,57 @@
 			)
 			.catch(err);
 
+	// ---- sync by audio ------------------------------------------------------------
+
+	// A sync that has to queue behind another job says so, with a way to stop it.
+	const SYNC_TOAST = 'audio-sync-wait';
+	async function syncing<T>(run: () => Promise<T>): Promise<T> {
+		const unlisten = await onAudioSyncProgress((p) =>
+			toast(`Sync by audio: ${p.detail ?? 'waiting'}`, {
+				id: SYNC_TOAST,
+				duration: Infinity,
+				action: { label: 'Cancel', onClick: () => void cancelAudioSync() }
+			})
+		);
+		try {
+			return await run();
+		} finally {
+			unlisten();
+			toast.dismiss(SYNC_TOAST);
+		}
+	}
+	const syncErr = (e: unknown) => {
+		if (String(e instanceof Error ? e.message : e) !== SYNC_CANCELLED) err(e);
+	};
+
+	// "Move anyway" sends the same pair forced: the backend applies the measurement it just made.
+	const syncByAudio = (referenceId: string, clipId: string) =>
+		void syncing(() => editor.syncByAudio(referenceId, clipId))
+			.then((s) =>
+				s.applied
+					? toast(describeSync(s))
+					: toast(describeSync(s), {
+							action: {
+								label: 'Move anyway',
+								onClick: () =>
+									void syncing(() => editor.syncByAudio(referenceId, clipId, true))
+										.then((f) => toast(describeSync(f)))
+										.catch(syncErr)
+							}
+						})
+			)
+			.catch(syncErr);
+
 	// ---- fades (toggle a default 0.5s fade on the selected clip) --------------
 
 	const FADE_DEFAULT = 0.5;
 	function toggleFadeIn() {
 		const c = editor.selectedClip;
-		if (c) void editor.setFade(c.id, c.fade_in > 0 ? 0 : FADE_DEFAULT);
+		if (c) void editor.setFade(c.id, c.fade_in > 0 ? 0 : FADE_DEFAULT).catch(err);
 	}
 	function toggleFadeOut() {
 		const c = editor.selectedClip;
-		if (c) void editor.setFade(c.id, undefined, c.fade_out > 0 ? 0 : FADE_DEFAULT);
+		if (c) void editor.setFade(c.id, undefined, c.fade_out > 0 ? 0 : FADE_DEFAULT).catch(err);
 	}
 
 	// ---- context menus -------------------------------------------------------
@@ -1710,27 +1826,29 @@
 
 	function trackItems(t: Track): MenuItem[] {
 		return [
-			{ label: 'Add video track', icon: 'video', action: () => onAddTrack('video') },
-			{ label: 'Add audio track', icon: 'audio-waveform', action: () => onAddTrack('audio') },
-			{ type: 'separator' },
-			{
-				...muteItem(t),
-				action: () => void editor.setTrackMuted(t.id, !t.muted).catch(err)
-			},
-			{
-				label: t.solo ? 'Clear solo' : 'Solo track',
-				icon: 'headphones',
-				action: () => void editor.setTrackSolo(t.id, !t.solo).catch(err)
-			},
-			{
-				label: t.locked ? 'Unlock track' : 'Lock track',
-				icon: 'lock',
-				action: () => void editor.setTrackLocked(t.id, !t.locked).catch(err)
-			},
+			...held([
+				{ label: 'Add video track', icon: 'video', action: () => onAddTrack('video') },
+				{ label: 'Add audio track', icon: 'audio-waveform', action: () => onAddTrack('audio') },
+				{ type: 'separator' },
+				{
+					...muteItem(t),
+					action: () => void editor.setTrackMuted(t.id, !t.muted).catch(err)
+				},
+				{
+					label: t.solo ? 'Clear solo' : 'Solo track',
+					icon: 'headphones',
+					action: () => void editor.setTrackSolo(t.id, !t.solo).catch(err)
+				},
+				{
+					label: t.locked ? 'Unlock track' : 'Lock track',
+					icon: 'lock',
+					action: () => void editor.setTrackLocked(t.id, !t.locked).catch(err)
+				}
+			]),
 			{ type: 'separator' },
 			...heightItems(t),
 			{ type: 'separator' },
-			{ label: `Remove track ${t.name}`, icon: 'trash', danger: true, action: () => onRemoveTrack(t) }
+			...held([{ label: `Remove track ${t.name}`, icon: 'trash', danger: true, action: () => onRemoveTrack(t) }])
 		];
 	}
 
@@ -1762,36 +1880,39 @@
 		const linked = linkPartners(editor.timeline, c.id).length > 0;
 		// Music with a fitted bar grid can be made to last as long as the picture.
 		const fit = fitOffer(t, c, editor.analysisFor(c.asset_id));
+		const kf = keyframeOffer(editor.timeline, editor.keyframeSource, c.id);
 		// Footage or music with sound can be split into drums / bass / other / vocals under the clip.
 		const stems = stemsOffer(
 			t,
 			c,
 			editor.assets.find((a) => a.id === c.asset_id)
 		);
+		// Two clips selected: the clicked one can be moved into sync with the other by their sound.
+		const sync = syncOffer(editor.timeline, editor.assets, editor.selectedClipIds, c.id);
 		contextMenu.show(e, [
-			{
-				label: 'Split at playhead',
-				icon: 'Scissors',
-				disabled: !within || !!t.locked,
-				action: () => {
-					// The playhead can be anywhere between frames; the cut is on one.
-					const at = splitPoint(quantizeTime(ui.time, { fps }), c.timeline_start, c.timeline_start + clipDuration(c), fps);
-					if (at === null) toast.error('That clip is too short to cut on a frame');
-					else void editor.split(c.id, at).catch(err);
+			...held([
+				{
+					label: n > 1 ? 'Split selected at playhead' : 'Split at playhead',
+					icon: 'Scissors',
+					shortcut: settings.shortcut('edit.split'),
+					disabled: !within || !!t.locked,
+					reason: !within ? 'Move the playhead into this clip first' : t.locked ? `Track ${t.name} is locked` : undefined,
+					// The playhead can be anywhere between frames; the cut is on one (`planPlayheadSplit`).
+					action: () => void splitSelection()
+				},
+				{
+					label: n > 1 ? 'Trim starts to playhead' : 'Trim start to playhead',
+					shortcut: settings.shortcut('edit.trimStart'),
+					disabled: !within || !!t.locked,
+					action: () => void trimSelection('left')
+				},
+				{
+					label: n > 1 ? 'Trim ends to playhead' : 'Trim end to playhead',
+					shortcut: settings.shortcut('edit.trimEnd'),
+					disabled: !within || !!t.locked,
+					action: () => void trimSelection('right')
 				}
-			},
-			{
-				label: n > 1 ? 'Trim starts to playhead' : 'Trim start to playhead',
-				shortcut: settings.shortcut('edit.trimStart'),
-				disabled: !within || !!t.locked,
-				action: () => void trimSelection('left')
-			},
-			{
-				label: n > 1 ? 'Trim ends to playhead' : 'Trim end to playhead',
-				shortcut: settings.shortcut('edit.trimEnd'),
-				disabled: !within || !!t.locked,
-				action: () => void trimSelection('right')
-			},
+			]),
 			{ type: 'separator' },
 			{
 				label: n > 1 ? `Copy ${n} clips` : 'Copy',
@@ -1802,109 +1923,135 @@
 					if (k) toast(k === 1 ? 'Clip copied' : `${k} clips copied`);
 				}
 			},
-			{
-				label: n > 1 ? `Duplicate ${n} clips` : 'Duplicate',
-				shortcut: settings.shortcut('edit.duplicate'),
-				action: () =>
-					void editor
-						.duplicateSelection()
-						.then((k) => k && toast(k === 1 ? 'Clip duplicated' : `${k} clips duplicated`))
-						.catch(err)
-			},
-			{ type: 'separator' },
-			...(lp.detach.show
-				? [
-						{
-							label: lp.detach.label,
-							icon: 'volume-x',
-							shortcut: settings.shortcut('edit.detachAudio'),
-							disabled: lp.detach.reason !== null,
-							reason: lp.detach.reason ?? undefined,
-							action: () => void detachSelection()
-						} satisfies MenuItem
-					]
-				: []),
-			...(lp.reattach.show
-				? [
-						{
-							label: lp.reattach.label,
-							icon: 'audio-waveform',
-							shortcut: settings.shortcut('edit.reattachAudio'),
-							disabled: lp.reattach.reason !== null,
-							reason: lp.reattach.reason ?? undefined,
-							action: () => void reattachSelection()
-						} satisfies MenuItem
-					]
-				: []),
-			{
-				label: lp.link.label,
-				icon: 'link',
-				shortcut: settings.shortcut('edit.link'),
-				disabled: lp.link.reason !== null,
-				reason: lp.link.reason ?? undefined,
-				action: () => void linkSelection()
-			},
-			{
-				label: lp.unlink.label,
-				icon: 'unlink',
-				shortcut: settings.shortcut('edit.unlink'),
-				disabled: lp.unlink.reason !== null,
-				reason: lp.unlink.reason ?? undefined,
-				action: () => void unlinkSelection()
-			},
+			...held([
+				{
+					label: n > 1 ? `Duplicate ${n} clips` : 'Duplicate',
+					shortcut: settings.shortcut('edit.duplicate'),
+					action: () => void duplicateClips()
+				},
+				{ type: 'separator' },
+				...(lp.detach.show
+					? [
+							{
+								label: lp.detach.label,
+								icon: 'volume-x',
+								shortcut: settings.shortcut('edit.detachAudio'),
+								disabled: lp.detach.reason !== null,
+								reason: lp.detach.reason ?? undefined,
+								action: () => void detachSelection()
+							} satisfies MenuItem
+						]
+					: []),
+				...(lp.reattach.show
+					? [
+							{
+								label: lp.reattach.label,
+								icon: 'audio-waveform',
+								shortcut: settings.shortcut('edit.reattachAudio'),
+								disabled: lp.reattach.reason !== null,
+								reason: lp.reattach.reason ?? undefined,
+								action: () => void reattachSelection()
+							} satisfies MenuItem
+						]
+					: []),
+				{
+					label: lp.link.label,
+					icon: 'link',
+					shortcut: settings.shortcut('edit.link'),
+					disabled: lp.link.reason !== null,
+					reason: lp.link.reason ?? undefined,
+					action: () => void linkSelection()
+				},
+				{
+					label: lp.unlink.label,
+					icon: 'unlink',
+					shortcut: settings.shortcut('edit.unlink'),
+					disabled: lp.unlink.reason !== null,
+					reason: lp.unlink.reason ?? undefined,
+					action: () => void unlinkSelection()
+				},
+				...(sync.show
+					? [
+							{
+								label: 'Sync by audio',
+								icon: 'audio-waveform',
+								disabled: sync.reason !== null,
+								reason: sync.reason ?? undefined,
+								action: () => syncByAudio(sync.referenceId!, c.id)
+							} satisfies MenuItem
+						]
+					: [])
+			]),
 			{ type: 'separator' },
 			...clipAnalysisItems(c, e),
 			{ type: 'separator' },
-			...(fit.show
-				? [
-						{
-							label: 'Fit to video…',
-							icon: 'music',
-							disabled: fit.reason !== null,
-							reason: fit.reason ?? undefined,
-							action: () => ui.openFitMusic(c.id)
-						} satisfies MenuItem
-					]
-				: []),
-			...(stems.show
-				? [
-						{
-							label: 'Separate stems under this clip…',
-							icon: 'layers',
-							disabled: stems.reason !== null,
-							reason: stems.reason ?? undefined,
-							action: () => ui.openStems(c.asset_id, c.id)
-						} satisfies MenuItem
-					]
-				: []),
-			...(fit.show || stems.show ? [{ type: 'separator' } satisfies MenuItem] : []),
-			{
-				label: enabled ? 'Disable clip' : 'Enable clip',
-				icon: enabled ? 'eye-off' : 'eye',
-				disabled: !!t.locked,
-				action: () => void editor.setClipEnabled(c.id, !enabled).catch(err)
-			},
-			{ type: 'separator' },
-			{
-				label: c.fade_in > 0 ? 'Remove fade-in' : 'Add fade-in',
-				action: () => void editor.setFade(c.id, c.fade_in > 0 ? 0 : FADE_DEFAULT).catch(err)
-			},
-			{
-				label: c.fade_out > 0 ? 'Remove fade-out' : 'Add fade-out',
-				action: () => void editor.setFade(c.id, undefined, c.fade_out > 0 ? 0 : FADE_DEFAULT).catch(err)
-			},
-			{ type: 'separator' },
-			// "Only this clip" deletes the picture and keeps its sound, or the other way round: `link: false`.
-			...removeRows({
-				count: n,
-				linked,
-				locked: !!t.locked,
-				trackName: t.name,
-				removeKey: settings.shortcut('edit.delete'),
-				rippleKey: settings.shortcut('edit.rippleDelete'),
-				remove: (ripple) => removeClip(c.id, ripple),
-				removeAlone: (ripple) => removeAlone(c.id, ripple)
-			})
+			...held([
+				...(fit.show
+					? [
+							{
+								label: 'Fit to video…',
+								icon: 'music',
+								disabled: fit.reason !== null,
+								reason: fit.reason ?? undefined,
+								action: () => ui.openFitMusic(c.id)
+							} satisfies MenuItem
+						]
+					: []),
+				...(stems.show
+					? [
+							{
+								label: 'Separate stems under this clip…',
+								icon: 'layers',
+								disabled: stems.reason !== null,
+								reason: stems.reason ?? undefined,
+								action: () => ui.openStems(c.asset_id, c.id)
+							} satisfies MenuItem
+						]
+					: []),
+				...(fit.show || stems.show ? [{ type: 'separator' } satisfies MenuItem] : []),
+				{
+					label: 'Copy keyframes',
+					icon: 'diamond',
+					disabled: kf.copy.disabled,
+					reason: kf.copy.reason,
+					action: () => copyKeyframesOf(c.id)
+				},
+				{
+					label: 'Paste keyframes',
+					icon: 'clipboard',
+					disabled: kf.paste.disabled,
+					reason: kf.paste.reason,
+					action: () => void pasteKeyframesOnto(c.id)
+				},
+				{ type: 'separator' },
+				{
+					label: enabled ? 'Disable clip' : 'Enable clip',
+					icon: enabled ? 'eye-off' : 'eye',
+					disabled: !!t.locked,
+					action: () => void editor.setClipEnabled(c.id, !enabled).catch(err)
+				},
+				{ type: 'separator' },
+				{
+					label: c.fade_in > 0 ? 'Remove fade-in' : 'Add fade-in',
+					action: () => void editor.setFade(c.id, c.fade_in > 0 ? 0 : FADE_DEFAULT).catch(err)
+				},
+				{
+					label: c.fade_out > 0 ? 'Remove fade-out' : 'Add fade-out',
+					action: () => void editor.setFade(c.id, undefined, c.fade_out > 0 ? 0 : FADE_DEFAULT).catch(err)
+				},
+				{ type: 'separator' },
+				// "Only this clip" deletes the picture and keeps its sound, or the other way round: `link: false`.
+				...removeRows({
+					count: n,
+					linked,
+					locked: !!t.locked,
+					trackName: t.name,
+					removeKey: settings.shortcut('edit.delete'),
+					rippleKey: settings.shortcut('edit.rippleDelete'),
+					remove: (ripple) => removeClip(c.id, ripple),
+					removeAlone: (ripple) => removeAlone(c.id, ripple)
+				})
+			])
 		]);
 	}
 
@@ -2082,19 +2229,19 @@
 
 	// The titles lane is not a track, so it follows the global height choice.
 	const titleMetrics = $derived(TITLE_METRICS[ui.heights.all]);
-	const titleRows = $derived(packRows(editor.overlays));
-	/** No title or caption on the cut: the lane is a strip (`track-heights.ts`). */
-	const titlesEmpty = $derived(editor.overlays.length === 0);
+	// The lane holds text titles and animated SVG titles in the same packed rows.
+	const titleRows = $derived(packRows([...editor.overlays, ...editor.svgOverlays]));
+	const titleCount = $derived(editor.overlays.length + editor.svgOverlays.length);
+	/** No title, caption or animated title on the cut: the lane is a strip (`track-heights.ts`). */
+	const titlesEmpty = $derived(titleCount === 0);
 	const titleLaneH = $derived(
-		titleLaneHeightFor(
-			ui.heights.all,
-			Math.max(1, ...[...titleRows.values()].map((r) => r + 1)),
-			editor.overlays.length
-		)
+		titleLaneHeightFor(ui.heights.all, Math.max(1, ...[...titleRows.values()].map((r) => r + 1)), titleCount)
 	);
 
 	type TitleDrag = {
 		id: string;
+		/** A text title or an animated SVG title: the same gesture, written by a different edit. */
+		kind: 'text' | 'svg';
 		mode: 'move' | 'l' | 'r';
 		grabSec: number;
 		origStart: number;
@@ -2106,22 +2253,30 @@
 	let titleDrag = $state<TitleDrag | null>(null);
 	let titleLaneEl = $state<HTMLElement | null>(null);
 
+	/** The edges of every title on the lane — text and animated — but `id`'s own. */
+	function otherTitleEdges(id: string): number[] {
+		return [...editor.overlays, ...editor.svgOverlays].filter((o) => o.id !== id).flatMap((o) => [o.start, o.end]);
+	}
+
 	/** Where a title's edges snap to: 0, the playhead, beats and bars, every clip edge and the other titles'. */
 	function titleSnapPoints(id: string): number[] {
 		const pts = [0, ui.time, ...beatTimes, ...barTimes];
 		for (const t of editor.timeline.tracks)
 			for (const c of t.clips) pts.push(c.timeline_start, c.timeline_start + clipDuration(c));
-		for (const o of editor.overlays) if (o.id !== id) pts.push(o.start, o.end);
+		pts.push(...otherTitleEdges(id));
 		return pts;
 	}
 
-	function onTitlePointerDown(e: PointerEvent, o: TextOverlay, mode: 'move' | 'l' | 'r') {
+	function onTitlePointerDown(e: PointerEvent, o: TextOverlay | SvgOverlay, mode: 'move' | 'l' | 'r', kind: 'text' | 'svg' = 'text') {
 		if (e.button !== 0) return;
 		e.stopPropagation();
-		editor.selectOverlay(o.id);
+		if (kind === 'svg') editor.selectSvgOverlay(o.id);
+		else editor.selectOverlay(o.id);
+		if (holdForReview(e)) return;
 		const left = titleLaneEl?.getBoundingClientRect().left ?? 0;
 		titleDrag = {
 			id: o.id,
+			kind,
 			mode,
 			grabSec: laneTime(e.clientX, left) - o.start,
 			origStart: o.start,
@@ -2162,10 +2317,14 @@
 		titleDrag = null;
 		if (!d) return;
 		if (!d.moved) return; // a plain click selected the title at the press and leaves the playhead alone
-		void editor.retimeOverlay(d.id, d.start, d.end).catch(err);
+		// An edit that removed it under the drag (an undo, an agent) leaves nothing to write.
+		if (d.kind === 'svg' && !editor.svgOverlays.some((o) => o.id === d.id)) return;
+		// One edit either way: an animated title's update re-times a preset's artwork in the same revision.
+		if (d.kind === 'svg') void editor.updateSvgOverlay(d.id, { start: d.start, end: d.end }).catch(err);
+		else void editor.retimeOverlay(d.id, d.start, d.end).catch(err);
 	}
 
-	const addTitleHere = () => void editor.addTitle('Title', ui.time, ui.time + 3).catch(err);
+	const addTitleHere = () => void editor.addTitle('Title', ui.time, ui.time + settings.editing.title_seconds).catch(err);
 
 	function onTitleContextMenu(e: MouseEvent, o: TextOverlay) {
 		e.stopPropagation();
@@ -2173,13 +2332,44 @@
 		contextMenu.show(e, [
 			{ label: 'Go to start', icon: 'skip-back', action: () => ui.seek(o.start, { snap: 'up', end: o.end }) },
 			{ type: 'separator' },
-			{
-				label: o.generated ? 'Remove caption' : 'Remove title',
-				icon: 'trash',
-				danger: true,
-				shortcut: settings.shortcut('edit.delete'),
-				action: () => void editor.removeOverlay(o.id).catch(err)
-			}
+			...held([
+				{
+					label: o.generated ? 'Remove caption' : 'Remove title',
+					icon: 'trash',
+					danger: true,
+					shortcut: settings.shortcut('edit.delete'),
+					action: () => void editor.removeOverlay(o.id).catch(err)
+				}
+			])
+		]);
+	}
+
+	function onSvgContextMenu(e: MouseEvent, o: SvgOverlay) {
+		e.stopPropagation();
+		editor.selectSvgOverlay(o.id);
+		contextMenu.show(e, [
+			{ label: 'Go to start', icon: 'skip-back', action: () => ui.seek(o.start, { snap: 'up', end: o.end }) },
+			...held(
+				o.preset
+					? []
+					: [
+							{
+								label: 'Edit SVG source',
+								icon: 'code-xml',
+								action: () => (ui.svgSourceFocus = o.id)
+							}
+						]
+			),
+			{ type: 'separator' },
+			...held([
+				{
+					label: 'Remove animated title',
+					icon: 'trash',
+					danger: true,
+					shortcut: settings.shortcut('edit.delete'),
+					action: () => void editor.removeSvgOverlay(o.id).catch(err)
+				}
+			])
 		]);
 	}
 
@@ -2189,16 +2379,27 @@
 		// controls in Titles carry the same import with every clip to choose from.
 		const { entries, more } = importMenuEntries(importableAssets(editor.timeline, editor.assets));
 		contextMenu.show(e, [
-			{ label: 'Add title at playhead', icon: 'captions', action: addTitleHere },
-			{ type: 'separator' },
-			...entries.map(
-				(m): MenuItem => ({
-					label: m.label,
-					icon: 'file-text',
-					disabled: editor.busy,
-					action: () => void importCaptionFile(m.choice)
-				})
-			),
+			...held([
+				{ label: 'Add title at playhead', icon: 'captions', action: addTitleHere },
+				...SVG_PRESETS.map(
+					(p): MenuItem => ({
+						label: `Add animated ${p.label.toLowerCase()}`,
+						icon: 'orbit',
+						disabled: editor.busy,
+						action: () => void addAnimatedTitle(p.kind)
+					})
+				),
+				{ label: 'Add custom SVG title…', icon: 'code-xml', disabled: editor.busy, action: () => void addCustomSvgTitle() },
+				{ type: 'separator' },
+				...entries.map(
+					(m): MenuItem => ({
+						label: m.label,
+						icon: 'file-text',
+						disabled: editor.busy,
+						action: () => void importCaptionFile(m.choice)
+					})
+				)
+			]),
 			...(more > 0
 				? [{ type: 'info', label: `${more} more clip${more === 1 ? '' : 's'}`, value: 'in Titles' } satisfies MenuItem]
 				: [])
@@ -2243,12 +2444,15 @@
 	/** Marker being dragged along the ruler, and the id being renamed inline. */
 	let markerDrag: { id: string; time: number } | null = $state(null);
 	let renaming = $state<string | null>(null);
+	/** The marker whose name, kind, length and comment are open in the dialog. */
+	let editingMarker = $state<string | null>(null);
 
-	const addMarkerHere = () => void editor.addMarkerAtPlayhead(ui.time).catch(err);
+	const addMarkerHere = () => void addMarker();
 
 	function onMarkerPointerDown(e: PointerEvent, m: Marker) {
 		if (e.button !== 0 || renaming === m.id) return;
 		e.stopPropagation();
+		if (holdForReview(e)) return;
 		markerDrag = { id: m.id, time: m.time };
 		capturePointer(e);
 	}
@@ -2266,14 +2470,21 @@
 		e.stopPropagation();
 		contextMenu.show(e, [
 			{ label: 'Go to marker', icon: 'bookmark', action: () => ui.seek(m.time) },
-			{ label: 'Rename', action: () => (renaming = m.id) },
-			{ type: 'separator' },
-			{
-				label: 'Remove marker',
-				icon: 'trash',
-				danger: true,
-				action: () => void editor.removeMarker(m.id).catch(err)
-			}
+			...held([
+				{ label: 'Rename', action: () => (renaming = m.id) },
+				{ label: 'Edit marker…', icon: 'file-text', action: () => (editingMarker = m.id) },
+				{
+					label: m.kind === 'chapter' ? 'Make it a comment' : 'Make it a chapter',
+					action: () => void editor.updateMarker(m.id, { kind: m.kind === 'chapter' ? 'comment' : 'chapter' }).catch(err)
+				},
+				{ type: 'separator' },
+				{
+					label: 'Remove marker',
+					icon: 'trash',
+					danger: true,
+					action: () => void editor.removeMarker(m.id).catch(err)
+				}
+			])
 		]);
 	}
 
@@ -2281,27 +2492,25 @@
 	// and lane menus stopPropagation, so only the bare background reaches this.
 	function onTimelineContextMenu(e: MouseEvent) {
 		contextMenu.show(e, [
-			{ label: 'Add video track', icon: 'video', action: () => onAddTrack('video') },
-			{ label: 'Add audio track', icon: 'audio-waveform', action: () => onAddTrack('audio') },
-			{ type: 'separator' },
-			{
-				label: editor.clipboard.length > 1 ? `Paste ${editor.clipboard.length} clips` : 'Paste',
-				icon: 'copy',
-				shortcut: settings.shortcut('edit.paste'),
-				disabled: editor.clipboard.length === 0,
-				action: () =>
-					void editor
-						.paste(ui.time)
-						.then((k) => k && toast(k === 1 ? 'Clip pasted' : `${k} clips pasted`))
-						.catch(err)
-			},
-			{ type: 'separator' },
-			{
-				label: 'Add marker at playhead',
-				icon: 'bookmark',
-				shortcut: settings.shortcut('marker.add'),
-				action: addMarkerHere
-			},
+			...held([
+				{ label: 'Add video track', icon: 'video', action: () => onAddTrack('video') },
+				{ label: 'Add audio track', icon: 'audio-waveform', action: () => onAddTrack('audio') },
+				{ type: 'separator' },
+				{
+					label: editor.clipboard.length > 1 ? `Paste ${editor.clipboard.length} clips` : 'Paste',
+					icon: 'copy',
+					shortcut: settings.shortcut('edit.paste'),
+					disabled: editor.clipboard.length === 0,
+					action: () => void pasteClips()
+				},
+				{ type: 'separator' },
+				{
+					label: 'Add marker at playhead',
+					icon: 'bookmark',
+					shortcut: settings.shortcut('marker.add'),
+					action: addMarkerHere
+				}
+			]),
 			{ type: 'separator' },
 			{
 				label: ui.snap ? 'Disable snapping' : 'Enable snapping',
@@ -2390,6 +2599,26 @@
 	style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden;position:relative"
 >
 
+	<!-- A proposal waiting, while the cut on screen is still the user's: one line to say so and the three
+	     answers, so the review is not only in the Agent panel (which may be a tab away, or closed). -->
+	{#if editor.staged && !editor.previewingStaged}
+		<div
+			data-proposal-strip
+			role="status"
+			style="flex:none;display:flex;align-items:center;gap:8px;min-height:30px;padding:3px 12px;background:var(--agent-surface);border-bottom:var(--line-width) solid var(--agent-border);color:var(--agent-300);font-size:12px"
+		>
+			<Icon n="git-pull-request-arrow" s={13} color="var(--agent-300)" />
+			<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+				>{proposalLine(editor.staged.diff.entries.length)}{editor.staged.note ? ` — ${editor.staged.note}` : ''}</span
+			>
+			<span style="color:var(--text-muted);white-space:nowrap">· outlined on the cut</span>
+			<div style="flex:1"></div>
+			<Btn size="sm" icon="eye" iconSize={12} disabled={reviewBusy} onclick={() => void editor.previewStaged()}>Preview</Btn>
+			<Btn variant="primary" size="sm" disabled={reviewBusy} onclick={() => void reviewAct(applyProposal)}>Apply</Btn>
+			<Btn size="sm" disabled={reviewBusy} onclick={() => void reviewAct(discardProposal)}>Discard</Btn>
+		</div>
+	{/if}
+
 	<!-- Timeline toolbar. What used to be the app's own toolbar row lives here, where
 	     it acts: the tools, ripple, snapping, undo / redo and the delivery frame beside
 	     the view controls. It wraps onto a second row rather than clipping, so nothing
@@ -2412,8 +2641,22 @@
 				)}
 			{/each}
 			<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
-			{@render toolBtn(settings.tip('Undo', 'edit.undo'), 'Undo', 'undo', null, () => void editor.undo(), !editor.canUndo)}
-			{@render toolBtn(settings.tip('Redo', 'edit.redo'), 'Redo', 'redo', null, () => void editor.redo(), !editor.canRedo)}
+			{@render toolBtn(
+				editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : settings.tip('Undo', 'edit.undo'),
+				'Undo',
+				'undo',
+				null,
+				() => void editor.undo(),
+				!editor.canUndo || editor.previewingStaged
+			)}
+			{@render toolBtn(
+				editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : settings.tip('Redo', 'edit.redo'),
+				'Redo',
+				'redo',
+				null,
+				() => void editor.redo(),
+				!editor.canRedo || editor.previewingStaged
+			)}
 		</div>
 		{#if editor.busy}<Badge tone="agent" dot>working…</Badge>{/if}
 		{#if editor.selectedClips.length > 1}
@@ -2447,15 +2690,17 @@
 					>Fade</span
 				>
 				<ToolbarToggle
-					title="Toggle a {FADE_DEFAULT}s fade-in on the selected clip"
+					title={editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : `Toggle a ${FADE_DEFAULT}s fade-in on the selected clip`}
 					label="Fade in"
 					pressed={sc.fade_in > 0}
+					disabled={editor.previewingStaged}
 					onclick={toggleFadeIn}>in</ToolbarToggle
 				>
 				<ToolbarToggle
-					title="Toggle a {FADE_DEFAULT}s fade-out on the selected clip"
+					title={editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : `Toggle a ${FADE_DEFAULT}s fade-out on the selected clip`}
 					label="Fade out"
 					pressed={sc.fade_out > 0}
+					disabled={editor.previewingStaged}
 					onclick={toggleFadeOut}>out</ToolbarToggle
 				>
 			</span>
@@ -2550,16 +2795,27 @@
 			</span>
 			<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
 			<span style="display:inline-flex;align-items:center;gap:6px">
-				<ToolbarToggle title="Add a video track" onclick={() => onAddTrack('video')}>+ V</ToolbarToggle>
-				<ToolbarToggle title="Add an audio track" onclick={() => onAddTrack('audio')}>+ A</ToolbarToggle>
+				<ToolbarToggle
+					title={editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : 'Add a video track'}
+					disabled={editor.previewingStaged}
+					onclick={() => onAddTrack('video')}>+ V</ToolbarToggle
+				>
+				<ToolbarToggle
+					title={editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : 'Add an audio track'}
+					disabled={editor.previewingStaged}
+					onclick={() => onAddTrack('audio')}>+ A</ToolbarToggle
+				>
 				<!-- The frame the cut is made for: the preview is this shape, and so is the export. -->
 				<ToolbarToggle
-					title={delivery.format
+					title={editor.previewingStaged
+						? PREVIEW_READ_ONLY_REASON
+						: delivery.format
 						? `Delivering ${delivery.format.width}\u00d7${delivery.format.height} — ${fitLabel(delivery.format.fit)}. Click to change.`
 						: 'The frame follows the footage. Click to cut for a delivery shape.'}
 					icon="crop"
 					iconSize={12}
 					on={!!delivery.format}
+					disabled={editor.previewingStaged}
 					aria-haspopup="menu"
 					onclick={pickDelivery}>{delivery.label}</ToolbarToggle
 				>
@@ -2626,17 +2882,19 @@
 					: 'var(--border-subtle)'};position:sticky;top:0;z-index:50;background:var(--surface-app);display:flex;align-items:center;gap:6px;padding:0 8px;font-family:var(--font-mono);font-variant-numeric:tabular-nums;white-space:nowrap"
 			>
 				<!-- Where the playhead is, and how long the cut is: the timeline's own clock, so a scrub or a
-				     drag here does not need the Preview on screen to say what time it is. -->
+				     drag here does not need the Preview on screen to say what time it is. The playhead's half is
+				     where a timecode is typed (`TimecodeField`). -->
 				<span
 					data-timeline-time
 					role="timer"
 					aria-label="Playhead {tc(ui.time)} of {tc(editor.duration)}"
-					use:tip={`Playhead timecode, then the length of the cut · ${editor.fps.toFixed(3)} fps · non-drop`}
 					style="display:inline-flex;align-items:baseline;gap:6px"
 				>
-					<span style="font-size:12px;font-weight:600;color:var(--kerf-300)">{tc(ui.time)}</span>
+					<TimecodeField entry="timeline" describedby="timeline-cut-length" />
 					<span aria-hidden="true" style="font-size:11px;color:var(--text-muted)">/</span>
-					<span style="font-size:11px;color:var(--text-muted)">{tc(editor.duration)}</span>
+					<span id="timeline-cut-length" use:tip={'The length of the cut'} style="font-size:11px;color:var(--text-muted)"
+						>{tc(editor.duration)}</span
+					>
 				</span>
 				<span style="flex:1"></span>
 				{#if editor.rippleMode}
@@ -2668,7 +2926,7 @@
 			>
 				<span style="font-family:var(--font-mono);font-size:12px;font-weight:600;color:var(--text-secondary);flex:none">T</span>
 				<span style="font-size:11px;color:var(--text-muted);flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-					>Titles · {editor.overlays.length}</span
+					>Titles · {titleCount}</span
 				>
 				<button
 					use:tip={'Add a title at the playhead'}
@@ -2780,7 +3038,7 @@
 								max="1"
 								step="0.005"
 								value={gainToFader(t.volume ?? 1)}
-								disabled={editor.busy}
+								disabled={editor.locked}
 								aria-label="{t.name} level"
 								use:tip={`Level ${gainLabel(t.volume ?? 1)} — double-click for unity`}
 								onchange={(e) => void editor.setTrackVolume(t.id, faderToGain(+e.currentTarget.value)).catch(err)}
@@ -2793,7 +3051,7 @@
 								max="1"
 								step="0.05"
 								value={t.pan ?? 0}
-								disabled={editor.busy}
+								disabled={editor.locked}
 								aria-label="{t.name} pan"
 								use:tip={`Pan ${panLabel(t.pan ?? 0)} — double-click to centre`}
 								onchange={(e) => void editor.setTrackPan(t.id, +e.currentTarget.value).catch(err)}
@@ -2841,6 +3099,7 @@
 						style="position:absolute;left:{cutEndX}px;right:0;top:0;bottom:0;pointer-events:none;box-sizing:border-box;border-left:var(--line-width) solid var(--border-strong);background:color-mix(in srgb,var(--surface-void) 55%,transparent)"
 					></span>
 				{/if}
+				<RenderBar {pxPerSec} from={viewLo / pxPerSec} to={viewHi / pxPerSec} {tc} />
 				{#each minorTicks as m (m.k)}
 					<span
 						data-tick={m.mid ? 'mid' : 'minor'}
@@ -2861,7 +3120,7 @@
 					<span
 						data-tick-label
 						style="position:absolute;left:{t.t * pxPerSec + 4}px;top:5px;font-family:var(--font-mono);font-size:10px;line-height:12px;color:var(--text-muted);pointer-events:none;white-space:nowrap"
-						>{tickLabel(t.k, grid, editor.fps)}</span
+						>{tickLabel(t.k, grid, editor.fps, timeDisplay.mode)}</span
 					>
 				{/each}
 				{#each sceneXs as x (x)}
@@ -2886,7 +3145,7 @@
 					{@const accent = m.color || 'var(--agent-400)'}
 					<span
 						role="presentation"
-						use:tip={`${m.name} — ${tc(mt)}`}
+						use:tip={markerTip(m, tc(mt))}
 						onpointerdown={(e) => onMarkerPointerDown(e, m)}
 						ondblclick={() => (renaming = m.id)}
 						oncontextmenu={(e) => onMarkerContextMenu(e, m)}
@@ -2894,6 +3153,12 @@
 							pxPerSec}px;top:0;bottom:0;width:8px;z-index:29;cursor:ew-resize;touch-action:none;display:flex;align-items:center"
 					>
 						<span style="position:absolute;left:-1px;top:0;bottom:0;width:2px;background:{accent}"></span>
+						{#if m.duration}
+							<span
+								style="position:absolute;left:0;bottom:0;height:3px;width:{m.duration *
+									pxPerSec}px;background:{accent};opacity:.6;pointer-events:none"
+							></span>
+						{/if}
 						{#if renaming === m.id}
 							<!-- svelte-ignore a11y_autofocus -->
 							<input
@@ -2966,14 +3231,6 @@
 				{/each}
 			{/if}
 
-			{#if !hasClips}
-				<div
-					style="position:absolute;left:0;right:0;top:var(--ruler-h);bottom:0;display:grid;place-items:center;color:var(--text-muted);font-size:12px"
-				>
-					Drop media here to start cutting.
-				</div>
-			{/if}
-
 			<!-- titles lane: every title, lower-third and caption, in its own row of
 			     items rather than a section of whichever clip is selected -->
 			<div
@@ -2993,6 +3250,7 @@
 					<button
 						class="ktitle"
 						data-diff={diff?.titles.get(o.id)}
+						data-touched={touched?.titles.has(o.id) ? '' : undefined}
 						onpointerdown={(e) => onTitlePointerDown(e, o, 'move')}
 						oncontextmenu={(e) => onTitleContextMenu(e, o)}
 						onclick={(e) => e.stopPropagation()}
@@ -3012,6 +3270,50 @@
 							<span
 								role="presentation"
 								onpointerdown={(e) => onTitlePointerDown(e, o, 'r')}
+								style="position:absolute;right:0;top:0;bottom:0;width:6px;cursor:ew-resize;z-index:3;touch-action:none"
+							></span>
+						{/if}
+					</button>
+					{#if live}
+						<div
+							style="position:absolute;left:{live.start * pxPerSec}px;top:{titleMetrics.pad + row * titleMetrics.row}px;height:{titleMetrics.row - 3}px;width:{Math.max(
+								6,
+								(live.end - live.start) * pxPerSec
+							)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:color-mix(in srgb,var(--drag-ghost) 16%,transparent);pointer-events:none;z-index:25"
+						></div>
+					{/if}
+				{/each}
+				{#each editor.svgOverlays as o (o.id)}
+					{@const live = titleDrag?.moved && titleDrag.id === o.id ? titleDrag : null}
+					{@const row = titleRows.get(o.id) ?? 0}
+					{@const width = Math.max(6, (o.end - o.start) * pxPerSec)}
+					{@const selected = editor.selectedSvgOverlayId === o.id}
+					<!-- An animated SVG title: the same block as a title, in the same rows, behind a motion
+					     icon and its own fill and edge so it reads as artwork, not text. -->
+					<button
+						class="ktitle"
+						data-kind="svg"
+						data-diff={diff?.titles.get(o.id)}
+						onpointerdown={(e) => onTitlePointerDown(e, o, 'move', 'svg')}
+						oncontextmenu={(e) => onSvgContextMenu(e, o)}
+						onclick={(e) => e.stopPropagation()}
+						use:tip={svgTooltip(o)}
+						style="position:absolute;left:{o.start * pxPerSec}px;top:{titleMetrics.pad + row * titleMetrics.row}px;height:{titleMetrics.row - 3}px;width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;gap:4px;padding:0 7px;touch-action:none;opacity:{live ? 0.4 : 1};cursor:{titleDrag ? 'grabbing' : 'grab'};text-align:left;background:{SVG_TITLE_FILL};border:{selected ? '1.5px solid var(--kerf-400)' : '1px solid var(--track-video-edge)'};box-shadow:{selected ? '0 0 0 1px var(--kerf-500)' : 'none'}"
+					>
+						{#if width > 34}<span style="position:relative;display:inline-flex;flex:none;color:var(--text-on-video)"><Icon n="orbit" s={titleMetrics.font + 1} /></span>{/if}
+						<span
+							style="position:relative;font-size:{titleMetrics.font}px;font-weight:600;color:var(--text-on-video);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+							>{svgDisplayName(o)}</span
+						>
+						{#if width > 24}
+							<span
+								role="presentation"
+								onpointerdown={(e) => onTitlePointerDown(e, o, 'l', 'svg')}
+								style="position:absolute;left:0;top:0;bottom:0;width:6px;cursor:ew-resize;z-index:3;touch-action:none"
+							></span>
+							<span
+								role="presentation"
+								onpointerdown={(e) => onTitlePointerDown(e, o, 'r', 'svg')}
 								style="position:absolute;right:0;top:0;bottom:0;width:6px;cursor:ew-resize;z-index:3;touch-action:none"
 							></span>
 						{/if}
@@ -3056,6 +3358,15 @@
 						? 'inset 0 2px 0 var(--border-strong)'
 						: 'none'}"
 				>
+					{#if !hasClips && t.id === drawn[0]?.id}
+						<!-- In the first lane, where the clip will land — it used to be centred over the whole stack and sat on the line between
+						     V1 and A1. Sticky, so it stays on screen when the timeline is scrolled. -->
+						<span
+							data-drop-hint
+							style="position:sticky;left:calc(var(--track-header-w) + 12px);display:flex;align-items:center;width:max-content;max-width:calc(100% - var(--track-header-w) - 24px);height:100%;color:var(--text-muted);font-size:12px;pointer-events:none;white-space:nowrap"
+							>Drop media here to start cutting.</span
+						>
+					{/if}
 					{#if drag?.moved && drag.trackId === t.id}
 						<!-- Where the dragged clip would land: the lane under the pointer takes a tint. -->
 						<span
@@ -3117,6 +3428,7 @@
 							data-clip-id={c.id}
 							data-lit={lit ? '' : undefined}
 							data-diff={diff?.clips.get(c.id)}
+							data-touched={touched?.clips.has(c.id) ? '' : undefined}
 							use:tip={showsLabel(width) ? undefined : name}
 							data-linked={badge && badge.partners.length > 0 ? '' : undefined}
 							data-sound-detached={c.source_audio === false ? '' : undefined}
@@ -3380,7 +3692,7 @@
 
 			<!-- a roll, slip or slide: how far, and what it leaves — or what is stopping it -->
 			{#if tg?.moved && tgPreview}
-				{@render readoutChip(readoutFor(tgPreview, fps), tg.nx, tg.ny)}
+				{@render readoutChip(readoutFor(tgPreview, fps, timeDisplay.mode), tg.nx, tg.ny)}
 			{/if}
 
 			<!-- an edge trim, a clip move or the razor: the number the gesture is making, and why it is red or held -->
@@ -3398,7 +3710,8 @@
 						track: editor.timeline.tracks.find((t) => t.id === nudge!.trackId)?.name ?? '',
 						fps,
 						count: nudge.members.size,
-						refused: dragPlan.ok ? null : dragPlan.reason || 'that move would not fit'
+						refused: dragPlan.ok ? null : dragPlan.reason || 'that move would not fit',
+						mode: timeDisplay.mode
 					}),
 					nudgeAt * pxPerSec - 14,
 					(lane?.offsetTop ?? 0) + (lane?.offsetHeight ?? 0) - 18
@@ -3427,6 +3740,10 @@
 		</div>
 	</div>
 </div>
+
+{#if editingMarker}
+	<MarkerDialog markerId={editingMarker} onClose={() => (editingMarker = null)} />
+{/if}
 
 <style>
 	/* A locked lane is hatched: the track header says so too, but a lane that looks like any other is
@@ -3469,6 +3786,19 @@
 	.kclip[data-diff='shifted']::after,
 	.ktitle[data-diff='shifted']::after {
 		border: 2px dashed var(--diff-shift);
+	}
+	/* Before the proposal is previewed: the clips and titles it would touch carry a faint dotted frame, so the
+	   cut shows where the agent has been without being replaced by it. */
+	.kclip[data-touched]::after,
+	.ktitle[data-touched]::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		z-index: 1;
+		box-sizing: border-box;
+		border: 2px dotted color-mix(in srgb, var(--agent-400) 70%, transparent);
+		border-radius: inherit;
+		pointer-events: none;
 	}
 
 	.kname {

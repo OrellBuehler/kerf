@@ -6,7 +6,6 @@
 	import type { MenuItem } from '#lib/context-menu.svelte';
 	import { contextRows } from '#lib/menu-items';
 	import { menuKey, rowFor, startRow } from '#lib/menu-nav';
-	import { tip } from '#lib/tip';
 
 	/** The window this instance draws in. One is mounted in the editor window and one in
 	 *  each detached window (`popout.svelte.ts`): a menu belongs to the window it was
@@ -170,29 +169,30 @@
 				<div style="padding:5px 8px 4px;min-width:0;max-width:300px">
 					<div
 						style="font-size:12px;font-weight:600;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-						use:tip={item.label}
 					>
 						{item.label}
 					</div>
 					{#if item.sub}
 						<div
 							style="font-size:var(--text-xs);color:var(--text-muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-							use:tip={item.sub}
 						>
 							{item.sub}
 						</div>
 					{/if}
 				</div>
 			{:else if item.type === 'info'}
-				<div
-					style="display:flex;align-items:baseline;gap:12px;padding:2px 8px;font-size:11px;line-height:16px;max-width:300px"
-					use:tip={item.title ?? item.value}
-				>
-					<span style="flex:none;color:var(--text-muted)">{item.label}</span>
-					<span
-						style="flex:1;min-width:0;text-align:right;font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-						>{item.value}</span
-					>
+				<div style="padding:2px 8px;font-size:11px;line-height:16px;max-width:300px">
+					<div style="display:flex;align-items:baseline;gap:12px">
+						<span style="flex:none;color:var(--text-muted)">{item.label}</span>
+						<span
+							style="flex:1;min-width:0;text-align:right;font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+							>{item.value}</span
+						>
+					</div>
+					{#if item.title && item.title !== item.value}
+						<!-- What a tooltip used to say over the next row's label: said under its own row instead. -->
+						<div style="font-size:var(--text-xs);line-height:1.3;color:var(--text-muted);text-align:right">{item.title}</div>
+					{/if}
 				</div>
 			{:else}
 				<button

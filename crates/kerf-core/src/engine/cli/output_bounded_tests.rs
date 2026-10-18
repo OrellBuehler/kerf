@@ -26,7 +26,7 @@ fn a_process_that_outlasts_the_limit_is_killed_and_reported_as_timed_out() {
     // `exec` makes the shell's pid the sleep's.
     let mut cmd = sh(&format!("echo $$ > '{}'; exec sleep 30", pidfile.display()));
     let started = Instant::now();
-    let err = output_bounded(&mut cmd, Duration::from_secs(1)).expect_err("sleep 30 is past 1 s");
+    let err = output_bounded(&mut cmd, Duration::from_secs(1), 0).expect_err("sleep 30 is past 1 s");
     assert_eq!(err.kind(), ErrorKind::TimedOut);
     assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
     // The shell writes its pid first thing; under load that can be later than the deadline of a
@@ -60,7 +60,7 @@ fn more_than_a_pipes_worth_on_both_outputs_does_not_block_the_child() {
         "i=0; while [ $i -lt 40 ]; do head -c 10000 /dev/zero; head -c 10000 /dev/zero >&2; i=$((i+1)); done",
     ] {
         let started = Instant::now();
-        let out = output_bounded(&mut sh(script), Duration::from_secs(30)).expect(script);
+        let out = output_bounded(&mut sh(script), Duration::from_secs(30), 0).expect(script);
         assert!(out.status.success(), "{script}");
         assert!(
             out.stdout.len() >= 300_000 - 20_000 && out.stderr.len() >= 300_000 - 20_000,
@@ -76,7 +76,7 @@ fn more_than_a_pipes_worth_on_both_outputs_does_not_block_the_child() {
 
 #[test]
 fn a_process_that_ends_in_time_gives_its_status_and_both_outputs() {
-    let out = output_bounded(&mut sh("echo out; echo err >&2; exit 3"), Duration::from_secs(30)).unwrap();
+    let out = output_bounded(&mut sh("echo out; echo err >&2; exit 3"), Duration::from_secs(30), 0).unwrap();
     assert_eq!(out.status.code(), Some(3));
     assert_eq!(out.stdout, b"out\n");
     assert_eq!(out.stderr, b"err\n");
@@ -84,6 +84,46 @@ fn a_process_that_ends_in_time_gives_its_status_and_both_outputs() {
 
 #[test]
 fn a_program_that_is_not_there_is_the_spawn_error() {
-    let err = output_bounded(&mut Command::new("kerf-no-such-program"), Duration::from_secs(1)).unwrap_err();
+    let err = output_bounded(&mut Command::new("kerf-no-such-program"), Duration::from_secs(1), 0).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::NotFound);
+}
+
+#[test]
+fn a_run_a_caller_cancels_is_killed_at_once_and_reported_as_no_answer() {
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let started = Instant::now();
+    let answer = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(200));
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        output_bounded_cancellable(
+            sh("exec sleep 30"),
+            Duration::from_secs(60),
+            Some(&|| stop.load(std::sync::atomic::Ordering::SeqCst)),
+        )
+    });
+    assert!(answer.expect("a stop is not an error").is_none());
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+}
+
+#[test]
+fn a_cancellable_run_keeps_the_deadline_and_the_outputs_of_the_plain_one() {
+    let never = || false;
+    let err = output_bounded_cancellable(sh("exec sleep 30"), Duration::from_millis(300), Some(&never)).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::TimedOut);
+
+    let out = output_bounded_cancellable(sh("echo out; echo err >&2; exit 3"), Duration::from_secs(30), Some(&never))
+        .unwrap()
+        .expect("it finished");
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!((out.stdout, out.stderr), (b"out\n".to_vec(), b"err\n".to_vec()));
+
+    // Without a cancel it is the plain bounded run.
+    let out = output_bounded_cancellable(sh("echo out"), Duration::from_secs(30), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(out.stdout, b"out\n");
+    let err = output_bounded_cancellable(Command::new("kerf-no-such-program"), Duration::from_secs(1), Some(&never)).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::NotFound);
 }

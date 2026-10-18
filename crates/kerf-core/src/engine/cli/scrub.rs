@@ -330,10 +330,22 @@ impl<'a> Snapshot<'a> {
     ///   cycle. (Rates a whole number of times the cut's, 60 in 30 and 2x, and 29.97 in 30, agree.);
     /// * the last frame of a title: the window's `drawtext` shows it through `end`, the still
     ///   stops before it;
+    /// * an animated title on screen (`start` through `end`): its pictures are laid by the one-shot
+    ///   still only, and a window's graph is cut without any (`window_args`);
     /// * 360 reframing and HDR originals, which the stream graph draws in another order.
     pub(super) fn plain(&self, k: u64) -> bool {
         let t = self.grid.time_of(k);
         if self.rendered.overlays.iter().any(|o| (o.end - t).abs() < 1e-6) {
+            return false;
+        }
+        // An animated title is pictures the one-shot still lays over the frame; the window's graph
+        // has none (see `window_args`), and the export draws one through its last frame.
+        if self
+            .rendered
+            .svg_overlays
+            .iter()
+            .any(|o| t >= o.start - 1e-6 && t <= o.end + 1e-6)
+        {
             return false;
         }
         still_layers(&self.rendered, &self.assets, self.grid.fps, t)
@@ -418,7 +430,11 @@ impl<'a> Snapshot<'a> {
             return Err(Error::Engine("nothing to draw past the end of the cut".to_string()));
         }
         let w1 = self.grid.time_of(b.saturating_add(2)).min(end);
-        let sliced = self.rendered.slice(w0, w1);
+        let mut sliced = self.rendered.slice(w0, w1);
+        // No frame of a window is under an animated title (`plain`), and its pictures are only on
+        // disk for the frames that are: leave them out of the graph rather than name a file that
+        // is not there.
+        sliced.svg_overlays.clear();
         if !sliced
             .tracks
             .iter()
@@ -647,6 +663,7 @@ impl ScrubFrames {
             snap.width,
             None,
             &out,
+            &|| false,
         )?;
         let mut st = self.shared.lock();
         st.stats.singles += 1;
@@ -1352,6 +1369,46 @@ mod tests {
         assert!(snap.plain(59), "the one before the last too");
         assert!(!snap.plain(60), "at its end");
         assert!(snap.plain(61));
+    }
+
+    #[test]
+    fn an_animated_title_is_drawn_by_the_one_shot_still_and_never_by_a_window() {
+        let a = video(30.0);
+        let assets = vec![a.clone()];
+        let mut timeline = one_clip(&a, |_| {});
+        timeline.svg_overlays.push(crate::model::SvgOverlay {
+            id: uuid::Uuid::new_v4(),
+            name: String::new(),
+            svg: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"/>".to_string(),
+            start: 3.0,
+            end: 4.0,
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            opacity: 1.0,
+            offset: 0.0,
+            preset: None,
+            template: None,
+        });
+        let snap = snap_of(&timeline, &assets);
+        assert!(snap.plain(88) && snap.plain(89), "just before it");
+        assert!(
+            (90..=120).all(|k| !snap.plain(k)),
+            "from its first frame to its last, inclusive"
+        );
+        assert!(snap.plain(121));
+        // A window that runs up to it stops short, and one drawn beside it has no title in its graph:
+        // its pictures are not on disk (only the one-shot's are), so it must not name them.
+        assert_eq!(
+            snap.window_range(70, false, &ScrubConfig::default()).map(|(_, b)| b),
+            Some(90)
+        );
+        let args = snap.window_args(60, 84, None).unwrap().join(" ");
+        assert!(!args.contains("-framerate") && !args.contains("svg"), "{args}");
+        // The one-shot names the picture it draws.
+        assert!(snap.still_args(100).unwrap().iter().any(|a| a.contains("still-")));
+        assert!(!snap.still_args(60).unwrap().iter().any(|a| a.contains("still-")));
     }
 
     #[test]

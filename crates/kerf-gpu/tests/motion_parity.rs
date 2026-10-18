@@ -250,6 +250,7 @@ fn timeline(tracks: Vec<Vec<Clip>>, format: Option<Delivery>) -> Timeline {
             })
             .collect(),
         overlays: Vec::new(),
+        svg_overlays: Vec::new(),
         markers: Vec::new(),
         format,
         master: Default::default(),
@@ -375,6 +376,10 @@ const SCALED: Limits = Limits { y: 1, uv: 1 };
 /// A translucent layer: the RGB round trip `colorchannelmixer` makes it take (`roundtrip.rs`: luma
 /// exact, chroma within one level of swscale's x86 vertical scaler) and a blend on top.
 const TRANSLUCENT: Limits = Limits { y: 0, uv: 1 };
+
+/// Two levels: a translucent layer the compositor also scales (the 2:1 shrink of an HD picture into
+/// the canvas): the scaler's one level and the round trip's.
+const HD_TRANSLUCENT: Limits = Limits { y: 2, uv: 2 };
 
 /// Two levels: a rotated layer, inside its edge. `rotate` is a fixed-point bilinear sample and the
 /// shader a float one (the scaled picture before it is one level off on its own), and the same
@@ -2869,4 +2874,144 @@ fn what_the_compositor_does_not_draw_of_an_effect_or_a_mask_is_refused() {
         upto(1.0, 30.0),
         "letterboxed",
     );
+}
+
+// ---- the BT.709 label ----------------------------------------------------------------------
+
+/// A 1280x720 gradient, untagged (HD that every player shows as BT.709) and the same picture tagged
+/// BT.709, two seconds each.
+struct HdPair {
+    untagged: Asset,
+    phone: Asset,
+}
+
+fn hd_pair() -> &'static HdPair {
+    static M: OnceLock<HdPair> = OnceLock::new();
+    M.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-hd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let encode = |name: &str, label: &str| -> Asset {
+            let p = dir.join(name);
+            ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                &format!(
+                    "gradients=size=1280x720:rate=30:duration=2:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:speed=0.3,\
+                     format=gbrp,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,{label}"
+                ),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-qp",
+                "0",
+                "-g",
+                "10",
+                "-pix_fmt",
+                "yuv420p",
+                p.to_str().unwrap(),
+            ]);
+            probed(&p)
+        };
+        HdPair {
+            untagged: encode("hd-untagged.mp4", "setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown"),
+            phone: encode("hd-709.mp4", "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709"),
+        }
+    })
+}
+
+/// The export labels untagged HD for **every frame of its graph**, not for the frames a matrix-naming
+/// clip is on screen in: a translucent untagged HD clip that is alone in its first second, and a
+/// BT.709 clip alone in its second, are drawn as the export draws them, and a cut without the
+/// BT.709 clip draws the same HD frames as BT.601 (the compositor takes the layer out of YUV with the
+/// matrix the plan says, which differs: the same frames are not the same picture).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn untagged_hd_is_labelled_for_the_whole_graph_that_holds_a_matrix() {
+    let h = hd_pair();
+    let assets = [h.untagged.clone(), h.phone.clone()];
+    let canvas = Some(Delivery::new(640, 360, Fit::Contain));
+    let glass = |h: &HdPair| {
+        let mut c = clip(&h.untagged, 0.0, 1.0, 0.0);
+        c.transform.opacity = 0.5;
+        c
+    };
+    let tl = timeline(vec![vec![glass(h)], vec![clip(&h.phone, 0.0, 1.0, 1.0)]], canvas);
+    let planner = kerf_core::Planner::new(&tl, &assets, &at_fps(30.0), kerf_core::PlanRequest::motion(policy())).unwrap();
+    let plan = planner.at_frame(10).unwrap();
+    assert_eq!(plan.layers.len(), 1);
+    assert!(
+        plan.layers[0].stream.label_bt709,
+        "the graph holds a BT.709 clip: the HD clip is labelled"
+    );
+    run(
+        "label/translucent-untagged-hd-before-a-709-clip",
+        &tl,
+        &assets,
+        30.0,
+        2.0,
+        HD_TRANSLUCENT,
+    );
+    // Over the BT.709 clip's own frames too: the translucent HD clip on a second track.
+    let mut over = glass(h);
+    over.timeline_start = 0.0;
+    over.source_out = 2.0;
+    let tl = timeline(
+        vec![
+            vec![clip(&h.phone, 0.0, 2.0, 0.0)],
+            vec![{
+                let mut c = over;
+                c.transform.scale = 0.6;
+                c
+            }],
+        ],
+        canvas,
+    );
+    run(
+        "label/translucent-untagged-hd-over-a-709-clip",
+        &tl,
+        &assets,
+        30.0,
+        2.0,
+        HD_TRANSLUCENT,
+    );
+    // The control: the same HD frames with no BT.709 clip in the graph are not labelled, and drawn.
+    let tl = timeline(vec![vec![glass(h)]], canvas);
+    let plan = kerf_core::Planner::new(&tl, &assets, &at_fps(30.0), kerf_core::PlanRequest::motion(policy()))
+        .unwrap()
+        .at_frame(10)
+        .unwrap();
+    assert!(!plan.layers[0].stream.label_bt709);
+    run("label/translucent-untagged-hd-alone", &tl, &assets, 30.0, 1.0, HD_TRANSLUCENT);
+}
+
+/// A dip to white is `yuv420p -> rgb24 -> yuv420p` around the fade, out of YUV with the clip's own matrix, so
+/// the label is read there too: an untagged HD clip that dips through white in a cut that holds a BT.709 clip
+/// is taken out of YUV as BT.709, exactly as the file tagged BT.709 is. The label is the first filter of its
+/// chain for this: behind the fit `scale` (the filter FFmpeg has convert the picture for the fade) it was
+/// BT.601 in and BT.709 out, Y 17 / UV 9 off on 9.0.2 and Y 30 / UV 16 on 6.1.1. The HD clips are drawn at
+/// their own size (a 1280x720 canvas: a layer the scaler resizes is refused its dip), and the bound is
+/// BT.709's (`WHITE_709`).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_labelled_hd_clip_dips_through_white_with_the_bt709_round_trip() {
+    let h = hd_pair();
+    let assets = [h.untagged.clone(), h.phone.clone()];
+    let first = clip(&h.phone, 0.0, 1.0, 0.0);
+    let mut dipping = clip(&h.untagged, 0.0, 1.0, 1.0);
+    dipping.transition_in = Some(Transition {
+        kind: TransitionKind::DipToWhite,
+        duration: 0.6,
+    });
+    let tl = timeline(vec![vec![first, dipping]], Some(Delivery::new(1280, 720, Fit::Contain)));
+    let plan = kerf_core::Planner::new(&tl, &assets, &at_fps(30.0), kerf_core::PlanRequest::motion(policy()))
+        .unwrap()
+        .at_frame(36)
+        .unwrap();
+    assert!(
+        plan.layers[0].stream.label_bt709,
+        "the graph holds a BT.709 clip: the dipping HD clip is labelled"
+    );
+    run("label/dip-white-labelled-hd", &tl, &assets, 30.0, 2.0, WHITE_709);
 }

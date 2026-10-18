@@ -74,15 +74,15 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use check::{AdapterKey, Check, Gate, Verdict};
-use diagnostics::{Counters, Reason, Tally};
+use diagnostics::{Counters, Reason};
 pub use mailbox::Delivery;
-use mailbox::{Mailbox, MailboxStats, Order, Worker};
+use mailbox::{Mailbox, Order, Worker};
 use pace::Pace;
 use play::PlaySession;
 pub use play::{PlayInfo, PlayKey, PlayTally};
 use prime::{Primed, Primer};
 pub use snapshot::Taken;
-use snapshot::{PlanInputs, PlanSnapshots, SnapshotStats};
+use snapshot::{PlanInputs, PlanSnapshots};
 
 /// The widest frame the GPU preview renders; a bigger panel is drawn from this, scaled up.
 pub const MAX_RENDER_WIDTH: u32 = 1920;
@@ -992,15 +992,16 @@ impl Want {
 /// How a `get_preview_frame` ended, for the command: the frame, or "a newer request took its place".
 type Answer = Delivery<Result<PreviewFrameResult, String>>;
 
-/// What `gpu_preview_diagnostics` answers: what this session's frames did and why the others went
+/// What the diagnostics answer (read by tests; no command serves them): what this session's frames did and why the others went
 /// through FFmpeg, and what the machinery around them did.
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct GpuDiagnostics {
-    pub tally: Tally,
+    pub tally: diagnostics::Tally,
     /// How often the frames' inputs were served from the held snapshot and how often taken again.
-    pub snapshots: SnapshotStats,
+    pub snapshots: snapshot::SnapshotStats,
     /// Requests posted, and how many a newer one replaced.
-    pub requests: MailboxStats,
+    pub requests: mailbox::MailboxStats,
     /// The parity self-test: running, passed (with its figures) or closed (and why); `None` before the
     /// first frame that wanted the GPU.
     pub self_test: Option<String>,
@@ -1460,6 +1461,7 @@ impl GpuPreview {
     }
 
     /// What this session's frames did and why the others went through FFmpeg.
+    #[cfg(test)]
     pub fn diagnostics(&self) -> GpuDiagnostics {
         let mail = self.mail.stats();
         let info = lock(&self.info);
@@ -2215,6 +2217,7 @@ mod tests {
                 })
                 .collect(),
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),

@@ -378,6 +378,7 @@ fn timeline(tracks: Vec<Vec<Clip>>) -> Timeline {
             })
             .collect(),
         overlays: Vec::new(),
+        svg_overlays: Vec::new(),
         markers: Vec::new(),
         format: Some(Delivery::new(CANVAS.0, CANVAS.1, Fit::Contain)),
         master: Default::default(),

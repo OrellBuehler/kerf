@@ -93,7 +93,8 @@ bunx @tauri-apps/cli@2 build --config crates/kerf-app/tauri.conf.json
 cargo run -p kerf-app        # also works; runs the frontend dev command first
 
 # MCP: run the app, then
-#   claude mcp add --transport http kerf http://127.0.0.1:7777/mcp   (KERF_MCP_ADDR overrides)
+#   claude mcp add --transport http kerf http://127.0.0.1:7777/mcp \
+#     --header "Authorization: Bearer <token>"   (Settings > Agent shows it; KERF_MCP_ADDR overrides the address)
 ```
 
 Debug builds use their own identifier (`ch.orellbuehler.kerf.dev`), so a dev run does not

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/kerf-core", "crates/kerf-gpu", "crates/kerf-app"]
 
 [workspace.package]
-version = "0.24.0"
+version = "0.25.0"
 edition = "2021"
 rust-version = "1.95"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -84,6 +84,9 @@ schemars = "1.2"
 
 # HTTP server for the embedded MCP endpoint (matches rmcp's tower/axum 0.8)
 axum = "0.8"
+# The server's shutdown token (rmcp takes this type) and the OS RNG behind the bearer token.
+tokio-util = "0.7"
+getrandom = "0.3"
 
 # Desktop shell — Tauri v2
 tauri = { version = "2", features = [] }
@@ -96,6 +99,18 @@ tauri-plugin-single-instance = "2.5"
 # `process` supplies the relaunch after the install.
 tauri-plugin-updater = "2.10"
 tauri-plugin-process = "2.3"
+
+# The PNG encoder behind the animated titles' picture cache (svg::raster::encode_frame_png) is
+# ~10x slower unoptimised, and a debug build (tests, `tauri dev`) draws a stream's titles inside
+# the same 10 s as a release one. Only the four small crates of the quick level.
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.dev.package.simd-adler32]
+opt-level = 3
 
 [profile.release]
 opt-level = 3

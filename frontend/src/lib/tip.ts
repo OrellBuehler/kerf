@@ -142,6 +142,8 @@ export interface TipEnv<E> {
 	/** Draw (or redraw) the tip for `el`. */
 	show(el: E, spec: TipSpec, via: Via): void;
 	hide(): void;
+	/** Whether tips are held back right now (a context menu is open): none is shown, and none is scheduled. */
+	blocked?(): boolean;
 }
 
 /** The tip's timing and who it is for, over an environment that can be faked — one controller is
@@ -191,7 +193,7 @@ export function createTipController<E>(env: TipEnv<E>) {
 	}
 
 	function request(el: E, v: Via) {
-		if (muted.has(el) || !specs.has(el)) return;
+		if (muted.has(el) || !specs.has(el) || env.blocked?.()) return;
 		if (shown && anchor === el) {
 			clearHide();
 			via = v;
@@ -266,6 +268,10 @@ export function createTipController<E>(env: TipEnv<E>) {
 		},
 		/** A press anywhere, a scroll, the window losing focus. */
 		dismissAll() {
+			hideNow();
+		},
+		/** Tips just became blocked: the one up, and the one about to be, go. */
+		hold() {
 			hideNow();
 		},
 		/** Escape: put the tip away, and keep it away from this control until the pointer has left and
@@ -351,7 +357,19 @@ function describe(el: HTMLElement, id: string | null) {
 	else el.removeAttribute('aria-describedby');
 }
 
+let held = false;
+
+/** Hold every tooltip back (`true`) or let them show again. A context menu holds them while it is open: a tip raised by
+ *  a row of the menu (or by whatever lies under the pointer's trail to it) is drawn above the menu and covers the very
+ *  labels being read. */
+export function holdTips(on: boolean) {
+	if (held === on) return;
+	held = on;
+	if (on) controller.hold();
+}
+
 const controller = createTipController<HTMLElement>({
+	blocked: () => held,
 	now: () => Date.now(),
 	after: (fn, ms) => setTimeout(fn, ms),
 	cancel: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),

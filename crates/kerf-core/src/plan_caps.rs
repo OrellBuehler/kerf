@@ -212,6 +212,9 @@ pub enum Unsupported {
     TranslucentMatrix(LayerRef, String),
     /// Colour correction on a picture that may be full range (the detail says what is known).
     GradedFullRange(LayerRef, String),
+    /// Curves, colour wheels or a 3D LUT (the detail names which): drawn by FFmpeg in RGB, with no
+    /// compositor pass or parity case yet.
+    Grade(LayerRef, &'static str),
     /// A video effect the compositor does not draw (the detail names it and says why), or one
     /// whose value FFmpeg's own filter refuses.
     Effects(LayerRef, &'static str),
@@ -270,6 +273,8 @@ pub enum Unsupported {
     /// A live text overlay is drawn in a font under [`MIN_TEXT_PX`] pixels (the smallest, in pixels):
     /// glyph bitmaps share too many pixels for one mask to stand for them.
     TextTooSmall(u32),
+    /// An animated SVG title is on screen: resvg draws it and FFmpeg overlays its pictures.
+    Svg,
     Scaler(String),
     /// The layer's colour matrix is unknown while the composite takes its matrix from the tags.
     MatrixUnknown(usize),
@@ -302,6 +307,7 @@ impl Unsupported {
             Self::NotKnownOpaque(..) => "not_known_opaque",
             Self::TranslucentMatrix(..) => "translucent_matrix",
             Self::GradedFullRange(..) => "graded_full_range",
+            Self::Grade(..) => "grade",
             Self::Effects(..) => "effects",
             Self::Mask(_) => "mask",
             Self::MaskWith(..) => "mask_with",
@@ -323,6 +329,7 @@ impl Unsupported {
             Self::TextWithoutFont => "text_without_font",
             Self::TextBorder => "text_border",
             Self::TextTooSmall(_) => "text_too_small",
+            Self::Svg => "svg",
             Self::Scaler(_) => "scaler",
             Self::MatrixUnknown(_) => "matrix_unknown",
             Self::MixedMatrices => "mixed_matrices",
@@ -363,6 +370,7 @@ impl fmt::Display for Unsupported {
                 write!(f, "{l}: opacity below 1 on a picture whose colour matrix is {detail}")
             }
             Self::GradedFullRange(l, detail) => write!(f, "{l}: colour correction on {detail}"),
+            Self::Grade(l, what) => write!(f, "{l}: {what} (drawn by FFmpeg only)"),
             Self::Effects(l, what) => write!(f, "{l}: video effects ({what})"),
             Self::Mask(l) => write!(f, "{l}: mask"),
             Self::MaskWith(l, what) => write!(f, "{l}: a mask {what}, which the compositor does not draw"),
@@ -415,6 +423,7 @@ impl fmt::Display for Unsupported {
             Self::TextBorder => f.write_str(
                 "a bold text overlay in a font with no bold face, which drawtext thickens with an overlapping border",
             ),
+            Self::Svg => f.write_str("an animated SVG title is on screen"),
             Self::Scaler(s) => write!(f, "scaler '{s}'"),
             Self::MatrixUnknown(n) => write!(
                 f,
@@ -482,8 +491,10 @@ mod tests {
             Unsupported::Text.kind(),
             Unsupported::TextWithoutFont.kind(),
             Unsupported::TextBorder.kind(),
+            Unsupported::Svg.kind(),
             Unsupported::Hdr(layer(0, "")).kind(),
             Unsupported::Effects(layer(0, ""), "a blur").kind(),
+            Unsupported::Grade(layer(0, ""), "curves").kind(),
             Unsupported::MaskWith(layer(0, ""), "on a rotated layer").kind(),
             Unsupported::Matte(layer(0, ""), "of a translucent layer").kind(),
             Unsupported::FadeOnTranslucent(layer(0, "")).kind(),

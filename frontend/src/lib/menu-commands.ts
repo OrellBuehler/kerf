@@ -10,6 +10,7 @@ import { ui } from './editor-ui.svelte';
 import { workspace } from './workspace.svelte';
 import { popout } from './popout.svelte';
 import { toast } from './notifications.svelte';
+import { holdForPreview, report } from './ops';
 import type { MenuCommand } from './menus';
 
 /** Cut the project for a delivery frame (`null`: follow the footage). Changing it
@@ -18,12 +19,12 @@ import type { MenuCommand } from './menus';
  *  rendered file. */
 export async function setDeliveryPreset(id: string): Promise<void> {
 	const p = DELIVERY_PRESETS.find((d) => d.id === id);
-	if (!p) return;
+	if (!p || holdForPreview()) return;
 	try {
 		await editor.setDeliveryFormat(p.format);
 		toast.success(p.format ? `Cutting for ${p.label} (${fitLabel(p.format.fit)})` : 'Following the footage');
 	} catch (err) {
-		toast.error(err instanceof Error ? err.message : String(err));
+		report(err);
 	}
 }
 
@@ -40,6 +41,10 @@ export function runMenuCommand(c: MenuCommand): void {
 			break;
 		case 'detach':
 			popout.toggle(c.panel);
+			break;
+		// File › Open Recent needs the page's unsaved-work question; the page runs those (`onMenuCommand`).
+		case 'recent':
+		case 'recent-clear':
 			break;
 	}
 }

@@ -22,7 +22,7 @@ use realfft::RealFftPlanner;
 use super::cli::{bg_command, ffmpeg_bin, fnv1a, launch_err, source_key, status_within};
 use super::cpu;
 use super::download::{fetch, Download};
-use super::pcm::{decode_audio, write_wav, AudioBuffer};
+use super::pcm::{decode_audio_cancellable, write_wav, AudioBuffer};
 use super::tts::{download_progress, ensure_runtime, init_runtime, ready_runtime, verify_onnx, verify_sha256, Report};
 use crate::error::{Error, Result};
 
@@ -150,12 +150,12 @@ pub fn separate(path: &Path, progress: &mut Report, cancel: &dyn Fn() -> bool) -
     let runtime = ensure_runtime(&mut download_progress("download_runtime", progress), cancel)?;
     let model = ensure_model(&mut download_progress("download_model", progress), cancel)?;
     init_runtime(&runtime)?;
-    let mix = decode_audio(path, STEM_SAMPLE_RATE, 2)?;
+    let mix = decode_audio_cancellable(path, STEM_SAMPLE_RATE, 2, cancel)?;
     if mix.frames() == 0 {
         return Err(Error::InvalidArgument("the file has no sound to separate".into()));
     }
     let stems = {
-        let lease = cpu::lease();
+        let lease = cpu::lease_waiting(&mut |_| {}, cancel)?;
         let threads = lease.threads();
         progress("separate", Some(0.0), None);
         separate_buffer(&model, threads, &mix, &mut |f| progress("separate", Some(f), None), cancel)?
@@ -429,6 +429,7 @@ pub(crate) fn separate_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::pcm::decode_audio;
 
     fn fixture() -> [Vec<f32>; 2] {
         let n = 5000;

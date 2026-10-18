@@ -96,9 +96,12 @@ describe('formatTimecode', () => {
 		expect(formatTimecode(0, 30)).toBe('00:00:00:00');
 		expect(formatTimecode(3723 + 12 / 30, 30)).toBe('01:02:03:12');
 	});
-	test('uses non-drop frame numbering for fractional rates', () => {
-		expect(formatTimecode(30/(30000/1001), 30000/1001)).toBe('00:00:01:00');
-		expect(formatTimecode(60, 30000/1001)).toBe('00:00:59:28');
+	test('counts drop-frame at 29.97, and non-drop when asked', () => {
+		expect(formatTimecode(30/(30000/1001), 30000/1001)).toBe('00;00;01;00');
+		expect(formatTimecode(60, 30000/1001)).toBe('00;00;59;28');
+		expect(formatTimecode(60, 30000/1001, { dropFrame: false })).toBe('00:00:59:28');
+		expect(formatTimecode(1801 / (30000/1001), 30000/1001, { dropFrame: false })).toBe('00:01:00:01');
+		expect(formatTimecode(1801 / (30000/1001), 30000/1001)).toBe('00;01;00;03');
 	});
 	test('handles minute and hour boundaries and invalid input', () => {
 		expect(formatTimecode(60, 30)).toBe('00:01:00:00');
@@ -114,7 +117,7 @@ describe('formatTimecode', () => {
 		expect(formatTimecode(5, 30, { frames: false })).toBe('00:00:05');
 		expect(formatTimecode(65.9, 30, { frames: false })).toBe('00:01:05');
 		// 5 timecode seconds at 29.97 is 150 frames, a hair past 5 s of the clock
-		expect(formatTimecode(150 / (30000 / 1001), 30000 / 1001, { frames: false })).toBe('00:00:05');
-		expect(formatTimecode(5, 30000 / 1001, { frames: false })).toBe('00:00:04');
+		expect(formatTimecode(150 / (30000 / 1001), 30000 / 1001, { frames: false })).toBe('00;00;05');
+		expect(formatTimecode(5, 30000 / 1001, { frames: false, dropFrame: false })).toBe('00:00:04');
 	});
 });

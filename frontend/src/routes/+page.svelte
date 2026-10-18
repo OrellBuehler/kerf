@@ -11,58 +11,84 @@
 	import VoiceoverDialog from '#lib/components/editor/VoiceoverDialog.svelte';
 	import FitMusicDialog from '#lib/components/editor/FitMusicDialog.svelte';
 	import StemsDialog from '#lib/components/editor/StemsDialog.svelte';
+	import SaveTemplateDialog from '#lib/components/editor/SaveTemplateDialog.svelte';
+	import ShortcutSheet from '#lib/components/editor/ShortcutSheet.svelte';
+	import RelinkDialog from '#lib/components/editor/RelinkDialog.svelte';
 	import ContextMenu from '#lib/components/editor/ContextMenu.svelte';
 	import NotificationCenter from '#lib/components/editor/NotificationCenter.svelte';
 	import Icon from '#lib/components/editor/Icon.svelte';
+	import Btn from '#lib/components/editor/Btn.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
-	import { editor } from '#lib/state.svelte';
+	import { editor, EditRefused, PreviewReadOnly } from '#lib/state.svelte';
 	import { agent } from '#lib/agent.svelte';
+	import { applyProposal, discardProposal } from '#lib/proposal-actions';
+	import { changeWord, reviewStepTip } from '#lib/proposal-ui';
 	import { updater } from '#lib/updater.svelte';
 	import { settings } from '#lib/settings.svelte';
 	import { mediaStatus } from '#lib/media-status.svelte';
 	import { workspace } from '#lib/workspace.svelte';
+	import { resetAllWorkspacesAsked } from '#lib/workspace-actions';
 	import { popout } from '#lib/popout.svelte';
 	import { windows } from '#lib/windows.svelte';
 	import { contextMenu } from '#lib/context-menu.svelte';
 	import {
 		cutSelection,
 		deleteSelection,
+		addMarker,
 		detachSelection,
+		duplicateClips,
+		holdForPreview,
 		linkSelection,
+		keyEdit,
+		pasteClips,
 		reattachSelection,
+		report,
+		splitSelection,
 		trimSelection,
 		unlinkSelection
 	} from '#lib/ops';
 	import { allowsRepeat, type ActionId } from '#lib/keymap';
 	import { runMenuCommand } from '#lib/menu-commands';
-	import { saveCoverFrame, saveProject } from '#lib/file-actions';
+	import type { MenuCommand } from '#lib/menus';
+	import { exportCaptionFile, exportInterchangeFile, exportMarkerList, saveCoverFrame, saveProject } from '#lib/file-actions';
 	import { importCaptionFile } from '#lib/title-actions';
+	import { checkMissingOnOpen } from '#lib/library-actions';
 	import {
+		askRecovery,
 		askUnsaved,
+		discardRecovery,
+		discardRecoveryAtExit,
 		inTauri,
+		listRecoveries,
 		isMediaPath,
-		confirmAction,
+		onAnalysisProgress,
 		onAnalysisStatus,
+		onImportProgress,
+		onModelProgress,
 		onProxyProgress,
+		onSmartCropProgress,
 		onWindowCloseRequested,
 		openReleases,
 		quitApp,
+		reportUiContext,
 		revealLogs,
 		setWindowTitle,
 		showMainWindow,
 		takeLaunchProject
 	} from '#lib/api';
 	import { windowTitle } from '#lib/window-title';
+	import { createContextReporter, uiContext } from '#lib/editor-context';
 	import { finishImport, importMedia } from '#lib/import-media';
 	import { clipsIn, exportButtonState } from '#lib/export-button';
 	import { afterPaint, fontsReady, revealWindow } from '#lib/reveal';
 	import { missingProjectMessage } from '#lib/launch';
+	import { recoveryCopy } from '#lib/recovery';
 	import { tip } from '#lib/tip';
-	import { CONFIRM, UNSAVED, proceedAfter, type UnsavedCopy } from '#lib/confirm-copy';
+	import { CONFIRM, UNSAVED, leaveAfter, proceedAfter, type UnsavedCopy } from '#lib/confirm-copy';
 	import { changeIndex, changePoints, stepChange } from '#lib/staged-diff';
 	import { clampPlayhead, secondFrames, stepFrames } from '#lib/frames';
+	import type { SettingsView } from '#lib/types';
 	import { isPagingKey, onEditorSurface } from '#lib/focus-area';
-	import type { AnalysisProgress, ModelProgress } from '#lib/types';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
 	 *  may fire: Space / Delete / J-K-L would edit the live project under it. */
@@ -73,7 +99,10 @@
 			ui.voiceoverDialog !== null ||
 			ui.aboutDialog ||
 			ui.fitMusicDialog !== null ||
-			ui.stemsDialog !== null
+			ui.relinkDialog ||
+			ui.stemsDialog !== null ||
+			ui.saveTemplateDialog !== null ||
+			ui.shortcutSheet
 	);
 	/** True while files are hovering over the window, for the drop overlay. */
 	let dropHover = $state(false);
@@ -83,6 +112,26 @@
 	$effect(() => {
 		void editor.assets.map((a) => a.id).join(',');
 		untrack(() => void mediaStatus.refresh());
+	});
+
+	// What the editor shows, for an agent's `get_editor_context` (throttled, `editor-context.ts`).
+	$effect(() => {
+		if (!inTauri()) return;
+		const reporter = createContextReporter((c) => void reportUiContext(c).catch(() => {}));
+		$effect(() =>
+			reporter.update(
+				uiContext({
+					time: ui.time,
+					selectedClipIds: editor.selectedClipIds,
+					markIn: ui.markIn,
+					markOut: ui.markOut,
+					view: ui.timelineView,
+					panel: ui.focusedPanel,
+					assetId: editor.selectedAssetId
+				})
+			)
+		);
+		return () => reporter.stop();
 	});
 
 	// A modal over the editor window puts what is in the detached windows out of reach too.
@@ -126,6 +175,8 @@
 
 	onMount(() => {
 		const firstLoad = editor.load();
+		// A project that comes up with media whose file is gone offers to relink it.
+		void firstLoad.then(() => checkMissingOnOpen());
 		void agent.load();
 		void ui.loadFonts();
 		void ui.loadTranscriptionStatus();
@@ -133,6 +184,18 @@
 		// Ask GitHub whether a newer signed release exists (silently — offline is
 		// not worth an interruption) and offer it in the title bar / dialog.
 		const unlisteners: Array<() => void> = [];
+		// An edit the backend (or the preview) refused is reported by whoever asked for it — a toast. One that
+		// nobody caught (`void editor.undo()` from a toast's button) is said here, so a refusal is never silent
+		// and never said twice.
+		const onRefusal = (ev: PromiseRejectionEvent) => {
+			if (!(ev.reason instanceof EditRefused)) return;
+			ev.preventDefault();
+			// Previewing a proposal is a state, not a failure.
+			if (ev.reason instanceof PreviewReadOnly) toast.info(ev.reason.message);
+			else toast.error(ev.reason.message);
+		};
+		window.addEventListener('unhandledrejection', onRefusal);
+		unlisteners.push(() => window.removeEventListener('unhandledrejection', onRefusal));
 		// The shortcuts and the menu-suppressing handler listen to every window the editor
 		// is in: a key pressed in a detached panel's window is dispatched there and never
 		// reaches a listener on this one.
@@ -142,13 +205,22 @@
 		// would drop it without a word, so ask first.
 		void onWindowCloseRequested(
 			() => editor.hasUnsavedWork,
-			() => proceedUnsaved(UNSAVED.close)
+			() => leaveUnsaved(UNSAVED.close)
 		).then((un) => unlisteners.push(un));
 
 		// Each asset's preview proxy and per-kind analysis, kept current by the backend's events
 		// (an agent's runs included) — the bin's badges and chips read them.
 		void onProxyProgress((s) => mediaStatus.noteProxy(s)).then((un) => unlisteners.push(un));
 		void onAnalysisStatus((s) => mediaStatus.noteAnalysis(s)).then((un) => unlisteners.push(un));
+		// Only a 360 lens pair reports an import's progress — its stitch is a full re-encode, so the import
+		// overlay shows how far along it is (and Stop). A speech model's download reports its bytes; a smart
+		// crop reports the shots sampled so far.
+		void onImportProgress((p) => (editor.importProgress = p.fraction)).then((un) => unlisteners.push(un));
+		void onModelProgress((p) => ui.noteModelProgress(p)).then((un) => unlisteners.push(un));
+		void onSmartCropProgress((p) => (editor.smartCropProgress = p.fraction)).then((un) => unlisteners.push(un));
+		// Analysis names its step as it goes — transcription in particular downloads a model and then runs for
+		// minutes. (The browser harness simulates the ticks.)
+		void onAnalysisProgress((p) => ui.noteAnalysisProgress(p)).then((un) => unlisteners.push(un));
 
 		// The desktop app hosts the MCP server, so an agent can edit the same
 		// project live. It emits `project-changed` after each mutation; re-fetch
@@ -180,6 +252,20 @@
 			} finally {
 				refreshing = false;
 			}
+		}
+		/** Another project is open now (an agent swapped it): forget the selection and what the session
+		 *  remembered about the last one, and load the new project as an open does. */
+		async function onProjectReplaced() {
+			editor.selectedAssetId = null;
+			editor.selectedClipId = null;
+			editor.selectedClipIds = [];
+			editor.selectedOverlayId = null;
+			editor.selectedSvgOverlayId = null;
+			await editor.load();
+			ui.projectReplaced();
+			await agent.load();
+			toast.info(`The agent switched to ${editor.projectName}`);
+			void checkMissingOnOpen();
 		}
 		/** The flag changed behind our back (an agent set it): re-read it, and say so
 		 *  — it is the user's own toolbar setting that moved. */
@@ -223,24 +309,15 @@
 					// otherwise only read at launch, so the picker would keep
 					// showing the previous model until the next start.
 					await listen('speech-model-changed', () => void ui.loadTranscriptionStatus()),
+					// An agent opened, started or saved-as a project through MCP: the same swap the
+					// menu does, so reload everything it showed (the backend already refused to drop
+					// unsaved work unless the agent was told to).
+					await listen('project-replaced', () => void onProjectReplaced()),
+					// An agent changed a setting (MCP `set_settings`): the dialog and everything backed by one follows.
+					await listen<SettingsView | null>('settings-changed', (e) => settings.noteChanged(e.payload)),
 					// Likewise the ripple flag: an agent that flips it changes what
 					// the user's next trim or delete does, so the toolbar has to say.
-					await listen('ripple-mode-changed', () => void onRippleChanged()),
-					// Only a 360 lens pair reports here — its stitch is a full
-					// re-encode, so the import overlay shows how far along it is.
-					await listen<{ fraction: number }>(
-						'import-progress',
-						(e) => (editor.importProgress = e.payload.fraction)
-					),
-					// Analysis names its step as it goes — transcription in
-					// particular downloads a model and then runs for minutes.
-					await listen<AnalysisProgress>('analysis-progress', (e) =>
-						ui.noteAnalysisProgress(e.payload)
-					),
-					await listen<ModelProgress>(
-						'model-progress',
-						(e) => (ui.modelFraction = e.payload.fraction ?? 0)
-					)
+					await listen('ripple-mode-changed', () => void onRippleChanged())
 				);
 				// A `.kerf` on the command line of this very launch (a second launch's
 				// arrives as the events above, unless it came while this page was still
@@ -250,6 +327,7 @@
 				// goes through the same path as the event, unsaved-work question
 				// included. A path that is not there is reported, never created.
 				await firstLoad;
+				await offerRecoveries();
 				const launched = await takeLaunchProject().catch(() => null);
 				if (launched && 'open' in launched) await openProjectAt(launched.open);
 				else if (launched) toast.error(missingProjectMessage(launched.missing));
@@ -261,9 +339,40 @@
 		};
 	});
 
+	/** The export no longer freezes the editor, but it renders *this* project: replacing it under the render would
+	 *  have the export read a project that is not the one it was started on. Said, not silently ignored. */
+	function renderRunning(): boolean {
+		if (editor.exportRun === null) return false;
+		toast.info('An export is running — stop it from the status bar before opening or starting another project.');
+		return true;
+	}
+
 	/** New / Open replace the project; one that was never saved would be gone. */
 	async function okToReplace(): Promise<boolean> {
 		return !editor.hasUnsavedWork || proceedUnsaved(UNSAVED.replace);
+	}
+
+	/** Untitled projects a crashed run left behind, newest first: Recover opens one (asking about
+	 *  this project's unsaved work first) and the rest wait for the next launch, Discard deletes it,
+	 *  Not now keeps it for the next launch. */
+	async function offerRecoveries() {
+		const found = await listRecoveries().catch(() => []);
+		for (const info of found) {
+			const choice = await askRecovery(recoveryCopy(info));
+			try {
+				if (choice === 'discard') await discardRecovery(info.id);
+				if (choice !== 'recover' || !(await okToReplace())) continue;
+				if (await editor.recoverProject(info.id)) {
+					ui.projectReplaced();
+					await agent.load();
+					toast.success('Recovered the unsaved project', { description: 'Save it to keep it.' });
+					void checkMissingOnOpen();
+					return;
+				}
+			} catch (e) {
+				toast.error("Couldn't recover the project", { description: e instanceof Error ? e.message : String(e) });
+			}
+		}
 	}
 
 	/** The unsaved-project prompt and what its answer means: whether to go ahead. "Save…" opens
@@ -272,11 +381,17 @@
 		return proceedAfter(await askUnsaved(copy), saveProject);
 	}
 
+	/** [`proceedUnsaved`] for closing or quitting: "Don't save" also lets the recovery session go. */
+	async function leaveUnsaved(copy: UnsavedCopy): Promise<boolean> {
+		return leaveAfter(await askUnsaved(copy), saveProject, discardRecoveryAtExit);
+	}
+
 	async function onNew() {
 		if (!inTauri()) {
 			toast.info('Creating a project is available in the desktop app.');
 			return;
 		}
+		if (renderRunning()) return;
 		if (!(await okToReplace())) return;
 		try {
 			if (await editor.newProject()) {
@@ -289,22 +404,35 @@
 		}
 	}
 
-	/** Open a project file — `path` when a launch handed one over, else the picker. */
-	async function openProjectAt(path?: string) {
+	/** Open a project file — `path` when a launch handed one over, else the picker; `recent` when it is one of
+	 *  File › Open Recent's (a file that has gone is then dropped from the list and said so). */
+	async function openProjectAt(path?: string, recent = false) {
 		if (!inTauri()) {
 			toast.info('Opening a project file is available in the desktop app.');
 			return;
 		}
+		if (renderRunning()) return;
 		if (!(await okToReplace())) return;
 		try {
-			if (await editor.openProject(path)) {
+			if (await (recent && path ? editor.openRecent(path) : editor.openProject(path))) {
 				ui.projectReplaced();
 				await agent.load();
 				toast.success(`Opened ${editor.projectName}`);
+				void checkMissingOnOpen();
 			}
 		} catch (e) {
 			toast.error(e instanceof Error ? e.message : String(e));
+		} finally {
+			// Opening puts the project at the top of the recent list; a file that has gone drops off it.
+			void settings.refreshRecent();
 		}
+	}
+
+	/** File › Open Recent's entries, and the one that clears the list; everything else is `runMenuCommand`'s. */
+	function onMenuCommand(c: MenuCommand) {
+		if (c.type === 'recent') void openProjectAt(c.path, true);
+		else if (c.type === 'recent-clear') void settings.clearRecentAsked();
+		else runMenuCommand(c);
 	}
 
 	async function onSave() {
@@ -334,18 +462,14 @@
 		}
 		await quitApp(
 			() => editor.hasUnsavedWork,
-			() => proceedUnsaved(UNSAVED.quit)
+			() => leaveUnsaved(UNSAVED.quit)
 		);
 	}
 
 	/** Window › Reset all workspaces throws away every arrangement made, so it asks first
 	 *  — unless there is none to lose, when it only rebuilds the one on screen. */
-	async function resetAllWorkspaces() {
-		const w = settings.workspaces;
-		const stored = Object.keys(w.layouts).length > 0 || Object.keys(w.library.tabs).length > 0;
-		const reset = CONFIRM.resetWorkspaces;
-		if (stored && !(await confirmAction(reset.message, reset.title, reset))) return;
-		workspace.resetAll();
+	function resetAllWorkspaces() {
+		return resetAllWorkspacesAsked();
 	}
 
 	function onAbout() {
@@ -381,6 +505,17 @@
 	/** The times the proposal on screen changes the cut at, for stepping through them. */
 	const reviewPoints = $derived(editor.previewingStaged && editor.staged ? changePoints(editor.staged.diff.entries) : []);
 
+	/** Apply or Discard from the banner: held while one is under way, so a double click is one answer. */
+	let reviewBusy = $state(false);
+	async function reviewAct(answer: () => Promise<boolean>) {
+		reviewBusy = true;
+		try {
+			await answer();
+		} finally {
+			reviewBusy = false;
+		}
+	}
+
 	/** `[` / `]`: the playhead to the change before / after it, while a proposal is on the timeline. */
 	function stepReview(dir: 1 | -1): void | false {
 		if (!editor.previewingStaged) return false;
@@ -403,18 +538,23 @@
 		e.preventDefault();
 	}
 
-	const clipErr = (err: unknown) => toast.error(err instanceof Error ? err.message : String(err));
-
-	/** Delete / Shift+Delete: a selected title goes first (whichever of the two it
+	/** Delete / Shift+Delete: a selected title or animated title goes first (whichever of the two it
 	 *  was — a title has no gap to close); else the selected clips as one edit,
 	 *  with `ripple` closing the gaps behind them (plain Delete leaves them,
 	 *  unless ripple mode is on). Nothing selected: not ours, so the key is left alone. */
 	function deleteKey(ripple: boolean): void | false {
 		if (editor.selectedOverlayId) {
+			if (holdForPreview()) return;
 			void editor
 				.removeOverlay(editor.selectedOverlayId)
 				.then(() => toast('Title removed', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
-				.catch(clipErr);
+				.catch(report);
+		} else if (editor.selectedSvgOverlayId) {
+			if (holdForPreview()) return;
+			void editor
+				.removeSvgOverlay(editor.selectedSvgOverlayId)
+				.then(() => toast('Animated title removed', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
+				.catch(report);
 		} else if (editor.selectedClipIds.length > 0) {
 			void deleteSelection(ripple);
 		} else {
@@ -434,13 +574,20 @@
 		'file.export': () => onExport(),
 		'file.importCaptions': () => void importCaptionFile(),
 		'file.saveCover': () => void saveCoverFrame(),
+		'file.exportCaptions': () => void exportCaptionFile(),
+		'file.exportOtio': () => void exportInterchangeFile('otio'),
+		'file.exportEdl': () => void exportInterchangeFile('edl'),
+		'file.exportMarkers': () => void exportMarkerList('csv'),
+		'file.exportChapters': () => void exportMarkerList('youtube'),
 		'app.settings': () => settings.toggle(),
 		'app.quit': () => void onQuit(),
 
 		'edit.undo': () => {
+			if (holdForPreview()) return;
 			if (editor.canUndo) void editor.undo();
 		},
 		'edit.redo': () => {
+			if (holdForPreview()) return;
 			if (editor.canRedo) void editor.redo();
 		},
 		'edit.selectAll': () => editor.selectAll(),
@@ -449,16 +596,9 @@
 			if (n) toast(n === 1 ? 'Clip copied' : `${n} clips copied`);
 		},
 		'edit.cut': () => void cutSelection(),
-		'edit.paste': () =>
-			void editor
-				.paste(ui.time)
-				.then((n) => n && toast(n === 1 ? 'Clip pasted' : `${n} clips pasted`))
-				.catch(clipErr),
-		'edit.duplicate': () =>
-			void editor
-				.duplicateSelection()
-				.then((n) => n && toast(n === 1 ? 'Clip duplicated' : `${n} clips duplicated`))
-				.catch(clipErr),
+		'edit.paste': () => void pasteClips(),
+		'edit.duplicate': () => void duplicateClips(),
+		'edit.split': () => void splitSelection(),
 		'edit.delete': () => deleteKey(false),
 		'edit.rippleDelete': () => deleteKey(true),
 		// Split-and-remove at the playhead; the backend follows ripple mode. Both say
@@ -495,12 +635,20 @@
 		'tool.slide': () => {
 			ui.tool = 'slide';
 		},
+		// One frame a press (the registry marks them `repeat: false`): each is one edit, and a held key would
+		// write a revision per auto-repeat.
+		'edit.rollBack': () => void keyEdit('roll', -1),
+		'edit.rollForward': () => void keyEdit('roll', 1),
+		'edit.slipBack': () => void keyEdit('slip', -1),
+		'edit.slipForward': () => void keyEdit('slip', 1),
+		'edit.slideBack': () => void keyEdit('slide', -1),
+		'edit.slideForward': () => void keyEdit('slide', 1),
 		'tool.snap': () => {
 			ui.snap = !ui.snap;
 		},
 		// A project setting: the registry marks it `repeat: false`, so a held key
 		// does not flip it back and forth.
-		'tool.rippleMode': () => void editor.setRippleMode(!editor.rippleMode).catch(clipErr),
+		'tool.rippleMode': () => void editor.setRippleMode(!editor.rippleMode).catch(report),
 
 		'playback.toggle': () => ui.togglePlay(),
 		'playback.shuttleBack': () => ui.shuttle(-1),
@@ -512,12 +660,15 @@
 		'playback.jumpForward': () => step(secondFrames(editor.fps)),
 		'playback.toStart': () => ui.seek(0),
 		'playback.toEnd': () => ui.seek(editor.duration),
+		// The timeline's timecode where it is on screen, else the transport's.
+		'playback.goToTimecode': () => {
+			const fields = [...document.querySelectorAll<HTMLInputElement>('[data-timecode-entry]')].filter((el) => el.getClientRects().length > 0);
+			const field = fields.find((el) => el.dataset.timecodeEntry === 'timeline') ?? fields[0];
+			if (!field) return false;
+			field.focus();
+		},
 
-		'marker.add': () =>
-			void editor
-				.addMarkerAtPlayhead(ui.time)
-				.then(() => toast('Marker added', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
-				.catch(clipErr),
+		'marker.add': () => void addMarker(),
 		'marker.prev': () => ui.gotoMarker(-1),
 		'marker.next': () => ui.gotoMarker(1),
 		'review.prevChange': () => stepReview(-1),
@@ -551,6 +702,7 @@
 		'window.resetAllWorkspaces': () => void resetAllWorkspaces(),
 		'window.dockAll': () => popout.dockAll(),
 
+		'app.shortcuts': () => ui.openShortcuts(),
 		'app.keyboard': () => settings.openSection('keyboard'),
 		'app.checkUpdate': () => updater.open(),
 		'app.releases': () =>
@@ -560,7 +712,7 @@
 				toast.info('The log folder is available in the desktop app.');
 				return;
 			}
-			void revealLogs().catch(clipErr);
+			void revealLogs().catch(report);
 		},
 		'app.about': () => onAbout()
 	};
@@ -606,22 +758,26 @@
 	inert={modalOpen}
 	style="position:fixed;inset:0;display:flex;flex-direction:column;background:var(--surface-void)"
 >
-	<TitleBar onAction={runAction} onCommand={runMenuCommand} />
+	<TitleBar onAction={runAction} onCommand={onMenuCommand} />
 	<!-- While a proposal is on screen the editor is showing a cut that is not
-	     the project's yet; say so where it cannot be missed. -->
+	     the project's yet; say so where it cannot be missed, and keep its three answers — apply, discard, go
+	     back — in reach, so the review does not need the Agent panel open. The timeline is read-only here. -->
 	{#if editor.previewingStaged}
 		<div
-			style="flex:none;display:flex;align-items:center;gap:9px;height:30px;padding:0 12px;background:var(--agent-surface);border-bottom:var(--line-width) solid var(--agent-border);color:var(--agent-300);font-size:12px"
+			role="status"
+			style="flex:none;display:flex;align-items:center;gap:9px;min-height:32px;padding:3px 12px;background:var(--agent-surface);border-bottom:var(--line-width) solid var(--agent-border);color:var(--agent-300);font-size:12px;overflow:hidden"
 		>
-			<span style="width:7px;height:7px;border-radius:50%;background:var(--agent-400);box-shadow:0 0 8px var(--agent-400)"
+			<span style="flex:none;width:7px;height:7px;border-radius:50%;background:var(--agent-400);box-shadow:0 0 8px var(--agent-400)"
 			></span>
-			<span>Previewing the agent's proposed cut — your timeline is unchanged.</span>
+			<span style="flex:none;white-space:nowrap" use:tip={'The agent’s proposal is on the timeline and the cut is read-only. Nothing is changed until you apply it.'}
+				>Previewing the agent's proposed cut — your timeline is unchanged.</span
+			>
 			{#if editor.staged}
 				<!-- The proposal as marks on the timeline: stepping from change to change, and what the
 				     marks mean (colour and outline style both say it). -->
 				<span
 					data-review-nav
-					style="display:inline-flex;align-items:center;gap:4px;margin-left:6px;color:var(--text-secondary);font-size:11px"
+					style="display:inline-flex;align-items:center;gap:4px;margin-left:6px;color:var(--text-secondary);font-size:11px;white-space:nowrap"
 				>
 					<button
 						use:tip={settings.tip('Previous change', 'review.prevChange')}
@@ -632,10 +788,10 @@
 						><Icon n="chevron-left" s={12} /></button
 					>
 					<span
-						style="font-family:var(--font-mono);min-width:8ch;text-align:center"
+						style="font-family:var(--font-mono);min-width:12ch;text-align:center"
 						aria-live="polite"
-						use:tip={`The proposal changes the cut at ${reviewPoints.length} place${reviewPoints.length === 1 ? '' : 's'}; ${editor.staged.diff.entries.length} change${editor.staged.diff.entries.length === 1 ? '' : 's'} in all`}
-						>{reviewPoints.length > 0 ? `place ${changeIndex(reviewPoints, ui.time, editor.fps, editor.duration)}/${reviewPoints.length}` : 'no places'}</span
+						use:tip={reviewStepTip(reviewPoints.length, editor.staged.diff.entries.length, settings.keysFor('review.prevChange'), settings.keysFor('review.nextChange'))}
+						>{reviewPoints.length > 0 ? `place ${changeIndex(reviewPoints, ui.time, editor.fps, editor.duration)} of ${reviewPoints.length}` : 'no places'}</span
 					>
 					<button
 						use:tip={settings.tip('Next change', 'review.nextChange')}
@@ -645,11 +801,9 @@
 						style="display:grid;place-items:center;width:22px;height:22px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);cursor:pointer"
 						><Icon n="chevron-right" s={12} /></button
 					>
-					<span style="margin-left:4px;font-family:var(--font-mono)"
-						>· {editor.staged.diff.entries.length} change{editor.staged.diff.entries.length === 1 ? '' : 's'}</span
-					>
+					<span style="margin-left:4px;font-family:var(--font-mono)">· {changeWord(editor.staged.diff.entries.length)} in all</span>
 				</span>
-				<span data-review-legend style="display:inline-flex;align-items:center;gap:10px;margin-left:8px;font-size:11px;color:var(--text-secondary)">
+				<span data-review-legend style="display:inline-flex;align-items:center;gap:10px;margin-left:8px;font-size:11px;color:var(--text-secondary);white-space:nowrap">
 					<span style="display:inline-flex;align-items:center;gap:4px"
 						><span style="width:12px;height:9px;border:2px solid var(--diff-add);border-radius:2px"></span>added</span
 					>
@@ -664,11 +818,11 @@
 				</span>
 			{/if}
 			<div style="flex:1"></div>
-			<button
-				onclick={() => editor.exitStagedPreview()}
-				style="height:24px;padding:0 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);font-size:11px;cursor:pointer"
-				>Exit preview</button
-			>
+			{#if editor.staged}
+				<Btn variant="primary" size="sm" disabled={reviewBusy} onclick={() => void reviewAct(applyProposal)}>Apply</Btn>
+				<Btn size="sm" disabled={reviewBusy} onclick={() => void reviewAct(discardProposal)}>Discard</Btn>
+			{/if}
+			<Btn size="sm" onclick={() => void editor.exitStagedPreview()}>Exit preview</Btn>
 		</div>
 	{/if}
 	<!-- Something the project itself could not do — a `.kerf` that would not
@@ -676,6 +830,7 @@
 	     `editor.error` and never shown, so a corrupt file opened as silence. -->
 	{#if editor.error}
 		<div
+			role="alert"
 			style="flex:none;display:flex;align-items:center;gap:9px;min-height:30px;padding:5px 12px;background:color-mix(in srgb,var(--danger) 14%,transparent);border-bottom:var(--line-width) solid color-mix(in srgb,var(--danger) 40%,transparent);color:var(--text-primary);font-size:12px"
 		>
 			<Icon n="alert-triangle" s={13} color="var(--danger)" />
@@ -731,12 +886,24 @@
 	<StemsDialog assetId={ui.stemsDialog.assetId} clipId={ui.stemsDialog.clipId} onClose={() => ui.closeStems()} />
 {/if}
 
+{#if ui.saveTemplateDialog}
+	<SaveTemplateDialog overlayId={ui.saveTemplateDialog.overlayId} onClose={() => ui.closeSaveTemplate()} />
+{/if}
+
 {#if updater.dialogOpen}
 	<UpdateDialog />
 {/if}
 
 {#if ui.aboutDialog}
 	<AboutDialog onClose={() => ui.closeAbout()} />
+{/if}
+
+{#if ui.shortcutSheet}
+	<ShortcutSheet onClose={() => ui.closeShortcuts()} />
+{/if}
+
+{#if ui.relinkDialog}
+	<RelinkDialog onClose={() => ui.closeRelink()} />
 {/if}
 
 <ContextMenu />

@@ -4,7 +4,8 @@
 import { clock } from './clock';
 import { COLOR_PROPERTIES, isKeyed, propertyKeys, propertyLabel, type Animatable } from './channels';
 import { activeLook } from './style-presets';
-import { DEFAULT_COLOR, type Color, type Property } from './types';
+import { isFullFrame, svgPresetLabel } from './svg-titles';
+import { DEFAULT_COLOR, type Color, type Property, type SvgOverlay } from './types';
 
 const close = (a: number, b: number) => Math.abs(a - b) < 1e-6;
 
@@ -37,9 +38,23 @@ export function colorSummary(clip: Animatable | undefined, shown: Color): string
 	return activeLook(shown)?.label ?? 'Custom';
 }
 
-/** The Timing section's line, labelled: `Start 0:00.0 · Dur 0:12.5`. */
-export function timingSummary(start: number, duration: number): string {
-	return `Start ${clock(start)} · Dur ${clock(duration)}`;
+/** The Timing section's line, labelled: `Start 0:00.0 · Dur 0:12.5`. `fmt` is how a time reads (the
+ *  interface's own mode); without it, seconds. */
+export function timingSummary(start: number, duration: number, fmt: (seconds: number) => string = clock): string {
+	return `Start ${fmt(start)} · Dur ${fmt(duration)}`;
+}
+
+/** An animated title's Placement line: `Full frame`, else its size and corner (`40% × 16% at 30%, 42%`), and a
+ *  title that is not opaque says how much is (`Full frame · 60% opaque`). */
+export function svgPlacementSummary(o: Pick<SvgOverlay, 'x' | 'y' | 'width' | 'height' | 'opacity'>): string {
+	const pct = (v: number) => `${Math.round(v * 100)}%`;
+	const where = isFullFrame(o) ? 'Full frame' : `${pct(o.width)} × ${pct(o.height)} at ${pct(o.x)}, ${pct(o.y)}`;
+	return o.opacity < 1 ? `${where} · ${pct(o.opacity)} opaque` : where;
+}
+
+/** An animated title's Artwork line: the preset it was made from, `Template` when it came from one, else `Custom SVG`. */
+export function svgSourceSummary(o: Pick<SvgOverlay, 'preset'> & Partial<Pick<SvgOverlay, 'template'>>): string {
+	return o.preset ? svgPresetLabel(o.preset.kind) : o.template ? 'Template' : 'Custom SVG';
 }
 
 /** The number a keyframe toggle animates, as the row names it. */

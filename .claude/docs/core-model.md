@@ -5,7 +5,9 @@
   references a source range (`source_in`/`source_out`) of an asset at a
   `timeline_start` — non-destructive. Besides the geometry (`Transform`) / color
   (`Color`) / `Transition` fields, a clip carries a `Vec<VideoEffect>` and
-  `Vec<AudioEffect>` (per-clip filter chains) and a `Vec<Keyframe>` (transform
+  `Vec<AudioEffect>` (per-clip filter chains), a `Grade` (`model/grade.rs`: optional curves, colour wheels and a
+  `.cube` LUT reference, normalized by `Grade::normalized`, omitted from the JSON when empty, not keyable; diffed as
+  "curves set" / "LUT … at N%"; `grade.ts` is its TS mirror) and a `Vec<Keyframe>` (transform
   **animation** — `Clip::transform_at` interpolates it, the engine renders the
   motion). **Each key carries an `Easing`** for the segment that *leaves* it (`Linear` —
   the default, omitted from the JSON so every existing project and graph is
@@ -127,8 +129,12 @@
   that were cut out get none. It reads through `for_render`, so a muted track is
   as uncaptioned as it is unheard; it chunks a sentence to `CaptionOptions`
   (a speech model emits whole sentences and a whole sentence does not fit a
-  9:16 frame), timing lines by *character share*
-  because neither speech backend reports word timings; lines too short to read
+  9:16 frame). A segment **with `words`** is chunked over its words (`word_chunks`, the same
+  `max_words` / `max_chars` rule): a line runs from its first word's start to the next line's, or
+  across a pause to its last word's end + `CAPTION_HOLD` (0.5 s; the last line no further than the
+  segment end), and is kept only if the span its words are *spoken* in meets the clip (a hold
+  reaching past an in-point captions nothing). One **without** words (an imported cue, an older
+  transcript) is timed by *character share* as before, so those caption byte-identically; lines too short to read
   merge back into a neighbour instead of flashing; and no two lines are ever on
   screen at once (captions are one lane of text, and the same footage reaching
   the cut twice would otherwise collide with itself). `TextOverlay.generated`
@@ -179,7 +185,12 @@
   wants `-3600`. The
   parsers are pure and tolerant — SubRip (BOM, CRLF / CR, missing or absurd indices, a
   `,` or `.` fraction read as a *decimal* fraction, `<i>` / `<font>` and `{\an8}`
-  stripped, no blank line between cues with the index handed back to its cue) and ASS /
+  stripped, no blank line between cues with the index handed back to its cue), **WebVTT**
+  (`parse_vtt`: blank-line blocks; the `WEBVTT` header, `NOTE` / `STYLE` / `REGION` skipped
+  uncounted, an optional cue id, `.` milliseconds and optional hours, cue settings ignored,
+  `<v Speaker>` / `<c.x>` / `<b>` and inline `<00:01.000>` timestamps removed, `&amp;`-style
+  references decoded *after* markup so `&lt;i&gt;` stays text; captions have no speaker
+  field, so a voice's name is dropped; `detect` says `vtt` for a `WEBVTT` first line) and ASS /
   SSA (the `[Events]` `Format:` line picks the columns, `Dialogue:` only, `{…}` blocks
   and `\p` drawings dropped, `\N` / `\h`) — and what they cannot read is **counted,
   never fatal** (`skipped_lines`: empty or zero / negative-length cues, a stray line, a
@@ -225,8 +236,21 @@
   revision computed inside the `edit_timeline` closure (an agent's lands in its
   proposal), and a refused import (no cues, nothing reaching the cut, an asset not on
   the timeline, more than 20,000 captions) writes nothing. Core takes *text*;
-  `read_caption_file` (`.srt` / `.ass` / `.ssa`, regular file, size) runs before the lock
+  `read_caption_file` (`.srt` / `.vtt` / `.ass` / `.ssa`, regular file, size) runs before the lock
   in the Tauri command and the MCP tool.
+  **Caption export** (`captions_export.rs`, pure) is the way back out: `cut_captions` is the
+  timeline's *generated* overlays (a typed title is not a caption) — already in timeline
+  time, projected through trims / reorders / speed when they were written, so a cue is
+  exactly the line the burned-in overlay draws — clipped to `[0, duration]`, control
+  characters dropped; `write_srt` / `write_vtt` round to whole ms (end ≥ start + 1 ms),
+  turn `-->` in SRT text into `->` and escape `& < >` in VTT, and read back through the
+  importers unchanged (a test).
+  **Markers** carry `duration` (0 = a point), `comment` and `kind` (`Comment` / `Chapter`),
+  all `#[serde(default)]` and omitted at their defaults, so a stored timeline is
+  byte-identical. `MarkerPatch` + `Marker::apply` is the one validated edit (time and
+  duration ≥ 0, comment ≤ `MAX_MARKER_COMMENT`, control characters but `\n` / `\t` dropped);
+  `slice` clips a marker's span to the window and the diff names length / kind / comment
+  changes. A `Chapter` marker becomes a chapter of the export (see `engine-cli.md`).
   Inherent helpers (`Timeline::locate`, `Track::end`/`reflow`, `Clip::duration`,
   `Timeline::slice` — the shifted sub-timeline copy behind range export) back the
   operations. **Beat alignment** lives here too and is pure + unit-tested:
@@ -248,8 +272,33 @@
   so a UI can jump there or mark it on the timeline. Everything is matched by
   **id**, so a reordered track reads as the handful of moves it is rather than as
   every clip having been replaced, and a removed track is one entry instead of one
-  per orphaned clip. `StagedEdit` is a pending proposal (base seq, the edit
-  labels, `stale`, and its diff). **Ripple** is here too, pure + unit-tested:
+  per orphaned clip. **Every entry has a stable `id`** (`<kind>:<clip|text|marker|track
+  id>`, e.g. `clip_retrimmed:<uuid>`; unique per diff, unchanged as a proposal grows; the
+  `Marker*` kinds carry a `marker_id`) so a reviewer can send back the ones it accepts.
+  `StagedEdit` is a pending proposal (base seq, the edit
+  labels, `stale`, its diff, `owned_by_agent` — the session id itself (`owner`) is Rust-side only,
+  `#[serde(skip)]`, so it never reaches the webview or another agent — how many steps `undo_staged` can take
+  back, and the asset changes held back with it — `StagedAssetChange`, id
+  `asset_projection:<asset id>`, usable wherever an entry id is).
+  **Partial accept** is `model/subset.rs` (pure + unit-tested): `Timeline::merge_subset(base,
+  proposed, picked_ids)` writes each picked change onto the **live** cut by identity (this
+  clip / text or animated title / marker / track — never by position), so what the user did since stands. A
+  clip's start, its footage window and everything else are separate picks (`ClipMoved` /
+  `ClipRetrimmed` / `ClipChanged` combine per clip). What cannot be taken apart is not
+  guessed: a **linked partner's** entries, the **new track** a picked clip lands on and the
+  moves that take clips off a track the proposal removes come with the pick
+  (`SubsetMerge::auto_included`, each with its reason); a pick that leaves two clips on top
+  of each other (`check_subset_lanes`, against what already overlapped in the live cut) or
+  pulls linked clips out of step (`first_sync_break`) is refused naming the track and time;
+  a pick whose target the user removed since is `skipped`, not fatal. What is left of a proposal after a
+  partial accept is `Timeline::rebase_rest(base, proposed, rest_ids)`: the same by-identity merge of the
+  **unapplied** changes onto the cut as it now is, *without* the closure and the two refusals (it is
+  the cut to show, not a change to write; a change that no longer fits is dropped and counted) — so a
+  forced accept leaves the user's newer work in the remainder instead of a diff that undoes it.
+  `Timeline::check_own_lanes(before, ids)`
+  is the same overlap rule for the clip an edit itself placed (`add_clip_to_timeline`,
+  `trim`, a voiceover): judged **after** the ripple, which may have made the room, and not
+  for an overlap the clip already had. **Ripple** is here too, pure + unit-tested:
   `Timeline::ripple_from(before)` takes what an edit left behind and the cut it
   started from and, per track, matched by **id** like `diff`, shifts the clips the
   edit left *starting where they started* by the net change in length of what it
@@ -319,6 +368,18 @@
   `Slipped clip … footage +0.03s (in-point 10.00s → 10.03s)` — two decimals (three
   if two would show a real shift as zero), signed as `slip_clip` is (`+` = later in
   its footage, so a reversed clip's window moving down prints `+`), not a `+0.0s` trim.
+- **Invariants** (`model/check.rs`, pure + unit-tested): `Timeline::check()` refuses a timeline no
+  edit should leave — a non-finite time, gain or speed; a clip whose `source_out <= source_in`; a
+  negative fade or transition; a text / SVG overlay that does not end after it starts; a non-finite
+  keyframe or marker time; a track, clip or overlay id used twice. `Project::run_edit` takes
+  `known_violations()` before the edit and calls `check_new(&known)` after it, on every edit (live and
+  staged) before the transaction commits: only a violation (rule + item id) the edit **introduced** is
+  refused, so a file an older build left broken can still be edited, and a failing edit persists
+  nothing. The message names the item ("the clip at 0:04.0 on V1 has a negative fade", "the text
+  “hi” at 0:01.0 must end after it starts").
+  **Overlaps are not checked**: Kerf allows them (an explicit `add_clip`, a trim into the next clip, old
+  files), and the ripple already treats an overlap the edit did not make as old news. Nothing is indexed
+  by position in the stored timeline (everything is by id), so there is no index range to check.
 - **Fit music to length** (`model/music_fit.rs`, pure + unit-tested): `plan_music_fit(music,
   target, rate)` keeps the intro (before the first downbeat) and the ending (after the last
   whole bar) and walks the bars between, **jumping only between repeating phrases**
@@ -336,3 +397,122 @@
   a full window makes the export's tail and fade-in cover the same samples (offset windows
   played both copies at full gain — +65 % peak in the Python prototype). An overrun with
   `fade_out` is cut at the target and faded over `FIT_FADE_S`.
+- **Limits that keep a project loadable.** A clip's speed is `MIN_SPEED..=MAX_SPEED`
+  (0.01×..100×, either sign) — `set_speed` and the ratio `set_speed_linked` hands each partner
+  both hold it (the audio tempo is one `atempo` step per doubling). `Mask::normalized` maps a
+  non-finite size to a default instead of clamping `NaN` through. `Project`'s writes also run a
+  serde walk (`finite.rs`, `first_non_finite`) over every timeline before it is stored: serde_json
+  writes `NaN` as `null`, which a plain number field cannot read back, so one poisoned number would
+  stop the project opening. The setters refuse non-finite input themselves with a message; the walk
+  is the net under every op that computes a number.
+- **Animated SVG overlays** (`Timeline.svg_overlays: Vec<SvgOverlay>`, `svg/`, pure +
+  unit-tested; the engine side is `engine-cli.md`). An overlay is SMIL-animated vector art
+  drawn between `start` and `end`, fit *contain* and centred into the rect `x, y, width, height`
+  (frame fractions), above the clips and below text overlays (list order; captions stay on
+  top). **`svg` stores the sanitised source, so stored == rendered**: `svg::sanitize` is an
+  allow-list run once on the way in — scripts, `foreignObject` / `iframe` / `audio` / `video`,
+  elements outside resvg's vocabulary, `on*` and foreign-namespace attributes, anything but
+  `#fragment` links (an `<image>` may carry `data:image/png|jpeg|gif|webp`, **whose header says at most 16 Mpx** — the
+  decoder allocates what the header claims — else its `href` is cut with a warning; `svg/images.rs`: PNG / GIF / WebP by
+  `imagesize`, **JPEG by our own marker walk** (`jpeg_size`: it skips the `0xFF` fill bytes the format allows before a marker, which
+  `imagesize` takes for a marker and so errors on or lands on a decoy frame header; the largest frame header before the end of the image
+  is the size)), external `url()`,
+  `@import`, `@keyframes` and `animation*` / `transition*` (warning "CSS animations are not
+  rendered — use SMIL"); a plain DOCTYPE is cut, one with an internal subset is refused; caps
+  128 KiB, 20,000 elements, depth 64, 2,000 animations, 1,000 values each, `MAX_SVG_OVERLAYS` =
+  50 a timeline. **Depth is read off the bytes before roxmltree sees the text** (`nesting_exceeds`: it
+  recurses per open element with no limit of its own, and ~3,500 nested `<g>` — 25 KB — abort a 2 MiB
+  thread's stack; comments / CDATA / PIs and quoted values are skipped); an animation's `attributeName`
+  must be an XML name with at most one prefix (`is_attribute_name`) because `at` writes it into the
+  document as markup (`x="1" href="/etc/passwd" onload="a" y` was an injection), and only `xlink:href` of
+  the XLink attributes survives, **and only when no unprefixed `href` is beside it** — resvg reads
+  `xlink:width` as `width` and the unprefixed `href` over the XLink one, and **roxmltree's bare-name
+  `node.attribute("href")` matches `xlink:href` too** (use `sanitize::plain_attribute` for "no namespace"). **It is a splice, not a re-serialisation** (byte ranges of the original, so the
+  second pass over its own output changes nothing — a test sweeps nasty inputs for exactly
+  that). **`SvgDoc::parse` + `SvgDoc::at(doc_t)`** are the evaluator: the document is read once
+  (roxmltree, then a usvg parse to refuse what resvg cannot size — a `viewBox` or pixel
+  `width`/`height` is required, since resvg sizes a bare document to its content and an
+  animation would change that per frame; `<use>` / `feImage` expansion is counted from the XML
+  *first* — more than 100,000 drawn nodes, 128 levels or a reference cycle is refused (a ring of
+  **gradients** by `href` is not: each only lends its stops, and usvg breaks the loop), since usvg
+  expands a cycle to its million-node limit before it notices; the target of a `use` is its unprefixed
+  `href`, else `xlink:href`, as resvg's, and a `url(#id)` in `fill` / `stroke` / `mask` / `clip-path` /
+  `filter` / `marker-*` (attribute, **every declaration of `style`**, or a `<style>` rule — see below) counts the target again for every element that draws it; a `pattern` /
+  gradient / `filter` `href` is followed too, and `<image>` pixels are summed the same way — more than 64 Mpx decoded in a frame,
+  each `<use>` of an image decoding it again, is refused — and `SvgDoc::widest_image_pixels` is what a frame's decode must hold),
+  and `at` returns a *static* SVG for one moment —
+  animation elements cut out, animated attributes spliced in — which is what every renderer is
+  handed, so a still, a stream and an export of the same moment are one picture. A CSS property
+  (`opacity`, `fill`, `visibility`…) is written by appending `;prop:value` to `style` (a rule in
+  `<style>` beats a presentation attribute, an inline declaration beats the rule; no leading `;` after an
+  empty or `;`-ended style, where resvg's CSS reader would drop it); geometry is a replaced / inserted
+  attribute. The value an animation starts from is the element's own, else for an **inherited** property
+  (`values::is_inherited`: fill, stroke*, font-*, letter-spacing, visibility, …) the nearest ancestor's
+  `style` declaration or attribute, else the initial one (`opacity`, `display`, `stop-color` are not inherited) **The subset**: `animate`, `animateColor`, `set`,
+  `animateTransform`; `begin` / `end` clock values, `id.begin|end ± offset` syncbases (resolved
+  once, memoised, 32 deep, a cycle is unresolved), `indefinite`; an `end` list with an **unresolved** item (an event, a syncbase on nothing or on an animation that
+  never begins / ends) leaves the interval open — its natural length — where one whose times all precede the begin
+  makes no interval; `dur`, `repeatCount` /
+  `repeatDur`, `min` / `max`, `fill`, `restart`, `values` / `from` / `to` / `by`, `keyTimes`,
+  `calcMode` linear / discrete / paced / spline (Newton + bisection), `additive`, `accumulate`
+  (ignored for a `to`-only animation, as in SMIL; the repeat index is an `f64`, not a saturating `u32`)
+  and the sandwich (begin time, then document order; a transform sum post-multiplies onto the
+  base transform). A frozen value is the last one when the active duration is an exact multiple
+  of `dur`, else the value at `AD mod dur`. Colours blend per sRGB channel, paths blend only on
+  one command sequence, mixed units and keywords step. **Anything else is a warning, never a
+  failure** (`SvgDoc::warnings` / `check_svg`): events, `repeat()`, `accessKey`, wallclock never
+  fire; `animateMotion`, `animate` on `transform`, animating `href` / `style` / `on*` and a base value that comes
+  from a `<style>` rule is not seen (the default is used) — all dropped or ignored with a warning. **Dropped too is anything that
+  would make the guard (which reads the document as stored) wrong afterwards**: an animation of `mask` / `filter` / `clip-path` / `clip` / `marker*` / `id` / `class`, one whose `values` / `from` / `to` / `by` hold a
+  `url(` **unless it animates `fill` or `stroke` between gradients** (a paint server is a handful of stops however often it
+  is used; "gradient" = an element that is the only one with its id, so there is no doubt which element `url(#g)` reaches), and one of `radius` / `order` / `numOctaves`
+  (they set the cost of a filter primitive). **A `<style>` rule keeps its `url(#id)`** (Illustrator's "Internal CSS" writes
+  `.stN{clip-path:url(#SVGID_n_)}`): `svg/rules.rs` reads every rule's *subject* (its last compound selector) and counts the
+  reference on each element that subject could match — the name, classes and id it spells out, nothing else (an ancestor, a
+  pseudo-class or an attribute test only narrows, so ignoring them over-counts), and **every** element when it cannot read the
+  selector (`*`, `svg|rect`, an escape). A rule that reaches the elements inside what it points at (`rect { mask: url(#m) }` over a
+  mask holding a rect) makes that mask refer to itself and is refused like any loop. **A later element repeating an `id` loses it**
+  (warning): usvg reaches the *last* element of an id through `url(#id)` and an href chain and the first through `<use>`, the guard
+  one, so the sanitiser leaves one — the first, which is also the browser's. A document whose filters, layers or overdraw
+  would take seconds a frame is refused when it is read
+  (`svg/cost.rs`: `feMorphology` radius, `feConvolveMatrix` order and `feTurbulence` octaves times the region, plus a pixmap per
+  isolated group and the pixels each path covers, all **at the scale resvg really draws with — every group's `transform`
+  multiplied on the way down, the `viewBox` one usvg puts on the root and an animated one included — and a region held to
+  resvg's own 5x canvas**; at a nominal 1080p when read, and again by the rasteriser on each moment's tree at the real size).
+  `svg::may_animate(src)` is false when the sanitised text has no animation element (a text test; `true` is only "maybe"), which is
+  what lets the engine keep such a title as one picture. Start and end are held to 24 h (`MAX_SVG_SECONDS`).
+  `natural_duration` (all animations settled; `None` for a still or an endless loop) is what
+  `add_svg_overlay` defaults the end to, held to 2–30 s (else 4 s; `SvgDoc::default_span`).
+  `SvgOverlay.template: Option<TemplateInstance>` is set when a title came from a motion template
+  (`core-project.md`, "Motion templates"): the controls and their values, skipped in the JSON when `None`.
+  Replacing the artwork through `SvgOverlayPatch.svg` clears it; the template values are changed through
+  `Project::set_template_values_parsed`, not the patch. `svg/splice.rs` is the id-addressed byte-range
+  splice (`Elements`, `Part::{Text, Attribute}`, `apply`) the controls ride on. Its helpers read an
+  attribute by the name the source spells (`xlink:href` is the XLink one, a bare `href` is not).
+  `SvgOverlayPatch` has `svg` (custom artwork), `preset_params` (re-fill) and `preset_kind` (another
+  preset, same id and draw order; `svg` excludes both, custom art refuses both). **Presets** (`SvgPresetKind`
+  `fade_up` / `typewriter` / `lower_third` / `word_pop`, `svg::render_preset`) are only SVG the
+  subset understands, drawn for a viewBox equal to the delivery frame (`Timeline::preset_frame`:
+  `format`, else 1920x1080), blank and static at their duration. `SvgOverlay.preset` remembers
+  how they were made, and **the artwork is re-made** when the span changes length, the params
+  change, the delivery format changes (`set_delivery_format`) and in `for_delivery` for a new
+  shape (custom art is only scaled). `slice` clips and shifts like text but adds the cut-off
+  front to `offset` (`SvgOverlay::doc_time(t)` = `t - start + offset`), so a range export or the
+  playback hand-over joins the animation part-way instead of replaying it. Ripple never moves
+  overlays; the diff reuses `OverlayAdded` / `Changed` / `Removed` with `overlay_id`
+  ("Added animated title “X” at 0:01.0–0:04.0"); `CutSummary.has_text` stays text-only. The catalogue and one
+  drawing of each preset are written to `frontend/src/lib/fixtures/svg-presets.json` for the browser harness
+  (`svg_preset_fixture_is_what_this_engine_does`; after an intended preset change run
+  `KERF_BLESS_SVG_PRESETS=1 cargo test -p kerf-core --no-default-features -- svg_preset_fixture`).
+- `timecode.rs` — SMPTE timecode at the timeline's `f64` rate: `TimecodeRate` (nominal base, frames
+  dropped per minute — drop-frame at 29.97 / 59.94, told by closeness to `30000/1001` / `60000/1001`),
+  `fields` / `frames` / `format` and `parse` (Premiere-style entry, relative `+` / `-`, a dropped label
+  read as its minute's first frame), all held to `MAX_TIMECODE_FRAME` so the TS mirror (`timecode.ts`) does
+  the same integer arithmetic in doubles. Pure; the frontend's tests replay its cases.
+- `hostile.rs` (only under `cfg(test)` or the `test-support` feature, which kerf-gpu, kerf-app and kerf-core's own integration tests turn on as a dev-dependency; never in a release build) — seeded mutation for robustness tests: every prefix, bounded
+  rounds of bit flips / inserted / deleted / duplicated bytes, and each number pushed to the edges of
+  `u32` / `i64` / `f64` (`number_variants`), each case under `catch_unwind`. Used by
+  `tests/hostile_input.rs` (caption files and their import, the stored timeline), `engine/cli/hostile_tests.rs`
+  (ffprobe JSON, source traits, silence / scene logs), `source_probe.rs`, kerf-gpu's y4m / `showinfo` and
+  kerf-app's settings; `frontend/src/lib/hostile-input.test.ts` is the page's twin. A panic found keeps its
+  input as a regression test.

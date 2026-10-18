@@ -30,7 +30,8 @@
 //! 5. keyframed opacity is a `geq` alpha rather than the RGB round trip, and a keyframed
 //!    zoom is the **last** stage of the clip's chain, after `fps` and after every effect,
 //!    mask and rotation ([`Animated`]);
-//! 6. a text overlay is on `between(t,start,end)`, end included;
+//! 6. a text overlay is on `between(t,start,end)`, end included (so is an animated SVG title,
+//!    which the plan only names: [`RenderPlan::svg`]);
 //! 7. the source frame is the `fps` filter's pick ([`Pick::Fps`], reproduced by
 //!    [`fps_pick`](crate::frame_pick::fps_pick)): a Motion plan holds **candidates** at a
 //!    clip's closing edge (the layers whose `enable` window contains the frame time), and
@@ -53,14 +54,15 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::clip_timing::{
-    clip_seek, clip_source_window, clips_with_fx, ffmpeg_frame_time, ClipFx, ClipTiming, FadeEdge, FadeStep, MotionKeys, Rational,
+    clip_seek, clip_source_window, clips_with_fx, ffmpeg_frame_time, graph_bt709_labels, ClipFx, ClipTiming, FadeEdge, FadeStep,
+    MotionKeys, Rational,
 };
 use crate::engine::{render_geometry, safe_color, valid_color, Container, ExportOptions};
 use crate::error::{Error, Result};
 use crate::frame_pick::{FpsPick, Pick};
 use crate::layer_geometry::Keyed;
 use crate::media::{MediaResolver, OriginalMedia, SourceMedia};
-use crate::model::{Asset, Hdr, Projection, Property, StreamKind, TextOverlay, Timeline, VideoEffect};
+use crate::model::{bt709_labels, Asset, Hdr, Projection, Property, StreamInfo, StreamKind, TextOverlay, Timeline, VideoEffect};
 use crate::plan_caps::{GpuCaps, LayerRef};
 use crate::render_plan::{
     clip_source_time, composite_matrix, Animated, CompositeColorPolicy, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe,
@@ -125,6 +127,10 @@ struct AssetFacts {
     duration: f64,
     /// `None` when the asset has no video picture of a known size.
     stream: Option<PlanStream>,
+    /// The original's first video stream, which the graph's BT.709 label is decided from: the
+    /// graph builders see the original's metadata whichever file is decoded (a proxy may be
+    /// smaller than HD, or tagged differently by the tone-map).
+    original: Option<StreamInfo>,
     projection: Option<Projection>,
 }
 
@@ -172,6 +178,9 @@ pub struct Planner {
     clips: Vec<PlannedClip>,
     tracks: Vec<TrackIndex>,
     overlays: Vec<PlannedText>,
+    /// The animated SVG titles' windows: a compositor draws none of them, so the plan only says
+    /// which are on screen (`RenderPlan::svg`).
+    svg: Vec<(Uuid, f64, f64)>,
 }
 
 impl Planner {
@@ -211,6 +220,7 @@ impl Planner {
         } else {
             Cow::Borrowed(assets)
         };
+        let originals = assets;
         let assets: &[Asset] = &decoded;
         // A rate FFmpeg would not parse is an error in either mode: nothing sensible can be
         // said about frames of a graph that does not build.
@@ -224,7 +234,8 @@ impl Planner {
         let facts: HashMap<Uuid, AssetFacts> = assets
             .iter()
             .zip(&media)
-            .map(|(a, m)| {
+            .zip(originals)
+            .map(|((a, m), original)| {
                 let stream = a
                     .streams
                     .iter()
@@ -237,6 +248,7 @@ impl Planner {
                     is_image: a.is_image(),
                     duration: a.duration,
                     stream,
+                    original: original.streams.iter().find(|s| s.kind == StreamKind::Video).cloned(),
                     projection: a.projection(),
                 };
                 (a.id, facts)
@@ -245,10 +257,18 @@ impl Planner {
 
         let mut clips: Vec<PlannedClip> = Vec::new();
         let mut by_track: Vec<(usize, Vec<usize>)> = Vec::new();
-        for (ti, ci, clip, fx) in clips_with_fx(&rendered, assets) {
+        // The export labels an untagged HD input BT.709 when another input of its graph names a
+        // matrix: over every clip of this cut, decided from the originals (a Still plan decides
+        // over the layers on screen instead, in `plan`).
+        let labels = graph_bt709_labels(&rendered, originals);
+        for (flat, (ti, ci, clip, fx)) in clips_with_fx(&rendered, assets).enumerate() {
             if rendered.tracks[ti].kind != StreamKind::Video {
                 continue;
             }
+            let fx = ClipFx {
+                label_bt709: labels[flat],
+                ..fx
+            };
             let timing = ClipTiming::new(clip, &fx);
             let effects = clip
                 .effects
@@ -333,6 +353,8 @@ impl Planner {
             })
             .collect();
 
+        let svg = rendered.svg_overlays.iter().map(|o| (o.id, o.start, o.end)).collect();
+
         let full_range_cut = clips.iter().any(|c| {
             c.asset
                 .as_ref()
@@ -358,6 +380,7 @@ impl Planner {
             clips,
             tracks,
             overlays,
+            svg,
         })
     }
 
@@ -518,6 +541,7 @@ impl Planner {
         let graph_time = ffmpeg_frame_time(frame.max(0) as u64, fps.num, fps.den);
         let tail_at = fps.exact_time(frame.max(0) as u64) + 1e-9;
         let mut layers = Vec::new();
+        let mut originals: Vec<Option<&StreamInfo>> = Vec::new();
         let mut pictureless = Vec::new();
         // A still's tail window is judged at the slot's start, which can be before `eval` (the `t`
         // it was asked for, inside the frame): look from there.
@@ -544,6 +568,11 @@ impl Planner {
                         name: asset.name.clone(),
                     });
                     continue;
+                };
+                originals.push(asset.original.as_ref());
+                let stream = PlanStream {
+                    label_bt709: motion && planned.fx.label_bt709,
+                    ..stream
                 };
                 let local = (eval - clip.timeline_start).max(0.0);
                 let reframe = clip.reframe_at(local).map(|pose| PlanReframe {
@@ -583,6 +612,7 @@ impl Planner {
                     stream,
                     transform: clip.transform_at(local),
                     color: clip.color_at(local),
+                    grade: clip.grade.clone(),
                     name: asset.name.clone(),
                     projection: asset.projection,
                     hdr: planned.hdr,
@@ -605,6 +635,11 @@ impl Planner {
                         reversed: clip.is_reversed(),
                     },
                 });
+            }
+        }
+        if !motion {
+            for (layer, label) in layers.iter_mut().zip(bt709_labels(&originals)) {
+                layer.stream.label_bt709 = label;
             }
         }
         let matrix = composite_matrix(&layers, self.canvas.policy).0;
@@ -631,6 +666,14 @@ impl Planner {
                 }
             })
             .collect();
+        // An animated title is on `between(t,start,end)` in an export frame and `start <= t < end`
+        // in a still, as a text overlay is.
+        let svg = self
+            .svg
+            .iter()
+            .filter(|(_, start, end)| eval >= *start && if motion { eval <= *end } else { eval < *end })
+            .map(|(id, ..)| *id)
+            .collect();
         Ok(RenderPlan {
             time: slot,
             mode: self.mode,
@@ -641,6 +684,7 @@ impl Planner {
             },
             layers,
             overlays,
+            svg,
             pictureless,
         })
     }
@@ -1596,6 +1640,63 @@ mod tests {
     }
 
     #[test]
+    fn curves_wheels_and_a_lut_are_refused_whatever_the_caps() {
+        use crate::model::{ClipLut, CurvePoint, Curves, Grade, Wheel, Wheels};
+        let a = asset();
+        let assets = [a.clone()];
+        let curves = Grade {
+            curves: Some(Curves {
+                master: vec![CurvePoint { x: 0.0, y: 1.0 }, CurvePoint { x: 1.0, y: 0.0 }],
+                ..Curves::default()
+            }),
+            ..Grade::default()
+        };
+        let wheels = Grade {
+            wheels: Some(Wheels {
+                shadows: Wheel {
+                    x: 0.3,
+                    y: 0.0,
+                    lightness: 0.0,
+                },
+                ..Wheels::default()
+            }),
+            ..Grade::default()
+        };
+        let lut = |intensity| Grade {
+            lut: Some(ClipLut {
+                path: "/missing/look.cube".into(),
+                intensity,
+            }),
+            ..Grade::default()
+        };
+        let all = GpuCaps {
+            motion: true,
+            keyed_opacity: true,
+            keyed_color: true,
+            ..GpuCaps::A0
+        };
+        for (grade, what) in [
+            (curves, Some("curves")),
+            (wheels, Some("colour wheels")),
+            (lut(1.0), Some("a 3D LUT")),
+            (lut(0.0), None),
+        ] {
+            let mut clip = make_clip(a.id, 0.0, 4.0, 0.0);
+            clip.grade = grade;
+            let tl = single(vec![clip]);
+            for mode in [PlanMode::Still, PlanMode::Motion] {
+                let plan = planner(&tl, &assets, mode, &opts(30.0)).at_frame(15).unwrap();
+                let why = plan.reasons(&all, plan.size(u32::MAX));
+                let found = why.iter().find_map(|u| match u {
+                    Unsupported::Grade(_, w) => Some(*w),
+                    _ => None,
+                });
+                assert_eq!(found, what, "{why:?}");
+            }
+        }
+    }
+
+    #[test]
     fn a_keyed_colour_is_sampled_per_frame_and_only_an_export_frame_is_refused_it() {
         use crate::model::{Property, PropertyKey};
         let a = asset();
@@ -1745,6 +1846,85 @@ mod tests {
         let half = |k: Keyframe| Keyframe { opacity: 0.5, ..k };
         bundle.keyframes = vec![half(keyed(0.0, 1.0, 0.0)), half(keyed(4.0, 1.5, 0.0))];
         assert!(!refused(bundle));
+    }
+
+    #[test]
+    fn an_animated_title_is_named_by_the_plan_and_refused_whatever_the_caps() {
+        let a = asset();
+        let mut tl = single(vec![make_clip(a.id, 0.0, 5.0, 0.0)]);
+        let mut title = crate::model::SvgOverlay {
+            id: Uuid::new_v4(),
+            name: String::new(),
+            svg: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"/>".to_string(),
+            start: 1.0,
+            end: 2.0,
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            opacity: 1.0,
+            offset: 0.0,
+            preset: None,
+            template: None,
+        };
+        let id = title.id;
+        let assets = [a];
+        let size = (1920, 1080);
+        // Without one nothing is named and nothing is refused on its account.
+        let none = planner(&tl, &assets, PlanMode::Motion, &opts(25.0)).at_frame(30).unwrap();
+        assert!(none.svg.is_empty() && !has(&none.reasons(&GpuCaps::A0, size), |u| matches!(u, Unsupported::Svg)));
+        let rate = planner(&tl, &assets, PlanMode::Motion, &opts(25.0)).canvas().fps;
+        title.end = rate.frame_time(50);
+        tl.svg_overlays.push(title);
+        let export = planner(&tl, &assets, PlanMode::Motion, &opts(25.0));
+        let still = planner(&tl, &assets, PlanMode::Still, &opts(25.0));
+        // As a text overlay is: through its end in an export frame, up to it in a still.
+        assert!(export.at_frame(24).unwrap().svg.is_empty());
+        assert_eq!(export.at_frame(25).unwrap().svg, vec![id]);
+        assert_eq!(export.at_frame(50).unwrap().svg, vec![id]);
+        assert!(export.at_frame(51).unwrap().svg.is_empty());
+        assert_eq!(still.at(rate.frame_time(30)).unwrap().svg, vec![id]);
+        assert!(still.at(rate.frame_time(50)).unwrap().svg.is_empty());
+        // No cap draws it: not the one A0 has, not one that draws everything a plan can hold.
+        let live = export.at_frame(30).unwrap();
+        let everything = GpuCaps {
+            motion: true,
+            text: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            keyed_opacity: true,
+            keyed_zoom: true,
+            keyed_color: true,
+            mask: true,
+            reframe: true,
+            hdr: true,
+            ..GpuCaps::A0
+        };
+        for caps in [GpuCaps::A0, everything] {
+            assert_eq!(
+                live.reasons(&caps, size)
+                    .iter()
+                    .filter(|u| matches!(u, Unsupported::Svg))
+                    .count(),
+                1
+            );
+        }
+        assert!(live.reasons(&everything, size).contains(&Unsupported::Svg));
+        assert_eq!(Unsupported::Svg.kind(), "svg");
+        assert_eq!(Unsupported::Svg.to_string(), "an animated SVG title is on screen");
+        assert!(!live.gpu_supported_at(size));
+        // The frames around it are drawn as ever.
+        assert!(export.at_frame(24).unwrap().reasons(&everything, size).is_empty());
+        // A span says where it starts and stops being drawn.
+        let span = export.span(0.0, 4.0, size, &everything);
+        let refused: Vec<_> = span
+            .runs()
+            .iter()
+            .filter(|r| !r.supported)
+            .map(|r| r.frames.clone())
+            .collect();
+        assert_eq!(refused, vec![25..51]);
     }
 
     #[test]

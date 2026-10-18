@@ -7,6 +7,7 @@ import {
 	dragPosition,
 	inkBox,
 	inkFromContext,
+	isVisibleAt,
 	packRows,
 	sampleOverlay,
 	scaledSize,
@@ -268,5 +269,43 @@ describe('the title box in the preview', () => {
 		const style = src.slice(src.indexOf('\t\t\t\t\t\t\t\tdata-title-box\n'), src.indexOf('</span>', src.indexOf('\t\t\t\t\t\t\t\tdata-title-box\n')));
 		expect(style).toContain('line-height:{ink.height}');
 		expect(style).not.toMatch(/[;"]height:/);
+	});
+});
+
+describe('packRows over text and animated titles', () => {
+	const svg = (id: string, start: number, end: number) => ({ id, start, end, name: '', svg: '', x: 0, y: 0, width: 1, height: 1, opacity: 1 });
+
+	test('takes anything with an id and a span, and packs the two kinds together', () => {
+		const text = overlay({ id: 't', start: 0, end: 4 });
+		const rows = packRows([text, svg('s1', 1, 3), svg('s2', 4, 6), svg('s3', 2, 5)]);
+		expect(rows.get('t')).toBe(0);
+		expect(rows.get('s1')).toBe(1);
+		expect(rows.get('s2')).toBe(0);
+		expect(rows.get('s3')).toBe(2);
+	});
+
+	test('items that tie keep the order they were given in', () => {
+		const rows = packRows([overlay({ id: 'text', start: 1, end: 2 }), svg('svg', 1, 2)]);
+		expect(rows.get('text')).toBe(0);
+		expect(rows.get('svg')).toBe(1);
+		const flipped = packRows([svg('svg', 1, 2), overlay({ id: 'text', start: 1, end: 2 })]);
+		expect(flipped.get('svg')).toBe(0);
+		expect(flipped.get('text')).toBe(1);
+	});
+
+	test('does not reorder or touch what it is given', () => {
+		const items = [svg('b', 3, 4), svg('a', 0, 1)];
+		packRows(items);
+		expect(items.map((i) => i.id)).toEqual(['b', 'a']);
+	});
+
+	test('an empty lane has no rows', () => {
+		expect(packRows([]).size).toBe(0);
+	});
+
+	test('isVisibleAt takes a span, as the engine draws between start and end inclusive', () => {
+		expect(isVisibleAt(svg('s', 1, 2), 1)).toBe(true);
+		expect(isVisibleAt(svg('s', 1, 2), 2)).toBe(true);
+		expect(isVisibleAt(svg('s', 1, 2), 2.01)).toBe(false);
 	});
 });

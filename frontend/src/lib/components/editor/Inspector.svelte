@@ -9,21 +9,36 @@
 	import EmptyState from './EmptyState.svelte';
 	import CheckRow from './CheckRow.svelte';
 	import SliderRow from './SliderRow.svelte';
+	import GradeSections from './GradeSections.svelte';
 	import TitlesControls from './TitlesControls.svelte';
+	import TemplateSection from './TemplateSection.svelte';
 	import MediaChips from './MediaChips.svelte';
+	import AnalysisRun from './AnalysisRun.svelte';
 	import AssetInspector from './AssetInspector.svelte';
 	import { analyzeMenuItems } from '#lib/analyze-menu';
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { contextMenu } from '#lib/context-menu.svelte';
 	import type { MenuItem } from '#lib/context-menu.svelte';
-	import { GENERATED_TITLE_FILL, MIN_TITLE, TITLE_SIZE_MAX, TITLE_SIZE_MIN, sampleOverlay } from '#lib/titles';
-	import type { TextOverlay } from '#lib/types';
+	import { GENERATED_TITLE_FILL, MIN_TITLE, SVG_TITLE_FILL, TITLE_SIZE_MAX, TITLE_SIZE_MIN, sampleOverlay } from '#lib/titles';
+	import type { SvgOverlay, SvgOverlayPatch, SvgPresetInfo, SvgPresetParams, TextOverlay } from '#lib/types';
 	import { clipDuration, DEFAULT_COLOR, DEFAULT_MASK, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '#lib/types';
 	import { COLOR_LOOKS, activeLook } from '#lib/style-presets';
 	import { MAX_GAIN } from '#lib/mixer';
 	import { AUDIO_FX, VIDEO_FX } from '#lib/effect-presets';
-	import { addTextHere, dropCaptions, makeCaptions } from '#lib/title-actions';
+	import {
+		addTextHere,
+		applySvgSource,
+		changePreset,
+		convertToCustom,
+		dropCaptions,
+		makeCaptions,
+		svgPresetInfos
+	} from '#lib/title-actions';
+	import { copyKeyframesOf, pasteKeyframesOnto, report } from '#lib/ops';
+	import { keyframeOffer } from '#lib/keyframe-copy';
+	import { SVG_PRESETS, svgDisplayName, takesParam } from '#lib/svg-titles';
+	import { untrack } from 'svelte';
 	import { needsCrop } from '#lib/smart-crop';
 	import { EASING_CHOICES, easingId } from '#lib/easing';
 	import {
@@ -43,10 +58,18 @@
 	import { toast } from '#lib/notifications.svelte';
 	import { settings } from '#lib/settings.svelte';
 	import { linkBadge, selectionUnits } from '#lib/link-ui';
-	import { clock, clockRange } from '#lib/clock';
+	import { timeDisplay } from '#lib/time-display.svelte';
 	import { parseColor, swatchHex, withPicked } from '#lib/title-color';
-	import { colorSummary, keyLabel, keyNeighbours, timingSummary } from '#lib/inspector-summary';
+	import {
+		colorSummary,
+		keyLabel,
+		keyNeighbours,
+		svgPlacementSummary,
+		svgSourceSummary,
+		timingSummary
+	} from '#lib/inspector-summary';
 	import { fitOffer, musicSummary } from '#lib/music-ui';
+	import MusicStructure from './MusicStructure.svelte';
 	import { DEGREES, NUMBER_COL, PERCENT, SECONDS, TIMES, readout, type RowSpec } from '#lib/slider-row';
 	import { FieldEdits } from '#lib/field-edit';
 	import { tip } from '#lib/tip';
@@ -59,9 +82,15 @@
 	interface Edit {
 		clipId: string | null;
 		overlayId: string | null;
+		svgId: string | null;
 		time: number;
 	}
-	const scope = $derived<Edit>({ clipId: editor.selectedClipId, overlayId: editor.selectedOverlayId, time: ui.time });
+	const scope = $derived<Edit>({
+		clipId: editor.selectedClipId,
+		overlayId: editor.selectedOverlayId,
+		svgId: editor.selectedSvgOverlayId,
+		time: ui.time
+	});
 	/** A fade of the clip the edit began on, held to that clip's length. */
 	function setFade(at: Edit, to: { fade_in?: number; fade_out?: number }) {
 		const c = clipOf(at);
@@ -97,15 +126,29 @@
 		return undefined;
 	};
 	const overlayOf = (at: Edit): TextOverlay | undefined => editor.overlays.find((o) => o.id === at.overlayId);
+	const svgOf = (at: Edit): SvgOverlay | undefined => editor.svgOverlays.find((o) => o.id === at.svgId);
 	/** Write a title field to the title it took focus on (see `fields`), with what was typed into it. */
-	function patchTitle(el: HTMLInputElement | HTMLSelectElement, patch: (typed: string) => Partial<Omit<TextOverlay, 'id' | 'keyframes'>>) {
+	function patchTitle(
+		el: HTMLInputElement | HTMLSelectElement,
+		patch: (typed: string) => Partial<Omit<TextOverlay, 'id' | 'keyframes'>>,
+		shown?: (o: TextOverlay) => string
+	) {
 		const { scope: at, text } = endEdit(el);
 		const ov = overlayOf(at);
-		if (ov) void run(() => editor.updateOverlay(ov.id, patch(text)));
+		if (!ov) return;
+		// A select changed from the keyboard while an edit is in flight or the proposal is on screen: its press is swallowed
+		// but its keys are not. Nothing is written, and it goes back to what the title has.
+		if (editor.locked) {
+			if (shown && el.isConnected) el.value = shown(ov);
+			return;
+		}
+		void run(() => editor.updateOverlay(ov.id, patch(text)));
 	}
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);
 	const kind = $derived(asset?.streams.some((s) => s.kind === 'video') ? 'video' : 'audio');
 	const hasAudio = $derived(asset?.streams.some((s) => s.kind === 'audio') ?? false);
+	/** The rate the clip's footage counts frames at — the In and Out are positions in *it*, not in the cut. */
+	const sourceFps = $derived(asset?.streams.find((s) => s.kind === 'video')?.fps || editor.fps);
 	/** A picture whose sound was detached plays none of its own: the audio clip linked to it
 	 *  does, and that is where the level, the fades of the *sound* and the effects belong. */
 	const soundDetached = $derived(clip?.source_audio === false);
@@ -300,6 +343,114 @@
 	const keyframes = $derived(clip?.keyframes ?? []);
 	const overlays = $derived(editor.overlays);
 	const overlay = $derived(editor.selectedOverlay);
+	const svgTitle = $derived(editor.selectedSvgOverlay);
+
+	// ---- animated SVG titles ---------------------------------------------------------------
+	// The artwork is the engine's; this edits the title around it (timing, placement, a preset's
+	// parameters) and, for custom artwork, its source. The page never draws the SVG itself.
+	let presetInfos = $state<SvgPresetInfo[]>([]);
+	$effect(() => {
+		if (!svgTitle?.preset || presetInfos.length) return;
+		svgPresetInfos().then(
+			(infos) => (presetInfos = infos),
+			() => {}
+		);
+	});
+	const presetInfo = $derived(svgTitle?.preset ? presetInfos.find((i) => i.kind === svgTitle.preset?.kind) : undefined);
+
+	/** A change to a title field written to the title it took focus on (see `fields`), with what was typed into it. A
+	 *  refusal is a toast, and the field goes back to what the title has (it would otherwise keep showing what was refused). */
+	async function patchSvg(
+		el: HTMLInputElement | HTMLSelectElement,
+		patch: (typed: string, o: SvgOverlay) => SvgOverlayPatch,
+		shown: (o: SvgOverlay) => string
+	) {
+		const { scope: at, text } = endEdit(el);
+		const o = svgOf(at);
+		if (!o) return;
+		if (editor.locked) {
+			if (el.isConnected) el.value = shown(o);
+			return;
+		}
+		try {
+			await editor.updateSvgOverlay(o.id, patch(text, o));
+		} catch (e) {
+			report(e);
+			const now = svgOf(at);
+			if (now && el.isConnected) el.value = shown(now);
+		}
+	}
+	/** Whether the playhead is inside the title, where the preview draws its placement box. */
+	const isVisibleNow = (o: SvgOverlay) => ui.time >= o.start && ui.time <= o.end;
+	/** A preset's parameters with one changed; a patch always carries all of them, since the backend fills what is left out
+	 *  with defaults. */
+	const presetPatch = (o: SvgOverlay, change: Partial<SvgPresetParams>): SvgOverlayPatch =>
+		o.preset ? { preset_params: { ...o.preset.params, ...change } } : {};
+
+	// The source box of a custom title: a draft that follows the title until it is edited, applied with Apply.
+	let draft = $state('');
+	let seeded = $state<{ id: string; text: string } | null>(null);
+	let sourceEl = $state<HTMLTextAreaElement | null>(null);
+	let sourceError = $state<string | null>(null);
+	let sourceWarnings = $state<string[]>([]);
+	let sourceRuns = $state<number | null>(null);
+	let applying = $state(false);
+	const draftDirty = $derived(svgTitle ? draft !== svgTitle.svg : false);
+
+	$effect(() => {
+		const id = svgTitle?.id ?? null;
+		const text = svgTitle?.svg ?? '';
+		untrack(() => {
+			if (!id) {
+				seeded = null;
+				return;
+			}
+			// Another title, or the same one changed underneath an untouched draft (an undo, an agent): take its source.
+			if (seeded === null || seeded.id !== id || draft === seeded.text) {
+				draft = text;
+				if (seeded?.id !== id) {
+					sourceError = null;
+					sourceWarnings = [];
+					sourceRuns = null;
+				}
+			}
+			seeded = { id, text };
+		});
+	});
+
+	// *Custom SVG…* and the lane menu's *Edit SVG source* ask for the source box: open its section and put the caret in it.
+	$effect(() => {
+		const id = ui.svgSourceFocus;
+		const el = sourceEl;
+		if (!id || !el || svgTitle?.id !== id || svgTitle.preset) return;
+		const section = el.closest('details');
+		if (section) section.open = true;
+		el.focus();
+		el.scrollIntoView({ block: 'nearest' });
+		ui.svgSourceFocus = null;
+	});
+
+	async function applySource() {
+		const o = svgTitle;
+		if (!o || applying) return;
+		applying = true;
+		sourceError = null;
+		try {
+			const check = await applySvgSource(o.id, draft);
+			sourceWarnings = check.warnings;
+			sourceRuns = check.natural_duration;
+			draft = check.svg;
+		} catch (e) {
+			sourceError = e instanceof Error ? e.message : String(e);
+			sourceWarnings = [];
+		} finally {
+			applying = false;
+		}
+	}
+	function revertSource() {
+		if (svgTitle) draft = svgTitle.svg;
+		sourceError = null;
+	}
 
 	function addVideoFx(kindKey: string) {
 		const c = clip;
@@ -340,9 +491,14 @@
 		const time = Math.max(0, ui.time - c.timeline_start);
 		void run(() => editor.addKeyframe(c.id, Math.round(time * 1000) / 1000));
 	}
-	function setEasing(k: { time: number }, id: string) {
+	function setEasing(el: HTMLSelectElement, k: { time: number }, was: string) {
+		// Pending, not disabled, so the keys still reach the select: nothing is written, and it goes back.
+		if (editor.locked) {
+			el.value = was;
+			return;
+		}
 		const c = clip;
-		const choice = EASING_CHOICES.find((e) => e.id === id);
+		const choice = EASING_CHOICES.find((e) => e.id === el.value);
 		if (!c || !choice) return;
 		void run(() => editor.setKeyframeEasing(c.id, k.time, choice.easing));
 	}
@@ -385,8 +541,16 @@
 		try {
 			await op();
 		} catch (e) {
-			toast.error(e instanceof Error ? e.message : String(e));
+			report(e);
 		}
+	}
+
+	/** A typed In / Out, asked of the port of the backend's own rules first (`trimRefusal`): footage the file does
+	 *  not have, a negative start, a lane it would land on — said at once, with the fields named as the Inspector names them. */
+	async function trimChecked(clipId: string, sourceIn?: number, sourceOut?: number) {
+		const why = editor.trimRefusal(clipId, sourceIn, sourceOut);
+		if (why) throw new Error(why);
+		await editor.trim(clipId, sourceIn, sourceOut);
 	}
 
 	// Right-click anywhere on the panel that isn't an editable field (those keep
@@ -427,9 +591,19 @@
 			await op();
 			toast(message, { action: { label: 'Undo', onClick: () => void editor.undo() } });
 		} catch (e) {
-			toast.error(e instanceof Error ? e.message : String(e));
+			report(e);
 		}
 	}
+
+	/** A field that is off while an edit is in flight or the proposal is on screen. It is read-only and `aria-disabled`,
+	 *  never `disabled`: a disabled field drops the keyboard focus the edit that is being written began in, and the
+	 *  next key goes nowhere. (`Btn`, `Chip`, `CheckRow`, `SliderRow` do the same through their `pending` / `disabled`.) */
+	const off = $derived(editor.locked ? { readonly: true, 'aria-disabled': true } : {});
+	/** The same for a `<select>` and a colour box, which have no read-only: the press that would open them is swallowed
+	 *  and `aria-disabled` says why. (While the proposal is on screen the whole panel is `inert`.) */
+	const swallow = (e: Event) => {
+		if (editor.locked) e.preventDefault();
+	};
 
 	// One height for every field in the panel (`--control-sm`), so a number, a text and a select sit on one line.
 	const FIELD = 'box-sizing:border-box;height:var(--control-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:var(--text-sm)';
@@ -471,7 +645,7 @@
 			{value}
 			{step}
 			min="0"
-			disabled={editor.busy}
+			{...off}
 			onfocus={noteFocus}
 			oninput={noteTyped}
 			oncompositionend={noteTyped}
@@ -490,6 +664,38 @@
 	</label>
 {/snippet}
 
+{#snippet timeRow(label: string, value: number, fps: number, onCommit: (v: number, at: Edit) => void)}
+	<!-- A time is typed as timecode or as seconds (`parseTime` takes either) and shown on a frame — the number
+	     field it replaces showed 4.633333 and took only seconds. -->
+	<label style={ROW_GRID}>
+		<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">{label}</span>
+		<input
+			type="text"
+			spellcheck="false"
+			autocomplete="off"
+			value={timeDisplay.field(value, fps)}
+			readonly={editor.locked}
+			aria-disabled={editor.locked || undefined}
+			aria-label={`${label}, as ${timeDisplay.mode === 'seconds' ? 'seconds' : 'timecode or seconds'}`}
+			onfocus={noteFocus}
+			oninput={noteTyped}
+			oncompositionend={noteTyped}
+			onchange={(e) => {
+				const { scope: at, text } = endEdit(e.currentTarget);
+				const v = timeDisplay.parseFrame(text, fps);
+				// Put the field back to what the clip has first: a refused entry then doesn't sit there
+				// showing something that was ignored, while an accepted one re-renders over this.
+				e.currentTarget.value = timeDisplay.field(value, fps);
+				if (editor.locked) return;
+				if (v === null) toast.error(`“${text.trim()}” is not a time — ${timeDisplay.hint()}`);
+				else onCommit(v, at);
+			}}
+			style="{inputCss};width:112px;grid-column:2 / 4;justify-self:end"
+		/>
+		<span aria-hidden="true" style="font-size:var(--text-sm);color:var(--text-muted)">{timeDisplay.mode === 'seconds' ? 's' : ''}</span>
+	</label>
+{/snippet}
+
 {#snippet keyToggle(prop: Property)}
 	{@const c = clip}
 	{@const keyed = c ? isKeyed(c, prop) : false}
@@ -497,7 +703,7 @@
 	<IconBtn
 		size={24}
 		active={here}
-		disabled={editor.busy}
+		pending={editor.locked}
 		title={here
 			? `Remove the ${keyLabel(prop)} keyframe at the playhead`
 			: keyed
@@ -522,7 +728,7 @@
 	onCommit: (v: number, at: Edit) => unknown,
 	animate?: Property
 )}
-	<SliderRow {label} {value} {spec} {scope} disabled={editor.busy} {onCommit}>
+	<SliderRow {label} {value} {spec} {scope} disabled={editor.locked} {onCommit}>
 		{#snippet keyframe()}
 			{#if animate}{@render keyToggle(animate)}{/if}
 		{/snippet}
@@ -550,7 +756,7 @@
 						type="text"
 						value={v}
 						use:tip={k}
-						disabled={editor.busy}
+						{...off}
 						onfocus={noteFocus}
 						oninput={noteTyped}
 						oncompositionend={noteTyped}
@@ -566,7 +772,7 @@
 						value={v as number}
 						use:tip={k}
 						step="0.1"
-						disabled={editor.busy}
+						{...off}
 						onfocus={noteFocus}
 						oninput={noteTyped}
 						oncompositionend={noteTyped}
@@ -583,7 +789,7 @@
 				size={28}
 				data-tone="quiet"
 				title={`Remove ${String(e.type).replace('_', ' ')}`}
-				disabled={editor.busy}
+				pending={editor.locked}
 				onclick={() => onRemove(i)}
 				style="margin-left:auto"><Icon n="x" s={14} /></IconBtn
 			>
@@ -591,11 +797,12 @@
 	{/each}
 	<select
 		class="k-select"
-		disabled={editor.busy}
+		aria-disabled={editor.locked || undefined}
+		onmousedown={swallow}
 		onchange={(ev) => {
 			const v = ev.currentTarget.value;
 			ev.currentTarget.value = '';
-			if (v) onAdd(v);
+			if (v && !editor.locked) onAdd(v);
 		}}
 		style="width:100%;margin-top:4px"
 	>
@@ -625,16 +832,17 @@
 				class="k-swatch"
 				value={swatchHex(value)}
 				data-empty={parsed ? undefined : ''}
-				disabled={editor.busy}
+				aria-disabled={editor.locked || undefined}
+				onclick={swallow}
 				aria-label="{name}: pick a color"
 				onfocus={noteFocus}
-				onchange={(e) => patchTitle(e.currentTarget, (picked) => patch(withPicked(value, picked, boxAlpha)))}
+				onchange={(e) => patchTitle(e.currentTarget, (picked) => patch(withPicked(value, picked, boxAlpha)), () => swatchHex(value))}
 			/>
 			<input
 				type="text"
 				{value}
 				placeholder={empty}
-				disabled={editor.busy}
+				{...off}
 				aria-label={name}
 				onfocus={noteFocus}
 				oninput={noteTyped}
@@ -671,13 +879,13 @@
 		On its own lane, independent of the clips beneath it. Drag it in the preview to move it, or a corner to resize.
 	</div>
 
-	<InspectorSection title="Text" summary={clockRange(o.start, o.end)} open>
+	<InspectorSection title="Text" summary={timeDisplay.range(o.start, o.end)} open>
 		<label style={ROW_GRID}>
 			<span style="font-size:12px;color:var(--text-muted)">Text</span>
 			<input
 				type="text"
 				value={o.text}
-				disabled={editor.busy}
+				{...off}
 				onfocus={noteFocus}
 				oninput={noteTyped}
 				oncompositionend={noteTyped}
@@ -685,11 +893,11 @@
 				style="{textCss};grid-column:2 / 5;min-width:0"
 			/>
 		</label>
-		{@render numRow('Start', o.start, 0.1, (v, at) => {
+		{@render timeRow('Start', o.start, editor.fps, (v, at) => {
 			const ov = overlayOf(at);
 			if (ov) void run(() => editor.retimeOverlay(ov.id, Math.min(v, Math.max(0, ov.end - MIN_TITLE)), ov.end));
 		})}
-		{@render numRow('End', o.end, 0.1, (v, at) => {
+		{@render timeRow('End', o.end, editor.fps, (v, at) => {
 			const ov = overlayOf(at);
 			if (ov) void run(() => editor.retimeOverlay(ov.id, ov.start, Math.max(v, ov.start + MIN_TITLE)));
 		})}
@@ -706,9 +914,10 @@
 			<select
 				class="k-select"
 				value={o.font ?? ''}
-				disabled={editor.busy}
+				aria-disabled={editor.locked || undefined}
+				onmousedown={swallow}
 				onfocus={noteFocus}
-				onchange={(e) => patchTitle(e.currentTarget, (typed) => ({ font: typed }))}
+				onchange={(e) => patchTitle(e.currentTarget, (typed) => ({ font: typed }), (t) => t.font ?? '')}
 				style="grid-column:2 / 5"
 			>
 				<option value="">Default</option>
@@ -719,7 +928,7 @@
 		</label>
 		<CheckRow
 			checked={o.bold}
-			disabled={editor.busy}
+			pending={editor.locked}
 			onfocus={noteFocus}
 			onchange={(e) => patchTitle(e.currentTarget, () => ({ bold: e.currentTarget.checked }))}
 		>
@@ -741,7 +950,7 @@
 						size={28}
 						data-tone="quiet"
 						title={`Remove the keyframe at ${k.time.toFixed(2)}s`}
-						disabled={editor.busy}
+						pending={editor.locked}
 						onclick={() => removeOverlayKeyframe(o, i)}><Icon n="x" s={14} /></IconBtn
 					>
 				</div>
@@ -749,7 +958,7 @@
 			<Btn
 				size="sm"
 				style="margin-top:4px"
-				disabled={editor.busy}
+				pending={editor.locked}
 				onclick={() => run(() => editor.setOverlayKeyframes(o.id, []))}>Clear keyframes</Btn
 			>
 			<div style="font-size:12px;color:var(--text-muted);margin-top:4px;line-height:1.4">
@@ -770,14 +979,265 @@
 			icon="trash"
 			iconSize={13}
 			style="width:100%"
-			disabled={editor.busy}
+			pending={editor.locked}
 			onclick={() => run(() => editor.removeOverlay(o.id))}>Remove {o.generated ? 'caption' : 'title'}</Btn
 		>
 	</div>
 {/snippet}
 
+{#snippet presetColor(label: string, o: SvgOverlay, key: 'color' | 'accent')}
+	{@const value = o.preset?.params[key] ?? ''}
+	{@const parsed = parseColor(value)}
+	<div style={ROW_GRID}>
+		<span style="font-size:12px;color:var(--text-muted)">{label}</span>
+		<div style="grid-column:2 / 5;display:flex;align-items:center;gap:6px;min-width:0">
+			<input
+				type="color"
+				class="k-swatch"
+				value={swatchHex(value)}
+				data-empty={parsed ? undefined : ''}
+				aria-disabled={editor.locked || undefined}
+				onclick={swallow}
+				aria-label="{label}: pick a color"
+				onfocus={noteFocus}
+				onchange={(e) =>
+					patchSvg(
+						e.currentTarget,
+						(picked, t) => presetPatch(t, { [key]: withPicked(t.preset?.params[key], picked) }),
+						(t) => t.preset?.params[key] ?? ''
+					)}
+			/>
+			<input
+				type="text"
+				{value}
+				{...off}
+				aria-label={label}
+				onfocus={noteFocus}
+				oninput={noteTyped}
+				oncompositionend={noteTyped}
+				onchange={(e) => patchSvg(e.currentTarget, (typed, t) => presetPatch(t, { [key]: typed }), (t) => t.preset?.params[key] ?? '')}
+				style="{textCss};flex:1;min-width:0;font-family:var(--font-mono)"
+			/>
+		</div>
+	</div>
+{/snippet}
+
+{#snippet svgEditor(o: SvgOverlay)}
+	<div style="display:flex;gap:9px;align-items:center">
+		<div
+			style="width:40px;height:28px;border-radius:var(--radius-sm);flex:none;background:{SVG_TITLE_FILL};border:var(--line-width) solid var(--track-video-edge);display:grid;place-items:center;color:var(--text-on-video)"
+		>
+			<Icon n="orbit" s={14} />
+		</div>
+		<div style="flex:1;min-width:0">
+			<div
+				style="font-size:13px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+				use:tip={svgDisplayName(o)}
+			>
+				{svgDisplayName(o)}
+			</div>
+			<div style="margin-top:3px"><Badge tone="neutral">Animated title · {svgSourceSummary(o)}</Badge></div>
+		</div>
+	</div>
+	<div style="font-size:12px;color:var(--text-muted);line-height:1.4;margin-top:8px">
+		On the titles lane, drawn over the clips and under the text titles. {isVisibleNow(o)
+			? 'Drag its box in the preview to move it, or a corner to resize.'
+			: 'Move the playhead into it to place it in the preview.'}
+	</div>
+
+	{#if o.template}<TemplateSection {o} />{/if}
+
+	<InspectorSection title="Timing" summary={timingSummary(o.start, o.end - o.start)} open>
+		<label style={ROW_GRID}>
+			<span style="font-size:12px;color:var(--text-muted)">Name</span>
+			<input
+				type="text"
+				value={o.name}
+				placeholder={svgDisplayName({ name: '', preset: o.preset })}
+				{...off}
+				onfocus={noteFocus}
+				oninput={noteTyped}
+				oncompositionend={noteTyped}
+				onchange={(e) => patchSvg(e.currentTarget, (typed) => ({ name: typed }), (t) => t.name)}
+				style="{textCss};grid-column:2 / 5;min-width:0"
+			/>
+		</label>
+		{@render numRow('Start', o.start, 0.1, (v, at) => {
+			const t = svgOf(at);
+			if (t) void run(() => editor.updateSvgOverlay(t.id, { start: Math.min(v, Math.max(0, t.end - MIN_TITLE)) }));
+		})}
+		{@render numRow('End', o.end, 0.1, (v, at) => {
+			const t = svgOf(at);
+			if (t) void run(() => editor.updateSvgOverlay(t.id, { end: Math.max(v, t.start + MIN_TITLE) }));
+		})}
+	</InspectorSection>
+
+	<InspectorSection title="Placement" summary={svgPlacementSummary(o)} open>
+		{@render rangeRow('X', o.x, { min: 0, max: 1, step: 0.01, neutral: 0, ...PERCENT, limit: { min: -5, max: 5 } }, (v, at) => {
+			const t = svgOf(at);
+			if (t) return run(() => editor.updateSvgOverlay(t.id, { x: v }));
+		})}
+		{@render rangeRow('Y', o.y, { min: 0, max: 1, step: 0.01, neutral: 0, ...PERCENT, limit: { min: -5, max: 5 } }, (v, at) => {
+			const t = svgOf(at);
+			if (t) return run(() => editor.updateSvgOverlay(t.id, { y: v }));
+		})}
+		{@render rangeRow('Width', o.width, { min: 0.02, max: 1, step: 0.01, neutral: 1, ...PERCENT, limit: { min: 0.01, max: 10 } }, (v, at) => {
+			const t = svgOf(at);
+			if (t) return run(() => editor.updateSvgOverlay(t.id, { width: v }));
+		})}
+		{@render rangeRow('Height', o.height, { min: 0.02, max: 1, step: 0.01, neutral: 1, ...PERCENT, limit: { min: 0.01, max: 10 } }, (v, at) => {
+			const t = svgOf(at);
+			if (t) return run(() => editor.updateSvgOverlay(t.id, { height: v }));
+		})}
+		{@render rangeRow('Opacity', o.opacity, { min: 0, max: 1, step: 0.01, neutral: 1, ...PERCENT }, (v, at) => {
+			const t = svgOf(at);
+			if (t) return run(() => editor.updateSvgOverlay(t.id, { opacity: v }));
+		})}
+		<div style="font-size:12px;color:var(--text-muted);margin-top:4px;line-height:1.4">
+			The artwork is fitted inside this rectangle, centred, keeping its shape.
+		</div>
+	</InspectorSection>
+
+	{#if o.preset}
+		{@const preset = o.preset}
+		<InspectorSection title="Preset" summary={svgSourceSummary(o)} open>
+			<div role="group" aria-label="Preset" style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:6px">
+				{#each SVG_PRESETS as p (p.kind)}
+					<Chip
+						pressed={preset.kind === p.kind}
+						title={p.hint}
+						pending={editor.locked}
+						onclick={() => void changePreset(o, p.kind)}>{p.label}</Chip
+					>
+				{/each}
+			</div>
+			<label style={ROW_GRID}>
+				<span style="font-size:12px;color:var(--text-muted)">Text</span>
+				<input
+					type="text"
+					value={preset.params.text}
+					{...off}
+					onfocus={noteFocus}
+					oninput={noteTyped}
+					oncompositionend={noteTyped}
+					onchange={(e) => patchSvg(e.currentTarget, (typed, t) => presetPatch(t, { text: typed }), (t) => t.preset?.params.text ?? '')}
+					style="{textCss};grid-column:2 / 5;min-width:0"
+				/>
+			</label>
+			{#if takesParam(presetInfo, 'subtitle')}
+				<label style={ROW_GRID}>
+					<span style="font-size:12px;color:var(--text-muted)">Subtitle</span>
+					<input
+						type="text"
+						value={preset.params.subtitle ?? ''}
+						placeholder="none"
+						{...off}
+						onfocus={noteFocus}
+						oninput={noteTyped}
+						oncompositionend={noteTyped}
+						onchange={(e) =>
+							patchSvg(
+								e.currentTarget,
+								(typed, t) => presetPatch(t, { subtitle: typed.trim() === '' ? null : typed }),
+								(t) => t.preset?.params.subtitle ?? ''
+							)}
+						style="{textCss};grid-column:2 / 5;min-width:0"
+					/>
+				</label>
+			{/if}
+			{#if takesParam(presetInfo, 'color')}{@render presetColor('Color', o, 'color')}{/if}
+			{#if takesParam(presetInfo, 'accent')}{@render presetColor('Accent', o, 'accent')}{/if}
+			{#if takesParam(presetInfo, 'font')}
+				<label style={ROW_GRID}>
+					<span style="font-size:12px;color:var(--text-muted)">Font</span>
+					<select
+						class="k-select"
+						value={preset.params.font ?? ''}
+						aria-disabled={editor.locked || undefined}
+						onmousedown={swallow}
+						onfocus={noteFocus}
+						onchange={(e) =>
+							patchSvg(e.currentTarget, (typed, t) => presetPatch(t, { font: typed === '' ? null : typed }), (t) => t.preset?.params.font ?? '')}
+						style="grid-column:2 / 5"
+					>
+						<option value="">Default</option>
+						{#each ui.availableFonts as f (f)}
+							<option value={f}>{f}</option>
+						{/each}
+						{#if preset.params.font && !ui.availableFonts.includes(preset.params.font)}
+							<option value={preset.params.font}>{preset.params.font}</option>
+						{/if}
+					</select>
+				</label>
+			{/if}
+			<div style="font-size:12px;color:var(--text-muted);margin:6px 0;line-height:1.4">
+				Changing the preset makes a new title with the same text, timing and placement. Convert to custom to write the SVG yourself.
+			</div>
+			<Btn size="sm" icon="code-xml" pending={editor.locked} onclick={() => void convertToCustom(o)}>Convert to custom</Btn>
+		</InspectorSection>
+	{:else}
+		<InspectorSection title="SVG source" summary={draftDirty ? 'Edited' : o.template ? 'Template' : 'Custom'} open={!o.template}>
+			<textarea
+				bind:this={sourceEl}
+				bind:value={draft}
+				spellcheck="false"
+				autocomplete="off"
+				aria-label="SVG source"
+				rows="12"
+				style="{FIELD};display:block;width:100%;height:auto;min-height:160px;resize:vertical;padding:8px 10px;font-family:var(--font-mono);font-size:11px;line-height:1.5;white-space:pre;overflow:auto"
+			></textarea>
+			<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-top:6px">
+				<Btn size="sm" variant="primary" disabled={!draftDirty || applying || editor.busy} onclick={() => void applySource()}>Apply</Btn>
+				<Btn size="sm" variant="ghost" disabled={!draftDirty || applying} onclick={revertSource}>Revert</Btn>
+				{#if draftDirty}<span style="font-size:12px;color:var(--text-muted)">Not applied yet</span>{/if}
+			</div>
+			{#if sourceError}
+				<div
+					role="alert"
+					data-svg-error
+					style="margin-top:6px;font-size:12px;line-height:1.4;color:var(--red-400);background:color-mix(in srgb,var(--red-600) 14%,transparent);border-radius:var(--radius-sm);padding:6px 8px"
+				>
+					{sourceError}
+				</div>
+			{/if}
+			{#if sourceWarnings.length}
+				<ul
+					data-svg-warnings
+					style="margin:6px 0 0;padding:6px 8px 6px 22px;font-size:12px;line-height:1.4;color:var(--orange-400);background:var(--warning-surface);border-radius:var(--radius-sm)"
+				>
+					{#each sourceWarnings as w, i (i)}<li>{w}</li>{/each}
+				</ul>
+			{/if}
+			{#if sourceRuns !== null}
+				<div style="font-size:12px;color:var(--text-muted);margin-top:6px;line-height:1.4">
+					The animation runs {sourceRuns.toFixed(1)} s; this title lasts {(o.end - o.start).toFixed(1)} s.
+				</div>
+			{/if}
+			<div style="font-size:12px;color:var(--text-muted);margin-top:6px;line-height:1.4">
+				SMIL animation (animate, set, animateTransform) is drawn; scripts, external images and CSS animations are not. Make the
+				viewBox the frame. Times count from the start of the title.
+			</div>
+		</InspectorSection>
+	{/if}
+
+	{#if !o.template && !o.preset}<TemplateSection {o} />{/if}
+
+	<div style="margin-top:18px">
+		<Btn
+			variant="destructive"
+			data-quiet
+			size="sm"
+			icon="trash"
+			iconSize={13}
+			style="width:100%"
+			pending={editor.locked}
+			onclick={() => run(() => editor.removeSvgOverlay(o.id))}>Remove animated title</Btn
+		>
+	</div>
+{/snippet}
+
 {#snippet overlaysSection()}
-	<InspectorSection title="Titles lane" summary={count((editor.timeline.overlays ?? []).length, 'item')} open>
+	<InspectorSection title="Titles lane" summary={count((editor.timeline.overlays ?? []).length + editor.svgOverlays.length, 'item')} open>
 		<TitlesControls />
 	</InspectorSection>
 {/snippet}
@@ -788,9 +1248,22 @@
 	style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden"
 >
 
-	<div style="flex:1;overflow-y:auto;padding:12px">
+	<!-- While the agent's proposal is previewed the cut on screen is not the project's, so what is selected here is
+	     the proposal's clip and nothing in this panel may edit it: it is `inert` (not reachable by pointer or key),
+	     and says why. -->
+	<div inert={editor.previewingStaged} style="flex:1;overflow-y:auto;padding:12px">
+		{#if editor.previewingStaged && (overlay || svgTitle || clip)}
+			<div
+				data-preview-readonly
+				style="margin-bottom:10px;padding:6px 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--agent-surface);font-size:11px;line-height:1.4;color:var(--agent-300)"
+			>
+				Previewing the agent's proposal — this is its clip, so the Inspector is read-only. Exit the preview to edit.
+			</div>
+		{/if}
 		{#if overlay}
 			{@render overlayEditor(overlay)}
+		{:else if svgTitle}
+			{@render svgEditor(svgTitle)}
 		{:else if clip}
 			{#if selectionUnits(editor.timeline, editor.selectedClipIds) > 1}
 				<!-- Several clips are selected but an edit here acts on one. Say which,
@@ -834,31 +1307,34 @@
 				     chips as the bin, and the same Analyze menu (the work is the asset's, not the clip's). -->
 				<div style="margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
 					<MediaChips assetId={asset.id} />
-					<Btn
-						size="sm"
-						variant="secondary"
-						icon="scan-line"
-						onclick={(e: MouseEvent) => {
-							const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-							contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), analyzeMenuItems(asset));
-						}}>Analyze</Btn
-					>
+					{#if ui.analyzing && ui.analyzingId === asset.id}
+						<div style="flex-basis:100%"><AnalysisRun /></div>
+					{:else}
+						<Btn
+							size="sm"
+							variant="secondary"
+							icon="scan-line"
+							onclick={(e: MouseEvent) => {
+								const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+								contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), analyzeMenuItems(asset));
+							}}>Analyze</Btn
+						>
+					{/if}
 				</div>
 			{/if}
 
-			<InspectorSection title="Timing" summary={timingSummary(clip.timeline_start, clipDuration(clip))} open>
-			{@render readRow('Start', clock(clip.timeline_start))}
-			{@render readRow('Duration', clock(clipDuration(clip)))}
+			<InspectorSection title="Timing" summary={timingSummary(clip.timeline_start, clipDuration(clip), (s) => timeDisplay.fmt(s))} open>
+			{@render readRow('Start', timeDisplay.fmt(clip.timeline_start))}
+			{@render readRow('Duration', timeDisplay.fmt(clipDuration(clip)))}
 
 			<div class="k-overline" style="margin:12px 0 4px">Trim source</div>
-			{@render readRow('Source range', clockRange(clip.source_in, clip.source_out))}
-			{@render numRow('In', clip.source_in, 0.1, (v, at) => {
+			{@render timeRow('In', clip.source_in, sourceFps, (v, at) => {
 				const c = clipOf(at);
-				if (c) void run(() => editor.trim(c.id, v, undefined));
+				if (c) void run(() => trimChecked(c.id, v, undefined));
 			})}
-			{@render numRow('Out', clip.source_out, 0.1, (v, at) => {
+			{@render timeRow('Out', clip.source_out, sourceFps, (v, at) => {
 				const c = clipOf(at);
-				if (c) void run(() => editor.trim(c.id, undefined, v));
+				if (c) void run(() => trimChecked(c.id, undefined, v));
 			})}
 			</InspectorSection>
 
@@ -891,7 +1367,7 @@
 					<Btn
 						size="sm"
 						icon="film"
-						disabled={editor.busy || musicOffer.reason !== null}
+						pending={editor.locked} disabled={musicOffer.reason !== null}
 						title={'Make this music last as long as the picture, repeating or dropping whole phrases'}
 						onclick={() => ui.openFitMusic(clip.id)}>Fit to video…</Btn
 					>
@@ -900,6 +1376,7 @@
 					{musicOffer.reason ??
 						'Repeats or drops whole phrases on bar lines, keeping the intro and the ending, until the music lasts as long as the picture.'}
 				</div>
+				<div style="margin-top:10px"><MusicStructure assetId={clip.asset_id} {music} /></div>
 				</InspectorSection>
 			{/if}
 
@@ -913,7 +1390,7 @@
 				const c = clipOf(at);
 				if (c) return run(() => editor.setSpeed(c.id, (c.speed ?? 1) < 0 ? -v : v));
 			})}
-			<CheckRow checked={speed < 0} disabled={editor.busy} onchange={() => run(() => editor.setSpeed(clip.id, -speed))}>
+			<CheckRow checked={speed < 0} pending={editor.locked} onchange={() => run(() => editor.setSpeed(clip.id, -speed))}>
 				Reverse
 			</CheckRow>
 			</InspectorSection>
@@ -945,7 +1422,7 @@
 							size="sm"
 							icon="diamond"
 							iconSize={12}
-							disabled={editor.busy}
+							pending={editor.locked}
 							onclick={() =>
 								run(() =>
 									editor.addReframeKeyframe(
@@ -957,12 +1434,12 @@
 						{#if reframeKeys.length}
 							<Btn
 								size="sm"
-								disabled={editor.busy}
+								pending={editor.locked}
 								onclick={() => run(() => editor.setReframeKeyframes(clip.id, []))}
 								>Clear {reframeKeys.length} key{reframeKeys.length === 1 ? '' : 's'}</Btn
 							>
 						{/if}
-						<Btn size="sm" disabled={editor.busy} onclick={() => run(() => editor.clearReframe(clip.id))}>Stop reframing</Btn>
+						<Btn size="sm" pending={editor.locked} onclick={() => run(() => editor.clearReframe(clip.id))}>Stop reframing</Btn>
 					</div>
 				{:else if sourceProjection}
 					<p style="font-size:12px;color:var(--text-muted);margin:0 0 6px;line-height:1.4">
@@ -971,7 +1448,7 @@
 					</p>
 					<Btn
 						size="sm"
-						disabled={editor.busy}
+						pending={editor.locked}
 						onclick={() => run(() => editor.setReframe(clip.id, { input: sourceProjection! }))}
 						>Reframe to flat</Btn
 					>
@@ -1000,7 +1477,7 @@
 						size="sm"
 						icon="crop"
 						iconSize={12}
-						disabled={editor.busy || !reframable}
+						pending={editor.locked} disabled={!reframable}
 						title={"Sample where this shot's content is and crop to the delivery frame around it"}
 						onclick={() =>
 							runUndoable('Framed for the delivery frame', () => editor.smartCrop(clip.id))}
@@ -1008,7 +1485,7 @@
 					>
 					<Btn
 						size="sm"
-						disabled={editor.busy || !hasCrop}
+						pending={editor.locked} disabled={!hasCrop}
 						title={'Clear the crop'}
 						onclick={() =>
 							run(() =>
@@ -1037,11 +1514,11 @@
 				<InspectorSection title="Color" summary={colorSummary(clip, col)}>
 				<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
 					<span class="k-overline" style="flex:1">Looks</span>
-					<Btn variant="ghost" size="sm" disabled={editor.busy} title={'Back to the ungraded picture'} onclick={() => setCol(DEFAULT_COLOR)}>Reset</Btn>
+					<Btn variant="ghost" size="sm" pending={editor.locked} title={'Back to the ungraded picture'} onclick={() => setCol(DEFAULT_COLOR)}>Reset</Btn>
 				</div>
 				<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px">
 					{#each COLOR_LOOKS as look (look.id)}
-						<Chip pressed={activeLook(col)?.id === look.id} disabled={editor.busy} onclick={() => setCol(look.color)}>{look.label}</Chip>
+						<Chip pressed={activeLook(col)?.id === look.id} pending={editor.locked} onclick={() => setCol(look.color)}>{look.label}</Chip>
 					{/each}
 				</div>
 				{@render rangeRow('Brightness', col.brightness, { min: -1, max: 1, step: 0.05, neutral: DEFAULT_COLOR.brightness }, (v, at) => setCol({ brightness: v }, at), 'brightness')}
@@ -1051,23 +1528,25 @@
 				{@render rangeRow('Gamma', col.gamma, { min: 0.1, max: 3, step: 0.05, neutral: DEFAULT_COLOR.gamma }, (v, at) => setCol({ gamma: v }, at), 'gamma')}
 				</InspectorSection>
 
+				<GradeSections {clip} />
+
 			<InspectorSection title="Mask" summary={mask ? (mask.shape === 'rect' ? 'Rectangle' : 'Ellipse') : 'None'}>
 			<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
 				<Chip
 					pressed={!mask}
-					disabled={editor.busy}
+					pending={editor.locked}
 					title={'No mask — the whole frame'}
 					onclick={() => run(() => editor.setMask(clip.id, null))}>None</Chip
 				>
 				<Chip
 					pressed={mask?.shape === 'rect'}
-					disabled={editor.busy}
+					pending={editor.locked}
 					title={'Cut this clip to a rectangle'}
 					onclick={() => patchMask({ shape: 'rect' })}>Rectangle</Chip
 				>
 				<Chip
 					pressed={mask?.shape === 'ellipse'}
-					disabled={editor.busy}
+					pending={editor.locked}
 					title={'Cut this clip to an ellipse'}
 					onclick={() => patchMask({ shape: 'ellipse' })}>Ellipse</Chip
 				>
@@ -1081,7 +1560,7 @@
 					patchMask({ height: v }, at))}
 				{@render rangeRow('Feather', mask.feather, { min: 0, max: 1, step: 0.01, neutral: DEFAULT_MASK.feather }, (v, at) =>
 					patchMask({ feather: v }, at))}
-				<CheckRow checked={!!mask.inverted} disabled={editor.busy} onchange={(e) => patchMask({ inverted: e.currentTarget.checked })}>
+				<CheckRow checked={!!mask.inverted} pending={editor.locked} onchange={(e) => patchMask({ inverted: e.currentTarget.checked })}>
 					Invert
 				</CheckRow>
 				<div style="font:var(--type-caption);color:var(--text-muted);margin:2px 0 6px">
@@ -1098,8 +1577,10 @@
 				<select
 					class="k-select"
 					value={transition?.kind ?? ''}
-					disabled={editor.busy}
-					onchange={(e) => {
+					aria-disabled={editor.locked || undefined}
+					onmousedown={swallow}
+						onchange={(e) => {
+						if (editor.locked) return;
 						const k = e.currentTarget.value as '' | TransitionKind;
 						if (!k) void run(() => editor.setTransition(clip.id, null));
 						else void run(() => editor.setTransition(clip.id, { kind: k, duration: transition?.duration ?? DEFAULT_TRANSITION_SECONDS }));
@@ -1133,14 +1614,39 @@
 					{@render fxBlock('Video effects', effects, VIDEO_FX, addVideoFx, setVideoFxParam, removeVideoFx)}
 
 					<InspectorSection title="Animation" summary={count(keyframes.length, 'keyframe')}>
+					{@const offer = keyframeOffer(editor.timeline, editor.keyframeSource, clip.id)}
+					<div style="display:flex;gap:7px;margin-bottom:6px">
+						<Btn
+							size="sm"
+							icon="copy"
+							iconSize={12}
+							style="flex:1"
+							pending={editor.locked || offer.copy.disabled}
+							title={offer.copy.reason ?? 'Remember this clip’s animation, to paste onto another clip'}
+							onclick={() => {
+								if (!offer.copy.disabled) copyKeyframesOf(clip.id);
+							}}>Copy keyframes</Btn
+						>
+						<Btn
+							size="sm"
+							icon="clipboard"
+							iconSize={12}
+							style="flex:1"
+							pending={editor.locked || offer.paste.disabled}
+							title={offer.paste.reason ?? 'Give this clip the copied clip’s animation (replaces the numbers it keys)'}
+							onclick={() => {
+								if (!offer.paste.disabled) void pasteKeyframesOnto(clip.id);
+							}}>Paste keyframes</Btn
+						>
+					</div>
 					<div style="display:flex;gap:7px;margin-bottom:4px">
-						<Btn size="sm" icon="diamond" iconSize={12} style="flex:1" disabled={editor.busy} onclick={addKeyframeHere}
+						<Btn size="sm" icon="diamond" iconSize={12} style="flex:1" pending={editor.locked} onclick={addKeyframeHere}
 							>Keyframe at playhead</Btn
 						>
 						{#if keyframes.length}
 							<Btn
 								size="sm"
-								disabled={editor.busy}
+								pending={editor.locked}
 								onclick={() => run(() => editor.clearKeyframes(clip.id))}>Clear</Btn
 							>
 						{/if}
@@ -1161,10 +1667,11 @@
 									<select
 										class="k-select"
 										value={current}
-										disabled={editor.busy}
-										use:tip={'How the clip moves from this keyframe to the next'}
+										aria-disabled={editor.locked || undefined}
+										onmousedown={swallow}
+																use:tip={'How the clip moves from this keyframe to the next'}
 										aria-label={`Easing after the keyframe at ${k.time.toFixed(2)} seconds`}
-										onchange={(e) => setEasing(k, e.currentTarget.value)}
+										onchange={(e) => setEasing(e.currentTarget, k, current)}
 										style="flex:none;width:104px"
 									>
 										{#each EASING_CHOICES as e (e.id)}
@@ -1179,7 +1686,7 @@
 									size={28}
 									data-tone="quiet"
 									title={`Remove keyframe ${i + 1}`}
-									disabled={editor.busy}
+									pending={editor.locked}
 									onclick={() => removeKeyframe(i)}><Icon n="x" s={14} /></IconBtn
 								>
 							</div>
@@ -1203,8 +1710,12 @@
 							<select
 								class="k-select"
 								value={manualProjection}
-								disabled={editor.busy}
-								onchange={(e) => (manualProjection = e.currentTarget.value as Projection)}
+								aria-disabled={editor.locked || undefined}
+								onmousedown={swallow}
+						onchange={(e) => {
+							if (editor.locked) e.currentTarget.value = manualProjection;
+							else manualProjection = e.currentTarget.value as Projection;
+						}}
 								style="grid-column:2 / 5"
 							>
 								<option value="equirect">Equirectangular</option>
@@ -1216,7 +1727,7 @@
 							<Btn
 								size="sm"
 								icon="globe"
-								disabled={editor.busy}
+								pending={editor.locked}
 								onclick={() =>
 									run(async () => {
 										await editor.setAssetProjection(clip.asset_id, manualProjection);
@@ -1236,12 +1747,12 @@
 					size="sm"
 					icon="trash"
 					iconSize={13}
-					disabled={editor.busy}
+					pending={editor.locked}
 					onclick={() => runUndoable('Clip removed', () => editor.remove(clip.id))}>Remove clip</Btn
 				>
 				<Btn
 					size="sm"
-					disabled={editor.busy}
+					pending={editor.locked}
 					title={'Remove the clip and close the gap it leaves'}
 					onclick={() => runUndoable('Clip ripple-deleted', () => editor.rippleDelete(clip.id))}
 					>Ripple delete</Btn

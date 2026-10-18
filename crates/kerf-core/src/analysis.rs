@@ -61,7 +61,8 @@ fn waiting(wait: crate::engine::cpu::Wait) -> AnalysisProgress {
     }
 }
 
-/// Wait for the heavy-job slot in the background lane, saying why through `progress`, and
+/// Wait for the heavy-job slot in this thread's lane (the background lane, under
+/// `cpu::in_background` as analysis and refinement run), saying why through `progress`, and
 /// give up if `cancel` turns true while queued.
 fn wait_for_slot(progress: ProgressFn, cancel: CancelFn) -> Result<crate::engine::cpu::Lease> {
     crate::engine::cpu::lease_waiting(&mut |w| progress(waiting(w)), cancel)
@@ -79,14 +80,16 @@ pub type CancelFn<'a> = &'a dyn Fn() -> bool;
 /// The no-op cancel, for callers that never abandon a pass.
 pub(crate) const NEVER_CANCEL: CancelFn<'static> = &|| false;
 
-/// Detects silent spans in an asset's audio.
+/// Detects silent spans in an asset's audio. `cancel` is the pass's: a provider that runs a
+/// child process polls it and returns [`Error::Cancelled`] once it is true, so Stop ends the
+/// step in flight and not just the ones after it.
 pub trait SilenceDetector: Send + Sync {
-    fn detect_silence(&self, asset: &Asset) -> Result<Vec<TimeRange>>;
+    fn detect_silence(&self, asset: &Asset, cancel: CancelFn) -> Result<Vec<TimeRange>>;
 }
 
-/// Detects scene-change timestamps in an asset's video.
+/// Detects scene-change timestamps in an asset's video (see [`SilenceDetector`] for `cancel`).
 pub trait SceneDetector: Send + Sync {
-    fn detect_scenes(&self, asset: &Asset) -> Result<Vec<f64>>;
+    fn detect_scenes(&self, asset: &Asset, cancel: CancelFn) -> Result<Vec<f64>>;
 }
 
 /// Produces a timecoded transcript from an asset's audio.
@@ -95,12 +98,18 @@ pub trait SceneDetector: Send + Sync {
 /// first run, download a model — so unlike its siblings it reports progress.
 pub trait Transcriber: Send + Sync {
     fn transcribe(&self, asset: &Asset, progress: ProgressFn, cancel: CancelFn) -> Result<Vec<TranscriptSegment>>;
+
+    /// Whether [`Transcriber::transcribe`] already timed the words to the speech and labelled
+    /// the speakers, from the audio it decoded anyway, so nothing need decode it again.
+    fn refines(&self) -> bool {
+        false
+    }
 }
 
 /// Measures EBU R128 loudness of an asset's audio (`None` for silent / video-only
 /// assets).
 pub trait LoudnessAnalyzer: Send + Sync {
-    fn measure(&self, asset: &Asset) -> Result<Option<Loudness>>;
+    fn measure(&self, asset: &Asset, cancel: CancelFn) -> Result<Option<Loudness>>;
 }
 
 /// Derives rhythm metadata — onset timestamps, tempo / beat grid, and the
@@ -108,7 +117,7 @@ pub trait LoudnessAnalyzer: Send + Sync {
 /// because they share the decoded PCM: a provider can (and the ffmpeg one does)
 /// produce all of them from a single decode.
 pub trait RhythmAnalyzer: Send + Sync {
-    fn analyze_rhythm(&self, asset: &Asset) -> Result<Rhythm>;
+    fn analyze_rhythm(&self, asset: &Asset, cancel: CancelFn) -> Result<Rhythm>;
 }
 
 /// Silence detection backed by FFmpeg's `silencedetect` filter (run via the
@@ -130,8 +139,8 @@ impl Default for FfmpegSilenceDetector {
 }
 
 impl SilenceDetector for FfmpegSilenceDetector {
-    fn detect_silence(&self, asset: &Asset) -> Result<Vec<TimeRange>> {
-        crate::engine::detect_silence(std::path::Path::new(&asset.path), self.noise_db, self.min_silence)
+    fn detect_silence(&self, asset: &Asset, cancel: CancelFn) -> Result<Vec<TimeRange>> {
+        crate::engine::detect_silence_cancellable(std::path::Path::new(&asset.path), self.noise_db, self.min_silence, cancel)
     }
 }
 
@@ -150,9 +159,14 @@ impl Default for FfmpegSceneDetector {
 }
 
 impl SceneDetector for FfmpegSceneDetector {
-    fn detect_scenes(&self, asset: &Asset) -> Result<Vec<f64>> {
+    fn detect_scenes(&self, asset: &Asset, cancel: CancelFn) -> Result<Vec<f64>> {
         let proxy = crate::project::Project::scoring_proxy(asset);
-        crate::engine::detect_scenes_preferring(std::path::Path::new(&asset.path), proxy.as_deref(), self.threshold)
+        crate::engine::detect_scenes_preferring_cancellable(
+            std::path::Path::new(&asset.path),
+            proxy.as_deref(),
+            self.threshold,
+            cancel,
+        )
     }
 }
 
@@ -161,11 +175,11 @@ impl SceneDetector for FfmpegSceneDetector {
 pub struct FfmpegLoudnessAnalyzer;
 
 impl LoudnessAnalyzer for FfmpegLoudnessAnalyzer {
-    fn measure(&self, asset: &Asset) -> Result<Option<Loudness>> {
+    fn measure(&self, asset: &Asset, cancel: CancelFn) -> Result<Option<Loudness>> {
         if !asset.has_audio() {
             return Ok(None);
         }
-        let loudness = crate::engine::measure_loudness(std::path::Path::new(&asset.path))?;
+        let loudness = crate::engine::measure_loudness_cancellable(std::path::Path::new(&asset.path), cancel)?;
         // Silent material measures as non-finite LUFS, which is not meaningful
         // (and would not round-trip through JSON): treat it as no measurement.
         Ok(loudness.integrated_lufs.is_finite().then_some(loudness))
@@ -187,11 +201,11 @@ impl Default for FfmpegRhythmAnalyzer {
 }
 
 impl RhythmAnalyzer for FfmpegRhythmAnalyzer {
-    fn analyze_rhythm(&self, asset: &Asset) -> Result<Rhythm> {
+    fn analyze_rhythm(&self, asset: &Asset, cancel: CancelFn) -> Result<Rhythm> {
         if !asset.has_audio() {
             return Ok(Rhythm::default());
         }
-        crate::engine::analyze_rhythm(std::path::Path::new(&asset.path), self.sensitivity)
+        crate::engine::analyze_rhythm_cancellable(std::path::Path::new(&asset.path), self.sensitivity, cancel)
     }
 }
 
@@ -260,28 +274,40 @@ impl Transcriber for WhisperTranscriber {
         if cancel() {
             return Err(Error::Cancelled);
         }
-        let samples = crate::engine::decode_audio_16k_mono(std::path::Path::new(&asset.path))?;
+        let samples = std::sync::Arc::new(crate::engine::decode_audio_16k_mono_cancellable(
+            std::path::Path::new(&asset.path),
+            cancel,
+        )?);
         let language = self.language.clone();
         // In-process inference is as CPU-hungry as the ffmpeg filter backend, so
         // it takes the same heavy-job slot and the same share of the cores. The
         // lease is held here while the worker below does the work, which is what
         // the join makes safe.
-        let cpu = crate::engine::cpu::lease();
+        let cpu = crate::engine::cpu::lease_waiting(&mut |_| {}, cancel)?;
         let threads = cpu.threads();
 
         // whisper-rs wants a `'static` progress callback, and `full()` blocks
         // for the whole inference — so run it on a worker and pump percentages
         // back over a channel instead of holding a borrow across the call.
         let (tx, rx) = std::sync::mpsc::channel::<i32>();
-        let worker = std::thread::spawn(move || run_whisper_rs(samples, model, language, threads, tx));
+        let audio = std::sync::Arc::clone(&samples);
+        let worker = std::thread::spawn(move || run_whisper_rs(&audio, model, language, threads, tx));
         for pct in rx {
             progress(AnalysisProgress::with_fraction("transcribe", pct as f64 / 100.0));
         }
-        let segments = worker
+        let mut segments = worker
             .join()
             .map_err(|_| Error::Engine("whisper: transcription thread panicked".to_string()))??;
         progress(AnalysisProgress::with_fraction("transcribe", 1.0));
+        if !segments.is_empty() {
+            progress(refining());
+            crate::transcript::refine(&samples, &mut segments);
+        }
         Ok(segments)
+    }
+
+    fn refines(&self) -> bool {
+        true
     }
 }
 
@@ -289,7 +315,7 @@ impl Transcriber for WhisperTranscriber {
 /// [`WhisperTranscriber::transcribe`]; `progress` receives 0..=100 percentages.
 #[cfg(feature = "whisper")]
 fn run_whisper_rs(
-    samples: Vec<f32>,
+    samples: &[f32],
     model: std::path::PathBuf,
     language: Option<String>,
     threads: usize,
@@ -313,15 +339,18 @@ fn run_whisper_rs(
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
+    // Per-token times, from which each segment's words are assembled.
+    params.set_token_timestamps(true);
     params.set_progress_callback_safe(move |pct: i32| {
         // The receiver is gone only if the caller gave up; dropping is fine.
         let _ = progress.send(pct);
     });
 
     state
-        .full(params, &samples)
+        .full(params, samples)
         .map_err(|e| Error::Engine(format!("whisper: inference failed: {e}")))?;
 
+    let eot = ctx.token_eot();
     let mut segments = Vec::new();
     for i in 0..state.full_n_segments() {
         let Some(segment) = state.get_segment(i) else { continue };
@@ -336,10 +365,30 @@ fn run_whisper_rs(
             continue;
         }
         // whisper timestamps are in centiseconds.
+        let (start, end) = (
+            segment.start_timestamp() as f64 / 100.0,
+            segment.end_timestamp() as f64 / 100.0,
+        );
+        // Text tokens only: the special ones (end of text, timestamps, language…) sort after it.
+        let tokens: Vec<crate::transcript::TokenTiming> = (0..segment.n_tokens())
+            .filter_map(|t| segment.get_token(t))
+            .filter(|t| t.token_id() < eot)
+            .filter_map(|t| {
+                let data = t.token_data();
+                Some(crate::transcript::TokenTiming {
+                    bytes: t.to_bytes().ok()?.to_vec(),
+                    start: data.t0 as f64 / 100.0,
+                    end: data.t1 as f64 / 100.0,
+                    p: data.p,
+                })
+            })
+            .collect();
         segments.push(TranscriptSegment {
-            start: segment.start_timestamp() as f64 / 100.0,
-            end: segment.end_timestamp() as f64 / 100.0,
+            start,
+            end,
             text,
+            words: crate::transcript::words_from_tokens(&tokens, start, end),
+            ..Default::default()
         });
     }
     Ok(segments)
@@ -501,17 +550,87 @@ impl Transcriber for VoiceoverScript {
     }
 }
 
+/// The progress a refinement reports while it works.
+fn refining() -> AnalysisProgress {
+    AnalysisProgress {
+        stage: "transcribe".to_string(),
+        fraction: None,
+        detail: Some("timing words and labelling speakers".to_string()),
+    }
+}
+
+/// Re-time a transcript's words to the speech energy and label its speakers, from one
+/// 16 kHz mono decode of the asset (see [`crate::transcript`]). No model, so it is cheap next
+/// to transcription, but it is a whole-file decode: it waits in the background lane for the
+/// heavy-job slot (saying so through `progress`, giving up on `cancel`) and holds it. Static,
+/// for a caller that has released the project lock.
+pub fn refine_transcript_media(
+    asset: &Asset,
+    mut segments: Vec<TranscriptSegment>,
+    progress: ProgressFn,
+    cancel: CancelFn,
+) -> Result<Vec<TranscriptSegment>> {
+    crate::transcript::ensure_words(&mut segments);
+    if segments.is_empty() || !asset.has_audio() {
+        return Ok(segments);
+    }
+    crate::engine::cpu::in_background(|| {
+        let _slot = wait_for_slot(progress, cancel)?;
+        if cancel() {
+            return Err(Error::Cancelled);
+        }
+        progress(refining());
+        let audio = crate::engine::decode_audio_cancellable(
+            std::path::Path::new(&asset.path),
+            crate::transcript::SAMPLE_RATE,
+            1,
+            cancel,
+        )?;
+        if cancel() {
+            return Err(Error::Cancelled);
+        }
+        crate::transcript::refine(&audio.samples, &mut segments);
+        Ok(segments)
+    })
+}
+
+/// A transcriber whose lines come back with their words timed to the speech and their
+/// speakers labelled. A refinement that does not finish — a failed decode, or a cancel or a
+/// long wait for the slot cut short — keeps the transcript, with words spread by character
+/// share and no speakers: the transcription is the expensive part and is never thrown away.
+struct Refined(Box<dyn Transcriber>);
+
+impl Transcriber for Refined {
+    fn transcribe(&self, asset: &Asset, progress: ProgressFn, cancel: CancelFn) -> Result<Vec<TranscriptSegment>> {
+        let mut segments = self.0.transcribe(asset, progress, cancel)?;
+        if self.0.refines() {
+            crate::transcript::ensure_words(&mut segments);
+            return Ok(segments);
+        }
+        match refine_transcript_media(asset, segments.clone(), progress, cancel) {
+            Ok(refined) => Ok(refined),
+            Err(e) => {
+                if !matches!(e, Error::Cancelled) {
+                    tracing::warn!(error = %e, "could not time words or label speakers; keeping the transcript");
+                }
+                crate::transcript::ensure_words(&mut segments);
+                Ok(segments)
+            }
+        }
+    }
+}
+
 /// A no-op provider returning empty results. Useful as a default and for tests.
 pub struct NullAnalyzer;
 
 impl SilenceDetector for NullAnalyzer {
-    fn detect_silence(&self, _asset: &Asset) -> Result<Vec<TimeRange>> {
+    fn detect_silence(&self, _asset: &Asset, _cancel: CancelFn) -> Result<Vec<TimeRange>> {
         Ok(Vec::new())
     }
 }
 
 impl SceneDetector for NullAnalyzer {
-    fn detect_scenes(&self, _asset: &Asset) -> Result<Vec<f64>> {
+    fn detect_scenes(&self, _asset: &Asset, _cancel: CancelFn) -> Result<Vec<f64>> {
         Ok(Vec::new())
     }
 }
@@ -523,13 +642,13 @@ impl Transcriber for NullAnalyzer {
 }
 
 impl LoudnessAnalyzer for NullAnalyzer {
-    fn measure(&self, _asset: &Asset) -> Result<Option<Loudness>> {
+    fn measure(&self, _asset: &Asset, _cancel: CancelFn) -> Result<Option<Loudness>> {
         Ok(None)
     }
 }
 
 impl RhythmAnalyzer for NullAnalyzer {
-    fn analyze_rhythm(&self, _asset: &Asset) -> Result<Rhythm> {
+    fn analyze_rhythm(&self, _asset: &Asset, _cancel: CancelFn) -> Result<Rhythm> {
         Ok(Rhythm::default())
     }
 }
@@ -842,10 +961,12 @@ pub fn analyze_asset_steps(
     let transcriber: Box<dyn Transcriber> = if !kinds.contains(&AnalysisKind::Transcript) {
         Box::new(NullAnalyzer)
     } else if asset.voiceover.is_some() {
-        Box::new(VoiceoverScript)
+        Box::new(Refined(Box::new(VoiceoverScript)))
     } else {
-        default_transcriber()
-            .unwrap_or_else(|| Box::new(UnavailableTranscriber(transcription_backend().err().unwrap_or_default())))
+        match default_transcriber() {
+            Some(t) => Box::new(Refined(t)),
+            None => Box::new(UnavailableTranscriber(transcription_backend().err().unwrap_or_default())),
+        }
     };
     let providers = AnalysisProviders {
         silence: &silence,
@@ -918,12 +1039,15 @@ fn run_steps(
         let outcome = match kind {
             AnalysisKind::Silence => providers
                 .silence
-                .detect_silence(asset)
+                .detect_silence(asset, cancel)
                 .map(|v| run.patch.silence_segments = v),
-            AnalysisKind::Scenes => providers.scene.detect_scenes(asset).map(|v| run.patch.scene_changes = v),
-            AnalysisKind::Loudness => providers.loudness.measure(asset).map(|v| run.patch.loudness = v),
+            AnalysisKind::Scenes => providers
+                .scene
+                .detect_scenes(asset, cancel)
+                .map(|v| run.patch.scene_changes = v),
+            AnalysisKind::Loudness => providers.loudness.measure(asset, cancel).map(|v| run.patch.loudness = v),
             // One provider call for onsets + tempo + class: they share a single decode.
-            AnalysisKind::Rhythm => providers.rhythm.analyze_rhythm(asset).map(|r| {
+            AnalysisKind::Rhythm => providers.rhythm.analyze_rhythm(asset, cancel).map(|r| {
                 run.patch.onsets = r.onsets;
                 run.patch.tempo = r.tempo;
                 run.patch.audio_class = r.audio_class;
@@ -1008,19 +1132,19 @@ mod tests {
     struct Probe<'a>(&'a Fake, AnalysisKind);
 
     impl SilenceDetector for Probe<'_> {
-        fn detect_silence(&self, _: &Asset) -> Result<Vec<TimeRange>> {
+        fn detect_silence(&self, _: &Asset, _: CancelFn) -> Result<Vec<TimeRange>> {
             self.0.step(self.1)?;
             Ok(vec![TimeRange { start: 1.0, end: 2.0 }])
         }
     }
     impl SceneDetector for Probe<'_> {
-        fn detect_scenes(&self, _: &Asset) -> Result<Vec<f64>> {
+        fn detect_scenes(&self, _: &Asset, _: CancelFn) -> Result<Vec<f64>> {
             self.0.step(self.1)?;
             Ok(vec![5.0, 9.0])
         }
     }
     impl LoudnessAnalyzer for Probe<'_> {
-        fn measure(&self, _: &Asset) -> Result<Option<Loudness>> {
+        fn measure(&self, _: &Asset, _: CancelFn) -> Result<Option<Loudness>> {
             self.0.step(self.1)?;
             Ok(Some(Loudness {
                 integrated_lufs: -16.0,
@@ -1031,7 +1155,7 @@ mod tests {
         }
     }
     impl RhythmAnalyzer for Probe<'_> {
-        fn analyze_rhythm(&self, _: &Asset) -> Result<Rhythm> {
+        fn analyze_rhythm(&self, _: &Asset, _: CancelFn) -> Result<Rhythm> {
             self.0.step(self.1)?;
             Ok(Rhythm {
                 onsets: vec![0.5],
@@ -1056,6 +1180,7 @@ mod tests {
                 start: 0.0,
                 end: 1.0,
                 text: "hello".to_string(),
+                ..Default::default()
             }])
         }
     }
@@ -1076,6 +1201,51 @@ mod tests {
             rhythm: &rh,
         };
         analyze_steps(asset, kinds, &providers, &mut |_| {}, &mut |_| {}, NEVER_CANCEL)
+    }
+
+    /// The pass's cancel reaches the provider that is running, not only the gaps between steps:
+    /// a whole-file ffmpeg read used to run on to its end after Stop.
+    #[test]
+    fn a_running_step_is_handed_the_cancel_and_stops_when_it_trips() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let _gate = crate::engine::cpu::test_lock();
+        struct Slow;
+        impl SilenceDetector for Slow {
+            fn detect_silence(&self, _: &Asset, cancel: CancelFn) -> Result<Vec<TimeRange>> {
+                let started = Instant::now();
+                while !cancel() {
+                    if started.elapsed() > Duration::from_secs(20) {
+                        return Ok(vec![TimeRange { start: 0.0, end: 1.0 }]);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(Error::Cancelled)
+            }
+        }
+        let stop = AtomicBool::new(false);
+        let null = NullAnalyzer;
+        let mut providers = AnalysisProviders::null(&null);
+        providers.silence = &Slow;
+        let started = Instant::now();
+        let run = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(150));
+                stop.store(true, Ordering::SeqCst);
+            });
+            analyze_steps(
+                &asset(),
+                &[AnalysisKind::Silence, AnalysisKind::Scenes],
+                &providers,
+                &mut |_| {},
+                &mut |_| {},
+                &|| stop.load(Ordering::SeqCst),
+            )
+        });
+        assert!(run.cancelled, "the step in flight ended the pass");
+        assert!(run.patch.ran.is_empty() && run.failed.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
     }
 
     #[test]
@@ -1106,7 +1276,7 @@ mod tests {
         // …then silence is re-run and finds nothing this time, and loudness is untouched.
         struct Quiet;
         impl SilenceDetector for Quiet {
-            fn detect_silence(&self, _: &Asset) -> Result<Vec<TimeRange>> {
+            fn detect_silence(&self, _: &Asset, _: CancelFn) -> Result<Vec<TimeRange>> {
                 Ok(Vec::new())
             }
         }
@@ -1575,5 +1745,83 @@ mod tests {
         assert_eq!(nobackend.kinds[4].state, AnalysisState::Off);
         assert_eq!(nobackend.kinds[4].reason.as_deref(), Some("no speech-to-text backend"));
         assert_eq!(nobackend.kinds[0].state, AnalysisState::NotRun);
+    }
+
+    struct Canned;
+
+    impl Transcriber for Canned {
+        fn transcribe(&self, _: &Asset, _: ProgressFn, _: CancelFn) -> Result<Vec<TranscriptSegment>> {
+            Ok(vec![TranscriptSegment {
+                start: 0.0,
+                end: 2.0,
+                text: "hello there".into(),
+                ..Default::default()
+            }])
+        }
+    }
+
+    /// A refinement that does not finish — stopped while queued, or a decode that fails (the
+    /// asset's file is not there) — keeps the finished transcription, with estimated words.
+    #[test]
+    fn a_refinement_that_does_not_finish_keeps_the_transcription() {
+        let mut a = asset();
+        a.path = "/no-such-kerf-refine.wav".into();
+        let stopped: CancelFn = &|| true;
+        for cancel in [stopped, NEVER_CANCEL] {
+            let out = Refined(Box::new(Canned)).transcribe(&a, &mut |_| {}, cancel).unwrap();
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].words.len(), 2);
+            assert!(out[0].words.iter().all(|w| w.estimated));
+            assert_eq!(out[0].speaker, None);
+        }
+        assert!(matches!(
+            refine_transcript_media(&a, Canned.transcribe(&a, &mut |_| {}, stopped).unwrap(), &mut |_| {}, stopped),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn refining_a_silent_asset_only_estimates_its_words() {
+        let a = crate::engine::test_support::test_asset(vec![crate::engine::test_support::video_stream(1920, 1080, 30.0)]);
+        let lines = Canned.transcribe(&a, &mut |_| {}, NEVER_CANCEL).unwrap();
+        let out = refine_transcript_media(&a, lines, &mut |_| {}, &|| true).unwrap();
+        assert_eq!(out[0].words.len(), 2);
+        assert_eq!(out[0].speaker, None);
+    }
+
+    /// The refinement through the real ffmpeg decode: a 48 kHz stereo WAV with a tone in two
+    /// stretches comes back with its estimated words tightened to the tone and one speaker.
+    #[test]
+    #[ignore = "drives the ffmpeg binary"]
+    fn refining_decodes_the_asset_and_tightens_its_words() {
+        let dir = std::env::temp_dir().join(format!("kerf-refine-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("speech.wav");
+        let rate = 48_000u32;
+        let mut samples = Vec::new();
+        for i in 0..3 * rate as usize {
+            let t = i as f32 / rate as f32;
+            let v = if (0.5..1.0).contains(&t) || (1.5..2.5).contains(&t) {
+                0.3 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
+            } else {
+                0.0001
+            };
+            samples.extend([v, v]);
+        }
+        crate::engine::write_wav(&path, &crate::engine::AudioBuffer::new(rate, 2, samples)).unwrap();
+        let mut a = asset();
+        a.path = path.to_string_lossy().into_owned();
+        let line = TranscriptSegment {
+            start: 0.0,
+            end: 3.0,
+            text: "hello there".into(),
+            ..Default::default()
+        };
+        let out = refine_transcript_media(&a, vec![line], &mut |_| {}, NEVER_CANCEL).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let words = &out[0].words;
+        assert_eq!(words.len(), 2);
+        assert!(words[0].start >= 0.49 && words[1].end <= 2.51, "{words:?}");
+        assert_eq!(out[0].speaker.as_deref(), Some("S1"));
     }
 }

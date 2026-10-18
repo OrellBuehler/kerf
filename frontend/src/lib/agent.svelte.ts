@@ -8,11 +8,17 @@
 
 import { addTask, listTasks, removeTask, resolveTask } from './api';
 import { editor } from './state.svelte';
+import { TASK_PAGE, keepNewest } from './paging';
 import type { Task, TaskStatus } from './types';
 
 class AgentQueue {
 	tasks = $state<Task[]>([]);
 	error = $state<string | null>(null);
+	/** How many of the newest tasks are held; more are asked for (`showOlder`). Done tasks pile up for as long as the
+	 *  project lives, and the queue is re-read on every agent edit. */
+	limit = TASK_PAGE;
+	/** There may be tasks older than the ones held. */
+	more = $state(false);
 
 	/** True while an agent is actively working a task. */
 	get working(): boolean {
@@ -41,11 +47,23 @@ class AgentQueue {
 
 	async load() {
 		try {
-			this.tasks = await listTasks();
+			this.set(await listTasks(this.limit));
 			this.error = null;
 		} catch (e) {
 			this.error = this.#msg(e);
 		}
+	}
+
+	/** Hold a queue the backend answered with: the newest `limit` of it, and whether more may be behind. */
+	private set(tasks: Task[]) {
+		this.tasks = keepNewest(tasks, this.limit);
+		this.more = tasks.length >= this.limit;
+	}
+
+	/** Ask for another page of older tasks. */
+	async showOlder() {
+		this.limit += TASK_PAGE;
+		await this.load();
 	}
 
 	async add(prompt: string): Promise<Task | null> {
@@ -59,14 +77,14 @@ class AgentQueue {
 	/** Accept a task — and with it any edits staged under it, which the backend
 	 *  applies in the same call, so the timeline and history have to re-read. */
 	async resolve(taskId: string): Promise<void> {
-		this.tasks = await resolveTask(taskId);
+		this.set(await resolveTask(taskId));
 		await editor.refreshTimeline();
 		await editor.refreshHistory();
 	}
 
 	/** Dismiss a task, discarding any proposal staged under it. */
 	async remove(taskId: string): Promise<void> {
-		this.tasks = await removeTask(taskId);
+		this.set(await removeTask(taskId));
 		await editor.refreshTimeline();
 	}
 

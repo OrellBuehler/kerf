@@ -3,7 +3,9 @@
 	// failed) and one chip per analysis kind (silence, scenes, loudness, rhythm, transcript —
 	// done / not run / running / failed / off). The bin's rows and the inspector's header both
 	// draw this, from the same statuses (`mediaStatus`), so they cannot disagree. The tooltip
-	// of each carries the reason; state is never colour alone (a mark and a border style too).
+	// of each carries the reason; state is never colour alone (a mark and a border style too). A chip is a word
+	// (Silence, Scenes, Loudness, Rhythm, Transcript), not the two-to-four letter tag it used to be (SIL, SCN, LUFS,
+	// BPM, TXT): nobody should have to hover to learn what a green box says.
 	import Badge from './Badge.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { editor } from '#lib/state.svelte';
@@ -102,7 +104,7 @@
 					data-testid="analysis-chip"
 					data-kind={chip.kind}
 					data-state={chip.state}
-					style="display:inline-flex;align-items:center;gap:2px;height:17px;padding:0 4px;border-radius:var(--radius-sm);font-family:var(--font-mono);font-size:var(--text-2xs);font-weight:600;letter-spacing:0.02em;line-height:1;{LOOK[
+					style="display:inline-flex;align-items:center;gap:3px;height:19px;padding:0 6px;border-radius:var(--radius-sm);font-size:var(--text-2xs);font-weight:600;line-height:1;white-space:nowrap;{LOOK[
 						chip.state
 					]}"
 				>
@@ -112,7 +114,7 @@
 							style="width:7px;height:7px;border:1.5px solid currentColor;border-top-color:transparent;border-radius:50%"
 						></span>
 					{/if}
-					{chip.short}{MARK[chip.state]}
+					{chip.label}{#if MARK[chip.state]}<span aria-hidden="true">{MARK[chip.state]}</span>{/if}
 				</span>
 			{/each}
 		</span>

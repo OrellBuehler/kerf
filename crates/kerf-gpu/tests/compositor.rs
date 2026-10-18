@@ -59,6 +59,7 @@ fn timeline_of(clips: Vec<Clip>) -> Timeline {
             ..Track::new(StreamKind::Video, "V1")
         }],
         overlays: Vec::new(),
+        svg_overlays: Vec::new(),
         markers: Vec::new(),
         format: None,
         master: Default::default(),

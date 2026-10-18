@@ -12,7 +12,9 @@
 	import {
 		FIXED_KEYS,
 		GROUPS,
+		KEY_PRESETS,
 		actionDef,
+		keyPreset,
 		chordFromEvent,
 		displayChord,
 		filterActions,
@@ -20,6 +22,7 @@
 		sameChord,
 		type ActionDef,
 		type Chord,
+		type KeyPresetId,
 		type Rebind
 	} from '#lib/keymap';
 	import { tip } from '#lib/tip';
@@ -41,6 +44,8 @@
 		gives: Chord | null;
 	} | null>(null);
 	let confirmingReset = $state(false);
+	/** A preset picked while the keyboard has changes of its own: those are replaced only on Replace. */
+	let confirmingPreset = $state<KeyPresetId | null>(null);
 	/** What a screen reader is told after a change; the list itself is the visual. */
 	let announcement = $state('');
 
@@ -160,6 +165,40 @@
 		void focusSelector('[data-key-reset-all]');
 	}
 
+	const presetName = (id: KeyPresetId) => keyPreset(id)?.label ?? id;
+
+	function pickPreset(e: Event & { currentTarget: HTMLSelectElement }) {
+		const id = e.currentTarget.value as KeyPresetId;
+		if (!keyPreset(id) || id === settings.keyPreset) return;
+		// Only a keyboard of the user's own is asked about; another preset is just swapped.
+		if (changed > 0 && settings.keyPreset === null) {
+			// The select shows what is in force until the question is answered.
+			e.currentTarget.value = 'custom';
+			confirmingReset = false;
+			confirmingPreset = id;
+			return;
+		}
+		applyPreset(id);
+	}
+
+	function applyPreset(id: KeyPresetId) {
+		settings.applyKeyPreset(id);
+		confirmingPreset = null;
+		announcement = `The ${presetName(id)} shortcuts are in force.`;
+		void focusSelector('[data-key-preset]');
+	}
+
+	function keepPreset() {
+		confirmingPreset = null;
+		void focusSelector('[data-key-preset]');
+	}
+
+	function onPresetKey(e: KeyboardEvent) {
+		if (e.key !== 'Escape') return;
+		e.stopPropagation();
+		keepPreset();
+	}
+
 	function onSearchKey(e: KeyboardEvent) {
 		if (e.key !== 'Escape') return;
 		// An Escape that cancels an IME composition is the IME's, not ours — and
@@ -205,6 +244,24 @@
 	<div
 		style="flex:none;padding:12px 16px 10px;border-bottom:var(--line-width) solid var(--border-subtle);display:flex;flex-direction:column;gap:8px"
 	>
+		<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-secondary)">
+			<span>Preset</span>
+			<select
+				class="k-select"
+				data-key-preset
+				value={settings.keyPreset ?? 'custom'}
+				onchange={pickPreset}
+				aria-label="Keyboard preset"
+				style="min-width:160px"
+			>
+				{#each KEY_PRESETS as p (p.id)}
+					<option value={p.id}>{p.label}</option>
+				{/each}
+				{#if settings.keyPreset === null}
+					<option value="custom" disabled>Custom</option>
+				{/if}
+			</select>
+		</label>
 		<div style="display:flex;align-items:center;gap:8px">
 			<label
 				class="k-field"
@@ -237,7 +294,10 @@
 					: changed === 1
 						? 'Put the changed shortcut back to its default'
 						: `Put all ${changed} changed shortcuts back to their defaults`}
-				onclick={() => (confirmingReset = true)}>Reset all</Btn
+				onclick={() => {
+					confirmingPreset = null;
+					confirmingReset = true;
+				}}>Reset all</Btn
 			>
 		</div>
 		{#if confirmingReset}
@@ -257,6 +317,25 @@
 				>
 				<Btn variant="destructive" size="sm" onclick={resetEverything}>Reset</Btn>
 				<Btn variant="ghost" size="sm" data-autofocus onclick={keepShortcuts}>Keep</Btn>
+			</div>
+		{:else if confirmingPreset}
+			<!-- Escape here answers the question (Keep), as on the reset question. -->
+			<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+			<div
+				role="alertdialog"
+				aria-label="Use a keyboard preset"
+				tabindex="-1"
+				use:takeFocus
+				onkeydown={onPresetKey}
+				style="display:flex;align-items:center;gap:8px;min-height:30px"
+			>
+				<span style="flex:1;font-size:12px;color:var(--text-secondary)"
+					>Replace {changed === 1 ? 'the 1 changed shortcut' : `all ${changed} changed shortcuts`} with the {presetName(
+						confirmingPreset
+					)} keys?</span
+				>
+				<Btn variant="destructive" size="sm" onclick={() => confirmingPreset && applyPreset(confirmingPreset)}>Replace</Btn>
+				<Btn variant="ghost" size="sm" data-autofocus onclick={keepPreset}>Keep</Btn>
 			</div>
 		{:else}
 			<p style="margin:0;font-size:12px;line-height:1.5;min-height:30px;color:var(--text-muted)">

@@ -7,6 +7,7 @@
 
 import { tidyMenu } from './menu-items';
 import { windowOf } from './realm';
+import { holdTips } from './tip';
 
 export type MenuItem =
 	| {
@@ -48,9 +49,12 @@ class ContextMenuState {
 		this.y = e.clientY;
 		this.win = windowOf(node);
 		this.visible = true;
+		// A tip drawn over the menu would cover the labels being read; none shows until it closes.
+		holdTips(true);
 	}
 
 	close() {
+		holdTips(false);
 		this.visible = false;
 		this.items = [];
 		this.win = null;

@@ -11,10 +11,25 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 
 const MB: u64 = 1024 * 1024;
+
+/// How long a transfer may go without receiving a byte before it is given up on. The request
+/// has a connect timeout but a transfer is legitimately as long as a gigabyte takes, so the
+/// bound is on *silence*: a connection that stops delivering (a laptop that changed network, a
+/// proxy that dropped the stream) used to leave the read blocked for good, with Cancel unable
+/// to reach it.
+const DOWNLOAD_STALL: Duration = Duration::from_secs(60);
+
+/// How often a waiting transfer looks at its cancel.
+const POLL: Duration = Duration::from_millis(200);
+
+/// What a stalled transfer's error says, so [`fetch`] can tell it from a failure that left
+/// bytes it cannot trust: the prefix on disk is valid, and the next attempt resumes it.
+const STALLED: &str = "stalled";
 
 /// How far a download has got.
 #[derive(Debug, Clone, Copy)]
@@ -60,11 +75,11 @@ pub fn fetch(download: &Download, progress: &mut dyn FnMut(DownloadProgress), ca
 
     let tmp = dst.with_extension(format!("{}.part", std::process::id()));
     tracing::info!(what, %url, "downloading");
-    // A cancel keeps the `.part` file: it is a valid prefix of the download,
+    // A cancel or a stall keeps the `.part` file: it is a valid prefix of the download,
     // and the next attempt resumes it with a range request. Any other failure
     // is a file we can't trust, so it goes.
     stream_to_file(download, &tmp, progress, cancel).inspect_err(|e| {
-        if !matches!(e, Error::Cancelled) {
+        if !keeps_partial(e) {
             let _ = std::fs::remove_file(&tmp);
         }
     })?;
@@ -80,6 +95,11 @@ pub fn fetch(download: &Download, progress: &mut dyn FnMut(DownloadProgress), ca
     std::fs::rename(&tmp, dst).map_err(|e| Error::Engine(format!("could not finalize {what} download: {e}")))?;
     tracing::info!(what, path = %dst.display(), "download ready");
     Ok(dst.to_path_buf())
+}
+
+/// Whether a failed transfer leaves a `.part` file worth resuming: a cancel, or a stall.
+fn keeps_partial(e: &Error) -> bool {
+    matches!(e, Error::Cancelled) || matches!(e, Error::Engine(m) if m.contains(STALLED))
 }
 
 /// The host in `url`'s redirect chain that a DNS filter has sinkholed, with
@@ -109,6 +129,7 @@ fn blocked_host(url: &str) -> Option<(String, String)> {
             .max_redirects_will_error(false)
             .http_status_as_error(false)
             .timeout_connect(Some(std::time::Duration::from_secs(5)))
+            .timeout_global(Some(std::time::Duration::from_secs(15)))
             .build()
             .call()
             .ok()?;
@@ -185,6 +206,17 @@ pub(super) fn stream_to_file(
     progress: &mut dyn FnMut(DownloadProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<()> {
+    stream_to_file_within(download, tmp, progress, cancel, DOWNLOAD_STALL)
+}
+
+/// [`stream_to_file`] with the silence it tolerates spelled out (the tests shorten it).
+pub(super) fn stream_to_file_within(
+    download: &Download,
+    tmp: &Path,
+    progress: &mut dyn FnMut(DownloadProgress),
+    cancel: &dyn Fn() -> bool,
+    stall: Duration,
+) -> Result<()> {
     let Download {
         url, what, mirror_env, ..
     } = *download;
@@ -196,6 +228,12 @@ pub(super) fn stream_to_file(
     let mut request = ureq::get(url)
         .config()
         .timeout_connect(Some(std::time::Duration::from_secs(15)))
+        .timeout_resolve(Some(std::time::Duration::from_secs(15)))
+        .timeout_send_request(Some(std::time::Duration::from_secs(30)))
+        .timeout_recv_response(Some(std::time::Duration::from_secs(60)))
+        // A backstop for the reader thread below, which cannot be interrupted: it ends when its
+        // read returns. Hours, not minutes: this is the whole body of a gigabyte on a slow line.
+        .timeout_recv_body(Some(std::time::Duration::from_secs(6 * 60 * 60)))
         .build();
     if have > 0 {
         request = request.header("Range", &format!("bytes={have}-"));
@@ -203,7 +241,7 @@ pub(super) fn stream_to_file(
     // Name the URL: the fetch is redirected to a CDN host, so which lookup or
     // connect failed is otherwise invisible — and a resolver that works for the
     // browser (DNS-over-HTTPS, the system proxy) is not the one this uses.
-    let mut response = request.call().map_err(|e| {
+    let response = request.call().map_err(|e| {
         if let Some((host, answer)) = blocked_host(url) {
             return Error::Engine(format!(
                 "could not download {what}: {host} {answer}, which is how a DNS filter (Pi-hole, \
@@ -235,11 +273,33 @@ pub(super) fn stream_to_file(
         .open(tmp)
         .map_err(|e| Error::Engine(format!("could not open {what} download file: {e}")))?;
 
-    let mut reader = response.body_mut().as_reader();
-    let mut buf = vec![0u8; 256 * 1024];
+    // The body is read on a thread of its own, so the loop below can notice a cancel, and a
+    // connection that has gone quiet, while the read is blocked. The bounded channel is the
+    // backpressure: a slow disk fills it and throttles the read. After a cancel or a stall the
+    // thread ends on its next read (the receiver is gone) or when the backstop timeout fires.
+    let mut body = response.into_body().into_reader();
+    let (chunks, received) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(4);
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            match body.read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => {
+                    if chunks.send(Ok(buf[..n].to_vec())).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = chunks.send(Err(e));
+                    return;
+                }
+            }
+        }
+    });
     let mut downloaded = offset;
     progress(DownloadProgress { downloaded, total });
     let mut last_report = downloaded;
+    let mut heard = Instant::now();
     loop {
         if cancel() {
             // Flush what we have so the `.part` file is a usable prefix to
@@ -247,15 +307,25 @@ pub(super) fn stream_to_file(
             let _ = file.flush();
             return Err(Error::Cancelled);
         }
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| Error::Engine(format!("{what} download failed: {e}")))?;
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buf[..n])
+        let chunk = match received.recv_timeout(POLL.min(stall)) {
+            Ok(Ok(chunk)) => chunk,
+            Ok(Err(e)) => return Err(Error::Engine(format!("{what} download failed: {e}"))),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if heard.elapsed() >= stall {
+                    let _ = file.flush();
+                    return Err(Error::Engine(format!(
+                        "{what} download {STALLED}: no data for {} s (the next attempt resumes where this one stopped)",
+                        stall.as_secs().max(1)
+                    )));
+                }
+                continue;
+            }
+        };
+        heard = Instant::now();
+        file.write_all(&chunk)
             .map_err(|e| Error::Engine(format!("could not write {what}: {e}")))?;
-        downloaded += n as u64;
+        downloaded += chunk.len() as u64;
         // Report about every megabyte — one event per 256 KB read would flood
         // the IPC channel to the webview for no extra information.
         if downloaded - last_report >= MB {

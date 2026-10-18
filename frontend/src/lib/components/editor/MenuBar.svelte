@@ -60,8 +60,9 @@
 		canUndo: editor.canUndo,
 		canRedo: editor.canRedo,
 		hasClips: editor.timeline.tracks.some((t) => t.clips.length > 0),
+		hasMarkers: editor.markers.length > 0,
 		exporting: editor.exportRun !== null,
-		hasSelection: editor.selectedClipIds.length > 0 || editor.selectedOverlayId !== null,
+		hasSelection: editor.selectedClipIds.length > 0 || editor.selectedOverlayId !== null || editor.selectedSvgOverlayId !== null,
 		rippleMode: editor.rippleMode,
 		snap: ui.snap,
 		minimap: ui.minimap,
@@ -76,7 +77,9 @@
 		workspace: workspace.shown,
 		openPanels: workspace.open,
 		detachedPanels: popout.detached,
-		desktop: inTauri()
+		desktop: inTauri(),
+		previewing: editor.previewingStaged,
+		recent: settings.recent
 	});
 	const full = $derived(buildMenus(menuState));
 	const tops = $derived(compact ? collapseMenus(full) : full);

@@ -56,7 +56,7 @@ no longer stopped by its neighbours (it pushes them — only the source's footag
 links off: the trim applied to a scratch copy of the lanes, then `ripple.ts`'s `rippleFrom`,
 sync lock included — see Linked A/V below), because a left-edge trim keeps the clip's start
 rather than holding the right edge — one ghost per clip it moves, on whichever track, the
-moved clips dimmed, red and inert if the backend would decline the ripple. The bounds are asked again at every move
+moved clips dimmed, red and inert if the backend would decline the ripple. **A trim may not leave the trimmed clip on another clip of its lane** (judged after the ripple, which may make the room: `ripple.ts`'s `checkOwnLanes`, `Timeline::check_own_lanes`), nor ask for footage past the asset's end or before 0 — the same rule refuses an added clip, and `set_speed` is held to `MIN_SPEED..MAX_SPEED` (`link-ops.ts`, `clip-limits.test.ts`). The bounds are asked again at every move
 and at the release, since the mode can flip mid-drag. `load()` reads the flag on every
 load (so Open and New refresh it; `state-ripple.test.ts` pins that). *Selection* is a set: `selection.ts` holds every way of
 changing `selectedClipIds` + the primary (`selectedClipId`, the clip the Inspector edits —
@@ -209,7 +209,7 @@ a gesture that finishes an edge exactly on a magnet draws a full-height line at 
 `Start`, `Bar 12`, `Beat`, `Edge V1`, `Title edge`) — read off the *result* (`markAt` / `snapLines`: which of the marks in play the
 edge sits on), not from a second snap, so it cannot disagree with where the clip went; a frame the edge merely rounded to is
 on nothing, and nothing shows with snapping off. Clip moves, edge trims, roll, slide, titles and a bin drop have it. *Readouts*
-(`gesture-readout.ts`, one `readoutChip` snippet, the roll / slip / slide chip's look): an **edge trim** says
+(`gesture-readout.ts`, one `readoutChip` snippet, the roll / slip / slide chip's look; their times read in the interface's time mode — an optional `mode`, `time-format.ts`): an **edge trim** says
 `Trim out −12 f · −0.40 s · length 00:00:09:18` beside the pointer, amber when the pointer asked for more than the clip may
 have (`trimLimitWhy`: neighbour / footage / the 0.05 s floor / the cut's start), red with the engine's reason when a linked or
 rippling trim would be refused; the part the trim takes away is hatched; and `ui.trimMonitor` gets a one-cell monitor of the
@@ -245,8 +245,22 @@ frame *before* a title, where it is not yet on screen to select or drag. A **ste
 would otherwise round back onto the frame it shows, or skip one. A keyframe diamond seeks to the key exactly (`{ snap: 'exact' }`: keyframes are in seconds, and the Inspector's
 keyframe-at-playhead check has a tolerance that assumes the playhead is *at* the key). A scrub bar's hover chip says the frame a
 click would land on. It also **cannot stand past the end of the cut**: an effect in
-`+page.svelte` takes it back to the new end when an edit shortens the cut (an empty cut reads `00:00:00:00 / 00:00:00:00`).
+`+page.svelte` takes it back to the new end when an edit shortens the cut (an empty cut reads `00:00:00:00 / 00:00:00:00`). With nothing on the timeline the lane says *Drop media here to start cutting.* **in the first lane** (sticky, left of the clip's landing place) — it was centred over the whole stack and sat on the line between V1 and A1.
 The playhead's *head* lives in the sticky ruler, so it stays when the tracks scroll vertically.
+**The render bar** (`RenderBar.svelte`, `render-bar.ts`) is a 3 px strip along the ruler's top edge saying how the
+Preview will play each span, from `get_render_bar` (`kerf_core::render_bar`: the cut planned as a play session from
+its start, `PlayCut`, every grid frame judged at the Preview's width (`ui.previewWidth`); asked again 400 ms after the
+cut, the media, the GPU setting or that width changes, one request in flight and one more after it):
+**red** (`stall`) where playback stalls whoever plays it — a reversed clip (the stream's `reverse` and the GPU cursor
+both read the whole window first), a clip waiting for its proxy under Proxy only, a frame with no plan; with the GPU
+preview **on**, **green** (`gpu`) where the compositor draws the frame exactly and in time at the Preview's size and
+**yellow** (`stream`) where it hands over to the FFmpeg stream (a plan refusal by `Compositor::CAPS`, a moving title, a
+cut whose rate the playing preview does not draw); where nothing is drawn (an audio-only cut, muted video, a gap) there
+is no span;
+with it **off** (the default) the stream plays everything else and the bar shows only the red. The tooltip names the
+state, the span and the first frame's reason. What only a running session knows (self-test, untrusted seeks, a
+backend that is down) is not in it; a cut over 25 000 frames (about a pixel each) is judged every n-th frame. A proxy
+wait names the clip, not the build's progress, which the bar is not asked again for.
 **A clip with the keyboard focus nudges**: ← / → move it (and the selection it is part of) a frame, ⇧ a second, Alt leaves its
 linked partners (`nudge.ts`). A run of presses is one edit, written once the keys go quiet (450 ms), on Enter or when focus
 leaves; until then the clip is drawn where it will land as a drag is (the plan is `planMove`'s, so overlaps, locks and links
@@ -265,21 +279,29 @@ takes its selected sound up too, as on screen, not toward A2.
 gone): while `editor.previewingStaged`, added clips and titles are outlined solid in `--diff-add`, moved / trimmed / adjusted
 ones dashed in `--diff-shift` (the line style says it without the hue), a track the proposal adds or alters has a coloured bar on
 its header, and a clip or title it removes is a hatched `--diff-remove` ghost where it stood (under whatever now fills the space,
-with a strip along the lane's top that stays visible). The page's banner carries `‹ place 2/3 › · 5 changes` (places are the distinct times the
-changes sit at, `changePoints`; changes are the entries, so the two counts are not mixed) and a legend. Page Up / Page Down (and `[` / `]`, which
+with a strip along the lane's top that stays visible). The page's banner carries `‹ place 2 of 3 › · 5 changes in all` (places are the distinct times the
+changes sit at, `changePoints`; changes are the entries, so the two counts are not mixed), a legend and **Apply / Discard / Exit preview**. **The cut is read-only while it is previewed**: a press that would start a drag, an edge trim, a roll / slip / slide, a title drag or a marker drag does not start one (`holdForReview` remembers the press; the first move past the slop — or a razor click, or an arrow nudge — says "Exit the preview to edit", and the pointer going up, being cancelled or the window blurring ends the press), selecting still works, the toolbar's and the menus' editing controls are off with the reason (`heldForPreview`), and `editor` refuses any edit that gets through (frontend.md, *Agent panel*). The ruler's labels follow the time mode (`tickLabel`'s `mode`: `m:ss`, the fraction below a second). **Before it is previewed** a proposal is already on the timeline: a strip over the toolbar (`Agent proposes 4 changes — Tighten the intro · Preview · Apply · Discard`) and a faint dotted agent-hued frame on the live clips and titles it touches (`touchedOnLive`; what it only adds has no live clip to mark). Page Up / Page Down (and `[` / `]`, which
 need a layout that types them without AltGr or Option; not the arrows, which a focused button keeps) — `review.prevChange` / `review.nextChange`, rebindable, only while a
 proposal is on the timeline — step the playhead from place to place (`stepChange`, `snap: 'up'`). Page Up / Page Down scroll whichever panel has the keyboard, so the review takes
 them only from the editor surface (`focus-area.ts`: the page, the timeline or the preview — panels mark `data-editor-surface` — or
 the dock container around one); `[` / `]` work from anywhere. The mark is a frame drawn just
 inside the clip's border (`::after`, under `ClipOverlays` — handles, edges and the link badge draw over it — and
 `pointer-events: none`), not an outline, so the partner highlight and the focus ring still show on a marked clip.
-**One timecode** (`timecode.ts`): `HH:MM:SS:FF`, non-drop, hours always there so `00:00:20:15` is not read as
+**One timecode** (`timecode.ts`, the mirror of kerf-core `timecode.rs`; `timecode-entry.test.ts` replays its cases):
+`HH:MM:SS:FF`, **drop-frame `HH;MM;SS;FF` at 29.97 and 59.94** (told by closeness to `30000/1001` / `60000/1001`,
+since the rate is an `f64`), non-drop at every other rate, hours always there so `00:00:20:15` is not read as
 minutes:seconds:frames — the transport, the timeline's clock, the status bar, the ruler (`HH:MM:SS` for a whole-second
 step), the mark and marker tooltips, the trim readouts, the keyframe tooltips and the export range. `mm:ss.cc`
 survives only in the Inspector's editable seconds fields and in the prose that mirrors Rust (`diff.ts`
 `formatTime`). **The timeline's clock** is the ruler's corner (`data-timeline-time`: playhead in amber, `/`, the cut's length;
 an empty cut is `00:00:00:00`, not the lane's 8 s minimum); the toolbar's unlabelled length is gone, and ripple's cue there
-is its icon.
+is its icon. At a drop-frame rate the ruler labels are drop-frame too, frames and all (`tickLabel`), so a tick reads as the playhead would there; its ticks stay on whole frames of nominal seconds. **The playhead's timecode is typed into**
+(`TimecodeField.svelte`, in the clock and in the transport; **Go to timecode**, `playback.goToTimecode`, ⌘G by default,
+focuses the timeline's, else the transport's): `parseTimecode` reads Premiere-style entry — any of `:;.,` between
+fields, fewer fields filling from the right (`1.00` a second), bare digits as right-aligned pairs (`1000` is
+`00:00:10:00`), `+15` / `-1.00` relative to the frame shown, an overflowing field carried into the next first, a dropped drop-frame label as its minute's first frame, all-empty fields (`:`) refused.
+Enter seeks to the frame (`frameTime`); Escape, Tab or a click away leave the playhead alone; an unreadable entry
+turns red and stays.
 
 The transport's **scrub bar** (`ScrubBar.svelte`, `scrub.ts`) shows the time under the pointer on a chip above the rail
 (`chipLeft` keeps it inside the bar, and it follows the pointer while the bar is held) and a tick per marker (`markerTicks`:
@@ -353,6 +375,17 @@ strip** (`COLLAPSED_TITLE_PX`, `titleLaneHeightFor`): its header is one button (
 at the playhead, and the lane still takes a right-click and a marquee; the first title expands it to the full
 lane. (It does not open on hover: a lane that grows under the pointer on its way to a track moves the clip it
 was aiming at.)
+**Animated SVG titles share the titles lane.** `editor.svgOverlays` are drawn in the same packed rows as the text titles (`packRows` is
+generic over `{id, start, end}`: `packRows([...overlays, ...svgOverlays])`, ties keep the order given), as `.ktitle[data-kind="svg"]`
+blocks: a motion icon (`orbit`) before the display name (`svgDisplayName`: its name, else a preset's text, else `SVG`) on
+`SVG_TITLE_FILL` (the text-title colour drawn toward the video track's, held to 4.5:1 under `--text-on-video` by the theme guard) with a
+`--track-video-edge` edge, so it reads as artwork, not text. The gesture is the text title's — the same `titleDrag`, 6 px trim edges,
+the clip drag's snapping with **the edges of the other animated titles added to the text titles' as magnets** (`otherTitleEdges`;
+named `Title edge` on the snap line), a plain click selects and leaves the playhead alone, Escape / pointercancel / blur abandon — and
+it writes **one** `update_svg_overlay({start, end})` on release (a preset re-times its own artwork in that revision; `retimeOverlay`
+and its keyframe re-timing are for text only). Delete removes it, the item's menu is *Go to start* / *Edit SVG source* (custom
+only) / *Remove animated title*, and the lane's menu adds each preset or a custom one at the playhead. `Titles · N` and the collapsed
+strip count both kinds, and a staged proposal marks and ghosts them like titles.
 The **toolbar** is `ToolbarToggle`s (`frontend.md`, Shared components): tools | Undo / Redo on the left, then
 zoom | snapping and Ripple | the three track heights and the overview | `+ V` / `+ A` and the delivery frame on the right,
 a rule between each group. Every one is 24 px high with a 24 px target at least, and lit the same way (amber outline

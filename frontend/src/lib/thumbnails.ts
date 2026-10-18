@@ -51,6 +51,12 @@ export class ThumbCache {
 		this.#done.set(id, null);
 	}
 
+	/** Forget one asset's frame (its file was relinked to another). */
+	forget(id: string) {
+		this.#done.delete(id);
+		this.#inflight.delete(id);
+	}
+
 	/** Drop everything but the assets still in the project. */
 	prune(keep: Iterable<string>) {
 		const alive = new Set(keep);

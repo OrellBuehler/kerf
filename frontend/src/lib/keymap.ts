@@ -350,10 +350,11 @@ const ACTION_LIST = [
 	{
 		id: 'file.save',
 		repeat: false,
-		label: 'Save project as…',
+		label: 'Save project…',
 		group: 'project',
 		context: 'global',
-		defaults: ['Mod+S', 'Mod+Shift+S']
+		defaults: ['Mod+S', 'Mod+Shift+S'],
+		hint: 'Writes the project to a .kerf file you choose. Once it has a file, the same command saves a copy under a new name (the menu then says “Save project as…”).'
 	},
 	{ id: 'file.import', repeat: false, label: 'Import media…', group: 'project', context: 'global', defaults: ['Mod+I'] },
 	{ id: 'file.export', repeat: false, label: 'Export…', group: 'project', context: 'global', defaults: ['Mod+E'] },
@@ -364,7 +365,7 @@ const ACTION_LIST = [
 		group: 'project',
 		context: 'global',
 		defaults: [],
-		hint: 'Puts a .srt / .ass / .ssa file on the cut as captions, timed to the finished cut.'
+		hint: 'Puts a .srt / .vtt / .ass / .ssa file on the cut as captions, timed to the finished cut.'
 	},
 	{
 		id: 'file.saveCover',
@@ -374,6 +375,51 @@ const ACTION_LIST = [
 		context: 'global',
 		defaults: [],
 		hint: 'Writes the frame under the playhead, at the full delivery frame, as an image.'
+	},
+	{
+		id: 'file.exportCaptions',
+		repeat: false,
+		label: 'Export captions…',
+		group: 'project',
+		context: 'global',
+		defaults: [],
+		hint: "Writes the cut's captions as a .srt or .vtt file, timed as the export draws them."
+	},
+	{
+		id: 'file.exportOtio',
+		repeat: false,
+		label: 'Export OTIO…',
+		group: 'project',
+		context: 'global',
+		defaults: [],
+		hint: 'Hands the cut to another editor as OpenTimelineIO: every track, transitions, speed and markers.'
+	},
+	{
+		id: 'file.exportEdl',
+		repeat: false,
+		label: 'Export EDL…',
+		group: 'project',
+		context: 'global',
+		defaults: [],
+		hint: 'Writes the first video track as a CMX 3600 edit decision list.'
+	},
+	{
+		id: 'file.exportMarkers',
+		repeat: false,
+		label: 'Export markers as CSV…',
+		group: 'project',
+		context: 'global',
+		defaults: [],
+		hint: 'Every marker as a spreadsheet row: name, kind, timecode, comment.'
+	},
+	{
+		id: 'file.exportChapters',
+		repeat: false,
+		label: 'Export YouTube chapters…',
+		group: 'project',
+		context: 'global',
+		defaults: [],
+		hint: 'Chapter lines for a video description, from the chapter markers.'
 	},
 	{ id: 'app.settings', repeat: false, label: 'Settings…', group: 'project', context: 'global', defaults: ['Mod+,'] },
 	{ id: 'app.quit', repeat: false, label: 'Quit Kerf', group: 'project', context: 'global', defaults: [] },
@@ -385,6 +431,15 @@ const ACTION_LIST = [
 	{ id: 'edit.cut', repeat: false, label: 'Cut', group: 'edit', context: 'global', defaults: ['Mod+X'] },
 	{ id: 'edit.paste', repeat: false, label: 'Paste at playhead', group: 'edit', context: 'global', defaults: ['Mod+V'] },
 	{ id: 'edit.duplicate', repeat: false, label: 'Duplicate', group: 'edit', context: 'global', defaults: ['Mod+D'] },
+	{
+		id: 'edit.split',
+		repeat: false,
+		label: 'Split at playhead',
+		group: 'edit',
+		context: 'global',
+		defaults: ['Mod+K'],
+		hint: 'Cuts the selected clips the playhead is inside — or, with nothing selected, every clip under it — on the frame it is on. Linked clips are cut together.'
+	},
 	{
 		id: 'edit.delete',
 		repeat: false,
@@ -493,6 +548,60 @@ const ACTION_LIST = [
 		hint: 'Drag a clip along its track; the clips touching it give way.'
 	},
 	{
+		id: 'edit.rollBack',
+		repeat: false,
+		label: 'Roll the cut back one frame',
+		group: 'tools',
+		context: 'global',
+		defaults: ['<'],
+		hint: 'Moves the cut nearest the playhead (between two touching clips) one frame earlier: one clip gains what the other loses, nothing after the pair moves. The playhead follows the cut.'
+	},
+	{
+		id: 'edit.rollForward',
+		repeat: false,
+		label: 'Roll the cut forward one frame',
+		group: 'tools',
+		context: 'global',
+		defaults: ['>'],
+		hint: 'Moves the cut nearest the playhead one frame later; the playhead follows it.'
+	},
+	{
+		id: 'edit.slipBack',
+		repeat: false,
+		label: 'Slip the footage back one frame',
+		group: 'tools',
+		context: 'global',
+		defaults: ['Alt+,'],
+		hint: 'The selected clip stays where it is and shows a frame earlier in its footage.'
+	},
+	{
+		id: 'edit.slipForward',
+		repeat: false,
+		label: 'Slip the footage forward one frame',
+		group: 'tools',
+		context: 'global',
+		defaults: ['Alt+.'],
+		hint: 'The selected clip stays where it is and shows a frame later in its footage.'
+	},
+	{
+		id: 'edit.slideBack',
+		repeat: false,
+		label: 'Slide the clip back one frame',
+		group: 'tools',
+		context: 'global',
+		defaults: ['Mod+Alt+,'],
+		hint: 'The selected clip moves a frame earlier along its track; the clips touching it give way and its footage is unchanged.'
+	},
+	{
+		id: 'edit.slideForward',
+		repeat: false,
+		label: 'Slide the clip forward one frame',
+		group: 'tools',
+		context: 'global',
+		defaults: ['Mod+Alt+.'],
+		hint: 'The selected clip moves a frame later along its track; the clips touching it give way.'
+	},
+	{
 		id: 'tool.snap',
 		repeat: false,
 		label: 'Toggle snapping',
@@ -521,6 +630,15 @@ const ACTION_LIST = [
 	{ id: 'playback.jumpForward', label: 'Forward one second', group: 'playback', context: 'global', defaults: ['Shift+ArrowRight'] },
 	{ id: 'playback.toStart', label: 'Go to start', group: 'playback', context: 'global', defaults: ['Home'] },
 	{ id: 'playback.toEnd', label: 'Go to end', group: 'playback', context: 'global', defaults: ['End'] },
+	{
+		id: 'playback.goToTimecode',
+		repeat: false,
+		label: 'Go to timecode',
+		group: 'playback',
+		context: 'global',
+		defaults: ['Mod+G'],
+		hint: 'Opens the timeline’s timecode for typing: 1000 is ten seconds in, 1:00:00 a minute, +15 fifteen frames on, -1.00 a second back. Enter goes there.'
+	},
 
 	{ id: 'marker.add', repeat: false, label: 'Add marker at playhead', group: 'markers', context: 'global', defaults: ['M'] },
 	{ id: 'marker.prev', label: 'Previous marker', group: 'markers', context: 'global', defaults: [','] },
@@ -586,9 +704,18 @@ const ACTION_LIST = [
 	},
 
 	{
-		id: 'app.keyboard',
+		id: 'app.shortcuts',
 		repeat: false,
 		label: 'Keyboard shortcuts…',
+		group: 'help',
+		context: 'global',
+		defaults: ['?'],
+		hint: 'A read-only list of every shortcut in force. Customize keyboard shortcuts… is where they are changed.'
+	},
+	{
+		id: 'app.keyboard',
+		repeat: false,
+		label: 'Customize keyboard shortcuts…',
 		group: 'help',
 		context: 'global',
 		defaults: [],
@@ -975,4 +1102,122 @@ export function filterActions(query: string, bindings: Bindings, platform: Platf
 			.toLowerCase();
 		return words.every((w) => hay.includes(w));
 	});
+}
+
+// ---- presets -------------------------------------------------------------------
+
+export type KeyPresetId = 'kerf' | 'premiere' | 'resolve' | 'finalcut';
+
+/** A named keyboard: chords per action over the defaults, applied as ordinary overrides — so
+ *  resolving, conflicts and Reset treat them like any other customisation. Only actions Kerf has;
+ *  what another editor binds that Kerf cannot do is left out (`frontend.md` lists it). */
+export interface KeyPreset {
+	id: KeyPresetId;
+	label: string;
+	/** Chords per action id; an action left out keeps its defaults. */
+	bindings: Readonly<Record<string, readonly string[]>>;
+	/** Where a Mac's keys differ, over `bindings` there. */
+	mac?: Readonly<Record<string, readonly string[]>>;
+}
+
+export const KEY_PRESETS: readonly KeyPreset[] = [
+	{ id: 'kerf', label: 'Kerf', bindings: {} },
+	{
+		id: 'premiere',
+		label: 'Premiere Pro',
+		bindings: {
+			'file.new': ['Mod+Alt+N'],
+			'file.export': ['Mod+M'],
+			'file.saveCover': ['Mod+Shift+E'],
+			'app.keyboard': ['Mod+Alt+K'],
+			'app.quit': ['Mod+Q'],
+			'edit.clearSelection': ['Escape', 'Mod+Shift+A'],
+			'tool.rippleMode': ['B'],
+			'marker.prev': ['Mod+Shift+M'],
+			'marker.next': ['Shift+M'],
+			'range.clearIn': ['Mod+Shift+I'],
+			'range.clearOut': ['Mod+Shift+O'],
+			'view.zoomFit': ['\\']
+		},
+		mac: {
+			'file.saveCover': ['Shift+E'],
+			'range.clearIn': ['Alt+I'],
+			'range.clearOut': ['Alt+O']
+		}
+	},
+	{
+		id: 'resolve',
+		label: 'DaVinci Resolve',
+		bindings: {
+			'app.keyboard': ['Mod+Alt+K'],
+			'app.quit': ['Mod+Q'],
+			'edit.clearSelection': ['Escape', 'Mod+Shift+A'],
+			'edit.trimStart': ['{'],
+			'edit.trimEnd': ['}'],
+			'edit.link': ['Mod+Alt+L'],
+			'edit.split': ['Mod+\\'],
+			'tool.pointer': ['A'],
+			'tool.razor': ['B'],
+			'tool.roll': ['T'],
+			'tool.snap': ['N'],
+			'marker.prev': ['Shift+ArrowUp'],
+			'marker.next': ['Shift+ArrowDown'],
+			'range.clearIn': ['Alt+I'],
+			'range.clearOut': ['Alt+O'],
+			'view.zoomIn': ['Mod+='],
+			'view.zoomOut': ['Mod+-']
+		}
+	},
+	{
+		id: 'finalcut',
+		label: 'Final Cut Pro',
+		bindings: {
+			'file.save': ['Mod+S'],
+			'app.keyboard': ['Mod+Alt+K'],
+			'app.quit': ['Mod+Q'],
+			'edit.clearSelection': ['Escape', 'Mod+Shift+A'],
+			'edit.delete': ['Shift+Backspace', 'Shift+Delete'],
+			'edit.rippleDelete': ['Backspace', 'Delete'],
+			'edit.trimStart': ['Alt+['],
+			'edit.trimEnd': ['Alt+]'],
+			'edit.detachAudio': ['Ctrl+Shift+S'],
+			'edit.split': ['Mod+B'],
+			'tool.pointer': ['A'],
+			'tool.razor': ['B'],
+			'tool.roll': ['T'],
+			'tool.snap': ['N'],
+			'playback.goToTimecode': ['Ctrl+P'],
+			'marker.prev': ['Ctrl+;'],
+			'marker.next': ["Ctrl+'"],
+			'range.clearIn': ['Alt+I'],
+			'range.clearOut': ['Alt+O'],
+			'view.zoomIn': ['Mod+='],
+			'view.zoomOut': ['Mod+-']
+		}
+	}
+];
+
+export function keyPreset(id: string): KeyPreset | undefined {
+	return KEY_PRESETS.find((p) => p.id === id);
+}
+
+/** The table a preset puts into force on `platform`. */
+export function presetTable(preset: KeyPreset, platform: Platform): Record<string, readonly string[]> {
+	return { ...preset.bindings, ...(platform === 'mac' ? preset.mac : undefined) };
+}
+
+/** The overrides a preset is: what applying it stores, in place of whatever was there. */
+export function presetOverrides(preset: KeyPreset, platform: Platform, actions: readonly ActionDef[] = ACTIONS): KeyOverrides {
+	let o = emptyOverrides();
+	for (const [id, chords] of Object.entries(presetTable(preset, platform))) {
+		o = setActionChords(o, id, chords.flatMap((c) => parseChord(c, platform) ?? []), platform, actions);
+	}
+	return o;
+}
+
+/** The preset these overrides are exactly, or null for a keyboard of the user's own. */
+export function presetOf(o: KeyOverrides, platform: Platform, actions: readonly ActionDef[] = ACTIONS): KeyPresetId | null {
+	const same = (a: Record<string, string[]>, b: Record<string, string[]>) =>
+		Object.keys(a).length === Object.keys(b).length && Object.entries(a).every(([id, list]) => b[id] !== undefined && sameList(list, b[id]));
+	return KEY_PRESETS.find((p) => same(presetOverrides(p, platform, actions).bindings, o.bindings))?.id ?? null;
 }

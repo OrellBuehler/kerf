@@ -13,7 +13,17 @@ const read = (path: string) => readFileSync(join(SRC, path), 'utf8');
 const EDITOR = 'lib/components/editor/';
 const code = (css: string) => css.replace(/\/\*[\s\S]*?\*\//g, '');
 
-const DIALOGS = ['ExportDialog', 'SettingsDialog', 'UpdateDialog', 'VoiceoverDialog', 'FitMusicDialog', 'StemsDialog', 'AboutDialog'];
+const DIALOGS = [
+	'ExportDialog',
+	'SettingsDialog',
+	'UpdateDialog',
+	'VoiceoverDialog',
+	'FitMusicDialog',
+	'StemsDialog',
+	'AboutDialog',
+	'MarkerDialog',
+	'SaveTemplateDialog'
+];
 
 /** The opening `<Modal …>` tag of a dialog, whatever it spans. */
 function modalTag(name: string): string {
@@ -163,9 +173,11 @@ describe('SliderRow', () => {
 
 	test('a write goes to what the edit began on: no row reads the selection when it ends', () => {
 		// The click that selects another clip also blurs the field, and a typed entry is written on that blur.
-		for (const name of ['rangeRow', 'numRow']) {
+		// `timeRow` is the In / Out and a title's Start / End (typed as timecode or seconds); `numRow` is what is left.
+		const rows: Record<string, number> = { rangeRow: 4, numRow: 1, timeRow: 4 };
+		for (const [name, least] of Object.entries(rows)) {
 			const found = calls(inspector, name);
-			expect(found.length, name).toBeGreaterThan(3);
+			expect(found.length, name).toBeGreaterThanOrEqual(least);
 			for (const call of found) {
 				// What a row hands back is the `at` it was given, never the selection as it is by then.
 				const from = call.search(/\(v, at\) =>|setGain/);
@@ -197,15 +209,16 @@ describe('SliderRow', () => {
 			expect(tag, name).toContain('oninput={noteTyped}');
 			// An IME's last composition may not end in an `input` event.
 			expect(tag, name).toContain('oncompositionend={noteTyped}');
-			expect(tag, name).toMatch(/endEdit\(|patchTitle\(/);
+			expect(tag, name).toMatch(/endEdit\(|patchTitle\(|patchSvg\(/);
 			expect(tag, name).not.toMatch(/currentTarget\.value(?!\s*=[^=])/);
 			expect(tag, name).not.toMatch(/\bclip[.!]|\bo\.id|selectedClip|\boverlay\b/);
 		}
 		// The title's colour pickers, select and checkbox change at once, but go through the same door.
 		const pickers = (inspector.match(/<input\b[\s\S]*?\/>/g) ?? []).filter((tag) => /type="color"/.test(tag));
-		expect(pickers.length).toBe(1);
-		expect(pickers[0]).toContain('onfocus={noteFocus}');
-		expect(pickers[0]).toContain('patchTitle(e.currentTarget');
+		expect(pickers.length).toBe(2);
+		for (const picker of pickers) expect(picker).toContain('onfocus={noteFocus}');
+		expect(pickers.filter((tag) => tag.includes('patchTitle(e.currentTarget'))).toHaveLength(1);
+		expect(pickers.filter((tag) => tag.includes('patchSvg('))).toHaveLength(1);
 		expect(inspector).not.toMatch(/updateOverlay\(o\.id/);
 		expect(inspector.match(/patchTitle\(e\.currentTarget/g)?.length).toBe(5);
 		for (const helper of ['setVideoFxParam', 'setAudioFxParam'])

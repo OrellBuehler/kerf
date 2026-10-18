@@ -4,9 +4,20 @@ import type { AudioDetached, Placement } from './api';
 import {
 	addClip,
 	addKeyframe,
+	applyStagedSubset,
+	cancelCoverExport,
+	cancelImport,
+	cancelSmartCrop,
+	discardedStagedEdit,
+	openRecent as apiOpenRecent,
+	relinkAsset,
+	removeAsset,
+	restoreDiscardedEdits,
+	undoStagedEdit,
 	addReframeKeyframe,
 	addOverlay,
 	analyzeAsset,
+	refineTranscript,
 	generateCaptions,
 	clearCaptions,
 	importCaptions,
@@ -35,6 +46,11 @@ import {
 	moveClip,
 	moveClips,
 	removeOverlay,
+	addSvgOverlay as apiAddSvgOverlay,
+	applyTemplate as apiApplyTemplate,
+	removeSvgOverlay as apiRemoveSvgOverlay,
+	setTemplateValues as apiSetTemplateValues,
+	updateSvgOverlay as apiUpdateSvgOverlay,
 	setAudioEffects,
 	setKeyframes,
 	setPropertyKeyframes,
@@ -47,6 +63,7 @@ import {
 	updateOverlay,
 	newProject as apiNewProject,
 	openProject as apiOpenProject,
+	recoverProject as apiRecoverProject,
 	pickMediaPaths,
 	projectPath,
 	redo as apiRedo,
@@ -55,13 +72,16 @@ import {
 	removeSilence,
 	snapToBeats,
 	smartCrop,
+	syncClipsByAudio,
 	removeTrack,
 	setTrackDuck,
 	setMask,
+	setGrade,
 	setTrackVolume,
 	setTrackPan,
 	setMasterVolume,
 	setMasterLimiter,
+	setMasterTruePeak,
 	setMasterDuck,
 	fitMusic,
 	setDeliveryFormat,
@@ -107,6 +127,7 @@ import {
 	undo as apiUndo
 } from './api';
 import type {
+	AudioSync,
 	ClipCut,
 	ClipMove,
 	SplitSide,
@@ -128,6 +149,7 @@ import type {
 	Easing,
 	Keyframe,
 	Mask,
+	Grade,
 	MusicFitReport,
 	Projection,
 	Property,
@@ -136,10 +158,19 @@ import type {
 	ReframeKeyframe,
 	Revision,
 	StagedEdit,
+	AssetRemoval,
+	Relinked,
+	SubsetApplied,
 	StemsPlaced,
 	StreamKind,
+	SvgLayout,
+	SvgOverlay,
+	SvgOverlayPatch,
+	SvgSource,
+	TemplateEdit,
 	TextKeyframe,
 	Marker,
+	MarkerPatch,
 	TextOverlay,
 	Timeline,
 	Transform,
@@ -149,11 +180,40 @@ import type {
 } from './types';
 import { clipDuration } from './types';
 import { timelineFps } from './timecode';
-import { Generation } from './generation';
+import { trimRefusal } from './trim-tools';
+import { HISTORY_PAGE, redoable, undoable } from './paging';
+import { Generation, ReadOrder } from './generation';
 import { retimeKeyframes, withKeyframeAt } from './titles';
 import { normalize, pruneSelection, type PickMode } from './selection';
 import { clickSelectLinked } from './link-ui';
 import { locateIndex, withLinkPartners } from './link-groups';
+
+/** What an edit refused for the page's own reasons says while a proposal is being previewed. */
+export const PREVIEW_READ_ONLY = 'Exit the preview to edit — you are looking at the agent’s proposed cut, not yours.';
+
+/** What importing files came to: what landed, what failed (with the reason) and how many were stopped by the user. */
+export interface ImportOutcome {
+	imported: Asset[];
+	failed: { name: string; message: string }[];
+	cancelled: number;
+}
+
+/** An edit that did not happen: the backend refused it, or the page did (see `EditorState.#apply`). The
+ *  message is what the user reads; `cause` is what the backend said. */
+export class EditRefused extends Error {
+	constructor(message: string, cause?: unknown) {
+		super(message, cause === undefined ? undefined : { cause });
+		this.name = 'EditRefused';
+	}
+}
+
+/** The page's own refusal while the proposal is previewed: not a failure, so it is said as a notice, not an error. */
+export class PreviewReadOnly extends EditRefused {
+	constructor() {
+		super(PREVIEW_READ_ONLY);
+		this.name = 'PreviewReadOnly';
+	}
+}
 
 class EditorState {
 	assets = $state<Asset[]>([]);
@@ -174,9 +234,17 @@ class EditorState {
 	/** The title being edited. Exclusive with the clip selection: a title is its
 	 *  own item on the titles lane, not a property of whichever clip is selected. */
 	selectedOverlayId = $state<string | null>(null);
+	/** The animated SVG title being edited. Exclusive with the clip and title selections, for the
+	 *  same reason: the Inspector shows one subject. */
+	selectedSvgOverlayId = $state<string | null>(null);
 	selectedMetadata = $state<AssetMetadata | null>(null);
 	analyses = $state<Record<string, AssetAnalysis>>({});
 	history = $state<Revision[]>([]);
+	/** How many of the newest edits are loaded: a project is read from its latest `HISTORY_PAGE`, and more are
+	 *  asked for (`showOlderHistory`) — a long session is hundreds of revisions, and every edit re-reads the list. */
+	historyLimit = HISTORY_PAGE;
+	/** There may be edits older than the ones loaded. */
+	historyMore = $state(false);
 	/** The proposal a connected agent has staged, or null. */
 	staged = $state<StagedEdit | null>(null);
 	/** While true, `timeline` holds the *proposed* cut, not the live one. */
@@ -201,7 +269,20 @@ class EditorState {
 	 * when the import is an ordinary instant probe.
 	 */
 	importProgress = $state<number | null>(null);
+	/** A stop has been asked for and the import has not given up yet. */
+	stoppingImport = $state(false);
+	/** A smart crop is sampling the shots (`smart-crop-progress` fills the fraction); Stop is the status bar's. */
+	smartCropping = $state(false);
+	smartCropProgress = $state<number | null>(null);
+	stoppingSmartCrop = $state(false);
+	/** A cover frame is being rendered at the full delivery frame (`saveCoverFrame`). */
+	coverRun = $state<{ cancelling: boolean } | null>(null);
 	error = $state<string | null>(null);
+	/** The proposal thrown away last, while it can still be brought back (only with none open). */
+	discarded = $state<StagedEdit | null>(null);
+
+	/** The clip whose animation was last copied (Copy keyframes); a paste reads it as it is then (`keyframe-copy.ts`). */
+	keyframeSource = $state<string | null>(null);
 
 	/** The live cut, parked while `previewingStaged` shows the proposal. */
 	#liveTimeline = $state.raw<Timeline | null>(null);
@@ -220,6 +301,9 @@ class EditorState {
 		this.timeline = tl;
 		if (this.selectedOverlayId && !(tl.overlays ?? []).some((o) => o.id === this.selectedOverlayId)) {
 			this.selectedOverlayId = null;
+		}
+		if (this.selectedSvgOverlayId && !(tl.svg_overlays ?? []).some((o) => o.id === this.selectedSvgOverlayId)) {
+			this.selectedSvgOverlayId = null;
 		}
 		// A clip another edit removed (an undo, an agent) is no longer selected —
 		// the Inspector would otherwise keep a clip that is not there.
@@ -277,6 +361,7 @@ class EditorState {
 	 */
 	selectClip(clipId: string, mode: PickMode = 'replace', alone = false) {
 		this.selectedOverlayId = null;
+		this.selectedSvgOverlayId = null;
 		const track = this.timeline.tracks.find((t) => t.clips.some((c) => c.id === clipId));
 		this.#setSelection(
 			clickSelectLinked(this.timeline, this.#selection(), clipId, mode, track ? track.clips.map((c) => c.id) : null, alone)
@@ -287,6 +372,7 @@ class EditorState {
 	 *  member: `primary` when it is one, else the last. */
 	selectClips(ids: readonly string[], primary: string | null = null) {
 		this.selectedOverlayId = null;
+		this.selectedSvgOverlayId = null;
 		this.#setSelection(normalize(ids, primary));
 	}
 
@@ -300,6 +386,7 @@ class EditorState {
 	selectAll() {
 		const ids = this.timeline.tracks.filter((t) => !t.locked).flatMap((t) => t.clips.map((c) => c.id));
 		this.selectedOverlayId = null;
+		this.selectedSvgOverlayId = null;
 		this.selectedClipIds = ids;
 		this.selectedClipId = ids.at(-1) ?? null;
 	}
@@ -308,6 +395,7 @@ class EditorState {
 		this.selectedClipId = null;
 		this.selectedClipIds = [];
 		this.selectedOverlayId = null;
+		this.selectedSvgOverlayId = null;
 	}
 
 	/** Select a title, dropping the clip selection so the Inspector shows one thing. */
@@ -316,6 +404,17 @@ class EditorState {
 		if (overlayId) {
 			this.selectedClipId = null;
 			this.selectedClipIds = [];
+			this.selectedSvgOverlayId = null;
+		}
+	}
+
+	/** Select an animated SVG title, dropping the clip and title selections. */
+	selectSvgOverlay(overlayId: string | null) {
+		this.selectedSvgOverlayId = overlayId;
+		if (overlayId) {
+			this.selectedClipId = null;
+			this.selectedClipIds = [];
+			this.selectedOverlayId = null;
 		}
 	}
 
@@ -327,6 +426,7 @@ class EditorState {
 	 * selected — rather than refusing the rest, and is counted in `skipped`.
 	 */
 	async removeSelected(ripple: boolean): Promise<{ removed: number; skipped: number }> {
+		this.#assertEditable();
 		const locked = new Set(this.timeline.tracks.filter((t) => t.locked).flatMap((t) => t.clips.map((c) => c.id)));
 		const clips = this.selectedClips;
 		const ids = clips.filter((c) => !locked.has(c.id)).map((c) => c.id);
@@ -345,7 +445,7 @@ class EditorState {
 		}
 		const kept = clips.filter((c) => locked.has(c.id)).map((c) => c.id);
 		this.selectClips(kept, kept.includes(this.selectedClipId ?? '') ? this.selectedClipId : null);
-		await this.#apply(removeClips(ids, ripple ? true : undefined));
+		await this.#apply(() => removeClips(ids, ripple ? true : undefined));
 		return { removed: ids.length, skipped };
 	}
 
@@ -360,6 +460,15 @@ class EditorState {
 
 	get selectedOverlay(): TextOverlay | undefined {
 		return this.overlays.find((o) => o.id === this.selectedOverlayId);
+	}
+
+	/** The animated SVG titles in draw order, from the timeline being shown (the backend omits an empty list). */
+	get svgOverlays(): SvgOverlay[] {
+		return this.timeline.svg_overlays ?? [];
+	}
+
+	get selectedSvgOverlay(): SvgOverlay | undefined {
+		return this.svgOverlays.find((o) => o.id === this.selectedSvgOverlayId);
 	}
 
 	/** Timeline length in seconds. Memoized: `timeline` is reassigned wholesale
@@ -391,6 +500,7 @@ class EditorState {
 		return (
 			this.assets.length > 0 ||
 			(this.timeline.overlays?.length ?? 0) > 0 ||
+			(this.timeline.svg_overlays?.length ?? 0) > 0 ||
 			this.timeline.tracks.some((t) => t.clips.length > 0)
 		);
 	}
@@ -403,13 +513,11 @@ class EditorState {
 	}
 
 	get canUndo(): boolean {
-		const i = this.history.findIndex((r) => r.current);
-		return i > 0;
+		return undoable(this.history, this.historyMore);
 	}
 
 	get canRedo(): boolean {
-		const i = this.history.findIndex((r) => r.current);
-		return i >= 0 && i < this.history.length - 1;
+		return redoable(this.history);
 	}
 
 	assetName(assetId: string): string {
@@ -448,21 +556,29 @@ class EditorState {
 		try {
 			this.previewingStaged = false;
 			this.#liveTimeline = null;
+			// A read of the old project's proposal still in flight must not put it back.
+			this.#stagedOrder.invalidate();
+			this.staged = null;
+			this.discarded = null;
+			this.keyframeSource = null;
 			this.#analysisAsked.clear();
 			// The ripple flag is the project's, saved in its file: a project that was
 			// saved with ripple on has to open that way, and a new one has to reset
 			// the toggle, so it is read with everything else every load. (It never
 			// rejects — a failed read keeps what was showing.)
+			// A project is read from its newest edits; older ones are asked for (`showOlderHistory`).
+			this.historyLimit = HISTORY_PAGE;
 			const [assets, timeline, history, currentPath] = await Promise.all([
 				listAssets(),
 				getTimeline(),
-				getHistory(),
+				getHistory(this.historyLimit),
 				projectPath(),
 				this.loadRippleMode()
 			]);
 			this.assets = assets;
 			this.#setTimeline(timeline);
 			this.history = history;
+			this.historyMore = history.length >= this.historyLimit;
 			this.currentPath = currentPath;
 			this.loadEpoch++;
 			await this.refreshStaged();
@@ -485,6 +601,7 @@ class EditorState {
 		this.selectedClipId = null;
 		this.selectedClipIds = [];
 		this.selectedOverlayId = null;
+		this.selectedSvgOverlayId = null;
 		await this.load();
 		return true;
 	}
@@ -497,6 +614,32 @@ class EditorState {
 		this.selectedClipId = null;
 		this.selectedClipIds = [];
 		this.selectedOverlayId = null;
+		this.selectedSvgOverlayId = null;
+		await this.load();
+		return true;
+	}
+
+	/** Open one of the recent projects and reload; a file that has since gone rejects (and drops off the list). */
+	async openRecent(file: string): Promise<boolean> {
+		const path = await apiOpenRecent(file);
+		if (path === null) return false; // running in the browser
+		this.selectedAssetId = null;
+		this.selectedClipId = null;
+		this.selectedClipIds = [];
+		this.selectedOverlayId = null;
+		this.selectedSvgOverlayId = null;
+		await this.load();
+		return true;
+	}
+
+	/** Open an untitled project a crashed Kerf left behind; resolves true if recovered. */
+	async recoverProject(id: string): Promise<boolean> {
+		if (!(await apiRecoverProject(id))) return false;
+		this.selectedAssetId = null;
+		this.selectedClipId = null;
+		this.selectedClipIds = [];
+		this.selectedOverlayId = null;
+		this.selectedSvgOverlayId = null;
 		await this.load();
 		return true;
 	}
@@ -542,28 +685,62 @@ class EditorState {
 
 	// ---- staged edits (the agent's pending proposal) ------------------------
 
+	/** Orders the reads of the proposal: of the ones that come back, the newest writes (`refreshStaged`); a project
+	 *  loaded or a proposal settled makes every read in flight stale. */
+	#stagedOrder = new ReadOrder();
+
 	async refreshStaged() {
+		const ticket = this.#stagedOrder.begin();
+		let next: StagedEdit | null;
 		try {
-			this.staged = await getStagedEdit();
+			next = await getStagedEdit();
 		} catch {
-			this.staged = null;
+			// A read that failed says nothing about the proposal: it is neither gone nor changed — and it
+			// takes nobody's place, so an older read that does come back still lands.
+			return;
 		}
-		if (!this.staged && this.previewingStaged) await this.exitStagedPreview();
-		else if (this.staged && this.previewingStaged) {
-			// The agent staged more while we were looking at it.
-			const proposed = await getStagedTimeline();
-			if (proposed) this.#setTimeline(proposed);
+		// A newer read has written while this one was out (the agent staged twice in a burst), or the project
+		// was loaded / the proposal settled: its answer is the later one, and this one must not overwrite it.
+		if (!this.#stagedOrder.land(ticket)) return;
+		this.staged = next;
+		if (!next) {
+			if (this.previewingStaged) await this.exitStagedPreview();
+			// A proposal that was thrown away can be brought back; ask what, if anything, is waiting. A read that
+			// fails offers nothing (a card that may be a stale one is worse), and one that was overtaken while it
+			// was out — a project loaded, a proposal opened or settled — is not what is waiting now.
+			let waiting: StagedEdit | null = null;
+			try {
+				waiting = await discardedStagedEdit();
+			} catch {
+				/* nothing to restore */
+			}
+			if (this.#stagedOrder.isLatest(ticket)) this.discarded = waiting;
+			return;
 		}
+		this.discarded = null;
+		if (!this.previewingStaged) return;
+		// The agent staged more while we were looking at it.
+		let proposed: Timeline | null = null;
+		try {
+			proposed = await getStagedTimeline();
+		} catch {
+			return;
+		}
+		// The preview may have been left, or the proposal changed again, while that was out.
+		if (proposed && this.previewingStaged && this.#stagedOrder.isLatest(ticket)) this.#setTimeline(proposed);
 	}
 
 	/** Show the proposed cut in the editor instead of the live one. */
 	async previewStaged() {
 		const proposed = await getStagedTimeline();
-		if (!proposed) return;
+		// Applied or discarded while it was being fetched: there is nothing to show.
+		if (!proposed || !this.staged) return;
 		if (!this.previewingStaged) this.#liveTimeline = this.timeline;
 		this.#setTimeline(proposed);
 		this.previewingStaged = true;
 		this.clearSelection();
+		// It may have been replaced in that time; read it again now that the preview follows it.
+		void this.refreshStaged();
 	}
 
 	async exitStagedPreview() {
@@ -574,40 +751,90 @@ class EditorState {
 		this.clearSelection();
 	}
 
-	/** Accept the proposal — it lands on the live timeline as one revision. */
+	/** Accept the proposal — it lands on the live timeline as one revision. A refusal (a stale cut, a
+	 *  clip that no longer fits) leaves the preview on screen. */
 	async applyStaged(force = false) {
-		await this.#apply(applyStagedEdit(force));
+		await this.#apply(() => applyStagedEdit(force), { review: true });
+		this.#proposalSettled();
 		await this.refreshStaged();
 	}
 
 	/** Throw the proposal away; the live timeline is untouched. */
 	async discardStaged() {
-		await this.#apply(discardStagedEdit());
+		await this.#apply(() => discardStagedEdit(), { review: true });
+		this.#proposalSettled();
 		await this.refreshStaged();
+	}
+
+	/** Accept only the picked changes of the proposal (`entryIds`: the ids of its diff entries) as one revision.
+	 *  What was not picked stays open for review, branched from the cut as it now is, until nothing is left. */
+	async applyStagedSubset(entryIds: string[], force = false): Promise<SubsetApplied> {
+		let done!: SubsetApplied;
+		await this.#apply(
+			async () => {
+				done = await applyStagedSubset(entryIds, force);
+				return done.timeline;
+			},
+			{ review: true }
+		);
+		if (done.closed) this.#proposalSettled();
+		await this.refreshStaged();
+		return done;
+	}
+
+	/** Take back the latest step the agent staged, inside the proposal (the live cut is untouched);
+	 *  resolves to the step's label. */
+	async undoStagedStep(): Promise<string> {
+		const undone = await undoStagedEdit();
+		await this.refreshStaged();
+		return undone.label;
+	}
+
+	/** Bring the proposal that was thrown away back (only while none is open). */
+	async restoreDiscarded(): Promise<void> {
+		await restoreDiscardedEdits();
+		this.discarded = null;
+		await this.refreshStaged();
+	}
+
+	/** The proposal is gone (applied or discarded): whatever a slower read still brings is older than that. */
+	#proposalSettled() {
+		this.#stagedOrder.invalidate();
+		this.staged = null;
 	}
 
 	async refreshHistory() {
 		try {
-			this.history = await getHistory();
+			const history = await getHistory(this.historyLimit);
+			this.history = history;
+			this.historyMore = history.length >= this.historyLimit;
 		} catch {
 			/* history is best-effort; ignore */
 		}
 	}
 
+	/** Load another page of older edits (the Agent panel's History lists them newest first). */
+	async showOlderHistory() {
+		this.historyLimit += HISTORY_PAGE;
+		await this.refreshHistory();
+	}
+
 	/** Pick one or more media files and import them. All files probe
 	 *  concurrently (each lands in the bin as it resolves); imports continue
 	 *  past a failed file and resolve to the successes plus per-file errors. */
-	async importMedia(): Promise<{ imported: Asset[]; failed: { name: string; message: string }[] }> {
+	async importMedia(): Promise<ImportOutcome> {
 		return this.importPaths(await pickMediaPaths());
 	}
 
 	/** Import specific files — what the picker resolves to, and what a drop onto
 	 *  the window hands over. */
-	async importPaths(paths: string[]): Promise<{ imported: Asset[]; failed: { name: string; message: string }[] }> {
-		if (paths.length === 0) return { imported: [], failed: [] };
+	async importPaths(paths: string[]): Promise<ImportOutcome> {
+		if (paths.length === 0) return { imported: [], failed: [], cancelled: 0 };
 		this.importing = true;
+		this.stoppingImport = false;
 		this.error = null;
 		const failed: { name: string; message: string }[] = [];
+		let cancelled = 0;
 		try {
 			const results = await Promise.all(
 				paths.map(async (path) => {
@@ -620,16 +847,19 @@ class EditorState {
 						}
 						return asset;
 					} catch (e) {
-						failed.push({ name: path.split(/[\\/]/).pop() || path, message: this.#msg(e) });
+						// A stop the user asked for is not a failure of the file.
+						if (/import cancel+ed/i.test(this.#msg(e))) cancelled++;
+						else failed.push({ name: path.split(/[\\/]/).pop() || path, message: this.#msg(e) });
 						return null;
 					}
 				})
 			);
 			const imported = results.filter((a): a is Asset => a !== null);
 			if (imported.length > 0) await this.select(imported[imported.length - 1].id);
-			return { imported, failed };
+			return { imported, failed, cancelled };
 		} finally {
 			this.importing = false;
+			this.stoppingImport = false;
 			this.importProgress = null;
 		}
 	}
@@ -643,6 +873,33 @@ class EditorState {
 		if (assets.length !== known.size || assets.some((a) => !known.has(a.id))) this.assets = assets;
 	}
 
+	/** Take media out of the project: refused while a clip (or the proposal) uses it, unless `force`, which first
+	 *  removes those clips as one `Remove media` step. Its analysis and proxies go with it; the file on disk stays. */
+	async removeMedia(assetId: string, force = false): Promise<AssetRemoval> {
+		let done!: AssetRemoval;
+		await this.#apply(async () => {
+			done = await removeAsset(assetId, force);
+			return done.timeline;
+		});
+		this.assets = this.assets.filter((a) => a.id !== assetId);
+		delete this.analyses[assetId];
+		if (this.selectedAssetId === assetId) {
+			this.selectedAssetId = null;
+			this.selectedMetadata = null;
+		}
+		return done;
+	}
+
+	/** Point an asset at another file (the media was moved, renamed or restored). It keeps its id and every clip
+	 *  cut from it; its analysis stays only when the file is the old media moved. */
+	async relinkMedia(assetId: string, path: string): Promise<Relinked> {
+		const done = await relinkAsset(assetId, path);
+		this.assets = this.assets.map((a) => (a.id === assetId ? done.asset : a));
+		if (!done.analysis_kept) delete this.analyses[assetId];
+		if (this.selectedAssetId === assetId) await this.select(assetId);
+		return done;
+	}
+
 	/** Run analysis (the named `steps`, else what Settings leaves switched on) on an asset and
 	 *  merge the result into local caches. */
 	async analyze(assetId: string, steps?: readonly AnalysisKind[]): Promise<AssetAnalysis> {
@@ -654,72 +911,112 @@ class EditorState {
 		return analysis;
 	}
 
+	/** Re-time the selected asset's transcript words and label its speakers, keeping the
+	 *  local caches in step. */
+	async refineTranscript(assetId: string): Promise<AssetAnalysis> {
+		const analysis = await refineTranscript(assetId);
+		this.analyses[assetId] = analysis;
+		if (assetId === this.selectedAssetId && this.selectedMetadata) {
+			this.selectedMetadata = { ...this.selectedMetadata, analysis };
+		}
+		return analysis;
+	}
+
 	// ---- editing actions (apply backend result to local timeline) -----------
 
-	async #apply(op: Promise<Timeline>) {
+	/** Whether the cut on screen is the project's own: false while a proposal is being previewed, when
+	 *  every id on the timeline is the proposal's and an edit would land on a cut nobody is looking at. */
+	get editable(): boolean {
+		return !this.previewingStaged;
+	}
+	/** Whether a control that edits the cut should be off: an edit is in flight, or the proposal is on screen. */
+	get locked(): boolean {
+		return this.busy || this.previewingStaged;
+	}
+	#assertEditable() {
+		if (this.previewingStaged) throw new PreviewReadOnly();
+	}
+
+	/**
+	 * Run one edit and show what it leaves. The proposal preview is a read-only view of a cut that is not
+	 * the project's, so an edit is refused *before* the backend is asked (`run` is a thunk for that reason)
+	 * — except the two that settle the proposal itself (`review`: apply, discard), which end it. The
+	 * preview is dropped only once the edit has gone through; a refusal leaves it exactly as it was.
+	 * A failure rejects with an `EditRefused` and is reported by whoever called (a toast); a caller that
+	 * did not catch it is caught by the page (`window-events`), so it is said once either way.
+	 */
+	async #apply(run: () => Promise<Timeline>, o: { review?: boolean } = {}) {
+		if (!o.review) this.#assertEditable();
 		this.#busyCount++;
-		this.error = null;
-		// Any real edit is an edit to the live cut, so reviewing is over.
-		this.previewingStaged = false;
-		this.#liveTimeline = null;
 		try {
-			this.#setTimeline(await op);
+			const tl = await run();
+			this.previewingStaged = false;
+			this.#liveTimeline = null;
+			this.#setTimeline(tl);
 			await this.refreshHistory();
+			// The proposal's `stale` flag is the backend's, and an edit just flipped it: re-read it, so the review
+			// says "you have edited since" now and not only when the agent next stages something. The same for a
+			// discarded one waiting to be restored, which an edit makes a restore of an older cut.
+			if ((this.staged || this.discarded) && !o.review) await this.refreshStaged();
 		} catch (e) {
-			this.error = this.#msg(e);
-			throw e;
+			throw e instanceof EditRefused ? e : new EditRefused(this.#msg(e), e);
 		} finally {
 			this.#busyCount--;
 		}
 	}
 
 	cut(assetId: string, start: number, end: number) {
-		return this.#apply(cutClip(assetId, start, end));
+		return this.#apply(() => cutClip(assetId, start, end));
 	}
 	add(assetId: string, sourceIn: number, sourceOut: number, trackId?: string, timelineStart?: number) {
-		return this.#apply(addClip(assetId, sourceIn, sourceOut, trackId, timelineStart));
+		return this.#apply(() => addClip(assetId, sourceIn, sourceOut, trackId, timelineStart));
 	}
 	/** Split a clip at `at`; its linked partners are cut at the same moment unless `link` is `false`. */
 	split(clipId: string, at: number, link?: boolean) {
-		return this.#apply(splitClip(clipId, at, link));
+		return this.#apply(() => splitClip(clipId, at, link));
 	}
 	/** Trim a clip; the partners that share the edge follow it unless `link` is `false`. */
 	trim(clipId: string, sourceIn?: number, sourceOut?: number, timelineStart?: number, link?: boolean) {
-		return this.#apply(trimClip(clipId, sourceIn, sourceOut, timelineStart, link));
+		return this.#apply(() => trimClip(clipId, sourceIn, sourceOut, timelineStart, link));
+	}
+	/** The sentence the backend would refuse a trim with (footage it does not have, a lane it would land on,
+	 *  after the ripple when that is on), or `null` when it takes it — answered here, from the cut on screen. */
+	trimRefusal(clipId: string, sourceIn?: number, sourceOut?: number, link?: boolean): string | null {
+		return trimRefusal(this.timeline, { ripple: this.rippleMode, assets: this.assets }, clipId, sourceIn, sourceOut, undefined, link);
 	}
 	reorder(trackId: string, clipId: string, newIndex: number) {
-		return this.#apply(reorderClip(trackId, clipId, newIndex));
+		return this.#apply(() => reorderClip(trackId, clipId, newIndex));
 	}
 	move(clipId: string, timelineStart: number, trackId?: string, link?: boolean) {
-		return this.#apply(moveClip(clipId, timelineStart, trackId, link));
+		return this.#apply(() => moveClip(clipId, timelineStart, trackId, link));
 	}
 	/** Move several clips as ONE edit — a dragged selection. All or nothing: the
 	 *  promise rejects, and nothing has moved, if the group does not fit. The partners of
 	 *  the clips named move with them (the same Δt, each on its own track) unless `link`
 	 *  is `false`. */
 	moveClips(moves: ClipMove[], link?: boolean) {
-		return this.#apply(moveClips(moves, link));
+		return this.#apply(() => moveClips(moves, link));
 	}
 	/** Roll the cut between two adjacent clips by `delta` seconds (positive later);
 	 *  the partner pairs sharing the cut roll with it unless `link` is `false`. */
 	roll(clipA: string, clipB: string, delta: number, link?: boolean) {
-		return this.#apply(rollEdit(clipA, clipB, delta, link));
+		return this.#apply(() => rollEdit(clipA, clipB, delta, link));
 	}
 	/** Slip a clip's footage by `delta` source seconds (positive = starts later in it). */
 	slip(clipId: string, delta: number, link?: boolean) {
-		return this.#apply(slipClip(clipId, delta, link));
+		return this.#apply(() => slipClip(clipId, delta, link));
 	}
 	/** Slide a clip along its track by `delta` timeline seconds; touching neighbours give way. */
 	slide(clipId: string, delta: number, link?: boolean) {
-		return this.#apply(slideClip(clipId, delta, link));
+		return this.#apply(() => slideClip(clipId, delta, link));
 	}
 	/** Split a clip at `at` and remove the `left` or `right` half; follows ripple mode. */
 	splitRemove(clipId: string, at: number, side: SplitSide) {
-		return this.#apply(splitRemove(clipId, at, side));
+		return this.#apply(() => splitRemove(clipId, at, side));
 	}
 	/** Split and remove on several clips as ONE edit (one revision, one undo). */
 	splitRemoveClips(cuts: ClipCut[], side: SplitSide) {
-		return this.#apply(splitRemoveClips(cuts, side));
+		return this.#apply(() => splitRemoveClips(cuts, side));
 	}
 
 	// ---- ripple mode ----------------------------------------------------------
@@ -776,7 +1073,7 @@ class EditorState {
 	/** Paste the clipboard so its earliest clip lands at `at`. */
 	async paste(at: number): Promise<number> {
 		if (this.clipboard.length === 0) return 0;
-		await this.#apply(insertClips([...this.clipboard], at));
+		await this.#apply(() => insertClips([...this.clipboard], at));
 		return this.clipboard.length;
 	}
 
@@ -785,7 +1082,7 @@ class EditorState {
 		const sel = this.selectedClips;
 		if (sel.length === 0) return 0;
 		const end = Math.max(...sel.map((c) => c.timeline_start + clipDuration(c)));
-		await this.#apply(duplicateClips(sel.map((c) => c.id), end));
+		await this.#apply(() => duplicateClips(sel.map((c) => c.id), end));
 		return sel.length;
 	}
 
@@ -793,11 +1090,11 @@ class EditorState {
 	 *  picture, keep its sound). */
 	remove(clipId: string, link?: boolean) {
 		this.#forget(clipId);
-		return this.#apply(removeClip(clipId, link));
+		return this.#apply(() => removeClip(clipId, link));
 	}
 	rippleDelete(clipId: string, link?: boolean) {
 		this.#forget(clipId);
-		return this.#apply(rippleDelete(clipId, link));
+		return this.#apply(() => rippleDelete(clipId, link));
 	}
 
 	/** Drop a clip from the selection; the primary falls to what is left. */
@@ -810,116 +1107,123 @@ class EditorState {
 		);
 	}
 	cutRange(clipId: string, from: number, to: number) {
-		return this.#apply(cutClipRange(clipId, from, to));
+		return this.#apply(() => cutClipRange(clipId, from, to));
 	}
 	addTrack(kind: StreamKind, name?: string) {
-		return this.#apply(addTrack(kind, name));
+		return this.#apply(() => addTrack(kind, name));
 	}
 	removeTrack(trackId: string) {
-		return this.#apply(removeTrack(trackId));
+		return this.#apply(() => removeTrack(trackId));
 	}
 	setTrackDuck(trackId: string, duck: boolean) {
-		return this.#apply(setTrackDuck(trackId, duck));
+		return this.#apply(() => setTrackDuck(trackId, duck));
 	}
 	/** Cut a clip to a shape, or `null` to clear the mask. */
 	setMask(clipId: string, mask: Mask | null) {
-		return this.#apply(setMask(clipId, mask));
+		return this.#apply(() => setMask(clipId, mask));
+	}
+	setGrade(clipId: string, grade: Grade) {
+		return this.#apply(() => setGrade(clipId, grade));
 	}
 	setTrackVolume(trackId: string, volume: number) {
-		return this.#apply(setTrackVolume(trackId, volume));
+		return this.#apply(() => setTrackVolume(trackId, volume));
 	}
 	setTrackPan(trackId: string, pan: number) {
-		return this.#apply(setTrackPan(trackId, pan));
+		return this.#apply(() => setTrackPan(trackId, pan));
 	}
 	/** The master fader: a linear gain on the finished mix (1 is unity). */
 	setMasterVolume(volume: number) {
-		return this.#apply(setMasterVolume(volume));
+		return this.#apply(() => setMasterVolume(volume));
 	}
 	/** The master limiter on or off; `ceilingDb` omitted keeps the ceiling it had. */
 	setMasterLimiter(enabled: boolean, ceilingDb?: number | null) {
-		return this.#apply(setMasterLimiter(enabled, ceilingDb));
+		return this.#apply(() => setMasterLimiter(enabled, ceilingDb));
+	}
+	/** The master limiter holds the true peak (4x oversampled on export) or only the sample peak. */
+	setMasterTruePeak(enabled: boolean) {
+		return this.#apply(() => setMasterTruePeak(enabled));
 	}
 	/** How ducked tracks dip: a negative `depthDb` is the speech gate (that many dB under speech,
 	 *  `-40..-1`), omitted the sidechain compressor. */
 	setMasterDuck(depthDb?: number | null) {
-		return this.#apply(setMasterDuck(depthDb));
+		return this.#apply(() => setMasterDuck(depthDb));
 	}
 	/** The frame this project is cut for; `null` follows the footage's shape. */
 	setDeliveryFormat(format: Delivery | null) {
-		return this.#apply(setDeliveryFormat(format));
+		return this.#apply(() => setDeliveryFormat(format));
 	}
 	/** Add an auto-named marker at `time` — the M shortcut and the timeline menu. */
 	addMarkerAtPlayhead(time: number) {
 		return this.addMarker(time, `Marker ${this.markers.length + 1}`);
 	}
 	addMarker(time: number, name: string, color?: string) {
-		return this.#apply(addMarker(time, name, color));
+		return this.#apply(() => addMarker(time, name, color));
 	}
-	updateMarker(markerId: string, patch: { time?: number; name?: string; color?: string }) {
-		return this.#apply(updateMarker(markerId, patch));
+	updateMarker(markerId: string, patch: MarkerPatch) {
+		return this.#apply(() => updateMarker(markerId, patch));
 	}
 	removeMarker(markerId: string) {
-		return this.#apply(removeMarker(markerId));
+		return this.#apply(() => removeMarker(markerId));
 	}
 	setTrackMuted(trackId: string, muted: boolean) {
-		return this.#apply(setTrackMuted(trackId, muted));
+		return this.#apply(() => setTrackMuted(trackId, muted));
 	}
 	setTrackSolo(trackId: string, solo: boolean) {
-		return this.#apply(setTrackSolo(trackId, solo));
+		return this.#apply(() => setTrackSolo(trackId, solo));
 	}
 	setTrackLocked(trackId: string, locked: boolean) {
-		return this.#apply(setTrackLocked(trackId, locked));
+		return this.#apply(() => setTrackLocked(trackId, locked));
 	}
 	setClipEnabled(clipId: string, enabled: boolean) {
-		return this.#apply(setClipEnabled(clipId, enabled));
+		return this.#apply(() => setClipEnabled(clipId, enabled));
 	}
 	setVolume(clipId: string, volume: number) {
-		return this.#apply(setVolume(clipId, volume));
+		return this.#apply(() => setVolume(clipId, volume));
 	}
 	setFade(clipId: string, fadeIn?: number, fadeOut?: number) {
-		return this.#apply(setFade(clipId, fadeIn, fadeOut));
+		return this.#apply(() => setFade(clipId, fadeIn, fadeOut));
 	}
 	setSpeed(clipId: string, speed: number) {
-		return this.#apply(setSpeed(clipId, speed));
+		return this.#apply(() => setSpeed(clipId, speed));
 	}
 	setTransform(clipId: string, patch: Partial<Transform>) {
-		return this.#apply(setTransform(clipId, patch));
+		return this.#apply(() => setTransform(clipId, patch));
 	}
 	setColor(clipId: string, patch: Partial<Color>) {
-		return this.#apply(setColor(clipId, patch));
+		return this.#apply(() => setColor(clipId, patch));
 	}
 	setTransition(clipId: string, transition: Transition | null) {
-		return this.#apply(setTransition(clipId, transition));
+		return this.#apply(() => setTransition(clipId, transition));
 	}
 	setVideoEffects(clipId: string, effects: VideoEffect[]) {
-		return this.#apply(setVideoEffects(clipId, effects));
+		return this.#apply(() => setVideoEffects(clipId, effects));
 	}
 	setAudioEffects(clipId: string, effects: AudioEffect[]) {
-		return this.#apply(setAudioEffects(clipId, effects));
+		return this.#apply(() => setAudioEffects(clipId, effects));
 	}
 	setKeyframes(clipId: string, keyframes: Keyframe[]) {
-		return this.#apply(setKeyframes(clipId, keyframes));
+		return this.#apply(() => setKeyframes(clipId, keyframes));
 	}
 	addKeyframe(clipId: string, time: number, patch: Partial<Omit<Keyframe, 'time'>> = {}) {
-		return this.#apply(addKeyframe(clipId, time, patch));
+		return this.#apply(() => addKeyframe(clipId, time, patch));
 	}
 	/** The easing of the segment leaving the keyframe at `time` (clip-local seconds). */
 	setKeyframeEasing(clipId: string, time: number, easing: Easing, prop?: Property) {
-		return this.#apply(setKeyframeEasing(clipId, time, easing, prop));
+		return this.#apply(() => setKeyframeEasing(clipId, time, easing, prop));
 	}
 	/** Replace the keys of one number — a transform number, a colour number or the volume. */
 	setPropertyKeyframes(clipId: string, prop: Property, keys: PropertyKey[]) {
-		return this.#apply(setPropertyKeyframes(clipId, prop, keys));
+		return this.#apply(() => setPropertyKeyframes(clipId, prop, keys));
 	}
 	/** Copy the animation of `props` (all keyed ones when empty) to another clip, `offset` later. */
 	copyKeyframes(fromClipId: string, toClipId: string, props: Property[] = [], offset = 0) {
-		return this.#apply(copyKeyframes(fromClipId, toClipId, props, offset));
+		return this.#apply(() => copyKeyframes(fromClipId, toClipId, props, offset));
 	}
 	clearKeyframes(clipId: string) {
-		return this.#apply(clearKeyframes(clipId));
+		return this.#apply(() => clearKeyframes(clipId));
 	}
 	setReframe(clipId: string, patch: Partial<Reframe>) {
-		return this.#apply(setReframe(clipId, patch));
+		return this.#apply(() => setReframe(clipId, patch));
 	}
 	/** Mark (or unmark) an asset as 360 footage; later cuts from it reframe. */
 	async setAssetProjection(assetId: string, projection: Projection | null) {
@@ -931,20 +1235,20 @@ class EditorState {
 		return asset;
 	}
 	clearReframe(clipId: string) {
-		return this.#apply(clearReframe(clipId));
+		return this.#apply(() => clearReframe(clipId));
 	}
 	setReframeKeyframes(clipId: string, keyframes: ReframeKeyframe[]) {
-		return this.#apply(setReframeKeyframes(clipId, keyframes));
+		return this.#apply(() => setReframeKeyframes(clipId, keyframes));
 	}
 	addReframeKeyframe(
 		clipId: string,
 		time: number,
 		patch: Partial<Omit<ReframeKeyframe, 'time'>> = {}
 	) {
-		return this.#apply(addReframeKeyframe(clipId, time, patch));
+		return this.#apply(() => addReframeKeyframe(clipId, time, patch));
 	}
 	addOverlay(text: string, start: number, end: number) {
-		return this.#apply(addOverlay(text, start, end));
+		return this.#apply(() => addOverlay(text, start, end));
 	}
 	/** Add a title at `start..end` and select it. */
 	async addTitle(text: string, start: number, end: number) {
@@ -955,7 +1259,7 @@ class EditorState {
 		return created;
 	}
 	updateOverlay(overlayId: string, patch: Partial<Omit<TextOverlay, 'id' | 'keyframes'>>) {
-		return this.#apply(updateOverlay(overlayId, patch));
+		return this.#apply(() => updateOverlay(overlayId, patch));
 	}
 	/** Set a title's span. Its keyframes are relative to the start, so a length
 	 *  change re-times them (fade-out stays on the end) as a second edit. */
@@ -980,10 +1284,50 @@ class EditorState {
 	}
 	removeOverlay(overlayId: string) {
 		if (this.selectedOverlayId === overlayId) this.selectedOverlayId = null;
-		return this.#apply(removeOverlay(overlayId));
+		return this.#apply(() => removeOverlay(overlayId));
+	}
+	/** Add an animated SVG title (custom artwork or a preset) from `start`, to `end` or as long as the artwork
+	 *  runs. Custom SVG has been through `validateSvg` first when the caller wants its warnings. */
+	addSvgOverlay(source: SvgSource, start: number, end?: number | null, layout?: SvgLayout) {
+		return this.#apply(() => apiAddSvgOverlay(source, start, end, layout));
+	}
+	/** Add an animated SVG title and select it. */
+	async addSvgTitle(source: SvgSource, start: number, end?: number | null, layout?: SvgLayout) {
+		const known = new Set(this.svgOverlays.map((o) => o.id));
+		await this.addSvgOverlay(source, start, end, layout);
+		const created = this.svgOverlays.find((o) => !known.has(o.id));
+		if (created) this.selectSvgOverlay(created.id);
+		return created;
+	}
+	updateSvgOverlay(overlayId: string, patch: SvgOverlayPatch) {
+		return this.#apply(() => apiUpdateSvgOverlay(overlayId, patch));
+	}
+	removeSvgOverlay(overlayId: string) {
+		if (this.selectedSvgOverlayId === overlayId) this.selectedSvgOverlayId = null;
+		return this.#apply(() => apiRemoveSvgOverlay(overlayId));
+	}
+	/** Add a library template as an animated title from `start` (to `end`, else as long as the template runs), with
+	 *  `values` (control id to value) already in its artwork, and select it. One edit; the warnings are the caller's. */
+	async applyTemplate(templateId: string, values: Record<string, string>, start: number, end?: number | null, layout?: SvgLayout) {
+		let edit!: TemplateEdit;
+		await this.#apply(async () => {
+			edit = await apiApplyTemplate(templateId, values, start, end, layout);
+			return edit.timeline;
+		});
+		this.selectSvgOverlay(edit.overlay_id);
+		return edit;
+	}
+	/** Change some control values of a template title: one edit, the title keeps its id, timing and placement. */
+	async setTemplateValues(overlayId: string, values: Record<string, string>) {
+		let edit!: TemplateEdit;
+		await this.#apply(async () => {
+			edit = await apiSetTemplateValues(overlayId, values);
+			return edit.timeline;
+		});
+		return edit;
 	}
 	setOverlayKeyframes(overlayId: string, keyframes: TextKeyframe[]) {
-		return this.#apply(setOverlayKeyframes(overlayId, keyframes));
+		return this.#apply(() => setOverlayKeyframes(overlayId, keyframes));
 	}
 	/**
 	 * Synthesize a script onto the VO track. The asset carries its script as its
@@ -992,9 +1336,8 @@ class EditorState {
 	 * cancelled run is not an error at all.
 	 */
 	async generateVoiceover(req: VoiceoverRequest): Promise<Asset> {
+		this.#assertEditable();
 		this.#busyCount++;
-		this.previewingStaged = false;
-		this.#liveTimeline = null;
 		try {
 			const { asset, timeline } = await generateVoiceover(req);
 			this.assets = this.assets.some((a) => a.id === asset.id)
@@ -1016,12 +1359,9 @@ class EditorState {
 	 * a cancelled run is not an error at all.
 	 */
 	async separateStems(assetId: string, clipId?: string): Promise<StemsPlaced> {
+		// Laid under a clip it is an edit to the live cut; into the library alone it is not.
+		if (clipId) this.#assertEditable();
 		this.#busyCount++;
-		if (clipId) {
-			// An edit to the live cut, so reviewing a proposal is over; into the library alone it is not.
-			this.previewingStaged = false;
-			this.#liveTimeline = null;
-		}
 		try {
 			const { placed, timeline } = await separateStems(assetId, clipId);
 			const known = new Set(this.assets.map((a) => a.id));
@@ -1045,25 +1385,25 @@ class EditorState {
 		}
 	}
 	generateCaptions(options?: CaptionOptions) {
-		return this.#apply(generateCaptions(options));
+		return this.#apply(() => generateCaptions(options));
 	}
 	clearCaptions() {
-		return this.#apply(clearCaptions());
+		return this.#apply(() => clearCaptions());
 	}
-	/** Caption the cut from a subtitle file on disk (`.srt` / `.ass` / `.ssa`).
+	/** Caption the cut from a subtitle file on disk (`.srt` / `.vtt` / `.ass` / `.ssa`).
 	 *  One `Import captions` revision that replaces the generated / imported
 	 *  captions; resolves to what the import did (see `describeImport`). */
 	importCaptions(path: string, req?: CaptionImportRequest) {
-		return this.#applyImport(importCaptions(path, req));
+		return this.#applyImport(() => importCaptions(path, req));
 	}
 	/** `importCaptions` for text already in hand (a file input, a paste). */
 	importCaptionsText(text: string, req?: CaptionImportRequest & { format?: CaptionFormat }) {
-		return this.#applyImport(importCaptionsText(text, req));
+		return this.#applyImport(() => importCaptionsText(text, req));
 	}
-	async #applyImport(op: Promise<CaptionImportResult>): Promise<CaptionImportSummary> {
+	async #applyImport(op: () => Promise<CaptionImportResult>): Promise<CaptionImportSummary> {
 		let summary: CaptionImportSummary | undefined;
-		await this.#apply(
-			op.then((r) => {
+		await this.#apply(() =>
+			op().then((r) => {
 				summary = r.summary;
 				return r.timeline;
 			})
@@ -1075,14 +1415,14 @@ class EditorState {
 		return exportSrt(assetId, outputPath);
 	}
 	removeSilence(assetId: string) {
-		return this.#apply(removeSilence(assetId));
+		return this.#apply(() => removeSilence(assetId));
 	}
 	/** **Fit to video**: replace a music clip with a bar-aligned arrangement that lasts `target` seconds
 	 *  (by default the picture's length from the clip's start) — one `Fit music to length` revision.
 	 *  Resolves to what it did. The clip is gone, so the clips that replace it are selected. */
 	async fitMusic(clipId: string, target: number | null | undefined, fadeOut: boolean): Promise<MusicFitReport> {
 		let report!: MusicFitReport;
-		await this.#apply(
+		await this.#apply(() =>
 			fitMusic(clipId, target, fadeOut).then((r) => {
 				report = r.report;
 				return r.timeline;
@@ -1093,21 +1433,72 @@ class EditorState {
 	}
 	/** Ripple a track's cuts onto the music's beat grid; all video tracks by default. */
 	snapToBeats(trackId?: string, tolerance?: number) {
-		return this.#apply(snapToBeats(trackId, tolerance));
+		return this.#apply(() => snapToBeats(trackId, tolerance));
 	}
 	/**
 	 * Frame each shot for the delivery frame instead of centring it blindly.
 	 * One clip when `clipId` is given, otherwise every clip on an unlocked video
 	 * track. Lands as one undoable `Smart crop` revision.
 	 */
-	smartCrop(clipId?: string) {
-		return this.#apply(smartCrop(clipId));
+	async smartCrop(clipId?: string) {
+		this.smartCropping = true;
+		this.smartCropProgress = null;
+		this.stoppingSmartCrop = false;
+		try {
+			await this.#apply(() => smartCrop(clipId));
+		} finally {
+			this.smartCropping = false;
+			this.smartCropProgress = null;
+			this.stoppingSmartCrop = false;
+		}
+	}
+	/** Stop the smart crop in flight; it then rejects with `smart crop cancelled`, which `report` says as a notice. */
+	async stopSmartCrop() {
+		this.stoppingSmartCrop = true;
+		try {
+			await cancelSmartCrop();
+		} catch {
+			this.stoppingSmartCrop = false;
+		}
+	}
+
+	/** Stop the cover frame being rendered; `saveCoverFrame` then says it was stopped. */
+	async stopCover() {
+		if (!this.coverRun) return;
+		this.coverRun = { cancelling: true };
+		try {
+			await cancelCoverExport();
+		} catch {
+			this.coverRun = { cancelling: false };
+		}
+	}
+
+	/** Stop every import in flight (a 360 lens pair being stitched is the one that takes long enough to stop). */
+	async stopImport() {
+		this.stoppingImport = true;
+		try {
+			await cancelImport();
+		} catch {
+			this.stoppingImport = false;
+		}
+	}
+	/** Move `clipId` so its sound lines up with `referenceId`'s; resolves to what was found.
+	 *  An unreliable match moves nothing unless `force`. One `Move clip` revision when it moves. */
+	async syncByAudio(referenceId: string, clipId: string, force = false): Promise<AudioSync> {
+		let sync!: AudioSync;
+		await this.#apply(() =>
+			syncClipsByAudio(referenceId, clipId, force).then((r) => {
+				sync = r.sync;
+				return r.timeline;
+			})
+		);
+		return sync;
 	}
 	/** Detach the sound of every clip of an asset still playing its own (one revision); resolves
 	 *  to what was detached and what was skipped (a locked track). */
 	async extractAudio(assetId: string): Promise<AudioDetached> {
 		let report!: AudioDetached;
-		await this.#apply(
+		await this.#apply(() =>
 			extractAudio(assetId).then((r) => {
 				report = r;
 				return r.timeline;
@@ -1117,7 +1508,7 @@ class EditorState {
 	}
 	/** Append an asset's whole audio to the first audio track as a clip of its own. */
 	addAssetAudio(assetId: string) {
-		return this.#apply(addAssetAudio(assetId));
+		return this.#apply(() => addAssetAudio(assetId));
 	}
 
 	// ---- linked A/V -------------------------------------------------------------
@@ -1125,13 +1516,13 @@ class EditorState {
 	/** Give a picture clip its own sound as a linked clip on an audio track, and mute the
 	 *  picture (one `Detach audio` revision). */
 	detachAudio(clipId: string) {
-		return this.#apply(detachAudio(clipId));
+		return this.#apply(() => detachAudio(clipId));
 	}
 	/** Detach several pictures' own sound as **one** `Detach audio (N clips)` revision; a clip that
 	 *  cannot be is skipped and reported. */
 	async detachAudioClips(clipIds: string[]): Promise<AudioDetached> {
 		let report!: AudioDetached;
-		await this.#apply(
+		await this.#apply(() =>
 			detachAudioClips(clipIds).then((r) => {
 				report = r;
 				return r.timeline;
@@ -1142,37 +1533,38 @@ class EditorState {
 	/** The way back: delete the linked audio clip and let the picture play its own sound
 	 *  again. Name either clip of the pair. */
 	reattachAudio(clipId: string) {
-		return this.#apply(reattachAudio(clipId));
+		return this.#apply(() => reattachAudio(clipId));
 	}
 	/** Reattach several pairs as **one** `Reattach audio (N clips)` revision, all or nothing. */
 	reattachAudioClips(clipIds: string[]) {
-		return this.#apply(reattachAudioClips(clipIds));
+		return this.#apply(() => reattachAudioClips(clipIds));
 	}
 	/** Link clips (two or more, one per track) so an edit to one is carried to the others. */
 	linkClips(clipIds: string[]) {
-		return this.#apply(linkClips(clipIds));
+		return this.#apply(() => linkClips(clipIds));
 	}
 	/** Take clips out of their link groups. */
 	unlinkClips(clipIds: string[]) {
-		return this.#apply(unlinkClips(clipIds));
+		return this.#apply(() => unlinkClips(clipIds));
 	}
 	concatenate(assetIds: string[]) {
-		return this.#apply(concatenate(assetIds));
+		return this.#apply(() => concatenate(assetIds));
 	}
 
 	// ---- history (undo / redo / revert) -------------------------------------
 
 	undo() {
-		this.clearSelection();
-		return this.#apply(apiUndo());
+		// Refused while the proposal is previewed (`#apply`): the selection it would clear is the proposal's.
+		if (!this.previewingStaged) this.clearSelection();
+		return this.#apply(() => apiUndo());
 	}
 	redo() {
-		this.clearSelection();
-		return this.#apply(apiRedo());
+		if (!this.previewingStaged) this.clearSelection();
+		return this.#apply(() => apiRedo());
 	}
 	revertTo(seq: number) {
-		this.clearSelection();
-		return this.#apply(apiRevertTo(seq));
+		if (!this.previewingStaged) this.clearSelection();
+		return this.#apply(() => apiRevertTo(seq));
 	}
 	/** What one revision changed; null where the backend can't say (browser). */
 	revisionDiff(seq: number) {
@@ -1184,8 +1576,12 @@ class EditorState {
 	 *  dialog (or glancing at the status bar) still shows progress and a Stop. */
 	exportRun = $state<{ progress: ExportProgress | null; cancelling: boolean } | null>(null);
 
-	async #render<T>(run: () => Promise<T>): Promise<T> {
-		this.#busyCount++;
+	/** Run a render. It raises `exportRun` (the status bar's progress and Stop, the dialog's state) but
+	 *  not `busy`: the export reads the cut it was started on, so the editor stays open while it runs —
+	 *  an export that takes minutes must not freeze every control. `blocks` is for the one that does
+	 *  write to the cut while it runs (the framing pass of a multi-format export). */
+	async #render<T>(run: () => Promise<T>, blocks = false): Promise<T> {
+		if (blocks) this.#busyCount++;
 		this.exportRun = { progress: null, cancelling: false };
 		let unlisten: (() => void) | undefined;
 		try {
@@ -1196,7 +1592,7 @@ class EditorState {
 		} finally {
 			unlisten?.();
 			this.exportRun = null;
-			this.#busyCount--;
+			if (blocks) this.#busyCount--;
 		}
 	}
 
@@ -1217,7 +1613,7 @@ class EditorState {
 		options: ExportOptions
 	): Promise<string[]> {
 		try {
-			return await this.#render(() => exportVariants(outputPath, formats, smartCrop, options));
+			return await this.#render(() => exportVariants(outputPath, formats, smartCrop, options), smartCrop);
 		} finally {
 			// The framing pass wrote onto the clips; the history has a revision
 			// the panel has not seen.

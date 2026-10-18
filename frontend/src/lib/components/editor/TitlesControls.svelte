@@ -1,6 +1,8 @@
 <script lang="ts">
 	// Titles, lower thirds and captions: style chips that add one at the playhead,
-	// the caption button (and which look it generates in), importing captions from
+	// animated SVG titles (a picker of the presets, thumbnails drawn by the engine and shown as
+	// images, and a custom one whose source is written in the Inspector), the library of motion
+	// templates (`TemplatesSection`), the caption button (and which look it generates in), importing captions from
 	// a subtitle file, and the lane's list of what is there. The content of the
 	// Inspector's "Titles lane" section and of the library's Titles tab — one
 	// component, so the two cannot drift.
@@ -9,11 +11,25 @@
 	import Chip from './Chip.svelte';
 	import CheckRow from './CheckRow.svelte';
 	import Icon from './Icon.svelte';
+	import Tile from './Tile.svelte';
+	import TemplatesSection from './TemplatesSection.svelte';
 	import { documentOf } from '#lib/realm';
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { CAPTION_LOOKS, TEXT_STYLES } from '#lib/style-presets';
-	import { addStyledTitle, addTextHere, dropCaptions, importCaptionFile, makeCaptions, pickTitle } from '#lib/title-actions';
+	import {
+		addAnimatedTitle,
+		addCustomSvgTitle,
+		addStyledTitle,
+		addTextHere,
+		dropCaptions,
+		importCaptionFile,
+		makeCaptions,
+		pickSvgTitle,
+		pickTitle,
+		presetThumbnail
+	} from '#lib/title-actions';
+	import { SVG_PRESETS, svgDisplayName, svgFrame, svgTooltip } from '#lib/svg-titles';
 	import {
 		CAPTION_EXTENSIONS,
 		CAPTION_HINT,
@@ -30,7 +46,8 @@
 		resolveChoice
 	} from '#lib/caption-import-ui';
 	import { attempt } from '#lib/ops';
-	import { clock } from '#lib/clock';
+	import { timeDisplay } from '#lib/time-display.svelte';
+	import { tip } from '#lib/tip';
 
 	const uid = $props.id();
 	/** The options row: where its window (the panel may be in a detached one) is read from. */
@@ -40,8 +57,40 @@
 	// reviewed); every button here acts on the live cut, and so does the count of
 	// captions an import or a recaption would replace.
 	const overlays = $derived(editor.overlays);
+	const svgOverlays = $derived(editor.svgOverlays);
 	const captionCount = $derived(generatedCount(editor.liveTimeline.overlays));
 	const hasCaptions = $derived(captionCount > 0);
+
+	// ---- animated titles ---------------------------------------------------------------------
+	// The picker opens under its button. A preset's thumbnail is the engine's own artwork for it, drawn for the
+	// project's delivery frame and shown through an <img>: a data URL runs no script and loads nothing. It plays
+	// its entrance when it appears and again when the pointer or the keyboard comes to it.
+	let animatedOpen = $state(false);
+	let thumbs = $state<Record<string, string>>({});
+	let replays = $state<Record<string, number>>({});
+	const thumbFrame = $derived(svgFrame(editor.timeline.format));
+
+	$effect(() => {
+		if (!animatedOpen) return;
+		for (const p of SVG_PRESETS) {
+			presetThumbnail(p.kind).then(
+				(url) => (thumbs[p.kind] = url),
+				() => {}
+			);
+		}
+	});
+
+	const replay = (kind: string) => (replays[kind] = (replays[kind] ?? 0) + 1);
+
+	function addPreset(kind: (typeof SVG_PRESETS)[number]['kind']) {
+		animatedOpen = false;
+		void addAnimatedTitle(kind);
+	}
+
+	function addCustom() {
+		animatedOpen = false;
+		void addCustomSvgTitle();
+	}
 
 	// ---- importing captions from a subtitle file ----------------------------
 	// The options row opens under the buttons; the file is picked from inside it, so
@@ -100,10 +149,71 @@
 <div class="k-overline" style="margin-bottom:6px">Add text</div>
 <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:6px;margin-bottom:14px">
 	{#each TEXT_STYLES as s (s.id)}
-		<Btn size="sm" icon="plus" iconSize={12} disabled={editor.busy} onclick={() => void addStyledTitle(s)}>{s.label}</Btn>
+		<Btn size="sm" icon="plus" iconSize={12} pending={editor.locked} onclick={() => void addStyledTitle(s)}>{s.label}</Btn>
 	{/each}
-	<Btn size="sm" icon="plus" iconSize={12} disabled={editor.busy} onclick={() => void addTextHere()}>Text</Btn>
+	<Btn size="sm" icon="plus" iconSize={12} pending={editor.locked} onclick={() => void addTextHere()}>Text</Btn>
 </div>
+<div class="k-overline" style="margin-bottom:6px">Animated</div>
+<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:6px;margin-bottom:{animatedOpen ? 6 : 14}px">
+	<Btn
+		size="sm"
+		icon="plus"
+		iconSize={12}
+		variant={animatedOpen ? 'primary' : 'secondary'}
+		aria-expanded={animatedOpen}
+		aria-controls="{uid}-animated"
+		pending={editor.locked}
+		title="Animated titles: ready-made motion, or your own SVG, drawn into the preview and the export"
+		onclick={() => (animatedOpen = !animatedOpen)}>Animated</Btn
+	>
+</div>
+{#if animatedOpen}
+	<div
+		id="{uid}-animated"
+		role="group"
+		aria-label="Animated titles"
+		style="display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:6px;margin-bottom:14px"
+	>
+		{#each SVG_PRESETS as p (p.kind)}
+			<Tile
+				data-preset={p.kind}
+				title={p.hint}
+				aria-label="Add {p.label} at the playhead"
+				pending={editor.locked}
+				style="height:auto;flex-direction:column;align-items:stretch;gap:5px;padding:5px"
+				onpointerenter={() => replay(p.kind)}
+				onfocus={(e: FocusEvent) => (e.currentTarget as HTMLElement).matches(':focus-visible') && replay(p.kind)}
+				onclick={() => addPreset(p.kind)}
+			>
+				<span
+					style="display:grid;place-items:center;aspect-ratio:{thumbFrame.width} / {thumbFrame.height};overflow:hidden;border-radius:var(--radius-sm);background:var(--surface-void);pointer-events:none"
+				>
+					{#if thumbs[p.kind]}
+						{#key replays[p.kind] ?? 0}
+							<img src={thumbs[p.kind]} alt="" decoding="async" style="width:100%;height:100%;object-fit:contain;display:block" />
+						{/key}
+					{/if}
+				</span>
+				<span style="overflow:hidden;text-overflow:ellipsis">{p.label}</span>
+			</Tile>
+		{/each}
+		<Tile
+			data-preset="custom"
+			title="Write your own animated SVG: starts from a small sample you edit in the Inspector"
+			pending={editor.locked}
+			style="height:auto;flex-direction:column;align-items:stretch;justify-content:center;gap:5px;padding:5px"
+			onclick={addCustom}
+		>
+			<span
+				style="display:grid;place-items:center;aspect-ratio:{thumbFrame.width} / {thumbFrame.height};overflow:hidden;border-radius:var(--radius-sm);border:var(--line-width) dashed var(--border-strong);color:var(--text-muted)"
+			>
+				<Icon n="code-xml" s={18} />
+			</span>
+			<span style="overflow:hidden;text-overflow:ellipsis">Custom SVG…</span>
+		</Tile>
+	</div>
+{/if}
+<TemplatesSection />
 <div class="k-overline" style="margin-bottom:6px">Captions</div>
 <div role="group" aria-label="Caption style" style="display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin-bottom:6px">
 	<span style="font-size:12px;color:var(--text-muted)">Style</span>
@@ -111,19 +221,19 @@
 		<Chip pressed={ui.captionStyle === c.id} title={c.hint} onclick={() => (ui.captionStyle = c.id)}>{c.label}</Chip>
 	{/each}
 </div>
-<div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin-bottom:6px">
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(142px,1fr));gap:6px;margin-bottom:6px">
 	<div style="display:flex;gap:4px;min-width:0">
 		<Btn
 			size="sm"
-			disabled={editor.busy}
+			pending={editor.locked}
 			title={hasCaptions ? recaptionHint(captionCount) : CAPTION_HINT}
 			style="flex:1;min-width:0"
 			onclick={() => void makeCaptions()}
 		>
-			{hasCaptions ? 'Recaption' : 'Captions'}
+			{hasCaptions ? 'Regenerate captions' : 'Generate captions'}
 		</Btn>
 		{#if hasCaptions}
-			<IconBtn size={28} title={clearHint(captionCount)} disabled={editor.busy} onclick={() => void dropCaptions()}>
+			<IconBtn size={28} title={clearHint(captionCount)} pending={editor.locked} onclick={() => void dropCaptions()}>
 				<Icon n="trash" s={14} />
 			</IconBtn>
 		{/if}
@@ -140,7 +250,7 @@
 	>
 </div>
 <div style="margin-bottom:10px">
-	<Btn size="sm" icon="mic" disabled={editor.busy} title="Speak a script onto the timeline" style="width:100%" onclick={() => ui.openVoiceover()}
+	<Btn size="sm" icon="mic" pending={editor.locked} title="Speak a script onto the timeline" style="width:100%" onclick={() => ui.openVoiceover()}
 		>Write a voiceover…</Btn
 	>
 </div>
@@ -215,7 +325,7 @@
 					: ''}
 			</div>
 			<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap">
-				<Btn size="sm" variant="primary" icon="file-text" disabled={editor.busy} onclick={() => void chooseFile()}
+				<Btn size="sm" variant="primary" icon="file-text" pending={editor.locked} onclick={() => void chooseFile()}
 					>Choose file…</Btn
 				>
 				<Btn size="sm" variant="ghost" onclick={() => closeImport(true)}>Cancel</Btn>
@@ -226,7 +336,7 @@
 		</div>
 	</div>
 {/if}
-{#if overlays.length === 0}
+{#if overlays.length === 0 && svgOverlays.length === 0}
 	<div style="font-size:12px;color:var(--text-muted);line-height:1.4">
 		No titles or captions yet. Add text, caption the whole cut from the transcripts of the clips on
 		the timeline (captions land on the words that survived your edit), or import a subtitle file.
@@ -242,14 +352,36 @@
 			<span style="flex:1;min-width:0;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 				>{o.text || '(empty)'}</span
 			>
-			<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);font-variant-numeric:tabular-nums">{clock(o.start)}</span>
+			<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);font-variant-numeric:tabular-nums">{timeDisplay.fmt(o.start)}</span>
 		</button>
 		<IconBtn
 			size={28}
 			data-tone="quiet"
 			title={`Remove ${o.text ? `“${o.text}”` : 'this title'}`}
-			disabled={editor.busy}
+			pending={editor.locked}
 			onclick={() => void attempt(() => editor.removeOverlay(o.id))}><Icon n="x" s={14} /></IconBtn
+		>
+	</div>
+{/each}
+{#each svgOverlays as o (o.id)}
+	{@const picked = editor.selectedSvgOverlayId === o.id}
+	<div data-kind="svg" style="display:flex;align-items:center;gap:6px;padding:3px 0">
+		<button
+			onclick={() => pickSvgTitle(o)}
+			aria-pressed={picked}
+			use:tip={svgTooltip(o)}
+			style="flex:1;min-width:0;display:flex;align-items:center;gap:8px;background:transparent;border:none;cursor:pointer;text-align:left;color:{picked ? 'var(--kerf-300)' : 'var(--text-secondary)'};padding:4px 0"
+		>
+			<Icon n="orbit" s={12} />
+			<span style="flex:1;min-width:0;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{svgDisplayName(o)}</span>
+			<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);font-variant-numeric:tabular-nums">{timeDisplay.fmt(o.start)}</span>
+		</button>
+		<IconBtn
+			size={28}
+			data-tone="quiet"
+			title={`Remove ${svgDisplayName(o) ? `“${svgDisplayName(o)}”` : 'this animated title'}`}
+			pending={editor.locked}
+			onclick={() => void attempt(() => editor.removeSvgOverlay(o.id))}><Icon n="x" s={14} /></IconBtn
 		>
 	</div>
 {/each}

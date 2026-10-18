@@ -33,7 +33,7 @@ describe('controls.css', () => {
 
 	test('a Btn and an IconBtn have a disabled look of their own, not the blanket opacity', () => {
 		for (const cls of ['.k-btn', '.k-ibtn']) {
-			const rule = new RegExp(`${cls.replace('.', '\\.')}:disabled\\s*\\{([^}]*)\\}`).exec(CONTROLS);
+			const rule = new RegExp(`${cls.replace('.', '\\.')}:disabled(?:,[^{]*)?\\s*\\{([^}]*)\\}`).exec(CONTROLS);
 			expect(rule, `${cls}:disabled`).not.toBeNull();
 			expect(rule![1]).toContain('color: var(--text-disabled)');
 			expect(rule![1]).toContain('opacity: 1');

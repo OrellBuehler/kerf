@@ -34,7 +34,7 @@
 
 use std::path::Path;
 
-use crate::model::{interpolate, Asset, Clip, Hdr, Timeline};
+use crate::model::{bt709_labels, interpolate, Asset, Clip, Hdr, StreamInfo, StreamKind, Timeline, SPLICE_CROSSFADE_S};
 
 /// The marker a head-padded proxy carries in its file name, ahead of `.mp4`.
 pub(crate) const HEAD_PADDED_SUFFIX: &str = ".lead.mp4";
@@ -92,6 +92,12 @@ pub struct ClipFx {
     /// for a crossfade; a motion transition sets it too, because the picture
     /// sliding is no reason for the audio to cut hard.
     pub afade_in: f64,
+    /// The crossfade into this clip (`afade_in`) / out of it (`tail`) is a real pair of two
+    /// different sounds, so it runs constant-power. Off for a fade up from black (no partner)
+    /// and for a pair whose overlap plays the same samples on both sides ([`same_sound`]):
+    /// correlated sound, which a linear pair keeps at unity where constant power would swell.
+    pub afade_in_power: bool,
+    pub tail_power: bool,
     /// Motion transitions, as `(dx, dy, seconds)` with the offsets in frame
     /// widths and heights. `move_in` is where the incoming clip starts before
     /// travelling to its position; `move_out` is where the outgoing clip is
@@ -111,6 +117,33 @@ pub struct ClipFx {
     /// from the start with no seek, such an input opens with the pad's clone of the
     /// first frame, which the original it stands for has no frame for.
     pub head_pad: bool,
+    /// The clip's picture is untagged HD YCbCr and shares the graph with an input that names a
+    /// matrix, so the chain labels it BT.709 (`setparams=colorspace=bt709`, the first filter of its chain):
+    /// FFmpeg 9 would otherwise read it as BT.601 and convert it into its neighbour's matrix.
+    /// Decided over the clips of the graph this table is for ([`graph_bt709_labels`]).
+    pub label_bt709: bool,
+    /// The YCbCr matrix the clip's frames are tagged with when they reach its grade (the
+    /// `setparams` name), which the grade's RGB filters must give back: FFmpeg 6.1 converts out of
+    /// RGB as BT.601 and drops the tag. `None` for an untagged or RGB picture.
+    pub frame_matrix: Option<&'static str>,
+}
+
+/// Which clips of `timeline` the graph built from it labels BT.709, indexed like [`transition_fx`]
+/// (flat storage order): [`bt709_labels`] over the first video stream of every video-track clip's
+/// asset. A clip of an audio track, or whose asset is missing or holds no picture, is no input.
+pub fn graph_bt709_labels(timeline: &Timeline, assets: &[Asset]) -> Vec<bool> {
+    let inputs: Vec<Option<&StreamInfo>> = timeline
+        .tracks
+        .iter()
+        .flat_map(|track| track.clips.iter().map(move |clip| (track.kind, clip)))
+        .map(|(kind, clip)| {
+            (kind == StreamKind::Video)
+                .then(|| assets.iter().find(|a| a.id == clip.asset_id))
+                .flatten()
+                .and_then(|a| a.streams.iter().find(|s| s.kind == StreamKind::Video))
+        })
+        .collect();
+    bt709_labels(&inputs)
 }
 
 /// Compute the [`ClipFx`] for every clip, resolving each `transition_in` against the
@@ -131,6 +164,11 @@ pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
         fx[flat].hdr = asset.and_then(|a| a.hdr());
         fx[flat].alpha = asset.is_some_and(|a| a.has_alpha());
         fx[flat].head_pad = asset.is_some_and(|a| is_head_padded_proxy(&a.path));
+        let stream = asset.and_then(|a| a.streams.iter().find(|s| s.kind == StreamKind::Video));
+        fx[flat].frame_matrix = crate::model::frame_matrix(stream, fx[flat].hdr.is_some());
+    }
+    for (fx, label) in fx.iter_mut().zip(graph_bt709_labels(timeline, assets)) {
+        fx.label_bt709 = label;
     }
     let asset_dur = |id| assets.iter().find(|a| a.id == id).map(|a| a.duration);
     let is_still = |id| assets.iter().find(|a| a.id == id).is_some_and(|a| a.is_image());
@@ -200,6 +238,10 @@ pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
                             // no handle — it just becomes a hard cut).
                             let overlap = d.min(p.duration()).min(clip.duration()).min(avail.max(0.0));
                             fx[base + pj].tail = fx[base + pj].tail.max(overlap);
+                            if overlap > 0.0 && !same_sound(p, clip, overlap) {
+                                fx[base + pj].tail_power = true;
+                                fx[base + j].afade_in_power = true;
+                            }
                             if overlap > 0.0 && tr.kind.pushes() {
                                 if let Some((dx, dy)) = slide {
                                     // The outgoing clip leaves the way the incoming one
@@ -227,6 +269,24 @@ pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
         base += n;
     }
     fx
+}
+
+/// Whether a crossfade of `overlap` seconds from `out` into `inn` carries correlated sound on
+/// both sides: one asset at one speed and direction, and either the incoming clip picking up
+/// within the overlap of where the outgoing one's handle continues (the same samples — a cut
+/// inside one take, a music fit's splice between continuous bars), or a de-click splice no
+/// longer than [`SPLICE_CROSSFADE_S`] (a music fit's splice between bars chosen to sound alike,
+/// which constant power would push over the song's own peak).
+pub fn same_sound(out: &Clip, inn: &Clip, overlap: f64) -> bool {
+    if out.asset_id != inn.asset_id || (out.speed - inn.speed).abs() > 1e-9 {
+        return false;
+    }
+    let (continues, picks_up) = if out.is_reversed() {
+        (out.source_in, inn.source_out)
+    } else {
+        (out.source_out, inn.source_in)
+    };
+    overlap <= SPLICE_CROSSFADE_S + 1e-9 || (continues - picks_up).abs() < overlap * out.speed_mag()
 }
 
 /// Every clip of `timeline` with its [`ClipFx`], in `transition_fx`'s order:
@@ -692,8 +752,11 @@ impl<'a> ClipTiming<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::test_support::{img_asset, make_clip, single, test_asset, video_stream};
+    use crate::engine::test_support::{
+        audio_track, img_asset, make_clip, single, test_asset, timeline_of, video_stream, video_track,
+    };
     use crate::model::{Transition, TransitionKind};
+    use uuid::Uuid;
 
     fn asset() -> Asset {
         test_asset(vec![video_stream(1920, 1080, 30.0)])
@@ -708,6 +771,66 @@ mod tests {
         let timeline = single(vec![a, b]);
         let fx = transition_fx(&timeline, std::slice::from_ref(asset));
         (timeline, fx)
+    }
+
+    fn picture(w: u32, h: u32, tag: Option<&str>) -> Asset {
+        let mut stream = video_stream(w, h, 30.0);
+        stream.pix_fmt = Some("yuv420p".into());
+        stream.color_space = tag.map(Into::into);
+        test_asset(vec![stream])
+    }
+
+    #[test]
+    fn the_graphs_clips_are_labelled_by_the_table_the_chains_are_built_from() {
+        let (hd, phone, sd) = (
+            picture(1920, 1080, None),
+            picture(1920, 1080, Some("bt709")),
+            picture(720, 576, None),
+        );
+        let assets = [hd.clone(), phone.clone(), sd.clone()];
+        let clip = |a: &Asset, at| make_clip(a.id, 0.0, 1.0, at);
+        // Stored order is the table's order: V1 holds an HD clip then the phone's, V2 an SD clip and an HD.
+        let tl = timeline_of(vec![
+            video_track(vec![clip(&hd, 0.0), clip(&phone, 1.0)]),
+            video_track(vec![clip(&sd, 0.0), clip(&hd, 1.0)]),
+        ]);
+        let labels: Vec<bool> = transition_fx(&tl, &assets).iter().map(|f| f.label_bt709).collect();
+        assert_eq!(labels, [true, false, false, true]);
+        assert_eq!(graph_bt709_labels(&tl, &assets), labels);
+        // Nothing else of a clip's fx moves with it.
+        assert!(transition_fx(&tl, &assets).iter().all(|f| ClipFx {
+            label_bt709: false,
+            frame_matrix: None,
+            ..*f
+        } == ClipFx::default()));
+
+        // Untagged footage alone, a single clip, and an HD clip beside SD: unlabelled.
+        for tracks in [
+            vec![video_track(vec![clip(&hd, 0.0)])],
+            vec![video_track(vec![clip(&hd, 0.0), clip(&hd, 1.0)])],
+            vec![video_track(vec![clip(&hd, 0.0)]), video_track(vec![clip(&sd, 0.0)])],
+        ] {
+            let tl = timeline_of(tracks);
+            assert!(transition_fx(&tl, &assets).iter().all(|f| !f.label_bt709));
+        }
+
+        // A tagged clip on an audio track is not a picture in the graph; one that is muted or
+        // disabled is gone before the graph is built (`for_render`), which is what the table is for.
+        let tl = timeline_of(vec![video_track(vec![clip(&hd, 0.0)]), audio_track(vec![clip(&phone, 0.0)])]);
+        assert_eq!(graph_bt709_labels(&tl, &assets), [false, false]);
+        let mut muted = video_track(vec![clip(&phone, 0.0)]);
+        muted.muted = true;
+        let tl = timeline_of(vec![video_track(vec![clip(&hd, 0.0)]), muted]);
+        assert_eq!(graph_bt709_labels(&tl, &assets), [true, false]);
+        assert_eq!(graph_bt709_labels(&tl.for_render(), &assets), [false]);
+
+        // A clip whose asset is not in the list is no input.
+        let tl = single(vec![
+            make_clip(Uuid::new_v4(), 0.0, 1.0, 0.0),
+            clip(&hd, 1.0),
+            clip(&phone, 2.0),
+        ]);
+        assert_eq!(graph_bt709_labels(&tl, &assets), [false, true, false]);
     }
 
     fn timing<'a>(tl: &'a Timeline, fx: &'a [ClipFx], i: usize) -> ClipTiming<'a> {
@@ -779,6 +902,57 @@ mod tests {
         assert_eq!((ramp[0].edge, ramp[0].tint), (FadeEdge::In, FadeTint::Alpha));
         assert_eq!((ramp[0].st, ramp[0].d), (10.0, 1.0));
         assert_eq!((inc.fx.xfade_in, inc.fx.afade_in), (1.0, 1.0));
+    }
+
+    #[test]
+    fn only_a_pair_of_different_sounds_crossfades_at_constant_power() {
+        let (asset, other) = (asset(), asset());
+        let fade = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 1.0,
+        });
+        // (outgoing: source in, out, speed), (incoming: source in, out, speed, asset) -> power?
+        let power = |a: (f64, f64, f64), b: (f64, f64, f64), id: Uuid| {
+            let mut out = make_clip(asset.id, a.0, a.1, 0.0);
+            out.speed = a.2;
+            let mut inn = make_clip(id, b.0, b.1, out.duration());
+            inn.speed = b.2;
+            inn.transition_in = fade;
+            let fx = transition_fx(&single(vec![out, inn]), &[asset.clone(), other.clone()]);
+            assert_eq!(fx[1].afade_in, 1.0);
+            assert_eq!(fx[0].tail_power, fx[1].afade_in_power);
+            fx[1].afade_in_power
+        };
+        // Elsewhere in the take, another asset, another speed or direction: two sounds.
+        assert!(power((0.0, 10.0, 1.0), (20.0, 30.0, 1.0), asset.id));
+        assert!(power((0.0, 10.0, 1.0), (10.0, 20.0, 1.0), other.id));
+        assert!(power((0.0, 20.0, 2.0), (20.0, 30.0, 1.0), asset.id));
+        assert!(power((20.0, 30.0, -1.0), (0.0, 10.0, 1.0), asset.id));
+        assert!(power((0.0, 10.0, 1.0), (11.5, 20.0, 1.0), asset.id));
+        // Picking up where the handle runs, or within the overlap of it: the same samples.
+        assert!(!power((0.0, 10.0, 1.0), (10.0, 20.0, 1.0), asset.id));
+        assert!(!power((0.0, 10.0, 1.0), (10.5, 20.0, 1.0), asset.id));
+        assert!(!power((0.0, 10.0, 1.0), (9.5, 20.0, 1.0), asset.id));
+        assert!(!power((0.0, 20.0, 2.0), (21.5, 30.0, 2.0), asset.id));
+        assert!(!power((20.0, 30.0, -1.0), (10.0, 20.0, -1.0), asset.id));
+        // A de-click splice of one recording (a music fit's, between bars that sound alike).
+        let splice = |id: Uuid| {
+            let out = make_clip(asset.id, 0.0, 10.0, 0.0);
+            let mut inn = make_clip(id, 20.0, 30.0, 10.0);
+            inn.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: SPLICE_CROSSFADE_S,
+            });
+            transition_fx(&single(vec![out, inn]), &[asset.clone(), other.clone()])[1].afade_in_power
+        };
+        assert!(!splice(asset.id));
+        assert!(splice(other.id));
+
+        // A dissolve up from black has no partner: a plain linear fade.
+        let mut lone = make_clip(asset.id, 0.0, 10.0, 0.0);
+        lone.transition_in = fade;
+        let fx = transition_fx(&single(vec![lone]), std::slice::from_ref(&asset));
+        assert_eq!((fx[0].afade_in, fx[0].afade_in_power), (1.0, false));
     }
 
     #[test]

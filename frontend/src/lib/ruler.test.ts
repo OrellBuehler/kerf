@@ -12,7 +12,7 @@ import {
 	tickLabel,
 	ticksIn
 } from './ruler';
-import { formatTimecode } from './timecode';
+import { formatFrames, formatTimecode, timecodeRate } from './timecode';
 import { ZOOM_MAX, ZOOM_MIN } from './zoom';
 
 const RATES = [24, 25, 30, 60, 30000 / 1001, 24000 / 1001];
@@ -94,11 +94,27 @@ describe('rulerStep', () => {
 	});
 
 	test('at a fractional rate a labelled second is on a frame, not a hair off it', () => {
-		const fps = 30000 / 1001;
+		const fps = 24000 / 1001;
 		const g = rulerGrid(36, fps);
-		expect(g.step).toBeCloseTo((5 * 30) / fps, 12);
+		expect(g.step).toBeCloseTo((5 * 24) / fps, 12);
 		expect(g.step).toBeGreaterThan(5);
 		for (let k = 0; k < 500; k++) expect(tickLabel(k, g, fps)).toBe(hms(k * 5));
+	});
+
+	test('at a drop-frame rate a label is the drop-frame timecode of its frame, as the playhead reads it', () => {
+		for (const fps of [30000 / 1001, 60000 / 1001]) {
+			const r = timecodeRate(fps);
+			for (const z of [36, 2, ZOOM_MAX]) {
+				const g = rulerGrid(z, fps);
+				const f = Math.round(g.step * fps);
+				for (let k = 0; k < 2000; k += 7) {
+					expect(tickLabel(k, g, fps)).toBe(formatFrames(r, k * f));
+					expect(tickLabel(k, g, fps)).toBe(formatTimecode(k * g.step, fps));
+				}
+			}
+		}
+		// Past the first minute the labels are drop-frame: 00;01;00;00 does not exist.
+		expect(tickLabel(12, rulerGrid(36, 30000 / 1001), 30000 / 1001)).toBe('00;01;00;02');
 	});
 });
 
@@ -222,7 +238,7 @@ describe('tickLabel', () => {
 			const nominal = nominalRate(fps);
 			const f = Math.round(g.step * fps);
 			for (let k = 0; k < 400; k++) {
-				const [, , s, ff] = tickLabel(k, g, fps).split(':').map(Number);
+				const [, , s, ff] = tickLabel(k, g, fps).split(/[:;]/).map(Number);
 				const frame = (Math.floor((k * f) / nominal) % 60) * nominal + ((k * f) % nominal);
 				expect(s * nominal + ff).toBe(frame);
 			}
@@ -257,5 +273,40 @@ describe('frame ticks', () => {
 
 	test('are bounded', () => {
 		expect(frameTicksIn(0, 1e6, 30, 2000, 300).length).toBe(300);
+	});
+});
+
+describe('tickLabel in seconds mode', () => {
+	test('a whole-second step is m:ss, h:mm:ss from an hour, and never a tenth it does not have', () => {
+		const g = rulerGrid(8, 30);
+		expect(g.frames).toBe(false);
+		expect(tickLabel(0, g, 30, 'seconds')).toBe('0:00');
+		const five = { step: 5, frames: false, divisions: 1 };
+		expect(tickLabel(13, five, 30, 'seconds')).toBe('1:05');
+		expect(tickLabel(720, five, 30, 'seconds')).toBe('1:00:00');
+		expect(tickLabel(721, five, 30, 'seconds')).toBe('1:00:05');
+	});
+
+	test('a step of a timecode second at 29.97 is labelled by the second it is nearest', () => {
+		const g = { step: 30 / 29.97, frames: false, divisions: 1 };
+		expect(tickLabel(59, g, 29.97, 'seconds')).toBe('0:59');
+		expect(tickLabel(60, g, 29.97, 'seconds')).toBe('1:00');
+	});
+
+	test('below a second the fraction is there, to the millisecond, so two frame ticks never read alike', () => {
+		const frame = { step: 1 / 30, frames: true, divisions: 1 };
+		const labels = Array.from({ length: 31 }, (_, k) => tickLabel(k, frame, 30, 'seconds'));
+		expect(new Set(labels).size).toBe(31);
+		expect(labels[1]).toBe('0:00.033');
+		expect(labels[15]).toBe('0:00.5');
+		expect(labels[30]).toBe('0:01.0');
+		expect(tickLabel(3, { step: 0.5, frames: true, divisions: 1 }, 30, 'seconds')).toBe('0:01.5');
+	});
+
+	test('timecode is still the default, and says the same as before', () => {
+		const g = rulerGrid(8, 30);
+		expect(tickLabel(13, { step: 5, frames: false, divisions: 1 }, 30)).toBe('00:01:05');
+		expect(tickLabel(13, { step: 5, frames: false, divisions: 1 }, 30, 'timecode')).toBe('00:01:05');
+		expect(tickLabel(0, g, 30)).toBe(tickLabel(0, g, 30, 'timecode'));
 	});
 });

@@ -69,6 +69,23 @@ export interface TranscriptSegment {
 	start: number;
 	end: number;
 	text: string;
+	/** The line's words with their own source times, when known. Absent in a transcript
+	 *  made before words were recorded and in imported captions. */
+	words?: Word[];
+	/** Who speaks the line (`S1`, `S2`, …), when speakers were labelled. */
+	speaker?: string | null;
+}
+
+/** One word of a transcript line, in the asset's source time. */
+export interface Word {
+	text: string;
+	start: number;
+	end: number;
+	confidence?: number | null;
+	/** Spread over the line by character share (the backend reports no word times), then
+	 *  tightened to the speech energy. */
+	estimated?: boolean;
+	speaker?: string | null;
 }
 
 export interface Loudness {
@@ -237,6 +254,53 @@ export interface Color {
 	gamma: number;
 	/** Warm/cool shift −1..1 (0 = neutral; positive warms, negative cools). */
 	temperature: number;
+}
+
+/** A point of a tone curve: input to output, both 0..1. */
+export interface CurvePoint {
+	x: number;
+	y: number;
+}
+
+/** Tone curves; an absent or empty list is the identity. A channel's curve runs first, the master on its result. */
+export interface Curves {
+	master?: CurvePoint[];
+	red?: CurvePoint[];
+	green?: CurvePoint[];
+	blue?: CurvePoint[];
+}
+
+/** One colour wheel (`colorbalance` for its range): a puck in the unit disc and a lightness −1..1. */
+export interface Wheel {
+	x: number;
+	y: number;
+	lightness: number;
+}
+
+export interface Wheels {
+	shadows: Wheel;
+	midtones: Wheel;
+	highlights: Wheel;
+}
+
+/** A `.cube` 3D LUT a clip is looked up through, and how much of it (0..1). */
+export interface ClipLut {
+	path: string;
+	intensity: number;
+}
+
+/** Curves, wheels and a LUT, applied after `color` (LUT, curves, wheels). Each absent when unused. */
+export interface Grade {
+	curves?: Curves | null;
+	wheels?: Wheels | null;
+	lut?: ClipLut | null;
+}
+
+/** What a `.cube` file holds. */
+export interface LutInfo {
+	path: string;
+	size: number;
+	title?: string;
 }
 
 export type MaskShape = 'rect' | 'ellipse';
@@ -416,6 +480,208 @@ export interface TextOverlay {
 	generated?: boolean;
 }
 
+/** The ready-made animated titles (`kerf_core::SvgPresetKind`). */
+export type SvgPresetKind = 'fade_up' | 'typewriter' | 'lower_third' | 'word_pop';
+
+/** What a preset is filled with. */
+export interface SvgPresetParams {
+	text: string;
+	subtitle?: string | null;
+	/** Any SVG colour. */
+	color: string;
+	/** The second colour a preset draws in (bar, last word, subtitle). */
+	accent: string;
+	/** A font family; unset / `null` is the font Kerf ships. */
+	font?: string | null;
+}
+
+/** Params as a caller may write them: the backend fills what is left out. */
+export type SvgPresetParamsInput = Pick<SvgPresetParams, 'text'> & Partial<Omit<SvgPresetParams, 'text'>>;
+
+/** How an animated title was made when it came from a preset. */
+export interface SvgPreset {
+	kind: SvgPresetKind;
+	params: SvgPresetParams;
+}
+
+/** An animated SVG title: SMIL-animated artwork drawn over the cut, above the clips and below the
+ *  text overlays. `svg` is the **sanitised** source (stored = rendered); the page never inlines it,
+ *  only shows a placement box and `<img>` data-URL thumbnails. The artwork is fit "contain",
+ *  centred, into the rectangle `x, y, width, height` (fractions of the frame, top-left origin). */
+export interface SvgOverlay {
+	id: string;
+	name: string;
+	svg: string;
+	start: number;
+	end: number;
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+	opacity: number;
+	/** Seconds of the document's own clock already elapsed at `start` (a slice cut into it).
+	 *  The backend omits it at 0. */
+	offset?: number;
+	/** Absent on custom artwork. */
+	preset?: SvgPreset;
+	/** Present on a title made from a motion template: what it remembers of it. The artwork is still this
+	 *  title's own `svg`, so a value change is `set_template_values`, never a patch of `svg` (that ends the template). */
+	template?: TemplateInstance;
+}
+
+/** Where an animated title's artwork comes from; externally tagged, as the backend reads it. */
+export type SvgSource = { custom: string } | { preset: { kind: SvgPresetKind; params: SvgPresetParamsInput } };
+
+/** Name and placement of a new animated title; a field left out takes the default (full frame, opaque). */
+export interface SvgLayout {
+	name?: string;
+	x?: number;
+	y?: number;
+	width?: number;
+	height?: number;
+	opacity?: number;
+}
+
+/** Fields of an animated title to change; one left out stays. `svg` replaces the artwork with
+ *  custom source (and so drops the preset); `preset_params` re-fills a preset title and `preset_kind`
+ *  switches it to another kind, keeping its id and place in the draw order (a custom title refuses
+ *  both); `svg` is exclusive with either. */
+export interface SvgOverlayPatch {
+	name?: string;
+	svg?: string;
+	preset_params?: SvgPresetParamsInput;
+	preset_kind?: SvgPresetKind;
+	start?: number;
+	end?: number;
+	x?: number;
+	y?: number;
+	width?: number;
+	height?: number;
+	opacity?: number;
+}
+
+/** One parameter a preset takes. */
+export interface SvgPresetParamInfo {
+	name: string;
+	required: boolean;
+	default?: string;
+}
+
+/** A preset and what it takes (`list_svg_presets`). */
+export interface SvgPresetInfo {
+	kind: SvgPresetKind;
+	label: string;
+	params: SvgPresetParamInfo[];
+}
+
+/** What `validate_svg` made of a source: the sanitised document, what could not be honoured, and how
+ *  long its animations run (`null` when they never end or there are none). */
+export interface SvgCheck {
+	svg: string;
+	warnings: string[];
+	natural_duration: number | null;
+}
+
+/** What a template control changes (`kerf_core::TemplateKind`): an element's text, a colour attribute, a
+ *  plain number in an attribute, a `font-family`, or an `<image>`'s `href` (a `data:` URL). */
+export type TemplateKind = 'text' | 'color' | 'number' | 'font' | 'image';
+
+/** Where a control's value goes: the element with this `id`, and which attribute (none for `text`). */
+export interface TemplateTarget {
+	element: string;
+	/** As the SVG spells it (`fill`, `stop-color`, `xlink:href`); required for every kind but `text`. */
+	attribute?: string;
+}
+
+/** One thing about a template that can be changed without opening the artwork. Values are strings:
+ *  text as it reads; a colour as `#rgb[a]` / `#rrggbb[aa]` / an SVG colour name / `none` / `currentColor`
+ *  (no `rgb()`); a number unitless in plain decimal; a font as one family name; an image as a `data:` URL
+ *  (`template_image_value` makes one from a file). */
+export interface TemplateControl {
+	/** Unique in the template; the key of a value. `[A-Za-z][A-Za-z0-9_-]{0,63}`. */
+	id: string;
+	label: string;
+	kind: TemplateKind;
+	/** Every place the one value is written (1 to 16). */
+	targets: TemplateTarget[];
+	/** Bounds of a `number` control; absent otherwise. */
+	min?: number;
+	max?: number;
+}
+
+/** What a title on the timeline remembers of the template it came from (`SvgOverlay.template`). */
+export interface TemplateInstance {
+	/** The library id it came from; the library is never consulted again. */
+	template_id: string;
+	name: string;
+	controls: TemplateControl[];
+	/** Each control's current value, read back from the title's `svg` after every change; a control whose
+	 *  element is gone is absent, and **`image` controls are never here** (their `data:` URL is in the `svg`). */
+	values: Record<string, string>;
+}
+
+/** A template in the library, as the grid shows it. Its poster is fetched on its own (`templatePoster`). */
+export interface TemplateInfo {
+	/** A lower-case UUID. */
+	id: string;
+	name: string;
+	description: string;
+	/** Seconds it runs: the length an applied one gets. */
+	duration: number;
+	/** The artwork's own shape in pixels. */
+	width: number;
+	height: number;
+	controls: TemplateControl[];
+	/** The families of the fonts it carries. */
+	fonts: string[];
+	has_poster: boolean;
+	size_bytes: number;
+}
+
+/** A file in the library that could not be read (it is listed, not a failure of the list). */
+export interface TemplateProblem {
+	file: string;
+	error: string;
+}
+
+/** The library: the templates that read, by name, and the files that did not. */
+export interface TemplateList {
+	templates: TemplateInfo[];
+	problems: TemplateProblem[];
+}
+
+/** A template saved into the library, and what could not be carried over (a font whose licence or size
+ *  keeps it out of the file, ...). */
+export interface TemplateSaved {
+	info: TemplateInfo;
+	warnings: string[];
+}
+
+/** What importing a `.kerftemplate` did: it never overwrites. `already_present`: the library had this very
+ *  template, nothing was written. `added_as_copy`: another template has the id, so this was kept under a new one. */
+export type ImportStatus = 'added' | 'already_present' | 'added_as_copy';
+
+export interface ImportOutcome {
+	info: TemplateInfo;
+	status: ImportStatus;
+	warnings: string[];
+}
+
+/** What applying a template or setting a template title's values hands back: the refreshed cut, the title
+ *  that was made or changed (the one to select), and what the sanitiser or the machine could not honour
+ *  (e.g. a font that is not installed). */
+export interface TemplateEdit {
+	timeline: Timeline;
+	overlay_id: string;
+	warnings: string[];
+}
+
+/** An element of a title that has an `id` and its tag name: what a control can aim at (`svg_element_ids`). */
+export interface SvgElementId {
+	id: string;
+	tag: string;
+}
+
 /** The look a generated caption set takes: a held subtitle line, or one large
  *  word at a time — the style social captions have converged on. */
 export type CaptionStyle = 'lines' | 'word_punch';
@@ -431,8 +697,8 @@ export interface CaptionOptions {
 	size?: number;
 }
 
-/** A subtitle format Kerf reads: SubRip (`.srt`) or ASS / SSA (`.ass`, `.ssa`). */
-export type CaptionFormat = 'srt' | 'ass';
+/** A subtitle format Kerf reads: SubRip (`.srt`), WebVTT (`.vtt`) or ASS / SSA (`.ass`, `.ssa`). */
+export type CaptionFormat = 'srt' | 'ass' | 'vtt';
 
 /** Which clock an imported subtitle file's times are on. `timeline`: a subtitle
  *  track made for the finished cut (the default). `source`: the file times one
@@ -498,6 +764,8 @@ export interface Clip {
 	speed?: number;
 	transform?: Transform;
 	color?: Color;
+	/** Curves, colour wheels and a LUT; absent when unused (the backend omits it). */
+	grade?: Grade;
 	transition_in?: Transition | null;
 	/** A shape cut out of this clip; absent is the whole frame. */
 	mask?: Mask | null;
@@ -618,6 +886,51 @@ export interface Marker {
 	time: number;
 	name: string;
 	color?: string | null;
+	/** How long the marked span runs from `time`, seconds. Absent / 0 is a point. */
+	duration?: number;
+	/** A free-form note. Absent is none. */
+	comment?: string;
+	/** Absent is `comment`. A `chapter` starts a chapter of the exported file. */
+	kind?: MarkerKind;
+}
+
+/** What a marker is for — mirrors `kerf_core::MarkerKind`. */
+export type MarkerKind = 'comment' | 'chapter';
+
+/** A change to a marker; each absent field is left alone. */
+export interface MarkerPatch {
+	time?: number;
+	name?: string;
+	color?: string;
+	duration?: number;
+	comment?: string;
+	kind?: MarkerKind;
+}
+
+/** A subtitle format Kerf writes (`kerf_core::SubtitleFormat`). */
+export type SubtitleFormat = 'srt' | 'vtt';
+
+/** An interchange format (`kerf_core::InterchangeFormat`). */
+export type InterchangeFormat = 'otio' | 'edl';
+
+/** A marker list a delivery carries (`kerf_core::MarkerListFormat`). */
+export type MarkerListFormat = 'csv' | 'youtube';
+
+/** One line of an export `Report`: what was dropped or approximated, and how often. */
+export interface ReportEntry {
+	level: 'info' | 'warning';
+	message: string;
+	count: number;
+}
+
+export interface Report {
+	entries: ReportEntry[];
+}
+
+/** A side-file written, and what its format could not carry (`kerf_core::ExportedFile`). */
+export interface ExportedFile {
+	path: string;
+	report: Report;
 }
 
 /** The frame the project is cut *for* — the shape of the delivered video.
@@ -647,11 +960,16 @@ export interface MasterBus {
 	 *  bus drops by exactly that many dB (negative, clamped to -40..-1) while the rest speaks.
 	 *  The backend omits it when unset. */
 	duck_depth_db?: number | null;
+	/** The limiter holds the true peak (runs 4x oversampled). Absent / false is the sample-peak
+	 *  limiter; the backend omits it when off. */
+	true_peak?: boolean;
 }
 
 export interface Timeline {
 	tracks: Track[];
 	overlays?: TextOverlay[];
+	/** Animated SVG titles, in draw order. The backend omits the list when empty. */
+	svg_overlays?: SvgOverlay[];
 	markers?: Marker[];
 	/** Unset = the shape follows the footage (the historical behaviour). */
 	format?: Delivery | null;
@@ -799,6 +1117,10 @@ export type DiffKind =
 	| 'master_changed';
 
 export interface DiffEntry {
+	/** The change's stable name, `<kind>:<the clip, text, marker or track it is about>`, which it keeps for
+	 *  as long as the proposal holds it: what `applyStagedSubset` is sent. The backend always sets it; it is
+	 *  optional here so a fixture need not, and `entryId` (`staged-subset.ts`) derives the same name. */
+	id?: string;
 	kind: DiffKind;
 	summary: string;
 	detail?: string | null;
@@ -806,6 +1128,8 @@ export interface DiffEntry {
 	clip_id?: string | null;
 	/** The title or caption an `overlay_*` entry is about. */
 	overlay_id?: string | null;
+	/** The marker a `marker_*` entry is about. */
+	marker_id?: string | null;
 	at?: number | null;
 }
 
@@ -822,12 +1146,102 @@ export interface StagedEdit {
 	base_seq: number;
 	task_id?: string | null;
 	note?: string | null;
+	/** Some agent session owns the proposal. (The session id itself never leaves the backend.) */
+	owned_by_agent?: boolean;
 	edits: string[];
+	/** How many of the latest staged steps `undoStagedEdit` can still take back (absent: none). */
+	undo_depth?: number;
+	/** Changes to the library held back with the proposal (an asset marked as 360); they land with it. */
+	asset_changes?: StagedAssetChange[];
 	created_at: string;
 	updated_at: string;
 	/** The live timeline moved on since this branched — applying replaces it. */
 	stale: boolean;
 	diff: TimelineDiff;
+}
+
+/** A change to an *asset* an agent made while a proposal was open (`kerf_core::StagedAssetChange`). */
+export interface StagedAssetChange {
+	/** `asset_projection:<asset id>`, usable wherever a `DiffEntry.id` is. */
+	id: string;
+	asset_id: string;
+	/** The projection the asset is to be marked with; `null` clears it. */
+	projection: Projection | null;
+	/** One line for the review card. */
+	summary: string;
+}
+
+/** A change applied although the reviewer did not pick it, and why it had to be. */
+export interface AutoIncluded {
+	id: string;
+	summary: string;
+	because: string;
+}
+
+/** A picked change that no longer applies, and why. */
+export interface SkippedChange {
+	id: string;
+	summary: string;
+	why: string;
+}
+
+/** What `applyStagedSubset` did (`kerf_core::SubsetApplied`). */
+export interface SubsetApplied {
+	/** Changes applied, the ones that came along included. */
+	applied: number;
+	auto_included: AutoIncluded[];
+	skipped: SkippedChange[];
+	/** Changes still waiting for review in the proposal. */
+	remaining: number;
+	/** Nothing is left, so the proposal closed. */
+	closed: boolean;
+	/** One sentence for the toast. */
+	message: string;
+	/** The live timeline afterwards. */
+	timeline: Timeline;
+}
+
+/** What `undoStagedEdit` took back: the step's label and the proposal as it now stands. */
+export interface StagedUndone {
+	label: string;
+	staged: StagedEdit;
+}
+
+/** What `relinkAsset` did (`kerf_core::Relinked`). */
+export interface Relinked {
+	asset: Asset;
+	/** The new file is the old media moved, so its analysis still holds; otherwise it was dropped. */
+	analysis_kept: boolean;
+	previous_path: string;
+}
+
+/** What `checkRelink` found, before anything is changed (`kerf_core::RelinkCheck`). */
+export interface RelinkCheck {
+	/** The file is the old media moved, so the analysis would be kept. */
+	analysis_kept: boolean;
+	/** The asset has analysis to lose: for one without, a different recording costs nothing. */
+	has_analysis: boolean;
+}
+
+/** What removing an asset did (`kerf_core::RemovedAsset`). */
+export interface RemovedAsset {
+	asset: Asset;
+	/** Clips of the cut removed with it (only with `force`). */
+	clips_removed: number;
+}
+
+/** The `remove_asset` answer: what was removed and the refreshed cut. */
+export interface AssetRemoval extends RemovedAsset {
+	timeline: Timeline;
+}
+
+/** An asset whose source file is gone (`kerf_core::MissingAsset`). */
+export interface MissingAsset {
+	asset_id: string;
+	name: string;
+	path: string;
+	/** Clips of the cut that use it. */
+	clips: number;
 }
 
 export type TaskStatus = 'queued' | 'working' | 'ready' | 'done' | 'failed';
@@ -884,6 +1298,43 @@ export interface ExportOptions {
 	loudnorm?: boolean;
 	/** Normalize the final mix to a platform's loudness target. Wins over `loudnorm`. */
 	loudness?: LoudnessPreset | null;
+	/** Reach the target with one measured static gain and a true-peak limiter instead of
+	 *  `loudnorm` (the export measures the mix first; dynamics stay as mixed). */
+	loudness_static?: boolean;
+	/** Mux the cut's captions in as a soft subtitle stream (mp4 / mov / mkv / webm). */
+	embed_captions?: boolean;
+	/** Caption files written beside the export (`cut.srt`, `cut.vtt`), once it completes. */
+	caption_sidecars?: SubtitleFormat[];
+	/** Replace caption files already beside the export; otherwise the export is refused. */
+	overwrite_sidecars?: boolean;
+	/** Leave the generated captions out of the picture (typed titles are still drawn). */
+	skip_burned_captions?: boolean;
+}
+
+/** What syncing a clip to another by their sound found (`kerf_core::AudioSync`). */
+export interface AudioSync {
+	reference_id: string;
+	clip_id: string;
+	/** Seconds the clip moves on the timeline; positive is later. */
+	offset: number;
+	/** Where the clip starts in sync. */
+	timeline_start: number;
+	/** Correlation peak over its RMS; 8 or more is a clear match. */
+	confidence: number;
+	/** Peak over the next-best match more than 50 ms away; 1.5 or more is unambiguous. `null` when
+	 *  nothing else matched at all. */
+	distinct: number | null;
+	reliable: boolean;
+	/** One recording has inverted polarity. */
+	inverted: boolean;
+	/** The clip was moved (an unreliable match is only reported unless forced). */
+	applied: boolean;
+}
+
+/** `sync_clips_by_audio`'s answer: the sync and the timeline after it. */
+export interface SyncedByAudio {
+	sync: AudioSync;
+	timeline: Timeline;
 }
 
 /** A delivery's loudness target (`kerf_core::LoudnessPreset`): YouTube and Spotify -14 LUFS,
@@ -949,8 +1400,10 @@ export interface ExportProgress {
 	fraction: number;
 	elapsed_secs: number;
 	eta_secs?: number | null;
-	/** Set while the render has not started because the machine is busy with another heavy job
-	 *  (`waiting for the preview proxy`): a queued export is not hung at 0%. */
+	/** Set while the render has not started: the machine is busy with another heavy job
+	 *  (`waiting for the preview proxy`), or a static loudness normalization is metering the mix
+	 *  (`measuring the mix's loudness`) — so the export is not hung at 0%. A multi-format export
+	 *  sets it too. */
 	waiting?: string | null;
 	/** Set by a multi-format export: which file is rendering, of how many.
 	 *  `fraction` then spans all of them. */
@@ -977,6 +1430,11 @@ export interface AnalysisProgress {
 	fraction?: number | null;
 	/** A short note, e.g. `84 MB / 142 MB`. */
 	detail?: string | null;
+}
+
+/** Payload of the `smart-crop-progress` event: how much of the shots have been sampled. */
+export interface SmartCropProgress {
+	fraction: number;
 }
 
 /** Payload of the `model-progress` event, emitted while a speech model downloads. */
@@ -1066,6 +1524,13 @@ export interface StemsStatus {
 }
 
 /** Payload of the `stems-progress` event, the same shape as `voiceover-progress`. */
+/** `audio-sync-progress`: a sync by audio waiting for the heavy-job slot (`detail` says why). */
+export interface AudioSyncProgress {
+	stage: 'waiting';
+	fraction: null;
+	detail: string | null;
+}
+
 export interface StemsProgress {
 	stage: 'download_runtime' | 'download_model' | 'separate' | 'encode';
 	fraction: number | null;
@@ -1091,6 +1556,18 @@ export interface StemsResult {
  *  there — never created, so the page says so instead. */
 export type LaunchRequest = { open: string } | { missing: string };
 
+/** An untitled project a crashed Kerf left behind (kerf-core `RecoveryInfo`), offered at launch. */
+export interface RecoveryInfo {
+	id: string;
+	/** When its file was last written (ISO 8601), if known. */
+	modified_at: string | null;
+	assets: number;
+	clips: number;
+	/** Edits in its history, the initial state not counted. */
+	edits: number;
+	last_edit: string | null;
+}
+
 /** A newer signed release found on GitHub by the updater. */
 export interface UpdateInfo {
 	/** The available version, e.g. `0.18.0`. */
@@ -1102,6 +1579,8 @@ export interface UpdateInfo {
 	/** Release notes (the GitHub release body), when present. */
 	notes?: string | null;
 }
+
+export type TimeDisplay = 'timecode' | 'seconds';
 
 /** App preferences — machine settings, not project state, so they live in the
  *  platform config directory rather than in the `.kerf` file. */
@@ -1126,6 +1605,14 @@ export interface AppSettings {
 	 *  every frame (experimental; off by default). Frames it cannot draw, and
 	 *  every failure, are the JPEG as ever. */
 	gpu_preview: boolean;
+	/** How times are written: frame-accurate `timecode` (the default) or plain `seconds`. */
+	time_display: TimeDisplay;
+	/** Open the project that was open last when Kerf starts without one named on its command line. */
+	reopen_last_project: boolean;
+	/** The `.kerf` files opened or saved most recently, newest first, at most 10. Kept by the app
+	 *  (`recentProjects` prunes the ones that are gone, `clearRecentProjects` empties it); a settings
+	 *  patch cannot write it. */
+	recent_projects: string[];
 	/** The single dock arrangement saved before there were workspaces (dockview's
 	 *  serialized layout). Read only to migrate it into the Edit workspace when
 	 *  `workspaces` is absent; nothing writes it any more. */
@@ -1140,7 +1627,25 @@ export interface AppSettings {
 	 *  { <action id>: [<chord>, …] } }`, only the actions they touched, validated
 	 *  and migrated by `keymap.ts` on the way back in. Opaque to the backend. */
 	keybindings: unknown | null;
+	/** Whether an agent's edits are held back for the user to review (the default). Changed on the
+	 *  Agent settings page (`setMcpSettings`); the agent cannot turn it off. */
+	agent_review: boolean;
+	/** Whether the embedded MCP server listens at all. */
+	mcp_enabled: boolean;
+	/** Where it listens (`host:port`); `null` is `127.0.0.1:7777`. `KERF_MCP_ADDR` in the environment
+	 *  still overrides it (`McpConnectionInfo.env_override`). */
+	mcp_addr: string | null;
+	/** Whether a request must carry `Authorization: Bearer <token>`. The token itself is never in the
+	 *  settings view: ask `mcpConnectionInfo`. */
+	mcp_require_token: boolean;
+	/** The editing defaults — `{ snap, still_seconds, title_seconds }` — read by `editing-prefs.ts`, which
+	 *  clamps what it finds. Opaque to the backend. */
+	editing: unknown | null;
 }
+
+/** What `setSettings` may write: any preference but the recent-projects list, which the app keeps itself
+ *  as projects open and save (the backend refuses a patch that names it). */
+export type SettingsPatch = Partial<Omit<AppSettings, 'recent_projects'>>;
 
 /** `AppSettings` resolved against the engine, which is what the settings
  *  surface renders: the effective percentage (an environment override may win
@@ -1331,4 +1836,154 @@ export interface PlayAsk {
 export interface MusicFitted {
 	timeline: Timeline;
 	report: MusicFitReport;
+}
+
+// ---- agent connection (MCP server): `crates/kerf-app/src/mcp_commands.rs` ---------
+
+/** What the Agent settings page shows and the user copies into an MCP client
+ *  (`McpConnectionInfo`). The token is a secret: show it on request, never log it. */
+export interface McpConnectionInfo {
+	/** Whether the server is switched on. */
+	enabled: boolean;
+	/** Where a client connects, e.g. `http://127.0.0.1:7777/mcp`. */
+	url: string;
+	/** Whether requests must carry `Authorization: Bearer <token>`. */
+	require_token: boolean;
+	/** The bearer token (made on the first start), even while it is not required. */
+	token: string | null;
+	/** Why the token is not what it should be: it could not be saved (it works until Kerf quits) or
+	 *  could not be made (the server stays off while one is required). `null` when it is fine. */
+	token_problem: string | null;
+	/** Whether the listener is up now. */
+	running: boolean;
+	/** Why it is not, when it should be (the port is taken, the address is refused). */
+	error: string | null;
+	/** The stored address (`null` is the default `127.0.0.1:7777`); what the address field edits. */
+	configured_addr: string | null;
+	/** `KERF_MCP_ADDR` is set in the environment and wins over `configured_addr`. */
+	env_override: boolean;
+	/** Whether an agent's edits wait for the user's review (the default). */
+	agent_review: boolean;
+	/** The one-line command that adds Kerf to Claude Code. */
+	claude_code_command: string;
+	/** A `mcpServers` JSON snippet for any other MCP client. */
+	generic_json_config: string;
+}
+
+/** The agent switches `set_mcp_settings` takes — any of them. The server restarts by itself when
+ *  the address or the enabled switch moves; a token or requirement change applies at once. */
+export interface McpSettingsPatch {
+	mcp_enabled?: boolean;
+	/** `host:port`; `null` goes back to the default. A network address needs the token. */
+	mcp_addr?: string | null;
+	mcp_require_token?: boolean;
+	agent_review?: boolean;
+}
+
+/** What the editor window shows, reported for an agent's `get_editor_context`
+ *  (`crates/kerf-app/src/editor_context.rs`). Timeline seconds; ids are the live timeline's. */
+export interface UiContext {
+	playhead: number;
+	selected_clip_ids: string[];
+	mark_in: number | null;
+	mark_out: number | null;
+	visible_range: { start: number; end: number } | null;
+	focused_panel: string | null;
+	selected_asset_id: string | null;
+}
+
+/** A scope the Scopes panel draws (`kerf_core::scopes::ScopeKind`). */
+export type ScopeKind = 'waveform' | 'parade' | 'vectorscope' | 'histogram';
+/** The Y'CbCr matrix the scopes read the frame with; `auto` is the delivery's. */
+export type ScopeMatrix = 'auto' | 'bt601' | 'bt709' | 'bt2020';
+
+export interface ScopeGridSize {
+	columns: number;
+	rows: number;
+	vector: number;
+}
+
+/** One channel over every pixel of the frame: levels 0..1, pixels clipped at 0 and at 1. */
+export interface ScopeChannel {
+	min: number;
+	max: number;
+	mean: number;
+	clipped_low: number;
+	clipped_high: number;
+	clipped_low_pct: number;
+	clipped_high_pct: number;
+}
+
+/** Mean Cb / Cr (-0.5..0.5), the hue (degrees from +Cb) and saturation (|CbCr| / 0.5) of
+ *  that mean, and the mean of every pixel's saturation. */
+export interface ScopeChroma {
+	cb: number;
+	cr: number;
+	hue_deg: number;
+	saturation: number;
+	mean_saturation: number;
+}
+
+export interface ScopePeak {
+	cb: number;
+	cr: number;
+	hue_deg: number;
+	saturation: number;
+	share: number;
+}
+
+export interface ScopeSummary {
+	width: number;
+	height: number;
+	matrix: 'bt601' | 'bt709' | 'bt2020';
+	red: ScopeChannel;
+	green: ScopeChannel;
+	blue: ScopeChannel;
+	luma: ScopeChannel;
+	chroma: ScopeChroma;
+	peaks: ScopePeak[];
+}
+
+/** Counts: `counts[row * columns + column]`, row 0 the lowest level (the most negative Cr on
+ *  the vectorscope, Cb across). */
+export interface ScopeGrid {
+	columns: number;
+	rows: number;
+	counts: number[];
+}
+
+/** 256 bins per channel. */
+export interface ScopeHistogram {
+	red: number[];
+	green: number[];
+	blue: number[];
+	luma: number[];
+}
+
+/** `kerf_core::scopes::Scopes`: the summary always, the grids that were asked for. */
+export interface Scopes {
+	summary: ScopeSummary;
+	waveform?: ScopeGrid;
+	/** Red, green, blue. */
+	parade?: ScopeGrid[];
+	vectorscope?: ScopeGrid;
+	histogram?: ScopeHistogram;
+}
+
+/** How the Preview plays a span (`kerf_core::render_bar::BarState`). */
+export type BarState = 'gpu' | 'stream' | 'stall';
+
+export interface BarSpan {
+	start: number;
+	end: number;
+	state: BarState;
+	/** A stable key for the reason (`reversed`, `proxy_wait`, `mask`, `gpu`, …). */
+	kind: string;
+	reason: string;
+}
+
+/** `kerf_core::render_bar::RenderBar`: with the GPU preview off only the stalls are listed. */
+export interface RenderBar {
+	gpu_preview: boolean;
+	spans: BarSpan[];
 }

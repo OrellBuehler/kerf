@@ -243,6 +243,12 @@
 								>
 							{/if}
 							<span class="kerf-spin" style="color:var(--kerf-400)"><Icon n="loader" s={14} /></span>
+							<IconBtn
+								title={editor.stoppingImport ? 'Stopping…' : 'Stop importing'}
+								size={24}
+								pending={editor.stoppingImport}
+								onclick={() => void editor.stopImport()}><Icon n="x" s={14} /></IconBtn
+							>
 						</span>
 					{:else}
 						<IconBtn

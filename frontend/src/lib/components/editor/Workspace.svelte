@@ -13,12 +13,14 @@
 	import AgentPanel from './AgentPanel.svelte';
 	import DeliverPanel from './DeliverPanel.svelte';
 	import Mixer from './Mixer.svelte';
+	import Scopes from './Scopes.svelte';
 	import DockEmpty from './DockEmpty.svelte';
 	import ContextMenu from './ContextMenu.svelte';
 	import { POPOUT_URL, isPanelId, type PanelId } from '#lib/layout';
 	import { workspace } from '#lib/workspace.svelte';
 	import { popout } from '#lib/popout.svelte';
 	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
 	import { agentTabLabel, proposalIndicator } from '#lib/agent-status';
 
 	const COMPONENTS: Record<PanelId, Component<any>> = {
@@ -28,7 +30,8 @@
 		inspector: Inspector,
 		agent: AgentPanel,
 		deliver: DeliverPanel,
-		mixer: Mixer
+		mixer: Mixer,
+		scopes: Scopes
 	};
 
 	let el = $state<HTMLDivElement | null>(null);
@@ -141,7 +144,11 @@
 		// Before the workspace is restored: a saved layout may hold windows to open.
 		popout.attach(api, { window: menuIn });
 		workspace.attach(api, el!);
+		ui.focusedPanel = api.activePanel?.id ?? null;
+		const active = api.onDidActivePanelChange((e) => (ui.focusedPanel = e.panel?.id ?? null));
 		return () => {
+			active.dispose();
+			ui.focusedPanel = null;
 			workspace.detach();
 			popout.detach();
 			api.dispose();

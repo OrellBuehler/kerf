@@ -56,8 +56,13 @@ base64 = "0.23.1"
 rmcp.workspace = true
 schemars.workspace = true
 axum.workspace = true
+tokio-util.workspace = true
+getrandom.workspace = true
 anyhow.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "time"] }
+
+[dev-dependencies]
+kerf-core = { workspace = true, features = ["test-support"] }
 
 # Detached panels need two things from WebKitGTK that wry does not do: let a script open a
 # window without a user gesture, and close the window when the page closes its webview.
@@ -71,4 +76,4 @@ webkit2gtk = "2.0"
 x11rb.workspace = true
 raw-window-handle.workspace = true
 # The process's own Xlib display (`gpu_preview::x11::display`), opened through libX11 at runtime.
-libloading = "0.8"
+libloading = "0.9"

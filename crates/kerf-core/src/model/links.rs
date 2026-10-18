@@ -1679,6 +1679,14 @@ impl Timeline {
             if !new.is_finite() || new == 0.0 {
                 return Err(Error::InvalidArgument("a linked clip would end up with no speed".to_string()));
             }
+            if !(super::MIN_SPEED..=super::MAX_SPEED).contains(&new.abs()) {
+                return Err(Error::InvalidArgument(format!(
+                    "a linked clip would end up at {:.3}× — a clip's speed stays within {}× to {}×",
+                    new.abs(),
+                    super::MIN_SPEED,
+                    super::MAX_SPEED
+                )));
+            }
             updates.push((partner, new));
         }
         self.tracks[ti].clips[ci].speed = speed;
@@ -1886,6 +1894,7 @@ mod tests {
         Timeline {
             tracks,
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -3123,6 +3132,7 @@ mod tests {
                 start: 1.0,
                 end: 4.0,
                 text: "hello there".to_string(),
+                ..Default::default()
             }],
         )]);
         let words = |t: &Timeline| -> Vec<(String, f64, f64)> {

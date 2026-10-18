@@ -239,3 +239,55 @@ describe('the cheaper line timer', () => {
 		}
 	});
 });
+
+describe('word-timed lines (mirrors the word_timed_* Rust tests)', () => {
+	const timed = (text: string, words: [string, number, number][]): TranscriptSegment => ({
+		start: words[0][1],
+		end: words[words.length - 1][2] + 1,
+		text,
+		words: words.map(([t, start, end]) => ({ text: t, start, end }))
+	});
+	const round = (out: { text: string; start: number; end: number }[]) =>
+		out.map((o) => [o.text, Math.round(o.start * 100) / 100, Math.round(o.end * 100) / 100]);
+
+	test('lines follow the words and their pauses', () => {
+		const line = timed('one two three four five six', [
+			['one', 0, 0.3],
+			['two', 0.3, 0.6],
+			['three', 0.6, 1.0],
+			['four', 1.0, 1.4],
+			['five', 4.0, 4.4],
+			['six', 4.4, 5.0]
+		]);
+		const out = captionsForTimeline(timelineOf([clip({ source_out: 20 })]), { a1: [line] });
+		expect(round(out)).toEqual([
+			['one two three four', 0, 1.9],
+			['five six', 4, 5.5]
+		]);
+	});
+
+	test('a short line merges into its neighbour', () => {
+		const line = timed('a long', [
+			['a', 0, 0.1],
+			['long', 0.1, 1.0]
+		]);
+		const out = captionsForTimeline(timelineOf([clip({ source_out: 20 })]), { a1: [line] }, {
+			...CAPTION_DEFAULTS,
+			max_words: 1
+		});
+		expect(round(out)).toEqual([['a long', 0, 1.5]]);
+	});
+
+	test('lines project through trim and speed, and a word spoken before the in-point shows nothing', () => {
+		const line = timed('cut kept', [
+			['cut', 1.0, 1.9],
+			['kept', 4.0, 5.0]
+		]);
+		const out = captionsForTimeline(
+			timelineOf([clip({ source_in: 2, source_out: 10, timeline_start: 5, speed: 2 })]),
+			{ a1: [line] },
+			CAPTION_STYLES.word_punch
+		);
+		expect(round(out)).toEqual([['kept', 6, 6.75]]);
+	});
+});

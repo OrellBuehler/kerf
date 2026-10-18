@@ -225,6 +225,62 @@ pub fn pix_fmt_is_high_bit(name: &str) -> bool {
         && (stem == "gray" || (stem.starts_with("yuv") && stem.ends_with('p')))
 }
 
+/// Whether a colour-matrix tag **states** one: `unknown`, `unspecified` and `reserved` (a value no
+/// matrix has, which FFmpeg reads as it reads none) do not, and neither does no tag at all. Every
+/// other name does, `gbr` (RGB, "identity") included: a file that says anything about its matrix is
+/// not untagged. Whether a stream's tag is the *file's* word to a graph is
+/// [`StreamInfo::names_a_matrix`]'s question.
+pub fn matrix_tag_is_stated(tag: Option<&str>) -> bool {
+    tag.is_some_and(|t| !matches!(t.trim(), "" | "unknown" | "unspecified" | "reserved"))
+}
+
+/// The codecs whose decoders write `bt470bg` on everything they decode, whatever the file says. A tag
+/// from one of them is the decoder's default, not the file's word. `mjpeg`, `amv`, `speedhq` and
+/// `jpegls` (`rgb24`, `gray` and `gray16le` alike) were probed on FFmpeg 6.1.1 and 9.0.2 with ~100
+/// encoder / pixel-format pairs, and no other encodable codec did. `mjpegb`, `sp5x`, `thp` and
+/// `smvjpeg` are decode-only, so there is no file to probe: they share MJPEG's `ff_mjpeg_decode_init`,
+/// which sets the tag. `mxpeg` (decode-only too) is listed on the same assumption, which costs nothing
+/// if it is wrong: a codec that writes no tag has nothing to exclude.
+pub(crate) const DEFAULT_TAG_CODECS: [&str; 9] = [
+    "mjpeg", "amv", "speedhq", "jpegls", "mjpegb", "sp5x", "thp", "smvjpeg", "mxpeg",
+];
+
+/// Whether a picture is **untagged HD YCbCr**: HD (mpv's rule, `width >= 1280 || height > 576`, on
+/// the source's displayed size), YCbCr on the pixel-format allow-list (alpha, grey and RGB are not),
+/// not `yuvj…` (JFIF and a webcam's MJPEG are BT.601 by definition), naming no matrix and not HDR
+/// (which is tone-mapped to a BT.709 picture). What every player shows as BT.709 and FFmpeg reads as
+/// BT.601 — see [`bt709_labels`].
+pub fn untagged_hd_yuv(color_space: Option<&str>, pix_fmt: &str, width: u32, height: u32, hdr: bool) -> bool {
+    if hdr || matrix_tag_is_stated(color_space) || pix_fmt.to_ascii_lowercase().starts_with("yuvj") {
+        return false;
+    }
+    matches!(pix_fmt_layout(pix_fmt), Some(PixLayout::Yuv420 | PixLayout::OtherYuv)) && (width >= 1280 || height > 576)
+}
+
+/// Which inputs of one filter graph the export labels **BT.709** (`setparams=colorspace=bt709`),
+/// given each input's first video stream (`None` for an input with no picture).
+///
+/// FFmpeg 9 negotiates the colour matrix along the graph and converts every layer that is tagged
+/// otherwise into the bottom layer's, and it reads a picture that names no matrix as BT.601. An
+/// untagged HD clip beside a BT.709 one is therefore *converted* (28 dB off), though every player
+/// shows it as BT.709 like its neighbour. So an untagged HD input is labelled BT.709 **when another
+/// input in the graph names a matrix** (a tag, or HDR, which the graph tone-maps to a BT.709
+/// picture), and only then: a graph with no such input, a single clip, and everything that is not
+/// untagged HD YCbCr (an SD picture, MJPEG, RGB, grey, alpha, a still image) is built as it always
+/// was. The label moves no pixel by itself; it states what the picture is.
+///
+/// The decision is the **graph's**, not a frame's: the export, the scrub window and the playback
+/// stream decide over the clips of their own cut, a still over the layers on screen. The preview
+/// decodes proxies but is decided from the **original's** stream, so a proxy smaller than HD (a
+/// small proxy size in Settings) is labelled as its original is.
+pub fn bt709_labels(inputs: &[Option<&StreamInfo>]) -> Vec<bool> {
+    let named = inputs.iter().flatten().any(|s| s.names_a_matrix());
+    inputs
+        .iter()
+        .map(|s| named && s.is_some_and(|s| s.is_untagged_hd_yuv()))
+        .collect()
+}
+
 /// The layout of a **known-opaque** pixel format, from an allow-list; `None` for
 /// anything else — alpha-carrying, palettised, or simply not on the list. A
 /// renderer that cannot draw alpha should refuse what is not here rather than
@@ -362,6 +418,53 @@ impl StreamInfo {
         }
     }
 
+    /// Whether this video stream **names a YCbCr matrix** to a graph that holds it: HDR (tone-mapped to
+    /// a tagged BT.709 picture) or a tag that is the *file's* word ([`matrix_tag_is_stated`]).
+    ///
+    /// The principle: **a tag a decoder writes by default is not the file's word.** Probed on both
+    /// FFmpegs, those are `gbr` on any PNG (`rgb24`, `rgba`, `gray`) and, depending on the encoder that
+    /// made it, on RGB video; `bt470bg` on a JPEG and a WebP; and `bt470bg` from the decoders of
+    /// [`DEFAULT_TAG_CODECS`] (MJPEG video and its relatives, an AMV player's clips, NDI's SpeedHQ,
+    /// JPEG-LS), whatever their pixel format. An explicit tag on any other codec is the file's,
+    /// `yuvj…` full-range H.264 included (FFmpeg's h264 decoder names every full-range stream
+    /// `yuvj420p`, and a camera's `pc` + `bt709` is a matrix).
+    ///
+    /// This is *not* the mirror of [`StreamInfo::is_untagged_hd_yuv`]'s exclusions: grey, alpha and SD
+    /// pictures are never labelled but do name a matrix when tagged, and that asymmetry is intended
+    /// (a tagged SD clip is a stated matrix; it just is not HD). What the two share is only that a
+    /// still image, RGB and a decoder's default are nobody's word.
+    pub fn names_a_matrix(&self) -> bool {
+        self.kind == StreamKind::Video && (self.hdr().is_some() || (self.tag_is_the_files() && self.has_a_yuv_tag()))
+    }
+
+    /// The tag is a matrix a YCbCr picture states: not `gbr` (RGB, "identity"), and not on an RGB
+    /// picture, which has no YCbCr matrix to name whoever tagged it.
+    pub(crate) fn has_a_yuv_tag(&self) -> bool {
+        matrix_tag_is_stated(self.color_space.as_deref())
+            && self.color_space.as_deref().map(str::trim) != Some("gbr")
+            && self.pix_fmt.as_deref().and_then(pix_fmt_layout) != Some(PixLayout::Rgb)
+    }
+
+    /// Whether the tag can be the file's own: not a still image's and not written by one of the
+    /// decoders that tag everything they decode ([`DEFAULT_TAG_CODECS`]).
+    fn tag_is_the_files(&self) -> bool {
+        !self.image && !DEFAULT_TAG_CODECS.iter().any(|c| self.codec.eq_ignore_ascii_case(c))
+    }
+
+    /// Whether this video stream is **untagged HD YCbCr** ([`untagged_hd_yuv`]) and a moving
+    /// picture: a still image is not (a lossy WebP is BT.601 by its format, not by a convention).
+    pub fn is_untagged_hd_yuv(&self) -> bool {
+        self.kind == StreamKind::Video
+            && !self.image
+            && untagged_hd_yuv(
+                self.color_space.as_deref(),
+                self.pix_fmt.as_deref().unwrap_or(""),
+                self.width.unwrap_or(0),
+                self.height.unwrap_or(0),
+                self.hdr().is_some(),
+            )
+    }
+
     /// The HDR transfer this video stream is encoded in, or `None` for SDR and
     /// for anything that is not video.
     pub fn hdr(&self) -> Option<Hdr> {
@@ -459,9 +562,14 @@ impl Asset {
     }
 
     /// The HDR transfer of this asset's video, if it is HDR footage that must be
-    /// tone-mapped to SDR wherever it is decoded.
+    /// tone-mapped to SDR wherever it is decoded. Of the **first** video stream, the one every
+    /// graph input (`[i:v]`) and the BT.709 label ([`bt709_labels`]) read: a second video stream
+    /// (cover art, a thumbnail) neither tone-maps the first nor names a matrix for it.
     pub fn hdr(&self) -> Option<Hdr> {
-        self.streams.iter().find_map(|s| s.hdr())
+        self.streams
+            .iter()
+            .find(|s| s.kind == StreamKind::Video)
+            .and_then(StreamInfo::hdr)
     }
 
     /// Whether this asset's picture carries an alpha channel, by the probed pixel format of
@@ -506,11 +614,35 @@ pub struct TimeRange {
 }
 
 /// A transcript line with timecodes (seconds).
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TranscriptSegment {
     pub start: f64,
     pub end: f64,
     pub text: String,
+    /// The line's words with their own source times, when known (see [`crate::transcript`]).
+    /// Empty in a transcript made before words were recorded and in imported captions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<Word>,
+    /// Who speaks the line (`S1`, `S2`, …), when speakers were labelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+}
+
+/// One word of a [`TranscriptSegment`], in the asset's source time.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct Word {
+    pub text: String,
+    pub start: f64,
+    pub end: f64,
+    /// The recognizer's confidence, 0..1, when it reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    /// The times were spread over the line by character share (the backend reports
+    /// none), then tightened to the speech energy.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub estimated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
 }
 
 /// EBU R128 loudness measurement of an asset's audio, from a single `loudnorm`
@@ -639,23 +771,34 @@ fn level_notes(master: Option<&LevelReading>, tracks: &[TrackLevels], bus: &Mast
              re-encoded."
         );
         if bus.limiter {
-            // The limiter holds the *sample* peak at its ceiling, so what is left over
-            // is the peak between samples: take the ceiling down by that, and a margin.
+            // A sample-peak limiter leaves the peak between samples over its ceiling: the fix
+            // is true-peak limiting, or the ceiling taken down by the overshoot and a margin.
+            // A true-peak limiter already holds it, so only a lower ceiling is left.
             let ceiling = bus.safe_ceiling_db();
             let lower = (ceiling - (tp - LEVELS_TRUE_PEAK_CEILING_DBTP) - LEVELS_CEILING_MARGIN_DB).max(MASTER_MIN_CEILING_DB);
-            if lower < ceiling {
-                notes.push(format!(
+            notes.push(match (bus.true_peak, lower < ceiling) {
+                (false, true) => format!(
                     "{over} The master limiter is already on, but it holds the sample peak at {ceiling:.1} dBFS and the peak \
-                     between samples runs above that. Lower its ceiling to about {lower:.1} dBFS (set_master_limiter)."
-                ));
-            } else {
-                notes.push(format!(
-                    "{over} The master limiter is already on at its lowest ceiling. Lower the master or the loudest track."
-                ));
-            }
+                     between samples runs above that. Turn on true-peak limiting (set_master_true_peak), or lower its \
+                     ceiling to about {lower:.1} dBFS (set_master_limiter)."
+                ),
+                (false, false) => format!(
+                    "{over} The master limiter is already on at its lowest ceiling. Turn on true-peak limiting \
+                     (set_master_true_peak), or lower the master or the loudest track."
+                ),
+                (true, true) => format!(
+                    "{over} The master limiter is already on and holds the true peak at {ceiling:.1} dBFS. Lower its \
+                     ceiling to about {lower:.1} dBFS (set_master_limiter)."
+                ),
+                (true, false) => format!(
+                    "{over} The master limiter is already on, holding the true peak at its lowest ceiling. Lower the \
+                     master or the loudest track."
+                ),
+            });
         } else {
             notes.push(format!(
-                "{over} Turn on the master limiter (set_master_limiter) or lower the master."
+                "{over} Turn on the master limiter (set_master_limiter) with true-peak limiting (set_master_true_peak), \
+                 or lower the master."
             ));
         }
     }
@@ -1380,11 +1523,19 @@ impl Mask {
             shape: self.shape,
             x: clamp01(self.x),
             y: clamp01(self.y),
-            width: self.width.clamp(0.01, 2.0),
-            height: self.height.clamp(0.01, 2.0),
+            width: finite_or(self.width, 0.5).clamp(0.01, 2.0),
+            height: finite_or(self.height, 0.5).clamp(0.01, 2.0),
             feather: clamp01(self.feather),
             inverted: self.inverted,
         }
+    }
+}
+
+fn finite_or(v: f64, fallback: f64) -> f64 {
+    if v.is_finite() {
+        v
+    } else {
+        fallback
     }
 }
 
@@ -1970,6 +2121,225 @@ impl TextOverlay {
     }
 }
 
+/// Most animated SVG overlays one timeline holds.
+pub const MAX_SVG_OVERLAYS: usize = 50;
+
+/// The latest second an animated title may start or end at (24 hours). A position far out is a
+/// mistake, not an edit, and the engine looks for the frame at it.
+pub const MAX_SVG_SECONDS: f64 = 24.0 * 3600.0;
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
+}
+
+fn white_hex() -> String {
+    "#ffffff".to_string()
+}
+
+fn accent_hex() -> String {
+    "#ffb000".to_string()
+}
+
+/// The ready-made animated titles; each is generated as SVG with SMIL, so a preset overlay is an
+/// ordinary SVG overlay that remembers how it was made (and is re-made when its timing or frame
+/// changes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SvgPresetKind {
+    FadeUp,
+    Typewriter,
+    LowerThird,
+    WordPop,
+}
+
+impl SvgPresetKind {
+    pub const ALL: [SvgPresetKind; 4] = [Self::FadeUp, Self::Typewriter, Self::LowerThird, Self::WordPop];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FadeUp => "fade_up",
+            Self::Typewriter => "typewriter",
+            Self::LowerThird => "lower_third",
+            Self::WordPop => "word_pop",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FadeUp => "Fade up",
+            Self::Typewriter => "Typewriter",
+            Self::LowerThird => "Lower third",
+            Self::WordPop => "Word pop",
+        }
+    }
+}
+
+/// What a preset is filled with.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SvgPresetParams {
+    pub text: String,
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    /// Any SVG colour (`#ffffff`, `white`, `rgb(...)`).
+    #[serde(default = "white_hex")]
+    pub color: String,
+    #[serde(default = "accent_hex")]
+    pub accent: String,
+    /// A font family; `None` is the font Kerf ships.
+    #[serde(default)]
+    pub font: Option<String>,
+}
+
+impl SvgPresetParams {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            subtitle: None,
+            color: white_hex(),
+            accent: accent_hex(),
+            font: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SvgPreset {
+    pub kind: SvgPresetKind,
+    pub params: SvgPresetParams,
+}
+
+/// An animated SVG title on the timeline: SMIL-animated vector artwork, drawn over the picture
+/// (above clips, below text overlays) between `start` and `end`. `svg` is the **sanitised** source
+/// (what is stored is what is rendered; see [`crate::svg`]). It is fit "contain", centred, into the
+/// rectangle `x, y, width, height` (fractions of the frame, top-left origin).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SvgOverlay {
+    pub id: Uuid,
+    #[serde(default)]
+    pub name: String,
+    pub svg: String,
+    pub start: f64,
+    pub end: f64,
+    #[serde(default)]
+    pub x: f64,
+    #[serde(default)]
+    pub y: f64,
+    #[serde(default = "one")]
+    pub width: f64,
+    #[serde(default = "one")]
+    pub height: f64,
+    #[serde(default = "one")]
+    pub opacity: f64,
+    /// Seconds of the document's own clock already elapsed at `start`: a slice or range export that
+    /// cuts into the overlay starts it part-way through its animation instead of replaying it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub offset: f64,
+    /// How the SVG was made when it came from a preset; `None` for custom artwork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<SvgPreset>,
+    /// The motion template this title was made from, with its controls and their values; `None` for
+    /// anything else (and so absent from the stored JSON, which is why a project without templates
+    /// reads and writes the bytes it always did). The artwork is `svg` itself: a value is spliced into
+    /// it, not kept beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<crate::template::TemplateInstance>,
+}
+
+impl SvgOverlay {
+    /// The overlay's own clock at timeline time `t`.
+    pub fn doc_time(&self, t: f64) -> f64 {
+        (t - self.start).max(0.0) + self.offset
+    }
+
+    /// How long the document is meant to run: the visible span plus what a slice cut off the front.
+    pub fn doc_duration(&self) -> f64 {
+        (self.end - self.start).max(0.0) + self.offset
+    }
+
+    /// A name to show: the given one, else the preset's text, else a placeholder.
+    pub fn display_name(&self) -> String {
+        if !self.name.trim().is_empty() {
+            self.name.trim().to_string()
+        } else if let Some(p) = &self.preset {
+            p.params.text.clone()
+        } else {
+            "SVG".to_string()
+        }
+    }
+
+    /// Re-make a preset's artwork for `frame` and the current length. Custom artwork is untouched.
+    pub fn regenerate(&mut self, frame: (u32, u32)) {
+        if let Some(p) = &self.preset {
+            self.svg = crate::svg::render_preset(p.kind, &p.params, self.doc_duration(), frame);
+        }
+    }
+}
+
+/// Fields of an [`SvgOverlay`] to change; `None` leaves one alone. `svg` replaces the artwork with
+/// custom source (and so drops the preset); `preset_params` re-fills a preset overlay and
+/// `preset_kind` switches it to another kind (both refused on custom artwork, and either one is
+/// exclusive with `svg`; together they re-make the preset in one edit).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SvgOverlayPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub svg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_params: Option<SvgPresetParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_kind: Option<SvgPresetKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f64>,
+}
+
+impl SvgOverlayPatch {
+    /// What a patch can be refused for without the timeline and without parsing: the artwork and the
+    /// preset's parameters or kind are exclusive, the parameters are valid, the times are numbers.
+    pub fn check_cheap(&self) -> crate::error::Result<()> {
+        use crate::error::Error;
+        if self.svg.is_some() && (self.preset_params.is_some() || self.preset_kind.is_some()) {
+            return Err(Error::InvalidArgument(
+                "pass either svg or preset_params / preset_kind, not both".to_string(),
+            ));
+        }
+        if let Some(params) = &self.preset_params {
+            crate::svg::check_params(params)?;
+        }
+        if [self.start, self.end].iter().flatten().any(|v| !v.is_finite()) {
+            return Err(Error::InvalidArgument("start and end must be numbers of seconds".to_string()));
+        }
+        if [self.start, self.end].iter().flatten().any(|v| *v > MAX_SVG_SECONDS) {
+            return Err(Error::InvalidArgument(format!(
+                "start and end must be within the first {} hours",
+                MAX_SVG_SECONDS / 3600.0
+            )));
+        }
+        Ok(())
+    }
+
+    /// Everything about the patch that costs time: [`SvgOverlayPatch::check_cheap`], then the custom
+    /// artwork sanitised and parsed (up to a second and a half for a heavy document). A surface calls
+    /// this **before it takes the project lock** and gives the result to
+    /// `Project::update_svg_overlay_parsed`.
+    pub fn check(&self) -> crate::error::Result<Option<crate::svg::SvgDoc>> {
+        self.check_cheap()?;
+        self.svg.as_deref().map(crate::svg::SvgDoc::parse).transpose()
+    }
+}
+
 /// Linearly interpolate a channel of `(time, value)` keyframes at `at`, holding
 /// the end values flat beyond the first / last keyframe. Empty input → `None`.
 pub fn interpolate(points: &[(f64, f64)], at: f64) -> Option<f64> {
@@ -2071,6 +2441,10 @@ pub const MIN_CAPTION_VISIBLE: f64 = 0.15;
 /// later.
 pub const MIN_WORD_CAPTION: f64 = 0.12;
 pub const MIN_WORD_VISIBLE: f64 = 0.06;
+
+/// How long a word-timed caption line stays up after its last word when a pause follows
+/// (seconds): long enough to finish reading it, short enough that the pause reads as one.
+pub const CAPTION_HOLD: f64 = 0.5;
 
 /// The shape a generated caption set takes on screen.
 ///
@@ -2264,9 +2638,9 @@ fn chunk_words(text: &str, layout: CaptionLayout) -> Vec<String> {
 
 /// Spread `span` across `chunks` in proportion to how much text each carries,
 /// then merge away any line too short to read. Character share is the honest
-/// approximation available here: neither speech backend reports word timings
-/// (`TranscriptSegment` has only a start and an end), so within a segment the
-/// speaker is assumed to be at a steady pace.
+/// approximation for a line without word timings (an imported cue, or a
+/// transcript made before words were recorded): within it the speaker is
+/// assumed to be at a steady pace. A line with words goes through [`word_chunks`].
 ///
 /// The merge is repeated — join the first too-short line to its shorter
 /// neighbour, re-time everything, look again — because joining changes every
@@ -2321,6 +2695,79 @@ fn time_chunks(chunks: Vec<String>, span: TimeRange, min: f64) -> Vec<(TimeRange
         at = end;
     }
     timed
+}
+
+/// Caption lines of a transcript line whose words carry their own (source) times:
+/// grouped like [`chunk_words`], each line running from its first word's start to the
+/// next line's — or, across a pause, to its last word's end plus [`CAPTION_HOLD`] (the
+/// last line no further than the segment's end) — and a line shorter than `min` merged
+/// into its shorter neighbour, as [`time_chunks`] does. Each line comes with the span its
+/// words are spoken in (no hold), which is what has to survive a cut for it to show.
+fn word_chunks(words: &[Word], seg_end: f64, layout: CaptionLayout) -> Vec<(TimeRange, TimeRange, String)> {
+    let words: Vec<&Word> = words
+        .iter()
+        .filter(|w| w.start.is_finite() && w.end.is_finite() && !w.text.trim().is_empty())
+        .collect();
+    // Each group is the index of its first and last word.
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    let mut chars = 0usize;
+    for (i, w) in words.iter().enumerate() {
+        let len = w.text.trim().chars().count();
+        match groups.last_mut() {
+            Some((first, last)) if *last + 1 - *first < layout.max_words && chars + len < layout.max_chars => {
+                *last = i;
+                chars += len + 1;
+            }
+            _ => {
+                groups.push((i, i));
+                chars = len;
+            }
+        }
+    }
+    let span_of = |groups: &[(usize, usize)], g: usize| {
+        let (first, last) = groups[g];
+        let start = words[first].start;
+        let last_end = words[last].end.max(start);
+        let end = match groups.get(g + 1) {
+            Some(&(next, _)) => words[next].start.min(last_end + CAPTION_HOLD),
+            None => (last_end + CAPTION_HOLD).min(seg_end.max(last_end)),
+        };
+        TimeRange {
+            start,
+            end: end.max(start),
+        }
+    };
+    let text_of = |(first, last): (usize, usize)| {
+        words[first..=last]
+            .iter()
+            .map(|w| w.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let chars_of = |g: (usize, usize)| text_of(g).chars().count();
+    while groups.len() >= 2 {
+        let Some(i) = (0..groups.len()).find(|&g| {
+            let r = span_of(&groups, g);
+            r.end - r.start < layout.min_line
+        }) else {
+            break;
+        };
+        let merge_back = i > 0 && (i + 1 == groups.len() || chars_of(groups[i - 1]) <= chars_of(groups[i + 1]));
+        let into = if merge_back { i - 1 } else { i };
+        let (_, last) = groups.remove(into + 1);
+        groups[into].1 = last;
+    }
+    (0..groups.len())
+        .map(|g| {
+            let shown = span_of(&groups, g);
+            let (first, last) = groups[g];
+            let spoken = TimeRange {
+                start: words[first].start,
+                end: words[last].end.max(words[first].start),
+            };
+            (shown, spoken, text_of(groups[g]))
+        })
+        .collect()
 }
 
 /// One caption line on its way to the screen: when, what, and which input it
@@ -2379,6 +2826,22 @@ fn project_through_clips<'a>(
                 let text = seg.text.trim();
                 let timed = seg.start.is_finite() && seg.end.is_finite() && seg.end > seg.start;
                 if text.is_empty() || !timed || !clip.covers_source(seg.start, seg.end) {
+                    continue;
+                }
+                if !seg.words.is_empty() {
+                    for (shown, spoken, chunk) in word_chunks(&seg.words, seg.end, layout) {
+                        let said = clip.source_span_to_timeline(spoken.start, spoken.end);
+                        let span = clip.source_span_to_timeline(shown.start, shown.end);
+                        let start = span.start.max(window.0);
+                        let end = span.end.min(window.1);
+                        if said.end.min(window.1) > said.start.max(window.0) && end - start >= layout.min_visible {
+                            lines.push(CaptionLine {
+                                range: TimeRange { start, end },
+                                text: chunk,
+                                origin,
+                            });
+                        }
+                    }
                     continue;
                 }
                 let span = clip.source_span_to_timeline(seg.start, seg.end);
@@ -2655,6 +3118,10 @@ pub struct Clip {
     /// Color correction (brightness / contrast / saturation / gamma).
     #[serde(default)]
     pub color: Color,
+    /// Curves, colour wheels and a 3D LUT, applied after `color` ([`Grade`]). Empty for every
+    /// clip saved before they existed.
+    #[serde(default, skip_serializing_if = "Grade::is_empty")]
+    pub grade: Grade,
     /// Transition blending this clip's start with the preceding clip, if any.
     #[serde(default)]
     pub transition_in: Option<Transition>,
@@ -2725,6 +3192,10 @@ fn is_yes(b: &bool) -> bool {
 /// Smallest speed magnitude allowed, to keep clip durations finite.
 pub const MIN_SPEED: f64 = 0.01;
 
+/// Largest speed magnitude a clip may be set to (100×): the audio tempo is a chain of `atempo`
+/// steps, one per doubling, and a clip sped past this is a few frames long whatever it was.
+pub const MAX_SPEED: f64 = 100.0;
+
 impl Clip {
     /// A new clip with default volume, no fades, full speed and identity
     /// transform / color and no transition.
@@ -2741,6 +3212,7 @@ impl Clip {
             speed: 1.0,
             transform: Transform::default(),
             color: Color::default(),
+            grade: Grade::default(),
             transition_in: None,
             effects: Vec::new(),
             audio: Vec::new(),
@@ -3322,8 +3794,23 @@ pub struct StagedEdit {
     /// The agent's own description of what it is proposing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// The agent session (its MCP session id) the proposal belongs to, when one was named. A
+    /// second agent's edits are refused while another session owns the proposal. **Never
+    /// serialised**: a session id is a bearer-ish handle on the MCP connection, and what reaches
+    /// the webview or another agent is [`StagedEdit::owned_by_agent`].
+    #[serde(skip)]
+    pub owner: Option<String>,
+    /// Some agent session owns the proposal (see `owner`, which is Rust-side only).
+    #[serde(default)]
+    pub owned_by_agent: bool,
     /// Labels of the individual edits, in the order they were staged.
     pub edits: Vec<String>,
+    /// How many of the latest staged steps [`crate::project::Project::undo_staged`] can still take back.
+    #[serde(default)]
+    pub undo_depth: usize,
+    /// Changes to the library (an asset's projection) held back with the proposal; they land with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asset_changes: Vec<StagedAssetChange>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// The live timeline has moved on since `base_seq`.
@@ -3332,10 +3819,31 @@ pub struct StagedEdit {
     pub diff: TimelineDiff,
 }
 
+/// A change to an *asset* an agent made while a proposal was open. The library is not the
+/// timeline, so it cannot ride in the proposal's timeline; it is held back beside it instead
+/// and written when the proposal is accepted (or the entry is picked in a partial accept).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StagedAssetChange {
+    /// `asset_projection:<asset id>` — usable wherever a [`DiffEntry::id`] is.
+    pub id: String,
+    pub asset_id: Uuid,
+    /// The spherical projection the asset is to be marked with; `None` clears it.
+    pub projection: Option<Projection>,
+    /// One line for the review card, e.g. `Mark interview.mp4 as equirect 360`.
+    pub summary: String,
+}
+
+impl StagedAssetChange {
+    /// The id every change of `kind` to `asset_id` has — one pending change per asset and kind.
+    pub fn projection_id(asset_id: Uuid) -> String {
+        format!("asset_projection:{asset_id}")
+    }
+}
+
 /// A named point on the timeline. Purely an annotation — it renders nothing —
 /// but it gives the user and the agent a shared vocabulary for places in the
 /// cut ("the laugh at 01:12"), which timestamps alone do not.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Marker {
     pub id: Uuid,
     /// Position on the timeline, seconds.
@@ -3344,6 +3852,102 @@ pub struct Marker {
     /// Optional CSS color for the ruler chip; the UI picks a default when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    /// How long the marked span runs from `time`, seconds; 0 is a point.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub duration: f64,
+    /// A free-form note (a review comment, a chapter description).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub comment: String,
+    #[serde(default, skip_serializing_if = "MarkerKind::is_comment")]
+    pub kind: MarkerKind,
+}
+
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
+}
+
+/// What a [`Marker`] is for. A `Chapter` starts a chapter of the delivered video:
+/// it is written into the export's chapter list and the YouTube chapter text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkerKind {
+    #[default]
+    Comment,
+    Chapter,
+}
+
+impl MarkerKind {
+    pub fn is_comment(&self) -> bool {
+        *self == MarkerKind::Comment
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarkerKind::Comment => "comment",
+            MarkerKind::Chapter => "chapter",
+        }
+    }
+}
+
+/// The longest a marker's comment may be (characters).
+pub const MAX_MARKER_COMMENT: usize = 10_000;
+
+/// A change to a [`Marker`]; each `None` leaves that field alone. An empty
+/// `color` clears it back to the UI default.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MarkerPatch {
+    pub time: Option<f64>,
+    pub name: Option<String>,
+    pub color: Option<String>,
+    pub duration: Option<f64>,
+    pub comment: Option<String>,
+    pub kind: Option<MarkerKind>,
+}
+
+impl Marker {
+    /// Apply `patch`, refusing it whole when a field is out of range.
+    pub fn apply(&mut self, patch: MarkerPatch) -> Result<()> {
+        if patch.time.is_some_and(|t| !t.is_finite() || t < 0.0) {
+            return Err(Error::InvalidArgument("marker time must be >= 0".to_string()));
+        }
+        if patch.duration.is_some_and(|d| !d.is_finite() || d < 0.0) {
+            return Err(Error::InvalidArgument("marker duration must be >= 0".to_string()));
+        }
+        let comment = patch.comment.map(|c| {
+            c.chars()
+                .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+                .collect::<String>()
+        });
+        if comment.as_ref().is_some_and(|c| c.chars().count() > MAX_MARKER_COMMENT) {
+            return Err(Error::InvalidArgument(format!(
+                "marker comment is longer than {MAX_MARKER_COMMENT} characters"
+            )));
+        }
+        if let Some(t) = patch.time {
+            self.time = t;
+        }
+        if let Some(n) = patch.name {
+            self.name = n;
+        }
+        if let Some(c) = patch.color {
+            self.color = if c.is_empty() { None } else { Some(c) };
+        }
+        if let Some(d) = patch.duration {
+            self.duration = d;
+        }
+        if let Some(c) = comment {
+            self.comment = c.trim_end().to_string();
+        }
+        if let Some(k) = patch.kind {
+            self.kind = k;
+        }
+        Ok(())
+    }
+
+    /// Where the marked span ends (`time` for a point marker).
+    pub fn end(&self) -> f64 {
+        self.time + self.duration.max(0.0)
+    }
 }
 
 /// How a clip's picture is fitted to an output frame of a different shape.
@@ -3720,9 +4324,10 @@ pub struct MasterBus {
     /// while it is off, so switching the limiter back on returns to the
     /// ceiling that was chosen.
     ///
-    /// A **sample-peak** ceiling: the limiter does not oversample, so the
-    /// *true* peak of the result can sit a fraction of a dB higher
-    /// ([`Project::levels`](crate::Project::levels) measures it).
+    /// A **sample-peak** ceiling unless `true_peak` is on: the plain limiter does not
+    /// oversample, so the *true* peak of the result can sit a fraction of a dB higher
+    /// ([`Project::levels`](crate::Project::levels) measures it). With `true_peak` the
+    /// limiter runs oversampled and holds the true peak at the ceiling too.
     #[serde(default = "default_master_ceiling")]
     pub ceiling_db: f64,
     /// How tracks flagged `duck` dip under the rest of the mix. `None` (the default) is
@@ -3732,6 +4337,11 @@ pub struct MasterBus {
     /// down in ~50 ms and back up ~300 ms after it falls quiet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duck_depth_db: Option<f64>,
+    /// The limiter holds the **true** peak: it runs on the mix upsampled four times, so
+    /// the peaks between samples stay under `ceiling_db` too. Only read while `limiter`
+    /// is on; off (the default) is the sample-peak limiter and its graph.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub true_peak: bool,
 }
 
 /// The speech gate's depth when it is switched on without one.
@@ -3766,6 +4376,7 @@ impl Default for MasterBus {
             limiter: false,
             ceiling_db: MASTER_DEFAULT_CEILING_DB,
             duck_depth_db: None,
+            true_peak: false,
         }
     }
 }
@@ -3843,6 +4454,10 @@ pub struct Timeline {
     pub tracks: Vec<Track>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overlays: Vec<TextOverlay>,
+    /// Animated SVG titles, drawn above the clips and below `overlays` (so captions stay on top), in
+    /// list order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub svg_overlays: Vec<SvgOverlay>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub markers: Vec<Marker>,
     /// The frame this cut is being made for. `None` (the default, and every
@@ -3868,6 +4483,7 @@ impl Timeline {
         Self {
             tracks: vec![Track::new(StreamKind::Video, "V1"), Track::new(StreamKind::Audio, "A1")],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: MasterBus::default(),
@@ -3876,6 +4492,23 @@ impl Timeline {
 
     pub fn overlay(&self, id: Uuid) -> Option<&TextOverlay> {
         self.overlays.iter().find(|o| o.id == id)
+    }
+
+    pub fn svg_overlay(&self, id: Uuid) -> Option<&SvgOverlay> {
+        self.svg_overlays.iter().find(|o| o.id == id)
+    }
+
+    /// The frame preset artwork is drawn for: the delivery format, else full HD.
+    pub fn preset_frame(&self) -> (u32, u32) {
+        self.format.map_or(crate::svg::DEFAULT_FRAME, |f| (f.width, f.height))
+    }
+
+    /// Re-make every preset overlay's artwork for `frame` (the delivery frame changed) and the
+    /// length it now has.
+    pub fn regenerate_svg_presets(&mut self, frame: (u32, u32)) {
+        for o in &mut self.svg_overlays {
+            o.regenerate(frame);
+        }
     }
 
     pub fn track(&self, id: Uuid) -> Option<&Track> {
@@ -3998,6 +4631,7 @@ impl Timeline {
                 })
                 .collect(),
             overlays: self.overlays.clone(),
+            svg_overlays: self.svg_overlays.clone(),
             markers: self.markers.clone(),
             format: self.format,
             master: self.master,
@@ -4053,6 +4687,19 @@ impl Timeline {
                     o
                 })
                 .collect(),
+            // Preset artwork is drawn for a frame (its viewBox is the frame), so it is re-made for
+            // the new shape; custom artwork is the author's and is only ever scaled.
+            svg_overlays: self
+                .svg_overlays
+                .iter()
+                .map(|o| {
+                    let mut o = o.clone();
+                    if !same_shape {
+                        o.regenerate((delivery.width, delivery.height));
+                    }
+                    o
+                })
+                .collect(),
             markers: self.markers.clone(),
             format: Some(delivery),
             // The same mix at every frame: a variant changes the picture only.
@@ -4081,6 +4728,7 @@ impl Timeline {
         let mut out = Timeline {
             tracks: Vec::with_capacity(self.tracks.len()),
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             // Markers inside the window come along, shifted like everything else;
             // without this a range export would desync every one of them.
             markers: self
@@ -4089,6 +4737,7 @@ impl Timeline {
                 .filter(|m| m.time >= start && m.time < end)
                 .map(|m| Marker {
                     time: m.time - start,
+                    duration: (m.end().min(end) - m.time).max(0.0),
                     ..m.clone()
                 })
                 .collect(),
@@ -4161,6 +4810,18 @@ impl Timeline {
             ov.end = (o.end.min(end) - start).max(ov.start);
             out.overlays.push(ov);
         }
+        for o in &self.svg_overlays {
+            if o.end <= start || o.start >= end {
+                continue;
+            }
+            let mut ov = o.clone();
+            // The animation is not replayed from its first frame: the part that was cut off the
+            // front has already elapsed on the document's clock.
+            ov.offset += (start - o.start).max(0.0);
+            ov.start = (o.start - start).max(0.0);
+            ov.end = (o.end.min(end) - start).max(ov.start);
+            out.svg_overlays.push(ov);
+        }
         out
     }
 }
@@ -4171,6 +4832,14 @@ pub use channels::{key_polyline, Property, PropertyKey, PropertyTrack, MAX_CHANN
 
 mod links;
 pub use links::{Detached, DetachedMany, SkippedDetach};
+
+mod subset;
+pub use subset::{AutoIncluded, SkippedChange, SubsetMerge};
+mod grade;
+pub use grade::{
+    frame_matrix, normalize_curve, ClipLut, CurvePoint, CurveSegment, CurveShape, Curves, Grade, Wheel, Wheels, MAX_CURVE_POINTS,
+};
+mod check;
 
 mod music_fit;
 pub use music_fit::{
@@ -5332,6 +6001,28 @@ pub enum DiffKind {
 }
 
 impl DiffKind {
+    /// The `snake_case` name this kind serializes as — the first half of a [`DiffEntry::id`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DiffKind::TrackAdded => "track_added",
+            DiffKind::TrackRemoved => "track_removed",
+            DiffKind::TrackChanged => "track_changed",
+            DiffKind::ClipAdded => "clip_added",
+            DiffKind::ClipRemoved => "clip_removed",
+            DiffKind::ClipMoved => "clip_moved",
+            DiffKind::ClipRetrimmed => "clip_retrimmed",
+            DiffKind::ClipChanged => "clip_changed",
+            DiffKind::OverlayAdded => "overlay_added",
+            DiffKind::OverlayRemoved => "overlay_removed",
+            DiffKind::OverlayChanged => "overlay_changed",
+            DiffKind::MarkerAdded => "marker_added",
+            DiffKind::MarkerRemoved => "marker_removed",
+            DiffKind::MarkerChanged => "marker_changed",
+            DiffKind::FormatChanged => "format_changed",
+            DiffKind::MasterChanged => "master_changed",
+        }
+    }
+
     /// Whether this entry adds, removes, or alters something — the three tints a
     /// diff needs.
     pub fn polarity(self) -> &'static str {
@@ -5346,6 +6037,12 @@ impl DiffKind {
 /// One change between two timelines, phrased for a human reviewing a cut.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffEntry {
+    /// Stable name of this change — `<kind>:<the clip, text, marker or track it is about>` — which
+    /// the same change keeps for as long as the proposal holds it, so a reviewer can send back
+    /// the ones it accepts ([`crate::project::Project::apply_staged_subset`]). Unique within a
+    /// diff: a thing has at most one change of each kind.
+    #[serde(default)]
+    pub id: String,
     pub kind: DiffKind,
     /// One line, e.g. `Trimmed clip on V1 at 0:04.0 — 4.0s → 2.5s (-1.5s)`.
     pub summary: String,
@@ -5359,6 +6056,9 @@ pub struct DiffEntry {
     /// The title or caption an `Overlay*` entry is about, so a view of the proposal can mark it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_id: Option<Uuid>,
+    /// The marker a `Marker*` entry is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker_id: Option<Uuid>,
     /// Where on the timeline to look, so the reviewer can jump straight to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<f64>,
@@ -5367,14 +6067,31 @@ pub struct DiffEntry {
 impl DiffEntry {
     fn new(kind: DiffKind, summary: String) -> Self {
         Self {
+            id: String::new(),
             kind,
             summary,
             detail: None,
             track_id: None,
             clip_id: None,
             overlay_id: None,
+            marker_id: None,
             at: None,
         }
+    }
+
+    /// Name the change after its kind and the thing it is about (see [`DiffEntry::id`]).
+    fn with_id(mut self) -> Self {
+        let target = self.clip_id.or(self.overlay_id).or(self.marker_id).or(self.track_id);
+        self.id = match target {
+            Some(target) => format!("{}:{target}", self.kind.as_str()),
+            None => self.kind.as_str().to_string(),
+        };
+        self
+    }
+
+    fn on_marker(mut self, id: Uuid) -> Self {
+        self.marker_id = Some(id);
+        self
     }
 
     fn detail(mut self, detail: impl Into<String>) -> Self {
@@ -5632,6 +6349,7 @@ fn clip_changes(before: &Clip, after: &Clip) -> Option<String> {
     }
     parts.extend(transform_changes(&before.transform, &after.transform));
     parts.extend(color_changes(&before.color, &after.color));
+    parts.extend(Grade::changes(&before.grade, &after.grade));
     // A framing pass before a multi-format export is an edit like any other,
     // and one an agent proposal has to be able to show.
     let framed: Vec<String> = after
@@ -5735,10 +6453,99 @@ fn overlay_changes(before: &TextOverlay, after: &TextOverlay) -> Option<String> 
     joined(parts)
 }
 
+/// The controls of a template title whose value differs, as `Tagline “A” → “B”`.
+fn template_value_changes(before: &SvgOverlay, after: &SvgOverlay) -> Vec<String> {
+    let (Some(was), Some(now)) = (&before.template, &after.template) else {
+        return Vec::new();
+    };
+    now.controls
+        .iter()
+        .filter_map(|c| {
+            let (a, b) = (was.values.get(&c.id), now.values.get(&c.id));
+            (a != b).then(|| {
+                format!(
+                    "{} “{}” → “{}”",
+                    c.label,
+                    a.map_or("", String::as_str),
+                    b.map_or("", String::as_str)
+                )
+            })
+        })
+        .collect()
+}
+
+fn svg_overlay_changes(before: &SvgOverlay, after: &SvgOverlay) -> Option<String> {
+    let mut parts = Vec::new();
+    if before.name != after.name {
+        parts.push(format!("name “{}” → “{}”", before.name, after.name));
+    }
+    match (&before.preset, &after.preset) {
+        (Some(a), Some(b)) => {
+            if a.kind != b.kind {
+                parts.push(format!("style {} → {}", a.kind.label(), b.kind.label()));
+            }
+            if a.params.text != b.params.text {
+                parts.push(format!("text “{}” → “{}”", a.params.text, b.params.text));
+            }
+            if a.params != b.params && a.params.text == b.params.text {
+                parts.push("preset look changed".to_string());
+            }
+        }
+        (Some(_), None) => parts.push("converted to custom SVG".to_string()),
+        (None, Some(_)) => parts.push("replaced by a preset".to_string()),
+        (None, None) => {
+            if before.svg != after.svg {
+                let values = template_value_changes(before, after);
+                if values.is_empty() {
+                    parts.push("artwork changed".to_string());
+                } else {
+                    parts.extend(values);
+                }
+            }
+        }
+    }
+    if before.template.is_some() && after.template.is_none() {
+        parts.push("no longer a template title".to_string());
+    }
+    if num_changed(before.start, after.start) || num_changed(before.end, after.end) {
+        parts.push(format!(
+            "timing {}–{} → {}–{}",
+            fmt_time(before.start),
+            fmt_time(before.end),
+            fmt_time(after.start),
+            fmt_time(after.end)
+        ));
+    }
+    if [
+        (before.x, after.x),
+        (before.y, after.y),
+        (before.width, after.width),
+        (before.height, after.height),
+    ]
+    .iter()
+    .any(|(a, b)| num_changed(*a, *b))
+    {
+        parts.push(format!(
+            "placement {:.2},{:.2} {:.2}x{:.2} → {:.2},{:.2} {:.2}x{:.2}",
+            before.x, before.y, before.width, before.height, after.x, after.y, after.width, after.height
+        ));
+    }
+    if num_changed(before.opacity, after.opacity) {
+        parts.push(format!(
+            "opacity {:.0}% → {:.0}%",
+            before.opacity * 100.0,
+            after.opacity * 100.0
+        ));
+    }
+    joined(parts)
+}
+
 /// What differs between two master buses, phrased like the track strip's
 /// (`level 100% → 70%`), or `None` when the mix would come out the same. The
 /// ceiling only counts while the limiter is on afterwards — a stored ceiling
-/// the limiter is not using changes nothing anyone can hear.
+/// the limiter is not using changes nothing anyone can hear. The true-peak switch
+/// always counts: it is the user's choice for the limiter whenever it runs, and an
+/// agent's staged switch must not read as an empty proposal.
 fn master_changes(before: &MasterBus, after: &MasterBus) -> Option<String> {
     let mut parts = Vec::new();
     if (before.volume - after.volume).abs() > DIFF_EPS {
@@ -5755,6 +6562,9 @@ fn master_changes(before: &MasterBus, after: &MasterBus) -> Option<String> {
             "limiter ceiling {:.1} → {:.1} dB",
             before.ceiling_db, after.ceiling_db
         ));
+    }
+    if before.true_peak != after.true_peak {
+        parts.push(format!("true-peak limiting {}", if after.true_peak { "on" } else { "off" }));
     }
     let duck = |d: Option<f64>| match d {
         Some(db) => format!("speech gate {db:.0} dB"),
@@ -5776,6 +6586,42 @@ fn fmt_delivery(d: &Delivery) -> String {
 }
 
 impl Timeline {
+    /// Refuse an edit that left one of `ids` on top of another clip of its track, unless the two
+    /// already overlapped in `before` (an overlap that was not this edit's doing). Run after the
+    /// ripple, which may have made the room: a clip lengthened over its neighbour is fine with the
+    /// neighbour pushed along and refused without. An id that is not on the timeline is ignored.
+    pub fn check_own_lanes(&self, before: &Timeline, ids: &[Uuid]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let prior: HashMap<Uuid, (f64, f64)> = before
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .map(|c| (c.id, (c.timeline_start, c.timeline_end())))
+            .collect();
+        for track in &self.tracks {
+            for p in track.clips.iter().filter(|c| ids.contains(&c.id)) {
+                let span = (p.timeline_start, p.timeline_end());
+                for q in &track.clips {
+                    let qspan = (q.timeline_start, q.timeline_end());
+                    if q.id == p.id || !spans_overlap(span, qspan) {
+                        continue;
+                    }
+                    if matches!((prior.get(&p.id), prior.get(&q.id)), (Some(a), Some(b)) if spans_overlap(*a, *b)) {
+                        continue;
+                    }
+                    return Err(Error::InvalidArgument(format!(
+                        "the clip would overlap another clip on {} at {} — move or trim that one first",
+                        track.name,
+                        fmt_time(p.timeline_start.max(q.timeline_start))
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// How many clips stand somewhere else here than in `before`: a different
     /// start on their track, or a different track. Matched by id, so a clip that
     /// exists on only one side is not counted. This is how a caller learns whether
@@ -6013,6 +6859,53 @@ impl Timeline {
             }
         }
 
+        for overlay in &after.svg_overlays {
+            match self.svg_overlay(overlay.id) {
+                None => rest.push(
+                    DiffEntry::new(
+                        DiffKind::OverlayAdded,
+                        format!(
+                            "Added animated title “{}” at {}–{}",
+                            overlay.display_name(),
+                            fmt_time(overlay.start),
+                            fmt_time(overlay.end)
+                        ),
+                    )
+                    .on_overlay(overlay.id)
+                    .at(overlay.start),
+                ),
+                Some(before) => {
+                    if let Some(detail) = svg_overlay_changes(before, overlay) {
+                        rest.push(
+                            DiffEntry::new(
+                                DiffKind::OverlayChanged,
+                                format!("Changed animated title “{}”", overlay.display_name()),
+                            )
+                            .detail(detail)
+                            .on_overlay(overlay.id)
+                            .at(overlay.start),
+                        );
+                    }
+                }
+            }
+        }
+        for overlay in &self.svg_overlays {
+            if after.svg_overlay(overlay.id).is_none() {
+                rest.push(
+                    DiffEntry::new(
+                        DiffKind::OverlayRemoved,
+                        format!(
+                            "Removed animated title “{}” at {}",
+                            overlay.display_name(),
+                            fmt_time(overlay.start)
+                        ),
+                    )
+                    .on_overlay(overlay.id)
+                    .at(overlay.start),
+                );
+            }
+        }
+
         let before_markers: HashMap<Uuid, &Marker> = self.markers.iter().map(|m| (m.id, m)).collect();
         for marker in &after.markers {
             match before_markers.get(&marker.id) {
@@ -6021,6 +6914,7 @@ impl Timeline {
                         DiffKind::MarkerAdded,
                         format!("Added marker “{}” at {}", marker.name, fmt_time(marker.time)),
                     )
+                    .on_marker(marker.id)
                     .at(marker.time),
                 ),
                 Some(before) => {
@@ -6034,10 +6928,24 @@ impl Timeline {
                     if before.color != marker.color {
                         parts.push("recolored".to_string());
                     }
+                    if num_changed(before.duration, marker.duration) {
+                        parts.push(format!(
+                            "length {} → {}",
+                            fmt_time(before.duration),
+                            fmt_time(marker.duration)
+                        ));
+                    }
+                    if before.kind != marker.kind {
+                        parts.push(format!("now a {}", marker.kind.as_str()));
+                    }
+                    if before.comment != marker.comment {
+                        parts.push("comment edited".to_string());
+                    }
                     if let Some(detail) = joined(parts) {
                         rest.push(
                             DiffEntry::new(DiffKind::MarkerChanged, format!("Changed marker “{}”", marker.name))
                                 .detail(detail)
+                                .on_marker(marker.id)
                                 .at(marker.time),
                         );
                     }
@@ -6051,6 +6959,7 @@ impl Timeline {
                         DiffKind::MarkerRemoved,
                         format!("Removed marker “{}” at {}", marker.name, fmt_time(marker.time)),
                     )
+                    .on_marker(marker.id)
                     .at(marker.time),
                 );
             }
@@ -6075,7 +6984,7 @@ impl Timeline {
         tracks.append(&mut clips);
         tracks.append(&mut rest);
         TimelineDiff {
-            entries: tracks,
+            entries: tracks.into_iter().map(DiffEntry::with_id).collect(),
             duration_before: self.duration(),
             duration_after: after.duration(),
             clips_before: before_clips.len(),
@@ -6087,6 +6996,247 @@ impl Timeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn picture(w: u32, h: u32, pix_fmt: &str, tag: Option<&str>) -> StreamInfo {
+        StreamInfo {
+            index: 0,
+            kind: StreamKind::Video,
+            codec: "h264".into(),
+            width: Some(w),
+            height: Some(h),
+            fps: Some(30.0),
+            sample_rate: None,
+            channels: None,
+            image: false,
+            projection: None,
+            rotation: 0,
+            color_transfer: None,
+            color_primaries: None,
+            pix_fmt: Some(pix_fmt.into()),
+            color_space: tag.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn a_tag_states_a_matrix_unless_it_says_nothing() {
+        for tag in [
+            "bt709",
+            "smpte170m",
+            "bt470bg",
+            "bt2020nc",
+            "bt2020c",
+            "smpte240m",
+            "fcc",
+            "ycgco",
+            "gbr",
+        ] {
+            assert!(matrix_tag_is_stated(Some(tag)), "{tag}");
+        }
+        // `reserved` is a value no matrix has: FFmpeg reads it as it reads no tag.
+        for tag in ["", "unknown", "unspecified", "reserved", " reserved "] {
+            assert!(!matrix_tag_is_stated(Some(tag)), "{tag:?}");
+        }
+        assert!(!matrix_tag_is_stated(None));
+    }
+
+    #[test]
+    fn untagged_hd_is_hd_ycbcr_that_names_nothing_and_is_not_hdr() {
+        let hd = |tag, fmt, w, h| untagged_hd_yuv(tag, fmt, w, h, false);
+        // mpv's rule: wide enough, or tall enough.
+        assert!(hd(None, "yuv420p", 1280, 720));
+        assert!(hd(None, "yuv420p", 1920, 1080));
+        assert!(hd(None, "yuv420p", 1024, 768));
+        assert!(hd(None, "yuv420p", 720, 1280), "a portrait phone clip is taller than 576");
+        assert!(hd(Some("unknown"), "yuv420p10le", 3840, 2160));
+        assert!(hd(Some("reserved"), "yuv422p", 1920, 1080));
+        assert!(hd(None, "nv12", 1920, 1080));
+        assert!(!hd(None, "yuv420p", 720, 576), "PAL is SD");
+        assert!(!hd(None, "yuv420p", 1279, 576));
+        assert!(!hd(None, "yuv420p", 854, 480));
+        assert!(hd(None, "yuv420p", 1280, 100), "wide enough");
+        // A tag of any kind is the file's word.
+        for tag in ["bt709", "smpte170m", "bt470bg", "bt2020nc"] {
+            assert!(!hd(Some(tag), "yuv420p", 1920, 1080), "{tag}");
+        }
+        // JFIF and a webcam's MJPEG are BT.601 by definition.
+        assert!(!hd(None, "yuvj420p", 1920, 1080));
+        assert!(!hd(None, "yuvj444p", 1920, 1080));
+        // RGB, grey, alpha, packed and unknown formats are not YCbCr on the list.
+        for fmt in [
+            "bgr0",
+            "rgb24",
+            "gbrp",
+            "gray",
+            "gray10le",
+            "yuva420p",
+            "rgba",
+            "yuva444p10le",
+            "pal8",
+            "",
+            "nonsense",
+        ] {
+            assert!(!hd(None, fmt, 1920, 1080), "{fmt:?}");
+        }
+        // HDR is tone-mapped to a tagged BT.709 picture.
+        assert!(!untagged_hd_yuv(None, "yuv420p10le", 3840, 2160, true));
+        // No size recorded is not HD.
+        assert!(!hd(None, "yuv420p", 0, 0));
+    }
+
+    #[test]
+    fn a_stream_names_a_matrix_by_tag_or_hdr_and_is_untagged_hd_only_as_a_moving_picture() {
+        assert!(picture(640, 360, "yuv420p", Some("bt709")).names_a_matrix());
+        assert!(picture(1920, 1080, "yuv420p", Some("smpte170m")).names_a_matrix());
+        assert!(!picture(1920, 1080, "yuv420p", None).names_a_matrix());
+        assert!(!picture(1920, 1080, "yuv420p", Some("reserved")).names_a_matrix());
+        let mut hlg = picture(1920, 1080, "yuv420p10le", Some("bt2020nc"));
+        hlg.color_transfer = Some("arib-std-b67".into());
+        assert!(hlg.names_a_matrix() && !hlg.is_untagged_hd_yuv());
+        // HDR names a matrix even when the file's tag is missing: the graph tone-maps it to BT.709.
+        hlg.color_space = None;
+        assert!(hlg.names_a_matrix() && !hlg.is_untagged_hd_yuv());
+        // An RGB picture has no YCbCr matrix to name, whatever the container writes.
+        assert!(!picture(1920, 1080, "gbrp", Some("gbr")).names_a_matrix());
+        assert!(!picture(1920, 1080, "bgr0", Some("gbr")).names_a_matrix());
+        // …and `gbr` is nobody's matrix on any layout: a PNG with alpha or a grey one carries it too.
+        assert!(!picture(1920, 1080, "rgba", Some("gbr")).names_a_matrix());
+        assert!(!picture(1920, 1080, "gray", Some("gbr")).names_a_matrix());
+        assert!(!picture(1920, 1080, "yuv420p", Some("gbr")).names_a_matrix());
+        // The tags decoders write on their own (probed): a JPEG's, a WebP's and MJPEG video's `bt470bg`,
+        // a PNG's `gbr`, RGB video's `gbr`. None names a matrix, so nothing beside them is labelled.
+        let hd = picture(1920, 1080, "yuv420p", None);
+        let phone = picture(1920, 1080, "yuv420p", Some("bt709"));
+        for (what, shape) in crate::engine::test_support::decoder_default_pictures(1920, 1080) {
+            assert!(!shape.names_a_matrix(), "{what}");
+            assert_eq!(bt709_labels(&[Some(&hd), Some(&shape)]), [false, false], "{what}");
+            assert_eq!(bt709_labels(&[Some(&shape), Some(&hd)]), [false, false], "{what}");
+            assert_eq!(
+                bt709_labels(&[Some(&phone), Some(&shape), Some(&hd)]),
+                [false, false, true],
+                "{what}"
+            );
+        }
+        // The same tag on footage that is not the decoder's default is the file's word: an H.264 or
+        // ProRes clip tagged `bt470bg` names it (and so does SD tagged `smpte170m`).
+        assert!(picture(1920, 1080, "yuv420p", Some("bt470bg")).names_a_matrix());
+        assert!(picture(1920, 1080, "yuv422p10le", Some("bt470bg")).names_a_matrix());
+        // …but not on a still image, nor from a decoder that tags everything it decodes (`DEFAULT_TAG_CODECS`),
+        // whatever the pixel format: `yuv422p` MJPEG is no more the file's word than `yuvj420p`, and a
+        // JPEG-LS grey picture (not RGB, so the layout rule does not catch it) is not either.
+        let mut jpeg = picture(1920, 1080, "yuv420p", Some("bt470bg"));
+        jpeg.image = true;
+        assert!(!jpeg.names_a_matrix());
+        for (codec, fmt) in [
+            ("mjpeg", "yuv422p"),
+            ("mjpeg", "yuvj422p"),
+            ("amv", "yuvj420p"),
+            ("speedhq", "yuv422p"),
+            ("jpegls", "gray"),
+            ("jpegls", "gray16le"),
+            ("jpegls", "yuv420p"),
+            ("mjpegb", "yuvj420p"),
+            ("sp5x", "yuvj420p"),
+            ("thp", "yuvj420p"),
+            ("smvjpeg", "yuvj420p"),
+            ("mxpeg", "yuvj420p"),
+        ] {
+            let mut s = picture(1920, 1080, fmt, Some("bt470bg"));
+            s.codec = codec.into();
+            assert!(!s.names_a_matrix(), "{codec} {fmt}");
+            s.codec = codec.to_ascii_uppercase();
+            assert!(!s.names_a_matrix(), "{codec} {fmt}: the codec is matched whatever its case");
+        }
+        // The pixel format is not the decoder: FFmpeg's h264 decoder reports every full-range stream as
+        // `yuvj420p`, and a camera's full-range BT.709 (libx264 `-color_range pc -colorspace bt709`
+        // probes `h264 yuvj420p pc bt709`) states a matrix, which labels the untagged HD beside it.
+        let full_range = picture(1920, 1080, "yuvj420p", Some("bt709"));
+        assert!(full_range.names_a_matrix());
+        assert_eq!(bt709_labels(&[Some(&hd), Some(&full_range)]), [true, false]);
+        // …while an untagged full-range clip is still never labelled itself.
+        let untagged_full_range = picture(1920, 1080, "yuvj420p", None);
+        assert!(!untagged_full_range.is_untagged_hd_yuv() && !untagged_full_range.names_a_matrix());
+        assert_eq!(bt709_labels(&[Some(&phone), Some(&untagged_full_range)]), [false, false]);
+        // An RGB picture has no YCbCr matrix to name even when its tag is not `gbr`, from a codec the
+        // list above does not hold (the layout rule alone: `jpegls` is on the list).
+        let mut rgb = picture(1920, 1080, "rgb24", Some("bt470bg"));
+        rgb.codec = "ffv1".into();
+        assert!(!rgb.names_a_matrix());
+        rgb.pix_fmt = Some("yuv420p".into());
+        assert!(rgb.names_a_matrix(), "the same tag on a YCbCr picture is a matrix");
+        // A grey picture is not RGB: from any other codec its tag is the file's word.
+        rgb.pix_fmt = Some("gray".into());
+        assert!(rgb.names_a_matrix(), "a tagged grey picture names a matrix");
+        // A second video stream (cover art) does not tone-map or tag the first.
+        let mut asset = crate::engine::test_support::test_asset(vec![
+            picture(1920, 1080, "yuv420p", None),
+            picture(640, 640, "yuvj420p", None),
+        ]);
+        asset.streams[1].color_transfer = Some("smpte2084".into());
+        assert_eq!(asset.hdr(), None);
+        asset.streams.swap(0, 1);
+        assert_eq!(asset.hdr(), Some(Hdr::Pq));
+        // A still image is not given a convention (a lossy WebP is BT.601 by its format).
+        let mut webp = picture(1920, 1080, "yuv420p", None);
+        assert!(webp.is_untagged_hd_yuv());
+        webp.image = true;
+        assert!(!webp.is_untagged_hd_yuv());
+        // A stream that is not video names nothing and is nothing.
+        let mut audio = picture(1920, 1080, "yuv420p", Some("bt709"));
+        audio.kind = StreamKind::Audio;
+        assert!(!audio.names_a_matrix() && !audio.is_untagged_hd_yuv());
+    }
+
+    #[test]
+    fn untagged_hd_is_labelled_only_beside_an_input_that_names_a_matrix() {
+        let hd = picture(1920, 1080, "yuv420p", None);
+        let hd2 = picture(1280, 720, "yuv420p", Some("unknown"));
+        let phone = picture(1920, 1080, "yuv420p", Some("bt709"));
+        let mut hlg = picture(3840, 2160, "yuv420p10le", Some("bt2020nc"));
+        hlg.color_transfer = Some("smpte2084".into());
+        let sd = picture(720, 576, "yuv420p", None);
+        let sd_tagged = picture(720, 576, "yuv420p", Some("smpte170m"));
+        let mjpeg = picture(1920, 1080, "yuvj420p", None);
+        let rgb = picture(1920, 1080, "bgr0", None);
+        let alpha = picture(1920, 1080, "yuva420p", None);
+        let mut png = picture(1920, 1080, "rgb24", None);
+        png.image = true;
+        let labels = |inputs: &[Option<&StreamInfo>]| bt709_labels(inputs);
+
+        // A single clip, and a graph of untagged footage, are never labelled.
+        assert_eq!(labels(&[Some(&hd)]), [false]);
+        assert_eq!(labels(&[Some(&hd), Some(&hd2)]), [false, false]);
+        assert_eq!(
+            labels(&[Some(&hd), Some(&sd), Some(&mjpeg), Some(&rgb), Some(&alpha), Some(&png)]),
+            [false; 6]
+        );
+        assert_eq!(labels(&[]), Vec::<bool>::new());
+        assert_eq!(labels(&[None, Some(&hd)]), [false, false]);
+        // Beside an explicit tag or HDR the untagged HD input is labelled, and nothing else is.
+        assert_eq!(labels(&[Some(&phone), Some(&hd)]), [false, true]);
+        assert_eq!(labels(&[Some(&hd), Some(&phone), Some(&hd2)]), [true, false, true]);
+        assert_eq!(labels(&[Some(&hlg), Some(&hd)]), [false, true]);
+        assert_eq!(labels(&[Some(&sd_tagged), Some(&hd)]), [false, true]);
+        // …and never SD, MJPEG, RGB, grey, alpha or a still image, whatever they sit beside.
+        assert_eq!(
+            labels(&[
+                Some(&phone),
+                Some(&sd),
+                Some(&mjpeg),
+                Some(&rgb),
+                Some(&alpha),
+                Some(&png),
+                None,
+                Some(&hd)
+            ]),
+            [false, false, false, false, false, false, false, true]
+        );
+        // An RGB picture tagged `gbr` does not name a matrix: it moves nothing.
+        let tagged_rgb = picture(1920, 1080, "gbrp", Some("gbr"));
+        assert_eq!(labels(&[Some(&tagged_rgb), Some(&hd)]), [false, false]);
+        // A tagged input that is not on screen is still an input of the graph: the label is the
+        // graph's, not the frame's.
+        assert_eq!(labels(&[Some(&phone), Some(&hd), Some(&hd)]), [false, true, true]);
+    }
 
     #[test]
     fn the_chroma_grid_follows_the_pixel_format() {
@@ -6453,6 +7603,7 @@ mod tests {
                 },
             ],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -6479,6 +7630,7 @@ mod tests {
                 track(StreamKind::Audio, "A1", vec![clip_at(0.0, 2.0)]),
             ],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -6499,6 +7651,7 @@ mod tests {
                 ..track(StreamKind::Audio, "A1", vec![clip_at(0.0, 2.0)])
             }],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -6556,6 +7709,7 @@ mod tests {
         let tl = Timeline {
             tracks: vec![track(StreamKind::Video, "V1", vec![clip])],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: Some(Delivery::new(1080, 1920, Fit::Cover)),
             master: Default::default(),
@@ -6591,6 +7745,7 @@ mod tests {
         let tl = Timeline {
             tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 2.0)])],
             overlays: vec![caption, title],
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: Some(Delivery::new(1920, 1080, Fit::Contain)),
             master: Default::default(),
@@ -6610,6 +7765,7 @@ mod tests {
         let before = Timeline {
             tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 2.0)])],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -6632,6 +7788,7 @@ mod tests {
                 track(StreamKind::Audio, "A1", vec![clip_at(0.0, 3.0)]),
             ],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -6803,6 +7960,7 @@ mod tests {
             let tl = Timeline {
                 tracks: vec![track(StreamKind::Video, "V1", vec![original.clone()])],
                 overlays: Vec::new(),
+                svg_overlays: Vec::new(),
                 markers: Vec::new(),
                 format: None,
                 master: Default::default(),
@@ -6839,6 +7997,7 @@ mod tests {
             let tl = Timeline {
                 tracks: vec![track(StreamKind::Video, "V1", vec![original.clone()])],
                 overlays: Vec::new(),
+                svg_overlays: Vec::new(),
                 markers: Vec::new(),
                 format: None,
                 master: Default::default(),
@@ -7043,6 +8202,7 @@ mod tests {
         let tl = Timeline {
             tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 60.0)])],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -7062,11 +8222,12 @@ mod tests {
             id: Uuid::new_v4(),
             time: t,
             name: n.into(),
-            color: None,
+            ..Default::default()
         };
         let tl = Timeline {
             tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 20.0)])],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: vec![mk(1.0, "before"), mk(4.0, "inside"), mk(9.0, "after")],
             format: None,
             master: Default::default(),
@@ -7088,6 +8249,7 @@ mod tests {
                 ..track(StreamKind::Audio, "A1", vec![clip_at(0.0, 10.0)])
             }],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -7290,7 +8452,7 @@ mod tests {
             id: Uuid::new_v4(),
             time: 72.0,
             name: "the laugh".to_string(),
-            color: None,
+            ..Default::default()
         });
         after.format = Some(Delivery::new(1080, 1920, Fit::Cover));
 
@@ -7437,6 +8599,7 @@ mod tests {
             start,
             end,
             text: text.to_string(),
+            ..Default::default()
         }
     }
 
@@ -7456,10 +8619,92 @@ mod tests {
         Timeline {
             tracks: vec![track],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
         }
+    }
+
+    fn timed(text: &str, words: &[(&str, f64, f64)]) -> TranscriptSegment {
+        let (start, end) = (words[0].1, words[words.len() - 1].2);
+        TranscriptSegment {
+            start,
+            end: end + 1.0,
+            text: text.to_string(),
+            words: words
+                .iter()
+                .map(|(t, a, b)| Word {
+                    text: t.to_string(),
+                    start: *a,
+                    end: *b,
+                    ..Word::default()
+                })
+                .collect(),
+            speaker: None,
+        }
+    }
+
+    #[test]
+    fn word_timed_lines_follow_the_words_and_their_pauses() {
+        let asset = Uuid::new_v4();
+        let timeline = one_clip(Clip::new(asset, 0.0, 20.0, 0.0));
+        let line = timed(
+            "one two three four five six",
+            &[
+                ("one", 0.0, 0.3),
+                ("two", 0.3, 0.6),
+                ("three", 0.6, 1.0),
+                ("four", 1.0, 1.4),
+                ("five", 4.0, 4.4),
+                ("six", 4.4, 5.0),
+            ],
+        );
+        assert_eq!(
+            captioned(&timeline, asset, vec![line]),
+            vec![
+                ("one two three four".to_string(), 0.0, 1.9),
+                ("five six".to_string(), 4.0, 5.5)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_short_word_timed_line_merges_into_its_neighbour() {
+        let asset = Uuid::new_v4();
+        let timeline = one_clip(Clip::new(asset, 0.0, 20.0, 0.0));
+        let opts = CaptionOptions {
+            style: CaptionStyle::Lines,
+            max_words: Some(1),
+            ..CaptionOptions::default()
+        };
+        let line = timed("a long", &[("a", 0.0, 0.1), ("long", 0.1, 1.0)]);
+        let got: Vec<(String, f64, f64)> = timeline
+            .captions(&HashMap::from([(asset, vec![line])]), opts)
+            .into_iter()
+            .map(|o| (o.text, o.start, o.end))
+            .collect();
+        assert_eq!(got, vec![("a long".to_string(), 0.0, 1.5)]);
+    }
+
+    #[test]
+    fn word_timed_lines_project_through_trim_and_speed() {
+        let asset = Uuid::new_v4();
+        let mut clip = Clip::new(asset, 2.0, 10.0, 5.0);
+        clip.speed = 2.0;
+        let timeline = one_clip(clip);
+        let line = timed("cut kept", &[("cut", 1.0, 1.9), ("kept", 4.0, 5.0)]);
+        // `cut` is spoken before the in-point (its hold reaching past it shows nothing);
+        // `kept` lands at 5 + (4 - 2) / 2 = 6.
+        let got: Vec<(String, f64, f64)> = timeline
+            .captions(
+                &HashMap::from([(asset, vec![line])]),
+                CaptionOptions::styled(CaptionStyle::WordPunch),
+            )
+            .into_iter()
+            .map(|o| (o.text, o.start, o.end))
+            .collect();
+        assert_eq!(got, vec![("kept".to_string(), 6.0, 6.75)]);
     }
 
     #[test]
@@ -7515,6 +8760,7 @@ mod tests {
         let mut tl = Timeline::new();
         tl.master = MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: 0.7,
             limiter: true,
             ceiling_db: -3.0,
@@ -7526,6 +8772,7 @@ mod tests {
             partial.master,
             MasterBus {
                 duck_depth_db: None,
+                true_peak: false,
                 volume: 1.0,
                 limiter: true,
                 ceiling_db: -1.5
@@ -7555,6 +8802,7 @@ mod tests {
     fn a_master_from_a_hand_edited_file_is_made_safe_for_the_graph() {
         let m = MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: f64::NAN,
             limiter: true,
             ceiling_db: f64::INFINITY,
@@ -7563,6 +8811,7 @@ mod tests {
         assert_eq!(m.safe_ceiling_db(), MASTER_DEFAULT_CEILING_DB);
         let m = MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: 99.0,
             limiter: true,
             ceiling_db: -90.0,
@@ -7581,6 +8830,7 @@ mod tests {
     fn the_master_follows_the_cut_into_every_render_of_it() {
         let master = MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: 0.5,
             limiter: true,
             ceiling_db: -2.0,
@@ -7727,7 +8977,7 @@ mod tests {
         // 11 kHz at a -1 dBFS ceiling, as measured: -0.2 dBTP is 0.8 over, so -2.3.
         let n = notes(-0.2, &on(-1.0));
         assert_eq!(n.len(), 2, "{n:?}");
-        assert!(!n[1].contains("Turn on"), "{n:?}");
+        assert!(!n[1].contains("Turn on the master limiter"), "{n:?}");
         assert!(
             n[1].contains("-0.2 dBTP") && n[1].contains("-1.0 dBFS") && n[1].contains("about -2.3 dBFS"),
             "{n:?}"
@@ -7737,9 +8987,25 @@ mod tests {
         assert_eq!(
             n[1],
             "True peak -0.2 dBTP is over the -1 dBTP platforms ask for and can clip when re-encoded. The master limiter is already \
-             on, but it holds the sample peak at -1.0 dBFS and the peak between samples runs above that. Lower its ceiling to \
-             about -2.3 dBFS (set_master_limiter)."
+             on, but it holds the sample peak at -1.0 dBFS and the peak between samples runs above that. Turn on true-peak \
+             limiting (set_master_true_peak), or lower its ceiling to about -2.3 dBFS (set_master_limiter)."
         );
+        // Already limiting the true peak: only the ceiling is left to lower.
+        let tp_on = |ceiling_db| MasterBus {
+            true_peak: true,
+            ..on(ceiling_db)
+        };
+        assert_eq!(
+            notes(-0.2, &tp_on(-1.0))[1],
+            "True peak -0.2 dBTP is over the -1 dBTP platforms ask for and can clip when re-encoded. The master limiter is already \
+             on and holds the true peak at -1.0 dBFS. Lower its ceiling to about -2.3 dBFS (set_master_limiter)."
+        );
+        let floor_tp = notes(0.4, &tp_on(MASTER_MIN_CEILING_DB));
+        assert!(
+            floor_tp[1].contains("holding the true peak at its lowest ceiling"),
+            "{floor_tp:?}"
+        );
+        assert!(!floor_tp[1].contains("set_master_true_peak"), "{floor_tp:?}");
         // From the default ceiling: 0.4 dBTP is 1.4 over.
         assert!(
             notes(0.4, &on(MASTER_DEFAULT_CEILING_DB))[1].contains("about -3.4 dBFS"),
@@ -7762,7 +9028,7 @@ mod tests {
         assert_eq!(
             notes(0.4, &MasterBus::default())[1],
             "True peak 0.4 dBTP is over the -1 dBTP platforms ask for and can clip when re-encoded. Turn on the master limiter \
-             (set_master_limiter) or lower the master."
+             (set_master_limiter) with true-peak limiting (set_master_true_peak), or lower the master."
         );
         assert!(notes(0.4, &off)[1].contains("Turn on the master limiter"));
         // Under the line: no note, limiter or not.
@@ -7898,6 +9164,7 @@ mod tests {
         let timeline = Timeline {
             tracks: vec![track],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -7921,6 +9188,7 @@ mod tests {
         let timeline = Timeline {
             tracks: vec![track],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -8061,6 +9329,7 @@ mod tests {
         let timeline = Timeline {
             tracks: vec![video, audio],
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -8934,7 +10203,7 @@ mod tests {
             id: Uuid::new_v4(),
             time: 7.0,
             name: "beat".to_string(),
-            color: None,
+            ..Default::default()
         });
         let (_, out) = rippled(&before, |t| clip_mut(t, a).source_out = 3.0);
         assert_eq!(out.overlays[0].start, 6.0);
@@ -10338,5 +11607,307 @@ mod tests {
         let mut rolled = t.clone();
         rolled.roll_edit(a, t.tracks[0].clips[1].id, 1.0, &footage(60.0)).unwrap();
         assert!(t.diff(&rolled).entries.iter().any(|e| e.summary.starts_with("Trimmed clip")));
+    }
+
+    // ---- animated SVG overlays ----------------------------------------------
+
+    fn svg_title(start: f64, end: f64) -> SvgOverlay {
+        SvgOverlay {
+            id: Uuid::new_v4(),
+            name: "Logo".to_string(),
+            svg: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"/>".to_string(),
+            start,
+            end,
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            opacity: 1.0,
+            offset: 0.0,
+            preset: None,
+            template: None,
+        }
+    }
+
+    fn preset_title(start: f64, end: f64) -> SvgOverlay {
+        let mut o = svg_title(start, end);
+        o.name = String::new();
+        o.preset = Some(SvgPreset {
+            kind: SvgPresetKind::FadeUp,
+            params: SvgPresetParams::new("Hello"),
+        });
+        o.regenerate((1920, 1080));
+        o
+    }
+
+    #[test]
+    fn a_timeline_without_svg_overlays_serialises_as_it_always_did() {
+        let json = serde_json::to_string(&Timeline::new()).unwrap();
+        assert!(!json.contains("svg_overlays"), "{json}");
+        let old = r#"{"tracks":[]}"#;
+        let tl: Timeline = serde_json::from_str(old).unwrap();
+        assert!(tl.svg_overlays.is_empty());
+        assert_eq!(
+            serde_json::to_string(&tl).unwrap(),
+            old,
+            "an old project round-trips byte for byte"
+        );
+        let mut with = Timeline::new();
+        with.svg_overlays.push(svg_title(0.0, 2.0));
+        let back: Timeline = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(back.svg_overlays, with.svg_overlays);
+    }
+
+    #[test]
+    fn a_template_instance_round_trips_in_snake_case_and_is_absent_when_there_is_none() {
+        use crate::template::{TemplateControl, TemplateInstance, TemplateKind, TemplateTarget};
+        let mut o = svg_title(0.0, 2.0);
+        let plain = serde_json::to_string(&o).unwrap();
+        assert!(
+            !plain.contains("template"),
+            "a title without one stores the bytes it always did: {plain}"
+        );
+        o.template = Some(TemplateInstance {
+            template_id: "6f1e0c0e-3b0f-4a5b-9c5e-0a8f2f6d7a11".into(),
+            name: "Kitefun end card".into(),
+            controls: vec![TemplateControl {
+                id: "brand".into(),
+                label: "Brand colour".into(),
+                kind: TemplateKind::Color,
+                targets: vec![TemplateTarget {
+                    element: "bg-stop".into(),
+                    attribute: Some("stop-color".into()),
+                }],
+                min: None,
+                max: None,
+            }],
+            values: [("brand".to_string(), "#112233".to_string())].into(),
+        });
+        let json = serde_json::to_value(&o).unwrap();
+        assert_eq!(
+            json["template"],
+            serde_json::json!({
+                "template_id": "6f1e0c0e-3b0f-4a5b-9c5e-0a8f2f6d7a11",
+                "name": "Kitefun end card",
+                "controls": [{
+                    "id": "brand", "label": "Brand colour", "kind": "color",
+                    "targets": [{"element": "bg-stop", "attribute": "stop-color"}]
+                }],
+                "values": {"brand": "#112233"}
+            })
+        );
+        let back: SvgOverlay = serde_json::from_value(json).unwrap();
+        assert_eq!(back, o);
+    }
+
+    #[test]
+    fn svg_overlay_json_defaults_and_omissions() {
+        let id = Uuid::new_v4();
+        let minimal = format!(r#"{{"id":"{id}","svg":"<svg/>","start":1.0,"end":2.5}}"#);
+        let o: SvgOverlay = serde_json::from_str(&minimal).unwrap();
+        assert_eq!(
+            (o.x, o.y, o.width, o.height, o.opacity, o.offset, o.name.as_str()),
+            (0.0, 0.0, 1.0, 1.0, 1.0, 0.0, "")
+        );
+        assert!(o.preset.is_none() && o.template.is_none());
+        let json = serde_json::to_value(&o).unwrap();
+        assert!(
+            json.get("offset").is_none() && json.get("preset").is_none() && json.get("template").is_none(),
+            "{json}"
+        );
+        assert_eq!(json["width"], 1.0);
+        let sliced = SvgOverlay { offset: 1.5, ..o };
+        assert_eq!(serde_json::to_value(&sliced).unwrap()["offset"], 1.5);
+
+        let p: SvgPreset = serde_json::from_str(r#"{"kind":"lower_third","params":{"text":"Jane"}}"#).unwrap();
+        assert_eq!(p.kind, SvgPresetKind::LowerThird);
+        assert_eq!(
+            (
+                p.params.color.as_str(),
+                p.params.accent.as_str(),
+                p.params.subtitle.clone(),
+                p.params.font.clone()
+            ),
+            ("#ffffff", "#ffb000", None, None)
+        );
+        for kind in SvgPresetKind::ALL {
+            assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
+        }
+        let patch: SvgOverlayPatch = serde_json::from_str(r#"{"opacity":0.5}"#).unwrap();
+        assert_eq!(
+            patch,
+            SvgOverlayPatch {
+                opacity: Some(0.5),
+                ..Default::default()
+            }
+        );
+        assert_eq!(serde_json::to_string(&SvgOverlayPatch::default()).unwrap(), "{}");
+        let kind: SvgOverlayPatch = serde_json::from_str(r#"{"preset_kind":"word_pop"}"#).unwrap();
+        assert_eq!(kind.preset_kind, Some(SvgPresetKind::WordPop));
+        assert_eq!(serde_json::to_string(&kind).unwrap(), r#"{"preset_kind":"word_pop"}"#);
+    }
+
+    #[test]
+    fn svg_overlay_clock_and_names() {
+        let mut o = svg_title(2.0, 6.0);
+        assert_eq!(
+            (o.doc_time(1.0), o.doc_time(2.0), o.doc_time(3.5), o.doc_duration()),
+            (0.0, 0.0, 1.5, 4.0)
+        );
+        o.offset = 1.0;
+        assert_eq!((o.doc_time(3.5), o.doc_duration()), (2.5, 5.0));
+        assert_eq!(o.display_name(), "Logo");
+        assert_eq!(preset_title(0.0, 3.0).display_name(), "Hello");
+        let mut anon = svg_title(0.0, 1.0);
+        anon.name = "  ".to_string();
+        assert_eq!(anon.display_name(), "SVG");
+    }
+
+    #[test]
+    fn slice_clips_and_shifts_svg_overlays_and_keeps_their_clock() {
+        let mut tl = Timeline::new();
+        tl.svg_overlays = vec![
+            svg_title(2.0, 8.0),
+            svg_title(0.0, 3.0),
+            svg_title(9.0, 12.0),
+            svg_title(5.0, 6.0),
+        ];
+        let ids: Vec<Uuid> = tl.svg_overlays.iter().map(|o| o.id).collect();
+        let s = tl.slice(4.0, 10.0);
+        let got: Vec<(Uuid, f64, f64, f64)> = s.svg_overlays.iter().map(|o| (o.id, o.start, o.end, o.offset)).collect();
+        assert_eq!(
+            got,
+            vec![(ids[0], 0.0, 4.0, 2.0), (ids[2], 5.0, 6.0, 0.0), (ids[3], 1.0, 2.0, 0.0),],
+            "cut at the front, clipped at the back, shifted; one wholly before is gone"
+        );
+        assert!(tl.slice(20.0, 30.0).svg_overlays.is_empty());
+        assert!(tl.slice(0.0, 2.0).svg_overlays.iter().all(|o| o.offset == 0.0));
+        // slicing a slice keeps counting from the document's start
+        let again = s.slice(1.0, 3.0);
+        let first = &again.svg_overlays[0];
+        assert_eq!((first.id, first.start, first.end, first.offset), (ids[0], 0.0, 2.0, 3.0));
+        assert_eq!(
+            first.doc_time(first.start),
+            3.0,
+            "the animation is already 3 s in where the cut begins"
+        );
+        // the whole span keeps its offset untouched
+        let whole = tl.slice(0.0, 100.0);
+        assert!(whole.svg_overlays.iter().all(|o| o.offset == 0.0));
+        assert_eq!(whole.svg_overlays.len(), 4);
+    }
+
+    #[test]
+    fn for_render_keeps_svg_overlays_and_ripple_never_moves_them() {
+        let (mut before, [a, ..]) = gapped();
+        before.svg_overlays.push(svg_title(6.0, 9.0));
+        assert_eq!(before.for_render().svg_overlays, before.svg_overlays);
+        let (_, out) = rippled(&before, |t| clip_mut(t, a).source_out = 3.0);
+        assert_eq!((out.svg_overlays[0].start, out.svg_overlays[0].end), (6.0, 9.0));
+        assert_eq!(spans_of(&out, 0)[1], (4.0, 7.0), "while the clips did move");
+    }
+
+    #[test]
+    fn for_delivery_remakes_presets_for_a_new_shape_and_leaves_custom_art_alone() {
+        let mut tl = Timeline::new();
+        let custom = svg_title(0.0, 4.0);
+        let preset = preset_title(0.0, 4.0);
+        tl.svg_overlays = vec![custom.clone(), preset.clone()];
+        let vertical = tl.for_delivery(Delivery::new(1080, 1920, Fit::Cover));
+        assert_eq!(vertical.svg_overlays[0], custom, "custom artwork is only ever scaled");
+        assert!(vertical.svg_overlays[1].svg.contains("viewBox=\"0 0 1080 1920\""));
+        assert_ne!(vertical.svg_overlays[1].svg, preset.svg);
+        assert_eq!(vertical.svg_overlays[1].preset, preset.preset);
+        assert_eq!(tl.svg_overlays[1], preset, "the cut itself is not touched");
+
+        tl.format = Some(Delivery::new(1920, 1080, Fit::Contain));
+        let same = tl.for_delivery(Delivery::new(1280, 720, Fit::Contain));
+        assert_eq!(
+            same.svg_overlays, tl.svg_overlays,
+            "the same shape at another size changes only the size"
+        );
+        let square = tl.for_delivery(Delivery::new(1080, 1080, Fit::Cover));
+        assert!(square.svg_overlays[1].svg.contains("viewBox=\"0 0 1080 1080\""));
+
+        let mut cut = Timeline::new();
+        let mut sliced = preset_title(0.0, 4.0);
+        sliced.offset = 1.0;
+        cut.svg_overlays = vec![sliced];
+        let remade = cut.for_delivery(Delivery::new(1080, 1920, Fit::Cover)).svg_overlays.remove(0);
+        assert!(
+            remade.svg.contains("begin=\"4.6s\""),
+            "the preset is re-made for its whole document: {}",
+            remade.svg
+        );
+    }
+
+    #[test]
+    fn diff_names_animated_titles_added_changed_and_removed() {
+        let mut before = Timeline::new();
+        let kept = svg_title(0.0, 2.0);
+        let gone = preset_title(5.0, 7.0);
+        before.svg_overlays = vec![kept.clone(), gone.clone()];
+
+        let mut after = before.clone();
+        let mut moved = kept.clone();
+        moved.start = 0.5;
+        moved.x = 0.25;
+        moved.opacity = 0.5;
+        let fresh = svg_title(1.0, 5.0);
+        after.svg_overlays = vec![moved, fresh.clone()];
+
+        let diff = before.diff(&after);
+        let by = |kind: DiffKind| diff.entries.iter().find(|e| e.kind == kind).unwrap();
+        let added = by(DiffKind::OverlayAdded);
+        assert_eq!(added.summary, "Added animated title “Logo” at 0:01.0–0:05.0");
+        assert_eq!((added.overlay_id, added.at), (Some(fresh.id), Some(1.0)));
+        let changed = by(DiffKind::OverlayChanged);
+        assert_eq!(changed.summary, "Changed animated title “Logo”");
+        assert_eq!(changed.overlay_id, Some(kept.id));
+        let detail = changed.detail.as_deref().unwrap();
+        assert!(detail.contains("timing 0:00.0–0:02.0 → 0:00.5–0:02.0"), "{detail}");
+        assert!(
+            detail.contains("placement 0.00,0.00 1.00x1.00 → 0.25,0.00 1.00x1.00"),
+            "{detail}"
+        );
+        assert!(detail.contains("opacity 100% → 50%"), "{detail}");
+        let removed = by(DiffKind::OverlayRemoved);
+        assert_eq!(removed.summary, "Removed animated title “Hello” at 0:05.0");
+        assert_eq!(removed.overlay_id, Some(gone.id));
+        assert_eq!(diff.entries.len(), 3);
+        assert!(before.diff(&before).is_empty());
+    }
+
+    #[test]
+    fn diff_reads_a_preset_retime_as_timing_and_a_conversion_as_a_conversion() {
+        let mut before = Timeline::new();
+        let p = preset_title(0.0, 4.0);
+        before.svg_overlays = vec![p];
+        let mut after = before.clone();
+        after.svg_overlays[0].end = 8.0;
+        after.svg_overlays[0].regenerate((1920, 1080));
+        let detail = before.diff(&after).entries[0].detail.clone().unwrap();
+        assert_eq!(
+            detail, "timing 0:00.0–0:04.0 → 0:00.0–0:08.0",
+            "the re-made artwork is not a separate change"
+        );
+
+        let mut reworded = before.clone();
+        reworded.svg_overlays[0].preset.as_mut().unwrap().params.text = "Bye".to_string();
+        let detail = before.diff(&reworded).entries[0].detail.clone().unwrap();
+        assert_eq!(detail, "text “Hello” → “Bye”");
+
+        let mut custom = before.clone();
+        custom.svg_overlays[0].preset = None;
+        assert_eq!(
+            before.diff(&custom).entries[0].detail.as_deref(),
+            Some("converted to custom SVG")
+        );
+
+        let mut edited = Timeline::new();
+        edited.svg_overlays = vec![svg_title(0.0, 1.0)];
+        let mut after = edited.clone();
+        after.svg_overlays[0].svg.push(' ');
+        assert_eq!(edited.diff(&after).entries[0].detail.as_deref(), Some("artwork changed"));
     }
 }

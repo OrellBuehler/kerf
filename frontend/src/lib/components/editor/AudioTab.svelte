@@ -57,7 +57,7 @@
 					size={28}
 					data-tone="quiet"
 					title={`Remove ${effectLabel(e)}`}
-					disabled={editor.busy}
+					pending={editor.locked}
 					onclick={() => void attempt(() => editor.setAudioEffects(clip.id, effects.filter((_, j) => j !== i)))}
 					><Icon n="x" s={14} /></IconBtn
 				>
@@ -72,5 +72,5 @@
 	<div style="font-size:12px;color:var(--text-muted);line-height:1.45;margin-bottom:8px">
 		Write a script and Kerf speaks it onto the VO track — it can caption the cut in the same step.
 	</div>
-	<Btn size="sm" variant="secondary" icon="mic" disabled={editor.busy} onclick={() => ui.openVoiceover()}>Write a voiceover…</Btn>
+	<Btn size="sm" variant="secondary" icon="mic" pending={editor.locked} onclick={() => ui.openVoiceover()}>Write a voiceover…</Btn>
 </div>

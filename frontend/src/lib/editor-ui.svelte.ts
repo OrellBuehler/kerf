@@ -7,6 +7,7 @@ import { editor } from './state.svelte';
 import {
 	cancelAnalysis,
 	cancelLevels,
+	cancelModelDownload,
 	downloadSpeechModel,
 	getLevels,
 	listFonts,
@@ -23,9 +24,10 @@ import type {
 	CaptionStyle,
 	CaptionTimeBase,
 	Levels,
+	ModelProgress,
 	TranscriptionStatus
 } from './types';
-import { autoSteps, kindInfo, kindOfStage, missingSteps } from './analysis-steps';
+import { autoSteps, counterKind, kindInfo, kindOfStage, missingSteps, stepCounter, stepWords, type StepCounter } from './analysis-steps';
 import { mediaStatus } from './media-status.svelte';
 import { isLevelsCancelled, measureRange, type MeasureStamp } from './levels-view';
 import type { ExportDraft } from './export-draft';
@@ -78,12 +80,19 @@ class EditorUi {
 	 *  and then runs inference for minutes, so the UI names the step and shows a
 	 *  real percentage wherever the backend can produce one. */
 	analysisStage = $state<AnalysisProgress | null>(null);
+	/** The kinds the running pass was asked for, for "step 2 of 5" — `null` when the run was left to Settings'
+	 *  switches and the plan is not known here. */
+	analysisPlan = $state<readonly AnalysisKind[] | null>(null);
 	/** Which speech-to-text backend is available, once probed. */
 	transcription = $state<TranscriptionStatus | null>(null);
 	/** Set while a speech model is being fetched deliberately (not mid-analysis). */
 	downloadingModel = $state<string | null>(null);
 	/** 0..1 for that download. */
 	modelFraction = $state(0);
+	/** The latest `model-progress` report: the bytes fetched of the model, for a line under the bar. */
+	modelProgress = $state<ModelProgress | null>(null);
+	/** A stop has been asked for and the download has not given up yet. */
+	cancellingModel = $state(false);
 	/** How many assets are still queued behind the one being analyzed, so the
 	 *  UI can say "2 of 5" rather than spin at an unknown length. */
 	analysisQueued = $state(0);
@@ -94,12 +103,18 @@ class EditorUi {
 	/** The Separate-stems dialog: `null` while closed, else the asset whose sound it splits and,
 	 *  when opened from a clip, the clip the stems are laid under. */
 	stemsDialog = $state<{ assetId: string; clipId: string | null } | null>(null);
+	/** The Save-as-template dialog: `null` while closed, else the animated title being kept as a template. */
+	saveTemplateDialog = $state<{ overlayId: string } | null>(null);
 	/** The Fit-to-video dialog: `null` while closed, else the music clip it plans a fit for. */
 	fitMusicDialog = $state<{ clipId: string } | null>(null);
 	/** The export dialog. Opened from the toolbar, ⌘E and the Deliver panel. */
 	exportDialog = $state(false);
 	/** The About dialog (Help › About Kerf). */
 	aboutDialog = $state(false);
+	/** The Relink-media dialog: opens on its own when a project comes up with media whose file is gone. */
+	relinkDialog = $state(false);
+	/** The read-only shortcut cheat sheet (`?`, Help › Keyboard shortcuts). */
+	shortcutSheet = $state(false);
 	/** The options the export dialog was last closed on, for the session (`export-draft.ts`). */
 	exportDraft = $state.raw<ExportDraft | null>(null);
 	/** The delivery shapes (ids from `DELIVERY_PRESETS`) ticked for a multi-format
@@ -115,6 +130,9 @@ class EditorUi {
 	 *  every time a sentence happened to be short. Shared by every place that
 	 *  offers the button (the Inspector and the library's Titles tab). */
 	captionStyle = $state<CaptionStyle>('lines');
+	/** The animated SVG title whose source the Inspector should open and focus: set when *Custom SVG…* makes
+	 *  one (or a lane menu asks to edit it), cleared by the Inspector once it has taken the focus. */
+	svgSourceFocus = $state<string | null>(null);
 	/** What the Titles controls' *Import captions* options say: whether a subtitle
 	 *  file's times are the finished cut's (`timeline`) or one clip's own footage
 	 *  (`source`, with the asset picked here). Held beside `captionStyle` so the two
@@ -149,6 +167,11 @@ class EditorUi {
 	 *  bracket the working range; export can render just this span. */
 	markIn = $state<number | null>(null);
 	markOut = $state<number | null>(null);
+	/** The timeline seconds on screen, written by the timeline as it scrolls and zooms (`null`
+	 *  while it is not mounted) — part of the editor context an agent can read. */
+	timelineView = $state<{ start: number; end: number } | null>(null);
+	/** The dock panel last activated (dockview's active panel), for the same context. */
+	focusedPanel = $state<string | null>(null);
 	#zoom = $state(ZOOM_DEFAULT);
 	/** Timeline zoom, pixels per second (`zoom.ts` owns the range and the maths). Setting it is a
 	 *  person taking the zoom, so the timeline stops fitting the cut to its window
@@ -182,6 +205,9 @@ class EditorUi {
 	/** Bumped when a preview proxy finishes generating, to nudge the preview into
 	 *  re-decoding the current frame (now served from the fast all-intra proxy). */
 	previewEpoch = $state(0);
+	/** The width the Preview asks its frames at (`null` before it has a box): the render bar
+	 *  judges the cut at it. */
+	previewWidth = $state<number | null>(null);
 	/** System font family names available for the text overlay font picker. */
 	availableFonts = $state<string[]>([]);
 
@@ -236,12 +262,36 @@ class EditorUi {
 		this.aboutDialog = false;
 	}
 
+	openRelink() {
+		this.relinkDialog = true;
+	}
+
+	closeRelink() {
+		this.relinkDialog = false;
+	}
+
+	openShortcuts() {
+		this.shortcutSheet = true;
+	}
+
+	closeShortcuts() {
+		this.shortcutSheet = false;
+	}
+
 	openStems(assetId: string, clipId: string | null = null) {
 		this.stemsDialog = { assetId, clipId };
 	}
 
 	closeStems() {
 		this.stemsDialog = null;
+	}
+
+	openSaveTemplate(overlayId: string) {
+		this.saveTemplateDialog = { overlayId };
+	}
+
+	closeSaveTemplate() {
+		this.saveTemplateDialog = null;
 	}
 
 	openFitMusic(clipId: string) {
@@ -264,6 +314,7 @@ class EditorUi {
 	 *  (the export options — a title, a codec — are not the new project's) is forgotten. */
 	projectReplaced() {
 		this.exportDraft = null;
+		this.svgSourceFocus = null;
 		this.zoomFollowsCut = true;
 	}
 
@@ -343,9 +394,20 @@ class EditorUi {
 		return this.analyzing ? kindOfStage(this.analysisStage?.stage) : null;
 	}
 
-	/** A short label for the step analysis is on, or null when idle. */
+	/** Where the running pass is in what it was asked for, once it has said which step it is on. */
+	get analysisStep(): StepCounter | null {
+		return this.analyzing ? stepCounter(this.analysisPlan, counterKind(this.analysisStage?.stage)) : null;
+	}
+
+	/** A short label for the step analysis is on, or null when idle: `step 2 of 5 · detecting scenes 40%`. */
 	get analysisLabel(): string | null {
 		if (!this.analyzing) return null;
+		const words = stepWords(this.analysisStep);
+		const named = this.#stageLabel();
+		return words ? `${words} · ${named}` : named;
+	}
+
+	#stageLabel(): string {
 		const p = this.analysisStage;
 		if (!p) return 'analyzing';
 		const kind = kindOfStage(p.stage);
@@ -371,18 +433,41 @@ class EditorUi {
 	async fetchSpeechModel(name: string) {
 		this.downloadingModel = name;
 		this.modelFraction = 0;
+		this.modelProgress = null;
+		this.cancellingModel = false;
 		try {
 			await downloadSpeechModel(name);
 			await this.loadTranscriptionStatus();
 		} catch (e) {
+			// A stop the user asked for is not a failure.
+			if (isModelCancelled(e)) toast.info(`Stopped downloading the ${name} speech model`);
 			// A few hundred megabytes over someone else's CDN fails often enough
 			// to be routine — offline, a proxy, a half-written cache file. It used
 			// to reject into nothing, so the download simply stopped looking like
 			// it was happening.
-			toast.error(`Couldn't download the ${name} speech model — ${message(e)}`);
+			else toast.error(`Couldn't download the ${name} speech model — ${message(e)}`);
 		} finally {
 			this.downloadingModel = null;
 			this.modelFraction = 0;
+			this.modelProgress = null;
+			this.cancellingModel = false;
+		}
+	}
+
+	/** A `model-progress` report from the backend (the user's download or an agent's). */
+	noteModelProgress(p: ModelProgress) {
+		this.modelProgress = p;
+		this.modelFraction = p.fraction ?? 0;
+	}
+
+	/** Stop the speech model download in flight; it then rejects and `fetchSpeechModel` says so. */
+	async stopModelDownload() {
+		this.cancellingModel = true;
+		try {
+			await cancelModelDownload();
+		} catch (e) {
+			this.cancellingModel = false;
+			toast.error(`Couldn't stop the download — ${message(e)}`);
 		}
 	}
 
@@ -395,6 +480,7 @@ class EditorUi {
 		this.analyzing = true;
 		this.analyzingId = assetId;
 		this.analysisStage = null;
+		this.analysisPlan = steps ?? null;
 		try {
 			await editor.analyze(assetId, steps);
 			// Transcription may have downloaded a model on the way.
@@ -408,9 +494,30 @@ class EditorUi {
 			this.analyzing = false;
 			this.analyzingId = null;
 			this.analysisStage = null;
+			this.analysisPlan = null;
 			this.stoppingAnalysis = false;
 			await mediaStatus.refresh();
 			this.reportFailedSteps(assetId, steps);
+		}
+	}
+
+	/** Re-time an asset's transcript words and label its speakers, shown and stoppable like an
+	 *  analysis pass. Resolves the speaker count, or null when it was stopped. */
+	async refineTranscript(assetId: string): Promise<number | null> {
+		this.analyzing = true;
+		this.analyzingId = assetId;
+		this.analysisStage = null;
+		try {
+			const analysis = await editor.refineTranscript(assetId);
+			return new Set(analysis.transcript.map((s) => s.speaker).filter(Boolean)).size;
+		} catch (e) {
+			if (isCancelled(e)) return null;
+			throw e;
+		} finally {
+			this.analyzing = false;
+			this.analyzingId = null;
+			this.analysisStage = null;
+			this.stoppingAnalysis = false;
 		}
 	}
 
@@ -600,6 +707,11 @@ class EditorUi {
 }
 
 /** The readable part of whatever the backend rejected with. */
+/** The rejection of a download the user stopped (`cancel_model_download`). */
+export function isModelCancelled(e: unknown): boolean {
+	return /cancel+ed/i.test(e instanceof Error ? e.message : String(e));
+}
+
 function message(e: unknown): string {
 	return e instanceof Error ? e.message : String(e);
 }

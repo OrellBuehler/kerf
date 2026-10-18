@@ -62,11 +62,15 @@ export function describeRemainder(fit: Pick<MusicFit, 'remainder'>, fadeOut: boo
 		: `${by} over — the whole arrangement plays, ending included`;
 }
 
-/** The toast after a fit: `Music fitted to 0:20.5 · 1 splice`, with what was done to an overrun. */
-export function describeFit(report: Pick<MusicFitReport, 'duration' | 'faded' | 'fit'>): string {
+/** The toast after a fit: `Music fitted to 0:20.5 · 1 splice`, with what was done to an overrun. `fmt` is how the
+ *  interface prints a time (`timeDisplay.fmt`); the default is the review card's `m:ss.d`. */
+export function describeFit(
+	report: Pick<MusicFitReport, 'duration' | 'faded' | 'fit'>,
+	fmt: (seconds: number) => string = formatTime
+): string {
 	const n = report.fit.splices;
 	const splices = n === 0 ? 'no splices' : `${n} splice${n === 1 ? '' : 's'}`;
-	return `Music fitted to ${formatTime(report.duration)} · ${splices}${report.faded ? ' · faded out' : ''}`;
+	return `Music fitted to ${fmt(report.duration)} · ${splices}${report.faded ? ' · faded out' : ''}`;
 }
 
 /** Parse the dialog's custom-length box: a positive number of seconds (a comma decimal is

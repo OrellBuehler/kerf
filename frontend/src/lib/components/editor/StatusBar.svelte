@@ -9,26 +9,42 @@
 	import { inTauri, revealLogs } from '#lib/api';
 	import { toast } from '#lib/notifications.svelte';
 	import { tip } from '#lib/tip';
-	import { clock } from '#lib/clock';
+	import { timeDisplay } from '#lib/time-display.svelte';
+	import { assetLine, projectFrame, projectLine } from '#lib/status-facts';
+	import { jobLine } from '#lib/job-line';
 
 	const showLogs = inTauri();
 
-	/** Real metadata of the selected asset: fps · resolution · codec. */
-	const meta = $derived.by(() => {
+	/** The project: the rate and frame the cut plays and exports at. */
+	const project = $derived(projectLine(editor.fps, projectFrame(editor.liveTimeline, editor.assets)));
+
+	/** The library asset that is selected, named — its own rate and size are not the project's. */
+	const picked = $derived.by(() => {
 		const a = editor.selectedAsset;
-		if (!a) return null;
-		const v = a.streams.find((s) => s.kind === 'video');
-		const parts: string[] = [];
-		if (v?.fps) parts.push(`${v.fps.toFixed(3)} fps`);
-		if (v?.width && v?.height) parts.push(`${v.width}×${v.height}`);
-		const codec = (v ?? a.streams[0])?.codec;
-		if (codec) parts.push(codec);
-		return parts.join(' · ') || null;
+		const line = a ? assetLine(a) : null;
+		return a && line ? { name: a.name, line } : null;
 	});
 
 	const clipCount = $derived(
 		editor.timeline.tracks.reduce((n, t) => n + t.clips.length, 0)
 	);
+
+	/** A job the user started on purpose and may stop: framing the shots, a cover frame, a model download, an import. */
+	const job = $derived(
+		jobLine({
+			smartCrop: editor.smartCropping ? { fraction: editor.smartCropProgress, stopping: editor.stoppingSmartCrop } : null,
+			cover: editor.coverRun ? { stopping: editor.coverRun.cancelling } : null,
+			model: ui.downloadingModel ? { name: ui.downloadingModel, fraction: ui.modelFraction, stopping: ui.cancellingModel } : null,
+			importing: editor.importing ? { fraction: editor.importProgress, stopping: editor.stoppingImport } : null
+		})
+	);
+	function stopJob() {
+		if (!job) return;
+		if (job.id === 'smart-crop') void editor.stopSmartCrop();
+		else if (job.id === 'cover') void editor.stopCover();
+		else if (job.id === 'model') void ui.stopModelDownload();
+		else void editor.stopImport();
+	}
 
 	/** Which file the frame under the playhead comes from — the proxy or the original, and why. */
 	const sourceNote = $derived(
@@ -46,10 +62,21 @@
 <div
 	style="height:var(--statusbar-h);flex:none;display:flex;align-items:center;gap:12px;padding:0 12px;background:var(--surface-app);border-top:var(--line-width) solid var(--border-default);font-variant-numeric:tabular-nums"
 >
-	{#if meta}
-		<span use:tip={'The selected asset: frame rate, size and codec'} style="font-size:var(--text-xs);color:var(--text-muted)">{meta}</span>
+	<span
+		data-status-project
+		use:tip={{ text: 'The project: the frame rate and size the cut plays and exports at', detail: 'Delivery frame, else the first picture on the cut.' }}
+		style="font-size:var(--text-xs);color:var(--text-muted)">{project}</span
+	>
+	<span use:tip={'Length of the cut'} style="font-size:var(--text-xs);color:var(--text-muted)">Cut {timeDisplay.fmt(editor.duration)}</span>
+	{#if picked}
+		<span style="width:1px;height:12px;background:var(--border-default)"></span>
+		<span
+			data-status-selected
+			use:tip={{ text: `Selected in the library: ${picked.name}`, detail: 'Its own frame rate, size and codec — not the project’s.' }}
+			style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--text-xs);color:var(--text-muted)"
+			>Selected {picked.name} · {picked.line}</span
+		>
 	{/if}
-	<span use:tip={'Length of the cut'} style="font-size:var(--text-xs);color:var(--text-muted)">Cut {clock(editor.duration)}</span>
 	<div style="flex:1"></div>
 	{#if sourceNote}
 		<!-- Which file this frame was decoded from: the preview proxy, or the original and why. -->
@@ -100,6 +127,20 @@
 			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);height:24px;padding:0 8px"
 		>
 			{editor.exportRun.cancelling ? 'Stopping…' : 'Stop'}
+		</button>
+	{:else if job}
+		<span data-testid="job-line" style="display:inline-flex;align-items:center;gap:6px;font-size:var(--text-xs);color:var(--kerf-300)">
+			<span class="kerf-spin" style="width:9px;height:9px;border:1.5px solid var(--kerf-400);border-top-color:transparent;border-radius:50%"></span>
+			{job.label}
+		</span>
+		<button
+			type="button"
+			disabled={job.stopping}
+			use:tip={job.tip}
+			onclick={stopJob}
+			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);height:24px;padding:0 8px"
+		>
+			{job.stopping ? 'Stopping…' : 'Stop'}
 		</button>
 	{:else if ui.analyzing}
 		<!-- Analysis is a long commitment (a speech model download, then minutes

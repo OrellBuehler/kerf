@@ -35,7 +35,11 @@ describe('the library', () => {
 
 	test('the Titles controls are equal buttons in a grid, with the two caption looks the only chips', () => {
 		const titles = read(`${EDITOR}TitlesControls.svelte`);
-		expect(titles).toContain('grid-template-columns:repeat(2,minmax(0,1fr))');
+		// Generate/Regenerate captions and Import: two equal cells when they fit, stacked when the panel is narrow (the
+		// longer labels did not fit half a 300 px Inspector).
+		expect(titles).toContain('grid-template-columns:repeat(auto-fit,minmax(142px,1fr))');
+		expect(titles).toContain('Regenerate captions');
+		expect(titles).toContain('Generate captions');
 		expect(titles).toContain('repeat(auto-fill,minmax(104px,1fr))');
 		expect(titles).not.toMatch(/flex:1[^;"]*"[^>]*>\s*\+ Text/);
 		expect((titles.match(/<Chip\b/g) ?? []).length).toBe(2);
@@ -64,14 +68,24 @@ describe('the library', () => {
 describe('the agent panel', () => {
 	const agent = read(`${EDITOR}AgentPanel.svelte`);
 
-	test('the review card’s buttons are pinned to the bottom of the scroll, which needs the card clipped, not overflow:hidden', () => {
+	test('the review buttons are the panel’s own row under the scrolling list, not a sticky part of the card', () => {
 		const actions = /data-review-actions\s+style="([^"]*)"/.exec(agent);
 		expect(actions, 'the review actions row').not.toBeNull();
-		expect(actions![1]).toContain('position:sticky');
-		expect(actions![1]).toContain('bottom:0');
-		const card = /border-left:calc\(var\(--line-width\) \* 2\) solid var\(--agent-500\);([^"]*)"/.exec(agent);
-		expect(card![1]).toContain('overflow:clip');
-		expect(card![1]).not.toContain('overflow:hidden');
+		// `flex:none` between the scroll area and the composer: on screen whatever the list holds.
+		expect(actions![1]).toContain('flex:none');
+		expect(actions![1]).not.toContain('position:sticky');
+		const scroll = agent.indexOf('overflow-y:auto');
+		const bar = agent.indexOf('data-review-actions');
+		const composer = agent.indexOf('<!-- add task -->');
+		expect(scroll).toBeGreaterThan(-1);
+		expect(bar).toBeGreaterThan(scroll);
+		expect(composer).toBeGreaterThan(bar);
+	});
+
+	test('the setup card folds away when a proposal arrives, and a row of the proposal selects through the shared review action', () => {
+		expect(agent).toContain('if (has && !hadStaged) showConnect = false');
+		expect(agent).toContain('inspectChange(e)');
+		expect(agent).toContain("from '#lib/proposal-actions'");
 	});
 
 	test('one status line, and no second "Agent queue" header over it', () => {
@@ -255,7 +269,8 @@ describe('smaller things the review asked for', () => {
 
 	test('a clip’s Remove is red ink on the neutral edge, not an alarm-coloured outline', () => {
 		expect(rule(CONTROLS, ".k-btn[data-variant='destructive'][data-quiet]")).toContain('--k-edge: var(--border-strong)');
-		expect(read(`${EDITOR}Inspector.svelte`).match(/data-quiet/g)?.length).toBe(2);
+		// the clip's Remove, the title's, and the animated title's
+		expect(read(`${EDITOR}Inspector.svelte`).match(/data-quiet/g)?.length).toBe(3);
 	});
 });
 

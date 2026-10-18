@@ -13,6 +13,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+use super::colors::{safe_color, valid_color};
 use super::cpu;
 use super::decode_policy::{
     export_hwaccel_request, facts_from_assets, facts_matter, looks_like_hardware_decode_failure, pix_fmt_bits_420,
@@ -26,8 +27,8 @@ use crate::clip_timing::{
 };
 use crate::error::{Error, Result};
 use crate::model::{
-    pix_fmt_layout, Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, PixLayout, Projection, Property, Reframe,
-    ReframeKeyframe, ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform,
+    pix_fmt_layout, Asset, AudioEffect, Clip, Color, Delivery, Grade, Hdr, Mask, MaskShape, PixLayout, Projection, Property,
+    Reframe, ReframeKeyframe, ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform,
     VideoEffect,
 };
 use crate::render_plan::{still_size, CompositeColorPolicy};
@@ -610,16 +611,49 @@ struct ProbeSideData {
     rotation: Option<f64>,
 }
 
+/// How long `ffprobe` may take over one file before it is killed. It reads headers, so this is a
+/// file on a share that stopped answering, not a big file — but a share that is merely *slow to
+/// wake* (a NAS spinning its disks up, a VPN coming back) takes a while to answer its first
+/// read, and ffprobe prints nothing until it is done, so there is no progress to build a stall
+/// bound on: five minutes, and a cancel ends the wait sooner.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long the once-per-process capability probes (`-filters`, `-h full`, `-h filter=…`) may
+/// take. They run inside a `OnceLock` every other thread waits on, and a cold first launch
+/// under a virus scan is slow, so the bound is generous; a binary that does not answer reads
+/// as the probe's "cannot run at all" case.
+const CAPABILITY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Probe a media file via `ffprobe -of json`.
 // In a full `ffmpeg` build the in-process libav probe is used instead.
 #[cfg_attr(feature = "ffmpeg", allow(dead_code))]
 pub fn probe(path: &Path) -> Result<ProbeResult> {
+    probe_with(path, None)
+}
+
+/// [`probe`] that gives up with [`Error::Cancelled`] once `cancel` is true (ffprobe is killed).
+// In a full `ffmpeg` build the in-process libav probe is used instead.
+#[cfg_attr(feature = "ffmpeg", allow(dead_code))]
+pub fn probe_cancellable(path: &Path, cancel: &dyn Fn() -> bool) -> Result<ProbeResult> {
+    probe_with(path, Some(cancel))
+}
+
+#[cfg_attr(feature = "ffmpeg", allow(dead_code))]
+fn probe_with(path: &Path, cancel: Option<&dyn Fn() -> bool>) -> Result<ProbeResult> {
     let bin = ffprobe_bin();
-    let output = command(&bin)
-        .args(["-v", "error", "-show_format", "-show_streams", "-of", "json"])
-        .arg(path)
-        .output()
-        .map_err(|e| launch_err(&bin, e))?;
+    let mut cmd = command(&bin);
+    cmd.args(["-v", "error", "-show_format", "-show_streams", "-of", "json"])
+        .arg(path);
+    let output = output_bounded_cancellable(cmd, PROBE_TIMEOUT, cancel)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::TimedOut => Error::Engine(format!(
+                "ffprobe did not answer for {} in {} s and was stopped (is the file on a share that went away?)",
+                path.display(),
+                PROBE_TIMEOUT.as_secs()
+            )),
+            _ => launch_err(&bin, e),
+        })?
+        .ok_or(Error::Cancelled)?;
     if !output.status.success() {
         return Err(Error::Engine(format!(
             "ffprobe failed: {}",
@@ -765,9 +799,10 @@ pub(crate) fn displayed_size(width: Option<u32>, height: Option<u32>, rotation: 
 }
 
 /// A colour tag as the engine stores it: `None` when the file does not say,
-/// rather than ffprobe's literal `"unknown"`.
+/// rather than ffprobe's literal `"unknown"` — or `"reserved"`, a value no matrix has, which
+/// FFmpeg reads as it reads none.
 pub(crate) fn known_color(tag: Option<&str>) -> Option<String> {
-    tag.filter(|t| !t.is_empty() && *t != "unknown" && *t != "unspecified")
+    tag.filter(|t| !t.is_empty() && !matches!(*t, "unknown" | "unspecified" | "reserved"))
         .map(str::to_string)
 }
 
@@ -883,7 +918,7 @@ pub(crate) fn projection_from_shape(path: Option<&Path>, width: Option<u32>, hei
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("insv") || e.eq_ignore_ascii_case("insp"));
     match (insta360, width, height) {
-        (true, Some(w), Some(h)) if h > 0 && w == h * 2 => Some(Projection::DualFisheye),
+        (true, Some(w), Some(h)) if h > 0 && h.checked_mul(2) == Some(w) => Some(Projection::DualFisheye),
         _ => None,
     }
 }
@@ -934,20 +969,21 @@ fn zscale_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
         let bin = ffmpeg_bin();
-        let ok = command(&bin)
-            .args(["-hide_banner", "-loglevel", "quiet", "-filters"])
-            .stdin(Stdio::null())
-            .output()
-            .map(|o| {
-                let list = String::from_utf8_lossy(&o.stdout);
-                let has = |name: &str| list.lines().any(|l| l.split_whitespace().nth(1) == Some(name));
-                has("zscale") && has("tonemap")
-            })
-            // A binary that will not even run renders nothing either way; only one
-            // that runs and lacks the filters gets the fallback. It also keeps the
-            // graph builders' output from depending on whether a test machine has
-            // ffmpeg installed.
-            .unwrap_or(true);
+        let ok = output_bounded(
+            command(&bin).args(["-hide_banner", "-loglevel", "quiet", "-filters"]),
+            CAPABILITY_PROBE_TIMEOUT,
+            0,
+        )
+        .map(|o| {
+            let list = String::from_utf8_lossy(&o.stdout);
+            let has = |name: &str| list.lines().any(|l| l.split_whitespace().nth(1) == Some(name));
+            has("zscale") && has("tonemap")
+        })
+        // A binary that will not even run renders nothing either way; only one
+        // that runs and lacks the filters gets the fallback. It also keeps the
+        // graph builders' output from depending on whether a test machine has
+        // ffmpeg installed.
+        .unwrap_or(true);
         tracing::debug!(available = ok, "probed ffmpeg for zscale + tonemap");
         ok
     })
@@ -1132,7 +1168,7 @@ pub(super) fn run_piped_until(cmd: &mut Command, input: Vec<u8>, deadline: Insta
 /// once a frame has reached the output**: a read that outputs nothing until its last frame is
 /// silent for the whole decode, so it gets either a frame to report on early (the scene pass
 /// selects frame 0) or a bound that grows with the work ([`stall_for_work`], the sheet's).
-const READ_STALL: std::time::Duration = std::time::Duration::from_secs(60);
+pub(super) const READ_STALL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The most a read that is silent until it ends is given before it counts as wedged.
 const READ_STALL_CEILING: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
@@ -1161,7 +1197,7 @@ fn sheet_stall(window_secs: f64) -> std::time::Duration {
 /// The `-progress` flags a bounded read adds **at spawn time** (like the thread caps, never in
 /// a pure builder): the report goes to stderr, which stdout-carrying reads (a contact sheet's
 /// JPEG) leave free, and is what [`output_unless_stalled`] listens for.
-const PROGRESS_ON_STDERR: [&str; 4] = ["-progress", "pipe:2", "-stats_period", "1"];
+pub(super) const PROGRESS_ON_STDERR: [&str; 4] = ["-progress", "pipe:2", "-stats_period", "1"];
 
 /// Whether `line` is one of the `key=value` lines of ffmpeg's `-progress` report.
 fn is_progress_line(line: &str) -> bool {
@@ -1186,22 +1222,26 @@ fn is_progress_line(line: &str) -> bool {
 }
 
 /// What [`output_unless_stalled`] collected.
-struct Collected {
-    status: std::process::ExitStatus,
-    stdout: Vec<u8>,
+pub(super) struct Collected {
+    pub(super) status: std::process::ExitStatus,
+    pub(super) stdout: Vec<u8>,
     /// stderr without the `-progress` report lines (what had arrived, when the read stalled).
-    stderr: String,
+    pub(super) stderr: String,
     /// ffmpeg said nothing for the stall bound and was killed.
-    stalled: bool,
+    pub(super) stalled: bool,
+    /// The caller's cancel tripped and ffmpeg was killed ([`output_supervised`]).
+    pub(super) cancelled: bool,
+    /// The run outlasted its `total` bound and was killed.
+    pub(super) timed_out: bool,
 }
 
 impl Collected {
-    fn succeeded(&self) -> bool {
-        self.status.success() && !self.stalled
+    pub(super) fn succeeded(&self) -> bool {
+        self.status.success() && !self.stalled && !self.cancelled && !self.timed_out
     }
 
     /// The last lines of stderr, for an error message.
-    fn stderr_tail(&self) -> String {
+    pub(super) fn stderr_tail(&self) -> String {
         let lines: Vec<&str> = self.stderr.lines().rev().take(12).collect();
         lines.into_iter().rev().collect::<Vec<_>>().join("\n").trim().to_string()
     }
@@ -1212,7 +1252,34 @@ impl Collected {
 /// pipes are drained on side threads, so neither a flood of warnings nor a large stdout can fill
 /// a pipe and wedge the child. A stalled read returns the stderr that had arrived and no stdout.
 /// The child is always reaped, whatever fails on the way.
-fn output_unless_stalled(mut cmd: Command, stall: std::time::Duration) -> std::io::Result<Collected> {
+#[cfg(test)]
+fn output_unless_stalled(cmd: Command, stall: std::time::Duration) -> std::io::Result<Collected> {
+    output_supervised(cmd, stall, None, &|| false)
+}
+
+/// [`output_unless_stalled`] for a job someone can stop: `cancel` is polled about fifty times a
+/// second and, once true, kills the child and returns what had arrived with `cancelled` set.
+/// The caller maps that to [`Error::Cancelled`] (it is not a failure to report). `total`, when
+/// given, is a wall-clock bound on the whole run (`timed_out`) for the reads that print no
+/// `-progress` (pass `Duration::MAX` as `stall` for those: stderr silence then means nothing).
+pub(super) fn output_supervised(
+    cmd: Command,
+    stall: std::time::Duration,
+    total: Option<std::time::Duration>,
+    cancel: &dyn Fn() -> bool,
+) -> std::io::Result<Collected> {
+    output_supervised_sized(cmd, stall, total, cancel, 0)
+}
+
+/// [`output_supervised`] that reads stdout into a buffer of `capacity` bytes allocated up front,
+/// for a read whose size is known (the scopes' raw frames), instead of doubling through it.
+pub(super) fn output_supervised_sized(
+    mut cmd: Command,
+    stall: std::time::Duration,
+    total: Option<std::time::Duration>,
+    cancel: &dyn Fn() -> bool,
+    capacity: usize,
+) -> std::io::Result<Collected> {
     use std::io::{BufRead, BufReader, Read};
     use std::sync::{Arc, Mutex};
 
@@ -1234,7 +1301,7 @@ fn output_unless_stalled(mut cmd: Command, stall: std::time::Duration) -> std::i
         text: String::new(),
     }));
     let out_handle = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::with_capacity(capacity);
         let _ = stdout.read_to_end(&mut bytes);
         bytes
     });
@@ -1254,7 +1321,8 @@ fn output_unless_stalled(mut cmd: Command, stall: std::time::Duration) -> std::i
             }
         })
     };
-    let mut stalled = false;
+    let started = Instant::now();
+    let (mut stalled, mut cancelled, mut timed_out) = (false, false, false);
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -1265,6 +1333,16 @@ fn output_unless_stalled(mut cmd: Command, stall: std::time::Duration) -> std::i
                 return Err(e);
             }
         }
+        if cancel() {
+            cancelled = true;
+            let _ = child.kill();
+            break child.wait()?;
+        }
+        if total.is_some_and(|total| started.elapsed() > total) {
+            timed_out = true;
+            let _ = child.kill();
+            break child.wait()?;
+        }
         if heard.lock().is_ok_and(|heard| heard.at.elapsed() > stall) {
             stalled = true;
             let _ = child.kill();
@@ -1273,7 +1351,7 @@ fn output_unless_stalled(mut cmd: Command, stall: std::time::Duration) -> std::i
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
     let text = |heard: &Mutex<Heard>| heard.lock().map(|heard| heard.text.clone()).unwrap_or_default();
-    if stalled {
+    if stalled || cancelled || timed_out {
         // The side threads end on their own when the pipes close; a wrapper that spawned the real
         // ffmpeg keeps them open past the kill, and the caller must not wait for that.
         return Ok(Collected {
@@ -1281,6 +1359,8 @@ fn output_unless_stalled(mut cmd: Command, stall: std::time::Duration) -> std::i
             stdout: Vec::new(),
             stderr: text(&heard),
             stalled,
+            cancelled,
+            timed_out,
         });
     }
     let stdout = out_handle.join().unwrap_or_default();
@@ -1290,7 +1370,36 @@ fn output_unless_stalled(mut cmd: Command, stall: std::time::Duration) -> std::i
         stdout,
         stderr: text(&heard),
         stalled,
+        cancelled,
+        timed_out,
     })
+}
+
+/// How long a child that has closed its pipes (or been killed) is given to exit before it is
+/// killed: ffmpeg flushes a muxer on the way out, which on a dying network share can block.
+const REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Wait for `child` to exit — for [`REAP_GRACE`] at most, then kill it. The bounded `wait()`:
+/// every place that reads a child's pipes to the end and then waits on it would otherwise hang
+/// for good on one that closed stdout and never exited.
+pub(super) fn reap(child: &mut std::process::Child) -> Result<std::process::ExitStatus> {
+    reap_within(child, REAP_GRACE)
+}
+
+fn reap_within(child: &mut std::process::Child, grace: std::time::Duration) -> Result<std::process::ExitStatus> {
+    let wait_failed = |e: std::io::Error| Error::Engine(format!("ffmpeg wait failed: {e}"));
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                return child.wait().map_err(wait_failed);
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(2)),
+            Err(e) => return Err(wait_failed(e)),
+        }
+    }
 }
 
 /// The red of the middle pixel of the still graph's composite over a one-frame
@@ -1399,6 +1508,7 @@ fn probe_composite_red(ffmpeg: &str, ffprobe: &str, tag_bt709: bool, deadline: I
             ..crate::model::Track::new(StreamKind::Video, "V1")
         }],
         overlays: Vec::new(),
+        svg_overlays: Vec::new(),
         markers: Vec::new(),
         format: None,
         master: Default::default(),
@@ -1457,6 +1567,12 @@ pub(crate) fn tonemap_chain(hdr: Hdr, zscale: bool) -> String {
 pub(super) fn tonemap_filter(hdr: Hdr) -> String {
     tonemap_chain(hdr, zscale_available())
 }
+
+/// The filter that labels a picture BT.709 without touching a pixel (`setparams`), for an untagged
+/// HD input that shares a graph with one naming a matrix ([`crate::model::bt709_labels`]). Not the
+/// `-colorspace` output option, which FFmpeg 9 takes as an order to convert into that matrix on the
+/// way (up to 22 levels moved, measured).
+const BT709_LABEL: &str = "setparams=colorspace=bt709";
 
 /// What the decodes that are handed a bare path rather than an [`Asset`] need to
 /// know about a file's first video stream, from one `ffprobe`.
@@ -1646,23 +1762,63 @@ pub(crate) fn source_hdr(path: &Path) -> Option<Hdr> {
 ///
 /// `noise_db` is the threshold in dBFS (e.g. `-30.0`); `min_silence` is the
 /// shortest span to report, in seconds.
-pub fn detect_silence(path: &Path, noise_db: f64, min_silence: f64) -> Result<Vec<TimeRange>> {
+///
+/// Gives up with [`Error::Cancelled`] once `cancel` is true (while it waits for the heavy-job
+/// slot or while ffmpeg runs), and fails — rather than answering "no silence" — when the decode
+/// does: a run that exits non-zero, or says nothing for [`READ_STALL`], is an error with
+/// ffmpeg's last words. A file with no audio stream is the one non-zero exit that is an answer
+/// (no silence), as the `0:a:0?` map always meant.
+pub fn detect_silence_cancellable(
+    path: &Path,
+    noise_db: f64,
+    min_silence: f64,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Vec<TimeRange>> {
     let bin = ffmpeg_bin();
     let filter = format!("silencedetect=noise={noise_db}dB:d={min_silence}");
     // A whole-file decode: takes the heavy-job slot and the budget's threads.
-    let cpu = cpu::lease();
+    let cpu = cpu::lease_waiting(&mut |_| {}, cancel)?;
+    // A free slot is taken without a look at the cancel: do not start a pass that was stopped.
+    if cancel() {
+        return Err(Error::Cancelled);
+    }
     let mut cmd = bg_command(&bin);
     cpu::limit_cmd(&mut cmd, cpu.threads());
-    let output = cmd
+    cmd.args(PROGRESS_ON_STDERR)
         .args(["-hide_banner", "-nostats"])
         .arg("-i")
         .arg(path)
-        .args(["-map", "0:a:0?", "-af", &filter, "-f", "null", "-"])
-        .stdout(Stdio::null())
-        .output()
-        .map_err(|e| launch_err(&bin, e))?;
-    // silencedetect prints to stderr regardless of exit status.
-    Ok(parse_silence(&String::from_utf8_lossy(&output.stderr)))
+        .args(["-map", "0:a:0?", "-af", &filter, "-f", "null", "-"]);
+    let output = output_supervised(cmd, READ_STALL, None, cancel).map_err(|e| launch_err(&bin, e))?;
+    silence_from_run(&output, path)
+}
+
+/// What a finished `silencedetect` run says (pure over [`Collected`], unit-tested): the spans
+/// it printed, or why there are none.
+fn silence_from_run(output: &Collected, path: &Path) -> Result<Vec<TimeRange>> {
+    if output.cancelled {
+        return Err(Error::Cancelled);
+    }
+    if output.stalled {
+        return Err(Error::Engine(format!(
+            "silence detection stalled: ffmpeg said nothing for {}s reading {}: {}",
+            READ_STALL.as_secs(),
+            path.display(),
+            output.stderr_tail()
+        )));
+    }
+    if !output.status.success() {
+        if output.stderr.contains("does not contain any stream") {
+            return Ok(Vec::new());
+        }
+        return Err(Error::Engine(format!(
+            "silence detection failed ({}) reading {}: {}",
+            output.status,
+            path.display(),
+            output.stderr_tail()
+        )));
+    }
+    Ok(parse_silence(&output.stderr))
 }
 
 fn parse_silence(stderr: &str) -> Vec<TimeRange> {
@@ -1693,8 +1849,24 @@ const SCENE_DETECT_WIDTH: u32 = 640;
 /// Decodes with `-hwaccel` when configured (the whole file is decoded, which is
 /// the expensive part for 4K sources); a failed accelerated run retries in
 /// software, mirroring [`decode_frame`]'s fallback.
+#[cfg(test)]
 pub fn detect_scenes(path: &Path, threshold: f64) -> Result<Vec<f64>> {
-    scene_pass(path, threshold).map(|(times, _)| times)
+    detect_scenes_cancellable(path, threshold, &|| false)
+}
+
+/// [`detect_scenes`] that gives up with [`Error::Cancelled`] once `cancel` is true, and that
+/// fails — rather than answering "no cuts" — when the decode does (a file with no video stream
+/// is the one non-zero exit that is an answer: no cuts).
+pub fn detect_scenes_cancellable(path: &Path, threshold: f64, cancel: &dyn Fn() -> bool) -> Result<Vec<f64>> {
+    let pass = scene_pass(path, threshold, cancel)?;
+    if !pass.ok && !pass.no_video {
+        return Err(Error::Engine(format!(
+            "scene detection failed reading {}: {}",
+            path.display(),
+            pass.why
+        )));
+    }
+    Ok(pass.times)
 }
 
 /// [`detect_scenes`] for the file at `original`, reading its preview `proxy` instead when one
@@ -1706,14 +1878,24 @@ pub fn detect_scenes(path: &Path, threshold: f64) -> Result<Vec<f64>> {
 /// the same because a proxy answers `-ss T` with the frame the original does (see
 /// [`build_proxy_args`]; a late-starting video is padded so its frames keep their
 /// timestamps), and the detector scores at [`SCENE_DETECT_WIDTH`] either way.
-pub fn detect_scenes_preferring(original: &Path, proxy: Option<&Path>, threshold: f64) -> Result<Vec<f64>> {
+///
+/// Gives up with [`Error::Cancelled`] once `cancel` is true (a stop on the proxy read does not
+/// fall back to reading the original).
+pub fn detect_scenes_preferring_cancellable(
+    original: &Path,
+    proxy: Option<&Path>,
+    threshold: f64,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Vec<f64>> {
     if let Some(proxy) = proxy {
-        if let Ok((times, true)) = scene_pass(proxy, threshold) {
-            return Ok(times);
+        match scene_pass(proxy, threshold, cancel) {
+            Ok(pass) if pass.ok => return Ok(pass.times),
+            Err(Error::Cancelled) => return Err(Error::Cancelled),
+            _ => {}
         }
         tracing::warn!(proxy = %proxy.display(), "scene detection could not read the proxy; reading the original");
     }
-    detect_scenes(original, threshold)
+    detect_scenes_cancellable(original, threshold, cancel)
 }
 
 /// The `-vf` chain of a scene pass (pure). Frame 0 is selected too (`eq(n,0)`) and dropped again
@@ -1724,11 +1906,23 @@ fn scene_filter(threshold: f64) -> String {
     format!("scale='min({SCENE_DETECT_WIDTH},iw)':-2:flags=bilinear,select='gt(scene,{threshold})+eq(n,0)',showinfo")
 }
 
-/// One scene-detection pass over `path`: the cut times and whether ffmpeg ended cleanly.
-/// [`detect_scenes`] has always answered with whatever the log held, so a run that failed
-/// reads as "no cuts"; the flag is what lets a caller with somewhere else to read tell. A run
-/// that goes [`READ_STALL`] without a word is killed and is an error, not a short list of cuts.
-fn scene_pass(path: &Path, threshold: f64) -> Result<(Vec<f64>, bool)> {
+/// What one scene-detection pass found.
+struct ScenePass {
+    /// The cut times in the log.
+    times: Vec<f64>,
+    /// ffmpeg ended cleanly.
+    ok: bool,
+    /// The input has no video stream to score (`-map 0:v:0?` left nothing to write).
+    no_video: bool,
+    /// The last of ffmpeg's words, for the error of a run that did not end cleanly.
+    why: String,
+}
+
+/// One scene-detection pass over `path`: the cut times and whether ffmpeg ended cleanly; the
+/// flag is what lets a caller with somewhere else to read (the original, behind a proxy) tell.
+/// A run that goes [`READ_STALL`] without a word is killed and is an error, not a short list of
+/// cuts.
+fn scene_pass(path: &Path, threshold: f64, cancel: &dyn Fn() -> bool) -> Result<ScenePass> {
     use std::sync::atomic::Ordering;
 
     let bin = ffmpeg_bin();
@@ -1736,7 +1930,10 @@ fn scene_pass(path: &Path, threshold: f64) -> Result<(Vec<f64>, bool)> {
     // Probed before queueing: a hung probe must not hold the one heavy-job slot.
     let hw = decode_hwaccel_for(path, Reading::Whole);
     // The whole file is decoded, so this queues behind any other heavy job.
-    let cpu = cpu::lease();
+    let cpu = cpu::lease_waiting(&mut |_| {}, cancel)?;
+    if cancel() {
+        return Err(Error::Cancelled);
+    }
     let run = |hw: Option<&str>| {
         let mut args: Vec<String> = vec!["-hide_banner".into(), "-nostats".into()];
         if let Some(hw) = hw {
@@ -1747,7 +1944,11 @@ fn scene_pass(path: &Path, threshold: f64) -> Result<(Vec<f64>, bool)> {
         cpu::limit_args(&mut args, cpu.threads());
         let mut cmd = bg_command(&bin);
         cmd.args(PROGRESS_ON_STDERR).args(&args);
-        output_unless_stalled(cmd, READ_STALL).map_err(|e| launch_err(&bin, e))
+        let out = output_supervised(cmd, READ_STALL, None, cancel).map_err(|e| launch_err(&bin, e))?;
+        if out.cancelled {
+            return Err(Error::Cancelled);
+        }
+        Ok(out)
     };
     let output = match hw.as_deref() {
         Some(h) => {
@@ -1773,7 +1974,12 @@ fn scene_pass(path: &Path, threshold: f64) -> Result<(Vec<f64>, bool)> {
             output.stderr_tail()
         )));
     }
-    Ok((parse_scenes(&output.stderr), output.status.success()))
+    Ok(ScenePass {
+        times: parse_scenes(&output.stderr),
+        ok: output.status.success(),
+        no_video: output.stderr.contains("does not contain any stream"),
+        why: output.stderr_tail(),
+    })
 }
 
 /// The cut times in a scene pass's `showinfo` log. Its first line (`n:0`, showinfo's own count of
@@ -1830,32 +2036,41 @@ const SALIENCE_MOTION_WEIGHT: f64 = 3.0;
 /// Hardware-accelerated like [`detect_scenes`], with the same software retry —
 /// the decode is the expensive half on 4K footage, and the arithmetic here runs
 /// on 2 KB frames.
-pub fn salience_map(path: &Path, start: f64, end: f64) -> Result<SalienceMap> {
+///
+/// Gives up with [`Error::Cancelled`] once `cancel` is true (queued for the slot or decoding),
+/// and is killed after [`READ_STALL`] without a word from ffmpeg.
+pub fn salience_map_cancellable(path: &Path, start: f64, end: f64, cancel: &dyn Fn() -> bool) -> Result<SalienceMap> {
     use std::sync::atomic::Ordering;
 
     let bin = ffmpeg_bin();
     let hw = decode_hwaccel_for(path, Reading::Whole);
-    let cpu = cpu::lease();
+    let cpu = cpu::lease_waiting(&mut |_| {}, cancel)?;
+    if cancel() {
+        return Err(Error::Cancelled);
+    }
     let mut args = build_salience_args(path, start, end);
     cpu::limit_args(&mut args, cpu.threads());
-    let run = |hw: Option<&str>| {
+    let run = |hw: Option<&str>| -> Result<Collected> {
         let mut cmd = bg_command(&bin);
+        cmd.args(PROGRESS_ON_STDERR);
         if let Some(hw) = hw {
             cmd.args(["-hwaccel", hw]);
         }
-        cmd.args(&args)
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| launch_err(&bin, e))
+        cmd.args(&args);
+        let out = output_supervised(cmd, READ_STALL, None, cancel).map_err(|e| launch_err(&bin, e))?;
+        if out.cancelled {
+            return Err(Error::Cancelled);
+        }
+        Ok(out)
     };
     let output = match hw.as_deref() {
         Some(h) => {
             let out = run(Some(h))?;
-            if out.status.success() && !out.stdout.is_empty() {
+            if out.succeeded() && !out.stdout.is_empty() {
                 out
             } else {
                 let sw = run(None)?;
-                if sw.status.success() {
+                if sw.succeeded() {
                     HWACCEL_OK.store(false, Ordering::Relaxed);
                     tracing::warn!("hardware decode failed while sampling salience; using software decode");
                 }
@@ -1864,16 +2079,20 @@ pub fn salience_map(path: &Path, start: f64, end: f64) -> Result<SalienceMap> {
         }
         None => run(None)?,
     };
-    if !output.status.success() {
+    if output.stalled {
         return Err(Error::Engine(format!(
-            "could not sample the shot: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "could not sample the shot: ffmpeg said nothing for {}s: {}",
+            READ_STALL.as_secs(),
+            output.stderr_tail()
         )));
+    }
+    if !output.succeeded() {
+        return Err(Error::Engine(format!("could not sample the shot: {}", output.stderr.trim())));
     }
     Ok(score_salience(&output.stdout))
 }
 
-/// Pure arg builder for [`salience_map`] (no I/O, unit-tested). Fast-seeks to
+/// Pure arg builder for [`salience_map_cancellable`] (no I/O, unit-tested). Fast-seeks to
 /// the window, decodes at most [`SALIENCE_SAMPLES`] frames spread across it, and
 /// writes them as raw gray at the analysis grid. `-an` because nothing here
 /// looks at sound, and `fps` before `scale` so the scaler runs on the frames
@@ -1951,7 +2170,7 @@ fn score_salience(raw: &[u8]) -> SalienceMap {
 /// at most `max_width` pixels wide.
 pub fn frame_at(path: &Path, time_secs: f64, max_width: u32) -> Result<Vec<u8>> {
     let scale = format!("scale='min({max_width},iw)':-2");
-    decode_frame(path, time_secs, &scale, "png", None, true)
+    decode_frame(path, time_secs, &scale, "png", None, true, None)
 }
 
 /// A rectangle of a frame to look at more closely, as fractions of the full
@@ -2032,7 +2251,20 @@ impl Region {
 /// see [`decode_frame`].
 pub fn frame_jpeg(path: &Path, time_secs: f64, max_width: u32, quality: u8, accurate: bool) -> Result<Vec<u8>> {
     let scale = format!("scale='min({max_width},iw)':-2");
-    decode_frame(path, time_secs, &scale, "mjpeg", Some(quality), accurate)
+    decode_frame(path, time_secs, &scale, "mjpeg", Some(quality), accurate, None)
+}
+
+/// [`frame_jpeg`] that gives up with [`Error::Cancelled`] once `cancel` is true.
+pub fn frame_jpeg_cancellable(
+    path: &Path,
+    time_secs: f64,
+    max_width: u32,
+    quality: u8,
+    accurate: bool,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Vec<u8>> {
+    let scale = format!("scale='min({max_width},iw)':-2");
+    decode_frame(path, time_secs, &scale, "mjpeg", Some(quality), accurate, Some(cancel))
 }
 
 /// [`frame_jpeg`] of one `region` of the frame: the region is cropped out of
@@ -2052,7 +2284,24 @@ pub fn frame_jpeg_region(
         return frame_jpeg(path, time_secs, max_width, quality, accurate);
     }
     let vf = region_frame_filter(region, max_width);
-    decode_frame(path, time_secs, &vf, "mjpeg", Some(quality), accurate)
+    decode_frame(path, time_secs, &vf, "mjpeg", Some(quality), accurate, None)
+}
+
+/// [`frame_jpeg_region`] that gives up with [`Error::Cancelled`] once `cancel` is true.
+pub fn frame_jpeg_region_cancellable(
+    path: &Path,
+    time_secs: f64,
+    region: Region,
+    max_width: u32,
+    quality: u8,
+    accurate: bool,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Vec<u8>> {
+    if region.is_full() {
+        return frame_jpeg_cancellable(path, time_secs, max_width, quality, accurate, cancel);
+    }
+    let vf = region_frame_filter(region, max_width);
+    decode_frame(path, time_secs, &vf, "mjpeg", Some(quality), accurate, Some(cancel))
 }
 
 /// Pure filter chain for [`frame_jpeg_region`] (unit-tested): crop, then scale
@@ -2070,8 +2319,22 @@ fn region_frame_filter(region: Region, max_width: u32) -> String {
 /// `accurate` ffmpeg decodes forward from the keyframe to the exact frame; with
 /// `accurate = false` it snaps to the keyframe (`-noaccurate_seek`, no forward
 /// decode) — tens of ms even on long-GOP 4K, for responsive scrubbing. Decode is
-/// hardware-accelerated per [`hwaccel`].
-fn decode_frame(path: &Path, time_secs: f64, vf: &str, vcodec: &str, quality: Option<u8>, accurate: bool) -> Result<Vec<u8>> {
+/// hardware-accelerated per [`hwaccel`]. With a `cancel` the decode is killed when it goes true and
+/// the answer is [`Error::Cancelled`] — never a reason to retry in software or to switch hardware
+/// decode off; without one (the scrub, which is never cancelled, only superseded) the decode waits
+/// on nothing but its own deadline.
+fn decode_frame(
+    path: &Path,
+    time_secs: f64,
+    vf: &str,
+    vcodec: &str,
+    quality: Option<u8>,
+    accurate: bool,
+    cancel: Option<&dyn Fn() -> bool>,
+) -> Result<Vec<u8>> {
+    if cancel.is_some_and(|cancel| cancel()) {
+        return Err(Error::Cancelled);
+    }
     let time_secs = time_secs.max(0.0);
     // HDR footage is tone-mapped after the caller's own scale/crop, so the
     // expensive float stage runs on the small frame rather than the 4K one.
@@ -2099,24 +2362,37 @@ fn decode_frame(path: &Path, time_secs: f64, vf: &str, vcodec: &str, quality: Op
     let use_hw = hw.is_some();
 
     let bytes = if use_hw {
-        match run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, hw.as_deref(), proxy) {
+        match run_frame_decode(
+            &bin,
+            path,
+            time_secs,
+            vf,
+            vcodec,
+            quality,
+            accurate,
+            hw.as_deref(),
+            proxy,
+            cancel,
+        ) {
             Ok(b) => b,
+            Err(Error::Cancelled) => return Err(Error::Cancelled),
             Err(hw_err) => {
                 // The accelerated decode failed — retry in software. If *that*
                 // works, `-hwaccel` is the culprit on this machine, so disable it
                 // for subsequent frames; if it fails too, the error is genuine.
-                match run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, None, proxy) {
+                match run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, None, proxy, cancel) {
                     Ok(b) => {
                         HWACCEL_OK.store(false, Ordering::Relaxed);
                         tracing::warn!("hardware decode failed ({hw_err}); using software decode for previews");
                         b
                     }
+                    Err(Error::Cancelled) => return Err(Error::Cancelled),
                     Err(_) => return Err(hw_err),
                 }
             }
         }
     } else {
-        run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, None, proxy)?
+        run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, None, proxy, cancel)?
     };
 
     if let Ok(mut c) = frame_cache().lock() {
@@ -2124,6 +2400,11 @@ fn decode_frame(path: &Path, time_secs: f64, vf: &str, vcodec: &str, quality: Op
     }
     Ok(bytes)
 }
+
+/// How long one single-frame decode may run before it is killed (a hardware decoder stuck in a
+/// driver would otherwise hold the preview's one frame in flight for good). The software retry
+/// that follows is a second chance, not a second wait.
+const FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Run one `ffmpeg` single-frame decode (optionally with `-hwaccel hw`) and
 /// return the encoded image bytes. Split out of [`decode_frame`] so the same
@@ -2139,6 +2420,7 @@ fn run_frame_decode(
     accurate: bool,
     hw: Option<&str>,
     single_thread: bool,
+    cancel: Option<&dyn Fn() -> bool>,
 ) -> Result<Vec<u8>> {
     let mut cmd = command(bin);
     // Interactive: never gated and never de-prioritized — a scrubbed frame is
@@ -2168,8 +2450,16 @@ fn run_frame_decode(
     if single_thread {
         cmd.args(["-threads", "1"]);
     }
-    cmd.arg("pipe:1").stderr(Stdio::piped());
-    let output = cmd.output().map_err(|e| launch_err(bin, e))?;
+    cmd.arg("pipe:1");
+    let output = output_bounded_cancellable(cmd, FRAME_TIMEOUT, cancel)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::TimedOut => Error::Engine(format!(
+                "could not extract frame at {time_secs:.3}s: ffmpeg did not answer in {} s and was stopped",
+                FRAME_TIMEOUT.as_secs()
+            )),
+            _ => launch_err(bin, e),
+        })?
+        .ok_or(Error::Cancelled)?;
     if !output.status.success() || output.stdout.is_empty() {
         return Err(Error::Engine(format!(
             "could not extract frame at {time_secs:.3}s: {}",
@@ -2179,11 +2469,8 @@ fn run_frame_decode(
     Ok(output.stdout)
 }
 
-/// Build a **contact sheet** of `path`: `columns`×`rows` frames sampled evenly
-/// across `[start, end)`, each cell scaled to `cell_width` px wide and tiled into
-/// one JPEG (`quality` = `-q:v`). Returns the montage bytes plus the per-cell
-/// timestamps in row-major order, so the caller can tell an LLM which moment each
-/// cell shows. One ffmpeg pass — lets the model skim a long clip cheaply.
+/// [`contact_sheet_cancellable`] with nothing to cancel it.
+#[cfg(test)]
 pub fn contact_sheet(
     path: &Path,
     start: f64,
@@ -2192,6 +2479,29 @@ pub fn contact_sheet(
     rows: u32,
     cell_width: u32,
     quality: u8,
+) -> Result<(Vec<u8>, Vec<f64>)> {
+    contact_sheet_cancellable(path, start, end, columns, rows, cell_width, quality, &|| false)
+}
+
+/// Build a **contact sheet** of `path`: `columns`×`rows` frames sampled evenly
+/// across `[start, end)`, each cell scaled to `cell_width` px wide and tiled into
+/// one JPEG (`quality` = `-q:v`). Returns the montage bytes plus the per-cell
+/// timestamps in row-major order, so the caller can tell an LLM which moment each
+/// cell shows. One ffmpeg pass — lets the model skim a long clip cheaply.
+///
+/// Gives up with [`Error::Cancelled`] once `cancel` is true (polled about fifty times a second; the
+/// sampling ffmpeg is killed) — an agent that dropped its request does not leave a many-seek
+/// decode running.
+#[allow(clippy::too_many_arguments)]
+pub fn contact_sheet_cancellable(
+    path: &Path,
+    start: f64,
+    end: f64,
+    columns: u32,
+    rows: u32,
+    cell_width: u32,
+    quality: u8,
+    cancel: &dyn Fn() -> bool,
 ) -> Result<(Vec<u8>, Vec<f64>)> {
     let path = path
         .to_str()
@@ -2208,7 +2518,10 @@ pub fn contact_sheet(
     // `tile` outputs the one frame when the window has been decoded, and ffmpeg reports nothing
     // before: the bound grows with the window (see `sheet_stall`).
     let stall = sheet_stall(end - start);
-    let output = output_unless_stalled(cmd, stall).map_err(|e| launch_err(&bin, e))?;
+    let output = output_supervised(cmd, stall, None, cancel).map_err(|e| launch_err(&bin, e))?;
+    if output.cancelled {
+        return Err(Error::Cancelled);
+    }
     if !output.succeeded() || output.stdout.is_empty() {
         let why = if output.stalled {
             format!("ffmpeg said nothing for {}s: {}", stall.as_secs(), output.stderr_tail())
@@ -2295,8 +2608,11 @@ fn build_contact_sheet_args(
 /// Decode the first audio stream to mono f32 PCM at `sample_rate` Hz and reduce
 /// it to `buckets` peak magnitudes in `0.0..=1.0` (for waveform rendering).
 pub fn waveform(path: &Path, buckets: usize, sample_rate: u32) -> Result<Vec<f32>> {
-    use std::io::Read;
+    waveform_cancellable(path, buckets, sample_rate, &|| false)
+}
 
+/// [`waveform`] that gives up with [`Error::Cancelled`] once `cancel` is true (the decode is killed).
+pub fn waveform_cancellable(path: &Path, buckets: usize, sample_rate: u32, cancel: &dyn Fn() -> bool) -> Result<Vec<f32>> {
     let buckets = buckets.max(1);
     // Stream the decoded PCM through a bounded peak-downsampler instead of
     // buffering the whole signal: a 1h file at 8 kHz mono is ~115 MB of f32
@@ -2307,7 +2623,7 @@ pub fn waveform(path: &Path, buckets: usize, sample_rate: u32) -> Result<Vec<f32
     // appearing is not worth queueing behind an export — but capped and niced.
     let mut cmd = bg_command(&bin);
     cpu::limit_cmd(&mut cmd, cpu::budget_threads());
-    let mut child = cmd
+    let child = cmd
         .args(["-hide_banner", "-loglevel", "error"])
         .arg("-i")
         .arg(path)
@@ -2322,45 +2638,19 @@ pub fn waveform(path: &Path, buckets: usize, sample_rate: u32) -> Result<Vec<f32
             "f32le",
             "pipe:1",
         ])
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| launch_err(&bin, e))?;
-
-    let stderr = child.stderr.take().expect("stderr piped");
-    let stderr_handle = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = std::io::BufReader::new(stderr).read_to_string(&mut s);
-        s
-    });
-
     let mut down = PeakDownsampler::new(buckets);
-    let mut stdout = child.stdout.take().expect("stdout piped");
-    // Read in fixed blocks and parse 4-byte f32le samples, carrying any straddling
-    // tail bytes (a pipe read need not land on a sample boundary) into the next read.
-    let mut block = [0u8; 1 << 16];
-    let mut leftover: Vec<u8> = Vec::with_capacity(4);
-    loop {
-        let n = stdout
-            .read(&mut block)
-            .map_err(|e| Error::Engine(format!("waveform read failed: {e}")))?;
-        if n == 0 {
-            break;
+    // The pump kills a decode that stops producing for `READ_STALL`, which a bare read of its
+    // stdout never did.
+    super::peaks::pump_pcm_cancellable(child, 4, READ_STALL, cancel, &mut |samples| {
+        for s in samples {
+            down.push(s.abs());
         }
-        leftover.extend_from_slice(&block[..n]);
-        for s in leftover.as_chunks::<4>().0 {
-            down.push(f32::from_le_bytes(*s).abs());
-        }
-        let consumed = (leftover.len() / 4) * 4;
-        leftover.copy_within(consumed.., 0);
-        leftover.truncate(leftover.len() - consumed);
-    }
-
-    let status = child.wait().map_err(|e| Error::Engine(format!("ffmpeg wait failed: {e}")))?;
-    if !status.success() {
-        let err = stderr_handle.join().unwrap_or_default();
-        return Err(Error::Engine(format!("could not decode audio: {}", err.trim())));
-    }
+    })?;
     Ok(down.finish())
 }
 
@@ -2435,20 +2725,27 @@ fn peaks(samples: &[f32], buckets: usize) -> Vec<f32> {
     out
 }
 
-/// Decode the first audio stream to 16 kHz mono f32 PCM (Whisper's input shape).
+/// Decode the first audio stream to 16 kHz mono f32 PCM (Whisper's input shape); gives up with
+/// [`Error::Cancelled`] once `cancel` is true.
 #[cfg(feature = "whisper")]
-pub fn decode_audio_16k_mono(path: &Path) -> Result<Vec<f32>> {
-    decode_audio_mono_f32(path, 16_000)
+pub fn decode_audio_16k_mono_cancellable(path: &Path, cancel: &dyn Fn() -> bool) -> Result<Vec<f32>> {
+    decode_audio_mono_f32(path, 16_000, cancel)
 }
 
-pub(super) fn decode_audio_mono_f32(path: &Path, sample_rate: u32) -> Result<Vec<f32>> {
+/// Decode the first audio stream to mono f32 PCM at `sample_rate`, into memory. A whole-file
+/// decode, so it takes the heavy-job slot (and says "cancelled" if `cancel` trips while it
+/// waits for it), and it is killed after [`READ_STALL`] without a byte of audio.
+pub(super) fn decode_audio_mono_f32(path: &Path, sample_rate: u32, cancel: &dyn Fn() -> bool) -> Result<Vec<f32>> {
     let bin = ffmpeg_bin();
     // Decodes the whole stream *into memory* — eight of these at once is the
     // several gigabytes an unsupervised agent used to cost — so it is gated.
-    let cpu = cpu::lease();
+    let cpu = cpu::lease_waiting(&mut |_| {}, cancel)?;
+    if cancel() {
+        return Err(Error::Cancelled);
+    }
     let mut cmd = bg_command(&bin);
     cpu::limit_cmd(&mut cmd, cpu.threads());
-    let output = cmd
+    let child = cmd
         .args(["-hide_banner", "-loglevel", "error"])
         .arg("-i")
         .arg(path)
@@ -2463,23 +2760,21 @@ pub(super) fn decode_audio_mono_f32(path: &Path, sample_rate: u32) -> Result<Vec
             "f32le",
             "pipe:1",
         ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
         .map_err(|e| launch_err(&bin, e))?;
-    if !output.status.success() {
-        return Err(Error::Engine(format!(
-            "could not decode audio: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(output
-        .stdout
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| f32::from_le_bytes(*b))
-        .collect())
+    let mut samples = Vec::new();
+    super::peaks::pump_pcm_cancellable(child, 4, READ_STALL, cancel, &mut |frames| {
+        samples.extend_from_slice(frames);
+    })?;
+    Ok(samples)
 }
+
+/// How long one [`audio_pcm`] window may take before it is killed: a window is seconds of sound
+/// behind a fast seek, so a minute is a read that went wrong.
+const AUDIO_PCM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Decode a window of the first audio stream to mono s16le PCM at
 /// `sample_rate` — the GUI's Web Audio preview playback. Raw s16le (no
@@ -2487,6 +2782,33 @@ pub(super) fn decode_audio_mono_f32(path: &Path, sample_rate: u32) -> Result<Vec
 /// codec support; the input-side `-ss` fast-seek keeps a window deep in a
 /// long source cheap to extract.
 pub fn audio_pcm(path: &Path, start: f64, duration: f64, sample_rate: u32, filters: Option<&str>) -> Result<Vec<u8>> {
+    audio_pcm_with(path, start, duration, sample_rate, filters, None)
+}
+
+/// [`audio_pcm`] that gives up with [`Error::Cancelled`] once `cancel` is true (the decode is
+/// killed), for a caller that is itself a job someone can stop.
+pub fn audio_pcm_cancellable(
+    path: &Path,
+    start: f64,
+    duration: f64,
+    sample_rate: u32,
+    filters: Option<&str>,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Vec<u8>> {
+    audio_pcm_with(path, start, duration, sample_rate, filters, Some(cancel))
+}
+
+fn audio_pcm_with(
+    path: &Path,
+    start: f64,
+    duration: f64,
+    sample_rate: u32,
+    filters: Option<&str>,
+    cancel: Option<&dyn Fn() -> bool>,
+) -> Result<Vec<u8>> {
+    if cancel.is_some_and(|cancel| cancel()) {
+        return Err(Error::Cancelled);
+    }
     let bin = ffmpeg_bin();
     let mut cmd = command(&bin);
     // Interactive, like the frame decode: the preview's playback is waiting on it.
@@ -2510,11 +2832,16 @@ pub fn audio_pcm(path: &Path, start: f64, duration: f64, sample_rate: u32, filte
     if let Some(filters) = filters.filter(|f| !f.is_empty()) {
         cmd.args(["-af", filters]);
     }
-    let output = cmd
-        .args(["-f", "s16le", "pipe:1"])
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| launch_err(&bin, e))?;
+    cmd.args(["-f", "s16le", "pipe:1"]);
+    let output = output_bounded_cancellable(cmd, AUDIO_PCM_TIMEOUT, cancel)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::TimedOut => Error::Engine(format!(
+                "could not decode audio: ffmpeg did not answer in {} s and was stopped",
+                AUDIO_PCM_TIMEOUT.as_secs()
+            )),
+            _ => launch_err(&bin, e),
+        })?
+        .ok_or(Error::Cancelled)?;
     if !output.status.success() {
         return Err(Error::Engine(format!(
             "could not decode audio: {}",
@@ -2669,8 +2996,15 @@ fn proxy_key(source_key: &str, width: u32, tonemapped: bool, head_padded: bool) 
 /// frame-sync mode of its day. Only these sources are rebuilt, and their proxy is
 /// named `<hash>.lead.mp4` (`is_head_padded_proxy`, in `clip_timing`).
 pub fn proxy_path(src: &Path, width: u32) -> Option<PathBuf> {
+    proxy_path_for(src, width, source_traits(src).unwrap_or_default())
+}
+
+/// [`proxy_path`] for traits already read: an encode takes **one** reading for its destination and
+/// for its filters, because a probe that failed is remembered only for a minute and an encode that
+/// waited for the machine's slot can read again, and answer differently, before it starts — a
+/// tone-mapped or head-padded picture would then be written to the plain proxy's name.
+fn proxy_path_for(src: &Path, width: u32, traits: SourceTraits) -> Option<PathBuf> {
     let dir = dirs::cache_dir()?.join("kerf").join("proxies");
-    let traits = source_traits(src).unwrap_or_default();
     let padded = needs_head_pad(traits.lead);
     let key = proxy_key(&source_key(src), width, traits.hdr.is_some(), padded);
     Some(dir.join(proxy_file_name(fnv1a(&key), padded)))
@@ -2924,8 +3258,11 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         progress,
         cancel,
     } = run;
-    let dst =
-        proxy_path(src, width).ok_or_else(|| Error::Engine("no cache directory available for preview proxies".to_string()))?;
+    // One reading of the source answers everything below: where the proxy goes, whether to tone-map
+    // it and whether its video starts late.
+    let traits = source_traits(src).unwrap_or_default();
+    let dst = proxy_path_for(src, width, traits)
+        .ok_or_else(|| Error::Engine("no cache directory available for preview proxies".to_string()))?;
     if dst.is_file() {
         return Ok(dst);
     }
@@ -2964,9 +3301,6 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         progress(0.0);
     }
     let threads = proxy_threads(cpu.threads());
-    // One cached probe answers both: whether to tone-map and whether the video
-    // starts late (the same one `proxy_path` keyed this proxy on).
-    let traits = source_traits(src).unwrap_or_default();
     let tonemap = traits.hdr.map(tonemap_filter);
     let head_pad = needs_head_pad(traits.lead).then(fps_mode_flag);
     let mut run = |hw_decode: Option<&str>| -> Result<Streamed> {
@@ -3044,7 +3378,7 @@ fn retry_proxy_in_software(outcome: StreamOutcome, success: bool, hw_decode: boo
 
 /// How a streamed ffmpeg run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamOutcome {
+pub(super) enum StreamOutcome {
     /// ffmpeg exited on its own (successfully or not — see the status).
     Ended,
     /// The cancel callback tripped and ffmpeg was killed.
@@ -3054,10 +3388,10 @@ enum StreamOutcome {
 }
 
 /// The result of [`run_ffmpeg_streamed`].
-struct Streamed {
-    status: std::process::ExitStatus,
-    stderr: String,
-    outcome: StreamOutcome,
+pub(super) struct Streamed {
+    pub(super) status: std::process::ExitStatus,
+    pub(super) stderr: String,
+    pub(super) outcome: StreamOutcome,
 }
 
 /// Run `ffmpeg` with `args`, reading its `-progress` stream: `progress` gets the
@@ -3074,9 +3408,27 @@ fn run_ffmpeg_streamed(
     progress: &mut dyn FnMut(f64),
     cancel: &dyn Fn() -> bool,
 ) -> Result<Streamed> {
+    run_ffmpeg_streamed_in(bin, args, None, duration, stall, progress, cancel)
+}
+
+/// [`run_ffmpeg_streamed`] with ffmpeg's working directory set to `cwd` (the whisper filter
+/// is handed bare file names so that no path has to survive filter-argument escaping).
+pub(super) fn run_ffmpeg_streamed_in(
+    bin: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    duration: Option<f64>,
+    stall: std::time::Duration,
+    progress: &mut dyn FnMut(f64),
+    cancel: &dyn Fn() -> bool,
+) -> Result<Streamed> {
     use std::io::{BufRead, BufReader, Read};
 
-    let mut child = bg_command(bin)
+    let mut command = bg_command(bin);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let mut child = command
         .args(["-progress", "pipe:1", "-stats_period", "0.5"])
         .args(args)
         .stdin(Stdio::null())
@@ -3134,7 +3486,7 @@ fn run_ffmpeg_streamed(
     if outcome != StreamOutcome::Ended {
         let _ = child.kill();
     }
-    let status = child.wait().map_err(|e| Error::Engine(format!("ffmpeg wait failed: {e}")))?;
+    let status = reap(&mut child)?;
     let stderr = stderr_handle.join().unwrap_or_default();
     Ok(Streamed { status, stderr, outcome })
 }
@@ -3418,13 +3770,57 @@ fn stitch_hw_encoder() -> Option<&'static str> {
         .copied()
 }
 
-/// Serializes stitches of the same pair. Importing both lens files at once (the
-/// obvious thing to do in a file dialog) would otherwise run the same
-/// multi-minute encode twice and throw one away; the loser of the race waits
-/// here and then finds the finished file in the cache.
-fn stitch_locks() -> &'static Mutex<HashMap<PathBuf, std::sync::Arc<Mutex<()>>>> {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, std::sync::Arc<Mutex<()>>>>> = OnceLock::new();
-    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+/// The stitches in flight, by the cache file each is making. Importing both lens files at once
+/// (the obvious thing to do in a file dialog) would otherwise run the same multi-minute encode
+/// twice and throw one away; the loser of the race waits for the claim and then finds the
+/// finished file in the cache. A claim is a *name in a set*, not a lock held across the encode:
+/// the mutex is taken for an insert or a remove, never while ffmpeg runs.
+struct Stitching {
+    running: Mutex<std::collections::HashSet<PathBuf>>,
+    finished: std::sync::Condvar,
+}
+
+fn stitching() -> &'static Stitching {
+    static STITCHING: OnceLock<Stitching> = OnceLock::new();
+    STITCHING.get_or_init(|| Stitching {
+        running: Mutex::new(std::collections::HashSet::new()),
+        finished: std::sync::Condvar::new(),
+    })
+}
+
+/// A pair's stitch claim; dropping it lets the next waiter go.
+struct StitchClaim(PathBuf);
+
+impl Drop for StitchClaim {
+    fn drop(&mut self) {
+        let stitching = stitching();
+        stitching.running.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+        stitching.finished.notify_all();
+    }
+}
+
+/// Claim the right to make `dst`, waiting (in slices, so `cancel` is heard) while another
+/// stitch of the same pair holds it. `None`: it finished while this one waited, and `dst` is
+/// there to use.
+fn claim_stitch(dst: &Path, cancel: &dyn Fn() -> bool) -> Result<Option<StitchClaim>> {
+    let stitching = stitching();
+    let mut running = stitching.running.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if dst.is_file() {
+            return Ok(None);
+        }
+        if running.insert(dst.to_path_buf()) {
+            return Ok(Some(StitchClaim(dst.to_path_buf())));
+        }
+        if cancel() {
+            return Err(Error::Cancelled);
+        }
+        running = stitching
+            .finished
+            .wait_timeout(running, std::time::Duration::from_millis(100))
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
 }
 
 /// Stitch an Insta360 lens pair into a single equirectangular file, returning
@@ -3441,23 +3837,32 @@ pub fn stitch_insta360(
     duration_hint: f64,
     progress: &mut dyn FnMut(ExportProgress),
 ) -> Result<PathBuf> {
+    stitch_insta360_with(front, rear, duration_hint, progress, &|| false)
+}
+
+/// [`stitch_insta360`] that can be abandoned: `cancel` is polled while the stitch waits for the
+/// same pair's other stitch, while it waits for the heavy-job slot, and while ffmpeg encodes
+/// (about twice a second); once true the encode is killed, its temp file removed and
+/// [`Error::Cancelled`] returned. A stalled encode (no `-progress` for [`EXPORT_STALL`]) is an
+/// error, as in an export.
+pub fn stitch_insta360_with(
+    front: &Path,
+    rear: &Path,
+    duration_hint: f64,
+    progress: &mut dyn FnMut(ExportProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<PathBuf> {
     let dst = stitched_path(front, rear)
         .ok_or_else(|| Error::Engine("no cache directory available for stitched 360 media".to_string()))?;
     if dst.is_file() {
         return Ok(dst);
     }
 
-    let gate = {
-        let mut locks = stitch_locks()
-            .lock()
-            .map_err(|_| Error::Engine("stitch lock poisoned".to_string()))?;
-        std::sync::Arc::clone(locks.entry(dst.clone()).or_default())
-    };
-    let _held = gate.lock().map_err(|_| Error::Engine("stitch lock poisoned".to_string()))?;
-    // Another stitch of this pair may have finished while we waited for the gate.
-    if dst.is_file() {
+    // The same pair's other stitch holds the claim for minutes: wait for it in slices, so a Stop
+    // works on the one that is only waiting, and take its result when it lands.
+    let Some(_claim) = claim_stitch(&dst, cancel)? else {
         return Ok(dst);
-    }
+    };
 
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::Engine(format!("could not create stitch cache dir: {e}")))?;
@@ -3483,7 +3888,7 @@ pub fn stitch_insta360(
                 start: std::time::Instant::now(),
             },
             progress,
-            &|| false,
+            cancel,
         )
     };
     // GPU-encode the stitch when a verified HEVC hardware encoder exists (the
@@ -3500,8 +3905,13 @@ pub fn stitch_insta360(
         let _ = std::fs::remove_file(&tmp);
         result = attempt("libx264", None, progress);
     }
-    if result.is_err() {
+    // A cancelled run is not a finished one: `run_ffmpeg_progress` reports it as `Ok`, and its
+    // half-written file must not be renamed into the cache for the next import to find.
+    if !matches!(result, Ok(RenderStatus::Completed)) {
         let _ = std::fs::remove_file(&tmp);
+    }
+    if matches!(result, Ok(RenderStatus::Cancelled)) {
+        return Err(Error::Cancelled);
     }
     result?;
     if dst.is_file() {
@@ -3760,7 +4170,46 @@ pub struct ExportOptions {
     pub loudnorm: bool,
     /// Normalize the final mix to a platform's loudness target. Wins over `loudnorm`.
     pub loudness: Option<LoudnessPreset>,
+    /// Reach the loudness target with one static gain instead of `loudnorm`'s moving one:
+    /// the mix is measured first (the export's own graph, as `get_levels` reads it), then
+    /// raised or lowered by the difference and held under the target's true peak by an
+    /// oversampled limiter. The dynamics stay as mixed; only peaks the gain pushes over the
+    /// ceiling are limited. Read only with a target (`loudness` or `loudnorm`).
+    pub loudness_static: bool,
+    /// The gain static normalization applies, in dB: measured by the render itself before
+    /// it builds the graph, never taken from a caller.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub loudness_gain_db: Option<f64>,
+    /// Mux the cut's captions in as a soft subtitle stream (`mov_text` in mp4 / mov,
+    /// `webvtt` in webm, `srt` in mkv). Refused for a container that carries none.
+    pub embed_captions: bool,
+    /// Write the cut's captions beside the export, one file per format
+    /// (`cut.mp4` → `cut.srt` / `cut.vtt`).
+    pub caption_sidecars: Vec<crate::captions_export::SubtitleFormat>,
+    /// Replace caption files already beside the output (the MCP `export` tool's `overwrite`,
+    /// or the GUI's confirmation); otherwise an export that would is refused.
+    pub overwrite_sidecars: bool,
+    /// Leave the generated captions out of the picture (typed titles are still drawn), for
+    /// a delivery that carries them as a subtitle track or a file instead.
+    pub skip_burned_captions: bool,
+    /// Set by the render, never by a caller: the SubRip file of the cut's captions
+    /// to mux in (see `side_files`).
+    #[serde(skip)]
+    pub subtitle_input: Option<String>,
+    /// Set by the render, never by a caller: the FFMETADATA file of the cut's
+    /// chapter markers to mux in.
+    #[serde(skip)]
+    pub chapters_input: Option<String>,
 }
+
+/// The most static loudness normalization raises or lowers a mix, in dB: a near-silent
+/// cut is not lifted into a wall of noise.
+pub const LOUDNESS_MAX_GAIN_DB: f64 = 30.0;
+
+/// How far under the target's true-peak ceiling the static normalization's limiter is set:
+/// resampling the 4x limiter's output back down rings a little over what it held.
+const STATIC_TP_MARGIN_DB: f64 = 0.3;
 
 /// A delivery's loudness target: integrated loudness and the true-peak ceiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -3831,6 +4280,14 @@ impl Default for ExportOptions {
             range: None,
             loudnorm: false,
             loudness: None,
+            loudness_static: false,
+            loudness_gain_db: None,
+            embed_captions: false,
+            caption_sidecars: Vec::new(),
+            overwrite_sidecars: false,
+            skip_burned_captions: false,
+            subtitle_input: None,
+            chapters_input: None,
         }
     }
 }
@@ -4093,6 +4550,12 @@ pub fn validate_export(opts: &ExportOptions, has_video: bool, has_audio: bool) -
                 issues.push(format!("Invalid audio bitrate \"{b}\"."));
             }
         }
+    }
+    if opts.embed_captions && side_files::subtitle_codec(c).is_none() {
+        issues.push(format!(
+            "A .{} file can't carry subtitles; write them beside the export instead.",
+            c.ext()
+        ));
     }
     issues
 }
@@ -4407,6 +4870,18 @@ fn push_inputs(
     Ok(plan)
 }
 
+/// The timeline an export draws: [`Timeline::for_render`] (muted / solo-shadowed tracks and
+/// disabled clips gone), and for a range export the sliced sub-timeline, so trims, fades,
+/// keyframes and overlays all see the same shifted geometry. The builder and whatever has to know
+/// what the builder will ask for before it is spawned (the titles' pictures) both start here.
+fn export_timeline(timeline: &Timeline, opts: &ExportOptions) -> Timeline {
+    let rendered = timeline.for_render();
+    match effective_range(&rendered, opts) {
+        Some((s, e)) => rendered.slice(s, e),
+        None => rendered,
+    }
+}
+
 /// [`build_export_args`] parameterised by the two-pass [`PassPhase`]. `null_sink`
 /// is the platform null device (`/dev/null` / `NUL`) used as the first-pass
 /// output, and `passlog` is the shared `-passlogfile` prefix — both injected by
@@ -4421,21 +4896,13 @@ fn build_export_args_phase(
     null_sink: &str,
     passlog: &str,
 ) -> Result<Vec<String>> {
-    // Drop muted / solo-shadowed tracks and disabled clips up front, so the rest
-    // of the builder never has to reason about them.
-    let rendered = timeline.for_render();
-    let timeline = &rendered;
-
-    // Range export: build the graph against the sliced sub-timeline, so trims,
-    // fades, keyframes and overlays all see the same shifted geometry.
-    let sliced;
-    let timeline = match effective_range(timeline, opts) {
-        Some((s, e)) => {
-            sliced = timeline.slice(s, e);
-            &sliced
-        }
-        None => timeline,
-    };
+    // Drop muted / solo-shadowed tracks and disabled clips up front, and cut the range an export
+    // of one span draws, so the rest of the builder never has to reason about either.
+    let mut cut = export_timeline(timeline, opts);
+    if opts.skip_burned_captions {
+        cut.overlays.retain(|o| !o.generated);
+    }
+    let timeline = &cut;
 
     // Stream gating: decide what the graph emits and what we `-map`, in lockstep.
     let timeline_has_video = timeline
@@ -4469,6 +4936,16 @@ fn build_export_args_phase(
     // `build_filter_complex` indexes them and how `fx` is indexed.
     let fmt = export_format(timeline, assets, opts);
     let plan = push_inputs(timeline, assets, &fmt, opts, &mut args)?;
+    // The animated titles' picture sequences follow the clips' inputs (the graph indexes them from
+    // there); a cut with none adds nothing.
+    if want_video {
+        svg_layer::push_inputs(&svg_layer::svg_sequences(timeline, &fmt), &fmt, &mut args);
+    }
+    let side = if pass == PassPhase::First {
+        side_files::SideInputs::default()
+    } else {
+        side_files::push_inputs(opts, &mut args)
+    };
 
     let total = timeline.duration();
     let graph = build_filter_complex(timeline, assets, &fmt, total, opts, want_video, want_audio, &plan);
@@ -4482,6 +4959,7 @@ fn build_export_args_phase(
         args.push("-map".to_string());
         args.push("[outa]".to_string());
     }
+    side_files::push_maps(&side, &mut args);
 
     // ---- video output options (only when a codec is explicitly chosen; a bare
     // default still maps [outv] and lets ffmpeg pick the encoder, as before) ----
@@ -4858,6 +5336,7 @@ fn preview_resolution(timeline: &Timeline, assets: &[Asset], max_width: u32) -> 
 /// every track, effect, transform, keyframe and overlay, not just the raw clip
 /// under the playhead. Only the two ends differ from an export: proxy sources go
 /// in (the caller substitutes those paths) and MJPEG comes out on a pipe.
+#[cfg(test)]
 fn build_preview_args(
     timeline: &Timeline,
     assets: &[Asset],
@@ -4873,6 +5352,7 @@ fn build_preview_args(
 /// the machine (`KERF_HWACCEL`, and whether an earlier hardware failure turned it
 /// off). The one seam the golden argv oracle needs to be independent of the machine
 /// it runs on; the argv it builds is exactly what `build_preview_args` always did.
+#[cfg(test)]
 fn build_preview_args_with(
     timeline: &Timeline,
     assets: &[Asset],
@@ -4882,6 +5362,39 @@ fn build_preview_args_with(
     quality: u8,
     hwaccel: Option<String>,
 ) -> Result<Vec<String>> {
+    let cut = preview_cut(timeline, assets, start, fps, max_width, hwaccel)?;
+    preview_args(&cut, assets, quality)
+}
+
+/// What the playback stream plays: the cut from the playhead, how it is rendered and the frame it
+/// is drawn in. Worked out apart from the argv so that what the argv will ask for — the animated
+/// titles' pictures — can be on disk before ffmpeg is spawned.
+struct PreviewCut {
+    sliced: Timeline,
+    opts: ExportOptions,
+    fmt: ExportFormat,
+    /// The animated titles of the cut before it was sliced, how long that cut is, and the playhead
+    /// the slice starts at: a title's pictures are named for the title, not for the playhead.
+    titles: Vec<crate::model::SvgOverlay>,
+    total: f64,
+    start: f64,
+}
+
+impl PreviewCut {
+    /// The animated titles' pictures the stream reads (named, not drawn).
+    fn svg(&self) -> Vec<svg_layer::SvgSeq<'_>> {
+        svg_layer::stream_sequences(&self.titles, self.total, &self.sliced, self.start, &self.fmt)
+    }
+}
+
+fn preview_cut(
+    timeline: &Timeline,
+    assets: &[Asset],
+    start: f64,
+    fps: f64,
+    max_width: u32,
+    hwaccel: Option<String>,
+) -> Result<PreviewCut> {
     // Same gate as the export: muted / solo-shadowed tracks and disabled clips
     // never reach the graph, so what plays is what would render.
     let timeline = &timeline.for_render();
@@ -4914,13 +5427,38 @@ fn build_preview_args_with(
         ..ExportOptions::default()
     };
     let fmt = export_format(&sliced, assets, &opts);
+    Ok(PreviewCut {
+        sliced,
+        opts,
+        fmt,
+        titles: timeline.svg_overlays.clone(),
+        total: end,
+        start,
+    })
+}
 
+/// The argv that plays a [`PreviewCut`] as JPEGs on stdout.
+fn preview_args(cut: &PreviewCut, assets: &[Asset], quality: u8) -> Result<Vec<String>> {
+    let PreviewCut { sliced, opts, fmt, .. } = cut;
     let mut args: Vec<String> = ["-hide_banner", "-nostats", "-nostdin", "-loglevel", "error"]
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let plan = push_inputs(&sliced, assets, &fmt, &opts, &mut args)?;
-    let graph = build_filter_complex(&sliced, assets, &fmt, sliced.duration(), &opts, true, false, &plan);
+    let plan = push_inputs(sliced, assets, fmt, opts, &mut args)?;
+    let titles = cut.svg();
+    svg_layer::push_inputs(&titles, fmt, &mut args);
+    let graph = build_filter_complex_with(
+        sliced,
+        assets,
+        fmt,
+        sliced.duration(),
+        opts,
+        true,
+        false,
+        &plan,
+        false,
+        Some(&titles),
+    );
     args.push("-filter_complex".to_string());
     args.push(graph.filter);
     args.push("-map".to_string());
@@ -4972,6 +5510,22 @@ pub fn stream_preview_with(
     request: PlaybackRequest,
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
 ) -> Result<()> {
+    stream_preview_until(timeline, assets, start, request, &|| false, on_frame)
+}
+
+/// [`stream_preview_with`] that can be told to stop **before the first frame**: `cancel` is looked
+/// at while the animated titles' pictures are being drawn (about forty times a second, and between
+/// the steps that come before the drawing), which `on_frame` — called only once there are frames —
+/// cannot interrupt. A stream cancelled then ends with [`Error::Cancelled`]; one that has started
+/// is stopped by `on_frame` returning `false`, as ever.
+pub fn stream_preview_until(
+    timeline: &Timeline,
+    assets: &[Asset],
+    start: f64,
+    request: PlaybackRequest,
+    cancel: &dyn Fn() -> bool,
+    on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
+) -> Result<()> {
     let params = playback_params(timeline, assets, request);
     // Whether the run that was spawned asked any input for hardware decode: none of a proxy's
     // inputs do, and a failure of a run that did not is not the hardware's.
@@ -4979,7 +5533,7 @@ pub fn stream_preview_with(
     // `None` until ffmpeg is running: a timeline with nothing to play fails
     // before that, and says nothing about the hardware.
     let mut sent = None;
-    match stream_preview_once(timeline, assets, start, params, on_frame, &mut sent, &mut hw) {
+    match stream_preview_once(timeline, assets, start, params, cancel, on_frame, &mut sent, &mut hw) {
         // A hardware decode that dies before the first frame is `-hwaccel`
         // being unusable here, not the graph: a static ffmpeg aborts outright
         // when `auto` probes a VAAPI whose libva isn't installed. Once frames
@@ -4988,7 +5542,7 @@ pub fn stream_preview_with(
         Err(e) if hw && sent == Some(0) => {
             HWACCEL_OK.store(false, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!("hardware decode failed starting playback; using software decode: {e}");
-            stream_preview_once(timeline, assets, start, params, on_frame, &mut sent, &mut hw)
+            stream_preview_once(timeline, assets, start, params, cancel, on_frame, &mut sent, &mut hw)
         }
         r => r,
     }
@@ -5028,17 +5582,23 @@ const PREVIEW_TIMEOUTS: PreviewTimeouts = PreviewTimeouts {
     stall: std::time::Duration::from_secs(15),
 };
 
+#[allow(clippy::too_many_arguments)]
 fn stream_preview_once(
     timeline: &Timeline,
     assets: &[Asset],
     start: f64,
     params: PlaybackParams,
+    cancel: &dyn Fn() -> bool,
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
     sent: &mut Option<u64>,
     hw_used: &mut bool,
 ) -> Result<()> {
     let PlaybackParams { fps, max_width } = params;
-    let mut args = build_preview_args(timeline, assets, start, fps, max_width, PREVIEW_STREAM_QUALITY)?;
+    let cut = preview_cut(timeline, assets, start, fps, max_width, decode_hwaccel())?;
+    // Animated titles are pictures on disk by now (a few seconds' work at most); held until the
+    // stream is over so the cache cannot take them away mid-play.
+    let _titles = svg_layer::prepare_preview(&cut.svg(), cancel)?;
+    let mut args = preview_args(&cut, assets, PREVIEW_STREAM_QUALITY)?;
     // The composited graph outgrows argv just as the export's does.
     let _script = externalize_filter_complex(&mut args, "preview")?;
     // Hardware decode is per input, and a proxy (what the stream reads once one is ready) is
@@ -5167,7 +5727,7 @@ fn pump_preview(
         let _ = child.kill();
     }
     drop(rx);
-    let status = child.wait().map_err(|e| Error::Engine(format!("ffmpeg wait failed: {e}")))?;
+    let status = reap(&mut child)?;
     let stderr_text = stderr_handle.join().unwrap_or_default();
     let tail = || {
         let mut tail: Vec<&str> = stderr_text.lines().rev().take(12).collect();
@@ -5199,11 +5759,15 @@ pub struct ExportProgress {
     pub fraction: f64,
     pub elapsed_secs: f64,
     pub eta_secs: Option<f64>,
-    /// Set while the render has not started because the machine is busy with another heavy job
-    /// — `waiting for the preview proxy` — so a queued export does not look hung at 0%.
+    /// Set while the render has not started: the machine is busy with another heavy job
+    /// (`waiting for the preview proxy`), or a static loudness normalization is metering the mix
+    /// first (`measuring the mix's loudness`) — so the export does not look hung at 0%.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting: Option<&'static str>,
 }
+
+/// What an export's `waiting` line says while a static loudness normalization meters the mix.
+const METERING_LOUDNESS: &str = "measuring the mix's loudness";
 
 /// Whether an export ran to completion or was stopped by the cancel callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5221,9 +5785,36 @@ pub fn render_with(timeline: &Timeline, assets: &[Asset], output: &Path, opts: &
     render_with_progress(timeline, assets, output, opts, &mut |_| {}, &|| false).map(|_| ())
 }
 
+/// When `path` was last written, or `None` when there is no such file: the "before" of a
+/// render, taken ahead of it so [`discard_partial`] can tell whether the run touched the file.
+pub fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Remove what a failed or cancelled render left at `path` — but only if this run touched it
+/// (`before` is the [`file_mtime`] taken ahead of the run). A failure before ffmpeg opened the
+/// output (bad options, an empty cut, a cancel while the export was still queued) must not
+/// delete the earlier export still sitting at that path; an unconditional remove did.
+pub fn discard_partial(path: &Path, before: Option<std::time::SystemTime>) {
+    if file_mtime(path) != before {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Run `render` (a render of `output`) and [`discard_partial`] what it left unless it completed.
+fn discarding_partial(output: &Path, render: impl FnOnce() -> Result<RenderStatus>) -> Result<RenderStatus> {
+    let before = file_mtime(output);
+    let result = render();
+    if !matches!(result, Ok(RenderStatus::Completed)) {
+        discard_partial(output, before);
+    }
+    result
+}
+
 /// Like [`render_with`] but streams [`ExportProgress`] to `progress` and polls
-/// `cancel` between updates — returning [`RenderStatus::Cancelled`] (and leaving
-/// the partial output for the caller to remove) when it trips.
+/// `cancel` between updates — returning [`RenderStatus::Cancelled`] when it trips.
+/// A render that fails or is cancelled **removes what it wrote** ([`discard_partial`]: only if
+/// this run touched the file), so no caller has to remember to clean up after one.
 ///
 /// When the options request hardware decode (`opts.hwaccel`), an input is
 /// really handed it, and the render fails, it is retried once fully in software
@@ -5244,7 +5835,7 @@ pub fn render_with_progress(
     progress: &mut dyn FnMut(ExportProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<RenderStatus> {
-    let opts = &ExportOptions {
+    let mut opts = ExportOptions {
         hwaccel: export_hwaccel_request(
             opts.hwaccel.as_deref(),
             hwaccel().is_some(),
@@ -5252,11 +5843,70 @@ pub fn render_with_progress(
         ),
         ..opts.clone()
     };
-    retry_export_in_software(
-        opts,
-        |o, hw_used| render_attempt(timeline, assets, output, o, progress, cancel, hw_used),
-        convict_hardware_decode,
-    )
+    let status = discarding_partial(output, || {
+        // A request that would be refused anyway is refused before the titles are drawn (and before
+        // a static loudness normalization spends a pass metering the mix).
+        let (_, has_audio) = export_preflight(timeline, assets, &opts)?;
+        match measure_static_loudness(timeline, assets, &mut opts, has_audio, progress, cancel) {
+            Err(Error::Cancelled) => return Ok(RenderStatus::Cancelled),
+            r => r?,
+        }
+        let opts = &opts;
+        // The animated titles are pictures on disk before any ffmpeg is spawned: drawn once for this
+        // export — a second pass and the software retry read the same files — and kept until it is over.
+        let Some(_titles) = svg_layer::prepare_export(timeline, assets, opts, progress, cancel)? else {
+            return Ok(RenderStatus::Cancelled);
+        };
+        // The captions and chapters to mux in are files for the length of the export. The caption
+        // files beside it are checked first and written only once it has completed, so a cancelled or
+        // failed export never touches a file already there.
+        let (opts, _side) = side_files::prepare(timeline, opts)?;
+        side_files::check_sidecars(output, &opts)?;
+        retry_export_in_software(
+            &opts,
+            |o, hw_used| render_attempt(timeline, assets, output, o, progress, cancel, hw_used),
+            convict_hardware_decode,
+        )
+    })?;
+    // After the render is safe: a caption file that cannot be written is reported, but the
+    // finished video is not thrown away for it.
+    if status == RenderStatus::Completed {
+        side_files::write_sidecars(timeline, output, &opts)?;
+    }
+    Ok(status)
+}
+
+/// Fill in `opts.loudness_gain_db` for a static loudness normalization that has not been
+/// measured yet: one metering pass over the export's own mix, without the normalization
+/// (see [`ExportOptions::loudness_static`]). Nothing for any other export, nor for one that
+/// writes no sound (a cut without any, or a container that carries none). The pass shows in
+/// `progress` as the export's `waiting` line — queued for the slot, then metering.
+fn measure_static_loudness(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &mut ExportOptions,
+    has_audio: bool,
+    progress: &mut dyn FnMut(ExportProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<()> {
+    let target = opts.loudness.is_some() || opts.loudnorm;
+    let writes_sound = has_audio && opts.include_audio && !opts.container.is_video_only();
+    if !(opts.loudness_static && target && writes_sound) || opts.loudness_gain_db.is_some() {
+        return Ok(());
+    }
+    let started = Instant::now();
+    let mut status = |wait: Option<cpu::Wait>| {
+        progress(ExportProgress {
+            fraction: 0.0,
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            eta_secs: None,
+            waiting: Some(wait.map_or(METERING_LOUDNESS, cpu::Wait::message)),
+        });
+    };
+    // A mix too quiet to measure is left at its level (the limiter still holds the peaks).
+    opts.loudness_gain_db = Some(levels::static_loudness_gain(timeline, assets, opts, &mut status, cancel)?.unwrap_or(0.0));
+    tracing::debug!(gain_db = ?opts.loudness_gain_db, "measured the mix for static loudness normalization");
+    Ok(())
 }
 
 /// Run an export attempt, and once more in software when one that asked an input for hardware
@@ -5410,12 +6060,19 @@ fn export_resource(args: &[String], facts_of: &dyn Fn(&str) -> InputFacts, lane_
     }
     // Inputs, in groups: everything up to and including each `-i <path>`.
     let mut group_hwaccel: Option<&str> = None;
+    let mut side_input = false;
     let mut graph: Option<&str> = None;
     let mut inputs = 0;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "-hwaccel" => group_hwaccel = rest.next().map(String::as_str),
+            // The captions and chapters a render muxes in decode no picture.
+            "-f" => side_input = rest.next().is_some_and(|f| side_files::is_side_format(f)),
+            "-i" if side_input => {
+                side_input = false;
+                rest.next();
+            }
             "-i" => {
                 inputs += 1;
                 let Some(path) = rest.next() else { return cpu::Resource::Cpu };
@@ -5479,6 +6136,48 @@ impl ExportVariant {
     }
 }
 
+/// Check every variant of a multi-format export and measure what they share before any is
+/// rendered: each variant's preflight first (one that would be refused fails before anything
+/// runs), then a static loudness normalization's metering pass, once for all of them — the
+/// mix is the same in every shape. Returns the options to render every variant with (the
+/// measured gain filled in), or `None` when cancelled while metering. [`render_variants`]
+/// runs it; a caller rendering the variants one call at a time runs it first and passes its
+/// options on, so the mix is not measured once per file.
+pub fn prepare_variants(
+    timeline: &Timeline,
+    assets: &[Asset],
+    variants: &[ExportVariant],
+    opts: &ExportOptions,
+    progress: &mut dyn FnMut(VariantProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<ExportOptions>> {
+    let mut has_audio = false;
+    for variant in variants {
+        let per_variant = ExportOptions {
+            resolution: Some((variant.delivery.width, variant.delivery.height)),
+            fit: variant.delivery.fit,
+            ..opts.clone()
+        };
+        has_audio |= export_preflight(&timeline.for_delivery(variant.delivery), assets, &per_variant)?.1;
+    }
+    let mut opts = opts.clone();
+    let total = variants.len();
+    let mut on_meter = |p: ExportProgress| {
+        progress(VariantProgress {
+            variant: 0,
+            total,
+            fraction: 0.0,
+            elapsed_secs: p.elapsed_secs,
+            eta_secs: None,
+            waiting: p.waiting,
+        });
+    };
+    match measure_static_loudness(timeline, assets, &mut opts, has_audio, &mut on_meter, cancel) {
+        Err(Error::Cancelled) => Ok(None),
+        r => r.map(|()| Some(opts)),
+    }
+}
+
 /// Progress across a multi-format export: the overall [`ExportProgress`] plus
 /// which variant is rendering, so a bar can say "2 of 3 · 9:16".
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
@@ -5492,6 +6191,15 @@ pub struct VariantProgress {
     /// Time left across the remaining variants, estimated from how long the
     /// completed share has taken.
     pub eta_secs: Option<f64>,
+    /// [`ExportProgress::waiting`]: queued for the slot, or metering the mix's loudness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<&'static str>,
+}
+
+/// Refuse an export whose caption files would replace ones already beside `output`, unless
+/// `opts.overwrite_sidecars` allows it. A multi-format export asks this of every variant first.
+pub fn check_caption_sidecars(output: &Path, opts: &ExportOptions) -> Result<()> {
+    side_files::check_sidecars(output, opts)
 }
 
 /// Render the same cut once per variant — one file per delivery frame, each
@@ -5501,8 +6209,9 @@ pub struct VariantProgress {
 /// takes every core it is given (`cpu::lease` would serialize them anyway),
 /// and a cancelled batch is then clean — the variant in flight is deleted like
 /// a cancelled single export, the ones already finished are kept, and the ones
-/// not started never existed. `opts` is the encode shared by all of them; its
-/// `resolution` and `fit` are replaced per variant by the delivery. Returns the
+/// not started never existed. A variant that **fails** is removed the same way (its partial
+/// file, if the run touched it; the finished ones stay). `opts` is the encode shared by all of
+/// them; its `resolution` and `fit` are replaced per variant by the delivery. Returns the
 /// status and how many files were completed.
 pub fn render_variants(
     timeline: &Timeline,
@@ -5517,6 +6226,9 @@ pub fn render_variants(
     }
     let total = variants.len();
     let started = Instant::now();
+    let Some(opts) = prepare_variants(timeline, assets, variants, opts, progress, cancel)? else {
+        return Ok((RenderStatus::Cancelled, 0));
+    };
     for (i, variant) in variants.iter().enumerate() {
         let framed = timeline.for_delivery(variant.delivery);
         let per_variant = ExportOptions {
@@ -5534,27 +6246,25 @@ pub fn render_variants(
                 fraction,
                 elapsed_secs,
                 eta_secs,
+                waiting: p.waiting,
             });
         };
+        // `render_with_progress` discards a failed or cancelled variant's partial file, but only
+        // if this run touched it: a cancel while the batch was still queued leaves an earlier
+        // export at that path alone, where the unconditional remove used here deleted it.
         let status = render_with_progress(&framed, assets, &variant.output, &per_variant, &mut on_progress, cancel)?;
         if status == RenderStatus::Cancelled {
-            let _ = std::fs::remove_file(&variant.output);
             return Ok((RenderStatus::Cancelled, i));
         }
     }
     Ok((RenderStatus::Completed, total))
 }
 
-/// One export run with `opts` exactly as given (no fallback).
-fn render_attempt(
-    timeline: &Timeline,
-    assets: &[Asset],
-    output: &Path,
-    opts: &ExportOptions,
-    progress: &mut dyn FnMut(ExportProgress),
-    cancel: &dyn Fn() -> bool,
-    hw_used: &std::cell::Cell<bool>,
-) -> Result<RenderStatus> {
+/// What an export is refused for before anything is drawn or spawned — an empty timeline, options
+/// that would export nothing or that the container cannot hold — and whether it has picture and
+/// sound. Asked ahead of the animated titles' drawing so a bad request does not spend seconds of the
+/// cores on pictures nobody will use.
+fn export_preflight(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Result<(bool, bool)> {
     if !timeline.tracks.iter().any(|t| !t.clips.is_empty()) {
         return Err(Error::InvalidArgument("timeline has no clips to export".to_string()));
     }
@@ -5572,6 +6282,44 @@ fn render_attempt(
     if !issues.is_empty() {
         return Err(Error::InvalidArgument(issues.join(" ")));
     }
+    check_export_luts(timeline)?;
+    Ok((has_video, has_audio))
+}
+
+/// An export refuses a LUT it cannot apply (the preview and stills leave it out instead): the file
+/// would otherwise be silently missing from the delivered picture. Reads the disk, off the lock.
+fn check_export_luts(timeline: &Timeline) -> Result<()> {
+    let clips = timeline
+        .tracks
+        .iter()
+        .filter(|t| t.kind == StreamKind::Video)
+        .flat_map(|t| t.clips.iter())
+        .filter(|c| c.enabled);
+    for lut in clips.filter_map(|c| c.grade.lut()) {
+        let why = match crate::color_lut::inspect_lut(&lut.path) {
+            Err(e) => e.to_string(),
+            Ok(_) if crate::color_lut::lut_file(&lut).is_none() => "Kerf could not write its copy of it".to_string(),
+            Ok(_) => continue,
+        };
+        return Err(Error::InvalidArgument(format!(
+            "cannot export: the LUT {} cannot be applied ({why}); choose another file or clear it",
+            lut.path
+        )));
+    }
+    Ok(())
+}
+
+/// One export run with `opts` exactly as given (no fallback).
+fn render_attempt(
+    timeline: &Timeline,
+    assets: &[Asset],
+    output: &Path,
+    opts: &ExportOptions,
+    progress: &mut dyn FnMut(ExportProgress),
+    cancel: &dyn Fn() -> bool,
+    hw_used: &std::cell::Cell<bool>,
+) -> Result<RenderStatus> {
+    let (has_video, _) = export_preflight(timeline, assets, opts)?;
 
     let output_str = output
         .to_str()
@@ -5595,11 +6343,8 @@ fn render_attempt(
             .join(format!("kerf-2pass-{}", std::process::id()))
             .to_string_lossy()
             .into_owned();
-        let cleanup = || {
-            for suffix in ["-0.log", "-0.log.mbtree", ".log", ".log.mbtree"] {
-                let _ = std::fs::remove_file(format!("{passlog}{suffix}"));
-            }
-        };
+        // Removed on every way out, a failed first pass and a stalled second one included.
+        let _logs = PassLogs(passlog.clone());
         // Analysis pass fills the first half of the bar, the encode the second.
         let mut a1 = build_export_args_phase(timeline, assets, output_str, opts, PassPhase::First, null_sink, &passlog)?;
         hw_used.set(tune_export_args(&mut a1, assets, HostOs::CURRENT));
@@ -5617,13 +6362,12 @@ fn render_attempt(
             cancel,
         )?;
         if s1 == RenderStatus::Cancelled {
-            cleanup();
             return Ok(RenderStatus::Cancelled);
         }
         let mut a2 = build_export_args_phase(timeline, assets, output_str, opts, PassPhase::Second, null_sink, &passlog)?;
         hw_used.set(hw_used.get() | tune_export_args(&mut a2, assets, HostOs::CURRENT));
         let _g2 = externalize_filter_complex(&mut a2, "p2")?;
-        let res = run_ffmpeg_progress(
+        run_ffmpeg_progress(
             &a2,
             output,
             Bar {
@@ -5634,9 +6378,7 @@ fn render_attempt(
             },
             progress,
             cancel,
-        );
-        cleanup();
-        res
+        )
     } else {
         let mut args = build_export_args(timeline, assets, output_str, opts)?;
         hw_used.set(tune_export_args(&mut args, assets, HostOs::CURRENT));
@@ -5657,6 +6399,17 @@ fn render_attempt(
             progress,
             cancel,
         )
+    }
+}
+
+/// The x264 two-pass stats files behind `prefix`, removed when dropped.
+struct PassLogs(String);
+
+impl Drop for PassLogs {
+    fn drop(&mut self) {
+        for suffix in ["-0.log", "-0.log.mbtree", ".log", ".log.mbtree"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", self.0));
+        }
     }
 }
 
@@ -5703,12 +6456,13 @@ struct HelpFlags {
 fn help_flags() -> &'static HelpFlags {
     static FLAGS: OnceLock<HelpFlags> = OnceLock::new();
     FLAGS.get_or_init(|| {
-        let help = command(&ffmpeg_bin())
-            .args(["-hide_banner", "-loglevel", "quiet", "-h", "full"])
-            .stdin(Stdio::null())
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
+        let help = output_bounded(
+            command(&ffmpeg_bin()).args(["-hide_banner", "-loglevel", "quiet", "-h", "full"]),
+            CAPABILITY_PROBE_TIMEOUT,
+            0,
+        )
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
         HelpFlags {
             filter_complex_script: help.contains("-filter_complex_script"),
             fps_mode: help.contains("-fps_mode"),
@@ -5948,7 +6702,7 @@ fn run_ffmpeg_progress_as(
         }
     }
 
-    let status = child.wait().map_err(|e| Error::Engine(format!("ffmpeg wait failed: {e}")))?;
+    let status = reap(&mut child)?;
     let stderr_text = stderr_handle.join().unwrap_or_default();
 
     if cancelled {
@@ -6077,6 +6831,26 @@ fn build_filter_complex_metered(
     plan: &InputPlan,
     meter: bool,
 ) -> FilterGraph {
+    build_filter_complex_with(timeline, assets, fmt, total, opts, want_video, want_audio, plan, meter, None)
+}
+
+/// [`build_filter_complex_metered`] with the animated titles' sequences given: the playback stream
+/// reads the ones named for a title, not for the playhead ([`svg_layer::stream_sequences`]), and the
+/// graph must index the very inputs its argv carries. `None` is the cut's own
+/// ([`svg_layer::svg_sequences`]).
+#[allow(clippy::too_many_arguments)]
+fn build_filter_complex_with(
+    timeline: &Timeline,
+    assets: &[Asset],
+    fmt: &ExportFormat,
+    total: f64,
+    opts: &ExportOptions,
+    want_video: bool,
+    want_audio: bool,
+    plan: &InputPlan,
+    meter: bool,
+    titles: Option<&[svg_layer::SvgSeq<'_>]>,
+) -> FilterGraph {
     let has_audio = |clip: &crate::model::Clip| clip_sounds(clip, assets);
     let is_image = |clip: &crate::model::Clip| assets.iter().find(|a| a.id == clip.asset_id).is_some_and(|a| a.is_image());
     let layout = fmt.channel_layout();
@@ -6182,18 +6956,30 @@ fn build_filter_complex_metered(
         ));
         let mut cur = "vbase".to_string();
         let draw = !timeline.overlays.is_empty();
+        // Animated titles: PNG sequences read as inputs after the clips'. They go over the whole
+        // composite and under the text.
+        let own;
+        let svg: &[svg_layer::SvgSeq<'_>] = match titles {
+            Some(given) => given,
+            None => {
+                own = svg_layer::svg_sequences(timeline, fmt);
+                &own
+            }
+        };
         // The picture ends on `[outv]`, or on `vhw` when a VAAPI encoder's upload follows.
         let vaapi = uploads_to_vaapi(opts);
         let final_pad = if vaapi { "vhw" } else { "outv" };
-        // The composite lands on `vcomp` for gif (palettegen follows), on `vtext`
+        // What comes after the titles: `vcomp` for gif (palettegen follows), `vtext`
         // when text overlays will be drawn on top, else directly on `final_pad`.
-        let composite_pad = if draw {
+        let after_svg = if draw {
             "vtext"
         } else if gif {
             "vcomp"
         } else {
             final_pad
         };
+        // The clips land on `vsvg` when titles follow, else where the titles would have gone.
+        let composite_pad = if svg.is_empty() { after_svg } else { "vsvg" };
         let last = video.len() - 1;
         for (n, (flat, input, clip)) in video.iter().enumerate() {
             let src = if vcount[*input] > 1 {
@@ -6256,10 +7042,13 @@ fn build_filter_complex_metered(
             chains.push(format!("[{cur}][v{flat}]{overlay}[{out}]"));
             cur = out;
         }
+        if !svg.is_empty() {
+            svg_layer::push_chains(svg, n_inputs, composite_pad, after_svg, &mut chains);
+        }
         // Text overlays (titles / lower-thirds / captions) drawn on the composited
         // picture in order; the last produces the gif source `vcomp` or `[outv]`.
         if draw {
-            let mut tcur = composite_pad.to_string();
+            let mut tcur = after_svg.to_string();
             let last_o = timeline.overlays.len() - 1;
             let text_final = if gif { "vcomp" } else { final_pad };
             for (oi, ov) in timeline.overlays.iter().enumerate() {
@@ -6351,15 +7140,14 @@ fn build_filter_complex_metered(
         // the output rate. A neutral master adds nothing, so a graph from before
         // the master existed is unchanged.
         let loudness = opts.loudness.or(opts.loudnorm.then_some(LoudnessPreset::Youtube));
-        let mix_tail = if let Some(target) = loudness {
-            format!(
-                "{master},{norm},aresample={sr}",
-                master = master_filters(&timeline.master),
-                norm = target.filter(),
-                sr = fmt.sample_rate
-            )
-        } else {
-            master_filters(&timeline.master)
+        let master = master_filters(&timeline.master, fmt.sample_rate);
+        let mix_tail = match loudness {
+            Some(target) if opts.loudness_static => format!(
+                "{master}{norm}",
+                norm = static_loudness_filters(target, opts.loudness_gain_db, fmt.sample_rate)
+            ),
+            Some(target) => format!("{master},{norm},aresample={sr}", norm = target.filter(), sr = fmt.sample_rate),
+            None => master,
         };
         let pads = |names: &[&str]| names.iter().map(|n| format!("[{n}]")).collect::<String>();
         let ducked: Vec<&str> = sources.iter().filter(|(_, d)| *d).map(|(n, _)| n.as_str()).collect();
@@ -6456,12 +7244,13 @@ fn alimiter_latency_available() -> bool {
     }
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        let ok = command(&ffmpeg_bin())
-            .args(["-hide_banner", "-loglevel", "quiet", "-h", "filter=alimiter"])
-            .stdin(Stdio::null())
-            .output()
-            .map(|o| help_lists_latency(&String::from_utf8_lossy(&o.stdout)))
-            .unwrap_or(true);
+        let ok = output_bounded(
+            command(&ffmpeg_bin()).args(["-hide_banner", "-loglevel", "quiet", "-h", "filter=alimiter"]),
+            CAPABILITY_PROBE_TIMEOUT,
+            0,
+        )
+        .map(|o| help_lists_latency(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or(true);
         tracing::debug!(available = ok, "probed ffmpeg for alimiter latency");
         ok
     })
@@ -6484,18 +7273,54 @@ fn alimiter_latency_available() -> bool {
 /// 100 ms release is slow enough not to pump on low notes. The ceiling is
 /// rounded to six decimals, which is far below anything audible and keeps the
 /// text from depending on the last digit of a libm `pow`.
-fn master_filters(master: &crate::model::MasterBus) -> String {
+///
+/// With `true_peak` the limiter runs on the mix upsampled four times (`aresample` there and
+/// back around it), so it holds the peaks between the samples too: the true peak a
+/// platform measures, not only the sample peak.
+fn master_filters(master: &crate::model::MasterBus, sample_rate: u32) -> String {
     let mut out = String::new();
     let volume = master.safe_volume();
     if (volume - 1.0).abs() > f64::EPSILON {
         out += &format!(",volume={}", fnum(volume));
     }
     if master.limiter {
-        let limit = (master.limit_linear() * 1e6).round() / 1e6;
-        let latency = if alimiter_latency_available() { ":latency=1" } else { "" };
-        out += &format!(",alimiter=limit={}:attack=5:release=100:level=0{latency}", fnum(limit));
+        let limiter = limiter_filter(master.limit_linear());
+        if master.true_peak {
+            out += &oversampled(&limiter, sample_rate);
+        } else {
+            out += &format!(",{limiter}");
+        }
     }
     out
+}
+
+/// The master's `alimiter` holding `limit` (linear, rounded to six decimals), with
+/// `latency=1` where this ffmpeg has it (see [`master_filters`]).
+fn limiter_filter(limit: f64) -> String {
+    let limit = (limit * 1e6).round() / 1e6;
+    let latency = if alimiter_latency_available() { ":latency=1" } else { "" };
+    format!("alimiter=limit={}:attack=5:release=100:level=0{latency}", fnum(limit))
+}
+
+/// `filter` run at four times `sample_rate` and resampled back, led by its joining comma: a
+/// limiter there sees the peaks between the output's samples (BS.1770 reads the true peak
+/// off the same 4x oversampling).
+fn oversampled(filter: &str, sample_rate: u32) -> String {
+    format!(
+        ",aresample={},{filter},aresample={sample_rate}",
+        sample_rate.saturating_mul(4)
+    )
+}
+
+/// The static loudness normalization: the measured gain (omitted when there is none to
+/// apply) then a true-peak limiter just under the target's ceiling, led by its comma.
+fn static_loudness_filters(target: LoudnessPreset, gain_db: Option<f64>, sample_rate: u32) -> String {
+    let mut out = String::new();
+    if let Some(g) = gain_db.filter(|g| g.is_finite() && g.abs() >= 0.005) {
+        out += &format!(",volume={:.2}dB", g.clamp(-LOUDNESS_MAX_GAIN_DB, LOUDNESS_MAX_GAIN_DB));
+    }
+    let ceiling = 10f64.powf((target.true_peak_db() - STATIC_TP_MARGIN_DB) / 20.0);
+    out + &oversampled(&limiter_filter(ceiling), sample_rate)
 }
 
 /// The owning track's mix settings, carried alongside each of its audio clips.
@@ -6783,39 +7608,6 @@ fn video_effect_filter(e: &VideoEffect) -> Option<String> {
         VideoEffect::Vignette => "vignette".to_string(),
         VideoEffect::ChromaKey { .. } => return None,
     })
-}
-
-/// Whether `s` is a safe ffmpeg colour spec to splice unquoted into a filter
-/// value: a bare name (letters only), `#RRGGBB[AA]` hex or `0xRRGGBB[AA]` hex,
-/// each with an optional `@alpha` suffix (a decimal in 0..1). `color`/`bg` reach
-/// `fontcolor=`/`bordercolor=`/`boxcolor=`/`chromakey=` unquoted — like every
-/// other free-form string spliced into this graph, a comma or colon here would
-/// start a new filter node or option instead of naming a colour.
-pub(crate) fn valid_color(s: &str) -> bool {
-    let (base, alpha) = s.split_once('@').map_or((s, None), |(b, a)| (b, Some(a)));
-    if let Some(a) = alpha {
-        if a.is_empty() || a.matches('.').count() > 1 || !a.chars().all(|c| c.is_ascii_digit() || c == '.') {
-            return false;
-        }
-    }
-    if let Some(hex) = base.strip_prefix('#') {
-        return matches!(hex.len(), 6 | 8) && hex.chars().all(|c| c.is_ascii_hexdigit());
-    }
-    if let Some(hex) = base.strip_prefix("0x").or_else(|| base.strip_prefix("0X")) {
-        return matches!(hex.len(), 6 | 8) && hex.chars().all(|c| c.is_ascii_hexdigit());
-    }
-    !base.is_empty() && base.chars().all(|c| c.is_ascii_alphabetic())
-}
-
-/// `s` if [`valid_color`], else `fallback` — the safe way to splice a
-/// caller-controlled colour into a filter value; rendering must never fail or
-/// inject over a bad one.
-pub(crate) fn safe_color<'a>(s: &'a str, fallback: &'a str) -> &'a str {
-    if valid_color(s) {
-        s
-    } else {
-        fallback
-    }
 }
 
 /// The `chromakey` filter for a chroma-key effect, or `None` for any other.
@@ -7352,6 +8144,13 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     });
 
     let mut p: Vec<String> = Vec::new();
+    // The label is the first filter of the chain, so that all of it reads what a file tagged BT.709
+    // would give. Later, a scaler may have converted the picture already: the fit `scale` is the
+    // filter FFmpeg has do the RGB conversion a dip to white's `fade` needs, as BT.601 in and
+    // BT.709 out (8 to 15 levels off the footage tagged in the file).
+    if fx.label_bt709 {
+        p.push(BT709_LABEL.to_string());
+    }
     // A head-padded proxy opens with one clone of its first frame at time zero (see
     // [`build_proxy_args`]), which a seek skips — and a read from the start does
     // not. The original has no such frame: its first one is the real one, and the
@@ -7481,6 +8280,11 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     } else if !clip.color.is_identity() {
         p.push(eq_filter(&clip.color));
     }
+    // The LUT, the curves and the wheels, after the `eq` (see `grade`), before any alpha plane.
+    p.extend(grade_filters(
+        &clip.grade,
+        if fx.label_bt709 { Some("bt709") } else { fx.frame_matrix },
+    ));
     // Color-space video effects (blur / sharpen / grayscale / invert / vignette),
     // applied in author order, before any alpha plane.
     for e in &clip.effects {
@@ -7576,22 +8380,70 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
 /// `max_width` px wide. Lets an LLM *see the cut it is assembling* (which footage
 /// is on screen, framing, picture-in-picture placement, crop, color) rather than
 /// reasoning about timestamps blind.
-pub fn timeline_frame(
+///
+/// Gives up with [`Error::Cancelled`] once `cancel` is true.
+pub fn timeline_frame_cancellable(
     timeline: &Timeline,
     assets: &[Asset],
     opts: &ExportOptions,
     t: f64,
     max_width: u32,
     quality: u8,
+    cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<u8>> {
-    run_still(timeline, assets, opts, t, max_width, None, &StillOutput::JpegPipe { quality })
+    run_still(
+        timeline,
+        assets,
+        opts,
+        t,
+        max_width,
+        None,
+        &StillOutput::JpegPipe { quality },
+        cancel,
+    )
+}
+
+/// The composited still at `t` as its Y'CbCr samples: limited-range 4:4:4 planes (Y, then Cb,
+/// then Cr) of the frame [`timeline_frame_cancellable`] would encode, with its size. The scopes read this
+/// rather than an RGB conversion, whose matrix is the composite's and not the delivery's.
+/// Niced like every read the UI draws from, killed past [`STILL_TIMEOUT`], and gives up with
+/// [`Error::Cancelled`] once `cancel` is true.
+pub fn timeline_frame_yuv_cancellable(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    max_width: u32,
+    cancel: &dyn Fn() -> bool,
+) -> Result<(u32, u32, Vec<u8>)> {
+    let fmt = export_format(&timeline.for_render(), assets, opts);
+    let (w, h) = still_size(fmt.width, fmt.height, max_width);
+    let planes = run_still(
+        timeline,
+        assets,
+        opts,
+        t,
+        max_width,
+        None,
+        &StillOutput::Yuv444Pipe { width: w, height: h },
+        cancel,
+    )?;
+    if planes.len() != (w as usize) * (h as usize) * 3 {
+        return Err(Error::Engine(format!(
+            "could not render timeline frame at {t:.3}s: {} bytes for a {w}x{h} frame",
+            planes.len()
+        )));
+    }
+    Ok((w, h, planes))
 }
 
 /// [`timeline_frame`] of one `region` of the composited canvas. The canvas is
 /// rendered large enough that the region alone comes out `max_width` wide
 /// (capped at the delivery frame, so nothing is invented), then cropped — a
 /// zoom into the cut rather than a screenshot of it.
-pub fn timeline_frame_region(
+/// Gives up with [`Error::Cancelled`] once `cancel` is true.
+#[allow(clippy::too_many_arguments)]
+pub fn timeline_frame_region_cancellable(
     timeline: &Timeline,
     assets: &[Asset],
     opts: &ExportOptions,
@@ -7599,6 +8451,7 @@ pub fn timeline_frame_region(
     region: Region,
     max_width: u32,
     quality: u8,
+    cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<u8>> {
     let region = (!region.is_full()).then_some(region);
     run_still(
@@ -7609,6 +8462,7 @@ pub fn timeline_frame_region(
         max_width,
         region,
         &StillOutput::JpegPipe { quality },
+        cancel,
     )
 }
 
@@ -7628,9 +8482,28 @@ pub fn export_still(
     format: ImageFormat,
     quality: u8,
 ) -> Result<PathBuf> {
+    export_still_cancellable(timeline, assets, opts, t, path, format, quality, &|| false)
+}
+
+/// [`export_still`] that gives up with [`Error::Cancelled`] once `cancel` is true (polled about
+/// fifty times a second while ffmpeg runs; the render is killed). A cover that fails or is
+/// cancelled removes what it wrote ([`discard_partial`]), leaving an earlier file at `path`
+/// alone when this run never touched it.
+#[allow(clippy::too_many_arguments)]
+pub fn export_still_cancellable(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    path: &Path,
+    format: ImageFormat,
+    quality: u8,
+    cancel: &dyn Fn() -> bool,
+) -> Result<PathBuf> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)?;
     }
+    let before = file_mtime(path);
     let out = StillOutput::File {
         path: path.to_string_lossy().into_owned(),
         format,
@@ -7638,12 +8511,16 @@ pub fn export_still(
     };
     // `u32::MAX` asks for no cap: `build_still_args` clamps to the delivery
     // width, which is exactly the cover size.
-    run_still(timeline, assets, opts, t, u32::MAX, None, &out)?;
+    if let Err(e) = run_still(timeline, assets, opts, t, u32::MAX, None, &out, cancel) {
+        discard_partial(path, before);
+        return Err(e);
+    }
     Ok(path.to_path_buf())
 }
 
 /// Run a composited still through ffmpeg, retrying in software if hardware
 /// decode was asked for and failed. Returns stdout (empty for a file sink).
+#[allow(clippy::too_many_arguments)]
 fn run_still(
     timeline: &Timeline,
     assets: &[Asset],
@@ -7652,29 +8529,47 @@ fn run_still(
     max_width: u32,
     region: Option<Region>,
     out: &StillOutput,
+    cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<u8>> {
     let piping = matches!(out, StillOutput::JpegPipe { .. });
+    // The scopes are a measurement, not the frame the user is waiting to see: niced. Their output
+    // size is known, so the read buffer is allocated once instead of doubling through ~3 MB.
+    let (background, capacity) = match out {
+        StillOutput::Yuv444Pipe { width, height } => (true, (*width as usize) * (*height as usize) * 3),
+        _ => (false, 0),
+    };
     let hw_used = std::cell::Cell::new(false);
+    // The titles' pictures, on disk and kept for the run (and its software retry).
+    let _titles = still_titles(timeline, assets, opts, t, max_width, region)?;
     let run = |o: &ExportOptions| -> Result<Vec<u8>> {
         let mut args = build_still_args(timeline, assets, o, t, max_width, region, out)?;
         hw_used.set(tune_still_args(&mut args, assets, HostOs::CURRENT));
+        let _script = externalize_filter_complex(&mut args, "still")?;
         let bin = ffmpeg_bin();
-        let output = output_bounded(command(&bin).args(&args), STILL_TIMEOUT).map_err(|e| match e.kind() {
-            std::io::ErrorKind::TimedOut => Error::Engine(format!(
+        let mut cmd = if background { bg_command(&bin) } else { command(&bin) };
+        cmd.args(&args);
+        // No `-progress` on a one-frame render, so no stall bound: a wall-clock one and the cancel.
+        let output = output_supervised_sized(cmd, std::time::Duration::MAX, Some(STILL_TIMEOUT), cancel, capacity)
+            .map_err(|e| launch_err(&bin, e))?;
+        if output.cancelled {
+            return Err(Error::Cancelled);
+        }
+        if output.timed_out {
+            return Err(Error::Engine(format!(
                 "could not render timeline frame at {t:.3}s: ffmpeg did not answer in {} s and was stopped",
                 STILL_TIMEOUT.as_secs()
-            )),
-            _ => launch_err(&bin, e),
-        })?;
+            )));
+        }
         if !output.status.success() || (piping && output.stdout.is_empty()) {
             return Err(Error::Engine(format!(
                 "could not render timeline frame at {t:.3}s: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                output.stderr.trim()
             )));
         }
         Ok(output.stdout)
     };
     match run(opts) {
+        Err(Error::Cancelled) => Err(Error::Cancelled),
         // Mirror `decode_frame`'s fallback: a software retry that succeeds means
         // `-hwaccel` is the culprit here, so stop asking for it. Only a run that
         // still asked for hardware after the spawn-time tuning can blame it.
@@ -7700,9 +8595,13 @@ const STILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// `Command::output()` with a deadline: run `cmd` with its stdin closed and both output pipes
 /// read, and kill it if it has not finished in `limit` (`ErrorKind::TimedOut`). The calling thread
-/// reads stdout to its end, a watchdog kills the process at the deadline (which ends that read),
+/// reads stdout to its end (into a buffer of `capacity` bytes up front), a watchdog kills the process at the deadline (which ends that read),
 /// and nothing waits on the child while the watchdog could need it.
-fn output_bounded(cmd: &mut Command, limit: std::time::Duration) -> std::io::Result<std::process::Output> {
+pub(super) fn output_bounded(
+    cmd: &mut Command,
+    limit: std::time::Duration,
+    capacity: usize,
+) -> std::io::Result<std::process::Output> {
     use std::io::Read;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{channel, RecvTimeoutError};
@@ -7735,7 +8634,7 @@ fn output_bounded(cmd: &mut Command, limit: std::time::Duration) -> std::io::Res
         }
         text
     });
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(capacity);
     let read = match stdout.as_mut() {
         Some(o) => o.read_to_end(&mut out).map(|_| ()),
         None => Ok(()),
@@ -7770,6 +8669,33 @@ fn output_bounded(cmd: &mut Command, limit: std::time::Duration) -> std::io::Res
         stdout: out,
         stderr,
     })
+}
+
+/// [`output_bounded`] that a caller's `cancel` can also stop: `Ok(None)` is a run killed because
+/// `cancel` went true (the caller says [`Error::Cancelled`]); a run past `limit` is the same
+/// `TimedOut` error. With no `cancel` it *is* [`output_bounded`] — the interactive reads (a
+/// scrubbed frame) keep the path that has no polling interval in it.
+pub(super) fn output_bounded_cancellable(
+    mut cmd: Command,
+    limit: std::time::Duration,
+    cancel: Option<&dyn Fn() -> bool>,
+) -> std::io::Result<Option<std::process::Output>> {
+    let Some(cancel) = cancel else {
+        return output_bounded(&mut cmd, limit, 0).map(Some);
+    };
+    // These reads print no `-progress`, so stderr silence means nothing: only the wall clock bounds them.
+    let run = output_supervised(cmd, std::time::Duration::MAX, Some(limit), cancel)?;
+    if run.cancelled {
+        return Ok(None);
+    }
+    if run.timed_out {
+        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the process timed out"));
+    }
+    Ok(Some(std::process::Output {
+        status: run.status,
+        stdout: run.stdout,
+        stderr: run.stderr.into_bytes(),
+    }))
 }
 
 /// Tune a built still argv for the process about to be spawned: each input's `-hwaccel` and
@@ -7815,6 +8741,9 @@ pub enum StillOutput {
     /// Raw `rgb24` on stdout — only for [`composite_color_policy`]'s probe, which
     /// wants the converted pixels themselves.
     RgbPipe,
+    /// Raw planar `yuv444p` on stdout — [`timeline_frame_yuv_cancellable`], for the scopes. The frame's size
+    /// sizes the read buffer; the argv does not carry it (the graph scales to `max_width`).
+    Yuv444Pipe { width: u32, height: u32 },
 }
 
 /// The image formats a cover frame can be written as.
@@ -7870,6 +8799,9 @@ impl StillOutput {
             StillOutput::RgbPipe => {
                 a.extend(["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"].map(String::from));
             }
+            StillOutput::Yuv444Pipe { .. } => {
+                a.extend(["-f", "rawvideo", "-pix_fmt", "yuv444p", "pipe:1"].map(String::from));
+            }
             StillOutput::File { path, format, quality } => {
                 if *format == ImageFormat::Jpeg {
                     a.extend(["-q:v".to_string(), quality.to_string()]);
@@ -7913,7 +8845,7 @@ pub fn export_seek_arg(seconds: f64) -> String {
 ///
 /// Every video clip whose timeline span contains `t` is decoded at its
 /// corresponding source time (`-ss` input seek), put through the same geometry /
-/// color chain the export uses ([`still_clip_chain`] mirrors [`video_clip_chain`]
+/// color chain the export uses ([`still_clip_chain_graded`] mirrors [`video_clip_chain`]
 /// minus the time-domain `trim`/`setpts`/`fps` steps and the fades not changing
 /// the picture at `t`), then `overlay`d onto a black canvas in **track-then-timeline order** — so later tracks composite on
 /// top and gaps fall through to black, matching export framing. The output canvas
@@ -7935,6 +8867,45 @@ fn build_still_args(
     build_still_args_rendered(&rendered, assets, opts, t, max_width, region, out)
 }
 
+/// The frame a still is composited on: the export's format, the region normalised, and the output
+/// canvas (`ow` x `oh`: the export's aspect capped to `max_width`, even). A region zoom composites a
+/// canvas wide enough that the region alone is `max_width` — the delivery frame caps it, so a zoom
+/// never upscales. The builder and whatever draws the still's titles first both ask this.
+fn still_canvas(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    max_width: u32,
+    region: Option<Region>,
+) -> (ExportFormat, Option<Region>, u32, u32) {
+    let fmt = export_format(timeline, assets, opts);
+    let region = region.map(Region::normalized);
+    let canvas_width = match region {
+        Some(r) => ((max_width as f64 / r.width).ceil() as u32).min(fmt.width),
+        None => max_width,
+    };
+    let (ow, oh) = still_size(fmt.width, fmt.height, canvas_width);
+    (fmt, region, ow, oh)
+}
+
+/// Have the animated titles a still at `t` shows drawn and kept (until the pins drop), before its
+/// ffmpeg is spawned. Nothing for a cut without any.
+fn still_titles(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    max_width: u32,
+    region: Option<Region>,
+) -> Result<Vec<crate::svg::raster::Pin>> {
+    if timeline.svg_overlays.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rendered = timeline.for_render();
+    let (_, _, ow, oh) = still_canvas(&rendered, assets, opts, max_width, region);
+    svg_layer::ensure_stills(&svg_layer::still_svgs(&rendered, ow, oh, t.max(0.0)))
+}
+
 /// [`build_still_args`] over a timeline that has already been through [`Timeline::for_render`]:
 /// what a caller asking for many frames of one cut (the scrub cache keys every frame of a
 /// window) does once instead of per frame.
@@ -7947,18 +8918,11 @@ fn build_still_args_rendered(
     region: Option<Region>,
     out: &StillOutput,
 ) -> Result<Vec<String>> {
-    let fmt = export_format(timeline, assets, opts);
-    // A region zoom composites a canvas wide enough that the region alone is
-    // `max_width` — the delivery frame caps it, so a zoom never upscales.
-    let region = region.map(Region::normalized);
-    let canvas_width = match region {
-        Some(r) => ((max_width as f64 / r.width).ceil() as u32).min(fmt.width),
-        None => max_width,
-    };
-    // Output canvas: export aspect ratio, capped to `max_width`, even dimensions.
-    let (ow, oh) = still_size(fmt.width, fmt.height, canvas_width);
+    let (fmt, region, ow, oh) = still_canvas(timeline, assets, opts, max_width, region);
     let t = t.max(0.0);
     let asset_of = |id| assets.iter().find(|a: &&Asset| a.id == id);
+    // The animated titles on screen at `t`: one picture each (`run_still` draws them first).
+    let svg = svg_layer::still_svgs(timeline, ow, oh, t);
 
     // Active video clips at `t`, in composite order (tracks in list order, clips
     // within a track in timeline order), paired with their source time, the clips a
@@ -7988,6 +8952,7 @@ fn build_still_args_rendered(
         args.push("-i".to_string());
         args.push(asset.path.clone());
     }
+    svg_layer::push_still_inputs(&svg, &mut args);
 
     // Black base + each active clip's still chain (its transform sampled at `t`,
     // so a keyframed clip shows its pose), overlaid in order, then the text
@@ -8008,17 +8973,26 @@ fn build_still_args_rendered(
         let rf = clip.reframe_at(ac.local_time);
         let hdr = asset_of(clip.asset_id).and_then(|a| a.hdr());
         let tone = hdr.map(|h| format!("{},", tonemap_filter(h))).unwrap_or_default();
+        let stream = asset_of(clip.asset_id).and_then(|a| a.streams.iter().find(|s| s.kind == StreamKind::Video));
+        let matrix = if layer.label_bt709 {
+            Some("bt709")
+        } else {
+            crate::model::frame_matrix(stream, hdr.is_some())
+        };
         chains.push(format!(
             "[{n}:v]{tone}{chain}[v{n}]",
-            chain = still_clip_chain(
+            chain = still_clip_chain_graded(
                 &tf,
                 &ac.color(),
+                &clip.grade,
+                matrix,
                 &clip.effects,
                 rf.as_ref(),
                 &canvas,
                 clip.mask.as_ref(),
                 clip.zoom_animated(),
-                &layer.fades
+                &layer.fades,
+                layer.label_bt709
             )
         ));
         let out = format!("ov{n}");
@@ -8028,6 +9002,8 @@ fn build_still_args_rendered(
         ));
         cur = out;
     }
+    // Titles over the clips, under the text, as in the export.
+    cur = svg_layer::push_still_chains(&svg, active.len(), &cur, &mut chains);
     for (oi, ov) in live.iter().enumerate() {
         let out = format!("txt{oi}");
         chains.push(format!("[{cur}]{f}[{out}]", f = drawtext_still(ov, oh, t)));
@@ -8081,22 +9057,34 @@ struct StillCanvas {
 /// ([`still_fx`]): where the export's chain applies its `fade` steps, after the rotation and
 /// ahead of a moving zoom, the same filters run on the frame. None at all for a still
 /// outside any fade, and then the chain is what it was.
+///
+/// `label_bt709` is the graph's BT.709 label for this layer ([`BT709_LABEL`]): the still decides
+/// it over the layers on screen, and puts it where [`video_clip_chain`] does, ahead of everything.
+///
+/// `grade` is the clip's curves, wheels and LUT, right after the `eq`, as `video_clip_chain` places them.
 #[allow(clippy::too_many_arguments)]
-fn still_clip_chain(
+fn still_clip_chain_graded(
     tf: &Transform,
     color: &Color,
+    grade: &Grade,
+    frame_matrix: Option<&str>,
     effects: &[VideoEffect],
     reframe: Option<&ResolvedReframe>,
     canvas: &StillCanvas,
     mask: Option<&Mask>,
     zoom_last: bool,
     fades: &StillFades,
+    label_bt709: bool,
 ) -> String {
     let StillCanvas { w: ow, h: oh, fit, sf } = canvas;
     let (ow, oh, fit) = (*ow, *oh, *fit);
     let chroma = effects.iter().any(|e| e.produces_alpha());
     let needs_alpha = (!tf.is_identity() && tf.needs_alpha()) || chroma || mask.is_some() || fades.needs_alpha();
-    let mut p: Vec<String> = vec!["trim=end_frame=1".to_string(), "setpts=PTS-STARTPTS".to_string()];
+    let mut p: Vec<String> = Vec::new();
+    if label_bt709 {
+        p.push(BT709_LABEL.to_string());
+    }
+    p.extend(["trim=end_frame=1".to_string(), "setpts=PTS-STARTPTS".to_string()]);
     let crop = tf.has_crop().then(|| {
         let cw = (1.0 - tf.crop_left - tf.crop_right).max(0.0);
         let ch = (1.0 - tf.crop_top - tf.crop_bottom).max(0.0);
@@ -8142,6 +9130,7 @@ fn still_clip_chain(
     if !color.is_identity() {
         p.push(eq_filter(color));
     }
+    p.extend(grade_filters(grade, frame_matrix));
     for e in effects {
         if let Some(f) = video_effect_filter(e) {
             p.push(f);
@@ -8171,6 +9160,35 @@ fn still_clip_chain(
     }
     p.extend(late_zoom);
     p.join(",")
+}
+
+/// [`still_clip_chain_graded`] with no grade.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn still_clip_chain(
+    tf: &Transform,
+    color: &Color,
+    effects: &[VideoEffect],
+    reframe: Option<&ResolvedReframe>,
+    canvas: &StillCanvas,
+    mask: Option<&Mask>,
+    zoom_last: bool,
+    fades: &StillFades,
+    label_bt709: bool,
+) -> String {
+    still_clip_chain_graded(
+        tf,
+        color,
+        &Grade::default(),
+        None,
+        effects,
+        reframe,
+        canvas,
+        mask,
+        zoom_last,
+        fades,
+        label_bt709,
+    )
 }
 
 /// The `overlay` placement for a clip in a [`timeline_frame`] composite: a full
@@ -8234,11 +9252,29 @@ fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, 
     for e in &clip.audio {
         p.push(audio_effect_filter(e));
     }
+    // A fade that is wholly one half of a real crossfade pair (`ClipFx::afade_in_power` /
+    // `tail_power`) is constant-power (`qsin`: sin in, cos out, so the summed power stays
+    // put) where linear ramps dip about 3 dB at the midpoint. A fade with a clip fade or a
+    // dip in it, a fade up from black, and a pair playing the same sound on both sides keep
+    // the linear ramp they always had.
+    let crossfade = |fade: f64, own: f64, power: bool| {
+        if fade > 0.0 && own <= 0.0 && power {
+            ":curve=qsin"
+        } else {
+            ""
+        }
+    };
     if fi > 0.0 {
-        p.push(format!("afade=t=in:st=0:d={}", fi.clamp(0.0, dur)));
+        let curve = crossfade(fx.afade_in, clip.fade_in + fx.black_in + fx.white_in, fx.afade_in_power);
+        p.push(format!("afade=t=in:st=0:d={}{curve}", fi.clamp(0.0, dur)));
     }
     if fo > 0.0 {
-        p.push(format!("afade=t=out:st={}:d={}", (dur - fo).max(0.0), fo.clamp(0.0, dur)));
+        let curve = crossfade(fx.tail, clip.fade_out + fx.black_out + fx.white_out, fx.tail_power);
+        p.push(format!(
+            "afade=t=out:st={}:d={}{curve}",
+            (dur - fo).max(0.0),
+            fo.clamp(0.0, dur)
+        ));
     }
     // The track fader, after the clip's own chain. Omitted at unity, so a
     // project that never touched a fader renders the graph it always did.
@@ -8339,21 +9375,49 @@ pub use levels::mix_levels;
 #[cfg(test)]
 mod golden;
 
+/// The BT.709 label on the four builders, and the plan's mirror of it.
+#[cfg(test)]
+mod bt709_label;
+
 /// What the export graph draws, pinned against rendered pixels (`#[ignore]`d).
 #[cfg(test)]
 mod rendered;
+
+/// A clip's curves, wheels and LUT as filters.
+mod grade;
+use grade::grade_filters;
 
 /// The still inside a fade, a dip, a dissolve, a slide or a push: its layers and their fades.
 mod still_fx;
 use still_fx::{still_layers, StillFades};
 
+/// Animated SVG titles as PNG sequences and stills: drawn before ffmpeg is spawned, overlaid by it.
+mod svg_layer;
+
+/// The cut's captions and chapter markers muxed into an export, and the caption
+/// files written beside it.
+mod side_files;
+
+/// Titles through the real ffmpeg (`#[ignore]`d).
+#[cfg(test)]
+mod svg_rendered;
+
 /// Which slot a job takes, the cores' or the hardware's.
 #[cfg(test)]
 mod lane_tests;
 
+/// ffprobe's JSON and ffmpeg's logs, mutated: nothing panics.
+#[cfg(test)]
+mod hostile_tests;
+
 /// The deadline on a one-shot still's process.
 #[cfg(all(test, unix))]
 mod output_bounded_tests;
+
+/// Children that cannot be waited on for ever: the supervised run, the bounded reap, the
+/// partial-output cleanup and the way a failed `silencedetect` is read.
+#[cfg(all(test, unix))]
+mod supervised_tests;
 
 /// A bounded cache of composited stills, keyed by the argv that would draw each.
 mod still_cache;
@@ -8395,6 +9459,10 @@ mod keyed_zoom;
 /// the export renders (`#[ignore]`d).
 #[cfg(test)]
 mod keyed_channels;
+
+/// Curves, wheels and a LUT against the pictures the export and the still render (`#[ignore]`d).
+#[cfg(test)]
+mod grade_rendered;
 
 /// Scene detection and contact sheets on a proxy against the original (`#[ignore]`d).
 #[cfg(test)]
@@ -9656,6 +10724,7 @@ mod tests {
             true,
             hw,
             proxy,
+            None,
         )
         .unwrap();
         assert_eq!(bytes, b"x");
@@ -9678,6 +10747,63 @@ mod tests {
         let original = argv_of_frame_decode(&dir, false, Some("auto"));
         assert_eq!(count(&original, "-hwaccel"), 1);
         assert_eq!(&original[original.len() - 3..], ["-vcodec", "mjpeg", "pipe:1"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_frame_decode_a_caller_cancels_is_killed_and_is_cancelled_not_a_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = cpu::test_lock();
+        let dir = std::env::temp_dir().join(format!("kerf-frame-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let slow = dir.join("slow-ffmpeg");
+        std::fs::write(&slow, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let started = Instant::now();
+        let err = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let cancel = || stop.load(std::sync::atomic::Ordering::SeqCst);
+            run_frame_decode(
+                slow.to_str().unwrap(),
+                Path::new("/media/a.mp4"),
+                3.0,
+                "scale=320:-2",
+                "mjpeg",
+                Some(4),
+                true,
+                None,
+                false,
+                Some(&cancel),
+            )
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+
+        // Already cancelled: not even started, hit or miss.
+        let err = decode_frame(
+            Path::new("/media/a.mp4"),
+            1.0,
+            "scale=320:-2",
+            "mjpeg",
+            Some(4),
+            true,
+            Some(&|| true),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "{err}");
+        let err = audio_pcm_cancellable(Path::new("/media/a.mp4"), 0.0, 1.0, 8_000, None, &|| true).unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9773,13 +10899,16 @@ mod tests {
         assert!(jpeg(&new));
         assert_eq!(old, new, "the still differs");
         let options = hw_still_opts();
-        assert_eq!(timeline_frame(&timeline, &assets, &options, 1.5, 640, 4).unwrap(), new);
+        assert_eq!(
+            timeline_frame_cancellable(&timeline, &assets, &options, 1.5, 640, 4, &|| false).unwrap(),
+            new
+        );
 
         // The frame grab: `frame_jpeg` decides for itself from the path it is given.
         let vf = "scale='min(320,iw)':-2";
         let grab = frame_jpeg(&proxy, 1.5, 320, 4, true).unwrap();
         assert!(jpeg(&grab));
-        let untuned = run_frame_decode(&ffmpeg_bin(), &proxy, 1.5, vf, "mjpeg", Some(4), true, None, false).unwrap();
+        let untuned = run_frame_decode(&ffmpeg_bin(), &proxy, 1.5, vf, "mjpeg", Some(4), true, None, false, None).unwrap();
         assert_eq!(grab, untuned, "the grab differs");
 
         // The stream: a second of frames, read from the proxy with the hardware dropped.
@@ -9837,6 +10966,27 @@ mod tests {
         let args = build_still_args(&timeline, &assets, &ExportOptions::default(), 1.0, u32::MAX, None, &out).unwrap();
         assert!(args.windows(2).any(|w| w[0] == "-vcodec" && w[1] == "png"));
         assert!(!args.contains(&"-q:v".to_string()), "-q:v is meaningless for png: {args:?}");
+    }
+
+    #[test]
+    fn the_scopes_still_pipes_raw_yuv444_and_is_otherwise_the_jpeg_still() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let assets = vec![asset.clone()];
+        let timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
+        let o = ExportOptions::default();
+        let yuv = StillOutput::Yuv444Pipe { width: 960, height: 540 };
+        let args = build_still_args(&timeline, &assets, &o, 1.0, 960, None, &yuv).unwrap();
+        let tail = ["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv444p", "pipe:1"];
+        assert_eq!(&args[args.len() - tail.len()..], tail.map(String::from).as_slice());
+        let jpeg = build_still_args(&timeline, &assets, &o, 1.0, 960, None, &StillOutput::JpegPipe { quality: 3 }).unwrap();
+        let head = |a: &[String]| a[..a.iter().position(|x| x == "-frames:v").unwrap()].to_vec();
+        assert_eq!(head(&args), head(&jpeg), "only the sink differs");
+        // The size only sizes the read buffer.
+        let other = StillOutput::Yuv444Pipe { width: 1, height: 1 };
+        assert_eq!(
+            build_still_args(&timeline, &assets, &o, 1.0, 960, None, &other).unwrap(),
+            args
+        );
     }
 
     #[test]
@@ -9988,6 +11138,32 @@ mod tests {
             assert!(a1.to_string_lossy().contains("proxies"));
             assert_eq!(a1.extension().and_then(|e| e.to_str()), Some("mp4"));
         }
+    }
+
+    #[test]
+    fn an_encode_names_its_proxy_from_the_traits_it_was_given() {
+        // One reading answers the destination, the tone-map and the pad: what the destination is
+        // follows from those traits alone, and a source that cannot be probed is the plain one.
+        let src = Path::new("/media/never-imported.mov");
+        let plain = SourceTraits::default();
+        let hlg = SourceTraits {
+            hdr: Some(Hdr::Hlg),
+            ..plain
+        };
+        let late = SourceTraits { lead: 0.5, ..plain };
+        let (Some(a), Some(b), Some(c), Some(unreadable)) = (
+            proxy_path_for(src, PROXY_MAX_WIDTH, plain),
+            proxy_path_for(src, PROXY_MAX_WIDTH, hlg),
+            proxy_path_for(src, PROXY_MAX_WIDTH, late),
+            proxy_path(src, PROXY_MAX_WIDTH),
+        ) else {
+            skip("skipped: this platform has no cache directory for proxies");
+            return;
+        };
+        assert_eq!(a, unreadable);
+        assert!(a != b && a != c && b != c);
+        assert!(is_head_padded_proxy(&c.to_string_lossy()) && !is_head_padded_proxy(&a.to_string_lossy()));
+        assert_eq!(Some(&b), proxy_path_for(src, PROXY_MAX_WIDTH, hlg).as_ref());
     }
 
     #[test]
@@ -10401,6 +11577,7 @@ mod tests {
         let timeline = Timeline {
             tracks: Vec::new(),
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -10934,6 +12111,7 @@ mod tests {
             Some(&mask),
             true,
             &StillFades::default(),
+            false,
         );
         let first = still_clip_chain(
             &tf,
@@ -10944,6 +12122,7 @@ mod tests {
             Some(&mask),
             false,
             &StillFades::default(),
+            false,
         );
         let zoom = "scale=iw*1.4:ih*1.4";
         // Last: after the rotation, with nothing behind it, and only once.
@@ -10960,8 +12139,28 @@ mod tests {
         // A moving zoom that has no zoom at the sampled instant has none to move.
         let at_rest = Transform { scale: 1.0, ..tf };
         assert_eq!(
-            still_clip_chain(&at_rest, &color, &effects, None, &canvas, None, true, &StillFades::default()),
-            still_clip_chain(&at_rest, &color, &effects, None, &canvas, None, false, &StillFades::default())
+            still_clip_chain(
+                &at_rest,
+                &color,
+                &effects,
+                None,
+                &canvas,
+                None,
+                true,
+                &StillFades::default(),
+                false
+            ),
+            still_clip_chain(
+                &at_rest,
+                &color,
+                &effects,
+                None,
+                &canvas,
+                None,
+                false,
+                &StillFades::default(),
+                false
+            )
         );
     }
 
@@ -11042,6 +12241,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(c.contains("scale=w='max(1,iw*0.0004)':h='max(1,ih*0.0004)'"), "{c}");
         let c = still_clip_chain(
@@ -11053,6 +12253,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(c.contains("scale=iw*0.5:ih*0.5"), "{c}");
     }
@@ -11108,6 +12309,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(!still.contains("force_divisible_by") && !still.contains("trunc("), "{still}");
     }
@@ -11342,39 +12544,6 @@ mod tests {
             assert!(render(look(broken).options(80.0)) == one_line, "{broken:?} is not one line");
         }
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn valid_color_accepts_names_hex_and_alpha() {
-        for ok in [
-            "white",
-            "AliceBlue",
-            "#fff000",
-            "#FFAA00CC",
-            "0x000000",
-            "0XAABBCCDD",
-            "white@0.5",
-            "black@1",
-            "black@.5",
-        ] {
-            assert!(valid_color(ok), "{ok}");
-        }
-    }
-
-    #[test]
-    fn valid_color_rejects_injection_and_malformed_input() {
-        for bad in [
-            "white,drawtext=textfile='/etc/passwd'",
-            "white:x=1",
-            "",
-            "#ff",
-            "0xZZZZZZ",
-            "white@",
-            "white@1.2.3",
-            "white@nan",
-        ] {
-            assert!(!valid_color(bad), "{bad}");
-        }
     }
 
     #[test]
@@ -11797,11 +12966,13 @@ mod tests {
                 start: 1.5,
                 end: 3.0,
                 text: "first".into(),
+                ..Default::default()
             },
             TranscriptSegment {
                 start: 3.0,
                 end: 4.25,
                 text: "second".into(),
+                ..Default::default()
             },
         ]);
         assert!(srt.contains("1\n00:00:01,500 --> 00:00:03,000\nfirst"), "{srt}");
@@ -13250,6 +14421,7 @@ mod tests {
     fn the_master_runs_after_the_sum_and_before_loudnorm() {
         let (tl, assets) = master_cut(MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: 0.8,
             limiter: true,
             ceiling_db: -3.0,
@@ -13300,6 +14472,7 @@ mod tests {
         // every frame, only the picture changes.
         let (tl, assets) = master_cut(MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: 0.5,
             limiter: true,
             ceiling_db: -2.0,
@@ -13313,6 +14486,7 @@ mod tests {
     fn the_playback_stream_has_no_sound_for_the_master_to_touch() {
         let (tl, assets) = master_cut(MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: 0.5,
             limiter: true,
             ceiling_db: -1.0,
@@ -13327,11 +14501,12 @@ mod tests {
     fn master_filters_are_safe_for_a_file_that_never_went_through_the_op() {
         let bus = |volume, ceiling_db| MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume,
             limiter: true,
             ceiling_db,
         };
-        let filters = |bus| with_alimiter_latency(true, || master_filters(&bus));
+        let filters = |bus| with_alimiter_latency(true, || master_filters(&bus, 48_000));
         // Not a number: no fader, the default ceiling.
         assert_eq!(
             filters(bus(f64::NAN, f64::NAN)),
@@ -13350,6 +14525,127 @@ mod tests {
     }
 
     #[test]
+    fn a_true_peak_limiter_runs_oversampled_and_is_omitted_when_off() {
+        let (tl, assets) = master_cut(MasterBus {
+            limiter: true,
+            true_peak: true,
+            ..MasterBus::default()
+        });
+        let g = with_alimiter_latency(true, || mix_of(&tl, &assets, &ExportOptions::default()));
+        assert!(
+            g.contains(
+                "dropout_transition=0,aresample=192000,alimiter=limit=0.841395:attack=5:release=100:level=0:latency=1,aresample=48000[outa]"
+            ),
+            "{g}"
+        );
+        let opts = ExportOptions {
+            audio_sample_rate: Some(44_100),
+            ..ExportOptions::default()
+        };
+        let g = with_alimiter_latency(false, || mix_of(&tl, &assets, &opts));
+        assert!(
+            g.contains(",aresample=176400,alimiter=limit=0.841395:attack=5:release=100:level=0,aresample=44100[outa]"),
+            "{g}"
+        );
+
+        // Off, or with the limiter off, the graph is the sample-peak one / the neutral one.
+        let with = |master: MasterBus| {
+            let mut t = tl.clone();
+            t.master = master;
+            mix_of(&t, &assets, &ExportOptions::default())
+        };
+        let g = with(MasterBus {
+            limiter: true,
+            ..MasterBus::default()
+        });
+        assert!(!g.contains("aresample"), "{g}");
+        assert_eq!(
+            with(MasterBus {
+                true_peak: true,
+                ..MasterBus::default()
+            }),
+            with(MasterBus::default())
+        );
+    }
+
+    #[test]
+    fn static_loudness_applies_the_measured_gain_and_a_true_peak_limiter() {
+        let (tl, assets) = master_cut(MasterBus {
+            volume: 0.8,
+            ..MasterBus::default()
+        });
+        let opts = ExportOptions {
+            loudness: Some(LoudnessPreset::Apple),
+            loudness_static: true,
+            loudness_gain_db: Some(3.456),
+            ..ExportOptions::default()
+        };
+        let g = with_alimiter_latency(true, || mix_of(&tl, &assets, &opts));
+        // -1 dBTP less the margin, 4x oversampled; no loudnorm.
+        assert!(
+            g.contains(
+                "dropout_transition=0,volume=0.8,volume=3.46dB,aresample=192000,alimiter=limit=0.860994:attack=5:release=100:level=0:latency=1,aresample=48000[outa]"
+            ),
+            "{g}"
+        );
+        assert!(!g.contains("loudnorm"), "{g}");
+
+        // An unmeasured or negligible gain adds no `volume`; a wild one is clamped.
+        for (gain, volume) in [(None, None), (Some(0.001), None), (Some(80.0), Some("volume=30.00dB"))] {
+            let g = mix_of(
+                &tl,
+                &assets,
+                &ExportOptions {
+                    loudness_gain_db: gain,
+                    ..opts.clone()
+                },
+            );
+            assert_eq!(g.contains("dB,"), volume.is_some(), "{g}");
+            if let Some(v) = volume {
+                assert!(g.contains(v), "{g}");
+            }
+        }
+
+        // Without a target the flag changes nothing, and the dynamic path is the old one.
+        let plain = |static_: bool, loudness| {
+            mix_of(
+                &tl,
+                &assets,
+                &ExportOptions {
+                    loudness,
+                    loudness_static: static_,
+                    loudness_gain_db: Some(2.0),
+                    ..ExportOptions::default()
+                },
+            )
+        };
+        assert_eq!(plain(true, None), plain(false, None));
+        assert_eq!(
+            plain(false, Some(LoudnessPreset::Youtube)),
+            mix_of(
+                &tl,
+                &assets,
+                &ExportOptions {
+                    loudnorm: true,
+                    ..ExportOptions::default()
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn the_static_gain_is_the_distance_to_the_target_within_bounds() {
+        assert_eq!(levels::static_gain_db(LoudnessPreset::Youtube, Some(-20.0)), Some(6.0));
+        assert_eq!(levels::static_gain_db(LoudnessPreset::Broadcast, Some(-14.0)), Some(-9.0));
+        assert_eq!(
+            levels::static_gain_db(LoudnessPreset::Apple, Some(-60.0)),
+            Some(LOUDNESS_MAX_GAIN_DB)
+        );
+        assert_eq!(levels::static_gain_db(LoudnessPreset::Apple, None), None);
+        assert_eq!(levels::static_gain_db(LoudnessPreset::Apple, Some(f64::NEG_INFINITY)), None);
+    }
+
+    #[test]
     fn crossfade_extends_the_outgoing_tail_and_dissolves_the_incoming() {
         let asset = av_asset(Uuid::new_v4(), 20.0);
         let a = make_clip(asset.id, 0.0, 10.0, 0.0);
@@ -13363,6 +14659,60 @@ mod tests {
         assert!(g.contains("trim=start=0:end=11"), "{g}");
         // Incoming clip B fades up via alpha, from where it sits on the timeline.
         assert!(g.contains("fade=t=in:st=10:d=1:alpha=1"), "{g}");
+    }
+
+    #[test]
+    fn a_crossfade_is_constant_power_and_a_clip_fade_stays_linear() {
+        let (asset, other) = (av_asset(Uuid::new_v4(), 20.0), av_asset(Uuid::new_v4(), 20.0));
+        let both = [asset.clone(), other.clone()];
+        let a = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let mut b = make_clip(other.id, 0.0, 10.0, 10.0);
+        b.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 1.0,
+        });
+        let g = graph_of(&single(vec![a.clone(), b.clone()]), &both);
+        assert!(g.contains("afade=t=out:st=10:d=1:curve=qsin,"), "{g}");
+        assert!(g.contains("afade=t=in:st=0:d=1:curve=qsin,"), "{g}");
+
+        // A cut inside one take plays the same samples both sides: the linear pair keeps
+        // that correlated sound at unity. Elsewhere in the same take is two sounds again.
+        let mut same = b.clone();
+        same.asset_id = asset.id;
+        (same.source_in, same.source_out) = (10.0, 20.0);
+        let mut both_takes = vec![asset];
+        both_takes[0].duration = 40.0;
+        let g = graph_of(&single(vec![a.clone(), same.clone()]), &both_takes);
+        assert!(g.contains("afade=t=out:st=10:d=1,"), "{g}");
+        assert!(g.contains("afade=t=in:st=0:d=1,"), "{g}");
+        assert!(!g.contains("qsin"), "{g}");
+        (same.source_in, same.source_out) = (25.0, 35.0);
+        let g = graph_of(&single(vec![a.clone(), same]), &both_takes);
+        assert_eq!(g.matches("curve=qsin").count(), 2, "{g}");
+
+        // A dissolve up from black has no partner: a linear fade.
+        let g = graph_of(&single(vec![b.clone()]), &both);
+        assert!(g.contains("afade=t=in:st=0:d=1,"), "{g}");
+        assert!(!g.contains("qsin"), "{g}");
+
+        // A clip fade beside the transition keeps the one linear ramp it always had.
+        let (mut a2, mut b2) = (a.clone(), b.clone());
+        a2.fade_out = 0.5;
+        b2.fade_in = 0.25;
+        let g = graph_of(&single(vec![a2, b2]), &both);
+        assert!(g.contains("afade=t=out:st=9.5:d=1.5,"), "{g}");
+        assert!(g.contains("afade=t=in:st=0:d=1.25,"), "{g}");
+        assert!(!g.contains("qsin"), "{g}");
+
+        // A dip is not a crossfade: the sound dips through silence linearly.
+        let mut dip = b;
+        dip.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::DipToBlack,
+            duration: 1.0,
+        });
+        let g = graph_of(&single(vec![a, dip]), &both);
+        assert!(g.contains("afade=t=in:st=0:d=0.5,"), "{g}");
+        assert!(!g.contains("qsin"), "{g}");
     }
 
     #[test]
@@ -14747,6 +16097,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(contained.contains("force_original_aspect_ratio=decrease"));
         assert!(contained.contains("pad=1080:1920"), "contain letterboxes: {contained}");
@@ -14760,6 +16111,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(covered.contains("force_original_aspect_ratio=increase"));
         assert!(covered.contains("crop=1080:1920"), "cover crops: {covered}");
@@ -15310,7 +16662,7 @@ mod tests {
             .expect("run ffmpeg");
         assert!(ok.success(), "could not synthesize test media");
 
-        let map = salience_map(&media, 0.0, 3.0).expect("sample");
+        let map = salience_map_cancellable(&media, 0.0, 3.0, &|| false).expect("sample");
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!((map.cols, map.rows), (SALIENCE_COLS, SALIENCE_ROWS));
@@ -15876,6 +17228,7 @@ mod tests {
             64,
             None,
             &StillOutput::RgbPipe,
+            &|| false,
         )
         .expect("render the still");
         let _ = std::fs::remove_dir_all(&dir);
@@ -16708,6 +18061,7 @@ mod tests {
                     ..crate::model::Track::new(StreamKind::Video, "V1")
                 }],
                 overlays: Vec::new(),
+                svg_overlays: Vec::new(),
                 markers: Vec::new(),
                 format: None,
                 master: Default::default(),
@@ -16731,6 +18085,11 @@ mod tests {
         let untagged = probe_json(r#""width":1280,"height":720,"color_space":"unknown""#);
         assert_eq!(untagged.streams[0].color_space, None);
         assert_eq!(probe_json(r#""width":1280,"height":720"#).streams[0].color_space, None);
+        // `reserved` (a value no matrix has) and `unspecified` are read by FFmpeg as no tag at all.
+        for none in ["reserved", "unspecified", ""] {
+            let probed = probe_json(&format!(r#""width":1280,"height":720,"color_space":"{none}""#));
+            assert_eq!(probed.streams[0].color_space, None, "{none:?}");
+        }
     }
 
     #[test]
@@ -17145,13 +18504,14 @@ mod tests {
         assert_eq!((w, h), (360, 640), "the file is portrait, not a letterboxed landscape");
         assert_eq!(red_bar_edge(w, h, &rgb), want_edge, "and upright");
 
-        let jpeg = timeline_frame(
+        let jpeg = timeline_frame_cancellable(
             &timeline,
             std::slice::from_ref(&asset),
             &ExportOptions::default(),
             0.5,
             360,
             3,
+            &|| false,
         )
         .expect("composited still");
         let still = dir.join("still.jpg");
@@ -17633,7 +18993,7 @@ mod tests {
         assert!(pcm.as_chunks::<2>().0.iter().any(|b| i16::from_le_bytes(*b).abs() > 1000));
         let wave = waveform(&media, 50, 8_000).expect("waveform");
         assert!(wave.iter().copied().fold(0.0, f32::max) > 0.1);
-        let loud = super::super::audio::measure_loudness(&media).expect("loudness");
+        let loud = super::super::audio::measure_loudness_cancellable(&media, &|| false).expect("loudness");
         assert!(loud.integrated_lufs > -40.0, "{loud:?}");
 
         // Preview frames decode (with hardware decode attempted first).

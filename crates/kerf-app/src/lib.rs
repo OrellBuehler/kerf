@@ -13,41 +13,65 @@
 //! thread pool via [`blocking`], resolving inputs under the shared project lock
 //! and releasing it before the slow part.
 
+mod editor_context;
 mod gpu_preview;
 mod mcp;
+mod mcp_commands;
 mod popout;
+mod recovery;
 mod settings;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
-    ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, ImportSummary, Keyframe, Levels,
-    Mask, Project, Projection, Property, PropertyKey, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, Task,
-    TextKeyframe, TimeRange, Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
+    ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, Grade, ImportOutcome, ImportSummary,
+    Keyframe, Levels, Mask, MissingAsset, Page, Project, Projection, Property, PropertyKey, ReframeKeyframe, RelinkCheck,
+    Relinked, RemovedAsset, Revision, SplitSide, StagedEdit, StreamKind, SubsetApplied, SvgCheck, SvgLayout, SvgOverlayPatch,
+    SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, Task, TemplateControl, TemplateLibrary, TemplateList,
+    TemplateSaveRequest, TemplateSaved, TextKeyframe, TimeRange, Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect,
+    WaveformRange,
 };
+
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 struct AppState {
     project: Arc<Mutex<Project>>,
-    /// Set by `cancel_export` and polled by the in-flight export; lives outside
-    /// the project lock so a cancel lands even while a render holds it.
-    export_cancel: Arc<AtomicBool>,
+    /// The stops for the long jobs (`cancel_export` and the rest): lives outside the project
+    /// lock so a cancel lands even while a render holds it. Each is a [`StopEpoch`], so a stop
+    /// reaches every run of that job that began before it — the GUI's and an agent's alike — and
+    /// a run that begins after it starts clean; there is no flag to reset under a run about to
+    /// start, which is how a Stop used to be lost.
+    export_cancel: StopEpoch,
     /// Same, for the in-flight analysis pass. Analysis downloads a speech model
     /// and then transcribes for minutes, so it has to be abandonable — and the
     /// GUI runs imported assets through it one after another, which is a long
     /// commitment to make on the user's behalf without an exit.
-    analysis_cancel: Arc<AtomicBool>,
+    analysis_cancel: StopEpoch,
     /// Same, for the Mixer's loudness measurement. It holds the heavy-job lease for
     /// a whole-mix decode (minutes on a long cut), so it has to be stoppable.
-    levels_cancel: Arc<AtomicBool>,
+    levels_cancel: StopEpoch,
+    /// Same, for the sync by audio (`cancel_audio_sync`).
+    sync_cancel: StopEpoch,
+    /// The last sync measured and the decode it measured, so "Move anyway" applies that
+    /// answer instead of decoding the same sound again.
+    last_sync: Arc<Mutex<Option<(kerf_core::AudioSyncPlan, kerf_core::AudioSyncMeasure)>>>,
     /// Same, for a voiceover being synthesized (or its model downloading).
-    voiceover_cancel: Arc<AtomicBool>,
-    stems_cancel: Arc<AtomicBool>,
+    voiceover_cancel: StopEpoch,
+    stems_cancel: StopEpoch,
+    /// Same, for a speech model being downloaded (`cancel_model_download`).
+    model_cancel: StopEpoch,
+    /// Same, for a cover frame being written (`cancel_cover_export`).
+    cover_cancel: StopEpoch,
+    /// Same, for the shots a smart crop is sampling (`cancel_smart_crop`).
+    smart_crop_cancel: StopEpoch,
+    /// Imports run side by side, so their stop (`cancel_import`) is a count rather than a
+    /// flag: it ends every import that began before it and none that begin after.
+    import_stop: StopEpoch,
     /// Whether the main window has been shown. It is created hidden (`visible:
     /// false` in `tauri.conf.json`) so nobody sees the webview's unthemed first
     /// frame; the webview asks for it once the theme is applied
@@ -72,9 +96,158 @@ struct AssetMetadata {
 
 type CmdResult<T> = Result<T, String>;
 
+/// A stop request for jobs that run side by side (several imports at once): [`StopEpoch::stop`]
+/// reaches every job that began before it and none that begin after, so a stop never has to be
+/// "reset" under a job about to start, and one press ends the whole batch.
+#[derive(Clone, Default)]
+struct StopEpoch(Arc<AtomicU64>);
+
+impl StopEpoch {
+    /// Note now as a job's start; the closure says whether a stop has come since.
+    fn begin(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        let (epoch, began) = (self.0.clone(), self.0.load(Ordering::SeqCst));
+        move || epoch.load(Ordering::SeqCst) != began
+    }
+
+    fn stop(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A question that is expensive to ask (it takes the project lock), put to a poll that runs fifty
+/// times a second: asked again only once `every` has passed, and once it has been answered `true`
+/// it stays `true`.
+pub(crate) struct Throttled<F: Fn() -> bool> {
+    ask: F,
+    every: std::time::Duration,
+    asked_at: std::cell::Cell<Option<std::time::Instant>>,
+    answer: std::cell::Cell<bool>,
+}
+
+impl<F: Fn() -> bool> Throttled<F> {
+    pub(crate) fn new(every: std::time::Duration, ask: F) -> Self {
+        Self {
+            ask,
+            every,
+            asked_at: std::cell::Cell::new(None),
+            answer: std::cell::Cell::new(false),
+        }
+    }
+
+    pub(crate) fn ask(&self) -> bool {
+        if self.answer.get() {
+            return true;
+        }
+        if self.asked_at.get().is_some_and(|at| at.elapsed() < self.every) {
+            return false;
+        }
+        self.asked_at.set(Some(std::time::Instant::now()));
+        self.answer.set((self.ask)());
+        self.answer.get()
+    }
+}
+
+/// The stop for a long job begun under project `generation`: `cancel`, or the project having been
+/// replaced since (an open or a new project) — a result for a project nobody has open is dropped on
+/// arrival, so the ffmpeg still working towards it is not left running. The generation is read
+/// under the lock at most twice a second; the closure is polled from the job's own thread.
+pub(crate) fn stop_or_replaced<'a>(
+    cancel: impl Fn() -> bool + 'a,
+    shared: &'a Mutex<Project>,
+    generation: u64,
+) -> impl Fn() -> bool + 'a {
+    let replaced = Throttled::new(std::time::Duration::from_millis(500), move || {
+        lock_user(shared).generation() != generation
+    });
+    move || cancel() || replaced.ask()
+}
+
+/// Fail a job whose project was swapped out (an open or a new project) while its lock was
+/// released: what it made belongs to a project that is no longer the open one. `noted` is
+/// [`Project::generation`] as read under the lock the job resolved its inputs with.
+pub(crate) fn require_generation(project: &Project, noted: u64, doing: &str) -> CmdResult<()> {
+    if project.generation() == noted {
+        Ok(())
+    } else {
+        Err(format!("the project was replaced while {doing}; the result was dropped"))
+    }
+}
+
 impl AppState {
+    fn new(
+        project: Arc<Mutex<Project>>,
+        main_window_shown: Arc<AtomicBool>,
+        launch: LaunchSlot,
+        scrub: Arc<kerf_core::ScrubFrames>,
+    ) -> Self {
+        Self {
+            project,
+            export_cancel: StopEpoch::default(),
+            analysis_cancel: StopEpoch::default(),
+            levels_cancel: StopEpoch::default(),
+            sync_cancel: StopEpoch::default(),
+            last_sync: Arc::new(Mutex::new(None)),
+            voiceover_cancel: StopEpoch::default(),
+            stems_cancel: StopEpoch::default(),
+            model_cancel: StopEpoch::default(),
+            cover_cancel: StopEpoch::default(),
+            smart_crop_cancel: StopEpoch::default(),
+            import_stop: StopEpoch::default(),
+            main_window_shown,
+            launch: Mutex::new(launch),
+            scrub,
+        }
+    }
+
     fn project(&self) -> std::sync::MutexGuard<'_, Project> {
         lock_user(&self.project)
+    }
+
+    /// An analysis run is starting: hand back what says whether `cancel_analysis` has been pressed
+    /// since, for the run to poll. The GUI's `analyze_asset` does this; the MCP `analyze_asset`
+    /// takes it the same way and combines it with its own cancellation, so the GUI's Stop ends an
+    /// agent's analysis too — and a Stop pressed just before another run starts is not undone by it.
+    pub(crate) fn begin_analysis(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        self.analysis_cancel.begin()
+    }
+
+    /// A speech-model download is starting; the closure says whether `cancel_model_download` has
+    /// been pressed since. The GUI's download and an agent's alike take one.
+    pub(crate) fn begin_model_download(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        self.model_cancel.begin()
+    }
+
+    /// A cover frame is being written; the closure says whether `cancel_cover_export` has been
+    /// pressed since. The GUI's export and an agent's alike take one.
+    pub(crate) fn begin_cover_export(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        self.cover_cancel.begin()
+    }
+
+    /// An import is starting; the closure says whether `cancel_import` has been pressed since.
+    pub(crate) fn begin_import(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        self.import_stop.begin()
+    }
+
+    /// A voiceover is being synthesized; the closure says whether `cancel_voiceover` has been pressed
+    /// since. The GUI's voiceover dialog and an agent's `generate_voiceover` take one alike.
+    pub(crate) fn begin_voiceover(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        self.voiceover_cancel.begin()
+    }
+
+    /// A stem separation is starting; the closure says whether `cancel_stems` has been pressed since.
+    pub(crate) fn begin_stems(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        self.stems_cancel.begin()
+    }
+
+    /// A smart crop is sampling; the closure says whether `cancel_smart_crop` has been pressed since.
+    pub(crate) fn begin_smart_crop(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        self.smart_crop_cancel.begin()
+    }
+
+    /// A render is starting (a single export or a multi-format one); the closure says whether
+    /// `cancel_export` has been pressed since.
+    pub(crate) fn begin_export(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        self.export_cancel.begin()
     }
 }
 
@@ -83,7 +256,7 @@ impl AppState {
 /// (see `mcp::KerfMcp::lock`). Recovers from a poisoned mutex (a panic while
 /// another op held it) rather than failing every command for the rest of the
 /// session.
-fn lock_user(project: &Mutex<Project>) -> std::sync::MutexGuard<'_, Project> {
+pub(crate) fn lock_user(project: &Mutex<Project>) -> std::sync::MutexGuard<'_, Project> {
     let mut guard = project.lock().unwrap_or_else(|e| e.into_inner());
     guard.set_actor(EditSource::User);
     guard
@@ -97,8 +270,23 @@ async fn blocking<T: Send + 'static>(job: impl FnOnce() -> CmdResult<T> + Send +
     tauri::async_runtime::spawn_blocking(job).await.map_err(|e| e.to_string())?
 }
 
-fn id(s: &str) -> CmdResult<Uuid> {
-    Uuid::parse_str(s).map_err(|e| e.to_string())
+/// Parse the id a command was handed, naming the argument in the error: a bare "invalid
+/// character" says nothing about which of a command's several ids was wrong.
+fn id(s: &str, arg: &str) -> CmdResult<Uuid> {
+    Uuid::parse_str(s).map_err(|e| {
+        let shown: String = s.chars().take(64).collect();
+        format!("invalid {arg} {shown:?}: not an id ({e})")
+    })
+}
+
+/// [`id`] for an argument that may be left out.
+fn opt_id(s: Option<&str>, arg: &str) -> CmdResult<Option<Uuid>> {
+    s.map(|s| id(s, arg)).transpose()
+}
+
+/// [`id`] for a list of ids; the error names the entry (`clip_ids[2]`).
+fn ids(list: &[String], arg: &str) -> CmdResult<Vec<Uuid>> {
+    list.iter().enumerate().map(|(i, s)| id(s, &format!("{arg}[{i}]"))).collect()
 }
 
 fn kind(s: &str) -> CmdResult<StreamKind> {
@@ -126,6 +314,30 @@ fn parse_transition(kind: Option<String>, duration: Option<f64>) -> CmdResult<Op
     }
 }
 
+/// Kerf's own directories an output must never be written into: the settings (which hold the agent
+/// token) and their backups, and the logs. Filled once at startup ([`set_app_dirs`]).
+static APP_DIRS: std::sync::OnceLock<Vec<(std::path::PathBuf, String)>> = std::sync::OnceLock::new();
+
+fn set_app_dirs(app: &AppHandle) {
+    let mut dirs = Vec::new();
+    if let Ok(config) = app.path().app_config_dir() {
+        dirs.push((config, "Kerf's settings".to_string()));
+    }
+    if let Ok(logs) = log_dir_path(app) {
+        dirs.push((logs, "Kerf's logs".to_string()));
+    }
+    let _ = crate::APP_DIRS.set(dirs);
+}
+
+/// `output` against what the project protects (a source, a capture, a proxy, the project's own file,
+/// the cache) **and Kerf's own settings and logs**: the checks every export, cover, subtitle file and
+/// Save As make, with the lock released (this canonicalises and stats).
+pub(crate) fn check_output(output: &std::path::Path, protected: &kerf_core::paths::Protected) -> kerf_core::Result<()> {
+    let mut all = protected.clone();
+    all.dirs.extend(APP_DIRS.get().into_iter().flatten().cloned());
+    Project::check_output_path_with(output, &all)
+}
+
 /// Reject a caller-supplied output path that names an ffmpeg protocol sink
 /// (`rtmp://…`, `http://…`, `pipe:1`, `concat:a|b`, …) instead of a plain
 /// local file, and require it be absolute. ffmpeg resolves the protocol (and
@@ -137,7 +349,82 @@ fn parse_transition(kind: Option<String>, duration: Option<f64>) -> CmdResult<Op
 /// A single ASCII letter immediately before a `:` that is followed by `\` or
 /// `/` is a Windows drive letter (`C:\Users\...`), not a protocol scheme —
 /// ffmpeg itself special-cases this the same way, so it is let through.
+///
+/// A **network path** is refused for a path an agent supplies (`\\host\share\out.mp4` and the
+/// mixed forms Windows reads the same way, `\\?\UNC\…`): opening one makes the machine
+/// authenticate to whatever host the string names, and a render may not be sent off the machine
+/// this way. Only the verbatim form of a local drive (`\\?\C:\...`) starts with two separators and
+/// is let through. `//host/share` is a network path **on Windows only**: on macOS and Linux
+/// `//tmp/out.mp4` is `/tmp/out.mp4`. The device namespace (`\\.\pipe\…`) is never an output.
 pub(crate) fn require_local_output_path(path: &str) -> Result<(), String> {
+    check_output_path(path, PathSource::Agent, cfg!(windows))
+}
+
+/// [`require_local_output_path`] for a path the user picked in Kerf's own save dialog: a network
+/// share they chose (`\\nas\share\out.mp4`) is their intent, so on Windows a UNC path passes. URLs,
+/// protocol sinks, relative paths and the device namespace are refused all the same.
+pub(crate) fn require_user_output_path(path: &str) -> Result<(), String> {
+    check_output_path(path, PathSource::User, cfg!(windows))
+}
+
+/// Who named a path: the user, in a dialog, or an agent, in a tool call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathSource {
+    User,
+    Agent,
+}
+
+/// `\\?\C:\`: the verbatim spelling of a drive, which is local.
+fn is_verbatim_drive(bytes: &[u8]) -> bool {
+    let separator = |at: usize| bytes.get(at).is_some_and(|b| matches!(b, b'\\' | b'/'));
+    separator(0)
+        && separator(1)
+        && bytes.get(2) == Some(&b'?')
+        && separator(3)
+        && bytes.get(4).is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(5) == Some(&b':')
+        && separator(6)
+}
+
+/// Whether `path` names a network share or the device namespace: `Some(true)` for a device
+/// (`\\.\pipe\…`, `\\?\GLOBALROOT\…`), `Some(false)` for a UNC path (`\\host\share`, `\\?\UNC\…`,
+/// and `//host/share` on Windows). `//host/share` is an ordinary absolute path elsewhere; the
+/// verbatim spelling of a local drive is local.
+fn network_path(path: &str, windows: bool) -> Option<bool> {
+    let bytes = path.as_bytes();
+    let separator = |at: usize| bytes.get(at).is_some_and(|b| matches!(b, b'\\' | b'/'));
+    if !(separator(0) && separator(1)) || is_verbatim_drive(bytes) {
+        return None;
+    }
+    let backslashed = bytes[0] == b'\\' || bytes[1] == b'\\';
+    if !(backslashed || windows) {
+        return None;
+    }
+    let normal = path.replace('\\', "/");
+    Some(normal.starts_with("//./") || (normal.starts_with("//?/") && !normal[4..].to_ascii_uppercase().starts_with("UNC/")))
+}
+
+/// [`require_local_output_path`] for a file an agent asks Kerf to read: opening a network path makes
+/// the machine authenticate to whatever host the string names, so UNC and device-namespace paths
+/// are refused **before any filesystem call**, on every surface an agent names a file through.
+pub(crate) fn require_local_input_path(path: &str) -> Result<(), String> {
+    check_input_path(path, cfg!(windows))
+}
+
+/// The rule of [`require_local_input_path`], with the platform a parameter so every spelling is
+/// tested everywhere.
+pub(crate) fn check_input_path(path: &str, windows: bool) -> Result<(), String> {
+    match network_path(path, windows) {
+        Some(_) => Err(format!(
+            "{path:?} is a network (UNC) or device path; copy the file to a local drive and import it from there"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The rules of [`require_local_output_path`] and [`require_user_output_path`], with the platform
+/// a parameter so every spelling is tested everywhere.
+pub(crate) fn check_output_path(path: &str, source: PathSource, windows: bool) -> Result<(), String> {
     if let Some(colon) = path.find(':') {
         let scheme = &path[..colon];
         let after = &path[colon + 1..];
@@ -154,10 +441,20 @@ pub(crate) fn require_local_output_path(path: &str) -> Result<(), String> {
             ));
         }
     }
+    if let Some(device) = network_path(path, windows) {
+        if device || source == PathSource::Agent || !windows {
+            return Err(format!(
+                "output path {path:?} is a network (UNC) or device path; save to a local drive instead"
+            ));
+        }
+        // A share the user chose in the save dialog.
+        return Ok(());
+    }
     let bytes = path.as_bytes();
+    let verbatim_drive = is_verbatim_drive(bytes);
     let is_windows_absolute =
         bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/');
-    if !(path.starts_with('/') || path.starts_with("\\\\") || is_windows_absolute) {
+    if !(path.starts_with('/') || verbatim_drive || is_windows_absolute) {
         return Err(format!("output path {path:?} must be an absolute local file path"));
     }
     Ok(())
@@ -172,9 +469,10 @@ fn list_assets(state: State<'_, AppState>) -> CmdResult<Vec<Asset>> {
 
 /// Distinct family names of every font installed on this machine, for the
 /// text overlay font picker.
-#[tauri::command(async)]
-fn list_fonts() -> CmdResult<Vec<String>> {
-    Ok(kerf_core::list_system_fonts())
+#[tauri::command]
+async fn list_fonts() -> CmdResult<Vec<String>> {
+    // The first call reads every font file's name table: seconds on a machine with hundreds.
+    blocking(|| Ok(kerf_core::list_system_fonts())).await
 }
 
 #[tauri::command(async)]
@@ -184,11 +482,139 @@ fn get_timeline(state: State<'_, AppState>) -> CmdResult<Timeline> {
 
 #[tauri::command(async)]
 fn get_asset_metadata(state: State<'_, AppState>, asset_id: String) -> CmdResult<AssetMetadata> {
-    let id = id(&asset_id)?;
+    let id = id(&asset_id, "asset_id")?;
     let project = state.project();
     let asset = project.require_asset(id).map_err(|e| e.to_string())?;
     let analysis = project.get_analysis(id).map_err(|e| e.to_string())?;
     Ok(AssetMetadata { asset, analysis })
+}
+
+// ---- library (remove / relink / missing media) ----------------------------
+
+/// What removing an asset did: the asset as it was, how many clips went with it (`force`
+/// only) and the refreshed cut.
+#[derive(Serialize)]
+struct AssetRemoval {
+    #[serde(flatten)]
+    removed: RemovedAsset,
+    timeline: Timeline,
+}
+
+/// Take an asset out of the library. Refused while a clip of the cut (or of an open proposal)
+/// uses it, unless `force`, which first removes those clips as one `Remove media` revision.
+/// Its analysis goes with it; its proxies and waveform cache are cleaned up with the lock
+/// released.
+#[tauri::command]
+async fn remove_asset(state: State<'_, AppState>, asset_id: String, force: Option<bool>) -> CmdResult<AssetRemoval> {
+    let asset_id = id(&asset_id, "asset_id")?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let (removed, timeline) = {
+            let project = lock_user(&shared);
+            let removed = project
+                .remove_asset(asset_id, force.unwrap_or(false))
+                .map_err(|e| e.to_string())?;
+            (removed, project.timeline().map_err(|e| e.to_string())?)
+        };
+        // The disk, with the lock released: the proxies (and any build of them) and the waveform.
+        kerf_core::proxy::delete(&removed.asset);
+        Project::forget_media_caches(std::path::Path::new(&removed.asset.path));
+        Ok(AssetRemoval { removed, timeline })
+    })
+    .await
+}
+
+/// The error an abandoned relink returns, for the webview to stay quiet on.
+const RELINK_CANCELLED: &str = "relink cancelled";
+
+/// Point an asset at another file: the media was moved, renamed or restored from a backup.
+/// The new file is probed, and compared with the old one's bytes, with the lock released
+/// (`relink_inputs` → `probe_relink` → `apply_relink_probed`); it must be the same kind of media
+/// (same streams, about the same length). The asset keeps its id, its place in the library and
+/// every clip cut from it, and its analysis is kept only when the file is the old media moved.
+/// Refused for an agent, as removing media is.
+#[tauri::command]
+async fn relink_asset(app: AppHandle, state: State<'_, AppState>, asset_id: String, new_path: String) -> CmdResult<Relinked> {
+    let asset_id = id(&asset_id, "asset_id")?;
+    let shared = state.project.clone();
+    let scrub = state.scrub.clone();
+    // The probe reads both files; `cancel_import` stops it like it stops an import's.
+    let cancelled = state.import_stop.begin();
+    blocking(move || {
+        let (old, generation) = {
+            let project = lock_user(&shared);
+            (
+                project.relink_inputs(asset_id).map_err(|e| e.to_string())?,
+                project.generation(),
+            )
+        };
+        let probe = Project::probe_relink(&old, std::path::Path::new(&new_path), &cancelled).map_err(|e| match e {
+            kerf_core::Error::Cancelled => RELINK_CANCELLED.to_string(),
+            other => other.to_string(),
+        })?;
+        let relinked = {
+            let project = lock_user(&shared);
+            require_generation(&project, generation, "relinking")?;
+            project.apply_relink_probed(asset_id, &probe).map_err(|e| e.to_string())?
+        };
+        if relinked.previous_path != relinked.asset.path {
+            Project::forget_media_caches(std::path::Path::new(&relinked.previous_path));
+        }
+        // Frames drawn from the old file are of no use, and the new one wants its proxy.
+        scrub.clear();
+        spawn_proxy(&app, &relinked.asset);
+        let _ = app.emit("proxy-ready", ());
+        Ok(relinked)
+    })
+    .await
+}
+
+/// What a relink to `new_path` would cost, asked before it is made: the same probe and the same
+/// refusals as `relink_asset` (the lock released while both files are read), and nothing is
+/// changed. `analysis_kept` says whether the file is the old media moved; `has_analysis` whether
+/// the asset has any analysis to lose, so the prompt stays quiet when a different file costs nothing.
+#[tauri::command]
+async fn check_relink(state: State<'_, AppState>, asset_id: String, new_path: String) -> CmdResult<RelinkCheck> {
+    let asset_id = id(&asset_id, "asset_id")?;
+    let shared = state.project.clone();
+    let cancelled = state.import_stop.begin();
+    blocking(move || {
+        let (old, has_analysis) = {
+            let project = lock_user(&shared);
+            (
+                project.relink_inputs(asset_id).map_err(|e| e.to_string())?,
+                project.has_analysis(asset_id).map_err(|e| e.to_string())?,
+            )
+        };
+        Project::check_relink(&old, has_analysis, std::path::Path::new(&new_path), &cancelled).map_err(|e| match e {
+            kerf_core::Error::Cancelled => RELINK_CANCELLED.to_string(),
+            other => other.to_string(),
+        })
+    })
+    .await
+}
+
+/// The assets whose source file is no longer on disk, each with how many clips of the cut use
+/// it: what a "relink media" prompt lists. The files are asked about with the project lock
+/// released (a share that has gone away can take a long time to say so).
+#[tauri::command]
+async fn missing_assets(state: State<'_, AppState>) -> CmdResult<Vec<MissingAsset>> {
+    let shared = state.project.clone();
+    blocking(move || {
+        let files = lock_user(&shared).missing_assets_inputs().map_err(|e| e.to_string())?;
+        Ok(Project::find_missing_assets(files))
+    })
+    .await
+}
+
+/// Which of `paths` exist, in order: the export dialog asks before it overwrites a file.
+/// Stats on the blocking pool; at most 256 paths.
+#[tauri::command]
+async fn paths_exist(paths: Vec<String>) -> CmdResult<Vec<bool>> {
+    if paths.len() > 256 {
+        return Err(format!("{} paths is too many to check at once (256 at most)", paths.len()));
+    }
+    blocking(move || Ok(paths.iter().map(|p| std::path::Path::new(p).exists()).collect())).await
 }
 
 // ---- project file (open / save) --------------------------------------------
@@ -200,59 +626,113 @@ fn project_path(state: State<'_, AppState>) -> CmdResult<Option<String>> {
     Ok(state.project().path().map(|p| p.display().to_string()))
 }
 
-/// Replace the open project with a fresh, empty in-memory one (no sample data).
-/// Like the seeded sample it isn't persisted until `save_project_as`. The GUI and
-/// the embedded MCP server share this `Project`, so both switch to it.
-#[tauri::command(async)]
-fn new_project(state: State<'_, AppState>) -> CmdResult<Option<String>> {
-    let mut project = state.project();
-    project.replace_with(Project::open_in_memory().map_err(|e| e.to_string())?);
-    state.scrub.clear();
-    Ok(project.path().map(|p| p.display().to_string()))
-}
-
-/// Open an existing `.kerf` file, replacing the in-memory project. Both the GUI
-/// and the embedded MCP server share this `Project`, so both now operate on —
-/// and persist to — the opened file. Returns its path.
+/// Replace the open project with a fresh, empty untitled one (no sample data), backed by a
+/// crash-recovery file (`recovery.rs`) but not saved until `save_project_as`. The GUI and the
+/// embedded MCP server share this `Project`, so both switch to it.
 #[tauri::command]
-async fn open_project(app: AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<Option<String>> {
+async fn new_project(app: AppHandle, state: State<'_, AppState>) -> CmdResult<Option<String>> {
     let shared = state.project.clone();
     let scrub = state.scrub.clone();
     blocking(move || {
-        // Open the file first, then swap it in — the (disk-bound) open doesn't
-        // hold the shared lock, and a failed open leaves the current project intact.
-        let opened = Project::open(&path).map_err(|e| e.to_string())?;
+        let fresh = recovery::untitled(&app)?;
         let mut project = lock_user(&shared);
-        project.replace_with(opened);
-        let result = project.path().map(|p| p.display().to_string());
+        let old = project.replace_with(fresh);
+        let path = project.path().map(|p| p.display().to_string());
         drop(project);
-        // The frames of the project that was open are of no use to this one.
+        old.close();
         scrub.clear();
-        // The speech model is remembered per project, so transcribing in the
-        // reopened one uses the model it was cut with.
+        // The speech model is remembered per project and a new one remembers none, so
+        // transcribing in it uses the default, not the model the project before it chose.
         restore_speech_model(&shared);
-        // Make sure every video asset in the reopened project has a preview proxy (a cached one
-        // is skipped; a missing one is built in the background). One ffprobe per asset keys the
-        // proxy, so it is all off this thread: the open must not wait for N probes — a project
-        // of eighty clips on a network drive would otherwise sit there for seconds.
-        respawn_proxies(&app);
-        Ok(result)
+        // A project with no file is nothing for a launch to reopen.
+        note_open(&app, None);
+        Ok(path)
     })
     .await
 }
 
-/// Everything an edit can change while `save_project_as` has the lock released:
-/// the cut, the media, the task queue and a staged proposal. Content rather than
-/// the revision seq, which an undo followed by a new edit recycles.
-fn project_fingerprint(project: &Project) -> CmdResult<String> {
-    let err = |e: kerf_core::Error| e.to_string();
-    serde_json::to_string(&(
-        project.timeline().map_err(err)?,
-        project.list_assets().map_err(err)?,
-        project.list_tasks().map_err(err)?,
-        project.staged().map_err(err)?,
-    ))
-    .map_err(|e| e.to_string())
+/// Open an existing `.kerf` file, replacing the in-memory project. Both the GUI
+/// and the embedded MCP server share this `Project`, so both now operate on —
+/// and persist to — the opened file. Returns its path. A path that names nothing is
+/// an error: `Project::open` would create it.
+#[tauri::command]
+async fn open_project(app: AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<Option<String>> {
+    let shared = state.project.clone();
+    let scrub = state.scrub.clone();
+    blocking(move || open_project_at(&app, &shared, &scrub, &path)).await
+}
+
+/// The open itself, for `open_project` and `open_recent`.
+fn open_project_at(
+    app: &AppHandle,
+    shared: &Mutex<Project>,
+    scrub: &kerf_core::ScrubFrames,
+    path: &str,
+) -> CmdResult<Option<String>> {
+    if !std::path::Path::new(path).is_file() {
+        return Err(format!("{path} does not exist"));
+    }
+    // Open the file first, then swap it in — the (disk-bound) open doesn't
+    // hold the shared lock, and a failed open leaves the current project intact.
+    let opened = Project::open(path).map_err(|e| e.to_string())?;
+    let mut project = lock_user(shared);
+    let old = project.replace_with(opened);
+    let result = project.path().map(|p| p.display().to_string());
+    drop(project);
+    // An untitled project's recovery directory goes with it: it was let go (or just saved).
+    old.close();
+    // The frames of the project that was open are of no use to this one.
+    scrub.clear();
+    // The speech model is remembered per project, so transcribing in the
+    // reopened one uses the model it was cut with.
+    restore_speech_model(shared);
+    // Make sure every video asset in the reopened project has a preview proxy (a cached one
+    // is skipped; a missing one is built in the background). One ffprobe per asset keys the
+    // proxy, so it is all off this thread: the open must not wait for N probes — a project
+    // of eighty clips on a network drive would otherwise sit there for seconds.
+    respawn_proxies(app);
+    note_open(app, result.as_deref());
+    Ok(result)
+}
+
+/// Remember which project is open now: `Some(path)` goes to the front of the recent list and is
+/// the one a launch with "reopen the last project" opens; `None` is a new project with no file,
+/// which leaves nothing to reopen. Used by every way a project becomes the open one, the MCP
+/// server's included. A list that cannot be written is not worth failing the open for; touches
+/// the disk, so call it off the main thread.
+pub(crate) fn note_open(app: &AppHandle, path: Option<&str>) {
+    if let Err(e) = settings::record_open(app, path) {
+        tracing::warn!(error = %e, "could not record the open project");
+    }
+}
+
+/// The projects opened or saved most recently, newest first (at most 10), the ones whose
+/// file is gone dropped and forgotten.
+#[tauri::command]
+async fn recent_projects(app: AppHandle) -> CmdResult<Vec<String>> {
+    blocking(move || settings::recent(&app)).await
+}
+
+/// Open one of the recent projects. A file that has since gone is not opened (and not
+/// created, as `Project::open` would): the entry is dropped from the list and the error says so.
+#[tauri::command]
+async fn open_recent(app: AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<Option<String>> {
+    let shared = state.project.clone();
+    let scrub = state.scrub.clone();
+    blocking(move || {
+        if !std::path::Path::new(&path).is_file() {
+            let _ = settings::recent(&app);
+            return Err(format!("{path} no longer exists; it was removed from the recent projects"));
+        }
+        open_project_at(&app, &shared, &scrub, &path)
+    })
+    .await
+}
+
+/// Forget every recent project.
+#[tauri::command]
+async fn clear_recent_projects(app: AppHandle) -> CmdResult<()> {
+    blocking(move || settings::clear_recent(&app).map(|_| ())).await
 }
 
 /// Snapshot the current project to a new `.kerf` file and switch to it, so
@@ -261,29 +741,52 @@ fn project_fingerprint(project: &Project) -> CmdResult<String> {
 ///
 /// The reopen runs with the lock released, like `open_project`, so a slow
 /// filesystem doesn't freeze the GUI and every MCP call. An edit landing in that
-/// window would be on the old project, so the reopened one is only swapped in
-/// if nothing changed; otherwise the save is redone under one held lock.
+/// window would be on the old project, so the reopened one is only swapped in if the
+/// project has not written anything since (`Project::change_count`, which also counts the
+/// analysis a background job merged, the ripple flag and the other rows an edit-only
+/// fingerprint missed); otherwise the save is redone under one held lock. A project that
+/// was replaced meanwhile (`Project::generation`) is not switched to at all, and the swap itself
+/// (`Project::replace_with_saved_copy`) keeps the generation: it is the same project in another
+/// file, so an analysis, import or voiceover in flight still lands.
 #[tauri::command]
-async fn save_project_as(state: State<'_, AppState>, path: String) -> CmdResult<Option<String>> {
+async fn save_project_as(app: AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<Option<String>> {
     let shared = state.project.clone();
     blocking(move || {
-        let before = {
+        // Onto the file that is open already there is nothing to do (every edit is written through).
+        let open = lock_user(&shared).path().map(std::path::Path::to_path_buf);
+        if open.is_some_and(|open| kerf_core::paths::same_file(&open, std::path::Path::new(&path))) {
+            note_open(&app, Some(&path));
+            return Ok(Some(path));
+        }
+        // Not onto a file the project or Kerf itself needs (a source, a proxy, the settings): the
+        // lock is held only to read what those are.
+        let protected = lock_user(&shared).output_path_inputs().map_err(|e| e.to_string())?;
+        check_output(std::path::Path::new(&path), &protected).map_err(|e| e.to_string())?;
+        let (generation, changes) = {
             let project = lock_user(&shared);
             project.save_as(&path).map_err(|e| e.to_string())?;
-            project_fingerprint(&project)?
+            (project.generation(), project.change_count())
         };
         let opened = Project::open(&path).map_err(|e| e.to_string())?;
         let mut project = lock_user(&shared);
-        if project_fingerprint(&project)? == before {
-            project.replace_with(opened);
+        require_generation(&project, generation, "it was being saved")?;
+        // The copy is the same project in another file, so jobs in flight (an analysis, an import, a
+        // voiceover) still land: the swap keeps the generation.
+        let old = if project.change_count() == changes {
+            project.replace_with_saved_copy(opened)
         } else {
-            // Close the stale copy first: `save_as` deletes the file it replaces,
+            // Close the stale copy first: `save_as` renames over the file it replaces,
             // which Windows refuses while it is open.
             drop(opened);
             project.save_as(&path).map_err(|e| e.to_string())?;
-            project.replace_with(Project::open(&path).map_err(|e| e.to_string())?);
-        }
-        Ok(project.path().map(|p| p.display().to_string()))
+            project.replace_with_saved_copy(Project::open(&path).map_err(|e| e.to_string())?)
+        };
+        let result = project.path().map(|p| p.display().to_string());
+        drop(project);
+        // The untitled project it was (and its recovery directory) is saved now: the directory goes.
+        old.close();
+        note_open(&app, result.as_deref());
+        Ok(result)
     })
     .await
 }
@@ -314,26 +817,48 @@ impl ImportProgress {
     }
 }
 
+/// The error an abandoned import returns, for the webview to stay quiet on.
+const IMPORT_CANCELLED: &str = "import cancelled";
+
+/// Add a media file to the library. An Insta360 lens pair is stitched first, which takes
+/// minutes: that streams `import-progress` and `cancel_import` ends it (and every other import
+/// under way), rejecting with `"import cancelled"` and leaving no half-written stitch.
 #[tauri::command]
 async fn import_asset(app: AppHandle, state: State<'_, AppState>, path: String) -> CmdResult<Asset> {
     let shared = state.project.clone();
+    let cancelled = state.import_stop.begin();
     blocking(move || {
+        let generation = lock_user(&shared).generation();
         // Probe (and, for an Insta360 lens pair, stitch) without the lock — so
         // parallel imports really run in parallel and a multi-minute stitch never
         // freezes the GUI or the agent — then take it only for the quick insert.
         let mut on_progress = |p: kerf_core::ExportProgress| {
             let _ = app.emit("import-progress", ImportProgress::new(&path, p));
         };
-        let asset = Project::probe_import(std::path::Path::new(&path), &mut on_progress).map_err(|e| e.to_string())?;
+        let asset =
+            Project::probe_import_with(std::path::Path::new(&path), &mut on_progress, &cancelled).map_err(|e| match e {
+                kerf_core::Error::Cancelled => IMPORT_CANCELLED.to_string(),
+                other => other.to_string(),
+            })?;
         // Importing the pair's other lens (or the same file twice) resolves to
         // the asset already in the project instead of duplicating it.
-        let asset = lock_user(&shared).insert_or_get_asset(&asset).map_err(|e| e.to_string())?;
+        let asset = {
+            let project = lock_user(&shared);
+            require_generation(&project, generation, "importing")?;
+            project.insert_or_get_asset(&asset).map_err(|e| e.to_string())?
+        };
         // Kick off the preview proxy in the background; preview uses the original
         // until it lands (see `spawn_proxy`).
         spawn_proxy(&app, &asset);
         Ok(asset)
     })
     .await
+}
+
+/// Stop every import in flight (a stitch is the one that takes long enough to stop).
+#[tauri::command(async)]
+fn cancel_import(state: State<'_, AppState>) {
+    state.import_stop.stop();
 }
 
 /// What the webview is told about an asset's proxy: the `proxy-progress` event, on every
@@ -382,11 +907,21 @@ pub(crate) fn spawn_proxy(app: &AppHandle, asset: &Asset) {
 fn respawn_proxies(app: &AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
-        let assets = match app.try_state::<AppState>() {
-            Some(state) => state.project().list_assets().unwrap_or_default(),
+        let (assets, generation) = match app.try_state::<AppState>() {
+            Some(state) => {
+                let project = state.project();
+                (project.list_assets().unwrap_or_default(), project.generation())
+            }
             None => return,
         };
         for asset in &assets {
+            // Another project opened meanwhile: these are not its assets.
+            let current = app
+                .try_state::<AppState>()
+                .is_some_and(|state| state.project().generation() == generation);
+            if !current {
+                return;
+            }
             spawn_proxy(&app, asset);
         }
     });
@@ -414,9 +949,17 @@ pub(crate) fn rebuild_proxy_now<'a>(
     lock: &dyn Fn() -> std::sync::MutexGuard<'a, Project>,
     asset_id: Uuid,
 ) -> CmdResult<kerf_core::ProxyStatus> {
-    let asset = lock().require_asset(asset_id).map_err(|e| e.to_string())?;
+    let (asset, generation) = {
+        let project = lock();
+        (
+            project.require_asset(asset_id).map_err(|e| e.to_string())?,
+            project.generation(),
+        )
+    };
     let status = kerf_core::proxy::rebuild(&asset, proxy_notifier(app)).map_err(|e| e.to_string())?;
-    lock().set_proxy_declined(asset_id, false).map_err(|e| e.to_string())?;
+    let project = lock();
+    require_generation(&project, generation, "its proxy was being rebuilt")?;
+    project.set_proxy_declined(asset_id, false).map_err(|e| e.to_string())?;
     Ok(status)
 }
 
@@ -446,14 +989,14 @@ pub(crate) fn delete_proxy_now<'a>(
 
 #[tauri::command]
 async fn rebuild_proxy(app: AppHandle, state: State<'_, AppState>, asset_id: String) -> CmdResult<kerf_core::ProxyStatus> {
-    let id = id(&asset_id)?;
+    let id = id(&asset_id, "asset_id")?;
     let shared = state.project.clone();
     blocking(move || rebuild_proxy_now(&app, &|| lock_user(&shared), id)).await
 }
 
 #[tauri::command]
 async fn delete_proxy(app: AppHandle, state: State<'_, AppState>, asset_id: String) -> CmdResult<kerf_core::ProxyStatus> {
-    let id = id(&asset_id)?;
+    let id = id(&asset_id, "asset_id")?;
     let shared = state.project.clone();
     blocking(move || delete_proxy_now(&app, &|| lock_user(&shared), id).map(|(_, status)| status)).await
 }
@@ -496,11 +1039,12 @@ pub(crate) fn run_analysis<'a>(
     steps: Option<&[kerf_core::AnalysisKind]>,
     cancel: &dyn Fn() -> bool,
 ) -> CmdResult<AnalysisOutcome> {
-    let (asset, stored) = {
+    let (asset, stored, generation) = {
         let project = lock();
         (
             project.require_asset(asset_id).map_err(|e| e.to_string())?,
             project.get_analysis(asset_id).map_err(|e| e.to_string())?,
+            project.generation(),
         )
     };
     // What is cached as of now: it grows with each finished step, and the status reads it.
@@ -530,16 +1074,38 @@ pub(crate) fn run_analysis<'a>(
             emit_status();
         }
     };
-    let mut on_step = |so_far: &AssetAnalysis| match lock().merge_analysis(so_far) {
-        Ok(merged) => {
-            *current.borrow_mut() = Some(merged);
-            emit_status();
+    let mut on_step = |so_far: &AssetAnalysis| {
+        let project = lock();
+        // A step that finished for a project that is no longer open is not cached in this one.
+        if project.generation() != generation {
+            return;
         }
-        // The final merge below tries again and reports it.
-        Err(e) => tracing::warn!(error = %e, "could not cache a finished analysis step"),
+        match project.merge_analysis(so_far) {
+            Ok(merged) => {
+                drop(project);
+                *current.borrow_mut() = Some(merged);
+                emit_status();
+            }
+            // The final merge below tries again and reports it.
+            Err(e) => tracing::warn!(error = %e, "could not cache a finished analysis step"),
+        }
     };
-    let run = kerf_core::analyze_asset_steps(&asset, steps, &mut on_progress, &mut on_step, cancel).map_err(|e| e.to_string())?;
-    let merged = lock().merge_analysis(&run.patch).map_err(|e| e.to_string())?;
+    // A project opened (or started) while the steps run makes the rest of the run pointless — its
+    // result is dropped below — so the running ffmpeg is stopped too, not left to finish the machine's
+    // time on a file nobody has open any more. The generation is asked of the project (a lock) at most
+    // twice a second.
+    let replaced = Throttled::new(std::time::Duration::from_millis(500), || lock().generation() != generation);
+    let stop = || cancel() || replaced.ask();
+    let run = kerf_core::analyze_asset_steps(&asset, steps, &mut on_progress, &mut on_step, &stop).map_err(|e| e.to_string())?;
+    let merged = {
+        let project = lock();
+        // The project was replaced while the steps ran: nothing of this run belongs in the new one,
+        // and the person who opened it knows (the same quiet stop as a cancel).
+        if project.generation() != generation {
+            return Err(ANALYSIS_CANCELLED.to_string());
+        }
+        project.merge_analysis(&run.patch).map_err(|e| e.to_string())?
+    };
     *current.borrow_mut() = Some(merged.clone());
     emit_status();
     if run.cancelled {
@@ -559,6 +1125,56 @@ pub(crate) fn run_analysis<'a>(
     })
 }
 
+/// Re-time an asset's cached transcript to the speech energy and label its speakers, without
+/// re-transcribing — the Tauri command's and the MCP tool's shared body. The transcript is read
+/// under the lock; the decode and clustering run with it released, in the background lane,
+/// streaming `analysis-progress` and giving up on `cancel`; the result is stored under the
+/// lock again, unless a newer transcript landed meanwhile. Only analysis moved, so it says so
+/// with `analysis-status`, not `project-changed`.
+pub(crate) fn run_refine<'a>(
+    app: &AppHandle,
+    lock: &dyn Fn() -> std::sync::MutexGuard<'a, Project>,
+    asset_id: Uuid,
+    cancel: &dyn Fn() -> bool,
+) -> CmdResult<AssetAnalysis> {
+    let (asset, read, generation) = {
+        let project = lock();
+        (
+            project.require_asset(asset_id).map_err(|e| e.to_string())?,
+            project.transcript(asset_id).map_err(|e| e.to_string())?,
+            project.generation(),
+        )
+    };
+    let id_text = asset_id.to_string();
+    let emit = |p: kerf_core::AnalysisProgress| {
+        let _ = app.emit(
+            "analysis-progress",
+            AnalysisProgressEvent {
+                asset_id: id_text.clone(),
+                stage: p.stage,
+                fraction: p.fraction,
+                detail: p.detail,
+            },
+        );
+    };
+    let refined = kerf_core::refine_transcript_media(&asset, read.clone(), &mut |p| emit(p), cancel);
+    emit(kerf_core::AnalysisProgress::stage("done"));
+    let refined = refined.map_err(|e| match e {
+        kerf_core::Error::Cancelled => ANALYSIS_CANCELLED.to_string(),
+        e => e.to_string(),
+    })?;
+    let stored = {
+        let project = lock();
+        // A project opened meanwhile is not told its asset was refined.
+        require_generation(&project, generation, "the transcript was being refined")?;
+        project
+            .store_transcript(asset_id, &read, refined)
+            .map_err(|e| e.to_string())?
+    };
+    let _ = app.emit("analysis-status", kerf_core::analysis_status(asset_id, Some(&stored)));
+    Ok(stored)
+}
+
 /// Parse the `steps` an adapter was handed (`None` = the default set).
 pub(crate) fn parse_steps(steps: Option<Vec<String>>) -> CmdResult<Option<Vec<kerf_core::AnalysisKind>>> {
     steps
@@ -574,17 +1190,13 @@ async fn analyze_asset(
     asset_id: String,
     steps: Option<Vec<String>>,
 ) -> CmdResult<AssetAnalysis> {
-    let id = id(&asset_id)?;
+    let id = id(&asset_id, "asset_id")?;
     let steps = parse_steps(steps)?;
     let shared = state.project.clone();
     // Fresh cancel flag for this pass; `cancel_analysis` flips it from the UI.
-    let cancel = state.analysis_cancel.clone();
-    cancel.store(false, Ordering::SeqCst);
+    let cancel = state.begin_analysis();
     blocking(move || {
-        run_analysis(&app, &|| lock_user(&shared), id, steps.as_deref(), &|| {
-            cancel.load(Ordering::SeqCst)
-        })
-        .map(|outcome| outcome.analysis)
+        run_analysis(&app, &|| lock_user(&shared), id, steps.as_deref(), &|| cancel()).map(|outcome| outcome.analysis)
     })
     .await
 }
@@ -593,7 +1205,16 @@ async fn analyze_asset(
 /// and transcript are done, running, failed or switched off. Cheap (one cache read each).
 #[tauri::command(async)]
 fn analysis_statuses(state: State<'_, AppState>) -> CmdResult<Vec<kerf_core::AnalysisStatus>> {
+    warm_transcription_backend();
     state.project().analysis_statuses().map_err(|e| e.to_string())
+}
+
+/// Ask whether a speech-to-text backend exists, which the first time runs `ffmpeg -h filter=whisper`
+/// (cached for the process, bounded at a minute) — and every analysis status reads it. So it is asked
+/// here, **before a project lock is taken**, never inside one: a cold probe must not hold the shared
+/// project for as long as an ffmpeg start takes on a slow disk. Setup warms it on a thread of its own.
+pub(crate) fn warm_transcription_backend() {
+    let _ = kerf_core::transcription_backend();
 }
 
 // ---- speech-to-text -------------------------------------------------------
@@ -640,13 +1261,18 @@ struct ModelProgressEvent {
     fraction: Option<f64>,
 }
 
+/// The error an abandoned model download returns, for the webview to stay quiet on.
+const MODEL_CANCELLED: &str = "model download cancelled";
+
 /// Download a speech model ahead of time, streaming `model-progress`.
 ///
 /// Transcription downloads on demand anyway; this exists so the user can start
 /// the (few hundred megabyte) fetch deliberately, and pick a model other than
-/// the default, instead of discovering it mid-analysis.
+/// the default, instead of discovering it mid-analysis. `cancel_model_download`
+/// stops it, rejecting with `"model download cancelled"`.
 #[tauri::command]
-async fn download_speech_model(app: AppHandle, name: String) -> CmdResult<String> {
+async fn download_speech_model(app: AppHandle, state: State<'_, AppState>, name: String) -> CmdResult<String> {
+    let cancel = state.model_cancel.begin();
     blocking(move || {
         let mut on_progress = |p: kerf_core::DownloadProgress| {
             let _ = app.emit(
@@ -659,10 +1285,19 @@ async fn download_speech_model(app: AppHandle, name: String) -> CmdResult<String
                 },
             );
         };
-        let path = kerf_core::download_speech_model(&name, &mut on_progress).map_err(|e| e.to_string())?;
+        let path = kerf_core::download_speech_model_cancellable(&name, &mut on_progress, &|| cancel()).map_err(|e| match e {
+            kerf_core::Error::Cancelled => MODEL_CANCELLED.to_string(),
+            other => other.to_string(),
+        })?;
         Ok(path.to_string_lossy().into_owned())
     })
     .await
+}
+
+/// Stop the speech model download in flight (if any).
+#[tauri::command(async)]
+fn cancel_model_download(state: State<'_, AppState>) {
+    state.model_cancel.stop();
 }
 
 // ---- voiceover ---------------------------------------------------------------
@@ -697,8 +1332,7 @@ fn voiceover_err(e: kerf_core::Error) -> String {
 /// `voiceover-progress`, so the first voiceover starts synthesizing at once.
 #[tauri::command]
 async fn prepare_voiceover(app: AppHandle, state: State<'_, AppState>, voice: String) -> CmdResult<kerf_core::VoiceoverStatus> {
-    let cancel = state.voiceover_cancel.clone();
-    cancel.store(false, Ordering::SeqCst);
+    let cancel = state.voiceover_cancel.begin();
     blocking(move || {
         let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
             let _ = app.emit(
@@ -710,7 +1344,7 @@ async fn prepare_voiceover(app: AppHandle, state: State<'_, AppState>, voice: St
                 },
             );
         };
-        kerf_core::prepare_voiceover(&voice, &mut on_progress, &|| cancel.load(Ordering::SeqCst)).map_err(voiceover_err)?;
+        kerf_core::prepare_voiceover(&voice, &mut on_progress, &|| cancel()).map_err(voiceover_err)?;
         Ok(kerf_core::voiceover_status())
     })
     .await
@@ -740,11 +1374,11 @@ async fn generate_voiceover(
     timeline_start: Option<f64>,
     captions: Option<CaptionOptions>,
 ) -> CmdResult<VoiceoverResult> {
-    let track = track_id.as_deref().map(id).transpose()?;
+    let track = opt_id(track_id.as_deref(), "track_id")?;
     let shared = state.project.clone();
-    let cancel = state.voiceover_cancel.clone();
-    cancel.store(false, Ordering::SeqCst);
+    let cancel = state.voiceover_cancel.begin();
     blocking(move || {
+        let generation = lock_user(&shared).generation();
         let voice = voice.unwrap_or_else(|| kerf_core::DEFAULT_VOICE.to_string());
         let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
             let _ = app.emit(
@@ -756,11 +1390,14 @@ async fn generate_voiceover(
                 },
             );
         };
-        let asset = Project::synthesize_voiceover(&text, &voice, speed.unwrap_or(1.0), &mut on_progress, &|| {
-            cancel.load(Ordering::SeqCst)
-        })
-        .map_err(voiceover_err)?;
+        let stop = stop_or_replaced(cancel, &shared, generation);
+        let asset =
+            Project::synthesize_voiceover(&text, &voice, speed.unwrap_or(1.0), &mut on_progress, &stop).map_err(voiceover_err)?;
         let project = lock_user(&shared);
+        // Spoken for a project that is no longer open: the quiet stop of a cancel, not a failure.
+        if project.generation() != generation {
+            return Err(VOICEOVER_CANCELLED.to_string());
+        }
         let (asset, _) = project
             .place_voiceover(&asset, track, timeline_start)
             .map_err(|e| e.to_string())?;
@@ -776,7 +1413,7 @@ async fn generate_voiceover(
 /// Request cancellation of the voiceover being generated (or its download).
 #[tauri::command(async)]
 fn cancel_voiceover(state: State<'_, AppState>) {
-    state.voiceover_cancel.store(true, Ordering::SeqCst);
+    state.voiceover_cancel.stop();
 }
 
 /// Whether stem separation would still download its runtime or model.
@@ -805,13 +1442,18 @@ async fn separate_stems(
     asset_id: String,
     clip_id: Option<String>,
 ) -> CmdResult<StemsResult> {
-    let asset_id = id(&asset_id)?;
-    let clip = clip_id.as_deref().map(id).transpose()?;
+    let asset_id = id(&asset_id, "asset_id")?;
+    let clip = opt_id(clip_id.as_deref(), "clip_id")?;
     let shared = state.project.clone();
-    let cancel = state.stems_cancel.clone();
-    cancel.store(false, Ordering::SeqCst);
+    let cancel = state.stems_cancel.begin();
     blocking(move || {
-        let asset = lock_user(&shared).require_asset(asset_id).map_err(|e| e.to_string())?;
+        let (asset, generation) = {
+            let project = lock_user(&shared);
+            (
+                project.require_asset(asset_id).map_err(|e| e.to_string())?,
+                project.generation(),
+            )
+        };
         let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
             let _ = app.emit(
                 "stems-progress",
@@ -822,12 +1464,16 @@ async fn separate_stems(
                 },
             );
         };
-        let stems =
-            Project::separate_stems_media(&asset, &mut on_progress, &|| cancel.load(Ordering::SeqCst)).map_err(|e| match e {
-                kerf_core::Error::Cancelled => STEMS_CANCELLED.to_string(),
-                other => other.to_string(),
-            })?;
+        let stop = stop_or_replaced(cancel, &shared, generation);
+        let stems = Project::separate_stems_media(&asset, &mut on_progress, &stop).map_err(|e| match e {
+            kerf_core::Error::Cancelled => STEMS_CANCELLED.to_string(),
+            other => other.to_string(),
+        })?;
         let project = lock_user(&shared);
+        // Separated for a project that is no longer open: the quiet stop of a cancel.
+        if project.generation() != generation {
+            return Err(STEMS_CANCELLED.to_string());
+        }
         let placed = project.place_stems(asset_id, &stems, clip).map_err(|e| e.to_string())?;
         let timeline = project.timeline().map_err(|e| e.to_string())?;
         Ok(StemsResult { placed, timeline })
@@ -838,7 +1484,7 @@ async fn separate_stems(
 /// Request cancellation of the running stem separation (or its download).
 #[tauri::command(async)]
 fn cancel_stems(state: State<'_, AppState>) {
-    state.stems_cancel.store(true, Ordering::SeqCst);
+    state.stems_cancel.stop();
 }
 
 // ---- ripple mode -------------------------------------------------------------
@@ -863,7 +1509,7 @@ fn set_ripple_mode(state: State<'_, AppState>, on: bool) -> CmdResult<bool> {
 
 #[tauri::command(async)]
 fn cut_clip(state: State<'_, AppState>, asset_id: String, start: f64, end: f64) -> CmdResult<Timeline> {
-    let id = id(&asset_id)?;
+    let id = id(&asset_id, "asset_id")?;
     let project = state.project();
     project.cut_clip(id, start, end).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -878,8 +1524,8 @@ fn add_clip(
     source_out: f64,
     timeline_start: Option<f64>,
 ) -> CmdResult<Timeline> {
-    let asset = id(&asset_id)?;
-    let track = track_id.as_deref().map(id).transpose()?;
+    let asset = id(&asset_id, "asset_id")?;
+    let track = opt_id(track_id.as_deref(), "track_id")?;
     let project = state.project();
     project
         .add_clip_to_timeline(asset, track, source_in, source_out, timeline_start)
@@ -891,7 +1537,7 @@ fn add_clip(
 /// detached sound) are split at the same moment unless `link` is `false`.
 #[tauri::command(async)]
 fn split_clip(state: State<'_, AppState>, clip_id: String, at: f64, link: Option<bool>) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.with_links(link, |p| p.split_at(id, at)).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -906,7 +1552,7 @@ fn trim_clip(
     timeline_start: Option<f64>,
     link: Option<bool>,
 ) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project
         .with_links(link, |p| p.trim(id, source_in, source_out, timeline_start))
@@ -916,8 +1562,8 @@ fn trim_clip(
 
 #[tauri::command(async)]
 fn reorder_clip(state: State<'_, AppState>, track_id: String, clip_id: String, new_index: usize) -> CmdResult<Timeline> {
-    let track = id(&track_id)?;
-    let clip = id(&clip_id)?;
+    let track = id(&track_id, "track_id")?;
+    let clip = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.reorder(track, clip, new_index).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -931,8 +1577,8 @@ fn move_clip(
     track_id: Option<String>,
     link: Option<bool>,
 ) -> CmdResult<Timeline> {
-    let clip = id(&clip_id)?;
-    let track = track_id.as_deref().map(id).transpose()?;
+    let clip = id(&clip_id, "clip_id")?;
+    let track = opt_id(track_id.as_deref(), "track_id")?;
     let project = state.project();
     project
         .with_links(link, |p| p.move_clip(clip, timeline_start, track))
@@ -956,7 +1602,7 @@ fn move_clips(state: State<'_, AppState>, moves: Vec<ClipMove>, link: Option<boo
 
 #[tauri::command(async)]
 fn ripple_delete(state: State<'_, AppState>, clip_id: String, link: Option<bool>) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.with_links(link, |p| p.ripple_delete(id)).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -964,7 +1610,7 @@ fn ripple_delete(state: State<'_, AppState>, clip_id: String, link: Option<bool>
 
 #[tauri::command(async)]
 fn cut_clip_range(state: State<'_, AppState>, clip_id: String, from: f64, to: f64, link: Option<bool>) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project
         .with_links(link, |p| p.cut_clip_range(id, from, to))
@@ -978,7 +1624,7 @@ fn cut_clip_range(state: State<'_, AppState>, clip_id: String, from: f64, to: f6
 /// partner pairs roll with it unless `link` is `false`.
 #[tauri::command(async)]
 fn roll_edit(state: State<'_, AppState>, clip_a: String, clip_b: String, delta: f64, link: Option<bool>) -> CmdResult<Timeline> {
-    let (a, b) = (id(&clip_a)?, id(&clip_b)?);
+    let (a, b) = (id(&clip_a, "clip_a")?, id(&clip_b, "clip_b")?);
     let project = state.project();
     project
         .with_links(link, |p| p.roll_edit(a, b, delta))
@@ -993,7 +1639,7 @@ fn roll_edit(state: State<'_, AppState>, clip_a: String, clip_b: String, delta: 
 /// is `false`.
 #[tauri::command(async)]
 fn slip_clip(state: State<'_, AppState>, clip_id: String, delta: f64, link: Option<bool>) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project
         .with_links(link, |p| p.slip_clip(id, delta))
@@ -1006,7 +1652,7 @@ fn slip_clip(state: State<'_, AppState>, clip_id: String, delta: f64, link: Opti
 /// Linked partners slide with it unless `link` is `false`.
 #[tauri::command(async)]
 fn slide_clip(state: State<'_, AppState>, clip_id: String, delta: f64, link: Option<bool>) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project
         .with_links(link, |p| p.slide_clip(id, delta))
@@ -1019,7 +1665,7 @@ fn slide_clip(state: State<'_, AppState>, clip_id: String, delta: f64, link: Opt
 /// partners that span `at` are trimmed with it unless `link` is `false`.
 #[tauri::command(async)]
 fn split_remove(state: State<'_, AppState>, clip_id: String, at: f64, side: String, link: Option<bool>) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let side = SplitSide::parse(&side).ok_or_else(|| format!("invalid side '{side}'; expected \"left\" or \"right\""))?;
     let project = state.project();
     project
@@ -1053,7 +1699,7 @@ fn add_track(state: State<'_, AppState>, kind: String, name: Option<String>) -> 
 
 #[tauri::command(async)]
 fn remove_track(state: State<'_, AppState>, track_id: String) -> CmdResult<Timeline> {
-    let id = id(&track_id)?;
+    let id = id(&track_id, "track_id")?;
     let project = state.project();
     project.remove_track(id).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1061,7 +1707,7 @@ fn remove_track(state: State<'_, AppState>, track_id: String) -> CmdResult<Timel
 
 #[tauri::command(async)]
 fn set_track_duck(state: State<'_, AppState>, track_id: String, duck: bool) -> CmdResult<Timeline> {
-    let id = id(&track_id)?;
+    let id = id(&track_id, "track_id")?;
     let project = state.project();
     project.set_track_duck(id, duck).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1070,7 +1716,7 @@ fn set_track_duck(state: State<'_, AppState>, track_id: String, duck: bool) -> C
 /// Set a track's fader — the gain riding every clip on the track.
 #[tauri::command(async)]
 fn set_track_volume(state: State<'_, AppState>, track_id: String, volume: f32) -> CmdResult<Timeline> {
-    let id = id(&track_id)?;
+    let id = id(&track_id, "track_id")?;
     let project = state.project();
     project.set_track_volume(id, volume).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1079,7 +1725,7 @@ fn set_track_volume(state: State<'_, AppState>, track_id: String, volume: f32) -
 /// Set a track's stereo placement, -1 (hard left) to 1 (hard right).
 #[tauri::command(async)]
 fn set_track_pan(state: State<'_, AppState>, track_id: String, pan: f32) -> CmdResult<Timeline> {
-    let id = id(&track_id)?;
+    let id = id(&track_id, "track_id")?;
     let project = state.project();
     project.set_track_pan(id, pan).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1103,6 +1749,14 @@ fn set_master_limiter(state: State<'_, AppState>, enabled: bool, ceiling_db: Opt
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// Make the master limiter hold the true peak (4x oversampled) or the sample peak.
+#[tauri::command(async)]
+fn set_master_true_peak(state: State<'_, AppState>, enabled: bool) -> CmdResult<Timeline> {
+    let project = state.project();
+    project.set_master_true_peak(enabled).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
 /// Choose how ducked tracks dip: `depth_db` (negative dB) for the speech gate, omitted
 /// for the sidechain compressor.
 #[tauri::command(async)]
@@ -1122,17 +1776,22 @@ fn set_master_duck(state: State<'_, AppState>, depth_db: Option<f64>) -> CmdResu
 async fn get_levels(state: State<'_, AppState>, range: Option<TimeRange>, loudnorm: Option<bool>) -> CmdResult<Levels> {
     let shared = state.project.clone();
     // Fresh cancel flag for this pass; `cancel_levels` flips it from the UI.
-    let cancel = state.levels_cancel.clone();
-    cancel.store(false, Ordering::SeqCst);
+    let cancel = state.levels_cancel.begin();
     blocking(move || {
-        let (timeline, assets) = lock_user(&shared).levels_inputs().map_err(|e| e.to_string())?;
-        Project::measure_levels(&timeline, &assets, range, loudnorm.unwrap_or(false), &|| {
-            cancel.load(Ordering::SeqCst)
-        })
-        .map_err(|e| match e {
-            kerf_core::Error::Cancelled => LEVELS_CANCELLED.to_string(),
-            other => other.to_string(),
-        })
+        let ((timeline, assets), generation) = {
+            let project = lock_user(&shared);
+            (project.levels_inputs().map_err(|e| e.to_string())?, project.generation())
+        };
+        let levels =
+            Project::measure_levels(&timeline, &assets, range, loudnorm.unwrap_or(false), &|| cancel()).map_err(|e| match e {
+                kerf_core::Error::Cancelled => LEVELS_CANCELLED.to_string(),
+                other => other.to_string(),
+            })?;
+        // The levels of a cut that is no longer the open one are of no use to the one that is.
+        if lock_user(&shared).generation() != generation {
+            return Err(LEVELS_CANCELLED.to_string());
+        }
+        Ok(levels)
     })
     .await
 }
@@ -1145,7 +1804,7 @@ const LEVELS_CANCELLED: &str = "levels cancelled";
 /// `"levels cancelled"`.
 #[tauri::command(async)]
 fn cancel_levels(state: State<'_, AppState>) {
-    state.levels_cancel.store(true, Ordering::SeqCst);
+    state.levels_cancel.stop();
 }
 
 /// Set the frame the project is cut for, or clear it back to the source shape.
@@ -1167,7 +1826,7 @@ fn set_delivery_format(
 
 #[tauri::command(async)]
 fn set_track_muted(state: State<'_, AppState>, track_id: String, muted: bool) -> CmdResult<Timeline> {
-    let id = id(&track_id)?;
+    let id = id(&track_id, "track_id")?;
     let project = state.project();
     project.set_track_muted(id, muted).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1175,7 +1834,7 @@ fn set_track_muted(state: State<'_, AppState>, track_id: String, muted: bool) ->
 
 #[tauri::command(async)]
 fn set_track_solo(state: State<'_, AppState>, track_id: String, solo: bool) -> CmdResult<Timeline> {
-    let id = id(&track_id)?;
+    let id = id(&track_id, "track_id")?;
     let project = state.project();
     project.set_track_solo(id, solo).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1183,7 +1842,7 @@ fn set_track_solo(state: State<'_, AppState>, track_id: String, solo: bool) -> C
 
 #[tauri::command(async)]
 fn set_track_locked(state: State<'_, AppState>, track_id: String, locked: bool) -> CmdResult<Timeline> {
-    let id = id(&track_id)?;
+    let id = id(&track_id, "track_id")?;
     let project = state.project();
     project.set_track_locked(id, locked).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1191,7 +1850,7 @@ fn set_track_locked(state: State<'_, AppState>, track_id: String, locked: bool) 
 
 #[tauri::command(async)]
 fn set_clip_enabled(state: State<'_, AppState>, clip_id: String, enabled: bool) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.set_clip_enabled(id, enabled).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1204,7 +1863,7 @@ fn set_clip_enabled(state: State<'_, AppState>, clip_id: String, enabled: bool) 
 /// sound is muted. One revision.
 #[tauri::command(async)]
 fn detach_audio(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.detach_audio(id).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1214,7 +1873,7 @@ fn detach_audio(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeli
 /// cannot be detached is skipped and reported; an error only when none could be.
 #[tauri::command(async)]
 fn detach_audio_clips(state: State<'_, AppState>, clip_ids: Vec<String>) -> CmdResult<AudioDetached> {
-    let ids = clip_ids.iter().map(|s| id(s)).collect::<Result<Vec<_>, _>>()?;
+    let ids = ids(&clip_ids, "clip_ids")?;
     let project = state.project();
     let done = project.detach_audio_clips(&ids).map_err(|e| e.to_string())?;
     Ok(AudioDetached {
@@ -1230,7 +1889,7 @@ fn detach_audio_clips(state: State<'_, AppState>, clip_ids: Vec<String>) -> CmdR
 /// revision.
 #[tauri::command(async)]
 fn reattach_audio(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.reattach_audio(id).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1240,7 +1899,7 @@ fn reattach_audio(state: State<'_, AppState>, clip_id: String) -> CmdResult<Time
 /// either clip of each pair; a pair that cannot be reattached refuses the lot.
 #[tauri::command(async)]
 fn reattach_audio_clips(state: State<'_, AppState>, clip_ids: Vec<String>) -> CmdResult<Timeline> {
-    let ids = clip_ids.iter().map(|s| id(s)).collect::<Result<Vec<_>, _>>()?;
+    let ids = ids(&clip_ids, "clip_ids")?;
     let project = state.project();
     project.reattach_audio_clips(&ids).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1250,7 +1909,7 @@ fn reattach_audio_clips(state: State<'_, AppState>, clip_ids: Vec<String>) -> Cm
 /// the others. One revision.
 #[tauri::command(async)]
 fn link_clips(state: State<'_, AppState>, clip_ids: Vec<String>) -> CmdResult<Timeline> {
-    let ids = clip_ids.iter().map(|s| id(s)).collect::<Result<Vec<_>, _>>()?;
+    let ids = ids(&clip_ids, "clip_ids")?;
     let project = state.project();
     project.link_clips(&ids).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1259,7 +1918,7 @@ fn link_clips(state: State<'_, AppState>, clip_ids: Vec<String>) -> CmdResult<Ti
 /// Unlink clips; a group left with a single clip dissolves. One revision.
 #[tauri::command(async)]
 fn unlink_clips(state: State<'_, AppState>, clip_ids: Vec<String>) -> CmdResult<Timeline> {
-    let ids = clip_ids.iter().map(|s| id(s)).collect::<Result<Vec<_>, _>>()?;
+    let ids = ids(&clip_ids, "clip_ids")?;
     let project = state.project();
     project.unlink_clips(&ids).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1278,7 +1937,7 @@ struct Placement {
 fn insert_clips(state: State<'_, AppState>, placements: Vec<Placement>, at: f64) -> CmdResult<Timeline> {
     let items = placements
         .into_iter()
-        .map(|p| id(&p.track_id).map(|t| (t, p.clip)))
+        .map(|p| id(&p.track_id, "placements[].track_id").map(|t| (t, p.clip)))
         .collect::<Result<Vec<_>, _>>()?;
     let project = state.project();
     project.insert_clips(&items, at).map_err(|e| e.to_string())?;
@@ -1287,7 +1946,7 @@ fn insert_clips(state: State<'_, AppState>, placements: Vec<Placement>, at: f64)
 
 #[tauri::command(async)]
 fn duplicate_clips(state: State<'_, AppState>, clip_ids: Vec<String>, at: f64) -> CmdResult<Timeline> {
-    let ids = clip_ids.iter().map(|s| id(s)).collect::<Result<Vec<_>, _>>()?;
+    let ids = ids(&clip_ids, "clip_ids")?;
     let project = state.project();
     project.duplicate_clips(&ids, at).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1296,7 +1955,7 @@ fn duplicate_clips(state: State<'_, AppState>, clip_ids: Vec<String>, at: f64) -
 /// Remove a clip — and its linked partners, unless `link` is `false`.
 #[tauri::command(async)]
 fn remove_clip(state: State<'_, AppState>, clip_id: String, link: Option<bool>) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.with_links(link, |p| p.remove(id)).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1313,7 +1972,7 @@ fn remove_clips(
     ripple: Option<bool>,
     link: Option<bool>,
 ) -> CmdResult<Timeline> {
-    let ids = clip_ids.iter().map(|s| id(s)).collect::<Result<Vec<_>, _>>()?;
+    let ids = ids(&clip_ids, "clip_ids")?;
     let project = state.project();
     project
         .with_links(link, |p| p.with_ripple(ripple, |p| p.remove_clips(&ids)))
@@ -1323,7 +1982,7 @@ fn remove_clips(
 
 #[tauri::command(async)]
 fn set_volume(state: State<'_, AppState>, clip_id: String, volume: f32) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.set_volume(id, volume).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1331,7 +1990,7 @@ fn set_volume(state: State<'_, AppState>, clip_id: String, volume: f32) -> CmdRe
 
 #[tauri::command(async)]
 fn set_fade(state: State<'_, AppState>, clip_id: String, fade_in: Option<f64>, fade_out: Option<f64>) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.set_fade(id, fade_in, fade_out).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1341,7 +2000,7 @@ fn set_fade(state: State<'_, AppState>, clip_id: String, fade_in: Option<f64>, f
 /// is `false`.
 #[tauri::command(async)]
 fn set_speed(state: State<'_, AppState>, clip_id: String, speed: f64, link: Option<bool>) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project
         .with_links(link, |p| p.set_speed(id, speed))
@@ -1364,7 +2023,7 @@ fn set_transform(
     crop_top: Option<f64>,
     crop_bottom: Option<f64>,
 ) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project
         .set_transform(
@@ -1393,7 +2052,7 @@ fn set_color(
     gamma: Option<f64>,
     temperature: Option<f64>,
 ) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project
         .set_color(id, brightness, contrast, saturation, gamma, temperature)
@@ -1408,7 +2067,7 @@ fn set_transition(
     kind: Option<String>,
     duration: Option<f64>,
 ) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let transition = parse_transition(kind, duration)?;
     let project = state.project();
     project.set_transition(id, transition).map_err(|e| e.to_string())?;
@@ -1419,15 +2078,44 @@ fn set_transition(
 /// through outside it.
 #[tauri::command(async)]
 fn set_mask(state: State<'_, AppState>, clip_id: String, mask: Option<Mask>) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.set_mask(id, mask).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// Replace a clip's curves, colour wheels and LUT. A LUT file is read and checked first, with the
+/// project unlocked.
+#[tauri::command]
+async fn set_grade(state: State<'_, AppState>, clip_id: String, grade: Grade) -> CmdResult<Timeline> {
+    let id = id(&clip_id, "clip_id")?;
+    let shared = state.project.clone();
+    blocking(move || {
+        // Only a newly chosen LUT file is checked, so a curve or wheel edit still applies to a
+        // clip whose LUT went missing.
+        let before = {
+            let timeline = lock_user(&shared).timeline().map_err(|e| e.to_string())?;
+            timeline.clip(id).and_then(|c| c.grade.lut.as_ref().map(|l| l.path.clone()))
+        };
+        if grade.lut.as_ref().is_some_and(|l| Some(&l.path) != before.as_ref()) {
+            kerf_core::color_lut::check_grade(&grade).map_err(|e| e.to_string())?;
+        }
+        let project = lock_user(&shared);
+        project.set_grade(id, grade).map_err(|e| e.to_string())?;
+        project.timeline().map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// What a `.cube` file holds (its size and title), or why it cannot be used as a LUT.
+#[tauri::command]
+async fn inspect_lut(path: String) -> CmdResult<kerf_core::color_lut::LutInfo> {
+    blocking(move || kerf_core::color_lut::inspect_lut(&path).map_err(|e| e.to_string())).await
+}
+
 #[tauri::command(async)]
 fn set_video_effects(state: State<'_, AppState>, clip_id: String, effects: Vec<VideoEffect>) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.set_video_effects(id, effects).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1435,7 +2123,7 @@ fn set_video_effects(state: State<'_, AppState>, clip_id: String, effects: Vec<V
 
 #[tauri::command(async)]
 fn set_audio_effects(state: State<'_, AppState>, clip_id: String, effects: Vec<AudioEffect>) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.set_audio_effects(id, effects).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1443,7 +2131,7 @@ fn set_audio_effects(state: State<'_, AppState>, clip_id: String, effects: Vec<A
 
 #[tauri::command(async)]
 fn set_keyframes(state: State<'_, AppState>, clip_id: String, keyframes: Vec<Keyframe>) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.set_keyframes(id, keyframes).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1461,7 +2149,7 @@ fn add_keyframe(
     rotation: Option<f64>,
     opacity: Option<f64>,
 ) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project
         .add_keyframe(id, time, scale, pos_x, pos_y, rotation, opacity)
@@ -1479,7 +2167,7 @@ fn set_keyframe_easing(
     easing: kerf_core::Easing,
     prop: Option<Property>,
 ) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     match prop {
         Some(prop) => project.set_property_easing(id, prop, time, easing),
@@ -1498,7 +2186,7 @@ fn set_property_keyframes(
     prop: Property,
     keys: Vec<PropertyKey>,
 ) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.set_property_keyframes(id, prop, keys).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1514,7 +2202,7 @@ fn copy_keyframes(
     props: Option<Vec<Property>>,
     offset: Option<f64>,
 ) -> CmdResult<Timeline> {
-    let (from, to) = (id(&from_clip_id)?, id(&to_clip_id)?);
+    let (from, to) = (id(&from_clip_id, "from_clip_id")?, id(&to_clip_id, "to_clip_id")?);
     let project = state.project();
     project
         .copy_keyframes(from, to, &props.unwrap_or_default(), offset.unwrap_or(0.0))
@@ -1524,7 +2212,7 @@ fn copy_keyframes(
 
 #[tauri::command(async)]
 fn clear_keyframes(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.clear_keyframes(id).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1543,7 +2231,7 @@ fn set_reframe(
     input: Option<Projection>,
     output: Option<Projection>,
 ) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project
         .set_reframe(id, yaw, pitch, roll, fov, lens_fov, input, output)
@@ -1561,7 +2249,7 @@ async fn set_asset_projection(
     asset_id: String,
     projection: Option<Projection>,
 ) -> CmdResult<Asset> {
-    let id = id(&asset_id)?;
+    let id = id(&asset_id, "asset_id")?;
     let shared = state.project.clone();
     // On the blocking pool: queueing the proxy runs the cached ffprobe that keys it.
     blocking(move || {
@@ -1577,7 +2265,7 @@ async fn set_asset_projection(
 
 #[tauri::command(async)]
 fn clear_reframe(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.clear_reframe(id).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1585,7 +2273,7 @@ fn clear_reframe(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timel
 
 #[tauri::command(async)]
 fn set_reframe_keyframes(state: State<'_, AppState>, clip_id: String, keyframes: Vec<ReframeKeyframe>) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.set_reframe_keyframes(id, keyframes).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1601,7 +2289,7 @@ fn add_reframe_keyframe(
     roll: Option<f64>,
     fov: Option<f64>,
 ) -> CmdResult<Timeline> {
-    let id = id(&clip_id)?;
+    let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project
         .add_reframe_keyframe(id, time, yaw, pitch, roll, fov)
@@ -1617,22 +2305,34 @@ fn add_marker(state: State<'_, AppState>, time: f64, name: String, color: Option
 }
 
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 fn update_marker(
     state: State<'_, AppState>,
     marker_id: String,
     time: Option<f64>,
     name: Option<String>,
     color: Option<String>,
+    duration: Option<f64>,
+    comment: Option<String>,
+    kind: Option<kerf_core::MarkerKind>,
 ) -> CmdResult<Timeline> {
-    let id = id(&marker_id)?;
+    let id = id(&marker_id, "marker_id")?;
+    let patch = kerf_core::MarkerPatch {
+        time,
+        name,
+        color,
+        duration,
+        comment,
+        kind,
+    };
     let project = state.project();
-    project.update_marker(id, time, name, color).map_err(|e| e.to_string())?;
+    project.edit_marker(id, patch).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
 #[tauri::command(async)]
 fn remove_marker(state: State<'_, AppState>, marker_id: String) -> CmdResult<Timeline> {
-    let id = id(&marker_id)?;
+    let id = id(&marker_id, "marker_id")?;
     let project = state.project();
     project.remove_marker(id).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1661,7 +2361,7 @@ fn update_overlay(
     font: Option<String>,
     bold: Option<bool>,
 ) -> CmdResult<Timeline> {
-    let oid = id(&overlay_id)?;
+    let oid = id(&overlay_id, "overlay_id")?;
     let project = state.project();
     project
         .update_overlay(oid, text, start, end, pos_x, pos_y, size, color, bg, font, bold)
@@ -1671,7 +2371,7 @@ fn update_overlay(
 
 #[tauri::command(async)]
 fn remove_overlay(state: State<'_, AppState>, overlay_id: String) -> CmdResult<Timeline> {
-    let oid = id(&overlay_id)?;
+    let oid = id(&overlay_id, "overlay_id")?;
     let project = state.project();
     project.remove_overlay(oid).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1679,10 +2379,327 @@ fn remove_overlay(state: State<'_, AppState>, overlay_id: String) -> CmdResult<T
 
 #[tauri::command(async)]
 fn set_overlay_keyframes(state: State<'_, AppState>, overlay_id: String, keyframes: Vec<TextKeyframe>) -> CmdResult<Timeline> {
-    let oid = id(&overlay_id)?;
+    let oid = id(&overlay_id, "overlay_id")?;
     let project = state.project();
     project.set_overlay_keyframes(oid, keyframes).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
+}
+
+/// Reading the artwork (sanitise + parse) takes up to a second and a half for a heavy document, so
+/// it runs on the blocking pool *before* the project lock is taken; the lock then only places it.
+#[tauri::command]
+async fn add_svg_overlay(
+    state: State<'_, AppState>,
+    source: SvgSource,
+    start: f64,
+    end: Option<f64>,
+    layout: Option<SvgLayout>,
+) -> CmdResult<Timeline> {
+    let shared = state.project.clone();
+    blocking(move || {
+        let checked = source.check().map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        project
+            .add_svg_overlay_parsed(checked, start, end, layout.unwrap_or_default())
+            .map_err(|e| e.to_string())?;
+        project.timeline().map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn update_svg_overlay(state: State<'_, AppState>, overlay_id: String, patch: SvgOverlayPatch) -> CmdResult<Timeline> {
+    let oid = id(&overlay_id, "overlay_id")?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let doc = patch.check().map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        project
+            .update_svg_overlay_parsed(oid, patch, doc)
+            .map_err(|e| e.to_string())?;
+        project.timeline().map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command(async)]
+fn remove_svg_overlay(state: State<'_, AppState>, overlay_id: String) -> CmdResult<Timeline> {
+    let oid = id(&overlay_id, "overlay_id")?;
+    let project = state.project();
+    project.remove_svg_overlay(oid).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// What `add_svg_overlay` / `update_svg_overlay` would make of this source: the sanitised
+/// document, what the sanitiser or the SMIL reader could not honour, and how long it runs.
+/// Needs no project, so it never waits for the lock, and parses on the blocking pool.
+#[tauri::command]
+async fn validate_svg(svg: String) -> CmdResult<SvgCheck> {
+    blocking(move || kerf_core::check_svg(&svg).map_err(|e| e.to_string())).await
+}
+
+#[tauri::command(async)]
+fn list_svg_presets() -> Vec<SvgPresetInfo> {
+    kerf_core::svg::preset_infos()
+}
+
+/// The artwork a preset would make for the project's delivery frame, as SVG text (the page shows
+/// it through an `<img>` data URL, never inline). `duration` defaults to 4 s.
+#[tauri::command(async)]
+fn svg_preset_preview(
+    state: State<'_, AppState>,
+    kind: SvgPresetKind,
+    params: SvgPresetParams,
+    duration: Option<f64>,
+) -> CmdResult<String> {
+    kerf_core::svg::check_params(&params).map_err(|e| e.to_string())?;
+    let frame = state.project().timeline().map_err(|e| e.to_string())?.preset_frame();
+    Ok(kerf_core::render_preset(kind, &params, duration.unwrap_or(4.0), frame))
+}
+
+// ---- motion templates --------------------------------------------------------
+
+/// The user's template library (`KERF_TEMPLATES_DIR` or the data directory). Library calls need no
+/// project, so none of them takes the lock.
+fn template_library() -> CmdResult<TemplateLibrary> {
+    TemplateLibrary::default_location().map_err(|e| e.to_string())
+}
+
+/// An image file as the `data:` URL an `image` control takes (`kerf_core::template::image_data_url`
+/// judges the picture; this only reads the file, bounded). Shared with the MCP tools.
+///
+/// The bound is the one the engine holds a picture to ([`kerf_core::template::MAX_IMAGE_BYTES`], a little
+/// under 96 KB: a title is at most 128 KiB), and it is kept by the read itself rather than by a `stat`
+/// that the file could outgrow: the file is opened, looked at through the handle it was opened as, and read
+/// at most one byte past the bound.
+pub(crate) fn template_image_data_url(path: &str) -> kerf_core::Result<String> {
+    use kerf_core::Error;
+    use std::io::Read;
+    let refuse = |why: String| Error::InvalidArgument(why);
+    let limit = kerf_core::template::MAX_IMAGE_BYTES as u64;
+    let file = std::path::Path::new(path);
+    if !file.is_absolute() {
+        return Err(refuse(format!("{path} must be an absolute file path")));
+    }
+    // Not opened if it is not a regular file at all: opening a named pipe would wait for a writer.
+    let meta = std::fs::metadata(file).map_err(|e| refuse(format!("cannot read {path}: {e}")))?;
+    if !meta.is_file() {
+        return Err(refuse(format!("{path} is not a regular file")));
+    }
+    let handle = std::fs::File::open(file).map_err(|e| refuse(format!("cannot read {path}: {e}")))?;
+    let meta = handle.metadata().map_err(|e| refuse(format!("cannot read {path}: {e}")))?;
+    if !meta.is_file() {
+        return Err(refuse(format!("{path} is not a regular file")));
+    }
+    let too_big = |bytes: u64| {
+        refuse(format!(
+            "{path} is {} KiB: too large for an image in a title (at most {} KiB)",
+            bytes.div_ceil(1024),
+            limit / 1024
+        ))
+    };
+    if meta.len() > limit {
+        return Err(too_big(meta.len()));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    handle
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| refuse(format!("cannot read {path}: {e}")))?;
+    if bytes.len() as u64 > limit {
+        return Err(too_big(bytes.len() as u64));
+    }
+    kerf_core::template::image_data_url(&bytes)
+}
+
+/// Only `.kerftemplate` files are read as templates, and the path is the one a file picker returned.
+fn require_template_path(path: &str) -> CmdResult<()> {
+    let is_template = std::path::Path::new(path)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case(kerf_core::template::EXTENSION));
+    if is_template {
+        Ok(())
+    } else {
+        Err(format!("{path} is not a .{} file", kerf_core::template::EXTENSION))
+    }
+}
+
+/// What applying a template or changing the values of a template title hands back: the refreshed cut,
+/// the title that was made or changed, and what the sanitiser or the machine could not honour (a font
+/// that is not installed, ...).
+#[derive(Serialize)]
+struct TemplateEdit {
+    timeline: Timeline,
+    overlay_id: Uuid,
+    warnings: Vec<String>,
+}
+
+/// An element of a title that has an `id`, and the tag it is: what a control can aim at.
+#[derive(Serialize)]
+struct SvgElementId {
+    id: String,
+    tag: String,
+}
+
+/// Every template in the library (by name) and the files that did not read. Only manifests are read;
+/// a poster is fetched on its own (`template_poster`).
+#[tauri::command]
+async fn list_templates() -> CmdResult<TemplateList> {
+    blocking(|| template_library()?.list().map_err(|e| e.to_string())).await
+}
+
+/// A template's poster as a `data:image/png;base64,` URL (a PNG of at most 512 px), `null` when it has
+/// none.
+#[tauri::command]
+async fn template_poster(template_id: String) -> CmdResult<Option<String>> {
+    blocking(move || {
+        let poster = template_library()?.poster(&template_id).map_err(|e| e.to_string())?;
+        Ok(poster.map(|png| {
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(png)
+            )
+        }))
+    })
+    .await
+}
+
+/// The `id`s of a title's elements and their tags, for the save dialog to offer as targets. Pure.
+#[tauri::command(async)]
+fn svg_element_ids(svg: String) -> CmdResult<Vec<SvgElementId>> {
+    let ids = kerf_core::template::element_ids(&svg).map_err(|e| e.to_string())?;
+    Ok(ids.into_iter().map(|(id, tag)| SvgElementId { id, tag }).collect())
+}
+
+/// An image file as the `data:` URL a template `image` value takes (PNG, JPEG, GIF or WebP).
+#[tauri::command]
+async fn template_image_value(path: String) -> CmdResult<String> {
+    blocking(move || template_image_data_url(&path).map_err(|e| e.to_string())).await
+}
+
+/// Keep the title `overlay_id` (as the working cut has it) in the library as a template with the given
+/// controls. The title is read under the lock; the fonts, the sanitiser and the poster run with it
+/// released. A library write, not a timeline edit: nothing is undone or staged.
+#[tauri::command]
+async fn save_template(
+    state: State<'_, AppState>,
+    overlay_id: String,
+    name: String,
+    description: Option<String>,
+    controls: Vec<TemplateControl>,
+) -> CmdResult<TemplateSaved> {
+    let oid = id(&overlay_id, "overlay_id")?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let source = lock_user(&shared).template_source(oid).map_err(|e| e.to_string())?;
+        let request = TemplateSaveRequest {
+            name,
+            description: description.unwrap_or_default(),
+            controls,
+        };
+        template_library()?.save(&source, request).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Add a library template to the timeline as an animated title: `values` (control id to value, partial)
+/// are spliced into its artwork and the result sanitised **before** the project lock is taken; the lock
+/// only places the title and stores the template's fonts in the project. `end` defaults to `start` plus
+/// the template's duration; `layout` places and names it like `add_svg_overlay`'s.
+#[tauri::command]
+async fn apply_template(
+    state: State<'_, AppState>,
+    template_id: String,
+    values: std::collections::BTreeMap<String, String>,
+    start: f64,
+    end: Option<f64>,
+    layout: Option<SvgLayout>,
+) -> CmdResult<TemplateEdit> {
+    let shared = state.project.clone();
+    blocking(move || {
+        let prepared = template_library()?
+            .get(&template_id)
+            .and_then(|t| t.prepare(&values))
+            .map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        let done = project
+            .apply_template_parsed(prepared, start, end, layout.unwrap_or_default())
+            .map_err(|e| e.to_string())?;
+        Ok(TemplateEdit {
+            timeline: project.timeline().map_err(|e| e.to_string())?,
+            overlay_id: done.overlay.id,
+            warnings: done.warnings,
+        })
+    })
+    .await
+}
+
+/// Change control values of a template title (partial: only the named controls). The title is read
+/// under the lock, the splice and the sanitiser run with it released, and the result is stored only if
+/// the title is still the one it was made from; one that changed meanwhile is an error saying to try again.
+#[tauri::command]
+async fn set_template_values(
+    state: State<'_, AppState>,
+    overlay_id: String,
+    values: std::collections::BTreeMap<String, String>,
+) -> CmdResult<TemplateEdit> {
+    let oid = id(&overlay_id, "overlay_id")?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let inputs = lock_user(&shared).template_edit_inputs(oid).map_err(|e| e.to_string())?;
+        let prepared = inputs.prepare(&values).map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        let done = project.set_template_values_parsed(oid, prepared).map_err(|e| e.to_string())?;
+        Ok(TemplateEdit {
+            timeline: project.timeline().map_err(|e| e.to_string())?,
+            overlay_id: done.overlay.id,
+            warnings: done.warnings,
+        })
+    })
+    .await
+}
+
+/// Bring a `.kerftemplate` file into the library. Never overwrites: the same template is
+/// `already_present`, another one with the same id is kept under a new id (`added_as_copy`). The
+/// path is the one the file picker returned: an absolute path to a regular `.kerftemplate` file.
+#[tauri::command]
+async fn import_template(path: String) -> CmdResult<ImportOutcome> {
+    require_template_path(&path)?;
+    blocking(move || {
+        let file = std::path::Path::new(&path);
+        kerf_core::paths::validate_import_path(file).map_err(|e| e.to_string())?;
+        template_library()?.import(file).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Write a library template to `path` (a directory gets `<name>.kerftemplate` in it, a path with no
+/// extension gets `.kerftemplate`); resolves to where it went. The picker has asked about replacing.
+/// Not onto a file the project still needs, into Kerf's own settings and logs, or into the library.
+#[tauri::command]
+async fn export_template(state: State<'_, AppState>, template_id: String, path: String) -> CmdResult<String> {
+    require_user_output_path(&path)?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let library = template_library()?;
+        let mut protected = lock_user(&shared).output_path_inputs().map_err(|e| e.to_string())?;
+        protected
+            .dirs
+            .push((library.dir().to_path_buf(), "the template library".to_string()));
+        check_output(std::path::Path::new(&path), &protected).map_err(|e| e.to_string())?;
+        let written = library
+            .export(&template_id, std::path::Path::new(&path))
+            .map_err(|e| e.to_string())?;
+        Ok(written.to_string_lossy().into_owned())
+    })
+    .await
+}
+
+/// Remove a template from the library. Titles already made from it keep working: they carry their own
+/// artwork and fonts.
+#[tauri::command]
+async fn delete_template(template_id: String) -> CmdResult<()> {
+    blocking(move || template_library()?.delete(&template_id).map_err(|e| e.to_string())).await
 }
 
 #[tauri::command(async)]
@@ -1719,7 +2736,7 @@ fn caption_request(
     options: Option<CaptionOptions>,
     offset: Option<f64>,
 ) -> CmdResult<CaptionImportRequest> {
-    let asset = asset_id.map(id).transpose()?;
+    let asset = opt_id(asset_id, "asset_id")?;
     Ok(CaptionImportRequest {
         base: CaptionTimeBase::resolve(base, asset).map_err(|e| e.to_string())?,
         options: options.unwrap_or_default(),
@@ -1729,8 +2746,14 @@ fn caption_request(
 
 /// The part of an import that holds the project lock: place a file that was
 /// already read and parsed with the lock released.
-fn place_caption_file(shared: &Mutex<Project>, file: &CaptionFile, req: CaptionImportRequest) -> CmdResult<CaptionImport> {
+fn place_caption_file(
+    shared: &Mutex<Project>,
+    generation: u64,
+    file: &CaptionFile,
+    req: CaptionImportRequest,
+) -> CmdResult<CaptionImport> {
     let project = lock_user(shared);
+    require_generation(&project, generation, "captions were being imported")?;
     let summary = project.import_captions(file, req).map_err(|e| e.to_string())?;
     let timeline = project.timeline().map_err(|e| e.to_string())?;
     Ok(CaptionImport { timeline, summary })
@@ -1757,9 +2780,10 @@ async fn import_captions(
     let req = caption_request(base.as_deref(), asset_id.as_deref(), options, offset)?;
     let shared = state.project.clone();
     blocking(move || {
+        let generation = lock_user(&shared).generation();
         let text = kerf_core::read_caption_file(std::path::Path::new(&path)).map_err(|e| e.to_string())?;
         let file = kerf_core::parse_captions(&text, None).map_err(|e| e.to_string())?;
-        place_caption_file(&shared, &file, req)
+        place_caption_file(&shared, generation, &file, req)
     })
     .await
 }
@@ -1782,28 +2806,137 @@ async fn import_captions_text(
     let format = CaptionFormat::from_arg(format.as_deref()).map_err(|e| e.to_string())?;
     let shared = state.project.clone();
     blocking(move || {
+        let generation = lock_user(&shared).generation();
         let file = kerf_core::parse_captions(&text, format).map_err(|e| e.to_string())?;
-        place_caption_file(&shared, &file, req)
+        place_caption_file(&shared, generation, &file, req)
     })
     .await
 }
 
 #[tauri::command]
 async fn export_srt(state: State<'_, AppState>, asset_id: String, output_path: String) -> CmdResult<String> {
-    let id = id(&asset_id)?;
-    require_local_output_path(&output_path)?;
+    let id = id(&asset_id, "asset_id")?;
+    require_user_output_path(&output_path)?;
     let shared = state.project.clone();
     blocking(move || {
-        let srt = lock_user(&shared).transcript_srt(id).map_err(|e| e.to_string())?;
+        let (protected, srt) = {
+            let project = lock_user(&shared);
+            (
+                project.output_path_inputs().map_err(|e| e.to_string())?,
+                project.transcript_srt(id).map_err(|e| e.to_string())?,
+            )
+        };
+        check_output(std::path::Path::new(&output_path), &protected).map_err(|e| e.to_string())?;
         std::fs::write(&output_path, srt).map_err(|e| e.to_string())?;
         Ok(output_path)
     })
     .await
 }
 
+/// Write the cut's captions (its generated overlays, as the export draws them)
+/// to `output_path` as SubRip or WebVTT, by `format` or the path's extension.
+#[tauri::command]
+async fn export_captions(
+    state: State<'_, AppState>,
+    output_path: String,
+    format: Option<kerf_core::SubtitleFormat>,
+) -> CmdResult<String> {
+    require_user_output_path(&output_path)?;
+    let path = std::path::PathBuf::from(&output_path);
+    let format = match format {
+        Some(f) => f,
+        None => kerf_core::SubtitleFormat::from_path(&path).map_err(|e| e.to_string())?,
+    };
+    let shared = state.project.clone();
+    blocking(move || {
+        let (timeline, protected) = {
+            let project = lock_user(&shared);
+            (
+                project.working_timeline().map_err(|e| e.to_string())?,
+                project.output_path_inputs().map_err(|e| e.to_string())?,
+            )
+        };
+        // Not onto a file the project still needs (a source, a proxy, the project itself).
+        check_output(&path, &protected).map_err(|e| e.to_string())?;
+        let text = Project::captions_document(&timeline, format).map_err(|e| e.to_string())?;
+        Project::write_document(&path, &text).map_err(|e| e.to_string())?;
+        Ok(output_path)
+    })
+    .await
+}
+
+/// Write the cut as OpenTimelineIO or a CMX 3600 EDL (`video_track`: which video
+/// track an EDL holds, 0 = V1), returning the path and what the format dropped.
+#[tauri::command]
+async fn export_interchange(
+    state: State<'_, AppState>,
+    output_path: String,
+    format: kerf_core::InterchangeFormat,
+    video_track: Option<usize>,
+) -> CmdResult<kerf_core::ExportedFile> {
+    require_user_output_path(&output_path)?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let (inputs, protected) = {
+            let project = lock_user(&shared);
+            (
+                project.delivery_inputs().map_err(|e| e.to_string())?,
+                project.output_path_inputs().map_err(|e| e.to_string())?,
+            )
+        };
+        check_output(std::path::Path::new(&output_path), &protected).map_err(|e| e.to_string())?;
+        let (text, report) =
+            Project::interchange_document(&inputs, format, video_track.unwrap_or(0)).map_err(|e| e.to_string())?;
+        Project::write_document(std::path::Path::new(&output_path), &text).map_err(|e| e.to_string())?;
+        Ok(kerf_core::ExportedFile {
+            path: output_path,
+            report,
+        })
+    })
+    .await
+}
+
+/// Write the markers as a CSV (formula-safe) or as YouTube chapter text.
+#[tauri::command]
+async fn export_markers(
+    state: State<'_, AppState>,
+    output_path: String,
+    format: kerf_core::MarkerListFormat,
+) -> CmdResult<kerf_core::ExportedFile> {
+    require_user_output_path(&output_path)?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let (inputs, protected) = {
+            let project = lock_user(&shared);
+            (
+                project.delivery_inputs().map_err(|e| e.to_string())?,
+                project.output_path_inputs().map_err(|e| e.to_string())?,
+            )
+        };
+        check_output(std::path::Path::new(&output_path), &protected).map_err(|e| e.to_string())?;
+        let (text, report) = Project::markers_document(&inputs, format).map_err(|e| e.to_string())?;
+        Project::write_document(std::path::Path::new(&output_path), &text).map_err(|e| e.to_string())?;
+        Ok(kerf_core::ExportedFile {
+            path: output_path,
+            report,
+        })
+    })
+    .await
+}
+
+/// Re-time an asset's cached transcript to the speech energy and label its speakers, without
+/// re-transcribing ([`run_refine`]). Stopped by `cancel_analysis`, like an analysis pass.
+#[tauri::command]
+async fn refine_transcript(app: AppHandle, state: State<'_, AppState>, asset_id: String) -> CmdResult<AssetAnalysis> {
+    let id = id(&asset_id, "asset_id")?;
+    let shared = state.project.clone();
+    let cancel = state.begin_analysis();
+    blocking(move || run_refine(&app, &|| lock_user(&shared), id, &|| cancel())).await
+}
+
 #[tauri::command(async)]
 fn remove_silence(state: State<'_, AppState>, asset_id: String) -> CmdResult<Timeline> {
-    let id = id(&asset_id)?;
+    let id = id(&asset_id, "asset_id")?;
     let project = state.project();
     project.remove_silence(id).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1811,7 +2944,7 @@ fn remove_silence(state: State<'_, AppState>, asset_id: String) -> CmdResult<Tim
 
 #[tauri::command(async)]
 fn snap_to_beats(state: State<'_, AppState>, track_id: Option<String>, tolerance: Option<f64>) -> CmdResult<Timeline> {
-    let track = track_id.as_deref().map(id).transpose()?;
+    let track = opt_id(track_id.as_deref(), "track_id")?;
     let project = state.project();
     project.snap_to_beats(track, tolerance).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1821,7 +2954,7 @@ fn snap_to_beats(state: State<'_, AppState>, track_id: Option<String>, tolerance
 /// defaults to the picture's length from the clip's start.
 #[tauri::command(async)]
 fn plan_music_fit(state: State<'_, AppState>, clip_id: String, target: Option<f64>) -> CmdResult<kerf_core::model::MusicFit> {
-    let clip = id(&clip_id)?;
+    let clip = id(&clip_id, "clip_id")?;
     state.project().plan_music_fit(clip, target).map_err(|e| e.to_string())
 }
 
@@ -1836,7 +2969,7 @@ struct MusicFitted {
 /// bar-aligned phrase splices, fading out an overrun when `fade_out`.
 #[tauri::command(async)]
 fn fit_music(state: State<'_, AppState>, clip_id: String, target: Option<f64>, fade_out: bool) -> CmdResult<MusicFitted> {
-    let clip = id(&clip_id)?;
+    let clip = id(&clip_id, "clip_id")?;
     let project = state.project();
     let report = project.fit_music(clip, target, fade_out).map_err(|e| e.to_string())?;
     let timeline = project.timeline().map_err(|e| e.to_string())?;
@@ -1860,7 +2993,7 @@ struct AudioDetached {
 /// it is an error (`add_asset_audio` is the explicit way to append the whole audio).
 #[tauri::command(async)]
 fn extract_audio(state: State<'_, AppState>, asset_id: String) -> CmdResult<AudioDetached> {
-    let id = id(&asset_id)?;
+    let id = id(&asset_id, "asset_id")?;
     let project = state.project();
     let done = project.extract_audio(id).map_err(|e| e.to_string())?;
     Ok(AudioDetached {
@@ -1875,7 +3008,7 @@ fn extract_audio(state: State<'_, AppState>, asset_id: String) -> CmdResult<Audi
 /// video track is heard twice where they overlap — `extract_audio` is for that.
 #[tauri::command(async)]
 fn add_asset_audio(state: State<'_, AppState>, asset_id: String) -> CmdResult<Timeline> {
-    let id = id(&asset_id)?;
+    let id = id(&asset_id, "asset_id")?;
     let project = state.project();
     project.add_asset_audio(id).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1883,7 +3016,7 @@ fn add_asset_audio(state: State<'_, AppState>, asset_id: String) -> CmdResult<Ti
 
 #[tauri::command(async)]
 fn concatenate(state: State<'_, AppState>, asset_ids: Vec<String>) -> CmdResult<Timeline> {
-    let ids = asset_ids.iter().map(|s| id(s)).collect::<CmdResult<Vec<_>>>()?;
+    let ids = ids(&asset_ids, "asset_ids")?;
     let project = state.project();
     project.concatenate(&ids).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
@@ -1891,9 +3024,21 @@ fn concatenate(state: State<'_, AppState>, asset_ids: Vec<String>) -> CmdResult<
 
 // ---- history (undo / redo / revert) ----------------------------------------
 
+/// The edit history, oldest first. `limit` / `offset` window it from the newest end: `offset`
+/// of the latest revisions are skipped and up to `limit` of the ones before them returned, so
+/// `limit: 50` is the last fifty edits and a following `offset: 50` the fifty before. Neither
+/// is everything.
 #[tauri::command(async)]
-fn get_history(state: State<'_, AppState>) -> CmdResult<Vec<Revision>> {
-    state.project().history().map_err(|e| e.to_string())
+fn get_history(state: State<'_, AppState>, limit: Option<usize>, offset: Option<usize>) -> CmdResult<Vec<Revision>> {
+    let page = Page {
+        limit,
+        offset: offset.unwrap_or(0),
+    };
+    state
+        .project()
+        .history_page(page)
+        .map(|(revisions, _)| revisions)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command(async)]
@@ -1933,17 +3078,82 @@ fn get_staged_timeline(state: State<'_, AppState>) -> CmdResult<Option<Timeline>
     state.project().staged_timeline().map_err(|e| e.to_string())
 }
 
-#[tauri::command(async)]
-fn apply_staged_edit(state: State<'_, AppState>, force: Option<bool>) -> CmdResult<Timeline> {
-    state
-        .project()
-        .apply_staged(force.unwrap_or(false))
+/// Whether the open proposal also marks assets (a 360 projection): applying it changes the
+/// footage, so their preview proxies have to be made again.
+fn staged_asset_changes(project: &Project) -> CmdResult<bool> {
+    project
+        .staged()
+        .map(|staged| staged.is_some_and(|staged| !staged.asset_changes.is_empty()))
         .map_err(|e| e.to_string())
+}
+
+/// Accept the whole proposal: it becomes the live timeline as one revision. `force` applies
+/// one that is `stale` (the cut moved on since it branched), replacing the newer work.
+#[tauri::command(async)]
+fn apply_staged_edit(app: AppHandle, state: State<'_, AppState>, force: Option<bool>) -> CmdResult<Timeline> {
+    let project = state.project();
+    let had_asset_changes = staged_asset_changes(&project)?;
+    let timeline = project.apply_staged(force.unwrap_or(false)).map_err(|e| e.to_string())?;
+    drop(project);
+    if had_asset_changes {
+        respawn_proxies(&app);
+    }
+    Ok(timeline)
+}
+
+/// Accept only the picked changes (`entry_ids`: the ids of the proposal's diff entries) onto
+/// the live cut. A partner that has to come along (a picture and its sound) is applied too and
+/// reported in `auto_included`; a pick that cannot stand alone, or no longer applies, is refused
+/// or `skipped` with why. The rest of the proposal stays open until nothing is left of it.
+#[tauri::command(async)]
+fn apply_staged_subset(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    entry_ids: Vec<String>,
+    force: Option<bool>,
+) -> CmdResult<SubsetApplied> {
+    let project = state.project();
+    let had_asset_changes = staged_asset_changes(&project)?;
+    let applied = project
+        .apply_staged_subset(&entry_ids, force.unwrap_or(false))
+        .map_err(|e| e.to_string())?;
+    drop(project);
+    if had_asset_changes {
+        respawn_proxies(&app);
+    }
+    Ok(applied)
 }
 
 #[tauri::command(async)]
 fn discard_staged_edit(state: State<'_, AppState>) -> CmdResult<Timeline> {
     state.project().discard_staged().map_err(|e| e.to_string())
+}
+
+/// What taking back a staged step left: its label, and the proposal as it now stands.
+#[derive(Serialize)]
+struct StagedUndone {
+    label: String,
+    staged: StagedEdit,
+}
+
+/// Take back the latest edit the agent staged, inside the proposal (the live cut is untouched).
+#[tauri::command(async)]
+fn undo_staged_edit(state: State<'_, AppState>) -> CmdResult<StagedUndone> {
+    let (label, staged) = state.project().undo_staged().map_err(|e| e.to_string())?;
+    Ok(StagedUndone { label, staged })
+}
+
+/// The proposal the user last discarded, while it can still be brought back; `None` once a
+/// new one opened or nothing was discarded.
+#[tauri::command(async)]
+fn discarded_staged_edit(state: State<'_, AppState>) -> CmdResult<Option<StagedEdit>> {
+    state.project().discarded_staged().map_err(|e| e.to_string())
+}
+
+/// Bring the discarded proposal back (only while no other proposal is open).
+#[tauri::command(async)]
+fn restore_discarded_edits(state: State<'_, AppState>) -> CmdResult<StagedEdit> {
+    state.project().restore_discarded().map_err(|e| e.to_string())
 }
 
 // ---- media (preview frames, waveforms) -------------------------------------
@@ -1968,7 +3178,7 @@ async fn get_frame(
     max_width: Option<u32>,
     accurate: Option<bool>,
 ) -> CmdResult<String> {
-    let id = id(&asset_id)?;
+    let id = id(&asset_id, "asset_id")?;
     let shared = state.project.clone();
     blocking(move || {
         // Resolve the asset under the lock, then *drop the guard* before decoding: the
@@ -2100,16 +3310,6 @@ fn gpu_preview_status(gpu: State<'_, Arc<gpu_preview::GpuPreview>>) -> gpu_previ
     gpu.status()
 }
 
-/// What this session's preview frames did, for diagnostics: how many the GPU drew and how many went
-/// through FFmpeg and for which kind of reason (the plan's refusals counted by kind, with the first
-/// message as an example), how often the frames' inputs were served from the held snapshot, how many
-/// requests a newer one replaced, and where the parity self-test stands. Local and in memory; also
-/// logged when the preview is torn down.
-#[tauri::command(async)]
-fn gpu_preview_diagnostics(gpu: State<'_, Arc<gpu_preview::GpuPreview>>) -> gpu_preview::GpuDiagnostics {
-    gpu.diagnostics()
-}
-
 /// Bytes in front of the JPEG in a playback message: the frame's timeline time as an `f64`, little
 /// endian. Mirrored by `parsePlaybackMessage` in `frontend/src/lib/frame-transport.ts`.
 const PLAYBACK_HEADER_BYTES: usize = 8;
@@ -2131,26 +3331,70 @@ fn playback_message(time: f64, jpeg: &[u8]) -> Vec<u8> {
     message
 }
 
-/// The id of the playback that *should* be running (0 = none). A stream keeps
-/// going only while this still equals the id it was started with, so a seek or a
-/// second Play supersedes the previous ffmpeg rather than racing it for the pane.
+/// Which playback stream should be running, by the id the page gave it (0 = none).
 ///
-/// The id comes from the caller rather than being minted here, and `stop_playback`
-/// only clears the id it was given, because start and stop are separate async
-/// IPC calls that can arrive out of order: a bare generation counter would let a
-/// stop meant for the previous stream land after the next one started and kill
-/// it, which reads as playback that dies the moment you seek.
-static ACTIVE_PLAYBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The ids come from the caller rather than being minted here, because start and stop are
+/// separate async IPC calls that can arrive out of order, and a bare generation counter would
+/// let a stop meant for the previous stream land after the next one started and kill it, which
+/// reads as playback that dies the moment you seek. Ids only ever go up: within a page a new
+/// playback's is higher than the last one's, and a page that was reloaded draws its ids from a
+/// newer [`playback_session`], so they are higher than anything the page before it used (a
+/// counter restarting at 1 would collide with the stale ids still held here). Both questions are
+/// then plain comparisons, whichever order the calls arrive in:
+///
+/// * the stream with the **highest id started** is the one that should run (`begin` keeps the
+///   maximum, so a start that arrives late cannot take the pane back from a newer one);
+/// * a stream is **stopped** once a stop at or above its id has been seen, which also covers a
+///   stop that reaches the backend *before* the start it was meant for: such a stop finds
+///   nothing to clear, and the stream would otherwise start with nobody left to end it.
+struct Playbacks {
+    active: AtomicU64,
+    stopped: AtomicU64,
+}
 
-/// The last id `stop_playback` was asked to cancel.
-///
-/// `ACTIVE_PLAYBACK` alone is not enough: a stop can reach the backend *before*
-/// the start it was meant to cancel (the webview issues them as two independent
-/// IPC calls, and the start goes through a dynamic import first). Such a stop
-/// finds nothing to clear and the stream then starts with nobody left to end it
-/// — an ffmpeg that plays on forever. Recording the id instead means the stream
-/// notices at its very next frame, whichever order the two calls land in.
-static STOPPED_PLAYBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+impl Playbacks {
+    const fn new() -> Self {
+        Self {
+            active: AtomicU64::new(0),
+            stopped: AtomicU64::new(0),
+        }
+    }
+
+    /// Playback `id` is starting: it supersedes every lower id.
+    fn begin(&self, id: u64) {
+        self.active.fetch_max(id, Ordering::SeqCst);
+    }
+
+    /// The page stopped playback `id` (a pause, a seek, an edit).
+    fn stop(&self, id: u64) {
+        self.stopped.fetch_max(id, Ordering::SeqCst);
+        let _ = self.active.compare_exchange(id, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// Whether playback `id` should end: superseded by a newer one, or stopped.
+    fn ended(&self, id: u64) -> bool {
+        self.active.load(Ordering::SeqCst) != id || self.stopped.load(Ordering::SeqCst) >= id
+    }
+
+    /// Playback `id` ran out; free the slot if it is still the one in it.
+    fn finish(&self, id: u64) {
+        let _ = self.active.compare_exchange(id, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
+static PLAYBACKS: Playbacks = Playbacks::new();
+
+/// Pages (webview loads) that have asked for playback ids this run.
+static PLAYBACK_SESSIONS: AtomicU64 = AtomicU64::new(0);
+
+/// A number for a page to build its playback ids from, higher than any this run has handed
+/// out: the page's ids are `session * 2^32 + n` (`playback-id.ts`), so a reloaded page's ids
+/// outrank the ones the page before it left behind. 2^21 sessions fit the 2^53 a JS number
+/// holds exactly; a run has no use for that many reloads.
+#[tauri::command(async)]
+fn playback_session() -> u64 {
+    PLAYBACK_SESSIONS.fetch_add(1, Ordering::SeqCst) + 1
+}
 
 /// Play the timeline from `start`, streaming composited frames to `on_frame`
 /// until playback is stopped, superseded, or the timeline ends.
@@ -2176,13 +3420,11 @@ async fn start_playback(
     max_width: Option<u32>,
     on_frame: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> CmdResult<()> {
-    use std::sync::atomic::Ordering;
-
     let shared = state.project.clone();
     // The stream takes the pane over: the window of frames being drawn around the playhead is of
     // no use until it stops, and is not left running beside it.
     state.scrub.stop();
-    ACTIVE_PLAYBACK.store(playback_id, Ordering::SeqCst);
+    PLAYBACKS.begin(playback_id);
     blocking(move || {
         // Resolve the inputs under the lock and drop the guard before streaming:
         // playback runs for as long as the user watches, and holding the shared
@@ -2205,10 +3447,13 @@ async fn start_playback(
         let mut late_frames: u64 = 0;
         let mut worst_late = 0.0_f64;
         let mut first_frame: Option<std::time::Duration> = None;
-        let result = kerf_core::stream_preview_with(&timeline, &assets, start, request, &mut |f| {
-            // Superseded by a newer playback, or explicitly stopped — including by
-            // a stop that arrived before this stream even started.
-            if ACTIVE_PLAYBACK.load(Ordering::SeqCst) != playback_id || STOPPED_PLAYBACK.load(Ordering::SeqCst) == playback_id {
+        // Superseded by a newer playback, or explicitly stopped — including by a stop that arrived
+        // before this stream even started.
+        let ended = || PLAYBACKS.ended(playback_id);
+        // `ended` is also the cancel of the animated titles' drawing, which can take seconds before
+        // the first frame exists for the callback below to decline.
+        let result = kerf_core::stream_preview_until(&timeline, &assets, start, request, &ended, &mut |f| {
+            if ended() {
                 return false;
             }
             let sent = on_frame
@@ -2238,9 +3483,8 @@ async fn start_playback(
         // Running out of timeline, or being superseded or stopped, is not an
         // error; only a genuine ffmpeg failure on a stream someone is still
         // watching is reported — the preview would otherwise just go black.
-        let current =
-            ACTIVE_PLAYBACK.load(Ordering::SeqCst) == playback_id && STOPPED_PLAYBACK.load(Ordering::SeqCst) != playback_id;
-        let _ = ACTIVE_PLAYBACK.compare_exchange(playback_id, 0, Ordering::SeqCst, Ordering::SeqCst);
+        let current = !PLAYBACKS.ended(playback_id);
+        PLAYBACKS.finish(playback_id);
         match result {
             Err(e) if current => {
                 tracing::warn!(error = %e, "preview stream failed");
@@ -2260,28 +3504,9 @@ async fn start_playback(
 /// A stop for a stream that has already been superseded is a no-op.
 #[tauri::command(async)]
 fn stop_playback(playback_id: u64) {
-    use std::sync::atomic::Ordering;
-    STOPPED_PLAYBACK.store(playback_id, Ordering::SeqCst);
-    let _ = ACTIVE_PLAYBACK.compare_exchange(playback_id, 0, Ordering::SeqCst, Ordering::SeqCst);
+    PLAYBACKS.stop(playback_id);
 }
 
-#[tauri::command]
-async fn get_waveform(state: State<'_, AppState>, asset_id: String, buckets: usize) -> CmdResult<Vec<f32>> {
-    let id = id(&asset_id)?;
-    let shared = state.project.clone();
-    blocking(move || {
-        // Resolve under the lock, decode the whole audio stream with it released —
-        // a long source takes seconds to bucket and must not stall other ops.
-        let asset = lock_user(&shared).require_asset(id).map_err(|e| e.to_string())?;
-        Project::decode_waveform(&asset, buckets).map_err(|e| e.to_string())
-    })
-    .await
-}
-
-/// `[start, end)` **source seconds** of an asset's audio as `buckets` min/max
-/// peak pairs per channel — what the timeline draws a clip's waveform from.
-/// The first call for a file decodes it into a cached peak pyramid; every later
-/// window at any zoom is a slice read.
 #[tauri::command]
 async fn get_waveform_range(
     state: State<'_, AppState>,
@@ -2290,11 +3515,11 @@ async fn get_waveform_range(
     end: f64,
     buckets: usize,
 ) -> CmdResult<WaveformRange> {
-    let id = id(&asset_id)?;
+    let id = id(&asset_id, "asset_id")?;
     let shared = state.project.clone();
     blocking(move || {
         // Resolve under the lock, read (and on a first call decode) with it
-        // released — same shape as `get_waveform`.
+        // released.
         let asset = lock_user(&shared).require_asset(id).map_err(|e| e.to_string())?;
         Project::decode_waveform_range(&asset, start, end, buckets).map_err(|e| e.to_string())
     })
@@ -2358,7 +3583,7 @@ fn filmstrip_payload(strip: &Filmstrip) -> FilmstripPayload {
 /// it; later ones are a cache read. Rejects for an asset with no video stream.
 #[tauri::command]
 async fn get_filmstrip(state: State<'_, AppState>, asset_id: String) -> CmdResult<FilmstripPayload> {
-    let id = id(&asset_id)?;
+    let id = id(&asset_id, "asset_id")?;
     let shared = state.project.clone();
     blocking(move || {
         // Only the asset record under the lock — a database read — then drop the
@@ -2385,8 +3610,8 @@ async fn get_audio(
     sample_rate: Option<u32>,
     clip_id: Option<String>,
 ) -> CmdResult<tauri::ipc::Response> {
-    let clip_id = clip_id.as_deref().map(id).transpose()?;
-    let id = id(&asset_id)?;
+    let clip_id = opt_id(clip_id.as_deref(), "clip_id")?;
+    let id = id(&asset_id, "asset_id")?;
     let shared = state.project.clone();
     let pcm = blocking(move || {
         // Resolve the asset under the lock, then drop the guard before the decode —
@@ -2415,10 +3640,10 @@ async fn get_audio(
 
 #[tauri::command]
 async fn get_energy(state: State<'_, AppState>, asset_id: String, buckets: usize) -> CmdResult<Vec<f32>> {
-    let id = id(&asset_id)?;
+    let id = id(&asset_id, "asset_id")?;
     let shared = state.project.clone();
     blocking(move || {
-        // Same lock-free decode shape as `get_waveform`.
+        // Resolve under the lock, decode with it released.
         let asset = lock_user(&shared).require_asset(id).map_err(|e| e.to_string())?;
         Project::decode_energy(&asset, buckets).map_err(|e| e.to_string())
     })
@@ -2427,9 +3652,19 @@ async fn get_energy(state: State<'_, AppState>, asset_id: String, buckets: usize
 
 // ---- agent task queue (mutations return the refreshed queue) ---------------
 
+/// The agent task queue, oldest first; `limit` / `offset` window it from the newest end like
+/// `get_history`.
 #[tauri::command(async)]
-fn list_tasks(state: State<'_, AppState>) -> CmdResult<Vec<Task>> {
-    state.project().list_tasks().map_err(|e| e.to_string())
+fn list_tasks(state: State<'_, AppState>, limit: Option<usize>, offset: Option<usize>) -> CmdResult<Vec<Task>> {
+    let page = Page {
+        limit,
+        offset: offset.unwrap_or(0),
+    };
+    state
+        .project()
+        .list_tasks_page(page)
+        .map(|(tasks, _)| tasks)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command(async)]
@@ -2438,16 +3673,22 @@ fn add_task(state: State<'_, AppState>, prompt: String) -> CmdResult<Task> {
 }
 
 #[tauri::command(async)]
-fn resolve_task(state: State<'_, AppState>, task_id: String) -> CmdResult<Vec<Task>> {
-    let id = id(&task_id)?;
+fn resolve_task(app: AppHandle, state: State<'_, AppState>, task_id: String) -> CmdResult<Vec<Task>> {
+    let id = id(&task_id, "task_id")?;
     let project = state.project();
+    let had_asset_changes = staged_asset_changes(&project)?;
     project.resolve_task(id).map_err(|e| e.to_string())?;
-    project.list_tasks().map_err(|e| e.to_string())
+    let tasks = project.list_tasks().map_err(|e| e.to_string())?;
+    drop(project);
+    if had_asset_changes {
+        respawn_proxies(&app);
+    }
+    Ok(tasks)
 }
 
 #[tauri::command(async)]
 fn remove_task(state: State<'_, AppState>, task_id: String) -> CmdResult<Vec<Task>> {
-    let id = id(&task_id)?;
+    let id = id(&task_id, "task_id")?;
     let project = state.project();
     project.remove_task(id).map_err(|e| e.to_string())?;
     project.list_tasks().map_err(|e| e.to_string())
@@ -2464,19 +3705,6 @@ async fn hw_encoders() -> CmdResult<Vec<String>> {
     blocking(|| Ok(kerf_core::hw_encoders().to_vec())).await
 }
 
-pub(crate) fn file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-/// Remove what a failed render left at `path` — but only if this run touched
-/// it. A failure before ffmpeg opened the output (bad options, an empty cut)
-/// must not delete the earlier export still sitting at that path.
-pub(crate) fn discard_partial(path: &std::path::Path, before: Option<std::time::SystemTime>) {
-    if file_mtime(path) != before {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
 #[tauri::command]
 async fn export_timeline(
     app: AppHandle,
@@ -2484,55 +3712,62 @@ async fn export_timeline(
     output_path: String,
     options: ExportOptions,
 ) -> CmdResult<String> {
-    require_local_output_path(&output_path)?;
+    require_user_output_path(&output_path)?;
     // Snapshot the timeline + assets under the lock, then release it before the
     // (seconds-to-minutes) ffmpeg render. Otherwise the export would hold the
     // shared Project mutex for its whole duration and freeze every other GUI
-    // command and the MCP agent until it finished.
-    let (timeline, assets) = {
+    // command and the MCP agent until it finished. What the output must not be (a source
+    // file, a proxy, the project itself) is read under it too; the check, which
+    // canonicalises and stats, runs without it.
+    let (timeline, assets, protected) = {
         let project = state.project();
         (
             project.timeline().map_err(|e| e.to_string())?,
             project.list_assets().map_err(|e| e.to_string())?,
+            project.output_path_inputs().map_err(|e| e.to_string())?,
         )
     };
 
     // Fresh cancel flag for this run; `cancel_export` flips it from another thread.
-    let cancel = state.export_cancel.clone();
-    cancel.store(false, Ordering::SeqCst);
+    let cancel = state.export_cancel.begin();
 
     blocking(move || {
+        check_output(std::path::Path::new(&output_path), &protected).map_err(|e| e.to_string())?;
         // Stream `export-progress` events ({ fraction, elapsed_secs, eta_secs }) so
         // the UI can show a bar + ETA. ffmpeg emits ~2/sec, no extra throttle needed.
         let mut on_progress = |p: kerf_core::ExportProgress| {
             let _ = app.emit("export-progress", p);
         };
-        let before = file_mtime(std::path::Path::new(&output_path));
-        let status = match kerf_core::render_with_progress(
+        // A render that fails or is cancelled removes what it wrote (`kerf_core::discard_partial`,
+        // only if this run touched the file), so no earlier export at the path is lost to it.
+        let status = kerf_core::render_with_progress(
             &timeline,
             &assets,
             std::path::Path::new(&output_path),
             &options,
             &mut on_progress,
-            &|| cancel.load(Ordering::SeqCst),
-        ) {
-            Ok(status) => status,
-            Err(e) => {
-                discard_partial(std::path::Path::new(&output_path), before);
-                return Err(e.to_string());
-            }
-        };
+            &|| cancel(),
+        )
+        .map_err(|e| e.to_string())?;
 
         match status {
             kerf_core::RenderStatus::Completed => Ok(output_path),
-            kerf_core::RenderStatus::Cancelled => {
-                // Drop the half-written file so a cancelled export leaves no debris.
-                let _ = std::fs::remove_file(&output_path);
-                Err("export cancelled".to_string())
-            }
+            kerf_core::RenderStatus::Cancelled => Err("export cancelled".to_string()),
         }
     })
     .await
+}
+
+/// Progress of the shot-framing pass of a multi-format export, which runs before the first
+/// file renders: the same event as the render's, flagged `waiting` so the bar does not sit at 0%.
+#[derive(Serialize, Clone)]
+struct FramingProgress {
+    variant: usize,
+    total: usize,
+    fraction: f64,
+    elapsed_secs: f64,
+    eta_secs: Option<f64>,
+    waiting: &'static str,
 }
 
 /// Render the cut once per delivery frame — one file per shape beside
@@ -2552,7 +3787,7 @@ async fn export_variants(
     if formats.is_empty() {
         return Err("pick at least one delivery frame".to_string());
     }
-    require_local_output_path(&output_path)?;
+    require_user_output_path(&output_path)?;
     let base = std::path::PathBuf::from(&output_path);
     let mut deliveries: Vec<Delivery> = Vec::new();
     for d in formats {
@@ -2565,19 +3800,54 @@ async fn export_variants(
         .iter()
         .map(|d| kerf_core::ExportVariant::beside(&base, *d))
         .collect();
+    for variant in &variants {
+        kerf_core::check_caption_sidecars(&variant.output, &options).map_err(|e| e.to_string())?;
+    }
     let shared = state.project.clone();
-    let cancel = state.export_cancel.clone();
-    cancel.store(false, Ordering::SeqCst);
+    let cancel = state.export_cancel.begin();
 
     blocking(move || {
+        // None of the files may be a source, a proxy or the project itself.
+        let protected = lock_user(&shared).output_path_inputs().map_err(|e| e.to_string())?;
+        for variant in &variants {
+            check_output(&variant.output, &protected).map_err(|e| e.to_string())?;
+        }
         // Frame first — plan under the lock, sample without it, apply under it
         // again — then snapshot and render with the lock released, like a
         // single export.
         if smart_crop {
-            let plan = lock_user(&shared).framing_inputs(&deliveries).map_err(|e| e.to_string())?;
+            let (plan, generation) = {
+                let project = lock_user(&shared);
+                (
+                    project.framing_inputs(&deliveries).map_err(|e| e.to_string())?,
+                    project.generation(),
+                )
+            };
             if !plan.jobs.is_empty() {
-                let framings = Project::sample_framings(&plan).map_err(|e| e.to_string())?;
-                let framed = lock_user(&shared).apply_framings(&framings).map_err(|e| e.to_string())?;
+                let (total, started) = (variants.len(), std::time::Instant::now());
+                let mut on_framed = |fraction: f32| {
+                    let _ = app.emit(
+                        "export-progress",
+                        FramingProgress {
+                            variant: 0,
+                            total,
+                            fraction: f64::from(fraction),
+                            elapsed_secs: started.elapsed().as_secs_f64(),
+                            eta_secs: None,
+                            waiting: "framing the shots",
+                        },
+                    );
+                };
+                let stop = stop_or_replaced(&cancel, &shared, generation);
+                let framings = Project::sample_framings_with(&plan, &mut on_framed, &stop).map_err(|e| match e {
+                    kerf_core::Error::Cancelled => "export cancelled".to_string(),
+                    other => other.to_string(),
+                })?;
+                let framed = {
+                    let project = lock_user(&shared);
+                    require_generation(&project, generation, "the shots were being framed")?;
+                    project.apply_framings(&framings).map_err(|e| e.to_string())?
+                };
                 if framed > 0 {
                     let _ = app.emit("project-changed", ());
                 }
@@ -2590,51 +3860,29 @@ async fn export_variants(
                 project.list_assets().map_err(|e| e.to_string())?,
             )
         };
-        // One variant at a time through `render_variants`, so a failure names
-        // the file in flight: that one is removed, the finished ones stay.
-        let total = variants.len();
-        let started = std::time::Instant::now();
-        for (i, variant) in variants.iter().enumerate() {
-            let mut on_progress = |p: kerf_core::VariantProgress| {
-                let fraction = (i as f64 + p.fraction.clamp(0.0, 1.0)) / total as f64;
-                let elapsed_secs = started.elapsed().as_secs_f64();
-                let _ = app.emit(
-                    "export-progress",
-                    kerf_core::VariantProgress {
-                        variant: i,
-                        total,
-                        fraction,
-                        elapsed_secs,
-                        eta_secs: (fraction > 0.0).then(|| elapsed_secs / fraction - elapsed_secs),
-                    },
-                );
-            };
-            let before = file_mtime(&variant.output);
-            match kerf_core::render_variants(
-                &timeline,
-                &assets,
-                std::slice::from_ref(variant),
-                &options,
-                &mut on_progress,
-                &|| cancel.load(Ordering::SeqCst),
-            ) {
-                Ok((kerf_core::RenderStatus::Completed, _)) => {}
-                // `render_variants` already removed the cancelled file.
-                Ok((kerf_core::RenderStatus::Cancelled, _)) => return Err("export cancelled".to_string()),
-                Err(e) => {
-                    discard_partial(&variant.output, before);
-                    return Err(e.to_string());
-                }
-            }
+        // `render_variants` writes the files one after another and removes the one that failed
+        // or was cancelled (only if this run touched it); the finished ones stay. Its progress
+        // is the event the webview already reads: which file, of how many, and the whole.
+        let mut on_progress = |p: kerf_core::VariantProgress| {
+            let _ = app.emit("export-progress", p);
+        };
+        match kerf_core::render_variants(&timeline, &assets, &variants, &options, &mut on_progress, &|| cancel()) {
+            Ok((kerf_core::RenderStatus::Completed, _)) => {}
+            Ok((kerf_core::RenderStatus::Cancelled, _)) => return Err("export cancelled".to_string()),
+            Err(e) => return Err(e.to_string()),
         }
         Ok(variants.iter().map(|v| v.output.to_string_lossy().into_owned()).collect())
     })
     .await
 }
 
+/// The error an abandoned cover export returns, for the webview to stay quiet on.
+const COVER_CANCELLED: &str = "cover export cancelled";
+
 /// Write the composited frame at `time_secs` to `output_path` as a **cover
 /// image** — full delivery resolution, decoded from the original media rather
 /// than a preview proxy. `format` follows the file extension when omitted.
+/// `cancel_cover_export` stops it, rejecting with `"cover export cancelled"`.
 #[tauri::command]
 async fn export_cover(
     state: State<'_, AppState>,
@@ -2642,37 +3890,248 @@ async fn export_cover(
     output_path: String,
     format: Option<kerf_core::ImageFormat>,
 ) -> CmdResult<String> {
-    require_local_output_path(&output_path)?;
+    require_user_output_path(&output_path)?;
     let shared = state.project.clone();
+    let cancel = state.cover_cancel.begin();
     blocking(move || {
         // Same shape as every heavy command: resolve under the lock, render
         // without it. A 4K still is a real decode.
-        let (timeline, assets) = lock_user(&shared).export_still_inputs().map_err(|e| e.to_string())?;
-        let path = Project::render_still(&timeline, &assets, time_secs, &output_path, format).map_err(|e| e.to_string())?;
+        let ((timeline, assets), protected) = {
+            let project = lock_user(&shared);
+            (
+                project.export_still_inputs().map_err(|e| e.to_string())?,
+                project.output_path_inputs().map_err(|e| e.to_string())?,
+            )
+        };
+        check_output(std::path::Path::new(&output_path), &protected).map_err(|e| e.to_string())?;
+        let path = Project::render_still_cancellable(&timeline, &assets, time_secs, &output_path, format, &|| cancel()).map_err(
+            |e| match e {
+                kerf_core::Error::Cancelled => COVER_CANCELLED.to_string(),
+                other => other.to_string(),
+            },
+        )?;
         Ok(path.to_string_lossy().into_owned())
     })
     .await
+}
+
+/// The video scopes of the composited frame at `time_secs`: the export's still of the cut (from
+/// the originals) read with the delivery's matrix. The summary always; the grids in `grids`.
+#[tauri::command]
+async fn get_scopes(
+    state: State<'_, AppState>,
+    time_secs: f64,
+    grids: Option<Vec<kerf_core::scopes::ScopeKind>>,
+    matrix: Option<kerf_core::scopes::ScopeMatrix>,
+    size: Option<kerf_core::scopes::GridSize>,
+    max_width: Option<u32>,
+) -> CmdResult<kerf_core::scopes::Scopes> {
+    let shared = state.project.clone();
+    blocking(move || {
+        let (timeline, assets) = lock_user(&shared).export_still_inputs().map_err(|e| e.to_string())?;
+        let req = kerf_core::scopes::ScopeRequest {
+            time_secs,
+            max_width: max_width.map(|w| w.clamp(64, kerf_core::scopes::MAX_SCOPE_WIDTH)),
+            matrix: matrix.unwrap_or_default(),
+            options: kerf_core::scopes::ScopeOptions {
+                grids: grids.unwrap_or_default(),
+                size: size.unwrap_or_default(),
+            },
+        };
+        kerf_core::scopes::timeline_scopes(&timeline, &assets, &req).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// How the Preview will play each span of the cut (`kerf_core::render_bar`): the GPU preview's
+/// compositor where it is on and draws the frame, the FFmpeg stream where it hands over, and the
+/// spans where playback stalls. `width` is the Preview's render width.
+#[tauri::command]
+async fn get_render_bar(
+    state: State<'_, AppState>,
+    gpu: State<'_, Arc<gpu_preview::GpuPreview>>,
+    width: Option<u32>,
+) -> CmdResult<kerf_core::render_bar::RenderBar> {
+    let shared = state.project.clone();
+    let caps = gpu.is_enabled().then_some(kerf_gpu::Compositor::CAPS);
+    blocking(move || {
+        // The project's rows under the lock; a proxy's state (a cached ffprobe, once per file)
+        // with it released.
+        let (timeline, assets, inputs) = {
+            let project = lock_user(&shared);
+            let (timeline, assets) = project.export_still_inputs().map_err(|e| e.to_string())?;
+            (timeline, assets, project.proxy_inputs().map_err(|e| e.to_string())?)
+        };
+        let waits = Project::proxy_waits_in(&timeline, kerf_core::proxy::effective_preview_source(), 0.0, None, |id| {
+            inputs
+                .iter()
+                .find(|i| i.asset.id == id)
+                .cloned()
+                .ok_or(kerf_core::Error::AssetNotFound(id))
+        })
+        .map_err(|e| e.to_string())?;
+        let req = kerf_core::render_bar::BarRequest {
+            caps,
+            width: width.unwrap_or(960).clamp(64, 1920),
+            color: kerf_core::composite_color_policy(),
+            media: &kerf_core::ProxyMedia,
+            // Named, not with the build's progress: the bar is asked again on an edit, not as a
+            // proxy builds, so a percentage would go stale under the pointer.
+            waits: waits
+                .iter()
+                .map(|w| (w.asset_id, format!("{} of {}", kerf_core::proxy::PROXY_WAIT_PREFIX, w.name)))
+                .collect(),
+        };
+        Ok(kerf_core::render_bar::render_bar(&timeline, &assets, &req))
+    })
+    .await
+}
+
+/// Stop the cover frame being written (if any).
+#[tauri::command(async)]
+fn cancel_cover_export(state: State<'_, AppState>) {
+    state.cover_cancel.stop();
+}
+
+/// The error an abandoned smart crop returns, for the webview to stay quiet on.
+const SMART_CROP_CANCELLED: &str = "smart crop cancelled";
+
+/// `smart-crop-progress`: how much of the shots have been sampled.
+#[derive(Serialize, Clone)]
+struct SmartCropProgress {
+    fraction: f64,
 }
 
 /// Frame every shot for the delivery frame instead of centring it blindly —
 /// samples where each clip's content sits and writes the crop that keeps it.
 /// One clip when `clip_id` is given, otherwise every clip on an unlocked video
 /// track. The result is an ordinary transform crop, so the inspector's sliders
-/// still have the last word.
+/// still have the last word. Streams `smart-crop-progress` (the fraction of clips
+/// sampled); `cancel_smart_crop` stops it, rejecting with `"smart crop cancelled"`.
 #[tauri::command]
-async fn smart_crop(state: State<'_, AppState>, clip_id: Option<String>) -> CmdResult<Timeline> {
-    let clip = clip_id.as_deref().map(id).transpose()?;
+async fn smart_crop(app: AppHandle, state: State<'_, AppState>, clip_id: Option<String>) -> CmdResult<Timeline> {
+    let clip = opt_id(clip_id.as_deref(), "clip_id")?;
     let shared = state.project.clone();
+    let cancel = state.smart_crop_cancel.begin();
     blocking(move || {
         // The usual shape for a heavy command: plan under the lock, decode
         // without it (one short ffmpeg pass per clip), apply under it again.
-        let plan = lock_user(&shared).smart_crop_inputs(clip).map_err(|e| e.to_string())?;
-        let crops = Project::sample_smart_crops(&plan).map_err(|e| e.to_string())?;
+        let (plan, generation) = {
+            let project = lock_user(&shared);
+            (
+                project.smart_crop_inputs(clip).map_err(|e| e.to_string())?,
+                project.generation(),
+            )
+        };
+        let mut on_progress = |fraction: f32| {
+            let _ = app.emit(
+                "smart-crop-progress",
+                SmartCropProgress {
+                    fraction: f64::from(fraction),
+                },
+            );
+        };
+        let stop = stop_or_replaced(cancel, &shared, generation);
+        let crops = Project::sample_smart_crops_with(&plan, &mut on_progress, &stop).map_err(|e| match e {
+            kerf_core::Error::Cancelled => SMART_CROP_CANCELLED.to_string(),
+            other => other.to_string(),
+        })?;
         let project = lock_user(&shared);
+        require_generation(&project, generation, "the shots were being framed")?;
         project.apply_smart_crops(&crops).map_err(|e| e.to_string())?;
         project.timeline().map_err(|e| e.to_string())
     })
     .await
+}
+
+/// Stop the smart crop in flight (if any).
+#[tauri::command(async)]
+fn cancel_smart_crop(state: State<'_, AppState>) {
+    state.smart_crop_cancel.stop();
+}
+
+/// What syncing a clip by its sound found, and the timeline after it.
+#[derive(serde::Serialize)]
+struct SyncedByAudio {
+    sync: kerf_core::AudioSync,
+    timeline: Timeline,
+}
+
+/// Move `clip_id` so its sound lines up with `reference_id`'s (linked partners follow).
+/// An unreliable match is reported without moving anything unless `force`; a forced sync of
+/// the pair just measured (the same decode) applies that measurement instead of decoding
+/// again. A wait for the heavy-job slot is told through `audio-sync-progress`;
+/// `cancel_audio_sync` stops it, which then rejects with `"audio sync cancelled"`.
+#[tauri::command]
+async fn sync_clips_by_audio(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    reference_id: String,
+    clip_id: String,
+    force: Option<bool>,
+) -> CmdResult<SyncedByAudio> {
+    let (reference, clip) = (id(&reference_id, "reference_id")?, id(&clip_id, "clip_id")?);
+    let force = force.unwrap_or(false);
+    let shared = state.project.clone();
+    let cancel = state.sync_cancel.begin();
+    let last = state.last_sync.clone();
+    blocking(move || {
+        let (plan, generation) = {
+            let project = lock_user(&shared);
+            (
+                project.audio_sync_inputs(reference, clip).map_err(|e| e.to_string())?,
+                project.generation(),
+            )
+        };
+        let cached = last
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|(p, _)| force && *p == plan)
+            .map(|(_, m)| *m);
+        let measured = match cached {
+            Some(m) => m,
+            None => {
+                let stop = stop_or_replaced(cancel, &shared, generation);
+                let m = Project::measure_audio_sync(
+                    &plan,
+                    &mut |w| {
+                        let _ = app.emit(
+                            "audio-sync-progress",
+                            VoiceoverProgressEvent {
+                                stage: "waiting".to_string(),
+                                fraction: None,
+                                detail: Some(w.message().to_string()),
+                            },
+                        );
+                    },
+                    &stop,
+                )
+                .map_err(|e| match e {
+                    kerf_core::Error::Cancelled => AUDIO_SYNC_CANCELLED.to_string(),
+                    other => other.to_string(),
+                })?;
+                *last.lock().unwrap_or_else(|e| e.into_inner()) = Some((plan, m));
+                m
+            }
+        };
+        let project = lock_user(&shared);
+        require_generation(&project, generation, "the clips were being synced")?;
+        let sync = project.apply_audio_sync(&measured, force).map_err(|e| e.to_string())?;
+        let timeline = project.timeline().map_err(|e| e.to_string())?;
+        Ok(SyncedByAudio { sync, timeline })
+    })
+    .await
+}
+
+/// The error a stopped sync returns, for the webview to stay quiet on.
+const AUDIO_SYNC_CANCELLED: &str = "audio sync cancelled";
+
+/// Stop the sync by audio in flight (if any): it gives up while it waits for the slot or
+/// between its decodes, and [`sync_clips_by_audio`] rejects with `"audio sync cancelled"`.
+#[tauri::command(async)]
+fn cancel_audio_sync(state: State<'_, AppState>) {
+    state.sync_cancel.stop();
 }
 
 /// Every publishing target Kerf knows about, with its frame and length limits.
@@ -2726,7 +4185,7 @@ const ANALYSIS_CANCELLED: &str = "analysis cancelled";
 /// transcription, about once a second — then gives up and caches nothing.
 #[tauri::command(async)]
 fn cancel_analysis(state: State<'_, AppState>) {
-    state.analysis_cancel.store(true, Ordering::SeqCst);
+    state.analysis_cancel.stop();
 }
 
 /// Request cancellation of the in-flight export (if any). The running
@@ -2734,18 +4193,10 @@ fn cancel_analysis(state: State<'_, AppState>) {
 /// ffmpeg, and returns the `"export cancelled"` error.
 #[tauri::command(async)]
 fn cancel_export(state: State<'_, AppState>) {
-    state.export_cancel.store(true, Ordering::SeqCst);
+    state.export_cancel.stop();
 }
 
 // ---- agent connection (MCP endpoint) ---------------------------------------
-
-/// The local MCP endpoint URL a connected LLM points at (e.g.
-/// `http://127.0.0.1:7777/mcp`), honoring the `KERF_MCP_ADDR` override. The
-/// agent panel surfaces this so the user knows how to connect their agent.
-#[tauri::command(async)]
-fn mcp_endpoint() -> String {
-    mcp::endpoint_url()
-}
 
 /// Where the endpoint is, and how long ago an agent last used it.
 ///
@@ -2770,6 +4221,14 @@ fn agent_status() -> AgentStatus {
         last_seen_secs: mcp::agent_last_seen_secs(),
         error: mcp::server_error(),
     }
+}
+
+/// What the editor window shows (playhead, selection, marks, visible range,
+/// focused panel), for the MCP `get_editor_context` tool. The webview sends it
+/// debounced and as a heartbeat; it is kept in app state, not in the project.
+#[tauri::command(async)]
+fn report_ui_context(state: State<'_, editor_context::EditorContextState>, context: editor_context::UiContext) {
+    state.report(context);
 }
 
 // ---- app settings ----------------------------------------------------------
@@ -2810,6 +4269,33 @@ fn set_settings(
         }
     }
     Ok(settings::SettingsView::current(&stored))
+}
+
+/// Put every preference back to its default (the old file is kept beside it as
+/// `settings.reset-<time>.json`) and answer with the resolved view.
+#[tauri::command(async)]
+fn reset_settings(app: AppHandle, gpu: State<'_, Arc<gpu_preview::GpuPreview>>) -> CmdResult<settings::SettingsView> {
+    let stored = settings::reset(&app)?;
+    // The proxy size and the preview source are back to theirs: queue what is missing and have
+    // the preview decode from whichever file it should now.
+    respawn_proxies(&app);
+    let _ = app.emit("proxy-ready", ());
+    if gpu.set_enabled(stored.gpu_preview) {
+        let gpu = gpu.inner().clone();
+        std::thread::spawn(move || gpu.teardown_if_off());
+    }
+    Ok(settings::SettingsView::current(&stored))
+}
+
+/// Show the settings file in the OS file manager (it is written first if there is none yet).
+#[tauri::command(async)]
+fn reveal_settings_file(app: AppHandle) -> CmdResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let file = settings::file_path(&app).ok_or("no config directory available for settings")?;
+    if !file.exists() {
+        settings::update(&app, &serde_json::json!({}))?;
+    }
+    app.opener().reveal_item_in_dir(&file).map_err(|e| e.to_string())
 }
 
 // ---- theme files -----------------------------------------------------------
@@ -2868,16 +4354,9 @@ async fn write_text_file(path: String, contents: String) -> CmdResult<String> {
 // ---- diagnostics (logs) ----------------------------------------------------
 
 /// Where the logfiles live: `<app data dir>/logs`. The one place this is
-/// decided, so `init_logging`, `log_dir` and `reveal_logs` cannot disagree.
+/// decided, so `init_logging` and `reveal_logs` cannot disagree.
 fn log_dir_path(app: &AppHandle) -> tauri::Result<std::path::PathBuf> {
     app.path().app_data_dir().map(|dir| dir.join("logs"))
-}
-
-#[tauri::command(async)]
-fn log_dir(app: AppHandle) -> CmdResult<String> {
-    log_dir_path(&app)
-        .map(|p| p.to_string_lossy().into_owned())
-        .map_err(|e| e.to_string())
 }
 
 /// Open the log directory in the OS file manager so users can attach the file.
@@ -2972,9 +4451,15 @@ fn log_frontend(level: String, message: String, context: Option<String>) {
 /// when the user hasn't (an explicit override wins) and the bundled binary is
 /// actually present, so dev builds — which have no sidecar — transparently fall
 /// back to a bare `ffmpeg`/`ffprobe` PATH lookup.
-fn use_bundled_ffmpeg() {
-    let Ok(exe) = std::env::current_exe() else { return };
-    let Some(dir) = exe.parent() else { return };
+///
+/// **Must run before anything else in the process starts a thread** (it is the first statement of
+/// [`run`]): `set_var` races every concurrent read of the environment, and the runtime, the
+/// webview and ffmpeg's own children all read it. Logging is not up yet either, so what was set
+/// is returned for `setup` to log.
+fn use_bundled_ffmpeg() -> Vec<(&'static str, std::path::PathBuf)> {
+    let mut set = Vec::new();
+    let Ok(exe) = std::env::current_exe() else { return set };
+    let Some(dir) = exe.parent() else { return set };
     for (var, name) in [("KERF_FFMPEG", "ffmpeg"), ("KERF_FFPROBE", "ffprobe")] {
         if std::env::var_os(var).is_some() {
             continue;
@@ -2982,9 +4467,10 @@ fn use_bundled_ffmpeg() {
         let path = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
         if path.is_file() {
             std::env::set_var(var, &path);
-            tracing::info!(%var, path = %path.display(), "using bundled FFmpeg binary");
+            set.push((var, path));
         }
     }
+    set
 }
 
 /// The daily-rolling `kerf.<date>.log` in `dir` (the last 14 days are kept).
@@ -3141,6 +4627,9 @@ struct LaunchSlot {
     request: Option<LaunchProject>,
     /// The webview has asked, so it is listening.
     taken: bool,
+    /// Something was asked for by name (a command line, a second launch), so the project a
+    /// setting would reopen is not wanted.
+    named: bool,
 }
 
 impl LaunchSlot {
@@ -3152,8 +4641,23 @@ impl LaunchSlot {
 
     fn hold(&mut self, request: LaunchProject) {
         if request != LaunchProject::Nothing {
+            self.named = true;
             self.request = Some(request);
         }
+    }
+
+    /// The project a setting reopens, once the disk has said it is there. It gives way to anything
+    /// asked for by name, however early or late either arrives: `None` when the page will pick it
+    /// up (or something was named), `Some` when the page is already listening and must be told.
+    fn offer_reopen(&mut self, path: String) -> Option<LaunchProject> {
+        if self.named {
+            return None;
+        }
+        if self.taken {
+            return Some(LaunchProject::Open(path));
+        }
+        self.request = Some(LaunchProject::Open(path));
+        None
     }
 
     /// A second launch's request. `None`: held for the webview to take. `Some`:
@@ -3162,6 +4666,7 @@ impl LaunchSlot {
         if request == LaunchProject::Nothing {
             return None;
         }
+        self.named = true;
         if self.taken {
             return Some(request);
         }
@@ -3290,6 +4795,23 @@ fn deliver_launch(app: &AppHandle, request: LaunchProject) {
     }
 }
 
+/// With nothing named on the command line and the setting on: ask the disk whether the project
+/// that was open last is still there and hand it to the page like a named one — held for the
+/// page's pull while it boots, or as an event when it is already listening (a slow share).
+fn reopen_last_project(app: &AppHandle, stored: &settings::Settings) {
+    let Some(path) = settings::reopen_target(stored, |p| p.is_file()) else {
+        return;
+    };
+    tracing::info!(path, "reopening the project that was open last");
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let undelivered = state.launch.lock().unwrap_or_else(|e| e.into_inner()).offer_reopen(path);
+    if let Some(request) = undelivered {
+        deliver_launch(app, request);
+    }
+}
+
 fn on_second_launch(app: &AppHandle, argv: Vec<String>, cwd: String) {
     tracing::info!(?argv, "second launch; focusing the running window");
     let state = app.try_state::<AppState>();
@@ -3317,6 +4839,8 @@ fn on_second_launch(app: &AppHandle, argv: Vec<String>, cwd: String) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before a thread exists: this sets environment variables.
+    let bundled_ffmpeg = use_bundled_ffmpeg();
     // Start on a fresh, empty in-memory project; the user opens an existing
     // `.kerf` file or imports media to populate it.
     let project = Arc::new(Mutex::new(Project::open_in_memory().expect("failed to create empty project")));
@@ -3336,30 +4860,32 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .manage(AppState {
-            project: project.clone(),
-            export_cancel: Arc::new(AtomicBool::new(false)),
-            analysis_cancel: Arc::new(AtomicBool::new(false)),
-            levels_cancel: Arc::new(AtomicBool::new(false)),
-            voiceover_cancel: Arc::new(AtomicBool::new(false)),
-            stems_cancel: Arc::new(AtomicBool::new(false)),
-            main_window_shown: main_window_shown.clone(),
-            launch: Mutex::new(LaunchSlot::new(launch.clone())),
-            scrub: scrub.clone(),
-        })
+        .manage(AppState::new(
+            project.clone(),
+            main_window_shown.clone(),
+            LaunchSlot::new(launch.clone()),
+            scrub.clone(),
+        ))
         .manage(popout::PopoutState::default())
+        .manage(editor_context::EditorContextState::default())
+        .manage(Mutex::new(recovery::RecoveryState::default()))
         .on_window_event(popout::on_window_event)
         .setup(move |app| {
             // Logging needs the resolved app data directory, so set it up here
             // (before anything else in setup) rather than at the top of `run`.
             init_logging(app.handle());
             install_panic_hook();
+            set_app_dirs(app.handle());
+            // The untitled project moves into a crash-recovery file before anything can edit it.
+            recovery::start(app.handle());
             // The editor window is built here, not by Tauri from the config (`create:
             // false` there): only a builder can carry the handler that lets a panel
             // be detached into a window of its own. Otherwise exactly what the config
             // says — hidden until the page has themed itself, see `show_main_window`.
             popout::create_main_window(app)?;
-            use_bundled_ffmpeg();
+            for (var, path) in &bundled_ffmpeg {
+                tracing::info!(%var, path = %path.display(), "using bundled FFmpeg binary");
+            }
             // Before anything can spawn ffmpeg: how much of the machine it may take.
             // The previous run died during the GPU preview's first frame (a driver crash): it must not
             // do it again on every launch, so the setting goes off before it is read.
@@ -3372,6 +4898,14 @@ pub fn run() {
             }
             let stored = settings::load(app.handle());
             settings::apply(&stored);
+            // With nothing named on the command line, the setting may ask for the project that
+            // was open last. The page takes it like any other launch request.
+            // Whether the file is still there is asked of the disk on a thread of its own: a project on
+            // a share that is offline would otherwise hold the whole launch (this is the main thread).
+            if launch == LaunchProject::Nothing && stored.reopen_last_project {
+                let (handle, stored) = (app.handle().clone(), stored.clone());
+                std::thread::spawn(move || reopen_last_project(&handle, &stored));
+            }
             // The GPU preview builds nothing until a frame wants it; this is only the setting.
             let gpu = Arc::new(gpu_preview::GpuPreview::for_app(app.handle().clone(), crashed, scrub));
             gpu.set_enabled(stored.gpu_preview);
@@ -3391,6 +4925,9 @@ pub fn run() {
                 LaunchProject::Missing(path) => tracing::warn!(path, "this launch named a project file that does not exist"),
                 LaunchProject::Nothing => {}
             }
+            // Read the machine's fonts off the first Play of an animated title.
+            std::thread::spawn(kerf_core::fonts::warm);
+            std::thread::spawn(warm_transcription_backend);
             // The window is created hidden; if the webview never asks for it
             // (`show_main_window`), this does.
             spawn_reveal_failsafe(app.handle().clone(), main_window_shown, REVEAL_FAILSAFE);
@@ -3398,12 +4935,7 @@ pub fn run() {
             // The app *is* the MCP server: host the tools over HTTP, sharing the
             // same Project the GUI edits, so a connected LLM works on the open
             // project and its edits show up live.
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = mcp::serve(project, handle).await {
-                    tracing::error!(error = %e, "MCP server stopped");
-                }
-            });
+            mcp::start(app.handle(), project);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -3415,7 +4947,16 @@ pub fn run() {
             new_project,
             open_project,
             save_project_as,
+            recent_projects,
+            open_recent,
+            clear_recent_projects,
+            remove_asset,
+            relink_asset,
+            check_relink,
+            missing_assets,
+            paths_exist,
             import_asset,
+            cancel_import,
             analyze_asset,
             analysis_statuses,
             proxy_statuses,
@@ -3424,6 +4965,7 @@ pub fn run() {
             transcription_status,
             set_speech_model,
             download_speech_model,
+            cancel_model_download,
             voiceover_status,
             prepare_voiceover,
             generate_voiceover,
@@ -3452,6 +4994,7 @@ pub fn run() {
             set_master_volume,
             set_master_limiter,
             set_master_duck,
+            set_master_true_peak,
             plan_music_fit,
             fit_music,
             stems_status,
@@ -3475,6 +5018,8 @@ pub fn run() {
             set_color,
             set_transition,
             set_mask,
+            set_grade,
+            inspect_lut,
             set_video_effects,
             set_audio_effects,
             set_keyframes,
@@ -3495,14 +5040,36 @@ pub fn run() {
             update_overlay,
             remove_overlay,
             set_overlay_keyframes,
+            add_svg_overlay,
+            update_svg_overlay,
+            remove_svg_overlay,
+            validate_svg,
+            list_svg_presets,
+            svg_preset_preview,
+            list_templates,
+            template_poster,
+            svg_element_ids,
+            template_image_value,
+            save_template,
+            apply_template,
+            set_template_values,
+            import_template,
+            export_template,
+            delete_template,
             generate_captions,
             clear_captions,
             import_captions,
             import_captions_text,
             export_srt,
+            export_captions,
+            export_interchange,
+            export_markers,
+            refine_transcript,
             remove_silence,
             snap_to_beats,
             smart_crop,
+            sync_clips_by_audio,
+            cancel_audio_sync,
             extract_audio,
             add_asset_audio,
             detach_audio,
@@ -3517,7 +5084,11 @@ pub fn run() {
             get_staged_edit,
             get_staged_timeline,
             apply_staged_edit,
+            apply_staged_subset,
             discard_staged_edit,
+            undo_staged_edit,
+            discarded_staged_edit,
+            restore_discarded_edits,
             undo,
             redo,
             revert_to,
@@ -3526,10 +5097,9 @@ pub fn run() {
             get_preview_frame,
             set_preview_bounds,
             gpu_preview_status,
-            gpu_preview_diagnostics,
+            playback_session,
             start_playback,
             stop_playback,
-            get_waveform,
             get_waveform_range,
             get_filmstrip,
             get_audio,
@@ -3544,20 +5114,32 @@ pub fn run() {
             cancel_export,
             cancel_analysis,
             export_cover,
+            cancel_cover_export,
+            cancel_smart_crop,
+            get_scopes,
+            get_render_bar,
             platform_targets,
             platform_check,
             reveal_path,
-            mcp_endpoint,
             agent_status,
+            mcp_commands::mcp_connection_info,
+            mcp_commands::regenerate_mcp_token,
+            mcp_commands::set_mcp_settings,
+            report_ui_context,
             get_settings,
             set_settings,
+            reset_settings,
+            reveal_settings_file,
             read_text_file,
             write_text_file,
-            log_dir,
             reveal_logs,
             log_frontend,
             show_main_window,
             take_launch_project,
+            recovery::list_recoveries,
+            recovery::recover_project,
+            recovery::discard_recovery,
+            recovery::discard_recovery_at_exit,
             popout::popout_expect,
             popout::popout_cancel,
             popout::close_popout,
@@ -3566,10 +5148,11 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building Kerf")
-        .run(|_app, event| {
+        .run(|app, event| {
             // The logfile's last line then says whether the end was a clean exit
             // or a crash.
             if let tauri::RunEvent::Exit = event {
+                recovery::on_exit(app);
                 tracing::info!("kerf exiting");
             }
         });
@@ -3578,9 +5161,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        bring_forward, file_appender, file_layer, filmstrip_payload, launch_project, log_panic, panic_summary, playback_message,
-        project_arg, require_json_path, require_local_output_path, reveal_once, truncate_log, LaunchProject, LaunchSlot,
-        LogBudget, FRONTEND_LOG_PER_SEC, PLAYBACK_HEADER_BYTES, REVEAL_FAILSAFE,
+        bring_forward, check_output_path, file_appender, file_layer, filmstrip_payload, id, ids, launch_project, log_panic,
+        opt_id, panic_summary, playback_message, playback_session, project_arg, require_generation, require_json_path,
+        require_local_output_path, reveal_once, truncate_log, LaunchProject, LaunchSlot, LogBudget, PathSource, Playbacks,
+        StopEpoch, FRONTEND_LOG_PER_SEC, PLAYBACK_HEADER_BYTES, REVEAL_FAILSAFE,
     };
     use base64::Engine as _;
     use kerf_core::{Filmstrip, FilmstripSheet};
@@ -3662,7 +5246,64 @@ mod tests {
         assert!(require_local_output_path("/home/user/out.mp4").is_ok());
         assert!(require_local_output_path("C:\\Users\\me\\out.mp4").is_ok());
         assert!(require_local_output_path("c:/Users/me/out.mp4").is_ok());
-        assert!(require_local_output_path("\\\\server\\share\\out.mp4").is_ok());
+        assert!(
+            require_local_output_path("\\\\?\\C:\\Users\\me\\out.mp4").is_ok(),
+            "the verbatim spelling of a local drive is local"
+        );
+    }
+
+    const NETWORK_PATHS: [&str; 8] = [
+        "\\\\server\\share\\out.mp4",
+        "//server/share/out.mp4",
+        "\\/server/share/out.mp4",
+        "/\\server\\share\\out.mp4",
+        "\\\\?\\UNC\\server\\share\\out.mp4",
+        "//?/UNC/server/share/out.mp4",
+        "\\\\.\\pipe\\kerf",
+        "\\\\localhost\\c$\\out.mp4",
+    ];
+
+    #[test]
+    fn an_agent_may_not_name_a_network_share_on_windows() {
+        for bad in NETWORK_PATHS {
+            let why = check_output_path(bad, PathSource::Agent, true).expect_err(bad);
+            assert!(why.contains("network"), "{bad}: {why}");
+        }
+    }
+
+    #[test]
+    fn a_double_slash_is_an_ordinary_absolute_path_off_windows() {
+        for ok in ["//tmp/out.mp4", "///tmp/out.mp4", "//home/user/out.mp4"] {
+            assert!(check_output_path(ok, PathSource::Agent, false).is_ok(), "{ok}");
+            assert!(check_output_path(ok, PathSource::User, false).is_ok(), "{ok}");
+        }
+        // The backslash forms are Windows spellings and no absolute path anywhere else.
+        for bad in ["\\\\server\\share\\out.mp4", "\\/server/share/out.mp4", "\\\\.\\pipe\\kerf"] {
+            assert!(check_output_path(bad, PathSource::Agent, false).is_err(), "{bad}");
+            assert!(check_output_path(bad, PathSource::User, false).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_share_picked_in_the_save_dialog_is_the_users_intent_on_windows() {
+        for ok in [
+            "\\\\nas\\share\\out.mp4",
+            "//nas/share/out.mp4",
+            "\\\\?\\UNC\\nas\\share\\out.mp4",
+            "C:\\Users\\me\\out.mp4",
+        ] {
+            assert!(check_output_path(ok, PathSource::User, true).is_ok(), "{ok}");
+        }
+        // The device namespace is never an output, and the rest of the rules still hold.
+        for bad in [
+            "\\\\.\\pipe\\kerf",
+            "\\\\?\\GLOBALROOT\\Device\\x",
+            "https://nas/share/out.mp4",
+            "out.mp4",
+            "pipe:1",
+        ] {
+            assert!(check_output_path(bad, PathSource::User, true).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -3787,6 +5428,84 @@ mod tests {
     }
 
     #[test]
+    fn template_files_are_only_read_as_kerftemplate() {
+        use super::require_template_path;
+        assert!(require_template_path("/t/card.kerftemplate").is_ok());
+        assert!(require_template_path("C:\\t\\CARD.KERFTEMPLATE").is_ok());
+        assert!(require_template_path("/home/u/.bashrc").is_err());
+        assert!(require_template_path("/t/card.kerftemplate.zip").is_err());
+        assert!(require_template_path("/t/card").is_err());
+    }
+
+    /// The ids command takes text straight from the webview: a title is at most 128 KiB, and a document
+    /// over that is refused before anything is parsed.
+    #[test]
+    fn the_ids_of_a_title_are_listed_for_a_title_that_could_be_one() {
+        let ok = super::svg_element_ids(r#"<svg xmlns="http://www.w3.org/2000/svg"><text id="a"/><g id="b"/></svg>"#.to_string())
+            .unwrap();
+        assert_eq!(
+            ok.iter().map(|e| (e.id.as_str(), e.tag.as_str())).collect::<Vec<_>>(),
+            [("a", "text"), ("b", "g")]
+        );
+        let big = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><text id="a"/><!--{}--></svg>"#,
+            "x".repeat(200 * 1024)
+        );
+        let e = super::svg_element_ids(big).err().expect("over the size of a title");
+        assert!(e.contains("larger than 128 KiB"), "{e}");
+        assert!(super::svg_element_ids("not svg".to_string()).is_err());
+    }
+
+    /// A picture for an image control is read bounded, and the engine judges it: a file that is not a
+    /// picture, a relative path, a directory and an oversized file are all refused with a reason.
+    #[test]
+    fn a_picture_for_a_template_is_read_bounded_and_judged_by_the_engine() {
+        use super::template_image_data_url;
+        let limit = kerf_core::template::MAX_IMAGE_BYTES as u64;
+        let dir = Scratch::new("template-image");
+        let png = dir.0.join("logo.png");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAEklEQVR4nGP4z8DwHxkzkC4AADxAH+HggXe0AAAAAElFTkSuQmCC")
+            .unwrap();
+        std::fs::write(&png, &bytes).unwrap();
+        let url = template_image_data_url(png.to_str().unwrap()).unwrap();
+        assert!(url.starts_with("data:image/png;base64,"), "{url}");
+
+        let refused = |path: &Path| template_image_data_url(path.to_str().unwrap()).unwrap_err().to_string();
+        assert!(template_image_data_url("logo.png")
+            .unwrap_err()
+            .to_string()
+            .contains("absolute"));
+        assert!(refused(&dir.0).contains("not a regular file"));
+        assert!(refused(&dir.0.join("missing.png")).contains("cannot read"));
+        let text = dir.0.join("notes.txt");
+        std::fs::write(&text, "not a picture").unwrap();
+        assert!(refused(&text).contains("PNG, JPEG, GIF or WebP"));
+        // The bound is the engine's own: a file one byte over what fits in a title is refused, whatever
+        // it is, and without being read whole (a huge sparse one answers at once).
+        let big = dir.0.join("big.png");
+        let file = std::fs::File::create(&big).unwrap();
+        file.set_len(limit + 1).unwrap();
+        let why = refused(&big);
+        assert!(why.contains("is 95 KiB") && why.contains("at most 94 KiB"), "{why}");
+        let huge = dir.0.join("huge.png");
+        std::fs::File::create(&huge).unwrap().set_len(8 << 30).unwrap();
+        assert!(refused(&huge).contains("too large"));
+        // A picture that is within the bound but not one the engine takes is the engine's refusal.
+        let mut padded = bytes;
+        padded.resize(limit as usize, 0);
+        assert!(template_image_data_url(write(&dir.0, "padded.png", &padded).to_str().unwrap()).is_ok());
+        padded.push(0);
+        assert!(refused(&write(&dir.0, "over.png", &padded)).contains("too large"));
+    }
+
+    fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
     fn the_first_launch_opens_the_kerf_it_was_given() {
         let there = |_: &Path| true;
         let nowhere = |_: &Path| false;
@@ -3889,6 +5608,33 @@ mod tests {
         assert_eq!(slot.offer(LaunchProject::Nothing), None);
         assert_eq!(slot.take(), Some(open("/first.kerf")), "and does not clobber what is waiting");
         assert_eq!(slot.offer(LaunchProject::Nothing), None);
+    }
+
+    #[test]
+    fn the_project_a_setting_reopens_arrives_whenever_the_disk_answers_and_never_beats_a_named_one() {
+        let open = |p: &str| LaunchProject::Open(p.to_string());
+        // The disk answers before the page asks: it is held for the page's pull.
+        let mut slot = LaunchSlot::new(LaunchProject::Nothing);
+        assert_eq!(slot.offer_reopen("/last.kerf".to_string()), None);
+        assert_eq!(slot.take(), Some(open("/last.kerf")));
+
+        // After: a slow share. The page is listening, so it is told as an event, once.
+        let mut slot = LaunchSlot::new(LaunchProject::Nothing);
+        assert_eq!(slot.take(), None);
+        assert_eq!(slot.offer_reopen("/last.kerf".to_string()), Some(open("/last.kerf")));
+
+        // A project named on the command line, or by a second launch, is the one wanted.
+        let mut slot = LaunchSlot::new(open("/named.kerf"));
+        assert_eq!(slot.offer_reopen("/last.kerf".to_string()), None);
+        assert_eq!(slot.take(), Some(open("/named.kerf")));
+        let mut slot = LaunchSlot::new(LaunchProject::Nothing);
+        assert_eq!(slot.take(), None);
+        assert_eq!(slot.offer(open("/second.kerf")), Some(open("/second.kerf")));
+        assert_eq!(slot.offer_reopen("/last.kerf".to_string()), None, "the late reopen gives way");
+        let mut slot = LaunchSlot::new(LaunchProject::Nothing);
+        assert_eq!(slot.offer(open("/second.kerf")), None);
+        assert_eq!(slot.offer_reopen("/last.kerf".to_string()), None);
+        assert_eq!(slot.take(), Some(open("/second.kerf")));
     }
 
     #[test]
@@ -4100,5 +5846,255 @@ mod tests {
             logs.contains("last words before the crash"),
             "the very last line is in the file"
         );
+    }
+
+    #[test]
+    fn a_bad_id_names_the_argument_it_came_from() {
+        let good = "3f2b1c9e-5a7d-4e0a-9c1b-2d4f6a8b0c1d";
+        assert!(id(good, "clip_id").is_ok());
+        let why = id("not-an-id", "clip_id").unwrap_err();
+        assert!(why.contains("clip_id") && why.contains("not-an-id"), "{why}");
+        let why = opt_id(Some(""), "track_id").unwrap_err();
+        assert!(why.contains("track_id"), "{why}");
+        assert_eq!(opt_id(None, "track_id"), Ok(None));
+        let list = vec![good.to_string(), good.to_string(), "oops".to_string()];
+        let why = ids(&list, "clip_ids").unwrap_err();
+        assert!(why.contains("clip_ids[2]"), "the entry that is wrong is named: {why}");
+        assert_eq!(ids(&list[..2], "clip_ids").unwrap().len(), 2);
+        let long = "x".repeat(10_000);
+        assert!(
+            id(&long, "asset_id").unwrap_err().len() < 300,
+            "a pasted blob is not echoed whole"
+        );
+    }
+
+    #[test]
+    fn a_stop_reaches_every_job_that_began_before_it_and_none_after() {
+        let stop = StopEpoch::default();
+        let (first, second) = (stop.begin(), stop.begin());
+        assert!(!first() && !second());
+        stop.stop();
+        assert!(first() && second(), "one stop ends the whole batch");
+        let later = stop.begin();
+        assert!(!later(), "a job that began after the stop is not cancelled by it");
+        stop.stop();
+        assert!(later());
+    }
+
+    /// An agent's long job takes its stop from the same epoch as the GUI button that cancels it, and
+    /// from no other: pressing Stop on a voiceover must not end an export.
+    #[test]
+    fn an_agents_long_jobs_stop_with_their_own_cancel_buttons() {
+        use crate::AppState;
+        use kerf_core::Project;
+        use std::sync::{Arc, Mutex};
+        let state = AppState::new(
+            Arc::new(Mutex::new(Project::open_in_memory().unwrap())),
+            Arc::new(AtomicBool::new(false)),
+            LaunchSlot::default(),
+            Arc::new(kerf_core::ScrubFrames::new(kerf_core::ScrubConfig::default())),
+        );
+        type Running = Box<dyn Fn() -> bool>;
+        let jobs: [(&str, Running, &StopEpoch); 7] = [
+            ("voiceover", Box::new(state.begin_voiceover()), &state.voiceover_cancel),
+            ("stems", Box::new(state.begin_stems()), &state.stems_cancel),
+            ("smart crop", Box::new(state.begin_smart_crop()), &state.smart_crop_cancel),
+            ("export", Box::new(state.begin_export()), &state.export_cancel),
+            ("analysis", Box::new(state.begin_analysis()), &state.analysis_cancel),
+            ("cover", Box::new(state.begin_cover_export()), &state.cover_cancel),
+            ("import", Box::new(state.begin_import()), &state.import_stop),
+        ];
+        for (name, running, _) in &jobs {
+            assert!(!running(), "{name} starts clean");
+        }
+        for (pressed, (name, _, button)) in jobs.iter().enumerate() {
+            button.stop();
+            for (at, (other, running, _)) in jobs.iter().enumerate() {
+                assert_eq!(running(), at <= pressed, "{other} after the {name} button");
+            }
+        }
+        let later = state.begin_voiceover();
+        assert!(!later(), "a Stop pressed before a run began does not end it");
+        state.voiceover_cancel.stop();
+        assert!(later());
+    }
+
+    #[test]
+    fn a_job_for_a_replaced_project_is_refused() {
+        use kerf_core::Project;
+        let mut project = Project::open_in_memory().unwrap();
+        let noted = project.generation();
+        assert!(require_generation(&project, noted, "importing").is_ok());
+        project.replace_with(Project::open_in_memory().unwrap()).close();
+        let why = require_generation(&project, noted, "importing").unwrap_err();
+        assert!(why.contains("replaced") && why.contains("importing"), "{why}");
+        assert!(require_generation(&project, project.generation(), "importing").is_ok());
+    }
+
+    /// Save As swaps in the reopened copy without moving the generation: a job that noted it before
+    /// (an analysis, an import, a voiceover) still lands in the project, and a swap that is another
+    /// project (open / new) still drops it.
+    #[test]
+    fn a_job_in_flight_still_lands_after_a_save_as() {
+        use kerf_core::{AnalysisKind, AssetAnalysis, Project, TimeRange};
+        let dir = std::env::temp_dir().join(format!("kerf-save-as-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut project = Project::sample().unwrap();
+        let Some(asset) = project.list_assets().ok().and_then(|a| a.into_iter().next()) else {
+            panic!("the sample project lists an asset");
+        };
+
+        // The job resolved its inputs under the old project, and is running with the lock released.
+        let noted = project.generation();
+        let changes = project.change_count();
+        let copy = dir.join("copy.kerf");
+        project.save_as(&copy).unwrap();
+        project.replace_with_saved_copy(Project::open(&copy).unwrap()).close();
+
+        require_generation(&project, noted, "it was being analysed").expect("the same project, in another file");
+        assert!(project.change_count() > changes, "the count only goes up");
+        let patch = AssetAnalysis {
+            asset_id: asset.id,
+            silence_segments: vec![TimeRange { start: 1.0, end: 2.0 }],
+            ran: vec![AnalysisKind::Silence],
+            ..AssetAnalysis::default()
+        };
+        project.merge_analysis(&patch).expect("what the job found lands");
+        assert!(project.get_analysis(asset.id).unwrap().is_some());
+
+        // Another project is another generation, and drops the job.
+        project.replace_with(Project::open_in_memory().unwrap()).close();
+        assert!(require_generation(&project, noted, "it was being analysed").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The generation check polled from a job's cancel is asked at most once per interval.
+    #[test]
+    fn the_replaced_check_is_throttled_and_sticks_once_true() {
+        use std::cell::Cell;
+        let asked = Cell::new(0u32);
+        let moved = Cell::new(false);
+        let check = crate::Throttled::new(std::time::Duration::from_millis(60), || {
+            asked.set(asked.get() + 1);
+            moved.get()
+        });
+        for _ in 0..100 {
+            assert!(!check.ask());
+        }
+        assert_eq!(asked.get(), 1, "a hundred polls in a hurry are one question");
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(!check.ask());
+        assert_eq!(asked.get(), 2, "and it is asked again after the interval");
+        moved.set(true);
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(check.ask(), "the project was replaced");
+        let after = asked.get();
+        assert!(check.ask() && check.ask());
+        assert_eq!(asked.get(), after, "once it is true it stays true, unasked");
+    }
+
+    /// A job stops for the user's Stop or for a replaced project, whichever comes first.
+    #[test]
+    fn a_job_stops_for_a_stop_or_for_a_replaced_project() {
+        use kerf_core::Project;
+        let shared = std::sync::Mutex::new(Project::open_in_memory().unwrap());
+        let generation = crate::lock_user(&shared).generation();
+        let stop = StopEpoch::default();
+        let cancel = crate::stop_or_replaced(stop.begin(), &shared, generation);
+        assert!(!cancel(), "nothing happened");
+        stop.stop();
+        assert!(cancel(), "the user's Stop");
+
+        let cancel = crate::stop_or_replaced(stop.begin(), &shared, generation);
+        assert!(!cancel());
+        crate::lock_user(&shared)
+            .replace_with(Project::open_in_memory().unwrap())
+            .close();
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        assert!(cancel(), "the project it began on was replaced");
+    }
+
+    /// Kerf's own settings and logs are never somewhere to write an output.
+    #[test]
+    fn an_output_is_refused_inside_kerfs_own_directories() {
+        let config = std::env::temp_dir().join(format!("kerf-config-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&config).unwrap();
+        let _ = crate::APP_DIRS.set(vec![(config.clone(), "Kerf's settings".to_string())]);
+        let protected = kerf_core::paths::Protected::default();
+        let inside = config.join("settings.json");
+        let err = crate::check_output(&inside, &protected).unwrap_err().to_string();
+        assert!(err.contains("Kerf's settings"), "{err}");
+        assert!(crate::check_output(&config.join("anything").join("deeper.mp4"), &protected).is_err());
+        let elsewhere = std::env::temp_dir().join("kerf-out-elsewhere.mp4");
+        assert!(crate::check_output(&elsewhere, &protected).is_ok());
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    /// A page's id for its `n`th playback, as `playback-id.ts` builds it.
+    fn page_id(session: u64, n: u64) -> u64 {
+        (session << 32) | n
+    }
+
+    #[test]
+    fn the_newest_playback_wins_whatever_order_the_calls_arrive_in() {
+        let p = Playbacks::new();
+        p.begin(6);
+        p.begin(5);
+        assert!(!p.ended(6), "a start that arrives late does not take the pane back");
+        assert!(p.ended(5), "and its own stream ends at once");
+        assert!(p.ended(7), "an id that never began is not running");
+    }
+
+    #[test]
+    fn a_stop_that_arrives_before_its_start_still_ends_the_stream() {
+        let p = Playbacks::new();
+        p.stop(4);
+        p.begin(4);
+        assert!(p.ended(4), "the stream notices at its first frame");
+        p.begin(5);
+        assert!(!p.ended(5), "the next playback is not held back by it");
+    }
+
+    #[test]
+    fn stopping_an_old_stream_does_not_end_the_one_that_replaced_it() {
+        let p = Playbacks::new();
+        p.begin(1);
+        p.begin(2);
+        p.stop(1);
+        assert!(!p.ended(2));
+        p.stop(2);
+        assert!(p.ended(2));
+        p.finish(2);
+        p.begin(3);
+        assert!(!p.ended(3));
+    }
+
+    #[test]
+    fn a_reloaded_page_cannot_collide_with_the_ids_the_one_before_it_left_behind() {
+        let p = Playbacks::new();
+        let (old, new) = (playback_session(), playback_session());
+        assert!(new > old, "each page gets a higher session than the last");
+        // The first page played a lot and was reloaded mid-stream; its counter restarts at 1.
+        p.begin(page_id(old, 900));
+        p.stop(page_id(old, 899));
+        p.begin(page_id(new, 1));
+        assert!(p.ended(page_id(old, 900)), "the old page's stream is superseded");
+        assert!(
+            !p.ended(page_id(new, 1)),
+            "the new page's first playback runs, though 1 < 900"
+        );
+        // A stop the old page sent last is not a stop of anything the new page plays.
+        p.stop(page_id(old, 950));
+        assert!(!p.ended(page_id(new, 1)));
+        p.begin(page_id(new, 2));
+        assert!(p.ended(page_id(new, 1)) && !p.ended(page_id(new, 2)));
+    }
+
+    #[test]
+    fn the_ids_a_page_builds_stay_exact_in_a_javascript_number() {
+        // 2^21 sessions of 2^32 ids: the largest is below 2^53, where doubles stop being exact.
+        let largest = page_id((1 << 21) - 1, u64::from(u32::MAX));
+        assert!(largest < (1 << 53));
+        assert_eq!(largest as f64 as u64, largest);
     }
 }

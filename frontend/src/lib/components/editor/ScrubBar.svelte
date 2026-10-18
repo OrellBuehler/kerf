@@ -11,7 +11,7 @@
 	import { editor } from '#lib/state.svelte';
 	import { beginDrag } from '#lib/drag';
 	import { windowOf } from '#lib/realm';
-	import { formatTimecode } from '#lib/timecode';
+	import { timeDisplay } from '#lib/time-display.svelte';
 	import { secondFrames, seekTime, stepFrames } from '#lib/frames';
 	import { chipLeft, frameLimited, markerTicks, scrubFraction, scrubRange, scrubTime } from '#lib/scrub';
 
@@ -127,7 +127,7 @@
 	aria-valuemin={0}
 	aria-valuemax={Math.max(0, duration)}
 	aria-valuenow={empty ? 0 : ui.time}
-	aria-valuetext={formatTimecode(ui.time, editor.fps)}
+	aria-valuetext={timeDisplay.fmt(ui.time)}
 	aria-disabled={empty}
 	data-scrub
 	data-held={held ? '' : undefined}
@@ -164,7 +164,7 @@
 			data-scrub-chip
 			style="position:absolute;bottom:calc(100% + 2px);left:{chipLeft(hoverX, CHIP_W, barW)}px;width:{CHIP_W}px;box-sizing:border-box;text-align:center;padding:1px 0;border-radius:var(--radius-sm);border:var(--line-width) solid var(--border-strong);background:var(--surface-raised);color:var(--text-primary);font-family:var(--font-mono);font-size:11px;line-height:14px;pointer-events:none;z-index:2"
 		>
-			{formatTimecode(hoverTime, editor.fps)}
+			{timeDisplay.fmt(hoverTime)}
 		</div>
 	{/if}
 	<div

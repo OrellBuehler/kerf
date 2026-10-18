@@ -135,6 +135,20 @@ fn by_path(path_facts: Vec<(&'static str, InputFacts)>) -> impl Fn(&str) -> Inpu
 }
 
 #[test]
+fn captions_and_chapters_muxed_in_keep_a_hardware_export_on_the_hardware() {
+    let facts = by_path(vec![("/a.mp4", h264_420())]);
+    let side = export(
+        "h264_amf",
+        "-hwaccel d3d11va -i /a.mp4 -f srt -i /t/subs.srt -f ffmetadata -i /t/chapters.txt",
+        PLAIN_GRAPH,
+    );
+    assert_eq!(export_resource(&side, &facts, true), Resource::Gpu);
+    // Only the captions' and chapters' formats are passed over: another `-f` input is judged.
+    let other = export("h264_amf", "-hwaccel d3d11va -i /a.mp4 -f mp4 -i /b.mp4", PLAIN_GRAPH);
+    assert_eq!(export_resource(&other, &facts, true), Resource::Cpu);
+}
+
+#[test]
 fn an_export_that_is_hardware_from_end_to_end_takes_the_hardware_slot() {
     let a = export("h264_amf", "-hwaccel d3d11va -ss 1 -i /a.mp4", PLAIN_GRAPH);
     let facts = by_path(vec![("/a.mp4", h264_420())]);

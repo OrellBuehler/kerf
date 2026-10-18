@@ -4,22 +4,28 @@
 	import { VIDEO_THUMB_BG } from './data';
 	import Badge from './Badge.svelte';
 	import MediaChips from './MediaChips.svelte';
+	import AnalysisRun from './AnalysisRun.svelte';
 	import Btn from './Btn.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { editor } from '#lib/state.svelte';
 	import { mediaStatus } from '#lib/media-status.svelte';
 	import { analyzeSubmenuItem } from '#lib/analyze-menu';
+	import { appendAllMedia, exportTranscriptSrt, report } from '#lib/ops';
 		import { proxyActions } from '#lib/proxy-info';
 	import { deleteProxy, rebuildProxy } from '#lib/api';
 	import { contextMenu } from '#lib/context-menu.svelte';
 	import type { MenuItem } from '#lib/context-menu.svelte';
 	import { getFrame, inTauri, revealPath } from '#lib/api';
 	import { importMedia } from '#lib/import-media';
+	import { relinkMediaFlow, removeMediaFlow } from '#lib/library-actions';
+	import { missingLine } from '#lib/library-copy';
 	import { toast } from '#lib/notifications.svelte';
 	import { thumbnails } from '#lib/thumbnails';
 	import { audioExtraction, mediaInfo, shortPath, specLine, thumbTime, type MediaInfo } from '#lib/media-info';
 	import type { Asset } from '#lib/types';
 	import { tip } from '#lib/tip';
+	import { settings } from '#lib/settings.svelte';
+	import { placementOut } from '#lib/editing-prefs';
 
 	type BinAsset = { asset: Asset; info: MediaInfo };
 
@@ -65,14 +71,12 @@
 		void editor.select(assetId);
 	}
 
-	function err(e: unknown) {
-		toast.error(e instanceof Error ? e.message : String(e));
-	}
+	const err = report;
 
 	// Drag an asset out of the bin; the timeline lanes accept the drop and add a
 	// clip. `ui.dndAsset` carries the payload (dataTransfer is opaque on dragover).
 	function onAssetDragStart(e: DragEvent, { asset, info }: BinAsset) {
-		ui.dndAsset = { id: asset.id, kind: info.kind === 'audio' ? 'audio' : 'video', duration: asset.duration };
+		ui.dndAsset = { id: asset.id, kind: info.kind === 'audio' ? 'audio' : 'video', duration: placementOut(asset, settings.editing.still_seconds) };
 		if (e.dataTransfer) {
 			e.dataTransfer.effectAllowed = 'copy';
 			// A custom MIME so an off-target drop on a text field doesn't paste the
@@ -99,7 +103,7 @@
 			icon: 'plus',
 			action: () =>
 				void editor
-					.add(asset.id, 0, asset.duration, undefined, ui.time)
+					.add(asset.id, 0, placementOut(asset, settings.editing.still_seconds), undefined, ui.time)
 					.then(() => toast.success(`Added ${asset.name}`))
 					.catch(err)
 		});
@@ -108,7 +112,7 @@
 			icon: 'list-plus',
 			action: () =>
 				void editor
-					.add(asset.id, 0, asset.duration, undefined, editor.duration)
+					.add(asset.id, 0, placementOut(asset, settings.editing.still_seconds), undefined, editor.duration)
 					.then(() => toast.success(`Appended ${asset.name}`))
 					.catch(err)
 		});
@@ -161,6 +165,24 @@
 				label: 'Separate stems…',
 				icon: 'layers',
 				action: () => ui.openStems(asset.id)
+			});
+
+		// The transcript as a subtitle file, in the asset's own time; off, with the reason, until there is one.
+		const hasTranscript = (analysis?.transcript.length ?? 0) > 0;
+		items.push({
+			label: 'Export transcript as .srt…',
+			icon: 'file-text',
+			disabled: !hasTranscript,
+			reason: hasTranscript ? undefined : 'Transcribe it first (Analyze › Transcribe speech)',
+			action: () => void exportTranscriptSrt(asset.id)
+		});
+		if (editor.assets.length > 1)
+			items.push({
+				label: `Append all ${editor.assets.length} files to the timeline`,
+				icon: 'list-plus',
+				disabled: editor.locked,
+				reason: editor.locked ? 'Exit the proposal preview to edit' : undefined,
+				action: () => void appendAllMedia()
 			});
 
 		items.push({ type: 'separator' });
@@ -216,6 +238,21 @@
 			});
 		}
 
+		const gone = mediaStatus.isMissing(asset.id);
+		items.push({ type: 'separator' });
+		items.push({
+			label: gone ? 'Relink media…' : 'Relink to another file…',
+			icon: 'link',
+			action: () => void relinkMediaFlow(asset)
+		});
+		items.push({
+			label: 'Remove from project…',
+			icon: 'trash',
+			danger: true,
+			disabled: editor.locked,
+			reason: editor.locked ? 'Exit the proposal preview to edit' : undefined,
+			action: () => void removeMediaFlow(asset)
+		});
 		items.push({ type: 'separator' });
 		items.push({
 			label: 'Copy path',
@@ -258,6 +295,9 @@
 							{/if}
 						</div>
 					</div>
+					<Btn variant="secondary" size="sm" icon="x" pending={editor.stoppingImport} onclick={() => void editor.stopImport()}>
+						{editor.stoppingImport ? 'Stopping…' : 'Stop'}
+					</Btn>
 				</div>
 			{:else}
 				<!-- dropzone -->
@@ -287,6 +327,18 @@
 			{/if}
 		{:else}
 			<!-- asset list; the count and the import actions are the library's header -->
+			{#if mediaStatus.missingList.length > 0}
+				<!-- Files the project expects and the disk does not have: said once, over the list, with the way out. -->
+				<div
+					role="alert"
+					data-testid="missing-banner"
+					style="margin-bottom:8px;padding:8px 10px;border-radius:var(--radius-sm);background:color-mix(in srgb,var(--danger) 14%,transparent);border:var(--line-width) solid color-mix(in srgb,var(--danger) 40%,transparent);display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-primary)"
+				>
+					<Icon n="alert-triangle" s={13} color="var(--danger)" />
+					<span style="flex:1;min-width:0">{missingLine(mediaStatus.missingList)}</span>
+					<Btn size="sm" variant="secondary" onclick={() => ui.openRelink()}>Relink…</Btn>
+				</div>
+			{/if}
 			<div style="display:flex;flex-direction:column;gap:8px">
 				{#each assets as a (a.asset.id)}
 					{@const sel = a.asset.id === editor.selectedAssetId}
@@ -363,12 +415,23 @@ Drag onto a timeline track to add a clip · right-click for details`}
 							{#if a.info.kind === 'image'}
 								<Badge tone="neutral">still</Badge>
 							{/if}
+							{#if mediaStatus.isMissing(a.asset.id)}
+								<span use:tip={`The file is not at ${a.asset.path}. Right-click to relink it.`}>
+									<Badge tone="danger">missing</Badge>
+								</span>
+							{/if}
 							{#if a.info.uses > 0}
 								<span use:tip={`Used in ${a.info.uses === 1 ? '1 clip' : `${a.info.uses} clips`} on the timeline`}>
 									<Badge tone="neutral" style="font-family:var(--font-mono)">×{a.info.uses}</Badge>
 								</span>
 							{/if}
 						</div>
+						{#if ui.analyzing && ui.analyzingId === a.asset.id}
+							<!-- What the run is on and how to stop it, on the card the run is for; a press here is Stop's, not the card's. -->
+							<div role="presentation" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+								<AnalysisRun compact />
+							</div>
+						{/if}
 					</div>
 				{/each}
 			</div>

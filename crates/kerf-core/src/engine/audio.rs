@@ -5,9 +5,8 @@
 //! `--no-default-features` build — no dev libraries, no extra system deps.
 
 use std::path::Path;
-use std::process::Stdio;
 
-use super::cli::{bg_command, decode_audio_mono_f32, ffmpeg_bin, launch_err};
+use super::cli::{bg_command, decode_audio_mono_f32, ffmpeg_bin, launch_err, output_supervised, PROGRESS_ON_STDERR, READ_STALL};
 use super::cpu;
 use super::music;
 use crate::error::{Error, Result};
@@ -18,23 +17,46 @@ use crate::model::{AudioClass, AudioClassification, Loudness, Rhythm, Tempo};
 /// Measure EBU R128 loudness of the first audio stream in a single `loudnorm`
 /// analysis pass. `loudnorm=print_format=json` prints a JSON object to stderr
 /// with the measured `input_i` / `input_lra` / `input_tp` / `input_thresh`.
-pub fn measure_loudness(path: &Path) -> Result<Loudness> {
+///
+/// Gives up with [`Error::Cancelled`] once `cancel` is true, and is killed after a minute
+/// without a word from ffmpeg. A decode that fails is an error: `loudnorm` prints its summary
+/// when the filter closes, which a failed run does too — with whatever it had heard by then, a
+/// plausible number for a file that was never read to its end.
+pub fn measure_loudness_cancellable(path: &Path, cancel: &dyn Fn() -> bool) -> Result<Loudness> {
     let bin = ffmpeg_bin();
     // Another whole-file decode; it takes the heavy-job slot like the rest.
-    let cpu = cpu::lease();
+    let cpu = cpu::lease_waiting(&mut |_| {}, cancel)?;
+    if cancel() {
+        return Err(Error::Cancelled);
+    }
     let mut cmd = bg_command(&bin);
     cpu::limit_cmd(&mut cmd, cpu.threads());
-    let output = cmd
+    cmd.args(PROGRESS_ON_STDERR)
         .args(["-hide_banner", "-nostats"])
         .arg("-i")
         .arg(path)
-        .args(["-map", "0:a:0", "-af", "loudnorm=print_format=json", "-f", "null", "-"])
-        .stdout(Stdio::null())
-        .output()
-        .map_err(|e| launch_err(&bin, e))?;
-    // loudnorm prints to stderr regardless of exit status.
-    parse_loudness(&String::from_utf8_lossy(&output.stderr))
-        .ok_or_else(|| Error::Engine("could not parse loudnorm measurement".to_string()))
+        .args(["-map", "0:a:0", "-af", "loudnorm=print_format=json", "-f", "null", "-"]);
+    let output = output_supervised(cmd, READ_STALL, None, cancel).map_err(|e| launch_err(&bin, e))?;
+    if output.cancelled {
+        return Err(Error::Cancelled);
+    }
+    if output.stalled {
+        return Err(Error::Engine(format!(
+            "loudness measurement stalled: ffmpeg said nothing for {}s reading {}: {}",
+            READ_STALL.as_secs(),
+            path.display(),
+            output.stderr_tail()
+        )));
+    }
+    if !output.succeeded() {
+        return Err(Error::Engine(format!(
+            "loudness measurement failed ({}) reading {}: {}",
+            output.status,
+            path.display(),
+            output.stderr_tail()
+        )));
+    }
+    parse_loudness(&output.stderr).ok_or_else(|| Error::Engine("could not parse loudnorm measurement".to_string()))
 }
 
 /// Pull the trailing JSON object `loudnorm=print_format=json` prints and read the
@@ -62,7 +84,12 @@ fn parse_loudness(stderr: &str) -> Option<Loudness> {
 /// slice actually feels, so an agent can match cut pacing to musical energy or
 /// find the quiet/loud passages. Same shape as the waveform so both render alike.
 pub fn energy_envelope(path: &Path, buckets: usize, sample_rate: u32) -> Result<Vec<f32>> {
-    let samples = decode_audio_mono_f32(path, sample_rate)?;
+    energy_envelope_cancellable(path, buckets, sample_rate, &|| false)
+}
+
+/// [`energy_envelope`] that gives up with [`Error::Cancelled`] once `cancel` is true.
+pub fn energy_envelope_cancellable(path: &Path, buckets: usize, sample_rate: u32, cancel: &dyn Fn() -> bool) -> Result<Vec<f32>> {
+    let samples = decode_audio_mono_f32(path, sample_rate, cancel)?;
     Ok(rms_buckets(&samples, buckets.max(1)))
 }
 
@@ -93,9 +120,13 @@ fn rms_buckets(samples: &[f32], buckets: usize) -> Vec<f32> {
 /// Onsets mark the moments new sound energy arrives (a drum hit, a note attack)
 /// so an agent can snap cut points to the beat; tempo is the autocorrelated
 /// beat grid; the class is the speech/music/mixed hint.
-pub fn analyze_rhythm(path: &Path, sensitivity: f64) -> Result<Rhythm> {
+///
+/// Gives up with [`Error::Cancelled`] once `cancel` is true (while it waits for the heavy-job
+/// slot or while the audio decodes; the DSP after the decode is a few seconds and is not
+/// interrupted).
+pub fn analyze_rhythm_cancellable(path: &Path, sensitivity: f64, cancel: &dyn Fn() -> bool) -> Result<Rhythm> {
     const SR: u32 = 22_050;
-    let samples = decode_audio_mono_f32(path, SR)?;
+    let samples = decode_audio_mono_f32(path, SR, cancel)?;
     let (env, frame_rate) = onset_envelope(&samples, SR);
     let music = music::cached(path).unwrap_or_else(|| {
         let fresh = music::analyze_music(&samples, SR);
@@ -233,7 +264,7 @@ fn estimate_tempo(env: &[f32], frame_rate: f64) -> Option<Tempo> {
 /// how often the energy drops into a gap (speech is gappy, music continuous) and
 /// how variable the zero-crossing rate is (speech alternates voiced/unvoiced).
 /// A hint, not a trained model — see [`crate::model::AudioClass`]. Takes the
-/// PCM rather than a path so [`analyze_rhythm`] can share one decode.
+/// PCM rather than a path so [`analyze_rhythm_cancellable`] can share one decode.
 fn classify_samples(samples: &[f32]) -> Option<AudioClassification> {
     const FRAME: usize = 1024; // ~46 ms at 22.05 kHz
     if samples.len() < FRAME * 4 {

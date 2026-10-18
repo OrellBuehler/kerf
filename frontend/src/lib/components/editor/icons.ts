@@ -51,6 +51,7 @@ import {
 	ZoomOut,
 	Trash2,
 	Copy,
+	ClipboardPaste,
 	ChevronDown,
 	Image,
 	X,
@@ -85,7 +86,11 @@ import {
 	Diamond,
 	Globe,
 	CircleAlert,
-	ChevronUp
+	ChevronUp,
+	CodeXml,
+	Orbit,
+	Ellipsis,
+	LayoutTemplate
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -140,6 +145,7 @@ export const icons: Record<string, LucideIcon> = {
 	'zoom-out': ZoomOut,
 	'trash': Trash2,
 	'copy': Copy,
+	'clipboard': ClipboardPaste,
 	'chevron-down': ChevronDown,
 	'image': Image,
 	'x': X,
@@ -181,7 +187,13 @@ export const icons: Record<string, LucideIcon> = {
 	// 360 footage, and a failure that is not the app's own (a task that failed).
 	'globe': Globe,
 	'circle-alert': CircleAlert,
-	'chevron-up': ChevronUp
+	'chevron-up': ChevronUp,
+	// Animated SVG titles: motion on the titles lane, and the source a custom one is written in.
+	'orbit': Orbit,
+	'code-xml': CodeXml,
+	// Motion templates: the library's kind of title, and the menu on a card.
+	'layout-template': LayoutTemplate,
+	'ellipsis': Ellipsis
 };
 
 export type IconName = keyof typeof icons;

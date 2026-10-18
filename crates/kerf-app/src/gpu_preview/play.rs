@@ -544,6 +544,7 @@ impl GpuPreview {
     }
 
     /// What the sessions did so far.
+    #[cfg(test)]
     pub(super) fn play_diagnostics(&self) -> PlayTally {
         let mut tally = *lock(&self.play_tally);
         if let Some(live) = lock(&self.play).as_ref() {

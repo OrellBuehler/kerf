@@ -75,7 +75,7 @@ agent isn't scripting a black box; it drives the identical engine — and its ed
 | **Edit by transcript** | The transcript is an editing surface: lines resolve to the clip carrying them, a click seeks, and `×` cuts that sentence out of the timeline and ripples the gap closed. |
 | **Smart mixing** | A **mixer strip** per audible track (fader + pan, mirrored exactly in preview), per-track **ducking** (music dips under dialogue via sidechain), a **master bus** (fader + safety limiter), single-pass **loudnorm** to −14 LUFS on export, and measured **levels** (LUFS / true peak, per track and master) an agent can check before it calls a cut finished. |
 | **GPU-accelerated export** | NVENC / QSV / VideoToolbox / AMF are **verified with a real test encode** before being offered, hardware decode falls back to software on its own, and **range export** renders just the region between your in/out marks. |
-| **Agent workflow** | 87 MCP tools, **staged edits with a reviewable diff**, a persisted task queue, and a fully revertible edit history attributed to user / agent / system. |
+| **Agent workflow** | The full MCP tool set (below), **staged edits with a reviewable diff**, a persisted task queue, and a fully revertible edit history attributed to user / agent / system. |
 | **Plays nicely with your machine** | One heavy FFmpeg job at a time, at a **CPU budget** you set (Background / Balanced / Full speed in Settings, or `KERF_CPU_PERCENT`) and below-normal priority — an agent analyzing eight sources no longer takes the desktop down. Every toast lands in a **notification center**, so a failure is still readable after it fades. |
 | **Auto-update** | The app updates itself from its own GitHub releases; a bundle only installs if its **minisign signature** verifies against the embedded public key. |
 
@@ -113,11 +113,13 @@ and (for the default `ffmpeg` feature) the FFmpeg development libraries + `clang
 ## Driving Kerf from an LLM
 
 The desktop app hosts the MCP server over streamable HTTP at `127.0.0.1:7777/mcp`
-(override with `KERF_MCP_ADDR`). Start the app, then point an MCP client at it — e.g.
-with Claude Code:
+(change it in Settings › Agent, or with `KERF_MCP_ADDR`). Every request must carry the
+bearer token Kerf made on first start; Settings › Agent shows it with the exact commands
+below filled in. Start the app, then point an MCP client at it — e.g. with Claude Code:
 
 ```bash
-claude mcp add --transport http kerf http://127.0.0.1:7777/mcp
+claude mcp add --transport http kerf http://127.0.0.1:7777/mcp \
+  --header "Authorization: Bearer <token>"
 ```
 
 …or in any MCP client config that supports HTTP servers:
@@ -125,26 +127,38 @@ claude mcp add --transport http kerf http://127.0.0.1:7777/mcp
 ```json
 {
   "mcpServers": {
-    "kerf": { "type": "http", "url": "http://127.0.0.1:7777/mcp" }
+    "kerf": {
+      "type": "http",
+      "url": "http://127.0.0.1:7777/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
   }
 }
 ```
+
+An agent's edits wait in a proposal for you to accept (all of it, or only some changes)
+unless you switch review off in the same place.
 
 Now ask the agent to work on the project you have open — _"skim the interview clip, cut
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (87)
+### The tools (165)
 
 <details>
 <summary><b>See / analyze</b></summary>
 
-`list_assets` · `import_asset` · `get_asset_metadata` · `analyze_asset` ·
-`get_timeline_state` · `timeline_summary` · `get_waveform` · `get_energy` ·
+`list_assets` · `import_asset` · `get_asset_metadata` · `analyze_asset` · `get_transcript` (lines with
+their speakers; the timed words on request) · `speaker_ranges` · `find_filler_words` · `refine_transcript` ·
+`get_analysis_detail` · `get_timeline_state` · `timeline_summary` · `get_editor_context` (what the user has
+selected and where the playhead is) · `get_scopes` (waveform / parade / vectorscope / histogram numbers of a
+frame) · `get_waveform` · `get_energy` ·
 **`get_frame`** (drill-in frame) · **`skim_asset`** (contact-sheet montage) ·
-**`preview_timeline`** (the composited cut) — the last three return images the model can
-see, and `get_frame` / `preview_timeline` take a `region` to **zoom** into a quarter of the
-frame at full source detail.
+**`preview_timeline`** (the composited cut) · **`preview_svg_overlay`** (an animated title
+as a contact sheet of moments) · `preview_svg_preset` · `validate_svg` — the bold ones return images the model
+can see, and `get_frame` / `preview_timeline` take a `region` to **zoom** into a quarter of
+the frame at full source detail. Also `get_waveform_range` · `analysis_status` · `missing_assets` ·
+`get_music_structure` · `get_ripple_mode` · `voiceover_status` · `stems_status`.
 </details>
 
 <details>
@@ -155,30 +169,49 @@ frame at full source detail.
 `remove` · `ripple_delete` · `cut_clip_range` · `duplicate_clips` · `set_clip_enabled` ·
 `add_track` · `remove_track` · `set_track_duck` · `set_track_muted` · `set_track_solo` ·
 `set_track_locked` · `add_marker` · `update_marker` · `remove_marker` · `remove_silence` ·
-`snap_to_beats` · `smart_crop` · `extract_audio` · `concatenate`
+`snap_to_beats` · `sync_clips_by_audio` · `smart_crop` · `extract_audio` · `concatenate` · `move_clips` · `remove_clips` ·
+`add_asset_audio` · `set_ripple_mode` · `plan_music_fit` · `fit_music` ·
+`detach_audio` · `detach_audio_clips` · `reattach_audio` · `reattach_audio_clips` ·
+`link_clips` · `unlink_clips`
 </details>
 
 <details>
 <summary><b>Style & animate</b></summary>
 
 `set_volume` · `set_fade` · `set_speed` · `set_transform` · `set_color` ·
-`set_transition` · `set_mask` · `set_video_effects` · `set_audio_effects` ·
+`set_grade` (curves, colour wheels, a .cube LUT) · `set_transition` · `set_mask` · `set_video_effects` · `set_audio_effects` ·
 `set_keyframes` · `add_keyframe` · `set_keyframe_easing` · `set_property_keyframes` · `copy_keyframes` · `clear_keyframes` · `set_reframe` · `clear_reframe` ·
 `set_reframe_keyframes` · `add_reframe_keyframe` · `set_track_volume` · `set_track_pan` ·
-`set_master_volume` · `set_master_limiter` ·
+`set_master_volume` · `set_master_limiter` · `set_master_true_peak` · `set_master_duck` ·
 `add_overlay` · `update_overlay` · `remove_overlay` · `set_overlay_keyframes` ·
-`generate_captions` · `import_captions` · `clear_captions` · `export_srt` · `list_fonts` ·
+`add_svg_overlay` · `update_svg_overlay` · `remove_svg_overlay` · `list_svg_presets` ·
+`list_templates` · `save_template` · `apply_template` · `set_template_values` · `import_template` · `export_template` · `delete_template` ·
+`generate_captions` · `import_captions` · `clear_captions` · `export_srt` · `export_captions` · `list_fonts` ·
 `set_delivery_format` · `set_asset_projection`
 </details>
 
 <details>
 <summary><b>Render & hand-off</b></summary>
 
-`export` · `export_capabilities` · `export_cover` · `platform_check` · `get_levels` · `stage_edits` ·
+`export` · `export_capabilities` · `export_cover` · `export_interchange` · `export_markers` · `platform_check` · `get_levels` · `stage_edits` ·
 `staged_diff` · `apply_staged_edits` · `discard_staged_edits` · `revision_diff` ·
 `list_tasks` · `add_task` · `claim_next_task` · `complete_task` · `fail_task` ·
 `resolve_task` · `remove_task` · `history` · `undo` · `redo` · `revert_to` ·
 `transcription_status` · `set_speech_model` · `download_speech_model`
+</details>
+
+<details>
+<summary><b>Project, review & background jobs</b></summary>
+
+`project_info` · `save_project` · `save_project_as` · `open_project` · `new_project` ·
+`get_settings` · `set_settings` · `undo_staged_edit` · `restore_discarded_edits` ·
+`apply_staged_subset` · `proxy_status` · `rebuild_proxy` · `delete_proxy` ·
+`job_status` · `cancel_job` · `list_jobs` — the long tools
+(`export`, `export_variants`, `analyze_asset`, `generate_voiceover`, `separate_stems`,
+`download_speech_model`, `import_asset`, `smart_crop`, `refine_transcript`, `sync_clips_by_audio`) take
+`background: true` and answer a
+`job_id` at once. Applying a proposal is refused to an agent while you have review on;
+`undo`, `redo` and `revert_to` are too, since they would rewrite your live cut.
 </details>
 
 Every mutating tool emits a `project-changed` event, so the agent's proposal appears in
@@ -269,7 +302,7 @@ kerf/
 │   │   └── engine/           #   cli.rs (binaries, always on) + ffmpeg.rs (in-process libav)
 │   └── kerf-app/             # Tauri v2 shell
 │       ├── lib.rs            #   one Arc<Mutex<Project>> shared by both surfaces
-│       └── mcp.rs            #   embedded rmcp streamable-HTTP MCP server
+│       └── mcp.rs (+ mcp/)   #   embedded rmcp streamable-HTTP MCP server, auth, jobs
 ├── frontend/                 # SvelteKit 2 / Svelte 5 (runes) / Tailwind 4 / shadcn-svelte
 └── site/                     # Hugo landing site (deployed to GitHub Pages)
 ```
