@@ -209,7 +209,7 @@ a gesture that finishes an edge exactly on a magnet draws a full-height line at 
 `Start`, `Bar 12`, `Beat`, `Edge V1`, `Title edge`) — read off the *result* (`markAt` / `snapLines`: which of the marks in play the
 edge sits on), not from a second snap, so it cannot disagree with where the clip went; a frame the edge merely rounded to is
 on nothing, and nothing shows with snapping off. Clip moves, edge trims, roll, slide, titles and a bin drop have it. *Readouts*
-(`gesture-readout.ts`, one `readoutChip` snippet, the roll / slip / slide chip's look): an **edge trim** says
+(`gesture-readout.ts`, one `readoutChip` snippet, the roll / slip / slide chip's look; their times read in the interface's time mode — an optional `mode`, `time-format.ts`): an **edge trim** says
 `Trim out −12 f · −0.40 s · length 00:00:09:18` beside the pointer, amber when the pointer asked for more than the clip may
 have (`trimLimitWhy`: neighbour / footage / the 0.05 s floor / the cut's start), red with the engine's reason when a linked or
 rippling trim would be refused; the part the trim takes away is hatched; and `ui.trimMonitor` gets a one-cell monitor of the
@@ -245,7 +245,7 @@ frame *before* a title, where it is not yet on screen to select or drag. A **ste
 would otherwise round back onto the frame it shows, or skip one. A keyframe diamond seeks to the key exactly (`{ snap: 'exact' }`: keyframes are in seconds, and the Inspector's
 keyframe-at-playhead check has a tolerance that assumes the playhead is *at* the key). A scrub bar's hover chip says the frame a
 click would land on. It also **cannot stand past the end of the cut**: an effect in
-`+page.svelte` takes it back to the new end when an edit shortens the cut (an empty cut reads `00:00:00:00 / 00:00:00:00`).
+`+page.svelte` takes it back to the new end when an edit shortens the cut (an empty cut reads `00:00:00:00 / 00:00:00:00`). With nothing on the timeline the lane says *Drop media here to start cutting.* **in the first lane** (sticky, left of the clip's landing place) — it was centred over the whole stack and sat on the line between V1 and A1.
 The playhead's *head* lives in the sticky ruler, so it stays when the tracks scroll vertically.
 **A clip with the keyboard focus nudges**: ← / → move it (and the selection it is part of) a frame, ⇧ a second, Alt leaves its
 linked partners (`nudge.ts`). A run of presses is one edit, written once the keys go quiet (450 ms), on Enter or when focus
@@ -265,8 +265,8 @@ takes its selected sound up too, as on screen, not toward A2.
 gone): while `editor.previewingStaged`, added clips and titles are outlined solid in `--diff-add`, moved / trimmed / adjusted
 ones dashed in `--diff-shift` (the line style says it without the hue), a track the proposal adds or alters has a coloured bar on
 its header, and a clip or title it removes is a hatched `--diff-remove` ghost where it stood (under whatever now fills the space,
-with a strip along the lane's top that stays visible). The page's banner carries `‹ place 2/3 › · 5 changes` (places are the distinct times the
-changes sit at, `changePoints`; changes are the entries, so the two counts are not mixed) and a legend. Page Up / Page Down (and `[` / `]`, which
+with a strip along the lane's top that stays visible). The page's banner carries `‹ place 2 of 3 › · 5 changes in all` (places are the distinct times the
+changes sit at, `changePoints`; changes are the entries, so the two counts are not mixed), a legend and **Apply / Discard / Exit preview**. **The cut is read-only while it is previewed**: a press that would start a drag, an edge trim, a roll / slip / slide, a title drag or a marker drag does not start one (`holdForReview` remembers the press; the first move past the slop — or a razor click, or an arrow nudge — says "Exit the preview to edit"), selecting still works, and `editor` refuses any edit that gets through (frontend.md, *Agent panel*). **Before it is previewed** a proposal is already on the timeline: a strip over the toolbar (`Agent proposes 4 changes — Tighten the intro · Preview · Apply · Discard`) and a faint dotted agent-hued frame on the live clips and titles it touches (`touchedOnLive`; what it only adds has no live clip to mark). Page Up / Page Down (and `[` / `]`, which
 need a layout that types them without AltGr or Option; not the arrows, which a focused button keeps) — `review.prevChange` / `review.nextChange`, rebindable, only while a
 proposal is on the timeline — step the playhead from place to place (`stepChange`, `snap: 'up'`). Page Up / Page Down scroll whichever panel has the keyboard, so the review takes
 them only from the editor surface (`focus-area.ts`: the page, the timeline or the preview — panels mark `data-editor-surface` — or
