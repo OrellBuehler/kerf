@@ -75,6 +75,11 @@ mod pcm;
 // pure DSP on decoded PCM, cached per file.
 pub mod music;
 
+// Word timing and speaker labels for transcripts: energy VAD, mel front end, diarization.
+pub(crate) mod diarize;
+pub(crate) mod mel;
+pub(crate) mod vad;
+
 // Stem separation (Demucs htdemucs on ONNX Runtime; STFT, chunking and overlap-add here).
 pub mod stems;
 pub use pcm::{decode_audio, wav_bytes, write_wav, AudioBuffer};

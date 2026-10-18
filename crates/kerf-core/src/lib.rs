@@ -23,13 +23,15 @@ pub mod play_plan;
 pub mod project;
 pub mod proxy;
 pub mod render_plan;
+pub mod transcript;
 
 mod engine;
 
 #[cfg(feature = "whisper")]
 pub use analysis::WhisperTranscriber;
 pub use analysis::{
-    analysis_status, analyze_asset_media, analyze_asset_steps, analyze_steps, auto_analysis, default_kinds, resolve_steps,
+    analysis_status, analyze_asset_media, analyze_asset_steps, analyze_steps, auto_analysis, default_kinds, refine_transcript_media,
+    resolve_steps,
     set_auto_analysis, transcription_backend, transcription_status, AnalysisKindStatus, AnalysisProgress, AnalysisProviders,
     AnalysisState, AnalysisStatus, AutoAnalysis, CancelFn, FfmpegRhythmAnalyzer, FfmpegSceneDetector, FfmpegSilenceDetector,
     NullAnalyzer, ProgressFn, RhythmAnalyzer, SceneDetector, SilenceDetector, StepsRun, Transcriber, TranscriptionStatus,
@@ -71,7 +73,7 @@ pub use model::{
     Projection, Property, PropertyKey, PropertyTrack, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap,
     SkippedDetach, SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Subsampling, Task, TaskStatus, TextKeyframe,
     TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TrackLevels, TranscriptSegment, Transform, Transition, TransitionKind,
-    VideoEffect, Voiceover, ADJACENT_EPS, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB,
+    VideoEffect, Voiceover, Word, ADJACENT_EPS, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB,
     MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_CHANNEL_VOLUME, MIN_EDIT_CLIP,
 };
 pub use plan_caps::{DipWhy, EffectKinds, GpuCaps, LayerRef, Unsupported};

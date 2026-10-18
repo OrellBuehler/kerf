@@ -3123,6 +3123,7 @@ mod tests {
                 start: 1.0,
                 end: 4.0,
                 text: "hello there".to_string(),
+                ..Default::default()
             }],
         )]);
         let words = |t: &Timeline| -> Vec<(String, f64, f64)> {

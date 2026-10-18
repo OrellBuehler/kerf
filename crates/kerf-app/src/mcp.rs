@@ -472,7 +472,9 @@ struct SetMasterDuckParams {
 struct CutClipRangeParams {
     #[schemars(description = "UUID of the clip to cut")]
     clip_id: String,
-    #[schemars(description = "Source-time start of the span to remove (seconds, e.g. a transcript segment's start)")]
+    #[schemars(
+        description = "Source-time start of the span to remove (seconds, e.g. a transcript segment's or a word's start)"
+    )]
     from: f64,
     #[schemars(description = "Source-time end of the span to remove (seconds)")]
     to: f64,
@@ -1092,6 +1094,49 @@ struct ExportSrtParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct GetTranscriptParams {
+    #[schemars(description = "UUID of the asset whose transcript to read")]
+    asset_id: String,
+    #[schemars(
+        description = "Include each line's words with their own source times (default true). Pass false to read the lines alone and save tokens."
+    )]
+    words: Option<bool>,
+    #[schemars(description = "Only the lines of this speaker (e.g. \"S2\"), when speakers were labelled")]
+    speaker: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SpeakerRangesParams {
+    #[schemars(description = "UUID of the asset")]
+    asset_id: String,
+    #[schemars(description = "Only this speaker's ranges (e.g. \"S1\"); omit for every speaker")]
+    speaker: Option<String>,
+    #[schemars(
+        description = "Words of one speaker closer than this many seconds are one range (default 0.75, at most 10)"
+    )]
+    join_gap: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct FillerWordsParams {
+    #[schemars(description = "UUID of the asset")]
+    asset_id: String,
+    #[schemars(
+        description = "Words or short phrases to find, case and punctuation ignored (default: um, uh, umm, uhm, erm, er, ah, hmm, mm, you know, i mean). At most 100."
+    )]
+    fillers: Option<Vec<String>>,
+}
+
+/// What `get_transcript` returns.
+#[derive(serde::Serialize)]
+struct TranscriptReply {
+    asset_id: String,
+    /// The speaker labels in the transcript, in order of first appearance.
+    speakers: Vec<String>,
+    segments: Vec<kerf_core::TranscriptSegment>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ConcatParams {
     #[schemars(description = "Ordered list of asset UUIDs to stitch together")]
     asset_ids: Vec<String>,
@@ -1450,7 +1495,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Get an asset's probed metadata and cached analysis (silence, scenes, transcript, EBU R128 loudness, onset times, tempo/beat grid, speech/music class), \
+        description = "Get an asset's probed metadata and cached analysis (silence, scenes, transcript lines with their speakers — get_transcript has the words —, EBU R128 loudness, onset times, tempo/beat grid, speech/music class), \
                        `analysis_status` (per kind: done / not_run / running / failed with a reason / off) and `proxy` \
                        (the preview proxy: ready, building with a fraction, failed with a reason, off or not_needed)"
     )]
@@ -1470,7 +1515,11 @@ impl KerfMcp {
                 analysis_status: kerf_core::analysis_status(id, analysis.as_ref()),
                 proxy: kerf_core::proxy::status(&input),
                 asset: input.asset,
-                analysis,
+                // Words are the bulk of a transcript; get_transcript serves them.
+                analysis: analysis.map(|mut a| {
+                    a.transcript = kerf_core::transcript::without_words(&a.transcript);
+                    a
+                }),
             })
         })
         .await?;
@@ -1781,7 +1830,7 @@ impl KerfMcp {
     #[tool(
         description = "Cut a source-time range out of a clip and close the gap (split + ripple in one edit) — \
                        the transcript-editing primitive: pass a transcript segment's start/end to delete that \
-                       sentence from the cut. Linked clips lose the same stretch of timeline (a picture's \
+                       sentence from the cut, or a word's (get_transcript, find_filler_words) to delete one word. Linked clips lose the same stretch of timeline (a picture's \
                        detached sound is cut with it); pass link=false to cut only this clip."
     )]
     fn cut_clip_range(&self, Parameters(p): Parameters<CutClipRangeParams>) -> Result<String, McpError> {
@@ -2808,6 +2857,112 @@ impl KerfMcp {
         };
         std::fs::write(path, srt).map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(format!("wrote {}", p.output_path))
+    }
+
+    #[tool(
+        description = "Read an asset's cached transcript (run analyze_asset with the transcript step first): each line \
+                       with its source-time start/end, its `speaker` (S1, S2, … when speakers were labelled) and, unless \
+                       words=false, its `words` — each with its own source start/end, a `confidence` when the \
+                       recognizer gave one, and `estimated: true` when its times were spread over the line by \
+                       character share and tightened to the speech energy rather than reported. Pass a word's start/end \
+                       to cut_clip_range to cut one word. `speaker` keeps that speaker's lines only."
+    )]
+    fn get_transcript(&self, Parameters(p): Parameters<GetTranscriptParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        let transcript = self.lock().transcript(id).map_err(core_err)?;
+        let mut speakers: Vec<String> = Vec::new();
+        for sp in transcript.iter().filter_map(|s| s.speaker.as_ref()) {
+            if !speakers.contains(sp) {
+                speakers.push(sp.clone());
+            }
+        }
+        let want = p.speaker.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let segments = transcript
+            .iter()
+            .filter(|s| want.is_none_or(|w| s.speaker.as_deref().is_some_and(|sp| sp.eq_ignore_ascii_case(w))))
+            .map(|s| kerf_core::TranscriptSegment {
+                words: if p.words.unwrap_or(true) {
+                    kerf_core::transcript::words_of(s).into_owned()
+                } else {
+                    Vec::new()
+                },
+                ..s.clone()
+            })
+            .collect();
+        json(&TranscriptReply {
+            asset_id: id.to_string(),
+            speakers,
+            segments,
+        })
+    }
+
+    #[tool(
+        description = "When each speaker talks in an asset, from its speaker-labelled transcript: per speaker (S1, S2, … \
+                       in order of first appearance) the SOURCE-time ranges of their words, joined across pauses \
+                       shorter than join_gap, and their total speaking time. Use it to cut to one speaker (keep or \
+                       remove their ranges with cut_clip_range / add_clip, which take source times) or to find who \
+                       talks most. Labels come from clustering voices without a model: distinct voices in clean turns \
+                       separate well; overlapping speech or similar voices may not. Errors if the transcript has no \
+                       speaker labels (refine_transcript adds them)."
+    )]
+    fn speaker_ranges(&self, Parameters(p): Parameters<SpeakerRangesParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        let join_gap = p.join_gap.filter(|g| g.is_finite()).unwrap_or(0.75).clamp(0.0, 10.0);
+        let speaker = p.speaker.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let ranges = self.lock().speaker_ranges(id, speaker, join_gap).map_err(core_err)?;
+        json(&ranges)
+    }
+
+    #[tool(
+        description = "Find filler words in an asset's transcript by their word bounds: each hit's text, SOURCE-time \
+                       start/end, the index of its line, and `estimated: true` when the word times were estimated \
+                       rather than reported. Speech models often leave fillers out of a transcript, so few hits does \
+                       not prove the speech has none. Remove one with cut_clip_range (from/to = its start/end) on the \
+                       clip that shows it; cut the latest first so earlier times do not shift."
+    )]
+    fn find_filler_words(&self, Parameters(p): Parameters<FillerWordsParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        let fillers = p.fillers.unwrap_or_default();
+        if fillers.len() > 100 {
+            return Err(McpError::invalid_params("at most 100 fillers".to_string(), None));
+        }
+        let found = self.lock().filler_words(id, &fillers).map_err(core_err)?;
+        json(&found)
+    }
+
+    #[tool(
+        description = "Re-time the words of an asset's cached transcript to the speech energy and label its speakers \
+                       (S1, S2, …), without re-transcribing — for a transcript made before Kerf did this. A \
+                       transcription already does it. No model is involved; it decodes the asset's audio once and \
+                       waits its turn behind exports and proxies. Returns how many lines, words and speakers the \
+                       transcript has now."
+    )]
+    async fn refine_transcript(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
+        let id = parse_id(&p.asset_id)?;
+        let project = self.project.clone();
+        let summary = blocking(move || {
+            let (asset, transcript) = {
+                let project = lock_agent(&project);
+                (
+                    project.require_asset(id).map_err(core_err)?,
+                    project.transcript(id).map_err(core_err)?,
+                )
+            };
+            let refined = kerf_core::refine_transcript_media(&asset, transcript, &mut |_| {}, &|| false).map_err(core_err)?;
+            let mut speakers: Vec<&str> = refined.iter().filter_map(|s| s.speaker.as_deref()).collect();
+            speakers.sort_unstable();
+            speakers.dedup();
+            let summary = serde_json::json!({
+                "segments": refined.len(),
+                "words": refined.iter().map(|s| s.words.len()).sum::<usize>(),
+                "speakers": speakers,
+            });
+            lock_agent(&project).store_transcript(id, refined).map_err(core_err)?;
+            Ok(summary)
+        })
+        .await?;
+        self.changed();
+        json(&summary)
     }
 
     #[tool(description = "Append the non-silent spans of an asset as clips, using cached analysis")]
