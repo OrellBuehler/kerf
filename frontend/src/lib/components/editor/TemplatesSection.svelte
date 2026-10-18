@@ -8,13 +8,13 @@
 	import EmptyState from './EmptyState.svelte';
 	import Icon from './Icon.svelte';
 	import TemplateCard from './TemplateCard.svelte';
-	import { listTemplates, onTemplatesChanged } from '$lib/api';
-	import { editor } from '$lib/state.svelte';
-	import { errorMessage } from '$lib/ops';
-	import { tidyReason } from '$lib/failure-copy';
-	import { forgetPoster, importTemplateFile } from '$lib/template-actions';
-	import { svgFrame } from '$lib/svg-titles';
-	import type { TemplateInfo, TemplateList } from '$lib/types';
+	import { listTemplates, onTemplatesChanged } from '#lib/api';
+	import { editor } from '#lib/state.svelte';
+	import { errorMessage } from '#lib/ops';
+	import { tidyReason } from '#lib/failure-copy';
+	import { forgetPoster, importTemplateFile } from '#lib/template-actions';
+	import { svgFrame } from '#lib/svg-titles';
+	import type { TemplateInfo, TemplateList } from '#lib/types';
 
 	let list = $state<TemplateList | null>(null);
 	let failed = $state<string | null>(null);

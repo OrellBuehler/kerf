@@ -8,15 +8,15 @@
 	// nothing while the panel is not on screen. The grids are painted from `scopes-view.ts`; every
 	// colour is a theme token resolved here, again whenever the theme changes.
 	import { untrack } from 'svelte';
-	import { editor } from '$lib/state.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { getScopes } from '$lib/api';
-	import { describeError } from '$lib/log';
-	import { intersectionObserverFor } from '$lib/realm';
-	import { windows } from '$lib/windows.svelte';
-	import { resolveColor } from '$lib/waveform-draw';
-	import { parseCssColor } from '$lib/preview-bounds';
+	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { settings } from '#lib/settings.svelte';
+	import { getScopes } from '#lib/api';
+	import { describeError } from '#lib/log';
+	import { intersectionObserverFor } from '#lib/realm';
+	import { windows } from '#lib/windows.svelte';
+	import { resolveColor } from '#lib/waveform-draw';
+	import { parseCssColor } from '#lib/preview-bounds';
 	import {
 		blankPixels,
 		histogramHeights,
@@ -30,8 +30,8 @@
 		ycbcr,
 		type Pixels,
 		type Rgb
-	} from '$lib/scopes-view';
-	import type { ScopeKind, Scopes } from '$lib/types';
+	} from '#lib/scopes-view';
+	import type { ScopeKind, Scopes } from '#lib/types';
 
 	const KIND_KEY = 'kerf.scopes.kind';
 	function storedKind(): ScopeKind {

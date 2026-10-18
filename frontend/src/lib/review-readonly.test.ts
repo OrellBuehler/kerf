@@ -25,7 +25,7 @@ describe('a refusal because the proposal is previewed is a notice, not a red toa
 			const source = read(`${EDITOR}${file}.svelte`);
 			// (The transcript’s Transcribe button is analysis, not an edit, and keeps its own error toast.)
 			if (file !== 'TranscriptPanel') expect(source, file).not.toMatch(/toast\.error\((?:e|err) instanceof Error \? (?:e|err)\.message : String\((?:e|err)\)\)/);
-			expect(source, file).toMatch(/import \{[^}]*\breport\b[^}]*\} from '\$lib\/ops'/);
+			expect(source, file).toMatch(/import \{[^}]*\breport\b[^}]*\} from '\#lib\/ops'/);
 		}
 		for (const file of ['title-actions.ts', 'menu-commands.ts']) expect(read(`lib/${file}`), file).toMatch(/\breport\b/);
 	});

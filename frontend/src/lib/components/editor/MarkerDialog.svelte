@@ -3,12 +3,12 @@
 	// chapter of the exported file and of the YouTube chapter text; a comment is a note on the cut.
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
-	import { editor, PreviewReadOnly } from '$lib/state.svelte';
-	import { toast } from '$lib/notifications.svelte';
-	import { report } from '$lib/ops';
-	import { failure } from '$lib/failure-copy';
-	import { markerPatch } from '$lib/marker-edit';
-	import type { MarkerKind } from '$lib/types';
+	import { editor, PreviewReadOnly } from '#lib/state.svelte';
+	import { toast } from '#lib/notifications.svelte';
+	import { report } from '#lib/ops';
+	import { failure } from '#lib/failure-copy';
+	import { markerPatch } from '#lib/marker-edit';
+	import type { MarkerKind } from '#lib/types';
 
 	let { markerId, onClose }: { markerId: string; onClose: () => void } = $props();
 

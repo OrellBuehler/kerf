@@ -3,7 +3,7 @@
    timeline, transcript, waveforms, tasks, history) renders from the real
    backend via `editor` / `agent`. */
 
-import type { TaskStatus } from '$lib/types';
+import type { TaskStatus } from '#lib/types';
 
 export const STATUS_MAP: Record<TaskStatus, { tone: string; icon: string; label: string }> = {
 	queued: { tone: 'neutral', icon: 'clock', label: 'Queued' },

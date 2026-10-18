@@ -3,21 +3,21 @@
 	import Icon from './Icon.svelte';
 	import PreviewEmpty from './PreviewEmpty.svelte';
 	import TimecodeField from './TimecodeField.svelte';
-	import { timeDisplay } from '$lib/time-display.svelte';
+	import { timeDisplay } from '#lib/time-display.svelte';
 	import ScrubBar from './ScrubBar.svelte';
 	import TrimMonitor from './TrimMonitor.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { contextMenu } from '$lib/context-menu.svelte';
-	import { onWindow } from '$lib/window-events';
-	import { windows } from '$lib/windows.svelte';
-	import { resizeObserverFor, windowOf } from '$lib/realm';
-	import { getPreviewFrame, getTimelineFrame, setPreviewBounds, startPlayback } from '$lib/api';
-	import { saveCoverFrame } from '$lib/file-actions';
-	import { gpuPreview } from '$lib/gpu-preview.svelte';
-	import { mediaStatus } from '$lib/media-status.svelte';
-	import { isProxyWaitMessage, previewSourceNote, previewSourceWidth } from '$lib/proxy-info';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { settings } from '#lib/settings.svelte';
+	import { editor } from '#lib/state.svelte';
+	import { contextMenu } from '#lib/context-menu.svelte';
+	import { onWindow } from '#lib/window-events';
+	import { windows } from '#lib/windows.svelte';
+	import { resizeObserverFor, windowOf } from '#lib/realm';
+	import { getPreviewFrame, getTimelineFrame, setPreviewBounds, startPlayback } from '#lib/api';
+	import { saveCoverFrame } from '#lib/file-actions';
+	import { gpuPreview } from '#lib/gpu-preview.svelte';
+	import { mediaStatus } from '#lib/media-status.svelte';
+	import { isProxyWaitMessage, previewSourceNote, previewSourceWidth } from '#lib/proxy-info';
 	import {
 		anyCovered,
 		boundsReport,
@@ -29,26 +29,26 @@
 		sameReport,
 		samplePoints,
 		surfaceShowing
-	} from '$lib/preview-bounds';
-	import { createFramePump } from '$lib/frame-pump.svelte';
-	import { singleFlight } from '$lib/single-flight';
-	import { measuredWidth, transportParts } from '$lib/transport-bar';
-	import { RESIZE_SETTLE_MS, capToSource, dprQuery, requestWidth } from '$lib/preview-size';
-	import type { PlayAhead, PreviewBoundsReport } from '$lib/types';
-	import { toast } from '$lib/notifications.svelte';
-	import { report } from '$lib/ops';
-	import { createFrameGate, createLadder, playbackFps, takeoverAhead } from '$lib/playback-sync';
-	import { GpuPlayback, NO_PLAY, playSession, type PlayRun } from '$lib/gpu-playback';
-	import { audio } from '$lib/audio';
-	import { CANVAS_PAINTER, createStreamPainter, jpegDataUrl } from '$lib/frame-transport';
-	import { decodeJpeg, paintPicture } from '$lib/frame-canvas';
-	import { renderedDuration, renderedFps, timecodeRate } from '$lib/timecode';
-	import { logFrontend } from '$lib/log';
-	import { clipDuration } from '$lib/types';
-	import type { SvgOverlay, TextOverlay } from '$lib/types';
-	import { dragRect, rectOf, rectPatch, roundRect, svgDisplayName, type Rect, type RectHandle } from '$lib/svg-titles';
-	import { boxPadding, containRect, dragPosition, inkBox, isVisibleAt, sampleOverlay, scaledSize, titleFamily } from '$lib/titles';
-	import { tip } from '$lib/tip';
+	} from '#lib/preview-bounds';
+	import { createFramePump } from '#lib/frame-pump.svelte';
+	import { singleFlight } from '#lib/single-flight';
+	import { measuredWidth, transportParts } from '#lib/transport-bar';
+	import { RESIZE_SETTLE_MS, capToSource, dprQuery, requestWidth } from '#lib/preview-size';
+	import type { PlayAhead, PreviewBoundsReport } from '#lib/types';
+	import { toast } from '#lib/notifications.svelte';
+	import { report } from '#lib/ops';
+	import { createFrameGate, createLadder, playbackFps, takeoverAhead } from '#lib/playback-sync';
+	import { GpuPlayback, NO_PLAY, playSession, type PlayRun } from '#lib/gpu-playback';
+	import { audio } from '#lib/audio';
+	import { CANVAS_PAINTER, createStreamPainter, jpegDataUrl } from '#lib/frame-transport';
+	import { decodeJpeg, paintPicture } from '#lib/frame-canvas';
+	import { renderedDuration, renderedFps, timecodeRate } from '#lib/timecode';
+	import { logFrontend } from '#lib/log';
+	import { clipDuration } from '#lib/types';
+	import type { SvgOverlay, TextOverlay } from '#lib/types';
+	import { dragRect, rectOf, rectPatch, roundRect, svgDisplayName, type Rect, type RectHandle } from '#lib/svg-titles';
+	import { boxPadding, containRect, dragPosition, inkBox, isVisibleAt, sampleOverlay, scaledSize, titleFamily } from '#lib/titles';
+	import { tip } from '#lib/tip';
 
 	const duration = $derived(Math.max(editor.duration, 0.001));
 	/** The transport bar's own width, or undefined until it has been measured (and while it

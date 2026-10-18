@@ -3,11 +3,11 @@
 	import Switch from './Switch.svelte';
 	import ChoiceChips from './ChoiceChips.svelte';
 	import Btn from './Btn.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { TIME_MODES, formatTime, type TimeMode } from '$lib/time-format';
-	import { shortPath } from '$lib/media-info';
-	import { fileName } from '$lib/failure-copy';
-	import { tip } from '$lib/tip';
+	import { settings } from '#lib/settings.svelte';
+	import { TIME_MODES, formatTime, type TimeMode } from '#lib/time-format';
+	import { shortPath } from '#lib/media-info';
+	import { fileName } from '#lib/failure-copy';
+	import { tip } from '#lib/tip';
 
 	// 4.4 s in a 30 fps cut: what each mode makes of the same moment.
 	const example = (mode: TimeMode) => formatTime(4.4, 30, mode);

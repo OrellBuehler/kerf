@@ -85,7 +85,7 @@ describe('the agent panel', () => {
 	test('the setup card folds away when a proposal arrives, and a row of the proposal selects through the shared review action', () => {
 		expect(agent).toContain('if (has && !hadStaged) showConnect = false');
 		expect(agent).toContain('inspectChange(e)');
-		expect(agent).toContain("from '$lib/proposal-actions'");
+		expect(agent).toContain("from '#lib/proposal-actions'");
 	});
 
 	test('one status line, and no second "Agent queue" header over it', () => {
@@ -247,7 +247,7 @@ describe('smaller things the review asked for', () => {
 
 	test('the page imports through the library’s one import, not a copy of it', () => {
 		const page = read('routes/+page.svelte');
-		expect(page).toContain("from '$lib/import-media'");
+		expect(page).toContain("from '#lib/import-media'");
 		expect(page).not.toContain('async function finishImport');
 		expect(page).not.toContain('async function onImport');
 	});

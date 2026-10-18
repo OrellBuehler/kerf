@@ -1,12 +1,12 @@
 <script lang="ts">
 	import SettingRow from './SettingRow.svelte';
 	import Btn from './Btn.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { useFilter } from '$lib/settings-filter';
-	import { colorGroupId } from '$lib/settings-index';
-	import { chip, OVERLINE } from '$lib/settings-ui';
-	import { COLOR_GROUPS, PRESETS, PRESET_IDS, SHAPE_TOKENS, THUMB_STYLES } from '$lib/theme';
-	import { tip } from '$lib/tip';
+	import { settings } from '#lib/settings.svelte';
+	import { useFilter } from '#lib/settings-filter';
+	import { colorGroupId } from '#lib/settings-index';
+	import { chip, OVERLINE } from '#lib/settings-ui';
+	import { COLOR_GROUPS, PRESETS, PRESET_IDS, SHAPE_TOKENS, THUMB_STYLES } from '#lib/theme';
+	import { tip } from '#lib/tip';
 
 	const filter = useFilter();
 	const themePreset = $derived(settings.themePreset);

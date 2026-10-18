@@ -5,12 +5,12 @@
 	import Icon from './Icon.svelte';
 	import IconBtn from './IconBtn.svelte';
 	import Tile from './Tile.svelte';
-	import { contextMenu, type MenuItem } from '$lib/context-menu.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { addTemplateHere, deleteTemplateFile, exportTemplateFile, posterOf } from '$lib/template-actions';
-	import { controlCount, fontsLine, templateTooltip } from '$lib/template-ui';
-	import { timeDisplay } from '$lib/time-display.svelte';
-	import type { TemplateInfo } from '$lib/types';
+	import { contextMenu, type MenuItem } from '#lib/context-menu.svelte';
+	import { editor } from '#lib/state.svelte';
+	import { addTemplateHere, deleteTemplateFile, exportTemplateFile, posterOf } from '#lib/template-actions';
+	import { controlCount, fontsLine, templateTooltip } from '#lib/template-ui';
+	import { timeDisplay } from '#lib/time-display.svelte';
+	import type { TemplateInfo } from '#lib/types';
 
 	let { info, aspect }: { info: TemplateInfo; aspect: { width: number; height: number } } = $props();
 

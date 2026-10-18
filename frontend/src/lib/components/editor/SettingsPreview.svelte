@@ -2,9 +2,9 @@
 	import SettingRow from './SettingRow.svelte';
 	import Switch from './Switch.svelte';
 	import ChoiceChips from './ChoiceChips.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { gpuPreview } from '$lib/gpu-preview.svelte';
-	import { PREVIEW_SOURCES, PROXY_SIZES } from '$lib/proxy-info';
+	import { settings } from '#lib/settings.svelte';
+	import { gpuPreview } from '#lib/gpu-preview.svelte';
+	import { PREVIEW_SOURCES, PROXY_SIZES } from '#lib/proxy-info';
 
 	// What the GPU preview is doing on this machine; read when its section shows.
 	const gpuStatus = $derived(gpuPreview.status);

@@ -3,11 +3,11 @@
 	import EmptyState from './EmptyState.svelte';
 	import Btn from './Btn.svelte';
 	import Chip from './Chip.svelte';
-	import { windows } from '$lib/windows.svelte';
-	import { documentOf } from '$lib/realm';
-	import { notifications, type Notice } from '$lib/notifications.svelte';
-	import { STATUS_LOOK as look } from '$lib/status-look';
-	import { tip } from '$lib/tip';
+	import { windows } from '#lib/windows.svelte';
+	import { documentOf } from '#lib/realm';
+	import { notifications, type Notice } from '#lib/notifications.svelte';
+	import { STATUS_LOOK as look } from '#lib/status-look';
+	import { tip } from '#lib/tip';
 
 	let el = $state<HTMLDivElement | null>(null);
 	let filter = $state<'all' | 'unread' | 'errors'>('all');

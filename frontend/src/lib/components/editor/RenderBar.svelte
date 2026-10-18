@@ -5,13 +5,13 @@
 	// red spans show. Asked again a moment after the cut, the media, the setting or the Preview's
 	// width changes: one request in flight, the newest asked for once it lands.
 	import { untrack } from 'svelte';
-	import { editor } from '$lib/state.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { getRenderBar } from '$lib/api';
-	import { tip } from '$lib/tip';
-	import { barColor, barTip, spansIn } from '$lib/render-bar';
-	import type { BarSpan } from '$lib/types';
+	import { editor } from '#lib/state.svelte';
+	import { settings } from '#lib/settings.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { getRenderBar } from '#lib/api';
+	import { tip } from '#lib/tip';
+	import { barColor, barTip, spansIn } from '#lib/render-bar';
+	import type { BarSpan } from '#lib/types';
 
 	let {
 		pxPerSec,

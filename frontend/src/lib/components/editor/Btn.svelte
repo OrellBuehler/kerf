@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
 	import Icon from './Icon.svelte';
-	import { tip, type TipInput } from '$lib/tip';
+	import { tip, type TipInput } from '#lib/tip';
 
 	let {
 		variant = 'secondary',

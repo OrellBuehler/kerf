@@ -23,9 +23,9 @@
 		takesAttribute,
 		type DraftContext,
 		type DraftControl
-	} from '$lib/template-ui';
-	import { tip } from '$lib/tip';
-	import type { TemplateKind } from '$lib/types';
+	} from '#lib/template-ui';
+	import { tip } from '#lib/tip';
+	import type { TemplateKind } from '#lib/types';
 
 	let {
 		draft,

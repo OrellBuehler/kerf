@@ -1,8 +1,8 @@
 <script lang="ts">
 	import SettingRow from './SettingRow.svelte';
-	import { settings, CPU_PRESETS } from '$lib/settings.svelte';
-	import { chip } from '$lib/settings-ui';
-	import { tip } from '$lib/tip';
+	import { settings, CPU_PRESETS } from '#lib/settings.svelte';
+	import { chip } from '#lib/settings-ui';
+	import { tip } from '#lib/tip';
 
 	const cores = $derived(settings.cpuCores);
 	const threads = $derived(settings.cpuThreads);

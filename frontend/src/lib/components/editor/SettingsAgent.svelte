@@ -7,10 +7,10 @@
 	import Switch from './Switch.svelte';
 	import Btn from './Btn.svelte';
 	import Icon from './Icon.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { agentStatus, confirmAction, mcpConnectionInfo, regenerateMcpToken, setMcpSettings } from '$lib/api';
-	import { CONFIRM, type ConfirmCopy } from '$lib/confirm-copy';
-	import { toast } from '$lib/notifications.svelte';
+	import { settings } from '#lib/settings.svelte';
+	import { agentStatus, confirmAction, mcpConnectionInfo, regenerateMcpToken, setMcpSettings } from '#lib/api';
+	import { CONFIRM, type ConfirmCopy } from '#lib/confirm-copy';
+	import { toast } from '#lib/notifications.svelte';
 	import {
 		addressNotice,
 		addressProblem,
@@ -21,8 +21,8 @@
 		networkWarning,
 		restartsListener,
 		tokenDisplay
-	} from '$lib/mcp-ui';
-	import type { McpConnectionInfo, McpSettingsPatch } from '$lib/types';
+	} from '#lib/mcp-ui';
+	import type { McpConnectionInfo, McpSettingsPatch } from '#lib/types';
 
 	let info = $state<McpConnectionInfo | null>(null);
 	let loadError = $state<string | null>(null);

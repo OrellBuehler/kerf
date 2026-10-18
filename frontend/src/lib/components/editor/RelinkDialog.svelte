@@ -6,12 +6,12 @@
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
 	import Icon from './Icon.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { mediaStatus } from '$lib/media-status.svelte';
-	import { relinkMediaFlow, removeMediaFlow } from '$lib/library-actions';
-	import { relinkIntro } from '$lib/library-copy';
-	import { shortPath } from '$lib/media-info';
-	import { tip } from '$lib/tip';
+	import { editor } from '#lib/state.svelte';
+	import { mediaStatus } from '#lib/media-status.svelte';
+	import { relinkMediaFlow, removeMediaFlow } from '#lib/library-actions';
+	import { relinkIntro } from '#lib/library-copy';
+	import { shortPath } from '#lib/media-info';
+	import { tip } from '#lib/tip';
 
 	let { onClose }: { onClose: () => void } = $props();
 

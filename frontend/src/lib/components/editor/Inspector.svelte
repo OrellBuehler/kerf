@@ -15,17 +15,17 @@
 	import MediaChips from './MediaChips.svelte';
 	import AnalysisRun from './AnalysisRun.svelte';
 	import AssetInspector from './AssetInspector.svelte';
-	import { analyzeMenuItems } from '$lib/analyze-menu';
-	import { editor } from '$lib/state.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { contextMenu } from '$lib/context-menu.svelte';
-	import type { MenuItem } from '$lib/context-menu.svelte';
-	import { GENERATED_TITLE_FILL, MIN_TITLE, SVG_TITLE_FILL, TITLE_SIZE_MAX, TITLE_SIZE_MIN, sampleOverlay } from '$lib/titles';
-	import type { SvgOverlay, SvgOverlayPatch, SvgPresetInfo, SvgPresetParams, TextOverlay } from '$lib/types';
-	import { clipDuration, DEFAULT_COLOR, DEFAULT_MASK, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '$lib/types';
-	import { COLOR_LOOKS, activeLook } from '$lib/style-presets';
-	import { MAX_GAIN } from '$lib/mixer';
-	import { AUDIO_FX, VIDEO_FX } from '$lib/effect-presets';
+	import { analyzeMenuItems } from '#lib/analyze-menu';
+	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { contextMenu } from '#lib/context-menu.svelte';
+	import type { MenuItem } from '#lib/context-menu.svelte';
+	import { GENERATED_TITLE_FILL, MIN_TITLE, SVG_TITLE_FILL, TITLE_SIZE_MAX, TITLE_SIZE_MIN, sampleOverlay } from '#lib/titles';
+	import type { SvgOverlay, SvgOverlayPatch, SvgPresetInfo, SvgPresetParams, TextOverlay } from '#lib/types';
+	import { clipDuration, DEFAULT_COLOR, DEFAULT_MASK, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '#lib/types';
+	import { COLOR_LOOKS, activeLook } from '#lib/style-presets';
+	import { MAX_GAIN } from '#lib/mixer';
+	import { AUDIO_FX, VIDEO_FX } from '#lib/effect-presets';
 	import {
 		addTextHere,
 		applySvgSource,
@@ -34,13 +34,13 @@
 		dropCaptions,
 		makeCaptions,
 		svgPresetInfos
-	} from '$lib/title-actions';
-	import { copyKeyframesOf, pasteKeyframesOnto, report } from '$lib/ops';
-	import { keyframeOffer } from '$lib/keyframe-copy';
-	import { SVG_PRESETS, svgDisplayName, takesParam } from '$lib/svg-titles';
+	} from '#lib/title-actions';
+	import { copyKeyframesOf, pasteKeyframesOnto, report } from '#lib/ops';
+	import { keyframeOffer } from '#lib/keyframe-copy';
+	import { SVG_PRESETS, svgDisplayName, takesParam } from '#lib/svg-titles';
 	import { untrack } from 'svelte';
-	import { needsCrop } from '$lib/smart-crop';
-	import { EASING_CHOICES, easingId } from '$lib/easing';
+	import { needsCrop } from '#lib/smart-crop';
+	import { EASING_CHOICES, easingId } from '#lib/easing';
 	import {
 		channelOf,
 		colorAnimated,
@@ -52,14 +52,14 @@
 		transformAt,
 		upsertKey,
 		volumeAnimated
-	} from '$lib/channels';
-	import { DEFAULT_TRANSITION_SECONDS, TRANSITION_GROUPS } from '$lib/transitions';
-	import type { Clip, Color, Mask, Projection, Property, Reframe, Transform, TransitionKind } from '$lib/types';
-	import { toast } from '$lib/notifications.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { linkBadge, selectionUnits } from '$lib/link-ui';
-	import { timeDisplay } from '$lib/time-display.svelte';
-	import { parseColor, swatchHex, withPicked } from '$lib/title-color';
+	} from '#lib/channels';
+	import { DEFAULT_TRANSITION_SECONDS, TRANSITION_GROUPS } from '#lib/transitions';
+	import type { Clip, Color, Mask, Projection, Property, Reframe, Transform, TransitionKind } from '#lib/types';
+	import { toast } from '#lib/notifications.svelte';
+	import { settings } from '#lib/settings.svelte';
+	import { linkBadge, selectionUnits } from '#lib/link-ui';
+	import { timeDisplay } from '#lib/time-display.svelte';
+	import { parseColor, swatchHex, withPicked } from '#lib/title-color';
 	import {
 		colorSummary,
 		keyLabel,
@@ -67,12 +67,12 @@
 		svgPlacementSummary,
 		svgSourceSummary,
 		timingSummary
-	} from '$lib/inspector-summary';
-	import { fitOffer, musicSummary } from '$lib/music-ui';
+	} from '#lib/inspector-summary';
+	import { fitOffer, musicSummary } from '#lib/music-ui';
 	import MusicStructure from './MusicStructure.svelte';
-	import { DEGREES, NUMBER_COL, PERCENT, SECONDS, TIMES, readout, type RowSpec } from '$lib/slider-row';
-	import { FieldEdits } from '$lib/field-edit';
-	import { tip } from '$lib/tip';
+	import { DEGREES, NUMBER_COL, PERCENT, SECONDS, TIMES, readout, type RowSpec } from '#lib/slider-row';
+	import { FieldEdits } from '#lib/field-edit';
+	import { tip } from '#lib/tip';
 
 	const clip = $derived(editor.selectedClip);
 	/** What a number row is editing: the clip or title and the playhead, as they are when an edit

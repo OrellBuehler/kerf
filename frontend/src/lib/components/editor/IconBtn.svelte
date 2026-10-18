@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
-	import { tip, tipText, type TipInput } from '$lib/tip';
+	import { tip, tipText, type TipInput } from '#lib/tip';
 
 	let {
 		active = undefined,

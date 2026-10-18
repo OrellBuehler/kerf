@@ -16,14 +16,14 @@
 	import TransitionsTab from './TransitionsTab.svelte';
 	import AudioTab from './AudioTab.svelte';
 	import TranscriptPanel from './TranscriptPanel.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { workspace } from '$lib/workspace.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { importMedia } from '$lib/import-media';
-	import { LIBRARY_MIN_OPEN_WIDTH, LIBRARY_OPEN_WIDTH, LIBRARY_RAIL_WIDTH } from '$lib/layout';
-	import { LIBRARY_TAB_SPECS, stepTab, type LibraryTab } from '$lib/workspaces';
-	import { tip } from '$lib/tip';
+	import { settings } from '#lib/settings.svelte';
+	import { workspace } from '#lib/workspace.svelte';
+	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { importMedia } from '#lib/import-media';
+	import { LIBRARY_MIN_OPEN_WIDTH, LIBRARY_OPEN_WIDTH, LIBRARY_RAIL_WIDTH } from '#lib/layout';
+	import { LIBRARY_TAB_SPECS, stepTab, type LibraryTab } from '#lib/workspaces';
+	import { tip } from '#lib/tip';
 
 	/** The dockview panel this is mounted in, and the dock around it; absent when
 	 *  rendered on its own. */

@@ -3,11 +3,11 @@
 	// bar. Choosing one swaps the dock's arrangement and nothing else. A group of
 	// toggle buttons rather than a tablist — there is no tabpanel to point at, the
 	// panels are the whole window — with the arrow keys as a shortcut along it.
-	import { workspace } from '$lib/workspace.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import type { ActionId } from '$lib/keymap';
-	import { WORKSPACE_SPECS, type WorkspaceId } from '$lib/workspaces';
-	import { tip } from '$lib/tip';
+	import { workspace } from '#lib/workspace.svelte';
+	import { settings } from '#lib/settings.svelte';
+	import type { ActionId } from '#lib/keymap';
+	import { WORKSPACE_SPECS, type WorkspaceId } from '#lib/workspaces';
+	import { tip } from '#lib/tip';
 
 	let list = $state<HTMLElement | null>(null);
 

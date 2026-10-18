@@ -1,11 +1,11 @@
 <script lang="ts">
 	import './layout.css';
-	import favicon from '$lib/assets/favicon.svg';
-	import { Toaster } from '$lib/components/ui/sonner';
+	import favicon from '#lib/assets/favicon.svg';
+	import { Toaster } from '#lib/components/ui/sonner';
 	import { onMount } from 'svelte';
-	import { installSliderFill } from '$lib/slider-fill';
-	import { installErrorLogging } from '$lib/log';
-	import { isEmbeddedPopout } from '$lib/popout-boot';
+	import { installSliderFill } from '#lib/slider-fill';
+	import { installErrorLogging } from '#lib/log';
+	import { isEmbeddedPopout } from '#lib/popout-boot';
 
 	let { children } = $props();
 

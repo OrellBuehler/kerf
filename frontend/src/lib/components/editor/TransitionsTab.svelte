@@ -4,11 +4,11 @@
 	// (the same `transition_in` the Inspector's Transition section edits).
 	import Chip from './Chip.svelte';
 	import Hint from './Hint.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { DEFAULT_TRANSITION_SECONDS, TRANSITION_GROUPS, needsSourceHandle, transitionLabel } from '$lib/transitions';
-	import { attempt } from '$lib/ops';
-	import type { TransitionKind } from '$lib/types';
-	import { FieldEdits } from '$lib/field-edit';
+	import { editor } from '#lib/state.svelte';
+	import { DEFAULT_TRANSITION_SECONDS, TRANSITION_GROUPS, needsSourceHandle, transitionLabel } from '#lib/transitions';
+	import { attempt } from '#lib/ops';
+	import type { TransitionKind } from '#lib/types';
+	import { FieldEdits } from '#lib/field-edit';
 
 	const clip = $derived(editor.selectedClip);
 	const current = $derived(clip?.transition_in ?? null);

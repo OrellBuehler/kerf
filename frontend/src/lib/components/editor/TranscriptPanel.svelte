@@ -8,14 +8,14 @@
 	import EmptyState from './EmptyState.svelte';
 	import ProgressBar from './ProgressBar.svelte';
 	import IconBtn from './IconBtn.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { mediaStatus } from '$lib/media-status.svelte';
-	import { toast } from '$lib/notifications.svelte';
-	import { exportTranscriptSrt, report } from '$lib/ops';
-	import { activeLineIndex, speakersOf, srcToTimeline, transcriptLines, type TxLine } from '$lib/transcript';
-	import { tip } from '$lib/tip';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { settings } from '#lib/settings.svelte';
+	import { editor } from '#lib/state.svelte';
+	import { mediaStatus } from '#lib/media-status.svelte';
+	import { toast } from '#lib/notifications.svelte';
+	import { exportTranscriptSrt, report } from '#lib/ops';
+	import { activeLineIndex, speakersOf, srcToTimeline, transcriptLines, type TxLine } from '#lib/transcript';
+	import { tip } from '#lib/tip';
 
 	const txLines = $derived(
 		transcriptLines(editor.selectedMetadata?.analysis?.transcript ?? [], editor.selectedAssetId, editor.timeline.tracks)

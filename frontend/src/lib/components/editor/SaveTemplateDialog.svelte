@@ -7,12 +7,12 @@
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
 	import TemplateControlEditor from './TemplateControlEditor.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { svgElementIds } from '$lib/api';
-	import { errorMessage } from '$lib/ops';
-	import { tidyReason } from '$lib/failure-copy';
-	import { svgDisplayName } from '$lib/svg-titles';
-	import { saveTitleAsTemplate } from '$lib/template-actions';
+	import { editor } from '#lib/state.svelte';
+	import { svgElementIds } from '#lib/api';
+	import { errorMessage } from '#lib/ops';
+	import { tidyReason } from '#lib/failure-copy';
+	import { svgDisplayName } from '#lib/svg-titles';
+	import { saveTitleAsTemplate } from '#lib/template-actions';
 	import {
 		MAX_CONTROLS,
 		checkDraft,
@@ -21,8 +21,8 @@
 		toControl,
 		type DraftContext,
 		type DraftControl
-	} from '$lib/template-ui';
-	import type { SvgElementId } from '$lib/types';
+	} from '#lib/template-ui';
+	import type { SvgElementId } from '#lib/types';
 
 	let { overlayId, onClose }: { overlayId: string; onClose: () => void } = $props();
 

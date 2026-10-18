@@ -9,12 +9,12 @@
 	import InspectorSection from './InspectorSection.svelte';
 	import Btn from './Btn.svelte';
 	import Icon from './Icon.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { FieldEdits } from '$lib/field-edit';
-	import { cssColorHex } from '$lib/css-color';
-	import { holdForPreview, report } from '$lib/ops';
-	import { setTemplateImage, setTemplateValue } from '$lib/template-actions';
+	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { FieldEdits } from '#lib/field-edit';
+	import { cssColorHex } from '#lib/css-color';
+	import { holdForPreview, report } from '#lib/ops';
+	import { setTemplateImage, setTemplateValue } from '#lib/template-actions';
 	import {
 		controlCount,
 		elementAttributes,
@@ -25,10 +25,10 @@
 		swatchOf,
 		targetsLine,
 		valueRefusal
-	} from '$lib/template-ui';
-	import { swatchHex } from '$lib/title-color';
-	import { tip } from '$lib/tip';
-	import type { SvgOverlay, TemplateControl } from '$lib/types';
+	} from '#lib/template-ui';
+	import { swatchHex } from '#lib/title-color';
+	import { tip } from '#lib/tip';
+	import type { SvgOverlay, TemplateControl } from '#lib/types';
 
 	let { o }: { o: SvgOverlay } = $props();
 

@@ -7,8 +7,8 @@
 	// same choice.
 	import Chip from './Chip.svelte';
 	import CheckRow from './CheckRow.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { VARIANT_PRESETS, formatsFor, variantPath } from '$lib/delivery-formats';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { VARIANT_PRESETS, formatsFor, variantPath } from '#lib/delivery-formats';
 
 	/** `where` finishes "One file per shape, …": the dialog has a destination
 	 *  field of its own to point at, the Deliver panel does not. */

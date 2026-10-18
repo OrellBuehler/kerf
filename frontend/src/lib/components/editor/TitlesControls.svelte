@@ -13,10 +13,10 @@
 	import Icon from './Icon.svelte';
 	import Tile from './Tile.svelte';
 	import TemplatesSection from './TemplatesSection.svelte';
-	import { documentOf } from '$lib/realm';
-	import { editor } from '$lib/state.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { CAPTION_LOOKS, TEXT_STYLES } from '$lib/style-presets';
+	import { documentOf } from '#lib/realm';
+	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { CAPTION_LOOKS, TEXT_STYLES } from '#lib/style-presets';
 	import {
 		addAnimatedTitle,
 		addCustomSvgTitle,
@@ -28,8 +28,8 @@
 		pickSvgTitle,
 		pickTitle,
 		presetThumbnail
-	} from '$lib/title-actions';
-	import { SVG_PRESETS, svgDisplayName, svgFrame, svgTooltip } from '$lib/svg-titles';
+	} from '#lib/title-actions';
+	import { SVG_PRESETS, svgDisplayName, svgFrame, svgTooltip } from '#lib/svg-titles';
 	import {
 		CAPTION_EXTENSIONS,
 		CAPTION_HINT,
@@ -44,10 +44,10 @@
 		keepLinesOn,
 		recaptionHint,
 		resolveChoice
-	} from '$lib/caption-import-ui';
-	import { attempt } from '$lib/ops';
-	import { timeDisplay } from '$lib/time-display.svelte';
-	import { tip } from '$lib/tip';
+	} from '#lib/caption-import-ui';
+	import { attempt } from '#lib/ops';
+	import { timeDisplay } from '#lib/time-display.svelte';
+	import { tip } from '#lib/tip';
 
 	const uid = $props.id();
 	/** The options row: where its window (the panel may be in a detached one) is read from. */
