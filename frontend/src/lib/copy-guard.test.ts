@@ -30,7 +30,8 @@ const state: MenuState = {
 	workspace: 'edit',
 	openPanels: ['library', 'preview', 'timeline', 'inspector', 'agent'],
 	detachedPanels: [],
-	desktop: true
+	desktop: true,
+	previewing: false
 };
 
 describe('the ellipsis', () => {

@@ -9,7 +9,8 @@
 	import { editor } from '$lib/state.svelte';
 	import { planMusicFit } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
-	import { formatTime } from '$lib/diff';
+	import { timeDisplay } from '$lib/time-display.svelte';
+	import { report } from '$lib/ops';
 	import { describeFit, describeRemainder, fitVerdict, musicSummary, parseTarget } from '$lib/music-ui';
 	import type { MusicFit } from '$lib/types';
 	import { tip } from '$lib/tip';
@@ -87,10 +88,10 @@
 		applying = true;
 		try {
 			const report = await editor.fitMusic(clipId, custom ? parseTarget(customText) : null, fadeOut);
-			toast.success(describeFit(report), { action: { label: 'Undo', onClick: () => void editor.undo() } });
+			toast.success(describeFit(report, (s) => timeDisplay.fmt(s)), { action: { label: 'Undo', onClick: () => void editor.undo() } });
 			onClose();
 		} catch (e) {
-			toast.error(e instanceof Error ? e.message : String(e));
+			report(e);
 		} finally {
 			applying = false;
 		}
@@ -154,9 +155,9 @@
 		>
 			{#if fit}
 				<span style={labelCss}>Target</span>
-				<span style={valueCss}>{formatTime(fit.target)}</span>
+				<span style={valueCss}>{timeDisplay.fmt(fit.target)}</span>
 				<span style={labelCss}>Fitted</span>
-				<span style={valueCss}>{formatTime(fit.duration)}</span>
+				<span style={valueCss}>{timeDisplay.fmt(fit.duration)}</span>
 				<span style={labelCss}>Splices</span>
 				<span style={valueCss}>{fit.splices}</span>
 				<span style={labelCss}>Bars between intro and ending</span>

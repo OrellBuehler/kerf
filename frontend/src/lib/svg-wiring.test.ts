@@ -81,9 +81,9 @@ describe('the titles lane', () => {
 });
 
 describe('the preview’s placement box', () => {
-	test('is drawn for the selected animated title only, while paused and inside its span', () => {
+	test('is drawn for the selected animated title only, while paused, not previewing a proposal, and inside its span', () => {
 		expect(preview).toContain('editor.selectedSvgOverlay');
-		expect(preview).toMatch(/o && !ui\.playing && !empty && isVisibleAt\(o, ui\.time\)/);
+		expect(preview).toMatch(/o && !ui\.playing && !empty && !editor\.previewingStaged && isVisibleAt\(o, ui\.time\)/);
 	});
 
 	test('counts toward the titles shown, which is what routes the preview', () => {

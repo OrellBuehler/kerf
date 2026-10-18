@@ -7,7 +7,9 @@
 //
 // A *field* is different from a readout: it is edited, so it shows a value that can be typed back exactly —
 // timecode in timecode mode, decimal seconds (to the frame, never `4.633333`) in seconds mode — and
-// `parseTime` takes either spelling in either mode, so a time can be pasted from wherever it was read.
+// `parseTime` takes either spelling in either mode, so a time can be pasted from wherever it was read. The one
+// thing a mode decides is what a bare colon time means: `1:05` is a second and five frames in timecode mode and a
+// minute and five seconds in seconds mode — the way the same mode would have printed it.
 //
 // What stays as it is: the review card's `m:ss.d` (`diff.ts`) and the platform check's `m:ss` are mirrors of
 // the backend's own phrasing, and a sentence the backend wrote cannot be re-spelled here.
@@ -62,16 +64,24 @@ export function formatField(seconds: number, fps: number, mode: TimeMode = DEFAU
 const NUMBER = /^\d+(?:\.\d+)?$|^\.\d+$/;
 const WHOLE = /^\d+$/;
 
+/** The spellings a time field takes, as a prompt after a refusal — those of the mode first. */
+export function timeHint(mode: TimeMode = DEFAULT_TIME_MODE): string {
+	return mode === 'seconds' ? 'try 12.5, 0:12.5 or 1:02:03' : 'try 12.5, 0:12.5 or 00:00:12:15';
+}
+
 /**
  * What a typed time means, in seconds — or `null` when it is not one. Accepted, in any mode:
  *  - seconds: `12.5`, `12.5s`, `.5`;
  *  - frames: `375f` (a count of frames of the cut's rate);
- *  - timecode: `HH:MM:SS:FF`, `MM:SS:FF`, `SS:FF` — the last field is frames (a `;` for drop-frame reads as `:`);
+ *  - timecode: `HH:MM:SS:FF` (four fields, in either mode; a `;` for drop-frame reads as `:`);
  *  - clock: `1:02.5`, `1:02:03.25` — a colon time whose last field has a decimal point is `[h:]m:s.fraction`.
+ * Two or three whole colon fields are what the *mode* says: in timecode mode `MM:SS:FF` and `SS:FF` (the last
+ * field is frames, `1:05` is a second and five frames), in seconds mode `H:MM:SS` and `M:SS` (`1:05` is a minute and
+ * five seconds, `75:10` is allowed — it is minutes — and `1:75` is not).
  * Whitespace is ignored and a negative time is refused. The result is as typed, not yet on a frame:
  * `roundToFrame` is the caller's decision (a field that is a frame count rounds; a title's length need not).
  */
-export function parseTime(text: string, fps: number): number | null {
+export function parseTime(text: string, fps: number, mode: TimeMode = DEFAULT_TIME_MODE): number | null {
 	const t = text.trim().toLowerCase().replace(/\s+/g, '').replace(/;/g, ':');
 	if (t === '' || t.startsWith('-')) return null;
 	const rate = usableFps(fps);
@@ -92,6 +102,11 @@ export function parseTime(text: string, fps: number): number | null {
 	}
 	if (!fields.every((f) => WHOLE.test(f))) return null;
 	const n = fields.map(Number);
+	if (mode === 'seconds' && n.length <= 3) {
+		const [h, m, s] = n.length === 3 ? n : [0, n[0], n[1]];
+		if (s >= 60 || (n.length === 3 && m >= 60)) return null;
+		return h * 3600 + m * 60 + s;
+	}
 	const frames = n[n.length - 1];
 	const seconds = n.length >= 2 ? n[n.length - 2] : 0;
 	const minutes = n.length >= 3 ? n[n.length - 3] : 0;
@@ -107,7 +122,7 @@ export function parseTime(text: string, fps: number): number | null {
 
 /** A typed time for a field that is a frame position: parsed, then put on a frame. `null` for text that is not
  *  a time. */
-export function parseFrameTime(text: string, fps: number): number | null {
-	const t = parseTime(text, fps);
+export function parseFrameTime(text: string, fps: number, mode: TimeMode = DEFAULT_TIME_MODE): number | null {
+	const t = parseTime(text, fps, mode);
 	return t === null ? null : roundToFrame(t, fps);
 }

@@ -8,7 +8,7 @@
 	import FaderMeter from './FaderMeter.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { audio } from '$lib/audio';
-	import { toast } from '$lib/notifications.svelte';
+	import { report } from '$lib/ops';
 	import { nudgePan, PAN_STEP, panLabel, panSides, panToPos, posToPan, sideLabel } from '$lib/mixer';
 	import type { StereoMeter } from '$lib/meter';
 	import { stateNote, type MixStrip } from '$lib/mixer-strips';
@@ -43,9 +43,7 @@
 	const read = $derived(reading ? readingText(reading) : null);
 	const sides = $derived(panSides(pan));
 
-	function err(e: unknown) {
-		toast.error(e instanceof Error ? e.message : String(e));
-	}
+	const err = report;
 
 	// ---- the fader ----------------------------------------------------------
 	function fadePreview(v: number) {

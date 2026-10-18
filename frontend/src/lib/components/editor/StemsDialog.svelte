@@ -10,7 +10,7 @@
 	import { cancelStems, onStemsProgress, stemsStatus } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 	import { failure } from '$lib/failure-copy';
-	import { formatTime } from '$lib/diff';
+	import { timeDisplay } from '$lib/time-display.svelte';
 	import type { StemsProgress, StemsStatus } from '$lib/types';
 	import { STEM_NAMES, capitalized, describeStems, downloadNote, isStemsCancelled, stageLabel } from '$lib/stems';
 	import { tip } from '$lib/tip';
@@ -96,7 +96,7 @@
 			>
 			{#if placement}
 				<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted)"
-					>clip at {formatTime(placement.clip.timeline_start)} on {placement.track.name}</span
+					>clip at {timeDisplay.fmt(placement.clip.timeline_start)} on {placement.track.name}</span
 				>
 			{/if}
 		</div>
