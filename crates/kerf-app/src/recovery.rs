@@ -51,18 +51,21 @@ pub(crate) fn start(app: &AppHandle) {
                 tracing::info!(session = id, "untitled project backed by a recovery file");
             }
             let app_state = app.state::<AppState>();
-            lock_user(&app_state.project).replace_with(project);
+            let old = lock_user(&app_state.project).replace_with(project);
+            old.close();
         }
         Err(e) => tracing::warn!(error = %e, "could not start an untitled project"),
     }
 }
 
-/// On a clean exit the untitled project goes: the user was asked about unsaved work before the
-/// window closed. A crash never gets here, which is the point.
+/// On a clean exit an untitled project that holds no work goes; one that does is kept for the
+/// next launch to offer (`Project::close_at_exit`), since the close guard can be bypassed. A
+/// crash never gets here, which is the point.
 pub(crate) fn on_exit(app: &AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
         if let Ok(empty) = Project::open_in_memory() {
-            lock_user(&state.project).replace_with(empty);
+            let old = lock_user(&state.project).replace_with(empty);
+            old.close_at_exit();
         }
     }
 }
@@ -107,7 +110,8 @@ pub(crate) async fn recover_project(app: AppHandle, state: State<'_, AppState>, 
     blocking(move || {
         let found = take(&app, &id)?;
         let recovered = Project::open_recovered(found).map_err(|e| e.to_string())?;
-        lock_user(&shared).replace_with(recovered);
+        let old = lock_user(&shared).replace_with(recovered);
+        old.close();
         scrub.clear();
         crate::restore_speech_model(&shared);
         crate::respawn_proxies(&app);

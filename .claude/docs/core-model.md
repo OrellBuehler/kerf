@@ -322,8 +322,12 @@
 - **Invariants** (`model/check.rs`, pure + unit-tested): `Timeline::check()` refuses a timeline no
   edit should leave — a non-finite time, gain or speed; a clip whose `source_out <= source_in`; a
   negative fade or transition; a text / SVG overlay that does not end after it starts; a non-finite
-  keyframe or marker time; a track, clip or overlay id used twice. `Project::run_edit` calls it on
-  every edit (live and staged) before the transaction commits, so a failing edit persists nothing.
+  keyframe or marker time; a track, clip or overlay id used twice. `Project::run_edit` takes
+  `known_violations()` before the edit and calls `check_new(&known)` after it, on every edit (live and
+  staged) before the transaction commits: only a violation (rule + item id) the edit **introduced** is
+  refused, so a file an older build left broken can still be edited, and a failing edit persists
+  nothing. The message names the item ("the clip at 0:04.0 on V1 has a negative fade", "the text
+  “hi” at 0:01.0 must end after it starts").
   **Overlaps are not checked**: Kerf allows them (an explicit `add_clip`, a trim into the next clip, old
   files), and the ripple already treats an overlap the edit did not make as old news. Nothing is indexed
   by position in the stored timeline (everything is by id), so there is no index range to check.

@@ -415,8 +415,9 @@ impl Project {
         self.recovery.as_ref().map(|r| r.dir())
     }
 
-    /// Close the project; an untitled one's recovery directory goes with it.
-    fn close(self) {
+    /// Close the project; an untitled one's recovery directory goes with it. Call it with no lock
+    /// held: deleting a directory is file-system work.
+    pub fn close(self) {
         let Self { conn, recovery, .. } = self;
         drop(conn);
         if let Some(dir) = recovery {
@@ -433,11 +434,39 @@ impl Project {
     /// new epoch. Call it under the lock the shared project sits behind, so no reader sees the new
     /// project under the old epoch either.
     ///
-    /// The project replaced is closed for good: an untitled one's recovery directory is deleted,
-    /// since replacing it means it was saved, recovered into another, or let go.
-    pub fn replace_with(&mut self, other: Project) {
-        std::mem::replace(self, other).close();
+    /// Returns the project replaced, for the caller to [`Self::close`] once it has released the
+    /// lock — closing deletes an untitled one's recovery directory, since replacing it means it
+    /// was saved, recovered into another, or let go.
+    #[must_use = "close the replaced project once the lock is released"]
+    pub fn replace_with(&mut self, other: Project) -> Project {
+        let old = std::mem::replace(self, other);
         crate::plan_epoch::bump_plan_epoch();
+        old
+    }
+
+    /// Close the project as the app exits: an untitled one's recovery directory is deleted only
+    /// when it holds no work. The close guard asks about unsaved work, but it can be bypassed (a
+    /// dialog that fails, a quit that skips it), and what it calls unsaved is narrower than what
+    /// a recovery offers; anything left is offered at the next launch.
+    pub fn close_at_exit(self) {
+        let keep = match (&self.recovery, self.recovery.as_ref().map(|r| r.project_path())) {
+            (Some(dir), Some(path)) => match crate::recovery::summarize_conn(&self.conn, dir.id(), &path) {
+                Ok(info) => info.is_some(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not tell whether the untitled project holds work; keeping it");
+                    true
+                }
+            },
+            _ => false,
+        };
+        if keep {
+            if let Some(id) = self.recovery_id() {
+                tracing::info!(session = id, "keeping the untitled project for recovery");
+            }
+            drop(self);
+        } else {
+            self.close();
+        }
     }
 
     /// Set who subsequent edits are attributed to in the history. The MCP server
@@ -495,6 +524,16 @@ impl Project {
         let found = store::user_version(&self.conn)?;
         store::check_supported(found)?;
         let blank = store::is_blank(&self.conn)?;
+        if !blank && self.conn.is_readonly(rusqlite::MAIN_DB)? {
+            // A write-protected file opens as it is: nothing is stamped, backed up or added. One
+            // that needs a real upgrade cannot be read by this build without writing to it.
+            if found < store::SCHEMA_VERSION && store::needs_upgrade(&self.conn, found) {
+                return Err(Error::Other(
+                    "this project was made by an older Kerf and needs upgrading, but its file is read-only — copy it somewhere you can write to and open the copy".into(),
+                ));
+            }
+            return Ok(());
+        }
         if !blank && found < store::SCHEMA_VERSION {
             if let Some(path) = &self.path {
                 store::backup_before_upgrade(&self.conn, path, found)?;
@@ -1590,6 +1629,8 @@ impl Project {
             // links nothing skips all of it, and the snapshot with it.
             let sync = links && timeline.has_links();
             let before = (ripple || sync).then(|| timeline.clone());
+            // What an older build left broken is not this edit's to answer for.
+            let known = timeline.known_violations();
             let result = f(timeline)?;
             if let Some(before) = &before {
                 // What the edit itself left, before the per-lane ripple moves each track
@@ -1615,7 +1656,7 @@ impl Project {
             if timeline.has_links() {
                 timeline.dissolve_all_orphans();
             }
-            timeline.check()?;
+            timeline.check_new(&known)?;
             Ok(result)
         };
         // While the agent has a staging session open its edits go to the
@@ -4602,10 +4643,12 @@ impl Project {
     }
 
     pub fn add_overlay(&self, text: String, start: f64, end: f64) -> Result<TextOverlay> {
+        // Judged after the clamp: `(-2, 0)` would otherwise become an overlay of no length.
+        let start = start.max(0.0);
         if !start.is_finite() || !end.is_finite() || end <= start {
             return Err(Error::InvalidArgument("overlay end must be after start".to_string()));
         }
-        let overlay = TextOverlay::new(text, start.max(0.0), end);
+        let overlay = TextOverlay::new(text, start, end);
         self.edit_timeline("Add text overlay", move |timeline| {
             timeline.overlays.push(overlay.clone());
             Ok(overlay)
@@ -8409,7 +8452,7 @@ mod tests {
         let mut shared = Project::open_in_memory().unwrap();
         let opened = Project::open_in_memory().unwrap();
         let before = bumps_here();
-        shared.replace_with(opened);
+        shared.replace_with(opened).close();
         assert!(bumps_here() > before);
     }
 

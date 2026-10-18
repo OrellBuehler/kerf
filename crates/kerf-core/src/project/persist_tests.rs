@@ -80,16 +80,22 @@ fn a_new_file_is_stamped_with_this_schema_and_gets_no_backup() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Make the file at `path` look like one a build from before schema versions wrote; `columns`
+/// false also takes away the columns v1 adds, so the upgrade has something to do.
+fn make_legacy(path: &Path, columns: bool) {
+    let conn = Connection::open(path).unwrap();
+    conn.pragma_update(None, "user_version", 0).unwrap();
+    if !columns {
+        conn.execute_batch("ALTER TABLE assets DROP COLUMN voiceover").unwrap();
+    }
+}
+
 #[test]
 fn a_legacy_file_is_backed_up_once_then_upgraded() {
     let dir = scratch();
     let path = dir.join("old cut.kerf");
     edited(2).0.save_as(&path).unwrap();
-    // What a build from before schema versions wrote.
-    Connection::open(&path)
-        .unwrap()
-        .pragma_update(None, "user_version", 0)
-        .unwrap();
+    make_legacy(&path, false);
 
     let project = Project::open(&path).unwrap();
     assert_eq!(project.history().unwrap().len(), 3);
@@ -101,12 +107,60 @@ fn a_legacy_file_is_backed_up_once_then_upgraded() {
 
     // A second downgrade-and-open keeps the first backup rather than overwriting it.
     let first = std::fs::read(&backup).unwrap();
-    Connection::open(&path)
-        .unwrap()
-        .pragma_update(None, "user_version", 0)
-        .unwrap();
+    make_legacy(&path, false);
     drop(Project::open(&path).unwrap());
     assert_eq!(std::fs::read(&backup).unwrap(), first);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_legacy_file_that_already_has_the_columns_is_stamped_without_a_backup() {
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    edited(1).0.save_as(&path).unwrap();
+    make_legacy(&path, true);
+    drop(Project::open(&path).unwrap());
+    assert_eq!(version_of(&path), SCHEMA_VERSION);
+    let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("cut.kerf")]);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_backup_that_cannot_be_written_does_not_stop_an_additive_upgrade() {
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    edited(1).0.save_as(&path).unwrap();
+    make_legacy(&path, false);
+    // Something that is not a file sits where the backup goes, so writing it fails.
+    std::fs::create_dir_all(schema_backup_path(&path, 0).join("x")).unwrap();
+    let project = Project::open(&path).unwrap();
+    assert_eq!(project.history().unwrap().len(), 2);
+    drop(project);
+    assert_eq!(version_of(&path), SCHEMA_VERSION);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_read_only_legacy_file_opens_untouched() {
+    let dir = scratch();
+    let path = dir.join("locked.kerf");
+    edited(2).0.save_as(&path).unwrap();
+    make_legacy(&path, true);
+    let before = std::fs::read(&path).unwrap();
+    // A write-protected file opens read-only; the URI form says so even to root.
+    let uri = format!("file:{}?mode=ro", path.display());
+    let project = Project::open(&uri).unwrap();
+    assert_eq!(project.history().unwrap().len(), 3);
+    assert_eq!(project.timeline().unwrap().tracks[0].clips.len(), 2);
+    drop(project);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no backup");
+
+    // One that needs a real upgrade says why it cannot be opened.
+    make_legacy(&path, false);
+    let err = Project::open(&uri).err().expect("needs an upgrade");
+    assert!(err.to_string().contains("read-only"), "{err}");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -144,6 +198,35 @@ fn an_edit_that_breaks_an_invariant_persists_nothing() {
     assert!(err.to_string().contains("would leave the timeline invalid"), "{err}");
     assert_eq!(project.timeline_json().unwrap(), before);
     assert_eq!(project.history().unwrap().len(), history);
+}
+
+#[test]
+fn a_timeline_an_older_build_left_broken_can_still_be_edited() {
+    let (project, asset) = edited(1);
+    // What `add_overlay(-2, 0)` used to store: an overlay of no length.
+    let mut t = project.timeline().unwrap();
+    t.overlays.push(TextOverlay::new("old", 0.0, 0.0));
+    project.save_timeline(&t).unwrap();
+
+    project.cut_clip(asset, 5.0, 6.0).unwrap();
+    project.add_marker(1.0, "m".into(), None).unwrap();
+    // But a new break is still refused, and named.
+    let err = project
+        .edit_timeline("Break it", |t| {
+            t.tracks[0].clips[0].fade_in = -1.0;
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("the clip at 0:00.0 on"), "{err}");
+}
+
+#[test]
+fn an_overlay_clamped_to_no_length_is_refused() {
+    let (project, _) = edited(0);
+    let err = project.add_overlay("t".into(), -2.0, 0.0).unwrap_err();
+    assert!(err.to_string().contains("end must be after start"), "{err}");
+    assert!(project.timeline().unwrap().overlays.is_empty());
+    project.add_overlay("t".into(), -2.0, 1.0).unwrap();
 }
 
 #[test]

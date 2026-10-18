@@ -199,25 +199,48 @@ fn inspect(id: String, dir: PathBuf) -> Seen {
 /// created) so SQLite can roll back the journal a crash left behind before it is read.
 fn summarize(id: &str, path: &Path) -> Result<Option<RecoveryInfo>> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-    let count = |sql: &str| -> Result<usize> {
-        let n: i64 = conn.query_row(sql, [], |r| r.get(0))?;
+    summarize_conn(&conn, id, path)
+}
+
+/// [`summarize`] over a connection already open on `path`. A table the file lacks holds nothing:
+/// a session that crashed while its file was being created (a 0-byte file, a schema half
+/// written) is empty, not unreadable, so it is cleaned up rather than skipped forever.
+pub(crate) fn summarize_conn(conn: &Connection, id: &str, path: &Path) -> Result<Option<RecoveryInfo>> {
+    let has = |table: &str| -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |r| r.get(0),
+        )?)
+    };
+    let count = |table: &str, filter: &str| -> Result<usize> {
+        if !has(table)? {
+            return Ok(0);
+        }
+        let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table} {filter}"), [], |r| r.get(0))?;
         Ok(usize::try_from(n).unwrap_or(0))
     };
-    let assets = count("SELECT COUNT(*) FROM assets")?;
-    let edits = count("SELECT COUNT(*) FROM history WHERE seq > 0")?;
-    let tasks = count("SELECT COUNT(*) FROM tasks")?;
-    let staged = count("SELECT COUNT(*) FROM staged")? > 0;
-    let clips = conn
-        .query_row("SELECT data FROM timeline WHERE id = 1", [], |r| r.get::<_, String>(0))
-        .optional()?
-        .and_then(|json| serde_json::from_str::<crate::model::Timeline>(&json).ok())
-        .map(|t| t.tracks.iter().map(|tr| tr.clips.len()).sum())
-        .unwrap_or(0);
-    let last_edit = conn
-        .query_row("SELECT label FROM history WHERE seq > 0 ORDER BY seq DESC LIMIT 1", [], |r| {
+    let assets = count("assets", "")?;
+    let edits = count("history", "WHERE seq > 0")?;
+    let tasks = count("tasks", "")?;
+    let staged = count("staged", "")? > 0;
+    let clips = if has("timeline")? {
+        conn.query_row("SELECT data FROM timeline WHERE id = 1", [], |r| r.get::<_, String>(0))
+            .optional()?
+            .and_then(|json| serde_json::from_str::<crate::model::Timeline>(&json).ok())
+            .map(|t| t.tracks.iter().map(|tr| tr.clips.len()).sum())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let last_edit = if edits > 0 {
+        conn.query_row("SELECT label FROM history WHERE seq > 0 ORDER BY seq DESC LIMIT 1", [], |r| {
             r.get::<_, String>(0)
         })
-        .optional()?;
+        .optional()?
+    } else {
+        None
+    };
     let modified_at = std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
@@ -353,6 +376,40 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_byte_or_half_made_project_is_empty() {
+        let root = scratch();
+        let zero = root.join("zero");
+        std::fs::create_dir_all(&zero).unwrap();
+        std::fs::write(zero.join(PROJECT_FILE), b"").unwrap();
+        let half = root.join("half");
+        std::fs::create_dir_all(&half).unwrap();
+        Connection::open(half.join(PROJECT_FILE))
+            .unwrap()
+            .execute_batch("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        assert!(scan(&root, None).is_empty());
+        assert!(dirs(&root).is_empty(), "both are cleaned up: {:?}", dirs(&root));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn exiting_keeps_a_session_with_work_and_deletes_an_untouched_one() {
+        let root = scratch();
+        let worked = Project::create_recovery(&root).unwrap();
+        worked.insert_asset(&some_asset()).unwrap();
+        let worked_dir = worked.recovery_dir().unwrap().to_path_buf();
+        worked.close_at_exit();
+        assert!(worked_dir.exists(), "offered at the next launch");
+        assert_eq!(scan(&root, None).len(), 1);
+
+        let idle = Project::create_recovery(&root).unwrap();
+        let idle_dir = idle.recovery_dir().unwrap().to_path_buf();
+        idle.close_at_exit();
+        assert!(!idle_dir.exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn recovering_carries_the_work_and_saving_it_removes_the_session() {
         let root = scratch();
         crashed_session(&root, true);
@@ -365,7 +422,7 @@ mod tests {
         let target = root.join("saved.kerf");
         recovered.save_as(&target).unwrap();
         let mut current = recovered;
-        current.replace_with(Project::open(&target).unwrap());
+        current.replace_with(Project::open(&target).unwrap()).close();
         assert!(!dir.exists(), "the session goes once its work is in a file");
         assert_eq!(current.list_assets().unwrap().len(), 1);
         std::fs::remove_dir_all(&root).ok();

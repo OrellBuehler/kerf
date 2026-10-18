@@ -1,33 +1,65 @@
 //! The `.kerf` file itself: which schema version it is at, the migrations that bring an
 //! older one forward, and copies that a crash or a full disk cannot leave half-written.
 
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use rusqlite::{params, Connection};
 
 use crate::error::{Error, Result};
 
 /// One schema step: upgrades a file from the version at its index to the next.
-type Migration = fn(&Connection) -> rusqlite::Result<()>;
+struct Migration {
+    run: fn(&Connection) -> rusqlite::Result<()>,
+    /// Whether `run` would change this file; a file that already has what the step adds gets
+    /// no backup for it.
+    needed: fn(&Connection) -> bool,
+    /// Whether the step drops or rewrites data. Only such a step refuses to run without a backup.
+    destructive: bool,
+}
 
 /// `MIGRATIONS[i]` upgrades schema `i` to `i + 1`. Version 0 is every file written before
 /// `PRAGMA user_version` was used — the legacy baseline. Append one step per change; never edit
 /// a shipped one. Steps run after `SCHEMA` has created any table the file lacked, so each must
 /// tolerate that (`IF NOT EXISTS`, probe before `ALTER`).
-const MIGRATIONS: &[Migration] = &[v0_to_v1];
+const MIGRATIONS: &[Migration] = &[Migration {
+    run: v0_to_v1,
+    needed: v0_to_v1_needed,
+    destructive: false,
+}];
 
 /// The schema this build writes and the newest it opens.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
 
+const V1_COLUMNS: [&str; 2] = ["source_paths", "voiceover"];
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    conn.prepare(&format!("SELECT {column} FROM {table} LIMIT 1")).is_ok()
+}
+
 /// v1: the columns older builds added by probing, now a numbered step.
 fn v0_to_v1(conn: &Connection) -> rusqlite::Result<()> {
-    for column in ["source_paths", "voiceover"] {
-        if conn.prepare(&format!("SELECT {column} FROM assets LIMIT 1")).is_err() {
+    for column in V1_COLUMNS {
+        if !has_column(conn, "assets", column) {
             conn.execute(&format!("ALTER TABLE assets ADD COLUMN {column} TEXT"), [])?;
         }
     }
     Ok(())
+}
+
+fn v0_to_v1_needed(conn: &Connection) -> bool {
+    V1_COLUMNS.iter().any(|c| !has_column(conn, "assets", c))
+}
+
+/// The steps from `found` on that would change this file.
+fn pending(conn: &Connection, found: u32) -> impl Iterator<Item = &'static Migration> + '_ {
+    MIGRATIONS.iter().skip(found as usize).filter(move |m| (m.needed)(conn))
+}
+
+/// Whether bringing a file at `found` forward would change anything but its version stamp.
+pub(crate) fn needs_upgrade(conn: &Connection, found: u32) -> bool {
+    pending(conn, found).next().is_some()
 }
 
 pub(crate) fn user_version(conn: &Connection) -> Result<u32> {
@@ -57,7 +89,7 @@ pub(crate) fn check_supported(found: u32) -> Result<()> {
 pub(crate) fn migrate(conn: &Connection, found: u32) -> Result<()> {
     for (v, step) in MIGRATIONS.iter().enumerate().skip(found as usize) {
         let tx = conn.unchecked_transaction()?;
-        step(conn)?;
+        (step.run)(conn)?;
         tx.pragma_update(None, "user_version", v as i64 + 1)?;
         tx.commit()?;
     }
@@ -83,14 +115,28 @@ pub fn backup_path(path: &Path, version: u32) -> PathBuf {
     path.with_file_name(format!("{stem} (schema v{version} backup).{ext}"))
 }
 
-/// Keep a copy of the file `conn` has open before it is upgraded from `version`. An existing
-/// backup is the older one and is left alone.
-pub(crate) fn backup_before_upgrade(conn: &Connection, path: &Path, version: u32) -> Result<PathBuf> {
-    let backup = backup_path(path, version);
-    if !backup.exists() {
-        vacuum_into_atomic(conn, &backup)?;
+/// Keep a copy of the file `conn` has open before it is upgraded from `version`, when an upgrade
+/// would change it. An existing backup is the older one and is left alone. A backup that cannot
+/// be written (a full disk, a folder the user may not write to) stops only a destructive upgrade;
+/// the others only add, so the file still opens.
+pub(crate) fn backup_before_upgrade(conn: &Connection, path: &Path, version: u32) -> Result<Option<PathBuf>> {
+    let mut steps = pending(conn, version).peekable();
+    if steps.peek().is_none() {
+        return Ok(None);
     }
-    Ok(backup)
+    let destructive = steps.any(|m| m.destructive);
+    let backup = backup_path(path, version);
+    if backup.is_file() {
+        return Ok(Some(backup));
+    }
+    match vacuum_into_atomic(conn, &backup) {
+        Ok(()) => Ok(Some(backup)),
+        Err(e) if !destructive => {
+            tracing::warn!(backup = %backup.display(), error = %e, "could not back up a project before upgrading it; upgrading anyway");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn parent_dir(path: &Path) -> PathBuf {
@@ -111,6 +157,7 @@ pub(crate) fn vacuum_into_atomic(conn: &Connection, target: &Path) -> Result<()>
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    sweep_stale_temps(&dir, &name);
     let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
     let result = (|| -> Result<()> {
         let dst = tmp
@@ -130,9 +177,45 @@ pub(crate) fn vacuum_into_atomic(conn: &Connection, target: &Path) -> Result<()>
     Ok(())
 }
 
+/// How old a temp file of ours must be before a save takes it for one a crash left: well past
+/// any snapshot still being written by another instance.
+const STALE_TEMP: Duration = Duration::from_secs(60 * 60);
+
+/// Whether `file` is a temp file [`vacuum_into_atomic`] makes for `name`: `.<name>.<uuid>.tmp`.
+fn is_temp_for(file: &str, name: &str) -> bool {
+    file.strip_prefix('.')
+        .and_then(|f| f.strip_prefix(name))
+        .and_then(|f| f.strip_prefix('.'))
+        .and_then(|f| f.strip_suffix(".tmp"))
+        .is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Delete the temp files a crashed save of `name` left in `dir`. Only this target's own pattern
+/// is looked at, and only once it is [`STALE_TEMP`] old.
+fn sweep_stale_temps(dir: &Path, name: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        if !is_temp_for(&entry.file_name().to_string_lossy(), name) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age >= STALE_TEMP));
+        if stale {
+            if let Err(e) = std::fs::remove_file(entry.path()) {
+                tracing::warn!(file = %entry.path().display(), error = %e, "could not delete a stale save temp file");
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 fn sync_dir(dir: &Path) {
-    if let Err(e) = File::open(dir).and_then(|d| d.sync_all()) {
+    if let Err(e) = std::fs::File::open(dir).and_then(|d| d.sync_all()) {
         tracing::warn!(dir = %dir.display(), error = %e, "could not fsync the directory after a save");
     }
 }
@@ -204,6 +287,42 @@ mod tests {
         assert!(vacuum_into_atomic(&db_with("x"), &dir.join("nope/cut.kerf")).is_err());
         assert!(names(&dir).is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_save_sweeps_its_own_stale_temp_files_and_nothing_else() {
+        let dir = scratch("sweep");
+        let target = dir.join("cut.kerf");
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let old = SystemTime::now() - STALE_TEMP - Duration::from_secs(60);
+        let make = |name: &str, aged: bool| {
+            let file = std::fs::File::create(dir.join(name)).unwrap();
+            if aged {
+                file.set_modified(old).unwrap();
+            }
+        };
+        make(&format!(".cut.kerf.{id}.tmp"), true);
+        make(&format!(".other.kerf.{id}.tmp"), true);
+        make(&format!(".cut.kerf.{}.tmp", uuid::Uuid::new_v4().simple()), false);
+        make(".cut.kerf.notauuid.tmp", true);
+        vacuum_into_atomic(&db_with("x"), &target).unwrap();
+        let left = names(&dir);
+        assert!(!left.contains(&format!(".cut.kerf.{id}.tmp")), "{left:?}");
+        assert_eq!(
+            left.len(),
+            4,
+            "the other target's, the fresh one, the odd name and the file: {left:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_temp_pattern_is_exact() {
+        let id = "0123456789abcdef0123456789abcdef";
+        assert!(is_temp_for(&format!(".cut.kerf.{id}.tmp"), "cut.kerf"));
+        assert!(!is_temp_for(&format!(".cut.kerf.{id}.tmp"), "cut"));
+        assert!(!is_temp_for(&format!("cut.kerf.{id}.tmp"), "cut.kerf"));
+        assert!(!is_temp_for(".cut.kerf.0123.tmp", "cut.kerf"));
     }
 
     #[test]

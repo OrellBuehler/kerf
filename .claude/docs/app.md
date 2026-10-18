@@ -211,8 +211,10 @@ sessions) and swaps the launch's empty project for `Project::create_recovery` th
 the top of `run()`, because a second launch is handed to the first by the single-instance plugin before
 `setup` and must not make a session. `new_project` (now `async` + `blocking`) makes a fresh session the
 same way (`recovery::untitled`; no data dir or no file locking falls back to in-memory). Replacing the
-project (`replace_with`: Open, New, Save As, Recover) deletes the old session, and a clean exit
-(`RunEvent::Exit`) does too — the close guard already asked about unsaved work; a crash leaves it.
+project (`replace_with`: Open, New, Save As, Recover) deletes the old session — each command
+`close()`s the returned project after dropping the lock. A clean exit (`RunEvent::Exit`) uses
+`close_at_exit`: an untouched session goes, one holding work stays to be offered next launch (the close
+guard can be bypassed, and `hasUnsavedWork` is narrower than recovery's rule); a crash leaves it.
 `list_recoveries` scans once per run (`kerf_core::recovery::scan`, skipping our own session) and keeps
 what it found **locked** in `RecoveryState` until `recover_project { id }` (opens it as the untitled
 project, like `open_project`: scrub cleared, speech model restored, proxies queued) or

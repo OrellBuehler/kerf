@@ -4,90 +4,186 @@
 //! is not a number, a clip with no footage, two things with one id. Overlaps on a track are not
 //! among them: Kerf allows them (an explicit `add_clip`, a trim into the next clip), and the
 //! ripple already treats an overlap the edit did not make as old news.
+//!
+//! An edit is refused only for what it *introduces*: a file an older build wrote may already hold
+//! a broken item, and refusing every edit to it would lock the user out of their own project.
 
 use std::collections::HashSet;
 
-use super::{Clip, Timeline};
+use uuid::Uuid;
+
+use super::{fmt_time, Clip, Timeline, Track};
 use crate::error::{Error, Result};
 
+/// Which invariant an item breaks; with the item's id, the same violation before and after an edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Rule {
+    TrackTwice,
+    TrackGain,
+    ClipTwice,
+    ClipTime,
+    ClipEmpty,
+    ClipSpeed,
+    ClipFade,
+    ClipTransition,
+    ClipKeyframe,
+    OverlayTwice,
+    OverlaySpan,
+    OverlayKeyframe,
+    TitleTwice,
+    TitleSpan,
+    MarkerTime,
+}
+
+/// One broken invariant: the rule, the item, and a sentence naming the item for the user.
+struct Violation {
+    rule: Rule,
+    item: Uuid,
+    why: String,
+}
+
+/// The violations a timeline already holds, which an edit to it may leave in place.
+#[derive(Debug, Default)]
+pub struct KnownViolations(HashSet<(Rule, Uuid)>);
+
 impl Timeline {
-    /// Refuse a timeline no edit should leave behind: a non-finite time, gain or speed; a clip
+    /// Refuse a timeline that breaks any invariant: a non-finite time, gain or speed; a clip
     /// whose out-point is not after its in-point; a negative fade or transition; an overlay that
-    /// ends before it starts; or an id used twice. Pure — `Project::run_edit` calls it before the
-    /// edit is committed, so a failing edit persists nothing.
+    /// does not end after it starts; or an id used twice.
     pub fn check(&self) -> Result<()> {
+        self.check_new(&KnownViolations::default())
+    }
+
+    /// What this timeline already breaks, taken before an edit so [`Self::check_new`] can tell
+    /// what the edit added.
+    pub fn known_violations(&self) -> KnownViolations {
+        KnownViolations(self.violations().into_iter().map(|v| (v.rule, v.item)).collect())
+    }
+
+    /// [`Self::check`], forgiving what `known` lists. `Project::run_edit` calls it before the
+    /// edit is committed, so a failing edit persists nothing.
+    pub fn check_new(&self, known: &KnownViolations) -> Result<()> {
+        match self.violations().into_iter().find(|v| !known.0.contains(&(v.rule, v.item))) {
+            Some(v) => Err(Error::InvalidArgument(format!(
+                "that edit would leave the timeline invalid: {}",
+                v.why
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn violations(&self) -> Vec<Violation> {
+        let mut out = Vec::new();
+        let mut push = |rule, item, why: String| out.push(Violation { rule, item, why });
         let mut tracks = HashSet::new();
         let mut clips = HashSet::new();
         for track in &self.tracks {
             if !tracks.insert(track.id) {
-                return invalid(format!("track {} appears twice", track.id));
+                push(
+                    Rule::TrackTwice,
+                    track.id,
+                    format!("track {} has the same id as another track", track.name),
+                );
             }
             if !track.volume.is_finite() || !track.pan.is_finite() {
-                return invalid(format!("track {} has a gain that is not a number", track.name));
+                push(
+                    Rule::TrackGain,
+                    track.id,
+                    format!("track {} has a gain that is not a number", track.name),
+                );
             }
             for clip in &track.clips {
+                let name = clip_name(track, clip);
                 if !clips.insert(clip.id) {
-                    return invalid(format!("clip {} appears twice", clip.id));
+                    push(Rule::ClipTwice, clip.id, format!("{name} has the same id as another clip"));
                 }
-                check_clip(clip)?;
+                for (rule, why) in clip_violations(clip) {
+                    push(rule, clip.id, format!("{name} {why}"));
+                }
             }
         }
         let mut overlays = HashSet::new();
         for o in &self.overlays {
+            let name = format!("the text {} at {}", quoted(&o.text, "overlay"), fmt_time(o.start));
             if !overlays.insert(o.id) {
-                return invalid(format!("overlay {} appears twice", o.id));
+                push(Rule::OverlayTwice, o.id, format!("{name} has the same id as another overlay"));
             }
             if !o.start.is_finite() || !o.end.is_finite() || o.end <= o.start {
-                return invalid(format!("overlay {} must end after it starts", o.id));
+                push(Rule::OverlaySpan, o.id, format!("{name} must end after it starts"));
             }
             if o.keyframes.iter().any(|k| !k.time.is_finite()) {
-                return invalid(format!("overlay {} has a keyframe at a time that is not a number", o.id));
+                push(
+                    Rule::OverlayKeyframe,
+                    o.id,
+                    format!("{name} has a keyframe at a time that is not a number"),
+                );
             }
         }
         for o in &self.svg_overlays {
+            let name = format!("the animated title {} at {}", quoted(&o.name, "title"), fmt_time(o.start));
             if !overlays.insert(o.id) {
-                return invalid(format!("animated title {} appears twice", o.id));
+                push(Rule::TitleTwice, o.id, format!("{name} has the same id as another overlay"));
             }
             if !o.start.is_finite() || !o.end.is_finite() || o.end <= o.start {
-                return invalid(format!("animated title {} must end after it starts", o.id));
+                push(Rule::TitleSpan, o.id, format!("{name} must end after it starts"));
             }
         }
-        if self.markers.iter().any(|m| !m.time.is_finite()) {
-            return invalid("a marker is at a time that is not a number".to_string());
+        for m in &self.markers {
+            if !m.time.is_finite() {
+                push(
+                    Rule::MarkerTime,
+                    m.id,
+                    format!("the marker {} is at a time that is not a number", quoted(&m.name, "marker")),
+                );
+            }
         }
-        Ok(())
+        out
     }
 }
 
-fn check_clip(c: &Clip) -> Result<()> {
-    let id = c.id;
-    if !(c.source_in.is_finite() && c.source_out.is_finite() && c.timeline_start.is_finite()) {
-        return invalid(format!("clip {id} has a time that is not a number"));
+/// "the clip at 0:04.0 on V1", or "a clip on V1" when it has no usable position.
+fn clip_name(track: &Track, clip: &Clip) -> String {
+    if clip.timeline_start.is_finite() {
+        format!("the clip at {} on {}", fmt_time(clip.timeline_start), track.name)
+    } else {
+        format!("a clip on {}", track.name)
     }
-    if c.source_out <= c.source_in {
-        return invalid(format!("clip {id} must end after it starts in its source"));
+}
+
+/// The text in curly quotes, cut short, or "(overlay without text)" when there is none.
+fn quoted(text: &str, noun: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return format!("({noun} without text)");
+    }
+    let short: String = text.chars().take(24).collect();
+    let more = if short.len() < text.len() { "\u{2026}" } else { "" };
+    format!("\u{201c}{short}{more}\u{201d}")
+}
+
+fn clip_violations(c: &Clip) -> Vec<(Rule, &'static str)> {
+    let mut out = Vec::new();
+    if !(c.source_in.is_finite() && c.source_out.is_finite() && c.timeline_start.is_finite()) {
+        out.push((Rule::ClipTime, "has a time that is not a number"));
+    } else if c.source_out <= c.source_in {
+        out.push((Rule::ClipEmpty, "must end after it starts in its source"));
     }
     if !c.speed.is_finite() || !c.volume.is_finite() {
-        return invalid(format!("clip {id} has a speed or volume that is not a number"));
+        out.push((Rule::ClipSpeed, "has a speed or volume that is not a number"));
     }
     if !(c.fade_in.is_finite() && c.fade_in >= 0.0 && c.fade_out.is_finite() && c.fade_out >= 0.0) {
-        return invalid(format!("clip {id} has a negative fade"));
+        out.push((Rule::ClipFade, "has a negative fade"));
     }
-    if let Some(t) = &c.transition_in {
-        if !t.duration.is_finite() || t.duration < 0.0 {
-            return invalid(format!("clip {id} has a negative transition"));
-        }
+    if c.transition_in
+        .as_ref()
+        .is_some_and(|t| !t.duration.is_finite() || t.duration < 0.0)
+    {
+        out.push((Rule::ClipTransition, "has a negative transition"));
     }
     if c.keyframes.iter().any(|k| !k.time.is_finite()) {
-        return invalid(format!("clip {id} has a keyframe at a time that is not a number"));
+        out.push((Rule::ClipKeyframe, "has a keyframe at a time that is not a number"));
     }
-    Ok(())
-}
-
-fn invalid(why: String) -> Result<()> {
-    Err(Error::InvalidArgument(format!(
-        "that edit would leave the timeline invalid: {why}"
-    )))
+    out
 }
 
 #[cfg(test)]
@@ -172,6 +268,40 @@ mod tests {
     #[test]
     fn an_overlay_that_ends_before_it_starts_is_refused() {
         rejects("overlay", |t| t.overlays[0].end = 0.5);
+    }
+
+    #[test]
+    fn the_message_names_the_item() {
+        let mut t = timeline();
+        let track = t.tracks[0].name.clone();
+        t.tracks[0].clips[1].fade_out = -1.0;
+        let err = t.check().unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("the clip at 0:04.0 on {track} has a negative fade")),
+            "{err}"
+        );
+        let mut t = timeline();
+        t.overlays[0].end = 0.5;
+        let err = t.check().unwrap_err().to_string();
+        assert!(
+            err.contains("the text \u{201c}hi\u{201d} at 0:01.0 must end after it starts"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn what_was_already_broken_is_forgiven_and_nothing_else() {
+        let mut t = timeline();
+        t.overlays[0].end = t.overlays[0].start;
+        let known = t.known_violations();
+        assert!(t.check().is_err());
+        t.check_new(&known).unwrap();
+        // Editing the broken item without mending it is still allowed.
+        t.overlays[0].text = "renamed".into();
+        t.check_new(&known).unwrap();
+        // A new break is not.
+        first(&mut t).fade_in = -1.0;
+        assert!(t.check_new(&known).is_err());
     }
 
     #[test]
