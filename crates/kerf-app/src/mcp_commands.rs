@@ -80,13 +80,46 @@ pub fn regenerate_mcp_token(app: AppHandle) -> CmdResult<String> {
 /// connection info as it is after.
 #[tauri::command(async)]
 pub fn set_mcp_settings(app: AppHandle, patch: serde_json::Value) -> CmdResult<McpConnectionInfo> {
-    const ALLOWED: [&str; 4] = ["mcp_enabled", "mcp_addr", "mcp_require_token", "agent_review"];
-    let serde_json::Value::Object(fields) = &patch else {
-        return Err("an agent settings patch must be an object".to_string());
-    };
-    if let Some(other) = fields.keys().find(|k| !ALLOWED.contains(&k.as_str())) {
-        return Err(format!("`{other}` is not an agent setting"));
-    }
+    check_agent_patch(&patch)?;
     settings::update(&app, &patch)?;
     Ok(info(&app))
+}
+
+/// The keys `set_mcp_settings` may write. The token has its own command, and nothing else of the
+/// settings (the layout, the theme) goes through here.
+const AGENT_KEYS: [&str; 4] = ["mcp_enabled", "mcp_addr", "mcp_require_token", "agent_review"];
+
+fn check_agent_patch(patch: &serde_json::Value) -> CmdResult<()> {
+    let serde_json::Value::Object(fields) = patch else {
+        return Err("an agent settings patch must be an object".to_string());
+    };
+    match fields.keys().find(|k| !AGENT_KEYS.contains(&k.as_str())) {
+        Some(other) => Err(format!("`{other}` is not an agent setting")),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_agent_switches_pass() {
+        for ok in [
+            serde_json::json!({}),
+            serde_json::json!({"agent_review": false}),
+            serde_json::json!({"mcp_enabled": true, "mcp_addr": null, "mcp_require_token": true}),
+        ] {
+            assert!(check_agent_patch(&ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            serde_json::json!({"mcp_token": "x"}),
+            serde_json::json!({"theme": null}),
+            serde_json::json!({"agent_review": true, "layout": {}}),
+            serde_json::json!([1]),
+            serde_json::json!("agent_review"),
+        ] {
+            assert!(check_agent_patch(&bad).is_err(), "{bad}");
+        }
+    }
 }

@@ -304,9 +304,11 @@ impl KerfMcp {
             Ok(Some(saved))
         })
         .await?;
-        self.announce_replaced();
         match saved {
-            Some(path) => json(&serde_json::json!({ "path": path, "saved": true })),
+            Some(path) => {
+                self.announce_replaced();
+                json(&serde_json::json!({ "path": path, "saved": true }))
+            }
             None => json(&serde_json::json!({ "path": p.path, "saved": true, "note": "that is the file already open" })),
         }
     }

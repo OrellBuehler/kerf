@@ -419,7 +419,7 @@ pub fn start(app: &AppHandle, project: Arc<Mutex<Project>>) {
         return;
     }
     let app = app.clone();
-    tauri::async_runtime::spawn(supervise(app, project, rx));
+    tauri::async_runtime::spawn(supervise(move || KerfMcp::new(project.clone(), app.clone()), rx));
 }
 
 /// Tell the running server the settings moved. A patch that carries no `mcp_*` field changes
@@ -456,14 +456,18 @@ impl Running {
     }
 }
 
-async fn supervise(app: AppHandle, project: Arc<Mutex<Project>>, mut rx: tokio::sync::watch::Receiver<McpConfig>) {
+async fn supervise<S, F>(factory: F, mut rx: tokio::sync::watch::Receiver<McpConfig>)
+where
+    S: rmcp::ServerHandler + Send + 'static,
+    F: Fn() -> S + Clone + Send + Sync + 'static,
+{
     let mut config = rx.borrow_and_update().clone();
     let auth = Arc::new(RwLock::new(Auth::of(&config)));
     loop {
         *auth.write().unwrap_or_else(|e| e.into_inner()) = Auth::of(&config);
         let mut running = None;
         if config.enabled {
-            match launch(&config, project.clone(), app.clone(), auth.clone()).await {
+            match launch(&config, factory.clone(), auth.clone()).await {
                 Ok(up) => {
                     set_status(true, None, &config.addr);
                     running = Some(up);
@@ -499,26 +503,29 @@ async fn supervise(app: AppHandle, project: Arc<Mutex<Project>>, mut rx: tokio::
     }
 }
 
-async fn launch(
-    config: &McpConfig,
-    project: Arc<Mutex<Project>>,
-    app: AppHandle,
-    auth: Arc<RwLock<Auth>>,
-) -> anyhow::Result<Running> {
+/// The listener's settings for rmcp: who may name which `Host`, and no browser `Origin` at all.
+fn http_config(addr: &str) -> StreamableHttpServerConfig {
+    StreamableHttpServerConfig::default()
+        .with_allowed_hosts(allowed_hosts(addr))
+        // No Origin is allowed: a native MCP client sends none, and a page in the user's
+        // browser must not be able to reach the editor through the loopback port.
+        .enforce_origin_validation()
+}
+
+async fn launch<S, F>(config: &McpConfig, factory: F, auth: Arc<RwLock<Auth>>) -> anyhow::Result<Running>
+where
+    S: rmcp::ServerHandler + Send + 'static,
+    F: Fn() -> S + Send + Sync + 'static,
+{
     if let Some(why) = bind_problem(&config.addr, config.require_token) {
         anyhow::bail!(why);
     }
     check_addr(&config.addr).map_err(anyhow::Error::msg)?;
     let stop = CancellationToken::new();
     let service = StreamableHttpService::new(
-        move || Ok(KerfMcp::new(project.clone(), app.clone())),
+        move || Ok(factory()),
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default()
-            .with_allowed_hosts(allowed_hosts(&config.addr))
-            // No Origin is allowed: a native MCP client sends none, and a page in the user's
-            // browser must not be able to reach the editor through the loopback port.
-            .enforce_origin_validation()
-            .with_cancellation_token(stop.child_token()),
+        http_config(&config.addr).with_cancellation_token(stop.child_token()),
     );
     let router = axum::Router::new()
         .nest_service("/mcp", service)
@@ -716,7 +723,10 @@ mod tests {
     /// One HTTP request over a plain socket, answering the status code.
     fn status_of(addr: std::net::SocketAddr, headers: &[(&str, &str)]) -> u16 {
         use std::io::{Read, Write};
-        let mut request = format!("POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 2\r\nConnection: close\r\n");
+        let mut request = "POST /mcp HTTP/1.1\r\nContent-Length: 2\r\nConnection: close\r\n".to_string();
+        if !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("host")) {
+            request.push_str(&format!("Host: {addr}\r\n"));
+        }
         for (name, value) in headers {
             request.push_str(&format!("{name}: {value}\r\n"));
         }
@@ -837,4 +847,129 @@ mod tests {
         let msg = describe_server_error("127.0.0.1:80", &other);
         assert!(msg.contains("permission denied") && msg.contains("127.0.0.1:80"), "{msg}");
     }
+
+    /// A server with no tools: enough for rmcp to answer, so the listener's own rules can be tried.
+    #[derive(Clone)]
+    struct Nothing;
+    impl rmcp::ServerHandler for Nothing {}
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// Whether anything accepts connections at `addr`.
+    fn listening(addr: &str) -> bool {
+        std::net::TcpStream::connect_timeout(&addr.parse().unwrap(), std::time::Duration::from_millis(300)).is_ok()
+    }
+
+    async fn until(what: &str, mut condition: impl FnMut() -> bool) {
+        for _ in 0..100 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn config_for(addr: &str, token: &str, enabled: bool) -> McpConfig {
+        McpConfig {
+            enabled,
+            addr: addr.to_string(),
+            require_token: true,
+            token: Some(token.to_string()),
+        }
+    }
+
+    /// The listener restarts by itself when the address moves or the switch is turned off, and a
+    /// new token applies to the very next request without a restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_server_follows_its_settings_live() {
+        let (a, b) = (format!("127.0.0.1:{}", free_port()), format!("127.0.0.1:{}", free_port()));
+        let (tx, rx) = tokio::sync::watch::channel(config_for(&a, &"1".repeat(40), true));
+        let task = tokio::spawn(supervise(|| Nothing, rx));
+        let ask = |addr: &str, token: Option<&str>| {
+            let addr: std::net::SocketAddr = addr.parse().unwrap();
+            let header = token.map(|t| format!("Bearer {t}"));
+            move || {
+                let headers: Vec<(&str, &str)> = header.iter().map(|h| ("Authorization", h.as_str())).collect();
+                status_of(addr, &headers)
+            }
+        };
+
+        until("the server to come up", || listening(&a)).await;
+        assert!(server_error().is_none());
+        assert_eq!(tokio::task::spawn_blocking(ask(&a, None)).await.unwrap(), 401, "no token");
+        assert_ne!(
+            tokio::task::spawn_blocking(ask(&a, Some(&"1".repeat(40)))).await.unwrap(),
+            401,
+            "the token opens the door"
+        );
+
+        // A new token: the next request sees it, and nothing restarted.
+        tx.send_replace(config_for(&a, &"2".repeat(40), true));
+        until("the new token to apply", || ask(&a, Some(&"1".repeat(40)))() == 401).await;
+        assert_ne!(ask(&a, Some(&"2".repeat(40)))(), 401);
+
+        // A new address: the old one stops, the new one starts.
+        tx.send_replace(config_for(&b, &"2".repeat(40), true));
+        until("the new address to listen", || listening(&b)).await;
+        until("the old address to stop", || !listening(&a)).await;
+        assert_eq!(bind_addr(), b);
+
+        // Switched off: nothing listens, and that is not an error.
+        tx.send_replace(config_for(&b, &"2".repeat(40), false));
+        until("the server to stop", || !listening(&b)).await;
+        assert!(server_error().is_none());
+
+        // On again.
+        tx.send_replace(config_for(&b, &"2".repeat(40), true));
+        until("the server to come back", || listening(&b)).await;
+
+        // An address it will not serve is reported, and the server stays down until one it will.
+        tx.send_replace(McpConfig {
+            require_token: false,
+            ..config_for("0.0.0.0:7777", &"2".repeat(40), true)
+        });
+        until("the refusal to be reported", || server_error().is_some()).await;
+        assert!(server_error().unwrap().contains("refusing to listen"), "{:?}", server_error());
+        assert!(!listening(&b));
+        tx.send_replace(config_for(&b, &"2".repeat(40), true));
+        until("the server to recover", || listening(&b) && server_error().is_none()).await;
+
+        drop(tx);
+        task.await.unwrap();
+        assert!(!listening(&b), "the server stops with its supervisor");
+    }
+
+    /// A page in the user's browser must not be able to reach the editor; a native client, which
+    /// sends no `Origin`, is not turned away on that ground.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_browser_origin_is_refused_and_a_native_client_is_not() {
+        let auth = Arc::new(RwLock::new(Auth::default()));
+        let addr = format!("127.0.0.1:{}", free_port());
+        let config = McpConfig {
+            enabled: true,
+            addr: addr.clone(),
+            require_token: false,
+            token: None,
+        };
+        let up = launch(&config, || Nothing, auth).await.expect("bind");
+        let socket: std::net::SocketAddr = addr.parse().unwrap();
+        let ask = move |headers: Vec<(&'static str, &'static str)>| {
+            tokio::task::spawn_blocking(move || status_of(socket, &headers))
+        };
+        assert_eq!(ask(vec![("Origin", "https://evil.example")]).await.unwrap(), 403, "a web page");
+        assert_eq!(ask(vec![("Origin", "null")]).await.unwrap(), 403, "a sandboxed page");
+        assert_eq!(ask(vec![("Origin", "http://localhost:3000")]).await.unwrap(), 403, "even a local page");
+        let native = ask(vec![("Content-Type", "application/json")]).await.unwrap();
+        assert_ne!(native, 403, "no Origin is a native client");
+        assert_eq!(
+            ask(vec![("Host", "evil.example")]).await.unwrap(),
+            403,
+            "a rebinding page names its own Host"
+        );
+        up.stop().await;
+    }
+
 }
