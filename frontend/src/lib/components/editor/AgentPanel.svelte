@@ -8,7 +8,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { agent } from '$lib/agent.svelte';
 	import { dismissTask, readyCard, resolveReady } from '$lib/agent-tasks';
-	import { agentStatus } from '$lib/api';
+	import { agentStatus, mcpConnectionInfo } from '$lib/api';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { diffHeadline, groupEntries, polarity } from '$lib/diff';
@@ -45,7 +45,10 @@
 	/** The panel's own height: below ~520 px there is no room for the composer's hint line. */
 	let panelHeight = $state(0);
 	let copied = $state<string | null>(null);
-	const claudeCmd = $derived(`claude mcp add --transport http kerf ${endpoint}`);
+	/** The connect command as the backend builds it — with the bearer token header while one is required,
+	 *  which the server insists on. Until it is read, the bare command. */
+	let connectCmd = $state<string | null>(null);
+	const claudeCmd = $derived(connectCmd ?? `claude mcp add --transport http kerf ${endpoint}`);
 
 	// Seconds since an agent last spoke to the endpoint, or null if none ever
 	// has. A streamable-HTTP client holds no connection between calls, so there
@@ -64,6 +67,7 @@
 				endpoint = s.endpoint;
 				lastSeen = s.last_seen_secs;
 				serverError = s.error;
+				connectCmd = (await mcpConnectionInfo()).claude_code_command || null;
 			} catch {
 				/* the endpoint is part of the app; a failed read is not worth a toast */
 			}
