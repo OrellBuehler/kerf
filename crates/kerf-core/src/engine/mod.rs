@@ -77,7 +77,10 @@ pub mod music;
 
 // Stem separation (Demucs htdemucs on ONNX Runtime; STFT, chunking and overlap-add here).
 pub mod stems;
-pub use pcm::{decode_audio, wav_bytes, write_wav, AudioBuffer};
+pub use pcm::{decode_audio, decode_audio_window, wav_bytes, write_wav, AudioBuffer};
+
+// Lining two recordings up by their sound (GCC-PHAT-β, coarse then refined): pure DSP.
+pub mod audio_sync;
 pub use stems::{status as stems_status, StemsStatus, STEM_NAMES};
 
 // Speech model provisioning + transcription through the `ffmpeg` binary's

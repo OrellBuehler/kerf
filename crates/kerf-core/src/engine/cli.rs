@@ -3760,7 +3760,26 @@ pub struct ExportOptions {
     pub loudnorm: bool,
     /// Normalize the final mix to a platform's loudness target. Wins over `loudnorm`.
     pub loudness: Option<LoudnessPreset>,
+    /// Reach the loudness target with one static gain instead of `loudnorm`'s moving one:
+    /// the mix is measured first (the export's own graph, as `get_levels` reads it), then
+    /// raised or lowered by the difference and held under the target's true peak by an
+    /// oversampled limiter. The dynamics stay as mixed; only peaks the gain pushes over the
+    /// ceiling are limited. Read only with a target (`loudness` or `loudnorm`).
+    pub loudness_static: bool,
+    /// The gain static normalization applies, in dB: measured by the render itself before
+    /// it builds the graph, never taken from a caller.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub loudness_gain_db: Option<f64>,
 }
+
+/// The most static loudness normalization raises or lowers a mix, in dB: a near-silent
+/// cut is not lifted into a wall of noise.
+pub const LOUDNESS_MAX_GAIN_DB: f64 = 30.0;
+
+/// How far under the target's true-peak ceiling the static normalization's limiter is set:
+/// resampling the 4x limiter's output back down rings a little over what it held.
+const STATIC_TP_MARGIN_DB: f64 = 0.3;
 
 /// A delivery's loudness target: integrated loudness and the true-peak ceiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -3831,6 +3850,8 @@ impl Default for ExportOptions {
             range: None,
             loudnorm: false,
             loudness: None,
+            loudness_static: false,
+            loudness_gain_db: None,
         }
     }
 }
@@ -5244,7 +5265,7 @@ pub fn render_with_progress(
     progress: &mut dyn FnMut(ExportProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<RenderStatus> {
-    let opts = &ExportOptions {
+    let mut opts = ExportOptions {
         hwaccel: export_hwaccel_request(
             opts.hwaccel.as_deref(),
             hwaccel().is_some(),
@@ -5252,11 +5273,35 @@ pub fn render_with_progress(
         ),
         ..opts.clone()
     };
+    match measure_static_loudness(timeline, assets, &mut opts, cancel) {
+        Err(Error::Cancelled) => return Ok(RenderStatus::Cancelled),
+        r => r?,
+    }
+    let opts = &opts;
     retry_export_in_software(
         opts,
         |o, hw_used| render_attempt(timeline, assets, output, o, progress, cancel, hw_used),
         convict_hardware_decode,
     )
+}
+
+/// Fill in `opts.loudness_gain_db` for a static loudness normalization that has not been
+/// measured yet: one metering pass over the export's own mix, without the normalization
+/// (see [`ExportOptions::loudness_static`]). Nothing for any other export.
+fn measure_static_loudness(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &mut ExportOptions,
+    cancel: &dyn Fn() -> bool,
+) -> Result<()> {
+    let target = opts.loudness.is_some() || opts.loudnorm;
+    if !(opts.loudness_static && target && opts.include_audio) || opts.loudness_gain_db.is_some() {
+        return Ok(());
+    }
+    // A mix too quiet to measure is left at its level (the limiter still holds the peaks).
+    opts.loudness_gain_db = Some(levels::static_loudness_gain(timeline, assets, opts, cancel)?.unwrap_or(0.0));
+    tracing::debug!(gain_db = ?opts.loudness_gain_db, "measured the mix for static loudness normalization");
+    Ok(())
 }
 
 /// Run an export attempt, and once more in software when one that asked an input for hardware
@@ -5517,6 +5562,12 @@ pub fn render_variants(
     }
     let total = variants.len();
     let started = Instant::now();
+    // Every variant carries the same mix: a static loudness gain is measured once.
+    let mut opts = opts.clone();
+    match measure_static_loudness(timeline, assets, &mut opts, cancel) {
+        Err(Error::Cancelled) => return Ok((RenderStatus::Cancelled, 0)),
+        r => r?,
+    }
     for (i, variant) in variants.iter().enumerate() {
         let framed = timeline.for_delivery(variant.delivery);
         let per_variant = ExportOptions {
@@ -6351,15 +6402,14 @@ fn build_filter_complex_metered(
         // the output rate. A neutral master adds nothing, so a graph from before
         // the master existed is unchanged.
         let loudness = opts.loudness.or(opts.loudnorm.then_some(LoudnessPreset::Youtube));
-        let mix_tail = if let Some(target) = loudness {
-            format!(
-                "{master},{norm},aresample={sr}",
-                master = master_filters(&timeline.master),
-                norm = target.filter(),
-                sr = fmt.sample_rate
-            )
-        } else {
-            master_filters(&timeline.master)
+        let master = master_filters(&timeline.master, fmt.sample_rate);
+        let mix_tail = match loudness {
+            Some(target) if opts.loudness_static => format!(
+                "{master}{norm}",
+                norm = static_loudness_filters(target, opts.loudness_gain_db, fmt.sample_rate)
+            ),
+            Some(target) => format!("{master},{norm},aresample={sr}", norm = target.filter(), sr = fmt.sample_rate),
+            None => master,
         };
         let pads = |names: &[&str]| names.iter().map(|n| format!("[{n}]")).collect::<String>();
         let ducked: Vec<&str> = sources.iter().filter(|(_, d)| *d).map(|(n, _)| n.as_str()).collect();
@@ -6484,18 +6534,51 @@ fn alimiter_latency_available() -> bool {
 /// 100 ms release is slow enough not to pump on low notes. The ceiling is
 /// rounded to six decimals, which is far below anything audible and keeps the
 /// text from depending on the last digit of a libm `pow`.
-fn master_filters(master: &crate::model::MasterBus) -> String {
+///
+/// With `true_peak` the limiter runs on the mix upsampled four times (`aresample` there and
+/// back around it), so it holds the peaks between the samples too: the true peak a
+/// platform measures, not only the sample peak.
+fn master_filters(master: &crate::model::MasterBus, sample_rate: u32) -> String {
     let mut out = String::new();
     let volume = master.safe_volume();
     if (volume - 1.0).abs() > f64::EPSILON {
         out += &format!(",volume={}", fnum(volume));
     }
     if master.limiter {
-        let limit = (master.limit_linear() * 1e6).round() / 1e6;
-        let latency = if alimiter_latency_available() { ":latency=1" } else { "" };
-        out += &format!(",alimiter=limit={}:attack=5:release=100:level=0{latency}", fnum(limit));
+        let limiter = limiter_filter(master.limit_linear());
+        if master.true_peak {
+            out += &oversampled(&limiter, sample_rate);
+        } else {
+            out += &format!(",{limiter}");
+        }
     }
     out
+}
+
+/// The master's `alimiter` holding `limit` (linear, rounded to six decimals), with
+/// `latency=1` where this ffmpeg has it (see [`master_filters`]).
+fn limiter_filter(limit: f64) -> String {
+    let limit = (limit * 1e6).round() / 1e6;
+    let latency = if alimiter_latency_available() { ":latency=1" } else { "" };
+    format!("alimiter=limit={}:attack=5:release=100:level=0{latency}", fnum(limit))
+}
+
+/// `filter` run at four times `sample_rate` and resampled back, led by its joining comma: a
+/// limiter there sees the peaks between the output's samples (BS.1770 reads the true peak
+/// off the same 4x oversampling).
+fn oversampled(filter: &str, sample_rate: u32) -> String {
+    format!(",aresample={},{filter},aresample={sample_rate}", sample_rate * 4)
+}
+
+/// The static loudness normalization: the measured gain (omitted when there is none to
+/// apply) then a true-peak limiter just under the target's ceiling, led by its comma.
+fn static_loudness_filters(target: LoudnessPreset, gain_db: Option<f64>, sample_rate: u32) -> String {
+    let mut out = String::new();
+    if let Some(g) = gain_db.filter(|g| g.is_finite() && g.abs() >= 0.005) {
+        out += &format!(",volume={:.2}dB", g.clamp(-LOUDNESS_MAX_GAIN_DB, LOUDNESS_MAX_GAIN_DB));
+    }
+    let ceiling = 10f64.powf((target.true_peak_db() - STATIC_TP_MARGIN_DB) / 20.0);
+    out + &oversampled(&limiter_filter(ceiling), sample_rate)
 }
 
 /// The owning track's mix settings, carried alongside each of its audio clips.
@@ -8234,11 +8317,22 @@ fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, 
     for e in &clip.audio {
         p.push(audio_effect_filter(e));
     }
+    // A fade that is wholly a transition's overlap is half of a crossfade pair, and
+    // the pair is constant-power (`qsin`: sin in, cos out, so the summed power stays
+    // put) where linear ramps dip about 3 dB at the midpoint. A fade with a clip fade
+    // or a dip in it keeps the linear ramp it always had.
+    let crossfade = |fade: f64, own: f64| if fade > 0.0 && own <= 0.0 { ":curve=qsin" } else { "" };
     if fi > 0.0 {
-        p.push(format!("afade=t=in:st=0:d={}", fi.clamp(0.0, dur)));
+        let curve = crossfade(fx.afade_in, clip.fade_in + fx.black_in + fx.white_in);
+        p.push(format!("afade=t=in:st=0:d={}{curve}", fi.clamp(0.0, dur)));
     }
     if fo > 0.0 {
-        p.push(format!("afade=t=out:st={}:d={}", (dur - fo).max(0.0), fo.clamp(0.0, dur)));
+        let curve = crossfade(fx.tail, clip.fade_out + fx.black_out + fx.white_out);
+        p.push(format!(
+            "afade=t=out:st={}:d={}{curve}",
+            (dur - fo).max(0.0),
+            fo.clamp(0.0, dur)
+        ));
     }
     // The track fader, after the clip's own chain. Omitted at unity, so a
     // project that never touched a fader renders the graph it always did.
@@ -13250,6 +13344,7 @@ mod tests {
     fn the_master_runs_after_the_sum_and_before_loudnorm() {
         let (tl, assets) = master_cut(MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: 0.8,
             limiter: true,
             ceiling_db: -3.0,
@@ -13300,6 +13395,7 @@ mod tests {
         // every frame, only the picture changes.
         let (tl, assets) = master_cut(MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: 0.5,
             limiter: true,
             ceiling_db: -2.0,
@@ -13313,6 +13409,7 @@ mod tests {
     fn the_playback_stream_has_no_sound_for_the_master_to_touch() {
         let (tl, assets) = master_cut(MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: 0.5,
             limiter: true,
             ceiling_db: -1.0,
@@ -13327,11 +13424,12 @@ mod tests {
     fn master_filters_are_safe_for_a_file_that_never_went_through_the_op() {
         let bus = |volume, ceiling_db| MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume,
             limiter: true,
             ceiling_db,
         };
-        let filters = |bus| with_alimiter_latency(true, || master_filters(&bus));
+        let filters = |bus| with_alimiter_latency(true, || master_filters(&bus, 48_000));
         // Not a number: no fader, the default ceiling.
         assert_eq!(
             filters(bus(f64::NAN, f64::NAN)),
@@ -13350,6 +13448,124 @@ mod tests {
     }
 
     #[test]
+    fn a_true_peak_limiter_runs_oversampled_and_is_omitted_when_off() {
+        let (tl, assets) = master_cut(MasterBus {
+            limiter: true,
+            true_peak: true,
+            ..MasterBus::default()
+        });
+        let g = with_alimiter_latency(true, || mix_of(&tl, &assets, &ExportOptions::default()));
+        assert!(
+            g.contains(
+                "dropout_transition=0,aresample=192000,alimiter=limit=0.841395:attack=5:release=100:level=0:latency=1,aresample=48000[outa]"
+            ),
+            "{g}"
+        );
+        let opts = ExportOptions {
+            audio_sample_rate: Some(44_100),
+            ..ExportOptions::default()
+        };
+        let g = with_alimiter_latency(false, || mix_of(&tl, &assets, &opts));
+        assert!(
+            g.contains(",aresample=176400,alimiter=limit=0.841395:attack=5:release=100:level=0,aresample=44100[outa]"),
+            "{g}"
+        );
+
+        // Off, or with the limiter off, the graph is the sample-peak one / the neutral one.
+        let (plain, _) = master_cut(MasterBus {
+            limiter: true,
+            ..MasterBus::default()
+        });
+        let (parked, _) = master_cut(MasterBus {
+            true_peak: true,
+            ..MasterBus::default()
+        });
+        let g = mix_of(&plain, &assets, &ExportOptions::default());
+        assert!(!g.contains("aresample"), "{g}");
+        assert_eq!(
+            mix_of(&parked, &assets, &ExportOptions::default()),
+            mix_of(&master_cut(MasterBus::default()).0, &assets, &ExportOptions::default())
+        );
+    }
+
+    #[test]
+    fn static_loudness_applies_the_measured_gain_and_a_true_peak_limiter() {
+        let (tl, assets) = master_cut(MasterBus {
+            volume: 0.8,
+            ..MasterBus::default()
+        });
+        let opts = ExportOptions {
+            loudness: Some(LoudnessPreset::Apple),
+            loudness_static: true,
+            loudness_gain_db: Some(3.456),
+            ..ExportOptions::default()
+        };
+        let g = with_alimiter_latency(true, || mix_of(&tl, &assets, &opts));
+        // -1 dBTP less the margin, 4x oversampled; no loudnorm.
+        assert!(
+            g.contains(
+                "dropout_transition=0,volume=0.8,volume=3.46dB,aresample=192000,alimiter=limit=0.860994:attack=5:release=100:level=0:latency=1,aresample=48000[outa]"
+            ),
+            "{g}"
+        );
+        assert!(!g.contains("loudnorm"), "{g}");
+
+        // An unmeasured or negligible gain adds no `volume`; a wild one is clamped.
+        for (gain, volume) in [(None, None), (Some(0.001), None), (Some(80.0), Some("volume=30.00dB"))] {
+            let g = mix_of(
+                &tl,
+                &assets,
+                &ExportOptions {
+                    loudness_gain_db: gain,
+                    ..opts.clone()
+                },
+            );
+            assert_eq!(g.contains("dB,"), volume.is_some(), "{g}");
+            if let Some(v) = volume {
+                assert!(g.contains(v), "{g}");
+            }
+        }
+
+        // Without a target the flag changes nothing, and the dynamic path is the old one.
+        let plain = |static_: bool, loudness| {
+            mix_of(
+                &tl,
+                &assets,
+                &ExportOptions {
+                    loudness,
+                    loudness_static: static_,
+                    loudness_gain_db: Some(2.0),
+                    ..ExportOptions::default()
+                },
+            )
+        };
+        assert_eq!(plain(true, None), plain(false, None));
+        assert_eq!(
+            plain(false, Some(LoudnessPreset::Youtube)),
+            mix_of(
+                &tl,
+                &assets,
+                &ExportOptions {
+                    loudnorm: true,
+                    ..ExportOptions::default()
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn the_static_gain_is_the_distance_to_the_target_within_bounds() {
+        assert_eq!(levels::static_gain_db(LoudnessPreset::Youtube, Some(-20.0)), Some(6.0));
+        assert_eq!(levels::static_gain_db(LoudnessPreset::Broadcast, Some(-14.0)), Some(-9.0));
+        assert_eq!(
+            levels::static_gain_db(LoudnessPreset::Apple, Some(-60.0)),
+            Some(LOUDNESS_MAX_GAIN_DB)
+        );
+        assert_eq!(levels::static_gain_db(LoudnessPreset::Apple, None), None);
+        assert_eq!(levels::static_gain_db(LoudnessPreset::Apple, Some(f64::NEG_INFINITY)), None);
+    }
+
+    #[test]
     fn crossfade_extends_the_outgoing_tail_and_dissolves_the_incoming() {
         let asset = av_asset(Uuid::new_v4(), 20.0);
         let a = make_clip(asset.id, 0.0, 10.0, 0.0);
@@ -13363,6 +13579,39 @@ mod tests {
         assert!(g.contains("trim=start=0:end=11"), "{g}");
         // Incoming clip B fades up via alpha, from where it sits on the timeline.
         assert!(g.contains("fade=t=in:st=10:d=1:alpha=1"), "{g}");
+    }
+
+    #[test]
+    fn a_crossfade_is_constant_power_and_a_clip_fade_stays_linear() {
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let a = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let mut b = make_clip(asset.id, 0.0, 10.0, 10.0);
+        b.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 1.0,
+        });
+        let g = graph_of(&single(vec![a.clone(), b.clone()]), std::slice::from_ref(&asset));
+        assert!(g.contains("afade=t=out:st=10:d=1:curve=qsin,"), "{g}");
+        assert!(g.contains("afade=t=in:st=0:d=1:curve=qsin,"), "{g}");
+
+        // A clip fade beside the transition keeps the one linear ramp it always had.
+        let (mut a2, mut b2) = (a.clone(), b.clone());
+        a2.fade_out = 0.5;
+        b2.fade_in = 0.25;
+        let g = graph_of(&single(vec![a2, b2]), std::slice::from_ref(&asset));
+        assert!(g.contains("afade=t=out:st=9.5:d=1.5,"), "{g}");
+        assert!(g.contains("afade=t=in:st=0:d=1.25,"), "{g}");
+        assert!(!g.contains("qsin"), "{g}");
+
+        // A dip is not a crossfade: the sound dips through silence linearly.
+        let mut dip = b;
+        dip.transition_in = Some(crate::model::Transition {
+            kind: TransitionKind::DipToBlack,
+            duration: 1.0,
+        });
+        let g = graph_of(&single(vec![a, dip]), &[asset]);
+        assert!(g.contains("afade=t=in:st=0:d=0.5,"), "{g}");
+        assert!(!g.contains("qsin"), "{g}");
     }
 
     #[test]

@@ -3732,6 +3732,11 @@ pub struct MasterBus {
     /// down in ~50 ms and back up ~300 ms after it falls quiet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duck_depth_db: Option<f64>,
+    /// The limiter holds the **true** peak: it runs on the mix upsampled four times, so
+    /// the peaks between samples stay under `ceiling_db` too. Only read while `limiter`
+    /// is on; off (the default) is the sample-peak limiter and its graph.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub true_peak: bool,
 }
 
 /// The speech gate's depth when it is switched on without one.
@@ -3766,6 +3771,7 @@ impl Default for MasterBus {
             limiter: false,
             ceiling_db: MASTER_DEFAULT_CEILING_DB,
             duck_depth_db: None,
+            true_peak: false,
         }
     }
 }
@@ -7515,6 +7521,7 @@ mod tests {
         let mut tl = Timeline::new();
         tl.master = MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: 0.7,
             limiter: true,
             ceiling_db: -3.0,
@@ -7526,6 +7533,7 @@ mod tests {
             partial.master,
             MasterBus {
                 duck_depth_db: None,
+                true_peak: false,
                 volume: 1.0,
                 limiter: true,
                 ceiling_db: -1.5
@@ -7555,6 +7563,7 @@ mod tests {
     fn a_master_from_a_hand_edited_file_is_made_safe_for_the_graph() {
         let m = MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: f64::NAN,
             limiter: true,
             ceiling_db: f64::INFINITY,
@@ -7563,6 +7572,7 @@ mod tests {
         assert_eq!(m.safe_ceiling_db(), MASTER_DEFAULT_CEILING_DB);
         let m = MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: 99.0,
             limiter: true,
             ceiling_db: -90.0,
@@ -7581,6 +7591,7 @@ mod tests {
     fn the_master_follows_the_cut_into_every_render_of_it() {
         let master = MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: 0.5,
             limiter: true,
             ceiling_db: -2.0,

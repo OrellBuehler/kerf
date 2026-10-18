@@ -2494,6 +2494,17 @@ impl Project {
         })
     }
 
+    /// Make the master limiter hold the **true** peak (it then runs on the mix upsampled
+    /// four times) or only the sample peak (the default). Kept while the limiter is off,
+    /// like its ceiling. One revision.
+    pub fn set_master_true_peak(&self, enabled: bool) -> Result<MasterBus> {
+        let label = if enabled { "Limit true peaks" } else { "Limit sample peaks" };
+        self.edit_timeline(label, |timeline| {
+            timeline.master.true_peak = enabled;
+            Ok(timeline.master)
+        })
+    }
+
     /// Choose how ducked tracks dip: `None` for the sidechain compressor (the default),
     /// `Some(depth_db)` for the speech gate that lowers them by exactly that much while
     /// the other tracks speak (clamped to `-40..=-1` dB). One revision.
@@ -5143,6 +5154,9 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
         .map_err(|e| Error::Other(format!("invalid datetime {s}: {e}")))
 }
 
+mod audio_sync;
+pub use audio_sync::{AudioSync, AudioSyncMeasure, AudioSyncPlan, SyncSide, MAX_SYNC_SECONDS, SYNC_SAMPLE_RATE};
+
 #[cfg(test)]
 mod linked_tests;
 
@@ -7399,6 +7413,22 @@ mod tests {
             Err(Error::InvalidArgument(_))
         ));
         assert_eq!(project.history().unwrap().last().unwrap().label, "Set master limiter");
+    }
+
+    #[test]
+    fn the_true_peak_switch_is_one_revision_and_survives_the_limiter_going_off() {
+        let project = Project::sample().unwrap();
+        let on = project.set_master_true_peak(true).unwrap();
+        assert!(on.true_peak && !on.limiter);
+        assert_eq!(project.history().unwrap().last().unwrap().label, "Limit true peaks");
+        project.set_master_limiter(true, None).unwrap();
+        let off = project.set_master_limiter(false, None).unwrap();
+        assert!(off.true_peak, "kept while the limiter is off");
+        let json = serde_json::to_string(&project.timeline().unwrap()).unwrap();
+        assert!(json.contains("\"true_peak\":true"), "{json}");
+        assert!(!project.set_master_true_peak(false).unwrap().true_peak);
+        let json = serde_json::to_string(&project.timeline().unwrap()).unwrap();
+        assert!(!json.contains("true_peak"), "off is not written: {json}");
     }
 
     #[test]

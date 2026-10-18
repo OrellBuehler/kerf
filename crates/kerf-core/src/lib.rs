@@ -82,7 +82,10 @@ pub use platform::{
     TARGETS as PLATFORM_TARGETS,
 };
 pub use play_plan::{PlayAhead, PlayCut, PlayRefusal};
-pub use project::{FramingPlan, Project, SmartCropJob, SmartCropPlan, StemsPlaced, MAX_CHANNEL_KEYS, VOICEOVER_TRACK};
+pub use project::{
+    AudioSync, AudioSyncMeasure, AudioSyncPlan, FramingPlan, Project, SmartCropJob, SmartCropPlan, StemsPlaced, SyncSide,
+    MAX_CHANNEL_KEYS, MAX_SYNC_SECONDS, SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
+};
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use render_plan::{
     Animated, CompositeColorPolicy, FadeOp, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream,

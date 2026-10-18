@@ -115,7 +115,44 @@ pub fn mix_levels(
         loudnorm,
         ..ExportOptions::default()
     };
-    let Some(run) = build_levels_args(timeline, assets, &opts)? else {
+    measure_mix(timeline, assets, &opts, cancel)
+}
+
+/// The gain static loudness normalization applies to an export with `opts`: its target's
+/// loudness less the mix's own, measured through the export's graph without the
+/// normalization (`None` when the mix is silent, under the meter's gate, or has no
+/// target to reach). Whole-file work, like [`mix_levels`].
+pub(super) fn static_loudness_gain(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<f64>> {
+    let Some(target) = opts.loudness.or(opts.loudnorm.then_some(LoudnessPreset::Youtube)) else {
+        return Ok(None);
+    };
+    let unnormalized = ExportOptions {
+        hwaccel: None,
+        loudness: None,
+        loudnorm: false,
+        loudness_static: false,
+        loudness_gain_db: None,
+        ..opts.clone()
+    };
+    let measured = measure_mix(timeline, assets, &unnormalized, cancel)?;
+    Ok(static_gain_db(target, measured.master.and_then(|m| m.integrated_lufs)))
+}
+
+/// What a static normalization to `target` raises a mix measured at `integrated` LUFS by,
+/// in dB, within [`LOUDNESS_MAX_GAIN_DB`] either way. Pure.
+pub(super) fn static_gain_db(target: LoudnessPreset, integrated: Option<f64>) -> Option<f64> {
+    integrated
+        .filter(|i| i.is_finite())
+        .map(|i| (target.lufs() - i).clamp(-LOUDNESS_MAX_GAIN_DB, LOUDNESS_MAX_GAIN_DB))
+}
+
+fn measure_mix(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, cancel: &dyn Fn() -> bool) -> Result<MixLevels> {
+    let Some(run) = build_levels_args(timeline, assets, opts)? else {
         return Ok(MixLevels::default());
     };
 
@@ -589,6 +626,7 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
         let (mut tl, assets) = two_track_cut();
         tl.master = MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: 0.5,
             limiter: true,
             ceiling_db: -1.0,
@@ -670,16 +708,21 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
     /// same number of LUFS as its peak (EBU Tech 3341, case 1), which is what makes
     /// the expected values below plain arithmetic.
     fn tone(dir: &Path, peak_db: f64, secs: f64) -> Asset {
+        tone_at(dir, 1000, peak_db, secs)
+    }
+
+    /// [`tone`] at `freq` Hz.
+    fn tone_at(dir: &Path, freq: u32, peak_db: f64, secs: f64) -> Asset {
         // FLAC, not a float wav: FFmpeg 9's format probe takes some repeating
         // float-PCM byte patterns for MPEG-TS and refuses the file.
-        let path = dir.join(format!("tone{peak_db}-{secs}.flac"));
+        let path = dir.join(format!("tone{freq}-{peak_db}-{secs}.flac"));
         if !path.exists() {
             // `sine` peaks at 1/8, and is mono: `pan` copies it into both channels at
             // full level (an `aformat` upmix would take 3 dB off each).
             let gain = 10f64.powf(peak_db / 20.0) / 0.125;
             let made = command(&ffmpeg_bin())
                 .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
-                .arg(format!("sine=f=1000:d={secs}:sample_rate=48000"))
+                .arg(format!("sine=f={freq}:d={secs}:sample_rate=48000"))
                 .arg("-af")
                 .arg(format!("pan=stereo|c0=c0|c1=c0,volume={gain:.9}"))
                 .args(["-c:a", "flac", "-sample_fmt", "s32"])
@@ -794,6 +837,7 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
         let mut tl = tracks_of(&asset, 1);
         tl.master = MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: 4.0,
             limiter: true,
             ceiling_db: -12.0,
@@ -831,8 +875,18 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
 
     /// The loudness and peaks an independent `ebur128` pass reads off a rendered file.
     fn read_back(file: &Path) -> LevelReading {
-        let out = command(&ffmpeg_bin())
-            .args(["-hide_banner", "-nostats", "-f", "wav", "-i"])
+        read_back_span(file, None)
+    }
+
+    /// [`read_back`] over `(start, seconds)` of the file.
+    fn read_back_span(file: &Path, span: Option<(f64, f64)>) -> LevelReading {
+        let mut cmd = command(&ffmpeg_bin());
+        cmd.args(["-hide_banner", "-nostats"]);
+        if let Some((start, secs)) = span {
+            cmd.args(["-ss", &start.to_string(), "-t", &secs.to_string()]);
+        }
+        let out = cmd
+            .args(["-f", "wav", "-i"])
             .arg(file)
             .args(["-af", "ebur128@x=peak=sample+true", "-f", "null", "-"])
             .stdin(Stdio::null())
@@ -860,6 +914,7 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
         tl.tracks[1].duck = true;
         tl.master = MasterBus {
             duck_depth_db: None,
+            true_peak: false,
             volume: 0.9,
             limiter: true,
             ceiling_db: -3.0,
@@ -935,5 +990,145 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
         let tl = tracks_of(&asset, 1);
         let got = mix_levels(&tl, std::slice::from_ref(&asset), None, false, &|| true);
         assert!(matches!(got, Err(Error::Cancelled)), "{got:?}");
+    }
+
+    fn export_wav(tl: &Timeline, assets: &[Asset], file: &Path, opts: ExportOptions) {
+        let opts = ExportOptions {
+            container: Container::Wav,
+            ..opts
+        };
+        let status = render_with_progress(tl, assets, file, &opts, &mut |_| {}, &|| false).expect("export");
+        assert_eq!(status, RenderStatus::Completed);
+    }
+
+    /// A quiet passage then a loud one, 18 dB apart. Static normalization moves both by the
+    /// same gain, so the cut lands on the target and the 18 dB survive; and the result keeps
+    /// under the target's -1 dBTP.
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn static_loudness_reaches_the_target_and_keeps_the_dynamics() {
+        let dir = scratch("static");
+        let quiet = tone(&dir, -30.0, 4.0);
+        let loud = tone(&dir, -12.0, 4.0);
+        let assets = [quiet.clone(), loud.clone()];
+        let tl = timeline_of(vec![audio_track(vec![
+            make_clip(quiet.id, 0.0, 4.0, 0.0),
+            make_clip(loud.id, 0.0, 4.0, 4.0),
+        ])]);
+        for target in [LoudnessPreset::Youtube, LoudnessPreset::Broadcast] {
+            let file = dir.join(format!("static-{target:?}.wav"));
+            export_wav(
+                &tl,
+                &assets,
+                &file,
+                ExportOptions {
+                    loudness: Some(target),
+                    loudness_static: true,
+                    ..ExportOptions::default()
+                },
+            );
+            let whole = read_back(&file);
+            near(&format!("{target:?}: integrated"), whole.integrated_lufs, target.lufs(), 0.5);
+            let tp = whole.true_peak_dbtp.unwrap();
+            assert!(tp <= target.true_peak_db() + 0.05, "{target:?}: true peak {tp}");
+            let (a, b) = (
+                read_back_span(&file, Some((0.5, 3.0))).integrated_lufs.unwrap(),
+                read_back_span(&file, Some((4.5, 3.0))).integrated_lufs.unwrap(),
+            );
+            near(&format!("{target:?}: the jump"), Some(b - a), 18.0, 0.5);
+        }
+    }
+
+    /// A gain that pushes the mix over the ceiling: the oversampled limiter holds the true
+    /// peak at -1 dBTP where the sample-peak limiter lets a high tone's peaks between
+    /// samples through.
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn the_true_peak_limiters_hold_the_peaks_between_samples() {
+        let dir = scratch("truepeak");
+        let asset = tone_at(&dir, 11_025, -6.0, 6.0);
+        let assets = std::slice::from_ref(&asset);
+        let mut tl = tracks_of(&asset, 1);
+        tl.master = MasterBus {
+            volume: 2.0,
+            limiter: true,
+            ceiling_db: -1.0,
+            ..MasterBus::default()
+        };
+        let mut read = |true_peak: bool| {
+            tl.master.true_peak = true_peak;
+            let file = dir.join(format!("master-{true_peak}.wav"));
+            export_wav(&tl, assets, &file, ExportOptions::default());
+            read_back(&file)
+        };
+        let (sample, oversampled) = (read(false), read(true));
+        let tp = oversampled.true_peak_dbtp.unwrap();
+        assert!(tp <= -0.9, "true-peak limiter: {oversampled:?}");
+        assert!(
+            sample.true_peak_dbtp.unwrap() > tp,
+            "the sample-peak limiter lets more through: {sample:?} vs {oversampled:?}"
+        );
+        // Held, not lowered: the limited tone sits just under the ceiling.
+        assert!(tp > -2.0, "{oversampled:?}");
+
+        // Clicks are quiet for how high they peak: normalizing them to -14 LUFS takes ~10 dB
+        // of gain, which would put the peaks far over -1 dBTP; the limiter after the gain
+        // holds them there.
+        let path = dir.join("clicks.flac");
+        let made = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("aevalsrc=exprs='if(lt(mod(t,0.1),0.0005),0.9,0)':s=48000:d=8")
+            .args(["-af", "pan=stereo|c0=c0|c1=c0", "-c:a", "flac", "-sample_fmt", "s32"])
+            .arg(&path)
+            .status_bounded()
+            .expect("run ffmpeg");
+        assert!(made.success());
+        let mut hot = test_asset(vec![audio_stream(48_000, 2)]);
+        hot.path = path.to_string_lossy().into_owned();
+        hot.duration = 8.0;
+        let file = dir.join("static-hot.wav");
+        export_wav(
+            &tracks_of(&hot, 1),
+            std::slice::from_ref(&hot),
+            &file,
+            ExportOptions {
+                loudness: Some(LoudnessPreset::Youtube),
+                loudness_static: true,
+                ..ExportOptions::default()
+            },
+        );
+        let back = read_back(&file);
+        assert!(back.true_peak_dbtp.unwrap() <= -0.95, "{back:?}");
+    }
+
+    /// A crossfade between two tones of equal level keeps the power of either: the
+    /// constant-power pair (`qsin`) sums to one where linear ramps dip 3 dB mid-way.
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn a_crossfade_keeps_the_power_constant() {
+        let dir = scratch("xfade");
+        let a = tone_at(&dir, 1000, -12.0, 10.0);
+        let b = tone_at(&dir, 1500, -12.0, 10.0);
+        let assets = [a.clone(), b.clone()];
+        let mut incoming = make_clip(b.id, 0.0, 4.0, 4.0);
+        incoming.transition_in = Some(crate::model::Transition {
+            kind: crate::model::TransitionKind::Crossfade,
+            duration: 2.0,
+        });
+        let tl = timeline_of(vec![audio_track(vec![make_clip(a.id, 0.0, 4.0, 0.0), incoming])]);
+        let file = dir.join("xfade.wav");
+        export_wav(&tl, &assets, &file, ExportOptions::default());
+        let pcm = crate::engine::decode_audio(&file, 48_000, 1).expect("decode");
+        let rms_db = |t: f64| {
+            let (from, to) = ((t * 48_000.0) as usize, ((t + 0.1) * 48_000.0) as usize);
+            let s = &pcm.samples[from..to];
+            10.0 * (s.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / s.len() as f64).log10()
+        };
+        let steady = rms_db(2.0);
+        for t in [4.45, 4.95, 5.45] {
+            let got = rms_db(t);
+            assert!((got - steady).abs() < 0.3, "at {t}s: {got} dB against {steady} dB");
+        }
+        assert!((rms_db(7.0) - steady).abs() < 0.3);
     }
 }
