@@ -6893,6 +6893,7 @@ mod tests {
             opacity: 0.8,
             offset: 0.0,
             preset: None,
+            template: None,
         };
         let custom = serde_json::to_value(SvgOverlaySummary::from(&o)).unwrap();
         assert_eq!(custom["kind"], "custom");
@@ -7056,6 +7057,7 @@ mod tests {
             opacity: 1.0,
             offset: 0.0,
             preset: None,
+            template: None,
         };
         let mut timeline = Timeline::new();
         timeline.svg_overlays = vec![title(4096), title(4097), title(120_000)];

@@ -27,9 +27,10 @@ use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
     ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, Grade, ImportSummary, Keyframe,
-    Levels, Mask, Project, Projection, Property, PropertyKey, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind,
-    SvgCheck, SvgLayout, SvgOverlayPatch, SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, Task, TextKeyframe,
-    TimeRange, Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
+    ImportOutcome, Levels, Mask, Project, Projection, Property, PropertyKey, ReframeKeyframe, Revision, SplitSide, StagedEdit,
+    StreamKind, SvgCheck, SvgLayout, SvgOverlayPatch, SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, Task,
+    TemplateControl, TemplateLibrary, TemplateList, TemplateSaveRequest, TemplateSaved, TextKeyframe, TimeRange, Timeline,
+    TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -1867,6 +1868,218 @@ fn svg_preset_preview(
     kerf_core::svg::check_params(&params).map_err(|e| e.to_string())?;
     let frame = state.project().timeline().map_err(|e| e.to_string())?.preset_frame();
     Ok(kerf_core::render_preset(kind, &params, duration.unwrap_or(4.0), frame))
+}
+
+// ---- motion templates --------------------------------------------------------
+
+/// The user's template library (`KERF_TEMPLATES_DIR` or the data directory). Library calls need no
+/// project, so none of them takes the lock.
+fn template_library() -> CmdResult<TemplateLibrary> {
+    TemplateLibrary::default_location().map_err(|e| e.to_string())
+}
+
+/// The most bytes of an image file a template control reads: a title is held to 128 KiB, so an image
+/// that fits is far smaller, and a bigger file is refused unread.
+const TEMPLATE_IMAGE_FILE_MAX: u64 = 4 << 20;
+
+/// An image file as the `data:` URL an `image` control takes (`kerf_core::template::image_data_url`
+/// judges the picture; this only reads the file, bounded). Shared with the MCP tools.
+pub(crate) fn template_image_data_url(path: &str) -> kerf_core::Result<String> {
+    use kerf_core::Error;
+    let file = std::path::Path::new(path);
+    if !file.is_absolute() {
+        return Err(Error::InvalidArgument(format!("{path} must be an absolute file path")));
+    }
+    let meta = std::fs::metadata(file).map_err(|e| Error::InvalidArgument(format!("cannot read {path}: {e}")))?;
+    if !meta.is_file() {
+        return Err(Error::InvalidArgument(format!("{path} is not a regular file")));
+    }
+    if meta.len() > TEMPLATE_IMAGE_FILE_MAX {
+        return Err(Error::InvalidArgument(format!(
+            "{path} is {} MiB: too large for an image in a title",
+            meta.len().div_ceil(1 << 20)
+        )));
+    }
+    let bytes = std::fs::read(file).map_err(|e| Error::InvalidArgument(format!("cannot read {path}: {e}")))?;
+    kerf_core::template::image_data_url(&bytes)
+}
+
+/// Only `.kerftemplate` files are read as templates, and the path is the one a file picker returned.
+fn require_template_path(path: &str) -> CmdResult<()> {
+    let is_template = std::path::Path::new(path)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case(kerf_core::template::EXTENSION));
+    if is_template {
+        Ok(())
+    } else {
+        Err(format!("{path} is not a .{} file", kerf_core::template::EXTENSION))
+    }
+}
+
+/// What applying a template or changing the values of a template title hands back: the refreshed cut,
+/// the title that was made or changed, and what the sanitiser or the machine could not honour (a font
+/// that is not installed, ...).
+#[derive(Serialize)]
+struct TemplateEdit {
+    timeline: Timeline,
+    overlay_id: Uuid,
+    warnings: Vec<String>,
+}
+
+/// An element of a title that has an `id`, and the tag it is: what a control can aim at.
+#[derive(Serialize)]
+struct SvgElementId {
+    id: String,
+    tag: String,
+}
+
+/// Every template in the library (by name) and the files that did not read. Only manifests are read;
+/// a poster is fetched on its own (`template_poster`).
+#[tauri::command]
+async fn list_templates() -> CmdResult<TemplateList> {
+    blocking(|| template_library()?.list().map_err(|e| e.to_string())).await
+}
+
+/// A template's poster as a `data:image/png;base64,` URL (a PNG of at most 512 px), `null` when it has
+/// none.
+#[tauri::command]
+async fn template_poster(template_id: String) -> CmdResult<Option<String>> {
+    blocking(move || {
+        let poster = template_library()?.poster(&template_id).map_err(|e| e.to_string())?;
+        Ok(poster.map(|png| format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png))))
+    })
+    .await
+}
+
+/// The `id`s of a title's elements and their tags, for the save dialog to offer as targets. Pure.
+#[tauri::command(async)]
+fn svg_element_ids(svg: String) -> CmdResult<Vec<SvgElementId>> {
+    let ids = kerf_core::template::element_ids(&svg).map_err(|e| e.to_string())?;
+    Ok(ids.into_iter().map(|(id, tag)| SvgElementId { id, tag }).collect())
+}
+
+/// An image file as the `data:` URL a template `image` value takes (PNG, JPEG, GIF or WebP).
+#[tauri::command]
+async fn template_image_value(path: String) -> CmdResult<String> {
+    blocking(move || template_image_data_url(&path).map_err(|e| e.to_string())).await
+}
+
+/// Keep the title `overlay_id` (as the working cut has it) in the library as a template with the given
+/// controls. The title is read under the lock; the fonts, the sanitiser and the poster run with it
+/// released. A library write, not a timeline edit: nothing is undone or staged.
+#[tauri::command]
+async fn save_template(
+    state: State<'_, AppState>,
+    overlay_id: String,
+    name: String,
+    description: Option<String>,
+    controls: Vec<TemplateControl>,
+) -> CmdResult<TemplateSaved> {
+    let oid = id(&overlay_id)?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let source = lock_user(&shared).template_source(oid).map_err(|e| e.to_string())?;
+        let request = TemplateSaveRequest {
+            name,
+            description: description.unwrap_or_default(),
+            controls,
+        };
+        template_library()?.save(&source, request).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Add a library template to the timeline as an animated title: `values` (control id to value, partial)
+/// are spliced into its artwork and the result sanitised **before** the project lock is taken; the lock
+/// only places the title and stores the template's fonts in the project. `end` defaults to `start` plus
+/// the template's duration; `layout` places and names it like `add_svg_overlay`'s.
+#[tauri::command]
+async fn apply_template(
+    state: State<'_, AppState>,
+    template_id: String,
+    values: std::collections::BTreeMap<String, String>,
+    start: f64,
+    end: Option<f64>,
+    layout: Option<SvgLayout>,
+) -> CmdResult<TemplateEdit> {
+    let shared = state.project.clone();
+    blocking(move || {
+        let prepared = template_library()?
+            .get(&template_id)
+            .and_then(|t| t.prepare(&values))
+            .map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        let done = project
+            .apply_template_parsed(prepared, start, end, layout.unwrap_or_default())
+            .map_err(|e| e.to_string())?;
+        Ok(TemplateEdit {
+            timeline: project.timeline().map_err(|e| e.to_string())?,
+            overlay_id: done.overlay.id,
+            warnings: done.warnings,
+        })
+    })
+    .await
+}
+
+/// Change control values of a template title (partial: only the named controls). The title is read
+/// under the lock, the splice and the sanitiser run with it released, and the result is stored only if
+/// the title is still the one it was made from; one that changed meanwhile is an error saying to try again.
+#[tauri::command]
+async fn set_template_values(
+    state: State<'_, AppState>,
+    overlay_id: String,
+    values: std::collections::BTreeMap<String, String>,
+) -> CmdResult<TemplateEdit> {
+    let oid = id(&overlay_id)?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let inputs = lock_user(&shared).template_edit_inputs(oid).map_err(|e| e.to_string())?;
+        let prepared = inputs.prepare(&values).map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        let done = project
+            .set_template_values_parsed(oid, prepared)
+            .map_err(|e| e.to_string())?;
+        Ok(TemplateEdit {
+            timeline: project.timeline().map_err(|e| e.to_string())?,
+            overlay_id: done.overlay.id,
+            warnings: done.warnings,
+        })
+    })
+    .await
+}
+
+/// Bring a `.kerftemplate` file into the library. Never overwrites: the same template is
+/// `already_present`, another one with the same id is kept under a new id (`added_as_copy`).
+#[tauri::command]
+async fn import_template(path: String) -> CmdResult<ImportOutcome> {
+    require_template_path(&path)?;
+    blocking(move || {
+        template_library()?
+            .import(std::path::Path::new(&path))
+            .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Write a library template to `path` (a directory gets `<name>.kerftemplate` in it, a path with no
+/// extension gets `.kerftemplate`); resolves to where it went. The picker has asked about replacing.
+#[tauri::command]
+async fn export_template(template_id: String, path: String) -> CmdResult<String> {
+    require_local_output_path(&path)?;
+    blocking(move || {
+        let written = template_library()?
+            .export(&template_id, std::path::Path::new(&path))
+            .map_err(|e| e.to_string())?;
+        Ok(written.to_string_lossy().into_owned())
+    })
+    .await
+}
+
+/// Remove a template from the library. Titles already made from it keep working: they carry their own
+/// artwork and fonts.
+#[tauri::command]
+async fn delete_template(template_id: String) -> CmdResult<()> {
+    blocking(move || template_library()?.delete(&template_id).map_err(|e| e.to_string())).await
 }
 
 #[tauri::command(async)]
@@ -3944,6 +4157,16 @@ pub fn run() {
             validate_svg,
             list_svg_presets,
             svg_preset_preview,
+            list_templates,
+            template_poster,
+            svg_element_ids,
+            template_image_value,
+            save_template,
+            apply_template,
+            set_template_values,
+            import_template,
+            export_template,
+            delete_template,
             generate_captions,
             clear_captions,
             import_captions,
