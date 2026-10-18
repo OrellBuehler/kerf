@@ -129,15 +129,16 @@ fn transitions() -> (Timeline, Vec<Asset>, f64) {
     (tl, vec![a, b, c], 24.0)
 }
 
-/// 29.97 fps across the first drop-frame minute.
+/// 29.97 fps across the first drop-frame minute, every edge on a frame.
 fn drop_frame() -> (Timeline, Vec<Asset>, f64) {
     let a = asset(1, "/m/ntsc.mov", 600.0, false);
+    let f = |n: f64| n * 1001.0 / 30000.0;
     let tl = Timeline {
         tracks: vec![track(
             101,
             StreamKind::Video,
             "V1",
-            vec![clip(11, &a, 0.0, 59.96, 0.0), clip(12, &a, 120.0, 130.0, 59.96)],
+            vec![clip(11, &a, 0.0, f(1800.0), 0.0), clip(12, &a, f(3600.0), f(3900.0), f(1800.0))],
         )],
         ..Timeline::new()
     };

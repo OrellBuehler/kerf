@@ -180,6 +180,7 @@ mod tests {
                     time: Some(4.0),
                     kind: Some(MarkerKind::Comment),
                     duration: Some(0.0),
+                    comment: Some(String::new()),
                     ..MarkerPatch::default()
                 },
             )
