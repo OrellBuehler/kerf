@@ -761,6 +761,13 @@ export async function recoverProject(id: string): Promise<boolean> {
 	return true;
 }
 
+/** The user chose "Don't save" as the app closes: delete this project's recovery session at
+ *  exit instead of offering it at the next launch. */
+export async function discardRecoveryAtExit(): Promise<void> {
+	if (!inTauri()) return;
+	await invoke('discard_recovery_at_exit');
+}
+
 /** Delete a left-behind project. */
 export async function discardRecovery(id: string): Promise<void> {
 	if (!inTauri()) return;

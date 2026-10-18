@@ -41,6 +41,7 @@
 		askRecovery,
 		askUnsaved,
 		discardRecovery,
+		discardRecoveryAtExit,
 		inTauri,
 		listRecoveries,
 		isMediaPath,
@@ -62,7 +63,7 @@
 	import { missingProjectMessage } from '$lib/launch';
 	import { recoveryCopy } from '$lib/recovery';
 	import { tip } from '$lib/tip';
-	import { CONFIRM, UNSAVED, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
+	import { CONFIRM, UNSAVED, leaveAfter, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
 	import { changeIndex, changePoints, stepChange } from '$lib/staged-diff';
 	import { clampPlayhead, secondFrames, stepFrames } from '$lib/frames';
 	import { isPagingKey, onEditorSurface } from '$lib/focus-area';
@@ -146,7 +147,7 @@
 		// would drop it without a word, so ask first.
 		void onWindowCloseRequested(
 			() => editor.hasUnsavedWork,
-			() => proceedUnsaved(UNSAVED.close)
+			() => leaveUnsaved(UNSAVED.close)
 		).then((un) => unlisteners.push(un));
 
 		// Each asset's preview proxy and per-kind analysis, kept current by the backend's events
@@ -299,6 +300,11 @@
 		return proceedAfter(await askUnsaved(copy), saveProject);
 	}
 
+	/** [`proceedUnsaved`] for closing or quitting: "Don't save" also lets the recovery session go. */
+	async function leaveUnsaved(copy: UnsavedCopy): Promise<boolean> {
+		return leaveAfter(await askUnsaved(copy), saveProject, discardRecoveryAtExit);
+	}
+
 	async function onNew() {
 		if (!inTauri()) {
 			toast.info('Creating a project is available in the desktop app.');
@@ -361,7 +367,7 @@
 		}
 		await quitApp(
 			() => editor.hasUnsavedWork,
-			() => proceedUnsaved(UNSAVED.quit)
+			() => leaveUnsaved(UNSAVED.quit)
 		);
 	}
 

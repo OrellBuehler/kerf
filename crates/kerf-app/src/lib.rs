@@ -3663,6 +3663,7 @@ pub fn run() {
             recovery::list_recoveries,
             recovery::recover_project,
             recovery::discard_recovery,
+            recovery::discard_recovery_at_exit,
             popout::popout_expect,
             popout::popout_cancel,
             popout::close_popout,

@@ -215,6 +215,10 @@ project (`replace_with`: Open, New, Save As, Recover) deletes the old session â€
 `close()`s the returned project after dropping the lock. A clean exit (`RunEvent::Exit`) uses
 `close_at_exit`: an untouched session goes, one holding work stays to be offered next launch (the close
 guard can be bypassed, and `hasUnsavedWork` is narrower than recovery's rule); a crash leaves it.
+An explicit **Don't save** in the close / quit prompt calls `discard_recovery_at_exit` (`leaveAfter`
+in `confirm-copy.ts`), which records the current session's id; at exit that session is deleted even
+with work (`close_on_exit`, matched by id, so a project replaced since is not). A prompt that failed
+or a close that asked nothing never sets it.
 `list_recoveries` scans once per run (`kerf_core::recovery::scan`, skipping our own session) and keeps
 what it found **locked** in `RecoveryState` until `recover_project { id }` (opens it as the untitled
 project, like `open_project`: scrub cleared, speech model restored, proxies queued) or

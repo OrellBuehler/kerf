@@ -20,6 +20,8 @@ pub(crate) struct RecoveryState {
     /// What the launch scan found, each held locked until recovered, discarded or the app exits.
     /// `None` until the webview first asks.
     found: Option<Vec<Recoverable>>,
+    /// The session the user chose "Don't save" for as the app closes: deleted at exit, not kept.
+    let_go: Option<String>,
 }
 
 fn root(app: &AppHandle) -> Option<PathBuf> {
@@ -62,12 +64,38 @@ pub(crate) fn start(app: &AppHandle) {
 /// next launch to offer (`Project::close_at_exit`), since the close guard can be bypassed. A
 /// crash never gets here, which is the point.
 pub(crate) fn on_exit(app: &AppHandle) {
+    let let_go = app
+        .try_state::<Mutex<RecoveryState>>()
+        .and_then(|s| s.lock().unwrap_or_else(|e| e.into_inner()).let_go.take());
     if let Some(state) = app.try_state::<AppState>() {
         if let Ok(empty) = Project::open_in_memory() {
             let old = lock_user(&state.project).replace_with(empty);
-            old.close_at_exit();
+            close_on_exit(old, let_go.as_deref());
         }
     }
+}
+
+/// Delete the session the user let go of by name; keep any other one that holds work. A session
+/// replaced since the answer (a New or an Open that did not close the app) is not the one meant.
+fn close_on_exit(project: Project, let_go: Option<&str>) {
+    if let_go.is_some() && project.recovery_id() == let_go {
+        project.close();
+    } else {
+        project.close_at_exit();
+    }
+}
+
+/// The user answered "Don't save" to the close or quit prompt: the untitled project's session is
+/// deleted at exit instead of being offered at the next launch. A prompt that failed, or a close
+/// that asked nothing, never calls this, so that work is still kept.
+#[tauri::command(async)]
+pub(crate) fn discard_recovery_at_exit(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+    let id = state.project().recovery_id().map(str::to_string);
+    app.state::<Mutex<RecoveryState>>()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .let_go = id;
+    Ok(())
 }
 
 /// The untitled projects a crashed Kerf left behind that hold real work, newest first. Scanned
@@ -124,4 +152,37 @@ pub(crate) async fn recover_project(app: AppHandle, state: State<'_, AppState>, 
 #[tauri::command]
 pub(crate) async fn discard_recovery(app: AppHandle, id: String) -> CmdResult<()> {
     blocking(move || take(&app, &id)?.discard().map_err(|e| e.to_string())).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An untitled project with one edit in its history: work a recovery would offer.
+    fn worked(root: &std::path::Path) -> Project {
+        let project = Project::create_recovery(root).unwrap();
+        project.add_marker(1.0, "m".into(), None).unwrap();
+        project
+    }
+
+    #[test]
+    fn a_session_let_go_by_name_is_deleted_and_any_other_kept() {
+        let root = std::env::temp_dir().join(format!("kerf-app-recovery-{}", uuid::Uuid::new_v4().simple()));
+        let project = worked(&root);
+        let dir = project.recovery_dir().unwrap().to_path_buf();
+        close_on_exit(project, None);
+        assert!(dir.exists(), "work nobody let go of is kept");
+
+        let project = worked(&root);
+        let dir = project.recovery_dir().unwrap().to_path_buf();
+        close_on_exit(project, Some("another-session"));
+        assert!(dir.exists(), "an answer about another session does not reach this one");
+
+        let project = worked(&root);
+        let dir = project.recovery_dir().unwrap().to_path_buf();
+        let id = project.recovery_id().unwrap().to_string();
+        close_on_exit(project, Some(&id));
+        assert!(!dir.exists(), "\"Don't save\" deletes it");
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
