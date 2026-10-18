@@ -1433,3 +1433,99 @@ export interface MusicFitted {
 	timeline: Timeline;
 	report: MusicFitReport;
 }
+
+/** A scope the Scopes panel draws (`kerf_core::scopes::ScopeKind`). */
+export type ScopeKind = 'waveform' | 'parade' | 'vectorscope' | 'histogram';
+/** The Y'CbCr matrix the scopes read the frame with; `auto` is the delivery's. */
+export type ScopeMatrix = 'auto' | 'bt601' | 'bt709' | 'bt2020';
+
+export interface ScopeGridSize {
+	columns: number;
+	rows: number;
+	vector: number;
+}
+
+/** One channel over every pixel of the frame: levels 0..1, pixels clipped at 0 and at 1. */
+export interface ScopeChannel {
+	min: number;
+	max: number;
+	mean: number;
+	clipped_low: number;
+	clipped_high: number;
+	clipped_low_pct: number;
+	clipped_high_pct: number;
+}
+
+/** Mean Cb / Cr (-0.5..0.5), the hue (degrees from +Cb) and saturation (|CbCr| / 0.5) of
+ *  that mean, and the mean of every pixel's saturation. */
+export interface ScopeChroma {
+	cb: number;
+	cr: number;
+	hue_deg: number;
+	saturation: number;
+	mean_saturation: number;
+}
+
+export interface ScopePeak {
+	cb: number;
+	cr: number;
+	hue_deg: number;
+	saturation: number;
+	share: number;
+}
+
+export interface ScopeSummary {
+	width: number;
+	height: number;
+	matrix: 'bt601' | 'bt709' | 'bt2020';
+	red: ScopeChannel;
+	green: ScopeChannel;
+	blue: ScopeChannel;
+	luma: ScopeChannel;
+	chroma: ScopeChroma;
+	peaks: ScopePeak[];
+}
+
+/** Counts: `counts[row * columns + column]`, row 0 the lowest level (the most negative Cr on
+ *  the vectorscope, Cb across). */
+export interface ScopeGrid {
+	columns: number;
+	rows: number;
+	counts: number[];
+}
+
+/** 256 bins per channel. */
+export interface ScopeHistogram {
+	red: number[];
+	green: number[];
+	blue: number[];
+	luma: number[];
+}
+
+/** `kerf_core::scopes::Scopes`: the summary always, the grids that were asked for. */
+export interface Scopes {
+	summary: ScopeSummary;
+	waveform?: ScopeGrid;
+	/** Red, green, blue. */
+	parade?: ScopeGrid[];
+	vectorscope?: ScopeGrid;
+	histogram?: ScopeHistogram;
+}
+
+/** How the Preview plays a span (`kerf_core::render_bar::BarState`). */
+export type BarState = 'gpu' | 'stream' | 'stall';
+
+export interface BarSpan {
+	start: number;
+	end: number;
+	state: BarState;
+	/** A stable key for the reason (`reversed`, `proxy_wait`, `mask`, `gpu`, …). */
+	kind: string;
+	reason: string;
+}
+
+/** `kerf_core::render_bar::RenderBar`: with the GPU preview off only the stalls are listed. */
+export interface RenderBar {
+	gpu_preview: boolean;
+	spans: BarSpan[];
+}

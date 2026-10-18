@@ -1025,3 +1025,14 @@ so the feature is **only** activated through these forwards — which is what ma
   `build_still_args`* under its own mutex, so a builder that asked would deadlock, and a non-probing read would
   answer differently before and after the first probe. The plan mirrors it (`PlanStream::matrix()` is BT.709 for a
   labelled layer under any policy, which a translucent round trip reads).
+
+**Scopes** (`scopes.rs`, pure but for `timeline_scopes`). The frame is `timeline_frame_yuv`: the still's own graph with a
+`StillOutput::Yuv444Pipe` sink (`-f rawvideo -pix_fmt yuv444p`, a new sink, so no golden moves), from the **originals**
+(`export_still_inputs`) at the delivery width — the Y'CbCr samples the file holds, not an `rgb24` pipe, whose matrix is the
+composite's (BT.601 on FFmpeg 6) rather than the one a player decodes the untagged delivery with. `yuv444_to_rgba` decodes
+them limited-range with the delivery's matrix (`delivery_matrix`: BT.709 at 1280 wide or over 576 tall, else BT.601; a
+caller can name `bt601` / `bt709` / `bt2020`), clipping what the cube cannot hold, as a screen does. `analyze` reads every
+pixel for the summary and the histogram (min / max / mean, pixels at 0 and 255 — a single clipped pixel is counted, which a
+decimated read misses) and a decimated frame (at most 480 x 270 samples) for the waveform, parade and vectorscope grids and
+the peaks (a 64² vectorscope, cells with at least 1 % of the samples). A moment read: ungated by `cpu::lease`, thread-capped
+by the still's spawn-time tuning. `scopes_of_a_rendered_frame` (`#[ignore]`d) holds a one-pixel clip through the real graph.

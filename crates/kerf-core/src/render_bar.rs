@@ -106,7 +106,7 @@ pub fn render_bar(timeline: &Timeline, assets: &[Asset], req: &BarRequest<'_>) -
         spans: Vec::new(),
     };
     let end = timeline.for_render().duration();
-    if !(end > 0.0) {
+    if end.is_nan() || end <= 0.0 {
         return bar;
     }
     let cut = match PlayCut::new(timeline, assets, 0.0, req.color, req.media) {
@@ -321,7 +321,7 @@ mod tests {
         let a = asset();
         let hours = 2.0 * 3600.0;
         let tl = timeline_of(vec![video_track(vec![make_clip(a.id, 0.0, hours, 0.0)])]);
-        let mut long = a.clone();
+        let mut long = a;
         long.duration = hours;
         let on = bar(&tl, &[long], Some(caps()), Vec::new());
         assert_eq!(states(&on), vec![(BarState::Gpu, "gpu".to_string())]);

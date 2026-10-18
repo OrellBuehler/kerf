@@ -83,6 +83,10 @@ and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**
 `skim_asset` is how an agent looks at footage,
 `get_preview_frame` (`hint: "forward"` is a frame of GPU playback) / `set_preview_bounds` / `gpu_preview_status` / `gpu_preview_diagnostics` (the GPU preview, below; GUI-only),
 `get_timeline_frame` (the composited still at a time; see Scrubbed frames below),
+`get_scopes` (`kerf_core::scopes` of the export's still at a time, from the originals: the summary and the grids asked
+for; the MCP tool of the same name) / `get_render_bar` (`kerf_core::render_bar` over the working cut, for the GPU
+preview's `Compositor::CAPS` when the setting is on, the proxy waits and the measured colour policy; GUI-only, see
+`frontend-timeline.md`),
 detached panels (`popout_expect` / `popout_cancel` / `popout_focus` / `popout_move` / `close_popout`, see Detached panels below; GUI-only, no MCP tool),
 `start_playback { playback_id, start, fps?, max_width?, on_frame }` / `stop_playback` — streamed
 composited frames over a `tauri::ipc::Channel<InvokeResponseBody>`, **raw bytes** (`playback_message`:

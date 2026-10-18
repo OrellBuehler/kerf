@@ -32,7 +32,7 @@ const MAX_PEAKS: usize = 5;
 const MIN_PEAK_SHARE: f64 = 0.01;
 
 /// One of the drawn scopes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeKind {
     Waveform,
@@ -42,7 +42,7 @@ pub enum ScopeKind {
 }
 
 /// The matrix a caller asks the scopes to read the frame with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeMatrix {
     /// The delivery's: [`delivery_matrix`] of the frame the cut renders at.
@@ -83,7 +83,7 @@ pub fn matrix_name(m: YuvMatrix) -> &'static str {
 }
 
 /// How finely the drawn grids are binned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GridSize {
     /// Waveform / parade columns (each parade channel has this many).
     pub columns: u32,
@@ -357,7 +357,7 @@ pub fn analyze(frame: RgbaFrame<'_>, m: YuvMatrix, opts: &ScopeOptions) -> Scope
         blue: vec![0; 256],
         luma: vec![0; 256],
     };
-    for p in px.chunks_exact(4).take(n) {
+    for p in px.as_chunks::<4>().0.iter().take(n) {
         let (r8, g8, b8) = (p[0], p[1], p[2]);
         let (r, g, b) = (r8 as f64 / 255.0, g8 as f64 / 255.0, b8 as f64 / 255.0);
         let (y, cb, cr) = ycbcr(m, r, g, b);

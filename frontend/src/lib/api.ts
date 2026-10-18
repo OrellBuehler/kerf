@@ -51,7 +51,12 @@ import type {
 	Projection,
 	Reframe,
 	ReframeKeyframe,
+	RenderBar,
 	Revision,
+	ScopeGridSize,
+	ScopeKind,
+	ScopeMatrix,
+	Scopes,
 	AppSettings,
 	SettingsView,
 	SplitSide,
@@ -127,6 +132,8 @@ import { analysisKindDone, ALL_KINDS } from './analysis-steps';
 import { sampleFilmstrip } from './sample-filmstrip';
 import { synthPcm } from './sample-audio';
 import { sampleFrameJpeg } from './sample-frame';
+import { harnessScopes } from './scopes-view';
+import { harnessRenderBar } from './render-bar';
 import { renderedFps } from './timecode';
 import { playbackFps } from './playback-sync';
 import { parsePlaybackMessage } from './frame-transport';
@@ -3079,6 +3086,32 @@ export async function getFrame(
 export async function getTimelineFrame(timeSecs: number, maxWidth = 960): Promise<string | null> {
 	if (!inTauri()) return null;
 	return invoke<string>('get_timeline_frame', { timeSecs, maxWidth });
+}
+
+/**
+ * The video scopes of the composited frame at `timeSecs` (`get_scopes`): the export's still of
+ * the cut, from the originals, read with the delivery's matrix (or `matrix`). The numeric summary
+ * always; the `grids` asked for at `size`. A real decode, so callers throttle it. In the browser
+ * harness: the scopes of colour bars.
+ */
+export async function getScopes(
+	timeSecs: number,
+	grids: ScopeKind[] = [],
+	size?: ScopeGridSize,
+	matrix: ScopeMatrix = 'auto'
+): Promise<Scopes> {
+	if (!inTauri()) return harnessScopes(grids, size);
+	return invoke<Scopes>('get_scopes', { timeSecs, grids, size: size ?? null, matrix });
+}
+
+/**
+ * How the Preview will play each span of the cut (`get_render_bar`): the GPU preview where it
+ * is on and draws it, the FFmpeg stream where it hands over, and the spans where playback stalls.
+ * `width` is the Preview's render width. In the browser harness: the reversed clips.
+ */
+export async function getRenderBar(width = 960): Promise<RenderBar> {
+	if (!inTauri()) return harnessRenderBar(devTimeline);
+	return invoke<RenderBar>('get_render_bar', { width });
 }
 
 /**

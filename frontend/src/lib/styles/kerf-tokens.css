@@ -130,6 +130,12 @@
 	--clip-accent: #f0c277;
 	--scene-marker: var(--kerf-500);
 	--beat-marker: var(--agent-500);
+	/* The Scopes panel's traces (a theme recolours them through these bases). */
+	--scope-trace: var(--green-400);
+	--scope-red: var(--red-500);
+	--scope-green: var(--green-500);
+	--scope-blue: var(--drag-ghost);
+	--scope-graticule: color-mix(in srgb, var(--border-base) 18%, transparent);
 	--silence-region: color-mix(in srgb, var(--red-500) 12%, transparent);
 	--timeline-grid: color-mix(in srgb, var(--border-base) 4%, transparent);
 	--timeline-grid-major: color-mix(in srgb, var(--border-base) 8%, transparent);

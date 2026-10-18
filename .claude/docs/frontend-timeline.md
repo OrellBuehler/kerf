@@ -247,6 +247,16 @@ keyframe-at-playhead check has a tolerance that assumes the playhead is *at* the
 click would land on. It also **cannot stand past the end of the cut**: an effect in
 `+page.svelte` takes it back to the new end when an edit shortens the cut (an empty cut reads `00:00:00:00 / 00:00:00:00`).
 The playhead's *head* lives in the sticky ruler, so it stays when the tracks scroll vertically.
+**The render bar** (`RenderBar.svelte`, `render-bar.ts`) is a 3 px strip along the ruler's top edge saying how the
+Preview will play each span, from `get_render_bar` (`kerf_core::render_bar`: the cut planned as a play session from
+its start, `PlayCut`, every grid frame judged; asked again 400 ms after the cut, the media or the GPU setting changes):
+**red** (`stall`) where playback stalls whoever plays it — a reversed clip (the stream's `reverse` and the GPU cursor
+both read the whole window first), a clip waiting for its proxy under Proxy only, a frame with no plan; with the GPU
+preview **on**, **green** (`gpu`) where the compositor draws the frame exactly and in time at the Preview's size and
+**yellow** (`stream`) where it hands over to the FFmpeg stream (a plan refusal by `Compositor::CAPS`, a moving title);
+with it **off** (the default) the stream plays everything else and the bar shows only the red. The tooltip names the
+state, the span and the first frame's reason. What only a running session knows (self-test, untrusted seeks, a
+backend that is down) is not in it; a cut over 200 000 frames is judged every n-th frame.
 **A clip with the keyboard focus nudges**: ← / → move it (and the selection it is part of) a frame, ⇧ a second, Alt leaves its
 linked partners (`nudge.ts`). A run of presses is one edit, written once the keys go quiet (450 ms), on Enter or when focus
 leaves; until then the clip is drawn where it will land as a drag is (the plan is `planMove`'s, so overlaps, locks and links

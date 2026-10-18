@@ -13,9 +13,9 @@ import type { GroupviewPanelState, Orientation, SerializedDockview, SerializedPo
 export const POPOUT_URL = '/popout.html';
 /** How many windows a stored layout may hold: one per panel there is, none of them
  *  a reason to trust a hand-edited file to be reasonable. */
-export const MAX_POPOUTS = 7;
+export const MAX_POPOUTS = 8;
 
-export const PANEL_IDS = ['library', 'preview', 'timeline', 'inspector', 'agent', 'deliver', 'mixer'] as const;
+export const PANEL_IDS = ['library', 'preview', 'timeline', 'inspector', 'agent', 'deliver', 'mixer', 'scopes'] as const;
 export type PanelId = (typeof PANEL_IDS)[number];
 
 /** The width of the library's icon rail. The panel's registry minimum, so a
@@ -46,7 +46,9 @@ export const PANELS: Record<PanelId, PanelSpec> = {
 	deliver: { title: 'Deliver', minimumWidth: 280, defaultWidth: 420 },
 	// A strip is ~84 px wide and the master another ~130: two tracks and the master
 	// fit in 340 px, and a third scrolls. Tall enough for a fader to have travel.
-	mixer: { title: 'Mixer', minimumWidth: 340, minimumHeight: 230, defaultWidth: 460 }
+	mixer: { title: 'Mixer', minimumWidth: 340, minimumHeight: 230, defaultWidth: 460 },
+	// A scope reads at a couple of hundred pixels; the readout under it needs the width.
+	scopes: { title: 'Scopes', minimumWidth: 240, minimumHeight: 200, defaultWidth: 340 }
 };
 
 export function isPanelId(id: unknown): id is PanelId {
@@ -125,14 +127,15 @@ export const PRESET_LAYOUTS: Record<WorkspaceId, SerializedDockview> = {
 		],
 		304
 	),
-	// Grading: the picture as large as it gets, the controls beside it, and a
-	// short timeline. The library is narrow — it is there for looks, not browsing.
+	// Grading: the picture as large as it gets, the scopes and the controls beside
+	// it, and a short timeline. The library is narrow — it is there for looks, not browsing.
 	color: preset(
 		560,
 		[
-			leaf('library', ['library'], 240),
-			leaf('preview', ['preview'], 820),
-			leaf('inspector', ['inspector', 'agent'], 380)
+			leaf('library', ['library'], 220),
+			leaf('preview', ['preview'], 580),
+			leaf('scopes', ['scopes'], 320),
+			leaf('inspector', ['inspector', 'agent'], 320)
 		],
 		234
 	),
@@ -578,9 +581,9 @@ export function presetPanelIds(id: WorkspaceId): PanelId[] {
 
 /** What a layout stored before layouts recorded it was offered: the panels of
  *  each preset as they stood when that was the only kind there was — every
- *  preset as it is now, bar the mixer Audio gained. */
+ *  preset as it is now, bar the mixer Audio gained and the scopes Color did. */
 export const UNSTAMPED_OFFERED: Record<WorkspaceId, PanelId[]> = Object.fromEntries(
-	WORKSPACE_IDS.map((id) => [id, presetPanelIds(id).filter((p) => p !== 'mixer')])
+	WORKSPACE_IDS.map((id) => [id, presetPanelIds(id).filter((p) => p !== 'mixer' && p !== 'scopes')])
 ) as Record<WorkspaceId, PanelId[]>;
 
 /** Presets as an earlier build shipped them, for the ones that changed shape
@@ -598,6 +601,16 @@ export const EARLIER_PRESETS: Partial<Record<WorkspaceId, SerializedDockview>> =
 			leaf('inspector', ['inspector', 'agent'], 420)
 		],
 		464
+	),
+	// Before the scopes: the preview and the inspector wider.
+	color: preset(
+		560,
+		[
+			leaf('library', ['library'], 240),
+			leaf('preview', ['preview'], 820),
+			leaf('inspector', ['inspector', 'agent'], 380)
+		],
+		234
 	)
 };
 

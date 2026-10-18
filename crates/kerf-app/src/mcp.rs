@@ -1413,6 +1413,27 @@ struct TimelineFrameParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ScopesParams {
+    #[schemars(description = "Timeline position to measure (seconds)")]
+    time_secs: f64,
+    #[schemars(
+        description = "Grids to return besides the numeric summary: any of `waveform` (luma), `parade` (red, green, blue), \
+                       `vectorscope`, `histogram`. Omit for the summary alone, which is usually all you need."
+    )]
+    grids: Option<Vec<kerf_core::scopes::ScopeKind>>,
+    #[schemars(
+        description = "Grid size: `columns` / `rows` of the waveform and parade (default 64 x 64, at most 512 x 256), \
+                       `vector` the vectorscope's side (default 48, at most 256)"
+    )]
+    grid_size: Option<kerf_core::scopes::GridSize>,
+    #[schemars(
+        description = "The Y'CbCr matrix to read the frame with: `auto` (default: the delivery's, BT.709 for HD and up, \
+                       BT.601 for SD), `bt601`, `bt709`, `bt2020`"
+    )]
+    matrix: Option<kerf_core::scopes::ScopeMatrix>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct CoverParams {
     #[schemars(description = "Timeline position to capture (seconds)")]
     time_secs: f64,
@@ -3933,6 +3954,44 @@ impl KerfMcp {
         json(&serde_json::json!({ "output": written.to_string_lossy() }))
     }
 
+    #[tool(
+        description = "Measure the picture at a timeline time without looking at it: video scopes of the composited \
+                       frame the export would write (originals, full delivery resolution). Returns a summary: per channel \
+                       (red, green, blue, luma) min / max / mean in 0..1 and how many pixels are clipped at 0 and at 1 \
+                       (`clipped_low` / `clipped_high`, counted over every pixel, so a single blown pixel shows), the mean \
+                       chroma (`cb`, `cr` in -0.5..0.5; `hue_deg` counter-clockwise from +Cb, so red is ~103, skin tones \
+                       ~123, blue ~350; `saturation` of the mean — a colour cast — and `mean_saturation`, how colourful \
+                       the frame is, both as |CbCr| / 0.5) and the densest vectorscope spots. Use it to check exposure, \
+                       clipping, a colour cast or a grade's effect after an edit. Grids are optional (counts, row 0 the \
+                       lowest level)."
+    )]
+    async fn get_scopes(&self, Parameters(p): Parameters<ScopesParams>) -> Result<String, McpError> {
+        if !p.time_secs.is_finite() {
+            return Err(McpError::invalid_params("time_secs must be a number", None));
+        }
+        let project = self.project.clone();
+        let size = p.grid_size.unwrap_or(kerf_core::scopes::GridSize {
+            columns: 64,
+            rows: 64,
+            vector: 48,
+        });
+        let req = kerf_core::scopes::ScopeRequest {
+            time_secs: p.time_secs,
+            max_width: None,
+            matrix: p.matrix.unwrap_or_default(),
+            options: kerf_core::scopes::ScopeOptions {
+                grids: p.grids.unwrap_or_default(),
+                size: size.clamped(),
+            },
+        };
+        let scopes = blocking(move || {
+            let (timeline, assets) = lock_agent(&project).export_still_inputs().map_err(core_err)?;
+            kerf_core::scopes::timeline_scopes(&timeline, &assets, &req).map_err(core_err)
+        })
+        .await?;
+        json(&scopes)
+    }
+
     // ---- agent task queue --------------------------------------------------
 
     #[tool(description = "List the agent task queue with each task's status (queued/working/ready/done/failed)")]
@@ -5834,6 +5893,27 @@ mod tests {
         ] {
             assert!(tools.iter().any(|t| t.name == name), "`{name}` is registered");
         }
+    }
+
+    #[test]
+    fn get_scopes_asks_only_for_a_time() {
+        let tools = router().list_all();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "get_scopes")
+            .expect("`get_scopes` is registered");
+        let required = tool
+            .input_schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(required, [serde_json::json!("time_secs")]);
+        let description = tool.description.as_deref().unwrap_or_default();
+        assert!(
+            description.contains("clipped_high") && description.contains("hue_deg"),
+            "{description}"
+        );
     }
 
     #[test]

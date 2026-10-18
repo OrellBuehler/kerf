@@ -34,6 +34,11 @@ SVG sheet, a drawing JPEG would smear): a caption
 actually *see* (rmcp wants bare base64 + MIME, **not** a `data:` URL). `preview_timeline` stays the one-shot
 still (`composite_timeline_frame`, the working cut, the exact time asked): the scrub cache and its windows
 (`app.md`) are the GUI's, where frames come one after another from a dragged playhead.
+**`get_scopes`** measures instead of showing (`kerf_core::scopes`, `engine-cli.md`): the summary of the frame the
+export writes at a time — per channel min / max / mean, pixels clipped at 0 and 1 counted over every pixel, the mean
+chroma's hue and saturation, the densest vectorscope spots — so an agent checks exposure, clipping or a cast with no
+image tokens; `grids` (waveform / parade / vectorscope / histogram, default 64 x 64 / 48) only when asked. There is no
+tool for the render bar (`get_render_bar`): how the GUI's preview plays a span is nothing an agent acts on.
 **Look, then look closer**: `get_frame` and `preview_timeline` take an optional
 `region` (a `Region` — fractions of the frame, normalized into it) that is
 cropped out *before* the scale to `max_width`, and `skim_asset` takes a `cell`
