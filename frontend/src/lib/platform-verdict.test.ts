@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { applyPreset, PRESETS, RESOLUTIONS } from './export-presets';
 import { VARIANT_PRESETS } from './delivery-formats';
-import { report } from './platforms';
+import { report, TARGETS } from './platforms';
 import { judgeable, platformVerdict, type TickedShape, type Verdict, type VerdictInput } from './platform-verdict';
 import { SRC, uiSources } from './test-sources';
 import type { CutSummary, PlatformReport, Timeline } from './types';
@@ -139,6 +139,14 @@ describe('the default 16:9 export, no shape ticked', () => {
 		]);
 		const ticked = verdict({ shapes: [{ label: '9:16', report: rep(720, 1280) }, { label: '9:16', report: rep(720, 1280) }] });
 		expect(ticked.tips.filter((t) => t.includes('upscale'))).toHaveLength(1);
+	});
+
+	test("the size a soft frame is made for is the backend's own, when it supplied the targets", () => {
+		const targets = TARGETS.map((t) => (t.id === 'youtube' ? { ...t, width: 3840, height: 2160 } : t));
+		const v = verdict({ file: rep(1280, 720), targets });
+		expect(v.tips).toEqual([
+			'1280×720 is below the size YouTube is made for (3840×2160); the platform will upscale it and it will look soft.'
+		]);
 	});
 
 	test('a low resolution is a folded tip, not a warning', () => {

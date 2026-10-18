@@ -1169,6 +1169,14 @@ driven end-to-end without a desktop build; its `stale` flag is computed as the b
 to draw). **`?music=1`** lays the harness's song (`music.mp3`,
 always in the library, with a bar grid) on its own track A2 — bar ticks on the ruler and
 *Fit to video* (see frontend-timeline.md) are then one right-click away.
+The library and review commands the desktop app answers have harness twins with the backend's wording:
+**`?missing=1`** leaves the b-roll and the song without a file (`missingAssets`, `relinkAsset` — kinds judged by
+extension, analysis kept only for the same file name — and `removeAsset`, which refuses a used asset without `force`
+in the backend's words), **`?recent=1`** seeds `recentProjects`, **`?exists=1`** makes `pathsExist` answer yes (the
+overwrite prompt), and the staged proposal carries core's entry ids so `applyStagedSubset` (the port in
+`staged-subset.ts`, tested case for case against `model/subset.rs`), `undoStagedEdit`, `discardedStagedEdit` and
+`restoreDiscardedEdits` run on it. Playback ids are `session * 2^32 + n` (`playback-id.ts`, session from
+`playback_session`; see app.md).
 `data.ts` keeps only the `STATUS_MAP`/`PRESETS` presentation bits —
 all project data renders from the real backend.
 

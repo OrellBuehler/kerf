@@ -1871,7 +1871,7 @@ impl KerfMcp {
                 let asset = {
                     let guard = lock_agent_as(&project, owner.as_deref());
                     // Imported into the project it was asked of, or not at all.
-                    require_generation(&guard, generation)?;
+                    require_generation(&guard, generation, "it was being imported")?;
                     guard.insert_or_get_asset(&probed).map_err(core_err)?
                 };
                 // Preview decodes come off a proxy; queue it now so the first frame anyone asks for
@@ -2075,10 +2075,9 @@ impl KerfMcp {
             kerf_core::resolve_steps(&asset, steps.as_deref()).map_err(core_err)?;
             project.generation()
         };
-        // The GUI's Stop button stops an agent's analysis too: it trips this flag, which the
-        // GUI's own command also resets at the start of its pass.
-        let gui_stop = self.app.state::<crate::AppState>().analysis_cancel.clone();
-        gui_stop.store(false, Ordering::SeqCst);
+        // The GUI's Stop button stops an agent's analysis too: it trips this flag, which a new run
+        // clears (`begin_analysis`, as the GUI's own command does) and polls.
+        let gui_stop = self.app.state::<crate::AppState>().begin_analysis();
         let (me, owner) = (self.clone(), self.owner());
         self.long_tool("analyze_asset", p.background, &context, move |run| async move {
             let run = run.also_cancelled_by({
@@ -2101,7 +2100,11 @@ impl KerfMcp {
                 .map_err(|e| McpError::internal_error(e, None))?;
                 // Whatever finished was merged as it did; a project swapped in meanwhile is not
                 // told it was analysed.
-                require_generation(&lock_agent_as(&project, owner.as_deref()), generation)?;
+                require_generation(
+                    &lock_agent_as(&project, owner.as_deref()),
+                    generation,
+                    "it was being analysed",
+                )?;
                 Ok(outcome)
             })
             .await?;
@@ -3446,7 +3449,7 @@ impl KerfMcp {
                         .map_err(core_err)?;
                 // Landing it is an edit of the cut, so it goes into the proposal.
                 let project = lock_agent_edit(&project, owner.as_deref())?;
-                require_generation(&project, generation)?;
+                require_generation(&project, generation, "the narration was being made")?;
                 let (asset, clip) = project
                     .with_ripple(p.ripple, |project| project.place_voiceover(&asset, track, p.timeline_start))
                     .map_err(core_err)?;
@@ -3536,7 +3539,7 @@ impl KerfMcp {
                     Some(_) => lock_agent_edit(&project, owner.as_deref())?,
                     None => lock_agent_as(&project, owner.as_deref()),
                 };
-                require_generation(&project, generation)?;
+                require_generation(&project, generation, "the stems were being made")?;
                 project.place_stems(asset_id, &stems, clip_id).map_err(core_err)
             })
             .await?;
@@ -3610,7 +3613,7 @@ impl KerfMcp {
                 )
                 .map_err(core_err)?;
                 let guard = lock_agent_edit(&project, owner.as_deref())?;
-                require_generation(&guard, generation)?;
+                require_generation(&guard, generation, "the shots were being framed")?;
                 let moved = guard.apply_smart_crops(&crops).map_err(core_err)?;
                 let timeline = guard.working_timeline().map_err(core_err)?;
                 Ok((moved, timeline))
@@ -4223,7 +4226,7 @@ impl KerfMcp {
                         )
                         .map_err(core_err)?;
                         let guard = lock_agent_edit(&project, owner.as_deref())?;
-                        require_generation(&guard, generation)?;
+                        require_generation(&guard, generation, "the shots were being framed")?;
                         wrote.store(guard.apply_framings(&framings).map_err(core_err)?, Ordering::SeqCst);
                     }
                 }
@@ -5315,16 +5318,12 @@ fn core_err(e: kerf_core::Error) -> McpError {
     }
 }
 
-/// The project the call was made on is gone: the user opened or started another while it ran.
-fn require_generation(project: &Project, expected: u64) -> Result<(), McpError> {
-    if project.generation() == expected {
-        return Ok(());
-    }
-    Err(McpError::invalid_params(
-        "the project was replaced (the user opened or started another) while this was running, so its result was dropped; \
-         run it again on the project that is open now",
-        None,
-    ))
+/// The project the call was made on is gone: the user opened or started another while `doing`
+/// ran. The check is the one the GUI's jobs make (`crate::require_generation`); what a model
+/// needs on top of it is what to do next.
+fn require_generation(project: &Project, expected: u64, doing: &str) -> Result<(), McpError> {
+    crate::require_generation(project, expected, doing)
+        .map_err(|why| McpError::invalid_params(format!("{why}. Run it again on the project that is open now"), None))
 }
 
 /// A caller's mistake (a stale id, a bad argument) is a `warn`; anything else
@@ -6983,12 +6982,12 @@ mod tests {
     fn a_project_swapped_mid_job_is_noticed() {
         let mut project = kerf_core::Project::open_in_memory().unwrap();
         let before = project.generation();
-        assert!(super::require_generation(&project, before).is_ok());
+        assert!(super::require_generation(&project, before, "it ran").is_ok());
         project.replace_with(kerf_core::Project::open_in_memory().unwrap());
-        let e = super::require_generation(&project, before).unwrap_err();
+        let e = super::require_generation(&project, before, "it ran").unwrap_err();
         assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert!(
-            e.message.contains("replaced") && e.message.contains("run it again"),
+            e.message.contains("replaced") && e.message.contains("Run it again"),
             "{}",
             e.message
         );

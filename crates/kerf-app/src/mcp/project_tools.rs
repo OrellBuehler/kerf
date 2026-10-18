@@ -602,4 +602,28 @@ mod tests {
         }
         assert_eq!(properties.len(), WRITABLE.len());
     }
+
+    #[test]
+    fn every_writable_setting_is_one_the_settings_file_reads_back() {
+        let p = SetSettingsParams {
+            cpu_percent: Some(60),
+            auto_analysis: Some(AutoAnalysisParams {
+                silence: Some(false),
+                ..AutoAnalysisParams::default()
+            }),
+            proxy_size: Some(1080),
+            preview_source: Some(PreviewSourceParam::Original),
+            time_display: Some(TimeDisplayParam::Seconds),
+        };
+        let patch = settings_patch(&p, defaults()).unwrap();
+        assert_eq!(patch.len(), WRITABLE.len(), "every writable key was exercised");
+        let read: settings::Settings = serde_json::from_value(serde_json::Value::Object(patch)).expect("the file reads it");
+        assert_eq!(read.cpu_percent, 60);
+        assert!(!read.auto_analysis.silence);
+        assert_eq!(read.proxy_size, kerf_core::ProxySize::W1080);
+        assert_eq!(read.preview_source, kerf_core::PreviewSource::Original);
+        assert_eq!(read.time_display, settings::TimeDisplay::Seconds);
+        let seen = readable_settings(&settings::Settings::default());
+        assert!(seen.get("time_display").is_some(), "the display mode is readable: {seen}");
+    }
 }
