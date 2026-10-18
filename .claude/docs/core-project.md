@@ -178,7 +178,8 @@
   attempted. A transcript cached before (no `words`, no `speaker`) still reads as done; readers
   estimate its words on the fly (`transcript::words_of`), and `refine_transcript` adds them without
   re-transcribing: `Project::transcript(asset)` under the lock → static `refine_transcript_media` →
-  `Project::store_transcript` (a merge with `ran = [transcript]`). `speaker_ranges(asset, speaker?,
+  `Project::store_transcript(asset, read, refined)` (a merge with `ran = [transcript]`, refused when the
+  cache no longer holds `read`, so a refinement never overwrites a newer transcript). `speaker_ranges(asset, speaker?,
   join_gap)` (errors naming the known speakers for an unknown one, or when nothing is labelled) and
   `filler_words(asset, fillers)` (default um / uh / … / you know, phrases matched across words of one
   line) read it by word bounds. **What a request runs** is `resolve_steps(asset, requested)`: a file with no audio is

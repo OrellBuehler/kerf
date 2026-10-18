@@ -15,6 +15,10 @@
 //!    their nearest neighbour.
 //! 4. Speakers are numbered in order of first appearance.
 //!
+//! The distance matrix is n² floats, so past [`MAX_CHUNKS`] chunks neighbouring ones are
+//! merged (a long file's turns then resolve more coarsely), and chunks whose vectors all
+//! coincide are one speaker without clustering.
+//!
 //! It works for interviews and dialogue with distinct voices and clean turns; overlapping
 //! speech, very similar voices or a music bed confuse it.
 
@@ -44,6 +48,19 @@ impl Default for Params {
 
 const N_MELS: usize = 40;
 const N_MFCC: usize = 20;
+
+/// The most chunks clustered: a 36 MB distance matrix. Two hours of dialogue in 4 s chunks
+/// stay under it.
+pub const MAX_CHUNKS: usize = 3000;
+
+/// `ch` with runs of neighbouring chunks merged so that at most `max` remain.
+fn cap_chunks(ch: Vec<std::ops::Range<usize>>, max: usize) -> Vec<std::ops::Range<usize>> {
+    if ch.len() <= max {
+        return ch;
+    }
+    let per = ch.len().div_ceil(max.max(1));
+    ch.chunks(per).map(|g| g[0].start..g[g.len() - 1].end).collect()
+}
 
 /// Word index ranges of the chunks; `words` are `(start, end)` seconds in time order.
 pub fn chunks(words: &[(f64, f64)], p: &Params) -> Vec<std::ops::Range<usize>> {
@@ -104,8 +121,9 @@ fn rms_distance(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Average-linkage clusters over a distance matrix, kept current by Lance–Williams updates,
-/// with each live cluster's nearest neighbour cached so a merge rescans only the rows that
-/// pointed at the pair: O(n²) for the usual case where a transcript-hour has a thousand chunks.
+/// with each live cluster's nearest neighbour cached. A merge rescans only the rows that
+/// pointed at the pair and now lie farther from it (a tie keeps its pointer), so typical
+/// input costs about O(n²); the worst case stays O(n³), which [`MAX_CHUNKS`] bounds.
 struct Clusters {
     n: usize,
     d: Vec<f32>,
@@ -171,7 +189,13 @@ impl Clusters {
                 continue;
             }
             if self.nn[k].1 == i || self.nn[k].1 == j {
-                self.rescan(k);
+                // The merged distance averages two that were at least the old minimum: equal
+                // to it, it is still the minimum.
+                if self.d[k * n + i] <= self.nn[k].0 {
+                    self.nn[k] = (self.d[k * n + i], i);
+                } else {
+                    self.rescan(k);
+                }
             } else if self.d[k * n + i] < self.nn[k].0 {
                 self.nn[k] = (self.d[k * n + i], i);
             }
@@ -187,7 +211,7 @@ pub fn diarize(audio: &[f32], words: &[(f64, f64)], p: &Params) -> (Vec<usize>, 
         return (Vec::new(), 0);
     }
     let one = || (vec![0; words.len()], 1);
-    let ch = chunks(words, p);
+    let ch = cap_chunks(chunks(words, p), MAX_CHUNKS);
     if ch.len() < 2 {
         return one();
     }
@@ -228,6 +252,9 @@ pub fn diarize(audio: &[f32], words: &[(f64, f64)], p: &Params) -> (Vec<usize>, 
             v[k - 1] = (v[k - 1] - mean) / sd;
             v[N_MFCC - 1 + k - 1] /= sd;
         }
+    }
+    if vecs.iter().all(|v| rms_distance(v, &vecs[0]) < 1e-6) {
+        return one();
     }
     let n = vecs.len();
     let mut dist = vec![0f32; n * n];
@@ -350,6 +377,33 @@ mod tests {
         let (labels, n) = diarize(&audio, &words, &Params::default());
         assert_eq!(n, 1);
         assert!(labels.iter().all(|l| *l == 0));
+    }
+
+    #[test]
+    fn identical_voices_are_one_speaker_without_clustering() {
+        let audio = vec![0f32; 16_000 * 60];
+        let words: Vec<(f64, f64)> = (0..60).map(|i| (i as f64, i as f64 + 0.7)).collect();
+        let (labels, n) = diarize(&audio, &words, &Params::default());
+        assert_eq!(n, 1);
+        assert!(labels.iter().all(|l| *l == 0));
+    }
+
+    #[test]
+    fn tied_distances_merge_without_rescanning_every_row() {
+        let n = 2000;
+        let mut c = Clusters::new(vec![0f32; n * n], n);
+        while c.count() > 1 {
+            let (_, i, j) = c.closest().unwrap();
+            c.merge(i, j);
+        }
+        assert_eq!(c.members.iter().map(Vec::len).max(), Some(n));
+    }
+
+    #[test]
+    fn too_many_chunks_merge_neighbours() {
+        let ch: Vec<std::ops::Range<usize>> = (0..10).map(|i| i..i + 1).collect();
+        assert_eq!(cap_chunks(ch.clone(), 20), ch);
+        assert_eq!(cap_chunks(ch, 4), vec![0..3, 3..6, 6..9, 9..10]);
     }
 
     #[test]

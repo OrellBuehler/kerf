@@ -32,12 +32,11 @@
 
 	async function labelSpeakers() {
 		const id = editor.selectedAssetId;
-		if (!id) return;
+		if (!id || ui.analyzing) return;
 		refining = true;
 		try {
-			const analysis = await editor.refineTranscript(id);
-			const n = speakersOf(analysis.transcript).length;
-			toast(n > 1 ? `${n} speakers labelled` : 'One speaker found');
+			const n = await ui.refineTranscript(id);
+			if (n !== null) toast(n > 1 ? `${n} speakers labelled` : 'One speaker found');
 		} catch (e) {
 			toast.error(e instanceof Error ? e.message : String(e));
 		} finally {
@@ -167,7 +166,7 @@
 					{/each}
 				</select>
 			{:else if speakers.length === 0}
-				<Btn size="sm" onclick={() => void labelSpeakers()} disabled={refining}
+				<Btn size="sm" onclick={() => void labelSpeakers()} disabled={ui.analyzing}
 					>{refining ? 'Labelling speakers…' : 'Label speakers'}</Btn
 				>
 			{/if}

@@ -29,7 +29,7 @@ use rmcp::transport::streamable_http_server::{
 };
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
 /// Default localhost bind address for the MCP endpoint; override with `KERF_MCP_ADDR`.
@@ -1203,12 +1203,23 @@ struct GetTranscriptParams {
     #[schemars(description = "UUID of the asset whose transcript to read")]
     asset_id: String,
     #[schemars(
-        description = "Include each line's words with their own source times (default true). Pass false to read the lines alone and save tokens."
+        description = "Include each line's words with their own source times (default false: the lines alone, far fewer tokens). Ask for them over a from/to window."
     )]
     words: Option<bool>,
     #[schemars(description = "Only the lines of this speaker (e.g. \"S2\"), when speakers were labelled")]
     speaker: Option<String>,
+    #[schemars(description = "Only lines that end after this SOURCE time (seconds)")]
+    from: Option<f64>,
+    #[schemars(description = "Only lines that start before this SOURCE time (seconds)")]
+    to: Option<f64>,
+    #[schemars(
+        description = "At most this many lines (default 200, at most 2000); when more match, `next_from` is where to continue"
+    )]
+    limit: Option<usize>,
 }
+
+/// Lines `get_transcript` returns when no limit is given, and at most.
+const TRANSCRIPT_LINES: (usize, usize) = (200, 2000);
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SpeakerRangesParams {
@@ -1237,6 +1248,62 @@ struct TranscriptReply {
     /// The speaker labels in the transcript, in order of first appearance.
     speakers: Vec<String>,
     segments: Vec<kerf_core::TranscriptSegment>,
+    /// More lines matched than `limit`: pass this as `from` for the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_from: Option<f64>,
+}
+
+/// An analysis without its transcript's words — the bulk of a transcript, which
+/// get_transcript serves a window at a time.
+fn without_words(mut a: kerf_core::AssetAnalysis) -> kerf_core::AssetAnalysis {
+    a.transcript = kerf_core::transcript::without_words(&a.transcript);
+    a
+}
+
+/// `get_transcript`'s reply: the lines that match the speaker and the window, up to the limit.
+fn transcript_reply(
+    asset_id: String,
+    transcript: &[kerf_core::TranscriptSegment],
+    p: &GetTranscriptParams,
+) -> Result<TranscriptReply, McpError> {
+    let bad = |what: &str| McpError::invalid_params(what.to_string(), None);
+    let from = p.from.unwrap_or(f64::NEG_INFINITY);
+    let to = p.to.unwrap_or(f64::INFINITY);
+    if p.from.is_some_and(|f| !f.is_finite()) || p.to.is_some_and(|t| !t.is_finite()) {
+        return Err(bad("from / to must be finite seconds"));
+    }
+    if to <= from {
+        return Err(bad("to must be after from"));
+    }
+    let limit = p.limit.unwrap_or(TRANSCRIPT_LINES.0).clamp(1, TRANSCRIPT_LINES.1);
+    let mut speakers: Vec<String> = Vec::new();
+    for sp in transcript.iter().filter_map(|s| s.speaker.as_ref()) {
+        if !speakers.contains(sp) {
+            speakers.push(sp.clone());
+        }
+    }
+    let want = p.speaker.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let mut matching = transcript.iter().filter(|s| {
+        s.end > from && s.start < to && want.is_none_or(|w| s.speaker.as_deref().is_some_and(|sp| sp.eq_ignore_ascii_case(w)))
+    });
+    let segments = matching
+        .by_ref()
+        .take(limit)
+        .map(|s| kerf_core::TranscriptSegment {
+            words: if p.words.unwrap_or(false) {
+                kerf_core::transcript::words_of(s).into_owned()
+            } else {
+                Vec::new()
+            },
+            ..s.clone()
+        })
+        .collect();
+    Ok(TranscriptReply {
+        asset_id,
+        speakers,
+        segments,
+        next_from: matching.next().map(|s| s.start),
+    })
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1820,11 +1887,7 @@ impl KerfMcp {
                 analysis_status: kerf_core::analysis_status(id, analysis.as_ref()),
                 proxy: kerf_core::proxy::status(&input),
                 asset: input.asset,
-                // Words are the bulk of a transcript; get_transcript serves them.
-                analysis: analysis.map(|mut a| {
-                    a.transcript = kerf_core::transcript::without_words(&a.transcript);
-                    a
-                }),
+                analysis: analysis.map(without_words),
             })
         })
         .await?;
@@ -1948,7 +2011,8 @@ impl KerfMcp {
                        stop the others (see `failed` and `analysis_status` in the result). Transcribing downloads a \
                        speech model on first use (~148 MB) and then runs for a good fraction of the media's duration, so \
                        expect that step to be slow; see transcription_status if the transcript comes back empty. A \
-                       preview proxy that is queued is built first."
+                       preview proxy that is queued is built first. The transcript comes back as lines without their \
+                       words; read the words with get_transcript."
     )]
     async fn analyze_asset(&self, Parameters(p): Parameters<AnalyzeParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
@@ -1968,7 +2032,7 @@ impl KerfMcp {
         .await?;
         self.changed();
         json(&AnalyzeResult {
-            analysis: outcome.analysis,
+            analysis: without_words(outcome.analysis),
             analysis_status: outcome.status,
             failed: outcome
                 .failed
@@ -3346,39 +3410,19 @@ impl KerfMcp {
 
     #[tool(
         description = "Read an asset's cached transcript (run analyze_asset with the transcript step first): each line \
-                       with its source-time start/end, its `speaker` (S1, S2, … when speakers were labelled) and, unless \
-                       words=false, its `words` — each with its own source start/end, a `confidence` when the \
-                       recognizer gave one, and `estimated: true` when its times were spread over the line by \
-                       character share and tightened to the speech energy rather than reported. Pass a word's start/end \
-                       to cut_clip_range to cut one word. `speaker` keeps that speaker's lines only."
+                       with its source-time start/end and its `speaker` (S1, S2, … when speakers were labelled — a \
+                       line's label is the speaker of most of its words). `speaker` keeps that speaker's lines only; \
+                       from/to keep the lines overlapping that SOURCE-time window; at most `limit` lines come back \
+                       (default 200), and `next_from` says where the next page starts. words=true adds each line's \
+                       `words` — each with its own source start/end, its speaker, a `confidence` when the recognizer \
+                       gave one, and `estimated: true` when its times were spread over the line by character share \
+                       and tightened to the speech energy rather than reported; they are most of the reply, so ask \
+                       for them over a window. Pass a word's start/end to cut_clip_range to cut one word."
     )]
     fn get_transcript(&self, Parameters(p): Parameters<GetTranscriptParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
         let transcript = self.lock().transcript(id).map_err(core_err)?;
-        let mut speakers: Vec<String> = Vec::new();
-        for sp in transcript.iter().filter_map(|s| s.speaker.as_ref()) {
-            if !speakers.contains(sp) {
-                speakers.push(sp.clone());
-            }
-        }
-        let want = p.speaker.as_deref().map(str::trim).filter(|s| !s.is_empty());
-        let segments = transcript
-            .iter()
-            .filter(|s| want.is_none_or(|w| s.speaker.as_deref().is_some_and(|sp| sp.eq_ignore_ascii_case(w))))
-            .map(|s| kerf_core::TranscriptSegment {
-                words: if p.words.unwrap_or(true) {
-                    kerf_core::transcript::words_of(s).into_owned()
-                } else {
-                    Vec::new()
-                },
-                ..s.clone()
-            })
-            .collect();
-        json(&TranscriptReply {
-            asset_id: id.to_string(),
-            speakers,
-            segments,
-        })
+        json(&transcript_reply(id.to_string(), &transcript, &p)?)
     }
 
     #[tool(
@@ -3386,9 +3430,10 @@ impl KerfMcp {
                        in order of first appearance) the SOURCE-time ranges of their words, joined across pauses \
                        shorter than join_gap, and their total speaking time. Use it to cut to one speaker (keep or \
                        remove their ranges with cut_clip_range / add_clip, which take source times) or to find who \
-                       talks most. Labels come from clustering voices without a model: distinct voices in clean turns \
-                       separate well; overlapping speech or similar voices may not. Errors if the transcript has no \
-                       speaker labels (refine_transcript adds them)."
+                       talks most. Ranges go by each word's own label, so a line get_transcript labels S1 (most of \
+                       its words) can still lend a word to S2's ranges. Labels come from clustering voices without a \
+                       model: distinct voices in clean turns separate well; overlapping speech or similar voices may \
+                       not. Errors if the transcript has no speaker labels (refine_transcript adds them)."
     )]
     fn speaker_ranges(&self, Parameters(p): Parameters<SpeakerRangesParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
@@ -3417,36 +3462,32 @@ impl KerfMcp {
 
     #[tool(
         description = "Re-time the words of an asset's cached transcript to the speech energy and label its speakers \
-                       (S1, S2, …), without re-transcribing — for a transcript made before Kerf did this. A \
-                       transcription already does it. No model is involved; it decodes the asset's audio once and \
-                       waits its turn behind exports and proxies. Returns how many lines, words and speakers the \
-                       transcript has now."
+                       (S1, S2, …), without re-transcribing — for a transcript made before Kerf did this; a \
+                       transcription already does it. No model is involved: it decodes the asset's audio once, as \
+                       background work that waits behind exports and preview proxies, and the user can stop it like \
+                       an analysis. Refused if a newer transcript landed while it ran. Returns how many lines, words \
+                       and speakers the transcript has now."
     )]
     async fn refine_transcript(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_id(&p.asset_id)?;
-        let project = self.project.clone();
+        let (project, app) = (self.project.clone(), self.app.clone());
         let summary = blocking(move || {
-            let (asset, transcript) = {
-                let project = lock_agent(&project);
-                (
-                    project.require_asset(id).map_err(core_err)?,
-                    project.transcript(id).map_err(core_err)?,
-                )
-            };
-            let refined = kerf_core::refine_transcript_media(&asset, transcript, &mut |_| {}, &|| false).map_err(core_err)?;
-            let mut speakers: Vec<&str> = refined.iter().filter_map(|s| s.speaker.as_deref()).collect();
+            let cancel = app.state::<crate::AppState>().analysis_cancel.clone();
+            cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+            let stored = crate::run_refine(&app, &|| lock_agent(&project), id, &|| {
+                cancel.load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .map_err(|e| McpError::internal_error(e, None))?;
+            let mut speakers: Vec<&str> = stored.transcript.iter().filter_map(|s| s.speaker.as_deref()).collect();
             speakers.sort_unstable();
             speakers.dedup();
-            let summary = serde_json::json!({
-                "segments": refined.len(),
-                "words": refined.iter().map(|s| s.words.len()).sum::<usize>(),
+            Ok(serde_json::json!({
+                "segments": stored.transcript.len(),
+                "words": stored.transcript.iter().map(|s| s.words.len()).sum::<usize>(),
                 "speakers": speakers,
-            });
-            lock_agent(&project).store_transcript(id, refined).map_err(core_err)?;
-            Ok(summary)
+            }))
         })
         .await?;
-        self.changed();
         json(&summary)
     }
 
@@ -5184,6 +5225,65 @@ mod tests {
                 .unwrap_or_default();
             assert_eq!(required, ["asset_id"], "{name}");
         }
+    }
+
+    fn timed_lines() -> Vec<kerf_core::TranscriptSegment> {
+        (0..5)
+            .map(|i| kerf_core::TranscriptSegment {
+                start: i as f64 * 2.0,
+                end: i as f64 * 2.0 + 1.5,
+                text: "one two".into(),
+                speaker: Some(if i % 2 == 0 { "S1" } else { "S2" }.into()),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn transcript_params(extra: serde_json::Value) -> super::GetTranscriptParams {
+        let mut p = serde_json::json!({ "asset_id": "a" });
+        p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(p).unwrap()
+    }
+
+    /// Words only when asked for; a window and a speaker narrow the lines, and a limit pages
+    /// them with `next_from`.
+    #[test]
+    fn get_transcript_windows_pages_and_filters_its_lines() {
+        let lines = timed_lines();
+        let all = super::transcript_reply("a".into(), &lines, &transcript_params(serde_json::json!({}))).unwrap();
+        assert_eq!(all.segments.len(), 5);
+        assert!(all.segments.iter().all(|s| s.words.is_empty()));
+        assert_eq!(all.speakers, ["S1", "S2"]);
+        assert_eq!(all.next_from, None);
+
+        let p = transcript_params(serde_json::json!({ "from": 3.0, "to": 6.5, "words": true }));
+        let window = super::transcript_reply("a".into(), &lines, &p).unwrap();
+        assert_eq!(window.segments.iter().map(|s| s.start).collect::<Vec<_>>(), [2.0, 4.0, 6.0]);
+        assert!(window.segments.iter().all(|s| s.words.len() == 2));
+
+        let p = transcript_params(serde_json::json!({ "speaker": "s1", "limit": 2 }));
+        let page = super::transcript_reply("a".into(), &lines, &p).unwrap();
+        assert_eq!(page.segments.iter().map(|s| s.start).collect::<Vec<_>>(), [0.0, 4.0]);
+        assert_eq!(page.next_from, Some(8.0));
+
+        for bad in [
+            serde_json::json!({ "from": 5.0, "to": 5.0 }),
+            serde_json::json!({ "from": -1.0, "to": -2.0 }),
+        ] {
+            assert!(super::transcript_reply("a".into(), &lines, &transcript_params(bad)).is_err());
+        }
+    }
+
+    #[test]
+    fn an_agent_reads_an_analysis_without_its_words() {
+        let mut lines = timed_lines();
+        kerf_core::transcript::ensure_words(&mut lines);
+        let analysis = super::without_words(kerf_core::AssetAnalysis {
+            transcript: lines,
+            ..Default::default()
+        });
+        assert_eq!(analysis.transcript.len(), 5);
+        assert!(analysis.transcript.iter().all(|s| s.words.is_empty() && s.speaker.is_some()));
     }
 
     /// `analyze_asset` runs only the steps it is asked for, and an agent that names none gets

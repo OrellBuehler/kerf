@@ -5185,9 +5185,21 @@ impl Project {
     }
 
     /// Store a re-timed / speaker-labelled transcript ([`crate::refine_transcript_media`])
-    /// for an asset, replacing the cached one and leaving every other kind as it was.
-    pub fn store_transcript(&self, asset_id: Uuid, transcript: Vec<TranscriptSegment>) -> Result<AssetAnalysis> {
-        self.require_asset(asset_id)?;
+    /// for an asset, replacing the cached one and leaving every other kind as it was. `read`
+    /// is the transcript the refinement started from: when the cache no longer holds it (a
+    /// transcription finished meanwhile) nothing is stored, so a newer transcript is not
+    /// overwritten by a refinement of the older one.
+    pub fn store_transcript(
+        &self,
+        asset_id: Uuid,
+        read: &[TranscriptSegment],
+        transcript: Vec<TranscriptSegment>,
+    ) -> Result<AssetAnalysis> {
+        if self.transcript(asset_id)? != read {
+            return Err(Error::InvalidArgument(
+                "the transcript changed while it was being refined; refine it again".to_string(),
+            ));
+        }
         self.merge_analysis(&AssetAnalysis {
             asset_id,
             transcript,
@@ -6046,15 +6058,29 @@ mod tests {
             words,
             speaker: Some(sp.into()),
         };
+        let plain = vec![TranscriptSegment {
+            start: 0.0,
+            end: 2.4,
+            text: "Um, hello hi".into(),
+            ..TranscriptSegment::default()
+        }];
         project
-            .store_transcript(
-                asset.id,
-                vec![
-                    line(vec![word("Um,", 0.0, 0.3, "S1"), word("hello", 0.4, 0.9, "S1")], "S1"),
-                    line(vec![word("hi", 2.0, 2.4, "S2")], "S2"),
-                ],
-            )
+            .merge_analysis(&AssetAnalysis {
+                asset_id: asset.id,
+                transcript: plain.clone(),
+                ran: vec![crate::model::AnalysisKind::Transcript],
+                ..AssetAnalysis::default()
+            })
             .unwrap();
+        let refined = vec![
+            line(vec![word("Um,", 0.0, 0.3, "S1"), word("hello", 0.4, 0.9, "S1")], "S1"),
+            line(vec![word("hi", 2.0, 2.4, "S2")], "S2"),
+        ];
+        project.store_transcript(asset.id, &plain, refined.clone()).unwrap();
+        // A refinement of a transcript that has since been replaced is refused.
+        let stale = project.store_transcript(asset.id, &plain, plain.clone()).unwrap_err();
+        assert!(stale.to_string().contains("changed"), "{stale}");
+        assert_eq!(project.transcript(asset.id).unwrap(), refined);
         let s2 = project.speaker_ranges(asset.id, Some("S2"), 0.5).unwrap();
         assert_eq!(s2.len(), 1);
         assert_eq!((s2[0].ranges[0].start, s2[0].ranges[0].end), (2.0, 2.4));

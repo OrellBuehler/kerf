@@ -560,6 +560,48 @@ pub(crate) fn run_analysis<'a>(
     })
 }
 
+/// Re-time an asset's cached transcript to the speech energy and label its speakers, without
+/// re-transcribing — the Tauri command's and the MCP tool's shared body. The transcript is read
+/// under the lock; the decode and clustering run with it released, in the background lane,
+/// streaming `analysis-progress` and giving up on `cancel`; the result is stored under the
+/// lock again, unless a newer transcript landed meanwhile. Only analysis moved, so it says so
+/// with `analysis-status`, not `project-changed`.
+pub(crate) fn run_refine<'a>(
+    app: &AppHandle,
+    lock: &dyn Fn() -> std::sync::MutexGuard<'a, Project>,
+    asset_id: Uuid,
+    cancel: &dyn Fn() -> bool,
+) -> CmdResult<AssetAnalysis> {
+    let (asset, read) = {
+        let project = lock();
+        (
+            project.require_asset(asset_id).map_err(|e| e.to_string())?,
+            project.transcript(asset_id).map_err(|e| e.to_string())?,
+        )
+    };
+    let id_text = asset_id.to_string();
+    let emit = |p: kerf_core::AnalysisProgress| {
+        let _ = app.emit(
+            "analysis-progress",
+            AnalysisProgressEvent {
+                asset_id: id_text.clone(),
+                stage: p.stage,
+                fraction: p.fraction,
+                detail: p.detail,
+            },
+        );
+    };
+    let refined = kerf_core::refine_transcript_media(&asset, read.clone(), &mut |p| emit(p), cancel);
+    emit(kerf_core::AnalysisProgress::stage("done"));
+    let refined = refined.map_err(|e| match e {
+        kerf_core::Error::Cancelled => ANALYSIS_CANCELLED.to_string(),
+        e => e.to_string(),
+    })?;
+    let stored = lock().store_transcript(asset_id, &read, refined).map_err(|e| e.to_string())?;
+    let _ = app.emit("analysis-status", kerf_core::analysis_status(asset_id, Some(&stored)));
+    Ok(stored)
+}
+
 /// Parse the `steps` an adapter was handed (`None` = the default set).
 pub(crate) fn parse_steps(steps: Option<Vec<String>>) -> CmdResult<Option<Vec<kerf_core::AnalysisKind>>> {
     steps
@@ -1875,25 +1917,14 @@ async fn export_srt(state: State<'_, AppState>, asset_id: String, output_path: S
 }
 
 /// Re-time an asset's cached transcript to the speech energy and label its speakers, without
-/// re-transcribing. The transcript is read under the lock, the decode and clustering run with it
-/// released, and the result is stored under it again.
+/// re-transcribing ([`run_refine`]). Stopped by `cancel_analysis`, like an analysis pass.
 #[tauri::command]
-async fn refine_transcript(state: State<'_, AppState>, asset_id: String) -> CmdResult<AssetAnalysis> {
+async fn refine_transcript(app: AppHandle, state: State<'_, AppState>, asset_id: String) -> CmdResult<AssetAnalysis> {
     let id = id(&asset_id)?;
     let shared = state.project.clone();
-    blocking(move || {
-        let (asset, transcript) = {
-            let project = lock_user(&shared);
-            (
-                project.require_asset(id).map_err(|e| e.to_string())?,
-                project.transcript(id).map_err(|e| e.to_string())?,
-            )
-        };
-        let refined =
-            kerf_core::refine_transcript_media(&asset, transcript, &mut |_| {}, &|| false).map_err(|e| e.to_string())?;
-        lock_user(&shared).store_transcript(id, refined).map_err(|e| e.to_string())
-    })
-    .await
+    let cancel = state.analysis_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+    blocking(move || run_refine(&app, &|| lock_user(&shared), id, &|| cancel.load(Ordering::SeqCst))).await
 }
 
 #[tauri::command(async)]

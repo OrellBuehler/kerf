@@ -31,24 +31,32 @@ export function srcToTimeline(c: Clip, src: number): number {
 	return c.timeline_start + Math.max(0, off) / mag;
 }
 
-/** Each segment resolved (by its midpoint) to the clip showing it — null once
- *  cut out. */
+/** Each segment resolved to the clip showing the most of what cutting it removes (its
+ *  words, else the whole line) — null once that is cut out, so a line whose words are gone
+ *  but whose pauses remain reads as cut. */
 export function transcriptLines(segments: TranscriptSegment[], assetId: string | null, tracks: Track[]): TxLine[] {
 	return segments.map((seg) => {
-		const mid = (seg.start + seg.end) / 2;
-		let clip: Clip | null = null;
-		outer: for (const tr of tracks) {
-			for (const c of tr.clips) {
-				if (c.asset_id === assetId && mid > c.source_in && mid < c.source_out) {
-					clip = c;
-					break outer;
-				}
-			}
-		}
 		const words = seg.words ?? [];
 		const cut = words.length
 			? { start: words[0].start, end: Math.max(words[words.length - 1].end, words[0].start) }
 			: { start: seg.start, end: seg.end };
+		let clip: Clip | null = null;
+		let best = 0;
+		for (const tr of tracks) {
+			for (const c of tr.clips) {
+				if (c.asset_id !== assetId) continue;
+				const overlap =
+					cut.end > cut.start
+						? Math.min(cut.end, c.source_out) - Math.max(cut.start, c.source_in)
+						: cut.start > c.source_in && cut.start < c.source_out
+							? Number.MIN_VALUE
+							: 0;
+				if (overlap > best) {
+					best = overlap;
+					clip = c;
+				}
+			}
+		}
 		return {
 			t: fmtClock(seg.start),
 			s: seg.text,

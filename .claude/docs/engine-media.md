@@ -187,11 +187,16 @@ frames above −100 dBFS) to the speech level (p95), ≥ 6 dB over the floor, a 
 mean + std of MFCC 1–19 (40 Slaney mel bands, Whisper's 25 ms / 10 ms framing, `realfft`, computed
 frame by frame so an hour never holds its spectrogram) over each chunk's voiced frames, scales them by
 the file's spread, and clusters with average linkage (Lance–Williams updates + cached nearest
-neighbours, ~O(n²) rather than the reference's cubic loop) until the closest pair is > 0.4 apart and
-≤ 6 remain; clusters under 5 % of the voiced frames fold into their neighbour. A segment's speaker is
-the one with most of its word-time. The refinement waits for the heavy-job slot and holds it
-(`refine_transcript_media`, static); a failed decode keeps the transcript with estimated words and no
-speakers (the transcription was the expensive part), a cancel cancels the step.
+neighbours; a row whose neighbour merged rescans only when the merged distance grew, so ties cost
+nothing: about O(n²) time on real input, O(n³) worst case, n² memory) until the closest pair is > 0.4
+apart and ≤ 6 remain; clusters under 5 % of the voiced frames fold into their neighbour. n is capped at
+`MAX_CHUNKS` (3000, a 36 MB matrix) by merging neighbouring chunks, and chunks whose vectors all coincide
+are one speaker without clustering. A segment's speaker is the one with most of its word-time
+(`speaker_ranges` goes by each word's own label). The refinement runs in the background lane, waits
+for the heavy-job slot and holds it (`refine_transcript_media`, static); the in-process backend refines
+from the samples it already decoded (`Transcriber::refines`). A refinement that does not finish — a
+failed decode, a cancel, a stop while queued — keeps the transcript with estimated words and no
+speakers: a finished transcription is never thrown away.
 
 **Voiceover works in every build too** (`engine/tts.rs`, always compiled, no cargo
 feature): Kokoro-82M text-to-speech, **in-process on ONNX Runtime**. Nothing of it

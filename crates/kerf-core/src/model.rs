@@ -614,7 +614,7 @@ pub struct TimeRange {
 }
 
 /// A transcript line with timecodes (seconds).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TranscriptSegment {
     pub start: f64,
     pub end: f64,

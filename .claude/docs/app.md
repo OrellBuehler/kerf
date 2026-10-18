@@ -67,8 +67,9 @@ the webview, decides what an SVG may do; `check_params` refuses empty text first
 `generate_captions` / `clear_captions` (caption the whole cut, in timeline
 time), `import_captions` / `import_captions_text` (a subtitle file by path / by text —
 the text variant is what an `<input type=file>` or a paste uses; both return
-`{timeline, summary}` rather than a bare `Timeline`), `export_srt`, `refine_transcript` (re-time words + label speakers on the cached transcript, lock
-released for the decode; returns the analysis), `remove_silence`, `snap_to_beats`,
+`{timeline, summary}` rather than a bare `Timeline`), `export_srt`, `refine_transcript` (re-time words + label speakers on the cached transcript via `run_refine`, shared
+with MCP: lock released, background lane, `analysis-progress`, stopped by `cancel_analysis`; returns the
+analysis), `remove_silence`, `snap_to_beats`,
 `smart_crop` (frame each shot for the delivery frame),
 `extract_audio` (detaches an asset's cut clips and reports what it skipped, see Linked A/V) / `add_asset_audio`
 (an asset's whole audio as a clip) / `detach_audio_clips`,

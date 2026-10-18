@@ -38,6 +38,25 @@ describe('transcriptLines', () => {
 		expect(lines[0].t).toBe('00:11');
 	});
 
+	test('a line resolves by the range its cut removes, not its midpoint', () => {
+		const line = {
+			start: 10,
+			end: 20,
+			text: 'a b',
+			words: [
+				{ text: 'a', start: 10.5, end: 11 },
+				{ text: 'b', start: 11, end: 12 }
+			]
+		};
+		// The words were cut; only the pause after them, which holds the midpoint, is left.
+		const pause = clip({ id: 'c2', source_in: 12, source_out: 20 });
+		expect(transcriptLines([line], 'a1', tracks(pause))[0].clip).toBeNull();
+		// The words straddle two clips: the one showing more of them wins.
+		const left = clip({ id: 'l', source_in: 0, source_out: 10.8 });
+		const right = clip({ id: 'r', source_in: 10.8, source_out: 20 });
+		expect(transcriptLines([line], 'a1', tracks(left, right))[0].clip).toBe(right);
+	});
+
 	test('ignores clips of other assets', () => {
 		const lines = transcriptLines([seg(11, 13)], 'other', tracks(clip({})));
 		expect(lines[0].clip).toBeNull();
