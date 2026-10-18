@@ -244,6 +244,9 @@ mod tests {
                 time: f64::NAN,
                 name: "m".into(),
                 color: None,
+                duration: 0.0,
+                comment: String::new(),
+                kind: Default::default(),
             });
         });
     }
