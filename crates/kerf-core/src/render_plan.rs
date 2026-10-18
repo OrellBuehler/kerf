@@ -31,7 +31,7 @@ use crate::error::Result;
 use crate::frame_pick::Pick;
 use crate::layer_geometry::{Keyed, LayerGeometry, Placement};
 use crate::model::{
-    pix_fmt_is_high_bit, pix_fmt_layout, pix_fmt_subsampling, Asset, Clip, Color, Hdr, Mask, PixLayout, Projection,
+    pix_fmt_is_high_bit, pix_fmt_layout, pix_fmt_subsampling, Asset, Clip, Color, Grade, Hdr, Mask, PixLayout, Projection,
     ResolvedReframe, StreamInfo, StreamKind, Subsampling, Timeline, Transform, VideoEffect,
 };
 use crate::plan_caps::{DipWhy, EffectKinds, GpuCaps, LayerRef, Unsupported};
@@ -579,6 +579,9 @@ pub struct PlanLayer {
     /// The transform **sampled** at this instant.
     pub transform: Transform,
     pub color: Color,
+    /// The clip's curves, wheels and LUT. No compositor draws them yet: a layer with any of them
+    /// is refused ([`Unsupported::Grade`]).
+    pub grade: Grade,
     /// The asset's name, for messages.
     pub name: String,
     /// The asset's spherical projection, if it is 360 footage.
@@ -676,6 +679,19 @@ pub(crate) fn composite_matrix(layers: &[PlanLayer], policy: CompositeColorPolic
         unsupported.push(Unsupported::RgbInStack(matrix));
     }
     (matrix, unsupported)
+}
+
+/// What of a clip's [`Grade`] a compositor would have to draw, or `None` for an identity grade.
+fn grade_refusal(grade: &Grade) -> Option<&'static str> {
+    if grade.lut().is_some() {
+        Some("a 3D LUT")
+    } else if grade.curves().is_some() {
+        Some("curves")
+    } else if grade.wheels().is_some() {
+        Some("colour wheels")
+    } else {
+        None
+    }
 }
 
 /// Why a compositor with `caps` does not draw `effect`: it is not one it draws (the detail says
@@ -990,6 +1006,11 @@ impl RenderPlan {
                     None => "a picture whose pixel format was never recorded (it may be full range)".to_string(),
                 };
                 out.push(Unsupported::GradedFullRange(at(), detail));
+            }
+            // Curves (`lutrgb`), wheels (`colorbalance`) and a LUT (`lut3d`) run in RGB, through a round
+            // trip FFmpeg negotiates; no compositor pass or parity case draws them.
+            if let Some(what) = grade_refusal(&layer.grade) {
+                out.push(Unsupported::Grade(at(), what));
             }
             if let Some(what) = layer
                 .effects

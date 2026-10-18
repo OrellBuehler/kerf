@@ -110,6 +110,7 @@ pub(super) const TOOLS: &[(&str, &str, Effect)] = &[
     ("set_speed", "Clip speed", Set),
     ("set_transform", "Clip transform", Set),
     ("set_color", "Clip colour", Set),
+    ("set_grade", "Clip grade", Set),
     ("set_transition", "Set transition", Set),
     ("set_video_effects", "Video effects", Set),
     ("set_audio_effects", "Audio effects", Set),

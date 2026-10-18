@@ -116,6 +116,10 @@ pub struct ClipFx {
     /// FFmpeg 9 would otherwise read it as BT.601 and convert it into its neighbour's matrix.
     /// Decided over the clips of the graph this table is for ([`graph_bt709_labels`]).
     pub label_bt709: bool,
+    /// The YCbCr matrix the clip's frames are tagged with when they reach its grade (the
+    /// `setparams` name), which the grade's RGB filters must give back: FFmpeg 6.1 converts out of
+    /// RGB as BT.601 and drops the tag. `None` for an untagged or RGB picture.
+    pub frame_matrix: Option<&'static str>,
 }
 
 /// Which clips of `timeline` the graph built from it labels BT.709, indexed like [`transition_fx`]
@@ -154,6 +158,8 @@ pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
         fx[flat].hdr = asset.and_then(|a| a.hdr());
         fx[flat].alpha = asset.is_some_and(|a| a.has_alpha());
         fx[flat].head_pad = asset.is_some_and(|a| is_head_padded_proxy(&a.path));
+        let stream = asset.and_then(|a| a.streams.iter().find(|s| s.kind == StreamKind::Video));
+        fx[flat].frame_matrix = crate::model::frame_matrix(stream, fx[flat].hdr.is_some());
     }
     for (fx, label) in fx.iter_mut().zip(graph_bt709_labels(timeline, assets)) {
         fx.label_bt709 = label;
@@ -766,6 +772,7 @@ mod tests {
         // Nothing else of a clip's fx moves with it.
         assert!(transition_fx(&tl, &assets).iter().all(|f| ClipFx {
             label_bt709: false,
+            frame_matrix: None,
             ..*f
         } == ClipFx::default()));
 

@@ -256,6 +256,53 @@ export interface Color {
 	temperature: number;
 }
 
+/** A point of a tone curve: input to output, both 0..1. */
+export interface CurvePoint {
+	x: number;
+	y: number;
+}
+
+/** Tone curves; an absent or empty list is the identity. A channel's curve runs first, the master on its result. */
+export interface Curves {
+	master?: CurvePoint[];
+	red?: CurvePoint[];
+	green?: CurvePoint[];
+	blue?: CurvePoint[];
+}
+
+/** One colour wheel (`colorbalance` for its range): a puck in the unit disc and a lightness −1..1. */
+export interface Wheel {
+	x: number;
+	y: number;
+	lightness: number;
+}
+
+export interface Wheels {
+	shadows: Wheel;
+	midtones: Wheel;
+	highlights: Wheel;
+}
+
+/** A `.cube` 3D LUT a clip is looked up through, and how much of it (0..1). */
+export interface ClipLut {
+	path: string;
+	intensity: number;
+}
+
+/** Curves, wheels and a LUT, applied after `color` (LUT, curves, wheels). Each absent when unused. */
+export interface Grade {
+	curves?: Curves | null;
+	wheels?: Wheels | null;
+	lut?: ClipLut | null;
+}
+
+/** What a `.cube` file holds. */
+export interface LutInfo {
+	path: string;
+	size: number;
+	title?: string;
+}
+
 export type MaskShape = 'rect' | 'ellipse';
 
 /** A shape cut out of a clip: inside it the clip is kept, outside it goes
@@ -614,6 +661,8 @@ export interface Clip {
 	speed?: number;
 	transform?: Transform;
 	color?: Color;
+	/** Curves, colour wheels and a LUT; absent when unused (the backend omits it). */
+	grade?: Grade;
 	transition_in?: Transition | null;
 	/** A shape cut out of this clip; absent is the whole frame. */
 	mask?: Mask | null;

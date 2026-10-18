@@ -394,7 +394,13 @@ disclosures, so they are keyboard-operable for free — each with a one-line
 **summary** on the right (`1.00×`, `Cropped`, `2 keyframes`) so a collapsed
 section still says what it holds; Timing, Volume and Titles open by default,
 everything else is folded. It edits the selected clip —
-trim, volume, fades, speed, transform, color, **transition** (a grouped picker
+trim, volume, fades, speed, transform, color, **curves / color wheels / LUT** (`GradeSections.svelte`: a canvas
+curve editor per channel — click adds a point, drag moves it, double-click or right-click removes it, one `set_grade` on
+release, Escape abandons via `beginDrag`; a click that only adds a point or puts a wheel's puck down waits 300 ms for
+a double-click, which undoes it, and a gesture that changes nothing writes nothing; three hue discs painted from `grade.ts`'s `wheelHue` with a lightness
+`SliderRow` each; a `.cube` picker, a Clear button and an intensity slider, with `inspect_lut` saying the size or why the
+file is not applied. Curves are drawn with `grade.ts`, the TS mirror of the engine's cubic; the preview shows the
+grade through FFmpeg because the GPU preview refuses a graded clip), **transition** (a grouped picker
 over `src/lib/transitions.ts` — fade / slide / push, then a direction, because
 that is the order the choice is actually made and a flat list of eleven names
 hides it; its bun test pins the ids against `TransitionKind::ALL`), plus **video / audio

@@ -26,10 +26,10 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
-    ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, ImportSummary, Keyframe, Levels,
-    Mask, Project, Projection, Property, PropertyKey, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, SvgCheck,
-    SvgLayout, SvgOverlayPatch, SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, Task, TextKeyframe, TimeRange,
-    Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
+    ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, Grade, ImportSummary, Keyframe,
+    Levels, Mask, Project, Projection, Property, PropertyKey, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind,
+    SvgCheck, SvgLayout, SvgOverlayPatch, SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, Task, TextKeyframe,
+    TimeRange, Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -1481,6 +1481,35 @@ fn set_mask(state: State<'_, AppState>, clip_id: String, mask: Option<Mask>) -> 
     let project = state.project();
     project.set_mask(id, mask).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
+}
+
+/// Replace a clip's curves, colour wheels and LUT. A LUT file is read and checked first, with the
+/// project unlocked.
+#[tauri::command]
+async fn set_grade(state: State<'_, AppState>, clip_id: String, grade: Grade) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let shared = state.project.clone();
+    blocking(move || {
+        // Only a newly chosen LUT file is checked, so a curve or wheel edit still applies to a
+        // clip whose LUT went missing.
+        let before = {
+            let timeline = lock_user(&shared).timeline().map_err(|e| e.to_string())?;
+            timeline.clip(id).and_then(|c| c.grade.lut.as_ref().map(|l| l.path.clone()))
+        };
+        if grade.lut.as_ref().is_some_and(|l| Some(&l.path) != before.as_ref()) {
+            kerf_core::color_lut::check_grade(&grade).map_err(|e| e.to_string())?;
+        }
+        let project = lock_user(&shared);
+        project.set_grade(id, grade).map_err(|e| e.to_string())?;
+        project.timeline().map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// What a `.cube` file holds (its size and title), or why it cannot be used as a LUT.
+#[tauri::command]
+async fn inspect_lut(path: String) -> CmdResult<kerf_core::color_lut::LutInfo> {
+    blocking(move || kerf_core::color_lut::inspect_lut(&path).map_err(|e| e.to_string())).await
 }
 
 #[tauri::command(async)]
@@ -3778,6 +3807,8 @@ pub fn run() {
             set_color,
             set_transition,
             set_mask,
+            set_grade,
+            inspect_lut,
             set_video_effects,
             set_audio_effects,
             set_keyframes,

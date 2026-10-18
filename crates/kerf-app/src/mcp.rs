@@ -16,10 +16,11 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use base64::Engine as _;
 use kerf_core::{
-    AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipMove, Delivery,
-    EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property, PropertyKey, ReframeKeyframe,
-    Region, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout, SvgOverlay, SvgOverlayPatch, SvgOverlayResult, SvgPreset,
-    SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange, Timeline, Transition, TransitionKind, VideoEffect,
+    AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipLut, ClipMove,
+    CurvePoint, Curves, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property,
+    PropertyKey, ReframeKeyframe, Region, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout, SvgOverlay, SvgOverlayPatch,
+    SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange, Timeline, Transition,
+    TransitionKind, VideoEffect, Wheel, Wheels,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities, ServerConfig};
@@ -852,6 +853,104 @@ struct ColorParams {
         description = "Warm/cool shift -1.0–1.0 (0.0 = unchanged; positive warms, negative cools); omit to leave unchanged"
     )]
     temperature: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct GradeParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(
+        description = "Tone curves, replacing the clip's: `master`, `red`, `green`, `blue`, each a list of {x, y} points in 0..1 (input -> output, at most 16; a monotone cubic is drawn through them and held flat past the first and last point). A channel's curve runs first, then the master. [{x:0,y:1},{x:1,y:0}] inverts; [{x:0,y:0},{x:0.25,y:0.2},{x:0.75,y:0.8},{x:1,y:1}] is a gentle S. Pass {} to clear the curves; omit to leave them unchanged"
+    )]
+    curves: Option<CurvesArg>,
+    #[schemars(
+        description = "Colour wheels, replacing the clip's: `shadows`, `midtones`, `highlights`, each {x, y, lightness}. (x, y) is a point in the unit disc whose angle is the hue pushed into that range (0 deg red, 120 deg green, 240 deg blue, counter-clockwise; e.g. teal shadows are x -0.3, y 0) and whose distance is the strength; lightness (-1..1) lifts or lowers the range. 0.1 to 0.3 is a visible grade, 1 is extreme. Pass {} to clear; omit to leave them unchanged"
+    )]
+    wheels: Option<WheelsArg>,
+    #[schemars(
+        description = "Absolute path of a .cube 3D LUT file to look the clip up through (after the color numbers, before the curves). The file is checked now: a 3D table of size 2 to 65 with a 0..1 domain. Pass \"\" to remove the LUT; omit to leave it unchanged"
+    )]
+    lut_path: Option<String>,
+    #[schemars(
+        description = "How much of the LUT, 0..1 (1 = all of it, the default for a new LUT); alone, changes the current LUT's"
+    )]
+    lut_intensity: Option<f64>,
+}
+
+/// `set_grade`'s curves: the model's [`Curves`], refusing a key it does not name (`mastre`), which the
+/// persisted type quietly drops.
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CurvesArg {
+    #[serde(default)]
+    master: Vec<PointArg>,
+    #[serde(default)]
+    red: Vec<PointArg>,
+    #[serde(default)]
+    green: Vec<PointArg>,
+    #[serde(default)]
+    blue: Vec<PointArg>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PointArg {
+    x: f64,
+    y: f64,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WheelsArg {
+    #[serde(default)]
+    shadows: WheelArg,
+    #[serde(default)]
+    midtones: WheelArg,
+    #[serde(default)]
+    highlights: WheelArg,
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WheelArg {
+    #[serde(default)]
+    x: f64,
+    #[serde(default)]
+    y: f64,
+    #[serde(default)]
+    lightness: f64,
+}
+
+impl From<CurvesArg> for Curves {
+    fn from(c: CurvesArg) -> Self {
+        let points = |v: Vec<PointArg>| v.into_iter().map(|p| CurvePoint { x: p.x, y: p.y }).collect();
+        Self {
+            master: points(c.master),
+            red: points(c.red),
+            green: points(c.green),
+            blue: points(c.blue),
+        }
+    }
+}
+
+impl From<WheelArg> for Wheel {
+    fn from(w: WheelArg) -> Self {
+        Self {
+            x: w.x,
+            y: w.y,
+            lightness: w.lightness,
+        }
+    }
+}
+
+impl From<WheelsArg> for Wheels {
+    fn from(w: WheelsArg) -> Self {
+        Self {
+            shadows: w.shadows.into(),
+            midtones: w.midtones.into(),
+            highlights: w.highlights.into(),
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -2911,6 +3010,50 @@ impl KerfMcp {
             let out = project
                 .set_color(clip_id, p.brightness, p.contrast, p.saturation, p.gamma, p.temperature)
                 .map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
+        description = "Grade a clip beyond set_color: tone curves (master and per channel), shadows / midtones / highlights colour wheels, and a .cube 3D LUT with an intensity. Each part is optional and omitted parts are left as they are. They apply after set_color's numbers, in the order LUT, curves, wheels. Check the result with preview_timeline."
+    )]
+    fn set_grade(&self, Parameters(p): Parameters<GradeParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        // A new LUT file is read before the project is locked.
+        if let Some(path) = p.lut_path.as_deref().filter(|s| !s.is_empty()) {
+            kerf_core::color_lut::inspect_lut(path).map_err(core_err)?;
+        }
+        self.edit(|project| {
+            let timeline = project.working_timeline().map_err(core_err)?;
+            let (ti, ci) = timeline
+                .locate(clip_id)
+                .ok_or_else(|| core_err(kerf_core::Error::ClipNotFound(clip_id)))?;
+            let mut grade = timeline.tracks[ti].clips[ci].grade.clone();
+            if let Some(curves) = p.curves.clone() {
+                grade.curves = Some(curves.into());
+            }
+            if let Some(wheels) = p.wheels {
+                grade.wheels = Some(wheels.into());
+            }
+            match (p.lut_path.as_deref(), p.lut_intensity) {
+                (Some(""), _) => grade.lut = None,
+                (Some(path), intensity) => {
+                    let kept = grade.lut.as_ref().filter(|l| l.path == path).map(|l| l.intensity);
+                    grade.lut = Some(ClipLut {
+                        path: path.to_string(),
+                        intensity: intensity.or(kept).unwrap_or(1.0),
+                    });
+                }
+                (None, Some(intensity)) => {
+                    let lut = grade
+                        .lut
+                        .as_mut()
+                        .ok_or_else(|| McpError::invalid_params("the clip has no LUT whose intensity to change", None))?;
+                    lut.intensity = intensity;
+                }
+                (None, None) => {}
+            }
+            let out = project.set_grade(clip_id, grade).map_err(core_err)?;
             json(&out)
         })
     }
@@ -5388,6 +5531,28 @@ mod tests {
         svg_moments, svg_preview, svg_sheet_caption, svg_sheet_times, svg_source, track_gaps, variant_output, ClipMoveParams,
         SvgMoments, SvgOverlaySummary, SvgPreviewTitle, SvgValidation,
     };
+
+    #[test]
+    fn set_grade_refuses_a_misspelt_key_inside_the_curves_or_wheels() {
+        let parse = |v: serde_json::Value| serde_json::from_value::<super::GradeParams>(v);
+        let ok = parse(serde_json::json!({
+            "clip_id": "c",
+            "curves": {"master": [{"x": 0, "y": 1}, {"x": 1, "y": 0}]},
+            "wheels": {"shadows": {"x": 0.2}}
+        }))
+        .unwrap();
+        let curves = kerf_core::Curves::from(ok.curves.unwrap());
+        assert_eq!(curves.master.len(), 2);
+        assert_eq!(kerf_core::Wheels::from(ok.wheels.unwrap()).shadows.x, 0.2);
+        for bad in [
+            serde_json::json!({"clip_id": "c", "curves": {"mastre": []}}),
+            serde_json::json!({"clip_id": "c", "curves": {"master": [{"x": 0, "y": 1, "z": 2}]}}),
+            serde_json::json!({"clip_id": "c", "wheels": {"midtone": {}}}),
+            serde_json::json!({"clip_id": "c", "wheels": {"shadows": {"lightnes": 0.1}}}),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn log_tool_error_handles_both_kinds() {

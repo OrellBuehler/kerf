@@ -26,8 +26,8 @@ use crate::clip_timing::{
 };
 use crate::error::{Error, Result};
 use crate::model::{
-    pix_fmt_layout, Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, PixLayout, Projection, Property, Reframe,
-    ReframeKeyframe, ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform,
+    pix_fmt_layout, Asset, AudioEffect, Clip, Color, Delivery, Grade, Hdr, Mask, MaskShape, PixLayout, Projection, Property,
+    Reframe, ReframeKeyframe, ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform,
     VideoEffect,
 };
 use crate::render_plan::{still_size, CompositeColorPolicy};
@@ -5740,7 +5740,31 @@ fn export_preflight(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions)
     if !issues.is_empty() {
         return Err(Error::InvalidArgument(issues.join(" ")));
     }
+    check_export_luts(timeline)?;
     Ok((has_video, has_audio))
+}
+
+/// An export refuses a LUT it cannot apply (the preview and stills leave it out instead): the file
+/// would otherwise be silently missing from the delivered picture. Reads the disk, off the lock.
+fn check_export_luts(timeline: &Timeline) -> Result<()> {
+    let clips = timeline
+        .tracks
+        .iter()
+        .filter(|t| t.kind == StreamKind::Video)
+        .flat_map(|t| t.clips.iter())
+        .filter(|c| c.enabled);
+    for lut in clips.filter_map(|c| c.grade.lut()) {
+        let why = match crate::color_lut::inspect_lut(&lut.path) {
+            Err(e) => e.to_string(),
+            Ok(_) if crate::color_lut::lut_file(&lut).is_none() => "Kerf could not write its copy of it".to_string(),
+            Ok(_) => continue,
+        };
+        return Err(Error::InvalidArgument(format!(
+            "cannot export: the LUT {} cannot be applied ({why}); choose another file or clear it",
+            lut.path
+        )));
+    }
+    Ok(())
 }
 
 /// One export run with `opts` exactly as given (no fallback).
@@ -7705,6 +7729,11 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     } else if !clip.color.is_identity() {
         p.push(eq_filter(&clip.color));
     }
+    // The LUT, the curves and the wheels, after the `eq` (see `grade`), before any alpha plane.
+    p.extend(grade_filters(
+        &clip.grade,
+        if fx.label_bt709 { Some("bt709") } else { fx.frame_matrix },
+    ));
     // Color-space video effects (blur / sharpen / grayscale / invert / vignette),
     // applied in author order, before any alpha plane.
     for e in &clip.effects {
@@ -7920,6 +7949,7 @@ fn run_still(
     let run = |o: &ExportOptions| -> Result<Vec<u8>> {
         let mut args = build_still_args(timeline, assets, o, t, max_width, region, out)?;
         hw_used.set(tune_still_args(&mut args, assets, HostOs::CURRENT));
+        let _script = externalize_filter_complex(&mut args, "still")?;
         let bin = ffmpeg_bin();
         let mut cmd = if background { bg_command(&bin) } else { command(&bin) };
         let output = output_bounded(cmd.args(&args), STILL_TIMEOUT, capacity).map_err(|e| match e.kind() {
@@ -8182,7 +8212,7 @@ pub fn export_seek_arg(seconds: f64) -> String {
 ///
 /// Every video clip whose timeline span contains `t` is decoded at its
 /// corresponding source time (`-ss` input seek), put through the same geometry /
-/// color chain the export uses ([`still_clip_chain`] mirrors [`video_clip_chain`]
+/// color chain the export uses ([`still_clip_chain_graded`] mirrors [`video_clip_chain`]
 /// minus the time-domain `trim`/`setpts`/`fps` steps and the fades not changing
 /// the picture at `t`), then `overlay`d onto a black canvas in **track-then-timeline order** — so later tracks composite on
 /// top and gaps fall through to black, matching export framing. The output canvas
@@ -8310,11 +8340,19 @@ fn build_still_args_rendered(
         let rf = clip.reframe_at(ac.local_time);
         let hdr = asset_of(clip.asset_id).and_then(|a| a.hdr());
         let tone = hdr.map(|h| format!("{},", tonemap_filter(h))).unwrap_or_default();
+        let stream = asset_of(clip.asset_id).and_then(|a| a.streams.iter().find(|s| s.kind == StreamKind::Video));
+        let matrix = if layer.label_bt709 {
+            Some("bt709")
+        } else {
+            crate::model::frame_matrix(stream, hdr.is_some())
+        };
         chains.push(format!(
             "[{n}:v]{tone}{chain}[v{n}]",
-            chain = still_clip_chain(
+            chain = still_clip_chain_graded(
                 &tf,
                 &ac.color(),
+                &clip.grade,
+                matrix,
                 &clip.effects,
                 rf.as_ref(),
                 &canvas,
@@ -8389,10 +8427,14 @@ struct StillCanvas {
 ///
 /// `label_bt709` is the graph's BT.709 label for this layer ([`BT709_LABEL`]): the still decides
 /// it over the layers on screen, and puts it where [`video_clip_chain`] does, ahead of everything.
+///
+/// `grade` is the clip's curves, wheels and LUT, right after the `eq`, as `video_clip_chain` places them.
 #[allow(clippy::too_many_arguments)]
-fn still_clip_chain(
+fn still_clip_chain_graded(
     tf: &Transform,
     color: &Color,
+    grade: &Grade,
+    frame_matrix: Option<&str>,
     effects: &[VideoEffect],
     reframe: Option<&ResolvedReframe>,
     canvas: &StillCanvas,
@@ -8455,6 +8497,7 @@ fn still_clip_chain(
     if !color.is_identity() {
         p.push(eq_filter(color));
     }
+    p.extend(grade_filters(grade, frame_matrix));
     for e in effects {
         if let Some(f) = video_effect_filter(e) {
             p.push(f);
@@ -8484,6 +8527,35 @@ fn still_clip_chain(
     }
     p.extend(late_zoom);
     p.join(",")
+}
+
+/// [`still_clip_chain_graded`] with no grade.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn still_clip_chain(
+    tf: &Transform,
+    color: &Color,
+    effects: &[VideoEffect],
+    reframe: Option<&ResolvedReframe>,
+    canvas: &StillCanvas,
+    mask: Option<&Mask>,
+    zoom_last: bool,
+    fades: &StillFades,
+    label_bt709: bool,
+) -> String {
+    still_clip_chain_graded(
+        tf,
+        color,
+        &Grade::default(),
+        None,
+        effects,
+        reframe,
+        canvas,
+        mask,
+        zoom_last,
+        fades,
+        label_bt709,
+    )
 }
 
 /// The `overlay` placement for a clip in a [`timeline_frame`] composite: a full
@@ -8660,6 +8732,10 @@ mod bt709_label;
 #[cfg(test)]
 mod rendered;
 
+/// A clip's curves, wheels and LUT as filters.
+mod grade;
+use grade::grade_filters;
+
 /// The still inside a fade, a dip, a dissolve, a slide or a push: its layers and their fades.
 mod still_fx;
 use still_fx::{still_layers, StillFades};
@@ -8727,6 +8803,10 @@ mod keyed_zoom;
 /// the export renders (`#[ignore]`d).
 #[cfg(test)]
 mod keyed_channels;
+
+/// Curves, wheels and a LUT against the pictures the export and the still render (`#[ignore]`d).
+#[cfg(test)]
+mod grade_rendered;
 
 /// Scene detection and contact sheets on a proxy against the original (`#[ignore]`d).
 #[cfg(test)]
