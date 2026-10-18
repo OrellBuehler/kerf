@@ -118,7 +118,7 @@
 			data-on={settings.open ? '' : undefined}
 			data-on-ink="primary"
 			onclick={() => settings.toggle()}
-			use:tip={settings.tip('Settings', 'app.settings', 'Performance, appearance and keyboard shortcuts')}
+			use:tip={settings.tip('Settings', 'app.settings', 'Preferences, appearance, the agent connection and keyboard shortcuts')}
 			aria-label="Settings"
 			style="-webkit-app-region:no-drag;width:28px;height:28px"
 		>

@@ -43,10 +43,10 @@ pub(crate) fn bumps_here() -> u64 {
     BUMPS_HERE.with(std::cell::Cell::get)
 }
 
-/// Whether a write to `table` can change a plan. The analysis cache, the edit history and the task
-/// list are written constantly by background work and read by no plan.
+/// Whether a write to `table` can change a plan. The analysis cache, the edit history, the task
+/// list and a proposal's undo steps are written constantly and read by no plan.
 pub(crate) fn table_moves_plan(table: &str) -> bool {
-    !matches!(table, "analysis" | "history" | "tasks")
+    !matches!(table, "analysis" | "history" | "tasks" | "staged_undo")
 }
 
 #[cfg(test)]
@@ -55,7 +55,7 @@ mod tests {
 
     #[test]
     fn the_background_tables_do_not_move_the_epoch_and_everything_else_does() {
-        for quiet in ["analysis", "history", "tasks"] {
+        for quiet in ["analysis", "history", "tasks", "staged_undo"] {
             assert!(!table_moves_plan(quiet), "{quiet}");
         }
         for loud in ["timeline", "assets", "meta", "staged", "a_table_added_later"] {

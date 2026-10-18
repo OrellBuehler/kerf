@@ -127,6 +127,30 @@ fn a_legacy_file_that_already_has_the_columns_is_stamped_without_a_backup() {
 }
 
 #[test]
+fn a_v1_file_gains_the_proposals_owner_columns_and_keeps_a_backup() {
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    edited(1).0.save_as(&path).unwrap();
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute_batch("ALTER TABLE staged DROP COLUMN owner; ALTER TABLE staged DROP COLUMN assets;")
+            .unwrap();
+    }
+    let project = Project::open(&path).unwrap();
+    assert_eq!(version_of(&path), SCHEMA_VERSION);
+    assert_eq!(version_of(&schema_backup_path(&path, 1)), 1, "the file as it was is kept");
+    let staged = project.begin_staging(None, None, Some("session-1")).unwrap();
+    assert_eq!(staged.owner.as_deref(), Some("session-1"));
+    drop(project);
+    // Already there: opening again changes nothing and makes no second backup.
+    let backups = std::fs::read_dir(&dir).unwrap().count();
+    drop(Project::open(&path).unwrap());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), backups);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn a_backup_that_cannot_be_written_does_not_stop_an_additive_upgrade() {
     let dir = scratch();
     let path = dir.join("cut.kerf");
@@ -233,7 +257,7 @@ fn an_overlay_clamped_to_no_length_is_refused() {
 fn an_agents_bad_edit_leaves_its_proposal_alone() {
     let (mut project, _) = edited(1);
     project.set_actor(EditSource::Agent);
-    project.begin_staging(None, None).unwrap();
+    project.begin_staging(None, None, None).unwrap();
     let staged = project.staged_row().unwrap().unwrap().timeline;
     assert!(project
         .edit_timeline("Break it", |t| {
@@ -269,7 +293,7 @@ fn a_staged_proposals_base_is_never_pruned() {
     let (mut project, asset) = edited(2);
     project.set_history_limit(2);
     project.set_actor(EditSource::Agent);
-    let staged = project.begin_staging(None, None).unwrap();
+    let staged = project.begin_staging(None, None, None).unwrap();
     project.cut_clip(asset, 20.0, 21.0).unwrap();
     project.set_actor(EditSource::User);
     for i in 0..4 {
@@ -277,9 +301,8 @@ fn a_staged_proposals_base_is_never_pruned() {
     }
     let kept = seqs(&project);
     assert_eq!(kept.first(), Some(&staged.base_seq), "{kept:?}");
-    project.set_actor(EditSource::Agent);
+    // The user applies it: with review on, an agent may not approve its own proposal.
     project.apply_staged(true).unwrap();
-    project.set_actor(EditSource::User);
     project.cut_clip(asset, 50.0, 51.0).unwrap();
     assert_eq!(seqs(&project).len(), 2, "pruned again once the proposal is gone");
 }

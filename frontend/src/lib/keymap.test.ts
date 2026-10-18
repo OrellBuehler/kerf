@@ -344,7 +344,7 @@ const ADDED: Record<string, string> = {
  *  A/V), by what the key is and which modifiers it carries. `Mod` is ⌘ / Ctrl as everywhere.
  *  Like `ADDED`, writing a new one here is how the decision is recorded. */
 const ADDED_SHIFT: Record<string, string> = { d: 'edit.detachAudio' };
-const ADDED_MOD: Record<string, string> = { l: 'edit.link', g: 'playback.goToTimecode' };
+const ADDED_MOD: Record<string, string> = { l: 'edit.link', k: 'edit.split', g: 'playback.goToTimecode' };
 const ADDED_MOD_SHIFT: Record<string, string> = { d: 'edit.reattachAudio', l: 'edit.unlink' };
 
 /** What a keypress should do now: the keys and chords added since take their own answer (a
@@ -382,6 +382,9 @@ describe('the default keys are the ones the editor always had', () => {
 			['d', { shift: true }, 'edit.reattachAudio'], // ⇧⌘D: the way back from ⇧D
 			['l', {}, 'edit.link'],
 			['l', { shift: true }, 'edit.unlink'],
+			['k', {}, 'edit.split'], // ⌘K: Split at playhead
+			[',', { alt: true }, 'edit.slideBack'], // ⌥⌘, / Ctrl+Alt+,
+			['.', { alt: true }, 'edit.slideForward'],
 			['g', {}, 'playback.goToTimecode']
 		];
 		const bare: [string, Mods, string][] = [
@@ -420,7 +423,16 @@ describe('the default keys are the ones the editor always had', () => {
 			['Delete', {}, 'edit.delete'],
 			['Backspace', {}, 'edit.delete'],
 			['Delete', { shift: true }, 'edit.rippleDelete'],
-			['Backspace', { shift: true }, 'edit.rippleDelete']
+			['Backspace', { shift: true }, 'edit.rippleDelete'],
+			// Roll, slip and the cheat sheet: bare or Alt chords on keys nothing else uses. `<` and `>` are what
+			// Shift+, and Shift+. type on a US keyboard and bare keys on a German one: the chord is the character.
+			['<', {}, 'edit.rollBack'],
+			['<', { shift: true }, 'edit.rollBack'],
+			['>', {}, 'edit.rollForward'],
+			[',', { alt: true }, 'edit.slipBack'],
+			['.', { alt: true }, 'edit.slipForward'],
+			['?', {}, 'app.shortcuts'],
+			['?', { shift: true }, 'app.shortcuts']
 		];
 		for (const p of PLATFORMS) {
 			const b = resolveBindings(emptyOverrides(), p);
@@ -972,6 +984,7 @@ describe('keys that act once per press', () => {
 			'edit.cut',
 			'edit.paste',
 			'edit.duplicate',
+			'edit.split',
 			'edit.delete',
 			'edit.rippleDelete',
 			'edit.trimStart',
@@ -980,6 +993,12 @@ describe('keys that act once per press', () => {
 			'edit.reattachAudio',
 			'edit.link',
 			'edit.unlink',
+			'edit.rollBack',
+			'edit.rollForward',
+			'edit.slipBack',
+			'edit.slipForward',
+			'edit.slideBack',
+			'edit.slideForward',
 			'tool.snap',
 			'tool.rippleMode',
 			'playback.toggle',
@@ -998,6 +1017,7 @@ describe('keys that act once per press', () => {
 			'window.resetWorkspace',
 			'window.resetAllWorkspaces',
 			'window.dockAll',
+			'app.shortcuts',
 			'app.keyboard',
 			'app.checkUpdate',
 			'app.releases',
@@ -1110,6 +1130,8 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/components/editor/NotificationCenter.svelte',
 			'lib/components/editor/Preview.svelte',
 			'lib/components/editor/ScrubBar.svelte',
+			'lib/components/editor/SettingsAgent.svelte',
+			'lib/components/editor/SettingsDialog.svelte',
 			'lib/components/editor/SliderRow.svelte',
 			'lib/components/editor/TimecodeField.svelte',
 			'lib/components/editor/Timeline.svelte',

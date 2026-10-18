@@ -4,6 +4,7 @@
 import type { MenuItem } from './context-menu.svelte';
 import type { Track } from './types';
 import type { NavRow } from './menu-nav';
+import { PREVIEW_READ_ONLY_REASON } from './proposal-ui';
 
 /** A menu with its separators made tidy: none leading, none trailing, never two in a row.
  *  A menu is assembled from optional groups (the Analyze rows, the Fit / Stems offers), and
@@ -16,6 +17,16 @@ export function tidyMenu(items: readonly MenuItem[]): MenuItem[] {
 	}
 	while (out.length > 0 && out[out.length - 1].type === 'separator') out.pop();
 	return out;
+}
+
+/** The rows of a menu that edit the cut, while the proposal is previewed: each is off with the reason, because the
+ *  cut on screen is the agent's and an edit would be refused (or, worse, planned against ids that are not the
+ *  project's). Rows that only look — go to, copy, analyze — are not passed through this. */
+export function heldForPreview(items: readonly MenuItem[], previewing: boolean): MenuItem[] {
+	if (!previewing) return [...items];
+	return items.map((item) =>
+		item.type === undefined || item.type === 'item' ? { ...item, disabled: true, reason: PREVIEW_READ_ONLY_REASON } : item
+	);
 }
 
 /** The track menu's mute / hide row: a picture track is hidden and shown (an eye), a sound

@@ -23,11 +23,18 @@ struct Migration {
 /// `PRAGMA user_version` was used — the legacy baseline. Append one step per change; never edit
 /// a shipped one. Steps run after `SCHEMA` has created any table the file lacked, so each must
 /// tolerate that (`IF NOT EXISTS`, probe before `ALTER`).
-const MIGRATIONS: &[Migration] = &[Migration {
-    run: v0_to_v1,
-    needed: v0_to_v1_needed,
-    destructive: false,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        run: v0_to_v1,
+        needed: v0_to_v1_needed,
+        destructive: false,
+    },
+    Migration {
+        run: v1_to_v2,
+        needed: v1_to_v2_needed,
+        destructive: false,
+    },
+];
 
 /// The schema this build writes and the newest it opens.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -50,6 +57,23 @@ fn v0_to_v1(conn: &Connection) -> rusqlite::Result<()> {
 
 fn v0_to_v1_needed(conn: &Connection) -> bool {
     V1_COLUMNS.iter().any(|c| !has_column(conn, "assets", c))
+}
+
+const V2_COLUMNS: [&str; 2] = ["owner", "assets"];
+
+/// v2: a proposal remembers which agent session owns it (`owner`) and the asset changes held
+/// back with it (`assets`, JSON). A proposal staged by an older build has neither.
+fn v1_to_v2(conn: &Connection) -> rusqlite::Result<()> {
+    for column in V2_COLUMNS {
+        if !has_column(conn, "staged", column) {
+            conn.execute(&format!("ALTER TABLE staged ADD COLUMN {column} TEXT"), [])?;
+        }
+    }
+    Ok(())
+}
+
+fn v1_to_v2_needed(conn: &Connection) -> bool {
+    V2_COLUMNS.iter().any(|c| !has_column(conn, "staged", c))
 }
 
 /// The steps from `found` on that would change this file.

@@ -240,7 +240,7 @@ fn measure_mix(
             }
         }
     }
-    let status = child.wait().map_err(|e| Error::Engine(format!("ffmpeg wait failed: {e}")))?;
+    let status = reap(&mut child)?;
     let tail = tail.into_iter().collect::<Vec<_>>().join("\n");
     if cancelled {
         return Err(Error::Cancelled);

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { agentTabLabel, ago, agentLine, COMPOSER_HINT_MIN_HEIGHT, proposalIndicator, REVIEW_CHIP_FULL_WIDTH, reviewChipText, showComposerHint } from './agent-status';
+import { agentTabLabel, ago, agentLine, COMPOSER_HINT_MIN_HEIGHT, proposalIndicator, REVIEW_CHIP_COUNT_WIDTH, REVIEW_CHIP_FULL_WIDTH, reviewChipText, showComposerHint } from './agent-status';
 import { STATUS_MAP } from './components/editor/data';
 import type { StagedEdit, TimelineDiff } from './types';
 
@@ -41,7 +41,7 @@ describe('the proposal indicator', () => {
 
 	test('counts the changes and says so in the chip and the tooltip', () => {
 		expect(proposalIndicator(staged(4))).toMatchObject({ count: 4, label: 'Review 4 changes', stale: false });
-		expect(proposalIndicator(staged(4))!.tip).toBe('The agent proposed 4 changes — open the Agent panel to apply or discard them');
+		expect(proposalIndicator(staged(4))!.tip).toBe('The agent proposes 4 changes — open the Agent panel to review them');
 	});
 
 	test('one change is singular', () => {
@@ -90,13 +90,24 @@ describe('the title bar chip', () => {
 		expect(reviewChipText(four, 1920 / 2 - 150)).toBe('Review 4 changes');
 	});
 
-	test('1366×768 (a right cell of 513) gets the short chip, so the project’s name keeps its room', () => {
-		expect(reviewChipText(four, 513)).toBe('4');
+	test('1280×720 (a right cell of about 470) and 1366×768 (513) say what the number counts, not a bare 4', () => {
+		expect(reviewChipText(four, 470)).toBe('4 changes');
+		expect(reviewChipText(four, 513)).toBe('4 changes');
+		expect(reviewChipText(proposalIndicator(staged(1))!, 470)).toBe('1 change');
+	});
+
+	test('says what the number counts when the cell has most of the room — 1440×900 (about 552) is one', () => {
+		expect(reviewChipText(four, 552)).toBe('4 changes');
+		expect(reviewChipText(four, REVIEW_CHIP_FULL_WIDTH - 1)).toBe('4 changes');
+		expect(reviewChipText(four, REVIEW_CHIP_COUNT_WIDTH)).toBe('4 changes');
+		expect(reviewChipText(proposalIndicator(staged(1))!, 552)).toBe('1 change');
 	});
 
 	test('is the count alone in a narrow cell, and a word when there is no count', () => {
-		expect(reviewChipText(four, REVIEW_CHIP_FULL_WIDTH - 1)).toBe('4');
+		expect(reviewChipText(four, REVIEW_CHIP_COUNT_WIDTH - 1)).toBe('4');
+		expect(reviewChipText(four, 300)).toBe('4');
 		expect(reviewChipText(proposalIndicator(staged(0))!, 300)).toBe('Review');
+		expect(reviewChipText(proposalIndicator(staged(0))!, 552)).toBe('Review');
 	});
 });
 

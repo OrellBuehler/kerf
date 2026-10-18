@@ -12,6 +12,7 @@ import type {
 	AnalysisKind,
 	AnalysisStatus,
 	AssetMetadata,
+	AssetRemoval,
 	AutoAnalysis,
 	PreviewSource,
 	ProxySize,
@@ -25,6 +26,7 @@ import type {
 	ClipCut,
 	ClipMove,
 	Mask,
+	MissingAsset,
 	Color,
 	Grade,
 	LutInfo,
@@ -39,9 +41,9 @@ import type {
 	SubtitleFormat,
 	ExportProgress,
 	Filmstrip,
-	GpuPreviewDiagnostics,
 	GpuPreviewStatus,
 	ImportProgress,
+	ModelProgress,
 	Easing,
 	Keyframe,
 	Property,
@@ -49,16 +51,21 @@ import type {
 	LaunchRequest,
 	RecoveryInfo,
 	Levels,
+	AnalysisProgress,
+	DiffEntry,
 	MasterBus,
 	MusicFit,
 	MusicFitted,
 	PreviewBoundsReport,
+	PlatformTarget,
 	PlayAsk,
 	PreviewFrameResult,
 	PreviewOrder,
 	Projection,
 	Reframe,
 	ReframeKeyframe,
+	RelinkCheck,
+	Relinked,
 	RenderBar,
 	Revision,
 	ScopeGridSize,
@@ -66,9 +73,16 @@ import type {
 	ScopeMatrix,
 	Scopes,
 	AppSettings,
+	McpConnectionInfo,
+	McpSettingsPatch,
+	TimeDisplay,
+	SettingsPatch,
 	SettingsView,
+	SmartCropProgress,
 	SplitSide,
 	StagedEdit,
+	StagedUndone,
+	SubsetApplied,
 	StemsProgress,
 	StemsResult,
 	SyncedByAudio,
@@ -105,6 +119,7 @@ import { normalizeGrade } from './grade';
 import { unsavedChoice, type UnsavedChoice, type UnsavedCopy } from './confirm-copy';
 import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
 import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
+import { claudeCodeCommand, clientUrl, genericJsonConfig } from './mcp-connect';
 import { fileTooLarge, importCaptionsInto, MAX_CAPTION_FILE_BYTES, parseFormat, resolveBase } from './caption-import';
 import { baseName, CAPTION_EXTENSIONS } from './caption-import-ui';
 import { easingProblem, insertKeyframe } from './easing';
@@ -129,7 +144,7 @@ import {
 	slipClipLinked as slipClipLinkedLocal,
 	type SourceLimits
 } from './edit-modes';
-import { linkPartners, withLinkPartners } from './link-groups';
+import { dissolveAllOrphans, linkPartners, withLinkPartners } from './link-groups';
 import * as ops from './link-ops';
 import { runEdit } from './link-ops';
 import { sourceLimits } from './trim-tools';
@@ -137,7 +152,7 @@ import { clampCeiling, clampDuckDepth, clampMasterVolume, DEFAULT_MASTER, estima
 import { toFixedEven } from './format-fixed';
 import { fitMusicOnto, musicFitInputs, type FitSources } from './music-fit';
 import { sampleMusicAnalysis, SAMPLE_MUSIC_DURATION } from './sample-music';
-import { exportSpan, report as platformReport } from './platforms';
+import { exportSpan, report as platformReport, TARGETS } from './platforms';
 import { centeredCrop } from './smart-crop';
 import { synthWaveformRange } from './sample-waveform';
 import { analysisKindDone, ALL_KINDS } from './analysis-steps';
@@ -149,6 +164,8 @@ import { harnessRenderBar } from './render-bar';
 import { renderedFps } from './timecode';
 import { playbackFps } from './playback-sync';
 import { parsePlaybackMessage } from './frame-transport';
+import { playbackId } from './playback-id';
+import { entryId, mergeSubset, subsetMessage } from './staged-subset';
 import { captionsForTimeline, resolveCaptions } from './captions';
 import { estimateWords } from './transcript';
 import { describeError, logFrontend } from './log';
@@ -262,6 +279,15 @@ const sampleAnalysis: Record<string, AssetAnalysis> = {
 	[sampleAssets[2].id]: sampleMusicAnalysis(sampleAssets[2].id)
 };
 
+/** `?missing=1` in the browser harness: the b-roll and the song have no file behind them, as after a
+ *  drive was unplugged or the media was moved, so the missing-media prompt and relink are explorable. */
+function wantsMissing(): boolean {
+	return typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('missing');
+}
+
+/** The harness assets whose "file" is gone. */
+const devMissing = new Set<string>(wantsMissing() ? [sampleAssets[1].id, sampleAssets[2].id] : []);
+
 // The starter cut is the *detached-and-linked* shape linked A/V produces: the interview's
 // sound is its own clip on A1, linked to the picture on V1, whose own sound is muted
 // (`source_audio: false`) — so it is heard once, and a move, trim, split or delete of
@@ -342,34 +368,47 @@ const sampleTimeline: Timeline = {
 	]
 };
 
-// A representative queue spanning the task lifecycle, mirroring the Rust seed.
+/** `?empty=1` in the browser harness: a first run — an empty library and a cut with its two empty tracks. */
+function wantsEmpty(): boolean {
+	return typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('empty');
+}
+
+// A representative queue spanning the task lifecycle, mirroring the Rust seed. The *ready* task is the one
+// whose proposal `?staged=1` stages (`seedDevStaged` ties them together): a ready task with nothing staged
+// under it is a card that offers to apply a change that does not exist. An empty project has no queue.
 const now = () => new Date().toISOString();
-let devTasks: Task[] = [
-	{
-		id: 't1',
-		prompt: 'Assemble a rough cut from the interview',
-		status: 'done',
-		result: 'Kept 6 segments; cut 2 fillers and 14 silences (−1:48)',
-		created_at: now(),
-		updated_at: now()
-	},
-	{
-		id: 't2',
-		prompt: 'Tighten the intro and remove filler words',
-		status: 'ready',
-		result: 'Staged 3 cuts; review on the timeline',
-		created_at: now(),
-		updated_at: now()
-	},
-	{
-		id: 't3',
-		prompt: 'Balance the voiceover levels against the music bed',
-		status: 'queued',
-		result: null,
-		created_at: now(),
-		updated_at: now()
-	}
-];
+let devTasks: Task[] = wantsEmpty()
+	? []
+	: [
+			{
+				id: 't1',
+				prompt: 'Assemble a rough cut from the interview',
+				status: 'done',
+				result: 'Kept 6 segments; cut 2 fillers and 14 silences (−1:48)',
+				created_at: now(),
+				updated_at: now()
+			},
+			...(fakeStagedRequested()
+				? [
+						{
+							id: 't2',
+							prompt: 'Tighten the intro and remove filler words',
+							status: 'ready' as const,
+							result: 'Staged 3 cuts; review on the timeline',
+							created_at: now(),
+							updated_at: now()
+						}
+					]
+				: []),
+			{
+				id: 't3',
+				prompt: 'Balance the voiceover levels against the music bed',
+				status: 'queued',
+				result: null,
+				created_at: now(),
+				updated_at: now()
+			}
+		];
 
 // ---- local timeline ops (browser dev fallback) ----------------------------
 
@@ -380,27 +419,51 @@ const snapshot = () => structuredClone(devTimeline);
 // ---- local edit history (browser dev fallback) ----------------------------
 // Mirrors kerf-core's snapshot history so undo/redo/revert work without Tauri.
 
-type DevRevision = { seq: number; label: string; source: EditSource; snapshot: Timeline };
+type DevRevision = { seq: number; label: string; source: EditSource; snapshot: Timeline; created_at: string };
 let devHistory: DevRevision[] = [
-	{ seq: 0, label: 'Initial state', source: 'system', snapshot: structuredClone(sampleTimeline) }
+	{ seq: 0, label: 'Initial state', source: 'system', snapshot: structuredClone(sampleTimeline), created_at: now() }
 ];
 let devHead = 0;
+
+if (wantsEmpty()) {
+	sampleAssets.length = 0;
+	devTimeline = { tracks: [{ id: 'v1', kind: 'video', name: 'V1', clips: [] }, { id: 'a1', kind: 'audio', name: 'A1', clips: [] }] };
+	devHistory = [{ seq: 0, label: 'Initial state', source: 'system', snapshot: structuredClone(devTimeline), created_at: now() }];
+}
 
 /** Append a snapshot of the current dev timeline, dropping any redo branch. */
 function recordDev(label: string) {
 	devHistory = devHistory.slice(0, devHead + 1);
 	devHead += 1;
-	devHistory.push({ seq: devHead, label, source: 'user', snapshot: snapshot() });
+	devHistory.push({ seq: devHead, label, source: 'user', snapshot: snapshot(), created_at: now() });
 }
 
 function devRestore(seq: number): Timeline {
 	const rev = devHistory.find((r) => r.seq === seq);
 	if (rev) {
+		// History does not bring removed media back (`Project::restore`): a step with a clip of an asset that
+		// is no longer in the library is refused, naming it.
+		const gone = [
+			...new Set(
+				rev.snapshot.tracks
+					.flatMap((t) => t.clips)
+					.filter((c) => !assetById(c.asset_id))
+					.map((c) => devRemovedNames.get(c.asset_id) ?? c.asset_id)
+			)
+		];
+		if (gone.length > 0) {
+			throw new Error(
+				`that step uses media that was removed from the library (${gone.join(', ')}) — undo and redo cannot bring it back; import the file again to cut from it, or go back to a step from before it was used`
+			);
+		}
 		devTimeline = structuredClone(rev.snapshot);
 		devHead = seq;
 	}
 	return snapshot();
 }
+
+/** The names of the media removed from the harness library, for the refusal above. */
+const devRemovedNames = new Map<string, string>();
 
 function trackEnd(t: Track): number {
 	return t.clips.reduce((m, c) => Math.max(m, c.timeline_start + clipDuration(c)), 0);
@@ -480,7 +543,8 @@ function devEnv(ripple: boolean | undefined, link: boolean | undefined): ops.Edi
 		ripple: ripple ?? devRippleMode,
 		links: devLinks(link),
 		footage: devLimits(),
-		hasAudio: (assetId) => !!assetById(assetId)?.streams.some((s) => s.kind === 'audio')
+		hasAudio: (assetId) => !!assetById(assetId)?.streams.some((s) => s.kind === 'audio'),
+		asset: (assetId) => assetById(assetId)
 	};
 }
 
@@ -542,11 +606,166 @@ export async function getAssetMetadata(assetId: string): Promise<AssetMetadata> 
 	return invoke<AssetMetadata>('get_asset_metadata', { assetId });
 }
 
+// ---- library: remove / relink / missing media -----------------------------------
+
+/**
+ * Take an asset out of the library. Refused while a clip of the cut (or of an open proposal) uses it,
+ * unless `force`, which first removes those clips as one `Remove media` revision. Its analysis goes with
+ * it; the backend also cleans up its proxies and waveform cache. Resolves to the asset as it was, how many
+ * clips went with it and the refreshed cut.
+ */
+export async function removeAsset(assetId: string, force = false): Promise<AssetRemoval> {
+	if (!inTauri()) {
+		const asset = assetById(assetId);
+		if (!asset) throw new Error(`asset not found: ${assetId}`);
+		const uses = (tl: Timeline) => tl.tracks.flatMap((t) => t.clips).filter((c) => c.asset_id === assetId);
+		const live = uses(devTimeline);
+		const proposed = devStaged ? uses(devStaged.timeline) : [];
+		const inUse = new Set([...live, ...proposed].map((c) => c.id));
+		if (inUse.size > 0 && !force) {
+			throw new Error(
+				`asset ${assetId} is used by ${inUse.size} clip(s) on the timeline or in the proposal — remove them first, or remove with force`
+			);
+		}
+		if (live.length > 0) {
+			for (const t of devTimeline.tracks) t.clips = t.clips.filter((c) => c.asset_id !== assetId);
+			dissolveAllOrphans(devTimeline);
+			recordDev(`Remove media ${asset.name}`);
+		}
+		if (devStaged && proposed.length > 0) {
+			const gone = new Set(proposed.map((c) => c.id));
+			for (const t of devStaged.timeline.tracks) t.clips = t.clips.filter((c) => c.asset_id !== assetId);
+			dissolveAllOrphans(devStaged.timeline);
+			// Its remembered steps still show the asset.
+			devStaged.steps = [];
+			devStaged.edit.undo_depth = 0;
+			devStaged.edit.diff.entries = devStaged.edit.diff.entries.filter((e) => !e.clip_id || !gone.has(e.clip_id));
+		}
+		sampleAssets.splice(sampleAssets.indexOf(asset), 1);
+		devRemovedNames.set(assetId, asset.name);
+		delete sampleAnalysis[assetId];
+		delete devProxy[assetId];
+		devMissing.delete(assetId);
+		return { asset: structuredClone(asset), clips_removed: live.length, timeline: snapshot() };
+	}
+	return invoke<AssetRemoval>('remove_asset', { assetId, force });
+}
+
+const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'tiff', 'tif', 'insp'];
+const SOUND_EXTENSIONS = ['wav', 'mp3', 'm4a', 'aac'];
+
+/** What the harness judges a relink by: the file's name and extension. Throws what the backend refuses with. */
+function harnessRelinkPlan(assetId: string, newPath: string) {
+	const asset = assetById(assetId);
+	if (!asset) throw new Error(`asset not found: ${assetId}`);
+	if (!newPath.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(newPath)) {
+		throw new Error(`invalid argument: ${newPath} must be an absolute path to a file`);
+	}
+	const ext = newPath.split('.').pop()?.toLowerCase() ?? '';
+	const image = IMAGE_EXTENSIONS.includes(ext);
+	const sound = SOUND_EXTENSIONS.includes(ext);
+	const had = { video: asset.streams.some((s) => s.kind === 'video'), audio: asset.streams.some((s) => s.kind === 'audio') };
+	const is = { video: !image && !sound, audio: sound || (!image && had.audio) };
+	const describe = (image: boolean, video: boolean, audio: boolean) =>
+		image ? 'a still image' : video && audio ? 'picture and sound' : video ? 'picture only' : audio ? 'sound only' : 'no audio or video';
+	if (image || is.video !== had.video || is.audio !== had.audio) {
+		throw new Error(
+			`invalid argument: that file is ${describe(image, is.video, is.audio)} but "${asset.name}" is ${describe(false, had.video, had.audio)} — pick the same media`
+		);
+	}
+	const other = sampleAssets.find((a) => a.path === newPath && a.id !== assetId);
+	if (other) throw new Error(`invalid argument: ${newPath} is already in the library as "${other.name}"`);
+	return { asset, sameMedia: baseName(newPath) === baseName(asset.path) };
+}
+
+/**
+ * Point an asset at another file: the media was moved, renamed or restored from a backup. The file must be
+ * the same kind of media (same streams, about the same length); the asset keeps its id, its place in the
+ * library and every clip cut from it. The analysis is kept only when the file is the old media moved
+ * (`analysis_kept`); any other compatible file is a different recording and its analysis is dropped.
+ * The browser harness judges by file name and extension.
+ */
+export async function relinkAsset(assetId: string, newPath: string): Promise<Relinked> {
+	if (!inTauri()) {
+		const { asset, sameMedia } = harnessRelinkPlan(assetId, newPath);
+		const previous = asset.path;
+		asset.path = newPath;
+		devMissing.delete(assetId);
+		if (!sameMedia) delete sampleAnalysis[assetId];
+		return { asset: structuredClone(asset), analysis_kept: sameMedia, previous_path: previous };
+	}
+	return invoke<Relinked>('relink_asset', { assetId, newPath });
+}
+
+/**
+ * What `relinkAsset` to this file would cost, asked first and changing nothing: the same refusals (the file is not
+ * the same kind of media, is taken, is not there), and whether the asset's analysis would survive
+ * (`analysis_kept`) and whether it has any to lose (`has_analysis`). Reads both files in the desktop app.
+ */
+export async function checkRelink(assetId: string, newPath: string): Promise<RelinkCheck> {
+	if (!inTauri()) {
+		const { sameMedia } = harnessRelinkPlan(assetId, newPath);
+		return { analysis_kept: sameMedia, has_analysis: !!sampleAnalysis[assetId] };
+	}
+	return invoke<RelinkCheck>('check_relink', { assetId, newPath });
+}
+
+/** The assets whose source file is no longer on disk, each with how many clips of the cut use it — what a
+ *  "relink media" prompt lists. The browser harness has none unless `?missing=1` says so. */
+export async function missingAssets(): Promise<MissingAsset[]> {
+	if (!inTauri()) {
+		return sampleAssets
+			.filter((a) => devMissing.has(a.id))
+			.map((a) => ({
+				asset_id: a.id,
+				name: a.name,
+				path: a.path,
+				clips: devTimeline.tracks.flatMap((t) => t.clips).filter((c) => c.asset_id === a.id).length
+			}));
+	}
+	return invoke<MissingAsset[]>('missing_assets');
+}
+
+/** Open a native file picker for the file to relink `name` to (media files only); `null` if cancelled. The
+ *  browser harness has no file system and answers with a plausible restored path (`?relinkto=other.mp4` names a
+ *  different file, to see what relinking to another recording asks). */
+export async function pickRelinkPath(name?: string): Promise<string | null> {
+	if (!inTauri()) {
+		const to = typeof window === 'undefined' ? null : new URLSearchParams(window.location.search).get('relinkto');
+		return `/restored/${to ?? name ?? 'media.mp4'}`;
+	}
+	const { open } = await import('@tauri-apps/plugin-dialog');
+	const selected = await open({
+		multiple: false,
+		title: name ? `Locate ${name}` : 'Locate the media file',
+		filters: [{ name: 'Media', extensions: MEDIA_EXTENSIONS }]
+	});
+	return typeof selected === 'string' ? selected : null;
+}
+
+/** Which of `paths` exist on disk, in order — what the export dialog asks before it overwrites a file. In the
+ *  browser harness nothing exists, unless `?exists=1` says everything does (to see the overwrite prompt). */
+export async function pathsExist(paths: string[]): Promise<boolean[]> {
+	if (!inTauri()) {
+		const all = typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('exists');
+		return paths.map(() => all);
+	}
+	if (paths.length === 0) return [];
+	return invoke<boolean[]>('paths_exist', { paths });
+}
+
 // ---- import / analysis -----------------------------------------------------
 
 export async function importAsset(path: string): Promise<Asset> {
 	if (!inTauri()) throw new Error('import is only available in the desktop app');
 	return invoke<Asset>('import_asset', { path });
+}
+
+/** Stop every import in flight (a 360 pair being stitched is the one that takes long enough to stop). The
+ *  imports reject with `import cancelled` and leave no half-written stitch; progress arrives as `onImportProgress`. */
+export async function cancelImport(): Promise<void> {
+	if (!inTauri()) return;
+	return invoke<void>('cancel_import');
 }
 
 /** Open a native (multi-select) file picker and return the chosen media paths. */
@@ -835,6 +1054,49 @@ export async function openProject(path?: string): Promise<string | null> {
 	return (await invoke<string | null>('open_project', { path: selected })) ?? null;
 }
 
+const RECENT_KEY = 'kerf.settings.recentProjects';
+
+/** `?recent=1` in the browser harness seeds a recent-projects list to explore the menu with. */
+function harnessRecent(): string[] {
+	try {
+		const stored = localStorage.getItem(RECENT_KEY);
+		if (stored !== null) return (JSON.parse(stored) as unknown[]).filter((p): p is string => typeof p === 'string');
+		if (new URLSearchParams(window.location.search).has('recent')) {
+			return ['/projects/summer-trip.kerf', '/projects/interview-cut.kerf', '/projects/showreel.kerf'];
+		}
+	} catch {
+		// Storage blocked or the list is not JSON: no recent projects.
+	}
+	return [];
+}
+
+/** The `.kerf` files opened or saved most recently, newest first (at most 10), the ones whose file is gone
+ *  dropped and forgotten. */
+export async function recentProjects(): Promise<string[]> {
+	if (!inTauri()) return harnessRecent();
+	return invoke<string[]>('recent_projects');
+}
+
+/** Open one of the recent projects; resolves to its path. A file that has since gone rejects (and is
+ *  dropped from the list). The caller asks about unsaved work first, as for any open. */
+export async function openRecent(path: string): Promise<string | null> {
+	if (!inTauri()) return null;
+	return (await invoke<string | null>('open_recent', { path })) ?? null;
+}
+
+/** Forget every recent project. */
+export async function clearRecentProjects(): Promise<void> {
+	if (!inTauri()) {
+		try {
+			localStorage.setItem(RECENT_KEY, '[]');
+		} catch {
+			// Storage blocked: nothing was remembered anyway.
+		}
+		return;
+	}
+	return invoke<void>('clear_recent_projects');
+}
+
 /** Save the project to a chosen `.kerf` file and switch to it; `null` if cancelled. */
 export async function saveProjectAs(defaultPath?: string): Promise<string | null> {
 	if (!inTauri()) return null;
@@ -870,18 +1132,22 @@ export async function importThemeFile(): Promise<string | null> {
 	return invoke<string>('read_text_file', { path: selected });
 }
 
+/** Hand a text file to the browser's download manager — what the harness does where the desktop app asks where to
+ *  save. Resolves to the file's name. */
+export function downloadTextFile(contents: string, name: string, mime = 'text/plain'): string {
+	const url = URL.createObjectURL(new Blob([contents], { type: mime }));
+	const a = document.createElement('a');
+	a.href = url;
+	a.download = name;
+	a.click();
+	setTimeout(() => URL.revokeObjectURL(url), 1000);
+	return name;
+}
+
 /** Save a theme as a JSON file; resolves to where it went, `null` if
  *  cancelled. The browser harness hands the file to the download manager. */
 export async function exportThemeFile(contents: string, defaultName: string): Promise<string | null> {
-	if (!inTauri()) {
-		const url = URL.createObjectURL(new Blob([contents], { type: 'application/json' }));
-		const a = document.createElement('a');
-		a.href = url;
-		a.download = defaultName;
-		a.click();
-		setTimeout(() => URL.revokeObjectURL(url), 1000);
-		return defaultName;
-	}
+	if (!inTauri()) return downloadTextFile(contents, defaultName, 'application/json');
 	const { save } = await import('@tauri-apps/plugin-dialog');
 	const path = await save({ filters: [{ name: 'Kerf theme', extensions: ['json'] }], defaultPath: defaultName });
 	if (typeof path !== 'string') return null;
@@ -897,6 +1163,19 @@ export async function exportThemeFile(contents: string, defaultName: string): Pr
 export async function analyzeAsset(assetId: string, steps?: readonly AnalysisKind[]): Promise<AssetAnalysis> {
 	if (!inTauri()) return devAnalyze(assetId, steps);
 	return invoke<AssetAnalysis>('analyze_asset', { assetId, steps: steps ? [...steps] : null });
+}
+
+const devProgressListeners = new Set<(p: AnalysisProgress) => void>();
+
+/** Subscribe to `analysis-progress` events: the step an analysis pass is on, with a fraction where the backend can
+ *  say one. Returns an unlisten fn. The browser harness emits a few ticks per step of its simulated run. */
+export async function onAnalysisProgress(cb: (p: AnalysisProgress) => void): Promise<() => void> {
+	if (!inTauri()) {
+		devProgressListeners.add(cb);
+		return () => void devProgressListeners.delete(cb);
+	}
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen<AnalysisProgress>('analysis-progress', (e) => cb(e.payload));
 }
 
 /** The per-kind analysis status of every asset (done / not run / running / failed / off). */
@@ -967,6 +1246,8 @@ function harnessProxyMode(): string | null {
 const devProxy: Record<string, ProxyStatus> = (() => {
 	const mode = harnessProxyMode();
 	const [a, b] = sampleAssets;
+	// `?empty=1`: an empty library has no proxies to be building.
+	if (!a || !b) return {};
 	return {
 		[a.id]: { asset_id: a.id, state: 'building', fraction: 0.42, width: 1280, elapsed_secs: 31, eta_secs: 43 },
 		[b.id]:
@@ -1059,6 +1340,15 @@ function devNoteAnalysis(assetId: string) {
 	for (const cb of devAnalysisListeners) cb(structuredClone(s));
 }
 
+/** How long one simulated analysis step takes; `?slow=1` makes it long enough to look at. */
+function devAnalysisStepMs(): number {
+	try {
+		return new URLSearchParams(location.search).has('slow') ? 2400 : 450;
+	} catch {
+		return 450;
+	}
+}
+
 async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Promise<AssetAnalysis> {
 	const auto = devAutoAnalysis();
 	const kinds = steps ?? ALL_KINDS.filter((k) => auto[k] && k !== 'transcript');
@@ -1074,10 +1364,14 @@ async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Pro
 		music: null
 	};
 	sampleAnalysis[assetId] ??= empty;
+	const stage = (k: AnalysisKind) => (k === 'transcript' ? 'transcribe' : k);
 	for (const kind of ALL_KINDS.filter((k) => kinds.includes(k))) {
 		devRunning = { id: assetId, kind };
 		devNoteAnalysis(assetId);
-		await new Promise((r) => setTimeout(r, 450));
+		for (const fraction of [0, 0.35, 0.7]) {
+			for (const cb of devProgressListeners) cb({ asset_id: assetId, stage: stage(kind), fraction });
+			await new Promise((r) => setTimeout(r, devAnalysisStepMs() / 3));
+		}
 		(devRan[assetId] ??= new Set()).add(kind);
 	}
 	devRunning = null;
@@ -1115,6 +1409,18 @@ export interface PlaybackRequest {
  */
 let playbackSeq = 0;
 
+/** This page's playback session, asked of the backend once: ids are built from it so a reloaded page's
+ *  cannot collide with the ones the page before it left behind (`playback-id.ts`). */
+let playbackSessionAsked: Promise<number> | null = null;
+
+function playbackSession(): Promise<number> {
+	playbackSessionAsked ??= invoke<number>('playback_session').catch((e) => {
+		playbackSessionAsked = null;
+		throw e;
+	});
+	return playbackSessionAsked;
+}
+
 export function startPlayback(
 	start: number,
 	request: PlaybackRequest,
@@ -1125,11 +1431,15 @@ export function startPlayback(
 	// The backend cancels *by id* rather than by a generation counter: start and
 	// stop are separate async calls that can arrive out of order, and a stop
 	// meant for the previous stream must not kill the one that replaced it.
-	const playbackId = ++playbackSeq;
+	const seq = ++playbackSeq;
+	// Known once the session is; a stop before then has nothing to stop, because the start never goes out.
+	let id = 0;
 	let stopped = false;
 	void (async () => {
+		const session = await playbackSession();
 		const { Channel } = await import('@tauri-apps/api/core');
 		if (stopped) return;
+		id = playbackId(session, seq);
 		const channel = new Channel<ArrayBuffer>();
 		channel.onmessage = (message) => {
 			if (stopped) return;
@@ -1147,7 +1457,7 @@ export function startPlayback(
 		// would not resolve), never for a stop or a supersede — but a stream
 		// already stopped on this side has no one left to tell.
 		void invoke('start_playback', {
-			playbackId,
+			playbackId: id,
 			start,
 			fps: request.fps,
 			maxWidth: request.width,
@@ -1155,11 +1465,13 @@ export function startPlayback(
 		}).catch((e) => {
 			if (!stopped) onError?.(e instanceof Error ? e.message : String(e));
 		});
-	})();
+	})().catch((e) => {
+		if (!stopped) onError?.(e instanceof Error ? e.message : String(e));
+	});
 	return () => {
 		if (stopped) return;
 		stopped = true;
-		void invoke('stop_playback', { playbackId }).catch((e) => console.warn('stop_playback failed', e));
+		if (id) void invoke('stop_playback', { playbackId: id }).catch((e) => console.warn('stop_playback failed', e));
 	};
 }
 
@@ -1230,10 +1542,24 @@ export async function setSpeechModel(name: string | null): Promise<Transcription
 	return invoke<TranscriptionStatus>('set_speech_model', { name });
 }
 
-/** Fetch a speech model into Kerf's cache, streaming `model-progress`. */
+/** Fetch a speech model into Kerf's cache, streaming `model-progress` (`onModelProgress`).
+ *  `cancelModelDownload` stops it; it then rejects with `model download cancelled`. */
 export async function downloadSpeechModel(name: string): Promise<string> {
 	if (!inTauri()) throw new Error('speech models are only available in the desktop app');
 	return invoke<string>('download_speech_model', { name });
+}
+
+/** Stop the speech model download in flight (if any). */
+export async function cancelModelDownload(): Promise<void> {
+	if (!inTauri()) return;
+	return invoke<void>('cancel_model_download');
+}
+
+/** Subscribe to `model-progress` events: the bytes of the speech model fetched so far. Returns an unlisten fn. */
+export async function onModelProgress(cb: (p: ModelProgress) => void): Promise<() => void> {
+	if (!inTauri()) return () => {};
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen<ModelProgress>('model-progress', (e) => cb(e.payload));
 }
 
 // ---- voiceover (text-to-speech) ---------------------------------------------
@@ -1510,11 +1836,9 @@ export async function setRippleMode(on: boolean): Promise<boolean> {
 
 export async function cutClip(assetId: string, start: number, end: number): Promise<Timeline> {
 	if (!inTauri()) {
-		devEdit(undefined, () => {
-			const track = trackForAsset(devTimeline, assetId);
-			track.clips.push({ id: uid(), asset_id: assetId, source_in: start, source_out: end, timeline_start: trackEnd(track), volume: 1, fade_in: 0, fade_out: 0 });
-		});
-		recordDev('Add clip');
+		const asset = assetById(assetId);
+		if (!asset) throw new Error(`asset not found: ${assetId}`);
+		devRun((tl) => ops.addClip(tl, devEnv(undefined, undefined), asset, null, start, end));
 		return snapshot();
 	}
 	return invoke<Timeline>('cut_clip', { assetId, start, end });
@@ -1528,12 +1852,9 @@ export async function addClip(
 	timelineStart?: number
 ): Promise<Timeline> {
 	if (!inTauri()) {
-		devEdit(undefined, () => {
-			const track = (trackId && devTimeline.tracks.find((t) => t.id === trackId)) || trackForAsset(devTimeline, assetId);
-			const start = timelineStart ?? trackEnd(track);
-			track.clips.push({ id: uid(), asset_id: assetId, source_in: sourceIn, source_out: sourceOut, timeline_start: start, volume: 1, fade_in: 0, fade_out: 0 });
-		});
-		recordDev('Add clip');
+		const asset = assetById(assetId);
+		if (!asset) throw new Error(`asset not found: ${assetId}`);
+		devRun((tl) => ops.addClip(tl, devEnv(undefined, undefined), asset, trackId, sourceIn, sourceOut, timelineStart));
 		return snapshot();
 	}
 	return invoke<Timeline>('add_clip', { assetId, trackId, sourceIn, sourceOut, timelineStart });
@@ -2872,6 +3193,19 @@ export async function smartCrop(clipId?: string): Promise<Timeline> {
 	return invoke<Timeline>('smart_crop', { clipId });
 }
 
+/** Stop the smart crop in flight (if any); it then rejects with `smart crop cancelled`. */
+export async function cancelSmartCrop(): Promise<void> {
+	if (!inTauri()) return;
+	return invoke<void>('cancel_smart_crop');
+}
+
+/** Subscribe to `smart-crop-progress` events: the fraction of the shots sampled so far. Returns an unlisten fn. */
+export async function onSmartCropProgress(cb: (p: SmartCropProgress) => void): Promise<() => void> {
+	if (!inTauri()) return () => {};
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen<SmartCropProgress>('smart-crop-progress', (e) => cb(e.payload));
+}
+
 /** Move `clipId` so its sound lines up with `referenceId`'s (a camera's scratch audio against
  *  the recorder): the backend decodes both clips' used source windows and cross-correlates them.
  *  Linked partners move with it. A match that is not `reliable` is reported and nothing moves
@@ -3030,17 +3364,32 @@ export async function concatenate(assetIds: string[]): Promise<Timeline> {
 
 // ---- history (undo / redo / revert) ----------------------------------------
 
-export async function getHistory(): Promise<Revision[]> {
+/** `offset` of the newest entries skipped, then up to `limit` of the ones before them, kept in the list's own
+ *  (oldest-first) order — the backend's `Page`. Neither is everything. */
+function windowOf<T>(all: T[], limit?: number, offset?: number): T[] {
+	if (limit === undefined && !offset) return all;
+	const end = Math.max(0, all.length - (offset ?? 0));
+	const start = limit === undefined ? 0 : Math.max(0, end - limit);
+	return all.slice(start, end);
+}
+
+/** The edit history, oldest first. `limit` / `offset` window it from the newest end: `limit: 50` is the last
+ *  fifty edits and a following `offset: 50` the fifty before. */
+export async function getHistory(limit?: number, offset?: number): Promise<Revision[]> {
 	if (!inTauri()) {
-		return devHistory.map((r) => ({
-			seq: r.seq,
-			label: r.label,
-			source: r.source,
-			created_at: new Date().toISOString(),
-			current: r.seq === devHead
-		}));
+		return windowOf(
+			devHistory.map((r) => ({
+				seq: r.seq,
+				label: r.label,
+				source: r.source,
+				created_at: r.created_at,
+				current: r.seq === devHead
+			})),
+			limit,
+			offset
+		);
 	}
-	return invoke<Revision[]>('get_history');
+	return invoke<Revision[]>('get_history', { limit: limit ?? null, offset: offset ?? null });
 }
 
 export async function undo(): Promise<Timeline> {
@@ -3090,8 +3439,42 @@ function fakeStagedRequested(): boolean {
 	return typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('staged');
 }
 
-let devStaged: { edit: StagedEdit; timeline: Timeline } | null = null;
+/** One thing the agent did inside the proposal: its label, what it changed and the proposal after it. */
+interface DevStep {
+	label: string;
+	entries: DiffEntry[];
+	timeline: Timeline;
+}
+
+interface DevStaged {
+	edit: StagedEdit;
+	/** The proposal. */
+	timeline: Timeline;
+	/** The cut it branched from. */
+	base: Timeline;
+	/** The steps it can still take back, oldest first (`undoStagedEdit`). */
+	steps: DevStep[];
+}
+
+let devStaged: DevStaged | null = null;
+/** The proposal thrown away last, kept so a discard made by mistake can be taken back. */
+let devDiscarded: DevStaged | null = null;
 let devStagedSeeded = false;
+
+const countClips = (tl: Timeline) => tl.tracks.reduce((n, t) => n + t.clips.length, 0);
+
+/** A harness diff entry with the id the backend would give it. */
+const named = (entry: DiffEntry): DiffEntry => ({ ...entry, id: entryId(entry) });
+
+function devDiff(base: Timeline, proposed: Timeline, entries: DiffEntry[]): TimelineDiff {
+	return {
+		entries,
+		duration_before: timelineDuration(base),
+		duration_after: timelineDuration(proposed),
+		clips_before: countClips(base),
+		clips_after: countClips(proposed)
+	};
+}
 
 /** A plausible proposal over the dev timeline: a tightened intro, ripple closed. */
 function seedDevStaged() {
@@ -3102,11 +3485,14 @@ function seedDevStaged() {
 	const audio = proposed.tracks.find((t) => t.kind === 'audio');
 	if (!video || video.clips.length < 2 || !audio || audio.clips.length === 0) return;
 
+	const steps: DevStep[] = [];
+	const step = (label: string, entry: DiffEntry) =>
+		steps.push({ label, entries: [named(entry)], timeline: structuredClone(proposed) });
+
 	const [first, second] = video.clips;
-	const entries: TimelineDiff['entries'] = [];
 	const wasSource = first.source_out - first.source_in;
 	first.source_out = first.source_in + wasSource - 3.5;
-	entries.push({
+	step('Trim clip', {
 		kind: 'clip_retrimmed',
 		summary: `Trimmed clip on ${video.name} at ${fmtTime(first.timeline_start)} — ${wasSource.toFixed(1)}s → ${(wasSource - 3.5).toFixed(1)}s (-3.5s)`,
 		track_id: video.id,
@@ -3115,7 +3501,7 @@ function seedDevStaged() {
 	});
 	const movedFrom = second.timeline_start;
 	second.timeline_start = trackEnd({ ...video, clips: [first] });
-	entries.push({
+	step('Move clip', {
 		kind: 'clip_moved',
 		summary: `Moved clip on ${video.name} — ${fmtTime(movedFrom)} → ${fmtTime(second.timeline_start)}`,
 		track_id: video.id,
@@ -3128,7 +3514,7 @@ function seedDevStaged() {
 	const bedWas = bed.source_out - bed.source_in;
 	const bedCut = bed.link_id && bed.link_id === first.link_id ? 3.5 : Math.min(20, bedWas / 2);
 	bed.source_out = bed.source_in + bedWas - bedCut;
-	entries.push({
+	step('Trim clip', {
 		kind: 'clip_retrimmed',
 		summary: `Trimmed clip on ${audio.name} at ${fmtTime(bed.timeline_start)} — ${bedWas.toFixed(1)}s → ${(bedWas - bedCut).toFixed(1)}s (-${bedCut.toFixed(1)}s)`,
 		track_id: audio.id,
@@ -3147,7 +3533,7 @@ function seedDevStaged() {
 		bold: true
 	};
 	proposed.overlays = [...(proposed.overlays ?? []), overlay];
-	entries.push({
+	step('Add overlay', {
 		kind: 'overlay_added',
 		summary: `Added text “${overlay.text}” at ${fmtTime(overlay.start)}–${fmtTime(overlay.end)}`,
 		overlay_id: overlay.id,
@@ -3158,7 +3544,7 @@ function seedDevStaged() {
 	const bedTrack = proposed.tracks.find((t) => t.kind === 'audio' && t !== audio && t.clips.length > 0);
 	if (bedTrack) {
 		const [gone] = bedTrack.clips.splice(0, 1);
-		entries.push({
+		step('Remove clip', {
 			kind: 'clip_removed',
 			summary: `Removed clip from ${bedTrack.name} at ${fmtTime(gone.timeline_start)} (${clipDuration(gone).toFixed(1)}s)`,
 			track_id: bedTrack.id,
@@ -3167,33 +3553,43 @@ function seedDevStaged() {
 		});
 	}
 
-	const countClips = (tl: Timeline) => tl.tracks.reduce((n, t) => n + t.clips.length, 0);
 	devStaged = {
 		timeline: proposed,
+		base: before,
+		steps,
 		edit: {
 			base_seq: devHead,
 			task_id: devTasks.find((t) => t.status === 'ready')?.id ?? null,
 			note: 'Tighten the intro',
-			edits: ['Trim clip', 'Move clip', 'Trim clip', 'Add overlay', ...(bedTrack ? ['Remove clip'] : [])],
+			owned_by_agent: true,
+			edits: steps.map((st) => st.label),
+			undo_depth: steps.length,
 			created_at: now(),
 			updated_at: now(),
 			stale: false,
-			diff: {
-				entries,
-				duration_before: timelineDuration(before),
-				duration_after: timelineDuration(proposed),
-				clips_before: countClips(before),
-				clips_after: countClips(proposed)
-			}
+			diff: devDiff(
+				before,
+				proposed,
+				steps.flatMap((st) => st.entries)
+			)
 		}
 	};
 }
+
+/** Whether the live cut moved on since the proposal branched from it — `Project::staged`'s `stale`: the
+ *  history head is not where the agent started. Applying it then replaces the newer cut and asks for `force`. */
+function devStagedStale(): boolean {
+	return !!devStaged && devStaged.edit.base_seq !== devHead;
+}
+
+const STALE_MESSAGE =
+	'the timeline changed since these edits were staged — applying would replace that newer cut; apply with force, or discard the staged edit';
 
 /** The proposal a connected agent has staged, or `null` when there is none. */
 export async function getStagedEdit(): Promise<StagedEdit | null> {
 	if (!inTauri()) {
 		if (!devStagedSeeded && fakeStagedRequested()) seedDevStaged();
-		return devStaged ? structuredClone(devStaged.edit) : null;
+		return devStaged ? { ...structuredClone(devStaged.edit), stale: devStagedStale() } : null;
 	}
 	return invoke<StagedEdit | null>('get_staged_edit');
 }
@@ -3211,24 +3607,128 @@ export async function getStagedTimeline(): Promise<Timeline | null> {
 export async function applyStagedEdit(force = false): Promise<Timeline> {
 	if (!inTauri()) {
 		if (!devStaged) throw new Error('no staged edit is pending');
-		if (devStaged.edit.stale && !force) throw new Error('the timeline changed since these edits were staged');
+		if (devStagedStale() && !force) throw new Error(STALE_MESSAGE);
 		devTimeline = structuredClone(devStaged.timeline);
 		recordDev(devStaged.edit.note ?? 'Agent edit');
 		devHistory[devHead].source = 'agent';
+		// Accepting the edits finishes the task they were staged under, as `apply_staged` does.
+		const taskId = devStaged.edit.task_id;
+		devTasks = devTasks.map((t) => (t.id === taskId ? { ...t, status: 'done', updated_at: now() } : t));
 		devStaged = null;
 		return snapshot();
 	}
 	return invoke<Timeline>('apply_staged_edit', { force });
 }
 
-/** Throw the proposal away, leaving the live timeline untouched. */
+/**
+ * Accept only the picked changes of the proposal (`entryIds`: the `id`s of its diff entries) onto the live
+ * cut, by the clip, text, marker or track each is about. A partner that has to come along (a picture and its
+ * sound) is applied too and reported in `auto_included`; a pick that cannot stand alone rejects with where,
+ * and one the cut has since moved past is `skipped`. The rest of the proposal stays open, branched from the
+ * cut as it now is, until nothing is left of it (`closed`). The browser harness runs the port in
+ * `staged-subset.ts`.
+ */
+export async function applyStagedSubset(entryIds: string[], force = false): Promise<SubsetApplied> {
+	if (!inTauri()) {
+		if (!devStaged) throw new Error('no staged edit is pending');
+		if (devStagedStale() && !force) throw new Error(STALE_MESSAGE);
+		const total = devStaged.edit.diff.entries.length;
+		const merge = mergeSubset(devTimeline, devStaged.base, devStaged.timeline, devStaged.edit.diff, entryIds);
+		if (merge.applied.length === 0) {
+			const why = merge.skipped.map((c) => `${c.summary} (${c.why})`).join('; ');
+			throw new Error(`invalid argument: none of those changes can be applied: ${why}`);
+		}
+		const applied = new Set(merge.applied);
+		const left = devStaged.edit.diff.entries.filter((e) => !applied.has(entryId(e)));
+		devTimeline = merge.timeline;
+		recordDev(`${devStaged.edit.note ?? 'Agent edit'} (${merge.applied.length} of ${total})`);
+		devHistory[devHead].source = 'agent';
+		const closed = left.length === 0;
+		if (closed) {
+			const taskId = devStaged.edit.task_id;
+			devTasks = devTasks.map((t) => (t.id === taskId ? { ...t, status: 'done', updated_at: now() } : t));
+			devStaged = null;
+		} else {
+			// The rest of the proposal now branches from the cut as it stands, and its steps are forgotten.
+			devStaged.base = snapshot();
+			devStaged.steps = [];
+			devStaged.edit = {
+				...devStaged.edit,
+				base_seq: devHead,
+				undo_depth: 0,
+				updated_at: now(),
+				diff: devDiff(devStaged.base, devStaged.timeline, left)
+			};
+		}
+		return {
+			applied: merge.applied.length,
+			auto_included: merge.autoIncluded,
+			skipped: merge.skipped,
+			remaining: left.length,
+			closed,
+			message: subsetMessage(merge.applied.length, total, merge.autoIncluded, merge.skipped, left.length),
+			timeline: snapshot()
+		};
+	}
+	return invoke<SubsetApplied>('apply_staged_subset', { entryIds, force });
+}
+
+/** Throw the proposal away, leaving the live timeline untouched. The last one thrown away can be brought
+ *  back with `restoreDiscardedEdits`. */
 export async function discardStagedEdit(): Promise<Timeline> {
 	if (!inTauri()) {
 		if (!devStaged) throw new Error('no staged edit is pending');
+		if (devStaged.edit.edits.length > 0) devDiscarded = devStaged;
 		devStaged = null;
 		return snapshot();
 	}
 	return invoke<Timeline>('discard_staged_edit');
+}
+
+/** Take back the latest edit the agent staged, inside the proposal (the live cut is untouched). Resolves to
+ *  the step's label and the proposal as it now stands; rejects when nothing is left to undo. */
+export async function undoStagedEdit(): Promise<StagedUndone> {
+	if (!inTauri()) {
+		if (!devStaged) throw new Error('no staged edit is pending');
+		const step = devStaged.steps.pop();
+		if (!step) throw new Error('invalid argument: nothing left to undo in the proposal (it remembers the last 20 steps)');
+		const proposal = devStaged.steps[devStaged.steps.length - 1]?.timeline ?? devStaged.base;
+		devStaged.timeline = structuredClone(proposal);
+		devStaged.edit = {
+			...devStaged.edit,
+			edits: devStaged.steps.map((st) => st.label),
+			undo_depth: devStaged.steps.length,
+			updated_at: now(),
+			diff: devDiff(
+				devStaged.base,
+				devStaged.timeline,
+				devStaged.steps.flatMap((st) => st.entries)
+			)
+		};
+		return { label: step.label, staged: { ...structuredClone(devStaged.edit), stale: devStagedStale() } };
+	}
+	return invoke<StagedUndone>('undo_staged_edit');
+}
+
+/** The proposal last discarded, while it can still be brought back; `null` when there is none. */
+export async function discardedStagedEdit(): Promise<StagedEdit | null> {
+	if (!inTauri()) return devDiscarded ? { ...structuredClone(devDiscarded.edit), stale: devDiscarded.edit.base_seq !== devHead } : null;
+	return invoke<StagedEdit | null>('discarded_staged_edit');
+}
+
+/** Bring the discarded proposal back (only while no other proposal is open). */
+export async function restoreDiscardedEdits(): Promise<StagedEdit> {
+	if (!inTauri()) {
+		if (devStaged) throw new Error('a staged edit is already pending; apply or discard it first');
+		if (!devDiscarded) throw new Error('there is no discarded proposal to bring back');
+		devStaged = devDiscarded;
+		devDiscarded = null;
+		// It comes back as it was but with no undo history (`Project::restore_discarded`).
+		devStaged.steps = [];
+		devStaged.edit = { ...devStaged.edit, undo_depth: 0, updated_at: now() };
+		return { ...structuredClone(devStaged.edit), stale: devStagedStale() };
+	}
+	return invoke<StagedEdit>('restore_discarded_edits');
 }
 
 // ---- agent task queue ------------------------------------------------------
@@ -3237,9 +3737,10 @@ export async function discardStagedEdit(): Promise<Timeline> {
 // them over MCP. In the browser there is no agent, so queued tasks simply wait —
 // which is the honest behavior: Kerf never edits on its own.
 
-export async function listTasks(): Promise<Task[]> {
-	if (!inTauri()) return structuredClone(devTasks);
-	return invoke<Task[]>('list_tasks');
+/** The agent task queue, oldest first; `limit` / `offset` window it from the newest end like `getHistory`. */
+export async function listTasks(limit?: number, offset?: number): Promise<Task[]> {
+	if (!inTauri()) return structuredClone(windowOf(devTasks, limit, offset));
+	return invoke<Task[]>('list_tasks', { limit: limit ?? null, offset: offset ?? null });
 }
 
 /** Enqueue a task; resolves to the newly created (queued) task. */
@@ -3481,24 +3982,6 @@ export async function gpuPreviewStatus(): Promise<GpuPreviewStatus> {
 	return invoke<GpuPreviewStatus>('gpu_preview_status');
 }
 
-/** What this session's GPU preview frames did, and why the others went through FFmpeg. Local
- *  and in memory; there is none in the browser harness. */
-export async function gpuPreviewDiagnostics(): Promise<GpuPreviewDiagnostics | null> {
-	if (!inTauri()) return null;
-	return invoke<GpuPreviewDiagnostics>('gpu_preview_diagnostics');
-}
-
-export async function getWaveform(assetId: string, buckets: number): Promise<number[]> {
-	if (!inTauri()) {
-		// Synthetic but deterministic peaks so the browser demo shows a waveform.
-		return Array.from({ length: buckets }, (_, i) => {
-			const seed = Math.sin(i * 0.7) * Math.cos(i * 0.19);
-			return Math.min(1, 0.25 + Math.abs(seed) * 0.7);
-		});
-	}
-	return invoke<number[]>('get_waveform', { assetId, buckets });
-}
-
 /**
  * `[start, end)` **source seconds** of an asset's audio as `buckets` min/max
  * peak pairs per channel, `[channel][bucket]` in -1..1 — what a clip's waveform
@@ -3654,14 +4137,20 @@ export async function onImportProgress(cb: (p: ImportProgress) => void): Promise
 }
 
 /** Open a save dialog defaulted to the given container extension. */
-export async function pickExportPath(ext: string): Promise<string | null> {
+export async function pickExportPath(ext: string, defaultName?: string): Promise<string | null> {
 	if (!inTauri()) return null;
 	const { save } = await import('@tauri-apps/plugin-dialog');
 	const path = await save({
 		filters: [{ name: ext.toUpperCase(), extensions: [ext] }],
-		defaultPath: `kerf-export.${ext}`
+		defaultPath: defaultName ?? `kerf-export.${ext}`
 	});
 	return typeof path === 'string' ? path : null;
+}
+
+/** Stop the cover frame being written (if any); `exportCover` then rejects with `cover export cancelled`. */
+export async function cancelCoverExport(): Promise<void> {
+	if (!inTauri()) return;
+	return invoke<void>('cancel_cover_export');
 }
 
 /** Write the composited frame at `timeSecs` to `outputPath` as a cover image —
@@ -3708,8 +4197,8 @@ export async function platformCheck(
 		// A title counts when it is on screen somewhere in the span, as it is in the sliced cut the export builds.
 		return platformReport({
 			duration: span ? span[1] - span[0] : full,
-			width: frame?.[0] ?? fmt?.width ?? first.streams[0]?.width ?? 1920,
-			height: frame?.[1] ?? fmt?.height ?? first.streams[0]?.height ?? 1080,
+			width: frame?.[0] ?? fmt?.width ?? first?.streams[0]?.width ?? 1920,
+			height: frame?.[1] ?? fmt?.height ?? first?.streams[0]?.height ?? 1080,
 			has_audio: true,
 			has_text: (devTimeline.overlays ?? []).some((o) => !span || (o.end > span[0] && o.start < span[1]))
 		});
@@ -3721,13 +4210,21 @@ export async function platformCheck(
 	});
 }
 
-// ---- agent connection (MCP endpoint) ---------------------------------------
+let platformTargetsKnown: Promise<PlatformTarget[]> | null = null;
 
-/** The local MCP endpoint a connected agent points at (e.g. http://127.0.0.1:7777/mcp). */
-export async function mcpEndpoint(): Promise<string> {
-	if (!inTauri()) return 'http://127.0.0.1:7777/mcp';
-	return invoke<string>('mcp_endpoint');
+/** Every publishing target Kerf knows (its frame and length limits), as `kerf_core::platform` has them. The
+ *  answer never changes in a session, so it is asked once. The browser harness answers with the mirror in
+ *  `platforms.ts`. */
+export async function platformTargets(): Promise<PlatformTarget[]> {
+	if (!inTauri()) return structuredClone(TARGETS);
+	platformTargetsKnown ??= invoke<PlatformTarget[]>('platform_targets').catch((e) => {
+		platformTargetsKnown = null;
+		throw e;
+	});
+	return platformTargetsKnown;
 }
+
+// ---- agent connection (MCP endpoint) ---------------------------------------
 
 /** Where the endpoint is, and how long ago an agent last used it — `null` when
  *  none ever has. A streamable-HTTP client holds no connection between calls,
@@ -3736,6 +4233,105 @@ export async function mcpEndpoint(): Promise<string> {
 export async function agentStatus(): Promise<{ endpoint: string; last_seen_secs: number | null; error: string | null }> {
 	if (!inTauri()) return { endpoint: 'http://127.0.0.1:7777/mcp', last_seen_secs: null, error: null };
 	return invoke<{ endpoint: string; last_seen_secs: number | null; error: string | null }>('agent_status');
+}
+
+// ---- agent connection: endpoint, token, switches (mcp_commands.rs) ------------
+
+/** In the browser harness there is no server: this is the state the Agent settings page edits. */
+let harnessMcp: McpConnectionInfo | null = null;
+
+function harnessToken(): string {
+	return (crypto.randomUUID() + crypto.randomUUID()).replace(/-/g, '');
+}
+
+/** The agent switches as `get_settings` carries them (`SettingsView`): the same state the Agent page edits. */
+function harnessAgentSettings(): Pick<AppSettings, 'agent_review' | 'mcp_enabled' | 'mcp_addr' | 'mcp_require_token'> {
+	const info = harnessMcpInfo({});
+	return {
+		agent_review: info.agent_review,
+		mcp_enabled: info.enabled,
+		mcp_addr: info.configured_addr,
+		mcp_require_token: info.require_token
+	};
+}
+
+/** A settings patch that carries agent switches changes the Agent page's state too. */
+function applyHarnessAgentSettings(patch: SettingsPatch) {
+	const next: McpSettingsPatch = {};
+	if (patch.agent_review !== undefined) next.agent_review = patch.agent_review;
+	if (patch.mcp_enabled !== undefined) next.mcp_enabled = patch.mcp_enabled;
+	if (patch.mcp_require_token !== undefined) next.mcp_require_token = patch.mcp_require_token;
+	if ('mcp_addr' in patch) next.mcp_addr = patch.mcp_addr ?? null;
+	if (Object.keys(next).length > 0) void setMcpSettings(next).catch(() => {});
+}
+
+/** `?tokenproblem=1` seeds the warning the Agent page shows when the token could not be kept. */
+function harnessTokenProblem(): string | null {
+	if (typeof window === 'undefined' || !new URLSearchParams(window.location.search).has('tokenproblem')) return null;
+	return 'The token could not be saved (permission denied). It works until Kerf quits; the next start makes a new one.';
+}
+
+function harnessMcpInfo(next: Partial<McpConnectionInfo>): McpConnectionInfo {
+	const base: McpConnectionInfo = harnessMcp ?? {
+		enabled: true,
+		url: 'http://127.0.0.1:7777/mcp',
+		require_token: true,
+		token: harnessToken(),
+		token_problem: harnessTokenProblem(),
+		running: true,
+		error: null,
+		configured_addr: null,
+		env_override: false,
+		agent_review: true,
+		claude_code_command: '',
+		generic_json_config: ''
+	};
+	const merged = { ...base, ...next };
+	merged.url = clientUrl(merged.configured_addr ?? '127.0.0.1:7777');
+	merged.running = merged.enabled;
+	merged.claude_code_command = claudeCodeCommand(merged.url, merged.token, merged.require_token);
+	merged.generic_json_config = genericJsonConfig(merged.url, merged.token, merged.require_token);
+	harnessMcp = merged;
+	return merged;
+}
+
+/** The endpoint, the token and ready-made client configuration, and whether the server is up. */
+export async function mcpConnectionInfo(): Promise<McpConnectionInfo> {
+	if (!inTauri()) return harnessMcpInfo({});
+	return invoke<McpConnectionInfo>('mcp_connection_info');
+}
+
+/** Make a new token; the old one stops working at once. Resolves to the new token. */
+export async function regenerateMcpToken(): Promise<string> {
+	if (!inTauri()) {
+		const token = harnessToken();
+		harnessMcpInfo({ token });
+		return token;
+	}
+	return invoke<string>('regenerate_mcp_token');
+}
+
+/** Change the agent switches (enabled, address, token requirement, review of agent edits); resolves
+ *  to the connection info as it is afterwards. Rejects when the combination is refused (a network
+ *  address with the token requirement off, an address that is not `host:port`). */
+export async function setMcpSettings(patch: McpSettingsPatch): Promise<McpConnectionInfo> {
+	if (!inTauri()) {
+		const next: Partial<McpConnectionInfo> = {};
+		if (patch.mcp_enabled !== undefined) next.enabled = patch.mcp_enabled;
+		if (patch.mcp_require_token !== undefined) next.require_token = patch.mcp_require_token;
+		if (patch.agent_review !== undefined) next.agent_review = patch.agent_review;
+		if ('mcp_addr' in patch) next.configured_addr = patch.mcp_addr ?? null;
+		const current = harnessMcpInfo({});
+		const addr = ('mcp_addr' in patch ? patch.mcp_addr : current.configured_addr) ?? '127.0.0.1:7777';
+		const require = patch.mcp_require_token ?? current.require_token;
+		if (!/^(127\.\d+\.\d+\.\d+|localhost|\[::1\]):/i.test(addr) && !require) {
+			throw new Error(
+				`refusing to listen on ${addr}: it is reachable from the network, and requests would carry no token`
+			);
+		}
+		return harnessMcpInfo(next);
+	}
+	return invoke<McpConnectionInfo>('set_mcp_settings', { patch });
 }
 
 /** Tell the backend what the editor shows, for an agent's `get_editor_context`
@@ -3761,10 +4357,15 @@ export async function getSettings(): Promise<SettingsView> {
 			preview_source: readBrowserPreviewSource(),
 			safe_areas: readBrowserSafeAreas(),
 			gpu_preview: harnessSurface(),
+			time_display: readBrowserTimeDisplay(),
+			reopen_last_project: readBrowserFlag(REOPEN_KEY),
+			recent_projects: harnessRecent(),
 			layout: readBrowserJson(LAYOUT_KEY),
 			theme: readBrowserJson(THEME_KEY),
 			workspaces: readBrowserJson(WORKSPACES_KEY),
-			keybindings: readBrowserJson(KEYBINDINGS_KEY)
+			keybindings: readBrowserJson(KEYBINDINGS_KEY),
+			...harnessAgentSettings(),
+			editing: readBrowserJson(EDITING_KEY)
 		});
 	}
 	return invoke<SettingsView>('get_settings');
@@ -3775,7 +4376,7 @@ export async function getSettings(): Promise<SettingsView> {
  * view. Only the fields in `patch` are written — the backend merges them into
  * the stored file, so a workspaces write cannot carry a stale copy of the theme.
  */
-export async function setSettings(patch: Partial<AppSettings>): Promise<SettingsView> {
+export async function setSettings(patch: SettingsPatch): Promise<SettingsView> {
 	if (!inTauri()) {
 		try {
 			if (patch.cpu_percent !== undefined) {
@@ -3786,10 +4387,14 @@ export async function setSettings(patch: Partial<AppSettings>): Promise<Settings
 			if (patch.proxy_size !== undefined) localStorage.setItem(PROXY_SIZE_KEY, String(patch.proxy_size));
 			if (patch.preview_source !== undefined) localStorage.setItem(PREVIEW_SOURCE_KEY, patch.preview_source);
 			if (patch.safe_areas !== undefined) localStorage.setItem(SAFE_AREAS_KEY, patch.safe_areas ? '1' : '0');
+			if (patch.time_display !== undefined) localStorage.setItem(TIME_DISPLAY_KEY, patch.time_display);
+			if (patch.reopen_last_project !== undefined) localStorage.setItem(REOPEN_KEY, patch.reopen_last_project ? '1' : '0');
 			if ('layout' in patch) writeBrowserJson(LAYOUT_KEY, patch.layout);
 			if ('theme' in patch) writeBrowserJson(THEME_KEY, patch.theme);
 			if ('workspaces' in patch) writeBrowserJson(WORKSPACES_KEY, patch.workspaces);
 			if ('keybindings' in patch) writeBrowserJson(KEYBINDINGS_KEY, patch.keybindings);
+			applyHarnessAgentSettings(patch);
+			if ('editing' in patch) writeBrowserJson(EDITING_KEY, patch.editing);
 		} catch {
 			// A private window with storage blocked still gets a working dialog.
 		}
@@ -3808,6 +4413,9 @@ const LAYOUT_KEY = 'kerf.settings.layout';
 const THEME_KEY = 'kerf.settings.theme';
 const WORKSPACES_KEY = 'kerf.settings.workspaces';
 const KEYBINDINGS_KEY = 'kerf.settings.keybindings';
+const EDITING_KEY = 'kerf.settings.editing';
+const TIME_DISPLAY_KEY = 'kerf.settings.timeDisplay';
+const REOPEN_KEY = 'kerf.settings.reopenLastProject';
 const MIN_CPU_PERCENT = 10;
 const DEFAULT_CPU_PERCENT = 75;
 
@@ -3865,6 +4473,22 @@ function readBrowserSafeAreas(): boolean {
 	}
 }
 
+function readBrowserTimeDisplay(): TimeDisplay {
+	try {
+		return localStorage.getItem(TIME_DISPLAY_KEY) === 'seconds' ? 'seconds' : 'timecode';
+	} catch {
+		return 'timecode';
+	}
+}
+
+function readBrowserFlag(key: string): boolean {
+	try {
+		return localStorage.getItem(key) === '1';
+	} catch {
+		return false;
+	}
+}
+
 function readBrowserJson(key: string): unknown | null {
 	try {
 		const raw = localStorage.getItem(key);
@@ -3881,21 +4505,61 @@ function writeBrowserJson(key: string, value: unknown) {
 
 function browserSettings(settings: AppSettings): SettingsView {
 	const cores = Math.max(1, navigator.hardwareConcurrency || 4);
+	const mcp = harnessMcpInfo({});
 	return {
 		...settings,
+		agent_review: mcp.agent_review,
+		mcp_enabled: mcp.enabled,
+		mcp_addr: mcp.configured_addr,
+		mcp_require_token: mcp.require_token,
 		cpu_cores: cores,
 		cpu_threads: Math.min(cores, Math.max(1, Math.round((cores * settings.cpu_percent) / 100))),
 		cpu_min_percent: MIN_CPU_PERCENT
 	};
 }
 
-// ---- diagnostics (logs) ----------------------------------------------------
-
-/** The platform log directory Kerf writes its logfile to, or `null` in the browser. */
-export async function logDir(): Promise<string | null> {
-	if (!inTauri()) return null;
-	return (await invoke<string>('log_dir')) ?? null;
+/**
+ * Put every preference back to its default (the old settings file is kept beside it as
+ * `settings.reset-<time>.json`) and resolve to the view in force. The recent-projects list is not a
+ * preference and stays. In the browser harness the remembered values are cleared.
+ */
+export async function resetSettings(): Promise<SettingsView> {
+	if (!inTauri()) {
+		try {
+			for (const key of [
+				CPU_KEY,
+				AUTO_ANALYSIS_KEY,
+				PROXY_SIZE_KEY,
+				PREVIEW_SOURCE_KEY,
+				LEGACY_TRANSCRIBE_KEY,
+				SAFE_AREAS_KEY,
+				LAYOUT_KEY,
+				THEME_KEY,
+				WORKSPACES_KEY,
+				KEYBINDINGS_KEY,
+				EDITING_KEY,
+				TIME_DISPLAY_KEY,
+				REOPEN_KEY
+			]) {
+				localStorage.removeItem(key);
+			}
+			// The review switch is a preference and goes back on; where the server listens is not.
+			harnessMcpInfo({ agent_review: true });
+		} catch {
+			// Storage blocked: there was nothing remembered to clear.
+		}
+		return getSettings();
+	}
+	return invoke<SettingsView>('reset_settings');
 }
+
+/** Show the settings file in the OS file manager. A no-op in the browser harness. */
+export async function revealSettingsFile(): Promise<void> {
+	if (!inTauri()) return;
+	await invoke('reveal_settings_file');
+}
+
+// ---- diagnostics (logs) ----------------------------------------------------
 
 /** Open the log directory in the OS file manager so the user can attach the logfile. */
 export async function revealLogs(): Promise<void> {

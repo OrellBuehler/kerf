@@ -18,7 +18,8 @@ import {
 	replaceConfirm,
 	type ImportChoice
 } from './caption-import-ui';
-import { attempt, errorMessage } from './ops';
+import { attempt, errorMessage, holdForPreview, report } from './ops';
+import { settings } from './settings.svelte';
 import type { TextStyle } from './style-presets';
 import { sampleSvg, svgDataUrl, svgFrame, svgPresetChoice } from './svg-titles';
 import type { SvgCheck, SvgOverlay, SvgPresetInfo, SvgPresetKind, TextOverlay } from './types';
@@ -26,7 +27,7 @@ import type { SvgCheck, SvgOverlay, SvgPresetInfo, SvgPresetKind, TextOverlay } 
 /** A plain title at the playhead. */
 export function addTextHere(): Promise<void> {
 	const at = Math.max(0, ui.time);
-	return attempt(() => editor.addTitle('Text', at, at + 3));
+	return attempt(() => editor.addTitle('Text', at, at + settings.editing.title_seconds));
 }
 
 /** Add a preset-styled overlay at the playhead: create, style, then (for faded
@@ -69,6 +70,7 @@ export function pickTitle(o: TextOverlay) {
  *  the generated set, so the button stays the same after the first press and
  *  only its label admits what it is doing. */
 export async function makeCaptions(): Promise<void> {
+	if (holdForPreview()) return;
 	if (!editor.timeline.tracks.some((t) => t.clips.length > 0)) {
 		toast.error('Put a clip on the timeline first');
 		return;
@@ -110,7 +112,7 @@ let importing = false;
  *  is left alone. Never throws; resolves `true` only when captions were imported
  *  (a cancelled picker or a declined confirmation is `false`, and silent). */
 export async function importCaptionFile(choice: ImportChoice = TIMELINE_CHOICE): Promise<boolean> {
-	if (importing) return false;
+	if (importing || holdForPreview()) return false;
 	let picked: CaptionFilePick | null;
 	try {
 		// Straight from the click: the browser harness opens its file input here.
@@ -134,7 +136,7 @@ export async function importCaptionFile(choice: ImportChoice = TIMELINE_CHOICE):
 		toast[importTone(summary)](describeImport(summary));
 		return true;
 	} catch (e) {
-		toast.error(errorMessage(e));
+		report(e);
 		return false;
 	} finally {
 		importing = false;

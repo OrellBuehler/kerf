@@ -44,7 +44,7 @@
 		resolveChoice
 	} from '$lib/caption-import-ui';
 	import { attempt } from '$lib/ops';
-	import { clock } from '$lib/clock';
+	import { timeDisplay } from '$lib/time-display.svelte';
 	import { tip } from '$lib/tip';
 
 	const uid = $props.id();
@@ -147,9 +147,9 @@
 <div class="k-overline" style="margin-bottom:6px">Add text</div>
 <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:6px;margin-bottom:14px">
 	{#each TEXT_STYLES as s (s.id)}
-		<Btn size="sm" icon="plus" iconSize={12} disabled={editor.busy} onclick={() => void addStyledTitle(s)}>{s.label}</Btn>
+		<Btn size="sm" icon="plus" iconSize={12} pending={editor.locked} onclick={() => void addStyledTitle(s)}>{s.label}</Btn>
 	{/each}
-	<Btn size="sm" icon="plus" iconSize={12} disabled={editor.busy} onclick={() => void addTextHere()}>Text</Btn>
+	<Btn size="sm" icon="plus" iconSize={12} pending={editor.locked} onclick={() => void addTextHere()}>Text</Btn>
 </div>
 <div class="k-overline" style="margin-bottom:6px">Animated</div>
 <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:6px;margin-bottom:{animatedOpen ? 6 : 14}px">
@@ -160,7 +160,7 @@
 		variant={animatedOpen ? 'primary' : 'secondary'}
 		aria-expanded={animatedOpen}
 		aria-controls="{uid}-animated"
-		disabled={editor.busy}
+		pending={editor.locked}
 		title="Animated titles: ready-made motion, or your own SVG, drawn into the preview and the export"
 		onclick={() => (animatedOpen = !animatedOpen)}>Animated</Btn
 	>
@@ -177,7 +177,7 @@
 				data-preset={p.kind}
 				title={p.hint}
 				aria-label="Add {p.label} at the playhead"
-				disabled={editor.busy}
+				pending={editor.locked}
 				style="height:auto;flex-direction:column;align-items:stretch;gap:5px;padding:5px"
 				onpointerenter={() => replay(p.kind)}
 				onfocus={(e: FocusEvent) => (e.currentTarget as HTMLElement).matches(':focus-visible') && replay(p.kind)}
@@ -198,7 +198,7 @@
 		<Tile
 			data-preset="custom"
 			title="Write your own animated SVG: starts from a small sample you edit in the Inspector"
-			disabled={editor.busy}
+			pending={editor.locked}
 			style="height:auto;flex-direction:column;align-items:stretch;justify-content:center;gap:5px;padding:5px"
 			onclick={addCustom}
 		>
@@ -218,19 +218,19 @@
 		<Chip pressed={ui.captionStyle === c.id} title={c.hint} onclick={() => (ui.captionStyle = c.id)}>{c.label}</Chip>
 	{/each}
 </div>
-<div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin-bottom:6px">
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(142px,1fr));gap:6px;margin-bottom:6px">
 	<div style="display:flex;gap:4px;min-width:0">
 		<Btn
 			size="sm"
-			disabled={editor.busy}
+			pending={editor.locked}
 			title={hasCaptions ? recaptionHint(captionCount) : CAPTION_HINT}
 			style="flex:1;min-width:0"
 			onclick={() => void makeCaptions()}
 		>
-			{hasCaptions ? 'Recaption' : 'Captions'}
+			{hasCaptions ? 'Regenerate captions' : 'Generate captions'}
 		</Btn>
 		{#if hasCaptions}
-			<IconBtn size={28} title={clearHint(captionCount)} disabled={editor.busy} onclick={() => void dropCaptions()}>
+			<IconBtn size={28} title={clearHint(captionCount)} pending={editor.locked} onclick={() => void dropCaptions()}>
 				<Icon n="trash" s={14} />
 			</IconBtn>
 		{/if}
@@ -247,7 +247,7 @@
 	>
 </div>
 <div style="margin-bottom:10px">
-	<Btn size="sm" icon="mic" disabled={editor.busy} title="Speak a script onto the timeline" style="width:100%" onclick={() => ui.openVoiceover()}
+	<Btn size="sm" icon="mic" pending={editor.locked} title="Speak a script onto the timeline" style="width:100%" onclick={() => ui.openVoiceover()}
 		>Write a voiceover…</Btn
 	>
 </div>
@@ -322,7 +322,7 @@
 					: ''}
 			</div>
 			<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap">
-				<Btn size="sm" variant="primary" icon="file-text" disabled={editor.busy} onclick={() => void chooseFile()}
+				<Btn size="sm" variant="primary" icon="file-text" pending={editor.locked} onclick={() => void chooseFile()}
 					>Choose file…</Btn
 				>
 				<Btn size="sm" variant="ghost" onclick={() => closeImport(true)}>Cancel</Btn>
@@ -349,13 +349,13 @@
 			<span style="flex:1;min-width:0;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 				>{o.text || '(empty)'}</span
 			>
-			<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);font-variant-numeric:tabular-nums">{clock(o.start)}</span>
+			<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);font-variant-numeric:tabular-nums">{timeDisplay.fmt(o.start)}</span>
 		</button>
 		<IconBtn
 			size={28}
 			data-tone="quiet"
 			title={`Remove ${o.text ? `“${o.text}”` : 'this title'}`}
-			disabled={editor.busy}
+			pending={editor.locked}
 			onclick={() => void attempt(() => editor.removeOverlay(o.id))}><Icon n="x" s={14} /></IconBtn
 		>
 	</div>
@@ -371,13 +371,13 @@
 		>
 			<Icon n="orbit" s={12} />
 			<span style="flex:1;min-width:0;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{svgDisplayName(o)}</span>
-			<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);font-variant-numeric:tabular-nums">{clock(o.start)}</span>
+			<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);font-variant-numeric:tabular-nums">{timeDisplay.fmt(o.start)}</span>
 		</button>
 		<IconBtn
 			size={28}
 			data-tone="quiet"
 			title={`Remove ${svgDisplayName(o) ? `“${svgDisplayName(o)}”` : 'this animated title'}`}
-			disabled={editor.busy}
+			pending={editor.locked}
 			onclick={() => void attempt(() => editor.removeSvgOverlay(o.id))}><Icon n="x" s={14} /></IconBtn
 		>
 	</div>

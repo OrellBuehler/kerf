@@ -13,7 +13,9 @@
 	const clip = $derived(editor.selectedClip);
 	const current = $derived(clip?.transition_in ?? null);
 	const reason = $derived(clip ? null : 'Select a clip on the timeline to set the transition into it.');
-	const off = $derived(reason !== null || editor.busy);
+	const off = $derived(reason !== null);
+	/** An edit is in flight, or the proposal is on screen: the controls ignore a press but keep focus. */
+	const hold = $derived(editor.locked);
 	/** The clip the length field took focus on and what was typed: its `change` comes with the blur, after the click that selects another clip has moved the selection and re-rendered the field with that clip's length. */
 	const length = new FieldEdits<string | null>();
 	const clipById = (id: string | null) => editor.timeline.tracks.flatMap((t) => t.clips).find((c) => c.id === id);
@@ -44,7 +46,8 @@
 						min="0.05"
 						step="0.1"
 						value={current.duration}
-						disabled={editor.busy}
+						readonly={editor.locked}
+						aria-disabled={editor.locked || undefined}
 						aria-label="Transition length in seconds"
 						onfocus={(e) => length.focus(e.currentTarget, editor.selectedClipId)}
 						oninput={(e) => length.input(e.currentTarget, e.currentTarget.value)}
@@ -71,6 +74,7 @@
 		<Chip
 			pressed={!!clip && !current}
 			disabled={off}
+					pending={hold}
 			title={reason ?? 'A hard cut — no transition into this clip'}
 			onclick={() => clip && void attempt(() => editor.setTransition(clip.id, null))}>None</Chip
 		>
@@ -84,6 +88,7 @@
 				<Chip
 					pressed={current?.kind === o.id}
 					disabled={off}
+					pending={hold}
 					title={reason ?? o.label}
 					onclick={() => pick(o.id)}>{o.label}</Chip
 				>

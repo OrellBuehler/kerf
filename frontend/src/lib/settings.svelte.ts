@@ -9,10 +9,13 @@
 // so this holds only the resolved view and writes through `api.ts` — which
 // keeps the browser harness working over localStorage.
 
-import { exportThemeFile, getSettings, importThemeFile, setSettings } from './api';
+import { clearRecentProjects, confirmAction, exportThemeFile, getSettings, importThemeFile, recentProjects, resetSettings, setMcpSettings, setSettings } from './api';
 import { toast } from './notifications.svelte';
 import { ui } from './editor-ui.svelte';
 import { mediaStatus } from './media-status.svelte';
+import { timeDisplay } from './time-display.svelte';
+import { CONFIRM } from './confirm-copy';
+import { DEFAULT_EDITING, clampSeconds, parseEditing, type EditingPrefs } from './editing-prefs';
 import { gpuPreview } from './gpu-preview.svelte';
 import { applyTheme, parseTheme, PRESETS, presetIdFor, themeJson, clampShape, upgradeStoredTheme, type ColorToken, type PresetId, type ShapeToken, type ThumbStyle, type Theme } from './theme';
 import { singleFlight } from './single-flight';
@@ -60,7 +63,7 @@ import {
 	type ResetPlan,
 	type Resolution
 } from './keymap';
-import type { AnalysisKind, AppSettings, AutoAnalysis, PreviewSource, ProxySize, SettingsView } from './types';
+import type { AnalysisKind, AutoAnalysis, PreviewSource, ProxySize, SettingsPatch, SettingsView, TimeDisplay } from './types';
 import type { TipSpec } from './tip';
 
 /** The named budgets. The slider still offers everything in between; these are
@@ -86,8 +89,17 @@ export const CPU_PRESETS = [
 	}
 ] as const;
 
-/** The sections of the settings dialog (`SettingsDialog.svelte` lists them). */
-export type SettingsSection = 'performance' | 'analysis' | 'speech' | 'preview' | 'appearance' | 'keyboard';
+/** The sections of the settings dialog (`settings-index.ts` lists them, in order). */
+export type SettingsSection =
+	| 'general'
+	| 'appearance'
+	| 'editing'
+	| 'preview'
+	| 'performance'
+	| 'analysis'
+	| 'agent'
+	| 'keyboard'
+	| 'advanced';
 
 class SettingsStore {
 	open = $state(false);
@@ -122,6 +134,22 @@ class SettingsStore {
 	 *  allows it (experimental; off by default). The JPEG path is the fallback for
 	 *  every frame it does not draw and for every failure. */
 	gpuPreview = $state(false);
+	/** How times are written everywhere (`timeDisplay.mode` follows it). */
+	timeMode = $state<TimeDisplay>('timecode');
+	/** Open the project that was open last when Kerf starts with none named. */
+	reopenLast = $state(false);
+	/** The `.kerf` files opened or saved most recently, newest first, the vanished ones dropped
+	 *  (`refreshRecent`); File › Open Recent reads this. */
+	recent = $state<string[]>([]);
+	/** The editing defaults (Settings › Editing). `snap` is only the *start* state of the timeline's toggle. */
+	editing = $state<EditingPrefs>({ ...DEFAULT_EDITING });
+	private editingRead = false;
+	/** Counts the settings changes that came from outside (an agent's `set_settings`): a page that holds its own
+	 *  copy of something the backend owns (the Agent section) reads it again when this moves. */
+	externalChanges = $state(0);
+	/** Whether an agent's edits wait for the user's review. Written through `setMcpSettings` (the Agent
+	 *  section), read back here so the panels can say when it is off. */
+	agentReview = $state(true);
 	cpuCores = $state(1);
 	cpuThreads = $state(1);
 	cpuMinPercent = $state(10);
@@ -174,6 +202,16 @@ class SettingsStore {
 		this.previewSource = view.preview_source;
 		this.safeAreas = view.safe_areas;
 		this.gpuPreview = view.gpu_preview ?? false;
+		this.timeMode = view.time_display ?? 'timecode';
+		timeDisplay.mode = this.timeMode;
+		this.reopenLast = view.reopen_last_project ?? false;
+		this.agentReview = view.agent_review ?? true;
+		this.editing = parseEditing(view.editing);
+		if (!this.editingRead) {
+			// The timeline starts with snapping as the preference says; what it is toggled to after that is the session's.
+			ui.snap = this.editing.snap;
+			this.editingRead = true;
+		}
 		if (this.gpuPreview && !gpuPreview.status) void gpuPreview.refresh();
 		this.cpuCores = view.cpu_cores;
 		this.cpuThreads = view.cpu_threads;
@@ -200,9 +238,20 @@ class SettingsStore {
 		this.loaded = true;
 	}
 
+	/** The settings changed behind our back (the `settings-changed` event, with the view in force): take them.
+	 *  An event without the view reads them again. */
+	noteChanged(view: SettingsView | null | undefined) {
+		if (view && typeof view === 'object') this.absorb(view);
+		else void this.load();
+		this.externalChanges++;
+		void ui.loadTranscriptionStatus();
+		void mediaStatus.refresh();
+	}
+
 	async load() {
 		try {
 			this.absorb(await getSettings());
+			void this.refreshRecent();
 		} catch (e) {
 			// Not worth a toast at launch: the dialog just shows the defaults.
 			console.error('could not read settings', e);
@@ -213,7 +262,7 @@ class SettingsStore {
 		}
 	}
 
-	private async write(patch: Partial<AppSettings>, what: string): Promise<boolean> {
+	private async write(patch: SettingsPatch, what: string): Promise<boolean> {
 		this.saving = true;
 		try {
 			this.absorb(await setSettings(patch));
@@ -293,6 +342,94 @@ class SettingsStore {
 		await this.write({ gpu_preview: on }, 'GPU preview setting');
 		await gpuPreview.refresh();
 		ui.refreshPreview();
+	}
+
+	/** How times are written. Every readout follows at once (`timeDisplay.mode`); the write confirms it. */
+	async setTimeMode(mode: TimeDisplay) {
+		if (mode === this.timeMode) return;
+		this.timeMode = mode;
+		timeDisplay.mode = mode;
+		await this.write({ time_display: mode }, 'time display setting');
+	}
+
+	async setReopenLast(on: boolean) {
+		if (on === this.reopenLast) return;
+		this.reopenLast = on;
+		await this.write({ reopen_last_project: on }, 'launch setting');
+	}
+
+	/** Re-read the recent projects: the ones whose file is gone are dropped (and forgotten by the backend). */
+	async refreshRecent() {
+		try {
+			this.recent = await recentProjects();
+		} catch {
+			/* a list that cannot be read is an empty menu, not a toast */
+		}
+	}
+
+	/** Forget the recent projects once the user has said so (File › Open Recent › Clear, Settings › General). */
+	async clearRecentAsked() {
+		const c = CONFIRM.clearRecent;
+		if (await confirmAction(c.message, c.title, c)) await this.clearRecent();
+	}
+
+	async clearRecent() {
+		try {
+			await clearRecentProjects();
+			this.recent = [];
+		} catch (e) {
+			toast.error("Couldn't clear the recent projects", { description: String(e) });
+		}
+	}
+
+	/** Change the editing defaults and write them. `snap` also moves the timeline's toggle now, so what the
+	 *  setting says is what the toolbar shows; the toggle itself stays a session choice. */
+	async setEditing(change: Partial<EditingPrefs>) {
+		const next: EditingPrefs = {
+			snap: change.snap ?? this.editing.snap,
+			still_seconds: clampSeconds(change.still_seconds ?? this.editing.still_seconds, DEFAULT_EDITING.still_seconds),
+			title_seconds: clampSeconds(change.title_seconds ?? this.editing.title_seconds, DEFAULT_EDITING.title_seconds)
+		};
+		if (JSON.stringify(next) === JSON.stringify(this.editing)) return;
+		this.editing = next;
+		if (change.snap !== undefined) ui.snap = next.snap;
+		await this.write({ editing: next }, 'editing defaults');
+	}
+
+	/** Hold an agent's edits for review (the default) or let them land directly. The write goes through the agent
+	 *  switches (`setMcpSettings`), which the agent itself cannot reach; what comes back is what is in force. */
+	async setAgentReview(on: boolean): Promise<boolean> {
+		try {
+			this.agentReview = (await setMcpSettings({ agent_review: on })).agent_review;
+			return true;
+		} catch (e) {
+			toast.error("Couldn't change the review setting", { description: String(e) });
+			return false;
+		}
+	}
+
+	/** Put every preference back to its default (the backend keeps the old file beside the new one). What was
+	 *  read once — workspaces, shortcuts, the theme, the timeline's starting snap — is read again from the
+	 *  fresh view; the caller rebuilds the dock (`workspace.rebuild()`; this module cannot import it). */
+	async resetAll(): Promise<boolean> {
+		if (this.themeTimer) {
+			clearTimeout(this.themeTimer);
+			this.themeTimer = null;
+		}
+		this.themeDirty = false;
+		try {
+			const view = await resetSettings();
+			this.workspacesRead = false;
+			this.keysRead = false;
+			this.editingRead = false;
+			this.absorb(view);
+			await Promise.all([ui.loadTranscriptionStatus(), mediaStatus.refresh()]);
+			ui.refreshPreview();
+			return true;
+		} catch (e) {
+			toast.error("Couldn't reset the settings", { description: String(e) });
+			return false;
+		}
 	}
 
 	/** The tab the library shows in the active workspace. Each workspace keeps

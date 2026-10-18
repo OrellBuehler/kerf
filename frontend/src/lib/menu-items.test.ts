@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { MenuItem } from './context-menu.svelte';
-import { muteItem, removeRows, tidyMenu, type RemoveRows } from './menu-items';
+import { heldForPreview, muteItem, removeRows, tidyMenu, type RemoveRows } from './menu-items';
 
 const item = (label: string): MenuItem => ({ label, action: () => {} });
 const sep: MenuItem = { type: 'separator' };
@@ -104,5 +104,34 @@ describe('removeRows', () => {
 		});
 		for (const i of r) i.action();
 		expect(calls).toEqual(['remove:false', 'remove:true', 'alone:false', 'alone:true']);
+	});
+});
+
+describe('heldForPreview', () => {
+	const rows: MenuItem[] = [
+		{ label: 'Duplicate', action: () => {} },
+		{ type: 'separator' },
+		{ type: 'header', label: 'Clip' },
+		{ label: 'Remove', danger: true, disabled: false, reason: 'Select a clip first', action: () => {} },
+		{ type: 'info', label: 'Analyzed', value: '2' }
+	];
+
+	test('is the same rows when there is no preview', () => {
+		expect(heldForPreview(rows, false)).toEqual(rows);
+	});
+
+	test('turns every action off with the one reason, and leaves separators, headers and facts as they are', () => {
+		const held = heldForPreview(rows, true);
+		expect(held).toHaveLength(rows.length);
+		expect(held[0]).toMatchObject({ label: 'Duplicate', disabled: true, reason: 'Exit the proposal preview to edit' });
+		expect(held[1]).toEqual(rows[1]);
+		expect(held[2]).toEqual(rows[2]);
+		expect(held[3]).toMatchObject({ label: 'Remove', danger: true, disabled: true, reason: 'Exit the proposal preview to edit' });
+		expect(held[4]).toEqual(rows[4]);
+	});
+
+	test('does not touch the rows it was given', () => {
+		heldForPreview(rows, true);
+		expect((rows[0] as { disabled?: boolean }).disabled).toBeUndefined();
 	});
 });

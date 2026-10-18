@@ -7,7 +7,7 @@
 
 import { MIN_CLIP, type TrimBounds } from './ripple-trim';
 import { trimEdit } from './frames';
-import { formatTimecode } from './timecode';
+import { formatTime, type TimeMode } from './time-format';
 import { deltaLabel, edgeFrameTime, type MonitorCell, type Readout, type TrimMonitor } from './trim-tools';
 import type { Clip, StreamKind } from './types';
 
@@ -42,10 +42,12 @@ export function trimEdgeReadout(o: {
 	fps: number;
 	/** The pointer asked for somewhere the bounds did not allow, and why. */
 	limit: string | null;
+	/** How a time reads (`time-format.ts`); timecode when left out. */
+	mode?: TimeMode;
 }): Readout {
 	const was = o.end - o.start;
 	const now = o.edge === 'l' ? o.end - o.pos : o.pos - o.start;
-	const title = `Trim ${o.edge === 'l' ? 'in' : 'out'} ${deltaLabel(now - was, o.fps)} · length ${formatTimecode(now, o.fps)}`;
+	const title = `Trim ${o.edge === 'l' ? 'in' : 'out'} ${deltaLabel(now - was, o.fps)} · length ${formatTime(now, o.fps, o.mode)}`;
 	return o.limit
 		? { title, detail: o.limit[0].toUpperCase() + o.limit.slice(1), tone: 'limit' }
 		: { title, detail: null, tone: 'ok' };
@@ -60,18 +62,19 @@ export function moveReadout(o: {
 	fps: number;
 	count: number;
 	refused: string | null;
+	mode?: TimeMode;
 }): Readout {
 	const many = o.count > 1 ? ` · ${o.count} clips` : '';
-	const title = `Move ${deltaLabel(o.delta, o.fps)} · ${formatTimecode(o.start, o.fps)} · ${o.track}${many}`;
+	const title = `Move ${deltaLabel(o.delta, o.fps)} · ${formatTime(o.start, o.fps, o.mode)} · ${o.track}${many}`;
 	return o.refused ? { title, detail: o.refused[0].toUpperCase() + o.refused.slice(1), tone: 'refused' } : { title, detail: null, tone: 'ok' };
 }
 
 /** The readout of a razor cut about to be made at `at`; `along` names the lanes a linked clip's
  *  partners are cut on too, and a clip too short for a cut on a frame says so. */
-export function cutReadout(o: { at: number | null; fps: number; along: readonly string[] }): Readout {
+export function cutReadout(o: { at: number | null; fps: number; along: readonly string[]; mode?: TimeMode }): Readout {
 	if (o.at === null) return { title: 'Cut', detail: 'That clip is too short to cut on a frame', tone: 'refused' };
 	const along = o.along.length > 0 ? ` · with ${o.along.join(', ')}` : '';
-	return { title: `Cut ${formatTimecode(o.at, o.fps)}${along}`, detail: null, tone: 'ok' };
+	return { title: `Cut ${formatTime(o.at, o.fps, o.mode)}${along}`, detail: null, tone: 'ok' };
 }
 
 /**
@@ -86,7 +89,8 @@ export function trimEdgeMonitor(
 	pos: number,
 	fps: number,
 	kind: StreamKind,
-	readout: Readout
+	readout: Readout,
+	mode?: TimeMode
 ): TrimMonitor | null {
 	if (kind !== 'video') return null;
 	const left = trimEdit(clip, edge, pos);
@@ -99,7 +103,7 @@ export function trimEdgeMonitor(
 		clipId: clip.id,
 		assetId: clip.asset_id,
 		time,
-		timecode: formatTimecode(time, fps)
+		timecode: formatTime(time, fps, mode)
 	};
 	return { ...readout, cells: [cell] };
 }

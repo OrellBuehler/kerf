@@ -350,10 +350,11 @@ const ACTION_LIST = [
 	{
 		id: 'file.save',
 		repeat: false,
-		label: 'Save project as…',
+		label: 'Save project…',
 		group: 'project',
 		context: 'global',
-		defaults: ['Mod+S', 'Mod+Shift+S']
+		defaults: ['Mod+S', 'Mod+Shift+S'],
+		hint: 'Writes the project to a .kerf file you choose. Once it has a file, the same command saves a copy under a new name (the menu then says “Save project as…”).'
 	},
 	{ id: 'file.import', repeat: false, label: 'Import media…', group: 'project', context: 'global', defaults: ['Mod+I'] },
 	{ id: 'file.export', repeat: false, label: 'Export…', group: 'project', context: 'global', defaults: ['Mod+E'] },
@@ -430,6 +431,15 @@ const ACTION_LIST = [
 	{ id: 'edit.cut', repeat: false, label: 'Cut', group: 'edit', context: 'global', defaults: ['Mod+X'] },
 	{ id: 'edit.paste', repeat: false, label: 'Paste at playhead', group: 'edit', context: 'global', defaults: ['Mod+V'] },
 	{ id: 'edit.duplicate', repeat: false, label: 'Duplicate', group: 'edit', context: 'global', defaults: ['Mod+D'] },
+	{
+		id: 'edit.split',
+		repeat: false,
+		label: 'Split at playhead',
+		group: 'edit',
+		context: 'global',
+		defaults: ['Mod+K'],
+		hint: 'Cuts the selected clips the playhead is inside — or, with nothing selected, every clip under it — on the frame it is on. Linked clips are cut together.'
+	},
 	{
 		id: 'edit.delete',
 		repeat: false,
@@ -538,6 +548,60 @@ const ACTION_LIST = [
 		hint: 'Drag a clip along its track; the clips touching it give way.'
 	},
 	{
+		id: 'edit.rollBack',
+		repeat: false,
+		label: 'Roll the cut back one frame',
+		group: 'tools',
+		context: 'global',
+		defaults: ['<'],
+		hint: 'Moves the cut nearest the playhead (between two touching clips) one frame earlier: one clip gains what the other loses, nothing after the pair moves. The playhead follows the cut.'
+	},
+	{
+		id: 'edit.rollForward',
+		repeat: false,
+		label: 'Roll the cut forward one frame',
+		group: 'tools',
+		context: 'global',
+		defaults: ['>'],
+		hint: 'Moves the cut nearest the playhead one frame later; the playhead follows it.'
+	},
+	{
+		id: 'edit.slipBack',
+		repeat: false,
+		label: 'Slip the footage back one frame',
+		group: 'tools',
+		context: 'global',
+		defaults: ['Alt+,'],
+		hint: 'The selected clip stays where it is and shows a frame earlier in its footage.'
+	},
+	{
+		id: 'edit.slipForward',
+		repeat: false,
+		label: 'Slip the footage forward one frame',
+		group: 'tools',
+		context: 'global',
+		defaults: ['Alt+.'],
+		hint: 'The selected clip stays where it is and shows a frame later in its footage.'
+	},
+	{
+		id: 'edit.slideBack',
+		repeat: false,
+		label: 'Slide the clip back one frame',
+		group: 'tools',
+		context: 'global',
+		defaults: ['Mod+Alt+,'],
+		hint: 'The selected clip moves a frame earlier along its track; the clips touching it give way and its footage is unchanged.'
+	},
+	{
+		id: 'edit.slideForward',
+		repeat: false,
+		label: 'Slide the clip forward one frame',
+		group: 'tools',
+		context: 'global',
+		defaults: ['Mod+Alt+.'],
+		hint: 'The selected clip moves a frame later along its track; the clips touching it give way.'
+	},
+	{
 		id: 'tool.snap',
 		repeat: false,
 		label: 'Toggle snapping',
@@ -640,9 +704,18 @@ const ACTION_LIST = [
 	},
 
 	{
-		id: 'app.keyboard',
+		id: 'app.shortcuts',
 		repeat: false,
 		label: 'Keyboard shortcuts…',
+		group: 'help',
+		context: 'global',
+		defaults: ['?'],
+		hint: 'A read-only list of every shortcut in force. Customize keyboard shortcuts… is where they are changed.'
+	},
+	{
+		id: 'app.keyboard',
+		repeat: false,
+		label: 'Customize keyboard shortcuts…',
 		group: 'help',
 		context: 'global',
 		defaults: [],
@@ -1082,6 +1155,7 @@ export const KEY_PRESETS: readonly KeyPreset[] = [
 			'edit.trimStart': ['{'],
 			'edit.trimEnd': ['}'],
 			'edit.link': ['Mod+Alt+L'],
+			'edit.split': ['Mod+\\'],
 			'tool.pointer': ['A'],
 			'tool.razor': ['B'],
 			'tool.roll': ['T'],
@@ -1107,6 +1181,7 @@ export const KEY_PRESETS: readonly KeyPreset[] = [
 			'edit.trimStart': ['Alt+['],
 			'edit.trimEnd': ['Alt+]'],
 			'edit.detachAudio': ['Ctrl+Shift+S'],
+			'edit.split': ['Mod+B'],
 			'tool.pointer': ['A'],
 			'tool.razor': ['B'],
 			'tool.roll': ['T'],

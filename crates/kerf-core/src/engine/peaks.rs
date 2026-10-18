@@ -30,7 +30,7 @@
 //!   queueing behind an export — but it runs thread-capped and niced, at most
 //!   [`MAX_CONCURRENT_DECODES`] at a time (a freshly opened project asks for
 //!   every clip's waveform at once), and concurrent requests for the *same*
-//!   file share one decode ([`shared_pyramid`]).
+//!   file share one decode ([`shared_pyramid_cancellable`]).
 //! * **Nothing waits on ffmpeg forever:** the pipe is read on a side thread and
 //!   a decode that produces nothing for [`DECODE_STALL`] is killed.
 //! * **Cached at `<cache>/kerf/waveforms/<hash>.bin`**, keyed by the source's
@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::cli::{bg_command, command, ffmpeg_bin, ffprobe_bin, fnv1a, launch_err, source_key};
+use super::cli::{bg_command, command, ffmpeg_bin, ffprobe_bin, fnv1a, launch_err, reap, source_key};
 use super::cpu;
 use crate::error::{Error, Result};
 
@@ -654,11 +654,29 @@ pub(super) fn drain_tail(mut stderr: impl Read) -> String {
     String::from_utf8_lossy(&tail).into_owned()
 }
 
-/// Read a running ffmpeg's stdout as f32le frames of `frame_bytes` bytes each
-/// and hand them, whole frames only, to `on_frames`, until it ends. A child that
-/// produces nothing for `stall` is killed and the call fails; a non-zero exit
-/// fails it too. Always reaps the child.
-pub(super) fn pump_pcm(mut child: Child, frame_bytes: usize, stall: Duration, on_frames: &mut dyn FnMut(&[f32])) -> Result<()> {
+/// [`pump_pcm_cancellable`] with nothing to cancel it.
+#[cfg(test)]
+pub(super) fn pump_pcm(child: Child, frame_bytes: usize, stall: Duration, on_frames: &mut dyn FnMut(&[f32])) -> Result<()> {
+    pump_pcm_cancellable(child, frame_bytes, stall, &|| false, on_frames)
+}
+
+/// How often [`pump_pcm_cancellable`] looks at its cancel while the decoder is quiet.
+const PUMP_POLL: Duration = Duration::from_millis(100);
+
+/// Read a running ffmpeg's stdout as f32le frames of `frame_bytes` bytes each and hand them,
+/// whole frames only, to `on_frames`, until it ends. A child that produces nothing for `stall` is
+/// killed and the call fails; a non-zero exit fails it too. Always reaps the child.
+///
+/// For a job someone can stop: `cancel` is polled between chunks and every [`PUMP_POLL`] while
+/// the decoder is silent; once true the child is killed and the call is [`Error::Cancelled`]
+/// (whatever `on_frames` had been handed stays handed).
+pub(super) fn pump_pcm_cancellable(
+    mut child: Child,
+    frame_bytes: usize,
+    stall: Duration,
+    cancel: &dyn Fn() -> bool,
+    on_frames: &mut dyn FnMut(&[f32]),
+) -> Result<()> {
     let stderr = child.stderr.take().expect("stderr piped");
     let stderr_handle = std::thread::spawn(move || drain_tail(stderr));
 
@@ -687,9 +705,12 @@ pub(super) fn pump_pcm(mut child: Child, frame_bytes: usize, stall: Duration, on
     // here for the next one.
     let mut pending: Vec<u8> = Vec::new();
     let mut floats: Vec<f32> = Vec::new();
+    let mut heard = Instant::now();
+    let mut cancelled = false;
     let failure = loop {
-        match rx.recv_timeout(stall) {
+        match rx.recv_timeout(stall.min(PUMP_POLL)) {
             Ok(Ok(bytes)) => {
+                heard = Instant::now();
                 pending.extend_from_slice(&bytes);
                 let whole = pending.len() / frame_bytes * frame_bytes;
                 if whole > 0 {
@@ -702,20 +723,29 @@ pub(super) fn pump_pcm(mut child: Child, frame_bytes: usize, stall: Duration, on
             Ok(Err(e)) => break Some(format!("waveform read failed: {e}")),
             Err(RecvTimeoutError::Disconnected) => break None,
             Err(RecvTimeoutError::Timeout) => {
-                break Some(format!(
-                    "waveform decode stalled: ffmpeg produced no audio for {}s",
-                    stall.as_secs_f32()
-                ));
+                if heard.elapsed() >= stall {
+                    break Some(format!(
+                        "waveform decode stalled: ffmpeg produced no audio for {}s",
+                        stall.as_secs_f32()
+                    ));
+                }
             }
+        }
+        if cancel() {
+            cancelled = true;
+            break None;
         }
     };
 
-    if failure.is_some() {
+    if failure.is_some() || cancelled {
         let _ = child.kill();
     }
     drop(rx);
-    let status = child.wait().map_err(|e| Error::Engine(format!("ffmpeg wait failed: {e}")))?;
+    let status = reap(&mut child)?;
     let stderr_text = stderr_handle.join().unwrap_or_default();
+    if cancelled {
+        return Err(Error::Cancelled);
+    }
     let tail = || {
         let mut tail: Vec<&str> = stderr_text.lines().rev().take(12).collect();
         tail.reverse();
@@ -747,14 +777,18 @@ fn slots() -> &'static Slots {
 }
 
 impl DecodeSlot {
-    fn acquire() -> Self {
+    /// A turn, waiting for one; gives up with [`Error::Cancelled`] once `cancel` is true.
+    fn acquire_cancellable(cancel: &dyn Fn() -> bool) -> Result<Self> {
         let slots = slots();
         let mut busy = slots.busy.lock().unwrap_or_else(|e| e.into_inner());
         while *busy >= MAX_CONCURRENT_DECODES {
-            busy = slots.free.wait(busy).unwrap_or_else(|e| e.into_inner());
+            if cancel() {
+                return Err(Error::Cancelled);
+            }
+            busy = slots.free.wait_timeout(busy, PUMP_POLL).unwrap_or_else(|e| e.into_inner()).0;
         }
         *busy += 1;
-        DecodeSlot
+        Ok(DecodeSlot)
     }
 }
 
@@ -767,9 +801,9 @@ impl Drop for DecodeSlot {
 }
 
 /// Decode `path` and build its pyramid — no cache involved.
-fn compute_pyramid(path: &Path) -> Result<WaveformPyramid> {
+fn compute_pyramid(path: &Path, cancel: &dyn Fn() -> bool) -> Result<WaveformPyramid> {
     let channels = probe_channels(path)?;
-    let _slot = DecodeSlot::acquire();
+    let _slot = DecodeSlot::acquire_cancellable(cancel)?;
     let bin = ffmpeg_bin();
     // Ungated (see the module docs), but capped and niced like every other
     // background read.
@@ -783,7 +817,7 @@ fn compute_pyramid(path: &Path) -> Result<WaveformPyramid> {
         .spawn()
         .map_err(|e| launch_err(&bin, e))?;
     let mut builder = PyramidBuilder::new(usize::from(channels));
-    pump_pcm(child, usize::from(channels) * 4, DECODE_STALL, &mut |frames| {
+    pump_pcm_cancellable(child, usize::from(channels) * 4, DECODE_STALL, cancel, &mut |frames| {
         builder.push(frames);
     })?;
     Ok(builder.finish())
@@ -792,12 +826,19 @@ fn compute_pyramid(path: &Path) -> Result<WaveformPyramid> {
 /// `path`'s pyramid through `cache_file` when given: read and validated if it is
 /// there, otherwise decoded and written (a failed write is logged, not fatal —
 /// the pyramid is still good).
+#[cfg(test)]
 fn pyramid_with_cache(path: &Path, cache_file: Option<&Path>) -> Result<WaveformPyramid> {
+    pyramid_with_cache_cancellable(path, cache_file, &|| false)
+}
+
+/// [`pyramid_with_cache`] that gives up with [`Error::Cancelled`] once `cancel` is true — while it
+/// waits for a decode slot or while the audio decodes (the ffmpeg is killed; nothing is cached).
+fn pyramid_with_cache_cancellable(path: &Path, cache_file: Option<&Path>, cancel: &dyn Fn() -> bool) -> Result<WaveformPyramid> {
     if let Some(hit) = cache_file.and_then(read_cache) {
         return Ok(hit);
     }
     let started = Instant::now();
-    let pyramid = compute_pyramid(path)?;
+    let pyramid = compute_pyramid(path, cancel)?;
     tracing::debug!(
         path = %path.display(),
         seconds = pyramid.duration(),
@@ -815,9 +856,9 @@ fn pyramid_with_cache(path: &Path, cache_file: Option<&Path>) -> Result<Waveform
 /// The first audio stream of `path` as a [`WaveformPyramid`]: from the disk
 /// cache when a valid one exists, else one ffmpeg decode that is then cached.
 /// Blocking and heavy on a miss — run it off the project lock. Callers that ask
-/// repeatedly want [`shared_pyramid`], which also memoizes in process.
+/// repeatedly want [`shared_pyramid_cancellable`], which also memoizes in process.
 pub fn waveform_pyramid(path: &Path) -> Result<WaveformPyramid> {
-    pyramid_with_cache(path, cache_path(path).as_deref())
+    pyramid_with_cache_cancellable(path, cache_path(path).as_deref(), &|| false)
 }
 
 // ---- the in-process memo ---------------------------------------------------
@@ -883,7 +924,12 @@ fn memo_get(key: &str) -> Option<Arc<WaveformPyramid>> {
 /// one file collapsed into a single load: a timeline with ten clips of the same
 /// asset asks for the same pyramid ten times in the same instant, and only the
 /// first should decode.
-pub fn shared_pyramid(path: &Path) -> Result<Arc<WaveformPyramid>> {
+///
+/// Gives up with [`Error::Cancelled`] once `cancel` is true: while it waits
+/// behind another request's decode of the same file, for a decode slot, or while it decodes itself
+/// (that request's decode is not stopped by this one's cancel; a decode that was cancelled caches
+/// nothing, and the next request starts it afresh).
+pub fn shared_pyramid_cancellable(path: &Path, cancel: &dyn Fn() -> bool) -> Result<Arc<WaveformPyramid>> {
     static FLIGHTS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
     let flights = FLIGHTS.get_or_init(|| Mutex::new(HashMap::new()));
 
@@ -899,12 +945,24 @@ pub fn shared_pyramid(path: &Path) -> Result<Arc<WaveformPyramid>> {
             .entry(key.clone())
             .or_default(),
     );
-    let result = {
-        let _turn = flight.lock().unwrap_or_else(|e| e.into_inner());
+    let result = (|| {
+        // Wait for our turn, looking at the cancel while we do.
+        let _turn = loop {
+            match flight.try_lock() {
+                Ok(turn) => break turn,
+                Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if cancel() {
+                        return Err(Error::Cancelled);
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        };
         // Whoever held the turn before us has probably just loaded it.
         match memo_get(&key) {
             Some(hit) => Ok(hit),
-            None => waveform_pyramid(path).map(|p| {
+            None => pyramid_with_cache_cancellable(path, cache_path(path).as_deref(), cancel).map(|p| {
                 let p = Arc::new(p);
                 memo()
                     .lock()
@@ -913,7 +971,7 @@ pub fn shared_pyramid(path: &Path) -> Result<Arc<WaveformPyramid>> {
                 p
             }),
         }
-    };
+    })();
     // Forget the flight once nobody else is queued on it (the map's reference
     // and ours are the two that remain).
     let mut map = flights.lock().unwrap_or_else(|e| e.into_inner());
@@ -924,10 +982,26 @@ pub fn shared_pyramid(path: &Path) -> Result<Arc<WaveformPyramid>> {
 }
 
 /// `[start, end)` source seconds of `path`'s audio as `buckets` peaks per
-/// channel — [`shared_pyramid`] then [`waveform_range`]. Blocking (a first call
+/// channel — [`shared_pyramid_cancellable`] then [`waveform_range`]. Blocking (a first call
 /// decodes the whole file); run it off the project lock.
 pub fn waveform_range_of(path: &Path, start: f64, end: f64, buckets: usize) -> Result<WaveformRange> {
-    Ok(waveform_range(&*shared_pyramid(path)?, start, end, buckets))
+    waveform_range_of_cancellable(path, start, end, buckets, &|| false)
+}
+
+/// [`waveform_range_of`] that gives up with [`Error::Cancelled`] once `cancel` is true.
+pub fn waveform_range_of_cancellable(
+    path: &Path,
+    start: f64,
+    end: f64,
+    buckets: usize,
+    cancel: &dyn Fn() -> bool,
+) -> Result<WaveformRange> {
+    Ok(waveform_range(
+        &*shared_pyramid_cancellable(path, cancel)?,
+        start,
+        end,
+        buckets,
+    ))
 }
 
 #[cfg(test)]
@@ -1623,6 +1697,44 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_cancel_stops_a_decode_that_is_still_producing() {
+        let started = Instant::now();
+        let mut got = 0usize;
+        let err = pump_pcm_cancellable(
+            fake_decoder("while true; do printf 'aaaa'; sleep 0.02; done"),
+            4,
+            Duration::from_secs(30),
+            &|| started.elapsed() > Duration::from_millis(400),
+            &mut |f| got += f.len(),
+        )
+        .expect_err("cancelled");
+        assert!(matches!(err, Error::Cancelled), "{err:?}");
+        assert!(got > 0, "what had arrived was delivered");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "killed promptly: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_reaches_a_decode_that_is_silent() {
+        let started = Instant::now();
+        let err = pump_pcm_cancellable(
+            fake_decoder("exec sleep 60"),
+            4,
+            Duration::from_secs(30),
+            &|| started.elapsed() > Duration::from_millis(300),
+            &mut |_| {},
+        )
+        .expect_err("cancelled");
+        assert!(matches!(err, Error::Cancelled), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_decoder_that_fails_reports_why() {
         let err = pump_pcm(
             fake_decoder("echo no such stream >&2; exit 3"),
@@ -1822,7 +1934,9 @@ mod tests {
         let dir = Scratch::new("shared");
         let wav = stereo_tone(&dir);
         let pyramids: Vec<Arc<WaveformPyramid>> = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..6).map(|_| s.spawn(|| shared_pyramid(&wav).expect("pyramid"))).collect();
+            let handles: Vec<_> = (0..6)
+                .map(|_| s.spawn(|| shared_pyramid_cancellable(&wav, &|| false).expect("pyramid")))
+                .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
         // One load, handed to everyone: a second decode would be a second Arc.

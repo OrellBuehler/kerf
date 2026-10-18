@@ -40,7 +40,8 @@ import { toFixedEven } from './format-fixed';
 import { quantizeTime, snapToFrame, splitPoint } from './frames';
 import { DIFF_EPS } from './ripple';
 import { gestureReason } from './link-ui';
-import { formatTimecode } from './timecode';
+import { trim } from './link-ops';
+import { formatTime, type TimeMode } from './time-format';
 import type { Asset, Clip, SplitSide, StreamKind, Timeline, Track } from './types';
 import { clipDuration } from './types';
 
@@ -84,6 +85,15 @@ export function plainCopy<T>(v: T): T {
 }
 
 const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
+/** The backend names its parameters (`source_out`); a person typing in the Inspector knows them as In, Out and Start. */
+function plainParams(message: string): string {
+	return message
+		.replace(/\bsource_in\b/g, 'the in point')
+		.replace(/\bsource_out\b/g, 'the out point')
+		.replace(/\btimeline_start\b/g, 'the start')
+		.replace(/ must be >= 0/g, ' can’t be negative');
+}
 const messageOf = (e: unknown) =>
 	gestureReason((e instanceof Error ? e.message : String(e)).replace(/^invalid argument: /, ''));
 
@@ -91,6 +101,47 @@ const messageOf = (e: unknown) =>
  *  or `Infinity` for a still (it loops, so it never runs out). */
 export function sourceLimits(assets: readonly Pick<Asset, 'id' | 'duration' | 'streams'>[]): SourceLimits {
 	return new Map(assets.map((a) => [a.id, a.streams.some((s) => s.image) ? Infinity : a.duration]));
+}
+
+/** What `trimRefusal` needs to know about the project. */
+export interface TrimEnv {
+	ripple: boolean;
+	assets: readonly Pick<Asset, 'id' | 'name' | 'duration' | 'streams'>[];
+}
+
+/** What `trim_clip` would answer to new source points for a clip, asked of the very port the harness runs
+ *  (`link-ops.ts`) on a scratch copy: `null` when the backend takes it, else its sentence — the footage it does
+ *  not have, a negative start, a lane it would land on (after the ripple, when that is on). The Inspector's In / Out
+ *  ask it before they send a typed number. Never throws and never touches `timeline`. */
+export function trimRefusal(
+	timeline: Timeline,
+	env: TrimEnv,
+	clipId: string,
+	sourceIn?: number,
+	sourceOut?: number,
+	timelineStart?: number,
+	link?: boolean
+): string | null {
+	try {
+		const assets = new Map(env.assets.map((a) => [a.id, a]));
+		trim(
+			plainCopy(timeline),
+			{
+				ripple: env.ripple,
+				links: link ?? true,
+				footage: sourceLimits(env.assets),
+				hasAudio: (id) => !!assets.get(id)?.streams.some((s) => s.kind === 'audio'),
+				asset: (id) => assets.get(id)
+			},
+			clipId,
+			sourceIn,
+			sourceOut,
+			timelineStart
+		);
+		return null;
+	} catch (e) {
+		return capital(plainParams((e instanceof Error ? e.message : String(e)).replace(/^invalid argument: /, '')));
+	}
 }
 
 // ---- cuts -------------------------------------------------------------------
@@ -322,7 +373,7 @@ export interface Readout {
 }
 
 /** What the live readout beside the pointer (and the monitor's header) says. */
-export function readoutFor(p: EditPreview, fps: number): Readout {
+export function readoutFor(p: EditPreview, fps: number, mode?: TimeMode): Readout {
 	const verb = TOOL_VERB[p.edit.tool];
 	if (!p.ok) return { title: verb, detail: p.why, tone: 'refused' };
 	if (p.ghosts.length === 0) {
@@ -331,7 +382,7 @@ export function readoutFor(p: EditPreview, fps: number): Readout {
 	}
 	const detail = p.clamped ? p.why : null;
 	const tone = p.clamped ? 'limit' : 'ok';
-	const tc = (s: number) => formatTimecode(s, fps);
+	const tc = (s: number) => formatTime(s, fps, mode);
 	const g = p.ghosts;
 	// A linked edit says whose lanes come along: `· with A1`.
 	const carried = [...new Set(g.filter((x) => x.role === 'partner').map((x) => x.track))];
@@ -398,11 +449,11 @@ export interface TrimMonitor extends Readout {
  * anywhere). Frames come from the source (`get_frame`), not the composite: it is the
  * *footage* that moves.
  */
-export function monitorFor(p: EditPreview, fps: number, kind: StreamKind): TrimMonitor | null {
+export function monitorFor(p: EditPreview, fps: number, kind: StreamKind, mode?: TimeMode): TrimMonitor | null {
 	if (kind !== 'video' || p.ghosts.length === 0) return null;
 	const cell = (g: GhostClip, label: 'Out' | 'In'): MonitorCell => {
 		const time = edgeFrameTime(g.clip, label === 'Out' ? 'last' : 'first', fps);
-		return { key: `${label}:${g.id}`, label, clipId: g.id, assetId: g.clip.asset_id, time, timecode: formatTimecode(time, fps) };
+		return { key: `${label}:${g.id}`, label, clipId: g.id, assetId: g.clip.asset_id, time, timecode: formatTime(time, fps, mode) };
 	};
 	const by = (role: GhostClip['role']) => p.ghosts.find((g) => g.role === role);
 	const cells: MonitorCell[] = [];

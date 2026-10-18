@@ -42,6 +42,16 @@ import { clipDuration, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
 /** Shortest a clip an edit-mode op may leave behind, seconds — the edge-trim floor too. */
 export const MIN_EDIT_CLIP = 0.05;
 
+/** Smallest speed magnitude a clip may be set to (`MIN_SPEED`, model.rs). */
+export const MIN_SPEED = 0.01;
+
+/** Largest speed magnitude a clip may be set to (`MAX_SPEED`, model.rs): 100×. */
+export const MAX_SPEED = 100;
+
+/** How far the footage of a clip may be asked past the asset's length, seconds (`SOURCE_EPS`, project.rs):
+ *  the float noise of a duration that went through a probe and a JSON round trip. */
+export const SOURCE_EPS = 1e-3;
+
 /** Two clip edges closer than this are one edge: the engine's own test for a
  *  transition partner, so a cut that blends is a cut that can be rolled. */
 export const ADJACENT_EPS = 1e-3;

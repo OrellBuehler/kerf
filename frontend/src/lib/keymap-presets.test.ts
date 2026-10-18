@@ -61,6 +61,22 @@ describe('keyboard presets', () => {
 		}
 	});
 
+	test('every preset keeps a key for the edits and the cheat sheet that are not any editor’s to rename', () => {
+		const ours = ['edit.split', 'edit.rollBack', 'edit.rollForward', 'edit.slipBack', 'edit.slipForward', 'edit.slideBack', 'edit.slideForward', 'app.shortcuts'];
+		for (const preset of KEY_PRESETS) {
+			for (const p of PLATFORMS) {
+				const bindings = resolveBindings(presetOverrides(preset, p), p);
+				for (const id of ours) expect([preset.id, p, id, bindings[id].length > 0]).toEqual([preset.id, p, id, true]);
+			}
+		}
+		const resolve = resolveBindings(presetOverrides(keyPreset('resolve')!, 'mac'), 'mac');
+		expect(matchAction(ev('\\', { meta: true }), resolve)).toBe('edit.split');
+		const fcp = resolveBindings(presetOverrides(keyPreset('finalcut')!, 'mac'), 'mac');
+		expect(matchAction(ev('b', { meta: true }), fcp)).toBe('edit.split');
+		const premiere = resolveBindings(presetOverrides(keyPreset('premiere')!, 'other'), 'other');
+		expect(matchAction(ev('k', { ctrl: true }), premiere)).toBe('edit.split');
+	});
+
 	test('a preset survives being stored and read back, and is recognised', () => {
 		for (const preset of KEY_PRESETS) {
 			for (const p of PLATFORMS) {

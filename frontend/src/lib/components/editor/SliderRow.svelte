@@ -150,7 +150,8 @@
 		spellcheck="false"
 		aria-label="{label} value"
 		value={editing ? text : readout(shown, spec)}
-		{disabled}
+		readonly={disabled}
+		aria-disabled={disabled || undefined}
 		onfocus={enter}
 		onblur={leave}
 		oninput={(e) => {
@@ -202,7 +203,7 @@
 			border-color var(--dur-fast) var(--ease-out),
 			color var(--dur-fast) var(--ease-out);
 	}
-	.num:hover:not(:disabled) {
+	.num:hover:not([aria-disabled='true']) {
 		border-color: var(--border-strong);
 		color: var(--text-primary);
 	}
@@ -211,7 +212,7 @@
 		border-color: var(--border-strong);
 		color: var(--text-primary);
 	}
-	.num:disabled {
+	.num[aria-disabled='true'] {
 		cursor: default;
 	}
 	.slot {

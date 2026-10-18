@@ -56,8 +56,10 @@ base64 = "0.23.1"
 rmcp.workspace = true
 schemars.workspace = true
 axum.workspace = true
+tokio-util.workspace = true
+getrandom.workspace = true
 anyhow.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "time"] }
 
 [dev-dependencies]
 kerf-core = { workspace = true, features = ["test-support"] }

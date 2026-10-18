@@ -11,7 +11,7 @@
 	import Btn from './Btn.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { settings } from '$lib/settings.svelte';
-	import { toast } from '$lib/notifications.svelte';
+	import { report } from '$lib/ops';
 	import { inspectLut, pickLutFile } from '$lib/api';
 	import { beginDrag } from '$lib/drag';
 	import { resolveColor } from '$lib/waveform-draw';
@@ -49,7 +49,7 @@
 		try {
 			await editor.setGrade(clipId, next);
 		} catch (e) {
-			toast.error(e instanceof Error ? e.message : String(e));
+			report(e);
 		}
 	}
 
@@ -182,7 +182,7 @@
 	$effect(() => () => settle(''));
 
 	function curveDown(e: PointerEvent) {
-		if (e.button !== 0 || editor.busy) return;
+		if (e.button !== 0 || editor.locked) return;
 		const clipId = clip.id;
 		const ch = channel;
 		// The second click of a double-click lands on the point the first one is still waiting to add.
@@ -285,7 +285,7 @@
 	}
 
 	function wheelDown(e: PointerEvent, range: WheelRange) {
-		if (e.button !== 0 || editor.busy) return;
+		if (e.button !== 0 || editor.locked) return;
 		const clipId = clip.id;
 		const el = e.currentTarget as HTMLElement;
 		const base = wheels[range];
@@ -363,7 +363,8 @@
 		<Btn
 			variant="ghost"
 			size="sm"
-			disabled={editor.busy || !stored(channel).length}
+			pending={editor.locked}
+			disabled={!stored(channel).length}
 			title={`Straighten the ${CHANNEL_LABEL[channel].toLowerCase()} curve`}
 			onclick={() => writeCurve(clip.id, channel, [])}>Reset</Btn
 		>
@@ -377,7 +378,7 @@
 		ondblclick={removeAt}
 		oncontextmenu={removeAt}
 	></canvas>
-	<div style="font:var(--type-caption);color:var(--text-muted);margin:6px 0">
+	<div style="font-size:var(--text-xs);color:var(--text-muted);margin:6px 0">
 		Click to add a point and drag it; double-click a point to take it out. Each channel runs first, then the master.
 	</div>
 </InspectorSection>
@@ -420,7 +421,7 @@
 					value={w.lightness}
 					spec={{ min: -1, max: 1, step: 0.01, neutral: 0, digits: 2 }}
 					scope={clip.id}
-					disabled={editor.busy}
+					disabled={editor.locked}
 					onCommit={(v, clipId) => writeWheel(clipId, range, { ...w, lightness: v })}
 				/>
 			</div>
@@ -430,7 +431,8 @@
 		<Btn
 			variant="ghost"
 			size="sm"
-			disabled={editor.busy || !grade.wheels}
+			pending={editor.locked}
+			disabled={!grade.wheels}
 			title="Back to neutral wheels"
 			onclick={() => write(clip.id, { ...grade, wheels: null })}>Reset</Btn
 		>
@@ -443,7 +445,7 @@
 			{lutName(grade.lut.path)}
 		</div>
 		{#if info?.path === grade.lut.path}
-			<div style="font:var(--type-caption);color:{info.error ? 'var(--danger)' : 'var(--text-muted)'};margin-bottom:6px">
+			<div style="font-size:var(--text-xs);color:{info.error ? 'var(--danger)' : 'var(--text-muted)'};margin-bottom:6px">
 				{info.error ? `Not applied: ${info.error}` : `${info.info?.size}³${info.info?.title ? ` · ${info.info.title}` : ''}`}
 			</div>
 		{/if}
@@ -452,17 +454,17 @@
 			value={grade.lut.intensity}
 			spec={{ min: 0, max: 1, step: 0.01, neutral: 1, ...PERCENT }}
 			scope={clip.id}
-			disabled={editor.busy}
+			disabled={editor.locked}
 			onCommit={(v, clipId) => write(clipId, { ...grade, lut: grade.lut ? { ...grade.lut, intensity: v } : null })}
 		/>
 	{/if}
 	<div style="display:flex;gap:6px;margin:6px 0">
-		<Btn size="sm" disabled={editor.busy} title="Look the clip up through a .cube 3D LUT" onclick={chooseLut}>Choose LUT…</Btn>
-		<Btn variant="ghost" size="sm" disabled={editor.busy || !grade.lut} title="Remove the LUT" onclick={() => write(clip.id, { ...grade, lut: null })}
+		<Btn size="sm" pending={editor.locked} title="Look the clip up through a .cube 3D LUT" onclick={chooseLut}>Choose LUT…</Btn>
+		<Btn variant="ghost" size="sm" pending={editor.locked} disabled={!grade.lut} title="Remove the LUT" onclick={() => write(clip.id, { ...grade, lut: null })}
 			>Clear</Btn
 		>
 	</div>
-	<div style="font:var(--type-caption);color:var(--text-muted)">
+	<div style="font-size:var(--text-xs);color:var(--text-muted)">
 		Applied after the Color numbers and before the curves and wheels.
 	</div>
 </InspectorSection>

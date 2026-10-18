@@ -135,21 +135,26 @@ describe('a chip that is on or off says which', () => {
 	});
 
 	test('a group of radio chips is one tab stop that the arrows move through', () => {
-		const settings = read(`${EDITOR}SettingsDialog.svelte`);
-		const groups = [...settings.matchAll(/role="radiogroup"[^>]*>/g)].map((m) => m[0]);
-		expect(groups.length).toBe(2);
-		for (const g of groups) expect(g).toContain('use:roving');
-		expect(settings.match(/role="radio"/g)?.length).toBe(2);
+		const chips = read(`${EDITOR}ChoiceChips.svelte`);
+		expect(chips.match(/role="radiogroup"[^>]*>/g)?.length).toBe(1);
+		expect(chips).toMatch(/role="radiogroup"[^>]*use:roving/);
+		expect(chips.match(/role="radio"/g)?.length).toBe(1);
 		// the tab stop is `tabStop()`'s pick — the chosen chip if it can take focus, else the first that can
-		expect(settings).toContain('tabindex={PROXY_SIZES.indexOf(p) === proxyStop ? 0 : -1}');
-		expect(settings).toContain('tabindex={PREVIEW_SOURCES.indexOf(p) === sourceStop ? 0 : -1}');
-		expect(settings).toContain('enabled: !(settings.proxySize === 0 && p.source !== \'original\')');
+		expect(chips).toContain('tabindex={i === stop ? 0 : -1}');
+		expect(chips).toContain('enabled: !o.disabled');
+		// every choice in the dialog is one of them
+		for (const f of ['SettingsPreview', 'SettingsGeneral'])
+			expect(read(`${EDITOR}${f}.svelte`), f).toContain('<ChoiceChips');
+		expect(read(`${EDITOR}SettingsDialog.svelte`)).not.toContain('role="radio"');
+		// …and a proxy size that cannot be chosen sits out of the tab order with the rest
+		expect(read(`${EDITOR}SettingsPreview.svelte`)).toContain("disabled: settings.proxySize === 0 && p.source !== 'original'");
 	});
 
 	test('proxy size only moves focus on an arrow: choosing one rebuilds every proxy', () => {
-		const settings = read(`${EDITOR}SettingsDialog.svelte`);
-		expect(settings).toMatch(/aria-label="Proxy size" use:roving=\{\{ follow: false \}\}/);
-		expect(settings).toMatch(/aria-label="Preview source" use:roving /);
+		const preview = read(`${EDITOR}SettingsPreview.svelte`);
+		expect(preview).toMatch(/label="Proxy size"[\s\S]*?follow=\{false\}/);
+		expect(preview).toMatch(/label="Preview source"/);
+		expect(read(`${EDITOR}ChoiceChips.svelte`)).toContain('use:roving={{ follow }}');
 		const roving = read('lib/roving.ts');
 		expect(roving).toContain('if (follow) radios[to].click();');
 	});
@@ -159,7 +164,8 @@ describe('the settings rail says where you are', () => {
 	test('it is a named nav, and the open section is aria-current', () => {
 		const settings = read(`${EDITOR}SettingsDialog.svelte`);
 		expect(settings).toContain('<nav\n\t\t\taria-label="Settings sections"');
-		expect(settings).toContain("aria-current={section === s.id ? 'page' : undefined}");
+		expect(settings).toContain("aria-current={here ? 'page' : undefined}");
+		expect(settings).toContain('const here = !searching && section === s.id');
 	});
 });
 
@@ -208,7 +214,7 @@ describe('hit targets are 24 px at least', () => {
 
 	test('the status bar’s Stop and Logs buttons fit the 26 px bar at 24 px', () => {
 		const status = read(`${EDITOR}StatusBar.svelte`);
-		expect(status.match(/height:24px;padding:0 [68]px/g)?.length).toBe(3);
+		expect(status.match(/height:24px;padding:0 [68]px/g)?.length).toBe(4);
 	});
 
 	test('the notification log’s row buttons are 24 px', () => {

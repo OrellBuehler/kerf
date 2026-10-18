@@ -172,9 +172,11 @@ describe('SliderRow', () => {
 
 	test('a write goes to what the edit began on: no row reads the selection when it ends', () => {
 		// The click that selects another clip also blurs the field, and a typed entry is written on that blur.
-		for (const name of ['rangeRow', 'numRow']) {
+		// `timeRow` is the In / Out and a title's Start / End (typed as timecode or seconds); `numRow` is what is left.
+		const rows: Record<string, number> = { rangeRow: 4, numRow: 1, timeRow: 4 };
+		for (const [name, least] of Object.entries(rows)) {
 			const found = calls(inspector, name);
-			expect(found.length, name).toBeGreaterThan(3);
+			expect(found.length, name).toBeGreaterThanOrEqual(least);
 			for (const call of found) {
 				// What a row hands back is the `at` it was given, never the selection as it is by then.
 				const from = call.search(/\(v, at\) =>|setGain/);

@@ -18,7 +18,7 @@
 import { VARIANT_PRESETS, hasPicture, ratioLabel } from './delivery-formats';
 import { containerInfo } from './export-presets';
 import { TARGETS } from './platforms';
-import type { DeliveryCheck, DeliveryIssue, ExportOptions, PlatformReport, Timeline } from './types';
+import type { DeliveryCheck, DeliveryIssue, ExportOptions, PlatformReport, PlatformTarget, Timeline } from './types';
 
 export type VerdictLevel = 'ok' | 'note' | 'warning' | 'error';
 
@@ -53,6 +53,9 @@ export interface VerdictInput {
 	project: PlatformReport | null;
 	/** The shapes ticked under Deliver to, each judged at its own frame, in picker order. */
 	shapes: TickedShape[];
+	/** The publishing targets the backend knows (`platformTargets`), for the size a soft frame is
+	 *  made for. Left out, the harness mirror in `platforms.ts` stands in. */
+	targets?: PlatformTarget[];
 }
 
 /** Whether the check has anything to judge: a video export, of a cut that has a picture. Audio
@@ -114,14 +117,14 @@ function nothingToJudge(report: PlatformReport): boolean {
 /** Advice for the platforms a file is made for: captions for a feed that plays muted, softness for
  *  a frame below what the platforms show. Neither is a limit, so neither is amber. The softness is one
  *  tip for the frame however many platforms would upscale it, not one per platform. */
-function tipsFor(reports: PlatformReport[]): string[] {
+function tipsFor(reports: PlatformReport[], targets: readonly PlatformTarget[]): string[] {
 	const out = new Set<string>();
 	for (const r of reports) {
 		const aimed = r.targets.filter(takes);
 		const soft = aimed.filter((c) => c.issues.some((i) => i.kind === 'resolution'));
 		if (soft.length) {
 			const many = soft.length > 1;
-			const native = TARGETS.find((t) => t.id === soft[0].target);
+			const native = targets.find((t) => t.id === soft[0].target);
 			const size = native ? ` (${native.width}×${native.height})` : '';
 			const names = list(
 				soft.map((c) => c.label),
@@ -172,7 +175,7 @@ function singleFile(file: PlatformReport, project: PlatformReport | null): Verdi
 		return c && !takes(c) ? [SHORT[id] ?? c.label] : [];
 	});
 
-	let text = `${width}×${height}, ${ratioLabel(width, height)}, ${clock(duration)}.`;
+	let text = `This cut is ${width}×${height} (${ratioLabel(width, height)}) and ${clock(duration)} long.`;
 	if (ready.length)
 		text += ` Fine for ${list(
 			ready.map((c) => FINE_FOR[c.target] ?? c.label),
@@ -202,10 +205,11 @@ function ticked(shape: TickedShape): VerdictGroup {
  *  the timeline). */
 export function platformVerdict(input: VerdictInput): Verdict | null {
 	const { file, project, shapes } = input;
+	const targets = input.targets ?? TARGETS;
 	if (shapes.length) {
 		if (shapes.some((s) => nothingToJudge(s.report))) return null;
-		return { groups: shapes.map(ticked), tips: tipsFor(shapes.map((s) => s.report)) };
+		return { groups: shapes.map(ticked), tips: tipsFor(shapes.map((s) => s.report), targets) };
 	}
 	if (!file || nothingToJudge(file)) return null;
-	return { groups: [singleFile(file, project)], tips: tipsFor([file]) };
+	return { groups: [singleFile(file, project)], tips: tipsFor([file], targets) };
 }

@@ -361,6 +361,15 @@ class WorkspaceState {
 		toast.success('All workspaces reset to their default arrangements');
 	}
 
+	/** The settings were reset underneath the dock: build the active workspace again from what they now say
+	 *  (nothing is written — the settings already hold the presets). */
+	rebuild() {
+		if (!this.#api) return;
+		this.#abandonSave();
+		this.active = settings.workspaces.active;
+		this.#restore(this.active);
+	}
+
 	/** Drop a change still waiting on the debounce: what it would write is being
 	 *  thrown away. */
 	#abandonSave() {
