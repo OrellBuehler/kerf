@@ -23,8 +23,10 @@
   the timeline draws from it is **ungated** (no `cpu::lease`) but thread-capped and
   niced, at most two decodes at once (a freshly opened project asks for every clip
   at the same instant), concurrent requests for one file share one decode
-  (`shared_pyramid`), and the pipe is read on a side thread so a decode silent for
-  60 s is killed. The pyramid is cached at `<cache>/kerf/waveforms/<hash>.bin`, keyed
+  (`shared_pyramid_cancellable`: a request waiting behind another's decode, or for one of the two slots, polls its
+  own cancel and gives up with `Cancelled`; a stopped decode caches nothing), and the pipe is read on a side thread (`pump_pcm_cancellable`, shared with
+  `cli::waveform`, the in-memory PCM decodes and `pcm::decode_audio_cancellable`) so a decode silent
+  for 60 s is killed and a caller's cancel is polled every 100 ms. The pyramid is cached at `<cache>/kerf/waveforms/<hash>.bin`, keyed
   by path + size + mtime + a format version, written to a temp file and renamed; a
   file that is short, long, the wrong version, inconsistent with its own frame count
   or has a bucket whose min exceeds its max is recomputed, never trusted — and the
@@ -32,8 +34,11 @@
   byte-bounded in-process LRU (64 MB) so scrolling does not re-read the cache file.
   `Project::waveform_range` / the lock-free `Project::decode_waveform_range` are the
   op (an asset with no audio stream is `InvalidArgument`), exposed as the
-  `get_waveform_range` Tauri command and MCP tool; `get_waveform` / `get_energy`
-  are unchanged.
+  `get_waveform_range` Tauri command and MCP tool; the MCP `get_waveform` / `get_energy` stay (the GUI draws from the
+  pyramid). The agent's reads have cancellable twins — `decode_waveform_cancellable`, `decode_waveform_range_cancellable`,
+  `decode_energy_cancellable`, `decode_contact_sheet_cancellable`, `composite_timeline_frame_cancellable` /
+  `_region_cancellable` — which the MCP tools hand the request's cancellation token, so a dropped request stops its
+  ffmpeg (`agent_reads_stop_when_their_request_is_dropped`, `#[ignore]`d, drives them).
 - `filmstrip.rs` (always compiled, CLI only) is the video twin of `peaks.rs`: what the
   timeline draws a clip's **thumbnails** from. An asset is sampled once into a
   `Filmstrip` — 96 px-high frames (width from the *displayed* aspect, so rotation is
@@ -91,10 +96,11 @@
 - `pcm.rs` (always compiled, CLI only): `AudioBuffer {sample_rate, channels, samples}`
   (interleaved f32) and `decode_audio(path, rate, channels)` — the ffmpeg binary
   resamples and remixes (`-ar` / `-ac`), so there is no Rust decoder or resampler. A
-  whole-file decode, so it takes `cpu::lease`; the pipe goes through `peaks.rs`'s
-  `pump_pcm`, so a decode silent for 60 s is killed. `write_wav` / `wav_bytes` write
+  whole-file decode, so it takes `cpu::lease` (`decode_audio_cancellable(.., cancel)` waits for it
+  with `lease_waiting`); the pipe goes through `peaks.rs`'s `pump_pcm_cancellable`, so a decode silent
+  for 60 s is killed and a cancel ends it (`Error::Cancelled`). `write_wav` / `wav_bytes` write
   32-bit float WAV for test fixtures and debug renders (no `hound`). `decode_audio_window(path,
-  start, secs, ..)` is the same with an input-side `-ss` / `-t`.
+  start, secs, .., &lease, cancel)` is the same with an input-side `-ss` / `-t`, on a slot the caller holds.
 - `audio_sync.rs` (pure DSP, ported from FilmCraft's `sync.rs` onto `realfft`): `find_offset(a, b,
   rate)` → `SyncResult {lag, lag_fine, confidence, distinct, inverted}` with `b[n] ≈ g·a[n + lag]`.
   GCC-PHAT-β (β 0.75) on signals decimated to ≤ 8 kHz (further past 4 M samples), then DC-removed
@@ -108,7 +114,8 @@
   not on the reference's track, where in sync they would overlap, and the clip and its partners on
   unlocked tracks; window `source_in..source_out`, ≤ 20 min) → static
   `measure_audio_sync(plan, on_wait, cancel)` (one `cpu::lease_waiting` held for both mono 16 kHz
-  window decodes, `decode_audio_window(.., &lease)`; cancel polled while queued and between steps)
+  window decodes, `decode_audio_window(.., &lease, cancel)`; cancel polled while queued, between steps and
+  inside each decode)
   → `apply_audio_sync(m, force)`, which re-reads both clips (either may have moved
   or been trimmed meanwhile: `synced_start`), reports an unreliable match without moving unless
   `force`, refuses a start before 0 and moves through `move_clip` (linked partners follow; no ripple).
@@ -169,7 +176,10 @@ working directory set to the model's folder and both `model=` and `destination=`
 bare file names. Either backend gets its ggml model from `ensure_model`, which
 **downloads it on first use** into `<cache>/kerf/models/ggml-<name>.bin` (streamed with
 progress, `.part` + atomic rename, resumed via a range request, magic-byte checked so an
-error page is never mistaken for a model). Which model: `set_speech_model` (the GUI
+error page is never mistaken for a model; the body is read on a thread, so **no byte for 60 s is a
+stall** — an error that keeps the `.part` for the resume — and Cancel is polled every 200 ms
+whatever the socket is doing; `download_speech_model_cancellable(name, progress, cancel)` is the
+hooked entry point, `download_speech_model` the no-hooks wrapper). Which model: `set_speech_model` (the GUI
 picker, persisted in project meta under `speech_model`) → `KERF_WHISPER_MODEL` (still
 accepts a *path*, for existing setups) → `base`. `KERF_WHISPER_LANGUAGE` sets the
 language hint, `KERF_WHISPER_MODEL_URL` an offline model mirror. `transcription_status()`
@@ -183,9 +193,14 @@ minutes of inference. **A pass is abandonable** (a `CancelFn` alongside the `Pro
 lands between steps, **while a step is still queued for the machine's slot** (`cpu::lease_waiting`
 polls it four times a second, and the check is repeated the instant the slot is taken, so a Stop
 that arrives while queued never starts a whole-file pass) *and* inside transcription — the ffmpeg
-`whisper` run polls it about once a second off `-stats_period 1` and kills the child, and the model
-download polls it per chunk, keeping the `.part` file so the next attempt resumes rather than
-re-fetching 148 MB. A cancelled or failed *step* caches nothing (a half-analyzed kind would read as
+`whisper` run goes through `run_ffmpeg_streamed_in` (`-progress` every half second, cancel polled
+at that rate, killed after 10 minutes with no line) and kills the child, and the model download
+polls it every 200 ms, keeping the `.part` file so the next attempt resumes rather than
+re-fetching 148 MB. **Every step's provider takes the pass's `CancelFn`** (`SilenceDetector`,
+`SceneDetector`, `LoudnessAnalyzer`, `RhythmAnalyzer`, as `Transcriber` always did), so Stop kills
+the whole-file ffmpeg read in flight (`engine-cli.md`, "Every ffmpeg / ffprobe child is
+supervised") rather than waiting out the step, and a step whose decode fails is *failed*, not
+"found nothing". A cancelled or failed *step* caches nothing (a half-analyzed kind would read as
 analyzed, a missing transcript as "no speech"); the steps that finished before it stay cached and
 show done. Analysis runs in the **background lane** of the heavy-job queue (`cpu::in_background`),
 behind exports and preview proxies; transcription takes its slot after its model download, which is

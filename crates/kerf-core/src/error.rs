@@ -46,6 +46,20 @@ pub enum Error {
     #[error("the timeline changed since these edits were staged — applying would replace that newer cut; apply with force, or discard the staged edit")]
     StagedEditStale,
 
+    #[error("another agent session owns the pending proposal — wait for the user to apply or discard it, or ask them to")]
+    StagedEditOwnedByOther,
+
+    #[error("the user applies agent edits in Kerf — ask them to review the proposal")]
+    AgentReviewRequired,
+
+    #[error("there is no discarded proposal to bring back")]
+    NoDiscardedEdit,
+
+    #[error(
+        "asset {asset} is used by {clips} clip(s) on the timeline or in the proposal — remove them first, or remove with force"
+    )]
+    AssetInUse { asset: uuid::Uuid, clips: usize },
+
     #[error("this project was made by a newer Kerf (file format v{found}; this version opens up to v{supported}) — update Kerf to open it")]
     NewerProject { found: u32, supported: u32 },
 

@@ -25,7 +25,7 @@ impl Project {
         super::store::has_table(&self.conn, "fonts")
     }
 
-    /// The fonts this project embeds (a table a file from before schema v2 may not have yet: none).
+    /// The fonts this project embeds (a table a file from before schema v3 may not have yet: none).
     /// A row whose bytes are not what its key says is skipped, with a warning.
     pub fn embedded_fonts(&self) -> Result<Vec<EmbeddedFont>> {
         if !self.has_fonts_table() {
@@ -600,7 +600,7 @@ mod tests {
     fn an_agents_template_is_staged_and_its_values_are_set_on_the_proposal() {
         let mut project = Project::open_in_memory().unwrap();
         project.set_actor(EditSource::Agent);
-        project.begin_staging(None, None).unwrap();
+        project.begin_staging(None, None, None).unwrap();
         let t = template();
         let added = project
             .apply_template(&t, &values(&[("tagline", "staged")]), 0.0, None, SvgLayout::default())
@@ -617,6 +617,7 @@ mod tests {
         let staged = project.staged().unwrap().unwrap();
         assert_eq!(staged.edits.len(), 2);
         assert!(staged.edits[0].contains("Add template title"));
+        project.set_actor(EditSource::User);
         project.apply_staged(false).unwrap();
         let o = &overlays(&project)[0];
         assert!(o.svg.contains("staged again"));
@@ -646,7 +647,7 @@ mod tests {
             Err(Error::SvgOverlayNotFound(_))
         ));
         project.set_actor(EditSource::Agent);
-        project.begin_staging(None, None).unwrap();
+        project.begin_staging(None, None, None).unwrap();
         project
             .update_svg_overlay(
                 live.id,

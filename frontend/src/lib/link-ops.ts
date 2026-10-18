@@ -16,7 +16,7 @@
 // the project would record — a group edit counts the partners it carried, which only the edit
 // knows.
 
-import { type SourceLimits } from './edit-modes';
+import { MAX_SPEED, MIN_SPEED, SOURCE_EPS, type SourceLimits } from './edit-modes';
 import {
 	clipById,
 	clipNotFound,
@@ -54,7 +54,7 @@ import {
 	type DetachedMany
 } from './links';
 import { moveClips as moveClipsOn, removeClips as removeClipsOn } from './multi-edit';
-import { conformLinks, rippleLanes } from './ripple';
+import { checkOwnLanes, conformLinks, rippleLanes } from './ripple';
 import { splitRemoveClips as splitRemoveClipsOn } from './edit-modes';
 import type { Asset, Clip, ClipCut, ClipMove, SplitSide, Timeline, Track } from './types';
 import { clipDuration } from './types';
@@ -67,6 +67,8 @@ export interface EditEnv {
 	links: boolean;
 	footage: SourceLimits;
 	hasAudio: (assetId: string) => boolean;
+	/** An asset's name and length, for the sentence that says a clip ran past its end. */
+	asset?: (assetId: string) => { name: string; duration: number } | undefined;
 }
 
 export interface Edited<R = void> {
@@ -81,6 +83,9 @@ interface RunOptions {
 	links: boolean;
 	/** The clips the edit named: their track speaks for a link group when the sync lock must choose. */
 	anchors?: readonly string[];
+	/** The clips the edit itself put somewhere (a trimmed or a new clip): none may end up on another clip
+	 *  of its track (`Project::edit_lanes`, checked after the ripple, which may have made the room). */
+	lanes?: readonly string[];
 }
 
 /** What `runEdit` made: the timeline, what the edit returned, and the tracks whose sound it trimmed. */
@@ -109,7 +114,8 @@ export function runEdit<R>(
 	const notes: string[] = [];
 	const carried: string[] = [];
 	const sync = opts.links && hasLinks(next);
-	const before = opts.ripple || sync ? structuredClone(next) : null;
+	const lanes = opts.lanes ?? [];
+	const before = opts.ripple || sync || lanes.length > 0 ? structuredClone(next) : null;
 	const result = edit(next, notes, carried);
 	if (before) {
 		// What the edit itself left, before the per-lane ripple moves each track by its own
@@ -122,6 +128,7 @@ export function runEdit<R>(
 			const broke = firstSyncBreak(next, before);
 			if (broke) throw syncBreakError(broke);
 		}
+		checkOwnLanes(next, before, lanes);
 	}
 	if (hasLinks(next)) dissolveAllOrphans(next);
 	return { timeline: next, result, notes };
@@ -149,7 +156,45 @@ export function splitAt(tl: Timeline, env: EditEnv, clipId: string, at: number):
 	);
 }
 
-/** `Project::trim`: new source in/out (and start) for a clip; the partners follow the edge. */
+/** `Project::add_clip_to_timeline`: a clip of `[sourceIn, sourceOut)` of an asset on a track (the first one of
+ *  the asset's kind when none is named), at `timelineStart` or after the last clip. The footage must exist, the
+ *  start must not be negative, the lane stays sorted, and the clip may not end up on another clip of its
+ *  track — judged after the ripple, which is how an insert onto footage pushes the later clips along instead. */
+export function addClip(
+	tl: Timeline,
+	env: EditEnv,
+	asset: Pick<Asset, 'id' | 'name' | 'duration' | 'streams'>,
+	trackId: string | null | undefined,
+	sourceIn: number,
+	sourceOut: number,
+	timelineStart?: number | null
+): Edited<Clip> {
+	if (!Number.isFinite(sourceIn) || !Number.isFinite(sourceOut)) throw invalid('source_in and source_out must be finite numbers');
+	if (sourceIn < 0) throw invalid('source_in must be >= 0');
+	if (sourceOut <= sourceIn) throw invalid('source_out must be greater than source_in');
+	const limit = env.footage.get(asset.id) ?? asset.duration;
+	if (sourceOut > limit + SOURCE_EPS)
+		throw invalid(`source_out ${sourceOut.toFixed(3)} s is past the end of "${asset.name}" (${asset.duration.toFixed(3)} s long)`);
+	if (timelineStart != null && (!Number.isFinite(timelineStart) || timelineStart < 0)) throw invalid('timeline_start must be >= 0');
+	const kind = asset.streams.some((s) => s.kind === 'video') ? 'video' : asset.streams.some((s) => s.kind === 'audio') ? 'audio' : 'data';
+	const id = newId();
+	return edited(
+		runEdit(tl, { ...env, lanes: [id] }, (t) => {
+			const track = trackId ? t.tracks.find((x) => x.id === trackId) : t.tracks.find((x) => x.kind === kind);
+			if (!track) throw new Error(trackId ? `track not found: ${trackId}` : 'no suitable track for asset');
+			const start = timelineStart ?? track.clips.reduce((m, c) => Math.max(m, c.timeline_start + clipDuration(c)), 0);
+			const clip: Clip = { id, asset_id: asset.id, source_in: sourceIn, source_out: sourceOut, timeline_start: start, volume: 1, fade_in: 0, fade_out: 0 };
+			track.clips.push(clip);
+			track.clips.sort((a, b) => a.timeline_start - b.timeline_start);
+			return structuredClone(clip);
+		}),
+		'Add clip'
+	);
+}
+
+/** `Project::trim`: new source in/out (and start) for a clip; the partners follow the edge. The points must be
+ *  finite, `source_in` at least 0 and `source_out` no further than the asset's footage; the trimmed clip may not
+ *  end up on another clip of its track (judged after the ripple, which may make the room). */
 export function trim(
 	tl: Timeline,
 	env: EditEnv,
@@ -158,13 +203,24 @@ export function trim(
 	sourceOut?: number | null,
 	timelineStart?: number | null
 ): Edited<void> {
+	if ([sourceIn, sourceOut, timelineStart].some((v) => v != null && !Number.isFinite(v)))
+		throw invalid('source_in, source_out and timeline_start must be finite numbers');
+	if (sourceIn != null && sourceIn < 0) throw invalid('source_in must be >= 0');
 	return edited(
-		runEdit(tl, { ...env, anchors: [clipId] }, (t, notes, carried) => {
+		runEdit(tl, { ...env, anchors: [clipId], lanes: [clipId] }, (t, notes, carried) => {
 			const found = locate(t, clipId);
 			if (!found) throw clipNotFound(clipId);
 			const [track, ci] = found;
 			const clip = track.clips[ci];
 			const was = structuredClone(clip);
+			if (sourceOut != null) {
+				const limit = env.footage.get(clip.asset_id);
+				const info = env.asset?.(clip.asset_id);
+				if (limit !== undefined && sourceOut > limit + SOURCE_EPS)
+					throw invalid(
+						`source_out ${sourceOut.toFixed(3)} s is past the end of "${info?.name ?? clip.asset_id}" (${(info?.duration ?? limit).toFixed(3)} s long)`
+					);
+			}
 			if (sourceIn != null) clip.source_in = sourceIn;
 			if (sourceOut != null) clip.source_out = sourceOut;
 			if (clip.source_out <= clip.source_in) throw invalid('source_out must be greater than source_in');
@@ -232,6 +288,8 @@ export function remove(tl: Timeline, env: EditEnv, clipId: string): Edited<numbe
 /** `Project::set_speed`: the clip and its partners retimed by the same ratio. */
 export function setSpeed(tl: Timeline, env: EditEnv, clipId: string, speed: number): Edited<Clip> {
 	if (!Number.isFinite(speed) || speed === 0) throw invalid('speed must be a non-zero, finite number');
+	if (Math.abs(speed) < MIN_SPEED || Math.abs(speed) > MAX_SPEED)
+		throw invalid(`speed must be between ${MIN_SPEED}× and ${MAX_SPEED}× (negative to reverse), got ${speed}`);
 	return edited(
 		runEdit(tl, { ...env, anchors: [clipId] }, (t) => {
 			if (env.links) return setSpeedLinked(t, clipId, speed);

@@ -38,6 +38,12 @@ const MIGRATIONS: &[Migration] = &[
         run: v1_to_v2,
         needed: v1_to_v2_needed,
         destructive: false,
+        needed_to_read: true,
+    },
+    Migration {
+        run: v2_to_v3,
+        needed: v2_to_v3_needed,
+        destructive: false,
         needed_to_read: false,
     },
 ];
@@ -65,9 +71,26 @@ fn v0_to_v1_needed(conn: &Connection) -> bool {
     V1_COLUMNS.iter().any(|c| !has_column(conn, "assets", c))
 }
 
-/// v2: the table of fonts a project embeds (a template's typeface travels with it). Also in `SCHEMA`
-/// for a new file; `CREATE TABLE IF NOT EXISTS`, so it does not matter which ran first.
+const V2_COLUMNS: [&str; 2] = ["owner", "assets"];
+
+/// v2: a proposal remembers which agent session owns it (`owner`) and the asset changes held
+/// back with it (`assets`, JSON). A proposal staged by an older build has neither.
 fn v1_to_v2(conn: &Connection) -> rusqlite::Result<()> {
+    for column in V2_COLUMNS {
+        if !has_column(conn, "staged", column) {
+            conn.execute(&format!("ALTER TABLE staged ADD COLUMN {column} TEXT"), [])?;
+        }
+    }
+    Ok(())
+}
+
+fn v1_to_v2_needed(conn: &Connection) -> bool {
+    V2_COLUMNS.iter().any(|c| !has_column(conn, "staged", c))
+}
+
+/// v3: the table of fonts a project embeds (a template's typeface travels with it). Also in `SCHEMA`
+/// for a new file; `CREATE TABLE IF NOT EXISTS`, so it does not matter which ran first.
+fn v2_to_v3(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS fonts (
             sha256 TEXT PRIMARY KEY,
@@ -77,7 +100,7 @@ fn v1_to_v2(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-fn v1_to_v2_needed(conn: &Connection) -> bool {
+fn v2_to_v3_needed(conn: &Connection) -> bool {
     !has_table(conn, "fonts")
 }
 

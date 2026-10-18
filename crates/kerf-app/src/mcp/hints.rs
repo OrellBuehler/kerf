@@ -192,6 +192,22 @@ pub(super) const TOOLS: &[(&str, &str, Effect)] = &[
     ("skim_asset", "Skim asset", Read),
     ("preview_timeline", "Preview timeline", Read),
     ("timeline_summary", "Timeline summary", Read),
+    ("preview_svg_preset", "Preview SVG title preset", Read),
+    ("missing_assets", "Missing media", Read),
+    ("get_analysis_detail", "Analysis detail", Read),
+    ("undo_staged_edit", "Undo staged step", Destroy),
+    ("restore_discarded_edits", "Restore discarded edits", Edit),
+    ("apply_staged_subset", "Apply part of staged edits", Destroy),
+    ("job_status", "Job status", Read),
+    ("cancel_job", "Cancel job", Erase),
+    ("list_jobs", "List jobs", Read),
+    ("project_info", "Project info", Read),
+    ("save_project", "Save project", Set),
+    ("save_project_as", "Save project as", Destroy),
+    ("open_project", "Open project", Destroy),
+    ("new_project", "New project", Destroy),
+    ("get_settings", "Agent-visible settings", Read),
+    ("set_settings", "Change settings", Set),
 ];
 
 /// Give every route its title and hints. A tool missing from [`TOOLS`] is left

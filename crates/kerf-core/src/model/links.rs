@@ -1679,6 +1679,14 @@ impl Timeline {
             if !new.is_finite() || new == 0.0 {
                 return Err(Error::InvalidArgument("a linked clip would end up with no speed".to_string()));
             }
+            if !(super::MIN_SPEED..=super::MAX_SPEED).contains(&new.abs()) {
+                return Err(Error::InvalidArgument(format!(
+                    "a linked clip would end up at {:.3}× — a clip's speed stays within {}× to {}×",
+                    new.abs(),
+                    super::MIN_SPEED,
+                    super::MAX_SPEED
+                )));
+            }
             updates.push((partner, new));
         }
         self.tracks[ti].clips[ci].speed = speed;

@@ -3,8 +3,9 @@
 	// chapter of the exported file and of the YouTube chapter text; a comment is a note on the cut.
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
-	import { editor } from '$lib/state.svelte';
+	import { editor, PreviewReadOnly } from '$lib/state.svelte';
 	import { toast } from '$lib/notifications.svelte';
+	import { report } from '$lib/ops';
 	import { failure } from '$lib/failure-copy';
 	import { markerPatch } from '$lib/marker-edit';
 	import type { MarkerKind } from '$lib/types';
@@ -37,7 +38,8 @@
 			await editor.updateMarker(marker.id, result.patch);
 			onClose();
 		} catch (err) {
-			toast.error(failure("Couldn't update the marker", err));
+			if (err instanceof PreviewReadOnly) report(err);
+			else toast.error(failure("Couldn't update the marker", err));
 		} finally {
 			saving = false;
 		}

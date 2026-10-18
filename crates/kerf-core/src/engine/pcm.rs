@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use super::cli::{bg_command, ffmpeg_bin, launch_err};
 use super::cpu;
-use super::peaks::pump_pcm;
+use super::peaks::pump_pcm_cancellable;
 use crate::error::{Error, Result};
 
 /// A decode silent this long is killed: see `peaks.rs`.
@@ -104,21 +104,33 @@ fn decode_args(path: &Path, window: Option<(f64, f64)>, sample_rate: u32, channe
 /// `sample_rate` in `channels` channels. A whole-file decode into memory, so it takes
 /// the heavy-job slot; a decode that stalls is killed.
 pub fn decode_audio(path: &Path, sample_rate: u32, channels: u16) -> Result<AudioBuffer> {
+    decode_audio_cancellable(path, sample_rate, channels, &|| false)
+}
+
+/// [`decode_audio`] that gives up with [`Error::Cancelled`] once `cancel` is true — while it
+/// waits for the heavy-job slot or while ffmpeg decodes.
+pub fn decode_audio_cancellable(path: &Path, sample_rate: u32, channels: u16, cancel: &dyn Fn() -> bool) -> Result<AudioBuffer> {
     if sample_rate == 0 || channels == 0 {
         return Err(Error::InvalidArgument(
             "decode needs a sample rate and a channel count".to_string(),
         ));
     }
+    let cpu = cpu::lease_waiting(&mut |_| {}, cancel)?;
+    if cancel() {
+        return Err(Error::Cancelled);
+    }
     decode_with(
         decode_args(path, None, sample_rate, channels),
         sample_rate,
         channels,
-        &cpu::lease(),
+        &cpu,
+        cancel,
     )
 }
 
 /// [`decode_audio`] of `secs` seconds from `start` (source seconds; an input-side seek,
-/// exact for audio), run on the heavy-job slot the caller already holds.
+/// exact for audio), run on the heavy-job slot the caller already holds. `cancel` stops the
+/// decode while ffmpeg runs ([`Error::Cancelled`]); a stalled decode is killed.
 pub fn decode_audio_window(
     path: &Path,
     start: f64,
@@ -126,17 +138,33 @@ pub fn decode_audio_window(
     sample_rate: u32,
     channels: u16,
     cpu: &cpu::Lease,
+    cancel: &dyn Fn() -> bool,
 ) -> Result<AudioBuffer> {
     if sample_rate == 0 || channels == 0 || !start.is_finite() || !secs.is_finite() || secs <= 0.0 {
         return Err(Error::InvalidArgument(
             "decode needs a sample rate, a channel count and a window".to_string(),
         ));
     }
+    if cancel() {
+        return Err(Error::Cancelled);
+    }
     let window = Some((start.max(0.0), secs));
-    decode_with(decode_args(path, window, sample_rate, channels), sample_rate, channels, cpu)
+    decode_with(
+        decode_args(path, window, sample_rate, channels),
+        sample_rate,
+        channels,
+        cpu,
+        cancel,
+    )
 }
 
-fn decode_with(args: Vec<std::ffi::OsString>, sample_rate: u32, channels: u16, cpu: &cpu::Lease) -> Result<AudioBuffer> {
+fn decode_with(
+    args: Vec<std::ffi::OsString>,
+    sample_rate: u32,
+    channels: u16,
+    cpu: &cpu::Lease,
+    cancel: &dyn Fn() -> bool,
+) -> Result<AudioBuffer> {
     let bin = ffmpeg_bin();
     let mut cmd = bg_command(&bin);
     cpu::limit_cmd(&mut cmd, cpu.threads());
@@ -148,7 +176,7 @@ fn decode_with(args: Vec<std::ffi::OsString>, sample_rate: u32, channels: u16, c
         .spawn()
         .map_err(|e| launch_err(&bin, e))?;
     let mut samples = Vec::new();
-    pump_pcm(child, usize::from(channels) * 4, DECODE_STALL, &mut |frames| {
+    pump_pcm_cancellable(child, usize::from(channels) * 4, DECODE_STALL, cancel, &mut |frames| {
         samples.extend_from_slice(frames);
     })?;
     Ok(AudioBuffer::new(sample_rate, channels, samples))

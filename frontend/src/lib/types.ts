@@ -1014,6 +1014,10 @@ export type DiffKind =
 	| 'master_changed';
 
 export interface DiffEntry {
+	/** The change's stable name, `<kind>:<the clip, text, marker or track it is about>`, which it keeps for
+	 *  as long as the proposal holds it: what `applyStagedSubset` is sent. The backend always sets it; it is
+	 *  optional here so a fixture need not, and `entryId` (`staged-subset.ts`) derives the same name. */
+	id?: string;
 	kind: DiffKind;
 	summary: string;
 	detail?: string | null;
@@ -1021,6 +1025,8 @@ export interface DiffEntry {
 	clip_id?: string | null;
 	/** The title or caption an `overlay_*` entry is about. */
 	overlay_id?: string | null;
+	/** The marker a `marker_*` entry is about. */
+	marker_id?: string | null;
 	at?: number | null;
 }
 
@@ -1037,12 +1043,102 @@ export interface StagedEdit {
 	base_seq: number;
 	task_id?: string | null;
 	note?: string | null;
+	/** Some agent session owns the proposal. (The session id itself never leaves the backend.) */
+	owned_by_agent?: boolean;
 	edits: string[];
+	/** How many of the latest staged steps `undoStagedEdit` can still take back (absent: none). */
+	undo_depth?: number;
+	/** Changes to the library held back with the proposal (an asset marked as 360); they land with it. */
+	asset_changes?: StagedAssetChange[];
 	created_at: string;
 	updated_at: string;
 	/** The live timeline moved on since this branched — applying replaces it. */
 	stale: boolean;
 	diff: TimelineDiff;
+}
+
+/** A change to an *asset* an agent made while a proposal was open (`kerf_core::StagedAssetChange`). */
+export interface StagedAssetChange {
+	/** `asset_projection:<asset id>`, usable wherever a `DiffEntry.id` is. */
+	id: string;
+	asset_id: string;
+	/** The projection the asset is to be marked with; `null` clears it. */
+	projection: Projection | null;
+	/** One line for the review card. */
+	summary: string;
+}
+
+/** A change applied although the reviewer did not pick it, and why it had to be. */
+export interface AutoIncluded {
+	id: string;
+	summary: string;
+	because: string;
+}
+
+/** A picked change that no longer applies, and why. */
+export interface SkippedChange {
+	id: string;
+	summary: string;
+	why: string;
+}
+
+/** What `applyStagedSubset` did (`kerf_core::SubsetApplied`). */
+export interface SubsetApplied {
+	/** Changes applied, the ones that came along included. */
+	applied: number;
+	auto_included: AutoIncluded[];
+	skipped: SkippedChange[];
+	/** Changes still waiting for review in the proposal. */
+	remaining: number;
+	/** Nothing is left, so the proposal closed. */
+	closed: boolean;
+	/** One sentence for the toast. */
+	message: string;
+	/** The live timeline afterwards. */
+	timeline: Timeline;
+}
+
+/** What `undoStagedEdit` took back: the step's label and the proposal as it now stands. */
+export interface StagedUndone {
+	label: string;
+	staged: StagedEdit;
+}
+
+/** What `relinkAsset` did (`kerf_core::Relinked`). */
+export interface Relinked {
+	asset: Asset;
+	/** The new file is the old media moved, so its analysis still holds; otherwise it was dropped. */
+	analysis_kept: boolean;
+	previous_path: string;
+}
+
+/** What `checkRelink` found, before anything is changed (`kerf_core::RelinkCheck`). */
+export interface RelinkCheck {
+	/** The file is the old media moved, so the analysis would be kept. */
+	analysis_kept: boolean;
+	/** The asset has analysis to lose: for one without, a different recording costs nothing. */
+	has_analysis: boolean;
+}
+
+/** What removing an asset did (`kerf_core::RemovedAsset`). */
+export interface RemovedAsset {
+	asset: Asset;
+	/** Clips of the cut removed with it (only with `force`). */
+	clips_removed: number;
+}
+
+/** The `remove_asset` answer: what was removed and the refreshed cut. */
+export interface AssetRemoval extends RemovedAsset {
+	timeline: Timeline;
+}
+
+/** An asset whose source file is gone (`kerf_core::MissingAsset`). */
+export interface MissingAsset {
+	asset_id: string;
+	name: string;
+	path: string;
+	/** Clips of the cut that use it. */
+	clips: number;
 }
 
 export type TaskStatus = 'queued' | 'working' | 'ready' | 'done' | 'failed';
@@ -1233,6 +1329,11 @@ export interface AnalysisProgress {
 	detail?: string | null;
 }
 
+/** Payload of the `smart-crop-progress` event: how much of the shots have been sampled. */
+export interface SmartCropProgress {
+	fraction: number;
+}
+
 /** Payload of the `model-progress` event, emitted while a speech model downloads. */
 export interface ModelProgress {
 	model: string;
@@ -1376,6 +1477,8 @@ export interface UpdateInfo {
 	notes?: string | null;
 }
 
+export type TimeDisplay = 'timecode' | 'seconds';
+
 /** App preferences — machine settings, not project state, so they live in the
  *  platform config directory rather than in the `.kerf` file. */
 export interface AppSettings {
@@ -1399,6 +1502,14 @@ export interface AppSettings {
 	 *  every frame (experimental; off by default). Frames it cannot draw, and
 	 *  every failure, are the JPEG as ever. */
 	gpu_preview: boolean;
+	/** How times are written: frame-accurate `timecode` (the default) or plain `seconds`. */
+	time_display: TimeDisplay;
+	/** Open the project that was open last when Kerf starts without one named on its command line. */
+	reopen_last_project: boolean;
+	/** The `.kerf` files opened or saved most recently, newest first, at most 10. Kept by the app
+	 *  (`recentProjects` prunes the ones that are gone, `clearRecentProjects` empties it); a settings
+	 *  patch cannot write it. */
+	recent_projects: string[];
 	/** The single dock arrangement saved before there were workspaces (dockview's
 	 *  serialized layout). Read only to migrate it into the Edit workspace when
 	 *  `workspaces` is absent; nothing writes it any more. */
@@ -1413,7 +1524,25 @@ export interface AppSettings {
 	 *  { <action id>: [<chord>, …] } }`, only the actions they touched, validated
 	 *  and migrated by `keymap.ts` on the way back in. Opaque to the backend. */
 	keybindings: unknown | null;
+	/** Whether an agent's edits are held back for the user to review (the default). Changed on the
+	 *  Agent settings page (`setMcpSettings`); the agent cannot turn it off. */
+	agent_review: boolean;
+	/** Whether the embedded MCP server listens at all. */
+	mcp_enabled: boolean;
+	/** Where it listens (`host:port`); `null` is `127.0.0.1:7777`. `KERF_MCP_ADDR` in the environment
+	 *  still overrides it (`McpConnectionInfo.env_override`). */
+	mcp_addr: string | null;
+	/** Whether a request must carry `Authorization: Bearer <token>`. The token itself is never in the
+	 *  settings view: ask `mcpConnectionInfo`. */
+	mcp_require_token: boolean;
+	/** The editing defaults — `{ snap, still_seconds, title_seconds }` — read by `editing-prefs.ts`, which
+	 *  clamps what it finds. Opaque to the backend. */
+	editing: unknown | null;
 }
+
+/** What `setSettings` may write: any preference but the recent-projects list, which the app keeps itself
+ *  as projects open and save (the backend refuses a patch that names it). */
+export type SettingsPatch = Partial<Omit<AppSettings, 'recent_projects'>>;
 
 /** `AppSettings` resolved against the engine, which is what the settings
  *  surface renders: the effective percentage (an environment override may win
@@ -1604,6 +1733,48 @@ export interface PlayAsk {
 export interface MusicFitted {
 	timeline: Timeline;
 	report: MusicFitReport;
+}
+
+// ---- agent connection (MCP server): `crates/kerf-app/src/mcp_commands.rs` ---------
+
+/** What the Agent settings page shows and the user copies into an MCP client
+ *  (`McpConnectionInfo`). The token is a secret: show it on request, never log it. */
+export interface McpConnectionInfo {
+	/** Whether the server is switched on. */
+	enabled: boolean;
+	/** Where a client connects, e.g. `http://127.0.0.1:7777/mcp`. */
+	url: string;
+	/** Whether requests must carry `Authorization: Bearer <token>`. */
+	require_token: boolean;
+	/** The bearer token (made on the first start), even while it is not required. */
+	token: string | null;
+	/** Why the token is not what it should be: it could not be saved (it works until Kerf quits) or
+	 *  could not be made (the server stays off while one is required). `null` when it is fine. */
+	token_problem: string | null;
+	/** Whether the listener is up now. */
+	running: boolean;
+	/** Why it is not, when it should be (the port is taken, the address is refused). */
+	error: string | null;
+	/** The stored address (`null` is the default `127.0.0.1:7777`); what the address field edits. */
+	configured_addr: string | null;
+	/** `KERF_MCP_ADDR` is set in the environment and wins over `configured_addr`. */
+	env_override: boolean;
+	/** Whether an agent's edits wait for the user's review (the default). */
+	agent_review: boolean;
+	/** The one-line command that adds Kerf to Claude Code. */
+	claude_code_command: string;
+	/** A `mcpServers` JSON snippet for any other MCP client. */
+	generic_json_config: string;
+}
+
+/** The agent switches `set_mcp_settings` takes — any of them. The server restarts by itself when
+ *  the address or the enabled switch moves; a token or requirement change applies at once. */
+export interface McpSettingsPatch {
+	mcp_enabled?: boolean;
+	/** `host:port`; `null` goes back to the default. A network address needs the token. */
+	mcp_addr?: string | null;
+	mcp_require_token?: boolean;
+	agent_review?: boolean;
 }
 
 /** What the editor window shows, reported for an agent's `get_editor_context`

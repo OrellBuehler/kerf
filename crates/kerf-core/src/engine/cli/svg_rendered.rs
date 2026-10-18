@@ -158,7 +158,7 @@ fn export_rgb(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, dir: 
 /// The scrubbed still of `timeline` at `t` as raw rgb24, through `run_still` (so its titles are
 /// drawn first, as an agent's `preview_timeline` has them).
 fn still_rgb(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, t: f64) -> Vec<u8> {
-    let out = run_still(timeline, assets, opts, t, W, None, &StillOutput::RgbPipe).unwrap();
+    let out = run_still(timeline, assets, opts, t, W, None, &StillOutput::RgbPipe, &|| false).unwrap();
     assert_eq!(out.len(), (W * H * 3) as usize);
     out
 }

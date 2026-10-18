@@ -26,7 +26,7 @@ fn part(target: &super::model::TemplateTarget) -> Part<'_> {
 }
 
 /// An SVG colour a `color` control may write: `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`, a colour name
-/// (`valid_color`'s bare letters, which `svgtypes` must also know), `none`, `transparent` or
+/// (bare letters, which `svgtypes` must also know; not FFmpeg's table, `transparent` is no name there), `none` or
 /// `currentColor`. Nothing with a `@`, a `0x` or a function: those are FFmpeg's spellings, and
 /// `rgb(1,2,3)` is a value with commas in it.
 pub(super) fn valid_svg_color(s: &str) -> bool {
@@ -40,7 +40,8 @@ pub(super) fn valid_svg_color(s: &str) -> bool {
     !s.contains('@')
         && !s.starts_with("0x")
         && !s.starts_with("0X")
-        && crate::engine::valid_color(s)
+        && !s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_alphabetic())
         && svgtypes::Color::from_str(s).is_ok()
 }
 

@@ -26,6 +26,8 @@ const state = (over: Partial<MenuState> = {}): MenuState => ({
 	openPanels: ['library', 'preview', 'timeline', 'inspector', 'agent'],
 	detachedPanels: [],
 	desktop: true,
+	previewing: false,
+	recent: [],
 	...over
 });
 
@@ -76,6 +78,7 @@ describe('File', () => {
 		expect(names).toEqual([
 			'New project',
 			'Open project…',
+			'Open Recent',
 			'Save project…',
 			'Import media…',
 			'Import captions…',
@@ -170,6 +173,56 @@ describe('Edit', () => {
 			const e = find(m.items, label);
 			expect('disabled' in e && e.disabled, label).toBe(true);
 			expect('reason' in e && e.reason, label).toBe('Select a clip first');
+		}
+	});
+
+	test('every entry that edits the cut is off, with the one reason, while the proposal is previewed', () => {
+		const REASON = 'Exit the proposal preview to edit';
+		const m = menu('edit', { previewing: true });
+		const edits = [
+			'Undo',
+			'Redo',
+			'Cut',
+			'Paste at playhead',
+			'Duplicate',
+			'Split at playhead',
+			'Delete selection',
+			'Ripple delete selection'
+		];
+		for (const label of edits) {
+			const e = find(m.items, label);
+			expect('disabled' in e && e.disabled, label).toBe(true);
+			expect('reason' in e && e.reason, label).toBe(REASON);
+		}
+		for (const sub of ['Clip', 'Roll, slip, slide']) {
+			const items = (find(m.items, sub) as Extract<MenuEntry, { kind: 'submenu' }>).items.filter((e) => e.kind !== 'separator');
+			expect(items.length, sub).toBeGreaterThan(0);
+			for (const e of items) {
+				expect('disabled' in e && e.disabled, `${sub}: ${entryLabel(e)}`).toBe(true);
+				expect('reason' in e && e.reason, `${sub}: ${entryLabel(e)}`).toBe(REASON);
+			}
+		}
+		const frames = (find(menu('view', { previewing: true }).items, 'Delivery frame') as Extract<MenuEntry, { kind: 'submenu' }>).items;
+		for (const e of frames) expect(e.kind !== 'separator' && e.disabled, 'delivery frame').toBe(true);
+		const captions = find(menu('file', { previewing: true }).items, 'Import captions…');
+		expect('disabled' in captions && captions.disabled).toBe(true);
+	});
+
+	test('what only looks stays on while the proposal is previewed: copy, select all, the tools, ripple and snapping', () => {
+		const m = menu('edit', { previewing: true });
+		for (const label of ['Copy', 'Select all clips', 'Ripple mode', 'Snapping']) {
+			const e = find(m.items, label);
+			expect('disabled' in e && e.disabled, label).toBeFalsy();
+		}
+		const tool = find(m.items, 'Tool') as Extract<MenuEntry, { kind: 'submenu' }>;
+		for (const e of tool.items) expect(e.kind !== 'separator' && e.disabled, 'tool').toBeFalsy();
+	});
+
+	test('and nothing is held for the preview when there is none', () => {
+		for (const m of buildMenus(state())) {
+			for (const e of flatten(m.items)) {
+				if (e.kind !== 'separator' && 'reason' in e) expect(e.reason, `${m.label}: ${entryLabel(e)}`).not.toBe('Exit the proposal preview to edit');
+			}
 		}
 	});
 
@@ -353,7 +406,7 @@ describe('Window', () => {
 describe('Help', () => {
 	test('shortcuts, updates, the release page, the logs and the version', () => {
 		const ids = menu('help').items.flatMap((e) => (e.kind === 'action' ? [e.id] : []));
-		expect(ids).toEqual(['app.keyboard', 'app.checkUpdate', 'app.releases', 'app.logs', 'app.about']);
+		expect(ids).toEqual(['app.shortcuts', 'app.keyboard', 'app.checkUpdate', 'app.releases', 'app.logs', 'app.about']);
 	});
 
 	test('the log folder is a desktop thing, and says so elsewhere', () => {
@@ -468,8 +521,43 @@ describe('moving about a menu', () => {
 		expect(entryLabel(items[second] as never)).toBe('Copy');
 		const third = typeahead(items, second, 'c')!;
 		expect(entryLabel(items[third] as never)).toBe('Clip');
-		expect(typeahead(items, third, 'c')).toBe(first);
+		const fourth = typeahead(items, third, 'c')!;
+		expect(entryLabel(items[fourth] as never)).toBe('Customize keyboard shortcuts…');
+		expect(typeahead(items, fourth, 'c')).toBe(first);
 		expect(typeahead(items, 0, 'C')).toBe(first);
 		expect(typeahead(items, 0, 'q')).toBeNull();
+	});
+});
+
+describe('File › Open Recent', () => {
+	const recent = (over: Partial<MenuState> = {}) => find(menu('file', over).items, 'Open Recent') as Extract<MenuEntry, { kind: 'submenu' }>;
+
+	test('lists the projects newest first, each by its file name, then clears', () => {
+		const sub = recent({ recent: ['/a/summer.kerf', '/b/interview.kerf'] });
+		expect(sub.kind).toBe('submenu');
+		expect(labels(sub.items)).toEqual(['summer.kerf', 'interview.kerf', 'Clear recent projects…']);
+		const first = sub.items[0];
+		expect(first.kind === 'command' && first.command).toEqual({ type: 'recent', path: '/a/summer.kerf' });
+		const last = sub.items[sub.items.length - 1];
+		expect(last.kind === 'command' && last.command).toEqual({ type: 'recent-clear' });
+	});
+
+	test('two projects with one name are told apart by their folder', () => {
+		const sub = recent({ recent: ['/work/a/cut.kerf', '/work/b/cut.kerf', '/c/other.kerf'] });
+		expect(labels(sub.items).slice(0, 3)).toEqual(['cut.kerf — a', 'cut.kerf — b', 'other.kerf']);
+	});
+
+	test('with none it is one greyed entry that says where they come from', () => {
+		const sub = recent({ recent: [] });
+		expect(sub.items).toHaveLength(1);
+		const only = sub.items[0];
+		expect(only.kind === 'command' && only.disabled).toBe(true);
+		expect(only.kind === 'command' && only.reason).toContain('listed here');
+	});
+
+	test('stays listed in a browser (an open there says it is a desktop thing)', () => {
+		const sub = recent({ desktop: false, recent: ['/a.kerf'] });
+		expect(sub.disabled).toBeUndefined();
+		expect(labels(sub.items)[0]).toBe('a.kerf');
 	});
 });

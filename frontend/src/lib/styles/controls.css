@@ -156,11 +156,11 @@
 .k-ibtn[data-tone='quiet'][data-current] {
 	--k-ink: var(--text-secondary);
 }
-.k-ibtn:hover:not(:disabled) {
+.k-ibtn:hover:not(:disabled):not([aria-disabled='true']) {
 	background: var(--surface-hover);
 	color: var(--text-primary);
 }
-.k-ibtn:active:not(:disabled) {
+.k-ibtn:active:not(:disabled):not([aria-disabled='true']) {
 	background: var(--surface-active);
 	color: var(--text-primary);
 }
@@ -219,7 +219,8 @@
 	background: var(--agent-surface);
 	box-shadow: var(--press-fill);
 }
-.k-ibtn:disabled {
+.k-ibtn:disabled,
+.k-ibtn[aria-disabled='true'] {
 	background: transparent;
 	border-color: transparent;
 	color: var(--text-disabled);
@@ -334,11 +335,11 @@
 		border-color var(--dur-fast) var(--ease-out),
 		color var(--dur-fast) var(--ease-out);
 }
-.k-chip:hover:not(:disabled) {
+.k-chip:hover:not(:disabled):not([aria-disabled='true']) {
 	background: var(--surface-hover);
 	color: var(--text-primary);
 }
-.k-chip:active:not(:disabled) {
+.k-chip:active:not(:disabled):not([aria-disabled='true']) {
 	background: var(--surface-active);
 	color: var(--text-primary);
 }
@@ -353,7 +354,8 @@
 .k-chip[aria-pressed='true']:active:not(:disabled) {
 	background: color-mix(in srgb, var(--kerf-500) 42%, transparent);
 }
-.k-chip:disabled {
+.k-chip:disabled,
+.k-chip[aria-disabled='true'] {
 	background: transparent;
 	border-color: var(--border-subtle);
 	color: var(--text-disabled);
@@ -389,14 +391,15 @@
 		border-color var(--dur-fast) var(--ease-out),
 		color var(--dur-fast) var(--ease-out);
 }
-.k-tile:hover:not(:disabled) {
+.k-tile:hover:not(:disabled):not([aria-disabled='true']) {
 	background: var(--surface-hover);
 	border-color: var(--border-strong);
 }
-.k-tile:active:not(:disabled) {
+.k-tile:active:not(:disabled):not([aria-disabled='true']) {
 	background: var(--surface-active);
 }
-.k-tile:disabled {
+.k-tile:disabled,
+.k-tile[aria-disabled='true'] {
 	background: transparent;
 	border-color: var(--border-subtle);
 	color: var(--text-disabled);
@@ -459,7 +462,8 @@
 	accent-color: var(--kerf-500);
 	cursor: inherit;
 }
-.k-check:has(input:disabled) {
+.k-check:has(input:disabled),
+.k-check:has(input[aria-disabled='true']) {
 	color: var(--text-disabled);
 	cursor: default;
 }

@@ -130,7 +130,7 @@ turns a PNG / JPEG / GIF / WebP file's bytes into the `data:` URL an `image` val
 - **Setting values is its own edit, not a field of `SvgOverlayPatch`**: the splice must read the title as it is
   (and the sanitiser takes up to a second and a half), which cannot happen in `check()` before the lock.
   `SvgOverlayPatch.svg` replaces the artwork and **ends the template** (`template` becomes `None`).
-- Embedded fonts are the `fonts` table (`sha256`, `family`, `data`), schema **v2**. Opening a project makes its
+- Embedded fonts are the `fonts` table (`sha256`, `family`, `data`), schema **v3** (v2 is the proposal's `owner` / `assets` columns). Opening a project makes its
   fonts *the* embedded set (it replaces the previous project's); applying a template adds to it. The SVG
   frame cache key carries `fonts::embedded_digest()` when the set is not empty.
 - A font is carried only when it is a plain `.ttf` / `.otf`, ≤ 8 MiB, ≤ 16 per template, and its `OS/2` licence

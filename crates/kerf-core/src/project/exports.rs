@@ -30,6 +30,15 @@ pub struct DeliveryInputs {
     pub title: String,
 }
 
+/// A marker's colour reaches an inline style in the ruler: a colour spec, nothing else (an empty
+/// one clears it).
+fn check_marker_color(patch: &MarkerPatch) -> Result<()> {
+    match patch.color.as_deref() {
+        Some(c) if !c.is_empty() => super::check_color("marker color", c),
+        _ => Ok(()),
+    }
+}
+
 /// A side-file written, and what its format could not carry.
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct ExportedFile {
@@ -41,6 +50,7 @@ impl Project {
     /// Change any of a marker's fields as one `Update marker` revision; each
     /// `None` in `patch` leaves that field alone.
     pub fn edit_marker(&self, marker_id: Uuid, patch: MarkerPatch) -> Result<Marker> {
+        check_marker_color(&patch)?;
         self.edit_timeline("Update marker", |timeline| {
             let marker = timeline
                 .markers
@@ -57,6 +67,7 @@ impl Project {
     /// [`Project::add_marker`] with the rest of a marker's fields (`patch.time`
     /// and `patch.name`, when given, win over `time` and `name`).
     pub fn add_marker_with(&self, time: f64, name: String, patch: MarkerPatch) -> Result<Marker> {
+        check_marker_color(&patch)?;
         let mut marker = Marker {
             id: Uuid::new_v4(),
             time,

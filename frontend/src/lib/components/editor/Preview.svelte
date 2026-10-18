@@ -3,7 +3,7 @@
 	import Icon from './Icon.svelte';
 	import PreviewEmpty from './PreviewEmpty.svelte';
 	import TimecodeField from './TimecodeField.svelte';
-	import { formatTimecode } from '$lib/timecode';
+	import { timeDisplay } from '$lib/time-display.svelte';
 	import ScrubBar from './ScrubBar.svelte';
 	import TrimMonitor from './TrimMonitor.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
@@ -36,6 +36,7 @@
 	import { RESIZE_SETTLE_MS, capToSource, dprQuery, requestWidth } from '$lib/preview-size';
 	import type { PlayAhead, PreviewBoundsReport } from '$lib/types';
 	import { toast } from '$lib/notifications.svelte';
+	import { report } from '$lib/ops';
 	import { createFrameGate, createLadder, playbackFps, takeoverAhead } from '$lib/playback-sync';
 	import { GpuPlayback, NO_PLAY, playSession, type PlayRun } from '$lib/gpu-playback';
 	import { audio } from '$lib/audio';
@@ -114,7 +115,7 @@
 	});
 
 	function tc(s: number): string {
-		return formatTimecode(s, editor.fps);
+		return timeDisplay.fmt(s);
 	}
 
 	// The frame under the playhead: fetched one at a time (frame-pump.svelte.ts), as FFmpeg's JPEG
@@ -489,17 +490,17 @@
 	});
 
 	const titlesHere = $derived.by(() => {
-		if (ui.playing || empty) return [];
+		if (ui.playing || empty || editor.previewingStaged) return [];
 		const here = editor.overlays.filter((o) => isVisibleAt(o, ui.time));
 		return here.sort((a, b) => Number(a.id === editor.selectedOverlayId) - Number(b.id === editor.selectedOverlayId));
 	});
 
 	// The selected animated SVG title, as a placement box over the rectangle the engine fits its artwork into
 	// (fractions of the same frame the titles are laid out in). The artwork itself is in the picture the engine
-	// rendered: the page draws only the box, never the SVG. Like the title boxes it is out of the way while playing.
+	// rendered: the page draws only the box, never the SVG. Like the title boxes it is out of the way while playing, and while a proposal is previewed (read-only).
 	const svgBox = $derived.by(() => {
 		const o = editor.selectedSvgOverlay;
-		return o && !ui.playing && !empty && isVisibleAt(o, ui.time) ? o : null;
+		return o && !ui.playing && !empty && !editor.previewingStaged && isVisibleAt(o, ui.time) ? o : null;
 	});
 
 	// ---- the GPU preview: how the frame is produced, and where the surface is ------------
@@ -875,7 +876,7 @@
 		try {
 			await editor.updateSvgOverlay(d.id, patch);
 		} catch (err) {
-			toast.error(err instanceof Error ? err.message : String(err));
+			report(err);
 		} finally {
 			sdrag = null;
 		}
@@ -961,7 +962,7 @@
 			if (d.mode === 'move') await editor.moveOverlay(d.id, round4(d.x), round4(d.y), d.at);
 			else await editor.updateOverlay(d.id, { size: round4(d.size) });
 		} catch (err) {
-			toast.error(err instanceof Error ? err.message : String(err));
+			report(err);
 		} finally {
 			tdrag = null;
 		}
@@ -1242,7 +1243,9 @@
 		{/if}
 		{#if parts.rate}
 			<span
-				use:tip={`Timeline frame rate; ${timecodeRate(editor.fps).drop > 0 ? 'drop-frame' : 'non-drop'} timecode`}
+				use:tip={timeDisplay.mode === 'seconds'
+					? 'Timeline frame rate'
+					: `Timeline frame rate; ${timecodeRate(editor.fps).drop > 0 ? 'drop-frame' : 'non-drop'} timecode`}
 				style="font-size:11px;color:var(--text-muted);white-space:nowrap">{Number(editor.fps.toFixed(3))} fps</span
 			>
 		{/if}

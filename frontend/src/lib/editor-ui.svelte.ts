@@ -7,6 +7,7 @@ import { editor } from './state.svelte';
 import {
 	cancelAnalysis,
 	cancelLevels,
+	cancelModelDownload,
 	downloadSpeechModel,
 	getLevels,
 	listFonts,
@@ -23,9 +24,10 @@ import type {
 	CaptionStyle,
 	CaptionTimeBase,
 	Levels,
+	ModelProgress,
 	TranscriptionStatus
 } from './types';
-import { autoSteps, kindInfo, kindOfStage, missingSteps } from './analysis-steps';
+import { autoSteps, counterKind, kindInfo, kindOfStage, missingSteps, stepCounter, stepWords, type StepCounter } from './analysis-steps';
 import { mediaStatus } from './media-status.svelte';
 import { isLevelsCancelled, measureRange, type MeasureStamp } from './levels-view';
 import type { ExportDraft } from './export-draft';
@@ -78,12 +80,19 @@ class EditorUi {
 	 *  and then runs inference for minutes, so the UI names the step and shows a
 	 *  real percentage wherever the backend can produce one. */
 	analysisStage = $state<AnalysisProgress | null>(null);
+	/** The kinds the running pass was asked for, for "step 2 of 5" — `null` when the run was left to Settings'
+	 *  switches and the plan is not known here. */
+	analysisPlan = $state<readonly AnalysisKind[] | null>(null);
 	/** Which speech-to-text backend is available, once probed. */
 	transcription = $state<TranscriptionStatus | null>(null);
 	/** Set while a speech model is being fetched deliberately (not mid-analysis). */
 	downloadingModel = $state<string | null>(null);
 	/** 0..1 for that download. */
 	modelFraction = $state(0);
+	/** The latest `model-progress` report: the bytes fetched of the model, for a line under the bar. */
+	modelProgress = $state<ModelProgress | null>(null);
+	/** A stop has been asked for and the download has not given up yet. */
+	cancellingModel = $state(false);
 	/** How many assets are still queued behind the one being analyzed, so the
 	 *  UI can say "2 of 5" rather than spin at an unknown length. */
 	analysisQueued = $state(0);
@@ -100,6 +109,10 @@ class EditorUi {
 	exportDialog = $state(false);
 	/** The About dialog (Help › About Kerf). */
 	aboutDialog = $state(false);
+	/** The Relink-media dialog: opens on its own when a project comes up with media whose file is gone. */
+	relinkDialog = $state(false);
+	/** The read-only shortcut cheat sheet (`?`, Help › Keyboard shortcuts). */
+	shortcutSheet = $state(false);
 	/** The options the export dialog was last closed on, for the session (`export-draft.ts`). */
 	exportDraft = $state.raw<ExportDraft | null>(null);
 	/** The delivery shapes (ids from `DELIVERY_PRESETS`) ticked for a multi-format
@@ -247,6 +260,22 @@ class EditorUi {
 		this.aboutDialog = false;
 	}
 
+	openRelink() {
+		this.relinkDialog = true;
+	}
+
+	closeRelink() {
+		this.relinkDialog = false;
+	}
+
+	openShortcuts() {
+		this.shortcutSheet = true;
+	}
+
+	closeShortcuts() {
+		this.shortcutSheet = false;
+	}
+
 	openStems(assetId: string, clipId: string | null = null) {
 		this.stemsDialog = { assetId, clipId };
 	}
@@ -355,9 +384,20 @@ class EditorUi {
 		return this.analyzing ? kindOfStage(this.analysisStage?.stage) : null;
 	}
 
-	/** A short label for the step analysis is on, or null when idle. */
+	/** Where the running pass is in what it was asked for, once it has said which step it is on. */
+	get analysisStep(): StepCounter | null {
+		return this.analyzing ? stepCounter(this.analysisPlan, counterKind(this.analysisStage?.stage)) : null;
+	}
+
+	/** A short label for the step analysis is on, or null when idle: `step 2 of 5 · detecting scenes 40%`. */
 	get analysisLabel(): string | null {
 		if (!this.analyzing) return null;
+		const words = stepWords(this.analysisStep);
+		const named = this.#stageLabel();
+		return words ? `${words} · ${named}` : named;
+	}
+
+	#stageLabel(): string {
 		const p = this.analysisStage;
 		if (!p) return 'analyzing';
 		const kind = kindOfStage(p.stage);
@@ -383,18 +423,41 @@ class EditorUi {
 	async fetchSpeechModel(name: string) {
 		this.downloadingModel = name;
 		this.modelFraction = 0;
+		this.modelProgress = null;
+		this.cancellingModel = false;
 		try {
 			await downloadSpeechModel(name);
 			await this.loadTranscriptionStatus();
 		} catch (e) {
+			// A stop the user asked for is not a failure.
+			if (isModelCancelled(e)) toast.info(`Stopped downloading the ${name} speech model`);
 			// A few hundred megabytes over someone else's CDN fails often enough
 			// to be routine — offline, a proxy, a half-written cache file. It used
 			// to reject into nothing, so the download simply stopped looking like
 			// it was happening.
-			toast.error(`Couldn't download the ${name} speech model — ${message(e)}`);
+			else toast.error(`Couldn't download the ${name} speech model — ${message(e)}`);
 		} finally {
 			this.downloadingModel = null;
 			this.modelFraction = 0;
+			this.modelProgress = null;
+			this.cancellingModel = false;
+		}
+	}
+
+	/** A `model-progress` report from the backend (the user's download or an agent's). */
+	noteModelProgress(p: ModelProgress) {
+		this.modelProgress = p;
+		this.modelFraction = p.fraction ?? 0;
+	}
+
+	/** Stop the speech model download in flight; it then rejects and `fetchSpeechModel` says so. */
+	async stopModelDownload() {
+		this.cancellingModel = true;
+		try {
+			await cancelModelDownload();
+		} catch (e) {
+			this.cancellingModel = false;
+			toast.error(`Couldn't stop the download — ${message(e)}`);
 		}
 	}
 
@@ -407,6 +470,7 @@ class EditorUi {
 		this.analyzing = true;
 		this.analyzingId = assetId;
 		this.analysisStage = null;
+		this.analysisPlan = steps ?? null;
 		try {
 			await editor.analyze(assetId, steps);
 			// Transcription may have downloaded a model on the way.
@@ -420,6 +484,7 @@ class EditorUi {
 			this.analyzing = false;
 			this.analyzingId = null;
 			this.analysisStage = null;
+			this.analysisPlan = null;
 			this.stoppingAnalysis = false;
 			await mediaStatus.refresh();
 			this.reportFailedSteps(assetId, steps);
@@ -632,6 +697,11 @@ class EditorUi {
 }
 
 /** The readable part of whatever the backend rejected with. */
+/** The rejection of a download the user stopped (`cancel_model_download`). */
+export function isModelCancelled(e: unknown): boolean {
+	return /cancel+ed/i.test(e instanceof Error ? e.message : String(e));
+}
+
 function message(e: unknown): string {
 	return e instanceof Error ? e.message : String(e);
 }

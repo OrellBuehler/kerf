@@ -15,6 +15,7 @@
  * enough the frame ticks are the minors. */
 
 import { formatTimecode, timecodeRate } from './timecode';
+import type { TimeMode } from './time-format';
 
 /** The least room, px, between two labels. */
 export const MIN_LABEL_PX = 100;
@@ -131,11 +132,26 @@ export function minorTicksIn(loSec: number, hiSec: number, grid: RulerGrid, limi
 	return out;
 }
 
-/** The label of tick `k` on a grid: the project timecode of its time — `HH:MM:SS` for a
- *  whole-second step, `HH:MM:SS:FF` below it. At a drop-frame rate it is the drop-frame label,
- *  frames and all, as the playhead's reads (Premiere's ruler too): the ticks stay on whole frames
- *  of nominal seconds, and a label cut at the second would read off by the frames dropped so far. */
-export function tickLabel(k: number, grid: RulerGrid, fps: number): string {
+/** A tick's time in seconds mode, like the readouts there (`m:ss.d`) but without a tenth that a whole-second step never has: `m:ss`
+ *  (`h:mm:ss` from an hour) on a whole-second step, and below a second the fraction too, to the millisecond with
+ *  trailing zeros dropped (`0:00.5`, `0:00.033`) — one decimal would label two frame ticks alike. */
+function secondsLabel(t: number, fine: boolean): string {
+	const ms = Math.round(Math.max(0, Number.isFinite(t) ? t : 0) * 1000);
+	const whole = fine ? Math.floor(ms / 1000) : Math.round(ms / 1000);
+	const h = Math.floor(whole / 3600);
+	const m = Math.floor((whole % 3600) / 60);
+	const ss = String(whole % 60).padStart(2, '0');
+	const frac = fine ? `.${String(ms % 1000).padStart(3, '0').replace(/0+$/, '') || '0'}` : '';
+	return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${ss}${frac}` : `${m}:${ss}${frac}`;
+}
+
+/** The label of tick `k` on a grid: its time as the interface prints one. In timecode mode (the default) the project
+ *  timecode — `HH:MM:SS` for a whole-second step, `HH:MM:SS:FF` below it; at a drop-frame rate it is the drop-frame label,
+ *  frames and all, as the playhead's reads (Premiere's ruler too): the ticks stay on whole frames of nominal seconds, and a
+ *  label cut at the second would read off by the frames dropped so far. In seconds mode `m:ss`, with the fraction below a
+ *  second. */
+export function tickLabel(k: number, grid: RulerGrid, fps: number, mode: TimeMode = 'timecode'): string {
+	if (mode === 'seconds') return secondsLabel(k * grid.step, grid.frames);
 	return formatTimecode(k * grid.step, fps, { frames: grid.frames || timecodeRate(fps).drop > 0 });
 }
 

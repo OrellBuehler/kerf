@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { formatTime } from './time-format';
 import {
 	colorKeyCount,
 	colorSummary,
@@ -52,6 +53,10 @@ describe('the Color summary', () => {
 describe('the Timing summary and the key labels', () => {
 	test('labels both numbers', () => {
 		expect(timingSummary(0, 12.5)).toBe('Start 0:00.0 · Dur 0:12.5');
+	});
+
+	test('reads its times the way the interface does (a formatter in, the mode’s spelling out)', () => {
+		expect(timingSummary(0, 12.5, (s) => formatTime(s, 30))).toBe('Start 00:00:00:00 · Dur 00:00:12:15');
 	});
 
 	test('a key toggle names the number as its row does', () => {

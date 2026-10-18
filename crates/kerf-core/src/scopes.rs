@@ -483,6 +483,16 @@ pub struct ScopeRequest {
 /// is made of them) as its Y'CbCr samples, decoded to RGB with the delivery's matrix. Runs FFmpeg:
 /// never under the project lock.
 pub fn timeline_scopes(timeline: &Timeline, assets: &[Asset], req: &ScopeRequest) -> Result<Scopes> {
+    timeline_scopes_cancellable(timeline, assets, req, &|| false)
+}
+
+/// [`timeline_scopes`] that gives up with [`Error::Cancelled`] once `cancel` is true.
+pub fn timeline_scopes_cancellable(
+    timeline: &Timeline,
+    assets: &[Asset],
+    req: &ScopeRequest,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Scopes> {
     if !req.time_secs.is_finite() {
         return Err(Error::Engine("the time to measure is not a number".to_string()));
     }
@@ -493,7 +503,8 @@ pub fn timeline_scopes(timeline: &Timeline, assets: &[Asset], req: &ScopeRequest
         ..crate::engine::ExportOptions::default()
     };
     let max_width = req.max_width.unwrap_or(MAX_SCOPE_WIDTH).clamp(64, MAX_SCOPE_WIDTH);
-    let (w, h, planes) = crate::engine::timeline_frame_yuv(timeline, assets, &opts, req.time_secs.max(0.0), max_width)?;
+    let (w, h, planes) =
+        crate::engine::timeline_frame_yuv_cancellable(timeline, assets, &opts, req.time_secs.max(0.0), max_width, cancel)?;
     let rgba = yuv444_to_rgba(&planes, w, h, matrix);
     Ok(analyze(
         RgbaFrame {

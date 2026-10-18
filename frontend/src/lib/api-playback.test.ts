@@ -1,21 +1,25 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import type { PlaybackFrame } from './api';
+import { PLAYBACK_ID_SPAN } from './playback-id';
 
 // The desktop half of playback: what `start_playback` is handed, and what a channel message becomes.
 // The Rust command takes `playback_id`, `start`, `fps`, `max_width` and `on_frame` (Tauri turns the
 // camelCase keys into those), `null` for what the engine should decide (the cut's own rate, the
 // default width), and its frames come back as raw bytes — the timeline time as a little-endian f64,
-// then the JPEG (`playback_message` in kerf-app) — rather than as JSON.
+// then the JPEG (`playback_message` in kerf-app) — rather than as JSON. The id is
+// `session * 2^32 + n` (`playback-id.ts`), the session being what `playback_session` answers.
 
 const calls: { cmd: string; args: Record<string, unknown> }[] = [];
 const channels: { onmessage: (message: unknown) => void }[] = [];
+/** What `playback_session` answers: a number that is higher for every page that asks. */
+const session = 7;
 
 const realCore = { ...(await import('@tauri-apps/api/core')) };
 
 mock.module('@tauri-apps/api/core', () => ({
 	invoke: async (cmd: string, args: Record<string, unknown>) => {
 		calls.push({ cmd, args });
-		return null;
+		return cmd === 'playback_session' ? session : null;
 	},
 	Channel: class {
 		onmessage: (message: unknown) => void = () => {};
@@ -138,6 +142,26 @@ describe('startPlayback (desktop)', () => {
 		expect(ids[1]).toBeGreaterThan(ids[0]);
 		first();
 		second();
+	});
+
+	test('the id carries the backend session, which a page asks for once', async () => {
+		const stop = startPlayback(0, { fps: null, width: null }, () => {});
+		await started();
+		const id = calls.find((c) => c.cmd === 'start_playback')!.args.playbackId as number;
+		expect(Math.floor(id / PLAYBACK_ID_SPAN)).toBe(session);
+		stop();
+		channels.length = 0;
+		const again = startPlayback(0, { fps: null, width: null }, () => {});
+		await started();
+		again();
+		expect(calls.filter((c) => c.cmd === 'playback_session')).toHaveLength(0);
+	});
+
+	test('a stop before the session arrives means the stream never starts', async () => {
+		const stop = startPlayback(0, { fps: null, width: null }, () => {});
+		stop();
+		await new Promise((r) => setTimeout(r, 20));
+		expect(calls.filter((c) => c.cmd === 'start_playback' || c.cmd === 'stop_playback')).toEqual([]);
 	});
 });
 

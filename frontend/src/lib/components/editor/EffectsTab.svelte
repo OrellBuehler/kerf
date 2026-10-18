@@ -30,7 +30,9 @@
 				? 'This clip has no picture — select a video clip.'
 				: null
 	);
-	const off = $derived(reason !== null || editor.busy);
+	const off = $derived(reason !== null);
+	/** An edit is in flight, or the proposal is on screen: the controls ignore a press but keep focus. */
+	const hold = $derived(editor.locked);
 </script>
 
 {#snippet head(label: string)}
@@ -48,6 +50,7 @@
 			variant="ghost"
 			size="sm"
 			disabled={off}
+				pending={hold}
 			title={reason ?? 'Back to the ungraded picture'}
 			onclick={() => clip && void attempt(() => editor.setColor(clip.id, DEFAULT_COLOR))}>Reset</Btn
 		>
@@ -58,6 +61,7 @@
 			<Chip
 				pressed={on}
 				disabled={off}
+				pending={hold}
 				title={reason ?? `${look.label} — sets brightness, contrast, saturation, warmth and gamma`}
 				onclick={() => clip && void attempt(() => editor.setColor(clip.id, look.color))}>{look.label}</Chip
 			>
@@ -69,6 +73,7 @@
 		{#each VIDEO_EFFECT_PRESETS as p (p.key)}
 			<Tile
 				disabled={off}
+				pending={hold}
 				title={reason ?? p.hint}
 				onclick={() => clip && void attempt(() => editor.setVideoEffects(clip.id, [...effects, freshEffect(p)]))}
 			>
@@ -89,7 +94,7 @@
 					size={28}
 					data-tone="quiet"
 					title={`Remove ${effectLabel(e)}`}
-					disabled={editor.busy}
+					pending={editor.locked}
 					onclick={() => void attempt(() => editor.setVideoEffects(clip.id, effects.filter((_, j) => j !== i)))}
 					><Icon n="x" s={14} /></IconBtn
 				>

@@ -11,7 +11,7 @@
 	import SectionHead from './SectionHead.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
-	import { platformCheck } from '$lib/api';
+	import { platformCheck, platformTargets } from '$lib/api';
 	import { VARIANT_PRESETS } from '$lib/delivery-formats';
 	import { platformVerdict, type Verdict, type VerdictLevel } from '$lib/platform-verdict';
 
@@ -45,6 +45,8 @@
 					shapes: []
 				}));
 		answers
+			// The publishing targets are the backend's (`kerf_core::platform`), asked once and kept.
+			.then(async (input) => ({ ...input, targets: await platformTargets().catch(() => undefined) }))
 			.then((input) => {
 				if (mine === seq) verdict = platformVerdict(input);
 			})

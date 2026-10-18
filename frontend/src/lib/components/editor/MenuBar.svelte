@@ -77,7 +77,9 @@
 		workspace: workspace.shown,
 		openPanels: workspace.open,
 		detachedPanels: popout.detached,
-		desktop: inTauri()
+		desktop: inTauri(),
+		previewing: editor.previewingStaged,
+		recent: settings.recent
 	});
 	const full = $derived(buildMenus(menuState));
 	const tops = $derived(compact ? collapseMenus(full) : full);

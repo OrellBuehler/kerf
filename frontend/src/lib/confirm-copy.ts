@@ -69,8 +69,108 @@ export const CONFIRM = {
 		ok: 'Apply and replace',
 		cancel: 'Cancel'
 	},
-	replaceCaptions: { title: 'Replace captions?', ok: 'Replace', cancel: 'Cancel' }
+	replaceCaptions: { title: 'Replace captions?', ok: 'Replace', cancel: 'Cancel' },
+	resetSettings: {
+		title: 'Reset all settings?',
+		message:
+			'Every preference goes back to its default: the theme, shortcuts, window layout, analysis, preview and the rest. Where the agent server listens and its token stay as they are. The old settings file is kept beside the new one.',
+		ok: 'Reset all settings',
+		cancel: 'Cancel'
+	},
+	clearRecent: {
+		title: 'Clear recent projects?',
+		message: 'The list in File › Open Recent is emptied. The project files themselves are not touched.',
+		ok: 'Clear the list',
+		cancel: 'Cancel'
+	},
+	agentReviewOff: {
+		title: 'Let the agent edit without review?',
+		message:
+			'With review off, an agent’s edits land on your timeline as soon as it makes them, as steps you can undo. Nothing waits for you to apply it. You can turn review back on at any time.',
+		ok: 'Turn review off',
+		cancel: 'Keep reviewing'
+	},
+	serverOff: {
+		title: 'Stop letting agents connect?',
+		message: 'Kerf’s agent server shuts down. Agents that are connected lose the connection and none can connect until you turn it back on. Nothing in your project changes.',
+		ok: 'Turn it off',
+		cancel: 'Keep it on'
+	},
+	tokenOff: {
+		title: 'Stop requiring the access token?',
+		message:
+			'Any program on this computer will be able to read your project and edit it through Kerf without the token. Turn this off only on a machine nobody else uses. Agents that are connected are disconnected and have to connect again.',
+		ok: 'Stop requiring it',
+		cancel: 'Keep requiring it'
+	},
+	restoreStale: {
+		title: 'Bring back changes from an older cut?',
+		message:
+			'You edited the timeline after these changes were discarded. They come back as a proposal against the older cut, and applying it then replaces your newer one — you are asked again before that.',
+		ok: 'Bring them back',
+		cancel: 'Cancel'
+	},
+	newToken: {
+		title: 'Make a new access token?',
+		message: 'The current token stops working at once. Every agent that connected with it has to be given the new one.',
+		ok: 'Make a new token',
+		cancel: 'Cancel'
+	}
 } as const;
+
+/** Taking media out of the project. Unused media is a plain question; media a clip uses (or a proposal holds) says
+ *  what goes with it. `uses` is the clips of the cut, `proposed` whether an agent's proposal also holds clips of it. */
+export function removeMediaCopy(name: string, uses: number, proposed = false): ConfirmCopy {
+	const clips = uses === 1 ? '1 clip' : `${uses} clips`;
+	if (uses === 0 && !proposed)
+		return {
+			title: `Remove ${name}?`,
+			message: `${name} leaves the library, and its analysis and preview proxies are deleted. The file on disk stays where it is.`,
+			ok: 'Remove media',
+			cancel: 'Cancel'
+		};
+	const where = uses > 0 ? `${clips} on the timeline${proposed ? ' and in the agent’s proposal' : ''}` : 'the agent’s proposal';
+	return {
+		title: `Remove ${name} and what uses it?`,
+		message: `${name} is used by ${where}. Removing it removes ${uses > 0 ? 'those clips' : 'those clips from the proposal'} as one step — and that step cannot be undone, because the media is gone. The file on disk stays.`,
+		ok: uses > 0 ? `Remove media and ${uses === 1 ? 'clip' : 'clips'}` : 'Remove media',
+		cancel: 'Cancel'
+	};
+}
+
+/** Pointing media at a different recording drops what was analysed from the old one (its transcript, silences,
+ *  beats …). The clips stay; the analysis would have to be run again. */
+export function relinkDropsAnalysisCopy(name: string): ConfirmCopy {
+	return {
+		title: `Relink ${name} to a different recording?`,
+		message: `That file is not ${name} moved — its length, streams or bytes differ. The clips stay as they are, but the analysis of ${name} (transcript, silences, beats …) would be wrong for it, so it is dropped and has to be run again.`,
+		ok: 'Relink and drop the analysis',
+		cancel: 'Cancel'
+	};
+}
+
+/** The export would replace files that are already there. */
+export function overwriteCopy(files: readonly string[]): ConfirmCopy {
+	const names = files.map((f) => f.split(/[\\/]/).filter(Boolean).pop() ?? f);
+	const shown = names.slice(0, 4).join(', ') + (names.length > 4 ? ` and ${names.length - 4} more` : '');
+	return {
+		title: files.length === 1 ? 'Replace the existing file?' : `Replace ${files.length} existing files?`,
+		message: `${shown} ${files.length === 1 ? 'is' : 'are'} already there. Exporting replaces ${files.length === 1 ? 'it' : 'them'}.`,
+		ok: files.length === 1 ? 'Replace' : 'Replace all',
+		cancel: 'Cancel'
+	};
+}
+
+/** Throwing away a proposal of several changes: named for what is lost (the agent's work), with the
+ *  button that keeps it saying what it does. */
+export function discardProposalCopy(changes: number): ConfirmCopy {
+	return {
+		title: 'Discard the agent’s changes?',
+		message: `${changes} proposed change${changes === 1 ? '' : 's'} will be thrown away. Your timeline is not touched.`,
+		ok: 'Discard',
+		cancel: 'Keep reviewing'
+	};
+}
 
 /** What would be lost if the app closed this moment: the project nobody saved, a render, an analysis. */
 export interface InstallRisk {

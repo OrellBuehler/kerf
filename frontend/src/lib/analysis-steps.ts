@@ -9,8 +9,6 @@ export interface KindInfo {
 	kind: AnalysisKind;
 	/** The name in menus and tooltips. */
 	label: string;
-	/** The two-to-four letter tag on a chip. */
-	short: string;
 	/** The `AnalysisProgress.stage` the backend reports while it runs. */
 	stage: string;
 	/** The progress line while it runs. */
@@ -21,11 +19,11 @@ export interface KindInfo {
 
 /** Every kind, in the order a pass runs them. */
 export const ANALYSIS_KINDS: readonly KindInfo[] = [
-	{ kind: 'silence', label: 'Silence', short: 'SIL', stage: 'silence', doing: 'detecting silence', action: 'Detect silence' },
-	{ kind: 'scenes', label: 'Scenes', short: 'SCN', stage: 'scenes', doing: 'detecting scenes', action: 'Find scene changes' },
-	{ kind: 'loudness', label: 'Loudness', short: 'LUFS', stage: 'loudness', doing: 'measuring loudness', action: 'Measure loudness' },
-	{ kind: 'rhythm', label: 'Rhythm', short: 'BPM', stage: 'rhythm', doing: 'finding the beat', action: 'Find the beat and tempo' },
-	{ kind: 'transcript', label: 'Transcript', short: 'TXT', stage: 'transcribe', doing: 'transcribing', action: 'Transcribe speech' }
+	{ kind: 'silence', label: 'Silence', stage: 'silence', doing: 'detecting silence', action: 'Detect silence' },
+	{ kind: 'scenes', label: 'Scenes', stage: 'scenes', doing: 'detecting scenes', action: 'Find scene changes' },
+	{ kind: 'loudness', label: 'Loudness', stage: 'loudness', doing: 'measuring loudness', action: 'Measure loudness' },
+	{ kind: 'rhythm', label: 'Rhythm', stage: 'rhythm', doing: 'finding the beat', action: 'Find the beat and tempo' },
+	{ kind: 'transcript', label: 'Transcript', stage: 'transcribe', doing: 'transcribing', action: 'Transcribe speech' }
 ];
 
 export const ALL_KINDS: readonly AnalysisKind[] = ANALYSIS_KINDS.map((k) => k.kind);
@@ -59,6 +57,35 @@ export function analysisKindDone(analysis: AssetAnalysis | null | undefined, kin
 	}
 }
 
+/** The kind a progress stage counts as in "step 2 of 5": its own, and the speech model's download is the
+ *  transcript step's first half. `waiting` (queued behind a proxy) and `done` are no step. */
+export function counterKind(stage: string | null | undefined): AnalysisKind | null {
+	return stage === 'download_model' ? 'transcript' : kindOfStage(stage);
+}
+
+export interface StepCounter {
+	/** 1-based. */
+	step: number;
+	of: number;
+}
+
+/**
+ * Where a run is in its plan: `step 2 of 5`. `plan` is the kinds it will run (in any order — a pass runs them in
+ * `ANALYSIS_KINDS` order, which is the order counted here); `null` while the run has not reported a step or the
+ * plan is not known (a run that was left to Settings' switches). A step the plan does not hold is no step.
+ */
+export function stepCounter(plan: readonly AnalysisKind[] | null | undefined, current: AnalysisKind | null): StepCounter | null {
+	if (!plan || plan.length === 0 || !current) return null;
+	const ordered = ANALYSIS_KINDS.map((k) => k.kind).filter((k) => plan.includes(k));
+	const at = ordered.indexOf(current);
+	return at < 0 ? null : { step: at + 1, of: ordered.length };
+}
+
+/** `step 2 of 5`, or nothing at all for a one-step run (it is that step; counting it adds nothing). */
+export function stepWords(c: StepCounter | null): string {
+	return c && c.of > 1 ? `step ${c.step} of ${c.of}` : '';
+}
+
 const STATE_WORD: Record<AnalysisState, string> = {
 	done: 'done',
 	not_run: 'not run',
@@ -75,7 +102,6 @@ export function stateWord(state: AnalysisState): string {
 export interface Chip {
 	kind: AnalysisKind;
 	label: string;
-	short: string;
 	state: AnalysisState;
 	/** The tooltip: `Silence — done`, `Loudness — failed: ffmpeg exited with 1`. */
 	title: string;
@@ -92,7 +118,6 @@ export function analysisChips(status: AnalysisStatus | null | undefined, running
 		return {
 			kind: info.kind,
 			label: info.label,
-			short: info.short,
 			state,
 			title: `${info.label} — ${stateWord(state)}${reason && state !== 'running' ? ` (${reason})` : ''}`
 		};

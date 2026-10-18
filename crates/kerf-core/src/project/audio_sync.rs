@@ -161,7 +161,7 @@ impl Project {
             if cancel() {
                 return Err(Error::Cancelled);
             }
-            Ok(decode_audio_window(&side.path, side.start, side.secs, SYNC_SAMPLE_RATE, 1, &lease)?.samples)
+            Ok(decode_audio_window(&side.path, side.start, side.secs, SYNC_SAMPLE_RATE, 1, &lease, cancel)?.samples)
         };
         let (a, b) = (decode(&plan.reference)?, decode(&plan.clip)?);
         if cancel() {

@@ -62,6 +62,33 @@ export function runsIntoUnlinked(track: string, at: number): Error {
 }
 
 /**
+ * The lane check for the clips an edit itself put somewhere (`Timeline::check_own_lanes`): a trimmed
+ * clip, a clip just added. A clip of `ids` that now overlaps another clip of its track, where the two
+ * did not overlap in `before`, refuses the edit (an overlap that was already there is not this edit's
+ * doing). Run after the ripple, which may have made the room: a clip lengthened over its neighbour is
+ * fine with the neighbour pushed along and refused without. An id that is not on the timeline is ignored.
+ */
+export function checkOwnLanes(timeline: Timeline, before: Timeline, ids: readonly string[]) {
+	if (ids.length === 0) return;
+	const prior = new Map<string, [number, number]>();
+	for (const c of before.tracks.flatMap((t) => t.clips)) prior.set(c.id, [c.timeline_start, clipEnd(c)]);
+	for (const track of timeline.tracks) {
+		for (const p of track.clips.filter((c) => ids.includes(c.id))) {
+			const span: [number, number] = [p.timeline_start, clipEnd(p)];
+			for (const q of track.clips) {
+				const other: [number, number] = [q.timeline_start, clipEnd(q)];
+				if (q.id === p.id || !spansOverlap(span, other)) continue;
+				const [a, b] = [prior.get(p.id), prior.get(q.id)];
+				if (a && b && spansOverlap(a, b)) continue;
+				throw invalid(
+					`the clip would overlap another clip on ${track.name} at ${formatTime(Math.max(p.timeline_start, q.timeline_start))} — move or trim that one first`
+				);
+			}
+		}
+	}
+}
+
+/**
  * The cut after a **ripple edit**: `after` is what an edit left behind and
  * `before` is what it started from. Pure — neither argument is modified — and
  * the identity (a copy) when nothing about any track's timing changed. With `links`

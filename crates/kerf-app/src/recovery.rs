@@ -143,6 +143,8 @@ pub(crate) async fn recover_project(app: AppHandle, state: State<'_, AppState>, 
         scrub.clear();
         crate::restore_speech_model(&shared);
         crate::respawn_proxies(&app);
+        // A project with no file is nothing for a launch to reopen.
+        crate::note_open(&app, None);
         Ok(())
     })
     .await

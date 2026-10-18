@@ -80,14 +80,16 @@ pub type CancelFn<'a> = &'a dyn Fn() -> bool;
 /// The no-op cancel, for callers that never abandon a pass.
 pub(crate) const NEVER_CANCEL: CancelFn<'static> = &|| false;
 
-/// Detects silent spans in an asset's audio.
+/// Detects silent spans in an asset's audio. `cancel` is the pass's: a provider that runs a
+/// child process polls it and returns [`Error::Cancelled`] once it is true, so Stop ends the
+/// step in flight and not just the ones after it.
 pub trait SilenceDetector: Send + Sync {
-    fn detect_silence(&self, asset: &Asset) -> Result<Vec<TimeRange>>;
+    fn detect_silence(&self, asset: &Asset, cancel: CancelFn) -> Result<Vec<TimeRange>>;
 }
 
-/// Detects scene-change timestamps in an asset's video.
+/// Detects scene-change timestamps in an asset's video (see [`SilenceDetector`] for `cancel`).
 pub trait SceneDetector: Send + Sync {
-    fn detect_scenes(&self, asset: &Asset) -> Result<Vec<f64>>;
+    fn detect_scenes(&self, asset: &Asset, cancel: CancelFn) -> Result<Vec<f64>>;
 }
 
 /// Produces a timecoded transcript from an asset's audio.
@@ -107,7 +109,7 @@ pub trait Transcriber: Send + Sync {
 /// Measures EBU R128 loudness of an asset's audio (`None` for silent / video-only
 /// assets).
 pub trait LoudnessAnalyzer: Send + Sync {
-    fn measure(&self, asset: &Asset) -> Result<Option<Loudness>>;
+    fn measure(&self, asset: &Asset, cancel: CancelFn) -> Result<Option<Loudness>>;
 }
 
 /// Derives rhythm metadata — onset timestamps, tempo / beat grid, and the
@@ -115,7 +117,7 @@ pub trait LoudnessAnalyzer: Send + Sync {
 /// because they share the decoded PCM: a provider can (and the ffmpeg one does)
 /// produce all of them from a single decode.
 pub trait RhythmAnalyzer: Send + Sync {
-    fn analyze_rhythm(&self, asset: &Asset) -> Result<Rhythm>;
+    fn analyze_rhythm(&self, asset: &Asset, cancel: CancelFn) -> Result<Rhythm>;
 }
 
 /// Silence detection backed by FFmpeg's `silencedetect` filter (run via the
@@ -137,8 +139,8 @@ impl Default for FfmpegSilenceDetector {
 }
 
 impl SilenceDetector for FfmpegSilenceDetector {
-    fn detect_silence(&self, asset: &Asset) -> Result<Vec<TimeRange>> {
-        crate::engine::detect_silence(std::path::Path::new(&asset.path), self.noise_db, self.min_silence)
+    fn detect_silence(&self, asset: &Asset, cancel: CancelFn) -> Result<Vec<TimeRange>> {
+        crate::engine::detect_silence_cancellable(std::path::Path::new(&asset.path), self.noise_db, self.min_silence, cancel)
     }
 }
 
@@ -157,9 +159,14 @@ impl Default for FfmpegSceneDetector {
 }
 
 impl SceneDetector for FfmpegSceneDetector {
-    fn detect_scenes(&self, asset: &Asset) -> Result<Vec<f64>> {
+    fn detect_scenes(&self, asset: &Asset, cancel: CancelFn) -> Result<Vec<f64>> {
         let proxy = crate::project::Project::scoring_proxy(asset);
-        crate::engine::detect_scenes_preferring(std::path::Path::new(&asset.path), proxy.as_deref(), self.threshold)
+        crate::engine::detect_scenes_preferring_cancellable(
+            std::path::Path::new(&asset.path),
+            proxy.as_deref(),
+            self.threshold,
+            cancel,
+        )
     }
 }
 
@@ -168,11 +175,11 @@ impl SceneDetector for FfmpegSceneDetector {
 pub struct FfmpegLoudnessAnalyzer;
 
 impl LoudnessAnalyzer for FfmpegLoudnessAnalyzer {
-    fn measure(&self, asset: &Asset) -> Result<Option<Loudness>> {
+    fn measure(&self, asset: &Asset, cancel: CancelFn) -> Result<Option<Loudness>> {
         if !asset.has_audio() {
             return Ok(None);
         }
-        let loudness = crate::engine::measure_loudness(std::path::Path::new(&asset.path))?;
+        let loudness = crate::engine::measure_loudness_cancellable(std::path::Path::new(&asset.path), cancel)?;
         // Silent material measures as non-finite LUFS, which is not meaningful
         // (and would not round-trip through JSON): treat it as no measurement.
         Ok(loudness.integrated_lufs.is_finite().then_some(loudness))
@@ -194,11 +201,11 @@ impl Default for FfmpegRhythmAnalyzer {
 }
 
 impl RhythmAnalyzer for FfmpegRhythmAnalyzer {
-    fn analyze_rhythm(&self, asset: &Asset) -> Result<Rhythm> {
+    fn analyze_rhythm(&self, asset: &Asset, cancel: CancelFn) -> Result<Rhythm> {
         if !asset.has_audio() {
             return Ok(Rhythm::default());
         }
-        crate::engine::analyze_rhythm(std::path::Path::new(&asset.path), self.sensitivity)
+        crate::engine::analyze_rhythm_cancellable(std::path::Path::new(&asset.path), self.sensitivity, cancel)
     }
 }
 
@@ -267,13 +274,16 @@ impl Transcriber for WhisperTranscriber {
         if cancel() {
             return Err(Error::Cancelled);
         }
-        let samples = std::sync::Arc::new(crate::engine::decode_audio_16k_mono(std::path::Path::new(&asset.path))?);
+        let samples = std::sync::Arc::new(crate::engine::decode_audio_16k_mono_cancellable(
+            std::path::Path::new(&asset.path),
+            cancel,
+        )?);
         let language = self.language.clone();
         // In-process inference is as CPU-hungry as the ffmpeg filter backend, so
         // it takes the same heavy-job slot and the same share of the cores. The
         // lease is held here while the worker below does the work, which is what
         // the join makes safe.
-        let cpu = crate::engine::cpu::lease();
+        let cpu = crate::engine::cpu::lease_waiting(&mut |_| {}, cancel)?;
         let threads = cpu.threads();
 
         // whisper-rs wants a `'static` progress callback, and `full()` blocks
@@ -570,7 +580,12 @@ pub fn refine_transcript_media(
             return Err(Error::Cancelled);
         }
         progress(refining());
-        let audio = crate::engine::decode_audio(std::path::Path::new(&asset.path), crate::transcript::SAMPLE_RATE, 1)?;
+        let audio = crate::engine::decode_audio_cancellable(
+            std::path::Path::new(&asset.path),
+            crate::transcript::SAMPLE_RATE,
+            1,
+            cancel,
+        )?;
         if cancel() {
             return Err(Error::Cancelled);
         }
@@ -609,13 +624,13 @@ impl Transcriber for Refined {
 pub struct NullAnalyzer;
 
 impl SilenceDetector for NullAnalyzer {
-    fn detect_silence(&self, _asset: &Asset) -> Result<Vec<TimeRange>> {
+    fn detect_silence(&self, _asset: &Asset, _cancel: CancelFn) -> Result<Vec<TimeRange>> {
         Ok(Vec::new())
     }
 }
 
 impl SceneDetector for NullAnalyzer {
-    fn detect_scenes(&self, _asset: &Asset) -> Result<Vec<f64>> {
+    fn detect_scenes(&self, _asset: &Asset, _cancel: CancelFn) -> Result<Vec<f64>> {
         Ok(Vec::new())
     }
 }
@@ -627,13 +642,13 @@ impl Transcriber for NullAnalyzer {
 }
 
 impl LoudnessAnalyzer for NullAnalyzer {
-    fn measure(&self, _asset: &Asset) -> Result<Option<Loudness>> {
+    fn measure(&self, _asset: &Asset, _cancel: CancelFn) -> Result<Option<Loudness>> {
         Ok(None)
     }
 }
 
 impl RhythmAnalyzer for NullAnalyzer {
-    fn analyze_rhythm(&self, _asset: &Asset) -> Result<Rhythm> {
+    fn analyze_rhythm(&self, _asset: &Asset, _cancel: CancelFn) -> Result<Rhythm> {
         Ok(Rhythm::default())
     }
 }
@@ -1024,12 +1039,15 @@ fn run_steps(
         let outcome = match kind {
             AnalysisKind::Silence => providers
                 .silence
-                .detect_silence(asset)
+                .detect_silence(asset, cancel)
                 .map(|v| run.patch.silence_segments = v),
-            AnalysisKind::Scenes => providers.scene.detect_scenes(asset).map(|v| run.patch.scene_changes = v),
-            AnalysisKind::Loudness => providers.loudness.measure(asset).map(|v| run.patch.loudness = v),
+            AnalysisKind::Scenes => providers
+                .scene
+                .detect_scenes(asset, cancel)
+                .map(|v| run.patch.scene_changes = v),
+            AnalysisKind::Loudness => providers.loudness.measure(asset, cancel).map(|v| run.patch.loudness = v),
             // One provider call for onsets + tempo + class: they share a single decode.
-            AnalysisKind::Rhythm => providers.rhythm.analyze_rhythm(asset).map(|r| {
+            AnalysisKind::Rhythm => providers.rhythm.analyze_rhythm(asset, cancel).map(|r| {
                 run.patch.onsets = r.onsets;
                 run.patch.tempo = r.tempo;
                 run.patch.audio_class = r.audio_class;
@@ -1114,19 +1132,19 @@ mod tests {
     struct Probe<'a>(&'a Fake, AnalysisKind);
 
     impl SilenceDetector for Probe<'_> {
-        fn detect_silence(&self, _: &Asset) -> Result<Vec<TimeRange>> {
+        fn detect_silence(&self, _: &Asset, _: CancelFn) -> Result<Vec<TimeRange>> {
             self.0.step(self.1)?;
             Ok(vec![TimeRange { start: 1.0, end: 2.0 }])
         }
     }
     impl SceneDetector for Probe<'_> {
-        fn detect_scenes(&self, _: &Asset) -> Result<Vec<f64>> {
+        fn detect_scenes(&self, _: &Asset, _: CancelFn) -> Result<Vec<f64>> {
             self.0.step(self.1)?;
             Ok(vec![5.0, 9.0])
         }
     }
     impl LoudnessAnalyzer for Probe<'_> {
-        fn measure(&self, _: &Asset) -> Result<Option<Loudness>> {
+        fn measure(&self, _: &Asset, _: CancelFn) -> Result<Option<Loudness>> {
             self.0.step(self.1)?;
             Ok(Some(Loudness {
                 integrated_lufs: -16.0,
@@ -1137,7 +1155,7 @@ mod tests {
         }
     }
     impl RhythmAnalyzer for Probe<'_> {
-        fn analyze_rhythm(&self, _: &Asset) -> Result<Rhythm> {
+        fn analyze_rhythm(&self, _: &Asset, _: CancelFn) -> Result<Rhythm> {
             self.0.step(self.1)?;
             Ok(Rhythm {
                 onsets: vec![0.5],
@@ -1185,6 +1203,51 @@ mod tests {
         analyze_steps(asset, kinds, &providers, &mut |_| {}, &mut |_| {}, NEVER_CANCEL)
     }
 
+    /// The pass's cancel reaches the provider that is running, not only the gaps between steps:
+    /// a whole-file ffmpeg read used to run on to its end after Stop.
+    #[test]
+    fn a_running_step_is_handed_the_cancel_and_stops_when_it_trips() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let _gate = crate::engine::cpu::test_lock();
+        struct Slow;
+        impl SilenceDetector for Slow {
+            fn detect_silence(&self, _: &Asset, cancel: CancelFn) -> Result<Vec<TimeRange>> {
+                let started = Instant::now();
+                while !cancel() {
+                    if started.elapsed() > Duration::from_secs(20) {
+                        return Ok(vec![TimeRange { start: 0.0, end: 1.0 }]);
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(Error::Cancelled)
+            }
+        }
+        let stop = AtomicBool::new(false);
+        let null = NullAnalyzer;
+        let mut providers = AnalysisProviders::null(&null);
+        providers.silence = &Slow;
+        let started = Instant::now();
+        let run = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(150));
+                stop.store(true, Ordering::SeqCst);
+            });
+            analyze_steps(
+                &asset(),
+                &[AnalysisKind::Silence, AnalysisKind::Scenes],
+                &providers,
+                &mut |_| {},
+                &mut |_| {},
+                &|| stop.load(Ordering::SeqCst),
+            )
+        });
+        assert!(run.cancelled, "the step in flight ended the pass");
+        assert!(run.patch.ran.is_empty() && run.failed.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    }
+
     #[test]
     fn only_the_named_steps_run_and_in_pass_order() {
         let _gate = crate::engine::cpu::test_lock();
@@ -1213,7 +1276,7 @@ mod tests {
         // …then silence is re-run and finds nothing this time, and loudness is untouched.
         struct Quiet;
         impl SilenceDetector for Quiet {
-            fn detect_silence(&self, _: &Asset) -> Result<Vec<TimeRange>> {
+            fn detect_silence(&self, _: &Asset, _: CancelFn) -> Result<Vec<TimeRange>> {
                 Ok(Vec::new())
             }
         }

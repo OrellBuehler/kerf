@@ -27,7 +27,7 @@ describe('progress bars', () => {
 	});
 
 	test('the run dialogs, the download and the panel all use it', () => {
-		for (const f of ['UpdateDialog', 'VoiceoverDialog', 'StemsDialog', 'SettingsDialog', 'ExportDialog', 'DeliverPanel'])
+		for (const f of ['UpdateDialog', 'VoiceoverDialog', 'StemsDialog', 'SettingsAnalysis', 'ExportDialog', 'DeliverPanel'])
 			expect(read(`${EDITOR}${f}.svelte`), f).toContain('<ProgressBar');
 	});
 

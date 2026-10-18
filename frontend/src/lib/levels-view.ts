@@ -78,10 +78,16 @@ export function clock(seconds: number): string {
 	return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
-/** What was measured, in words: "Whole cut · 2:00" or "In → out · 0:10–0:25". */
-export function scopeLabel(range: { start: number; end: number } | null, duration: number): string {
-	if (range) return `In → out · ${clock(range.start)}–${clock(range.end)}`;
-	return `Whole cut · ${clock(duration)}`;
+/** What was measured, in words: "Whole cut · 2:00" or "In → out · 0:10–0:25". `fmt` is how the interface prints a
+ *  time (`timeDisplay.fmt`) — the in / out marks are positions on the same timeline as the playhead; the default
+ *  is this file's `m:ss`. */
+export function scopeLabel(
+	range: { start: number; end: number } | null,
+	duration: number,
+	fmt: (seconds: number) => string = clock
+): string {
+	if (range) return `In → out · ${fmt(range.start)}–${fmt(range.end)}`;
+	return `Whole cut · ${fmt(duration)}`;
 }
 
 /** The project state a measurement was taken against. */
