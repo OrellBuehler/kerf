@@ -1488,11 +1488,19 @@ impl Mask {
             shape: self.shape,
             x: clamp01(self.x),
             y: clamp01(self.y),
-            width: self.width.clamp(0.01, 2.0),
-            height: self.height.clamp(0.01, 2.0),
+            width: finite_or(self.width, 0.5).clamp(0.01, 2.0),
+            height: finite_or(self.height, 0.5).clamp(0.01, 2.0),
             feather: clamp01(self.feather),
             inverted: self.inverted,
         }
+    }
+}
+
+fn finite_or(v: f64, fallback: f64) -> f64 {
+    if v.is_finite() {
+        v
+    } else {
+        fallback
     }
 }
 
@@ -3046,6 +3054,10 @@ fn is_yes(b: &bool) -> bool {
 /// Smallest speed magnitude allowed, to keep clip durations finite.
 pub const MIN_SPEED: f64 = 0.01;
 
+/// Largest speed magnitude a clip may be set to (100×): the audio tempo is a chain of `atempo`
+/// steps, one per doubling, and a clip sped past this is a few frames long whatever it was.
+pub const MAX_SPEED: f64 = 100.0;
+
 impl Clip {
     /// A new clip with default volume, no fades, full speed and identity
     /// transform / color and no transition.
@@ -3643,14 +3655,45 @@ pub struct StagedEdit {
     /// The agent's own description of what it is proposing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// The agent session (its MCP session id) the proposal belongs to, when one was named. A
+    /// second agent's edits are refused while another session owns the proposal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     /// Labels of the individual edits, in the order they were staged.
     pub edits: Vec<String>,
+    /// How many of the latest staged steps [`crate::project::Project::undo_staged`] can still take back.
+    #[serde(default)]
+    pub undo_depth: usize,
+    /// Changes to the library (an asset's projection) held back with the proposal; they land with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asset_changes: Vec<StagedAssetChange>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// The live timeline has moved on since `base_seq`.
     pub stale: bool,
     /// What applying it would do to the cut.
     pub diff: TimelineDiff,
+}
+
+/// A change to an *asset* an agent made while a proposal was open. The library is not the
+/// timeline, so it cannot ride in the proposal's timeline; it is held back beside it instead
+/// and written when the proposal is accepted (or the entry is picked in a partial accept).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StagedAssetChange {
+    /// `asset_projection:<asset id>` — usable wherever a [`DiffEntry::id`] is.
+    pub id: String,
+    pub asset_id: Uuid,
+    /// The spherical projection the asset is to be marked with; `None` clears it.
+    pub projection: Option<Projection>,
+    /// One line for the review card, e.g. `Mark interview.mp4 as equirect 360`.
+    pub summary: String,
+}
+
+impl StagedAssetChange {
+    /// The id every change of `kind` to `asset_id` has — one pending change per asset and kind.
+    pub fn projection_id(asset_id: Uuid) -> String {
+        format!("asset_projection:{asset_id}")
+    }
 }
 
 /// A named point on the timeline. Purely an annotation — it renders nothing —
@@ -4541,6 +4584,9 @@ pub use channels::{key_polyline, Property, PropertyKey, PropertyTrack, MAX_CHANN
 
 mod links;
 pub use links::{Detached, DetachedMany, SkippedDetach};
+
+mod subset;
+pub use subset::{AutoIncluded, SkippedChange, SubsetMerge};
 
 mod music_fit;
 pub use music_fit::{
@@ -5702,6 +5748,28 @@ pub enum DiffKind {
 }
 
 impl DiffKind {
+    /// The `snake_case` name this kind serializes as — the first half of a [`DiffEntry::id`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DiffKind::TrackAdded => "track_added",
+            DiffKind::TrackRemoved => "track_removed",
+            DiffKind::TrackChanged => "track_changed",
+            DiffKind::ClipAdded => "clip_added",
+            DiffKind::ClipRemoved => "clip_removed",
+            DiffKind::ClipMoved => "clip_moved",
+            DiffKind::ClipRetrimmed => "clip_retrimmed",
+            DiffKind::ClipChanged => "clip_changed",
+            DiffKind::OverlayAdded => "overlay_added",
+            DiffKind::OverlayRemoved => "overlay_removed",
+            DiffKind::OverlayChanged => "overlay_changed",
+            DiffKind::MarkerAdded => "marker_added",
+            DiffKind::MarkerRemoved => "marker_removed",
+            DiffKind::MarkerChanged => "marker_changed",
+            DiffKind::FormatChanged => "format_changed",
+            DiffKind::MasterChanged => "master_changed",
+        }
+    }
+
     /// Whether this entry adds, removes, or alters something — the three tints a
     /// diff needs.
     pub fn polarity(self) -> &'static str {
@@ -5716,6 +5784,12 @@ impl DiffKind {
 /// One change between two timelines, phrased for a human reviewing a cut.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffEntry {
+    /// Stable name of this change — `<kind>:<the clip, text, marker or track it is about>` — which
+    /// the same change keeps for as long as the proposal holds it, so a reviewer can send back
+    /// the ones it accepts ([`crate::project::Project::apply_staged_subset`]). Unique within a
+    /// diff: a thing has at most one change of each kind.
+    #[serde(default)]
+    pub id: String,
     pub kind: DiffKind,
     /// One line, e.g. `Trimmed clip on V1 at 0:04.0 — 4.0s → 2.5s (-1.5s)`.
     pub summary: String,
@@ -5729,6 +5803,9 @@ pub struct DiffEntry {
     /// The title or caption an `Overlay*` entry is about, so a view of the proposal can mark it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_id: Option<Uuid>,
+    /// The marker a `Marker*` entry is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker_id: Option<Uuid>,
     /// Where on the timeline to look, so the reviewer can jump straight to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<f64>,
@@ -5737,14 +5814,31 @@ pub struct DiffEntry {
 impl DiffEntry {
     fn new(kind: DiffKind, summary: String) -> Self {
         Self {
+            id: String::new(),
             kind,
             summary,
             detail: None,
             track_id: None,
             clip_id: None,
             overlay_id: None,
+            marker_id: None,
             at: None,
         }
+    }
+
+    /// Name the change after its kind and the thing it is about (see [`DiffEntry::id`]).
+    fn with_id(mut self) -> Self {
+        let target = self.clip_id.or(self.overlay_id).or(self.marker_id).or(self.track_id);
+        self.id = match target {
+            Some(target) => format!("{}:{target}", self.kind.as_str()),
+            None => self.kind.as_str().to_string(),
+        };
+        self
+    }
+
+    fn on_marker(mut self, id: Uuid) -> Self {
+        self.marker_id = Some(id);
+        self
     }
 
     fn detail(mut self, detail: impl Into<String>) -> Self {
@@ -6204,6 +6298,42 @@ fn fmt_delivery(d: &Delivery) -> String {
 }
 
 impl Timeline {
+    /// Refuse an edit that left one of `ids` on top of another clip of its track, unless the two
+    /// already overlapped in `before` (an overlap that was not this edit's doing). Run after the
+    /// ripple, which may have made the room: a clip lengthened over its neighbour is fine with the
+    /// neighbour pushed along and refused without. An id that is not on the timeline is ignored.
+    pub fn check_own_lanes(&self, before: &Timeline, ids: &[Uuid]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let prior: HashMap<Uuid, (f64, f64)> = before
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter())
+            .map(|c| (c.id, (c.timeline_start, c.timeline_end())))
+            .collect();
+        for track in &self.tracks {
+            for p in track.clips.iter().filter(|c| ids.contains(&c.id)) {
+                let span = (p.timeline_start, p.timeline_end());
+                for q in &track.clips {
+                    let qspan = (q.timeline_start, q.timeline_end());
+                    if q.id == p.id || !spans_overlap(span, qspan) {
+                        continue;
+                    }
+                    if matches!((prior.get(&p.id), prior.get(&q.id)), (Some(a), Some(b)) if spans_overlap(*a, *b)) {
+                        continue;
+                    }
+                    return Err(Error::InvalidArgument(format!(
+                        "the clip would overlap another clip on {} at {} — move or trim that one first",
+                        track.name,
+                        fmt_time(p.timeline_start.max(q.timeline_start))
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// How many clips stand somewhere else here than in `before`: a different
     /// start on their track, or a different track. Matched by id, so a clip that
     /// exists on only one side is not counted. This is how a caller learns whether
@@ -6496,6 +6626,7 @@ impl Timeline {
                         DiffKind::MarkerAdded,
                         format!("Added marker “{}” at {}", marker.name, fmt_time(marker.time)),
                     )
+                    .on_marker(marker.id)
                     .at(marker.time),
                 ),
                 Some(before) => {
@@ -6513,6 +6644,7 @@ impl Timeline {
                         rest.push(
                             DiffEntry::new(DiffKind::MarkerChanged, format!("Changed marker “{}”", marker.name))
                                 .detail(detail)
+                                .on_marker(marker.id)
                                 .at(marker.time),
                         );
                     }
@@ -6526,6 +6658,7 @@ impl Timeline {
                         DiffKind::MarkerRemoved,
                         format!("Removed marker “{}” at {}", marker.name, fmt_time(marker.time)),
                     )
+                    .on_marker(marker.id)
                     .at(marker.time),
                 );
             }
@@ -6550,7 +6683,7 @@ impl Timeline {
         tracks.append(&mut clips);
         tracks.append(&mut rest);
         TimelineDiff {
-            entries: tracks,
+            entries: tracks.into_iter().map(DiffEntry::with_id).collect(),
             duration_before: self.duration(),
             duration_after: after.duration(),
             clips_before: before_clips.len(),

@@ -248,8 +248,27 @@
   so a UI can jump there or mark it on the timeline. Everything is matched by
   **id**, so a reordered track reads as the handful of moves it is rather than as
   every clip having been replaced, and a removed track is one entry instead of one
-  per orphaned clip. `StagedEdit` is a pending proposal (base seq, the edit
-  labels, `stale`, and its diff). **Ripple** is here too, pure + unit-tested:
+  per orphaned clip. **Every entry has a stable `id`** (`<kind>:<clip|text|marker|track
+  id>`, e.g. `clip_retrimmed:<uuid>`; unique per diff, unchanged as a proposal grows; the
+  `Marker*` kinds carry a `marker_id`) so a reviewer can send back the ones it accepts.
+  `StagedEdit` is a pending proposal (base seq, the edit
+  labels, `stale`, its diff, the owning agent session, how many steps `undo_staged` can take
+  back, and the asset changes held back with it — `StagedAssetChange`, id
+  `asset_projection:<asset id>`, usable wherever an entry id is).
+  **Partial accept** is `model/subset.rs` (pure + unit-tested): `Timeline::merge_subset(base,
+  proposed, picked_ids)` writes each picked change onto the **live** cut by identity (this
+  clip / text or animated title / marker / track — never by position), so what the user did since stands. A
+  clip's start, its footage window and everything else are separate picks (`ClipMoved` /
+  `ClipRetrimmed` / `ClipChanged` combine per clip). What cannot be taken apart is not
+  guessed: a **linked partner's** entries, the **new track** a picked clip lands on and the
+  moves that take clips off a track the proposal removes come with the pick
+  (`SubsetMerge::auto_included`, each with its reason); a pick that leaves two clips on top
+  of each other (`check_subset_lanes`, against what already overlapped in the live cut) or
+  pulls linked clips out of step (`first_sync_break`) is refused naming the track and time;
+  a pick whose target the user removed since is `skipped`, not fatal. `Timeline::check_own_lanes(before, ids)`
+  is the same overlap rule for the clip an edit itself placed (`add_clip_to_timeline`,
+  `trim`, a voiceover): judged **after** the ripple, which may have made the room, and not
+  for an overlap the clip already had. **Ripple** is here too, pure + unit-tested:
   `Timeline::ripple_from(before)` takes what an edit left behind and the cut it
   started from and, per track, matched by **id** like `diff`, shifts the clips the
   edit left *starting where they started* by the net change in length of what it
@@ -336,6 +355,14 @@
   a full window makes the export's tail and fade-in cover the same samples (offset windows
   played both copies at full gain — +65 % peak in the Python prototype). An overrun with
   `fade_out` is cut at the target and faded over `FIT_FADE_S`.
+- **Limits that keep a project loadable.** A clip's speed is `MIN_SPEED..=MAX_SPEED`
+  (0.01×..100×, either sign) — `set_speed` and the ratio `set_speed_linked` hands each partner
+  both hold it (the audio tempo is one `atempo` step per doubling). `Mask::normalized` maps a
+  non-finite size to a default instead of clamping `NaN` through. `Project`'s writes also run a
+  serde walk (`finite.rs`, `first_non_finite`) over every timeline before it is stored: serde_json
+  writes `NaN` as `null`, which a plain number field cannot read back, so one poisoned number would
+  stop the project opening. The setters refuse non-finite input themselves with a message; the walk
+  is the net under every op that computes a number.
 - **Animated SVG overlays** (`Timeline.svg_overlays: Vec<SvgOverlay>`, `svg/`, pure +
   unit-tested; the engine side is `engine-cli.md`). An overlay is SMIL-animated vector art
   drawn between `start` and `end`, fit *contain* and centred into the rect `x, y, width, height`

@@ -9,12 +9,14 @@ pub mod analysis;
 pub mod captions_import;
 mod clip_timing;
 pub mod error;
+pub mod finite;
 pub mod fonts;
 pub mod frame_pick;
 pub mod layer_geometry;
 pub mod mask_plane;
 pub mod media;
 pub mod model;
+pub mod paths;
 pub mod plan_caps;
 pub mod plan_epoch;
 pub mod planner;
@@ -68,15 +70,16 @@ pub use frame_pick::{fps_pick, seek_ticks, FpsPick, Pick, PickProgress, SourceFr
 pub use mask_plane::mask_alpha_plane;
 pub use media::{MediaResolver, OriginalMedia, ProxyMedia, SourceMedia};
 pub use model::{
-    AnalysisKind, Asset, AssetAnalysis, AudioEffect, CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle,
+    AnalysisKind, Asset, AssetAnalysis, AudioEffect, AutoIncluded, CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle,
     CaptionTimeBase, Clip, ClipCut, ClipMove, Color, CropFrame, Delivery, DeltaRange, Detached, DetachedMany, DiffEntry,
     DiffKind, Easing, EditOutcome, EditSource, Framing, Keyframe, LevelReading, Levels, Marker, Mask, MaskShape, MasterBus,
     Projection, Property, PropertyKey, PropertyTrack, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap,
-    SkippedDetach, SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Subsampling, SvgOverlay, SvgOverlayPatch,
-    SvgPreset, SvgPresetKind, SvgPresetParams, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff,
-    Track, TrackLevels, TranscriptSegment, Transform, Transition, TransitionKind, VideoEffect, Voiceover, ADJACENT_EPS,
-    LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB,
-    MAX_CHANNEL_VOLUME, MAX_SVG_OVERLAYS, MAX_SVG_SECONDS, MIN_EDIT_CLIP,
+    SkippedChange, SkippedDetach, SourceLimits, SplitSide, StagedAssetChange, StagedEdit, StreamInfo, StreamKind, Subsampling,
+    SubsetMerge, SvgOverlay, SvgOverlayPatch, SvgPreset, SvgPresetKind, SvgPresetParams, Task, TaskStatus, TextKeyframe,
+    TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TrackLevels, TranscriptSegment, Transform, Transition, TransitionKind,
+    VideoEffect, Voiceover, ADJACENT_EPS, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB,
+    MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_CHANNEL_VOLUME, MAX_SPEED, MAX_SVG_OVERLAYS, MAX_SVG_SECONDS, MIN_EDIT_CLIP,
+    MIN_SPEED,
 };
 pub use plan_caps::{DipWhy, EffectKinds, GpuCaps, LayerRef, Unsupported};
 pub use plan_epoch::{bump_plan_epoch, plan_epoch};
@@ -87,8 +90,8 @@ pub use platform::{
 };
 pub use play_plan::{PlayAhead, PlayCut, PlayRefusal};
 pub use project::{
-    FramingPlan, Project, SmartCropJob, SmartCropPlan, StemsPlaced, SvgChecked, SvgLayout, SvgOverlayResult, SvgSource,
-    MAX_CHANNEL_KEYS, VOICEOVER_TRACK,
+    FramingPlan, MissingAsset, Page, Project, Relinked, RemovedAsset, SmartCropJob, SmartCropPlan, StemsPlaced, SubsetApplied,
+    SvgChecked, SvgLayout, SvgOverlayResult, SvgSource, MAX_CHANNEL_KEYS, STAGED_UNDO_DEPTH, VOICEOVER_TRACK,
 };
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use render_plan::{

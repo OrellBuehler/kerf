@@ -57,7 +57,7 @@
   naming the lane — the rule `move_clips` holds a moved partner to. It cannot be checked inside
   `carry_extent_edit`, because ripple legitimately makes room (a sound extended with its picture's tail
   pushes the voice-over behind it; a move by trim changes no length, so nothing ripples and the sound
-  lands on it). The named clip's own lane is still not checked, as a trim never has; a sound carried before 0 loses its head (the lead
+  lands on it). The named clip's own lane is checked the same way, after the ripple (`Timeline::check_own_lanes`, registered by `trim` / `add_clip_to_timeline` in `edit_lanes`; an overlap it already had is not its to refuse); a sound carried before 0 loses its head (the lead
   is reported, below), a **picture** is never trimmed to fit and refuses, as does any clip
   left under `MIN_EDIT_CLIP` (0.05 s — refused, not stubbed) and one a trim would take
   entirely; *split* cuts every partner the time is inside and then

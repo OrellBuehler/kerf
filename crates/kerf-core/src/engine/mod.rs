@@ -39,8 +39,8 @@ pub use source_probe::source_seek_points_are_keyframes;
 // cached, drawn from at any zoom. Also CLI-only, so it works in every build.
 mod peaks;
 pub use peaks::{
-    waveform_pyramid, waveform_range, waveform_range_of, WaveformLevel, WaveformPyramid, WaveformRange,
-    MAX_RANGE_BUCKETS as MAX_WAVEFORM_BUCKETS,
+    cache_path as waveform_cache_path, waveform_pyramid, waveform_range, waveform_range_of, WaveformLevel, WaveformPyramid,
+    WaveformRange, MAX_RANGE_BUCKETS as MAX_WAVEFORM_BUCKETS,
 };
 
 // Filmstrip thumbnails for timeline clips: one decode per asset into a few
