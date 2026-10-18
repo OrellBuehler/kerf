@@ -504,13 +504,20 @@ impl Project {
     /// preview. `progress` reports that encode; it is never called for an
     /// ordinary file, which is probe-only and instant.
     pub fn probe_import(path: &Path, progress: &mut dyn FnMut(ExportProgress)) -> Result<Asset> {
+        Self::probe_import_with(path, progress, &|| false)
+    }
+
+    /// [`Project::probe_import`] that can be stopped: `cancel` is polled while the stitch waits
+    /// for its slot and while it encodes, and a stop is [`Error::Cancelled`] with the
+    /// half-written stitch removed (an ordinary file is probe-only and never sees it).
+    pub fn probe_import_with(path: &Path, progress: &mut dyn FnMut(ExportProgress), cancel: &dyn Fn() -> bool) -> Result<Asset> {
         let asset = Self::probe_asset(path)?;
         let video = asset.streams.iter().find(|s| s.kind == StreamKind::Video);
         let Some((front, rear)) = video.and_then(|v| engine::insta360_pair(path, v.width, v.height)) else {
             return Ok(asset);
         };
 
-        let stitched = engine::stitch_insta360(&front, &rear, asset.duration, progress)?;
+        let stitched = engine::stitch_insta360_with(&front, &rear, asset.duration, progress, cancel)?;
         let mut stitched_asset = Self::probe_asset(&stitched)?;
         // The stitch is plain h264 with no spherical metadata of its own (the
         // ffmpeg CLI cannot write the `sv3d` box), so the projection we just
@@ -1190,6 +1197,20 @@ impl Project {
         path: impl AsRef<Path>,
         format: Option<engine::ImageFormat>,
     ) -> Result<PathBuf> {
+        Self::render_still_cancellable(timeline, assets, time_secs, path, format, &|| false)
+    }
+
+    /// [`Project::render_still`] that can be stopped: `cancel` is polled while ffmpeg runs
+    /// (it is killed, and the cover it was writing removed, unless this run never touched an
+    /// earlier file at `path`) and the result is [`Error::Cancelled`].
+    pub fn render_still_cancellable(
+        timeline: &Timeline,
+        assets: &[Asset],
+        time_secs: f64,
+        path: impl AsRef<Path>,
+        format: Option<engine::ImageFormat>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<PathBuf> {
         let path = path.as_ref();
         let format = format.unwrap_or_else(|| engine::ImageFormat::from_path(path));
         let opts = engine::ExportOptions {
@@ -1199,7 +1220,7 @@ impl Project {
         // `-q:v 2` is the highest useful JPEG quality; a cover is re-encoded by
         // whatever platform receives it, so there is nothing to gain by saving
         // bytes here and plenty to lose.
-        engine::export_still(timeline, assets, &opts, time_secs, path, format, 2)
+        engine::export_still_cancellable(timeline, assets, &opts, time_secs, path, format, 2, cancel)
     }
 
     /// Render a cover frame for the current timeline at `time_secs`.
@@ -2870,10 +2891,28 @@ impl Project {
     /// rather than failing the batch; if *nothing* could be read, the first error
     /// is returned so the caller has something to show.
     pub fn sample_smart_crops(plan: &SmartCropPlan) -> Result<Vec<(Uuid, CropFrame)>> {
+        Self::sample_smart_crops_with(plan, &mut |_| {}, &|| false)
+    }
+
+    /// [`Project::sample_smart_crops`] that reports and can be stopped: `progress` is told the
+    /// fraction of clips sampled (`0.0` before the first, then after each) and `cancel` is
+    /// polled while a clip decodes — a stop is [`Error::Cancelled`], not a skipped clip.
+    pub fn sample_smart_crops_with(
+        plan: &SmartCropPlan,
+        progress: &mut dyn FnMut(f32),
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<(Uuid, CropFrame)>> {
         let mut crops = Vec::new();
         let mut first_error = None;
-        for job in &plan.jobs {
-            match engine::salience_map(&job.path, job.start, job.end) {
+        let total = plan.jobs.len().max(1) as f32;
+        progress(0.0);
+        for (i, job) in plan.jobs.iter().enumerate() {
+            let sampled = engine::salience_map_cancellable(&job.path, job.start, job.end, cancel);
+            if matches!(sampled, Err(Error::Cancelled)) {
+                return Err(Error::Cancelled);
+            }
+            progress((i + 1) as f32 / total);
+            match sampled {
                 Ok(map) => {
                     if let Some(crop) = map.crop_for(job.width, job.height, plan.target_aspect) {
                         crops.push((job.clip_id, crop));
@@ -3002,9 +3041,22 @@ impl Project {
     /// whose media cannot be read is skipped like in smart crop; if nothing
     /// could be read at all, the first error is returned.
     pub fn sample_framings(plan: &FramingPlan) -> Result<Vec<(Uuid, Framing)>> {
+        Self::sample_framings_with(plan, &mut |_| {}, &|| false)
+    }
+
+    /// [`Project::sample_framings`] that reports and can be stopped (see
+    /// [`Project::sample_smart_crops_with`]).
+    pub fn sample_framings_with(
+        plan: &FramingPlan,
+        progress: &mut dyn FnMut(f32),
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<(Uuid, Framing)>> {
         let mut out = Vec::new();
         let mut first_error = None;
-        for job in &plan.jobs {
+        let total = plan.jobs.len().max(1) as f32;
+        progress(0.0);
+        for (i, job) in plan.jobs.iter().enumerate() {
+            let done = (i + 1) as f32 / total;
             let needs: Vec<(u32, u32)> = plan
                 .ratios
                 .iter()
@@ -3014,11 +3066,13 @@ impl Project {
             let map = if needs.is_empty() {
                 None
             } else {
-                match engine::salience_map(&job.path, job.start, job.end) {
+                match engine::salience_map_cancellable(&job.path, job.start, job.end, cancel) {
                     Ok(map) => Some(map),
+                    Err(Error::Cancelled) => return Err(Error::Cancelled),
                     Err(e) => {
                         tracing::warn!(clip = %job.clip_id, path = %job.path.display(), error = %e, "could not sample a shot for framing");
                         first_error.get_or_insert(e);
+                        progress(done);
                         continue;
                     }
                 }
@@ -3035,6 +3089,7 @@ impl Project {
                 };
                 out.push((job.clip_id, Framing::new(ratio, &crop)));
             }
+            progress(done);
         }
         match (out.is_empty(), first_error) {
             (true, Some(e)) => Err(e),

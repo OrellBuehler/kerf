@@ -23,6 +23,9 @@ pub struct ProbeResult {
 
 mod cli;
 
+// The colour specs a filter value may carry: ffmpeg's own grammar, not "looks like a colour".
+mod colors;
+
 // How `geq` (a mask's filter) reads the last column and row of a plane on this ffmpeg: measured, once.
 mod geq_edge;
 pub use geq_edge::{geq_edge, geq_penultimate_plane, GeqEdge};
@@ -65,7 +68,7 @@ pub use decode_policy::limit_frame_args;
 // Audio analysis (loudness, energy, onsets, tempo, classification): CLI/PCM
 // based, available in every build like the rest of `cli`.
 mod audio;
-pub use audio::{analyze_rhythm, energy_envelope, measure_loudness};
+pub use audio::{analyze_rhythm_cancellable, energy_envelope, measure_loudness_cancellable};
 
 // Decoded audio as an interleaved f32 buffer (through the ffmpeg binary) and a WAV
 // writer for tests and debug renders.
@@ -98,13 +101,14 @@ mod ffmpeg;
 // they only need the FFmpeg binaries, never the dev libraries.
 pub use cli::{
     audio_effects_filter, audio_pcm, contact_sheet, contact_sheet_times, decode_hwaccel, delivery_frame,
-    detect_scenes_preferring, detect_silence, disable_decode_hwaccel, export_still, frame_at, frame_jpeg, frame_jpeg_region,
-    generate_proxy, generate_proxy_with, hw_encoders, insta360_pair, mix_levels, playback_params, proxy_base_width, proxy_path,
-    proxy_width, proxy_width_for, ready_proxy, remove_proxy_files, salience_map, seek_arg, set_proxy_base_width, source_identity,
-    stitch_insta360, stitched_path, stream_preview, stream_preview_with, timeline_frame, timeline_frame_region, validate_export,
-    waveform, Container, ExportOptions, ExportProgress, ExportVariant, Fit, ImageFormat, LoudnessPreset, PlaybackParams,
-    PlaybackRequest, PreviewFrame, ProxyRun, RateControl, Region, RenderStatus, ScrubConfig, ScrubFrames, ScrubStats,
-    VariantProgress, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
+    detect_scenes_preferring_cancellable, detect_silence_cancellable, disable_decode_hwaccel, discard_partial, export_still,
+    export_still_cancellable, file_mtime, frame_at, frame_jpeg, frame_jpeg_region, generate_proxy, generate_proxy_with,
+    hw_encoders, insta360_pair, mix_levels, playback_params, proxy_base_width, proxy_path, proxy_width, proxy_width_for,
+    ready_proxy, remove_proxy_files, salience_map_cancellable, seek_arg, set_proxy_base_width, source_identity, stitch_insta360,
+    stitch_insta360_with, stitched_path, stream_preview, stream_preview_with, timeline_frame, timeline_frame_region,
+    validate_export, waveform, Container, ExportOptions, ExportProgress, ExportVariant, Fit, ImageFormat, LoudnessPreset,
+    PlaybackParams, PlaybackRequest, PreviewFrame, ProxyRun, RateControl, Region, RenderStatus, ScrubConfig, ScrubFrames,
+    ScrubStats, VariantProgress, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
 };
 
 pub(crate) use cli::insta360_pair_name;
@@ -117,14 +121,14 @@ pub use cli::{
     source_is_indexed_container, text_raster_graph, text_still_filter, TextPart, TextRasterGraph,
 };
 pub(crate) use cli::{proxy_fidelity, ProxyFidelity};
-pub(crate) use cli::{safe_color, valid_color};
+pub(crate) use colors::{safe_color, valid_color};
 
 // Speech models: the download itself, plus what can be downloaded. Re-exported
 // under speech-prefixed names so the crate root reads unambiguously next to the
 // `whisper` build feature (which is only one of the two backends).
 pub use whisper::{
-    download_model as download_speech_model, set_model as set_speech_model, DownloadProgress, ModelInfo as SpeechModelInfo,
-    DEFAULT_MODEL as DEFAULT_SPEECH_MODEL,
+    download_model as download_speech_model, download_model_cancellable as download_speech_model_cancellable,
+    set_model as set_speech_model, DownloadProgress, ModelInfo as SpeechModelInfo, DEFAULT_MODEL as DEFAULT_SPEECH_MODEL,
 };
 
 pub use tts::{
@@ -138,12 +142,45 @@ pub fn speech_model_names() -> Vec<&'static str> {
 }
 
 #[cfg(feature = "whisper")]
-pub use cli::decode_audio_16k_mono;
+pub use cli::decode_audio_16k_mono_cancellable;
+
+/// How long the in-process probe may take before the caller stops waiting for it.
+#[cfg_attr(not(feature = "ffmpeg"), allow(dead_code))]
+const LIBAV_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `probe` on a thread and wait for it for `limit`. libav opens a file in-process, where
+/// nothing can kill it: a file on a share that stopped answering would hold the caller (an
+/// import, with the project lock one step away) for good. The thread is left to finish on its
+/// own — it holds nothing but the path — and the caller gets an error it can show.
+#[cfg_attr(not(feature = "ffmpeg"), allow(dead_code))]
+fn probe_within<T: Send + 'static>(
+    limit: std::time::Duration,
+    path: &Path,
+    probe: impl FnOnce(&Path) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    use crate::error::Error;
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+
+    let owned = path.to_path_buf();
+    let (done, answer) = channel();
+    std::thread::spawn(move || {
+        let _ = done.send(probe(&owned));
+    });
+    match answer.recv_timeout(limit) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => Err(Error::Engine(format!(
+            "probing {} did not finish in {} s and was abandoned (is the file on a share that went away?)",
+            path.display(),
+            limit.as_secs()
+        ))),
+        Err(RecvTimeoutError::Disconnected) => Err(Error::Engine(format!("probing {} failed unexpectedly", path.display()))),
+    }
+}
 
 /// Probe a media file for duration and per-stream metadata.
 #[cfg(feature = "ffmpeg")]
 pub fn probe(path: &Path) -> Result<ProbeResult> {
-    ffmpeg::probe(path)
+    probe_within(LIBAV_PROBE_TIMEOUT, path, ffmpeg::probe)
 }
 
 /// Probe a media file for duration and per-stream metadata.
@@ -200,4 +237,47 @@ pub fn render_variants(
     cancel: &dyn Fn() -> bool,
 ) -> Result<(RenderStatus, usize)> {
     cli::render_variants(timeline, assets, variants, opts, progress, cancel)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_probe_that_never_returns_is_abandoned_with_an_error() {
+        let started = Instant::now();
+        let err = probe_within(Duration::from_millis(300), Path::new("/mnt/gone/a.mp4"), |_| {
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(0u8)
+        })
+        .expect_err("a hung probe");
+        assert!(
+            err.to_string().contains("/mnt/gone/a.mp4") && err.to_string().contains("abandoned"),
+            "{err}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_probe_that_answers_gives_its_result_or_its_error() {
+        assert_eq!(
+            probe_within(Duration::from_secs(5), Path::new("a.mp4"), |_| Ok(7u8)).unwrap(),
+            7
+        );
+        let err = probe_within(Duration::from_secs(5), Path::new("a.mp4"), |_| {
+            Err::<u8, _>(crate::error::Error::Engine("no such stream".into()))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("no such stream"), "{err}");
+    }
+
+    #[test]
+    fn a_probe_that_panics_is_an_error_not_a_hang() {
+        let err = probe_within(Duration::from_secs(5), Path::new("a.mp4"), |_| -> Result<u8> {
+            panic!("libav")
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("failed unexpectedly"), "{err}");
+    }
 }

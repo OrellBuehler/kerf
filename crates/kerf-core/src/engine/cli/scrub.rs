@@ -647,6 +647,7 @@ impl ScrubFrames {
             snap.width,
             None,
             &out,
+            &|| false,
         )?;
         let mut st = self.shared.lock();
         st.stats.singles += 1;

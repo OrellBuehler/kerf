@@ -19,12 +19,11 @@
 //! Neither piece needs the FFmpeg *dev* libraries, so both live in the
 //! always-compiled CLI half of the engine.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 
-use super::cli::{bg_command, command, ffmpeg_bin, launch_err};
+use super::cli::{command, ffmpeg_bin, output_bounded, run_ffmpeg_streamed_in, StreamOutcome};
 use super::cpu;
 use super::download::{fetch, Download};
 use crate::error::{Error, Result};
@@ -283,16 +282,21 @@ pub fn filter_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
         let bin = ffmpeg_bin();
-        let ok = command(&bin)
-            .args(["-hide_banner", "-loglevel", "quiet", "-h", "filter=whisper"])
-            .stdin(Stdio::null())
-            .output()
-            .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("whisper AVOptions"))
-            .unwrap_or(false);
+        let ok = output_bounded(
+            command(&bin).args(["-hide_banner", "-loglevel", "quiet", "-h", "filter=whisper"]),
+            std::time::Duration::from_secs(60),
+        )
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("whisper AVOptions"))
+        .unwrap_or(false);
         tracing::debug!(available = ok, "probed ffmpeg for the whisper filter");
         ok
     })
 }
+
+/// How long the whisper filter may go without a `-progress` line before it is killed. ffmpeg
+/// reports on a timer, not per frame, so this is a wedge, not a slow inference — and killing a
+/// transcription that was merely slow is the worse error, hence ten minutes.
+const TRANSCRIBE_STALL: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How much audio the filter buffers before running one inference pass, in
 /// seconds. The filter's own default is 3, which chops speech into three-second
@@ -390,66 +394,36 @@ pub fn transcribe(
     let bin = ffmpeg_bin();
     // Minutes of inference over the whole file — the single heaviest thing an
     // analysis pass does, and the one worth keeping off the user's other cores.
-    let cpu = cpu::lease();
+    let cpu = cpu::lease_waiting(&mut |_| {}, cancel)?;
+    if cancel() {
+        return Err(Error::Cancelled);
+    }
     cpu::limit_args(&mut args, cpu.threads());
     tracing::info!(path = %path.display(), model = %model.display(), "transcribing with the ffmpeg whisper filter");
 
-    let mut child = bg_command(&bin)
-        .current_dir(&model_dir)
-        .arg("-progress")
-        .arg("pipe:1")
-        .arg("-stats_period")
-        .arg("1")
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| launch_err(&bin, e))?;
-
-    // Drain stderr on a side thread: whisper logs steadily, and a full pipe
-    // would deadlock the stdout progress read.
-    let stderr = child.stderr.take().expect("stderr piped");
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = BufReader::new(stderr).read_to_string(&mut buf);
-        buf
-    });
-
-    let stdout = child.stdout.take().expect("stdout piped");
-    // `-stats_period 1` makes ffmpeg write a progress block every second, so the
-    // cancel is polled about that often — inference on a long take runs for
-    // minutes and is the one wait worth being able to abandon.
-    let mut cancelled = false;
-    for line in BufReader::new(stdout).lines() {
-        let Ok(line) = line else { break };
-        if cancel() {
-            cancelled = true;
-            let _ = child.kill();
-            break;
-        }
-        if line == "progress=end" {
-            break;
-        }
-        if duration > 0.0 {
-            if let Some(us) = line.strip_prefix("out_time_us=").and_then(|v| v.trim().parse::<i64>().ok()) {
-                progress((us.max(0) as f64 / 1_000_000.0 / duration).clamp(0.0, 1.0));
-            }
-        }
-    }
-
-    let status = child.wait().map_err(|e| Error::Engine(format!("ffmpeg wait failed: {e}")))?;
-    let stderr_text = stderr_handle.join().unwrap_or_default();
-    if cancelled {
-        return Err(Error::Cancelled);
-    }
-    if !status.success() {
-        let mut tail: Vec<&str> = stderr_text.lines().rev().take(12).collect();
+    // `-progress` reports every half second, so the cancel is polled about that often and a
+    // run that goes `TRANSCRIBE_STALL` without a line is killed: inference on a long take runs
+    // for minutes and is the one wait worth being able to abandon, and never one worth hanging on.
+    let duration = (duration > 0.0).then_some(duration);
+    let streamed = run_ffmpeg_streamed_in(&bin, &args, Some(&model_dir), duration, TRANSCRIBE_STALL, progress, cancel)?;
+    let tail = || {
+        let mut tail: Vec<&str> = streamed.stderr.lines().rev().take(12).collect();
         tail.reverse();
-        return Err(Error::Engine(format!(
-            "whisper transcription failed: {}",
-            tail.join("\n").trim()
-        )));
+        tail.join("\n").trim().to_string()
+    };
+    match streamed.outcome {
+        StreamOutcome::Cancelled => return Err(Error::Cancelled),
+        StreamOutcome::Stalled => {
+            return Err(Error::Engine(format!(
+                "whisper transcription stalled: ffmpeg said nothing for {}s and was stopped: {}",
+                TRANSCRIBE_STALL.as_secs(),
+                tail()
+            )))
+        }
+        StreamOutcome::Ended => {}
+    }
+    if !streamed.status.success() {
+        return Err(Error::Engine(format!("whisper transcription failed: {}", tail())));
     }
     progress(1.0);
 
@@ -679,6 +653,56 @@ mod tests {
         addr
     }
 
+    /// A server that sends the headers and half the body and then goes quiet for `quiet`, with
+    /// the connection open: the shape of a transfer that stalls rather than fails.
+    fn spawn_stalling_server(body: Vec<u8>, quiet: std::time::Duration) -> String {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = format!("http://{}/model.bin", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let Ok(peek) = stream.try_clone() else { break };
+                let mut reader = BufReader::new(peek);
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) if line.trim().is_empty() => break,
+                        Ok(_) => {}
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body[..body.len() / 2]);
+                let _ = stream.flush();
+                std::thread::sleep(quiet);
+            }
+        });
+        addr
+    }
+
+    fn stream_to_file_within(
+        url: &str,
+        tmp: &Path,
+        progress: &mut dyn FnMut(DownloadProgress),
+        cancel: &dyn Fn() -> bool,
+        stall: std::time::Duration,
+    ) -> Result<()> {
+        let download = Download {
+            url,
+            dst: tmp,
+            what: "speech model",
+            mirror_env: "KERF_WHISPER_MODEL_URL",
+            verify: &verify_ggml,
+        };
+        super::super::download::stream_to_file_within(&download, tmp, progress, cancel, stall)
+    }
+
     /// The shared streamer, called the way these tests always called whisper's own.
     fn stream_to_file(
         url: &str,
@@ -756,6 +780,52 @@ mod tests {
             "expected a partial file, got {on_disk}"
         );
         assert_eq!(std::fs::read(&tmp).expect("read"), body[..on_disk as usize]);
+    }
+
+    /// A connection that goes quiet used to leave the read blocked for good, deaf to Cancel.
+    #[test]
+    fn a_download_that_goes_quiet_fails_as_stalled_and_keeps_its_prefix() {
+        let body = fake_model(1024 * 1024);
+        let url = spawn_stalling_server(body.clone(), std::time::Duration::from_secs(20));
+        let tmp = temp_path("stall");
+        let _cleanup = TempFile(tmp.clone());
+
+        let started = std::time::Instant::now();
+        let err = stream_to_file_within(&url, &tmp, &mut |_| {}, &|| false, std::time::Duration::from_millis(600))
+            .expect_err("a stalled transfer is an error");
+        assert!(err.to_string().contains("stalled"), "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        let on_disk = std::fs::read(&tmp).expect("the prefix stays for a resume");
+        assert!(!on_disk.is_empty() && on_disk.len() < body.len());
+        assert_eq!(on_disk, body[..on_disk.len()]);
+    }
+
+    #[test]
+    fn a_cancel_reaches_a_download_that_is_blocked_on_a_quiet_connection() {
+        let body = fake_model(1024 * 1024);
+        let url = spawn_stalling_server(body, std::time::Duration::from_secs(20));
+        let tmp = temp_path("quiet-cancel");
+        let _cleanup = TempFile(tmp.clone());
+
+        let started = std::time::Instant::now();
+        let err = stream_to_file_within(
+            &url,
+            &tmp,
+            &mut |_| {},
+            &|| started.elapsed() > std::time::Duration::from_millis(800),
+            std::time::Duration::from_secs(60),
+        )
+        .expect_err("cancelled");
+        assert!(matches!(err, Error::Cancelled), "{err:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
