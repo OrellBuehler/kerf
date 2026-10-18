@@ -583,6 +583,7 @@ impl Planner {
                     stream,
                     transform: clip.transform_at(local),
                     color: clip.color_at(local),
+                    grade: clip.grade.clone(),
                     name: asset.name.clone(),
                     projection: asset.projection,
                     hdr: planned.hdr,
@@ -1593,6 +1594,63 @@ mod tests {
         };
         let plan = planner(&tl, &assets, PlanMode::Motion, &opts(30.0)).at_frame(15).unwrap();
         assert!(plan.reasons(&caps, plan.size(u32::MAX)).is_empty());
+    }
+
+    #[test]
+    fn curves_wheels_and_a_lut_are_refused_whatever_the_caps() {
+        use crate::model::{ClipLut, CurvePoint, Curves, Grade, Wheel, Wheels};
+        let a = asset();
+        let assets = [a.clone()];
+        let curves = Grade {
+            curves: Some(Curves {
+                master: vec![CurvePoint { x: 0.0, y: 1.0 }, CurvePoint { x: 1.0, y: 0.0 }],
+                ..Curves::default()
+            }),
+            ..Grade::default()
+        };
+        let wheels = Grade {
+            wheels: Some(Wheels {
+                shadows: Wheel {
+                    x: 0.3,
+                    y: 0.0,
+                    lightness: 0.0,
+                },
+                ..Wheels::default()
+            }),
+            ..Grade::default()
+        };
+        let lut = |intensity| Grade {
+            lut: Some(ClipLut {
+                path: "/missing/look.cube".into(),
+                intensity,
+            }),
+            ..Grade::default()
+        };
+        let all = GpuCaps {
+            motion: true,
+            keyed_opacity: true,
+            keyed_color: true,
+            ..GpuCaps::A0
+        };
+        for (grade, what) in [
+            (curves, Some("curves")),
+            (wheels, Some("colour wheels")),
+            (lut(1.0), Some("a 3D LUT")),
+            (lut(0.0), None),
+        ] {
+            let mut clip = make_clip(a.id, 0.0, 4.0, 0.0);
+            clip.grade = grade;
+            let tl = single(vec![clip]);
+            for mode in [PlanMode::Still, PlanMode::Motion] {
+                let plan = planner(&tl, &assets, mode, &opts(30.0)).at_frame(15).unwrap();
+                let why = plan.reasons(&all, plan.size(u32::MAX));
+                let found = why.iter().find_map(|u| match u {
+                    Unsupported::Grade(_, w) => Some(*w),
+                    _ => None,
+                });
+                assert_eq!(found, what, "{why:?}");
+            }
+        }
     }
 
     #[test]

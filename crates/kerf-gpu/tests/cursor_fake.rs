@@ -191,6 +191,7 @@ fn layer(path: String, pick: Pick) -> PlanLayer {
         },
         transform: Transform::default(),
         color: Color::default(),
+        grade: kerf_core::Grade::default(),
         name: "a".into(),
         projection: None,
         hdr: None,

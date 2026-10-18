@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
-    ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, ImportSummary, Keyframe, Levels,
+    ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, Grade, ImportSummary, Keyframe, Levels,
     Mask, Project, Projection, Property, PropertyKey, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, Task,
     TextKeyframe, TimeRange, Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
 };
@@ -1423,6 +1423,27 @@ fn set_mask(state: State<'_, AppState>, clip_id: String, mask: Option<Mask>) -> 
     let project = state.project();
     project.set_mask(id, mask).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
+}
+
+/// Replace a clip's curves, colour wheels and LUT. A LUT file is read and checked first, with the
+/// project unlocked.
+#[tauri::command]
+async fn set_grade(state: State<'_, AppState>, clip_id: String, grade: Grade) -> CmdResult<Timeline> {
+    let id = id(&clip_id)?;
+    let shared = state.project.clone();
+    blocking(move || {
+        kerf_core::color_lut::check_grade(&grade).map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        project.set_grade(id, grade).map_err(|e| e.to_string())?;
+        project.timeline().map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// What a `.cube` file holds (its size and title), or why it cannot be used as a LUT.
+#[tauri::command]
+async fn inspect_lut(path: String) -> CmdResult<kerf_core::color_lut::LutInfo> {
+    blocking(move || kerf_core::color_lut::inspect_lut(&path).map_err(|e| e.to_string())).await
 }
 
 #[tauri::command(async)]
@@ -3475,6 +3496,8 @@ pub fn run() {
             set_color,
             set_transition,
             set_mask,
+            set_grade,
+            inspect_lut,
             set_video_effects,
             set_audio_effects,
             set_keyframes,

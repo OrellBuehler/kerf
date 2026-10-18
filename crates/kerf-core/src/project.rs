@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::captions_import::{CaptionFile, CaptionImportRequest, ImportSummary, MAX_CAPTION_OFFSET, MAX_IMPORTED_CAPTIONS};
 use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
+use crate::model::Grade;
 use crate::model::{default_beat_tolerance, fmt_time};
 use crate::model::{music_fit_clips, plan_music_fit, MusicFit, MusicFitReport, MAX_FIT_BARS};
 use crate::model::{
@@ -3128,6 +3129,23 @@ impl Project {
         })
     }
 
+    /// Replace a clip's curves, colour wheels and LUT ([`Grade`]), normalized (points clamped and
+    /// sorted, identity curves and neutral wheels dropped). The LUT's file is not read here: check it
+    /// first, off the project lock, with [`crate::color_lut::check_grade`].
+    pub fn set_grade(&self, clip_id: Uuid, grade: Grade) -> Result<Clip> {
+        let grade = grade.normalized();
+        if let Some(lut) = &grade.lut {
+            if !std::path::Path::new(&lut.path).is_absolute() {
+                return Err(Error::InvalidArgument(format!("the LUT path must be absolute: {}", lut.path)));
+            }
+        }
+        self.edit_timeline("Set grade", |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            timeline.tracks[ti].clips[ci].grade = grade;
+            Ok(timeline.tracks[ti].clips[ci].clone())
+        })
+    }
+
     /// Cut a clip to a shape, or clear the mask. Outside the shape the clip goes
     /// transparent, so whatever is on a lower track shows through — which is how
     /// a face is blurred (a masked, blurred copy of the shot on the track above),
@@ -5179,6 +5197,44 @@ mod tests {
         let timeline = project.timeline().unwrap();
         let total_clips: usize = timeline.tracks.iter().map(|t| t.clips.len()).sum();
         assert!(total_clips >= 3);
+    }
+
+    #[test]
+    fn a_grade_is_normalized_stored_and_diffed() {
+        use crate::model::{ClipLut, CurvePoint, Curves};
+        let project = Project::sample().unwrap();
+        let before = project.timeline().unwrap();
+        let clip = before.tracks[0].clips[0].id;
+        let grade = Grade {
+            curves: Some(Curves {
+                master: vec![CurvePoint { x: 1.0, y: 0.0 }, CurvePoint { x: 0.0, y: 1.0 }],
+                red: vec![CurvePoint { x: 0.0, y: 0.0 }, CurvePoint { x: 1.0, y: 1.0 }],
+                ..Curves::default()
+            }),
+            wheels: None,
+            lut: Some(ClipLut {
+                path: "relative.cube".into(),
+                intensity: 1.0,
+            }),
+        };
+        assert!(
+            project.set_grade(clip, grade.clone()).is_err(),
+            "a relative LUT path is refused"
+        );
+        let out = project.set_grade(clip, Grade { lut: None, ..grade }).unwrap();
+        let curves = out.grade.curves.unwrap();
+        assert_eq!(curves.master[0], CurvePoint { x: 0.0, y: 1.0 }, "sorted");
+        assert!(curves.red.is_empty(), "the identity curve is dropped");
+        let after = project.timeline().unwrap();
+        let diff = before.diff(&after);
+        assert!(
+            diff.entries
+                .iter()
+                .any(|e| e.detail.as_deref().is_some_and(|d| d.contains("curves set"))),
+            "{diff:?}"
+        );
+        let cleared = project.set_grade(clip, Grade::default()).unwrap();
+        assert!(cleared.grade.is_empty());
     }
 
     #[test]

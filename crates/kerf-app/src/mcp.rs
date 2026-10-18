@@ -16,9 +16,10 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use base64::Engine as _;
 use kerf_core::{
-    AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipMove, Delivery,
+    AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipLut, ClipMove,
+    Curves, Delivery,
     EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property, PropertyKey, ReframeKeyframe,
-    Region, SplitSide, StreamKind, TextKeyframe, TimeRange, Transition, TransitionKind, VideoEffect,
+    Region, SplitSide, StreamKind, TextKeyframe, TimeRange, Transition, TransitionKind, VideoEffect, Wheels,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities, ServerConfig};
@@ -822,6 +823,26 @@ struct ColorParams {
         description = "Warm/cool shift -1.0–1.0 (0.0 = unchanged; positive warms, negative cools); omit to leave unchanged"
     )]
     temperature: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct GradeParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(
+        description = "Tone curves, replacing the clip's: `master`, `red`, `green`, `blue`, each a list of {x, y} points in 0..1 (input -> output, at most 16; a monotone cubic is drawn through them and held flat past the first and last point). A channel's curve runs first, then the master. [{x:0,y:1},{x:1,y:0}] inverts; [{x:0,y:0},{x:0.25,y:0.2},{x:0.75,y:0.8},{x:1,y:1}] is a gentle S. Pass {} to clear the curves; omit to leave them unchanged"
+    )]
+    curves: Option<Curves>,
+    #[schemars(
+        description = "Colour wheels, replacing the clip's: `shadows`, `midtones`, `highlights`, each {x, y, lightness}. (x, y) is a point in the unit disc whose angle is the hue pushed into that range (0 deg red, 120 deg green, 240 deg blue, counter-clockwise; e.g. teal shadows are x -0.3, y 0) and whose distance is the strength; lightness (-1..1) lifts or lowers the range. 0.1 to 0.3 is a visible grade, 1 is extreme. Pass {} to clear; omit to leave them unchanged"
+    )]
+    wheels: Option<Wheels>,
+    #[schemars(
+        description = "Absolute path of a .cube 3D LUT file to look the clip up through (after the color numbers, before the curves). The file is checked now: a 3D table of size 2 to 65 with a 0..1 domain. Pass \"\" to remove the LUT; omit to leave it unchanged"
+    )]
+    lut_path: Option<String>,
+    #[schemars(description = "How much of the LUT, 0..1 (1 = all of it, the default for a new LUT); alone, changes the current LUT's")]
+    lut_intensity: Option<f64>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -2339,6 +2360,49 @@ impl KerfMcp {
             let out = project
                 .set_color(clip_id, p.brightness, p.contrast, p.saturation, p.gamma, p.temperature)
                 .map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
+        description = "Grade a clip beyond set_color: tone curves (master and per channel), shadows / midtones / highlights colour wheels, and a .cube 3D LUT with an intensity. Each part is optional and omitted parts are left as they are. They apply after set_color's numbers, in the order LUT, curves, wheels. Check the result with preview_timeline."
+    )]
+    fn set_grade(&self, Parameters(p): Parameters<GradeParams>) -> Result<String, McpError> {
+        let clip_id = parse_id(&p.clip_id)?;
+        // A new LUT file is read before the project is locked.
+        if let Some(path) = p.lut_path.as_deref().filter(|s| !s.is_empty()) {
+            kerf_core::color_lut::inspect_lut(path).map_err(core_err)?;
+        }
+        self.edit(|project| {
+            let timeline = project.working_timeline().map_err(core_err)?;
+            let (ti, ci) = timeline
+                .locate(clip_id)
+                .ok_or_else(|| core_err(kerf_core::Error::ClipNotFound(clip_id)))?;
+            let mut grade = timeline.tracks[ti].clips[ci].grade.clone();
+            if let Some(curves) = p.curves.clone() {
+                grade.curves = Some(curves);
+            }
+            if let Some(wheels) = p.wheels {
+                grade.wheels = Some(wheels);
+            }
+            match (p.lut_path.as_deref(), p.lut_intensity) {
+                (Some(""), _) => grade.lut = None,
+                (Some(path), intensity) => {
+                    grade.lut = Some(ClipLut {
+                        path: path.to_string(),
+                        intensity: intensity.unwrap_or(1.0),
+                    })
+                }
+                (None, Some(intensity)) => {
+                    let lut = grade
+                        .lut
+                        .as_mut()
+                        .ok_or_else(|| McpError::invalid_params("the clip has no LUT whose intensity to change", None))?;
+                    lut.intensity = intensity;
+                }
+                (None, None) => {}
+            }
+            let out = project.set_grade(clip_id, grade).map_err(core_err)?;
             json(&out)
         })
     }

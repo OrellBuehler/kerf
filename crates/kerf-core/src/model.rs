@@ -2655,6 +2655,10 @@ pub struct Clip {
     /// Color correction (brightness / contrast / saturation / gamma).
     #[serde(default)]
     pub color: Color,
+    /// Curves, colour wheels and a 3D LUT, applied after `color` ([`Grade`]). Empty for every
+    /// clip saved before they existed.
+    #[serde(default, skip_serializing_if = "Grade::is_empty")]
+    pub grade: Grade,
     /// Transition blending this clip's start with the preceding clip, if any.
     #[serde(default)]
     pub transition_in: Option<Transition>,
@@ -2741,6 +2745,7 @@ impl Clip {
             speed: 1.0,
             transform: Transform::default(),
             color: Color::default(),
+            grade: Grade::default(),
             transition_in: None,
             effects: Vec::new(),
             audio: Vec::new(),
@@ -4171,6 +4176,9 @@ pub use channels::{key_polyline, Property, PropertyKey, PropertyTrack, MAX_CHANN
 
 mod links;
 pub use links::{Detached, DetachedMany, SkippedDetach};
+
+mod grade;
+pub use grade::{normalize_curve, ClipLut, CurvePoint, CurveSegment, CurveShape, Curves, Grade, Wheel, Wheels, MAX_CURVE_POINTS};
 
 mod music_fit;
 pub use music_fit::{
@@ -5632,6 +5640,7 @@ fn clip_changes(before: &Clip, after: &Clip) -> Option<String> {
     }
     parts.extend(transform_changes(&before.transform, &after.transform));
     parts.extend(color_changes(&before.color, &after.color));
+    parts.extend(Grade::changes(&before.grade, &after.grade));
     // A framing pass before a multi-format export is an edit like any other,
     // and one an agent proposal has to be able to show.
     let framed: Vec<String> = after

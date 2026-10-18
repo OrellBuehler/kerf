@@ -212,6 +212,9 @@ pub enum Unsupported {
     TranslucentMatrix(LayerRef, String),
     /// Colour correction on a picture that may be full range (the detail says what is known).
     GradedFullRange(LayerRef, String),
+    /// Curves, colour wheels or a 3D LUT (the detail names which): drawn by FFmpeg in RGB, with no
+    /// compositor pass or parity case yet.
+    Grade(LayerRef, &'static str),
     /// A video effect the compositor does not draw (the detail names it and says why), or one
     /// whose value FFmpeg's own filter refuses.
     Effects(LayerRef, &'static str),
@@ -302,6 +305,7 @@ impl Unsupported {
             Self::NotKnownOpaque(..) => "not_known_opaque",
             Self::TranslucentMatrix(..) => "translucent_matrix",
             Self::GradedFullRange(..) => "graded_full_range",
+            Self::Grade(..) => "grade",
             Self::Effects(..) => "effects",
             Self::Mask(_) => "mask",
             Self::MaskWith(..) => "mask_with",
@@ -363,6 +367,7 @@ impl fmt::Display for Unsupported {
                 write!(f, "{l}: opacity below 1 on a picture whose colour matrix is {detail}")
             }
             Self::GradedFullRange(l, detail) => write!(f, "{l}: colour correction on {detail}"),
+            Self::Grade(l, what) => write!(f, "{l}: {what} (drawn by FFmpeg only)"),
             Self::Effects(l, what) => write!(f, "{l}: video effects ({what})"),
             Self::Mask(l) => write!(f, "{l}: mask"),
             Self::MaskWith(l, what) => write!(f, "{l}: a mask {what}, which the compositor does not draw"),
@@ -484,6 +489,7 @@ mod tests {
             Unsupported::TextBorder.kind(),
             Unsupported::Hdr(layer(0, "")).kind(),
             Unsupported::Effects(layer(0, ""), "a blur").kind(),
+            Unsupported::Grade(layer(0, ""), "curves").kind(),
             Unsupported::MaskWith(layer(0, ""), "on a rotated layer").kind(),
             Unsupported::Matte(layer(0, ""), "of a translucent layer").kind(),
             Unsupported::FadeOnTranslucent(layer(0, "")).kind(),

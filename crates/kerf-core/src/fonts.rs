@@ -133,19 +133,25 @@ fn font_dirs() -> impl Iterator<Item = PathBuf> {
 /// Named for the user, created owner-only, and refused when it already exists but is someone else's
 /// or open to others. Elsewhere (Windows, macOS) the temp directory is already the user's own.
 fn private_dir(base: &Path) -> Option<PathBuf> {
+    private_cache_dir(base, "kerf-fonts")
+}
+
+/// [`private_dir`] under another name (`<prefix>-<uid>`), for the other files Kerf writes for FFmpeg
+/// to read (the LUT copies, `color_lut`).
+pub(crate) fn private_cache_dir(base: &Path, prefix: &str) -> Option<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
         // SAFETY: `geteuid` has no preconditions and cannot fail.
         let uid = unsafe { libc::geteuid() };
-        let dir = base.join(format!("kerf-fonts-{uid}"));
+        let dir = base.join(format!("{prefix}-{uid}"));
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).ok()?;
         let meta = std::fs::symlink_metadata(&dir).ok()?;
         (meta.is_dir() && meta.uid() == uid && meta.mode() & 0o022 == 0).then_some(dir)
     }
     #[cfg(not(unix))]
     {
-        let dir = base.join("kerf-fonts");
+        let dir = base.join(prefix);
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir)
     }

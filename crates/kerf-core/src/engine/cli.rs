@@ -26,7 +26,7 @@ use crate::clip_timing::{
 };
 use crate::error::{Error, Result};
 use crate::model::{
-    pix_fmt_layout, Asset, AudioEffect, Clip, Color, Delivery, Hdr, Mask, MaskShape, PixLayout, Projection, Property, Reframe,
+    pix_fmt_layout, Asset, AudioEffect, Clip, Color, Delivery, Grade, Hdr, Mask, MaskShape, PixLayout, Projection, Property, Reframe,
     ReframeKeyframe, ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform,
     VideoEffect,
 };
@@ -7481,6 +7481,8 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     } else if !clip.color.is_identity() {
         p.push(eq_filter(&clip.color));
     }
+    // The LUT, the curves and the wheels, after the `eq` (see `grade`), before any alpha plane.
+    p.extend(grade_filters(&clip.grade));
     // Color-space video effects (blur / sharpen / grayscale / invert / vignette),
     // applied in author order, before any alpha plane.
     for e in &clip.effects {
@@ -8010,9 +8012,10 @@ fn build_still_args_rendered(
         let tone = hdr.map(|h| format!("{},", tonemap_filter(h))).unwrap_or_default();
         chains.push(format!(
             "[{n}:v]{tone}{chain}[v{n}]",
-            chain = still_clip_chain(
+            chain = still_clip_chain_graded(
                 &tf,
                 &ac.color(),
+                &clip.grade,
                 &clip.effects,
                 rf.as_ref(),
                 &canvas,
@@ -8081,10 +8084,13 @@ struct StillCanvas {
 /// ([`still_fx`]): where the export's chain applies its `fade` steps, after the rotation and
 /// ahead of a moving zoom, the same filters run on the frame. None at all for a still
 /// outside any fade, and then the chain is what it was.
+///
+/// `grade` is the clip's curves, wheels and LUT, right after the `eq`, as `video_clip_chain` places them.
 #[allow(clippy::too_many_arguments)]
-fn still_clip_chain(
+fn still_clip_chain_graded(
     tf: &Transform,
     color: &Color,
+    grade: &Grade,
     effects: &[VideoEffect],
     reframe: Option<&ResolvedReframe>,
     canvas: &StillCanvas,
@@ -8142,6 +8148,7 @@ fn still_clip_chain(
     if !color.is_identity() {
         p.push(eq_filter(color));
     }
+    p.extend(grade_filters(grade));
     for e in effects {
         if let Some(f) = video_effect_filter(e) {
             p.push(f);
@@ -8171,6 +8178,22 @@ fn still_clip_chain(
     }
     p.extend(late_zoom);
     p.join(",")
+}
+
+/// [`still_clip_chain_graded`] with no grade.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn still_clip_chain(
+    tf: &Transform,
+    color: &Color,
+    effects: &[VideoEffect],
+    reframe: Option<&ResolvedReframe>,
+    canvas: &StillCanvas,
+    mask: Option<&Mask>,
+    zoom_last: bool,
+    fades: &StillFades,
+) -> String {
+    still_clip_chain_graded(tf, color, &Grade::default(), effects, reframe, canvas, mask, zoom_last, fades)
 }
 
 /// The `overlay` placement for a clip in a [`timeline_frame`] composite: a full
@@ -8343,6 +8366,10 @@ mod golden;
 #[cfg(test)]
 mod rendered;
 
+/// A clip's curves, wheels and LUT as filters.
+mod grade;
+use grade::grade_filters;
+
 /// The still inside a fade, a dip, a dissolve, a slide or a push: its layers and their fades.
 mod still_fx;
 use still_fx::{still_layers, StillFades};
@@ -8395,6 +8422,10 @@ mod keyed_zoom;
 /// the export renders (`#[ignore]`d).
 #[cfg(test)]
 mod keyed_channels;
+
+/// Curves, wheels and a LUT against the pictures the export and the still render (`#[ignore]`d).
+#[cfg(test)]
+mod grade_rendered;
 
 /// Scene detection and contact sheets on a proxy against the original (`#[ignore]`d).
 #[cfg(test)]
