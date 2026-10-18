@@ -6,6 +6,7 @@
 	import Badge from './Badge.svelte';
 	import Btn from './Btn.svelte';
 	import MediaChips from './MediaChips.svelte';
+	import AnalysisRun from './AnalysisRun.svelte';
 	import InspectorSection from './InspectorSection.svelte';
 	import { VIDEO_THUMB_BG } from './data';
 	import { editor } from '$lib/state.svelte';
@@ -19,6 +20,7 @@
 	import { proxyActions } from '$lib/proxy-info';
 	import { deleteProxy, rebuildProxy } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
+	import { exportTranscriptSrt } from '$lib/ops';
 	import { tip } from '$lib/tip';
 	import type { Asset } from '$lib/types';
 
@@ -86,15 +88,19 @@
 
 	<div style="margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
 		<MediaChips assetId={asset.id} />
-		<Btn
-			size="sm"
-			variant="secondary"
-			icon="scan-line"
-			onclick={(e: MouseEvent) => {
-				const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-				contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), analyzeMenuItems(asset));
-			}}>Analyze</Btn
-		>
+		{#if ui.analyzing && ui.analyzingId === asset.id}
+			<div style="flex-basis:100%"><AnalysisRun /></div>
+		{:else}
+			<Btn
+				size="sm"
+				variant="secondary"
+				icon="scan-line"
+				onclick={(e: MouseEvent) => {
+					const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+					contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), analyzeMenuItems(asset));
+				}}>Analyze</Btn
+			>
+		{/if}
 	</div>
 
 	<div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap">
@@ -102,7 +108,7 @@
 			size="sm"
 			icon="plus"
 			iconSize={12}
-			disabled={editor.busy}
+			pending={editor.locked}
 			onclick={() =>
 				void editor
 					.add(asset.id, 0, asset.duration, undefined, ui.time)
@@ -113,13 +119,22 @@
 			size="sm"
 			icon="list-plus"
 			iconSize={12}
-			disabled={editor.busy}
+			pending={editor.locked}
 			onclick={() =>
 				void editor
 					.add(asset.id, 0, asset.duration, undefined, editor.duration)
 					.then(() => toast.success(`Appended ${asset.name}`))
 					.catch(err)}>Append</Btn
 		>
+		{#if mediaStatus.done(asset.id, 'transcript')}
+			<Btn
+				size="sm"
+				icon="file-text"
+				iconSize={12}
+				title="Write the transcript as a subtitle file, in this media's own time"
+				onclick={() => void exportTranscriptSrt(asset.id)}>Export .srt</Btn
+			>
+		{/if}
 	</div>
 
 	<InspectorSection title="Media" summary={`${info.duration}${info.resolution ? ` · ${info.resolution}` : ''}`} open>

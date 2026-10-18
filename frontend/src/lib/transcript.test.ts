@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { activeLineIndex, fmtClock, srcToTimeline, transcriptLines } from './transcript';
+import { activeLineIndex, fmtClock, srcToTimeline, srtStamp, toSrt, transcriptLines } from './transcript';
 import type { Clip, Track } from './types';
 
 const clip = (over: Partial<Clip>): Clip =>
@@ -50,5 +50,31 @@ describe('activeLineIndex', () => {
 		expect(activeLineIndex(lines, 6.5)).toBe(0);
 		expect(activeLineIndex(lines, 9.5)).toBe(1);
 		expect(activeLineIndex(lines, 0)).toBe(-1);
+	});
+});
+
+// The twin of `transcript_to_srt` (kerf-core `model.rs`): the harness writes the same file the app does.
+describe('a transcript as .srt', () => {
+	test('a timestamp is rounded to the millisecond and carried, never negative', () => {
+		expect(srtStamp(0)).toBe('00:00:00,000');
+		expect(srtStamp(5.5)).toBe('00:00:05,500');
+		expect(srtStamp(3725.0495)).toBe('01:02:05,050');
+		expect(srtStamp(59.9996)).toBe('00:01:00,000');
+		for (const t of [-4, NaN, Infinity]) expect(srtStamp(t)).toBe('00:00:00,000');
+	});
+
+	test('every segment is a numbered cue ending in a blank line', () => {
+		expect(
+			toSrt([
+				{ start: 0, end: 5.5, text: 'Welcome back to the channel.' },
+				{ start: 5.5, end: 12.5, text: '  Today we are talking about editing.  ' }
+			])
+		).toBe(
+			'1\n00:00:00,000 --> 00:00:05,500\nWelcome back to the channel.\n\n2\n00:00:05,500 --> 00:00:12,500\nToday we are talking about editing.\n\n'
+		);
+	});
+
+	test('no segments is an empty document', () => {
+		expect(toSrt([])).toBe('');
 	});
 });

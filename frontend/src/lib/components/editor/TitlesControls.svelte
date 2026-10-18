@@ -100,9 +100,9 @@
 <div class="k-overline" style="margin-bottom:6px">Add text</div>
 <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:6px;margin-bottom:14px">
 	{#each TEXT_STYLES as s (s.id)}
-		<Btn size="sm" icon="plus" iconSize={12} disabled={editor.busy} onclick={() => void addStyledTitle(s)}>{s.label}</Btn>
+		<Btn size="sm" icon="plus" iconSize={12} pending={editor.locked} onclick={() => void addStyledTitle(s)}>{s.label}</Btn>
 	{/each}
-	<Btn size="sm" icon="plus" iconSize={12} disabled={editor.busy} onclick={() => void addTextHere()}>Text</Btn>
+	<Btn size="sm" icon="plus" iconSize={12} pending={editor.locked} onclick={() => void addTextHere()}>Text</Btn>
 </div>
 <div class="k-overline" style="margin-bottom:6px">Captions</div>
 <div role="group" aria-label="Caption style" style="display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin-bottom:6px">
@@ -111,19 +111,19 @@
 		<Chip pressed={ui.captionStyle === c.id} title={c.hint} onclick={() => (ui.captionStyle = c.id)}>{c.label}</Chip>
 	{/each}
 </div>
-<div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin-bottom:6px">
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(142px,1fr));gap:6px;margin-bottom:6px">
 	<div style="display:flex;gap:4px;min-width:0">
 		<Btn
 			size="sm"
-			disabled={editor.busy}
+			pending={editor.locked}
 			title={hasCaptions ? recaptionHint(captionCount) : CAPTION_HINT}
 			style="flex:1;min-width:0"
 			onclick={() => void makeCaptions()}
 		>
-			{hasCaptions ? 'Recaption' : 'Captions'}
+			{hasCaptions ? 'Regenerate captions' : 'Generate captions'}
 		</Btn>
 		{#if hasCaptions}
-			<IconBtn size={28} title={clearHint(captionCount)} disabled={editor.busy} onclick={() => void dropCaptions()}>
+			<IconBtn size={28} title={clearHint(captionCount)} pending={editor.locked} onclick={() => void dropCaptions()}>
 				<Icon n="trash" s={14} />
 			</IconBtn>
 		{/if}
@@ -140,7 +140,7 @@
 	>
 </div>
 <div style="margin-bottom:10px">
-	<Btn size="sm" icon="mic" disabled={editor.busy} title="Speak a script onto the timeline" style="width:100%" onclick={() => ui.openVoiceover()}
+	<Btn size="sm" icon="mic" pending={editor.locked} title="Speak a script onto the timeline" style="width:100%" onclick={() => ui.openVoiceover()}
 		>Write a voiceover…</Btn
 	>
 </div>
@@ -215,7 +215,7 @@
 					: ''}
 			</div>
 			<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap">
-				<Btn size="sm" variant="primary" icon="file-text" disabled={editor.busy} onclick={() => void chooseFile()}
+				<Btn size="sm" variant="primary" icon="file-text" pending={editor.locked} onclick={() => void chooseFile()}
 					>Choose file…</Btn
 				>
 				<Btn size="sm" variant="ghost" onclick={() => closeImport(true)}>Cancel</Btn>
@@ -248,7 +248,7 @@
 			size={28}
 			data-tone="quiet"
 			title={`Remove ${o.text ? `“${o.text}”` : 'this title'}`}
-			disabled={editor.busy}
+			pending={editor.locked}
 			onclick={() => void attempt(() => editor.removeOverlay(o.id))}><Icon n="x" s={14} /></IconBtn
 		>
 	</div>

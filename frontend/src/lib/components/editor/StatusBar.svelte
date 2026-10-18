@@ -10,20 +10,18 @@
 	import { toast } from '$lib/notifications.svelte';
 	import { tip } from '$lib/tip';
 	import { timeDisplay } from '$lib/time-display.svelte';
+	import { assetLine, projectFrame, projectLine } from '$lib/status-facts';
 
 	const showLogs = inTauri();
 
-	/** Real metadata of the selected asset: fps · resolution · codec. */
-	const meta = $derived.by(() => {
+	/** The project: the rate and frame the cut plays and exports at. */
+	const project = $derived(projectLine(editor.fps, projectFrame(editor.liveTimeline, editor.assets)));
+
+	/** The library asset that is selected, named — its own rate and size are not the project's. */
+	const picked = $derived.by(() => {
 		const a = editor.selectedAsset;
-		if (!a) return null;
-		const v = a.streams.find((s) => s.kind === 'video');
-		const parts: string[] = [];
-		if (v?.fps) parts.push(`${v.fps.toFixed(3)} fps`);
-		if (v?.width && v?.height) parts.push(`${v.width}×${v.height}`);
-		const codec = (v ?? a.streams[0])?.codec;
-		if (codec) parts.push(codec);
-		return parts.join(' · ') || null;
+		const line = a ? assetLine(a) : null;
+		return a && line ? { name: a.name, line } : null;
 	});
 
 	const clipCount = $derived(
@@ -46,10 +44,21 @@
 <div
 	style="height:var(--statusbar-h);flex:none;display:flex;align-items:center;gap:12px;padding:0 12px;background:var(--surface-app);border-top:var(--line-width) solid var(--border-default);font-variant-numeric:tabular-nums"
 >
-	{#if meta}
-		<span use:tip={'The selected asset: frame rate, size and codec'} style="font-size:var(--text-xs);color:var(--text-muted)">{meta}</span>
-	{/if}
+	<span
+		data-status-project
+		use:tip={{ text: 'The project: the frame rate and size the cut plays and exports at', detail: 'Delivery frame, else the first picture on the cut.' }}
+		style="font-size:var(--text-xs);color:var(--text-muted)">{project}</span
+	>
 	<span use:tip={'Length of the cut'} style="font-size:var(--text-xs);color:var(--text-muted)">Cut {timeDisplay.fmt(editor.duration)}</span>
+	{#if picked}
+		<span style="width:1px;height:12px;background:var(--border-default)"></span>
+		<span
+			data-status-selected
+			use:tip={{ text: `Selected in the library: ${picked.name}`, detail: 'Its own frame rate, size and codec — not the project’s.' }}
+			style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:var(--text-xs);color:var(--text-muted)"
+			>Selected {picked.name} · {picked.line}</span
+		>
+	{/if}
 	<div style="flex:1"></div>
 	{#if sourceNote}
 		<!-- Which file this frame was decoded from: the preview proxy, or the original and why. -->

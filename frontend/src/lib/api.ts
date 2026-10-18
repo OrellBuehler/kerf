@@ -41,6 +41,7 @@ import type {
 	PropertyKey,
 	LaunchRequest,
 	Levels,
+	AnalysisProgress,
 	MasterBus,
 	MusicFit,
 	MusicFitted,
@@ -809,18 +810,22 @@ export async function importThemeFile(): Promise<string | null> {
 	return invoke<string>('read_text_file', { path: selected });
 }
 
+/** Hand a text file to the browser's download manager — what the harness does where the desktop app asks where to
+ *  save. Resolves to the file's name. */
+export function downloadTextFile(contents: string, name: string, mime = 'text/plain'): string {
+	const url = URL.createObjectURL(new Blob([contents], { type: mime }));
+	const a = document.createElement('a');
+	a.href = url;
+	a.download = name;
+	a.click();
+	setTimeout(() => URL.revokeObjectURL(url), 1000);
+	return name;
+}
+
 /** Save a theme as a JSON file; resolves to where it went, `null` if
  *  cancelled. The browser harness hands the file to the download manager. */
 export async function exportThemeFile(contents: string, defaultName: string): Promise<string | null> {
-	if (!inTauri()) {
-		const url = URL.createObjectURL(new Blob([contents], { type: 'application/json' }));
-		const a = document.createElement('a');
-		a.href = url;
-		a.download = defaultName;
-		a.click();
-		setTimeout(() => URL.revokeObjectURL(url), 1000);
-		return defaultName;
-	}
+	if (!inTauri()) return downloadTextFile(contents, defaultName, 'application/json');
 	const { save } = await import('@tauri-apps/plugin-dialog');
 	const path = await save({ filters: [{ name: 'Kerf theme', extensions: ['json'] }], defaultPath: defaultName });
 	if (typeof path !== 'string') return null;
@@ -836,6 +841,19 @@ export async function exportThemeFile(contents: string, defaultName: string): Pr
 export async function analyzeAsset(assetId: string, steps?: readonly AnalysisKind[]): Promise<AssetAnalysis> {
 	if (!inTauri()) return devAnalyze(assetId, steps);
 	return invoke<AssetAnalysis>('analyze_asset', { assetId, steps: steps ? [...steps] : null });
+}
+
+const devProgressListeners = new Set<(p: AnalysisProgress) => void>();
+
+/** Subscribe to `analysis-progress` events: the step an analysis pass is on, with a fraction where the backend can
+ *  say one. Returns an unlisten fn. The browser harness emits a few ticks per step of its simulated run. */
+export async function onAnalysisProgress(cb: (p: AnalysisProgress) => void): Promise<() => void> {
+	if (!inTauri()) {
+		devProgressListeners.add(cb);
+		return () => void devProgressListeners.delete(cb);
+	}
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen<AnalysisProgress>('analysis-progress', (e) => cb(e.payload));
 }
 
 /** The per-kind analysis status of every asset (done / not run / running / failed / off). */
@@ -906,6 +924,8 @@ function harnessProxyMode(): string | null {
 const devProxy: Record<string, ProxyStatus> = (() => {
 	const mode = harnessProxyMode();
 	const [a, b] = sampleAssets;
+	// `?empty=1`: an empty library has no proxies to be building.
+	if (!a || !b) return {};
 	return {
 		[a.id]: { asset_id: a.id, state: 'building', fraction: 0.42, width: 1280, elapsed_secs: 31, eta_secs: 43 },
 		[b.id]:
@@ -998,6 +1018,15 @@ function devNoteAnalysis(assetId: string) {
 	for (const cb of devAnalysisListeners) cb(structuredClone(s));
 }
 
+/** How long one simulated analysis step takes; `?slow=1` makes it long enough to look at. */
+function devAnalysisStepMs(): number {
+	try {
+		return new URLSearchParams(location.search).has('slow') ? 2400 : 450;
+	} catch {
+		return 450;
+	}
+}
+
 async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Promise<AssetAnalysis> {
 	const auto = devAutoAnalysis();
 	const kinds = steps ?? ALL_KINDS.filter((k) => auto[k] && k !== 'transcript');
@@ -1013,10 +1042,14 @@ async function devAnalyze(assetId: string, steps?: readonly AnalysisKind[]): Pro
 		music: null
 	};
 	sampleAnalysis[assetId] ??= empty;
+	const stage = (k: AnalysisKind) => (k === 'transcript' ? 'transcribe' : k);
 	for (const kind of ALL_KINDS.filter((k) => kinds.includes(k))) {
 		devRunning = { id: assetId, kind };
 		devNoteAnalysis(assetId);
-		await new Promise((r) => setTimeout(r, 450));
+		for (const fraction of [0, 0.35, 0.7]) {
+			for (const cb of devProgressListeners) cb({ asset_id: assetId, stage: stage(kind), fraction });
+			await new Promise((r) => setTimeout(r, devAnalysisStepMs() / 3));
+		}
 		(devRan[assetId] ??= new Set()).add(kind);
 	}
 	devRunning = null;
@@ -3352,12 +3385,12 @@ export async function onImportProgress(cb: (p: ImportProgress) => void): Promise
 }
 
 /** Open a save dialog defaulted to the given container extension. */
-export async function pickExportPath(ext: string): Promise<string | null> {
+export async function pickExportPath(ext: string, defaultName?: string): Promise<string | null> {
 	if (!inTauri()) return null;
 	const { save } = await import('@tauri-apps/plugin-dialog');
 	const path = await save({
 		filters: [{ name: ext.toUpperCase(), extensions: [ext] }],
-		defaultPath: `kerf-export.${ext}`
+		defaultPath: defaultName ?? `kerf-export.${ext}`
 	});
 	return typeof path === 'string' ? path : null;
 }
@@ -3406,8 +3439,8 @@ export async function platformCheck(
 		// A title counts when it is on screen somewhere in the span, as it is in the sliced cut the export builds.
 		return platformReport({
 			duration: span ? span[1] - span[0] : full,
-			width: frame?.[0] ?? fmt?.width ?? first.streams[0]?.width ?? 1920,
-			height: frame?.[1] ?? fmt?.height ?? first.streams[0]?.height ?? 1080,
+			width: frame?.[0] ?? fmt?.width ?? first?.streams[0]?.width ?? 1920,
+			height: frame?.[1] ?? fmt?.height ?? first?.streams[0]?.height ?? 1080,
 			has_audio: true,
 			has_text: (devTimeline.overlays ?? []).some((o) => !span || (o.end > span[0] && o.start < span[1]))
 		});

@@ -35,7 +35,11 @@ describe('the library', () => {
 
 	test('the Titles controls are equal buttons in a grid, with the two caption looks the only chips', () => {
 		const titles = read(`${EDITOR}TitlesControls.svelte`);
-		expect(titles).toContain('grid-template-columns:repeat(2,minmax(0,1fr))');
+		// Generate/Regenerate captions and Import: two equal cells when they fit, stacked when the panel is narrow (the
+		// longer labels did not fit half a 300 px Inspector).
+		expect(titles).toContain('grid-template-columns:repeat(auto-fit,minmax(142px,1fr))');
+		expect(titles).toContain('Regenerate captions');
+		expect(titles).toContain('Generate captions');
 		expect(titles).toContain('repeat(auto-fill,minmax(104px,1fr))');
 		expect(titles).not.toMatch(/flex:1[^;"]*"[^>]*>\s*\+ Text/);
 		expect((titles.match(/<Chip\b/g) ?? []).length).toBe(2);

@@ -12,6 +12,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { mediaStatus } from '$lib/media-status.svelte';
 	import { toast } from '$lib/notifications.svelte';
+	import { exportTranscriptSrt } from '$lib/ops';
 	import { activeLineIndex, srcToTimeline, transcriptLines, type TxLine } from '$lib/transcript';
 	import { tip } from '$lib/tip';
 
@@ -127,6 +128,16 @@
 			{/if}
 		</EmptyState>
 	{:else}
+		<div style="display:flex;align-items:center;gap:8px;padding:0 6px 8px">
+			<span class="k-overline" style="flex:1">{txLines.length} line{txLines.length === 1 ? '' : 's'}</span>
+			<Btn
+				size="sm"
+				icon="file-text"
+				iconSize={12}
+				title="Write the transcript as a subtitle file, in this media's own time"
+				onclick={() => editor.selectedAssetId && void exportTranscriptSrt(editor.selectedAssetId)}>Export .srt</Btn
+			>
+		</div>
 		<div data-selectable style="display:flex;flex-direction:column;gap:2px">
 			{#each txLines as l, i (i)}
 				<div class="line" data-active={i === activeTx ? '' : undefined}>

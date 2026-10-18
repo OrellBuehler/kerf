@@ -2,6 +2,9 @@
 // of range, no clip under the playhead), and a button has nowhere to put that
 // but a notice.
 
+import { downloadTextFile, getAssetMetadata, inTauri, pickExportPath, revealPath } from './api';
+import { animatedProps, keyframeOffer, propsPhrase } from './keyframe-copy';
+import { toSrt } from './transcript';
 import { editor } from './state.svelte';
 import { ui } from './editor-ui.svelte';
 import { withLinkPartners } from './link-groups';
@@ -244,4 +247,92 @@ export async function unlinkSelection(): Promise<void> {
 		return;
 	}
 	toast(unlinkedNotice(plan.ids.length), { action: { label: 'Undo', onClick: () => void editor.undo() } });
+}
+
+// ---- things the engine could always do and the interface did not reach ------------------------------
+
+/** **Export transcript as .srt** (the library's menu, the asset's panel, the transcript's header): the cached
+ *  transcript of an asset as a SubRip file, in the asset's own time. The desktop app asks where; the browser harness
+ *  hands the same text to the download manager. Says why when there is no transcript to write. */
+export async function exportTranscriptSrt(assetId: string): Promise<void> {
+	const asset = editor.assets.find((a) => a.id === assetId);
+	if (!asset) return;
+	let transcript;
+	try {
+		transcript = (await getAssetMetadata(assetId)).analysis?.transcript ?? [];
+	} catch (e) {
+		toast.error(errorMessage(e));
+		return;
+	}
+	if (transcript.length === 0) {
+		toast.info(`${asset.name} has no transcript yet — transcribe it first (Analyze › Transcribe speech)`);
+		return;
+	}
+	const name = `${asset.name.replace(/\.[^./\\]+$/, '')}.srt`;
+	if (!inTauri()) {
+		downloadTextFile(toSrt(transcript), name, 'application/x-subrip');
+		toast.success(`Saved ${name} — in the desktop app you choose where it goes`);
+		return;
+	}
+	try {
+		const path = await pickExportPath('srt', name);
+		if (!path) return;
+		const out = await editor.exportSrt(assetId, path);
+		toast.success(`Saved the transcript of ${asset.name}`, { action: { label: 'Show in folder', onClick: () => void revealPath(out).catch(() => {}) } });
+	} catch (e) {
+		toast.error(errorMessage(e));
+	}
+}
+
+/** **Append all media to the timeline** (the library's menu): every asset, in library order, end to end — a picture
+ *  on the first picture track and a sound on the first sound track, each after what is already there. One revision
+ *  (`concatenate`), so one Undo. */
+export async function appendAllMedia(): Promise<void> {
+	const ids = editor.assets.map((a) => a.id);
+	if (ids.length === 0) {
+		toast.info('Import media first');
+		return;
+	}
+	try {
+		await editor.concatenate(ids);
+	} catch (e) {
+		toast.error(errorMessage(e));
+		return;
+	}
+	toast(ids.length === 1 ? 'Appended 1 file to the timeline' : `Appended ${ids.length} files to the timeline, in library order`, {
+		action: { label: 'Undo', onClick: () => void editor.undo() }
+	});
+}
+
+/** **Copy keyframes** (the clip menu, the Inspector's Animation section): remember the clip whose animation is to be
+ *  pasted. The animation is read at the paste, so what is pasted is what the clip does then. */
+export function copyKeyframesOf(clipId: string): void {
+	const offer = keyframeOffer(editor.timeline, editor.keyframeSource, clipId).copy;
+	if (offer.disabled) {
+		toast.info(offer.reason ?? 'Nothing to copy');
+		return;
+	}
+	editor.keyframeSource = clipId;
+	const clip = editor.timeline.tracks.flatMap((t) => t.clips).find((c) => c.id === clipId);
+	toast(`Copied the animation of ${clip ? editor.assetName(clip.asset_id) : 'the clip'} — select another clip and paste it`);
+}
+
+/** **Paste keyframes**: the copied clip's animation onto `clipId`, one revision, keeping the clip's own timing (the
+ *  keys stay at the same distance from the clip's start). */
+export async function pasteKeyframesOnto(clipId: string): Promise<void> {
+	const offer = keyframeOffer(editor.timeline, editor.keyframeSource, clipId).paste;
+	const from = editor.keyframeSource;
+	if (offer.disabled || !from) {
+		toast.info(offer.reason ?? 'Nothing to paste');
+		return;
+	}
+	const source = editor.timeline.tracks.flatMap((t) => t.clips).find((c) => c.id === from);
+	const props = source ? animatedProps(source) : [];
+	try {
+		await editor.copyKeyframes(from, clipId, [], 0);
+	} catch (e) {
+		toast.error(errorMessage(e));
+		return;
+	}
+	toast(`Pasted the ${propsPhrase(props)} animation`, { action: { label: 'Undo', onClick: () => void editor.undo() } });
 }

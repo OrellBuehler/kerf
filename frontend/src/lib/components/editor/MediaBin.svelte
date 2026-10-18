@@ -4,11 +4,13 @@
 	import { VIDEO_THUMB_BG } from './data';
 	import Badge from './Badge.svelte';
 	import MediaChips from './MediaChips.svelte';
+	import AnalysisRun from './AnalysisRun.svelte';
 	import Btn from './Btn.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { mediaStatus } from '$lib/media-status.svelte';
 	import { analyzeSubmenuItem } from '$lib/analyze-menu';
+	import { appendAllMedia, exportTranscriptSrt } from '$lib/ops';
 		import { proxyActions } from '$lib/proxy-info';
 	import { deleteProxy, rebuildProxy } from '$lib/api';
 	import { contextMenu } from '$lib/context-menu.svelte';
@@ -161,6 +163,24 @@
 				label: 'Separate stems…',
 				icon: 'layers',
 				action: () => ui.openStems(asset.id)
+			});
+
+		// The transcript as a subtitle file, in the asset's own time; off, with the reason, until there is one.
+		const hasTranscript = (analysis?.transcript.length ?? 0) > 0;
+		items.push({
+			label: 'Export transcript as .srt…',
+			icon: 'file-text',
+			disabled: !hasTranscript,
+			reason: hasTranscript ? undefined : 'Transcribe it first (Analyze › Transcribe speech)',
+			action: () => void exportTranscriptSrt(asset.id)
+		});
+		if (editor.assets.length > 1)
+			items.push({
+				label: `Append all ${editor.assets.length} files to the timeline`,
+				icon: 'list-plus',
+				disabled: editor.locked,
+				reason: editor.locked ? 'Exit the proposal preview to edit' : undefined,
+				action: () => void appendAllMedia()
 			});
 
 		items.push({ type: 'separator' });
@@ -369,6 +389,12 @@ Drag onto a timeline track to add a clip · right-click for details`}
 								</span>
 							{/if}
 						</div>
+						{#if ui.analyzing && ui.analyzingId === a.asset.id}
+							<!-- What the run is on and how to stop it, on the card the run is for; a press here is Stop's, not the card's. -->
+							<div role="presentation" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+								<AnalysisRun compact />
+							</div>
+						{/if}
 					</div>
 				{/each}
 			</div>

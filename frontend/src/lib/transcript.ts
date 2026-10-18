@@ -6,6 +6,24 @@ import type { Clip, Track, TranscriptSegment } from './types';
 
 export type TxLine = { t: string; s: string; start: number; end: number; clip: Clip | null };
 
+/** `00:01:02,500` — an SRT timestamp, as `transcript_to_srt`'s `ts` (kerf-core `model.rs`) writes it: rounded to the
+ *  millisecond, carried into the next unit, never negative. */
+export function srtStamp(seconds: number): string {
+	const ms = Math.round((Number.isFinite(seconds) ? Math.max(0, seconds) : 0) * 1000);
+	const h = Math.floor(ms / 3_600_000);
+	const m = Math.floor((ms % 3_600_000) / 60_000);
+	const s = Math.floor((ms % 60_000) / 1000);
+	const pad = (n: number, w = 2) => String(n).padStart(w, '0');
+	return `${pad(h)}:${pad(m)}:${pad(s)},${pad(ms % 1000, 3)}`;
+}
+
+/** A transcript as a SubRip (`.srt`) document, in source time — the faithful mirror of `transcript_to_srt`: every
+ *  segment, numbered from 1, each `n\nstart --> end\ntext\n\n`. The desktop app writes the file itself
+ *  (`export_srt`); this is what the browser harness hands to the download manager. */
+export function toSrt(segments: readonly TranscriptSegment[]): string {
+	return segments.map((seg, i) => `${i + 1}\n${srtStamp(seg.start)} --> ${srtStamp(seg.end)}\n${seg.text.trim()}\n\n`).join('');
+}
+
 export function fmtClock(s: number): string {
 	const m = Math.floor(s / 60);
 	const sec = Math.floor(s % 60);

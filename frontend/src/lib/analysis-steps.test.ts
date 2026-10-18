@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import {
 	ALL_KINDS,
+	counterKind,
+	stepCounter,
+	stepWords,
 	QUICK_EDIT_STEPS,
 	analysisChips,
 	analysisKindDone,
@@ -39,7 +42,8 @@ describe('the chips of an asset', () => {
 		expect(chips[1].title).toBe('Scenes — not run');
 		expect(chips[2].title).toBe('Loudness — failed (ffmpeg exited with 1)');
 		expect(chips[4].title).toBe('Transcript — off (switched off in Settings)');
-		expect(chips.map((c) => c.short)).toEqual(['SIL', 'SCN', 'LUFS', 'BPM', 'TXT']);
+		// A chip is a word, not a tag: nothing in it needs a tooltip to be read.
+		expect(chips.map((c) => c.label)).toEqual(['Silence', 'Scenes', 'Loudness', 'Rhythm', 'Transcript']);
 	});
 
 	test('with no status yet every chip reads not run', () => {
@@ -254,5 +258,37 @@ describe('the analysis meter', () => {
 
 	test('nothing to draw when the file can give nothing', () => {
 		expect(analysisMeter(chipsFor(analysisChips(status({})), { audio: false, image: true }))).toBeNull();
+	});
+});
+
+describe('where a run is in its plan', () => {
+	const all = ['silence', 'scenes', 'loudness', 'rhythm', 'transcript'] as const;
+
+	test('counts the step in pass order, whatever order the plan was written in', () => {
+		expect(stepCounter(all, 'scenes')).toEqual({ step: 2, of: 5 });
+		expect(stepCounter(['transcript', 'silence'], 'silence')).toEqual({ step: 1, of: 2 });
+		expect(stepCounter(['transcript', 'silence'], 'transcript')).toEqual({ step: 2, of: 2 });
+	});
+
+	test('says nothing before the run has named a step, or for a kind it was not asked to run', () => {
+		expect(stepCounter(all, null)).toBeNull();
+		expect(stepCounter(['silence'], 'scenes')).toBeNull();
+		expect(stepCounter(null, 'silence')).toBeNull();
+		expect(stepCounter([], 'silence')).toBeNull();
+	});
+
+	test('the speech model’s download is the transcript’s step, and waiting is no step', () => {
+		expect(counterKind('download_model')).toBe('transcript');
+		expect(counterKind('transcribe')).toBe('transcript');
+		expect(counterKind('rhythm')).toBe('rhythm');
+		expect(counterKind('waiting')).toBeNull();
+		expect(counterKind('done')).toBeNull();
+		expect(counterKind(undefined)).toBeNull();
+	});
+
+	test('words: "step 2 of 5", and nothing for a one-step run', () => {
+		expect(stepWords({ step: 2, of: 5 })).toBe('step 2 of 5');
+		expect(stepWords({ step: 1, of: 1 })).toBe('');
+		expect(stepWords(null)).toBe('');
 	});
 });

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { agentTabLabel, ago, agentLine, COMPOSER_HINT_MIN_HEIGHT, proposalIndicator, REVIEW_CHIP_FULL_WIDTH, reviewChipText, showComposerHint } from './agent-status';
+import { agentTabLabel, ago, agentLine, COMPOSER_HINT_MIN_HEIGHT, proposalIndicator, REVIEW_CHIP_COUNT_WIDTH, REVIEW_CHIP_FULL_WIDTH, reviewChipText, showComposerHint } from './agent-status';
 import { STATUS_MAP } from './components/editor/data';
 import type { StagedEdit, TimelineDiff } from './types';
 
@@ -94,9 +94,17 @@ describe('the title bar chip', () => {
 		expect(reviewChipText(four, 513)).toBe('4');
 	});
 
+	test('says what the number counts when the cell has most of the room — 1440×900 (about 552) is one', () => {
+		expect(reviewChipText(four, 552)).toBe('4 changes');
+		expect(reviewChipText(four, REVIEW_CHIP_FULL_WIDTH - 1)).toBe('4 changes');
+		expect(reviewChipText(four, REVIEW_CHIP_COUNT_WIDTH)).toBe('4 changes');
+		expect(reviewChipText(proposalIndicator(staged(1))!, 552)).toBe('1 change');
+	});
+
 	test('is the count alone in a narrow cell, and a word when there is no count', () => {
-		expect(reviewChipText(four, REVIEW_CHIP_FULL_WIDTH - 1)).toBe('4');
+		expect(reviewChipText(four, REVIEW_CHIP_COUNT_WIDTH - 1)).toBe('4');
 		expect(reviewChipText(proposalIndicator(staged(0))!, 300)).toBe('Review');
+		expect(reviewChipText(proposalIndicator(staged(0))!, 552)).toBe('Review');
 	});
 });
 

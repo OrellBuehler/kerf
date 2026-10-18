@@ -8,7 +8,9 @@
 	import { workspace } from '$lib/workspace.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { importMedia } from '$lib/import-media';
-	import { firstRunSteps } from '$lib/first-run';
+	import { firstRunAction, firstRunSteps } from '$lib/first-run';
+	import { toast } from '$lib/notifications.svelte';
+	import { errorMessage } from '$lib/ops';
 	import { clipsIn, exportButtonState } from '$lib/export-button';
 
 	const steps = $derived(
@@ -19,6 +21,22 @@
 			exportKeys: settings.shortcut('file.export')
 		})
 	);
+	const action = $derived(
+		firstRunAction({ assets: editor.assets, selectedId: editor.selectedAssetId, libraryOpen: workspace.open.includes('library') })
+	);
+	const target = $derived(action.kind === 'add' ? editor.assets.find((a) => a.id === action.assetId) : undefined);
+
+	/** Put the picked media on the timeline at the start, and say what went where. */
+	async function addSelected() {
+		const a = target;
+		if (!a) return;
+		try {
+			await editor.add(a.id, 0, a.duration, undefined, 0);
+			toast.success(`Added ${a.name} to the timeline`);
+		} catch (e) {
+			toast.error(errorMessage(e));
+		}
+	}
 	const exportState = $derived(
 		exportButtonState({ clips: clipsIn(editor.liveTimeline), running: editor.exportRun !== null })
 	);
@@ -66,10 +84,19 @@
 		{/each}
 	</ol>
 	<div class="actions">
-		{#if editor.assets.length === 0}
-			<Btn variant="primary" size="sm" icon="plus" onclick={importMedia}>Import media…</Btn>
+		{#if action.kind === 'import'}
+			<Btn variant="primary" size="sm" icon="plus" onclick={importMedia}>{action.label}</Btn>
+		{:else if action.kind === 'add'}
+			<Btn
+				variant="primary"
+				size="sm"
+				icon="plus"
+				pending={editor.busy}
+				title={target ? `Put ${target.name} at the start of the timeline` : undefined}
+				onclick={addSelected}>{action.label}</Btn
+			>
 		{:else}
-			<Btn size="sm" icon="film" onclick={() => workspace.show('library')}>Open Library</Btn>
+			<Btn size="sm" icon="film" onclick={() => workspace.show('library')}>{action.label}</Btn>
 		{/if}
 		<Btn
 			size="sm"

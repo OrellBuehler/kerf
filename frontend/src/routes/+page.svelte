@@ -48,6 +48,7 @@
 		inTauri,
 		isMediaPath,
 		confirmAction,
+		onAnalysisProgress,
 		onAnalysisStatus,
 		onProxyProgress,
 		onWindowCloseRequested,
@@ -166,6 +167,9 @@
 		// (an agent's runs included) — the bin's badges and chips read them.
 		void onProxyProgress((s) => mediaStatus.noteProxy(s)).then((un) => unlisteners.push(un));
 		void onAnalysisStatus((s) => mediaStatus.noteAnalysis(s)).then((un) => unlisteners.push(un));
+		// Analysis names its step as it goes — transcription in particular downloads a model and then runs for
+		// minutes. (The browser harness simulates the ticks.)
+		void onAnalysisProgress((p) => ui.noteAnalysisProgress(p)).then((un) => unlisteners.push(un));
 
 		// The desktop app hosts the MCP server, so an agent can edit the same
 		// project live. It emits `project-changed` after each mutation; re-fetch
@@ -248,11 +252,6 @@
 					await listen<{ fraction: number }>(
 						'import-progress',
 						(e) => (editor.importProgress = e.payload.fraction)
-					),
-					// Analysis names its step as it goes — transcription in
-					// particular downloads a model and then runs for minutes.
-					await listen<AnalysisProgress>('analysis-progress', (e) =>
-						ui.noteAnalysisProgress(e.payload)
 					),
 					await listen<ModelProgress>(
 						'model-progress',

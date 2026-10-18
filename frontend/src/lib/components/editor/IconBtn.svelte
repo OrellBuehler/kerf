@@ -8,6 +8,8 @@
 		size = 32,
 		style = '',
 		class: klass = '',
+		pending = false,
+		onclick = undefined,
 		children,
 		...rest
 	}: {
@@ -17,6 +19,9 @@
 		size?: number;
 		style?: string;
 		class?: string;
+		/** An edit is in flight: off to the eye and the click, but still focusable (see `Btn`). */
+		pending?: boolean;
+		onclick?: unknown;
 		children?: Snippet;
 		[key: string]: unknown;
 	} = $props();
@@ -29,6 +34,11 @@
 	use:tip={title}
 	aria-label={tipText(title) || undefined}
 	aria-pressed={active}
+	aria-disabled={pending ? 'true' : undefined}
+	onclick={(e: MouseEvent) => {
+		if (pending) return;
+		(onclick as ((e: MouseEvent) => void) | undefined)?.(e);
+	}}
 	style="width:{size}px;height:{size}px;{style}"
 	{...rest}
 >

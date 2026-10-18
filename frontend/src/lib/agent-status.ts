@@ -84,8 +84,16 @@ export function showComposerHint(panelHeight: number): boolean {
  *  with its name intact; the full label is for wider windows. */
 export const REVIEW_CHIP_FULL_WIDTH = 560;
 
-/** What the title bar's chip says in a cell `cellWidth` wide (0 while it is not measured yet: the full label). */
+/** Below `REVIEW_CHIP_FULL_WIDTH` and from here up, the chip says what the number counts (`4 changes`) without the
+ *  verb: a bare `4` beside a git icon read as a build number, not as the agent's work waiting for you. 1440×900 has a
+ *  right cell of about 552 and gets this; 1366×768 (513) keeps the bare count and the name its room. */
+export const REVIEW_CHIP_COUNT_WIDTH = 540;
+
+/** What the title bar's chip says in a cell `cellWidth` wide (0 while it is not measured yet: the full label): the
+ *  whole label, then the count with its noun, then — when even that would crowd the project's name — the count
+ *  alone, which the chip's tooltip and accessible name still spell out. */
 export function reviewChipText(indicator: ProposalIndicator, cellWidth: number): string {
-	const narrow = cellWidth > 0 && cellWidth < REVIEW_CHIP_FULL_WIDTH;
-	return narrow ? String(indicator.count || 'Review') : indicator.label;
+	if (cellWidth <= 0 || cellWidth >= REVIEW_CHIP_FULL_WIDTH) return indicator.label;
+	if (cellWidth >= REVIEW_CHIP_COUNT_WIDTH) return indicator.count === 0 ? 'Review' : changes(indicator.count);
+	return String(indicator.count || 'Review');
 }

@@ -23,12 +23,15 @@
 		detachSelection,
 		linkSelection,
 		reattachSelection,
+		copyKeyframesOf,
+		pasteKeyframesOnto,
 		selectionLinkPlans,
 		splitSelection,
 		trimSelection,
 		unlinkSelection
 	} from '$lib/ops';
 	import { importCaptionFile } from '$lib/title-actions';
+	import { keyframeOffer } from '$lib/keyframe-copy';
 	import type { ActionId } from '$lib/keymap';
 	import { DELIVERY_PRESETS, fitLabel, presetFor } from '$lib/delivery-formats';
 	import { setDeliveryPreset } from '$lib/menu-commands';
@@ -1810,6 +1813,7 @@
 		const linked = linkPartners(editor.timeline, c.id).length > 0;
 		// Music with a fitted bar grid can be made to last as long as the picture.
 		const fit = fitOffer(t, c, editor.analysisFor(c.asset_id));
+		const kf = keyframeOffer(editor.timeline, editor.keyframeSource, c.id);
 		// Footage or music with sound can be split into drums / bass / other / vocals under the clip.
 		const stems = stemsOffer(
 			t,
@@ -1924,6 +1928,21 @@
 					]
 				: []),
 			...(fit.show || stems.show ? [{ type: 'separator' } satisfies MenuItem] : []),
+			{
+				label: 'Copy keyframes',
+				icon: 'diamond',
+				disabled: kf.copy.disabled,
+				reason: kf.copy.reason,
+				action: () => copyKeyframesOf(c.id)
+			},
+			{
+				label: 'Paste keyframes',
+				icon: 'clipboard',
+				disabled: kf.paste.disabled,
+				reason: kf.paste.reason,
+				action: () => void pasteKeyframesOnto(c.id)
+			},
+			{ type: 'separator' },
 			{
 				label: enabled ? 'Disable clip' : 'Enable clip',
 				icon: enabled ? 'eye-off' : 'eye',
@@ -3034,14 +3053,6 @@
 				{/each}
 			{/if}
 
-			{#if !hasClips}
-				<div
-					style="position:absolute;left:0;right:0;top:var(--ruler-h);bottom:0;display:grid;place-items:center;color:var(--text-muted);font-size:12px"
-				>
-					Drop media here to start cutting.
-				</div>
-			{/if}
-
 			<!-- titles lane: every title, lower-third and caption, in its own row of
 			     items rather than a section of whichever clip is selected -->
 			<div
@@ -3125,6 +3136,15 @@
 						? 'inset 0 2px 0 var(--border-strong)'
 						: 'none'}"
 				>
+					{#if !hasClips && t.id === drawn[0]?.id}
+						<!-- In the first lane, where the clip will land — it used to be centred over the whole stack and sat on the line between
+						     V1 and A1. Sticky, so it stays on screen when the timeline is scrolled. -->
+						<span
+							data-drop-hint
+							style="position:sticky;left:calc(var(--track-header-w) + 12px);display:flex;align-items:center;width:max-content;max-width:calc(100% - var(--track-header-w) - 24px);height:100%;color:var(--text-muted);font-size:12px;pointer-events:none;white-space:nowrap"
+							>Drop media here to start cutting.</span
+						>
+					{/if}
 					{#if drag?.moved && drag.trackId === t.id}
 						<!-- Where the dragged clip would land: the lane under the pointer takes a tint. -->
 						<span

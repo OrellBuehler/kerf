@@ -215,6 +215,9 @@ class EditorState {
 	importProgress = $state<number | null>(null);
 	error = $state<string | null>(null);
 
+	/** The clip whose animation was last copied (Copy keyframes); a paste reads it as it is then (`keyframe-copy.ts`). */
+	keyframeSource = $state<string | null>(null);
+
 	/** The live cut, parked while `previewingStaged` shows the proposal. */
 	#liveTimeline = $state.raw<Timeline | null>(null);
 	/** The cut an edit lands on: the live one even while a proposal is on screen
@@ -462,6 +465,7 @@ class EditorState {
 			this.previewingStaged = false;
 			this.#liveTimeline = null;
 			this.staged = null;
+			this.keyframeSource = null;
 			this.#analysisAsked.clear();
 			// The ripple flag is the project's, saved in its file: a project that was
 			// saved with ripple on has to open that way, and a new one has to reset

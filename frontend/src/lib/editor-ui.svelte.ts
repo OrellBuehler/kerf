@@ -25,7 +25,7 @@ import type {
 	Levels,
 	TranscriptionStatus
 } from './types';
-import { autoSteps, kindInfo, kindOfStage, missingSteps } from './analysis-steps';
+import { autoSteps, counterKind, kindInfo, kindOfStage, missingSteps, stepCounter, stepWords, type StepCounter } from './analysis-steps';
 import { mediaStatus } from './media-status.svelte';
 import { isLevelsCancelled, measureRange, type MeasureStamp } from './levels-view';
 import type { ExportDraft } from './export-draft';
@@ -78,6 +78,9 @@ class EditorUi {
 	 *  and then runs inference for minutes, so the UI names the step and shows a
 	 *  real percentage wherever the backend can produce one. */
 	analysisStage = $state<AnalysisProgress | null>(null);
+	/** The kinds the running pass was asked for, for "step 2 of 5" — `null` when the run was left to Settings'
+	 *  switches and the plan is not known here. */
+	analysisPlan = $state<readonly AnalysisKind[] | null>(null);
 	/** Which speech-to-text backend is available, once probed. */
 	transcription = $state<TranscriptionStatus | null>(null);
 	/** Set while a speech model is being fetched deliberately (not mid-analysis). */
@@ -353,9 +356,20 @@ class EditorUi {
 		return this.analyzing ? kindOfStage(this.analysisStage?.stage) : null;
 	}
 
-	/** A short label for the step analysis is on, or null when idle. */
+	/** Where the running pass is in what it was asked for, once it has said which step it is on. */
+	get analysisStep(): StepCounter | null {
+		return this.analyzing ? stepCounter(this.analysisPlan, counterKind(this.analysisStage?.stage)) : null;
+	}
+
+	/** A short label for the step analysis is on, or null when idle: `step 2 of 5 · detecting scenes 40%`. */
 	get analysisLabel(): string | null {
 		if (!this.analyzing) return null;
+		const words = stepWords(this.analysisStep);
+		const named = this.#stageLabel();
+		return words ? `${words} · ${named}` : named;
+	}
+
+	#stageLabel(): string {
 		const p = this.analysisStage;
 		if (!p) return 'analyzing';
 		const kind = kindOfStage(p.stage);
@@ -405,6 +419,7 @@ class EditorUi {
 		this.analyzing = true;
 		this.analyzingId = assetId;
 		this.analysisStage = null;
+		this.analysisPlan = steps ?? null;
 		try {
 			await editor.analyze(assetId, steps);
 			// Transcription may have downloaded a model on the way.
@@ -418,6 +433,7 @@ class EditorUi {
 			this.analyzing = false;
 			this.analyzingId = null;
 			this.analysisStage = null;
+			this.analysisPlan = null;
 			this.stoppingAnalysis = false;
 			await mediaStatus.refresh();
 			this.reportFailedSteps(assetId, steps);
