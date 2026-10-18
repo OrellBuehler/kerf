@@ -3560,18 +3560,15 @@ impl KerfMcp {
         description = "Write an asset's cached transcript to a SubRip (.srt) subtitle file (run analyze_asset first). \
                        Refuses to overwrite an existing file unless overwrite is true."
     )]
-    fn export_srt(&self, Parameters(p): Parameters<ExportSrtParams>) -> Result<String, McpError> {
+    async fn export_srt(&self, Parameters(p): Parameters<ExportSrtParams>) -> Result<String, McpError> {
         let id = parse_arg("asset_id", &p.asset_id)?;
         crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
-        let path = std::path::Path::new(&p.output_path);
-        refuse_overwrite(path, p.overwrite.unwrap_or(false))?;
-        let srt = {
-            let project = self.lock();
-            // Not onto a file the project still needs (a source, a proxy, the project itself).
-            project.check_output_path(path).map_err(core_err)?;
-            project.transcript_srt(id).map_err(core_err)?
-        };
-        std::fs::write(path, srt).map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        let path = std::path::PathBuf::from(&p.output_path);
+        refuse_overwrite(&path, p.overwrite.unwrap_or(false))?;
+        // Not onto a file the project still needs (a source, a proxy, the project itself).
+        self.check_outputs(std::slice::from_ref(&path)).await?;
+        let srt = self.lock().transcript_srt(id).map_err(core_err)?;
+        blocking(move || std::fs::write(&path, srt).map_err(|e| McpError::internal_error(e.to_string(), None))).await?;
         Ok(format!("wrote {}", p.output_path))
     }
 
@@ -4096,7 +4093,7 @@ impl KerfMcp {
         let output = std::path::PathBuf::from(&p.output_path);
         refuse_overwrite(&output, p.overwrite.unwrap_or(false))?;
         // Not onto a file the project still needs (a source, a proxy, the project itself).
-        self.lock().check_output_path(&output).map_err(core_err)?;
+        self.check_outputs(std::slice::from_ref(&output)).await?;
         let opts = p.options.unwrap_or_default();
         let (project, owner) = (self.project.clone(), self.owner());
         // A render runs for minutes. Without progress an agent cannot tell a slow export from a
@@ -4195,13 +4192,11 @@ impl KerfMcp {
             .map(|d| kerf_core::ExportVariant::beside(&base, *d))
             .collect();
         let overwrite = p.overwrite.unwrap_or(false);
-        {
-            let project = self.lock();
-            for variant in &variants {
-                refuse_overwrite(&variant.output, overwrite)?;
-                project.check_output_path(&variant.output).map_err(core_err)?;
-            }
+        for variant in &variants {
+            refuse_overwrite(&variant.output, overwrite)?;
         }
+        self.check_outputs(&variants.iter().map(|v| v.output.clone()).collect::<Vec<_>>())
+            .await?;
         let smart_crop = p.smart_crop.unwrap_or(true);
         let (me, owner) = (self.clone(), self.owner());
         let generation = self.lock().generation();
@@ -4331,7 +4326,7 @@ impl KerfMcp {
         crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
         let output = std::path::PathBuf::from(&p.output_path);
         refuse_overwrite(&output, p.overwrite.unwrap_or(false))?;
-        self.lock().check_output_path(&output).map_err(core_err)?;
+        self.check_outputs(std::slice::from_ref(&output)).await?;
         let (project, owner) = (self.project.clone(), self.owner());
         let cancel = context.ct.clone();
         let time_secs = p.time_secs;
@@ -4792,6 +4787,14 @@ impl KerfMcp {
 }
 
 impl KerfMcp {
+    /// Refuse any of `paths` as a place to write: the source of an asset, a capture file, a proxy,
+    /// the project's own file. What the project holds is read under the lock; canonicalising and
+    /// comparing the paths — filesystem calls, slow on a share that went away — happen on the
+    /// blocking pool with the lock released.
+    async fn check_outputs(&self, paths: &[std::path::PathBuf]) -> Result<(), McpError> {
+        check_output_paths(self.project.clone(), self.owner(), paths.to_vec()).await
+    }
+
     /// The user's live timeline is theirs while their review of agent edits is on: an agent
     /// stepping its history back or forward would change the cut with nothing to review.
     fn refuse_live_history(&self) -> Result<(), McpError> {
@@ -4800,6 +4803,22 @@ impl KerfMcp {
         }
         Ok(())
     }
+}
+
+/// [`KerfMcp::check_outputs`] without the server around it.
+async fn check_output_paths(
+    project: Arc<Mutex<Project>>,
+    owner: Option<String>,
+    paths: Vec<std::path::PathBuf>,
+) -> Result<(), McpError> {
+    blocking(move || {
+        let project = lock_agent_as(&project, owner.as_deref());
+        for path in &paths {
+            project.check_output_path(path).map_err(core_err)?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// Forwards the `analysis-progress` events the GUI's bin listens to — for one asset — to a [`Run`],
@@ -7022,5 +7041,40 @@ mod tests {
             missing.is_empty(),
             "add these to the tool index in .claude/docs/mcp.md: {missing:?}"
         );
+    }
+
+    /// An export, cover or subtitle file is never written over something the project still needs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_output_onto_a_source_file_is_refused_before_anything_renders() {
+        let dir = std::env::temp_dir().join(format!("kerf-mcp-out-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("clip.mp4");
+        std::fs::write(&source, b"not really a video").unwrap();
+        let project = kerf_core::Project::open_in_memory().unwrap();
+        let asset: kerf_core::Asset = serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(),
+            "path": source.to_string_lossy(),
+            "name": "clip.mp4",
+            "duration": 2.0,
+            "streams": [],
+            "imported_at": "2025-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        project.insert_or_get_asset(&asset).unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(project));
+
+        let refused = super::check_output_paths(shared.clone(), None, vec![dir.join("out.mp4"), source.clone()])
+            .await
+            .expect_err("the source is not a place to render to");
+        assert_eq!(refused.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(refused.message.contains("clip.mp4"), "{}", refused.message);
+        // The same file by another way in.
+        let detour = dir.join("..").join(dir.file_name().unwrap()).join("clip.mp4");
+        assert!(super::check_output_paths(shared.clone(), None, vec![detour]).await.is_err());
+        // Anywhere else is fine.
+        super::check_output_paths(shared, None, vec![dir.join("out.mp4")])
+            .await
+            .expect("a fresh path");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -207,12 +207,15 @@ an edit to the user's cut, so imported media (and its background proxy) lands fo
 them immediately, reporting on the same `import-progress` event a lens-pair
 stitch drives for the GUI. `export` takes rmcp's `RequestContext` beside its
 `Parameters`: a render runs for minutes, so it forwards ffmpeg's progress to the
-client's `progressToken` and passes `context.ct` as the cancel callback, deleting
-the half-written file on cancel the way the GUI's export does. `export_capabilities` lists the
+client's `progressToken` and passes `context.ct` as the cancel callback (both through `jobs::Run`; `background: true`
+makes it a job instead). A failed or cancelled render removes only what *this run* wrote
+(`kerf_core::discard_partial` against the `file_mtime` taken before — core does it, the tool repeats it so a cancel can
+never leave debris), and the output is refused when it is a file the project still uses (`Project::check_output_path`:
+a source, a proxy, the project itself). `export_capabilities` lists the
 verified hardware encoders (it runs the probe); a `video_codec` from outside that list is the
 caller's risk, and a `*_vaapi` one on a machine nothing has probed yet waits up to 10 s for the
 probe to name the render node before the export starts (`vaapi_device_within`). Progress goes
-through an unbounded channel to a spawned forwarder because the render itself is
+through an unbounded channel to a spawned forwarder (`jobs::foreground`) because the render itself is
 on the blocking pool and `notify_progress` is async; the forwarder drains the
 channel even with no token, so a client that asked for no progress doesn't leave
 ticks piling up.

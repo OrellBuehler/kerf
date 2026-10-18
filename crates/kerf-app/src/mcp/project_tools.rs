@@ -275,15 +275,16 @@ impl KerfMcp {
         let overwrite = p.overwrite.unwrap_or(false);
         let (shared, owner, app) = (self.project.clone(), self.owner(), self.app.clone());
         let saved = blocking(move || {
+            let open = lock_agent_as(&shared, owner.as_deref()).path().map(Path::to_path_buf);
+            // Onto the file that is open there is nothing to do; onto another one that exists, only
+            // if told. Both look at the disk, so neither is asked under the lock.
+            if open.is_some_and(|open| kerf_core::paths::same_file(&open, &path)) {
+                return Ok(None);
+            }
+            super::refuse_overwrite(&path, overwrite)?;
             let before = {
+                // `save_as` refuses a file the project still uses (a source, a proxy) itself.
                 let project = lock_agent_as(&shared, owner.as_deref());
-                if let Some(open) = project.path() {
-                    if kerf_core::paths::same_file(open, &path) {
-                        return Ok(None);
-                    }
-                }
-                super::refuse_overwrite(&path, overwrite)?;
-                project.check_output_path(&path).map_err(core_err)?;
                 project.save_as(&path).map_err(core_err)?;
                 project.change_count()
             };
