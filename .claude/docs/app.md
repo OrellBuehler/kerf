@@ -146,7 +146,12 @@ many seconds ago an agent last spoke to it, or `null` if none ever has —
 `initialize` is the one moment an agent is known to be there; a
 streamable-HTTP client holds no connection between calls, so there is no socket
 to report and the panel judges from the age instead of the green dot it used to
-show unconditionally). A **failed render deletes what it wrote** (`discard_partial`, in both
+show unconditionally). `mcp_connection_info` (URL, token, `running` / `error`, `claude_code_command` with the bearer header
+and a generic `mcpServers` JSON snippet; `mcp_commands.rs`), `regenerate_mcp_token` (the old token stops working at once)
+and `set_mcp_settings { mcp_enabled?, mcp_addr?, mcp_require_token?, agent_review? }` (refuses any other key; a network
+address needs the token; `settings::update` restarts the listener when the address or switch moves, see `mcp.md`) are the Agent
+settings page's commands — the settings file holds `agent_review`, `mcp_enabled`, `mcp_addr`, `mcp_require_token` and
+`mcp_token`, and `SettingsView` carries all but the token. A **failed render deletes what it wrote** (`discard_partial`, in both
 `export_timeline` and the MCP `export`): only if this run touched the file
 (mtime differs from before), so a failure before ffmpeg opened the output cannot
 delete the earlier export sitting at that path. `export_variants` renders its

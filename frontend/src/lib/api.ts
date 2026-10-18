@@ -54,6 +54,8 @@ import type {
 	ReframeKeyframe,
 	Revision,
 	AppSettings,
+	McpConnectionInfo,
+	McpSettingsPatch,
 	SettingsView,
 	SplitSide,
 	StagedEdit,
@@ -89,6 +91,7 @@ import type {
 import { unsavedChoice, type UnsavedChoice, type UnsavedCopy } from './confirm-copy';
 import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
 import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
+import { claudeCodeCommand, clientUrl, genericJsonConfig } from './mcp-connect';
 import { fileTooLarge, importCaptionsInto, MAX_CAPTION_FILE_BYTES, parseFormat, resolveBase } from './caption-import';
 import { baseName, CAPTION_EXTENSIONS } from './caption-import-ui';
 import { easingProblem, insertKeyframe } from './easing';
@@ -3536,12 +3539,6 @@ export async function platformCheck(
 
 // ---- agent connection (MCP endpoint) ---------------------------------------
 
-/** The local MCP endpoint a connected agent points at (e.g. http://127.0.0.1:7777/mcp). */
-export async function mcpEndpoint(): Promise<string> {
-	if (!inTauri()) return 'http://127.0.0.1:7777/mcp';
-	return invoke<string>('mcp_endpoint');
-}
-
 /** Where the endpoint is, and how long ago an agent last used it — `null` when
  *  none ever has. A streamable-HTTP client holds no connection between calls,
  *  so there is no socket to report as open; the panel judges from the age. In
@@ -3549,6 +3546,77 @@ export async function mcpEndpoint(): Promise<string> {
 export async function agentStatus(): Promise<{ endpoint: string; last_seen_secs: number | null; error: string | null }> {
 	if (!inTauri()) return { endpoint: 'http://127.0.0.1:7777/mcp', last_seen_secs: null, error: null };
 	return invoke<{ endpoint: string; last_seen_secs: number | null; error: string | null }>('agent_status');
+}
+
+// ---- agent connection: endpoint, token, switches (mcp_commands.rs) ------------
+
+/** In the browser harness there is no server: this is the state the Agent settings page edits. */
+let harnessMcp: McpConnectionInfo | null = null;
+
+function harnessToken(): string {
+	return (crypto.randomUUID() + crypto.randomUUID()).replace(/-/g, '');
+}
+
+function harnessMcpInfo(next: Partial<McpConnectionInfo>): McpConnectionInfo {
+	const base: McpConnectionInfo = harnessMcp ?? {
+		enabled: true,
+		url: 'http://127.0.0.1:7777/mcp',
+		require_token: true,
+		token: harnessToken(),
+		running: true,
+		error: null,
+		configured_addr: null,
+		env_override: false,
+		agent_review: true,
+		claude_code_command: '',
+		generic_json_config: ''
+	};
+	const merged = { ...base, ...next };
+	merged.url = clientUrl(merged.configured_addr ?? '127.0.0.1:7777');
+	merged.running = merged.enabled;
+	merged.claude_code_command = claudeCodeCommand(merged.url, merged.token, merged.require_token);
+	merged.generic_json_config = genericJsonConfig(merged.url, merged.token, merged.require_token);
+	harnessMcp = merged;
+	return merged;
+}
+
+/** The endpoint, the token and ready-made client configuration, and whether the server is up. */
+export async function mcpConnectionInfo(): Promise<McpConnectionInfo> {
+	if (!inTauri()) return harnessMcpInfo({});
+	return invoke<McpConnectionInfo>('mcp_connection_info');
+}
+
+/** Make a new token; the old one stops working at once. Resolves to the new token. */
+export async function regenerateMcpToken(): Promise<string> {
+	if (!inTauri()) {
+		const token = harnessToken();
+		harnessMcpInfo({ token });
+		return token;
+	}
+	return invoke<string>('regenerate_mcp_token');
+}
+
+/** Change the agent switches (enabled, address, token requirement, review of agent edits); resolves
+ *  to the connection info as it is afterwards. Rejects when the combination is refused (a network
+ *  address with the token requirement off, an address that is not `host:port`). */
+export async function setMcpSettings(patch: McpSettingsPatch): Promise<McpConnectionInfo> {
+	if (!inTauri()) {
+		const next: Partial<McpConnectionInfo> = {};
+		if (patch.mcp_enabled !== undefined) next.enabled = patch.mcp_enabled;
+		if (patch.mcp_require_token !== undefined) next.require_token = patch.mcp_require_token;
+		if (patch.agent_review !== undefined) next.agent_review = patch.agent_review;
+		if ('mcp_addr' in patch) next.configured_addr = patch.mcp_addr ?? null;
+		const current = harnessMcpInfo({});
+		const addr = ('mcp_addr' in patch ? patch.mcp_addr : current.configured_addr) ?? '127.0.0.1:7777';
+		const require = patch.mcp_require_token ?? current.require_token;
+		if (!/^(127\.\d+\.\d+\.\d+|localhost|\[::1\]):/i.test(addr) && !require) {
+			throw new Error(
+				`refusing to listen on ${addr}: it is reachable from the network, and requests would carry no token`
+			);
+		}
+		return harnessMcpInfo(next);
+	}
+	return invoke<McpConnectionInfo>('set_mcp_settings', { patch });
 }
 
 // ---- app settings ----------------------------------------------------------

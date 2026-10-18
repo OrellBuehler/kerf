@@ -69,6 +69,20 @@ pub struct Settings {
     /// frontend owns the action registry, the chord syntax and the migration
     /// between versions, so a new action or a renamed one needs no change here.
     pub keybindings: Option<serde_json::Value>,
+    // ---- agent / MCP server (owned by `mcp.rs`; keep together) ----
+    /// Whether an agent's edits are held back for the user to review before they reach the cut
+    /// (the default). The agent-facing `set_settings` tool cannot change it.
+    pub agent_review: bool,
+    /// Whether the embedded MCP server listens at all.
+    pub mcp_enabled: bool,
+    /// Where it listens (`host:port`); `None` is `127.0.0.1:7777`. `KERF_MCP_ADDR` in the
+    /// environment still overrides it.
+    pub mcp_addr: Option<String>,
+    /// Whether a request must carry `Authorization: Bearer <mcp_token>`.
+    pub mcp_require_token: bool,
+    /// The bearer token. Generated on the first start and kept here.
+    pub mcp_token: Option<String>,
+    // ---- end agent / MCP server ----
 }
 
 impl Default for Settings {
@@ -85,6 +99,11 @@ impl Default for Settings {
             theme: None,
             workspaces: None,
             keybindings: None,
+            agent_review: true,
+            mcp_enabled: true,
+            mcp_addr: None,
+            mcp_require_token: true,
+            mcp_token: None,
         }
     }
 }
@@ -99,6 +118,35 @@ pub fn safe_areas() -> bool {
 
 pub fn set_safe_areas(on: bool) {
     SAFE_AREAS.store(on, Ordering::Relaxed);
+}
+
+/// Whether an agent's edits wait for review. Every agent entry point reads it (and sets it on the
+/// project it locks), so a change applies to the very next agent call. On until a setting says
+/// otherwise: that is also what a call that races the startup sees.
+static AGENT_REVIEW: AtomicBool = AtomicBool::new(true);
+
+pub fn agent_review() -> bool {
+    AGENT_REVIEW.load(Ordering::Relaxed)
+}
+
+pub fn set_agent_review(on: bool) {
+    AGENT_REVIEW.store(on, Ordering::Relaxed);
+}
+
+/// What a settings patch must not do to the agent's door: a bad address or token, or a network
+/// address with no token to guard it.
+fn check_agent_fields(settings: &Settings) -> Result<(), String> {
+    if let Some(addr) = settings.mcp_addr.as_deref() {
+        crate::mcp::check_addr(addr)?;
+    }
+    if let Some(token) = settings.mcp_token.as_deref() {
+        crate::mcp::check_token(token)?;
+    }
+    let addr = settings.mcp_addr.as_deref().unwrap_or(crate::mcp::DEFAULT_ADDR);
+    match crate::mcp::bind_problem(addr, settings.mcp_require_token) {
+        Some(why) => Err(why),
+        None => Ok(()),
+    }
 }
 
 /// What the settings surface actually shows: the stored preference resolved
@@ -120,6 +168,10 @@ pub struct SettingsView {
     pub theme: Option<serde_json::Value>,
     pub workspaces: Option<serde_json::Value>,
     pub keybindings: Option<serde_json::Value>,
+    pub agent_review: bool,
+    pub mcp_enabled: bool,
+    pub mcp_addr: Option<String>,
+    pub mcp_require_token: bool,
 }
 
 impl SettingsView {
@@ -143,6 +195,10 @@ impl SettingsView {
             theme: stored.theme.clone(),
             workspaces: stored.workspaces.clone(),
             keybindings: stored.keybindings.clone(),
+            agent_review: stored.agent_review,
+            mcp_enabled: stored.mcp_enabled,
+            mcp_addr: stored.mcp_addr.clone(),
+            mcp_require_token: stored.mcp_require_token,
         }
     }
 }
@@ -154,7 +210,7 @@ impl SettingsView {
 static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 /// The keys a patch may carry — every field of [`Settings`].
-const KEYS: [&str; 10] = [
+const KEYS: [&str; 15] = [
     "cpu_percent",
     "auto_analysis",
     "proxy_size",
@@ -165,6 +221,11 @@ const KEYS: [&str; 10] = [
     "theme",
     "workspaces",
     "keybindings",
+    "agent_review",
+    "mcp_enabled",
+    "mcp_addr",
+    "mcp_require_token",
+    "mcp_token",
 ];
 
 fn path(app: &AppHandle) -> Option<PathBuf> {
@@ -281,7 +342,14 @@ fn merge(settings: &Settings, patch: &serde_json::Value) -> Result<Settings, Str
     for (key, value) in patch {
         merged.insert(key.clone(), value.clone());
     }
-    serde_json::from_value(serde_json::Value::Object(merged)).map_err(|e| format!("invalid settings: {e}"))
+    let merged: Settings =
+        serde_json::from_value(serde_json::Value::Object(merged)).map_err(|e| format!("invalid settings: {e}"))?;
+    // Only a patch that touches the agent's door is held to its rules: a stored file with an odd
+    // address in it must not stop the theme from being saved.
+    if patch.keys().any(|k| k.starts_with("mcp_")) {
+        check_agent_fields(&merged)?;
+    }
+    Ok(merged)
 }
 
 /// The stored preferences (see [`load_from`]).
@@ -319,6 +387,10 @@ pub fn update(app: &AppHandle, patch: &serde_json::Value) -> Result<Settings, St
         merged.cpu_percent = kerf_core::set_cpu_percent(merged.cpu_percent);
     }
     save_to(&file, &merged)?;
+    if patch.get("agent_review").is_some() {
+        set_agent_review(merged.agent_review);
+    }
+    crate::mcp::settings_changed(&merged, patch);
     Ok(merged)
 }
 
@@ -332,6 +404,7 @@ pub fn apply(settings: &Settings) {
     kerf_core::proxy::set_proxy_size(settings.proxy_size);
     kerf_core::proxy::set_preview_source_setting(settings.preview_source);
     set_safe_areas(settings.safe_areas);
+    set_agent_review(settings.agent_review);
     if std::env::var_os(CPU_ENV).is_some() {
         tracing::info!(percent = kerf_core::cpu_percent(), "CPU budget set from {CPU_ENV}");
         return;
@@ -630,5 +703,125 @@ mod tests {
         // A stored source this build has not heard of is Auto, not a corrupt file.
         let unknown = parse(r#"{"preview_source": "somewhere_else"}"#).unwrap();
         assert_eq!(unknown.preview_source, kerf_core::PreviewSource::Auto);
+    }
+
+    #[test]
+    fn the_agent_door_is_closed_by_default() {
+        let s = Settings::default();
+        assert!(s.agent_review, "an agent's edits wait for review");
+        assert!(s.mcp_enabled);
+        assert!(s.mcp_require_token, "a token is required");
+        assert_eq!(s.mcp_addr, None, "the default address is loopback");
+        assert_eq!(s.mcp_token, None, "the token is made on the first start");
+        let old: Settings = serde_json::from_str(r#"{"cpu_percent": 50}"#).unwrap();
+        assert!(
+            old.agent_review && old.mcp_require_token,
+            "an older file gets the safe values"
+        );
+    }
+
+    #[test]
+    fn every_stored_field_can_be_patched_and_nothing_else() {
+        let stored = serde_json::to_value(Settings::default()).unwrap();
+        for key in stored.as_object().unwrap().keys() {
+            assert!(KEYS.contains(&key.as_str()), "`{key}` is a setting but cannot be patched");
+        }
+        for key in KEYS {
+            assert!(stored.get(key).is_some(), "`{key}` can be patched but is not stored");
+        }
+    }
+
+    #[test]
+    fn the_view_shows_the_switches_but_never_the_token() {
+        let s = Settings {
+            mcp_token: Some("s".repeat(64)),
+            agent_review: false,
+            ..Settings::default()
+        };
+        let view = serde_json::to_value(SettingsView::current(&s)).unwrap();
+        assert_eq!(view["agent_review"], false);
+        assert_eq!(view["mcp_require_token"], true);
+        assert!(view.get("mcp_token").is_none(), "{view}");
+        assert!(!view.to_string().contains(&"s".repeat(64)));
+    }
+
+    #[test]
+    fn an_agent_patch_changes_only_its_own_fields() {
+        let base = Settings {
+            cpu_percent: 40,
+            theme: Some(serde_json::json!({"name": "Mine"})),
+            ..Settings::default()
+        };
+        let merged = merge(
+            &base,
+            &serde_json::json!({"agent_review": false, "mcp_addr": "127.0.0.1:9000"}),
+        )
+        .unwrap();
+        assert!(!merged.agent_review);
+        assert_eq!(merged.mcp_addr.as_deref(), Some("127.0.0.1:9000"));
+        assert_eq!(merged.cpu_percent, 40);
+        assert_eq!(merged.theme, base.theme);
+        assert!(merged.mcp_require_token);
+        let cleared = merge(&merged, &serde_json::json!({"mcp_addr": null})).unwrap();
+        assert_eq!(cleared.mcp_addr, None, "null goes back to the default");
+    }
+
+    #[test]
+    fn a_bad_address_or_token_is_refused() {
+        let base = Settings::default();
+        for bad in ["7777", "example.com:80", "", "127.0.0.1"] {
+            assert!(merge(&base, &serde_json::json!({ "mcp_addr": bad })).is_err(), "{bad:?}");
+        }
+        assert!(merge(&base, &serde_json::json!({"mcp_token": "short"})).is_err());
+        assert!(merge(&base, &serde_json::json!({"mcp_token": "a".repeat(40)})).is_ok());
+        assert!(merge(&base, &serde_json::json!({"mcp_enabled": "yes"})).is_err());
+    }
+
+    #[test]
+    fn the_server_cannot_be_opened_to_the_network_without_a_token() {
+        let base = Settings::default();
+        let err = merge(
+            &base,
+            &serde_json::json!({"mcp_addr": "0.0.0.0:7777", "mcp_require_token": false}),
+        )
+        .unwrap_err();
+        assert!(err.contains("0.0.0.0:7777") && err.contains("token"), "{err}");
+        assert!(
+            merge(&base, &serde_json::json!({"mcp_addr": "0.0.0.0:7777"})).is_ok(),
+            "with the token it may"
+        );
+        assert!(
+            merge(&base, &serde_json::json!({"mcp_require_token": false})).is_ok(),
+            "loopback needs none"
+        );
+        let open = Settings {
+            mcp_addr: Some("0.0.0.0:7777".to_string()),
+            ..Settings::default()
+        };
+        let err = merge(&open, &serde_json::json!({"mcp_require_token": false})).unwrap_err();
+        assert!(err.contains("token"), "{err}");
+    }
+
+    #[test]
+    fn a_stored_oddity_does_not_block_an_unrelated_patch() {
+        let odd = Settings {
+            mcp_addr: Some("not an address".to_string()),
+            ..Settings::default()
+        };
+        let merged = merge(&odd, &serde_json::json!({"safe_areas": true})).unwrap();
+        assert!(
+            merged.safe_areas,
+            "only a patch that touches the agent's door is held to its rules"
+        );
+    }
+
+    #[test]
+    fn the_agent_review_switch_is_one_the_agent_tools_read() {
+        let before = agent_review();
+        set_agent_review(false);
+        assert!(!agent_review());
+        set_agent_review(true);
+        assert!(agent_review());
+        set_agent_review(before);
     }
 }

@@ -56,8 +56,10 @@ base64 = "0.23.1"
 rmcp.workspace = true
 schemars.workspace = true
 axum.workspace = true
+tokio-util.workspace = true
+getrandom.workspace = true
 anyhow.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "time"] }
 
 # Detached panels need two things from WebKitGTK that wry does not do: let a script open a
 # window without a user gesture, and close the window when the page closes its webview.

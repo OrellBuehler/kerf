@@ -204,6 +204,19 @@
 				refreshing = false;
 			}
 		}
+		/** Another project is open now (an agent swapped it): forget the selection and what the session
+		 *  remembered about the last one, and load the new project as an open does. */
+		async function onProjectReplaced() {
+			editor.selectedAssetId = null;
+			editor.selectedClipId = null;
+			editor.selectedClipIds = [];
+			editor.selectedOverlayId = null;
+			editor.selectedSvgOverlayId = null;
+			await editor.load();
+			ui.projectReplaced();
+			await agent.load();
+			toast.info(`The agent switched to ${editor.projectName}`);
+		}
 		/** The flag changed behind our back (an agent set it): re-read it, and say so
 		 *  — it is the user's own toolbar setting that moved. */
 		async function onRippleChanged() {
@@ -246,6 +259,10 @@
 					// otherwise only read at launch, so the picker would keep
 					// showing the previous model until the next start.
 					await listen('speech-model-changed', () => void ui.loadTranscriptionStatus()),
+					// An agent opened, started or saved-as a project through MCP: the same swap the
+					// menu does, so reload everything it showed (the backend already refused to drop
+					// unsaved work unless the agent was told to).
+					await listen('project-replaced', () => void onProjectReplaced()),
 					// Likewise the ripple flag: an agent that flips it changes what
 					// the user's next trim or delete does, so the toolbar has to say.
 					await listen('ripple-mode-changed', () => void onRippleChanged()),
