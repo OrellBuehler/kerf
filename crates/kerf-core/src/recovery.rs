@@ -146,7 +146,7 @@ pub fn scan(root: &Path, skip: Option<&str>) -> Vec<Recoverable> {
             Seen::Empty | Seen::Skipped => {}
         }
     }
-    found.sort_by(|a, b| b.info.modified_at.cmp(&a.info.modified_at));
+    found.sort_by_key(|r| std::cmp::Reverse(r.info.modified_at));
     found
 }
 

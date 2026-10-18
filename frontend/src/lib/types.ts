@@ -1192,6 +1192,18 @@ export interface StemsResult {
  *  there — never created, so the page says so instead. */
 export type LaunchRequest = { open: string } | { missing: string };
 
+/** An untitled project a crashed Kerf left behind (kerf-core `RecoveryInfo`), offered at launch. */
+export interface RecoveryInfo {
+	id: string;
+	/** When its file was last written (ISO 8601), if known. */
+	modified_at: string | null;
+	assets: number;
+	clips: number;
+	/** Edits in its history, the initial state not counted. */
+	edits: number;
+	last_edit: string | null;
+}
+
 /** A newer signed release found on GitHub by the updater. */
 export interface UpdateInfo {
 	/** The available version, e.g. `0.18.0`. */

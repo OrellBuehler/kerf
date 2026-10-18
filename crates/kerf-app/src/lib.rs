@@ -16,6 +16,7 @@
 mod gpu_preview;
 mod mcp;
 mod popout;
+mod recovery;
 mod settings;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -201,15 +202,21 @@ fn project_path(state: State<'_, AppState>) -> CmdResult<Option<String>> {
     Ok(state.project().path().map(|p| p.display().to_string()))
 }
 
-/// Replace the open project with a fresh, empty in-memory one (no sample data).
-/// Like the seeded sample it isn't persisted until `save_project_as`. The GUI and
-/// the embedded MCP server share this `Project`, so both switch to it.
-#[tauri::command(async)]
-fn new_project(state: State<'_, AppState>) -> CmdResult<Option<String>> {
-    let mut project = state.project();
-    project.replace_with(Project::open_in_memory().map_err(|e| e.to_string())?);
-    state.scrub.clear();
-    Ok(project.path().map(|p| p.display().to_string()))
+/// Replace the open project with a fresh, empty untitled one (no sample data), backed by a
+/// crash-recovery file (`recovery.rs`) but not saved until `save_project_as`. The GUI and the
+/// embedded MCP server share this `Project`, so both switch to it.
+#[tauri::command]
+async fn new_project(app: AppHandle, state: State<'_, AppState>) -> CmdResult<Option<String>> {
+    let shared = state.project.clone();
+    let scrub = state.scrub.clone();
+    blocking(move || {
+        let fresh = recovery::untitled(&app)?;
+        let mut project = lock_user(&shared);
+        project.replace_with(fresh);
+        scrub.clear();
+        Ok(project.path().map(|p| p.display().to_string()))
+    })
+    .await
 }
 
 /// Open an existing `.kerf` file, replacing the in-memory project. Both the GUI
@@ -278,7 +285,7 @@ async fn save_project_as(state: State<'_, AppState>, path: String) -> CmdResult<
         if project_fingerprint(&project)? == before {
             project.replace_with(opened);
         } else {
-            // Close the stale copy first: `save_as` deletes the file it replaces,
+            // Close the stale copy first: `save_as` renames over the file it replaces,
             // which Windows refuses while it is open.
             drop(opened);
             project.save_as(&path).map_err(|e| e.to_string())?;
@@ -3425,12 +3432,15 @@ pub fn run() {
             scrub: scrub.clone(),
         })
         .manage(popout::PopoutState::default())
+        .manage(Mutex::new(recovery::RecoveryState::default()))
         .on_window_event(popout::on_window_event)
         .setup(move |app| {
             // Logging needs the resolved app data directory, so set it up here
             // (before anything else in setup) rather than at the top of `run`.
             init_logging(app.handle());
             install_panic_hook();
+            // The untitled project moves into a crash-recovery file before anything can edit it.
+            recovery::start(app.handle());
             // The editor window is built here, not by Tauri from the config (`create:
             // false` there): only a builder can carry the handler that lets a panel
             // be detached into a window of its own. Otherwise exactly what the config
@@ -3643,6 +3653,9 @@ pub fn run() {
             log_frontend,
             show_main_window,
             take_launch_project,
+            recovery::list_recoveries,
+            recovery::recover_project,
+            recovery::discard_recovery,
             popout::popout_expect,
             popout::popout_cancel,
             popout::close_popout,
@@ -3651,10 +3664,11 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building Kerf")
-        .run(|_app, event| {
+        .run(|app, event| {
             // The logfile's last line then says whether the end was a clean exit
             // or a crash.
             if let tauri::RunEvent::Exit = event {
+                recovery::on_exit(app);
                 tracing::info!("kerf exiting");
             }
         });

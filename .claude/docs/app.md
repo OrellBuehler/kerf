@@ -205,6 +205,21 @@ separate permission), so it is listed in object form with an `allow` entry for
 `https://github.com/OrellBuehler/kerf/*` — without a scope every `openUrl` call
 comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 
+**Crash recovery** (`recovery.rs`): the untitled project is never only in memory. `setup` resolves
+`<app data>/recovery` (the debug identity's own data dir, so a dev run never touches an installed Kerf's
+sessions) and swaps the launch's empty project for `Project::create_recovery` there — in `setup`, not at
+the top of `run()`, because a second launch is handed to the first by the single-instance plugin before
+`setup` and must not make a session. `new_project` (now `async` + `blocking`) makes a fresh session the
+same way (`recovery::untitled`; no data dir or no file locking falls back to in-memory). Replacing the
+project (`replace_with`: Open, New, Save As, Recover) deletes the old session, and a clean exit
+(`RunEvent::Exit`) does too — the close guard already asked about unsaved work; a crash leaves it.
+`list_recoveries` scans once per run (`kerf_core::recovery::scan`, skipping our own session) and keeps
+what it found **locked** in `RecoveryState` until `recover_project { id }` (opens it as the untitled
+project, like `open_project`: scrub cleared, speech model restored, proxies queued) or
+`discard_recovery { id }` (deletes it); one left alone is offered again next launch. No MCP tools —
+recovery is the user's call at launch. `project_path` stays `null` for a recovery-backed project, so
+the GUI still treats it as unsaved.
+
 **Scrubbed frames.** `get_timeline_frame` and the GPU preview's JPEG route go through `AppState.scrub`, one
 `kerf_core::ScrubFrames` per process: the frame of the cut's grid that holds the time, from a bounded cache or from
 the window of neighbours one process draws for it (`engine-cli.md`, "Scrubbed frames"). `start_playback` stops the

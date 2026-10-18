@@ -148,7 +148,7 @@ mod tests {
                 time: f64::NAN,
                 name: "m".into(),
                 color: None,
-            })
+            });
         });
     }
 
@@ -165,7 +165,7 @@ mod tests {
             t.tracks[0].clips[1].transition_in = Some(Transition {
                 kind: TransitionKind::Crossfade,
                 duration: -0.5,
-            })
+            });
         });
     }
 
