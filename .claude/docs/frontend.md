@@ -1,6 +1,6 @@
 # Frontend (`frontend/`)
 
-SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout quirks:
+SvelteKit 3 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout quirks:
 - **No `svelte.config.js`** — adapter and compiler options live inline in
   `vite.config.ts` via the `sveltekit()` plugin (new-style config). Static SPA via
   `adapter-static` (fallback `index.html`); `+layout.ts` sets `ssr = false` +
