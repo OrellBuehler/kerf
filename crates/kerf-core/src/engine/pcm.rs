@@ -69,8 +69,20 @@ impl AudioBuffer {
 
 /// The ffmpeg arguments that decode `path`'s first audio stream to interleaved f32le
 /// at `sample_rate` in `channels` channels on stdout. Pure.
-fn decode_args(path: &Path, sample_rate: u32, channels: u16) -> Vec<std::ffi::OsString> {
-    let mut args: Vec<std::ffi::OsString> = ["-hide_banner", "-loglevel", "error", "-i"].iter().map(Into::into).collect();
+/// `window` (`(start, seconds)` of source time) is an input-side seek and length.
+fn decode_args(path: &Path, window: Option<(f64, f64)>, sample_rate: u32, channels: u16) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = ["-hide_banner", "-loglevel", "error"].iter().map(Into::into).collect();
+    if let Some((start, secs)) = window {
+        for a in [
+            "-ss".to_string(),
+            format!("{start:.6}"),
+            "-t".to_string(),
+            format!("{secs:.6}"),
+        ] {
+            args.push(a.into());
+        }
+    }
+    args.push("-i".into());
     args.push(path.as_os_str().to_owned());
     for a in [
         "-map",
@@ -103,15 +115,61 @@ pub fn decode_audio_cancellable(path: &Path, sample_rate: u32, channels: u16, ca
             "decode needs a sample rate and a channel count".to_string(),
         ));
     }
-    let bin = ffmpeg_bin();
     let cpu = cpu::lease_waiting(&mut |_| {}, cancel)?;
     if cancel() {
         return Err(Error::Cancelled);
     }
+    decode_with(
+        decode_args(path, None, sample_rate, channels),
+        sample_rate,
+        channels,
+        &cpu,
+        cancel,
+    )
+}
+
+/// [`decode_audio`] of `secs` seconds from `start` (source seconds; an input-side seek,
+/// exact for audio), run on the heavy-job slot the caller already holds. `cancel` stops the
+/// decode while ffmpeg runs ([`Error::Cancelled`]); a stalled decode is killed.
+pub fn decode_audio_window(
+    path: &Path,
+    start: f64,
+    secs: f64,
+    sample_rate: u32,
+    channels: u16,
+    cpu: &cpu::Lease,
+    cancel: &dyn Fn() -> bool,
+) -> Result<AudioBuffer> {
+    if sample_rate == 0 || channels == 0 || !start.is_finite() || !secs.is_finite() || secs <= 0.0 {
+        return Err(Error::InvalidArgument(
+            "decode needs a sample rate, a channel count and a window".to_string(),
+        ));
+    }
+    if cancel() {
+        return Err(Error::Cancelled);
+    }
+    let window = Some((start.max(0.0), secs));
+    decode_with(
+        decode_args(path, window, sample_rate, channels),
+        sample_rate,
+        channels,
+        cpu,
+        cancel,
+    )
+}
+
+fn decode_with(
+    args: Vec<std::ffi::OsString>,
+    sample_rate: u32,
+    channels: u16,
+    cpu: &cpu::Lease,
+    cancel: &dyn Fn() -> bool,
+) -> Result<AudioBuffer> {
+    let bin = ffmpeg_bin();
     let mut cmd = bg_command(&bin);
     cpu::limit_cmd(&mut cmd, cpu.threads());
     let child = cmd
-        .args(decode_args(path, sample_rate, channels))
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -186,8 +244,21 @@ mod tests {
     }
 
     #[test]
+    fn a_window_seeks_and_bounds_the_input() {
+        let args: Vec<String> = decode_args(Path::new("a.wav"), Some((1.5, 2.25)), 16_000, 1)
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let joined = args.join(" ");
+        assert!(
+            joined.starts_with("-hide_banner -loglevel error -ss 1.500000 -t 2.250000 -i a.wav -map 0:a:0 -ac 1 -ar 16000"),
+            "{joined}"
+        );
+    }
+
+    #[test]
     fn decode_args_ask_for_interleaved_f32_at_the_rate() {
-        let args: Vec<String> = decode_args(Path::new("a.wav"), 22_050, 2)
+        let args: Vec<String> = decode_args(Path::new("a.wav"), None, 22_050, 2)
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();

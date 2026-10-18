@@ -126,6 +126,18 @@ describe('what a typed time means', () => {
 		}
 	});
 
+	test('at a drop-frame rate the readout is drop-frame, and a field reads it back to the frame across the dropped labels', () => {
+		const fps = 30000 / 1001;
+		expect(formatTime(1800 / fps, fps)).toBe('00;01;00;02');
+		expect(formatTime(1800 / fps, fps, 'seconds')).toBe(clock(1800 / fps));
+		for (const frame of [0, 1, 1799, 1800, 1801, 3598, 17981, 17982, 107892, 200000]) {
+			const t = frame / fps;
+			expect([frame, parseFrameTime(formatTime(t, fps), fps)]).toEqual([frame, expect.closeTo(t, 6)]);
+			expect([frame, parseFrameTime(formatField(t, fps), fps)]).toEqual([frame, expect.closeTo(t, 6)]);
+		}
+		expect(parseTime('00:01:00:00', fps)).toBeCloseTo(1800 / fps, 9);
+	});
+
 	test('a field that is a frame position puts what was typed on a frame', () => {
 		expect(parseFrameTime('4.6', 30)).toBeCloseTo(4.6, 9);
 		expect(parseFrameTime('4.62', 30)).toBeCloseTo(139 / 30, 9);

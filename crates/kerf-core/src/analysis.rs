@@ -61,7 +61,8 @@ fn waiting(wait: crate::engine::cpu::Wait) -> AnalysisProgress {
     }
 }
 
-/// Wait for the heavy-job slot in the background lane, saying why through `progress`, and
+/// Wait for the heavy-job slot in this thread's lane (the background lane, under
+/// `cpu::in_background` as analysis and refinement run), saying why through `progress`, and
 /// give up if `cancel` turns true while queued.
 fn wait_for_slot(progress: ProgressFn, cancel: CancelFn) -> Result<crate::engine::cpu::Lease> {
     crate::engine::cpu::lease_waiting(&mut |w| progress(waiting(w)), cancel)
@@ -97,6 +98,12 @@ pub trait SceneDetector: Send + Sync {
 /// first run, download a model — so unlike its siblings it reports progress.
 pub trait Transcriber: Send + Sync {
     fn transcribe(&self, asset: &Asset, progress: ProgressFn, cancel: CancelFn) -> Result<Vec<TranscriptSegment>>;
+
+    /// Whether [`Transcriber::transcribe`] already timed the words to the speech and labelled
+    /// the speakers, from the audio it decoded anyway, so nothing need decode it again.
+    fn refines(&self) -> bool {
+        false
+    }
 }
 
 /// Measures EBU R128 loudness of an asset's audio (`None` for silent / video-only
@@ -267,7 +274,10 @@ impl Transcriber for WhisperTranscriber {
         if cancel() {
             return Err(Error::Cancelled);
         }
-        let samples = crate::engine::decode_audio_16k_mono_cancellable(std::path::Path::new(&asset.path), cancel)?;
+        let samples = std::sync::Arc::new(crate::engine::decode_audio_16k_mono_cancellable(
+            std::path::Path::new(&asset.path),
+            cancel,
+        )?);
         let language = self.language.clone();
         // In-process inference is as CPU-hungry as the ffmpeg filter backend, so
         // it takes the same heavy-job slot and the same share of the cores. The
@@ -280,15 +290,24 @@ impl Transcriber for WhisperTranscriber {
         // for the whole inference — so run it on a worker and pump percentages
         // back over a channel instead of holding a borrow across the call.
         let (tx, rx) = std::sync::mpsc::channel::<i32>();
-        let worker = std::thread::spawn(move || run_whisper_rs(samples, model, language, threads, tx));
+        let audio = std::sync::Arc::clone(&samples);
+        let worker = std::thread::spawn(move || run_whisper_rs(&audio, model, language, threads, tx));
         for pct in rx {
             progress(AnalysisProgress::with_fraction("transcribe", pct as f64 / 100.0));
         }
-        let segments = worker
+        let mut segments = worker
             .join()
             .map_err(|_| Error::Engine("whisper: transcription thread panicked".to_string()))??;
         progress(AnalysisProgress::with_fraction("transcribe", 1.0));
+        if !segments.is_empty() {
+            progress(refining());
+            crate::transcript::refine(&samples, &mut segments);
+        }
         Ok(segments)
+    }
+
+    fn refines(&self) -> bool {
+        true
     }
 }
 
@@ -296,7 +315,7 @@ impl Transcriber for WhisperTranscriber {
 /// [`WhisperTranscriber::transcribe`]; `progress` receives 0..=100 percentages.
 #[cfg(feature = "whisper")]
 fn run_whisper_rs(
-    samples: Vec<f32>,
+    samples: &[f32],
     model: std::path::PathBuf,
     language: Option<String>,
     threads: usize,
@@ -320,15 +339,18 @@ fn run_whisper_rs(
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
+    // Per-token times, from which each segment's words are assembled.
+    params.set_token_timestamps(true);
     params.set_progress_callback_safe(move |pct: i32| {
         // The receiver is gone only if the caller gave up; dropping is fine.
         let _ = progress.send(pct);
     });
 
     state
-        .full(params, &samples)
+        .full(params, samples)
         .map_err(|e| Error::Engine(format!("whisper: inference failed: {e}")))?;
 
+    let eot = ctx.token_eot();
     let mut segments = Vec::new();
     for i in 0..state.full_n_segments() {
         let Some(segment) = state.get_segment(i) else { continue };
@@ -343,10 +365,30 @@ fn run_whisper_rs(
             continue;
         }
         // whisper timestamps are in centiseconds.
+        let (start, end) = (
+            segment.start_timestamp() as f64 / 100.0,
+            segment.end_timestamp() as f64 / 100.0,
+        );
+        // Text tokens only: the special ones (end of text, timestamps, language…) sort after it.
+        let tokens: Vec<crate::transcript::TokenTiming> = (0..segment.n_tokens())
+            .filter_map(|t| segment.get_token(t))
+            .filter(|t| t.token_id() < eot)
+            .filter_map(|t| {
+                let data = t.token_data();
+                Some(crate::transcript::TokenTiming {
+                    bytes: t.to_bytes().ok()?.to_vec(),
+                    start: data.t0 as f64 / 100.0,
+                    end: data.t1 as f64 / 100.0,
+                    p: data.p,
+                })
+            })
+            .collect();
         segments.push(TranscriptSegment {
-            start: segment.start_timestamp() as f64 / 100.0,
-            end: segment.end_timestamp() as f64 / 100.0,
+            start,
+            end,
             text,
+            words: crate::transcript::words_from_tokens(&tokens, start, end),
+            ..Default::default()
         });
     }
     Ok(segments)
@@ -505,6 +547,76 @@ struct VoiceoverScript;
 impl Transcriber for VoiceoverScript {
     fn transcribe(&self, asset: &Asset, _progress: ProgressFn, _cancel: CancelFn) -> Result<Vec<TranscriptSegment>> {
         Ok(asset.voiceover.as_ref().map(|v| v.segments.clone()).unwrap_or_default())
+    }
+}
+
+/// The progress a refinement reports while it works.
+fn refining() -> AnalysisProgress {
+    AnalysisProgress {
+        stage: "transcribe".to_string(),
+        fraction: None,
+        detail: Some("timing words and labelling speakers".to_string()),
+    }
+}
+
+/// Re-time a transcript's words to the speech energy and label its speakers, from one
+/// 16 kHz mono decode of the asset (see [`crate::transcript`]). No model, so it is cheap next
+/// to transcription, but it is a whole-file decode: it waits in the background lane for the
+/// heavy-job slot (saying so through `progress`, giving up on `cancel`) and holds it. Static,
+/// for a caller that has released the project lock.
+pub fn refine_transcript_media(
+    asset: &Asset,
+    mut segments: Vec<TranscriptSegment>,
+    progress: ProgressFn,
+    cancel: CancelFn,
+) -> Result<Vec<TranscriptSegment>> {
+    crate::transcript::ensure_words(&mut segments);
+    if segments.is_empty() || !asset.has_audio() {
+        return Ok(segments);
+    }
+    crate::engine::cpu::in_background(|| {
+        let _slot = wait_for_slot(progress, cancel)?;
+        if cancel() {
+            return Err(Error::Cancelled);
+        }
+        progress(refining());
+        let audio = crate::engine::decode_audio_cancellable(
+            std::path::Path::new(&asset.path),
+            crate::transcript::SAMPLE_RATE,
+            1,
+            cancel,
+        )?;
+        if cancel() {
+            return Err(Error::Cancelled);
+        }
+        crate::transcript::refine(&audio.samples, &mut segments);
+        Ok(segments)
+    })
+}
+
+/// A transcriber whose lines come back with their words timed to the speech and their
+/// speakers labelled. A refinement that does not finish — a failed decode, or a cancel or a
+/// long wait for the slot cut short — keeps the transcript, with words spread by character
+/// share and no speakers: the transcription is the expensive part and is never thrown away.
+struct Refined(Box<dyn Transcriber>);
+
+impl Transcriber for Refined {
+    fn transcribe(&self, asset: &Asset, progress: ProgressFn, cancel: CancelFn) -> Result<Vec<TranscriptSegment>> {
+        let mut segments = self.0.transcribe(asset, progress, cancel)?;
+        if self.0.refines() {
+            crate::transcript::ensure_words(&mut segments);
+            return Ok(segments);
+        }
+        match refine_transcript_media(asset, segments.clone(), progress, cancel) {
+            Ok(refined) => Ok(refined),
+            Err(e) => {
+                if !matches!(e, Error::Cancelled) {
+                    tracing::warn!(error = %e, "could not time words or label speakers; keeping the transcript");
+                }
+                crate::transcript::ensure_words(&mut segments);
+                Ok(segments)
+            }
+        }
     }
 }
 
@@ -849,10 +961,12 @@ pub fn analyze_asset_steps(
     let transcriber: Box<dyn Transcriber> = if !kinds.contains(&AnalysisKind::Transcript) {
         Box::new(NullAnalyzer)
     } else if asset.voiceover.is_some() {
-        Box::new(VoiceoverScript)
+        Box::new(Refined(Box::new(VoiceoverScript)))
     } else {
-        default_transcriber()
-            .unwrap_or_else(|| Box::new(UnavailableTranscriber(transcription_backend().err().unwrap_or_default())))
+        match default_transcriber() {
+            Some(t) => Box::new(Refined(t)),
+            None => Box::new(UnavailableTranscriber(transcription_backend().err().unwrap_or_default())),
+        }
     };
     let providers = AnalysisProviders {
         silence: &silence,
@@ -1066,6 +1180,7 @@ mod tests {
                 start: 0.0,
                 end: 1.0,
                 text: "hello".to_string(),
+                ..Default::default()
             }])
         }
     }
@@ -1630,5 +1745,83 @@ mod tests {
         assert_eq!(nobackend.kinds[4].state, AnalysisState::Off);
         assert_eq!(nobackend.kinds[4].reason.as_deref(), Some("no speech-to-text backend"));
         assert_eq!(nobackend.kinds[0].state, AnalysisState::NotRun);
+    }
+
+    struct Canned;
+
+    impl Transcriber for Canned {
+        fn transcribe(&self, _: &Asset, _: ProgressFn, _: CancelFn) -> Result<Vec<TranscriptSegment>> {
+            Ok(vec![TranscriptSegment {
+                start: 0.0,
+                end: 2.0,
+                text: "hello there".into(),
+                ..Default::default()
+            }])
+        }
+    }
+
+    /// A refinement that does not finish — stopped while queued, or a decode that fails (the
+    /// asset's file is not there) — keeps the finished transcription, with estimated words.
+    #[test]
+    fn a_refinement_that_does_not_finish_keeps_the_transcription() {
+        let mut a = asset();
+        a.path = "/no-such-kerf-refine.wav".into();
+        let stopped: CancelFn = &|| true;
+        for cancel in [stopped, NEVER_CANCEL] {
+            let out = Refined(Box::new(Canned)).transcribe(&a, &mut |_| {}, cancel).unwrap();
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].words.len(), 2);
+            assert!(out[0].words.iter().all(|w| w.estimated));
+            assert_eq!(out[0].speaker, None);
+        }
+        assert!(matches!(
+            refine_transcript_media(&a, Canned.transcribe(&a, &mut |_| {}, stopped).unwrap(), &mut |_| {}, stopped),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn refining_a_silent_asset_only_estimates_its_words() {
+        let a = crate::engine::test_support::test_asset(vec![crate::engine::test_support::video_stream(1920, 1080, 30.0)]);
+        let lines = Canned.transcribe(&a, &mut |_| {}, NEVER_CANCEL).unwrap();
+        let out = refine_transcript_media(&a, lines, &mut |_| {}, &|| true).unwrap();
+        assert_eq!(out[0].words.len(), 2);
+        assert_eq!(out[0].speaker, None);
+    }
+
+    /// The refinement through the real ffmpeg decode: a 48 kHz stereo WAV with a tone in two
+    /// stretches comes back with its estimated words tightened to the tone and one speaker.
+    #[test]
+    #[ignore = "drives the ffmpeg binary"]
+    fn refining_decodes_the_asset_and_tightens_its_words() {
+        let dir = std::env::temp_dir().join(format!("kerf-refine-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("speech.wav");
+        let rate = 48_000u32;
+        let mut samples = Vec::new();
+        for i in 0..3 * rate as usize {
+            let t = i as f32 / rate as f32;
+            let v = if (0.5..1.0).contains(&t) || (1.5..2.5).contains(&t) {
+                0.3 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
+            } else {
+                0.0001
+            };
+            samples.extend([v, v]);
+        }
+        crate::engine::write_wav(&path, &crate::engine::AudioBuffer::new(rate, 2, samples)).unwrap();
+        let mut a = asset();
+        a.path = path.to_string_lossy().into_owned();
+        let line = TranscriptSegment {
+            start: 0.0,
+            end: 3.0,
+            text: "hello there".into(),
+            ..Default::default()
+        };
+        let out = refine_transcript_media(&a, vec![line], &mut |_| {}, NEVER_CANCEL).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let words = &out[0].words;
+        assert_eq!(words.len(), 2);
+        assert!(words[0].start >= 0.49 && words[1].end <= 2.51, "{words:?}");
+        assert_eq!(out[0].speaker.as_deref(), Some("S1"));
     }
 }

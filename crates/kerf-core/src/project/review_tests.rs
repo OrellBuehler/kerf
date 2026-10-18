@@ -574,7 +574,12 @@ fn an_edit_that_leaves_a_non_finite_number_is_refused_live_and_staged() {
     };
     let before = (revisions(&p), p.timeline_json().unwrap());
     let err = p.edit_timeline("poison", poison).unwrap_err().to_string();
-    assert!(err.contains("volume") && err.contains("finite"), "{err}");
+    // The timeline check (`Timeline::check_new`) and the finite guard both refuse it; either
+    // wording names the volume and says it is not a number.
+    assert!(
+        err.contains("volume") && (err.contains("finite") || err.contains("not a number")),
+        "{err}"
+    );
     assert_eq!((revisions(&p), p.timeline_json().unwrap()), before);
     assert_eq!(volume(&p, c1.id), 1.0);
 
@@ -1045,15 +1050,15 @@ fn the_change_counter_keeps_counting_across_a_swapped_in_project() {
     }
     let before = shared.change_count();
     // The new project's own connection starts again from a handful of schema rows.
-    shared.replace_with(Project::open_in_memory().unwrap());
+    shared.replace_with(Project::open_in_memory().unwrap()).close();
     let after = shared.change_count();
     assert!(after > before, "{after} must not repeat or fall below {before}");
     shared.set_ripple_mode(true).unwrap();
     assert!(shared.change_count() > after);
     // Two swaps in a row (an open that was replaced at once) still only go up.
     let mid = shared.change_count();
-    shared.replace_with(Project::open_in_memory().unwrap());
-    shared.replace_with(Project::open_in_memory().unwrap());
+    shared.replace_with(Project::open_in_memory().unwrap()).close();
+    shared.replace_with(Project::open_in_memory().unwrap()).close();
     assert!(shared.change_count() > mid);
 }
 
@@ -1062,10 +1067,10 @@ fn the_generation_moves_when_a_project_is_swapped_in_and_the_review_setting_stay
     let mut shared = Project::open_in_memory().unwrap();
     shared.set_agent_review(false);
     let g = shared.generation();
-    shared.replace_with(Project::open_in_memory().unwrap());
+    shared.replace_with(Project::open_in_memory().unwrap()).close();
     assert_eq!(shared.generation(), g + 1);
     assert!(!shared.agent_review(), "the app's setting belongs to the app, not the file");
-    shared.replace_with(Project::open_in_memory().unwrap());
+    shared.replace_with(Project::open_in_memory().unwrap()).close();
     assert_eq!(shared.generation(), g + 2);
 }
 
@@ -1078,7 +1083,7 @@ fn a_saved_copy_swapped_in_is_the_same_project_so_its_generation_stays() {
     let before = shared.change_count();
     let copy = dir.join("copy.kerf");
     shared.save_as(&copy).unwrap();
-    shared.replace_with_saved_copy(Project::open(&copy).unwrap());
+    shared.replace_with_saved_copy(Project::open(&copy).unwrap()).close();
     assert_eq!(shared.generation(), g, "a job that noted it still lands");
     assert!(shared.change_count() > before, "the change counter keeps going up");
     assert!(!shared.agent_review(), "the app's setting stays");
@@ -1090,7 +1095,7 @@ fn a_saved_copy_swapped_in_is_the_same_project_so_its_generation_stays() {
     assert!(shared.get_analysis(a.id).unwrap().is_some());
 
     // Any other project is another generation.
-    shared.replace_with(Project::open_in_memory().unwrap());
+    shared.replace_with(Project::open_in_memory().unwrap()).close();
     assert_eq!(shared.generation(), g + 1);
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -2047,13 +2052,13 @@ fn a_discarded_proposal_is_not_offered_again_in_a_project_that_is_opened_afresh(
     // Opening the file keeps it (Save As reopens a copy)…
     assert!(Project::open(&path).unwrap().discarded_staged().unwrap().is_some());
     let mut shared = Project::open_in_memory().unwrap();
-    shared.replace_with_saved_copy(Project::open(&path).unwrap());
+    shared.replace_with_saved_copy(Project::open(&path).unwrap()).close();
     assert!(
         shared.discarded_staged().unwrap().is_some(),
         "the same project, in another file"
     );
     // …making it the project the app has open does not.
-    shared.replace_with(Project::open(&path).unwrap());
+    shared.replace_with(Project::open(&path).unwrap()).close();
     assert!(shared.discarded_staged().unwrap().is_none());
     assert!(
         Project::open(&path).unwrap().discarded_staged().unwrap().is_none(),
@@ -2142,6 +2147,8 @@ fn a_project_staged_by_an_older_kerf_opens_with_its_proposal_intact() {
                      created_at TEXT NOT NULL, updated_at TEXT NOT NULL);",
             )
             .unwrap();
+        // A build from before the v1 -> v2 schema step stamped it with the version it knew.
+        p.conn.pragma_update(None, "user_version", 1).unwrap();
         p.conn
             .execute(
                 "INSERT INTO staged (id, base_seq, base, timeline, edits, task_id, note, created_at, updated_at)

@@ -12,7 +12,7 @@ import {
 	tickLabel,
 	ticksIn
 } from './ruler';
-import { formatTimecode } from './timecode';
+import { formatFrames, formatTimecode, timecodeRate } from './timecode';
 import { ZOOM_MAX, ZOOM_MIN } from './zoom';
 
 const RATES = [24, 25, 30, 60, 30000 / 1001, 24000 / 1001];
@@ -94,11 +94,27 @@ describe('rulerStep', () => {
 	});
 
 	test('at a fractional rate a labelled second is on a frame, not a hair off it', () => {
-		const fps = 30000 / 1001;
+		const fps = 24000 / 1001;
 		const g = rulerGrid(36, fps);
-		expect(g.step).toBeCloseTo((5 * 30) / fps, 12);
+		expect(g.step).toBeCloseTo((5 * 24) / fps, 12);
 		expect(g.step).toBeGreaterThan(5);
 		for (let k = 0; k < 500; k++) expect(tickLabel(k, g, fps)).toBe(hms(k * 5));
+	});
+
+	test('at a drop-frame rate a label is the drop-frame timecode of its frame, as the playhead reads it', () => {
+		for (const fps of [30000 / 1001, 60000 / 1001]) {
+			const r = timecodeRate(fps);
+			for (const z of [36, 2, ZOOM_MAX]) {
+				const g = rulerGrid(z, fps);
+				const f = Math.round(g.step * fps);
+				for (let k = 0; k < 2000; k += 7) {
+					expect(tickLabel(k, g, fps)).toBe(formatFrames(r, k * f));
+					expect(tickLabel(k, g, fps)).toBe(formatTimecode(k * g.step, fps));
+				}
+			}
+		}
+		// Past the first minute the labels are drop-frame: 00;01;00;00 does not exist.
+		expect(tickLabel(12, rulerGrid(36, 30000 / 1001), 30000 / 1001)).toBe('00;01;00;02');
 	});
 });
 
@@ -222,7 +238,7 @@ describe('tickLabel', () => {
 			const nominal = nominalRate(fps);
 			const f = Math.round(g.step * fps);
 			for (let k = 0; k < 400; k++) {
-				const [, , s, ff] = tickLabel(k, g, fps).split(':').map(Number);
+				const [, , s, ff] = tickLabel(k, g, fps).split(/[:;]/).map(Number);
 				const frame = (Math.floor((k * f) / nominal) % 60) * nominal + ((k * f) % nominal);
 				expect(s * nominal + ff).toBe(frame);
 			}

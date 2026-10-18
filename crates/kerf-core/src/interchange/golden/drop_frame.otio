@@ -1,0 +1,209 @@
+{
+  "OTIO_SCHEMA": "Timeline.1",
+  "global_start_time": null,
+  "metadata": {
+    "kerf": {
+      "format": null,
+      "master": {
+        "ceiling_db": -1.5,
+        "limiter": false,
+        "volume": 1.0
+      },
+      "overlays": [],
+      "rate": 29.97002997002997,
+      "svg_overlays": []
+    }
+  },
+  "name": "Kerf drop_frame",
+  "tracks": {
+    "OTIO_SCHEMA": "Stack.1",
+    "children": [
+      {
+        "OTIO_SCHEMA": "Track.1",
+        "children": [
+          {
+            "OTIO_SCHEMA": "Clip.2",
+            "active_media_reference_key": "DEFAULT_MEDIA",
+            "effects": [],
+            "enabled": true,
+            "markers": [],
+            "media_references": {
+              "DEFAULT_MEDIA": {
+                "OTIO_SCHEMA": "ExternalReference.1",
+                "available_image_bounds": null,
+                "available_range": {
+                  "OTIO_SCHEMA": "TimeRange.1",
+                  "duration": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "rate": 29.97002997002997,
+                    "value": 17982.017982
+                  },
+                  "start_time": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "rate": 29.97002997002997,
+                    "value": 0.0
+                  }
+                },
+                "metadata": {
+                  "kerf": {
+                    "asset_id": "00000000-0000-0000-0000-000000000001"
+                  }
+                },
+                "name": "ntsc.mov",
+                "target_url": "file:///m/ntsc.mov"
+              }
+            },
+            "metadata": {
+              "kerf": {
+                "asset_id": "00000000-0000-0000-0000-000000000001",
+                "color": {
+                  "brightness": 0.0,
+                  "contrast": 1.0,
+                  "gamma": 1.0,
+                  "saturation": 1.0,
+                  "temperature": 0.0
+                },
+                "fade_in": 0.0,
+                "fade_out": 0.0,
+                "id": "00000000-0000-0000-0000-00000000000b",
+                "source_in": 0.0,
+                "source_out": 60.06,
+                "speed": 1.0,
+                "timeline_start": 0.0,
+                "transform": {
+                  "crop_bottom": 0.0,
+                  "crop_left": 0.0,
+                  "crop_right": 0.0,
+                  "crop_top": 0.0,
+                  "opacity": 1.0,
+                  "pos_x": 0.0,
+                  "pos_y": 0.0,
+                  "rotation": 0.0,
+                  "scale": 1.0
+                },
+                "transition_in": null,
+                "volume": 1.0
+              }
+            },
+            "name": "ntsc.mov",
+            "source_range": {
+              "OTIO_SCHEMA": "TimeRange.1",
+              "duration": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "rate": 29.97002997002997,
+                "value": 1800.0
+              },
+              "start_time": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "rate": 29.97002997002997,
+                "value": 0.0
+              }
+            }
+          },
+          {
+            "OTIO_SCHEMA": "Clip.2",
+            "active_media_reference_key": "DEFAULT_MEDIA",
+            "effects": [],
+            "enabled": true,
+            "markers": [],
+            "media_references": {
+              "DEFAULT_MEDIA": {
+                "OTIO_SCHEMA": "ExternalReference.1",
+                "available_image_bounds": null,
+                "available_range": {
+                  "OTIO_SCHEMA": "TimeRange.1",
+                  "duration": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "rate": 29.97002997002997,
+                    "value": 17982.017982
+                  },
+                  "start_time": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "rate": 29.97002997002997,
+                    "value": 0.0
+                  }
+                },
+                "metadata": {
+                  "kerf": {
+                    "asset_id": "00000000-0000-0000-0000-000000000001"
+                  }
+                },
+                "name": "ntsc.mov",
+                "target_url": "file:///m/ntsc.mov"
+              }
+            },
+            "metadata": {
+              "kerf": {
+                "asset_id": "00000000-0000-0000-0000-000000000001",
+                "color": {
+                  "brightness": 0.0,
+                  "contrast": 1.0,
+                  "gamma": 1.0,
+                  "saturation": 1.0,
+                  "temperature": 0.0
+                },
+                "fade_in": 0.0,
+                "fade_out": 0.0,
+                "id": "00000000-0000-0000-0000-00000000000c",
+                "source_in": 120.12,
+                "source_out": 130.13,
+                "speed": 1.0,
+                "timeline_start": 60.06,
+                "transform": {
+                  "crop_bottom": 0.0,
+                  "crop_left": 0.0,
+                  "crop_right": 0.0,
+                  "crop_top": 0.0,
+                  "opacity": 1.0,
+                  "pos_x": 0.0,
+                  "pos_y": 0.0,
+                  "rotation": 0.0,
+                  "scale": 1.0
+                },
+                "transition_in": null,
+                "volume": 1.0
+              }
+            },
+            "name": "ntsc.mov",
+            "source_range": {
+              "OTIO_SCHEMA": "TimeRange.1",
+              "duration": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "rate": 29.97002997002997,
+                "value": 300.0
+              },
+              "start_time": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "rate": 29.97002997002997,
+                "value": 3600.0
+              }
+            }
+          }
+        ],
+        "effects": [],
+        "enabled": true,
+        "kind": "Video",
+        "markers": [],
+        "metadata": {
+          "kerf": {
+            "duck": false,
+            "id": "00000000-0000-0000-0000-000000000065",
+            "locked": false,
+            "muted": false,
+            "pan": 0.0,
+            "solo": false,
+            "volume": 1.0
+          }
+        },
+        "name": "V1",
+        "source_range": null
+      }
+    ],
+    "effects": [],
+    "enabled": true,
+    "markers": [],
+    "metadata": {},
+    "name": "tracks",
+    "source_range": null
+  }
+}

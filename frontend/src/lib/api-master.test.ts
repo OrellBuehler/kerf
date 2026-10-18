@@ -6,6 +6,7 @@ import {
 	revertTo,
 	setMasterDuck,
 	setMasterLimiter,
+	setMasterTruePeak,
 	setMasterVolume,
 	setTrackVolume
 } from './api';
@@ -42,6 +43,12 @@ describe('the master bus (browser harness)', () => {
 		const off = await setMasterLimiter(false);
 		expect(off.master).toEqual({ volume: 1, limiter: false, ceiling_db: -3.5 });
 		expect((await setMasterLimiter(true)).master?.ceiling_db).toBe(-3.5);
+	});
+
+	test('true peak is written only while on, and alone it is a master of its own', async () => {
+		expect((await setMasterTruePeak(true)).master).toEqual({ volume: 1, limiter: false, ceiling_db: -1.5, true_peak: true });
+		expect((await setMasterTruePeak(false)).master).toBeUndefined();
+		expect((await getHistory()).find((h) => h.current)?.label).toBe('Limit sample peaks');
 	});
 
 	test('each move is one revision', async () => {

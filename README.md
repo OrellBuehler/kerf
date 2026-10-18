@@ -143,13 +143,16 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (147)
+### The tools (158)
 
 <details>
 <summary><b>See / analyze</b></summary>
 
-`list_assets` · `import_asset` · `get_asset_metadata` · `analyze_asset` · `get_transcript` ·
-`get_analysis_detail` · `get_timeline_state` · `timeline_summary` · `get_waveform` · `get_energy` ·
+`list_assets` · `import_asset` · `get_asset_metadata` · `analyze_asset` · `get_transcript` (lines with
+their speakers; the timed words on request) · `speaker_ranges` · `find_filler_words` · `refine_transcript` ·
+`get_analysis_detail` · `get_timeline_state` · `timeline_summary` · `get_editor_context` (what the user has
+selected and where the playhead is) · `get_scopes` (waveform / parade / vectorscope / histogram numbers of a
+frame) · `get_waveform` · `get_energy` ·
 **`get_frame`** (drill-in frame) · **`skim_asset`** (contact-sheet montage) ·
 **`preview_timeline`** (the composited cut) · **`preview_svg_overlay`** (an animated title
 as a contact sheet of moments) · `preview_svg_preset` · `validate_svg` — the bold ones return images the model
@@ -166,7 +169,7 @@ the frame at full source detail. Also `get_waveform_range` · `analysis_status` 
 `remove` · `ripple_delete` · `cut_clip_range` · `duplicate_clips` · `set_clip_enabled` ·
 `add_track` · `remove_track` · `set_track_duck` · `set_track_muted` · `set_track_solo` ·
 `set_track_locked` · `add_marker` · `update_marker` · `remove_marker` · `remove_silence` ·
-`snap_to_beats` · `smart_crop` · `extract_audio` · `concatenate` · `move_clips` · `remove_clips` ·
+`snap_to_beats` · `sync_clips_by_audio` · `smart_crop` · `extract_audio` · `concatenate` · `move_clips` · `remove_clips` ·
 `add_asset_audio` · `set_ripple_mode` · `plan_music_fit` · `fit_music` ·
 `detach_audio` · `detach_audio_clips` · `reattach_audio` · `reattach_audio_clips` ·
 `link_clips` · `unlink_clips`
@@ -176,20 +179,20 @@ the frame at full source detail. Also `get_waveform_range` · `analysis_status` 
 <summary><b>Style & animate</b></summary>
 
 `set_volume` · `set_fade` · `set_speed` · `set_transform` · `set_color` ·
-`set_transition` · `set_mask` · `set_video_effects` · `set_audio_effects` ·
+`set_grade` (curves, colour wheels, a .cube LUT) · `set_transition` · `set_mask` · `set_video_effects` · `set_audio_effects` ·
 `set_keyframes` · `add_keyframe` · `set_keyframe_easing` · `set_property_keyframes` · `copy_keyframes` · `clear_keyframes` · `set_reframe` · `clear_reframe` ·
 `set_reframe_keyframes` · `add_reframe_keyframe` · `set_track_volume` · `set_track_pan` ·
-`set_master_volume` · `set_master_limiter` · `set_master_duck` ·
+`set_master_volume` · `set_master_limiter` · `set_master_true_peak` · `set_master_duck` ·
 `add_overlay` · `update_overlay` · `remove_overlay` · `set_overlay_keyframes` ·
 `add_svg_overlay` · `update_svg_overlay` · `remove_svg_overlay` · `list_svg_presets` ·
-`generate_captions` · `import_captions` · `clear_captions` · `export_srt` · `list_fonts` ·
+`generate_captions` · `import_captions` · `clear_captions` · `export_srt` · `export_captions` · `list_fonts` ·
 `set_delivery_format` · `set_asset_projection`
 </details>
 
 <details>
 <summary><b>Render & hand-off</b></summary>
 
-`export` · `export_capabilities` · `export_cover` · `platform_check` · `get_levels` · `stage_edits` ·
+`export` · `export_capabilities` · `export_cover` · `export_interchange` · `export_markers` · `platform_check` · `get_levels` · `stage_edits` ·
 `staged_diff` · `apply_staged_edits` · `discard_staged_edits` · `revision_diff` ·
 `list_tasks` · `add_task` · `claim_next_task` · `complete_task` · `fail_task` ·
 `resolve_task` · `remove_task` · `history` · `undo` · `redo` · `revert_to` ·
@@ -204,7 +207,8 @@ the frame at full source detail. Also `get_waveform_range` · `analysis_status` 
 `apply_staged_subset` · `proxy_status` · `rebuild_proxy` · `delete_proxy` ·
 `job_status` · `cancel_job` · `list_jobs` — the long tools
 (`export`, `export_variants`, `analyze_asset`, `generate_voiceover`, `separate_stems`,
-`download_speech_model`, `import_asset`, `smart_crop`) take `background: true` and answer a
+`download_speech_model`, `import_asset`, `smart_crop`, `refine_transcript`, `sync_clips_by_audio`) take
+`background: true` and answer a
 `job_id` at once. Applying a proposal is refused to an agent while you have review on;
 `undo`, `redo` and `revert_to` are too, since they would rewrite your live cut.
 </details>

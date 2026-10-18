@@ -31,7 +31,8 @@
   when it resolves its inputs under the lock and drops its result if it changed. **`replace_with_saved_copy`
   is the one swap that does not move it** — Save As reopens the copy it wrote, which is the same project in
   another file, so jobs in flight (analysis, import, voiceover, proxies) still land; the change count carries on
-  across it too. Only that swap may use it. `change_count()`
+  across it too. Only that swap may use it. Both swaps **return the project replaced** (`#[must_use]`;
+  `agent_review` carries over): the caller `close()`s it after releasing the lock (see crash recovery). `change_count()`
   is SQLite's `total_changes` — every row written through the connection (analysis merges,
   ripple mode, meta, a declined proxy …), so "did anything write while the lock was released?"
   is two numbers, not a content fingerprint. It is **monotonic across `replace_with`** (the swapped-in
@@ -39,10 +40,10 @@
   noted under the old project can never equal one read under the new — `generation()` still says
   *which* project. `merge_analysis` / `set_analysis` (and
   `place_stems`) answer `AssetNotFound` for an asset that is gone instead of writing for nothing.
-  **`save_as` is atomic**: `VACUUM INTO` a temporary file beside the destination, then rename; a
-  failure leaves the destination as it was (it used to be deleted first), and saving onto the
-  file the project is open on is a no-op; the destination is held to `check_output_path` first (never
-  over an asset's source, a stitched capture, a proxy or the cache). **`insert_asset` is an upsert** (`ON CONFLICT … DO
+  **`save_as` is atomic** (`store::vacuum_into_atomic`, below): a failure leaves the destination as
+  it was (it used to be deleted first), and saving onto the file the project is open on is a no-op; the
+  destination is held to `check_output_path` first (never over an asset's source, a stitched capture, a
+  proxy or the cache). **`insert_asset` is an upsert** (`ON CONFLICT … DO
   UPDATE`), never `INSERT OR REPLACE`: replacing deletes the row first and `analysis` hangs off it
   with `ON DELETE CASCADE`, so marking an asset 360 used to drop its transcript.
   **The media library** is filesystem work (stat, ffprobe, reading file ends), so each op is split to
@@ -96,9 +97,44 @@
   may not land on another clip of its lane (checked after the ripple, so ripple mode still
   pushes the later clips along), and `add_clip_to_timeline` keeps the track sorted;
   `set_speed` is held to `MIN_SPEED..=MAX_SPEED`.
+  **The file** (`project/store.rs`): `PRAGMA user_version` is the schema version, brought forward by
+  `MIGRATIONS` (one step each, each in its own transaction stamping the version it reached; never edit
+  a shipped step, append one). Version 0 is every file written before versions existed (the legacy
+  baseline; v0→v1 is the old probe-then-`ALTER` columns). A new file is stamped `SCHEMA_VERSION`; a
+  file newer than that is refused before anything is written (`Error::NewerProject`, "made by a newer
+  Kerf", which the GUI toasts); an older file is first copied beside itself as
+  `<stem> (schema vN backup).kerf` (kept if one already exists), then upgraded. Each step has a
+  `needed` probe and a `destructive` flag: no backup when no pending step would change the file (only
+  the version is stamped), and a backup that fails (full disk, read-only folder) is a warning unless a
+  pending step is destructive. A **read-only** file (SQLite fell back to read-only) opens as it is,
+  nothing written; one that needs a real upgrade is refused with a "copy it somewhere you can write"
+  message. `SCHEMA` still runs first, so a step must tolerate tables it creates. **Save As is atomic** (`vacuum_into_atomic`):
+  `VACUUM INTO` a hidden temp file in the target's directory, fsync it, rename it over the target,
+  fsync the directory on unix; any failure removes the temp file and leaves the old target as it was.
+  Each save first deletes this target's own `.<name>.<uuid>.tmp` files over an hour old (a crashed
+  save's). Saving a project onto its own file is a no-op. **The history is bounded**: `record_revision` keeps
+  the newest `history_limit` revisions (`DEFAULT_HISTORY_LIMIT` 500, `KERF_HISTORY_LIMIT` overrides,
+  `set_history_limit` per project, minimum 1 — the head is always the newest after a record), and
+  never prunes a staged proposal's `base_seq` or anything after it. The oldest revision left is the new
+  baseline: undo stops there and `revision_diff` of it is empty, like revision 0. `revert_to` /
+  `diff_revisions` only reach revisions `history()` still lists. Stored JSON is not compressed.
+  **Crash recovery** (`recovery.rs`): an untitled project can live in `<root>/<session>/untitled.kerf`
+  (`Project::create_recovery`), its directory held under an OS lock (`File::try_lock` on
+  `<session>/lock`, a separate file because Windows byte-range locks would block SQLite) for as long
+  as it is open; `path()` stays `None`, so it still reads as unsaved. `recovery::scan(root, skip)`
+  offers the directories whose lock it can take and that hold work (assets, a revision past 0, a task
+  or a proposal — the `summarize` read opens read-write so SQLite can roll back a crash's hot
+  journal; a table the file lacks counts as empty, so a 0-byte or half-created file is cleaned up),
+  holding them locked as `Recoverable`; one it locked that holds nothing is deleted. A
+  directory is **never** deleted unless this process holds its lock: `WouldBlock` (a running
+  instance) and any other lock error (unsupported, permissions) or an unreadable project leave it
+  alone. `Project::open_recovered` reopens one. `replace_with` / `replace_with_saved_copy` swap under the lock and **return** the
+  project replaced (`#[must_use]`); the caller `close()`s it after releasing the lock, which deletes
+  its recovery directory (it was saved, recovered into another, or let go). `close_at_exit` deletes it
+  only when it holds no work (the same `summarize` rule) — anything else waits for the next launch.
   `Project::sample()` seeds an in-memory demo (two assets + analysis + a starter
   timeline + a sample task queue); it backs the kerf-core tests, but the app now
-  launches with an **empty** `Project::open_in_memory()` — the user imports media or
+  launches with an **empty** untitled project (`Project::create_recovery`, see above) — the user imports media or
   opens a `.kerf` file to populate it.
   `analyze_asset`, `frame_at`, `waveform` and `waveform_range` delegate to the engine; editing ops are
   unchanged. `snap_to_beats(track_id, tolerance)` is "cut to the beat": it collects
@@ -146,6 +182,37 @@
   plus the overall fraction). Sequential on purpose: an export takes every core
   it is given and `cpu::lease` would serialize them anyway, and a cancel is
   then clean — the file in flight is deleted, the finished ones kept.
+  **Side-files of a delivery** (`project/exports.rs`): `delivery_inputs` snapshots the
+  working timeline, the *original* assets, the render frame rate (`render_geometry`) and the
+  project's name under the lock; the static `captions_document` (refused with no captions;
+  it and `markers_document` read `for_render`, as the export does),
+  `interchange_document` (OTIO / EDL, refused with no clips) and `markers_document` (CSV /
+  YouTube, refused with no markers) build the text with it released, and `write_document`
+  writes it. `edit_marker` / `add_marker_with` take a `MarkerPatch` as one revision.
+  **Interchange** (`interchange/`, pure, no file I/O) returns text plus a `Report` (`Level`
+  info / warning, identical messages merged with a count — FilmCraft's design). **OTIO**
+  (`otio.rs`): every track (`enabled` = not muted), gaps, `Transition.1` from `transition_fx`
+  (a dissolve or motion transition is `in_offset` 0 / `out_offset` the achieved overlap, a
+  dip `d/2` either side, none written for a hard cut), `LinearTimeWarp` for speed, an
+  `ExternalReference` `file://` URL to `Asset::path`, the timeline's markers on the stack, and
+  `metadata.kerf` holding each clip's whole serde state, each track's mixer flags, the
+  overlays, SVG titles, format and master. **EDL** (`edl.rs`): one video track
+  (`video_track`, 0 = V1), record from `01:00:00:00`, source from the file's zero, frames at
+  the rate (`Timebase`: NTSC rates exact, drop-frame at 29.97 / 59.94 with `;` before the
+  frames), 8-character reels from the file stem made unique per file, `* FROM CLIP NAME` /
+  `* TO CLIP NAME` / `* SOURCE FILE`, a dissolve as the outgoing `C` line plus the incoming
+  `D nnn` (`BL` with no predecessor), dips written as cuts and slides / pushes as dissolves
+  (reported), `M2` at speed × timebase (negative reversed) with the source out at
+  `src_in ± record frames × |speed|` (counting down when reversed), disabled clips left out,
+  and the sound of A/V clips reported as not written (events are channel `V`).
+  Golden text in `interchange/golden/*.{otio,edl}` (`golden.rs`; bless with
+  `KERF_INTERCHANGE_BLESS=1 cargo test -p kerf-core --no-default-features interchange`).
+  **Marker lists** (`interchange/markers.rs`): `markers_csv` (RFC 4180, every cell quoted,
+  free-text cells starting with `= + - @` / tab / CR — or one of the four after leading
+  whitespace — prefixed with `'`), `youtube_chapters` (chapter markers, else all; `0:00 Intro`
+  added when the first is later, fewer than three or shorter than 10 s reported, not
+  enforced) and `ffmetadata_chapters` (chapter markers only, each to the next or its own
+  duration, `= ; # \` and newlines escaped; `None` with none).
   The **agent task queue** is a real `tasks` table (one row per `Task`,
   columns not JSON): `add_task` / `list_tasks` / `claim_next_task` / `complete_task`
   / `fail_task` / `resolve_task` / `remove_task` drive the `queued → working →
@@ -225,7 +292,8 @@
   only a proposal an agent discarded — one the user threw away stays thrown away unless the user restores it. An empty proposal is not kept and does not replace one that is. **The kept copy is dropped when it can only mislead**: when a newer proposal is
   really applied (`apply_staged`, `apply_staged_subset`; a session that changed nothing closing is not one), and when the project
   is replaced (`replace_with` — an open or new project; `replace_with_saved_copy`, Save As, keeps it). The `staged` table
-  gained `owner` and `assets` (added by `init`'s probe-and-`ALTER`, like `voiceover`; an older
+  gained `owner` and `assets` (schema step v1 → v2 in `store.rs`, a probe-and-`ALTER` like `voiceover`'s
+  v0 → v1, so a file at v1 is copied aside once as `(schema v1 backup)` before it is upgraded; an older
   file's open proposal loads with no owner and no asset changes).
   `plan_music_fit(clip, target)` / `fit_music(clip, target, fade_out)` fit a music clip on
   an audio track (normal speed, unlinked, with a cached `AssetAnalysis.music`) to `target`
@@ -297,7 +365,18 @@
   per-kind toggles, minus transcript without a backend), a named list runs exactly that — so an
   agent cannot fetch a speech model for someone who turned transcription off, and a user can still
   transcribe one clip by hand. Transcribing with no backend is a failed step, not an empty
-  transcript. **What a request runs** is `resolve_steps(asset, requested)`: a file with no audio is
+  transcript. **Word timings and speaker labels are part of the `transcript` step**, not a sixth
+  kind: no model, one 16 kHz decode and a few seconds of DSP per hour next to minutes of inference,
+  so they always run with it (reported as `transcribe` with the detail "timing words and labelling
+  speakers") and per-kind status stays five kinds — `transcript` done means words and speakers were
+  attempted. A transcript cached before (no `words`, no `speaker`) still reads as done; readers
+  estimate its words on the fly (`transcript::words_of`), and `refine_transcript` adds them without
+  re-transcribing: `Project::transcript(asset)` under the lock → static `refine_transcript_media` →
+  `Project::store_transcript(asset, read, refined)` (a merge with `ran = [transcript]`, refused when the
+  cache no longer holds `read`, so a refinement never overwrites a newer transcript). `speaker_ranges(asset, speaker?,
+  join_gap)` (errors naming the known speakers for an unknown one, or when nothing is labelled) and
+  `filler_words(asset, fillers)` (default um / uh / … / you know, phrases matched across words of one
+  line) read it by word bounds. **What a request runs** is `resolve_steps(asset, requested)`: a file with no audio is
   not asked for silence, loudness, rhythm or speech (silent b-roll used to get a failed transcript
   chip and an error toast on every import), a still has nothing to analyze, and an empty answer is
   an `InvalidArgument` that says why (everything switched off; a silent file asked for its speech)

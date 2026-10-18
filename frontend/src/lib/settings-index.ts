@@ -86,7 +86,7 @@ export const ENTRIES: readonly SettingEntry[] = [
 	e('mcp-token', 'agent', 'Access token', 'mcp', 'secret', 'bearer', 'authorization', 'password', 'regenerate', 'copy', 'require'),
 	e('mcp-connect', 'agent', 'Connect an agent', 'mcp', 'claude code', 'claude', 'cursor', 'client', 'json', 'config', 'command', 'instructions', 'cli'),
 
-	e('keyboard', 'keyboard', 'Keyboard shortcuts', 'shortcut', 'keys', 'hotkey', 'binding', 'rebind', 'chord'),
+	e('keyboard', 'keyboard', 'Keyboard shortcuts', 'shortcut', 'keys', 'hotkey', 'binding', 'rebind', 'chord', 'preset', 'premiere', 'resolve', 'davinci', 'final cut', 'fcp'),
 
 	e('open-logs', 'advanced', 'Open the log folder', 'log', 'logs', 'debug', 'diagnostics', 'support'),
 	e('reveal-settings', 'advanced', 'Show the settings file', 'file', 'json', 'config', 'folder', 'reveal'),

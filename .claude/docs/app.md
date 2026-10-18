@@ -87,7 +87,7 @@ ripple mode) and `split_remove_clips { cuts, side }` (`cuts: [{clip_id, at}]`, o
 `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
 `set_track_duck`, `set_track_volume` / `set_track_pan`, `set_master_volume` /
-`set_master_limiter` / `set_master_duck` (`depthDb?`; the master bus; each returns the
+`set_master_limiter` / `set_master_duck` (`depthDb?`) / `set_master_true_peak` (`enabled`; the master bus; each returns the
 `Timeline`), `plan_music_fit` (`clipId`, `target?` → `MusicFit`), `fit_music` (`clipId`,
 `target?`, `fadeOut` → `{timeline, report}`), `stems_status`, `separate_stems` (`assetId`, `clipId?` →
 `{placed, timeline}`; streams `stems-progress`, rejects `stems cancelled`), `cancel_stems`, `get_levels` (`range?`,
@@ -97,6 +97,9 @@ width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
 (one revision; `ripple: true` is the multi-select ripple delete, via
 `with_ripple`; omitted follows the project's mode), `set_volume`, `set_fade`,
 `set_speed`, `set_transform`, `set_color`, `set_transition`, `set_mask`,
+`set_grade { clipId, grade }` (curves / wheels / LUT; a LUT path the clip did not have is checked off the lock,
+`blocking`, so a curve edit on a clip whose LUT went missing still applies),
+`inspect_lut { path }` (→ `LutInfo {path, size, title}`, or why it is not a usable `.cube`),
 `set_video_effects`,
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
 `set_keyframe_easing { clipId, time, easing, prop? }` (the key within a millisecond of `time`; with
@@ -119,8 +122,17 @@ the webview, decides what an SVG may do; `check_params` refuses empty text first
 `generate_captions` / `clear_captions` (caption the whole cut, in timeline
 time), `import_captions` / `import_captions_text` (a subtitle file by path / by text —
 the text variant is what an `<input type=file>` or a paste uses; both return
-`{timeline, summary}` rather than a bare `Timeline`), `export_srt`, `remove_silence`, `snap_to_beats`,
+`{timeline, summary}` rather than a bare `Timeline`), `export_srt`, `export_captions` (the cut's
+captions as `.srt` / `.vtt`), `export_interchange` (OTIO / EDL, returns `{path, report}`),
+`export_markers` (CSV / YouTube chapters, `{path, report}`) — each snapshots under the lock and
+builds and writes the file on the blocking pool —, `refine_transcript` (re-time words + label speakers on the cached transcript via `run_refine`, shared
+with MCP: lock released, background lane, `analysis-progress`, stopped by `cancel_analysis`; returns the
+analysis), `remove_silence`, `snap_to_beats`,
 `smart_crop` (frame each shot for the delivery frame),
+`sync_clips_by_audio` (`referenceId`, `clipId`, `force?` → `{sync: AudioSync, timeline}`; heavy, the
+lock-free inputs → measure → apply split; a slot wait emits `audio-sync-progress`; a forced call for the
+plan last measured applies `AppState.last_sync` instead of decoding again — "Move anyway") /
+`cancel_audio_sync` (rejects it with `audio sync cancelled`),
 `extract_audio` (detaches an asset's cut clips and reports what it skipped, see Linked A/V) / `add_asset_audio`
 (an asset's whole audio as a clip) / `detach_audio_clips`,
 `detach_audio` / `reattach_audio` / `reattach_audio_clips` / `link_clips` / `unlink_clips`, `concatenate` — each
@@ -135,6 +147,10 @@ and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**
 `skim_asset` is how an agent looks at footage,
 `get_preview_frame` (`hint: "forward"` is a frame of GPU playback) / `set_preview_bounds` / `gpu_preview_status` (the GPU preview, below; GUI-only; its tallies are kept for tests and logs, no command serves them),
 `get_timeline_frame` (the composited still at a time; see Scrubbed frames below),
+`get_scopes` (`kerf_core::scopes` of the export's still at a time, from the originals: the summary and the grids asked
+for; the MCP tool of the same name) / `get_render_bar` (`kerf_core::render_bar` over the working cut, for the GPU
+preview's `Compositor::CAPS` when the setting is on, the proxy waits and the measured colour policy; GUI-only, see
+`frontend-timeline.md`),
 detached panels (`popout_expect` / `popout_cancel` / `popout_focus` / `popout_move` / `close_popout`, see Detached panels below; GUI-only, no MCP tool),
 `start_playback { playback_id, start, fps?, max_width?, on_frame }` / `stop_playback` — streamed
 composited frames over a `tauri::ipc::Channel<InvokeResponseBody>`, **raw bytes** (`playback_message`:
@@ -297,13 +313,15 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 
 **Command index** (every name in `generate_handler!`; the prose above says what they do):
 *project* `project_path`, `new_project`, `open_project`, `save_project_as`, `recent_projects`, `open_recent`,
-`clear_recent_projects`, `take_launch_project`, `show_main_window`; *library* `list_assets`, `get_asset_metadata`,
+`clear_recent_projects`, `take_launch_project`, `show_main_window`, `list_recoveries`, `recover_project`, `discard_recovery`,
+`discard_recovery_at_exit`; *library* `list_assets`, `get_asset_metadata`,
 `list_fonts`, `import_asset`, `cancel_import`, `remove_asset`, `relink_asset`, `check_relink`, `missing_assets`, `paths_exist`,
 `set_asset_projection`; *analysis, proxies, transcription* `analyze_asset`, `cancel_analysis`, `analysis_statuses`,
 `proxy_statuses`, `rebuild_proxy`, `delete_proxy`, `transcription_status`, `set_speech_model`, `download_speech_model`,
 `cancel_model_download`; *voiceover, stems, mixing* `voiceover_status`, `prepare_voiceover`, `generate_voiceover`,
 `cancel_voiceover`, `stems_status`, `separate_stems`, `cancel_stems`, `get_levels`, `cancel_levels`, `plan_music_fit`,
-`fit_music`, `set_track_volume`, `set_track_pan`, `set_master_volume`, `set_master_limiter`, `set_master_duck`;
+`fit_music`, `set_track_volume`, `set_track_pan`, `set_master_volume`, `set_master_limiter`, `set_master_true_peak`,
+`set_master_duck`, `sync_clips_by_audio`, `cancel_audio_sync`;
 *timeline* `get_timeline`, `get_ripple_mode`, `set_ripple_mode`, `cut_clip`, `add_clip`, `split_clip`, `trim_clip`,
 `reorder_clip`, `move_clip`, `move_clips`, `ripple_delete`, `cut_clip_range`, `roll_edit`, `slip_clip`, `slide_clip`,
 `split_remove`, `split_remove_clips`, `insert_clips`, `duplicate_clips`, `remove_clip`, `remove_clips`, `add_track`,
@@ -311,30 +329,60 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `set_delivery_format`, `concatenate`, `remove_silence`, `snap_to_beats`, `smart_crop`, `cancel_smart_crop`;
 *linked A/V* `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
 `reattach_audio_clips`, `link_clips`, `unlink_clips`; *clip properties* `set_volume`, `set_fade`, `set_speed`,
-`set_transform`, `set_color`, `set_transition`, `set_mask`, `set_video_effects`, `set_audio_effects`, `set_keyframes`,
+`set_transform`, `set_color`, `set_grade`, `inspect_lut`, `set_transition`, `set_mask`, `set_video_effects`, `set_audio_effects`, `set_keyframes`,
 `add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`, `copy_keyframes`, `clear_keyframes`, `set_reframe`,
 `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`; *markers, text, titles, captions* `add_marker`,
 `update_marker`, `remove_marker`, `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
 `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `validate_svg`, `list_svg_presets`,
-`svg_preset_preview`, `generate_captions`, `clear_captions`, `import_captions`, `import_captions_text`, `export_srt`;
+`svg_preset_preview`, `generate_captions`, `clear_captions`, `import_captions`, `import_captions_text`, `export_srt`, `export_captions`, `export_interchange`, `export_markers`,
+`refine_transcript`;
 *history and review* `get_history`, `revision_diff`, `undo`, `redo`, `revert_to`, `get_staged_edit`,
 `get_staged_timeline`, `apply_staged_edit`, `apply_staged_subset`, `discard_staged_edit`, `undo_staged_edit`,
 `discarded_staged_edit`, `restore_discarded_edits`, `list_tasks`, `add_task`, `resolve_task`, `remove_task`;
 *preview and media* `get_frame`, `get_timeline_frame`, `get_preview_frame`, `set_preview_bounds`, `gpu_preview_status`,
 `playback_session`, `start_playback`, `stop_playback`, `get_waveform_range`,
-`get_filmstrip`, `get_audio`, `get_energy`; *delivery* `hw_encoders`, `export_timeline`, `export_variants`,
+`get_filmstrip`, `get_audio`, `get_energy`, `get_scopes`, `get_render_bar`; *delivery* `hw_encoders`, `export_timeline`, `export_variants`,
 `cancel_export`, `export_cover`, `cancel_cover_export`, `platform_targets`, `platform_check`, `reveal_path`;
-*agent and app* `agent_status`, `mcp_connection_info`, `regenerate_mcp_token`, `set_mcp_settings`, `get_settings`, `set_settings`, `reset_settings`, `reveal_settings_file`,
+*agent and app* `agent_status`, `report_ui_context`, `mcp_connection_info`, `regenerate_mcp_token`, `set_mcp_settings`, `get_settings`, `set_settings`, `reset_settings`, `reveal_settings_file`,
 `read_text_file`, `write_text_file`, `reveal_logs`, `log_frontend`; *detached panels* `popout_expect`,
 `popout_cancel`, `close_popout`, `popout_focus`, `popout_move`.
 **Events**: `project-changed`, `analysis-progress`, `analysis-status`, `proxy-progress`, `proxy-ready`,
-`export-progress`, `import-progress`, `model-progress`, `smart-crop-progress`, `voiceover-progress`, `stems-progress`,
+`export-progress`, `import-progress`, `audio-sync-progress`, `model-progress`, `smart-crop-progress`, `voiceover-progress`, `stems-progress`,
 `gpu-preview-checked`, `popout-closed`, `open-project-file`, `launch-project-missing`; from the MCP server also
 `project-replaced` (another project is open: reload everything), `settings-changed` (**payload: the full
 `SettingsView`**, as `get_settings` answers it, after an agent's `set_settings`), `ripple-mode-changed` and
 `speech-model-changed`. `platform_targets` is wired: the
 Deliver panel's verdict (`platform-verdict.ts`) takes the targets from it (`platformTargets()`, asked once) for the size a
 soft frame is made for; the browser harness answers with the mirror in `platforms.ts`.
+
+**Editor context (`editor_context.rs`).** `report_ui_context` takes what the editor shows —
+playhead, selected clip ids, in/out marks, the visible timeline range (`ui.timelineView`,
+written by the timeline), the focused dock panel (`ui.focusedPanel`, dockview's active panel)
+and the selected asset — into `EditorContextState`, its own `Mutex` in app state and never the
+`Project` (a view of the window, not the cut). `editor-context.ts` throttles it to the latest
+state once per 300 ms, only when it changed, and re-sends it every 30 s as a heartbeat; the MCP
+`get_editor_context` reads it back with `age_secs`, and `stale` once a report is over 90 s old.
+
+**Crash recovery** (`recovery.rs`): the untitled project is never only in memory. `setup` resolves
+`<app data>/recovery` (the debug identity's own data dir, so a dev run never touches an installed Kerf's
+sessions) and swaps the launch's empty project for `Project::create_recovery` there — in `setup`, not at
+the top of `run()`, because a second launch is handed to the first by the single-instance plugin before
+`setup` and must not make a session. `new_project` (now `async` + `blocking`) makes a fresh session the
+same way (`recovery::untitled`; no data dir or no file locking falls back to in-memory). Replacing the
+project (`replace_with`: Open, New, Save As, Recover) deletes the old session — each command
+`close()`s the returned project after dropping the lock. A clean exit (`RunEvent::Exit`) uses
+`close_at_exit`: an untouched session goes, one holding work stays to be offered next launch (the close
+guard can be bypassed, and `hasUnsavedWork` is narrower than recovery's rule); a crash leaves it.
+An explicit **Don't save** in the close / quit prompt calls `discard_recovery_at_exit` (`leaveAfter`
+in `confirm-copy.ts`), which records the current session's id; at exit that session is deleted even
+with work (`close_on_exit`, matched by id, so a project replaced since is not). A prompt that failed
+or a close that asked nothing never sets it.
+`list_recoveries` scans once per run (`kerf_core::recovery::scan`, skipping our own session) and keeps
+what it found **locked** in `RecoveryState` until `recover_project { id }` (opens it as the untitled
+project, like `open_project`: scrub cleared, speech model restored, proxies queued) or
+`discard_recovery { id }` (deletes it); one left alone is offered again next launch. No MCP tools —
+recovery is the user's call at launch. `project_path` stays `null` for a recovery-backed project, so
+the GUI still treats it as unsaved.
 
 **Scrubbed frames.** `get_timeline_frame` and the GPU preview's JPEG route go through `AppState.scrub`, one
 `kerf_core::ScrubFrames` per process: the frame of the cut's grid that holds the time, from a bounded cache or from

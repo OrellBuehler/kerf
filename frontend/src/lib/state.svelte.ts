@@ -17,6 +17,7 @@ import {
 	addReframeKeyframe,
 	addOverlay,
 	analyzeAsset,
+	refineTranscript,
 	generateCaptions,
 	clearCaptions,
 	importCaptions,
@@ -60,6 +61,7 @@ import {
 	updateOverlay,
 	newProject as apiNewProject,
 	openProject as apiOpenProject,
+	recoverProject as apiRecoverProject,
 	pickMediaPaths,
 	projectPath,
 	redo as apiRedo,
@@ -68,13 +70,16 @@ import {
 	removeSilence,
 	snapToBeats,
 	smartCrop,
+	syncClipsByAudio,
 	removeTrack,
 	setTrackDuck,
 	setMask,
+	setGrade,
 	setTrackVolume,
 	setTrackPan,
 	setMasterVolume,
 	setMasterLimiter,
+	setMasterTruePeak,
 	setMasterDuck,
 	fitMusic,
 	setDeliveryFormat,
@@ -120,6 +125,7 @@ import {
 	undo as apiUndo
 } from './api';
 import type {
+	AudioSync,
 	ClipCut,
 	ClipMove,
 	SplitSide,
@@ -141,6 +147,7 @@ import type {
 	Easing,
 	Keyframe,
 	Mask,
+	Grade,
 	MusicFitReport,
 	Projection,
 	Property,
@@ -160,6 +167,7 @@ import type {
 	SvgSource,
 	TextKeyframe,
 	Marker,
+	MarkerPatch,
 	TextOverlay,
 	Timeline,
 	Transform,
@@ -621,6 +629,18 @@ class EditorState {
 		return true;
 	}
 
+	/** Open an untitled project a crashed Kerf left behind; resolves true if recovered. */
+	async recoverProject(id: string): Promise<boolean> {
+		if (!(await apiRecoverProject(id))) return false;
+		this.selectedAssetId = null;
+		this.selectedClipId = null;
+		this.selectedClipIds = [];
+		this.selectedOverlayId = null;
+		this.selectedSvgOverlayId = null;
+		await this.load();
+		return true;
+	}
+
 	/** Persist the project to a chosen `.kerf` file; resolves true if saved. */
 	async saveProjectAs(): Promise<boolean> {
 		const path = await apiSaveProjectAs(this.currentPath ?? undefined);
@@ -888,6 +908,17 @@ class EditorState {
 		return analysis;
 	}
 
+	/** Re-time the selected asset's transcript words and label its speakers, keeping the
+	 *  local caches in step. */
+	async refineTranscript(assetId: string): Promise<AssetAnalysis> {
+		const analysis = await refineTranscript(assetId);
+		this.analyses[assetId] = analysis;
+		if (assetId === this.selectedAssetId && this.selectedMetadata) {
+			this.selectedMetadata = { ...this.selectedMetadata, analysis };
+		}
+		return analysis;
+	}
+
 	// ---- editing actions (apply backend result to local timeline) -----------
 
 	/** Whether the cut on screen is the project's own: false while a proposal is being previewed, when
@@ -1088,6 +1119,9 @@ class EditorState {
 	setMask(clipId: string, mask: Mask | null) {
 		return this.#apply(() => setMask(clipId, mask));
 	}
+	setGrade(clipId: string, grade: Grade) {
+		return this.#apply(() => setGrade(clipId, grade));
+	}
 	setTrackVolume(trackId: string, volume: number) {
 		return this.#apply(() => setTrackVolume(trackId, volume));
 	}
@@ -1101,6 +1135,10 @@ class EditorState {
 	/** The master limiter on or off; `ceilingDb` omitted keeps the ceiling it had. */
 	setMasterLimiter(enabled: boolean, ceilingDb?: number | null) {
 		return this.#apply(() => setMasterLimiter(enabled, ceilingDb));
+	}
+	/** The master limiter holds the true peak (4x oversampled on export) or only the sample peak. */
+	setMasterTruePeak(enabled: boolean) {
+		return this.#apply(() => setMasterTruePeak(enabled));
 	}
 	/** How ducked tracks dip: a negative `depthDb` is the speech gate (that many dB under speech,
 	 *  `-40..-1`), omitted the sidechain compressor. */
@@ -1118,7 +1156,7 @@ class EditorState {
 	addMarker(time: number, name: string, color?: string) {
 		return this.#apply(() => addMarker(time, name, color));
 	}
-	updateMarker(markerId: string, patch: { time?: number; name?: string; color?: string }) {
+	updateMarker(markerId: string, patch: MarkerPatch) {
 		return this.#apply(() => updateMarker(markerId, patch));
 	}
 	removeMarker(markerId: string) {
@@ -1329,7 +1367,7 @@ class EditorState {
 	clearCaptions() {
 		return this.#apply(() => clearCaptions());
 	}
-	/** Caption the cut from a subtitle file on disk (`.srt` / `.ass` / `.ssa`).
+	/** Caption the cut from a subtitle file on disk (`.srt` / `.vtt` / `.ass` / `.ssa`).
 	 *  One `Import captions` revision that replaces the generated / imported
 	 *  captions; resolves to what the import did (see `describeImport`). */
 	importCaptions(path: string, req?: CaptionImportRequest) {
@@ -1420,6 +1458,18 @@ class EditorState {
 		} catch {
 			this.stoppingImport = false;
 		}
+	}
+	/** Move `clipId` so its sound lines up with `referenceId`'s; resolves to what was found.
+	 *  An unreliable match moves nothing unless `force`. One `Move clip` revision when it moves. */
+	async syncByAudio(referenceId: string, clipId: string, force = false): Promise<AudioSync> {
+		let sync!: AudioSync;
+		await this.#apply(() =>
+			syncClipsByAudio(referenceId, clipId, force).then((r) => {
+				sync = r.sync;
+				return r.timeline;
+			})
+		);
+		return sync;
 	}
 	/** Detach the sound of every clip of an asset still playing its own (one revision); resolves
 	 *  to what was detached and what was skipped (a locked track). */

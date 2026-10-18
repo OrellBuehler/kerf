@@ -709,6 +709,7 @@ mod tests {
             time: 3.0,
             name: "beat".into(),
             color: None,
+            ..Default::default()
         });
         proposed.master.volume = 0.5;
         let diff = base.diff(&proposed);

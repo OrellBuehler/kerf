@@ -425,7 +425,27 @@ so the feature is **only** activated through these forwards — which is what ma
   -16, broadcast -23 LUFS, all -1 dBTP, `loudnorm` TP half a dB under) wins over the bool;
   youtube is byte-identical to `loudnorm: true`.
   `ExportOptions.loudnorm` appends a single-pass `loudnorm` to -14 LUFS
-  on the final mix, and `ExportOptions.range` renders only a span by building the
+  on the final mix. **Captions and chapters ride along** (`cli/side_files.rs`):
+  `ExportOptions.embed_captions` muxes the cut's captions as a soft subtitle stream
+  (`mov_text` in mp4 / mov, `webvtt` in webm, `srt` in mkv; `validate_export` refuses it for
+  any other container) — **not the default track** (`-disposition:s:0 0`), since the captions
+  are burned in as well unless `skip_burned_captions` (neutral `false`, omitted) drops the
+  generated overlays from the picture — and `caption_sidecars` writes `.srt` / `.vtt` beside the
+  output **only once the render has completed** (a cancelled or failed export never touches a
+  file there; a file that cannot be written is reported *after* the render is safe — the finished video
+  is not discarded for it, `render_with_progress` writes them outside `discarding_partial`), an existing one refused up front unless `overwrite_sidecars` (the MCP `overwrite`,
+  the GUI's confirmation; `check_caption_sidecars` checks every variant first). Captions asked
+  for when the cut has none are refused; a range they do not reach just carries none. Chapter
+  markers become the
+  file's chapters in mp4 / mov / mkv / webm / m4a. The builders stay pure: the render
+  (`side_files::prepare`, from `for_render` + the range slice) writes a SubRip and an
+  FFMETADATA temp file and names them in the render-only `#[serde(skip)]` fields
+  `subtitle_input` / `chapters_input`; the builder then adds `-f srt -i …` / `-f ffmetadata
+  -i …` after the clips and titles, `-map N:s:0 -c:s <codec>` and `-map_chapters M`
+  (skipped on a first pass). Unset, nothing is added — the golden oracle is unchanged —
+  and `export_resource` skips those inputs when judging the GPU lane. The `#[ignore]`d
+  `ffprobe_sees_the_subtitle_stream_and_the_chapters` renders mp4 / mkv / webm and probes.
+  `ExportOptions.range` renders only a span by building the
   graph from `Timeline::slice(start, end)` (a shifted sub-timeline copy — boundary
   clips retrimmed honoring speed/reverse, keyframes resampled, overlays clipped).
   **The master bus** (`Timeline.master: MasterBus {volume, limiter, ceiling_db}`,
@@ -461,6 +481,23 @@ so the feature is **only** activated through these forwards — which is what ma
   `safe_volume` / `safe_ceiling_db` re-clamp in the builder (a `.kerf` never passes
   the clamping ops), and `DiffKind::MasterChanged` stops a master-only agent
   proposal diffing as empty and being discarded by `apply_staged`.
+  **`MasterBus.true_peak`** (opt-in, not written while off, read only with the limiter on) runs the
+  limiter oversampled: `aresample=<4×rate>,alimiter=…,aresample=<rate>` (`oversampled`), so the
+  peaks between samples stay under the ceiling (rendered: an 11 kHz tone pushed into a -1 dB ceiling
+  reads ≤ -0.9 dBTP with it, more without). Latency probing is the same `limiter_filter`.
+  **Static loudness** (`ExportOptions.loudness_static`, with a `loudness` / `loudnorm` target):
+  instead of single-pass `loudnorm` (which rides the gain and overshoots TP), `render_with_progress`
+  first runs one `levels::static_loudness_gain` pass (after the preflight; skipped when nothing writes
+  sound — a silent cut, `include_audio` off, a video-only container; its slot wait and the pass itself
+  show as the export's `waiting` line, `measuring the mix's loudness`). `prepare_variants` preflights
+  every variant and then measures **once** for all of them; `render_variants` runs it, and the app's
+  one-variant-per-call loop calls it first and hands its options on. The pass meters the export's
+  own graph with the normalization off and fills the `serde(skip)`
+  `loudness_gain_db` with `target − I` (±`LOUDNESS_MAX_GAIN_DB` 30; 0 for a mix under the gate); the
+  builder then emits `volume=<g>dB` (omitted under 0.005) and the oversampled limiter at the target's
+  -1 dBTP less `STATIC_TP_MARGIN_DB` 0.3 (the resample back rings over what it held). Off, every graph
+  is byte-identical; a cancel during the measure is `Cancelled`. Rendered: two passages 18 dB apart
+  land on -14 / -23 LUFS ±0.5 and stay 18 dB apart, TP ≤ -0.95; clicks given +10 dB stay ≤ -0.95 dBTP.
   **Levels** (`Project::levels_inputs` → static `measure_levels` → `engine::mix_levels`,
   `engine/cli/levels.rs`; lock-free split again): one ffmpeg pass over the export's own
   audio graph. `build_filter_complex_metered` is `build_filter_complex` plus taps
@@ -479,10 +516,12 @@ so the feature is **only** activated through these forwards — which is what ma
   logs ten a second) and `cancel` kill the child. `Levels.notes` is the advice
   against -14 LUFS / -1 dBTP, and it takes the **master bus** the mix went through
   (`Levels::new(.., &timeline.master)`, `level_notes`): over -1 dBTP with the limiter
-  off says turn it on, but with it **already on** says lower its ceiling by the
-  overshoot plus 0.5 dB (`LEVELS_CEILING_MARGIN_DB`, clamped to the filter's floor; at
-  the floor, lower the master instead) — the old advice looped an agent that followed
-  it, because the limiter holds the sample peak and the overshoot is between samples.
+  off says turn it on with true-peak limiting, but with it **already on** says turn on
+  `set_master_true_peak` or lower its ceiling by the overshoot plus 0.5 dB
+  (`LEVELS_CEILING_MARGIN_DB`, clamped to the filter's floor; at the floor, lower the
+  master instead) — the old advice looped an agent that followed it, because the plain
+  limiter holds the sample peak and the overshoot is between samples. With `true_peak`
+  already on only the lower ceiling (or, at the floor, the master) is offered.
   A track over 0 dBFS before the master is told so without claiming a clip: the graph
   is float, so nothing clips until the mix is written and the master can still bring
   it under. `levels.ts` `levelNotes` mirrors the words exactly (a string in both
@@ -503,7 +542,22 @@ so the feature is **only** activated through these forwards — which is what ma
   already moved the frames to `timeline_start`, so every `fade` (in / out, dip,
   dissolve) starts at `timeline_start + …` — timed from 0 they blacked out any
   later clip with a fade-out and dropped its fade-in and transitions. Audio is
-  re-based to the clip before `adelay`, so its `afade`s stay clip-local.
+  re-based to the clip before `adelay`, so its `afade`s stay clip-local. **A crossfade is
+  constant-power**: an `afade` that is wholly one half of a **real pair** (`ClipFx::afade_in_power` on
+  the incoming clip, `tail_power` on the outgoing one — set by `transition_fx` only for a dissolve or
+  motion transition from an adjacent partner, with no clip fade or dip folded into the fade) gets
+  `:curve=qsin` (sin in, cos out; linear ramps dipped 3 dB mid-way). Everything else keeps the old
+  linear ramp: a fade up from black (no partner), a mixed fade, and a pair whose overlap plays the same
+  samples on both sides (`clip_timing::same_sound`: one asset, same speed and direction, the incoming
+  clip picking up within `overlap · speed` of where the outgoing handle continues — a cut inside one
+  take, a music fit's splice between continuous bars) or that is a de-click splice of one recording
+  (≤ `SPLICE_CROSSFADE_S`, a music fit's splice between bars chosen to sound alike): correlated sound
+  a linear pair sums to unity where qsin swells +3 dB (the music-fit render tests are sample-exact on
+  it, and a fitted loop must not peak over its source). Rendered: `a_crossfade_keeps_the_power_constant` (two tones, ±0.3 dB through the
+  overlap; -2 dB at a quarter with the curve compiled out). `audio-mix.ts` mirrors it (`crossfadeIn`,
+  `fadeInTimes`: the preview ramps through 16 points of the sine; `crossfadePair` / `sameSound` pair
+  the clip on its track as it renders, disabled clips left out, and approximate the overlap without
+  the outgoing handle).
   **The scrubbed still draws fades, dips, dissolves, slides and pushes as the file does**
   (`engine/cli/still_fx.rs`; it used to show each clip's own span unfaded — the incoming clip alone
   inside a dissolve, 176 levels off the export's frame — and the agent's `timeline_frame`, the cover
@@ -692,7 +746,37 @@ so the feature is **only** activated through these forwards — which is what ma
   an unkeyed clip does (a constant `scale`, a constant `rotate=…:fillcolor=none`, `colorchannelmixer`);
   the overlay's `x` / `y` are each the curve or the static offset (`curve_or_static`). Any keyed number
   makes the clip "animated" for the pad / centre decision exactly as the bundle did, so a bundle clip
-  (all five keyed) is byte-identical. **A keyed colour is an `eq` with `eval=frame`** (`eq_filter_keyed`):
+  (all five keyed) is byte-identical. **The grade after the `eq`** (`Clip.grade`, `model/grade.rs`; filters in `engine/cli/grade.rs`, the same in
+  `video_clip_chain` and `still_clip_chain_graded`): **LUT → curves → wheels** (Lumetri's order: basic, creative,
+  curves, wheels), after the tone-map and the `eq`, before effects and any alpha plane; each part is omitted at neutral
+  (no grade, a LUT at 0 %, identity curves, neutral wheels), so no golden moved. **Curves are `lutrgb` expressions**, not a
+  file: per channel `st(0,val/maxval)`, the channel's curve then the master as a balanced `if(lt(..))` tree over the
+  points down to one segment's Horner cubic (the model's Fritsch–Carlson constants, printed exactly), then
+  `round(maxval*clip(ld(0),0,1))` — the integer FFmpeg stores is the model's at any depth (a unit test evaluates the
+  expression for every 8- and 10-bit value). `curves` would draw its own overshooting spline; `lut1d` truncates and
+  needs a file. **The LUT is `lut3d=file='…':interp=tetrahedral` over Kerf's copy** (`color_lut.rs`): the user's
+  `.cube` is parsed strictly (3D only, size 2–65, unit domain, `size³` finite rows, 32 MB cap; FFmpeg's reader ignores a
+  `DOMAIN_MIN` before the size and misreads CR-only files), rewritten to `<cache>/kerf/luts/<fnv>.cube` with the
+  intensity baked in (exact: tetrahedral interpolation of an affine table is itself), path escaped like `fontfile=`. A
+  missing or broken file is **left out** of a preview or still with a warning, like a missing font, and **refused by an
+  export** (`check_export_luts` in `export_preflight`, naming the file). The builders read the disk for the copy, so they
+  run off the project lock. The copies are pruned on the first lookup of a run: older than 30 days (a reused copy's mtime
+  is touched), then least recently used past 256 MB. Parse errors give the line and a fixed message, never the file's
+  text. **Wheels are
+  `colorbalance`**: a puck `(x, y)` in the unit disc is `(x, -x/2 + √3/2 y, -x/2 - √3/2 y)` plus the lightness on all
+  three, held to ±1, rounded to 1e-4, zeros omitted; the filter weighs its ranges by a pixel's max + min (a sum, not
+  the mean: measured, 6.1 and 9.0.2), so midtones act on fairly dark pixels and a mid grey is highlights. All three are RGB filters: FFmpeg converts in
+  with the frames' matrix, but **6.1 converts back as BT.601 and leaves the tag `unknown`** (a BT.709 HD clip came back 7
+  levels off, mis-tagged; 9.0.2 keeps both). So for a tagged picture (`ClipFx::frame_matrix` / `model::frame_matrix`:
+  the stream's YCbCr tag, BT.709 after a tone-map or the graph's BT.709 label) the grade ends in
+  `scale=out_color_matrix=<m>,format=yuv444p|yuv444p10le|yuv444p12le|yuv444p16le,setparams=colorspace=<m>`; an untagged
+  picture is BT.601 both ways and gets nothing. `the_grade_text_is_pinned` pins the curves / wheels / matrix text.
+  `grade_rendered.rs` (`#[ignore]`d, 6.1 and 9.0.2) holds the export and the still to the model within 4 levels
+  (inverting / S / per-channel curves, a channel-rotating and a squaring LUT at 100 / 50 %, a missing LUT, each wheel
+  range, all three in order) and an HD BT.709 clip's export to the model in its own RGB, delivered with the ungraded
+  clip's tags. That clip's still is not held to the model: its RGB is the composite's matrix
+  (`composite_color_policy`), not the clip's.
+  **A keyed colour is an `eq` with `eval=frame`** (`eq_filter_keyed`):
   each keyed number a quoted expression of the frame's time `t` — `t` is the frame timestamp, which
   `setpts` has put on the timeline, so clip-local time is `(t-start)` as everywhere else — the unkeyed
   numbers stay the plain numbers, the temperature is `gamma_r='1+0.3*(…)'` / `gamma_b='1-0.3*(…)'`.
@@ -1095,3 +1179,15 @@ so the feature is **only** activated through these forwards — which is what ma
   `build_still_args`* under its own mutex, so a builder that asked would deadlock, and a non-probing read would
   answer differently before and after the first probe. The plan mirrors it (`PlanStream::matrix()` is BT.709 for a
   labelled layer under any policy, which a translucent round trip reads).
+
+**Scopes** (`scopes.rs`, pure but for `timeline_scopes`). The frame is `timeline_frame_yuv_cancellable` (`timeline_scopes_cancellable` is the cancel-taking entry; `timeline_scopes` passes none): the still's own graph with a
+`StillOutput::Yuv444Pipe` sink (`-f rawvideo -pix_fmt yuv444p`, a new sink, so no golden moves), from the **originals**
+(`export_still_inputs`) at the delivery width — the Y'CbCr samples the file holds, not an `rgb24` pipe, whose matrix is the
+composite's (BT.601 on FFmpeg 6) rather than the one a player decodes the untagged delivery with. `yuv444_to_rgba` decodes
+them limited-range with the delivery's matrix (`delivery_matrix`: BT.709 at 1280 wide or over 576 tall, else BT.601; a
+caller can name `bt601` / `bt709` / `bt2020`), clipping what the cube cannot hold, as a screen does. `analyze` reads every
+pixel for the summary and the histogram (min / max / mean, pixels at 0 and 255 — a single clipped pixel is counted, which a
+decimated read misses) and a decimated frame (at most 480 x 270 samples) for the waveform, parade and vectorscope grids and
+the peaks (a 64² vectorscope, cells with at least 1 % of the samples). A measurement, not a frame anyone waits to see:
+ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still's spawn-time tuning, supervised like every still (`output_supervised_sized`: `STILL_TIMEOUT`, the cancel, killed past either), at most
+`MAX_SCOPE_WIDTH` (3840) wide, the pipe read into a buffer sized from the frame (the `capacity` of `output_supervised_sized`, `output_bounded` takes one too). `scopes_of_a_rendered_frame` (`#[ignore]`d) holds a one-pixel clip through the real graph.

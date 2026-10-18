@@ -150,6 +150,9 @@ struct TranscriptSummary {
     /// The start of the first segment and the end of the last, in the asset's own time.
     from: f64,
     to: f64,
+    /// The speaker labels (S1, S2, …) when speakers were labelled.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    speakers: Vec<String>,
     /// The beginning of the text; `truncated` says whether there is more (`get_transcript`).
     text: String,
     truncated: bool,
@@ -229,6 +232,7 @@ impl AnalysisSummary {
                 words: analysis.transcript.iter().map(|s| s.text.split_whitespace().count()).sum(),
                 from: analysis.transcript.first().map_or(0.0, |s| s.start),
                 to: analysis.transcript.last().map_or(0.0, |s| s.end),
+                speakers: speakers_of(&analysis.transcript),
                 text,
                 truncated,
             }
@@ -277,14 +281,48 @@ pub(super) fn paged<T: Clone>(matching: &[T], offset: usize, limit: usize) -> Pa
     }
 }
 
-/// The transcript segments overlapping `[from, to)` (either end open).
-pub(super) fn transcript_window(analysis: &AssetAnalysis, from: Option<f64>, to: Option<f64>) -> Vec<TranscriptSegment> {
+/// The transcript segments overlapping `[from, to)` (either end open), of `speaker` when one is
+/// named (case ignored). A line's words come only with `words` (its own, or estimated ones for a
+/// line that has none): they are most of a transcript's weight.
+pub(super) fn transcript_window(
+    analysis: &AssetAnalysis,
+    from: Option<f64>,
+    to: Option<f64>,
+    speaker: Option<&str>,
+    words: bool,
+) -> Vec<TranscriptSegment> {
+    let want = speaker.map(str::trim).filter(|s| !s.is_empty());
     analysis
         .transcript
         .iter()
-        .filter(|s| from.is_none_or(|f| s.end > f) && to.is_none_or(|t| s.start < t))
-        .cloned()
+        .filter(|s| {
+            from.is_none_or(|f| s.end > f)
+                && to.is_none_or(|t| s.start < t)
+                && want.is_none_or(|w| s.speaker.as_deref().is_some_and(|sp| sp.eq_ignore_ascii_case(w)))
+        })
+        .map(|s| TranscriptSegment {
+            start: s.start,
+            end: s.end,
+            text: s.text.clone(),
+            words: if words {
+                kerf_core::transcript::words_of(s).into_owned()
+            } else {
+                Vec::new()
+            },
+            speaker: s.speaker.clone(),
+        })
         .collect()
+}
+
+/// The speaker labels of a transcript, in order of first appearance.
+pub(super) fn speakers_of(transcript: &[TranscriptSegment]) -> Vec<String> {
+    let mut speakers: Vec<String> = Vec::new();
+    for sp in transcript.iter().filter_map(|s| s.speaker.as_ref()) {
+        if !speakers.contains(sp) {
+            speakers.push(sp.clone());
+        }
+    }
+    speakers
 }
 
 #[derive(Debug, Clone, Copy, serde::Deserialize, schemars::JsonSchema)]
@@ -650,6 +688,12 @@ pub(super) struct TranscriptParams {
     offset: Option<usize>,
     #[schemars(description = "Most segments to return (default 100, at most 500)")]
     limit: Option<usize>,
+    #[schemars(description = "Only the lines of this speaker (e.g. \"S2\"), when speakers were labelled")]
+    speaker: Option<String>,
+    #[schemars(
+        description = "Include each line's words with their own source times (default false: the lines alone, far fewer tokens). Ask for them over a from/to window."
+    )]
+    words: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -804,11 +848,17 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Read an asset's transcript a slice at a time: the segments `{start, end, text}` (SOURCE seconds) \
-                       overlapping [from, to), at most `limit` (default 100) from `offset`, with `total` and \
-                       `next_offset` for the next page. The transcript must exist (analyze_asset with `transcript`; \
-                       a generated voiceover's is its script). Use this instead of reading the whole transcript when \
-                       you need a passage: get_asset_metadata shows how long it is."
+        description = "Read an asset's transcript a slice at a time: the segments `{start, end, text, speaker}` (SOURCE \
+                       seconds; `speaker` is S1, S2, … when speakers were labelled — a line's label is the speaker of \
+                       most of its words) overlapping [from, to), at most `limit` (default 100) from `offset`, with \
+                       `total`, `speakers` and `next_offset` for the next page. `speaker` keeps that speaker's lines \
+                       only. words=true adds each line's `words` — each with its own source start/end, its speaker, a \
+                       `confidence` when the recognizer gave one, and `estimated: true` when its times were spread over \
+                       the line by character share and tightened to the speech energy rather than reported; they are \
+                       most of the reply, so ask for them over a window. Pass a word's start/end to cut_clip_range to \
+                       cut one word. The transcript must exist (analyze_asset with `transcript`; a generated \
+                       voiceover's is its script). Use this instead of reading the whole transcript when you need a \
+                       passage: get_asset_metadata shows how long it is."
     )]
     fn get_transcript(&self, Parameters(p): Parameters<TranscriptParams>) -> Result<String, McpError> {
         let id = parse_arg("asset_id", &p.asset_id)?;
@@ -821,11 +871,12 @@ impl KerfMcp {
                 None,
             ));
         };
-        let window = transcript_window(&analysis, p.from, p.to);
+        let window = transcript_window(&analysis, p.from, p.to, p.speaker.as_deref(), p.words.unwrap_or(false));
         let mut answer =
             serde_json::to_value(paged(&window, offset, limit)).map_err(|e| McpError::internal_error(e.to_string(), None))?;
         if let Some(map) = answer.as_object_mut() {
             map.insert("asset_id".to_string(), serde_json::json!(id));
+            map.insert("speakers".to_string(), serde_json::json!(speakers_of(&analysis.transcript)));
             map.insert("segments".to_string(), map.get("items").cloned().unwrap_or_default());
             map.remove("items");
         }
@@ -871,6 +922,7 @@ mod tests {
             start,
             end,
             text: text.to_string(),
+            ..Default::default()
         }
     }
 
@@ -988,14 +1040,71 @@ mod tests {
     fn the_transcript_window_keeps_what_overlaps() {
         let a = analysis();
         let texts = |w: Vec<TranscriptSegment>| w.into_iter().map(|s| s.text).collect::<Vec<_>>();
-        assert_eq!(texts(transcript_window(&a, None, None)).len(), 3);
-        assert_eq!(texts(transcript_window(&a, Some(2.0), Some(8.0))), vec!["this is a test"]);
+        assert_eq!(texts(transcript_window(&a, None, None, None, false)).len(), 3);
         assert_eq!(
-            texts(transcript_window(&a, Some(1.0), None)),
+            texts(transcript_window(&a, Some(2.0), Some(8.0), None, false)),
+            vec!["this is a test"]
+        );
+        assert_eq!(
+            texts(transcript_window(&a, Some(1.0), None, None, false)),
             vec!["Hello there", "this is a test", "the end"]
         );
-        assert_eq!(texts(transcript_window(&a, None, Some(2.0))), vec!["Hello there"]);
-        assert!(transcript_window(&a, Some(50.0), None).is_empty());
+        assert_eq!(
+            texts(transcript_window(&a, None, Some(2.0), None, false)),
+            vec!["Hello there"]
+        );
+        assert!(transcript_window(&a, Some(50.0), None, None, false).is_empty());
+    }
+
+    fn lines() -> AssetAnalysis {
+        let mut transcript: Vec<TranscriptSegment> = (0..5)
+            .map(|i| TranscriptSegment {
+                start: i as f64 * 2.0,
+                end: i as f64 * 2.0 + 1.5,
+                text: "one two".into(),
+                speaker: Some(if i % 2 == 0 { "S1" } else { "S2" }.into()),
+                ..Default::default()
+            })
+            .collect();
+        kerf_core::transcript::ensure_words(&mut transcript[..2]);
+        AssetAnalysis {
+            asset_id: Uuid::nil(),
+            transcript,
+            ran: vec![AnalysisKind::Transcript],
+            ..AssetAnalysis::default()
+        }
+    }
+
+    /// Words only when asked for (estimated ones for a line that has none); a window and a speaker
+    /// narrow the lines, and a page of them says where the next starts.
+    #[test]
+    fn a_transcript_read_has_words_only_on_request_and_filters_by_speaker_and_window() {
+        let a = lines();
+        let plain = transcript_window(&a, None, None, None, false);
+        assert_eq!(plain.len(), 5);
+        assert!(plain.iter().all(|s| s.words.is_empty() && s.speaker.is_some()));
+        assert_eq!(speakers_of(&a.transcript), ["S1", "S2"]);
+
+        let words = transcript_window(&a, Some(3.0), Some(6.5), None, true);
+        assert_eq!(words.iter().map(|s| s.start).collect::<Vec<_>>(), [2.0, 4.0, 6.0]);
+        assert!(
+            words.iter().all(|s| s.words.len() == 2),
+            "a line without words gets estimated ones"
+        );
+
+        let s1 = transcript_window(&a, None, None, Some(" s1 "), false);
+        assert_eq!(s1.iter().map(|s| s.start).collect::<Vec<_>>(), [0.0, 4.0, 8.0]);
+        let page = paged(&s1, 0, 2);
+        assert_eq!((page.total, page.returned, page.next_offset), (3, 2, Some(2)));
+        assert!(transcript_window(&a, None, None, Some("S9"), false).is_empty());
+    }
+
+    #[test]
+    fn the_summary_names_the_speakers_and_no_words() {
+        let a = lines();
+        let text = serde_json::to_string(&AnalysisSummary::of(&a)).unwrap();
+        assert!(text.contains("\"speakers\":[\"S1\",\"S2\"]"), "{text}");
+        assert!(!text.contains("\"words\":["), "{text}");
     }
 
     #[test]

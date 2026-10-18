@@ -219,6 +219,19 @@ export function unsavedChoice(answer: string, copy: Pick<UnsavedCopy, 'save' | '
 
 /** Whether to go ahead once the choice is made. "Save…" saves first and goes ahead only if a file
  *  was written (the save dialog can be cancelled, or fail); "Discard" goes ahead; "Cancel" does not. */
+/** [`proceedAfter`] for closing or quitting: an explicit "Don't save" also lets the untitled
+ *  project's recovery session go (`letGo`), so the next launch does not offer it back. Only that
+ *  answer does — a failed prompt never gets here — and a `letGo` that fails still closes. */
+export async function leaveAfter(
+	choice: UnsavedChoice,
+	save: () => Promise<boolean>,
+	letGo: () => Promise<void>
+): Promise<boolean> {
+	const go = await proceedAfter(choice, save);
+	if (go && choice === 'discard') await letGo().catch(() => {});
+	return go;
+}
+
 export async function proceedAfter(choice: UnsavedChoice, save: () => Promise<boolean>): Promise<boolean> {
 	if (choice === 'cancel') return false;
 	if (choice === 'discard') return true;

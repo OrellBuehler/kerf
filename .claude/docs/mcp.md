@@ -50,6 +50,12 @@ SVG sheet, a drawing JPEG would smear): a caption
 actually *see* (rmcp wants bare base64 + MIME, **not** a `data:` URL). `preview_timeline` stays the one-shot
 still (`composite_timeline_frame`, the working cut, the exact time asked): the scrub cache and its windows
 (`app.md`) are the GUI's, where frames come one after another from a dragged playhead.
+**`get_scopes`** measures instead of showing (`kerf_core::scopes`, `engine-cli.md`): the summary of the frame the
+export writes at a time — per channel min / max / mean, pixels clipped at 0 and 1 counted over every pixel, the mean
+chroma's hue and saturation, the densest vectorscope spots — so an agent checks exposure, clipping or a cast with no
+image tokens; `grids` (waveform / parade / vectorscope / histogram, default 64 x 64 / 48, each `grid_size` field
+optional) only when asked, `max_width` clamped to 3840. There is no
+tool for the render bar (`get_render_bar`): how the GUI's preview plays a span is nothing an agent acts on.
 **Look, then look closer**: `get_frame` and `preview_timeline` take an optional
 `region` (a `Region` — fractions of the frame, normalized into it) that is
 cropped out *before* the scale to `max_width`, and `skim_asset` takes a `cell`
@@ -104,6 +110,11 @@ detached (`source_audio: false`) carries none — its linked audio clip is the o
 `link` on exactly the edits that carry linked clips (`link_is_an_optional_argument_on_exactly_the_edits_that_carry_linked_clips`
 pins it against the generated schemas, the way `ripple` is pinned); `timeline_summary` gives each
 track `linked_clips` / `detached_sound_clips`, and the server `instructions` carry one paragraph.
+**Grading over MCP**: `set_grade` (`clip_id`, `curves?` `{master, red, green, blue: [{x, y}]}`, `wheels?`
+`{shadows, midtones, highlights: {x, y, lightness}}`, `lut_path?` (`""` removes), `lut_intensity?`): omitted parts are
+kept, the same `lut_path` without an intensity keeps the current one; a new LUT file is read and checked before the
+lock is taken; the clip comes back. The nested curves / wheels are MCP-only mirrors (`CurvesArg`, `WheelsArg`, …) with
+`deny_unknown_fields`, so `mastre` is refused; the persisted model stays lenient.
 **Per-property animation over MCP**: `set_property_keyframes` (`clip_id`, `prop`, `keys:
 [{time, value, easing?}]`; `[]` makes the number static again; the clip comes back) animates one number —
 a transform number, a colour number or the clip's volume — independently of the rest,
@@ -141,6 +152,12 @@ zeros and a model would take that for silence. `set_speech_model` is the write s
 is *selected*, so downloading without selecting was a silent no-op) — it makes
 both writes the GUI picker makes, though the picker itself only re-reads at
 launch, so a model an agent selects shows there on the next start.
+`sync_clips_by_audio { reference_clip_id, clip_id, force? }` moves a clip into sync with another by
+their sound (inputs under `lock_agent`, decode + correlate without it, `apply_audio_sync` under it
+again; `context.ct` cancels it, a slot wait goes out as a progress notification) and answers
+`AudioSync` (offset, confidence, distinct — `null` for no rival peak —, reliable, inverted, applied);
+`project-changed` only when it moved. Its description says only each clip's used source window is
+compared. `export_variants` progress says `measuring the mix's loudness` while a static normalization meters. `export`'s `options.loudness_static` is in its description.
 `smart_crop` frames each shot for the delivery frame (the server `instructions`
 pair it with `set_delivery_format`, since reshaping to 9:16 otherwise keeps
 whatever was in the middle). `export_variants` is the one-call multi-format
@@ -160,13 +177,18 @@ say to caption **last** and to re-run after any further
 edit, because captions are placed in timeline time and a later trim moves the
 words out from under them — which an agent has no way to infer from the tool
 list.
-`import_captions` is the same step for a `.srt` / `.ass` / `.ssa` file: an absolute
+`import_captions` is the same step for a `.srt` / `.vtt` / `.ass` / `.ssa` file: an absolute
 `path` or inline `text` (exactly one), a `base` (`timeline`, or `source` with an
 `asset_id` — `CaptionTimeBase::resolve`, shared with the GUI, refuses a contradiction
 rather than preferring one half), the `generate_captions` look and an `offset`; it
 reads and parses on the blocking pool *before* taking the lock, and returns the
 `ImportSummary` rather than every overlay, and the `instructions` call it the caption
 step (last, and it replaces the generated set).
+`export_captions` writes the cut's captions (`.srt` / `.vtt`), `export_interchange` the cut as
+OTIO or a CMX 3600 EDL and `export_markers` the markers as CSV or YouTube chapters — each
+refuses to overwrite without `overwrite`, builds the file with the lock released and the last
+two return `{path, report}`. `export`'s options take `embed_captions` / `caption_sidecars`.
+`add_marker` / `update_marker` take `duration`, `comment` and `kind` (`comment` / `chapter`).
 `generate_voiceover` narrates a script onto the `VO` track (optionally captioning the
 cut in the same call), forwarding synthesis progress to the client's token and
 re-emitting `voiceover-progress` so the GUI shows an agent's voiceover too; like an
@@ -236,13 +258,14 @@ speech gate; omitted = compressor), `stems_status` and `separate_stems { asset_i
 (async, progress through the token like `generate_voiceover`, cancel via `context.ct`, the
 GUI sees `stems-progress`; answers `StemsPlaced`), and `export`'s `options.loudness` preset. The server
 `instructions` route music under a cut through analyze → fit_music → duck.
-`set_master_volume` / `set_master_limiter` are staged edits like any other;
+`set_master_volume` / `set_master_limiter` / `set_master_true_peak` are staged edits like any other;
 `get_levels` (`range?`, `loudnorm?`) measures the working timeline (the proposal) and takes
 `context.ct` as its cancel, and the server `instructions` — now a `const INSTRUCTIONS`, so a
 test can pin them — send a social cut through it (-14 LUFS, true peak under -1 dBTP, fix with
 the master tools or `loudnorm`). `set_master_limiter` names the ceiling the engine really
 defaults to (a test ties its text to `MASTER_DEFAULT_CEILING_DB`) and says that a true peak still
-over -1 dBTP with the limiter on is fixed by lowering the ceiling, not by switching it on again.
+over -1 dBTP with the limiter on is fixed by `set_master_true_peak` or a lower ceiling, not by
+switching it on again.
 `platform_check` (optional `range`, `{start, end}` timeline seconds: judge only the span an export of
 that range would write, on the sliced cut) tells it whether the cut is publishable where it is going
 (and the server `instructions` tell it to run that before reporting a cut
@@ -253,6 +276,26 @@ the audience), and `export_cover` writes the thumbnail.
 `revision_diff` explains a past revision. The server `instructions` spell the flow
 out, since an agent that does not know its edits are held back would report a cut
 the user has not got.
+
+**Transcript reads.** Words are most of a transcript (~1.4 MB for two hours), so `analyze_asset` and
+`get_asset_metadata` answer a summary (`reads::AnalysisSummary`: counts, the head of the text and the speaker
+labels; never the words or the lines). `get_transcript { asset_id, words?, speaker?, from?, to?, offset?,
+limit? }` (`reads.rs`) pages the lines overlapping the source window, each with its `speaker`, at most `limit`
+(default 100, ≤ 500) from `offset` with `total`, `speakers` and `next_offset` to page on; `words: true` (default
+false) adds the words, estimated on the fly for a transcript cached before words were recorded.
+`speaker_ranges { asset_id, speaker?, join_gap?, offset?, limit? }` (gap clamped 0..10 s, default 0.75) is "cut to speaker": each
+speaker's source-time ranges (by each word's label, not the line's majority; a window of `limit` ≤ 2000 per speaker, `total_ranges`
+and `more` say what is left) and speaking time.
+`find_filler_words { asset_id, fillers?, offset?, limit? }` (≤ 100 fillers) returns fillers by word bounds for
+`cut_clip_range`, paged (`total`, `next_offset`; `limit` ≤ 1000). `refine_transcript { asset_id, background? }` re-times words and labels speakers on a cached
+transcript through `crate::run_refine`, the Tauri command's body: background lane, `analysis-progress`,
+stopped by the request's cancellation or the GUI's analysis Stop (`begin_analysis`), refused if a newer
+transcript landed meanwhile or the project was replaced (`require_generation`), `analysis-status` after
+(not `project-changed`: only analysis moved). `sync_clips_by_audio` is a long tool the same way (`background`,
+progress for a wait on the heavy-job slot, `stop_or_replaced`), and its move stages like any agent edit
+(`lock_agent_edit`). `get_scopes` takes the request's cancellation and reads the working timeline (the
+proposal); `set_grade` checks a new LUT path like an import (absolute, local, an existing regular file, no URL or
+network share) before it reads it.
 
 **Proxies and analysis steps.** `analyze_asset { asset_id, steps? }` runs only the named kinds
 (`silence`, `scenes`, `loudness`, `rhythm`, `transcript`, `all`; aliases such as `tempo` / `transcription`
@@ -271,6 +314,27 @@ a full-detail frame of the original.
 tools take the project as the agent (`lock_agent`: activity stamped, edits attributed). Asking
 `analyze_asset` for nothing it can run — everything switched off and no `steps`, or only audio steps on
 a file with no audio — is an invalid-params error, not an empty result.
+
+**Strict arguments, hints and editor context.** The `call_tool` override refuses a call
+naming a key its tool's `input_schema` does not list (`mcp/args.rs`) as invalid params
+(-32602), naming the key and the accepted ones (or "it takes no arguments") — serde drops
+an unknown key, so `trim { rippel: false }` used to trim with the project's mode and report
+success. The accepted set follows `allOf` / `anyOf` / `oneOf` and local `$ref`s (a
+`#[serde(flatten)]` struct or enum), and a schema with `additionalProperties` (a flattened
+map) accepts anything. Only **top-level** keys are checked; keys inside a nested object
+(`export`'s `options`, a `moves` entry) are still dropped by serde. schemars does not list
+`#[serde(alias)]` names, so the check would refuse them: parameter structs take no alias
+(`mcp_parameters_take_no_serde_alias` scans `mcp.rs` and the `mcp/` modules). Every tool has a `title` and the four hints from the table in
+`mcp/hints.rs`, applied to the routes once in `router()`; `every_tool_is_titled_and_annotated`
+fails on a tool missing from it (and on an entry naming no tool), so **a new tool needs a
+row there**. Staged (or undoable) agent edits are not destructive; applying / discarding a
+proposal, `resolve_task` / `remove_task`, undo / redo / `revert_to` (the live cut), the
+exports (a file outside the project) and `delete_proxy` are. Reads and previews are
+`readOnlyHint`, and `openWorldHint` marks the tools that may download a model.
+`get_editor_context` returns what the webview last reported (`app.md`): playhead,
+`selected_clip_ids`, `mark_in` / `mark_out`, `visible_range`, `focused_panel`,
+`selected_asset_id`, with `age_secs` and `stale`; before any report (headless) it is
+`{reported: false, stale: true, note}`. The `instructions` point "this clip" / "here" at it.
 
 ## Review, ownership and the live cut
 
@@ -312,13 +376,13 @@ Agent edits **stage** (`core-project.md`). The adapter's part:
 ## Background jobs (`mcp/jobs.rs`)
 
 `analyze_asset`, `export`, `export_variants`, `generate_voiceover`, `separate_stems`, `download_speech_model`,
-`import_asset` and `smart_crop` take `background: true` and answer `{job_id}` at once; `job_status`, `cancel_job` and
+`import_asset`, `smart_crop`, `refine_transcript` and `sync_clips_by_audio` take `background: true` and answer `{job_id}` at once; `job_status`, `cancel_job` and
 `list_jobs` read and stop them. Each is written once against `jobs::Run` (`cancelled()` + `progress(fraction, message)`):
 a foreground call builds it from the request (`foreground`: the `ct` cancellation token and the `progressToken`, with a relay
 task that keeps progress monotonic), a background one from its record in `Jobs` (bounded: 8 running, 48 records, a finished
 job forgotten after an hour). `KerfMcp::long_tool` does the branching, so **argument validation stays in the tool body,
 before it** — a bad path or id is an error on the call, not a job that fails later. The GUI's Stop reaches the agent's run
-of the same job: `analyze_asset`, `import_asset`, `download_speech_model`, `export_cover`, `generate_voiceover`,
+of the same job: `analyze_asset`, `refine_transcript` (the analysis Stop), `import_asset`, `download_speech_model`, `export_cover`, `generate_voiceover`,
 `separate_stems`, `smart_crop`, `export` and `export_variants` poll the `StopEpoch` the GUI's own button trips
 (`Run::also_cancelled_by(begin_analysis() / begin_import() / begin_model_download() / begin_cover_export() /
 begin_voiceover() / begin_stems() / begin_smart_crop() / begin_export())`; a Stop pressed before a run began does not end
@@ -337,7 +401,8 @@ request's cancellation token, so a dropped request kills its ffmpeg; `export_cov
 only the assets of the page are looked at on the disk) and lists each asset with `source_missing` (stat, outside the lock), `proxy` (`ProxyBrief`: state, fraction, ETA,
 reason) and per-kind `analysis` states; `get_asset_metadata` and `analyze_asset` answer an `AnalysisSummary` (counts, totals,
 the first ~600 characters of the transcript); `get_transcript` and `get_analysis_detail` page the lists (`offset` / `limit`,
-`next_offset`, windows in source seconds); `get_timeline_state` moves the *generated* captions into a `captions` window
+`next_offset`, windows in source seconds; `get_transcript` also takes `speaker` and `words`: the lines carry their speaker label and the
+timed words only on request, `speakers` lists the labels, and the summaries name the speakers but never carry words); `get_timeline_state` moves the *generated* captions into a `captions` window
 (`captions_offset` / `captions_limit`; `full: true` for everything) and, past 200 clips, windows the clips too
 (`clips_offset` / `clips_limit`, a `clips_window` object with `next_offset`); `staged_diff` and `revision_diff` answer the
 diff's numbers and headline with `entries` paged (`offset` / `limit`, 100 by default); `history` and `list_tasks` take
@@ -351,7 +416,7 @@ relinking and removing media are the user's); `generate_captions` answers a coun
 `project_info`, `save_project`, `save_project_as` (absolute `.kerf`, `overwrite`, reopen guarded by `change_count` and
 `require_generation`; the swap keeps the generation, so jobs in flight still land), `open_project`, `new_project`
 (all three record the open project for the recent list / "reopen last project", as the GUI does):
-replacing a project that exists only in memory needs `discard_unsaved`, which review forbids (above); a swap emits
+`new_project` starts an untitled project in a crash-recovery file like the window's New (`recovery::untitled`), and each swap `close()`s the project it replaced once the lock is released (an untitled one's recovery directory goes with it). Replacing a project that exists only in memory (or untitled) needs `discard_unsaved`, which review forbids (above); a swap emits
 `project-replaced` (the page reloads like after its own open) and does what the GUI's open does (`restore_speech_model`,
 `respawn_proxies`, scrub cache). `get_settings` / `set_settings` are an allow-list (`READABLE` / `WRITABLE`): auto_analysis,
 cpu_percent, proxy_size, preview_source, time_display, plus `agent_review` read-only — never the theme, layout, workspaces,
@@ -365,30 +430,31 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
 
 - **Project and library**: `project_info`, `save_project`, `save_project_as`, `open_project`, `new_project`, `list_assets`,
   `missing_assets`, `get_asset_metadata`, `import_asset`, `set_asset_projection`, `list_fonts`.
-- **Analysis and proxies**: `analyze_asset`, `analysis_status`, `get_transcript`, `get_analysis_detail`,
+- **Analysis and proxies**: `analyze_asset`, `analysis_status`, `get_transcript`, `speaker_ranges`, `find_filler_words`,
+  `refine_transcript`, `get_analysis_detail`,
   `transcription_status`, `download_speech_model`, `set_speech_model`, `proxy_status`, `rebuild_proxy`, `delete_proxy`,
   `get_music_structure`.
-- **Looking and measuring**: `timeline_summary`, `get_timeline_state`, `skim_asset`, `get_frame`, `preview_timeline`,
+- **Looking and measuring**: `timeline_summary`, `get_timeline_state`, `get_editor_context`, `get_scopes`, `skim_asset`, `get_frame`, `preview_timeline`,
   `get_waveform`, `get_waveform_range`, `get_energy`, `get_levels`, `platform_check`.
 - **Editing the cut**: `cut_clip`, `add_clip_to_timeline`, `split_at`, `trim`, `reorder`, `move_clip`, `move_clips`,
   `ripple_delete`, `cut_clip_range`, `roll_edit`, `slip_clip`, `slide_clip`, `split_remove`, `split_remove_clips`, `remove`,
-  `remove_clips`, `duplicate_clips`, `concatenate`, `remove_silence`, `snap_to_beats`, `smart_crop`, `add_track`,
+  `remove_clips`, `duplicate_clips`, `concatenate`, `remove_silence`, `snap_to_beats`, `sync_clips_by_audio`, `smart_crop`, `add_track`,
   `remove_track`, `get_ripple_mode`, `set_ripple_mode`.
 - **Linked picture and sound**: `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
   `reattach_audio_clips`, `link_clips`, `unlink_clips`.
 - **Clip look and sound**: `set_volume`, `set_fade`, `set_speed`, `set_transform`, `set_color`, `set_transition`,
-  `set_video_effects`, `set_audio_effects`, `set_mask`, `set_clip_enabled`.
+  `set_grade`, `set_video_effects`, `set_audio_effects`, `set_mask`, `set_clip_enabled`.
 - **Keyframes and 360**: `set_keyframes`, `add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`, `copy_keyframes`,
   `clear_keyframes`, `set_reframe`, `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`.
 - **Mix and music**: `set_track_volume`, `set_track_pan`, `set_track_duck`, `set_track_muted`, `set_track_solo`,
-  `set_track_locked`, `set_master_volume`, `set_master_limiter`, `set_master_duck`, `plan_music_fit`, `fit_music`,
+  `set_track_locked`, `set_master_volume`, `set_master_limiter`, `set_master_true_peak`, `set_master_duck`, `plan_music_fit`, `fit_music`,
   `separate_stems`, `stems_status`.
 - **Titles, captions, markers, frame**: `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
   `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `list_svg_presets`, `validate_svg`, `preview_svg_overlay`,
-  `preview_svg_preset`, `generate_captions`, `import_captions`, `clear_captions`, `export_srt`, `add_marker`,
+  `preview_svg_preset`, `generate_captions`, `import_captions`, `clear_captions`, `export_srt`, `export_captions`, `add_marker`,
   `update_marker`, `remove_marker`, `set_delivery_format`.
 - **Voiceover**: `generate_voiceover`, `voiceover_status`.
-- **Delivery**: `export`, `export_variants`, `export_cover`, `export_capabilities`.
+- **Delivery**: `export`, `export_variants`, `export_cover`, `export_capabilities`, `export_interchange`, `export_markers`.
 - **Review and history**: `stage_edits`, `staged_diff`, `apply_staged_edits`, `apply_staged_subset`, `discard_staged_edits`,
   `undo_staged_edit`, `restore_discarded_edits`, `history`, `revision_diff`, `undo`, `redo`, `revert_to`.
 - **Task queue**: `list_tasks`, `add_task`, `claim_next_task`, `complete_task`, `fail_task`, `resolve_task`, `remove_task`.

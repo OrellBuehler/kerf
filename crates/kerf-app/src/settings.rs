@@ -1759,4 +1759,18 @@ mod tests {
         assert!(fresh.agent_review, "review is a preference, and goes back on");
         assert_eq!(fresh.cpu_percent, Settings::default().cpu_percent);
     }
+
+    /// The settings file and a webview's patch, mutated: an unreadable one is an error (the file is
+    /// moved aside and the defaults used), never a panic.
+    #[test]
+    fn hostile_settings_never_panic() {
+        let stored = r##"{"cpu_percent":75,"auto_analysis":{"enabled":true,"silence":true,"scenes":false,"loudness":true,"rhythm":true,"transcript":false},"transcribe":true,"proxy_size":1080,"preview_source":"proxy","safe_areas":true,"gpu_preview":false,"layout":{"grid":{"root":{"type":"branch","data":[]}},"panels":{}},"theme":{"name":"Mine","version":1,"colors":{"kerf-500":"#ff8800"}},"workspaces":{"active":"color","library":{"tab":"effects","collapsed":true}},"keybindings":{"version":1,"bindings":{"edit.undo":["Mod+Z"],"tool.razor":[]}}}"##;
+        kerf_core::hostile::assert_no_panic("settings.json", &[stored.as_bytes()], 1500, |bytes| {
+            let text = String::from_utf8_lossy(bytes);
+            let read = parse(&text);
+            if let Ok(patch) = serde_json::from_str::<serde_json::Value>(&text) {
+                let _ = merge(read.as_ref().unwrap_or(&Settings::default()), &patch);
+            }
+        });
+    }
 }

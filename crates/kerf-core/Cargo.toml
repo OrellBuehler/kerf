@@ -27,6 +27,8 @@ libav-render = ["ffmpeg"]
 # transcription still works when the `ffmpeg` binary has the (FFmpeg 8.0)
 # `whisper` filter — see `engine::whisper`.
 whisper = ["dep:whisper-rs"]
+# `hostile`, the seeded mutation the robustness tests share; never in a release build.
+test-support = []
 
 [dependencies]
 serde.workspace = true
@@ -50,7 +52,7 @@ misaki-rs = { version = "0.6", default-features = false }
 sha2 = "0.11"
 flate2 = "1"
 tar = "0.4"
-zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 # STFT for the music analysis (onset flux, chroma; see engine::music).
 realfft = "3.5"
 # Animated SVG overlays (see svg): roxmltree reads the source, resvg draws each frame. Text and
@@ -69,6 +71,10 @@ imagesize = "0.15"
 data-url = "0.3"
 ffmpeg-next = { workspace = true, optional = true }
 whisper-rs = { version = "0.16.0", optional = true }
+
+[dev-dependencies]
+# Itself with `test-support`, so the integration tests under `tests/` see `hostile`.
+kerf-core = { path = ".", default-features = false, features = ["test-support"] }
 
 # Scheduling priority for background ffmpeg runs (see engine::cpu). Unix only —
 # Windows sets its priority class through a process creation flag instead.

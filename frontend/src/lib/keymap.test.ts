@@ -344,7 +344,7 @@ const ADDED: Record<string, string> = {
  *  A/V), by what the key is and which modifiers it carries. `Mod` is ⌘ / Ctrl as everywhere.
  *  Like `ADDED`, writing a new one here is how the decision is recorded. */
 const ADDED_SHIFT: Record<string, string> = { d: 'edit.detachAudio' };
-const ADDED_MOD: Record<string, string> = { l: 'edit.link', k: 'edit.split' };
+const ADDED_MOD: Record<string, string> = { l: 'edit.link', k: 'edit.split', g: 'playback.goToTimecode' };
 const ADDED_MOD_SHIFT: Record<string, string> = { d: 'edit.reattachAudio', l: 'edit.unlink' };
 
 /** What a keypress should do now: the keys and chords added since take their own answer (a
@@ -384,7 +384,8 @@ describe('the default keys are the ones the editor always had', () => {
 			['l', { shift: true }, 'edit.unlink'],
 			['k', {}, 'edit.split'], // ⌘K: Split at playhead
 			[',', { alt: true }, 'edit.slideBack'], // ⌥⌘, / Ctrl+Alt+,
-			['.', { alt: true }, 'edit.slideForward']
+			['.', { alt: true }, 'edit.slideForward'],
+			['g', {}, 'playback.goToTimecode']
 		];
 		const bare: [string, Mods, string][] = [
 			['v', {}, 'tool.pointer'],
@@ -972,6 +973,11 @@ describe('keys that act once per press', () => {
 			'file.export',
 			'file.importCaptions',
 			'file.saveCover',
+			'file.exportCaptions',
+			'file.exportOtio',
+			'file.exportEdl',
+			'file.exportMarkers',
+			'file.exportChapters',
 			'app.settings',
 			'app.quit',
 			'edit.copy',
@@ -998,6 +1004,7 @@ describe('keys that act once per press', () => {
 			'playback.toggle',
 			'playback.shuttleBack',
 			'playback.shuttleForward',
+			'playback.goToTimecode',
 			'marker.add',
 			// Commands with no key of their own, run from the menus: one press, one run.
 			'view.minimap',
@@ -1126,6 +1133,7 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/components/editor/SettingsAgent.svelte',
 			'lib/components/editor/SettingsDialog.svelte',
 			'lib/components/editor/SliderRow.svelte',
+			'lib/components/editor/TimecodeField.svelte',
 			'lib/components/editor/Timeline.svelte',
 			'lib/components/editor/TitlesControls.svelte',
 			'lib/components/editor/VoiceoverDialog.svelte',

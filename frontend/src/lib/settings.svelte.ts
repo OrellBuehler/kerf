@@ -40,9 +40,12 @@ import {
 	displayChord,
 	emptyOverrides,
 	hasOverrides,
+	keyPreset,
 	matchAction,
 	modLabel,
 	parseKeyOverrides,
+	presetOf,
+	presetOverrides,
 	rebindConflicts,
 	resetAll,
 	resetPlan,
@@ -55,6 +58,7 @@ import {
 	type Chord,
 	type KeyEventLike,
 	type KeyOverrides,
+	type KeyPresetId,
 	type Rebind,
 	type ResetPlan,
 	type Resolution
@@ -562,6 +566,18 @@ class SettingsStore {
 
 	resetAllKeys() {
 		this.changeKeys(resetAll(this.keyOverrides));
+	}
+
+	/** The keyboard preset in force, or null for one of the user's own. */
+	get keyPreset(): KeyPresetId | null {
+		return presetOf(this.keyOverrides, this.platform);
+	}
+
+	/** Put a preset's keyboard in place of whatever is stored (the dialog asks first when that is
+	 *  something of the user's). */
+	applyKeyPreset(id: KeyPresetId) {
+		const preset = keyPreset(id);
+		if (preset) this.changeKeys(presetOverrides(preset, this.platform));
 	}
 
 	private changeKeys(next: KeyOverrides) {

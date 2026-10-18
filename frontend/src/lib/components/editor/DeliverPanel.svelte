@@ -14,6 +14,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { formatsFor, hasPicture, presetFor, ratioLabel } from '$lib/delivery-formats';
 	import { timeDisplay } from '$lib/time-display.svelte';
+	import { timecodeRate } from '$lib/timecode';
 	import { tip } from '$lib/tip';
 
 	const hasClips = $derived(editor.timeline.tracks.some((t) => t.clips.length > 0));
@@ -24,6 +25,9 @@
 	const frame = $derived(presetFor(editor.timeline.format));
 	const rendering = $derived(editor.exportRun !== null);
 	const progress = $derived(editor.exportRun?.progress ?? null);
+	const lengthTip = $derived(
+		timeDisplay.mode === 'seconds' ? 'Minutes and seconds' : timecodeRate(editor.fps).drop > 0 ? 'Drop-frame timecode' : 'Non-drop timecode'
+	);
 	const clipCount = $derived(editor.timeline.tracks.reduce((n, t) => n + t.clips.length, 0));
 </script>
 
@@ -33,7 +37,7 @@
 		<div style="display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--text-secondary)">
 			<div style="display:flex;justify-content:space-between;gap:8px">
 				<span style="color:var(--text-muted)">Length</span>
-				<span style="font-family:var(--font-mono)" use:tip={'Non-drop timecode'}
+				<span style="font-family:var(--font-mono)" use:tip={lengthTip}
 					>{timeDisplay.fmt(editor.duration)}</span
 				>
 			</div>

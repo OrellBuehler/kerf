@@ -2,6 +2,7 @@
 	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
 	import PreviewEmpty from './PreviewEmpty.svelte';
+	import TimecodeField from './TimecodeField.svelte';
 	import { timeDisplay } from '$lib/time-display.svelte';
 	import ScrubBar from './ScrubBar.svelte';
 	import TrimMonitor from './TrimMonitor.svelte';
@@ -41,7 +42,7 @@
 	import { audio } from '$lib/audio';
 	import { CANVAS_PAINTER, createStreamPainter, jpegDataUrl } from '$lib/frame-transport';
 	import { decodeJpeg, paintPicture } from '$lib/frame-canvas';
-	import { renderedDuration, renderedFps } from '$lib/timecode';
+	import { renderedDuration, renderedFps, timecodeRate } from '$lib/timecode';
 	import { logFrontend } from '$lib/log';
 	import { clipDuration } from '$lib/types';
 	import type { SvgOverlay, TextOverlay } from '$lib/types';
@@ -602,6 +603,9 @@
 			: previewSourceWidth(editor.timeline, editor.assets, mediaStatus.proxies, settings.previewSource, settings.proxySize, ui.time)
 	);
 	const frameWidth = $derived(boxWidth === null ? null : capToSource(boxWidth, sourceWidth));
+	$effect(() => {
+		ui.previewWidth = frameWidth;
+	});
 	/** Bumped when the backend has taken a new place for the surface: the frame is drawn again. */
 	let boundsEpoch = $state(0);
 	let wantedBounds: PreviewBoundsReport | null = null;
@@ -1232,17 +1236,16 @@
 		>
 			<Icon n="skip-forward" s={14} />
 		</button>
-		<span
-			use:tip={`Timeline timecode · ${editor.fps.toFixed(3)} fps · non-drop`}
-			style="font-family:var(--font-mono);font-size:12px;color:var(--kerf-300);font-weight:500;white-space:nowrap">{tc(ui.time)}</span
-		>
+		<TimecodeField entry="preview" weight={500} />
 		<ScrubBar {duration} {empty} />
 		{#if parts.duration}
 			<span style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);white-space:nowrap">{tc(duration)}</span>
 		{/if}
 		{#if parts.rate}
 			<span
-				use:tip={'Timeline frame rate; non-drop timecode'}
+				use:tip={timeDisplay.mode === 'seconds'
+					? 'Timeline frame rate'
+					: `Timeline frame rate; ${timecodeRate(editor.fps).drop > 0 ? 'drop-frame' : 'non-drop'} timecode`}
 				style="font-size:11px;color:var(--text-muted);white-space:nowrap">{Number(editor.fps.toFixed(3))} fps</span
 			>
 		{/if}

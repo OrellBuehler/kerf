@@ -60,6 +60,9 @@ pub enum Error {
     )]
     AssetInUse { asset: uuid::Uuid, clips: usize },
 
+    #[error("this project was made by a newer Kerf (file format v{found}; this version opens up to v{supported}) — update Kerf to open it")]
+    NewerProject { found: u32, supported: u32 },
+
     #[error("FFmpeg support is not enabled in this build (enable the `ffmpeg` feature)")]
     FfmpegDisabled,
 

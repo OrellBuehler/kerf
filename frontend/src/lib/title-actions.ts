@@ -103,7 +103,7 @@ export function dropCaptions(): Promise<void> {
  *  that never answers must not leave the controls dead. */
 let importing = false;
 
-/** Caption the cut from a subtitle file the user picks (`.srt` / `.ass` / `.ssa`),
+/** Caption the cut from a subtitle file the user picks (`.srt` / `.vtt` / `.ass` / `.ssa`),
  *  timed as `choice` says and in the look the caption chips are set to. Picks the
  *  file, asks before replacing captions that are already on the cut — generated
  *  and imported ones are one set, so the import replaces either — then imports as

@@ -385,7 +385,7 @@ fn extract_member(archive: &Path, member: &str, dst: &Path) -> Result<()> {
         let mut zip = zip::ZipArchive::new(file).map_err(|e| err(&e))?;
         for i in 0..zip.len() {
             let mut entry = zip.by_index(i).map_err(|e| err(&e))?;
-            if entry.is_file() && is_member(entry.name(), member) {
+            if entry.is_file() && entry.name().is_ok_and(|name| is_member(&name, member)) {
                 std::io::copy(&mut entry, &mut out).map_err(|e| err(&e))?;
                 return Ok(());
             }
@@ -832,6 +832,7 @@ pub fn build_transcript(sentences: &[Sentence], durations: &[f64]) -> Vec<Transc
             start: at,
             end: at + duration,
             text: sentence.text.clone(),
+            ..Default::default()
         });
         at += duration;
     }

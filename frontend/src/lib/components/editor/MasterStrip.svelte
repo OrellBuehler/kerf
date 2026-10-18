@@ -125,6 +125,9 @@
 	function toggleLimiter() {
 		void editor.setMasterLimiter(!master.limiter).catch(err);
 	}
+	function toggleTruePeak() {
+		void editor.setMasterTruePeak(!master.true_peak).catch(err);
+	}
 	const ceilingStep = (v: number, key: SliderKey) =>
 		key.kind === 'edge' ? (key.to === 0 ? -24 : 0) : nudgeCeiling(v, key.dir, key.size);
 	function ceilingMove(v: number) {
@@ -238,6 +241,17 @@
 				</div>
 				<span class="ceil-val">{ceilingLabel(ceiling)}</span>
 			</div>
+			<button
+				type="button"
+				class="limiter"
+				class:on={!!master.true_peak}
+				class:dim={!master.limiter}
+				aria-pressed={!!master.true_peak}
+				use:tip={master.true_peak
+					? 'True peak on — the exported limiter runs 4× oversampled, so the peaks between samples stay under the ceiling too (what platforms measure as dBTP). The preview’s limiter is the same either way.'
+					: 'True peak off — the exported limiter holds the sample peak; the peaks between samples can read up to about a decibel above the ceiling.'}
+				onclick={toggleTruePeak}>True peak</button
+			>
 
 			<div class="duck">
 				<div class="duck-head">
@@ -439,7 +453,8 @@
 		align-items: baseline;
 		gap: 0 4px;
 	}
-	.ceiling.dim {
+	.ceiling.dim,
+	.limiter.dim {
 		opacity: 0.6;
 	}
 	.cap {

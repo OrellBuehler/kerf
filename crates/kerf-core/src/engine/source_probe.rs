@@ -445,4 +445,26 @@ mod tests {
         assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn hostile_packet_and_frame_json_never_panics() {
+        let packets = packets_json(3, 12);
+        let frames = r#"{"frames":[{"pts":0,"key_frame":1,"pict_type":"I"},{"pkt_pts":1536,"key_frame":1,"pict_type":"I"},{"best_effort_timestamp":3072,"key_frame":0,"pict_type":"P"}]}"#;
+        crate::hostile::assert_no_panic(
+            "ffprobe packets and frames",
+            &[packets.as_bytes(), frames.as_bytes()],
+            1500,
+            |b| {
+                let text = String::from_utf8_lossy(b);
+                if let Some(p) = parse_packets(&text) {
+                    let (sync, _) = sync_points(&p, SYNC_PROBE_POINTS);
+                    if let Some(k) = parse_keyframes(&text) {
+                        let _ = decode_as_keyframes(&sync, &k);
+                    }
+                }
+                let mut answers = [text.to_string(), text.to_string(), text.to_string(), text.to_string()].into_iter();
+                let _ = probe_seek_points(|_, _, _| answers.next());
+            },
+        );
+    }
 }

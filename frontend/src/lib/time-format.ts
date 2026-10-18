@@ -1,8 +1,8 @@
 // How a time reads, and how a typed one is read back — pure. There were three spellings of a position in the
 // editor: the transport's frame timecode, the side panels' `m:ss.d`, and a bare `4.633333` in a number field,
 // so the same clip's start was `00:00:12:15` in one panel and `0:12.5` in the next. This is the one place that
-// decides, over a *mode* — `timecode` (the default: non-drop `HH:MM:SS:FF`, a count of frames of the rate it is
-// asked in) or `seconds` (`m:ss.d`, what the review card prints). Which one is in force is `timeDisplay`
+// decides, over a *mode* — `timecode` (the default: `HH:MM:SS:FF`, drop-frame `HH;MM;SS;FF` at 29.97 / 59.94, a count of
+// frames of the rate it is asked in) or `seconds` (`m:ss.d`, what the review card prints). Which one is in force is `timeDisplay`
 // (`time-display.svelte.ts`); everything that prints a position calls through it.
 //
 // A *field* is different from a readout: it is edited, so it shows a value that can be typed back exactly —
@@ -15,7 +15,7 @@
 // the backend's own phrasing, and a sentence the backend wrote cannot be re-spelled here.
 
 import { clock } from './clock';
-import { formatTimecode } from './timecode';
+import { formatTimecode, timecodeFrames, timecodeRate } from './timecode';
 
 export type TimeMode = 'timecode' | 'seconds';
 
@@ -116,8 +116,9 @@ export function parseTime(text: string, fps: number, mode: TimeMode = DEFAULT_TI
 	if (frames >= nominal) return null;
 	if (seconds >= 60 || (n.length >= 3 && minutes >= 60)) return null;
 	// Timecode counts frames in whole nominal seconds (`formatTimecode`), so at 29.97 the second that is
-	// `:00` is the 30th frame, not exactly one second in: divide the count, not the fields.
-	return (((hours * 60 + minutes) * 60 + seconds) * nominal + frames) / rate;
+	// `:00` is the 30th frame, not exactly one second in: divide the count, not the fields. At a drop-frame
+	// rate the count is the drop-frame one, as the label that was printed.
+	return timecodeFrames(timecodeRate(rate), hours, minutes, seconds, frames) / rate;
 }
 
 /** A typed time for a field that is a frame position: parsed, then put on a frame. `null` for text that is not

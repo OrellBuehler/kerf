@@ -335,17 +335,19 @@ impl KerfMcp {
             super::require_generation(&project, generation, "it was being saved")?;
             // The copy is the same project in another file, so the jobs in flight still land: the
             // swap keeps the generation.
-            if project.change_count() == before {
-                project.replace_with_saved_copy(opened);
+            let old = if project.change_count() == before {
+                project.replace_with_saved_copy(opened)
             } else {
                 // Something wrote while the copy was being reopened (analysis merged, an edit):
                 // the copy is out of date, so make it again under one held lock.
                 drop(opened);
                 project.save_as(&path).map_err(core_err)?;
-                project.replace_with_saved_copy(Project::open(&path).map_err(core_err)?);
-            }
+                project.replace_with_saved_copy(Project::open(&path).map_err(core_err)?)
+            };
             let saved = project.path().map(|p| p.display().to_string());
             drop(project);
+            // An untitled project's recovery directory goes: it was just saved.
+            old.close();
             app.state::<crate::AppState>().scrub.clear();
             crate::note_open(&app, saved.as_deref());
             Ok(Some(saved))
@@ -380,9 +382,10 @@ impl KerfMcp {
             let mut project = lock_agent_as(&shared, owner.as_deref());
             // Asked again under the lock that swaps: the user may have added to it meanwhile.
             require_discard_ok(&project, discard)?;
-            project.replace_with(opened);
+            let old = project.replace_with(opened);
             let now = project.path().map(|p| p.display().to_string());
             drop(project);
+            old.close();
             Self::after_replace(&app, &shared);
             crate::note_open(&app, now.as_deref());
             Ok(now)
@@ -393,7 +396,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Start a new, empty project in memory, replacing the one that is open (the window switches to it). \
+        description = "Start a new, empty untitled project, replacing the one that is open (the window switches to it). \
                        Refused while the open project has work that was never saved, unless `discard_unsaved` (which, like \
                        open_project, only works while the user has agent review off). The new project has no file until \
                        save_project_as."
@@ -403,11 +406,17 @@ impl KerfMcp {
         require_discard_ok(&self.lock(), discard)?;
         let (shared, owner, app) = (self.project.clone(), self.owner(), self.app.clone());
         blocking(move || {
-            let fresh = Project::open_in_memory().map_err(core_err)?;
+            // An untitled project is backed by a crash-recovery file, as the window's New makes it.
+            let fresh = crate::recovery::untitled(&app).map_err(|e| McpError::internal_error(e, None))?;
             let mut project = lock_agent_as(&shared, owner.as_deref());
-            require_discard_ok(&project, discard)?;
-            project.replace_with(fresh);
+            if let Err(e) = require_discard_ok(&project, discard) {
+                drop(project);
+                fresh.close();
+                return Err(e);
+            }
+            let old = project.replace_with(fresh);
             drop(project);
+            old.close();
             Self::after_replace(&app, &shared);
             // A project with no file is nothing for a launch to reopen.
             crate::note_open(&app, None);

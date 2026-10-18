@@ -285,6 +285,7 @@ pub fn filter_available() -> bool {
         let ok = output_bounded(
             command(&bin).args(["-hide_banner", "-loglevel", "quiet", "-h", "filter=whisper"]),
             std::time::Duration::from_secs(60),
+            0,
         )
         .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("whisper AVOptions"))
         .unwrap_or(false);
@@ -493,7 +494,12 @@ pub fn parse_srt(text: &str) -> Vec<TranscriptSegment> {
         if text.is_empty() {
             continue;
         }
-        segments.push(TranscriptSegment { start, end, text });
+        segments.push(TranscriptSegment {
+            start,
+            end,
+            text,
+            ..Default::default()
+        });
     }
     segments
 }

@@ -101,8 +101,8 @@ editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Bt
 and `StatusBar` as fixed chrome around a **dockable workspace** (`Workspace.svelte`, composed by
 `routes/+page.svelte`). The workspace is `dockview` (the vanilla package; its
 `--dv-*` variables are mapped onto Kerf tokens in `styles/dockview-kerf.css` so
-it follows the theme) hosting seven panels — `LibraryPanel`, `Preview`, `Timeline`,
-`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer` — each a Svelte component
+it follows the theme) hosting eight panels — `LibraryPanel`, `Preview`, `Timeline`,
+`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer`, `Scopes` — each a Svelte component
 `mount`ed into a dockview content element, so every panel is resizable by its
 sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
 and closable; the **Window** menu reopens one (the library left of the
@@ -298,7 +298,9 @@ still turns amber when an update is waiting, which is why it stayed out of Help;
 has *Check for updates…*. The OS window's title is `• interview.kerf — Kerf` (`window-title.ts`; the dot leads while there is
 unsaved work), set through `setWindowTitle` and the `core:window:allow-set-title` capability. The project's path moved to the status bar. **The menus**
 (`MenuBar.svelte` over the pure, bun-tested `menus.ts`): *File* (New, Open…, Save…,
-Import media…, Import captions…, Export…, Save cover frame…, Settings, Quit — Save is
+Import media…, Import captions…, Export…, Save cover frame…, an **Export as** submenu — Export captions…,
+Export OTIO…, Export EDL…, Export markers as CSV…, Export YouTube chapters…, the last two off until
+there is a marker (`MenuState.hasMarkers`) —, Settings, Quit — Save is
 "as…" once the project has a file, since a saved project is its own SQLite file and
 `save_project_as` is the only save there is), *Edit* (Undo / Redo, Cut / Copy / Paste /
 Duplicate, **Split at playhead**, Delete / Ripple delete / Select all, **Tool**, **Clip** and
@@ -307,7 +309,7 @@ one-frame roll / slip / slide keys — Ripple mode and Snapping as ticks,
 Customize keyboard shortcuts…), *View* (zoom, **Track height**, Overview strip, Safe-area guides,
 **Delivery frame**, **Workspace**), *Window* (every panel as a tick, Reset <workspace>
 workspace, Reset all workspaces — which asks first when any arrangement is stored),
-*Playback* (Play / pause, Go to start / end, back and forward a frame and a second,
+*Playback* (Play / pause, Go to start / end, Go to timecode, back and forward a frame and a second,
 Shuttle J / K / L, Set / Clear in and out, markers — the transport lives in the Preview
 panel and a panel can be closed, so the whole of it is here as registry actions with
 their bindings), *Help* (Keyboard shortcuts… — the cheat sheet —, Customize keyboard shortcuts…, Check for updates…, Release notes, Show log folder,
@@ -393,7 +395,13 @@ disclosures, so they are keyboard-operable for free — each with a one-line
 **summary** on the right (`1.00×`, `Cropped`, `2 keyframes`) so a collapsed
 section still says what it holds; Timing, Volume and Titles open by default,
 everything else is folded. It edits the selected clip —
-trim, volume, fades, speed, transform, color, **transition** (a grouped picker
+trim, volume, fades, speed, transform, color, **curves / color wheels / LUT** (`GradeSections.svelte`: a canvas
+curve editor per channel — click adds a point, drag moves it, double-click or right-click removes it, one `set_grade` on
+release, Escape abandons via `beginDrag`; a click that only adds a point or puts a wheel's puck down waits 300 ms for
+a double-click, which undoes it, and a gesture that changes nothing writes nothing; three hue discs painted from `grade.ts`'s `wheelHue` with a lightness
+`SliderRow` each; a `.cube` picker, a Clear button and an intensity slider, with `inspect_lut` saying the size or why the
+file is not applied. Curves are drawn with `grade.ts`, the TS mirror of the engine's cubic; the preview shows the
+grade through FFmpeg because the GPU preview refuses a graded clip), **transition** (a grouped picker
 over `src/lib/transitions.ts` — fade / slide / push, then a direction, because
 that is the order the choice is actually made and a flat list of eleven names
 hides it; its bun test pins the ids against `TransitionKind::ALL`), plus **video / audio
@@ -441,7 +449,7 @@ box / bold).
 (a title's text was typed in the number face), and a field of seconds says so with an `s` in the keyframe slot beside it. A section
 header is 32 px (it was 49) with a flex summary that ends in an ellipsis beside the title, and its summary says what it holds: Timing
 `Start 0:00.0 · Dur 0:12.5`, Color `None` for an ungraded clip (it read `Custom`), the look it matches, `Custom`, or `Animated · 2 keys`
-(`inspector-summary.ts`). **One formatter for a time** (`time-format.ts`, pure and bun-tested; `timeDisplay` in `time-display.svelte.ts` is the reactive singleton every readout calls): a *mode* — `timecode` (the default: non-drop `HH:MM:SS:FF`, frames counted at the rate it is asked in) or `seconds` (`m:ss.d`, what the review card prints) — over the timeline's playhead and readouts, the transport, the scrub bar, the Inspector, the titles list, the status bar's `Cut`, the export range, the Deliver panel, the ruler's labels (`tickLabel(k, grid, fps, mode)`: `m:ss` on a whole-second step, the fraction to the millisecond below one), the Mixer's measured range (`scopeLabel(range, duration, fmt)`) and the Stems / Fit-music dialogs (`describeFit(report, fmt)`). Settings wires the mode (`timeDisplay.mode = …`); nothing else sets it. A bin row keeps its `m:ss` duration, the platform check its `m:ss` (it states the same length as the limit messages the backend writes), and the review card's `m:ss.d` is a mirror of the backend's phrasing (`diff.ts`) — a sentence the backend wrote is not re-spelled here. **A field is edited, so it shows what can be typed back**: the Inspector's In / Out and a title's Start / End are text fields (`timeRow`) showing timecode (or decimal seconds to the frame, never `4.633333`) and taking either spelling — `12.5`, `375f`, `0:12.5`, `00:00:12:15` (`parseTime(text, fps, mode)`; **a bare colon time is read the way the mode prints one**: timecode mode `1:05` is a second and five frames (the last field is frames, a field past the rate is refused), seconds mode it is a minute and five seconds (`M:SS` / `H:MM:SS`, `75:10` is minutes, `1:75` is refused); four fields are timecode and a decimal on the last is a clock, in both; the refusal's toast says what to type in the mode, `timeHint`) — put on a frame (`parseFrameTime`). In / Out count frames at the *source's* rate, not the cut's. The Source range read-only row went: it said what In and Out already show. A ◇ is amber and outlined when the
+(`inspector-summary.ts`). **One formatter for a time** (`time-format.ts`, pure and bun-tested; `timeDisplay` in `time-display.svelte.ts` is the reactive singleton every readout calls): a *mode* — `timecode` (the default: `HH:MM:SS:FF`, frames counted at the rate it is asked in — drop-frame `HH;MM;SS;FF` at 29.97 / 59.94, `formatTimecode` / `timecodeFrames`; the ruler's labels and `TimecodeField` follow `timeDisplay`) or `seconds` (`m:ss.d`, what the review card prints) — over the timeline's playhead and readouts, the transport, the scrub bar, the Inspector, the titles list, the status bar's `Cut`, the export range, the Deliver panel, the ruler's labels (`tickLabel(k, grid, fps, mode)`: `m:ss` on a whole-second step, the fraction to the millisecond below one), the Mixer's measured range (`scopeLabel(range, duration, fmt)`) and the Stems / Fit-music dialogs (`describeFit(report, fmt)`). Settings wires the mode (`timeDisplay.mode = …`); nothing else sets it. A bin row keeps its `m:ss` duration, the platform check its `m:ss` (it states the same length as the limit messages the backend writes), and the review card's `m:ss.d` is a mirror of the backend's phrasing (`diff.ts`) — a sentence the backend wrote is not re-spelled here. **A field is edited, so it shows what can be typed back**: the Inspector's In / Out and a title's Start / End are text fields (`timeRow`) showing timecode (or decimal seconds to the frame, never `4.633333`) and taking either spelling — `12.5`, `375f`, `0:12.5`, `00:00:12:15` (`parseTime(text, fps, mode)`; **a bare colon time is read the way the mode prints one**: timecode mode `1:05` is a second and five frames (the last field is frames, a field past the rate is refused), seconds mode it is a minute and five seconds (`M:SS` / `H:MM:SS`, `75:10` is minutes, `1:75` is refused); four fields are timecode and a decimal on the last is a clock, in both; the refusal's toast says what to type in the mode, `timeHint`) — put on a frame (`parseFrameTime`). In / Out count frames at the *source's* rate, not the cut's. The Source range read-only row went: it said what In and Out already show. A ◇ is amber and outlined when the
 number is keyed somewhere, filled when a key sits at the playhead, and its tooltip names the row (`warmth`, not `temperature`). Crop is
 `Left / Right / Top / Bottom`, the mask `Center X / Y`, the title's `Position X / Y`, the section `Transition` with an `Into clip` select.
 **Footage Kerf did not detect as 360 has no 360 section**: the override (a source select and `This is 360 footage`) is a collapsed
@@ -549,6 +557,17 @@ YouTube −14 / Spotify −14 / Apple −16 / Broadcast −23 LUFS (`LOUDNESS_TA
 target and `loudness` wins over it exactly as in the engine (`loudnessChoice`), and
 `withLoudness` clears the flag in the same move so Off cannot be turned back into YouTube
 by a flag left set. The chosen target also reads in the summary line (`… · AAC 192k · -16 LUFS`).
+With a target, **Keep the dynamics** writes `ExportOptions.loudness_static` (one measured gain and a
+true-peak limiter instead of `loudnorm`; the hint under it says which). The Mixer's master FX block has a
+**True peak** toggle beside the limiter (`setMasterTruePeak`, dimmed while the limiter is off; export-only —
+the preview's limiter is the same either way, and `fxSummary` does not mention it).
+The clip menu offers **Sync by audio** when exactly two clips are selected and one is right-clicked:
+`audio-sync.ts` `syncOffer` greys it with the backend's refusals (no sound, speed ≠ 1, linked to each other,
+both on one track, the clicked clip's or a partner's track locked); `editor.syncByAudio` moves the clicked
+clip to the other (`describeSync` toast, and a **Move anyway** action — `force`, which applies the
+measurement just made — for a match that was not reliable). A sync queued behind another job shows a
+toast with Cancel (`onAudioSyncProgress` / `cancelAudioSync`; the cancelled rejection stays quiet). The harness answers as if both
+recordings started together.
 The options are remembered for the session (`export-draft.ts`: `ui.exportDraft`, written when the
 dialog closes, restored by `restoreDraft` unless the project has been re-cut for another frame since —
 a remembered 9:16 preset must not open on a 16:9 cut — and dropped by `ui.projectReplaced()` when a
@@ -639,6 +658,22 @@ filters, the `import_captions` arguments — in `api-caption-import.test.ts`.
 The **cover frame** is saved from the preview's context menu
 (`Save cover frame…` → `export_cover` at the playhead), and both a finished
 export and a saved cover offer **Show in folder** in their toast.
+The side-file exports (`file-actions.ts`: `exportCaptionFile`, `exportInterchangeFile`,
+`exportMarkerList`) ask for a path (`pickSavePath`) and toast the backend's `Report` as the
+description (`export-report.ts`: warnings first, `(×n)` counts; a warning toast when anything was
+dropped), so the notification log keeps what an OTIO / EDL could not carry; the harness writes no
+file and says so. The **export dialog** has a *Captions & chapters* section when the cut has
+captions or chapter markers: embed as a subtitle track (only for a container that carries one,
+`carriesSubtitles`, mirrored in `validateExport`; switching to one that cannot turns it off),
+*Keep captions out of the picture* (`skip_burned_captions`, with a line on why: the embedded
+track is off by default and the captions are otherwise burned in), `.srt` / `.vtt` sidecars, and
+a line saying how many chapter markers become chapters; with no captions in the cut all of these
+are reset to off. A sidecar that already exists comes back as a refusal naming it, which the
+dialog turns into a *Replace caption files?* confirmation and a rerun with `overwrite_sidecars`.
+**Markers** are edited in `MarkerDialog.svelte` (the marker's context menu, *Edit marker…*:
+name, Comment / Chapter, length, comment, one `update_marker` through `marker-edit.ts`, which
+sends only what changed); *Make it a chapter / a comment* flips the kind; a marker with a length
+draws its span under the ruler chip, and the tooltip names the kind, span and comment.
 `Preview` shows the composited frame under the playhead, and during
 **forward 1× playback it switches to the streamed frame source** (`start_playback`)
 — per-frame `get_timeline_frame` decodes stay for scrubbing, shuttle and the
@@ -761,7 +796,12 @@ files`; `export-progress` then carries `variant` / `total`. The
 **Transcript tab** of the library (`TranscriptPanel.svelte`, over the pure, bun-tested
 `src/lib/transcript.ts`) **is an editing surface**: lines resolve to the clip carrying them,
 click seeks, the playhead line highlights, and `×` cuts the sentence from the timeline
-(`cut_clip_range`); cut lines render struck through. When it is *empty* it says which
+(`cut_clip_range`, over its words' bounds when it has words, so the pauses either side stay); cut
+lines render struck through. A line resolves to the clip showing most of its cut range (not its
+midpoint), so a line whose words are gone reads as cut. With two or more speakers a label heads each
+change of speaker and a select filters the lines to one; a transcript with no speakers offers **Label
+speakers** (`ui.refineTranscript` → `refine_transcript`, shown and stoppable like an analysis pass).
+When it is *empty* it says which
 of the five reasons applies (nothing selected / no backend / model not downloaded /
 not analyzed / no speech) and offers the matching action — a model picker + download,
 or Analyze — instead of a dead end. The **agent panel is a real MCP task
@@ -804,6 +844,11 @@ engine. Below the queue, the **History** section renders
 `editor.history` (the `Revision[]` edit log, attributed to user/agent/system) with one-click
 `editor.revertTo(seq)`, and each row expands to *what* that revision changed
 (`revision_diff`).
+
+**Editor context.** So that an agent knows what "this clip" is, the page reports the playhead,
+selection, in/out marks, `ui.timelineView` (the timeline's visible seconds), `ui.focusedPanel`
+(dockview's active panel) and the selected asset through `reportUiContext` (`editor-context.ts`:
+throttled, unchanged state not re-sent, a 30 s heartbeat; a no-op in the harness) — `app.md`.
 
 **The Preview with nothing on the timeline** is `PreviewEmpty` (it was a clapperboard and "No media loaded"): a card of three steps — *Import
 media*, *Cut it on the timeline*, *Export* — each marked done / current / to do from the project (`firstRunSteps`, `first-run.ts`: an
@@ -1028,6 +1073,13 @@ Tab, or focus given back (Escape, a chord), so it cannot leak into a later dialo
 come back too); Voiceover ignores it while the script is non-empty (`scrimCloses`) and keeps the
 script as a draft (`kerf.voiceover.draft`, cleared by a successful generate, not kept for a script
 regenerated from an existing voiceover); Settings / Update / Fit / Stems still close on it.
+**Recovering a crashed untitled project**: after the first load (and before a launch file is
+opened) `offerRecoveries` in `+page.svelte` asks `listRecoveries` and, per session, newest first,
+`askRecovery(recoveryCopy(info))` — a native three-button dialog, **Recover · Discard · Not now**
+(`recovery.ts` holds the copy and `recoveryChoice`; a dismissed or unrecognised answer is Not now, and
+the two-button fallback offers Recover / Not now, never Discard). Recover asks about this project's
+unsaved work first (`okToReplace`), then `editor.recoverProject(id)`; after one recovery the rest wait
+for the next launch. The browser harness has none.
 **Nothing unsaved is dropped silently**: once saved a project is a
 SQLite file and every edit is committed as it happens, so only a never-saved,
 non-empty project (`editor.hasUnsavedWork`) can be lost — New, Open, the window's
@@ -1107,6 +1159,18 @@ action has since taken one (`applyReset`) — and Reset all, and a read-only lis
 abandoning drags and closing menus and dialogs, Tab, Enter / Space on a focused
 control, a widget's arrows, wheel and click modifiers). Focus goes back to a row
 after every change: focus left on the page behind a modal stops Escape closing it.
+**Presets** (`KEY_PRESETS` in `keymap.ts`): Kerf (the defaults), Premiere Pro, DaVinci Resolve and
+Final Cut Pro, each an override table over existing action ids (a `mac` table where the Mac's keys
+differ), applied as ordinary overrides (`presetOverrides`), so resolving, conflicts and per-row Reset are
+the usual ones. The Keyboard section's **Preset** select shows the one in force (`presetOf`, *Custom* when
+none) and replaces stored changes only after a Replace / Keep question. `keymap-presets.test.ts` holds
+every preset to known action ids, readable chords and no collision on either platform. Left out, and why:
+
+| Preset | Not mapped | Why |
+| --- | --- | --- |
+| Premiere Pro | Ripple Edit / Rate Stretch / Pen / Hand / Zoom / Type tools, Add Edit (⌘K), Insert / Overwrite (, .), Lift / Extract (; '), next / previous edit (↑ ↓), 5-frame steps, workspaces (⌥⇧1–9), Duplicate (⌘⇧/), apply transitions (⌘D, ⇧D) | No such action in Kerf; ⌥⇧ / ⇧ + digit types a symbol, which a layout-following chord reads as the symbol; ⇧/ is not a chord. Ripple mode takes B. |
+| DaVinci Resolve | Pages (⇧2–8), Trim mode's roll / slip / slide split, Blade at playhead (⌘B), Insert / Overwrite (F9 F10), next / previous edit, Loop (⌘/) | No such action, or ⇧ + digit (as above); the Trim tool (T) is Roll. Trim start / end are `{` / `}` (what ⇧[ / ⇧] type on a US layout), which a layout that needs AltGr for them cannot press. |
+| Final Cut Pro | Position / Range / Hand / Zoom tools, Blade at playhead (⌘B), Connect / Insert / Append (Q W E), 10-frame steps, Share destinations | No such action; ⇧← / ⇧→ stay a second. |
 
 **Settings** are their own runes singleton (`src/lib/settings.svelte.ts`) behind the title bar's gear (⌘,). `SettingsDialog.svelte` is a
 rail of **nine sections** — General, Appearance, Editing, Preview & playback, Performance, Analysis, Agent, Keyboard, Advanced; it opens on
@@ -1399,3 +1463,16 @@ pointercancel / lost capture / blur abandon; `data-svg-box`, never the artwork),
 preview like a title. Delete removes it with an Undo toast. **Review**: `staged-diff.ts` marks an animated title by its
 `overlay_id` like a text title, and resolves an `overlay_removed` against `svg_overlays` too (the ghost's `svg` flag, named by
 `svgDisplayName`). Wiring is held by `svg-wiring.test.ts`, the actions by `title-actions-svg.test.ts`, the state by `state-svg.test.ts`.
+
+## Scopes panel
+
+`Scopes.svelte`, docked in the Color preset between the preview and the inspector (a layout stored before it is
+offered it like the mixer in Audio: `UNSTAMPED_OFFERED` leaves it out, `EARLIER_PRESETS.color` is the old Color). A
+selector picks waveform / RGB parade / vectorscope / histogram (remembered in `localStorage`), drawn on a canvas from
+`get_scopes`' grids by `scopes-view.ts` (pure, bun-tested: log density, row 0 at the bottom, 75 % targets and the
+skin-tone line on the vectorscope), and the readout under it is the summary (`summaryLines`: a clipped channel is
+counted in pixels and warns). The frame is the export's still from the originals at 960 wide, niced, so it is a real
+decode: one request in flight, the newest playhead and cut asked for once it lands, 150 ms after the last change while
+paused and every 2 s while playing, nothing while the panel is hidden. Colours are the `--scope-*` tokens (derived from
+the theme's bases in `kerf-tokens.css`; the parade's blue is the theme's own `blue-500`), resolved again on a theme
+change. The harness answers colour bars (`harnessScopes`).

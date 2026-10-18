@@ -44,6 +44,11 @@ describe('the ellipsis', () => {
 		'file.importCaptions',
 		'file.export',
 		'file.saveCover',
+		'file.exportCaptions',
+		'file.exportOtio',
+		'file.exportEdl',
+		'file.exportMarkers',
+		'file.exportChapters',
 		'app.settings',
 		'app.shortcuts',
 		'app.keyboard',
@@ -151,7 +156,11 @@ describe('a confirm names its buttons', () => {
 
 	test('the unsaved-project prompts are asked with Save…, Don’t save and Cancel', () => {
 		const page = read('routes/+page.svelte');
-		for (const which of ['close', 'quit', 'replace']) expect(page, which).toContain(`proceedUnsaved(UNSAVED.${which})`);
+		// Closing and quitting also let the recovery session go on Don't save (`leaveAfter`).
+		for (const which of ['close', 'quit']) expect(page, which).toContain(`leaveUnsaved(UNSAVED.${which})`);
+		expect(page).toContain('proceedUnsaved(UNSAVED.replace)');
+		expect(page).toContain('leaveAfter(await askUnsaved(copy)');
+		expect(page).toContain('proceedAfter(await askUnsaved(copy)');
 		expect(page).not.toContain('never been saved');
 	});
 });

@@ -165,6 +165,11 @@ class EditorUi {
 	 *  bracket the working range; export can render just this span. */
 	markIn = $state<number | null>(null);
 	markOut = $state<number | null>(null);
+	/** The timeline seconds on screen, written by the timeline as it scrolls and zooms (`null`
+	 *  while it is not mounted) — part of the editor context an agent can read. */
+	timelineView = $state<{ start: number; end: number } | null>(null);
+	/** The dock panel last activated (dockview's active panel), for the same context. */
+	focusedPanel = $state<string | null>(null);
 	#zoom = $state(ZOOM_DEFAULT);
 	/** Timeline zoom, pixels per second (`zoom.ts` owns the range and the maths). Setting it is a
 	 *  person taking the zoom, so the timeline stops fitting the cut to its window
@@ -198,6 +203,9 @@ class EditorUi {
 	/** Bumped when a preview proxy finishes generating, to nudge the preview into
 	 *  re-decoding the current frame (now served from the fast all-intra proxy). */
 	previewEpoch = $state(0);
+	/** The width the Preview asks its frames at (`null` before it has a box): the render bar
+	 *  judges the cut at it. */
+	previewWidth = $state<number | null>(null);
 	/** System font family names available for the text overlay font picker. */
 	availableFonts = $state<string[]>([]);
 
@@ -480,6 +488,26 @@ class EditorUi {
 			this.stoppingAnalysis = false;
 			await mediaStatus.refresh();
 			this.reportFailedSteps(assetId, steps);
+		}
+	}
+
+	/** Re-time an asset's transcript words and label its speakers, shown and stoppable like an
+	 *  analysis pass. Resolves the speaker count, or null when it was stopped. */
+	async refineTranscript(assetId: string): Promise<number | null> {
+		this.analyzing = true;
+		this.analyzingId = assetId;
+		this.analysisStage = null;
+		try {
+			const analysis = await editor.refineTranscript(assetId);
+			return new Set(analysis.transcript.map((s) => s.speaker).filter(Boolean)).size;
+		} catch (e) {
+			if (isCancelled(e)) return null;
+			throw e;
+		} finally {
+			this.analyzing = false;
+			this.analyzingId = null;
+			this.analysisStage = null;
+			this.stoppingAnalysis = false;
 		}
 	}
 

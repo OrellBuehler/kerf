@@ -83,8 +83,15 @@ describe('levelNotes', () => {
 		const n = hot(-0.2, on(-1));
 		expect(n).toHaveLength(2);
 		expect(n[1]).toBe(
-			'True peak -0.2 dBTP is over the -1 dBTP platforms ask for and can clip when re-encoded. The master limiter is already on, but it holds the sample peak at -1.0 dBFS and the peak between samples runs above that. Lower its ceiling to about -2.3 dBFS (set_master_limiter).'
+			'True peak -0.2 dBTP is over the -1 dBTP platforms ask for and can clip when re-encoded. The master limiter is already on, but it holds the sample peak at -1.0 dBFS and the peak between samples runs above that. Turn on true-peak limiting (set_master_true_peak), or lower its ceiling to about -2.3 dBFS (set_master_limiter).'
 		);
+		// Already limiting the true peak: only the ceiling is left to lower.
+		const tpOn = (ceiling_db: number): MasterBus => ({ ...on(ceiling_db), true_peak: true });
+		expect(hot(-0.2, tpOn(-1))[1]).toBe(
+			'True peak -0.2 dBTP is over the -1 dBTP platforms ask for and can clip when re-encoded. The master limiter is already on and holds the true peak at -1.0 dBFS. Lower its ceiling to about -2.3 dBFS (set_master_limiter).'
+		);
+		expect(hot(0.4, tpOn(MASTER_MIN_CEILING_DB))[1]).toContain('holding the true peak at its lowest ceiling');
+		expect(hot(0.4, tpOn(MASTER_MIN_CEILING_DB))[1]).not.toContain('set_master_true_peak');
 		expect(hot(0.4, on(MASTER_DEFAULT_CEILING_DB))[1]).toContain('about -3.4 dBFS');
 		// Never below what the limiter can be given; at the floor there is nothing to lower.
 		expect(hot(10, on(-20))[1]).toContain('about -24.0 dBFS');
@@ -95,7 +102,7 @@ describe('levelNotes', () => {
 		// Limiter off: still told to turn it on, and a stored ceiling alone is not "on".
 		expect(hot(0.4, { volume: 1, limiter: false, ceiling_db: -6 })[1]).toContain('Turn on the master limiter');
 		expect(hot(0.4, DEFAULT_MASTER)[1]).toBe(
-			'True peak 0.4 dBTP is over the -1 dBTP platforms ask for and can clip when re-encoded. Turn on the master limiter (set_master_limiter) or lower the master.'
+			'True peak 0.4 dBTP is over the -1 dBTP platforms ask for and can clip when re-encoded. Turn on the master limiter (set_master_limiter) with true-peak limiting (set_master_true_peak), or lower the master.'
 		);
 		// Under the line: no note, limiter or not.
 		expect(hot(-1, on(-1.5))).toHaveLength(1);
