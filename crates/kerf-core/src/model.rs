@@ -3656,9 +3656,14 @@ pub struct StagedEdit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     /// The agent session (its MCP session id) the proposal belongs to, when one was named. A
-    /// second agent's edits are refused while another session owns the proposal.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// second agent's edits are refused while another session owns the proposal. **Never
+    /// serialised**: a session id is a bearer-ish handle on the MCP connection, and what reaches
+    /// the webview or another agent is [`StagedEdit::owned_by_agent`].
+    #[serde(skip)]
     pub owner: Option<String>,
+    /// Some agent session owns the proposal (see `owner`, which is Rust-side only).
+    #[serde(default)]
+    pub owned_by_agent: bool,
     /// Labels of the individual edits, in the order they were staged.
     pub edits: Vec<String>,
     /// How many of the latest staged steps [`crate::project::Project::undo_staged`] can still take back.

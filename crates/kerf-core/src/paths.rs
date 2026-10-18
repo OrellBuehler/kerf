@@ -106,6 +106,50 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
     false
 }
 
+/// How much of each end of a file [`same_content`] reads: enough that two takes of the same
+/// length differ somewhere in it, little enough to be instant on a local disk.
+pub const FINGERPRINT_BYTES: u64 = 1 << 20;
+
+/// Whether two files have the same size, or `None` when either cannot be stat'ed (a file that is
+/// gone is not "different", it is unknown). A stat each.
+pub fn same_size(a: &Path, b: &Path) -> Option<bool> {
+    let (a, b) = (std::fs::metadata(a).ok()?, std::fs::metadata(b).ok()?);
+    Some(a.len() == b.len())
+}
+
+/// Whether two files are, as far as a cheap look can tell, the same bytes: the same size and the
+/// same hash of their first and last [`FINGERPRINT_BYTES`] (the whole file, when it is shorter
+/// than both). `None` when either cannot be read. It reads the files, so it is not for use under
+/// the project lock.
+pub fn same_content(a: &Path, b: &Path) -> Option<bool> {
+    if !same_size(a, b)? {
+        return Some(false);
+    }
+    Some(fingerprint(a).ok()? == fingerprint(b).ok()?)
+}
+
+/// SHA-256 of the head and the tail of `path`, with its length mixed in.
+fn fingerprint(path: &Path) -> std::io::Result<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut hash = Sha256::new();
+    hash.update(len.to_le_bytes());
+    let mut chunk = Vec::new();
+    file.by_ref().take(FINGERPRINT_BYTES).read_to_end(&mut chunk)?;
+    hash.update(&chunk);
+    if len > FINGERPRINT_BYTES {
+        chunk.clear();
+        let tail = FINGERPRINT_BYTES.min(len - FINGERPRINT_BYTES);
+        file.seek(SeekFrom::Start(len - tail))?;
+        file.by_ref().take(tail).read_to_end(&mut chunk)?;
+        hash.update(&chunk);
+    }
+    Ok(hash.finalize().to_vec())
+}
+
 /// Whether `path` lies inside `dir` (both canonicalised).
 fn within(path: &Path, dir: &Path) -> bool {
     canonical(path).starts_with(canonical(dir))
@@ -170,6 +214,43 @@ mod tests {
         for path in ["C:\\clips\\a.mp4", "C:/clips/a.mp4", "/home/me/a:b.mp4", "clip.mp4", "/tmp/x"] {
             assert!(!has_protocol_prefix(path), "{path}");
         }
+    }
+
+    #[test]
+    fn two_files_are_the_same_only_when_their_ends_and_size_agree() {
+        let d = dir("same-content");
+        let big = |name: &str, f: &dyn Fn(usize) -> u8, n: usize| {
+            let p = d.join(name);
+            std::fs::write(&p, (0..n).map(f).collect::<Vec<u8>>()).unwrap();
+            p
+        };
+        let n = 3 * FINGERPRINT_BYTES as usize;
+        let a = big("a.bin", &|i| (i % 251) as u8, n);
+        let same = big("same.bin", &|i| (i % 251) as u8, n);
+        // Differs in the middle, which a head-and-tail look does not see: documented, cheap.
+        let middle = big("mid.bin", &|i| if i == n / 2 { 7 } else { (i % 251) as u8 }, n);
+        let head = big("head.bin", &|i| if i == 10 { 7 } else { (i % 251) as u8 }, n);
+        let tail = big("tail.bin", &|i| if i == n - 10 { 7 } else { (i % 251) as u8 }, n);
+        let shorter = big("short.bin", &|i| (i % 251) as u8, n - 1);
+
+        assert_eq!(same_content(&a, &same), Some(true));
+        assert_eq!(same_content(&a, &head), Some(false));
+        assert_eq!(same_content(&a, &tail), Some(false));
+        assert_eq!(same_content(&a, &shorter), Some(false), "a different size is different");
+        assert_eq!(same_content(&a, &middle), Some(true));
+        assert_eq!(same_size(&a, &shorter), Some(false));
+        assert_eq!(same_size(&a, &middle), Some(true));
+
+        // A file shorter than one window is read whole.
+        let (x, y) = (
+            big("x.bin", &|i| i as u8, 100),
+            big("y.bin", &|i| (i as u8).wrapping_add(1), 100),
+        );
+        assert_eq!(same_content(&x, &y), Some(false));
+        // A missing file is unknown, not different.
+        assert_eq!(same_content(&a, &d.join("gone.bin")), None);
+        assert_eq!(same_size(&d.join("gone.bin"), &a), None);
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]

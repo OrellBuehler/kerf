@@ -252,7 +252,8 @@
   id>`, e.g. `clip_retrimmed:<uuid>`; unique per diff, unchanged as a proposal grows; the
   `Marker*` kinds carry a `marker_id`) so a reviewer can send back the ones it accepts.
   `StagedEdit` is a pending proposal (base seq, the edit
-  labels, `stale`, its diff, the owning agent session, how many steps `undo_staged` can take
+  labels, `stale`, its diff, `owned_by_agent` — the session id itself (`owner`) is Rust-side only,
+  `#[serde(skip)]`, so it never reaches the webview or another agent — how many steps `undo_staged` can take
   back, and the asset changes held back with it — `StagedAssetChange`, id
   `asset_projection:<asset id>`, usable wherever an entry id is).
   **Partial accept** is `model/subset.rs` (pure + unit-tested): `Timeline::merge_subset(base,
@@ -265,7 +266,12 @@
   (`SubsetMerge::auto_included`, each with its reason); a pick that leaves two clips on top
   of each other (`check_subset_lanes`, against what already overlapped in the live cut) or
   pulls linked clips out of step (`first_sync_break`) is refused naming the track and time;
-  a pick whose target the user removed since is `skipped`, not fatal. `Timeline::check_own_lanes(before, ids)`
+  a pick whose target the user removed since is `skipped`, not fatal. What is left of a proposal after a
+  partial accept is `Timeline::rebase_rest(base, proposed, rest_ids)`: the same by-identity merge of the
+  **unapplied** changes onto the cut as it now is, *without* the closure and the two refusals (it is
+  the cut to show, not a change to write; a change that no longer fits is dropped and counted) — so a
+  forced accept leaves the user's newer work in the remainder instead of a diff that undoes it.
+  `Timeline::check_own_lanes(before, ids)`
   is the same overlap rule for the clip an edit itself placed (`add_clip_to_timeline`,
   `trim`, a voiceover): judged **after** the ripple, which may have made the room, and not
   for an overlap the clip already had. **Ripple** is here too, pure + unit-tested:
