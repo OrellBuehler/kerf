@@ -209,7 +209,8 @@ a `viewBox` (or width and height) required, the viewBox = the delivery frame for
 dropped (CSS animations, scripts, links and external images or fonts, `animateMotion`; the only image kept is an `<image>`
 whose href is a `data:image/png|jpeg|gif|webp` URI) and the loop validate_svg → preview_svg_overlay → add_svg_overlay →
 preview_timeline; tests pin the texts (including the order of that loop) and the schemas.
-`import_asset` is the one write that does **not** stage — a file on disk is not
+`import_asset` refuses a UNC / device-namespace `path` before any filesystem call (`require_local_input_path`), then a URL,
+protocol, relative path or missing file (`validate_import_path`). It is the one write that does **not** stage — a file on disk is not
 an edit to the user's cut, so imported media (and its background proxy) lands for
 them immediately, reporting on the same `import-progress` event a lens-pair
 stitch drives for the GUI. `export` takes rmcp's `RequestContext` beside its
@@ -317,10 +318,12 @@ a foreground call builds it from the request (`foreground`: the `ct` cancellatio
 task that keeps progress monotonic), a background one from its record in `Jobs` (bounded: 8 running, 48 records, a finished
 job forgotten after an hour). `KerfMcp::long_tool` does the branching, so **argument validation stays in the tool body,
 before it** — a bad path or id is an error on the call, not a job that fails later. The GUI's Stop reaches the agent's run
-of the same job: `analyze_asset`, `import_asset`, `download_speech_model` and `export_cover` poll the `StopEpoch` the GUI's own
-button trips (`Run::also_cancelled_by(begin_analysis() / begin_import() / begin_model_download() / begin_cover_export())`;
-a Stop pressed before a run began does not end it, and a run begun after is not wiped by one), and the voiceover, stems,
-smart-crop and framing jobs stop when the project is replaced (`stop_or_replaced`). `analyze_asset` also forwards the GUI's `analysis-progress` events for its asset
+of the same job: `analyze_asset`, `import_asset`, `download_speech_model`, `export_cover`, `generate_voiceover`,
+`separate_stems`, `smart_crop`, `export` and `export_variants` poll the `StopEpoch` the GUI's own button trips
+(`Run::also_cancelled_by(begin_analysis() / begin_import() / begin_model_download() / begin_cover_export() /
+begin_voiceover() / begin_stems() / begin_smart_crop() / begin_export())`; a Stop pressed before a run began does not end
+it, and a run begun after is not wiped by one), and the voiceover, stems, smart-crop and framing jobs also stop when the
+project is replaced (`stop_or_replaced`). `analyze_asset` also forwards the GUI's `analysis-progress` events for its asset
 to the client (`AnalysisProgressRelay`); `download_speech_model` emits `model-progress` like the GUI's own download.
 Every job that resolves inputs under the lock notes `Project::generation()` and refuses to land its result in a project
 opened since (`require_generation`) — a Save As does not count as one (`replace_with_saved_copy` keeps it). The reads
@@ -357,7 +360,8 @@ payload, which the page applies.
 
 ## Tool index
 
-Every tool, by purpose (a test pins that this list names each registered tool):
+Every tool, by purpose (a test pins that this list names each registered tool, and another that the README's tool lists and
+`### The tools (N)` heading and the site's `toolCount` in `site/hugo.toml` match the registered count — keep prose free of numbers):
 
 - **Project and library**: `project_info`, `save_project`, `save_project_as`, `open_project`, `new_project`, `list_assets`,
   `missing_assets`, `get_asset_metadata`, `import_asset`, `set_asset_projection`, `list_fonts`.

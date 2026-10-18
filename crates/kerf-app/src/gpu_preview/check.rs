@@ -188,8 +188,8 @@ impl Check {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     /// The summary of the passed check, if there is one, or the reason it is closed.
+    #[cfg(test)]
     pub fn standing(&self) -> Option<String> {
         match &self.slot().phase {
             Phase::Passed(summary) => Some(format!("passed: {summary}")),

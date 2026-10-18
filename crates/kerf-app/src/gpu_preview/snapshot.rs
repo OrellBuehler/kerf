@@ -120,8 +120,8 @@ pub struct PlanSnapshots {
     taken: AtomicU64,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 /// What the snapshot cache did, for the diagnostics.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct SnapshotStats {
     /// Frames that were planned from the held snapshot.
@@ -170,7 +170,7 @@ impl PlanSnapshots {
         *self.held.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn stats(&self) -> SnapshotStats {
         SnapshotStats {
             served: self.served.load(Ordering::Relaxed),

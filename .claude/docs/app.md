@@ -19,8 +19,10 @@ and the target is checked like an export's output (`check_output`: sources, prox
 (`cancel_import` → `import cancelled`). A run calls `.begin()` and polls the closure it gets; `.stop()` ends every run
 begun before it and none begun after, so there is no flag to reset under a run about to start (a Stop pressed just
 before another run began used to be wiped by it) and a GUI Stop reaches the agent's run of the same job:
-`begin_analysis`, `begin_model_download`, `begin_import` and `begin_cover_export` are what `mcp.rs` takes for
-`analyze_asset`, `download_speech_model`, `import_asset` and `export_cover`. **A replaced project stops its jobs**:
+`begin_analysis`, `begin_model_download`, `begin_import`, `begin_cover_export`, `begin_voiceover`, `begin_stems`,
+`begin_smart_crop` and `begin_export` are what `mcp.rs` takes for `analyze_asset`, `download_speech_model`,
+`import_asset`, `export_cover`, `generate_voiceover`, `separate_stems`, `smart_crop` and `export` / `export_variants`
+(one `export_cancel` for both; a test pins that each `begin_*` listens to its own button and no other). **A replaced project stops its jobs**:
 `run_analysis`, voiceover, stems, smart crop and the export's framing pass fold "the generation moved" into their
 cancel (`stop_or_replaced` / `Throttled`: the generation is read under the lock at most twice a second), so the ffmpeg
 working towards a result that would be dropped is killed instead of finishing.
@@ -194,7 +196,9 @@ load, so the next save cannot destroy an imported theme; a file that parses is r
 JSON type) is logged and leaves only that field at its default — **and the file keeps what it held**: that raw
 value (a newer build's enum name, say) and any key this build has never heard of are carried in `Settings::kept` and
 written back unchanged by every save until the user changes that setting, so opening the file in an older build and saving
-something unrelated costs nothing. At most five `settings.corrupt-*` and five `settings.reset-*` copies are kept (the newest;
+something unrelated costs nothing. A key that is a field of `Settings` must be in `STORED_KEYS` or `parse` files it under
+`kept` and the setting is lost on restart (this once happened to `editing`); a test checks every key of the serialized
+defaults is listed, and another round-trips every field through `save_to` / `load_from`. At most five `settings.corrupt-*` and five `settings.reset-*` copies are kept (the newest;
 `prune_backups`). The recent list is statted with the settings lock **released** (`recent_in`: read, stat, then lock and
 drop the ones the stat said were gone), so an offline share never holds up another settings write. The file also carries `time_display`
 (`timecode` | `seconds`), `reopen_last_project` and `recent_projects` (newest first, at most 10; kept by
@@ -234,7 +238,9 @@ after it is released and before the lock-free render: a source file, a capture, 
 forms and `\\?\UNC\…`, and `//host/share` **on Windows only**: on macOS and Linux `//tmp/x` is `/tmp/x`; only the
 verbatim local-drive spelling `\\?\C:\…` passes). A path the user picked in Kerf's own save dialog goes through
 `require_user_output_path`, which lets a share they chose through on Windows (`PathSource::User`); URLs, protocol sinks,
-relative paths and the device namespace (`\\.\pipe\…`) are refused for both. `check_output` adds Kerf's own config
+relative paths and the device namespace (`\\.\pipe\…`) are refused for both. A file an agent asks Kerf to **read**
+(`import_asset`, a caption file's `path`) goes through `require_local_input_path` first — the same UNC / device
+refusal (`network_path`), before any `stat`, since opening a share makes the machine authenticate to its host. `check_output` adds Kerf's own config
 dir (the settings, which hold the agent token, and their backups) and the logs to what the project protects. The error carries
 ffmpeg's stderr tail. `start_playback` resolves `Ok` for a stop or supersede but rejects with the
 ffmpeg error when a stream someone is still watching dies, so the preview can say

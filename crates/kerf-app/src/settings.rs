@@ -297,7 +297,7 @@ const KEYS: [&str; 18] = [
 
 /// Every key of the settings file this build understands: the patchable ones, the two the app
 /// keeps itself, and the retired `transcribe`. Any other key is kept as found ([`Settings::kept`]).
-const STORED_KEYS: [&str; 20] = [
+const STORED_KEYS: [&str; 21] = [
     "cpu_percent",
     "auto_analysis",
     "proxy_size",
@@ -310,6 +310,7 @@ const STORED_KEYS: [&str; 20] = [
     "theme",
     "workspaces",
     "keybindings",
+    "editing",
     "agent_review",
     "mcp_enabled",
     "mcp_addr",
@@ -1017,6 +1018,75 @@ mod tests {
         assert!(back.gpu_preview);
         assert_eq!(back.keybindings, Some(keybindings));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_stored_field_is_a_known_key() {
+        let stored = serde_json::to_value(Settings::default()).unwrap();
+        for key in stored.as_object().unwrap().keys() {
+            assert!(STORED_KEYS.contains(&key.as_str()), "{key} would be filed under `kept`");
+        }
+        for key in KEYS {
+            assert!(STORED_KEYS.contains(&key), "{key} is patchable but not stored");
+        }
+    }
+
+    #[test]
+    fn every_field_survives_a_save_and_a_load() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        let s = Settings {
+            cpu_percent: 33,
+            auto_analysis: kerf_core::AutoAnalysis {
+                scenes: false,
+                transcript: false,
+                ..kerf_core::AutoAnalysis::default()
+            },
+            proxy_size: kerf_core::ProxySize::W720,
+            preview_source: kerf_core::PreviewSource::ProxyOnly,
+            safe_areas: true,
+            gpu_preview: true,
+            time_display: TimeDisplay::Seconds,
+            reopen_last_project: true,
+            recent_projects: vec!["/a.kerf".to_string(), "/b.kerf".to_string()],
+            last_open_project: Some("/a.kerf".to_string()),
+            layout: Some(serde_json::json!({"grid": 1})),
+            theme: Some(serde_json::json!({"name": "Mine"})),
+            workspaces: Some(serde_json::json!({"active": "color"})),
+            keybindings: Some(serde_json::json!({"version": 1, "bindings": {"tool.razor": ["B"]}})),
+            editing: Some(serde_json::json!({"snap": false, "still_seconds": 8, "title_seconds": 4})),
+            agent_review: false,
+            mcp_enabled: false,
+            mcp_addr: Some("127.0.0.1:7788".to_string()),
+            mcp_require_token: false,
+            mcp_token: Some("a-token-that-is-long-enough-to-keep".to_string()),
+            ..Settings::default()
+        };
+        let before = serde_json::to_value(&s).unwrap();
+        for (key, value) in before.as_object().unwrap() {
+            assert_ne!(
+                value,
+                &serde_json::to_value(Settings::default()).unwrap()[key],
+                "{key} is still its default here, so the round trip would not notice losing it"
+            );
+        }
+        save_to(&file, &s).unwrap();
+        let back = load_from(&file);
+        assert_eq!(serde_json::to_value(&back).unwrap(), before);
+        assert!(
+            back.kept.is_empty(),
+            "nothing the build owns is filed as unknown: {:?}",
+            back.kept
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_stored_editing_default_is_read_not_kept() {
+        let editing = serde_json::json!({"snap": false, "still_seconds": 8, "title_seconds": 4});
+        let s = parse(&serde_json::json!({ "editing": editing }).to_string()).unwrap();
+        assert_eq!(s.editing, Some(editing));
+        assert!(s.kept.is_empty());
     }
 
     #[test]

@@ -245,4 +245,3 @@ describe('recent projects and paths', () => {
 		await api.setMcpSettings({ agent_review: true, mcp_addr: null });
 	});
 });
-

@@ -166,6 +166,29 @@ pub(crate) fn require_generation(project: &Project, noted: u64, doing: &str) -> 
 }
 
 impl AppState {
+    fn new(
+        project: Arc<Mutex<Project>>,
+        main_window_shown: Arc<AtomicBool>,
+        launch: LaunchSlot,
+        scrub: Arc<kerf_core::ScrubFrames>,
+    ) -> Self {
+        Self {
+            project,
+            export_cancel: StopEpoch::default(),
+            analysis_cancel: StopEpoch::default(),
+            levels_cancel: StopEpoch::default(),
+            voiceover_cancel: StopEpoch::default(),
+            stems_cancel: StopEpoch::default(),
+            model_cancel: StopEpoch::default(),
+            cover_cancel: StopEpoch::default(),
+            smart_crop_cancel: StopEpoch::default(),
+            import_stop: StopEpoch::default(),
+            main_window_shown,
+            launch: Mutex::new(launch),
+            scrub,
+        }
+    }
+
     fn project(&self) -> std::sync::MutexGuard<'_, Project> {
         lock_user(&self.project)
     }
@@ -193,6 +216,28 @@ impl AppState {
     /// An import is starting; the closure says whether `cancel_import` has been pressed since.
     pub(crate) fn begin_import(&self) -> impl Fn() -> bool + Send + Sync + 'static {
         self.import_stop.begin()
+    }
+
+    /// A voiceover is being synthesized; the closure says whether `cancel_voiceover` has been pressed
+    /// since. The GUI's voiceover dialog and an agent's `generate_voiceover` take one alike.
+    pub(crate) fn begin_voiceover(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        self.voiceover_cancel.begin()
+    }
+
+    /// A stem separation is starting; the closure says whether `cancel_stems` has been pressed since.
+    pub(crate) fn begin_stems(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        self.stems_cancel.begin()
+    }
+
+    /// A smart crop is sampling; the closure says whether `cancel_smart_crop` has been pressed since.
+    pub(crate) fn begin_smart_crop(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        self.smart_crop_cancel.begin()
+    }
+
+    /// A render is starting (a single export or a multi-format one); the closure says whether
+    /// `cancel_export` has been pressed since.
+    pub(crate) fn begin_export(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        self.export_cancel.begin()
     }
 }
 
@@ -319,6 +364,54 @@ pub(crate) enum PathSource {
     Agent,
 }
 
+/// `\\?\C:\`: the verbatim spelling of a drive, which is local.
+fn is_verbatim_drive(bytes: &[u8]) -> bool {
+    let separator = |at: usize| bytes.get(at).is_some_and(|b| matches!(b, b'\\' | b'/'));
+    separator(0)
+        && separator(1)
+        && bytes.get(2) == Some(&b'?')
+        && separator(3)
+        && bytes.get(4).is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(5) == Some(&b':')
+        && separator(6)
+}
+
+/// Whether `path` names a network share or the device namespace: `Some(true)` for a device
+/// (`\\.\pipe\…`, `\\?\GLOBALROOT\…`), `Some(false)` for a UNC path (`\\host\share`, `\\?\UNC\…`,
+/// and `//host/share` on Windows). `//host/share` is an ordinary absolute path elsewhere; the
+/// verbatim spelling of a local drive is local.
+fn network_path(path: &str, windows: bool) -> Option<bool> {
+    let bytes = path.as_bytes();
+    let separator = |at: usize| bytes.get(at).is_some_and(|b| matches!(b, b'\\' | b'/'));
+    if !(separator(0) && separator(1)) || is_verbatim_drive(bytes) {
+        return None;
+    }
+    let backslashed = bytes[0] == b'\\' || bytes[1] == b'\\';
+    if !(backslashed || windows) {
+        return None;
+    }
+    let normal = path.replace('\\', "/");
+    Some(normal.starts_with("//./") || (normal.starts_with("//?/") && !normal[4..].to_ascii_uppercase().starts_with("UNC/")))
+}
+
+/// [`require_local_output_path`] for a file an agent asks Kerf to read: opening a network path makes
+/// the machine authenticate to whatever host the string names, so UNC and device-namespace paths
+/// are refused **before any filesystem call**, on every surface an agent names a file through.
+pub(crate) fn require_local_input_path(path: &str) -> Result<(), String> {
+    check_input_path(path, cfg!(windows))
+}
+
+/// The rule of [`require_local_input_path`], with the platform a parameter so every spelling is
+/// tested everywhere.
+pub(crate) fn check_input_path(path: &str, windows: bool) -> Result<(), String> {
+    match network_path(path, windows) {
+        Some(_) => Err(format!(
+            "{path:?} is a network (UNC) or device path; copy the file to a local drive and import it from there"
+        )),
+        None => Ok(()),
+    }
+}
+
 /// The rules of [`require_local_output_path`] and [`require_user_output_path`], with the platform
 /// a parameter so every spelling is tested everywhere.
 pub(crate) fn check_output_path(path: &str, source: PathSource, windows: bool) -> Result<(), String> {
@@ -338,35 +431,20 @@ pub(crate) fn check_output_path(path: &str, source: PathSource, windows: bool) -
             ));
         }
     }
-    let bytes = path.as_bytes();
-    let separator = |at: usize| bytes.get(at).is_some_and(|b| matches!(b, b'\\' | b'/'));
-    // `\\?\C:\`: the verbatim spelling of a drive, which is local.
-    let is_verbatim_drive = separator(0)
-        && separator(1)
-        && bytes.get(2) == Some(&b'?')
-        && separator(3)
-        && bytes.get(4).is_some_and(u8::is_ascii_alphabetic)
-        && bytes.get(5) == Some(&b':')
-        && separator(6);
-    if separator(0) && separator(1) && !is_verbatim_drive {
-        let backslashed = bytes[0] == b'\\' || bytes[1] == b'\\';
-        // `//host/share` is an ordinary absolute path outside Windows.
-        if backslashed || windows {
-            let normal = path.replace('\\', "/");
-            let device = normal.starts_with("//./")
-                || (normal.starts_with("//?/") && !normal[4..].to_ascii_uppercase().starts_with("UNC/"));
-            if device || source == PathSource::Agent || !windows {
-                return Err(format!(
-                    "output path {path:?} is a network (UNC) or device path; save to a local drive instead"
-                ));
-            }
-            // A share the user chose in the save dialog.
-            return Ok(());
+    if let Some(device) = network_path(path, windows) {
+        if device || source == PathSource::Agent || !windows {
+            return Err(format!(
+                "output path {path:?} is a network (UNC) or device path; save to a local drive instead"
+            ));
         }
+        // A share the user chose in the save dialog.
+        return Ok(());
     }
+    let bytes = path.as_bytes();
+    let verbatim_drive = is_verbatim_drive(bytes);
     let is_windows_absolute =
         bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/');
-    if !(path.starts_with('/') || is_verbatim_drive || is_windows_absolute) {
+    if !(path.starts_with('/') || verbatim_drive || is_windows_absolute) {
         return Err(format!("output path {path:?} must be an absolute local file path"));
     }
     Ok(())
@@ -4149,21 +4227,12 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .manage(AppState {
-            project: project.clone(),
-            export_cancel: StopEpoch::default(),
-            analysis_cancel: StopEpoch::default(),
-            levels_cancel: StopEpoch::default(),
-            voiceover_cancel: StopEpoch::default(),
-            stems_cancel: StopEpoch::default(),
-            model_cancel: StopEpoch::default(),
-            cover_cancel: StopEpoch::default(),
-            smart_crop_cancel: StopEpoch::default(),
-            import_stop: StopEpoch::default(),
-            main_window_shown: main_window_shown.clone(),
-            launch: Mutex::new(LaunchSlot::new(launch.clone())),
-            scrub: scrub.clone(),
-        })
+        .manage(AppState::new(
+            project.clone(),
+            main_window_shown.clone(),
+            LaunchSlot::new(launch.clone()),
+            scrub.clone(),
+        ))
         .manage(popout::PopoutState::default())
         .on_window_event(popout::on_window_event)
         .setup(move |app| {
@@ -5067,6 +5136,44 @@ mod tests {
         let later = stop.begin();
         assert!(!later(), "a job that began after the stop is not cancelled by it");
         stop.stop();
+        assert!(later());
+    }
+
+    /// An agent's long job takes its stop from the same epoch as the GUI button that cancels it, and
+    /// from no other: pressing Stop on a voiceover must not end an export.
+    #[test]
+    fn an_agents_long_jobs_stop_with_their_own_cancel_buttons() {
+        use crate::AppState;
+        use kerf_core::Project;
+        use std::sync::{Arc, Mutex};
+        let state = AppState::new(
+            Arc::new(Mutex::new(Project::open_in_memory().unwrap())),
+            Arc::new(AtomicBool::new(false)),
+            LaunchSlot::default(),
+            Arc::new(kerf_core::ScrubFrames::new(kerf_core::ScrubConfig::default())),
+        );
+        type Running = Box<dyn Fn() -> bool>;
+        let jobs: [(&str, Running, &StopEpoch); 7] = [
+            ("voiceover", Box::new(state.begin_voiceover()), &state.voiceover_cancel),
+            ("stems", Box::new(state.begin_stems()), &state.stems_cancel),
+            ("smart crop", Box::new(state.begin_smart_crop()), &state.smart_crop_cancel),
+            ("export", Box::new(state.begin_export()), &state.export_cancel),
+            ("analysis", Box::new(state.begin_analysis()), &state.analysis_cancel),
+            ("cover", Box::new(state.begin_cover_export()), &state.cover_cancel),
+            ("import", Box::new(state.begin_import()), &state.import_stop),
+        ];
+        for (name, running, _) in &jobs {
+            assert!(!running(), "{name} starts clean");
+        }
+        for (pressed, (name, _, button)) in jobs.iter().enumerate() {
+            button.stop();
+            for (at, (other, running, _)) in jobs.iter().enumerate() {
+                assert_eq!(running(), at <= pressed, "{other} after the {name} button");
+            }
+        }
+        let later = state.begin_voiceover();
+        assert!(!later(), "a Stop pressed before a run began does not end it");
+        state.voiceover_cancel.stop();
         assert!(later());
     }
 

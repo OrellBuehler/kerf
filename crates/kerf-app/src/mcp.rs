@@ -1854,8 +1854,8 @@ impl KerfMcp {
     #[tool(
         description = "Import a media file into the project and return the Asset (probed streams, duration, \
                        resolution, fps, codecs). `path` must be an absolute path to a media file on this computer \
-                       (a URL, an ffmpeg protocol such as concat: or pipe:, a relative path or a missing file is \
-                       refused at once). Importing a file the project already holds resolves to that \
+                       (a URL, an ffmpeg protocol such as concat: or pipe:, a network share (UNC path), a relative \
+                       path or a missing file is refused at once). Importing a file the project already holds resolves to that \
                        asset instead of duplicating it, so this is safe to re-run. One Insta360 lens file pulls \
                        in its sibling and stitches the pair into a single 360 asset — a full re-encode that can \
                        run for minutes (send a `progressToken` for progress, cancel the request to stop it, or pass \
@@ -1867,8 +1867,10 @@ impl KerfMcp {
         Parameters(p): Parameters<ImportParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<String, McpError> {
-        // Absolute, an existing regular file, no URL or ffmpeg protocol: said now, on the call,
-        // not by a background job a moment later.
+        // Absolute, an existing regular file, no URL, ffmpeg protocol or network share: said now, on
+        // the call, not by a background job a moment later. The network check goes first, before any
+        // stat: opening a UNC path makes this machine authenticate to the host it names.
+        crate::require_local_input_path(&p.path).map_err(|e| McpError::invalid_params(e, None))?;
         kerf_core::paths::validate_import_path(std::path::Path::new(&p.path)).map_err(core_err)?;
         let me = self.clone();
         let owner = self.owner();
@@ -3457,7 +3459,10 @@ impl KerfMcp {
             size: p.caption_size,
         });
         let (me, owner) = (self.clone(), self.owner());
+        // The GUI's Stop on a voiceover ends an agent's too (`begin_voiceover`).
+        let gui_stop = self.app.state::<crate::AppState>().begin_voiceover();
         self.long_tool("generate_voiceover", p.background, &context, move |run| async move {
+            let run = run.also_cancelled_by(gui_stop);
             let (project, app) = (me.project.clone(), me.app.clone());
             let placed = blocking(move || {
                 let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
@@ -3547,7 +3552,10 @@ impl KerfMcp {
             (asset, project.generation())
         };
         let (me, owner) = (self.clone(), self.owner());
+        // The GUI's Stop on a separation ends an agent's too (`begin_stems`).
+        let gui_stop = self.app.state::<crate::AppState>().begin_stems();
         self.long_tool("separate_stems", p.background, &context, move |run| async move {
+            let run = run.also_cancelled_by(gui_stop);
             let (project, app) = (me.project.clone(), me.app.clone());
             let placed = blocking(move || {
                 let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
@@ -3629,7 +3637,10 @@ impl KerfMcp {
     ) -> Result<String, McpError> {
         let clip = p.clip_id.as_deref().map(|s| parse_arg("clip_id", s)).transpose()?;
         let (me, owner) = (self.clone(), self.owner());
+        // The GUI's Stop on a smart crop ends an agent's too (`begin_smart_crop`).
+        let gui_stop = self.app.state::<crate::AppState>().begin_smart_crop();
         self.long_tool("smart_crop", p.background, &context, move |run| async move {
+            let run = run.also_cancelled_by(gui_stop);
             let project = me.project.clone();
             let (moved, timeline) = blocking(move || {
                 // Plan under the lock, sample with it released (one short ffmpeg decode per
@@ -4143,7 +4154,10 @@ impl KerfMcp {
         // hung one, and without cancellation it cannot abandon a render whose settings it already
         // knows are wrong. Both ride the protocol (`progressToken`, `notifications/cancelled`) —
         // or, as a background job, `job_status` and `cancel_job`.
+        // ...and the GUI's Stop on an export ends this render too (`begin_export`).
+        let gui_stop = self.app.state::<crate::AppState>().begin_export();
         self.long_tool("export", p.background, &context, move |run| async move {
+            let run = run.also_cancelled_by(gui_stop);
             let status = blocking(move || {
                 // Snapshot the timeline + assets under the lock, then render with the
                 // lock released so a long export doesn't freeze the GUI (or block other
@@ -4243,7 +4257,10 @@ impl KerfMcp {
         let smart_crop = p.smart_crop.unwrap_or(true);
         let (me, owner) = (self.clone(), self.owner());
         let generation = self.lock().generation();
+        // The GUI's Stop on an export ends the framing pass and every file of this one too.
+        let gui_stop = self.app.state::<crate::AppState>().begin_export();
         self.long_tool("export_variants", p.background, &context, move |run| async move {
+            let run = run.also_cancelled_by(gui_stop);
             let project = me.project.clone();
             // The framing pass is the one write this tool makes. It is announced whether or not the
             // render after it succeeds: the proposal changed either way.
@@ -4534,10 +4551,7 @@ impl KerfMcp {
             Project::decode_waveform_range_cancellable(&asset, start, end, count, &|| cancel.is_cancelled()).map_err(core_err)
         })
         .await?;
-        // Compact, not `json()`'s pretty print: that puts every number of
-        // four 4096-long arrays on its own indented line, roughly doubling
-        // what the model has to read for the same peaks.
-        serde_json::to_string(&range).map_err(|e| McpError::internal_error(e.to_string(), None))
+        json(&range)
     }
 
     #[tool(
@@ -5595,6 +5609,7 @@ fn fmt_ts(t: f64) -> String {
 fn caption_source(path: Option<&str>, text: Option<String>) -> Result<String, McpError> {
     match (path, text) {
         (Some(path), None) => {
+            crate::require_local_input_path(path).map_err(|e| McpError::invalid_params(e, None))?;
             let path = std::path::Path::new(path);
             if !path.is_absolute() {
                 return Err(McpError::invalid_params(
@@ -6810,6 +6825,33 @@ mod tests {
         router().list_all().iter().map(|t| t.name.to_string()).collect()
     }
 
+    /// The numbers and lists the README and the site print are the surface this build serves: a
+    /// tool added without them fails here, not in a reader's head.
+    #[test]
+    fn the_readme_and_the_site_describe_the_tools_the_server_has() {
+        const README: &str = include_str!("../../../README.md");
+        const SITE: &str = include_str!("../../../site/hugo.toml");
+        let names = tool_names();
+        let count = names.len();
+        let heading = README
+            .lines()
+            .find_map(|line| line.strip_prefix("### The tools (")?.strip_suffix(')'))
+            .expect("the README has a `### The tools (N)` heading");
+        assert_eq!(heading.parse::<usize>().ok(), Some(count), "README heading: {heading}");
+        let shown = SITE
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("toolCount = "))
+            .expect("site/hugo.toml has a toolCount");
+        assert_eq!(shown.trim().parse::<usize>().ok(), Some(count), "site toolCount: {shown}");
+        let section = README
+            .split("### The tools")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("the tools section");
+        let unlisted: Vec<&String> = names.iter().filter(|name| !section.contains(&format!("`{name}`"))).collect();
+        assert!(unlisted.is_empty(), "tools the README's lists leave out: {unlisted:?}");
+    }
+
     #[test]
     fn the_new_tools_are_on_the_surface() {
         let names = tool_names();
@@ -7078,6 +7120,37 @@ mod tests {
             let e = core_err(kerf_core::paths::validate_import_path(std::path::Path::new(bad)).unwrap_err());
             assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_network_or_device_path_is_refused_before_any_filesystem_call() {
+        for bad in [
+            "\\\\server\\share\\clip.mp4",
+            "\\\\?\\UNC\\server\\share\\clip.mp4",
+            "\\\\.\\pipe\\kerf",
+            "\\/server/share/clip.mp4",
+        ] {
+            let why = crate::require_local_input_path(bad).expect_err(bad);
+            assert!(why.contains("network"), "{bad}: {why}");
+            let e = caption_source(Some(bad), None).unwrap_err();
+            assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{bad}");
+            assert!(e.message.contains("network"), "{bad}: {}", e.message);
+        }
+        for bad in ["//server/share/clip.mp4", "//./pipe/kerf"] {
+            assert!(crate::check_input_path(bad, true).is_err(), "{bad}");
+        }
+        for ok in [
+            "/home/user/clip.mp4",
+            "//tmp/clip.mp4",
+            "C:\\Users\\me\\clip.mp4",
+            "\\\\?\\C:\\Users\\me\\clip.mp4",
+        ] {
+            assert!(crate::check_input_path(ok, false).is_ok(), "{ok}");
+        }
+        assert!(
+            crate::check_input_path("//tmp/clip.mp4", true).is_err(),
+            "//host/share is a share on Windows"
+        );
     }
 
     #[test]

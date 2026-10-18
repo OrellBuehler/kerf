@@ -33,7 +33,7 @@ disableKinds = ["taxonomy", "term", "RSS"]
   repo = "OrellBuehler/kerf"
   releases = "https://github.com/OrellBuehler/kerf/releases/latest"
   mcpUrl = "http://127.0.0.1:7777/mcp"
-  toolCount = 78
+  toolCount = 147
 
   # Umami (self-hosted): cookieless, no personal data, so no consent banner.
   # Only loaded in a production build — `hugo server` is the development

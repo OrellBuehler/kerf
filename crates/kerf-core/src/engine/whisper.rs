@@ -888,19 +888,40 @@ mod tests {
         assert!(err.to_string().contains("not a ggml file"), "{err}");
     }
 
-    /// Hits the network and writes ~75 MB into the model cache, so it is not part
-    /// of the normal run:
+    /// Hits the network and writes ~75 MB, so it is not part of the normal run:
     /// `cargo test -p kerf-core --no-default-features -- --ignored downloads_a_real_model`
+    ///
+    /// It downloads into a cache directory of its own: a model already in the user's would be a
+    /// cache hit, nothing would stream, and the progress it asserts on would never come.
     #[test]
     #[ignore = "downloads a real model over the network"]
     fn downloads_a_real_model() {
+        struct TempDir(PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = TempDir(std::env::temp_dir().join(format!("kerf-model-real-{}-{:x}", std::process::id(), fnv_time())));
+        let dst = dir.0.join("kerf").join("models").join("ggml-tiny.bin");
+        assert!(!dst.exists(), "a cold cache");
+        let url = model_url("tiny");
+        let download = Download {
+            url: &url,
+            dst: &dst,
+            what: "speech model",
+            mirror_env: "KERF_WHISPER_MODEL_URL",
+            verify: &verify_ggml,
+        };
+
         let mut seen = Vec::new();
-        let path = download_model("tiny", &mut |p| seen.push(p)).expect("download");
+        let path = fetch(&download, &mut |p| seen.push(p), &|| false).expect("download");
+        assert_eq!(path, dst);
         assert!(path.is_file());
         verify_ggml(&path).expect("a real ggml file");
         assert!(seen.last().is_some_and(|p| p.fraction() == Some(1.0)), "{seen:?}");
         // A second call is a cache hit, not a second download.
-        let again = download_model("tiny", &mut |_| panic!("should not re-download")).expect("cached");
+        let again = fetch(&download, &mut |_| panic!("should not re-download"), &|| false).expect("cached");
         assert_eq!(again, path);
     }
 

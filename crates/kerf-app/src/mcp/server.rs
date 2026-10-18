@@ -873,7 +873,7 @@ mod tests {
     fn secrets_compare_equal_only_when_identical() {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(constant_time_eq(b"", b""));
-        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abx"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(!constant_time_eq(b"abcd", b"abc"));
         assert!(!constant_time_eq(b"", b"a"));
