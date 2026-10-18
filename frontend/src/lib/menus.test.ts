@@ -231,6 +231,7 @@ describe('Playback', () => {
 			'playback.toggle',
 			'playback.toStart',
 			'playback.toEnd',
+			'playback.goToTimecode',
 			'playback.stepBack',
 			'playback.stepForward',
 			'playback.jumpBack',

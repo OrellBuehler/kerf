@@ -521,6 +521,15 @@ const ACTION_LIST = [
 	{ id: 'playback.jumpForward', label: 'Forward one second', group: 'playback', context: 'global', defaults: ['Shift+ArrowRight'] },
 	{ id: 'playback.toStart', label: 'Go to start', group: 'playback', context: 'global', defaults: ['Home'] },
 	{ id: 'playback.toEnd', label: 'Go to end', group: 'playback', context: 'global', defaults: ['End'] },
+	{
+		id: 'playback.goToTimecode',
+		repeat: false,
+		label: 'Go to timecode',
+		group: 'playback',
+		context: 'global',
+		defaults: ['Mod+G'],
+		hint: 'Opens the timeline’s timecode for typing: 1000 is ten seconds in, 1:00:00 a minute, +15 fifteen frames on, -1.00 a second back. Enter goes there.'
+	},
 
 	{ id: 'marker.add', repeat: false, label: 'Add marker at playhead', group: 'markers', context: 'global', defaults: ['M'] },
 	{ id: 'marker.prev', label: 'Previous marker', group: 'markers', context: 'global', defaults: [','] },
@@ -975,4 +984,120 @@ export function filterActions(query: string, bindings: Bindings, platform: Platf
 			.toLowerCase();
 		return words.every((w) => hay.includes(w));
 	});
+}
+
+// ---- presets -------------------------------------------------------------------
+
+export type KeyPresetId = 'kerf' | 'premiere' | 'resolve' | 'finalcut';
+
+/** A named keyboard: chords per action over the defaults, applied as ordinary overrides — so
+ *  resolving, conflicts and Reset treat them like any other customisation. Only actions Kerf has;
+ *  what another editor binds that Kerf cannot do is left out (`frontend.md` lists it). */
+export interface KeyPreset {
+	id: KeyPresetId;
+	label: string;
+	/** Chords per action id; an action left out keeps its defaults. */
+	bindings: Readonly<Record<string, readonly string[]>>;
+	/** Where a Mac's keys differ, over `bindings` there. */
+	mac?: Readonly<Record<string, readonly string[]>>;
+}
+
+export const KEY_PRESETS: readonly KeyPreset[] = [
+	{ id: 'kerf', label: 'Kerf', bindings: {} },
+	{
+		id: 'premiere',
+		label: 'Premiere Pro',
+		bindings: {
+			'file.new': ['Mod+Alt+N'],
+			'file.export': ['Mod+M'],
+			'file.saveCover': ['Mod+Shift+E'],
+			'app.keyboard': ['Mod+Alt+K'],
+			'app.quit': ['Mod+Q'],
+			'edit.clearSelection': ['Escape', 'Mod+Shift+A'],
+			'tool.rippleMode': ['B'],
+			'marker.prev': ['Mod+Shift+M'],
+			'marker.next': ['Shift+M'],
+			'range.clearIn': ['Mod+Shift+I'],
+			'range.clearOut': ['Mod+Shift+O'],
+			'view.zoomFit': ['\\']
+		},
+		mac: {
+			'file.saveCover': ['Shift+E'],
+			'range.clearIn': ['Alt+I'],
+			'range.clearOut': ['Alt+O']
+		}
+	},
+	{
+		id: 'resolve',
+		label: 'DaVinci Resolve',
+		bindings: {
+			'app.keyboard': ['Mod+Alt+K'],
+			'app.quit': ['Mod+Q'],
+			'edit.clearSelection': ['Escape', 'Mod+Shift+A'],
+			'edit.trimStart': ['{'],
+			'edit.trimEnd': ['}'],
+			'edit.link': ['Mod+Alt+L'],
+			'tool.pointer': ['A'],
+			'tool.razor': ['B'],
+			'tool.roll': ['T'],
+			'tool.snap': ['N'],
+			'marker.prev': ['Shift+ArrowUp'],
+			'marker.next': ['Shift+ArrowDown'],
+			'range.clearIn': ['Alt+I'],
+			'range.clearOut': ['Alt+O'],
+			'view.zoomIn': ['Mod+='],
+			'view.zoomOut': ['Mod+-']
+		}
+	},
+	{
+		id: 'finalcut',
+		label: 'Final Cut Pro',
+		bindings: {
+			'file.save': ['Mod+S'],
+			'app.keyboard': ['Mod+Alt+K'],
+			'app.quit': ['Mod+Q'],
+			'edit.clearSelection': ['Escape', 'Mod+Shift+A'],
+			'edit.delete': ['Shift+Backspace', 'Shift+Delete'],
+			'edit.rippleDelete': ['Backspace', 'Delete'],
+			'edit.trimStart': ['Alt+['],
+			'edit.trimEnd': ['Alt+]'],
+			'edit.detachAudio': ['Ctrl+Shift+S'],
+			'tool.pointer': ['A'],
+			'tool.razor': ['B'],
+			'tool.roll': ['T'],
+			'tool.snap': ['N'],
+			'playback.goToTimecode': ['Ctrl+P'],
+			'marker.prev': ['Ctrl+;'],
+			'marker.next': ["Ctrl+'"],
+			'range.clearIn': ['Alt+I'],
+			'range.clearOut': ['Alt+O'],
+			'view.zoomIn': ['Mod+='],
+			'view.zoomOut': ['Mod+-']
+		}
+	}
+];
+
+export function keyPreset(id: string): KeyPreset | undefined {
+	return KEY_PRESETS.find((p) => p.id === id);
+}
+
+/** The table a preset puts into force on `platform`. */
+export function presetTable(preset: KeyPreset, platform: Platform): Record<string, readonly string[]> {
+	return { ...preset.bindings, ...(platform === 'mac' ? preset.mac : undefined) };
+}
+
+/** The overrides a preset is: what applying it stores, in place of whatever was there. */
+export function presetOverrides(preset: KeyPreset, platform: Platform, actions: readonly ActionDef[] = ACTIONS): KeyOverrides {
+	let o = emptyOverrides();
+	for (const [id, chords] of Object.entries(presetTable(preset, platform))) {
+		o = setActionChords(o, id, chords.flatMap((c) => parseChord(c, platform) ?? []), platform, actions);
+	}
+	return o;
+}
+
+/** The preset these overrides are exactly, or null for a keyboard of the user's own. */
+export function presetOf(o: KeyOverrides, platform: Platform, actions: readonly ActionDef[] = ACTIONS): KeyPresetId | null {
+	const same = (a: Record<string, string[]>, b: Record<string, string[]>) =>
+		Object.keys(a).length === Object.keys(b).length && Object.entries(a).every(([id, list]) => b[id] !== undefined && sameList(list, b[id]));
+	return KEY_PRESETS.find((p) => same(presetOverrides(p, platform, actions).bindings, o.bindings))?.id ?? null;
 }

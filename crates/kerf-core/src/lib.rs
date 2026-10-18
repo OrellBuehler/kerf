@@ -11,6 +11,9 @@ mod clip_timing;
 pub mod error;
 pub mod fonts;
 pub mod frame_pick;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod hostile;
 pub mod layer_geometry;
 pub mod mask_plane;
 pub mod media;
@@ -27,6 +30,7 @@ pub mod render_bar;
 pub mod render_plan;
 pub mod scopes;
 pub mod svg;
+pub mod timecode;
 pub mod transcript;
 
 mod engine;

@@ -8,6 +8,7 @@
 	import HeightGlyph from './HeightGlyph.svelte';
 	import ToolbarToggle from './ToolbarToggle.svelte';
 	import Minimap from './Minimap.svelte';
+	import TimecodeField from './TimecodeField.svelte';
 	import { toast } from '$lib/notifications.svelte';
 	import { ui, type Tool } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
@@ -2678,17 +2679,19 @@
 					: 'var(--border-subtle)'};position:sticky;top:0;z-index:50;background:var(--surface-app);display:flex;align-items:center;gap:6px;padding:0 8px;font-family:var(--font-mono);font-variant-numeric:tabular-nums;white-space:nowrap"
 			>
 				<!-- Where the playhead is, and how long the cut is: the timeline's own clock, so a scrub or a
-				     drag here does not need the Preview on screen to say what time it is. -->
+				     drag here does not need the Preview on screen to say what time it is. The playhead's half is
+				     where a timecode is typed (`TimecodeField`). -->
 				<span
 					data-timeline-time
 					role="timer"
 					aria-label="Playhead {tc(ui.time)} of {tc(editor.duration)}"
-					use:tip={`Playhead timecode, then the length of the cut · ${editor.fps.toFixed(3)} fps · non-drop`}
 					style="display:inline-flex;align-items:baseline;gap:6px"
 				>
-					<span style="font-size:12px;font-weight:600;color:var(--kerf-300)">{tc(ui.time)}</span>
+					<TimecodeField entry="timeline" describedby="timeline-cut-length" />
 					<span aria-hidden="true" style="font-size:11px;color:var(--text-muted)">/</span>
-					<span style="font-size:11px;color:var(--text-muted)">{tc(editor.duration)}</span>
+					<span id="timeline-cut-length" use:tip={'The length of the cut'} style="font-size:11px;color:var(--text-muted)"
+						>{tc(editor.duration)}</span
+					>
 				</span>
 				<span style="flex:1"></span>
 				{#if editor.rippleMode}
