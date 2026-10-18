@@ -1332,3 +1332,15 @@ export interface MusicFitted {
 	timeline: Timeline;
 	report: MusicFitReport;
 }
+
+/** What the editor window shows, reported for an agent's `get_editor_context`
+ *  (`crates/kerf-app/src/editor_context.rs`). Timeline seconds; ids are the live timeline's. */
+export interface UiContext {
+	playhead: number;
+	selected_clip_ids: string[];
+	mark_in: number | null;
+	mark_out: number | null;
+	visible_range: { start: number; end: number } | null;
+	focused_panel: string | null;
+	selected_asset_id: string | null;
+}

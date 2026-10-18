@@ -135,7 +135,14 @@ many seconds ago an agent last spoke to it, or `null` if none ever has —
 `initialize` is the one moment an agent is known to be there; a
 streamable-HTTP client holds no connection between calls, so there is no socket
 to report and the panel judges from the age instead of the green dot it used to
-show unconditionally). A **failed render deletes what it wrote** (`discard_partial`, in both
+show unconditionally). `report_ui_context` takes what the editor shows — playhead, selected
+clip ids, in/out marks, the visible timeline range (`ui.timelineView`, written by the
+timeline), the focused dock panel (`ui.focusedPanel`, dockview's active panel) and the
+selected asset — into `editor_context::EditorContextState`, its own `Mutex` in app state and
+never the `Project` (a view of the window, not the cut). `editor-context.ts` throttles it to
+the latest state once per 300 ms, only when it changed, and re-sends it every 30 s as a
+heartbeat; the MCP `get_editor_context` reads it back with `age_secs`, and `stale` once a
+report is over 90 s old. A **failed render deletes what it wrote** (`discard_partial`, in both
 `export_timeline` and the MCP `export`): only if this run touched the file
 (mtime differs from before), so a failure before ffmpeg opened the output cannot
 delete the earlier export sitting at that path. `export_variants` renders its

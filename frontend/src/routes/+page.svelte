@@ -47,12 +47,14 @@
 		onWindowCloseRequested,
 		openReleases,
 		quitApp,
+		reportUiContext,
 		revealLogs,
 		setWindowTitle,
 		showMainWindow,
 		takeLaunchProject
 	} from '$lib/api';
 	import { windowTitle } from '$lib/window-title';
+	import { createContextReporter, uiContext } from '$lib/editor-context';
 	import { finishImport, importMedia } from '$lib/import-media';
 	import { clipsIn, exportButtonState } from '$lib/export-button';
 	import { afterPaint, fontsReady, revealWindow } from '$lib/reveal';
@@ -83,6 +85,26 @@
 	$effect(() => {
 		void editor.assets.map((a) => a.id).join(',');
 		untrack(() => void mediaStatus.refresh());
+	});
+
+	// What the editor shows, for an agent's `get_editor_context` (throttled, `editor-context.ts`).
+	$effect(() => {
+		if (!inTauri()) return;
+		const reporter = createContextReporter((c) => void reportUiContext(c).catch(() => {}));
+		$effect(() =>
+			reporter.update(
+				uiContext({
+					time: ui.time,
+					selectedClipIds: editor.selectedClipIds,
+					markIn: ui.markIn,
+					markOut: ui.markOut,
+					view: ui.timelineView,
+					panel: ui.focusedPanel,
+					assetId: editor.selectedAssetId
+				})
+			)
+		);
+		return () => reporter.stop();
 	});
 
 	// A modal over the editor window puts what is in the detached windows out of reach too.

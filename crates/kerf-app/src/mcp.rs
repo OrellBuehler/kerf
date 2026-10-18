@@ -31,6 +31,9 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
 
+mod args;
+mod hints;
+
 /// Default localhost bind address for the MCP endpoint; override with `KERF_MCP_ADDR`.
 const DEFAULT_ADDR: &str = "127.0.0.1:7777";
 
@@ -1559,6 +1562,24 @@ impl KerfMcp {
     fn get_timeline_state(&self) -> Result<String, McpError> {
         let project = self.lock();
         json(&project.working_timeline().map_err(core_err)?)
+    }
+
+    #[tool(
+        description = "What the user is looking at in the Kerf window: `playhead` (timeline seconds), \
+                       `selected_clip_ids`, `mark_in` / `mark_out` (the in/out marks, null when unset), \
+                       `visible_range` (the timeline seconds on screen), `focused_panel` (timeline, preview, \
+                       inspector, library, mixer, agent or deliver) and `selected_asset_id` (the library's \
+                       pick). Call it when the user says \"this clip\", \"here\" or \"the selection\". The ids \
+                       are the user's live timeline, which your staged edits may since have changed. \
+                       `age_secs` says how long ago the window last reported; `stale` is true when it has \
+                       stopped reporting, and `reported` is false when no window ever has (Kerf headless)."
+    )]
+    fn get_editor_context(&self) -> Result<String, McpError> {
+        use tauri::Manager;
+        match self.app.try_state::<crate::editor_context::EditorContextState>() {
+            Some(state) => json(&state.read()),
+            None => json(&crate::editor_context::EditorContextState::default().read()),
+        }
     }
 
     #[tool(
@@ -3855,7 +3876,22 @@ async fn blocking<T: Send + 'static>(job: impl FnOnce() -> Result<T, McpError> +
 /// compile time, so build them once and hand out a borrow.
 fn router() -> &'static rmcp::handler::server::router::tool::ToolRouter<KerfMcp> {
     static ROUTER: OnceLock<rmcp::handler::server::router::tool::ToolRouter<KerfMcp>> = OnceLock::new();
-    ROUTER.get_or_init(KerfMcp::tool_router)
+    ROUTER.get_or_init(|| {
+        let mut router = KerfMcp::tool_router();
+        hints::annotate(&mut router);
+        router
+    })
+}
+
+/// Refuse a call naming an argument its tool does not take (`args`).
+fn reject_unknown_arguments(request: &rmcp::model::CallToolRequestParams) -> Result<(), McpError> {
+    let Some(tool) = router().get(&request.name) else {
+        return Ok(());
+    };
+    match args::unknown_argument(tool, request.arguments.as_ref()) {
+        Some(message) => Err(McpError::invalid_params(message, None)),
+        None => Ok(()),
+    }
 }
 
 /// How the server introduces itself to clients. `ServerConfig::default()` fills
@@ -3874,7 +3910,10 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              loads a file the user has not added yet), run \
              analyze_asset to populate silence / scene / transcript / loudness \
              (EBU R128 LUFS) / onset / tempo (BPM + beat grid) / speech-vs-music \
-             metadata. \
+             metadata. When the user points at something in the window — \
+             \"this clip\", \"here\", \"the selection\", \"between the marks\" — \
+             get_editor_context says what they have selected, where the playhead \
+             and the in/out marks are and which part of the timeline is on screen. \
              You can also SEE the footage: skim_asset returns a contact-sheet \
              image of a clip (survey it to find the good parts), get_frame shows \
              a single moment up close, and preview_timeline renders the cut you \
@@ -4016,16 +4055,22 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
 
 #[tool_handler(router = router())]
 impl ServerHandler for KerfMcp {
-    /// The `#[tool_handler]` default, plus the one place every failing tool
-    /// call — whichever helper built the error — reaches the logfile.
+    /// The `#[tool_handler]` default behind the strict-argument check, plus the
+    /// one place every failing tool call — whichever helper built the error —
+    /// reaches the logfile.
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, McpError> {
         let tool = request.name.to_string();
-        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let result = router().call(tcc).await;
+        let result = match reject_unknown_arguments(&request) {
+            Ok(()) => {
+                let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+                router().call(tcc).await
+            }
+            Err(e) => Err(e),
+        };
         if let Err(e) = &result {
             log_tool_error(&tool, e);
         }
@@ -4389,7 +4434,8 @@ fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
 mod tests {
     use super::{
         allowed_hosts, caption_source, clip_moves, core_err, describe_server_error, fmt_ts, image_result, log_tool_error,
-        refuse_overwrite, require_window, router, server_identity, track_gaps, variant_output, ClipMoveParams,
+        refuse_overwrite, reject_unknown_arguments, require_window, router, server_identity, track_gaps, variant_output,
+        ClipMoveParams,
     };
 
     #[test]
@@ -5199,6 +5245,126 @@ mod tests {
             "{span}"
         );
         assert_eq!(span["format"], "9:16");
+    }
+
+    #[test]
+    fn the_server_instructions_point_at_the_editor_context() {
+        let text = super::INSTRUCTIONS;
+        assert!(text.contains("get_editor_context"), "{text}");
+        assert!(text.contains("\"this clip\""), "{text}");
+    }
+
+    fn call(name: &'static str, args: serde_json::Value) -> rmcp::model::CallToolRequestParams {
+        rmcp::model::CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone())
+    }
+
+    /// serde drops a key a parameter struct does not name, so a misspelt override
+    /// would run the edit without it and report success.
+    #[test]
+    fn an_unknown_argument_is_refused_naming_the_accepted_ones() {
+        use rmcp::model::ErrorCode;
+        let e = reject_unknown_arguments(&call("trim", serde_json::json!({"clip_id": "x", "rippel": false})))
+            .expect_err("a misspelt ripple must not be dropped silently");
+        assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(e.code.0, -32602);
+        for name in ["\"rippel\"", "trim", "ripple", "clip_id", "source_in", "link"] {
+            assert!(e.message.contains(name), "{name}: {}", e.message);
+        }
+
+        let e = reject_unknown_arguments(&call("list_assets", serde_json::json!({"verbose": true}))).unwrap_err();
+        assert!(e.message.contains("takes no arguments"), "{}", e.message);
+
+        assert!(reject_unknown_arguments(&call("trim", serde_json::json!({"clip_id": "x", "ripple": false}))).is_ok());
+        assert!(reject_unknown_arguments(&call("list_assets", serde_json::json!({}))).is_ok());
+        assert!(reject_unknown_arguments(&rmcp::model::CallToolRequestParams::new("list_assets")).is_ok());
+        assert!(
+            reject_unknown_arguments(&call("no_such_tool", serde_json::json!({"x": 1}))).is_ok(),
+            "an unknown tool is the router's to report"
+        );
+    }
+
+    /// Every argument a tool's schema lists is accepted — the check reads the same
+    /// schema the client was given, so it can only refuse what the client was not offered —
+    /// and no tool admits a key it does not list.
+    #[test]
+    fn every_listed_argument_is_accepted_and_nothing_else() {
+        for tool in router().list_all() {
+            let props = tool
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .cloned()
+                .unwrap_or_default();
+            let args: serde_json::Map<String, serde_json::Value> =
+                props.keys().map(|k| (k.clone(), serde_json::Value::Null)).collect();
+            let mut request = rmcp::model::CallToolRequestParams::new(tool.name.clone()).with_arguments(args);
+            assert!(reject_unknown_arguments(&request).is_ok(), "{}", tool.name);
+            request
+                .arguments
+                .as_mut()
+                .unwrap()
+                .insert("not_an_argument".into(), serde_json::Value::Null);
+            assert!(reject_unknown_arguments(&request).is_err(), "{} admits any key", tool.name);
+        }
+    }
+
+    /// A client decides from these hints what to run unasked and what to confirm,
+    /// so a tool without them is a tool it has to guess about.
+    #[test]
+    fn every_tool_is_titled_and_annotated() {
+        let tools = router().list_all();
+        for tool in &tools {
+            assert!(
+                tool.title.as_deref().is_some_and(|t| !t.is_empty()),
+                "{} has no title",
+                tool.name
+            );
+            let a = tool
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} has no annotations", tool.name));
+            for (hint, value) in [
+                ("readOnlyHint", a.read_only_hint),
+                ("destructiveHint", a.destructive_hint),
+                ("idempotentHint", a.idempotent_hint),
+                ("openWorldHint", a.open_world_hint),
+            ] {
+                assert!(value.is_some(), "{} lacks {hint}", tool.name);
+            }
+        }
+        for (name, ..) in super::hints::TOOLS {
+            assert!(tools.iter().any(|t| t.name == *name), "hints name {name}, which is no tool");
+        }
+        let hint = |name: &str| tools.iter().find(|t| t.name == name).unwrap().annotations.clone().unwrap();
+        for read in [
+            "get_timeline_state",
+            "preview_timeline",
+            "staged_diff",
+            "get_editor_context",
+            "get_levels",
+        ] {
+            assert_eq!(hint(read).read_only_hint, Some(true), "{read}");
+        }
+        for staged in ["trim", "remove_clips", "remove_track", "set_volume", "stage_edits"] {
+            let a = hint(staged);
+            assert_eq!((a.read_only_hint, a.destructive_hint), (Some(false), Some(false)), "{staged}");
+        }
+        for destructive in [
+            "apply_staged_edits",
+            "discard_staged_edits",
+            "revert_to",
+            "export",
+            "export_variants",
+            "export_cover",
+            "export_srt",
+            "delete_proxy",
+            "remove_task",
+        ] {
+            assert_eq!(hint(destructive).destructive_hint, Some(true), "{destructive}");
+        }
+        for downloads in ["download_speech_model", "generate_voiceover", "separate_stems"] {
+            assert_eq!(hint(downloads).open_world_hint, Some(true), "{downloads}");
+        }
     }
 
     #[test]
