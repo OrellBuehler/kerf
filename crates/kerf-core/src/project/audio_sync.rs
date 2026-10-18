@@ -58,7 +58,7 @@ pub struct AudioSyncMeasure {
 }
 
 /// What syncing a clip by its sound did.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct AudioSync {
     pub reference_id: Uuid,
     pub clip_id: Uuid,

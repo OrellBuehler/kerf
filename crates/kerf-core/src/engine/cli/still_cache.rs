@@ -43,6 +43,11 @@ impl StillKey {
 
 /// A file as the key sees it: its length and modification time, or that it is not there.
 pub(crate) fn file_stamp(path: &str) -> Vec<u8> {
+    // A title's picture is named by its content, so the name is the whole stamp (and it may not be
+    // drawn yet when a key is asked for, which a `stat` would call a different file).
+    if super::svg_layer::in_cache(path) {
+        return b"svg".to_vec();
+    }
     let Ok(meta) = std::fs::metadata(path) else {
         return b"missing".to_vec();
     };

@@ -1,12 +1,12 @@
 // What the Titles controls do, shared by the Inspector's "Titles lane" section
 // and the library's Titles tab so the two cannot drift: add a title at the
-// playhead, add one in a preset style, caption the cut, caption it from a
+// playhead, add one in a preset style, add an animated SVG title, caption the cut, caption it from a
 // subtitle file, pick a title to edit.
 
 import { editor } from './state.svelte';
 import { ui } from './editor-ui.svelte';
 import { toast } from './notifications.svelte';
-import { confirmAction, pickCaptionFile, type CaptionFilePick } from './api';
+import { confirmAction, listSvgPresets, pickCaptionFile, svgPresetPreview, validateSvg, type CaptionFilePick } from './api';
 import { CONFIRM } from './confirm-copy';
 import { describeImport } from './caption-import';
 import {
@@ -20,7 +20,8 @@ import {
 } from './caption-import-ui';
 import { attempt, errorMessage } from './ops';
 import type { TextStyle } from './style-presets';
-import type { TextOverlay } from './types';
+import { sampleSvg, svgDataUrl, svgFrame, svgPresetChoice } from './svg-titles';
+import type { SvgCheck, SvgOverlay, SvgPresetInfo, SvgPresetKind, TextOverlay } from './types';
 
 /** A plain title at the playhead. */
 export function addTextHere(): Promise<void> {
@@ -138,4 +139,93 @@ export async function importCaptionFile(choice: ImportChoice = TIMELINE_CHOICE):
 	} finally {
 		importing = false;
 	}
+}
+
+// ---- animated SVG titles ---------------------------------------------------------------------
+//
+// The artwork is the engine's (rendered into every preview and export frame); the page asks for
+// SVG text only to show a preset as a thumbnail, through an `<img>` data URL, never inline.
+
+let presetListing: Promise<SvgPresetInfo[]> | null = null;
+
+/** What each preset takes (`list_svg_presets`), asked for once: it is the same for the life of the app. A failed
+ *  read is asked again next time. */
+export function svgPresetInfos(): Promise<SvgPresetInfo[]> {
+	presetListing ??= listSvgPresets().catch((e) => {
+		presetListing = null;
+		throw e;
+	});
+	return presetListing;
+}
+
+/** A thumbnail is a preset drawn long enough that the browser's own SMIL player plays the entrance once and holds
+ *  it, rather than going on to the exit. */
+export const THUMBNAIL_SECONDS = 600;
+
+const thumbnails = new Map<string, Promise<string>>();
+
+/** A preset's thumbnail as an `<img>` data URL, drawn for the project's delivery frame with its sample text and kept
+ *  per frame shape. */
+export function presetThumbnail(kind: SvgPresetKind): Promise<string> {
+	const { width, height } = svgFrame(editor.timeline.format);
+	const key = `${kind}|${width}x${height}`;
+	let art = thumbnails.get(key);
+	if (!art) {
+		art = svgPresetPreview(kind, svgPresetChoice(kind)?.sample ?? { text: 'Your title' }, THUMBNAIL_SECONDS).then(svgDataUrl);
+		art.catch(() => thumbnails.delete(key));
+		thumbnails.set(key, art);
+	}
+	return art;
+}
+
+/** A preset animated title at the playhead, filled with its sample text, selected. */
+export function addAnimatedTitle(kind: SvgPresetKind): Promise<void> {
+	const at = Math.max(0, ui.time);
+	const params = svgPresetChoice(kind)?.sample ?? { text: 'Your title' };
+	return attempt(async () => void (await editor.addSvgTitle({ preset: { kind, params } }, at)));
+}
+
+/** A custom animated title at the playhead, seeded with a small animated SVG sized to the frame, selected, with the
+ *  Inspector's source box open on it. */
+export function addCustomSvgTitle(): Promise<void> {
+	const at = Math.max(0, ui.time);
+	const { width, height } = svgFrame(editor.timeline.format);
+	return attempt(async () => {
+		const created = await editor.addSvgTitle({ custom: sampleSvg(width, height) }, at);
+		if (created) ui.svgSourceFocus = created.id;
+	});
+}
+
+/** Pick an animated title from a list, and bring the playhead into its span so the preview has its box on screen.
+ *  Picking the selected one again lets go of it. */
+export function pickSvgTitle(o: SvgOverlay) {
+	if (editor.selectedSvgOverlayId === o.id) {
+		editor.selectSvgOverlay(null);
+		return;
+	}
+	editor.selectSvgOverlay(o.id);
+	if (ui.time < o.start || ui.time > o.end) ui.seek(o.start, { snap: 'up', end: o.end });
+}
+
+/** Put custom source on an animated title: the backend's reading of it first (`validate_svg` throws on a document it
+ *  would refuse, and says what it could not honour — an edit does not), then the edit. The warnings are the caller's to show. */
+export async function applySvgSource(overlayId: string, svg: string): Promise<SvgCheck> {
+	const check = await validateSvg(svg);
+	await editor.updateSvgOverlay(overlayId, { svg });
+	return check;
+}
+
+/** Make a preset title custom: its own artwork becomes the source, which drops the preset, and the source box opens. */
+export function convertToCustom(o: SvgOverlay): Promise<void> {
+	return attempt(async () => {
+		await editor.updateSvgOverlay(o.id, { svg: o.svg });
+		ui.svgSourceFocus = o.id;
+	});
+}
+
+/** Change which preset a title is: one edit that keeps the title's id, name, text, colours, timing, placement and place
+ *  in the draw order, and leaves it selected if it was. */
+export function changePreset(o: SvgOverlay, kind: SvgPresetKind): Promise<void> {
+	if (!o.preset || o.preset.kind === kind) return Promise.resolve();
+	return attempt(() => editor.updateSvgOverlay(o.id, { preset_kind: kind }));
 }

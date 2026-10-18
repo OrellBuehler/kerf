@@ -765,9 +765,10 @@ pub(crate) fn displayed_size(width: Option<u32>, height: Option<u32>, rotation: 
 }
 
 /// A colour tag as the engine stores it: `None` when the file does not say,
-/// rather than ffprobe's literal `"unknown"`.
+/// rather than ffprobe's literal `"unknown"` — or `"reserved"`, a value no matrix has, which
+/// FFmpeg reads as it reads none.
 pub(crate) fn known_color(tag: Option<&str>) -> Option<String> {
-    tag.filter(|t| !t.is_empty() && *t != "unknown" && *t != "unspecified")
+    tag.filter(|t| !t.is_empty() && !matches!(*t, "unknown" | "unspecified" | "reserved"))
         .map(str::to_string)
 }
 
@@ -1399,6 +1400,7 @@ fn probe_composite_red(ffmpeg: &str, ffprobe: &str, tag_bt709: bool, deadline: I
             ..crate::model::Track::new(StreamKind::Video, "V1")
         }],
         overlays: Vec::new(),
+        svg_overlays: Vec::new(),
         markers: Vec::new(),
         format: None,
         master: Default::default(),
@@ -1457,6 +1459,12 @@ pub(crate) fn tonemap_chain(hdr: Hdr, zscale: bool) -> String {
 pub(super) fn tonemap_filter(hdr: Hdr) -> String {
     tonemap_chain(hdr, zscale_available())
 }
+
+/// The filter that labels a picture BT.709 without touching a pixel (`setparams`), for an untagged
+/// HD input that shares a graph with one naming a matrix ([`crate::model::bt709_labels`]). Not the
+/// `-colorspace` output option, which FFmpeg 9 takes as an order to convert into that matrix on the
+/// way (up to 22 levels moved, measured).
+const BT709_LABEL: &str = "setparams=colorspace=bt709";
 
 /// What the decodes that are handed a bare path rather than an [`Asset`] need to
 /// know about a file's first video stream, from one `ffprobe`.
@@ -2669,8 +2677,15 @@ fn proxy_key(source_key: &str, width: u32, tonemapped: bool, head_padded: bool) 
 /// frame-sync mode of its day. Only these sources are rebuilt, and their proxy is
 /// named `<hash>.lead.mp4` (`is_head_padded_proxy`, in `clip_timing`).
 pub fn proxy_path(src: &Path, width: u32) -> Option<PathBuf> {
+    proxy_path_for(src, width, source_traits(src).unwrap_or_default())
+}
+
+/// [`proxy_path`] for traits already read: an encode takes **one** reading for its destination and
+/// for its filters, because a probe that failed is remembered only for a minute and an encode that
+/// waited for the machine's slot can read again, and answer differently, before it starts — a
+/// tone-mapped or head-padded picture would then be written to the plain proxy's name.
+fn proxy_path_for(src: &Path, width: u32, traits: SourceTraits) -> Option<PathBuf> {
     let dir = dirs::cache_dir()?.join("kerf").join("proxies");
-    let traits = source_traits(src).unwrap_or_default();
     let padded = needs_head_pad(traits.lead);
     let key = proxy_key(&source_key(src), width, traits.hdr.is_some(), padded);
     Some(dir.join(proxy_file_name(fnv1a(&key), padded)))
@@ -2924,8 +2939,11 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         progress,
         cancel,
     } = run;
-    let dst =
-        proxy_path(src, width).ok_or_else(|| Error::Engine("no cache directory available for preview proxies".to_string()))?;
+    // One reading of the source answers everything below: where the proxy goes, whether to tone-map
+    // it and whether its video starts late.
+    let traits = source_traits(src).unwrap_or_default();
+    let dst = proxy_path_for(src, width, traits)
+        .ok_or_else(|| Error::Engine("no cache directory available for preview proxies".to_string()))?;
     if dst.is_file() {
         return Ok(dst);
     }
@@ -2964,9 +2982,6 @@ pub fn generate_proxy_with(src: &Path, width: u32, run: ProxyRun<'_>) -> Result<
         progress(0.0);
     }
     let threads = proxy_threads(cpu.threads());
-    // One cached probe answers both: whether to tone-map and whether the video
-    // starts late (the same one `proxy_path` keyed this proxy on).
-    let traits = source_traits(src).unwrap_or_default();
     let tonemap = traits.hdr.map(tonemap_filter);
     let head_pad = needs_head_pad(traits.lead).then(fps_mode_flag);
     let mut run = |hw_decode: Option<&str>| -> Result<Streamed> {
@@ -4428,6 +4443,18 @@ fn push_inputs(
     Ok(plan)
 }
 
+/// The timeline an export draws: [`Timeline::for_render`] (muted / solo-shadowed tracks and
+/// disabled clips gone), and for a range export the sliced sub-timeline, so trims, fades,
+/// keyframes and overlays all see the same shifted geometry. The builder and whatever has to know
+/// what the builder will ask for before it is spawned (the titles' pictures) both start here.
+fn export_timeline(timeline: &Timeline, opts: &ExportOptions) -> Timeline {
+    let rendered = timeline.for_render();
+    match effective_range(&rendered, opts) {
+        Some((s, e)) => rendered.slice(s, e),
+        None => rendered,
+    }
+}
+
 /// [`build_export_args`] parameterised by the two-pass [`PassPhase`]. `null_sink`
 /// is the platform null device (`/dev/null` / `NUL`) used as the first-pass
 /// output, and `passlog` is the shared `-passlogfile` prefix — both injected by
@@ -4442,21 +4469,10 @@ fn build_export_args_phase(
     null_sink: &str,
     passlog: &str,
 ) -> Result<Vec<String>> {
-    // Drop muted / solo-shadowed tracks and disabled clips up front, so the rest
-    // of the builder never has to reason about them.
-    let rendered = timeline.for_render();
-    let timeline = &rendered;
-
-    // Range export: build the graph against the sliced sub-timeline, so trims,
-    // fades, keyframes and overlays all see the same shifted geometry.
-    let sliced;
-    let timeline = match effective_range(timeline, opts) {
-        Some((s, e)) => {
-            sliced = timeline.slice(s, e);
-            &sliced
-        }
-        None => timeline,
-    };
+    // Drop muted / solo-shadowed tracks and disabled clips up front, and cut the range an export
+    // of one span draws, so the rest of the builder never has to reason about either.
+    let cut = export_timeline(timeline, opts);
+    let timeline = &cut;
 
     // Stream gating: decide what the graph emits and what we `-map`, in lockstep.
     let timeline_has_video = timeline
@@ -4490,6 +4506,11 @@ fn build_export_args_phase(
     // `build_filter_complex` indexes them and how `fx` is indexed.
     let fmt = export_format(timeline, assets, opts);
     let plan = push_inputs(timeline, assets, &fmt, opts, &mut args)?;
+    // The animated titles' picture sequences follow the clips' inputs (the graph indexes them from
+    // there); a cut with none adds nothing.
+    if want_video {
+        svg_layer::push_inputs(&svg_layer::svg_sequences(timeline, &fmt), &fmt, &mut args);
+    }
 
     let total = timeline.duration();
     let graph = build_filter_complex(timeline, assets, &fmt, total, opts, want_video, want_audio, &plan);
@@ -4879,6 +4900,7 @@ fn preview_resolution(timeline: &Timeline, assets: &[Asset], max_width: u32) -> 
 /// every track, effect, transform, keyframe and overlay, not just the raw clip
 /// under the playhead. Only the two ends differ from an export: proxy sources go
 /// in (the caller substitutes those paths) and MJPEG comes out on a pipe.
+#[cfg(test)]
 fn build_preview_args(
     timeline: &Timeline,
     assets: &[Asset],
@@ -4894,6 +4916,7 @@ fn build_preview_args(
 /// the machine (`KERF_HWACCEL`, and whether an earlier hardware failure turned it
 /// off). The one seam the golden argv oracle needs to be independent of the machine
 /// it runs on; the argv it builds is exactly what `build_preview_args` always did.
+#[cfg(test)]
 fn build_preview_args_with(
     timeline: &Timeline,
     assets: &[Asset],
@@ -4903,6 +4926,39 @@ fn build_preview_args_with(
     quality: u8,
     hwaccel: Option<String>,
 ) -> Result<Vec<String>> {
+    let cut = preview_cut(timeline, assets, start, fps, max_width, hwaccel)?;
+    preview_args(&cut, assets, quality)
+}
+
+/// What the playback stream plays: the cut from the playhead, how it is rendered and the frame it
+/// is drawn in. Worked out apart from the argv so that what the argv will ask for — the animated
+/// titles' pictures — can be on disk before ffmpeg is spawned.
+struct PreviewCut {
+    sliced: Timeline,
+    opts: ExportOptions,
+    fmt: ExportFormat,
+    /// The animated titles of the cut before it was sliced, how long that cut is, and the playhead
+    /// the slice starts at: a title's pictures are named for the title, not for the playhead.
+    titles: Vec<crate::model::SvgOverlay>,
+    total: f64,
+    start: f64,
+}
+
+impl PreviewCut {
+    /// The animated titles' pictures the stream reads (named, not drawn).
+    fn svg(&self) -> Vec<svg_layer::SvgSeq<'_>> {
+        svg_layer::stream_sequences(&self.titles, self.total, &self.sliced, self.start, &self.fmt)
+    }
+}
+
+fn preview_cut(
+    timeline: &Timeline,
+    assets: &[Asset],
+    start: f64,
+    fps: f64,
+    max_width: u32,
+    hwaccel: Option<String>,
+) -> Result<PreviewCut> {
     // Same gate as the export: muted / solo-shadowed tracks and disabled clips
     // never reach the graph, so what plays is what would render.
     let timeline = &timeline.for_render();
@@ -4935,13 +4991,38 @@ fn build_preview_args_with(
         ..ExportOptions::default()
     };
     let fmt = export_format(&sliced, assets, &opts);
+    Ok(PreviewCut {
+        sliced,
+        opts,
+        fmt,
+        titles: timeline.svg_overlays.clone(),
+        total: end,
+        start,
+    })
+}
 
+/// The argv that plays a [`PreviewCut`] as JPEGs on stdout.
+fn preview_args(cut: &PreviewCut, assets: &[Asset], quality: u8) -> Result<Vec<String>> {
+    let PreviewCut { sliced, opts, fmt, .. } = cut;
     let mut args: Vec<String> = ["-hide_banner", "-nostats", "-nostdin", "-loglevel", "error"]
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let plan = push_inputs(&sliced, assets, &fmt, &opts, &mut args)?;
-    let graph = build_filter_complex(&sliced, assets, &fmt, sliced.duration(), &opts, true, false, &plan);
+    let plan = push_inputs(sliced, assets, fmt, opts, &mut args)?;
+    let titles = cut.svg();
+    svg_layer::push_inputs(&titles, fmt, &mut args);
+    let graph = build_filter_complex_with(
+        sliced,
+        assets,
+        fmt,
+        sliced.duration(),
+        opts,
+        true,
+        false,
+        &plan,
+        false,
+        Some(&titles),
+    );
     args.push("-filter_complex".to_string());
     args.push(graph.filter);
     args.push("-map".to_string());
@@ -4993,6 +5074,22 @@ pub fn stream_preview_with(
     request: PlaybackRequest,
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
 ) -> Result<()> {
+    stream_preview_until(timeline, assets, start, request, &|| false, on_frame)
+}
+
+/// [`stream_preview_with`] that can be told to stop **before the first frame**: `cancel` is looked
+/// at while the animated titles' pictures are being drawn (about forty times a second, and between
+/// the steps that come before the drawing), which `on_frame` — called only once there are frames —
+/// cannot interrupt. A stream cancelled then ends with [`Error::Cancelled`]; one that has started
+/// is stopped by `on_frame` returning `false`, as ever.
+pub fn stream_preview_until(
+    timeline: &Timeline,
+    assets: &[Asset],
+    start: f64,
+    request: PlaybackRequest,
+    cancel: &dyn Fn() -> bool,
+    on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
+) -> Result<()> {
     let params = playback_params(timeline, assets, request);
     // Whether the run that was spawned asked any input for hardware decode: none of a proxy's
     // inputs do, and a failure of a run that did not is not the hardware's.
@@ -5000,7 +5097,7 @@ pub fn stream_preview_with(
     // `None` until ffmpeg is running: a timeline with nothing to play fails
     // before that, and says nothing about the hardware.
     let mut sent = None;
-    match stream_preview_once(timeline, assets, start, params, on_frame, &mut sent, &mut hw) {
+    match stream_preview_once(timeline, assets, start, params, cancel, on_frame, &mut sent, &mut hw) {
         // A hardware decode that dies before the first frame is `-hwaccel`
         // being unusable here, not the graph: a static ffmpeg aborts outright
         // when `auto` probes a VAAPI whose libva isn't installed. Once frames
@@ -5009,7 +5106,7 @@ pub fn stream_preview_with(
         Err(e) if hw && sent == Some(0) => {
             HWACCEL_OK.store(false, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!("hardware decode failed starting playback; using software decode: {e}");
-            stream_preview_once(timeline, assets, start, params, on_frame, &mut sent, &mut hw)
+            stream_preview_once(timeline, assets, start, params, cancel, on_frame, &mut sent, &mut hw)
         }
         r => r,
     }
@@ -5049,17 +5146,23 @@ const PREVIEW_TIMEOUTS: PreviewTimeouts = PreviewTimeouts {
     stall: std::time::Duration::from_secs(15),
 };
 
+#[allow(clippy::too_many_arguments)]
 fn stream_preview_once(
     timeline: &Timeline,
     assets: &[Asset],
     start: f64,
     params: PlaybackParams,
+    cancel: &dyn Fn() -> bool,
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
     sent: &mut Option<u64>,
     hw_used: &mut bool,
 ) -> Result<()> {
     let PlaybackParams { fps, max_width } = params;
-    let mut args = build_preview_args(timeline, assets, start, fps, max_width, PREVIEW_STREAM_QUALITY)?;
+    let cut = preview_cut(timeline, assets, start, fps, max_width, decode_hwaccel())?;
+    // Animated titles are pictures on disk by now (a few seconds' work at most); held until the
+    // stream is over so the cache cannot take them away mid-play.
+    let _titles = svg_layer::prepare_preview(&cut.svg(), cancel)?;
+    let mut args = preview_args(&cut, assets, PREVIEW_STREAM_QUALITY)?;
     // The composited graph outgrows argv just as the export's does.
     let _script = externalize_filter_complex(&mut args, "preview")?;
     // Hardware decode is per input, and a proxy (what the stream reads once one is ready) is
@@ -5273,11 +5376,18 @@ pub fn render_with_progress(
         ),
         ..opts.clone()
     };
+    // A request that would be refused anyway is refused before the titles are drawn.
+    export_preflight(timeline, assets, &opts)?;
     match measure_static_loudness(timeline, assets, &mut opts, cancel) {
         Err(Error::Cancelled) => return Ok(RenderStatus::Cancelled),
         r => r?,
     }
     let opts = &opts;
+    // The animated titles are pictures on disk before any ffmpeg is spawned: drawn once for this
+    // export — a second pass and the software retry read the same files — and kept until it is over.
+    let Some(_titles) = svg_layer::prepare_export(timeline, assets, opts, progress, cancel)? else {
+        return Ok(RenderStatus::Cancelled);
+    };
     retry_export_in_software(
         opts,
         |o, hw_used| render_attempt(timeline, assets, output, o, progress, cancel, hw_used),
@@ -5596,16 +5706,11 @@ pub fn render_variants(
     Ok((RenderStatus::Completed, total))
 }
 
-/// One export run with `opts` exactly as given (no fallback).
-fn render_attempt(
-    timeline: &Timeline,
-    assets: &[Asset],
-    output: &Path,
-    opts: &ExportOptions,
-    progress: &mut dyn FnMut(ExportProgress),
-    cancel: &dyn Fn() -> bool,
-    hw_used: &std::cell::Cell<bool>,
-) -> Result<RenderStatus> {
+/// What an export is refused for before anything is drawn or spawned — an empty timeline, options
+/// that would export nothing or that the container cannot hold — and whether it has picture and
+/// sound. Asked ahead of the animated titles' drawing so a bad request does not spend seconds of the
+/// cores on pictures nobody will use.
+fn export_preflight(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Result<(bool, bool)> {
     if !timeline.tracks.iter().any(|t| !t.clips.is_empty()) {
         return Err(Error::InvalidArgument("timeline has no clips to export".to_string()));
     }
@@ -5623,6 +5728,20 @@ fn render_attempt(
     if !issues.is_empty() {
         return Err(Error::InvalidArgument(issues.join(" ")));
     }
+    Ok((has_video, has_audio))
+}
+
+/// One export run with `opts` exactly as given (no fallback).
+fn render_attempt(
+    timeline: &Timeline,
+    assets: &[Asset],
+    output: &Path,
+    opts: &ExportOptions,
+    progress: &mut dyn FnMut(ExportProgress),
+    cancel: &dyn Fn() -> bool,
+    hw_used: &std::cell::Cell<bool>,
+) -> Result<RenderStatus> {
+    let (has_video, _) = export_preflight(timeline, assets, opts)?;
 
     let output_str = output
         .to_str()
@@ -6128,6 +6247,26 @@ fn build_filter_complex_metered(
     plan: &InputPlan,
     meter: bool,
 ) -> FilterGraph {
+    build_filter_complex_with(timeline, assets, fmt, total, opts, want_video, want_audio, plan, meter, None)
+}
+
+/// [`build_filter_complex_metered`] with the animated titles' sequences given: the playback stream
+/// reads the ones named for a title, not for the playhead ([`svg_layer::stream_sequences`]), and the
+/// graph must index the very inputs its argv carries. `None` is the cut's own
+/// ([`svg_layer::svg_sequences`]).
+#[allow(clippy::too_many_arguments)]
+fn build_filter_complex_with(
+    timeline: &Timeline,
+    assets: &[Asset],
+    fmt: &ExportFormat,
+    total: f64,
+    opts: &ExportOptions,
+    want_video: bool,
+    want_audio: bool,
+    plan: &InputPlan,
+    meter: bool,
+    titles: Option<&[svg_layer::SvgSeq<'_>]>,
+) -> FilterGraph {
     let has_audio = |clip: &crate::model::Clip| clip_sounds(clip, assets);
     let is_image = |clip: &crate::model::Clip| assets.iter().find(|a| a.id == clip.asset_id).is_some_and(|a| a.is_image());
     let layout = fmt.channel_layout();
@@ -6233,18 +6372,30 @@ fn build_filter_complex_metered(
         ));
         let mut cur = "vbase".to_string();
         let draw = !timeline.overlays.is_empty();
+        // Animated titles: PNG sequences read as inputs after the clips'. They go over the whole
+        // composite and under the text.
+        let own;
+        let svg: &[svg_layer::SvgSeq<'_>] = match titles {
+            Some(given) => given,
+            None => {
+                own = svg_layer::svg_sequences(timeline, fmt);
+                &own
+            }
+        };
         // The picture ends on `[outv]`, or on `vhw` when a VAAPI encoder's upload follows.
         let vaapi = uploads_to_vaapi(opts);
         let final_pad = if vaapi { "vhw" } else { "outv" };
-        // The composite lands on `vcomp` for gif (palettegen follows), on `vtext`
+        // What comes after the titles: `vcomp` for gif (palettegen follows), `vtext`
         // when text overlays will be drawn on top, else directly on `final_pad`.
-        let composite_pad = if draw {
+        let after_svg = if draw {
             "vtext"
         } else if gif {
             "vcomp"
         } else {
             final_pad
         };
+        // The clips land on `vsvg` when titles follow, else where the titles would have gone.
+        let composite_pad = if svg.is_empty() { after_svg } else { "vsvg" };
         let last = video.len() - 1;
         for (n, (flat, input, clip)) in video.iter().enumerate() {
             let src = if vcount[*input] > 1 {
@@ -6307,10 +6458,13 @@ fn build_filter_complex_metered(
             chains.push(format!("[{cur}][v{flat}]{overlay}[{out}]"));
             cur = out;
         }
+        if !svg.is_empty() {
+            svg_layer::push_chains(svg, n_inputs, composite_pad, after_svg, &mut chains);
+        }
         // Text overlays (titles / lower-thirds / captions) drawn on the composited
         // picture in order; the last produces the gif source `vcomp` or `[outv]`.
         if draw {
-            let mut tcur = composite_pad.to_string();
+            let mut tcur = after_svg.to_string();
             let last_o = timeline.overlays.len() - 1;
             let text_final = if gif { "vcomp" } else { final_pad };
             for (oi, ov) in timeline.overlays.iter().enumerate() {
@@ -7435,6 +7589,13 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     });
 
     let mut p: Vec<String> = Vec::new();
+    // The label is the first filter of the chain, so that all of it reads what a file tagged BT.709
+    // would give. Later, a scaler may have converted the picture already: the fit `scale` is the
+    // filter FFmpeg has do the RGB conversion a dip to white's `fade` needs, as BT.601 in and
+    // BT.709 out (8 to 15 levels off the footage tagged in the file).
+    if fx.label_bt709 {
+        p.push(BT709_LABEL.to_string());
+    }
     // A head-padded proxy opens with one clone of its first frame at time zero (see
     // [`build_proxy_args`]), which a seek skips — and a read from the start does
     // not. The original has no such frame: its first one is the real one, and the
@@ -7738,6 +7899,8 @@ fn run_still(
 ) -> Result<Vec<u8>> {
     let piping = matches!(out, StillOutput::JpegPipe { .. });
     let hw_used = std::cell::Cell::new(false);
+    // The titles' pictures, on disk and kept for the run (and its software retry).
+    let _titles = still_titles(timeline, assets, opts, t, max_width, region)?;
     let run = |o: &ExportOptions| -> Result<Vec<u8>> {
         let mut args = build_still_args(timeline, assets, o, t, max_width, region, out)?;
         hw_used.set(tune_still_args(&mut args, assets, HostOs::CURRENT));
@@ -8018,6 +8181,45 @@ fn build_still_args(
     build_still_args_rendered(&rendered, assets, opts, t, max_width, region, out)
 }
 
+/// The frame a still is composited on: the export's format, the region normalised, and the output
+/// canvas (`ow` x `oh`: the export's aspect capped to `max_width`, even). A region zoom composites a
+/// canvas wide enough that the region alone is `max_width` — the delivery frame caps it, so a zoom
+/// never upscales. The builder and whatever draws the still's titles first both ask this.
+fn still_canvas(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    max_width: u32,
+    region: Option<Region>,
+) -> (ExportFormat, Option<Region>, u32, u32) {
+    let fmt = export_format(timeline, assets, opts);
+    let region = region.map(Region::normalized);
+    let canvas_width = match region {
+        Some(r) => ((max_width as f64 / r.width).ceil() as u32).min(fmt.width),
+        None => max_width,
+    };
+    let (ow, oh) = still_size(fmt.width, fmt.height, canvas_width);
+    (fmt, region, ow, oh)
+}
+
+/// Have the animated titles a still at `t` shows drawn and kept (until the pins drop), before its
+/// ffmpeg is spawned. Nothing for a cut without any.
+fn still_titles(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    max_width: u32,
+    region: Option<Region>,
+) -> Result<Vec<crate::svg::raster::Pin>> {
+    if timeline.svg_overlays.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rendered = timeline.for_render();
+    let (_, _, ow, oh) = still_canvas(&rendered, assets, opts, max_width, region);
+    svg_layer::ensure_stills(&svg_layer::still_svgs(&rendered, ow, oh, t.max(0.0)))
+}
+
 /// [`build_still_args`] over a timeline that has already been through [`Timeline::for_render`]:
 /// what a caller asking for many frames of one cut (the scrub cache keys every frame of a
 /// window) does once instead of per frame.
@@ -8030,18 +8232,11 @@ fn build_still_args_rendered(
     region: Option<Region>,
     out: &StillOutput,
 ) -> Result<Vec<String>> {
-    let fmt = export_format(timeline, assets, opts);
-    // A region zoom composites a canvas wide enough that the region alone is
-    // `max_width` — the delivery frame caps it, so a zoom never upscales.
-    let region = region.map(Region::normalized);
-    let canvas_width = match region {
-        Some(r) => ((max_width as f64 / r.width).ceil() as u32).min(fmt.width),
-        None => max_width,
-    };
-    // Output canvas: export aspect ratio, capped to `max_width`, even dimensions.
-    let (ow, oh) = still_size(fmt.width, fmt.height, canvas_width);
+    let (fmt, region, ow, oh) = still_canvas(timeline, assets, opts, max_width, region);
     let t = t.max(0.0);
     let asset_of = |id| assets.iter().find(|a: &&Asset| a.id == id);
+    // The animated titles on screen at `t`: one picture each (`run_still` draws them first).
+    let svg = svg_layer::still_svgs(timeline, ow, oh, t);
 
     // Active video clips at `t`, in composite order (tracks in list order, clips
     // within a track in timeline order), paired with their source time, the clips a
@@ -8071,6 +8266,7 @@ fn build_still_args_rendered(
         args.push("-i".to_string());
         args.push(asset.path.clone());
     }
+    svg_layer::push_still_inputs(&svg, &mut args);
 
     // Black base + each active clip's still chain (its transform sampled at `t`,
     // so a keyframed clip shows its pose), overlaid in order, then the text
@@ -8101,7 +8297,8 @@ fn build_still_args_rendered(
                 &canvas,
                 clip.mask.as_ref(),
                 clip.zoom_animated(),
-                &layer.fades
+                &layer.fades,
+                layer.label_bt709
             )
         ));
         let out = format!("ov{n}");
@@ -8111,6 +8308,8 @@ fn build_still_args_rendered(
         ));
         cur = out;
     }
+    // Titles over the clips, under the text, as in the export.
+    cur = svg_layer::push_still_chains(&svg, active.len(), &cur, &mut chains);
     for (oi, ov) in live.iter().enumerate() {
         let out = format!("txt{oi}");
         chains.push(format!("[{cur}]{f}[{out}]", f = drawtext_still(ov, oh, t)));
@@ -8164,6 +8363,9 @@ struct StillCanvas {
 /// ([`still_fx`]): where the export's chain applies its `fade` steps, after the rotation and
 /// ahead of a moving zoom, the same filters run on the frame. None at all for a still
 /// outside any fade, and then the chain is what it was.
+///
+/// `label_bt709` is the graph's BT.709 label for this layer ([`BT709_LABEL`]): the still decides
+/// it over the layers on screen, and puts it where [`video_clip_chain`] does, ahead of everything.
 #[allow(clippy::too_many_arguments)]
 fn still_clip_chain(
     tf: &Transform,
@@ -8174,12 +8376,17 @@ fn still_clip_chain(
     mask: Option<&Mask>,
     zoom_last: bool,
     fades: &StillFades,
+    label_bt709: bool,
 ) -> String {
     let StillCanvas { w: ow, h: oh, fit, sf } = canvas;
     let (ow, oh, fit) = (*ow, *oh, *fit);
     let chroma = effects.iter().any(|e| e.produces_alpha());
     let needs_alpha = (!tf.is_identity() && tf.needs_alpha()) || chroma || mask.is_some() || fades.needs_alpha();
-    let mut p: Vec<String> = vec!["trim=end_frame=1".to_string(), "setpts=PTS-STARTPTS".to_string()];
+    let mut p: Vec<String> = Vec::new();
+    if label_bt709 {
+        p.push(BT709_LABEL.to_string());
+    }
+    p.extend(["trim=end_frame=1".to_string(), "setpts=PTS-STARTPTS".to_string()]);
     let crop = tf.has_crop().then(|| {
         let cw = (1.0 - tf.crop_left - tf.crop_right).max(0.0);
         let ch = (1.0 - tf.crop_top - tf.crop_bottom).max(0.0);
@@ -8433,6 +8640,10 @@ pub use levels::mix_levels;
 #[cfg(test)]
 mod golden;
 
+/// The BT.709 label on the four builders, and the plan's mirror of it.
+#[cfg(test)]
+mod bt709_label;
+
 /// What the export graph draws, pinned against rendered pixels (`#[ignore]`d).
 #[cfg(test)]
 mod rendered;
@@ -8440,6 +8651,13 @@ mod rendered;
 /// The still inside a fade, a dip, a dissolve, a slide or a push: its layers and their fades.
 mod still_fx;
 use still_fx::{still_layers, StillFades};
+
+/// Animated SVG titles as PNG sequences and stills: drawn before ffmpeg is spawned, overlaid by it.
+mod svg_layer;
+
+/// Titles through the real ffmpeg (`#[ignore]`d).
+#[cfg(test)]
+mod svg_rendered;
 
 /// Which slot a job takes, the cores' or the hardware's.
 #[cfg(test)]
@@ -10085,6 +10303,32 @@ mod tests {
     }
 
     #[test]
+    fn an_encode_names_its_proxy_from_the_traits_it_was_given() {
+        // One reading answers the destination, the tone-map and the pad: what the destination is
+        // follows from those traits alone, and a source that cannot be probed is the plain one.
+        let src = Path::new("/media/never-imported.mov");
+        let plain = SourceTraits::default();
+        let hlg = SourceTraits {
+            hdr: Some(Hdr::Hlg),
+            ..plain
+        };
+        let late = SourceTraits { lead: 0.5, ..plain };
+        let (Some(a), Some(b), Some(c), Some(unreadable)) = (
+            proxy_path_for(src, PROXY_MAX_WIDTH, plain),
+            proxy_path_for(src, PROXY_MAX_WIDTH, hlg),
+            proxy_path_for(src, PROXY_MAX_WIDTH, late),
+            proxy_path(src, PROXY_MAX_WIDTH),
+        ) else {
+            skip("skipped: this platform has no cache directory for proxies");
+            return;
+        };
+        assert_eq!(a, unreadable);
+        assert!(a != b && a != c && b != c);
+        assert!(is_head_padded_proxy(&c.to_string_lossy()) && !is_head_padded_proxy(&a.to_string_lossy()));
+        assert_eq!(Some(&b), proxy_path_for(src, PROXY_MAX_WIDTH, hlg).as_ref());
+    }
+
+    #[test]
     fn spherical_sources_proxy_larger_and_under_their_own_key() {
         // Reframing crops ~100° out of 360, so a 360 proxy keeps more pixels.
         assert_eq!(proxy_width(None), PROXY_MAX_WIDTH);
@@ -10495,6 +10739,7 @@ mod tests {
         let timeline = Timeline {
             tracks: Vec::new(),
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),
@@ -11028,6 +11273,7 @@ mod tests {
             Some(&mask),
             true,
             &StillFades::default(),
+            false,
         );
         let first = still_clip_chain(
             &tf,
@@ -11038,6 +11284,7 @@ mod tests {
             Some(&mask),
             false,
             &StillFades::default(),
+            false,
         );
         let zoom = "scale=iw*1.4:ih*1.4";
         // Last: after the rotation, with nothing behind it, and only once.
@@ -11054,8 +11301,28 @@ mod tests {
         // A moving zoom that has no zoom at the sampled instant has none to move.
         let at_rest = Transform { scale: 1.0, ..tf };
         assert_eq!(
-            still_clip_chain(&at_rest, &color, &effects, None, &canvas, None, true, &StillFades::default()),
-            still_clip_chain(&at_rest, &color, &effects, None, &canvas, None, false, &StillFades::default())
+            still_clip_chain(
+                &at_rest,
+                &color,
+                &effects,
+                None,
+                &canvas,
+                None,
+                true,
+                &StillFades::default(),
+                false
+            ),
+            still_clip_chain(
+                &at_rest,
+                &color,
+                &effects,
+                None,
+                &canvas,
+                None,
+                false,
+                &StillFades::default(),
+                false
+            )
         );
     }
 
@@ -11136,6 +11403,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(c.contains("scale=w='max(1,iw*0.0004)':h='max(1,ih*0.0004)'"), "{c}");
         let c = still_clip_chain(
@@ -11147,6 +11415,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(c.contains("scale=iw*0.5:ih*0.5"), "{c}");
     }
@@ -11202,6 +11471,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(!still.contains("force_divisible_by") && !still.contains("trunc("), "{still}");
     }
@@ -14996,6 +15266,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(contained.contains("force_original_aspect_ratio=decrease"));
         assert!(contained.contains("pad=1080:1920"), "contain letterboxes: {contained}");
@@ -15009,6 +15280,7 @@ mod tests {
             None,
             false,
             &StillFades::default(),
+            false,
         );
         assert!(covered.contains("force_original_aspect_ratio=increase"));
         assert!(covered.contains("crop=1080:1920"), "cover crops: {covered}");
@@ -16957,6 +17229,7 @@ mod tests {
                     ..crate::model::Track::new(StreamKind::Video, "V1")
                 }],
                 overlays: Vec::new(),
+                svg_overlays: Vec::new(),
                 markers: Vec::new(),
                 format: None,
                 master: Default::default(),
@@ -16980,6 +17253,11 @@ mod tests {
         let untagged = probe_json(r#""width":1280,"height":720,"color_space":"unknown""#);
         assert_eq!(untagged.streams[0].color_space, None);
         assert_eq!(probe_json(r#""width":1280,"height":720"#).streams[0].color_space, None);
+        // `reserved` (a value no matrix has) and `unspecified` are read by FFmpeg as no tag at all.
+        for none in ["reserved", "unspecified", ""] {
+            let probed = probe_json(&format!(r#""width":1280,"height":720,"color_space":"{none}""#));
+            assert_eq!(probed.streams[0].color_space, None, "{none:?}");
+        }
     }
 
     #[test]

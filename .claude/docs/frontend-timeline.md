@@ -353,6 +353,17 @@ strip** (`COLLAPSED_TITLE_PX`, `titleLaneHeightFor`): its header is one button (
 at the playhead, and the lane still takes a right-click and a marquee; the first title expands it to the full
 lane. (It does not open on hover: a lane that grows under the pointer on its way to a track moves the clip it
 was aiming at.)
+**Animated SVG titles share the titles lane.** `editor.svgOverlays` are drawn in the same packed rows as the text titles (`packRows` is
+generic over `{id, start, end}`: `packRows([...overlays, ...svgOverlays])`, ties keep the order given), as `.ktitle[data-kind="svg"]`
+blocks: a motion icon (`orbit`) before the display name (`svgDisplayName`: its name, else a preset's text, else `SVG`) on
+`SVG_TITLE_FILL` (the text-title colour drawn toward the video track's, held to 4.5:1 under `--text-on-video` by the theme guard) with a
+`--track-video-edge` edge, so it reads as artwork, not text. The gesture is the text title's — the same `titleDrag`, 6 px trim edges,
+the clip drag's snapping with **the edges of the other animated titles added to the text titles' as magnets** (`otherTitleEdges`;
+named `Title edge` on the snap line), a plain click selects and leaves the playhead alone, Escape / pointercancel / blur abandon — and
+it writes **one** `update_svg_overlay({start, end})` on release (a preset re-times its own artwork in that revision; `retimeOverlay`
+and its keyframe re-timing are for text only). Delete removes it, the item's menu is *Go to start* / *Edit SVG source* (custom
+only) / *Remove animated title*, and the lane's menu adds each preset or a custom one at the playhead. `Titles · N` and the collapsed
+strip count both kinds, and a staged proposal marks and ghosts them like titles.
 The **toolbar** is `ToolbarToggle`s (`frontend.md`, Shared components): tools | Undo / Redo on the left, then
 zoom | snapping and Ripple | the three track heights and the overview | `+ V` / `+ A` and the delivery frame on the right,
 a rule between each group. Every one is 24 px high with a 24 px target at least, and lit the same way (amber outline
