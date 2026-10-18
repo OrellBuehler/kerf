@@ -42,6 +42,7 @@ import type {
 	ExportProgress,
 	Filmstrip,
 	GpuPreviewStatus,
+	ImportOutcome,
 	ImportProgress,
 	ModelProgress,
 	Easing,
@@ -90,6 +91,7 @@ import type {
 	StemsStatus,
 	StreamKind,
 	SvgCheck,
+	SvgElementId,
 	SvgLayout,
 	SvgOverlayPatch,
 	SvgPresetInfo,
@@ -97,6 +99,10 @@ import type {
 	SvgPresetParamsInput,
 	SvgSource,
 	Task,
+	TemplateControl,
+	TemplateEdit,
+	TemplateList,
+	TemplateSaved,
 	TextKeyframe,
 	TextOverlay,
 	Timeline,
@@ -180,6 +186,18 @@ import {
 	updateSvgOverlayIn,
 	validateSvgSource
 } from './svg-dev';
+import {
+	applyTemplateTo,
+	deleteTemplateDev,
+	exportTemplateDev,
+	importTemplateDev,
+	listTemplatesDev,
+	saveTemplateFrom,
+	setTemplateValuesIn,
+	svgElementIdsOf,
+	templateImageValueOf,
+	templatePosterDev
+} from './template-dev';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
 
 export type { AudioDetached };
@@ -2893,6 +2911,103 @@ export async function svgPresetPreview(
 ): Promise<string> {
 	if (!inTauri()) return svgPresetArt(kind, params);
 	return invoke<string>('svg_preset_preview', { kind, params, duration: duration ?? null });
+}
+
+// ---- motion templates ------------------------------------------------------
+// An animated SVG title kept in the user's library with named controls (a tagline, a brand colour, a
+// logo). The library is app-level (not a timeline edit: not undone, not staged); applying a template and
+// setting a template title's values are edits and hand back the refreshed timeline.
+
+/** The library by name, and the files in it that did not read (`problems`). Only manifests are read; a
+ *  poster is fetched on its own with `templatePoster`. */
+export async function listTemplates(): Promise<TemplateList> {
+	if (!inTauri()) return listTemplatesDev();
+	return invoke<TemplateList>('list_templates');
+}
+
+/** A template's poster as a `data:` URL for an `<img>` (a PNG of at most 512 px in the app), `null` when
+ *  it has none. Rejects for an id the library lacks. */
+export async function templatePoster(templateId: string): Promise<string | null> {
+	if (!inTauri()) return templatePosterDev(templateId);
+	return invoke<string | null>('template_poster', { templateId });
+}
+
+/** The `id`s of a title's elements and the tag each is on, for offering them as the targets of a control. */
+export async function svgElementIds(svg: string): Promise<SvgElementId[]> {
+	if (!inTauri()) return svgElementIdsOf(svg);
+	return invoke<SvgElementId[]>('svg_element_ids', { svg });
+}
+
+/** A picture file (PNG, JPEG, GIF or WebP, a little under 96 KB) as the `data:` URL an `image` control takes.
+ *  The browser harness cannot read files and answers a fixed picture for any image path. */
+export async function templateImageValue(path: string): Promise<string> {
+	if (!inTauri()) return templateImageValueOf(path);
+	return invoke<string>('template_image_value', { path });
+}
+
+/** Keep the animated title `overlayId` in the library as a template with these `controls` (each aimed at
+ *  element ids of its artwork). Slow (fonts, sanitiser, poster). Resolves to the new template and what could
+ *  not be carried over (a font whose licence or size keeps it out). Not undoable: `deleteTemplate` removes it. */
+export async function saveTemplate(
+	overlayId: string,
+	name: string,
+	controls: TemplateControl[],
+	description?: string
+): Promise<TemplateSaved> {
+	if (!inTauri()) return saveTemplateFrom(devTimeline, overlayId, name, description, controls);
+	return invoke<TemplateSaved>('save_template', { overlayId, name, description: description ?? null, controls });
+}
+
+/** Add a library template to the timeline as an animated title from `start` to `end` (default: its own
+ *  length). `values` (control id to value, partial) are spliced into its artwork; `layout` places and names it
+ *  like `addSvgOverlay`'s. The template's fonts are stored in the project, so the title keeps working if the
+ *  template is deleted. Resolves to the refreshed timeline, the new title's id (to select it) and the
+ *  warnings (a font that is not installed, ...). */
+export async function applyTemplate(
+	templateId: string,
+	values: Record<string, string>,
+	start: number,
+	end?: number | null,
+	layout: SvgLayout = {}
+): Promise<TemplateEdit> {
+	if (!inTauri()) {
+		const { overlay, warnings } = applyTemplateTo(devTimeline, templateId, values, start, end, layout);
+		recordDev(`Add template title “${overlay.name}”`);
+		return { timeline: snapshot(), overlay_id: overlay.id, warnings };
+	}
+	return invoke<TemplateEdit>('apply_template', { templateId, values, start, end: end ?? null, layout });
+}
+
+/** Change control values of a template title (partial: only the controls named). One edit; the title keeps its
+ *  id, timing and placement. Rejects for a title that did not come from a template, a value its control refuses,
+ *  and a title that changed while the values were being applied ("try again"). */
+export async function setTemplateValues(overlayId: string, values: Record<string, string>): Promise<TemplateEdit> {
+	if (!inTauri()) {
+		const { overlay, warnings } = setTemplateValuesIn(devTimeline, overlayId, values);
+		recordDev('Set template values');
+		return { timeline: snapshot(), overlay_id: overlay.id, warnings };
+	}
+	return invoke<TemplateEdit>('set_template_values', { overlayId, values });
+}
+
+/** Bring a `.kerftemplate` file into the library. Never overwrites: the same template is `already_present`,
+ *  another one with its id is kept under a new id (`added_as_copy`). */
+export async function importTemplate(path: string): Promise<ImportOutcome> {
+	if (!inTauri()) return importTemplateDev(path);
+	return invoke<ImportOutcome>('import_template', { path });
+}
+
+/** Write a library template to `path` (a folder gets `<name>.kerftemplate` in it, a path without an
+ *  extension gets `.kerftemplate`) and resolve to where it went. The file picker has asked about replacing. */
+export async function exportTemplate(templateId: string, path: string): Promise<string> {
+	if (!inTauri()) return exportTemplateDev(templateId, path);
+	return invoke<string>('export_template', { templateId, path });
+}
+
+/** Remove a template from the library. Titles already made from it keep working. */
+export async function deleteTemplate(templateId: string): Promise<void> {
+	if (!inTauri()) return deleteTemplateDev(templateId);
+	return invoke<void>('delete_template', { templateId });
 }
 
 /** Caption the cut: project every clip's transcript through the current edit and

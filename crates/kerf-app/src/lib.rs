@@ -2639,25 +2639,34 @@ async fn set_template_values(
 }
 
 /// Bring a `.kerftemplate` file into the library. Never overwrites: the same template is
-/// `already_present`, another one with the same id is kept under a new id (`added_as_copy`).
+/// `already_present`, another one with the same id is kept under a new id (`added_as_copy`). The
+/// path is the one the file picker returned: an absolute path to a regular `.kerftemplate` file.
 #[tauri::command]
 async fn import_template(path: String) -> CmdResult<ImportOutcome> {
     require_template_path(&path)?;
     blocking(move || {
-        template_library()?
-            .import(std::path::Path::new(&path))
-            .map_err(|e| e.to_string())
+        let file = std::path::Path::new(&path);
+        kerf_core::paths::validate_import_path(file).map_err(|e| e.to_string())?;
+        template_library()?.import(file).map_err(|e| e.to_string())
     })
     .await
 }
 
 /// Write a library template to `path` (a directory gets `<name>.kerftemplate` in it, a path with no
 /// extension gets `.kerftemplate`); resolves to where it went. The picker has asked about replacing.
+/// Not onto a file the project still needs, into Kerf's own settings and logs, or into the library.
 #[tauri::command]
-async fn export_template(template_id: String, path: String) -> CmdResult<String> {
-    require_local_output_path(&path)?;
+async fn export_template(state: State<'_, AppState>, template_id: String, path: String) -> CmdResult<String> {
+    require_user_output_path(&path)?;
+    let shared = state.project.clone();
     blocking(move || {
-        let written = template_library()?
+        let library = template_library()?;
+        let mut protected = lock_user(&shared).output_path_inputs().map_err(|e| e.to_string())?;
+        protected
+            .dirs
+            .push((library.dir().to_path_buf(), "the template library".to_string()));
+        check_output(std::path::Path::new(&path), &protected).map_err(|e| e.to_string())?;
+        let written = library
             .export(&template_id, std::path::Path::new(&path))
             .map_err(|e| e.to_string())?;
         Ok(written.to_string_lossy().into_owned())
@@ -5395,6 +5404,46 @@ mod tests {
         assert!(require_json_path("C:\\t\\THEME.JSON").is_ok());
         assert!(require_json_path("/home/u/.bashrc").is_err());
         assert!(require_json_path("/t/theme.json.exe").is_err());
+    }
+
+    #[test]
+    fn template_files_are_only_read_as_kerftemplate() {
+        use super::require_template_path;
+        assert!(require_template_path("/t/card.kerftemplate").is_ok());
+        assert!(require_template_path("C:\\t\\CARD.KERFTEMPLATE").is_ok());
+        assert!(require_template_path("/home/u/.bashrc").is_err());
+        assert!(require_template_path("/t/card.kerftemplate.zip").is_err());
+        assert!(require_template_path("/t/card").is_err());
+    }
+
+    /// A picture for an image control is read bounded, and the engine judges it: a file that is not a
+    /// picture, a relative path, a directory and an oversized file are all refused with a reason.
+    #[test]
+    fn a_picture_for_a_template_is_read_bounded_and_judged_by_the_engine() {
+        use super::{template_image_data_url, TEMPLATE_IMAGE_FILE_MAX};
+        let dir = Scratch::new("template-image");
+        let png = dir.0.join("logo.png");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAEklEQVR4nGP4z8DwHxkzkC4AADxAH+HggXe0AAAAAElFTkSuQmCC")
+            .unwrap();
+        std::fs::write(&png, &bytes).unwrap();
+        let url = template_image_data_url(png.to_str().unwrap()).unwrap();
+        assert!(url.starts_with("data:image/png;base64,"), "{url}");
+
+        let refused = |path: &Path| template_image_data_url(path.to_str().unwrap()).unwrap_err().to_string();
+        assert!(template_image_data_url("logo.png")
+            .unwrap_err()
+            .to_string()
+            .contains("absolute"));
+        assert!(refused(&dir.0).contains("not a regular file"));
+        assert!(refused(&dir.0.join("missing.png")).contains("cannot read"));
+        let text = dir.0.join("notes.txt");
+        std::fs::write(&text, "not a picture").unwrap();
+        assert!(refused(&text).contains("PNG, JPEG, GIF or WebP"));
+        let big = dir.0.join("big.png");
+        let file = std::fs::File::create(&big).unwrap();
+        file.set_len(TEMPLATE_IMAGE_FILE_MAX + 1).unwrap();
+        assert!(refused(&big).contains("too large"), "{}", refused(&big));
     }
 
     #[test]

@@ -1432,7 +1432,22 @@ does: over 128 KiB, not XML (the browser's `DOMParser`, guarded because bun has 
 reads names, `#rgb[a]` / `#rrggbb[aa]` and `rgb[a]()` / `hsl[a]()` as `svgtypes` does). A preset change in
 `kerf-core/src/svg/presets.rs` fails `svg_preset_fixture_is_what_this_engine_does` until
 `KERF_BLESS_SVG_PRESETS=1 cargo test -p kerf-core --no-default-features -- svg_preset_fixture` rewrites it;
-`api-svg.test.ts` drives the harness.
+`api-svg.test.ts` drives the harness. A patch with `svg` also drops `template` (the controls pointed into the old artwork).
+
+**Motion templates in `api.ts`** (surfaces only; the library UI is separate). `listTemplates()` → `TemplateList`,
+`templatePoster(id)` → a `data:` URL or `null`, `svgElementIds(svg)` → `[{id, tag}]`, `templateImageValue(path)` → the
+`data:` URL an `image` control takes, `saveTemplate(overlayId, name, controls, description?)` → `TemplateSaved`,
+`applyTemplate(templateId, values, start, end?, layout?)` and `setTemplateValues(overlayId, values)` → `TemplateEdit`
+(`{timeline, overlay_id, warnings}`: the refreshed cut, the title to select, what could not be honoured),
+`importTemplate(path)` → `ImportOutcome`, `exportTemplate(id, path)` → where it went, `deleteTemplate(id)`. A title from a
+template has `SvgOverlay.template` (`TemplateInstance`: `template_id`, `name`, `controls`, `values`); **`values` is read
+back from the title's own `svg` and has no `image` controls**, and changing one is `setTemplateValues`, never a patch of
+`svg` (that ends the template). The harness stand-in is `template-dev.ts`: an in-memory library seeded with one sample
+template (`SAMPLE_TEMPLATE_ID`; `resetDevTemplates()` puts it back), kerf-core's refusals for controls and values (ids, kinds
+and their attributes, a missing or repeated element id, colours without `rgb()`, unitless numbers within `min` / `max`,
+partial values, unknown control ids), values spliced into the artwork by element id with the same escaping and read back,
+and `import_template` never overwriting; there is no file system, so an exported "file" is kept under its path for
+`importTemplate` to read back, and any image path answers one fixed picture. `api-templates.test.ts` drives it.
 
 **Animated SVG titles in the editor.** The engine draws the artwork (resvg, into every preview and export frame), so the
 page **never inlines the SVG** — `svg-titles.test.ts` fails on any `{@html}` / `innerHTML` in `src/` — and shows it only as an

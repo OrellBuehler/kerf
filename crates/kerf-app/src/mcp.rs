@@ -36,6 +36,7 @@ mod jobs;
 mod project_tools;
 mod reads;
 mod server;
+mod templates;
 
 use jobs::Run;
 pub(crate) use server::bind_problem;
@@ -1898,7 +1899,8 @@ fn is_zero(n: &usize) -> bool {
 struct SvgOverlaySummary {
     id: Uuid,
     name: String,
-    /// `custom`, or the preset's kind (`fade_up`, `typewriter`, `lower_third`, `word_pop`).
+    /// `custom`, or the preset's kind (`fade_up`, `typewriter`, `lower_third`, `word_pop`). A title
+    /// made from a template is `custom` and has `template`.
     kind: &'static str,
     start: f64,
     end: f64,
@@ -1910,7 +1912,54 @@ struct SvgOverlaySummary {
     /// What a preset title was filled with; absent on a custom one.
     #[serde(skip_serializing_if = "Option::is_none")]
     params: Option<SvgPresetParams>,
+    /// The template a title came from, with the controls it has and what they hold now; absent on a
+    /// preset or a custom title.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    template: Option<TemplateSummary>,
     svg_bytes: usize,
+}
+
+/// What a title remembers of its template, as an agent needs it to call `set_template_values`: the
+/// controls without the elements they point at.
+#[derive(Serialize)]
+struct TemplateSummary {
+    template_id: String,
+    name: String,
+    controls: Vec<ControlSummary>,
+    /// Each control's current value; an `image` control has none (its picture is in the artwork).
+    values: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct ControlSummary {
+    id: String,
+    label: String,
+    kind: kerf_core::TemplateKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max: Option<f64>,
+}
+
+impl From<&kerf_core::TemplateInstance> for TemplateSummary {
+    fn from(t: &kerf_core::TemplateInstance) -> Self {
+        Self {
+            template_id: t.template_id.clone(),
+            name: t.name.clone(),
+            controls: t
+                .controls
+                .iter()
+                .map(|c| ControlSummary {
+                    id: c.id.clone(),
+                    label: c.label.clone(),
+                    kind: c.kind,
+                    min: c.min,
+                    max: c.max,
+                })
+                .collect(),
+            values: t.values.clone(),
+        }
+    }
 }
 
 impl From<&SvgOverlay> for SvgOverlaySummary {
@@ -1927,6 +1976,7 @@ impl From<&SvgOverlay> for SvgOverlaySummary {
             height: o.height,
             opacity: o.opacity,
             params: o.preset.as_ref().map(|p| p.params.clone()),
+            template: o.template.as_ref().map(TemplateSummary::from),
             svg_bytes: o.svg.len(),
         }
     }
@@ -5743,8 +5793,11 @@ async fn blocking<T: Send + 'static>(job: impl FnOnce() -> Result<T, McpError> +
 fn router() -> &'static rmcp::handler::server::router::tool::ToolRouter<KerfMcp> {
     static ROUTER: OnceLock<rmcp::handler::server::router::tool::ToolRouter<KerfMcp>> = OnceLock::new();
     ROUTER.get_or_init(|| {
-        let mut router =
-            KerfMcp::tool_router() + KerfMcp::tool_router_jobs() + KerfMcp::tool_router_reads() + KerfMcp::tool_router_project();
+        let mut router = KerfMcp::tool_router()
+            + KerfMcp::tool_router_jobs()
+            + KerfMcp::tool_router_reads()
+            + KerfMcp::tool_router_project()
+            + KerfMcp::tool_router_templates();
         hints::annotate(&mut router);
         router
     })
@@ -5902,6 +5955,20 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              several moments) until it looks right, then add_svg_overlay, then \
              preview_timeline at a few moments between its start and end to \
              judge it against the footage. \
+             To reuse a title, keep it as a template: when you write the SVG give \
+             the elements you want to change `id` attributes, then validate_svg, \
+             add_svg_overlay, preview, and save_template with `controls` (a \
+             tagline, a brand colour, a logo: each names an element id and a kind \
+             of text, color, number, font or image). list_templates shows the \
+             user's library; apply_template puts one on the cut as an animated \
+             title with `values` for its controls (a staged edit, like any other) \
+             and set_template_values changes them later; a title made from a \
+             template lists its controls and current values under `template` in \
+             timeline_summary. update_svg_overlay with `svg` replaces the artwork \
+             and ends the template. save_template, import_template and \
+             export_template change the user's library or a file, not your \
+             proposal, and delete_template is refused while the user reviews your \
+             edits. \
              To narrate a cut, write the script and generate_voiceover it (English; \
              it lands on its own VO track with a transcript that is its script, \
              exactly timed), cut the picture to the narration, then caption last. \
@@ -7171,6 +7238,7 @@ mod tests {
             ("mcp/project_tools.rs", include_str!("mcp/project_tools.rs")),
             ("mcp/reads.rs", include_str!("mcp/reads.rs")),
             ("mcp/server.rs", include_str!("mcp/server.rs")),
+            ("mcp/templates.rs", include_str!("mcp/templates.rs")),
         ] {
             assert!(
                 !source.replace(' ', "").contains(concat!("alias", "=\"")),
@@ -7238,10 +7306,20 @@ mod tests {
             "staged_diff",
             "get_editor_context",
             "get_levels",
+            "list_templates",
         ] {
             assert_eq!(hint(read).read_only_hint, Some(true), "{read}");
         }
-        for staged in ["trim", "remove_clips", "remove_track", "set_volume", "stage_edits"] {
+        for staged in [
+            "trim",
+            "remove_clips",
+            "remove_track",
+            "set_volume",
+            "stage_edits",
+            "apply_template",
+            "set_template_values",
+            "save_template",
+        ] {
             let a = hint(staged);
             assert_eq!((a.read_only_hint, a.destructive_hint), (Some(false), Some(false)), "{staged}");
         }
@@ -7253,6 +7331,8 @@ mod tests {
             "export_variants",
             "export_cover",
             "export_srt",
+            "export_template",
+            "delete_template",
             "delete_proxy",
             "remove_task",
         ] {
@@ -7371,6 +7451,152 @@ mod tests {
         ] {
             assert!(tools.iter().any(|t| t.name == name), "`{name}` is registered");
         }
+    }
+
+    #[test]
+    fn the_server_instructions_send_a_reusable_title_through_a_template() {
+        let text = super::INSTRUCTIONS;
+        let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("`{needle}` in the instructions"));
+        assert!(
+            at("preview_timeline at a few moments between its start") < at("To reuse a title")
+                && at("To reuse a title") < at("save_template with `controls`")
+                && at("save_template with `controls`") < at("apply_template puts one on the cut")
+                && at("apply_template puts one on the cut") < at("set_template_values changes them later")
+                && at("set_template_values changes them later") < at("To narrate a cut"),
+            "the template paragraph follows the SVG one: author with ids, validate, add, save, apply, set: {text}"
+        );
+        for needle in [
+            "`id` attributes",
+            "list_templates",
+            "ends the template",
+            "delete_template is refused while the user reviews",
+        ] {
+            assert!(text.contains(needle), "the instructions should mention `{needle}`: {text}");
+        }
+    }
+
+    #[test]
+    fn the_template_tools_ask_for_little_and_say_what_they_take() {
+        let tools = router().list_all();
+        let tool = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("`{name}` is registered"))
+        };
+        let required = |name: &str| -> Vec<String> {
+            let mut r: Vec<String> = tool(name)
+                .input_schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|r| r.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            r.sort();
+            r
+        };
+        assert!(required("list_templates").is_empty());
+        assert_eq!(required("save_template"), ["name", "overlay_id"]);
+        assert_eq!(required("apply_template"), ["start", "template_id"]);
+        assert_eq!(required("set_template_values"), ["overlay_id"]);
+        assert_eq!(required("import_template"), ["path"]);
+        assert_eq!(required("export_template"), ["output_path", "template_id"]);
+        assert_eq!(required("delete_template"), ["template_id"]);
+        let description = |name: &str| tool(name).description.as_deref().unwrap_or_default().to_string();
+        for (name, needles) in [
+            (
+                "save_template",
+                &[
+                    "`id` attributes",
+                    "controls",
+                    "validate_svg",
+                    "not part of your staged proposal",
+                ][..],
+            ),
+            (
+                "apply_template",
+                &["list_templates", "image_files", "staged edit", "set_template_values"][..],
+            ),
+            (
+                "set_template_values",
+                &["control", "timeline_summary", "update_svg_overlay"][..],
+            ),
+            ("import_template", &["already_present", "added_as_copy", "network share"][..]),
+            ("export_template", &[".kerftemplate", "overwrite"][..]),
+            ("delete_template", &["cannot be undone", "review"][..]),
+        ] {
+            for needle in needles {
+                assert!(
+                    description(name).contains(needle),
+                    "{name} should say `{needle}`: {}",
+                    description(name)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_control_in_save_template_refuses_a_key_it_does_not_name() {
+        let parse = |controls: serde_json::Value| {
+            serde_json::from_value::<super::templates::SaveTemplateParams>(serde_json::json!({
+                "overlay_id": "x", "name": "n", "controls": controls
+            }))
+        };
+        let ok = parse(serde_json::json!([
+            {"id": "tagline", "label": "Tagline", "kind": "text", "targets": [{"element": "tagline"}]},
+            {"id": "size", "label": "Size", "kind": "number", "min": 1, "max": 9,
+             "targets": [{"element": "t", "attribute": "font-size"}]}
+        ]));
+        assert!(ok.is_ok(), "{ok:?}");
+        for bad in [
+            serde_json::json!([{"id": "a", "label": "A", "kind": "text", "target": [{"element": "t"}], "targets": []}]),
+            serde_json::json!([{"id": "a", "label": "A", "kind": "text", "targets": [{"element": "t", "attr": "fill"}]}]),
+            serde_json::json!([{"id": "a", "label": "A", "kind": "paragraph", "targets": [{"element": "t"}]}]),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_agent_reads_a_template_title_with_its_controls_and_values_but_not_its_source() {
+        use kerf_core::{SvgOverlay, TemplateControl, TemplateInstance, TemplateKind, TemplateTarget};
+        let o = SvgOverlay {
+            id: uuid::Uuid::new_v4(),
+            name: "End card".to_string(),
+            svg: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"/>".to_string(),
+            start: 0.0,
+            end: 4.0,
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            opacity: 1.0,
+            offset: 0.0,
+            preset: None,
+            template: Some(TemplateInstance {
+                template_id: "0b8c2a52-6d7c-4a52-9d3c-1d3a6f3b6d11".to_string(),
+                name: "Kitefun end card".to_string(),
+                controls: vec![TemplateControl {
+                    id: "tagline".to_string(),
+                    label: "Tagline".to_string(),
+                    kind: TemplateKind::Text,
+                    targets: vec![TemplateTarget {
+                        element: "tagline".to_string(),
+                        attribute: None,
+                    }],
+                    min: None,
+                    max: None,
+                }],
+                values: [("tagline".to_string(), "See you".to_string())].into(),
+            }),
+        };
+        let v = serde_json::to_value(SvgOverlaySummary::from(&o)).unwrap();
+        assert_eq!(v["kind"], "custom");
+        assert_eq!(v["template"]["template_id"], "0b8c2a52-6d7c-4a52-9d3c-1d3a6f3b6d11");
+        assert_eq!(v["template"]["controls"][0]["id"], "tagline");
+        assert_eq!(v["template"]["controls"][0]["kind"], "text");
+        assert_eq!(v["template"]["values"]["tagline"], "See you");
+        assert!(v["template"]["controls"][0].get("targets").is_none(), "{v}");
+        assert!(v.get("svg").is_none(), "{v}");
     }
 
     #[test]

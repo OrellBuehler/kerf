@@ -87,6 +87,11 @@ agent).
 | export a library entry to a file | `export_template` | `export_template` |
 | delete a library entry | `delete_template` | `delete_template` |
 
+Beyond the table, the Tauri side has `template_poster` (a grid card's PNG as a `data:` URL), `svg_element_ids` (the ids a
+control can aim at) and `template_image_value` (an image file as the `data:` URL an `image` control takes); over MCP an
+`image` control takes a file through `image_files`, `delete_template` is refused while the user reviews agent edits, and the
+library tools emit `templates-changed`. See `.claude/docs/app.md` and `.claude/docs/mcp.md`.
+
 ## Phase 1 as built in kerf-core
 
 The contract above stands; this records what the engine does where the contract left a choice, so the

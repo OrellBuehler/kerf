@@ -252,7 +252,7 @@ export function validateSvgSource(src: string): SvgCheck {
 }
 
 /** A placement the compositor can draw: finite numbers, a real size, an opacity. */
-function checkRect(o: Pick<SvgOverlay, 'x' | 'y' | 'width' | 'height' | 'opacity'>): void {
+export function checkRect(o: Pick<SvgOverlay, 'x' | 'y' | 'width' | 'height' | 'opacity'>): void {
 	const { x, y, width, height, opacity } = o;
 	if (![x, y, width, height, opacity].every(Number.isFinite)) {
 		throw new Error('x, y, width, height and opacity must be numbers');
@@ -338,6 +338,7 @@ export function updateSvgOverlayIn(timeline: Timeline, overlayId: string, patch:
 	if (svg !== undefined) {
 		o.svg = svg;
 		delete o.preset;
+		delete o.template;
 		regenerate = false;
 	} else if (patch.preset_params || patch.preset_kind) {
 		if (!o.preset) throw new Error('this title is custom SVG, not a preset; pass svg to change it');
