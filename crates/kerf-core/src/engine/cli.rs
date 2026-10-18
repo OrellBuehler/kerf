@@ -5364,11 +5364,15 @@ pub struct ExportProgress {
     pub fraction: f64,
     pub elapsed_secs: f64,
     pub eta_secs: Option<f64>,
-    /// Set while the render has not started because the machine is busy with another heavy job
-    /// — `waiting for the preview proxy` — so a queued export does not look hung at 0%.
+    /// Set while the render has not started: the machine is busy with another heavy job
+    /// (`waiting for the preview proxy`), or a static loudness normalization is metering the mix
+    /// first (`measuring the mix's loudness`) — so the export does not look hung at 0%.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting: Option<&'static str>,
 }
+
+/// What an export's `waiting` line says while a static loudness normalization meters the mix.
+const METERING_LOUDNESS: &str = "measuring the mix's loudness";
 
 /// Whether an export ran to completion or was stopped by the cancel callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5417,9 +5421,10 @@ pub fn render_with_progress(
         ),
         ..opts.clone()
     };
-    // A request that would be refused anyway is refused before the titles are drawn.
-    export_preflight(timeline, assets, &opts)?;
-    match measure_static_loudness(timeline, assets, &mut opts, cancel) {
+    // A request that would be refused anyway is refused before the titles are drawn (and before
+    // a static loudness normalization spends a pass metering the mix).
+    let (_, has_audio) = export_preflight(timeline, assets, &opts)?;
+    match measure_static_loudness(timeline, assets, &mut opts, has_audio, progress, cancel) {
         Err(Error::Cancelled) => return Ok(RenderStatus::Cancelled),
         r => r?,
     }
@@ -5447,19 +5452,33 @@ pub fn render_with_progress(
 
 /// Fill in `opts.loudness_gain_db` for a static loudness normalization that has not been
 /// measured yet: one metering pass over the export's own mix, without the normalization
-/// (see [`ExportOptions::loudness_static`]). Nothing for any other export.
+/// (see [`ExportOptions::loudness_static`]). Nothing for any other export, nor for one that
+/// writes no sound (a cut without any, or a container that carries none). The pass shows in
+/// `progress` as the export's `waiting` line — queued for the slot, then metering.
 fn measure_static_loudness(
     timeline: &Timeline,
     assets: &[Asset],
     opts: &mut ExportOptions,
+    has_audio: bool,
+    progress: &mut dyn FnMut(ExportProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<()> {
     let target = opts.loudness.is_some() || opts.loudnorm;
-    if !(opts.loudness_static && target && opts.include_audio) || opts.loudness_gain_db.is_some() {
+    let writes_sound = has_audio && opts.include_audio && !opts.container.is_video_only();
+    if !(opts.loudness_static && target && writes_sound) || opts.loudness_gain_db.is_some() {
         return Ok(());
     }
+    let started = Instant::now();
+    let mut status = |wait: Option<cpu::Wait>| {
+        progress(ExportProgress {
+            fraction: 0.0,
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            eta_secs: None,
+            waiting: Some(wait.map_or(METERING_LOUDNESS, cpu::Wait::message)),
+        });
+    };
     // A mix too quiet to measure is left at its level (the limiter still holds the peaks).
-    opts.loudness_gain_db = Some(levels::static_loudness_gain(timeline, assets, opts, cancel)?.unwrap_or(0.0));
+    opts.loudness_gain_db = Some(levels::static_loudness_gain(timeline, assets, opts, &mut status, cancel)?.unwrap_or(0.0));
     tracing::debug!(gain_db = ?opts.loudness_gain_db, "measured the mix for static loudness normalization");
     Ok(())
 }
@@ -5691,6 +5710,48 @@ impl ExportVariant {
     }
 }
 
+/// Check every variant of a multi-format export and measure what they share before any is
+/// rendered: each variant's preflight first (one that would be refused fails before anything
+/// runs), then a static loudness normalization's metering pass, once for all of them — the
+/// mix is the same in every shape. Returns the options to render every variant with (the
+/// measured gain filled in), or `None` when cancelled while metering. [`render_variants`]
+/// runs it; a caller rendering the variants one call at a time runs it first and passes its
+/// options on, so the mix is not measured once per file.
+pub fn prepare_variants(
+    timeline: &Timeline,
+    assets: &[Asset],
+    variants: &[ExportVariant],
+    opts: &ExportOptions,
+    progress: &mut dyn FnMut(VariantProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<ExportOptions>> {
+    let mut has_audio = false;
+    for variant in variants {
+        let per_variant = ExportOptions {
+            resolution: Some((variant.delivery.width, variant.delivery.height)),
+            fit: variant.delivery.fit,
+            ..opts.clone()
+        };
+        has_audio |= export_preflight(&timeline.for_delivery(variant.delivery), assets, &per_variant)?.1;
+    }
+    let mut opts = opts.clone();
+    let total = variants.len();
+    let mut on_meter = |p: ExportProgress| {
+        progress(VariantProgress {
+            variant: 0,
+            total,
+            fraction: 0.0,
+            elapsed_secs: p.elapsed_secs,
+            eta_secs: None,
+            waiting: p.waiting,
+        });
+    };
+    match measure_static_loudness(timeline, assets, &mut opts, has_audio, &mut on_meter, cancel) {
+        Err(Error::Cancelled) => Ok(None),
+        r => r.map(|()| Some(opts)),
+    }
+}
+
 /// Progress across a multi-format export: the overall [`ExportProgress`] plus
 /// which variant is rendering, so a bar can say "2 of 3 · 9:16".
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
@@ -5704,6 +5765,9 @@ pub struct VariantProgress {
     /// Time left across the remaining variants, estimated from how long the
     /// completed share has taken.
     pub eta_secs: Option<f64>,
+    /// [`ExportProgress::waiting`]: queued for the slot, or metering the mix's loudness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<&'static str>,
 }
 
 /// Render the same cut once per variant — one file per delivery frame, each
@@ -5735,12 +5799,9 @@ pub fn render_variants(
     }
     let total = variants.len();
     let started = Instant::now();
-    // Every variant carries the same mix: a static loudness gain is measured once.
-    let mut opts = opts.clone();
-    match measure_static_loudness(timeline, assets, &mut opts, cancel) {
-        Err(Error::Cancelled) => return Ok((RenderStatus::Cancelled, 0)),
-        r => r?,
-    }
+    let Some(opts) = prepare_variants(timeline, assets, variants, opts, progress, cancel)? else {
+        return Ok((RenderStatus::Cancelled, 0));
+    };
     for (i, variant) in variants.iter().enumerate() {
         let framed = timeline.for_delivery(variant.delivery);
         let per_variant = ExportOptions {
@@ -5758,6 +5819,7 @@ pub fn render_variants(
                 fraction,
                 elapsed_secs,
                 eta_secs,
+                waiting: p.waiting,
             });
         };
         let status = render_with_progress(&framed, assets, &variant.output, &per_variant, &mut on_progress, cancel)?;
@@ -6784,7 +6846,10 @@ fn limiter_filter(limit: f64) -> String {
 /// limiter there sees the peaks between the output's samples (BS.1770 reads the true peak
 /// off the same 4x oversampling).
 fn oversampled(filter: &str, sample_rate: u32) -> String {
-    format!(",aresample={},{filter},aresample={sample_rate}", sample_rate * 4)
+    format!(
+        ",aresample={},{filter},aresample={sample_rate}",
+        sample_rate.saturating_mul(4)
+    )
 }
 
 /// The static loudness normalization: the measured gain (omitted when there is none to
@@ -8630,24 +8695,24 @@ fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, 
     for e in &clip.audio {
         p.push(audio_effect_filter(e));
     }
-    // A fade that is wholly a transition's overlap is half of a crossfade pair, and
-    // the pair is constant-power (`qsin`: sin in, cos out, so the summed power stays
-    // put) where linear ramps dip about 3 dB at the midpoint. A fade with a clip fade
-    // or a dip in it keeps the linear ramp it always had, and so does a crossfade
-    // between two clips of one asset: correlated sound, which a linear pair keeps at unity.
-    let crossfade = |fade: f64, own: f64, same: bool| {
-        if fade > 0.0 && own <= 0.0 && !same {
+    // A fade that is wholly one half of a real crossfade pair (`ClipFx::afade_in_power` /
+    // `tail_power`) is constant-power (`qsin`: sin in, cos out, so the summed power stays
+    // put) where linear ramps dip about 3 dB at the midpoint. A fade with a clip fade or a
+    // dip in it, a fade up from black, and a pair playing the same sound on both sides keep
+    // the linear ramp they always had.
+    let crossfade = |fade: f64, own: f64, power: bool| {
+        if fade > 0.0 && own <= 0.0 && power {
             ":curve=qsin"
         } else {
             ""
         }
     };
     if fi > 0.0 {
-        let curve = crossfade(fx.afade_in, clip.fade_in + fx.black_in + fx.white_in, fx.afade_in_same);
+        let curve = crossfade(fx.afade_in, clip.fade_in + fx.black_in + fx.white_in, fx.afade_in_power);
         p.push(format!("afade=t=in:st=0:d={}{curve}", fi.clamp(0.0, dur)));
     }
     if fo > 0.0 {
-        let curve = crossfade(fx.tail, clip.fade_out + fx.black_out + fx.white_out, fx.tail_same);
+        let curve = crossfade(fx.tail, clip.fade_out + fx.black_out + fx.white_out, fx.tail_power);
         p.push(format!(
             "afade=t=out:st={}:d={}{curve}",
             (dur - fo).max(0.0),
@@ -14012,11 +14077,23 @@ mod tests {
         assert!(g.contains("afade=t=out:st=10:d=1:curve=qsin,"), "{g}");
         assert!(g.contains("afade=t=in:st=0:d=1:curve=qsin,"), "{g}");
 
-        // Two clips of one asset carry correlated sound: the linear pair keeps it at unity.
+        // A cut inside one take plays the same samples both sides: the linear pair keeps
+        // that correlated sound at unity. Elsewhere in the same take is two sounds again.
         let mut same = b.clone();
         same.asset_id = asset.id;
-        let g = graph_of(&single(vec![a.clone(), same]), std::slice::from_ref(&asset));
+        (same.source_in, same.source_out) = (10.0, 20.0);
+        let mut both_takes = vec![asset];
+        both_takes[0].duration = 40.0;
+        let g = graph_of(&single(vec![a.clone(), same.clone()]), &both_takes);
         assert!(g.contains("afade=t=out:st=10:d=1,"), "{g}");
+        assert!(g.contains("afade=t=in:st=0:d=1,"), "{g}");
+        assert!(!g.contains("qsin"), "{g}");
+        (same.source_in, same.source_out) = (25.0, 35.0);
+        let g = graph_of(&single(vec![a.clone(), same]), &both_takes);
+        assert_eq!(g.matches("curve=qsin").count(), 2, "{g}");
+
+        // A dissolve up from black has no partner: a linear fade.
+        let g = graph_of(&single(vec![b.clone()]), &both);
         assert!(g.contains("afade=t=in:st=0:d=1,"), "{g}");
         assert!(!g.contains("qsin"), "{g}");
 

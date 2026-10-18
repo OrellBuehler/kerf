@@ -2602,11 +2602,12 @@ impl KerfMcp {
         description = "Switch the master limiter on or off, optionally moving its ceiling (dBFS, default -1.5). A \
                        lookahead limiter on the finished mix that holds the loudest peaks under the ceiling \
                        instead of letting them clip — turn it on for a cut destined for a platform, which asks for \
-                       a true peak under -1 dBTP. It is a sample-peak ceiling: the true peak between samples can \
-                       read above it (up to about 1 dB on a pure high tone), which is why the default sits half a \
-                       decibel under that line. Confirm the true peak with get_levels, and if it is still over \
-                       -1 dBTP with the limiter on, lower the ceiling by the overshoot plus half a decibel (the \
-                       notes say to what) instead of switching it on again. A limiter has nothing to do on a mix \
+                       a true peak under -1 dBTP. It is a sample-peak ceiling unless set_master_true_peak is on: the \
+                       true peak between samples can read above it (up to about 1 dB on a pure high tone), which is \
+                       why the default sits half a decibel under that line. Confirm the true peak with get_levels, and \
+                       if it is still over -1 dBTP with the limiter on, turn on set_master_true_peak or lower the \
+                       ceiling by the overshoot plus half a decibel (the notes say to what) instead of switching it on \
+                       again. A limiter has nothing to do on a mix \
                        already under its ceiling and leaves it alone. Returns the master bus."
     )]
     fn set_master_limiter(&self, Parameters(p): Parameters<SetMasterLimiterParams>) -> Result<String, McpError> {
@@ -3770,24 +3771,55 @@ impl KerfMcp {
         description = "Sync a clip to another by their sound: decodes both clips' audio, finds the offset where \
                        they match (GCC-PHAT cross-correlation, to a fraction of a millisecond) and moves the clip \
                        so the same moment lands at the same timeline time — a camera's scratch audio against the \
-                       recorder, two cameras on one stage. Both clips need sound and normal forward speed, and must \
-                       not be linked to each other. Returns `offset` (seconds the clip moved; positive is later), \
+                       recorder, two cameras on one stage. Only each clip's used source window (source_in..source_out, \
+                       at most 20 minutes) is compared, so trim both to the stretch they share for a fast, clean \
+                       match. Both clips need sound and normal forward speed, must not be linked to each other or \
+                       share a track, and the moving clip's track must be unlocked — checked before anything is \
+                       decoded. Send a `progressToken` to hear when it waits for another job; cancelling the request \
+                       stops it. Returns `offset` (seconds the clip moved; positive is later), \
                        `timeline_start`, `confidence` (peak over noise, >= 8 is clear), `distinct` (peak over the \
-                       next-best match, >= 1.5 is unambiguous — music can match at several offsets), `reliable`, \
+                       next-best match, >= 1.5 is unambiguous — music can match at several offsets; null when nothing \
+                       else matched at all), `reliable`, \
                        `inverted` (one recording has flipped polarity) and `applied`. An unreliable match does not \
                        move anything unless force is true."
     )]
-    async fn sync_clips_by_audio(&self, Parameters(p): Parameters<SyncByAudioParams>) -> Result<String, McpError> {
+    async fn sync_clips_by_audio(
+        &self,
+        Parameters(p): Parameters<SyncByAudioParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
         let (reference, clip) = (parse_id(&p.reference_clip_id)?, parse_id(&p.clip_id)?);
         let force = p.force.unwrap_or(false);
         let project = self.project.clone();
+        let cancel = context.ct.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let forward = {
+            let peer = context.peer.clone();
+            let token = context.meta.get_progress_token();
+            tauri::async_runtime::spawn(async move {
+                while let Some(message) = rx.recv().await {
+                    let Some(token) = token.clone() else { continue };
+                    let param = ProgressNotificationParam::new(token, 0.0).with_total(1.0);
+                    let _ = peer.notify_progress(param.with_message(message)).await;
+                }
+            })
+        };
         let sync = blocking(move || {
             // Resolve under the lock, decode and correlate without it, move under it again.
             let plan = lock_agent(&project).audio_sync_inputs(reference, clip).map_err(core_err)?;
-            let measured = Project::measure_audio_sync(&plan).map_err(core_err)?;
+            let measured = Project::measure_audio_sync(
+                &plan,
+                &mut |w| {
+                    let _ = tx.send(w.message().to_string());
+                },
+                &|| cancel.is_cancelled(),
+            )
+            .map_err(core_err)?;
             lock_agent(&project).apply_audio_sync(&measured, force).map_err(core_err)
         })
-        .await?;
+        .await;
+        let _ = forward.await;
+        let sync = sync?;
         if sync.applied {
             self.changed();
         }
@@ -4126,7 +4158,7 @@ impl KerfMcp {
                        safe H.264/AAC MP4 default. `options.loudness` normalizes the mix to a platform target: \
                        youtube / spotify (-14 LUFS), apple (-16), broadcast (EBU R128, -23), all at -1 dBTP; add \
                        `options.loudness_static: true` to get there with one measured gain and a true-peak limiter \
-                       (the mix's dynamics untouched; the render measures it first) instead of loudnorm's riding gain. A render takes minutes:send a `progressToken` in the request's \
+                       (the mix's dynamics untouched; the render measures it first) instead of loudnorm's riding gain. A render takes minutes: send a `progressToken` in the request's \
                        `_meta` to receive progress notifications while it runs, and cancel the request \
                        (`notifications/cancelled`) to stop it — a cancelled render deletes its half-written file \
                        rather than leaving a broken one behind. Refuses to overwrite an existing file unless \
@@ -4288,12 +4320,15 @@ impl KerfMcp {
                 while let Some(progress) = rx.recv().await {
                     let Some(token) = token.clone() else { continue };
                     let param = ProgressNotificationParam::new(token, progress.fraction).with_total(1.0);
-                    let mut message = format!(
-                        "rendering {} of {} ({})",
-                        progress.variant + 1,
-                        progress.total,
-                        labels.get(progress.variant).cloned().unwrap_or_default()
-                    );
+                    let mut message = match progress.waiting {
+                        Some(why) => why.to_string(),
+                        None => format!(
+                            "rendering {} of {} ({})",
+                            progress.variant + 1,
+                            progress.total,
+                            labels.get(progress.variant).cloned().unwrap_or_default()
+                        ),
+                    };
                     if let Some(eta) = progress.eta_secs {
                         message.push_str(&format!(", {} to go", fmt_ts(eta)));
                     }

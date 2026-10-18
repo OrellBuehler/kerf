@@ -84,7 +84,8 @@
 	import { NAME_CHIP_PCT, showsLabel } from '$lib/clip-label';
 	import { fitOffer } from '$lib/music-ui';
 	import { stemsOffer } from '$lib/stems';
-	import { describeSync, syncOffer } from '$lib/audio-sync';
+	import { describeSync, syncOffer, SYNC_CANCELLED } from '$lib/audio-sync';
+	import { cancelAudioSync, onAudioSyncProgress } from '$lib/api';
 	import { transitionLabel } from '$lib/transitions';
 	import { marqueeMode, pickMode, sameIds, type Selection } from '$lib/selection';
 	import { linkPartners } from '$lib/link-groups';
@@ -1681,9 +1682,30 @@
 
 	// ---- sync by audio ------------------------------------------------------------
 
+	// A sync that has to queue behind another job says so, with a way to stop it.
+	const SYNC_TOAST = 'audio-sync-wait';
+	async function syncing<T>(run: () => Promise<T>): Promise<T> {
+		const unlisten = await onAudioSyncProgress((p) =>
+			toast(`Sync by audio: ${p.detail ?? 'waiting'}`, {
+				id: SYNC_TOAST,
+				duration: Infinity,
+				action: { label: 'Cancel', onClick: () => void cancelAudioSync() }
+			})
+		);
+		try {
+			return await run();
+		} finally {
+			unlisten();
+			toast.dismiss(SYNC_TOAST);
+		}
+	}
+	const syncErr = (e: unknown) => {
+		if (String(e instanceof Error ? e.message : e) !== SYNC_CANCELLED) err(e);
+	};
+
+	// "Move anyway" sends the same pair forced: the backend applies the measurement it just made.
 	const syncByAudio = (referenceId: string, clipId: string) =>
-		void editor
-			.syncByAudio(referenceId, clipId)
+		void syncing(() => editor.syncByAudio(referenceId, clipId))
 			.then((s) =>
 				s.applied
 					? toast(describeSync(s))
@@ -1691,14 +1713,13 @@
 							action: {
 								label: 'Move anyway',
 								onClick: () =>
-									void editor
-										.syncByAudio(referenceId, clipId, true)
+									void syncing(() => editor.syncByAudio(referenceId, clipId, true))
 										.then((f) => toast(describeSync(f)))
-										.catch(err)
+										.catch(syncErr)
 							}
 						})
 			)
-			.catch(err);
+			.catch(syncErr);
 
 	// ---- fades (toggle a default 0.5s fade on the selected clip) --------------
 

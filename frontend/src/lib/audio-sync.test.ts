@@ -36,6 +36,19 @@ describe('syncOffer', () => {
 			syncOffer(tl(clip('a', 'snd', { link_id: 'L' }), clip('b', 'snd', { link_id: 'L' })), assets, ['a', 'b'], 'b').reason
 		).toBe('The clips are linked — unlink them first');
 		expect(syncOffer(tl(clip('a', 'snd'), clip('b', 'snd'), true), assets, ['a', 'b'], 'b').reason).toBe('Track A2 is locked');
+		// The reference stays put, so its lock does not matter.
+		expect(syncOffer(tl(clip('a', 'snd'), clip('b', 'snd'), true), assets, ['a', 'b'], 'a').reason).toBeNull();
+		const one = { tracks: [track('A1', [clip('a', 'snd'), clip('b', 'snd', { timeline_start: 5 })])] } as Timeline;
+		expect(syncOffer(one, assets, ['a', 'b'], 'b').reason).toBe('The clips are on one track — in sync they would overlap');
+		// A partner moving along on a locked track blocks the move too.
+		const linked = {
+			tracks: [
+				track('A1', [clip('a', 'snd')]),
+				track('A2', [clip('b', 'snd', { link_id: 'L' })]),
+				track('V1', [clip('v', 'snd', { link_id: 'L' })], { locked: true })
+			]
+		} as Timeline;
+		expect(syncOffer(linked, assets, ['a', 'b'], 'b').reason).toBe('Track V1 is locked');
 	});
 });
 

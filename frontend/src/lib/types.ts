@@ -1073,8 +1073,9 @@ export interface AudioSync {
 	timeline_start: number;
 	/** Correlation peak over its RMS; 8 or more is a clear match. */
 	confidence: number;
-	/** Peak over the next-best match more than 50 ms away; 1.5 or more is unambiguous. */
-	distinct: number;
+	/** Peak over the next-best match more than 50 ms away; 1.5 or more is unambiguous. `null` when
+	 *  nothing else matched at all. */
+	distinct: number | null;
 	reliable: boolean;
 	/** One recording has inverted polarity. */
 	inverted: boolean;
@@ -1151,8 +1152,10 @@ export interface ExportProgress {
 	fraction: number;
 	elapsed_secs: number;
 	eta_secs?: number | null;
-	/** Set while the render has not started because the machine is busy with another heavy job
-	 *  (`waiting for the preview proxy`): a queued export is not hung at 0%. */
+	/** Set while the render has not started: the machine is busy with another heavy job
+	 *  (`waiting for the preview proxy`), or a static loudness normalization is metering the mix
+	 *  (`measuring the mix's loudness`) — so the export is not hung at 0%. A multi-format export
+	 *  sets it too. */
 	waiting?: string | null;
 	/** Set by a multi-format export: which file is rendering, of how many.
 	 *  `fraction` then spans all of them. */
@@ -1268,6 +1271,13 @@ export interface StemsStatus {
 }
 
 /** Payload of the `stems-progress` event, the same shape as `voiceover-progress`. */
+/** `audio-sync-progress`: a sync by audio waiting for the heavy-job slot (`detail` says why). */
+export interface AudioSyncProgress {
+	stage: 'waiting';
+	fraction: null;
+	detail: string | null;
+}
+
 export interface StemsProgress {
 	stage: 'download_runtime' | 'download_model' | 'separate' | 'encode';
 	fraction: number | null;

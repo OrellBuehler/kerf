@@ -8744,6 +8744,19 @@ mod tests {
         assert_eq!(applied.master.volume, 0.6);
         assert!(project.timeline().unwrap().master.limiter);
         assert_eq!(project.history().unwrap().len(), revisions_before + 1);
+
+        // The true-peak switch alone is a change too, even with the limiter it shapes off.
+        let project = agent_project();
+        let revisions_before = project.history().unwrap().len();
+        project.begin_staging(None, None).unwrap();
+        project.set_master_true_peak(true).unwrap();
+        assert!(!project.timeline().unwrap().master.true_peak);
+        let staged = project.staged().unwrap().unwrap();
+        assert_eq!(staged.diff.entries.len(), 1, "{:?}", staged.diff);
+        assert_eq!(staged.diff.entries[0].kind, DiffKind::MasterChanged);
+        assert!(project.apply_staged(false).unwrap().master.true_peak);
+        assert!(project.timeline().unwrap().master.true_peak);
+        assert_eq!(project.history().unwrap().len(), revisions_before + 1);
     }
 
     #[test]

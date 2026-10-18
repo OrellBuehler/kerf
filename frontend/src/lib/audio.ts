@@ -35,7 +35,7 @@
 import { getAudio } from './api';
 import type { Clip, MasterBus, Timeline } from './types';
 import { panGains } from './mixer';
-import { clipGainAt, crossfadesFromItself, fadeInTimes, fadeOutOf, gainAutomation, type GainClip, limiterParams } from './audio-mix';
+import { clipGainAt, crossfadePair, fadeInTimes, fadeOutOf, gainAutomation, type GainClip, limiterParams } from './audio-mix';
 import { clipSounds } from './mixer-strips';
 import { clampMasterVolume, masterOf, trackRenders } from './levels';
 import { readBlock, type Reading } from './meter';
@@ -182,7 +182,7 @@ export class AudioEngine {
 				void this.#buffer(clip)
 					.then((buf) => {
 						// Buffers resolve async; only schedule into the session that asked.
-						if (buf && this.#session === session) this.#schedule(clip, buf, session, bus, crossfadesFromItself(track.clips, clip));
+						if (buf && this.#session === session) this.#schedule(clip, buf, session, bus, crossfadePair(track.clips, clip));
 					})
 					.catch(() => {
 						// #buffer() already evicted the cache entry and reported the
@@ -340,7 +340,7 @@ export class AudioEngine {
 		return { master: readTap(m.tap), tracks };
 	}
 
-	#schedule(clip: Clip, buf: AudioBuffer, s: Session, bus: Bus, sameSource = false) {
+	#schedule(clip: Clip, buf: AudioBuffer, s: Session, bus: Bus, powerPair = false) {
 		const ctx = this.#ctx!;
 		const mag = speedMag(clip);
 		const dur = (clip.source_out - clip.source_in) / mag;
@@ -368,7 +368,7 @@ export class AudioEngine {
 		// approximates as an extra fade-in (the export folds it in the same way).
 		// The track fader multiplies the clip's own gain, as it does on export — on the
 		// bus, which `clipGainAt` leaves out (its product with the clip's is the same).
-		const shaped: GainClip = sameSource ? { ...clip, same_source: true } : clip;
+		const shaped: GainClip = powerPair ? { ...clip, power_pair: true } : clip;
 		const fo = fadeOutOf(clip);
 		const env = (tl: number) => clipGainAt(shaped, tl, clipStart, clipEnd);
 		const t0 = Math.max(clipStart, nowT);

@@ -199,6 +199,18 @@ pub fn render_with_progress(
     cli::render_with_progress(timeline, assets, output, opts, progress, cancel)
 }
 
+/// Check every variant and measure what they share, once — see [`cli::prepare_variants`].
+pub fn prepare_variants(
+    timeline: &crate::model::Timeline,
+    assets: &[crate::model::Asset],
+    variants: &[ExportVariant],
+    opts: &ExportOptions,
+    progress: &mut dyn FnMut(VariantProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<ExportOptions>> {
+    cli::prepare_variants(timeline, assets, variants, opts, progress, cancel)
+}
+
 /// Render one file per delivery frame — see [`cli::render_variants`].
 pub fn render_variants(
     timeline: &crate::model::Timeline,

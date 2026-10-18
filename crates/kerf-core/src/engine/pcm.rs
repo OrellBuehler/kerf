@@ -109,24 +109,35 @@ pub fn decode_audio(path: &Path, sample_rate: u32, channels: u16) -> Result<Audi
             "decode needs a sample rate and a channel count".to_string(),
         ));
     }
-    decode_with(decode_args(path, None, sample_rate, channels), sample_rate, channels)
+    decode_with(
+        decode_args(path, None, sample_rate, channels),
+        sample_rate,
+        channels,
+        &cpu::lease(),
+    )
 }
 
 /// [`decode_audio`] of `secs` seconds from `start` (source seconds; an input-side seek,
-/// exact for audio).
-pub fn decode_audio_window(path: &Path, start: f64, secs: f64, sample_rate: u32, channels: u16) -> Result<AudioBuffer> {
+/// exact for audio), run on the heavy-job slot the caller already holds.
+pub fn decode_audio_window(
+    path: &Path,
+    start: f64,
+    secs: f64,
+    sample_rate: u32,
+    channels: u16,
+    cpu: &cpu::Lease,
+) -> Result<AudioBuffer> {
     if sample_rate == 0 || channels == 0 || !start.is_finite() || !secs.is_finite() || secs <= 0.0 {
         return Err(Error::InvalidArgument(
             "decode needs a sample rate, a channel count and a window".to_string(),
         ));
     }
     let window = Some((start.max(0.0), secs));
-    decode_with(decode_args(path, window, sample_rate, channels), sample_rate, channels)
+    decode_with(decode_args(path, window, sample_rate, channels), sample_rate, channels, cpu)
 }
 
-fn decode_with(args: Vec<std::ffi::OsString>, sample_rate: u32, channels: u16) -> Result<AudioBuffer> {
+fn decode_with(args: Vec<std::ffi::OsString>, sample_rate: u32, channels: u16, cpu: &cpu::Lease) -> Result<AudioBuffer> {
     let bin = ffmpeg_bin();
-    let cpu = cpu::lease();
     let mut cmd = bg_command(&bin);
     cpu::limit_cmd(&mut cmd, cpu.threads());
     let child = cmd

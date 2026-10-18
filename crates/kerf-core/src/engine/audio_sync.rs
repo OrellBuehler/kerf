@@ -4,8 +4,8 @@
 //! [`find_offset`] returns the lag `L` (in samples) for which `b[n] ≈ g · a[n + L]`: when `b`
 //! started recording two seconds after `a`, `L = 2 · sample_rate`. Two passes:
 //!
-//! 1. **Coarse.** Both signals are DC-removed, normalised, low-pass filtered (windowed sinc) and
-//!    decimated to ≤ 8 kHz (further for very long recordings, so the transform stays ≤ 4 M points).
+//! 1. **Coarse.** Both signals are low-pass filtered (windowed sinc), decimated to ≤ 8 kHz,
+//!    DC-removed and normalised (further for very long recordings, so the transform stays ≤ 4 M points).
 //!    The generalised cross-correlation with partial phase transform weighting (GCC-PHAT-β:
 //!    `R = A·B* / |A·B*|^β`) whitens the spectra, so the peak is sharp and independent of the
 //!    microphones' gains and frequency responses; β < 1 keeps noise-only bins from dominating.
@@ -193,15 +193,17 @@ pub fn find_offset(a: &[f32], b: &[f32], sample_rate: u32, opts: &SyncOptions) -
         .div_ceil(opts.coarse_rate.max(500) as usize)
         .max((a.len() + b.len()).div_ceil(opts.max_coarse_samples.max(1 << 12)))
         .max(1);
-    let (mut ca, mut cb) = (a.to_vec(), b.to_vec());
+    // Decimated before they are normalised, so each side is copied once (the filter passes DC,
+    // which the normalisation then removes).
+    let (mut ca, mut cb) = (decimate(a, d), decimate(b, d));
     normalise(&mut ca);
     normalise(&mut cb);
-    let (ca, cb) = (decimate(&ca, d), decimate(&cb, d));
     let (la, lb) = (ca.len() as i64, cb.len() as i64);
     let n = (ca.len() + cb.len()).next_power_of_two();
     let rate_c = sr as f32 / d as f32;
     let band = ((40.0 / rate_c).min(0.05), if d > 1 { 0.40 } else { 0.5 });
     let r = gcc(&ca, &cb, n, opts.phat_beta, band);
+    drop((ca, cb));
     // Valid lags: b[0..lb) against a[L..L+lb) must overlap by a minimum amount.
     let min_overlap = ((rate_c as i64) / 2).min(la.min(lb) / 4).max(8);
     let max_lag_c = opts.max_lag.map(|m| m.abs() / d as i64 + 1);
@@ -230,6 +232,7 @@ pub fn find_offset(a: &[f32], b: &[f32], sample_rate: u32, opts: &SyncOptions) -
         .filter(|l| (l - best.0).abs() > guard && in_range(*l))
         .map(|l| corr_at(&r, l).abs())
         .fold(0.0f32, f32::max);
+    drop(r);
     let distinct = if second > 0.0 { best.1.abs() / second } else { f32::INFINITY };
     let inverted = best.1 < 0.0;
     let coarse = best.0 * d as i64;
@@ -249,30 +252,29 @@ pub fn find_offset(a: &[f32], b: &[f32], sample_rate: u32, opts: &SyncOptions) -
         return Some(coarse_only);
     }
     let w = ((ov1 - ov0) as usize).min(opts.refine_window.max(256)) as i64;
-    // The window of b with the most energy on both sides (a lag-shifted).
+    // The window of b with the most energy on both sides (a lag-shifted), judged on the energies
+    // of `hop`-long blocks (a window is `per` of them), so nothing the length of the input is kept.
     let start = {
         let hop = (w / 4).max(1);
-        let prefix = |x: &[f32]| {
-            let mut p = Vec::with_capacity(x.len() + 1);
-            p.push(0.0f64);
-            let mut s = 0.0;
-            for &v in x {
-                s += f64::from(v) * f64::from(v);
-                p.push(s);
-            }
-            p
+        let per = (w / hop) as usize;
+        let blocks = |x: &[f32], from: i64| -> Vec<f64> {
+            (0..(ov1 - ov0) / hop)
+                .map(|k| {
+                    let s = (from + k * hop) as usize;
+                    x[s..s + hop as usize].iter().map(|&v| f64::from(v) * f64::from(v)).sum()
+                })
+                .collect()
         };
-        let (pa, pb) = (prefix(a), prefix(b));
-        let (mut s, mut best_s, mut best_e) = (ov0, ov0, -1.0f64);
-        while s + w <= ov1 {
-            let eb = pb[(s + w) as usize] - pb[s as usize];
-            let ea = pa[(s + coarse + w) as usize] - pa[(s + coarse) as usize];
-            let e = eb.min(ea);
+        let (ea, eb) = (blocks(a, ov0 + coarse), blocks(b, ov0));
+        let (mut k, mut best_s, mut best_e) = (0usize, ov0, -1.0f64);
+        while ov0 + k as i64 * hop + w <= ov1 {
+            let sum = |e: &[f64]| e[k..k + per].iter().sum::<f64>();
+            let e = sum(&ea).min(sum(&eb));
             if e > best_e {
                 best_e = e;
-                best_s = s;
+                best_s = ov0 + k as i64 * hop;
             }
-            s += hop;
+            k += 1;
         }
         best_s
     };
@@ -468,6 +470,30 @@ mod tests {
             let r = find_offset(&mics[0], &mics[k], SR, &SyncOptions::default()).unwrap();
             assert!((r.lag as f64 - expect).abs() <= 1.0, "mic {k}: {r:?} vs {expect}");
             assert!((r.lag_fine - expect).abs() < 0.75, "mic {k}: {r:?} vs {expect}");
+            assert!(r.reliable(), "{r:?}");
+        }
+    }
+
+    /// At 48 kHz the coarse pass decimates by six; a long recording is decimated further still.
+    #[test]
+    fn a_heavily_decimated_search_still_lands_on_the_sample() {
+        let sr = 48_000u32;
+        let s = speechy(f64::from(sr), 8.0, 21);
+        for (delay, opts) in [
+            (12_345i64, SyncOptions::default()),
+            (
+                -54_321,
+                SyncOptions {
+                    max_coarse_samples: 1 << 16,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let b: Vec<f32> = (0..300_000i64)
+                .map(|n| s.get((n + delay) as usize).copied().filter(|_| n + delay >= 0).unwrap_or(0.0))
+                .collect();
+            let r = find_offset(&s, &b, sr, &opts).unwrap();
+            assert_eq!(r.lag, delay, "{r:?}");
             assert!(r.reliable(), "{r:?}");
         }
     }

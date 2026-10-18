@@ -426,8 +426,12 @@ so the feature is **only** activated through these forwards — which is what ma
   reads ≤ -0.9 dBTP with it, more without). Latency probing is the same `limiter_filter`.
   **Static loudness** (`ExportOptions.loudness_static`, with a `loudness` / `loudnorm` target):
   instead of single-pass `loudnorm` (which rides the gain and overshoots TP), `render_with_progress`
-  (and `render_variants`, once for every variant) first runs one `levels::static_loudness_gain` pass —
-  the export's own metered graph with the normalization off — and fills the `serde(skip)`
+  first runs one `levels::static_loudness_gain` pass (after the preflight; skipped when nothing writes
+  sound — a silent cut, `include_audio` off, a video-only container; its slot wait and the pass itself
+  show as the export's `waiting` line, `measuring the mix's loudness`). `prepare_variants` preflights
+  every variant and then measures **once** for all of them; `render_variants` runs it, and the app's
+  one-variant-per-call loop calls it first and hands its options on. The pass meters the export's
+  own graph with the normalization off and fills the `serde(skip)`
   `loudness_gain_db` with `target − I` (±`LOUDNESS_MAX_GAIN_DB` 30; 0 for a mix under the gate); the
   builder then emits `volume=<g>dB` (omitted under 0.005) and the oversampled limiter at the target's
   -1 dBTP less `STATIC_TP_MARGIN_DB` 0.3 (the resample back rings over what it held). Off, every graph
@@ -451,10 +455,12 @@ so the feature is **only** activated through these forwards — which is what ma
   logs ten a second) and `cancel` kill the child. `Levels.notes` is the advice
   against -14 LUFS / -1 dBTP, and it takes the **master bus** the mix went through
   (`Levels::new(.., &timeline.master)`, `level_notes`): over -1 dBTP with the limiter
-  off says turn it on, but with it **already on** says lower its ceiling by the
-  overshoot plus 0.5 dB (`LEVELS_CEILING_MARGIN_DB`, clamped to the filter's floor; at
-  the floor, lower the master instead) — the old advice looped an agent that followed
-  it, because the limiter holds the sample peak and the overshoot is between samples.
+  off says turn it on with true-peak limiting, but with it **already on** says turn on
+  `set_master_true_peak` or lower its ceiling by the overshoot plus 0.5 dB
+  (`LEVELS_CEILING_MARGIN_DB`, clamped to the filter's floor; at the floor, lower the
+  master instead) — the old advice looped an agent that followed it, because the plain
+  limiter holds the sample peak and the overshoot is between samples. With `true_peak`
+  already on only the lower ceiling (or, at the floor, the master) is offered.
   A track over 0 dBFS before the master is told so without claiming a clip: the graph
   is float, so nothing clips until the mix is written and the master can still bring
   it under. `levels.ts` `levelNotes` mirrors the words exactly (a string in both
@@ -476,15 +482,21 @@ so the feature is **only** activated through these forwards — which is what ma
   dissolve) starts at `timeline_start + …` — timed from 0 they blacked out any
   later clip with a fade-out and dropped its fade-in and transitions. Audio is
   re-based to the clip before `adelay`, so its `afade`s stay clip-local. **A crossfade is
-  constant-power**: an `afade` that is wholly a transition's overlap (`ClipFx::afade_in` on the
-  incoming clip, `tail` on the outgoing one, with no clip fade or dip folded into it) gets
-  `:curve=qsin` (sin in, cos out; linear ramps dipped 3 dB mid-way), anything mixed keeps the old
-  linear ramp, and so does a crossfade between two clips of **one asset** (`ClipFx::afade_in_same` /
-  `tail_same`): that sound is correlated — a music fit's splice, a cut inside one take — and a linear
-  pair sums it to unity where qsin swells +3 dB (the music-fit render tests are sample-exact on it). Rendered: `a_crossfade_keeps_the_power_constant` (two tones, ±0.3 dB through the
+  constant-power**: an `afade` that is wholly one half of a **real pair** (`ClipFx::afade_in_power` on
+  the incoming clip, `tail_power` on the outgoing one — set by `transition_fx` only for a dissolve or
+  motion transition from an adjacent partner, with no clip fade or dip folded into the fade) gets
+  `:curve=qsin` (sin in, cos out; linear ramps dipped 3 dB mid-way). Everything else keeps the old
+  linear ramp: a fade up from black (no partner), a mixed fade, and a pair whose overlap plays the same
+  samples on both sides (`clip_timing::same_sound`: one asset, same speed and direction, the incoming
+  clip picking up within `overlap · speed` of where the outgoing handle continues — a cut inside one
+  take, a music fit's splice between continuous bars) or that is a de-click splice of one recording
+  (≤ `SPLICE_CROSSFADE_S`, a music fit's splice between bars chosen to sound alike): correlated sound
+  a linear pair sums to unity where qsin swells +3 dB (the music-fit render tests are sample-exact on
+  it, and a fitted loop must not peak over its source). Rendered: `a_crossfade_keeps_the_power_constant` (two tones, ±0.3 dB through the
   overlap; -2 dB at a quarter with the curve compiled out). `audio-mix.ts` mirrors it (`crossfadeIn`,
-  `fadeInTimes`: the preview ramps through 16 points of the sine; `crossfadesFromItself` is the
-  same-asset rule).
+  `fadeInTimes`: the preview ramps through 16 points of the sine; `crossfadePair` / `sameSound` pair
+  the clip on its track as it renders, disabled clips left out, and approximate the overlap without
+  the outgoing handle).
   **The scrubbed still draws fades, dips, dissolves, slides and pushes as the file does**
   (`engine/cli/still_fx.rs`; it used to show each clip's own span unfaded — the incoming clip alone
   inside a dissolve, 176 levels off the export's frame — and the agent's `timeline_frame`, the cover

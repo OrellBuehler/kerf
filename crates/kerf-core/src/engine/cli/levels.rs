@@ -115,17 +115,19 @@ pub fn mix_levels(
         loudnorm,
         ..ExportOptions::default()
     };
-    measure_mix(timeline, assets, &opts, cancel)
+    measure_mix(timeline, assets, &opts, &mut |_| {}, cancel)
 }
 
 /// The gain static loudness normalization applies to an export with `opts`: its target's
 /// loudness less the mix's own, measured through the export's graph without the
 /// normalization (`None` when the mix is silent, under the meter's gate, or has no
-/// target to reach). Whole-file work, like [`mix_levels`].
+/// target to reach). Whole-file work, like [`mix_levels`]; `status` hears `Some` while it waits
+/// for the slot and `None` once it meters.
 pub(super) fn static_loudness_gain(
     timeline: &Timeline,
     assets: &[Asset],
     opts: &ExportOptions,
+    status: &mut dyn FnMut(Option<cpu::Wait>),
     cancel: &dyn Fn() -> bool,
 ) -> Result<Option<f64>> {
     let Some(target) = opts.loudness.or(opts.loudnorm.then_some(LoudnessPreset::Youtube)) else {
@@ -139,7 +141,7 @@ pub(super) fn static_loudness_gain(
         loudness_gain_db: None,
         ..opts.clone()
     };
-    let measured = measure_mix(timeline, assets, &unnormalized, cancel)?;
+    let measured = measure_mix(timeline, assets, &unnormalized, status, cancel)?;
     Ok(static_gain_db(target, measured.master.and_then(|m| m.integrated_lufs)))
 }
 
@@ -151,7 +153,13 @@ pub(super) fn static_gain_db(target: LoudnessPreset, integrated: Option<f64>) ->
         .map(|i| (target.lufs() - i).clamp(-LOUDNESS_MAX_GAIN_DB, LOUDNESS_MAX_GAIN_DB))
 }
 
-fn measure_mix(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, cancel: &dyn Fn() -> bool) -> Result<MixLevels> {
+fn measure_mix(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    status: &mut dyn FnMut(Option<cpu::Wait>),
+    cancel: &dyn Fn() -> bool,
+) -> Result<MixLevels> {
     let Some(run) = build_levels_args(timeline, assets, opts)? else {
         return Ok(MixLevels::default());
     };
@@ -159,7 +167,8 @@ fn measure_mix(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, canc
     let bin = ffmpeg_bin();
     // Foreground, and stoppable while it waits for the slot (the Mixer's Stop works on a queued
     // measurement as on a running one).
-    let lease = cpu::lease_waiting(&mut |_| {}, cancel)?;
+    let lease = cpu::lease_waiting(&mut |w| status(Some(w)), cancel)?;
+    status(None);
     let mut args = run.args;
     cpu::limit_args(&mut args, lease.threads());
     let _script = externalize_filter_complex(&mut args, "lv")?;

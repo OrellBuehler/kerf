@@ -37,10 +37,18 @@ export function syncOffer(
 		if (!assets.find((a) => a.id === clip.asset_id)?.streams.some((s) => s.kind === 'audio')) return offer('Both clips need sound');
 		if ((clip.speed ?? 1) !== 1) return offer('Both clips need to play at normal speed');
 	}
-	if (linkPartners(timeline as Timeline, clickedId).includes(ref.clip.id)) return offer('The clips are linked — unlink them first');
-	if (own.track.locked) return offer(`Track ${own.track.name} is locked`);
+	const partners = linkPartners(timeline as Timeline, clickedId);
+	if (partners.includes(ref.clip.id)) return offer('The clips are linked — unlink them first');
+	if (ref.track.id === own.track.id) return offer('The clips are on one track — in sync they would overlap');
+	for (const id of [clickedId, ...partners]) {
+		const track = find(id)?.track;
+		if (track?.locked) return offer(`Track ${track.name} is locked`);
+	}
 	return offer(null);
 }
+
+/** What a stopped sync rejects with (`AUDIO_SYNC_CANCELLED`), for the UI to stay quiet on. */
+export const SYNC_CANCELLED = 'audio sync cancelled';
 
 const signed = (s: number) => `${s >= 0 ? '+' : '−'}${Math.abs(s).toFixed(3)} s`;
 

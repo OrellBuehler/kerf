@@ -2,9 +2,11 @@
 //! [`crate::engine::audio_sync`].
 //!
 //! The usual heavy-op split: [`Project::audio_sync_inputs`] resolves both clips under the
-//! lock, [`Project::measure_audio_sync`] decodes and correlates with no `&self`, and
+//! lock (and refuses what the move could not do, before anything is decoded),
+//! [`Project::measure_audio_sync`] decodes and correlates with no `&self`, and
 //! [`Project::apply_audio_sync`] moves the clip through [`Project::move_clip`] (linked
-//! partners move with it; a move never ripples).
+//! partners move with it; a move never ripples). Only each clip's used source window
+//! (`source_in..source_out`, at most [`MAX_SYNC_SECONDS`]) is compared.
 
 use std::path::PathBuf;
 
@@ -13,6 +15,7 @@ use uuid::Uuid;
 
 use super::Project;
 use crate::engine::audio_sync::{find_offset, SyncOptions};
+use crate::engine::cpu::{self, Wait};
 use crate::engine::decode_audio_window;
 use crate::error::{Error, Result};
 use crate::model::{Clip, Timeline};
@@ -24,7 +27,7 @@ pub const SYNC_SAMPLE_RATE: u32 = 16_000;
 pub const MAX_SYNC_SECONDS: f64 = 1200.0;
 
 /// One side of a sync: the source window of the clip that is decoded.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SyncSide {
     pub clip_id: Uuid,
     pub path: PathBuf,
@@ -34,7 +37,8 @@ pub struct SyncSide {
 }
 
 /// What [`Project::measure_audio_sync`] decodes: the reference clip and the clip moved to it.
-#[derive(Debug, Clone)]
+/// Equal plans decode the same sound, so a measurement of one stands for the other.
+#[derive(Debug, Clone, PartialEq)]
 pub struct AudioSyncPlan {
     pub reference: SyncSide,
     pub clip: SyncSide,
@@ -52,6 +56,7 @@ pub struct AudioSyncMeasure {
     /// the clip's sound starts before the reference's window).
     pub lag: f64,
     pub confidence: f64,
+    /// Infinite when nothing else correlated at all.
     pub distinct: f64,
     pub reliable: bool,
     pub inverted: bool,
@@ -69,8 +74,9 @@ pub struct AudioSync {
     /// The correlation peak over its RMS: 8 or more is a clear match.
     pub confidence: f64,
     /// The peak over the next-best match more than 50 ms away: 1.5 or more is unambiguous
-    /// (music and hum can match at several offsets).
-    pub distinct: f64,
+    /// (music and hum can match at several offsets). `null` when no other offset correlated
+    /// at all — as unambiguous as it gets, and not a number JSON can carry.
+    pub distinct: Option<f64>,
     /// Clear and unambiguous enough to trust.
     pub reliable: bool,
     /// One recording is the other with its polarity inverted.
@@ -83,16 +89,38 @@ impl Project {
     /// Resolve what syncing `clip_id` to `reference_id` by their sound decodes, without
     /// decoding: the lock-held half. Both clips play their source forward at normal speed
     /// and have sound; they are different clips, and not linked to each other (a linked
-    /// pair moves together, so it could never be pulled into line).
+    /// pair moves together, so it could never be pulled into line). The move itself is
+    /// checked here too, so a sync that could not be applied fails before the decode: the
+    /// clip (and every partner moving with it) must be on unlocked tracks, and not on the
+    /// reference's track, where in sync the two would overlap.
     pub fn audio_sync_inputs(&self, reference_id: Uuid, clip_id: Uuid) -> Result<AudioSyncPlan> {
         if reference_id == clip_id {
             return Err(Error::InvalidArgument("a clip cannot be synced to itself".to_string()));
         }
         let timeline = self.working_timeline()?;
-        if timeline.link_partners(clip_id).contains(&reference_id) {
+        let partners = timeline.link_partners(clip_id);
+        if partners.contains(&reference_id) {
             return Err(Error::InvalidArgument(
                 "the two clips are linked and move together; detach them first".to_string(),
             ));
+        }
+        let (rt, _) = timeline.locate(reference_id).ok_or(Error::ClipNotFound(reference_id))?;
+        let (ct, _) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+        if rt == ct {
+            return Err(Error::InvalidArgument(format!(
+                "both clips are on track {}; in sync they would overlap, so move one to another track first",
+                timeline.tracks[ct].name
+            )));
+        }
+        for id in std::iter::once(clip_id).chain(partners) {
+            if let Some((ti, _)) = timeline.locate(id) {
+                if timeline.tracks[ti].locked {
+                    return Err(Error::InvalidArgument(format!(
+                        "track {} is locked",
+                        timeline.tracks[ti].name
+                    )));
+                }
+            }
         }
         Ok(AudioSyncPlan {
             reference: self.sync_side(&timeline, reference_id)?,
@@ -116,15 +144,32 @@ impl Project {
     }
 
     /// Decode both clips' sound (mono, [`SYNC_SAMPLE_RATE`]) and find the offset between them.
-    /// Static and lock-free: the slow half. An answer that is not [`AudioSync::reliable`] is
-    /// still an answer; whether to act on it is [`Project::apply_audio_sync`]'s question.
-    pub fn measure_audio_sync(plan: &AudioSyncPlan) -> Result<AudioSyncMeasure> {
+    /// Static and lock-free: the slow half, on the heavy-job slot — `on_wait` hears why it
+    /// queues for it, and `cancel` stops it while it waits and between the decodes
+    /// ([`Error::Cancelled`]). An answer that is not [`AudioSync::reliable`] is still an
+    /// answer; whether to act on it is [`Project::apply_audio_sync`]'s question.
+    pub fn measure_audio_sync(
+        plan: &AudioSyncPlan,
+        on_wait: &mut dyn FnMut(Wait),
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<AudioSyncMeasure> {
+        if cancel() {
+            return Err(Error::Cancelled);
+        }
+        let lease = cpu::lease_waiting(on_wait, cancel)?;
         let decode = |side: &SyncSide| -> Result<Vec<f32>> {
-            Ok(decode_audio_window(&side.path, side.start, side.secs, SYNC_SAMPLE_RATE, 1)?.samples)
+            if cancel() {
+                return Err(Error::Cancelled);
+            }
+            Ok(decode_audio_window(&side.path, side.start, side.secs, SYNC_SAMPLE_RATE, 1, &lease)?.samples)
         };
         let (a, b) = (decode(&plan.reference)?, decode(&plan.clip)?);
+        if cancel() {
+            return Err(Error::Cancelled);
+        }
         let found = find_offset(&a, &b, SYNC_SAMPLE_RATE, &SyncOptions::default())
             .ok_or_else(|| Error::InvalidArgument("not enough sound in one of the clips to sync by".to_string()))?;
+        drop(lease);
         Ok(AudioSyncMeasure {
             reference_id: plan.reference.clip_id,
             clip_id: plan.clip.clip_id,
@@ -155,7 +200,7 @@ impl Project {
             offset: start - clip.timeline_start,
             timeline_start: start,
             confidence: m.confidence,
-            distinct: m.distinct,
+            distinct: m.distinct.is_finite().then_some(m.distinct),
             reliable: m.reliable,
             inverted: m.inverted,
             applied: false,
@@ -172,14 +217,6 @@ impl Project {
         self.move_clip(m.clip_id, start.max(0.0), None)?;
         out.applied = true;
         Ok(out)
-    }
-
-    /// [`Project::audio_sync_inputs`] → [`Project::measure_audio_sync`] →
-    /// [`Project::apply_audio_sync`], holding `&self` throughout.
-    pub fn sync_clips_by_audio(&self, reference_id: Uuid, clip_id: Uuid, force: bool) -> Result<AudioSync> {
-        let plan = self.audio_sync_inputs(reference_id, clip_id)?;
-        let measured = Self::measure_audio_sync(&plan)?;
-        self.apply_audio_sync(&measured, force)
     }
 }
 
@@ -268,16 +305,60 @@ mod tests {
             start,
             secs,
         };
+        let plan = AudioSyncPlan {
+            reference: side(&a, 0.0, 12.0),
+            clip: side(&b, 0.0, 6.0),
+        };
+        assert!(matches!(
+            Project::measure_audio_sync(&plan, &mut |_| {}, &|| true),
+            Err(Error::Cancelled)
+        ));
         for (clip_start, want) in [(0.0, 1.25), (2.0, 3.25)] {
             let plan = AudioSyncPlan {
                 reference: side(&a, 0.0, 12.0),
                 clip: side(&b, clip_start, 6.0),
             };
-            let m = Project::measure_audio_sync(&plan).expect("measure");
+            let m = Project::measure_audio_sync(&plan, &mut |_| {}, &|| false).expect("measure");
             assert!((m.lag - want).abs() < 1.0 / f64::from(SYNC_SAMPLE_RATE), "{m:?}");
             assert!(m.reliable && !m.inverted, "{m:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sync_the_move_would_refuse_fails_before_anything_is_decoded() {
+        use crate::model::StreamKind;
+        let project = Project::sample().unwrap();
+        let timeline = project.timeline().unwrap();
+        let on = |kind| {
+            let t = timeline
+                .tracks
+                .iter()
+                .find(|t| t.kind == kind && !t.clips.is_empty())
+                .unwrap();
+            (t.id, t.clips[0].clone())
+        };
+        let ((_, video), (sound, audio)) = (on(StreamKind::Video), on(StreamKind::Audio));
+        let plan = project.audio_sync_inputs(video.id, audio.id).unwrap();
+        assert_eq!(
+            (plan.clip.start, plan.clip.secs),
+            (audio.source_in, audio.source_out - audio.source_in)
+        );
+        assert!(project.audio_sync_inputs(audio.id, audio.id).is_err());
+
+        // On one track the two would overlap once in sync.
+        let again = project.cut_clip(audio.asset_id, 20.0, 25.0).unwrap();
+        let now = project.timeline().unwrap();
+        let (ti, _) = now.locate(again.id).unwrap();
+        let neighbour = now.tracks[ti].clips.iter().find(|c| c.id != again.id).unwrap().id;
+        let err = project.audio_sync_inputs(neighbour, again.id).unwrap_err().to_string();
+        assert!(err.contains("would overlap"), "{err}");
+
+        // A locked track cannot take the move; the reference's can, as it stays put.
+        project.set_track_locked(sound, true).unwrap();
+        let err = project.audio_sync_inputs(video.id, audio.id).unwrap_err().to_string();
+        assert!(err.contains("is locked"), "{err}");
+        assert!(project.audio_sync_inputs(audio.id, video.id).is_ok());
     }
 
     #[test]

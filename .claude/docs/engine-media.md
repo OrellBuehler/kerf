@@ -97,16 +97,22 @@
   start, secs, ..)` is the same with an input-side `-ss` / `-t`.
 - `audio_sync.rs` (pure DSP, ported from FilmCraft's `sync.rs` onto `realfft`): `find_offset(a, b,
   rate)` → `SyncResult {lag, lag_fine, confidence, distinct, inverted}` with `b[n] ≈ g·a[n + lag]`.
-  GCC-PHAT-β (β 0.75) on DC-removed, normalised signals decimated to ≤ 8 kHz (further past 4 M
-  samples), then refined at the full rate on the loudest common window with parabolic
-  interpolation; `reliable()` is confidence ≥ 8 and distinct (peak over the best one > 50 ms away)
+  GCC-PHAT-β (β 0.75) on signals decimated to ≤ 8 kHz (further past 4 M samples), then DC-removed
+  and normalised (one copy a side, dropped with the correlation before the refine), then refined at
+  the full rate on the loudest common window (picked from `w/4`-long block energies, not prefix sums
+  of the whole input) with parabolic interpolation; `reliable()` is confidence ≥ 8 and distinct (peak over the best one > 50 ms away)
   ≥ 1.5. Unit-tested on synthetic speech: exact pure delays both ways, noisy coloured mics within a
-  sample, inverted polarity, unrelated signals unreliable. The project half is `project/audio_sync.rs`:
-  `audio_sync_inputs` (both clips forward at speed 1, with sound, not linked to each other; window
-  `source_in..source_out`, ≤ 20 min) → static `measure_audio_sync` (two mono 16 kHz window decodes,
-  `cpu::lease` each) → `apply_audio_sync(m, force)`, which re-reads both clips (either may have moved
+  sample, a 48 kHz search decimated by 6 and by 11, inverted polarity, unrelated signals unreliable.
+  The project half is `project/audio_sync.rs`: `audio_sync_inputs` (both clips forward at speed 1,
+  with sound, not linked to each other; the move checked up front so it fails before any decode —
+  not on the reference's track, where in sync they would overlap, and the clip and its partners on
+  unlocked tracks; window `source_in..source_out`, ≤ 20 min) → static
+  `measure_audio_sync(plan, on_wait, cancel)` (one `cpu::lease_waiting` held for both mono 16 kHz
+  window decodes, `decode_audio_window(.., &lease)`; cancel polled while queued and between steps)
+  → `apply_audio_sync(m, force)`, which re-reads both clips (either may have moved
   or been trimmed meanwhile: `synced_start`), reports an unreliable match without moving unless
   `force`, refuses a start before 0 and moves through `move_clip` (linked partners follow; no ripple).
+  `AudioSync.distinct` is `None` (JSON `null`) when nothing else correlated, never `inf`.
   An `#[ignore]`d test syncs two ffmpeg-cut copies of one pink-noise take to within a sample.
 - `music.rs` (always compiled, pure DSP + a cache): `analyze_music(mono, rate)` →
   `MusicAnalysis {grid: BeatGrid, duration, bar_chroma, phrases}`, computed inside

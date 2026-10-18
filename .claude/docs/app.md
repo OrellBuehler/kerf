@@ -75,7 +75,9 @@ with MCP: lock released, background lane, `analysis-progress`, stopped by `cance
 analysis), `remove_silence`, `snap_to_beats`,
 `smart_crop` (frame each shot for the delivery frame),
 `sync_clips_by_audio` (`referenceId`, `clipId`, `force?` → `{sync: AudioSync, timeline}`; heavy, the
-lock-free inputs → measure → apply split),
+lock-free inputs → measure → apply split; a slot wait emits `audio-sync-progress`; a forced call for the
+plan last measured applies `AppState.last_sync` instead of decoding again — "Move anyway") /
+`cancel_audio_sync` (rejects it with `audio sync cancelled`),
 `extract_audio` (detaches an asset's cut clips and reports what it skipped, see Linked A/V) / `add_asset_audio`
 (an asset's whole audio as a clip) / `detach_audio_clips`,
 `detach_audio` / `reattach_audio` / `reattach_audio_clips` / `link_clips` / `unlink_clips`, `concatenate` — each

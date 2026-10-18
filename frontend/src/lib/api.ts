@@ -70,6 +70,7 @@ import type {
 	StemsProgress,
 	StemsResult,
 	SyncedByAudio,
+	AudioSyncProgress,
 	StemsStatus,
 	StreamKind,
 	SvgCheck,
@@ -2839,18 +2840,29 @@ export async function smartCrop(clipId?: string): Promise<Timeline> {
 }
 
 /** Move `clipId` so its sound lines up with `referenceId`'s (a camera's scratch audio against
- *  the recorder): the backend decodes both and cross-correlates them. Linked partners move with
- *  it. A match that is not `reliable` is reported and nothing moves unless `force`. The harness
- *  has no sound to compare: it answers as if both recordings started together (the same source
- *  second at the same timeline time) with a clear match. */
+ *  the recorder): the backend decodes both clips' used source windows and cross-correlates them.
+ *  Linked partners move with it. A match that is not `reliable` is reported and nothing moves
+ *  unless `force` — which, for the pair just measured, applies that measurement without decoding
+ *  again. A wait for the heavy-job slot arrives as `audio-sync-progress` (`onAudioSyncProgress`);
+ *  `cancelAudioSync` stops it (`audio sync cancelled`). The harness has no sound to compare: it
+ *  answers as if both recordings started together (the same source second at the same timeline
+ *  time) with a clear match. */
 export async function syncClipsByAudio(referenceId: string, clipId: string, force = false): Promise<SyncedByAudio> {
 	if (!inTauri()) {
 		if (referenceId === clipId) throw new Error('a clip cannot be synced to itself');
 		const ref = locate(devTimeline, referenceId);
 		const own = locate(devTimeline, clipId);
 		if (!ref || !own) throw new Error('clip not found');
-		if (linkPartners(devTimeline, clipId).includes(referenceId)) {
+		const partners = linkPartners(devTimeline, clipId);
+		if (partners.includes(referenceId)) {
 			throw new Error('the two clips are linked and move together; detach them first');
+		}
+		if (ref[0].id === own[0].id) {
+			throw new Error(`both clips are on track ${own[0].name}; in sync they would overlap, so move one to another track first`);
+		}
+		for (const id of [clipId, ...partners]) {
+			const track = locate(devTimeline, id)?.[0];
+			if (track?.locked) throw new Error(`track ${track.name} is locked`);
 		}
 		const [r, c] = [ref[0].clips[ref[1]], own[0].clips[own[1]]];
 		for (const x of [r, c]) {
@@ -2867,6 +2879,20 @@ export async function syncClipsByAudio(referenceId: string, clipId: string, forc
 		};
 	}
 	return invoke<SyncedByAudio>('sync_clips_by_audio', { referenceId, clipId, force });
+}
+
+/** Stop the sync by audio in flight; it then rejects with `audio sync cancelled`. */
+export async function cancelAudioSync(): Promise<void> {
+	if (!inTauri()) return;
+	return invoke<void>('cancel_audio_sync');
+}
+
+/** Subscribe to `audio-sync-progress` (a sync waiting for another job). Returns an unlisten fn;
+ *  the harness never waits. */
+export async function onAudioSyncProgress(cb: (p: AudioSyncProgress) => void): Promise<() => void> {
+	if (!inTauri()) return () => {};
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen<AudioSyncProgress>('audio-sync-progress', (e) => cb(e.payload));
 }
 
 /** Give an asset's sound its own clip on an audio track, for every use of the asset on a

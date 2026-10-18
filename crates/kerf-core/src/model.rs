@@ -771,23 +771,34 @@ fn level_notes(master: Option<&LevelReading>, tracks: &[TrackLevels], bus: &Mast
              re-encoded."
         );
         if bus.limiter {
-            // The limiter holds the *sample* peak at its ceiling, so what is left over
-            // is the peak between samples: take the ceiling down by that, and a margin.
+            // A sample-peak limiter leaves the peak between samples over its ceiling: the fix
+            // is true-peak limiting, or the ceiling taken down by the overshoot and a margin.
+            // A true-peak limiter already holds it, so only a lower ceiling is left.
             let ceiling = bus.safe_ceiling_db();
             let lower = (ceiling - (tp - LEVELS_TRUE_PEAK_CEILING_DBTP) - LEVELS_CEILING_MARGIN_DB).max(MASTER_MIN_CEILING_DB);
-            if lower < ceiling {
-                notes.push(format!(
+            notes.push(match (bus.true_peak, lower < ceiling) {
+                (false, true) => format!(
                     "{over} The master limiter is already on, but it holds the sample peak at {ceiling:.1} dBFS and the peak \
-                     between samples runs above that. Lower its ceiling to about {lower:.1} dBFS (set_master_limiter)."
-                ));
-            } else {
-                notes.push(format!(
-                    "{over} The master limiter is already on at its lowest ceiling. Lower the master or the loudest track."
-                ));
-            }
+                     between samples runs above that. Turn on true-peak limiting (set_master_true_peak), or lower its \
+                     ceiling to about {lower:.1} dBFS (set_master_limiter)."
+                ),
+                (false, false) => format!(
+                    "{over} The master limiter is already on at its lowest ceiling. Turn on true-peak limiting \
+                     (set_master_true_peak), or lower the master or the loudest track."
+                ),
+                (true, true) => format!(
+                    "{over} The master limiter is already on and holds the true peak at {ceiling:.1} dBFS. Lower its \
+                     ceiling to about {lower:.1} dBFS (set_master_limiter)."
+                ),
+                (true, false) => format!(
+                    "{over} The master limiter is already on, holding the true peak at its lowest ceiling. Lower the \
+                     master or the loudest track."
+                ),
+            });
         } else {
             notes.push(format!(
-                "{over} Turn on the master limiter (set_master_limiter) or lower the master."
+                "{over} Turn on the master limiter (set_master_limiter) with true-peak limiting (set_master_true_peak), \
+                 or lower the master."
             ));
         }
     }
@@ -4254,9 +4265,10 @@ pub struct MasterBus {
     /// while it is off, so switching the limiter back on returns to the
     /// ceiling that was chosen.
     ///
-    /// A **sample-peak** ceiling: the limiter does not oversample, so the
-    /// *true* peak of the result can sit a fraction of a dB higher
-    /// ([`Project::levels`](crate::Project::levels) measures it).
+    /// A **sample-peak** ceiling unless `true_peak` is on: the plain limiter does not
+    /// oversample, so the *true* peak of the result can sit a fraction of a dB higher
+    /// ([`Project::levels`](crate::Project::levels) measures it). With `true_peak` the
+    /// limiter runs oversampled and holds the true peak at the ceiling too.
     #[serde(default = "default_master_ceiling")]
     pub ceiling_db: f64,
     /// How tracks flagged `duck` dip under the rest of the mix. `None` (the default) is
@@ -6388,7 +6400,9 @@ fn svg_overlay_changes(before: &SvgOverlay, after: &SvgOverlay) -> Option<String
 /// What differs between two master buses, phrased like the track strip's
 /// (`level 100% → 70%`), or `None` when the mix would come out the same. The
 /// ceiling only counts while the limiter is on afterwards — a stored ceiling
-/// the limiter is not using changes nothing anyone can hear.
+/// the limiter is not using changes nothing anyone can hear. The true-peak switch
+/// always counts: it is the user's choice for the limiter whenever it runs, and an
+/// agent's staged switch must not read as an empty proposal.
 fn master_changes(before: &MasterBus, after: &MasterBus) -> Option<String> {
     let mut parts = Vec::new();
     if (before.volume - after.volume).abs() > DIFF_EPS {
@@ -6405,6 +6419,9 @@ fn master_changes(before: &MasterBus, after: &MasterBus) -> Option<String> {
             "limiter ceiling {:.1} → {:.1} dB",
             before.ceiling_db, after.ceiling_db
         ));
+    }
+    if before.true_peak != after.true_peak {
+        parts.push(format!("true-peak limiting {}", if after.true_peak { "on" } else { "off" }));
     }
     let duck = |d: Option<f64>| match d {
         Some(db) => format!("speech gate {db:.0} dB"),
@@ -8778,7 +8795,7 @@ mod tests {
         // 11 kHz at a -1 dBFS ceiling, as measured: -0.2 dBTP is 0.8 over, so -2.3.
         let n = notes(-0.2, &on(-1.0));
         assert_eq!(n.len(), 2, "{n:?}");
-        assert!(!n[1].contains("Turn on"), "{n:?}");
+        assert!(!n[1].contains("Turn on the master limiter"), "{n:?}");
         assert!(
             n[1].contains("-0.2 dBTP") && n[1].contains("-1.0 dBFS") && n[1].contains("about -2.3 dBFS"),
             "{n:?}"
@@ -8788,9 +8805,25 @@ mod tests {
         assert_eq!(
             n[1],
             "True peak -0.2 dBTP is over the -1 dBTP platforms ask for and can clip when re-encoded. The master limiter is already \
-             on, but it holds the sample peak at -1.0 dBFS and the peak between samples runs above that. Lower its ceiling to \
-             about -2.3 dBFS (set_master_limiter)."
+             on, but it holds the sample peak at -1.0 dBFS and the peak between samples runs above that. Turn on true-peak \
+             limiting (set_master_true_peak), or lower its ceiling to about -2.3 dBFS (set_master_limiter)."
         );
+        // Already limiting the true peak: only the ceiling is left to lower.
+        let tp_on = |ceiling_db| MasterBus {
+            true_peak: true,
+            ..on(ceiling_db)
+        };
+        assert_eq!(
+            notes(-0.2, &tp_on(-1.0))[1],
+            "True peak -0.2 dBTP is over the -1 dBTP platforms ask for and can clip when re-encoded. The master limiter is already \
+             on and holds the true peak at -1.0 dBFS. Lower its ceiling to about -2.3 dBFS (set_master_limiter)."
+        );
+        let floor_tp = notes(0.4, &tp_on(MASTER_MIN_CEILING_DB));
+        assert!(
+            floor_tp[1].contains("holding the true peak at its lowest ceiling"),
+            "{floor_tp:?}"
+        );
+        assert!(!floor_tp[1].contains("set_master_true_peak"), "{floor_tp:?}");
         // From the default ceiling: 0.4 dBTP is 1.4 over.
         assert!(
             notes(0.4, &on(MASTER_DEFAULT_CEILING_DB))[1].contains("about -3.4 dBFS"),
@@ -8813,7 +8846,7 @@ mod tests {
         assert_eq!(
             notes(0.4, &MasterBus::default())[1],
             "True peak 0.4 dBTP is over the -1 dBTP platforms ask for and can clip when re-encoded. Turn on the master limiter \
-             (set_master_limiter) or lower the master."
+             (set_master_limiter) with true-peak limiting (set_master_true_peak), or lower the master."
         );
         assert!(notes(0.4, &off)[1].contains("Turn on the master limiter"));
         // Under the line: no note, limiter or not.

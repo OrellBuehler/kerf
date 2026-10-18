@@ -555,8 +555,10 @@ true-peak limiter instead of `loudnorm`; the hint under it says which). The Mixe
 the preview's limiter is the same either way, and `fxSummary` does not mention it).
 The clip menu offers **Sync by audio** when exactly two clips are selected and one is right-clicked:
 `audio-sync.ts` `syncOffer` greys it with the backend's refusals (no sound, speed ≠ 1, linked to each other,
-locked track); `editor.syncByAudio` moves the clicked clip to the other (`describeSync` toast, and a
-**Move anyway** action — `force` — for a match that was not reliable). The harness answers as if both
+both on one track, the clicked clip's or a partner's track locked); `editor.syncByAudio` moves the clicked
+clip to the other (`describeSync` toast, and a **Move anyway** action — `force`, which applies the
+measurement just made — for a match that was not reliable). A sync queued behind another job shows a
+toast with Cancel (`onAudioSyncProgress` / `cancelAudioSync`; the cancelled rejection stays quiet). The harness answers as if both
 recordings started together.
 The options are remembered for the session (`export-draft.ts`: `ui.exportDraft`, written when the
 dialog closes, restored by `restoreDraft` unless the project has been re-cut for another frame since —

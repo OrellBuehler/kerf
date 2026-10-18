@@ -3,7 +3,8 @@ import {
 	clipGainAt,
 	CROSSFADE_STEPS,
 	crossfadeIn,
-	crossfadesFromItself,
+	crossfadePair,
+	SPLICE_CROSSFADE_S,
 	fadeInOf,
 	fadeInTimes,
 	fadeOutOf,
@@ -79,7 +80,7 @@ describe('clipGainAt', () => {
 });
 
 describe('a crossfade-in is constant-power, as the export draws it', () => {
-	const x = { volume: 1, transition_in: { kind: 'crossfade', duration: 2 } } as never;
+	const x = { volume: 1, transition_in: { kind: 'crossfade', duration: 2 }, power_pair: true } as never;
 	test('sin over the overlap, so it and the outgoing cos sum to unit power', () => {
 		expect(crossfadeIn(x)).toBe(true);
 		for (const f of [0, 0.25, 0.5, 0.75, 1]) {
@@ -90,15 +91,42 @@ describe('a crossfade-in is constant-power, as the export draws it', () => {
 		expect(fadeInTimes(x, 10)).toHaveLength(CROSSFADE_STEPS);
 		expect(fadeInTimes(x, 10).at(-1)).toBe(12);
 	});
-	test('a crossfade from a clip of the same asset is correlated sound and stays linear', () => {
-		const a = { id: 'a', asset_id: 's', source_in: 0, source_out: 10, timeline_start: 0 } as never;
-		const b = { id: 'b', asset_id: 's', source_in: 20, source_out: 30, timeline_start: 10, transition_in: { kind: 'crossfade', duration: 2 } };
-		expect(crossfadesFromItself([a, b as never], b as never)).toBe(true);
-		expect(crossfadesFromItself([a, { ...b, asset_id: 'o' } as never], { ...b, asset_id: 'o' } as never)).toBe(false);
-		expect(crossfadesFromItself([a, { ...b, timeline_start: 12 } as never], { ...b, timeline_start: 12 } as never)).toBe(false);
-		const same = { ...b, volume: 1, same_source: true } as never;
-		expect(crossfadeIn(same)).toBe(false);
-		expect(clipGainAt(same, 11, 10, 20)).toBeCloseTo(0.5, 12);
+	test('only a pair of two different sounds is constant-power (`clip_timing` replays)', () => {
+		type C = { id: string; asset_id: string; source_in: number; source_out: number; timeline_start: number; speed?: number; enabled?: boolean; transition_in?: unknown };
+		const fade = { kind: 'crossfade', duration: 1 };
+		const pair = (a: [number, number, number], b: [number, number, number], asset = 's', extra: C[] = []) => {
+			const out: C = { id: 'a', asset_id: 's', source_in: a[0], source_out: a[1], speed: a[2], timeline_start: 0 };
+			const len = (a[1] - a[0]) / Math.abs(a[2]);
+			const inn: C = { id: 'b', asset_id: asset, source_in: b[0], source_out: b[1], speed: b[2], timeline_start: len, transition_in: fade };
+			return crossfadePair([out, ...extra, inn] as never, inn as never);
+		};
+		expect(pair([0, 10, 1], [20, 30, 1])).toBe(true);
+		expect(pair([0, 10, 1], [10, 20, 1], 'o')).toBe(true);
+		expect(pair([0, 20, 2], [20, 30, 1])).toBe(true);
+		expect(pair([20, 30, -1], [0, 10, 1])).toBe(true);
+		expect(pair([0, 10, 1], [11.5, 20, 1])).toBe(true);
+		expect(pair([0, 10, 1], [10, 20, 1])).toBe(false);
+		expect(pair([0, 10, 1], [10.5, 20, 1])).toBe(false);
+		expect(pair([0, 10, 1], [9.5, 20, 1])).toBe(false);
+		expect(pair([0, 20, 2], [21.5, 30, 2])).toBe(false);
+		expect(pair([20, 30, -1], [10, 20, -1])).toBe(false);
+		// A de-click splice of one recording (a music fit's, between bars that sound alike).
+		const spliced = (asset: string) => {
+			const out = { id: 'a', asset_id: 's', source_in: 0, source_out: 10, timeline_start: 0 };
+			const inn = { id: 'b', asset_id: asset, source_in: 20, source_out: 30, timeline_start: 10, transition_in: { kind: 'crossfade', duration: SPLICE_CROSSFADE_S } };
+			return crossfadePair([out, inn] as never, inn as never);
+		};
+		expect(spliced('s')).toBe(false);
+		expect(spliced('o')).toBe(true);
+		// A disabled clip is not in the render, so it is nobody's partner.
+		const ghost: C = { id: 'g', asset_id: 'z', source_in: 0, source_out: 1, timeline_start: 9.5, enabled: false };
+		expect(pair([0, 10, 1], [20, 30, 1], 's', [ghost])).toBe(true);
+		// No partner: a fade up from black.
+		const lone = { id: 'b', asset_id: 's', source_in: 0, source_out: 10, timeline_start: 5, transition_in: fade };
+		expect(crossfadePair([lone] as never, lone as never)).toBe(false);
+		const plain = { volume: 1, transition_in: fade } as never;
+		expect(crossfadeIn(plain)).toBe(false);
+		expect(clipGainAt(plain, 10.5, 10, 20)).toBeCloseTo(0.5, 12);
 	});
 	test('a clip fade beside it, a dip, or no transition stays linear', () => {
 		const mixed = { volume: 1, fade_in: 0.5, transition_in: { kind: 'crossfade', duration: 1.5 } } as never;
