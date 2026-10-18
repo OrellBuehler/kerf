@@ -23,8 +23,9 @@
   the timeline draws from it is **ungated** (no `cpu::lease`) but thread-capped and
   niced, at most two decodes at once (a freshly opened project asks for every clip
   at the same instant), concurrent requests for one file share one decode
-  (`shared_pyramid`), and the pipe is read on a side thread so a decode silent for
-  60 s is killed. The pyramid is cached at `<cache>/kerf/waveforms/<hash>.bin`, keyed
+  (`shared_pyramid`), and the pipe is read on a side thread (`pump_pcm_cancellable`, shared with
+  `cli::waveform`, the in-memory PCM decodes and `pcm::decode_audio_cancellable`) so a decode silent
+  for 60 s is killed and a caller's cancel is polled every 100 ms. The pyramid is cached at `<cache>/kerf/waveforms/<hash>.bin`, keyed
   by path + size + mtime + a format version, written to a temp file and renamed; a
   file that is short, long, the wrong version, inconsistent with its own frame count
   or has a bucket whose min exceeds its max is recomputed, never trusted — and the
@@ -149,7 +150,10 @@ working directory set to the model's folder and both `model=` and `destination=`
 bare file names. Either backend gets its ggml model from `ensure_model`, which
 **downloads it on first use** into `<cache>/kerf/models/ggml-<name>.bin` (streamed with
 progress, `.part` + atomic rename, resumed via a range request, magic-byte checked so an
-error page is never mistaken for a model). Which model: `set_speech_model` (the GUI
+error page is never mistaken for a model; the body is read on a thread, so **no byte for 60 s is a
+stall** — an error that keeps the `.part` for the resume — and Cancel is polled every 200 ms
+whatever the socket is doing; `download_speech_model_cancellable(name, progress, cancel)` is the
+hooked entry point, `download_speech_model` the no-hooks wrapper). Which model: `set_speech_model` (the GUI
 picker, persisted in project meta under `speech_model`) → `KERF_WHISPER_MODEL` (still
 accepts a *path*, for existing setups) → `base`. `KERF_WHISPER_LANGUAGE` sets the
 language hint, `KERF_WHISPER_MODEL_URL` an offline model mirror. `transcription_status()`
@@ -163,9 +167,14 @@ minutes of inference. **A pass is abandonable** (a `CancelFn` alongside the `Pro
 lands between steps, **while a step is still queued for the machine's slot** (`cpu::lease_waiting`
 polls it four times a second, and the check is repeated the instant the slot is taken, so a Stop
 that arrives while queued never starts a whole-file pass) *and* inside transcription — the ffmpeg
-`whisper` run polls it about once a second off `-stats_period 1` and kills the child, and the model
-download polls it per chunk, keeping the `.part` file so the next attempt resumes rather than
-re-fetching 148 MB. A cancelled or failed *step* caches nothing (a half-analyzed kind would read as
+`whisper` run goes through `run_ffmpeg_streamed_in` (`-progress` every half second, cancel polled
+at that rate, killed after 10 minutes with no line) and kills the child, and the model download
+polls it every 200 ms, keeping the `.part` file so the next attempt resumes rather than
+re-fetching 148 MB. **Every step's provider takes the pass's `CancelFn`** (`SilenceDetector`,
+`SceneDetector`, `LoudnessAnalyzer`, `RhythmAnalyzer`, as `Transcriber` always did), so Stop kills
+the whole-file ffmpeg read in flight (`engine-cli.md`, "Every ffmpeg / ffprobe child is
+supervised") rather than waiting out the step, and a step whose decode fails is *failed*, not
+"found nothing". A cancelled or failed *step* caches nothing (a half-analyzed kind would read as
 analyzed, a missing transcript as "no speech"); the steps that finished before it stay cached and
 show done. Analysis runs in the **background lane** of the heavy-job queue (`cpu::in_background`),
 behind exports and preview proxies; transcription takes its slot after its model download, which is
