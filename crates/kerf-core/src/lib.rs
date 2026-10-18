@@ -47,19 +47,20 @@ pub use engine::cpu::{
     set_cpu_percent, set_gpu_lane, DEFAULT_CPU_PERCENT, MAX_GPU_JOBS, MIN_CPU_PERCENT,
 };
 pub use engine::{
-    composite_color_policy, contact_sheet_times, decode_audio, decode_hwaccel, disable_decode_hwaccel, download_speech_model,
-    export_seek_arg, export_still, ffmpeg_command, ffmpeg_path, filmstrip_for, fps_mode_flag, generate_proxy, geq_edge,
-    geq_penultimate_plane, hw_encoders, insta360_pair, limit_ffmpeg_args, limit_frame_args, playback_params, prepare_voiceover,
-    proxy_path, proxy_width, render_variants, render_with, render_with_progress, seek_arg, set_speech_model, source_identity,
-    source_is_indexed_container, source_seek_points_are_keyframes, speech_model_names, stems_status, stitch_insta360,
-    stitched_path, stream_preview, stream_preview_until, stream_preview_with, text_raster_graph, text_still_filter,
-    validate_export, voiceover_status, wav_bytes, waveform_pyramid, waveform_range, waveform_range_of, write_wav, AudioBuffer,
-    Container, DownloadProgress, ExportOptions, ExportProgress, ExportVariant, Filmstrip, FilmstripSheet, Fit, GeqEdge,
-    ImageFormat, LoudnessPreset, PlaybackParams, PlaybackRequest, PreviewFrame, RateControl, Region, RenderStatus, ScrubConfig,
-    ScrubFrames, ScrubStats, SpeechModelInfo, StemsStatus, TextPart, TextRasterGraph, VariantProgress, VoiceInfo,
-    VoiceoverStatus, WaveformLevel, WaveformPyramid, WaveformRange, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT,
-    MAX_FILMSTRIP_FRAMES, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS, MIN_STREAM_FPS,
-    MIN_STREAM_WIDTH, MIN_VOICE_SPEED, STEM_NAMES,
+    composite_color_policy, contact_sheet_times, decode_audio, decode_hwaccel, disable_decode_hwaccel, discard_partial,
+    download_speech_model, download_speech_model_cancellable, export_seek_arg, export_still, export_still_cancellable,
+    ffmpeg_command, ffmpeg_path, file_mtime, filmstrip_for, fps_mode_flag, generate_proxy, geq_edge, geq_penultimate_plane,
+    hw_encoders, insta360_pair, limit_ffmpeg_args, limit_frame_args, playback_params, prepare_voiceover, proxy_path, proxy_width,
+    render_variants, render_with, render_with_progress, seek_arg, set_speech_model, source_identity, source_is_indexed_container,
+    source_seek_points_are_keyframes, speech_model_names, stems_status, stitch_insta360, stitch_insta360_with, stitched_path,
+    stream_preview, stream_preview_until, stream_preview_with, text_raster_graph, text_still_filter, validate_export,
+    voiceover_status, wav_bytes, waveform_pyramid, waveform_range, waveform_range_of, write_wav, AudioBuffer, Container,
+    DownloadProgress, ExportOptions, ExportProgress, ExportVariant, Filmstrip, FilmstripSheet, Fit, GeqEdge, ImageFormat,
+    LoudnessPreset, PlaybackParams, PlaybackRequest, PreviewFrame, RateControl, Region, RenderStatus, ScrubConfig, ScrubFrames,
+    ScrubStats, SpeechModelInfo, StemsStatus, TextPart, TextRasterGraph, VariantProgress, VoiceInfo, VoiceoverStatus,
+    WaveformLevel, WaveformPyramid, WaveformRange, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT, MAX_FILMSTRIP_FRAMES,
+    MAX_STREAM_FPS, MAX_STREAM_WIDTH, MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS, MIN_STREAM_FPS, MIN_STREAM_WIDTH, MIN_VOICE_SPEED,
+    STEM_NAMES,
 };
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;

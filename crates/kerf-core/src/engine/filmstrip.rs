@@ -114,7 +114,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::cli::{
-    command, decode_hwaccel_for_asset, disable_hwaccel, ffmpeg_bin, ffprobe_bin, fnv1a, launch_err, source_hdr, source_key,
+    command, decode_hwaccel_for_asset, disable_hwaccel, ffmpeg_bin, ffprobe_bin, fnv1a, launch_err, reap, source_hdr, source_key,
     tonemap_filter,
 };
 use super::cpu;
@@ -851,7 +851,7 @@ fn pump_raw(mut child: Child, frame_bytes: usize, stall: Duration, on_frames: &m
         let _ = child.kill();
     }
     drop(rx);
-    let status = child.wait().map_err(|e| Error::Engine(format!("ffmpeg wait failed: {e}")))?;
+    let status = reap(&mut child)?;
     let stderr_text = stderr_handle.join().unwrap_or_default();
     let tail = || {
         let mut tail: Vec<&str> = stderr_text.lines().rev().take(12).collect();

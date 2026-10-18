@@ -545,7 +545,9 @@ fn scenes_on_proxy_rgb_sources_are_read_from_the_original_for_scores() {
         assert_eq!(Project::scoring_proxy(&asset), None, "{name}");
         assert_eq!(Project::sheet_proxy(&asset).as_deref(), Some(proxy.as_path()), "{name}");
         assert_eq!(
-            FfmpegSceneDetector::default().detect_scenes(&asset).unwrap(),
+            FfmpegSceneDetector::default()
+                .detect_scenes(&asset, crate::analysis::NEVER_CANCEL)
+                .unwrap(),
             detect_scenes(&clip, 0.4).unwrap(),
             "{name}: the detector reads the original"
         );
@@ -701,19 +703,23 @@ fn scenes_on_proxy_the_detector_reads_a_ready_proxy_and_falls_back_to_the_origin
     let want = detect_scenes(&original, 0.4).unwrap();
     let detector = FfmpegSceneDetector::default();
     assert_eq!(Project::scoring_proxy(&asset), None, "no proxy yet");
-    assert_eq!(detector.detect_scenes(&asset).unwrap(), want, "no proxy: the original");
+    assert_eq!(
+        detector.detect_scenes(&asset, crate::analysis::NEVER_CANCEL).unwrap(),
+        want,
+        "no proxy: the original"
+    );
 
     let proxy = generate_proxy(&original, PROXY_MAX_WIDTH).expect("proxy");
     let _cleanup = ProxyGuard(proxy.clone());
     assert_eq!(Project::scoring_proxy(&asset).as_deref(), Some(proxy.as_path()));
-    let from_proxy = detector.detect_scenes(&asset).unwrap();
+    let from_proxy = detector.detect_scenes(&asset, crate::analysis::NEVER_CANCEL).unwrap();
     assert_eq!(from_proxy.len(), want.len());
     for (g, w) in from_proxy.iter().zip(&want) {
         assert!((g - w).abs() < SAME_FRAME, "{from_proxy:?} against {want:?}");
     }
 
     std::fs::copy(&other, &proxy).unwrap();
-    let swapped = detector.detect_scenes(&asset).unwrap();
+    let swapped = detector.detect_scenes(&asset, crate::analysis::NEVER_CANCEL).unwrap();
     assert_eq!(
         swapped.len(),
         1,
@@ -723,7 +729,7 @@ fn scenes_on_proxy_the_detector_reads_a_ready_proxy_and_falls_back_to_the_origin
 
     std::fs::write(&proxy, b"not a movie").unwrap();
     assert_eq!(
-        detector.detect_scenes(&asset).unwrap(),
+        detector.detect_scenes(&asset, crate::analysis::NEVER_CANCEL).unwrap(),
         want,
         "a proxy that does not read: the original"
     );

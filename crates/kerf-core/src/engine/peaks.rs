@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::cli::{bg_command, command, ffmpeg_bin, ffprobe_bin, fnv1a, launch_err, source_key};
+use super::cli::{bg_command, command, ffmpeg_bin, ffprobe_bin, fnv1a, launch_err, reap, source_key};
 use super::cpu;
 use crate::error::{Error, Result};
 
@@ -658,7 +658,23 @@ pub(super) fn drain_tail(mut stderr: impl Read) -> String {
 /// and hand them, whole frames only, to `on_frames`, until it ends. A child that
 /// produces nothing for `stall` is killed and the call fails; a non-zero exit
 /// fails it too. Always reaps the child.
-pub(super) fn pump_pcm(mut child: Child, frame_bytes: usize, stall: Duration, on_frames: &mut dyn FnMut(&[f32])) -> Result<()> {
+pub(super) fn pump_pcm(child: Child, frame_bytes: usize, stall: Duration, on_frames: &mut dyn FnMut(&[f32])) -> Result<()> {
+    pump_pcm_cancellable(child, frame_bytes, stall, &|| false, on_frames)
+}
+
+/// How often [`pump_pcm_cancellable`] looks at its cancel while the decoder is quiet.
+const PUMP_POLL: Duration = Duration::from_millis(100);
+
+/// [`pump_pcm`] for a job someone can stop: `cancel` is polled between chunks and every
+/// [`PUMP_POLL`] while the decoder is silent; once true the child is killed and the call is
+/// [`Error::Cancelled`] (whatever `on_frames` had been handed stays handed).
+pub(super) fn pump_pcm_cancellable(
+    mut child: Child,
+    frame_bytes: usize,
+    stall: Duration,
+    cancel: &dyn Fn() -> bool,
+    on_frames: &mut dyn FnMut(&[f32]),
+) -> Result<()> {
     let stderr = child.stderr.take().expect("stderr piped");
     let stderr_handle = std::thread::spawn(move || drain_tail(stderr));
 
@@ -687,9 +703,12 @@ pub(super) fn pump_pcm(mut child: Child, frame_bytes: usize, stall: Duration, on
     // here for the next one.
     let mut pending: Vec<u8> = Vec::new();
     let mut floats: Vec<f32> = Vec::new();
+    let mut heard = Instant::now();
+    let mut cancelled = false;
     let failure = loop {
-        match rx.recv_timeout(stall) {
+        match rx.recv_timeout(stall.min(PUMP_POLL)) {
             Ok(Ok(bytes)) => {
+                heard = Instant::now();
                 pending.extend_from_slice(&bytes);
                 let whole = pending.len() / frame_bytes * frame_bytes;
                 if whole > 0 {
@@ -702,20 +721,29 @@ pub(super) fn pump_pcm(mut child: Child, frame_bytes: usize, stall: Duration, on
             Ok(Err(e)) => break Some(format!("waveform read failed: {e}")),
             Err(RecvTimeoutError::Disconnected) => break None,
             Err(RecvTimeoutError::Timeout) => {
-                break Some(format!(
-                    "waveform decode stalled: ffmpeg produced no audio for {}s",
-                    stall.as_secs_f32()
-                ));
+                if heard.elapsed() >= stall {
+                    break Some(format!(
+                        "waveform decode stalled: ffmpeg produced no audio for {}s",
+                        stall.as_secs_f32()
+                    ));
+                }
             }
+        }
+        if cancel() {
+            cancelled = true;
+            break None;
         }
     };
 
-    if failure.is_some() {
+    if failure.is_some() || cancelled {
         let _ = child.kill();
     }
     drop(rx);
-    let status = child.wait().map_err(|e| Error::Engine(format!("ffmpeg wait failed: {e}")))?;
+    let status = reap(&mut child)?;
     let stderr_text = stderr_handle.join().unwrap_or_default();
+    if cancelled {
+        return Err(Error::Cancelled);
+    }
     let tail = || {
         let mut tail: Vec<&str> = stderr_text.lines().rev().take(12).collect();
         tail.reverse();
@@ -1619,6 +1647,44 @@ mod tests {
         .to_string();
         assert!(err.contains("stalled"), "{err}");
         assert_eq!(got, [0.5, 0.25]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_stops_a_decode_that_is_still_producing() {
+        let started = Instant::now();
+        let mut got = 0usize;
+        let err = pump_pcm_cancellable(
+            fake_decoder("while true; do printf 'aaaa'; sleep 0.02; done"),
+            4,
+            Duration::from_secs(30),
+            &|| started.elapsed() > Duration::from_millis(400),
+            &mut |f| got += f.len(),
+        )
+        .expect_err("cancelled");
+        assert!(matches!(err, Error::Cancelled), "{err:?}");
+        assert!(got > 0, "what had arrived was delivered");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "killed promptly: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_reaches_a_decode_that_is_silent() {
+        let started = Instant::now();
+        let err = pump_pcm_cancellable(
+            fake_decoder("exec sleep 60"),
+            4,
+            Duration::from_secs(30),
+            &|| started.elapsed() > Duration::from_millis(300),
+            &mut |_| {},
+        )
+        .expect_err("cancelled");
+        assert!(matches!(err, Error::Cancelled), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
     }
 
     #[cfg(unix)]

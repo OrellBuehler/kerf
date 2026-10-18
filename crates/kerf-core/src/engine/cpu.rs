@@ -446,12 +446,15 @@ static GPU_LANE: AtomicU8 = AtomicU8::new(0);
 /// decodes. Callers must not hold the project lock across this — the wait is
 /// unbounded by design (a queued job waits out the render ahead of it). A job that has a
 /// cancel flag and a way to speak ([`lease_waiting`]) should use that instead: it can say
-/// why it waits and be stopped while it does.
+/// why it waits and be stopped while it does. Every job in the engine does, so this is what the
+/// gate's own tests take.
+#[cfg(test)]
 pub fn lease() -> Lease {
     lease_priority(lane())
 }
 
 /// [`lease`] in the given lane.
+#[cfg(test)]
 pub fn lease_priority(priority: Priority) -> Lease {
     settled(acquire(Resource::Cpu, priority, false, &mut |_| {}, &|| false))
 }
@@ -484,6 +487,7 @@ pub fn lease_gpu_priority_waiting(priority: Priority, on_wait: &mut dyn FnMut(Wa
 }
 
 /// An acquisition that cannot be cancelled has no `Err` to report.
+#[cfg(test)]
 fn settled(lease: Result<Lease>) -> Lease {
     match lease {
         Ok(lease) => lease,

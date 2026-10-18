@@ -133,6 +133,55 @@ so the feature is **only** activated through these forwards — which is what ma
   (a 4:2:2 4K sheet is silent for the whole decode: 29 to 39 s measured).
   `salience_map` (smart crop, framing) stays on the original: its crop moved by up to 4.6 % of the
   frame width between original and proxy.
+  **Every ffmpeg / ffprobe child is supervised: nothing waits for one for ever, and a job's
+  Stop reaches the child, not just the gap before the next one.** Four shapes, by what the read is.
+  *Whole-file reads with a `-progress` stream* (`detect_silence_cancellable`, the scene pass,
+  `measure_loudness_cancellable`, `salience_map_cancellable`) go through `output_supervised(cmd,
+  stall, total, cancel)`: `-progress pipe:2` at spawn time, killed after `READ_STALL` of stderr
+  silence (or an optional wall-clock `total`, for a read with no progress to hear; pass
+  `Duration::MAX` as the stall), `cancel` polled 50 times a second (`Collected.cancelled`, mapped to
+  `Error::Cancelled`), and the lease taken with `cpu::lease_waiting(.., cancel)` (the plain `cpu::lease()` is
+  test-only now; a free slot is
+  taken without a look at the cancel, so each also checks it once after the lease).
+  *PCM decodes* (`decode_audio_mono_f32` behind rhythm / energy / in-process whisper,
+  `pcm::decode_audio_cancellable` behind stems, `waveform`) stream stdout through
+  `peaks::pump_pcm_cancellable`: killed after a stall of no audio, cancel polled every 100 ms.
+  *Moment reads and probes* (`probe`, `run_frame_decode`, `audio_pcm`, the once-per-process
+  capability probes `zscale_available` / `help_flags` / `alimiter_latency_available` /
+  `whisper::filter_available`) use `output_bounded` with a wall-clock limit (60 s probe and
+  capability, 120 s a frame, 60 s an audio window); a capability probe that times out reads as
+  "cannot run at all", like a binary that will not start. *Streamed jobs* (export, proxy,
+  stitch, whisper filter) use `run_ffmpeg_progress_as` / `run_ffmpeg_streamed_in`: stall bound
+  plus cancel, then `reap`. **`reap(child)` is the only way to `wait()` on a child whose pipes
+  have closed**: 30 s of grace, then kill (`child.wait()` after a pipe closes blocked for good on a
+  muxer flushing to a share that went away). The in-process libav probe (`ffmpeg` feature) runs on
+  a thread and is abandoned after 60 s (`probe_within`; the thread cannot be killed, it holds
+  only the path). **A failed decode is an error, never an empty answer**: a `silencedetect` or
+  scene pass that exits non-zero, and a `loudnorm` run that does (it prints its summary on the way
+  out, a plausible number for a file never read to its end), fail with ffmpeg's last words;
+  the one non-zero exit that is an answer is a file with no stream of that kind ("Output file
+  does not contain any stream": no silence, no cuts), as the `0:a:0?` / `0:v:0?` maps always
+  meant. Analysis threads the pass's cancel into the providers (`SilenceDetector::detect_silence`
+  / `SceneDetector::detect_scenes` / `LoudnessAnalyzer::measure` / `RhythmAnalyzer::analyze_rhythm`
+  all take a `CancelFn`), so Stop ends the step in flight. `fn` pairs: the plain name is the
+  no-cancel wrapper where something outside the engine uses it (`export_still`,
+  `stitch_insta360`, `download_speech_model`, `Project::probe_import`, `render_still`,
+  `sample_smart_crops`, `sample_framings`), `_cancellable` / `_with` the hooked one. The smart-crop
+  samplers report the fraction of clips done (`progress(f32)`, `0.0` first) and a stop is `Cancelled`, not a
+  skipped clip; the cover (`Project::render_still_cancellable`) has no fraction to report, only a cancel.
+  **A render that fails or is cancelled removes what it wrote**: `render_with_progress` (and so
+  `render_variants`, one call per variant) wraps the run in `discarding_partial` — `file_mtime`
+  before, `discard_partial(path, before)` after anything but `Completed` — which removes the
+  output only if this run touched it (`mtime != before`), so a cancel while queued, or a failure
+  before ffmpeg opened the output (bad options, a source that will not open), leaves last week's
+  export at that path alone. Never an unconditional `remove_file` after a cancel. Same for
+  `export_still_cancellable` (a cover) and `stitch_insta360_with` (the `.part` goes, and a
+  cancelled run is `Err(Cancelled)`, never renamed into the cache). The two-pass stats files are
+  a drop guard, so a failed first pass cleans them too.
+  **The speech-model download** (`download.rs`) reads its body on a thread: no byte for 60 s is a
+  *stall* (error, `.part` kept for the resume), Cancel is polled every 200 ms whatever the socket
+  is doing, and the request has resolve / send / response timeouts (a connect timeout was all it
+  had; a quiet connection blocked the read for good, deaf to Cancel).
   **A proxy reports, can be abandoned, and cannot hang.** `generate_proxy_with(src, width,
   ProxyRun { reservation, duration, progress, cancel })` is `generate_proxy` with hooks (the
   latter is it with none): the encode runs through `run_ffmpeg_streamed`, which writes
@@ -662,8 +711,14 @@ so the feature is **only** activated through these forwards — which is what ma
   x/y made every animated clip and every animated overlay abort the render with
   `No such filter`, invisibly, because the graph *string* looked right and every
   unit test asserted on the string. Free-form strings get the same care: overlay /
-  box / chroma-key colours pass `valid_color` (else a safe default — a `.kerf` file
-  never goes through `validate_export`), `pix_fmt` / `scaler` / `gif_dither` are
+  box / chroma-key colours pass `valid_color` (`engine/colors.rs`; else a safe default — a `.kerf` file
+  never goes through `validate_export`), which is **ffmpeg's own grammar, not "looks like a
+  colour"**: a name from `av_parse_color`'s table (lower-cased, binary-searched; `grey`, `darkgrey`,
+  `lightgray`, `rebeccapurple` and `transparent` are *not* in it), `#RRGGBB[AA]` or `0xRRGGBB[AA]`
+  (lower-case `0x` only; `#RGB` is refused by ffmpeg), each with an optional `@alpha` that is a
+  decimal `0..=1` or `0x0..0xff` — never `random` (a new colour per parse, so preview and export
+  disagree). `every_name_is_parsed_by_ffmpeg` (`#[ignore]`d) renders every table name, both cases,
+  and the hex / alpha forms through the real binary, `pix_fmt` / `scaler` / `gif_dither` are
   allow-listed, and overlay text escapes `%` as `\\%` (a bare `%` makes
   `drawtext` render nothing while ffmpeg exits 0). **Text overlays** (`Timeline.overlays`) are
   `drawtext`'d onto the final composite (animated x/y/alpha exprs when keyframed); the
@@ -841,7 +896,10 @@ so the feature is **only** activated through these forwards — which is what ma
   can't write an `sv3d` box) with the originals kept in `Asset.source_paths`.
   It is a full re-encode (~2x realtime in software, far faster on a GPU), so it
   streams progress (`import-progress`
-  in the app), is serialized per pair, and dedupes via `insert_or_get_asset` —
+  in the app; `stitch_insta360_with` / `Project::probe_import_with` also take a cancel, polled
+  while it waits on the same pair's other stitch, for the slot, and while it encodes), is serialized
+  per pair (a claim on the cache file in a set + condvar, never a mutex held across the encode; a
+  waiting stitch polls its cancel every 100 ms and takes the other's result when it lands), and dedupes via `insert_or_get_asset` —
   importing the other lens afterwards is a cache hit resolving to the same asset.
   Each input gets a **per-input `-ss` fast-seek** to its clip's source-window
   start (shared `clip_source_window`/`clip_seek`, frame-accurate against the
@@ -859,7 +917,8 @@ so the feature is **only** activated through these forwards — which is what ma
   skipped to the next frame (`a_still_picks_the_frame_at_a_fine_time_base_second`,
   `#[ignore]`d, both FFmpegs). `render_with_progress` streams ffmpeg's `-progress` to
   report `{fraction, elapsed_secs, eta_secs}` and polls a cancel callback (killing ffmpeg →
-  `RenderStatus::Cancelled`); `render_with` is the no-op-callback wrapper.
+  `RenderStatus::Cancelled`, the partial output removed — see `discard_partial` above);
+  `render_with` is the no-op-callback wrapper.
   `audio_pcm` decodes a source window to raw mono s16le PCM (input-side `-ss`) —
   the GUI's Web Audio preview playback fetches clip audio through it.
   **Playback is a real video stream**, not a slideshow: `stream_preview` hands a
