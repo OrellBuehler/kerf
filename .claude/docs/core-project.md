@@ -26,6 +26,49 @@
   follows the mode, re-reading its clip like `trim`; `split_remove_clips` is that
   for a group — one revision (`Split and remove left (2 clips)`), the single-clip
   `split_remove` being a group of one. All of them refuse a locked track.
+  **Two counters tell the app that the project under a job is not the one it left.**
+  `generation()` moves when `replace_with` swaps a project in (open / new): a job notes it
+  when it resolves its inputs under the lock and drops its result if it changed. `change_count()`
+  is SQLite's `total_changes` — every row written through the connection (analysis merges,
+  ripple mode, meta, a declined proxy …), so "did anything write while the lock was released?"
+  is two numbers, not a content fingerprint. `merge_analysis` / `set_analysis` (and
+  `place_stems`) answer `AssetNotFound` for an asset that is gone instead of writing for nothing.
+  **`save_as` is atomic**: `VACUUM INTO` a temporary file beside the destination, then rename; a
+  failure leaves the destination as it was (it used to be deleted first), and saving onto the
+  file the project is open on is a no-op. **`insert_asset` is an upsert** (`ON CONFLICT … DO
+  UPDATE`), never `INSERT OR REPLACE`: replacing deletes the row first and `analysis` hangs off it
+  with `ON DELETE CASCADE`, so marking an asset 360 used to drop its transcript.
+  **The media library**: `missing_assets()` (a stat per asset, with the clips that use each),
+  `relink_asset(id, path)` / the lock-free split `probe_asset` → `apply_relink(id, &probed)`
+  (same kinds of stream, length within `RELINK_DURATION_TOLERANCE` s or 1 %; **analysis is kept
+  only for the same media moved** — same length to the millisecond, same streams, same size when
+  the old file is still there — otherwise dropped; a hand-set projection and the id, name and
+  clips carry over) and `remove_asset(id, force)` (`AssetInUse` while a clip of the live cut or the
+  proposal uses it; `force` removes those clips as one never-rippling `Remove media` revision and
+  strips the proposal and a kept discarded one). Both are the user's: refused for an agent while
+  review is on. Caches keyed by the file's path / size / mtime are cleaned by the static
+  `forget_media_caches(path)`, which probes and so runs with the lock released.
+  **Paths**: `probe_asset` (so every import) wants an absolute path to an existing regular file
+  and refuses `http:` / `concat:` / `pipe:` strings and relative paths (`paths.rs`);
+  `check_output_path(out)` refuses an export onto an asset's source, a stitched capture file, the
+  project database and its journal, or anything inside Kerf's cache, canonicalised so a symlink,
+  hard link or `..` detour cannot hide it — `export`, `export_with` and `export_still` call it, and an
+  adapter that renders with the lock released calls it first, under the lock. `history_page(Page)` /
+  `list_tasks_page(Page)` window a long list from the newest end (`Page { limit, offset }`) and
+  return the total.
+  **What a setter accepts is checked where it is set**: a non-finite number is refused by every
+  numeric setter and, as the net under all of them, by the serde walk every stored timeline
+  goes through (`core-model.md`); `set_volume` clamps to `MAX_CHANNEL_VOLUME` like the track and
+  master faders; overlay / marker / chroma-key colours go through `valid_color` when set;
+  audio effect parameters are held to the ranges of the FFmpeg filters they become (`acompressor`:
+  threshold −60..0 dB, ratio 1..20, attack 0.01..2000 ms, release 0.01..9000 ms, makeup 0..36 dB;
+  `agate` ≤ 0 dB; EQ gain ±900 dB; frequencies above 0 up to 999999 Hz — an `#[ignore]`d test runs
+  every boundary through the real ffmpeg), video effects likewise (`gblur` 0..1024, `unsharp`
+  −2..5, `chromakey` similarity ≥ 1e-5); a clip added or trimmed stays inside its footage
+  (`source_in ≥ 0`, `source_out ≤` the asset's length, a still has no end), the new/trimmed clip
+  may not land on another clip of its lane (checked after the ripple, so ripple mode still
+  pushes the later clips along), and `add_clip_to_timeline` keeps the track sorted;
+  `set_speed` is held to `MIN_SPEED..=MAX_SPEED`.
   `Project::sample()` seeds an in-memory demo (two assets + analysis + a starter
   timeline + a sample task queue); it backs the kerf-core tests, but the app now
   launches with an **empty** `Project::open_in_memory()` — the user imports media or
@@ -101,6 +144,46 @@
   edits) and `remove_task` discards it. `diff_revisions` / `revision_diff` point
   the same diff at the stored history snapshots, so the edit log can say what an
   edit did rather than only which operation ran.
+  **Review is the default (`set_agent_review`, on; the app sets it from Settings, it is not in the
+  file and survives `replace_with`).** With it on, an `Agent`-actor edit with no session open
+  *opens one* (in the same transaction as the edit, so a failing edit leaves no empty proposal),
+  and an agent can neither land a proposal nor rewind the user's history: `apply_staged` (`force`
+  included), `apply_staged_subset`, `resolve_task` of a task with staged edits, and
+  `undo`/`redo`/`revert_to` as the agent are refused (`AgentReviewRequired` / an
+  `InvalidArgument` for the history) — the actor on the lock *is* the "initiated by" argument.
+  Off, an agent edits live unless a session is open. **A proposal has an owner** (the MCP
+  session id, `staged.owner`): the adapter calls `ensure_agent_staging(owner)` inside the same
+  lock as an agent edit — it records which session is acting (`set_actor` forgets it at every
+  lock), opens the session when review is on, lets a session with no owner (a claimed task's) be
+  adopted by the first named editor, and answers `StagedEditOwnedByOther` to a different
+  session; a caller that names nobody is "different" from an owner. Apply, discard and undo
+  by a non-owner agent are refused the same way (the tool that only ends a proposal calls
+  `declare_agent(owner)`, which records the session without opening anything); the user (GUI)
+  is never refused.
+  `claim_next_task(owner)` / `begin_staging(task, note, owner)` open a session for a given owner.
+  **Asset-level agent writes are staged too**: `set_asset_projection` as the agent records a
+  `StagedAssetChange` in the proposal (the `staged.assets` column) instead of rewriting the
+  library, the agent's own `get_asset` / `list_assets` read through the pending changes (the
+  user's do not), and accepting writes them (no revision — the library is not in the edit
+  history); asking for what the library already has stages nothing.
+  **Undo inside a proposal**: every step pushes the previous state onto `staged_undo` (a table, so
+  an edit writes one timeline copy, not twenty), bounded at `STAGED_UNDO_DEPTH` (20) and emptied
+  with the proposal; `undo_staged()` pops one — returning its label and the proposal —
+  timeline edits and held-back asset changes alike. **Partial accept**:
+  `apply_staged_subset(entry_ids, force)` takes ids from `staged.diff.entries[].id` (or an
+  `asset_changes[].id`), writes them onto the live cut with `Timeline::merge_subset`
+  (`core-model.md`) as one `Agent edit (k of n changes)` revision and reports what it did in a
+  `SubsetApplied` (`auto_included` with reasons, `skipped`, `remaining`, `closed`, a
+  `message`). The rest of the proposal **stays open, re-based onto the cut as it now is**
+  (`base` and `base_seq` move; the full proposed timeline is kept, so the remaining diff is
+  exactly what was not picked); it closes when nothing is left. **Discard is restorable**:
+  `discard_staged` keeps a non-empty proposal in `meta` (`discarded_staged`, in the file, so it
+  survives a restart); `discarded_staged()` previews it and `restore_discarded()` brings it
+  back — only with no proposal open (`StagedEditPending`), once, possibly `stale`, with no undo
+  history, owned by no session when the user restores it, with its task dropped if that was
+  dismissed. An empty proposal is not kept and does not replace one that is. The `staged` table
+  gained `owner` and `assets` (added by `init`'s probe-and-`ALTER`, like `voiceover`; an older
+  file's open proposal loads with no owner and no asset changes).
   `plan_music_fit(clip, target)` / `fit_music(clip, target, fade_out)` fit a music clip on
   an audio track (normal speed, unlinked, with a cached `AssetAnalysis.music`) to `target`
   or, by default, the picture's end minus the clip's start; `fit_music` replaces the clip

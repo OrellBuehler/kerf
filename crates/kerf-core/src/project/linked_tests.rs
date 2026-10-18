@@ -527,7 +527,8 @@ fn a_trim_that_would_carry_the_sound_over_an_unlinked_clip_is_refused_like_a_mov
 fn a_staged_trim_is_lane_checked_too_and_a_refusal_leaves_the_proposal_alone() {
     let (mut p, pic, sound, _) = pair_before_a_voiceover();
     p.set_actor(EditSource::Agent);
-    p.begin_staging(None, None).unwrap();
+    p.set_agent_review(false);
+    p.begin_staging(None, None, None).unwrap();
     let before = p.staged().unwrap().unwrap().edits.len();
     let err = p.trim(pic, None, Some(6.5), None).unwrap_err().to_string();
     assert!(err.contains("A1") && err.contains("not linked to it"), "{err}");
@@ -555,8 +556,12 @@ fn ripple_that_makes_room_lets_the_carried_sound_extend_but_a_move_by_trim_is_st
 #[test]
 fn an_overlap_that_was_already_there_is_not_the_trims_to_refuse() {
     let (p, pic, sound, vo) = pair_before_a_voiceover();
-    // The voice-over already runs under the sound's tail (put there by hand, links off).
-    p.with_links(Some(false), |p| p.trim(sound, None, Some(7.0), None)).unwrap();
+    // The voice-over already runs under the sound's tail (a project from before a trim refused to
+    // run into a neighbour; the trim itself would be refused now, so the overlap is written directly).
+    let mut tl = timeline(&p);
+    let (ti, ci) = tl.locate(sound).unwrap();
+    tl.tracks[ti].clips[ci].source_out = 7.0;
+    p.save_timeline(&tl).unwrap();
     assert_eq!(span(&p, sound), (0.0, 7.0));
     // Shortening the picture's tail by a second does not go near it: the sound's tail is not shared.
     p.trim(pic, None, Some(4.0), None).unwrap();
@@ -803,8 +808,9 @@ fn duplicating_a_pair_links_the_copies_to_each_other_and_a_lone_copy_to_nothing(
 fn staged_agent_edits_propagate_in_the_proposal_and_not_the_live_cut() {
     let mut cut = detached_cut();
     cut.project.set_actor(EditSource::Agent);
+    cut.project.set_agent_review(false);
     let p = &cut.project;
-    p.begin_staging(None, Some("tighten")).unwrap();
+    p.begin_staging(None, Some("tighten"), None).unwrap();
     p.move_clip(cut.c[1], 20.0, None).unwrap();
     assert_eq!(span(p, cut.c[1]), (10.0, 16.0), "the live cut did not move");
     let staged = p.staged_timeline().unwrap().unwrap();
@@ -828,7 +834,8 @@ fn a_proposal_that_only_links_or_detaches_is_not_thrown_away_as_empty() {
         .add_clip_to_timeline(asset.id, Some(timeline(&project).tracks[A1].id), 0.0, 10.0, Some(0.0))
         .unwrap();
     project.set_actor(EditSource::Agent);
-    project.begin_staging(None, None).unwrap();
+    project.set_agent_review(false);
+    project.begin_staging(None, None, None).unwrap();
     project.link_clips(&[c.id, a.id]).unwrap();
     let staged = project.staged().unwrap().unwrap();
     assert!(!staged.diff.is_empty(), "linking is a change a reviewer must see");
@@ -836,13 +843,13 @@ fn a_proposal_that_only_links_or_detaches_is_not_thrown_away_as_empty() {
     project.apply_staged(false).unwrap();
     assert!(clip_of(&project, c.id).link_id.is_some());
 
-    project.begin_staging(None, None).unwrap();
+    project.begin_staging(None, None, None).unwrap();
     project.unlink_clips(&[c.id]).unwrap();
     project.apply_staged(false).unwrap();
     assert!(clip_of(&project, c.id).link_id.is_none());
 
     // Muting a picture's own sound alone is a change too.
-    project.begin_staging(None, None).unwrap();
+    project.begin_staging(None, None, None).unwrap();
     project.detach_audio(c.id).unwrap();
     let diff = project.staged().unwrap().unwrap().diff;
     assert!(diff.summary().contains("own sound off"), "{}", diff.summary());
@@ -1665,8 +1672,9 @@ fn an_edit_that_leaves_a_link_with_one_clip_dissolves_it() {
 fn a_dissolve_also_happens_in_a_staged_proposal() {
     let mut cut = detached_cut();
     cut.project.set_actor(EditSource::Agent);
+    cut.project.set_agent_review(false);
     let p = &cut.project;
-    p.begin_staging(None, None).unwrap();
+    p.begin_staging(None, None, None).unwrap();
     let a1 = timeline(p).tracks[A1].id;
     p.remove_track(a1).unwrap();
     let staged = p.staged_timeline().unwrap().unwrap();
@@ -1687,8 +1695,9 @@ fn a_project_with_no_links_is_known_to_have_none_without_reading_the_timeline() 
     // A staged proposal is judged by its own timeline, not the live one.
     let mut project = project;
     project.set_actor(EditSource::Agent);
+    project.set_agent_review(false);
     let p = &project;
-    p.begin_staging(None, None).unwrap();
+    p.begin_staging(None, None, None).unwrap();
     assert!(!p.working_has_links().unwrap());
     p.link_clips(&[c.id, timeline(p).tracks[A1].clips[0].id]).unwrap();
     assert!(p.working_has_links().unwrap());
@@ -1806,8 +1815,9 @@ fn a_sound_trimmed_to_make_room_is_said_in_the_revision_label() {
     // …in a staged proposal as in the live cut.
     let (mut project, [x1, _, _, _]) = jl_pairs();
     project.set_actor(EditSource::Agent);
+    project.set_agent_review(false);
     project.set_ripple_mode(true).unwrap();
-    project.begin_staging(None, None).unwrap();
+    project.begin_staging(None, None, None).unwrap();
     project.trim(x1, None, Some(12.0), None).unwrap();
     assert_eq!(
         project.staged().unwrap().unwrap().edits,

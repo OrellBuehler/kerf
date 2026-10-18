@@ -528,8 +528,8 @@ fn special_cases() -> Vec<Case> {
         ));
     }
 
-    // Both lanes pushed by different amounts: a ripple trim that the partner can only follow part
-    // way (its footage runs out), so the track of the clip that was named has to speak for the group.
+    // A ripple trim out to the very end of the footage (a trim past it is refused): the lane of the
+    // clip that was named speaks for the group, whichever of the two it was.
     {
         let mut ids = Ids::new();
         let (x, x2) = (ids.clip(AV, 45.0, 55.0, 5.0), ids.clip(AV, 0.0, 10.0, 15.0));
@@ -544,7 +544,7 @@ fn special_cases() -> Vec<Case> {
             ("a ripple trim named by the picture: its track speaks for the group", x.id),
             ("a ripple trim named by the sound: its track speaks for the group", y.id),
         ] {
-            let mut c = case(name, t.clone(), json!({"kind": "trim", "clip_id": named, "source_out": 65.0}));
+            let mut c = case(name, t.clone(), json!({"kind": "trim", "clip_id": named, "source_out": 60.0}));
             c.ripple = true;
             out.push(c);
         }

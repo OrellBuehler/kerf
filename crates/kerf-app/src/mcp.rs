@@ -3076,7 +3076,7 @@ impl KerfMcp {
     )]
     fn stage_edits(&self, Parameters(p): Parameters<StageEditsParams>) -> Result<String, McpError> {
         self.edit(|project| {
-            let staged = project.begin_staging(None, p.note.as_deref()).map_err(core_err)?;
+            let staged = project.begin_staging(None, p.note.as_deref(), None).map_err(core_err)?;
             json(&staged)
         })
     }
@@ -3463,7 +3463,7 @@ impl KerfMcp {
     #[tool(description = "Claim the oldest queued task (marks it working) and return it; returns null when the queue is empty")]
     fn claim_next_task(&self) -> Result<String, McpError> {
         self.edit(|project| {
-            let task = project.claim_next_task().map_err(core_err)?;
+            let task = project.claim_next_task(None).map_err(core_err)?;
             json(&task)
         })
     }
