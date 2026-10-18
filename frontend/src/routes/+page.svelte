@@ -25,6 +25,7 @@
 	import { settings } from '$lib/settings.svelte';
 	import { mediaStatus } from '$lib/media-status.svelte';
 	import { workspace } from '$lib/workspace.svelte';
+	import { resetAllWorkspacesAsked } from '$lib/workspace-actions';
 	import { popout } from '$lib/popout.svelte';
 	import { windows } from '$lib/windows.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
@@ -52,10 +53,12 @@
 		askUnsaved,
 		inTauri,
 		isMediaPath,
-		confirmAction,
 		onAnalysisProgress,
 		onAnalysisStatus,
+		onImportProgress,
+		onModelProgress,
 		onProxyProgress,
+		onSmartCropProgress,
 		onWindowCloseRequested,
 		openReleases,
 		quitApp,
@@ -70,11 +73,11 @@
 	import { afterPaint, fontsReady, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
 	import { tip } from '$lib/tip';
-	import { CONFIRM, UNSAVED, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
+	import { UNSAVED, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
 	import { changeIndex, changePoints, stepChange } from '$lib/staged-diff';
 	import { clampPlayhead, secondFrames, stepFrames } from '$lib/frames';
+	import type { SettingsView } from '$lib/types';
 	import { isPagingKey, onEditorSurface } from '$lib/focus-area';
-	import type { ModelProgress } from '$lib/types';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
 	 *  may fire: Space / Delete / J-K-L would edit the live project under it. */
@@ -174,6 +177,12 @@
 		// (an agent's runs included) — the bin's badges and chips read them.
 		void onProxyProgress((s) => mediaStatus.noteProxy(s)).then((un) => unlisteners.push(un));
 		void onAnalysisStatus((s) => mediaStatus.noteAnalysis(s)).then((un) => unlisteners.push(un));
+		// Only a 360 lens pair reports an import's progress — its stitch is a full re-encode, so the import
+		// overlay shows how far along it is (and Stop). A speech model's download reports its bytes; a smart
+		// crop reports the shots sampled so far.
+		void onImportProgress((p) => (editor.importProgress = p.fraction)).then((un) => unlisteners.push(un));
+		void onModelProgress((p) => ui.noteModelProgress(p)).then((un) => unlisteners.push(un));
+		void onSmartCropProgress((p) => (editor.smartCropProgress = p.fraction)).then((un) => unlisteners.push(un));
 		// Analysis names its step as it goes — transcription in particular downloads a model and then runs for
 		// minutes. (The browser harness simulates the ticks.)
 		void onAnalysisProgress((p) => ui.noteAnalysisProgress(p)).then((un) => unlisteners.push(un));
@@ -268,19 +277,11 @@
 					// menu does, so reload everything it showed (the backend already refused to drop
 					// unsaved work unless the agent was told to).
 					await listen('project-replaced', () => void onProjectReplaced()),
+					// An agent changed a setting (MCP `set_settings`): the dialog and everything backed by one follows.
+					await listen<SettingsView>('settings-changed', (e) => settings.noteChanged(e.payload)),
 					// Likewise the ripple flag: an agent that flips it changes what
 					// the user's next trim or delete does, so the toolbar has to say.
-					await listen('ripple-mode-changed', () => void onRippleChanged()),
-					// Only a 360 lens pair reports here — its stitch is a full
-					// re-encode, so the import overlay shows how far along it is.
-					await listen<{ fraction: number }>(
-						'import-progress',
-						(e) => (editor.importProgress = e.payload.fraction)
-					),
-					await listen<ModelProgress>(
-						'model-progress',
-						(e) => (ui.modelFraction = e.payload.fraction ?? 0)
-					)
+					await listen('ripple-mode-changed', () => void onRippleChanged())
 				);
 				// A `.kerf` on the command line of this very launch (a second launch's
 				// arrives as the events above, unless it came while this page was still
@@ -390,12 +391,8 @@
 
 	/** Window › Reset all workspaces throws away every arrangement made, so it asks first
 	 *  — unless there is none to lose, when it only rebuilds the one on screen. */
-	async function resetAllWorkspaces() {
-		const w = settings.workspaces;
-		const stored = Object.keys(w.layouts).length > 0 || Object.keys(w.library.tabs).length > 0;
-		const reset = CONFIRM.resetWorkspaces;
-		if (stored && !(await confirmAction(reset.message, reset.title, reset))) return;
-		workspace.resetAll();
+	function resetAllWorkspaces() {
+		return resetAllWorkspacesAsked();
 	}
 
 	function onAbout() {

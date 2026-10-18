@@ -22,6 +22,8 @@
 	import { audioExtraction, mediaInfo, shortPath, specLine, thumbTime, type MediaInfo } from '$lib/media-info';
 	import type { Asset } from '$lib/types';
 	import { tip } from '$lib/tip';
+	import { settings } from '$lib/settings.svelte';
+	import { placementOut } from '$lib/editing-prefs';
 
 	type BinAsset = { asset: Asset; info: MediaInfo };
 
@@ -72,7 +74,7 @@
 	// Drag an asset out of the bin; the timeline lanes accept the drop and add a
 	// clip. `ui.dndAsset` carries the payload (dataTransfer is opaque on dragover).
 	function onAssetDragStart(e: DragEvent, { asset, info }: BinAsset) {
-		ui.dndAsset = { id: asset.id, kind: info.kind === 'audio' ? 'audio' : 'video', duration: asset.duration };
+		ui.dndAsset = { id: asset.id, kind: info.kind === 'audio' ? 'audio' : 'video', duration: placementOut(asset, settings.editing.still_seconds) };
 		if (e.dataTransfer) {
 			e.dataTransfer.effectAllowed = 'copy';
 			// A custom MIME so an off-target drop on a text field doesn't paste the
@@ -99,7 +101,7 @@
 			icon: 'plus',
 			action: () =>
 				void editor
-					.add(asset.id, 0, asset.duration, undefined, ui.time)
+					.add(asset.id, 0, placementOut(asset, settings.editing.still_seconds), undefined, ui.time)
 					.then(() => toast.success(`Added ${asset.name}`))
 					.catch(err)
 		});
@@ -108,7 +110,7 @@
 			icon: 'list-plus',
 			action: () =>
 				void editor
-					.add(asset.id, 0, asset.duration, undefined, editor.duration)
+					.add(asset.id, 0, placementOut(asset, settings.editing.still_seconds), undefined, editor.duration)
 					.then(() => toast.success(`Appended ${asset.name}`))
 					.catch(err)
 		});
@@ -276,6 +278,9 @@
 							{/if}
 						</div>
 					</div>
+					<Btn variant="secondary" size="sm" icon="x" pending={editor.stoppingImport} onclick={() => void editor.stopImport()}>
+						{editor.stoppingImport ? 'Stopping…' : 'Stop'}
+					</Btn>
 				</div>
 			{:else}
 				<!-- dropzone -->

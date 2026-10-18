@@ -2259,7 +2259,7 @@
 		else void editor.retimeOverlay(d.id, d.start, d.end).catch(err);
 	}
 
-	const addTitleHere = () => void editor.addTitle('Title', ui.time, ui.time + 3).catch(err);
+	const addTitleHere = () => void editor.addTitle('Title', ui.time, ui.time + settings.editing.title_seconds).catch(err);
 
 	function onTitleContextMenu(e: MouseEvent, o: TextOverlay) {
 		e.stopPropagation();

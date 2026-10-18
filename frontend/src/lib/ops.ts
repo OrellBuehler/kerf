@@ -30,8 +30,17 @@ export function errorMessage(e: unknown): string {
  *  so it is a notice; anything else is an error. The one place a rejected edit becomes a toast. */
 export function report(e: unknown): void {
 	if (e instanceof PreviewReadOnly) toast.info(e.message);
+	// A stop the user asked for (smart crop, an import, a cover frame) is not a failure.
+	else if (isCancelled(e)) toast.info(capitalize(errorMessage(e)));
 	else toast.error(errorMessage(e));
 }
+
+/** A rejection that says the user stopped the run: `smart crop cancelled`, `export cancelled`. */
+export function isCancelled(e: unknown): boolean {
+	return /\bcancel+ed$/i.test(errorMessage(e).trim());
+}
+
+const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
 /** The first line of every edit that reads the cut on screen before it asks the backend: while the proposal is
  *  previewed that cut is not the project's, so there is nothing to plan, copy or run — say so and stop.

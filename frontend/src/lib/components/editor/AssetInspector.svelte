@@ -22,6 +22,8 @@
 	import { toast } from '$lib/notifications.svelte';
 	import { exportTranscriptSrt, report } from '$lib/ops';
 	import { tip } from '$lib/tip';
+	import { settings } from '$lib/settings.svelte';
+	import { placementOut } from '$lib/editing-prefs';
 	import type { Asset } from '$lib/types';
 
 	let { asset }: { asset: Asset } = $props();
@@ -109,7 +111,7 @@
 			pending={editor.locked}
 			onclick={() =>
 				void editor
-					.add(asset.id, 0, asset.duration, undefined, ui.time)
+					.add(asset.id, 0, placementOut(asset, settings.editing.still_seconds), undefined, ui.time)
 					.then(() => toast.success(`Added ${asset.name}`))
 					.catch(err)}>Add at playhead</Btn
 		>
@@ -120,7 +122,7 @@
 			pending={editor.locked}
 			onclick={() =>
 				void editor
-					.add(asset.id, 0, asset.duration, undefined, editor.duration)
+					.add(asset.id, 0, placementOut(asset, settings.editing.still_seconds), undefined, editor.duration)
 					.then(() => toast.success(`Appended ${asset.name}`))
 					.catch(err)}>Append</Btn
 		>

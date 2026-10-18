@@ -4,6 +4,16 @@ import type { AudioDetached, Placement } from './api';
 import {
 	addClip,
 	addKeyframe,
+	applyStagedSubset,
+	cancelCoverExport,
+	cancelImport,
+	cancelSmartCrop,
+	discardedStagedEdit,
+	openRecent as apiOpenRecent,
+	relinkAsset,
+	removeAsset,
+	restoreDiscardedEdits,
+	undoStagedEdit,
 	addReframeKeyframe,
 	addOverlay,
 	analyzeAsset,
@@ -139,6 +149,9 @@ import type {
 	ReframeKeyframe,
 	Revision,
 	StagedEdit,
+	AssetRemoval,
+	Relinked,
+	SubsetApplied,
 	StemsPlaced,
 	StreamKind,
 	SvgLayout,
@@ -165,6 +178,13 @@ import { locateIndex, withLinkPartners } from './link-groups';
 
 /** What an edit refused for the page's own reasons says while a proposal is being previewed. */
 export const PREVIEW_READ_ONLY = 'Exit the preview to edit — you are looking at the agent’s proposed cut, not yours.';
+
+/** What importing files came to: what landed, what failed (with the reason) and how many were stopped by the user. */
+export interface ImportOutcome {
+	imported: Asset[];
+	failed: { name: string; message: string }[];
+	cancelled: number;
+}
 
 /** An edit that did not happen: the backend refused it, or the page did (see `EditorState.#apply`). The
  *  message is what the user reads; `cause` is what the backend said. */
@@ -232,7 +252,17 @@ class EditorState {
 	 * when the import is an ordinary instant probe.
 	 */
 	importProgress = $state<number | null>(null);
+	/** A stop has been asked for and the import has not given up yet. */
+	stoppingImport = $state(false);
+	/** A smart crop is sampling the shots (`smart-crop-progress` fills the fraction); Stop is the status bar's. */
+	smartCropping = $state(false);
+	smartCropProgress = $state<number | null>(null);
+	stoppingSmartCrop = $state(false);
+	/** A cover frame is being rendered at the full delivery frame (`saveCoverFrame`). */
+	coverRun = $state<{ cancelling: boolean } | null>(null);
 	error = $state<string | null>(null);
+	/** The proposal thrown away last, while it can still be brought back (only with none open). */
+	discarded = $state<StagedEdit | null>(null);
 
 	/** The clip whose animation was last copied (Copy keyframes); a paste reads it as it is then (`keyframe-copy.ts`). */
 	keyframeSource = $state<string | null>(null);
@@ -514,6 +544,7 @@ class EditorState {
 			// A read of the old project's proposal still in flight must not put it back.
 			this.#stagedOrder.invalidate();
 			this.staged = null;
+			this.discarded = null;
 			this.keyframeSource = null;
 			this.#analysisAsked.clear();
 			// The ripple flag is the project's, saved in its file: a project that was
@@ -561,6 +592,19 @@ class EditorState {
 	async openProject(file?: string): Promise<boolean> {
 		const path = await apiOpenProject(file);
 		if (path === null) return false; // cancelled, or running in the browser
+		this.selectedAssetId = null;
+		this.selectedClipId = null;
+		this.selectedClipIds = [];
+		this.selectedOverlayId = null;
+		this.selectedSvgOverlayId = null;
+		await this.load();
+		return true;
+	}
+
+	/** Open one of the recent projects and reload; a file that has since gone rejects (and drops off the list). */
+	async openRecent(file: string): Promise<boolean> {
+		const path = await apiOpenRecent(file);
+		if (path === null) return false; // running in the browser
 		this.selectedAssetId = null;
 		this.selectedClipId = null;
 		this.selectedClipIds = [];
@@ -631,8 +675,15 @@ class EditorState {
 		this.staged = next;
 		if (!next) {
 			if (this.previewingStaged) await this.exitStagedPreview();
+			// A proposal that was thrown away can be brought back; ask what, if anything, is waiting.
+			try {
+				this.discarded = await discardedStagedEdit();
+			} catch {
+				/* nothing to restore */
+			}
 			return;
 		}
+		this.discarded = null;
 		if (!this.previewingStaged) return;
 		// The agent staged more while we were looking at it.
 		let proposed: Timeline | null = null;
@@ -681,6 +732,37 @@ class EditorState {
 		await this.refreshStaged();
 	}
 
+	/** Accept only the picked changes of the proposal (`entryIds`: the ids of its diff entries) as one revision.
+	 *  What was not picked stays open for review, branched from the cut as it now is, until nothing is left. */
+	async applyStagedSubset(entryIds: string[], force = false): Promise<SubsetApplied> {
+		let done!: SubsetApplied;
+		await this.#apply(
+			async () => {
+				done = await applyStagedSubset(entryIds, force);
+				return done.timeline;
+			},
+			{ review: true }
+		);
+		if (done.closed) this.#proposalSettled();
+		await this.refreshStaged();
+		return done;
+	}
+
+	/** Take back the latest step the agent staged, inside the proposal (the live cut is untouched);
+	 *  resolves to the step's label. */
+	async undoStagedStep(): Promise<string> {
+		const undone = await undoStagedEdit();
+		await this.refreshStaged();
+		return undone.label;
+	}
+
+	/** Bring the proposal that was thrown away back (only while none is open). */
+	async restoreDiscarded(): Promise<void> {
+		await restoreDiscardedEdits();
+		this.discarded = null;
+		await this.refreshStaged();
+	}
+
 	/** The proposal is gone (applied or discarded): whatever a slower read still brings is older than that. */
 	#proposalSettled() {
 		this.#stagedOrder.invalidate();
@@ -698,17 +780,19 @@ class EditorState {
 	/** Pick one or more media files and import them. All files probe
 	 *  concurrently (each lands in the bin as it resolves); imports continue
 	 *  past a failed file and resolve to the successes plus per-file errors. */
-	async importMedia(): Promise<{ imported: Asset[]; failed: { name: string; message: string }[] }> {
+	async importMedia(): Promise<ImportOutcome> {
 		return this.importPaths(await pickMediaPaths());
 	}
 
 	/** Import specific files — what the picker resolves to, and what a drop onto
 	 *  the window hands over. */
-	async importPaths(paths: string[]): Promise<{ imported: Asset[]; failed: { name: string; message: string }[] }> {
-		if (paths.length === 0) return { imported: [], failed: [] };
+	async importPaths(paths: string[]): Promise<ImportOutcome> {
+		if (paths.length === 0) return { imported: [], failed: [], cancelled: 0 };
 		this.importing = true;
+		this.stoppingImport = false;
 		this.error = null;
 		const failed: { name: string; message: string }[] = [];
+		let cancelled = 0;
 		try {
 			const results = await Promise.all(
 				paths.map(async (path) => {
@@ -721,16 +805,19 @@ class EditorState {
 						}
 						return asset;
 					} catch (e) {
-						failed.push({ name: path.split(/[\\/]/).pop() || path, message: this.#msg(e) });
+						// A stop the user asked for is not a failure of the file.
+						if (/import cancel+ed/i.test(this.#msg(e))) cancelled++;
+						else failed.push({ name: path.split(/[\\/]/).pop() || path, message: this.#msg(e) });
 						return null;
 					}
 				})
 			);
 			const imported = results.filter((a): a is Asset => a !== null);
 			if (imported.length > 0) await this.select(imported[imported.length - 1].id);
-			return { imported, failed };
+			return { imported, failed, cancelled };
 		} finally {
 			this.importing = false;
+			this.stoppingImport = false;
 			this.importProgress = null;
 		}
 	}
@@ -742,6 +829,33 @@ class EditorState {
 		const assets = await listAssets();
 		const known = new Set(this.assets.map((a) => a.id));
 		if (assets.length !== known.size || assets.some((a) => !known.has(a.id))) this.assets = assets;
+	}
+
+	/** Take media out of the project: refused while a clip (or the proposal) uses it, unless `force`, which first
+	 *  removes those clips as one `Remove media` step. Its analysis and proxies go with it; the file on disk stays. */
+	async removeMedia(assetId: string, force = false): Promise<AssetRemoval> {
+		let done!: AssetRemoval;
+		await this.#apply(async () => {
+			done = await removeAsset(assetId, force);
+			return done.timeline;
+		});
+		this.assets = this.assets.filter((a) => a.id !== assetId);
+		delete this.analyses[assetId];
+		if (this.selectedAssetId === assetId) {
+			this.selectedAssetId = null;
+			this.selectedMetadata = null;
+		}
+		return done;
+	}
+
+	/** Point an asset at another file (the media was moved, renamed or restored). It keeps its id and every clip
+	 *  cut from it; its analysis stays only when the file is the old media moved. */
+	async relinkMedia(assetId: string, path: string): Promise<Relinked> {
+		const done = await relinkAsset(assetId, path);
+		this.assets = this.assets.map((a) => (a.id === assetId ? done.asset : a));
+		if (!done.analysis_kept) delete this.analyses[assetId];
+		if (this.selectedAssetId === assetId) await this.select(assetId);
+		return done;
 	}
 
 	/** Run analysis (the named `steps`, else what Settings leaves switched on) on an asset and
@@ -1245,8 +1359,47 @@ class EditorState {
 	 * One clip when `clipId` is given, otherwise every clip on an unlocked video
 	 * track. Lands as one undoable `Smart crop` revision.
 	 */
-	smartCrop(clipId?: string) {
-		return this.#apply(() => smartCrop(clipId));
+	async smartCrop(clipId?: string) {
+		this.smartCropping = true;
+		this.smartCropProgress = null;
+		this.stoppingSmartCrop = false;
+		try {
+			await this.#apply(() => smartCrop(clipId));
+		} finally {
+			this.smartCropping = false;
+			this.smartCropProgress = null;
+			this.stoppingSmartCrop = false;
+		}
+	}
+	/** Stop the smart crop in flight; it then rejects with `smart crop cancelled`, which `report` says as a notice. */
+	async stopSmartCrop() {
+		this.stoppingSmartCrop = true;
+		try {
+			await cancelSmartCrop();
+		} catch {
+			this.stoppingSmartCrop = false;
+		}
+	}
+
+	/** Stop the cover frame being rendered; `saveCoverFrame` then says it was stopped. */
+	async stopCover() {
+		if (!this.coverRun) return;
+		this.coverRun = { cancelling: true };
+		try {
+			await cancelCoverExport();
+		} catch {
+			this.coverRun = { cancelling: false };
+		}
+	}
+
+	/** Stop every import in flight (a 360 lens pair being stitched is the one that takes long enough to stop). */
+	async stopImport() {
+		this.stoppingImport = true;
+		try {
+			await cancelImport();
+		} catch {
+			this.stoppingImport = false;
+		}
 	}
 	/** Detach the sound of every clip of an asset still playing its own (one revision); resolves
 	 *  to what was detached and what was skipped (a locked track). */

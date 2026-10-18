@@ -3,10 +3,12 @@
 	import Badge from './Badge.svelte';
 	import Btn from './Btn.svelte';
 	import IconBtn from './IconBtn.svelte';
+	import McpConnect from './McpConnect.svelte';
 	import { toast } from '$lib/notifications.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { agent } from '$lib/agent.svelte';
+	import { settings } from '$lib/settings.svelte';
 	import { dismissTask, readyCard, resolveReady } from '$lib/agent-tasks';
 	import { agentStatus, mcpConnectionInfo } from '$lib/api';
 	import { contextMenu } from '$lib/context-menu.svelte';
@@ -19,7 +21,7 @@
 	import { holdForPreview, report } from '$lib/ops';
 	import { STATUS_MAP, PRESETS } from './data';
 	import { agentLine, showComposerHint } from '$lib/agent-status';
-	import type { DiffEntry, EditSource, Task, TaskStatus, TimelineDiff } from '$lib/types';
+	import type { DiffEntry, EditSource, McpConnectionInfo, Task, TaskStatus, TimelineDiff } from '$lib/types';
 	import { tip } from '$lib/tip';
 
 	const working = $derived(agent.working);
@@ -45,10 +47,12 @@
 	/** The panel's own height: below ~520 px there is no room for the composer's hint line. */
 	let panelHeight = $state(0);
 	let copied = $state<string | null>(null);
-	/** The connect command as the backend builds it — with the bearer token header while one is required,
-	 *  which the server insists on. Until it is read, the bare command. */
-	let connectCmd = $state<string | null>(null);
-	const claudeCmd = $derived(connectCmd ?? `claude mcp add --transport http kerf ${endpoint}`);
+	/** The connection as the backend describes it — the endpoint, the token, and the setup for each client, with
+	 *  the bearer token header while one is required. Until it is read, the bare endpoint and command. */
+	let mcpInfo = $state<McpConnectionInfo | null>(null);
+	/** The token is dots on screen until asked for (`McpConnect`); copying always takes the real one. */
+	let revealed = $state(false);
+	const claudeCmd = $derived(mcpInfo?.claude_code_command || `claude mcp add --transport http kerf ${endpoint}`);
 
 	// Seconds since an agent last spoke to the endpoint, or null if none ever
 	// has. A streamable-HTTP client holds no connection between calls, so there
@@ -67,7 +71,7 @@
 				endpoint = s.endpoint;
 				lastSeen = s.last_seen_secs;
 				serverError = s.error;
-				connectCmd = (await mcpConnectionInfo()).claude_code_command || null;
+				mcpInfo = await mcpConnectionInfo();
 			} catch {
 				/* the endpoint is part of the app; a failed read is not worth a toast */
 			}
@@ -461,21 +465,24 @@
 				bind:this={connectEl}
 				style="flex:none;border-radius:var(--radius-md);background:var(--surface-raised);border:var(--line-width) solid var(--border-default);padding:10px 11px;display:flex;flex-direction:column;gap:11px"
 			>
-				<div>
-					<div style="font-size:12px;color:var(--text-muted);line-height:1.5;margin-bottom:6px">
-						Point any MCP client at this local endpoint:
+				{#if mcpInfo}
+					<McpConnect info={mcpInfo} bind:revealed compact />
+				{:else}
+					<div>
+						<div style="font-size:12px;color:var(--text-muted);line-height:1.5;margin-bottom:6px">
+							Point any MCP client at this local endpoint:
+						</div>
+						{@render copyRow(endpoint, 'endpoint')}
 					</div>
-					{@render copyRow(endpoint, 'endpoint')}
-				</div>
-				<div>
-					<div style="font-size:12px;color:var(--text-muted);line-height:1.5;margin-bottom:6px">
-						Using <span style="color:var(--text-secondary)">Claude Code</span>? Run this in your terminal:
-					</div>
-					{@render copyRow(claudeCmd, 'cmd')}
-				</div>
+				{/if}
 				<div style="font-size:12px;color:var(--text-muted);line-height:1.5">
-					The agent edits the project you have open and proposes cuts you review here. Override the address
-					with <span style="font-family:var(--font-mono)">KERF_MCP_ADDR</span>.
+					The agent edits the project you have open and proposes cuts you review here. Address, token and review
+					live in <button
+						type="button"
+						onclick={() => settings.openSection('agent')}
+						style="background:none;border:none;padding:0;cursor:pointer;color:var(--kerf-300);font:inherit;text-decoration:underline"
+						>Settings › Agent</button
+					>.
 				</div>
 			</div>
 		{/if}

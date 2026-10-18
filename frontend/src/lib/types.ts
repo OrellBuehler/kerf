@@ -1344,6 +1344,9 @@ export interface AppSettings {
 	 *  { <action id>: [<chord>, …] } }`, only the actions they touched, validated
 	 *  and migrated by `keymap.ts` on the way back in. Opaque to the backend. */
 	keybindings: unknown | null;
+	/** The editing defaults — `{ snap, still_seconds, title_seconds }` — read by `editing-prefs.ts`, which
+	 *  clamps what it finds. Opaque to the backend. */
+	editing: unknown | null;
 }
 
 /** `AppSettings` resolved against the engine, which is what the settings
@@ -1354,6 +1357,11 @@ export interface SettingsView extends AppSettings {
 	cpu_cores: number;
 	cpu_threads: number;
 	cpu_min_percent: number;
+	/** The agent switches (`setMcpSettings` writes them; the token is `mcpConnectionInfo`'s to give). */
+	agent_review: boolean;
+	mcp_enabled: boolean;
+	mcp_addr: string | null;
+	mcp_require_token: boolean;
 }
 
 /** The dialog's baseline options (a preset is applied over this). One deliberate

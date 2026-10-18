@@ -7,6 +7,7 @@ import { editor } from './state.svelte';
 import {
 	cancelAnalysis,
 	cancelLevels,
+	cancelModelDownload,
 	downloadSpeechModel,
 	getLevels,
 	listFonts,
@@ -23,6 +24,7 @@ import type {
 	CaptionStyle,
 	CaptionTimeBase,
 	Levels,
+	ModelProgress,
 	TranscriptionStatus
 } from './types';
 import { autoSteps, counterKind, kindInfo, kindOfStage, missingSteps, stepCounter, stepWords, type StepCounter } from './analysis-steps';
@@ -87,6 +89,10 @@ class EditorUi {
 	downloadingModel = $state<string | null>(null);
 	/** 0..1 for that download. */
 	modelFraction = $state(0);
+	/** The latest `model-progress` report: the bytes fetched of the model, for a line under the bar. */
+	modelProgress = $state<ModelProgress | null>(null);
+	/** A stop has been asked for and the download has not given up yet. */
+	cancellingModel = $state(false);
 	/** How many assets are still queued behind the one being analyzed, so the
 	 *  UI can say "2 of 5" rather than spin at an unknown length. */
 	analysisQueued = $state(0);
@@ -399,18 +405,41 @@ class EditorUi {
 	async fetchSpeechModel(name: string) {
 		this.downloadingModel = name;
 		this.modelFraction = 0;
+		this.modelProgress = null;
+		this.cancellingModel = false;
 		try {
 			await downloadSpeechModel(name);
 			await this.loadTranscriptionStatus();
 		} catch (e) {
+			// A stop the user asked for is not a failure.
+			if (isModelCancelled(e)) toast.info(`Stopped downloading the ${name} speech model`);
 			// A few hundred megabytes over someone else's CDN fails often enough
 			// to be routine — offline, a proxy, a half-written cache file. It used
 			// to reject into nothing, so the download simply stopped looking like
 			// it was happening.
-			toast.error(`Couldn't download the ${name} speech model — ${message(e)}`);
+			else toast.error(`Couldn't download the ${name} speech model — ${message(e)}`);
 		} finally {
 			this.downloadingModel = null;
 			this.modelFraction = 0;
+			this.modelProgress = null;
+			this.cancellingModel = false;
+		}
+	}
+
+	/** A `model-progress` report from the backend (the user's download or an agent's). */
+	noteModelProgress(p: ModelProgress) {
+		this.modelProgress = p;
+		this.modelFraction = p.fraction ?? 0;
+	}
+
+	/** Stop the speech model download in flight; it then rejects and `fetchSpeechModel` says so. */
+	async stopModelDownload() {
+		this.cancellingModel = true;
+		try {
+			await cancelModelDownload();
+		} catch (e) {
+			this.cancellingModel = false;
+			toast.error(`Couldn't stop the download — ${message(e)}`);
 		}
 	}
 
@@ -630,6 +659,11 @@ class EditorUi {
 }
 
 /** The readable part of whatever the backend rejected with. */
+/** The rejection of a download the user stopped (`cancel_model_download`). */
+export function isModelCancelled(e: unknown): boolean {
+	return /cancel+ed/i.test(e instanceof Error ? e.message : String(e));
+}
+
 function message(e: unknown): string {
 	return e instanceof Error ? e.message : String(e);
 }

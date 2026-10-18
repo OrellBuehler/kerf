@@ -11,6 +11,7 @@
 	import { tip } from '$lib/tip';
 	import { timeDisplay } from '$lib/time-display.svelte';
 	import { assetLine, projectFrame, projectLine } from '$lib/status-facts';
+	import { jobLine } from '$lib/job-line';
 
 	const showLogs = inTauri();
 
@@ -27,6 +28,23 @@
 	const clipCount = $derived(
 		editor.timeline.tracks.reduce((n, t) => n + t.clips.length, 0)
 	);
+
+	/** A job the user started on purpose and may stop: framing the shots, a cover frame, a model download, an import. */
+	const job = $derived(
+		jobLine({
+			smartCrop: editor.smartCropping ? { fraction: editor.smartCropProgress, stopping: editor.stoppingSmartCrop } : null,
+			cover: editor.coverRun ? { stopping: editor.coverRun.cancelling } : null,
+			model: ui.downloadingModel ? { name: ui.downloadingModel, fraction: ui.modelFraction, stopping: ui.cancellingModel } : null,
+			importing: editor.importing ? { fraction: editor.importProgress, stopping: editor.stoppingImport } : null
+		})
+	);
+	function stopJob() {
+		if (!job) return;
+		if (job.id === 'smart-crop') void editor.stopSmartCrop();
+		else if (job.id === 'cover') void editor.stopCover();
+		else if (job.id === 'model') void ui.stopModelDownload();
+		else void editor.stopImport();
+	}
 
 	/** Which file the frame under the playhead comes from — the proxy or the original, and why. */
 	const sourceNote = $derived(
@@ -109,6 +127,20 @@
 			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);height:24px;padding:0 8px"
 		>
 			{editor.exportRun.cancelling ? 'Stopping…' : 'Stop'}
+		</button>
+	{:else if job}
+		<span data-testid="job-line" style="display:inline-flex;align-items:center;gap:6px;font-size:var(--text-xs);color:var(--kerf-300)">
+			<span class="kerf-spin" style="width:9px;height:9px;border:1.5px solid var(--kerf-400);border-top-color:transparent;border-radius:50%"></span>
+			{job.label}
+		</span>
+		<button
+			type="button"
+			disabled={job.stopping}
+			use:tip={job.tip}
+			onclick={stopJob}
+			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);height:24px;padding:0 8px"
+		>
+			{job.stopping ? 'Stopping…' : 'Stop'}
 		</button>
 	{:else if ui.analyzing}
 		<!-- Analysis is a long commitment (a speech model download, then minutes

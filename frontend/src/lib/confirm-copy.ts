@@ -69,8 +69,66 @@ export const CONFIRM = {
 		ok: 'Apply and replace',
 		cancel: 'Cancel'
 	},
-	replaceCaptions: { title: 'Replace captions?', ok: 'Replace', cancel: 'Cancel' }
+	replaceCaptions: { title: 'Replace captions?', ok: 'Replace', cancel: 'Cancel' },
+	resetSettings: {
+		title: 'Reset all settings?',
+		message:
+			'Every preference goes back to its default: the theme, shortcuts, window layout, analysis, preview and the rest. Where the agent server listens and its token stay as they are. The old settings file is kept beside the new one.',
+		ok: 'Reset all settings',
+		cancel: 'Cancel'
+	},
+	clearRecent: {
+		title: 'Clear recent projects?',
+		message: 'The list in File › Open Recent is emptied. The project files themselves are not touched.',
+		ok: 'Clear the list',
+		cancel: 'Cancel'
+	},
+	agentReviewOff: {
+		title: 'Let the agent edit without review?',
+		message:
+			'With review off, an agent’s edits land on your timeline as soon as it makes them, as steps you can undo. Nothing waits for you to apply it. You can turn review back on at any time.',
+		ok: 'Turn review off',
+		cancel: 'Keep reviewing'
+	},
+	newToken: {
+		title: 'Make a new access token?',
+		message: 'The current token stops working at once. Every agent that connected with it has to be given the new one.',
+		ok: 'Make a new token',
+		cancel: 'Cancel'
+	}
 } as const;
+
+/** Taking media out of the project. Unused media is a plain question; media a clip uses (or a proposal holds) says
+ *  what goes with it. `uses` is the clips of the cut, `proposed` whether an agent's proposal also holds clips of it. */
+export function removeMediaCopy(name: string, uses: number, proposed = false): ConfirmCopy {
+	const clips = uses === 1 ? '1 clip' : `${uses} clips`;
+	if (uses === 0 && !proposed)
+		return {
+			title: `Remove ${name}?`,
+			message: `${name} leaves the library, and its analysis and preview proxies are deleted. The file on disk stays where it is.`,
+			ok: 'Remove media',
+			cancel: 'Cancel'
+		};
+	const where = uses > 0 ? `${clips} on the timeline${proposed ? ' and in the agent’s proposal' : ''}` : 'the agent’s proposal';
+	return {
+		title: `Remove ${name} and what uses it?`,
+		message: `${name} is used by ${where}. Removing it removes ${uses > 0 ? 'those clips' : 'those clips from the proposal'} as one step — and that step cannot be undone, because the media is gone. The file on disk stays.`,
+		ok: uses > 0 ? `Remove media and ${uses === 1 ? 'clip' : 'clips'}` : 'Remove media',
+		cancel: 'Cancel'
+	};
+}
+
+/** The export would replace files that are already there. */
+export function overwriteCopy(files: readonly string[]): ConfirmCopy {
+	const names = files.map((f) => f.split(/[\\/]/).filter(Boolean).pop() ?? f);
+	const shown = names.slice(0, 4).join(', ') + (names.length > 4 ? ` and ${names.length - 4} more` : '');
+	return {
+		title: files.length === 1 ? 'Replace the existing file?' : `Replace ${files.length} existing files?`,
+		message: `${shown} ${files.length === 1 ? 'is' : 'are'} already there. Exporting replaces ${files.length === 1 ? 'it' : 'them'}.`,
+		ok: files.length === 1 ? 'Replace' : 'Replace all',
+		cancel: 'Cancel'
+	};
+}
 
 /** Throwing away a proposal of several changes: named for what is lost (the agent's work), with the
  *  button that keeps it saying what it does. */

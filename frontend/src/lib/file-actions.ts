@@ -7,6 +7,7 @@ import { editor } from './state.svelte';
 import { toast } from './notifications.svelte';
 import { coverLine, failure, savedLine } from './failure-copy';
 import { ui } from './editor-ui.svelte';
+import { isCancelled } from './ops';
 
 /** Write the frame under the playhead as a cover image — the thumbnail a
  *  platform shows before anyone presses play. Rendered at the full delivery
@@ -19,13 +20,17 @@ export async function saveCoverFrame(): Promise<void> {
 	}
 	const path = await pickCoverPath();
 	if (!path) return;
+	editor.coverRun = { cancelling: false };
 	try {
 		const out = await exportCover(ui.time, path);
 		toast.success(coverLine(out), {
 			action: { label: 'Show in folder', onClick: () => void revealPath(out).catch(() => {}) }
 		});
 	} catch (e) {
-		toast.error(failure("Couldn't save the cover frame", e));
+		if (isCancelled(e)) toast.info('Stopped saving the cover frame');
+		else toast.error(failure("Couldn't save the cover frame", e));
+	} finally {
+		editor.coverRun = null;
 	}
 }
 

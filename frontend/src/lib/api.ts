@@ -4053,7 +4053,8 @@ export async function getSettings(): Promise<SettingsView> {
 			layout: readBrowserJson(LAYOUT_KEY),
 			theme: readBrowserJson(THEME_KEY),
 			workspaces: readBrowserJson(WORKSPACES_KEY),
-			keybindings: readBrowserJson(KEYBINDINGS_KEY)
+			keybindings: readBrowserJson(KEYBINDINGS_KEY),
+			editing: readBrowserJson(EDITING_KEY)
 		});
 	}
 	return invoke<SettingsView>('get_settings');
@@ -4081,6 +4082,7 @@ export async function setSettings(patch: Partial<AppSettings>): Promise<Settings
 			if ('theme' in patch) writeBrowserJson(THEME_KEY, patch.theme);
 			if ('workspaces' in patch) writeBrowserJson(WORKSPACES_KEY, patch.workspaces);
 			if ('keybindings' in patch) writeBrowserJson(KEYBINDINGS_KEY, patch.keybindings);
+			if ('editing' in patch) writeBrowserJson(EDITING_KEY, patch.editing);
 		} catch {
 			// A private window with storage blocked still gets a working dialog.
 		}
@@ -4099,6 +4101,7 @@ const LAYOUT_KEY = 'kerf.settings.layout';
 const THEME_KEY = 'kerf.settings.theme';
 const WORKSPACES_KEY = 'kerf.settings.workspaces';
 const KEYBINDINGS_KEY = 'kerf.settings.keybindings';
+const EDITING_KEY = 'kerf.settings.editing';
 const TIME_DISPLAY_KEY = 'kerf.settings.timeDisplay';
 const REOPEN_KEY = 'kerf.settings.reopenLastProject';
 const MIN_CPU_PERCENT = 10;
@@ -4190,8 +4193,13 @@ function writeBrowserJson(key: string, value: unknown) {
 
 function browserSettings(settings: AppSettings): SettingsView {
 	const cores = Math.max(1, navigator.hardwareConcurrency || 4);
+	const mcp = harnessMcpInfo({});
 	return {
 		...settings,
+		agent_review: mcp.agent_review,
+		mcp_enabled: mcp.enabled,
+		mcp_addr: mcp.configured_addr,
+		mcp_require_token: mcp.require_token,
 		cpu_cores: cores,
 		cpu_threads: Math.min(cores, Math.max(1, Math.round((cores * settings.cpu_percent) / 100))),
 		cpu_min_percent: MIN_CPU_PERCENT
@@ -4217,11 +4225,14 @@ export async function resetSettings(): Promise<SettingsView> {
 				THEME_KEY,
 				WORKSPACES_KEY,
 				KEYBINDINGS_KEY,
+				EDITING_KEY,
 				TIME_DISPLAY_KEY,
 				REOPEN_KEY
 			]) {
 				localStorage.removeItem(key);
 			}
+			// The review switch is a preference and goes back on; where the server listens is not.
+			harnessMcpInfo({ agent_review: true });
 		} catch {
 			// Storage blocked: there was nothing remembered to clear.
 		}
