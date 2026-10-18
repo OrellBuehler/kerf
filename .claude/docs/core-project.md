@@ -354,7 +354,11 @@
     long as its header says. Unknown entries are ignored. The manifest's `format` and `version` are
     looked at before the rest is parsed: another version is refused by name, a newer one as "made by a
     newer Kerf". A font must be a plain sfnt (`fonts::check_font`: not a `.ttc`, `fontdb` can parse it)
-    and its manifest family becomes the family the file really is. A poster that is not a PNG under
+    and its manifest family becomes the family the file really is; **one whose `OS/2` `fsType` does not
+    allow embedding (`fonts::embedding_allowed`: restricted licence 0x0002, preview & print 0x0004, bitmap
+    only 0x0200) refuses the whole file** — when a file is read, so `import` and `get` both — as a font that
+    cannot be read does: `save` leaves such a font out with a warning, and a file that carries one anyway
+    was made elsewhere, so dropping it would hand back a template that draws other than the one sent. A poster that is not a PNG under
     2048 px is no poster. `to_bytes` is deterministic (fixed timestamps and order). The library is
     `dirs::data_dir()/kerf/templates/<id>.kerftemplate` (`KERF_TEMPLATES_DIR` overrides, read on every
     call).
@@ -368,15 +372,21 @@
     element exists exactly once, has the attribute (a `text` control aims at a `text` / `tspan` /
     `textPath`, an `image` one at an `<image>`), no two controls write the same place, and a text
     control's element holds no other control's target. **Values** (`apply_values`, pure, partial — only the
-    named controls change; an unknown id is refused): text ≤ 2,000 characters, no control characters;
+    named controls change; an unknown id is refused): text ≤ 2,000 characters, no control characters (`\r\n` and a lone `\r` become `\n` first; **any** value over the
+    title's 128 KiB is refused before it is decoded or copied to a target);
     colour `#rgb[a]` / `#rrggbb[aa]` / a name `svgtypes` knows (bare letters, not
     `engine::valid_color`: that is FFmpeg's table, which has no `transparent`) / `none` / `currentColor` (no `@`, no `0x`, no function); number finite, within the bounds, written in plain
     decimal (**unitless**: `5px` is refused); font ≤ 64 characters of letters, digits, space, `- _ .`
     (an unknown family is a *warning*, the title draws in Geist); image a `data:` URL that passes
     `images::check_href` (the 16 Mpx header rule). Values are **spliced by byte range** (`svg::splice`,
     roxmltree ranges; text escaped `& < >`, an attribute escaped for its own quote; two edits on the same
-    bytes are an error) and **the result then goes through `SvgDoc::parse`** (the sanitiser has the last
-    word). An animation that animates the same attribute keeps its own values: a control sets the base.
+    bytes are an error). **A `text` control sets the element's own text, not its contents**: the value goes
+    into the first run of direct text (text and CDATA between the element's children), the other runs are
+    emptied, and every child element, comment and processing instruction stays — a SMIL `<animate>` /
+    `<set>` or a styled `<tspan>` inside the element survives (an element with no text gets it just before
+    its end tag, `<x/>` is opened). `read_values` reads those same direct runs, so the value shown is the value
+    a set writes (a word inside a `<tspan>` is its own control's). **The result then goes through
+    `SvgDoc::parse`** (the sanitiser has the last word). An animation that animates the same attribute keeps its own values: a control sets the base.
   * **Lock-free shape.** The zip, the fonts, the sanitiser and the poster are all outside the project lock.
     Apply: `TemplateLibrary::get(id)` (or any `Template`) → `Template::prepare(&values)` →
     `PreparedTemplate` → under the lock `Project::apply_template_parsed(prepared, start, end?, SvgLayout)`.
@@ -385,12 +395,18 @@
     agent's is staged). Set values: `Project::template_edit_inputs(overlay)` (reads
     `working_timeline()`) → `TemplateEditInputs::prepare(&values)` → `Project::set_template_values_parsed`,
     one `Set template values` edit that **refuses a title that changed since it was prepared**. The
+    controls a title stored are checked again (`validate_controls_shape`, in `template_edit_inputs` and in
+    `prepare`) before they are trusted to say where a value goes, and **no values is an `InvalidArgument`**
+    (`prepare` refuses it) rather than a revision that changed nothing — every surface gets that one answer. The
     plain `apply_template` / `set_template_values` are `#[cfg(test)]`, like `add_svg_overlay`. An
     `update_svg_overlay` with `svg` replaces the artwork and so **ends the template** (the controls point
     into the old one); a rename or a move keeps it. The diff says `Tagline “A” → “B”` for a values change.
   * **Library** (`library.rs`, app-level — not a timeline edit, not undone, not staged): `list()` reads only
     each manifest, sorts by name, and returns the files that did not read in `problems` instead of
-    failing; a file is only listed if its name is its manifest's id. `save(&TemplateSource, request)`
+    failing; a file is only listed if its name is its manifest's id **and its extension is exactly
+    `.kerftemplate`** (`path_of` writes no other, so what is listed is what `get` / `delete` / `export` reach);
+    it also removes a `.kerf-tmp-*.tmp` file older than ten minutes (the remains of a write that never
+    finished). `save(&TemplateSource, request)`
     (`Project::template_source(overlay)` reads the source under the lock; the rest needs no project) builds
     a template (`save.rs`): the controls validated against the title, the size from its `viewBox`, the fonts
     its `font-family` values resolve to (attributes, `style`, `<style>` rules and SMIL `set` / `animate`;
@@ -402,22 +418,48 @@
     whole file** (the title re-sanitised, the controls checked against it, a missing poster drawn), then
     writes a fresh canonical file — the library never keeps the bytes of the original; an id the
     library has is `already_present` when the content is the same, else the import is kept under a new
-    id (`added_as_copy`), never overwriting; a damaged entry of that id is replaced. `export(id, dest)`
-    copies the library file atomically (a directory gets `<name>.kerftemplate`). Every write is a temp
-    file beside the target, fsync, rename. `delete(id)`; ids are checked as UUIDs before they become a
-    file name.
+    id (`added_as_copy`), never overwriting; a damaged entry of that id is replaced. **The copy's id is made
+    from its content** (a version-8 UUID of the template's digest), so importing the same file again finds
+    its copy and says `already_present` instead of adding a third. `export(id, dest)`
+    copies the library file atomically (a directory gets `<name>.kerftemplate`, a name Windows reserves for
+    a device — `con`, `nul`, `com1` ... — gets an underscore in front). Every write is a temp file beside
+    the target under a random name, opened `create_new` (a file or link planted there is never written
+    through), fsync, rename. `delete(id)`; ids are checked as UUIDs before they become a file name. **The
+    library is bounded** — `MAX_TEMPLATES` (500) files and `MAX_BYTES` (2 GiB) in all, checked by `add`
+    (so by `save` and `import` too; replacing an entry never grows the count) with an error that says to
+    delete some.
   * **Embedded fonts** (`fonts.rs`, `project/templates.rs`): the `fonts` table (`sha256` primary key,
     `family`, `data`; schema v3) holds what the project embeds; `apply_template_parsed` stores a template's
-    fonts in the edit's transaction (`INSERT OR IGNORE`; a row whose bytes do not hash to its key is
-    skipped on read) up to 128 MiB, and fonts are **not removed when a title is** (undo may bring it
-    back). **Opening a project replaces the process's embedded set with its own**
-    (`Project::init` → `fonts::replace_embedded`; the previous project's fonts must not change how this
-    one draws), `replace_with` does it again at the swap from the set the project holds in memory
-    (`Project.embedded`, so no table is read under the lock; another project may have registered
-    between its open and its swap), and applying a template adds to it (`register_embedded`); each moves
-    the plan epoch when the set changed. The registry is **process-wide** (per thread under
-    `cfg(test)` in kerf-core), so tests in another crate that open projects on parallel threads and look at
-    fonts must serialise. See `engine-cli.md` for how the SVG font database and the picture cache keys follow.
+    fonts in the edit's transaction (a font already stored is skipped without being written; a row whose
+    bytes do not hash to its key is skipped on read) up to 128 MiB. **A font stays while a title names its
+    family and not longer** (`collect_unused_fonts`): a font is kept when the source of a title on the live
+    timeline *or on the open proposal* names its family (`fonts::names_family`, a case-blind substring: a name
+    in a caption costs one font too many, never one too few), and the rest are deleted **when a proposal is
+    discarded (or closed with nothing left of it), on Save As (the project saved and its copy) and when a project is opened** — nowhere else, so
+    undo can still bring a deleted title's font back until one of those. Once collected a font is gone: undoing
+    to a revision whose title used it, or restoring a discarded proposal, draws that title in Geist until the
+    template is applied again. That is what stops a template an agent applied and the user turned down from
+    keeping the 128 MiB for ever.
+    **Opening a project registers nothing**: `Project::open` only reads its fonts into memory
+    (`Project.embedded`), because an opened project may never become the open one (the user cancels,
+    `open_project` is refused for unsaved work, Save As's copy fails to swap). **The process's set is replaced
+    at the swap** (`replace_with` / `replace_with_saved_copy` → `activate_fonts`, from what the project holds,
+    so no table is read under the lock; `activate_fonts` is public for a program that opens one project and
+    never swaps), and applying a template adds to it (`register_embedded`); each moves the plan epoch when the
+    set changed. The registry is **process-wide** (per thread under `cfg(test)` in kerf-core), so tests in another
+    crate that open projects on parallel threads and look at fonts must serialise.
+    **A title is drawn with the fonts it names**, not with everything registered: planning a title takes
+    `fonts::snapshot_for` (a `FontSet`: the registered fonts whose family the title's source names, with their
+    digest and, built on first use, their database), and that one value keys the pictures *and* draws them
+    (`SvgSeq::fonts`, `StillSvg::fonts`), so the key cannot name another set than the pictures were drawn with
+    however the registry moves between planning and drawing. So a template font held for a proposal's review
+    is in no key and no picture of a title that does not name it. **Residual:** a *live* title that names the
+    same family (an installed Arial, say) is drawn with the proposal's embedded Arial while the proposal is
+    open, since embedded faces win over installed ones and nothing marks a font as the proposal's; it is the
+    same pixels as accepting it, and the font goes if the proposal is discarded. The registry's lock is held
+    only to swap an `Arc`, never across a build of the font database (a system scan and every face parsed:
+    seconds), so `replace_embedded` / `embedded_digest` and the swap under the project lock never wait on
+    one. See `engine-cli.md` for how the SVG font database and the picture cache keys follow.
 - `analysis.rs` — transcription / scene / silence / rhythm are **pluggable traits**
   (`Transcriber`, `SceneDetector`, `SilenceDetector`, `RhythmAnalyzer`). Real impls
   now exist:

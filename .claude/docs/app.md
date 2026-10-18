@@ -122,8 +122,10 @@ the webview, decides what an SVG may do; `check_params` refuses empty text first
 **motion templates** (`kerf_core::template`; model in `core-project.md`, the MCP side in `mcp.md`): the library calls need no
 project and never take the lock — `list_templates` → `TemplateList {templates, problems}` (manifests only),
 `template_poster { templateId }` → a `data:image/png;base64,` URL or `null` (a grid card fetches its own),
-`svg_element_ids { svg }` → `[{id, tag}]` (what a control can aim at; pure), `template_image_value { path }` → the `data:` URL
-an `image` control takes (a bounded read, 4 MiB, then `template::image_data_url` judges the picture),
+`svg_element_ids { svg }` → `[{id, tag}]` (what a control can aim at; pure, and the text comes from the webview, so the core
+refuses one over a title's 128 KiB before parsing it), `template_image_value { path }` → the `data:` URL
+an `image` control takes (the file opened, checked through the handle, read at most one byte past `template::MAX_IMAGE_BYTES` —
+94 KiB — then `template::image_data_url` judges the picture),
 `import_template { path }` (a `.kerftemplate`; `validate_import_path`, then `TemplateLibrary::import` → `ImportOutcome`,
 which never overwrites), `export_template { templateId, path }` (`require_user_output_path`, `check_output` against the
 project's sources / proxies, Kerf's settings and logs **and the library directory**; resolves to where the file went),

@@ -21,9 +21,10 @@
 //! **The installed fonts are not in the key** because they cannot change under it: the font database
 //! is built once per process (`fonts::svg_fontdb`) and so is this directory, which is emptied when
 //! the process starts. A font installed while Kerf runs is seen by neither until the next run. **The
-//! fonts a project embeds can** (opening another project, applying a template), so the engine's keys
-//! carry `fonts::embedded_digest()` whenever there is one, and a picture drawn with another set is
-//! never served.
+//! fonts a project embeds can** (opening another project, applying a template), so the engine takes a
+//! `fonts::FontSet` once, when a title is planned, keys the pictures by its digest (when it is not empty)
+//! and draws them with its database: the key and the fonts are one value, and a picture drawn with another
+//! set is never served.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -96,8 +97,9 @@ pub fn render(svg: &str, pw: u32, ph: u32, opacity: f64) -> Result<Pixmap> {
     render_with(svg, pw, ph, opacity, fonts::svg_fontdb())
 }
 
-/// [`render`] with the fonts it is given instead of the process's (`fonts::svg_fontdb_with`): a template
-/// being saved or imported draws its poster with the fonts it carries.
+/// [`render`] with the fonts it is given instead of the process's: the set a title was planned with
+/// (`fonts::FontSet::db`), or a template being saved or imported drawing its poster with the fonts it
+/// carries (`fonts::svg_fontdb_with`).
 pub fn render_with(svg: &str, pw: u32, ph: u32, opacity: f64, fontdb: Arc<fontdb::Database>) -> Result<Pixmap> {
     let (pw, ph) = (pw.max(1), ph.max(1));
     if u64::from(pw) * u64::from(ph) > MAX_PIXELS {

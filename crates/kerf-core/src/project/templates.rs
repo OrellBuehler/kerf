@@ -65,33 +65,93 @@ impl Project {
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
-    /// Store `fonts` in the project's table; one already there (by SHA-256) is left alone. Runs inside
-    /// whatever transaction the caller has open.
+    /// Store `fonts` in the project's table; one already there (by SHA-256) is skipped without being
+    /// read again. Runs inside whatever transaction the caller has open.
     pub(super) fn store_fonts(&self, fonts: &[EmbeddedFont]) -> Result<()> {
-        let mut stmt = self
+        let mut have = self.conn.prepare("SELECT 1 FROM fonts WHERE sha256 = ?1")?;
+        let mut insert = self
             .conn
             .prepare("INSERT OR IGNORE INTO fonts (sha256, family, data) VALUES (?1, ?2, ?3)")?;
         for font in fonts {
-            stmt.execute(params![font.sha256, font.family, font.data.as_slice()])?;
+            if have.exists(params![font.sha256])? {
+                continue;
+            }
+            insert.execute(params![font.sha256, font.family, font.data.as_slice()])?;
         }
         Ok(())
     }
 
-    /// Make this project's fonts the ones titles are drawn with: [`fonts::replace_embedded`] with the
-    /// table, so what an earlier project embedded does not leak into this one and a title draws the
-    /// same however many projects were opened first. Called when a project is opened; moves the plan
-    /// epoch when the set changed, since every title's pictures are keyed by it.
-    pub(super) fn register_fonts(&self) -> Result<()> {
+    /// Read the fonts the file embeds into memory (`Project.embedded`) **without** making them the ones
+    /// titles are drawn with: a project that is only being opened is not the open one yet, and may never
+    /// be (the user cancels, the swap is refused), so it must not change how the open project draws.
+    /// [`Project::activate_fonts`] does that, and the swap into the shared project calls it.
+    pub(super) fn load_fonts(&self) -> Result<()> {
         *self.embedded.borrow_mut() = self.embedded_fonts()?;
-        self.activate_fonts();
         Ok(())
     }
 
     /// Make the fonts this project holds the ones titles are drawn with (what it read when it was
     /// opened and what templates added since): no table is read, so this is cheap under the lock.
-    pub(super) fn activate_fonts(&self) {
+    /// **The registry is the process's**, so this is for the project that is the open one: the swap
+    /// ([`Project::replace_with`]) does it for the shared project, and a program that opens a single
+    /// project and draws its titles without ever swapping calls it itself. Moves the plan epoch when the
+    /// set changed, since every title's pictures are keyed by it.
+    pub fn activate_fonts(&self) {
         if fonts::replace_embedded(self.embedded.borrow().clone()) {
             crate::plan_epoch::bump_plan_epoch();
+        }
+    }
+
+    /// Delete the fonts no title names: a template's typeface stays in the project while a title uses it,
+    /// not for good. A font is **kept** when the source of an animated title on the live timeline, or on
+    /// the open proposal's, names its family ([`fonts::names_family`]); everything else goes, which is
+    /// what keeps a template an agent applied and the user turned down from using up the project's
+    /// [`MAX_PROJECT_FONT_BYTES`] for ever. Run when a proposal is discarded, on Save As and when a project
+    /// is opened — never between, so undo can still bring a deleted title's font back until then; once
+    /// collected it is not stored any more, and the title draws in Geist until the template is applied
+    /// again (the same for a discarded proposal that is restored). Returns how many fonts went.
+    ///
+    /// Touches the file and what this project holds in memory, **not** the process's registry
+    /// ([`Project::activate_fonts`] is the caller's to follow with, for the project that is open).
+    pub(super) fn collect_unused_fonts(&self) -> Result<usize> {
+        if !self.has_fonts_table() {
+            return Ok(0);
+        }
+        let stored: Vec<(String, String)> = {
+            let mut stmt = self.conn.prepare("SELECT sha256, family FROM fonts")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        if stored.is_empty() {
+            return Ok(0);
+        }
+        let mut titles: Vec<String> = self.timeline()?.svg_overlays.iter().map(|o| o.svg.to_lowercase()).collect();
+        if let Some(row) = self.staged_row()? {
+            let proposed: crate::model::Timeline = serde_json::from_str(&row.timeline)?;
+            titles.extend(proposed.svg_overlays.iter().map(|o| o.svg.to_lowercase()));
+        }
+        let mut gone = 0;
+        let mut delete = self.conn.prepare("DELETE FROM fonts WHERE sha256 = ?1")?;
+        for (sha256, family) in &stored {
+            if titles.iter().any(|t| fonts::names_family(t, family)) {
+                continue;
+            }
+            gone += delete.execute(params![sha256])?;
+            self.embedded.borrow_mut().retain(|f| f.sha256 != *sha256);
+        }
+        Ok(gone)
+    }
+
+    /// [`Project::collect_unused_fonts`] for the project that is the open one: what went is no longer
+    /// registered for drawing either.
+    pub(super) fn collect_unused_fonts_now(&self) {
+        match self.collect_unused_fonts() {
+            Ok(0) => {}
+            Ok(gone) => {
+                tracing::info!(gone, "dropped the embedded fonts no title names");
+                self.activate_fonts();
+            }
+            Err(e) => tracing::warn!(error = %e, "could not tell which embedded fonts are unused"),
         }
     }
 
@@ -105,9 +165,10 @@ impl Project {
         } else {
             HashSet::new()
         };
+        let mut seen: HashSet<&str> = HashSet::new();
         let added: u64 = incoming
             .iter()
-            .filter(|f| !have.contains(&f.sha256))
+            .filter(|f| !have.contains(&f.sha256) && seen.insert(f.sha256.as_str()))
             .map(|f| f.data.len() as u64)
             .sum();
         if self.embedded_font_bytes()? + added > MAX_PROJECT_FONT_BYTES {
@@ -136,13 +197,16 @@ impl Project {
     }
 
     /// What changing the values of the template title `overlay_id` needs: the artwork as it is now and
-    /// its controls. `InvalidArgument` for a title that did not come from a template.
+    /// its controls (checked: a project file can hold anything). `InvalidArgument` for a title that did
+    /// not come from a template.
     pub fn template_edit_inputs(&self, overlay_id: Uuid) -> Result<TemplateEditInputs> {
         let timeline = self.working_timeline()?;
         let o = timeline
             .svg_overlay(overlay_id)
             .ok_or(Error::SvgOverlayNotFound(overlay_id))?;
         let instance = o.template.clone().ok_or_else(|| not_a_template(o))?;
+        // Stored with the title, not written by this build: checked before they are trusted.
+        crate::template::validate_controls_shape(&instance.controls)?;
         Ok(TemplateEditInputs::new(overlay_id, o.svg.clone(), instance))
     }
 
@@ -458,9 +522,10 @@ mod tests {
         fonts::replace_embedded(Vec::new());
     }
 
-    /// The same template with another font file.
+    /// The same template with another font file, named by its title.
     fn with_font_two() -> Template {
         let mut t = with_font();
+        t.svg = t.svg.replace("Zeist", "Zeyst");
         t.manifest.id = Uuid::new_v4().to_string();
         t.fonts = vec![EmbeddedFont::new("Zeyst", fonts::shipped_font_renamed(false, "Zeyst"))];
         t.manifest.fonts[0].family = "Zeyst".into();
@@ -557,6 +622,51 @@ mod tests {
         let err = project.set_template_values_parsed(added.id, prepared).unwrap_err();
         assert!(err.to_string().contains("changed while"), "{err}");
         assert_eq!(overlays(&project)[0].template.as_ref().unwrap().values["tagline"], "first");
+    }
+
+    #[test]
+    fn the_controls_a_title_stored_are_checked_before_its_values_are_set() {
+        let project = Project::open_in_memory().unwrap();
+        let added = project
+            .apply_template(&template(), &values(&[]), 0.0, None, SvgLayout::default())
+            .unwrap()
+            .overlay;
+        // A file from elsewhere (or a bug) left a control that would write an event handler.
+        project
+            .edit_timeline("corrupt", |t| {
+                let instance = t.svg_overlays[0].template.as_mut().unwrap();
+                instance.controls[1].kind = TemplateKind::Number;
+                instance.controls[1].targets[0].attribute = Some("onclick".into());
+                Ok(())
+            })
+            .unwrap();
+        let head = project.history().unwrap().len();
+        let err = project.template_edit_inputs(added.id).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)) && err.to_string().contains("onclick"),
+            "{err}"
+        );
+        let err = project
+            .set_template_values(added.id, &values(&[("tagline", "x")]))
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err}");
+        assert_eq!(project.history().unwrap().len(), head, "no revision for a refusal");
+    }
+
+    #[test]
+    fn setting_no_values_records_no_revision() {
+        let project = Project::open_in_memory().unwrap();
+        let added = project
+            .apply_template(&template(), &values(&[]), 0.0, None, SvgLayout::default())
+            .unwrap()
+            .overlay;
+        let head = project.history().unwrap().len();
+        let err = project.set_template_values(added.id, &values(&[])).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)) && err.to_string().contains("no values to set"),
+            "{err}"
+        );
+        assert_eq!(project.history().unwrap().len(), head);
     }
 
     #[test]
@@ -665,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn a_project_opens_with_its_fonts_registered_and_replaces_the_last_projects() {
+    fn opening_a_project_registers_nothing_and_becoming_the_open_one_replaces_the_last_ones_fonts() {
         let dir = std::env::temp_dir().join(format!("kerf-tpl-{}", Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("a.kerf");
@@ -677,26 +787,69 @@ mod tests {
         }
         fonts::replace_embedded(Vec::new());
         assert!(!fonts::has_family("Zeist"));
+        let epoch = crate::plan_epoch::plan_epoch();
         let first = Project::open(&path).unwrap();
-        assert!(fonts::has_family("Zeist"), "opening registers the project's fonts");
+        assert!(
+            !fonts::has_family("Zeist") && fonts::embedded_digest().is_none(),
+            "an opened project is not the open one: nothing it embeds is drawn with yet"
+        );
+        assert_eq!(first.embedded.borrow().len(), 1, "but it has read them");
+        first.activate_fonts();
+        assert!(fonts::has_family("Zeist"), "activating registers the project's fonts");
+        assert!(crate::plan_epoch::plan_epoch() > epoch);
         let digest = fonts::embedded_digest();
         assert!(digest.is_some());
-        // Another project without fonts: the first one's do not leak into it.
+        // Another project without fonts, swapped in: the first one's do not leak into it.
         let epoch = crate::plan_epoch::plan_epoch();
-        let other = Project::open_in_memory().unwrap();
+        let mut shared = Project::open_in_memory().unwrap();
+        let old = shared.replace_with(first);
+        assert!(fonts::has_family("Zeist"));
+        let old_first = shared.replace_with(old);
         assert!(!fonts::has_family("Zeist") && fonts::embedded_digest().is_none());
         assert!(crate::plan_epoch::plan_epoch() > epoch);
-        drop(other);
-        drop(first);
-        // Reopening gives the same set, so the same keys.
-        let _again = Project::open(&path).unwrap();
+        drop((shared, old_first));
+        // Reopening and swapping in gives the same set, so the same keys.
+        let mut again = Project::open_in_memory().unwrap();
+        again.replace_with(Project::open(&path).unwrap()).close();
         assert_eq!(fonts::embedded_digest(), digest);
         // Save As carries the fonts.
         let copy = dir.join("b.kerf");
-        _again.save_as(&copy).unwrap();
+        again.save_as(&copy).unwrap();
         fonts::replace_embedded(Vec::new());
-        let _copy = Project::open(&copy).unwrap();
+        let mut copy_open = Project::open_in_memory().unwrap();
+        copy_open.replace_with(Project::open(&copy).unwrap()).close();
         assert!(fonts::has_family("Zeist"));
+        fonts::replace_embedded(Vec::new());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_open_that_is_refused_or_cancelled_leaves_the_open_projects_fonts_alone() {
+        let dir = std::env::temp_dir().join(format!("kerf-tpl-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("other.kerf");
+        {
+            let other = Project::create(&path).unwrap();
+            other
+                .apply_template(&with_font_two(), &values(&[]), 0.0, None, SvgLayout::default())
+                .unwrap();
+        }
+        fonts::replace_embedded(Vec::new());
+        let open = Project::open_in_memory().unwrap();
+        open.apply_template(&with_font(), &values(&[]), 0.0, None, SvgLayout::default())
+            .unwrap();
+        let digest = fonts::embedded_digest();
+        assert!(fonts::has_family("Zeist") && !fonts::has_family("Zeyst"));
+        // The file is opened (the MCP open_project does this before it asks whether the open project may
+        // be let go; Save As does it for the copy) and then nothing is swapped in.
+        let opened = Project::open(&path).unwrap();
+        assert!(
+            fonts::has_family("Zeist") && !fonts::has_family("Zeyst"),
+            "still the open project's fonts"
+        );
+        assert_eq!(fonts::embedded_digest(), digest);
+        assert_eq!(opened.embedded_fonts().unwrap().len(), 1);
+        drop(opened);
         fonts::replace_embedded(Vec::new());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -711,6 +864,7 @@ mod tests {
             b.apply_template(&with_font(), &values(&[]), 0.0, None, SvgLayout::default())
                 .unwrap();
         }
+        fonts::replace_embedded(Vec::new());
         let mut shared = Project::open_in_memory().unwrap();
         let b = Project::open(&path).unwrap();
         // Between the open and the swap something else registered another font and dropped b's.
@@ -725,6 +879,7 @@ mod tests {
             .apply_template(&with_font_two(), &values(&[]), 0.0, None, SvgLayout::default())
             .unwrap();
         let mut again = Project::open_in_memory().unwrap();
+        fonts::replace_embedded(Vec::new());
         assert!(!fonts::has_family("Zeist"));
         let old_shared = again.replace_with(shared);
         assert!(
@@ -735,6 +890,144 @@ mod tests {
         old_shared.close();
         fonts::replace_embedded(Vec::new());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A title (custom art) that names the family `family`.
+    fn naming(family: &str) -> crate::SvgSource {
+        crate::SvgSource::Custom(format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"><text font-family=\"{family}\">a</text></svg>"
+        ))
+    }
+
+    fn stored_families(p: &Project) -> Vec<String> {
+        p.embedded_fonts().unwrap().into_iter().map(|f| f.family).collect()
+    }
+
+    #[test]
+    fn the_fonts_of_a_discarded_proposal_are_dropped_and_no_longer_drawn_with() {
+        let mut project = Project::open_in_memory().unwrap();
+        project.set_actor(EditSource::Agent);
+        project.begin_staging(None, None, None).unwrap();
+        project
+            .apply_template(&with_font(), &values(&[]), 0.0, None, SvgLayout::default())
+            .unwrap();
+        assert_eq!(stored_families(&project), ["Zeist"], "stored with the proposal");
+        assert!(fonts::has_family("Zeist"));
+        // Collecting while the proposal is open keeps what it names.
+        assert_eq!(project.collect_unused_fonts().unwrap(), 0);
+        project.set_actor(EditSource::User);
+        project.discard_staged().unwrap();
+        assert!(project.embedded_fonts().unwrap().is_empty(), "nothing names it any more");
+        assert_eq!(project.embedded_font_bytes().unwrap(), 0, "the room it took is back");
+        assert!(!fonts::has_family("Zeist") && fonts::embedded_digest().is_none());
+        assert!(project.embedded.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_discard_keeps_the_fonts_the_live_cut_names() {
+        let mut project = Project::open_in_memory().unwrap();
+        project
+            .apply_template(&with_font(), &values(&[]), 0.0, None, SvgLayout::default())
+            .unwrap();
+        project.set_actor(EditSource::Agent);
+        project.begin_staging(None, None, None).unwrap();
+        project
+            .apply_template(&with_font_two(), &values(&[]), 5.0, None, SvgLayout::default())
+            .unwrap();
+        let mut both = stored_families(&project);
+        both.sort();
+        assert_eq!(both, ["Zeist", "Zeyst"]);
+        project.set_actor(EditSource::User);
+        project.discard_staged().unwrap();
+        assert_eq!(
+            stored_families(&project),
+            ["Zeist"],
+            "the live title's stays, the proposal's goes"
+        );
+        assert!(fonts::has_family("Zeist") && !fonts::has_family("Zeyst"));
+        fonts::replace_embedded(Vec::new());
+    }
+
+    #[test]
+    fn a_proposal_whose_template_was_undone_leaves_no_font_when_it_closes() {
+        let mut project = Project::open_in_memory().unwrap();
+        project.set_actor(EditSource::Agent);
+        project.begin_staging(None, None, None).unwrap();
+        project
+            .apply_template(&with_font(), &values(&[]), 0.0, None, SvgLayout::default())
+            .unwrap();
+        project.undo_staged().unwrap();
+        assert_eq!(stored_families(&project), ["Zeist"], "kept until the proposal ends");
+        project.set_actor(EditSource::User);
+        project.apply_staged(false).unwrap();
+        assert!(project.embedded_fonts().unwrap().is_empty());
+        assert!(!fonts::has_family("Zeist"));
+    }
+
+    #[test]
+    fn accepting_a_proposal_keeps_its_fonts() {
+        let mut project = Project::open_in_memory().unwrap();
+        project.set_actor(EditSource::Agent);
+        project.begin_staging(None, None, None).unwrap();
+        project
+            .apply_template(&with_font(), &values(&[]), 0.0, None, SvgLayout::default())
+            .unwrap();
+        project.set_actor(EditSource::User);
+        project.apply_staged(false).unwrap();
+        assert_eq!(stored_families(&project), ["Zeist"]);
+        assert_eq!(project.collect_unused_fonts().unwrap(), 0, "the live cut names it now");
+        fonts::replace_embedded(Vec::new());
+    }
+
+    #[test]
+    fn saving_as_and_opening_drop_the_fonts_nothing_names() {
+        let dir = std::env::temp_dir().join(format!("kerf-tpl-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.kerf");
+        let used = EmbeddedFont::new("Zeist", fonts::shipped_font_renamed(true, "Zeist"));
+        let unused = EmbeddedFont::new("Zeyst", fonts::shipped_font_renamed(false, "Zeyst"));
+        {
+            let project = Project::create(&path).unwrap();
+            project
+                .add_svg_overlay(naming("Zeist"), 0.0, Some(2.0), SvgLayout::default())
+                .unwrap();
+            project.store_fonts(&[used, unused.clone()]).unwrap();
+            assert_eq!(project.embedded_fonts().unwrap().len(), 2);
+        }
+        // Opening drops the one nothing names, in the file and in what the project holds.
+        let project = Project::open(&path).unwrap();
+        assert_eq!(stored_families(&project), ["Zeist"]);
+        assert_eq!(project.embedded.borrow().len(), 1);
+        assert!(!fonts::has_family("Zeyst"), "and opening registered nothing");
+        // Save As is the same for the project it saves, and for its copy.
+        project.store_fonts(std::slice::from_ref(&unused)).unwrap();
+        project.load_fonts().unwrap();
+        assert_eq!(project.embedded.borrow().len(), 2);
+        let copy = dir.join("b.kerf");
+        project.save_as(&copy).unwrap();
+        assert_eq!(stored_families(&project), ["Zeist"], "the project that was saved");
+        assert_eq!(project.embedded.borrow().len(), 1);
+        assert_eq!(stored_families(&Project::open(&copy).unwrap()), ["Zeist"], "the copy");
+        drop(project);
+        fonts::replace_embedded(Vec::new());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_font_already_stored_is_not_written_again() {
+        let project = Project::open_in_memory().unwrap();
+        let font = EmbeddedFont::new("Zeist", fonts::shipped_font_renamed(true, "Zeist"));
+        project.store_fonts(std::slice::from_ref(&font)).unwrap();
+        let changes = project.conn.total_changes();
+        project.store_fonts(&[font.clone(), font]).unwrap();
+        assert_eq!(project.conn.total_changes(), changes, "no row was written for a stored font");
+        assert_eq!(project.embedded_fonts().unwrap().len(), 1);
+        // And one font offered twice is stored, and counted for the limit, once.
+        let other = EmbeddedFont::new("Zeyst", fonts::shipped_font_renamed(false, "Zeyst"));
+        project.store_fonts(&[other.clone(), other]).unwrap();
+        assert_eq!(project.embedded_fonts().unwrap().len(), 2);
+        let twice = EmbeddedFont::new("Big", vec![7u8; (MAX_PROJECT_FONT_BYTES / 2 + 1) as usize]);
+        assert!(project.check_font_room(&[twice.clone(), twice]).is_ok());
     }
 
     #[test]
@@ -748,7 +1041,8 @@ mod tests {
             )
             .unwrap();
         assert!(project.embedded_fonts().unwrap().is_empty());
-        project.register_fonts().unwrap();
+        project.load_fonts().unwrap();
+        project.activate_fonts();
         assert_eq!(fonts::embedded_digest(), None);
     }
 

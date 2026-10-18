@@ -2465,29 +2465,50 @@ fn template_library() -> CmdResult<TemplateLibrary> {
     TemplateLibrary::default_location().map_err(|e| e.to_string())
 }
 
-/// The most bytes of an image file a template control reads: a title is held to 128 KiB, so an image
-/// that fits is far smaller, and a bigger file is refused unread.
-const TEMPLATE_IMAGE_FILE_MAX: u64 = 4 << 20;
-
 /// An image file as the `data:` URL an `image` control takes (`kerf_core::template::image_data_url`
 /// judges the picture; this only reads the file, bounded). Shared with the MCP tools.
+///
+/// The bound is the one the engine holds a picture to ([`kerf_core::template::MAX_IMAGE_BYTES`], a little
+/// under 96 KB: a title is at most 128 KiB), and it is kept by the read itself rather than by a `stat`
+/// that the file could outgrow: the file is opened, looked at through the handle it was opened as, and read
+/// at most one byte past the bound.
 pub(crate) fn template_image_data_url(path: &str) -> kerf_core::Result<String> {
     use kerf_core::Error;
+    use std::io::Read;
+    let refuse = |why: String| Error::InvalidArgument(why);
+    let limit = kerf_core::template::MAX_IMAGE_BYTES as u64;
     let file = std::path::Path::new(path);
     if !file.is_absolute() {
-        return Err(Error::InvalidArgument(format!("{path} must be an absolute file path")));
+        return Err(refuse(format!("{path} must be an absolute file path")));
     }
-    let meta = std::fs::metadata(file).map_err(|e| Error::InvalidArgument(format!("cannot read {path}: {e}")))?;
+    // Not opened if it is not a regular file at all: opening a named pipe would wait for a writer.
+    let meta = std::fs::metadata(file).map_err(|e| refuse(format!("cannot read {path}: {e}")))?;
     if !meta.is_file() {
-        return Err(Error::InvalidArgument(format!("{path} is not a regular file")));
+        return Err(refuse(format!("{path} is not a regular file")));
     }
-    if meta.len() > TEMPLATE_IMAGE_FILE_MAX {
-        return Err(Error::InvalidArgument(format!(
-            "{path} is {} MiB: too large for an image in a title",
-            meta.len().div_ceil(1 << 20)
-        )));
+    let handle = std::fs::File::open(file).map_err(|e| refuse(format!("cannot read {path}: {e}")))?;
+    let meta = handle.metadata().map_err(|e| refuse(format!("cannot read {path}: {e}")))?;
+    if !meta.is_file() {
+        return Err(refuse(format!("{path} is not a regular file")));
     }
-    let bytes = std::fs::read(file).map_err(|e| Error::InvalidArgument(format!("cannot read {path}: {e}")))?;
+    let too_big = |bytes: u64| {
+        refuse(format!(
+            "{path} is {} KiB: too large for an image in a title (at most {} KiB)",
+            bytes.div_ceil(1024),
+            limit / 1024
+        ))
+    };
+    if meta.len() > limit {
+        return Err(too_big(meta.len()));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    handle
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| refuse(format!("cannot read {path}: {e}")))?;
+    if bytes.len() as u64 > limit {
+        return Err(too_big(bytes.len() as u64));
+    }
     kerf_core::template::image_data_url(&bytes)
 }
 
@@ -5416,11 +5437,31 @@ mod tests {
         assert!(require_template_path("/t/card").is_err());
     }
 
+    /// The ids command takes text straight from the webview: a title is at most 128 KiB, and a document
+    /// over that is refused before anything is parsed.
+    #[test]
+    fn the_ids_of_a_title_are_listed_for_a_title_that_could_be_one() {
+        let ok = super::svg_element_ids(r#"<svg xmlns="http://www.w3.org/2000/svg"><text id="a"/><g id="b"/></svg>"#.to_string())
+            .unwrap();
+        assert_eq!(
+            ok.iter().map(|e| (e.id.as_str(), e.tag.as_str())).collect::<Vec<_>>(),
+            [("a", "text"), ("b", "g")]
+        );
+        let big = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><text id="a"/><!--{}--></svg>"#,
+            "x".repeat(200 * 1024)
+        );
+        let e = super::svg_element_ids(big).err().expect("over the size of a title");
+        assert!(e.contains("larger than 128 KiB"), "{e}");
+        assert!(super::svg_element_ids("not svg".to_string()).is_err());
+    }
+
     /// A picture for an image control is read bounded, and the engine judges it: a file that is not a
     /// picture, a relative path, a directory and an oversized file are all refused with a reason.
     #[test]
     fn a_picture_for_a_template_is_read_bounded_and_judged_by_the_engine() {
-        use super::{template_image_data_url, TEMPLATE_IMAGE_FILE_MAX};
+        use super::template_image_data_url;
+        let limit = kerf_core::template::MAX_IMAGE_BYTES as u64;
         let dir = Scratch::new("template-image");
         let png = dir.0.join("logo.png");
         let bytes = base64::engine::general_purpose::STANDARD
@@ -5440,10 +5481,28 @@ mod tests {
         let text = dir.0.join("notes.txt");
         std::fs::write(&text, "not a picture").unwrap();
         assert!(refused(&text).contains("PNG, JPEG, GIF or WebP"));
+        // The bound is the engine's own: a file one byte over what fits in a title is refused, whatever
+        // it is, and without being read whole (a huge sparse one answers at once).
         let big = dir.0.join("big.png");
         let file = std::fs::File::create(&big).unwrap();
-        file.set_len(TEMPLATE_IMAGE_FILE_MAX + 1).unwrap();
-        assert!(refused(&big).contains("too large"), "{}", refused(&big));
+        file.set_len(limit + 1).unwrap();
+        let why = refused(&big);
+        assert!(why.contains("is 95 KiB") && why.contains("at most 94 KiB"), "{why}");
+        let huge = dir.0.join("huge.png");
+        std::fs::File::create(&huge).unwrap().set_len(8 << 30).unwrap();
+        assert!(refused(&huge).contains("too large"));
+        // A picture that is within the bound but not one the engine takes is the engine's refusal.
+        let mut padded = bytes;
+        padded.resize(limit as usize, 0);
+        assert!(template_image_data_url(write(&dir.0, "padded.png", &padded).to_str().unwrap()).is_ok());
+        padded.push(0);
+        assert!(refused(&write(&dir.0, "over.png", &padded)).contains("too large"));
+    }
+
+    fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
     }
 
     #[test]

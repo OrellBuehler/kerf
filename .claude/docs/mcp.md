@@ -248,10 +248,15 @@ title that changed in between: "try again"). Both answer `SvgOverlayOutcome` —
 `template` (`template_id`, `name`, `controls` without their targets, `values`) is how an agent learns the control ids to set,
 and `warnings`; `timeline_summary` lists it the same way. `values` are strings by control id (partial; an unknown id is
 `invalid_params`); an `image` control takes a picture **file** through `image_files` (control id → absolute path, at most 8,
-`require_local_input_path` then a bounded read — 4 MiB — and `template::image_data_url`), and a control in both maps is refused.
-`import_template` takes the import-path rules (`require_local_input_path`, `validate_import_path`) and must end in `.kerftemplate`;
-`export_template` is `export_srt`'s shape (`require_local_output_path`, the `.kerftemplate` extension so no directory or
-other-extension guessing, `refuse_overwrite`, `check_outputs`) and also refuses a path inside the library directory. **`delete_template`
+`require_local_input_path` then `crate::template_image_data_url`: the file is opened, looked at through the handle and read at most
+one byte past `template::MAX_IMAGE_BYTES` — 94 KiB, what fits in a title, the limit the engine judges by — and then
+`template::image_data_url`), and a control in both maps is refused. `set_template_values` with no values (and no files) is the engine's
+`InvalidArgument` ("no values to set"), not an adapter check.
+`import_template` takes the import-path rules (`require_local_input_path`, then the `.kerftemplate` name check, and only then
+`validate_import_path` on `blocking`); `export_template` is `export_srt`'s shape (`require_local_output_path`, the `.kerftemplate`
+extension so no directory or other-extension guessing) and **everything that looks at the disk runs in one `blocking` step**
+(`export_now`: `refuse_overwrite`, the refusal of a path inside the library directory — it canonicalises — and `check_outputs_now`,
+then the write), the async worker doing none of it. **`delete_template`
 is refused while `agent_review` is on** (a template is the user's own work and the delete cannot be undone), annotated destructive
 like `export_template`; `save_template` and `apply_template` are annotated as edits, `set_template_values` / `import_template` as
 idempotent sets. The instructions place the loop after the SVG one: author with `id`s → `validate_svg` → `add_svg_overlay` →

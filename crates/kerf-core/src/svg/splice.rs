@@ -19,7 +19,8 @@ use crate::error::Result;
 /// The part of an element a value goes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Part<'a> {
-    /// Everything between the start and the end tag.
+    /// The element's own text: its direct text nodes. Child elements (`<animate>`, `<set>`, a styled
+    /// `<tspan>`) and comments are not text and are never touched.
     Text,
     /// The value of the attribute with this name as the source spells it (`fill`, `xlink:href`).
     Attribute(&'a str),
@@ -27,9 +28,25 @@ pub(crate) enum Part<'a> {
 
 /// One replacement of a byte range of the source.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Edit {
+struct Piece {
     range: Range<usize>,
     with: String,
+}
+
+impl Piece {
+    fn new(range: Range<usize>, with: impl Into<String>) -> Self {
+        Self {
+            range,
+            with: with.into(),
+        }
+    }
+}
+
+/// What it takes to put one value somewhere: usually one replaced range, several for text that is
+/// split by child elements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Edit {
+    pieces: Vec<Piece>,
 }
 
 /// A title's elements by `id`, read once.
@@ -57,6 +74,15 @@ impl<'a> Elements<'a> {
             }
         }
         Ok(Self { src, doc, by_id })
+    }
+
+    /// Every element that has an `id`, in document order, with its tag name (no prefix).
+    pub(crate) fn ids(&self) -> Vec<(String, String)> {
+        self.doc
+            .descendants()
+            .filter(Node::is_element)
+            .filter_map(|n| Some((plain_attribute(&n, "id")?.to_string(), n.tag_name().name().to_string())))
+            .collect()
     }
 
     /// How many elements have this `id`.
@@ -93,12 +119,13 @@ impl<'a> Elements<'a> {
         })
     }
 
-    /// The current value of `part`: the text content (entities decoded) or the attribute's value.
+    /// The current value of `part`: the element's own text (its direct text nodes, entities decoded: the
+    /// text `edit` writes, not that of its children) or the attribute's value.
     pub(crate) fn read(&self, id: &str, part: Part<'_>) -> Result<Option<String>> {
         let node = self.one(id)?;
         Ok(match part {
             Part::Text => Some(
-                node.descendants()
+                node.children()
                     .filter(|n| n.node_type() == NodeType::Text)
                     .filter_map(|n| n.text())
                     .collect(),
@@ -118,8 +145,7 @@ impl<'a> Elements<'a> {
                 let (range, quote) = value_range(self.src, attr.range())
                     .ok_or_else(|| invalid(format!("the attribute “{name}” of “{id}” cannot be read")))?;
                 Ok(Edit {
-                    range,
-                    with: escape_attr(value, quote),
+                    pieces: vec![Piece::new(range, escape_attr(value, quote))],
                 })
             }
             Part::Text => {
@@ -134,22 +160,47 @@ impl<'a> Elements<'a> {
                         .map_or(open_end, |i| range.start + 1 + i);
                     let name = &self.src[range.start + 1..name_end];
                     Ok(Edit {
-                        range: open_end - 2..open_end,
-                        with: format!(">{escaped}</{name}>"),
+                        pieces: vec![Piece::new(open_end - 2..open_end, format!(">{escaped}</{name}>"))],
                     })
                 } else {
                     let close = self.src[..range.end]
                         .rfind("</")
                         .filter(|close| *close >= open_end)
                         .ok_or_else(|| invalid(format!("the element “{id}” has no end tag")))?;
-                    Ok(Edit {
-                        range: open_end..close,
-                        with: escaped,
-                    })
+                    // The value goes into the first run of the element's own text and the other runs
+                    // are emptied; a child element between them stays. With no text at all the value
+                    // goes just before the end tag.
+                    let mut runs = text_runs(&node, open_end, close).into_iter();
+                    let pieces = match runs.next() {
+                        None => vec![Piece::new(close..close, escaped)],
+                        Some(first) => std::iter::once(Piece::new(first, escaped))
+                            .chain(runs.map(|run| Piece::new(run, "")))
+                            .collect(),
+                    };
+                    Ok(Edit { pieces })
                 }
             }
         }
     }
+}
+
+/// The byte ranges of `node`'s own text, between its tags: what is not inside a child element, a comment or
+/// a processing instruction. (A text node's own range is no help: roxmltree merges text and CDATA into
+/// one node and ranges only the first piece, so the runs are the gaps between the children.)
+fn text_runs(node: &Node<'_, '_>, open_end: usize, close: usize) -> Vec<Range<usize>> {
+    let mut runs = Vec::new();
+    let mut at = open_end;
+    for child in node.children().filter(|c| c.node_type() != NodeType::Text) {
+        let r = child.range();
+        if r.start > at {
+            runs.push(at..r.start);
+        }
+        at = at.max(r.end);
+    }
+    if close > at {
+        runs.push(at..close);
+    }
+    runs
 }
 
 /// The attribute `name` as the source spells it: `href` has no namespace, `xlink:href` is the XLink one.
@@ -171,17 +222,20 @@ fn escape_text(value: &str) -> String {
 /// `src` with `edits` made. Two edits that touch the same bytes (two controls on one attribute, or a
 /// control on a text whose element another control sets inside) are an error: neither could say what
 /// the result is.
-pub(crate) fn apply(src: &str, mut edits: Vec<Edit>) -> Result<String> {
-    edits.sort_by(|a, b| a.range.start.cmp(&b.range.start).then(a.range.end.cmp(&b.range.end)));
+pub(crate) fn apply(src: &str, edits: Vec<Edit>) -> Result<String> {
+    let mut pieces: Vec<Piece> = edits.into_iter().flat_map(|e| e.pieces).collect();
+    pieces.sort_by(|a, b| a.range.start.cmp(&b.range.start).then(a.range.end.cmp(&b.range.end)));
     let mut out = String::with_capacity(src.len());
     let mut at = 0;
-    for edit in &edits {
-        if edit.range.start < at {
+    let mut last_start = None;
+    for piece in &pieces {
+        if piece.range.start < at || last_start == Some(piece.range.start) {
             return Err(invalid("two controls set the same part of the title"));
         }
-        out.push_str(&src[at..edit.range.start]);
-        out.push_str(&edit.with);
-        at = edit.range.end;
+        out.push_str(&src[at..piece.range.start]);
+        out.push_str(&piece.with);
+        at = piece.range.end;
+        last_start = Some(piece.range.start);
     }
     out.push_str(&src[at..]);
     Ok(out)
@@ -244,8 +298,28 @@ mod tests {
     fn text_is_read_decoded_and_whole() {
         let elements = Elements::parse(DOC).unwrap();
         assert_eq!(elements.read("tag", Part::Text).unwrap().as_deref(), Some("Hello & welcome"));
-        assert_eq!(elements.read("nest", Part::Text).unwrap().as_deref(), Some("a"));
+        assert_eq!(elements.read("nest", Part::Text).unwrap().as_deref(), Some(""));
+        assert_eq!(elements.read("inner", Part::Text).unwrap().as_deref(), Some("a"));
         assert_eq!(elements.read("empty", Part::Text).unwrap().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn the_ids_are_listed_in_document_order_with_their_tags() {
+        let elements = Elements::parse(DOC).unwrap();
+        let ids = elements.ids();
+        let names: Vec<(&str, &str)> = ids.iter().map(|(i, t)| (i.as_str(), t.as_str())).collect();
+        assert_eq!(
+            names,
+            [
+                ("bg", "rect"),
+                ("tag", "text"),
+                ("empty", "text"),
+                ("short", "text"),
+                ("logo", "image"),
+                ("nest", "text"),
+                ("inner", "tspan")
+            ]
+        );
     }
 
     #[test]
@@ -277,9 +351,12 @@ mod tests {
         let a = elements.edit("bg", Part::Attribute("fill"), "red").unwrap();
         let b = elements.edit("bg", Part::Attribute("fill"), "blue").unwrap();
         assert!(apply(DOC, vec![a, b]).is_err());
-        let outer = elements.edit("nest", Part::Text, "x").unwrap();
-        let inner = elements.edit("inner", Part::Text, "y").unwrap();
-        assert!(apply(DOC, vec![outer, inner]).is_err());
+        let t1 = elements.edit("tag", Part::Text, "x").unwrap();
+        let t2 = elements.edit("tag", Part::Text, "y").unwrap();
+        assert!(apply(DOC, vec![t1, t2]).is_err());
+        let e1 = elements.edit("empty", Part::Text, "x").unwrap();
+        let e2 = elements.edit("empty", Part::Text, "y").unwrap();
+        assert!(apply(DOC, vec![e1, e2]).is_err(), "two inserts at one point");
         assert!(elements.contains("nest", "inner").unwrap());
         assert!(!elements.contains("inner", "nest").unwrap());
     }
@@ -293,5 +370,103 @@ mod tests {
         let two = apply(DOC, vec![b, a]).unwrap();
         assert_eq!(one, two);
         assert!(one.contains("fill='red'") && one.contains(">hi</text>"));
+    }
+
+    const ANIMATED: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <text id="tag" x="1" y="2" opacity="0"><animate attributeName="opacity" from="0" to="1" dur="1s" fill="freeze"/>Hello</text>
+  <text id="styled" x="1" y="2">Hi <tspan id="bold" font-weight="bold" fill="#f00">there</tspan> you<!-- note --> all</text>
+  <text id="cdata" x="1" y="2">A<![CDATA[ <B> ]]>C</text>
+  <text id="onlykids" x="1" y="2"><animate attributeName="opacity" from="0" to="1" dur="1s"/><tspan>kid</tspan></text>
+  <text id="blank" x="1" y="2"><set attributeName="opacity" to="1" begin="0s"/></text>
+  <text id="spread" x="1" y="2">
+    <animate attributeName="opacity" from="0" to="1" dur="1s"/>
+    Hello
+  </text>
+</svg>"##;
+
+    fn set_in(src: &str, id: &str, value: &str) -> String {
+        let elements = Elements::parse(src).unwrap();
+        apply(src, vec![elements.edit(id, Part::Text, value).unwrap()]).unwrap()
+    }
+
+    #[test]
+    fn setting_text_keeps_a_smil_animation_inside_the_element() {
+        let out = set_in(ANIMATED, "tag", "Bye & bye");
+        assert!(
+            out.contains(
+                r#"<text id="tag" x="1" y="2" opacity="0"><animate attributeName="opacity" from="0" to="1" dur="1s" fill="freeze"/>Bye &amp; bye</text>"#
+            ),
+            "{out}"
+        );
+        assert!(crate::svg::SvgDoc::parse(ANIMATED).unwrap().is_animated());
+        let doc = crate::svg::SvgDoc::parse(&out).unwrap();
+        assert!(doc.is_animated(), "the animation survives the set");
+        assert!(doc.sanitized().contains("<animate"), "{}", doc.sanitized());
+    }
+
+    #[test]
+    fn setting_text_keeps_styled_children_comments_and_empties_the_other_runs() {
+        let out = set_in(ANIMATED, "styled", "Yo");
+        assert!(
+            out.contains(r##"<text id="styled" x="1" y="2">Yo<tspan id="bold" font-weight="bold" fill="#f00">there</tspan><!-- note --></text>"##),
+            "{out}"
+        );
+        let elements = Elements::parse(&out).unwrap();
+        assert_eq!(elements.read("styled", Part::Text).unwrap().as_deref(), Some("Yo"));
+        assert_eq!(elements.read("bold", Part::Text).unwrap().as_deref(), Some("there"));
+    }
+
+    #[test]
+    fn text_and_cdata_in_one_run_are_replaced_together() {
+        let out = set_in(ANIMATED, "cdata", "x");
+        assert!(out.contains(r#"<text id="cdata" x="1" y="2">x</text>"#), "{out}");
+        let elements = Elements::parse(ANIMATED).unwrap();
+        assert_eq!(elements.read("cdata", Part::Text).unwrap().as_deref(), Some("A <B> C"));
+    }
+
+    #[test]
+    fn an_element_with_children_and_no_text_gets_the_text_before_its_end_tag() {
+        let out = set_in(ANIMATED, "onlykids", "x < y");
+        assert!(
+            out.contains(r#"<tspan>kid</tspan>x &lt; y</text>"#) && out.contains("<animate"),
+            "{out}"
+        );
+        let out = set_in(ANIMATED, "blank", "x");
+        assert!(
+            out.contains(r#"<set attributeName="opacity" to="1" begin="0s"/>x</text>"#),
+            "{out}"
+        );
+        for id in ["onlykids", "blank"] {
+            assert!(Document::parse(&set_in(ANIMATED, id, "\u{e9}<\"'>")).is_ok(), "{id}");
+        }
+    }
+
+    #[test]
+    fn the_value_shown_is_the_value_a_set_writes() {
+        for id in ["tag", "styled", "cdata", "onlykids", "blank", "spread"] {
+            let out = set_in(ANIMATED, id, "Fresh");
+            let elements = Elements::parse(&out).unwrap();
+            assert_eq!(elements.read(id, Part::Text).unwrap().as_deref(), Some("Fresh"), "{id}");
+            assert!(crate::svg::SvgDoc::parse(&out).is_ok(), "{id}");
+        }
+        let out = set_in(ANIMATED, "spread", "Fresh");
+        assert!(
+            out.contains(
+                r#"<text id="spread" x="1" y="2">Fresh<animate attributeName="opacity" from="0" to="1" dur="1s"/></text>"#
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_tspan_can_be_set_inside_a_text_that_is_set_too() {
+        let elements = Elements::parse(ANIMATED).unwrap();
+        let outer = elements.edit("styled", Part::Text, "Yo").unwrap();
+        let inner = elements.edit("bold", Part::Text, "you").unwrap();
+        let out = apply(ANIMATED, vec![outer, inner]).unwrap();
+        assert!(
+            out.contains(r##"Yo<tspan id="bold" font-weight="bold" fill="#f00">you</tspan>"##),
+            "{out}"
+        );
     }
 }

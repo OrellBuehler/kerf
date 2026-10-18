@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::archive::Template;
 use super::model::{TemplateControl, TemplateInstance, TemplateKind};
-use super::validate::{has_control_chars, invalid, MAX_FAMILY_CHARS, MAX_TEXT_CHARS};
+use super::validate::{has_control_chars, invalid, validate_controls_shape, MAX_FAMILY_CHARS, MAX_TEXT_CHARS};
 use crate::error::Result;
 use crate::fonts::{self, EmbeddedFont};
 use crate::svg::splice::{self, Elements, Part};
@@ -58,17 +58,32 @@ fn valid_family(s: &str) -> bool {
 /// trimmed, a number in its plain form, an image as the `data:` URL it is.
 fn check_value(control: &TemplateControl, value: &str) -> Result<String> {
     let id = &control.id;
+    // Before anything reads it (a data URL is decoded, every target gets a copy): no value of any kind
+    // can be bigger than the title it goes into.
+    if value.len() > crate::svg::MAX_BYTES {
+        return Err(invalid(format!(
+            "the value for “{id}” is {} KiB; a title is at most {} KiB",
+            value.len().div_ceil(1024),
+            crate::svg::MAX_BYTES / 1024
+        )));
+    }
     match control.kind {
         TemplateKind::Text => {
-            if value.chars().count() > MAX_TEXT_CHARS {
+            // A line break is a line break however the platform it was typed on spells it.
+            let text = if value.contains('\r') {
+                value.replace("\r\n", "\n").replace('\r', "\n")
+            } else {
+                value.to_string()
+            };
+            if text.chars().count() > MAX_TEXT_CHARS {
                 return Err(invalid(format!(
                     "the text of “{id}” is longer than {MAX_TEXT_CHARS} characters"
                 )));
             }
-            if has_control_chars(value) {
+            if has_control_chars(&text) {
                 return Err(invalid(format!("the text of “{id}” has a control character in it")));
             }
-            Ok(value.to_string())
+            Ok(text)
         }
         TemplateKind::Color => {
             let color = value.trim();
@@ -174,17 +189,25 @@ pub fn read_values(svg: &str, controls: &[TemplateControl]) -> BTreeMap<String, 
 }
 
 /// A warning for each `font` control set to a family nothing has (not installed, not embedded, not one of
-/// `carried`): the title would be drawn in Geist instead.
+/// `carried`): the title would be drawn in Geist instead. What the title holds is a `font-family` *list*
+/// (`'Barlow Condensed', sans-serif`), read as CSS reads one: split on commas, quotes stripped, names
+/// compared without regard to case, and the control is fine when any of them is something the title can
+/// be drawn in (a generic family always is).
 fn font_warnings(controls: &[TemplateControl], now: &BTreeMap<String, String>, carried: &[&str]) -> Vec<String> {
     controls
         .iter()
         .filter(|c| c.kind == TemplateKind::Font)
         .filter_map(|c| {
-            let family = now.get(&c.id)?;
-            let known = carried.contains(&family.as_str()) || fonts::is_generic_family(family) || fonts::has_family(family);
+            let list = now.get(&c.id)?;
+            let first = fonts::family_list(list).next()?;
+            let known = fonts::family_list(list).any(|family| {
+                carried.iter().any(|have| fonts::same_family(have, family))
+                    || fonts::is_generic_family(family)
+                    || fonts::has_family(family)
+            });
             (!known).then(|| {
                 format!(
-                    "the font “{family}” is not installed, so “{}” is drawn in {}",
+                    "the font “{first}” is not installed, so “{}” is drawn in {}",
                     c.label,
                     fonts::DEFAULT_FAMILY
                 )
@@ -263,8 +286,16 @@ impl TemplateEditInputs {
     }
 
     /// Apply `values` (partial) to the title as it is now and read the result. Pure and slow: not for
-    /// under the project lock.
+    /// under the project lock. **No values is an error**, not an edit that changes nothing: it would
+    /// record a revision that did nothing. The controls were stored with the title, so they are checked
+    /// again before they are trusted to say where a value goes.
     pub fn prepare(&self, values: &BTreeMap<String, String>) -> Result<PreparedValues> {
+        if values.is_empty() {
+            return Err(invalid(
+                "no values to set: name at least one of the title's controls and the value it should take",
+            ));
+        }
+        validate_controls_shape(&self.instance.controls)?;
         let spliced = apply_values(&self.svg, &self.instance.controls, values)?;
         let doc = SvgDoc::parse(&spliced)?;
         let now = read_values(doc.sanitized(), &self.instance.controls);
@@ -289,6 +320,10 @@ pub struct PreparedValues {
     pub(crate) warnings: Vec<String>,
 }
 
+/// The most bytes of an image file that fit in a title: base64 grows it by a third, and the whole title is
+/// held to [`crate::svg::MAX_BYTES`] with some room left for the artwork around it.
+pub const MAX_IMAGE_BYTES: usize = crate::svg::MAX_BYTES * 3 / 4 - 2048;
+
 /// An image file's bytes as the `data:` URL an `image` control takes: PNG, JPEG, GIF or WebP, by its
 /// first bytes, within the embedded-image pixel cap, and small enough to sit in a title (the whole SVG is
 /// held to 128 KiB). Pure; a surface reads the file first.
@@ -305,12 +340,11 @@ pub fn image_data_url(bytes: &[u8]) -> Result<String> {
         return Err(invalid("not a PNG, JPEG, GIF or WebP image"));
     };
     images::check(mime, bytes).map_err(|why| invalid(why.to_string()))?;
-    let limit = crate::svg::MAX_BYTES * 3 / 4 - 2048;
-    if bytes.len() > limit {
+    if bytes.len() > MAX_IMAGE_BYTES {
         return Err(invalid(format!(
             "the image is {} KiB; one that sits in a title is at most {} KiB",
             bytes.len().div_ceil(1024),
-            limit / 1024
+            MAX_IMAGE_BYTES / 1024
         )));
     }
     Ok(format!("data:{mime};base64,{}", base64(bytes)))
@@ -559,5 +593,128 @@ mod tests {
         for (len, expect) in [(0usize, ""), (1, "AA=="), (2, "AAA="), (3, "AAAA")] {
             assert_eq!(base64(&vec![0u8; len]), expect);
         }
+    }
+
+    const ANIMATED: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+<text id="tag" x="1" y="50" font-size="12" opacity="0"><animate attributeName="opacity" from="0" to="1" dur="1s" fill="freeze"/>Hello</text>
+<text id="rich" x="1" y="80" font-size="12">Big <tspan id="word" font-weight="bold" fill="#ff0000">news</tspan> today</text>
+</svg>"##;
+
+    fn animated_controls() -> Vec<TemplateControl> {
+        vec![
+            control("tagline", TemplateKind::Text, "tag", None),
+            control("rich", TemplateKind::Text, "rich", None),
+            control("word", TemplateKind::Text, "word", None),
+        ]
+    }
+
+    #[test]
+    fn setting_a_text_keeps_the_animation_and_the_styled_words_inside_it() {
+        assert!(SvgDoc::parse(ANIMATED).unwrap().is_animated());
+        let out = apply_values(ANIMATED, &animated_controls(), &values(&[("tagline", "Bye")])).unwrap();
+        assert!(
+            out.contains(r#"<animate attributeName="opacity" from="0" to="1" dur="1s" fill="freeze"/>Bye</text>"#),
+            "{out}"
+        );
+        let doc = SvgDoc::parse(&out).unwrap();
+        assert!(doc.is_animated(), "the title still fades in");
+        assert!(doc.sanitized().contains("<animate"));
+        assert_eq!(read_values(doc.sanitized(), &animated_controls())["tagline"], "Bye");
+
+        // The text around a styled word is the control's; the word has a control of its own.
+        let out = apply_values(
+            ANIMATED,
+            &animated_controls(),
+            &values(&[("rich", "Old"), ("word", "stories")]),
+        )
+        .unwrap();
+        assert!(
+            out.contains(r##"Old<tspan id="word" font-weight="bold" fill="#ff0000">stories</tspan></text>"##),
+            "{out}"
+        );
+        let read = read_values(SvgDoc::parse(&out).unwrap().sanitized(), &animated_controls());
+        assert_eq!((read["rich"].as_str(), read["word"].as_str()), ("Old", "stories"));
+        // Reading before any set shows the text a set writes over, not the words inside it.
+        let before = read_values(ANIMATED, &animated_controls());
+        assert_eq!((before["rich"].as_str(), before["tagline"].as_str()), ("Big  today", "Hello"));
+    }
+
+    #[test]
+    fn a_line_break_is_one_whatever_it_was_typed_on() {
+        let out = apply(&[("tagline", "one\r\ntwo\rthree\nfour")]).unwrap();
+        assert!(out.contains(">one\ntwo\nthree\nfour</text>"), "{out:?}");
+        assert!(!out.contains('\r'));
+        let err = apply(&[("tagline", "a\u{0}b")]).unwrap_err().to_string();
+        assert!(err.contains("control character"), "{err}");
+    }
+
+    #[test]
+    fn a_value_bigger_than_a_title_is_refused_before_it_is_read() {
+        let huge = format!("data:image/png;base64,{}", "A".repeat(crate::svg::MAX_BYTES));
+        for (id, value) in [
+            ("logo", huge.as_str()),
+            ("tagline", &huge),
+            ("brand", &huge),
+            ("face", &huge),
+            ("radius", &huge),
+        ] {
+            let err = apply(&[(id, value)]).unwrap_err().to_string();
+            assert!(err.contains("a title is at most 128 KiB"), "{id}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_font_list_is_read_as_css_reads_it() {
+        let controls = vec![control("face", TemplateKind::Font, "tag", Some("font-family"))];
+        let warn = |list: &str, carried: &[&str]| font_warnings(&controls, &values(&[("face", list)]), carried);
+        assert!(warn("Geist", &[]).is_empty());
+        assert!(warn("'Geist', sans-serif", &[]).is_empty(), "quotes and a fallback list");
+        assert!(warn("\"GEIST\"", &[]).is_empty(), "case does not matter");
+        assert!(
+            warn("Nope One, sans-serif", &[]).is_empty(),
+            "a generic family is always there"
+        );
+        assert!(warn("zeist , 'Nope'", &["Zeist"]).is_empty(), "carried, whatever the case");
+        assert!(warn("", &[]).is_empty());
+        let w = warn("'Nope One', \"Nope Two\"", &[]);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("“Nope One”") && w[0].contains("The face"), "{w:?}");
+        assert!(warn("Zeist", &[]).len() == 1, "not carried, not installed");
+    }
+
+    fn inputs(controls: Vec<TemplateControl>, values: BTreeMap<String, String>) -> Result<PreparedValues> {
+        let overlay = uuid::Uuid::new_v4();
+        let instance = TemplateInstance {
+            template_id: uuid::Uuid::new_v4().to_string(),
+            name: "t".into(),
+            controls,
+            values: BTreeMap::new(),
+        };
+        TemplateEditInputs::new(overlay, SVG.to_string(), instance).prepare(&values)
+    }
+
+    #[test]
+    fn setting_no_values_is_an_error_not_an_edit_that_changes_nothing() {
+        let err = inputs(controls(), BTreeMap::new()).unwrap_err().to_string();
+        assert!(err.contains("no values to set"), "{err}");
+        assert!(inputs(controls(), values(&[("tagline", "x")])).is_ok());
+    }
+
+    #[test]
+    fn controls_stored_in_a_project_are_checked_before_they_are_trusted() {
+        // A project file can hold anything: a control that writes an event handler, one whose id is not a key.
+        let mut evil = control("tagline", TemplateKind::Number, "dot", Some("onclick"));
+        evil.id = "tagline".into();
+        let err = inputs(vec![evil], values(&[("tagline", "1")])).unwrap_err().to_string();
+        assert!(err.contains("onclick"), "{err}");
+        let mut odd = control("x", TemplateKind::Text, "tag", None);
+        odd.id = "a b\"c".into();
+        assert!(inputs(vec![odd], values(&[("a b\"c", "1")])).is_err());
+        let mut twice = controls();
+        twice.push(control("tagline", TemplateKind::Text, "tag", None));
+        assert!(inputs(twice, values(&[("tagline", "1")]))
+            .unwrap_err()
+            .to_string()
+            .contains("two controls"));
     }
 }

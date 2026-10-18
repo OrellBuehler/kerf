@@ -205,6 +205,15 @@ impl Template {
         for entry in &mut manifest.fonts {
             let data = Arc::new(opened.required(&entry.file, MAX_FONT_BYTES)?);
             let check = fonts::check_font(&data).map_err(|e| invalid(format!("the font “{}”: {e}", entry.file)))?;
+            // `save` leaves such a font out; a file that carries one anyway (made elsewhere, or by hand) is
+            // refused whole, as one with a font that cannot be read is: dropping it would hand back a
+            // template that draws differently from the one that was sent.
+            if !fonts::embedding_allowed(&data) {
+                return Err(invalid(format!(
+                    "the font “{}” does not allow embedding (its licence is restricted), so a template cannot carry it",
+                    entry.file
+                )));
+            }
             // What a person reads is the family the file really is.
             entry.family = check.family;
             fonts.push(EmbeddedFont {
@@ -327,7 +336,8 @@ impl Template {
     }
 
     /// The name this template is exported under: its name made safe for a file system, then the
-    /// extension.
+    /// extension. A name Windows reserves for a device (`con`, `nul`, `com1` ... also with an extension
+    /// after them) gets an underscore in front, so the file can be made on every system.
     pub fn file_name(&self) -> String {
         let name: String = self
             .manifest
@@ -341,9 +351,25 @@ impl Template {
                 }
             })
             .collect();
-        let name = name.trim().trim_matches('.');
-        format!("{}.{EXTENSION}", if name.is_empty() { "template" } else { name })
+        let name = name.trim().trim_matches('.').trim();
+        let name = if name.is_empty() { "template" } else { name };
+        if windows_reserved(name) {
+            format!("_{name}.{EXTENSION}")
+        } else {
+            format!("{name}.{EXTENSION}")
+        }
     }
+}
+
+/// Whether Windows takes `name` for a device: `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`,
+/// whatever the case and whatever follows the first dot (`con.txt` is the console too).
+fn windows_reserved(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end().to_ascii_lowercase();
+    matches!(stem.as_str(), "con" | "prn" | "aux" | "nul")
+        || stem
+            .strip_prefix("com")
+            .or_else(|| stem.strip_prefix("lpt"))
+            .is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
 }
 
 #[cfg(test)]
@@ -460,6 +486,32 @@ pub(crate) mod tests {
         assert_eq!(back.fonts[0].family, "Zeist");
         assert_eq!(*back.fonts[0].data, data);
         assert_eq!(back.fonts[0].sha256, crate::fonts::sha256_hex(&data));
+    }
+
+    #[test]
+    fn a_font_that_does_not_allow_embedding_is_refused_when_a_file_is_read() {
+        let with_font = |fs_type: u16| {
+            let mut t = template();
+            t.manifest.fonts = vec![ManifestFont {
+                file: "fonts/Zeist.ttf".into(),
+                family: "Zeist".into(),
+            }];
+            t.fonts = vec![EmbeddedFont::new(
+                "Zeist",
+                crate::fonts::with_fs_type(crate::fonts::shipped_font_renamed(true, "Zeist"), fs_type),
+            )];
+            t.to_bytes().unwrap()
+        };
+        for refused in [0x0002u16, 0x0004, 0x0200] {
+            let e = err(&with_font(refused));
+            assert!(
+                e.contains("fonts/Zeist.ttf") && e.contains("does not allow embedding"),
+                "{refused:#06x}: {e}"
+            );
+        }
+        for allowed in [0u16, 0x0008] {
+            assert!(Template::read(&with_font(allowed)).is_ok(), "{allowed:#06x}");
+        }
     }
 
     #[test]
@@ -638,5 +690,28 @@ pub(crate) mod tests {
         assert_eq!(t.file_name(), "_Kite_fun_ end_card.kerftemplate");
         t.manifest.name = "...".into();
         assert_eq!(t.file_name(), "template.kerftemplate");
+    }
+
+    #[test]
+    fn a_name_windows_reserves_for_a_device_is_not_the_file_name() {
+        let mut t = template();
+        for (name, file) in [
+            ("con", "_con.kerftemplate"),
+            ("NUL", "_NUL.kerftemplate"),
+            ("Prn", "_Prn.kerftemplate"),
+            ("aux", "_aux.kerftemplate"),
+            ("COM1", "_COM1.kerftemplate"),
+            ("lpt9", "_lpt9.kerftemplate"),
+            ("con.txt", "_con.txt.kerftemplate"),
+            (" Com3 .x", "_Com3 .x.kerftemplate"),
+            ("COM0", "COM0.kerftemplate"),
+            ("COM10", "COM10.kerftemplate"),
+            ("console", "console.kerftemplate"),
+            ("my con", "my con.kerftemplate"),
+            ("Nullify", "Nullify.kerftemplate"),
+        ] {
+            t.manifest.name = name.into();
+            assert_eq!(t.file_name(), file, "{name:?}");
+        }
     }
 }

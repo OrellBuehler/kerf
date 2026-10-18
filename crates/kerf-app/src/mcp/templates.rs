@@ -19,7 +19,9 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router, ErrorData as McpError};
 use uuid::Uuid;
 
-use super::{blocking, core_err, json, lock_agent_as, parse_arg, refuse_overwrite, KerfMcp, SvgOverlayOutcome};
+use super::{
+    blocking, check_outputs_now, core_err, json, lock_agent_as, parse_arg, refuse_overwrite, KerfMcp, SvgOverlayOutcome,
+};
 
 /// The event the window listens to for a change of the library made behind its back.
 const LIBRARY_CHANGED: &str = "templates-changed";
@@ -239,10 +241,8 @@ fn prepare_values(
     values: Option<BTreeMap<String, String>>,
     image_files: Option<BTreeMap<String, String>>,
 ) -> Result<PreparedValues, McpError> {
+    // No values at all is the engine's to refuse (`TemplateEditInputs::prepare`): one answer for every surface.
     let values = control_values(values, image_files)?;
-    if values.is_empty() {
-        return Err(bad("give `values` and/or `image_files`: there is nothing to change"));
-    }
     let inputs = lock_agent_as(project, owner)
         .template_edit_inputs(overlay_id)
         .map_err(core_err)?;
@@ -260,6 +260,29 @@ fn save_title(
 ) -> Result<TemplateSaved, McpError> {
     let source = lock_agent_as(project, owner).template_source(overlay_id).map_err(core_err)?;
     library.save(&source, request).map_err(core_err)
+}
+
+/// `import_template`'s work: the file looked at on disk, then read into the library. Blocking.
+fn import_now(library: &TemplateLibrary, path: &std::path::Path) -> Result<kerf_core::ImportOutcome, McpError> {
+    kerf_core::paths::validate_import_path(path).map_err(core_err)?;
+    library.import(path).map_err(core_err)
+}
+
+/// `export_template`'s work: every look at the disk (does the file exist, where does the path really
+/// lead) and the write. Blocking; the lock is taken only to read what the project protects.
+fn export_now(
+    project: &Mutex<Project>,
+    owner: Option<&str>,
+    library: &TemplateLibrary,
+    template_id: &str,
+    path: &std::path::Path,
+    overwrite: bool,
+) -> Result<PathBuf, McpError> {
+    refuse_overwrite(path, overwrite)?;
+    refuse_inside_library(library, path)?;
+    // Not onto a file the project still needs, nor into Kerf's own settings and logs.
+    check_outputs_now(project, owner, std::slice::from_ref(&path.to_path_buf()))?;
+    library.export(template_id, path).map_err(core_err)
 }
 
 /// A template is the user's: while they review agent edits, only they remove one.
@@ -396,10 +419,9 @@ impl KerfMcp {
     )]
     async fn import_template(&self, Parameters(p): Parameters<ImportTemplateParams>) -> Result<String, McpError> {
         crate::require_local_input_path(&p.path).map_err(bad)?;
-        let path = PathBuf::from(&p.path);
-        kerf_core::paths::validate_import_path(&path).map_err(core_err)?;
+        // The cheap check first: what is not named like a template is not looked at on disk at all.
         let path = template_path_arg(&p.path)?;
-        let outcome = blocking(move || library()?.import(&path).map_err(core_err)).await?;
+        let outcome = blocking(move || import_now(&library()?, &path)).await?;
         self.notify(LIBRARY_CHANGED);
         json(&outcome)
     }
@@ -413,12 +435,12 @@ impl KerfMcp {
     async fn export_template(&self, Parameters(p): Parameters<ExportTemplateParams>) -> Result<String, McpError> {
         crate::require_local_output_path(&p.output_path).map_err(bad)?;
         let path = template_path_arg(&p.output_path)?;
-        refuse_overwrite(&path, p.overwrite.unwrap_or(false))?;
-        refuse_inside_library(&library()?, &path)?;
-        // Not onto a file the project still needs, nor into Kerf's own settings and logs.
-        self.check_outputs(std::slice::from_ref(&path)).await?;
-        let template_id = p.template_id;
-        let written = blocking(move || library()?.export(&template_id, &path).map_err(core_err)).await?;
+        let (overwrite, template_id) = (p.overwrite.unwrap_or(false), p.template_id);
+        let (project, owner) = (self.project.clone(), self.owner());
+        // Every look at the disk (does the file exist, where does the path really lead) is on the blocking
+        // pool, with the lock taken only for what the project needs.
+        let written =
+            blocking(move || export_now(&project, owner.as_deref(), &library()?, &template_id, &path, overwrite)).await?;
         json(&serde_json::json!({ "path": written.to_string_lossy() }))
     }
 
@@ -576,7 +598,7 @@ mod tests {
         let e = invalid(prepare_values(&shared, Some("session-a"), title, values(&[("nope", "x")]), None).unwrap_err());
         assert!(e.contains("nope"), "{e}");
         let e = invalid(prepare_values(&shared, Some("session-a"), title, None, None).unwrap_err());
-        assert!(e.contains("nothing to change"), "{e}");
+        assert!(e.contains("no values to set"), "{e}");
         // A title that did not come from a template has no values to set.
         let plain = {
             let agent = super::super::lock_agent_edit(&shared, Some("session-a")).unwrap();
@@ -684,6 +706,66 @@ mod tests {
         let e = invalid(refuse_inside_library(&library, &inside).unwrap_err());
         assert!(e.contains("template library"), "{e}");
         assert!(refuse_inside_library(&library, &dir.join("elsewhere.kerftemplate")).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_export_checks_the_disk_in_one_blocking_step_and_refuses_what_it_should() {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("export");
+        let (shared, library, done, _) = saved(&dir);
+        let out = dir.join("card.kerftemplate");
+        let export =
+            |path: &std::path::Path, overwrite| export_now(&shared, Some("session-a"), &library, &done.info.id, path, overwrite);
+        assert_eq!(export(&out, false).unwrap(), out);
+        let e = invalid(export(&out, false).unwrap_err());
+        assert!(e.contains("already exists") && e.contains("overwrite"), "{e}");
+        assert_eq!(export(&out, true).unwrap(), out, "told to replace it");
+        let e = invalid(export(&library.dir().join("copy.kerftemplate"), false).unwrap_err());
+        assert!(e.contains("template library"), "{e}");
+        // Even through a link into the library: where the path really leads is what is checked.
+        #[cfg(unix)]
+        {
+            let link = dir.join("shortcut");
+            std::os::unix::fs::symlink(library.dir(), &link).unwrap();
+            let e = invalid(export(&link.join("copy.kerftemplate"), false).unwrap_err());
+            assert!(e.contains("template library"), "{e}");
+        }
+        let e = invalid(
+            export_now(
+                &shared,
+                None,
+                &library,
+                &Uuid::new_v4().to_string(),
+                &dir.join("x.kerftemplate"),
+                false,
+            )
+            .unwrap_err(),
+        );
+        assert!(e.contains("no template"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_import_is_named_like_a_template_before_the_disk_is_asked_about_it() {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("import");
+        // Not named like a template: refused by name, whatever is (or is not) at the path.
+        let e = invalid(template_path_arg("/definitely/not/here/notes.txt").unwrap_err());
+        assert!(e.contains("not a template file"), "{e}");
+        let (_, library, done, _) = saved(&dir);
+        let out = dir.join("card.kerftemplate");
+        library.export(&done.info.id, &out).unwrap();
+        let other = TemplateLibrary::at(dir.join("other"));
+        assert_eq!(
+            import_now(&other, &template_path_arg(out.to_str().unwrap()).unwrap())
+                .unwrap()
+                .status,
+            ImportStatus::Added
+        );
+        // Named like one, but nothing there: the disk answers.
+        let e = import_now(&other, &dir.join("nothing.kerftemplate")).unwrap_err();
+        assert!(!e.message.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

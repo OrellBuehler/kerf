@@ -35,7 +35,7 @@ use sha2::{Digest, Sha256};
 use super::{cpu, export_format, export_timeline, ExportFormat, ExportOptions, ExportProgress};
 use crate::clip_timing::Rational;
 use crate::error::{Error, Result};
-use crate::fonts;
+use crate::fonts::{self, FontSet};
 use crate::model::{Asset, StreamKind, SvgOverlay, Timeline};
 use crate::svg::raster::{self, Pin, MAX_PIXELS, RASTER_VERSION};
 use crate::svg::SvgDoc;
@@ -160,10 +160,11 @@ fn clamped_opacity(o: &SvgOverlay) -> f64 {
 }
 
 /// A digest of what decides a picture, as 32 hex digits. **The fonts a project embeds are part of it**
-/// (`fonts::embedded_digest`, the set the drawing will use): another set, another picture. With none
-/// embedded nothing is added, so a project without them keeps the keys it always had.
-fn digest(parts: impl FnOnce(&mut Sha256)) -> String {
-    digest_with(fonts::embedded_digest().as_deref(), parts)
+/// (the digest of the [`FontSet`] the title is planned with, which is also the set it is drawn with):
+/// another set, another picture. With none embedded nothing is added, so a project without them keeps
+/// the keys it always had.
+fn digest(fonts: &FontSet, parts: impl FnOnce(&mut Sha256)) -> String {
+    digest_with(fonts.digest(), parts)
 }
 
 /// [`digest`] for a given embedded font set (`None` for none).
@@ -221,6 +222,9 @@ pub(super) struct SvgSeq<'a> {
     /// The overlay's window, for `enable`.
     pub start: f64,
     pub end: f64,
+    /// The embedded fonts the title is drawn with, taken when it was planned: the key above names this
+    /// set, and the drawing uses it, whatever the registry holds by then.
+    pub fonts: Arc<FontSet>,
 }
 
 impl SvgSeq<'_> {
@@ -260,7 +264,15 @@ fn argv_root(root: &std::path::Path) -> String {
     root.to_string_lossy().trim_end_matches(std::path::is_separator).to_string()
 }
 
-fn seq_of<'a>(o: &'a SvgOverlay, root: &std::path::Path, fps: Rational, rect: Rect, layout: Layout) -> SvgSeq<'a> {
+fn seq_of<'a>(
+    o: &'a SvgOverlay,
+    root: &std::path::Path,
+    fps: Rational,
+    rect: Rect,
+    layout: Layout,
+    registered: &Arc<FontSet>,
+) -> SvgSeq<'a> {
+    let fonts = registered.named_by([o.svg.as_str()]);
     let Layout {
         lands_on,
         window_start,
@@ -274,7 +286,7 @@ fn seq_of<'a>(o: &'a SvgOverlay, root: &std::path::Path, fps: Rational, rect: Re
         // Nothing moves, so the picture is the same at every moment, and what decides it is the
         // artwork, its size and its opacity: not when the title starts, how long it runs, or the
         // rate, so trimming a held title keeps its picture.
-        let key = digest(|h| {
+        let key = digest(&fonts, |h| {
             h.update(b"held");
             hash_svg(h, &o.svg);
             h.update([rect.w.to_le_bytes(), rect.h.to_le_bytes()].concat());
@@ -297,11 +309,12 @@ fn seq_of<'a>(o: &'a SvgOverlay, root: &std::path::Path, fps: Rational, rect: Re
             opacity,
             start: o.start,
             end: o.end,
+            fonts,
         };
     }
     // The rectangle's position is where the picture is laid, not what it shows, so a title that is
     // only moved keeps its frames.
-    let key = digest(|h| {
+    let key = digest(&fonts, |h| {
         h.update(b"sequence");
         hash_svg(h, &o.svg);
         h.update(doc_t0.to_bits().to_le_bytes());
@@ -327,6 +340,7 @@ fn seq_of<'a>(o: &'a SvgOverlay, root: &std::path::Path, fps: Rational, rect: Re
         opacity,
         start: o.start,
         end: o.end,
+        fonts,
     }
 }
 
@@ -350,6 +364,7 @@ pub(super) fn svg_sequences<'a>(timeline: &'a Timeline, fmt: &ExportFormat) -> V
         return Vec::new();
     };
     let root = raster::root();
+    let registered = fonts::snapshot();
     timeline
         .svg_overlays
         .iter()
@@ -366,7 +381,7 @@ pub(super) fn svg_sequences<'a>(timeline: &'a Timeline, fmt: &ExportFormat) -> V
                 doc_t0,
                 frames,
             };
-            Some(seq_of(o, &root, fps, rect, layout))
+            Some(seq_of(o, &root, fps, rect, layout, &registered))
         })
         .collect()
 }
@@ -407,6 +422,7 @@ pub(super) fn stream_sequences<'a>(
         return Vec::new();
     };
     let root = raster::root();
+    let registered = fonts::snapshot();
     sliced
         .svg_overlays
         .iter()
@@ -434,7 +450,7 @@ pub(super) fn stream_sequences<'a>(
                 doc_t0,
                 frames,
             };
-            Some(seq_of(o, &root, fps, rect, layout))
+            Some(seq_of(o, &root, fps, rect, layout, &registered))
         })
         .collect()
 }
@@ -611,7 +627,7 @@ fn draw_run(job: &Job<'_>, run: &Run, stop: &AtomicBool) -> Result<()> {
     let (seq, doc) = (job.seq, &job.doc);
     let first = raster::frame_path(&seq.dir, run.first);
     if !first.exists() {
-        let picture = raster::render(&doc.at(run.doc_t), seq.rect.w, seq.rect.h, seq.opacity)?;
+        let picture = raster::render_with(&doc.at(run.doc_t), seq.rect.w, seq.rect.h, seq.opacity, seq.fonts.db())?;
         raster::write_atomic(&first, &raster::encode_frame_png(&picture)?)?;
     }
     for j in run.first + 1..run.first + run.len {
@@ -954,6 +970,8 @@ pub(super) struct StillSvg<'a> {
     /// The document's clock at the still's time.
     pub doc_t: f64,
     pub opacity: f64,
+    /// The embedded fonts the picture is drawn with, taken when it was planned (see [`SvgSeq::fonts`]).
+    pub fonts: Arc<FontSet>,
 }
 
 /// The overlays on screen in a still of `timeline` at `t` (`start <= t < end`, as a text overlay)
@@ -963,6 +981,7 @@ pub(super) fn still_svgs<'a>(timeline: &'a Timeline, w: u32, h: u32, t: f64) -> 
         return Vec::new();
     }
     let root = raster::root();
+    let registered = fonts::snapshot();
     timeline
         .svg_overlays
         .iter()
@@ -971,7 +990,8 @@ pub(super) fn still_svgs<'a>(timeline: &'a Timeline, w: u32, h: u32, t: f64) -> 
             let rect = rect_px(o, w, h)?;
             let doc_t = o.doc_time(t);
             let opacity = clamped_opacity(o);
-            let key = digest(|hash| {
+            let fonts = registered.named_by([o.svg.as_str()]);
+            let key = digest(&fonts, |hash| {
                 hash.update(b"still");
                 hash_svg(hash, &o.svg);
                 hash.update(doc_t.to_bits().to_le_bytes());
@@ -985,6 +1005,7 @@ pub(super) fn still_svgs<'a>(timeline: &'a Timeline, w: u32, h: u32, t: f64) -> 
                 rect,
                 doc_t,
                 opacity,
+                fonts,
             })
         })
         .collect()
@@ -1033,7 +1054,7 @@ fn ensure_stills_with(live: &[StillSvg<'_>], trim: &dyn Fn()) -> Result<Vec<Pin>
             continue;
         }
         let doc = parsed(s.svg)?;
-        let picture = raster::render(&doc.at(s.doc_t), s.rect.w, s.rect.h, s.opacity)?;
+        let picture = raster::render_with(&doc.at(s.doc_t), s.rect.w, s.rect.h, s.opacity, s.fonts.db())?;
         raster::write_atomic(&s.path, &raster::encode_frame_png(&picture)?)?;
         wrote = true;
     }
@@ -1196,14 +1217,21 @@ mod tests {
         });
     }
 
+    /// `sliding()` with text in the family `family`.
+    fn typed(family: &str) -> String {
+        doc(&format!(
+            "<rect id=\"b\" y=\"40\" width=\"40\" height=\"28\" fill=\"#ff3355\"><animate attributeName=\"x\" from=\"0\" to=\"152\" dur=\"2s\" fill=\"freeze\"/></rect><text x=\"2\" y=\"20\" font-family=\"{family}\">a</text>"
+        ))
+    }
+
     #[test]
-    fn the_fonts_a_project_embeds_are_part_of_every_picture_key_and_none_leaves_it_alone() {
+    fn the_fonts_a_title_names_are_part_of_its_picture_keys_and_none_leaves_them_alone() {
         use crate::fonts::{self, EmbeddedFont};
         crate::svg::raster::with_pinned_dir(PIN, || {
-            let (tl, _) = cut(vec![overlay(sliding(), 1.0, 3.0)]);
+            let (tl, _) = cut(vec![overlay(typed("Zeist"), 1.0, 3.0)]);
             let held = {
                 let mut still = tl.clone();
-                still.svg_overlays[0].svg = doc("<rect width=\"10\" height=\"10\"/>");
+                still.svg_overlays[0].svg = doc("<text font-family=\"Zeist\">a</text>");
                 still
             };
             let f = fmt(1920, 1080, 30.0);
@@ -1230,14 +1258,81 @@ mod tests {
             // The same set is the same key (a project reopened finds its frames), another set another.
             assert!(!fonts::register_embedded(std::slice::from_ref(&a)));
             assert_eq!(keys(&tl), with_a);
+            // A font the title does not name is not in its key, however many the project holds.
             let b = EmbeddedFont::new("Zeyst", fonts::shipped_font_renamed(false, "Zeyst"));
             assert!(fonts::register_embedded(std::slice::from_ref(&b)));
-            let with_ab = keys(&tl);
-            assert_ne!(with_ab.0, with_a.0);
+            assert_eq!(keys(&tl), with_a, "the project's other font changes nothing it draws");
+            let both = {
+                let mut both = tl.clone();
+                both.svg_overlays[0].svg = typed("Zeist, Zeyst");
+                both
+            };
+            assert_ne!(keys(&both).0, with_a.0, "a title that names both is keyed by both");
             // Back to nothing: the original keys, byte for byte.
             assert!(fonts::replace_embedded(Vec::new()));
             assert_eq!(keys(&tl), bare);
             assert_eq!(keys(&held), bare_held);
+        });
+    }
+
+    #[test]
+    fn a_font_held_for_a_proposal_does_not_move_a_title_that_does_not_name_it() {
+        use crate::fonts::{self, EmbeddedFont};
+        crate::svg::raster::with_pinned_dir(PIN, || {
+            let (live, _) = cut(vec![
+                overlay(typed("Geist"), 1.0, 3.0),
+                overlay(typed("Sans Serif"), 1.0, 3.0),
+            ]);
+            let f = fmt(1920, 1080, 30.0);
+            let dirs = |tl: &Timeline| svg_sequences(tl, &f).iter().map(|s| s.dir.clone()).collect::<Vec<_>>();
+            let before = dirs(&live);
+            let stills_before = still_svgs(&live, 960, 540, 2.0)
+                .iter()
+                .map(|s| s.path.clone())
+                .collect::<Vec<_>>();
+            assert!(fonts::register_embedded(&[EmbeddedFont::new(
+                "Zeist",
+                fonts::shipped_font_renamed(true, "Zeist")
+            )]));
+            assert_eq!(dirs(&live), before, "no live title names it: every picture is where it was");
+            let stills = still_svgs(&live, 960, 540, 2.0);
+            assert_eq!(stills.iter().map(|s| s.path.clone()).collect::<Vec<_>>(), stills_before);
+            assert!(stills.iter().all(|s| s.fonts.digest().is_none()));
+            // The proposal's title names it, and is drawn with it.
+            let (proposal, _) = cut(vec![overlay(typed("Geist"), 1.0, 3.0), overlay(typed("Zeist"), 1.0, 3.0)]);
+            let seqs = svg_sequences(&proposal, &f);
+            assert_eq!(seqs[0].dir, before[0]);
+            assert_ne!(seqs[1].dir, before[1]);
+            assert!(seqs[0].fonts.digest().is_none() && seqs[1].fonts.digest().is_some());
+            fonts::replace_embedded(Vec::new());
+        });
+    }
+
+    #[test]
+    fn a_plan_draws_with_the_fonts_its_keys_name_whatever_the_registry_does_next() {
+        use crate::fonts::{self, EmbeddedFont};
+        crate::svg::raster::with_pinned_dir(PIN, || {
+            let (tl, _) = cut(vec![overlay(typed("Zeist"), 1.0, 3.0)]);
+            let f = fmt(1920, 1080, 30.0);
+            assert!(fonts::register_embedded(&[EmbeddedFont::new(
+                "Zeist",
+                fonts::shipped_font_renamed(true, "Zeist")
+            )]));
+            let seqs = svg_sequences(&tl, &f);
+            let stills = still_svgs(&tl, 960, 540, 2.0);
+            let digest = seqs[0].fonts.digest().map(str::to_string);
+            assert!(digest.is_some());
+            // Another project is opened (or the font dropped) between planning and drawing.
+            assert!(fonts::replace_embedded(Vec::new()));
+            assert_eq!(fonts::embedded_digest(), None);
+            let has_zeist = |db: &fontdb::Database| db.faces().any(|face| face.families.iter().any(|(n, _)| n == "Zeist"));
+            assert!(
+                has_zeist(&seqs[0].fonts.db()),
+                "the sequence is drawn with the set its key names"
+            );
+            assert!(has_zeist(&stills[0].fonts.db()), "and so is the still");
+            assert_eq!(seqs[0].fonts.digest().map(str::to_string), digest);
+            assert!(!has_zeist(&fonts::svg_fontdb()));
         });
     }
 

@@ -33,7 +33,9 @@ pub use model::{
 };
 pub use save::{build_template, element_ids, BuiltTemplate, TemplateSaveRequest, TemplateSource};
 pub use validate::{validate_controls, validate_controls_shape};
-pub use values::{apply_values, image_data_url, read_values, PreparedTemplate, PreparedValues, TemplateEditInputs};
+pub use values::{
+    apply_values, image_data_url, read_values, PreparedTemplate, PreparedValues, TemplateEditInputs, MAX_IMAGE_BYTES,
+};
 
 /// The file extension of a template.
 pub const EXTENSION: &str = "kerftemplate";

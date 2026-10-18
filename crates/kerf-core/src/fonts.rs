@@ -68,17 +68,18 @@ fn finish_svg_db(svg: &mut Database) {
 /// face is looked at *before* the installed ones, so a family both have is the project's. Geist
 /// stands for `serif` and `sans-serif`, which is also where a family nothing has falls to.
 ///
-/// With nothing embedded this is the one database built for the process; with some it is rebuilt when
-/// the set changes (kept while it does not), and [`embedded_digest`] says which set it was built from.
-/// `Arc` because `usvg` takes its font database that way.
+/// This is the database of the **whole** registered set ([`snapshot`]); drawing a timeline's titles takes
+/// [`snapshot_for`], the part of the set those titles name. With nothing embedded it is the one database
+/// built for the process; with some it is built once per set, and [`FontSet::digest`] says which set it
+/// was built from. `Arc` because `usvg` takes its font database that way.
 pub fn svg_fontdb() -> Arc<Database> {
-    with_registry(Registry::svg_db)
+    snapshot().db()
 }
 
 /// [`svg_fontdb`] with `extra` fonts layered in as well, registered nowhere: a template being saved
 /// or imported draws its poster with the fonts it is about to carry, whatever the open project has.
 pub fn svg_fontdb_with(extra: &[EmbeddedFont]) -> Arc<Database> {
-    let mut all: BTreeMap<String, EmbeddedFont> = with_registry(|r| r.fonts.clone());
+    let mut all: BTreeMap<String, EmbeddedFont> = snapshot().fonts.iter().map(|f| (f.sha256.clone(), f.clone())).collect();
     for font in extra {
         all.entry(font.sha256.clone()).or_insert_with(|| font.clone());
     }
@@ -120,47 +121,110 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     })
 }
 
-/// The embedded set and the database built from it. Per process; under `cfg(test)` per thread, so
-/// that tests running side by side cannot see (or key their pictures by) each other's fonts.
-struct Registry {
-    fonts: BTreeMap<String, EmbeddedFont>,
+/// A set of embedded fonts and the database drawing with them, **immutable once made**: a picture is
+/// keyed by [`FontSet::digest`] and drawn with [`FontSet::db`], and both come from one value, so the key
+/// cannot name a set other than the one the picture was drawn with, however the registry moves in between.
+/// Planning a title takes one (`snapshot_for`) and carries it to the drawing.
+///
+/// The database is built on first use, **by the caller of [`FontSet::db`] and under no registry lock**
+/// (a build scans the system's fonts and parses every embedded face: seconds, on a cold disk): the
+/// registry is only ever held to swap an `Arc`, so [`replace_embedded`] and [`embedded_digest`] never wait
+/// on a build.
+pub struct FontSet {
     /// A digest of the set: `None` when it is empty.
     digest: Option<String>,
-    built: Option<(String, Arc<Database>)>,
+    /// By SHA-256.
+    fonts: Vec<EmbeddedFont>,
+    db: OnceLock<Arc<Database>>,
 }
 
-impl Registry {
-    const fn new() -> Self {
-        Registry {
-            fonts: BTreeMap::new(),
-            digest: None,
-            built: None,
-        }
+impl std::fmt::Debug for FontSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FontSet")
+            .field("digest", &self.digest)
+            .field("fonts", &self.fonts.len())
+            .finish()
     }
+}
 
-    fn changed(&mut self) {
-        self.digest = (!self.fonts.is_empty()).then(|| {
+impl FontSet {
+    fn of(fonts: &BTreeMap<String, EmbeddedFont>) -> Arc<Self> {
+        let digest = (!fonts.is_empty()).then(|| {
             let mut hash = Sha256::new();
-            for key in self.fonts.keys() {
+            for key in fonts.keys() {
                 hash.update(key.as_bytes());
             }
             hash.finalize()[..16].iter().map(|b| format!("{b:02x}")).collect()
         });
-        self.built = None;
+        Arc::new(Self {
+            digest,
+            fonts: fonts.values().cloned().collect(),
+            db: OnceLock::new(),
+        })
     }
 
-    fn svg_db(&mut self) -> Arc<Database> {
-        let Some(digest) = &self.digest else {
-            return base_svg_db();
-        };
-        if let Some((built_for, db)) = &self.built {
-            if built_for == digest {
-                return db.clone();
+    /// The set with nothing embedded: the process's one database, whatever the registry holds.
+    pub fn none() -> Arc<Self> {
+        static NONE: OnceLock<Arc<FontSet>> = OnceLock::new();
+        NONE.get_or_init(|| FontSet::of(&BTreeMap::new())).clone()
+    }
+
+    /// A digest of the set (32 hex digits), `None` for an empty one. **Part of every animated-title
+    /// picture's cache key** when there is one, so a frame drawn with other fonts is never served; with
+    /// none the keys are what they always were.
+    pub fn digest(&self) -> Option<&str> {
+        self.digest.as_deref()
+    }
+
+    /// The fonts of the set.
+    pub fn fonts(&self) -> &[EmbeddedFont] {
+        &self.fonts
+    }
+
+    /// The database to draw with: the system's faces behind the set's, built once.
+    pub fn db(&self) -> Arc<Database> {
+        self.db_with(|fonts| {
+            if fonts.is_empty() {
+                base_svg_db()
+            } else {
+                Arc::new(build_svg_db(fonts.iter()))
             }
+        })
+    }
+
+    /// [`FontSet::db`] with the build given (a test makes it observable).
+    fn db_with(&self, build: impl FnOnce(&[EmbeddedFont]) -> Arc<Database>) -> Arc<Database> {
+        self.db.get_or_init(|| build(&self.fonts)).clone()
+    }
+}
+
+/// The embedded set. Per process; under `cfg(test)` per thread, so that tests running side by side
+/// cannot see (or key their pictures by) each other's fonts. Held only to read or swap an `Arc`.
+struct Registry {
+    /// Everything registered; `None` is nothing.
+    set: Option<Arc<FontSet>>,
+    /// The parts of `set` that titles named lately ([`snapshot_for`]), so that a part is built once.
+    parts: Vec<Arc<FontSet>>,
+}
+
+/// How many parts of the registered set are remembered.
+const PARTS_KEPT: usize = 8;
+
+impl Registry {
+    const fn new() -> Self {
+        Registry {
+            set: None,
+            parts: Vec::new(),
         }
-        let db = Arc::new(build_svg_db(self.fonts.values()));
-        self.built = Some((digest.clone(), db.clone()));
-        db
+    }
+
+    fn set(&self) -> Arc<FontSet> {
+        self.set.clone().unwrap_or_else(FontSet::none)
+    }
+
+    fn replace(&mut self, fonts: &BTreeMap<String, EmbeddedFont>) {
+        self.set = (!fonts.is_empty()).then(|| FontSet::of(fonts));
+        self.parts.clear();
     }
 }
 
@@ -195,56 +259,131 @@ fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
     REGISTRY.with(|r| f(&mut r.borrow_mut()))
 }
 
+/// The whole registered set, as it is now.
+pub fn snapshot() -> Arc<FontSet> {
+    with_registry(|r| r.set())
+}
+
+/// Whether the text of a title (`lowered`: lower-cased, see [`snapshot_for`]) names `family`. By the
+/// family's name appearing in the text, wherever it is written (an attribute, a `style`, a `<style>`
+/// rule, a SMIL `set` / `animate`): a title cannot be drawn in a family it does not name, and a name that
+/// is only text content ("Lora" in a caption) costs one font too many, never one too few.
+pub fn names_family(lowered: &str, family: &str) -> bool {
+    let family = family.trim().to_lowercase();
+    !family.is_empty() && lowered.contains(&family)
+}
+
+/// [`FontSet::named_by`] for the registry's whole set, as it is now.
+pub fn snapshot_for<'a>(titles: impl IntoIterator<Item = &'a str>) -> Arc<FontSet> {
+    snapshot().named_by(titles)
+}
+
+impl FontSet {
+    /// The part of this set that `titles` (the sources of the animated titles being drawn) name: **the
+    /// fonts those titles are drawn with**. A font nobody here names changes neither a picture nor its
+    /// cache key, so a template's font that sits in the project (held for a proposal's review, or left by
+    /// a title that was deleted) does not move how an unrelated title draws.
+    ///
+    /// Take it **once, where the drawing is planned**, and carry it to the drawing: the key
+    /// ([`FontSet::digest`]) and the fonts ([`FontSet::db`]) then come from the same set. A part is
+    /// built once however often it is asked for.
+    pub fn named_by<'a>(self: &Arc<Self>, titles: impl IntoIterator<Item = &'a str>) -> Arc<FontSet> {
+        if self.fonts.is_empty() {
+            return self.clone();
+        }
+        let lowered: Vec<String> = titles.into_iter().map(str::to_lowercase).collect();
+        let named: BTreeMap<String, EmbeddedFont> = self
+            .fonts
+            .iter()
+            .filter(|f| lowered.iter().any(|t| names_family(t, &f.family)))
+            .map(|f| (f.sha256.clone(), f.clone()))
+            .collect();
+        if named.len() == self.fonts.len() {
+            return self.clone();
+        }
+        if named.is_empty() {
+            return FontSet::none();
+        }
+        let part = FontSet::of(&named);
+        with_registry(|r| {
+            if let Some(known) = r.parts.iter().find(|p| p.digest == part.digest) {
+                return known.clone();
+            }
+            // Remembered only while this is the registry's set: one that moved on keeps its own parts.
+            if r.set.as_ref().is_some_and(|s| Arc::ptr_eq(s, self)) {
+                if r.parts.len() >= PARTS_KEPT {
+                    r.parts.remove(0);
+                }
+                r.parts.push(part.clone());
+            }
+            part
+        })
+    }
+}
+
 /// Add `fonts` to the embedded set (a font already there, by its SHA-256, is left alone). Returns
 /// whether the set changed — when it did, the pictures drawn so far no longer stand for it and
 /// [`embedded_digest`] has moved.
 pub fn register_embedded(fonts: &[EmbeddedFont]) -> bool {
     with_registry(|r| {
-        let before = r.fonts.len();
+        let mut all: BTreeMap<String, EmbeddedFont> = r.set().fonts.iter().map(|f| (f.sha256.clone(), f.clone())).collect();
+        let before = all.len();
         for font in fonts {
-            r.fonts.entry(font.sha256.clone()).or_insert_with(|| font.clone());
+            all.entry(font.sha256.clone()).or_insert_with(|| font.clone());
         }
-        let changed = r.fonts.len() != before;
+        let changed = all.len() != before;
         if changed {
-            r.changed();
+            r.replace(&all);
         }
         changed
     })
 }
 
-/// Make `fonts` the embedded set, as opening a project does: the previous project's fonts are not
-/// this one's, and a title must draw the same however many projects were opened before it. Returns
-/// whether the set changed.
+/// Make `fonts` the embedded set, as a project becoming the open one does: the previous project's fonts
+/// are not this one's, and a title must draw the same however many projects were opened before it.
+/// Returns whether the set changed.
 pub fn replace_embedded(fonts: Vec<EmbeddedFont>) -> bool {
+    let next: BTreeMap<String, EmbeddedFont> = fonts.into_iter().map(|f| (f.sha256.clone(), f)).collect();
     with_registry(|r| {
-        let next: BTreeMap<String, EmbeddedFont> = fonts.into_iter().map(|f| (f.sha256.clone(), f)).collect();
-        let changed = !r.fonts.keys().eq(next.keys());
+        let changed = !r.set().fonts.iter().map(|f| &f.sha256).eq(next.keys());
         if changed {
-            r.fonts = next;
-            r.changed();
+            r.replace(&next);
         }
         changed
     })
 }
 
-/// A digest of the embedded set (32 hex digits), `None` when nothing is embedded. **Part of every
-/// animated-title picture's cache key** when there is one, so frames drawn with another set of fonts
-/// are never served; with none the keys are what they always were.
+/// A digest of the whole embedded set (32 hex digits), `None` when nothing is embedded. What a picture
+/// is keyed by is [`FontSet::digest`] of the set it was planned with ([`snapshot_for`]).
 pub fn embedded_digest() -> Option<String> {
-    with_registry(|r| r.digest.clone())
+    with_registry(|r| r.set().digest.clone())
 }
 
 /// The embedded set, by SHA-256.
 pub fn embedded_fonts() -> Vec<EmbeddedFont> {
-    with_registry(|r| r.fonts.values().cloned().collect())
+    with_registry(|r| r.set().fonts.clone())
 }
 
 /// Whether a family called `family` is installed or embedded (or is the shipped Geist): the one the
 /// title will really be drawn with, rather than the Geist a family nothing has falls to.
 pub fn has_family(family: &str) -> bool {
+    let family = family.trim().to_lowercase();
     svg_fontdb()
         .faces()
-        .any(|face| face.families.iter().any(|(name, _)| name == family))
+        .any(|face| face.families.iter().any(|(name, _)| name.to_lowercase() == family))
+}
+
+/// The families of a CSS `font-family` list, in order: split on commas, trimmed, quotes stripped.
+/// (Generic families such as `sans-serif` are among them; [`is_generic_family`] tells.)
+pub fn family_list(list: &str) -> impl Iterator<Item = &str> {
+    list.split(',')
+        .map(|family| family.trim().trim_matches(['"', '\'']).trim())
+        .filter(|family| !family.is_empty())
+}
+
+/// Whether two family names are the same family (CSS compares them without regard to case).
+pub fn same_family(a: &str, b: &str) -> bool {
+    a.trim().to_lowercase() == b.trim().to_lowercase()
 }
 
 /// Families CSS names for a kind of face rather than a font: never embedded, never looked up.
@@ -284,9 +423,14 @@ fn is_sfnt(data: &[u8]) -> bool {
     data.starts_with(&[0, 1, 0, 0]) || data.starts_with(b"OTTO") || data.starts_with(b"true")
 }
 
-/// Whether the font's `OS/2` table allows embedding it (`fsType` bit 1 is "restricted licence
-/// embedding"). A font with no such table is taken to allow it.
+/// Whether the font's `OS/2` table allows embedding it. `fsType` is refused when it says "restricted
+/// licence embedding" (0x0002), "preview & print embedding" (0x0004: for reading a document, not for
+/// carrying the font into another) or "bitmap embedding only" (0x0200); installable (0) and editable
+/// (0x0008) embedding are allowed, and so is the "no subsetting" flag (0x0100) on its own, since a font is
+/// carried whole. A font with no such table is taken to allow it.
 pub fn embedding_allowed(data: &[u8]) -> bool {
+    // Restricted licence, preview & print, bitmap only.
+    const EMBEDDING_REFUSED: u16 = 0x0002 | 0x0004 | 0x0200;
     let u16_at = |at: usize| data.get(at..at + 2).map(|b| u16::from_be_bytes([b[0], b[1]]));
     let u32_at = |at: usize| data.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
     let Some(tables) = u16_at(4) else { return true };
@@ -294,7 +438,7 @@ pub fn embedding_allowed(data: &[u8]) -> bool {
         let record = 12 + i * 16;
         if data.get(record..record + 4) == Some(b"OS/2") {
             let Some(offset) = u32_at(record + 8) else { return true };
-            return u16_at(offset as usize + 8).is_none_or(|fs_type| fs_type & 0x0002 == 0);
+            return u16_at(offset as usize + 8).is_none_or(|fs_type| fs_type & EMBEDDING_REFUSED == 0);
         }
     }
     true
@@ -620,6 +764,19 @@ pub(crate) fn shipped_font_renamed(bold: bool, family: &str) -> Vec<u8> {
     data
 }
 
+/// `font` with the `fsType` of its `OS/2` table set to `fs_type`.
+#[cfg(test)]
+pub(crate) fn with_fs_type(mut font: Vec<u8>, fs_type: u16) -> Vec<u8> {
+    let tables = usize::from(u16::from_be_bytes([font[4], font[5]]));
+    let record = (0..tables)
+        .map(|i| 12 + i * 16)
+        .find(|r| &font[*r..*r + 4] == b"OS/2")
+        .expect("an OS/2 table");
+    let offset = u32::from_be_bytes(font[record + 8..record + 12].try_into().unwrap()) as usize;
+    font[offset + 8..offset + 10].copy_from_slice(&fs_type.to_be_bytes());
+    font
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -876,18 +1033,20 @@ mod tests {
 
     #[test]
     fn restricted_embedding_is_read_from_the_os2_table() {
-        let mut font = shipped_font_renamed(false, "Zeist");
+        let font = shipped_font_renamed(false, "Zeist");
         assert!(embedding_allowed(&font), "Geist is an open font");
-        let tables = usize::from(u16::from_be_bytes([font[4], font[5]]));
-        let record = (0..tables)
-            .map(|i| 12 + i * 16)
-            .find(|r| &font[*r..*r + 4] == b"OS/2")
-            .expect("an OS/2 table");
-        let offset = u32::from_be_bytes(font[record + 8..record + 12].try_into().unwrap()) as usize;
-        font[offset + 8..offset + 10].copy_from_slice(&2u16.to_be_bytes());
-        assert!(!embedding_allowed(&font), "fsType 2: restricted licence embedding");
-        font[offset + 8..offset + 10].copy_from_slice(&8u16.to_be_bytes());
-        assert!(embedding_allowed(&font), "editable embedding is allowed");
+        for refused in [0x0002u16, 0x0004, 0x0200, 0x0102, 0x0204] {
+            assert!(
+                !embedding_allowed(&with_fs_type(font.clone(), refused)),
+                "fsType {refused:#06x} does not allow carrying the font"
+            );
+        }
+        for allowed in [0u16, 0x0008, 0x0100, 0x0108] {
+            assert!(
+                embedding_allowed(&with_fs_type(font.clone(), allowed)),
+                "fsType {allowed:#06x} allows it"
+            );
+        }
         assert!(embedding_allowed(b"short"));
     }
 
@@ -903,6 +1062,93 @@ mod tests {
         );
         assert!(is_generic_family("Sans-Serif") && is_generic_family("monospace") && !is_generic_family("Roboto"));
         replace_embedded(Vec::new());
+    }
+
+    #[test]
+    fn a_build_in_progress_holds_no_registry_lock() {
+        let zeist = EmbeddedFont::new("Zeist", shipped_font_renamed(true, "Zeist"));
+        assert!(register_embedded(std::slice::from_ref(&zeist)));
+        let set = snapshot();
+        let digest = embedded_digest();
+        // From inside the build the registry is read, replaced and read again: were it held across the
+        // build (it was, once), this would deadlock, or under test panic on the borrow.
+        let db = set.db_with(|fonts| {
+            assert_eq!(embedded_digest(), digest);
+            assert!(replace_embedded(Vec::new()));
+            assert_eq!(embedded_digest(), None);
+            assert!(register_embedded(&[EmbeddedFont::new(
+                "Zeyst",
+                shipped_font_renamed(false, "Zeyst")
+            )]));
+            Arc::new(build_svg_db(fonts.iter()))
+        });
+        assert!(
+            family_of(&db, "Zeist", 400).is_some(),
+            "the set it was taken for, not the registry's now"
+        );
+        assert!(family_of(&db, "Zeyst", 400).is_none());
+        assert!(Arc::ptr_eq(&db, &set.db()), "and built once");
+        assert_eq!(set.digest(), digest.as_deref());
+        replace_embedded(Vec::new());
+    }
+
+    #[test]
+    fn a_snapshot_is_one_set_for_the_key_and_for_the_drawing() {
+        let zeist = EmbeddedFont::new("Zeist", shipped_font_renamed(true, "Zeist"));
+        register_embedded(std::slice::from_ref(&zeist));
+        let before = snapshot();
+        assert_eq!(before.digest(), embedded_digest().as_deref());
+        // The registry moves on; the snapshot (key and fonts together) does not.
+        let zeyst = EmbeddedFont::new("Zeyst", shipped_font_renamed(false, "Zeyst"));
+        assert!(register_embedded(std::slice::from_ref(&zeyst)));
+        assert_ne!(before.digest(), embedded_digest().as_deref());
+        assert!(family_of(&before.db(), "Zeist", 400).is_some() && family_of(&before.db(), "Zeyst", 400).is_none());
+        assert_eq!(before.fonts().len(), 1);
+        replace_embedded(Vec::new());
+    }
+
+    #[test]
+    fn only_the_fonts_a_timeline_names_are_in_the_set_it_is_drawn_with() {
+        let zeist = EmbeddedFont::new("Zeist", shipped_font_renamed(true, "Zeist"));
+        let zeyst = EmbeddedFont::new("Zeyst", shipped_font_renamed(false, "Zeyst"));
+        register_embedded(&[zeist, zeyst]);
+        let plain = r#"<svg><text font-family="Geist">a</text></svg>"#;
+        let with_zeist = r#"<svg><text style="font-family:'ZEIST', sans-serif">a</text></svg>"#;
+        let with_both = r#"<svg><text font-family="Zeist">a</text><set attributeName="font-family" to="Zeyst"/></svg>"#;
+
+        let none = snapshot_for([plain]);
+        assert_eq!(
+            none.digest(),
+            None,
+            "no title names an embedded family: the keys are what they were"
+        );
+        assert!(Arc::ptr_eq(&none.db(), &base_svg_db()));
+        assert!(Arc::ptr_eq(&snapshot_for([]).db(), &base_svg_db()));
+
+        let one = snapshot_for([plain, with_zeist]);
+        assert_eq!(one.fonts().iter().map(|f| f.family.as_str()).collect::<Vec<_>>(), ["Zeist"]);
+        assert!(family_of(&one.db(), "Zeist", 400).is_some() && family_of(&one.db(), "Zeyst", 400).is_none());
+        assert!(Arc::ptr_eq(&one, &snapshot_for([with_zeist])), "the same part is built once");
+
+        let both = snapshot_for([with_both]);
+        assert_eq!(both.digest(), embedded_digest().as_deref());
+        assert!(Arc::ptr_eq(&both, &snapshot()), "all of it is the registry's own set");
+        assert_ne!(one.digest(), both.digest());
+        replace_embedded(Vec::new());
+        assert_eq!(snapshot_for([with_both]).digest(), None, "and nothing registered is nothing");
+    }
+
+    #[test]
+    fn family_lists_and_names_are_read_as_css_reads_them() {
+        assert_eq!(
+            family_list(r#" "Barlow Condensed" , 'Open Sans',sans-serif,, "#).collect::<Vec<_>>(),
+            ["Barlow Condensed", "Open Sans", "sans-serif"]
+        );
+        assert!(same_family(" geist ", "GEIST") && !same_family("Geist", "Geist Mono"));
+        assert!(
+            has_family("geist") && has_family("GEIST"),
+            "installed or shipped, whatever the case"
+        );
     }
 
     #[test]

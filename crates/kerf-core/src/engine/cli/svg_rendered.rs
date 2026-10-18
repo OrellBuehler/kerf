@@ -793,6 +793,37 @@ fn a_template_title_is_exported_with_the_values_it_was_set_to() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+#[ignore = "drives the real ffmpeg"]
+fn a_text_set_through_a_control_still_fades_in() {
+    use crate::template::fixtures::template;
+    let dir = scratch("template-fade");
+    with_pinned_dir(dir.join("cache").to_str().unwrap(), || {
+        let bg = background(&dir, "30");
+        let assets = [bg.clone()];
+        let t = template();
+        // The fixture's text fades in with a SMIL `animate` that sits inside the element a control sets.
+        let drawn = |values: &[(&str, &str)], tag: &str| {
+            let values = values.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            let prepared = t.prepare(&values).unwrap();
+            assert!(prepared.doc.is_animated(), "{tag}: the animation survived the splice");
+            let tl = cut(&bg, vec![title(prepared.doc.sanitized().to_string(), 0.0, 4.0)]);
+            export_rgb(&tl, &assets, &options(30.0), &dir, tag)
+        };
+        for (values, tag) in [(&[][..], "made"), (&[("tagline", "Bye")][..], "set")] {
+            let frames = drawn(values, tag);
+            assert_ne!(
+                frames[0], frames[60],
+                "{tag}: no text at the first frame, text at two seconds"
+            );
+            assert_eq!(frames[60], frames[90], "{tag}: and it holds once faded in");
+        }
+        // Changing the words changes the picture: the text that is drawn is the text that was set.
+        assert_ne!(drawn(&[], "words-a")[60], drawn(&[("tagline", "Bye")], "words-b")[60]);
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[allow(clippy::print_stderr)]
 fn eprintln_timing(took: std::time::Duration, frames: u32) {
     eprintln!(

@@ -17,6 +17,7 @@ use super::{MAX_FONTS, MAX_FONT_BYTES, MAX_TOTAL_BYTES};
 use crate::error::Result;
 use crate::fonts::{self, EmbeddedFont, FaceLookup};
 use crate::model::MAX_SVG_SECONDS;
+use crate::svg::splice::Elements;
 
 /// What a template is made of, taken from a title on the timeline.
 #[derive(Debug, Clone, PartialEq)]
@@ -60,9 +61,8 @@ struct FontUse {
 
 impl FontUse {
     fn family_list(&mut self, list: &str) {
-        for family in list.split(',') {
-            let family = family.trim().trim_matches(['"', '\'']).trim();
-            if !family.is_empty() && !fonts::is_generic_family(family) {
+        for family in fonts::family_list(list) {
+            if !fonts::is_generic_family(family) {
                 self.families.insert(family.to_string());
             }
         }
@@ -297,15 +297,11 @@ pub fn build_template(source: &TemplateSource, request: TemplateSaveRequest, id:
 }
 
 /// The `id`s of the title's elements, for a surface that offers to make controls out of them: every
-/// element with an `id` and the tag it is.
+/// element with an `id` and the tag it is. A document over the size a title may be (128 KiB), nested
+/// deeper than one may be, or not XML is refused before anything is listed: the text may come straight
+/// from a webview.
 pub fn element_ids(svg: &str) -> Result<Vec<(String, String)>> {
-    let doc = roxmltree::Document::parse_with_options(svg, crate::svg::xml_options())
-        .map_err(|e| invalid(format!("not valid XML: {e}")))?;
-    Ok(doc
-        .descendants()
-        .filter(roxmltree::Node::is_element)
-        .filter_map(|n| Some((n.attribute("id")?.to_string(), n.tag_name().name().to_string())))
-        .collect())
+    Ok(Elements::parse(svg)?.ids())
 }
 
 #[cfg(test)]
@@ -481,6 +477,23 @@ mod tests {
                 ("bg".to_string(), "rect".to_string()),
                 ("tag".to_string(), "text".to_string())
             ]
+        );
+    }
+
+    #[test]
+    fn element_ids_refuses_what_a_title_cannot_be_before_parsing_it() {
+        let big = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"><g id="a"/><!--{}--></svg>"#,
+            "x".repeat(crate::svg::MAX_BYTES)
+        );
+        let e = element_ids(&big).unwrap_err().to_string();
+        assert!(e.contains("larger than 128 KiB"), "{e}");
+        let deep = format!("{}{}", "<g>".repeat(5000), "</g>".repeat(5000));
+        assert!(element_ids(&format!("<svg xmlns=\"http://www.w3.org/2000/svg\">{deep}</svg>")).is_err());
+        assert!(element_ids("not xml").is_err());
+        assert!(
+            element_ids(&format!("<!DOCTYPE svg [<!ENTITY a \"b\">]>{TITLE}")).is_err(),
+            "no DTDs"
         );
     }
 }

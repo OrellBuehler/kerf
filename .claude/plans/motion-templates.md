@@ -66,7 +66,7 @@ through the sanitiser like any custom SVG. A target id missing from the SVG is a
 Changing a value re-splices the overlay's current `svg`; the base SVG is not stored twice.
 
 Embedded fonts: a project table keyed by sha256 (`family`, `data`), registered with the SVG font
-database when the project opens or a template is applied. The SVG frame cache must not serve frames
+database when the project becomes the open one or a template is applied. The SVG frame cache must not serve frames
 drawn with a different font set.
 
 ### Library
@@ -135,9 +135,10 @@ turns a PNG / JPEG / GIF / WebP file's bytes into the `data:` URL an `image` val
 - **Setting values is its own edit, not a field of `SvgOverlayPatch`**: the splice must read the title as it is
   (and the sanitiser takes up to a second and a half), which cannot happen in `check()` before the lock.
   `SvgOverlayPatch.svg` replaces the artwork and **ends the template** (`template` becomes `None`).
-- Embedded fonts are the `fonts` table (`sha256`, `family`, `data`), schema **v3** (v2 is the proposal's `owner` / `assets` columns). Opening a project makes its
-  fonts *the* embedded set (it replaces the previous project's); applying a template adds to it. The SVG
-  frame cache key carries `fonts::embedded_digest()` when the set is not empty.
+- Embedded fonts are the `fonts` table (`sha256`, `family`, `data`), schema **v3** (v2 is the proposal's `owner` / `assets` columns). A project becoming the open
+  one makes its fonts *the* embedded set (it replaces the previous project's; opening alone registers nothing); applying a template adds to it. A title is planned
+  with the part of the set it names (`fonts::FontSet`), whose digest is in the SVG frame cache key when it is not empty and whose database draws the picture.
+  A font no title names is deleted when a proposal is discarded, on Save As and on open.
 - A font is carried only when it is a plain `.ttf` / `.otf`, ≤ 8 MiB, ≤ 16 per template, and its `OS/2` licence
   flags allow embedding; otherwise `save` leaves it out and warns. Embedded faces win over installed ones.
 - `import` never overwrites: the same id with other content is kept under a new id (`added_as_copy`).

@@ -313,6 +313,17 @@ fn the_fonts_a_project_embeds_survive_save_as() {
     let dir = scratch();
     let (project, _) = edited(1);
     let font = crate::fonts::EmbeddedFont::new("Zeist", crate::fonts::shipped_font_renamed(true, "Zeist"));
+    // A title that names the family is what keeps the font through a save.
+    project
+        .add_svg_overlay(
+            crate::SvgSource::Custom(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><text font-family="Zeist">a</text></svg>"#.into(),
+            ),
+            0.0,
+            Some(2.0),
+            crate::SvgLayout::default(),
+        )
+        .unwrap();
     project.store_fonts(std::slice::from_ref(&font)).unwrap();
     let path = dir.join("a.kerf");
     project.save_as(&path).unwrap();
