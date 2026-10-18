@@ -365,7 +365,20 @@ so the feature is **only** activated through these forwards — which is what ma
   -16, broadcast -23 LUFS, all -1 dBTP, `loudnorm` TP half a dB under) wins over the bool;
   youtube is byte-identical to `loudnorm: true`.
   `ExportOptions.loudnorm` appends a single-pass `loudnorm` to -14 LUFS
-  on the final mix, and `ExportOptions.range` renders only a span by building the
+  on the final mix. **Captions and chapters ride along** (`cli/side_files.rs`):
+  `ExportOptions.embed_captions` muxes the cut's captions as a soft subtitle stream
+  (`mov_text` in mp4 / mov, `webvtt` in webm, `srt` in mkv; `validate_export` refuses it for
+  any other container) and `caption_sidecars` writes `.srt` / `.vtt` beside the output
+  (written before the render, removed unless it completes); chapter markers become the
+  file's chapters in mp4 / mov / mkv / webm / m4a. The builders stay pure: the render
+  (`side_files::prepare`, from `for_render` + the range slice) writes a SubRip and an
+  FFMETADATA temp file and names them in the render-only `#[serde(skip)]` fields
+  `subtitle_input` / `chapters_input`; the builder then adds `-f srt -i …` / `-f ffmetadata
+  -i …` after the clips and titles, `-map N:s:0 -c:s <codec>` and `-map_chapters M`
+  (skipped on a first pass). Unset, nothing is added — the golden oracle is unchanged —
+  and `export_resource` skips those inputs when judging the GPU lane. The `#[ignore]`d
+  `ffprobe_sees_the_subtitle_stream_and_the_chapters` renders mp4 / mkv / webm and probes.
+  `ExportOptions.range` renders only a span by building the
   graph from `Timeline::slice(start, end)` (a shifted sub-timeline copy — boundary
   clips retrimmed honoring speed/reverse, keyframes resampled, overlays clipped).
   **The master bus** (`Timeline.master: MasterBus {volume, limiter, ceiling_db}`,

@@ -144,13 +144,18 @@ say to caption **last** and to re-run after any further
 edit, because captions are placed in timeline time and a later trim moves the
 words out from under them — which an agent has no way to infer from the tool
 list.
-`import_captions` is the same step for a `.srt` / `.ass` / `.ssa` file: an absolute
+`import_captions` is the same step for a `.srt` / `.vtt` / `.ass` / `.ssa` file: an absolute
 `path` or inline `text` (exactly one), a `base` (`timeline`, or `source` with an
 `asset_id` — `CaptionTimeBase::resolve`, shared with the GUI, refuses a contradiction
 rather than preferring one half), the `generate_captions` look and an `offset`; it
 reads and parses on the blocking pool *before* taking the lock, and returns the
 `ImportSummary` rather than every overlay, and the `instructions` call it the caption
 step (last, and it replaces the generated set).
+`export_captions` writes the cut's captions (`.srt` / `.vtt`), `export_interchange` the cut as
+OTIO or a CMX 3600 EDL and `export_markers` the markers as CSV or YouTube chapters — each
+refuses to overwrite without `overwrite`, builds the file with the lock released and the last
+two return `{path, report}`. `export`'s options take `embed_captions` / `caption_sidecars`.
+`add_marker` / `update_marker` take `duration`, `comment` and `kind` (`comment` / `chapter`).
 `generate_voiceover` narrates a script onto the `VO` track (optionally captioning the
 cut in the same call), forwarding synthesis progress to the client's token and
 re-emitting `voiceover-progress` so the GUI shows an agent's voiceover too; like an

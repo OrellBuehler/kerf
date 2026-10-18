@@ -298,7 +298,9 @@ still turns amber when an update is waiting, which is why it stayed out of Help;
 has *Check for updates…*. The OS window's title is `• interview.kerf — Kerf` (`window-title.ts`; the dot leads while there is
 unsaved work), set through `setWindowTitle` and the `core:window:allow-set-title` capability. The project's path moved to the status bar. **The menus**
 (`MenuBar.svelte` over the pure, bun-tested `menus.ts`): *File* (New, Open…, Save…,
-Import media…, Import captions…, Export…, Save cover frame…, Settings, Quit — Save is
+Import media…, Import captions…, Export…, Save cover frame…, an **Export as** submenu — Export captions…,
+Export OTIO…, Export EDL…, Export markers as CSV…, Export YouTube chapters…, the last two off until
+there is a marker (`MenuState.hasMarkers`) —, Settings, Quit — Save is
 "as…" once the project has a file, since a saved project is its own SQLite file and
 `save_project_as` is the only save there is), *Edit* (Undo / Redo, Cut / Copy / Paste /
 Duplicate, Delete / Ripple delete / Select all, **Tool** and **Clip** submenus —
@@ -637,6 +639,18 @@ filters, the `import_captions` arguments — in `api-caption-import.test.ts`.
 The **cover frame** is saved from the preview's context menu
 (`Save cover frame…` → `export_cover` at the playhead), and both a finished
 export and a saved cover offer **Show in folder** in their toast.
+The side-file exports (`file-actions.ts`: `exportCaptionFile`, `exportInterchangeFile`,
+`exportMarkerList`) ask for a path (`pickSavePath`) and toast the backend's `Report` as the
+description (`export-report.ts`: warnings first, `(×n)` counts; a warning toast when anything was
+dropped), so the notification log keeps what an OTIO / EDL could not carry; the harness writes no
+file and says so. The **export dialog** has a *Captions & chapters* section when the cut has
+captions or chapter markers: embed as a subtitle track (only for a container that carries one,
+`carriesSubtitles`, mirrored in `validateExport`; switching to one that cannot turns it off),
+`.srt` / `.vtt` sidecars, and a line saying how many chapter markers become chapters.
+**Markers** are edited in `MarkerDialog.svelte` (the marker's context menu, *Edit marker…*:
+name, Comment / Chapter, length, comment, one `update_marker` through `marker-edit.ts`, which
+sends only what changed); *Make it a chapter / a comment* flips the kind; a marker with a length
+draws its span under the ruler chip, and the tooltip names the kind, span and comment.
 `Preview` shows the composited frame under the playhead, and during
 **forward 1× playback it switches to the streamed frame source** (`start_playback`)
 — per-frame `get_timeline_frame` decodes stay for scrubbing, shuttle and the
