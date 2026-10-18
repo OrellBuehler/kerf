@@ -759,7 +759,10 @@ files`; `export-progress` then carries `variant` / `total`. The
 **Transcript tab** of the library (`TranscriptPanel.svelte`, over the pure, bun-tested
 `src/lib/transcript.ts`) **is an editing surface**: lines resolve to the clip carrying them,
 click seeks, the playhead line highlights, and `×` cuts the sentence from the timeline
-(`cut_clip_range`); cut lines render struck through. When it is *empty* it says which
+(`cut_clip_range`, over its words' bounds when it has words, so the pauses either side stay); cut
+lines render struck through. With two or more speakers a label heads each change of speaker and a
+select filters the lines to one; a transcript with no speakers offers **Label speakers**
+(`refine_transcript`). When it is *empty* it says which
 of the five reasons applies (nothing selected / no backend / model not downloaded /
 not analyzed / no speech) and offers the matching action — a model picker + download,
 or Analyze — instead of a dead end. The **agent panel is a real MCP task

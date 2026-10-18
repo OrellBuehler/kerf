@@ -2689,7 +2689,7 @@ fn word_chunks(words: &[Word], seg_end: f64, layout: CaptionLayout) -> Vec<(Time
     for (i, w) in words.iter().enumerate() {
         let len = w.text.trim().chars().count();
         match groups.last_mut() {
-            Some((first, last)) if *last + 1 - *first < layout.max_words && chars + len + 1 <= layout.max_chars => {
+            Some((first, last)) if *last + 1 - *first < layout.max_words && chars + len < layout.max_chars => {
                 *last = i;
                 chars += len + 1;
             }
@@ -8345,7 +8345,10 @@ mod tests {
         );
         assert_eq!(
             captioned(&timeline, asset, vec![line]),
-            vec![("one two three four".to_string(), 0.0, 1.9), ("five six".to_string(), 4.0, 5.5)]
+            vec![
+                ("one two three four".to_string(), 0.0, 1.9),
+                ("five six".to_string(), 4.0, 5.5)
+            ]
         );
     }
 

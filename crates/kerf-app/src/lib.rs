@@ -1874,6 +1874,28 @@ async fn export_srt(state: State<'_, AppState>, asset_id: String, output_path: S
     .await
 }
 
+/// Re-time an asset's cached transcript to the speech energy and label its speakers, without
+/// re-transcribing. The transcript is read under the lock, the decode and clustering run with it
+/// released, and the result is stored under it again.
+#[tauri::command]
+async fn refine_transcript(state: State<'_, AppState>, asset_id: String) -> CmdResult<AssetAnalysis> {
+    let id = id(&asset_id)?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let (asset, transcript) = {
+            let project = lock_user(&shared);
+            (
+                project.require_asset(id).map_err(|e| e.to_string())?,
+                project.transcript(id).map_err(|e| e.to_string())?,
+            )
+        };
+        let refined =
+            kerf_core::refine_transcript_media(&asset, transcript, &mut |_| {}, &|| false).map_err(|e| e.to_string())?;
+        lock_user(&shared).store_transcript(id, refined).map_err(|e| e.to_string())
+    })
+    .await
+}
+
 #[tauri::command(async)]
 fn remove_silence(state: State<'_, AppState>, asset_id: String) -> CmdResult<Timeline> {
     let id = id(&asset_id)?;
@@ -3585,6 +3607,7 @@ pub fn run() {
             import_captions,
             import_captions_text,
             export_srt,
+            refine_transcript,
             remove_silence,
             snap_to_beats,
             smart_crop,

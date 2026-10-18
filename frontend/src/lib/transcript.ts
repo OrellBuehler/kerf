@@ -2,9 +2,19 @@
 // timeline clip currently carrying it, so a line can seek to itself, be cut
 // out, and read as struck through once it is gone.
 
-import type { Clip, Track, TranscriptSegment } from './types';
+import type { Clip, Track, TranscriptSegment, Word } from './types';
 
-export type TxLine = { t: string; s: string; start: number; end: number; clip: Clip | null };
+export type TxLine = {
+	t: string;
+	s: string;
+	start: number;
+	end: number;
+	clip: Clip | null;
+	speaker: string | null;
+	/** What cutting the line removes: its words' bounds when it has words (the pauses
+	 *  either side stay), else the whole line. */
+	cut: { start: number; end: number };
+};
 
 export function fmtClock(s: number): string {
 	const m = Math.floor(s / 60);
@@ -35,7 +45,43 @@ export function transcriptLines(segments: TranscriptSegment[], assetId: string |
 				}
 			}
 		}
-		return { t: fmtClock(seg.start), s: seg.text, start: seg.start, end: seg.end, clip };
+		const words = seg.words ?? [];
+		const cut = words.length
+			? { start: words[0].start, end: Math.max(words[words.length - 1].end, words[0].start) }
+			: { start: seg.start, end: seg.end };
+		return {
+			t: fmtClock(seg.start),
+			s: seg.text,
+			start: seg.start,
+			end: seg.end,
+			clip,
+			speaker: seg.speaker ?? null,
+			cut
+		};
+	});
+}
+
+/** The speaker labels in a transcript, in order of first appearance. */
+export function speakersOf(segments: TranscriptSegment[]): string[] {
+	const out: string[] = [];
+	for (const s of segments) if (s.speaker && !out.includes(s.speaker)) out.push(s.speaker);
+	return out;
+}
+
+/** A line's words spread over its span in proportion to their character length,
+ *  each marked `estimated`. Mirrors `transcript::estimate_words`. */
+export function estimateWords(seg: TranscriptSegment): Word[] {
+	const texts = seg.text.split(/\s+/).filter(Boolean);
+	const span = seg.end - seg.start;
+	if (!texts.length || !(Number.isFinite(seg.start) && Number.isFinite(span) && span > 0)) return [];
+	const weights = texts.map((t) => Math.max([...t].length, 1));
+	const total = weights.reduce((a, b) => a + b, 0);
+	let acc = 0;
+	return texts.map((text, i) => {
+		const start = seg.start + (span * acc) / total;
+		acc += weights[i];
+		const end = i + 1 === texts.length ? seg.end : seg.start + (span * acc) / total;
+		return { text, start, end, estimated: true, speaker: seg.speaker ?? null };
 	});
 }
 

@@ -339,7 +339,10 @@ fn run_whisper_rs(
             continue;
         }
         // whisper timestamps are in centiseconds.
-        let (start, end) = (segment.start_timestamp() as f64 / 100.0, segment.end_timestamp() as f64 / 100.0);
+        let (start, end) = (
+            segment.start_timestamp() as f64 / 100.0,
+            segment.end_timestamp() as f64 / 100.0,
+        );
         // Text tokens only: the special ones (end of text, timestamps, language…) sort after it.
         let tokens: Vec<crate::transcript::TokenTiming> = (0..segment.n_tokens())
             .filter_map(|t| segment.get_token(t))
@@ -544,11 +547,7 @@ pub fn refine_transcript_media(
         fraction: None,
         detail: Some("timing words and labelling speakers".to_string()),
     });
-    let audio = crate::engine::decode_audio(
-        std::path::Path::new(&asset.path),
-        crate::transcript::SAMPLE_RATE,
-        1,
-    )?;
+    let audio = crate::engine::decode_audio(std::path::Path::new(&asset.path), crate::transcript::SAMPLE_RATE, 1)?;
     if cancel() {
         return Err(Error::Cancelled);
     }
@@ -1654,5 +1653,41 @@ mod tests {
         assert_eq!(nobackend.kinds[4].state, AnalysisState::Off);
         assert_eq!(nobackend.kinds[4].reason.as_deref(), Some("no speech-to-text backend"));
         assert_eq!(nobackend.kinds[0].state, AnalysisState::NotRun);
+    }
+
+    /// The refinement through the real ffmpeg decode: a 48 kHz stereo WAV with a tone in two
+    /// stretches comes back with its estimated words tightened to the tone and one speaker.
+    #[test]
+    #[ignore = "drives the ffmpeg binary"]
+    fn refining_decodes_the_asset_and_tightens_its_words() {
+        let dir = std::env::temp_dir().join(format!("kerf-refine-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("speech.wav");
+        let rate = 48_000u32;
+        let mut samples = Vec::new();
+        for i in 0..3 * rate as usize {
+            let t = i as f32 / rate as f32;
+            let v = if (0.5..1.0).contains(&t) || (1.5..2.5).contains(&t) {
+                0.3 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
+            } else {
+                0.0001
+            };
+            samples.extend([v, v]);
+        }
+        crate::engine::write_wav(&path, &crate::engine::AudioBuffer::new(rate, 2, samples)).unwrap();
+        let mut a = asset();
+        a.path = path.to_string_lossy().into_owned();
+        let line = TranscriptSegment {
+            start: 0.0,
+            end: 3.0,
+            text: "hello there".into(),
+            ..Default::default()
+        };
+        let out = refine_transcript_media(&a, vec![line], &mut |_| {}, NEVER_CANCEL).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let words = &out[0].words;
+        assert_eq!(words.len(), 2);
+        assert!(words[0].start >= 0.49 && words[1].end <= 2.51, "{words:?}");
+        assert_eq!(out[0].speaker.as_deref(), Some("S1"));
     }
 }

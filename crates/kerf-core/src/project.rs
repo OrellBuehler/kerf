@@ -6058,7 +6058,11 @@ mod tests {
         let s2 = project.speaker_ranges(asset.id, Some("S2"), 0.5).unwrap();
         assert_eq!(s2.len(), 1);
         assert_eq!((s2[0].ranges[0].start, s2[0].ranges[0].end), (2.0, 2.4));
-        assert!(project.speaker_ranges(asset.id, Some("S9"), 0.5).unwrap_err().to_string().contains("S1, S2"));
+        assert!(project
+            .speaker_ranges(asset.id, Some("S9"), 0.5)
+            .unwrap_err()
+            .to_string()
+            .contains("S1, S2"));
         let fillers = project.filler_words(asset.id, &[]).unwrap();
         assert_eq!(fillers.len(), 1);
         assert_eq!((fillers[0].start, fillers[0].end), (0.0, 0.3));

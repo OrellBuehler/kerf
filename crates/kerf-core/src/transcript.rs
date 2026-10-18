@@ -370,8 +370,8 @@ mod tests {
         };
         let words = words_from_tokens(
             &[
-                t(" Hel", 0.0, 0.2),
-                t("lo", 0.2, 0.4),
+                t(" Ho", 0.0, 0.2),
+                t("use", 0.2, 0.4),
                 t(",", 0.4, 0.4),
                 t(" world", 0.5, 0.9),
                 t(" x", 2.0, 9.0),
@@ -380,22 +380,22 @@ mod tests {
             1.5,
         );
         let got: Vec<(&str, f64, f64)> = words.iter().map(|w| (w.text.as_str(), w.start, w.end)).collect();
-        assert_eq!(got, vec![("Hello,", 0.1, 0.4), ("world", 0.5, 0.9), ("x", 1.5, 1.5)]);
+        assert_eq!(got, vec![("House,", 0.1, 0.4), ("world", 0.5, 0.9), ("x", 1.5, 1.5)]);
         assert_eq!(words[0].confidence, Some(0.5));
         assert!(words.iter().all(|w| !w.estimated));
     }
 
     #[test]
     fn a_character_split_across_tokens_survives() {
-        let bytes = "é".as_bytes();
+        let bytes = "ï".as_bytes();
         let t = |b: &[u8]| TokenTiming {
             bytes: b.to_vec(),
             start: 0.0,
             end: 0.1,
             p: 1.0,
         };
-        let words = words_from_tokens(&[t(b" caf"), t(&bytes[..1]), t(&bytes[1..])], 0.0, 1.0);
-        assert_eq!(words[0].text, "café");
+        let words = words_from_tokens(&[t(b" na"), t(&bytes[..1]), t(&bytes[1..]), t(b"ve")], 0.0, 1.0);
+        assert_eq!(words[0].text, "naïve");
     }
 
     #[test]

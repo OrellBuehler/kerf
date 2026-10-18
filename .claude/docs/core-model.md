@@ -127,8 +127,12 @@
   that were cut out get none. It reads through `for_render`, so a muted track is
   as uncaptioned as it is unheard; it chunks a sentence to `CaptionOptions`
   (a speech model emits whole sentences and a whole sentence does not fit a
-  9:16 frame), timing lines by *character share*
-  because neither speech backend reports word timings; lines too short to read
+  9:16 frame). A segment **with `words`** is chunked over its words (`word_chunks`, the same
+  `max_words` / `max_chars` rule): a line runs from its first word's start to the next line's, or
+  across a pause to its last word's end + `CAPTION_HOLD` (0.5 s; the last line no further than the
+  segment end), and is kept only if the span its words are *spoken* in meets the clip (a hold
+  reaching past an in-point captions nothing). One **without** words (an imported cue, an older
+  transcript) is timed by *character share* as before, so those caption byte-identically; lines too short to read
   merge back into a neighbour instead of flashing; and no two lines are ever on
   screen at once (captions are one lane of text, and the same footage reaching
   the cut twice would otherwise collide with itself). `TextOverlay.generated`

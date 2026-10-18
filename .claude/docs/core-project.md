@@ -171,7 +171,17 @@
   per-kind toggles, minus transcript without a backend), a named list runs exactly that — so an
   agent cannot fetch a speech model for someone who turned transcription off, and a user can still
   transcribe one clip by hand. Transcribing with no backend is a failed step, not an empty
-  transcript. **What a request runs** is `resolve_steps(asset, requested)`: a file with no audio is
+  transcript. **Word timings and speaker labels are part of the `transcript` step**, not a sixth
+  kind: no model, one 16 kHz decode and a few seconds of DSP per hour next to minutes of inference,
+  so they always run with it (reported as `transcribe` with the detail "timing words and labelling
+  speakers") and per-kind status stays five kinds — `transcript` done means words and speakers were
+  attempted. A transcript cached before (no `words`, no `speaker`) still reads as done; readers
+  estimate its words on the fly (`transcript::words_of`), and `refine_transcript` adds them without
+  re-transcribing: `Project::transcript(asset)` under the lock → static `refine_transcript_media` →
+  `Project::store_transcript` (a merge with `ran = [transcript]`). `speaker_ranges(asset, speaker?,
+  join_gap)` (errors naming the known speakers for an unknown one, or when nothing is labelled) and
+  `filler_words(asset, fillers)` (default um / uh / … / you know, phrases matched across words of one
+  line) read it by word bounds. **What a request runs** is `resolve_steps(asset, requested)`: a file with no audio is
   not asked for silence, loudness, rhythm or speech (silent b-roll used to get a failed transcript
   chip and an error toast on every import), a still has nothing to analyze, and an empty answer is
   an `InvalidArgument` that says why (everything switched off; a silent file asked for its speech)

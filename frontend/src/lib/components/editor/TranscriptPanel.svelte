@@ -1,7 +1,8 @@
 <script lang="ts">
 	// The transcript as an editing surface: lines resolve to the clip carrying
 	// them, click seeks, the playhead line highlights, and × cuts the sentence
-	// from the timeline. Empty, it says which of the five reasons applies.
+	// (its words, when they are timed) from the timeline. Speakers label the
+	// lines and can filter them. Empty, it says which of the five reasons applies.
 	import Icon from './Icon.svelte';
 	import Btn from './Btn.svelte';
 	import EmptyState from './EmptyState.svelte';
@@ -12,13 +13,37 @@
 	import { editor } from '$lib/state.svelte';
 	import { mediaStatus } from '$lib/media-status.svelte';
 	import { toast } from '$lib/notifications.svelte';
-	import { activeLineIndex, srcToTimeline, transcriptLines, type TxLine } from '$lib/transcript';
+	import { activeLineIndex, speakersOf, srcToTimeline, transcriptLines, type TxLine } from '$lib/transcript';
 	import { tip } from '$lib/tip';
 
 	const txLines = $derived(
 		transcriptLines(editor.selectedMetadata?.analysis?.transcript ?? [], editor.selectedAssetId, editor.timeline.tracks)
 	);
 	const activeTx = $derived(activeLineIndex(txLines, ui.time));
+	const speakers = $derived(speakersOf(editor.selectedMetadata?.analysis?.transcript ?? []));
+	let speakerFilter = $state<string | null>(null);
+	$effect(() => {
+		if (speakerFilter && !speakers.includes(speakerFilter)) speakerFilter = null;
+	});
+	const shown = $derived(
+		txLines.map((l, i) => ({ l, i })).filter(({ l }) => !speakerFilter || l.speaker === speakerFilter)
+	);
+	let refining = $state(false);
+
+	async function labelSpeakers() {
+		const id = editor.selectedAssetId;
+		if (!id) return;
+		refining = true;
+		try {
+			const analysis = await editor.refineTranscript(id);
+			const n = speakersOf(analysis.transcript).length;
+			toast(n > 1 ? `${n} speakers labelled` : 'One speaker found');
+		} catch (e) {
+			toast.error(e instanceof Error ? e.message : String(e));
+		} finally {
+			refining = false;
+		}
+	}
 
 	function seekLine(l: TxLine) {
 		if (!l.clip) return;
@@ -30,7 +55,7 @@
 	async function cutLine(l: TxLine) {
 		if (!l.clip) return;
 		try {
-			await editor.cutRange(l.clip.id, l.start, l.end);
+			await editor.cutRange(l.clip.id, l.cut.start, l.cut.end);
 			toast('Line cut from timeline', {
 				action: { label: 'Undo', onClick: () => void editor.undo() }
 			});
@@ -127,8 +152,31 @@
 			{/if}
 		</EmptyState>
 	{:else}
+		<div class="speakers">
+			{#if speakers.length > 1}
+				<select
+					value={speakerFilter ?? ''}
+					onchange={(e) => (speakerFilter = (e.currentTarget as HTMLSelectElement).value || null)}
+					aria-label="Show speaker"
+					class="k-select"
+					style="color:var(--text-secondary)"
+				>
+					<option value="">All speakers</option>
+					{#each speakers as sp (sp)}
+						<option value={sp}>{sp}</option>
+					{/each}
+				</select>
+			{:else if speakers.length === 0}
+				<Btn size="sm" onclick={() => void labelSpeakers()} disabled={refining}
+					>{refining ? 'Labelling speakers…' : 'Label speakers'}</Btn
+				>
+			{/if}
+		</div>
 		<div data-selectable style="display:flex;flex-direction:column;gap:2px">
-			{#each txLines as l, i (i)}
+			{#each shown as { l, i }, k (i)}
+				{#if speakers.length > 1 && l.speaker && (k === 0 || shown[k - 1].l.speaker !== l.speaker)}
+					<div class="speaker">{l.speaker}</div>
+				{/if}
 				<div class="line" data-active={i === activeTx ? '' : undefined}>
 					<button
 						onclick={() => seekLine(l)}
@@ -167,6 +215,20 @@
 <style>
 	/* A line is lit by the pointer, and the one the playhead is in carries the accent bar: the old
 	   darker block alone was easy to miss. Text on `surface-hover` is held to 4.5:1 by the contrast guard. */
+	.speakers {
+		display: flex;
+		justify-content: flex-end;
+		margin-bottom: 6px;
+	}
+	.speakers:empty {
+		display: none;
+	}
+	.speaker {
+		font-family: var(--font-mono);
+		font-size: var(--text-2xs);
+		color: var(--text-muted);
+		padding: 8px 8px 2px;
+	}
 	.line {
 		display: flex;
 		gap: 8px;

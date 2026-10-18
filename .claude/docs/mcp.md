@@ -234,6 +234,14 @@ the audience), and `export_cover` writes the thumbnail.
 out, since an agent that does not know its edits are held back would report a cut
 the user has not got.
 
+**Transcript reads.** `get_transcript { asset_id, words?, speaker? }` returns the lines with their
+`speaker` and (unless `words: false`, to save tokens) their words, estimated on the fly for a transcript
+cached before words were recorded; `get_asset_metadata` strips the words. `speaker_ranges { asset_id,
+speaker?, join_gap? }` (gap clamped 0..10 s, default 0.75) is "cut to speaker": each speaker's
+source-time ranges and speaking time. `find_filler_words { asset_id, fillers? }` (≤ 100) returns
+fillers by word bounds for `cut_clip_range`. `refine_transcript { asset_id }` re-times words and labels
+speakers on a cached transcript (lock released for the decode, `project-changed` after).
+
 **Proxies and analysis steps.** `analyze_asset { asset_id, steps? }` runs only the named kinds
 (`silence`, `scenes`, `loudness`, `rhythm`, `transcript`, `all`; aliases such as `tempo` / `transcription`
 parse) and merges them into the cache; omitted, it runs what the user left on in Settings ›

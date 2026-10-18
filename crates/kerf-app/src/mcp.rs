@@ -477,9 +477,7 @@ struct SetMasterDuckParams {
 struct CutClipRangeParams {
     #[schemars(description = "UUID of the clip to cut")]
     clip_id: String,
-    #[schemars(
-        description = "Source-time start of the span to remove (seconds, e.g. a transcript segment's or a word's start)"
-    )]
+    #[schemars(description = "Source-time start of the span to remove (seconds, e.g. a transcript segment's or a word's start)")]
     from: f64,
     #[schemars(description = "Source-time end of the span to remove (seconds)")]
     to: f64,
@@ -1218,9 +1216,7 @@ struct SpeakerRangesParams {
     asset_id: String,
     #[schemars(description = "Only this speaker's ranges (e.g. \"S1\"); omit for every speaker")]
     speaker: Option<String>,
-    #[schemars(
-        description = "Words of one speaker closer than this many seconds are one range (default 0.75, at most 10)"
-    )]
+    #[schemars(description = "Words of one speaker closer than this many seconds are one range (default 0.75, at most 10)")]
     join_gap: Option<f64>,
 }
 
@@ -5167,6 +5163,26 @@ mod tests {
             .expect("properties");
         for name in ["path", "text", "format", "base", "asset_id", "style"] {
             assert!(props.contains_key(name), "{name} is missing from the schema");
+        }
+    }
+
+    /// The transcript tools are registered and need only the asset: words, speaker, gap and
+    /// fillers are all optional.
+    #[test]
+    fn transcript_tools_take_only_the_asset() {
+        let tools = router().list_all();
+        for name in ["get_transcript", "speaker_ranges", "find_filler_words", "refine_transcript"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("`{name}` is registered"));
+            let required: Vec<&str> = tool
+                .input_schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            assert_eq!(required, ["asset_id"], "{name}");
         }
     }
 
