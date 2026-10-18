@@ -5606,7 +5606,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kerf-save-as-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut project = Project::sample().unwrap();
-        let asset = project.list_assets().unwrap().remove(0);
+        let Some(asset) = project.list_assets().ok().and_then(|a| a.into_iter().next()) else {
+            panic!("the sample project lists an asset");
+        };
 
         // The job resolved its inputs under the old project, and is running with the lock released.
         let noted = project.generation();

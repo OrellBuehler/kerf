@@ -327,7 +327,7 @@ fn missing_assets_lists_the_files_that_are_gone_with_the_clips_that_use_them() {
     p.insert_asset(&present).unwrap();
 
     let missing = p.missing_assets().unwrap();
-    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert_eq!(missing.len(), 1);
     assert_eq!((missing[0].asset_id, missing[0].clips), (gone.id, 2));
     assert_eq!(missing[0].path, "/av.mp4");
     let _ = c1;
