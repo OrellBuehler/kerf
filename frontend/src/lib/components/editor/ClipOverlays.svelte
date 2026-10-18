@@ -28,7 +28,7 @@
 	 * clip linked to it carries the level), and its fades are the picture's alone. */
 	import type { Keyframe, Clip } from '$lib/types';
 	import { clipDuration } from '$lib/types';
-	import { formatTimecode } from '$lib/timecode';
+	import { timeDisplay } from '$lib/time-display.svelte';
 	import { beginDrag } from '$lib/drag';
 	import { quantizeFade } from '$lib/frames';
 	import { gainLabel } from '$lib/mixer';
@@ -232,7 +232,7 @@
 
 	const stop = (e: Event) => e.stopPropagation();
 
-	const stamp = (s: number) => formatTimecode(s, fps);
+	const stamp = (s: number) => timeDisplay.fmt(s, fps);
 </script>
 
 <div

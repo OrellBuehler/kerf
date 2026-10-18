@@ -2,7 +2,7 @@
 	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
 	import PreviewEmpty from './PreviewEmpty.svelte';
-	import { formatTimecode } from '$lib/timecode';
+	import { timeDisplay } from '$lib/time-display.svelte';
 	import ScrubBar from './ScrubBar.svelte';
 	import TrimMonitor from './TrimMonitor.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
@@ -112,7 +112,7 @@
 	});
 
 	function tc(s: number): string {
-		return formatTimecode(s, editor.fps);
+		return timeDisplay.fmt(s);
 	}
 
 	// The frame under the playhead: fetched one at a time (frame-pump.svelte.ts), as FFmpeg's JPEG

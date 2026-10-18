@@ -37,9 +37,10 @@ export function colorSummary(clip: Animatable | undefined, shown: Color): string
 	return activeLook(shown)?.label ?? 'Custom';
 }
 
-/** The Timing section's line, labelled: `Start 0:00.0 · Dur 0:12.5`. */
-export function timingSummary(start: number, duration: number): string {
-	return `Start ${clock(start)} · Dur ${clock(duration)}`;
+/** The Timing section's line, labelled: `Start 0:00.0 · Dur 0:12.5`. `fmt` is how a time reads (the
+ *  interface's own mode); without it, seconds. */
+export function timingSummary(start: number, duration: number, fmt: (seconds: number) => string = clock): string {
+	return `Start ${fmt(start)} · Dur ${fmt(duration)}`;
 }
 
 /** The number a keyframe toggle animates, as the row names it. */

@@ -9,7 +9,7 @@
 	import { inTauri, revealLogs } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 	import { tip } from '$lib/tip';
-	import { clock } from '$lib/clock';
+	import { timeDisplay } from '$lib/time-display.svelte';
 
 	const showLogs = inTauri();
 
@@ -49,7 +49,7 @@
 	{#if meta}
 		<span use:tip={'The selected asset: frame rate, size and codec'} style="font-size:var(--text-xs);color:var(--text-muted)">{meta}</span>
 	{/if}
-	<span use:tip={'Length of the cut'} style="font-size:var(--text-xs);color:var(--text-muted)">Cut {clock(editor.duration)}</span>
+	<span use:tip={'Length of the cut'} style="font-size:var(--text-xs);color:var(--text-muted)">Cut {timeDisplay.fmt(editor.duration)}</span>
 	<div style="flex:1"></div>
 	{#if sourceNote}
 		<!-- Which file this frame was decoded from: the preview proxy, or the original and why. -->

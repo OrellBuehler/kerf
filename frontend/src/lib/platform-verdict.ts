@@ -172,7 +172,7 @@ function singleFile(file: PlatformReport, project: PlatformReport | null): Verdi
 		return c && !takes(c) ? [SHORT[id] ?? c.label] : [];
 	});
 
-	let text = `${width}×${height}, ${ratioLabel(width, height)}, ${clock(duration)}.`;
+	let text = `This cut is ${width}×${height} (${ratioLabel(width, height)}) and ${clock(duration)} long.`;
 	if (ready.length)
 		text += ` Fine for ${list(
 			ready.map((c) => FINE_FOR[c.target] ?? c.label),

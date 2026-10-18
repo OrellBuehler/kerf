@@ -13,7 +13,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
 	import { formatsFor, hasPicture, presetFor, ratioLabel } from '$lib/delivery-formats';
-	import { formatTimecode } from '$lib/timecode';
+	import { timeDisplay } from '$lib/time-display.svelte';
 	import { tip } from '$lib/tip';
 
 	const hasClips = $derived(editor.timeline.tracks.some((t) => t.clips.length > 0));
@@ -34,7 +34,7 @@
 			<div style="display:flex;justify-content:space-between;gap:8px">
 				<span style="color:var(--text-muted)">Length</span>
 				<span style="font-family:var(--font-mono)" use:tip={'Non-drop timecode'}
-					>{formatTimecode(editor.duration, editor.fps)}</span
+					>{timeDisplay.fmt(editor.duration)}</span
 				>
 			</div>
 			<div style="display:flex;justify-content:space-between;gap:8px">

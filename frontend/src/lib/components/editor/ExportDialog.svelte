@@ -12,7 +12,7 @@
 	import { inTauri, pickExportPath, hwEncoders, knownHwEncoders, revealPath } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 	import { formatsFor, hasPicture } from '$lib/delivery-formats';
-	import { formatTimecode } from '$lib/timecode';
+	import { timeDisplay } from '$lib/time-display.svelte';
 	import { frameKey, restoreDraft } from '$lib/export-draft';
 	import { judgeable } from '$lib/platform-verdict';
 	import type { RowSpec } from '$lib/slider-row';
@@ -111,7 +111,7 @@
 			: null
 	);
 
-	const fmtTime = (s: number): string => formatTimecode(s, editor.fps);
+	const fmtTime = (s: number): string => timeDisplay.fmt(s);
 
 	function fmtEta(s: number | null | undefined): string {
 		if (s == null || !isFinite(s)) return '';

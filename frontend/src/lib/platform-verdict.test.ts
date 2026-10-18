@@ -81,22 +81,22 @@ describe('the default 16:9 export, no shape ticked', () => {
 		expect(v.groups[0].lines).toEqual([
 			{
 				level: 'note',
-				text: '1920×1080, 16:9, 0:20. Fine for YouTube and the web. Tick a shape under Deliver to for Reels, Shorts or TikTok.'
+				text: 'This cut is 1920×1080 (16:9) and 0:20 long. Fine for YouTube and the web. Tick a shape under Deliver to for Reels, Shorts or TikTok.'
 			}
 		]);
 	});
 
 	test('states the length rounded like the platform messages, so the two agree', () => {
-		expect(texts(verdict({ file: rep(1920, 1080, 20.5) }))[0]).toContain('16:9, 0:21.');
-		expect(texts(verdict({ file: rep(1920, 1080, 59.4) }))[0]).toContain('16:9, 0:59.');
-		expect(texts(verdict({ file: rep(1920, 1080, 3725) }))[0]).toContain('16:9, 62:05.');
+		expect(texts(verdict({ file: rep(1920, 1080, 20.5) }))[0]).toContain('and 0:21 long.');
+		expect(texts(verdict({ file: rep(1920, 1080, 59.4) }))[0]).toContain('and 0:59 long.');
+		expect(texts(verdict({ file: rep(1920, 1080, 3725) }))[0]).toContain('and 62:05 long.');
 	});
 
 	test('a cut just over a limit names the same length in the line and in the limit message', () => {
 		// 180.6 s: the neutral line and "… is over YouTube Shorts' 3:00 limit" must both say 3:01.
 		const v = verdict({ file: rep(1080, 1920, 180.6) });
 		const [head, ...limits] = texts(v);
-		expect(head).toContain('9:16, 3:01.');
+		expect(head).toContain('and 3:01 long.');
 		expect(limits.some((t) => t.startsWith('3:01 is over YouTube Shorts'))).toBe(true);
 		for (const t of limits) expect(t).not.toContain('3:00 is');
 		const ticked = verdict({ shapes: [shape('9:16', 180.6)] });
@@ -144,7 +144,7 @@ describe('the default 16:9 export, no shape ticked', () => {
 	test('a low resolution is a folded tip, not a warning', () => {
 		const v = verdict({ file: rep(1280, 720) });
 		expect(levels(v)).toEqual(['note']);
-		expect(texts(v)[0]).toBe('1280×720, 16:9, 0:20. Fine for YouTube and the web. Tick a shape under Deliver to for Reels, Shorts or TikTok.');
+		expect(texts(v)[0]).toBe('This cut is 1280×720 (16:9) and 0:20 long. Fine for YouTube and the web. Tick a shape under Deliver to for Reels, Shorts or TikTok.');
 		expect(v.tips).toEqual([
 			'1280×720 is below the size YouTube is made for (1920×1080); the platform will upscale it and it will look soft.'
 		]);
@@ -157,7 +157,7 @@ describe('a project already cut for a shape, no shape ticked', () => {
 		expect(v.groups[0].lines).toEqual([
 			{
 				level: 'note',
-				text: '1080×1080, 1:1, 0:20. Fine for YouTube Shorts and Instagram feed. Tick a shape under Deliver to for Reels or TikTok.'
+				text: 'This cut is 1080×1080 (1:1) and 0:20 long. Fine for YouTube Shorts and Instagram feed. Tick a shape under Deliver to for Reels or TikTok.'
 			}
 		]);
 		expect(texts(v).join(' ')).not.toMatch(/letterbox|toolbar/i);
@@ -170,13 +170,13 @@ describe('a project already cut for a shape, no shape ticked', () => {
 
 	test('a 9:16 cut is fine for the three vertical feeds and suggests nothing', () => {
 		const v = verdict({ file: rep(1080, 1920) });
-		expect(texts(v)).toEqual(['1080×1920, 9:16, 0:20. Fine for Instagram Reels, YouTube Shorts and TikTok.']);
+		expect(texts(v)).toEqual(['This cut is 1080×1920 (9:16) and 0:20 long. Fine for Instagram Reels, YouTube Shorts and TikTok.']);
 	});
 
 	test('a 4:5 cut is fine for the feed and Shorts, and suggests the vertical feeds', () => {
 		const v = verdict({ file: rep(1080, 1350) });
 		expect(texts(v)).toEqual([
-			'1080×1350, 4:5, 0:20. Fine for YouTube Shorts and Instagram feed. Tick a shape under Deliver to for Reels or TikTok.'
+			'This cut is 1080×1350 (4:5) and 0:20 long. Fine for YouTube Shorts and Instagram feed. Tick a shape under Deliver to for Reels or TikTok.'
 		]);
 	});
 
@@ -185,7 +185,7 @@ describe('a project already cut for a shape, no shape ticked', () => {
 		expect(v.groups[0].lines).toEqual([
 			{
 				level: 'note',
-				text: '1440×1080, 4:3, 0:20. No platform here takes this shape without bars. Tick a shape under Deliver to for Reels, Shorts or TikTok.'
+				text: 'This cut is 1440×1080 (4:3) and 0:20 long. No platform here takes this shape without bars. Tick a shape under Deliver to for Reels, Shorts or TikTok.'
 			}
 		]);
 	});
@@ -195,7 +195,7 @@ describe('real limits are the only amber and red', () => {
 	test('a 9:16 cut over three minutes: Reels is warned, Shorts rejects, TikTok is fine', () => {
 		const v = verdict({ file: rep(1080, 1920, 4.5 * 60) });
 		const [head, ...rest] = v.groups[0].lines;
-		expect(head).toEqual({ level: 'note', text: '1080×1920, 9:16, 4:30. Fine for TikTok.' });
+		expect(head).toEqual({ level: 'note', text: 'This cut is 1080×1920 (9:16) and 4:30 long. Fine for TikTok.' });
 		expect(rest.map((l) => l.level)).toEqual(['warning', 'error']);
 		expect(rest[0].text).toContain('Instagram Reels');
 		expect(rest[0].text).toContain('1:30');
@@ -206,7 +206,7 @@ describe('real limits are the only amber and red', () => {
 	test('a cut too short for a platform is an error on that platform only', () => {
 		const v = verdict({ file: rep(1080, 1920, 2) });
 		expect(v.groups[0].lines.map((l) => l.level)).toEqual(['note', 'error', 'error']);
-		expect(v.groups[0].lines[0].text).toBe('1080×1920, 9:16, 0:02. Fine for YouTube Shorts.');
+		expect(v.groups[0].lines[0].text).toBe('This cut is 1080×1920 (9:16) and 0:02 long. Fine for YouTube Shorts.');
 		expect(texts(v).slice(1).join(' ')).toContain('Instagram Reels');
 		expect(texts(v).slice(1).join(' ')).toContain('TikTok');
 	});
@@ -222,7 +222,7 @@ describe('real limits are the only amber and red', () => {
 		const marked = verdict({ file: report({ ...cut(1080, 1920, 4.5 * 60), duration: 20 }) });
 		expect(levels(long)).toContain('error');
 		expect(levels(marked)).toEqual(['note']);
-		expect(texts(marked)[0]).toBe('1080×1920, 9:16, 0:20. Fine for Instagram Reels, YouTube Shorts and TikTok.');
+		expect(texts(marked)[0]).toBe('This cut is 1080×1920 (9:16) and 0:20 long. Fine for Instagram Reels, YouTube Shorts and TikTok.');
 	});
 });
 
@@ -308,7 +308,7 @@ describe('a project cut for a shape, exported wider', () => {
 
 	test('does not also send the user to Deliver to for the same thing', () => {
 		const v = verdict({ file: rep(1920, 1080), project: vertical });
-		expect(v.groups[0].lines[0].text).toBe('1920×1080, 16:9, 0:20. Fine for YouTube and the web.');
+		expect(v.groups[0].lines[0].text).toBe('This cut is 1920×1080 (16:9) and 0:20 long. Fine for YouTube and the web.');
 	});
 
 	test('never mentions the toolbar', () => {

@@ -43,7 +43,7 @@
 	import { toast } from '$lib/notifications.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { linkBadge, selectionUnits } from '$lib/link-ui';
-	import { clock, clockRange } from '$lib/clock';
+	import { timeDisplay } from '$lib/time-display.svelte';
 	import { parseColor, swatchHex, withPicked } from '$lib/title-color';
 	import { colorSummary, keyLabel, keyNeighbours, timingSummary } from '$lib/inspector-summary';
 	import { fitOffer, musicSummary } from '$lib/music-ui';
@@ -106,6 +106,8 @@
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);
 	const kind = $derived(asset?.streams.some((s) => s.kind === 'video') ? 'video' : 'audio');
 	const hasAudio = $derived(asset?.streams.some((s) => s.kind === 'audio') ?? false);
+	/** The rate the clip's footage counts frames at — the In and Out are positions in *it*, not in the cut. */
+	const sourceFps = $derived(asset?.streams.find((s) => s.kind === 'video')?.fps || editor.fps);
 	/** A picture whose sound was detached plays none of its own: the audio clip linked to it
 	 *  does, and that is where the level, the fades of the *sound* and the effects belong. */
 	const soundDetached = $derived(clip?.source_audio === false);
@@ -490,6 +492,38 @@
 	</label>
 {/snippet}
 
+{#snippet timeRow(label: string, value: number, fps: number, onCommit: (v: number, at: Edit) => void)}
+	<!-- A time is typed as timecode or as seconds (`parseTime` takes either) and shown on a frame — the number
+	     field it replaces showed 4.633333 and took only seconds. -->
+	<label style={ROW_GRID}>
+		<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">{label}</span>
+		<input
+			type="text"
+			spellcheck="false"
+			autocomplete="off"
+			value={timeDisplay.field(value, fps)}
+			readonly={editor.locked}
+			aria-disabled={editor.locked || undefined}
+			aria-label={`${label}, as ${timeDisplay.mode === 'seconds' ? 'seconds' : 'timecode or seconds'}`}
+			onfocus={noteFocus}
+			oninput={noteTyped}
+			oncompositionend={noteTyped}
+			onchange={(e) => {
+				const { scope: at, text } = endEdit(e.currentTarget);
+				const v = timeDisplay.parseFrame(text, fps);
+				// Put the field back to what the clip has first: a refused entry then doesn't sit there
+				// showing something that was ignored, while an accepted one re-renders over this.
+				e.currentTarget.value = timeDisplay.field(value, fps);
+				if (editor.locked) return;
+				if (v === null) toast.error(`“${text.trim()}” is not a time — try 12.5, 0:12.5 or 00:00:12:15`);
+				else onCommit(v, at);
+			}}
+			style="{inputCss};width:112px;grid-column:2 / 4;justify-self:end"
+		/>
+		<span aria-hidden="true" style="font-size:var(--text-sm);color:var(--text-muted)">{timeDisplay.mode === 'seconds' ? 's' : ''}</span>
+	</label>
+{/snippet}
+
 {#snippet keyToggle(prop: Property)}
 	{@const c = clip}
 	{@const keyed = c ? isKeyed(c, prop) : false}
@@ -671,7 +705,7 @@
 		On its own lane, independent of the clips beneath it. Drag it in the preview to move it, or a corner to resize.
 	</div>
 
-	<InspectorSection title="Text" summary={clockRange(o.start, o.end)} open>
+	<InspectorSection title="Text" summary={timeDisplay.range(o.start, o.end)} open>
 		<label style={ROW_GRID}>
 			<span style="font-size:12px;color:var(--text-muted)">Text</span>
 			<input
@@ -685,11 +719,11 @@
 				style="{textCss};grid-column:2 / 5;min-width:0"
 			/>
 		</label>
-		{@render numRow('Start', o.start, 0.1, (v, at) => {
+		{@render timeRow('Start', o.start, editor.fps, (v, at) => {
 			const ov = overlayOf(at);
 			if (ov) void run(() => editor.retimeOverlay(ov.id, Math.min(v, Math.max(0, ov.end - MIN_TITLE)), ov.end));
 		})}
-		{@render numRow('End', o.end, 0.1, (v, at) => {
+		{@render timeRow('End', o.end, editor.fps, (v, at) => {
 			const ov = overlayOf(at);
 			if (ov) void run(() => editor.retimeOverlay(ov.id, ov.start, Math.max(v, ov.start + MIN_TITLE)));
 		})}
@@ -846,17 +880,17 @@
 				</div>
 			{/if}
 
-			<InspectorSection title="Timing" summary={timingSummary(clip.timeline_start, clipDuration(clip))} open>
-			{@render readRow('Start', clock(clip.timeline_start))}
-			{@render readRow('Duration', clock(clipDuration(clip)))}
+			<InspectorSection title="Timing" summary={timingSummary(clip.timeline_start, clipDuration(clip), (s) => timeDisplay.fmt(s))} open>
+			{@render readRow('Start', timeDisplay.fmt(clip.timeline_start))}
+			{@render readRow('Duration', timeDisplay.fmt(clipDuration(clip)))}
 
 			<div class="k-overline" style="margin:12px 0 4px">Trim source</div>
-			{@render readRow('Source range', clockRange(clip.source_in, clip.source_out))}
-			{@render numRow('In', clip.source_in, 0.1, (v, at) => {
+			{@render readRow('Source range', timeDisplay.range(clip.source_in, clip.source_out, sourceFps))}
+			{@render timeRow('In', clip.source_in, sourceFps, (v, at) => {
 				const c = clipOf(at);
 				if (c) void run(() => editor.trim(c.id, v, undefined));
 			})}
-			{@render numRow('Out', clip.source_out, 0.1, (v, at) => {
+			{@render timeRow('Out', clip.source_out, sourceFps, (v, at) => {
 				const c = clipOf(at);
 				if (c) void run(() => editor.trim(c.id, undefined, v));
 			})}

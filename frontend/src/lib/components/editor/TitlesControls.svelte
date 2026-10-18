@@ -30,7 +30,7 @@
 		resolveChoice
 	} from '$lib/caption-import-ui';
 	import { attempt } from '$lib/ops';
-	import { clock } from '$lib/clock';
+	import { timeDisplay } from '$lib/time-display.svelte';
 
 	const uid = $props.id();
 	/** The options row: where its window (the panel may be in a detached one) is read from. */
@@ -242,7 +242,7 @@
 			<span style="flex:1;min-width:0;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 				>{o.text || '(empty)'}</span
 			>
-			<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);font-variant-numeric:tabular-nums">{clock(o.start)}</span>
+			<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);font-variant-numeric:tabular-nums">{timeDisplay.fmt(o.start)}</span>
 		</button>
 		<IconBtn
 			size={28}

@@ -40,7 +40,7 @@ import { toFixedEven } from './format-fixed';
 import { quantizeTime, snapToFrame, splitPoint } from './frames';
 import { DIFF_EPS } from './ripple';
 import { gestureReason } from './link-ui';
-import { formatTimecode } from './timecode';
+import { formatTime, type TimeMode } from './time-format';
 import type { Asset, Clip, SplitSide, StreamKind, Timeline, Track } from './types';
 import { clipDuration } from './types';
 
@@ -322,7 +322,7 @@ export interface Readout {
 }
 
 /** What the live readout beside the pointer (and the monitor's header) says. */
-export function readoutFor(p: EditPreview, fps: number): Readout {
+export function readoutFor(p: EditPreview, fps: number, mode?: TimeMode): Readout {
 	const verb = TOOL_VERB[p.edit.tool];
 	if (!p.ok) return { title: verb, detail: p.why, tone: 'refused' };
 	if (p.ghosts.length === 0) {
@@ -331,7 +331,7 @@ export function readoutFor(p: EditPreview, fps: number): Readout {
 	}
 	const detail = p.clamped ? p.why : null;
 	const tone = p.clamped ? 'limit' : 'ok';
-	const tc = (s: number) => formatTimecode(s, fps);
+	const tc = (s: number) => formatTime(s, fps, mode);
 	const g = p.ghosts;
 	// A linked edit says whose lanes come along: `· with A1`.
 	const carried = [...new Set(g.filter((x) => x.role === 'partner').map((x) => x.track))];
@@ -398,11 +398,11 @@ export interface TrimMonitor extends Readout {
  * anywhere). Frames come from the source (`get_frame`), not the composite: it is the
  * *footage* that moves.
  */
-export function monitorFor(p: EditPreview, fps: number, kind: StreamKind): TrimMonitor | null {
+export function monitorFor(p: EditPreview, fps: number, kind: StreamKind, mode?: TimeMode): TrimMonitor | null {
 	if (kind !== 'video' || p.ghosts.length === 0) return null;
 	const cell = (g: GhostClip, label: 'Out' | 'In'): MonitorCell => {
 		const time = edgeFrameTime(g.clip, label === 'Out' ? 'last' : 'first', fps);
-		return { key: `${label}:${g.id}`, label, clipId: g.id, assetId: g.clip.asset_id, time, timecode: formatTimecode(time, fps) };
+		return { key: `${label}:${g.id}`, label, clipId: g.id, assetId: g.clip.asset_id, time, timecode: formatTime(time, fps, mode) };
 	};
 	const by = (role: GhostClip['role']) => p.ghosts.find((g) => g.role === role);
 	const cells: MonitorCell[] = [];
