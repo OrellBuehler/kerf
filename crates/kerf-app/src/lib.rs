@@ -2785,6 +2785,69 @@ async fn export_cover(
     .await
 }
 
+/// The video scopes of the composited frame at `time_secs`: the export's still of the cut (from
+/// the originals) read with the delivery's matrix. The summary always; the grids in `grids`.
+#[tauri::command]
+async fn get_scopes(
+    state: State<'_, AppState>,
+    time_secs: f64,
+    grids: Option<Vec<kerf_core::scopes::ScopeKind>>,
+    matrix: Option<kerf_core::scopes::ScopeMatrix>,
+    size: Option<kerf_core::scopes::GridSize>,
+    max_width: Option<u32>,
+) -> CmdResult<kerf_core::scopes::Scopes> {
+    let shared = state.project.clone();
+    blocking(move || {
+        let (timeline, assets) = lock_user(&shared).export_still_inputs().map_err(|e| e.to_string())?;
+        let req = kerf_core::scopes::ScopeRequest {
+            time_secs,
+            max_width: max_width.map(|w| w.clamp(64, kerf_core::scopes::MAX_SCOPE_WIDTH)),
+            matrix: matrix.unwrap_or_default(),
+            options: kerf_core::scopes::ScopeOptions {
+                grids: grids.unwrap_or_default(),
+                size: size.unwrap_or_default(),
+            },
+        };
+        kerf_core::scopes::timeline_scopes(&timeline, &assets, &req).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// How the Preview will play each span of the cut (`kerf_core::render_bar`): the GPU preview's
+/// compositor where it is on and draws the frame, the FFmpeg stream where it hands over, and the
+/// spans where playback stalls. `width` is the Preview's render width.
+#[tauri::command]
+async fn get_render_bar(
+    state: State<'_, AppState>,
+    gpu: State<'_, Arc<gpu_preview::GpuPreview>>,
+    width: Option<u32>,
+) -> CmdResult<kerf_core::render_bar::RenderBar> {
+    let shared = state.project.clone();
+    let caps = gpu.is_enabled().then_some(kerf_gpu::Compositor::CAPS);
+    blocking(move || {
+        let (timeline, assets, waits) = {
+            let project = lock_user(&shared);
+            let (timeline, assets) = project.export_still_inputs().map_err(|e| e.to_string())?;
+            let waits = project.proxy_waits(0.0, None).map_err(|e| e.to_string())?;
+            (timeline, assets, waits)
+        };
+        let req = kerf_core::render_bar::BarRequest {
+            caps,
+            width: width.unwrap_or(960).clamp(64, 1920),
+            color: kerf_core::composite_color_policy(),
+            media: &kerf_core::ProxyMedia,
+            // Named, not with the build's progress: the bar is asked again on an edit, not as a
+            // proxy builds, so a percentage would go stale under the pointer.
+            waits: waits
+                .iter()
+                .map(|w| (w.asset_id, format!("{} of {}", kerf_core::proxy::PROXY_WAIT_PREFIX, w.name)))
+                .collect(),
+        };
+        Ok(kerf_core::render_bar::render_bar(&timeline, &assets, &req))
+    })
+    .await
+}
+
 /// Frame every shot for the delivery frame instead of centring it blindly —
 /// samples where each clip's content sits and writes the crop that keeps it.
 /// One clip when `clip_id` is given, otherwise every clip on an unlocked video
@@ -3693,6 +3756,8 @@ pub fn run() {
             cancel_export,
             cancel_analysis,
             export_cover,
+            get_scopes,
+            get_render_bar,
             platform_targets,
             platform_check,
             reveal_path,

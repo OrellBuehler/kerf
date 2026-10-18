@@ -101,8 +101,8 @@ editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Bt
 and `StatusBar` as fixed chrome around a **dockable workspace** (`Workspace.svelte`, composed by
 `routes/+page.svelte`). The workspace is `dockview` (the vanilla package; its
 `--dv-*` variables are mapped onto Kerf tokens in `styles/dockview-kerf.css` so
-it follows the theme) hosting seven panels — `LibraryPanel`, `Preview`, `Timeline`,
-`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer` — each a Svelte component
+it follows the theme) hosting eight panels — `LibraryPanel`, `Preview`, `Timeline`,
+`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer`, `Scopes` — each a Svelte component
 `mount`ed into a dockview content element, so every panel is resizable by its
 sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
 and closable; the **Window** menu reopens one (the library left of the
@@ -1365,3 +1365,16 @@ pointercancel / lost capture / blur abandon; `data-svg-box`, never the artwork),
 preview like a title. Delete removes it with an Undo toast. **Review**: `staged-diff.ts` marks an animated title by its
 `overlay_id` like a text title, and resolves an `overlay_removed` against `svg_overlays` too (the ghost's `svg` flag, named by
 `svgDisplayName`). Wiring is held by `svg-wiring.test.ts`, the actions by `title-actions-svg.test.ts`, the state by `state-svg.test.ts`.
+
+## Scopes panel
+
+`Scopes.svelte`, docked in the Color preset between the preview and the inspector (a layout stored before it is
+offered it like the mixer in Audio: `UNSTAMPED_OFFERED` leaves it out, `EARLIER_PRESETS.color` is the old Color). A
+selector picks waveform / RGB parade / vectorscope / histogram (remembered in `localStorage`), drawn on a canvas from
+`get_scopes`' grids by `scopes-view.ts` (pure, bun-tested: log density, row 0 at the bottom, 75 % targets and the
+skin-tone line on the vectorscope), and the readout under it is the summary (`summaryLines`: a clipped channel is
+counted in pixels and warns). The frame is the export's still from the originals at 960 wide, niced, so it is a real
+decode: one request in flight, the newest playhead and cut asked for once it lands, 150 ms after the last change while
+paused and every 2 s while playing, nothing while the panel is hidden. Colours are the `--scope-*` tokens (derived from
+the theme's bases in `kerf-tokens.css`; the parade's blue is the theme's own `blue-500`), resolved again on a theme
+change. The harness answers colour bars (`harnessScopes`).

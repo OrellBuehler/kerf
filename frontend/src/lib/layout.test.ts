@@ -82,6 +82,12 @@ describe('presets', () => {
 		for (const id of WORKSPACE_IDS.filter((w) => w !== 'audio')) expect(viewsOf(PRESET_LAYOUTS[id])).not.toContain('mixer');
 	});
 
+	test('Color docks the scopes beside the preview', () => {
+		const row = (PRESET_LAYOUTS.color.grid.root as any).data[0].data.map((n: any) => n.data.views[0]);
+		expect(row).toEqual(['library', 'preview', 'scopes', 'inspector']);
+		expect(PANELS.scopes.title).toBe('Scopes');
+	});
+
 	test('the agent is one tab away in every workspace', () => {
 		for (const id of WORKSPACE_IDS) expect(viewsOf(PRESET_LAYOUTS[id])).toContain('agent');
 	});
@@ -565,10 +571,22 @@ describe('what a preset offers', () => {
 		for (const id of WORKSPACE_IDS.filter((w) => w !== 'audio')) expect(presetPanelIds(id)).not.toContain('mixer');
 	});
 
-	test('a layout stored before the record is taken to have been offered every panel but the mixer', () => {
+	test('a layout stored before the record is taken to have been offered every panel but the mixer and the scopes', () => {
 		for (const id of WORKSPACE_IDS) {
-			expect(UNSTAMPED_OFFERED[id]).toEqual(presetPanelIds(id).filter((p) => p !== 'mixer'));
+			expect(UNSTAMPED_OFFERED[id]).toEqual(presetPanelIds(id).filter((p) => p !== 'mixer' && p !== 'scopes'));
 		}
+	});
+
+	test('the earlier Color preset has no scopes, and the scopes are Color’s alone', () => {
+		expect(openPanelIds(EARLIER_PRESETS.color!)).not.toContain('scopes');
+		expect(presetPanelIds('color')).toContain('scopes');
+		for (const id of WORKSPACE_IDS.filter((w) => w !== 'color')) expect(presetPanelIds(id)).not.toContain('scopes');
+	});
+
+	test('the scopes come back between the preview and the inspector', () => {
+		const back = insertPanel(closed(PRESET_LAYOUTS.color, 'scopes'), 'scopes', PRESET_LAYOUTS.color)!;
+		const row = (back.grid.root as any).data[0].data.map((n: any) => n.data.views[0]);
+		expect(row).toEqual(['library', 'preview', 'scopes', 'inspector']);
 	});
 
 	test('the earlier Audio preset is a layout of its own: no mixer, a tall timeline', () => {

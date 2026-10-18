@@ -109,6 +109,7 @@
 		type FollowInput
 	} from '$lib/zoom';
 	import { tip, type TipInput } from '$lib/tip';
+	import RenderBar from './RenderBar.svelte';
 
 	const pxPerSec = $derived(ui.zoom);
 	/** The lane is as long as the cut, and while a gesture is held as far as the gesture has reached,
@@ -2892,6 +2893,7 @@
 						style="position:absolute;left:{cutEndX}px;right:0;top:0;bottom:0;pointer-events:none;box-sizing:border-box;border-left:var(--line-width) solid var(--border-strong);background:color-mix(in srgb,var(--surface-void) 55%,transparent)"
 					></span>
 				{/if}
+				<RenderBar {pxPerSec} from={viewLo / pxPerSec} to={viewHi / pxPerSec} {tc} />
 				{#each minorTicks as m (m.k)}
 					<span
 						data-tick={m.mid ? 'mid' : 'minor'}

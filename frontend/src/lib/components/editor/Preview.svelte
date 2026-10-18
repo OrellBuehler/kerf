@@ -601,6 +601,9 @@
 			: previewSourceWidth(editor.timeline, editor.assets, mediaStatus.proxies, settings.previewSource, settings.proxySize, ui.time)
 	);
 	const frameWidth = $derived(boxWidth === null ? null : capToSource(boxWidth, sourceWidth));
+	$effect(() => {
+		ui.previewWidth = frameWidth;
+	});
 	/** Bumped when the backend has taken a new place for the surface: the frame is drawn again. */
 	let boundsEpoch = $state(0);
 	let wantedBounds: PreviewBoundsReport | null = null;
