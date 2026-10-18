@@ -291,6 +291,13 @@ fn apply_asset_changes(asset: &mut Asset, changes: &[StagedAssetChange]) {
     }
 }
 
+/// `meta` key holding `[id, name]` pairs of the assets taken out of the library
+/// ([`Project::remove_asset`]), newest last, so a refused undo can name the media it misses.
+const REMOVED_ASSETS: &str = "removed_assets";
+
+/// How many removed assets' names are kept.
+const REMOVED_ASSETS_KEPT: usize = 200;
+
 /// `meta` key holding the seq of the currently-applied revision.
 const HISTORY_HEAD: &str = "history_head";
 
@@ -330,6 +337,9 @@ pub struct Project {
     /// Counts the projects this one has been replaced by ([`Project::replace_with`]), so a job that
     /// resolved its inputs under one project can tell its result is for another.
     generation: u64,
+    /// What the connection's own write count is added to, so [`Project::change_count`] keeps
+    /// counting up across [`Project::replace_with`] (the new connection starts again at zero).
+    change_base: u64,
     /// Whether an agent's edits are held for review (see [`Project::set_agent_review`]).
     agent_review: Cell<bool>,
     /// The agent session the current call declared ([`Project::ensure_agent_staging`]); cleared
@@ -405,6 +415,7 @@ impl Project {
             edit_carried: RefCell::new(Vec::new()),
             edit_lanes: RefCell::new(Vec::new()),
             generation: 0,
+            change_base: 0,
             agent_review: Cell::new(true),
             agent_owner: RefCell::new(None),
         }
@@ -436,8 +447,10 @@ impl Project {
     pub fn replace_with(&mut self, other: Project) {
         let generation = self.generation.wrapping_add(1);
         let review = self.agent_review.get();
+        let change_base = self.change_count().saturating_add(1);
         *self = other;
         self.generation = generation;
+        self.change_base = change_base;
         self.agent_review.set(review);
         crate::plan_epoch::bump_plan_epoch();
     }
@@ -452,11 +465,14 @@ impl Project {
 
     /// A count of every row this project's connection has inserted, updated or deleted since it
     /// was opened — analysis merged in, the ripple flag, meta, a declined proxy, not only edits.
-    /// It never goes down, so "did anything write while the lock was released?" is a comparison of
-    /// two numbers instead of a fingerprint of the whole project. A write that rolled back still
-    /// counts: the answer errs towards "something changed".
+    /// It never goes down, **not even across [`Project::replace_with`]** (a swapped-in project's
+    /// count carries on from the one it replaced, so a number noted under the old project can
+    /// never equal one read under the new), and so "did anything write while the lock was
+    /// released?" is a comparison of two numbers instead of a fingerprint of the whole project. A
+    /// write that rolled back still counts: the answer errs towards "something changed". It is
+    /// still [`Project::generation`] that says the project itself is another one.
     pub fn change_count(&self) -> u64 {
-        self.conn.total_changes()
+        self.change_base.saturating_add(self.conn.total_changes())
     }
 
     /// Set who subsequent edits are attributed to in the history. The MCP server
@@ -497,12 +513,18 @@ impl Project {
     /// place, so a failure (a full disk, a crash, a locked file) leaves the destination as it
     /// was — a project that already lives there is never deleted first. Saving onto the file this
     /// project is open on is a no-op: every edit is already written through.
+    ///
+    /// The destination is held to the same rules as an export's output
+    /// ([`Project::check_output_path`]): a project saved over an asset's source file, a stitched
+    /// capture or a proxy would destroy media the cut still needs, so that is refused before
+    /// anything is written.
     pub fn save_as(&self, path: impl AsRef<Path>) -> Result<()> {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = path.as_ref();
         if self.path.as_deref().is_some_and(|own| crate::paths::same_file(own, path)) {
             return Ok(());
         }
+        self.check_output_path(path)?;
         let name = path
             .file_name()
             .ok_or_else(|| Error::InvalidArgument(format!("not a file path: {}", path.display())))?
@@ -733,14 +755,14 @@ impl Project {
     /// for its slot and while it encodes, and a stop is [`Error::Cancelled`] with the
     /// half-written stitch removed (an ordinary file is probe-only and never sees it).
     pub fn probe_import_with(path: &Path, progress: &mut dyn FnMut(ExportProgress), cancel: &dyn Fn() -> bool) -> Result<Asset> {
-        let asset = Self::probe_asset(path)?;
+        let asset = Self::probe_asset_with(path, cancel)?;
         let video = asset.streams.iter().find(|s| s.kind == StreamKind::Video);
         let Some((front, rear)) = video.and_then(|v| engine::insta360_pair(path, v.width, v.height)) else {
             return Ok(asset);
         };
 
         let stitched = engine::stitch_insta360_with(&front, &rear, asset.duration, progress, cancel)?;
-        let mut stitched_asset = Self::probe_asset(&stitched)?;
+        let mut stitched_asset = Self::probe_asset_with(&stitched, cancel)?;
         // The stitch is plain h264 with no spherical metadata of its own (the
         // ffmpeg CLI cannot write the `sv3d` box), so the projection we just
         // rendered it into is recorded here rather than re-detected.
@@ -765,8 +787,16 @@ impl Project {
     /// `concat:` / `pipe:` strings as protocols, and a relative path means whatever the process's
     /// working directory makes it (see [`crate::paths::validate_import_path`]).
     pub fn probe_asset(path: &Path) -> Result<Asset> {
+        Self::probe_asset_with(path, &|| false)
+    }
+
+    /// [`Project::probe_asset`] that can be stopped: `cancel` is polled while ffprobe runs, and a
+    /// stop is [`Error::Cancelled`] with the child killed. The probe is bounded to minutes, not
+    /// seconds, so a file on a slow share is read — and a job someone cancelled does not sit out
+    /// the wait.
+    pub fn probe_asset_with(path: &Path, cancel: &dyn Fn() -> bool) -> Result<Asset> {
         crate::paths::validate_import_path(path)?;
-        let probe = engine::probe(path)?;
+        let probe = engine::probe_cancellable(path, cancel)?;
         let name = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -903,8 +933,20 @@ impl Project {
     }
 
     /// The assets whose source file is no longer on disk, each with how many clips of the live
-    /// timeline use it — what a "relink media" prompt lists. It stats the files, nothing more.
+    /// timeline use it — what a "relink media" prompt lists.
+    ///
+    /// **That is a stat per asset, and a stat on a share that went away can take a long time to
+    /// fail**, so an adapter does not call this under the project lock: it takes
+    /// [`Project::missing_assets_inputs`] under it and hands the result to the static
+    /// [`Project::find_missing_assets`] with the lock released. This is the two put together, for
+    /// a caller that has no lock to worry about.
     pub fn missing_assets(&self) -> Result<Vec<MissingAsset>> {
+        Ok(Self::find_missing_assets(self.missing_assets_inputs()?))
+    }
+
+    /// The locked half of [`Project::missing_assets`]: every asset's file and the clips of the
+    /// live timeline that use it, read from the database only — no file is touched.
+    pub fn missing_assets_inputs(&self) -> Result<Vec<AssetFile>> {
         let timeline = self.timeline()?;
         let mut used: HashMap<Uuid, usize> = HashMap::new();
         for clip in timeline.tracks.iter().flat_map(|t| t.clips.iter()) {
@@ -913,8 +955,7 @@ impl Project {
         Ok(self
             .list_assets()?
             .into_iter()
-            .filter(|a| !Path::new(&a.path).exists())
-            .map(|a| MissingAsset {
+            .map(|a| AssetFile {
                 clips: used.get(&a.id).copied().unwrap_or(0),
                 asset_id: a.id,
                 name: a.name,
@@ -923,36 +964,89 @@ impl Project {
             .collect())
     }
 
+    /// The lock-free half of [`Project::missing_assets`]: the `files` whose path is no longer on
+    /// disk. Stats each one, so call it with the project lock released.
+    pub fn find_missing_assets(files: Vec<AssetFile>) -> Vec<MissingAsset> {
+        files
+            .into_iter()
+            .filter(|f| !Path::new(&f.path).exists())
+            .map(|f| MissingAsset {
+                asset_id: f.asset_id,
+                name: f.name,
+                path: f.path,
+                clips: f.clips,
+            })
+            .collect()
+    }
+
     /// Point an asset at another file — the media was moved, renamed or restored from a backup.
-    /// Probes `new_path` ([`Project::probe_asset`], so it must be an absolute path to a file),
-    /// [`Project::apply_relink`]s it and forgets what was cached for the old file
-    /// ([`Project::forget_media_caches`]). That is media work, so the adapters do the three
-    /// steps themselves — probe and clean up with the project lock released, `apply_relink`
-    /// under it.
+    ///
+    /// This is [`Project::relink_inputs`], [`Project::probe_relink`], [`Project::apply_relink_probed`]
+    /// and [`Project::forget_media_caches`] in a row, all behind `&self`. **The middle and the last
+    /// are media work** — an ffprobe, a read of both files' ends, a stat — so an adapter does the
+    /// steps itself: the first and the third under the project lock, the others with it released.
     pub fn relink_asset(&self, asset_id: Uuid, new_path: impl AsRef<Path>) -> Result<Relinked> {
-        let probed = Self::probe_asset(new_path.as_ref())?;
-        let done = self.apply_relink(asset_id, &probed)?;
+        let old = self.relink_inputs(asset_id)?;
+        let probe = Self::probe_relink(&old, new_path.as_ref(), &|| false)?;
+        let done = self.apply_relink_probed(asset_id, &probe)?;
         if done.previous_path != done.asset.path {
             Self::forget_media_caches(Path::new(&done.previous_path));
         }
         Ok(done)
     }
 
-    /// The locked half of [`Project::relink_asset`]: `probed` is what probing the new file made.
+    /// The locked first step of a relink: the asset as stored (its path, length and streams are
+    /// what the new file is compared against). Refused for an agent, as the relink itself is, so
+    /// the refusal comes before any media work. Database only.
+    pub fn relink_inputs(&self, asset_id: Uuid) -> Result<Asset> {
+        self.refuse_agent_library_edit()?;
+        self.stored_asset(asset_id)?.ok_or(Error::AssetNotFound(asset_id))
+    }
+
+    /// The lock-free middle of a relink: probe `new_path` ([`Project::probe_asset`], so it must be
+    /// an absolute path to a file), check it can stand in for `old`
+    /// ([`Project::apply_relink_probed`] holds it to the same rules) and compare it with the old
+    /// file's bytes when that is still there — its size, then a hash of its first and last
+    /// [`crate::paths::FINGERPRINT_BYTES`]. Reads both files: **call it with the lock released**.
+    /// `cancel` stops the probe.
+    pub fn probe_relink(old: &Asset, new_path: &Path, cancel: &dyn Fn() -> bool) -> Result<RelinkProbe> {
+        let probed = Self::probe_asset_with(new_path, cancel)?;
+        check_relink_compatible(old, &probed)?;
+        let same_file = crate::paths::same_content(Path::new(&old.path), Path::new(&probed.path));
+        Ok(RelinkProbe {
+            probed,
+            old_path: old.path.clone(),
+            same_file,
+        })
+    }
+
+    /// The locked last step of a relink: `probe` is what [`Project::probe_relink`] made from the
+    /// asset [`Project::relink_inputs`] returned, and nothing here touches a file.
     ///
     /// The file has to be the same kind of media: the same kinds of stream (a picture with sound
     /// stays a picture with sound) and a length within [`RELINK_DURATION_TOLERANCE`] seconds (or
     /// 1 %) of the old, since the clips cut from the old file point into it by time. The asset
     /// keeps its id, name, place in the library and every clip that uses it. **Analysis is kept
     /// only when the file is the same media moved** — same length to the millisecond, same
-    /// streams (and the same size, when the old file is still there to compare); any other
-    /// compatible file is a different recording and its transcript, silences and beats would be
-    /// wrong, so they are dropped ([`Relinked::analysis_kept`]). A proxy declined for the old
-    /// file is forgiven for the new one. Caches keyed by the old file are not touched here (that
-    /// needs the disk — [`Project::forget_media_caches`], with the lock released).
-    pub fn apply_relink(&self, asset_id: Uuid, probed: &Asset) -> Result<Relinked> {
+    /// streams, and, when the old file was still there to compare with, the same size and the same
+    /// first and last bytes; any other compatible file is a different recording and its transcript,
+    /// silences and beats would be wrong, so they are dropped ([`Relinked::analysis_kept`]). With
+    /// the old file gone there is nothing to compare, and length and streams have to do. A proxy
+    /// declined for the old file is forgiven for the new one. Caches keyed by the old file are not
+    /// touched here (that needs the disk — [`Project::forget_media_caches`], lock released).
+    ///
+    /// The library entry may have changed while the file was being read (another relink, a
+    /// removal); that is an error to retry, not a comparison against the wrong file.
+    pub fn apply_relink_probed(&self, asset_id: Uuid, probe: &RelinkProbe) -> Result<Relinked> {
         self.refuse_agent_library_edit()?;
         let old = self.stored_asset(asset_id)?.ok_or(Error::AssetNotFound(asset_id))?;
+        if old.path != probe.old_path {
+            return Err(Error::InvalidArgument(format!(
+                "\"{}\" was relinked or changed while the new file was being checked — try again",
+                old.name
+            )));
+        }
+        let probed = &probe.probed;
         if let Some(other) = self.asset_by_path(&probed.path)? {
             if other.id != old.id {
                 return Err(Error::InvalidArgument(format!(
@@ -962,11 +1056,7 @@ impl Project {
             }
         }
         check_relink_compatible(&old, probed)?;
-        let same_len = match (std::fs::metadata(&old.path), std::fs::metadata(&probed.path)) {
-            (Ok(a), Ok(b)) => a.len() == b.len(),
-            _ => true,
-        };
-        let keep = same_len && same_media(&old, probed);
+        let keep = probe.same_file != Some(false) && same_media(&old, probed);
 
         let mut asset = old.clone();
         asset.path = probed.path.clone();
@@ -994,12 +1084,36 @@ impl Project {
         })
     }
 
+    /// [`Project::apply_relink_probed`] for a caller that probed the file itself with
+    /// [`Project::probe_asset`]: kept for it, as the shape before the relink was split. It stats
+    /// the two files to compare their size — a stat each, under whatever lock the caller holds —
+    /// but reads no content, so it cannot tell the same length of a different take; prefer
+    /// `relink_inputs` → `probe_relink` → `apply_relink_probed`.
+    pub fn apply_relink(&self, asset_id: Uuid, probed: &Asset) -> Result<Relinked> {
+        self.refuse_agent_library_edit()?;
+        let old = self.stored_asset(asset_id)?.ok_or(Error::AssetNotFound(asset_id))?;
+        let same_file = crate::paths::same_size(Path::new(&old.path), Path::new(&probed.path));
+        self.apply_relink_probed(
+            asset_id,
+            &RelinkProbe {
+                probed: probed.clone(),
+                old_path: old.path,
+                same_file,
+            },
+        )
+    }
+
     /// Take an asset out of the library. Refused while a clip of the live timeline or of an open
     /// proposal uses it ([`Error::AssetInUse`]) — unless `force`, which first removes those clips
     /// as **one** `Remove media` revision (never rippling, never touching the clips' partners;
     /// a clip on a locked track refuses it, unlock the track first) and drops the asset's clips
     /// from the open proposal, its held-back changes to the asset and a kept discarded proposal
-    /// that mentions it. Its analysis goes with it. Not available to an agent while review is on.
+    /// that mentions it. Its analysis goes with it. Never available to an agent.
+    ///
+    /// **History does not bring it back**: the edit log holds snapshots of the cut, and a snapshot
+    /// that has clips of the removed asset can no longer be restored (undo, redo and revert answer
+    /// with the name of the missing media); steps from before it was used
+    /// still can.
     ///
     /// Caches keyed by the file (proxy, waveform) are left for [`Project::forget_media_caches`],
     /// which needs the disk and so the lock released.
@@ -1071,6 +1185,7 @@ impl Project {
         }
         self.conn
             .execute("DELETE FROM assets WHERE id = ?1", params![asset_id.to_string()])?;
+        self.note_removed_asset(&asset)?;
         self.set_proxy_declined(asset_id, false)?;
         tx.commit()?;
         Ok(RemovedAsset {
@@ -1097,13 +1212,21 @@ impl Project {
         }
     }
 
-    /// An agent edits the library only through a proposal; removing or relinking media has no
-    /// proposal form, so while review is on it is the user's.
+    /// Removing or relinking media is the user's, always. A proposal cannot carry it (the library
+    /// is not in the timeline), and an agent that did it directly would change what the user is
+    /// looking at: with review on that is the review it was told to wait for, and with review off
+    /// a session may still be open, whose edits would go to the proposal while the asset row went
+    /// from under the live cut. So it is refused outright, with or without review.
     fn refuse_agent_library_edit(&self) -> Result<()> {
-        if self.actor == EditSource::Agent && self.agent_review.get() {
+        if self.actor != EditSource::Agent {
+            return Ok(());
+        }
+        if self.agent_review.get() {
             return Err(Error::AgentReviewRequired);
         }
-        Ok(())
+        Err(Error::InvalidArgument(
+            "removing or relinking media is done by the user, in Kerf's library — ask them".to_string(),
+        ))
     }
 
     // ---- analysis ---------------------------------------------------------
@@ -1238,6 +1361,36 @@ impl Project {
         engine::frame_jpeg(&path, time_secs, max_width, quality, accurate)
     }
 
+    /// [`Project::decode_preview_frame`] for a caller that is a job someone can stop (an agent's
+    /// request that was cancelled): `cancel` kills the decode and the answer is
+    /// [`Error::Cancelled`]. The scrub keeps the plain one — a scrubbed frame is superseded, not
+    /// cancelled.
+    pub fn decode_preview_frame_cancellable(
+        asset: &Asset,
+        time_secs: f64,
+        max_width: u32,
+        quality: u8,
+        accurate: bool,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>> {
+        let time_secs = if asset.is_image() { 0.0 } else { time_secs };
+        let path = Self::preview_source(asset);
+        engine::frame_jpeg_cancellable(&path, time_secs, max_width, quality, accurate, cancel)
+    }
+
+    /// [`Project::decode_preview_region`] that `cancel` can stop ([`Error::Cancelled`]).
+    pub fn decode_preview_region_cancellable(
+        asset: &Asset,
+        time_secs: f64,
+        region: engine::Region,
+        max_width: u32,
+        quality: u8,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>> {
+        let time_secs = if asset.is_image() { 0.0 } else { time_secs };
+        engine::frame_jpeg_region_cancellable(Path::new(&asset.path), time_secs, region, max_width, quality, true, cancel)
+    }
+
     /// Decode a window of an asset's audio as mono s16le PCM at `sample_rate`,
     /// for the GUI's preview playback. Static like
     /// [`Project::decode_preview_frame`] so the caller can release the project
@@ -1258,6 +1411,26 @@ impl Project {
     ) -> Result<Vec<u8>> {
         let filters = engine::audio_effects_filter(effects);
         engine::audio_pcm(Path::new(&asset.path), start, duration, sample_rate, filters.as_deref())
+    }
+
+    /// [`Project::decode_audio_pcm`] that `cancel` can stop ([`Error::Cancelled`]).
+    pub fn decode_audio_pcm_cancellable(
+        asset: &Asset,
+        start: f64,
+        duration: f64,
+        sample_rate: u32,
+        effects: &[crate::model::AudioEffect],
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>> {
+        let filters = engine::audio_effects_filter(effects);
+        engine::audio_pcm_cancellable(
+            Path::new(&asset.path),
+            start,
+            duration,
+            sample_rate,
+            filters.as_deref(),
+            cancel,
+        )
     }
 
     /// The media path a preview should decode for `asset`: its generated proxy
@@ -1966,6 +2139,7 @@ impl Project {
                     return Err(Error::StagedEditOwnedByOther);
                 }
                 let tx = self.conn.unchecked_transaction()?;
+                self.adopt_staged(row.owner.as_deref())?;
                 let out = self.edit_staged(row, label, f)?;
                 tx.commit()?;
                 return Ok(out);
@@ -2165,8 +2339,8 @@ impl Project {
     /// Say which agent session the current lock belongs to, and nothing more: no proposal is
     /// opened and no ownership is checked here. What a tool that only *ends* a proposal (apply,
     /// discard, undo a step) calls, so the owner rule can tell its caller from a stranger;
-    /// [`Project::ensure_agent_staging`] does this and the rest for an edit. Forgotten at the
-    /// next [`Project::set_actor`], i.e. every lock. A no-op for the user.
+    /// [`Project::ensure_agent_staging`] does this and refuses a stranger early for an edit.
+    /// Forgotten at the next [`Project::set_actor`], i.e. every lock. A no-op for the user.
     pub fn declare_agent(&self, owner: Option<&str>) {
         if self.actor == EditSource::Agent {
             *self.agent_owner.borrow_mut() = owner.map(str::to_string);
@@ -2174,13 +2348,15 @@ impl Project {
     }
 
     /// What the adapter calls, inside the same lock as the edit it is about to make, to say which
-    /// agent session is acting and to get a proposal ready for it.
+    /// agent session is acting and to refuse it early when the proposal is another's.
     ///
-    /// With review on ([`Project::set_agent_review`]) and no proposal open, one is opened and owned
-    /// by `owner`; a proposal with no owner yet (a claimed task's) is adopted by the first named
-    /// session to edit it. A proposal **owned by a different session** is refused with
-    /// [`Error::StagedEditOwnedByOther`] — one agent must not fold its edits into, apply or discard
-    /// another's pending work. A caller that names no session counts as different from an owner.
+    /// It **declares and checks, and writes nothing**: a proposal **owned by a different session**
+    /// is refused with [`Error::StagedEditOwnedByOther`] — one agent must not fold its edits into,
+    /// apply or discard another's pending work (a caller that names no session counts as different
+    /// from an owner) — and that is all. The session itself is opened (with review on and none
+    /// open), or adopted (a claimed task's proposal has no owner yet; the first named session to
+    /// edit it takes it), *by the edit*, inside the edit's own transaction: a call that opened it
+    /// here would leave an empty proposal owned by the agent behind whenever the edit then failed.
     /// A no-op for the user's own edits.
     pub fn ensure_agent_staging(&self, owner: Option<&str>) -> Result<()> {
         if self.actor != EditSource::Agent {
@@ -2193,21 +2369,20 @@ impl Project {
             .optional()?;
         match row_owner {
             Some(Some(held)) if owner != Some(held.as_str()) => Err(Error::StagedEditOwnedByOther),
-            Some(Some(_)) => Ok(()),
-            Some(None) => {
-                if let Some(owner) = owner {
-                    self.conn
-                        .execute("UPDATE staged SET owner = ?1 WHERE id = 1 AND owner IS NULL", params![owner])?;
-                }
-                Ok(())
-            }
-            None => {
-                if self.agent_review.get() {
-                    self.open_session(None, None, owner)?;
-                }
-                Ok(())
+            _ => Ok(()),
+        }
+    }
+
+    /// Give a proposal that has no owner to the session the current call declared, if it named
+    /// one. Part of the transaction of the edit that is staging into it.
+    fn adopt_staged(&self, row_owner: Option<&str>) -> Result<()> {
+        if row_owner.is_none() {
+            if let Some(owner) = self.agent_owner.borrow().as_deref() {
+                self.conn
+                    .execute("UPDATE staged SET owner = ?1 WHERE id = 1 AND owner IS NULL", params![owner])?;
             }
         }
+        Ok(())
     }
 
     /// Refuse an agent that is not the proposal's owner.
@@ -2246,6 +2421,7 @@ impl Project {
             base_seq: row.base_seq,
             task_id: row.task_id,
             note: row.note,
+            owned_by_agent: row.owner.is_some(),
             owner: row.owner,
             edits: row.edits,
             undo_depth,
@@ -2378,7 +2554,8 @@ impl Project {
         let base: Timeline = serde_json::from_str(&row.base)?;
         let proposed: Timeline = serde_json::from_str(&row.timeline)?;
         let live: Timeline = serde_json::from_str(&live_json)?;
-        let total = base.diff(&proposed).entries.len() + row.assets.len();
+        let all_entries = base.diff(&proposed).entries;
+        let total = all_entries.len() + row.assets.len();
 
         let (asset_picks, timeline_picks): (Vec<&String>, Vec<&String>) =
             entry_ids.iter().partition(|id| row.assets.iter().any(|c| &c.id == *id));
@@ -2419,17 +2596,44 @@ impl Project {
         let remaining_assets: Vec<StagedAssetChange> =
             row.assets.iter().filter(|c| !asset_picks.contains(&&c.id)).cloned().collect();
         let merged: Timeline = serde_json::from_str(&merged_json)?;
-        let remaining = merged.diff(&proposed).entries.len() + remaining_assets.len();
+        // What is left of the proposal is the changes that were neither applied nor skipped (a skipped
+        // pick no longer fits the cut), laid on the cut *as it now is*. The proposal's own timeline is
+        // not kept as it was: after a forced accept it lacks whatever the user did since it branched,
+        // and a remainder that was "the proposal against the new cut" would read as — and apply as —
+        // undoing that work.
+        let done: HashSet<&str> = merge
+            .iter()
+            .flat_map(|m| {
+                m.applied
+                    .iter()
+                    .map(String::as_str)
+                    .chain(m.skipped.iter().map(|s| s.id.as_str()))
+            })
+            .collect();
+        let rest: Vec<String> = all_entries
+            .iter()
+            .filter(|e| !done.contains(e.id.as_str()))
+            .map(|e| e.id.clone())
+            .collect();
+        let (rest_timeline, dropped) = if rest.is_empty() {
+            (merged.clone(), 0)
+        } else {
+            let again = merged.rebase_rest(&base, &proposed, &rest)?;
+            let dropped = again.skipped.len();
+            (again.timeline, dropped)
+        };
+        let remaining = merged.diff(&rest_timeline).entries.len() + remaining_assets.len();
         let closed = remaining == 0;
         if closed {
             self.clear_staged()?;
         } else {
             // The rest of the proposal now branches from the cut as it stands.
             self.conn.execute(
-                "UPDATE staged SET base = ?1, base_seq = ?2, assets = ?3, updated_at = ?4 WHERE id = 1",
+                "UPDATE staged SET base = ?1, base_seq = ?2, timeline = ?3, assets = ?4, updated_at = ?5 WHERE id = 1",
                 params![
                     merged_json,
                     self.head()?,
+                    timeline_to_json(&rest_timeline)?,
                     serde_json::to_string(&remaining_assets)?,
                     Utc::now().to_rfc3339()
                 ],
@@ -2453,6 +2657,13 @@ impl Project {
         }
         if !skipped.is_empty() {
             message.push_str(&format!("; {} no longer apply", skipped.len()));
+        }
+        if dropped > 0 {
+            message.push_str(&format!(
+                "; {dropped} more of the proposal no longer fit{} the cut and {} dropped from it",
+                if dropped == 1 { "s" } else { "" },
+                if dropped == 1 { "was" } else { "were" }
+            ));
         }
         message.push_str(&if closed {
             ".".to_string()
@@ -2632,11 +2843,70 @@ impl Project {
             .optional()?;
         let snapshot = snapshot.ok_or(Error::RevisionNotFound(seq))?;
         let timeline: Timeline = serde_json::from_str(&snapshot)?;
+        self.refuse_removed_media(&timeline)?;
         let tx = self.conn.unchecked_transaction()?;
         self.save_timeline_str(&snapshot)?;
         self.set_head(seq)?;
         tx.commit()?;
         Ok(timeline)
+    }
+
+    /// Refuse a snapshot that has a clip of an asset that is no longer in the library. Restoring it
+    /// would put clips on the timeline that point at nothing — they could not be previewed,
+    /// exported or even removed from a library listing. The refusal names the media that was
+    /// removed (its name was kept when it went) and says what still works.
+    fn refuse_removed_media(&self, timeline: &Timeline) -> Result<()> {
+        let mut wanted: Vec<Uuid> = Vec::new();
+        for clip in timeline.tracks.iter().flat_map(|t| t.clips.iter()) {
+            if !wanted.contains(&clip.asset_id) {
+                wanted.push(clip.asset_id);
+            }
+        }
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let mut stmt = self.conn.prepare("SELECT id FROM assets")?;
+        let present: HashSet<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        let gone: Vec<Uuid> = wanted.into_iter().filter(|id| !present.contains(&id.to_string())).collect();
+        if gone.is_empty() {
+            return Ok(());
+        }
+        let removed = self.removed_asset_names()?;
+        let names: Vec<String> = gone
+            .iter()
+            .map(|id| {
+                removed
+                    .iter()
+                    .find(|(k, _)| *k == id.to_string())
+                    .map_or_else(|| id.to_string(), |(_, name)| name.clone())
+            })
+            .collect();
+        Err(Error::InvalidArgument(format!(
+            "that step uses media that was removed from the library ({}) — undo and redo cannot bring it back; import the file again to cut from it, or go back to a step from before it was used",
+            names.join(", ")
+        )))
+    }
+
+    /// Remember that `asset` was taken out of the library, by name, so a refused undo can say
+    /// which media it misses. Bounded: the oldest are forgotten first (their ids then show).
+    fn note_removed_asset(&self, asset: &Asset) -> Result<()> {
+        let mut removed = self.removed_asset_names()?;
+        let id = asset.id.to_string();
+        removed.retain(|(k, _)| *k != id);
+        removed.push((id, asset.name.clone()));
+        if removed.len() > REMOVED_ASSETS_KEPT {
+            removed.drain(..removed.len() - REMOVED_ASSETS_KEPT);
+        }
+        self.set_meta(REMOVED_ASSETS, &serde_json::to_string(&removed)?)
+    }
+
+    fn removed_asset_names(&self) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .meta(REMOVED_ASSETS)?
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default())
     }
 
     /// The full edit history, oldest first; the entry matching the head is `current`.
@@ -4589,13 +4859,24 @@ impl Project {
         })
     }
 
-    /// Refuse `output` as a place to write a render or a still: the source file of an asset (or a
-    /// capture file one was stitched from), this project's own database and its journal, and
-    /// anything inside Kerf's cache — a proxy, waveform or generated medium. Exporting onto one
-    /// would overwrite what the project still needs. Paths are canonicalised, so a symlink, a
-    /// hard link or a `..` detour to the file is the file. An adapter that exports with the lock
-    /// released calls this first, under it.
+    /// Refuse `output` as a place to write a render, a still or a saved project: the source file
+    /// of an asset (or a capture file one was stitched from), this project's own database and its
+    /// journal, and anything inside Kerf's cache — a proxy, waveform or generated medium. Writing
+    /// onto one would overwrite what the project still needs. Paths are canonicalised, so a
+    /// symlink, a hard link or a `..` detour to the file is the file.
+    ///
+    /// Canonicalising and comparing are filesystem calls, so an adapter that renders with the
+    /// lock released does not do them under it: it takes [`Project::output_path_inputs`] under the
+    /// lock and runs [`Project::check_output_path_with`] after releasing it. This is the two in a
+    /// row, for a caller with no lock to worry about (`export`, `export_with` and `save_as` are
+    /// that caller).
     pub fn check_output_path(&self, output: &Path) -> Result<()> {
+        Self::check_output_path_with(output, &self.output_path_inputs()?)
+    }
+
+    /// What an output path must not be, read from the database (and the environment, for the
+    /// cache's place) — no file is touched. The locked half of [`Project::check_output_path`].
+    pub fn output_path_inputs(&self) -> Result<crate::paths::Protected> {
         let mut protected = crate::paths::Protected::default();
         for asset in self.list_assets()? {
             protected
@@ -4622,7 +4903,14 @@ impl Project {
                 "Kerf's cache of proxies, waveforms and generated media".to_string(),
             ));
         }
-        crate::paths::check_output(output, &protected)
+        Ok(protected)
+    }
+
+    /// The lock-free half of [`Project::check_output_path`]: `output` against what
+    /// [`Project::output_path_inputs`] listed. Canonicalises and stats, so call it with the project
+    /// lock released.
+    pub fn check_output_path_with(output: &Path, protected: &crate::paths::Protected) -> Result<()> {
+        crate::paths::check_output(output, protected)
     }
 
     /// Render the timeline to `output_path`. Requires the `ffmpeg` feature.
@@ -5304,6 +5592,7 @@ impl Project {
         if declared.is_some() && owned_by_other(row.owner.as_deref(), declared.as_deref()) {
             return Err(Error::StagedEditOwnedByOther);
         }
+        self.adopt_staged(row.owner.as_deref())?;
         let id = StagedAssetChange::projection_id(asset.id);
         let mut assets = row.assets.clone();
         let had = assets.iter().any(|c| c.id == id);
@@ -6612,6 +6901,32 @@ pub struct RemovedAsset {
     pub asset: Asset,
     /// Clips of the live timeline removed with it (`force` only).
     pub clips_removed: usize,
+}
+
+/// What [`Project::probe_relink`] found out about the file an asset is to be pointed at — handed
+/// to [`Project::apply_relink_probed`] under the lock, so nothing there reads a file.
+#[derive(Debug, Clone)]
+pub struct RelinkProbe {
+    /// The new file, probed.
+    pub probed: Asset,
+    /// The path the asset pointed at when the probe was made: the apply step refuses if that is no
+    /// longer so (it was relinked or removed meanwhile).
+    pub old_path: String,
+    /// Whether the new file has the same bytes as the old, as far as could be told cheaply (size,
+    /// then a hash of both ends): `None` when the old file is gone or either cannot be read.
+    pub same_file: Option<bool>,
+}
+
+/// An asset and the file it points at: the input of [`Project::find_missing_assets`], which stats
+/// the files with the project lock released ([`Project::missing_assets_inputs`] lists them under
+/// it).
+#[derive(Debug, Clone)]
+pub struct AssetFile {
+    pub asset_id: Uuid,
+    pub name: String,
+    pub path: String,
+    /// Clips of the live timeline that use the asset.
+    pub clips: usize,
 }
 
 /// An asset whose source file is gone (see [`Project::missing_assets`]).
