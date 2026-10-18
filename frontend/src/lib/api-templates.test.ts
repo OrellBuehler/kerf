@@ -15,7 +15,7 @@ import {
 	templatePoster,
 	updateSvgOverlay
 } from './api';
-import { resetDevTemplates, SAMPLE_TEMPLATE_ID } from './template-dev';
+import { applyValues, readValues, resetDevTemplates, SAMPLE_TEMPLATE_ID } from './template-dev';
 import type { SvgOverlay, TemplateControl, Timeline } from './types';
 
 // Under bun there is no Tauri, so these drive the browser harness's template library. It has to keep the
@@ -453,5 +453,30 @@ describe('moving templates in and out of the library (browser harness)', () => {
 		await expect(importTemplate('/tmp/card.zip')).rejects.toThrow(/not a .kerftemplate file/);
 		await expect(importTemplate('/tmp/nothing.kerftemplate')).rejects.toThrow(/does not exist/);
 		await expect(importTemplate('card.kerftemplate')).rejects.toThrow(/relative path/);
+	});
+});
+
+describe('a text control sets only its own text (browser harness)', () => {
+	const text = (id: string): TemplateControl => ({ id, label: id, kind: 'text', targets: [{ element: id }] });
+	const SVG = `<svg viewBox="0 0 10 10"><text id="tag" opacity="0"><animate attributeName="opacity" from="0" to="1" dur="1s" fill="freeze"/>Hello</text><text id="styled">Hi <tspan fill="red">there</tspan>!</text><text id="cdata">A<![CDATA[ <B> ]]>C</text><text id="kids"><tspan>x</tspan></text></svg>`;
+
+	test('a child animation survives a new value', () => {
+		const out = applyValues(SVG, [text('tag')], { tag: 'Bye' });
+		expect(out).toContain('<text id="tag" opacity="0"><animate attributeName="opacity" from="0" to="1" dur="1s" fill="freeze"/>Bye</text>');
+		expect(readValues(out, [text('tag')])).toEqual({ tag: 'Bye' });
+	});
+
+	test('a styled child stays and the other runs are emptied', () => {
+		expect(readValues(SVG, [text('styled')])).toEqual({ styled: 'Hi !' });
+		expect(applyValues(SVG, [text('styled')], { styled: 'Yo' })).toContain('<text id="styled">Yo<tspan fill="red">there</tspan></text>');
+	});
+
+	test('cdata is read as text and replaced with its run', () => {
+		expect(readValues(SVG, [text('cdata')])).toEqual({ cdata: 'A <B> C' });
+		expect(applyValues(SVG, [text('cdata')], { cdata: 'x' })).toContain('<text id="cdata">x</text>');
+	});
+
+	test('an element with only children gets the value before its end tag', () => {
+		expect(applyValues(SVG, [text('kids')], { kids: 'y' })).toContain('<text id="kids"><tspan>x</tspan>y</text>');
 	});
 });

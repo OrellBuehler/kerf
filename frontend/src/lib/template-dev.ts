@@ -170,12 +170,45 @@ function closeOf(svg: string, tag: Tag): number {
 	throw invalid(`the element “${tag.attrs.find((a) => a.name === 'id')?.value}” has no end tag`);
 }
 
+/** The ranges of `tag`'s own text, as kerf-core's `text_runs` has them: the gaps between its child elements,
+ *  comments and processing instructions. A CDATA section is part of the run it sits in. */
+function textRuns(svg: string, tag: Tag): { from: number; to: number }[] {
+	const close = closeOf(svg, tag);
+	const token = /<!\[CDATA\[[\s\S]*?\]\]>|<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<(\/?)[A-Za-z_][\w:.-]*(?:\s+[^\s=>/]+\s*=\s*(?:"[^"]*"|'[^']*'))*\s*(\/?)>/g;
+	token.lastIndex = tag.end;
+	const runs: { from: number; to: number }[] = [];
+	let at = tag.end;
+	let depth = 0;
+	for (let m = token.exec(svg); m && m.index < close; m = token.exec(svg)) {
+		if (m[0].startsWith('<![CDATA[')) continue;
+		if (depth === 0 && m.index > at) runs.push({ from: at, to: m.index });
+		if (m[0].startsWith('<!--') || m[0].startsWith('<?')) {
+			if (depth === 0) at = m.index + m[0].length;
+			continue;
+		}
+		if (m[1]) depth -= 1;
+		else if (!m[2]) depth += 1;
+		if (depth === 0) at = m.index + m[0].length;
+	}
+	if (close > at) runs.push({ from: at, to: close });
+	return runs;
+}
+
+/** A run's text as the XML parser reads it: entities decoded, a CDATA section's content as it is. */
+function runText(run: string): string {
+	return run
+		.split(/(<!\[CDATA\[[\s\S]*?\]\]>)/)
+		.map((part) => (part.startsWith('<![CDATA[') ? part.slice(9, -3) : decode(part)))
+		.join('');
+}
+
 function readTarget(svg: string, element: string, attribute: string | undefined): string | null {
 	const tag = elementWith(svg, element);
 	if (attribute === undefined) {
 		if (tag.selfClosing) return '';
-		const inner = svg.slice(tag.end, closeOf(svg, tag));
-		return decode(inner.replace(/<[^>]*>/g, ''));
+		return textRuns(svg, tag)
+			.map((run) => runText(svg.slice(run.from, run.to)))
+			.join('');
 	}
 	return tag.attrs.find((a) => a.name === attribute)?.value ?? null;
 }
@@ -264,7 +297,14 @@ export function applyValues(svg: string, controls: TemplateControl[], values: Re
 				if (tag.selfClosing) {
 					edits.push({ from: tag.end - 2, to: tag.end, with: `>${escapeText(value)}</${tag.name}>` });
 				} else {
-					edits.push({ from: tag.end, to: closeOf(svg, tag), with: escapeText(value) });
+					const [first, ...rest] = textRuns(svg, tag);
+					if (!first) {
+						const close = closeOf(svg, tag);
+						edits.push({ from: close, to: close, with: escapeText(value) });
+					} else {
+						edits.push({ from: first.from, to: first.to, with: escapeText(value) });
+						for (const run of rest) edits.push({ from: run.from, to: run.to, with: '' });
+					}
 				}
 			} else {
 				const attr = tag.attrs.find((a) => a.name === target.attribute);
