@@ -115,6 +115,9 @@ class EditorUi {
 	 *  every time a sentence happened to be short. Shared by every place that
 	 *  offers the button (the Inspector and the library's Titles tab). */
 	captionStyle = $state<CaptionStyle>('lines');
+	/** The animated SVG title whose source the Inspector should open and focus: set when *Custom SVG…* makes
+	 *  one (or a lane menu asks to edit it), cleared by the Inspector once it has taken the focus. */
+	svgSourceFocus = $state<string | null>(null);
 	/** What the Titles controls' *Import captions* options say: whether a subtitle
 	 *  file's times are the finished cut's (`timeline`) or one clip's own footage
 	 *  (`source`, with the asset picked here). Held beside `captionStyle` so the two
@@ -269,6 +272,7 @@ class EditorUi {
 	 *  (the export options — a title, a codec — are not the new project's) is forgotten. */
 	projectReplaced() {
 		this.exportDraft = null;
+		this.svgSourceFocus = null;
 		this.zoomFollowsCut = true;
 	}
 

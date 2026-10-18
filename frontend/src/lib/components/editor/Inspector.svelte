@@ -17,13 +17,23 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
-	import { GENERATED_TITLE_FILL, MIN_TITLE, TITLE_SIZE_MAX, TITLE_SIZE_MIN, sampleOverlay } from '$lib/titles';
-	import type { TextOverlay } from '$lib/types';
+	import { GENERATED_TITLE_FILL, MIN_TITLE, SVG_TITLE_FILL, TITLE_SIZE_MAX, TITLE_SIZE_MIN, sampleOverlay } from '$lib/titles';
+	import type { SvgOverlay, SvgOverlayPatch, SvgPresetInfo, SvgPresetParams, TextOverlay } from '$lib/types';
 	import { clipDuration, DEFAULT_COLOR, DEFAULT_MASK, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '$lib/types';
 	import { COLOR_LOOKS, activeLook } from '$lib/style-presets';
 	import { MAX_GAIN } from '$lib/mixer';
 	import { AUDIO_FX, VIDEO_FX } from '$lib/effect-presets';
-	import { addTextHere, dropCaptions, makeCaptions } from '$lib/title-actions';
+	import {
+		addTextHere,
+		applySvgSource,
+		changePreset,
+		convertToCustom,
+		dropCaptions,
+		makeCaptions,
+		svgPresetInfos
+	} from '$lib/title-actions';
+	import { SVG_PRESETS, svgDisplayName, takesParam } from '$lib/svg-titles';
+	import { untrack } from 'svelte';
 	import { needsCrop } from '$lib/smart-crop';
 	import { EASING_CHOICES, easingId } from '$lib/easing';
 	import {
@@ -45,7 +55,14 @@
 	import { linkBadge, selectionUnits } from '$lib/link-ui';
 	import { clock, clockRange } from '$lib/clock';
 	import { parseColor, swatchHex, withPicked } from '$lib/title-color';
-	import { colorSummary, keyLabel, keyNeighbours, timingSummary } from '$lib/inspector-summary';
+	import {
+		colorSummary,
+		keyLabel,
+		keyNeighbours,
+		svgPlacementSummary,
+		svgSourceSummary,
+		timingSummary
+	} from '$lib/inspector-summary';
 	import { fitOffer, musicSummary } from '$lib/music-ui';
 	import { DEGREES, NUMBER_COL, PERCENT, SECONDS, TIMES, readout, type RowSpec } from '$lib/slider-row';
 	import { FieldEdits } from '$lib/field-edit';
@@ -59,9 +76,15 @@
 	interface Edit {
 		clipId: string | null;
 		overlayId: string | null;
+		svgId: string | null;
 		time: number;
 	}
-	const scope = $derived<Edit>({ clipId: editor.selectedClipId, overlayId: editor.selectedOverlayId, time: ui.time });
+	const scope = $derived<Edit>({
+		clipId: editor.selectedClipId,
+		overlayId: editor.selectedOverlayId,
+		svgId: editor.selectedSvgOverlayId,
+		time: ui.time
+	});
 	/** A fade of the clip the edit began on, held to that clip's length. */
 	function setFade(at: Edit, to: { fade_in?: number; fade_out?: number }) {
 		const c = clipOf(at);
@@ -97,6 +120,7 @@
 		return undefined;
 	};
 	const overlayOf = (at: Edit): TextOverlay | undefined => editor.overlays.find((o) => o.id === at.overlayId);
+	const svgOf = (at: Edit): SvgOverlay | undefined => editor.svgOverlays.find((o) => o.id === at.svgId);
 	/** Write a title field to the title it took focus on (see `fields`), with what was typed into it. */
 	function patchTitle(el: HTMLInputElement | HTMLSelectElement, patch: (typed: string) => Partial<Omit<TextOverlay, 'id' | 'keyframes'>>) {
 		const { scope: at, text } = endEdit(el);
@@ -300,6 +324,110 @@
 	const keyframes = $derived(clip?.keyframes ?? []);
 	const overlays = $derived(editor.overlays);
 	const overlay = $derived(editor.selectedOverlay);
+	const svgTitle = $derived(editor.selectedSvgOverlay);
+
+	// ---- animated SVG titles ---------------------------------------------------------------
+	// The artwork is the engine's; this edits the title around it (timing, placement, a preset's
+	// parameters) and, for custom artwork, its source. The page never draws the SVG itself.
+	let presetInfos = $state<SvgPresetInfo[]>([]);
+	$effect(() => {
+		if (!svgTitle?.preset || presetInfos.length) return;
+		svgPresetInfos().then(
+			(infos) => (presetInfos = infos),
+			() => {}
+		);
+	});
+	const presetInfo = $derived(svgTitle?.preset ? presetInfos.find((i) => i.kind === svgTitle.preset?.kind) : undefined);
+
+	/** A change to a title field written to the title it took focus on (see `fields`), with what was typed into it. A
+	 *  refusal is a toast, and the field goes back to what the title has (it would otherwise keep showing what was refused). */
+	async function patchSvg(
+		el: HTMLInputElement | HTMLSelectElement,
+		patch: (typed: string, o: SvgOverlay) => SvgOverlayPatch,
+		shown: (o: SvgOverlay) => string
+	) {
+		const { scope: at, text } = endEdit(el);
+		const o = svgOf(at);
+		if (!o) return;
+		try {
+			await editor.updateSvgOverlay(o.id, patch(text, o));
+		} catch (e) {
+			toast.error(e instanceof Error ? e.message : String(e));
+			const now = svgOf(at);
+			if (now && el.isConnected) el.value = shown(now);
+		}
+	}
+	/** Whether the playhead is inside the title, where the preview draws its placement box. */
+	const isVisibleNow = (o: SvgOverlay) => ui.time >= o.start && ui.time <= o.end;
+	/** A preset's parameters with one changed; a patch always carries all of them, since the backend fills what is left out
+	 *  with defaults. */
+	const presetPatch = (o: SvgOverlay, change: Partial<SvgPresetParams>): SvgOverlayPatch =>
+		o.preset ? { preset_params: { ...o.preset.params, ...change } } : {};
+
+	// The source box of a custom title: a draft that follows the title until it is edited, applied with Apply.
+	let draft = $state('');
+	let seeded = $state<{ id: string; text: string } | null>(null);
+	let sourceEl = $state<HTMLTextAreaElement | null>(null);
+	let sourceError = $state<string | null>(null);
+	let sourceWarnings = $state<string[]>([]);
+	let sourceRuns = $state<number | null>(null);
+	let applying = $state(false);
+	const draftDirty = $derived(svgTitle ? draft !== svgTitle.svg : false);
+
+	$effect(() => {
+		const id = svgTitle?.id ?? null;
+		const text = svgTitle?.svg ?? '';
+		untrack(() => {
+			if (!id) {
+				seeded = null;
+				return;
+			}
+			// Another title, or the same one changed underneath an untouched draft (an undo, an agent): take its source.
+			if (seeded === null || seeded.id !== id || draft === seeded.text) {
+				draft = text;
+				if (seeded?.id !== id) {
+					sourceError = null;
+					sourceWarnings = [];
+					sourceRuns = null;
+				}
+			}
+			seeded = { id, text };
+		});
+	});
+
+	// *Custom SVG…* and the lane menu's *Edit SVG source* ask for the source box: open its section and put the caret in it.
+	$effect(() => {
+		const id = ui.svgSourceFocus;
+		const el = sourceEl;
+		if (!id || !el || svgTitle?.id !== id || svgTitle.preset) return;
+		const section = el.closest('details');
+		if (section) section.open = true;
+		el.focus();
+		el.scrollIntoView({ block: 'nearest' });
+		ui.svgSourceFocus = null;
+	});
+
+	async function applySource() {
+		const o = svgTitle;
+		if (!o || applying) return;
+		applying = true;
+		sourceError = null;
+		try {
+			const check = await applySvgSource(o.id, draft);
+			sourceWarnings = check.warnings;
+			sourceRuns = check.natural_duration;
+			draft = check.svg;
+		} catch (e) {
+			sourceError = e instanceof Error ? e.message : String(e);
+			sourceWarnings = [];
+		} finally {
+			applying = false;
+		}
+	}
+	function revertSource() {
+		if (svgTitle) draft = svgTitle.svg;
+		sourceError = null;
+	}
 
 	function addVideoFx(kindKey: string) {
 		const c = clip;
@@ -776,8 +904,253 @@
 	</div>
 {/snippet}
 
+{#snippet presetColor(label: string, o: SvgOverlay, key: 'color' | 'accent')}
+	{@const value = o.preset?.params[key] ?? ''}
+	{@const parsed = parseColor(value)}
+	<div style={ROW_GRID}>
+		<span style="font-size:12px;color:var(--text-muted)">{label}</span>
+		<div style="grid-column:2 / 5;display:flex;align-items:center;gap:6px;min-width:0">
+			<input
+				type="color"
+				class="k-swatch"
+				value={swatchHex(value)}
+				data-empty={parsed ? undefined : ''}
+				disabled={editor.busy}
+				aria-label="{label}: pick a color"
+				onfocus={noteFocus}
+				onchange={(e) =>
+					patchSvg(
+						e.currentTarget,
+						(picked, t) => presetPatch(t, { [key]: withPicked(t.preset?.params[key], picked) }),
+						(t) => t.preset?.params[key] ?? ''
+					)}
+			/>
+			<input
+				type="text"
+				{value}
+				disabled={editor.busy}
+				aria-label={label}
+				onfocus={noteFocus}
+				oninput={noteTyped}
+				oncompositionend={noteTyped}
+				onchange={(e) => patchSvg(e.currentTarget, (typed, t) => presetPatch(t, { [key]: typed }), (t) => t.preset?.params[key] ?? '')}
+				style="{textCss};flex:1;min-width:0;font-family:var(--font-mono)"
+			/>
+		</div>
+	</div>
+{/snippet}
+
+{#snippet svgEditor(o: SvgOverlay)}
+	<div style="display:flex;gap:9px;align-items:center">
+		<div
+			style="width:40px;height:28px;border-radius:var(--radius-sm);flex:none;background:{SVG_TITLE_FILL};border:var(--line-width) solid var(--track-video-edge);display:grid;place-items:center;color:var(--text-on-video)"
+		>
+			<Icon n="orbit" s={14} />
+		</div>
+		<div style="flex:1;min-width:0">
+			<div
+				style="font-size:13px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+				use:tip={svgDisplayName(o)}
+			>
+				{svgDisplayName(o)}
+			</div>
+			<div style="margin-top:3px"><Badge tone="neutral">Animated title · {svgSourceSummary(o)}</Badge></div>
+		</div>
+	</div>
+	<div style="font-size:12px;color:var(--text-muted);line-height:1.4;margin-top:8px">
+		On the titles lane, drawn over the clips and under the text titles. {isVisibleNow(o)
+			? 'Drag its box in the preview to move it, or a corner to resize.'
+			: 'Move the playhead into it to place it in the preview.'}
+	</div>
+
+	<InspectorSection title="Timing" summary={timingSummary(o.start, o.end - o.start)} open>
+		<label style={ROW_GRID}>
+			<span style="font-size:12px;color:var(--text-muted)">Name</span>
+			<input
+				type="text"
+				value={o.name}
+				placeholder={svgDisplayName({ name: '', preset: o.preset })}
+				disabled={editor.busy}
+				onfocus={noteFocus}
+				oninput={noteTyped}
+				oncompositionend={noteTyped}
+				onchange={(e) => patchSvg(e.currentTarget, (typed) => ({ name: typed }), (t) => t.name)}
+				style="{textCss};grid-column:2 / 5;min-width:0"
+			/>
+		</label>
+		{@render numRow('Start', o.start, 0.1, (v, at) => {
+			const t = svgOf(at);
+			if (t) void run(() => editor.updateSvgOverlay(t.id, { start: Math.min(v, Math.max(0, t.end - MIN_TITLE)) }));
+		})}
+		{@render numRow('End', o.end, 0.1, (v, at) => {
+			const t = svgOf(at);
+			if (t) void run(() => editor.updateSvgOverlay(t.id, { end: Math.max(v, t.start + MIN_TITLE) }));
+		})}
+	</InspectorSection>
+
+	<InspectorSection title="Placement" summary={svgPlacementSummary(o)} open>
+		{@render rangeRow('X', o.x, { min: 0, max: 1, step: 0.01, neutral: 0, ...PERCENT, limit: { min: -5, max: 5 } }, (v, at) => {
+			const t = svgOf(at);
+			if (t) return run(() => editor.updateSvgOverlay(t.id, { x: v }));
+		})}
+		{@render rangeRow('Y', o.y, { min: 0, max: 1, step: 0.01, neutral: 0, ...PERCENT, limit: { min: -5, max: 5 } }, (v, at) => {
+			const t = svgOf(at);
+			if (t) return run(() => editor.updateSvgOverlay(t.id, { y: v }));
+		})}
+		{@render rangeRow('Width', o.width, { min: 0.02, max: 1, step: 0.01, neutral: 1, ...PERCENT, limit: { min: 0.01, max: 10 } }, (v, at) => {
+			const t = svgOf(at);
+			if (t) return run(() => editor.updateSvgOverlay(t.id, { width: v }));
+		})}
+		{@render rangeRow('Height', o.height, { min: 0.02, max: 1, step: 0.01, neutral: 1, ...PERCENT, limit: { min: 0.01, max: 10 } }, (v, at) => {
+			const t = svgOf(at);
+			if (t) return run(() => editor.updateSvgOverlay(t.id, { height: v }));
+		})}
+		{@render rangeRow('Opacity', o.opacity, { min: 0, max: 1, step: 0.01, neutral: 1, ...PERCENT }, (v, at) => {
+			const t = svgOf(at);
+			if (t) return run(() => editor.updateSvgOverlay(t.id, { opacity: v }));
+		})}
+		<div style="font-size:12px;color:var(--text-muted);margin-top:4px;line-height:1.4">
+			The artwork is fitted inside this rectangle, centred, keeping its shape.
+		</div>
+	</InspectorSection>
+
+	{#if o.preset}
+		{@const preset = o.preset}
+		<InspectorSection title="Preset" summary={svgSourceSummary(o)} open>
+			<div role="group" aria-label="Preset" style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:6px">
+				{#each SVG_PRESETS as p (p.kind)}
+					<Chip
+						pressed={preset.kind === p.kind}
+						title={p.hint}
+						disabled={editor.busy}
+						onclick={() => void changePreset(o, p.kind)}>{p.label}</Chip
+					>
+				{/each}
+			</div>
+			<label style={ROW_GRID}>
+				<span style="font-size:12px;color:var(--text-muted)">Text</span>
+				<input
+					type="text"
+					value={preset.params.text}
+					disabled={editor.busy}
+					onfocus={noteFocus}
+					oninput={noteTyped}
+					oncompositionend={noteTyped}
+					onchange={(e) => patchSvg(e.currentTarget, (typed, t) => presetPatch(t, { text: typed }), (t) => t.preset?.params.text ?? '')}
+					style="{textCss};grid-column:2 / 5;min-width:0"
+				/>
+			</label>
+			{#if takesParam(presetInfo, 'subtitle')}
+				<label style={ROW_GRID}>
+					<span style="font-size:12px;color:var(--text-muted)">Subtitle</span>
+					<input
+						type="text"
+						value={preset.params.subtitle ?? ''}
+						placeholder="none"
+						disabled={editor.busy}
+						onfocus={noteFocus}
+						oninput={noteTyped}
+						oncompositionend={noteTyped}
+						onchange={(e) =>
+							patchSvg(
+								e.currentTarget,
+								(typed, t) => presetPatch(t, { subtitle: typed.trim() === '' ? null : typed }),
+								(t) => t.preset?.params.subtitle ?? ''
+							)}
+						style="{textCss};grid-column:2 / 5;min-width:0"
+					/>
+				</label>
+			{/if}
+			{#if takesParam(presetInfo, 'color')}{@render presetColor('Color', o, 'color')}{/if}
+			{#if takesParam(presetInfo, 'accent')}{@render presetColor('Accent', o, 'accent')}{/if}
+			{#if takesParam(presetInfo, 'font')}
+				<label style={ROW_GRID}>
+					<span style="font-size:12px;color:var(--text-muted)">Font</span>
+					<select
+						class="k-select"
+						value={preset.params.font ?? ''}
+						disabled={editor.busy}
+						onfocus={noteFocus}
+						onchange={(e) =>
+							patchSvg(e.currentTarget, (typed, t) => presetPatch(t, { font: typed === '' ? null : typed }), (t) => t.preset?.params.font ?? '')}
+						style="grid-column:2 / 5"
+					>
+						<option value="">Default</option>
+						{#each ui.availableFonts as f (f)}
+							<option value={f}>{f}</option>
+						{/each}
+						{#if preset.params.font && !ui.availableFonts.includes(preset.params.font)}
+							<option value={preset.params.font}>{preset.params.font}</option>
+						{/if}
+					</select>
+				</label>
+			{/if}
+			<div style="font-size:12px;color:var(--text-muted);margin:6px 0;line-height:1.4">
+				Changing the preset makes a new title with the same text, timing and placement. Convert to custom to write the SVG yourself.
+			</div>
+			<Btn size="sm" icon="code-xml" disabled={editor.busy} onclick={() => void convertToCustom(o)}>Convert to custom</Btn>
+		</InspectorSection>
+	{:else}
+		<InspectorSection title="SVG source" summary={draftDirty ? 'Edited' : 'Custom'} open>
+			<textarea
+				bind:this={sourceEl}
+				bind:value={draft}
+				spellcheck="false"
+				autocomplete="off"
+				aria-label="SVG source"
+				rows="12"
+				style="{FIELD};display:block;width:100%;height:auto;min-height:160px;resize:vertical;padding:8px 10px;font-family:var(--font-mono);font-size:11px;line-height:1.5;white-space:pre;overflow:auto"
+			></textarea>
+			<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-top:6px">
+				<Btn size="sm" variant="primary" disabled={!draftDirty || applying || editor.busy} onclick={() => void applySource()}>Apply</Btn>
+				<Btn size="sm" variant="ghost" disabled={!draftDirty || applying} onclick={revertSource}>Revert</Btn>
+				{#if draftDirty}<span style="font-size:12px;color:var(--text-muted)">Not applied yet</span>{/if}
+			</div>
+			{#if sourceError}
+				<div
+					role="alert"
+					data-svg-error
+					style="margin-top:6px;font-size:12px;line-height:1.4;color:var(--red-400);background:color-mix(in srgb,var(--red-600) 14%,transparent);border-radius:var(--radius-sm);padding:6px 8px"
+				>
+					{sourceError}
+				</div>
+			{/if}
+			{#if sourceWarnings.length}
+				<ul
+					data-svg-warnings
+					style="margin:6px 0 0;padding:6px 8px 6px 22px;font-size:12px;line-height:1.4;color:var(--orange-400);background:var(--warning-surface);border-radius:var(--radius-sm)"
+				>
+					{#each sourceWarnings as w, i (i)}<li>{w}</li>{/each}
+				</ul>
+			{/if}
+			{#if sourceRuns !== null}
+				<div style="font-size:12px;color:var(--text-muted);margin-top:6px;line-height:1.4">
+					The animation runs {sourceRuns.toFixed(1)} s; this title lasts {(o.end - o.start).toFixed(1)} s.
+				</div>
+			{/if}
+			<div style="font-size:12px;color:var(--text-muted);margin-top:6px;line-height:1.4">
+				SMIL animation (animate, set, animateTransform) is drawn; scripts, external images and CSS animations are not. Make the
+				viewBox the frame. Times count from the start of the title.
+			</div>
+		</InspectorSection>
+	{/if}
+
+	<div style="margin-top:18px">
+		<Btn
+			variant="destructive"
+			data-quiet
+			size="sm"
+			icon="trash"
+			iconSize={13}
+			style="width:100%"
+			disabled={editor.busy}
+			onclick={() => run(() => editor.removeSvgOverlay(o.id))}>Remove animated title</Btn
+		>
+	</div>
+{/snippet}
+
 {#snippet overlaysSection()}
-	<InspectorSection title="Titles lane" summary={count((editor.timeline.overlays ?? []).length, 'item')} open>
+	<InspectorSection title="Titles lane" summary={count((editor.timeline.overlays ?? []).length + editor.svgOverlays.length, 'item')} open>
 		<TitlesControls />
 	</InspectorSection>
 {/snippet}
@@ -791,6 +1164,8 @@
 	<div style="flex:1;overflow-y:auto;padding:12px">
 		{#if overlay}
 			{@render overlayEditor(overlay)}
+		{:else if svgTitle}
+			{@render svgEditor(svgTitle)}
 		{:else if clip}
 			{#if selectionUnits(editor.timeline, editor.selectedClipIds) > 1}
 				<!-- Several clips are selected but an edit here acts on one. Say which,

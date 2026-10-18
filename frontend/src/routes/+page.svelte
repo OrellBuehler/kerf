@@ -427,7 +427,7 @@
 
 	const clipErr = (err: unknown) => toast.error(err instanceof Error ? err.message : String(err));
 
-	/** Delete / Shift+Delete: a selected title goes first (whichever of the two it
+	/** Delete / Shift+Delete: a selected title or animated title goes first (whichever of the two it
 	 *  was — a title has no gap to close); else the selected clips as one edit,
 	 *  with `ripple` closing the gaps behind them (plain Delete leaves them,
 	 *  unless ripple mode is on). Nothing selected: not ours, so the key is left alone. */
@@ -436,6 +436,11 @@
 			void editor
 				.removeOverlay(editor.selectedOverlayId)
 				.then(() => toast('Title removed', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
+				.catch(clipErr);
+		} else if (editor.selectedSvgOverlayId) {
+			void editor
+				.removeSvgOverlay(editor.selectedSvgOverlayId)
+				.then(() => toast('Animated title removed', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
 				.catch(clipErr);
 		} else if (editor.selectedClipIds.length > 0) {
 			void deleteSelection(ripple);

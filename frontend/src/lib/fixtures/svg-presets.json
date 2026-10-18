@@ -1,0 +1,146 @@
+{
+  "about": "Written by kerf-core (svg/presets.rs); served by the browser harness. Regenerate: KERF_BLESS_SVG_PRESETS=1 cargo test -p kerf-core --no-default-features -- svg_preset_fixture",
+  "defaults": {
+    "accent": "#ffb000",
+    "color": "#ffffff",
+    "font": "Geist"
+  },
+  "duration": 4.0,
+  "frame": [
+    1920,
+    1080
+  ],
+  "infos": [
+    {
+      "kind": "fade_up",
+      "label": "Fade up",
+      "params": [
+        {
+          "name": "text",
+          "required": true
+        },
+        {
+          "name": "subtitle",
+          "required": false
+        },
+        {
+          "default": "#ffffff",
+          "name": "color",
+          "required": false
+        },
+        {
+          "default": "#ffb000",
+          "name": "accent",
+          "required": false
+        },
+        {
+          "default": "Geist",
+          "name": "font",
+          "required": false
+        }
+      ]
+    },
+    {
+      "kind": "typewriter",
+      "label": "Typewriter",
+      "params": [
+        {
+          "name": "text",
+          "required": true
+        },
+        {
+          "name": "subtitle",
+          "required": false
+        },
+        {
+          "default": "#ffffff",
+          "name": "color",
+          "required": false
+        },
+        {
+          "default": "#ffb000",
+          "name": "accent",
+          "required": false
+        },
+        {
+          "default": "Geist",
+          "name": "font",
+          "required": false
+        }
+      ]
+    },
+    {
+      "kind": "lower_third",
+      "label": "Lower third",
+      "params": [
+        {
+          "name": "text",
+          "required": true
+        },
+        {
+          "name": "subtitle",
+          "required": false
+        },
+        {
+          "default": "#ffffff",
+          "name": "color",
+          "required": false
+        },
+        {
+          "default": "#ffb000",
+          "name": "accent",
+          "required": false
+        },
+        {
+          "default": "Geist",
+          "name": "font",
+          "required": false
+        }
+      ]
+    },
+    {
+      "kind": "word_pop",
+      "label": "Word pop",
+      "params": [
+        {
+          "name": "text",
+          "required": true
+        },
+        {
+          "default": "#ffffff",
+          "name": "color",
+          "required": false
+        },
+        {
+          "default": "#ffb000",
+          "name": "accent",
+          "required": false
+        },
+        {
+          "default": "Geist",
+          "name": "font",
+          "required": false
+        }
+      ]
+    }
+  ],
+  "presets": {
+    "fade_up": {
+      "plain": "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1920\" height=\"1080\" viewBox=\"0 0 1920 1080\"><g opacity=\"0\"><animate attributeName=\"opacity\" from=\"0\" to=\"1\" begin=\"0s\" dur=\"0.6s\" fill=\"freeze\" calcMode=\"spline\" keyTimes=\"0;1\" keySplines=\"0.16 1 0.3 1\"/><animate attributeName=\"opacity\" from=\"1\" to=\"0\" begin=\"3.6s\" dur=\"0.4s\" fill=\"freeze\"/><animateTransform attributeName=\"transform\" type=\"translate\" from=\"0 43.2\" to=\"0 0\" begin=\"0s\" dur=\"0.6s\" fill=\"freeze\" calcMode=\"spline\" keyTimes=\"0;1\" keySplines=\"0.16 1 0.3 1\"/><text x=\"960\" y=\"568.35\" text-anchor=\"middle\" font-family=\"Geist\" font-size=\"81\" font-weight=\"700\" fill=\"#ffffff\">Your title</text></g></svg>",
+      "subtitled": "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1920\" height=\"1080\" viewBox=\"0 0 1920 1080\"><g opacity=\"0\"><animate attributeName=\"opacity\" from=\"0\" to=\"1\" begin=\"0s\" dur=\"0.6s\" fill=\"freeze\" calcMode=\"spline\" keyTimes=\"0;1\" keySplines=\"0.16 1 0.3 1\"/><animate attributeName=\"opacity\" from=\"1\" to=\"0\" begin=\"3.6s\" dur=\"0.4s\" fill=\"freeze\"/><animateTransform attributeName=\"transform\" type=\"translate\" from=\"0 43.2\" to=\"0 0\" begin=\"0s\" dur=\"0.6s\" fill=\"freeze\" calcMode=\"spline\" keyTimes=\"0;1\" keySplines=\"0.16 1 0.3 1\"/><text x=\"960\" y=\"535.95\" text-anchor=\"middle\" font-family=\"Geist\" font-size=\"81\" font-weight=\"700\" fill=\"#ffffff\">Your title</text><text x=\"960\" y=\"591.03\" text-anchor=\"middle\" font-family=\"Geist\" font-size=\"32.4\" font-weight=\"400\" fill=\"#ffb000\">Your subtitle</text></g></svg>"
+    },
+    "lower_third": {
+      "plain": "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1920\" height=\"1080\" viewBox=\"0 0 1920 1080\"><defs><clipPath id=\"kerf-wipe\"><rect x=\"96\" y=\"813.888\" width=\"0\" height=\"89.856\"><animate attributeName=\"width\" from=\"0\" to=\"1843.2\" begin=\"0.2s\" dur=\"0.6s\" fill=\"freeze\" calcMode=\"spline\" keyTimes=\"0;1\" keySplines=\"0.16 1 0.3 1\"/><animate attributeName=\"width\" from=\"1843.2\" to=\"0\" begin=\"3.25s\" dur=\"0.5s\" fill=\"freeze\"/></rect></clipPath></defs><rect x=\"115.2\" y=\"799.2\" width=\"0\" height=\"6.48\" fill=\"#ffb000\"><animate attributeName=\"width\" from=\"0\" to=\"576\" begin=\"0s\" dur=\"0.45s\" fill=\"freeze\" calcMode=\"spline\" keyTimes=\"0;1\" keySplines=\"0.16 1 0.3 1\"/><animate attributeName=\"width\" from=\"576\" to=\"0\" begin=\"3.55s\" dur=\"0.45s\" fill=\"freeze\"/></rect><text x=\"115.2\" y=\"870.048\" text-anchor=\"start\" font-family=\"Geist\" font-size=\"56.16\" font-weight=\"700\" fill=\"#ffffff\" clip-path=\"url(#kerf-wipe)\">Your title</text></svg>",
+      "subtitled": "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1920\" height=\"1080\" viewBox=\"0 0 1920 1080\"><defs><clipPath id=\"kerf-wipe\"><rect x=\"96\" y=\"813.888\" width=\"0\" height=\"89.856\"><animate attributeName=\"width\" from=\"0\" to=\"1843.2\" begin=\"0.2s\" dur=\"0.6s\" fill=\"freeze\" calcMode=\"spline\" keyTimes=\"0;1\" keySplines=\"0.16 1 0.3 1\"/><animate attributeName=\"width\" from=\"1843.2\" to=\"0\" begin=\"3.25s\" dur=\"0.5s\" fill=\"freeze\"/></rect></clipPath></defs><rect x=\"115.2\" y=\"799.2\" width=\"0\" height=\"6.48\" fill=\"#ffb000\"><animate attributeName=\"width\" from=\"0\" to=\"576\" begin=\"0s\" dur=\"0.45s\" fill=\"freeze\" calcMode=\"spline\" keyTimes=\"0;1\" keySplines=\"0.16 1 0.3 1\"/><animate attributeName=\"width\" from=\"576\" to=\"0\" begin=\"3.55s\" dur=\"0.45s\" fill=\"freeze\"/></rect><text x=\"115.2\" y=\"870.048\" text-anchor=\"start\" font-family=\"Geist\" font-size=\"56.16\" font-weight=\"700\" fill=\"#ffffff\" clip-path=\"url(#kerf-wipe)\">Your title</text><text x=\"115.2\" y=\"921.024\" text-anchor=\"start\" font-family=\"Geist\" font-size=\"34.56\" font-weight=\"400\" fill=\"#ffffff\" opacity=\"0\">Your subtitle<animate attributeName=\"opacity\" from=\"0\" to=\"1\" begin=\"0.6s\" dur=\"0.4s\" fill=\"freeze\"/><animate attributeName=\"opacity\" from=\"1\" to=\"0\" begin=\"3.1s\" dur=\"0.3s\" fill=\"freeze\"/></text></svg>"
+    },
+    "typewriter": {
+      "plain": "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1920\" height=\"1080\" viewBox=\"0 0 1920 1080\"><g opacity=\"1\"><animate attributeName=\"opacity\" from=\"1\" to=\"0\" begin=\"3.6s\" dur=\"0.4s\" fill=\"freeze\"/><text x=\"960\" y=\"566.46\" text-anchor=\"middle\" font-family=\"Geist\" font-size=\"75.6\" font-weight=\"400\" fill=\"#ffffff\"><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.25s\"/>Y</tspan><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.31s\"/>o</tspan><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.37s\"/>u</tspan><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.43s\"/>r</tspan><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.49s\"/> </tspan><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.55s\"/>t</tspan><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.61s\"/>i</tspan><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.67s\"/>t</tspan><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.73s\"/>l</tspan><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.79s\"/>e</tspan></text></g></svg>",
+      "subtitled": "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1920\" height=\"1080\" viewBox=\"0 0 1920 1080\"><g opacity=\"1\"><animate attributeName=\"opacity\" from=\"1\" to=\"0\" begin=\"3.6s\" dur=\"0.4s\" fill=\"freeze\"/><text x=\"960\" y=\"534.06\" text-anchor=\"middle\" font-family=\"Geist\" font-size=\"75.6\" font-weight=\"400\" fill=\"#ffffff\"><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.25s\"/>Y</tspan><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.31s\"/>o</tspan><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.37s\"/>u</tspan><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.43s\"/>r</tspan><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.49s\"/> </tspan><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.55s\"/>t</tspan><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.61s\"/>i</tspan><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.67s\"/>t</tspan><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.73s\"/>l</tspan><tspan visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.79s\"/>e</tspan></text><text x=\"960\" y=\"591.894\" text-anchor=\"middle\" font-family=\"Geist\" font-size=\"34.02\" font-weight=\"400\" fill=\"#ffb000\" opacity=\"0\">Your subtitle<animate attributeName=\"opacity\" from=\"0\" to=\"1\" begin=\"0.85s\" dur=\"0.4s\" fill=\"freeze\"/></text></g></svg>"
+    },
+    "word_pop": {
+      "plain": "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1920\" height=\"1080\" viewBox=\"0 0 1920 1080\"><g transform=\"translate(960 540)\" visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.1s\" dur=\"0.7s\"/><animateTransform attributeName=\"transform\" type=\"scale\" values=\"0.6;1.12;1\" keyTimes=\"0;0.6;1\" begin=\"0.1s\" dur=\"0.22s\" additive=\"sum\"/><text x=\"0\" y=\"52.92\" text-anchor=\"middle\" font-family=\"Geist\" font-size=\"151.2\" font-weight=\"700\" fill=\"#ffffff\" stroke=\"#000000\" stroke-opacity=\"0.35\" stroke-width=\"9.072\" paint-order=\"stroke\">Your</text></g><g transform=\"translate(960 540)\" visibility=\"hidden\"><set attributeName=\"visibility\" to=\"visible\" begin=\"0.8s\" dur=\"3.2s\"/><animateTransform attributeName=\"transform\" type=\"scale\" values=\"0.6;1.12;1\" keyTimes=\"0;0.6;1\" begin=\"0.8s\" dur=\"0.22s\" additive=\"sum\"/><animate attributeName=\"opacity\" from=\"1\" to=\"0\" begin=\"3.7s\" dur=\"0.3s\" fill=\"freeze\"/><text x=\"0\" y=\"52.92\" text-anchor=\"middle\" font-family=\"Geist\" font-size=\"151.2\" font-weight=\"700\" fill=\"#ffb000\" stroke=\"#000000\" stroke-opacity=\"0.35\" stroke-width=\"9.072\" paint-order=\"stroke\">title</text></g></svg>"
+    }
+  },
+  "subtitle": "Your subtitle",
+  "text": "Your title"
+}

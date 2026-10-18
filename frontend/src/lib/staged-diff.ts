@@ -8,6 +8,7 @@
  * change. */
 
 import { seekTime, stepPoint } from './frames';
+import { svgDisplayName } from './svg-titles';
 import type { DiffEntry, Timeline } from './types';
 import { clipDuration } from './types';
 
@@ -27,12 +28,14 @@ export interface RemovedTitle {
 	start: number;
 	end: number;
 	text: string;
+	/** An animated SVG title rather than text: its `text` is its display name. */
+	svg?: boolean;
 }
 
 export interface DiffView {
 	/** By clip id on the proposed cut. */
 	clips: Map<string, ChangeMark>;
-	/** By title id on the proposed cut. */
+	/** By title id on the proposed cut — text overlays and animated SVG titles alike (their ids never collide). */
 	titles: Map<string, ChangeMark>;
 	/** Tracks the proposal adds or alters, by id. */
 	tracks: Map<string, ChangeMark>;
@@ -74,8 +77,11 @@ export function diffView(entries: readonly DiffEntry[], proposed: Timeline, live
 				if (e.overlay_id) mark(view.titles, e.overlay_id, 'shifted');
 				break;
 			case 'overlay_removed': {
+				// `overlay_*` entries name a text overlay or an animated SVG title by the same field.
 				const o = (live.overlays ?? []).find((x) => x.id === e.overlay_id);
+				const s = o ? undefined : (live.svg_overlays ?? []).find((x) => x.id === e.overlay_id);
 				if (o) view.removedTitles.push({ id: o.id, start: o.start, end: o.end, text: o.text });
+				else if (s) view.removedTitles.push({ id: s.id, start: s.start, end: s.end, text: svgDisplayName(s), svg: true });
 				break;
 			}
 			case 'track_added':

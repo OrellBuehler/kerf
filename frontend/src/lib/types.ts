@@ -416,6 +416,105 @@ export interface TextOverlay {
 	generated?: boolean;
 }
 
+/** The ready-made animated titles (`kerf_core::SvgPresetKind`). */
+export type SvgPresetKind = 'fade_up' | 'typewriter' | 'lower_third' | 'word_pop';
+
+/** What a preset is filled with. */
+export interface SvgPresetParams {
+	text: string;
+	subtitle?: string | null;
+	/** Any SVG colour. */
+	color: string;
+	/** The second colour a preset draws in (bar, last word, subtitle). */
+	accent: string;
+	/** A font family; unset / `null` is the font Kerf ships. */
+	font?: string | null;
+}
+
+/** Params as a caller may write them: the backend fills what is left out. */
+export type SvgPresetParamsInput = Pick<SvgPresetParams, 'text'> & Partial<Omit<SvgPresetParams, 'text'>>;
+
+/** How an animated title was made when it came from a preset. */
+export interface SvgPreset {
+	kind: SvgPresetKind;
+	params: SvgPresetParams;
+}
+
+/** An animated SVG title: SMIL-animated artwork drawn over the cut, above the clips and below the
+ *  text overlays. `svg` is the **sanitised** source (stored = rendered); the page never inlines it,
+ *  only shows a placement box and `<img>` data-URL thumbnails. The artwork is fit "contain",
+ *  centred, into the rectangle `x, y, width, height` (fractions of the frame, top-left origin). */
+export interface SvgOverlay {
+	id: string;
+	name: string;
+	svg: string;
+	start: number;
+	end: number;
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+	opacity: number;
+	/** Seconds of the document's own clock already elapsed at `start` (a slice cut into it).
+	 *  The backend omits it at 0. */
+	offset?: number;
+	/** Absent on custom artwork. */
+	preset?: SvgPreset;
+}
+
+/** Where an animated title's artwork comes from; externally tagged, as the backend reads it. */
+export type SvgSource = { custom: string } | { preset: { kind: SvgPresetKind; params: SvgPresetParamsInput } };
+
+/** Name and placement of a new animated title; a field left out takes the default (full frame, opaque). */
+export interface SvgLayout {
+	name?: string;
+	x?: number;
+	y?: number;
+	width?: number;
+	height?: number;
+	opacity?: number;
+}
+
+/** Fields of an animated title to change; one left out stays. `svg` replaces the artwork with
+ *  custom source (and so drops the preset); `preset_params` re-fills a preset title and `preset_kind`
+ *  switches it to another kind, keeping its id and place in the draw order (a custom title refuses
+ *  both); `svg` is exclusive with either. */
+export interface SvgOverlayPatch {
+	name?: string;
+	svg?: string;
+	preset_params?: SvgPresetParamsInput;
+	preset_kind?: SvgPresetKind;
+	start?: number;
+	end?: number;
+	x?: number;
+	y?: number;
+	width?: number;
+	height?: number;
+	opacity?: number;
+}
+
+/** One parameter a preset takes. */
+export interface SvgPresetParamInfo {
+	name: string;
+	required: boolean;
+	default?: string;
+}
+
+/** A preset and what it takes (`list_svg_presets`). */
+export interface SvgPresetInfo {
+	kind: SvgPresetKind;
+	label: string;
+	params: SvgPresetParamInfo[];
+}
+
+/** What `validate_svg` made of a source: the sanitised document, what could not be honoured, and how
+ *  long its animations run (`null` when they never end or there are none). */
+export interface SvgCheck {
+	svg: string;
+	warnings: string[];
+	natural_duration: number | null;
+}
+
 /** The look a generated caption set takes: a held subtitle line, or one large
  *  word at a time — the style social captions have converged on. */
 export type CaptionStyle = 'lines' | 'word_punch';
@@ -652,6 +751,8 @@ export interface MasterBus {
 export interface Timeline {
 	tracks: Track[];
 	overlays?: TextOverlay[];
+	/** Animated SVG titles, in draw order. The backend omits the list when empty. */
+	svg_overlays?: SvgOverlay[];
 	markers?: Marker[];
 	/** Unset = the shape follows the footage (the historical behaviour). */
 	format?: Delivery | null;

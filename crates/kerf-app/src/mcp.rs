@@ -18,7 +18,8 @@ use base64::Engine as _;
 use kerf_core::{
     AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipMove, Delivery,
     EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property, PropertyKey, ReframeKeyframe,
-    Region, SplitSide, StreamKind, TextKeyframe, TimeRange, Transition, TransitionKind, VideoEffect,
+    Region, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout, SvgOverlay, SvgOverlayPatch, SvgOverlayResult, SvgPreset,
+    SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange, Timeline, Transition, TransitionKind, VideoEffect,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities, ServerConfig};
@@ -49,6 +50,10 @@ const MAX_PREVIEW_WIDTH: u32 = 1920;
 /// anyway, so the bytes hardly move.
 const ZOOM_QUALITY: u8 = 2;
 const MAX_WAVEFORM_BUCKETS: usize = 4096;
+/// The widest cell of an SVG contact sheet (a sheet holds up to 36 of them).
+const MAX_SVG_CELL_WIDTH: u32 = 960;
+/// An SVG source longer than this is left out of `get_timeline_state` unless asked for.
+const SVG_INLINE_LIMIT: usize = 4 * 1024;
 
 #[derive(Clone)]
 pub struct KerfMcp {
@@ -1068,6 +1073,108 @@ struct UpdateOverlayParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AddSvgOverlayParams {
+    #[schemars(
+        description = "Your own SVG document: the text of an <svg ...>...</svg> file, animated with SMIL (see the tool description). Give this OR `preset`, not both"
+    )]
+    svg: Option<String>,
+    #[schemars(description = "A ready-made animated title instead of `svg` (see list_svg_presets). Needs `params`")]
+    preset: Option<SvgPresetKind>,
+    #[schemars(
+        description = "What fills the preset: `text` (required), and optionally `subtitle`, `color`, `accent` (any SVG colour like \"#ffffff\") and `font` (a system family from list_fonts). Only with `preset`"
+    )]
+    params: Option<SvgPresetParams>,
+    #[schemars(description = "When the title appears, in timeline seconds")]
+    start: f64,
+    #[schemars(
+        description = "When it disappears, in timeline seconds. Omit it to run for the SVG's own length when its animations end (clamped to 2–30 s), else 4 s"
+    )]
+    end: Option<f64>,
+    #[schemars(description = "Left edge of the placement rectangle as a fraction of the frame width; default 0")]
+    x: Option<f64>,
+    #[schemars(description = "Top edge of the placement rectangle as a fraction of the frame height; default 0")]
+    y: Option<f64>,
+    #[schemars(description = "Width of the placement rectangle as a fraction of the frame width; default 1 (the whole frame)")]
+    width: Option<f64>,
+    #[schemars(description = "Height of the placement rectangle as a fraction of the frame height; default 1 (the whole frame)")]
+    height: Option<f64>,
+    #[schemars(description = "Opacity of the whole title, 0–1; default 1")]
+    opacity: Option<f64>,
+    #[schemars(description = "A label for the title (shown in the timeline); default is the preset's text")]
+    name: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct UpdateSvgOverlayParams {
+    #[schemars(description = "UUID of the SVG overlay (see timeline_summary)")]
+    overlay_id: String,
+    #[schemars(description = "New label; omit to leave unchanged")]
+    name: Option<String>,
+    #[schemars(
+        description = "Replace the artwork with your own SVG (the title stops being a preset). Not together with `preset_params`; omit to leave unchanged"
+    )]
+    svg: Option<String>,
+    #[schemars(
+        description = "Re-fill a PRESET title: the full set of params (`text` required, optional `subtitle`, `color`, `accent`, `font`). Refused on a custom SVG title; omit to leave unchanged"
+    )]
+    preset_params: Option<SvgPresetParams>,
+    #[schemars(
+        description = "Switch a PRESET title to another kind (see list_svg_presets), keeping its id, name, timing, placement and place in the draw order; its params carry over unless `preset_params` is given too. Refused on a custom SVG title and together with `svg`; omit to leave unchanged"
+    )]
+    preset_kind: Option<SvgPresetKind>,
+    #[schemars(description = "New start time (timeline seconds); omit to leave unchanged")]
+    start: Option<f64>,
+    #[schemars(description = "New end time (timeline seconds); omit to leave unchanged")]
+    end: Option<f64>,
+    #[schemars(description = "Left edge of the placement rectangle, fraction of the frame width; omit to leave unchanged")]
+    x: Option<f64>,
+    #[schemars(description = "Top edge of the placement rectangle, fraction of the frame height; omit to leave unchanged")]
+    y: Option<f64>,
+    #[schemars(description = "Width of the placement rectangle, fraction of the frame width; omit to leave unchanged")]
+    width: Option<f64>,
+    #[schemars(description = "Height of the placement rectangle, fraction of the frame height; omit to leave unchanged")]
+    height: Option<f64>,
+    #[schemars(description = "Opacity of the whole title, 0–1; omit to leave unchanged")]
+    opacity: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ValidateSvgParams {
+    #[schemars(description = "The SVG document to check: the text of an <svg ...>...</svg> file")]
+    svg: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PreviewSvgOverlayParams {
+    #[schemars(
+        description = "UUID of an SVG title already on the timeline (see timeline_summary's `svg_overlays`). Give this OR `svg`, not both"
+    )]
+    overlay_id: Option<String>,
+    #[schemars(
+        description = "A draft SVG document to look at before adding it (the text of an <svg ...>...</svg> file). Give this OR `overlay_id`, not both"
+    )]
+    svg: Option<String>,
+    #[schemars(
+        description = "The moments to draw, in seconds AFTER THE TITLE APPEARS (0 = its first frame; for a title already on the timeline, a sliced one's offset is added for you). At most 36. Not together with `count`"
+    )]
+    times: Option<Vec<f64>>,
+    #[schemars(
+        description = "How many moments to draw, spread evenly from the first frame to the end of the title (default 6, at most 36). Not together with `times`"
+    )]
+    count: Option<u32>,
+    #[schemars(description = "Width in pixels of each cell of the sheet (default 480, 64 to 960)")]
+    max_width: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct TimelineStateParams {
+    #[schemars(
+        description = "Return every animated SVG title's source however long it is. By default a source over 4 KiB is replaced by a note with its size"
+    )]
+    full_svg: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct OverlayIdParams {
     #[schemars(description = "UUID of the overlay")]
     overlay_id: String,
@@ -1385,12 +1492,214 @@ fn is_zero(n: &usize) -> bool {
     *n == 0
 }
 
+/// An SVG overlay as an agent reads it: everything but the source, which can be 128 KiB of
+/// markup (a preset's is generated, a custom one the agent wrote itself).
+#[derive(Serialize)]
+struct SvgOverlaySummary {
+    id: Uuid,
+    name: String,
+    /// `custom`, or the preset's kind (`fade_up`, `typewriter`, `lower_third`, `word_pop`).
+    kind: &'static str,
+    start: f64,
+    end: f64,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    opacity: f64,
+    /// What a preset title was filled with; absent on a custom one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<SvgPresetParams>,
+    svg_bytes: usize,
+}
+
+impl From<&SvgOverlay> for SvgOverlaySummary {
+    fn from(o: &SvgOverlay) -> Self {
+        Self {
+            id: o.id,
+            name: o.display_name(),
+            kind: o.preset.as_ref().map_or("custom", |p| p.kind.as_str()),
+            start: o.start,
+            end: o.end,
+            x: o.x,
+            y: o.y,
+            width: o.width,
+            height: o.height,
+            opacity: o.opacity,
+            params: o.preset.as_ref().map(|p| p.params.clone()),
+            svg_bytes: o.svg.len(),
+        }
+    }
+}
+
+/// What `add_svg_overlay` / `update_svg_overlay` answer.
+#[derive(Serialize)]
+struct SvgOverlayOutcome {
+    overlay: SvgOverlaySummary,
+    /// What the sanitiser or the SMIL reader dropped or could not honour.
+    warnings: Vec<String>,
+}
+
+impl From<SvgOverlayResult> for SvgOverlayOutcome {
+    fn from(r: SvgOverlayResult) -> Self {
+        Self {
+            overlay: SvgOverlaySummary::from(&r.overlay),
+            warnings: r.warnings,
+        }
+    }
+}
+
+/// `svg` xor `preset` + `params`, as the one source `add_svg_overlay` takes.
+fn svg_source(
+    svg: Option<String>,
+    preset: Option<SvgPresetKind>,
+    params: Option<SvgPresetParams>,
+) -> Result<SvgSource, McpError> {
+    let bad = |msg: &str| McpError::invalid_params(msg.to_string(), None);
+    match (svg, preset, params) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(bad("pass either `svg` or `preset` with `params`, not both")),
+        (Some(svg), None, None) => Ok(SvgSource::Custom(svg)),
+        (None, Some(kind), Some(params)) => Ok(SvgSource::Preset(SvgPreset { kind, params })),
+        (None, Some(_), None) => Err(bad("a preset needs `params` (at least `text`)")),
+        (None, None, Some(_)) => Err(bad("`params` fill a `preset`; name one (see list_svg_presets)")),
+        (None, None, None) => Err(bad("pass `svg` (your own document) or a `preset` with `params`")),
+    }
+}
+
+/// What `validate_svg` answers. No source: the agent has it, and sanitising only removes things.
+#[derive(Serialize)]
+struct SvgValidation {
+    /// The size of the sanitised document, the part that is stored (limit 128 KiB).
+    svg_bytes: usize,
+    /// What the sanitiser or the SMIL reader would drop or could not honour.
+    warnings: Vec<String>,
+    /// When every animation has finished, in seconds after the title appears; null for a still
+    /// or a document that loops forever.
+    natural_duration: Option<f64>,
+}
+
+impl From<SvgCheck> for SvgValidation {
+    fn from(c: SvgCheck) -> Self {
+        Self {
+            svg_bytes: c.svg.len(),
+            warnings: c.warnings,
+            natural_duration: c.natural_duration,
+        }
+    }
+}
+
+/// Which moments of a title a preview sheet shows.
+#[derive(Debug, PartialEq)]
+enum SvgMoments {
+    /// These seconds after the title appears.
+    At(Vec<f64>),
+    /// This many, evenly from the first frame to the end.
+    Spread(usize),
+}
+
+/// `times` xor `count` as the moments of a preview sheet. A list the sheet cannot hold is refused
+/// rather than cut short, because the caption would then not match what was asked for.
+fn svg_moments(times: Option<Vec<f64>>, count: Option<u32>) -> Result<SvgMoments, McpError> {
+    let bad = |msg: String| McpError::invalid_params(msg, None);
+    let most = kerf_core::svg::raster::MAX_SHEET_CELLS;
+    match (times, count) {
+        (Some(_), Some(_)) => Err(bad("pass either `times` or `count`, not both".to_string())),
+        (Some(times), None) => {
+            if times.is_empty() || times.len() > most {
+                return Err(bad(format!("`times` takes 1 to {most} moments, got {}", times.len())));
+            }
+            if let Some(t) = times.iter().find(|t| !t.is_finite() || **t < 0.0) {
+                return Err(bad(format!("`times` are seconds after the title appears, not {t}")));
+            }
+            Ok(SvgMoments::At(times))
+        }
+        (None, count) => Ok(SvgMoments::Spread((count.unwrap_or(6) as usize).clamp(1, most))),
+    }
+}
+
+/// The moments of a title that runs `span` seconds, in seconds after it appears.
+fn svg_sheet_times(moments: &SvgMoments, span: f64) -> Vec<f64> {
+    match moments {
+        SvgMoments::At(times) => times.clone(),
+        SvgMoments::Spread(1) => vec![span / 2.0],
+        SvgMoments::Spread(n) => (0..*n).map(|i| span * i as f64 / (*n - 1) as f64).collect(),
+    }
+}
+
+/// The text beside a preview sheet: what it shows and which moment each cell is.
+fn svg_sheet_caption(label: &str, times: &[f64], offset: f64, warnings: &[String]) -> String {
+    let mut out = format!(
+        "{label}: {} moment{} (row-major), cell -> seconds after it appears:",
+        times.len(),
+        if times.len() == 1 { "" } else { "s" }
+    );
+    for (i, t) in times.iter().enumerate() {
+        out.push_str(&format!("\n  cell {}: {t:.2}s", i + 1));
+    }
+    if offset > 0.0 {
+        out.push_str(&format!(
+            "\nthis title was cut into, so its animation is {offset:.2}s further on than these times: the labels on the image are that clock"
+        ));
+    }
+    if !warnings.is_empty() {
+        out.push_str(&format!("\nwarnings: {}", warnings.join("; ")));
+    }
+    out
+}
+
+/// A title to look at: what the agent named, with how long it runs and how far in it starts.
+struct SvgPreviewTitle {
+    svg: String,
+    /// How it is introduced in the caption.
+    label: String,
+    /// Seconds it is on screen; `None` for a draft, which runs for the length `add_svg_overlay` would give it.
+    span: Option<f64>,
+    /// Seconds of the document's own clock already elapsed when it appears.
+    offset: f64,
+    /// A draft is read for the first time here, so what the sanitiser dropped is news.
+    report_warnings: bool,
+}
+
+/// Draw the contact sheet of `title` at `moments` into a `frame`-shaped cell `cell_w` wide:
+/// the PNG and its caption. Reads the document (so it belongs on the blocking pool) and touches
+/// no project.
+fn svg_preview(
+    title: &SvgPreviewTitle,
+    moments: &SvgMoments,
+    cell_w: u32,
+    frame: (u32, u32),
+) -> Result<(Vec<u8>, String), McpError> {
+    let doc = SvgDoc::parse(&title.svg).map_err(core_err)?;
+    let span = title.span.unwrap_or_else(|| doc.default_span());
+    let times = svg_sheet_times(moments, span);
+    let clock: Vec<f64> = times.iter().map(|t| t + title.offset).collect();
+    let png = kerf_core::svg::raster::contact_sheet(&doc, &clock, cell_w, frame).map_err(core_err)?;
+    let warnings = if title.report_warnings { doc.warnings() } else { &[] };
+    Ok((png, svg_sheet_caption(&title.label, &times, title.offset, warnings)))
+}
+
+/// Leave the sources of large SVG titles out of a timeline read: a title can carry 128 KiB and a
+/// timeline 50 of them. The note says how to get the source.
+fn elide_large_svg(timeline: &mut Timeline) {
+    for o in &mut timeline.svg_overlays {
+        if o.svg.len() > SVG_INLINE_LIMIT {
+            o.svg = format!(
+                "[{} bytes of SVG left out; call get_timeline_state with full_svg=true to read it]",
+                o.svg.len()
+            );
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct TimelineSummary {
     total_duration_secs: f64,
     track_count: usize,
     total_clip_count: usize,
     tracks: Vec<TrackSummary>,
+    /// The animated SVG titles, in draw order, without their source. Absent when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    svg_overlays: Vec<SvgOverlaySummary>,
     /// The frame this cut is being made for, e.g. "1080x1920 (cover)". Absent
     /// when the project follows its footage's shape. Worth reading before
     /// framing anything: under a cover delivery the crop decides what survives.
@@ -1557,11 +1866,17 @@ impl KerfMcp {
         description = "Get the full non-destructive timeline state (tracks and clips). A clip with `link_id` is \
                        linked to the other clips sharing it (a picture and its detached sound); one with \
                        `source_audio: false` is a picture whose own sound was detached and is silent — its \
-                       sound is on the linked audio clip. Both fields are absent on an ordinary clip."
+                       sound is on the linked audio clip. Both fields are absent on an ordinary clip. Animated SVG titles \
+                       (`svg_overlays`) carry their SVG source here, but a source over 4 KiB is replaced by a note with \
+                       its size (a title can be 128 KiB): pass `full_svg: true` to get every source whole. \
+                       timeline_summary lists the titles without any source, and preview_svg_overlay shows how one looks."
     )]
-    fn get_timeline_state(&self) -> Result<String, McpError> {
-        let project = self.lock();
-        json(&project.working_timeline().map_err(core_err)?)
+    fn get_timeline_state(&self, Parameters(p): Parameters<TimelineStateParams>) -> Result<String, McpError> {
+        let mut timeline = self.lock().working_timeline().map_err(core_err)?;
+        if !p.full_svg.unwrap_or(false) {
+            elide_large_svg(&mut timeline);
+        }
+        json(&timeline)
     }
 
     #[tool(
@@ -2597,6 +2912,180 @@ impl KerfMcp {
             project.remove_overlay(overlay_id).map_err(core_err)?;
             Ok("ok".to_string())
         })
+    }
+
+    #[tool(
+        description = "Add an animated SVG title (kinetic text, lower-third, logo sting, shape animation) drawn over the \
+                       picture from start to end (timeline seconds), above the clips and below text overlays and \
+                       captions. Pick a ready-made `preset` with `params` (list_svg_presets), or write your own `svg`. \
+                       Your own SVG is animated with SMIL only: `animate`, `set`, `animateTransform` (translate / scale / \
+                       rotate / skewX / skewY) and `animateColor`, with begin / dur / from / to / by / values / keyTimes / \
+                       calcMode (linear, discrete, paced, spline + keySplines) / repeatCount / fill=\"freeze\", and \
+                       `id.begin` / `id.end` chains. Times in the SVG are seconds RELATIVE TO THE OVERLAY'S START \
+                       (begin=\"0s\" is the moment it appears, so the animation does not depend on where you place it). \
+                       The document needs a viewBox (or width and height) and is scaled to fit, centred, inside the \
+                       placement rectangle x / y / width / height (fractions of the frame; default the whole frame): for a \
+                       full-frame title draw it in the delivery frame's own coordinates (viewBox=\"0 0 1920 1080\" for \
+                       1080p; timeline_summary shows `delivery_format`), for a corner bug use a small rectangle. Dropped \
+                       with a warning in the result: CSS animations and transitions, scripts and event handlers, \
+                       foreignObject, links and external images or fonts (system fonts by name work; the only image that \
+                       is kept is an <image> whose href is a data:image/png, data:image/jpeg, data:image/gif or \
+                       data:image/webp URI), animateMotion, and `animate` on `transform` (use animateTransform). Limits: \
+                       128 KiB of SVG, 50 SVG overlays. Returns the overlay (without its source) and `warnings`. Draft your \
+                       own SVG with validate_svg and preview_svg_overlay (`svg`) first; once added, check it in the cut \
+                       with preview_timeline at a few times between start and end."
+    )]
+    async fn add_svg_overlay(&self, Parameters(p): Parameters<AddSvgOverlayParams>) -> Result<String, McpError> {
+        let source = svg_source(p.svg, p.preset, p.params)?;
+        let layout = SvgLayout {
+            name: p.name,
+            x: p.x,
+            y: p.y,
+            width: p.width,
+            height: p.height,
+            opacity: p.opacity,
+        };
+        // Reading the document takes up to a second and a half: on the blocking pool, and before the
+        // project lock, which then only places it.
+        let checked = blocking(move || source.check().map_err(core_err)).await?;
+        self.edit(|project| {
+            let out = project
+                .add_svg_overlay_parsed(checked, p.start, p.end, layout)
+                .map_err(core_err)?;
+            json(&SvgOverlayOutcome::from(out))
+        })
+    }
+
+    #[tool(
+        description = "Change an animated SVG title: its timing (start / end), placement (x / y / width / height as frame \
+                       fractions), opacity or name, or its artwork. For a PRESET title pass `preset_params` (the full set; \
+                       `text` required) to re-fill it and/or `preset_kind` to switch it to another preset (one edit; the \
+                       title keeps its id, name, timing and place in the draw order); its animation re-times itself to \
+                       the new length when you change start / end. To swap the artwork for your own, pass `svg` (the \
+                       title then stops being a preset); `svg` is exclusive with `preset_params` and `preset_kind`, \
+                       which a custom SVG title refuses. Omit a field to leave it unchanged. Returns the overlay \
+                       (without its source) and `warnings`."
+    )]
+    async fn update_svg_overlay(&self, Parameters(p): Parameters<UpdateSvgOverlayParams>) -> Result<String, McpError> {
+        let overlay_id = parse_id(&p.overlay_id)?;
+        let patch = SvgOverlayPatch {
+            name: p.name,
+            svg: p.svg,
+            preset_params: p.preset_params,
+            preset_kind: p.preset_kind,
+            start: p.start,
+            end: p.end,
+            x: p.x,
+            y: p.y,
+            width: p.width,
+            height: p.height,
+            opacity: p.opacity,
+        };
+        // As in add_svg_overlay: read the artwork before the project lock is taken.
+        let (patch, doc) = blocking(move || {
+            let doc = patch.check().map_err(core_err)?;
+            Ok((patch, doc))
+        })
+        .await?;
+        self.edit(|project| {
+            let out = project.update_svg_overlay_parsed(overlay_id, patch, doc).map_err(core_err)?;
+            json(&SvgOverlayOutcome::from(out))
+        })
+    }
+
+    #[tool(description = "Remove an animated SVG title (its id is in timeline_summary's `svg_overlays`)")]
+    fn remove_svg_overlay(&self, Parameters(p): Parameters<OverlayIdParams>) -> Result<String, McpError> {
+        let overlay_id = parse_id(&p.overlay_id)?;
+        self.edit(|project| {
+            project.remove_svg_overlay(overlay_id).map_err(core_err)?;
+            Ok("ok".to_string())
+        })
+    }
+
+    #[tool(
+        description = "List the ready-made animated titles add_svg_overlay can make with `preset` + `params`, and what each \
+                       takes (name, whether required, default). fade_up: the text rises and fades in, then fades out; \
+                       typewriter: letters appear one by one; lower_third: an accent bar wipes in above a name (and \
+                       subtitle) at the lower left; word_pop: one big word at a time pops in, centred — the social-video \
+                       look. A preset is drawn for the delivery frame (set_delivery_format) and times its animation to \
+                       the overlay's length, so it also follows a trim; the text is centred or left-anchored and long \
+                       text shrinks to fit, never wraps."
+    )]
+    fn list_svg_presets(&self) -> Result<String, McpError> {
+        json(&kerf_core::svg::preset_infos())
+    }
+
+    #[tool(
+        description = "Check an SVG document you wrote for add_svg_overlay / update_svg_overlay without adding it: it is \
+                       sanitised and its SMIL animations read, exactly as an add would. Returns `svg_bytes` (the size of \
+                       the sanitised document; the limit is 128 KiB), `warnings` (what would be dropped or could not be \
+                       honoured: CSS animations, scripts, external images, animateMotion, an unreadable value, ...) and \
+                       `natural_duration` (seconds after the title appears when every animation has finished; null for \
+                       a still or something that loops forever, which add_svg_overlay then gives 4 s). A document that \
+                       cannot be used at all (not XML, no <svg> root, no viewBox or width and height, over a limit) is \
+                       an error saying why. Nothing is changed and the source is not echoed back. To see how it \
+                       looks, use preview_svg_overlay."
+    )]
+    async fn validate_svg(&self, Parameters(p): Parameters<ValidateSvgParams>) -> Result<String, McpError> {
+        let check = blocking(move || kerf_core::check_svg(&p.svg).map_err(core_err)).await?;
+        json(&SvgValidation::from(check))
+    }
+
+    #[tool(
+        description = "See an animated SVG title without rendering the cut: a PNG contact sheet of it at several moments, \
+                       each cell the title drawn over a dark grey frame of the delivery shape with its time written \
+                       under it, plus a text index of cell -> seconds. Pass `svg` to look at a draft before you add \
+                       it (its warnings come back too) or `overlay_id` for a title already on the timeline (reads the \
+                       cut you are proposing, staged edits included). By default 6 moments spread from its first frame \
+                       to its end (the last is usually the title gone or at rest); pass `times` (seconds after it \
+                       appears) to look at exact moments, e.g. around a transition, or `count` for more or fewer. \
+                       It shows the title alone, not over the footage: to judge placement and legibility against the \
+                       picture, add it and use preview_timeline at a few times between its start and end."
+    )]
+    async fn preview_svg_overlay(&self, Parameters(p): Parameters<PreviewSvgOverlayParams>) -> Result<CallToolResult, McpError> {
+        let overlay_id = p.overlay_id.as_deref().map(parse_id).transpose()?;
+        if overlay_id.is_some() == p.svg.is_some() {
+            return Err(McpError::invalid_params(
+                "pass either `overlay_id` (a title on the timeline) or `svg` (a draft), exactly one".to_string(),
+                None,
+            ));
+        }
+        let moments = svg_moments(p.times, p.count)?;
+        let cell_w = p.max_width.unwrap_or(480).clamp(64, MAX_SVG_CELL_WIDTH);
+        let (project, draft) = (self.project.clone(), p.svg);
+        let (png, caption) = blocking(move || {
+            // Resolve the title and the frame under the lock, draw with it released.
+            let (title, frame) = {
+                let project = lock_agent(&project);
+                let timeline = project.working_timeline().map_err(core_err)?;
+                let frame = timeline.preset_frame();
+                let title = match (overlay_id, draft) {
+                    (Some(id), _) => {
+                        let o = timeline
+                            .svg_overlay(id)
+                            .ok_or_else(|| core_err(kerf_core::Error::SvgOverlayNotFound(id)))?;
+                        SvgPreviewTitle {
+                            svg: o.svg.clone(),
+                            label: format!("SVG title \"{}\" ({id})", o.display_name()),
+                            span: Some(o.end - o.start),
+                            offset: o.offset,
+                            report_warnings: false,
+                        }
+                    }
+                    (None, svg) => SvgPreviewTitle {
+                        svg: svg.unwrap_or_default(),
+                        label: "draft SVG (not on the timeline)".to_string(),
+                        span: None,
+                        offset: 0.0,
+                        report_warnings: true,
+                    },
+                };
+                (title, frame)
+            };
+            svg_preview(&title, &moments, cell_w, frame)
+        })
+        .await?;
+        Ok(png_result(caption, png))
     }
 
     #[tool(
@@ -3742,7 +4231,8 @@ impl KerfMcp {
     #[tool(
         description = "Summarise the timeline: total duration, track count, clips per track, any per-track gaps, \
                        and per track how many clips are linked to a partner (`linked_clips`) and how many pictures \
-                       have had their own sound detached (`detached_sound_clips`)"
+                       have had their own sound detached (`detached_sound_clips`), and the animated SVG titles \
+                       (`svg_overlays`: id, kind, timing, placement; no source)"
     )]
     fn timeline_summary(&self) -> Result<String, McpError> {
         let project = self.lock();
@@ -3768,6 +4258,7 @@ impl KerfMcp {
             track_count: tracks.len(),
             total_clip_count,
             tracks,
+            svg_overlays: timeline.svg_overlays.iter().map(SvgOverlaySummary::from).collect(),
             delivery_format: timeline
                 .format
                 .map(|d| format!("{}x{} ({})", d.width, d.height, format!("{:?}", d.fit).to_lowercase())),
@@ -4009,6 +4500,27 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              footage) and replaces that same caption set — so it is the caption \
              step too: do it last, and re-run it after further edits. export_srt \
              writes a subtitle file. \
+             For motion graphics beyond a text overlay, add_svg_overlay puts an \
+             animated SVG title on the cut: a ready-made preset (list_svg_presets: \
+             fade_up, typewriter, lower_third, word_pop, filled in with `params`) \
+             or your own `svg`. Your SVG is animated with SMIL only — animate, \
+             set, animateTransform and animateColor — and its times are seconds \
+             relative to the overlay's start. Give it a viewBox (or width and \
+             height); it is fitted inside the overlay's x / y / width / height \
+             rectangle (default the whole frame), so for artwork that covers the \
+             frame use the delivery frame's own size as the viewBox. CSS \
+             animations, scripts, external images and animateMotion are not \
+             rendered (the result's `warnings` say what was dropped). SVG titles \
+             sit above the footage and below text overlays and captions, are \
+             placed in timeline time like any overlay (a later trim does not move \
+             them, so add them once the cut is settled) and are listed in \
+             timeline_summary; update_svg_overlay retimes or re-fills one, \
+             remove_svg_overlay removes it. Write your own SVG in a loop: \
+             validate_svg (its warnings say what would be dropped) and \
+             preview_svg_overlay with `svg` (a contact sheet of the animation at \
+             several moments) until it looks right, then add_svg_overlay, then \
+             preview_timeline at a few moments between its start and end to \
+             judge it against the footage. \
              To narrate a cut, write the script and generate_voiceover it (English; \
              it lands on its own VO track with a transcript that is its script, \
              exactly timed), cut the picture to the narration, then caption last. \
@@ -4268,6 +4780,7 @@ fn core_err(e: kerf_core::Error) -> McpError {
         | E::ClipNotFound(_)
         | E::TrackNotFound(_)
         | E::OverlayNotFound(_)
+        | E::SvgOverlayNotFound(_)
         | E::RevisionNotFound(_)
         | E::TaskNotFound(_)
         | E::InvalidArgument(_)
@@ -4296,8 +4809,17 @@ fn log_tool_error(tool: &str, e: &McpError) {
 /// block followed by an image content block (rmcp expects bare base64 + MIME,
 /// not a `data:` URL).
 fn image_result(caption: String, jpeg: Vec<u8>) -> CallToolResult {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
-    CallToolResult::success(vec![ContentBlock::text(caption), ContentBlock::image(b64, "image/jpeg")])
+    image_block(caption, &jpeg, "image/jpeg")
+}
+
+/// [`image_result`] for PNG bytes: a drawing with flat colour and sharp edges, where JPEG smears.
+fn png_result(caption: String, png: Vec<u8>) -> CallToolResult {
+    image_block(caption, &png, "image/png")
+}
+
+fn image_block(caption: String, bytes: &[u8], mime: &str) -> CallToolResult {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    CallToolResult::success(vec![ContentBlock::text(caption), ContentBlock::image(b64, mime)])
 }
 
 /// The spans of a track that render nothing: the hole before the first clip and
@@ -4433,9 +4955,10 @@ fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        allowed_hosts, caption_source, clip_moves, core_err, describe_server_error, fmt_ts, image_result, log_tool_error,
-        refuse_overwrite, reject_unknown_arguments, require_window, router, server_identity, track_gaps, variant_output,
-        ClipMoveParams,
+        allowed_hosts, caption_source, clip_moves, core_err, describe_server_error, elide_large_svg, fmt_ts, image_result,
+        log_tool_error, png_result, refuse_overwrite, reject_unknown_arguments, require_window, router, server_identity,
+        svg_moments, svg_preview, svg_sheet_caption, svg_sheet_times, svg_source, track_gaps, variant_output, ClipMoveParams,
+        SvgMoments, SvgOverlaySummary, SvgPreviewTitle, SvgValidation,
     };
 
     #[test]
@@ -5065,6 +5588,7 @@ mod tests {
             kerf_core::Error::ClipNotFound(id),
             kerf_core::Error::AssetNotFound(id),
             kerf_core::Error::TrackNotFound(id),
+            kerf_core::Error::SvgOverlayNotFound(id),
             kerf_core::Error::InvalidArgument("marker time must be >= 0".to_string()),
             kerf_core::Error::StagedEditStale,
         ] {
@@ -5437,5 +5961,351 @@ mod tests {
             let e = require_window(start, end).expect_err("not a forward window");
             assert_eq!(e.code, ErrorCode::INVALID_PARAMS, "{start}..{end}");
         }
+    }
+
+    #[test]
+    fn the_server_instructions_describe_the_svg_subset() {
+        let text = super::INSTRUCTIONS;
+        for needle in [
+            "add_svg_overlay",
+            "list_svg_presets",
+            "SMIL",
+            "animateTransform",
+            "viewBox",
+            "relative to the overlay's start",
+            "animateMotion",
+            "update_svg_overlay",
+            "remove_svg_overlay",
+            "validate_svg",
+            "preview_svg_overlay",
+        ] {
+            assert!(text.contains(needle), "the instructions should mention `{needle}`: {text}");
+        }
+        let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("`{needle}` in the instructions"));
+        assert!(
+            at("validate_svg") < at("preview_svg_overlay")
+                && at("preview_svg_overlay") < at("then add_svg_overlay, then")
+                && at("then add_svg_overlay, then") < at("preview_timeline at a few moments between its start"),
+            "the loop runs validate, preview, add, then look at the cut: {text}"
+        );
+        let tools = router().list_all();
+        for name in [
+            "add_svg_overlay",
+            "update_svg_overlay",
+            "remove_svg_overlay",
+            "list_svg_presets",
+            "validate_svg",
+            "preview_svg_overlay",
+        ] {
+            assert!(tools.iter().any(|t| t.name == name), "`{name}` is registered");
+        }
+    }
+
+    #[test]
+    fn the_svg_tools_ask_for_little_and_say_what_the_svg_may_do() {
+        let tools = router().list_all();
+        let tool = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("`{name}` is registered"))
+        };
+        let required = |name: &str| -> Vec<String> {
+            let mut r: Vec<String> = tool(name)
+                .input_schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|r| r.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            r.sort();
+            r
+        };
+        assert_eq!(required("add_svg_overlay"), ["start"]);
+        assert_eq!(required("update_svg_overlay"), ["overlay_id"]);
+        assert_eq!(required("remove_svg_overlay"), ["overlay_id"]);
+        let description = tool("add_svg_overlay").description.as_deref().unwrap_or_default().to_string();
+        for needle in [
+            "SMIL",
+            "viewBox",
+            "RELATIVE TO THE OVERLAY'S START",
+            "animateMotion",
+            "preview_timeline",
+        ] {
+            assert!(
+                description.contains(needle),
+                "add_svg_overlay should say `{needle}`: {description}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_title_comes_from_svg_or_from_a_preset_never_both_or_neither() {
+        use kerf_core::{SvgPresetKind, SvgPresetParams, SvgSource};
+        use rmcp::model::ErrorCode;
+        let params = || Some(SvgPresetParams::new("Hello"));
+        let kind = Some(SvgPresetKind::FadeUp);
+        assert_eq!(
+            svg_source(Some("<svg/>".to_string()), None, None).unwrap(),
+            SvgSource::Custom("<svg/>".to_string())
+        );
+        assert!(matches!(
+            svg_source(None, kind, params()).unwrap(),
+            SvgSource::Preset(p) if p.kind == SvgPresetKind::FadeUp && p.params.text == "Hello"
+        ));
+        for (svg, kind, params) in [
+            (Some("<svg/>".to_string()), kind, params()),
+            (Some("<svg/>".to_string()), kind, None),
+            (Some("<svg/>".to_string()), None, params()),
+            (None, kind, None),
+            (None, None, params()),
+            (None, None, None),
+        ] {
+            let e = svg_source(svg, kind, params).expect_err("not one source");
+            assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    /// The source of a title can be 128 KiB: the agent reads timing and placement, not markup.
+    #[test]
+    fn an_agent_reads_a_title_without_its_source() {
+        use kerf_core::{SvgOverlay, SvgPreset, SvgPresetKind, SvgPresetParams};
+        let mut o = SvgOverlay {
+            id: uuid::Uuid::new_v4(),
+            name: String::new(),
+            svg: "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"/>".to_string(),
+            start: 1.0,
+            end: 4.0,
+            x: 0.1,
+            y: 0.2,
+            width: 0.5,
+            height: 0.25,
+            opacity: 0.8,
+            offset: 0.0,
+            preset: None,
+        };
+        let custom = serde_json::to_value(SvgOverlaySummary::from(&o)).unwrap();
+        assert_eq!(custom["kind"], "custom");
+        assert_eq!(custom["name"], "SVG");
+        assert_eq!(custom["svg_bytes"], o.svg.len());
+        assert!(custom.get("svg").is_none() && custom.get("params").is_none(), "{custom}");
+
+        o.preset = Some(SvgPreset {
+            kind: SvgPresetKind::LowerThird,
+            params: SvgPresetParams::new("Ada Lovelace"),
+        });
+        let preset = serde_json::to_value(SvgOverlaySummary::from(&o)).unwrap();
+        assert_eq!(preset["kind"], "lower_third");
+        assert_eq!(preset["name"], "Ada Lovelace");
+        assert_eq!(preset["params"]["text"], "Ada Lovelace");
+        assert!(preset.get("svg").is_none(), "{preset}");
+    }
+
+    fn svg_text(extra: &str) -> String {
+        format!("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 160 90\"><rect width=\"20\" height=\"20\" fill=\"red\"><animate attributeName=\"x\" from=\"0\" to=\"100\" dur=\"3s\" fill=\"freeze\"/></rect>{extra}</svg>")
+    }
+
+    #[test]
+    fn png_results_serialize_as_caption_plus_a_png_block() {
+        let value = serde_json::to_value(png_result("cells".to_string(), vec![0x89, b'P', b'N', b'G'])).unwrap();
+        let content = value["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "{content:?}");
+        assert_eq!(
+            (content[0]["type"].as_str(), content[0]["text"].as_str()),
+            (Some("text"), Some("cells"))
+        );
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["mimeType"], "image/png");
+        assert_eq!(content[1]["data"], "iVBORw==");
+    }
+
+    #[test]
+    fn a_preview_asks_for_moments_by_times_or_by_count_never_both() {
+        use rmcp::model::ErrorCode;
+        assert_eq!(svg_moments(None, None).unwrap(), SvgMoments::Spread(6), "six by default");
+        assert_eq!(svg_moments(None, Some(0)).unwrap(), SvgMoments::Spread(1));
+        assert_eq!(
+            svg_moments(None, Some(500)).unwrap(),
+            SvgMoments::Spread(36),
+            "a count is clamped"
+        );
+        assert_eq!(
+            svg_moments(Some(vec![0.0, 1.5]), None).unwrap(),
+            SvgMoments::At(vec![0.0, 1.5])
+        );
+        for (times, count) in [
+            (Some(vec![1.0]), Some(3)),
+            (Some(vec![]), None),
+            (Some(vec![0.5; 37]), None),
+            (Some(vec![f64::NAN]), None),
+            (Some(vec![-1.0]), None),
+        ] {
+            let e = svg_moments(times.clone(), count).expect_err("a mistake the caller can fix");
+            assert_eq!(e.code, ErrorCode::INVALID_PARAMS, "{times:?} {count:?}");
+        }
+    }
+
+    #[test]
+    fn a_spread_runs_from_the_first_frame_to_the_end_of_the_title() {
+        assert_eq!(svg_sheet_times(&SvgMoments::Spread(5), 4.0), [0.0, 1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(svg_sheet_times(&SvgMoments::Spread(2), 3.0), [0.0, 3.0]);
+        assert_eq!(
+            svg_sheet_times(&SvgMoments::Spread(1), 3.0),
+            [1.5],
+            "a single cell is the middle"
+        );
+        assert_eq!(
+            svg_sheet_times(&SvgMoments::At(vec![0.5, 9.0]), 3.0),
+            [0.5, 9.0],
+            "asked-for times are kept"
+        );
+    }
+
+    #[test]
+    fn a_sheet_caption_indexes_the_cells_and_flags_a_slice_and_warnings() {
+        let plain = svg_sheet_caption("draft", &[0.0, 1.5], 0.0, &[]);
+        assert_eq!(
+            plain,
+            "draft: 2 moments (row-major), cell -> seconds after it appears:\n  cell 1: 0.00s\n  cell 2: 1.50s"
+        );
+        let full = svg_sheet_caption("t", &[2.0], 1.0, &["scripts were removed".to_string()]);
+        assert!(full.starts_with("t: 1 moment (row-major)"), "{full}");
+        assert!(full.contains("1.00s further on"), "{full}");
+        assert!(full.ends_with("warnings: scripts were removed"), "{full}");
+    }
+
+    #[test]
+    fn a_preview_draws_a_png_sheet_and_offsets_a_sliced_title() {
+        let title = SvgPreviewTitle {
+            svg: svg_text("<script>1</script>"),
+            label: "draft".to_string(),
+            span: None,
+            offset: 0.0,
+            report_warnings: true,
+        };
+        let (png, caption) = svg_preview(&title, &SvgMoments::Spread(3), 96, (160, 90)).unwrap();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert!(
+            caption.contains("cell 3: 3.00s"),
+            "a draft runs for its animation's length: {caption}"
+        );
+        assert!(caption.contains("warnings:") && caption.contains("script"), "{caption}");
+
+        let on_timeline = SvgPreviewTitle {
+            span: Some(2.0),
+            offset: 1.0,
+            report_warnings: false,
+            label: "SVG title".to_string(),
+            ..title
+        };
+        let (png, caption) = svg_preview(&on_timeline, &SvgMoments::At(vec![0.0, 2.0]), 96, (160, 90)).unwrap();
+        assert_eq!(&png[..4], b"\x89PNG");
+        assert!(
+            caption.contains("cell 2: 2.00s") && caption.contains("1.00s further on"),
+            "{caption}"
+        );
+        assert!(!caption.contains("warnings"), "{caption}");
+
+        let broken = SvgPreviewTitle {
+            svg: "<nope/>".to_string(),
+            label: "draft".to_string(),
+            span: None,
+            offset: 0.0,
+            report_warnings: true,
+        };
+        let e = svg_preview(&broken, &SvgMoments::Spread(1), 96, (160, 90)).expect_err("not an svg");
+        assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn validate_svg_answers_size_warnings_and_duration_without_the_source() {
+        let check = kerf_core::check_svg(&svg_text("<script>1</script>")).unwrap();
+        let sanitized = check.svg.len();
+        let value = serde_json::to_value(SvgValidation::from(check)).unwrap();
+        assert_eq!(value["svg_bytes"], sanitized);
+        assert_eq!(value["natural_duration"], 3.0);
+        assert!(value["warnings"][0].as_str().unwrap().contains("script"), "{value}");
+        assert!(value.get("svg").is_none(), "{value}");
+        let still = kerf_core::check_svg("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1 1\"/>").unwrap();
+        assert!(serde_json::to_value(SvgValidation::from(still)).unwrap()["natural_duration"].is_null());
+    }
+
+    #[test]
+    fn a_timeline_read_leaves_out_large_svg_sources_and_says_how_to_get_them() {
+        use kerf_core::{SvgOverlay, Timeline};
+        let title = |bytes: usize| SvgOverlay {
+            id: uuid::Uuid::new_v4(),
+            name: String::new(),
+            svg: "x".repeat(bytes),
+            start: 0.0,
+            end: 1.0,
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            opacity: 1.0,
+            offset: 0.0,
+            preset: None,
+        };
+        let mut timeline = Timeline::new();
+        timeline.svg_overlays = vec![title(4096), title(4097), title(120_000)];
+        elide_large_svg(&mut timeline);
+        assert_eq!(timeline.svg_overlays[0].svg.len(), 4096, "up to 4 KiB is kept");
+        for (o, bytes) in timeline.svg_overlays[1..].iter().zip([4097, 120_000]) {
+            assert!(
+                o.svg.contains(&format!("{bytes} bytes")) && o.svg.contains("full_svg=true"),
+                "{}",
+                o.svg
+            );
+            assert!(o.svg.len() < 200);
+        }
+    }
+
+    #[test]
+    fn the_svg_authoring_tools_are_described_for_a_model_that_has_not_seen_the_gui() {
+        let tools = router().list_all();
+        let tool = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("`{name}` is registered"))
+        };
+        let description = |name: &str| tool(name).description.as_deref().unwrap_or_default().to_string();
+        let required = |name: &str| -> Vec<String> {
+            tool(name)
+                .input_schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|r| r.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default()
+        };
+        let property = |name: &str, field: &str| tool(name).input_schema["properties"].get(field).cloned();
+        assert_eq!(required("validate_svg"), ["svg"]);
+        assert!(
+            required("preview_svg_overlay").is_empty(),
+            "everything is optional but one source"
+        );
+        assert!(required("get_timeline_state").is_empty());
+        for field in ["overlay_id", "svg", "times", "count", "max_width"] {
+            assert!(property("preview_svg_overlay", field).is_some(), "{field}");
+        }
+        assert!(property("update_svg_overlay", "preset_kind").is_some());
+        assert!(property("get_timeline_state", "full_svg").is_some());
+        assert!(description("update_svg_overlay").contains("preset_kind"));
+        assert!(
+            description("preview_svg_overlay").contains("PNG") && description("preview_svg_overlay").contains("preview_timeline")
+        );
+        assert!(description("validate_svg").contains("natural_duration"));
+        assert!(description("get_timeline_state").contains("full_svg"));
+
+        let presets = description("list_svg_presets");
+        assert!(
+            presets.contains("bar wipes in above a name"),
+            "the lower_third bar sits above the name: {presets}"
+        );
+        let add = description("add_svg_overlay");
+        for needle in ["data:image/png", "data:image/jpeg", "data:image/gif", "data:image/webp"] {
+            assert!(add.contains(needle), "only these embedded images are kept: {add}");
+        }
+        assert!(!add.contains("`data:` images are fine"), "{add}");
     }
 }
