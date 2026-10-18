@@ -992,7 +992,8 @@ impl Want {
 /// How a `get_preview_frame` ended, for the command: the frame, or "a newer request took its place".
 type Answer = Delivery<Result<PreviewFrameResult, String>>;
 
-/// What `gpu_preview_diagnostics` answers: what this session's frames did and why the others went
+#[cfg_attr(not(test), allow(dead_code))]
+/// What the diagnostics answer (read by tests; no command serves them): what this session's frames did and why the others went
 /// through FFmpeg, and what the machinery around them did.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct GpuDiagnostics {
@@ -1459,6 +1460,7 @@ impl GpuPreview {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     /// What this session's frames did and why the others went through FFmpeg.
     pub fn diagnostics(&self) -> GpuDiagnostics {
         let mail = self.mail.stats();

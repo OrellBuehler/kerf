@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { entryId, mergeSubset, subsetMessage } from './staged-subset';
-import type { Clip, DiffEntry, Timeline, TimelineDiff } from './types';
+import type { Clip, DiffEntry, SvgOverlay, Timeline, TimelineDiff } from './types';
 
 // The cases are the ones in crates/kerf-core/src/model/subset.rs, with the diff written by hand
 // (the harness has no diff engine: its entries are authored like the backend's).
@@ -164,6 +164,89 @@ describe('mergeSubset', () => {
 		expect(merge.timeline.markers?.map((m) => m.id)).toEqual(['m1']);
 		expect(merge.timeline.master?.volume).toBe(0.5);
 		expect(merge.applied).toHaveLength(3);
+	});
+
+	test('a pick that would pull linked clips out of step is refused, naming the tracks', () => {
+		const base: Timeline = {
+			tracks: [
+				{ id: 'v1', kind: 'video', name: 'V1', clips: [clip('v', 0, 4, { link_id: 'L' })] },
+				{ id: 'a1', kind: 'audio', name: 'A1', clips: [clip('s', 0, 4, { link_id: 'L' })] }
+			]
+		};
+		// The proposal itself moved the picture and left its sound where it was.
+		const apart = structuredClone(base);
+		apart.tracks[0].clips[0].timeline_start = 2;
+		const move: DiffEntry = { kind: 'clip_moved', summary: 'Moved v', clip_id: 'v', track_id: 'v1', at: 2 };
+		expect(() => mergeSubset(base, base, apart, diffOf(move), ['clip_moved:v'])).toThrow(
+			/pull the linked clips on V1 and A1 out of step — pick the changes to both, or apply the whole proposal/
+		);
+		// Moved together, they are still in step and it lands: the partner's move comes with the pick.
+		const together = structuredClone(apart);
+		together.tracks[1].clips[0].timeline_start = 2;
+		const both = diffOf(move, { kind: 'clip_moved', summary: 'Moved s', clip_id: 's', track_id: 'a1', at: 2 });
+		const merge = mergeSubset(base, base, together, both, ['clip_moved:v']);
+		expect(merge.autoIncluded.map((a) => a.id)).toEqual(['clip_moved:s']);
+		expect(merge.timeline.tracks[1].clips[0].timeline_start).toBe(2);
+		// A pair that was apart before the pick is not this merge's doing.
+		const loose: Timeline = structuredClone(base);
+		loose.tracks[1].clips[0].timeline_start = 1;
+		const proposedLoose = structuredClone(loose);
+		proposedLoose.tracks[0].clips[0].volume = 0.5;
+		proposedLoose.tracks[1].clips[0].volume = 0.5;
+		expect(() => mergeSubset(loose, loose, proposedLoose, diffOf(changed('v')), ['clip_changed:v'])).not.toThrow();
+	});
+
+	test('animated titles apply by identity like text', () => {
+		const title = (id: string, start: number): SvgOverlay => ({
+			id,
+			name: id,
+			svg: "<svg xmlns='http://www.w3.org/2000/svg'/>",
+			start,
+			end: start + 2,
+			x: 0,
+			y: 0,
+			width: 1,
+			height: 1,
+			opacity: 1
+		});
+		const base = cut();
+		base.svg_overlays = [title('kept', 0), title('dropped', 4)];
+		const proposed = structuredClone(base);
+		proposed.svg_overlays![0].opacity = 0.5;
+		proposed.svg_overlays!.splice(1, 1);
+		proposed.svg_overlays!.push(title('added', 8));
+		const diff = diffOf(
+			{ kind: 'overlay_changed', summary: 'Changed kept', overlay_id: 'kept', at: 0 },
+			{ kind: 'overlay_removed', summary: 'Removed dropped', overlay_id: 'dropped', at: 4 },
+			{ kind: 'overlay_added', summary: 'Added added', overlay_id: 'added', at: 8 }
+		);
+		const ids = diff.entries.map(entryId);
+		// The user dropped one of them meanwhile: that pick is skipped, the others land.
+		const live = structuredClone(base);
+		live.svg_overlays!.splice(1, 1);
+		const merge = mergeSubset(live, base, proposed, diff, ids);
+		expect(merge.skipped).toHaveLength(1);
+		expect(merge.skipped[0].why).toContain('animated title');
+		expect(merge.timeline.svg_overlays!.map((o) => o.id)).toEqual(['kept', 'added']);
+		expect(merge.timeline.svg_overlays![0].opacity).toBe(0.5);
+		expect(merge.timeline.overlays ?? []).toEqual([]);
+	});
+
+	test('picking everything reproduces the proposal', () => {
+		const base = cut();
+		const proposed = cut();
+		proposed.tracks[0].clips[0].source_out = 3;
+		proposed.tracks[0].clips[1].timeline_start = 3;
+		proposed.tracks[0].clips[1].volume = 0.4;
+		const diff = diffOf(
+			{ kind: 'clip_retrimmed', summary: 'Trimmed a', clip_id: 'a', track_id: 'v1', at: 0 },
+			{ kind: 'clip_moved', summary: 'Moved b', clip_id: 'b', track_id: 'v1', at: 3 },
+			changed('b')
+		);
+		const merge = mergeSubset(base, base, proposed, diff, diff.entries.map(entryId));
+		expect(merge.applied).toHaveLength(3);
+		expect(merge.skipped).toEqual([]);
+		expect(merge.timeline).toEqual(proposed);
 	});
 
 	test('picking a removed track drops it only after its clips moved off', () => {

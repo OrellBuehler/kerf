@@ -28,7 +28,10 @@
   `split_remove` being a group of one. All of them refuse a locked track.
   **Two counters tell the app that the project under a job is not the one it left.**
   `generation()` moves when `replace_with` swaps a project in (open / new): a job notes it
-  when it resolves its inputs under the lock and drops its result if it changed. `change_count()`
+  when it resolves its inputs under the lock and drops its result if it changed. **`replace_with_saved_copy`
+  is the one swap that does not move it** — Save As reopens the copy it wrote, which is the same project in
+  another file, so jobs in flight (analysis, import, voiceover, proxies) still land; the change count carries on
+  across it too. Only that swap may use it. `change_count()`
   is SQLite's `total_changes` — every row written through the connection (analysis merges,
   ripple mode, meta, a declined proxy …), so "did anything write while the lock was released?"
   is two numbers, not a content fingerprint. It is **monotonic across `replace_with`** (the swapped-in
@@ -163,7 +166,9 @@
   for an agent holding staged edits rather than walking the ground out from under
   them. The queue ties in at both ends: `claim_next_task` opens a staging session
   for the task, `resolve_task` applies it (accepting the task *is* accepting its
-  edits) and `remove_task` discards it. `diff_revisions` / `revision_diff` point
+  edits) and `remove_task` discards it — **the proposal first, in one transaction with the delete**: an agent
+  that does not own the proposal is refused `StagedEditOwnedByOther` with the task still in the queue (it used
+  to delete the row and then fail). `diff_revisions` / `revision_diff` point
   the same diff at the stored history snapshots, so the edit log can say what an
   edit did rather than only which operation ran.
   **Review is the default (`set_agent_review`, on; the app sets it from Settings, it is not in the
@@ -184,7 +189,12 @@
   edit then failed. Apply, discard and undo
   by a non-owner agent are refused the same way (the tool that only ends a proposal calls
   `declare_agent(owner)`, which records the session without opening anything); the user (GUI)
-  is never refused.
+  is never refused. **A proposal whose session is gone is released**: `release_orphaned_staging(gone)` clears the
+  owner when the adapter says the owning MCP session no longer exists (closed, expired, or the server restarted
+  with a new token), so the agent that reconnected — or the next named session to edit — adopts it instead of
+  being told another agent owns it; with no owner left, the ordinary adoption rule applies and the steps are kept.
+  `set_ripple_mode` as an agent is refused while review is on (the flag is the user's toolbar setting and applies
+  at once, to a proposal in progress too): the edit's `ripple` argument is how an agent ripples for one call.
   `claim_next_task(owner)` / `begin_staging(task, note, owner)` open a session for a given owner.
   **Asset-level agent writes are staged too**: `set_asset_projection` as the agent records a
   `StagedAssetChange` in the proposal (the `staged.assets` column) instead of rewriting the
@@ -209,7 +219,8 @@
   survives a restart); `discarded_staged()` previews it and `restore_discarded()` brings it
   back — only with no proposal open (`StagedEditPending`), once, possibly `stale`, with no undo
   history, owned by no session when the user restores it, with its task dropped if that was
-  dismissed. An empty proposal is not kept and does not replace one that is. The `staged` table
+  dismissed. **Who discarded it is kept** (`discarded_by_user` in the stored row): an agent may bring back
+  only a proposal an agent discarded — one the user threw away stays thrown away unless the user restores it. An empty proposal is not kept and does not replace one that is. The `staged` table
   gained `owner` and `assets` (added by `init`'s probe-and-`ALTER`, like `voiceover`; an older
   file's open proposal loads with no owner and no asset changes).
   `plan_music_fit(clip, target)` / `fit_music(clip, target, fade_out)` fit a music clip on

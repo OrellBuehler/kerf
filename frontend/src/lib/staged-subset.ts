@@ -11,11 +11,14 @@
  *    removes — those are *auto-included* and reported;
  *  - a pick that would put two clips on top of each other is refused with where, because the changes
  *    that make room are a different entry the reviewer did not pick;
+ *  - a pick that would leave linked clips out of step with each other (the sync guard,
+ *    `Timeline::first_sync_break`) is refused, because the change that keeps them together is one the
+ *    reviewer did not pick;
  *  - a pick whose target the user has since changed is *skipped* and listed, not fatal.
  *
  * Pure. The harness' diff entries carry the ids core would give them (`entryId`). */
 
-import { dissolveAllOrphans, locateIndex } from './link-groups';
+import { dissolveAllOrphans, firstSyncBreak, hasLinks, locateIndex } from './link-groups';
 import { formatTime } from './diff';
 import { clipDuration } from './types';
 import type { AutoIncluded, Clip, DiffEntry, SkippedChange, Timeline, TimelineDiff } from './types';
@@ -308,6 +311,13 @@ export function mergeSubset(live: Timeline, base: Timeline, proposed: Timeline, 
 
 	dissolveAllOrphans(out);
 	checkLanes(out, live, touched);
+	if (hasLinks(out)) {
+		const broke = firstSyncBreak(out, live);
+		if (broke)
+			throw invalid(
+				`applying only those changes would pull the linked clips on ${broke[0]} and ${broke[1]} out of step — pick the changes to both, or apply the whole proposal`
+			);
+	}
 
 	return {
 		timeline: out,

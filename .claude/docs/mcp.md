@@ -9,7 +9,14 @@ with its own `#[tool_router(router = …)]` impl — `router()` adds them togeth
 **Connecting and auth** (`mcp/server.rs`, settings `mcp_enabled` / `mcp_addr` / `mcp_require_token` / `mcp_token`,
 `mcp_commands.rs` for the GUI). Every request needs `Authorization: Bearer <token>` (`mcp_require_token`, on by default;
 the token is 32 random bytes in hex, made on the first start and kept in the settings file, compared in constant time by an
-axum middleware that reads the *live* token — regenerating it applies to the next request). rmcp's
+axum middleware that reads the *live* token). **A different token (or `mcp_require_token` switched) restarts the
+listener** (`needs_restart`): every session opened under the old credentials ends with it, so a session id from before
+no longer answers (404, and the old token 401s) — revoking a token is immediate, not "the next request"; the clients
+that hold the new token initialize again. A refused request is logged at most once every ten seconds with how many were
+left out. The token never reaches a log line (`McpConfig`, `Auth` and `Settings` print `<redacted>`), `generate_token` retries the OS
+and returns an error rather than falling back to something guessable (or panicking), a token that could not be saved is kept
+for the run and reported as `token_problem` in `mcp_connection_info` (and one that could not be made keeps the server off
+while a token is required, saying so as its `error`). rmcp's
 `.enforce_origin_validation()` with an empty allow-list refuses any request that carries an `Origin` (native clients send
 none; a web page must not drive the editor through the loopback port), and rmcp validates the inbound **`Host`** against
 `allowed_hosts` (loopback plus whatever the bind address names; a wildcard bind yields an empty list = allow any). A bind
@@ -71,8 +78,8 @@ once at launch, and `project-changed` would re-fetch the timeline, history and
 task queue, none of which moved. `set_ripple_mode` is the same shape (it emits
 `ripple-mode-changed`, not `project-changed`: a flag, not an edit). **Ripple over
 MCP**: `get_ripple_mode` / `set_ripple_mode` read and write the project flag
-(the tool description warns that the latter flips the *user's* toolbar setting —
-a call that wants one different answer passes `ripple` instead), `move_clips`
+(the latter flips the *user's* toolbar setting, so the core refuses it for an agent while
+review is on — a call that wants one different answer passes `ripple` instead), `move_clips`
 (`moves: [{clip_id, timeline_start, track_id?}]`, ids parsed by `clip_moves`) and
 `remove_clips` (`clip_ids`, answering `{removed, ripple_active, rippled,
 clips_shifted}` — `rippled` is *measured* (`Timeline::clips_moved_since`, the clips
@@ -284,9 +291,22 @@ Agent edits **stage** (`core-project.md`). The adapter's part:
   `undo_staged_edit` (the last step of the proposal, up to 20), `discard_staged_edits` and `restore_discarded_edits` (the
   last discarded proposal, once) work on the agent's own proposal at any time. `get_settings` shows `agent_review`;
   `set_settings` cannot change it.
+- **A proposal outlives its session.** `note_session` records every session id that made a call (`server::note_session_seen`);
+  `lock_agent` asks `Project::release_orphaned_staging` whether the proposal's owner is a session that was seen and is
+  no longer on any listener (closed, expired, or gone with a restart — a new token ends them all), and clears the owner if
+  so, so the agent that reconnected, or the next to edit, adopts its own old proposal with its steps instead of being told
+  another agent owns it. An id never seen is treated as alive: ownership is let go of only on evidence.
+- **What the user alone does.** `discard_unsaved` on `open_project` / `new_project` is refused while review is on (the
+  user confirms throwing unsaved work away, in Kerf's window); `save_project_as` will not replace an existing file while
+  review is on, whatever `overwrite` says, and every export-family tool and Save As is held off Kerf's own settings and logs
+  (`crate::check_output`, beside the project's sources and proxies); `set_ripple_mode` is refused (the `ripple` argument
+  on an edit is the per-call way); `restore_discarded_edits` brings back only what an agent discarded, never what the
+  user did; `remove_task` by a session that does not own the task's proposal leaves the task in the queue.
 - **Results are summaries.** `apply_staged_edits`, `discard_staged_edits`, `undo`, `redo`, `revert_to`, `smart_crop`,
   `fit_music` and `snap_to_beats` answer `reads::timeline_brief` (durations, clip counts per track) instead of the whole
-  timeline; `staged_diff` has the entries (each with an `id`, the key `apply_staged_subset` takes).
+  timeline; `staged_diff` has the entries (each with an `id`, the key `apply_staged_subset` takes). The tools that
+  set a track's switches answer `reads::track_brief` (the track without its clips, with a `clip_count`),
+  `set_delivery_format` the format and a `timeline_brief`, `remove_task` the id and how many tasks remain.
 
 ## Background jobs (`mcp/jobs.rs`)
 
@@ -296,38 +316,51 @@ Agent edits **stage** (`core-project.md`). The adapter's part:
 a foreground call builds it from the request (`foreground`: the `ct` cancellation token and the `progressToken`, with a relay
 task that keeps progress monotonic), a background one from its record in `Jobs` (bounded: 8 running, 48 records, a finished
 job forgotten after an hour). `KerfMcp::long_tool` does the branching, so **argument validation stays in the tool body,
-before it** — a bad path or id is an error on the call, not a job that fails later. `analyze_asset` also stops on the GUI's
-Stop (`AppState.analysis_cancel`, `Run::also_cancelled_by`) and forwards the GUI's `analysis-progress` events for its asset
+before it** — a bad path or id is an error on the call, not a job that fails later. The GUI's Stop reaches the agent's run
+of the same job: `analyze_asset`, `import_asset`, `download_speech_model` and `export_cover` poll the `StopEpoch` the GUI's own
+button trips (`Run::also_cancelled_by(begin_analysis() / begin_import() / begin_model_download() / begin_cover_export())`;
+a Stop pressed before a run began does not end it, and a run begun after is not wiped by one), and the voiceover, stems,
+smart-crop and framing jobs stop when the project is replaced (`stop_or_replaced`). `analyze_asset` also forwards the GUI's `analysis-progress` events for its asset
 to the client (`AnalysisProgressRelay`); `download_speech_model` emits `model-progress` like the GUI's own download.
 Every job that resolves inputs under the lock notes `Project::generation()` and refuses to land its result in a project
-opened since (`require_generation`).
+opened since (`require_generation`) — a Save As does not count as one (`replace_with_saved_copy` keeps it). The reads
+that decode (`get_waveform`, `get_waveform_range`, `get_energy`, `skim_asset`, `preview_timeline`, `get_frame`) take the
+request's cancellation token, so a dropped request kills its ffmpeg; `export_cover` reports `reading the cut` →
+`rendering the cover frame` → `cover written` on the `progressToken`.
 
 ## Small answers, paged reads (`mcp/reads.rs`)
 
-`list_assets` lists each asset with `source_missing` (stat, outside the lock), `proxy` (`ProxyBrief`: state, fraction, ETA,
+`list_assets` pages (`offset` / `limit`, 100 by default, at most 500; `{total, offset, returned, next_offset, assets}`, and
+only the assets of the page are looked at on the disk) and lists each asset with `source_missing` (stat, outside the lock), `proxy` (`ProxyBrief`: state, fraction, ETA,
 reason) and per-kind `analysis` states; `get_asset_metadata` and `analyze_asset` answer an `AnalysisSummary` (counts, totals,
 the first ~600 characters of the transcript); `get_transcript` and `get_analysis_detail` page the lists (`offset` / `limit`,
 `next_offset`, windows in source seconds); `get_timeline_state` moves the *generated* captions into a `captions` window
-(`captions_offset` / `captions_limit`; `full: true` for everything); `history` and `list_tasks` take `offset` / `limit` and
-answer `{total, next_offset, …}`; `generate_captions` answers a count, the first few overlays and the first hundred ids.
+(`captions_offset` / `captions_limit`; `full: true` for everything) and, past 200 clips, windows the clips too
+(`clips_offset` / `clips_limit`, a `clips_window` object with `next_offset`); `staged_diff` and `revision_diff` answer the
+diff's numbers and headline with `entries` paged (`offset` / `limit`, 100 by default); `history` and `list_tasks` take
+`offset` / `limit` and answer `{total, next_offset, …}`; `missing_assets` lists the assets whose source file is gone (read-only:
+relinking and removing media are the user's); `generate_captions` answers a count, the first few overlays and the first hundred ids.
 `timeline_summary` carries `media_notes` (the media a cut uses whose proxy is not ready or whose file is gone) and
 `clips_without_proxy` per track.
 
 ## Project and settings tools (`mcp/project_tools.rs`)
 
-`project_info`, `save_project`, `save_project_as` (absolute `.kerf`, `overwrite`, reopen guarded by `change_count`),
-`open_project`, `new_project`: replacing a project that exists only in memory needs `discard_unsaved`; a swap emits
+`project_info`, `save_project`, `save_project_as` (absolute `.kerf`, `overwrite`, reopen guarded by `change_count` and
+`require_generation`; the swap keeps the generation, so jobs in flight still land), `open_project`, `new_project`
+(all three record the open project for the recent list / "reopen last project", as the GUI does):
+replacing a project that exists only in memory needs `discard_unsaved`, which review forbids (above); a swap emits
 `project-replaced` (the page reloads like after its own open) and does what the GUI's open does (`restore_speech_model`,
 `respawn_proxies`, scrub cache). `get_settings` / `set_settings` are an allow-list (`READABLE` / `WRITABLE`): auto_analysis,
 cpu_percent, proxy_size, preview_source, time_display, plus `agent_review` read-only — never the theme, layout, workspaces,
-shortcuts, token, address or review switch.
+shortcuts, token, address or review switch. `set_settings` emits `settings-changed` with the full `SettingsView` as its
+payload, which the page applies.
 
 ## Tool index
 
 Every tool, by purpose (a test pins that this list names each registered tool):
 
 - **Project and library**: `project_info`, `save_project`, `save_project_as`, `open_project`, `new_project`, `list_assets`,
-  `get_asset_metadata`, `import_asset`, `set_asset_projection`, `list_fonts`.
+  `missing_assets`, `get_asset_metadata`, `import_asset`, `set_asset_projection`, `list_fonts`.
 - **Analysis and proxies**: `analyze_asset`, `analysis_status`, `get_transcript`, `get_analysis_detail`,
   `transcription_status`, `download_speech_model`, `set_speech_model`, `proxy_status`, `rebuild_proxy`, `delete_proxy`,
   `get_music_structure`.

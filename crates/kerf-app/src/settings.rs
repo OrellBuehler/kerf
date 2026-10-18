@@ -37,7 +37,7 @@ pub enum TimeDisplay {
 /// The longest the recent-projects list grows.
 pub const RECENT_MAX: usize = 10;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Share of the machine one heavy job (analysis, transcription, proxy,
@@ -75,6 +75,10 @@ pub struct Settings {
     /// [`RECENT_MAX`]. Maintained by the app (`record_recent`, `recent`,
     /// `clear_recent`); a settings patch cannot write it.
     pub recent_projects: Vec<String>,
+    /// The project that was open when Kerf last had one: set when a project is opened, created
+    /// or saved to a file, cleared when a fresh unsaved one takes its place. What
+    /// `reopen_last_project` opens. App-maintained like `recent_projects`; a patch cannot write it.
+    pub last_open_project: Option<String>,
     /// The workspace arrangement (dockview's serialized layout). Opaque here:
     /// the frontend validates it and falls back to its default layout.
     pub layout: Option<serde_json::Value>,
@@ -107,6 +111,23 @@ pub struct Settings {
     /// The bearer token. Generated on the first start and kept here.
     pub mcp_token: Option<String>,
     // ---- end agent / MCP server ----
+    /// What the file held that this build could not read into a field: a known setting whose value
+    /// is one a newer build wrote (an enum name it does not have, a number out of range), and keys
+    /// it does not know at all. Written back as they were until the user changes that setting, so
+    /// opening the file in an older build and saving something unrelated costs nothing.
+    #[serde(skip)]
+    pub(crate) kept: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The token is a secret: a `{:?}` of the settings shows everything else.
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut shown = serde_json::to_value(self).unwrap_or_default();
+        if let Some(token) = shown.get_mut("mcp_token").filter(|t| !t.is_null()) {
+            *token = serde_json::Value::String("<redacted>".to_string());
+        }
+        write!(f, "Settings({shown})")
+    }
 }
 
 impl Default for Settings {
@@ -122,6 +143,7 @@ impl Default for Settings {
             time_display: TimeDisplay::default(),
             reopen_last_project: false,
             recent_projects: Vec::new(),
+            last_open_project: None,
             layout: None,
             theme: None,
             workspaces: None,
@@ -131,6 +153,7 @@ impl Default for Settings {
             mcp_addr: None,
             mcp_require_token: true,
             mcp_token: None,
+            kept: serde_json::Map::new(),
         }
     }
 }
@@ -264,6 +287,31 @@ const KEYS: [&str; 17] = [
     "mcp_token",
 ];
 
+/// Every key of the settings file this build understands: the patchable ones, the two the app
+/// keeps itself, and the retired `transcribe`. Any other key is kept as found ([`Settings::kept`]).
+const STORED_KEYS: [&str; 20] = [
+    "cpu_percent",
+    "auto_analysis",
+    "proxy_size",
+    "preview_source",
+    "safe_areas",
+    "gpu_preview",
+    "time_display",
+    "reopen_last_project",
+    "layout",
+    "theme",
+    "workspaces",
+    "keybindings",
+    "agent_review",
+    "mcp_enabled",
+    "mcp_addr",
+    "mcp_require_token",
+    "mcp_token",
+    "recent_projects",
+    "last_open_project",
+    "transcribe",
+];
+
 fn path(app: &AppHandle) -> Option<PathBuf> {
     app.path().app_config_dir().ok().map(|dir| dir.join("settings.json"))
 }
@@ -329,6 +377,34 @@ fn load_from(file: &Path) -> Settings {
     }
 }
 
+const CORRUPT_PREFIX: &str = "settings.corrupt-";
+const RESET_PREFIX: &str = "settings.reset-";
+
+/// How many `settings.corrupt-*` and `settings.reset-*` copies are kept (each kind): enough to find
+/// the theme someone lost, few enough that a file that breaks on every launch cannot fill a disk.
+const BACKUPS_KEPT: usize = 5;
+
+/// Delete all but the newest [`BACKUPS_KEPT`] backups of one kind (`<prefix><unix-ms>.json`) beside
+/// `file`. Best effort: a backup that cannot be removed stays.
+fn prune_backups(file: &Path, prefix: &str) {
+    let Some(dir) = file.parent() else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut found: Vec<(u128, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let ms = name.strip_prefix(prefix)?.strip_suffix(".json")?.parse::<u128>().ok()?;
+            Some((ms, entry.path()))
+        })
+        .collect();
+    found.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    for (_, path) in found.into_iter().skip(BACKUPS_KEPT) {
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(error = %e, path = %path.display(), "could not remove an old settings backup");
+        }
+    }
+}
+
 /// Keep an unusable settings file as `settings.corrupt-<unix-ms>.json` beside itself.
 fn move_aside(file: &Path, why: &str) {
     let ms = std::time::SystemTime::now()
@@ -337,12 +413,15 @@ fn move_aside(file: &Path, why: &str) {
         .unwrap_or(0);
     let aside = sibling(file, &format!("settings.corrupt-{ms}.json"));
     match std::fs::rename(file, &aside) {
-        Ok(()) => tracing::warn!(
-            error = %why,
-            path = %file.display(),
-            kept_as = %aside.display(),
-            "unusable settings moved aside; using defaults"
-        ),
+        Ok(()) => {
+            tracing::warn!(
+                error = %why,
+                path = %file.display(),
+                kept_as = %aside.display(),
+                "unusable settings moved aside; using defaults"
+            );
+            prune_backups(file, CORRUPT_PREFIX);
+        }
         Err(re) => tracing::warn!(
             error = %why,
             rename_error = %re,
@@ -362,18 +441,28 @@ fn parse(raw: &str) -> Result<Settings, serde_json::Error> {
     let serde_json::Value::Object(file) = serde_json::from_str(raw)? else {
         return Err(serde_json::Error::custom("the settings file must hold a JSON object"));
     };
+    let mut understood = serde_json::Map::new();
     let mut kept = serde_json::Map::new();
     for (key, value) in file {
+        if !STORED_KEYS.contains(&key.as_str()) {
+            // A setting this build has never heard of: not a field of ours, but the file's.
+            kept.insert(key, value);
+            continue;
+        }
         let probe = serde_json::Map::from_iter([(key.clone(), value.clone())]);
         match serde_json::from_value::<Settings>(serde_json::Value::Object(probe)) {
             Ok(_) => {
+                understood.insert(key, value);
+            }
+            Err(e) => {
+                tracing::warn!(setting = %key, error = %e, "ignoring an invalid setting; its default is used and the stored value is kept");
                 kept.insert(key, value);
             }
-            Err(e) => tracing::warn!(setting = %key, error = %e, "ignoring an invalid setting; its default is used"),
         }
     }
-    let has_auto_analysis = kept.contains_key("auto_analysis");
-    let mut settings: Settings = serde_json::from_value(serde_json::Value::Object(kept))?;
+    let has_auto_analysis = understood.contains_key("auto_analysis");
+    let mut settings: Settings = serde_json::from_value(serde_json::Value::Object(understood))?;
+    settings.kept = kept;
     migrate(&mut settings, has_auto_analysis);
     keep_agent_door_sound(&mut settings);
     Ok(settings)
@@ -414,7 +503,14 @@ fn migrate(settings: &mut Settings, has_auto_analysis: bool) {
 }
 
 fn save_to(file: &Path, settings: &Settings) -> Result<(), String> {
-    let raw = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
+    let mut stored = serde_json::to_value(settings).map_err(|e| e.to_string())?;
+    if let Some(object) = stored.as_object_mut() {
+        // What this build could not read goes back as it was found, over the default it stood in as.
+        for (key, value) in &settings.kept {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+    let raw = serde_json::to_string_pretty(&stored).map_err(|e| e.to_string())?;
     write_atomic(file, raw.as_bytes()).map_err(|e| format!("could not write settings: {e}"))
 }
 
@@ -434,8 +530,13 @@ fn merge(settings: &Settings, patch: &serde_json::Value) -> Result<Settings, Str
     for (key, value) in patch {
         merged.insert(key.clone(), value.clone());
     }
-    let merged: Settings =
+    let mut merged: Settings =
         serde_json::from_value(serde_json::Value::Object(merged)).map_err(|e| format!("invalid settings: {e}"))?;
+    // A setting the patch writes replaces whatever unreadable value the file held for it.
+    merged.kept = settings.kept.clone();
+    for key in patch.keys() {
+        merged.kept.remove(key);
+    }
     // Only a patch that touches the agent's door is held to its rules: a stored file with an odd
     // address in it must not stop the theme from being saved.
     if patch.keys().any(|k| k.starts_with("mcp_")) {
@@ -505,6 +606,7 @@ fn update_file(file: &Path, patch: &serde_json::Value) -> Result<Settings, Strin
 fn reset_keep(current: &Settings) -> Settings {
     Settings {
         recent_projects: current.recent_projects.clone(),
+        last_open_project: current.last_open_project.clone(),
         // The agent's door is not a preference to put back: a reset must not change where the
         // server listens or lock out the clients that hold its token. (The review switch is a
         // preference, and goes back on.)
@@ -532,8 +634,9 @@ fn reset_file(file: &Path) -> Result<Settings, String> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        if let Err(e) = std::fs::copy(file, sibling(file, &format!("settings.reset-{ms}.json"))) {
-            tracing::warn!(error = %e, "could not keep a copy of the settings being reset");
+        match std::fs::copy(file, sibling(file, &format!("{RESET_PREFIX}{ms}.json"))) {
+            Ok(_) => prune_backups(file, RESET_PREFIX),
+            Err(e) => tracing::warn!(error = %e, "could not keep a copy of the settings being reset"),
         }
     }
     save_to(file, &fresh)?;
@@ -568,43 +671,85 @@ pub fn prune_recent(list: &mut Vec<String>, exists: impl Fn(&Path) -> bool) -> b
     list.len() != before
 }
 
-/// What a launch with nothing named on its command line should open: the newest recent
-/// project, when the setting is on and the file is still there.
+/// What a launch with nothing named on its command line should open: the project that was open
+/// last ([`Settings::last_open_project`]), when the setting is on and the file is still there. A
+/// session that ended on a project nobody had saved reopens nothing. `exists` stats the file: call
+/// this off the main thread.
 pub fn reopen_target(settings: &Settings, exists: impl Fn(&Path) -> bool) -> Option<String> {
     if !settings.reopen_last_project {
         return None;
     }
-    settings.recent_projects.iter().find(|p| exists(Path::new(p))).cloned()
+    settings.last_open_project.as_ref().filter(|p| exists(Path::new(p))).cloned()
+}
+
+/// Edit the stored settings under the file lock and write them back if `edit` says it changed them.
+fn edit_stored(app: &AppHandle, edit: impl FnOnce(&mut Settings) -> bool) -> Result<Settings, String> {
+    let file = path(app).ok_or("no config directory available for settings")?;
+    let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    edit_stored_file(&file, edit)
+}
+
+fn edit_stored_file(file: &Path, edit: impl FnOnce(&mut Settings) -> bool) -> Result<Settings, String> {
+    let mut stored = load_from(file);
+    if edit(&mut stored) {
+        save_to(file, &stored)?;
+    }
+    Ok(stored)
 }
 
 /// Edit the stored list under the file lock and write it back if `edit` says it changed.
 fn edit_recent(app: &AppHandle, edit: impl FnOnce(&mut Vec<String>) -> bool) -> Result<Vec<String>, String> {
-    let file = path(app).ok_or("no config directory available for settings")?;
-    let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    edit_recent_file(&file, edit)
+    edit_stored(app, |s| edit(&mut s.recent_projects)).map(|s| s.recent_projects)
 }
 
+#[cfg(test)]
 fn edit_recent_file(file: &Path, edit: impl FnOnce(&mut Vec<String>) -> bool) -> Result<Vec<String>, String> {
-    let mut stored = load_from(file);
-    if edit(&mut stored.recent_projects) {
-        save_to(file, &stored)?;
+    edit_stored_file(file, |s| edit(&mut s.recent_projects)).map(|s| s.recent_projects)
+}
+
+/// Note which project is open now: `Some(path)` is a project that was just opened, created on a
+/// file or saved to one (it goes to the front of the recent list and becomes the one a launch
+/// reopens); `None` is a fresh project with no file, which a launch has nothing to reopen. Touches
+/// the disk: call it off the main thread.
+pub fn record_open(app: &AppHandle, path: Option<&str>) -> Result<(), String> {
+    edit_stored(app, |s| apply_open(s, path)).map(|_| ())
+}
+
+/// [`record_open`] on settings in hand; whether anything changed.
+fn apply_open(settings: &mut Settings, path: Option<&str>) -> bool {
+    let before = (settings.last_open_project.clone(), settings.recent_projects.clone());
+    settings.last_open_project = path.map(str::to_string);
+    if let Some(path) = path {
+        push_recent(&mut settings.recent_projects, path);
     }
-    Ok(stored.recent_projects)
+    before != (settings.last_open_project.clone(), settings.recent_projects.clone())
 }
 
-/// Note that `path` was just opened or saved to. Touches the disk: call it off the
-/// main thread.
-pub fn record_recent(app: &AppHandle, path: &str) -> Result<Vec<String>, String> {
-    edit_recent(app, |list| {
-        push_recent(list, path);
-        true
-    })
-}
-
-/// The recent projects, the ones whose file is gone dropped (and forgotten). Stats the
-/// files: call it off the main thread.
+/// The recent projects, the ones whose file is gone dropped (and forgotten). Stats the files —
+/// with the settings lock **released**, since a share that went away can take long to say so and
+/// every other settings write would wait behind it — then takes the lock and forgets the ones
+/// that were gone. Call it off the main thread.
 pub fn recent(app: &AppHandle) -> Result<Vec<String>, String> {
-    edit_recent(app, |list| prune_recent(list, Path::is_file))
+    let file = path(app).ok_or("no config directory available for settings")?;
+    recent_in(&file, Path::is_file)
+}
+
+fn recent_in(file: &Path, exists: impl Fn(&Path) -> bool) -> Result<Vec<String>, String> {
+    let listed = {
+        let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        load_from(file).recent_projects
+    };
+    let gone = missing_of(&listed, exists);
+    let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    edit_stored_file(file, |s| {
+        prune_recent(&mut s.recent_projects, |p| !gone.iter().any(|g| Path::new(g) == p))
+    })
+    .map(|s| s.recent_projects)
+}
+
+/// The entries of `list` that `exists` denies.
+fn missing_of(list: &[String], exists: impl Fn(&Path) -> bool) -> Vec<String> {
+    list.iter().filter(|p| !exists(Path::new(p))).cloned().collect()
 }
 
 /// Forget every recent project.
@@ -961,8 +1106,9 @@ mod tests {
     fn every_stored_field_can_be_patched_and_nothing_else() {
         let stored = serde_json::to_value(Settings::default()).unwrap();
         for key in stored.as_object().unwrap().keys() {
-            // The recent-projects list is the app's own, kept as projects open and save.
-            if key == "recent_projects" {
+            // The recent-projects list and the last open project are the app's own, kept as
+            // projects open and save.
+            if key == "recent_projects" || key == "last_open_project" {
                 continue;
             }
             assert!(KEYS.contains(&key.as_str()), "`{key}` is a setting but cannot be patched");
@@ -1223,6 +1369,7 @@ mod tests {
         assert!(!prune_recent(&mut list, |_| true), "nothing to prune is no change");
 
         assert!(merge(&Settings::default(), &serde_json::json!({"recent_projects": []})).is_err());
+        assert!(merge(&Settings::default(), &serde_json::json!({"last_open_project": "/p/a.kerf"})).is_err());
     }
 
     #[test]
@@ -1262,20 +1409,205 @@ mod tests {
     #[test]
     fn reopening_the_last_project_needs_the_setting_and_a_file_that_is_still_there() {
         let mut s = Settings {
-            recent_projects: vec!["/p/gone.kerf".to_string(), "/p/b.kerf".to_string()],
+            recent_projects: vec!["/p/newer.kerf".to_string(), "/p/b.kerf".to_string()],
+            last_open_project: Some("/p/b.kerf".to_string()),
             ..Settings::default()
         };
-        let exists = |p: &Path| p.ends_with("b.kerf");
+        let exists = |p: &Path| p.ends_with("b.kerf") || p.ends_with("newer.kerf");
         assert_eq!(reopen_target(&s, exists), None, "off by default");
         s.reopen_last_project = true;
         assert_eq!(
             reopen_target(&s, exists).as_deref(),
             Some("/p/b.kerf"),
-            "the newest one that exists"
+            "the one that was open at the end, not the newest of the list"
         );
         assert_eq!(reopen_target(&s, |_| false), None);
-        s.recent_projects.clear();
-        assert_eq!(reopen_target(&s, exists), None);
+        s.last_open_project = None;
+        assert_eq!(
+            reopen_target(&s, exists),
+            None,
+            "a session that ended on an unsaved project reopens nothing"
+        );
+    }
+
+    #[test]
+    fn the_last_open_project_follows_open_new_and_save_as() {
+        let mut s = Settings::default();
+        assert!(apply_open(&mut s, Some("/p/a.kerf")));
+        assert_eq!(s.last_open_project.as_deref(), Some("/p/a.kerf"));
+        assert!(apply_open(&mut s, Some("/p/b.kerf")));
+        assert_eq!(s.recent_projects, ["/p/b.kerf", "/p/a.kerf"]);
+        assert!(!apply_open(&mut s, Some("/p/b.kerf")), "the same project again is no change");
+        // A fresh unsaved project is open now: there is nothing to reopen, the list stays.
+        assert!(apply_open(&mut s, None));
+        assert_eq!(s.last_open_project, None);
+        assert_eq!(s.recent_projects, ["/p/b.kerf", "/p/a.kerf"]);
+        assert!(!apply_open(&mut s, None));
+    }
+
+    #[test]
+    fn the_last_open_project_is_written_beside_the_rest_and_read_back() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        let stored = edit_stored_file(&file, |s| apply_open(s, Some("/p/a.kerf"))).unwrap();
+        assert_eq!(stored.last_open_project.as_deref(), Some("/p/a.kerf"));
+        assert_eq!(load_from(&file).last_open_project.as_deref(), Some("/p/a.kerf"));
+        edit_stored_file(&file, |s| apply_open(s, None)).unwrap();
+        assert_eq!(load_from(&file).last_open_project, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_recent_list_is_checked_against_the_disk_with_the_settings_lock_free() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        let (here, gone) = (dir.join("here.kerf"), dir.join("gone.kerf"));
+        std::fs::write(&here, "x").unwrap();
+        edit_recent_file(&file, |l| {
+            push_recent(l, &gone.to_string_lossy());
+            push_recent(l, &here.to_string_lossy());
+            true
+        })
+        .unwrap();
+        let kept = recent_in(&file, |p| {
+            // A stat that is slow (a share that went away) must not hold up other settings writes.
+            let free = FILE_LOCK.try_lock().is_ok();
+            assert!(free, "the settings lock was held while a file was stat-ed");
+            p.is_file()
+        })
+        .unwrap();
+        assert_eq!(kept, [here.to_string_lossy().to_string()]);
+        assert_eq!(
+            load_from(&file).recent_projects,
+            kept,
+            "the vanished one is forgotten on disk too"
+        );
+
+        // A project opened while the stats were running is not lost to the rewrite.
+        edit_recent_file(&file, |l| {
+            push_recent(l, &gone.to_string_lossy());
+            true
+        })
+        .unwrap();
+        let racing = dir.join("racing.kerf");
+        let after = recent_in(&file, |p| {
+            if p.ends_with("gone.kerf") {
+                edit_stored_file(&file, |s| {
+                    push_recent(&mut s.recent_projects, &racing.to_string_lossy());
+                    true
+                })
+                .unwrap();
+            }
+            p.is_file()
+        })
+        .unwrap();
+        assert!(after.contains(&racing.to_string_lossy().to_string()), "{after:?}");
+        assert!(!after.contains(&gone.to_string_lossy().to_string()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_setting_a_newer_build_wrote_survives_a_save_of_something_else() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        std::fs::write(
+            &file,
+            r#"{"time_display": "frames", "proxy_size": "huge", "from_a_newer_build": {"a": [1, 2]}, "theme": {"name": "Mine"}}"#,
+        )
+        .unwrap();
+        let loaded = load_from(&file);
+        assert_eq!(loaded.time_display, TimeDisplay::Timecode, "the default is what runs");
+        assert_eq!(loaded.theme, Some(serde_json::json!({"name": "Mine"})));
+
+        // Something unrelated is saved: the unreadable values are still in the file as they were.
+        update_file(&file, &serde_json::json!({"safe_areas": true})).unwrap();
+        let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(on_disk["time_display"], "frames");
+        assert_eq!(on_disk["proxy_size"], "huge");
+        assert_eq!(on_disk["from_a_newer_build"], serde_json::json!({"a": [1, 2]}));
+        assert_eq!(on_disk["safe_areas"], true);
+        assert_eq!(on_disk["theme"]["name"], "Mine");
+
+        // The recent list is edited the same way, through the same save.
+        edit_recent_file(&file, |l| {
+            push_recent(l, "/p/a.kerf");
+            true
+        })
+        .unwrap();
+        let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(on_disk["time_display"], "frames");
+
+        // Changing the setting itself replaces the value the file held.
+        update_file(&file, &serde_json::json!({"time_display": "seconds"})).unwrap();
+        let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(on_disk["time_display"], "seconds");
+        assert_eq!(on_disk["proxy_size"], "huge", "the other one is untouched");
+        assert_eq!(load_from(&file).time_display, TimeDisplay::Seconds);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_the_newest_backups_of_each_kind_are_kept() {
+        let dir = scratch();
+        let file = dir.join("settings.json");
+        for ms in 100..112u32 {
+            std::fs::write(dir.join(format!("settings.corrupt-{ms}.json")), "x").unwrap();
+            std::fs::write(dir.join(format!("settings.reset-{ms}.json")), "x").unwrap();
+        }
+        std::fs::write(dir.join("settings.corrupt-notanumber.json"), "x").unwrap();
+        std::fs::write(&file, "{ not json").unwrap();
+        let _ = load_from(&file);
+
+        let names = |prefix: &str| -> Vec<String> {
+            let mut found: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with(prefix))
+                .collect();
+            found.sort();
+            found
+        };
+        // The new one (named after now) plus the newest four of the old ones.
+        let corrupt = names("settings.corrupt-");
+        assert_eq!(
+            corrupt.iter().filter(|n| n.ends_with("notanumber.json")).count(),
+            1,
+            "a file that is not one of ours is left alone: {corrupt:?}"
+        );
+        assert_eq!(corrupt.len(), BACKUPS_KEPT + 1, "{corrupt:?}");
+        assert!(corrupt.iter().all(|n| n.ends_with("notanumber.json") || !n.contains("-100.")));
+        assert_eq!(
+            names("settings.reset-").len(),
+            12,
+            "a corrupt file does not touch the reset copies"
+        );
+
+        std::fs::write(&file, "{}").unwrap();
+        reset_file(&file).unwrap();
+        assert_eq!(names("settings.reset-").len(), BACKUPS_KEPT, "{:?}", names("settings.reset-"));
+        assert!(
+            names("settings.reset-")
+                .iter()
+                .all(|n| !n.contains("-100.") && !n.contains("-106.")),
+            "the oldest went"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_token_does_not_appear_in_a_debug_print() {
+        let token = "s3cr3t".repeat(8);
+        let s = Settings {
+            mcp_token: Some(token.clone()),
+            ..Settings::default()
+        };
+        let shown = format!("{s:?}");
+        assert!(!shown.contains(&token), "{shown}");
+        assert!(shown.contains("<redacted>") && shown.contains("cpu_percent"), "{shown}");
+        assert!(
+            !format!("{:?}", Settings::default()).contains("<redacted>"),
+            "no token, nothing to hide"
+        );
     }
 
     #[test]

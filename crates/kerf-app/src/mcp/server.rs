@@ -34,12 +34,24 @@ pub const ENV_ADDR: &str = "KERF_MCP_ADDR";
 pub const MIN_TOKEN_LEN: usize = 32;
 
 /// What the server runs on, from the stored settings and the environment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct McpConfig {
     pub enabled: bool,
     pub addr: String,
     pub require_token: bool,
     pub token: Option<String>,
+}
+
+/// A token is a secret: it never reaches a log line through a `{:?}`.
+impl std::fmt::Debug for McpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpConfig")
+            .field("enabled", &self.enabled)
+            .field("addr", &self.addr)
+            .field("require_token", &self.require_token)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl McpConfig {
@@ -65,7 +77,7 @@ impl McpConfig {
             enabled: settings.mcp_enabled,
             addr,
             require_token: settings.mcp_require_token,
-            token: settings.mcp_token.clone(),
+            token: settings.mcp_token.clone().or_else(run_token),
         }
     }
 }
@@ -152,17 +164,22 @@ pub fn allowed_hosts(addr: &str) -> Vec<String> {
 
 // ---- the token ---------------------------------------------------------------
 
-/// A fresh bearer token: 32 random bytes from the OS, in hex.
-pub fn generate_token() -> String {
+/// A fresh bearer token: 32 random bytes from the OS, in hex. The OS refusing to give randomness
+/// (tried three times) is an error and not a quiet fall back to something guessable — and not a
+/// panic either: `uuid` draws from the same source and would panic when it fails.
+pub fn generate_token() -> Result<String, String> {
     let mut bytes = [0u8; 32];
-    if getrandom::fill(&mut bytes).is_err() {
-        // The OS refusing to give randomness is not something to carry on from quietly with a
-        // predictable token; two v4 UUIDs draw from the same source and fail the same way, so
-        // this is only a last resort that keeps the app starting.
-        bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    let mut last = None;
+    for _ in 0..3 {
+        match getrandom::fill(&mut bytes) {
+            Ok(()) => return Ok(bytes.iter().map(|b| format!("{b:02x}")).collect()),
+            Err(e) => last = Some(e),
+        }
     }
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    Err(format!(
+        "the operating system gave no random bytes for the agent token{}",
+        last.map(|e| format!(": {e}")).unwrap_or_default()
+    ))
 }
 
 /// Whether `token` is a token the settings may store.
@@ -188,12 +205,21 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// What the middleware checks each request against; shared with the server so a new token
-/// reaches it without a restart.
-#[derive(Debug, Clone, Default)]
+/// What the middleware checks each request against; shared with the server and set again
+/// whenever the settings move (the server also restarts on a changed token, which ends every session).
+#[derive(Clone, Default)]
 pub struct Auth {
     pub require_token: bool,
     pub token: Option<String>,
+}
+
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Auth")
+            .field("require_token", &self.require_token)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl Auth {
@@ -232,7 +258,7 @@ async fn require_bearer(State(auth): State<Arc<RwLock<Auth>>>, request: Request,
         auth.permits(header)
     };
     if !permitted {
-        tracing::warn!(target: "mcp", "request refused: missing or wrong bearer token");
+        note_refused();
         let mut response = (
             StatusCode::UNAUTHORIZED,
             "Unauthorized: send `Authorization: Bearer <token>`. The token is in Kerf, Settings > Agent.",
@@ -244,6 +270,32 @@ async fn require_bearer(State(auth): State<Arc<RwLock<Auth>>>, request: Request,
         return response;
     }
     next.run(request).await
+}
+
+/// Refusals are logged at most once every [`REFUSED_LOG_EVERY`] seconds, with how many were left
+/// out: a client with a stale token retries in a loop, and a log line each would bury the rest.
+const REFUSED_LOG_EVERY: i64 = 10;
+
+fn note_refused() {
+    static LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = super::unix_now();
+    let last = LAST.load(std::sync::atomic::Ordering::Relaxed);
+    if now - last >= REFUSED_LOG_EVERY
+        && LAST
+            .compare_exchange(
+                last,
+                now,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    {
+        let skipped = SKIPPED.swap(0, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(target: "mcp", skipped, "request refused: missing or wrong bearer token");
+    } else {
+        SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 // ---- state the rest of the app reads ----------------------------------------
@@ -315,6 +367,9 @@ pub struct ConnectionInfo {
     pub url: String,
     pub require_token: bool,
     pub token: Option<String>,
+    /// The token could not be made or kept: what to tell the user ("this token works until Kerf
+    /// quits", "no token could be made, so the server stays off").
+    pub token_problem: Option<String>,
     pub running: bool,
     pub error: Option<String>,
     pub configured_addr: Option<String>,
@@ -374,6 +429,7 @@ pub fn connection_info(settings: &Settings) -> ConnectionInfo {
         url,
         require_token: config.require_token,
         token: config.token,
+        token_problem: token_problem(),
         running: state.running,
         error: state.error,
         configured_addr: settings.mcp_addr.clone(),
@@ -386,17 +442,48 @@ pub fn connection_info(settings: &Settings) -> ConnectionInfo {
 
 static CONTROL: OnceLock<tokio::sync::watch::Sender<McpConfig>> = OnceLock::new();
 
+/// A token that could not be written to the settings file, kept for this run so the server and
+/// what the Agent page shows agree (the page must not say "no token" while the server asks for
+/// one).
+static RUN_TOKEN: Mutex<Option<String>> = Mutex::new(None);
+
+/// What is wrong with the token, for the Agent page: it was not kept, or could not be made.
+static TOKEN_PROBLEM: Mutex<Option<String>> = Mutex::new(None);
+
+fn run_token() -> Option<String> {
+    RUN_TOKEN.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn token_problem() -> Option<String> {
+    TOKEN_PROBLEM.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn set_token_problem(problem: Option<String>) {
+    *TOKEN_PROBLEM.lock().unwrap_or_else(|e| e.into_inner()) = problem;
+}
+
 /// Fill in a token if there is none (the first start), persisting it, and return the settings as
-/// they stand.
+/// they stand. A token that cannot be made leaves none (the server then refuses to start while one
+/// is required); one that cannot be saved is kept for this run and the problem is reported.
 fn with_token(app: &AppHandle, mut settings: Settings) -> Settings {
-    if settings.mcp_token.is_none() {
-        let token = generate_token();
-        match crate::settings::update(app, &serde_json::json!({ "mcp_token": token })) {
+    if settings.mcp_token.is_some() {
+        return settings;
+    }
+    match generate_token() {
+        Ok(token) => match crate::settings::update(app, &serde_json::json!({ "mcp_token": token })) {
             Ok(stored) => settings = stored,
             Err(e) => {
                 tracing::warn!(error = %e, "could not store the MCP token; using one for this run only");
+                set_token_problem(Some(format!(
+                    "The token could not be saved ({e}). It works until Kerf quits; the next start makes a new one."
+                )));
+                *RUN_TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(token.clone());
                 settings.mcp_token = Some(token);
             }
+        },
+        Err(e) => {
+            tracing::error!(error = %e, "could not make an MCP token");
+            set_token_problem(Some(format!("No token could be made: {e}.")));
         }
     }
     settings
@@ -436,7 +523,65 @@ pub fn settings_changed(settings: &Settings, patch: &serde_json::Value) {
     }
 }
 
+/// The session tables of the listeners that are up (there is one in the app; a test may start more).
+static SESSIONS: Mutex<Vec<Arc<LocalSessionManager>>> = Mutex::new(Vec::new());
+
+/// Whether a listener has ever come up in this process: before the first, no session can be judged gone.
+static EVER_LISTENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn register_sessions(sessions: &Arc<LocalSessionManager>) {
+    SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).push(sessions.clone());
+    EVER_LISTENED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn forget_sessions(sessions: &Arc<LocalSessionManager>) {
+    SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|s| !Arc::ptr_eq(s, sessions));
+}
+
+/// Session ids that have made a call, newest last (a bounded list): the ones whose absence from a
+/// listener means something. A proposal's owner is always one of these, so an id never seen — a test's,
+/// or a client that reached the project some other way — is never judged gone.
+static SEEN: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collections::VecDeque::new());
+const SEEN_MAX: usize = 64;
+
+/// Note that the session `id` made a call (it exists, and from here on its disappearance is evidence).
+pub fn note_session_seen(id: &str) {
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.iter().any(|s| s == id) {
+        seen.push_back(id.to_string());
+        if seen.len() > SEEN_MAX {
+            seen.pop_front();
+        }
+    }
+}
+
+/// Whether the session `id` is on a listener that is up. A table being written counts as present.
+fn session_exists(id: &str) -> bool {
+    if !EVER_LISTENED.load(std::sync::atomic::Ordering::SeqCst) {
+        return true;
+    }
+    SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|s| s.sessions.try_read().map(|table| table.contains_key(id)).unwrap_or(true))
+}
+
+/// Whether the MCP session `id` should be treated as still there. A session that made a call
+/// ([`note_session_seen`]) and is no longer on any listener — its connection closed, it expired, or
+/// the server restarted with a new token — is gone, and a proposal it owned is released
+/// ([`kerf_core::Project::release_orphaned_staging`]). Ownership is only ever let go of on that
+/// evidence: an id never seen, or asked about before a listener has come up, is alive.
+pub fn session_alive(id: &str) -> bool {
+    let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|s| s == id);
+    !seen || session_exists(id)
+}
+
 struct Running {
+    sessions: Arc<LocalSessionManager>,
     stop: CancellationToken,
     task: tauri::async_runtime::JoinHandle<std::io::Result<()>>,
 }
@@ -446,6 +591,8 @@ impl Running {
     /// seconds are cut.
     async fn stop(self) {
         self.stop.cancel();
+        // Every session of this listener ends with it.
+        forget_sessions(&self.sessions);
         let mut task = self.task;
         if tokio::time::timeout(std::time::Duration::from_secs(2), &mut task)
             .await
@@ -454,6 +601,19 @@ impl Running {
             task.abort();
         }
     }
+}
+
+/// Whether the listener has to be stopped and started again for `next` (it is up now if `running`).
+/// A new address or the server switched on or off does, and so does a different token or the
+/// requirement for one switched: the sessions opened under the old credentials end with the
+/// listener, and a session id from before no longer answers. A server that is not up retries on any
+/// change.
+fn needs_restart(config: &McpConfig, next: &McpConfig, running: bool) -> bool {
+    next.enabled != config.enabled
+        || next.addr != config.addr
+        || next.token != config.token
+        || next.require_token != config.require_token
+        || (next.enabled && !running)
 }
 
 async fn supervise<S, F>(factory: F, mut rx: tokio::sync::watch::Receiver<McpConfig>)
@@ -480,8 +640,8 @@ where
         } else {
             set_status(false, None, &config.addr);
         }
-        // A token (or the requirement for one) applies live; a new address, or the server being
-        // switched on or off, takes a restart. A server that is not up retries on any change.
+        // A new address, a new token (or the requirement for one) and the server being switched on
+        // or off all restart the listener. A server that is not up retries on any change.
         loop {
             if rx.changed().await.is_err() {
                 if let Some(up) = running {
@@ -491,7 +651,7 @@ where
             }
             let next = rx.borrow_and_update().clone();
             *auth.write().unwrap_or_else(|e| e.into_inner()) = Auth::of(&next);
-            let restart = next.enabled != config.enabled || next.addr != config.addr || (next.enabled && running.is_none());
+            let restart = needs_restart(&config, &next, running.is_some());
             config = next;
             if restart {
                 break;
@@ -521,16 +681,23 @@ where
         anyhow::bail!(why);
     }
     check_addr(&config.addr).map_err(anyhow::Error::msg)?;
+    if config.require_token && config.token.is_none() {
+        anyhow::bail!(
+            "there is no token to require, so the server stays off; turn the token requirement off or make a new token"
+        );
+    }
     let stop = CancellationToken::new();
+    let sessions = Arc::new(LocalSessionManager::default());
     let service = StreamableHttpService::new(
         move || Ok(factory()),
-        LocalSessionManager::default().into(),
+        sessions.clone(),
         http_config(&config.addr).with_cancellation_token(stop.child_token()),
     );
     let router = axum::Router::new()
         .nest_service("/mcp", service)
         .layer(middleware::from_fn_with_state(auth, require_bearer));
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
+    register_sessions(&sessions);
     tracing::info!(addr = %config.addr, token = config.require_token, "kerf MCP server listening on http://{}/mcp", config.addr);
     let shutdown = stop.clone();
     let task = tauri::async_runtime::spawn(async move {
@@ -538,7 +705,7 @@ where
             .with_graceful_shutdown(shutdown.cancelled_owned())
             .await
     });
-    Ok(Running { stop, task })
+    Ok(Running { sessions, stop, task })
 }
 
 #[cfg(test)]
@@ -651,7 +818,7 @@ mod tests {
 
     #[test]
     fn a_generated_token_is_long_random_hex() {
-        let (a, b) = (generate_token(), generate_token());
+        let (a, b) = (generate_token().unwrap(), generate_token().unwrap());
         assert_eq!(a.len(), 64);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
@@ -722,6 +889,11 @@ mod tests {
 
     /// One HTTP request over a plain socket, answering the status code.
     fn status_of(addr: std::net::SocketAddr, headers: &[(&str, &str)]) -> u16 {
+        try_status_of(addr, headers).unwrap_or_else(|| panic!("no answer from {addr}"))
+    }
+
+    /// [`status_of`] for a server that may be down (or restarting): `None` when nothing answers.
+    fn try_status_of(addr: std::net::SocketAddr, headers: &[(&str, &str)]) -> Option<u16> {
         use std::io::{Read, Write};
         let mut request = "POST /mcp HTTP/1.1\r\nContent-Length: 2\r\nConnection: close\r\n".to_string();
         if !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("host")) {
@@ -731,16 +903,12 @@ mod tests {
             request.push_str(&format!("{name}: {value}\r\n"));
         }
         request.push_str("\r\n{}");
-        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
+        let mut stream = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).ok()?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok()?;
+        stream.write_all(request.as_bytes()).ok()?;
         let mut response = String::new();
         let _ = stream.read_to_string(&mut response);
-        response
-            .split_whitespace()
-            .nth(1)
-            .and_then(|code| code.parse().ok())
-            .unwrap_or_else(|| panic!("no status in {response:?}"))
+        response.split_whitespace().nth(1).and_then(|code| code.parse().ok())
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -798,6 +966,102 @@ mod tests {
         // Switching the requirement off lets a bare request through.
         auth.write().unwrap().require_token = false;
         assert_eq!(ask(vec![]).await.unwrap(), 200);
+    }
+
+    #[test]
+    fn a_changed_token_or_requirement_restarts_the_listener_and_other_settings_do_not() {
+        let base = McpConfig {
+            require_token: true,
+            ..config_for("127.0.0.1:7777", &"a".repeat(40), true)
+        };
+        assert!(!needs_restart(&base, &base.clone(), true), "nothing moved");
+        let other_token = McpConfig {
+            token: Some("b".repeat(40)),
+            ..base.clone()
+        };
+        assert!(needs_restart(&base, &other_token, true), "a new token ends the old sessions");
+        let loose = McpConfig {
+            require_token: false,
+            ..base.clone()
+        };
+        assert!(needs_restart(&base, &loose, true));
+        assert!(needs_restart(&loose, &base, true));
+        let elsewhere = McpConfig {
+            addr: "127.0.0.1:7778".to_string(),
+            ..base.clone()
+        };
+        assert!(needs_restart(&base, &elsewhere, true));
+        let off = McpConfig {
+            enabled: false,
+            ..base.clone()
+        };
+        assert!(needs_restart(&base, &off, true));
+        assert!(!needs_restart(&off, &off.clone(), false), "off stays off");
+        assert!(needs_restart(&base, &base.clone(), false), "a server that is not up retries");
+    }
+
+    /// One request over a plain socket: the status and the headers (names lower-cased), read as
+    /// far as the end of the headers.
+    fn exchange(addr: std::net::SocketAddr, headers: &[(&str, &str)], body: &str) -> Option<(u16, Vec<(String, String)>)> {
+        use std::io::{Read, Write};
+        let mut request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        request.push_str(body);
+        let mut stream = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).ok()?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok()?;
+        stream.write_all(request.as_bytes()).ok()?;
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).ok()? == 0 {
+                break;
+            }
+            head.push(byte[0]);
+        }
+        let text = String::from_utf8_lossy(&head).into_owned();
+        let mut lines = text.lines();
+        let status = lines.next()?.split_whitespace().nth(1)?.parse().ok()?;
+        let headers = lines
+            .filter_map(|l| l.split_once(':'))
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+            .collect();
+        Some((status, headers))
+    }
+
+    const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
+    const INITIALIZED: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+
+    #[test]
+    fn a_token_never_reaches_a_debug_print() {
+        let token = "q".repeat(48);
+        let config = mcp_config_with(&token);
+        let shown = format!(
+            "{config:?} {:?}",
+            Auth {
+                require_token: true,
+                token: Some(token.clone()),
+            }
+        );
+        assert!(!shown.contains(&token), "{shown}");
+        assert!(shown.contains("<redacted>") && shown.contains("127.0.0.1:7777"), "{shown}");
+    }
+
+    fn mcp_config_with(token: &str) -> McpConfig {
+        McpConfig {
+            require_token: true,
+            ..config_for("127.0.0.1:7777", token, true)
+        }
+    }
+
+    #[test]
+    fn a_session_that_never_made_a_call_is_never_judged_gone() {
+        assert!(session_alive("an-id-nobody-has-used"), "no evidence it ever existed");
     }
 
     #[test]
@@ -910,9 +1174,17 @@ mod tests {
             "the token opens the door"
         );
 
-        // A new token: the next request sees it, and nothing restarted.
+        // A new token: the listener restarts (see `a_new_token_ends_the_sessions_opened_under_the_old_one`),
+        // and from then on only the new one gets in.
         tx.send_replace(config_for(&a, &"2".repeat(40), true));
-        until("the new token to apply", || ask(&a, Some(&"1".repeat(40)))() == 401).await;
+        let (old_token, new_token) = ("1".repeat(40), "2".repeat(40));
+        let (old_at, new_at) = (a.parse().unwrap(), a.parse().unwrap());
+        until("the new token to apply", || {
+            let new_in = try_status_of(new_at, &[("Authorization", &format!("Bearer {new_token}"))]);
+            let old_out = try_status_of(old_at, &[("Authorization", &format!("Bearer {old_token}"))]);
+            matches!(new_in, Some(code) if code != 401) && old_out == Some(401)
+        })
+        .await;
         assert_ne!(ask(&a, Some(&"2".repeat(40)))(), 401);
 
         // A new address: the old one stops, the new one starts.
@@ -944,6 +1216,102 @@ mod tests {
         drop(tx);
         task.await.unwrap();
         assert!(!listening(&b), "the server stops with its supervisor");
+    }
+
+    /// One MCP `initialize` over a plain socket: the session id the server hands out, if it lets us in.
+    async fn open_session(addr: std::net::SocketAddr, token: String) -> Option<String> {
+        tokio::task::spawn_blocking(move || {
+            let auth = format!("Bearer {token}");
+            let (status, headers) = exchange(addr, &[("Authorization", auth.as_str())], INITIALIZE)?;
+            (status == 200)
+                .then(|| headers.into_iter().find(|(k, _)| k == "mcp-session-id").map(|(_, v)| v))
+                .flatten()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A notification on an existing session: the status the server answers, `None` when it is down.
+    async fn ping_session(addr: std::net::SocketAddr, token: String, session: String) -> Option<u16> {
+        tokio::task::spawn_blocking(move || {
+            let auth = format!("Bearer {token}");
+            exchange(
+                addr,
+                &[("Authorization", auth.as_str()), ("Mcp-Session-Id", session.as_str())],
+                INITIALIZED,
+            )
+            .map(|r| r.0)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The real listener, the real middleware and a real session table: a session opened with one
+    /// token stops answering once the token is replaced — its id is gone with the listener, so a
+    /// client holding it has to start over with the new token — and the old token opens nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_token_ends_the_sessions_opened_under_the_old_one() {
+        let text = format!("127.0.0.1:{}", free_port());
+        let addr: std::net::SocketAddr = text.parse().unwrap();
+        let (old, new) = ("a".repeat(48), "b".repeat(48));
+        let (tx, rx) = tokio::sync::watch::channel(config_for(&text, &old, true));
+        let task = tokio::spawn(supervise(|| Nothing, rx));
+        until("the server to come up", || listening(&text)).await;
+
+        let session = open_session(addr, old.clone()).await.expect("the token opens a session");
+        note_session_seen(&session);
+        assert!(session_alive(&session), "a session of the listener that is up");
+        // This session opens a proposal; it owns it.
+        let shared = Mutex::new(Project::open_in_memory().unwrap());
+        {
+            let mine = super::super::lock_agent_edit(&shared, Some(&session)).expect("the first edit opens the proposal");
+            mine.add_overlay("Title".to_string(), 0.0, 2.0).unwrap();
+            assert_eq!(mine.staged().unwrap().unwrap().owner.as_deref(), Some(session.as_str()));
+        }
+        assert_eq!(ping_session(addr, old.clone(), session.clone()).await, Some(202));
+        assert_eq!(
+            ping_session(addr, new.clone(), session.clone()).await,
+            Some(401),
+            "wrong token"
+        );
+
+        // The token is replaced: the listener restarts, and the session it had is gone.
+        tx.send_replace(config_for(&text, &new, true));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while ping_session(addr, new.clone(), session.clone()).await != Some(404) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the old session still answers after the token changed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!session_alive(&session), "the restarted listener has no such session");
+        assert_eq!(
+            ping_session(addr, old.clone(), session.clone()).await,
+            Some(401),
+            "the old token is refused"
+        );
+        assert!(open_session(addr, old).await.is_none(), "and opens no new session");
+        let fresh = open_session(addr, new.clone()).await.expect("the new token opens one");
+        note_session_seen(&fresh);
+        assert!(session_alive(&fresh));
+        // The agent that reconnected is not told another agent owns its own proposal: the session
+        // that made it is gone, so the new one takes it over.
+        {
+            let again = super::super::lock_agent_edit(&shared, Some(&fresh)).expect("a gone session's proposal is released");
+            again.add_overlay("Another".to_string(), 3.0, 4.0).unwrap();
+            let staged = again.staged().unwrap().unwrap();
+            assert_eq!(staged.owner.as_deref(), Some(fresh.as_str()));
+            assert_eq!(staged.edits.len(), 2, "the earlier steps are still in it");
+        }
+        // A session still on the listener keeps its proposal against a stranger.
+        let stranger = open_session(addr, new.clone()).await.expect("another session");
+        note_session_seen(&stranger);
+        assert!(super::super::lock_agent_edit(&shared, Some(&stranger)).is_err());
+        assert_eq!(ping_session(addr, new, fresh).await, Some(202));
+
+        drop(tx);
+        task.await.unwrap();
     }
 
     /// A page in the user's browser must not be able to reach the editor; a native client, which

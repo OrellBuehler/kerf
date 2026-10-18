@@ -1035,6 +1035,83 @@ fn the_generation_moves_when_a_project_is_swapped_in_and_the_review_setting_stay
 }
 
 #[test]
+fn a_saved_copy_swapped_in_is_the_same_project_so_its_generation_stays() {
+    let dir = scratch("saved-copy");
+    let (mut shared, a) = av_project();
+    shared.set_agent_review(false);
+    let g = shared.generation();
+    let before = shared.change_count();
+    let copy = dir.join("copy.kerf");
+    shared.save_as(&copy).unwrap();
+    shared.replace_with_saved_copy(Project::open(&copy).unwrap());
+    assert_eq!(shared.generation(), g, "a job that noted it still lands");
+    assert!(shared.change_count() > before, "the change counter keeps going up");
+    assert!(!shared.agent_review(), "the app's setting stays");
+    assert_eq!(shared.path(), Some(copy.as_path()));
+    assert!(shared.get_asset(a.id).unwrap().is_some(), "the copy holds the asset");
+
+    // What an in-flight analysis applies to the swapped-in project lands.
+    shared.set_analysis(&silence_patch(a.id)).unwrap();
+    assert!(shared.get_analysis(a.id).unwrap().is_some());
+
+    // Any other project is another generation.
+    shared.replace_with(Project::open_in_memory().unwrap());
+    assert_eq!(shared.generation(), g + 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn an_agent_that_does_not_own_the_proposal_cannot_remove_the_task_it_belongs_to() {
+    let (mut p, _, c1, _) = cut();
+    let task = p.add_task("tighten").unwrap();
+    p.set_actor(EditSource::Agent);
+    p.declare_agent(Some("alpha"));
+    p.claim_next_task(Some("alpha")).unwrap();
+    p.set_volume(c1.id, 0.5).unwrap();
+
+    p.set_actor(EditSource::Agent);
+    p.declare_agent(Some("beta"));
+    assert!(matches!(p.remove_task(task.id), Err(Error::StagedEditOwnedByOther)));
+    assert!(p.get_task(task.id).unwrap().is_some(), "the refusal deleted nothing");
+    assert!(p.staged().unwrap().is_some());
+
+    p.set_actor(EditSource::Agent);
+    p.declare_agent(Some("alpha"));
+    p.remove_task(task.id).unwrap();
+    assert!(p.get_task(task.id).unwrap().is_none());
+    assert!(p.staged().unwrap().is_none());
+    assert!(matches!(p.remove_task(task.id), Err(Error::TaskNotFound(_))));
+}
+
+#[test]
+fn an_agent_cannot_bring_back_a_proposal_the_user_threw_away() {
+    let (mut p, _, c1, _) = cut();
+    p.set_actor(EditSource::Agent);
+    p.ensure_agent_staging(Some("alpha")).unwrap();
+    p.set_volume(c1.id, 0.5).unwrap();
+    p.set_actor(EditSource::User);
+    p.discard_staged().unwrap();
+
+    p.set_actor(EditSource::Agent);
+    p.declare_agent(Some("alpha"));
+    let err = p.restore_discarded().unwrap_err().to_string();
+    assert!(err.contains("only they can bring it back"), "{err}");
+    assert!(p.staged().unwrap().is_none());
+    p.set_actor(EditSource::User);
+    assert_eq!(p.restore_discarded().unwrap().edits, vec!["Set volume"], "the user can");
+
+    // An agent's own discard is its own to take back.
+    p.apply_staged(false).unwrap();
+    p.set_actor(EditSource::Agent);
+    p.ensure_agent_staging(Some("alpha")).unwrap();
+    p.set_volume(c1.id, 0.3).unwrap();
+    p.discard_staged().unwrap();
+    p.set_actor(EditSource::Agent);
+    p.declare_agent(Some("alpha"));
+    assert_eq!(p.restore_discarded().unwrap().edits, vec!["Set volume"]);
+}
+
+#[test]
 fn the_change_counter_moves_for_every_kind_of_write_and_for_no_read() {
     let (p, a) = av_project();
     let start = p.change_count();
@@ -2105,4 +2182,49 @@ fn relinking_real_media_keeps_analysis_only_for_the_same_recording() {
     std::fs::remove_file(&retake).unwrap();
     assert_eq!(p.missing_assets().unwrap().len(), 1);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn an_agent_may_not_flip_the_ripple_setting_while_review_is_on() {
+    let (mut p, _) = av_project();
+    p.set_actor(EditSource::Agent);
+    let err = p.set_ripple_mode(true).unwrap_err().to_string();
+    assert!(err.contains("`ripple`"), "{err}");
+    p.set_actor(EditSource::User);
+    assert!(!p.ripple_mode().unwrap(), "nothing changed");
+    p.set_ripple_mode(true).unwrap();
+    p.set_agent_review(false);
+    p.set_actor(EditSource::Agent);
+    p.set_ripple_mode(false).unwrap();
+    assert!(!p.ripple_mode().unwrap(), "with review off it is the agent's to flip");
+}
+
+#[test]
+fn a_proposal_whose_session_is_gone_is_released_and_taken_over_by_the_next_session() {
+    let (mut p, _, c1, _) = cut();
+    assert!(
+        !p.release_orphaned_staging(|_| true).unwrap(),
+        "nothing open, nothing to release"
+    );
+    p.set_actor(EditSource::Agent);
+    p.ensure_agent_staging(Some("alpha")).unwrap();
+    p.set_volume(c1.id, 0.5).unwrap();
+
+    // Alpha is still there: nothing changes, and a stranger is still turned away.
+    assert!(!p.release_orphaned_staging(|owner| owner == "someone else").unwrap());
+    p.set_actor(EditSource::Agent);
+    assert!(matches!(
+        p.ensure_agent_staging(Some("beta")),
+        Err(Error::StagedEditOwnedByOther)
+    ));
+
+    // Alpha's connection closed (a reconnect gets a new session id).
+    assert!(p.release_orphaned_staging(|owner| owner == "alpha").unwrap());
+    assert!(!p.staged().unwrap().unwrap().owned_by_agent);
+    p.set_actor(EditSource::Agent);
+    p.ensure_agent_staging(Some("beta")).unwrap();
+    p.set_volume(c1.id, 0.2).unwrap();
+    let taken = p.staged().unwrap().unwrap();
+    assert_eq!(taken.owner.as_deref(), Some("beta"), "the next named session adopted it");
+    assert_eq!(taken.edits.len(), 2, "its steps are all still there");
 }

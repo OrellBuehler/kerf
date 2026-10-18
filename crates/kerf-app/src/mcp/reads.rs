@@ -399,15 +399,28 @@ pub(super) struct MediaNotes {
     pub notes: Vec<MediaNote>,
 }
 
+/// Whether the user has proxies switched off (size 0) or previews always on the original: no proxy is
+/// wanted, so none being ready is not news.
+pub(super) fn proxies_switched_off() -> bool {
+    kerf_core::proxy::proxy_size() == kerf_core::ProxySize::Off
+        || kerf_core::proxy::preview_source_setting() == kerf_core::PreviewSource::Original
+}
+
 /// What of the media `timeline` uses has no ready proxy, or no source file: a note per asset and
 /// the clip count per track. Pure: `proxies` and `missing` are read off the disk by the caller.
+///
+/// With `proxies_off` (the user switched proxies off, or previews always use the original) a proxy
+/// that is `off` is the user's choice and not worth a note on every clip. (One they deleted by hand
+/// is `off` too, with proxies on: that asset is still noted.)
 pub(super) fn media_notes(
     timeline: &Timeline,
     assets: &[Asset],
     proxies: &HashMap<uuid::Uuid, ProxyStatus>,
     missing: &std::collections::HashSet<uuid::Uuid>,
+    proxies_off: bool,
 ) -> MediaNotes {
-    let unready = |id: &uuid::Uuid| proxies.get(id).is_some_and(|p| !proxy_is_settled(p.state));
+    let waiting = |p: &ProxyStatus| !(proxy_is_settled(p.state) || (proxies_off && p.state == ProxyPhase::Off));
+    let unready = |id: &uuid::Uuid| proxies.get(id).is_some_and(waiting);
     let per_track = timeline
         .tracks
         .iter()
@@ -421,7 +434,7 @@ pub(super) fn media_notes(
             .flat_map(|t| t.clips.iter())
             .filter(|c| c.asset_id == asset.id)
             .count();
-        let proxy = proxies.get(&asset.id).filter(|p| !proxy_is_settled(p.state));
+        let proxy = proxies.get(&asset.id).filter(|p| waiting(p));
         let source_missing = missing.contains(&asset.id);
         if clips > 0 && (proxy.is_some() || source_missing) {
             notes.push(MediaNote {
@@ -464,13 +477,50 @@ pub(super) fn caption_result(written: &[kerf_core::TextOverlay]) -> serde_json::
     })
 }
 
+/// A track as the tools that set one of its switches answer: the track's own fields (name, kind,
+/// fader, pan, mute, solo, lock, duck…) and how many clips are on it, not the clips themselves —
+/// `get_timeline_state` has those.
+pub(super) fn track_brief(track: &kerf_core::Track) -> serde_json::Value {
+    let mut value = serde_json::to_value(track).unwrap_or_default();
+    if let Some(map) = value.as_object_mut() {
+        map.remove("clips");
+        map.insert("clip_count".to_string(), serde_json::json!(track.clips.len()));
+    }
+    value
+}
+
+/// Changes per page of a diff when the caller does not say, and the most it may ask for.
+pub(super) const DEFAULT_DIFF_PAGE: usize = 100;
+pub(super) const MAX_DIFF_PAGE: usize = 500;
+
+/// A diff as the review tools answer it: the numbers and the headline always, the changes
+/// themselves a page at a time (`next_offset` in `entries` is the next).
+pub(super) fn diff_page(diff: &kerf_core::TimelineDiff, offset: Option<usize>, limit: Option<usize>) -> serde_json::Value {
+    let (offset, limit) = page_of(offset, limit, DEFAULT_DIFF_PAGE, MAX_DIFF_PAGE);
+    serde_json::json!({
+        "headline": diff.headline(),
+        "duration_before": diff.duration_before,
+        "duration_after": diff.duration_after,
+        "clips_before": diff.clips_before,
+        "clips_after": diff.clips_after,
+        "entries": paged(&diff.entries, offset, limit),
+    })
+}
+
 /// How `get_timeline_state` is asked to show a timeline.
 pub(super) struct StateView {
-    /// Every SVG source whole, and every caption inline.
+    /// Every SVG source whole, and every caption and clip inline.
     pub full: bool,
     pub captions_offset: Option<usize>,
     pub captions_limit: Option<usize>,
+    pub clips_offset: Option<usize>,
+    pub clips_limit: Option<usize>,
 }
+
+/// Clips `get_timeline_state` shows inline unless asked for more. An ordinary cut fits whole; it is
+/// a long edit with hundreds of clips that is windowed.
+pub(super) const DEFAULT_CLIP_WINDOW: usize = 200;
+const MAX_CLIP_WINDOW: usize = 1000;
 
 /// The timeline as `get_timeline_state` answers: SVG sources over the inline limit replaced by a
 /// note (`super::elide_large_svg`, applied by the caller), and the **generated captions** — often
@@ -481,6 +531,7 @@ pub(super) fn timeline_state(timeline: &Timeline, view: &StateView) -> Result<se
     if view.full {
         return Ok(value);
     }
+    window_clips(timeline, &mut value, view);
     let generated: Vec<serde_json::Value> = timeline
         .overlays
         .iter()
@@ -524,7 +575,58 @@ pub(super) fn timeline_state(timeline: &Timeline, view: &StateView) -> Result<se
     Ok(value)
 }
 
+/// Keep only a window of the cut's clips in `value` (the timeline as JSON) when it has more than
+/// fit: the window runs over the clips in track order, then start order, and `clips_window` says
+/// where it sits and how to move it. A cut that fits is left whole and gets no `clips_window`.
+fn window_clips(timeline: &Timeline, value: &mut serde_json::Value, view: &StateView) {
+    let total: usize = timeline.tracks.iter().map(|t| t.clips.len()).sum();
+    let (offset, limit) = page_of(view.clips_offset, view.clips_limit, DEFAULT_CLIP_WINDOW, MAX_CLIP_WINDOW);
+    if total <= limit && offset == 0 {
+        return;
+    }
+    let Some(tracks) = value.get_mut("tracks").and_then(|t| t.as_array_mut()) else {
+        return;
+    };
+    let (mut index, mut returned) = (0usize, 0usize);
+    for track in tracks.iter_mut() {
+        let Some(clips) = track.get_mut("clips").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        let kept: Vec<serde_json::Value> = std::mem::take(clips)
+            .into_iter()
+            .filter(|_| {
+                let inside = index >= offset && index < offset.saturating_add(limit);
+                index += 1;
+                returned += usize::from(inside);
+                inside
+            })
+            .collect();
+        *clips = kept;
+    }
+    let end = offset.saturating_add(returned);
+    if let Some(map) = value.as_object_mut() {
+        let mut window = serde_json::json!({
+            "total": total,
+            "offset": offset,
+            "returned": returned,
+            "note": "this cut has more clips than fit: the tracks list only the clips of this window, in track order. Pass clips_offset / clips_limit for another slice, or full=true for every clip (timeline_summary has the per-track counts and gaps)",
+        });
+        if end < total {
+            window["next_offset"] = serde_json::json!(end);
+        }
+        map.insert("clips_window".to_string(), window);
+    }
+}
+
 // ---- tools --------------------------------------------------------------------
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+pub(super) struct ListPageParams {
+    #[schemars(description = "Skip this many assets (default 0), to page on; `next_offset` in the answer is the next page")]
+    offset: Option<usize>,
+    #[schemars(description = "Most assets to return (default 100, at most 500)")]
+    limit: Option<usize>,
+}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub(super) struct AssetOnly {
@@ -590,7 +692,8 @@ fn check_window(from: Option<f64>, to: Option<f64>) -> Result<(), McpError> {
 #[tool_router(router = tool_router_reads, vis = "pub(super)")]
 impl KerfMcp {
     #[tool(
-        description = "List the media assets in the project. Each carries its probed streams, `source_missing` (the \
+        description = "List the media assets in the project, `limit` (default 100, at most 500) from `offset` — the answer has \
+                       `total`, `returned` and `next_offset` — under `assets`. Each carries its probed streams, `source_missing` (the \
                        file is gone from disk — set only when true), `proxy` (the preview proxy: `state` is ready, \
                        building with `fraction` and `eta_secs`, queued, missing, failed with a `reason`, off, or \
                        not_needed; until it is ready previews decode the original and are slower — export is not \
@@ -598,9 +701,13 @@ impl KerfMcp {
                        not_run, running, failed or off; `analysis_failed` says why). proxy_status and analysis_status \
                        give the same per asset in more detail; get_asset_metadata summarises what the analysis found."
     )]
-    async fn list_assets(&self) -> Result<String, McpError> {
+    async fn list_assets(&self, Parameters(page): Parameters<ListPageParams>) -> Result<String, McpError> {
+        let (offset, limit) = page_of(page.offset, page.limit, DEFAULT_PAGE, MAX_PAGE);
         let (project, owner) = (self.project.clone(), self.owner());
         let entries = blocking(move || {
+            // The transcription backend may need an ffmpeg start the first time it is asked: before
+            // the lock, never inside it.
+            crate::warm_transcription_backend();
             // Everything that is the project's, under the lock; the disk (the proxies' cached
             // ffprobe, a stat per source) with it released.
             let (inputs, statuses) = {
@@ -610,21 +717,55 @@ impl KerfMcp {
                     project.analysis_statuses().map_err(core_err)?,
                 )
             };
-            let proxies: HashMap<_, _> = kerf_core::proxy::statuses(&inputs)
+            // Only the assets of this page are looked at on the disk (a proxy's state is a cached
+            // ffprobe, `source_missing` a stat, each): the listing of a library of thousands stays cheap.
+            let total = inputs.len();
+            let window: Vec<_> = inputs.into_iter().skip(offset).take(limit).collect();
+            let proxies: HashMap<_, _> = kerf_core::proxy::statuses(&window)
                 .into_iter()
                 .map(|s| (s.asset_id, s))
                 .collect();
             let statuses: HashMap<_, _> = statuses.into_iter().map(|s| (s.asset_id, s)).collect();
-            Ok(inputs
+            let items = window
                 .iter()
                 .filter_map(|input| {
                     let id = input.asset.id;
                     Some(AssetEntry::new(&input.asset, proxies.get(&id)?, statuses.get(&id)?))
                 })
-                .collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            Ok((total, items))
         })
         .await?;
-        json(&entries)
+        let (total, items) = entries;
+        let end = offset.saturating_add(items.len());
+        json(&serde_json::json!({
+            "total": total,
+            "offset": offset,
+            "returned": items.len(),
+            "next_offset": (end < total).then_some(end),
+            "assets": items,
+        }))
+    }
+
+    #[tool(
+        description = "List the assets whose source file is no longer on disk (moved, renamed, a drive that is not \
+                       mounted): each with its name, the path it was imported from and how many clips of the cut use \
+                       it. Empty means every file is there. Previews and exports that need an offline file fail until \
+                       it is back. This is read-only: relinking or removing media is the user's, in Kerf's library — \
+                       tell them which files and where they were."
+    )]
+    async fn missing_assets(&self) -> Result<String, McpError> {
+        let (project, owner) = (self.project.clone(), self.owner());
+        let missing = blocking(move || {
+            // The project's files under the lock; asking the disk — a share that went away can take a
+            // long time to say so — with it released.
+            let files = lock_agent_as(&project, owner.as_deref())
+                .missing_assets_inputs()
+                .map_err(core_err)?;
+            Ok(kerf_core::Project::find_missing_assets(files))
+        })
+        .await?;
+        json(&missing)
     }
 
     #[tool(
@@ -901,6 +1042,8 @@ mod tests {
             full: false,
             captions_offset: None,
             captions_limit: None,
+            clips_offset: None,
+            clips_limit: None,
         };
         let state = timeline_state(&captioned(300), &view).unwrap();
         assert_eq!(state["overlays"].as_array().unwrap().len(), 1, "typed titles stay");
@@ -927,6 +1070,8 @@ mod tests {
             full: true,
             captions_offset: None,
             captions_limit: None,
+            clips_offset: None,
+            clips_limit: None,
         };
         let state = timeline_state(&captioned(300), &full).unwrap();
         assert_eq!(state["overlays"].as_array().unwrap().len(), 301);
@@ -934,6 +1079,99 @@ mod tests {
 
         let plain = timeline_state(&Timeline::new(), &StateView { full: false, ..full }).unwrap();
         assert!(plain.get("captions").is_none() && plain.get("overlays").is_none());
+    }
+
+    /// A cut of `per_track` clips on each of two tracks.
+    fn clipped(per_track: usize) -> Timeline {
+        let mut t = Timeline::new();
+        let asset = Uuid::nil();
+        for track in &mut t.tracks {
+            for i in 0..per_track {
+                track.clips.push(kerf_core::Clip::new(asset, 0.0, 1.0, i as f64 * 2.0));
+            }
+        }
+        t
+    }
+
+    fn clip_count(state: &serde_json::Value) -> usize {
+        state["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["clips"].as_array().unwrap().len())
+            .sum()
+    }
+
+    fn view(offset: Option<usize>, limit: Option<usize>, full: bool) -> StateView {
+        StateView {
+            full,
+            captions_offset: None,
+            captions_limit: None,
+            clips_offset: offset,
+            clips_limit: limit,
+        }
+    }
+
+    #[test]
+    fn a_cut_that_fits_is_shown_whole_and_a_long_one_in_a_window_of_clips() {
+        let whole = timeline_state(&clipped(DEFAULT_CLIP_WINDOW / 2), &view(None, None, false)).unwrap();
+        assert_eq!(clip_count(&whole), DEFAULT_CLIP_WINDOW, "two tracks of a hundred fit exactly");
+        assert!(whole.get("clips_window").is_none(), "nothing to say about a cut that fits");
+
+        let long = clipped(300);
+        let first = timeline_state(&long, &view(None, None, false)).unwrap();
+        assert_eq!(clip_count(&first), DEFAULT_CLIP_WINDOW);
+        assert_eq!(first["clips_window"]["total"], 600);
+        assert_eq!(first["clips_window"]["returned"], DEFAULT_CLIP_WINDOW);
+        assert_eq!(first["clips_window"]["next_offset"], DEFAULT_CLIP_WINDOW);
+        assert_eq!(first["tracks"].as_array().unwrap().len(), 2, "every track is still listed");
+        assert!(first["tracks"][0]["clips"].as_array().unwrap().len() == DEFAULT_CLIP_WINDOW);
+        assert!(
+            first["tracks"][1]["clips"].as_array().unwrap().is_empty(),
+            "the window ran out inside the first track"
+        );
+
+        // A page that crosses from one track into the next, to the end.
+        let last = timeline_state(&long, &view(Some(250), Some(1000), false)).unwrap();
+        assert_eq!(clip_count(&last), 350);
+        assert_eq!(last["tracks"][0]["clips"].as_array().unwrap().len(), 50);
+        assert_eq!(last["tracks"][1]["clips"].as_array().unwrap().len(), 300);
+        assert!(last["clips_window"].get("next_offset").is_none(), "that was the end");
+
+        // `full` is every clip, and no window.
+        let all = timeline_state(&long, &view(None, None, true)).unwrap();
+        assert_eq!(clip_count(&all), 600);
+        assert!(all.get("clips_window").is_none());
+    }
+
+    #[test]
+    fn a_track_answer_leaves_out_its_clips_and_a_diff_is_paged() {
+        let track = &clipped(40).tracks[0];
+        let brief = track_brief(track);
+        assert!(brief.get("clips").is_none(), "{brief}");
+        assert_eq!(brief["clip_count"], 40);
+        assert_eq!(brief["id"], serde_json::json!(track.id));
+        assert_eq!(brief["name"], "V1");
+
+        let before = Timeline::new();
+        let after = clipped(150);
+        let diff = before.diff(&after);
+        let total = diff.entries.len();
+        assert!(total >= 300, "a change per clip added: {total}");
+        let first = diff_page(&diff, None, None);
+        assert_eq!(first["entries"]["returned"], DEFAULT_DIFF_PAGE);
+        assert_eq!(first["entries"]["total"], diff.entries.len());
+        assert_eq!(first["entries"]["next_offset"], DEFAULT_DIFF_PAGE);
+        assert_eq!(first["clips_after"], 300);
+        assert!(
+            first["headline"].as_str().unwrap().contains(&format!("{total} changes")),
+            "{first}"
+        );
+        let last = diff_page(&diff, Some(250), Some(9_999));
+        assert_eq!(last["entries"]["returned"], total - 250);
+        assert!(last["entries"].get("next_offset").is_none());
+        let small = diff_page(&diff, Some(0), Some(0));
+        assert_eq!(small["entries"]["returned"], 1, "a limit of nothing still returns one");
     }
 
     #[test]
@@ -1060,7 +1298,7 @@ mod tests {
         .into_iter()
         .collect();
         let missing: std::collections::HashSet<Uuid> = [missing_src].into_iter().collect();
-        let notes = media_notes(&timeline, &assets, &proxies, &missing);
+        let notes = media_notes(&timeline, &assets, &proxies, &missing, false);
         assert_eq!(notes.per_track, vec![2, 0], "two clips on V1 wait for a proxy");
         let names: Vec<&str> = notes.notes.iter().map(|n| n.name.as_str()).collect();
         assert_eq!(names, vec!["building.mp4", "gone.mp4"], "the ready one is not mentioned");
@@ -1082,7 +1320,7 @@ mod tests {
         let mut timeline = Timeline::new();
         timeline.tracks[0].clips = vec![clip_of(id)];
         let proxies: HashMap<_, _> = [(id, proxy(id, ProxyPhase::Ready))].into_iter().collect();
-        let notes = media_notes(&timeline, &[asset_named(id, "a.mp4")], &proxies, &Default::default());
+        let notes = media_notes(&timeline, &[asset_named(id, "a.mp4")], &proxies, &Default::default(), false);
         assert!(notes.notes.is_empty());
         assert_eq!(notes.per_track, vec![0, 0]);
     }
@@ -1094,10 +1332,28 @@ mod tests {
             let mut timeline = Timeline::new();
             timeline.tracks[0].clips = vec![clip_of(id)];
             let proxies: HashMap<_, _> = [(id, proxy(id, state))].into_iter().collect();
-            let notes = media_notes(&timeline, &[asset_named(id, "a.mp4")], &proxies, &Default::default());
+            let notes = media_notes(&timeline, &[asset_named(id, "a.mp4")], &proxies, &Default::default(), false);
             assert_eq!(notes.per_track[0], 1, "{state:?}");
             assert_eq!(notes.notes.len(), 1, "{state:?}");
         }
+    }
+
+    #[test]
+    fn with_proxies_switched_off_no_clip_is_noted_for_having_none() {
+        let (off, failed) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut timeline = Timeline::new();
+        timeline.tracks[0].clips = vec![clip_of(off), clip_of(failed)];
+        let assets = [asset_named(off, "off.mp4"), asset_named(failed, "failed.mp4")];
+        let proxies: HashMap<_, _> = [
+            (off, proxy(off, ProxyPhase::Off)),
+            (failed, proxy(failed, ProxyPhase::Failed)),
+        ]
+        .into_iter()
+        .collect();
+        let notes = media_notes(&timeline, &assets, &proxies, &Default::default(), true);
+        assert_eq!(notes.per_track, vec![1, 0], "only the failed one still waits");
+        let names: Vec<&str> = notes.notes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["failed.mp4"], "off is the user's choice, a failure is not");
     }
 
     #[test]

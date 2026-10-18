@@ -62,6 +62,7 @@ import type {
 	McpConnectionInfo,
 	McpSettingsPatch,
 	TimeDisplay,
+	SettingsPatch,
 	SettingsView,
 	SmartCropProgress,
 	SplitSide,
@@ -3482,6 +3483,9 @@ export async function restoreDiscardedEdits(): Promise<StagedEdit> {
 		if (!devDiscarded) throw new Error('there is no discarded proposal to bring back');
 		devStaged = devDiscarded;
 		devDiscarded = null;
+		// It comes back as it was but with no undo history (`Project::restore_discarded`).
+		devStaged.steps = [];
+		devStaged.edit = { ...devStaged.edit, undo_depth: 0, updated_at: now() };
 		return { ...structuredClone(devStaged.edit), stale: devStagedStale() };
 	}
 	return invoke<StagedEdit>('restore_discarded_edits');
@@ -3973,12 +3977,34 @@ function harnessToken(): string {
 	return (crypto.randomUUID() + crypto.randomUUID()).replace(/-/g, '');
 }
 
+/** The agent switches as `get_settings` carries them (`SettingsView`): the same state the Agent page edits. */
+function harnessAgentSettings(): Pick<AppSettings, 'agent_review' | 'mcp_enabled' | 'mcp_addr' | 'mcp_require_token'> {
+	const info = harnessMcpInfo({});
+	return {
+		agent_review: info.agent_review,
+		mcp_enabled: info.enabled,
+		mcp_addr: info.configured_addr,
+		mcp_require_token: info.require_token
+	};
+}
+
+/** A settings patch that carries agent switches changes the Agent page's state too. */
+function applyHarnessAgentSettings(patch: SettingsPatch) {
+	const next: McpSettingsPatch = {};
+	if (patch.agent_review !== undefined) next.agent_review = patch.agent_review;
+	if (patch.mcp_enabled !== undefined) next.mcp_enabled = patch.mcp_enabled;
+	if (patch.mcp_require_token !== undefined) next.mcp_require_token = patch.mcp_require_token;
+	if ('mcp_addr' in patch) next.mcp_addr = patch.mcp_addr ?? null;
+	if (Object.keys(next).length > 0) void setMcpSettings(next).catch(() => {});
+}
+
 function harnessMcpInfo(next: Partial<McpConnectionInfo>): McpConnectionInfo {
 	const base: McpConnectionInfo = harnessMcp ?? {
 		enabled: true,
 		url: 'http://127.0.0.1:7777/mcp',
 		require_token: true,
 		token: harnessToken(),
+		token_problem: null,
 		running: true,
 		error: null,
 		configured_addr: null,
@@ -4057,7 +4083,8 @@ export async function getSettings(): Promise<SettingsView> {
 			layout: readBrowserJson(LAYOUT_KEY),
 			theme: readBrowserJson(THEME_KEY),
 			workspaces: readBrowserJson(WORKSPACES_KEY),
-			keybindings: readBrowserJson(KEYBINDINGS_KEY)
+			keybindings: readBrowserJson(KEYBINDINGS_KEY),
+			...harnessAgentSettings()
 		});
 	}
 	return invoke<SettingsView>('get_settings');
@@ -4068,7 +4095,7 @@ export async function getSettings(): Promise<SettingsView> {
  * view. Only the fields in `patch` are written — the backend merges them into
  * the stored file, so a workspaces write cannot carry a stale copy of the theme.
  */
-export async function setSettings(patch: Partial<AppSettings>): Promise<SettingsView> {
+export async function setSettings(patch: SettingsPatch): Promise<SettingsView> {
 	if (!inTauri()) {
 		try {
 			if (patch.cpu_percent !== undefined) {
@@ -4085,6 +4112,7 @@ export async function setSettings(patch: Partial<AppSettings>): Promise<Settings
 			if ('theme' in patch) writeBrowserJson(THEME_KEY, patch.theme);
 			if ('workspaces' in patch) writeBrowserJson(WORKSPACES_KEY, patch.workspaces);
 			if ('keybindings' in patch) writeBrowserJson(KEYBINDINGS_KEY, patch.keybindings);
+			applyHarnessAgentSettings(patch);
 		} catch {
 			// A private window with storage blocked still gets a working dialog.
 		}

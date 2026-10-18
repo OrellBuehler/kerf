@@ -188,6 +188,7 @@ impl Check {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     /// The summary of the passed check, if there is one, or the reason it is closed.
     pub fn standing(&self) -> Option<String> {
         match &self.slot().phase {

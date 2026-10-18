@@ -23,7 +23,8 @@
   the timeline draws from it is **ungated** (no `cpu::lease`) but thread-capped and
   niced, at most two decodes at once (a freshly opened project asks for every clip
   at the same instant), concurrent requests for one file share one decode
-  (`shared_pyramid`), and the pipe is read on a side thread (`pump_pcm_cancellable`, shared with
+  (`shared_pyramid_cancellable`: a request waiting behind another's decode, or for one of the two slots, polls its
+  own cancel and gives up with `Cancelled`; a stopped decode caches nothing), and the pipe is read on a side thread (`pump_pcm_cancellable`, shared with
   `cli::waveform`, the in-memory PCM decodes and `pcm::decode_audio_cancellable`) so a decode silent
   for 60 s is killed and a caller's cancel is polled every 100 ms. The pyramid is cached at `<cache>/kerf/waveforms/<hash>.bin`, keyed
   by path + size + mtime + a format version, written to a temp file and renamed; a
@@ -33,8 +34,11 @@
   byte-bounded in-process LRU (64 MB) so scrolling does not re-read the cache file.
   `Project::waveform_range` / the lock-free `Project::decode_waveform_range` are the
   op (an asset with no audio stream is `InvalidArgument`), exposed as the
-  `get_waveform_range` Tauri command and MCP tool; `get_waveform` / `get_energy`
-  are unchanged.
+  `get_waveform_range` Tauri command and MCP tool; the MCP `get_waveform` / `get_energy` stay (the GUI draws from the
+  pyramid). The agent's reads have cancellable twins — `decode_waveform_cancellable`, `decode_waveform_range_cancellable`,
+  `decode_energy_cancellable`, `decode_contact_sheet_cancellable`, `composite_timeline_frame_cancellable` /
+  `_region_cancellable` — which the MCP tools hand the request's cancellation token, so a dropped request stops its
+  ffmpeg (`agent_reads_stop_when_their_request_is_dropped`, `#[ignore]`d, drives them).
 - `filmstrip.rs` (always compiled, CLI only) is the video twin of `peaks.rs`: what the
   timeline draws a clip's **thumbnails** from. An asset is sampled once into a
   `Filmstrip` — 96 px-high frames (width from the *displayed* aspect, so rotation is

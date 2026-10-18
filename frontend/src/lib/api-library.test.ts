@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import type { Timeline } from './types';
+import type { SettingsPatch, Timeline } from './types';
 
 // The browser harness stands in for kerf-app's library, staged-proposal, recent-project and paging
 // commands. What it answers must keep the shape and the wording the backend's do (`MissingAsset`,
@@ -67,6 +67,10 @@ describe('a staged proposal', () => {
 		expect(back.edits).toEqual(undone.staged.edits);
 		expect(await api.discardedStagedEdit()).toBeNull();
 		await expect(api.restoreDiscardedEdits()).rejects.toThrow('already pending');
+		// It comes back as it was but with no undo history, as `Project::restore_discarded` does.
+		expect(back.undo_depth).toBe(0);
+		expect((await api.getStagedEdit())!.undo_depth).toBe(0);
+		await expect(api.undoStagedEdit()).rejects.toThrow('nothing left to undo');
 	});
 
 	test('a partial accept lays the picked change and the sound linked to it, and the rest stays open', async () => {
@@ -211,6 +215,25 @@ describe('recent projects and paths', () => {
 		const set = await api.setSettings({ time_display: 'seconds', reopen_last_project: true });
 		expect(set).toMatchObject({ time_display: 'seconds', reopen_last_project: true });
 		expect(await api.resetSettings()).toMatchObject({ time_display: 'timecode', reopen_last_project: false });
+	});
+
+	test('a settings patch cannot name the recent list, which the app keeps itself', () => {
+		// @ts-expect-error `recent_projects` is maintained by open / save-as, not patchable
+		const patch: SettingsPatch = { recent_projects: [] };
+		expect(Object.keys(patch)).toEqual(['recent_projects']);
+		const allowed: SettingsPatch = { time_display: 'seconds', agent_review: false };
+		expect(Object.keys(allowed)).toEqual(['time_display', 'agent_review']);
+	});
+
+	test('the settings view carries the agent switches, and the Agent page and the view agree', async () => {
+		const view = await api.getSettings();
+		expect(view).toMatchObject({ agent_review: true, mcp_enabled: true, mcp_addr: null, mcp_require_token: true });
+		expect('mcp_token' in view).toBe(false);
+		await api.setMcpSettings({ agent_review: false, mcp_addr: '127.0.0.1:9000' });
+		expect(await api.getSettings()).toMatchObject({ agent_review: false, mcp_addr: '127.0.0.1:9000' });
+		const info = await api.mcpConnectionInfo();
+		expect(info).toMatchObject({ agent_review: false, configured_addr: '127.0.0.1:9000', token_problem: null });
+		await api.setMcpSettings({ agent_review: true, mcp_addr: null });
 	});
 });
 

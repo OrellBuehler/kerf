@@ -39,8 +39,8 @@ pub use source_probe::source_seek_points_are_keyframes;
 // cached, drawn from at any zoom. Also CLI-only, so it works in every build.
 mod peaks;
 pub use peaks::{
-    cache_path as waveform_cache_path, waveform_pyramid, waveform_range, waveform_range_of, WaveformLevel, WaveformPyramid,
-    WaveformRange, MAX_RANGE_BUCKETS as MAX_WAVEFORM_BUCKETS,
+    cache_path as waveform_cache_path, waveform_pyramid, waveform_range, waveform_range_of, waveform_range_of_cancellable,
+    WaveformLevel, WaveformPyramid, WaveformRange, MAX_RANGE_BUCKETS as MAX_WAVEFORM_BUCKETS,
 };
 
 // Filmstrip thumbnails for timeline clips: one decode per asset into a few
@@ -68,7 +68,7 @@ pub use decode_policy::limit_frame_args;
 // Audio analysis (loudness, energy, onsets, tempo, classification): CLI/PCM
 // based, available in every build like the rest of `cli`.
 mod audio;
-pub use audio::{analyze_rhythm_cancellable, energy_envelope, measure_loudness_cancellable};
+pub use audio::{analyze_rhythm_cancellable, energy_envelope, energy_envelope_cancellable, measure_loudness_cancellable};
 
 // Decoded audio as an interleaved f32 buffer (through the ffmpeg binary) and a WAV
 // writer for tests and debug renders.
@@ -100,16 +100,16 @@ mod ffmpeg;
 // Analysis, frame and waveform extraction always go through the CLI backend —
 // they only need the FFmpeg binaries, never the dev libraries.
 pub use cli::{
-    audio_effects_filter, audio_pcm, audio_pcm_cancellable, contact_sheet, contact_sheet_times, decode_hwaccel, delivery_frame,
-    detect_scenes_preferring_cancellable, detect_silence_cancellable, disable_decode_hwaccel, discard_partial, export_still,
-    export_still_cancellable, file_mtime, frame_at, frame_jpeg, frame_jpeg_cancellable, frame_jpeg_region,
+    audio_effects_filter, audio_pcm, audio_pcm_cancellable, contact_sheet_cancellable, contact_sheet_times, decode_hwaccel,
+    delivery_frame, detect_scenes_preferring_cancellable, detect_silence_cancellable, disable_decode_hwaccel, discard_partial,
+    export_still, export_still_cancellable, file_mtime, frame_at, frame_jpeg, frame_jpeg_cancellable, frame_jpeg_region,
     frame_jpeg_region_cancellable, generate_proxy, generate_proxy_with, hw_encoders, insta360_pair, mix_levels, playback_params,
     proxy_base_width, proxy_path, proxy_width, proxy_width_for, ready_proxy, remove_proxy_files, salience_map_cancellable,
     seek_arg, set_proxy_base_width, source_identity, stitch_insta360, stitch_insta360_with, stitched_path, stream_preview,
-    stream_preview_until, stream_preview_with, timeline_frame, timeline_frame_region, validate_export, waveform, Container,
-    ExportOptions, ExportProgress, ExportVariant, Fit, ImageFormat, LoudnessPreset, PlaybackParams, PlaybackRequest,
-    PreviewFrame, ProxyRun, RateControl, Region, RenderStatus, ScrubConfig, ScrubFrames, ScrubStats, VariantProgress,
-    MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
+    stream_preview_until, stream_preview_with, timeline_frame_cancellable, timeline_frame_region_cancellable, validate_export,
+    waveform, waveform_cancellable, Container, ExportOptions, ExportProgress, ExportVariant, Fit, ImageFormat, LoudnessPreset,
+    PlaybackParams, PlaybackRequest, PreviewFrame, ProxyRun, RateControl, Region, RenderStatus, ScrubConfig, ScrubFrames,
+    ScrubStats, VariantProgress, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
 };
 
 pub(crate) use cli::insta360_pair_name;

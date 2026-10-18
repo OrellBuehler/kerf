@@ -1344,7 +1344,22 @@ export interface AppSettings {
 	 *  { <action id>: [<chord>, …] } }`, only the actions they touched, validated
 	 *  and migrated by `keymap.ts` on the way back in. Opaque to the backend. */
 	keybindings: unknown | null;
+	/** Whether an agent's edits are held back for the user to review (the default). Changed on the
+	 *  Agent settings page (`setMcpSettings`); the agent cannot turn it off. */
+	agent_review: boolean;
+	/** Whether the embedded MCP server listens at all. */
+	mcp_enabled: boolean;
+	/** Where it listens (`host:port`); `null` is `127.0.0.1:7777`. `KERF_MCP_ADDR` in the environment
+	 *  still overrides it (`McpConnectionInfo.env_override`). */
+	mcp_addr: string | null;
+	/** Whether a request must carry `Authorization: Bearer <token>`. The token itself is never in the
+	 *  settings view: ask `mcpConnectionInfo`. */
+	mcp_require_token: boolean;
 }
+
+/** What `setSettings` may write: any preference but the recent-projects list, which the app keeps itself
+ *  as projects open and save (the backend refuses a patch that names it). */
+export type SettingsPatch = Partial<Omit<AppSettings, 'recent_projects'>>;
 
 /** `AppSettings` resolved against the engine, which is what the settings
  *  surface renders: the effective percentage (an environment override may win
@@ -1550,6 +1565,9 @@ export interface McpConnectionInfo {
 	require_token: boolean;
 	/** The bearer token (made on the first start), even while it is not required. */
 	token: string | null;
+	/** Why the token is not what it should be: it could not be saved (it works until Kerf quits) or
+	 *  could not be made (the server stays off while one is required). `null` when it is fine. */
+	token_problem: string | null;
 	/** Whether the listener is up now. */
 	running: boolean;
 	/** Why it is not, when it should be (the port is taken, the address is refused). */

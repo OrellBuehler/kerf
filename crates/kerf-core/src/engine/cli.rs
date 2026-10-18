@@ -1251,6 +1251,7 @@ impl Collected {
 /// pipes are drained on side threads, so neither a flood of warnings nor a large stdout can fill
 /// a pipe and wedge the child. A stalled read returns the stderr that had arrived and no stdout.
 /// The child is always reaped, whatever fails on the way.
+#[cfg(test)]
 fn output_unless_stalled(cmd: Command, stall: std::time::Duration) -> std::io::Result<Collected> {
     output_supervised(cmd, stall, None, &|| false)
 }
@@ -2455,11 +2456,8 @@ fn run_frame_decode(
     Ok(output.stdout)
 }
 
-/// Build a **contact sheet** of `path`: `columns`×`rows` frames sampled evenly
-/// across `[start, end)`, each cell scaled to `cell_width` px wide and tiled into
-/// one JPEG (`quality` = `-q:v`). Returns the montage bytes plus the per-cell
-/// timestamps in row-major order, so the caller can tell an LLM which moment each
-/// cell shows. One ffmpeg pass — lets the model skim a long clip cheaply.
+/// [`contact_sheet_cancellable`] with nothing to cancel it.
+#[cfg(test)]
 pub fn contact_sheet(
     path: &Path,
     start: f64,
@@ -2468,6 +2466,29 @@ pub fn contact_sheet(
     rows: u32,
     cell_width: u32,
     quality: u8,
+) -> Result<(Vec<u8>, Vec<f64>)> {
+    contact_sheet_cancellable(path, start, end, columns, rows, cell_width, quality, &|| false)
+}
+
+/// Build a **contact sheet** of `path`: `columns`×`rows` frames sampled evenly
+/// across `[start, end)`, each cell scaled to `cell_width` px wide and tiled into
+/// one JPEG (`quality` = `-q:v`). Returns the montage bytes plus the per-cell
+/// timestamps in row-major order, so the caller can tell an LLM which moment each
+/// cell shows. One ffmpeg pass — lets the model skim a long clip cheaply.
+///
+/// Gives up with [`Error::Cancelled`] once `cancel` is true (polled about fifty times a second; the
+/// sampling ffmpeg is killed) — an agent that dropped its request does not leave a many-seek
+/// decode running.
+#[allow(clippy::too_many_arguments)]
+pub fn contact_sheet_cancellable(
+    path: &Path,
+    start: f64,
+    end: f64,
+    columns: u32,
+    rows: u32,
+    cell_width: u32,
+    quality: u8,
+    cancel: &dyn Fn() -> bool,
 ) -> Result<(Vec<u8>, Vec<f64>)> {
     let path = path
         .to_str()
@@ -2484,7 +2505,10 @@ pub fn contact_sheet(
     // `tile` outputs the one frame when the window has been decoded, and ffmpeg reports nothing
     // before: the bound grows with the window (see `sheet_stall`).
     let stall = sheet_stall(end - start);
-    let output = output_unless_stalled(cmd, stall).map_err(|e| launch_err(&bin, e))?;
+    let output = output_supervised(cmd, stall, None, cancel).map_err(|e| launch_err(&bin, e))?;
+    if output.cancelled {
+        return Err(Error::Cancelled);
+    }
     if !output.succeeded() || output.stdout.is_empty() {
         let why = if output.stalled {
             format!("ffmpeg said nothing for {}s: {}", stall.as_secs(), output.stderr_tail())
@@ -2571,6 +2595,11 @@ fn build_contact_sheet_args(
 /// Decode the first audio stream to mono f32 PCM at `sample_rate` Hz and reduce
 /// it to `buckets` peak magnitudes in `0.0..=1.0` (for waveform rendering).
 pub fn waveform(path: &Path, buckets: usize, sample_rate: u32) -> Result<Vec<f32>> {
+    waveform_cancellable(path, buckets, sample_rate, &|| false)
+}
+
+/// [`waveform`] that gives up with [`Error::Cancelled`] once `cancel` is true (the decode is killed).
+pub fn waveform_cancellable(path: &Path, buckets: usize, sample_rate: u32, cancel: &dyn Fn() -> bool) -> Result<Vec<f32>> {
     let buckets = buckets.max(1);
     // Stream the decoded PCM through a bounded peak-downsampler instead of
     // buffering the whole signal: a 1h file at 8 kHz mono is ~115 MB of f32
@@ -2604,7 +2633,7 @@ pub fn waveform(path: &Path, buckets: usize, sample_rate: u32) -> Result<Vec<f32
     let mut down = PeakDownsampler::new(buckets);
     // The pump kills a decode that stops producing for `READ_STALL`, which a bare read of its
     // stdout never did.
-    super::peaks::pump_pcm(child, 4, READ_STALL, &mut |samples| {
+    super::peaks::pump_pcm_cancellable(child, 4, READ_STALL, cancel, &mut |samples| {
         for s in samples {
             down.push(s.abs());
         }
@@ -8094,13 +8123,16 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
 /// `max_width` px wide. Lets an LLM *see the cut it is assembling* (which footage
 /// is on screen, framing, picture-in-picture placement, crop, color) rather than
 /// reasoning about timestamps blind.
-pub fn timeline_frame(
+///
+/// Gives up with [`Error::Cancelled`] once `cancel` is true.
+pub fn timeline_frame_cancellable(
     timeline: &Timeline,
     assets: &[Asset],
     opts: &ExportOptions,
     t: f64,
     max_width: u32,
     quality: u8,
+    cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<u8>> {
     run_still(
         timeline,
@@ -8110,7 +8142,7 @@ pub fn timeline_frame(
         max_width,
         None,
         &StillOutput::JpegPipe { quality },
-        &|| false,
+        cancel,
     )
 }
 
@@ -8118,7 +8150,9 @@ pub fn timeline_frame(
 /// rendered large enough that the region alone comes out `max_width` wide
 /// (capped at the delivery frame, so nothing is invented), then cropped — a
 /// zoom into the cut rather than a screenshot of it.
-pub fn timeline_frame_region(
+/// Gives up with [`Error::Cancelled`] once `cancel` is true.
+#[allow(clippy::too_many_arguments)]
+pub fn timeline_frame_region_cancellable(
     timeline: &Timeline,
     assets: &[Asset],
     opts: &ExportOptions,
@@ -8126,6 +8160,7 @@ pub fn timeline_frame_region(
     region: Region,
     max_width: u32,
     quality: u8,
+    cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<u8>> {
     let region = (!region.is_full()).then_some(region);
     run_still(
@@ -8136,7 +8171,7 @@ pub fn timeline_frame_region(
         max_width,
         region,
         &StillOutput::JpegPipe { quality },
-        &|| false,
+        cancel,
     )
 }
 
@@ -10480,7 +10515,10 @@ mod tests {
         assert!(jpeg(&new));
         assert_eq!(old, new, "the still differs");
         let options = hw_still_opts();
-        assert_eq!(timeline_frame(&timeline, &assets, &options, 1.5, 640, 4).unwrap(), new);
+        assert_eq!(
+            timeline_frame_cancellable(&timeline, &assets, &options, 1.5, 640, 4, &|| false).unwrap(),
+            new
+        );
 
         // The frame grab: `frame_jpeg` decides for itself from the path it is given.
         let vf = "scale='min(320,iw)':-2";
@@ -17880,13 +17918,14 @@ mod tests {
         assert_eq!((w, h), (360, 640), "the file is portrait, not a letterboxed landscape");
         assert_eq!(red_bar_edge(w, h, &rgb), want_edge, "and upright");
 
-        let jpeg = timeline_frame(
+        let jpeg = timeline_frame_cancellable(
             &timeline,
             std::slice::from_ref(&asset),
             &ExportOptions::default(),
             0.5,
             360,
             3,
+            &|| false,
         )
         .expect("composited still");
         let still = dir.join("still.jpg");

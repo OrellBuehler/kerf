@@ -446,6 +446,22 @@ impl Project {
     /// carries over: it belongs to the app, not to the file.
     pub fn replace_with(&mut self, other: Project) {
         let generation = self.generation.wrapping_add(1);
+        self.swap_in(other, generation);
+    }
+
+    /// Become `copy`, a reopened copy of **this same project** saved to another file (Save As), and
+    /// stay the same project: the **generation does not move**, so the jobs in flight (an analysis,
+    /// an import, a voiceover, a proxy) that noted it still land in the project they began on —
+    /// which, but for the file it lives in, is this one. The change count carries on as in
+    /// [`Project::replace_with`]. Only for that swap: anything that is a different project is
+    /// [`Project::replace_with`]. Call it under the lock, after checking that
+    /// [`Project::change_count`] did not move since the copy was written.
+    pub fn replace_with_saved_copy(&mut self, copy: Project) {
+        let generation = self.generation;
+        self.swap_in(copy, generation);
+    }
+
+    fn swap_in(&mut self, other: Project, generation: u64) {
         let review = self.agent_review.get();
         let change_base = self.change_count().saturating_add(1);
         *self = other;
@@ -652,8 +668,16 @@ impl Project {
     }
 
     /// Turn ripple mode on or off for the project. Not an edit: it records no
-    /// revision and does not touch the timeline.
+    /// revision and does not touch the timeline. It is the user's toolbar setting and applies at
+    /// once, also to a proposal being built, so an agent may not flip it while the user's review
+    /// of agent edits is on (it passes `ripple` on the edit instead, see [`Project::with_ripple`]).
     pub fn set_ripple_mode(&self, on: bool) -> Result<()> {
+        if self.actor == EditSource::Agent && self.agent_review.get() {
+            return Err(Error::InvalidArgument(
+                "the ripple setting is the user's while they review agent edits: pass `ripple` on the edit for one call, or ask them to switch it"
+                    .to_string(),
+            ));
+        }
         self.set_meta(RIPPLE_MODE, if on { "true" } else { "false" })
     }
 
@@ -1619,15 +1643,33 @@ impl Project {
         cell_width: u32,
         quality: u8,
     ) -> Result<(Vec<u8>, Vec<f64>)> {
+        Self::decode_contact_sheet_cancellable(asset, start, end, columns, rows, cell_width, quality, &|| false)
+    }
+
+    /// [`Project::decode_contact_sheet`] that `cancel` can stop ([`Error::Cancelled`]): a request
+    /// the agent dropped does not leave a many-seek sampling running, and a stop is not retried
+    /// on the original.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_contact_sheet_cancellable(
+        asset: &Asset,
+        start: Option<f64>,
+        end: Option<f64>,
+        columns: u32,
+        rows: u32,
+        cell_width: u32,
+        quality: u8,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(Vec<u8>, Vec<f64>)> {
         let start = start.unwrap_or(0.0).max(0.0);
         let end = end.unwrap_or(asset.duration).min(asset.duration).max(start);
         if let Some(proxy) = Self::sheet_proxy(asset) {
-            match engine::contact_sheet(&proxy, start, end, columns, rows, cell_width, quality) {
+            match engine::contact_sheet_cancellable(&proxy, start, end, columns, rows, cell_width, quality, cancel) {
                 Ok(sheet) => return Ok(sheet),
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
                 Err(e) => tracing::warn!(error = %e, "contact sheet could not read the proxy; reading the original"),
             }
         }
-        engine::contact_sheet(Path::new(&asset.path), start, end, columns, rows, cell_width, quality)
+        engine::contact_sheet_cancellable(Path::new(&asset.path), start, end, columns, rows, cell_width, quality, cancel)
     }
 
     /// Composite a single still of the current timeline at timeline time `t` as
@@ -1658,6 +1700,18 @@ impl Project {
         max_width: u32,
         quality: u8,
     ) -> Result<Vec<u8>> {
+        Self::composite_timeline_frame_cancellable(timeline, assets, time_secs, max_width, quality, &|| false)
+    }
+
+    /// [`Project::composite_timeline_frame`] that `cancel` can stop ([`Error::Cancelled`]).
+    pub fn composite_timeline_frame_cancellable(
+        timeline: &Timeline,
+        assets: &[Asset],
+        time_secs: f64,
+        max_width: u32,
+        quality: u8,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>> {
         // Hardware-accelerated decode like the single-frame path (with the same
         // learned software fallback inside the engine) — this runs continuously
         // while the user scrubs.
@@ -1665,7 +1719,7 @@ impl Project {
             hwaccel: engine::decode_hwaccel(),
             ..engine::ExportOptions::default()
         };
-        engine::timeline_frame(timeline, assets, &opts, time_secs, max_width, quality)
+        engine::timeline_frame_cancellable(timeline, assets, &opts, time_secs, max_width, quality, cancel)
     }
 
     /// [`Project::composite_timeline_frame`] zoomed into `region` of the
@@ -1679,11 +1733,25 @@ impl Project {
         max_width: u32,
         quality: u8,
     ) -> Result<Vec<u8>> {
+        Self::composite_timeline_region_cancellable(timeline, assets, time_secs, region, max_width, quality, &|| false)
+    }
+
+    /// [`Project::composite_timeline_region`] that `cancel` can stop ([`Error::Cancelled`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_timeline_region_cancellable(
+        timeline: &Timeline,
+        assets: &[Asset],
+        time_secs: f64,
+        region: engine::Region,
+        max_width: u32,
+        quality: u8,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>> {
         let opts = engine::ExportOptions {
             hwaccel: engine::decode_hwaccel(),
             ..engine::ExportOptions::default()
         };
-        engine::timeline_frame_region(timeline, assets, &opts, time_secs, region, max_width, quality)
+        engine::timeline_frame_region_cancellable(timeline, assets, &opts, time_secs, region, max_width, quality, cancel)
     }
 
     /// How ready the current cut is for each publishing target — what a platform
@@ -1916,6 +1984,12 @@ impl Project {
         engine::waveform(Path::new(&asset.path), buckets, 8_000)
     }
 
+    /// [`Project::decode_waveform`] that `cancel` can stop ([`Error::Cancelled`]): an agent's
+    /// request that was dropped does not leave a whole-file decode running.
+    pub fn decode_waveform_cancellable(asset: &Asset, buckets: usize, cancel: &dyn Fn() -> bool) -> Result<Vec<f32>> {
+        engine::waveform_cancellable(Path::new(&asset.path), buckets, 8_000, cancel)
+    }
+
     /// `[start, end)` **source seconds** of an asset's audio as `buckets` min/max
     /// peak pairs per channel — what the timeline draws a clip's waveform from.
     /// Served from a cached peak pyramid (one decode per file, ever), so any
@@ -1933,12 +2007,24 @@ impl Project {
     /// like [`Project::decode_waveform`]: a waveform appearing is not worth
     /// queueing behind an export.
     pub fn decode_waveform_range(asset: &Asset, start: f64, end: f64, buckets: usize) -> Result<engine::WaveformRange> {
+        Self::decode_waveform_range_cancellable(asset, start, end, buckets, &|| false)
+    }
+
+    /// [`Project::decode_waveform_range`] that `cancel` can stop ([`Error::Cancelled`]) — while it
+    /// waits for the file's decode, or while it runs it. A stopped decode caches nothing.
+    pub fn decode_waveform_range_cancellable(
+        asset: &Asset,
+        start: f64,
+        end: f64,
+        buckets: usize,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<engine::WaveformRange> {
         // A video-only asset has nothing to draw; say so rather than spawn an
         // ffmpeg to fail on `-map 0:a:0`. (No stream info at all is tried anyway.)
         if !asset.streams.is_empty() && !asset.streams.iter().any(|s| s.kind == StreamKind::Audio) {
             return Err(Error::InvalidArgument(format!("asset {} has no audio stream", asset.id)));
         }
-        engine::waveform_range_of(Path::new(&asset.path), start, end, buckets)
+        engine::waveform_range_of_cancellable(Path::new(&asset.path), start, end, buckets, cancel)
     }
 
     /// The ready proxy a filmstrip should decode instead of `asset`'s original, if
@@ -1986,6 +2072,11 @@ impl Project {
     /// lock-free like [`Project::decode_waveform`].
     pub fn decode_energy(asset: &Asset, buckets: usize) -> Result<Vec<f32>> {
         engine::energy_envelope(Path::new(&asset.path), buckets, 8_000)
+    }
+
+    /// [`Project::decode_energy`] that `cancel` can stop ([`Error::Cancelled`]).
+    pub fn decode_energy_cancellable(asset: &Asset, buckets: usize, cancel: &dyn Fn() -> bool) -> Result<Vec<f32>> {
+        engine::energy_envelope_cancellable(Path::new(&asset.path), buckets, 8_000, cancel)
     }
 
     // ---- timeline ---------------------------------------------------------
@@ -2240,6 +2331,7 @@ impl Project {
                         updated_at: parse_dt(&updated_at)?,
                         owner,
                         assets: assets.as_deref().map(serde_json::from_str).transpose()?.unwrap_or_default(),
+                        discarded_by_user: false,
                     })
                 },
             )
@@ -2371,6 +2463,26 @@ impl Project {
             Some(Some(held)) if owner != Some(held.as_str()) => Err(Error::StagedEditOwnedByOther),
             _ => Ok(()),
         }
+    }
+
+    /// Let go of a proposal whose agent session is gone. `gone` is asked about the session that
+    /// owns the open proposal (if any) and says whether that connection no longer exists — it
+    /// closed, expired, or the server was restarted (a new token). Such a proposal is nobody's:
+    /// its owner is cleared, so the agent that reconnected, or the next named session to edit it,
+    /// takes it over ([`Project::ensure_agent_staging`]) instead of being told another agent owns
+    /// it. Returns whether an owner was released. Writes nothing when there is no owner.
+    pub fn release_orphaned_staging(&self, gone: impl FnOnce(&str) -> bool) -> Result<bool> {
+        let owner: Option<Option<String>> = self
+            .conn
+            .query_row("SELECT owner FROM staged WHERE id = 1", [], |r| r.get(0))
+            .optional()?;
+        let Some(Some(owner)) = owner else { return Ok(false) };
+        if !gone(&owner) {
+            return Ok(false);
+        }
+        self.conn
+            .execute("UPDATE staged SET owner = NULL WHERE id = 1 AND owner = ?1", params![owner])?;
+        Ok(true)
     }
 
     /// Give a proposal that has no owner to the session the current call declared, if it named
@@ -2713,7 +2825,9 @@ impl Project {
     /// Close the open proposal `row` without asking who may, keeping it if it held anything.
     fn discard_row(&self, row: &StagedRow) -> Result<()> {
         if !row.edits.is_empty() || !row.assets.is_empty() {
-            self.set_meta(DISCARDED_STAGED, &serde_json::to_string(row)?)?;
+            let mut kept = serde_json::to_value(row)?;
+            kept["discarded_by_user"] = (self.actor != EditSource::Agent).into();
+            self.set_meta(DISCARDED_STAGED, &kept.to_string())?;
         }
         self.clear_staged()?;
         Ok(())
@@ -2739,12 +2853,18 @@ impl Project {
     /// ([`Error::StagedEditPending`] otherwise), and once: the copy is spent. It comes back as it
     /// was (its steps, its held-back asset changes) but with no undo history, and it may now be
     /// `stale`. The user's restoring it leaves it owned by no session; an agent's keeps the
-    /// ownership rule.
+    /// ownership rule — and an agent may only bring back what an agent discarded: a proposal the
+    /// user threw away stays thrown away unless the user restores it.
     pub fn restore_discarded(&self) -> Result<StagedEdit> {
         if self.staged_exists()? {
             return Err(Error::StagedEditPending);
         }
         let mut row = self.discarded_row()?.ok_or(Error::NoDiscardedEdit)?;
+        if self.actor == EditSource::Agent && row.discarded_by_user {
+            return Err(Error::InvalidArgument(
+                "the user discarded that proposal; only they can bring it back in Kerf".to_string(),
+            ));
+        }
         self.check_owner(row.owner.as_deref())?;
         row.owner = match self.actor {
             EditSource::Agent => self.agent_owner.borrow().clone(),
@@ -5110,16 +5230,19 @@ impl Project {
 
     /// Drop a task, and with it any proposal staged under it — dismissing the
     /// task is how the user says no to the edit.
+    ///
+    /// The proposal goes first and the whole is one transaction: an agent that does not own the
+    /// proposal ([`Error::StagedEditOwnedByOther`]) is refused with the task still in the queue,
+    /// not after it was deleted.
     pub fn remove_task(&self, id: Uuid) -> Result<()> {
-        let affected = self
-            .conn
-            .execute("DELETE FROM tasks WHERE id = ?1", params![id.to_string()])?;
-        if affected == 0 {
-            return Err(Error::TaskNotFound(id));
-        }
+        self.require_task(id)?;
+        let tx = self.conn.unchecked_transaction()?;
         if self.staged_row()?.is_some_and(|r| r.task_id == Some(id)) {
             self.discard_staged()?;
         }
+        self.conn
+            .execute("DELETE FROM tasks WHERE id = ?1", params![id.to_string()])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -6810,6 +6933,9 @@ struct StagedRow {
     owner: Option<String>,
     #[serde(default)]
     assets: Vec<StagedAssetChange>,
+    /// Set on the copy kept by a discard: the user threw it away, so an agent may not bring it back.
+    #[serde(default)]
+    discarded_by_user: bool,
 }
 
 /// What [`Project::apply_staged_subset`] did.

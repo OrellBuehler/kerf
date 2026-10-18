@@ -84,7 +84,12 @@ fn parse_loudness(stderr: &str) -> Option<Loudness> {
 /// slice actually feels, so an agent can match cut pacing to musical energy or
 /// find the quiet/loud passages. Same shape as the waveform so both render alike.
 pub fn energy_envelope(path: &Path, buckets: usize, sample_rate: u32) -> Result<Vec<f32>> {
-    let samples = decode_audio_mono_f32(path, sample_rate, &|| false)?;
+    energy_envelope_cancellable(path, buckets, sample_rate, &|| false)
+}
+
+/// [`energy_envelope`] that gives up with [`Error::Cancelled`] once `cancel` is true.
+pub fn energy_envelope_cancellable(path: &Path, buckets: usize, sample_rate: u32, cancel: &dyn Fn() -> bool) -> Result<Vec<f32>> {
+    let samples = decode_audio_mono_f32(path, sample_rate, cancel)?;
     Ok(rms_buckets(&samples, buckets.max(1)))
 }
 

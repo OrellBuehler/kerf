@@ -543,6 +543,7 @@ impl GpuPreview {
         self.retire(session);
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     /// What the sessions did so far.
     pub(super) fn play_diagnostics(&self) -> PlayTally {
         let mut tally = *lock(&self.play_tally);

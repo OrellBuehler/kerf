@@ -31,12 +31,40 @@ fn unsaved_work(project: &Project) -> Result<bool, McpError> {
         || timeline.tracks.iter().any(|t| !t.clips.is_empty()))
 }
 
-/// Refuse to replace the open project when that would lose unsaved work, unless told to.
+/// Refuse to replace the open project when that would lose unsaved work, unless told to — and
+/// while the user reviews agent edits, not even then: throwing their work away is something only
+/// they confirm, in Kerf's window, so `discard_unsaved` is the way to do it only with review off.
 fn require_discard_ok(project: &Project, discard_unsaved: bool) -> Result<(), McpError> {
-    if !discard_unsaved && unsaved_work(project)? {
+    if !unsaved_work(project)? {
+        return Ok(());
+    }
+    if !discard_unsaved {
         return Err(McpError::invalid_params(
             "the open project has work that was never saved (it lives only in memory) and would be lost. Save it first with \
              save_project_as, or pass discard_unsaved=true if the user said to throw it away",
+            None,
+        ));
+    }
+    if project.agent_review() {
+        return Err(McpError::invalid_params(
+            "the open project has work that was never saved, and the user is reviewing agent edits: only they can throw it \
+             away. Save it with save_project_as, or ask them to open or start the other project in Kerf",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// With the user's review on, an agent does not replace a file that is there, whatever `overwrite`
+/// says: destruction nobody reviews is the user's to do. (A path that does not exist is nobody's loss.)
+fn refuse_replacing_while_reviewing(path: &Path, overwrite: bool, review: bool) -> Result<(), McpError> {
+    if overwrite && review && path.exists() {
+        return Err(McpError::invalid_params(
+            format!(
+                "{} already exists, and while the user reviews agent edits only they can replace a file: save under \
+                 a new name, or ask them",
+                path.display()
+            ),
             None,
         ));
     }
@@ -64,7 +92,9 @@ fn project_path_arg(path: &str) -> Result<std::path::PathBuf, McpError> {
 pub(super) struct SaveAsParams {
     #[schemars(description = "Absolute path of the .kerf file to write")]
     path: String,
-    #[schemars(description = "Replace the file if it already exists (default false: the call fails naming it)")]
+    #[schemars(
+        description = "Replace the file if it already exists (default false: the call fails naming it). Refused while the user reviews agent edits"
+    )]
     overwrite: Option<bool>,
 }
 
@@ -73,7 +103,7 @@ pub(super) struct OpenParams {
     #[schemars(description = "Absolute path of the .kerf file to open")]
     path: String,
     #[schemars(
-        description = "Open it even though the project that is open has work that was never saved (it would be lost). Default false"
+        description = "Open it even though the project that is open has work that was never saved (it would be lost). Default false; refused while the user reviews agent edits — ask them"
     )]
     discard_unsaved: Option<bool>,
 }
@@ -81,7 +111,7 @@ pub(super) struct OpenParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub(super) struct NewParams {
     #[schemars(
-        description = "Start the new project even though the project that is open has work that was never saved (it would be lost). Default false"
+        description = "Start the new project even though the project that is open has work that was never saved (it would be lost). Default false; refused while the user reviews agent edits — ask them"
     )]
     discard_unsaved: Option<bool>,
 }
@@ -267,41 +297,57 @@ impl KerfMcp {
 
     #[tool(
         description = "Save the project to a new .kerf file and carry on working in that file. `path` is absolute and \
-                       ends in .kerf; an existing file is refused unless `overwrite`. Onto the file that is already open \
-                       this does nothing. The window follows to the new file."
+                       ends in .kerf; an existing file is refused unless `overwrite` — and while the user reviews agent \
+                       edits (the default) an existing file is never replaced by you, whatever `overwrite` says: pick a new \
+                       name. Not onto a file the project or Kerf itself needs (a source, a proxy, the settings). Onto the \
+                       file that is already open this does nothing. The window follows to the new file; jobs already running \
+                       carry on in it."
     )]
     async fn save_project_as(&self, Parameters(p): Parameters<SaveAsParams>) -> Result<String, McpError> {
         let path = project_path_arg(&p.path)?;
         let overwrite = p.overwrite.unwrap_or(false);
         let (shared, owner, app) = (self.project.clone(), self.owner(), self.app.clone());
         let saved = blocking(move || {
-            let open = lock_agent_as(&shared, owner.as_deref()).path().map(Path::to_path_buf);
+            let (open, review) = {
+                let project = lock_agent_as(&shared, owner.as_deref());
+                (project.path().map(Path::to_path_buf), project.agent_review())
+            };
             // Onto the file that is open there is nothing to do; onto another one that exists, only
             // if told. Both look at the disk, so neither is asked under the lock.
             if open.is_some_and(|open| kerf_core::paths::same_file(&open, &path)) {
                 return Ok(None);
             }
             super::refuse_overwrite(&path, overwrite)?;
-            let before = {
+            // Replacing a file that is there is destruction nobody reviews: with the user's review on
+            // it is theirs to do (an agent writes a new name), whatever `overwrite` says.
+            refuse_replacing_while_reviewing(&path, overwrite, review)?;
+            // Not onto a file the project or Kerf needs (a source, a proxy, the settings, the logs).
+            super::check_outputs_now(&shared, owner.as_deref(), std::slice::from_ref(&path))?;
+            let (generation, before) = {
                 // `save_as` refuses a file the project still uses (a source, a proxy) itself.
                 let project = lock_agent_as(&shared, owner.as_deref());
                 project.save_as(&path).map_err(core_err)?;
-                project.change_count()
+                (project.generation(), project.change_count())
             };
             let opened = Project::open(&path).map_err(core_err)?;
             let mut project = lock_agent_as(&shared, owner.as_deref());
+            // The project may have been replaced while the copy was written: it is not switched to.
+            super::require_generation(&project, generation, "it was being saved")?;
+            // The copy is the same project in another file, so the jobs in flight still land: the
+            // swap keeps the generation.
             if project.change_count() == before {
-                project.replace_with(opened);
+                project.replace_with_saved_copy(opened);
             } else {
                 // Something wrote while the copy was being reopened (analysis merged, an edit):
                 // the copy is out of date, so make it again under one held lock.
                 drop(opened);
                 project.save_as(&path).map_err(core_err)?;
-                project.replace_with(Project::open(&path).map_err(core_err)?);
+                project.replace_with_saved_copy(Project::open(&path).map_err(core_err)?);
             }
             let saved = project.path().map(|p| p.display().to_string());
             drop(project);
             app.state::<crate::AppState>().scrub.clear();
+            crate::note_open(&app, saved.as_deref());
             Ok(Some(saved))
         })
         .await?;
@@ -317,7 +363,9 @@ impl KerfMcp {
     #[tool(
         description = "Open an existing .kerf project, replacing the one that is open (the window switches to it). Refused \
                        while the open project has work that was never saved, unless `discard_unsaved` — a saved project \
-                       loses nothing. Your staged proposal belongs to the project it was made on and does not follow."
+                       loses nothing. `discard_unsaved` only works while the user has agent review switched off; with it on \
+                       (the default) throwing unsaved work away is theirs to confirm in Kerf — save it with save_project_as \
+                       or ask them. Your staged proposal belongs to the project it was made on and does not follow."
     )]
     async fn open_project(&self, Parameters(p): Parameters<OpenParams>) -> Result<String, McpError> {
         let path = project_path_arg(&p.path)?;
@@ -336,6 +384,7 @@ impl KerfMcp {
             let now = project.path().map(|p| p.display().to_string());
             drop(project);
             Self::after_replace(&app, &shared);
+            crate::note_open(&app, now.as_deref());
             Ok(now)
         })
         .await?;
@@ -345,8 +394,9 @@ impl KerfMcp {
 
     #[tool(
         description = "Start a new, empty project in memory, replacing the one that is open (the window switches to it). \
-                       Refused while the open project has work that was never saved, unless `discard_unsaved`. The new \
-                       project has no file until save_project_as."
+                       Refused while the open project has work that was never saved, unless `discard_unsaved` (which, like \
+                       open_project, only works while the user has agent review off). The new project has no file until \
+                       save_project_as."
     )]
     async fn new_project(&self, Parameters(p): Parameters<NewParams>) -> Result<String, McpError> {
         let discard = p.discard_unsaved.unwrap_or(false);
@@ -359,6 +409,8 @@ impl KerfMcp {
             project.replace_with(fresh);
             drop(project);
             Self::after_replace(&app, &shared);
+            // A project with no file is nothing for a launch to reopen.
+            crate::note_open(&app, None);
             Ok(())
         })
         .await?;
@@ -404,7 +456,11 @@ impl KerfMcp {
             Ok(stored)
         })
         .await?;
-        self.notify("settings-changed");
+        // The window's own copy of the settings (the full `SettingsView`, as `get_settings` answers it
+        // there) is told what they are now.
+        if let Err(e) = tauri::Emitter::emit(&self.app, "settings-changed", settings::SettingsView::current(&stored)) {
+            tracing::warn!(error = %e, "failed to emit settings-changed");
+        }
         json(&readable_settings(&stored))
     }
 }
@@ -450,6 +506,30 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_does_not_replace_an_existing_file_while_review_is_on() {
+        let dir = std::env::temp_dir().join(format!("kerf-mcp-over-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("theirs.kerf");
+        std::fs::write(&existing, "x").unwrap();
+        let err = refuse_replacing_while_reviewing(&existing, true, true).expect_err("review is on");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("only they can replace a file"), "{}", err.message);
+        assert!(
+            refuse_replacing_while_reviewing(&existing, true, false).is_ok(),
+            "with review off it may"
+        );
+        assert!(
+            refuse_replacing_while_reviewing(&existing, false, true).is_ok(),
+            "no overwrite asked: `refuse_overwrite` is the one that says no"
+        );
+        assert!(
+            refuse_replacing_while_reviewing(&dir.join("new.kerf"), true, true).is_ok(),
+            "nothing there to lose"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_fresh_in_memory_project_has_nothing_to_lose() {
         let project = Project::open_in_memory().unwrap();
         assert!(!unsaved_work(&project).unwrap());
@@ -468,7 +548,27 @@ mod tests {
             "{}",
             err.message
         );
-        assert!(require_discard_ok(&project, true).is_ok(), "with the flag it goes ahead");
+        // The flag is not enough while the user reviews agent edits: throwing work away is theirs.
+        let err = require_discard_ok(&project, true).expect_err("review is on");
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("only they can throw it away"), "{}", err.message);
+        project.set_agent_review(false);
+        assert!(
+            require_discard_ok(&project, true).is_ok(),
+            "with review off and the flag it goes ahead"
+        );
+        assert!(
+            require_discard_ok(&project, false).is_err(),
+            "and without the flag it still does not"
+        );
+    }
+
+    #[test]
+    fn nothing_to_lose_is_never_refused_review_or_not() {
+        let project = Project::open_in_memory().unwrap();
+        assert!(project.agent_review());
+        assert!(require_discard_ok(&project, true).is_ok());
+        assert!(require_discard_ok(&project, false).is_ok());
     }
 
     #[test]

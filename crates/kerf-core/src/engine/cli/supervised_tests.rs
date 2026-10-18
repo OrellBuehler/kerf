@@ -498,6 +498,60 @@ mod real {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The reads an agent asks for — a waveform, a pyramid window, an energy curve, a contact sheet,
+    /// a composited still — stop when the request that asked is dropped, and what they stopped is
+    /// not kept: the same call afterwards decodes and answers.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored agent_reads_stop`
+    #[test]
+    #[ignore = "drives the ffmpeg binary"]
+    fn agent_reads_stop_when_their_request_is_dropped() {
+        use crate::engine::{energy_envelope_cancellable, waveform_range_of_cancellable};
+        let dir = dir("agent-reads");
+        let wav = make(
+            &dir,
+            "a.wav",
+            &["-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:a", "pcm_s16le"],
+        );
+        assert!(matches!(
+            waveform_cancellable(&wav, 20, 8_000, &|| true),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(waveform_cancellable(&wav, 20, 8_000, &|| false).unwrap().len(), 20);
+
+        assert!(matches!(
+            waveform_range_of_cancellable(&wav, 0.0, 1.0, 10, &|| true),
+            Err(Error::Cancelled)
+        ));
+        let window = waveform_range_of_cancellable(&wav, 0.0, 1.0, 10, &|| false).expect("a stopped decode cached nothing");
+        assert_eq!(window.buckets, 10);
+
+        assert!(matches!(
+            energy_envelope_cancellable(&wav, 10, 8_000, &|| true),
+            Err(Error::Cancelled)
+        ));
+        assert_eq!(energy_envelope_cancellable(&wav, 10, 8_000, &|| false).unwrap().len(), 10);
+
+        let (timeline, assets) = long_cut(&dir, 2);
+        let video = PathBuf::from(&assets[0].path);
+        assert!(matches!(
+            contact_sheet_cancellable(&video, 0.0, 2.0, 2, 2, 80, 5, &|| true),
+            Err(Error::Cancelled)
+        ));
+        let (sheet, times) = contact_sheet_cancellable(&video, 0.0, 2.0, 2, 2, 80, 5, &|| false).expect("sheet");
+        assert!(!sheet.is_empty() && times.len() == 4);
+
+        let opts = ExportOptions::default();
+        assert!(matches!(
+            timeline_frame_cancellable(&timeline, &assets, &opts, 0.5, 320, 4, &|| true),
+            Err(Error::Cancelled)
+        ));
+        assert!(!timeline_frame_cancellable(&timeline, &assets, &opts, 0.5, 320, 4, &|| false)
+            .expect("still")
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---- exports: what a cancel or a failure leaves behind --------------------------------
 
     use crate::engine::test_support::{av_asset, make_clip, timeline_of, video_stream, video_track};

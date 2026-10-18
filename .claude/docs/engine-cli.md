@@ -13,7 +13,7 @@ so the feature is **only** activated through these forwards — which is what ma
 - `cli.rs` is **always compiled** and drives the `ffmpeg` / `ffprobe` **binaries**
   (override with `KERF_FFMPEG` / `KERF_FFPROBE`). Probe, `silencedetect`, scene
   detection, preview frames (`frame_at`; `frame_jpeg` for a low-res JPEG), the
-  per-asset **contact sheet** (`contact_sheet` — a `tile`d grid of frames sampled
+  per-asset **contact sheet** (`contact_sheet_cancellable` — a `tile`d grid of frames sampled
   across a range, for skimming footage), the **salience map** behind smart crop
   (`salience_map` / `build_salience_args` / `score_salience`, the last two pure +
   unit-tested — one pass decodes ~48 tiny gray frames of a source window and scores
@@ -21,7 +21,7 @@ so the feature is **only** activated through these forwards — which is what ma
   scores on detail and a follow shot on both; deliberately *not* face detection —
   no model to ship, and the answer only has to beat a centre crop) and the
   **composited timeline still**
-  (`timeline_frame` / `build_still_args`, pure + unit-tested — overlays
+  (`timeline_frame_cancellable` / `build_still_args`, pure + unit-tested — overlays
   every clip visible at a timeline time onto a black canvas, mirroring the export
   geometry, so an agent can *see the cut*), the **cover frame** (`export_still` —
   the same graph and the same builder, but a `StillOutput::File` sink and no

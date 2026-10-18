@@ -11,7 +11,7 @@ use crate::settings;
 type CmdResult<T> = Result<T, String>;
 
 /// What the Agent settings page shows and the user copies into a client.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct McpConnectionInfo {
     /// Whether the server is switched on.
     pub enabled: bool,
@@ -22,6 +22,9 @@ pub struct McpConnectionInfo {
     /// The bearer token (always present once the app has started once; sent even when it is not
     /// required so the page can show it before the user turns the requirement back on).
     pub token: Option<String>,
+    /// Why the token is not what it should be: it could not be saved (it works until Kerf quits)
+    /// or could not be made at all (the server stays off while one is required). `null` when fine.
+    pub token_problem: Option<String>,
     /// Whether the listener is up now.
     pub running: bool,
     /// Why it is not, when it should be.
@@ -45,6 +48,7 @@ impl From<ConnectionInfo> for McpConnectionInfo {
             url: c.url,
             require_token: c.require_token,
             token: c.token,
+            token_problem: c.token_problem,
             running: c.running,
             error: c.error,
             configured_addr: c.configured_addr,
@@ -66,10 +70,11 @@ pub fn mcp_connection_info(app: AppHandle) -> McpConnectionInfo {
     info(&app)
 }
 
-/// Make a new token. The old one stops working at once; every client has to be given the new one.
+/// Make a new token. The old one stops working at once — the server restarts, which ends every
+/// session opened under it — and every client has to be given the new one.
 #[tauri::command(async)]
 pub fn regenerate_mcp_token(app: AppHandle) -> CmdResult<String> {
-    let token = mcp::generate_token();
+    let token = mcp::generate_token()?;
     settings::update(&app, &serde_json::json!({ "mcp_token": token }))?;
     Ok(token)
 }

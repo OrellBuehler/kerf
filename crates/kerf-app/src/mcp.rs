@@ -109,6 +109,18 @@ struct RevisionDiffParams {
     seq: i64,
     #[schemars(description = "Compare against this revision seq instead of `seq - 1`")]
     from: Option<i64>,
+    #[schemars(description = "Skip this many changes (default 0), to page on; `entries.next_offset` is the next page")]
+    offset: Option<usize>,
+    #[schemars(description = "Most changes to return (default 100, at most 500)")]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+struct DiffPageParams {
+    #[schemars(description = "Skip this many changes (default 0), to page on; `diff.entries.next_offset` is the next page")]
+    offset: Option<usize>,
+    #[schemars(description = "Most changes to return (default 100, at most 500)")]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1276,6 +1288,12 @@ struct TimelineStateParams {
     captions_offset: Option<usize>,
     #[schemars(description = "How many generated captions the window holds (default 20, at most 500)")]
     captions_limit: Option<usize>,
+    #[schemars(
+        description = "Which clip (in track order) the clip window starts at (default 0). A cut of up to 200 clips is shown whole; a longer one is windowed and `clips_window.next_offset` is the next page"
+    )]
+    clips_offset: Option<usize>,
+    #[schemars(description = "How many clips the window holds (default 200, at most 1000)")]
+    clips_limit: Option<usize>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1855,7 +1873,10 @@ impl KerfMcp {
         let me = self.clone();
         let owner = self.owner();
         let generation = self.lock().generation();
+        // The GUI's Stop on an import ends an agent's import too.
+        let gui_stop = self.app.state::<crate::AppState>().begin_import();
         self.long_tool("import_asset", p.background, &context, move |run| async move {
+            let run = run.also_cancelled_by(gui_stop);
             let (project, app) = (me.project.clone(), me.app.clone());
             let path = p.path;
             let asset = blocking(move || {
@@ -1918,16 +1939,24 @@ impl KerfMcp {
                        off (switched off in Settings › Analysis, or no speech-to-text backend). Use it to see what \
                        analyze_asset still has to do before an edit that reads the result."
     )]
-    fn analysis_status(&self, Parameters(p): Parameters<ProxyStatusParams>) -> Result<String, McpError> {
+    async fn analysis_status(&self, Parameters(p): Parameters<ProxyStatusParams>) -> Result<String, McpError> {
         let wanted = p.asset_id.as_deref().map(|s| parse_arg("asset_id", s)).transpose()?;
-        let project = self.lock();
-        match wanted {
-            Some(id) => {
-                project.require_asset(id).map_err(core_err)?;
-                json(&vec![project.analysis_status(id).map_err(core_err)?])
+        let (project, owner) = (self.project.clone(), self.owner());
+        let statuses = blocking(move || {
+            // The transcription backend may need an ffmpeg start the first time it is asked: before
+            // the lock, never inside it.
+            crate::warm_transcription_backend();
+            let project = lock_agent_as(&project, owner.as_deref());
+            match wanted {
+                Some(id) => {
+                    project.require_asset(id).map_err(core_err)?;
+                    Ok(vec![project.analysis_status(id).map_err(core_err)?])
+                }
+                None => project.analysis_statuses().map_err(core_err),
             }
-            None => json(&project.analysis_statuses().map_err(core_err)?),
-        }
+        })
+        .await?;
+        json(&statuses)
     }
 
     #[tool(
@@ -1983,6 +2012,8 @@ impl KerfMcp {
             full,
             captions_offset: p.captions_offset,
             captions_limit: p.captions_limit,
+            clips_offset: p.clips_offset,
+            clips_limit: p.clips_limit,
         };
         json(&reads::timeline_state(&timeline, &view)?)
     }
@@ -2014,7 +2045,10 @@ impl KerfMcp {
             ));
         }
         let app = self.app.clone();
+        // The GUI's Cancel on the model download ends an agent's download too.
+        let gui_stop = app.state::<crate::AppState>().begin_model_download();
         self.long_tool("download_speech_model", p.background, &context, move |run| async move {
+            let run = run.also_cancelled_by(gui_stop);
             let model = name.clone();
             let path = blocking(move || {
                 let mut on_progress = |d: kerf_core::DownloadProgress| {
@@ -2075,15 +2109,12 @@ impl KerfMcp {
             kerf_core::resolve_steps(&asset, steps.as_deref()).map_err(core_err)?;
             project.generation()
         };
-        // The GUI's Stop button stops an agent's analysis too: it trips this flag, which a new run
-        // clears (`begin_analysis`, as the GUI's own command does) and polls.
+        // The GUI's Stop button stops an agent's analysis too: this run polls the same stop the
+        // GUI's own does (`begin_analysis`), and a Stop pressed before it began does not end it.
         let gui_stop = self.app.state::<crate::AppState>().begin_analysis();
         let (me, owner) = (self.clone(), self.owner());
         self.long_tool("analyze_asset", p.background, &context, move |run| async move {
-            let run = run.also_cancelled_by({
-                let stop = gui_stop.clone();
-                move || stop.load(Ordering::SeqCst)
-            });
+            let run = run.also_cancelled_by(gui_stop);
             let (project, app) = (me.project.clone(), me.app.clone());
             let outcome = blocking(move || {
                 // Heavy ffmpeg analysis with the lock released, re-locking only to merge each
@@ -2436,7 +2467,7 @@ impl KerfMcp {
         let track_id = parse_arg("track_id", &p.track_id)?;
         self.edit(|project| {
             let track = project.set_track_duck(track_id, p.duck).map_err(core_err)?;
-            json(&track)
+            json(&reads::track_brief(&track))
         })
     }
 
@@ -2497,7 +2528,7 @@ impl KerfMcp {
         let track_id = parse_arg("track_id", &p.track_id)?;
         self.edit(|project| {
             let track = project.set_track_volume(track_id, p.volume).map_err(core_err)?;
-            json(&track)
+            json(&reads::track_brief(&track))
         })
     }
 
@@ -2511,7 +2542,7 @@ impl KerfMcp {
         let track_id = parse_arg("track_id", &p.track_id)?;
         self.edit(|project| {
             let track = project.set_track_pan(track_id, p.pan).map_err(core_err)?;
-            json(&track)
+            json(&reads::track_brief(&track))
         })
     }
 
@@ -2577,7 +2608,7 @@ impl KerfMcp {
         };
         self.edit(|project| {
             let timeline = project.set_delivery_format(format).map_err(core_err)?;
-            json(&timeline)
+            json(&serde_json::json!({ "format": timeline.format, "timeline": reads::timeline_brief(&timeline) }))
         })
     }
 
@@ -2620,7 +2651,7 @@ impl KerfMcp {
         let track_id = parse_arg("track_id", &p.track_id)?;
         self.edit(|project| {
             let track = project.set_track_muted(track_id, p.muted).map_err(core_err)?;
-            json(&track)
+            json(&reads::track_brief(&track))
         })
     }
 
@@ -2633,7 +2664,7 @@ impl KerfMcp {
         let track_id = parse_arg("track_id", &p.track_id)?;
         self.edit(|project| {
             let track = project.set_track_solo(track_id, p.solo).map_err(core_err)?;
-            json(&track)
+            json(&reads::track_brief(&track))
         })
     }
 
@@ -2645,7 +2676,7 @@ impl KerfMcp {
         let track_id = parse_arg("track_id", &p.track_id)?;
         self.edit(|project| {
             let track = project.set_track_locked(track_id, p.locked).map_err(core_err)?;
-            json(&track)
+            json(&reads::track_brief(&track))
         })
     }
 
@@ -2761,8 +2792,9 @@ impl KerfMcp {
         description = "Turn ripple mode on or off for the project (see get_ripple_mode). This flips the USER's \
                        setting, which shows in their toolbar and stays until changed again, and it applies at \
                        once — also to your staged edits. It is not an edit: no revision, and the timeline does \
-                       not move. To ripple (or not) for one call, pass `ripple` to trim / set_speed / remove / \
-                       remove_clips / add_clip_to_timeline instead, unless the user asked you to switch modes."
+                       not move. While the user has agent review switched on (the default) it is refused: pass \
+                       `ripple` to trim / set_speed / remove / remove_clips / add_clip_to_timeline to ripple (or not) \
+                       for one call, or ask the user to switch modes."
     )]
     fn set_ripple_mode(&self, Parameters(p): Parameters<SetRippleModeParams>) -> Result<String, McpError> {
         let on = {
@@ -3444,9 +3476,9 @@ impl KerfMcp {
                         },
                     );
                 };
-                let asset =
-                    Project::synthesize_voiceover(&p.text, &voice, p.speed.unwrap_or(1.0), &mut on_progress, &|| run.cancelled())
-                        .map_err(core_err)?;
+                let stop = crate::stop_or_replaced(|| run.cancelled(), &project, generation);
+                let asset = Project::synthesize_voiceover(&p.text, &voice, p.speed.unwrap_or(1.0), &mut on_progress, &stop)
+                    .map_err(core_err)?;
                 // Landing it is an edit of the cut, so it goes into the proposal.
                 let project = lock_agent_edit(&project, owner.as_deref())?;
                 require_generation(&project, generation, "the narration was being made")?;
@@ -3533,7 +3565,8 @@ impl KerfMcp {
                         },
                     );
                 };
-                let stems = Project::separate_stems_media(&asset, &mut on_progress, &|| run.cancelled()).map_err(core_err)?;
+                let stop = crate::stop_or_replaced(|| run.cancelled(), &project, generation);
+                let stems = Project::separate_stems_media(&asset, &mut on_progress, &stop).map_err(core_err)?;
                 // The stems land in the library either way; laying them under a clip is an edit.
                 let project = match clip_id {
                     Some(_) => lock_agent_edit(&project, owner.as_deref())?,
@@ -3606,10 +3639,11 @@ impl KerfMcp {
                     let project = lock_agent_as(&project, owner.as_deref());
                     (project.smart_crop_inputs(clip).map_err(core_err)?, project.generation())
                 };
+                let stop = crate::stop_or_replaced(|| run.cancelled(), &project, generation);
                 let crops = Project::sample_smart_crops_with(
                     &plan,
                     &mut |f| run.progress(Some(f64::from(f)), "sampling where each shot's content sits"),
-                    &|| run.cancelled(),
+                    &stop,
                 )
                 .map_err(core_err)?;
                 let guard = lock_agent_edit(&project, owner.as_deref())?;
@@ -3894,19 +3928,22 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "What your staged edits would change about the user's cut — every add, cut, move, retrim and \
-                       adjustment (each entry has an `id`), plus the runtime before and after, `undo_depth` (how many \
-                       steps undo_staged_edit can take back) and any held-back library changes. Returns null when \
-                       nothing is staged."
+        description = "What your staged edits would change about the user's cut: `diff.entries` — every add, cut, move, \
+                       retrim and adjustment (each has an `id`), a page at a time (`limit` default 100, at most 500, from \
+                       `offset`; `diff.entries.next_offset` pages on) — with the runtime and clip count before and after, \
+                       and `staged` (the headline, your note, `undo_depth` — how many steps undo_staged_edit can take back \
+                       — and whether it is `stale`) and any held-back library changes under `asset_changes`. Returns null \
+                       when nothing is staged."
     )]
-    fn staged_diff(&self) -> Result<String, McpError> {
+    fn staged_diff(&self, Parameters(p): Parameters<DiffPageParams>) -> Result<String, McpError> {
         let project = self.lock();
         match project.staged().map_err(core_err)? {
             None => json(&serde_json::json!(null)),
-            Some(staged) => {
-                let summary = staged.diff.summary();
-                json(&serde_json::json!({ "staged": staged, "summary": summary }))
-            }
+            Some(staged) => json(&serde_json::json!({
+                "staged": reads::staged_brief(&staged),
+                "asset_changes": staged.asset_changes,
+                "diff": reads::diff_page(&staged.diff, p.offset, p.limit),
+            })),
         }
     }
 
@@ -3950,9 +3987,9 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Bring back the proposal that was last discarded (by discard_staged_edits or by the user), once, and \
-                       only while no proposal is open. It returns as it was, without its undo history, and may be `stale` \
-                       if the user edited the timeline since."
+        description = "Bring back the proposal YOU last discarded (discard_staged_edits), once, and only while no proposal \
+                       is open. It returns as it was, without its undo history, and may be `stale` if the user edited the \
+                       timeline since. A proposal the user discarded is theirs to bring back, in Kerf: this refuses it."
     )]
     fn restore_discarded_edits(&self) -> Result<String, McpError> {
         self.act(|project| {
@@ -3992,15 +4029,18 @@ impl KerfMcp {
         })
     }
 
-    #[tool(description = "Explain what one revision changed (see history), as a list of edits to the cut")]
+    #[tool(
+        description = "Explain what one revision changed (see history), as a list of edits to the cut: `diff.entries` a \
+                       page at a time (`limit` default 100, at most 500, from `offset`; `diff.entries.next_offset` pages on), \
+                       with the headline and the runtime and clip count before and after."
+    )]
     fn revision_diff(&self, Parameters(p): Parameters<RevisionDiffParams>) -> Result<String, McpError> {
         let project = self.lock();
         let diff = match p.from {
             Some(from) => project.diff_revisions(from, p.seq).map_err(core_err)?,
             None => project.revision_diff(p.seq).map_err(core_err)?,
         };
-        let summary = diff.summary();
-        json(&serde_json::json!({ "diff": diff, "summary": summary }))
+        json(&serde_json::json!({ "diff": reads::diff_page(&diff, p.offset, p.limit) }))
     }
 
     #[tool(
@@ -4219,10 +4259,11 @@ impl KerfMcp {
                         .framing_inputs(&deliveries)
                         .map_err(core_err)?;
                     if !plan.jobs.is_empty() {
+                        let stop = crate::stop_or_replaced(|| run.cancelled(), &project, generation);
                         let framings = Project::sample_framings_with(
                             &plan,
                             &mut |f| run.progress(Some(f64::from(f) * 0.1), "framing each shot"),
-                            &|| run.cancelled(),
+                            &stop,
                         )
                         .map_err(core_err)?;
                         let guard = lock_agent_edit(&project, owner.as_deref())?;
@@ -4331,16 +4372,26 @@ impl KerfMcp {
         refuse_overwrite(&output, p.overwrite.unwrap_or(false))?;
         self.check_outputs(std::slice::from_ref(&output)).await?;
         let (project, owner) = (self.project.clone(), self.owner());
-        let cancel = context.ct.clone();
         let time_secs = p.time_secs;
+        // The request's own cancellation, and the GUI's Cancel on a cover; progress rides the
+        // request's `progressToken` in the stages a one-frame render has.
+        let gui_stop = self.app.state::<crate::AppState>().begin_cover_export();
+        let (run, relay) = jobs::foreground(&context);
+        let run = run.also_cancelled_by(gui_stop);
         let written = blocking(move || {
+            run.progress(Some(0.1), "reading the cut");
             let (timeline, assets) = lock_agent_as(&project, owner.as_deref())
                 .export_still_inputs()
                 .map_err(core_err)?;
-            Project::render_still_cancellable(&timeline, &assets, time_secs, &output, None, &|| cancel.is_cancelled())
-                .map_err(core_err)
+            run.progress(Some(0.2), "rendering the cover frame");
+            let written = Project::render_still_cancellable(&timeline, &assets, time_secs, &output, None, &|| run.cancelled())
+                .map_err(core_err)?;
+            run.progress(Some(1.0), "cover written");
+            Ok(written)
         })
-        .await?;
+        .await;
+        relay.finish().await;
+        let written = written?;
         json(&serde_json::json!({ "output": written.to_string_lossy() }))
     }
 
@@ -4380,7 +4431,9 @@ impl KerfMcp {
 
     #[tool(
         description = "Claim the oldest queued task (marks it working) and return it; returns null when the queue is empty. \
-                       Claiming opens a proposal for the task: every edit you make is held for the user's review."
+                       Claiming opens a proposal for the task, whether or not the user has review switched on: your edits go \
+                       into it instead of the live cut, and the user reviews and accepts it in Kerf (only with review off \
+                       may you apply_staged_edits yourself)."
     )]
     fn claim_next_task(&self) -> Result<String, McpError> {
         let owner = self.owner();
@@ -4419,28 +4472,40 @@ impl KerfMcp {
         })
     }
 
-    #[tool(description = "Remove a task from the queue permanently, returning the updated task list")]
+    #[tool(
+        description = "Remove a task from the queue permanently, and with it the proposal staged under it (dismissing a task \
+                       is how the user says no to its edits; the proposal can still be brought back with \
+                       restore_discarded_edits). Refused, with the task left in the queue, when another agent session owns \
+                       that proposal. Returns the id removed and how many tasks remain (list_tasks has them)."
+    )]
     fn remove_task(&self, Parameters(p): Parameters<TaskIdParams>) -> Result<String, McpError> {
         let id = parse_arg("task_id", &p.task_id)?;
         self.act(|project| {
             project.remove_task(id).map_err(core_err)?;
-            json(&project.list_tasks().map_err(core_err)?)
+            let remaining = project.list_tasks_page(kerf_core::Page::default()).map_err(core_err)?.1;
+            json(&serde_json::json!({ "removed": id, "remaining_tasks": remaining }))
         })
     }
 
     #[tool(
         description = "Peak magnitude per bucket (0.0–1.0, unsigned) over the WHOLE of an asset's first audio stream, as a bare JSON array of `buckets` numbers (1–4096; a few hundred shows the shape). To look at a window, with a sign and per channel, use get_waveform_range; for how loud each slice FEELS use get_energy."
     )]
-    async fn get_waveform(&self, Parameters(p): Parameters<WaveformParams>) -> Result<String, McpError> {
+    async fn get_waveform(
+        &self,
+        Parameters(p): Parameters<WaveformParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
         let id = parse_arg("asset_id", &p.asset_id)?;
         let count = p.buckets.clamp(1, MAX_WAVEFORM_BUCKETS);
         let project = self.project.clone();
+        let cancel = context.ct.clone();
         let buckets = blocking(move || {
             // Resolve under the lock, decode the whole audio stream with it
             // released — bucketing a long source takes seconds and must not
-            // stall the GUI's commands on the shared mutex.
+            // stall the GUI's commands on the shared mutex. A dropped request
+            // stops the decode.
             let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
-            Project::decode_waveform(&asset, count).map_err(core_err)
+            Project::decode_waveform_cancellable(&asset, count, &|| cancel.is_cancelled()).map_err(core_err)
         })
         .await?;
         json(&buckets)
@@ -4449,18 +4514,24 @@ impl KerfMcp {
     #[tool(
         description = "Read what an asset's audio looks like over a window: the lowest and highest sample value in each of `buckets` equal slices of source time [start, end), per channel. Unlike get_waveform (one unsigned magnitude per bucket across the whole file) it is signed, one lane per channel (stereo gives two, mono one) and zoomable: ask for the whole asset in a few hundred buckets to find the loud, quiet and silent stretches, then ask again for a short window around one of them to find the exact moment a word, beat or click starts — the way to pick a cut point. Returns compact JSON {channels, buckets, duration, peaks_per_second, min, max}. `min` and `max` are each an array of `channels` arrays of `buckets` numbers in -1.0..1.0; bucket j covers source time start + j * (end - start) / buckets. `duration` is the length of the audio in seconds: a bucket before 0 or past it reads 0.0 / 0.0, so use `duration` to tell where the audio ends from silence. A value of exactly 1.0 or -1.0 is a clipped sample, and a run of them is distortion already baked into the source. `peaks_per_second` is the stored resolution the buckets were read from (10, 25, 100 or 500); when it is below buckets / (end - start) the request was finer than the stored 500 per second and neighbouring buckets repeat, so a shorter window will not reveal more. An asset with no audio stream (video-only footage, a still image) is rejected. The first call for a long file decodes it once, which can take seconds; every later window of that file is instant."
     )]
-    async fn get_waveform_range(&self, Parameters(p): Parameters<WaveformRangeParams>) -> Result<String, McpError> {
+    async fn get_waveform_range(
+        &self,
+        Parameters(p): Parameters<WaveformRangeParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
         let id = parse_arg("asset_id", &p.asset_id)?;
         require_window(p.start, p.end)?;
         let (start, end) = (p.start, p.end);
         let count = p.buckets.clamp(1, MAX_WAVEFORM_BUCKETS);
         let project = self.project.clone();
+        let cancel = context.ct.clone();
         let range = blocking(move || {
             // Resolve under the lock, read the pyramid with it released — the
             // first call for a file decodes all of its audio, which must not
-            // stall the GUI's commands on the shared mutex.
+            // stall the GUI's commands on the shared mutex. A dropped request
+            // stops that decode (and caches nothing of it).
             let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
-            Project::decode_waveform_range(&asset, start, end, count).map_err(core_err)
+            Project::decode_waveform_range_cancellable(&asset, start, end, count, &|| cancel.is_cancelled()).map_err(core_err)
         })
         .await?;
         // Compact, not `json()`'s pretty print: that puts every number of
@@ -4472,14 +4543,19 @@ impl KerfMcp {
     #[tool(
         description = "Get an RMS energy envelope (0.0–1.0 per bucket) for an asset's first audio stream — a perceptual loudness-over-time curve. Unlike the peak waveform, it tracks how loud each slice feels, so use it to find quiet/loud passages and match cut pacing to musical energy."
     )]
-    async fn get_energy(&self, Parameters(p): Parameters<WaveformParams>) -> Result<String, McpError> {
+    async fn get_energy(
+        &self,
+        Parameters(p): Parameters<WaveformParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
         let id = parse_arg("asset_id", &p.asset_id)?;
         let count = p.buckets.clamp(1, MAX_WAVEFORM_BUCKETS);
         let project = self.project.clone();
+        let cancel = context.ct.clone();
         let energy = blocking(move || {
-            // Same lock-free decode shape as `get_waveform`.
+            // Same lock-free, cancellable decode shape as `get_waveform`.
             let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
-            Project::decode_energy(&asset, count).map_err(core_err)
+            Project::decode_energy_cancellable(&asset, count, &|| cancel.is_cancelled()).map_err(core_err)
         })
         .await?;
         json(&energy)
@@ -4574,12 +4650,17 @@ impl KerfMcp {
         if let Some(cell) = p.cell {
             return self.skim_cell(id, &p, (columns, rows, cell), context).await;
         }
+        let cancel = context.ct.clone();
         let (jpeg, times) = blocking(move || {
             // Resolve under the lock, sample the (columns × rows) frames with it
             // released — a contact sheet is many seeks and would otherwise freeze
-            // the GUI's commands on the shared mutex for its whole build.
+            // the GUI's commands on the shared mutex for its whole build. A dropped
+            // request stops the sampling.
             let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
-            Project::decode_contact_sheet(&asset, p.start, p.end, columns, rows, cell_width, 5).map_err(core_err)
+            Project::decode_contact_sheet_cancellable(&asset, p.start, p.end, columns, rows, cell_width, 5, &|| {
+                cancel.is_cancelled()
+            })
+            .map_err(core_err)
         })
         .await?;
         let index = times
@@ -4640,17 +4721,32 @@ impl KerfMcp {
     #[tool(
         description = "Render the assembled timeline at a timeline time into one composite image the model can see — the actual cut on screen at that moment (footage layered in track order, picture-in-picture placement, crop, color; gaps render black). Use to verify an edit you just made; pass `region` to zoom into a detail of it. A moment inside a fade, dip, dissolve, slide or push is drawn as the export draws it: the outgoing clip under the incoming one's ramp, the dip's fade, the clips part-way across the frame."
     )]
-    async fn preview_timeline(&self, Parameters(p): Parameters<TimelineFrameParams>) -> Result<CallToolResult, McpError> {
+    async fn preview_timeline(
+        &self,
+        Parameters(p): Parameters<TimelineFrameParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         let project = self.project.clone();
+        let cancel = context.ct.clone();
         let (time_secs, max_width) = (p.time_secs, p.max_width.unwrap_or(640).clamp(64, MAX_PREVIEW_WIDTH));
         let region = p.region;
         let jpeg = blocking(move || {
             // Snapshot the inputs under the lock, composite with it released —
-            // mirrors the GUI's `get_timeline_frame`.
+            // mirrors the GUI's `get_timeline_frame`. A dropped request stops the render.
             let (timeline, assets) = lock_agent(&project).timeline_frame_inputs().map_err(core_err)?;
             match region {
-                Some(r) => Project::composite_timeline_region(&timeline, &assets, time_secs, r.region(), max_width, ZOOM_QUALITY),
-                None => Project::composite_timeline_frame(&timeline, &assets, time_secs, max_width, 4),
+                Some(r) => Project::composite_timeline_region_cancellable(
+                    &timeline,
+                    &assets,
+                    time_secs,
+                    r.region(),
+                    max_width,
+                    ZOOM_QUALITY,
+                    &|| cancel.is_cancelled(),
+                ),
+                None => Project::composite_timeline_frame_cancellable(&timeline, &assets, time_secs, max_width, 4, &|| {
+                    cancel.is_cancelled()
+                }),
             }
             .map_err(core_err)
         })
@@ -4700,7 +4796,7 @@ impl KerfMcp {
                 .filter(|a| !std::path::Path::new(&a.path).exists())
                 .map(|a| a.id)
                 .collect();
-            let media = reads::media_notes(&timeline, &assets, &proxies, &missing);
+            let media = reads::media_notes(&timeline, &assets, &proxies, &missing, reads::proxies_switched_off());
             let linked = timeline.linked_clip_ids();
             let tracks: Vec<TrackSummary> = timeline
                 .tracks
@@ -4748,7 +4844,11 @@ impl KerfMcp {
 
     /// Note which rmcp session a call arrived on (called for every tool call, before it runs).
     fn note_session(&self, context: &RequestContext<RoleServer>) {
-        *self.session.lock().unwrap_or_else(|e| e.into_inner()) = session_id_of(context);
+        let session = session_id_of(context);
+        if let Some(id) = &session {
+            server::note_session_seen(id);
+        }
+        *self.session.lock().unwrap_or_else(|e| e.into_inner()) = session;
     }
 
     /// The session this agent is, for the proposal ownership rules.
@@ -4833,18 +4933,18 @@ async fn check_output_paths(
     owner: Option<String>,
     paths: Vec<std::path::PathBuf>,
 ) -> Result<(), McpError> {
-    blocking(move || {
-        // What the project protects is read under the lock; comparing paths against it
-        // canonicalises and stats, which is done with the lock released.
-        let protected = lock_agent_as(&project, owner.as_deref())
-            .output_path_inputs()
-            .map_err(core_err)?;
-        for path in &paths {
-            Project::check_output_path_with(path, &protected).map_err(core_err)?;
-        }
-        Ok(())
-    })
-    .await
+    blocking(move || check_outputs_now(&project, owner.as_deref(), &paths)).await
+}
+
+/// [`check_output_paths`] for a caller already on the blocking pool. What the project protects is
+/// read under the lock; comparing paths against it — and against Kerf's own settings and logs —
+/// canonicalises and stats, which is done with the lock released.
+fn check_outputs_now(project: &Mutex<Project>, owner: Option<&str>, paths: &[std::path::PathBuf]) -> Result<(), McpError> {
+    let protected = lock_agent_as(project, owner).output_path_inputs().map_err(core_err)?;
+    for path in paths {
+        crate::check_output(path, &protected).map_err(core_err)?;
+    }
+    Ok(())
 }
 
 /// Forwards the `analysis-progress` events the GUI's bin listens to — for one asset — to a [`Run`],
@@ -4906,6 +5006,12 @@ fn lock_agent(project: &Mutex<Project>) -> MutexGuard<'_, Project> {
     // The user's setting, which a project that was opened or created since startup does not
     // carry: read at every agent lock, so a change applies to the next call.
     guard.set_agent_review(crate::settings::agent_review());
+    // A proposal whose agent session has ended (it closed, expired, or the server restarted with a
+    // new token) is nobody's: the agent that reconnected, or the next one to edit, takes it over
+    // instead of being told another agent owns it.
+    if let Err(e) = guard.release_orphaned_staging(|owner| !server::session_alive(owner)) {
+        tracing::warn!(error = %e, "could not look at who owns the staged proposal");
+    }
     guard
 }
 
@@ -4968,7 +5074,7 @@ async fn blocking<T: Send + 'static>(job: impl FnOnce() -> Result<T, McpError> +
 ///
 /// `#[tool_handler]`'s default router expression is `Self::tool_router()`, and
 /// the generated `call_tool`, `list_tools` and `get_tool` each evaluate it — so
-/// every request rebuilds all ~85 routes: a schema-cache lookup, a boxed
+/// every request rebuilds every route (well over a hundred tools): a schema-cache lookup, a boxed
 /// handler and a map insert apiece, ~250 µs of release-build work per tool call
 /// that produces the identical router every time. The routes are fixed at
 /// compile time, so build them once and hand out a borrow.
@@ -5142,10 +5248,12 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              round that), and so are undo / redo / revert_to, which would rewrite \
              their live cut; say the proposal is ready and ask them to review it. \
              Review is the user's switch (Settings › Agent); with it off, those \
-             tools work and your edits land as you make them unless you opened a \
-             proposal with stage_edits. One agent's proposal is closed to another \
-             connected at the same time. Outside a task, stage_edits opens a \
-             proposal explicitly. \
+             tools work and your edits land as you make them — except while a \
+             proposal is open (claim_next_task always opens one for its task, and \
+             stage_edits opens one outside a task), when they go into it until you \
+             apply_staged_edits or the user accepts it. One agent's proposal is \
+             closed to another connected at the same time (it is yours again if \
+             your connection drops and you reconnect). \
              Long tools (analyze_asset, export, export_variants, \
              generate_voiceover, separate_stems, download_speech_model, \
              import_asset, smart_crop) take `background: true`: they answer a \
@@ -5156,14 +5264,19 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              summarise an analysis (counts, durations, the head of the transcript), \
              and get_transcript / get_analysis_detail page through the rest; \
              get_timeline_state shows generated captions as a window \
-             (captions_offset / captions_limit); history and list_tasks page with \
-             offset / limit. list_assets shows each asset's preview proxy (ready, \
+             (captions_offset / captions_limit) and, for a very long cut, its clips \
+             (clips_offset / clips_limit); history, list_tasks, list_assets, \
+             staged_diff and revision_diff page with offset / limit. list_assets shows each asset's preview proxy (ready, \
              queued, building with an ETA, failed, off) and which analyses have \
              run, and timeline_summary's `media_notes` lists the cut's media whose \
              proxy is not ready (previews of it are slower; export is unaffected) \
-             or whose source file is missing. project_info says whether the open \
+             or whose source file is missing (missing_assets lists every asset whose file \
+             is gone; relinking or removing media is the user's, in Kerf's library). \
+             project_info says whether the open \
              project is saved; open_project / new_project refuse to throw away \
-             unsaved work unless told `discard_unsaved`. \
+             unsaved work, and `discard_unsaved` only works while the user's review is \
+             off (otherwise ask them). save_project_as will not replace an existing file while \
+             review is on. \
              Every applied edit is tracked: history lists the revisions, \
              revision_diff explains one of them, and undo / redo / revert_to roll \
              the live cut back (only while review is off; your own staged steps \
@@ -6719,6 +6832,7 @@ mod tests {
             "apply_staged_subset",
             "list_assets",
             "get_asset_metadata",
+            "missing_assets",
         ] {
             assert!(names.iter().any(|n| n == tool), "`{tool}` is not registered");
         }
@@ -6781,6 +6895,32 @@ mod tests {
     #[test]
     fn paging_arguments_are_optional_on_history_and_the_task_list() {
         let tools = router().list_all();
+        // The listings and diffs that used to answer everything page the same way.
+        for name in ["list_assets", "staged_diff"] {
+            let tool = tools.iter().find(|t| t.name == name).unwrap();
+            for field in ["offset", "limit"] {
+                assert!(tool.input_schema["properties"].get(field).is_some(), "{name} takes {field}");
+            }
+            assert!(tool
+                .input_schema
+                .get("required")
+                .is_none_or(|r| r.as_array().is_some_and(Vec::is_empty)));
+        }
+        let revision = tools.iter().find(|t| t.name == "revision_diff").unwrap();
+        assert_eq!(revision.input_schema["required"], serde_json::json!(["seq"]));
+        for field in ["offset", "limit"] {
+            assert!(
+                revision.input_schema["properties"].get(field).is_some(),
+                "revision_diff takes {field}"
+            );
+        }
+        let state = tools.iter().find(|t| t.name == "get_timeline_state").unwrap();
+        for field in ["clips_offset", "clips_limit", "captions_offset", "captions_limit"] {
+            assert!(
+                state.input_schema["properties"].get(field).is_some(),
+                "get_timeline_state takes {field}"
+            );
+        }
         for name in ["history", "list_tasks"] {
             let tool = tools.iter().find(|t| t.name == name).unwrap();
             for field in ["offset", "limit"] {
@@ -7024,6 +7164,58 @@ mod tests {
         assert!(matches!(e, kerf_core::Error::StagedEditOwnedByOther), "{e}");
         let e = stranger.undo_staged().map(|_| ()).unwrap_err();
         assert!(matches!(e, kerf_core::Error::StagedEditOwnedByOther), "{e}");
+    }
+
+    /// A task removed by an agent that does not own the proposal under it stays in the queue; the
+    /// owner may remove it, and the user always may.
+    #[test]
+    fn a_task_is_not_removed_by_an_agent_that_does_not_own_its_proposal() {
+        let shared = std::sync::Mutex::new(kerf_core::Project::open_in_memory().unwrap());
+        let task = super::lock_agent_as(&shared, Some("session-a")).add_task("tighten").unwrap();
+        {
+            let owner = super::lock_agent_edit(&shared, Some("session-a")).unwrap();
+            owner.claim_next_task(Some("session-a")).unwrap();
+            owner.add_overlay("Title".to_string(), 0.0, 2.0).unwrap();
+        }
+        let stranger = super::lock_agent_as(&shared, Some("session-b"));
+        let e = stranger.remove_task(task.id).unwrap_err();
+        assert!(matches!(e, kerf_core::Error::StagedEditOwnedByOther), "{e}");
+        assert!(
+            stranger.get_task(task.id).unwrap().is_some(),
+            "the refusal left the task in the queue"
+        );
+        drop(stranger);
+        let owner = super::lock_agent_as(&shared, Some("session-a"));
+        owner.remove_task(task.id).unwrap();
+        assert!(owner.get_task(task.id).unwrap().is_none());
+    }
+
+    /// What the user discarded, an agent does not bring back; what it discarded itself it may.
+    #[test]
+    fn an_agent_cannot_restore_a_proposal_the_user_discarded() {
+        let shared = std::sync::Mutex::new(kerf_core::Project::open_in_memory().unwrap());
+        {
+            let guard = super::lock_agent_edit(&shared, Some("session-a")).unwrap();
+            guard.add_overlay("Title".to_string(), 0.0, 2.0).unwrap();
+        }
+        crate::lock_user(&shared).discard_staged().unwrap();
+        let agent = super::lock_agent_as(&shared, Some("session-a"));
+        let e = agent.restore_discarded().unwrap_err();
+        assert!(e.to_string().contains("only they can bring it back"), "{e}");
+        assert!(agent.staged().unwrap().is_none());
+        drop(agent);
+        assert!(crate::lock_user(&shared).restore_discarded().is_ok(), "the user can");
+    }
+
+    /// With review on, the agent leaves the user's ripple switch alone.
+    #[test]
+    fn an_agent_does_not_flip_the_ripple_switch_while_review_is_on() {
+        let shared = std::sync::Mutex::new(kerf_core::Project::open_in_memory().unwrap());
+        let agent = super::lock_agent_as(&shared, Some("session-a"));
+        assert!(agent.agent_review());
+        let e = agent.set_ripple_mode(true).unwrap_err();
+        assert_eq!(super::core_err(e).code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(!agent.ripple_mode().unwrap());
     }
 
     /// With review on, an agent cannot accept its own proposal — `force` or not — nor step the
