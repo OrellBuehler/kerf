@@ -43,6 +43,9 @@ pub enum Error {
     #[error("the timeline changed since these edits were staged — applying would replace that newer cut; apply with force, or discard the staged edit")]
     StagedEditStale,
 
+    #[error("this project was made by a newer Kerf (file format v{found}; this version opens up to v{supported}) — update Kerf to open it")]
+    NewerProject { found: u32, supported: u32 },
+
     #[error("FFmpeg support is not enabled in this build (enable the `ffmpeg` feature)")]
     FfmpegDisabled,
 

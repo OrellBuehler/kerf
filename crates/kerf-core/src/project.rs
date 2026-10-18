@@ -177,6 +177,23 @@ pub struct Project {
     /// The linked partners an edit carried a trim to (`Timeline::carry_extent_edit`), so
     /// `run_edit` can lane-check them once the ripple has run. Filled while an edit runs.
     edit_carried: RefCell<Vec<Uuid>>,
+    /// The crash-recovery directory an untitled project lives in (see [`crate::recovery`]),
+    /// locked while this is open. Declared after `conn` so the file closes before the lock goes.
+    recovery: Option<crate::recovery::RecoveryDir>,
+    /// How many revisions the history keeps (see [`Project::set_history_limit`]).
+    history_limit: usize,
+}
+
+/// How many revisions a project keeps by default: every one is the whole timeline, so an
+/// unbounded history grows the file without limit. `KERF_HISTORY_LIMIT` overrides it.
+pub const DEFAULT_HISTORY_LIMIT: usize = 500;
+
+fn default_history_limit() -> usize {
+    std::env::var("KERF_HISTORY_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_HISTORY_LIMIT)
+        .max(1)
 }
 
 /// What an edit's revision label says about the sounds it trimmed to make room: nothing
@@ -225,18 +242,24 @@ fn resolve_analysis_proxy(
 }
 
 impl Project {
-    /// Create (or overwrite the schema of) a `.kerf` file on disk.
-    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let project = Self {
-            conn: Connection::open(&path)?,
-            path: Some(path),
+    fn with_conn(conn: Connection, path: Option<PathBuf>, recovery: Option<crate::recovery::RecoveryDir>) -> Self {
+        Self {
+            conn,
+            path,
             actor: EditSource::User,
             ripple_override: Cell::new(None),
             links_override: Cell::new(None),
             edit_notes: RefCell::new(Vec::new()),
             edit_carried: RefCell::new(Vec::new()),
-        };
+            recovery,
+            history_limit: default_history_limit(),
+        }
+    }
+
+    /// Create (or overwrite the schema of) a `.kerf` file on disk.
+    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let project = Self::with_conn(Connection::open(&path)?, Some(path), None);
         project.init()?;
         Ok(project)
     }
@@ -244,32 +267,65 @@ impl Project {
     /// Open an existing `.kerf` file, ensuring the schema is present.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let project = Self {
-            conn: Connection::open(&path)?,
-            path: Some(path),
-            actor: EditSource::User,
-            ripple_override: Cell::new(None),
-            links_override: Cell::new(None),
-            edit_notes: RefCell::new(Vec::new()),
-            edit_carried: RefCell::new(Vec::new()),
-        };
+        let project = Self::with_conn(Connection::open(&path)?, Some(path), None);
         project.init()?;
         Ok(project)
     }
 
     /// An in-memory project, handy for tests and a throwaway sample.
     pub fn open_in_memory() -> Result<Self> {
-        let project = Self {
-            conn: Connection::open_in_memory()?,
-            path: None,
-            actor: EditSource::User,
-            ripple_override: Cell::new(None),
-            links_override: Cell::new(None),
-            edit_notes: RefCell::new(Vec::new()),
-            edit_carried: RefCell::new(Vec::new()),
-        };
+        let project = Self::with_conn(Connection::open_in_memory()?, None, None);
         project.init()?;
         Ok(project)
+    }
+
+    /// A new untitled project backed by a locked recovery directory under `root`, so a crash
+    /// before the first Save loses nothing. It reads as unsaved (`path()` is `None`).
+    pub fn create_recovery(root: &Path) -> Result<Self> {
+        let dir = crate::recovery::RecoveryDir::create(root)?;
+        let conn = match Connection::open(dir.project_path()) {
+            Ok(conn) => conn,
+            Err(e) => {
+                let _ = dir.remove();
+                return Err(e.into());
+            }
+        };
+        let project = Self::with_conn(conn, None, Some(dir));
+        if let Err(e) = project.init() {
+            project.close();
+            return Err(e);
+        }
+        Ok(project)
+    }
+
+    /// Reopen a session a crashed Kerf left behind; it stays untitled and keeps its directory
+    /// (and lock) until it is saved or let go.
+    pub fn open_recovered(found: crate::recovery::Recoverable) -> Result<Self> {
+        let dir = found.dir;
+        let project = Self::with_conn(Connection::open(dir.project_path())?, None, Some(dir));
+        project.init()?;
+        Ok(project)
+    }
+
+    /// The recovery session this untitled project lives in, if it has one.
+    pub fn recovery_id(&self) -> Option<&str> {
+        self.recovery.as_ref().map(|r| r.id())
+    }
+
+    pub fn recovery_dir(&self) -> Option<&Path> {
+        self.recovery.as_ref().map(|r| r.dir())
+    }
+
+    /// Close the project; an untitled one's recovery directory goes with it.
+    fn close(self) {
+        let Self { conn, recovery, .. } = self;
+        drop(conn);
+        if let Some(dir) = recovery {
+            let path = dir.dir().to_path_buf();
+            if let Err(e) = dir.remove() {
+                tracing::warn!(dir = %path.display(), error = %e, "could not delete a recovery directory");
+            }
+        }
     }
 
     /// Become `other` (a project just opened or created), for the one `Project` the app and its MCP
@@ -277,8 +333,11 @@ impl Project {
     /// that took its inputs from this project between that and the swap read the old project under the
     /// new epoch. Call it under the lock the shared project sits behind, so no reader sees the new
     /// project under the old epoch either.
+    ///
+    /// The project replaced is closed for good: an untitled one's recovery directory is deleted,
+    /// since replacing it means it was saved, recovered into another, or let go.
     pub fn replace_with(&mut self, other: Project) {
-        *self = other;
+        std::mem::replace(self, other).close();
         crate::plan_epoch::bump_plan_epoch();
     }
 
@@ -299,18 +358,20 @@ impl Project {
     /// in-memory project itself is unchanged; the caller reopens the file (via
     /// [`Project::open`]) to make subsequent edits write through to it. This is
     /// how "Save As" turns the throwaway sample into a persistent project.
+    ///
+    /// Atomic: the snapshot is written beside the target and renamed over it only once it is
+    /// whole and on disk, so a failure leaves any file already there untouched. Saving a project
+    /// onto its own file is a no-op — its edits are already there.
     pub fn save_as(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        // `VACUUM INTO` refuses to write to an existing file; the save dialog
-        // has already confirmed any overwrite, so clear it first.
-        if path.exists() {
-            std::fs::remove_file(path)?;
+        if let Some(own) = &self.path {
+            let same =
+                |a: &Path, b: &Path| matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b);
+            if own == path || same(own, path) {
+                return Ok(());
+            }
         }
-        let dst = path
-            .to_str()
-            .ok_or_else(|| Error::InvalidArgument(format!("non-UTF-8 project path: {}", path.display())))?;
-        self.conn.execute("VACUUM INTO ?1", params![dst])?;
-        Ok(())
+        store::vacuum_into_atomic(&self.conn, path)
     }
 
     /// An in-memory project seeded with demo assets, analysis, and a timeline.
@@ -329,20 +390,22 @@ impl Project {
             }
         }))?;
         crate::plan_epoch::bump_plan_epoch();
-        self.conn.execute_batch(SCHEMA)?;
 
-        // `CREATE TABLE IF NOT EXISTS` leaves an existing table's columns alone,
-        // so a column added after a `.kerf` file was written has to be migrated
-        // onto it explicitly. Adding one is cheap and lossless; the guard is a
-        // probe for the column rather than a schema version because that is the
-        // whole of the migration story so far.
-        let has_source_paths = self.conn.prepare("SELECT source_paths FROM assets LIMIT 1").is_ok();
-        if !has_source_paths {
-            self.conn.execute("ALTER TABLE assets ADD COLUMN source_paths TEXT", [])?;
+        // `PRAGMA user_version` is the file's schema (`store::MIGRATIONS`). A newer one is refused
+        // before anything is written; an older one is copied aside, then upgraded a step at a time.
+        let found = store::user_version(&self.conn)?;
+        store::check_supported(found)?;
+        let blank = store::is_blank(&self.conn)?;
+        if !blank && found < store::SCHEMA_VERSION {
+            if let Some(path) = &self.path {
+                store::backup_before_upgrade(&self.conn, path, found)?;
+            }
         }
-        let has_voiceover = self.conn.prepare("SELECT voiceover FROM assets LIMIT 1").is_ok();
-        if !has_voiceover {
-            self.conn.execute("ALTER TABLE assets ADD COLUMN voiceover TEXT", [])?;
+        self.conn.execute_batch(SCHEMA)?;
+        if blank {
+            store::stamp_current(&self.conn)?;
+        } else {
+            store::migrate(&self.conn, found)?;
         }
 
         let has_timeline: bool = self
@@ -1453,6 +1516,7 @@ impl Project {
             if timeline.has_links() {
                 timeline.dissolve_all_orphans();
             }
+            timeline.check()?;
             Ok(result)
         };
         // While the agent has a staging session open its edits go to the
@@ -1693,7 +1757,8 @@ impl Project {
         self.set_meta(HISTORY_HEAD, &seq.to_string())
     }
 
-    /// Append a revision after the current head, dropping any redo branch.
+    /// Append a revision after the current head, dropping any redo branch, then
+    /// [prune](Self::prune_history) the oldest beyond the limit.
     fn record_revision(&self, label: &str, source: EditSource, snapshot: &str) -> Result<i64> {
         let head = self.head()?;
         self.conn.execute("DELETE FROM history WHERE seq > ?1", params![head])?;
@@ -1704,7 +1769,31 @@ impl Project {
             params![seq, label, source.as_str(), snapshot, Utc::now().to_rfc3339()],
         )?;
         self.set_head(seq)?;
+        self.prune_history(seq)?;
         Ok(seq)
+    }
+
+    /// Keep the newest `history_limit` revisions, up to `newest` (the head, just recorded — so the
+    /// redo branch is already gone and the head is always kept). A staged proposal's `base_seq`
+    /// and everything after it are kept whatever the limit. The oldest revision left is the new
+    /// baseline: undo stops there and [`Self::revision_diff`] reads it as changing nothing.
+    fn prune_history(&self, newest: i64) -> Result<()> {
+        let mut floor = newest - self.history_limit as i64 + 1;
+        let base: Option<i64> = self
+            .conn
+            .query_row("SELECT base_seq FROM staged WHERE id = 1", [], |r| r.get(0))
+            .optional()?;
+        if let Some(base) = base {
+            floor = floor.min(base);
+        }
+        self.conn.execute("DELETE FROM history WHERE seq < ?1", params![floor])?;
+        Ok(())
+    }
+
+    /// How many revisions the history keeps from now on (at least 1, the current one); older
+    /// ones are dropped as new edits land. Defaults to [`DEFAULT_HISTORY_LIMIT`].
+    pub fn set_history_limit(&mut self, limit: usize) {
+        self.history_limit = limit.max(1);
     }
 
     /// Restore the stored snapshot at `seq` as the live timeline and move the
@@ -1823,10 +1912,13 @@ impl Project {
     /// and changed nothing.
     pub fn revision_diff(&self, seq: i64) -> Result<TimelineDiff> {
         let timeline = self.revision_timeline(seq)?;
-        if seq <= 0 {
-            return Ok(timeline.diff(&timeline));
-        }
-        self.diff_revisions(seq - 1, seq)
+        // The oldest revision a pruned history kept is its baseline too.
+        let previous = match self.revision_timeline(seq - 1) {
+            Ok(previous) if seq > 0 => previous,
+            Err(Error::RevisionNotFound(_)) | Ok(_) => return Ok(timeline.diff(&timeline)),
+            Err(e) => return Err(e),
+        };
+        Ok(previous.diff(&timeline))
     }
 
     // ---- timeline operations ---------------------------------------------
@@ -5143,12 +5235,18 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
         .map_err(|e| Error::Other(format!("invalid datetime {s}: {e}")))
 }
 
+mod store;
+pub use store::{backup_path as schema_backup_path, SCHEMA_VERSION};
+
 #[cfg(test)]
 mod linked_tests;
 
 /// The Rust half of the differential corpus the browser harness is replayed against.
 #[cfg(test)]
 mod linked_corpus;
+
+#[cfg(test)]
+mod persist_tests;
 
 /// What [`Project::place_stems`] did: the stem assets (in `STEM_NAMES` order) and the
 /// clips it laid under the separated clip, if one was named.
@@ -5399,7 +5497,10 @@ mod tests {
         let assets = project.list_assets().unwrap();
         assert_eq!(assets.len(), 1);
         assert!(assets[0].voiceover.is_none());
+        let backup = schema_backup_path(&path, 0);
+        assert!(backup.exists(), "the pre-upgrade file is kept beside it");
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
     }
 
     fn asset_with(path: &str, streams: Vec<StreamInfo>) -> Asset {
