@@ -25,8 +25,9 @@ use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
     ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, ImportSummary, Keyframe, Levels,
-    Mask, Project, Projection, Property, PropertyKey, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, Task,
-    TextKeyframe, TimeRange, Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
+    Mask, Project, Projection, Property, PropertyKey, ReframeKeyframe, Revision, SplitSide, StagedEdit, StreamKind, SvgCheck,
+    SvgLayout, SvgOverlayPatch, SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, Task, TextKeyframe, TimeRange,
+    Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect, WaveformRange,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -1685,6 +1686,78 @@ fn set_overlay_keyframes(state: State<'_, AppState>, overlay_id: String, keyfram
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// Reading the artwork (sanitise + parse) takes up to a second and a half for a heavy document, so
+/// it runs on the blocking pool *before* the project lock is taken; the lock then only places it.
+#[tauri::command]
+async fn add_svg_overlay(
+    state: State<'_, AppState>,
+    source: SvgSource,
+    start: f64,
+    end: Option<f64>,
+    layout: Option<SvgLayout>,
+) -> CmdResult<Timeline> {
+    let shared = state.project.clone();
+    blocking(move || {
+        let checked = source.check().map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        project
+            .add_svg_overlay_parsed(checked, start, end, layout.unwrap_or_default())
+            .map_err(|e| e.to_string())?;
+        project.timeline().map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn update_svg_overlay(state: State<'_, AppState>, overlay_id: String, patch: SvgOverlayPatch) -> CmdResult<Timeline> {
+    let oid = id(&overlay_id)?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let doc = patch.check().map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        project
+            .update_svg_overlay_parsed(oid, patch, doc)
+            .map_err(|e| e.to_string())?;
+        project.timeline().map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command(async)]
+fn remove_svg_overlay(state: State<'_, AppState>, overlay_id: String) -> CmdResult<Timeline> {
+    let oid = id(&overlay_id)?;
+    let project = state.project();
+    project.remove_svg_overlay(oid).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// What `add_svg_overlay` / `update_svg_overlay` would make of this source: the sanitised
+/// document, what the sanitiser or the SMIL reader could not honour, and how long it runs.
+/// Needs no project, so it never waits for the lock, and parses on the blocking pool.
+#[tauri::command]
+async fn validate_svg(svg: String) -> CmdResult<SvgCheck> {
+    blocking(move || kerf_core::check_svg(&svg).map_err(|e| e.to_string())).await
+}
+
+#[tauri::command(async)]
+fn list_svg_presets() -> Vec<SvgPresetInfo> {
+    kerf_core::svg::preset_infos()
+}
+
+/// The artwork a preset would make for the project's delivery frame, as SVG text (the page shows
+/// it through an `<img>` data URL, never inline). `duration` defaults to 4 s.
+#[tauri::command(async)]
+fn svg_preset_preview(
+    state: State<'_, AppState>,
+    kind: SvgPresetKind,
+    params: SvgPresetParams,
+    duration: Option<f64>,
+) -> CmdResult<String> {
+    kerf_core::svg::check_params(&params).map_err(|e| e.to_string())?;
+    let frame = state.project().timeline().map_err(|e| e.to_string())?.preset_frame();
+    Ok(kerf_core::render_preset(kind, &params, duration.unwrap_or(4.0), frame))
+}
+
 #[tauri::command(async)]
 fn generate_captions(state: State<'_, AppState>, options: Option<CaptionOptions>) -> CmdResult<Timeline> {
     let project = state.project();
@@ -2205,10 +2278,14 @@ async fn start_playback(
         let mut late_frames: u64 = 0;
         let mut worst_late = 0.0_f64;
         let mut first_frame: Option<std::time::Duration> = None;
-        let result = kerf_core::stream_preview_with(&timeline, &assets, start, request, &mut |f| {
-            // Superseded by a newer playback, or explicitly stopped — including by
-            // a stop that arrived before this stream even started.
-            if ACTIVE_PLAYBACK.load(Ordering::SeqCst) != playback_id || STOPPED_PLAYBACK.load(Ordering::SeqCst) == playback_id {
+        // Superseded by a newer playback, or explicitly stopped — including by a stop that arrived
+        // before this stream even started.
+        let ended =
+            || ACTIVE_PLAYBACK.load(Ordering::SeqCst) != playback_id || STOPPED_PLAYBACK.load(Ordering::SeqCst) == playback_id;
+        // `ended` is also the cancel of the animated titles' drawing, which can take seconds before
+        // the first frame exists for the callback below to decline.
+        let result = kerf_core::stream_preview_until(&timeline, &assets, start, request, &ended, &mut |f| {
+            if ended() {
                 return false;
             }
             let sent = on_frame
@@ -3391,6 +3468,8 @@ pub fn run() {
                 LaunchProject::Missing(path) => tracing::warn!(path, "this launch named a project file that does not exist"),
                 LaunchProject::Nothing => {}
             }
+            // Read the machine's fonts off the first Play of an animated title.
+            std::thread::spawn(kerf_core::fonts::warm);
             // The window is created hidden; if the webview never asks for it
             // (`show_main_window`), this does.
             spawn_reveal_failsafe(app.handle().clone(), main_window_shown, REVEAL_FAILSAFE);
@@ -3495,6 +3574,12 @@ pub fn run() {
             update_overlay,
             remove_overlay,
             set_overlay_keyframes,
+            add_svg_overlay,
+            update_svg_overlay,
+            remove_svg_overlay,
+            validate_svg,
+            list_svg_presets,
+            svg_preset_preview,
             generate_captions,
             clear_captions,
             import_captions,

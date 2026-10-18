@@ -1894,6 +1894,7 @@ mod tests {
         Timeline {
             tracks,
             overlays: Vec::new(),
+            svg_overlays: Vec::new(),
             markers: Vec::new(),
             format: None,
             master: Default::default(),

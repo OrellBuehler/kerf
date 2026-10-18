@@ -26,6 +26,44 @@ use uuid::Uuid;
 use super::{fmt_time, spans_overlap, Clip, DiffKind, Timeline};
 use crate::error::{Error, Result};
 
+/// What a change does to an item of a list.
+#[derive(Clone, Copy)]
+enum Act {
+    Add,
+    Change,
+    Remove,
+}
+
+/// Lay one add / change / remove of the item `id` onto `list`, or say why it no longer applies
+/// (`what` names the item for the message). Items are matched by id, never by position.
+fn lay<T: Clone>(
+    list: &mut Vec<T>,
+    id: Uuid,
+    key: impl Fn(&T) -> Uuid,
+    act: Act,
+    wanted: Option<&T>,
+    what: &str,
+) -> std::result::Result<(), String> {
+    let there = list.iter().position(|t| key(t) == id);
+    match (act, there, wanted) {
+        (Act::Remove, Some(at), _) => {
+            list.remove(at);
+            Ok(())
+        }
+        (Act::Remove, None, _) => Err(format!("the {what} is already gone")),
+        (Act::Add, None, Some(t)) => {
+            list.push(t.clone());
+            Ok(())
+        }
+        (Act::Add, Some(_), _) => Err(format!("the {what} is already on the timeline")),
+        (Act::Change, Some(at), Some(t)) => {
+            list[at] = t.clone();
+            Ok(())
+        }
+        _ => Err(format!("that {what} is no longer on the timeline")),
+    }
+}
+
 /// A change that was applied although the reviewer did not pick it, and why it had to be.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AutoIncluded {
@@ -300,50 +338,43 @@ impl Timeline {
             match e.kind {
                 DiffKind::OverlayAdded | DiffKind::OverlayChanged | DiffKind::OverlayRemoved => {
                     let Some(id) = e.overlay_id else { continue };
-                    let there = out.overlays.iter().position(|o| o.id == id);
-                    match (e.kind, there, proposed.overlay(id)) {
-                        (DiffKind::OverlayRemoved, Some(at), _) => {
-                            out.overlays.remove(at);
-                        }
-                        (DiffKind::OverlayRemoved, None, _) => {
-                            skip(i, "the text is already gone");
-                            continue;
-                        }
-                        (DiffKind::OverlayAdded, None, Some(o)) => out.overlays.push(o.clone()),
-                        (DiffKind::OverlayAdded, Some(_), _) => {
-                            skip(i, "the text is already on the timeline");
-                            continue;
-                        }
-                        (DiffKind::OverlayChanged, Some(at), Some(o)) => out.overlays[at] = o.clone(),
-                        _ => {
-                            skip(i, "that text is no longer on the timeline");
-                            continue;
-                        }
+                    let act = match e.kind {
+                        DiffKind::OverlayAdded => Act::Add,
+                        DiffKind::OverlayChanged => Act::Change,
+                        _ => Act::Remove,
+                    };
+                    // Plain text and animated titles share the overlay kinds; the id says which.
+                    let animated =
+                        proposed.svg_overlay(id).is_some() || base.svg_overlay(id).is_some() || self.svg_overlay(id).is_some();
+                    let laid = if animated {
+                        lay(
+                            &mut out.svg_overlays,
+                            id,
+                            |o| o.id,
+                            act,
+                            proposed.svg_overlay(id),
+                            "animated title",
+                        )
+                    } else {
+                        lay(&mut out.overlays, id, |o| o.id, act, proposed.overlay(id), "text")
+                    };
+                    if let Err(why) = laid {
+                        skip(i, &why);
+                        continue;
                     }
                     applied.insert(i);
                 }
                 DiffKind::MarkerAdded | DiffKind::MarkerChanged | DiffKind::MarkerRemoved => {
                     let Some(id) = e.marker_id else { continue };
-                    let there = out.markers.iter().position(|m| m.id == id);
+                    let act = match e.kind {
+                        DiffKind::MarkerAdded => Act::Add,
+                        DiffKind::MarkerChanged => Act::Change,
+                        _ => Act::Remove,
+                    };
                     let wanted = proposed.markers.iter().find(|m| m.id == id);
-                    match (e.kind, there, wanted) {
-                        (DiffKind::MarkerRemoved, Some(at), _) => {
-                            out.markers.remove(at);
-                        }
-                        (DiffKind::MarkerRemoved, None, _) => {
-                            skip(i, "the marker is already gone");
-                            continue;
-                        }
-                        (DiffKind::MarkerAdded, None, Some(m)) => out.markers.push(m.clone()),
-                        (DiffKind::MarkerAdded, Some(_), _) => {
-                            skip(i, "the marker is already there");
-                            continue;
-                        }
-                        (DiffKind::MarkerChanged, Some(at), Some(m)) => out.markers[at] = m.clone(),
-                        _ => {
-                            skip(i, "that marker is no longer on the timeline");
-                            continue;
-                        }
+                    if let Err(why) = lay(&mut out.markers, id, |m| m.id, act, wanted, "marker") {
+                        skip(i, &why);
+                        continue;
                     }
                     out.markers.sort_by(|a, b| a.time.total_cmp(&b.time));
                     applied.insert(i);
@@ -665,6 +696,47 @@ mod tests {
         assert_eq!(merge.timeline.markers.len(), 1);
         assert_eq!(merge.timeline.master.volume, 0.5);
         assert!(base.diff(&merge.timeline).entries.len() == 3 && merge.timeline.diff(&proposed).is_empty());
+    }
+
+    #[test]
+    fn animated_titles_apply_by_identity_like_text() {
+        use crate::model::SvgOverlay;
+        let title = |name: &str, start: f64| SvgOverlay {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            svg: "<svg xmlns='http://www.w3.org/2000/svg'/>".into(),
+            start,
+            end: start + 2.0,
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            opacity: 1.0,
+            offset: 0.0,
+            preset: None,
+        };
+        let (mut base, _, _) = cut();
+        let kept = title("kept", 0.0);
+        let dropped = title("dropped", 4.0);
+        base.svg_overlays = vec![kept.clone(), dropped];
+        let mut proposed = base.clone();
+        proposed.svg_overlays[0].opacity = 0.5;
+        proposed.svg_overlays.remove(1);
+        let added = title("added", 8.0);
+        proposed.svg_overlays.push(added.clone());
+        let ids: Vec<String> = base.diff(&proposed).entries.iter().map(|e| e.id.clone()).collect();
+        assert_eq!(ids.len(), 3, "{ids:?}");
+
+        // The user dropped one of them meanwhile: that pick is skipped, the others land.
+        let mut live = base.clone();
+        live.svg_overlays.remove(1);
+        let merge = live.merge_subset(&base, &proposed, &ids).unwrap();
+        assert_eq!(merge.skipped.len(), 1, "{:?}", merge.skipped);
+        assert!(merge.skipped[0].why.contains("animated title"));
+        let ids_now: Vec<Uuid> = merge.timeline.svg_overlays.iter().map(|o| o.id).collect();
+        assert_eq!(ids_now, vec![kept.id, added.id]);
+        assert_eq!(merge.timeline.svg_overlays[0].opacity, 0.5);
+        assert!(merge.timeline.overlays.is_empty(), "no text overlay appeared");
     }
 
     #[test]

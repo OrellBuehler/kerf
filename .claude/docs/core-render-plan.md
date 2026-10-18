@@ -310,6 +310,11 @@
     **`TextBorder`** (`synthetic_bold`: a bold request in a font with no bold face — only a *named* family; the default has one) and
     **`TextTooSmall(px)`** (the smallest overlay's `fontsize`, `round(height * size)`, under `MIN_TEXT_PX` = 12, judged at the
     render size by `reasons`, not the size-free half).
+  - **Animated SVG titles** (`Timeline.svg_overlays`): resvg draws them and FFmpeg overlays the pictures, so no compositor pass draws one and
+    none ever will without a parity case. The `Planner` keeps their windows and `RenderPlan.svg` (`Vec<Uuid>`) names the ones on screen at a frame,
+    live like a text overlay (`start <= t < end` in a Still, `<= end` in Motion: the graph's `between`); `reasons` pushes **`Unsupported::Svg`**
+    (`kind` `svg`, "an animated SVG title is on screen") for any plan that names one, whatever the caps, so the frame — and a `PlayCut` scan
+    that reaches it — falls back to FFmpeg. The plan carries no geometry or artwork: nothing draws from it.
   - **Pixel format is judged from a positive allow-list** (`pix_fmt_layout` in
     `model.rs` → `PixLayout { Yuv420, Gray, OtherYuv, Rgb }`): a format that is not
     known to be opaque is refused, so a name a deny-list never thought of (`ayuv`,
@@ -348,6 +353,29 @@
     arithmetic that was not reproduced (float and fixed-point models of it were off by
     up to 26 levels). `PlanCanvas.matrix` is the result; `PlanStream::matrix` is the
     one a translucent layer is taken out of YUV with.
+    **The graph's BT.709 label is mirrored** (`PlanStream::label_bt709`, `engine-cli.md`): an untagged HD YCbCr layer that
+    shares the export graph with an input naming a matrix is BT.709 to the plan exactly when the graph labels it, under
+    every policy (it is also the matrix a translucent layer leaves YUV with on FFmpeg 6.1). A **Motion** plan takes it from
+    the cut's table (`graph_bt709_labels` over every video clip of the rendered timeline: a BT.709 clip that is not on
+    screen at this frame still labels the HD clip, as the export's graph does), a **Still** plan from the layers on screen
+    (`model::bt709_labels` in `Planner::plan`, as `build_still_args` does over `still_layers`). Both decide from the
+    **original's** video stream (`AssetFacts::original`), never the proxy's the layer describes: the proxy of a 1080p
+    clip at a small Settings size is 640x360 and still labelled. So stacks of untagged HD with BT.709 or HDR footage are
+    one matrix and are drawn on 9.0.2 (they were refused), and untagged HD beside `smpte170m` / `bt470bg` / `bt2020nc`
+    footage is BT.709 against BT.601 / BT.2020 and refused (it was drawn as BT.601 throughout). `Unknown` still
+    refuses any stack that is not BT.601. `reserved` reads as no tag (`PlanStream::matrix`, `known_color`). A PNG's `gbr` and the
+    `bt470bg` of a JPEG, a WebP and the `mjpeg`, `amv`, `speedhq`, `jpegls` (and their decode-only relatives) decoders are decoders' defaults and name no matrix, so a logo,
+    a photo or a webcam clip beside HD labels nothing and the plan reads those stacks as it did (a full-range H.264 clip's
+    stated `bt709` is the file's word and does label).
+    **An accepted difference**: the plan's decision is the cut's (a Motion plan) or the layers' on screen (a Still), while the
+    FFmpeg stream a handover starts (`SpanPlan::handover`, a `Timeline::slice` from `stream_start`) decides over its own
+    clips; where the slice drops the matrix-naming clip, a translucent HD layer or a dip to white in the stream is read as
+    BT.601 where the plan drew it as BT.709 (the label's own effect on such a layer, the clip alone labelled against not: a translucent
+    one 1 level in the export on 9.0.2 and 8 to 14 on 6.1.1 (export 8, still 14, stream 11, scrub window 14), coloured text 16 levels on its
+    pixels on 9.0.2 and none on 6.1.1, a dip to white 2 levels on 9.0.2 and 15 on 6.1.1 in the export: the dip is
+    `yuv420p -> rgb24 -> yuv420p`, which reads the matrix the label states). The same label is what moves an HD clip's dip in a mixed
+    stack on FFmpeg 6.1.1 (33.0 dB / 15 levels into the HD clip, 32.5 / 15 out of it, over all frames of the export; method in
+    `engine-cli.md`); it equals the file tagged BT.709, which the plan draws (`a_labelled_hd_clip_dips_through_white_with_the_bt709_round_trip`). Opaque pictures are identical.
   - **What depends on the render size** is decided in the plan, before any decode
     (`LayerGeometry` lives in kerf-core as `layer_geometry.rs` for this reason): a
     translucent layer of odd size, **resizing a picture that is not 8/10-bit
