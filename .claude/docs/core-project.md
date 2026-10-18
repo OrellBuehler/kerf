@@ -26,9 +26,44 @@
   follows the mode, re-reading its clip like `trim`; `split_remove_clips` is that
   for a group — one revision (`Split and remove left (2 clips)`), the single-clip
   `split_remove` being a group of one. All of them refuse a locked track.
+  **The file** (`project/store.rs`): `PRAGMA user_version` is the schema version, brought forward by
+  `MIGRATIONS` (one step each, each in its own transaction stamping the version it reached; never edit
+  a shipped step, append one). Version 0 is every file written before versions existed (the legacy
+  baseline; v0→v1 is the old probe-then-`ALTER` columns). A new file is stamped `SCHEMA_VERSION`; a
+  file newer than that is refused before anything is written (`Error::NewerProject`, "made by a newer
+  Kerf", which the GUI toasts); an older file is first copied beside itself as
+  `<stem> (schema vN backup).kerf` (kept if one already exists), then upgraded. Each step has a
+  `needed` probe and a `destructive` flag: no backup when no pending step would change the file (only
+  the version is stamped), and a backup that fails (full disk, read-only folder) is a warning unless a
+  pending step is destructive. A **read-only** file (SQLite fell back to read-only) opens as it is,
+  nothing written; one that needs a real upgrade is refused with a "copy it somewhere you can write"
+  message. `SCHEMA` still runs first, so a step must tolerate tables it creates. **Save As is atomic** (`vacuum_into_atomic`):
+  `VACUUM INTO` a hidden temp file in the target's directory, fsync it, rename it over the target,
+  fsync the directory on unix; any failure removes the temp file and leaves the old target as it was.
+  Each save first deletes this target's own `.<name>.<uuid>.tmp` files over an hour old (a crashed
+  save's). Saving a project onto its own file is a no-op. **The history is bounded**: `record_revision` keeps
+  the newest `history_limit` revisions (`DEFAULT_HISTORY_LIMIT` 500, `KERF_HISTORY_LIMIT` overrides,
+  `set_history_limit` per project, minimum 1 — the head is always the newest after a record), and
+  never prunes a staged proposal's `base_seq` or anything after it. The oldest revision left is the new
+  baseline: undo stops there and `revision_diff` of it is empty, like revision 0. `revert_to` /
+  `diff_revisions` only reach revisions `history()` still lists. Stored JSON is not compressed.
+  **Crash recovery** (`recovery.rs`): an untitled project can live in `<root>/<session>/untitled.kerf`
+  (`Project::create_recovery`), its directory held under an OS lock (`File::try_lock` on
+  `<session>/lock`, a separate file because Windows byte-range locks would block SQLite) for as long
+  as it is open; `path()` stays `None`, so it still reads as unsaved. `recovery::scan(root, skip)`
+  offers the directories whose lock it can take and that hold work (assets, a revision past 0, a task
+  or a proposal — the `summarize` read opens read-write so SQLite can roll back a crash's hot
+  journal; a table the file lacks counts as empty, so a 0-byte or half-created file is cleaned up),
+  holding them locked as `Recoverable`; one it locked that holds nothing is deleted. A
+  directory is **never** deleted unless this process holds its lock: `WouldBlock` (a running
+  instance) and any other lock error (unsupported, permissions) or an unreadable project leave it
+  alone. `Project::open_recovered` reopens one. `replace_with` swaps under the lock and **returns** the
+  project replaced (`#[must_use]`); the caller `close()`s it after releasing the lock, which deletes
+  its recovery directory (it was saved, recovered into another, or let go). `close_at_exit` deletes it
+  only when it holds no work (the same `summarize` rule) — anything else waits for the next launch.
   `Project::sample()` seeds an in-memory demo (two assets + analysis + a starter
   timeline + a sample task queue); it backs the kerf-core tests, but the app now
-  launches with an **empty** `Project::open_in_memory()` — the user imports media or
+  launches with an **empty** untitled project (`Project::create_recovery`, see above) — the user imports media or
   opens a `.kerf` file to populate it.
   `analyze_asset`, `frame_at`, `waveform` and `waveform_range` delegate to the engine; editing ops are
   unchanged. `snap_to_beats(track_id, tolerance)` is "cut to the beat": it collects

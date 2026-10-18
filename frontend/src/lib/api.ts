@@ -40,6 +40,7 @@ import type {
 	Property,
 	PropertyKey,
 	LaunchRequest,
+	RecoveryInfo,
 	Levels,
 	MasterBus,
 	MusicFit,
@@ -142,6 +143,7 @@ import { captionsForTimeline, resolveCaptions } from './captions';
 import { estimateWords } from './transcript';
 import { describeError, logFrontend } from './log';
 import { parseLaunchRequest } from './launch';
+import { recoveryChoice, type RecoveryChoice, type RecoveryCopy } from './recovery';
 import { DEV_MODEL_BYTES, STEM_NAMES, STEMS_CANCELLED, devStemAssets, placeStems } from './stems';
 import {
 	addSvgOverlayTo,
@@ -753,6 +755,50 @@ export async function onPopoutClosed(cb: (label: string) => void): Promise<() =>
 export async function takeLaunchProject(): Promise<LaunchRequest | null> {
 	if (!inTauri()) return null;
 	return parseLaunchRequest(await invoke<unknown>('take_launch_project'));
+}
+
+/** Untitled projects a crashed Kerf left behind, newest first. The browser harness has none. */
+export async function listRecoveries(): Promise<RecoveryInfo[]> {
+	if (!inTauri()) return [];
+	return invoke<RecoveryInfo[]>('list_recoveries');
+}
+
+/** Make a left-behind project the open one (still untitled); `false` outside Tauri. */
+export async function recoverProject(id: string): Promise<boolean> {
+	if (!inTauri()) return false;
+	await invoke('recover_project', { id });
+	return true;
+}
+
+/** The user chose "Don't save" as the app closes: delete this project's recovery session at
+ *  exit instead of offering it at the next launch. */
+export async function discardRecoveryAtExit(): Promise<void> {
+	if (!inTauri()) return;
+	await invoke('discard_recovery_at_exit');
+}
+
+/** Delete a left-behind project. */
+export async function discardRecovery(id: string): Promise<void> {
+	if (!inTauri()) return;
+	await invoke('discard_recovery', { id });
+}
+
+/** The recovery prompt: Recover, Discard and Not now (`recovery.ts`). Where the native dialog
+ *  cannot show three named buttons it asks Recover / Not now, so Discard is never the fallback;
+ *  closing the dialog is Not now. The browser harness has `window.confirm`. */
+export async function askRecovery(copy: RecoveryCopy): Promise<RecoveryChoice> {
+	if (!inTauri()) return window.confirm(copy.message) ? 'recover' : 'later';
+	const { message: show } = await import('@tauri-apps/plugin-dialog');
+	try {
+		const answer = await show(copy.message, {
+			title: copy.title,
+			kind: 'info',
+			buttons: { yes: copy.recover, no: copy.discard, cancel: copy.later }
+		});
+		return recoveryChoice(answer, copy);
+	} catch {
+		return (await confirmAction(copy.message, copy.title, { ok: copy.recover, cancel: copy.later })) ? 'recover' : 'later';
+	}
 }
 
 /** Discard the open project for a fresh, empty one; `false` outside Tauri. */

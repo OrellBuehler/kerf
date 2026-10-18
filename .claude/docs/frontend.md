@@ -1040,6 +1040,13 @@ Tab, or focus given back (Escape, a chord), so it cannot leak into a later dialo
 come back too); Voiceover ignores it while the script is non-empty (`scrimCloses`) and keeps the
 script as a draft (`kerf.voiceover.draft`, cleared by a successful generate, not kept for a script
 regenerated from an existing voiceover); Settings / Update / Fit / Stems still close on it.
+**Recovering a crashed untitled project**: after the first load (and before a launch file is
+opened) `offerRecoveries` in `+page.svelte` asks `listRecoveries` and, per session, newest first,
+`askRecovery(recoveryCopy(info))` — a native three-button dialog, **Recover · Discard · Not now**
+(`recovery.ts` holds the copy and `recoveryChoice`; a dismissed or unrecognised answer is Not now, and
+the two-button fallback offers Recover / Not now, never Discard). Recover asks about this project's
+unsaved work first (`okToReplace`), then `editor.recoverProject(id)`; after one recovery the rest wait
+for the next launch. The browser harness has none.
 **Nothing unsaved is dropped silently**: once saved a project is a
 SQLite file and every edit is committed as it happens, so only a never-saved,
 non-empty project (`editor.hasUnsavedWork`) can be lost — New, Open, the window's

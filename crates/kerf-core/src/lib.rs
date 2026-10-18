@@ -22,6 +22,7 @@ pub mod platform;
 pub mod play_plan;
 pub mod project;
 pub mod proxy;
+pub mod recovery;
 pub mod render_bar;
 pub mod render_plan;
 pub mod scopes;
@@ -90,9 +91,10 @@ pub use platform::{
 pub use play_plan::{PlayAhead, PlayCut, PlayRefusal};
 pub use project::{
     FramingPlan, Project, SmartCropJob, SmartCropPlan, StemsPlaced, SvgChecked, SvgLayout, SvgOverlayResult, SvgSource,
-    MAX_CHANNEL_KEYS, VOICEOVER_TRACK,
+    DEFAULT_HISTORY_LIMIT, MAX_CHANNEL_KEYS, SCHEMA_VERSION, VOICEOVER_TRACK,
 };
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
+pub use recovery::{Recoverable, RecoveryInfo};
 pub use render_plan::{
     Animated, CompositeColorPolicy, FadeOp, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream,
     PlanText, PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_SHRINK, MIN_TEXT_PX,

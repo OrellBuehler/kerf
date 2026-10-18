@@ -323,6 +323,18 @@
   `Slipped clip … footage +0.03s (in-point 10.00s → 10.03s)` — two decimals (three
   if two would show a real shift as zero), signed as `slip_clip` is (`+` = later in
   its footage, so a reversed clip's window moving down prints `+`), not a `+0.0s` trim.
+- **Invariants** (`model/check.rs`, pure + unit-tested): `Timeline::check()` refuses a timeline no
+  edit should leave — a non-finite time, gain or speed; a clip whose `source_out <= source_in`; a
+  negative fade or transition; a text / SVG overlay that does not end after it starts; a non-finite
+  keyframe or marker time; a track, clip or overlay id used twice. `Project::run_edit` takes
+  `known_violations()` before the edit and calls `check_new(&known)` after it, on every edit (live and
+  staged) before the transaction commits: only a violation (rule + item id) the edit **introduced** is
+  refused, so a file an older build left broken can still be edited, and a failing edit persists
+  nothing. The message names the item ("the clip at 0:04.0 on V1 has a negative fade", "the text
+  “hi” at 0:01.0 must end after it starts").
+  **Overlaps are not checked**: Kerf allows them (an explicit `add_clip`, a trim into the next clip, old
+  files), and the ripple already treats an overlap the edit did not make as old news. Nothing is indexed
+  by position in the stored timeline (everything is by id), so there is no index range to check.
 - **Fit music to length** (`model/music_fit.rs`, pure + unit-tested): `plan_music_fit(music,
   target, rate)` keeps the intro (before the first downbeat) and the ending (after the last
   whole bar) and walks the bars between, **jumping only between repeating phrases**

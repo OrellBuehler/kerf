@@ -219,6 +219,27 @@ and the selected asset — into `EditorContextState`, its own `Mutex` in app sta
 state once per 300 ms, only when it changed, and re-sends it every 30 s as a heartbeat; the MCP
 `get_editor_context` reads it back with `age_secs`, and `stale` once a report is over 90 s old.
 
+**Crash recovery** (`recovery.rs`): the untitled project is never only in memory. `setup` resolves
+`<app data>/recovery` (the debug identity's own data dir, so a dev run never touches an installed Kerf's
+sessions) and swaps the launch's empty project for `Project::create_recovery` there — in `setup`, not at
+the top of `run()`, because a second launch is handed to the first by the single-instance plugin before
+`setup` and must not make a session. `new_project` (now `async` + `blocking`) makes a fresh session the
+same way (`recovery::untitled`; no data dir or no file locking falls back to in-memory). Replacing the
+project (`replace_with`: Open, New, Save As, Recover) deletes the old session — each command
+`close()`s the returned project after dropping the lock. A clean exit (`RunEvent::Exit`) uses
+`close_at_exit`: an untouched session goes, one holding work stays to be offered next launch (the close
+guard can be bypassed, and `hasUnsavedWork` is narrower than recovery's rule); a crash leaves it.
+An explicit **Don't save** in the close / quit prompt calls `discard_recovery_at_exit` (`leaveAfter`
+in `confirm-copy.ts`), which records the current session's id; at exit that session is deleted even
+with work (`close_on_exit`, matched by id, so a project replaced since is not). A prompt that failed
+or a close that asked nothing never sets it.
+`list_recoveries` scans once per run (`kerf_core::recovery::scan`, skipping our own session) and keeps
+what it found **locked** in `RecoveryState` until `recover_project { id }` (opens it as the untitled
+project, like `open_project`: scrub cleared, speech model restored, proxies queued) or
+`discard_recovery { id }` (deletes it); one left alone is offered again next launch. No MCP tools —
+recovery is the user's call at launch. `project_path` stays `null` for a recovery-backed project, so
+the GUI still treats it as unsaved.
+
 **Scrubbed frames.** `get_timeline_frame` and the GPU preview's JPEG route go through `AppState.scrub`, one
 `kerf_core::ScrubFrames` per process: the frame of the cut's grid that holds the time, from a bounded cache or from
 the window of neighbours one process draws for it (`engine-cli.md`, "Scrubbed frames"). `start_playback` stops the

@@ -10,6 +10,7 @@ used under the MIT License below. The adapted code is listed here.
 - `crates/kerf-core/src/engine/vad.rs` — from FilmCraft `crates/speech/src/vad.rs`
 - `crates/kerf-core/src/engine/diarize.rs` — from FilmCraft `crates/speech/src/diarize.rs`
 - `crates/kerf-core/src/engine/mel.rs` — from FilmCraft `crates/speech/src/mel.rs`
+- `crates/kerf-core/src/project/store.rs` (`vacuum_into_atomic` and its tests) — from FilmCraft `crates/format/src/atomic.rs`
 
 ## FilmCraft license
 

@@ -51,6 +51,7 @@ import {
 	updateOverlay,
 	newProject as apiNewProject,
 	openProject as apiOpenProject,
+	recoverProject as apiRecoverProject,
 	pickMediaPaths,
 	projectPath,
 	redo as apiRedo,
@@ -533,6 +534,18 @@ class EditorState {
 	async openProject(file?: string): Promise<boolean> {
 		const path = await apiOpenProject(file);
 		if (path === null) return false; // cancelled, or running in the browser
+		this.selectedAssetId = null;
+		this.selectedClipId = null;
+		this.selectedClipIds = [];
+		this.selectedOverlayId = null;
+		this.selectedSvgOverlayId = null;
+		await this.load();
+		return true;
+	}
+
+	/** Open an untitled project a crashed Kerf left behind; resolves true if recovered. */
+	async recoverProject(id: string): Promise<boolean> {
+		if (!(await apiRecoverProject(id))) return false;
 		this.selectedAssetId = null;
 		this.selectedClipId = null;
 		this.selectedClipIds = [];

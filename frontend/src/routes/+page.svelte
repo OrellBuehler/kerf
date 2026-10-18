@@ -38,8 +38,12 @@
 	import { saveCoverFrame, saveProject } from '$lib/file-actions';
 	import { importCaptionFile } from '$lib/title-actions';
 	import {
+		askRecovery,
 		askUnsaved,
+		discardRecovery,
+		discardRecoveryAtExit,
 		inTauri,
+		listRecoveries,
 		isMediaPath,
 		confirmAction,
 		onAnalysisStatus,
@@ -59,8 +63,9 @@
 	import { clipsIn, exportButtonState } from '$lib/export-button';
 	import { afterPaint, fontsReady, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
+	import { recoveryCopy } from '$lib/recovery';
 	import { tip } from '$lib/tip';
-	import { CONFIRM, UNSAVED, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
+	import { CONFIRM, UNSAVED, leaveAfter, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
 	import { changeIndex, changePoints, stepChange } from '$lib/staged-diff';
 	import { clampPlayhead, secondFrames, stepFrames } from '$lib/frames';
 	import { isPagingKey, onEditorSurface } from '$lib/focus-area';
@@ -164,7 +169,7 @@
 		// would drop it without a word, so ask first.
 		void onWindowCloseRequested(
 			() => editor.hasUnsavedWork,
-			() => proceedUnsaved(UNSAVED.close)
+			() => leaveUnsaved(UNSAVED.close)
 		).then((un) => unlisteners.push(un));
 
 		// Each asset's preview proxy and per-kind analysis, kept current by the backend's events
@@ -272,6 +277,7 @@
 				// goes through the same path as the event, unsaved-work question
 				// included. A path that is not there is reported, never created.
 				await firstLoad;
+				await offerRecoveries();
 				const launched = await takeLaunchProject().catch(() => null);
 				if (launched && 'open' in launched) await openProjectAt(launched.open);
 				else if (launched) toast.error(missingProjectMessage(launched.missing));
@@ -288,10 +294,37 @@
 		return !editor.hasUnsavedWork || proceedUnsaved(UNSAVED.replace);
 	}
 
+	/** Untitled projects a crashed run left behind, newest first: Recover opens one (asking about
+	 *  this project's unsaved work first) and the rest wait for the next launch, Discard deletes it,
+	 *  Not now keeps it for the next launch. */
+	async function offerRecoveries() {
+		const found = await listRecoveries().catch(() => []);
+		for (const info of found) {
+			const choice = await askRecovery(recoveryCopy(info));
+			try {
+				if (choice === 'discard') await discardRecovery(info.id);
+				if (choice !== 'recover' || !(await okToReplace())) continue;
+				if (await editor.recoverProject(info.id)) {
+					ui.projectReplaced();
+					await agent.load();
+					toast.success('Recovered the unsaved project', { description: 'Save it to keep it.' });
+					return;
+				}
+			} catch (e) {
+				toast.error("Couldn't recover the project", { description: e instanceof Error ? e.message : String(e) });
+			}
+		}
+	}
+
 	/** The unsaved-project prompt and what its answer means: whether to go ahead. "Save…" opens
 	 *  the save dialog and goes ahead only once the project is on disk. */
 	async function proceedUnsaved(copy: UnsavedCopy): Promise<boolean> {
 		return proceedAfter(await askUnsaved(copy), saveProject);
+	}
+
+	/** [`proceedUnsaved`] for closing or quitting: "Don't save" also lets the recovery session go. */
+	async function leaveUnsaved(copy: UnsavedCopy): Promise<boolean> {
+		return leaveAfter(await askUnsaved(copy), saveProject, discardRecoveryAtExit);
 	}
 
 	async function onNew() {
@@ -356,7 +389,7 @@
 		}
 		await quitApp(
 			() => editor.hasUnsavedWork,
-			() => proceedUnsaved(UNSAVED.quit)
+			() => leaveUnsaved(UNSAVED.quit)
 		);
 	}
 
