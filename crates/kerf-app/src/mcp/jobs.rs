@@ -325,6 +325,26 @@ pub fn jobs() -> &'static Arc<Jobs> {
     JOBS.get_or_init(|| Arc::new(Jobs::new()))
 }
 
+/// Start `work` as a job of `registry` and answer its id at once. The work runs as a task of its
+/// own, and a second task records how it ended, so a panic in it ends the job as a failure instead
+/// of leaving it `running` for good.
+fn spawn_job<F, Fut>(registry: &Arc<Jobs>, tool: &'static str, work: F) -> Result<String, McpError>
+where
+    F: FnOnce(Run) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<String, McpError>> + Send + 'static,
+{
+    let (id, run) = registry.begin(tool)?;
+    let (registry, started) = (registry.clone(), id.clone());
+    let working = tauri::async_runtime::spawn(work(run));
+    tauri::async_runtime::spawn(async move {
+        let outcome = working
+            .await
+            .unwrap_or_else(|e| Err(McpError::internal_error(format!("the job stopped unexpectedly: {e}"), None)));
+        registry.finish(&started, outcome);
+    });
+    Ok(id)
+}
+
 impl KerfMcp {
     /// Run `work` the way the caller asked: held open on the request (progress on its token,
     /// cancelled with it), or — `background` — as a job that answers `{job_id}` at once. The
@@ -342,13 +362,7 @@ impl KerfMcp {
         Fut: Future<Output = Result<String, McpError>> + Send + 'static,
     {
         if background.unwrap_or(false) {
-            let (id, run) = jobs().begin(tool)?;
-            let registry = jobs().clone();
-            let started = id.clone();
-            tauri::async_runtime::spawn(async move {
-                let outcome = work(run).await;
-                registry.finish(&started, outcome);
-            });
+            let id = spawn_job(jobs(), tool, work)?;
             return json(&serde_json::json!({
                 "job_id": id,
                 "tool": tool,
@@ -556,5 +570,61 @@ mod tests {
         run.progress(Some(0.5), "half");
         assert_eq!(log.lock().unwrap().as_slice(), &[(Some(0.5), "half".to_string())]);
         assert!(!Run::quiet().cancelled());
+    }
+
+    async fn ended(registry: &Arc<Jobs>, id: &str) -> JobView {
+        for _ in 0..200 {
+            let view = registry.view(id).unwrap();
+            if view.state != JobState::Running {
+                return view;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("job {id} never ended");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_spawned_job_reports_and_ends_with_its_result() {
+        let registry = registry(4, 10);
+        let id = spawn_job(&registry, "export", |run| async move {
+            run.progress(Some(0.5), "halfway");
+            Ok(r#"{"output":"/x.mp4"}"#.to_string())
+        })
+        .unwrap();
+        let view = ended(&registry, &id).await;
+        assert_eq!(view.state, JobState::Done);
+        assert_eq!(view.result.unwrap()["output"], "/x.mp4");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_that_panics_ends_failed_not_running_for_good() {
+        let registry = registry(4, 10);
+        let id = spawn_job(&registry, "analyze_asset", |_run| async move {
+            if true {
+                panic!("boom");
+            }
+            Ok(String::new())
+        })
+        .unwrap();
+        let view = ended(&registry, &id).await;
+        assert_eq!(view.state, JobState::Failed);
+        assert!(view.error.unwrap().contains("stopped unexpectedly"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_a_job_reaches_the_work_and_ends_it_cancelled() {
+        let registry = registry(4, 10);
+        let id = spawn_job(&registry, "export", |run| async move {
+            while !run.cancelled() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(McpError::internal_error("export cancelled", None))
+        })
+        .unwrap();
+        assert_eq!(registry.view(&id).unwrap().state, JobState::Running);
+        assert_eq!(registry.cancel(&id), Some(true));
+        let view = ended(&registry, &id).await;
+        assert_eq!(view.state, JobState::Cancelled);
+        assert_eq!(view.error.as_deref(), Some("export cancelled"));
     }
 }

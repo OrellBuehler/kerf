@@ -854,7 +854,11 @@ mod tests {
     impl rmcp::ServerHandler for Nothing {}
 
     fn free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     }
 
     /// Whether anything accepts connections at `addr`.
@@ -956,12 +960,19 @@ mod tests {
         };
         let up = launch(&config, || Nothing, auth).await.expect("bind");
         let socket: std::net::SocketAddr = addr.parse().unwrap();
-        let ask = move |headers: Vec<(&'static str, &'static str)>| {
-            tokio::task::spawn_blocking(move || status_of(socket, &headers))
-        };
-        assert_eq!(ask(vec![("Origin", "https://evil.example")]).await.unwrap(), 403, "a web page");
+        let ask =
+            move |headers: Vec<(&'static str, &'static str)>| tokio::task::spawn_blocking(move || status_of(socket, &headers));
+        assert_eq!(
+            ask(vec![("Origin", "https://evil.example")]).await.unwrap(),
+            403,
+            "a web page"
+        );
         assert_eq!(ask(vec![("Origin", "null")]).await.unwrap(), 403, "a sandboxed page");
-        assert_eq!(ask(vec![("Origin", "http://localhost:3000")]).await.unwrap(), 403, "even a local page");
+        assert_eq!(
+            ask(vec![("Origin", "http://localhost:3000")]).await.unwrap(),
+            403,
+            "even a local page"
+        );
         let native = ask(vec![("Content-Type", "application/json")]).await.unwrap();
         assert_ne!(native, 403, "no Origin is a native client");
         assert_eq!(
@@ -971,5 +982,4 @@ mod tests {
         );
         up.stop().await;
     }
-
 }
