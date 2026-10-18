@@ -18,12 +18,20 @@
   a: >-
     Any MCP client. The desktop app hosts a streamable-HTTP MCP server on
     127.0.0.1:7777/mcp, so Claude Code, Claude Desktop or any HTTP-capable Model Context
-    Protocol client connects with a single command and starts editing.
+    Protocol client connects with a single command and starts editing. Settings ▸ Agent
+    shows that command, with your access token filled in, for several clients.
 - q: Does the AI change my timeline without asking?
   a: >-
     No. Agent edits build a staged proposal, not your cut. The review card shows a real
     diff — added, cut, moved, retrimmed — and you can watch the proposed timeline play
-    before you apply it as one revertible revision, or discard it.
+    before you apply it as one revertible revision, accept only some of the changes, or
+    discard it; a discarded proposal can be restored. Review is a setting only you can
+    turn off — the agent cannot change it.
+- q: Can other programs on my computer control Kerf?
+  a: >-
+    Not without your token. The MCP server listens only on your own machine and every
+    request must carry the bearer token Kerf generated on first start. Requests from a
+    web page are refused, so a website you visit cannot reach it either.
 - q: Is Kerf free?
   a: >-
     Yes, free to download and free for noncommercial use under the PolyForm Noncommercial
@@ -44,6 +52,17 @@
     Your timeline is an edit list over the original media: a clip is just a source range
     at a timeline position. Cuts, effects, colour and keyframes edit that data, never the
     files. Sources are read once, at export — nothing is re-encoded before then.
+- q: Can I finish an edit in Premiere Pro, DaVinci Resolve or Final Cut Pro?
+  a: >-
+    Yes. Kerf exports the cut as OpenTimelineIO (OTIO) or a CMX 3600 EDL, with a report of
+    anything the other editor will not receive, and writes captions as SRT or WebVTT. If
+    your hands know another editor, pick its shortcut preset in Settings ▸ Keyboard.
+- q: What happens if Kerf crashes?
+  a: >-
+    You keep your work. Even an untitled project is written to a recovery file as you
+    edit, and Kerf offers to restore it at the next launch. Saving never overwrites the old
+    file until the new one is complete, and a project is backed up before a newer Kerf
+    upgrades it.
 - q: Can Kerf edit 360 and Insta360 footage?
   a: >-
     Yes. Spherical footage is detected on import and clips cut from it are reframed to an

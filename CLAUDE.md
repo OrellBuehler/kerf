@@ -17,7 +17,8 @@ engine the GUI uses. Nothing is re-encoded until export.
   `Arc<Mutex<Project>>`. No editing logic here.
 - `kerf-gpu` — wgpu compositor; `kerf-app` links it for the opt-in GPU preview surface
   (A2, off by default). Export and forward playback stay FFmpeg's.
-- `frontend/` — SvelteKit 2 / Svelte 5 runes, Tailwind 4, Bun.
+- `frontend/` — SvelteKit 3 / Svelte 5 runes, Tailwind 4, Bun. Imports use the `#lib/…`
+  subpath import (`package.json` `imports`), not `$lib`.
 
 ## Detailed docs — read the relevant one before touching a subsystem
 
@@ -25,15 +26,15 @@ Most rules in these files exist because a bug already happened. They record *why
 
 | File | Covers |
 | --- | --- |
-| `.claude/docs/engine-cli.md` | `engine/cli.rs`: probe, proxies (head pad, sidecars), HW encode/decode, `cpu.rs` budget, export graph, master bus, levels, masks, keyframe expressions, keyed zoom order, 360/v360, Insta360 stitch, stills, playback stream, rotation, HDR tone-map, per-property channel graph (keyed colour / volume) |
-| `.claude/docs/engine-media.md` | `peaks.rs` waveforms, `filmstrip.rs`, libav backend, whisper transcription, Kokoro TTS voiceover, optional cargo features |
-| `.claude/docs/core-model.md` | `model.rs`: clips, easing, transitions, captions, caption import, beats, diff, ripple, edit modes, per-property keyframe channels |
+| `.claude/docs/engine-cli.md` | `engine/cli.rs`: probe, proxies (head pad, sidecars), HW encode/decode, `cpu.rs` budget, export graph, master bus, levels, masks, keyframe expressions, keyed zoom order, 360/v360, Insta360 stitch, stills, playback stream, rotation, HDR tone-map, per-property channel graph (keyed colour / volume), grade (curves / LUTs / wheels), scopes, loudness and true-peak limiter, constant-power crossfades |
+| `.claude/docs/engine-media.md` | `peaks.rs` waveforms, `filmstrip.rs`, libav backend, whisper transcription (word timings, VAD, speakers), audio sync, Kokoro TTS voiceover, optional cargo features |
+| `.claude/docs/core-model.md` | `model.rs`: clips, easing, transitions, captions, caption import, beats, diff, ripple, edit modes, per-property keyframe channels, markers / chapters, timecode, OTIO / EDL interchange, hostile-input tests |
 | `.claude/docs/core-links.md` | Linked A/V: detach/reattach, carried edits, sync lock, `run_edit`, the links corpus |
 | `.claude/docs/core-render-plan.md` | `platform.rs`, `render_plan.rs` / `planner.rs` / `plan_caps.rs`, frame picks, GPU refusal rules, colour / partly-keyed transforms in the plan |
 | `.claude/docs/core-golden.md` | The golden argv oracle and how to bless it |
-| `.claude/docs/core-project.md` | `project.rs` persistence, ripple flag, smart crop, multi-format delivery, task queue, staged agent edits, `analysis.rs` (analysis steps, per-kind status), `proxy.rs` (proxy status / queue / settings) |
+| `.claude/docs/core-project.md` | `project.rs` persistence, ripple flag, smart crop, multi-format delivery, task queue, staged agent edits (owners, partial accept, restore), schema versions and migrations, crash recovery, motion templates and embedded fonts, `analysis.rs` (analysis steps, per-kind status), `proxy.rs` (proxy status / queue / settings) |
 | `.claude/docs/gpu.md` | kerf-gpu: frame cache, y4m/showinfo parsing, router, `FrameSource`, `FrameCursor`, presenting a frame (A2), parity harness findings |
-| `.claude/docs/mcp.md` | The embedded MCP server and its tools |
+| `.claude/docs/mcp.md` | The embedded MCP server: auth (bearer token, origin check), sessions, background jobs, tool annotations, every tool |
 | `.claude/docs/app.md` | kerf-app shell: CSP, single instance, launch args, window reveal, commands list, settings, logging, the GPU preview surface (`gpu_preview.rs`) |
 | `.claude/docs/build-and-ci.md` | Debug identity, prek checks, CI, auto-update, release workflow, PR builds |
 | `.claude/docs/frontend.md` | Theming, design system, title-bar menu bar, dockable workspaces (stored layouts, offered panels, reset), library, inspector, titles, mixer, export dialog, agent panel, notifications, keymap, settings, updater, GPU preview in the page, browser harness |
@@ -95,6 +96,13 @@ cargo run -p kerf-app        # also works; runs the frontend dev command first
 # MCP: run the app, then
 #   claude mcp add --transport http kerf http://127.0.0.1:7777/mcp \
 #     --header "Authorization: Bearer <token>"   (Settings > Agent shows it; KERF_MCP_ADDR overrides the address)
+
+# Release: prepare-release.yml pushes release/X.Y.Z but cannot open the PR (Actions may not
+# create PRs), so open it yourself; after merging, publish vX.Y.Z on the merge commit with
+# hand-written notes in the style of the previous release
+gh workflow run prepare-release.yml -f version=X.Y.Z
+gh pr create --base main --head release/X.Y.Z --title "release X.Y.Z"
+gh release create vX.Y.Z --target <merge sha> --title vX.Y.Z --notes-file notes.md
 ```
 
 Debug builds use their own identifier (`ch.orellbuehler.kerf.dev`), so a dev run does not

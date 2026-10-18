@@ -289,8 +289,8 @@ built `--enable-whisper`; a build from source falls back to that filter unless y
 
 ## Architecture
 
-Kerf is a Cargo workspace of **two Rust crates** plus a Tauri-embedded SvelteKit frontend.
-`kerf-core` is the UI-agnostic engine; `kerf-app` is a thin adapter that exposes that one
+Kerf is a Cargo workspace of **three Rust crates** plus a Tauri-embedded SvelteKit frontend.
+`kerf-core` is the UI-agnostic engine, `kerf-gpu` an opt-in wgpu preview compositor, and `kerf-app` a thin adapter that exposes that one
 `Project` API **twice** — as Tauri commands to the webview and as MCP tools to a connected
 LLM — over one shared, locked project.
 
@@ -302,17 +302,18 @@ kerf/
 │   │   ├── project.rs        #   SQLite .kerf project + all timeline operations + task queue
 │   │   ├── analysis.rs       #   pluggable Transcriber / SceneDetector / SilenceDetector
 │   │   └── engine/           #   cli.rs (binaries, always on) + ffmpeg.rs (in-process libav)
+│   ├── kerf-gpu/             # wgpu compositor for the opt-in GPU preview
 │   └── kerf-app/             # Tauri v2 shell
 │       ├── lib.rs            #   one Arc<Mutex<Project>> shared by both surfaces
 │       └── mcp.rs (+ mcp/)   #   embedded rmcp streamable-HTTP MCP server, auth, jobs
-├── frontend/                 # SvelteKit 2 / Svelte 5 (runes) / Tailwind 4 / shadcn-svelte
+├── frontend/                 # SvelteKit 3 / Svelte 5 (runes) / Tailwind 4 / shadcn-svelte
 └── site/                     # Hugo landing site (deployed to GitHub Pages)
 ```
 
 | Layer       | Choice                                          |
 | ----------- | ----------------------------------------------- |
 | Shell       | Rust + Tauri **2**                              |
-| Frontend    | SvelteKit **2** / Svelte **5** (runes), Bun     |
+| Frontend    | SvelteKit **3** / Svelte **5** (runes), Bun     |
 | Styling     | Tailwind CSS **4** (CSS config) + design tokens |
 | Media       | FFmpeg binaries (always) · `ffmpeg-next` **8.1** (optional libav) |
 | Persistence | `rusqlite` (bundled SQLite) — one `.kerf` file  |
