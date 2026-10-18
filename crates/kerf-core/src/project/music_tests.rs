@@ -243,7 +243,8 @@ fn a_score_is_fitted_to_the_cuts_of_the_working_timeline() {
     };
     let plan = project.compose_music_inputs(&req).unwrap();
     assert_eq!(plan.music_start, 0.0);
-    assert_eq!(plan.at, Some(0.0));
+    assert_eq!(plan.at, None, "the caller's own, resolved when the music is placed");
+    assert!(plan.replaces.is_empty());
     let report = plan.align.as_ref().unwrap();
     assert_eq!(report.cuts, 2);
     assert_eq!(report.on_downbeat_after, 2);
@@ -263,6 +264,7 @@ fn a_score_is_fitted_to_the_cuts_of_the_working_timeline() {
     late.at = Some(1.0);
     let plan = project.compose_music_inputs(&late).unwrap();
     assert_eq!(plan.music_start, 1.0);
+    assert_eq!(plan.at, Some(1.0));
     assert!(plan.align.as_ref().unwrap().on_beat_after >= plan.align.as_ref().unwrap().on_beat_before);
 
     // An explicit video track, and the guards.
@@ -543,4 +545,267 @@ fn a_composed_score_is_rendered_placed_and_measured_by_section() {
     // The same score is the same file: a cache hit, the same asset.
     let cached = Project::synthesize_music(&edited, &mut |_, _, _| {}, &|| false).unwrap();
     assert_eq!(cached.path, again.path);
+}
+
+/// A composed bed of `bars` drop bars after a 2-bar intro at 120 BPM, placed at `at` and cut by
+/// `fit_music` to about `target` seconds into several segments (the 16-bar drop repeats its two
+/// chords, so whole phrases can be left out). The bed's clips, in time order, and its end.
+fn fitted_bed(project: &Project, path: &str, at: f64, target: f64) -> (Vec<Uuid>, f64) {
+    let (_, clip) = project
+        .place_music(&composed(path, &score(120.0, 16)), None, Some(at), None)
+        .unwrap();
+    let report = project.fit_music(clip.id, Some(target), false).unwrap();
+    assert!(report.clips.len() >= 2, "a bed of several segments: {report:?}");
+    let timeline = project.timeline().unwrap();
+    let track = timeline.tracks.iter().find(|t| t.name == MUSIC_TRACK).unwrap();
+    (report.clips, track.end())
+}
+
+/// An unrelated clip right after the bed on its track.
+fn follower_after(project: &Project, end: f64) -> Uuid {
+    let other = asset("/other.wav", 4.0, vec![stream(StreamKind::Audio)]);
+    project.insert_asset(&other).unwrap();
+    let track = project
+        .timeline()
+        .unwrap()
+        .tracks
+        .iter()
+        .find(|t| t.name == MUSIC_TRACK)
+        .unwrap()
+        .id;
+    project
+        .add_clip_to_timeline(other.id, Some(track), 0.0, 4.0, Some(end))
+        .unwrap()
+        .id
+}
+
+fn music_clips(project: &Project) -> Vec<Clip> {
+    let tl = project.timeline().unwrap();
+    tl.tracks.iter().find(|t| t.name == MUSIC_TRACK).unwrap().clips.clone()
+}
+
+#[test]
+fn recomposing_replaces_the_whole_fitted_bed_not_one_segment() {
+    let project = Project::open_in_memory().unwrap();
+    let (bed, end) = fitted_bed(&project, "/m/a.wav", 3.0, 22.0);
+    let start = project.timeline().unwrap().clip(bed[0]).unwrap().timeline_start;
+    project.set_volume(bed[1], 0.7).unwrap();
+    let old_asset = project.timeline().unwrap().clip(bed[0]).unwrap().asset_id;
+    let before = project.history().unwrap().len();
+    assert!(end - start < 36.0, "fit_music left phrases out");
+
+    // The score is edited (shorter, another tempo); the clip named is the second segment.
+    let edited = score(100.0, 6);
+    let plan = project
+        .compose_music_inputs(&ComposeRequest {
+            score: edited.clone(),
+            track_id: None,
+            at: None,
+            align: None,
+            replace_clip_id: Some(bed[1]),
+        })
+        .unwrap();
+    assert_eq!(plan.replaces, bed, "the whole bed, in time order");
+    assert_eq!(plan.music_start, start, "from the bed's first clip, not the named one");
+    assert_eq!(plan.at, None);
+    let (new_asset, clip) = project
+        .place_music(&composed("/m/b.wav", &edited), None, None, Some(bed[1]))
+        .unwrap();
+
+    assert_eq!(clip.id, bed[1], "the named clip's id survives");
+    let clips = music_clips(&project);
+    assert_eq!(clips.len(), 1, "one clip of the new render, no segment of the old: {clips:?}");
+    assert_eq!(clips[0].asset_id, new_asset.id);
+    assert_ne!(new_asset.id, old_asset);
+    assert!((clips[0].timeline_start - start).abs() < 1e-9, "at the earliest start");
+    assert!((clips[0].duration() - new_asset.duration).abs() < 1e-9);
+    assert_eq!((clips[0].source_in, clips[0].speed), (0.0, 1.0));
+    assert!(
+        (clips[0].volume - 1.0).abs() < 1e-6,
+        "the first clip's gain (the second was turned down)"
+    );
+    assert_eq!(project.history().unwrap().len(), before + 1, "one revision");
+    assert_eq!(project.history().unwrap().last().unwrap().label, "Recompose music");
+}
+
+#[test]
+fn recomposing_a_bed_ripples_the_clips_after_it_when_ripple_is_on_and_not_otherwise() {
+    // Ripple on: a shorter piece pulls the next clip in, a longer one pushes it out.
+    for (bars, longer) in [(6u32, false), (30, true)] {
+        let project = Project::open_in_memory().unwrap();
+        let (bed, end) = fitted_bed(&project, "/m/a.wav", 0.0, 22.0);
+        let next = follower_after(&project, end);
+        let edited = score(120.0, bars);
+        let new_asset = composed("/m/b.wav", &edited);
+        let (stored, clip) = project
+            .with_ripple(Some(true), |p| p.place_music(&new_asset, None, None, Some(bed[0])))
+            .unwrap();
+        let tl = project.timeline().unwrap();
+        let moved = tl.clip(next).unwrap();
+        assert!(
+            (moved.timeline_start - clip.timeline_end()).abs() < 0.05,
+            "ripple on, longer {longer}: the next clip starts at {} and the piece ends at {}",
+            moved.timeline_start,
+            clip.timeline_end()
+        );
+        assert_eq!(music_clips(&project).len(), 2, "the new bed and the follower");
+        assert_eq!(clip.asset_id, stored.id);
+    }
+
+    // Ripple off, a shorter piece: the next clip stays and a gap is left.
+    let project = Project::open_in_memory().unwrap();
+    let (bed, end) = fitted_bed(&project, "/m/a.wav", 0.0, 22.0);
+    let next = follower_after(&project, end);
+    let (_, clip) = project
+        .with_ripple(Some(false), |p| {
+            p.place_music(&composed("/m/b.wav", &score(120.0, 6)), None, None, Some(bed[0]))
+        })
+        .unwrap();
+    assert!(clip.timeline_end() < end);
+    assert!((project.timeline().unwrap().clip(next).unwrap().timeline_start - end).abs() < 1e-9);
+
+    // Ripple off, a longer piece: it would run into the next clip, so nothing changes at all.
+    let project = Project::open_in_memory().unwrap();
+    let (bed, end) = fitted_bed(&project, "/m/a.wav", 0.0, 22.0);
+    let next = follower_after(&project, end);
+    let before = music_clips(&project);
+    let e = project
+        .with_ripple(Some(false), |p| {
+            p.place_music(&composed("/m/long.wav", &score(120.0, 30)), None, None, Some(bed[0]))
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.to_lowercase().contains("overlap") || e.contains("another clip") || e.contains("on top"),
+        "{e}"
+    );
+    let after = music_clips(&project);
+    assert_eq!(
+        after.iter().map(|c| c.id).collect::<Vec<_>>(),
+        before.iter().map(|c| c.id).collect::<Vec<_>>()
+    );
+    assert!(after
+        .iter()
+        .all(|c| c.asset_id == before.iter().find(|b| b.id == c.id).unwrap().asset_id));
+    assert!((project.timeline().unwrap().clip(next).unwrap().timeline_start - end).abs() < 1e-9);
+}
+
+#[test]
+fn a_locked_track_or_a_bad_target_is_refused_before_anything_renders_or_is_stored() {
+    let project = Project::open_in_memory().unwrap();
+    let (bed, _) = fitted_bed(&project, "/m/a.wav", 0.0, 22.0);
+    let track = project
+        .timeline()
+        .unwrap()
+        .tracks
+        .iter()
+        .find(|t| t.name == MUSIC_TRACK)
+        .unwrap()
+        .id;
+    let req = |replace: Option<Uuid>| ComposeRequest {
+        score: score(110.0, 4),
+        track_id: None,
+        at: None,
+        align: None,
+        replace_clip_id: replace,
+    };
+    let assets_before = project.list_assets().unwrap().len();
+    project.set_track_locked(track, true).unwrap();
+    // The plan says so, for a new clip and for a recompose, before a minute of rendering.
+    for replace in [None, Some(bed[0])] {
+        let e = project.compose_music_inputs(&req(replace)).unwrap_err().to_string();
+        assert!(e.contains("is locked"), "{e}");
+    }
+    // ... and so does placing, with nothing stored.
+    let fresh = composed("/m/c.wav", &score(110.0, 4));
+    for replace in [None, Some(bed[0])] {
+        let e = project.place_music(&fresh, None, None, replace).unwrap_err().to_string();
+        assert!(e.contains("is locked"), "{e}");
+    }
+    assert_eq!(project.list_assets().unwrap().len(), assets_before);
+    project.set_track_locked(track, false).unwrap();
+
+    // A clip that is not there, and a score that does not resolve: nothing stored either.
+    assert!(project.compose_music_inputs(&req(Some(Uuid::new_v4()))).is_err());
+    assert!(project.place_music(&fresh, None, None, Some(Uuid::new_v4())).is_err());
+    let mut broken = score(110.0, 4);
+    broken.sections[0].chords = vec!["Hm".into()];
+    let e = project
+        .place_music(&composed("/m/bad.wav", &broken), None, None, None)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("sections[0]"), "{e}");
+    assert_eq!(project.list_assets().unwrap().len(), assets_before, "no asset, no analysis");
+}
+
+#[test]
+fn a_linked_bed_is_not_replaced() {
+    let project = Project::open_in_memory().unwrap();
+    let (_, clip) = project
+        .place_music(&composed("/m/a.wav", &score(120.0, 4)), None, Some(0.0), None)
+        .unwrap();
+    let req = ComposeRequest {
+        score: score(110.0, 4),
+        track_id: None,
+        at: None,
+        align: None,
+        replace_clip_id: Some(clip.id),
+    };
+    // Link the music to a picture clip.
+    let v = video_asset(&project);
+    let picture = project.add_clip_to_timeline(v.id, None, 0.0, 5.0, Some(0.0)).unwrap();
+    project.link_clips(&[clip.id, picture.id]).unwrap();
+    let e = project.compose_music_inputs(&req).unwrap_err().to_string();
+    assert!(e.contains("unlink the music"), "{e}");
+}
+
+#[test]
+fn a_misspelled_field_is_an_error_not_a_default() {
+    // `enrgy` for `energy`, `at` for `at_s`: each would be silently dropped without the check.
+    let section = r#"{"kind":"drop","bars":4,"chords":["C"],"enrgy":0.9}"#;
+    let score_json = |section: &str| format!(r#"{{"bpm":100,"key":"C","style":"pop","sections":[{section}]}}"#);
+    let e = serde_json::from_str::<MusicScore>(&score_json(section))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("unknown field `enrgy`"), "{e}");
+    let e = serde_json::from_str::<MusicScore>(
+        r#"{"bpm":100,"key":"C","style":"pop","sections":[{"kind":"drop","bars":4,"chords":["C"]}],"hits":[{"at":3.0,"kind":"impact"}]}"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("unknown field `at`"), "{e}");
+    let e = serde_json::from_str::<MusicScore>(
+        r#"{"bpm":100,"key":"C","style":"pop","sections":[{"kind":"drop","bars":4,"chords":["C"]}],"instruments":{"drum":10}}"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("unknown field `drum`"), "{e}");
+    let e = serde_json::from_str::<MusicScore>(
+        r#"{"bpm":100,"key":"C","style":"pop","sections":[{"kind":"drop","bars":4,"chords":["C"]}],"tempo":90}"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("unknown field `tempo`"), "{e}");
+    // The right spelling is accepted.
+    serde_json::from_str::<MusicScore>(&score_json(r#"{"kind":"drop","bars":4,"chords":["C"],"energy":0.9}"#)).unwrap();
+
+    // The request, its align and the band-balance request and sections.
+    let score_ok = score_json(r#"{"kind":"drop","bars":4,"chords":["C"]}"#);
+    let e = serde_json::from_str::<ComposeRequest>(&format!(r#"{{"score":{score_ok},"replace_clip":"x"}}"#))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("unknown field `replace_clip`"), "{e}");
+    let e = serde_json::from_str::<ComposeRequest>(&format!(r#"{{"score":{score_ok},"align":{{"to":"cuts","max_tempo":0.1}}}}"#))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("unknown field `max_tempo`"), "{e}");
+    let e = serde_json::from_str::<BandBalanceRequest>(r#"{"sectons":[]}"#)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("unknown field `sectons`"), "{e}");
+    let e = serde_json::from_str::<BandBalanceRequest>(r#"{"sections":[{"start":0,"end":3,"lable":"a"}]}"#)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("unknown field `lable`"), "{e}");
+    serde_json::from_str::<BandBalanceRequest>(r#"{"sections":[{"start":0,"end":3,"label":"a"}]}"#).unwrap();
 }

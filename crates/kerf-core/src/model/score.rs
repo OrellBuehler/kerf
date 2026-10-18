@@ -153,6 +153,7 @@ impl SectionKind {
 
 /// A run of whole bars with a chord per bar.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ScoreSection {
     pub kind: SectionKind,
     /// Length in bars, at least 1.
@@ -193,6 +194,7 @@ impl HitKind {
 
 /// A sound effect placed at a time in the music.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ScoreHit {
     /// Seconds from the start of the music.
     pub at_s: f64,
@@ -203,6 +205,7 @@ pub struct ScoreHit {
 /// program (0 standard, 8 room, 16 power, 24 electronic, 25 808/909, 32 jazz, 40 brush, 48
 /// orchestral).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InstrumentOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drums: Option<u8>,
@@ -227,6 +230,7 @@ impl InstrumentOverrides {
 
 /// A piece of music, in 4/4.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MusicScore {
     /// Beats per minute, 40..=240.
     pub bpm: f64,
@@ -262,7 +266,9 @@ pub struct SectionSpan {
 #[derive(Debug, Clone)]
 pub struct Resolved {
     pub key: Key,
-    /// `chords[section][bar]`, each section's list cycled to its length.
+    /// `chords[section][bar]` **as played**: each section's list cycled to its length, with the
+    /// last bar of an outro that ends the piece replaced by the tonic chord (it resolves) — so the
+    /// notes, the analysis chroma and the bar before's approach note all agree.
     pub chords: Vec<Vec<Chord>>,
     pub spans: Vec<SectionSpan>,
     pub total_bars: u32,
@@ -355,6 +361,12 @@ impl MusicScore {
             bar += section.bars;
             if bar > MAX_SCORE_BARS {
                 return Err(invalid(format!("a score has at most {MAX_SCORE_BARS} bars")));
+            }
+        }
+        // A piece that ends on an outro ends on the tonic chord, whatever the last bar was written as.
+        if self.sections.last().is_some_and(|s| s.kind == SectionKind::Outro) {
+            if let Some(last) = chords.last_mut().and_then(|c: &mut Vec<Chord>| c.last_mut()) {
+                *last = key.tonic_chord().coloured(colour);
             }
         }
         let duration = duration_s(self);
@@ -660,6 +672,11 @@ mod tests {
         // Bar 0 is Am: A, C and E carry the chroma.
         assert!(m.bar_chroma[0][9] > 0.4 && m.bar_chroma[0][0] > 0.3 && m.bar_chroma[0][4] > 0.3);
         assert!(m.bar_chroma[0][6] == 0.0);
+        // The outro's last bar is written as V (E major, with a G sharp) but plays the tonic, and so
+        // does the chroma the analysis is written from.
+        let last = m.bar_chroma[39];
+        assert!(last[9] > 0.4 && last[0] > 0.3 && last[4] > 0.3 && last[8] == 0.0, "{last:?}");
+        assert_eq!(s.resolve().unwrap().chords[6][3].root, 9);
         let norm: f32 = m.bar_chroma[0].iter().map(|v| v * v).sum();
         assert!((norm - 1.0).abs() < 1e-5);
         // The verse and the first drop repeat the same four chords: a phrase match.

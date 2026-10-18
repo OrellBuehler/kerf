@@ -936,7 +936,7 @@ impl Bar {
     }
 }
 
-fn bars_of(score: &MusicScore, resolved: &super::Resolved, preset: &Preset) -> Vec<Bar> {
+fn bars_of(score: &MusicScore, resolved: &super::Resolved) -> Vec<Bar> {
     let bar_s = score.bar_s();
     let mut flat: Vec<(usize, usize, Chord)> = Vec::new();
     for (si, chords) in resolved.chords.iter().enumerate() {
@@ -944,14 +944,7 @@ fn bars_of(score: &MusicScore, resolved: &super::Resolved, preset: &Preset) -> V
             flat.push((si, bi, *c));
         }
     }
-    let tonic = resolved.key.tonic_chord().coloured(preset.colour);
     let total = flat.len();
-    // The piece ends on the tonic when its last section is an outro: the bar before approaches that.
-    if resolved.spans.last().is_some_and(|s| s.kind == SectionKind::Outro) {
-        if let Some(last) = flat.last_mut() {
-            last.2 = tonic;
-        }
-    }
     let mut out = Vec::with_capacity(total);
     for (g, (si, bi, chord)) in flat.iter().enumerate() {
         let span = &resolved.spans[*si];
@@ -1876,7 +1869,7 @@ pub fn expand(score: &MusicScore) -> Result<Arrangement> {
         over.lead.unwrap_or(p.lead),
         0,
     ];
-    let bars = bars_of(score, &resolved, p);
+    let bars = bars_of(score, &resolved);
     let mut gen = Gen {
         score,
         preset: p,
@@ -1962,15 +1955,9 @@ mod tests {
         v
     }
 
-    /// The chord of every bar as played: the written ones, the last bar of an outro resolved.
+    /// The chord of every bar as played (`resolve` already resolves the outro's last bar).
     fn played(s: &MusicScore) -> Vec<Chord> {
-        let r = s.resolve().unwrap();
-        let mut chords: Vec<Chord> = r.chords.iter().flatten().copied().collect();
-        if s.sections.last().is_some_and(|x| x.kind == SectionKind::Outro) {
-            let last = chords.len() - 1;
-            chords[last] = r.key.tonic_chord().coloured(colour_of(s.style));
-        }
-        chords
+        s.resolve().unwrap().chords.iter().flatten().copied().collect()
     }
 
     fn in_bar(a: &Arrangement, role: Role, bar: usize, bar_s: f64) -> Vec<&NoteEvent> {

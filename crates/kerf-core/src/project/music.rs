@@ -45,6 +45,7 @@ pub enum AlignTo {
 
 /// Fit the score to the picture ([`plan_score_to_picture`]): nudge the tempo and add the hits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ScoreAlign {
     pub to: AlignTo,
     /// Which video track's cuts; the first video track when absent. Ignored for markers.
@@ -58,6 +59,7 @@ pub struct ScoreAlign {
 
 /// Everything `compose_music` is asked.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ComposeRequest {
     pub score: MusicScore,
     /// The audio track to put the music on (default: the track named `M`, made on first use).
@@ -69,27 +71,34 @@ pub struct ComposeRequest {
     pub at: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align: Option<ScoreAlign>,
-    /// Swap this music clip to the new render instead of adding a clip — how a score is edited
-    /// and composed again. The clip keeps its place, gain, fades and effects; its length
-    /// becomes the render's.
+    /// Replace this music with the new render instead of adding a clip — how a score is edited
+    /// and composed again. **The whole bed goes**: every clip of this clip's asset on its track
+    /// (what `fit_music` made of one piece) becomes one clip of the new render, at the earliest of
+    /// their starts, with this clip's id, the first one's gain, fades-in and effects and the last
+    /// one's fade-out; its length becomes the render's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<String>")]
     pub replace_clip_id: Option<Uuid>,
 }
 
-/// A checked request, with the placement made definite and the score fitted to the picture:
-/// what [`Project::synthesize_music`] renders and [`Project::place_music`] lands.
+/// A checked request with the score fitted to the picture: what [`Project::synthesize_music`]
+/// renders and [`Project::place_music`] lands.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ComposePlan {
     /// The score to render (the request's, or the aligned one).
     pub score: MusicScore,
     /// What aligning did, when it was asked for.
     pub align: Option<AlignReport>,
-    /// Pass these to [`Project::place_music`].
+    /// Pass these to [`Project::place_music`]: the request's own, as given. A `None` start is
+    /// resolved when the music is placed (after what the track holds *then*).
     pub track_id: Option<Uuid>,
     pub at: Option<f64>,
     pub replace_clip_id: Option<Uuid>,
-    /// Where on the timeline the music will start, seconds.
+    /// The clips the placement will replace — the whole bed of `replace_clip_id`, in time order;
+    /// empty when a clip is added.
+    pub replaces: Vec<Uuid>,
+    /// Where on the timeline the music started when the plan was made (what `align` fitted the cuts
+    /// to), seconds: informational.
     pub music_start: f64,
 }
 
@@ -102,8 +111,9 @@ pub struct Composed {
     pub clip: Clip,
     pub score: MusicScore,
     pub align: Option<AlignReport>,
-    /// An existing clip was swapped to the new render (`replace_clip_id`) rather than a clip added.
-    pub replaced: bool,
+    /// The clips that were replaced by `clip` (`ComposePlan::replaces`); empty when a clip was
+    /// added.
+    pub replaced: Vec<Uuid>,
 }
 
 impl Project {
@@ -118,22 +128,13 @@ impl Project {
                 return Err(invalid("at must be a time in seconds, 0 or later"));
             }
         }
-        let start = match req.replace_clip_id {
+        let (start, replaces) = match req.replace_clip_id {
             Some(clip_id) => {
-                let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
-                let clip = &timeline.tracks[ti].clips[ci];
-                if timeline.tracks[ti].kind != StreamKind::Audio {
-                    return Err(invalid("only music on an audio track can be replaced"));
-                }
-                let old = self.require_asset(clip.asset_id)?;
-                if old.music_score.is_none() {
-                    return Err(invalid(
-                        "that clip is not composed music: only a clip of a composed asset can be replaced",
-                    ));
-                }
-                clip.timeline_start
+                let bed = self.music_bed(&timeline, clip_id)?;
+                let start = bed.iter().map(|c| c.timeline_start).fold(f64::INFINITY, f64::min);
+                (start, bed.iter().map(|c| c.id).collect())
             }
-            None => music_start(&timeline, req.track_id, req.at)?,
+            None => (music_start(&timeline, req.track_id, req.at)?, Vec::new()),
         };
         let (score, align) = match &req.align {
             None => (req.score.clone(), None),
@@ -155,10 +156,37 @@ impl Project {
             score,
             align,
             track_id: req.track_id,
-            at: Some(start),
+            at: req.at,
             replace_clip_id: req.replace_clip_id,
+            replaces,
             music_start: start,
         })
+    }
+
+    /// The music bed a clip belongs to, in time order: every clip of its asset on its track —
+    /// what `fit_music` made of one piece. Refused unless it can be replaced: the clip is on an
+    /// unlocked audio track, its asset was composed, and none of the bed is linked to a picture.
+    fn music_bed(&self, timeline: &Timeline, clip_id: Uuid) -> Result<Vec<Clip>> {
+        let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+        let track = &timeline.tracks[ti];
+        if track.kind != StreamKind::Audio {
+            return Err(invalid("only music on an audio track can be replaced"));
+        }
+        if track.locked {
+            return Err(invalid(format!("{} is locked", track.name)));
+        }
+        let asset_id = track.clips[ci].asset_id;
+        if self.require_asset(asset_id)?.music_score.is_none() {
+            return Err(invalid(
+                "that clip is not composed music: only a clip of a composed asset can be replaced",
+            ));
+        }
+        let mut bed: Vec<Clip> = track.clips.iter().filter(|c| c.asset_id == asset_id).cloned().collect();
+        if bed.iter().any(|c| c.link_id.is_some()) {
+            return Err(invalid("unlink the music from its picture before composing it again"));
+        }
+        bed.sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
+        Ok(bed)
     }
 
     /// Render `score` and describe the result as an importable [`Asset`], *without* `&self`:
@@ -177,13 +205,16 @@ impl Project {
     /// Land composed music: store the asset (reusing it when the same score was composed
     /// before), write its tempo and bar analysis **from the score** — the grid is exact, so
     /// `get_music_structure`, `fit_music` and beat snapping work at once, with no analysis pass —
-    /// and put it on the timeline as one edit.
+    /// and put it on the timeline as one edit. The score is checked first: a score that does not
+    /// resolve stores nothing.
     ///
     /// With no `track_id` it goes on the audio track named [`MUSIC_TRACK`], made on first use;
-    /// with no `timeline_start` after what that track holds. With `replace_clip_id` the clip
-    /// (on its own track, at its own start) is swapped to this asset instead, keeping its gain,
-    /// fades and effects; its length becomes the new render's and it must still fit before the
-    /// next clip of its track (or ripple makes the room).
+    /// with no `timeline_start` after what that track holds *now*. A locked track is refused. With
+    /// `replace_clip_id` the **whole music bed** is replaced: every clip of that clip's asset on its
+    /// track (the segments `fit_music` made of one piece) becomes **one** clip of this asset, at the
+    /// earliest of their starts and with the named clip's id, the first one's gain, fade-in and
+    /// effects and the last one's fade-out; its length is the new render's and ripple applies to
+    /// the clips after it as to any edit (without it the new clip must fit before the next one).
     pub fn place_music(
         &self,
         asset: &Asset,
@@ -194,26 +225,20 @@ impl Project {
         let Some(score) = &asset.music_score else {
             return Err(invalid("that asset was not composed from a score"));
         };
-        if let Some(clip_id) = replace_clip_id {
-            // Refuse before anything is stored.
-            let timeline = self.working_timeline()?;
-            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
-            if timeline.tracks[ti].kind != StreamKind::Audio {
-                return Err(invalid("only music on an audio track can be replaced"));
+        // Everything that can be said wrong is said before anything is stored.
+        let rhythm = score.rhythm(asset.duration)?;
+        let timeline = self.working_timeline()?;
+        match replace_clip_id {
+            Some(clip_id) => {
+                self.music_bed(&timeline, clip_id)?;
             }
-            if timeline.tracks[ti].locked {
-                return Err(invalid(format!("{} is locked", timeline.tracks[ti].name)));
-            }
-            let old = self.require_asset(timeline.tracks[ti].clips[ci].asset_id)?;
-            if old.music_score.is_none() {
-                return Err(invalid(
-                    "that clip is not composed music: only a clip of a composed asset can be replaced",
-                ));
+            // The track it goes on exists, is audio and is not locked.
+            None => {
+                music_start(&timeline, track_id, timeline_start)?;
             }
         }
         let asset = self.insert_or_get_asset(asset)?;
         // The analysis the score implies; whatever an earlier pass measured for other kinds stays.
-        let rhythm = score.rhythm(asset.duration)?;
         let mut analysis = self.get_analysis(asset.id)?.unwrap_or_else(|| AssetAnalysis {
             asset_id: asset.id,
             ..AssetAnalysis::default()
@@ -238,16 +263,7 @@ impl Project {
         };
         let clip = self.edit_timeline(label, |timeline| {
             if let Some(clip_id) = replace_clip_id {
-                let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
-                let clip = &mut timeline.tracks[ti].clips[ci];
-                clip.asset_id = asset.id;
-                clip.source_in = 0.0;
-                clip.source_out = asset.duration;
-                clip.speed = 1.0;
-                let duration = clip.duration();
-                clip.fade_in = clip.fade_in.min(duration);
-                clip.fade_out = clip.fade_out.min(duration);
-                return Ok(clip.clone());
+                return replace_bed(timeline, clip_id, &asset);
             }
             let tid = match track_id {
                 Some(t) => {
@@ -271,6 +287,12 @@ impl Project {
                     }
                 },
             };
+            if timeline.track(tid).is_some_and(|t| t.locked) {
+                return Err(invalid(format!(
+                    "{} is locked",
+                    timeline.track(tid).map(|t| t.name.as_str()).unwrap_or("the track")
+                )));
+            }
             let start = timeline_start
                 .map(|t| t.max(0.0))
                 .unwrap_or_else(|| timeline.track(tid).map(Track::end).unwrap_or(0.0));
@@ -285,6 +307,42 @@ impl Project {
         })?;
         Ok((asset, clip))
     }
+}
+
+/// Replace the whole music bed `clip_id` belongs to with one clip of `asset`, in `timeline`.
+fn replace_bed(timeline: &mut Timeline, clip_id: Uuid, asset: &Asset) -> Result<Clip> {
+    let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+    let track = &mut timeline.tracks[ti];
+    if track.locked {
+        return Err(invalid(format!("{} is locked", track.name)));
+    }
+    let asset_id = track.clips[ci].asset_id;
+    let mut bed: Vec<Clip> = track.clips.iter().filter(|c| c.asset_id == asset_id).cloned().collect();
+    bed.sort_by(|a, b| a.timeline_start.total_cmp(&b.timeline_start));
+    let first = bed.first().expect("the named clip is in its bed").clone();
+    let last = bed
+        .iter()
+        .max_by(|a, b| a.timeline_end().total_cmp(&b.timeline_end()))
+        .expect("the named clip is in its bed");
+    let mut clip = first.clone();
+    clip.id = clip_id;
+    clip.asset_id = asset.id;
+    clip.source_in = 0.0;
+    clip.source_out = asset.duration;
+    clip.speed = 1.0;
+    clip.timeline_start = first.timeline_start;
+    let duration = clip.duration();
+    clip.fade_in = first.fade_in.min(duration);
+    clip.fade_out = last.fade_out.min(duration);
+    // The new clip takes the place of the first one of the bed in the track's order.
+    let at = track
+        .clips
+        .iter()
+        .position(|c| c.id == first.id)
+        .expect("the first clip of the bed is on the track");
+    track.clips.retain(|c| c.asset_id != asset_id);
+    track.clips.insert(at.min(track.clips.len()), clip.clone());
+    Ok(clip)
 }
 
 /// Where music placed with these arguments would start: the clip placement's own rule.
@@ -302,6 +360,9 @@ fn music_start(timeline: &Timeline, track_id: Option<Uuid>, at: Option<f64>) -> 
             .iter()
             .find(|t| t.kind == StreamKind::Audio && t.name == MUSIC_TRACK),
     };
+    if let Some(track) = track.filter(|t| t.locked) {
+        return Err(invalid(format!("{} is locked", track.name)));
+    }
     Ok(at.map(|t| t.max(0.0)).unwrap_or_else(|| track.map(Track::end).unwrap_or(0.0)))
 }
 
@@ -353,6 +414,7 @@ fn cut_times(timeline: &Timeline, align: &ScoreAlign) -> Result<Vec<f64>> {
 
 /// What `get_band_balance` is asked: exactly one of `asset_id`, `clip_id` or `range`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BandBalanceRequest {
     /// An asset's whole sound. Times are the asset's own seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]

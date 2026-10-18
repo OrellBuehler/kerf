@@ -50,6 +50,7 @@ pub const MIN_WINDOW_S: f64 = 0.25;
 
 /// A stretch of the measured sound, seconds from its start.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BandWindow {
     pub start: f64,
     pub end: f64,

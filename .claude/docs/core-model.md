@@ -405,7 +405,9 @@
   are names (`C`, `Em`, `F#m7`, `Gsus4`, `D/F#`, `Bbmaj7`, `E5`, `Cadd9`, `Am7b5`) or **roman numerals in the key's own
   scale** (in A minor `VI` is F, `VII` is G, `i` is Am; case is quality, a leading `b` / `#` moves the root), one per
   bar, a shorter list cycling; `resolve()` checks everything and the error names `sections[i] (kind)` and the
-  chord (`InvalidArgument`); limits keep a render in memory (100 sections, 128 bars each, 400 bars, 600 s, 256
+  chord (`InvalidArgument`) — and its `chords` are **as played**: the last bar of an outro that ends the piece is
+  already the tonic chord, so the notes, the bar before's approach note and the analysis chroma agree; the score
+  types refuse an unknown field (`deny_unknown_fields`); limits keep a render in memory (100 sections, 128 bars each, 400 bars, 600 s, 256
   hits). `duration_s` = bars + a **release tail** (`RELEASE_TAIL_S` 1.5 s, at most 0.9 of a bar so the tail is never
   a whole extra bar); `beat_grid()` is exact (beat 0 at 0 s, bar every 4), `music_analysis(duration)` writes the
   asset's **bar structure from the chords** (per-bar chroma from the chord tones, then the same `phrase_matches` the
@@ -438,7 +440,10 @@
   tempo**, taking from the nearest run of equally good tempos the one that centres the cuts (so a nudge lands the
   cuts within a few ms, not at the edge of the tolerance); then an `impact` on every cut on a downbeat (on the
   grid, not on the cut) and, before a `drop` a cut lands within one beat of, a `dropout` (one beat) and a `riser`
-  (not after a build, which has its own). Hits already there are not added twice. The report lists every cut's
+  (not after a build, which has its own). Hits already there are not added twice. The score's **own hits stay at their
+  absolute seconds**, so a tempo whose piece would end before the last of them is never a candidate (a fit to 127 BPM
+  that would cut the piece short of an impact at 80 s settles on the slower tempo that keeps it); the hits added stop at
+  `MAX_HITS` (a note in the report says how many were left out) and the score returned is `validate()`d. The report lists every cut's
   `before` / `after` reading (on beat, on downbeat, offset) and the counts.
 - **Limits that keep a project loadable.** A clip's speed is `MIN_SPEED..=MAX_SPEED`
   (0.01×..100×, either sign) — `set_speed` and the ratio `set_speed_linked` hands each partner

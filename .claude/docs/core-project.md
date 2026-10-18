@@ -303,23 +303,35 @@
   **Composed music** (`project/music.rs`, tests in `music_tests.rs`; the voiceover's shape again): an asset carries
   **`Asset.music_score`** (`MusicScore`, a `music_score` JSON column — schema step v2 → v3 in `store.rs`, a
   probe-and-`ALTER` like the others, so a v2 file is copied aside once as `(schema v2 backup)`), which is what lets a
-  piece be edited and composed again and what its analysis is written from. The split: `compose_music_inputs(&ComposeRequest
-  {score, track_id?, at?, align?, replace_clip_id?}) -> ComposePlan` under the lock (the score is valid; a replaced
-  clip is on an audio track and of a **composed** asset; the music's start is the clip's, else `at`, else the end of the
-  track; with `align`, the **working timeline's** cuts — the boundaries *between* the clips of a video track, the
-  picture's first start and last end being its edges — or its markers go to `plan_score_to_picture` with that start, and
-  the plan holds the fitted score, the `AlignReport` and the placement pinned) → static `synthesize_music(score,
-  progress, cancel) -> Asset` (renders with the lock released, probes, names it `Music: <title>`) → `place_music(asset,
-  track_id?, timeline_start?, replace_clip_id?)` under the lock: the asset is stored (the same score is the same file, so
-  the same asset), **its analysis is written from the score** (`Rhythm` kind: the exact grid as a full-confidence
-  `Tempo`, the bars and phrases as `MusicAnalysis`, onsets, class music — nothing is analysed, so `get_music_structure`,
-  `fit_music` and the beat snap work at once; other kinds an earlier pass cached stay), and **one `Add music`
-  edit** puts the clip on the audio track named **`M`** (`MUSIC_TRACK`, made on first use like `VO`) after what it
-  holds. An agent's edit stages through `edit_timeline` (the asset and its analysis land at once, the placement
-  waits). **`replace_clip_id`** swaps that clip's asset to the new render as one `Recompose music` revision: the
-  clip keeps its id, place, gain, fades, effects and keys, `source_in` 0, `source_out` the new length, speed 1; it is
-  registered with `edit_lanes`, so a longer render that would run into the next clip on its track is refused unless
-  ripple makes the room, and a clip of ordinary media is refused (`not composed music`). **Band balance**
+  piece be edited and composed again and what its analysis is written from. **The request types refuse a misspelled
+  field** (`#[serde(deny_unknown_fields)]` on `MusicScore`, `ScoreSection`, `ScoreHit`, `InstrumentOverrides`,
+  `ComposeRequest`, `ScoreAlign`, `BandBalanceRequest`, `BandWindow`): `enrgy` is an error naming it, not a section
+  with the default energy. The split: `compose_music_inputs(&ComposeRequest {score, track_id?, at?, align?,
+  replace_clip_id?}) -> ComposePlan` under the lock — **everything that can be said wrong is said here, before the
+  render**: the score resolves, the target track exists, is audio and is **not locked**, a replaced clip is on an
+  audio track, of a **composed** asset, with no clip of the bed linked to a picture — then the music's start (the
+  **earliest clip of the replaced bed**, else `at`, else the end of the track) and, with `align`, the **working
+  timeline's** cuts (the boundaries *between* the clips of a video track, the picture's first start and last end being
+  its edges) or markers go to `plan_score_to_picture`. The plan holds the fitted score, the `AlignReport`, the
+  request's own `track_id` / `at` / `replace_clip_id` **as given** (a `None` start is resolved when the music is
+  placed, after what the track holds *then*), `replaces` (the clip ids of the bed, in time order; empty when a clip is
+  added) and `music_start` (what the alignment used; informational) → static `synthesize_music(score, progress,
+  cancel) -> Asset` (renders with the lock released, probes, names it `Music: <title>`) → `place_music(asset,
+  track_id?, timeline_start?, replace_clip_id?)` under the lock: **the score is resolved and the target checked
+  before anything is stored** (an unresolvable score, a bad or locked target store no asset and no analysis); then the
+  asset is stored (the same score is the same file, so the same asset), **its analysis is written from the score**
+  (`Rhythm` kind: the exact grid as a full-confidence `Tempo`, the bars and phrases as `MusicAnalysis`, onsets, class
+  music — nothing is analysed, so `get_music_structure`, `fit_music` and the beat snap work at once; other kinds an
+  earlier pass cached stay), and **one `Add music` edit** puts the clip on the audio track named **`M`** (`MUSIC_TRACK`,
+  made on first use like `VO`) after what it holds. An agent's edit stages through `edit_timeline` (the asset and its
+  analysis land at once, the placement waits). **`replace_clip_id` replaces the whole bed**: every clip of the named
+  clip's asset on its track — the segments `fit_music` made of one piece — is removed and **one** clip of the new
+  render takes the place of the first, as one `Recompose music` revision: the named clip's id, the earliest start,
+  the first clip's gain / fade-in / effects / keys and the last one's fade-out, `source_in` 0, `source_out` the new
+  length, speed 1. It is registered with `edit_lanes` and goes through `edit_timeline`, so **ripple applies as to any
+  edit** (the clips after the bed move by the difference in length) and without it a longer render that would run into
+  the next clip is refused with nothing changed. `Composed.replaced` is the list of the clip ids that were replaced.
+  **Band balance**
   (`band_balance_inputs(&BandBalanceRequest {asset_id? | clip_id? | range?, sections?}) -> BandPlan` under the lock →
   static `measure_band_balance(&plan, cancel) -> BandBalance` → `band_balance(&req)` for a caller with `&self`): exactly one
   target; times are the **target's own clock** (an asset's seconds, a clip's *source* seconds with its `volume` applied

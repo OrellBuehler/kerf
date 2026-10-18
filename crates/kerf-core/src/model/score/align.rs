@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{bar_seconds, HitKind, MusicScore, ScoreHit, SectionKind, MAX_BPM, MIN_BPM};
+use super::{bar_seconds, HitKind, MusicScore, ScoreHit, SectionKind, MAX_BPM, MAX_HITS, MIN_BPM, RELEASE_TAIL_S};
 use crate::error::Result;
 
 /// How far the tempo may move by default, as a fraction (6 %).
@@ -120,14 +120,17 @@ fn fit(cuts: &[f64], bpm: f64, tolerance: f64) -> (u32, f64) {
 /// The tempo is searched in steps of 0.05 % within `±max_tempo_change` for the one that puts the
 /// most cuts on beats; it only changes when that beats the tempo the score has, and among the
 /// equally good tempos in the nearest run to the original it takes the one that centres the cuts
-/// on the grid. Cuts outside the music are ignored.
+/// on the grid. Cuts outside the music are ignored. The score's own `hits` stay at their absolute
+/// seconds, so a tempo that would end the piece before the last of them is never chosen; the hits
+/// added are capped at what room is left under [`MAX_HITS`] (the report's `notes` say so), and the
+/// score returned is validated.
 pub fn plan_score_to_picture(
     score: &MusicScore,
     cut_times_s: &[f64],
     music_start_s: f64,
     opts: &AlignOptions,
 ) -> Result<(MusicScore, AlignReport)> {
-    let resolved = score.resolve()?;
+    score.validate()?;
     let duration = score.duration_s();
     let mut cuts: Vec<(f64, f64)> = cut_times_s
         .iter()
@@ -154,7 +157,14 @@ pub fn plan_score_to_picture(
                 (bpm, w, d)
             })
             .collect();
-        let valid = |bpm: f64| (MIN_BPM..=MAX_BPM).contains(&bpm);
+        // The piece may not end before one of the hits it already has: they are absolute seconds.
+        let last_hit = score.hits.iter().map(|h| h.at_s).fold(0.0, f64::max);
+        let bars = score.total_bars() as f64;
+        let duration_at = |bpm: f64| {
+            let bar = bar_seconds(bpm);
+            bars * bar + RELEASE_TAIL_S.min(0.9 * bar)
+        };
+        let valid = |bpm: f64| (MIN_BPM..=MAX_BPM).contains(&bpm) && duration_at(bpm) >= last_hit;
         let baseline = fit(&music, bpm_before, tol).0;
         let best = candidates
             .iter()
@@ -212,18 +222,29 @@ pub fn plan_score_to_picture(
             |hits: &[ScoreHit], kind: HitKind, at: f64| hits.iter().any(|h| h.kind == kind && (h.at_s - at).abs() < DUPLICATE_S);
         let new_spans = aligned.section_spans()?;
         let total = aligned.duration_s();
+        let mut skipped = 0usize;
+        // Add `hit` unless the score is full.
+        let mut add = |aligned: &mut MusicScore, hit: ScoreHit| {
+            if aligned.hits.len() >= MAX_HITS {
+                skipped += 1;
+            } else {
+                aligned.hits.push(hit);
+                hits_added.push(hit);
+            }
+        };
         // An impact on every cut that sits on a downbeat.
         for m in &music {
             let r = read(*m, bpm_after, tol);
             if r.on_downbeat {
                 let at = (m / (4.0 * period)).round() * 4.0 * period;
                 if at <= total && !existing(&aligned.hits, HitKind::Impact, at) {
-                    let hit = ScoreHit {
-                        at_s: at,
-                        kind: HitKind::Impact,
-                    };
-                    aligned.hits.push(hit);
-                    hits_added.push(hit);
+                    add(
+                        &mut aligned,
+                        ScoreHit {
+                            at_s: at,
+                            kind: HitKind::Impact,
+                        },
+                    );
                 }
             }
         }
@@ -241,8 +262,7 @@ pub fn plan_score_to_picture(
                 kind: HitKind::Dropout,
             };
             if !existing(&aligned.hits, HitKind::Dropout, dropout.at_s) {
-                aligned.hits.push(dropout);
-                hits_added.push(dropout);
+                add(&mut aligned, dropout);
             }
             // A build already ends in a riser of its own.
             let riser = ScoreHit {
@@ -253,13 +273,18 @@ pub fn plan_score_to_picture(
                 && !existing(&aligned.hits, HitKind::Riser, riser.at_s)
                 && span.start_s >= bar_seconds(bpm_after) * 0.5
             {
-                aligned.hits.push(riser);
-                hits_added.push(riser);
+                add(&mut aligned, riser);
             }
+        }
+        if skipped > 0 {
+            notes.push(format!(
+                "the score is at its limit of {MAX_HITS} hits: {skipped} hit(s) were not added"
+            ));
         }
         aligned.hits.sort_by(|a, b| a.at_s.total_cmp(&b.at_s));
     }
-    let _ = resolved;
+    // Whatever was done to it, what is handed back is a score the renderer accepts.
+    aligned.validate()?;
 
     let details: Vec<CutAlignment> = cuts
         .iter()
@@ -356,6 +381,54 @@ mod tests {
         slow.bpm = 41.0;
         let (a, _) = plan_score_to_picture(&slow, &[5.0, 10.0, 15.0], 0.0, &AlignOptions::default()).unwrap();
         assert!(a.bpm >= 40.0);
+    }
+
+    #[test]
+    fn a_tempo_change_never_ends_the_piece_before_a_hit_it_already_has() {
+        let mut score = song(MusicStyle::Pop);
+        // Cuts a bar apart at 127 BPM: the tempo that fits them is inside the 6 % limit of 120.
+        let cuts: Vec<f64> = (1..=12).map(|k| 240.0 / 127.0 * k as f64).collect();
+        let (free, _) = plan_score_to_picture(&score, &cuts, 0.0, &AlignOptions::default()).unwrap();
+        assert!(free.bpm > 126.0, "{}", free.bpm);
+        assert!(free.duration_s() < 80.0, "at 127 BPM the piece is {} s", free.duration_s());
+
+        // An impact at 80 s: 127 BPM would end the piece (77 s) before it, so a slower fit is chosen
+        // and the hit stays where it was, inside the piece.
+        score.hits.push(ScoreHit {
+            at_s: 80.0,
+            kind: HitKind::Impact,
+        });
+        let (aligned, report) = plan_score_to_picture(&score, &cuts, 0.0, &AlignOptions::default()).unwrap();
+        assert!(aligned.bpm <= 122.4, "{}", aligned.bpm);
+        assert!(aligned.duration_s() >= 80.0);
+        assert!(aligned.hits.iter().any(|h| h.at_s == 80.0 && h.kind == HitKind::Impact));
+        aligned.validate().unwrap();
+        assert!(report.bpm_after == aligned.bpm);
+    }
+
+    #[test]
+    fn added_hits_stop_at_the_limit_and_the_report_says_so() {
+        let mut score = song(MusicStyle::Pop);
+        // 254 hits already, none near the downbeats the cuts land on.
+        score.hits = (1..=254)
+            .map(|k| ScoreHit {
+                at_s: 0.3 * k as f64,
+                kind: HitKind::Whoosh,
+            })
+            .collect();
+        let opts = AlignOptions {
+            max_tempo_change: 0.0,
+            ..AlignOptions::default()
+        };
+        let (aligned, report) = plan_score_to_picture(&score, &[4.0, 8.0, 12.0, 16.0], 0.0, &opts).unwrap();
+        assert_eq!(aligned.hits.len(), MAX_HITS);
+        assert_eq!(report.hits_added.len(), 2);
+        assert!(
+            report.notes.iter().any(|n| n.contains("2 hit(s) were not added")),
+            "{:?}",
+            report.notes
+        );
+        aligned.validate().unwrap();
     }
 
     #[test]
