@@ -1526,7 +1526,7 @@ async fn compose_music(
                 clip,
                 score: plan.score,
                 align: plan.align,
-                replaced: plan.replace_clip_id.is_some(),
+                replaced: plan.replaces,
             },
             timeline,
         })

@@ -4041,7 +4041,7 @@ impl KerfMcp {
                     clip,
                     score: plan.score,
                     align: plan.align,
-                    replaced: plan.replace_clip_id.is_some(),
+                    replaced: plan.replaces,
                 })
             })
             .await?;
