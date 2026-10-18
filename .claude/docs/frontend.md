@@ -646,7 +646,11 @@ dropped), so the notification log keeps what an OTIO / EDL could not carry; the 
 file and says so. The **export dialog** has a *Captions & chapters* section when the cut has
 captions or chapter markers: embed as a subtitle track (only for a container that carries one,
 `carriesSubtitles`, mirrored in `validateExport`; switching to one that cannot turns it off),
-`.srt` / `.vtt` sidecars, and a line saying how many chapter markers become chapters.
+*Keep captions out of the picture* (`skip_burned_captions`, with a line on why: the embedded
+track is off by default and the captions are otherwise burned in), `.srt` / `.vtt` sidecars, and
+a line saying how many chapter markers become chapters; with no captions in the cut all of these
+are reset to off. A sidecar that already exists comes back as a refusal naming it, which the
+dialog turns into a *Replace caption files?* confirmation and a rerun with `overwrite_sidecars`.
 **Markers** are edited in `MarkerDialog.svelte` (the marker's context menu, *Edit marker…*:
 name, Comment / Chapter, length, comment, one `update_marker` through `marker-edit.ts`, which
 sends only what changed); *Make it a chapter / a comment* flips the kind; a marker with a length

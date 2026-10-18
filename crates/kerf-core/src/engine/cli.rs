@@ -3781,6 +3781,12 @@ pub struct ExportOptions {
     /// Write the cut's captions beside the export, one file per format
     /// (`cut.mp4` → `cut.srt` / `cut.vtt`).
     pub caption_sidecars: Vec<crate::captions_export::SubtitleFormat>,
+    /// Replace caption files already beside the output (the MCP `export` tool's `overwrite`,
+    /// or the GUI's confirmation); otherwise an export that would is refused.
+    pub overwrite_sidecars: bool,
+    /// Leave the generated captions out of the picture (typed titles are still drawn), for
+    /// a delivery that carries them as a subtitle track or a file instead.
+    pub skip_burned_captions: bool,
     /// Set by the render, never by a caller: the SubRip file of the cut's captions
     /// to mux in (see `side_files`).
     #[serde(skip)]
@@ -3862,6 +3868,8 @@ impl Default for ExportOptions {
             loudness: None,
             embed_captions: false,
             caption_sidecars: Vec::new(),
+            overwrite_sidecars: false,
+            skip_burned_captions: false,
             subtitle_input: None,
             chapters_input: None,
         }
@@ -4474,7 +4482,10 @@ fn build_export_args_phase(
 ) -> Result<Vec<String>> {
     // Drop muted / solo-shadowed tracks and disabled clips up front, and cut the range an export
     // of one span draws, so the rest of the builder never has to reason about either.
-    let cut = export_timeline(timeline, opts);
+    let mut cut = export_timeline(timeline, opts);
+    if opts.skip_burned_captions {
+        cut.overlays.retain(|o| !o.generated);
+    }
     let timeline = &cut;
 
     // Stream gating: decide what the graph emits and what we `-map`, in lockstep.
@@ -5392,21 +5403,20 @@ pub fn render_with_progress(
     let Some(_titles) = svg_layer::prepare_export(timeline, assets, opts, progress, cancel)? else {
         return Ok(RenderStatus::Cancelled);
     };
-    // The captions and chapters to mux in are files for the length of the export, and the caption
-    // files beside it are written first and taken back unless it completes.
+    // The captions and chapters to mux in are files for the length of the export. The caption
+    // files beside it are checked first and written only once it has completed, so a cancelled or
+    // failed export never touches a file already there.
     let (opts, _side) = side_files::prepare(timeline, opts)?;
-    let sidecars = side_files::write_sidecars(timeline, output, &opts)?;
+    side_files::check_sidecars(output, &opts)?;
     let result = retry_export_in_software(
         &opts,
         |o, hw_used| render_attempt(timeline, assets, output, o, progress, cancel, hw_used),
         convict_hardware_decode,
-    );
-    if !matches!(result, Ok(RenderStatus::Completed)) {
-        for path in &sidecars {
-            let _ = std::fs::remove_file(path);
-        }
+    )?;
+    if result == RenderStatus::Completed {
+        side_files::write_sidecars(timeline, output, &opts)?;
     }
-    result
+    Ok(result)
 }
 
 /// Run an export attempt, and once more in software when one that asked an input for hardware
@@ -5661,6 +5671,12 @@ pub struct VariantProgress {
 /// not started never existed. `opts` is the encode shared by all of them; its
 /// `resolution` and `fit` are replaced per variant by the delivery. Returns the
 /// status and how many files were completed.
+/// Refuse an export whose caption files would replace ones already beside `output`, unless
+/// `opts.overwrite_sidecars` allows it. A multi-format export asks this of every variant first.
+pub fn check_caption_sidecars(output: &Path, opts: &ExportOptions) -> Result<()> {
+    side_files::check_sidecars(output, opts)
+}
+
 pub fn render_variants(
     timeline: &Timeline,
     assets: &[Asset],

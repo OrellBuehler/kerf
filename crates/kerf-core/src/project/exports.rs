@@ -96,7 +96,7 @@ impl Project {
     /// The cut's captions as a subtitle file (see [`cut_captions`]). Refused when
     /// the cut has none.
     pub fn captions_document(timeline: &Timeline, format: SubtitleFormat) -> Result<String> {
-        let cues = cut_captions(timeline);
+        let cues = cut_captions(&timeline.for_render());
         if cues.is_empty() {
             return Err(Error::InvalidArgument(
                 "the cut has no captions to export; generate or import captions first".to_string(),
@@ -125,14 +125,15 @@ impl Project {
 
     /// The markers as a CSV or as YouTube chapter text. Refused when there are none.
     pub fn markers_document(inputs: &DeliveryInputs, format: MarkerListFormat) -> Result<(String, Report)> {
-        let markers = &inputs.timeline.markers;
+        let rendered = inputs.timeline.for_render();
+        let markers = &rendered.markers;
         if markers.is_empty() {
             return Err(Error::InvalidArgument("the cut has no markers to export".to_string()));
         }
         match format {
             MarkerListFormat::Csv => Ok((markers_csv(markers, inputs.rate)?, Report::default())),
             MarkerListFormat::Youtube => {
-                let (text, report) = youtube_chapters(markers, inputs.timeline.duration());
+                let (text, report) = youtube_chapters(markers, rendered.duration());
                 if text.is_empty() {
                     return Err(Error::InvalidArgument(
                         "no marker falls inside the cut, so there are no chapters".to_string(),

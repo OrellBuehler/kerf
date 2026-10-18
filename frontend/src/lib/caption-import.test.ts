@@ -306,6 +306,10 @@ describe('WebVTT', () => {
 	test('entities and timestamps are text unless they are markup', () => {
 		const parsed = parseVtt('WEBVTT\n\n00:01.000 --> 00:02.000\na &unknown; b & c &#233;&#xE9; &lrm;d <3 <laughs> <0x>\n');
 		expect(texts(parsed)).toEqual(['a &unknown; b & c éé d <3 <laughs> <0x>']);
+		// Names an object inherits are not references.
+		expect(texts(parseVtt("WEBVTT\n\n00:01.000 --> 00:02.000\n&constructor; &toString; &__proto__; &hasOwnProperty;\n"))).toEqual([
+			"&constructor; &toString; &__proto__; &hasOwnProperty;"
+		]);
 	});
 
 	test('broken cues are counted and a signature is optional', () => {

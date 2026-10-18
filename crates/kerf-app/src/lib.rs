@@ -2774,6 +2774,9 @@ async fn export_variants(
         .iter()
         .map(|d| kerf_core::ExportVariant::beside(&base, *d))
         .collect();
+    for variant in &variants {
+        kerf_core::check_caption_sidecars(&variant.output, &options).map_err(|e| e.to_string())?;
+    }
     let shared = state.project.clone();
     let cancel = state.export_cancel.clone();
     cancel.store(false, Ordering::SeqCst);

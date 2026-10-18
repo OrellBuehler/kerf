@@ -1323,6 +1323,9 @@ mod tests {
     fn webvtt_entities_and_timestamps_are_text_unless_they_are_markup() {
         let parsed = parse_vtt("WEBVTT\n\n00:01.000 --> 00:02.000\na &unknown; b & c &#233;&#xE9; &lrm;d <3 <laughs> <0x>\n");
         assert_eq!(texts(&parsed), vec!["a &unknown; b & c éé d <3 <laughs> <0x>"]);
+        let names = "&constructor; &toString; &__proto__; &hasOwnProperty;";
+        let parsed = parse_vtt(&format!("WEBVTT\n\n00:01.000 --> 00:02.000\n{names}\n"));
+        assert_eq!(texts(&parsed), vec![names]);
     }
 
     #[test]

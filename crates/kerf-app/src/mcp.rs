@@ -1406,8 +1406,11 @@ struct ExportParams {
                        decode, composes with any encoder); resolution ([w,h]); fps; audio_bitrate \
                        (\"192k\"); include_audio; faststart; range ({start,end} timeline seconds — \
                        render only that span); embed_captions (mux the cut's captions in as a soft \
-                       subtitle stream — mp4/mov/mkv/webm only); caption_sidecars ([\"srt\",\"vtt\"] — \
-                       caption files beside the output). Chapter markers become the file's chapters.")]
+                       subtitle stream — mp4/mov/mkv/webm only, not shown by default); \
+                       skip_burned_captions (leave the captions out of the picture); caption_sidecars \
+                       ([\"srt\",\"vtt\"] — caption files beside the output, written once the render \
+                       completes; an existing one is refused unless overwrite is true). Chapter markers \
+                       become the file's chapters.")]
     #[serde(default)]
     options: Option<ExportOptions>,
     #[schemars(
@@ -4031,7 +4034,10 @@ impl KerfMcp {
     ) -> Result<String, McpError> {
         crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
         refuse_overwrite(std::path::Path::new(&p.output_path), p.overwrite.unwrap_or(false))?;
-        let opts = p.options.unwrap_or_default();
+        let opts = ExportOptions {
+            overwrite_sidecars: p.overwrite.unwrap_or(false),
+            ..p.options.unwrap_or_default()
+        };
         let project = self.project.clone();
         let output_path = p.output_path;
 
@@ -4155,8 +4161,13 @@ impl KerfMcp {
             .map(|d| kerf_core::ExportVariant::beside(&base, *d))
             .collect();
         let overwrite = p.overwrite.unwrap_or(false);
+        let opts = ExportOptions {
+            overwrite_sidecars: overwrite,
+            ..opts
+        };
         for variant in &variants {
             refuse_overwrite(&variant.output, overwrite)?;
+            kerf_core::check_caption_sidecars(&variant.output, &opts).map_err(core_err)?;
         }
         let project = self.project.clone();
 

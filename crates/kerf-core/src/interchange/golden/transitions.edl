@@ -13,13 +13,13 @@ FCM: NON-DROP FRAME
 * SOURCE FILE: /m/shot_a.mov
 * SOURCE FILE: /m/shot_b.mov
 
-003  SHOT_A2  V     C        00:00:10:00 00:00:12:00 01:00:06:00 01:00:08:00
+003  SHOT_A2  V     C        00:00:10:00 00:00:14:00 01:00:06:00 01:00:08:00
 M2   SHOT_A2        048.0                00:00:10:00
 * FROM CLIP NAME: shot_a.mp4
 * SOURCE FILE: /m/shot_a.mp4
 
 004  SHOT_A2  V     C        00:00:14:00 00:00:14:00 01:00:08:00 01:00:08:00
-004  SHOT_A   V     D    012 00:00:52:00 00:00:54:00 01:00:08:00 01:00:10:00
+004  SHOT_A   V     D    012 00:00:52:00 00:00:50:00 01:00:08:00 01:00:10:00
 M2   SHOT_A         -024.0                00:00:52:00
 * FROM CLIP NAME: shot_a.mp4
 * TO CLIP NAME: shot_a.mov

@@ -78,7 +78,8 @@
   then clean — the file in flight is deleted, the finished ones kept.
   **Side-files of a delivery** (`project/exports.rs`): `delivery_inputs` snapshots the
   working timeline, the *original* assets, the render frame rate (`render_geometry`) and the
-  project's name under the lock; the static `captions_document` (refused with no captions),
+  project's name under the lock; the static `captions_document` (refused with no captions;
+  it and `markers_document` read `for_render`, as the export does),
   `interchange_document` (OTIO / EDL, refused with no clips) and `markers_document` (CSV /
   YouTube, refused with no markers) build the text with it released, and `write_document`
   writes it. `edit_marker` / `add_marker_with` take a `MarkerPatch` as one revision.
@@ -95,7 +96,9 @@
   frames), 8-character reels from the file stem made unique per file, `* FROM CLIP NAME` /
   `* TO CLIP NAME` / `* SOURCE FILE`, a dissolve as the outgoing `C` line plus the incoming
   `D nnn` (`BL` with no predecessor), dips written as cuts and slides / pushes as dissolves
-  (reported), `M2` at speed × timebase (negative reversed), disabled clips left out.
+  (reported), `M2` at speed × timebase (negative reversed) with the source out at
+  `src_in ± record frames × |speed|` (counting down when reversed), disabled clips left out,
+  and the sound of A/V clips reported as not written (events are channel `V`).
   Golden text in `interchange/golden/*.{otio,edl}` (`golden.rs`; bless with
   `KERF_INTERCHANGE_BLESS=1 cargo test -p kerf-core --no-default-features interchange`).
   **Marker lists** (`interchange/markers.rs`): `markers_csv` (RFC 4180, every cell quoted,

@@ -81,6 +81,17 @@ fn source_entry(tb: &Timebase, clip: &Clip) -> i64 {
     tb.frames(clip.timeline_to_source(clip.timeline_start))
 }
 
+/// Where a clip's source run ends after `rec_frames` of record time: the speed's worth of
+/// source frames on from the entry, counting down for a reversed clip.
+fn source_exit(src_in: i64, rec_frames: i64, clip: &Clip) -> i64 {
+    let span = (rec_frames as f64 * clip.speed_mag()).round() as i64;
+    if clip.is_reversed() {
+        src_in - span
+    } else {
+        src_in + span
+    }
+}
+
 pub(super) fn export(timeline: &Timeline, assets: &[Asset], opts: &InterchangeOptions, report: &mut Report) -> Result<String> {
     let tb = Timebase::new(opts.rate)?;
     let video: Vec<usize> = (0..timeline.tracks.len())
@@ -154,13 +165,16 @@ pub(super) fn export(timeline: &Timeline, assets: &[Asset], opts: &InterchangeOp
         for extra in clip_extras(clip) {
             report.warn(format!("clip {extra} are not carried by an EDL"));
         }
+        if clip.source_audio && asset_of(clip).is_some_and(|a| a.has_audio()) {
+            report.warn("the sound of video clips is not written to the EDL (events are picture only, channel V)");
+        }
         let reel = reels.reel(asset_of(clip));
         let src_in = source_entry(&tb, clip);
         let main = Line {
             reel: reel.clone(),
             trans: "C".to_string(),
             dur: None,
-            src: (src_in, src_in + (rec_out - rec_in)),
+            src: (src_in, source_exit(src_in, rec_out - rec_in, clip)),
             rec: (record_start + rec_in, record_start + rec_out),
         };
         let prev = previous

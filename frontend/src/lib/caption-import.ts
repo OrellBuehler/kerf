@@ -404,7 +404,7 @@ const VTT_ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', nbsp:
 
 /** The text a WebVTT reference stands for, or null when it is not one. */
 function vttEntity(name: string): string | null {
-	if (name in VTT_ENTITIES) return VTT_ENTITIES[name];
+	if (Object.hasOwn(VTT_ENTITIES, name)) return VTT_ENTITIES[name];
 	const num = /^#(?:[xX]([0-9a-fA-F]+)|(\d+))$/.exec(name);
 	if (!num) return null;
 	const code = num[1] !== undefined ? parseInt(num[1], 16) : Number(num[2]);

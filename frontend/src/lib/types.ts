@@ -1049,8 +1049,12 @@ export interface ExportOptions {
 	loudness?: LoudnessPreset | null;
 	/** Mux the cut's captions in as a soft subtitle stream (mp4 / mov / mkv / webm). */
 	embed_captions?: boolean;
-	/** Caption files written beside the export (`cut.srt`, `cut.vtt`). */
+	/** Caption files written beside the export (`cut.srt`, `cut.vtt`), once it completes. */
 	caption_sidecars?: SubtitleFormat[];
+	/** Replace caption files already beside the export; otherwise the export is refused. */
+	overwrite_sidecars?: boolean;
+	/** Leave the generated captions out of the picture (typed titles are still drawn). */
+	skip_burned_captions?: boolean;
 }
 
 /** A delivery's loudness target (`kerf_core::LoudnessPreset`): YouTube and Spotify -14 LUFS,

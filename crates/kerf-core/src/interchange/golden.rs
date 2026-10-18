@@ -192,6 +192,7 @@ fn interchange_basic_otio_and_edl_are_golden() {
         "info: audio tracks are not written to the EDL\n\
          info: markers are not written to the EDL\n\
          warning: titles and captions are not carried by an EDL\n\
+         warning: the sound of video clips is not written to the EDL (events are picture only, channel V) (x2)\n\
          warning: clip fades are not carried by an EDL\n\
          warning: clip transforms and keyframes are not carried by an EDL\n"
     );
@@ -220,7 +221,8 @@ fn interchange_transitions_otio_and_edl_are_golden() {
 #[test]
 fn interchange_drop_frame_edl_is_golden() {
     let edl = check("drop_frame", drop_frame, InterchangeFormat::Edl);
-    assert!(edl.is_empty(), "{edl}");
+    assert_eq!(edl.entries.len(), 1, "{edl}");
+    assert!(edl.to_string().contains("sound of video clips"), "{edl}");
     check("drop_frame", drop_frame, InterchangeFormat::Otio);
 }
 

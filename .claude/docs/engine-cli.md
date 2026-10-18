@@ -368,8 +368,14 @@ so the feature is **only** activated through these forwards — which is what ma
   on the final mix. **Captions and chapters ride along** (`cli/side_files.rs`):
   `ExportOptions.embed_captions` muxes the cut's captions as a soft subtitle stream
   (`mov_text` in mp4 / mov, `webvtt` in webm, `srt` in mkv; `validate_export` refuses it for
-  any other container) and `caption_sidecars` writes `.srt` / `.vtt` beside the output
-  (written before the render, removed unless it completes); chapter markers become the
+  any other container) — **not the default track** (`-disposition:s:0 0`), since the captions
+  are burned in as well unless `skip_burned_captions` (neutral `false`, omitted) drops the
+  generated overlays from the picture — and `caption_sidecars` writes `.srt` / `.vtt` beside the
+  output **only once the render has completed** (a cancelled or failed export never touches a
+  file there), an existing one refused up front unless `overwrite_sidecars` (the MCP `overwrite`,
+  the GUI's confirmation; `check_caption_sidecars` checks every variant first). Captions asked
+  for when the cut has none are refused; a range they do not reach just carries none. Chapter
+  markers become the
   file's chapters in mp4 / mov / mkv / webm / m4a. The builders stay pure: the render
   (`side_files::prepare`, from `for_render` + the range slice) writes a SubRip and an
   FFMETADATA temp file and names them in the render-only `#[serde(skip)]` fields

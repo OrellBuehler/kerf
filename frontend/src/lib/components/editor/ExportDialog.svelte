@@ -9,7 +9,7 @@
 	import Readiness from './Readiness.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
-	import { inTauri, pickExportPath, hwEncoders, knownHwEncoders, revealPath } from '$lib/api';
+	import { confirmAction, inTauri, pickExportPath, hwEncoders, knownHwEncoders, revealPath } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 	import { formatsFor, hasPicture } from '$lib/delivery-formats';
 	import { formatTimecode } from '$lib/timecode';
@@ -55,6 +55,12 @@
 	const hasCaptions = $derived((editor.timeline.overlays ?? []).some((o) => o.generated));
 	const chapterCount = $derived(editor.markers.filter((m) => m.kind === 'chapter').length);
 	const sidecar = (f: SubtitleFormat) => (opts.caption_sidecars ?? []).includes(f);
+	// Options for captions the cut does not have are off, and stay off in what is exported.
+	$effect(() => {
+		if (!hasCaptions && (opts.embed_captions || opts.skip_burned_captions || (opts.caption_sidecars ?? []).length)) {
+			opts = { ...opts, embed_captions: false, skip_burned_captions: false, caption_sidecars: [] };
+		}
+	});
 	function toggleSidecar(f: SubtitleFormat, on: boolean) {
 		const rest = (opts.caption_sidecars ?? []).filter((x) => x !== f);
 		patch({ caption_sidecars: on ? [...rest, f] : rest });
@@ -237,28 +243,48 @@
 			if (!outputPath) return;
 		}
 		try {
-			const finalOpts = useRange && marks ? { ...opts, range: marks } : opts;
-			if (variantFormats.length) {
-				const outs = await editor.exportVariants(outputPath, variantFormats, ui.deliverSmartCrop, finalOpts);
-				const first = outs[0];
-				toast.success(exportedLine(outs), {
-					action: { label: 'Show in folder', onClick: () => void revealPath(first).catch(() => {}) }
-				});
-				onClose();
-				return;
-			}
-			const out = await editor.export(outputPath, finalOpts);
-			// A path in a toast is not much use on its own — offer the folder.
-			toast.success(exportedLine([out]), {
-				action: { label: 'Show in folder', onClick: () => void revealPath(out).catch(() => {}) }
-			});
-			onClose();
+			await render(useRange && marks ? { ...opts, range: marks } : opts);
 		} catch (e) {
 			const m = msg(e);
-			// A user-requested stop is not a failure — keep the dialog open quietly.
-			if (m === 'export cancelled') toast.info('Export cancelled');
-			else toast.error(failure('Export failed', e));
+			// Caption files already beside the output: name them and ask before replacing them.
+			if (m.includes('already exists; allow overwriting')) {
+				const replace = await confirmAction(`${m.replace(/; allow overwriting.*$/, '')}. Replace it?`, 'Replace caption files?', {
+					ok: 'Replace',
+					cancel: 'Cancel'
+				});
+				if (!replace) return;
+				try {
+					await render({ ...(useRange && marks ? { ...opts, range: marks } : opts), overwrite_sidecars: true });
+				} catch (again) {
+					exportFailed(again);
+				}
+				return;
+			}
+			exportFailed(e);
 		}
+	}
+	function exportFailed(e: unknown) {
+		const m = msg(e);
+		// A user-requested stop is not a failure — keep the dialog open quietly.
+		if (m === 'export cancelled') toast.info('Export cancelled');
+		else toast.error(failure('Export failed', e));
+	}
+	async function render(finalOpts: ExportOptions) {
+		if (variantFormats.length) {
+			const outs = await editor.exportVariants(outputPath, variantFormats, ui.deliverSmartCrop, finalOpts);
+			const first = outs[0];
+			toast.success(exportedLine(outs), {
+				action: { label: 'Show in folder', onClick: () => void revealPath(first).catch(() => {}) }
+			});
+			onClose();
+			return;
+		}
+		const out = await editor.export(outputPath, finalOpts);
+		// A path in a toast is not much use on its own — offer the folder.
+		toast.success(exportedLine([out]), {
+			action: { label: 'Show in folder', onClick: () => void revealPath(out).catch(() => {}) }
+		});
+		onClose();
 	}
 	const stop = () => editor.stopExport();
 </script>
@@ -650,6 +676,12 @@
 				{#if carriesSubtitles(opts.container)}
 					{@render toggleRow('Embed captions as a subtitle track', !!opts.embed_captions, (v) => patch({ embed_captions: v }))}
 				{/if}
+				{@render toggleRow('Keep captions out of the picture', !!opts.skip_burned_captions, (v) => patch({ skip_burned_captions: v }))}
+				<div style="font-size:12px;color:var(--text-muted);padding:2px 0 4px;line-height:1.4">
+					Captions are drawn into the picture unless this is on. An embedded track is off until the viewer turns it
+					on, so with both a player shows the captions once; keep them out of the picture to deliver them only as a
+					track or a file.
+				</div>
 				{@render toggleRow('Write .srt beside the export', sidecar('srt'), (v) => toggleSidecar('srt', v))}
 				{@render toggleRow('Write .vtt beside the export', sidecar('vtt'), (v) => toggleSidecar('vtt', v))}
 			{/if}

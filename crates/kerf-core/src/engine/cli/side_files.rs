@@ -16,11 +16,11 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{effective_range, Container, ExportOptions};
+use super::{export_timeline, Container, ExportOptions};
 use crate::captions_export::{cut_captions, write_captions, SubtitleFormat};
 use crate::error::{Error, Result};
 use crate::interchange::markers::ffmetadata_chapters;
-use crate::model::Timeline;
+use crate::model::{MarkerKind, Timeline};
 
 /// The subtitle codec a container carries, or `None` when it carries none.
 pub(crate) fn subtitle_codec(c: Container) -> Option<&'static str> {
@@ -76,6 +76,10 @@ pub(super) fn push_maps(side: &SideInputs, args: &mut Vec<String>) {
             format!("{input}:s:0"),
             "-c:s".to_string(),
             codec.to_string(),
+            // A soft track rides beside captions already drawn into the picture; it is not the
+            // default, so a player does not show both unless the viewer turns it on.
+            "-disposition:s:0".to_string(),
+            "0".to_string(),
         ]);
     }
     if let Some(input) = side.chapters {
@@ -106,18 +110,9 @@ impl SideFiles {
     }
 }
 
-/// The timeline the builder renders: `for_render`, sliced to the range.
-fn rendered_view(timeline: &Timeline, opts: &ExportOptions) -> Timeline {
-    let rendered = timeline.for_render();
-    match effective_range(&rendered, opts) {
-        Some((s, e)) => rendered.slice(s, e),
-        None => rendered,
-    }
-}
-
 /// Write the captions and chapters an export muxes in, returning the options that
-/// name them and the files (removed on drop). Refuses captions asked for when the
-/// exported cut has none.
+/// name them and the files (removed on drop). Captions asked for when the cut has
+/// none are refused; a range the captions do not reach just embeds none.
 pub(super) fn prepare(timeline: &Timeline, opts: &ExportOptions) -> Result<(ExportOptions, SideFiles)> {
     let mut out = ExportOptions {
         subtitle_input: None,
@@ -126,19 +121,20 @@ pub(super) fn prepare(timeline: &Timeline, opts: &ExportOptions) -> Result<(Expo
     };
     let mut files = SideFiles::default();
     let wants_captions = opts.embed_captions || !opts.caption_sidecars.is_empty();
-    let chapters = carries_chapters(opts.container);
-    if !wants_captions && !chapters {
+    if wants_captions && cut_captions(&timeline.for_render()).is_empty() {
+        return Err(Error::InvalidArgument(
+            "the cut has no captions to export; generate or import captions first".to_string(),
+        ));
+    }
+    let embed = opts.embed_captions && subtitle_codec(opts.container).is_some();
+    let chapters = carries_chapters(opts.container) && timeline.markers.iter().any(|m| m.kind == MarkerKind::Chapter);
+    if !embed && !chapters {
         return Ok((out, files));
     }
-    let view = rendered_view(timeline, opts);
-    if wants_captions {
+    let view = export_timeline(timeline, opts);
+    if embed {
         let cues = cut_captions(&view);
-        if cues.is_empty() {
-            return Err(Error::InvalidArgument(
-                "the exported cut has no captions; generate or import captions first".to_string(),
-            ));
-        }
-        if opts.embed_captions && subtitle_codec(opts.container).is_some() {
+        if !cues.is_empty() {
             out.subtitle_input = Some(files.write("srt", &write_captions(&cues, SubtitleFormat::Srt))?);
         }
     }
@@ -150,29 +146,58 @@ pub(super) fn prepare(timeline: &Timeline, opts: &ExportOptions) -> Result<(Expo
     Ok((out, files))
 }
 
-/// Where a caption file of `format` goes beside `output`.
-fn sidecar_path(output: &Path, format: SubtitleFormat) -> PathBuf {
-    output.with_extension(format.ext())
+/// The caption files the options ask for beside `output`, each once.
+fn sidecar_paths(output: &Path, opts: &ExportOptions) -> Vec<(SubtitleFormat, PathBuf)> {
+    let mut out: Vec<(SubtitleFormat, PathBuf)> = Vec::new();
+    for &format in &opts.caption_sidecars {
+        let path = output.with_extension(format.ext());
+        if path != output && !out.iter().any(|(_, p)| *p == path) {
+            out.push((format, path));
+        }
+    }
+    out
 }
 
-/// Write the caption files beside `output` the options ask for, returning their paths.
-pub(super) fn write_sidecars(timeline: &Timeline, output: &Path, opts: &ExportOptions) -> Result<Vec<PathBuf>> {
-    let mut written: Vec<PathBuf> = Vec::new();
-    if opts.caption_sidecars.is_empty() {
-        return Ok(written);
+/// Refuse caption files that would replace one already there, unless the options allow it
+/// (`overwrite_sidecars`: the MCP `export` tool's `overwrite`, or the GUI's confirmation).
+pub(super) fn check_sidecars(output: &Path, opts: &ExportOptions) -> Result<()> {
+    if opts.overwrite_sidecars {
+        return Ok(());
     }
-    let cues = cut_captions(&rendered_view(timeline, opts));
-    for &format in &opts.caption_sidecars {
-        let path = sidecar_path(output, format);
-        if written.contains(&path) || path == output {
-            continue;
-        }
-        if let Err(e) = std::fs::write(&path, write_captions(&cues, format)) {
-            for p in &written {
-                let _ = std::fs::remove_file(p);
-            }
-            return Err(Error::InvalidArgument(format!("cannot write {}: {e}", path.display())));
-        }
+    let taken: Vec<String> = sidecar_paths(output, opts)
+        .into_iter()
+        .filter(|(_, p)| p.exists())
+        .map(|(_, p)| p.display().to_string())
+        .collect();
+    if taken.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument(format!(
+            "{} already exists; allow overwriting to replace it",
+            taken.join(" and ")
+        )))
+    }
+}
+
+/// Write the caption files beside `output`: called once the export has completed, so a cancelled
+/// or failed one never touches them. A range the captions do not reach writes none.
+pub(super) fn write_sidecars(timeline: &Timeline, output: &Path, opts: &ExportOptions) -> Result<Vec<PathBuf>> {
+    let paths = sidecar_paths(output, opts);
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cues = cut_captions(&export_timeline(timeline, opts));
+    if cues.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut written = Vec::new();
+    for (format, path) in paths {
+        std::fs::write(&path, write_captions(&cues, format)).map_err(|e| {
+            Error::InvalidArgument(format!(
+                "the export finished, but {} could not be written: {e}",
+                path.display()
+            ))
+        })?;
         written.push(path);
     }
     Ok(written)
@@ -234,7 +259,9 @@ mod tests {
                 "{args}"
             );
             assert!(
-                args.contains(&format!("-map [outa] -map 1:s:0 -c:s {codec} -map_chapters 2 ")),
+                args.contains(&format!(
+                    "-map [outa] -map 1:s:0 -c:s {codec} -disposition:s:0 0 -map_chapters 2 "
+                )),
                 "{args}"
             );
         }
@@ -304,6 +331,65 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn captions_can_stay_out_of_the_picture_while_a_title_is_drawn() {
+        let (mut tl, assets) = captioned();
+        tl.overlays.push(TextOverlay::new("a typed title", 0.0, 1.0));
+        let graph = |opts: &ExportOptions| build_export_args(&tl, &assets, "out.mp4", opts).unwrap().join(" ");
+        let burned = graph(&ExportOptions::default());
+        assert!(burned.contains("hello") && burned.contains("a typed title"), "{burned}");
+        let soft = graph(&ExportOptions {
+            skip_burned_captions: true,
+            ..ExportOptions::default()
+        });
+        assert!(!soft.contains("hello") && soft.contains("a typed title"), "{soft}");
+    }
+
+    #[test]
+    fn a_range_the_captions_do_not_reach_embeds_and_writes_none() {
+        let (tl, _) = captioned();
+        let opts = ExportOptions {
+            embed_captions: true,
+            caption_sidecars: vec![SubtitleFormat::Srt],
+            range: Some(crate::model::TimeRange { start: 2.0, end: 4.0 }),
+            ..ExportOptions::default()
+        };
+        let (out, _files) = prepare(&tl, &opts).unwrap();
+        assert_eq!(out.subtitle_input, None);
+        let dir = std::env::temp_dir().join(format!("kerf-sidecars-range-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(write_sidecars(&tl, &dir.join("cut.mp4"), &opts).unwrap().is_empty());
+        assert!(!dir.join("cut.srt").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An existing `cut.srt` is refused without leave to overwrite, and with it a render that is
+    /// cancelled (or fails) leaves the file as it was: sidecars are written only on completion.
+    #[test]
+    fn an_existing_sidecar_survives_a_refused_or_cancelled_export() {
+        let (tl, mut assets) = captioned();
+        let dir = std::env::temp_dir().join(format!("kerf-sidecars-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assets[0].path = dir.join("missing-source.mp4").to_string_lossy().into_owned();
+        let srt = dir.join("cut.srt");
+        std::fs::write(&srt, "mine").unwrap();
+        let out = dir.join("cut.mp4");
+        let opts = ExportOptions {
+            caption_sidecars: vec![SubtitleFormat::Srt],
+            ..ExportOptions::default()
+        };
+        let refused = super::super::render_with_progress(&tl, &assets, &out, &opts, &mut |_| {}, &|| true);
+        assert!(refused.unwrap_err().to_string().contains("cut.srt already exists"));
+        let allowed = ExportOptions {
+            overwrite_sidecars: true,
+            ..opts
+        };
+        let run = super::super::render_with_progress(&tl, &assets, &out, &allowed, &mut |_| {}, &|| true);
+        assert!(!matches!(run, Ok(super::super::RenderStatus::Completed)), "{run:?}");
+        assert_eq!(std::fs::read_to_string(&srt).unwrap(), "mine");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Renders a caption and a chapter into mp4, mkv and webm and asks ffprobe what came out.
     #[test]
     #[ignore = "needs the ffmpeg binary"]
@@ -348,6 +434,7 @@ mod tests {
                 container,
                 embed_captions: true,
                 caption_sidecars: vec![SubtitleFormat::Srt],
+                overwrite_sidecars: true,
                 ..ExportOptions::default()
             };
             render_with(&tl, std::slice::from_ref(&asset), &out, &opts).unwrap();
