@@ -101,6 +101,7 @@ describe('an animated title’s summaries', () => {
 		const preset = { kind: 'lower_third' as const, params: { text: 'Ann', color: 'white', accent: 'gold' } };
 		expect(svgSourceSummary({ preset })).toBe('Lower third');
 		expect(svgSourceSummary({})).toBe('Custom SVG');
+		expect(svgSourceSummary({ template: { template_id: 't', name: 'End card', controls: [], values: {} } })).toBe('Template');
 	});
 
 	test('the Timing line is the clip’s', () => {

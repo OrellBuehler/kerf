@@ -119,6 +119,25 @@ up to ~1.7 s, so these three are `async` + `blocking`**: the add and update pars
 `list_svg_presets` → `SvgPresetInfo[]` and `svg_preset_preview { kind, params, duration? }` → the preset's SVG text
 for the project's delivery frame (the page shows it through an `<img>` data URL, never inline — the sanitiser, not
 the webview, decides what an SVG may do; `check_params` refuses empty text first),
+**motion templates** (`kerf_core::template`; model in `core-project.md`, the MCP side in `mcp.md`): the library calls need no
+project and never take the lock — `list_templates` → `TemplateList {templates, problems}` (manifests only),
+`template_poster { templateId }` → a `data:image/png;base64,` URL or `null` (a grid card fetches its own),
+`svg_element_ids { svg }` → `[{id, tag}]` (what a control can aim at; pure, and the text comes from the webview, so the core
+refuses one over a title's 128 KiB before parsing it), `template_image_value { path }` → the `data:` URL
+an `image` control takes (the file opened, checked through the handle, read at most one byte past `template::MAX_IMAGE_BYTES` —
+94 KiB — then `template::image_data_url` judges the picture),
+`import_template { path }` (a `.kerftemplate`; `validate_import_path`, then `TemplateLibrary::import` → `ImportOutcome`,
+which never overwrites), `export_template { templateId, path }` (`require_user_output_path`, `check_output` against the
+project's sources / proxies, Kerf's settings and logs **and the library directory**; resolves to where the file went),
+`delete_template { templateId }`; all `async` on `blocking`. `save_template { overlayId, name, description?, controls }` reads
+the title under `lock_user` (`Project::template_source`) and builds the file (fonts, sanitiser, poster: slow) with the lock
+released → `TemplateSaved {info, warnings}`. **`apply_template { templateId, values, start, end?, layout? }`** (`layout` is the
+`SvgLayout` of `add_svg_overlay`; `values` is control id → string, partial) reads the template and `prepare`s it (splice +
+sanitiser) *before* `lock_user`, which then only runs `apply_template_parsed`; **`set_template_values { overlayId, values }`**
+takes the title under the lock (`template_edit_inputs`), prepares with it released and stores with
+`set_template_values_parsed`, which refuses a title that changed meanwhile ("try again"). Both resolve to
+`TemplateEdit {timeline, overlay_id, warnings}` — the refreshed cut, the title made or changed, and what the sanitiser or the
+machine could not honour. The library is app-level (not undone, not staged);
 `generate_captions` / `clear_captions` (caption the whole cut, in timeline
 time), `import_captions` / `import_captions_text` (a subtitle file by path / by text —
 the text variant is what an `<input type=file>` or a paste uses; both return
@@ -334,7 +353,8 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`; *markers, text, titles, captions* `add_marker`,
 `update_marker`, `remove_marker`, `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
 `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `validate_svg`, `list_svg_presets`,
-`svg_preset_preview`, `generate_captions`, `clear_captions`, `import_captions`, `import_captions_text`, `export_srt`, `export_captions`, `export_interchange`, `export_markers`,
+`svg_preset_preview`, `list_templates`, `template_poster`, `svg_element_ids`, `template_image_value`, `save_template`,
+`apply_template`, `set_template_values`, `import_template`, `export_template`, `delete_template`, `generate_captions`, `clear_captions`, `import_captions`, `import_captions_text`, `export_srt`, `export_captions`, `export_interchange`, `export_markers`,
 `refine_transcript`;
 *history and review* `get_history`, `revision_diff`, `undo`, `redo`, `revert_to`, `get_staged_edit`,
 `get_staged_timeline`, `apply_staged_edit`, `apply_staged_subset`, `discard_staged_edit`, `undo_staged_edit`,
@@ -350,8 +370,8 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `export-progress`, `import-progress`, `audio-sync-progress`, `model-progress`, `smart-crop-progress`, `voiceover-progress`, `stems-progress`,
 `gpu-preview-checked`, `popout-closed`, `open-project-file`, `launch-project-missing`; from the MCP server also
 `project-replaced` (another project is open: reload everything), `settings-changed` (**payload: the full
-`SettingsView`**, as `get_settings` answers it, after an agent's `set_settings`), `ripple-mode-changed` and
-`speech-model-changed`. `platform_targets` is wired: the
+`SettingsView`**, as `get_settings` answers it, after an agent's `set_settings`), `ripple-mode-changed`,
+`speech-model-changed` and `templates-changed` (an agent saved, imported or deleted a template: refetch `list_templates`). `platform_targets` is wired: the
 Deliver panel's verdict (`platform-verdict.ts`) takes the targets from it (`platformTargets()`, asked once) for the size a
 soft frame is made for; the browser harness answers with the mirror in `platforms.ts`.
 

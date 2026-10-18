@@ -47,7 +47,9 @@ import {
 	moveClips,
 	removeOverlay,
 	addSvgOverlay as apiAddSvgOverlay,
+	applyTemplate as apiApplyTemplate,
 	removeSvgOverlay as apiRemoveSvgOverlay,
+	setTemplateValues as apiSetTemplateValues,
 	updateSvgOverlay as apiUpdateSvgOverlay,
 	setAudioEffects,
 	setKeyframes,
@@ -165,6 +167,7 @@ import type {
 	SvgOverlay,
 	SvgOverlayPatch,
 	SvgSource,
+	TemplateEdit,
 	TextKeyframe,
 	Marker,
 	MarkerPatch,
@@ -1302,6 +1305,26 @@ class EditorState {
 	removeSvgOverlay(overlayId: string) {
 		if (this.selectedSvgOverlayId === overlayId) this.selectedSvgOverlayId = null;
 		return this.#apply(() => apiRemoveSvgOverlay(overlayId));
+	}
+	/** Add a library template as an animated title from `start` (to `end`, else as long as the template runs), with
+	 *  `values` (control id to value) already in its artwork, and select it. One edit; the warnings are the caller's. */
+	async applyTemplate(templateId: string, values: Record<string, string>, start: number, end?: number | null, layout?: SvgLayout) {
+		let edit!: TemplateEdit;
+		await this.#apply(async () => {
+			edit = await apiApplyTemplate(templateId, values, start, end, layout);
+			return edit.timeline;
+		});
+		this.selectSvgOverlay(edit.overlay_id);
+		return edit;
+	}
+	/** Change some control values of a template title: one edit, the title keeps its id, timing and placement. */
+	async setTemplateValues(overlayId: string, values: Record<string, string>) {
+		let edit!: TemplateEdit;
+		await this.#apply(async () => {
+			edit = await apiSetTemplateValues(overlayId, values);
+			return edit.timeline;
+		});
+		return edit;
 	}
 	setOverlayKeyframes(overlayId: string, keyframes: TextKeyframe[]) {
 		return this.#apply(() => setOverlayKeyframes(overlayId, keyframes));

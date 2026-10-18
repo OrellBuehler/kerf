@@ -9,6 +9,7 @@
 		style = '',
 		class: klass = '',
 		pending = false,
+		type = 'button',
 		onclick = undefined,
 		children,
 		...rest
@@ -21,6 +22,8 @@
 		class?: string;
 		/** An edit is in flight: off to the eye and the click, but still focusable (see `Btn`). */
 		pending?: boolean;
+		/** `button` unless it is a form's own submit (a bare `<button>` inside a form submits it). */
+		type?: 'button' | 'submit' | 'reset';
 		onclick?: unknown;
 		children?: Snippet;
 		[key: string]: unknown;
@@ -30,6 +33,7 @@
 <!-- `aria-pressed` only when it is a toggle (`active` given): a plain icon button announced as
      "not pressed" reads as a switch. Colors and states are `styles/controls.css`. -->
 <button
+	{type}
 	class={['k-ibtn', klass]}
 	use:tip={title}
 	aria-label={tipText(title) || undefined}

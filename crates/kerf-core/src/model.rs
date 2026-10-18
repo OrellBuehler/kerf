@@ -2237,6 +2237,12 @@ pub struct SvgOverlay {
     /// How the SVG was made when it came from a preset; `None` for custom artwork.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<SvgPreset>,
+    /// The motion template this title was made from, with its controls and their values; `None` for
+    /// anything else (and so absent from the stored JSON, which is why a project without templates
+    /// reads and writes the bytes it always did). The artwork is `svg` itself: a value is spliced into
+    /// it, not kept beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<crate::template::TemplateInstance>,
 }
 
 impl SvgOverlay {
@@ -6447,6 +6453,27 @@ fn overlay_changes(before: &TextOverlay, after: &TextOverlay) -> Option<String> 
     joined(parts)
 }
 
+/// The controls of a template title whose value differs, as `Tagline “A” → “B”`.
+fn template_value_changes(before: &SvgOverlay, after: &SvgOverlay) -> Vec<String> {
+    let (Some(was), Some(now)) = (&before.template, &after.template) else {
+        return Vec::new();
+    };
+    now.controls
+        .iter()
+        .filter_map(|c| {
+            let (a, b) = (was.values.get(&c.id), now.values.get(&c.id));
+            (a != b).then(|| {
+                format!(
+                    "{} “{}” → “{}”",
+                    c.label,
+                    a.map_or("", String::as_str),
+                    b.map_or("", String::as_str)
+                )
+            })
+        })
+        .collect()
+}
+
 fn svg_overlay_changes(before: &SvgOverlay, after: &SvgOverlay) -> Option<String> {
     let mut parts = Vec::new();
     if before.name != after.name {
@@ -6468,9 +6495,17 @@ fn svg_overlay_changes(before: &SvgOverlay, after: &SvgOverlay) -> Option<String
         (None, Some(_)) => parts.push("replaced by a preset".to_string()),
         (None, None) => {
             if before.svg != after.svg {
-                parts.push("artwork changed".to_string());
+                let values = template_value_changes(before, after);
+                if values.is_empty() {
+                    parts.push("artwork changed".to_string());
+                } else {
+                    parts.extend(values);
+                }
             }
         }
+    }
+    if before.template.is_some() && after.template.is_none() {
+        parts.push("no longer a template title".to_string());
     }
     if num_changed(before.start, after.start) || num_changed(before.end, after.end) {
         parts.push(format!(
@@ -11590,6 +11625,7 @@ mod tests {
             opacity: 1.0,
             offset: 0.0,
             preset: None,
+            template: None,
         }
     }
 
@@ -11623,6 +11659,48 @@ mod tests {
     }
 
     #[test]
+    fn a_template_instance_round_trips_in_snake_case_and_is_absent_when_there_is_none() {
+        use crate::template::{TemplateControl, TemplateInstance, TemplateKind, TemplateTarget};
+        let mut o = svg_title(0.0, 2.0);
+        let plain = serde_json::to_string(&o).unwrap();
+        assert!(
+            !plain.contains("template"),
+            "a title without one stores the bytes it always did: {plain}"
+        );
+        o.template = Some(TemplateInstance {
+            template_id: "6f1e0c0e-3b0f-4a5b-9c5e-0a8f2f6d7a11".into(),
+            name: "Kitefun end card".into(),
+            controls: vec![TemplateControl {
+                id: "brand".into(),
+                label: "Brand colour".into(),
+                kind: TemplateKind::Color,
+                targets: vec![TemplateTarget {
+                    element: "bg-stop".into(),
+                    attribute: Some("stop-color".into()),
+                }],
+                min: None,
+                max: None,
+            }],
+            values: [("brand".to_string(), "#112233".to_string())].into(),
+        });
+        let json = serde_json::to_value(&o).unwrap();
+        assert_eq!(
+            json["template"],
+            serde_json::json!({
+                "template_id": "6f1e0c0e-3b0f-4a5b-9c5e-0a8f2f6d7a11",
+                "name": "Kitefun end card",
+                "controls": [{
+                    "id": "brand", "label": "Brand colour", "kind": "color",
+                    "targets": [{"element": "bg-stop", "attribute": "stop-color"}]
+                }],
+                "values": {"brand": "#112233"}
+            })
+        );
+        let back: SvgOverlay = serde_json::from_value(json).unwrap();
+        assert_eq!(back, o);
+    }
+
+    #[test]
     fn svg_overlay_json_defaults_and_omissions() {
         let id = Uuid::new_v4();
         let minimal = format!(r#"{{"id":"{id}","svg":"<svg/>","start":1.0,"end":2.5}}"#);
@@ -11631,9 +11709,12 @@ mod tests {
             (o.x, o.y, o.width, o.height, o.opacity, o.offset, o.name.as_str()),
             (0.0, 0.0, 1.0, 1.0, 1.0, 0.0, "")
         );
-        assert!(o.preset.is_none());
+        assert!(o.preset.is_none() && o.template.is_none());
         let json = serde_json::to_value(&o).unwrap();
-        assert!(json.get("offset").is_none() && json.get("preset").is_none(), "{json}");
+        assert!(
+            json.get("offset").is_none() && json.get("preset").is_none() && json.get("template").is_none(),
+            "{json}"
+        );
         assert_eq!(json["width"], 1.0);
         let sliced = SvgOverlay { offset: 1.5, ..o };
         assert_eq!(serde_json::to_value(&sliced).unwrap()["offset"], 1.5);

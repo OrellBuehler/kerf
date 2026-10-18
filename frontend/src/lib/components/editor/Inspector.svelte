@@ -11,6 +11,7 @@
 	import SliderRow from './SliderRow.svelte';
 	import GradeSections from './GradeSections.svelte';
 	import TitlesControls from './TitlesControls.svelte';
+	import TemplateSection from './TemplateSection.svelte';
 	import MediaChips from './MediaChips.svelte';
 	import AnalysisRun from './AnalysisRun.svelte';
 	import AssetInspector from './AssetInspector.svelte';
@@ -1044,6 +1045,8 @@
 			: 'Move the playhead into it to place it in the preview.'}
 	</div>
 
+	{#if o.template}<TemplateSection {o} />{/if}
+
 	<InspectorSection title="Timing" summary={timingSummary(o.start, o.end - o.start)} open>
 		<label style={ROW_GRID}>
 			<span style="font-size:12px;color:var(--text-muted)">Name</span>
@@ -1173,7 +1176,7 @@
 			<Btn size="sm" icon="code-xml" pending={editor.locked} onclick={() => void convertToCustom(o)}>Convert to custom</Btn>
 		</InspectorSection>
 	{:else}
-		<InspectorSection title="SVG source" summary={draftDirty ? 'Edited' : 'Custom'} open>
+		<InspectorSection title="SVG source" summary={draftDirty ? 'Edited' : o.template ? 'Template' : 'Custom'} open={!o.template}>
 			<textarea
 				bind:this={sourceEl}
 				bind:value={draft}
@@ -1216,6 +1219,8 @@
 			</div>
 		</InspectorSection>
 	{/if}
+
+	{#if !o.template && !o.preset}<TemplateSection {o} />{/if}
 
 	<div style="margin-top:18px">
 		<Btn

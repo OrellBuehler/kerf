@@ -11,6 +11,7 @@
 	import VoiceoverDialog from '$lib/components/editor/VoiceoverDialog.svelte';
 	import FitMusicDialog from '$lib/components/editor/FitMusicDialog.svelte';
 	import StemsDialog from '$lib/components/editor/StemsDialog.svelte';
+	import SaveTemplateDialog from '$lib/components/editor/SaveTemplateDialog.svelte';
 	import ShortcutSheet from '$lib/components/editor/ShortcutSheet.svelte';
 	import RelinkDialog from '$lib/components/editor/RelinkDialog.svelte';
 	import ContextMenu from '$lib/components/editor/ContextMenu.svelte';
@@ -100,6 +101,7 @@
 			ui.fitMusicDialog !== null ||
 			ui.relinkDialog ||
 			ui.stemsDialog !== null ||
+			ui.saveTemplateDialog !== null ||
 			ui.shortcutSheet
 	);
 	/** True while files are hovering over the window, for the drop overlay. */
@@ -882,6 +884,10 @@
 
 {#if ui.stemsDialog}
 	<StemsDialog assetId={ui.stemsDialog.assetId} clipId={ui.stemsDialog.clipId} onClose={() => ui.closeStems()} />
+{/if}
+
+{#if ui.saveTemplateDialog}
+	<SaveTemplateDialog overlayId={ui.saveTemplateDialog.overlayId} onClose={() => ui.closeSaveTemplate()} />
 {/if}
 
 {#if updater.dialogOpen}

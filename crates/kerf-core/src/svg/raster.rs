@@ -18,14 +18,18 @@
 //! one a [`Pin`] holds (an export's sequences are pinned from the moment they are prepared until
 //! ffmpeg is done) — the check and the removal are one step against a new pin.
 //!
-//! **The fonts are not in the key** because they cannot change under it: the font database is built
-//! once per process (`fonts::svg_fontdb`) and so is this directory, which is emptied when the
-//! process starts. A font installed while Kerf runs is seen by neither until the next run.
+//! **The installed fonts are not in the key** because they cannot change under it: the font database
+//! is built once per process (`fonts::svg_fontdb`) and so is this directory, which is emptied when
+//! the process starts. A font installed while Kerf runs is seen by neither until the next run. **The
+//! fonts a project embeds can** (opening another project, applying a template), so the engine takes a
+//! `fonts::FontSet` once, when a title is planned, keys the pictures by its digest (when it is not empty)
+//! and draws them with its database: the key and the fonts are one value, and a picture drawn with another
+//! set is never served.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::SystemTime;
 
 use resvg::usvg::{self, ImageHrefResolver, ImageKind};
@@ -50,11 +54,11 @@ const MARKER: &str = "complete";
 
 // ---- drawing ----------------------------------------------------------------------------------
 
-fn options() -> usvg::Options<'static> {
+fn options(fontdb: Arc<fontdb::Database>) -> usvg::Options<'static> {
     usvg::Options {
         // The face text gets when it names none: the shipped one, on every machine.
         font_family: fonts::DEFAULT_FAMILY.to_string(),
-        fontdb: fonts::svg_fontdb(),
+        fontdb,
         resources_dir: None,
         image_href_resolver: image_resolver(),
         ..usvg::Options::default()
@@ -90,13 +94,20 @@ pub(super) fn image_resolver() -> ImageHrefResolver<'static> {
 /// slides in from outside the `viewBox` is not seen in the margin). `opacity` multiplies every
 /// channel of the premultiplied result, so the alpha is already the overlay's.
 pub fn render(svg: &str, pw: u32, ph: u32, opacity: f64) -> Result<Pixmap> {
+    render_with(svg, pw, ph, opacity, fonts::svg_fontdb())
+}
+
+/// [`render`] with the fonts it is given instead of the process's: the set a title was planned with
+/// (`fonts::FontSet::db`), or a template being saved or imported drawing its poster with the fonts it
+/// carries (`fonts::svg_fontdb_with`).
+pub fn render_with(svg: &str, pw: u32, ph: u32, opacity: f64, fontdb: Arc<fontdb::Database>) -> Result<Pixmap> {
     let (pw, ph) = (pw.max(1), ph.max(1));
     if u64::from(pw) * u64::from(ph) > MAX_PIXELS {
         return Err(Error::InvalidArgument(format!(
             "an animated title of {pw} x {ph} pixels is too large to draw"
         )));
     }
-    let tree = usvg::Tree::from_str(svg, &options()).map_err(|e| invalid(format!("not a drawable SVG: {e}")))?;
+    let tree = usvg::Tree::from_str(svg, &options(fontdb)).map_err(|e| invalid(format!("not a drawable SVG: {e}")))?;
     let (w, h) = (tree.size().width(), tree.size().height());
     let (fw, fh) = fit_contain(w, h, pw, ph);
     let into = Transform::from_scale(fw as f32 / w, fh as f32 / h);

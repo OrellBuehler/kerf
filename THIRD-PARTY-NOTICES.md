@@ -23,6 +23,14 @@ used under the MIT License below. The adapted code is listed here.
 - `frontend/src/lib/keymap.ts` (`KEY_PRESETS`) — from FilmCraft `crates/engine/src/shortcut_presets.rs`
 - `crates/kerf-core/src/engine/audio_sync.rs` — from FilmCraft `crates/audio-dsp/src/sync.rs`
 
+## Modelled on EffectCraft
+
+The `.kerftemplate` format (`crates/kerf-core/src/template/`) is modelled on the `.ectemplate` manifest and
+controls model of [EffectCraft](https://github.com/storytold/effectcraft) (`crates/project/src/essential.rs`,
+`engine/templates.rs`), which is licensed MIT OR Apache-2.0. No EffectCraft code is copied; the shape of a
+template (a manifest with named controls bound to elements of the artwork, a poster and embedded fonts) is.
+Its brand marks are not used.
+
 ## FilmCraft license
 
 ```text
