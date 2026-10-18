@@ -90,6 +90,26 @@ export const CONFIRM = {
 		ok: 'Turn review off',
 		cancel: 'Keep reviewing'
 	},
+	serverOff: {
+		title: 'Stop letting agents connect?',
+		message: 'Kerf’s agent server shuts down. Agents that are connected lose the connection and none can connect until you turn it back on. Nothing in your project changes.',
+		ok: 'Turn it off',
+		cancel: 'Keep it on'
+	},
+	tokenOff: {
+		title: 'Stop requiring the access token?',
+		message:
+			'Any program on this computer will be able to read your project and edit it through Kerf without the token. Turn this off only on a machine nobody else uses. Agents that are connected are disconnected and have to connect again.',
+		ok: 'Stop requiring it',
+		cancel: 'Keep requiring it'
+	},
+	restoreStale: {
+		title: 'Bring back changes from an older cut?',
+		message:
+			'You edited the timeline after these changes were discarded. They come back as a proposal against the older cut, and applying it then replaces your newer one — you are asked again before that.',
+		ok: 'Bring them back',
+		cancel: 'Cancel'
+	},
 	newToken: {
 		title: 'Make a new access token?',
 		message: 'The current token stops working at once. Every agent that connected with it has to be given the new one.',
@@ -114,6 +134,17 @@ export function removeMediaCopy(name: string, uses: number, proposed = false): C
 		title: `Remove ${name} and what uses it?`,
 		message: `${name} is used by ${where}. Removing it removes ${uses > 0 ? 'those clips' : 'those clips from the proposal'} as one step — and that step cannot be undone, because the media is gone. The file on disk stays.`,
 		ok: uses > 0 ? `Remove media and ${uses === 1 ? 'clip' : 'clips'}` : 'Remove media',
+		cancel: 'Cancel'
+	};
+}
+
+/** Pointing media at a different recording drops what was analysed from the old one (its transcript, silences,
+ *  beats …). The clips stay; the analysis would have to be run again. */
+export function relinkDropsAnalysisCopy(name: string): ConfirmCopy {
+	return {
+		title: `Relink ${name} to a different recording?`,
+		message: `That file is not ${name} moved — its length, streams or bytes differ. The clips stay as they are, but the analysis of ${name} (transcript, silences, beats …) would be wrong for it, so it is dropped and has to be run again.`,
+		ok: 'Relink and drop the analysis',
 		cancel: 'Cancel'
 	};
 }

@@ -38,7 +38,8 @@ logging is not up yet, so it returns what it set and `setup` logs it.
 a clip of the cut or of a proposal uses the asset unless `force`; the proxies and waveform cache go with the lock
 released), `relink_asset { assetId, newPath }` → `Relinked` (`relink_inputs` under the lock, `probe_relink` — the probe and a
 comparison of both files' ends — with it released, `apply_relink_probed` under it, `forget_media_caches` released
-again; `cancel_import` stops the probe), `missing_assets` → `MissingAsset[]` (`missing_assets_inputs` under the lock,
+again; `cancel_import` stops the probe), `check_relink { assetId, newPath }` → `RelinkCheck {analysis_kept, has_analysis}` (the same
+lock-free probe and refusals, changing nothing: what a relink would cost, so the prompt can say a different recording drops the analysis first), `missing_assets` → `MissingAsset[]` (`missing_assets_inputs` under the lock,
 `find_missing_assets` stat-ing the files with it released: a share that went away can take long to say so), `paths_exist { paths }` → `boolean[]` (the export dialog's
 overwrite check), `recent_projects`, `open_recent { path }` (a vanished file is dropped from the list, never created —
 `open_project` refuses a path that names nothing too) and `clear_recent_projects`. Staged proposals:
@@ -211,8 +212,10 @@ many seconds ago an agent last spoke to it, or `null` if none ever has —
 `initialize` is the one moment an agent is known to be there; a
 streamable-HTTP client holds no connection between calls, so there is no socket
 to report and the panel judges from the age instead of the green dot it used to
-show unconditionally). `mcp_connection_info` (URL, token, `running` / `error`, `claude_code_command` with the bearer header
-and a generic `mcpServers` JSON snippet; `mcp_commands.rs`), `regenerate_mcp_token` (the old token stops working at once)
+show unconditionally). `mcp_connection_info` (URL, token, `token_problem` — why the token is not what it should be, or `null` —, `running` / `error`
+**for the address now configured** (`listener_state`: until the supervisor has restarted for a new address, the old one's
+state says nothing about it, so `running` is false and `error` empty, which is what lets the page wait for the restart),
+`claude_code_command` with the bearer header and a generic `mcpServers` JSON snippet; `mcp_commands.rs`), `regenerate_mcp_token` (the old token stops working at once)
 and `set_mcp_settings { mcp_enabled?, mcp_addr?, mcp_require_token?, agent_review? }` (refuses any other key; a network
 address needs the token; `settings::update` restarts the listener when the address or switch moves, see `mcp.md`) are the Agent
 settings page's commands — the settings file holds `agent_review`, `mcp_enabled`, `mcp_addr`, `mcp_require_token` and
@@ -289,7 +292,7 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 **Command index** (every name in `generate_handler!`; the prose above says what they do):
 *project* `project_path`, `new_project`, `open_project`, `save_project_as`, `recent_projects`, `open_recent`,
 `clear_recent_projects`, `take_launch_project`, `show_main_window`; *library* `list_assets`, `get_asset_metadata`,
-`list_fonts`, `import_asset`, `cancel_import`, `remove_asset`, `relink_asset`, `missing_assets`, `paths_exist`,
+`list_fonts`, `import_asset`, `cancel_import`, `remove_asset`, `relink_asset`, `check_relink`, `missing_assets`, `paths_exist`,
 `set_asset_projection`; *analysis, proxies, transcription* `analyze_asset`, `cancel_analysis`, `analysis_statuses`,
 `proxy_statuses`, `rebuild_proxy`, `delete_proxy`, `transcription_status`, `set_speech_model`, `download_speech_model`,
 `cancel_model_download`; *voiceover, stems, mixing* `voiceover_status`, `prepare_voiceover`, `generate_voiceover`,

@@ -90,8 +90,8 @@ pub use platform::{
 };
 pub use play_plan::{PlayAhead, PlayCut, PlayRefusal};
 pub use project::{
-    FramingPlan, MissingAsset, Page, Project, Relinked, RemovedAsset, SmartCropJob, SmartCropPlan, StemsPlaced, SubsetApplied,
-    SvgChecked, SvgLayout, SvgOverlayResult, SvgSource, MAX_CHANNEL_KEYS, STAGED_UNDO_DEPTH, VOICEOVER_TRACK,
+    FramingPlan, MissingAsset, Page, Project, RelinkCheck, Relinked, RemovedAsset, SmartCropJob, SmartCropPlan, StemsPlaced,
+    SubsetApplied, SvgChecked, SvgLayout, SvgOverlayResult, SvgSource, MAX_CHANNEL_KEYS, STAGED_UNDO_DEPTH, VOICEOVER_TRACK,
 };
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use render_plan::{

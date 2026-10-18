@@ -4,13 +4,24 @@
 	// itself when the address or the switch moves, and what comes back is what is in force.
 	import SettingRow from './SettingRow.svelte';
 	import McpConnect from './McpConnect.svelte';
+	import Switch from './Switch.svelte';
 	import Btn from './Btn.svelte';
 	import Icon from './Icon.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { agentStatus, confirmAction, mcpConnectionInfo, regenerateMcpToken, setMcpSettings } from '$lib/api';
-	import { CONFIRM } from '$lib/confirm-copy';
+	import { CONFIRM, type ConfirmCopy } from '$lib/confirm-copy';
 	import { toast } from '$lib/notifications.svelte';
-	import { addressProblem, envOverrideNote, lastSeenLine, mcpStatus, networkWarning, tokenDisplay } from '$lib/mcp-ui';
+	import {
+		addressNotice,
+		addressProblem,
+		awaitListener,
+		envOverrideNote,
+		lastSeenLine,
+		mcpStatus,
+		networkWarning,
+		restartsListener,
+		tokenDisplay
+	} from '$lib/mcp-ui';
 	import type { McpConnectionInfo, McpSettingsPatch } from '$lib/types';
 
 	let info = $state<McpConnectionInfo | null>(null);
@@ -47,33 +58,43 @@
 		return () => clearInterval(t);
 	});
 
-	/** Write one or more of the agent switches; what comes back replaces what is shown. */
-	async function change(patch: McpSettingsPatch): Promise<boolean> {
+	/** Write one or more of the agent switches. What comes back replaces what is shown; a change that restarts the
+	 *  listener is followed until it has (or has not) come up. Resolves to the state in force, or `null` when refused. */
+	async function change(patch: McpSettingsPatch): Promise<McpConnectionInfo | null> {
 		busy = true;
 		try {
-			const next = await setMcpSettings(patch);
+			let next = await setMcpSettings(patch);
 			info = next;
 			settings.agentReview = next.agent_review;
 			if (!addrDirty) addr = next.configured_addr ?? '';
-			return true;
+			if (restartsListener(patch)) {
+				next = await awaitListener(mcpConnectionInfo, next);
+				info = next;
+			}
+			return next;
 		} catch (e) {
 			toast.error("Couldn't change the agent setting", { description: e instanceof Error ? e.message : String(e) });
 			await load();
-			return false;
+			return null;
 		} finally {
 			busy = false;
 		}
 	}
 
-	async function setReview(on: boolean, box: HTMLInputElement) {
-		if (!on) {
-			const c = CONFIRM.agentReviewOff;
-			if (!(await confirmAction(c.message, c.title, c))) {
-				box.checked = true;
-				return;
-			}
+	/** A switch was pressed: ask first when `ask` is given and it is being turned off, write it, and put the box back
+	 *  to what is in force when the write was refused (the box moved on its own; the state it shows did not). */
+	async function flip(
+		box: HTMLInputElement,
+		on: boolean,
+		patch: McpSettingsPatch,
+		inForce: () => boolean,
+		ask?: ConfirmCopy
+	) {
+		if (!on && ask && !(await confirmAction(ask.message, ask.title, ask))) {
+			box.checked = true;
+			return;
 		}
-		if (!(await change({ agent_review: on }))) box.checked = !on;
+		if ((await change(patch)) === null) box.checked = inForce();
 	}
 
 	const problem = $derived(info ? addressProblem(addr, info.require_token) : null);
@@ -83,7 +104,11 @@
 		if (problem || unchanged) return;
 		const wanted = addr.trim();
 		addrDirty = false;
-		if (await change({ mcp_addr: wanted === '' ? null : wanted })) toast.success(wanted === '' ? 'Listening on the default address' : `Listening on ${wanted}`);
+		const asked = wanted === '' ? null : wanted;
+		const done = await change({ mcp_addr: asked });
+		if (!done) return;
+		const note = addressNotice(done, asked);
+		toast[note.tone](note.title, note.description ? { description: note.description } : undefined);
 	}
 
 	async function copyToken() {
@@ -123,24 +148,22 @@
 	const network = $derived(info ? networkWarning(info.configured_addr, info.require_token) : null);
 </script>
 
-<SettingRow id="agent-review" label="Review the agent’s edits before they land">
+<SettingRow id="agent-review" for="sw-agent-review" label="Review the agent’s edits before they land">
 	{#snippet hint()}
 		On, everything an agent changes waits as a proposal: you look at it on the timeline and apply, pick or discard it.
 		Off, its edits land as they are made (each one still a step you can undo).
 	{/snippet}
-	<input
-		type="checkbox"
-		role="switch"
-		aria-label="Review the agent’s edits before they land"
-		data-testid="agent-review"
+	<Switch
+		id="sw-agent-review"
+		label="Review the agent’s edits before they land"
+		testid="agent-review"
 		checked={settings.agentReview}
 		disabled={busy}
-		onchange={(e) => void setReview(e.currentTarget.checked, e.currentTarget)}
-		style="accent-color:var(--kerf-500);cursor:pointer;width:16px;height:16px"
+		onchange={(on, box) => void flip(box, on, { agent_review: on }, () => settings.agentReview, CONFIRM.agentReviewOff)}
 	/>
 </SettingRow>
 
-<SettingRow id="mcp-enabled" label="Let agents connect">
+<SettingRow id="mcp-enabled" for="sw-mcp-enabled" label="Let agents connect">
 	{#snippet hint()}
 		Kerf runs an MCP server on this computer so an AI agent — Claude Code, Cursor and others — can look at your project
 		and edit it through the same engine the buttons use. Nothing leaves your machine unless you point it at a network
@@ -158,15 +181,13 @@
 		{/if}
 	{/snippet}
 	{#if info}
-		<input
-			type="checkbox"
-			role="switch"
-			aria-label="Let agents connect"
-			data-testid="mcp-enabled"
+		<Switch
+			id="sw-mcp-enabled"
+			label="Let agents connect"
+			testid="mcp-enabled"
 			checked={info.enabled}
 			disabled={busy}
-			onchange={(e) => void change({ mcp_enabled: e.currentTarget.checked })}
-			style="accent-color:var(--kerf-500);cursor:pointer;width:16px;height:16px"
+			onchange={(on, box) => void flip(box, on, { mcp_enabled: on }, () => info?.enabled ?? !on, CONFIRM.serverOff)}
 		/>
 	{/if}
 </SettingRow>
@@ -215,18 +236,22 @@
 		drive Kerf without it. Turn it off only on a machine nobody else uses.
 	{/snippet}
 	{#if info}
-		<label style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-primary);margin-bottom:8px;cursor:pointer">
-			<input
-				type="checkbox"
-				role="switch"
-				data-testid="mcp-require-token"
+		<div style="margin-bottom:4px">
+			<Switch
+				label="Require the access token"
+				text="Require the access token"
+				testid="mcp-require-token"
 				checked={info.require_token}
 				disabled={busy}
-				onchange={(e) => void change({ mcp_require_token: e.currentTarget.checked })}
-				style="accent-color:var(--kerf-500);cursor:pointer;width:16px;height:16px"
+				onchange={(on, box) => void flip(box, on, { mcp_require_token: on }, () => info?.require_token ?? !on, CONFIRM.tokenOff)}
 			/>
-			Require the access token
-		</label>
+		</div>
+		{#if info.token_problem}
+			<div role="alert" data-testid="mcp-token-problem" style="margin-bottom:8px;display:flex;gap:6px;font-size:12px;line-height:1.5;color:var(--orange-400)">
+				<Icon n="alert-triangle" s={13} style="flex:none;margin-top:2px" />
+				<span>{info.token_problem}</span>
+			</div>
+		{/if}
 		<div style="display:flex;gap:6px;align-items:center">
 			<code
 				data-selectable

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import SettingRow from './SettingRow.svelte';
+	import Switch from './Switch.svelte';
 	import Btn from './Btn.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { LENGTH_RANGE, clampSeconds, secondsLabel } from '$lib/editing-prefs';
@@ -45,17 +46,16 @@
 
 <SettingRow
 	id="snap-default"
+	for="sw-snap-default"
 	label="Snapping on when Kerf starts"
 	hint="Clips, the playhead, markers and bar lines pull a drag to them. The magnet in the timeline toolbar (and Edit › Snapping) still turns it on or off for the session — this is only where it starts."
 >
-	<input
-		type="checkbox"
-		role="switch"
-		aria-label="Snapping on when Kerf starts"
-		data-testid="editing-snap"
+	<Switch
+		id="sw-snap-default"
+		label="Snapping on when Kerf starts"
+		testid="editing-snap"
 		checked={settings.editing.snap}
-		onchange={(e) => void settings.setEditing({ snap: e.currentTarget.checked })}
-		style="accent-color:var(--kerf-500);cursor:pointer;width:16px;height:16px"
+		onchange={(on) => void settings.setEditing({ snap: on })}
 	/>
 </SettingRow>
 

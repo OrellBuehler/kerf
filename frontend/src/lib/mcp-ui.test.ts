@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { addressProblem, envOverrideNote, isLoopbackAddr, lastSeenLine, maskSecret, mcpStatus, networkWarning, tokenDisplay } from './mcp-ui';
+import { addressNotice, addressProblem, awaitListener, envOverrideNote, isLoopbackAddr, lastSeenLine, listenerSettled, maskSecret, mcpStatus, networkWarning, restartsListener, tokenDisplay } from './mcp-ui';
 import { clientHelps } from './mcp-clients';
 
 const info = {
@@ -91,5 +91,70 @@ describe('when an agent last came', () => {
 		expect(lastSeenLine(30)).toBe('Last used 30 s ago');
 		expect(lastSeenLine(300)).toBe('Last used 5 min ago');
 		expect(lastSeenLine(7200)).toBe('Last used 2 h ago');
+	});
+});
+
+describe('waiting for the listener after a change', () => {
+	const base = { enabled: true, running: false, error: null as string | null, url: 'http://127.0.0.1:9000/mcp', env_override: false };
+	const full = (over: Partial<typeof base>) => ({ ...base, ...over }) as never;
+
+	test('settled is up, off or failed; anything else is still moving', () => {
+		expect(listenerSettled(base)).toBeNull();
+		expect(listenerSettled({ ...base, running: true })).toBe('up');
+		expect(listenerSettled({ ...base, error: 'in use' })).toBe('failed');
+		expect(listenerSettled({ ...base, enabled: false })).toBe('off');
+		expect(listenerSettled({ ...base, enabled: false, running: true })).toBeNull();
+	});
+
+	test('it reads until the server is up, no longer than asked', async () => {
+		const reads = [full({}), full({}), full({ running: true })];
+		let slept = 0;
+		const info = await awaitListener(async () => reads.shift()!, full({}), { sleep: async () => void slept++ });
+		expect(info.running).toBe(true);
+		expect(slept).toBe(3);
+
+		slept = 0;
+		const stuck = await awaitListener(async () => full({}), full({}), { tries: 4, sleep: async () => void slept++ });
+		expect(stuck.running).toBe(false);
+		expect(slept).toBe(4);
+	});
+
+	test('a state that is already settled is not waited for, and a failing read ends the wait', async () => {
+		let reads = 0;
+		const up = full({ running: true });
+		expect(await awaitListener(async () => (reads++, up), up, { sleep: async () => {} })).toBe(up);
+		expect(reads).toBe(0);
+		const first = full({});
+		const failed = await awaitListener(
+			async () => {
+				throw new Error('gone');
+			},
+			first,
+			{ sleep: async () => {} }
+		);
+		expect(failed).toBe(first);
+	});
+
+	test('the notice says what happened, not what was hoped for', () => {
+		expect(addressNotice({ ...base, running: true }, '127.0.0.1:9000')).toMatchObject({ tone: 'success', title: 'Listening on 127.0.0.1:9000' });
+		expect(addressNotice({ ...base, running: true }, null).title).toBe('Listening on the default address');
+		expect(addressNotice({ ...base, error: 'in use' }, '127.0.0.1:9000')).toEqual({
+			tone: 'error',
+			title: 'Couldn’t listen on that address',
+			description: 'in use'
+		});
+		expect(addressNotice(base, '127.0.0.1:9000')).toMatchObject({ tone: 'info', title: 'Address saved' });
+		expect(addressNotice({ ...base, enabled: false }, '127.0.0.1:9000')).toMatchObject({ tone: 'success', title: 'Address saved' });
+		const env = addressNotice({ ...base, env_override: true, running: true, url: 'http://127.0.0.1:7777/mcp' }, '127.0.0.1:9000');
+		expect(env.tone).toBe('info');
+		expect(env.description).toContain('KERF_MCP_ADDR');
+		expect(env.description).toContain('http://127.0.0.1:7777/mcp');
+	});
+
+	test('only the switches that move the listener are waited on', () => {
+		expect(restartsListener({ mcp_addr: null })).toBe(true);
+		expect(restartsListener({ mcp_enabled: false })).toBe(true);
+		expect(restartsListener({ mcp_require_token: false })).toBe(true);
+		expect(restartsListener({ agent_review: false } as never)).toBe(false);
 	});
 });

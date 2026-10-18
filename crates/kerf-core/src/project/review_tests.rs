@@ -428,6 +428,41 @@ fn a_relink_is_checked_with_the_lock_released_and_applied_without_touching_a_fil
 }
 
 #[test]
+fn a_relink_says_before_it_is_made_whether_the_analysis_would_be_kept() {
+    let (p, a, _, _) = cut();
+    assert!(!p.has_analysis(a.id).unwrap());
+    p.set_analysis(&silence_patch(a.id)).unwrap();
+    assert!(p.has_analysis(a.id).unwrap());
+    let old = p.relink_inputs(a.id).unwrap();
+
+    let probe = |probed: Asset, same_file| RelinkProbe {
+        probed,
+        old_path: old.path.clone(),
+        same_file,
+    };
+    let moved = asset("/moved/av.mp4", 60.0, a.streams.clone());
+    assert!(probe(moved.clone(), Some(true)).keeps_analysis(&old));
+    assert!(
+        probe(moved.clone(), None).keeps_analysis(&old),
+        "nothing to compare with: length and streams decide"
+    );
+    assert!(
+        !probe(moved, Some(false)).keeps_analysis(&old),
+        "other bytes are another take"
+    );
+    let longer = asset("/moved/av.mp4", 60.3, a.streams.clone());
+    assert!(!probe(longer, Some(true)).keeps_analysis(&old));
+
+    // The answer is the one the relink then gives, and the check changed nothing.
+    let other = probe(asset("/other-take.mp4", 60.3, a.streams.clone()), None);
+    assert!(!other.keeps_analysis(&old));
+    assert!(p.has_analysis(a.id).unwrap());
+    assert_eq!(p.require_asset(a.id).unwrap().path, "/av.mp4");
+    assert!(!p.apply_relink_probed(a.id, &other).unwrap().analysis_kept);
+    assert!(!p.has_analysis(a.id).unwrap());
+}
+
+#[test]
 fn the_old_apply_relink_still_compares_file_sizes_when_both_files_are_there() {
     let dir = scratch("relink-legacy");
     let (old_file, same_size, other_size) = (dir.join("old.mp4"), dir.join("same.mp4"), dir.join("other.mp4"));
@@ -1954,6 +1989,80 @@ fn a_discarded_proposal_can_be_brought_back_once_and_only_when_none_is_open() {
 }
 
 #[test]
+fn a_discarded_proposal_is_forgotten_once_a_newer_one_is_applied() {
+    let (mut p, _, c1, c2) = cut();
+    p.set_actor(EditSource::Agent);
+    p.set_volume(c1.id, 0.5).unwrap();
+    p.set_actor(EditSource::User);
+    p.discard_staged().unwrap();
+    assert!(p.discarded_staged().unwrap().is_some());
+
+    // A session that changed nothing closing does not take it.
+    p.begin_staging(None, None, None).unwrap();
+    p.apply_staged(false).unwrap();
+    assert!(p.discarded_staged().unwrap().is_some());
+
+    p.set_actor(EditSource::Agent);
+    p.set_volume(c2.id, 0.7).unwrap();
+    p.set_actor(EditSource::User);
+    p.apply_staged(false).unwrap();
+    assert!(
+        p.discarded_staged().unwrap().is_none(),
+        "what was thrown away before is no longer an undo"
+    );
+    assert!(matches!(p.restore_discarded(), Err(Error::NoDiscardedEdit)));
+}
+
+#[test]
+fn a_discarded_proposal_is_forgotten_once_part_of_a_newer_one_is_applied() {
+    let (mut p, _, c1, c2) = cut();
+    p.set_actor(EditSource::Agent);
+    p.set_volume(c1.id, 0.5).unwrap();
+    p.set_actor(EditSource::User);
+    p.discard_staged().unwrap();
+
+    p.set_actor(EditSource::Agent);
+    p.set_volume(c1.id, 0.4).unwrap();
+    p.set_volume(c2.id, 0.7).unwrap();
+    p.set_actor(EditSource::User);
+    let pick = format!("clip_changed:{}", c1.id);
+    p.apply_staged_subset(&[pick], false).unwrap();
+    assert!(p.discarded_staged().unwrap().is_none());
+}
+
+#[test]
+fn a_discarded_proposal_is_not_offered_again_in_a_project_that_is_opened_afresh() {
+    let dir = scratch("discard-replace");
+    let path = dir.join("p.kerf");
+    let mut p = Project::create(&path).unwrap();
+    let a = asset("/av.mp4", 60.0, vec![stream(StreamKind::Video), stream(StreamKind::Audio)]);
+    p.insert_asset(&a).unwrap();
+    let c1 = p.add_clip_to_timeline(a.id, None, 0.0, 10.0, Some(0.0)).unwrap();
+    p.set_actor(EditSource::Agent);
+    p.set_volume(c1.id, 0.5).unwrap();
+    p.set_actor(EditSource::User);
+    p.discard_staged().unwrap();
+    drop(p);
+
+    // Opening the file keeps it (Save As reopens a copy)…
+    assert!(Project::open(&path).unwrap().discarded_staged().unwrap().is_some());
+    let mut shared = Project::open_in_memory().unwrap();
+    shared.replace_with_saved_copy(Project::open(&path).unwrap());
+    assert!(
+        shared.discarded_staged().unwrap().is_some(),
+        "the same project, in another file"
+    );
+    // …making it the project the app has open does not.
+    shared.replace_with(Project::open(&path).unwrap());
+    assert!(shared.discarded_staged().unwrap().is_none());
+    assert!(
+        Project::open(&path).unwrap().discarded_staged().unwrap().is_none(),
+        "nor is it kept in the file"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn a_restored_proposal_is_what_it_was_and_goes_stale_if_the_cut_moved() {
     let (mut p, _, c1, c2) = cut();
     p.set_actor(EditSource::Agent);
@@ -2181,6 +2290,42 @@ fn relinking_real_media_keeps_analysis_only_for_the_same_recording() {
     assert!(p.missing_assets().unwrap().is_empty());
     std::fs::remove_file(&retake).unwrap();
     assert_eq!(p.missing_assets().unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Asking what a relink would cost reads both files and changes nothing.
+#[test]
+#[ignore = "drives the real ffmpeg / ffprobe binaries"]
+fn checking_a_relink_against_real_media_reports_the_cost_and_changes_nothing() {
+    let dir = scratch("relink-check-real");
+    let (original, copy, retake, silent) = (
+        dir.join("original.mp4"),
+        dir.join("copy.mp4"),
+        dir.join("retake.mp4"),
+        dir.join("silent.mp4"),
+    );
+    assert!(make_media(&original, 2, true), "ffmpeg could not make a test clip");
+    std::fs::copy(&original, &copy).unwrap();
+    assert!(make_media(&retake, 2, true));
+    let mut other = std::fs::read(&retake).unwrap();
+    other.push(0);
+    std::fs::write(&retake, &other).unwrap();
+    assert!(make_media(&silent, 2, false));
+    let p = Project::open_in_memory().unwrap();
+    let a = p.import_asset(&original).unwrap();
+    p.set_analysis(&silence_patch(a.id)).unwrap();
+
+    let old = p.relink_inputs(a.id).unwrap();
+    let has = p.has_analysis(a.id).unwrap();
+    let never = || false;
+    let same = Project::check_relink(&old, has, &copy, &never).unwrap();
+    assert_eq!((same.analysis_kept, same.has_analysis), (true, true));
+    let again = Project::check_relink(&old, has, &retake, &never).unwrap();
+    assert_eq!((again.analysis_kept, again.has_analysis), (false, true));
+    let err = Project::check_relink(&old, has, &silent, &never).unwrap_err().to_string();
+    assert!(err.contains("picture only"), "{err}");
+    assert_eq!(p.require_asset(a.id).unwrap().path, original.to_string_lossy());
+    assert!(p.has_analysis(a.id).unwrap(), "asking dropped nothing");
     let _ = std::fs::remove_dir_all(dir);
 }
 

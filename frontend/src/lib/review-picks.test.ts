@@ -67,11 +67,11 @@ describe('what comes along', () => {
 	const entries = [entry('clip_retrimmed', { clip_id: 'pic' }), entry('clip_retrimmed', { clip_id: 'snd' }), entry('clip_retrimmed', { clip_id: 'other' })];
 
 	test('nothing picked, nothing comes', () => {
-		expect(comingAlong(entries, new Set(), [live]).size).toBe(0);
+		expect(comingAlong(entries, new Set(), { live }).size).toBe(0);
 	});
 
 	test('the sound of a picked picture comes with it, and nothing unrelated does', () => {
-		const along = comingAlong(entries, new Set(['clip_retrimmed:pic']), [live, null]);
+		const along = comingAlong(entries, new Set(['clip_retrimmed:pic']), { live });
 		expect([...along.keys()]).toEqual(['clip_retrimmed:snd']);
 		expect(along.get('clip_retrimmed:snd')).toContain('picture and its sound');
 	});
@@ -79,13 +79,39 @@ describe('what comes along', () => {
 	test('a link only the proposal knows is found too', () => {
 		const bare = cut([clip('pic')], [clip('snd')]);
 		const proposed = cut([picture], [sound]);
-		expect([...comingAlong(entries, new Set(['clip_retrimmed:snd']), [bare, proposed]).keys()]).toEqual(['clip_retrimmed:pic']);
+		expect([...comingAlong(entries, new Set(['clip_retrimmed:snd']), { live: bare, proposed }).keys()]).toEqual(['clip_retrimmed:pic']);
+	});
+
+	test('a link only the base knew is found too, as the backend finds it', () => {
+		const bare = cut([clip('pic')], [clip('snd')]);
+		expect([...comingAlong(entries, new Set(['clip_retrimmed:pic']), { live: bare, base: live, proposed: bare }).keys()]).toEqual([
+			'clip_retrimmed:snd'
+		]);
 	});
 
 	test('the new track a picked clip lands on comes along', () => {
 		const rows = [entry('clip_added', { clip_id: 'n', track_id: 't9' }), entry('track_added', { track_id: 't9' })];
-		const along = comingAlong(rows, new Set(['clip_added:n']), [live]);
+		const along = comingAlong(rows, new Set(['clip_added:n']), { live });
 		expect([...along.keys()]).toEqual(['track_added:t9']);
+	});
+
+	test('the clips that leave a track picked for removal come with the removal', () => {
+		const base = cut([clip('x'), clip('y')], [clip('z')]);
+		const rows = [
+			entry('track_removed', { track_id: 'v1' }),
+			entry('clip_moved', { clip_id: 'x', track_id: 'a1' }),
+			entry('clip_moved', { clip_id: 'z', track_id: 'a1' })
+		];
+		const along = comingAlong(rows, new Set(['track_removed:v1']), { live: base });
+		expect([...along.keys()]).toEqual(['clip_moved:x']);
+		expect(along.get('clip_moved:x')).toContain('lost with the track');
+	});
+
+	test('what the closure adds brings its own along', () => {
+		const rows = [entry('clip_added', { clip_id: 'p2', track_id: 't9' }), entry('clip_added', { clip_id: 's2', track_id: 't9' }), entry('track_added', { track_id: 't9' })];
+		const proposed = cut([clip('p2', { link_id: 'g2' })], [clip('s2', { link_id: 'g2' })]);
+		const along = comingAlong(rows, new Set(['clip_added:p2']), { live, proposed });
+		expect([...along.keys()].sort()).toEqual(['clip_added:s2', 'track_added:t9']);
 	});
 });
 

@@ -52,6 +52,12 @@
 {/snippet}
 
 <div style="display:flex;flex-direction:column;gap:{compact ? '9px' : '12px'}">
+	{#if info.token_problem}
+		<div role="alert" data-testid="mcp-connect-token-problem" style="display:flex;gap:6px;font-size:12px;line-height:1.5;color:var(--orange-400)">
+			<Icon n="alert-triangle" s={13} style="flex:none;margin-top:2px" />
+			<span>{info.token_problem}</span>
+		</div>
+	{/if}
 	<div>
 		<div style="font-size:12px;color:var(--text-muted);line-height:1.5;margin-bottom:6px">Any MCP client connects to this local endpoint:</div>
 		{@render copyRow(info.url, info.url, 'url', 'Copy the endpoint')}

@@ -998,6 +998,14 @@ export interface Relinked {
 	previous_path: string;
 }
 
+/** What `checkRelink` found, before anything is changed (`kerf_core::RelinkCheck`). */
+export interface RelinkCheck {
+	/** The file is the old media moved, so the analysis would be kept. */
+	analysis_kept: boolean;
+	/** The asset has analysis to lose: for one without, a different recording costs nothing. */
+	has_analysis: boolean;
+}
+
 /** What removing an asset did (`kerf_core::RemovedAsset`). */
 export interface RemovedAsset {
 	asset: Asset;

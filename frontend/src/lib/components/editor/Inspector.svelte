@@ -544,7 +544,7 @@
 	}
 
 	/** A typed In / Out, asked of the port of the backend's own rules first (`trimRefusal`): footage the file does
-	 *  not have, a negative start, a lane it would land on — said at once, in the backend's words. */
+	 *  not have, a negative start, a lane it would land on — said at once, with the fields named as the Inspector names them. */
 	async function trimChecked(clipId: string, sourceIn?: number, sourceOut?: number) {
 		const why = editor.trimRefusal(clipId, sourceIn, sourceOut);
 		if (why) throw new Error(why);

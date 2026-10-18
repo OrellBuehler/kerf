@@ -1135,11 +1135,11 @@ model. **Agent** — *Review the agent's edits* (`agent_review`; turning it **of
 (`mcpStatus`: off / listening on URL / why it is not / starting) and when an agent last came, the *address* (validated before it is sent,
 `addressProblem`; the server restarts by itself; `KERF_MCP_ADDR` in the environment wins and the row says so — a restart-required note
 rather than a silent no-op; a network address needs the token), the *access token* (require switch; masked until *Show*; *Copy*;
-*New token…* asks), and **Connect an agent** (`McpConnect.svelte`, also the Agent panel's Connect card: the endpoint plus per-client setup
+*New token…* asks; **a `token_problem` — the token could not be saved or made — is said under the switch and in `McpConnect`**, `?tokenproblem=1` seeds it in the harness), and **Connect an agent** (`McpConnect.svelte`, also the Agent panel's Connect card: the endpoint plus per-client setup
 — Claude Code's one-line command with the `Authorization: Bearer` header, a `mcpServers` JSON for Cursor / Windsurf / Cline / Zed, VS Code's
 `.vscode/mcp.json`, Claude Desktop through `mcp-remote`; `mcp-clients.ts`; the token is dots in the snippet until *Show token*, a copy
-always takes the real text). All of it goes through `setMcpSettings` / `mcpConnectionInfo` / `regenerateMcpToken`; a `settings-changed`
-event (an agent's `set_settings`) is `settings.noteChanged(view)` and the section reads again. **Keyboard** — described above.
+always takes the real text). All of it goes through `setMcpSettings` / `mcpConnectionInfo` / `regenerateMcpToken`; **turning the server off or the token requirement off asks** (`CONFIRM.serverOff` / `tokenOff`), and a switch whose write is refused puts its box back (`flip`: the box moved by itself, the state it shows did not). A change that restarts the listener (address, switch, token requirement) is followed with `awaitListener` — read again until `listenerSettled` (up / off / failed), at most five seconds — and the address says what happened (`addressNotice`: listening on it, why it did not, `KERF_MCP_ADDR` wins, or *Address saved* while it is still starting), never what was hoped for. A `settings-changed`
+event (an agent's `set_settings`) carries the `SettingsView` and is `settings.noteChanged(view)`; one without it (`null`) reads the settings again. Every on/off setting is a **`Switch`** (a 16 px native checkbox in a 32 × 28 px label, so the press need not land on the box) and its `SettingRow` takes `for` so the row's name toggles it. **Keyboard** — described above.
 **Advanced** — *Open logs*, *Show the settings file* (`reveal_settings_file`), *Reset layout* (every workspace to its preset, the question
 Window › Reset all workspaces asks: `resetAllWorkspacesAsked`) and *Reset all settings* (confirm; `reset_settings` keeps the old file beside
 the new one and the agent door — address, token — as it was; `settings.resetAll()` reads everything that is read once again and the dock
@@ -1151,17 +1151,18 @@ workspaces, keybindings and editing defaults as JSON strings) over `navigator.ha
 **Media that has gone, media taken out** (`library-actions.ts`, words and counts in `library-copy.ts`). `mediaStatus.missing` is what `missing_assets` says
 (read with every status refresh and once more when a project comes up: `checkMissingOnOpen` opens **`RelinkDialog`** by itself when anything is
 gone). A bin card carries a `missing` badge, the bin a banner with *Relink…*, the asset's Inspector a callout, and the bin's menu *Relink to another
-file…* / *Remove from project…*. **Relink** (`pickRelinkPath` → `relink_asset`) keeps the asset's id, place and every clip; it says when the new file
-is a different recording and the analysis was dropped. **Remove** confirms: unused media is a plain question; media a clip (or the open proposal —
+file…* / *Remove from project…*. **Relink** (`pickRelinkPath` → `check_relink` → `relink_asset`) keeps the asset's id, place and every clip; the dry run refuses a file that cannot stand in before
+anything is asked, and for a different recording of an asset that *has* analysis asks first (`relinkDropsAnalysisCopy`); it says afterwards that the analysis was dropped. The dialog
+speaks of one file or several (`relinkIntro`), and each row's buttons carry the asset's name (`Locate broll.mp4…`). `?relinkto=other.mp4` makes the harness picker choose a different file. **Remove** confirms: unused media is a plain question; media a clip (or the open proposal —
 `getStagedTimeline` is counted) uses says what goes with it and passes `force`, one `Remove media` step that cannot be undone (the media is gone);
 both are held while a proposal is previewed.
 **Partial accept** (`review-picks.ts`, the Agent panel's card): every change has a checkbox (and each group header a tri-state one, library changes
 a `Library` group); nothing ticked is the whole proposal. Ticked changes go to `apply_staged_subset` (`editor.applyStagedSubset` → `#apply` with
 `review`, the proposal closes only when the backend says `closed`; a stale cut asks first, as for Apply). **A linked picture and sound go together**: the card says
-*Comes along — linked to a clip you picked* beforehand (`comingAlong`, the same closure read off the live cut and the proposal) and the toast
+*Comes along — linked to a clip you picked* beforehand (`comingAlong` runs `closeOver` — the one closure `staged-subset.ts` also takes before it merges, the port of `merge_subset`: links, the new track, and the moves that leave a track picked for removal — over the live cut and the proposal; the base is not on the page, so the live cut stands in for it) and the toast
 is the backend's own sentence (what came along, what no longer applied, how many are left). The Apply button says `Apply 2 of 4`. *Undo step*
 (`undo_staged_edit`, a small icon beside the badge) takes back the agent's latest step inside the proposal. **A discard is restorable**: the toast's
-Undo and the panel's *Restore* card (`editor.discarded`, read whenever no proposal is open) call `restore_discarded_edits`.
+Undo and the panel's *Restore* card (`editor.discarded`, read whenever no proposal is open — a read that fails or was overtaken by a project load / a new proposal leaves no card; an edit re-reads it, so the card says *The timeline has changed since* and *Restore* asks first, `CONFIRM.restoreStale`) call `restore_discarded_edits`. Core drops the kept copy when a newer proposal is applied or the project is replaced (`core-project.md`).
 **Export asks before it replaces a file** (`export-overwrite.ts`): the files the render will write (the path, or one `-9x16` sibling per delivery shape)
 go through `pathsExist`; the file the native save dialog returned is skipped (it asked), every other one that exists is asked about once.
 **Music structure** (`MusicStructure.svelte`, `music-structure.ts`) is the Inspector's view of `get_music_structure`: the energy curve (`getEnergy`, asked

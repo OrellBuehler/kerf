@@ -9,6 +9,7 @@
 		label,
 		hint = undefined,
 		stacked = false,
+		for: control = undefined,
 		children
 	}: {
 		id: string;
@@ -16,6 +17,8 @@
 		hint?: Snippet | string;
 		/** The control goes under the words and takes the row's whole width. */
 		stacked?: boolean;
+		/** The id of the switch in the row: pressing the name then toggles it. */
+		for?: string;
 		children?: Snippet;
 	} = $props();
 
@@ -33,7 +36,11 @@
 			: 'align-items:flex-start;justify-content:space-between'}"
 	>
 		<div style="min-width:0;{stacked ? '' : 'flex:1'}">
-			<div id={labelId} style="font-size:13px;color:var(--text-primary);line-height:1.4">{label}</div>
+			{#if control}
+				<label id={labelId} for={control} style="display:block;font-size:13px;color:var(--text-primary);line-height:1.4;cursor:pointer">{label}</label>
+			{:else}
+				<div id={labelId} style="font-size:13px;color:var(--text-primary);line-height:1.4">{label}</div>
+			{/if}
 			{#if hint}
 				<div style="margin-top:3px;font-size:12px;line-height:1.55;color:var(--text-secondary)">
 					{#if typeof hint === 'string'}{hint}{:else}{@render hint()}{/if}

@@ -43,11 +43,6 @@ export function parseEditing(raw: unknown): EditingPrefs {
 	};
 }
 
-/** Whether the prefs are all defaults (then nothing needs storing). */
-export function isDefaultEditing(p: EditingPrefs): boolean {
-	return p.snap === DEFAULT_EDITING.snap && p.still_seconds === DEFAULT_EDITING.still_seconds && p.title_seconds === DEFAULT_EDITING.title_seconds;
-}
-
 /** How a length reads in the field and the hint: `5 s`, `2.5 s`. */
 export function secondsLabel(s: number): string {
 	return `${Number.isInteger(s) ? s : s.toFixed(1)} s`;

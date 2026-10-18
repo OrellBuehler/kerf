@@ -160,7 +160,7 @@
 			() => {}
 		);
 	});
-	const along = $derived(staged ? comingAlong(staged.diff.entries, picks, [editor.liveTimeline, proposedCut]) : new Map<string, string>());
+	const along = $derived(staged ? comingAlong(staged.diff.entries, picks, { live: editor.liveTimeline, proposed: proposedCut }) : new Map<string, string>());
 
 	// The setup card is for a panel with nothing in it; once a proposal lands it is the proposal that matters,
 	// and at 1280×720 the card pushed it off the screen. (Asked for again, it opens again.)
@@ -666,7 +666,7 @@
 				<span style="flex:1;min-width:0;font-size:12px;line-height:1.45;color:var(--text-secondary)">
 					You discarded {changeWord(editor.discarded.diff.entries.length + (editor.discarded.asset_changes ?? []).length)}{editor.discarded.note
 						? ` — ${editor.discarded.note}`
-						: ''}.
+						: ''}.{editor.discarded.stale ? ' The timeline has changed since.' : ''}
 				</span>
 				<Btn variant="secondary" size="sm" icon="rotate-ccw" iconSize={12} data-testid="restore-discarded" onclick={() => void restoreProposal()}>Restore</Btn>
 			</div>

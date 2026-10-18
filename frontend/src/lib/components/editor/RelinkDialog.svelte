@@ -9,7 +9,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { mediaStatus } from '$lib/media-status.svelte';
 	import { relinkMediaFlow, removeMediaFlow } from '$lib/library-actions';
-	import { missingLine } from '$lib/library-copy';
+	import { relinkIntro } from '$lib/library-copy';
 	import { shortPath } from '$lib/media-info';
 	import { tip } from '$lib/tip';
 
@@ -49,11 +49,7 @@
 				Every file is where the project expects it.
 			</div>
 		{:else}
-			<p style="margin:0 0 10px;font-size:12px;line-height:1.55;color:var(--text-secondary)">
-				{missingLine(list)}. They were moved, renamed or are on a drive that is not connected. Point each at the file it
-				has become — the clips cut from it stay exactly as they are — or take it out of the project. Nothing is deleted
-				from disk either way.
-			</p>
+			<p style="margin:0 0 10px;font-size:12px;line-height:1.55;color:var(--text-secondary)">{relinkIntro(list)}</p>
 			<ul data-testid="relink-list" style="margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:8px">
 				{#each list as m (m.asset_id)}
 					<li
@@ -72,10 +68,10 @@
 							{shortPath(m.path)}
 						</div>
 						<div style="margin-top:8px;display:flex;gap:6px">
-							<Btn variant="primary" size="sm" icon="folder-open" pending={working !== null} data-rescue={m === list[0] ? '' : undefined} data-testid="relink-locate" onclick={() => relink(m.asset_id)}
+							<Btn variant="primary" size="sm" icon="folder-open" pending={working !== null} data-rescue={m === list[0] ? '' : undefined} aria-label="Locate {m.name}…" data-testid="relink-locate" onclick={() => relink(m.asset_id)}
 								>Locate…</Btn
 							>
-							<Btn variant="ghost" size="sm" icon="trash" pending={working !== null} data-testid="relink-remove" onclick={() => remove(m.asset_id)}>Remove from project…</Btn>
+							<Btn variant="ghost" size="sm" icon="trash" pending={working !== null} aria-label="Remove {m.name} from project…" data-testid="relink-remove" onclick={() => remove(m.asset_id)}>Remove from project…</Btn>
 						</div>
 					</li>
 				{/each}

@@ -101,22 +101,12 @@ interface ClipOps {
 	entries: number[];
 }
 
-/** Lay the changes of `proposed` (relative to `base`) named by `picked` onto `live` — see the file header. */
-export function mergeSubset(live: Timeline, base: Timeline, proposed: Timeline, diff: TimelineDiff, picked: string[]): SubsetMerge {
-	const entries = diff.entries;
-	const ids = entries.map(entryId);
-	if (picked.length === 0) throw invalid('pick at least one change to apply');
-	const chosen = new Set<number>();
-	for (const id of picked) {
-		const i = ids.indexOf(id);
-		if (i < 0) throw invalid(`no change ${id} in the proposal — ids come from the proposal's diff entries`);
-		chosen.add(i);
-	}
-	const pickedSet = new Set(chosen);
+/** The closure `merge_subset` takes before it applies anything: what has to come with the changes in `chosen` (indices
+ *  into `entries`) — a linked partner's change, the new track a picked clip lands on, the moves that take clips off a
+ *  track picked for removal. Grows `chosen` in place and answers why each addition came, `{ index → because }`. `cuts` are
+ *  the live cut, the base and the proposal: a link group is the clips ever together in any of them. */
+export function closeOver(entries: readonly DiffEntry[], chosen: Set<number>, cuts: Timeline[], base: Timeline): Map<number, string> {
 	const because = new Map<number, string>();
-
-	// The closure: what has to come with what was picked.
-	const cuts = [live, base, proposed];
 	const groups = linkGroups(cuts);
 	for (;;) {
 		const more: [number, string][] = [];
@@ -153,6 +143,22 @@ export function mergeSubset(live: Timeline, base: Timeline, proposed: Timeline, 
 		}
 		if (!grew) break;
 	}
+	return because;
+}
+
+/** Lay the changes of `proposed` (relative to `base`) named by `picked` onto `live` — see the file header. */
+export function mergeSubset(live: Timeline, base: Timeline, proposed: Timeline, diff: TimelineDiff, picked: string[]): SubsetMerge {
+	const entries = diff.entries;
+	const ids = entries.map(entryId);
+	if (picked.length === 0) throw invalid('pick at least one change to apply');
+	const chosen = new Set<number>();
+	for (const id of picked) {
+		const i = ids.indexOf(id);
+		if (i < 0) throw invalid(`no change ${id} in the proposal — ids come from the proposal's diff entries`);
+		chosen.add(i);
+	}
+	const pickedSet = new Set(chosen);
+	const because = closeOver(entries, chosen, [live, base, proposed], base);
 
 	const out: Timeline = structuredClone(live);
 	const applied = new Set<number>();

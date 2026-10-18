@@ -1,5 +1,6 @@
 <script lang="ts">
 	import SettingRow from './SettingRow.svelte';
+	import Switch from './Switch.svelte';
 	import ChoiceChips from './ChoiceChips.svelte';
 	import Btn from './Btn.svelte';
 	import { settings } from '$lib/settings.svelte';
@@ -30,17 +31,16 @@
 
 <SettingRow
 	id="reopen-last"
+	for="sw-reopen-last"
 	label="Reopen the last project on launch"
 	hint="Off, Kerf starts empty. A project named on the command line, or opened by double-clicking a .kerf file, always wins."
 >
-	<input
-		type="checkbox"
-		role="switch"
-		aria-label="Reopen the last project on launch"
-		data-testid="reopen-last"
+	<Switch
+		id="sw-reopen-last"
+		label="Reopen the last project on launch"
+		testid="reopen-last"
 		checked={settings.reopenLast}
-		onchange={(e) => void settings.setReopenLast(e.currentTarget.checked)}
-		style="accent-color:var(--kerf-500);cursor:pointer;width:16px;height:16px"
+		onchange={(on) => void settings.setReopenLast(on)}
 	/>
 </SettingRow>
 

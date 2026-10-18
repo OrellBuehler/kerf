@@ -2,10 +2,11 @@
  * (`staged-subset.ts`: the change's stable name, which is what `apply_staged_subset` is sent) and the Apply button
  * says how many. A picture and its sound are one piece of material, so picking one of a linked pair brings the
  * other along; the backend does that for real and reports it (`SubsetApplied.auto_included`), and `comingAlong`
- * is the same rule read off the two cuts the page has (the live one and the proposal) so the card can say so
- * *before* the press. The track a picked clip lands on comes along too. */
+ * is the same closure (`closeOver`, shared with the harness' `mergeSubset`) read off the cuts the page has, so the
+ * card can say so *before* the press. The track a picked clip lands on comes along too, and so do the moves that take
+ * clips off a track picked for removal. */
 
-import { entryId } from './staged-subset';
+import { closeOver, entryId } from './staged-subset';
 import type { DiffEntry, StagedAssetChange, Timeline } from './types';
 
 /** One row of the review: a change of the cut, or a held-back change to the library. */
@@ -53,52 +54,30 @@ export function keepPresent(picks: ReadonlySet<string>, rows: readonly Pick<Pick
 	return kept.length === picks.size ? picks : new Set(kept);
 }
 
-/** Link ids of the clips of a cut, by clip id. */
-function linkOf(cut: Timeline | null | undefined): Map<string, string> {
-	const out = new Map<string, string>();
-	for (const t of cut?.tracks ?? []) for (const c of t.clips) if (c.link_id) out.set(c.id, c.link_id);
-	return out;
+/** The cuts a proposal is read against. `base` is the cut the proposal branched from; the page does not have it, and
+ *  the live cut is it unless the user edited since (a stale proposal), so it defaults to `live`. */
+export interface PickCuts {
+	live: Timeline | null | undefined;
+	base?: Timeline | null;
+	proposed?: Timeline | null;
 }
 
-/** The changes that would be applied without being picked, and why — `{ id → because }`. Read off the live
- *  cut and the proposal; the backend's answer after the press is the authority. */
-export function comingAlong(
-	entries: readonly DiffEntry[],
-	picks: ReadonlySet<string>,
-	cuts: readonly (Timeline | null | undefined)[]
-): Map<string, string> {
+const NO_CUT: Timeline = { tracks: [] };
+
+/** The changes that would be applied without being picked, and why — `{ id → because }`. The same closure the
+ *  backend takes (`staged-subset.ts`'s `closeOver`, the port of `Timeline::merge_subset`), read off the cuts the
+ *  page has; the backend's answer after the press is the authority. */
+export function comingAlong(entries: readonly DiffEntry[], picks: ReadonlySet<string>, cuts: PickCuts): Map<string, string> {
 	const out = new Map<string, string>();
 	if (picks.size === 0) return out;
-	const links = cuts.map(linkOf);
-	const groupOf = (clip: string) => links.map((l) => l.get(clip)).find((g) => g !== undefined);
 	const ids = entries.map(entryId);
-	const chosen = new Set(ids.filter((id) => picks.has(id)));
-	for (let again = true; again; ) {
-		again = false;
-		entries.forEach((e, i) => {
-			if (!chosen.has(ids[i])) return;
-			if (e.clip_id) {
-				const group = groupOf(e.clip_id);
-				entries.forEach((f, j) => {
-					if (chosen.has(ids[j]) || !f.clip_id || f.clip_id === e.clip_id) return;
-					if (group !== undefined && groupOf(f.clip_id) === group) {
-						chosen.add(ids[j]);
-						out.set(ids[j], 'linked to a clip you picked — a picture and its sound go together');
-						again = true;
-					}
-				});
-			}
-			if ((e.kind === 'clip_added' || e.kind === 'clip_moved') && e.track_id) {
-				entries.forEach((f, j) => {
-					if (!chosen.has(ids[j]) && f.kind === 'track_added' && f.track_id === e.track_id) {
-						chosen.add(ids[j]);
-						out.set(ids[j], 'a clip you picked is on this new track');
-						again = true;
-					}
-				});
-			}
-		});
-	}
+	const chosen = new Set<number>();
+	ids.forEach((id, i) => picks.has(id) && chosen.add(i));
+	if (chosen.size === 0) return out;
+	const live = cuts.live ?? NO_CUT;
+	const base = cuts.base ?? live;
+	const proposed = cuts.proposed ?? live;
+	for (const [i, why] of closeOver(entries, chosen, [live, base, proposed], base)) out.set(ids[i], why);
 	return out;
 }
 

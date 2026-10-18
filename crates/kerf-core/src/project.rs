@@ -443,9 +443,12 @@ impl Project {
     /// project under the old epoch either.
     ///
     /// The **generation** moves too ([`Project::generation`]), and the app's agent-review setting
-    /// carries over: it belongs to the app, not to the file.
+    /// carries over: it belongs to the app, not to the file. A discarded proposal kept in `other`'s
+    /// file is dropped: it belongs to the session that discarded it, and a project that is opened
+    /// again is not offered a restore of something thrown away before.
     pub fn replace_with(&mut self, other: Project) {
         let generation = self.generation.wrapping_add(1);
+        let _ = other.forget_discarded();
         self.swap_in(other, generation);
     }
 
@@ -1044,6 +1047,32 @@ impl Project {
         })
     }
 
+    /// A relink asked about and not made: whether `new_path` could stand in for the asset `old`
+    /// ([`Project::relink_inputs`]) and what it would cost — the same probe as
+    /// [`Project::probe_relink`], so the same refusals, and [`RelinkProbe::keeps_analysis`] decides
+    /// as the real relink will. `has_analysis` is whether the asset has any
+    /// ([`Project::has_analysis`], read under the lock). Reads both files: **lock released**.
+    pub fn check_relink(old: &Asset, has_analysis: bool, new_path: &Path, cancel: &dyn Fn() -> bool) -> Result<RelinkCheck> {
+        let probe = Self::probe_relink(old, new_path, cancel)?;
+        Ok(RelinkCheck {
+            analysis_kept: probe.keeps_analysis(old),
+            has_analysis,
+        })
+    }
+
+    /// Whether the asset has analysis stored. Database only.
+    pub fn has_analysis(&self, asset_id: Uuid) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM analysis WHERE asset_id = ?1",
+                params![asset_id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
     /// The locked last step of a relink: `probe` is what [`Project::probe_relink`] made from the
     /// asset [`Project::relink_inputs`] returned, and nothing here touches a file.
     ///
@@ -1080,7 +1109,7 @@ impl Project {
             }
         }
         check_relink_compatible(&old, probed)?;
-        let keep = probe.same_file != Some(false) && same_media(&old, probed);
+        let keep = probe.keeps_analysis(&old);
 
         let mut asset = old.clone();
         asset.path = probed.path.clone();
@@ -1204,8 +1233,7 @@ impl Project {
             .meta(DISCARDED_STAGED)?
             .is_some_and(|saved| saved.contains(&asset_id.to_string()))
         {
-            self.conn
-                .execute("DELETE FROM meta WHERE key = ?1", params![DISCARDED_STAGED])?;
+            self.forget_discarded()?;
         }
         self.conn
             .execute("DELETE FROM assets WHERE id = ?1", params![asset_id.to_string()])?;
@@ -2631,6 +2659,7 @@ impl Project {
             self.apply_asset_change(change)?;
         }
         self.clear_staged()?;
+        self.forget_discarded()?;
         tx.commit()?;
         if diff.is_empty() {
             return self.timeline();
@@ -2705,6 +2734,7 @@ impl Project {
         for change in &applied_assets {
             self.apply_asset_change(change)?;
         }
+        self.forget_discarded()?;
         let remaining_assets: Vec<StagedAssetChange> =
             row.assets.iter().filter(|c| !asset_picks.contains(&&c.id)).cloned().collect();
         let merged: Timeline = serde_json::from_str(&merged_json)?;
@@ -2805,6 +2835,14 @@ impl Project {
         self.insert_asset(&asset)
     }
 
+    /// Drop the kept discarded proposal: a newer one was applied, or the project it belonged to is
+    /// no longer the one open, so bringing it back would read as an undo of something else.
+    fn forget_discarded(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = ?1", params![DISCARDED_STAGED])?;
+        Ok(())
+    }
+
     /// Empty the staged table. `WHERE 1` keeps SQLite from truncating it, which does not call the
     /// update hook the plan epoch is moved by.
     fn clear_staged(&self) -> Result<usize> {
@@ -2894,8 +2932,7 @@ impl Project {
             ],
         )?;
         self.conn.execute("DELETE FROM staged_undo WHERE 1", [])?;
-        self.conn
-            .execute("DELETE FROM meta WHERE key = ?1", params![DISCARDED_STAGED])?;
+        self.forget_discarded()?;
         tx.commit()?;
         self.staged()?.ok_or(Error::NoStagedEdit)
     }
@@ -7020,6 +7057,15 @@ pub struct Relinked {
     pub previous_path: String,
 }
 
+/// What [`Project::check_relink`] found: how a relink to a file would turn out, before it is made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct RelinkCheck {
+    /// The file is the old media moved, so the analysis would be kept ([`Relinked::analysis_kept`]).
+    pub analysis_kept: bool,
+    /// The asset has analysis to lose: when it has none, a different recording costs nothing.
+    pub has_analysis: bool,
+}
+
 /// What [`Project::remove_asset`] did.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RemovedAsset {
@@ -7041,6 +7087,14 @@ pub struct RelinkProbe {
     /// Whether the new file has the same bytes as the old, as far as could be told cheaply (size,
     /// then a hash of both ends): `None` when the old file is gone or either cannot be read.
     pub same_file: Option<bool>,
+}
+
+impl RelinkProbe {
+    /// Whether relinking `old` to this file keeps its analysis: the same media moved — same length
+    /// to the millisecond and streams, and, when the old file was there to compare, the same bytes.
+    pub fn keeps_analysis(&self, old: &Asset) -> bool {
+        self.same_file != Some(false) && same_media(old, &self.probed)
+    }
 }
 
 /// An asset and the file it points at: the input of [`Project::find_missing_assets`], which stats

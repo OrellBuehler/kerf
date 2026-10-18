@@ -56,6 +56,7 @@ import type {
 	Projection,
 	Reframe,
 	ReframeKeyframe,
+	RelinkCheck,
 	Relinked,
 	Revision,
 	AppSettings,
@@ -397,23 +398,23 @@ const snapshot = () => structuredClone(devTimeline);
 // ---- local edit history (browser dev fallback) ----------------------------
 // Mirrors kerf-core's snapshot history so undo/redo/revert work without Tauri.
 
-type DevRevision = { seq: number; label: string; source: EditSource; snapshot: Timeline };
+type DevRevision = { seq: number; label: string; source: EditSource; snapshot: Timeline; created_at: string };
 let devHistory: DevRevision[] = [
-	{ seq: 0, label: 'Initial state', source: 'system', snapshot: structuredClone(sampleTimeline) }
+	{ seq: 0, label: 'Initial state', source: 'system', snapshot: structuredClone(sampleTimeline), created_at: now() }
 ];
 let devHead = 0;
 
 if (wantsEmpty()) {
 	sampleAssets.length = 0;
 	devTimeline = { tracks: [{ id: 'v1', kind: 'video', name: 'V1', clips: [] }, { id: 'a1', kind: 'audio', name: 'A1', clips: [] }] };
-	devHistory = [{ seq: 0, label: 'Initial state', source: 'system', snapshot: structuredClone(devTimeline) }];
+	devHistory = [{ seq: 0, label: 'Initial state', source: 'system', snapshot: structuredClone(devTimeline), created_at: now() }];
 }
 
 /** Append a snapshot of the current dev timeline, dropping any redo branch. */
 function recordDev(label: string) {
 	devHistory = devHistory.slice(0, devHead + 1);
 	devHead += 1;
-	devHistory.push({ seq: devHead, label, source: 'user', snapshot: snapshot() });
+	devHistory.push({ seq: devHead, label, source: 'user', snapshot: snapshot(), created_at: now() });
 }
 
 function devRestore(seq: number): Timeline {
@@ -632,6 +633,30 @@ export async function removeAsset(assetId: string, force = false): Promise<Asset
 const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'tiff', 'tif', 'insp'];
 const SOUND_EXTENSIONS = ['wav', 'mp3', 'm4a', 'aac'];
 
+/** What the harness judges a relink by: the file's name and extension. Throws what the backend refuses with. */
+function harnessRelinkPlan(assetId: string, newPath: string) {
+	const asset = assetById(assetId);
+	if (!asset) throw new Error(`asset not found: ${assetId}`);
+	if (!newPath.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(newPath)) {
+		throw new Error(`invalid argument: ${newPath} must be an absolute path to a file`);
+	}
+	const ext = newPath.split('.').pop()?.toLowerCase() ?? '';
+	const image = IMAGE_EXTENSIONS.includes(ext);
+	const sound = SOUND_EXTENSIONS.includes(ext);
+	const had = { video: asset.streams.some((s) => s.kind === 'video'), audio: asset.streams.some((s) => s.kind === 'audio') };
+	const is = { video: !image && !sound, audio: sound || (!image && had.audio) };
+	const describe = (image: boolean, video: boolean, audio: boolean) =>
+		image ? 'a still image' : video && audio ? 'picture and sound' : video ? 'picture only' : audio ? 'sound only' : 'no audio or video';
+	if (image || is.video !== had.video || is.audio !== had.audio) {
+		throw new Error(
+			`invalid argument: that file is ${describe(image, is.video, is.audio)} but "${asset.name}" is ${describe(false, had.video, had.audio)} — pick the same media`
+		);
+	}
+	const other = sampleAssets.find((a) => a.path === newPath && a.id !== assetId);
+	if (other) throw new Error(`invalid argument: ${newPath} is already in the library as "${other.name}"`);
+	return { asset, sameMedia: baseName(newPath) === baseName(asset.path) };
+}
+
 /**
  * Point an asset at another file: the media was moved, renamed or restored from a backup. The file must be
  * the same kind of media (same streams, about the same length); the asset keeps its id, its place in the
@@ -641,33 +666,27 @@ const SOUND_EXTENSIONS = ['wav', 'mp3', 'm4a', 'aac'];
  */
 export async function relinkAsset(assetId: string, newPath: string): Promise<Relinked> {
 	if (!inTauri()) {
-		const asset = assetById(assetId);
-		if (!asset) throw new Error(`asset not found: ${assetId}`);
-		if (!newPath.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(newPath)) {
-			throw new Error(`invalid argument: ${newPath} must be an absolute path to a file`);
-		}
-		const ext = newPath.split('.').pop()?.toLowerCase() ?? '';
-		const image = IMAGE_EXTENSIONS.includes(ext);
-		const sound = SOUND_EXTENSIONS.includes(ext);
-		const had = { video: asset.streams.some((s) => s.kind === 'video'), audio: asset.streams.some((s) => s.kind === 'audio') };
-		const is = { video: !image && !sound, audio: sound || (!image && had.audio) };
-		const describe = (image: boolean, video: boolean, audio: boolean) =>
-			image ? 'a still image' : video && audio ? 'picture and sound' : video ? 'picture only' : audio ? 'sound only' : 'no audio or video';
-		if (image || is.video !== had.video || is.audio !== had.audio) {
-			throw new Error(
-				`invalid argument: that file is ${describe(image, is.video, is.audio)} but "${asset.name}" is ${describe(false, had.video, had.audio)} — pick the same media`
-			);
-		}
-		const other = sampleAssets.find((a) => a.path === newPath && a.id !== assetId);
-		if (other) throw new Error(`invalid argument: ${newPath} is already in the library as "${other.name}"`);
+		const { asset, sameMedia } = harnessRelinkPlan(assetId, newPath);
 		const previous = asset.path;
-		const sameMedia = baseName(newPath) === baseName(previous);
 		asset.path = newPath;
 		devMissing.delete(assetId);
 		if (!sameMedia) delete sampleAnalysis[assetId];
 		return { asset: structuredClone(asset), analysis_kept: sameMedia, previous_path: previous };
 	}
 	return invoke<Relinked>('relink_asset', { assetId, newPath });
+}
+
+/**
+ * What `relinkAsset` to this file would cost, asked first and changing nothing: the same refusals (the file is not
+ * the same kind of media, is taken, is not there), and whether the asset's analysis would survive
+ * (`analysis_kept`) and whether it has any to lose (`has_analysis`). Reads both files in the desktop app.
+ */
+export async function checkRelink(assetId: string, newPath: string): Promise<RelinkCheck> {
+	if (!inTauri()) {
+		const { sameMedia } = harnessRelinkPlan(assetId, newPath);
+		return { analysis_kept: sameMedia, has_analysis: !!sampleAnalysis[assetId] };
+	}
+	return invoke<RelinkCheck>('check_relink', { assetId, newPath });
 }
 
 /** The assets whose source file is no longer on disk, each with how many clips of the cut use it — what a
@@ -687,9 +706,13 @@ export async function missingAssets(): Promise<MissingAsset[]> {
 }
 
 /** Open a native file picker for the file to relink `name` to (media files only); `null` if cancelled. The
- *  browser harness has no file system and answers with a plausible restored path. */
+ *  browser harness has no file system and answers with a plausible restored path (`?relinkto=other.mp4` names a
+ *  different file, to see what relinking to another recording asks). */
 export async function pickRelinkPath(name?: string): Promise<string | null> {
-	if (!inTauri()) return `/restored/${name ?? 'media.mp4'}`;
+	if (!inTauri()) {
+		const to = typeof window === 'undefined' ? null : new URLSearchParams(window.location.search).get('relinkto');
+		return `/restored/${to ?? name ?? 'media.mp4'}`;
+	}
 	const { open } = await import('@tauri-apps/plugin-dialog');
 	const selected = await open({
 		multiple: false,
@@ -3138,7 +3161,7 @@ export async function getHistory(limit?: number, offset?: number): Promise<Revis
 				seq: r.seq,
 				label: r.label,
 				source: r.source,
-				created_at: new Date().toISOString(),
+				created_at: r.created_at,
 				current: r.seq === devHead
 			})),
 			limit,
@@ -3994,13 +4017,19 @@ function applyHarnessAgentSettings(patch: SettingsPatch) {
 	if (Object.keys(next).length > 0) void setMcpSettings(next).catch(() => {});
 }
 
+/** `?tokenproblem=1` seeds the warning the Agent page shows when the token could not be kept. */
+function harnessTokenProblem(): string | null {
+	if (typeof window === 'undefined' || !new URLSearchParams(window.location.search).has('tokenproblem')) return null;
+	return 'The token could not be saved (permission denied). It works until Kerf quits; the next start makes a new one.';
+}
+
 function harnessMcpInfo(next: Partial<McpConnectionInfo>): McpConnectionInfo {
 	const base: McpConnectionInfo = harnessMcp ?? {
 		enabled: true,
 		url: 'http://127.0.0.1:7777/mcp',
 		require_token: true,
 		token: harnessToken(),
-		token_problem: null,
+		token_problem: harnessTokenProblem(),
 		running: true,
 		error: null,
 		configured_addr: null,

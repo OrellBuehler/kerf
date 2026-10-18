@@ -26,12 +26,14 @@ const calls: string[] = [];
 let stagedNow: StagedEdit | null = staged();
 let applyFails: string | null = null;
 let stagedReads: (() => Promise<StagedEdit | null>)[] = [];
+let discardedReads: (() => Promise<StagedEdit | null>)[] = [];
 
 const backend = () => ({
 	...real,
 	getTimeline: async () => structuredClone(live),
 	getStagedEdit: async () => (stagedReads.length > 0 ? stagedReads.shift()!() : stagedNow && structuredClone(stagedNow)),
 	getStagedTimeline: async () => (stagedNow ? structuredClone(proposed) : null),
+	discardedStagedEdit: async () => (discardedReads.length > 0 ? discardedReads.shift()!() : null),
 	applyStagedEdit: async () => {
 		calls.push('apply');
 		if (applyFails) throw new Error(applyFails);
@@ -65,6 +67,7 @@ beforeEach(async () => {
 	stagedNow = staged();
 	applyFails = null;
 	stagedReads = [];
+	discardedReads = [];
 	exporting = Promise.resolve('/out.mp4');
 	await editor.load();
 	editor.error = null;
@@ -237,6 +240,68 @@ describe('reading the proposal', () => {
 		await reading;
 		expect(editor.previewingStaged).toBe(false);
 		expect(editor.timeline.tracks[0].clips[0].source_out).toBe(10);
+	});
+});
+
+describe('the proposal that was thrown away', () => {
+	const kept = (): StagedEdit => ({ ...staged(2), stale: false });
+
+	test('is offered while nothing is open, and not once another proposal is', async () => {
+		stagedNow = null;
+		discardedReads = [async () => kept()];
+		await editor.refreshStaged();
+		expect(editor.discarded?.diff.entries.length).toBe(2);
+		stagedNow = staged();
+		await editor.refreshStaged();
+		expect(editor.discarded).toBeNull();
+	});
+
+	test('is not offered on a read that failed, as a card that may be stale is worse than none', async () => {
+		stagedNow = null;
+		discardedReads = [async () => kept()];
+		await editor.refreshStaged();
+		expect(editor.discarded).not.toBeNull();
+		discardedReads = [() => Promise.reject(new Error('busy'))];
+		await editor.refreshStaged();
+		expect(editor.discarded).toBeNull();
+	});
+
+	test('is not put back by a read that was out while a proposal opened', async () => {
+		stagedNow = null;
+		let release!: (v: StagedEdit | null) => void;
+		discardedReads = [() => new Promise<StagedEdit | null>((r) => (release = r))];
+		const reading = editor.refreshStaged();
+		await Promise.resolve();
+		await Promise.resolve();
+		stagedNow = staged();
+		await editor.refreshStaged();
+		release(kept());
+		await reading;
+		expect(editor.discarded).toBeNull();
+	});
+
+	test('is not put back by a read that was out while another project loaded', async () => {
+		stagedNow = null;
+		let release!: (v: StagedEdit | null) => void;
+		discardedReads = [() => new Promise<StagedEdit | null>((r) => (release = r))];
+		const reading = editor.refreshStaged();
+		await Promise.resolve();
+		await Promise.resolve();
+		await editor.load();
+		release(kept());
+		await reading;
+		expect(editor.discarded).toBeNull();
+	});
+});
+
+describe('an edit while a discarded proposal waits', () => {
+	test('re-reads it, so a restore knows it would bring back an older cut', async () => {
+		stagedNow = null;
+		discardedReads = [async () => ({ ...staged(2), stale: false }), async () => ({ ...staged(2), stale: true })];
+		await editor.refreshStaged();
+		expect(editor.discarded?.stale).toBe(false);
+		await editor.split('c1', 3);
+		expect(editor.discarded?.stale).toBe(true);
 	});
 });
 

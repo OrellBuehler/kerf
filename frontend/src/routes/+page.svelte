@@ -285,7 +285,7 @@
 					// unsaved work unless the agent was told to).
 					await listen('project-replaced', () => void onProjectReplaced()),
 					// An agent changed a setting (MCP `set_settings`): the dialog and everything backed by one follows.
-					await listen<SettingsView>('settings-changed', (e) => settings.noteChanged(e.payload)),
+					await listen<SettingsView | null>('settings-changed', (e) => settings.noteChanged(e.payload)),
 					// Likewise the ripple flag: an agent that flips it changes what
 					// the user's next trim or delete does, so the toolbar has to say.
 					await listen('ripple-mode-changed', () => void onRippleChanged())

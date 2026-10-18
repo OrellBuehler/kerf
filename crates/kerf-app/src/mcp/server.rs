@@ -417,11 +417,19 @@ pub fn generic_json_config(url: &str, token: Option<&str>, require_token: bool) 
     serde_json::to_string_pretty(&serde_json::json!({ "mcpServers": { "kerf": server } })).unwrap_or_default()
 }
 
+/// Whether the listener is up and what stopped it, for the address now configured. The status is for
+/// the address the supervisor last started on: until it has restarted for a new one, that listener
+/// (or its error) is the old address's and says nothing about this one.
+fn listener_state(state: &Status, addr: &str) -> (bool, Option<String>) {
+    let current = state.addr.as_deref() == Some(addr);
+    (state.running && current, state.error.clone().filter(|_| current))
+}
+
 /// The connection details for `settings`, with whether the server is up now.
 pub fn connection_info(settings: &Settings) -> ConnectionInfo {
     let config = McpConfig::from_settings(settings);
     let url = client_url(&config.addr);
-    let state = status();
+    let (running, error) = listener_state(&status(), &config.addr);
     ConnectionInfo {
         enabled: config.enabled,
         claude_code_command: claude_code_command(&url, config.token.as_deref(), config.require_token),
@@ -430,8 +438,8 @@ pub fn connection_info(settings: &Settings) -> ConnectionInfo {
         require_token: config.require_token,
         token: config.token,
         token_problem: token_problem(),
-        running: state.running,
-        error: state.error,
+        running,
+        error,
         configured_addr: settings.mcp_addr.clone(),
         env_override: env_override(),
         agent_review: settings.agent_review,
@@ -711,6 +719,33 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_listener_is_only_reported_up_for_the_address_it_was_started_on() {
+        let up = Status {
+            running: true,
+            error: None,
+            addr: Some("127.0.0.1:7777".into()),
+        };
+        assert_eq!(listener_state(&up, "127.0.0.1:7777"), (true, None));
+        assert_eq!(
+            listener_state(&up, "127.0.0.1:9000"),
+            (false, None),
+            "not yet restarted for the new one"
+        );
+        let failed = Status {
+            running: false,
+            error: Some("in use".into()),
+            addr: Some("127.0.0.1:7777".into()),
+        };
+        assert_eq!(listener_state(&failed, "127.0.0.1:7777"), (false, Some("in use".into())));
+        assert_eq!(
+            listener_state(&failed, "127.0.0.1:9000"),
+            (false, None),
+            "the old address's error is not this one's"
+        );
+        assert_eq!(listener_state(&Status::default(), "127.0.0.1:7777"), (false, None));
+    }
 
     #[test]
     fn loopback_binds_keep_the_default_allow_list() {

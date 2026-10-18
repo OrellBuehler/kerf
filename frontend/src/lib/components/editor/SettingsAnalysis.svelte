@@ -1,5 +1,6 @@
 <script lang="ts">
 	import SettingRow from './SettingRow.svelte';
+	import Switch from './Switch.svelte';
 	import Btn from './Btn.svelte';
 	import ProgressBar from './ProgressBar.svelte';
 	import { settings } from '$lib/settings.svelte';
@@ -101,32 +102,28 @@
 	}
 </script>
 
-<SettingRow id="analyze-on-import" label="Analyze new media when it is imported">
+<SettingRow id="analyze-on-import" for="sw-auto-analysis" label="Analyze new media when it is imported">
 	{#snippet hint()}
 		Each pass reads the whole file, one clip at a time, behind any preview proxy that is being built. Off, nothing runs
 		by itself — right-click a clip in the bin and pick what to analyze.
 	{/snippet}
-	<input
-		type="checkbox"
-		role="switch"
-		aria-label="Analyze new media when it is imported"
-		data-testid="auto-analysis-master"
+	<Switch
+		id="sw-auto-analysis"
+		label="Analyze new media when it is imported"
+		testid="auto-analysis-master"
 		checked={settings.autoAnalysis.enabled}
-		onchange={(e) => void settings.setAutoAnalysis({ enabled: e.currentTarget.checked })}
-		style="accent-color:var(--kerf-500);cursor:pointer;width:16px;height:16px"
+		onchange={(on) => void settings.setAutoAnalysis({ enabled: on })}
 	/>
 </SettingRow>
 
 {#each ANALYSIS_KINDS as k (k.kind)}
-	<SettingRow id="analyze-{k.kind}" label="{k.label} on import" hint={KIND_HELP[k.kind]}>
-		<input
-			type="checkbox"
-			role="switch"
-			aria-label="{k.label} on import"
-			data-testid="auto-analysis-{k.kind}"
+	<SettingRow id="analyze-{k.kind}" for="sw-analyze-{k.kind}" label="{k.label} on import" hint={KIND_HELP[k.kind]}>
+		<Switch
+			id="sw-analyze-{k.kind}"
+			label="{k.label} on import"
+			testid="auto-analysis-{k.kind}"
 			checked={settings.autoAnalysis[k.kind]}
-			onchange={(e) => void settings.setAutoKind(k.kind, e.currentTarget.checked)}
-			style="accent-color:var(--kerf-500);cursor:pointer;width:16px;height:16px"
+			onchange={(on) => void settings.setAutoKind(k.kind, on)}
 		/>
 	</SettingRow>
 {/each}

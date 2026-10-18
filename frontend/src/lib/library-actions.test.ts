@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { clipsUsing, missingLine, relinkLine, removedLine } from './library-copy';
+import { clipsUsing, missingLine, relinkIntro, relinkLine, removedLine } from './library-copy';
 import { overwriteCopy, removeMediaCopy } from './confirm-copy';
 import type { Timeline } from './types';
 
@@ -30,6 +30,17 @@ describe('the words', () => {
 		expect(missingLine([])).toBe('');
 		expect(missingLine([{ name: 'broll.mp4' }])).toBe('broll.mp4 can’t be found');
 		expect(missingLine([{ name: 'a' }, { name: 'b' }])).toBe('2 media files can’t be found');
+	});
+
+	test('the dialog speaks of one file in the singular and of several in the plural', () => {
+		expect(relinkIntro([])).toBe('');
+		const one = relinkIntro([{ name: 'broll.mp4' }]);
+		expect(one).toStartWith('broll.mp4 can’t be found. It was moved, renamed or is on a drive');
+		expect(one).toContain('Point it at the file it has become — the clips cut from it stay');
+		expect(one).not.toMatch(/\b(They were|each|them)\b/);
+		const many = relinkIntro([{ name: 'a' }, { name: 'b' }]);
+		expect(many).toStartWith('2 media files can’t be found. They were moved, renamed or are on a drive');
+		expect(many).toContain('Point each at the file it has become — the clips cut from them stay');
 	});
 
 	test('a removal names the clips that went with it', () => {

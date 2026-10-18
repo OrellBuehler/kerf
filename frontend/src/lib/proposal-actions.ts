@@ -48,8 +48,11 @@ export async function discardProposal(): Promise<boolean> {
 	}
 }
 
-/** Bring the proposal that was thrown away back (the toast's Undo, the Agent panel's Restore). */
+/** Bring the proposal that was thrown away back (the toast's Undo, the Agent panel's Restore). One from before the
+ *  cut was edited asks first: it comes back as a stale proposal, which only a forced apply can land. */
 export async function restoreProposal(): Promise<boolean> {
+	const c = CONFIRM.restoreStale;
+	if (editor.discarded?.stale && !(await confirmAction(c.message, c.title, c))) return false;
 	try {
 		await editor.restoreDiscarded();
 		toast.success('Brought the proposed changes back');

@@ -2,7 +2,6 @@ import { describe, expect, test } from 'bun:test';
 import {
 	clampSeconds,
 	DEFAULT_EDITING,
-	isDefaultEditing,
 	LENGTH_RANGE,
 	parseEditing,
 	placementOut,
@@ -35,9 +34,8 @@ describe('parseEditing', () => {
 });
 
 describe('the defaults', () => {
-	test('know when they are the defaults', () => {
-		expect(isDefaultEditing(DEFAULT_EDITING)).toBe(true);
-		expect(isDefaultEditing({ ...DEFAULT_EDITING, title_seconds: 4 })).toBe(false);
+	test('read as seconds', () => {
+		expect(DEFAULT_EDITING.still_seconds).toBe(5);
 		expect(secondsLabel(5)).toBe('5 s');
 		expect(secondsLabel(2.5)).toBe('2.5 s');
 	});

@@ -22,6 +22,15 @@ export function missingLine(list: readonly Pick<MissingAsset, 'name'>[]): string
 	return `${list.length} media files can’t be found`;
 }
 
+/** The paragraph over the Relink dialog's list, for one missing file or several. */
+export function relinkIntro(list: readonly Pick<MissingAsset, 'name'>[]): string {
+	if (list.length === 0) return '';
+	const one = list.length === 1;
+	return `${missingLine(list)}. ${one ? 'It was' : 'They were'} moved, renamed or ${one ? 'is' : 'are'} on a drive that is not connected. Point ${
+		one ? 'it' : 'each'
+	} at the file it has become — the clips cut from ${one ? 'it' : 'them'} stay exactly as they are — or take it out of the project. Nothing is deleted from disk either way.`;
+}
+
 /** What removing says it did. */
 export function removedLine(name: string, clipsRemoved: number): string {
 	return clipsRemoved > 0 ? `Removed ${name} and ${clipsRemoved} ${clipsRemoved === 1 ? 'clip' : 'clips'}` : `Removed ${name}`;

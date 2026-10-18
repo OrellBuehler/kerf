@@ -195,6 +195,15 @@ describe('history and task paging', () => {
 	});
 });
 
+describe('the harness history', () => {
+	test('keeps the time each edit was made, so reading it twice gives the same answer', async () => {
+		const first = await api.getHistory();
+		await new Promise((r) => setTimeout(r, 5));
+		expect(await api.getHistory()).toEqual(first);
+		expect(await api.getHistory(1)).toEqual([first[first.length - 1]]);
+	});
+});
+
 describe('recent projects and paths', () => {
 	test('the harness seeds a list and clears it', async () => {
 		const recent = await api.recentProjects();

@@ -1,8 +1,8 @@
 // Taking media out of the project and pointing it at another file — what the bin's menu, the Inspector and the
 // Relink dialog all do, so each asks the same questions and says the same thing afterwards.
 
-import { confirmAction, getStagedTimeline, pickRelinkPath } from './api';
-import { removeMediaCopy } from './confirm-copy';
+import { checkRelink, confirmAction, getStagedTimeline, pickRelinkPath } from './api';
+import { relinkDropsAnalysisCopy, removeMediaCopy } from './confirm-copy';
 import { editor } from './state.svelte';
 import { ui } from './editor-ui.svelte';
 import { mediaStatus } from './media-status.svelte';
@@ -38,11 +38,18 @@ export async function removeMediaFlow(asset: Asset): Promise<boolean> {
 	}
 }
 
-/** Pick the file `asset` has moved to and link it. Resolves to whether it was relinked. */
+/** Pick the file `asset` has moved to and link it. A file that is a different recording of it drops the asset's
+ *  analysis, which is asked about first (the backend's dry run says so, and refuses a file that cannot stand in
+ *  for it before anything is asked). Resolves to whether it was relinked. */
 export async function relinkMediaFlow(asset: Pick<Asset, 'id' | 'name'>): Promise<boolean> {
 	const path = await pickRelinkPath(asset.name);
 	if (!path) return false;
 	try {
+		const check = await checkRelink(asset.id, path);
+		if (check.has_analysis && !check.analysis_kept) {
+			const c = relinkDropsAnalysisCopy(asset.name);
+			if (!(await confirmAction(c.message, c.title, c))) return false;
+		}
 		const done = await editor.relinkMedia(asset.id, path);
 		thumbnails.forget(asset.id);
 		await mediaStatus.refresh();

@@ -56,7 +56,9 @@
   file is gone) → `apply_relink_probed(id, &RelinkProbe)` (no file touched; refused when the entry's
   path is no longer the one probed against, "try again"); `relink_asset(id, path)` is all three plus
   `forget_media_caches`, and `apply_relink(id, &Asset)` (an already-probed asset, stat-only size
-  compare) stays as the pre-split shape. Same kinds of stream, length within
+  compare) stays as the pre-split shape. **`Project::check_relink(&old, has_analysis, path, cancel)`** is the dry run
+  (`probe_relink` + `RelinkProbe::keeps_analysis(&old)`, the rule the real relink applies) → `RelinkCheck
+  {analysis_kept, has_analysis}`; `has_analysis(id)` is the locked read. Same kinds of stream, length within
   `RELINK_DURATION_TOLERANCE` s or 1 %; **analysis is kept only for the same media moved** — same
   length to the millisecond, same streams, and, when the old file was there to compare, the same size
   *and* ends (an old file that is gone leaves length + streams to decide); otherwise it is dropped. A
@@ -220,7 +222,9 @@
   back — only with no proposal open (`StagedEditPending`), once, possibly `stale`, with no undo
   history, owned by no session when the user restores it, with its task dropped if that was
   dismissed. **Who discarded it is kept** (`discarded_by_user` in the stored row): an agent may bring back
-  only a proposal an agent discarded — one the user threw away stays thrown away unless the user restores it. An empty proposal is not kept and does not replace one that is. The `staged` table
+  only a proposal an agent discarded — one the user threw away stays thrown away unless the user restores it. An empty proposal is not kept and does not replace one that is. **The kept copy is dropped when it can only mislead**: when a newer proposal is
+  really applied (`apply_staged`, `apply_staged_subset`; a session that changed nothing closing is not one), and when the project
+  is replaced (`replace_with` — an open or new project; `replace_with_saved_copy`, Save As, keeps it). The `staged` table
   gained `owner` and `assets` (added by `init`'s probe-and-`ALTER`, like `voiceover`; an older
   file's open proposal loads with no owner and no asset changes).
   `plan_music_fit(clip, target)` / `fit_music(clip, target, fade_out)` fit a music clip on

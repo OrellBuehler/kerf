@@ -85,6 +85,15 @@ export function plainCopy<T>(v: T): T {
 }
 
 const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
+/** The backend names its parameters (`source_out`); a person typing in the Inspector knows them as In, Out and Start. */
+function plainParams(message: string): string {
+	return message
+		.replace(/\bsource_in\b/g, 'the in point')
+		.replace(/\bsource_out\b/g, 'the out point')
+		.replace(/\btimeline_start\b/g, 'the start')
+		.replace(/ must be >= 0/g, ' can’t be negative');
+}
 const messageOf = (e: unknown) =>
 	gestureReason((e instanceof Error ? e.message : String(e)).replace(/^invalid argument: /, ''));
 
@@ -131,7 +140,7 @@ export function trimRefusal(
 		);
 		return null;
 	} catch (e) {
-		return capital((e instanceof Error ? e.message : String(e)).replace(/^invalid argument: /, ''));
+		return capital(plainParams((e instanceof Error ? e.message : String(e)).replace(/^invalid argument: /, '')));
 	}
 }
 

@@ -59,7 +59,7 @@ import {
 	type ResetPlan,
 	type Resolution
 } from './keymap';
-import type { AnalysisKind, AppSettings, AutoAnalysis, PreviewSource, ProxySize, SettingsView, TimeDisplay } from './types';
+import type { AnalysisKind, AutoAnalysis, PreviewSource, ProxySize, SettingsPatch, SettingsView, TimeDisplay } from './types';
 import type { TipSpec } from './tip';
 
 /** The named budgets. The slider still offers everything in between; these are
@@ -234,9 +234,11 @@ class SettingsStore {
 		this.loaded = true;
 	}
 
-	/** The settings changed behind our back (the `settings-changed` event, with the view in force): take them. */
-	noteChanged(view: SettingsView) {
-		this.absorb(view);
+	/** The settings changed behind our back (the `settings-changed` event, with the view in force): take them.
+	 *  An event without the view reads them again. */
+	noteChanged(view: SettingsView | null | undefined) {
+		if (view && typeof view === 'object') this.absorb(view);
+		else void this.load();
 		this.externalChanges++;
 		void ui.loadTranscriptionStatus();
 		void mediaStatus.refresh();
@@ -256,7 +258,7 @@ class SettingsStore {
 		}
 	}
 
-	private async write(patch: Partial<AppSettings>, what: string): Promise<boolean> {
+	private async write(patch: SettingsPatch, what: string): Promise<boolean> {
 		this.saving = true;
 		try {
 			this.absorb(await setSettings(patch));

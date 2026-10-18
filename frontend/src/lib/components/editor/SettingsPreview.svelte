@@ -1,5 +1,6 @@
 <script lang="ts">
 	import SettingRow from './SettingRow.svelte';
+	import Switch from './Switch.svelte';
 	import ChoiceChips from './ChoiceChips.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { gpuPreview } from '$lib/gpu-preview.svelte';
@@ -51,24 +52,22 @@
 	/>
 </SettingRow>
 
-<SettingRow id="safe-areas" label="Shade the safe areas over the preview">
+<SettingRow id="safe-areas" for="sw-safe-areas" label="Shade the safe areas over the preview">
 	{#snippet hint()}
 		Where a phone's own interface covers a vertical or square cut: the status strip at the top, the caption rail along
 		the bottom and the action buttons on the right, plus a title-safe box inset from every edge. Keep faces and text out
 		of the shaded zones. A guide only — nothing is cropped, and a 16:9 project draws none. The preview's right-click
 		menu toggles the same setting.
 	{/snippet}
-	<input
-		type="checkbox"
-		role="switch"
-		aria-label="Shade the safe areas over the preview"
+	<Switch
+		id="sw-safe-areas"
+		label="Shade the safe areas over the preview"
 		checked={settings.safeAreas}
-		onchange={(e) => void settings.setSafeAreas(e.currentTarget.checked)}
-		style="accent-color:var(--kerf-500);cursor:pointer;width:16px;height:16px"
+		onchange={(on) => void settings.setSafeAreas(on)}
 	/>
 </SettingRow>
 
-<SettingRow id="gpu-preview" label="GPU preview (experimental)">
+<SettingRow id="gpu-preview" for="sw-gpu-preview" label="GPU preview (experimental)">
 	{#snippet hint()}
 		Draws frames the GPU compositor can render exactly in a native surface instead of FFmpeg's JPEG, including fades,
 		dissolves, dips, slides and pushes. Anything it can't draw, such as an unsupported effect or a dip to white it
@@ -102,12 +101,10 @@
 			</span>
 		{/if}
 	{/snippet}
-	<input
-		type="checkbox"
-		role="switch"
-		aria-label="Draw the preview on the GPU"
+	<Switch
+		id="sw-gpu-preview"
+		label="Draw the preview on the GPU"
 		checked={settings.gpuPreview}
-		onchange={(e) => void settings.setGpuPreview(e.currentTarget.checked)}
-		style="accent-color:var(--kerf-500);cursor:pointer;width:16px;height:16px"
+		onchange={(on) => void settings.setGpuPreview(on)}
 	/>
 </SettingRow>

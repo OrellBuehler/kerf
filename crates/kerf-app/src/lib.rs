@@ -26,10 +26,10 @@ use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
     ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, ImportSummary, Keyframe, Levels,
-    Mask, MissingAsset, Page, Project, Projection, Property, PropertyKey, ReframeKeyframe, Relinked, RemovedAsset, Revision,
-    SplitSide, StagedEdit, StreamKind, SubsetApplied, SvgCheck, SvgLayout, SvgOverlayPatch, SvgPresetInfo, SvgPresetKind,
-    SvgPresetParams, SvgSource, Task, TextKeyframe, TimeRange, Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect,
-    WaveformRange,
+    Mask, MissingAsset, Page, Project, Projection, Property, PropertyKey, ReframeKeyframe, RelinkCheck, Relinked, RemovedAsset,
+    Revision, SplitSide, StagedEdit, StreamKind, SubsetApplied, SvgCheck, SvgLayout, SvgOverlayPatch, SvgPresetInfo,
+    SvgPresetKind, SvgPresetParams, SvgSource, Task, TextKeyframe, TimeRange, Timeline, TimelineDiff, Transition, TransitionKind,
+    VideoEffect, WaveformRange,
 };
 
 use serde::Serialize;
@@ -477,6 +477,31 @@ async fn relink_asset(app: AppHandle, state: State<'_, AppState>, asset_id: Stri
         spawn_proxy(&app, &relinked.asset);
         let _ = app.emit("proxy-ready", ());
         Ok(relinked)
+    })
+    .await
+}
+
+/// What a relink to `new_path` would cost, asked before it is made: the same probe and the same
+/// refusals as `relink_asset` (the lock released while both files are read), and nothing is
+/// changed. `analysis_kept` says whether the file is the old media moved; `has_analysis` whether
+/// the asset has any analysis to lose, so the prompt stays quiet when a different file costs nothing.
+#[tauri::command]
+async fn check_relink(state: State<'_, AppState>, asset_id: String, new_path: String) -> CmdResult<RelinkCheck> {
+    let asset_id = id(&asset_id, "asset_id")?;
+    let shared = state.project.clone();
+    let cancelled = state.import_stop.begin();
+    blocking(move || {
+        let (old, has_analysis) = {
+            let project = lock_user(&shared);
+            (
+                project.relink_inputs(asset_id).map_err(|e| e.to_string())?,
+                project.has_analysis(asset_id).map_err(|e| e.to_string())?,
+            )
+        };
+        Project::check_relink(&old, has_analysis, std::path::Path::new(&new_path), &cancelled).map_err(|e| match e {
+            kerf_core::Error::Cancelled => RELINK_CANCELLED.to_string(),
+            other => other.to_string(),
+        })
     })
     .await
 }
@@ -4221,6 +4246,7 @@ pub fn run() {
             clear_recent_projects,
             remove_asset,
             relink_asset,
+            check_relink,
             missing_assets,
             paths_exist,
             import_asset,

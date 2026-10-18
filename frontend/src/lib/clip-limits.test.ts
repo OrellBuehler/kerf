@@ -178,10 +178,19 @@ describe('trimRefusal', () => {
 	test('answers with the backend sentence, or null when the trim goes through', () => {
 		const t = cut();
 		const world = { ripple: false, assets: [ASSET] };
-		expect(trimRefusal(t, world, 'c2', undefined, 61)).toMatch(/^Source_out 61\.000 s is past the end of "av\.mp4"/);
+		expect(trimRefusal(t, world, 'c2', undefined, 61)).toMatch(/^The out point 61\.000 s is past the end of "av\.mp4"/);
 		expect(trimRefusal(t, world, 'c1', undefined, 12)).toMatch(/overlap another clip on V1/);
 		expect(trimRefusal(t, { ...world, ripple: true }, 'c1', undefined, 12)).toBeNull();
 		expect(trimRefusal(t, world, 'c1', undefined, 8)).toBeNull();
 		expect(t).toEqual(cut());
+	});
+
+	test('names the fields as the Inspector does, never as the backend’s parameters', () => {
+		const t = cut();
+		const world = { ripple: false, assets: [ASSET] };
+		const said = [trimRefusal(t, world, 'c1', -1), trimRefusal(t, world, 'c1', undefined, 61), trimRefusal(t, world, 'c1', 5, 4)];
+		expect(said[0]).toBe('The in point can’t be negative');
+		expect(said[2]).toBe('The out point must be greater than the in point');
+		for (const m of said) expect(m).not.toMatch(/source_|timeline_start/);
 	});
 });

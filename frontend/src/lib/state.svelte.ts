@@ -682,12 +682,16 @@ class EditorState {
 		this.staged = next;
 		if (!next) {
 			if (this.previewingStaged) await this.exitStagedPreview();
-			// A proposal that was thrown away can be brought back; ask what, if anything, is waiting.
+			// A proposal that was thrown away can be brought back; ask what, if anything, is waiting. A read that
+			// fails offers nothing (a card that may be a stale one is worse), and one that was overtaken while it
+			// was out — a project loaded, a proposal opened or settled — is not what is waiting now.
+			let waiting: StagedEdit | null = null;
 			try {
-				this.discarded = await discardedStagedEdit();
+				waiting = await discardedStagedEdit();
 			} catch {
 				/* nothing to restore */
 			}
+			if (this.#stagedOrder.isLatest(ticket)) this.discarded = waiting;
 			return;
 		}
 		this.discarded = null;
@@ -917,8 +921,9 @@ class EditorState {
 			this.#setTimeline(tl);
 			await this.refreshHistory();
 			// The proposal's `stale` flag is the backend's, and an edit just flipped it: re-read it, so the review
-			// says "you have edited since" now and not only when the agent next stages something.
-			if (this.staged && !o.review) await this.refreshStaged();
+			// says "you have edited since" now and not only when the agent next stages something. The same for a
+			// discarded one waiting to be restored, which an edit makes a restore of an older cut.
+			if ((this.staged || this.discarded) && !o.review) await this.refreshStaged();
 		} catch (e) {
 			throw e instanceof EditRefused ? e : new EditRefused(this.#msg(e), e);
 		} finally {
