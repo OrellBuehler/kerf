@@ -258,7 +258,10 @@ naming a key its tool's `input_schema` does not list (`mcp/args.rs`) as invalid 
 an unknown key, so `trim { rippel: false }` used to trim with the project's mode and report
 success. The accepted set follows `allOf` / `anyOf` / `oneOf` and local `$ref`s (a
 `#[serde(flatten)]` struct or enum), and a schema with `additionalProperties` (a flattened
-map) accepts anything. Every tool has a `title` and the four hints from the table in
+map) accepts anything. Only **top-level** keys are checked; keys inside a nested object
+(`export`'s `options`, a `moves` entry) are still dropped by serde. schemars does not list
+`#[serde(alias)]` names, so the check would refuse them: parameter structs take no alias
+(`mcp_parameters_take_no_serde_alias` scans `mcp.rs`). Every tool has a `title` and the four hints from the table in
 `mcp/hints.rs`, applied to the routes once in `router()`; `every_tool_is_titled_and_annotated`
 fails on a tool missing from it (and on an entry naming no tool), so **a new tool needs a
 row there**. Staged (or undoable) agent edits are not destructive; applying / discarding a

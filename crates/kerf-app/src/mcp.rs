@@ -5807,6 +5807,17 @@ mod tests {
         );
     }
 
+    /// The strict-argument check accepts what the schema lists, and schemars does not
+    /// list a `#[serde(alias)]` name, so an alias on a parameter would be refused.
+    #[test]
+    fn mcp_parameters_take_no_serde_alias() {
+        let source = include_str!("mcp.rs").replace(' ', "");
+        assert!(
+            !source.contains(concat!("alias", "=\"")),
+            "an MCP parameter uses #[serde(alias)]"
+        );
+    }
+
     /// Every argument a tool's schema lists is accepted — the check reads the same
     /// schema the client was given, so it can only refuse what the client was not offered —
     /// and no tool admits a key it does not list.

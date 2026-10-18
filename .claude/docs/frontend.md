@@ -764,9 +764,7 @@ of the five reasons applies (nothing selected / no backend / model not downloade
 not analyzed / no speech) and offers the matching action — a model picker + download,
 or Analyze — instead of a dead end. The **agent panel is a real MCP task
 queue** (one status line · review card · queue · quick edits · history · composer) — Kerf has no in-app chat; a connected
-LLM claims tasks over MCP. So that an agent knows what "this clip" is, the page reports the **editor context** (playhead,
-selection, in/out marks, `ui.timelineView`, `ui.focusedPanel`, selected asset) through `reportUiContext`
-(`editor-context.ts`: throttled, unchanged state not re-sent, a 30 s heartbeat; a no-op in the harness) — `app.md`. The queue is `agent` state (`src/lib/agent.svelte.ts`, a third
+LLM claims tasks over MCP. The queue is `agent` state (`src/lib/agent.svelte.ts`, a third
 runes singleton) backed by the `tasks` table over Tauri/MCP: the add-task box and preset chips
 `agent.add(...)` real tasks, and `ready` tasks show Apply/Dismiss (`resolve_task`/`remove_task`).
 The panel is **one status line** (`agentLine`: `Agent connected` / `No agent connected` / `Last seen 4m ago` /
@@ -808,6 +806,11 @@ engine. Below the queue, the **History** section renders
 `editor.history` (the `Revision[]` edit log, attributed to user/agent/system) with one-click
 `editor.revertTo(seq)`, and each row expands to *what* that revision changed
 (`revision_diff`).
+
+**Editor context.** So that an agent knows what "this clip" is, the page reports the playhead,
+selection, in/out marks, `ui.timelineView` (the timeline's visible seconds), `ui.focusedPanel`
+(dockview's active panel) and the selected asset through `reportUiContext` (`editor-context.ts`:
+throttled, unchanged state not re-sent, a 30 s heartbeat; a no-op in the harness) — `app.md`.
 
 **The Preview with nothing on the timeline** is `PreviewEmpty` (it was a clapperboard and "No media loaded"): a card of three steps — *Import
 media*, *Cut it on the timeline*, *Export* — each marked done / current / to do from the project (`firstRunSteps`, `first-run.ts`: an
