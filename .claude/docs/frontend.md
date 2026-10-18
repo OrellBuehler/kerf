@@ -773,7 +773,12 @@ files`; `export-progress` then carries `variant` / `total`. The
 **Transcript tab** of the library (`TranscriptPanel.svelte`, over the pure, bun-tested
 `src/lib/transcript.ts`) **is an editing surface**: lines resolve to the clip carrying them,
 click seeks, the playhead line highlights, and `×` cuts the sentence from the timeline
-(`cut_clip_range`); cut lines render struck through. When it is *empty* it says which
+(`cut_clip_range`, over its words' bounds when it has words, so the pauses either side stay); cut
+lines render struck through. A line resolves to the clip showing most of its cut range (not its
+midpoint), so a line whose words are gone reads as cut. With two or more speakers a label heads each
+change of speaker and a select filters the lines to one; a transcript with no speakers offers **Label
+speakers** (`ui.refineTranscript` → `refine_transcript`, shown and stoppable like an analysis pass).
+When it is *empty* it says which
 of the five reasons applies (nothing selected / no backend / model not downloaded /
 not analyzed / no speech) and offers the matching action — a model picker + download,
 or Analyze — instead of a dead end. The **agent panel is a real MCP task
@@ -820,6 +825,11 @@ engine. Below the queue, the **History** section renders
 `editor.history` (the `Revision[]` edit log, attributed to user/agent/system) with one-click
 `editor.revertTo(seq)`, and each row expands to *what* that revision changed
 (`revision_diff`).
+
+**Editor context.** So that an agent knows what "this clip" is, the page reports the playhead,
+selection, in/out marks, `ui.timelineView` (the timeline's visible seconds), `ui.focusedPanel`
+(dockview's active panel) and the selected asset through `reportUiContext` (`editor-context.ts`:
+throttled, unchanged state not re-sent, a 30 s heartbeat; a no-op in the harness) — `app.md`.
 
 **The Preview with nothing on the timeline** is `PreviewEmpty` (it was a clapperboard and "No media loaded"): a card of three steps — *Import
 media*, *Cut it on the timeline*, *Export* — each marked done / current / to do from the project (`firstRunSteps`, `first-run.ts`: an

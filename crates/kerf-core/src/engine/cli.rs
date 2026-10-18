@@ -12118,11 +12118,13 @@ mod tests {
                 start: 1.5,
                 end: 3.0,
                 text: "first".into(),
+                ..Default::default()
             },
             TranscriptSegment {
                 start: 3.0,
                 end: 4.25,
                 text: "second".into(),
+                ..Default::default()
             },
         ]);
         assert!(srt.contains("1\n00:00:01,500 --> 00:00:03,000\nfirst"), "{srt}");

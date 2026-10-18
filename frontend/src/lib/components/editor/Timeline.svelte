@@ -280,6 +280,11 @@
 		return () => ro.disconnect();
 	});
 
+	$effect(() => {
+		ui.timelineView = { start: scrollX / pxPerSec, end: (scrollX + viewW) / pxPerSec };
+	});
+	$effect(() => () => (ui.timelineView = null));
+
 	// Two primitives rather than one object: a scroll tick that does not cross a
 	// quantum changes neither, so no clip's waveform is touched by it.
 	const viewLo = $derived(visibleLaneRange(scrollX, viewW).lo);

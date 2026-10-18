@@ -13,6 +13,7 @@
 //! thread pool via [`blocking`], resolving inputs under the shared project lock
 //! and releasing it before the slow part.
 
+mod editor_context;
 mod gpu_preview;
 mod mcp;
 mod popout;
@@ -558,6 +559,48 @@ pub(crate) fn run_analysis<'a>(
         analysis: merged,
         failed: run.failed,
     })
+}
+
+/// Re-time an asset's cached transcript to the speech energy and label its speakers, without
+/// re-transcribing — the Tauri command's and the MCP tool's shared body. The transcript is read
+/// under the lock; the decode and clustering run with it released, in the background lane,
+/// streaming `analysis-progress` and giving up on `cancel`; the result is stored under the
+/// lock again, unless a newer transcript landed meanwhile. Only analysis moved, so it says so
+/// with `analysis-status`, not `project-changed`.
+pub(crate) fn run_refine<'a>(
+    app: &AppHandle,
+    lock: &dyn Fn() -> std::sync::MutexGuard<'a, Project>,
+    asset_id: Uuid,
+    cancel: &dyn Fn() -> bool,
+) -> CmdResult<AssetAnalysis> {
+    let (asset, read) = {
+        let project = lock();
+        (
+            project.require_asset(asset_id).map_err(|e| e.to_string())?,
+            project.transcript(asset_id).map_err(|e| e.to_string())?,
+        )
+    };
+    let id_text = asset_id.to_string();
+    let emit = |p: kerf_core::AnalysisProgress| {
+        let _ = app.emit(
+            "analysis-progress",
+            AnalysisProgressEvent {
+                asset_id: id_text.clone(),
+                stage: p.stage,
+                fraction: p.fraction,
+                detail: p.detail,
+            },
+        );
+    };
+    let refined = kerf_core::refine_transcript_media(&asset, read.clone(), &mut |p| emit(p), cancel);
+    emit(kerf_core::AnalysisProgress::stage("done"));
+    let refined = refined.map_err(|e| match e {
+        kerf_core::Error::Cancelled => ANALYSIS_CANCELLED.to_string(),
+        e => e.to_string(),
+    })?;
+    let stored = lock().store_transcript(asset_id, &read, refined).map_err(|e| e.to_string())?;
+    let _ = app.emit("analysis-status", kerf_core::analysis_status(asset_id, Some(&stored)));
+    Ok(stored)
 }
 
 /// Parse the `steps` an adapter was handed (`None` = the default set).
@@ -1952,6 +1995,17 @@ async fn export_markers(
     .await
 }
 
+/// Re-time an asset's cached transcript to the speech energy and label its speakers, without
+/// re-transcribing ([`run_refine`]). Stopped by `cancel_analysis`, like an analysis pass.
+#[tauri::command]
+async fn refine_transcript(app: AppHandle, state: State<'_, AppState>, asset_id: String) -> CmdResult<AssetAnalysis> {
+    let id = id(&asset_id)?;
+    let shared = state.project.clone();
+    let cancel = state.analysis_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+    blocking(move || run_refine(&app, &|| lock_user(&shared), id, &|| cancel.load(Ordering::SeqCst))).await
+}
+
 #[tauri::command(async)]
 fn remove_silence(state: State<'_, AppState>, asset_id: String) -> CmdResult<Timeline> {
     let id = id(&asset_id)?;
@@ -2927,6 +2981,14 @@ fn agent_status() -> AgentStatus {
     }
 }
 
+/// What the editor window shows (playhead, selection, marks, visible range,
+/// focused panel), for the MCP `get_editor_context` tool. The webview sends it
+/// debounced and as a heartbeat; it is kept in app state, not in the project.
+#[tauri::command(async)]
+fn report_ui_context(state: State<'_, editor_context::EditorContextState>, context: editor_context::UiContext) {
+    state.report(context);
+}
+
 // ---- app settings ----------------------------------------------------------
 
 /// The current preferences, resolved against the engine (see
@@ -3503,6 +3565,7 @@ pub fn run() {
             scrub: scrub.clone(),
         })
         .manage(popout::PopoutState::default())
+        .manage(editor_context::EditorContextState::default())
         .on_window_event(popout::on_window_event)
         .setup(move |app| {
             // Logging needs the resolved app data directory, so set it up here
@@ -3666,6 +3729,7 @@ pub fn run() {
             export_captions,
             export_interchange,
             export_markers,
+            refine_transcript,
             remove_silence,
             snap_to_beats,
             smart_crop,
@@ -3715,6 +3779,7 @@ pub fn run() {
             reveal_path,
             mcp_endpoint,
             agent_status,
+            report_ui_context,
             get_settings,
             set_settings,
             read_text_file,

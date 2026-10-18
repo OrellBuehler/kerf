@@ -519,7 +519,12 @@ pub fn parse_srt(text: &str) -> Vec<TranscriptSegment> {
         if text.is_empty() {
             continue;
         }
-        segments.push(TranscriptSegment { start, end, text });
+        segments.push(TranscriptSegment {
+            start,
+            end,
+            text,
+            ..Default::default()
+        });
     }
     segments
 }

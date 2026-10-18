@@ -70,7 +70,9 @@ the text variant is what an `<input type=file>` or a paste uses; both return
 `{timeline, summary}` rather than a bare `Timeline`), `export_srt`, `export_captions` (the cut's
 captions as `.srt` / `.vtt`), `export_interchange` (OTIO / EDL, returns `{path, report}`),
 `export_markers` (CSV / YouTube chapters, `{path, report}`) — each snapshots under the lock and
-builds and writes the file on the blocking pool —, `remove_silence`, `snap_to_beats`,
+builds and writes the file on the blocking pool —, `refine_transcript` (re-time words + label speakers on the cached transcript via `run_refine`, shared
+with MCP: lock released, background lane, `analysis-progress`, stopped by `cancel_analysis`; returns the
+analysis), `remove_silence`, `snap_to_beats`,
 `smart_crop` (frame each shot for the delivery frame),
 `extract_audio` (detaches an asset's cut clips and reports what it skipped, see Linked A/V) / `add_asset_audio`
 (an asset's whole audio as a clip) / `detach_audio_clips`,
@@ -207,6 +209,14 @@ one enables the command **with no scope of its own** (`allow-default-urls` is a
 separate permission), so it is listed in object form with an `allow` entry for
 `https://github.com/OrellBuehler/kerf/*` — without a scope every `openUrl` call
 comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
+
+**Editor context (`editor_context.rs`).** `report_ui_context` takes what the editor shows —
+playhead, selected clip ids, in/out marks, the visible timeline range (`ui.timelineView`,
+written by the timeline), the focused dock panel (`ui.focusedPanel`, dockview's active panel)
+and the selected asset — into `EditorContextState`, its own `Mutex` in app state and never the
+`Project` (a view of the window, not the cut). `editor-context.ts` throttles it to the latest
+state once per 300 ms, only when it changed, and re-sends it every 30 s as a heartbeat; the MCP
+`get_editor_context` reads it back with `age_secs`, and `stale` once a report is over 90 s old.
 
 **Scrubbed frames.** `get_timeline_frame` and the GPU preview's JPEG route go through `AppState.scrub`, one
 `kerf_core::ScrubFrames` per process: the frame of the cut's grid that holds the time, from a bounded cache or from

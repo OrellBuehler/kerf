@@ -3950,11 +3950,13 @@ impl Project {
                     start: 0.0,
                     end: 5.5,
                     text: "Welcome back to the channel.".to_string(),
+                    ..Default::default()
                 },
                 crate::model::TranscriptSegment {
                     start: 5.5,
                     end: 12.5,
                     text: "Today we are talking about non-destructive editing.".to_string(),
+                    ..Default::default()
                 },
             ],
             loudness: Some(crate::model::Loudness {
@@ -4903,6 +4905,7 @@ impl Project {
                 start: c.start + req.offset,
                 end: c.end + req.offset,
                 text: c.text.clone(),
+                ..Default::default()
             })
             .collect();
         let (first, last) = (cues[0].start, cues.iter().map(|c| c.end).fold(f64::MIN, f64::max));
@@ -5156,6 +5159,75 @@ impl Project {
             return Err(Error::InvalidArgument("asset has no transcript".to_string()));
         }
         Ok(crate::model::transcript_to_srt(&analysis.transcript))
+    }
+
+    /// An asset's cached transcript; an error that says why when there is none.
+    pub fn transcript(&self, asset_id: Uuid) -> Result<Vec<TranscriptSegment>> {
+        self.require_asset(asset_id)?;
+        let transcript = self.get_analysis(asset_id)?.map(|a| a.transcript).unwrap_or_default();
+        if transcript.is_empty() {
+            return Err(Error::InvalidArgument(
+                "asset has no transcript; run analyze_asset with the transcript step first".to_string(),
+            ));
+        }
+        Ok(transcript)
+    }
+
+    /// Store a re-timed / speaker-labelled transcript ([`crate::refine_transcript_media`])
+    /// for an asset, replacing the cached one and leaving every other kind as it was. `read`
+    /// is the transcript the refinement started from: when the cache no longer holds it (a
+    /// transcription finished meanwhile) nothing is stored, so a newer transcript is not
+    /// overwritten by a refinement of the older one.
+    pub fn store_transcript(
+        &self,
+        asset_id: Uuid,
+        read: &[TranscriptSegment],
+        transcript: Vec<TranscriptSegment>,
+    ) -> Result<AssetAnalysis> {
+        if self.transcript(asset_id)? != read {
+            return Err(Error::InvalidArgument(
+                "the transcript changed while it was being refined; refine it again".to_string(),
+            ));
+        }
+        self.merge_analysis(&AssetAnalysis {
+            asset_id,
+            transcript,
+            ran: vec![crate::model::AnalysisKind::Transcript],
+            ..AssetAnalysis::default()
+        })
+    }
+
+    /// When each speaker of an asset's transcript talks, in source time (only `speaker`'s
+    /// when given); words less than `join_gap` seconds apart are one range.
+    pub fn speaker_ranges(
+        &self,
+        asset_id: Uuid,
+        speaker: Option<&str>,
+        join_gap: f64,
+    ) -> Result<Vec<crate::transcript::SpeakerRanges>> {
+        let transcript = self.transcript(asset_id)?;
+        if !transcript.iter().any(|s| s.speaker.is_some()) {
+            return Err(Error::InvalidArgument(
+                "the transcript has no speaker labels; refine it (refine_transcript) to label speakers".to_string(),
+            ));
+        }
+        let ranges = crate::transcript::speaker_ranges(&transcript, speaker, join_gap.max(0.0));
+        if let (Some(want), true) = (speaker, ranges.is_empty()) {
+            let mut known: Vec<String> = transcript.iter().filter_map(|s| s.speaker.clone()).collect();
+            known.sort();
+            known.dedup();
+            return Err(Error::InvalidArgument(format!(
+                "no speaker {want:?} in the transcript; it has {}",
+                known.join(", ")
+            )));
+        }
+        Ok(ranges)
+    }
+
+    /// The filler words (`fillers`, else the usual um / uh / you know…) in an asset's
+    /// transcript, by word bounds, in source time.
+    pub fn filler_words(&self, asset_id: Uuid, fillers: &[String]) -> Result<Vec<crate::transcript::FillerWord>> {
+        Ok(crate::transcript::filler_words(&self.transcript(asset_id)?, fillers))
     }
 }
 
@@ -5590,11 +5662,13 @@ mod tests {
                     start: 0.0,
                     end: 1.6,
                     text: "Welcome to the shop.".into(),
+                    ..Default::default()
                 },
                 TranscriptSegment {
                     start: 1.85,
                     end: 4.0,
                     text: "We open at nine.".into(),
+                    ..Default::default()
                 },
             ],
         });
@@ -5952,6 +6026,66 @@ mod tests {
         // preview never breaks or blocks on a proxy that hasn't landed yet.
         let asset = asset_with("/no-such-kerf-source.mp4", vec![vid_stream(false)]);
         assert_eq!(Project::preview_source(&asset), PathBuf::from(&asset.path));
+    }
+
+    #[test]
+    fn a_stored_transcript_answers_speakers_and_fillers() {
+        use crate::model::Word;
+        let project = Project::open_in_memory().unwrap();
+        let asset = project
+            .insert_or_get_asset(&asset_with("/kerf-speakers.mp4", vec![vid_stream(false)]))
+            .unwrap();
+        assert!(project.transcript(asset.id).is_err());
+        let word = |text: &str, start: f64, end: f64, sp: &str| Word {
+            text: text.into(),
+            start,
+            end,
+            speaker: Some(sp.into()),
+            ..Word::default()
+        };
+        let line = |words: Vec<Word>, sp: &str| TranscriptSegment {
+            start: words[0].start,
+            end: words[words.len() - 1].end,
+            text: words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "),
+            words,
+            speaker: Some(sp.into()),
+        };
+        let plain = vec![TranscriptSegment {
+            start: 0.0,
+            end: 2.4,
+            text: "Um, hello hi".into(),
+            ..TranscriptSegment::default()
+        }];
+        project
+            .merge_analysis(&AssetAnalysis {
+                asset_id: asset.id,
+                transcript: plain.clone(),
+                ran: vec![crate::model::AnalysisKind::Transcript],
+                ..AssetAnalysis::default()
+            })
+            .unwrap();
+        let refined = vec![
+            line(vec![word("Um,", 0.0, 0.3, "S1"), word("hello", 0.4, 0.9, "S1")], "S1"),
+            line(vec![word("hi", 2.0, 2.4, "S2")], "S2"),
+        ];
+        project.store_transcript(asset.id, &plain, refined.clone()).unwrap();
+        // A refinement of a transcript that has since been replaced is refused.
+        let stale = project.store_transcript(asset.id, &plain, plain.clone()).unwrap_err();
+        assert!(stale.to_string().contains("changed"), "{stale}");
+        assert_eq!(project.transcript(asset.id).unwrap(), refined);
+        let s2 = project.speaker_ranges(asset.id, Some("S2"), 0.5).unwrap();
+        assert_eq!(s2.len(), 1);
+        assert_eq!((s2[0].ranges[0].start, s2[0].ranges[0].end), (2.0, 2.4));
+        assert!(project
+            .speaker_ranges(asset.id, Some("S9"), 0.5)
+            .unwrap_err()
+            .to_string()
+            .contains("S1, S2"));
+        let fillers = project.filler_words(asset.id, &[]).unwrap();
+        assert_eq!(fillers.len(), 1);
+        assert_eq!((fillers[0].start, fillers[0].end), (0.0, 0.3));
+        let analysis = project.get_analysis(asset.id).unwrap().unwrap();
+        assert!(analysis.ran.contains(&crate::model::AnalysisKind::Transcript));
     }
 
     #[test]

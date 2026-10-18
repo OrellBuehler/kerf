@@ -26,17 +26,18 @@ pub mod project;
 pub mod proxy;
 pub mod render_plan;
 pub mod svg;
+pub mod transcript;
 
 mod engine;
 
 #[cfg(feature = "whisper")]
 pub use analysis::WhisperTranscriber;
 pub use analysis::{
-    analysis_status, analyze_asset_media, analyze_asset_steps, analyze_steps, auto_analysis, default_kinds, resolve_steps,
-    set_auto_analysis, transcription_backend, transcription_status, AnalysisKindStatus, AnalysisProgress, AnalysisProviders,
-    AnalysisState, AnalysisStatus, AutoAnalysis, CancelFn, FfmpegRhythmAnalyzer, FfmpegSceneDetector, FfmpegSilenceDetector,
-    NullAnalyzer, ProgressFn, RhythmAnalyzer, SceneDetector, SilenceDetector, StepsRun, Transcriber, TranscriptionStatus,
-    WhisperFilterTranscriber,
+    analysis_status, analyze_asset_media, analyze_asset_steps, analyze_steps, auto_analysis, default_kinds,
+    refine_transcript_media, resolve_steps, set_auto_analysis, transcription_backend, transcription_status, AnalysisKindStatus,
+    AnalysisProgress, AnalysisProviders, AnalysisState, AnalysisStatus, AutoAnalysis, CancelFn, FfmpegRhythmAnalyzer,
+    FfmpegSceneDetector, FfmpegSilenceDetector, NullAnalyzer, ProgressFn, RhythmAnalyzer, SceneDetector, SilenceDetector,
+    StepsRun, Transcriber, TranscriptionStatus, WhisperFilterTranscriber,
 };
 pub use captions_export::{cut_captions, write_captions, CaptionCue, SubtitleFormat};
 pub use captions_import::{
@@ -74,13 +75,13 @@ pub use media::{MediaResolver, OriginalMedia, ProxyMedia, SourceMedia};
 pub use model::{
     AnalysisKind, Asset, AssetAnalysis, AudioEffect, CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle,
     CaptionTimeBase, Clip, ClipCut, ClipMove, Color, CropFrame, Delivery, DeltaRange, Detached, DetachedMany, DiffEntry,
-    DiffKind, Easing, EditOutcome, EditSource, Framing, Keyframe, LevelReading, Levels, Marker, MarkerKind, MarkerPatch, Mask,
-    MaskShape, MasterBus, Projection, Property, PropertyKey, PropertyTrack, Reframe, ReframeKeyframe, ResolvedReframe, Revision,
-    Rhythm, SalienceMap, SkippedDetach, SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Subsampling, SvgOverlay,
-    SvgOverlayPatch, SvgPreset, SvgPresetKind, SvgPresetParams, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline,
-    TimelineDiff, Track, TrackLevels, TranscriptSegment, Transform, Transition, TransitionKind, VideoEffect, Voiceover,
-    ADJACENT_EPS, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB, MASTER_MAX_VOLUME,
-    MASTER_MIN_CEILING_DB, MAX_CHANNEL_VOLUME, MAX_SVG_OVERLAYS, MAX_SVG_SECONDS, MIN_EDIT_CLIP,
+    DiffKind, Easing, EditOutcome, EditSource, Framing, Keyframe, LevelReading, Levels, Marker, MarkerKind, MarkerPatch, Mask, MaskShape, MasterBus,
+    Projection, Property, PropertyKey, PropertyTrack, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap,
+    SkippedDetach, SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Subsampling, SvgOverlay, SvgOverlayPatch,
+    SvgPreset, SvgPresetKind, SvgPresetParams, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff,
+    Track, TrackLevels, TranscriptSegment, Transform, Transition, TransitionKind, VideoEffect, Voiceover, Word, ADJACENT_EPS,
+    LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB,
+    MAX_CHANNEL_VOLUME, MAX_SVG_OVERLAYS, MAX_SVG_SECONDS, MIN_EDIT_CLIP,
 };
 pub use plan_caps::{DipWhy, EffectKinds, GpuCaps, LayerRef, Unsupported};
 pub use plan_epoch::{bump_plan_epoch, plan_epoch};

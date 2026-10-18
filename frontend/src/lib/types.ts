@@ -69,6 +69,23 @@ export interface TranscriptSegment {
 	start: number;
 	end: number;
 	text: string;
+	/** The line's words with their own source times, when known. Absent in a transcript
+	 *  made before words were recorded and in imported captions. */
+	words?: Word[];
+	/** Who speaks the line (`S1`, `S2`, …), when speakers were labelled. */
+	speaker?: string | null;
+}
+
+/** One word of a transcript line, in the asset's source time. */
+export interface Word {
+	text: string;
+	start: number;
+	end: number;
+	confidence?: number | null;
+	/** Spread over the line by character share (the backend reports no word times), then
+	 *  tightened to the speech energy. */
+	estimated?: boolean;
+	speaker?: string | null;
 }
 
 export interface Loudness {
@@ -1481,4 +1498,16 @@ export interface PlayAsk {
 export interface MusicFitted {
 	timeline: Timeline;
 	report: MusicFitReport;
+}
+
+/** What the editor window shows, reported for an agent's `get_editor_context`
+ *  (`crates/kerf-app/src/editor_context.rs`). Timeline seconds; ids are the live timeline's. */
+export interface UiContext {
+	playhead: number;
+	selected_clip_ids: string[];
+	mark_in: number | null;
+	mark_out: number | null;
+	visible_range: { start: number; end: number } | null;
+	focused_panel: string | null;
+	selected_asset_id: string | null;
 }
