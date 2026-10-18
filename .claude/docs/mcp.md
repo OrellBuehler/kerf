@@ -271,8 +271,10 @@ Agent edits **stage** (`core-project.md`). The adapter's part:
 - **Identity.** rmcp makes one `KerfMcp` per session, and `call_tool` stores the request's `Mcp-Session-Id` in it
   (`note_session`, read back by `owner()`; none for a client that keeps no session). `lock()` / `lock_agent_as` hand the
   project that id (`Project::declare_agent`), and **`edit()`** — every timeline edit — also calls
-  `Project::ensure_agent_staging(owner)` first: with review on it opens the proposal for the session, and a proposal
-  another session owns is refused (`StagedEditOwnedByOther`, `invalid_params`). `act()` is `edit()` without that step, for what
+  `Project::ensure_agent_staging(owner)` first, which declares the session and refuses a proposal another session owns
+  (`StagedEditOwnedByOther`, `invalid_params`); the edit itself then opens the session's proposal when review is on
+  (lazily, in its own transaction — a failed edit leaves none behind). `staged_diff` / `StagedEdit` say only
+  `owned_by_agent`, never the session id. `act()` is `edit()` without that step, for what
   is not an edit of the cut (tasks, apply / discard / undo of the proposal, history). The blocking-pool edits (voiceover
   placement, stems, smart crop, framings, caption import) take `lock_agent_edit`.
 - **Review is the user's switch** (`agent_review`, default on, read at every agent lock from `settings::agent_review()`).

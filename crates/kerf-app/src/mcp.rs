@@ -4519,9 +4519,14 @@ impl KerfMcp {
     #[tool(
         description = "Decode a single frame from an asset at a source time and return it as a low-res image the model can actually see. Use to drill into a specific moment (e.g. one cell flagged by skim_asset) before cutting."
     )]
-    async fn get_frame(&self, Parameters(p): Parameters<FrameParams>) -> Result<CallToolResult, McpError> {
+    async fn get_frame(
+        &self,
+        Parameters(p): Parameters<FrameParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         let id = parse_arg("asset_id", &p.asset_id)?;
         let project = self.project.clone();
+        let cancel = context.ct.clone();
         let (time_secs, max_width) = (p.time_secs, p.max_width.unwrap_or(640).clamp(64, MAX_PREVIEW_WIDTH));
         let region = p.region;
         let jpeg = blocking(move || {
@@ -4531,8 +4536,14 @@ impl KerfMcp {
             match region {
                 // A zoom is a request for detail, so it decodes the original at
                 // the best JPEG quality rather than the proxy at the preview one.
-                Some(r) => Project::decode_preview_region(&asset, time_secs, r.region(), max_width, ZOOM_QUALITY),
-                None => Project::decode_preview_frame(&asset, time_secs, max_width, 4, true),
+                Some(r) => {
+                    Project::decode_preview_region_cancellable(&asset, time_secs, r.region(), max_width, ZOOM_QUALITY, &|| {
+                        cancel.is_cancelled()
+                    })
+                }
+                None => {
+                    Project::decode_preview_frame_cancellable(&asset, time_secs, max_width, 4, true, &|| cancel.is_cancelled())
+                }
             }
             .map_err(core_err)
         })
@@ -4547,14 +4558,18 @@ impl KerfMcp {
     #[tool(
         description = "Skim an asset: sample frames evenly across a time range (default the whole asset) into one contact-sheet image, plus a text index of which source timestamp each grid cell shows. The cheap way to survey footage and find the good parts; then pass `cell` (same range and grid) to see one cell at full detail, or call get_frame — with a `region` to zoom — to inspect a promising moment, and add_clip_to_timeline / cut_clip to use it."
     )]
-    async fn skim_asset(&self, Parameters(p): Parameters<SkimParams>) -> Result<CallToolResult, McpError> {
+    async fn skim_asset(
+        &self,
+        Parameters(p): Parameters<SkimParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         let id = parse_arg("asset_id", &p.asset_id)?;
         let columns = p.columns.unwrap_or(4).clamp(1, 8);
         let rows = p.rows.unwrap_or(4).clamp(1, 8);
         let cell_width = p.cell_width.unwrap_or(240).clamp(80, 640);
         let project = self.project.clone();
         if let Some(cell) = p.cell {
-            return self.skim_cell(id, &p, columns, rows, cell).await;
+            return self.skim_cell(id, &p, (columns, rows, cell), context).await;
         }
         let (jpeg, times) = blocking(move || {
             // Resolve under the lock, sample the (columns × rows) frames with it
@@ -4581,9 +4596,8 @@ impl KerfMcp {
         &self,
         id: uuid::Uuid,
         p: &SkimParams,
-        columns: u32,
-        rows: u32,
-        cell: u32,
+        (columns, rows, cell): (u32, u32, u32),
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let cells = columns * rows;
         if cell < 1 || cell > cells {
@@ -4595,6 +4609,7 @@ impl KerfMcp {
         let max_width = p.max_width.unwrap_or(640).clamp(64, MAX_PREVIEW_WIDTH);
         let (start, end) = (p.start, p.end);
         let project = self.project.clone();
+        let cancel = context.ct.clone();
         let (jpeg, time) = blocking(move || {
             let asset = lock_agent(&project).require_asset(id).map_err(core_err)?;
             // The same range defaults `decode_contact_sheet` applies, so the cell
@@ -4602,7 +4617,10 @@ impl KerfMcp {
             let start = start.unwrap_or(0.0).max(0.0);
             let end = end.unwrap_or(asset.duration).min(asset.duration).max(start);
             let time = kerf_core::contact_sheet_times(start, end, columns, rows)[(cell - 1) as usize];
-            let jpeg = Project::decode_preview_region(&asset, time, Region::FULL, max_width, ZOOM_QUALITY).map_err(core_err)?;
+            let jpeg = Project::decode_preview_region_cancellable(&asset, time, Region::FULL, max_width, ZOOM_QUALITY, &|| {
+                cancel.is_cancelled()
+            })
+            .map_err(core_err)?;
             Ok::<_, McpError>((jpeg, time))
         })
         .await?;
@@ -4748,8 +4766,9 @@ impl KerfMcp {
     /// failed operation notifies nothing, because nothing changed.
     ///
     /// Before the edit, the project is told which session is acting
-    /// ([`Project::ensure_agent_staging`]): with review on that opens the proposal the edit
-    /// goes into, owned by this session, and a proposal another session owns refuses it.
+    /// ([`Project::ensure_agent_staging`]): a proposal another session owns refuses the edit
+    /// there and then. The edit itself, with review on, opens the proposal it goes into — for
+    /// this session, in its own transaction, so one that fails leaves nothing behind.
     fn edit<T>(&self, op: impl FnOnce(&Project) -> Result<T, McpError>) -> Result<T, McpError> {
         let owner = self.owner();
         // The guard is a temporary of this statement, so it is dropped here —
@@ -4812,9 +4831,13 @@ async fn check_output_paths(
     paths: Vec<std::path::PathBuf>,
 ) -> Result<(), McpError> {
     blocking(move || {
-        let project = lock_agent_as(&project, owner.as_deref());
+        // What the project protects is read under the lock; comparing paths against it
+        // canonicalises and stats, which is done with the lock released.
+        let protected = lock_agent_as(&project, owner.as_deref())
+            .output_path_inputs()
+            .map_err(core_err)?;
         for path in &paths {
-            project.check_output_path(path).map_err(core_err)?;
+            Project::check_output_path_with(path, &protected).map_err(core_err)?;
         }
         Ok(())
     })
@@ -4891,8 +4914,8 @@ fn lock_agent_as<'a>(project: &'a Mutex<Project>, owner: Option<&str>) -> MutexG
     guard
 }
 
-/// [`lock_agent_as`] for an edit of the cut: with review on, it has the proposal the edit goes
-/// into opened for `owner` first, and refuses a proposal another session owns.
+/// [`lock_agent_as`] for an edit of the cut: it refuses at once a proposal another session owns.
+/// (The edit then stages into the session's own proposal, opening it when review is on.)
 fn lock_agent_edit<'a>(project: &'a Mutex<Project>, owner: Option<&str>) -> Result<MutexGuard<'a, Project>, McpError> {
     let guard = lock_agent_as(project, owner);
     guard.ensure_agent_staging(owner).map_err(core_err)?;
@@ -7076,5 +7099,20 @@ mod tests {
             .await
             .expect("a fresh path");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A call that fails leaves no empty proposal owned by the agent behind.
+    #[test]
+    fn a_failed_first_edit_opens_no_proposal() {
+        let shared = std::sync::Mutex::new(kerf_core::Project::open_in_memory().unwrap());
+        {
+            let guard = super::lock_agent_edit(&shared, Some("session-a")).unwrap();
+            assert!(guard.remove_overlay(uuid::Uuid::new_v4()).is_err(), "no such title");
+            assert!(guard.staged().unwrap().is_none(), "nothing was staged, so nothing is open");
+        }
+        // And so a second session is not locked out by a mistake of the first.
+        let second = super::lock_agent_edit(&shared, Some("session-b")).unwrap();
+        second.add_overlay("Title".to_string(), 0.0, 2.0).unwrap();
+        assert!(second.staged().unwrap().is_some());
     }
 }
