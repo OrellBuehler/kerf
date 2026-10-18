@@ -306,34 +306,47 @@ const sampleTimeline: Timeline = {
 	]
 };
 
-// A representative queue spanning the task lifecycle, mirroring the Rust seed.
+/** `?empty=1` in the browser harness: a first run — an empty library and a cut with its two empty tracks. */
+function wantsEmpty(): boolean {
+	return typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('empty');
+}
+
+// A representative queue spanning the task lifecycle, mirroring the Rust seed. The *ready* task is the one
+// whose proposal `?staged=1` stages (`seedDevStaged` ties them together): a ready task with nothing staged
+// under it is a card that offers to apply a change that does not exist. An empty project has no queue.
 const now = () => new Date().toISOString();
-let devTasks: Task[] = [
-	{
-		id: 't1',
-		prompt: 'Assemble a rough cut from the interview',
-		status: 'done',
-		result: 'Kept 6 segments; cut 2 fillers and 14 silences (−1:48)',
-		created_at: now(),
-		updated_at: now()
-	},
-	{
-		id: 't2',
-		prompt: 'Tighten the intro and remove filler words',
-		status: 'ready',
-		result: 'Staged 3 cuts; review on the timeline',
-		created_at: now(),
-		updated_at: now()
-	},
-	{
-		id: 't3',
-		prompt: 'Balance the voiceover levels against the music bed',
-		status: 'queued',
-		result: null,
-		created_at: now(),
-		updated_at: now()
-	}
-];
+let devTasks: Task[] = wantsEmpty()
+	? []
+	: [
+			{
+				id: 't1',
+				prompt: 'Assemble a rough cut from the interview',
+				status: 'done',
+				result: 'Kept 6 segments; cut 2 fillers and 14 silences (−1:48)',
+				created_at: now(),
+				updated_at: now()
+			},
+			...(fakeStagedRequested()
+				? [
+						{
+							id: 't2',
+							prompt: 'Tighten the intro and remove filler words',
+							status: 'ready' as const,
+							result: 'Staged 3 cuts; review on the timeline',
+							created_at: now(),
+							updated_at: now()
+						}
+					]
+				: []),
+			{
+				id: 't3',
+				prompt: 'Balance the voiceover levels against the music bed',
+				status: 'queued',
+				result: null,
+				created_at: now(),
+				updated_at: now()
+			}
+		];
 
 // ---- local timeline ops (browser dev fallback) ----------------------------
 
@@ -349,6 +362,12 @@ let devHistory: DevRevision[] = [
 	{ seq: 0, label: 'Initial state', source: 'system', snapshot: structuredClone(sampleTimeline) }
 ];
 let devHead = 0;
+
+if (wantsEmpty()) {
+	sampleAssets.length = 0;
+	devTimeline = { tracks: [{ id: 'v1', kind: 'video', name: 'V1', clips: [] }, { id: 'a1', kind: 'audio', name: 'A1', clips: [] }] };
+	devHistory = [{ seq: 0, label: 'Initial state', source: 'system', snapshot: structuredClone(devTimeline) }];
+}
 
 /** Append a snapshot of the current dev timeline, dropping any redo branch. */
 function recordDev(label: string) {
@@ -2886,11 +2905,17 @@ function seedDevStaged() {
 	};
 }
 
+/** Whether the live cut moved on since the proposal branched from it — `Project::staged`'s `stale`: the
+ *  history head is not where the agent started. Applying it then replaces the newer cut and asks for `force`. */
+function devStagedStale(): boolean {
+	return !!devStaged && devStaged.edit.base_seq !== devHead;
+}
+
 /** The proposal a connected agent has staged, or `null` when there is none. */
 export async function getStagedEdit(): Promise<StagedEdit | null> {
 	if (!inTauri()) {
 		if (!devStagedSeeded && fakeStagedRequested()) seedDevStaged();
-		return devStaged ? structuredClone(devStaged.edit) : null;
+		return devStaged ? { ...structuredClone(devStaged.edit), stale: devStagedStale() } : null;
 	}
 	return invoke<StagedEdit | null>('get_staged_edit');
 }
@@ -2908,10 +2933,13 @@ export async function getStagedTimeline(): Promise<Timeline | null> {
 export async function applyStagedEdit(force = false): Promise<Timeline> {
 	if (!inTauri()) {
 		if (!devStaged) throw new Error('no staged edit is pending');
-		if (devStaged.edit.stale && !force) throw new Error('the timeline changed since these edits were staged');
+		if (devStagedStale() && !force) throw new Error('the timeline changed since these edits were staged');
 		devTimeline = structuredClone(devStaged.timeline);
 		recordDev(devStaged.edit.note ?? 'Agent edit');
 		devHistory[devHead].source = 'agent';
+		// Accepting the edits finishes the task they were staged under, as `apply_staged` does.
+		const taskId = devStaged.edit.task_id;
+		devTasks = devTasks.map((t) => (t.id === taskId ? { ...t, status: 'done', updated_at: now() } : t));
 		devStaged = null;
 		return snapshot();
 	}

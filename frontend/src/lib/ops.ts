@@ -16,6 +16,7 @@ import {
 import { toast } from './notifications.svelte';
 import { cutNotice, lockedNotice, removalNotice } from './removal';
 import { planPlayheadTrim, trimNotice } from './trim-tools';
+import { keyEditDone, planKeyEdit, planPlayheadSplit, splitDone, splitNotice, type KeyTool } from './key-edits';
 import type { SplitSide } from './types';
 
 export function errorMessage(e: unknown): string {
@@ -91,6 +92,74 @@ export async function trimSelection(side: SplitSide): Promise<void> {
 	// Some were cut and some could not be (a locked track, a clip too short): the
 	// edit that happened is visible, the one that did not needs a sentence.
 	if (plan.problems.length > 0) toast.warning(trimNotice({ ...plan, trims: [] }, selected.length, side));
+}
+
+/** **Split at playhead** (the key, Edit › Split at playhead, the clip menu): the selected clips under the
+ *  playhead — or every clip under it when nothing is selected — are cut on the frame it is on. A link group
+ *  is one cut; separate lanes are separate edits, so the toast's Undo takes back as many as were made. Says
+ *  why when there is nothing to cut instead of doing nothing. */
+export async function splitSelection(): Promise<void> {
+	const selected = editor.selectedClipIds;
+	const plan = planPlayheadSplit(editor.timeline, selected, ui.time, editor.fps);
+	if (plan.splits.length === 0) {
+		toast.info(splitNotice(plan, selected.length));
+		return;
+	}
+	let done = 0;
+	try {
+		for (const s of plan.splits) {
+			await editor.split(s.clipId, s.at);
+			done++;
+		}
+	} catch (e) {
+		toast.error(errorMessage(e));
+		if (done === 0) return;
+	}
+	const n = done;
+	toast(splitDone(n), {
+		action: {
+			label: 'Undo',
+			onClick: () => {
+				void (async () => {
+					for (let i = 0; i < n; i++) await editor.undo();
+				})().catch((e) => toast.error(errorMessage(e)));
+			}
+		}
+	});
+	if (plan.problems.length > 0) toast.warning(splitNotice({ ...plan, splits: [] }, selected.length));
+}
+
+/** One press of a roll / slip / slide key (`edit.rollBack` …): a frame of the cut, planned and checked
+ *  on a scratch copy first (`key-edits.ts`). A refusal is said, not swallowed; a roll takes the playhead
+ *  with the cut so the next press acts on the same one. */
+export async function keyEdit(tool: KeyTool, dir: 1 | -1): Promise<void> {
+	const result = planKeyEdit(
+		tool,
+		{
+			timeline: editor.timeline,
+			assets: editor.assets,
+			selected: editor.selectedClipIds,
+			primary: editor.selectedClipId,
+			time: ui.time,
+			fps: editor.fps
+		},
+		dir
+	);
+	if (!result.ok) {
+		toast.info(result.reason);
+		return;
+	}
+	const { edit, delta, cutAt } = result.plan;
+	try {
+		if (edit.tool === 'roll') await editor.roll(edit.a, edit.b, delta, undefined);
+		else if (edit.tool === 'slip') await editor.slip(edit.clipId, delta, undefined);
+		else await editor.slide(edit.clipId, delta, undefined);
+	} catch (e) {
+		toast.error(errorMessage(e));
+		return;
+	}
+	if (cutAt !== null) ui.seek(cutAt);
+	toast(result.note ?? keyEditDone(tool, dir), { action: { label: 'Undo', onClick: () => void editor.undo() } });
 }
 
 // ---- linked A/V: detach, reattach, link, unlink --------------------------------------

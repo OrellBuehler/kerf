@@ -64,14 +64,24 @@ describe('the library', () => {
 describe('the agent panel', () => {
 	const agent = read(`${EDITOR}AgentPanel.svelte`);
 
-	test('the review card’s buttons are pinned to the bottom of the scroll, which needs the card clipped, not overflow:hidden', () => {
+	test('the review buttons are the panel’s own row under the scrolling list, not a sticky part of the card', () => {
 		const actions = /data-review-actions\s+style="([^"]*)"/.exec(agent);
 		expect(actions, 'the review actions row').not.toBeNull();
-		expect(actions![1]).toContain('position:sticky');
-		expect(actions![1]).toContain('bottom:0');
-		const card = /border-left:calc\(var\(--line-width\) \* 2\) solid var\(--agent-500\);([^"]*)"/.exec(agent);
-		expect(card![1]).toContain('overflow:clip');
-		expect(card![1]).not.toContain('overflow:hidden');
+		// `flex:none` between the scroll area and the composer: on screen whatever the list holds.
+		expect(actions![1]).toContain('flex:none');
+		expect(actions![1]).not.toContain('position:sticky');
+		const scroll = agent.indexOf('overflow-y:auto');
+		const bar = agent.indexOf('data-review-actions');
+		const composer = agent.indexOf('<!-- add task -->');
+		expect(scroll).toBeGreaterThan(-1);
+		expect(bar).toBeGreaterThan(scroll);
+		expect(composer).toBeGreaterThan(bar);
+	});
+
+	test('the setup card folds away when a proposal arrives, and a row of the proposal selects through the shared review action', () => {
+		expect(agent).toContain('if (has && !hadStaged) showConnect = false');
+		expect(agent).toContain('inspectChange(e)');
+		expect(agent).toContain("from '$lib/proposal-actions'");
 	});
 
 	test('one status line, and no second "Agent queue" header over it', () => {

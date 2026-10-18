@@ -106,7 +106,8 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			act('file.new'),
 			act('file.open'),
 			sep,
-			act('file.save', { label: s.saved ? 'Save project as…' : 'Save project…' }),
+			// The registry's own label is "Save project…"; once the project has a file the same command writes a copy.
+			act('file.save', s.saved ? { label: 'Save project as…' } : {}),
 			sep,
 			act('file.import'),
 			act('file.importCaptions'),
@@ -138,6 +139,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			act('edit.copy', { ...sel }),
 			act('edit.paste'),
 			act('edit.duplicate', { ...sel }),
+			act('edit.split', { ...clips }),
 			sep,
 			act('edit.delete', { ...sel }),
 			act('edit.rippleDelete', { ...sel }),
@@ -160,6 +162,20 @@ export function buildMenus(s: MenuState): MenuDef[] {
 					sep,
 					act('edit.link', { ...sel }),
 					act('edit.unlink', { ...sel })
+				]
+			},
+			{
+				kind: 'submenu',
+				label: 'Roll, slip, slide',
+				items: [
+					act('edit.rollBack', { ...clips }),
+					act('edit.rollForward', { ...clips }),
+					sep,
+					act('edit.slipBack', { ...sel }),
+					act('edit.slipForward', { ...sel }),
+					sep,
+					act('edit.slideBack', { ...sel }),
+					act('edit.slideForward', { ...sel })
 				]
 			},
 			sep,
@@ -305,6 +321,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 		id: 'help',
 		label: 'Help',
 		items: [
+			act('app.shortcuts'),
 			act('app.keyboard'),
 			sep,
 			act('app.checkUpdate'),

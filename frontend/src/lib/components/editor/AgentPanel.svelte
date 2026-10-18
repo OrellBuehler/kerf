@@ -8,13 +8,15 @@
 	import { editor } from '$lib/state.svelte';
 	import { agent } from '$lib/agent.svelte';
 	import { dismissTask, readyCard, resolveReady } from '$lib/agent-tasks';
-	import { agentStatus, confirmAction } from '$lib/api';
+	import { agentStatus } from '$lib/api';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { diffHeadline, groupEntries, polarity } from '$lib/diff';
 	import { confirmReplaceCaptions } from '$lib/title-actions';
-	import { CONFIRM } from '$lib/confirm-copy';
 	import { QUICK_EDIT_STEPS } from '$lib/analysis-steps';
+	import { applyProposal, discardProposal, inspectChange } from '$lib/proposal-actions';
+	import { changeWord } from '$lib/proposal-ui';
+	import { cutSignature, isLocalPreset, quickTarget, silenceOutcome, targetNote } from '$lib/quick-edits';
 	import { STATUS_MAP, PRESETS } from './data';
 	import { agentLine, showComposerHint } from '$lib/agent-status';
 	import type { DiffEntry, EditSource, Task, TaskStatus, TimelineDiff } from '$lib/types';
@@ -22,7 +24,15 @@
 
 	const working = $derived(agent.working);
 	const disabled = $derived(editor.assets.length === 0 || editor.busy);
-	const LOCAL_PRESETS = new Set(['Remove silences', 'Assemble rough cut', 'Cut to the beat', 'Caption the cut', 'Frame for the delivery']);
+	/** The footage the one-asset quick edits act on, said beside them (`quick-edits.ts`). */
+	const target = $derived(
+		quickTarget({
+			clipAssetId: editor.selectedClip?.asset_id,
+			assetId: editor.selectedAssetId,
+			assets: editor.assets,
+			timeline: editor.liveTimeline
+		})
+	);
 
 	let draft = $state('');
 
@@ -119,6 +129,15 @@
 	const groups = $derived(staged ? groupEntries(staged.diff.entries) : []);
 	let applying = $state(false);
 
+	// The setup card is for a panel with nothing in it; once a proposal lands it is the proposal that matters,
+	// and at 1280×720 the card pushed it off the screen. (Asked for again, it opens again.)
+	let hadStaged = false;
+	$effect(() => {
+		const has = staged !== null;
+		if (has && !hadStaged) showConnect = false;
+		hadStaged = has;
+	});
+
 	// The design system already names these three; a proposal is a diff.
 	const polarityTint: Record<'added' | 'removed' | 'changed', string> = {
 		added: 'var(--diff-add)',
@@ -131,37 +150,12 @@
 		changed: '~'
 	};
 
-	/** Jump the playhead to where a change happens, so it can be looked at. */
-	function inspect(e: DiffEntry) {
-		if (e.at == null) return;
-		ui.seek(e.at, { snap: 'up' });
-		if (e.clip_id) editor.selectClip(e.clip_id);
-	}
-
-	async function applyProposal() {
-		if (!staged) return;
-		if (
-			staged.stale &&
-			!(await confirmAction(CONFIRM.staleApply.message, CONFIRM.staleApply.title, CONFIRM.staleApply))
-		)
-			return;
+	async function onApply() {
 		applying = true;
 		try {
-			await editor.applyStaged(staged.stale);
-			toast.success('Applied the proposed changes');
-		} catch (err) {
-			toast.error(err instanceof Error ? err.message : String(err));
+			await applyProposal();
 		} finally {
 			applying = false;
-		}
-	}
-
-	async function discardProposal() {
-		try {
-			await editor.discardStaged();
-			toast.info('Discarded the proposed changes');
-		} catch (err) {
-			toast.error(err instanceof Error ? err.message : String(err));
 		}
 	}
 
@@ -217,36 +211,45 @@
 		}
 	}
 
-	/** The video cuts as they stand, to tell a no-op alignment from a real one. */
-	function cutSignature(): string {
-		return JSON.stringify(
-			editor.timeline.tracks
-				.filter((t) => t.kind === 'video')
-				.map((t) => t.clips.map((c) => [c.timeline_start, c.source_in, c.source_out]))
-		);
+	/** Leave the done edit in the queue's history. It is added only now, after the edit has run, so a
+	 *  connected agent never sees a task it could claim and redo; failing to record it is not worth an error. */
+	async function record(preset: string) {
+		try {
+			const task = await agent.add(preset);
+			if (task) await agent.resolve(task.id);
+		} catch {
+			/* the edit is on the timeline and in the history; the queue entry is a courtesy */
+		}
 	}
 
 	async function runPreset(p: string) {
-		const assetId = editor.selectedAssetId ?? editor.assets[0]?.id;
-		if (!assetId) {
+		if (!isLocalPreset(p)) {
+			try {
+				await agent.add(p);
+				toast.info(connected ? `Queued “${p}” for your agent` : `Queued “${p}” — waiting for an agent`);
+			} catch (e) {
+				toast.error(e instanceof Error ? e.message : String(e));
+			}
+			return;
+		}
+		if (editor.assets.length === 0) {
 			toast.error('Import media first');
 			return;
 		}
 		// The one preset that writes over something the user may care about: captions
 		// from transcripts replace a set already on the cut, an imported one included.
-		// Asked before the task is queued, so declining leaves nothing behind.
 		if (p === 'Caption the cut' && !(await confirmReplaceCaptions())) return;
-		let task: Task | null = null;
 		try {
-			task = await agent.add(p);
-			// Some presets map to a local op we can run now; the rest wait for the agent.
-			if (task && (p === 'Remove silences' || p === 'Assemble rough cut')) {
+			if (p === 'Remove silences') {
+				if (!target) throw new Error('Import media first');
 				// Only the silent spans are read: not a transcript, not the beat.
-				await ui.ensureAnalysis(assetId, QUICK_EDIT_STEPS.silences);
-				await editor.removeSilence(assetId);
-				await agent.resolve(task.id);
-				toast.success(p === 'Remove silences' ? 'Removed detected silences' : 'Assembled a rough cut');
-			} else if (task && p === 'Cut to the beat') {
+				await ui.ensureAnalysis(target.id, QUICK_EDIT_STEPS.silences);
+				const before = cutSignature(editor.timeline);
+				await editor.removeSilence(target.id);
+				const out = silenceOutcome(target, cutSignature(editor.timeline) !== before);
+				toast[out.kind](out.text);
+				if (out.kind === 'success') await record(p);
+			} else if (p === 'Cut to the beat') {
 				// The grid comes from the music, so analyze whatever is on the audio tracks.
 				const music = [
 					...new Set(
@@ -255,44 +258,39 @@
 				];
 				if (music.length === 0) throw new Error('Put music on an audio track first');
 				for (const id of music) await ui.ensureAnalysis(id, QUICK_EDIT_STEPS.beat);
-				const before = cutSignature();
+				const before = cutSignature(editor.timeline);
 				await editor.snapToBeats();
-				await agent.resolve(task.id);
 				// A grid that does not reach the cuts leaves them alone; say so
 				// rather than claiming an alignment that never happened.
-				if (cutSignature() === before) toast.info('No cuts were near a beat');
-				else toast.success('Aligned the cuts to the beat');
-			} else if (task && p === 'Caption the cut') {
+				if (cutSignature(editor.timeline) === before) toast.info('No cuts were near a beat');
+				else {
+					toast.success('Aligned the cuts to the beat');
+					await record(p);
+				}
+			} else if (p === 'Caption the cut') {
 				// Captions read from the clips' transcripts, so analyze whatever is
 				// in the cut but has not been transcribed yet.
 				const sources = [...new Set(editor.timeline.tracks.flatMap((t) => t.clips.map((c) => c.asset_id)))];
 				if (sources.length === 0) throw new Error('Put a clip on the timeline first');
 				for (const id of sources) await ui.ensureAnalysis(id, QUICK_EDIT_STEPS.captions);
 				await editor.generateCaptions();
-				await agent.resolve(task.id);
 				const n = (editor.timeline.overlays ?? []).filter((o) => o.generated).length;
 				toast.success(`Captioned the cut — ${n} line${n === 1 ? '' : 's'}`, {
 					action: { label: 'Undo', onClick: () => void editor.undo() }
 				});
-			} else if (task && p === 'Frame for the delivery') {
+				await record(p);
+			} else if (p === 'Frame for the delivery') {
 				// Smart crop only matters once the project has a frame to be cut
 				// for; without one the frame follows the footage and every shot
 				// already fills it.
 				await editor.smartCrop();
-				await agent.resolve(task.id);
 				toast.success('Framed every shot for the delivery frame', {
 					action: { label: 'Undo', onClick: () => void editor.undo() }
 				});
-			} else {
-				toast.info(connected ? `Queued “${p}” for your agent` : `Queued “${p}” — waiting for an agent`);
+				await record(p);
 			}
 		} catch (e) {
 			toast.error(e instanceof Error ? e.message : String(e));
-			// `add` made the row before the precondition ran; a local preset that
-			// failed must not leave it in the queue looking real (a connected
-			// agent could claim it and redo the work).
-			const id = task?.id;
-			if (id && agent.tasks.find((t) => t.id === id)?.status !== 'done') await agent.remove(id).catch(() => {});
 		}
 	}
 
@@ -319,7 +317,7 @@
 			{ label: 'Copy connect command', icon: 'copy', action: () => void copy(claudeCmd, 'cmd') },
 			{ type: 'separator' },
 			...PRESETS.map(
-				(p): MenuItem => ({ label: `${LOCAL_PRESETS.has(p) ? 'Run now' : 'Queue for agent'}: ${p}`, icon: 'list-plus', disabled, action: () => void runPreset(p) })
+				(p): MenuItem => ({ label: `${isLocalPreset(p) ? 'Run now' : 'Queue for agent'}: ${p}`, icon: 'list-plus', disabled, action: () => void runPreset(p) })
 			)
 		];
 		contextMenu.show(e, items);
@@ -503,11 +501,11 @@
 								{#each group.entries as e, i (`${e.kind}-${i}-${e.summary}`)}
 									{@const tone = polarity(e.kind)}
 									<button
-										onclick={() => inspect(e)}
-										disabled={e.at == null}
-										use:tip={e.at == null ? e.summary : `Jump to ${e.summary}`}
+										onclick={() => void inspectChange(e)}
+										disabled={e.at == null && !e.clip_id && !e.overlay_id}
+										use:tip={e.at == null && !e.clip_id && !e.overlay_id ? e.summary : `Look at this change: ${e.summary}`}
 										style="display:flex;gap:7px;align-items:baseline;width:100%;text-align:left;padding:3px 4px;border:none;border-radius:var(--radius-sm);background:transparent;color:inherit;cursor:{e.at ==
-										null
+										null && !e.clip_id && !e.overlay_id
 											? 'default'
 											: 'pointer'}"
 									>
@@ -526,26 +524,6 @@
 					{/each}
 				</div>
 
-				<!-- Pinned to the bottom of the scrolling panel while the card is on screen: at 1366×768 the
-				     list is taller than the room, and Apply was below the fold. -->
-				<div
-					data-review-actions
-					style="position:sticky;bottom:0;z-index:1;display:flex;gap:7px;padding:8px 11px;background:var(--surface-raised);border-top:var(--line-width) solid var(--border-subtle)"
-				>
-					<Btn variant="primary" size="sm" style="flex:1" disabled={applying} onclick={applyProposal}>{applying ? 'Applying…' : 'Apply'}</Btn>
-					<Btn
-						size="sm"
-						icon={editor.previewingStaged ? 'eye-off' : 'eye'}
-						iconSize={13}
-						aria-pressed={editor.previewingStaged}
-						title={editor.previewingStaged ? 'Back to your cut' : 'Show the proposed cut in the editor'}
-						onclick={togglePreview}
-						style={editor.previewingStaged ? 'border-color:var(--agent-500);color:var(--agent-300)' : ''}
-					>
-						{editor.previewingStaged ? 'Exit' : 'Preview'}
-					</Btn>
-					<Btn size="sm" onclick={discardProposal}>Discard</Btn>
-				</div>
 			</div>
 		{/if}
 
@@ -592,18 +570,26 @@
 					</div>
 					<div style="display:flex;flex-wrap:wrap;gap:6px">
 						{#each [true, false] as local (local)}
-							{#each PRESETS.filter((p) => LOCAL_PRESETS.has(p) === local) as p (p)}
+							{#each PRESETS.filter((p) => isLocalPreset(p) === local) as p (p)}
+								{@const held = local && editor.previewingStaged}
 								<Btn
 									size="sm"
-									{disabled}
+									disabled={disabled || held}
 									icon={local ? 'play' : 'list-plus'}
 									iconSize={12}
-									title={local ? `Run now: ${p}` : `Queue for agent: ${p}`}
+									title={held
+										? 'Exit the preview first — this edits your cut'
+										: { text: `${local ? 'Run now' : 'Queue for agent'}: ${p}`, detail: targetNote(p, target) }}
 									onclick={() => runPreset(p)}>{p}</Btn
 								>
 							{/each}
 						{/each}
 					</div>
+					{#if target}
+						<div data-quick-target style="font-size:12px;color:var(--text-muted);line-height:1.45">
+							Remove silences acts on <span style="color:var(--text-secondary)">{target.name}</span> — the footage of the selected clip, else the selected media.
+						</div>
+					{/if}
 				</div>
 			{/if}
 		</div>
@@ -674,6 +660,30 @@
 			</div>
 		</div>
 	</div>
+
+	<!-- The review actions are the panel's, not the card's: pinned under the scrolling list, so Apply is on
+	     screen whatever the list holds and whichever of the sections above is open (at 1280×720 the setup
+	     card and a long list pushed it below the fold). -->
+	{#if staged}
+		<div
+			data-review-actions
+			style="flex:none;display:flex;align-items:center;gap:7px;padding:8px 12px;background:var(--surface-raised);border-top:var(--line-width) solid var(--agent-border)"
+		>
+			<Btn variant="primary" size="sm" style="flex:1" disabled={applying} onclick={onApply}>{applying ? 'Applying…' : 'Apply'}</Btn>
+			<Btn
+				size="sm"
+				icon={editor.previewingStaged ? 'eye-off' : 'eye'}
+				iconSize={13}
+				aria-pressed={editor.previewingStaged}
+				title={editor.previewingStaged ? 'Back to your cut' : 'Show the proposed cut in the editor'}
+				onclick={togglePreview}
+				style={editor.previewingStaged ? 'border-color:var(--agent-500);color:var(--agent-300)' : ''}
+			>
+				{editor.previewingStaged ? 'Exit preview' : 'Preview'}
+			</Btn>
+			<Btn size="sm" onclick={() => void discardProposal()}>Discard</Btn>
+		</div>
+	{/if}
 
 	<!-- add task -->
 	<div

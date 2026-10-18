@@ -100,6 +100,8 @@ class EditorUi {
 	exportDialog = $state(false);
 	/** The About dialog (Help › About Kerf). */
 	aboutDialog = $state(false);
+	/** The read-only shortcut cheat sheet (`?`, Help › Keyboard shortcuts). */
+	shortcutSheet = $state(false);
 	/** The options the export dialog was last closed on, for the session (`export-draft.ts`). */
 	exportDraft = $state.raw<ExportDraft | null>(null);
 	/** The delivery shapes (ids from `DELIVERY_PRESETS`) ticked for a multi-format
@@ -234,6 +236,14 @@ class EditorUi {
 
 	closeAbout() {
 		this.aboutDialog = false;
+	}
+
+	openShortcuts() {
+		this.shortcutSheet = true;
+	}
+
+	closeShortcuts() {
+		this.shortcutSheet = false;
 	}
 
 	openStems(assetId: string, clipId: string | null = null) {

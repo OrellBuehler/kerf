@@ -43,6 +43,7 @@ describe('the ellipsis', () => {
 		'file.export',
 		'file.saveCover',
 		'app.settings',
+		'app.shortcuts',
 		'app.keyboard',
 		'app.checkUpdate',
 		'window.resetAllWorkspaces'

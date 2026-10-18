@@ -72,6 +72,17 @@ export const CONFIRM = {
 	replaceCaptions: { title: 'Replace captions?', ok: 'Replace', cancel: 'Cancel' }
 } as const;
 
+/** Throwing away a proposal of several changes: named for what is lost (the agent's work), with the
+ *  button that keeps it saying what it does. */
+export function discardProposalCopy(changes: number): ConfirmCopy {
+	return {
+		title: 'Discard the agent’s changes?',
+		message: `${changes} proposed change${changes === 1 ? '' : 's'} will be thrown away. Your timeline is not touched.`,
+		ok: 'Discard',
+		cancel: 'Keep reviewing'
+	};
+}
+
 /** What would be lost if the app closed this moment: the project nobody saved, a render, an analysis. */
 export interface InstallRisk {
 	unsaved: boolean;

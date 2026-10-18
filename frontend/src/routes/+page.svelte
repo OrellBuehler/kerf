@@ -11,12 +11,16 @@
 	import VoiceoverDialog from '$lib/components/editor/VoiceoverDialog.svelte';
 	import FitMusicDialog from '$lib/components/editor/FitMusicDialog.svelte';
 	import StemsDialog from '$lib/components/editor/StemsDialog.svelte';
+	import ShortcutSheet from '$lib/components/editor/ShortcutSheet.svelte';
 	import ContextMenu from '$lib/components/editor/ContextMenu.svelte';
 	import NotificationCenter from '$lib/components/editor/NotificationCenter.svelte';
 	import Icon from '$lib/components/editor/Icon.svelte';
+	import Btn from '$lib/components/editor/Btn.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
-	import { editor } from '$lib/state.svelte';
+	import { editor, EditRefused } from '$lib/state.svelte';
 	import { agent } from '$lib/agent.svelte';
+	import { applyProposal, discardProposal } from '$lib/proposal-actions';
+	import { changeWord } from '$lib/proposal-ui';
 	import { updater } from '$lib/updater.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { mediaStatus } from '$lib/media-status.svelte';
@@ -29,7 +33,9 @@
 		deleteSelection,
 		detachSelection,
 		linkSelection,
+		keyEdit,
 		reattachSelection,
+		splitSelection,
 		trimSelection,
 		unlinkSelection
 	} from '$lib/ops';
@@ -73,7 +79,8 @@
 			ui.voiceoverDialog !== null ||
 			ui.aboutDialog ||
 			ui.fitMusicDialog !== null ||
-			ui.stemsDialog !== null
+			ui.stemsDialog !== null ||
+			ui.shortcutSheet
 	);
 	/** True while files are hovering over the window, for the drop overlay. */
 	let dropHover = $state(false);
@@ -133,6 +140,16 @@
 		// Ask GitHub whether a newer signed release exists (silently — offline is
 		// not worth an interruption) and offer it in the title bar / dialog.
 		const unlisteners: Array<() => void> = [];
+		// An edit the backend (or the preview) refused is reported by whoever asked for it — a toast. One that
+		// nobody caught (`void editor.undo()` from a toast's button) is said here, so a refusal is never silent
+		// and never said twice.
+		const onRefusal = (ev: PromiseRejectionEvent) => {
+			if (!(ev.reason instanceof EditRefused)) return;
+			ev.preventDefault();
+			toast.error(ev.reason.message);
+		};
+		window.addEventListener('unhandledrejection', onRefusal);
+		unlisteners.push(() => window.removeEventListener('unhandledrejection', onRefusal));
 		// The shortcuts and the menu-suppressing handler listen to every window the editor
 		// is in: a key pressed in a detached panel's window is dispatched there and never
 		// reaches a listener on this one.
@@ -261,6 +278,14 @@
 		};
 	});
 
+	/** The export no longer freezes the editor, but it renders *this* project: replacing it under the render would
+	 *  have the export read a project that is not the one it was started on. Said, not silently ignored. */
+	function renderRunning(): boolean {
+		if (editor.exportRun === null) return false;
+		toast.info('An export is running — stop it from the status bar before opening or starting another project.');
+		return true;
+	}
+
 	/** New / Open replace the project; one that was never saved would be gone. */
 	async function okToReplace(): Promise<boolean> {
 		return !editor.hasUnsavedWork || proceedUnsaved(UNSAVED.replace);
@@ -277,6 +302,7 @@
 			toast.info('Creating a project is available in the desktop app.');
 			return;
 		}
+		if (renderRunning()) return;
 		if (!(await okToReplace())) return;
 		try {
 			if (await editor.newProject()) {
@@ -295,6 +321,7 @@
 			toast.info('Opening a project file is available in the desktop app.');
 			return;
 		}
+		if (renderRunning()) return;
 		if (!(await okToReplace())) return;
 		try {
 			if (await editor.openProject(path)) {
@@ -381,6 +408,17 @@
 	/** The times the proposal on screen changes the cut at, for stepping through them. */
 	const reviewPoints = $derived(editor.previewingStaged && editor.staged ? changePoints(editor.staged.diff.entries) : []);
 
+	/** Apply or Discard from the banner: held while one is under way, so a double click is one answer. */
+	let reviewBusy = $state(false);
+	async function reviewAct(answer: () => Promise<boolean>) {
+		reviewBusy = true;
+		try {
+			await answer();
+		} finally {
+			reviewBusy = false;
+		}
+	}
+
 	/** `[` / `]`: the playhead to the change before / after it, while a proposal is on the timeline. */
 	function stepReview(dir: 1 | -1): void | false {
 		if (!editor.previewingStaged) return false;
@@ -459,6 +497,7 @@
 				.duplicateSelection()
 				.then((n) => n && toast(n === 1 ? 'Clip duplicated' : `${n} clips duplicated`))
 				.catch(clipErr),
+		'edit.split': () => void splitSelection(),
 		'edit.delete': () => deleteKey(false),
 		'edit.rippleDelete': () => deleteKey(true),
 		// Split-and-remove at the playhead; the backend follows ripple mode. Both say
@@ -495,6 +534,14 @@
 		'tool.slide': () => {
 			ui.tool = 'slide';
 		},
+		// One frame a press (the registry marks them `repeat: false`): each is one edit, and a held key would
+		// write a revision per auto-repeat.
+		'edit.rollBack': () => void keyEdit('roll', -1),
+		'edit.rollForward': () => void keyEdit('roll', 1),
+		'edit.slipBack': () => void keyEdit('slip', -1),
+		'edit.slipForward': () => void keyEdit('slip', 1),
+		'edit.slideBack': () => void keyEdit('slide', -1),
+		'edit.slideForward': () => void keyEdit('slide', 1),
 		'tool.snap': () => {
 			ui.snap = !ui.snap;
 		},
@@ -551,6 +598,7 @@
 		'window.resetAllWorkspaces': () => void resetAllWorkspaces(),
 		'window.dockAll': () => popout.dockAll(),
 
+		'app.shortcuts': () => ui.openShortcuts(),
 		'app.keyboard': () => settings.openSection('keyboard'),
 		'app.checkUpdate': () => updater.open(),
 		'app.releases': () =>
@@ -578,7 +626,7 @@
 		// operate it, so J/K/L still shuttle after a fader was clicked.
 		if (target?.closest('input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), textarea, select, [contenteditable="true"]')) return;
 		const k = e.key.toLowerCase();
-		const operates = k === ' ' || k === 'enter' || k.startsWith('arrow');
+		const operates = k === ' ' || k === 'enter' || (k.startsWith('arrow') && !(e.ctrlKey || e.metaKey || e.altKey));
 		if (operates && target?.closest('input, button, summary, [role="slider"], [role="tab"], [role="menuitem"]')) return;
 		// The menu bar has its own keys; a letter typed in an open menu is a jump to an
 		// entry, not the razor tool (it stops what it takes; this is for what it leaves).
@@ -608,20 +656,24 @@
 >
 	<TitleBar onAction={runAction} onCommand={runMenuCommand} />
 	<!-- While a proposal is on screen the editor is showing a cut that is not
-	     the project's yet; say so where it cannot be missed. -->
+	     the project's yet; say so where it cannot be missed, and keep its three answers — apply, discard, go
+	     back — in reach, so the review does not need the Agent panel open. The timeline is read-only here. -->
 	{#if editor.previewingStaged}
 		<div
-			style="flex:none;display:flex;align-items:center;gap:9px;height:30px;padding:0 12px;background:var(--agent-surface);border-bottom:var(--line-width) solid var(--agent-border);color:var(--agent-300);font-size:12px"
+			role="status"
+			style="flex:none;display:flex;align-items:center;gap:9px;min-height:32px;padding:3px 12px;background:var(--agent-surface);border-bottom:var(--line-width) solid var(--agent-border);color:var(--agent-300);font-size:12px;overflow:hidden"
 		>
-			<span style="width:7px;height:7px;border-radius:50%;background:var(--agent-400);box-shadow:0 0 8px var(--agent-400)"
+			<span style="flex:none;width:7px;height:7px;border-radius:50%;background:var(--agent-400);box-shadow:0 0 8px var(--agent-400)"
 			></span>
-			<span>Previewing the agent's proposed cut — your timeline is unchanged.</span>
+			<span style="flex:none;white-space:nowrap" use:tip={'The agent’s proposal is on the timeline and the cut is read-only. Nothing is changed until you apply it.'}
+				>Previewing the agent's proposed cut — your timeline is unchanged.</span
+			>
 			{#if editor.staged}
 				<!-- The proposal as marks on the timeline: stepping from change to change, and what the
 				     marks mean (colour and outline style both say it). -->
 				<span
 					data-review-nav
-					style="display:inline-flex;align-items:center;gap:4px;margin-left:6px;color:var(--text-secondary);font-size:11px"
+					style="display:inline-flex;align-items:center;gap:4px;margin-left:6px;color:var(--text-secondary);font-size:11px;white-space:nowrap"
 				>
 					<button
 						use:tip={settings.tip('Previous change', 'review.prevChange')}
@@ -632,10 +684,10 @@
 						><Icon n="chevron-left" s={12} /></button
 					>
 					<span
-						style="font-family:var(--font-mono);min-width:8ch;text-align:center"
+						style="font-family:var(--font-mono);min-width:12ch;text-align:center"
 						aria-live="polite"
-						use:tip={`The proposal changes the cut at ${reviewPoints.length} place${reviewPoints.length === 1 ? '' : 's'}; ${editor.staged.diff.entries.length} change${editor.staged.diff.entries.length === 1 ? '' : 's'} in all`}
-						>{reviewPoints.length > 0 ? `place ${changeIndex(reviewPoints, ui.time, editor.fps, editor.duration)}/${reviewPoints.length}` : 'no places'}</span
+						use:tip={`The proposal changes the cut at ${reviewPoints.length} place${reviewPoints.length === 1 ? '' : 's'}; ${changeWord(editor.staged.diff.entries.length)} in all. Page Up / Page Down step between them.`}
+						>{reviewPoints.length > 0 ? `place ${changeIndex(reviewPoints, ui.time, editor.fps, editor.duration)} of ${reviewPoints.length}` : 'no places'}</span
 					>
 					<button
 						use:tip={settings.tip('Next change', 'review.nextChange')}
@@ -645,11 +697,9 @@
 						style="display:grid;place-items:center;width:22px;height:22px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);cursor:pointer"
 						><Icon n="chevron-right" s={12} /></button
 					>
-					<span style="margin-left:4px;font-family:var(--font-mono)"
-						>· {editor.staged.diff.entries.length} change{editor.staged.diff.entries.length === 1 ? '' : 's'}</span
-					>
+					<span style="margin-left:4px;font-family:var(--font-mono)">· {changeWord(editor.staged.diff.entries.length)} in all</span>
 				</span>
-				<span data-review-legend style="display:inline-flex;align-items:center;gap:10px;margin-left:8px;font-size:11px;color:var(--text-secondary)">
+				<span data-review-legend style="display:inline-flex;align-items:center;gap:10px;margin-left:8px;font-size:11px;color:var(--text-secondary);white-space:nowrap">
 					<span style="display:inline-flex;align-items:center;gap:4px"
 						><span style="width:12px;height:9px;border:2px solid var(--diff-add);border-radius:2px"></span>added</span
 					>
@@ -664,11 +714,11 @@
 				</span>
 			{/if}
 			<div style="flex:1"></div>
-			<button
-				onclick={() => editor.exitStagedPreview()}
-				style="height:24px;padding:0 9px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--agent-border);background:var(--surface-raised);color:var(--text-secondary);font-size:11px;cursor:pointer"
-				>Exit preview</button
-			>
+			{#if editor.staged}
+				<Btn variant="primary" size="sm" disabled={reviewBusy} onclick={() => void reviewAct(applyProposal)}>Apply</Btn>
+				<Btn size="sm" disabled={reviewBusy} onclick={() => void reviewAct(discardProposal)}>Discard</Btn>
+			{/if}
+			<Btn size="sm" onclick={() => void editor.exitStagedPreview()}>Exit preview</Btn>
 		</div>
 	{/if}
 	<!-- Something the project itself could not do — a `.kerf` that would not
@@ -676,6 +726,7 @@
 	     `editor.error` and never shown, so a corrupt file opened as silence. -->
 	{#if editor.error}
 		<div
+			role="alert"
 			style="flex:none;display:flex;align-items:center;gap:9px;min-height:30px;padding:5px 12px;background:color-mix(in srgb,var(--danger) 14%,transparent);border-bottom:var(--line-width) solid color-mix(in srgb,var(--danger) 40%,transparent);color:var(--text-primary);font-size:12px"
 		>
 			<Icon n="alert-triangle" s={13} color="var(--danger)" />
@@ -737,6 +788,10 @@
 
 {#if ui.aboutDialog}
 	<AboutDialog onClose={() => ui.closeAbout()} />
+{/if}
+
+{#if ui.shortcutSheet}
+	<ShortcutSheet onClose={() => ui.closeShortcuts()} />
 {/if}
 
 <ContextMenu />

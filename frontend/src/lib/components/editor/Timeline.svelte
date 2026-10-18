@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
+	import Btn from './Btn.svelte';
 	import Badge from './Badge.svelte';
 	import ClipOverlays from './ClipOverlays.svelte';
 	import ClipFilmstrip from './ClipFilmstrip.svelte';
@@ -23,6 +24,7 @@
 		linkSelection,
 		reattachSelection,
 		selectionLinkPlans,
+		splitSelection,
 		trimSelection,
 		unlinkSelection
 	} from '$lib/ops';
@@ -41,6 +43,9 @@
 	import { magnetList, markAt, snapLines, type Magnet, type SnapLine } from '$lib/snap';
 	import { cutReadout, moveReadout, trimEdgeMonitor, trimEdgeReadout, trimLimitWhy } from '$lib/gesture-readout';
 	import { diffView, type DiffView } from '$lib/staged-diff';
+	import { applyProposal, discardProposal } from '$lib/proposal-actions';
+	import { PREVIEW_READ_ONLY } from '$lib/state.svelte';
+	import { proposalLine, touchedOnLive } from '$lib/proposal-ui';
 	import { displayTracks, opensAudioGroup } from '$lib/track-order';
 	import { NUDGE_QUIET_MS, nudgeFrames, nudgedStart } from '$lib/nudge';
 	import {
@@ -92,7 +97,7 @@
 	import { marqueeHits, normalizeRect, type LaneBox, type SpanClip } from '$lib/marquee';
 	import { drawnMoveTracks, planMove, type Ghost, type MovePlan } from '$lib/multi-move';
 	import { frameTicksIn, minorTicksIn, rulerGrid, showsFrameTicks, tickLabel, ticksIn } from '$lib/ruler';
-	import { formatTimecode } from '$lib/timecode';
+	import { timeDisplay } from '$lib/time-display.svelte';
 	import { MIN_CLIP, trimBounds, type TrimBounds } from '$lib/ripple-trim';
 	import {
 		clampZoom,
@@ -121,6 +126,34 @@
 		editor.previewingStaged && editor.staged ? diffView(editor.staged.diff.entries, editor.timeline, editor.liveTimeline) : null
 	);
 
+	/** What the proposal touches on the *live* cut, for the faint marks shown before it is previewed. */
+	const touched = $derived(
+		editor.staged && !editor.previewingStaged ? touchedOnLive(editor.staged.diff.entries, editor.liveTimeline) : null
+	);
+	let reviewBusy = $state(false);
+	async function reviewAct(answer: () => Promise<boolean>) {
+		reviewBusy = true;
+		try {
+			await answer();
+		} finally {
+			reviewBusy = false;
+		}
+	}
+
+	/** A press that would start a gesture while the proposal is on screen: the cut is read-only then, so no
+	 *  gesture starts — it is remembered, and the first move past the slop (or a razor click) says why. */
+	let previewPress = $state<{ x: number; y: number } | null>(null);
+	function reviewing(): boolean {
+		if (!editor.previewingStaged) return false;
+		toast.info(PREVIEW_READ_ONLY);
+		return true;
+	}
+	function holdForReview(e: PointerEvent): boolean {
+		if (!editor.previewingStaged) return false;
+		previewPress = { x: e.clientX, y: e.clientY };
+		return true;
+	}
+
 	// ---- linked A/V ----------------------------------------------------------------
 	//
 	// A picture and its detached sound are linked clips: a click selects both, a move, trim,
@@ -139,7 +172,7 @@
 	let hoverId = $state<string | null>(null);
 
 	/** The project timecode: what the transport, the status bar and the ruler read in. */
-	const tc = (s: number): string => formatTimecode(s, editor.fps);
+	const tc = (s: number): string => timeDisplay.fmt(s);
 
 	/** A track's lane height: its preset's pixels (`track-heights.ts`). The waveform's
 	 *  lane count and whether a clip shows thumbnails both follow from what they
@@ -499,6 +532,7 @@
 		alt = e.altKey;
 		editor.selectClip(c.id, 'replace', e.altKey);
 		void editor.select(c.asset_id);
+		if (holdForReview(e)) return;
 		const laneLeft =
 			((e.currentTarget as HTMLElement).closest('[data-lane]') as HTMLElement | null)?.getBoundingClientRect().left ?? 0;
 		const asset = editor.assets.find((a) => a.id === c.asset_id);
@@ -675,6 +709,7 @@
 		}
 		if (ui.tool === 'razor') {
 			e.stopPropagation();
+			if (reviewing()) return;
 			// Snapped like any other placement, then held half a frame inside the clip.
 			const at = splitPoint(
 				snapPoint(laneTime(e.clientX, laneLeft), t.id, ''),
@@ -697,6 +732,7 @@
 				e.stopPropagation();
 				return;
 			}
+			if (holdForReview(e)) return;
 			beginTrimTool(e, c, t, laneLeft);
 			return;
 		}
@@ -718,6 +754,7 @@
 			e.stopPropagation();
 			return;
 		}
+		if (holdForReview(e)) return;
 		drag = {
 			clipId: c.id,
 			kind: t.kind,
@@ -998,7 +1035,8 @@
 					track: track?.name ?? '',
 					fps,
 					count: d.members.size,
-					refused: dropRefused ? dragPlan.reason || 'that drop would not fit' : null
+					refused: dropRefused ? dragPlan.reason || 'that drop would not fit' : null,
+					mode: timeDisplay.mode
 				}),
 				x: d.nx,
 				y: d.ny
@@ -1006,7 +1044,7 @@
 		}
 		const t = trimDrag;
 		if (t?.moved) {
-			let r = trimEdgeReadout({ edge: t.edge, start: t.origStart, end: t.origEnd, pos: t.pos, fps, limit: t.limit });
+			let r = trimEdgeReadout({ edge: t.edge, start: t.origStart, end: t.origEnd, pos: t.pos, fps, limit: t.limit, mode: timeDisplay.mode });
 			// A trim the backend would turn down, or one that cuts a partner's sound back, says so here.
 			if (trimView && !trimView.ok && trimView.reason) r = { ...r, detail: trimView.reason, tone: 'refused' };
 			else if (trimView?.ok && trimView.trimmed.length > 0) {
@@ -1017,7 +1055,7 @@
 		const z = razor;
 		if (z && ui.tool === 'razor' && !drag && !tg) {
 			const along = [...razorLanes].filter(([id]) => id !== z.trackId).map(([, name]) => name);
-			const r = cutReadout({ at: z.at, fps, along });
+			const r = cutReadout({ at: z.at, fps, along, mode: timeDisplay.mode });
 			return { r: razorMagnet ? { ...r, title: `${r.title} · ${razorMagnet.label}` } : r, x: z.nx, y: z.ny };
 		}
 		return null;
@@ -1031,7 +1069,7 @@
 		const track = d ? editor.timeline.tracks.find((t) => t.id === d.trackId) : undefined;
 		const clip = d ? track?.clips.find((x) => x.id === d.clipId) : undefined;
 		if (d?.moved && c && track && clip) {
-			ui.trimMonitor = trimEdgeMonitor(clip, d.edge, d.pos, fps, track.kind, c.r);
+			ui.trimMonitor = trimEdgeMonitor(clip, d.edge, d.pos, fps, track.kind, c.r, timeDisplay.mode);
 			edgeMonitorOn = true;
 		} else if (edgeMonitorOn) {
 			ui.trimMonitor = null;
@@ -1119,6 +1157,16 @@
 		alt = e.altKey;
 		pointer = { x: e.clientX, y: e.clientY };
 		heldButtons = e.buttons;
+		if (previewPress) {
+			// Released, or moved far enough to be a drag: either way the press is over, and a drag says why nothing moved.
+			const p = previewPress;
+			if ((e.buttons & 1) === 0) previewPress = null;
+			else if (Math.hypot(e.clientX - p.x, e.clientY - p.y) >= DRAG_SLOP) {
+				previewPress = null;
+				reviewing();
+			}
+			return;
+		}
 		// The primary button is up but we never saw pointerup for it — treat
 		// exactly like a cancel rather than trust a move that outran its release.
 		if ((drag || trimDrag || titleDrag || marquee || scrubbing || markDrag || markerDrag) && (e.buttons & 1) === 0) {
@@ -1289,7 +1337,7 @@
 		const p = tgPreview;
 		if (!g) return;
 		const track = editor.timeline.tracks.find((t) => t.id === g.trackId);
-		ui.trimMonitor = p && track ? monitorFor(p, fps, track.kind) : null;
+		ui.trimMonitor = p && track ? monitorFor(p, fps, track.kind, timeDisplay.mode) : null;
 	});
 	let cancelTrimTool: (() => void) | null = null;
 	// The panel closing gives a gesture up (this cleanup runs once, at teardown)…
@@ -1770,15 +1818,13 @@
 		);
 		contextMenu.show(e, [
 			{
-				label: 'Split at playhead',
+				label: n > 1 ? 'Split selected at playhead' : 'Split at playhead',
 				icon: 'Scissors',
+				shortcut: settings.shortcut('edit.split'),
 				disabled: !within || !!t.locked,
-				action: () => {
-					// The playhead can be anywhere between frames; the cut is on one.
-					const at = splitPoint(quantizeTime(ui.time, { fps }), c.timeline_start, c.timeline_start + clipDuration(c), fps);
-					if (at === null) toast.error('That clip is too short to cut on a frame');
-					else void editor.split(c.id, at).catch(err);
-				}
+				reason: !within ? 'Move the playhead into this clip first' : t.locked ? `Track ${t.name} is locked` : undefined,
+				// The playhead can be anywhere between frames; the cut is on one (`planPlayheadSplit`).
+				action: () => void splitSelection()
 			},
 			{
 				label: n > 1 ? 'Trim starts to playhead' : 'Trim start to playhead',
@@ -2119,6 +2165,7 @@
 		if (e.button !== 0) return;
 		e.stopPropagation();
 		editor.selectOverlay(o.id);
+		if (holdForReview(e)) return;
 		const left = titleLaneEl?.getBoundingClientRect().left ?? 0;
 		titleDrag = {
 			id: o.id,
@@ -2249,6 +2296,7 @@
 	function onMarkerPointerDown(e: PointerEvent, m: Marker) {
 		if (e.button !== 0 || renaming === m.id) return;
 		e.stopPropagation();
+		if (holdForReview(e)) return;
 		markerDrag = { id: m.id, time: m.time };
 		capturePointer(e);
 	}
@@ -2389,6 +2437,26 @@
 	data-editor-surface
 	style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden;position:relative"
 >
+
+	<!-- A proposal waiting, while the cut on screen is still the user's: one line to say so and the three
+	     answers, so the review is not only in the Agent panel (which may be a tab away, or closed). -->
+	{#if editor.staged && !editor.previewingStaged}
+		<div
+			data-proposal-strip
+			role="status"
+			style="flex:none;display:flex;align-items:center;gap:8px;min-height:30px;padding:3px 12px;background:var(--agent-surface);border-bottom:var(--line-width) solid var(--agent-border);color:var(--agent-300);font-size:12px"
+		>
+			<Icon n="git-pull-request-arrow" s={13} color="var(--agent-300)" />
+			<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+				>{proposalLine(editor.staged.diff.entries.length)}{editor.staged.note ? ` — ${editor.staged.note}` : ''}</span
+			>
+			<span style="color:var(--text-muted);white-space:nowrap">· outlined on the cut</span>
+			<div style="flex:1"></div>
+			<Btn size="sm" icon="eye" iconSize={12} disabled={reviewBusy} onclick={() => void editor.previewStaged()}>Preview</Btn>
+			<Btn variant="primary" size="sm" disabled={reviewBusy} onclick={() => void reviewAct(applyProposal)}>Apply</Btn>
+			<Btn size="sm" disabled={reviewBusy} onclick={() => void reviewAct(discardProposal)}>Discard</Btn>
+		</div>
+	{/if}
 
 	<!-- Timeline toolbar. What used to be the app's own toolbar row lives here, where
 	     it acts: the tools, ripple, snapping, undo / redo and the delivery frame beside
@@ -2993,6 +3061,7 @@
 					<button
 						class="ktitle"
 						data-diff={diff?.titles.get(o.id)}
+						data-touched={touched?.titles.has(o.id) ? '' : undefined}
 						onpointerdown={(e) => onTitlePointerDown(e, o, 'move')}
 						oncontextmenu={(e) => onTitleContextMenu(e, o)}
 						onclick={(e) => e.stopPropagation()}
@@ -3117,6 +3186,7 @@
 							data-clip-id={c.id}
 							data-lit={lit ? '' : undefined}
 							data-diff={diff?.clips.get(c.id)}
+							data-touched={touched?.clips.has(c.id) ? '' : undefined}
 							use:tip={showsLabel(width) ? undefined : name}
 							data-linked={badge && badge.partners.length > 0 ? '' : undefined}
 							data-sound-detached={c.source_audio === false ? '' : undefined}
@@ -3380,7 +3450,7 @@
 
 			<!-- a roll, slip or slide: how far, and what it leaves — or what is stopping it -->
 			{#if tg?.moved && tgPreview}
-				{@render readoutChip(readoutFor(tgPreview, fps), tg.nx, tg.ny)}
+				{@render readoutChip(readoutFor(tgPreview, fps, timeDisplay.mode), tg.nx, tg.ny)}
 			{/if}
 
 			<!-- an edge trim, a clip move or the razor: the number the gesture is making, and why it is red or held -->
@@ -3398,7 +3468,8 @@
 						track: editor.timeline.tracks.find((t) => t.id === nudge!.trackId)?.name ?? '',
 						fps,
 						count: nudge.members.size,
-						refused: dragPlan.ok ? null : dragPlan.reason || 'that move would not fit'
+						refused: dragPlan.ok ? null : dragPlan.reason || 'that move would not fit',
+						mode: timeDisplay.mode
 					}),
 					nudgeAt * pxPerSec - 14,
 					(lane?.offsetTop ?? 0) + (lane?.offsetHeight ?? 0) - 18
@@ -3469,6 +3540,19 @@
 	.kclip[data-diff='shifted']::after,
 	.ktitle[data-diff='shifted']::after {
 		border: 2px dashed var(--diff-shift);
+	}
+	/* Before the proposal is previewed: the clips and titles it would touch carry a faint dotted frame, so the
+	   cut shows where the agent has been without being replaced by it. */
+	.kclip[data-touched]::after,
+	.ktitle[data-touched]::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		z-index: 1;
+		box-sizing: border-box;
+		border: 2px dotted color-mix(in srgb, var(--agent-400) 70%, transparent);
+		border-radius: inherit;
+		pointer-events: none;
 	}
 
 	.kname {

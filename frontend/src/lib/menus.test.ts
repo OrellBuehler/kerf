@@ -333,7 +333,7 @@ describe('Window', () => {
 describe('Help', () => {
 	test('shortcuts, updates, the release page, the logs and the version', () => {
 		const ids = menu('help').items.flatMap((e) => (e.kind === 'action' ? [e.id] : []));
-		expect(ids).toEqual(['app.keyboard', 'app.checkUpdate', 'app.releases', 'app.logs', 'app.about']);
+		expect(ids).toEqual(['app.shortcuts', 'app.keyboard', 'app.checkUpdate', 'app.releases', 'app.logs', 'app.about']);
 	});
 
 	test('the log folder is a desktop thing, and says so elsewhere', () => {
@@ -448,7 +448,9 @@ describe('moving about a menu', () => {
 		expect(entryLabel(items[second] as never)).toBe('Copy');
 		const third = typeahead(items, second, 'c')!;
 		expect(entryLabel(items[third] as never)).toBe('Clip');
-		expect(typeahead(items, third, 'c')).toBe(first);
+		const fourth = typeahead(items, third, 'c')!;
+		expect(entryLabel(items[fourth] as never)).toBe('Customize keyboard shortcuts…');
+		expect(typeahead(items, fourth, 'c')).toBe(first);
 		expect(typeahead(items, 0, 'C')).toBe(first);
 		expect(typeahead(items, 0, 'q')).toBeNull();
 	});
