@@ -5139,7 +5139,7 @@ mod tests {
         assert!(caption_source(srt.to_str(), None).unwrap().contains("Hi"));
         let txt = dir.join("cues.txt");
         std::fs::write(&txt, "x").unwrap();
-        assert!(invalid(caption_source(txt.to_str(), None)).contains(".srt, .ass or .ssa"));
+        assert!(invalid(caption_source(txt.to_str(), None)).contains(".srt, .vtt, .ass or .ssa"));
         assert!(invalid(caption_source(dir.join("missing.srt").to_str(), None)).contains("cannot read"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
