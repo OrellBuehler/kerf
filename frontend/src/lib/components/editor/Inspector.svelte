@@ -73,6 +73,8 @@
 	import { DEGREES, NUMBER_COL, PERCENT, SECONDS, TIMES, readout, type RowSpec } from '#lib/slider-row';
 	import { FieldEdits } from '#lib/field-edit';
 	import { tip } from '#lib/tip';
+	import ComposedMusic from './ComposedMusic.svelte';
+	import { scoreTitle } from '#lib/music-score';
 
 	const clip = $derived(editor.selectedClip);
 	/** What a number row is editing: the clip or title and the playhead, as they are when an edit
@@ -1337,6 +1339,12 @@
 				if (c) void run(() => trimChecked(c.id, undefined, v));
 			})}
 			</InspectorSection>
+
+			{#if asset?.music_score}
+				<InspectorSection title="Composed music" summary={scoreTitle(asset.music_score)} open>
+				<ComposedMusic {asset} {clip} {track} />
+				</InspectorSection>
+			{/if}
 
 			{#if hasAudio && soundDetached}
 				<InspectorSection title="Volume" summary="Sound detached" open>

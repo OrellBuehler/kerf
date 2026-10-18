@@ -8,6 +8,8 @@
 	import MediaChips from './MediaChips.svelte';
 	import AnalysisRun from './AnalysisRun.svelte';
 	import InspectorSection from './InspectorSection.svelte';
+	import ComposedMusic from './ComposedMusic.svelte';
+	import { scoreTitle } from '#lib/music-score';
 	import MusicStructure from './MusicStructure.svelte';
 	import { musicSummary } from '#lib/music-ui';
 	import { VIDEO_THUMB_BG } from './data';
@@ -84,6 +86,7 @@
 				<Badge tone="neutral">{KIND[info.kind]} · library</Badge>
 				{#if info.projection}<Badge tone="kerf">360</Badge>{/if}
 				{#if info.voiceover}<Badge tone="kerf">voiceover</Badge>{/if}
+				{#if info.composed}<Badge tone="kerf">composed</Badge>{/if}
 			</div>
 		</div>
 	</div>
@@ -165,6 +168,12 @@
 			onclick={() => void removeMediaFlow(asset)}>Remove…</Btn
 		>
 	</div>
+
+	{#if asset.music_score}
+		<InspectorSection title="Composed music" summary={scoreTitle(asset.music_score)} open>
+			<ComposedMusic {asset} />
+		</InspectorSection>
+	{/if}
 
 	<InspectorSection title="Media" summary={`${info.duration}${info.resolution ? ` · ${info.resolution}` : ''}`} open>
 		{#each facts.media as f (f.label)}{@render row(f)}{/each}

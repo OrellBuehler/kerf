@@ -118,6 +118,88 @@ pub fn mix_levels(
     measure_mix(timeline, assets, &opts, &mut |_| {}, cancel)
 }
 
+/// The argv that renders the finished mix of `timeline` over `range` to interleaved f32 PCM on
+/// stdout (`channels` at `rate`), and the seconds it lasts — or `None` when the cut has no sound.
+/// The export's own audio graph (faders, ducking, master bus), without `loudnorm`. Pure.
+fn build_mix_pcm_args(
+    timeline: &Timeline,
+    assets: &[Asset],
+    range: Option<TimeRange>,
+    rate: u32,
+    channels: u16,
+) -> Result<Option<(Vec<String>, f64)>> {
+    let opts = ExportOptions {
+        range,
+        ..ExportOptions::default()
+    };
+    let rendered = timeline.for_render();
+    let sliced;
+    let timeline = match effective_range(&rendered, &opts) {
+        Some((s, e)) => {
+            sliced = rendered.slice(s, e);
+            &sliced
+        }
+        None => &rendered,
+    };
+    let fmt = export_format(timeline, assets, &opts);
+    let mut args: Vec<String> = vec!["-hide_banner".to_string(), "-loglevel".to_string(), "error".to_string()];
+    let plan = push_inputs(timeline, assets, &fmt, &opts, &mut args)?;
+    let duration = timeline.duration();
+    let graph = build_filter_complex(timeline, assets, &fmt, duration, &opts, false, true, &plan);
+    if !graph.has_audio {
+        return Ok(None);
+    }
+    args.extend([
+        "-filter_complex".to_string(),
+        graph.filter,
+        "-map".to_string(),
+        "[outa]".to_string(),
+        "-ac".to_string(),
+        channels.to_string(),
+        "-ar".to_string(),
+        rate.to_string(),
+        "-f".to_string(),
+        "f32le".to_string(),
+        "pipe:1".to_string(),
+    ]);
+    Ok(Some((args, duration)))
+}
+
+/// Stream the finished mix of `timeline` over `range` (the whole cut when `None`) to `on_frames`
+/// as interleaved f32 at `rate` — what the export would write, before encoding — and return the
+/// seconds streamed (0 when the cut has no sound). For a read an agent is looking at, so it is
+/// **ungated** like the other moment reads, but capped to a share of the cores and niced;
+/// `cancel` kills the pass ([`Error::Cancelled`]) and a pass silent for a minute is killed.
+pub fn stream_mix_pcm(
+    timeline: &Timeline,
+    assets: &[Asset],
+    range: Option<TimeRange>,
+    rate: u32,
+    channels: u16,
+    cancel: &dyn Fn() -> bool,
+    on_frames: &mut dyn FnMut(&[f32]),
+) -> Result<f64> {
+    let Some((mut args, duration)) = build_mix_pcm_args(timeline, assets, range, rate, channels)? else {
+        return Ok(0.0);
+    };
+    if cancel() {
+        return Err(Error::Cancelled);
+    }
+    cpu::cap_args(&mut args, cpu::shared_threads(cpu::budget_threads(), 2));
+    let _script = externalize_filter_complex(&mut args, "bm")?;
+    let bin = ffmpeg_bin();
+    tracing::debug!(command = %format!("{bin} {}", args.join(" ")), "ffmpeg mix pcm command");
+    let child = bg_command(&bin)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| launch_err(&bin, e))?;
+    crate::engine::peaks::pump_pcm_cancellable(child, usize::from(channels) * 4, LEVELS_STALL, cancel, on_frames)?;
+    Ok(duration)
+}
+
 /// The gain static loudness normalization applies to an export with `opts`: its target's
 /// loudness less the mix's own, measured through the export's graph without the
 /// normalization (`None` when the mix is silent, under the meter's gate, or has no
@@ -698,6 +780,34 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
             .is_none());
     }
 
+    #[test]
+    fn the_mix_pcm_argv_is_the_export_graph_streamed_as_float_samples() {
+        let (tl, assets) = two_track_cut();
+        let (args, duration) = build_mix_pcm_args(&tl, &assets, None, 44_100, 2).unwrap().unwrap();
+        assert_eq!(args[..3], ["-hide_banner", "-loglevel", "error"]);
+        assert_eq!(
+            args[args.len() - 9..],
+            ["-map", "[outa]", "-ac", "2", "-ar", "44100", "-f", "f32le", "pipe:1"]
+        );
+        // The graph is the export's own audio graph, with no meters in it.
+        let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        assert!(
+            graph.ends_with("amix=inputs=3:normalize=0:dropout_transition=0[outa]"),
+            "{graph}"
+        );
+        assert!(!graph.contains("ebur128"), "{graph}");
+        assert!((duration - 8.0).abs() < 1e-9);
+        // A range is a slice of it.
+        let (_, d) = build_mix_pcm_args(&tl, &assets, Some(TimeRange { start: 1.0, end: 3.0 }), 44_100, 2)
+            .unwrap()
+            .unwrap();
+        assert!((d - 2.0).abs() < 1e-9);
+        // A cut with nothing to hear has no pcm.
+        let silent = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let none = timeline_of(vec![video_track(vec![make_clip(silent.id, 0.0, 5.0, 0.0)])]);
+        assert!(build_mix_pcm_args(&none, &[silent], None, 44_100, 2).unwrap().is_none());
+    }
+
     // ---- the real thing (`#[ignore]`d: they drive the ffmpeg binary, 4.4, 6.1 and 9.0 alike) ---
     //
     // `cargo test -p kerf-core --no-default-features -- --ignored levels`
@@ -1139,5 +1249,65 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
             assert!((got - steady).abs() < 0.3, "at {t}s: {got} dB against {steady} dB");
         }
         assert!((rms_db(7.0) - steady).abs() < 0.3);
+    }
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn the_mix_streams_into_the_band_meter_over_a_range() {
+        use crate::engine::bands::{BandMeter, BandWindow, SAMPLE_RATE};
+        let dir = scratch("bands");
+        let low = tone_at(&dir, 100, -20.0, 8.0);
+        let high = tone_at(&dir, 3000, -20.0, 8.0);
+        // A 100 Hz tone for the first 4 s on one track, a 3 kHz tone for the last 4 on another.
+        let mut a1 = audio_track(vec![make_clip(low.id, 0.0, 4.0, 0.0)]);
+        a1.name = "A1".into();
+        let mut a2 = audio_track(vec![make_clip(high.id, 0.0, 4.0, 4.0)]);
+        a2.name = "A2".into();
+        let tl = timeline_of(vec![a1, a2]);
+        let assets = [low, high];
+        let windows = [
+            BandWindow {
+                start: 0.5,
+                end: 3.5,
+                label: None,
+            },
+            BandWindow {
+                start: 4.5,
+                end: 7.5,
+                label: None,
+            },
+        ];
+        let mut meter = BandMeter::new(SAMPLE_RATE, 2, &windows).unwrap();
+        let heard = stream_mix_pcm(&tl, &assets, None, SAMPLE_RATE, 2, &|| false, &mut |f| meter.push(f)).unwrap();
+        assert!((heard - 8.0).abs() < 1e-6);
+        let w = meter.finish();
+        assert_eq!(w[0].dominant, Some("bass"));
+        assert_eq!(w[1].dominant, Some("high_mid"));
+        near("level", w[0].rms_dbfs, -23.0, 0.5);
+
+        // A range reads only what it covers: the second tone's 2 s, seen from time 4.
+        let mut meter = BandMeter::new(
+            SAMPLE_RATE,
+            2,
+            &[BandWindow {
+                start: 0.25,
+                end: 1.75,
+                label: None,
+            }],
+        )
+        .unwrap();
+        let range = Some(TimeRange { start: 4.0, end: 6.0 });
+        let heard = stream_mix_pcm(&tl, &assets, range, SAMPLE_RATE, 2, &|| false, &mut |f| meter.push(f)).unwrap();
+        assert!((heard - 2.0).abs() < 1e-6);
+        assert_eq!(meter.finish()[0].dominant, Some("high_mid"));
+
+        // A cancel stops it, and a cut with no sound is 0 s.
+        let cancelled = stream_mix_pcm(&tl, &assets, None, SAMPLE_RATE, 2, &|| true, &mut |_| {});
+        assert!(matches!(cancelled, Err(Error::Cancelled)));
+        let none = timeline_of(vec![video_track(Vec::new())]);
+        assert_eq!(
+            stream_mix_pcm(&none, &[], None, SAMPLE_RATE, 2, &|| false, &mut |_| {}).unwrap(),
+            0.0
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

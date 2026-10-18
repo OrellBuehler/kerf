@@ -143,7 +143,7 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (165)
+### The tools (168)
 
 <details>
 <summary><b>See / analyze</b></summary>
@@ -158,7 +158,8 @@ frame) · `get_waveform` · `get_energy` ·
 as a contact sheet of moments) · `preview_svg_preset` · `validate_svg` — the bold ones return images the model
 can see, and `get_frame` / `preview_timeline` take a `region` to **zoom** into a quarter of
 the frame at full source detail. Also `get_waveform_range` · `analysis_status` · `missing_assets` ·
-`get_music_structure` · `get_ripple_mode` · `voiceover_status` · `stems_status`.
+`get_music_structure` · `get_band_balance` (where music keeps its energy, in six bands per section) ·
+`get_ripple_mode` · `voiceover_status` · `stems_status` · `music_status`.
 </details>
 
 <details>
@@ -170,7 +171,8 @@ the frame at full source detail. Also `get_waveform_range` · `analysis_status` 
 `add_track` · `remove_track` · `set_track_duck` · `set_track_muted` · `set_track_solo` ·
 `set_track_locked` · `add_marker` · `update_marker` · `remove_marker` · `remove_silence` ·
 `snap_to_beats` · `sync_clips_by_audio` · `smart_crop` · `extract_audio` · `concatenate` · `move_clips` · `remove_clips` ·
-`add_asset_audio` · `set_ripple_mode` · `plan_music_fit` · `fit_music` ·
+`add_asset_audio` · `set_ripple_mode` · `plan_music_fit` · `fit_music` · `compose_music` (original music from a
+score, fitted to the cuts) ·
 `detach_audio` · `detach_audio_clips` · `reattach_audio` · `reattach_audio_clips` ·
 `link_clips` · `unlink_clips`
 </details>
@@ -207,7 +209,7 @@ the frame at full source detail. Also `get_waveform_range` · `analysis_status` 
 `get_settings` · `set_settings` · `undo_staged_edit` · `restore_discarded_edits` ·
 `apply_staged_subset` · `proxy_status` · `rebuild_proxy` · `delete_proxy` ·
 `job_status` · `cancel_job` · `list_jobs` — the long tools
-(`export`, `export_variants`, `analyze_asset`, `generate_voiceover`, `separate_stems`,
+(`export`, `export_variants`, `analyze_asset`, `generate_voiceover`, `compose_music`, `separate_stems`,
 `download_speech_model`, `import_asset`, `smart_crop`, `refine_transcript`, `sync_clips_by_audio`) take
 `background: true` and answer a
 `job_id` at once. Applying a proposal is refused to an agent while you have review on;

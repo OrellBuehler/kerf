@@ -181,7 +181,10 @@ CREATE TABLE IF NOT EXISTS assets (
     source_paths TEXT,
     -- JSON `Voiceover` for audio Kerf synthesized from a script; NULL for
     -- media the user brought. Migrated onto older files like `source_paths`.
-    voiceover    TEXT
+    voiceover    TEXT,
+    -- JSON `MusicScore` for audio Kerf composed from a score; NULL for media the
+    -- user brought. Added to older files by the v2 to v3 migration (`store.rs`).
+    music_score  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS analysis (
@@ -257,6 +260,9 @@ CREATE INDEX IF NOT EXISTS idx_assets_imported     ON assets (imported_at);
 
 /// The audio track [`Project::place_voiceover`] puts narration on by default.
 pub const VOICEOVER_TRACK: &str = "VO";
+
+/// The audio track [`Project::place_music`] puts composed music on by default.
+pub const MUSIC_TRACK: &str = "M";
 
 /// An asset name for a voiceover: its script's opening words.
 fn voiceover_name(text: &str) -> String {
@@ -972,6 +978,7 @@ impl Project {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         })
     }
 
@@ -982,8 +989,8 @@ impl Project {
     /// used to throw away its transcript, silence map and rhythm.
     pub fn insert_asset(&self, asset: &Asset) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO assets (id, path, name, duration, streams, imported_at, source_paths, voiceover)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO assets (id, path, name, duration, streams, imported_at, source_paths, voiceover, music_score)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(id) DO UPDATE SET
                  path = excluded.path,
                  name = excluded.name,
@@ -991,7 +998,8 @@ impl Project {
                  streams = excluded.streams,
                  imported_at = excluded.imported_at,
                  source_paths = excluded.source_paths,
-                 voiceover = excluded.voiceover",
+                 voiceover = excluded.voiceover,
+                 music_score = excluded.music_score",
             params![
                 asset.id.to_string(),
                 asset.path,
@@ -1005,6 +1013,7 @@ impl Project {
                     Some(serde_json::to_string(&asset.source_paths)?)
                 },
                 asset.voiceover.as_ref().map(serde_json::to_string).transpose()?,
+                asset.music_score.as_ref().map(serde_json::to_string).transpose()?,
             ],
         )?;
         Ok(())
@@ -5536,6 +5545,7 @@ impl Project {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         };
 
         let broll = Asset {
@@ -5563,6 +5573,7 @@ impl Project {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         };
 
         self.insert_asset(&interview)?;
@@ -7167,7 +7178,7 @@ fn row_to_task(
 }
 
 /// The `assets` columns every asset read selects, in [`read_asset_row`]'s order.
-const ASSET_COLUMNS: &str = "id, path, name, duration, streams, imported_at, source_paths, voiceover";
+const ASSET_COLUMNS: &str = "id, path, name, duration, streams, imported_at, source_paths, voiceover, music_score";
 
 /// An `assets` row as stored, JSON columns still serialized.
 struct AssetRow {
@@ -7179,6 +7190,7 @@ struct AssetRow {
     imported_at: String,
     source_paths: Option<String>,
     voiceover: Option<String>,
+    music_score: Option<String>,
 }
 
 fn read_asset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRow> {
@@ -7191,6 +7203,7 @@ fn read_asset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRow> {
         imported_at: row.get(5)?,
         source_paths: row.get(6)?,
         voiceover: row.get(7)?,
+        music_score: row.get(8)?,
     })
 }
 
@@ -7207,6 +7220,7 @@ fn row_to_asset(row: AssetRow) -> Result<Asset> {
             None => Vec::new(),
         },
         voiceover: row.voiceover.map(|json| serde_json::from_str(&json)).transpose()?,
+        music_score: row.music_score.map(|json| serde_json::from_str(&json)).transpose()?,
     })
 }
 
@@ -7269,6 +7283,12 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
         .map_err(|e| Error::Other(format!("invalid datetime {s}: {e}")))
 }
 
+mod music;
+#[cfg(test)]
+mod music_tests;
+pub use music::{
+    AlignTo, BandBalance, BandBalanceRequest, BandPlan, BandSource, ComposePlan, ComposeRequest, Composed, ScoreAlign,
+};
 mod audio_sync;
 pub use audio_sync::{AudioSync, AudioSyncMeasure, AudioSyncPlan, SyncSide, MAX_SYNC_SECONDS, SYNC_SAMPLE_RATE};
 mod store;
@@ -7763,6 +7783,7 @@ mod tests {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         }
     }
 
@@ -8577,6 +8598,7 @@ mod tests {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         };
         project.insert_asset(&asset).unwrap();
 
@@ -9949,6 +9971,7 @@ mod tests {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         };
         project.insert_asset(&asset).unwrap();
 
@@ -9995,6 +10018,7 @@ mod tests {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         };
         project.insert_asset(&asset).unwrap();
         let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
@@ -10048,6 +10072,7 @@ mod tests {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         };
         let id = asset.id;
         project.insert_asset(&asset).unwrap();
@@ -10156,6 +10181,7 @@ mod tests {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         };
         project.insert_asset(&asset).unwrap();
 
@@ -10219,6 +10245,7 @@ mod tests {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         };
         project.insert_asset(&asset).unwrap();
 

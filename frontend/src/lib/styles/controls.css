@@ -627,7 +627,9 @@ button:disabled {
    instead, since a bar parked at some fraction would claim a progress it does not have. */
 .k-progress {
 	position: relative;
-	flex: 1;
+	/* Basis auto, not `flex: 1` (basis 0): in a column — the run dialogs stack the label over the bar — a zero
+	   basis beat the height and the bar was drawn 0 px tall. In a row it still takes what is left. */
+	flex: 1 1 auto;
 	min-width: 0;
 	height: var(--k-progress-h, 6px);
 	border-radius: calc(var(--k-progress-h, 6px) / 2);

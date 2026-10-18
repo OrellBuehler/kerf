@@ -123,6 +123,7 @@ import {
 	splitClip,
 	trimClip,
 	generateVoiceover,
+	composeMusic,
 	separateStems,
 	undo as apiUndo
 } from './api';
@@ -176,7 +177,9 @@ import type {
 	Transform,
 	Transition,
 	VideoEffect,
-	VoiceoverRequest
+	VoiceoverRequest,
+	ComposeRequest,
+	ComposeResult
 } from './types';
 import { clipDuration } from './types';
 import { timelineFps } from './timecode';
@@ -1347,6 +1350,29 @@ class EditorState {
 			await this.refreshHistory();
 			await this.select(asset.id);
 			return asset;
+		} finally {
+			this.#busyCount--;
+		}
+	}
+	/**
+	 * Render a score onto the M track (or, with `replace_clip_id`, into that composed clip) and select the
+	 * clip it lands as. The core writes the music's tempo and bar analysis from the score, so nothing is
+	 * queued for analysis. Like `generateVoiceover` it reports nothing through `error`: the dialog says
+	 * what happened, and a cancelled run is not an error at all.
+	 */
+	async composeMusic(req: ComposeRequest): Promise<ComposeResult> {
+		this.#assertEditable();
+		this.#busyCount++;
+		try {
+			const done = await composeMusic(req);
+			this.assets = this.assets.some((a) => a.id === done.asset.id)
+				? this.assets.map((a) => (a.id === done.asset.id ? done.asset : a))
+				: [...this.assets, done.asset];
+			this.#setTimeline(done.timeline);
+			await this.refreshHistory();
+			this.selectClips([done.clip.id], done.clip.id);
+			await this.ensureAnalyses([done.asset.id]);
+			return done;
 		} finally {
 			this.#busyCount--;
 		}

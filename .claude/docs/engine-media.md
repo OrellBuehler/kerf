@@ -1,4 +1,4 @@
-# Engine: waveforms, filmstrips, libav, transcription, voiceover
+# Engine: waveforms, filmstrips, libav, transcription, voiceover, composing, band balance
 
 - `peaks.rs` (always compiled, CLI only) is what the timeline draws a clip's **waveform**
   from, and it answers a different question than `waveform` (N peaks for a whole
@@ -264,6 +264,59 @@ same script is a cache hit and the same asset. `Project::synthesize_voiceover`
 spinning) + `place_voiceover` (under the lock: the asset, its transcript, and one
 `Add voiceover` edit onto the `VO` audio track, created on first use) is the
 lock-free split again.
+
+**Composing music works in every build too** (`engine/compose.rs`, always compiled, no cargo
+feature): a `MusicScore` (`core-model.md`) becomes notes (`expand`) and the notes become sound through
+**`rustysynth`** (pure Rust, MIT, pinned `=1.3.6`; 1.3.7 was too new to take) playing **GeneralUser GS
+v2.0.3**, whose licence lets anyone use the music it makes. The SoundFont (~32 MB) downloads on the first
+composition through `engine/download.rs` (resumable, cancellable, `KERF_SOUNDFONT_URL` a mirror) into
+`<cache>/kerf/soundfonts/`, pinned at a commit of its repository and verified as RIFF `sfbk` **and by
+SHA-256** before the rename. **One synthesizer per role** (drums, top of the kit, bass, pad, keys, lead,
+effects — the top is its own role because the GM kits record hats and cymbals ~20 dB under the kick),
+all sharing the one loaded `Arc<SoundFont>`, mixed **a tenth of a second at a time** so memory is the
+finished stereo mix and nothing else: the role gains from the style's preset, a **sidechain** (a dip
+`attack_s` *before* each kick, full at it, a squared recovery; the bass, pad and keys take shares of the
+depth — `sidechain_curve`, pure, a block equals the whole), the picture's **dropouts** (`gate_curve`:
+everything but the effects silent, the ramp up ending *on* the window's end so the downbeat that follows is
+whole), a per-section **make-up gain** (`Arrangement.makeup`: a section with fewer layers — a pad-only intro,
+a breakdown without kick and bass — is lifted half the way, ≤ 6 dB, to the loudness of the fullest, from
+the style's role shares; without it the intro measured 15–20 LU under the drop), then `master`: raise until
+the loudest 0.5 % of samples sit at 0.7 (never more than 6 dB over full scale), soft-clip past a 0.8 knee,
+scale to **exactly −1 dBFS** — loudness stays the master bus's and the export preset's job. Output is
+48 kHz stereo **16-bit WAV with a seeded triangular dither** in the data dir
+(`<data>/kerf/music/music-<hash>.wav`, the only copy; hash of the renderer version, the SoundFont's
+SHA-256 and the canonical score JSON, so the same score is a cache hit and the same asset;
+`RENDERER_VERSION` is bumped when what a score sounds like changes). `render(score, progress, cancel)`
+reports `download_soundfont`, `waiting` (`cpu::lease_waiting`, **foreground**: someone waits on it) and
+`render` (a fraction), checks cancel every block, writes through `.part` + rename and never holds the
+project lock (`Project::synthesize_music` is the static half, `place_music` lands it). `status()` →
+`MusicStatus` (SoundFont ready / bytes to fetch, renders in flight, the styles). rustysynth applies
+`note_off` to **every** voice of a key on a channel, so `expand` makes sure one key never overlaps itself;
+drum one-shots ignore their note-off, but the orchestral kit's timpani do not (they get a held note). The
+effects are GM sounds: the riser is the **reverse cymbal** (program 119), a sample that peaks a fixed time
+after it starts at one pitch and `2^(-semitones/24)` as long a note higher (measured 1.9 s at key 48), so a
+riser of length L is pitched to peak exactly at its end (`REVERSE_CYMBAL_PEAK_S`); an impact is a crash, a
+kick, a timpani on the tonic and a low synth boom. `#[ignore]`d tests download the SoundFont and render
+every style (duration, not silent, peak −1 dBFS, cache hit), print the **calibration report**
+(`calibration_report`: each role solo as a K-weighted share of the song against the share its preset aims
+at — the preset `gain`s were converged on it in two iterations, and the test **fails** when a role drifts
+more than 1.5 points + 25 % from its `shares`, printing the gain to move — plus the band shares per section;
+set `KERF_COMPOSE_DUMP=<dir>` to keep the WAVs) and check that the beat tracker, which knows nothing of the
+score, finds the score's tempo and sits on its eighth grid within 20 ms (it may lock to the off-beat hats of a
+four-on-the-floor beat, which is why the music's analysis is written from the score).
+
+**Band balance** (`engine/bands.rs`, always compiled, pure DSP + a decode): `BandMeter` / `band_balance`
+measure **windows** — RMS, the K-weighted loudness of BS.1770 (two biquads; ungated, so a window of a
+song reads like the meter's LUFS; a 1 kHz full-scale sine is −3.0), and six bands (sub 20–60, bass 60–250,
+low-mid 250–500, mid 500–2 k, high-mid 2–6 k, air 6–20 kHz) as an energy in dB and a share of the in-band
+energy — from a Hann STFT (8192 / hop 4096 on the mono sum) scaled by Parseval so a full-scale sine reads
+−3 dBFS in its band; a frame belongs to the window its centre is in; the meter takes interleaved samples as
+they stream off the decoder, so memory is a frame. `stream_file` (the asset or a clip's source range,
+stereo 44.1 kHz) and `cli::stream_mix_pcm` (the **export's own audio graph** — faders, ducking, master
+bus, no `loudnorm` — to f32 PCM) are **ungated** like every read an agent looks at, but `cap_args` /
+`limit_cmd` to a share of the cores, niced, a stall killed and cancel polled. A mono file is upmixed by
+ffmpeg at −3 dB per channel (power kept), so its RMS reads 3 dB under a mono analysis and its loudness reads
+the same.
 
 Two more optional features: `libav-render` (above) and `whisper` (in-process
 `whisper-rs`; needs cmake, a C++ compiler and **libclang** at build time). Both are

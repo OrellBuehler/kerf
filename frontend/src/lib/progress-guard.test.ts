@@ -27,7 +27,7 @@ describe('progress bars', () => {
 	});
 
 	test('the run dialogs, the download and the panel all use it', () => {
-		for (const f of ['UpdateDialog', 'VoiceoverDialog', 'StemsDialog', 'SettingsAnalysis', 'ExportDialog', 'DeliverPanel'])
+		for (const f of ['UpdateDialog', 'VoiceoverDialog', 'ComposeMusicDialog', 'StemsDialog', 'SettingsAnalysis', 'ExportDialog', 'DeliverPanel'])
 			expect(read(`${EDITOR}${f}.svelte`), f).toContain('<ProgressBar');
 	});
 
@@ -37,6 +37,11 @@ describe('progress bars', () => {
 		expect(bar).toContain('aria-label={label}');
 		expect(bar).toContain('aria-valuenow={pct ?? undefined}');
 		expect(bar).toContain("data-indeterminate={pct === null ? '' : undefined}");
+	});
+
+	test('a bar keeps its height in a column: its flex basis is auto, not 0', () => {
+		expect(CONTROLS).toMatch(/\.k-progress \{[^}]*flex: 1 1 auto;/);
+		expect(CONTROLS).not.toMatch(/\.k-progress \{[^}]*flex: 1;/);
 	});
 
 	test('with no value it sweeps, and under reduced motion it does not move', () => {

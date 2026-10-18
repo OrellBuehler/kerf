@@ -141,6 +141,7 @@ impl Rig {
             imported_at: chrono::Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         };
         Self { dir, asset }
     }

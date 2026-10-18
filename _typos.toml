@@ -18,6 +18,10 @@ anull = "anull"
 mis = "mis"
 # "PNGs" splits as PN + Gs
 PN = "PN"
+# deliberate misspellings the unknown-field tests and docs use (`energy`, `sections`, `label`)
+enrgy = "enrgy"
+sectons = "sectons"
+lable = "lable"
 
 [files]
 # argv digests of the golden oracle: 16-hex FNV hashes, not words
