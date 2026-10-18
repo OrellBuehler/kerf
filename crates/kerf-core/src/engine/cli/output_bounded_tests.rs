@@ -87,3 +87,43 @@ fn a_program_that_is_not_there_is_the_spawn_error() {
     let err = output_bounded(&mut Command::new("kerf-no-such-program"), Duration::from_secs(1)).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::NotFound);
 }
+
+#[test]
+fn a_run_a_caller_cancels_is_killed_at_once_and_reported_as_no_answer() {
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let started = Instant::now();
+    let answer = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            std::thread::sleep(Duration::from_millis(200));
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        output_bounded_cancellable(
+            sh("exec sleep 30"),
+            Duration::from_secs(60),
+            Some(&|| stop.load(std::sync::atomic::Ordering::SeqCst)),
+        )
+    });
+    assert!(answer.expect("a stop is not an error").is_none());
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+}
+
+#[test]
+fn a_cancellable_run_keeps_the_deadline_and_the_outputs_of_the_plain_one() {
+    let never = || false;
+    let err = output_bounded_cancellable(sh("exec sleep 30"), Duration::from_millis(300), Some(&never)).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::TimedOut);
+
+    let out = output_bounded_cancellable(sh("echo out; echo err >&2; exit 3"), Duration::from_secs(30), Some(&never))
+        .unwrap()
+        .expect("it finished");
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!((out.stdout, out.stderr), (b"out\n".to_vec(), b"err\n".to_vec()));
+
+    // Without a cancel it is the plain bounded run.
+    let out = output_bounded_cancellable(sh("echo out"), Duration::from_secs(30), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(out.stdout, b"out\n");
+    let err = output_bounded_cancellable(Command::new("kerf-no-such-program"), Duration::from_secs(1), Some(&never)).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::NotFound);
+}

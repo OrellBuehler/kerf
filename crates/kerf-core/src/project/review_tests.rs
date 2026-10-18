@@ -121,9 +121,68 @@ fn an_asset_in_use_is_refused_unless_forced_and_force_is_one_revision() {
     assert!(tl(&p).clip(c1.id).is_none() && tl(&p).clip(c2.id).is_none());
     assert!(p.list_assets().unwrap().is_empty());
 
-    // The removal can be undone as a cut, though the library row is gone.
-    p.undo().unwrap();
-    assert!(tl(&p).clip(c1.id).is_some());
+    // The library row is gone for good, so history cannot put clips of it back (see
+    // `undo_redo_and_revert_refuse_a_step_that_uses_removed_media`).
+    let err = p.undo().unwrap_err().to_string();
+    assert!(err.contains("removed from the library") && err.contains("/av.mp4"), "{err}");
+    assert!(tl(&p).clip(c1.id).is_none());
+}
+
+#[test]
+fn undo_redo_and_revert_refuse_a_step_that_uses_removed_media() {
+    let (p, a, c1, _c2) = cut();
+    let before = revisions(&p);
+    // A second asset that stays, so there is a step to go back to that does not use the first.
+    let keep = asset("/keep.mp4", 30.0, vec![stream(StreamKind::Video)]);
+    p.insert_asset(&keep).unwrap();
+    p.remove_asset(a.id, true).unwrap();
+    let head = p.history().unwrap().pop().unwrap();
+    assert!(head.label.starts_with("Remove media"), "{}", head.label);
+    let kept_cut = p.timeline_json().unwrap();
+
+    // Undo would put the two clips back; revert to any step that has them is refused as well.
+    for result in [
+        p.undo().map(|_| ()),
+        p.revert_to(before as i64 - 1).map(|_| ()),
+        p.revert_to(1).map(|_| ()),
+    ] {
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_))
+                && err.to_string().contains("removed from the library")
+                && err.to_string().contains("/av.mp4"),
+            "{err:?}"
+        );
+    }
+    assert_eq!(p.timeline_json().unwrap(), kept_cut, "a refusal changes nothing");
+    assert_eq!(p.history().unwrap().iter().filter(|r| r.current).count(), 1);
+    assert_eq!(p.history().unwrap().pop().unwrap().seq, head.seq, "the head did not move");
+    assert!(tl(&p).clip(c1.id).is_none());
+
+    // Steps from before the media was used still restore, and redo past them is refused again.
+    p.revert_to(0).unwrap();
+    assert!(tl(&p).tracks.iter().all(|t| t.clips.is_empty()));
+    let err = p.redo().unwrap_err().to_string();
+    assert!(err.contains("removed from the library"), "{err}");
+    // New work from there branches the history as usual.
+    p.add_clip_to_timeline(keep.id, None, 0.0, 5.0, None).unwrap();
+    assert!(p.undo().is_ok());
+}
+
+#[test]
+fn removing_an_unused_asset_also_closes_history_to_the_steps_that_used_it() {
+    let (p, a) = av_project();
+    let c = p.add_clip_to_timeline(a.id, None, 0.0, 5.0, Some(0.0)).unwrap();
+    p.remove_clips(&[c.id]).unwrap();
+    p.remove_asset(a.id, false).unwrap();
+    assert!(
+        p.undo().is_err(),
+        "the step that deleted the clip would bring a clip of nothing back"
+    );
+    // The names are remembered past the removal, but an unknown id is still said, never dropped.
+    p.conn.execute("DELETE FROM meta WHERE key = 'removed_assets'", []).unwrap();
+    let err = p.undo().unwrap_err().to_string();
+    assert!(err.contains(&a.id.to_string()), "{err}");
 }
 
 #[test]
@@ -157,6 +216,41 @@ fn an_agent_cannot_remove_or_relink_media_while_its_edits_are_reviewed() {
     assert!(matches!(p.remove_asset(a.id, true), Err(Error::AgentReviewRequired)));
     let probed = asset("/moved.mp4", 60.0, vec![stream(StreamKind::Video), stream(StreamKind::Audio)]);
     assert!(matches!(p.apply_relink(a.id, &probed), Err(Error::AgentReviewRequired)));
+}
+
+#[test]
+fn an_agent_never_removes_or_relinks_media_even_with_review_off_and_a_proposal_open() {
+    let (mut p, a, c1, _c2) = cut();
+    p.set_agent_review(false);
+    p.set_actor(EditSource::Agent);
+    p.begin_staging(None, None, Some("alpha")).unwrap();
+    p.set_volume(c1.id, 0.5).unwrap();
+    let staged_before = p.staged_timeline().unwrap();
+    p.set_actor(EditSource::User);
+    let live = (revisions(&p), p.timeline_json().unwrap());
+    p.set_actor(EditSource::Agent);
+
+    // Not a forced removal that would edit the proposal while the row goes from under the live cut…
+    let err = p.remove_asset(a.id, true).unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidArgument(_)) && err.to_string().contains("done by the user"),
+        "{err:?}"
+    );
+    assert!(p.remove_asset(a.id, false).is_err());
+    let probed = asset("/moved.mp4", 60.0, a.streams.clone());
+    assert!(p.apply_relink(a.id, &probed).is_err());
+    assert!(p.relink_inputs(a.id).is_err());
+    assert!(p.relink_asset(a.id, "/moved.mp4").is_err());
+
+    p.set_actor(EditSource::User);
+    assert_eq!(p.list_assets().unwrap().len(), 1, "the asset is still there");
+    assert_eq!((revisions(&p), p.timeline_json().unwrap()), live, "the live cut is untouched");
+    assert_eq!(
+        serde_json::to_string(&p.staged_timeline().unwrap()).unwrap(),
+        serde_json::to_string(&staged_before).unwrap(),
+        "so is the proposal"
+    );
+    assert_eq!(p.require_asset(a.id).unwrap().path, "/av.mp4");
 }
 
 #[test]
@@ -237,6 +331,130 @@ fn missing_assets_lists_the_files_that_are_gone_with_the_clips_that_use_them() {
     assert_eq!((missing[0].asset_id, missing[0].clips), (gone.id, 2));
     assert_eq!(missing[0].path, "/av.mp4");
     let _ = c1;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_missing_check_is_split_so_no_file_is_touched_under_the_lock() {
+    let dir = scratch("missing-split");
+    let here = dir.join("here.mp4");
+    std::fs::write(&here, b"x").unwrap();
+    let (p, gone, ..) = cut();
+    let present = asset(here.to_str().unwrap(), 5.0, vec![stream(StreamKind::Video)]);
+    p.insert_asset(&present).unwrap();
+
+    // The locked half is the database only: every asset, present or not, with its clips.
+    let inputs = p.missing_assets_inputs().unwrap();
+    assert_eq!(inputs.len(), 2);
+    assert_eq!(inputs.iter().find(|f| f.asset_id == gone.id).unwrap().clips, 2);
+    assert_eq!(inputs.iter().find(|f| f.asset_id == present.id).unwrap().clips, 0);
+
+    // The other half needs no project at all.
+    let found = Project::find_missing_assets(inputs);
+    assert_eq!(found.len(), 1);
+    assert_eq!((found[0].asset_id, found[0].clips), (gone.id, 2));
+    assert_eq!(
+        serde_json::to_string(&found).unwrap(),
+        serde_json::to_string(&p.missing_assets().unwrap()).unwrap(),
+        "the one-call form is the two together"
+    );
+    std::fs::remove_file(&here).unwrap();
+    assert_eq!(Project::find_missing_assets(p.missing_assets_inputs().unwrap()).len(), 2);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_relink_is_checked_with_the_lock_released_and_applied_without_touching_a_file() {
+    let (p, a, c1, _) = cut();
+    p.set_analysis(&silence_patch(a.id)).unwrap();
+    let old = p.relink_inputs(a.id).unwrap();
+    assert_eq!(old.path, "/av.mp4");
+    assert!(matches!(p.relink_inputs(Uuid::new_v4()), Err(Error::AssetNotFound(_))));
+
+    let probed = asset("/moved/av.mp4", 60.0, a.streams.clone());
+    let probe = |same_file| RelinkProbe {
+        probed: probed.clone(),
+        old_path: old.path.clone(),
+        same_file,
+    };
+
+    // The same length and streams from a file with other bytes is another take.
+    let done = p.apply_relink_probed(a.id, &probe(Some(false))).unwrap();
+    assert!(!done.analysis_kept);
+    assert!(p.get_analysis(a.id).unwrap().is_none());
+    // Put it back for the next case: relinked to where it was, with analysis again.
+    let back = RelinkProbe {
+        probed: asset("/av.mp4", 60.0, a.streams.clone()),
+        old_path: "/moved/av.mp4".into(),
+        same_file: None,
+    };
+    p.apply_relink_probed(a.id, &back).unwrap();
+    p.set_analysis(&silence_patch(a.id)).unwrap();
+
+    // Same bytes, or an old file that is gone and cannot be compared: length and streams decide.
+    for same in [Some(true), None] {
+        let probe = RelinkProbe {
+            probed: asset("/moved/av.mp4", 60.0, a.streams.clone()),
+            old_path: "/av.mp4".into(),
+            same_file: same,
+        };
+        let done = p.apply_relink_probed(a.id, &probe).unwrap();
+        assert!(done.analysis_kept, "{same:?}");
+        p.apply_relink_probed(
+            a.id,
+            &RelinkProbe {
+                probed: asset("/av.mp4", 60.0, a.streams.clone()),
+                old_path: "/moved/av.mp4".into(),
+                same_file: None,
+            },
+        )
+        .unwrap();
+    }
+    assert!(tl(&p).clip(c1.id).is_some());
+
+    // The entry changed while the file was being read: retry, never compare with the wrong file.
+    let stale = RelinkProbe {
+        probed: asset("/elsewhere.mp4", 60.0, a.streams.clone()),
+        old_path: "/was/somewhere/else.mp4".into(),
+        same_file: Some(true),
+    };
+    let err = p.apply_relink_probed(a.id, &stale).unwrap_err().to_string();
+    assert!(err.contains("try again"), "{err}");
+    assert_eq!(p.require_asset(a.id).unwrap().path, "/av.mp4");
+
+    // Bad media is refused up front by the lock-free half, before anything is applied.
+    let wrong = asset("/silent.mp4", 60.0, vec![stream(StreamKind::Video)]);
+    assert!(check_relink_compatible(&old, &wrong).is_err());
+}
+
+#[test]
+fn the_old_apply_relink_still_compares_file_sizes_when_both_files_are_there() {
+    let dir = scratch("relink-legacy");
+    let (old_file, same_size, other_size) = (dir.join("old.mp4"), dir.join("same.mp4"), dir.join("other.mp4"));
+    std::fs::write(&old_file, vec![1u8; 100]).unwrap();
+    std::fs::write(&same_size, vec![2u8; 100]).unwrap();
+    std::fs::write(&other_size, vec![1u8; 101]).unwrap();
+    let p = Project::open_in_memory().unwrap();
+    let a = asset(
+        old_file.to_str().unwrap(),
+        60.0,
+        vec![stream(StreamKind::Video), stream(StreamKind::Audio)],
+    );
+    p.insert_asset(&a).unwrap();
+    p.set_analysis(&silence_patch(a.id)).unwrap();
+
+    // Another size is another file…
+    let different = asset(other_size.to_str().unwrap(), 60.0, a.streams.clone());
+    assert!(!p.apply_relink(a.id, &different).unwrap().analysis_kept);
+    assert_eq!(p.require_asset(a.id).unwrap().path, other_size.to_string_lossy());
+
+    // …but the stat-only wrapper cannot see bytes differ at the same size: that is what the
+    // `probe_relink` path, which reads both ends of both files, is for.
+    p.apply_relink(a.id, &asset(old_file.to_str().unwrap(), 60.0, a.streams.clone()))
+        .unwrap();
+    p.set_analysis(&silence_patch(a.id)).unwrap();
+    let same = asset(same_size.to_str().unwrap(), 60.0, a.streams.clone());
+    assert!(p.apply_relink(a.id, &same).unwrap().analysis_kept);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -720,6 +938,91 @@ fn saving_onto_the_projects_own_file_changes_nothing() {
 }
 
 #[test]
+fn a_project_is_never_saved_over_media_it_uses_or_the_cache() {
+    let dir = scratch("save-protected");
+    let source = dir.join("source.mp4");
+    std::fs::write(&source, b"the footage").unwrap();
+    let capture = dir.join("front.insv");
+    std::fs::write(&capture, b"a lens").unwrap();
+    let p = Project::open_in_memory().unwrap();
+    let mut a = asset(source.to_str().unwrap(), 5.0, vec![stream(StreamKind::Video)]);
+    a.source_paths = vec![capture.to_string_lossy().into_owned()];
+    p.insert_asset(&a).unwrap();
+
+    let err = p.save_as(&source).unwrap_err().to_string();
+    assert!(err.contains("source file") && err.contains("overwrite"), "{err}");
+    assert!(
+        p.save_as(dir.join("sub").join("..").join("source.mp4")).is_err(),
+        "through a detour"
+    );
+    assert!(p.save_as(&capture).unwrap_err().to_string().contains("capture file"));
+    assert_eq!(std::fs::read(&source).unwrap(), b"the footage", "the footage is untouched");
+    assert_eq!(std::fs::read(&capture).unwrap(), b"a lens");
+    #[cfg(unix)]
+    {
+        let link = dir.join("link.kerf");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        assert!(p.save_as(&link).is_err(), "a symlink to the footage is the footage");
+        assert_eq!(std::fs::read(&source).unwrap(), b"the footage");
+    }
+    if let Some(cache) = dirs::cache_dir() {
+        let inside = cache.join("kerf").join("proxies").join("x.kerf");
+        assert!(p.save_as(&inside).is_err());
+        assert!(!inside.exists());
+    }
+    // Anywhere else is fine, and the names of what was refused left nothing behind.
+    p.save_as(dir.join("ok.kerf")).unwrap();
+    let names: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.iter().all(|n| !n.ends_with(".saving")), "{names:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_output_check_is_split_into_data_under_the_lock_and_a_static_check_after_it() {
+    let dir = scratch("output-split");
+    let source = dir.join("source.mp4");
+    std::fs::write(&source, b"x").unwrap();
+    let db = dir.join("p.kerf");
+    let p = Project::create(&db).unwrap();
+    p.insert_asset(&asset(source.to_str().unwrap(), 5.0, vec![stream(StreamKind::Video)]))
+        .unwrap();
+
+    let guard = p.output_path_inputs().unwrap();
+    drop(p);
+    // With the project gone (its lock released) the check still runs, from what was read.
+    for bad in [source, db, dir.join("sub").join("..").join("source.mp4")] {
+        assert!(Project::check_output_path_with(&bad, &guard).is_err(), "{}", bad.display());
+    }
+    assert!(Project::check_output_path_with(&dir.join("out.mp4"), &guard).is_ok());
+    assert!(Project::check_output_path_with(Path::new(""), &guard).is_err());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_change_counter_keeps_counting_across_a_swapped_in_project() {
+    let (mut shared, a) = av_project();
+    for _ in 0..20 {
+        shared.set_proxy_declined(a.id, true).unwrap();
+        shared.set_proxy_declined(a.id, false).unwrap();
+    }
+    let before = shared.change_count();
+    // The new project's own connection starts again from a handful of schema rows.
+    shared.replace_with(Project::open_in_memory().unwrap());
+    let after = shared.change_count();
+    assert!(after > before, "{after} must not repeat or fall below {before}");
+    shared.set_ripple_mode(true).unwrap();
+    assert!(shared.change_count() > after);
+    // Two swaps in a row (an open that was replaced at once) still only go up.
+    let mid = shared.change_count();
+    shared.replace_with(Project::open_in_memory().unwrap());
+    shared.replace_with(Project::open_in_memory().unwrap());
+    assert!(shared.change_count() > mid);
+}
+
+#[test]
 fn the_generation_moves_when_a_project_is_swapped_in_and_the_review_setting_stays() {
     let mut shared = Project::open_in_memory().unwrap();
     shared.set_agent_review(false);
@@ -927,11 +1230,12 @@ fn an_agent_session_owns_its_proposal_and_another_is_turned_away() {
     let (mut p, _, c1, _) = cut();
     p.set_actor(EditSource::Agent);
     p.ensure_agent_staging(Some("alpha")).unwrap();
-    let staged = p.staged().unwrap().expect("review on: the call opened a session");
-    assert_eq!(staged.owner.as_deref(), Some("alpha"));
-    assert!(staged.edits.is_empty());
-    p.ensure_agent_staging(Some("alpha")).unwrap();
+    assert!(p.staged().unwrap().is_none(), "declaring opens nothing: the edit does");
     p.set_volume(c1.id, 0.5).unwrap();
+    let staged = p.staged().unwrap().expect("review on: the edit opened a session");
+    assert_eq!(staged.owner.as_deref(), Some("alpha"));
+    assert!(staged.owned_by_agent);
+    p.ensure_agent_staging(Some("alpha")).unwrap();
 
     // Another agent: refused before it edits, however it asks.
     for other in [Some("beta"), None] {
@@ -993,15 +1297,75 @@ fn declaring_a_session_lets_its_owner_end_a_proposal_without_opening_one() {
 
 #[test]
 fn a_proposal_with_no_owner_is_adopted_by_the_first_named_session_to_edit_it() {
-    let (mut p, ..) = cut();
+    let (mut p, _, c1, _) = cut();
     p.set_actor(EditSource::Agent);
     p.begin_staging(None, Some("note"), None).unwrap();
+    // Declaring takes nothing; the edit that lands does.
     p.ensure_agent_staging(Some("alpha")).unwrap();
+    assert_eq!(p.staged().unwrap().unwrap().owner, None);
+    p.set_volume(c1.id, 0.5).unwrap();
     assert_eq!(p.staged().unwrap().unwrap().owner.as_deref(), Some("alpha"));
     assert!(matches!(
         p.ensure_agent_staging(Some("beta")),
         Err(Error::StagedEditOwnedByOther)
     ));
+}
+
+#[test]
+fn ensuring_a_session_writes_nothing_so_a_failed_edit_leaves_no_trace() {
+    let (mut p, _, c1, _) = cut();
+    let written = p.change_count();
+    p.set_actor(EditSource::Agent);
+    p.ensure_agent_staging(Some("alpha")).unwrap();
+    assert_eq!(p.change_count(), written, "declaring and checking write nothing");
+
+    // Review on, nothing open: an edit that fails opens no proposal for the session.
+    assert!(p.set_volume(Uuid::new_v4(), 0.5).is_err());
+    assert!(p.set_volume(c1.id, f32::NAN).is_err());
+    assert!(p.staged().unwrap().is_none(), "no empty proposal owned by the failing agent");
+
+    // A proposal nobody owns yet (a claimed task's): a failing edit does not adopt it either.
+    p.begin_staging(None, Some("task"), None).unwrap();
+    p.set_actor(EditSource::Agent);
+    p.ensure_agent_staging(Some("alpha")).unwrap();
+    assert!(p.set_volume(Uuid::new_v4(), 0.5).is_err());
+    let staged = p.staged().unwrap().unwrap();
+    assert_eq!((staged.owner, staged.owned_by_agent), (None, false));
+    // The edit that lands is what takes it.
+    p.set_volume(c1.id, 0.5).unwrap();
+    assert_eq!(p.staged().unwrap().unwrap().owner.as_deref(), Some("alpha"));
+
+    // The same goes for the library: a held-back asset change opens a session in its own transaction.
+    let (mut q, a) = av_project();
+    q.set_actor(EditSource::Agent);
+    q.ensure_agent_staging(Some("alpha")).unwrap();
+    assert!(q.set_asset_projection(a.id, Some(Projection::Flat)).is_err());
+    assert!(q.staged().unwrap().is_none());
+    q.set_asset_projection(a.id, Some(Projection::Equirect)).unwrap();
+    assert_eq!(q.staged().unwrap().unwrap().owner.as_deref(), Some("alpha"));
+}
+
+#[test]
+fn what_the_webview_and_other_agents_read_of_a_proposal_never_carries_the_session_id() {
+    let (mut p, _, c1, _) = cut();
+    p.set_actor(EditSource::Agent);
+    p.ensure_agent_staging(Some("secret-session-id")).unwrap();
+    p.set_volume(c1.id, 0.5).unwrap();
+    let staged = p.staged().unwrap().unwrap();
+    assert_eq!(staged.owner.as_deref(), Some("secret-session-id"), "kept for the Rust side");
+    assert!(staged.owned_by_agent);
+
+    let json = serde_json::to_value(&staged).unwrap();
+    assert!(!json.to_string().contains("secret-session-id"), "{json}");
+    assert!(json.get("owner").is_none());
+    assert_eq!(json["owned_by_agent"], true);
+
+    // An unowned proposal says so.
+    p.set_actor(EditSource::User);
+    p.discard_staged().unwrap();
+    p.begin_staging(None, None, None).unwrap();
+    let json = serde_json::to_value(p.staged().unwrap().unwrap()).unwrap();
+    assert_eq!(json["owned_by_agent"], false);
 }
 
 #[test]
@@ -1247,6 +1611,126 @@ fn a_partial_accept_lands_the_picked_changes_and_leaves_the_rest_for_review() {
     assert!(p.staged().unwrap().is_none());
     assert_eq!(volume(&p, c2.id), 0.25);
     assert_eq!(tl(&p).markers.len(), 1);
+}
+
+/// c1 (0..10), c2 (10..16) and c3 (16..22) on V1; an agent proposes a new volume for c1 and c2 and
+/// a marker, then the user edits c3 (so the proposal is stale).
+fn stale_proposal() -> (Project, Clip, Clip, Clip, Vec<String>) {
+    let (mut p, a, c1, c2) = cut();
+    let c3 = p.add_clip_to_timeline(a.id, None, 30.0, 36.0, Some(16.0)).unwrap();
+    p.set_actor(EditSource::Agent);
+    p.set_volume(c1.id, 0.5).unwrap();
+    p.set_volume(c2.id, 0.25).unwrap();
+    p.add_marker(3.0, "beat".into(), None).unwrap();
+    p.set_actor(EditSource::User);
+    p.set_volume(c3.id, 0.7).unwrap();
+    let ids = p
+        .staged()
+        .unwrap()
+        .unwrap()
+        .diff
+        .entries
+        .iter()
+        .map(|e| e.id.clone())
+        .collect();
+    (p, c1, c2, c3, ids)
+}
+
+#[test]
+fn a_forced_partial_accept_leaves_exactly_the_unpicked_changes_and_keeps_the_users_newer_work() {
+    let (p, c1, c2, c3, ids) = stale_proposal();
+    assert!(p.staged().unwrap().unwrap().stale);
+    // The proposal is stale: picking without force is refused, with it the pick lands.
+    let pick = ids
+        .iter()
+        .find(|i| i.starts_with("clip_changed:") && i.ends_with(&c1.id.to_string()))
+        .unwrap()
+        .clone();
+    assert!(matches!(
+        p.apply_staged_subset(std::slice::from_ref(&pick), false),
+        Err(Error::StagedEditStale)
+    ));
+
+    let done = p.apply_staged_subset(std::slice::from_ref(&pick), true).unwrap();
+    assert_eq!((done.applied, done.remaining, done.closed), (1, 2, false), "{}", done.message);
+    assert_eq!(volume(&p, c1.id), 0.5, "the pick landed");
+    assert_eq!(volume(&p, c3.id), 0.7, "the user's newer edit stands on the live cut");
+    assert_eq!(volume(&p, c2.id), 1.0);
+
+    // What is left to review is the two unpicked agent changes and nothing else: the proposal is
+    // not "the old proposal against the new cut", which would read as undoing the user's edit of c3.
+    let staged = p.staged().unwrap().expect("the rest stays open");
+    assert!(!staged.stale, "it is re-based onto the cut as it now is");
+    let mut left: Vec<&str> = staged.diff.entries.iter().map(|e| e.id.as_str()).collect();
+    left.sort_unstable();
+    let mut want: Vec<&str> = ids.iter().filter(|i| **i != pick).map(String::as_str).collect();
+    want.sort_unstable();
+    assert_eq!(left, want, "exactly the unpicked agent changes");
+    assert!(staged.diff.entries.iter().all(|e| e.clip_id != Some(c3.id)));
+    let proposed = p.staged_timeline().unwrap().unwrap();
+    assert_eq!(
+        proposed.clip(c3.id).unwrap().volume,
+        0.7,
+        "the user's edit is in the rest of the proposal"
+    );
+    assert_eq!(proposed.clip(c1.id).unwrap().volume, 0.5);
+    assert_eq!(proposed.clip(c2.id).unwrap().volume, 0.25);
+
+    // Accepting the rest finishes the job without touching c3.
+    let done = p
+        .apply_staged_subset(&want.iter().map(|s| s.to_string()).collect::<Vec<_>>(), false)
+        .unwrap();
+    assert!(done.closed, "{}", done.message);
+    assert!(p.staged().unwrap().is_none());
+    assert_eq!((volume(&p, c1.id), volume(&p, c2.id), volume(&p, c3.id)), (0.5, 0.25, 0.7));
+    assert_eq!(tl(&p).markers.len(), 1);
+}
+
+#[test]
+fn a_forced_partial_accept_applying_only_a_library_change_still_keeps_the_users_work() {
+    let (mut p, a, c1, ..) = cut();
+    p.set_actor(EditSource::Agent);
+    p.set_volume(c1.id, 0.5).unwrap();
+    p.set_asset_projection(a.id, Some(Projection::Equirect)).unwrap();
+    p.set_actor(EditSource::User);
+    let c3 = p.add_clip_to_timeline(a.id, None, 40.0, 44.0, Some(16.0)).unwrap();
+    let staged = p.staged().unwrap().unwrap();
+    assert!(staged.stale);
+    let asset_change = staged.asset_changes[0].id.clone();
+
+    let done = p.apply_staged_subset(&[asset_change], true).unwrap();
+    assert_eq!((done.applied, done.remaining), (1, 1));
+    assert_eq!(p.require_asset(a.id).unwrap().projection(), Some(Projection::Equirect));
+    let kept = p.staged_timeline().unwrap().unwrap();
+    assert!(
+        kept.clip(c3.id).is_some(),
+        "the clip the user added since is not undone by the rest"
+    );
+    assert_eq!(kept.clip(c1.id).unwrap().volume, 0.5);
+    assert_eq!(p.staged().unwrap().unwrap().diff.entries.len(), 1);
+}
+
+#[test]
+fn a_change_of_the_rest_that_no_longer_fits_the_cut_is_dropped_and_said() {
+    let (p, c1, c2, c3, ids) = stale_proposal();
+    // The user removes c2 after the agent changed it, and a forced accept goes ahead.
+    p.remove_clips(&[c2.id]).unwrap();
+    let pick = ids
+        .iter()
+        .find(|i| i.starts_with("clip_changed:") && i.ends_with(&c1.id.to_string()))
+        .unwrap()
+        .clone();
+    let done = p.apply_staged_subset(&[pick], true).unwrap();
+    assert!(
+        done.message.contains("no longer fit") && done.message.contains("dropped"),
+        "{}",
+        done.message
+    );
+    assert_eq!(done.remaining, 1, "only the marker is left: {}", done.message);
+    let staged = p.staged().unwrap().unwrap();
+    assert_eq!(staged.diff.entries.len(), 1);
+    assert!(p.staged_timeline().unwrap().unwrap().clip(c2.id).is_none(), "not resurrected");
+    assert_eq!(p.staged_timeline().unwrap().unwrap().clip(c3.id).unwrap().volume, 0.7);
 }
 
 #[test]
@@ -1497,8 +1981,8 @@ fn a_project_staged_by_an_older_kerf_opens_with_its_proposal_intact() {
     // …and it is a working proposal: edit it as an agent, undo, apply.
     p.set_actor(EditSource::Agent);
     p.ensure_agent_staging(Some("alpha")).unwrap();
-    assert_eq!(p.staged().unwrap().unwrap().owner.as_deref(), Some("alpha"), "adopted");
     p.set_volume(clip.id, 0.2).unwrap();
+    assert_eq!(p.staged().unwrap().unwrap().owner.as_deref(), Some("alpha"), "adopted");
     p.undo_staged().unwrap();
     p.set_actor(EditSource::User);
     p.apply_staged(true).unwrap();
@@ -1591,6 +2075,28 @@ fn relinking_real_media_keeps_analysis_only_for_the_same_recording() {
     let done = p.relink_asset(a.id, &retake).unwrap();
     assert!(!done.analysis_kept);
     assert!(p.get_analysis(a.id).unwrap().is_none());
+
+    // Same size, same length, same streams — and other bytes: a retake the size check cannot see.
+    let lookalike = dir.join("lookalike.mp4");
+    let mut bytes = std::fs::read(&retake).unwrap();
+    let at = bytes.len() / 3;
+    bytes[at] ^= 0xff;
+    std::fs::write(&lookalike, &bytes).unwrap();
+    p.set_analysis(&silence_patch(a.id)).unwrap();
+    let done = p.relink_asset(a.id, &lookalike).unwrap();
+    assert!(
+        !done.analysis_kept,
+        "another take of the same size is not the old recording moved"
+    );
+    assert!(p.get_analysis(a.id).unwrap().is_none());
+    // …where the same bytes under another name are.
+    let twin = dir.join("twin.mp4");
+    std::fs::copy(&lookalike, &twin).unwrap();
+    p.set_analysis(&silence_patch(a.id)).unwrap();
+    assert!(p.relink_asset(a.id, &twin).unwrap().analysis_kept);
+    std::fs::remove_file(&lookalike).unwrap();
+    std::fs::copy(&twin, &retake).unwrap();
+    p.relink_asset(a.id, &retake).unwrap();
 
     let err = p.relink_asset(a.id, &silent).unwrap_err().to_string();
     assert!(err.contains("picture only"), "{err}");

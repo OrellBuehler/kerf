@@ -31,31 +31,53 @@
   when it resolves its inputs under the lock and drops its result if it changed. `change_count()`
   is SQLite's `total_changes` — every row written through the connection (analysis merges,
   ripple mode, meta, a declined proxy …), so "did anything write while the lock was released?"
-  is two numbers, not a content fingerprint. `merge_analysis` / `set_analysis` (and
+  is two numbers, not a content fingerprint. It is **monotonic across `replace_with`** (the swapped-in
+  project's connection restarts at zero; the count carries on from the one it replaced), so a number
+  noted under the old project can never equal one read under the new — `generation()` still says
+  *which* project. `merge_analysis` / `set_analysis` (and
   `place_stems`) answer `AssetNotFound` for an asset that is gone instead of writing for nothing.
   **`save_as` is atomic**: `VACUUM INTO` a temporary file beside the destination, then rename; a
   failure leaves the destination as it was (it used to be deleted first), and saving onto the
-  file the project is open on is a no-op. **`insert_asset` is an upsert** (`ON CONFLICT … DO
+  file the project is open on is a no-op; the destination is held to `check_output_path` first (never
+  over an asset's source, a stitched capture, a proxy or the cache). **`insert_asset` is an upsert** (`ON CONFLICT … DO
   UPDATE`), never `INSERT OR REPLACE`: replacing deletes the row first and `analysis` hangs off it
   with `ON DELETE CASCADE`, so marking an asset 360 used to drop its transcript.
-  **The media library**: `missing_assets()` (a stat per asset, with the clips that use each),
-  `relink_asset(id, path)` / the lock-free split `probe_asset` → `apply_relink(id, &probed)`
-  (same kinds of stream, length within `RELINK_DURATION_TOLERANCE` s or 1 %; **analysis is kept
-  only for the same media moved** — same length to the millisecond, same streams, same size when
-  the old file is still there — otherwise dropped; a hand-set projection and the id, name and
-  clips carry over) and `remove_asset(id, force)` (`AssetInUse` while a clip of the live cut or the
-  proposal uses it; `force` removes those clips as one never-rippling `Remove media` revision and
-  strips the proposal and a kept discarded one). Both are the user's: refused for an agent while
-  review is on. Caches keyed by the file's path / size / mtime are cleaned by the static
-  `forget_media_caches(path)`, which probes and so runs with the lock released.
-  **Paths**: `probe_asset` (so every import) wants an absolute path to an existing regular file
-  and refuses `http:` / `concat:` / `pipe:` strings and relative paths (`paths.rs`);
-  `check_output_path(out)` refuses an export onto an asset's source, a stitched capture file, the
-  project database and its journal, or anything inside Kerf's cache, canonicalised so a symlink,
-  hard link or `..` detour cannot hide it — `export`, `export_with` and `export_still` call it, and an
-  adapter that renders with the lock released calls it first, under the lock. `history_page(Page)` /
-  `list_tasks_page(Page)` window a long list from the newest end (`Page { limit, offset }`) and
-  return the total.
+  **The media library** is filesystem work (stat, ffprobe, reading file ends), so each op is split to
+  keep it out from under the project lock: an `_inputs` read under the lock (database only), a
+  static fn that touches files with the lock released, an `apply_*` under it again — the
+  `*_inputs → static → apply_*` shape of every media job. `missing_assets_inputs()` →
+  `Project::find_missing_assets(files)` (a stat per asset; `missing_assets()` is the two behind
+  `&self`, for a caller with no lock). `relink_inputs(id)` (the stored asset) →
+  `Project::probe_relink(&old, path, cancel)` (probe, compatibility check, then **the old file's
+  size and a SHA-256 of both files' first and last MiB** — `paths::same_content`, `None` when the old
+  file is gone) → `apply_relink_probed(id, &RelinkProbe)` (no file touched; refused when the entry's
+  path is no longer the one probed against, "try again"); `relink_asset(id, path)` is all three plus
+  `forget_media_caches`, and `apply_relink(id, &Asset)` (an already-probed asset, stat-only size
+  compare) stays as the pre-split shape. Same kinds of stream, length within
+  `RELINK_DURATION_TOLERANCE` s or 1 %; **analysis is kept only for the same media moved** — same
+  length to the millisecond, same streams, and, when the old file was there to compare, the same size
+  *and* ends (an old file that is gone leaves length + streams to decide); otherwise it is dropped. A
+  hand-set projection, the id, name and clips carry over. `remove_asset(id, force)` (`AssetInUse` while
+  a clip of the live cut or the proposal uses it; `force` removes those clips as one never-rippling
+  `Remove media` revision and strips the proposal and a kept discarded one). **Both are the user's,
+  and an agent's call is refused outright** — `AgentReviewRequired` with review on, an
+  `InvalidArgument` with it off (a session could be open, and a forced removal would then edit the
+  proposal while the asset row left the live cut). **History does not bring removed media back**:
+  `restore` (undo / redo / revert) refuses a snapshot with a clip of an asset that is no longer in
+  the library — naming it, from the `removed_assets` meta list (`[id, name]`, newest 200) — rather than
+  put clips of nothing on the timeline; steps from before the media was used still restore. Caches keyed
+  by the file's path / size / mtime are cleaned by the static `forget_media_caches(path)`, which
+  probes and so runs with the lock released.
+  **Paths**: `probe_asset` / `probe_asset_with(path, cancel)` (so every import) want an absolute path to
+  an existing regular file and refuse `http:` / `concat:` / `pipe:` strings and relative paths
+  (`paths.rs`); `check_output_path(out)` refuses an export onto an asset's source, a stitched
+  capture file, the project database and its journal, or anything inside Kerf's cache, canonicalised so
+  a symlink, hard link or `..` detour cannot hide it — `export`, `export_with`, `export_still` and
+  `save_as` call it. It canonicalises and stats, so an adapter that renders with the lock released
+  takes `output_path_inputs()` (a `paths::Protected` list, database + environment only) under the lock
+  and runs the static `Project::check_output_path_with(out, &protected)` after releasing it.
+  `history_page(Page)` / `list_tasks_page(Page)` window a long list from the newest end
+  (`Page { limit, offset }`) and return the total.
   **What a setter accepts is checked where it is set**: a non-finite number is refused by every
   numeric setter and, as the net under all of them, by the serde walk every stored timeline
   goes through (`core-model.md`); `set_volume` clamps to `MAX_CHANNEL_VOLUME` like the track and
@@ -152,11 +174,14 @@
   `undo`/`redo`/`revert_to` as the agent are refused (`AgentReviewRequired` / an
   `InvalidArgument` for the history) — the actor on the lock *is* the "initiated by" argument.
   Off, an agent edits live unless a session is open. **A proposal has an owner** (the MCP
-  session id, `staged.owner`): the adapter calls `ensure_agent_staging(owner)` inside the same
-  lock as an agent edit — it records which session is acting (`set_actor` forgets it at every
-  lock), opens the session when review is on, lets a session with no owner (a claimed task's) be
-  adopted by the first named editor, and answers `StagedEditOwnedByOther` to a different
-  session; a caller that names nobody is "different" from an owner. Apply, discard and undo
+  session id, `staged.owner`; `StagedEdit` serialises only `owned_by_agent`, never the id): the
+  adapter calls `ensure_agent_staging(owner)` inside the same lock as an agent edit — it **declares
+  and checks and writes nothing**: it records which session is acting (`set_actor` forgets it at
+  every lock) and answers `StagedEditOwnedByOther` to a different session (a caller that names nobody
+  is "different" from an owner). The *edit* then opens the session (review on, none open) or lets a
+  session with no owner (a claimed task's) be adopted by the first named editor, inside its own
+  transaction — a call that opened it up front left an empty owned proposal behind whenever the
+  edit then failed. Apply, discard and undo
   by a non-owner agent are refused the same way (the tool that only ends a proposal calls
   `declare_agent(owner)`, which records the session without opening anything); the user (GUI)
   is never refused.
@@ -174,9 +199,12 @@
   `asset_changes[].id`), writes them onto the live cut with `Timeline::merge_subset`
   (`core-model.md`) as one `Agent edit (k of n changes)` revision and reports what it did in a
   `SubsetApplied` (`auto_included` with reasons, `skipped`, `remaining`, `closed`, a
-  `message`). The rest of the proposal **stays open, re-based onto the cut as it now is**
-  (`base` and `base_seq` move; the full proposed timeline is kept, so the remaining diff is
-  exactly what was not picked); it closes when nothing is left. **Discard is restorable**:
+  `message`). The rest of the proposal **stays open, re-based onto the cut as it now is**:
+  `base` and `base_seq` move, and the proposal's timeline is rebuilt as the live cut plus
+  *exactly the changes not applied* (`Timeline::rebase_rest`, `core-model.md`) — not kept as it was,
+  which after a forced accept lacks what the user did since and would diff as undoing it. A change
+  that no longer fits the cut is dropped from the rest (counted in the `message`); it closes when
+  nothing is left. **Discard is restorable**:
   `discard_staged` keeps a non-empty proposal in `meta` (`discarded_staged`, in the file, so it
   survives a restart); `discarded_staged()` previews it and `restore_discarded()` brings it
   back — only with no proposal open (`StagedEditPending`), once, possibly `stale`, with no undo

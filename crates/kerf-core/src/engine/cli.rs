@@ -611,9 +611,12 @@ struct ProbeSideData {
     rotation: Option<f64>,
 }
 
-/// How long `ffprobe` may take over one file before it is killed: it reads headers, so a minute
-/// is a file on a share that stopped answering, not a big file.
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long `ffprobe` may take over one file before it is killed. It reads headers, so this is a
+/// file on a share that stopped answering, not a big file — but a share that is merely *slow to
+/// wake* (a NAS spinning its disks up, a VPN coming back) takes a while to answer its first
+/// read, and ffprobe prints nothing until it is done, so there is no progress to build a stall
+/// bound on: five minutes, and a cancel ends the wait sooner.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// How long the once-per-process capability probes (`-filters`, `-h full`, `-h filter=…`) may
 /// take. They run inside a `OnceLock` every other thread waits on, and a cold first launch
@@ -625,21 +628,32 @@ const CAPABILITY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 // In a full `ffmpeg` build the in-process libav probe is used instead.
 #[cfg_attr(feature = "ffmpeg", allow(dead_code))]
 pub fn probe(path: &Path) -> Result<ProbeResult> {
+    probe_with(path, None)
+}
+
+/// [`probe`] that gives up with [`Error::Cancelled`] once `cancel` is true (ffprobe is killed).
+// In a full `ffmpeg` build the in-process libav probe is used instead.
+#[cfg_attr(feature = "ffmpeg", allow(dead_code))]
+pub fn probe_cancellable(path: &Path, cancel: &dyn Fn() -> bool) -> Result<ProbeResult> {
+    probe_with(path, Some(cancel))
+}
+
+#[cfg_attr(feature = "ffmpeg", allow(dead_code))]
+fn probe_with(path: &Path, cancel: Option<&dyn Fn() -> bool>) -> Result<ProbeResult> {
     let bin = ffprobe_bin();
-    let output = output_bounded(
-        command(&bin)
-            .args(["-v", "error", "-show_format", "-show_streams", "-of", "json"])
-            .arg(path),
-        PROBE_TIMEOUT,
-    )
-    .map_err(|e| match e.kind() {
-        std::io::ErrorKind::TimedOut => Error::Engine(format!(
-            "ffprobe did not answer for {} in {} s and was stopped (is the file on a share that went away?)",
-            path.display(),
-            PROBE_TIMEOUT.as_secs()
-        )),
-        _ => launch_err(&bin, e),
-    })?;
+    let mut cmd = command(&bin);
+    cmd.args(["-v", "error", "-show_format", "-show_streams", "-of", "json"])
+        .arg(path);
+    let output = output_bounded_cancellable(cmd, PROBE_TIMEOUT, cancel)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::TimedOut => Error::Engine(format!(
+                "ffprobe did not answer for {} in {} s and was stopped (is the file on a share that went away?)",
+                path.display(),
+                PROBE_TIMEOUT.as_secs()
+            )),
+            _ => launch_err(&bin, e),
+        })?
+        .ok_or(Error::Cancelled)?;
     if !output.status.success() {
         return Err(Error::Engine(format!(
             "ffprobe failed: {}",
@@ -2142,7 +2156,7 @@ fn score_salience(raw: &[u8]) -> SalienceMap {
 /// at most `max_width` pixels wide.
 pub fn frame_at(path: &Path, time_secs: f64, max_width: u32) -> Result<Vec<u8>> {
     let scale = format!("scale='min({max_width},iw)':-2");
-    decode_frame(path, time_secs, &scale, "png", None, true)
+    decode_frame(path, time_secs, &scale, "png", None, true, None)
 }
 
 /// A rectangle of a frame to look at more closely, as fractions of the full
@@ -2223,7 +2237,20 @@ impl Region {
 /// see [`decode_frame`].
 pub fn frame_jpeg(path: &Path, time_secs: f64, max_width: u32, quality: u8, accurate: bool) -> Result<Vec<u8>> {
     let scale = format!("scale='min({max_width},iw)':-2");
-    decode_frame(path, time_secs, &scale, "mjpeg", Some(quality), accurate)
+    decode_frame(path, time_secs, &scale, "mjpeg", Some(quality), accurate, None)
+}
+
+/// [`frame_jpeg`] that gives up with [`Error::Cancelled`] once `cancel` is true.
+pub fn frame_jpeg_cancellable(
+    path: &Path,
+    time_secs: f64,
+    max_width: u32,
+    quality: u8,
+    accurate: bool,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Vec<u8>> {
+    let scale = format!("scale='min({max_width},iw)':-2");
+    decode_frame(path, time_secs, &scale, "mjpeg", Some(quality), accurate, Some(cancel))
 }
 
 /// [`frame_jpeg`] of one `region` of the frame: the region is cropped out of
@@ -2243,7 +2270,24 @@ pub fn frame_jpeg_region(
         return frame_jpeg(path, time_secs, max_width, quality, accurate);
     }
     let vf = region_frame_filter(region, max_width);
-    decode_frame(path, time_secs, &vf, "mjpeg", Some(quality), accurate)
+    decode_frame(path, time_secs, &vf, "mjpeg", Some(quality), accurate, None)
+}
+
+/// [`frame_jpeg_region`] that gives up with [`Error::Cancelled`] once `cancel` is true.
+pub fn frame_jpeg_region_cancellable(
+    path: &Path,
+    time_secs: f64,
+    region: Region,
+    max_width: u32,
+    quality: u8,
+    accurate: bool,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Vec<u8>> {
+    if region.is_full() {
+        return frame_jpeg_cancellable(path, time_secs, max_width, quality, accurate, cancel);
+    }
+    let vf = region_frame_filter(region, max_width);
+    decode_frame(path, time_secs, &vf, "mjpeg", Some(quality), accurate, Some(cancel))
 }
 
 /// Pure filter chain for [`frame_jpeg_region`] (unit-tested): crop, then scale
@@ -2261,8 +2305,22 @@ fn region_frame_filter(region: Region, max_width: u32) -> String {
 /// `accurate` ffmpeg decodes forward from the keyframe to the exact frame; with
 /// `accurate = false` it snaps to the keyframe (`-noaccurate_seek`, no forward
 /// decode) — tens of ms even on long-GOP 4K, for responsive scrubbing. Decode is
-/// hardware-accelerated per [`hwaccel`].
-fn decode_frame(path: &Path, time_secs: f64, vf: &str, vcodec: &str, quality: Option<u8>, accurate: bool) -> Result<Vec<u8>> {
+/// hardware-accelerated per [`hwaccel`]. With a `cancel` the decode is killed when it goes true and
+/// the answer is [`Error::Cancelled`] — never a reason to retry in software or to switch hardware
+/// decode off; without one (the scrub, which is never cancelled, only superseded) the decode waits
+/// on nothing but its own deadline.
+fn decode_frame(
+    path: &Path,
+    time_secs: f64,
+    vf: &str,
+    vcodec: &str,
+    quality: Option<u8>,
+    accurate: bool,
+    cancel: Option<&dyn Fn() -> bool>,
+) -> Result<Vec<u8>> {
+    if cancel.is_some_and(|cancel| cancel()) {
+        return Err(Error::Cancelled);
+    }
     let time_secs = time_secs.max(0.0);
     // HDR footage is tone-mapped after the caller's own scale/crop, so the
     // expensive float stage runs on the small frame rather than the 4K one.
@@ -2290,24 +2348,37 @@ fn decode_frame(path: &Path, time_secs: f64, vf: &str, vcodec: &str, quality: Op
     let use_hw = hw.is_some();
 
     let bytes = if use_hw {
-        match run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, hw.as_deref(), proxy) {
+        match run_frame_decode(
+            &bin,
+            path,
+            time_secs,
+            vf,
+            vcodec,
+            quality,
+            accurate,
+            hw.as_deref(),
+            proxy,
+            cancel,
+        ) {
             Ok(b) => b,
+            Err(Error::Cancelled) => return Err(Error::Cancelled),
             Err(hw_err) => {
                 // The accelerated decode failed — retry in software. If *that*
                 // works, `-hwaccel` is the culprit on this machine, so disable it
                 // for subsequent frames; if it fails too, the error is genuine.
-                match run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, None, proxy) {
+                match run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, None, proxy, cancel) {
                     Ok(b) => {
                         HWACCEL_OK.store(false, Ordering::Relaxed);
                         tracing::warn!("hardware decode failed ({hw_err}); using software decode for previews");
                         b
                     }
+                    Err(Error::Cancelled) => return Err(Error::Cancelled),
                     Err(_) => return Err(hw_err),
                 }
             }
         }
     } else {
-        run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, None, proxy)?
+        run_frame_decode(&bin, path, time_secs, vf, vcodec, quality, accurate, None, proxy, cancel)?
     };
 
     if let Ok(mut c) = frame_cache().lock() {
@@ -2335,6 +2406,7 @@ fn run_frame_decode(
     accurate: bool,
     hw: Option<&str>,
     single_thread: bool,
+    cancel: Option<&dyn Fn() -> bool>,
 ) -> Result<Vec<u8>> {
     let mut cmd = command(bin);
     // Interactive: never gated and never de-prioritized — a scrubbed frame is
@@ -2365,13 +2437,15 @@ fn run_frame_decode(
         cmd.args(["-threads", "1"]);
     }
     cmd.arg("pipe:1");
-    let output = output_bounded(&mut cmd, FRAME_TIMEOUT).map_err(|e| match e.kind() {
-        std::io::ErrorKind::TimedOut => Error::Engine(format!(
-            "could not extract frame at {time_secs:.3}s: ffmpeg did not answer in {} s and was stopped",
-            FRAME_TIMEOUT.as_secs()
-        )),
-        _ => launch_err(bin, e),
-    })?;
+    let output = output_bounded_cancellable(cmd, FRAME_TIMEOUT, cancel)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::TimedOut => Error::Engine(format!(
+                "could not extract frame at {time_secs:.3}s: ffmpeg did not answer in {} s and was stopped",
+                FRAME_TIMEOUT.as_secs()
+            )),
+            _ => launch_err(bin, e),
+        })?
+        .ok_or(Error::Cancelled)?;
     if !output.status.success() || output.stdout.is_empty() {
         return Err(Error::Engine(format!(
             "could not extract frame at {time_secs:.3}s: {}",
@@ -2666,6 +2740,33 @@ const AUDIO_PCM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60
 /// codec support; the input-side `-ss` fast-seek keeps a window deep in a
 /// long source cheap to extract.
 pub fn audio_pcm(path: &Path, start: f64, duration: f64, sample_rate: u32, filters: Option<&str>) -> Result<Vec<u8>> {
+    audio_pcm_with(path, start, duration, sample_rate, filters, None)
+}
+
+/// [`audio_pcm`] that gives up with [`Error::Cancelled`] once `cancel` is true (the decode is
+/// killed), for a caller that is itself a job someone can stop.
+pub fn audio_pcm_cancellable(
+    path: &Path,
+    start: f64,
+    duration: f64,
+    sample_rate: u32,
+    filters: Option<&str>,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Vec<u8>> {
+    audio_pcm_with(path, start, duration, sample_rate, filters, Some(cancel))
+}
+
+fn audio_pcm_with(
+    path: &Path,
+    start: f64,
+    duration: f64,
+    sample_rate: u32,
+    filters: Option<&str>,
+    cancel: Option<&dyn Fn() -> bool>,
+) -> Result<Vec<u8>> {
+    if cancel.is_some_and(|cancel| cancel()) {
+        return Err(Error::Cancelled);
+    }
     let bin = ffmpeg_bin();
     let mut cmd = command(&bin);
     // Interactive, like the frame decode: the preview's playback is waiting on it.
@@ -2690,13 +2791,15 @@ pub fn audio_pcm(path: &Path, start: f64, duration: f64, sample_rate: u32, filte
         cmd.args(["-af", filters]);
     }
     cmd.args(["-f", "s16le", "pipe:1"]);
-    let output = output_bounded(&mut cmd, AUDIO_PCM_TIMEOUT).map_err(|e| match e.kind() {
-        std::io::ErrorKind::TimedOut => Error::Engine(format!(
-            "could not decode audio: ffmpeg did not answer in {} s and was stopped",
-            AUDIO_PCM_TIMEOUT.as_secs()
-        )),
-        _ => launch_err(&bin, e),
-    })?;
+    let output = output_bounded_cancellable(cmd, AUDIO_PCM_TIMEOUT, cancel)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::TimedOut => Error::Engine(format!(
+                "could not decode audio: ffmpeg did not answer in {} s and was stopped",
+                AUDIO_PCM_TIMEOUT.as_secs()
+            )),
+            _ => launch_err(&bin, e),
+        })?
+        .ok_or(Error::Cancelled)?;
     if !output.status.success() {
         return Err(Error::Engine(format!(
             "could not decode audio: {}",
@@ -8231,6 +8334,33 @@ pub(super) fn output_bounded(cmd: &mut Command, limit: std::time::Duration) -> s
     })
 }
 
+/// [`output_bounded`] that a caller's `cancel` can also stop: `Ok(None)` is a run killed because
+/// `cancel` went true (the caller says [`Error::Cancelled`]); a run past `limit` is the same
+/// `TimedOut` error. With no `cancel` it *is* [`output_bounded`] — the interactive reads (a
+/// scrubbed frame) keep the path that has no polling interval in it.
+pub(super) fn output_bounded_cancellable(
+    mut cmd: Command,
+    limit: std::time::Duration,
+    cancel: Option<&dyn Fn() -> bool>,
+) -> std::io::Result<Option<std::process::Output>> {
+    let Some(cancel) = cancel else {
+        return output_bounded(&mut cmd, limit).map(Some);
+    };
+    // These reads print no `-progress`, so stderr silence means nothing: only the wall clock bounds them.
+    let run = output_supervised(cmd, std::time::Duration::MAX, Some(limit), cancel)?;
+    if run.cancelled {
+        return Ok(None);
+    }
+    if run.timed_out {
+        return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the process timed out"));
+    }
+    Ok(Some(std::process::Output {
+        status: run.status,
+        stdout: run.stdout,
+        stderr: run.stderr.into_bytes(),
+    }))
+}
+
 /// Tune a built still argv for the process about to be spawned: each input's `-hwaccel` and
 /// threads per `decode_policy` (a proxy is decoded on one thread without a hardware session; a
 /// still whose every input is a proxy runs its graph and encoder on one thread too), the budget's
@@ -10175,6 +10305,7 @@ mod tests {
             true,
             hw,
             proxy,
+            None,
         )
         .unwrap();
         assert_eq!(bytes, b"x");
@@ -10197,6 +10328,63 @@ mod tests {
         let original = argv_of_frame_decode(&dir, false, Some("auto"));
         assert_eq!(count(&original, "-hwaccel"), 1);
         assert_eq!(&original[original.len() - 3..], ["-vcodec", "mjpeg", "pipe:1"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_frame_decode_a_caller_cancels_is_killed_and_is_cancelled_not_a_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = cpu::test_lock();
+        let dir = std::env::temp_dir().join(format!("kerf-frame-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let slow = dir.join("slow-ffmpeg");
+        std::fs::write(&slow, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let started = Instant::now();
+        let err = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let cancel = || stop.load(std::sync::atomic::Ordering::SeqCst);
+            run_frame_decode(
+                slow.to_str().unwrap(),
+                Path::new("/media/a.mp4"),
+                3.0,
+                "scale=320:-2",
+                "mjpeg",
+                Some(4),
+                true,
+                None,
+                false,
+                Some(&cancel),
+            )
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+
+        // Already cancelled: not even started, hit or miss.
+        let err = decode_frame(
+            Path::new("/media/a.mp4"),
+            1.0,
+            "scale=320:-2",
+            "mjpeg",
+            Some(4),
+            true,
+            Some(&|| true),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "{err}");
+        let err = audio_pcm_cancellable(Path::new("/media/a.mp4"), 0.0, 1.0, 8_000, None, &|| true).unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10298,7 +10486,7 @@ mod tests {
         let vf = "scale='min(320,iw)':-2";
         let grab = frame_jpeg(&proxy, 1.5, 320, 4, true).unwrap();
         assert!(jpeg(&grab));
-        let untuned = run_frame_decode(&ffmpeg_bin(), &proxy, 1.5, vf, "mjpeg", Some(4), true, None, false).unwrap();
+        let untuned = run_frame_decode(&ffmpeg_bin(), &proxy, 1.5, vf, "mjpeg", Some(4), true, None, false, None).unwrap();
         assert_eq!(grab, untuned, "the grab differs");
 
         // The stream: a second of frames, read from the proxy with the hardware dropped.

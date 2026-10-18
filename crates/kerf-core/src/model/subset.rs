@@ -106,6 +106,25 @@ impl Timeline {
     /// Lay the changes of `proposed` (relative to `base`) named by `picked` onto `self`, the
     /// live cut. See the module docs for what is auto-included and what is refused.
     pub fn merge_subset(&self, base: &Timeline, proposed: &Timeline, picked: &[String]) -> Result<SubsetMerge> {
+        self.merge_picked(base, proposed, picked, true)
+    }
+
+    /// The part of a proposal that is still waiting after a partial accept, as a proposal of its
+    /// own: `self` is the live cut as it now stands, `base` / `proposed` the proposal that was
+    /// reviewed, and `rest` the ids of the changes that were **not** applied. Each is laid on
+    /// `self` by identity exactly as [`Timeline::merge_subset`] does — so what the user changed
+    /// since the proposal branched (a forced accept lets them) stays — but nothing is closed over
+    /// and nothing is refused: this is the cut the reviewer would be shown, not a change about
+    /// to be written, and a change that no longer fits is dropped (in `skipped`), not an error.
+    pub(crate) fn rebase_rest(&self, base: &Timeline, proposed: &Timeline, rest: &[String]) -> Result<SubsetMerge> {
+        self.merge_picked(base, proposed, rest, false)
+    }
+
+    /// `strict` is the partial accept: the picks are closed over what cannot be taken apart, and
+    /// the result is refused if it stacks clips or splits linked ones. Not strict is the rebase of
+    /// the rest of a proposal (see [`Timeline::rebase_rest`]): the picks as given, laid on without
+    /// those two checks.
+    fn merge_picked(&self, base: &Timeline, proposed: &Timeline, picked: &[String], strict: bool) -> Result<SubsetMerge> {
         let diff = base.diff(proposed);
         let entries = &diff.entries;
         if picked.is_empty() {
@@ -126,9 +145,9 @@ impl Timeline {
 
         // The closure: what has to come with what was picked.
         let groups = link_groups([self, base, proposed]);
-        loop {
+        let closed_over = |chosen: &mut BTreeSet<usize>, because: &mut HashMap<usize, String>| loop {
             let mut more: Vec<(usize, String)> = Vec::new();
-            for &i in &chosen {
+            for &i in chosen.iter() {
                 let e = &entries[i];
                 if let Some(clip) = e.clip_id {
                     for partner in partners(&groups, [self, base, proposed], clip) {
@@ -175,6 +194,9 @@ impl Timeline {
                     because.insert(j, why);
                 }
             }
+        };
+        if strict {
+            closed_over(&mut chosen, &mut because);
         }
 
         let mut out = self.clone();
@@ -407,8 +429,10 @@ impl Timeline {
         if out.has_links() {
             out.dissolve_all_orphans();
         }
-        out.check_subset_lanes(self, &touched)?;
-        if out.has_links() {
+        if strict {
+            out.check_subset_lanes(self, &touched)?;
+        }
+        if strict && out.has_links() {
             if let Some((a, b)) = out.first_sync_break(self) {
                 return Err(Error::InvalidArgument(format!(
                     "applying only those changes would pull the linked clips on {a} and {b} out of step — pick the changes to both, or apply the whole proposal"

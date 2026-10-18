@@ -148,15 +148,26 @@ so the feature is **only** activated through these forwards — which is what ma
   `peaks::pump_pcm_cancellable`: killed after a stall of no audio, cancel polled every 100 ms.
   *Moment reads and probes* (`probe`, `run_frame_decode`, `audio_pcm`, the once-per-process
   capability probes `zscale_available` / `help_flags` / `alimiter_latency_available` /
-  `whisper::filter_available`) use `output_bounded` with a wall-clock limit (60 s probe and
-  capability, 120 s a frame, 60 s an audio window); a capability probe that times out reads as
-  "cannot run at all", like a binary that will not start. *Streamed jobs* (export, proxy,
+  `whisper::filter_available`) use `output_bounded` with a wall-clock limit (**300 s** for the
+  import probe — ffprobe prints nothing until it is done, so there is no stall to listen for, and a
+  share that is slow to wake needs minutes, not seconds; 60 s capability, 120 s a frame, 60 s an
+  audio window); a capability probe that times out reads as
+  "cannot run at all", like a binary that will not start. **The reads a job drives take a cancel**:
+  `probe_cancellable` (behind `Project::probe_asset_with`, so `probe_import_with` and the relink),
+  `frame_jpeg_cancellable` / `frame_jpeg_region_cancellable` (behind
+  `Project::decode_preview_frame_cancellable` / `decode_preview_region_cancellable`) and
+  `audio_pcm_cancellable` (`Project::decode_audio_pcm_cancellable`) go through
+  `output_bounded_cancellable(cmd, limit, Option<cancel>)`: with a cancel it is `output_supervised`
+  (stall off, `limit` as the wall-clock `total`), so a stop kills the child and the answer is
+  `Error::Cancelled` — which the frame decode never reads as a hardware failure (no software
+  retry, `HWACCEL_OK` untouched). With `None` it is the plain `output_bounded`: the scrub's frame
+  decodes keep the path with no polling interval (a scrubbed frame is superseded, not cancelled). *Streamed jobs* (export, proxy,
   stitch, whisper filter) use `run_ffmpeg_progress_as` / `run_ffmpeg_streamed_in`: stall bound
   plus cancel, then `reap`. **`reap(child)` is the only way to `wait()` on a child whose pipes
   have closed**: 30 s of grace, then kill (`child.wait()` after a pipe closes blocked for good on a
   muxer flushing to a share that went away). The in-process libav probe (`ffmpeg` feature) runs on
-  a thread and is abandoned after 60 s (`probe_within`; the thread cannot be killed, it holds
-  only the path). **A failed decode is an error, never an empty answer**: a `silencedetect` or
+  a thread and is abandoned after 300 s or when its cancel goes true (`probe_within`, polled every
+  50 ms; the thread cannot be killed, it holds only the path). **A failed decode is an error, never an empty answer**: a `silencedetect` or
   scene pass that exits non-zero, and a `loudnorm` run that does (it prints its summary on the way
   out, a plausible number for a file never read to its end), fail with ffmpeg's last words;
   the one non-zero exit that is an answer is a file with no stream of that kind ("Output file

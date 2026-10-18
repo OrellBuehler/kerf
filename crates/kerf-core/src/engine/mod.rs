@@ -100,15 +100,16 @@ mod ffmpeg;
 // Analysis, frame and waveform extraction always go through the CLI backend —
 // they only need the FFmpeg binaries, never the dev libraries.
 pub use cli::{
-    audio_effects_filter, audio_pcm, contact_sheet, contact_sheet_times, decode_hwaccel, delivery_frame,
+    audio_effects_filter, audio_pcm, audio_pcm_cancellable, contact_sheet, contact_sheet_times, decode_hwaccel, delivery_frame,
     detect_scenes_preferring_cancellable, detect_silence_cancellable, disable_decode_hwaccel, discard_partial, export_still,
-    export_still_cancellable, file_mtime, frame_at, frame_jpeg, frame_jpeg_region, generate_proxy, generate_proxy_with,
-    hw_encoders, insta360_pair, mix_levels, playback_params, proxy_base_width, proxy_path, proxy_width, proxy_width_for,
-    ready_proxy, remove_proxy_files, salience_map_cancellable, seek_arg, set_proxy_base_width, source_identity, stitch_insta360,
-    stitch_insta360_with, stitched_path, stream_preview, stream_preview_until, stream_preview_with, timeline_frame,
-    timeline_frame_region, validate_export, waveform, Container, ExportOptions, ExportProgress, ExportVariant, Fit, ImageFormat,
-    LoudnessPreset, PlaybackParams, PlaybackRequest, PreviewFrame, ProxyRun, RateControl, Region, RenderStatus, ScrubConfig,
-    ScrubFrames, ScrubStats, VariantProgress, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
+    export_still_cancellable, file_mtime, frame_at, frame_jpeg, frame_jpeg_cancellable, frame_jpeg_region,
+    frame_jpeg_region_cancellable, generate_proxy, generate_proxy_with, hw_encoders, insta360_pair, mix_levels, playback_params,
+    proxy_base_width, proxy_path, proxy_width, proxy_width_for, ready_proxy, remove_proxy_files, salience_map_cancellable,
+    seek_arg, set_proxy_base_width, source_identity, stitch_insta360, stitch_insta360_with, stitched_path, stream_preview,
+    stream_preview_until, stream_preview_with, timeline_frame, timeline_frame_region, validate_export, waveform, Container,
+    ExportOptions, ExportProgress, ExportVariant, Fit, ImageFormat, LoudnessPreset, PlaybackParams, PlaybackRequest,
+    PreviewFrame, ProxyRun, RateControl, Region, RenderStatus, ScrubConfig, ScrubFrames, ScrubStats, VariantProgress,
+    MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
 };
 
 pub(crate) use cli::insta360_pair_name;
@@ -144,49 +145,67 @@ pub fn speech_model_names() -> Vec<&'static str> {
 #[cfg(feature = "whisper")]
 pub use cli::decode_audio_16k_mono_cancellable;
 
-/// How long the in-process probe may take before the caller stops waiting for it.
+/// How long the in-process probe may take before the caller stops waiting for it. Five minutes: a
+/// probe only reads headers, but it is the call a file on a share that is slow to wake (a NAS
+/// spinning its disks up, a VPN) takes its time over, and a probe has no progress to listen for,
+/// so the bound is a plain one and a cancel ends the wait sooner.
 #[cfg_attr(not(feature = "ffmpeg"), allow(dead_code))]
-const LIBAV_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const LIBAV_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Run `probe` on a thread and wait for it for `limit`. libav opens a file in-process, where
-/// nothing can kill it: a file on a share that stopped answering would hold the caller (an
-/// import, with the project lock one step away) for good. The thread is left to finish on its
-/// own — it holds nothing but the path — and the caller gets an error it can show.
+/// Run `probe` on a thread and wait for it for `limit`, or until `cancel` is true. libav opens a
+/// file in-process, where nothing can kill it: a file on a share that stopped answering would hold
+/// the caller (an import, with the project lock one step away) for good. The thread is left to
+/// finish on its own — it holds nothing but the path — and the caller gets an error it can show
+/// (`Error::Cancelled` for a stop).
 #[cfg_attr(not(feature = "ffmpeg"), allow(dead_code))]
 fn probe_within<T: Send + 'static>(
     limit: std::time::Duration,
     path: &Path,
+    cancel: &dyn Fn() -> bool,
     probe: impl FnOnce(&Path) -> Result<T> + Send + 'static,
 ) -> Result<T> {
     use crate::error::Error;
     use std::sync::mpsc::{channel, RecvTimeoutError};
+    use std::time::{Duration, Instant};
 
     let owned = path.to_path_buf();
     let (done, answer) = channel();
     std::thread::spawn(move || {
         let _ = done.send(probe(&owned));
     });
-    match answer.recv_timeout(limit) {
-        Ok(result) => result,
-        Err(RecvTimeoutError::Timeout) => Err(Error::Engine(format!(
-            "probing {} did not finish in {} s and was abandoned (is the file on a share that went away?)",
-            path.display(),
-            limit.as_secs()
-        ))),
-        Err(RecvTimeoutError::Disconnected) => Err(Error::Engine(format!("probing {} failed unexpectedly", path.display()))),
+    let started = Instant::now();
+    loop {
+        let left = limit.saturating_sub(started.elapsed());
+        match answer.recv_timeout(left.min(Duration::from_millis(50))) {
+            Ok(result) => return result,
+            Err(RecvTimeoutError::Timeout) if cancel() => return Err(Error::Cancelled),
+            Err(RecvTimeoutError::Timeout) if started.elapsed() >= limit => {
+                return Err(Error::Engine(format!(
+                    "probing {} did not finish in {} s and was abandoned (is the file on a share that went away?)",
+                    path.display(),
+                    limit.as_secs()
+                )))
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(Error::Engine(format!("probing {} failed unexpectedly", path.display())))
+            }
+        }
     }
 }
 
-/// Probe a media file for duration and per-stream metadata.
+/// Probe a media file for duration and per-stream metadata. `cancel` stops it:
+/// [`crate::error::Error::Cancelled`] once it is true.
 #[cfg(feature = "ffmpeg")]
-pub fn probe(path: &Path) -> Result<ProbeResult> {
-    probe_within(LIBAV_PROBE_TIMEOUT, path, ffmpeg::probe)
+pub fn probe_cancellable(path: &Path, cancel: &dyn Fn() -> bool) -> Result<ProbeResult> {
+    probe_within(LIBAV_PROBE_TIMEOUT, path, cancel, ffmpeg::probe)
 }
 
-/// Probe a media file for duration and per-stream metadata.
+/// Probe a media file for duration and per-stream metadata. `cancel` stops it:
+/// [`crate::error::Error::Cancelled`] once it is true.
 #[cfg(not(feature = "ffmpeg"))]
-pub fn probe(path: &Path) -> Result<ProbeResult> {
-    cli::probe(path)
+pub fn probe_cancellable(path: &Path, cancel: &dyn Fn() -> bool) -> Result<ProbeResult> {
+    cli::probe_cancellable(path, cancel)
 }
 
 /// Render the timeline to `output` (in-process libav with the `libav-render`
@@ -247,7 +266,7 @@ mod tests {
     #[test]
     fn a_probe_that_never_returns_is_abandoned_with_an_error() {
         let started = Instant::now();
-        let err = probe_within(Duration::from_millis(300), Path::new("/mnt/gone/a.mp4"), |_| {
+        let err = probe_within(Duration::from_millis(300), Path::new("/mnt/gone/a.mp4"), &|| false, |_| {
             std::thread::sleep(Duration::from_secs(5));
             Ok(0u8)
         })
@@ -262,10 +281,10 @@ mod tests {
     #[test]
     fn a_probe_that_answers_gives_its_result_or_its_error() {
         assert_eq!(
-            probe_within(Duration::from_secs(5), Path::new("a.mp4"), |_| Ok(7u8)).unwrap(),
+            probe_within(Duration::from_secs(5), Path::new("a.mp4"), &|| false, |_| Ok(7u8)).unwrap(),
             7
         );
-        let err = probe_within(Duration::from_secs(5), Path::new("a.mp4"), |_| {
+        let err = probe_within(Duration::from_secs(5), Path::new("a.mp4"), &|| false, |_| {
             Err::<u8, _>(crate::error::Error::Engine("no such stream".into()))
         })
         .unwrap_err();
@@ -273,8 +292,20 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_probe_is_given_up_on_at_once() {
+        let started = Instant::now();
+        let err = probe_within(Duration::from_secs(60), Path::new("/mnt/gone/a.mp4"), &|| true, |_| {
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(0u8)
+        })
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Cancelled), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    }
+
+    #[test]
     fn a_probe_that_panics_is_an_error_not_a_hang() {
-        let err = probe_within(Duration::from_secs(5), Path::new("a.mp4"), |_| -> Result<u8> {
+        let err = probe_within(Duration::from_secs(5), Path::new("a.mp4"), &|| false, |_| -> Result<u8> {
             panic!("libav")
         })
         .unwrap_err();
