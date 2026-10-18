@@ -88,7 +88,9 @@ import {
 	CircleAlert,
 	ChevronUp,
 	CodeXml,
-	Orbit
+	Orbit,
+	Ellipsis,
+	LayoutTemplate
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -188,7 +190,10 @@ export const icons: Record<string, LucideIcon> = {
 	'chevron-up': ChevronUp,
 	// Animated SVG titles: motion on the titles lane, and the source a custom one is written in.
 	'orbit': Orbit,
-	'code-xml': CodeXml
+	'code-xml': CodeXml,
+	// Motion templates: the library's kind of title, and the menu on a card.
+	'layout-template': LayoutTemplate,
+	'ellipsis': Ellipsis
 };
 
 export type IconName = keyof typeof icons;

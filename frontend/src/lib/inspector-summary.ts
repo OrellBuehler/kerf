@@ -52,9 +52,9 @@ export function svgPlacementSummary(o: Pick<SvgOverlay, 'x' | 'y' | 'width' | 'h
 	return o.opacity < 1 ? `${where} · ${pct(o.opacity)} opaque` : where;
 }
 
-/** An animated title's Artwork line: the preset it was made from, else `Custom SVG`. */
-export function svgSourceSummary(o: Pick<SvgOverlay, 'preset'>): string {
-	return o.preset ? svgPresetLabel(o.preset.kind) : 'Custom SVG';
+/** An animated title's Artwork line: the preset it was made from, `Template` when it came from one, else `Custom SVG`. */
+export function svgSourceSummary(o: Pick<SvgOverlay, 'preset'> & Partial<Pick<SvgOverlay, 'template'>>): string {
+	return o.preset ? svgPresetLabel(o.preset.kind) : o.template ? 'Template' : 'Custom SVG';
 }
 
 /** The number a keyframe toggle animates, as the row names it. */

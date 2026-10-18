@@ -191,6 +191,7 @@ import {
 	deleteTemplateDev,
 	exportTemplateDev,
 	importTemplateDev,
+	latestExportedTemplate,
 	listTemplatesDev,
 	saveTemplateFrom,
 	setTemplateValuesIn,
@@ -2954,7 +2955,11 @@ export async function saveTemplate(
 	controls: TemplateControl[],
 	description?: string
 ): Promise<TemplateSaved> {
-	if (!inTauri()) return saveTemplateFrom(devTimeline, overlayId, name, description, controls);
+	if (!inTauri()) {
+		const saved = saveTemplateFrom(devTimeline, overlayId, name, description, controls);
+		noteTemplatesChangedDev();
+		return saved;
+	}
 	return invoke<TemplateSaved>('save_template', { overlayId, name, description: description ?? null, controls });
 }
 
@@ -2993,7 +2998,11 @@ export async function setTemplateValues(overlayId: string, values: Record<string
 /** Bring a `.kerftemplate` file into the library. Never overwrites: the same template is `already_present`,
  *  another one with its id is kept under a new id (`added_as_copy`). */
 export async function importTemplate(path: string): Promise<ImportOutcome> {
-	if (!inTauri()) return importTemplateDev(path);
+	if (!inTauri()) {
+		const outcome = importTemplateDev(path);
+		if (outcome.status !== 'already_present') noteTemplatesChangedDev();
+		return outcome;
+	}
 	return invoke<ImportOutcome>('import_template', { path });
 }
 
@@ -3006,8 +3015,56 @@ export async function exportTemplate(templateId: string, path: string): Promise<
 
 /** Remove a template from the library. Titles already made from it keep working. */
 export async function deleteTemplate(templateId: string): Promise<void> {
-	if (!inTauri()) return deleteTemplateDev(templateId);
+	if (!inTauri()) {
+		deleteTemplateDev(templateId);
+		noteTemplatesChangedDev();
+		return;
+	}
 	return invoke<void>('delete_template', { templateId });
+}
+
+const devTemplateListeners = new Set<() => void>();
+const noteTemplatesChangedDev = () => devTemplateListeners.forEach((cb) => cb());
+
+/** Subscribe to `templates-changed`: the library gained, lost or replaced a template (a save, an import, a delete: the
+ *  GUI's own and an agent's). Returns an unlisten fn. The browser harness announces its own saves, imports and deletes. */
+export async function onTemplatesChanged(cb: () => void): Promise<() => void> {
+	if (!inTauri()) {
+		devTemplateListeners.add(cb);
+		return () => void devTemplateListeners.delete(cb);
+	}
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen('templates-changed', () => cb());
+}
+
+/** Pick a `.kerftemplate` to import; `null` if cancelled. The harness has no file system: it offers the template most
+ *  recently exported in this session (export, delete, import is the round trip), else nothing. */
+export async function pickTemplateFile(): Promise<string | null> {
+	if (!inTauri()) return latestExportedTemplate();
+	const { open } = await import('@tauri-apps/plugin-dialog');
+	const selected = await open({ multiple: false, filters: [{ name: 'Kerf template', extensions: ['kerftemplate'] }] });
+	return typeof selected === 'string' ? selected : null;
+}
+
+/** Ask where to write a template (`defaultName` is the file's name); `null` if cancelled. The harness answers a path
+ *  under `/harness/`, which `exportTemplate` keeps in memory. */
+export async function pickTemplateExportPath(defaultName: string): Promise<string | null> {
+	if (!inTauri()) return `/harness/${defaultName}`;
+	const { save } = await import('@tauri-apps/plugin-dialog');
+	const path = await save({ filters: [{ name: 'Kerf template', extensions: ['kerftemplate'] }], defaultPath: defaultName });
+	return typeof path === 'string' ? path : null;
+}
+
+/** Pick a picture for an `image` control (PNG, JPEG, GIF or WebP); `null` if cancelled. The harness answers a stand-in
+ *  path, and `templateImageValue` gives any such path the same small picture. */
+export async function pickImageFile(): Promise<string | null> {
+	if (!inTauri()) return '/harness/logo.png';
+	const { open } = await import('@tauri-apps/plugin-dialog');
+	const selected = await open({
+		multiple: false,
+		filters: [{ name: 'Image', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }]
+	});
+	return typeof selected === 'string' ? selected : null;
 }
 
 /** Caption the cut: project every clip's transcript through the current edit and

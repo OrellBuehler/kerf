@@ -103,6 +103,8 @@ class EditorUi {
 	/** The Separate-stems dialog: `null` while closed, else the asset whose sound it splits and,
 	 *  when opened from a clip, the clip the stems are laid under. */
 	stemsDialog = $state<{ assetId: string; clipId: string | null } | null>(null);
+	/** The Save-as-template dialog: `null` while closed, else the animated title being kept as a template. */
+	saveTemplateDialog = $state<{ overlayId: string } | null>(null);
 	/** The Fit-to-video dialog: `null` while closed, else the music clip it plans a fit for. */
 	fitMusicDialog = $state<{ clipId: string } | null>(null);
 	/** The export dialog. Opened from the toolbar, ⌘E and the Deliver panel. */
@@ -282,6 +284,14 @@ class EditorUi {
 
 	closeStems() {
 		this.stemsDialog = null;
+	}
+
+	openSaveTemplate(overlayId: string) {
+		this.saveTemplateDialog = { overlayId };
+	}
+
+	closeSaveTemplate() {
+		this.saveTemplateDialog = null;
 	}
 
 	openFitMusic(clipId: string) {

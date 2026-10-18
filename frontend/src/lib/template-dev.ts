@@ -8,6 +8,7 @@
 // path round-trips, and a picture for an `image` control is a fixed one.
 import { checkRect, isSvgColour, MAX_SVG_OVERLAYS } from './svg-dev';
 import { svgDisplayName } from './svg-titles';
+import { plainDecimal } from './template-ui';
 import type {
 	ImportOutcome,
 	SvgElementId,
@@ -27,6 +28,10 @@ const MAX_CONTROLS = 64;
 const MAX_TARGETS = 16;
 const MAX_TEXT_CHARS = 2000;
 const MAX_FAMILY_CHARS = 64;
+const MAX_NAME_CHARS = 120;
+const MAX_LABEL_CHARS = 80;
+const MAX_DESCRIPTION_CHARS = 2000;
+const MAX_SVG_BYTES = 128 * 1024;
 const MAX_SVG_SECONDS = 24 * 3600;
 const COLOR_ATTRIBUTES = ['fill', 'stroke', 'stop-color', 'flood-color', 'lighting-color', 'color'];
 
@@ -86,7 +91,10 @@ function seed(): Map<string, Entry> {
 	return new Map([[info.id, { info, svg: SAMPLE_SVG }]]);
 }
 
-library = seed();
+/** `?empty=1` is a first run: no templates. `?templateproblems=1` adds a file in the library that would not read. */
+const wants = (flag: string) => typeof window !== 'undefined' && new URLSearchParams(window.location?.search ?? '').has(flag);
+
+library = wants('empty') ? new Map() : seed();
 
 /** Put the harness library back to its one sample template and forget the exported files (tests, `?empty`). */
 export function resetDevTemplates(empty = false): void {
@@ -187,6 +195,16 @@ export function readValues(svg: string, controls: TemplateControl[]): Record<str
 	return values;
 }
 
+/** The words Rust's `f64::from_str` takes, after a trim: a sign, decimal digits with an optional point and exponent
+ *  (`5`, `5.`, `.5`, `1e3`, `+2.5E-3`), or `inf` / `infinity` / `nan` in any case. Nothing `Number()` adds: `0x10`, `0b11`,
+ *  `0o7`, `1_000`, a bare `.`. `null` is a string Rust refuses; a word that parses but is not finite comes back as `NaN`. */
+function parseFloatLikeRust(raw: string): number | null {
+	const t = raw.trim();
+	if (/^[+-]?(?:inf|infinity|nan)$/i.test(t)) return Number.NaN;
+	if (!/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(t)) return null;
+	return Number(t);
+}
+
 function checkValue(control: TemplateControl, raw: string): string {
 	const { id } = control;
 	switch (control.kind) {
@@ -205,13 +223,13 @@ function checkValue(control: TemplateControl, raw: string): string {
 			return color;
 		}
 		case 'number': {
-			const n = Number(raw.trim());
-			if (raw.trim() === '' || Number.isNaN(n)) throw invalid(`“${raw}” is not a number for “${id}”`);
+			const n = parseFloatLikeRust(raw);
+			if (n === null) throw invalid(`“${raw}” is not a number for “${id}”`);
 			if (!Number.isFinite(n)) throw invalid(`“${raw}” is not a finite number for “${id}”`);
 			if ((control.min !== undefined && n < control.min) || (control.max !== undefined && n > control.max)) {
 				throw invalid(`${n} is outside what “${id}” takes (${control.min ?? 'any'} to ${control.max ?? 'any'})`);
 			}
-			return n === 0 ? '0' : n.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 20 });
+			return plainDecimal(n);
 		}
 		case 'font': {
 			const family = raw.trim();
@@ -266,44 +284,98 @@ export function applyValues(svg: string, controls: TemplateControl[], values: Re
 	}
 	let out = svg;
 	for (const e of [...edits].reverse()) out = out.slice(0, e.from) + e.with + out.slice(e.to);
+	// The result goes through the sanitiser, which holds a title to 128 KiB.
+	if (new TextEncoder().encode(out).length > MAX_SVG_BYTES) throw invalid(`the SVG is larger than ${MAX_SVG_BYTES / 1024} KiB`);
 	return out;
 }
 
 // ---- checking a template's controls (save) -------------------------------------------------
+// Two passes, as kerf-core runs them (`validate_controls_shape`, then `validate_controls` against the title).
 
-function checkControls(controls: TemplateControl[], svg: string): void {
+const hasControlChars = (s: string) => [...s].some((c) => /\p{Cc}/u.test(c) && c !== '\t' && c !== '\n');
+
+/** `check_text`: required means not blank; at most `max` characters; no control characters but tab and line break. */
+function checkText(what: string, text: string, max: number, required: boolean): void {
+	if (required && text.trim() === '') throw invalid(`${what} is empty`);
+	if ([...text].length > max) throw invalid(`${what} is longer than ${max} characters`);
+	if (hasControlChars(text)) throw invalid(`${what} has a control character in it`);
+}
+
+/** An attribute name as the source spells it: an XML name with at most one prefix, and that prefix `xlink`. */
+function attributeNameOk(name: string): boolean {
+	const ncname = (s: string) => s.length <= 64 && /^[A-Za-z_][A-Za-z0-9_.-]*$/.test(s);
+	const colon = name.indexOf(':');
+	return colon >= 0 ? name.slice(0, colon) === 'xlink' && ncname(name.slice(colon + 1)) : ncname(name);
+}
+
+function checkControlsShape(controls: TemplateControl[]): void {
 	if (controls.length > MAX_CONTROLS) throw invalid(`a template has at most ${MAX_CONTROLS} controls`);
 	const ids = new Set<string>();
-	const places = new Set<string>();
 	for (const c of controls) {
 		if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(c.id)) {
 			throw invalid(`“${c.id}” is not a control id: start with a letter, then letters, digits, - or _ (64 at most)`);
 		}
 		if (ids.has(c.id)) throw invalid(`two controls are called “${c.id}”`);
 		ids.add(c.id);
-		if (!c.label.trim() || [...c.label].length > 80) throw invalid(`the label of “${c.id}” must be 1 to 80 characters`);
+		checkText(`the label of “${c.id}”`, c.label, MAX_LABEL_CHARS, true);
 		if (c.targets.length === 0 || c.targets.length > MAX_TARGETS) throw invalid(`“${c.id}” needs 1 to ${MAX_TARGETS} targets`);
+		for (const t of c.targets) {
+			checkText(`a target of “${c.id}”`, t.element, 200, true);
+			checkAttribute(c, t.attribute);
+		}
 		if (c.kind === 'number') {
+			for (const bound of [c.min, c.max]) {
+				if (bound !== undefined && !Number.isFinite(bound)) throw invalid(`the bounds of “${c.id}” must be numbers`);
+			}
 			if (c.min !== undefined && c.max !== undefined && c.min > c.max) {
 				throw invalid(`the minimum of “${c.id}” is above its maximum`);
 			}
 		} else if (c.min !== undefined || c.max !== undefined) {
 			throw invalid(`only a number control has a minimum or maximum (“${c.id}”)`);
 		}
+	}
+}
+
+/** Whether `inner` is inside `outer` (or the same element), by the start tags' places in the source. */
+function within(svg: string, outer: string, inner: string): boolean {
+	const o = elementWith(svg, outer);
+	const i = elementWith(svg, inner);
+	if (o.start === i.start) return true;
+	return !o.selfClosing && i.start >= o.end && i.start < closeOf(svg, o);
+}
+
+function checkControls(controls: TemplateControl[], svg: string): void {
+	checkControlsShape(controls);
+	if (controls.length === 0) return;
+	const places: { element: string; attribute: string | undefined }[] = [];
+	for (const c of controls) {
 		for (const t of c.targets) {
-			checkAttribute(c, t.attribute);
-			const tag = elementWith(svg, t.element);
-			if (t.attribute === undefined) {
-				if (!['text', 'tspan', 'textPath'].includes(tag.name)) {
-					throw invalid(`“${c.id}” is a text control, but “${t.element}” is a <${tag.name}>, not text`);
-				}
-			} else if (!tag.attrs.some((a) => a.name === t.attribute)) {
-				throw invalid(`the element “${t.element}” has no attribute “${t.attribute}” to set`);
+			const matching = tags(svg).filter((tag) => tag.attrs.some((a) => a.name === 'id' && a.value === t.element));
+			if (matching.length === 0) throw invalid(`“${c.id}” targets the element “${t.element}”, which the title does not have`);
+			if (matching.length > 1) throw invalid(`“${c.id}” targets “${t.element}”, which ${matching.length} elements are called`);
+			const tag = matching[0];
+			if (c.kind === 'text' && !['text', 'tspan', 'textPath'].includes(tag.name)) {
+				throw invalid(`“${c.id}” is a text control but “${t.element}” is a <${tag.name}>: aim it at a <text> or <tspan>`);
 			}
-			if (c.kind === 'image' && tag.name !== 'image') throw invalid(`“${c.id}” is an image control, but “${t.element}” is not an <image>`);
-			const place = `${t.element}\u0000${t.attribute ?? ''}`;
-			if (places.has(place)) throw invalid(`two controls write the same place (“${t.element}”)`);
-			places.add(place);
+			if (c.kind === 'image' && tag.name !== 'image') {
+				throw invalid(`“${c.id}” is an image control but “${t.element}” is a <${tag.name}>, not an <image>`);
+			}
+			if (t.attribute !== undefined && !tag.attrs.some((a) => a.name === t.attribute)) {
+				throw invalid(`“${c.id}” sets “${t.attribute}” on “${t.element}”, which has no such attribute`);
+			}
+			if (places.some((p) => p.element === t.element && p.attribute === t.attribute)) {
+				throw invalid(`more than one control writes ${t.attribute ?? 'the text'} of “${t.element}”`);
+			}
+			places.push({ element: t.element, attribute: t.attribute });
+		}
+	}
+	// A control that replaces an element's text replaces what is inside it, including another control's target.
+	for (const outer of places) {
+		if (outer.attribute !== undefined) continue;
+		for (const inner of places) {
+			if (inner.element !== outer.element && within(svg, outer.element, inner.element)) {
+				throw invalid(`the text of “${outer.element}” is a control, and it holds “${inner.element}”, which another control sets`);
+			}
 		}
 	}
 }
@@ -318,6 +390,7 @@ function checkAttribute(c: TemplateControl, attribute: string | undefined): void
 	const forbidden =
 		['id', 'class', 'style', 'href', 'xlink:href'].includes(attribute) || attribute.startsWith('xmlns') || attribute.startsWith('on');
 	const imageLink = c.kind === 'image' && (attribute === 'href' || attribute === 'xlink:href');
+	if (!attributeNameOk(attribute) || (forbidden && !imageLink)) throw invalid(`“${attribute}” cannot be set by a control (“${id}”)`);
 	const allowed: Record<TemplateKind, (a: string) => boolean> = {
 		text: () => false,
 		color: (a) => COLOR_ATTRIBUTES.includes(a),
@@ -325,9 +398,7 @@ function checkAttribute(c: TemplateControl, attribute: string | undefined): void
 		image: (a) => a === 'href' || a === 'xlink:href',
 		number: () => true
 	};
-	if ((forbidden && !imageLink) || !allowed[c.kind](attribute)) {
-		throw invalid(`a ${c.kind} control cannot write “${attribute}” (“${id}”)`);
-	}
+	if (!allowed[c.kind](attribute)) throw invalid(`a ${c.kind} control cannot write “${attribute}” (“${id}”)`);
 }
 
 // ---- the commands -------------------------------------------------------------------------
@@ -335,9 +406,12 @@ function checkAttribute(c: TemplateControl, attribute: string | undefined): void
 const byName = (a: Entry, b: Entry) =>
 	a.info.name.toLowerCase().localeCompare(b.info.name.toLowerCase()) || a.info.id.localeCompare(b.info.id);
 
-/** `list_templates`: the library by name; a harness library has no unreadable files. */
+/** `list_templates`: the library by name; a harness library has no unreadable files unless `?templateproblems=1` says so. */
 export function listTemplatesDev(): TemplateList {
-	return { templates: [...library.values()].sort(byName).map((e) => structuredClone(e.info)), problems: [] };
+	const problems = wants('templateproblems')
+		? [{ file: '9d1c0f52-4a47-4b8e-8e0c-6b0c1d3f7a11.kerftemplate', error: 'invalid argument: not a Kerf template (format “other”)' }]
+		: [];
+	return { templates: [...library.values()].sort(byName).map((e) => structuredClone(e.info)), problems };
 }
 
 /** `template_poster`: the artwork as an SVG data URL (the backend sends a PNG; both go through an `<img>`). */
@@ -374,17 +448,22 @@ export function saveTemplateFrom(
 ): TemplateSaved {
 	const o = timeline.svg_overlays?.find((t) => t.id === overlayId);
 	if (!o) throw invalid(`animated title not found: ${overlayId}`);
-	const title = name.trim();
-	if (!title || [...title].length > 120) throw invalid('the name must be 1 to 120 characters');
-	if ([...(description ?? '')].length > 2000) throw invalid('the description is longer than 2000 characters');
+	const duration = Math.max(o.end - o.start, 0) + (o.offset ?? 0);
+	if (!Number.isFinite(duration) || duration <= 0 || duration > MAX_SVG_SECONDS) {
+		throw invalid('the title has no length to make a template of');
+	}
+	// A blank name is the title's own display name, as `build_template` has it.
+	const title = name.trim() || svgDisplayName(o);
+	const about = (description ?? '').trim();
+	checkText('the name', title, MAX_NAME_CHARS, true);
+	checkText('the description', about, MAX_DESCRIPTION_CHARS, false);
 	checkControls(controls, o.svg);
 	const { width, height } = shapeOf(o.svg);
-	const duration = o.end - o.start + (o.offset ?? 0);
 	const info: TemplateInfo = {
 		id: uid(),
 		name: title,
-		description: description ?? '',
-		duration: duration > 0 ? duration : 4,
+		description: about,
+		duration,
 		width,
 		height,
 		controls: structuredClone(controls),
@@ -479,8 +558,15 @@ export function exportTemplateDev(id: string, path: string): string {
 	} else if (!hasExtension(path)) {
 		target = `${path}.${TEMPLATE_EXTENSION}`;
 	}
+	files.delete(target);
 	files.set(target, structuredClone(entry));
 	return target;
+}
+
+/** The path the most recent `export_template` wrote in this session, for the harness's import picker; `null` if none. */
+export function latestExportedTemplate(): string | null {
+	const paths = [...files.keys()];
+	return paths.length ? paths[paths.length - 1] : null;
 }
 
 /** `import_template`: never overwrites. The same template is `already_present`, another one with its id is kept under a new id. */

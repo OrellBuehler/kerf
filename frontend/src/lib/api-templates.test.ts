@@ -155,6 +155,52 @@ describe('applying a template (browser harness)', () => {
 		await expect(applyTemplate(SAMPLE_TEMPLATE_ID, {}, 0, null, { width: 0 })).rejects.toThrow(/width and height/);
 	});
 
+	test('a number is what Rust’s f64 parser takes, written in plain decimal: no 0x, 0b, 0o or separators', async () => {
+		const plain = await plainTitle();
+		const size: TemplateControl = { id: 'size', label: 'Size', kind: 'number', targets: [{ element: 'who', attribute: 'font-size' }] };
+		const { info } = await saveTemplate(plain.id, 'Sized', [size]);
+		const sizeOf = async (value: string) => {
+			const { timeline, overlay_id } = await applyTemplate(info.id, { size: value }, 0);
+			return titles(timeline).find((t) => t.id === overlay_id)!.template!.values.size;
+		};
+		const ok: [string, string][] = [
+			['100', '100'],
+			[' 100 ', '100'],
+			['+100', '100'],
+			['100.', '100'],
+			['.5e2', '50'],
+			['1e2', '100'],
+			['1E2', '100'],
+			['-0', '0'],
+			['0.50', '0.5'],
+			['-7.25', '-7.25'],
+			['1e21', '1000000000000000000000'],
+			['1e-7', '0.0000001'],
+			['1.5e-25', '0.00000000000000000000000015']
+		];
+		for (const [given, written] of ok) expect(await sizeOf(given), given).toBe(written);
+		for (const bad of ['0x10', '0X10', '0b11', '0o7', '1_000', '.', 'e5', '1e', '--1', '1 0', '', '  ', '5px', '١٢']) {
+			await expect(applyTemplate(info.id, { size: bad }, 0), JSON.stringify(bad)).rejects.toThrow(/is not a number/);
+		}
+		for (const word of ['inf', 'Infinity', '-INF', 'nan', 'NaN', '1e999']) {
+			await expect(applyTemplate(info.id, { size: word }, 0), word).rejects.toThrow(/is not a finite number/);
+		}
+	});
+
+	test('a title is held to 128 KiB after the values are spliced in', async () => {
+		const room = 1500;
+		const fill = '<!--' + 'x'.repeat(128 * 1024 - ART.length - '<!---->'.length - room) + '-->';
+		const big = (await addSvgOverlay({ custom: ART.replace('</svg>', `${fill}</svg>`) }, 0, 4)).svg_overlays!.at(-1)!;
+		expect(new TextEncoder().encode(big.svg).length).toBeLessThanOrEqual(128 * 1024);
+		const { info } = await saveTemplate(big.id, 'Big', [text('who')]);
+		const { overlay_id, timeline } = await applyTemplate(info.id, { who: 'é'.repeat(300) }, 0);
+		expect(titles(timeline).find((t) => t.id === overlay_id)!.template!.values.who).toBe('é'.repeat(300));
+		const before = (await head()).seq;
+		await expect(applyTemplate(info.id, { who: 'é'.repeat(1000) }, 0)).rejects.toThrow(/the SVG is larger than 128 KiB/);
+		await expect(setTemplateValues(overlay_id, { who: 'é'.repeat(1000) })).rejects.toThrow(/the SVG is larger than 128 KiB/);
+		expect((await head()).seq).toBe(before);
+	});
+
 	test('a colour takes a name, none and currentColor but not a function', async () => {
 		for (const ok of ['teal', '#abc', '#aabbccdd', 'none', 'currentColor']) {
 			const { timeline, overlay_id } = await applyTemplate(SAMPLE_TEMPLATE_ID, { brand: ok }, 0);
@@ -255,18 +301,91 @@ describe('keeping a title as a template (browser harness)', () => {
 			await expect(saveTemplate(plain.id, name, controls)).rejects.toThrow(pattern);
 			expect((await listTemplates()).templates.length).toBe(1);
 		};
-		await refuse([text('a', 'nothing-here')], /no element with the id “nothing-here”/);
-		await refuse([color('c', 'plate', 'stroke')], /no attribute “stroke”/);
+		await refuse([text('a', 'nothing-here')], /targets the element “nothing-here”, which the title does not have/);
+		await refuse([color('c', 'plate', 'stroke')], /sets “stroke” on “plate”, which has no such attribute/);
 		await refuse([color('c', 'plate', 'width')], /cannot write “width”/);
 		await refuse([{ id: 'c', label: 'c', kind: 'color', targets: [{ element: 'plate' }] }], /needs an attribute/);
 		await refuse([{ id: 't', label: 't', kind: 'text', targets: [{ element: 'who', attribute: 'fill' }] }], /take no attribute/);
-		await refuse([text('t', 'plate')], /not text/);
-		await refuse([text('a', 'who'), text('b', 'who')], /same place/);
+		await refuse([text('t', 'plate')], /text control but “plate” is a <rect>/);
+		await refuse([text('a', 'who'), text('b', 'who')], /more than one control writes the text of “who”/);
 		await refuse([text('a', 'who'), text('a', 'who')], /two controls are called/);
 		await refuse([text('9lives', 'who')], /not a control id/);
 		await refuse([{ id: 'n', label: 'n', kind: 'color', targets: [{ element: 'plate', attribute: 'fill' }], min: 1 }], /only a number/);
-		await refuse([text('who')], /name must be/, '  ');
 		await expect(saveTemplate('00000000-0000-4000-8000-000000000000', 'X', [])).rejects.toThrow(/not found/);
+	});
+
+	test('a text control cannot hold another control’s target: an outer text and a tspan inside it', async () => {
+		const nested = await addSvgOverlay(
+			{
+				custom:
+					'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 180"><text id="outer" x="1" y="1" fill="white">Hello <tspan id="inner" fill="red">there</tspan></text></svg>'
+			},
+			0,
+			4
+		);
+		const o = titles(nested).at(-1)!;
+		const save = (controls: TemplateControl[]) => saveTemplate(o.id, 'Nested', controls);
+		await expect(save([text('a', 'outer'), text('b', 'inner')])).rejects.toThrow(
+			/the text of “outer” is a control, and it holds “inner”, which another control sets/
+		);
+		await expect(save([text('a', 'outer'), color('c', 'inner')])).rejects.toThrow(/the text of “outer” is a control, and it holds “inner”/);
+		await expect(save([color('c', 'outer'), text('b', 'inner')])).resolves.toBeDefined();
+		await expect(save([text('a', 'outer'), color('c', 'outer')])).resolves.toBeDefined();
+		await expect(save([text('b', 'inner')])).resolves.toBeDefined();
+	});
+
+	test('an attribute name is an XML name with at most an xlink prefix', async () => {
+		const plain = await plainTitle();
+		const number = (attribute: string): TemplateControl => ({
+			id: 'n',
+			label: 'N',
+			kind: 'number',
+			targets: [{ element: 'who', attribute }]
+		});
+		for (const bad of ['a b', 'font:size', 'xlink:', 'xlink:a:b', '1a', '-a', 'a;b', 'a'.repeat(65), 'é', 'xml:lang', ':a', '']) {
+			await expect(saveTemplate(plain.id, 'X', [number(bad)])).rejects.toThrow(/cannot be set by a control/);
+		}
+		for (const forbidden of ['id', 'class', 'style', 'href', 'xlink:href', 'xmlns', 'xmlns:xlink', 'onclick', 'onload']) {
+			await expect(saveTemplate(plain.id, 'X', [number(forbidden)])).rejects.toThrow(/cannot be set by a control/);
+		}
+		await expect(saveTemplate(plain.id, 'X', [number('font-size')])).resolves.toBeDefined();
+		const image = (attribute: string): TemplateControl => ({ id: 'i', label: 'I', kind: 'image', targets: [{ element: 'logo', attribute }] });
+		await expect(saveTemplate(plain.id, 'X', [image('onclick')])).rejects.toThrow(/cannot be set by a control/);
+		await expect(saveTemplate(plain.id, 'X', [image('href')])).resolves.toBeDefined();
+	});
+
+	test('a name, a description and a label may not carry a control character, nor run long', async () => {
+		const plain = await plainTitle();
+		const control = (label: string): TemplateControl => ({ ...text('who'), label });
+		await expect(saveTemplate(plain.id, 'a\u0007b', [])).rejects.toThrow(/the name has a control character/);
+		await expect(saveTemplate(plain.id, 'x'.repeat(121), [])).rejects.toThrow(/the name is longer than 120/);
+		await expect(saveTemplate(plain.id, 'X', [], 'a\u0000b')).rejects.toThrow(/the description has a control character/);
+		await expect(saveTemplate(plain.id, 'X', [], 'x'.repeat(2001))).rejects.toThrow(/the description is longer than 2000/);
+		await expect(saveTemplate(plain.id, 'X', [control('a\u001fb')])).rejects.toThrow(/the label of “who” has a control character/);
+		await expect(saveTemplate(plain.id, 'X', [control('   ')])).rejects.toThrow(/the label of “who” is empty/);
+		await expect(saveTemplate(plain.id, 'X', [control('x'.repeat(81))])).rejects.toThrow(/the label of “who” is longer than 80/);
+		const tabbed = await saveTemplate(plain.id, 'Two\tcolumns', [control('Line\none')], 'a\nb');
+		expect(tabbed.info.name).toBe('Two\tcolumns');
+		expect(tabbed.info.description).toBe('a\nb');
+		expect((await listTemplates()).templates.length).toBe(2);
+		await expect(saveTemplate(plain.id, 'X', [{ ...text('who'), targets: [{ element: 'who\u0007' }] }])).rejects.toThrow(/a target of “who” has a control character/);
+	});
+
+	test('a blank name is the title’s own name, as the engine has it; the description is trimmed', async () => {
+		const plain = await plainTitle();
+		const unnamed = await saveTemplate(plain.id, '  ', [], '  about  ');
+		expect(unnamed.info.name).toBe('SVG');
+		expect(unnamed.info.description).toBe('about');
+		await updateSvgOverlay(plain.id, { name: '  Opener ' });
+		expect((await saveTemplate(plain.id, '', [])).info.name).toBe('Opener');
+		expect((await saveTemplate(plain.id, ' Mine ', [])).info.name).toBe('Mine');
+	});
+
+	test('the template runs as long as the title does, a slice’s offset included', async () => {
+		const plain = await plainTitle();
+		expect((await saveTemplate(plain.id, 'Whole', [])).info.duration).toBe(4);
+		const sliced = (await addSvgOverlay({ custom: ART }, 1, 3)).svg_overlays!.at(-1)!;
+		expect((await saveTemplate(sliced.id, 'Short', [])).info.duration).toBe(2);
 	});
 
 	test('an image control is aimed at an <image> href and never mirrored into the values', async () => {

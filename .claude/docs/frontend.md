@@ -1449,6 +1449,46 @@ partial values, unknown control ids), values spliced into the artwork by element
 and `import_template` never overwriting; there is no file system, so an exported "file" is kept under its path for
 `importTemplate` to read back, and any image path answers one fixed picture. `api-templates.test.ts` drives it.
 
+**Motion templates in the editor.** The library, the saving, the splicing and the sanitiser are the engine's; the page
+asks well and shows the result through `<img>` data URLs only. `template-ui.ts` is the pure side (bun-tested): `slugId`
+(a control id from its label: lower case, accents dropped, `-2` past a taken one), `defaultAttribute` (a color's `stop-color`
+on a `stop`, else `fill`; an image's `href`; a font's `font-family`; a number's usual size), `elementsFor` (text at
+`text` / `tspan`, an image at `<image>`), the draft model (`DraftControl`, `relabel` / `changeKind` / `pickElement`),
+`controlProblem` / `checkDraft` (kerf-core's `validate_controls` said before the round trip — the engine still has the last
+word), `valueRefusal` / `normalizeValue` / `plainDecimal` (a value as the engine takes it: numbers unitless, plain decimal),
+`pickColor` / `swatchOf`, and the words (`savedLine`, `importLine`, `appliedLine`). It reads a title's *source* only for
+names and values (`elementAttributes`, `imageHref`: a regular-expression walk of the start tags, so an element is offered
+the attribute it has; a picture is shown only if it is a `data:image/png|jpeg|gif|webp` URL). `template-actions.ts` runs
+them (`addTemplateHere`, `importTemplateFile`, `exportTemplateFile`, `deleteTemplateFile` — asks first —,
+`saveTitleAsTemplate`, `setTemplateValue`, `setTemplateImage`; `posterOf` caches a poster per id) and says outcomes through
+`notifications` (the engine's warnings are the toast's description); `editor.applyTemplate` / `setTemplateValues` take
+the `TemplateEdit`'s timeline like any edit and the first selects the new title. **Library**: `TemplatesSection` is part
+of `TitlesControls`, so the Titles tab and the Inspector's Titles lane both have it: an `Import…` ghost button on the
+`TEMPLATES` heading, one `TemplateCard` each (poster in the delivery frame's shape, the duration as a chip over it, name,
+`N controls`, font families; a click adds it at the playhead; the `⋯` button and a right-click offer *Add at the
+playhead*, *Export…* — a save dialog for `.kerftemplate`, the harness answers `/harness/<name>` and keeps the "file" for
+`importTemplate` — and *Delete…* — confirmed, titles made from it keep working). The grid reads the library when it opens,
+after its own actions and on `templates-changed` (`onTemplatesChanged`; the harness announces its own saves, imports and
+deletes); `problems` are a collapsed one-line `<details>`; an empty library explains how to make one. There is no drag to
+the timeline: the preset tiles have none either. **Save as template…** (`SaveTemplateDialog` over `Modal`; `ui.saveTemplateDialog`,
+mounted by the page and counted in `modalOpen`): name (blank = the title's own name, as the engine has it), description, and
+a list of controls (`TemplateControlEditor`): label, kind, an id that follows the label until edited, the element(s)
+from `svgElementIds` (`id · tag`, only those the kind can aim at), the attribute (a select for color / image, fixed for
+font, none for text, free with the element's own numeric attributes as suggestions for a number), min / max for a
+number; each control's problem is under it and Save waits on all; the engine's refusal is shown in the dialog and its
+warnings (a font that could not be embedded) in a toast. A title that is itself from a template starts with its
+controls. **Inspector**: an animated title gets a **Template** section (`TemplateSection`) — first, above Timing, when it
+came from a template (a field per control: text, a swatch + hex field, a number with its `min` / `max`, a font select
+over `ui.availableFonts`, an image thumbnail + *Choose image…* → `pickImageFile` → `templateImageValue`; one
+`set_template_values` edit per committed change — `change` / blur, never per keystroke, to the title the field took focus
+on (`FieldEdits`), unchanged values write nothing, a refused one toasts and puts the field back; a control whose
+element left the artwork says so) and last, for custom artwork, as *Save as template…*; preset titles have no ids to
+aim at and no section. Editing the SVG source ends the link (the section says so). A swatch for a color *name* asks the
+browser's canvas (`css-color.ts`). Harness: `?empty=1` has no templates, `?templateproblems=1` lists an unreadable file;
+`template-dev.ts` now refuses what core does (nested text controls, `attribute_name_ok`, control characters in name /
+description / label, a blank name falling back to the title's, Rust's `f64` grammar for numbers, 128 KiB after the
+splice). Tests: `template-ui`, `template-actions`, `template-wiring`, `css-color`, `api-templates`.
+
 **Animated SVG titles in the editor.** The engine draws the artwork (resvg, into every preview and export frame), so the
 page **never inlines the SVG** — `svg-titles.test.ts` fails on any `{@html}` / `innerHTML` in `src/` — and shows it only as an
 `<img>` data URL (`svgDataUrl`; the CSP's `img-src` has `data:`) for a preset's thumbnail. `svg-titles.ts` is the pure side

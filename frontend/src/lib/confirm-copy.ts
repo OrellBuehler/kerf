@@ -70,6 +70,7 @@ export const CONFIRM = {
 		cancel: 'Cancel'
 	},
 	replaceCaptions: { title: 'Replace captions?', ok: 'Replace', cancel: 'Cancel' },
+	deleteTemplate: { title: 'Delete this template?', ok: 'Delete', cancel: 'Cancel' },
 	resetSettings: {
 		title: 'Reset all settings?',
 		message:
