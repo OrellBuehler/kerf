@@ -113,7 +113,7 @@ pub(super) fn export(timeline: &Timeline, assets: &[Asset], opts: &InterchangeOp
     if !timeline.markers.is_empty() {
         report.info("markers are not written to the EDL");
     }
-    if !timeline.overlays.is_empty() {
+    if !timeline.overlays.is_empty() || !timeline.svg_overlays.is_empty() {
         report.warn("titles and captions are not carried by an EDL");
     }
     if track.muted {

@@ -239,12 +239,19 @@ pub(super) fn export(timeline: &Timeline, assets: &[Asset], opts: &InterchangeOp
             timeline.overlays.len()
         ));
     }
+    if !timeline.svg_overlays.is_empty() {
+        report.info(format!(
+            "{} animated titles have no OTIO equivalent; they are kept in metadata.kerf",
+            timeline.svg_overlays.len()
+        ));
+    }
     let doc = json!({
         "OTIO_SCHEMA": "Timeline.1",
         "name": one_line(&opts.title),
         "global_start_time": null,
         "metadata": {"kerf": {
             "overlays": timeline.overlays,
+            "svg_overlays": timeline.svg_overlays,
             "format": timeline.format,
             "master": timeline.master,
             "rate": opts.rate,

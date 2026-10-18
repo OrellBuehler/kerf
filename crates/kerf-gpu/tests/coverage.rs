@@ -60,6 +60,7 @@ fn archetypes(base: &Asset, side: &Asset) -> Vec<(&'static str, Timeline)> {
     let timeline = |tracks, overlays, format| Timeline {
         tracks,
         overlays,
+        svg_overlays: Vec::new(),
         markers: vec![],
         format: Some(format),
         master: Default::default(),

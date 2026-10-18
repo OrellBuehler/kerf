@@ -18,7 +18,7 @@
 //! every still that is not inside a transition is what it always was.
 
 use crate::clip_timing::{transition_fx, ClipTiming, FadeStep, FadeTint, Rational};
-use crate::model::{Asset, Timeline};
+use crate::model::{bt709_labels, Asset, StreamInfo, StreamKind, Timeline};
 use crate::render_plan::{active_video_clips, active_video_clips_with_tails, ActiveClip};
 
 use super::fade_filter;
@@ -87,6 +87,10 @@ pub(super) struct StillLayer<'a> {
     /// The travel of a slide or push in frame widths and heights; `(0, 0)` for a clip that
     /// is not moving.
     pub motion: (f64, f64),
+    /// The still's chain labels the picture BT.709: it is untagged HD beside a layer of this
+    /// still that names a matrix ([`bt709_labels`]), decided over the layers on screen, which
+    /// are the inputs of this still's graph.
+    pub label_bt709: bool,
 }
 
 /// The layers of the still of `timeline` (the rendered one) at `t`, in composite order.
@@ -95,6 +99,24 @@ pub(super) struct StillLayer<'a> {
 /// `fps` is the delivery rate; one FFmpeg would refuse leaves the still as it was, drawing
 /// the clips of their own span and no transition.
 pub(super) fn still_layers<'a>(timeline: &'a Timeline, assets: &[Asset], fps: f64, t: f64) -> Vec<StillLayer<'a>> {
+    let mut layers = timed_layers(timeline, assets, fps, t);
+    let streams: Vec<Option<&StreamInfo>> = layers
+        .iter()
+        .map(|l| {
+            assets
+                .iter()
+                .find(|a| a.id == l.active.clip.asset_id)
+                .and_then(|a| a.streams.iter().find(|s| s.kind == StreamKind::Video))
+        })
+        .collect();
+    for (layer, label) in layers.iter_mut().zip(bt709_labels(&streams)) {
+        layer.label_bt709 = label;
+    }
+    layers
+}
+
+/// The layers on screen with their fades and travel; [`still_layers`] adds the label.
+fn timed_layers<'a>(timeline: &'a Timeline, assets: &[Asset], fps: f64, t: f64) -> Vec<StillLayer<'a>> {
     let (Some(canvas), Some(pick)) = (Rational::from_fps(fps), Rational::from_fps_filter(fps)) else {
         return active_video_clips(timeline, assets, t)
             .into_iter()
@@ -102,6 +124,7 @@ pub(super) fn still_layers<'a>(timeline: &'a Timeline, assets: &[Asset], fps: f6
                 active,
                 fades: StillFades::default(),
                 motion: (0.0, 0.0),
+                label_bt709: false,
             })
             .collect();
     };
@@ -141,6 +164,7 @@ pub(super) fn still_layers<'a>(timeline: &'a Timeline, assets: &[Asset], fps: f6
                     alpha_source: fx[active.flat].alpha,
                 },
                 motion,
+                label_bt709: false,
             }
         })
         .collect()
