@@ -27,6 +27,7 @@ const state = (over: Partial<MenuState> = {}): MenuState => ({
 	detachedPanels: [],
 	desktop: true,
 	previewing: false,
+	recent: [],
 	...over
 });
 
@@ -77,6 +78,7 @@ describe('File', () => {
 		expect(names).toEqual([
 			'New project',
 			'Open project…',
+			'Open Recent',
 			'Save project…',
 			'Import media…',
 			'Import captions…',
@@ -504,5 +506,38 @@ describe('moving about a menu', () => {
 		expect(typeahead(items, fourth, 'c')).toBe(first);
 		expect(typeahead(items, 0, 'C')).toBe(first);
 		expect(typeahead(items, 0, 'q')).toBeNull();
+	});
+});
+
+describe('File › Open Recent', () => {
+	const recent = (over: Partial<MenuState> = {}) => find(menu('file', over).items, 'Open Recent') as Extract<MenuEntry, { kind: 'submenu' }>;
+
+	test('lists the projects newest first, each by its file name, then clears', () => {
+		const sub = recent({ recent: ['/a/summer.kerf', '/b/interview.kerf'] });
+		expect(sub.kind).toBe('submenu');
+		expect(labels(sub.items)).toEqual(['summer.kerf', 'interview.kerf', 'Clear recent projects…']);
+		const first = sub.items[0];
+		expect(first.kind === 'command' && first.command).toEqual({ type: 'recent', path: '/a/summer.kerf' });
+		const last = sub.items[sub.items.length - 1];
+		expect(last.kind === 'command' && last.command).toEqual({ type: 'recent-clear' });
+	});
+
+	test('two projects with one name are told apart by their folder', () => {
+		const sub = recent({ recent: ['/work/a/cut.kerf', '/work/b/cut.kerf', '/c/other.kerf'] });
+		expect(labels(sub.items).slice(0, 3)).toEqual(['cut.kerf — a', 'cut.kerf — b', 'other.kerf']);
+	});
+
+	test('with none it is one greyed entry that says where they come from', () => {
+		const sub = recent({ recent: [] });
+		expect(sub.items).toHaveLength(1);
+		const only = sub.items[0];
+		expect(only.kind === 'command' && only.disabled).toBe(true);
+		expect(only.kind === 'command' && only.reason).toContain('listed here');
+	});
+
+	test('stays listed in a browser (an open there says it is a desktop thing)', () => {
+		const sub = recent({ desktop: false, recent: ['/a.kerf'] });
+		expect(sub.disabled).toBeUndefined();
+		expect(labels(sub.items)[0]).toBe('a.kerf');
 	});
 });

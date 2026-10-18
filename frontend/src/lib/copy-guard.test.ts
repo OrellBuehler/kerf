@@ -31,7 +31,8 @@ const state: MenuState = {
 	openPanels: ['library', 'preview', 'timeline', 'inspector', 'agent'],
 	detachedPanels: [],
 	desktop: true,
-	previewing: false
+	previewing: false,
+	recent: ['/projects/a.kerf']
 };
 
 describe('the ellipsis', () => {
@@ -57,7 +58,8 @@ describe('the ellipsis', () => {
 	test('an entry that opens a dialog says so, and one that acts at once does not', () => {
 		const offenders = entries.flatMap((e) => {
 			const label = entryLabel(e);
-			const opens = e.kind === 'action' && OPENS_SOMETHING.has(e.id);
+			// Clearing the recent projects asks first (a confirm is a dialog); the greyed placeholder shares its command.
+			const opens = (e.kind === 'action' && OPENS_SOMETHING.has(e.id)) || (e.kind === 'command' && e.command.type === 'recent-clear' && !e.disabled);
 			if (opens && !label.endsWith('…')) return [`${label} opens something and has no ellipsis`];
 			if (!opens && label.endsWith('…')) return [`${label} acts at once and has an ellipsis`];
 			return [];

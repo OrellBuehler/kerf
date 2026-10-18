@@ -19,6 +19,7 @@ import {
 	type ImportChoice
 } from './caption-import-ui';
 import { attempt, errorMessage, holdForPreview, report } from './ops';
+import { settings } from './settings.svelte';
 import type { TextStyle } from './style-presets';
 import { sampleSvg, svgDataUrl, svgFrame, svgPresetChoice } from './svg-titles';
 import type { SvgCheck, SvgOverlay, SvgPresetInfo, SvgPresetKind, TextOverlay } from './types';
@@ -26,7 +27,7 @@ import type { SvgCheck, SvgOverlay, SvgPresetInfo, SvgPresetKind, TextOverlay } 
 /** A plain title at the playhead. */
 export function addTextHere(): Promise<void> {
 	const at = Math.max(0, ui.time);
-	return attempt(() => editor.addTitle('Text', at, at + 3));
+	return attempt(() => editor.addTitle('Text', at, at + settings.editing.title_seconds));
 }
 
 /** Add a preset-styled overlay at the playhead: create, style, then (for faded

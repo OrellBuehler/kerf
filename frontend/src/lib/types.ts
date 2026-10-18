@@ -1355,6 +1355,9 @@ export interface AppSettings {
 	/** Whether a request must carry `Authorization: Bearer <token>`. The token itself is never in the
 	 *  settings view: ask `mcpConnectionInfo`. */
 	mcp_require_token: boolean;
+	/** The editing defaults — `{ snap, still_seconds, title_seconds }` — read by `editing-prefs.ts`, which
+	 *  clamps what it finds. Opaque to the backend. */
+	editing: unknown | null;
 }
 
 /** What `setSettings` may write: any preference but the recent-projects list, which the app keeps itself

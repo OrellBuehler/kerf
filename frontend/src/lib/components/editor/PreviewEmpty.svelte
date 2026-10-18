@@ -11,6 +11,7 @@
 	import { firstRunAction, firstRunSteps } from '$lib/first-run';
 	import { toast } from '$lib/notifications.svelte';
 	import { report } from '$lib/ops';
+	import { placementOut } from '$lib/editing-prefs';
 	import { clipsIn, exportButtonState } from '$lib/export-button';
 
 	const steps = $derived(
@@ -31,7 +32,7 @@
 		const a = target;
 		if (!a) return;
 		try {
-			await editor.add(a.id, 0, a.duration, undefined, 0);
+			await editor.add(a.id, 0, placementOut(a, settings.editing.still_seconds), undefined, 0);
 			toast.success(`Added ${a.name} to the timeline`);
 		} catch (e) {
 			report(e);

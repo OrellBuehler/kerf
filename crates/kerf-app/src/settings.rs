@@ -97,6 +97,10 @@ pub struct Settings {
     /// frontend owns the action registry, the chord syntax and the migration
     /// between versions, so a new action or a renamed one needs no change here.
     pub keybindings: Option<serde_json::Value>,
+    /// The editing defaults — snapping on at launch, the length of a still image and of a title
+    /// when one is placed: `{ snap, still_seconds, title_seconds }`. Opaque like the rest: the
+    /// frontend owns the shape and clamps what it reads.
+    pub editing: Option<serde_json::Value>,
     // ---- agent / MCP server (owned by `mcp.rs`; keep together) ----
     /// Whether an agent's edits are held back for the user to review before they reach the cut
     /// (the default). The agent-facing `set_settings` tool cannot change it.
@@ -148,6 +152,7 @@ impl Default for Settings {
             theme: None,
             workspaces: None,
             keybindings: None,
+            editing: None,
             agent_review: true,
             mcp_enabled: true,
             mcp_addr: None,
@@ -221,6 +226,7 @@ pub struct SettingsView {
     pub theme: Option<serde_json::Value>,
     pub workspaces: Option<serde_json::Value>,
     pub keybindings: Option<serde_json::Value>,
+    pub editing: Option<serde_json::Value>,
     pub agent_review: bool,
     pub mcp_enabled: bool,
     pub mcp_addr: Option<String>,
@@ -251,6 +257,7 @@ impl SettingsView {
             theme: stored.theme.clone(),
             workspaces: stored.workspaces.clone(),
             keybindings: stored.keybindings.clone(),
+            editing: stored.editing.clone(),
             agent_review: stored.agent_review,
             mcp_enabled: stored.mcp_enabled,
             mcp_addr: stored.mcp_addr.clone(),
@@ -267,7 +274,7 @@ static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 /// The keys a patch may carry — every field of [`Settings`] but `recent_projects`,
 /// which the app keeps itself.
-const KEYS: [&str; 17] = [
+const KEYS: [&str; 18] = [
     "cpu_percent",
     "auto_analysis",
     "proxy_size",
@@ -280,6 +287,7 @@ const KEYS: [&str; 17] = [
     "theme",
     "workspaces",
     "keybindings",
+    "editing",
     "agent_review",
     "mcp_enabled",
     "mcp_addr",
@@ -799,6 +807,7 @@ mod tests {
         assert!(s.theme.is_none());
         assert!(s.workspaces.is_none());
         assert!(s.keybindings.is_none());
+        assert!(s.editing.is_none());
     }
 
     #[test]
@@ -892,6 +901,26 @@ mod tests {
         // …and a null is "back to the defaults".
         let cleared = merge(&merged, &serde_json::json!({"keybindings": null})).unwrap();
         assert!(cleared.keybindings.is_none());
+    }
+
+    #[test]
+    fn editing_defaults_round_trip_untouched_patch_alone_and_reset() {
+        let editing = serde_json::json!({"snap": false, "still_seconds": 8, "title_seconds": 4});
+        let s = Settings {
+            editing: Some(editing.clone()),
+            ..Settings::default()
+        };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.editing, Some(editing.clone()));
+        assert_eq!(SettingsView::current(&back).editing, Some(editing.clone()));
+
+        let merged = merge(&Settings::default(), &serde_json::json!({ "editing": editing })).unwrap();
+        assert_eq!(merged.editing, Some(editing));
+        let other = merge(&merged, &serde_json::json!({"safe_areas": true})).unwrap();
+        assert_eq!(other.editing, merged.editing, "another patch leaves the defaults alone");
+        let cleared = merge(&merged, &serde_json::json!({"editing": null})).unwrap();
+        assert!(cleared.editing.is_none());
+        assert!(reset_keep(&merged).editing.is_none(), "a reset puts them back");
     }
 
     fn scratch() -> PathBuf {

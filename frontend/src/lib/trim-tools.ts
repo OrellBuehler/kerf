@@ -40,6 +40,7 @@ import { toFixedEven } from './format-fixed';
 import { quantizeTime, snapToFrame, splitPoint } from './frames';
 import { DIFF_EPS } from './ripple';
 import { gestureReason } from './link-ui';
+import { trim } from './link-ops';
 import { formatTime, type TimeMode } from './time-format';
 import type { Asset, Clip, SplitSide, StreamKind, Timeline, Track } from './types';
 import { clipDuration } from './types';
@@ -91,6 +92,47 @@ const messageOf = (e: unknown) =>
  *  or `Infinity` for a still (it loops, so it never runs out). */
 export function sourceLimits(assets: readonly Pick<Asset, 'id' | 'duration' | 'streams'>[]): SourceLimits {
 	return new Map(assets.map((a) => [a.id, a.streams.some((s) => s.image) ? Infinity : a.duration]));
+}
+
+/** What `trimRefusal` needs to know about the project. */
+export interface TrimEnv {
+	ripple: boolean;
+	assets: readonly Pick<Asset, 'id' | 'name' | 'duration' | 'streams'>[];
+}
+
+/** What `trim_clip` would answer to new source points for a clip, asked of the very port the harness runs
+ *  (`link-ops.ts`) on a scratch copy: `null` when the backend takes it, else its sentence — the footage it does
+ *  not have, a negative start, a lane it would land on (after the ripple, when that is on). The Inspector's In / Out
+ *  ask it before they send a typed number. Never throws and never touches `timeline`. */
+export function trimRefusal(
+	timeline: Timeline,
+	env: TrimEnv,
+	clipId: string,
+	sourceIn?: number,
+	sourceOut?: number,
+	timelineStart?: number,
+	link?: boolean
+): string | null {
+	try {
+		const assets = new Map(env.assets.map((a) => [a.id, a]));
+		trim(
+			plainCopy(timeline),
+			{
+				ripple: env.ripple,
+				links: link ?? true,
+				footage: sourceLimits(env.assets),
+				hasAudio: (id) => !!assets.get(id)?.streams.some((s) => s.kind === 'audio'),
+				asset: (id) => assets.get(id)
+			},
+			clipId,
+			sourceIn,
+			sourceOut,
+			timelineStart
+		);
+		return null;
+	} catch (e) {
+		return capital((e instanceof Error ? e.message : String(e)).replace(/^invalid argument: /, ''));
+	}
 }
 
 // ---- cuts -------------------------------------------------------------------

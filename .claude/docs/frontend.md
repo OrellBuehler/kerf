@@ -1108,37 +1108,75 @@ abandoning drags and closing menus and dialogs, Tab, Enter / Space on a focused
 control, a widget's arrows, wheel and click modifiers). Focus goes back to a row
 after every change: focus left on the page behind a modal stops Escape closing it.
 
-**Settings** are their own runes singleton (`src/lib/settings.svelte.ts`) behind
-the title bar's gear (⌘,): `SettingsDialog.svelte` is a section rail plus a
-panel, so the next preference is a row in a list rather than new chrome. Six
-sections: **Performance** — the CPU limit as three named budgets (Background /
-Balanced / Full speed) over a slider, reading back "9 of 12 cores for Kerf · 3
-left for everything else", because the complaint this answers arrives in those
-terms and not in percentages — **Analysis**, a master "analyze new media when it is imported" and one
-toggle per kind (silence, scenes, loudness, rhythm, transcript; `Settings.auto_analysis`, which replaced
-the single `transcribe` checkbox and migrates it): a clip can always be analysed by hand whatever is off,
-and the same set decides what an agent's `analyze_asset` runs when it names no steps — so the per-kind
-toggles stay editable while the master is off. **Speech** keeps
-the voiceover model and points at Analysis; `TranscriptionStatus.enabled` is the transcript switch, so
-the transcript tab says "Speech-to-text is off for new imports" and offers Transcribe. And **Preview**:
-the **proxy size** (720 / 1080 / 1280 default / Off, `settings.proxySize`) and the **preview source**
-(Auto / Always original / Proxy only, `settings.previewSource`; disabled with size Off, which forces the
-original) — both written through, followed by a status refresh and a preview nudge — then one checkbox
-for the safe-area guides over a vertical or square cut, and the experimental GPU preview
-toggle with this machine's status line (technique, adapter, last failure). And **Appearance**: the
-three theme presets as chips, a name and a dark/light scheme, **Import… /
-Export…** (a `.json` file through the dialog plugin and `read_text_file` /
-`write_text_file`; the harness uses an `<input type=file>` and a download), then
-every color token as a picker grouped by `COLOR_GROUPS`. A color edit applies
-at once (`applyTheme`) and is written 300 ms later — a picker fires per pixel
-of a drag — and while one is pending a view coming back from another write
-leaves the theme alone, so the newer colors never flicker back. Changing any
-color makes the theme `Custom` (`presetIdFor` compares colors, not the name).
-And **Keyboard**, described above. The percentage is clamped by the engine, so the
-view that comes *back* from `set_settings` is what renders, not the value asked
-for; in the browser harness `api.ts` answers from localStorage
-(`kerf.settings.*`, the layout, theme, workspaces and keybindings as JSON strings) over
-`navigator.hardwareConcurrency` so the dialog is drivable under `bun run dev`.
+**Settings** are their own runes singleton (`src/lib/settings.svelte.ts`) behind the title bar's gear (⌘,). `SettingsDialog.svelte` is a
+rail of **nine sections** — General, Appearance, Editing, Preview & playback, Performance, Analysis, Agent, Keyboard, Advanced; it opens on
+General — and a **search box** on top of the rail. A section is a component of its own (`Settings<Name>.svelte`) made of `SettingRow`s
+(`id`, label, hint, control right or stacked), and `settings-index.ts` lists every row's id with the words that should find it: a query
+hides every row it does not match (`useFilter()` context, `settings-filter.ts`), the panel then shows each section with a match under its
+heading (counts on the rail; a rail click scrolls to the section), Escape clears the box before it closes the dialog.
+`settings-index.test.ts` scans the section files and holds rows and index to each other, so a row that cannot be found, or an entry
+nothing answers to, fails a test. Where each setting lives (**every control is wired end to end**):
+**General** — *Time display* (`time_display`: timecode / seconds; `settings.setTimeMode` sets `timeDisplay.mode`, which every readout
+follows, and is read back on launch), *Reopen the last project* (`reopen_last_project`) and *Recent projects* (the list `recentProjects`
+prunes, with *Clear* behind a confirm; the same list is File › Open Recent). **Appearance** — theme presets, name and scheme, Import… /
+Export… (their own row, so they no longer wrap), then the shape sliders and every colour token (a colour edit applies at once and is written
+300 ms later; changing any makes the theme `Custom`). **Editing** — the defaults a fresh session starts with, one opaque JSON object
+`Settings.editing` (`{snap, still_seconds, title_seconds}`, `editing-prefs.ts`, read field by field and clamped, never trusted):
+*Snapping on at launch* (sets `ui.snap` once on load and again when changed; the toolbar toggle stays the session's), *Length of a still
+image* (`placementOut(asset, still_seconds)` is the source end of every single placement — the bin's *Add at playhead* / *Append*, the
+Inspector's, the empty Preview's and a bin drag — *Append all* is the backend's `concatenate` and keeps its default) and *Length of a new
+title* (the Titles lane's + and *Add text*). **Preview & playback** — proxy size and preview source (`ChoiceChips`, the one radio-chip
+component: one tab stop, arrows move; proxy size only moves focus because choosing one rebuilds every proxy), safe areas, the GPU preview
+and its status line. **Performance** — the CPU limit as three named budgets over a slider, read back as "9 of 12 cores for Kerf · 3 left".
+**Analysis** — a master "analyze on import" and one switch per kind (`auto_analysis`; the same set decides what an agent's `analyze_asset`
+runs when it names no steps), the **speech model** (select, status, *Download now* with a progress bar showing bytes and a **Stop**:
+`ui.fetchSpeechModel` / `ui.stopModelDownload` over `model-progress`, a stopped download is a notice, not an error) and the voiceover
+model. **Agent** — *Review the agent's edits* (`agent_review`; turning it **off** asks), *Let agents connect* with the listener's state
+(`mcpStatus`: off / listening on URL / why it is not / starting) and when an agent last came, the *address* (validated before it is sent,
+`addressProblem`; the server restarts by itself; `KERF_MCP_ADDR` in the environment wins and the row says so — a restart-required note
+rather than a silent no-op; a network address needs the token), the *access token* (require switch; masked until *Show*; *Copy*;
+*New token…* asks), and **Connect an agent** (`McpConnect.svelte`, also the Agent panel's Connect card: the endpoint plus per-client setup
+— Claude Code's one-line command with the `Authorization: Bearer` header, a `mcpServers` JSON for Cursor / Windsurf / Cline / Zed, VS Code's
+`.vscode/mcp.json`, Claude Desktop through `mcp-remote`; `mcp-clients.ts`; the token is dots in the snippet until *Show token*, a copy
+always takes the real text). All of it goes through `setMcpSettings` / `mcpConnectionInfo` / `regenerateMcpToken`; a `settings-changed`
+event (an agent's `set_settings`) is `settings.noteChanged(view)` and the section reads again. **Keyboard** — described above.
+**Advanced** — *Open logs*, *Show the settings file* (`reveal_settings_file`), *Reset layout* (every workspace to its preset, the question
+Window › Reset all workspaces asks: `resetAllWorkspacesAsked`) and *Reset all settings* (confirm; `reset_settings` keeps the old file beside
+the new one and the agent door — address, token — as it was; `settings.resetAll()` reads everything that is read once again and the dock
+is rebuilt, `workspace.rebuild()`). The percentage is clamped by the engine, so the view that comes *back* from `set_settings` is what
+renders, not the value asked for; in the browser harness `api.ts` answers from localStorage (`kerf.settings.*`, the layout, theme,
+workspaces, keybindings and editing defaults as JSON strings) over `navigator.hardwareConcurrency` so the dialog is drivable under
+`bun run dev`.
+
+**Media that has gone, media taken out** (`library-actions.ts`, words and counts in `library-copy.ts`). `mediaStatus.missing` is what `missing_assets` says
+(read with every status refresh and once more when a project comes up: `checkMissingOnOpen` opens **`RelinkDialog`** by itself when anything is
+gone). A bin card carries a `missing` badge, the bin a banner with *Relink…*, the asset's Inspector a callout, and the bin's menu *Relink to another
+file…* / *Remove from project…*. **Relink** (`pickRelinkPath` → `relink_asset`) keeps the asset's id, place and every clip; it says when the new file
+is a different recording and the analysis was dropped. **Remove** confirms: unused media is a plain question; media a clip (or the open proposal —
+`getStagedTimeline` is counted) uses says what goes with it and passes `force`, one `Remove media` step that cannot be undone (the media is gone);
+both are held while a proposal is previewed.
+**Partial accept** (`review-picks.ts`, the Agent panel's card): every change has a checkbox (and each group header a tri-state one, library changes
+a `Library` group); nothing ticked is the whole proposal. Ticked changes go to `apply_staged_subset` (`editor.applyStagedSubset` → `#apply` with
+`review`, the proposal closes only when the backend says `closed`; a stale cut asks first, as for Apply). **A linked picture and sound go together**: the card says
+*Comes along — linked to a clip you picked* beforehand (`comingAlong`, the same closure read off the live cut and the proposal) and the toast
+is the backend's own sentence (what came along, what no longer applied, how many are left). The Apply button says `Apply 2 of 4`. *Undo step*
+(`undo_staged_edit`, a small icon beside the badge) takes back the agent's latest step inside the proposal. **A discard is restorable**: the toast's
+Undo and the panel's *Restore* card (`editor.discarded`, read whenever no proposal is open) call `restore_discarded_edits`.
+**Export asks before it replaces a file** (`export-overwrite.ts`): the files the render will write (the path, or one `-9x16` sibling per delivery shape)
+go through `pathsExist`; the file the native save dialog returned is skipped (it asked), every other one that exists is asked about once.
+**Music structure** (`MusicStructure.svelte`, `music-structure.ts`) is the Inspector's view of `get_music_structure`: the energy curve (`getEnergy`, asked
+once per asset), a line per bar, the intro and a coloured band wherever a stretch repeats (the longest repeating phrase wins over the halves inside it);
+under the clip's *Music* section and the asset's *Music structure*.
+**File › Open Recent** is `settings.recent` (`recentProjects`, pruned; refreshed on open and save) in a submenu with *Clear recent projects…* (asks); the page runs
+it (`onMenuCommand` → `openProjectAt(path, true)`, the unsaved-work question included). **Jobs you may stop** (`job-line.ts`): the status bar shows
+the one in front — framing the shots (`smart-crop-progress`, `cancel_smart_crop`), a cover frame, a speech model download, an import (also a ✕ in the
+library header and a Stop on the empty bin) — with its percentage and **Stop**; a stopped run is a notice (`isCancelled` in `report`), not an error.
+**Long lists are read a page at a time** (`paging.ts`): `getHistory(limit)` / `listTasks(limit)` return the newest 100 edits / 30 tasks, the Agent panel
+says `100+ edits` and *Show older edits* / *Show older tasks* ask for more; undo / redo cope with a head older than the page (`undoable`, `redoable`).
+**The refusals the engine gained are mirrored** (`clip-limits.test.ts` replays `review_tests.rs`): `link-ops.ts` `addClip` / `trim` / `setSpeed` refuse
+footage past the end (`SOURCE_EPS`), a negative start, a clip left on another of its lane *after* the ripple (`checkOwnLanes`, `runEdit`'s `lanes`) and a
+speed outside `MIN_SPEED..MAX_SPEED` (a linked partner too); the harness runs them, and the Inspector's typed In / Out asks `trimRefusal` first so the
+sentence is the backend's, said at once.
 
 The **update flow** is its own runes singleton (`src/lib/updater.svelte.ts`,
 alongside `editor`/`ui`/`agent`): it runs a *silent* check at startup and every

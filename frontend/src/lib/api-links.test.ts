@@ -234,8 +234,10 @@ describe('linked A/V (browser harness)', () => {
 		await expect(trimClip('c1', undefined, undefined, 1)).rejects.toThrow(/A2 at 0:13\.0 that is not linked to it/);
 		expect(await headSeq()).toBe(before);
 		expect(JSON.stringify(await getTimeline())).toBe(json);
-		// With links off the picture is trimmed alone; with ripple on the clip is pushed ahead of the sound.
-		t = await trimClip('c1', undefined, 14, undefined, false);
+		// With links off the picture is trimmed alone (and may not run onto the next shot either); with ripple on the
+		// clip is pushed ahead of the sound.
+		await expect(trimClip('c1', undefined, 14, undefined, false)).rejects.toThrow(/overlap another clip on V1/);
+		t = await trimClip('c1', undefined, 11, undefined, false);
 		expect(clip(t, sound.id)!.source_out).toBe(12.5);
 		await revertTo(before);
 		await setRippleMode(true);
@@ -373,7 +375,12 @@ describe('linkedTrimPreview agrees with the commit (browser harness)', () => {
 				expect(preview).not.toBeNull();
 				const target = every(before).find((x) => x.id === clipId)!;
 				const e = trimEdit(target, edge, pos);
-				const done = await trimClip(clipId, e.source_in, e.source_out, e.timeline_start);
+				// The backend refuses a trim that leaves the clip on another of its lane; the preview says so too.
+				const done = await trimClip(clipId, e.source_in, e.source_out, e.timeline_start).catch(() => null);
+				if (!done) {
+					expect([clipId, edge, pos, preview.ok]).toEqual([clipId, edge, pos, false]);
+					continue;
+				}
 				for (const g of preview.ghosts) {
 					const real = every(done).find((x) => x.id === g.id)!;
 					expect([clipId, edge, pos, g.id, real.timeline_start]).toEqual([clipId, edge, pos, g.id, expect.closeTo(g.start, 9)]);

@@ -175,7 +175,8 @@ of *this* computer Kerf may use is not something that should travel inside a
 `.kerf` file; `KERF_CPU_PERCENT` wins at launch, a moved slider wins after.
 The file also carries the **workspaces** (which one is active, each one's
 dock arrangement, the library rail's tab and folded state), the **color theme**,
-the **keybindings** the user changed and `layout` — the single arrangement from
+the **keybindings** the user changed, the **editing defaults** (`editing`: `{snap, still_seconds, title_seconds}`, read and clamped by
+`editing-prefs.ts`; a reset puts them back) and `layout` — the single arrangement from
 before there were workspaces, now only migrated from — as opaque
 `serde_json::Value`s: the frontend owns their shape and
 validates them on the way back in, so `get_settings` re-reads the file for those

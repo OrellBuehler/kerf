@@ -67,6 +67,7 @@
 		timingSummary
 	} from '$lib/inspector-summary';
 	import { fitOffer, musicSummary } from '$lib/music-ui';
+	import MusicStructure from './MusicStructure.svelte';
 	import { DEGREES, NUMBER_COL, PERCENT, SECONDS, TIMES, readout, type RowSpec } from '$lib/slider-row';
 	import { FieldEdits } from '$lib/field-edit';
 	import { tip } from '$lib/tip';
@@ -540,6 +541,14 @@
 		} catch (e) {
 			report(e);
 		}
+	}
+
+	/** A typed In / Out, asked of the port of the backend's own rules first (`trimRefusal`): footage the file does
+	 *  not have, a negative start, a lane it would land on — said at once, in the backend's words. */
+	async function trimChecked(clipId: string, sourceIn?: number, sourceOut?: number) {
+		const why = editor.trimRefusal(clipId, sourceIn, sourceOut);
+		if (why) throw new Error(why);
+		await editor.trim(clipId, sourceIn, sourceOut);
 	}
 
 	// Right-click anywhere on the panel that isn't an editable field (those keep
@@ -1315,11 +1324,11 @@
 			<div class="k-overline" style="margin:12px 0 4px">Trim source</div>
 			{@render timeRow('In', clip.source_in, sourceFps, (v, at) => {
 				const c = clipOf(at);
-				if (c) void run(() => editor.trim(c.id, v, undefined));
+				if (c) void run(() => trimChecked(c.id, v, undefined));
 			})}
 			{@render timeRow('Out', clip.source_out, sourceFps, (v, at) => {
 				const c = clipOf(at);
-				if (c) void run(() => editor.trim(c.id, undefined, v));
+				if (c) void run(() => trimChecked(c.id, undefined, v));
 			})}
 			</InspectorSection>
 
@@ -1361,6 +1370,7 @@
 					{musicOffer.reason ??
 						'Repeats or drops whole phrases on bar lines, keeping the intro and the ending, until the music lasts as long as the picture.'}
 				</div>
+				<div style="margin-top:10px"><MusicStructure assetId={clip.asset_id} {music} /></div>
 				</InspectorSection>
 			{/if}
 

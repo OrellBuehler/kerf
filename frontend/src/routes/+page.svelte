@@ -12,6 +12,7 @@
 	import FitMusicDialog from '$lib/components/editor/FitMusicDialog.svelte';
 	import StemsDialog from '$lib/components/editor/StemsDialog.svelte';
 	import ShortcutSheet from '$lib/components/editor/ShortcutSheet.svelte';
+	import RelinkDialog from '$lib/components/editor/RelinkDialog.svelte';
 	import ContextMenu from '$lib/components/editor/ContextMenu.svelte';
 	import NotificationCenter from '$lib/components/editor/NotificationCenter.svelte';
 	import Icon from '$lib/components/editor/Icon.svelte';
@@ -25,6 +26,7 @@
 	import { settings } from '$lib/settings.svelte';
 	import { mediaStatus } from '$lib/media-status.svelte';
 	import { workspace } from '$lib/workspace.svelte';
+	import { resetAllWorkspacesAsked } from '$lib/workspace-actions';
 	import { popout } from '$lib/popout.svelte';
 	import { windows } from '$lib/windows.svelte';
 	import { contextMenu } from '$lib/context-menu.svelte';
@@ -46,16 +48,20 @@
 	} from '$lib/ops';
 	import { allowsRepeat, type ActionId } from '$lib/keymap';
 	import { runMenuCommand } from '$lib/menu-commands';
+	import type { MenuCommand } from '$lib/menus';
 	import { saveCoverFrame, saveProject } from '$lib/file-actions';
 	import { importCaptionFile } from '$lib/title-actions';
+	import { checkMissingOnOpen } from '$lib/library-actions';
 	import {
 		askUnsaved,
 		inTauri,
 		isMediaPath,
-		confirmAction,
 		onAnalysisProgress,
 		onAnalysisStatus,
+		onImportProgress,
+		onModelProgress,
 		onProxyProgress,
+		onSmartCropProgress,
 		onWindowCloseRequested,
 		openReleases,
 		quitApp,
@@ -70,11 +76,11 @@
 	import { afterPaint, fontsReady, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
 	import { tip } from '$lib/tip';
-	import { CONFIRM, UNSAVED, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
+	import { UNSAVED, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
 	import { changeIndex, changePoints, stepChange } from '$lib/staged-diff';
 	import { clampPlayhead, secondFrames, stepFrames } from '$lib/frames';
+	import type { SettingsView } from '$lib/types';
 	import { isPagingKey, onEditorSurface } from '$lib/focus-area';
-	import type { ModelProgress } from '$lib/types';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
 	 *  may fire: Space / Delete / J-K-L would edit the live project under it. */
@@ -85,6 +91,7 @@
 			ui.voiceoverDialog !== null ||
 			ui.aboutDialog ||
 			ui.fitMusicDialog !== null ||
+			ui.relinkDialog ||
 			ui.stemsDialog !== null ||
 			ui.shortcutSheet
 	);
@@ -139,6 +146,8 @@
 
 	onMount(() => {
 		const firstLoad = editor.load();
+		// A project that comes up with media whose file is gone offers to relink it.
+		void firstLoad.then(() => checkMissingOnOpen());
 		void agent.load();
 		void ui.loadFonts();
 		void ui.loadTranscriptionStatus();
@@ -174,6 +183,12 @@
 		// (an agent's runs included) — the bin's badges and chips read them.
 		void onProxyProgress((s) => mediaStatus.noteProxy(s)).then((un) => unlisteners.push(un));
 		void onAnalysisStatus((s) => mediaStatus.noteAnalysis(s)).then((un) => unlisteners.push(un));
+		// Only a 360 lens pair reports an import's progress — its stitch is a full re-encode, so the import
+		// overlay shows how far along it is (and Stop). A speech model's download reports its bytes; a smart
+		// crop reports the shots sampled so far.
+		void onImportProgress((p) => (editor.importProgress = p.fraction)).then((un) => unlisteners.push(un));
+		void onModelProgress((p) => ui.noteModelProgress(p)).then((un) => unlisteners.push(un));
+		void onSmartCropProgress((p) => (editor.smartCropProgress = p.fraction)).then((un) => unlisteners.push(un));
 		// Analysis names its step as it goes — transcription in particular downloads a model and then runs for
 		// minutes. (The browser harness simulates the ticks.)
 		void onAnalysisProgress((p) => ui.noteAnalysisProgress(p)).then((un) => unlisteners.push(un));
@@ -221,6 +236,7 @@
 			ui.projectReplaced();
 			await agent.load();
 			toast.info(`The agent switched to ${editor.projectName}`);
+			void checkMissingOnOpen();
 		}
 		/** The flag changed behind our back (an agent set it): re-read it, and say so
 		 *  — it is the user's own toolbar setting that moved. */
@@ -268,19 +284,11 @@
 					// menu does, so reload everything it showed (the backend already refused to drop
 					// unsaved work unless the agent was told to).
 					await listen('project-replaced', () => void onProjectReplaced()),
+					// An agent changed a setting (MCP `set_settings`): the dialog and everything backed by one follows.
+					await listen<SettingsView>('settings-changed', (e) => settings.noteChanged(e.payload)),
 					// Likewise the ripple flag: an agent that flips it changes what
 					// the user's next trim or delete does, so the toolbar has to say.
-					await listen('ripple-mode-changed', () => void onRippleChanged()),
-					// Only a 360 lens pair reports here — its stitch is a full
-					// re-encode, so the import overlay shows how far along it is.
-					await listen<{ fraction: number }>(
-						'import-progress',
-						(e) => (editor.importProgress = e.payload.fraction)
-					),
-					await listen<ModelProgress>(
-						'model-progress',
-						(e) => (ui.modelFraction = e.payload.fraction ?? 0)
-					)
+					await listen('ripple-mode-changed', () => void onRippleChanged())
 				);
 				// A `.kerf` on the command line of this very launch (a second launch's
 				// arrives as the events above, unless it came while this page was still
@@ -338,8 +346,9 @@
 		}
 	}
 
-	/** Open a project file — `path` when a launch handed one over, else the picker. */
-	async function openProjectAt(path?: string) {
+	/** Open a project file — `path` when a launch handed one over, else the picker; `recent` when it is one of
+	 *  File › Open Recent's (a file that has gone is then dropped from the list and said so). */
+	async function openProjectAt(path?: string, recent = false) {
 		if (!inTauri()) {
 			toast.info('Opening a project file is available in the desktop app.');
 			return;
@@ -347,14 +356,25 @@
 		if (renderRunning()) return;
 		if (!(await okToReplace())) return;
 		try {
-			if (await editor.openProject(path)) {
+			if (await (recent && path ? editor.openRecent(path) : editor.openProject(path))) {
 				ui.projectReplaced();
 				await agent.load();
 				toast.success(`Opened ${editor.projectName}`);
+				void checkMissingOnOpen();
 			}
 		} catch (e) {
 			toast.error(e instanceof Error ? e.message : String(e));
+		} finally {
+			// Opening puts the project at the top of the recent list; a file that has gone drops off it.
+			void settings.refreshRecent();
 		}
+	}
+
+	/** File › Open Recent's entries, and the one that clears the list; everything else is `runMenuCommand`'s. */
+	function onMenuCommand(c: MenuCommand) {
+		if (c.type === 'recent') void openProjectAt(c.path, true);
+		else if (c.type === 'recent-clear') void settings.clearRecentAsked();
+		else runMenuCommand(c);
 	}
 
 	async function onSave() {
@@ -390,12 +410,8 @@
 
 	/** Window › Reset all workspaces throws away every arrangement made, so it asks first
 	 *  — unless there is none to lose, when it only rebuilds the one on screen. */
-	async function resetAllWorkspaces() {
-		const w = settings.workspaces;
-		const stored = Object.keys(w.layouts).length > 0 || Object.keys(w.library.tabs).length > 0;
-		const reset = CONFIRM.resetWorkspaces;
-		if (stored && !(await confirmAction(reset.message, reset.title, reset))) return;
-		workspace.resetAll();
+	function resetAllWorkspaces() {
+		return resetAllWorkspacesAsked();
 	}
 
 	function onAbout() {
@@ -672,7 +688,7 @@
 	inert={modalOpen}
 	style="position:fixed;inset:0;display:flex;flex-direction:column;background:var(--surface-void)"
 >
-	<TitleBar onAction={runAction} onCommand={runMenuCommand} />
+	<TitleBar onAction={runAction} onCommand={onMenuCommand} />
 	<!-- While a proposal is on screen the editor is showing a cut that is not
 	     the project's yet; say so where it cannot be missed, and keep its three answers — apply, discard, go
 	     back — in reach, so the review does not need the Agent panel open. The timeline is read-only here. -->
@@ -810,6 +826,10 @@
 
 {#if ui.shortcutSheet}
 	<ShortcutSheet onClose={() => ui.closeShortcuts()} />
+{/if}
+
+{#if ui.relinkDialog}
+	<RelinkDialog onClose={() => ui.closeRelink()} />
 {/if}
 
 <ContextMenu />

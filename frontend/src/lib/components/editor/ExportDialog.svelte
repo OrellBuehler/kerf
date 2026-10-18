@@ -9,7 +9,9 @@
 	import Readiness from './Readiness.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
-	import { inTauri, pickExportPath, hwEncoders, knownHwEncoders, revealPath } from '$lib/api';
+	import { confirmAction, inTauri, pathsExist, pickExportPath, hwEncoders, knownHwEncoders, revealPath } from '$lib/api';
+	import { overwriteCopy } from '$lib/confirm-copy';
+	import { exportTargets, filesToReplace } from '$lib/export-overwrite';
 	import { toast } from '$lib/notifications.svelte';
 	import { formatsFor, hasPicture } from '$lib/delivery-formats';
 	import { timeDisplay } from '$lib/time-display.svelte';
@@ -73,6 +75,8 @@
 
 	let opts = $state<ExportOptions>(initial.opts);
 	let outputPath = $state('');
+	/** The file the native save dialog returned — it asked about replacing it already. */
+	let pickedPath = $state<string | null>(null);
 	let activePreset = $state(initial.id);
 	let customRes = $state(remembered?.customRes ?? false);
 	onDestroy(() => {
@@ -215,7 +219,10 @@
 	}
 	async function browse() {
 		const p = await pickExportPath(info.ext);
-		if (p) outputPath = p;
+		if (p) {
+			outputPath = p;
+			pickedPath = p;
+		}
 	}
 	async function doExport() {
 		if (!inTauri()) {
@@ -225,6 +232,14 @@
 		if (!outputPath) {
 			await browse();
 			if (!outputPath) return;
+		}
+		// The files this will write that are already there — the save dialog asked about the one it picked, not
+		// about a container switched since, nor about the per-shape siblings of a multi-format export.
+		const targets = exportTargets(outputPath, variantFormats);
+		const replace = filesToReplace(targets, await pathsExist(targets).catch(() => []), pickedPath);
+		if (replace.length > 0) {
+			const copy = overwriteCopy(replace);
+			if (!(await confirmAction(copy.message, copy.title, copy))) return;
 		}
 		try {
 			const finalOpts = useRange && marks ? { ...opts, range: marks } : opts;

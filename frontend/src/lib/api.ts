@@ -521,7 +521,8 @@ function devEnv(ripple: boolean | undefined, link: boolean | undefined): ops.Edi
 		ripple: ripple ?? devRippleMode,
 		links: devLinks(link),
 		footage: devLimits(),
-		hasAudio: (assetId) => !!assetById(assetId)?.streams.some((s) => s.kind === 'audio')
+		hasAudio: (assetId) => !!assetById(assetId)?.streams.some((s) => s.kind === 'audio'),
+		asset: (assetId) => assetById(assetId)
 	};
 }
 
@@ -1747,11 +1748,9 @@ export async function setRippleMode(on: boolean): Promise<boolean> {
 
 export async function cutClip(assetId: string, start: number, end: number): Promise<Timeline> {
 	if (!inTauri()) {
-		devEdit(undefined, () => {
-			const track = trackForAsset(devTimeline, assetId);
-			track.clips.push({ id: uid(), asset_id: assetId, source_in: start, source_out: end, timeline_start: trackEnd(track), volume: 1, fade_in: 0, fade_out: 0 });
-		});
-		recordDev('Add clip');
+		const asset = assetById(assetId);
+		if (!asset) throw new Error(`asset not found: ${assetId}`);
+		devRun((tl) => ops.addClip(tl, devEnv(undefined, undefined), asset, null, start, end));
 		return snapshot();
 	}
 	return invoke<Timeline>('cut_clip', { assetId, start, end });
@@ -1765,12 +1764,9 @@ export async function addClip(
 	timelineStart?: number
 ): Promise<Timeline> {
 	if (!inTauri()) {
-		devEdit(undefined, () => {
-			const track = (trackId && devTimeline.tracks.find((t) => t.id === trackId)) || trackForAsset(devTimeline, assetId);
-			const start = timelineStart ?? trackEnd(track);
-			track.clips.push({ id: uid(), asset_id: assetId, source_in: sourceIn, source_out: sourceOut, timeline_start: start, volume: 1, fade_in: 0, fade_out: 0 });
-		});
-		recordDev('Add clip');
+		const asset = assetById(assetId);
+		if (!asset) throw new Error(`asset not found: ${assetId}`);
+		devRun((tl) => ops.addClip(tl, devEnv(undefined, undefined), asset, trackId, sourceIn, sourceOut, timelineStart));
 		return snapshot();
 	}
 	return invoke<Timeline>('add_clip', { assetId, trackId, sourceIn, sourceOut, timelineStart });
@@ -4084,7 +4080,8 @@ export async function getSettings(): Promise<SettingsView> {
 			theme: readBrowserJson(THEME_KEY),
 			workspaces: readBrowserJson(WORKSPACES_KEY),
 			keybindings: readBrowserJson(KEYBINDINGS_KEY),
-			...harnessAgentSettings()
+			...harnessAgentSettings(),
+			editing: readBrowserJson(EDITING_KEY)
 		});
 	}
 	return invoke<SettingsView>('get_settings');
@@ -4113,6 +4110,7 @@ export async function setSettings(patch: SettingsPatch): Promise<SettingsView> {
 			if ('workspaces' in patch) writeBrowserJson(WORKSPACES_KEY, patch.workspaces);
 			if ('keybindings' in patch) writeBrowserJson(KEYBINDINGS_KEY, patch.keybindings);
 			applyHarnessAgentSettings(patch);
+			if ('editing' in patch) writeBrowserJson(EDITING_KEY, patch.editing);
 		} catch {
 			// A private window with storage blocked still gets a working dialog.
 		}
@@ -4131,6 +4129,7 @@ const LAYOUT_KEY = 'kerf.settings.layout';
 const THEME_KEY = 'kerf.settings.theme';
 const WORKSPACES_KEY = 'kerf.settings.workspaces';
 const KEYBINDINGS_KEY = 'kerf.settings.keybindings';
+const EDITING_KEY = 'kerf.settings.editing';
 const TIME_DISPLAY_KEY = 'kerf.settings.timeDisplay';
 const REOPEN_KEY = 'kerf.settings.reopenLastProject';
 const MIN_CPU_PERCENT = 10;
@@ -4222,8 +4221,13 @@ function writeBrowserJson(key: string, value: unknown) {
 
 function browserSettings(settings: AppSettings): SettingsView {
 	const cores = Math.max(1, navigator.hardwareConcurrency || 4);
+	const mcp = harnessMcpInfo({});
 	return {
 		...settings,
+		agent_review: mcp.agent_review,
+		mcp_enabled: mcp.enabled,
+		mcp_addr: mcp.configured_addr,
+		mcp_require_token: mcp.require_token,
 		cpu_cores: cores,
 		cpu_threads: Math.min(cores, Math.max(1, Math.round((cores * settings.cpu_percent) / 100))),
 		cpu_min_percent: MIN_CPU_PERCENT
@@ -4249,11 +4253,14 @@ export async function resetSettings(): Promise<SettingsView> {
 				THEME_KEY,
 				WORKSPACES_KEY,
 				KEYBINDINGS_KEY,
+				EDITING_KEY,
 				TIME_DISPLAY_KEY,
 				REOPEN_KEY
 			]) {
 				localStorage.removeItem(key);
 			}
+			// The review switch is a preference and goes back on; where the server listens is not.
+			harnessMcpInfo({ agent_review: true });
 		} catch {
 			// Storage blocked: there was nothing remembered to clear.
 		}
