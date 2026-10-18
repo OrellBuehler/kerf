@@ -7,13 +7,13 @@
 	// (Silence, Scenes, Loudness, Rhythm, Transcript), not the two-to-four letter tag it used to be (SIL, SCN, LUFS,
 	// BPM, TXT): nobody should have to hover to learn what a green box says.
 	import Badge from './Badge.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { mediaStatus } from '$lib/media-status.svelte';
-	import { analysisChips, analysisMeter, chipsFor, type MediaTraits } from '$lib/analysis-steps';
-	import { proxyBadge } from '$lib/proxy-info';
-	import type { AnalysisState } from '$lib/types';
-	import { tip } from '$lib/tip';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { editor } from '#lib/state.svelte';
+	import { mediaStatus } from '#lib/media-status.svelte';
+	import { analysisChips, analysisMeter, chipsFor, type MediaTraits } from '#lib/analysis-steps';
+	import { proxyBadge } from '#lib/proxy-info';
+	import type { AnalysisState } from '#lib/types';
+	import { tip } from '#lib/tip';
 
 	let {
 		assetId,

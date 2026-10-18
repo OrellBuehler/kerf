@@ -4,13 +4,13 @@
 	// `1:00:00` a minute, `+15` fifteen frames on, `-1.00` a second back. Enter goes there; Escape, Tab
 	// or a click elsewhere leaves the playhead where it was. In seconds mode (`timeDisplay`) it reads and
 	// takes seconds (`12.5`, `0:12.5`, `1:05`), and `+15` / `-1.00` still move by frames.
-	import { ui } from '$lib/editor-ui.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { frameTime } from '$lib/frames';
-	import { timeDisplay } from '$lib/time-display.svelte';
-	import { parseTimecode, timecodeFrameAt, timecodeRate } from '$lib/timecode';
-	import { tip } from '$lib/tip';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { editor } from '#lib/state.svelte';
+	import { settings } from '#lib/settings.svelte';
+	import { frameTime } from '#lib/frames';
+	import { timeDisplay } from '#lib/time-display.svelte';
+	import { parseTimecode, timecodeFrameAt, timecodeRate } from '#lib/timecode';
+	import { tip } from '#lib/tip';
 
 	let {
 		entry,

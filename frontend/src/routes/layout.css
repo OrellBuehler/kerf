@@ -4,10 +4,10 @@
 @import '@fontsource-variable/geist';
 @import '@fontsource-variable/geist-mono';
 @import '@fontsource-variable/space-grotesk';
-@import '$lib/styles/kerf-tokens.css';
-@import '$lib/styles/controls.css';
+@import '#lib/styles/kerf-tokens.css';
+@import '#lib/styles/controls.css';
 @import 'dockview/dist/styles/dockview.css';
-@import '$lib/styles/dockview-kerf.css';
+@import '#lib/styles/dockview-kerf.css';
 
 @custom-variant dark (&:is(.dark *));
 

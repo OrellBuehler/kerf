@@ -846,8 +846,12 @@ so the feature is **only** activated through these forwards — which is what ma
   PNG, and nothing in the graph is animated, so an export, the scrubbed still, the stream and an agent's contact sheet draw one
   title from one rasteriser. `raster::render(svg, pw, ph, opacity)` fits the document "contain" into the rectangle, clipped to its
   own viewport (a slide-in from outside the `viewBox` is not seen in the margin), with the alpha already multiplied by the
-  opacity (the graph has no `colorchannelmixer` for it); fonts are `fonts::svg_fontdb()` (system + shipped Geist, Geist standing
-  for serif and sans-serif and for the family nothing has, so text never vanishes); an `<image>` `href` that is not `data:` is
+  opacity (the graph has no `colorchannelmixer` for it); fonts are a `fonts::FontSet`'s database (`raster::render_with`; `render` uses `fonts::svg_fontdb()`, the whole registered set):
+  the open project's **embedded** fonts *that the title names*, then the system's and the shipped Geist, Geist standing for serif and
+  sans-serif and for the family nothing has, so text never vanishes; an embedded face is loaded first so it beats an installed one of
+  the same family — a template's typeface wins on the machine that also has another build of it; `fonts::replace_embedded` /
+  `register_embedded` change the registered set, a `FontSet` is immutable and builds its database once, on first use, outside the
+  registry's lock (the one built for the process when no embedded font is named); an `<image>` `href` that is not `data:` is
   nothing (no file read, no network), `resources_dir` is `None`, and a `data:` image is decoded only after its **header** says it
   is within 16 Mpx (`svg/images.rs`: `imagesize`, the crate usvg sizes with; the decoders allocate what the header claims, so
   60,000 x 60,000 bytes-of-header aborted the process) — the resolver answers "nothing" for one that is not, whatever the
@@ -924,9 +928,17 @@ so the feature is **only** activated through these forwards — which is what ma
   - **The cache** (`<cache>/kerf/svg/<pid>/<key>/NNNNNN.png` + a `complete` marker, else a private `kerf-svg-<uid>` directory in the
     temp one, else a unique `0700` `kerf-svg-<pid>-<nanos>-<n>` made with a plain `mkdir`): `key` = SHA-256 of `RASTER_VERSION`, the
     sanitised source, the document clock at the first picture, the rate, the picture count, the pixel size and the opacity —
-    **not the position** (moving a title keeps its frames) and **not the fonts**: the font database and this directory are both
-    built once per process and the directory is emptied at the first use (`claim_dir`: a pid is reused, and a marker left by an
-    earlier run is not trusted). A frame is renamed into place whole, so one that exists is right and an interrupted run resumes;
+    **not the position** (moving a title keeps its frames) and **not the installed fonts**: the system's database and this
+    directory are both built once per process and the directory is emptied at the first use (`claim_dir`: a pid is reused, and a
+    marker left by an earlier run is not trusted). **The embedded fonts the title names are in the key when there are any**
+    (`svg_layer::digest` mixes in the digest of the title's `FontSet`, a hash of its fonts' SHA-256s; with none nothing is added, so every
+    existing key and the golden argv are byte for byte what they were): opening another project or applying a template changes the
+    registered set, and a picture drawn with another one is not served (the `DocCache`, which only parses, ignores it); a font the
+    title does not name is in neither its key nor its picture. **The `FontSet` is taken once, when the title is planned**
+    (`svg_sequences` / `stream_sequences` / `still_svgs` take `fonts::snapshot()` and each title `named_by` its own source) and rides in
+    `SvgSeq::fonts` / `StillSvg::fonts`: the key and `draw_run` / `ensure_stills` use the same value, so a project swapped in between
+    planning and drawing (an export being prepared) cannot draw a picture under the neighbour's key. Under `cfg(test)` the registry is
+    per thread, so tests cannot key each other's pictures; `tests/embedded_fonts.rs` runs the process-wide one. A frame is renamed into place whole, so one that exists is right and an interrupted run resumes;
     the marker is last, and `mark_complete` refuses a directory that is gone (it used to recreate it empty, "complete"). A
     sequence is **ready** when the marker is there and so are its first and last picture. Consecutive missing frames whose `at()`
     text is the same are one render and hard links (copy where links fail). Directories of dead pids are removed at the first use

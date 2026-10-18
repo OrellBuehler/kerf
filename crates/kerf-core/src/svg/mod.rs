@@ -24,11 +24,12 @@
 
 mod anim;
 mod cost;
-mod images;
+pub(crate) mod images;
 mod presets;
 pub mod raster;
 mod rules;
 mod sanitize;
+pub(crate) mod splice;
 mod values;
 
 use std::collections::{HashMap, HashSet};
@@ -403,6 +404,21 @@ fn has_size(root: &Node) -> bool {
         return l.len() == 4 && l[2] > 0.0 && l[3] > 0.0;
     }
     matches!((root.attribute("width"), root.attribute("height")), (Some(w), Some(h)) if positive(w, false) && positive(h, false))
+}
+
+/// The shape of a stored title in user units: its `viewBox`, else its pixel `width` and `height` (the two
+/// things [`has_size`] accepts). `None` for a document that has neither.
+pub fn intrinsic_size(src: &str) -> Option<(f64, f64)> {
+    let doc = Document::parse_with_options(src, xml_options()).ok()?;
+    let root = doc.root_element();
+    if let Some(Value::List(l)) = root.attribute("viewBox").map(|v| values::parse(values::Kind::List, v)) {
+        return (l.len() == 4 && l[2] > 0.0 && l[3] > 0.0).then(|| (l[2], l[3]));
+    }
+    let len = |name: &str| match values::parse(values::Kind::Len, root.attribute(name)?) {
+        Value::Len(v, u) if v > 0.0 && u != "%" => Some(v),
+        _ => None,
+    };
+    Some((len("width")?, len("height")?))
 }
 
 /// The link of an element the way resvg reads it: the unprefixed `href`, then `xlink:href` (SVG 2

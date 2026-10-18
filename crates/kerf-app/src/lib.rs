@@ -27,11 +27,12 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
-    ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, Grade, ImportSummary, Keyframe,
-    Levels, Mask, MissingAsset, Page, Project, Projection, Property, PropertyKey, ReframeKeyframe, RelinkCheck, Relinked,
-    RemovedAsset, Revision, SplitSide, StagedEdit, StreamKind, SubsetApplied, SvgCheck, SvgLayout, SvgOverlayPatch,
-    SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, Task, TextKeyframe, TimeRange, Timeline, TimelineDiff, Transition,
-    TransitionKind, VideoEffect, WaveformRange,
+    ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, Grade, ImportOutcome, ImportSummary,
+    Keyframe, Levels, Mask, MissingAsset, Page, Project, Projection, Property, PropertyKey, ReframeKeyframe, RelinkCheck,
+    Relinked, RemovedAsset, Revision, SplitSide, StagedEdit, StreamKind, SubsetApplied, SvgCheck, SvgLayout, SvgOverlayPatch,
+    SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, Task, TemplateControl, TemplateLibrary, TemplateList,
+    TemplateSaveRequest, TemplateSaved, TextKeyframe, TimeRange, Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect,
+    WaveformRange,
 };
 
 use serde::Serialize;
@@ -2617,6 +2618,251 @@ fn svg_preset_preview(
     Ok(kerf_core::render_preset(kind, &params, duration.unwrap_or(4.0), frame))
 }
 
+// ---- motion templates --------------------------------------------------------
+
+/// The user's template library (`KERF_TEMPLATES_DIR` or the data directory). Library calls need no
+/// project, so none of them takes the lock.
+fn template_library() -> CmdResult<TemplateLibrary> {
+    TemplateLibrary::default_location().map_err(|e| e.to_string())
+}
+
+/// An image file as the `data:` URL an `image` control takes (`kerf_core::template::image_data_url`
+/// judges the picture; this only reads the file, bounded). Shared with the MCP tools.
+///
+/// The bound is the one the engine holds a picture to ([`kerf_core::template::MAX_IMAGE_BYTES`], a little
+/// under 96 KB: a title is at most 128 KiB), and it is kept by the read itself rather than by a `stat`
+/// that the file could outgrow: the file is opened, looked at through the handle it was opened as, and read
+/// at most one byte past the bound.
+pub(crate) fn template_image_data_url(path: &str) -> kerf_core::Result<String> {
+    use kerf_core::Error;
+    use std::io::Read;
+    let refuse = |why: String| Error::InvalidArgument(why);
+    let limit = kerf_core::template::MAX_IMAGE_BYTES as u64;
+    let file = std::path::Path::new(path);
+    if !file.is_absolute() {
+        return Err(refuse(format!("{path} must be an absolute file path")));
+    }
+    // Not opened if it is not a regular file at all: opening a named pipe would wait for a writer.
+    let meta = std::fs::metadata(file).map_err(|e| refuse(format!("cannot read {path}: {e}")))?;
+    if !meta.is_file() {
+        return Err(refuse(format!("{path} is not a regular file")));
+    }
+    let handle = std::fs::File::open(file).map_err(|e| refuse(format!("cannot read {path}: {e}")))?;
+    let meta = handle.metadata().map_err(|e| refuse(format!("cannot read {path}: {e}")))?;
+    if !meta.is_file() {
+        return Err(refuse(format!("{path} is not a regular file")));
+    }
+    let too_big = |bytes: u64| {
+        refuse(format!(
+            "{path} is {} KiB: too large for an image in a title (at most {} KiB)",
+            bytes.div_ceil(1024),
+            limit / 1024
+        ))
+    };
+    if meta.len() > limit {
+        return Err(too_big(meta.len()));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    handle
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| refuse(format!("cannot read {path}: {e}")))?;
+    if bytes.len() as u64 > limit {
+        return Err(too_big(bytes.len() as u64));
+    }
+    kerf_core::template::image_data_url(&bytes)
+}
+
+/// Only `.kerftemplate` files are read as templates, and the path is the one a file picker returned.
+fn require_template_path(path: &str) -> CmdResult<()> {
+    let is_template = std::path::Path::new(path)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case(kerf_core::template::EXTENSION));
+    if is_template {
+        Ok(())
+    } else {
+        Err(format!("{path} is not a .{} file", kerf_core::template::EXTENSION))
+    }
+}
+
+/// What applying a template or changing the values of a template title hands back: the refreshed cut,
+/// the title that was made or changed, and what the sanitiser or the machine could not honour (a font
+/// that is not installed, ...).
+#[derive(Serialize)]
+struct TemplateEdit {
+    timeline: Timeline,
+    overlay_id: Uuid,
+    warnings: Vec<String>,
+}
+
+/// An element of a title that has an `id`, and the tag it is: what a control can aim at.
+#[derive(Serialize)]
+struct SvgElementId {
+    id: String,
+    tag: String,
+}
+
+/// Every template in the library (by name) and the files that did not read. Only manifests are read;
+/// a poster is fetched on its own (`template_poster`).
+#[tauri::command]
+async fn list_templates() -> CmdResult<TemplateList> {
+    blocking(|| template_library()?.list().map_err(|e| e.to_string())).await
+}
+
+/// A template's poster as a `data:image/png;base64,` URL (a PNG of at most 512 px), `null` when it has
+/// none.
+#[tauri::command]
+async fn template_poster(template_id: String) -> CmdResult<Option<String>> {
+    blocking(move || {
+        let poster = template_library()?.poster(&template_id).map_err(|e| e.to_string())?;
+        Ok(poster.map(|png| {
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(png)
+            )
+        }))
+    })
+    .await
+}
+
+/// The `id`s of a title's elements and their tags, for the save dialog to offer as targets. Pure.
+#[tauri::command(async)]
+fn svg_element_ids(svg: String) -> CmdResult<Vec<SvgElementId>> {
+    let ids = kerf_core::template::element_ids(&svg).map_err(|e| e.to_string())?;
+    Ok(ids.into_iter().map(|(id, tag)| SvgElementId { id, tag }).collect())
+}
+
+/// An image file as the `data:` URL a template `image` value takes (PNG, JPEG, GIF or WebP).
+#[tauri::command]
+async fn template_image_value(path: String) -> CmdResult<String> {
+    blocking(move || template_image_data_url(&path).map_err(|e| e.to_string())).await
+}
+
+/// Keep the title `overlay_id` (as the working cut has it) in the library as a template with the given
+/// controls. The title is read under the lock; the fonts, the sanitiser and the poster run with it
+/// released. A library write, not a timeline edit: nothing is undone or staged.
+#[tauri::command]
+async fn save_template(
+    state: State<'_, AppState>,
+    overlay_id: String,
+    name: String,
+    description: Option<String>,
+    controls: Vec<TemplateControl>,
+) -> CmdResult<TemplateSaved> {
+    let oid = id(&overlay_id, "overlay_id")?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let source = lock_user(&shared).template_source(oid).map_err(|e| e.to_string())?;
+        let request = TemplateSaveRequest {
+            name,
+            description: description.unwrap_or_default(),
+            controls,
+        };
+        template_library()?.save(&source, request).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Add a library template to the timeline as an animated title: `values` (control id to value, partial)
+/// are spliced into its artwork and the result sanitised **before** the project lock is taken; the lock
+/// only places the title and stores the template's fonts in the project. `end` defaults to `start` plus
+/// the template's duration; `layout` places and names it like `add_svg_overlay`'s.
+#[tauri::command]
+async fn apply_template(
+    state: State<'_, AppState>,
+    template_id: String,
+    values: std::collections::BTreeMap<String, String>,
+    start: f64,
+    end: Option<f64>,
+    layout: Option<SvgLayout>,
+) -> CmdResult<TemplateEdit> {
+    let shared = state.project.clone();
+    blocking(move || {
+        let prepared = template_library()?
+            .get(&template_id)
+            .and_then(|t| t.prepare(&values))
+            .map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        let done = project
+            .apply_template_parsed(prepared, start, end, layout.unwrap_or_default())
+            .map_err(|e| e.to_string())?;
+        Ok(TemplateEdit {
+            timeline: project.timeline().map_err(|e| e.to_string())?,
+            overlay_id: done.overlay.id,
+            warnings: done.warnings,
+        })
+    })
+    .await
+}
+
+/// Change control values of a template title (partial: only the named controls). The title is read
+/// under the lock, the splice and the sanitiser run with it released, and the result is stored only if
+/// the title is still the one it was made from; one that changed meanwhile is an error saying to try again.
+#[tauri::command]
+async fn set_template_values(
+    state: State<'_, AppState>,
+    overlay_id: String,
+    values: std::collections::BTreeMap<String, String>,
+) -> CmdResult<TemplateEdit> {
+    let oid = id(&overlay_id, "overlay_id")?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let inputs = lock_user(&shared).template_edit_inputs(oid).map_err(|e| e.to_string())?;
+        let prepared = inputs.prepare(&values).map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        let done = project.set_template_values_parsed(oid, prepared).map_err(|e| e.to_string())?;
+        Ok(TemplateEdit {
+            timeline: project.timeline().map_err(|e| e.to_string())?,
+            overlay_id: done.overlay.id,
+            warnings: done.warnings,
+        })
+    })
+    .await
+}
+
+/// Bring a `.kerftemplate` file into the library. Never overwrites: the same template is
+/// `already_present`, another one with the same id is kept under a new id (`added_as_copy`). The
+/// path is the one the file picker returned: an absolute path to a regular `.kerftemplate` file.
+#[tauri::command]
+async fn import_template(path: String) -> CmdResult<ImportOutcome> {
+    require_template_path(&path)?;
+    blocking(move || {
+        let file = std::path::Path::new(&path);
+        kerf_core::paths::validate_import_path(file).map_err(|e| e.to_string())?;
+        template_library()?.import(file).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// Write a library template to `path` (a directory gets `<name>.kerftemplate` in it, a path with no
+/// extension gets `.kerftemplate`); resolves to where it went. The picker has asked about replacing.
+/// Not onto a file the project still needs, into Kerf's own settings and logs, or into the library.
+#[tauri::command]
+async fn export_template(state: State<'_, AppState>, template_id: String, path: String) -> CmdResult<String> {
+    require_user_output_path(&path)?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let library = template_library()?;
+        let mut protected = lock_user(&shared).output_path_inputs().map_err(|e| e.to_string())?;
+        protected
+            .dirs
+            .push((library.dir().to_path_buf(), "the template library".to_string()));
+        check_output(std::path::Path::new(&path), &protected).map_err(|e| e.to_string())?;
+        let written = library
+            .export(&template_id, std::path::Path::new(&path))
+            .map_err(|e| e.to_string())?;
+        Ok(written.to_string_lossy().into_owned())
+    })
+    .await
+}
+
+/// Remove a template from the library. Titles already made from it keep working: they carry their own
+/// artwork and fonts.
+#[tauri::command]
+async fn delete_template(template_id: String) -> CmdResult<()> {
+    blocking(move || template_library()?.delete(&template_id).map_err(|e| e.to_string())).await
+}
+
 #[tauri::command(async)]
 fn generate_captions(state: State<'_, AppState>, options: Option<CaptionOptions>) -> CmdResult<Timeline> {
     let project = state.project();
@@ -4967,6 +5213,16 @@ pub fn run() {
             validate_svg,
             list_svg_presets,
             svg_preset_preview,
+            list_templates,
+            template_poster,
+            svg_element_ids,
+            template_image_value,
+            save_template,
+            apply_template,
+            set_template_values,
+            import_template,
+            export_template,
+            delete_template,
             generate_captions,
             clear_captions,
             import_captions,
@@ -5336,6 +5592,84 @@ mod tests {
         assert!(require_json_path("C:\\t\\THEME.JSON").is_ok());
         assert!(require_json_path("/home/u/.bashrc").is_err());
         assert!(require_json_path("/t/theme.json.exe").is_err());
+    }
+
+    #[test]
+    fn template_files_are_only_read_as_kerftemplate() {
+        use super::require_template_path;
+        assert!(require_template_path("/t/card.kerftemplate").is_ok());
+        assert!(require_template_path("C:\\t\\CARD.KERFTEMPLATE").is_ok());
+        assert!(require_template_path("/home/u/.bashrc").is_err());
+        assert!(require_template_path("/t/card.kerftemplate.zip").is_err());
+        assert!(require_template_path("/t/card").is_err());
+    }
+
+    /// The ids command takes text straight from the webview: a title is at most 128 KiB, and a document
+    /// over that is refused before anything is parsed.
+    #[test]
+    fn the_ids_of_a_title_are_listed_for_a_title_that_could_be_one() {
+        let ok = super::svg_element_ids(r#"<svg xmlns="http://www.w3.org/2000/svg"><text id="a"/><g id="b"/></svg>"#.to_string())
+            .unwrap();
+        assert_eq!(
+            ok.iter().map(|e| (e.id.as_str(), e.tag.as_str())).collect::<Vec<_>>(),
+            [("a", "text"), ("b", "g")]
+        );
+        let big = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><text id="a"/><!--{}--></svg>"#,
+            "x".repeat(200 * 1024)
+        );
+        let e = super::svg_element_ids(big).err().expect("over the size of a title");
+        assert!(e.contains("larger than 128 KiB"), "{e}");
+        assert!(super::svg_element_ids("not svg".to_string()).is_err());
+    }
+
+    /// A picture for an image control is read bounded, and the engine judges it: a file that is not a
+    /// picture, a relative path, a directory and an oversized file are all refused with a reason.
+    #[test]
+    fn a_picture_for_a_template_is_read_bounded_and_judged_by_the_engine() {
+        use super::template_image_data_url;
+        let limit = kerf_core::template::MAX_IMAGE_BYTES as u64;
+        let dir = Scratch::new("template-image");
+        let png = dir.0.join("logo.png");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAEklEQVR4nGP4z8DwHxkzkC4AADxAH+HggXe0AAAAAElFTkSuQmCC")
+            .unwrap();
+        std::fs::write(&png, &bytes).unwrap();
+        let url = template_image_data_url(png.to_str().unwrap()).unwrap();
+        assert!(url.starts_with("data:image/png;base64,"), "{url}");
+
+        let refused = |path: &Path| template_image_data_url(path.to_str().unwrap()).unwrap_err().to_string();
+        assert!(template_image_data_url("logo.png")
+            .unwrap_err()
+            .to_string()
+            .contains("absolute"));
+        assert!(refused(&dir.0).contains("not a regular file"));
+        assert!(refused(&dir.0.join("missing.png")).contains("cannot read"));
+        let text = dir.0.join("notes.txt");
+        std::fs::write(&text, "not a picture").unwrap();
+        assert!(refused(&text).contains("PNG, JPEG, GIF or WebP"));
+        // The bound is the engine's own: a file one byte over what fits in a title is refused, whatever
+        // it is, and without being read whole (a huge sparse one answers at once).
+        let big = dir.0.join("big.png");
+        let file = std::fs::File::create(&big).unwrap();
+        file.set_len(limit + 1).unwrap();
+        let why = refused(&big);
+        assert!(why.contains("is 95 KiB") && why.contains("at most 94 KiB"), "{why}");
+        let huge = dir.0.join("huge.png");
+        std::fs::File::create(&huge).unwrap().set_len(8 << 30).unwrap();
+        assert!(refused(&huge).contains("too large"));
+        // A picture that is within the bound but not one the engine takes is the engine's refusal.
+        let mut padded = bytes;
+        padded.resize(limit as usize, 0);
+        assert!(template_image_data_url(write(&dir.0, "padded.png", &padded).to_str().unwrap()).is_ok());
+        padded.push(0);
+        assert!(refused(&write(&dir.0, "over.png", &padded)).contains("too large"));
+    }
+
+    fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
     }
 
     #[test]

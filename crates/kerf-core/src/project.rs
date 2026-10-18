@@ -243,6 +243,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at TEXT NOT NULL
 );
 
+-- Fonts the project embeds (a template's typeface travels with it), by the SHA-256 of the file.
+-- Added by schema v3 (`store::MIGRATIONS`); older files get it from the migration.
+CREATE TABLE IF NOT EXISTS fonts (
+    sha256 TEXT PRIMARY KEY,
+    family TEXT NOT NULL,
+    data   BLOB NOT NULL
+);
+
 -- Covers `claim_next_task` (WHERE status = 'queued' ORDER BY created_at LIMIT 1)
 -- and the queue/asset list sorts. Idempotent, so safe to apply to older files.
 CREATE INDEX IF NOT EXISTS idx_tasks_status_created ON tasks (status, created_at);
@@ -358,6 +366,10 @@ pub struct Project {
     recovery: Option<crate::recovery::RecoveryDir>,
     /// How many revisions the history keeps (see [`Project::set_history_limit`]).
     history_limit: usize,
+    /// The fonts this project embeds, kept beside the `fonts` table so that becoming the shared
+    /// project ([`Project::replace_with`]) can make them the drawing fonts without reading the table
+    /// under the lock. A `RefCell`, like the overrides above.
+    embedded: RefCell<Vec<crate::fonts::EmbeddedFont>>,
 }
 
 /// How many steps back [`Project::undo_staged`] can take a proposal.
@@ -437,6 +449,7 @@ impl Project {
             agent_owner: RefCell::new(None),
             recovery,
             history_limit: default_history_limit(),
+            embedded: RefCell::new(Vec::new()),
         }
     }
 
@@ -524,6 +537,11 @@ impl Project {
     /// file is dropped: it belongs to the session that discarded it, and a project that is opened
     /// again is not offered a restore of something thrown away before.
     ///
+    /// The swap also makes `other`'s embedded fonts the ones titles are drawn with — **this is the only
+    /// place opening a project reaches the process's fonts** (opening reads them, it registers none, so
+    /// an open that is cancelled or refused leaves the open project drawing as it did), from what it
+    /// already holds in memory: no table is read under the lock.
+    ///
     /// Returns the project replaced, for the caller to [`Self::close`] once it has released the
     /// lock — closing deletes an untitled one's recovery directory, since replacing it means it
     /// was saved, recovered into another, or let go.
@@ -555,6 +573,9 @@ impl Project {
         self.generation = generation;
         self.change_base = change_base;
         self.agent_review.set(review);
+        // The fonts titles are drawn with are the active project's, whatever another project registered
+        // between this one being opened and being swapped in.
+        self.activate_fonts();
         crate::plan_epoch::bump_plan_epoch();
         old
     }
@@ -653,6 +674,8 @@ impl Project {
             return Ok(());
         }
         self.check_output_path(path)?;
+        // Only what a title uses is saved: the fonts of a template turned down are not carried along.
+        self.collect_unused_fonts_now();
         store::vacuum_into_atomic(&self.conn, path)
     }
 
@@ -686,6 +709,7 @@ impl Project {
                     "this project was made by an older Kerf and needs upgrading, but its file is read-only — copy it somewhere you can write to and open the copy".into(),
                 ));
             }
+            self.load_fonts_logged();
             return Ok(());
         }
         if !blank && found < store::SCHEMA_VERSION {
@@ -728,7 +752,24 @@ impl Project {
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('created_at', ?1)",
             params![Utc::now().to_rfc3339()],
         )?;
+        // Fonts no title names any more are dropped now (the file, not the process's fonts: this project
+        // is not the open one until it is swapped in).
+        if let Err(e) = self.collect_unused_fonts() {
+            tracing::warn!(error = %e, "could not tell which embedded fonts are unused");
+        }
+        self.load_fonts_logged();
         Ok(())
+    }
+
+    /// Opening a project reads the fonts it embeds into memory, **not into the process's registry**: they
+    /// become the ones titles are drawn with when it becomes the open project ([`Project::replace_with`],
+    /// [`Project::activate_fonts`]), so an open that is cancelled or refused changes nothing about how
+    /// the open project draws. A project whose fonts cannot be read still opens: its titles fall back to
+    /// the installed ones.
+    fn load_fonts_logged(&self) {
+        if let Err(e) = self.load_fonts() {
+            tracing::warn!(error = %e, "could not read the fonts this project embeds");
+        }
     }
 
     // ---- meta -------------------------------------------------------------
@@ -2741,6 +2782,8 @@ impl Project {
         // the user's history.
         if diff.is_empty() && row.assets.is_empty() {
             self.clear_staged()?;
+            // What was staged and undone left its fonts behind, and nothing names them now.
+            self.collect_unused_fonts_now();
             return self.timeline();
         }
         let label = match (&row.note, row.edits.as_slice()) {
@@ -2966,6 +3009,9 @@ impl Project {
             self.set_meta(DISCARDED_STAGED, &kept.to_string())?;
         }
         self.clear_staged()?;
+        // A template the proposal applied came with its fonts, stored when it was proposed: with the
+        // proposal gone nothing names them (unless the live cut does).
+        self.collect_unused_fonts_now();
         Ok(())
     }
 
@@ -6322,6 +6368,7 @@ impl Project {
             opacity,
             offset: 0.0,
             preset,
+            template: None,
         };
         self.edit_timeline("Add animated title", move |timeline| {
             if timeline.svg_overlays.len() >= MAX_SVG_OVERLAYS {
@@ -6397,6 +6444,8 @@ impl Project {
             if let Some(doc) = &doc {
                 o.svg = doc.sanitized().to_string();
                 o.preset = None;
+                // New artwork: the controls point into the old one.
+                o.template = None;
                 warnings = doc.warnings().to_vec();
                 regenerate = false;
             } else if patch.preset_params.is_some() || patch.preset_kind.is_some() {
@@ -7246,6 +7295,7 @@ mod store;
 pub use store::{backup_path as schema_backup_path, SCHEMA_VERSION};
 mod exports;
 pub use exports::{DeliveryInputs, ExportedFile};
+mod templates;
 
 /// A window onto a long, ordered list (the edit history, the task queue): `offset` of the
 /// **newest** entries are skipped and up to `limit` of the ones before them returned, kept in

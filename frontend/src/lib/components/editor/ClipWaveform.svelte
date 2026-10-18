@@ -11,10 +11,10 @@
 	 * pixels, so a zoom or a scroll in the meantime shows the old picture stretched
 	 * or shifted into the right place instead of a blank. */
 	import { untrack } from 'svelte';
-	import type { Clip } from '$lib/types';
-	import { effectiveGain } from '$lib/mixer';
-	import { waveforms } from '$lib/waveforms';
-	import { drawWaveform, type WavePalette } from '$lib/waveform-draw';
+	import type { Clip } from '#lib/types';
+	import { effectiveGain } from '#lib/mixer';
+	import { waveforms } from '#lib/waveforms';
+	import { drawWaveform, type WavePalette } from '#lib/waveform-draw';
 	import {
 		bucketCells,
 		canvasScale,
@@ -25,8 +25,8 @@
 		secondsPerDevicePx,
 		tilesForColumns,
 		type TileData
-	} from '$lib/waveform-view';
-	import { tip } from '$lib/tip';
+	} from '#lib/waveform-view';
+	import { tip } from '#lib/tip';
 
 	let {
 		clip,

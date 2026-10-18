@@ -11,16 +11,16 @@
 	import Minimap from './Minimap.svelte';
 	import TimecodeField from './TimecodeField.svelte';
 	import MarkerDialog from './MarkerDialog.svelte';
-	import { markerTip } from '$lib/marker-edit';
-	import { toast } from '$lib/notifications.svelte';
-	import { ui, type Tool } from '$lib/editor-ui.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { contextMenu } from '$lib/context-menu.svelte';
-	import { documentOf, resizeObserverFor, windowOf } from '$lib/realm';
-	import { onWindow } from '$lib/window-events';
-	import { windows } from '$lib/windows.svelte';
-	import type { MenuItem } from '$lib/context-menu.svelte';
+	import { markerTip } from '#lib/marker-edit';
+	import { toast } from '#lib/notifications.svelte';
+	import { ui, type Tool } from '#lib/editor-ui.svelte';
+	import { editor } from '#lib/state.svelte';
+	import { settings } from '#lib/settings.svelte';
+	import { contextMenu } from '#lib/context-menu.svelte';
+	import { documentOf, resizeObserverFor, windowOf } from '#lib/realm';
+	import { onWindow } from '#lib/window-events';
+	import { windows } from '#lib/windows.svelte';
+	import type { MenuItem } from '#lib/context-menu.svelte';
 	import {
 		addMarker,
 		deleteSelection,
@@ -37,28 +37,28 @@
 		splitSelection,
 		trimSelection,
 		unlinkSelection
-	} from '$lib/ops';
-	import { addAnimatedTitle, addCustomSvgTitle, importCaptionFile } from '$lib/title-actions';
-	import { keyframeOffer } from '$lib/keyframe-copy';
-	import type { ActionId } from '$lib/keymap';
-	import { DELIVERY_PRESETS, fitLabel, presetFor } from '$lib/delivery-formats';
-	import { setDeliveryPreset } from '$lib/menu-commands';
-	import { importMenuEntries, importableAssets } from '$lib/caption-import-ui';
-	import type { Clip, Marker, StreamKind, SvgOverlay, TextOverlay, Track } from '$lib/types';
-	import { GENERATED_TITLE_FILL, SVG_TITLE_FILL, packRows, snapSpanStart, snapTime, trimSpan } from '$lib/titles';
-	import { SVG_PRESETS, svgDisplayName, svgTooltip } from '$lib/svg-titles';
-	import { faderToGain, gainLabel, gainToFader, panLabel } from '$lib/mixer';
-	import { trackHasSound } from '$lib/mixer-strips';
-	import { clampEdge, quantizeSpanStart, quantizeTime, splitPoint, startBefore, trimEdit } from '$lib/frames';
-	import { beginDrag } from '$lib/drag';
-	import { createAutoscroll, followScroll, liveEnd, type ScrollRegion } from '$lib/autoscroll';
-	import { magnetList, markAt, snapLines, type Magnet, type SnapLine } from '$lib/snap';
-	import { cutReadout, moveReadout, trimEdgeMonitor, trimEdgeReadout, trimLimitWhy } from '$lib/gesture-readout';
-	import { diffView, type DiffView } from '$lib/staged-diff';
-	import { applyProposal, discardProposal } from '$lib/proposal-actions';
-	import { PREVIEW_READ_ONLY_REASON, proposalLine, touchedOnLive } from '$lib/proposal-ui';
-	import { displayTracks, opensAudioGroup } from '$lib/track-order';
-	import { NUDGE_QUIET_MS, nudgeFrames, nudgedStart } from '$lib/nudge';
+	} from '#lib/ops';
+	import { addAnimatedTitle, addCustomSvgTitle, importCaptionFile } from '#lib/title-actions';
+	import { keyframeOffer } from '#lib/keyframe-copy';
+	import type { ActionId } from '#lib/keymap';
+	import { DELIVERY_PRESETS, fitLabel, presetFor } from '#lib/delivery-formats';
+	import { setDeliveryPreset } from '#lib/menu-commands';
+	import { importMenuEntries, importableAssets } from '#lib/caption-import-ui';
+	import type { Clip, Marker, StreamKind, SvgOverlay, TextOverlay, Track } from '#lib/types';
+	import { GENERATED_TITLE_FILL, SVG_TITLE_FILL, packRows, snapSpanStart, snapTime, trimSpan } from '#lib/titles';
+	import { SVG_PRESETS, svgDisplayName, svgTooltip } from '#lib/svg-titles';
+	import { faderToGain, gainLabel, gainToFader, panLabel } from '#lib/mixer';
+	import { trackHasSound } from '#lib/mixer-strips';
+	import { clampEdge, quantizeSpanStart, quantizeTime, splitPoint, startBefore, trimEdit } from '#lib/frames';
+	import { beginDrag } from '#lib/drag';
+	import { createAutoscroll, followScroll, liveEnd, type ScrollRegion } from '#lib/autoscroll';
+	import { magnetList, markAt, snapLines, type Magnet, type SnapLine } from '#lib/snap';
+	import { cutReadout, moveReadout, trimEdgeMonitor, trimEdgeReadout, trimLimitWhy } from '#lib/gesture-readout';
+	import { diffView, type DiffView } from '#lib/staged-diff';
+	import { applyProposal, discardProposal } from '#lib/proposal-actions';
+	import { PREVIEW_READ_ONLY_REASON, proposalLine, touchedOnLive } from '#lib/proposal-ui';
+	import { displayTracks, opensAudioGroup } from '#lib/track-order';
+	import { NUDGE_QUIET_MS, nudgeFrames, nudgedStart } from '#lib/nudge';
 	import {
 		CUT_REACH_PX,
 		cutsOf,
@@ -77,9 +77,9 @@
 		type GestureEdit,
 		type Readout,
 		type TrimTool
-	} from '$lib/trim-tools';
-	import { readPalette } from '$lib/waveform-draw';
-	import { filmstrips } from '$lib/filmstrips';
+	} from '#lib/trim-tools';
+	import { readPalette } from '#lib/waveform-draw';
+	import { filmstrips } from '#lib/filmstrips';
 	import {
 		HEIGHT_PRESETS,
 		MIXER_MIN_PX,
@@ -88,31 +88,31 @@
 		TITLE_METRICS,
 		titleLaneHeightFor,
 		uniformPreset
-	} from '$lib/track-heights';
-	import { viewCoversCut, type Target } from '$lib/minimap';
-	import { visibleLaneRange } from '$lib/waveform-view';
-	import { clipDuration } from '$lib/types';
-	import { barGrid, beatGrid, beatPeriod, gridMagnets, sourceToTimeline } from '$lib/beats';
-	import { NAME_CHIP_PCT, showsLabel } from '$lib/clip-label';
-	import { fitOffer } from '$lib/music-ui';
-	import { stemsOffer } from '$lib/stems';
-	import { composeOffer } from '$lib/compose-form';
-	import { describeSync, syncOffer, SYNC_CANCELLED } from '$lib/audio-sync';
-	import { cancelAudioSync, onAudioSyncProgress } from '$lib/api';
-	import { transitionLabel } from '$lib/transitions';
-	import { marqueeMode, pickMode, sameIds, type Selection } from '$lib/selection';
-	import { linkPartners } from '$lib/link-groups';
-	import { ALT_HINT, linkBadges, marqueeSelectLinked, onlyPartners } from '$lib/link-ui';
-	import { analyzeSubmenuItem } from '$lib/analyze-menu';
-	import { heldForPreview, muteItem, removeRows } from '$lib/menu-items';
-	import { doneCount, doneSummary } from '$lib/analysis-steps';
-	import { mediaStatus } from '$lib/media-status.svelte';
-	import { linkedTrimBounds, linkedTrimPreview } from '$lib/linked-trim';
-	import { marqueeHits, normalizeRect, type LaneBox, type SpanClip } from '$lib/marquee';
-	import { drawnMoveTracks, planMove, type Ghost, type MovePlan } from '$lib/multi-move';
-	import { frameTicksIn, minorTicksIn, rulerGrid, showsFrameTicks, tickLabel, ticksIn } from '$lib/ruler';
-	import { timeDisplay } from '$lib/time-display.svelte';
-	import { MIN_CLIP, trimBounds, type TrimBounds } from '$lib/ripple-trim';
+	} from '#lib/track-heights';
+	import { viewCoversCut, type Target } from '#lib/minimap';
+	import { visibleLaneRange } from '#lib/waveform-view';
+	import { clipDuration } from '#lib/types';
+	import { barGrid, beatGrid, beatPeriod, gridMagnets, sourceToTimeline } from '#lib/beats';
+	import { NAME_CHIP_PCT, showsLabel } from '#lib/clip-label';
+	import { fitOffer } from '#lib/music-ui';
+	import { stemsOffer } from '#lib/stems';
+	import { composeOffer } from '#lib/compose-form';
+	import { describeSync, syncOffer, SYNC_CANCELLED } from '#lib/audio-sync';
+	import { cancelAudioSync, onAudioSyncProgress } from '#lib/api';
+	import { transitionLabel } from '#lib/transitions';
+	import { marqueeMode, pickMode, sameIds, type Selection } from '#lib/selection';
+	import { linkPartners } from '#lib/link-groups';
+	import { ALT_HINT, linkBadges, marqueeSelectLinked, onlyPartners } from '#lib/link-ui';
+	import { analyzeSubmenuItem } from '#lib/analyze-menu';
+	import { heldForPreview, muteItem, removeRows } from '#lib/menu-items';
+	import { doneCount, doneSummary } from '#lib/analysis-steps';
+	import { mediaStatus } from '#lib/media-status.svelte';
+	import { linkedTrimBounds, linkedTrimPreview } from '#lib/linked-trim';
+	import { marqueeHits, normalizeRect, type LaneBox, type SpanClip } from '#lib/marquee';
+	import { drawnMoveTracks, planMove, type Ghost, type MovePlan } from '#lib/multi-move';
+	import { frameTicksIn, minorTicksIn, rulerGrid, showsFrameTicks, tickLabel, ticksIn } from '#lib/ruler';
+	import { timeDisplay } from '#lib/time-display.svelte';
+	import { MIN_CLIP, trimBounds, type TrimBounds } from '#lib/ripple-trim';
 	import {
 		clampZoom,
 		fitZoom,
@@ -125,8 +125,8 @@
 		zoomLabel,
 		zoomToSlider,
 		type FollowInput
-	} from '$lib/zoom';
-	import { tip, type TipInput } from '$lib/tip';
+	} from '#lib/zoom';
+	import { tip, type TipInput } from '#lib/tip';
 	import RenderBar from './RenderBar.svelte';
 
 	const pxPerSec = $derived(ui.zoom);

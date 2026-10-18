@@ -2,10 +2,10 @@
 	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
 	import Kbd from './Kbd.svelte';
-	import { contextMenu } from '$lib/context-menu.svelte';
-	import type { MenuItem } from '$lib/context-menu.svelte';
-	import { contextRows } from '$lib/menu-items';
-	import { menuKey, rowFor, startRow } from '$lib/menu-nav';
+	import { contextMenu } from '#lib/context-menu.svelte';
+	import type { MenuItem } from '#lib/context-menu.svelte';
+	import { contextRows } from '#lib/menu-items';
+	import { menuKey, rowFor, startRow } from '#lib/menu-nav';
 
 	/** The window this instance draws in. One is mounted in the editor window and one in
 	 *  each detached window (`popout.svelte.ts`): a menu belongs to the window it was

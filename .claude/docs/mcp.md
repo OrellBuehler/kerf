@@ -231,6 +231,36 @@ a `viewBox` (or width and height) required, the viewBox = the delivery frame for
 dropped (CSS animations, scripts, links and external images or fonts, `animateMotion`; the only image kept is an `<image>`
 whose href is a `data:image/png|jpeg|gif|webp` URI) and the loop validate_svg → preview_svg_overlay → add_svg_overlay →
 preview_timeline; tests pin the texts (including the order of that loop) and the schemas.
+**Motion templates over MCP** (`mcp/templates.rs`, its own `tool_router_templates`; the model is `core-project.md` "Motion
+templates"). A template is an animated SVG title kept in the user's library with named **controls** (`text` / `color` /
+`number` / `font` / `image`, each aimed at element ids of the artwork). `list_templates` (read-only, no lock: `TemplateLibrary::list`
+on `blocking`, `{templates, problems}`; the poster is not returned, an agent looks with `preview_svg_overlay`) and the library
+writes `save_template { overlay_id, name, description?, controls? }`, `import_template { path }`, `export_template { template_id,
+output_path, overwrite? }` and `delete_template { template_id }` are **not edits of the cut**: nothing stages or undoes, and the
+tool emits `templates-changed` (not `project-changed`) so an open library grid can refresh. `save_template` reads the title
+under `lock_agent_as` from `working_timeline()` (a staged title can be kept), releases it, and only then builds the file (fonts,
+sanitiser, poster); `controls` are `TemplateControlArg`s (`deny_unknown_fields`, so a misspelt key is refused, not dropped).
+**`apply_template { template_id, values?, image_files?, start, end?, x?, y?, width?, height?, opacity?, name? }`** and
+**`set_template_values { overlay_id, values?, image_files? }`** are edits: the file is read and `prepare`d (splice + sanitiser, up to
+~1.7 s) on `blocking` **before** the lock, and `edit()` then runs `apply_template_parsed` / `set_template_values_parsed`, so they
+stage like any agent edit (`set_template_values` reads the title it splices from `working_timeline()` and the core refuses a
+title that changed in between: "try again"). Both answer `SvgOverlayOutcome` — the title as an `SvgOverlaySummary`, whose new
+`template` (`template_id`, `name`, `controls` without their targets, `values`) is how an agent learns the control ids to set,
+and `warnings`; `timeline_summary` lists it the same way. `values` are strings by control id (partial; an unknown id is
+`invalid_params`); an `image` control takes a picture **file** through `image_files` (control id → absolute path, at most 8,
+`require_local_input_path` then `crate::template_image_data_url`: the file is opened, looked at through the handle and read at most
+one byte past `template::MAX_IMAGE_BYTES` — 94 KiB, what fits in a title, the limit the engine judges by — and then
+`template::image_data_url`), and a control in both maps is refused. `set_template_values` with no values (and no files) is the engine's
+`InvalidArgument` ("no values to set"), not an adapter check.
+`import_template` takes the import-path rules (`require_local_input_path`, then the `.kerftemplate` name check, and only then
+`validate_import_path` on `blocking`); `export_template` is `export_srt`'s shape (`require_local_output_path`, the `.kerftemplate`
+extension so no directory or other-extension guessing) and **everything that looks at the disk runs in one `blocking` step**
+(`export_now`: `refuse_overwrite`, the refusal of a path inside the library directory — it canonicalises — and `check_outputs_now`,
+then the write), the async worker doing none of it. **`delete_template`
+is refused while `agent_review` is on** (a template is the user's own work and the delete cannot be undone), annotated destructive
+like `export_template`; `save_template` and `apply_template` are annotated as edits, `set_template_values` / `import_template` as
+idempotent sets. The instructions place the loop after the SVG one: author with `id`s → `validate_svg` → `add_svg_overlay` →
+preview → `save_template` with `controls` → `apply_template`; tests pin that order and the schemas.
 `import_asset` refuses a UNC / device-namespace `path` before any filesystem call (`require_local_input_path`), then a URL,
 protocol, relative path or missing file (`validate_import_path`). It is the one write that does **not** stage — a file on disk is not
 an edit to the user's cut, so imported media (and its background proxy) lands for
@@ -397,7 +427,8 @@ Agent edits **stage** (`core-project.md`). The adapter's part:
   review is on, whatever `overwrite` says, and every export-family tool and Save As is held off Kerf's own settings and logs
   (`crate::check_output`, beside the project's sources and proxies); `set_ripple_mode` is refused (the `ripple` argument
   on an edit is the per-call way); `restore_discarded_edits` brings back only what an agent discarded, never what the
-  user did; `remove_task` by a session that does not own the task's proposal leaves the task in the queue.
+  user did; `remove_task` by a session that does not own the task's proposal leaves the task in the queue;
+  `delete_template` is refused, since a template is theirs and a delete cannot be undone (Motion templates over MCP, above).
 - **Results are summaries.** `apply_staged_edits`, `discard_staged_edits`, `undo`, `redo`, `revert_to`, `smart_crop`,
   `fit_music` and `snap_to_beats` answer `reads::timeline_brief` (durations, clip counts per track) instead of the whole
   timeline; `staged_diff` has the entries (each with an `id`, the key `apply_staged_subset` takes). The tools that
@@ -482,7 +513,8 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
   `compose_music`, `music_status`, `separate_stems`, `stems_status`.
 - **Titles, captions, markers, frame**: `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
   `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `list_svg_presets`, `validate_svg`, `preview_svg_overlay`,
-  `preview_svg_preset`, `generate_captions`, `import_captions`, `clear_captions`, `export_srt`, `export_captions`, `add_marker`,
+  `preview_svg_preset`, `list_templates`, `save_template`, `apply_template`, `set_template_values`, `import_template`,
+  `export_template`, `delete_template`, `generate_captions`, `import_captions`, `clear_captions`, `export_srt`, `export_captions`, `add_marker`,
   `update_marker`, `remove_marker`, `set_delivery_format`.
 - **Voiceover**: `generate_voiceover`, `voiceover_status`.
 - **Delivery**: `export`, `export_variants`, `export_cover`, `export_capabilities`, `export_interchange`, `export_markers`.

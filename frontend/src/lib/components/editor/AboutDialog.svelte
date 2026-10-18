@@ -5,11 +5,11 @@
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
 	import KerfMark from './KerfMark.svelte';
-	import { updater } from '$lib/updater.svelte';
-	import { openReleases } from '$lib/api';
-	import { failure } from '$lib/failure-copy';
-	import { toast } from '$lib/notifications.svelte';
-	import { aboutRows, platformName, REPOSITORY, TAGLINE, versionInfo, type AboutInfo } from '$lib/about';
+	import { updater } from '#lib/updater.svelte';
+	import { openReleases } from '#lib/api';
+	import { failure } from '#lib/failure-copy';
+	import { toast } from '#lib/notifications.svelte';
+	import { aboutRows, platformName, REPOSITORY, TAGLINE, versionInfo, type AboutInfo } from '#lib/about';
 
 	let { onClose }: { onClose: () => void } = $props();
 

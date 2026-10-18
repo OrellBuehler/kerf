@@ -8,7 +8,7 @@
 	import { tick } from 'svelte';
 	import Icon from './Icon.svelte';
 	import Btn from './Btn.svelte';
-	import { settings } from '$lib/settings.svelte';
+	import { settings } from '#lib/settings.svelte';
 	import {
 		FIXED_KEYS,
 		GROUPS,
@@ -24,8 +24,8 @@
 		type Chord,
 		type KeyPresetId,
 		type Rebind
-	} from '$lib/keymap';
-	import { tip } from '$lib/tip';
+	} from '#lib/keymap';
+	import { tip } from '#lib/tip';
 
 	const platform = settings.platform;
 

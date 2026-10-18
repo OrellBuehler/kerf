@@ -2,8 +2,8 @@
 	import SettingRow from './SettingRow.svelte';
 	import Switch from './Switch.svelte';
 	import Btn from './Btn.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { LENGTH_RANGE, clampSeconds, secondsLabel } from '$lib/editing-prefs';
+	import { settings } from '#lib/settings.svelte';
+	import { LENGTH_RANGE, clampSeconds, secondsLabel } from '#lib/editing-prefs';
 
 	/** The field edits a number of seconds; a stepper either side moves it by half a second. */
 	function commit(which: 'still_seconds' | 'title_seconds', raw: string, el?: HTMLInputElement) {

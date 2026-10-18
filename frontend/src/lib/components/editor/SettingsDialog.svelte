@@ -15,9 +15,9 @@
 	import SettingsAnalysis from './SettingsAnalysis.svelte';
 	import SettingsAgent from './SettingsAgent.svelte';
 	import SettingsAdvanced from './SettingsAdvanced.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { filterSettings, SECTIONS, sectionOrFirst, type SectionId } from '$lib/settings-index';
-	import { provideFilter } from '$lib/settings-filter';
+	import { settings } from '#lib/settings.svelte';
+	import { filterSettings, SECTIONS, sectionOrFirst, type SectionId } from '#lib/settings-index';
+	import { provideFilter } from '#lib/settings-filter';
 
 	let { onClose }: { onClose: () => void } = $props();
 

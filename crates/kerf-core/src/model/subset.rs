@@ -739,6 +739,7 @@ mod tests {
             opacity: 1.0,
             offset: 0.0,
             preset: None,
+            template: None,
         };
         let (mut base, _, _) = cut();
         let kept = title("kept", 0.0);

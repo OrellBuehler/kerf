@@ -151,18 +151,18 @@ fn a_v1_file_gains_the_proposals_owner_columns_and_keeps_a_backup() {
 }
 
 #[test]
-fn a_v2_file_gains_the_music_score_column_and_keeps_a_backup() {
+fn a_v3_file_gains_the_music_score_column_and_keeps_a_backup() {
     let dir = scratch();
     let path = dir.join("cut.kerf");
     edited(1).0.save_as(&path).unwrap();
     {
         let conn = Connection::open(&path).unwrap();
-        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
         conn.execute_batch("ALTER TABLE assets DROP COLUMN music_score").unwrap();
     }
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
-    assert_eq!(version_of(&schema_backup_path(&path, 2)), 2, "the file as it was is kept");
+    assert_eq!(version_of(&schema_backup_path(&path, 3)), 3, "the file as it was is kept");
     // The asset that was there reads back with no score, and a composed one can now be stored.
     assert!(project.list_assets().unwrap()[0].music_score.is_none());
     let mut composed = asset("/m/a.wav", 8.0, vec![stream(StreamKind::Audio)]);
@@ -218,6 +218,150 @@ fn a_read_only_legacy_file_opens_untouched() {
     make_legacy(&path, false);
     let err = Project::open(&uri).err().expect("needs an upgrade");
     assert!(err.to_string().contains("read-only"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Make the file at `path` look like one schema v2 wrote: stamped 2, and without the table of
+/// embedded fonts v3 adds.
+fn make_v2(path: &Path) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch("DROP TABLE fonts").unwrap();
+    conn.pragma_update(None, "user_version", 2).unwrap();
+}
+
+fn has_fonts_table(path: &Path) -> bool {
+    store::has_table(&Connection::open(path).unwrap(), "fonts")
+}
+
+#[test]
+fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    edited(2).0.save_as(&path).unwrap();
+    make_v2(&path);
+    assert_eq!(SCHEMA_VERSION, 4);
+    assert!(!has_fonts_table(&path));
+
+    let project = Project::open(&path).unwrap();
+    assert_eq!(project.history().unwrap().len(), 3);
+    assert!(project.embedded_fonts().unwrap().is_empty());
+    drop(project);
+    assert_eq!(version_of(&path), SCHEMA_VERSION);
+    assert!(has_fonts_table(&path));
+    let backup = dir.join("cut (schema v2 backup).kerf");
+    assert_eq!(version_of(&backup), 2);
+    assert!(!has_fonts_table(&backup), "the backup is the file as it was");
+
+    // The upgraded file takes fonts, and a second downgrade keeps the first backup.
+    let project = Project::open(&path).unwrap();
+    project
+        .store_fonts(&[crate::fonts::EmbeddedFont::new(
+            "Zeist",
+            crate::fonts::shipped_font_renamed(false, "Zeist"),
+        )])
+        .unwrap();
+    drop(project);
+    let first = std::fs::read(&backup).unwrap();
+    make_v2(&path);
+    drop(Project::open(&path).unwrap());
+    assert_eq!(std::fs::read(&backup).unwrap(), first);
+    crate::fonts::replace_embedded(Vec::new());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_v2_file_that_already_has_the_fonts_table_is_stamped_without_a_backup() {
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    edited(1).0.save_as(&path).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "user_version", 2)
+        .unwrap();
+    drop(Project::open(&path).unwrap());
+    assert_eq!(version_of(&path), SCHEMA_VERSION);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no backup");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_file_from_before_every_step_gets_each() {
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    edited(1).0.save_as(&path).unwrap();
+    make_legacy(&path, false);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE fonts; ALTER TABLE staged DROP COLUMN owner; ALTER TABLE staged DROP COLUMN assets;")
+        .unwrap();
+    drop(Project::open(&path).unwrap());
+    assert_eq!(version_of(&path), SCHEMA_VERSION);
+    assert!(has_fonts_table(&path));
+    let conn = Connection::open(&path).unwrap();
+    assert!(conn.prepare("SELECT voiceover FROM assets").is_ok());
+    assert!(conn.prepare("SELECT owner, assets FROM staged").is_ok());
+    assert_eq!(version_of(&dir.join("cut (schema v0 backup).kerf")), 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_read_only_v1_file_without_the_proposals_columns_is_refused() {
+    let dir = scratch();
+    let path = dir.join("locked.kerf");
+    edited(1).0.save_as(&path).unwrap();
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute_batch("ALTER TABLE staged DROP COLUMN owner; ALTER TABLE staged DROP COLUMN assets;")
+            .unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    let uri = format!("file:{}?mode=ro", path.display());
+    let err = Project::open(&uri).err().expect("reading a proposal needs the columns");
+    assert!(err.to_string().contains("read-only"), "{err}");
+    assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_read_only_v2_file_without_the_fonts_table_opens_as_it_is() {
+    let dir = scratch();
+    let path = dir.join("locked.kerf");
+    edited(2).0.save_as(&path).unwrap();
+    make_v2(&path);
+    let before = std::fs::read(&path).unwrap();
+    let uri = format!("file:{}?mode=ro", path.display());
+    let project = Project::open(&uri).unwrap();
+    assert_eq!(project.history().unwrap().len(), 3);
+    assert!(project.embedded_fonts().unwrap().is_empty(), "no table, no fonts, no error");
+    assert_eq!(project.embedded_font_bytes().unwrap(), 0);
+    drop(project);
+    assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no backup");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn the_fonts_a_project_embeds_survive_save_as() {
+    let dir = scratch();
+    let (project, _) = edited(1);
+    let font = crate::fonts::EmbeddedFont::new("Zeist", crate::fonts::shipped_font_renamed(true, "Zeist"));
+    // A title that names the family is what keeps the font through a save.
+    project
+        .add_svg_overlay(
+            crate::SvgSource::Custom(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><text font-family="Zeist">a</text></svg>"#.into(),
+            ),
+            0.0,
+            Some(2.0),
+            crate::SvgLayout::default(),
+        )
+        .unwrap();
+    project.store_fonts(std::slice::from_ref(&font)).unwrap();
+    let path = dir.join("a.kerf");
+    project.save_as(&path).unwrap();
+    assert_eq!(Project::open(&path).unwrap().embedded_fonts().unwrap(), vec![font]);
+    crate::fonts::replace_embedded(Vec::new());
     std::fs::remove_dir_all(&dir).ok();
 }
 

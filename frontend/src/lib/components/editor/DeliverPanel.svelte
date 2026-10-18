@@ -10,12 +10,12 @@
 	import SectionHead from './SectionHead.svelte';
 	import DeliverTo from './DeliverTo.svelte';
 	import Readiness from './Readiness.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { formatsFor, hasPicture, presetFor, ratioLabel } from '$lib/delivery-formats';
-	import { timeDisplay } from '$lib/time-display.svelte';
-	import { timecodeRate } from '$lib/timecode';
-	import { tip } from '$lib/tip';
+	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { formatsFor, hasPicture, presetFor, ratioLabel } from '#lib/delivery-formats';
+	import { timeDisplay } from '#lib/time-display.svelte';
+	import { timecodeRate } from '#lib/timecode';
+	import { tip } from '#lib/tip';
 
 	const hasClips = $derived(editor.timeline.tracks.some((t) => t.clips.length > 0));
 	// Shapes are for a picture: the dialog ignores them for an audio-only cut, so

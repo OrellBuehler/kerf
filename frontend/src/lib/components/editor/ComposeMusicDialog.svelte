@@ -13,18 +13,18 @@
 	import Icon from './Icon.svelte';
 	import ProgressBar from './ProgressBar.svelte';
 	import SliderRow from './SliderRow.svelte';
-	import { editor, PreviewReadOnly } from '$lib/state.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { cancelMusic, musicStatus, onMusicProgress } from '$lib/api';
-	import { toast } from '$lib/notifications.svelte';
-	import { failure } from '$lib/failure-copy';
-	import { report } from '$lib/ops';
-	import { timeDisplay } from '$lib/time-display.svelte';
-	import { PREVIEW_READ_ONLY_REASON } from '$lib/proposal-ui';
-	import { PERCENT } from '$lib/slider-row';
-	import { clipDuration } from '$lib/types';
-	import type { ComposeResult, MusicProgress, MusicStatus } from '$lib/types';
-	import { DEFAULT_ENERGY, DEFAULT_MAX_TEMPO_CHANGE, MAX_BPM, MAX_SECTIONS, MIN_BPM, MUSIC_STYLES, SECTION_KINDS } from '$lib/music-score';
+	import { editor, PreviewReadOnly } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { cancelMusic, musicStatus, onMusicProgress } from '#lib/api';
+	import { toast } from '#lib/notifications.svelte';
+	import { failure } from '#lib/failure-copy';
+	import { report } from '#lib/ops';
+	import { timeDisplay } from '#lib/time-display.svelte';
+	import { PREVIEW_READ_ONLY_REASON } from '#lib/proposal-ui';
+	import { PERCENT } from '#lib/slider-row';
+	import { clipDuration } from '#lib/types';
+	import type { ComposeResult, MusicProgress, MusicStatus } from '#lib/types';
+	import { DEFAULT_ENERGY, DEFAULT_MAX_TEMPO_CHANGE, MAX_BPM, MAX_SECTIONS, MIN_BPM, MUSIC_STYLES, SECTION_KINDS } from '#lib/music-score';
 	import {
 		MAX_TEMPO_LIMIT,
 		addSection,
@@ -57,8 +57,8 @@
 		soundfontNote,
 		type ComposeForm,
 		type ComposePrefill
-	} from '$lib/compose-form';
-	import { tip } from '$lib/tip';
+	} from '#lib/compose-form';
+	import { tip } from '#lib/tip';
 
 	let { onClose, prefill = null }: { onClose: () => void; prefill?: ComposePrefill | null } = $props();
 

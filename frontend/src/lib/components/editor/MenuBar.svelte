@@ -21,15 +21,15 @@
 	import { tick, untrack } from 'svelte';
 	import Icon from './Icon.svelte';
 	import Kbd from './Kbd.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { workspace } from '$lib/workspace.svelte';
-	import { popout } from '$lib/popout.svelte';
-	import { updater } from '$lib/updater.svelte';
-	import { inTauri } from '$lib/api';
-	import { presetFor } from '$lib/delivery-formats';
-	import { uniformPreset } from '$lib/track-heights';
+	import { settings } from '#lib/settings.svelte';
+	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { workspace } from '#lib/workspace.svelte';
+	import { popout } from '#lib/popout.svelte';
+	import { updater } from '#lib/updater.svelte';
+	import { inTauri } from '#lib/api';
+	import { presetFor } from '#lib/delivery-formats';
+	import { uniformPreset } from '#lib/track-heights';
 	import {
 		buildMenus,
 		collapseMenus,
@@ -40,10 +40,10 @@
 		type MenuCommand,
 		type MenuEntry,
 		type MenuState
-	} from '$lib/menus';
-	import type { ActionId } from '$lib/keymap';
-	import { createAltTap } from '$lib/alt-tap';
-	import { tip } from '$lib/tip';
+	} from '#lib/menus';
+	import type { ActionId } from '#lib/keymap';
+	import { createAltTap } from '#lib/alt-tap';
+	import { tip } from '#lib/tip';
 
 	let {
 		compact = false,

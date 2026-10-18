@@ -4,8 +4,8 @@
 	// its only controls were in the status bar — the bin card and the Inspector, which started it, said "analyzing…"
 	// and nothing else. Stop gives up between steps, and within about a second during transcription.
 	import Btn from './Btn.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { tip } from '$lib/tip';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { tip } from '#lib/tip';
 
 	let { compact = false }: { compact?: boolean } = $props();
 

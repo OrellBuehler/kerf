@@ -13,18 +13,18 @@
 	// approximation — each says so where you switch it on, and the peak readout says the meters
 	// are the preview's sample peak. The Measure button reads the real mix.
 	import { untrack } from 'svelte';
-	import { intersectionObserverFor } from '$lib/realm';
-	import { windows, type FrameHandle } from '$lib/windows.svelte';
+	import { intersectionObserverFor } from '#lib/realm';
+	import { windows, type FrameHandle } from '#lib/windows.svelte';
 	import MixerStrip from './MixerStrip.svelte';
 	import MasterStrip from './MasterStrip.svelte';
 	import Badge from './Badge.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { audio } from '$lib/audio';
-	import { masterOf } from '$lib/levels';
-	import { mixerStrips } from '$lib/mixer-strips';
-	import { clearStereo, IDLE_STEREO, SILENCE, settleStereo, stepStereo, type StereoMeter } from '$lib/meter';
-	import { isStale, noteTone, verdict } from '$lib/levels-view';
+	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { audio } from '#lib/audio';
+	import { masterOf } from '#lib/levels';
+	import { mixerStrips } from '#lib/mixer-strips';
+	import { clearStereo, IDLE_STEREO, SILENCE, settleStereo, stepStereo, type StereoMeter } from '#lib/meter';
+	import { isStale, noteTone, verdict } from '#lib/levels-view';
 
 	/** Assets that carry sound, rebuilt only when the bin changes. */
 	const audible = $derived(

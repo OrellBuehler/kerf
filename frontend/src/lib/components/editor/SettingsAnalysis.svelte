@@ -3,15 +3,15 @@
 	import Switch from './Switch.svelte';
 	import Btn from './Btn.svelte';
 	import ProgressBar from './ProgressBar.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { useFilter } from '$lib/settings-filter';
-	import { cancelVoiceover, onVoiceoverProgress, prepareVoiceover, voiceoverStatus } from '$lib/api';
-	import { toast } from '$lib/notifications.svelte';
-	import { failure } from '$lib/failure-copy';
-	import { ANALYSIS_KINDS } from '$lib/analysis-steps';
-	import { approxMB, isVoiceoverCancelled, loadPrefs, stageLabel } from '$lib/voiceover';
-	import type { VoiceoverProgress, VoiceoverStatus } from '$lib/types';
+	import { settings } from '#lib/settings.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { useFilter } from '#lib/settings-filter';
+	import { cancelVoiceover, onVoiceoverProgress, prepareVoiceover, voiceoverStatus } from '#lib/api';
+	import { toast } from '#lib/notifications.svelte';
+	import { failure } from '#lib/failure-copy';
+	import { ANALYSIS_KINDS } from '#lib/analysis-steps';
+	import { approxMB, isVoiceoverCancelled, loadPrefs, stageLabel } from '#lib/voiceover';
+	import type { VoiceoverProgress, VoiceoverStatus } from '#lib/types';
 
 	const filter = useFilter();
 

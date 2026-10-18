@@ -5,17 +5,17 @@
 	import WorkspaceTabs from './WorkspaceTabs.svelte';
 	import MenuBar from './MenuBar.svelte';
 	import Btn from './Btn.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { workspace } from '$lib/workspace.svelte';
-	import { proposalIndicator, reviewChipText } from '$lib/agent-status';
-	import { clipsIn, exportButtonState } from '$lib/export-button';
-	import { updater } from '$lib/updater.svelte';
-	import { notifications } from '$lib/notifications.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import type { ActionId } from '$lib/keymap';
-	import type { MenuCommand } from '$lib/menus';
-	import { tip } from '$lib/tip';
+	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { workspace } from '#lib/workspace.svelte';
+	import { proposalIndicator, reviewChipText } from '#lib/agent-status';
+	import { clipsIn, exportButtonState } from '#lib/export-button';
+	import { updater } from '#lib/updater.svelte';
+	import { notifications } from '#lib/notifications.svelte';
+	import { settings } from '#lib/settings.svelte';
+	import type { ActionId } from '#lib/keymap';
+	import type { MenuCommand } from '#lib/menus';
+	import { tip } from '#lib/tip';
 
 	let { onAction, onCommand }: { onAction: (id: ActionId) => void; onCommand: (command: MenuCommand) => void } = $props();
 

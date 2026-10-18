@@ -527,6 +527,9 @@ export interface SvgOverlay {
 	offset?: number;
 	/** Absent on custom artwork. */
 	preset?: SvgPreset;
+	/** Present on a title made from a motion template: what it remembers of it. The artwork is still this
+	 *  title's own `svg`, so a value change is `set_template_values`, never a patch of `svg` (that ends the template). */
+	template?: TemplateInstance;
 }
 
 /** Where an animated title's artwork comes from; externally tagged, as the backend reads it. */
@@ -580,6 +583,106 @@ export interface SvgCheck {
 	svg: string;
 	warnings: string[];
 	natural_duration: number | null;
+}
+
+/** What a template control changes (`kerf_core::TemplateKind`): an element's text, a colour attribute, a
+ *  plain number in an attribute, a `font-family`, or an `<image>`'s `href` (a `data:` URL). */
+export type TemplateKind = 'text' | 'color' | 'number' | 'font' | 'image';
+
+/** Where a control's value goes: the element with this `id`, and which attribute (none for `text`). */
+export interface TemplateTarget {
+	element: string;
+	/** As the SVG spells it (`fill`, `stop-color`, `xlink:href`); required for every kind but `text`. */
+	attribute?: string;
+}
+
+/** One thing about a template that can be changed without opening the artwork. Values are strings:
+ *  text as it reads; a colour as `#rgb[a]` / `#rrggbb[aa]` / an SVG colour name / `none` / `currentColor`
+ *  (no `rgb()`); a number unitless in plain decimal; a font as one family name; an image as a `data:` URL
+ *  (`template_image_value` makes one from a file). */
+export interface TemplateControl {
+	/** Unique in the template; the key of a value. `[A-Za-z][A-Za-z0-9_-]{0,63}`. */
+	id: string;
+	label: string;
+	kind: TemplateKind;
+	/** Every place the one value is written (1 to 16). */
+	targets: TemplateTarget[];
+	/** Bounds of a `number` control; absent otherwise. */
+	min?: number;
+	max?: number;
+}
+
+/** What a title on the timeline remembers of the template it came from (`SvgOverlay.template`). */
+export interface TemplateInstance {
+	/** The library id it came from; the library is never consulted again. */
+	template_id: string;
+	name: string;
+	controls: TemplateControl[];
+	/** Each control's current value, read back from the title's `svg` after every change; a control whose
+	 *  element is gone is absent, and **`image` controls are never here** (their `data:` URL is in the `svg`). */
+	values: Record<string, string>;
+}
+
+/** A template in the library, as the grid shows it. Its poster is fetched on its own (`templatePoster`). */
+export interface TemplateInfo {
+	/** A lower-case UUID. */
+	id: string;
+	name: string;
+	description: string;
+	/** Seconds it runs: the length an applied one gets. */
+	duration: number;
+	/** The artwork's own shape in pixels. */
+	width: number;
+	height: number;
+	controls: TemplateControl[];
+	/** The families of the fonts it carries. */
+	fonts: string[];
+	has_poster: boolean;
+	size_bytes: number;
+}
+
+/** A file in the library that could not be read (it is listed, not a failure of the list). */
+export interface TemplateProblem {
+	file: string;
+	error: string;
+}
+
+/** The library: the templates that read, by name, and the files that did not. */
+export interface TemplateList {
+	templates: TemplateInfo[];
+	problems: TemplateProblem[];
+}
+
+/** A template saved into the library, and what could not be carried over (a font whose licence or size
+ *  keeps it out of the file, ...). */
+export interface TemplateSaved {
+	info: TemplateInfo;
+	warnings: string[];
+}
+
+/** What importing a `.kerftemplate` did: it never overwrites. `already_present`: the library had this very
+ *  template, nothing was written. `added_as_copy`: another template has the id, so this was kept under a new one. */
+export type ImportStatus = 'added' | 'already_present' | 'added_as_copy';
+
+export interface ImportOutcome {
+	info: TemplateInfo;
+	status: ImportStatus;
+	warnings: string[];
+}
+
+/** What applying a template or setting a template title's values hands back: the refreshed cut, the title
+ *  that was made or changed (the one to select), and what the sanitiser or the machine could not honour
+ *  (e.g. a font that is not installed). */
+export interface TemplateEdit {
+	timeline: Timeline;
+	overlay_id: string;
+	warnings: string[];
+}
+
+/** An element of a title that has an `id` and its tag name: what a control can aim at (`svg_element_ids`). */
+export interface SvgElementId {
+	id: string;
+	tag: string;
 }
 
 /** The look a generated caption set takes: a held subtitle line, or one large

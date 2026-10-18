@@ -7,13 +7,13 @@
 	 * the picture under it is an FFmpeg composite, so the pointer's rate must not be the playhead's).
 	 * Playback is paused while the bar is held and resumes at the end of the gesture, whichever
 	 * end it has: a seek mid-play restarts the audio each time. */
-	import { ui } from '$lib/editor-ui.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { beginDrag } from '$lib/drag';
-	import { windowOf } from '$lib/realm';
-	import { timeDisplay } from '$lib/time-display.svelte';
-	import { secondFrames, seekTime, stepFrames } from '$lib/frames';
-	import { chipLeft, frameLimited, markerTicks, scrubFraction, scrubRange, scrubTime } from '$lib/scrub';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { editor } from '#lib/state.svelte';
+	import { beginDrag } from '#lib/drag';
+	import { windowOf } from '#lib/realm';
+	import { timeDisplay } from '#lib/time-display.svelte';
+	import { secondFrames, seekTime, stepFrames } from '#lib/frames';
+	import { chipLeft, frameLimited, markerTicks, scrubFraction, scrubRange, scrubTime } from '#lib/scrub';
 
 	let { duration, empty }: { duration: number; empty: boolean } = $props();
 

@@ -9,13 +9,13 @@
 	import SliderRow from './SliderRow.svelte';
 	import Chip from './Chip.svelte';
 	import Btn from './Btn.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { report } from '$lib/ops';
-	import { inspectLut, pickLutFile } from '$lib/api';
-	import { beginDrag } from '$lib/drag';
-	import { resolveColor } from '$lib/waveform-draw';
-	import { PERCENT } from '$lib/slider-row';
+	import { editor } from '#lib/state.svelte';
+	import { settings } from '#lib/settings.svelte';
+	import { report } from '#lib/ops';
+	import { inspectLut, pickLutFile } from '#lib/api';
+	import { beginDrag } from '#lib/drag';
+	import { resolveColor } from '#lib/waveform-draw';
+	import { PERCENT } from '#lib/slider-row';
 	import {
 		CURVE_CHANNELS,
 		IDENTITY_POINTS,
@@ -38,8 +38,8 @@
 		withChannel,
 		type CurveChannel,
 		type WheelRange
-	} from '$lib/grade';
-	import type { Clip, CurvePoint, Grade, LutInfo, Wheel } from '$lib/types';
+	} from '#lib/grade';
+	import type { Clip, CurvePoint, Grade, LutInfo, Wheel } from '#lib/types';
 
 	let { clip }: { clip: Clip } = $props();
 

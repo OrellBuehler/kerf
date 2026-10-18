@@ -1,13 +1,13 @@
 <script lang="ts">
 	import SettingRow from './SettingRow.svelte';
 	import Btn from './Btn.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { workspace } from '$lib/workspace.svelte';
-	import { resetAllWorkspacesAsked } from '$lib/workspace-actions';
-	import { confirmAction, inTauri, revealLogs, revealSettingsFile } from '$lib/api';
-	import { CONFIRM } from '$lib/confirm-copy';
-	import { toast } from '$lib/notifications.svelte';
-	import { report } from '$lib/ops';
+	import { settings } from '#lib/settings.svelte';
+	import { workspace } from '#lib/workspace.svelte';
+	import { resetAllWorkspacesAsked } from '#lib/workspace-actions';
+	import { confirmAction, inTauri, revealLogs, revealSettingsFile } from '#lib/api';
+	import { CONFIRM } from '#lib/confirm-copy';
+	import { toast } from '#lib/notifications.svelte';
+	import { report } from '#lib/ops';
 
 	let resetting = $state(false);
 

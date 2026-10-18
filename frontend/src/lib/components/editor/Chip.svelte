@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
-	import { tip, type TipInput } from '$lib/tip';
+	import { tip, type TipInput } from '#lib/tip';
 
 	let {
 		pressed,

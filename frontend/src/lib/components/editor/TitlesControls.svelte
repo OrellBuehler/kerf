@@ -1,7 +1,8 @@
 <script lang="ts">
 	// Titles, lower thirds and captions: style chips that add one at the playhead,
 	// animated SVG titles (a picker of the presets, thumbnails drawn by the engine and shown as
-	// images, and a custom one whose source is written in the Inspector), the caption button (and which look it generates in), importing captions from
+	// images, and a custom one whose source is written in the Inspector), the library of motion
+	// templates (`TemplatesSection`), the caption button (and which look it generates in), importing captions from
 	// a subtitle file, and the lane's list of what is there. The content of the
 	// Inspector's "Titles lane" section and of the library's Titles tab — one
 	// component, so the two cannot drift.
@@ -11,10 +12,11 @@
 	import CheckRow from './CheckRow.svelte';
 	import Icon from './Icon.svelte';
 	import Tile from './Tile.svelte';
-	import { documentOf } from '$lib/realm';
-	import { editor } from '$lib/state.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { CAPTION_LOOKS, TEXT_STYLES } from '$lib/style-presets';
+	import TemplatesSection from './TemplatesSection.svelte';
+	import { documentOf } from '#lib/realm';
+	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { CAPTION_LOOKS, TEXT_STYLES } from '#lib/style-presets';
 	import {
 		addAnimatedTitle,
 		addCustomSvgTitle,
@@ -26,8 +28,8 @@
 		pickSvgTitle,
 		pickTitle,
 		presetThumbnail
-	} from '$lib/title-actions';
-	import { SVG_PRESETS, svgDisplayName, svgFrame, svgTooltip } from '$lib/svg-titles';
+	} from '#lib/title-actions';
+	import { SVG_PRESETS, svgDisplayName, svgFrame, svgTooltip } from '#lib/svg-titles';
 	import {
 		CAPTION_EXTENSIONS,
 		CAPTION_HINT,
@@ -42,10 +44,10 @@
 		keepLinesOn,
 		recaptionHint,
 		resolveChoice
-	} from '$lib/caption-import-ui';
-	import { attempt } from '$lib/ops';
-	import { timeDisplay } from '$lib/time-display.svelte';
-	import { tip } from '$lib/tip';
+	} from '#lib/caption-import-ui';
+	import { attempt } from '#lib/ops';
+	import { timeDisplay } from '#lib/time-display.svelte';
+	import { tip } from '#lib/tip';
 
 	const uid = $props.id();
 	/** The options row: where its window (the panel may be in a detached one) is read from. */
@@ -211,6 +213,7 @@
 		</Tile>
 	</div>
 {/if}
+<TemplatesSection />
 <div class="k-overline" style="margin-bottom:6px">Captions</div>
 <div role="group" aria-label="Caption style" style="display:flex;align-items:center;flex-wrap:wrap;gap:5px;margin-bottom:6px">
 	<span style="font-size:12px;color:var(--text-muted)">Style</span>

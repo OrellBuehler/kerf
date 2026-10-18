@@ -531,6 +531,12 @@
   what lets the engine keep such a title as one picture. Start and end are held to 24 h (`MAX_SVG_SECONDS`).
   `natural_duration` (all animations settled; `None` for a still or an endless loop) is what
   `add_svg_overlay` defaults the end to, held to 2–30 s (else 4 s; `SvgDoc::default_span`).
+  `SvgOverlay.template: Option<TemplateInstance>` is set when a title came from a motion template
+  (`core-project.md`, "Motion templates"): the controls and their values, skipped in the JSON when `None`.
+  Replacing the artwork through `SvgOverlayPatch.svg` clears it; the template values are changed through
+  `Project::set_template_values_parsed`, not the patch. `svg/splice.rs` is the id-addressed byte-range
+  splice (`Elements`, `Part::{Text, Attribute}`, `apply`) the controls ride on. Its helpers read an
+  attribute by the name the source spells (`xlink:href` is the XLink one, a bare `href` is not).
   `SvgOverlayPatch` has `svg` (custom artwork), `preset_params` (re-fill) and `preset_kind` (another
   preset, same id and draw order; `svg` excludes both, custom art refuses both). **Presets** (`SvgPresetKind`
   `fade_up` / `typewriter` / `lower_third` / `word_pop`, `svg::render_preset`) are only SVG the

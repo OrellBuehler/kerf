@@ -10,6 +10,7 @@
 // `DOMParser`; absent under bun), a root that is not `<svg xmlns="http://www.w3.org/2000/svg">`, and
 // one without a size to fit.
 import fixture from './fixtures/svg-presets.json';
+import { SVG_COLOUR_NAMES } from './svg-color-names';
 import type {
 	SvgCheck,
 	SvgLayout,
@@ -55,22 +56,6 @@ function esc(s: string): string {
 
 const regexSafe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-// The colour names SVG knows (the engine's `svgtypes` list).
-const COLOUR_NAMES = new Set(
-	`aliceblue antiquewhite aqua aquamarine azure beige bisque black blanchedalmond blue blueviolet brown burlywood cadetblue
-chartreuse chocolate coral cornflowerblue cornsilk crimson cyan darkblue darkcyan darkgoldenrod darkgray darkgreen darkgrey
-darkkhaki darkmagenta darkolivegreen darkorange darkorchid darkred darksalmon darkseagreen darkslateblue darkslategray
-darkslategrey darkturquoise darkviolet deeppink deepskyblue dimgray dimgrey dodgerblue firebrick floralwhite forestgreen
-fuchsia gainsboro ghostwhite gold goldenrod gray green greenyellow grey honeydew hotpink indianred indigo ivory khaki lavender
-lavenderblush lawngreen lemonchiffon lightblue lightcoral lightcyan lightgoldenrodyellow lightgray lightgreen lightgrey
-lightpink lightsalmon lightseagreen lightskyblue lightslategray lightslategrey lightsteelblue lightyellow lime limegreen linen
-magenta maroon mediumaquamarine mediumblue mediumorchid mediumpurple mediumseagreen mediumslateblue mediumspringgreen
-mediumturquoise mediumvioletred midnightblue mintcream mistyrose moccasin navajowhite navy oldlace olive olivedrab orange
-orangered orchid palegoldenrod palegreen paleturquoise palevioletred papayawhip peachpuff peru pink plum powderblue purple red
-rosybrown royalblue saddlebrown salmon sandybrown seagreen seashell sienna silver skyblue slateblue slategray slategrey snow
-springgreen steelblue tan teal thistle tomato transparent turquoise violet wheat white whitesmoke yellow yellowgreen`.split(/\s+/)
-);
-
 const NUMBER = String.raw`[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?`;
 const isNumber = (s: string) => new RegExp(`^${NUMBER}$`).test(s);
 const isPercent = (s: string) => new RegExp(`^${NUMBER}%$`).test(s);
@@ -80,7 +65,7 @@ const isPercent = (s: string) => new RegExp(`^${NUMBER}%$`).test(s);
 export function isSvgColour(value: string): boolean {
 	const s = value.trim();
 	if (/^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(s)) return true;
-	if (COLOUR_NAMES.has(s.toLowerCase())) return true;
+	if (SVG_COLOUR_NAMES.has(s.toLowerCase())) return true;
 	const fn = /^(rgba?|hsla?)\(\s*(.*?)\s*\)$/i.exec(s);
 	if (!fn) return false;
 	const args = fn[2].split(/\s*,\s*|\s+/);
@@ -252,7 +237,7 @@ export function validateSvgSource(src: string): SvgCheck {
 }
 
 /** A placement the compositor can draw: finite numbers, a real size, an opacity. */
-function checkRect(o: Pick<SvgOverlay, 'x' | 'y' | 'width' | 'height' | 'opacity'>): void {
+export function checkRect(o: Pick<SvgOverlay, 'x' | 'y' | 'width' | 'height' | 'opacity'>): void {
 	const { x, y, width, height, opacity } = o;
 	if (![x, y, width, height, opacity].every(Number.isFinite)) {
 		throw new Error('x, y, width, height and opacity must be numbers');
@@ -338,6 +323,7 @@ export function updateSvgOverlayIn(timeline: Timeline, overlayId: string, patch:
 	if (svg !== undefined) {
 		o.svg = svg;
 		delete o.preset;
+		delete o.template;
 		regenerate = false;
 	} else if (patch.preset_params || patch.preset_kind) {
 		if (!o.preset) throw new Error('this title is custom SVG, not a preset; pass svg to change it');

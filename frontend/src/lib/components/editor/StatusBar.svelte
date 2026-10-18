@@ -1,17 +1,17 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { gpuPreview } from '$lib/gpu-preview.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { mediaStatus } from '$lib/media-status.svelte';
-	import { previewSourceNote } from '$lib/proxy-info';
-	import { inTauri, revealLogs } from '$lib/api';
-	import { toast } from '$lib/notifications.svelte';
-	import { tip } from '$lib/tip';
-	import { timeDisplay } from '$lib/time-display.svelte';
-	import { assetLine, projectFrame, projectLine } from '$lib/status-facts';
-	import { jobLine } from '$lib/job-line';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { editor } from '#lib/state.svelte';
+	import { gpuPreview } from '#lib/gpu-preview.svelte';
+	import { settings } from '#lib/settings.svelte';
+	import { mediaStatus } from '#lib/media-status.svelte';
+	import { previewSourceNote } from '#lib/proxy-info';
+	import { inTauri, revealLogs } from '#lib/api';
+	import { toast } from '#lib/notifications.svelte';
+	import { tip } from '#lib/tip';
+	import { timeDisplay } from '#lib/time-display.svelte';
+	import { assetLine, projectFrame, projectLine } from '#lib/status-facts';
+	import { jobLine } from '#lib/job-line';
 
 	const showLogs = inTauri();
 

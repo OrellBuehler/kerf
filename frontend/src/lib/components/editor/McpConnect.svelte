@@ -6,10 +6,10 @@
 	import IconBtn from './IconBtn.svelte';
 	import Btn from './Btn.svelte';
 	import ChoiceChips from './ChoiceChips.svelte';
-	import { toast } from '$lib/notifications.svelte';
-	import { clientHelps, type ClientHelp } from '$lib/mcp-clients';
-	import { maskSecret } from '$lib/mcp-ui';
-	import type { McpConnectionInfo } from '$lib/types';
+	import { toast } from '#lib/notifications.svelte';
+	import { clientHelps, type ClientHelp } from '#lib/mcp-clients';
+	import { maskSecret } from '#lib/mcp-ui';
+	import type { McpConnectionInfo } from '#lib/types';
 
 	let {
 		info,

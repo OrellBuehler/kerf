@@ -7,16 +7,16 @@
 	import { untrack } from 'svelte';
 	import Btn from './Btn.svelte';
 	import Icon from './Icon.svelte';
-	import { editor } from '$lib/state.svelte';
-	import { ui } from '$lib/editor-ui.svelte';
-	import { BAND_ORDER, BAND_SHORT, balanceView } from '$lib/band-view';
-	import { BAND_BALANCE_CANCELLED, cancelBandBalance, getBandBalance } from '$lib/api';
-	import { composeOffer, fmtLength, hitsLine, sectionContour, styleLabel } from '$lib/compose-form';
-	import { scoreDuration, totalBars } from '$lib/music-score';
-	import { timeDisplay } from '$lib/time-display.svelte';
-	import { failure } from '$lib/failure-copy';
-	import type { Asset, BandBalance, Clip, Track } from '$lib/types';
-	import { tip } from '$lib/tip';
+	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
+	import { BAND_ORDER, BAND_SHORT, balanceView } from '#lib/band-view';
+	import { BAND_BALANCE_CANCELLED, cancelBandBalance, getBandBalance } from '#lib/api';
+	import { composeOffer, fmtLength, hitsLine, sectionContour, styleLabel } from '#lib/compose-form';
+	import { scoreDuration, totalBars } from '#lib/music-score';
+	import { timeDisplay } from '#lib/time-display.svelte';
+	import { failure } from '#lib/failure-copy';
+	import type { Asset, BandBalance, Clip, Track } from '#lib/types';
+	import { tip } from '#lib/tip';
 
 	let {
 		asset,

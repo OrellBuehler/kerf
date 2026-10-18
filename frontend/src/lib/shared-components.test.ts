@@ -22,7 +22,8 @@ const DIALOGS = [
 	'FitMusicDialog',
 	'StemsDialog',
 	'AboutDialog',
-	'MarkerDialog'
+	'MarkerDialog',
+	'SaveTemplateDialog'
 ];
 
 /** The opening `<Modal …>` tag of a dialog, whatever it spans. */

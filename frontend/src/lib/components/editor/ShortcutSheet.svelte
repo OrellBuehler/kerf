@@ -5,8 +5,8 @@
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
 	import Kbd from './Kbd.svelte';
-	import { settings } from '$lib/settings.svelte';
-	import { shortcutSheet, unboundLine } from '$lib/shortcut-sheet';
+	import { settings } from '#lib/settings.svelte';
+	import { shortcutSheet, unboundLine } from '#lib/shortcut-sheet';
 
 	let { onClose }: { onClose: () => void } = $props();
 

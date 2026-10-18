@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { Snippet } from 'svelte';
 	import Icon from './Icon.svelte';
-	import { tip, type TipInput } from '$lib/tip';
+	import { tip, type TipInput } from '#lib/tip';
 
 	let {
 		variant = 'secondary',
@@ -12,6 +12,7 @@
 		class: klass = '',
 		title = undefined,
 		pending = false,
+		type = 'button',
 		onclick = undefined,
 		children,
 		...rest
@@ -26,6 +27,8 @@
 		/** An edit is in flight (or the cut is read-only): off to the eye and to the click, but not `disabled` — a
 		 *  disabled button drops keyboard focus, so the key that was about to press the next one is lost. */
 		pending?: boolean;
+		/** `button` unless a form's own Save says `submit` (a bare `<button>` inside a form submits it). */
+		type?: 'button' | 'submit' | 'reset';
 		onclick?: unknown;
 		children?: Snippet;
 		[key: string]: unknown;
@@ -35,6 +38,7 @@
 <!-- Colors, hover, pressed and disabled live in `styles/controls.css`: an inline background
      could not be hovered. `style` is for layout only. -->
 <button
+	{type}
 	class={['k-btn', klass]}
 	use:tip={title}
 	data-variant={variant}

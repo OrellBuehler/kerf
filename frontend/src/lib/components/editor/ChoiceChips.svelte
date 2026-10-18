@@ -2,10 +2,10 @@
 	// A radio group drawn as chips: one tab stop, the arrows move through it (`roving`), the chosen chip is
 	// `aria-checked`. `follow: false` is for a choice that is expensive to make (Proxy size rebuilds every
 	// proxy): the arrows only move focus and Space / Enter choose.
-	import { roving } from '$lib/roving';
-	import { tabStop } from '$lib/menu-nav';
-	import { chip } from '$lib/settings-ui';
-	import { tip } from '$lib/tip';
+	import { roving } from '#lib/roving';
+	import { tabStop } from '#lib/menu-nav';
+	import { chip } from '#lib/settings-ui';
+	import { tip } from '#lib/tip';
 
 	let {
 		label,

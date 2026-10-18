@@ -1,5 +1,5 @@
 <script lang="ts" module>
-	import { getEnergy } from '$lib/api';
+	import { getEnergy } from '#lib/api';
 
 	// The energy of an asset does not change, and the Inspector remounts on every selection: ask once per asset.
 	const energy = new Map<string, Promise<number[]>>();
@@ -22,11 +22,11 @@
 	// every fourth), the intro before the first downbeat and a coloured band wherever a stretch comes back. It is
 	// `get_music_structure` for a person — the same grid, bars and phrases an agent reads, so what Fit to video will
 	// splice between is visible before it is asked.
-	import { timeDisplay } from '$lib/time-display.svelte';
-	import { barStart } from '$lib/music-fit';
-	import { energyPath, musicStructure, repeatLine, repeatSpans } from '$lib/music-structure';
-	import { barLength, musicSummary } from '$lib/music-ui';
-	import type { MusicAnalysis } from '$lib/types';
+	import { timeDisplay } from '#lib/time-display.svelte';
+	import { barStart } from '#lib/music-fit';
+	import { energyPath, musicStructure, repeatLine, repeatSpans } from '#lib/music-structure';
+	import { barLength, musicSummary } from '#lib/music-ui';
+	import type { MusicAnalysis } from '#lib/types';
 
 	let { assetId, music }: { assetId: string; music: MusicAnalysis } = $props();
 

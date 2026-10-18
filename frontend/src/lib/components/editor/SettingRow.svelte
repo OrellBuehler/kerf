@@ -2,7 +2,7 @@
 	// One setting: its name and what it does on the left, the control on the right (or underneath, for a wide
 	// one). It shows only when the settings search lets its `id` through (`settings-index.ts` lists the id).
 	import type { Snippet } from 'svelte';
-	import { useFilter } from '$lib/settings-filter';
+	import { useFilter } from '#lib/settings-filter';
 
 	let {
 		id,
