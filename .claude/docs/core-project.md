@@ -125,7 +125,9 @@
   **Crash recovery** (`recovery.rs`): an untitled project can live in `<root>/<session>/untitled.kerf`
   (`Project::create_recovery`), its directory held under an OS lock (`File::try_lock` on
   `<session>/lock`, a separate file because Windows byte-range locks would block SQLite) for as long
-  as it is open; `path()` stays `None`, so it still reads as unsaved. `recovery::scan(root, skip)`
+  as it is open, and **unlocked explicitly** on drop (`SessionLock`): the lock belongs to the open
+  file, which a child forked by another thread (`pre_exec` spawns fork) shares until it execs, so
+  closing alone could leave a let-go session locked; `path()` stays `None`, so it still reads as unsaved. `recovery::scan(root, skip)`
   offers the directories whose lock it can take and that hold work (assets, a revision past 0, a task
   or a proposal — the `summarize` read opens read-write so SQLite can roll back a crash's hot
   journal; a table the file lacks counts as empty, so a 0-byte or half-created file is cleaned up),
