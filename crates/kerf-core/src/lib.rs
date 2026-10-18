@@ -6,11 +6,13 @@
 //! timeline (EDL), and the operations that mutate it.
 
 pub mod analysis;
+pub mod captions_export;
 pub mod captions_import;
 mod clip_timing;
 pub mod error;
 pub mod fonts;
 pub mod frame_pick;
+pub mod interchange;
 pub mod layer_geometry;
 pub mod mask_plane;
 pub mod media;
@@ -40,6 +42,7 @@ pub use captions_import::{
     CaptionImportRequest, ImportSummary, ImportedCue, ParsedCaptions, MAX_CAPTION_CUES, MAX_CAPTION_FILE_BYTES,
     MAX_CAPTION_OFFSET, MAX_CAPTION_WORDS, MAX_CUE_CHARS, MAX_IMPORTED_CAPTIONS, MAX_LINE_CHARS,
 };
+pub use captions_export::{cut_captions, write_captions, CaptionCue, SubtitleFormat};
 pub use clip_timing::{fade_alpha, fade_chroma, fade_luma, FadeEdge, FadeStep, FadeTint, MotionKeys, Rational, FADE_FULL};
 pub use engine::cpu::{
     budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, gpu_lane, high_pending as proxy_jobs_pending,
@@ -61,13 +64,15 @@ pub use engine::{
 };
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;
+pub use interchange::markers::MarkerListFormat;
+pub use interchange::{InterchangeFormat, InterchangeOptions, Level as ReportLevel, Report, ReportEntry};
 pub use frame_pick::{fps_pick, seek_ticks, FpsPick, Pick, PickProgress, SourceFrames};
 pub use mask_plane::mask_alpha_plane;
 pub use media::{MediaResolver, OriginalMedia, ProxyMedia, SourceMedia};
 pub use model::{
     AnalysisKind, Asset, AssetAnalysis, AudioEffect, CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle,
     CaptionTimeBase, Clip, ClipCut, ClipMove, Color, CropFrame, Delivery, DeltaRange, Detached, DetachedMany, DiffEntry,
-    DiffKind, Easing, EditOutcome, EditSource, Framing, Keyframe, LevelReading, Levels, Marker, Mask, MaskShape, MasterBus,
+    DiffKind, Easing, EditOutcome, EditSource, Framing, Keyframe, LevelReading, Levels, Marker, MarkerKind, MarkerPatch, Mask, MaskShape, MasterBus,
     Projection, Property, PropertyKey, PropertyTrack, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap,
     SkippedDetach, SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Subsampling, Task, TaskStatus, TextKeyframe,
     TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TrackLevels, TranscriptSegment, Transform, Transition, TransitionKind,
@@ -82,7 +87,7 @@ pub use platform::{
     TARGETS as PLATFORM_TARGETS,
 };
 pub use play_plan::{PlayAhead, PlayCut, PlayRefusal};
-pub use project::{FramingPlan, Project, SmartCropJob, SmartCropPlan, StemsPlaced, MAX_CHANNEL_KEYS, VOICEOVER_TRACK};
+pub use project::{DeliveryInputs, ExportedFile, FramingPlan, Project, SmartCropJob, SmartCropPlan, StemsPlaced, MAX_CHANNEL_KEYS, VOICEOVER_TRACK};
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use render_plan::{
     Animated, CompositeColorPolicy, FadeOp, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream,

@@ -3335,7 +3335,7 @@ pub struct StagedEdit {
 /// A named point on the timeline. Purely an annotation — it renders nothing —
 /// but it gives the user and the agent a shared vocabulary for places in the
 /// cut ("the laugh at 01:12"), which timestamps alone do not.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Marker {
     pub id: Uuid,
     /// Position on the timeline, seconds.
@@ -3344,6 +3344,102 @@ pub struct Marker {
     /// Optional CSS color for the ruler chip; the UI picks a default when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    /// How long the marked span runs from `time`, seconds; 0 is a point.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub duration: f64,
+    /// A free-form note (a review comment, a chapter description).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub comment: String,
+    #[serde(default, skip_serializing_if = "MarkerKind::is_comment")]
+    pub kind: MarkerKind,
+}
+
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
+}
+
+/// What a [`Marker`] is for. A `Chapter` starts a chapter of the delivered video:
+/// it is written into the export's chapter list and the YouTube chapter text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkerKind {
+    #[default]
+    Comment,
+    Chapter,
+}
+
+impl MarkerKind {
+    pub fn is_comment(&self) -> bool {
+        *self == MarkerKind::Comment
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarkerKind::Comment => "comment",
+            MarkerKind::Chapter => "chapter",
+        }
+    }
+}
+
+/// The longest a marker's comment may be (characters).
+pub const MAX_MARKER_COMMENT: usize = 10_000;
+
+/// A change to a [`Marker`]; each `None` leaves that field alone. An empty
+/// `color` clears it back to the UI default.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MarkerPatch {
+    pub time: Option<f64>,
+    pub name: Option<String>,
+    pub color: Option<String>,
+    pub duration: Option<f64>,
+    pub comment: Option<String>,
+    pub kind: Option<MarkerKind>,
+}
+
+impl Marker {
+    /// Apply `patch`, refusing it whole when a field is out of range.
+    pub fn apply(&mut self, patch: MarkerPatch) -> Result<()> {
+        if patch.time.is_some_and(|t| !t.is_finite() || t < 0.0) {
+            return Err(Error::InvalidArgument("marker time must be >= 0".to_string()));
+        }
+        if patch.duration.is_some_and(|d| !d.is_finite() || d < 0.0) {
+            return Err(Error::InvalidArgument("marker duration must be >= 0".to_string()));
+        }
+        let comment = patch.comment.map(|c| {
+            c.chars()
+                .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+                .collect::<String>()
+        });
+        if comment.as_ref().is_some_and(|c| c.chars().count() > MAX_MARKER_COMMENT) {
+            return Err(Error::InvalidArgument(format!(
+                "marker comment is longer than {MAX_MARKER_COMMENT} characters"
+            )));
+        }
+        if let Some(t) = patch.time {
+            self.time = t;
+        }
+        if let Some(n) = patch.name {
+            self.name = n;
+        }
+        if let Some(c) = patch.color {
+            self.color = if c.is_empty() { None } else { Some(c) };
+        }
+        if let Some(d) = patch.duration {
+            self.duration = d;
+        }
+        if let Some(c) = comment {
+            self.comment = c.trim_end().to_string();
+        }
+        if let Some(k) = patch.kind {
+            self.kind = k;
+        }
+        Ok(())
+    }
+
+    /// Where the marked span ends (`time` for a point marker).
+    pub fn end(&self) -> f64 {
+        self.time + self.duration.max(0.0)
+    }
 }
 
 /// How a clip's picture is fitted to an output frame of a different shape.
@@ -4089,6 +4185,7 @@ impl Timeline {
                 .filter(|m| m.time >= start && m.time < end)
                 .map(|m| Marker {
                     time: m.time - start,
+                    duration: (m.end().min(end) - m.time).max(0.0),
                     ..m.clone()
                 })
                 .collect(),
@@ -6034,6 +6131,19 @@ impl Timeline {
                     if before.color != marker.color {
                         parts.push("recolored".to_string());
                     }
+                    if num_changed(before.duration, marker.duration) {
+                        parts.push(format!(
+                            "length {} → {}",
+                            fmt_time(before.duration),
+                            fmt_time(marker.duration)
+                        ));
+                    }
+                    if before.kind != marker.kind {
+                        parts.push(format!("now a {}", marker.kind.as_str()));
+                    }
+                    if before.comment != marker.comment {
+                        parts.push("comment edited".to_string());
+                    }
                     if let Some(detail) = joined(parts) {
                         rest.push(
                             DiffEntry::new(DiffKind::MarkerChanged, format!("Changed marker “{}”", marker.name))
@@ -7062,7 +7172,7 @@ mod tests {
             id: Uuid::new_v4(),
             time: t,
             name: n.into(),
-            color: None,
+            ..Default::default()
         };
         let tl = Timeline {
             tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 20.0)])],
@@ -7290,7 +7400,7 @@ mod tests {
             id: Uuid::new_v4(),
             time: 72.0,
             name: "the laugh".to_string(),
-            color: None,
+            ..Default::default()
         });
         after.format = Some(Delivery::new(1080, 1920, Fit::Cover));
 
@@ -8934,7 +9044,7 @@ mod tests {
             id: Uuid::new_v4(),
             time: 7.0,
             name: "beat".to_string(),
-            color: None,
+            ..Default::default()
         });
         let (_, out) = rippled(&before, |t| clip_mut(t, a).source_out = 3.0);
         assert_eq!(out.overlays[0].start, 6.0);

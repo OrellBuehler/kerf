@@ -23,6 +23,7 @@ use crate::model::{
     Voiceover, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_FOV, MIN_FOV,
 };
 use crate::model::{Detached, DetachedMany};
+use crate::model::MarkerPatch;
 use crate::model::{Property, PropertyKey};
 
 /// One clip queued for smart-crop sampling: which media to look at, over which
@@ -4354,6 +4355,7 @@ impl Project {
             time,
             name,
             color,
+            ..Default::default()
         };
         self.edit_timeline("Add marker", move |timeline| {
             timeline.markers.push(marker.clone());
@@ -4371,28 +4373,15 @@ impl Project {
         name: Option<String>,
         color: Option<String>,
     ) -> Result<Marker> {
-        if time.is_some_and(|t| !t.is_finite() || t < 0.0) {
-            return Err(Error::InvalidArgument("marker time must be >= 0".to_string()));
-        }
-        self.edit_timeline("Update marker", |timeline| {
-            let marker = timeline
-                .markers
-                .iter_mut()
-                .find(|m| m.id == marker_id)
-                .ok_or_else(|| Error::InvalidArgument(format!("no marker {marker_id}")))?;
-            if let Some(t) = time {
-                marker.time = t;
-            }
-            if let Some(n) = name {
-                marker.name = n;
-            }
-            if let Some(c) = color {
-                marker.color = if c.is_empty() { None } else { Some(c) };
-            }
-            let out = marker.clone();
-            timeline.markers.sort_by(|a, b| a.time.total_cmp(&b.time));
-            Ok(out)
-        })
+        self.edit_marker(
+            marker_id,
+            MarkerPatch {
+                time,
+                name,
+                color,
+                ..MarkerPatch::default()
+            },
+        )
     }
 
     /// Remove a marker.
@@ -5142,6 +5131,9 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
         .map_err(|e| Error::Other(format!("invalid datetime {s}: {e}")))
 }
+
+mod exports;
+pub use exports::{DeliveryInputs, ExportedFile};
 
 #[cfg(test)]
 mod linked_tests;
