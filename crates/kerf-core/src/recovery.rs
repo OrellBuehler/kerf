@@ -24,7 +24,19 @@ const PROJECT_FILE: &str = "untitled.kerf";
 pub struct RecoveryDir {
     id: String,
     dir: PathBuf,
-    lock: File,
+    lock: SessionLock,
+}
+
+/// The held lock file, unlocked explicitly when dropped. Closing it is not enough: the lock belongs
+/// to the open file, which a child forked by another thread shares until it execs (`pre_exec`
+/// spawns fork), so a session let go at that moment would stay locked and be skipped as in use.
+#[derive(Debug)]
+struct SessionLock(File);
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 impl RecoveryDir {
@@ -67,7 +79,7 @@ impl RecoveryDir {
     }
 }
 
-fn lock(dir: &Path) -> Result<File> {
+fn lock(dir: &Path) -> Result<SessionLock> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -75,7 +87,7 @@ fn lock(dir: &Path) -> Result<File> {
         .truncate(false)
         .open(dir.join(LOCK_FILE))?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(SessionLock(file)),
         Err(TryLockError::WouldBlock) => Err(Error::Other(format!("{} is in use", dir.display()))),
         Err(TryLockError::Error(e)) => Err(e.into()),
     }
@@ -172,7 +184,11 @@ fn inspect(id: String, dir: PathBuf) -> Seen {
             return Seen::Skipped;
         }
     }
-    let owned = RecoveryDir { id, dir, lock: file };
+    let owned = RecoveryDir {
+        id,
+        dir,
+        lock: SessionLock(file),
+    };
     let project = owned.project_path();
     let summary = if project.exists() {
         summarize(&owned.id, &project)
@@ -346,6 +362,19 @@ mod tests {
         assert!(scan(&root, None).is_empty(), "held by the first scan");
         drop(found);
         assert_eq!(scan(&root, None).len(), 1, "offered again once released");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_session_let_go_is_unlocked_while_a_forked_child_shares_its_lock() {
+        let root = scratch();
+        let dir = RecoveryDir::create(&root).unwrap();
+        let path = dir.dir().to_path_buf();
+        // What a child forked by another thread holds until it execs: the same open file.
+        let inherited = dir.lock.0.try_clone().unwrap();
+        drop(dir);
+        assert!(lock(&path).is_ok(), "released though a copy of the lock file is still open");
+        drop(inherited);
         std::fs::remove_dir_all(&root).ok();
     }
 
