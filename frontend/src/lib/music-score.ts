@@ -16,6 +16,9 @@ export const MAX_SCORE_BARS = 400;
 /** The longest piece, seconds. */
 export const MAX_SCORE_SECONDS = 600;
 export const MAX_HITS = 256;
+/** The largest seed: 2^53 - 1, the largest integer a JavaScript number (and so JSON through the webview or an
+ *  agent) holds exactly. A bigger one would come back as another seed and render another piece. */
+export const MAX_SEED = Number.MAX_SAFE_INTEGER;
 export const MAX_CHORDS_PER_SECTION = 64;
 /** How long the sound rings on after the last bar (at most 0.9 of a bar). */
 export const RELEASE_TAIL_S = 1.5;
@@ -104,6 +107,28 @@ export function sectionLabels(kinds: readonly SectionKind[]): string[] {
 	});
 }
 
+/** The tonic chord of a key, as text: `Am` for `Am` / `A minor`, `F#` for `F#`. */
+export function tonicChord(key: string): string {
+	const m = /^([A-Ga-g])([#♯b♭]*)/.exec(key.trim());
+	if (!m) return key.trim();
+	return `${m[1].toUpperCase()}${m[2].replace(/♯/g, '#').replace(/♭/g, 'b')}${isMinorKey(key) ? 'm' : ''}`;
+}
+
+/** `Resolved::chords`: `chords[section][bar]` **as played** — each section's list cycled to its length, and the
+ *  last bar of an outro that ends the piece replaced by the tonic chord (it resolves), so the notes and the chroma
+ *  the analysis is written from agree. Chords stay text here: the harness has no synthesizer. */
+export function resolvedChords(score: MusicScore): string[][] {
+	const chords = score.sections.map((s) => {
+		const bars = Number.isInteger(s.bars) && s.bars > 0 ? s.bars : 0;
+		return Array.from({ length: bars }, (_, b) => (s.chords.length > 0 ? s.chords[b % s.chords.length] : ''));
+	});
+	if (score.sections.at(-1)?.kind === 'outro') {
+		const last = chords.at(-1);
+		if (last && last.length > 0) last[last.length - 1] = tonicChord(score.key);
+	}
+	return chords;
+}
+
 // ---- keys and chords (score/chord.rs, syntax only) ---------------------------------------
 
 const LETTERS = 'CDEFGAB';
@@ -123,6 +148,9 @@ function takeNote(s: string): [number, string] | null {
 	}
 	return [((pc % 12) + 12) % 12, rest];
 }
+
+/** The engine's `invalid argument: …` (`Error::InvalidArgument`). */
+const invalid = (why: string) => new Error(`invalid argument: ${why}`);
 
 const notAKey = (text: string) => `"${text}" is not a key: write a tonic and an optional m, like G, F#m, Bb or Ebm`;
 
@@ -194,6 +222,9 @@ export function validateScore(score: MusicScore): string | null {
 	}
 	const key = keyError(score.key);
 	if (key) return key;
+	if (!Number.isInteger(score.seed) || score.seed < 0 || score.seed > MAX_SEED) {
+		return `seed must be 0..=${MAX_SEED} (2^53 - 1, so it survives JSON in JavaScript; got ${score.seed})`;
+	}
 	if (score.sections.length === 0) return 'the score needs at least one section';
 	if (score.sections.length > MAX_SECTIONS) return `a score has at most ${MAX_SECTIONS} sections`;
 	let bars = 0;
@@ -286,6 +317,8 @@ export function planScoreToPicture(
 	musicStart: number,
 	opts: AlignOptions = DEFAULT_ALIGN
 ): { score: MusicScore; report: AlignReport } {
+	const refused = validateScore(score);
+	if (refused) throw invalid(refused);
 	const duration = scoreDuration(score);
 	const cuts = cutTimes
 		.filter((t) => Number.isFinite(t))
@@ -312,9 +345,17 @@ export function planScoreToPicture(
 			const [weight, distance] = fit(music, bpm, tol);
 			candidates.push({ bpm, weight, distance });
 		}
-		const valid = (bpm: number) => bpm >= MIN_BPM && bpm <= MAX_BPM;
+		// The piece may not end before one of the hits it already has: they are absolute seconds.
+		const lastHit = (score.hits ?? []).reduce((m, h) => Math.max(m, h.at_s), 0);
+		const bars = totalBars(score);
+		const durationAt = (bpm: number) => {
+			const bar = barSeconds(bpm);
+			return bars * bar + Math.min(RELEASE_TAIL_S, 0.9 * bar);
+		};
+		const valid = (bpm: number) => bpm >= MIN_BPM && bpm <= MAX_BPM && durationAt(bpm) >= lastHit;
 		const baseline = fit(music, before, tol)[0];
-		const best = candidates.filter((c) => valid(c.bpm)).reduce((m, c) => Math.max(m, c.weight), baseline);
+		const weights = candidates.filter((c) => valid(c.bpm)).map((c) => c.weight);
+		const best = weights.length > 0 ? Math.max(...weights) : baseline;
 		if (best > baseline) {
 			let nearest = -1;
 			candidates.forEach((c, i) => {
@@ -352,7 +393,13 @@ export function planScoreToPicture(
 	if (opts.add_hits) {
 		const hits = [...(aligned.hits ?? [])];
 		const existing = (kind: HitKind, at: number) => hits.some((h) => h.kind === kind && Math.abs(h.at_s - at) < DUPLICATE_S);
+		let skipped = 0;
+		// Add `hit` unless the score is full.
 		const add = (hit: ScoreHit) => {
+			if (hits.length >= MAX_HITS) {
+				skipped += 1;
+				return;
+			}
 			hits.push(hit);
 			hitsAdded.push(hit);
 		};
@@ -373,9 +420,13 @@ export function planScoreToPicture(
 				add({ at_s: span.start_s, kind: 'riser' });
 			}
 		});
+		if (skipped > 0) notes.push(`the score is at its limit of ${MAX_HITS} hits: ${skipped} hit(s) were not added`);
 		hits.sort((a, b) => a.at_s - b.at_s);
 		if (hits.length > 0) aligned.hits = hits;
 	}
+	// Whatever was done to it, what is handed back is a score the renderer accepts.
+	const left = validateScore(aligned);
+	if (left) throw invalid(left);
 
 	const details: CutAlignment[] = deduped.map(([cut, m]) => ({
 		cut_s: cut,

@@ -1468,12 +1468,14 @@ export interface MusicScore {
 	sections: ScoreSection[];
 	/** Absent when there are none (the backend omits an empty list). */
 	hits?: ScoreHit[];
-	/** Varies the humanization and the hook; the same score and seed are the same audio. */
+	/** Varies the humanization and the hook; the same score and seed are the same audio. 0 to 2^53 - 1
+	 *  (9007199254740991): the largest integer JSON in JavaScript keeps exactly. */
 	seed: number;
 	instruments?: InstrumentOverrides;
 }
 
-/** What to fit a score to: the cuts of a video track, or the timeline's markers. */
+/** What to fit a score to: the cuts of a video track, or the timeline's markers. Like the score and the request,
+ *  it refuses a key it does not have (`deny_unknown_fields`). */
 export interface ScoreAlign {
 	to: 'cuts' | 'markers';
 	/** With `cuts`: the video track (absent: the first). */
@@ -1490,7 +1492,10 @@ export interface ComposeRequest {
 	/** Where it starts on the timeline, seconds; absent, after what the track holds. */
 	at?: number;
 	align?: ScoreAlign;
-	/** Swap this composed-music clip to the new render instead of adding a clip. */
+	/** Replace this music with the new render instead of adding a clip: **the whole bed** goes — every clip of this
+	 *  clip's asset on its track (what Fit to video made of one piece) becomes one clip of the new render, at the
+	 *  earliest of their starts, with this clip's id, the first one's level, fade-in and effects and the last one's
+	 *  fade-out. `at` and `track_id` are ignored. */
 	replace_clip_id?: string;
 }
 
@@ -1536,8 +1541,9 @@ export interface Composed {
 	clip: Clip;
 	score: MusicScore;
 	align: AlignReport | null;
-	/** An existing clip was swapped to the new render rather than a clip added. */
-	replaced: boolean;
+	/** The clips the new one replaced — the whole music bed of `replace_clip_id`, in time order; empty when a clip
+	 *  was added. */
+	replaced: string[];
 }
 
 export interface ComposeResult extends Composed {

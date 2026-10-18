@@ -12,6 +12,7 @@ import {
 	MAX_BPM,
 	MAX_CHORDS_PER_SECTION,
 	MAX_SECTIONS,
+	MAX_SEED,
 	MAX_SECTION_BARS,
 	MIN_BPM,
 	MUSIC_STYLES,
@@ -254,9 +255,9 @@ export function formIssues(form: ComposeForm): FormIssues {
 			: `Tempo is ${MIN_BPM} to ${MAX_BPM} BPM`;
 	const key = form.key.trim() === '' ? 'Enter a key: a tonic and an optional m, like G, F#m, Bb or Ebm' : keyError(form.key);
 	const seed =
-		form.seed === null || (Number.isInteger(form.seed) && form.seed >= 0 && form.seed <= Number.MAX_SAFE_INTEGER)
+		form.seed === null || (Number.isInteger(form.seed) && form.seed >= 0 && form.seed <= MAX_SEED)
 			? null
-			: 'Variation is a whole number, 0 or more';
+			: `Variation is a whole number from 0 to ${MAX_SEED}`;
 	const sections = form.sections.map((s): SectionIssues => {
 		const chords = parseChords(s.chords);
 		let chordsIssue: string | null = null;
@@ -418,9 +419,9 @@ export function isMusicCancelled(e: unknown): boolean {
 	return (e instanceof Error ? e.message : String(e)) === 'music cancelled';
 }
 
-/** `Composed.replaced` is whether a clip was swapped, or (newer cores) the ids of the clips that were. */
-export function wasReplaced(replaced: boolean | readonly string[] | null | undefined): boolean {
-	return Array.isArray(replaced) ? replaced.length > 0 : !!replaced;
+/** Whether the piece replaced any clip: `Composed.replaced` is the ids of the clips it replaced, empty when one was added. */
+export function wasReplaced(replaced: readonly string[]): boolean {
+	return replaced.length > 0;
 }
 
 /** `110` or `113.2`: a tempo to a tenth, without a trailing `.0`. */
@@ -473,7 +474,7 @@ export function describeScore(score: MusicScore): string {
 }
 
 /** The toast after a piece lands. */
-export function describeComposed(done: { score: MusicScore; replaced: boolean | readonly string[] }): string {
+export function describeComposed(done: { score: MusicScore; replaced: readonly string[] }): string {
 	return `${wasReplaced(done.replaced) ? 'Music re-composed' : 'Music added'}: ${scoreTitle(done.score)} · ${fmtLength(scoreDuration(done.score))}`;
 }
 

@@ -2,11 +2,15 @@ import { describe, expect, test } from 'bun:test';
 import {
 	chordError,
 	keyError,
+	MAX_HITS,
+	MAX_SEED,
 	planScoreToPicture,
+	resolvedChords,
 	scoreDuration,
 	scoreTitle,
 	sectionLabels,
 	sectionSpans,
+	tonicChord,
 	validateScore
 } from './music-score';
 import type { MusicScore, ScoreSection, SectionKind } from './types';
@@ -92,6 +96,23 @@ describe('the score', () => {
 		s.sections = [];
 		expect(validateScore(s)).toContain('at least one section');
 
+		// A seed must survive a trip through JavaScript: 2^53 - 1 at most, checked after the key and before the sections.
+		s = song();
+		s.seed = MAX_SEED;
+		expect(validateScore(s)).toBeNull();
+		s.seed = MAX_SEED + 1;
+		expect(validateScore(s)).toBe(
+			'seed must be 0..=9007199254740991 (2^53 - 1, so it survives JSON in JavaScript; got 9007199254740992)'
+		);
+		s.seed = -1;
+		expect(validateScore(s)).toContain('seed must be 0..=9007199254740991');
+		s.seed = 1.5;
+		expect(validateScore(s)).toContain('seed must be 0..=');
+		s = { ...song(), sections: [], seed: MAX_SEED + 1 };
+		expect(validateScore(s)).toContain('seed must be');
+		s = { ...song(), key: 'Z', seed: -1 };
+		expect(validateScore(s)).toContain('not a key');
+
 		s = song();
 		s.hits = [{ at_s: 9999, kind: 'impact' }];
 		expect(validateScore(s)).toContain('hits[0] (impact)');
@@ -103,6 +124,37 @@ describe('the score', () => {
 		s = song();
 		s.sections = [section('drop', 128, ['C']), section('drop', 128, ['C']), section('drop', 128, ['C']), section('drop', 128, ['C'])];
 		expect(validateScore(s)).toContain('at most 400 bars');
+	});
+});
+
+describe('the chords as played', () => {
+	test('cycle in each section, and the last bar of an outro resolves on the tonic', () => {
+		// song(): the outro is `i VI iv V` in Am — its last bar is written as V and plays the tonic.
+		const played = resolvedChords(song());
+		expect(played.map((c) => c.length)).toEqual([4, 8, 4, 8, 4, 8, 4]);
+		expect(played[0]).toEqual(['i', 'VI', 'i', 'VI']);
+		expect(played[1]).toEqual(['i', 'VI', 'III', 'VII', 'i', 'VI', 'III', 'VII']);
+		expect(played[6]).toEqual(['i', 'VI', 'iv', 'Am']);
+	});
+
+	test('only an outro that ends the piece resolves', () => {
+		const middle = { ...song(), sections: [section('outro', 2, ['C', 'G']), section('verse', 2, ['C', 'G'])] };
+		expect(resolvedChords(middle).flat()).toEqual(['C', 'G', 'C', 'G']);
+		const ends = { ...song(), key: 'G', sections: [section('verse', 2, ['C', 'D']), section('outro', 2, ['C', 'D'])] };
+		expect(resolvedChords(ends)[1]).toEqual(['C', 'G']);
+	});
+
+	test('the tonic chord is the key as a chord', () => {
+		expect(tonicChord('Am')).toBe('Am');
+		expect(tonicChord(' F#m ')).toBe('F#m');
+		expect(tonicChord('Bb')).toBe('Bb');
+		expect(tonicChord('ebm')).toBe('Ebm');
+		expect(tonicChord('G')).toBe('G');
+	});
+
+	test('a section with no chords or no bars plays nothing', () => {
+		const odd = { ...song(), sections: [section('verse', 0, ['C']), section('verse', 2, [])] };
+		expect(resolvedChords(odd)).toEqual([[], ['', '']]);
 	});
 });
 
@@ -198,6 +250,44 @@ describe('score to picture', () => {
 		const bare = planScoreToPicture(song(), [4], 0, { max_tempo_change: 0.06, tolerance_s: 0.04, add_hits: false });
 		expect(bare.score.hits ?? []).toEqual([]);
 		expect(bare.report.hits_added).toEqual([]);
+	});
+
+	test('a tempo change never ends the piece before a hit it already has', () => {
+		const score = song();
+		// Cuts a bar apart at 127 BPM: the tempo that fits them is inside the 6 % limit of 120.
+		const cuts = Array.from({ length: 12 }, (_, k) => (240 / 127) * (k + 1));
+		const free = planScoreToPicture(score, cuts, 0).score;
+		expect(free.bpm).toBeGreaterThan(126);
+		expect(scoreDuration(free)).toBeLessThan(80);
+
+		// An impact at 80 s: 127 BPM would end the piece (77 s) before it, so a slower fit is chosen
+		// and the hit stays where it was, inside the piece.
+		score.hits = [{ at_s: 80, kind: 'impact' }];
+		const { score: aligned, report } = planScoreToPicture(score, cuts, 0);
+		expect(aligned.bpm).toBeLessThanOrEqual(122.4);
+		expect(scoreDuration(aligned)).toBeGreaterThanOrEqual(80);
+		expect(aligned.hits!.some((h) => h.at_s === 80 && h.kind === 'impact')).toBe(true);
+		expect(validateScore(aligned)).toBeNull();
+		expect(report.bpm_after).toBe(aligned.bpm);
+	});
+
+	test('added hits stop at the limit and the report says so', () => {
+		// 254 hits already, none near the downbeats the cuts land on.
+		const score: MusicScore = { ...song(), hits: Array.from({ length: 254 }, (_, k) => ({ at_s: 0.3 * (k + 1), kind: 'whoosh' as const })) };
+		const opts = { max_tempo_change: 0, tolerance_s: 0.04, add_hits: true };
+		const { score: aligned, report } = planScoreToPicture(score, [4, 8, 12, 16], 0, opts);
+		expect(aligned.hits!.length).toBe(MAX_HITS);
+		expect(report.hits_added.length).toBe(2);
+		expect(report.notes.some((n) => n.includes('2 hit(s) were not added'))).toBe(true);
+		expect(report.notes).toContain(`the score is at its limit of ${MAX_HITS} hits: 2 hit(s) were not added`);
+		expect(validateScore(aligned)).toBeNull();
+	});
+
+	test('a score the engine would refuse is refused, not fitted', () => {
+		const bad = song();
+		bad.sections[1].chords[0] = 'Hm';
+		expect(() => planScoreToPicture(bad, [4], 0)).toThrow(/^invalid argument: sections\[1\] \(verse\).*"Hm"/);
+		expect(() => planScoreToPicture({ ...song(), bpm: 20 }, [4], 0)).toThrow('invalid argument: bpm must be');
 	});
 
 	test('no cuts is a quiet no-op, and the search is deterministic', () => {

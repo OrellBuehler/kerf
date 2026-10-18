@@ -40,7 +40,7 @@ import {
 	wasReplaced,
 	type ComposeForm
 } from './compose-form';
-import { MUSIC_STYLES, scoreDuration, validateScore } from './music-score';
+import { MAX_SEED, MUSIC_STYLES, scoreDuration, validateScore } from './music-score';
 import type { AlignReport, Clip, MusicScore, Timeline, Track } from './types';
 
 const clip = (start: number, length: number, extra: Partial<Clip> = {}): Clip =>
@@ -311,9 +311,9 @@ describe('what is wrong with the form', () => {
 		expect(formIssues(f).sections[0].chords).toBe('At most 64 chords');
 	});
 
-	test('the variation is a whole number, 0 or more', () => {
-		for (const seed of [-1, 1.5, Number.NaN]) expect(formIssues({ ...form(), seed }).seed).not.toBeNull();
-		for (const seed of [0, 7, null]) expect(formIssues({ ...form(), seed }).seed).toBeNull();
+	test('the variation is a whole number from 0 to 2^53 - 1', () => {
+		for (const seed of [-1, 1.5, Number.NaN, MAX_SEED + 2]) expect(formIssues({ ...form(), seed }).seed).toBe('Variation is a whole number from 0 to 9007199254740991');
+		for (const seed of [0, 7, null, MAX_SEED]) expect(formIssues({ ...form(), seed }).seed).toBeNull();
 	});
 
 	test('what only the whole score can say is `general`', () => {
@@ -363,6 +363,7 @@ describe('what is wrong with the form', () => {
 			f.sections[0].bars = bars;
 			cases.push(f);
 		}
+		for (const seed of [0, 12, MAX_SEED, MAX_SEED + 2, -1, 1.5]) cases.push({ ...base, seed });
 		for (const energy of [0, 1, -0.1, 1.1, null]) {
 			const f = form();
 			f.sections[0].energy = energy;
@@ -528,20 +529,17 @@ describe('the words', () => {
 		expect(isMusicCancelled(new Error('invalid argument: bpm must be 40..=240'))).toBe(false);
 	});
 
-	test('a swapped clip is a boolean from one core and a list of ids from another', () => {
-		expect(wasReplaced(true)).toBe(true);
-		expect(wasReplaced(false)).toBe(false);
+	test('a replaced clip is a list of ids: none is a clip added', () => {
 		expect(wasReplaced(['a'])).toBe(true);
+		expect(wasReplaced(['a', 'b'])).toBe(true);
 		expect(wasReplaced([])).toBe(false);
-		expect(wasReplaced(undefined)).toBe(false);
-		expect(wasReplaced(null)).toBe(false);
 	});
 
 	test('the toast says whether the piece was added or the clip re-composed', () => {
 		const score = formToScore({ ...form(), style: 'lofi', bpm: 82, key: 'Am' });
-		expect(describeComposed({ score, replaced: false })).toMatch(/^Music added: Lo-fi · Am · 82 BPM · \d+ s$/);
-		expect(describeComposed({ score, replaced: true })).toMatch(/^Music re-composed: Lo-fi · Am · 82 BPM/);
-		expect(describeComposed({ score, replaced: ['c1'] })).toMatch(/^Music re-composed/);
+		expect(describeComposed({ score, replaced: [] })).toMatch(/^Music added: Lo-fi · Am · 82 BPM · \d+ s$/);
+		expect(describeComposed({ score, replaced: ['c1'] })).toMatch(/^Music re-composed: Lo-fi · Am · 82 BPM/);
+		expect(describeComposed({ score, replaced: ['c1', 'c2'] })).toMatch(/^Music re-composed/);
 	});
 
 	test('a tempo is a tenth, without a trailing .0', () => {

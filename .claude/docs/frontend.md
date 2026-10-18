@@ -1337,13 +1337,25 @@ reject as the backend does and leave nothing behind. `api-ripple.test.ts` drives
 `band balance cancelled` (`BAND_BALANCE_CANCELLED`), which a dialog stays quiet on. The ids are snake_case
 inside the request (`track_id`, `replace_clip_id`), unlike the camelCase arguments of the older commands.
 `music-score.ts` is the faithful mirror of the score's pure half — `scoreDuration`, `sectionSpans`,
-`validateScore` (the engine's refusals, word for word, naming the section or chord), `chordError` /
-`keyError` (the grammar only) and `planScoreToPicture` — replayed from the Rust cases in
-`music-score.test.ts`, for the dialog's live length and errors and for the harness. Under `bun run dev`
-`composeMusic` fakes the SoundFont download and render ticks, lands an audio-only asset as long as the score
-on the `M` track (the same score is the same asset by path; its tempo and bar analysis written from the
-score), swaps the clip for `replace_clip_id`, aligns to the first video track's cuts or the markers, and
-refuses what the engine refuses; `getBandBalance` picks its windows as `project/music.rs` does and words its
+`validateScore` (the engine's refusals, word for word, naming the section or chord; a seed over 2^53 - 1 is refused
+too, `MAX_SEED`), `chordError` / `keyError` (the grammar only), `resolvedChords` (the chords **as played**: the last bar
+of an outro that ends the piece is the tonic, as `resolve()` has it) and `planScoreToPicture` (validates the score
+going in and the one coming out; never picks a tempo that ends the piece before a hit it already has; stops adding
+hits at `MAX_HITS` and says how many it left out) — replayed from the Rust cases in `music-score.test.ts`, for the
+dialog's live length and errors and for the harness. `music-place.ts` mirrors the placement in `project/music.rs`
+(`musicBed`, `musicStart`, `putMusic`, `rehearseMusic`; `music-place.test.ts`) and `music-wire.ts` the structs' `deny_unknown_fields` (serde's "unknown field `x`, expected one of …" in Tauri's "invalid
+args for command" frame, nested structs included). Under `bun run dev` `composeMusic` fakes the SoundFont download and render ticks and
+lands an audio-only asset as long as the score on the `M` track (the same score is the same asset by path; its tempo
+and bar analysis written from the score, from the chords as played), aligns to the first video track's cuts or the
+markers, and refuses what the engine refuses. A placement is rehearsed on a copy of the cut with the render's length
+**before** the render (a piece over another clip of its track — `{at: 0}` and then `{at: 2}` on `M` — is refused with
+`the clip would overlap another clip on M at … — move or trim that one first`, unless ripple is on and only pushes it)
+and checked again when it lands, as one edit that ripples like any other (`runEdit` with the clip as a lane); the asset
+and its analysis are stored only after that, so a refusal leaves neither. `replace_clip_id` replaces the **whole music
+bed** — every clip of that asset on the track — with one clip at the earliest start, the named clip's id, the first
+clip's level / fade-in / effects / keys and the last one's fade-out (`Composed.replaced` is the ids, in time order,
+`[]` for an added clip); a locked track, a bed linked to a picture and a clip that is not composed music are refused in
+the core's words. `getBandBalance` picks its windows as `project/music.rs` does and words its
 `notes` as `balance_notes` (`band-balance.ts`) but the measurement itself is made up (in a browser it takes
 ~0.6 s and honours Stop; under bun it is at once). `api-compose.test.ts` drives the bridge.
 **The Compose music dialog** (`ComposeMusicDialog`, `ui.composeDialog`, `ui.openCompose(prefill?)`, inert-behind like
@@ -1366,7 +1378,7 @@ earlier alignment wrote are kept (*Clear hits*): they sit at fixed times in the 
 after, the tempo change, hits added, the engine's notes: `alignRows`) and Done; without one it closes on a toast with
 Undo. Either way the new clip is selected (`editor.composeMusic`, which also refreshes the assets and loads the analysis
 the core wrote) and the playhead goes to its start unless it is already inside (`revealAt`). `Composed.replaced` is read
-through `wasReplaced` (a boolean, or the ids of the clips replaced). Re-composing replaces the **whole music bed** — every
+through `wasReplaced` (the ids of the clips replaced). Re-composing replaces the **whole music bed** — every
 clip of that asset on the track, the segments Fit to video made of one piece (`musicBed`, `replaceNote`) — and is off,
 with the core's reason, on a locked track or a bed linked to a picture (`composeOffer`). Reached from **File › Compose
 music…** (`file.composeMusic`, unbound, held while a proposal is previewed), the Media tab's header (a music icon beside

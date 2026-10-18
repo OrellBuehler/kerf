@@ -1,8 +1,10 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import {
+	addClip,
 	addMarker,
 	cancelMusic,
 	composeMusic,
+	fitMusic,
 	getAssetMetadata,
 	getBandBalance,
 	getHistory,
@@ -12,10 +14,12 @@ import {
 	onMusicProgress,
 	prepareMusic,
 	revertTo,
+	setRippleMode,
+	setTrackLocked,
 	undo
 } from './api';
-import { scoreDuration } from './music-score';
-import type { ComposeRequest, MusicProgress, MusicScore } from './types';
+import { MAX_SEED, scoreDuration } from './music-score';
+import type { Clip, ComposeRequest, MusicProgress, MusicScore } from './types';
 
 // Under bun there is no Tauri, so these drive the browser harness's composition: a SoundFont download
 // on first use, render ticks, then an audio-only asset as long as the score on the "M" track, its
@@ -46,7 +50,7 @@ function score(): MusicScore {
 	};
 }
 
-const mClip = (tl: { tracks: { name: string; clips: { id: string }[] }[] }) => tl.tracks.find((t) => t.name === 'M')?.clips ?? [];
+const mClip = (tl: { tracks: { name: string; clips: Clip[] }[] }) => tl.tracks.find((t) => t.name === 'M')?.clips ?? [];
 
 describe('music_status (browser harness)', () => {
 	test('lists the styles and the first composition still fetches the SoundFont', async () => {
@@ -69,7 +73,7 @@ describe('compose_music (browser harness)', () => {
 			const composed = await composeMusic({ score: score() });
 			stop();
 			expect(stages.at(-1)).toBe('render');
-			expect(composed.replaced).toBe(false);
+			expect(composed.replaced).toEqual([]);
 			expect(composed.align).toBeNull();
 			expect(composed.score).toEqual(score());
 			expect(composed.asset.duration).toBeCloseTo(scoreDuration(score()), 9);
@@ -113,7 +117,7 @@ describe('compose_music (browser harness)', () => {
 			const first = await composeMusic({ score: score(), at: 5 });
 			const longer = { ...score(), sections: [...score().sections, { kind: 'verse' as const, bars: 2, chords: ['Am'] }] };
 			const redone = await composeMusic({ score: longer, replace_clip_id: first.clip.id });
-			expect(redone.replaced).toBe(true);
+			expect(redone.replaced).toEqual([first.clip.id]);
 			expect(redone.clip.id).toBe(first.clip.id);
 			expect(redone.clip.timeline_start).toBe(5);
 			expect(redone.clip.asset_id).toBe(redone.asset.id);
@@ -124,6 +128,145 @@ describe('compose_music (browser harness)', () => {
 			const tl = await undo();
 			expect(tl.tracks.flatMap((t) => t.clips).find((c) => c.id === first.clip.id)!.asset_id).toBe(first.asset.id);
 			expect((await getTimeline()).tracks.flatMap((t) => t.clips).find((c) => c.id === first.clip.id)!.timeline_start).toBe(5);
+		},
+		SLOW
+	);
+
+	test(
+		'replacing replaces the whole bed Fit to video made of the piece, with one clip at its earliest start',
+		async () => {
+			const first = await composeMusic({ score: score(), at: 3 });
+			const fitted = await fitMusic(first.clip.id, 22, false);
+			const bed = mClip(fitted.timeline);
+			expect(bed.length).toBeGreaterThanOrEqual(2);
+			const ids = bed.map((c) => c.id);
+			const start = bed[0].timeline_start;
+			const redone = await composeMusic({ score: { ...score(), bpm: 100 }, replace_clip_id: ids[1] });
+			expect(redone.replaced).toEqual(ids);
+			expect(redone.clip.id).toBe(ids[1]);
+			expect(redone.clip.timeline_start).toBe(start);
+			expect(mClip(redone.timeline).map((c) => c.id)).toEqual([ids[1]]);
+			expect((await getHistory()).find((r) => r.current)!.label).toBe('Recompose music');
+		},
+		SLOW
+	);
+
+	test(
+		'a longer piece that runs into the next clip is refused without ripple and pushes it with ripple',
+		async () => {
+			const first = await composeMusic({ score: score(), at: 0 });
+			const end = first.asset.duration;
+			const other = (await listAssets()).find((a) => a.name === 'music.mp3')!;
+			const added = await addClip(other.id, 0, 4, first.timeline.tracks.find((t) => t.name === 'M')!.id, end);
+			const next = mClip(added)[1];
+			const longer = { ...score(), sections: [...score().sections, { kind: 'verse' as const, bars: 8, chords: ['Am'] }] };
+			const history = (await getHistory()).length;
+			const assets = (await listAssets()).length;
+			await expect(composeMusic({ score: longer, replace_clip_id: first.clip.id })).rejects.toThrow(
+				/^invalid argument: the clip would overlap another clip on M at .* — move or trim that one first$/
+			);
+			// refused before the render: no history, no asset
+			expect((await getHistory()).length).toBe(history);
+			expect((await listAssets()).length).toBe(assets);
+			await setRippleMode(true);
+			try {
+				const redone = await composeMusic({ score: longer, replace_clip_id: first.clip.id });
+				const [made, pushed] = mClip(redone.timeline);
+				expect(pushed.id).toBe(next.id);
+				expect(pushed.timeline_start).toBeCloseTo(made.timeline_start + redone.asset.duration, 6);
+			} finally {
+				await setRippleMode(false);
+			}
+		},
+		SLOW
+	);
+
+	test(
+		'a piece that would land on another clip of M is refused before it renders, and one after it is not',
+		async () => {
+			await composeMusic({ score: score(), at: 0 });
+			const assets = (await listAssets()).length;
+			const history = (await getHistory()).length;
+			const stages: string[] = [];
+			const stop = await onMusicProgress((p) => stages.push(p.stage));
+			await expect(composeMusic({ score: score(), at: 2 })).rejects.toThrow(/^invalid argument: the clip would overlap another clip on M at /);
+			stop();
+			expect(stages).toEqual([]);
+			expect((await listAssets()).length).toBe(assets);
+			expect((await getHistory()).length).toBe(history);
+			const after = await composeMusic({ score: score(), at: scoreDuration(score()) });
+			expect(mClip(after.timeline).length).toBe(2);
+		},
+		SLOW
+	);
+
+	test(
+		'a locked M track refuses a new piece and a recompose before the render',
+		async () => {
+			const first = await composeMusic({ score: score() });
+			const m = first.timeline.tracks.find((t) => t.name === 'M')!;
+			await setTrackLocked(m.id, true);
+			try {
+				await expect(composeMusic({ score: score(), at: 100 })).rejects.toThrow('invalid argument: M is locked');
+				await expect(composeMusic({ score: score(), track_id: m.id, at: 100 })).rejects.toThrow('invalid argument: M is locked');
+				await expect(composeMusic({ score: score(), replace_clip_id: first.clip.id })).rejects.toThrow('invalid argument: M is locked');
+			} finally {
+				await setTrackLocked(m.id, false);
+			}
+		},
+		SLOW
+	);
+
+	test(
+		'a placement refused after the render, against the cut as it is by then, stores neither the asset nor its analysis',
+		async () => {
+			const first = await composeMusic({ score: score() });
+			const m = first.timeline.tracks.find((t) => t.name === 'M')!;
+			const other = { ...score(), bpm: 90 };
+			const assets = (await listAssets()).length;
+			const history = (await getHistory()).length;
+			// Locked while it renders: the plan was fine, landing is not.
+			const stop = await onMusicProgress((p) => {
+				if (p.stage === 'render' && p.fraction === 0.5) void setTrackLocked(m.id, true);
+			});
+			try {
+				await expect(composeMusic({ score: other, at: 200 })).rejects.toThrow('invalid argument: M is locked');
+			} finally {
+				stop();
+				await setTrackLocked(m.id, false);
+			}
+			expect((await listAssets()).length).toBe(assets);
+			expect((await listAssets()).some((a) => a.music_score?.bpm === 90)).toBe(false);
+			expect((await getHistory()).length).toBeGreaterThanOrEqual(history);
+			const again = await composeMusic({ score: other, at: 200 });
+			expect((await getAssetMetadata(again.asset.id)).analysis?.tempo?.bpm).toBeCloseTo(90, 6);
+		},
+		SLOW
+	);
+
+	test(
+		'a piece that ends on an outro ends on the tonic, in the analysis too',
+		async () => {
+			const ending = (written: string): MusicScore => ({
+				...score(),
+				sections: [
+					{ kind: 'verse', bars: 4, chords: ['i', 'VI', 'III', 'VII'] },
+					{ kind: 'outro', bars: 4, chords: ['i', 'VI', 'iv', written] }
+				]
+			});
+			let slot = 0;
+			const lastBar = async (written: string) => {
+				const { asset } = await composeMusic({ score: ending(written), at: 100 * ++slot });
+				const chroma = (await getAssetMetadata(asset.id)).analysis!.music!.bar_chroma;
+				return chroma[chroma.length - 1];
+			};
+			// The last bar is the tonic whether it was written as V, as Am or as i; any other bar is its own chord.
+			const [asV, asAm, asI] = [await lastBar('V'), await lastBar('Am'), await lastBar('i')];
+			expect(asV).toEqual(asAm);
+			expect(asV).toEqual(asI);
+			const { asset } = await composeMusic({ score: ending('V'), at: 100 * ++slot });
+			const chroma = (await getAssetMetadata(asset.id)).analysis!.music!.bar_chroma;
+			expect(chroma[chroma.length - 2]).not.toEqual(chroma[chroma.length - 1]);
 		},
 		SLOW
 	);
@@ -152,6 +295,24 @@ describe('compose_music (browser harness)', () => {
 		expect(composed.align?.cuts).toBe(1);
 		expect(composed.align?.details[0].cut_s).toBe(8);
 	}, SLOW);
+
+	test('refuses a key the request and the score structs do not have, as serde does', async () => {
+		const stray = { score: score(), replace_clip: 'c' } as unknown as ComposeRequest;
+		await expect(composeMusic(stray)).rejects.toThrow(
+			'invalid args `request` for command `compose_music`: unknown field `replace_clip`, expected one of `score`, `track_id`, `at`, `align`, `replace_clip_id`'
+		);
+		const inScore = { score: { ...score(), tempo: 120 } } as unknown as ComposeRequest;
+		await expect(composeMusic(inScore)).rejects.toThrow('unknown field `tempo`, expected one of `bpm`, `key`, `style`, `sections`, `hits`, `seed`, `instruments`');
+		const inSection = { score: { ...score(), sections: [{ kind: 'intro', bar: 4, chords: ['Am'] }] } } as unknown as ComposeRequest;
+		await expect(composeMusic(inSection)).rejects.toThrow('unknown field `bar`');
+		await expect(composeMusic({ score: score(), align: { to: 'cuts', tempo: 1 } } as unknown as ComposeRequest)).rejects.toThrow('unknown field `tempo`, expected one of `to`, `track_id`, `max_tempo_change`');
+	});
+
+	test('a seed has to survive JSON in JavaScript', async () => {
+		await expect(composeMusic({ score: { ...score(), seed: MAX_SEED + 1 } })).rejects.toThrow(
+			'seed must be 0..=9007199254740991 (2^53 - 1, so it survives JSON in JavaScript; got 9007199254740992)'
+		);
+	});
 
 	test('refuses what the engine refuses, naming the section or chord', async () => {
 		const bad = score();
@@ -219,6 +380,15 @@ describe('get_band_balance (browser harness)', () => {
 		const mix = await getBandBalance({ range: { start: 2, end: 10 } });
 		expect(mix.target).toBe('mix');
 		expect([mix.start, mix.end]).toEqual([2, 10]);
+	});
+
+	test('refuses a key the request does not have', async () => {
+		await expect(getBandBalance({ clip: 'x' } as never)).rejects.toThrow(
+			'invalid args `request` for command `get_band_balance`: unknown field `clip`, expected one of `asset_id`, `clip_id`, `range`, `sections`'
+		);
+		await expect(getBandBalance({ asset_id: 'x', sections: [{ start: 0, end: 1, name: 'a' }] } as never)).rejects.toThrow(
+			'unknown field `name`, expected one of `start`, `end`, `label`'
+		);
 	});
 
 	test('names exactly one target and refuses what cannot be measured', async () => {

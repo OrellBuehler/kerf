@@ -166,12 +166,15 @@ import {
 	MUSIC_STYLES,
 	barSeconds,
 	planScoreToPicture,
+	resolvedChords,
 	scoreDuration,
 	scoreTitle,
 	sectionLabels,
 	sectionSpans,
 	validateScore
 } from './music-score';
+import { musicBed, musicStart, putMusic, rehearseMusic } from './music-place';
+import { checkBandRequest, checkComposeRequest } from './music-wire';
 import { balanceNotes, checkSections, equalWindows, phraseWindows, clipWindows, synthBalance } from './band-balance';
 import { sampleMusicAnalysis, SAMPLE_MUSIC_DURATION } from './sample-music';
 import { exportSpan, report as platformReport, TARGETS } from './platforms';
@@ -1810,8 +1813,19 @@ function devAlignCuts(align: ScoreAlign): number[] {
 	return distinct.slice(1, -1);
 }
 
-/** Check a compose request and make the placement definite (`Project::compose_music_inputs`). */
+/** Whether the asset of a clip was composed (it carries a score); `undefined` for an asset the project does not have. */
+const devComposed = (assetId: string): boolean | undefined => {
+	const asset = assetById(assetId);
+	return asset ? !!asset.music_score : undefined;
+};
+
+/** Check a compose request and resolve it (`Project::compose_music_inputs`): the request has no key the structs do
+ *  not, the score is valid, a replaced clip is a music bed that can be, the music's start is known and, with
+ *  `align`, the score is fitted to the cuts or markers. Last, the placement is rehearsed on a copy of the cut with
+ *  the render's length (`check_music_fits`): a piece that would land on another clip of its track is refused now,
+ *  not after the render. */
 function devComposePlan(request: ComposeRequest) {
+	checkComposeRequest(request);
 	const invalid = (why: string) => new Error(`invalid argument: ${why}`);
 	const bad = validateScore(request.score);
 	if (bad) throw invalid(bad);
@@ -1819,25 +1833,13 @@ function devComposePlan(request: ComposeRequest) {
 		throw invalid('at must be a time in seconds, 0 or later');
 	}
 	let start: number;
-	if (request.replace_clip_id) {
-		const found = locate(devTimeline, request.replace_clip_id);
-		if (!found) throw new Error(`clip not found: ${request.replace_clip_id}`);
-		const [track, i] = found;
-		if (track.kind !== 'audio') throw invalid('only music on an audio track can be replaced');
-		if (!assetById(track.clips[i].asset_id)?.music_score) {
-			throw invalid('that clip is not composed music: only a clip of a composed asset can be replaced');
-		}
-		start = track.clips[i].timeline_start;
+	let replaces: string[] = [];
+	if (request.replace_clip_id !== undefined) {
+		const bed = musicBed(devTimeline, request.replace_clip_id, devComposed);
+		start = Math.min(...bed.map((c) => c.timeline_start));
+		replaces = bed.map((c) => c.id);
 	} else {
-		let track: Track | undefined;
-		if (request.track_id) {
-			track = devTimeline.tracks.find((t) => t.id === request.track_id);
-			if (!track) throw new Error(`track not found: ${request.track_id}`);
-			if (track.kind !== 'audio') throw invalid('music goes on an audio track');
-		} else {
-			track = devTimeline.tracks.find((t) => t.kind === 'audio' && t.name === 'M');
-		}
-		start = request.at !== undefined ? Math.max(request.at, 0) : track ? trackEnd(track) : 0;
+		start = musicStart(devTimeline, request.track_id, request.at);
 	}
 	let score = request.score;
 	let align: AlignReport | null = null;
@@ -1854,14 +1856,18 @@ function devComposePlan(request: ComposeRequest) {
 		score = planned.score;
 		align = planned.report;
 	}
-	return { score, align, start };
+	rehearseMusic(devTimeline, request, scoreDuration(score), devRippleMode, devComposed, uid);
+	return { score, align, start, replaces };
 }
 
-/** The asset a rendered score is, and the analysis `place_music` writes from it. */
-function devMusicAsset(score: MusicScore): Asset {
+/** The asset a rendered score is, and the analysis `place_music` writes from it — made, not stored: `commit` stores
+ *  them, once the placement has gone through (a refused placement leaves neither the asset nor its analysis; an asset
+ *  that was already there, the same score composed before, stays). The chords are the ones **as played**: the last bar
+ *  of an outro that ends the piece is the tonic, whatever it was written as (`resolvedChords`). */
+function devMusicAsset(score: MusicScore): { asset: Asset; commit: () => void } {
 	const path = `/music/music-${devScoreHash(score)}.wav`;
 	const known = sampleAssets.find((a) => a.path === path);
-	if (known) return known;
+	if (known) return { asset: known, commit: () => {} };
 	const asset: Asset = {
 		id: uid(),
 		path,
@@ -1871,11 +1877,10 @@ function devMusicAsset(score: MusicScore): Asset {
 		imported_at: new Date().toISOString(),
 		music_score: structuredClone(score)
 	};
-	sampleAssets.push(asset);
 	const grid = { period_s: 60 / score.bpm, phase_s: 0, downbeat_offset: 0, beats_per_bar: 4 };
 	const bars = Math.floor((asset.duration + 1e-6) / barSeconds(score.bpm));
 	// One chroma per distinct chord, so a repeated chord is a repeated bar and the phrases are found.
-	const chords = score.sections.flatMap((sec) => Array.from({ length: sec.bars }, (_, b) => sec.chords[b % sec.chords.length]));
+	const chords = resolvedChords(score).flat();
 	const chroma = (chord: string) => {
 		let h = 7;
 		for (const c of chord) h = Math.imul(h ^ c.charCodeAt(0), 0x01000193);
@@ -1885,7 +1890,7 @@ function devMusicAsset(score: MusicScore): Asset {
 	};
 	const bar_chroma = Array.from({ length: bars }, (_, k) => (chords[k] ? chroma(chords[k]) : new Array<number>(12).fill(0)));
 	const tempo = tempoFromGrid(grid, asset.duration, 1);
-	sampleAnalysis[asset.id] = {
+	const analysis: AssetAnalysis = {
 		asset_id: asset.id,
 		silence_segments: [],
 		scene_changes: [],
@@ -1897,7 +1902,13 @@ function devMusicAsset(score: MusicScore): Asset {
 		ran: ['rhythm'],
 		music: { grid, duration: asset.duration, bar_chroma, phrases: phraseMatches(bar_chroma) }
 	};
-	return asset;
+	return {
+		asset,
+		commit: () => {
+			sampleAssets.push(asset);
+			sampleAnalysis[asset.id] = analysis;
+		}
+	};
 }
 
 /** Whether music can be composed here, whether the first composition still downloads the SoundFont,
@@ -1933,51 +1944,28 @@ export async function composeMusic(request: ComposeRequest): Promise<ComposeResu
 		} finally {
 			devMusicRendering -= 1;
 		}
-		// The plan was made before the wait; landing it re-checks the clip, as the engine does under the lock.
-		const replacing = request.replace_clip_id ? locate(devTimeline, request.replace_clip_id) : null;
-		if (request.replace_clip_id && !replacing) throw new Error(`clip not found: ${request.replace_clip_id}`);
-		if (replacing?.[0].locked) throw new Error(`invalid argument: ${replacing[0].name} is locked`);
-		const asset = devMusicAsset(plan.score);
+		// The plan was made before the wait; landing it checks the placement again against the cut as it is now,
+		// as the engine does under the lock — one edit, rippled like any other, in which the clip the edit put
+		// somewhere may not end up on another clip. Only then is the asset stored: a refused placement leaves
+		// neither it nor its analysis.
+		const made = devMusicAsset(plan.score);
 		const clipId = request.replace_clip_id ?? uid();
-		devEdit(undefined, () => {
-			if (request.replace_clip_id) {
-				const [track, i] = locate(devTimeline, request.replace_clip_id)!;
-				const clip = track.clips[i];
-				clip.asset_id = asset.id;
-				clip.source_in = 0;
-				clip.source_out = asset.duration;
-				clip.speed = 1;
-				const duration = clipDuration(clip);
-				clip.fade_in = Math.min(clip.fade_in, duration);
-				clip.fade_out = Math.min(clip.fade_out, duration);
-				return;
-			}
-			let track = request.track_id ? devTimeline.tracks.find((t) => t.id === request.track_id) : undefined;
-			track ??= devTimeline.tracks.find((t) => t.kind === 'audio' && t.name === 'M');
-			if (!track) {
-				track = { id: uid(), kind: 'audio', name: 'M', clips: [] };
-				devTimeline.tracks.push(track);
-			}
-			track.clips.push({
-				id: clipId,
-				asset_id: asset.id,
-				source_in: 0,
-				source_out: asset.duration,
-				timeline_start: plan.start,
-				volume: 1,
-				fade_in: 0,
-				fade_out: 0
-			});
-		});
-		recordDev(request.replace_clip_id ? 'Recompose music' : 'Add music');
+		const done = runEdit(
+			devTimeline,
+			{ ripple: devRippleMode, links: devLinks(undefined), lanes: [clipId] },
+			(scratch) => putMusic(scratch, made.asset, request, clipId, devComposed, uid)
+		);
+		made.commit();
+		devTimeline = done.timeline;
+		recordDev(request.replace_clip_id !== undefined ? 'Recompose music' : 'Add music');
 		const timeline = snapshot();
 		const clip = timeline.tracks.flatMap((t) => t.clips).find((c) => c.id === clipId)!;
 		return {
-			asset: structuredClone(asset),
+			asset: structuredClone(made.asset),
 			clip,
 			score: structuredClone(plan.score),
 			align: plan.align,
-			replaced: !!request.replace_clip_id,
+			replaced: plan.replaces,
 			timeline
 		};
 	}
@@ -2012,6 +2000,7 @@ export async function onMusicProgress(cb: (p: MusicProgress) => void): Promise<(
  *  and notes are the engine's. Rejects with `band balance cancelled` if stopped. */
 export async function getBandBalance(request: BandBalanceRequest): Promise<BandBalance> {
 	if (!inTauri()) {
+		checkBandRequest(request);
 		const invalid = (why: string) => new Error(`invalid argument: ${why}`);
 		const named = [request.asset_id, request.clip_id, request.range].filter((x) => x !== undefined).length;
 		if (named !== 1) throw invalid('name exactly one of asset_id, clip_id or range to measure');
