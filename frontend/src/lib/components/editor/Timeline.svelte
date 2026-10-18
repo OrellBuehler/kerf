@@ -96,6 +96,7 @@
 	import { NAME_CHIP_PCT, showsLabel } from '$lib/clip-label';
 	import { fitOffer } from '$lib/music-ui';
 	import { stemsOffer } from '$lib/stems';
+	import { composeOffer } from '$lib/compose-form';
 	import { describeSync, syncOffer, SYNC_CANCELLED } from '$lib/audio-sync';
 	import { cancelAudioSync, onAudioSyncProgress } from '$lib/api';
 	import { transitionLabel } from '$lib/transitions';
@@ -1887,6 +1888,12 @@
 			c,
 			editor.assets.find((a) => a.id === c.asset_id)
 		);
+		// Composed music can be edited and rendered again into this very clip.
+		const compose = composeOffer(
+			t,
+			editor.assets.find((a) => a.id === c.asset_id),
+			c
+		);
 		// Two clips selected: the clicked one can be moved into sync with the other by their sound.
 		const sync = syncOffer(editor.timeline, editor.assets, editor.selectedClipIds, c.id);
 		contextMenu.show(e, [
@@ -2008,7 +2015,21 @@
 							} satisfies MenuItem
 						]
 					: []),
-				...(fit.show || stems.show ? [{ type: 'separator' } satisfies MenuItem] : []),
+				...(compose.show
+					? [
+							{
+								label: 'Edit & re-compose…',
+								icon: 'music',
+								disabled: compose.reason !== null,
+								reason: compose.reason ?? undefined,
+								action: () => {
+									const score = editor.assets.find((a) => a.id === c.asset_id)?.music_score;
+									if (score) ui.openCompose({ score, replaceClipId: c.id });
+								}
+							} satisfies MenuItem
+						]
+					: []),
+				...(fit.show || stems.show || compose.show ? [{ type: 'separator' } satisfies MenuItem] : []),
 				{
 					label: 'Copy keyframes',
 					icon: 'diamond',

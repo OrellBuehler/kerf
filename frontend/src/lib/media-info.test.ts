@@ -97,6 +97,18 @@ describe('voiceover assets', () => {
 	});
 });
 
+describe('composed assets', () => {
+	const composed = {
+		...music,
+		id: 'c',
+		music_score: { bpm: 82, key: 'Am', style: 'lofi', sections: [{ kind: 'intro', bars: 4, chords: ['i'] }], seed: 0 }
+	} as Asset;
+	test('name the style, key and tempo of the score; an ordinary asset names none', () => {
+		expect(mediaInfo(composed, timeline).composed).toBe('Lo-fi · Am · 82 BPM');
+		expect(mediaInfo(music, timeline).composed).toBeNull();
+	});
+});
+
 describe('analysisFacts', () => {
 	const analysis: AssetAnalysis = {
 		asset_id: 'a',

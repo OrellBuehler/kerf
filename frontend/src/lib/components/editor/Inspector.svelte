@@ -69,6 +69,8 @@
 	} from '$lib/inspector-summary';
 	import { fitOffer, musicSummary } from '$lib/music-ui';
 	import MusicStructure from './MusicStructure.svelte';
+	import ComposedMusic from './ComposedMusic.svelte';
+	import { scoreTitle } from '$lib/music-score';
 	import { DEGREES, NUMBER_COL, PERCENT, SECONDS, TIMES, readout, type RowSpec } from '$lib/slider-row';
 	import { FieldEdits } from '$lib/field-edit';
 	import { tip } from '$lib/tip';
@@ -1332,6 +1334,12 @@
 				if (c) void run(() => trimChecked(c.id, undefined, v));
 			})}
 			</InspectorSection>
+
+			{#if asset?.music_score}
+				<InspectorSection title="Composed music" summary={scoreTitle(asset.music_score)} open>
+				<ComposedMusic {asset} {clip} {track} />
+				</InspectorSection>
+			{/if}
 
 			{#if hasAudio && soundDetached}
 				<InspectorSection title="Volume" summary="Sound detached" open>

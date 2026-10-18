@@ -32,6 +32,7 @@ import { mediaStatus } from './media-status.svelte';
 import { isLevelsCancelled, measureRange, type MeasureStamp } from './levels-view';
 import type { ExportDraft } from './export-draft';
 import type { VoiceoverPrefill } from './voiceover';
+import type { ComposePrefill } from './compose-form';
 import type { TrimMonitor, TrimTool } from './trim-tools';
 import { ZOOM_DEFAULT, stepZoom } from './zoom';
 import { seekTime, stepPoint, type SeekOptions } from './frames';
@@ -100,6 +101,8 @@ class EditorUi {
 	stoppingAnalysis = $state(false);
 	/** The voiceover dialog: `null` while closed, else what it opens with. */
 	voiceoverDialog = $state<{ prefill: VoiceoverPrefill | null } | null>(null);
+	/** The Compose-music dialog: `null` while closed, else the piece it edits again (none: a fresh one). */
+	composeDialog = $state<{ prefill: ComposePrefill | null } | null>(null);
 	/** The Separate-stems dialog: `null` while closed, else the asset whose sound it splits and,
 	 *  when opened from a clip, the clip the stems are laid under. */
 	stemsDialog = $state<{ assetId: string; clipId: string | null } | null>(null);
@@ -250,6 +253,14 @@ class EditorUi {
 
 	closeVoiceover() {
 		this.voiceoverDialog = null;
+	}
+
+	openCompose(prefill: ComposePrefill | null = null) {
+		this.composeDialog = { prefill };
+	}
+
+	closeCompose() {
+		this.composeDialog = null;
 	}
 
 	openAbout() {

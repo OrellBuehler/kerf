@@ -252,6 +252,11 @@
 						</span>
 					{:else}
 						<IconBtn
+							title={{ text: 'Compose music…', detail: 'Write a chord progression and Kerf plays it onto the timeline.' }}
+							size={24}
+							onclick={() => ui.openCompose()}><Icon n="music" s={14} /></IconBtn
+						>
+						<IconBtn
 							title={{ text: 'Write a voiceover…', detail: 'Speak a script onto the timeline.' }}
 							size={24}
 							onclick={() => ui.openVoiceover()}><Icon n="mic" s={14} /></IconBtn

@@ -9,6 +9,7 @@
 	import UpdateDialog from '$lib/components/editor/UpdateDialog.svelte';
 	import AboutDialog from '$lib/components/editor/AboutDialog.svelte';
 	import VoiceoverDialog from '$lib/components/editor/VoiceoverDialog.svelte';
+	import ComposeMusicDialog from '$lib/components/editor/ComposeMusicDialog.svelte';
 	import FitMusicDialog from '$lib/components/editor/FitMusicDialog.svelte';
 	import StemsDialog from '$lib/components/editor/StemsDialog.svelte';
 	import ShortcutSheet from '$lib/components/editor/ShortcutSheet.svelte';
@@ -96,6 +97,7 @@
 			settings.open ||
 			updater.dialogOpen ||
 			ui.voiceoverDialog !== null ||
+			ui.composeDialog !== null ||
 			ui.aboutDialog ||
 			ui.fitMusicDialog !== null ||
 			ui.relinkDialog ||
@@ -571,6 +573,10 @@
 		'file.import': () => void importMedia(),
 		'file.export': () => onExport(),
 		'file.importCaptions': () => void importCaptionFile(),
+		'file.composeMusic': () => {
+			if (holdForPreview()) return;
+			ui.openCompose();
+		},
 		'file.saveCover': () => void saveCoverFrame(),
 		'file.exportCaptions': () => void exportCaptionFile(),
 		'file.exportOtio': () => void exportInterchangeFile('otio'),
@@ -874,6 +880,10 @@
 
 {#if ui.voiceoverDialog}
 	<VoiceoverDialog prefill={ui.voiceoverDialog.prefill} onClose={() => ui.closeVoiceover()} />
+{/if}
+
+{#if ui.composeDialog}
+	<ComposeMusicDialog prefill={ui.composeDialog.prefill} onClose={() => ui.closeCompose()} />
 {/if}
 
 {#if ui.fitMusicDialog}

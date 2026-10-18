@@ -18,6 +18,7 @@ const DIALOGS = [
 	'SettingsDialog',
 	'UpdateDialog',
 	'VoiceoverDialog',
+	'ComposeMusicDialog',
 	'FitMusicDialog',
 	'StemsDialog',
 	'AboutDialog',
@@ -88,6 +89,13 @@ describe('Modal', () => {
 		expect(tag).toContain('rescue');
 	});
 
+	test('the composer keeps the score it was given: a click on the scrim does nothing, a run locks it and focus goes to the live action', () => {
+		const tag = modalTag('ComposeMusicDialog');
+		expect(tag).toContain('busy={generating}');
+		expect(tag).toContain('dismissOnScrim={false}');
+		expect(tag).toContain('rescue');
+	});
+
 	test('the others lock while they run and move focus to the live action', () => {
 		expect(modalTag('FitMusicDialog')).toContain('busy={applying}');
 		expect(modalTag('StemsDialog')).toContain('busy={running}');
@@ -105,7 +113,7 @@ describe('Modal', () => {
 	});
 
 	test('a dialog whose footer swaps for a run marks the action focus goes to', () => {
-		for (const name of ['ExportDialog', 'VoiceoverDialog', 'FitMusicDialog', 'StemsDialog', 'UpdateDialog'])
+		for (const name of ['ExportDialog', 'VoiceoverDialog', 'ComposeMusicDialog', 'FitMusicDialog', 'StemsDialog', 'UpdateDialog'])
 			expect(read(`${EDITOR}${name}.svelte`), name).toContain('data-rescue');
 	});
 });

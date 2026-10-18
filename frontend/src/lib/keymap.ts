@@ -368,6 +368,15 @@ const ACTION_LIST = [
 		hint: 'Puts a .srt / .vtt / .ass / .ssa file on the cut as captions, timed to the finished cut.'
 	},
 	{
+		id: 'file.composeMusic',
+		repeat: false,
+		label: 'Compose music…',
+		group: 'project',
+		context: 'global',
+		defaults: [],
+		hint: 'Writes a chord progression and Kerf plays it onto the M track with a SoundFont; it can fit the tempo to the cuts.'
+	},
+	{
 		id: 'file.saveCover',
 		repeat: false,
 		label: 'Save cover frame…',

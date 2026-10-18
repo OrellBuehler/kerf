@@ -1745,6 +1745,7 @@ const devMusicListeners = new Set<(p: MusicProgress) => void>();
 let devMusicReady = false;
 let devMusicCancelled = false;
 let devMusicRendering = 0;
+let devBandCancelled = false;
 const DEV_SOUNDFONT_BYTES = 32319396;
 
 /** What a cancelled composition rejects with, for a dialog to stay quiet on. */
@@ -2084,6 +2085,14 @@ export async function getBandBalance(request: BandBalanceRequest): Promise<BandB
 				windows_from = 'equal';
 			}
 		}
+		// In a browser the made-up measurement takes a moment, so Stop can be tried; under bun it is at once.
+		devBandCancelled = false;
+		if (typeof window !== 'undefined') {
+			for (let i = 0; i < 4; i++) {
+				await new Promise((r) => setTimeout(r, 150));
+				if (devBandCancelled) throw new Error(BAND_BALANCE_CANCELLED);
+			}
+		}
 		const measured = synthBalance(windows, kinds);
 		return {
 			target,
@@ -2100,7 +2109,10 @@ export async function getBandBalance(request: BandBalanceRequest): Promise<BandB
 
 /** Ask the running band-balance measurement to give up; it then rejects with `band balance cancelled`. */
 export async function cancelBandBalance(): Promise<void> {
-	if (!inTauri()) return;
+	if (!inTauri()) {
+		devBandCancelled = true;
+		return;
+	}
 	return invoke<void>('cancel_band_balance');
 }
 

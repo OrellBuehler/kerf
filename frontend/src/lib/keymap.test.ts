@@ -972,6 +972,7 @@ describe('keys that act once per press', () => {
 			'file.import',
 			'file.export',
 			'file.importCaptions',
+			'file.composeMusic',
 			'file.saveCover',
 			'file.exportCaptions',
 			'file.exportOtio',

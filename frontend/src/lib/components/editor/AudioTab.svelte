@@ -73,4 +73,10 @@
 		Write a script and Kerf speaks it onto the VO track — it can caption the cut in the same step.
 	</div>
 	<Btn size="sm" variant="secondary" icon="mic" pending={editor.locked} onclick={() => ui.openVoiceover()}>Write a voiceover…</Btn>
+
+	<div class="k-overline" style="margin:14px 0 7px">Music</div>
+	<div style="font-size:12px;color:var(--text-muted);line-height:1.45;margin-bottom:8px">
+		Write a chord progression and Kerf plays it onto the M track — it can fit the tempo to the cuts in the same step.
+	</div>
+	<Btn size="sm" variant="secondary" icon="music" pending={editor.locked} onclick={() => ui.openCompose()}>Compose music…</Btn>
 </div>

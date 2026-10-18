@@ -42,6 +42,7 @@ describe('the ellipsis', () => {
 		'file.save',
 		'file.import',
 		'file.importCaptions',
+		'file.composeMusic',
 		'file.export',
 		'file.saveCover',
 		'file.exportCaptions',
@@ -115,6 +116,18 @@ describe('one name for one action', () => {
 		expect(read(`${EDITOR}MediaBin.svelte`)).toContain("label: 'Separate stems…'");
 	});
 
+	test('composing music is "Compose music…" wherever it is offered, titled "Compose music", and a clip is "Edit & re-compose…"', () => {
+		const dialog = read(`${EDITOR}ComposeMusicDialog.svelte`);
+		expect(dialog).toContain('title="Compose music"');
+		expect(dialog).toContain("'Compose music'}</Btn");
+		for (const file of ['AudioTab', 'LibraryPanel']) expect(read(`${EDITOR}${file}.svelte`), file).toContain('Compose music…');
+		expect(read(`${EDITOR}MediaBin.svelte`)).toContain('compose music…');
+		expect(read('lib/keymap.ts')).toContain("label: 'Compose music…'");
+		expect(read(`${EDITOR}ComposedMusic.svelte`)).toContain('Edit & re-compose…');
+		expect(read(`${EDITOR}Timeline.svelte`)).toContain("label: 'Edit & re-compose…'");
+		expect(read(`${EDITOR}MediaBin.svelte`)).toContain("label: 'Edit & compose again…'");
+	});
+
 	test('Browse opens a file picker, so it says so', () => {
 		expect(read(`${EDITOR}ExportDialog.svelte`)).toContain('onclick={browse}>Browse…</Btn>');
 	});
@@ -144,6 +157,7 @@ describe('a failure is "Couldn\'t"', () => {
 	test('the long-running dialogs lead their failures with what they were doing', () => {
 		expect(read(`${EDITOR}ExportDialog.svelte`)).toContain("failure('Export failed', e)");
 		expect(read(`${EDITOR}VoiceoverDialog.svelte`)).toContain("failure('Voiceover failed', e)");
+		expect(read(`${EDITOR}ComposeMusicDialog.svelte`)).toContain("failure('Composing failed', e)");
 		expect(read(`${EDITOR}StemsDialog.svelte`)).toContain("failure('Stem separation failed', e)");
 	});
 });

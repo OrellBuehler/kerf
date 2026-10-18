@@ -194,6 +194,14 @@
 				action: () => ui.openVoiceover({ text: vo.text, voice: vo.voice, speed: vo.speed })
 			});
 		}
+		if (asset.music_score) {
+			const score = asset.music_score;
+			items.push({
+				label: 'Edit & compose again…',
+				icon: 'music',
+				action: () => ui.openCompose({ score })
+			});
+		}
 		items.push(analyzeSubmenuItem(asset, { x: e.clientX, y: e.clientY }));
 		if (info.kind === 'video')
 			items.push({
@@ -321,8 +329,9 @@
 					</div>
 					<Btn variant="secondary" size="sm" icon="plus">Import media…</Btn>
 				</div>
-				<div style="display:flex;justify-content:center;margin-top:8px">
+				<div style="display:flex;justify-content:center;flex-wrap:wrap;gap:4px;margin-top:8px">
 					<Btn variant="ghost" size="sm" icon="mic" onclick={() => ui.openVoiceover()}>or write a voiceover…</Btn>
+					<Btn variant="ghost" size="sm" icon="music" onclick={() => ui.openCompose()}>or compose music…</Btn>
 				</div>
 			{/if}
 		{:else}
@@ -411,6 +420,9 @@ Drag onto a timeline track to add a clip · right-click for details`}
 							{/if}
 							{#if a.info.voiceover}
 								<Badge tone="kerf">voiceover</Badge>
+							{/if}
+							{#if a.info.composed}
+								<Badge tone="kerf">composed</Badge>
 							{/if}
 							{#if a.info.kind === 'image'}
 								<Badge tone="neutral">still</Badge>
