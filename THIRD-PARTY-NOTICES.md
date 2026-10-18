@@ -5,6 +5,8 @@ used under the MIT License below. The adapted code is listed here.
 
 ## Adapted from FilmCraft
 
+- `crates/kerf-app/src/mcp/args.rs` — from FilmCraft `crates/automation/src/server.rs` (the strict-argument check)
+- `crates/kerf-app/src/mcp.rs` (`every_tool_is_titled_and_annotated`) — from FilmCraft `crates/automation/src/server.rs` (`tools_are_titled_and_annotated`)
 
 ## FilmCraft license
 

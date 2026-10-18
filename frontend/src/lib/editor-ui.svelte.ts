@@ -152,6 +152,11 @@ class EditorUi {
 	 *  bracket the working range; export can render just this span. */
 	markIn = $state<number | null>(null);
 	markOut = $state<number | null>(null);
+	/** The timeline seconds on screen, written by the timeline as it scrolls and zooms (`null`
+	 *  while it is not mounted) — part of the editor context an agent can read. */
+	timelineView = $state<{ start: number; end: number } | null>(null);
+	/** The dock panel last activated (dockview's active panel), for the same context. */
+	focusedPanel = $state<string | null>(null);
 	#zoom = $state(ZOOM_DEFAULT);
 	/** Timeline zoom, pixels per second (`zoom.ts` owns the range and the maths). Setting it is a
 	 *  person taking the zoom, so the timeline stops fitting the cut to its window

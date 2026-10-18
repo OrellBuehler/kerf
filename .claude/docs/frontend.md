@@ -807,6 +807,11 @@ engine. Below the queue, the **History** section renders
 `editor.revertTo(seq)`, and each row expands to *what* that revision changed
 (`revision_diff`).
 
+**Editor context.** So that an agent knows what "this clip" is, the page reports the playhead,
+selection, in/out marks, `ui.timelineView` (the timeline's visible seconds), `ui.focusedPanel`
+(dockview's active panel) and the selected asset through `reportUiContext` (`editor-context.ts`:
+throttled, unchanged state not re-sent, a 30 s heartbeat; a no-op in the harness) — `app.md`.
+
 **The Preview with nothing on the timeline** is `PreviewEmpty` (it was a clapperboard and "No media loaded"): a card of three steps — *Import
 media*, *Cut it on the timeline*, *Export* — each marked done / current / to do from the project (`firstRunSteps`, `first-run.ts`: an
 asset in the library finishes the first, a clip the second), with the keymap's own key for import and export in the line, an

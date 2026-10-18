@@ -77,6 +77,7 @@ import type {
 	Transition,
 	TranscriptionStatus,
 	TranscriptSegment,
+	UiContext,
 	UpdateInfo,
 	VideoEffect,
 	VoiceoverProgress,
@@ -3488,6 +3489,13 @@ export async function mcpEndpoint(): Promise<string> {
 export async function agentStatus(): Promise<{ endpoint: string; last_seen_secs: number | null; error: string | null }> {
 	if (!inTauri()) return { endpoint: 'http://127.0.0.1:7777/mcp', last_seen_secs: null, error: null };
 	return invoke<{ endpoint: string; last_seen_secs: number | null; error: string | null }>('agent_status');
+}
+
+/** Tell the backend what the editor shows, for an agent's `get_editor_context`
+ *  (`editor-context.ts` throttles it). The browser harness has no agent to ask, so nothing is sent. */
+export async function reportUiContext(context: UiContext): Promise<void> {
+	if (!inTauri()) return;
+	await invoke('report_ui_context', { context });
 }
 
 // ---- app settings ----------------------------------------------------------

@@ -13,6 +13,7 @@
 //! thread pool via [`blocking`], resolving inputs under the shared project lock
 //! and releasing it before the slow part.
 
+mod editor_context;
 mod gpu_preview;
 mod mcp;
 mod popout;
@@ -2849,6 +2850,14 @@ fn agent_status() -> AgentStatus {
     }
 }
 
+/// What the editor window shows (playhead, selection, marks, visible range,
+/// focused panel), for the MCP `get_editor_context` tool. The webview sends it
+/// debounced and as a heartbeat; it is kept in app state, not in the project.
+#[tauri::command(async)]
+fn report_ui_context(state: State<'_, editor_context::EditorContextState>, context: editor_context::UiContext) {
+    state.report(context);
+}
+
 // ---- app settings ----------------------------------------------------------
 
 /// The current preferences, resolved against the engine (see
@@ -3425,6 +3434,7 @@ pub fn run() {
             scrub: scrub.clone(),
         })
         .manage(popout::PopoutState::default())
+        .manage(editor_context::EditorContextState::default())
         .on_window_event(popout::on_window_event)
         .setup(move |app| {
             // Logging needs the resolved app data directory, so set it up here
@@ -3634,6 +3644,7 @@ pub fn run() {
             reveal_path,
             mcp_endpoint,
             agent_status,
+            report_ui_context,
             get_settings,
             set_settings,
             read_text_file,

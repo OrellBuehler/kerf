@@ -251,3 +251,24 @@ a full-detail frame of the original.
 tools take the project as the agent (`lock_agent`: activity stamped, edits attributed). Asking
 `analyze_asset` for nothing it can run — everything switched off and no `steps`, or only audio steps on
 a file with no audio — is an invalid-params error, not an empty result.
+
+**Strict arguments, hints and editor context.** The `call_tool` override refuses a call
+naming a key its tool's `input_schema` does not list (`mcp/args.rs`) as invalid params
+(-32602), naming the key and the accepted ones (or "it takes no arguments") — serde drops
+an unknown key, so `trim { rippel: false }` used to trim with the project's mode and report
+success. The accepted set follows `allOf` / `anyOf` / `oneOf` and local `$ref`s (a
+`#[serde(flatten)]` struct or enum), and a schema with `additionalProperties` (a flattened
+map) accepts anything. Only **top-level** keys are checked; keys inside a nested object
+(`export`'s `options`, a `moves` entry) are still dropped by serde. schemars does not list
+`#[serde(alias)]` names, so the check would refuse them: parameter structs take no alias
+(`mcp_parameters_take_no_serde_alias` scans `mcp.rs`). Every tool has a `title` and the four hints from the table in
+`mcp/hints.rs`, applied to the routes once in `router()`; `every_tool_is_titled_and_annotated`
+fails on a tool missing from it (and on an entry naming no tool), so **a new tool needs a
+row there**. Staged (or undoable) agent edits are not destructive; applying / discarding a
+proposal, `resolve_task` / `remove_task`, undo / redo / `revert_to` (the live cut), the
+exports (a file outside the project) and `delete_proxy` are. Reads and previews are
+`readOnlyHint`, and `openWorldHint` marks the tools that may download a model.
+`get_editor_context` returns what the webview last reported (`app.md`): playhead,
+`selected_clip_ids`, `mark_in` / `mark_out`, `visible_range`, `focused_panel`,
+`selected_asset_id`, with `age_secs` and `stale`; before any report (headless) it is
+`{reported: false, stale: true, note}`. The `instructions` point "this clip" / "here" at it.

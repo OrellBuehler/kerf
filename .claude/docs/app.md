@@ -205,6 +205,14 @@ separate permission), so it is listed in object form with an `allow` entry for
 `https://github.com/OrellBuehler/kerf/*` — without a scope every `openUrl` call
 comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 
+**Editor context (`editor_context.rs`).** `report_ui_context` takes what the editor shows —
+playhead, selected clip ids, in/out marks, the visible timeline range (`ui.timelineView`,
+written by the timeline), the focused dock panel (`ui.focusedPanel`, dockview's active panel)
+and the selected asset — into `EditorContextState`, its own `Mutex` in app state and never the
+`Project` (a view of the window, not the cut). `editor-context.ts` throttles it to the latest
+state once per 300 ms, only when it changed, and re-sends it every 30 s as a heartbeat; the MCP
+`get_editor_context` reads it back with `age_secs`, and `stale` once a report is over 90 s old.
+
 **Scrubbed frames.** `get_timeline_frame` and the GPU preview's JPEG route go through `AppState.scrub`, one
 `kerf_core::ScrubFrames` per process: the frame of the cut's grid that holds the time, from a bounded cache or from
 the window of neighbours one process draws for it (`engine-cli.md`, "Scrubbed frames"). `start_playback` stops the
