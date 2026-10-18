@@ -131,9 +131,10 @@ export function minorTicksIn(loSec: number, hiSec: number, grid: RulerGrid, limi
 }
 
 /** The label of tick `k` on a grid: the project timecode of its time — `HH:MM:SS` for a
- *  whole-second step, `HH:MM:SS:FF` below it. */
+ *  whole-second step, `HH:MM:SS:FF` below it. Non-drop at 29.97 too: the steps are nominal
+ *  seconds, which a drop-frame label would read off by the frames dropped so far. */
 export function tickLabel(k: number, grid: RulerGrid, fps: number): string {
-	return formatTimecode(k * grid.step, fps, { frames: grid.frames });
+	return formatTimecode(k * grid.step, fps, { frames: grid.frames, dropFrame: false });
 }
 
 /** Frames are drawn on the ruler once one is at least this wide, px. */

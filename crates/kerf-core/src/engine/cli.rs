@@ -8351,6 +8351,10 @@ use still_fx::{still_layers, StillFades};
 #[cfg(test)]
 mod lane_tests;
 
+/// ffprobe's JSON and ffmpeg's logs, mutated: nothing panics.
+#[cfg(test)]
+mod hostile_tests;
+
 /// The deadline on a one-shot still's process.
 #[cfg(all(test, unix))]
 mod output_bounded_tests;

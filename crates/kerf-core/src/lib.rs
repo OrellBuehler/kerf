@@ -11,6 +11,8 @@ mod clip_timing;
 pub mod error;
 pub mod fonts;
 pub mod frame_pick;
+#[doc(hidden)]
+pub mod hostile;
 pub mod layer_geometry;
 pub mod mask_plane;
 pub mod media;
@@ -23,6 +25,7 @@ pub mod play_plan;
 pub mod project;
 pub mod proxy;
 pub mod render_plan;
+pub mod timecode;
 
 mod engine;
 

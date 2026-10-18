@@ -512,6 +512,13 @@
 		'playback.jumpForward': () => step(secondFrames(editor.fps)),
 		'playback.toStart': () => ui.seek(0),
 		'playback.toEnd': () => ui.seek(editor.duration),
+		// The timeline's timecode where it is on screen, else the transport's.
+		'playback.goToTimecode': () => {
+			const fields = [...document.querySelectorAll<HTMLInputElement>('[data-timecode-entry]')].filter((el) => el.getClientRects().length > 0);
+			const field = fields.find((el) => el.dataset.timecodeEntry === 'timeline') ?? fields[0];
+			if (!field) return false;
+			field.focus();
+		},
 
 		'marker.add': () =>
 			void editor
