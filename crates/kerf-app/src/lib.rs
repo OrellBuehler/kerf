@@ -1618,6 +1618,7 @@ fn add_marker(state: State<'_, AppState>, time: f64, name: String, color: Option
 }
 
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 fn update_marker(
     state: State<'_, AppState>,
     marker_id: String,

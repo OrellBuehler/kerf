@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::captions_import::{CaptionFile, CaptionImportRequest, ImportSummary, MAX_CAPTION_OFFSET, MAX_IMPORTED_CAPTIONS};
 use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
+use crate::model::MarkerPatch;
 use crate::model::{default_beat_tolerance, fmt_time};
 use crate::model::{music_fit_clips, plan_music_fit, MusicFit, MusicFitReport, MAX_FIT_BARS};
 use crate::model::{
@@ -23,7 +24,6 @@ use crate::model::{
     Voiceover, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_FOV, MAX_SVG_OVERLAYS, MAX_SVG_SECONDS, MIN_FOV,
 };
 use crate::model::{Detached, DetachedMany};
-use crate::model::MarkerPatch;
 use crate::model::{Property, PropertyKey};
 use crate::model::{SvgOverlay, SvgOverlayPatch, SvgPreset};
 use crate::svg::{check_params, SvgDoc};

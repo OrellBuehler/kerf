@@ -257,7 +257,7 @@ mod tests {
         };
         let (out, files) = prepare(&tl, &opts).unwrap();
         let subs = out.subtitle_input.clone().unwrap();
-        let chapters = out.chapters_input.clone().unwrap();
+        let chapters = out.chapters_input.unwrap();
         assert_eq!(
             std::fs::read_to_string(&subs).unwrap(),
             "1\n00:00:00,500 --> 00:00:01,500\nhello\n\n"
@@ -269,7 +269,7 @@ mod tests {
         assert!(!Path::new(&subs).exists() && !Path::new(&chapters).exists());
 
         // A cut with no chapter marker and no captions asked for adds nothing.
-        let mut plain = tl.clone();
+        let mut plain = tl;
         plain.markers.clear();
         let (out, _files) = prepare(&plain, &ExportOptions::default()).unwrap();
         assert_eq!((out.subtitle_input, out.chapters_input), (None, None));
@@ -308,9 +308,9 @@ mod tests {
     #[test]
     #[ignore = "needs the ffmpeg binary"]
     fn ffprobe_sees_the_subtitle_stream_and_the_chapters() {
+        use super::super::{command, ffmpeg_bin, ffprobe_bin, render_with};
         use crate::engine::test_support::StatusBounded;
         use crate::project::Project;
-        use super::super::{command, ffmpeg_bin, ffprobe_bin, render_with};
 
         let dir = std::env::temp_dir().join(format!("kerf-side-render-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -338,7 +338,11 @@ mod tests {
                 ..Default::default()
             });
         }
-        for (container, codec) in [(Container::Mp4, "mov_text"), (Container::Mkv, "subrip"), (Container::Webm, "webvtt")] {
+        for (container, codec) in [
+            (Container::Mp4, "mov_text"),
+            (Container::Mkv, "subrip"),
+            (Container::Webm, "webvtt"),
+        ] {
             let out = dir.join(format!("cut.{}", container.ext()));
             let opts = ExportOptions {
                 container,
@@ -348,14 +352,25 @@ mod tests {
             };
             render_with(&tl, std::slice::from_ref(&asset), &out, &opts).unwrap();
             let probe = command(&ffprobe_bin())
-                .args(["-v", "error", "-show_entries", "stream=codec_type,codec_name:chapter=start_time:chapter_tags=title"])
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_type,codec_name:chapter=start_time:chapter_tags=title",
+                ])
                 .args(["-of", "compact"])
                 .arg(&out)
                 .output()
                 .unwrap();
             let text = String::from_utf8_lossy(&probe.stdout);
-            assert!(text.contains(&format!("codec_name={codec}|codec_type=subtitle")), "{container:?}: {text}");
-            assert!(text.contains("tag:title=Intro") && text.contains("tag:title=Part two"), "{container:?}: {text}");
+            assert!(
+                text.contains(&format!("codec_name={codec}|codec_type=subtitle")),
+                "{container:?}: {text}"
+            );
+            assert!(
+                text.contains("tag:title=Intro") && text.contains("tag:title=Part two"),
+                "{container:?}: {text}"
+            );
             let srt = std::fs::read_to_string(dir.join("cut.srt")).unwrap();
             assert!(srt.contains("00:00:00,500 --> 00:00:01,500\nhello there"), "{srt}");
         }

@@ -138,7 +138,10 @@ fn drop_frame() -> (Timeline, Vec<Asset>, f64) {
             101,
             StreamKind::Video,
             "V1",
-            vec![clip(11, &a, 0.0, f(1800.0), 0.0), clip(12, &a, f(3600.0), f(3900.0), f(1800.0))],
+            vec![
+                clip(11, &a, 0.0, f(1800.0), 0.0),
+                clip(12, &a, f(3600.0), f(3900.0), f(1800.0)),
+            ],
         )],
         ..Timeline::new()
     };

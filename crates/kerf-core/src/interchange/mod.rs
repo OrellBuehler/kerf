@@ -77,7 +77,11 @@ impl Report {
         let message = message.into();
         match self.entries.iter_mut().find(|e| e.level == level && e.message == message) {
             Some(e) => e.count = e.count.saturating_add(1),
-            None => self.entries.push(ReportEntry { level, message, count: 1 }),
+            None => self.entries.push(ReportEntry {
+                level,
+                message,
+                count: 1,
+            }),
         }
     }
 
@@ -127,7 +131,12 @@ pub struct InterchangeOptions {
 }
 
 /// `timeline` written in `format`, with what it could not carry.
-pub fn export(format: InterchangeFormat, timeline: &Timeline, assets: &[Asset], opts: &InterchangeOptions) -> Result<(String, Report)> {
+pub fn export(
+    format: InterchangeFormat,
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &InterchangeOptions,
+) -> Result<(String, Report)> {
     let mut report = Report::default();
     let text = match format {
         InterchangeFormat::Otio => otio::export(timeline, assets, opts, &mut report)?,
@@ -300,7 +309,10 @@ mod tests {
         assert_eq!(r.entries.len(), 2);
         assert_eq!(r.entries[0].count, 2);
         assert!(r.has_warnings());
-        assert_eq!(r.to_string(), "warning: fades are not carried (x2)\ninfo: fades are not carried\n");
+        assert_eq!(
+            r.to_string(),
+            "warning: fades are not carried (x2)\ninfo: fades are not carried\n"
+        );
     }
 
     #[test]
