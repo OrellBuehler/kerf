@@ -188,6 +188,7 @@ fn layer(path: String, pick: Pick) -> PlanLayer {
             color_primaries: None,
             pix_fmt: Some("yuv420p".into()),
             color_space: None,
+            label_bt709: false,
         },
         transform: Transform::default(),
         color: Color::default(),

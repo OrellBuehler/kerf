@@ -418,7 +418,14 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   CI parity job runs both builds. The consequence to know about: an *export* is untagged
   `yuv420p` that a player shows as BT.709 for HD, so the FFmpeg preview already disagrees
   with the file by a few levels on saturated colour. Fixing that is a decision for when
-  the GPU path replaces the FFmpeg preview. The stream's own matrix
+  the GPU path replaces the FFmpeg preview. **One graph is settled**: untagged HD beside footage that names a matrix is
+  labelled BT.709 by the export graph itself (`engine-cli.md`, *The BT.709 label*; the plan mirrors it,
+  `core-render-plan.md`), so the stack is one matrix and is drawn on 9.0.2 (it was a mixed stack there, refused); untagged HD beside `smpte170m` footage became BT.709 against BT.601 and is refused there. A lone
+  untagged HD clip is still read as BT.601 by FFmpeg and drawn that way (27.3 dB against a player on 9.0.2). A logo or a photo beside HD
+  (a PNG's `gbr`, the `bt470bg` of a JPEG, a WebP and the `mjpeg`, `amv`, `speedhq`, `jpegls` (and their decode-only relatives) decoders are decoders' defaults, not matrices) is not a stack that is labelled and is
+  drawn or refused as before. **Accepted difference**: the playback stream that takes over from the compositor (`SpanPlan::handover`) is a
+  slice of the cut and labels over its own clips, where the Motion plan labels over the cut's graph; when the slice has dropped the
+  matrix-naming clip a translucent HD layer differs by 1 level in the export on 9.0.2 and 8 to 14 on 6.1.1 (export 8, still 14, stream 11, scrub window 14), coloured text by 16 levels on its pixels on 9.0.2 and not at all on 6.1.1, and a dip to white by 2 levels on 9.0.2 and 15 on 6.1.1 in the export (the RGB round trip reads the label; labelled against not, the clip alone; in a mixed stack on 6.1.1 the label moves an HD clip's dip by 33.0 dB / 15 levels into it and 32.5 / 15 out of it over all frames, method in `engine-cli.md`), opaque pictures not at all. The stream's own matrix
   (`PlanStream::matrix`, from the probed `color_space`) is used for taking a translucent
   layer out of YUV in the round trip below and for choosing the composite's matrix.
 - **`eq` is a YUV operation**, not an RGB one: `eq.rs` builds vf_eq's own per-plane
@@ -658,6 +665,12 @@ the full-range pictures (`run_full_range`: drawn exactly under `FixedBt601`, ref
 at once. The Still-plan side is `parity.rs`: `frames_inside_a_transition_are_drawn_as_ffmpegs_still_draws_them` (the plan holds the frame and the GPU is held strictly to the still, the still to
 the export), `every_kind_of_transition_and_the_clips_own_fades_are_drawn_in_a_still`, `a_dip_to_white_is_drawn_where_its_round_trip_was_measured_and_refused_elsewhere` and
 `a_full_range_picture_fades_as_the_ffmpeg_in_use_converts_its_range` (the `check_refused` cases, with FFmpeg rendering each fallback).
+**The BT.709 label's case** (`untagged_hd_is_labelled_for_the_whole_graph_that_holds_a_matrix`): a 1280x720 untagged HD clip made translucent (2 levels of Y / UV, the scaler's and the round trip's:
+`HD_TRANSLUCENT`) alone in the first second of a cut whose second second holds a BT.709 clip, and over a BT.709 clip, plus the same frames with no BT.709 clip in the graph; the Motion plan labels by the cut's graph where a
+Still plan labels by the layers on screen. Reading the labelled layer as BT.601 again fails it on both FFmpegs (9.0.2 refuses the frames as mixed matrices, 6.1.1 draws them 8 levels off).
+**The label's dip case** (`a_labelled_hd_clip_dips_through_white_with_the_bt709_round_trip`, `WHITE_709`; the Still side `a_labelled_hd_layer_in_a_dip_to_white_is_drawn_as_the_layer_tagged_in_the_file`):
+a labelled HD clip dipping through white is drawn as the file tagged BT.709 is, which is what the export renders because the label is the first filter of the chain. Behind the fit `scale` (the filter FFmpeg has convert the picture
+to the `rgb24` the white `fade` needs) it was BT.601 out of YUV and BT.709 back, and the compositor was Y 17 / UV 9 off the export on 9.0.2, Y 30 / UV 16 on 6.1.1, on every frame of the clip.
 
 **GPU-6's cases** (zoom in, out, from small, with a position, eased, three keys, late, speed 2, reversed, Cover into 960x540 and 9:16; masks
 shapes x feather x invert, off-centre, larger than the frame, thin, the shape's edge on the picture's border, over noise; the effects and their chains;
@@ -695,7 +708,11 @@ scaling, picture-in-picture (including a 361x203 layer in a 722x640 frame), scal
 + crop, odd-sized and off-canvas layers, **letterboxed layers over and under others** (bars
 cover, graded bars), **opacity** (several sources and roles, a graded fade),
 **matrices** (BT.709 and BT.2020 single and layered, mixed tags, an RGB PNG under and over
-tagged clips, translucent layers over tagged ones in both orders), colour (all four knobs,
+tagged clips, translucent layers over tagged ones in both orders), **the BT.709 label** (`label/` and `proxy/`: untagged HD alone, among
+untagged footage and beside a BT.709 clip, plain and translucent in both orders, strictly on both FFmpegs; beside an HLG proxy, which the
+tone-map tags BT.709; untagged SD and PNG logos, which are not labelled; `smpte170m` and `bt2020nc` footage beside it, refused on 9.0.2; the previews'
+own proxies from `generate_proxy`; a real JPEG, WebP and MJPEG clip, whose `bt470bg` tags are decoders' defaults and label nothing; and `tests/motion_parity.rs`, a translucent HD clip alone in its second of a cut whose
+other second holds a BT.709 clip, where the Motion plan labels by the cut's graph; a labelled HD clip's dip to white in a still and in motion), colour (all four knobs,
 contrast + saturation only, warm / cool), PNG and JPEG stills, speed / reverse / keyframes (a zoom
 and a position moving; a rotation and an opacity moving over a held zoom),
 10-bit / 4:2:2 / 4:4:4 / BGR0 / gray / full-range / odd-sized / metadata-rotated sources
@@ -716,7 +733,7 @@ above), **a moving zoom last, masks and effects** (`zoom/`, `zoom+mask/`, `mask/
 caption styles, positions and edges, boxes, colours, sizes, keyframed and overlapping overlays, escapes, installed fonts,
 over every kind of picture, with no layer, and the text it must refuse, each held to the same picture without the text; see
 "Text" above). The table
-holds 681 rows on FFmpeg 6.1.1 and 641 on the pinned 9.0.2 the Windows and macOS bundles ship (where the mixed-tag stacks are asserted refused instead of compared; 152 rows are `text/`, its
+holds 709 rows on FFmpeg 6.1.1 and 662 on the pinned 9.0.2 the Windows and macOS bundles ship (where the mixed-tag stacks are asserted refused instead of compared; 152 rows are `text/`, its
 controls included, 161 the transitions and fades and 143 the zoom, mask and effect cases) plus the plane-level scaler (75) and effect (99) runs, all passing strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
 (`KERF_PARITY_KEEP=1` keeps them for passing ones; `KERF_PARITY_EXPLORE=1` prints
 everything and fails nothing); every run writes `target/parity/report.txt`.

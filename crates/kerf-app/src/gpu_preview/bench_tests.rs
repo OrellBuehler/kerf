@@ -98,6 +98,7 @@ fn big_project(dir: &Path, assets: usize, clips: usize) -> Project {
     let timeline = Timeline {
         tracks,
         overlays: Vec::new(),
+        svg_overlays: Vec::new(),
         markers: Vec::new(),
         format: None,
         master: Default::default(),
@@ -581,6 +582,7 @@ fn play_project(clips: &[PathBuf; 2], heavy: bool) -> Project {
     let timeline = Timeline {
         tracks,
         overlays,
+        svg_overlays: Vec::new(),
         markers: Vec::new(),
         format: None,
         master: Default::default(),

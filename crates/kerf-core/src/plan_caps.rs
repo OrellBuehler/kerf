@@ -273,6 +273,8 @@ pub enum Unsupported {
     /// A live text overlay is drawn in a font under [`MIN_TEXT_PX`] pixels (the smallest, in pixels):
     /// glyph bitmaps share too many pixels for one mask to stand for them.
     TextTooSmall(u32),
+    /// An animated SVG title is on screen: resvg draws it and FFmpeg overlays its pictures.
+    Svg,
     Scaler(String),
     /// The layer's colour matrix is unknown while the composite takes its matrix from the tags.
     MatrixUnknown(usize),
@@ -327,6 +329,7 @@ impl Unsupported {
             Self::TextWithoutFont => "text_without_font",
             Self::TextBorder => "text_border",
             Self::TextTooSmall(_) => "text_too_small",
+            Self::Svg => "svg",
             Self::Scaler(_) => "scaler",
             Self::MatrixUnknown(_) => "matrix_unknown",
             Self::MixedMatrices => "mixed_matrices",
@@ -420,6 +423,7 @@ impl fmt::Display for Unsupported {
             Self::TextBorder => f.write_str(
                 "a bold text overlay in a font with no bold face, which drawtext thickens with an overlapping border",
             ),
+            Self::Svg => f.write_str("an animated SVG title is on screen"),
             Self::Scaler(s) => write!(f, "scaler '{s}'"),
             Self::MatrixUnknown(n) => write!(
                 f,
@@ -487,6 +491,7 @@ mod tests {
             Unsupported::Text.kind(),
             Unsupported::TextWithoutFont.kind(),
             Unsupported::TextBorder.kind(),
+            Unsupported::Svg.kind(),
             Unsupported::Hdr(layer(0, "")).kind(),
             Unsupported::Effects(layer(0, ""), "a blur").kind(),
             Unsupported::Grade(layer(0, ""), "curves").kind(),

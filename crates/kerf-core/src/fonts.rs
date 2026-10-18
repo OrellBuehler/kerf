@@ -17,7 +17,7 @@
 //! written again rather than leaving every title unrenderable until a restart.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::SystemTime;
 
 use fontdb::{Database, Family, Query, Source, Weight};
@@ -35,6 +35,30 @@ fn db() -> &'static Database {
         db.load_system_fonts();
         db
     })
+}
+
+/// The fonts an animated SVG title is drawn with: the system's and the shipped Geist, with Geist
+/// standing in for `serif` and `sans-serif` — which is also where a family nothing has falls to, so
+/// text never vanishes for want of a face and a title looks the same on a machine with no Times.
+/// Built once; `Arc` because `usvg` takes its font database that way.
+pub fn svg_fontdb() -> Arc<Database> {
+    static DB: OnceLock<Arc<Database>> = OnceLock::new();
+    DB.get_or_init(|| {
+        let mut svg = db().clone();
+        svg.load_font_source(Source::Binary(Arc::new(REGULAR)));
+        svg.load_font_source(Source::Binary(Arc::new(BOLD)));
+        svg.set_serif_family(DEFAULT_FAMILY);
+        svg.set_sans_serif_family(DEFAULT_FAMILY);
+        Arc::new(svg)
+    })
+    .clone()
+}
+
+/// Read the machine's fonts now if they have not been, so the first animated title (or font list)
+/// finds them: a macOS install has some hundreds of faces, and a cold disk takes seconds to read
+/// them. Idempotent and quick once done; the app calls it from a thread at launch.
+pub fn warm() {
+    let _ = svg_fontdb();
 }
 
 /// Distinct family names of every font installed on this machine, sorted.
@@ -133,25 +157,24 @@ fn font_dirs() -> impl Iterator<Item = PathBuf> {
 /// Named for the user, created owner-only, and refused when it already exists but is someone else's
 /// or open to others. Elsewhere (Windows, macOS) the temp directory is already the user's own.
 fn private_dir(base: &Path) -> Option<PathBuf> {
-    private_cache_dir(base, "kerf-fonts")
+    private_dir_named(base, "kerf-fonts")
 }
 
-/// [`private_dir`] under another name (`<prefix>-<uid>`), for the other files Kerf writes for FFmpeg
-/// to read (the LUT copies, `color_lut`).
-pub(crate) fn private_cache_dir(base: &Path, prefix: &str) -> Option<PathBuf> {
+/// [`private_dir`] under another name: the animated SVG frames fall back to one the same way.
+pub(crate) fn private_dir_named(base: &Path, name: &str) -> Option<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
         // SAFETY: `geteuid` has no preconditions and cannot fail.
         let uid = unsafe { libc::geteuid() };
-        let dir = base.join(format!("{prefix}-{uid}"));
+        let dir = base.join(format!("{name}-{uid}"));
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).ok()?;
         let meta = std::fs::symlink_metadata(&dir).ok()?;
         (meta.is_dir() && meta.uid() == uid && meta.mode() & 0o022 == 0).then_some(dir)
     }
     #[cfg(not(unix))]
     {
-        let dir = base.join(prefix);
+        let dir = base.join(name);
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir)
     }
