@@ -33,6 +33,7 @@ pub mod render_bar;
 pub mod render_plan;
 pub mod scopes;
 pub mod svg;
+pub mod template;
 pub mod timecode;
 pub mod transcript;
 
@@ -112,3 +113,8 @@ pub use render_plan::{
     PlanText, PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_SHRINK, MIN_TEXT_PX,
 };
 pub use svg::{check_svg, render_preset, SvgCheck, SvgDoc, SvgPresetInfo, SvgPresetParamInfo, MAX_ANIMATIONS, MAX_VALUES};
+pub use template::{
+    ImportOutcome, ImportStatus, Library as TemplateLibrary, PreparedTemplate, PreparedValues, Template, TemplateControl,
+    TemplateEditInputs, TemplateInfo, TemplateInstance, TemplateKind, TemplateList, TemplateManifest, TemplateProblem,
+    TemplateSaveRequest, TemplateSaved, TemplateSource, TemplateTarget,
+};

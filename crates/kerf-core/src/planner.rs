@@ -1865,6 +1865,7 @@ mod tests {
             opacity: 1.0,
             offset: 0.0,
             preset: None,
+            template: None,
         };
         let id = title.id;
         let assets = [a];

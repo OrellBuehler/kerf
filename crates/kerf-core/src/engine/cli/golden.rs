@@ -902,6 +902,7 @@ fn svg_for(tl: &mut Timeline, j: usize) {
             opacity: 1.0,
             offset: 0.0,
             preset: None,
+            template: None,
         };
         if r.chance(0.5) {
             (o.x, o.y, o.width, o.height) = (r.real(-0.3, 0.7), r.real(-0.3, 0.7), r.real(0.05, 0.6), r.real(0.05, 0.6));

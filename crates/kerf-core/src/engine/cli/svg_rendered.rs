@@ -94,6 +94,7 @@ fn title(svg: String, start: f64, end: f64) -> SvgOverlay {
         opacity: 1.0,
         offset: 0.0,
         preset: None,
+        template: None,
     }
 }
 
@@ -752,6 +753,42 @@ fn a_text_heavy_title_is_drawn_inside_the_streams_budget() {
         eprintln_timing(took, 301);
         assert!(took < std::time::Duration::from_secs(10), "{took:?} for 301 frames at 960 px");
         drop(pins);
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The pixel at the middle of an exported frame.
+fn centre(frame: &[u8]) -> [u8; 3] {
+    let at = (((H / 2) * W + W / 2) * 3) as usize;
+    [frame[at], frame[at + 1], frame[at + 2]]
+}
+
+#[test]
+#[ignore = "drives the real ffmpeg"]
+fn a_template_title_is_exported_with_the_values_it_was_set_to() {
+    use crate::template::fixtures::template;
+    let dir = scratch("template");
+    with_pinned_dir(dir.join("cache").to_str().unwrap(), || {
+        let bg = background(&dir, "30");
+        let assets = [bg.clone()];
+        let t = template();
+        let drawn = |brand: Option<&str>, tag: &str| {
+            let values = brand
+                .map(|b| [("brand".to_string(), b.to_string())].into())
+                .unwrap_or_default();
+            let prepared = t.prepare(&values).unwrap();
+            let tl = cut(&bg, vec![title(prepared.doc.sanitized().to_string(), 0.0, 4.0)]);
+            let frames = export_rgb(&tl, &assets, &options(30.0), &dir, tag);
+            centre(&frames[60])
+        };
+        // The fixture's backdrop fills the whole title; its colour is the control.
+        let as_made = drawn(None, "made");
+        let red = drawn(Some("#ff0000"), "red");
+        let green = drawn(Some("lime"), "green");
+        let close = |got: [u8; 3], want: [u8; 3]| got.iter().zip(want).all(|(a, b)| a.abs_diff(b) <= 8);
+        assert!(close(as_made, [0x10, 0x20, 0x30]), "as made: {as_made:?}");
+        assert!(close(red, [255, 0, 0]), "red: {red:?}");
+        assert!(close(green, [0, 255, 0]), "lime: {green:?}");
     });
     let _ = std::fs::remove_dir_all(dir);
 }

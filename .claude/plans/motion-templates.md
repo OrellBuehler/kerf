@@ -86,3 +86,55 @@ agent).
 | import a file into the library | `import_template` | `import_template` |
 | export a library entry to a file | `export_template` | `export_template` |
 | delete a library entry | `delete_template` | `delete_template` |
+
+## Phase 1 as built in kerf-core
+
+The contract above stands; this records what the engine does where the contract left a choice, so the
+surface and frontend work follows it. Details and limits: `.claude/docs/core-project.md` ("Motion templates").
+
+### Shapes (snake_case JSON, `schemars::JsonSchema` on all but the instance)
+
+- `TemplateControl { id, label, kind: text|color|number|font|image, targets: [{element, attribute?}], min?, max? }`
+- `TemplateInstance { template_id, name, controls: [TemplateControl], values: {control_id: string} }`, on
+  `SvgOverlay.template` (absent when none). **`values` is read back from the title's `svg` after every
+  change and has an entry for every control whose element is still there, except `image` controls**
+  (their `data:` URL is in the `svg`; read the `href` of the target element there for a thumbnail).
+- `TemplateInfo { id, name, description, duration, width, height, controls, fonts: [family], has_poster, size_bytes }`;
+  `TemplateList { templates: [TemplateInfo], problems: [{file, error}] }` (a damaged file is a problem, not a failure);
+  `TemplateSaveRequest { name, description?, controls }`; `TemplateSaved { info, warnings }`;
+  `ImportOutcome { info, status: added|already_present|added_as_copy, warnings }`.
+- Units: `number` values are unitless numbers; a `color` is `#rgb[a]`, `#rrggbb[aa]`, an SVG colour name,
+  `none` or `currentColor` (no `rgb()`); a `font` is one family name.
+
+### Calls (what each surface runs, and where the lock is)
+
+| Surface | Core | Lock |
+| --- | --- | --- |
+| `list_templates` | `TemplateLibrary::default_location()?.list()` | none |
+| (poster for a grid card) | `TemplateLibrary::poster(id) -> Option<Vec<u8>>` (PNG, ≤ 512 px) | none |
+| `save_template` | `project.template_source(overlay_id)` (cheap) → `TemplateLibrary::save(&source, request)` (fonts, poster: slow) | source only |
+| `apply_template` | `lib.get(id)?.prepare(&values)?` (slow) → `project.apply_template_parsed(prepared, start, end?, SvgLayout)` | apply only |
+| `set_template_values` | `project.template_edit_inputs(overlay_id)?` (cheap) → `.prepare(&values)?` (slow) → `project.set_template_values_parsed(overlay_id, prepared)` | first and last |
+| `import_template` | `TemplateLibrary::import(path)` | none |
+| `export_template` | `TemplateLibrary::export(id, dest) -> PathBuf` | none |
+| `delete_template` | `TemplateLibrary::delete(id)` | none |
+
+`apply_template_parsed` and `set_template_values_parsed` return `SvgOverlayResult` (the title and the warnings,
+including "font not installed"). `set_template_values_parsed` refuses a title that changed after
+`prepare` read it (`InvalidArgument`, "changed while ... try again"): prepare again. `template::image_data_url(bytes)`
+turns a PNG / JPEG / GIF / WebP file's bytes into the `data:` URL an `image` value takes (a title is held to
+128 KiB, so about 90 KB of image).
+
+### Where it differs from, or adds to, the text above
+
+- **Setting values is its own edit, not a field of `SvgOverlayPatch`**: the splice must read the title as it is
+  (and the sanitiser takes up to a second and a half), which cannot happen in `check()` before the lock.
+  `SvgOverlayPatch.svg` replaces the artwork and **ends the template** (`template` becomes `None`).
+- Embedded fonts are the `fonts` table (`sha256`, `family`, `data`), schema **v2**. Opening a project makes its
+  fonts *the* embedded set (it replaces the previous project's); applying a template adds to it. The SVG
+  frame cache key carries `fonts::embedded_digest()` when the set is not empty.
+- A font is carried only when it is a plain `.ttf` / `.otf`, ≤ 8 MiB, ≤ 16 per template, and its `OS/2` licence
+  flags allow embedding; otherwise `save` leaves it out and warns. Embedded faces win over installed ones.
+- `import` never overwrites: the same id with other content is kept under a new id (`added_as_copy`).
+- A library file is listed only when its name is `<manifest id>.kerftemplate`.
+- Attribution: `THIRD-PARTY-NOTICES.md` (there is no `NOTICE` file).

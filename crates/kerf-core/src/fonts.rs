@@ -16,11 +16,15 @@
 //! (a `stat`), so a cache that is cleared or a temp directory that is swept while the app runs is
 //! written again rather than leaving every title unrenderable until a restart.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::SystemTime;
 
-use fontdb::{Database, Family, Query, Source, Weight};
+use fontdb::{Database, Family, Query, Source, Style, Weight};
+use sha2::{Digest, Sha256};
+
+use crate::error::{Error, Result};
 
 /// The family shipped in the binary (Geist, the interface's own typeface).
 pub const DEFAULT_FAMILY: &str = "Geist";
@@ -37,21 +41,340 @@ fn db() -> &'static Database {
     })
 }
 
-/// The fonts an animated SVG title is drawn with: the system's and the shipped Geist, with Geist
-/// standing in for `serif` and `sans-serif` — which is also where a family nothing has falls to, so
-/// text never vanishes for want of a face and a title looks the same on a machine with no Times.
-/// Built once; `Arc` because `usvg` takes its font database that way.
-pub fn svg_fontdb() -> Arc<Database> {
+/// The system's fonts and the shipped Geist, with Geist standing in for `serif` and `sans-serif`.
+/// Built once; what a project embeds is layered on top of it ([`build_svg_db`]).
+fn base_svg_db() -> Arc<Database> {
     static DB: OnceLock<Arc<Database>> = OnceLock::new();
     DB.get_or_init(|| {
         let mut svg = db().clone();
-        svg.load_font_source(Source::Binary(Arc::new(REGULAR)));
-        svg.load_font_source(Source::Binary(Arc::new(BOLD)));
-        svg.set_serif_family(DEFAULT_FAMILY);
-        svg.set_sans_serif_family(DEFAULT_FAMILY);
+        finish_svg_db(&mut svg);
         Arc::new(svg)
     })
     .clone()
+}
+
+/// Geist, and Geist for `serif` and `sans-serif` — which is also where a family nothing has falls
+/// to, so text never vanishes for want of a face and a title looks the same on a machine with no Times.
+fn finish_svg_db(svg: &mut Database) {
+    svg.load_font_source(Source::Binary(Arc::new(REGULAR)));
+    svg.load_font_source(Source::Binary(Arc::new(BOLD)));
+    svg.set_serif_family(DEFAULT_FAMILY);
+    svg.set_sans_serif_family(DEFAULT_FAMILY);
+}
+
+/// The fonts an animated SVG title is drawn with: the system's, the shipped Geist, and **the fonts
+/// the open project embeds** ([`replace_embedded`], [`register_embedded`]) — a template's typeface
+/// travels with it, so a title looks the same on a machine that has never installed it. An embedded
+/// face is looked at *before* the installed ones, so a family both have is the project's. Geist
+/// stands for `serif` and `sans-serif`, which is also where a family nothing has falls to.
+///
+/// With nothing embedded this is the one database built for the process; with some it is rebuilt when
+/// the set changes (kept while it does not), and [`embedded_digest`] says which set it was built from.
+/// `Arc` because `usvg` takes its font database that way.
+pub fn svg_fontdb() -> Arc<Database> {
+    with_registry(Registry::svg_db)
+}
+
+/// [`svg_fontdb`] with `extra` fonts layered in as well, registered nowhere: a template being saved
+/// or imported draws its poster with the fonts it is about to carry, whatever the open project has.
+pub fn svg_fontdb_with(extra: &[EmbeddedFont]) -> Arc<Database> {
+    let mut all: BTreeMap<String, EmbeddedFont> = with_registry(|r| r.fonts.clone());
+    for font in extra {
+        all.entry(font.sha256.clone()).or_insert_with(|| font.clone());
+    }
+    if all.is_empty() {
+        return base_svg_db();
+    }
+    Arc::new(build_svg_db(all.values()))
+}
+
+// ---- fonts that travel with a project --------------------------------------------------------------
+
+/// A font a project or a template carries rather than finds installed: the file's bytes, named by
+/// their SHA-256 (the key the project's `fonts` table stores them under).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedFont {
+    pub sha256: String,
+    /// The family it is called in the template's manifest / the table (what a person reads; the
+    /// family text uses is the one inside the font file).
+    pub family: String,
+    pub data: Arc<Vec<u8>>,
+}
+
+impl EmbeddedFont {
+    pub fn new(family: impl Into<String>, data: Vec<u8>) -> Self {
+        Self {
+            sha256: sha256_hex(&data),
+            family: family.into(),
+            data: Arc::new(data),
+        }
+    }
+}
+
+/// The SHA-256 of `bytes` as lower-case hex.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    Sha256::digest(bytes).iter().fold(String::with_capacity(64), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// The embedded set and the database built from it. Per process; under `cfg(test)` per thread, so
+/// that tests running side by side cannot see (or key their pictures by) each other's fonts.
+struct Registry {
+    fonts: BTreeMap<String, EmbeddedFont>,
+    /// A digest of the set: `None` when it is empty.
+    digest: Option<String>,
+    built: Option<(String, Arc<Database>)>,
+}
+
+impl Registry {
+    const fn new() -> Self {
+        Registry {
+            fonts: BTreeMap::new(),
+            digest: None,
+            built: None,
+        }
+    }
+
+    fn changed(&mut self) {
+        self.digest = (!self.fonts.is_empty()).then(|| {
+            let mut hash = Sha256::new();
+            for key in self.fonts.keys() {
+                hash.update(key.as_bytes());
+            }
+            hash.finalize()[..16].iter().map(|b| format!("{b:02x}")).collect()
+        });
+        self.built = None;
+    }
+
+    fn svg_db(&mut self) -> Arc<Database> {
+        let Some(digest) = &self.digest else {
+            return base_svg_db();
+        };
+        if let Some((built_for, db)) = &self.built {
+            if built_for == digest {
+                return db.clone();
+            }
+        }
+        let db = Arc::new(build_svg_db(self.fonts.values()));
+        self.built = Some((digest.clone(), db.clone()));
+        db
+    }
+}
+
+/// The system's faces behind `embedded` ones (the first of equal matches wins a `fontdb` query, so
+/// putting them first makes a template's own typeface beat an installed one of the same family).
+fn build_svg_db<'a>(embedded: impl Iterator<Item = &'a EmbeddedFont>) -> Database {
+    let mut svg = Database::new();
+    for font in embedded {
+        let ids = svg.load_font_source(Source::Binary(font.data.clone()));
+        if ids.is_empty() {
+            tracing::warn!(family = %font.family, "an embedded font could not be read; text in it falls back");
+        }
+    }
+    for face in db().faces() {
+        svg.push_face_info(face.clone());
+    }
+    finish_svg_db(&mut svg);
+    svg
+}
+
+#[cfg(not(test))]
+fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
+    static REGISTRY: Mutex<Registry> = Mutex::new(Registry::new());
+    f(&mut REGISTRY.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+#[cfg(test)]
+fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
+    thread_local! {
+        static REGISTRY: std::cell::RefCell<Registry> = const { std::cell::RefCell::new(Registry::new()) };
+    }
+    REGISTRY.with(|r| f(&mut r.borrow_mut()))
+}
+
+/// Add `fonts` to the embedded set (a font already there, by its SHA-256, is left alone). Returns
+/// whether the set changed — when it did, the pictures drawn so far no longer stand for it and
+/// [`embedded_digest`] has moved.
+pub fn register_embedded(fonts: &[EmbeddedFont]) -> bool {
+    with_registry(|r| {
+        let before = r.fonts.len();
+        for font in fonts {
+            r.fonts.entry(font.sha256.clone()).or_insert_with(|| font.clone());
+        }
+        let changed = r.fonts.len() != before;
+        if changed {
+            r.changed();
+        }
+        changed
+    })
+}
+
+/// Make `fonts` the embedded set, as opening a project does: the previous project's fonts are not
+/// this one's, and a title must draw the same however many projects were opened before it. Returns
+/// whether the set changed.
+pub fn replace_embedded(fonts: Vec<EmbeddedFont>) -> bool {
+    with_registry(|r| {
+        let next: BTreeMap<String, EmbeddedFont> = fonts.into_iter().map(|f| (f.sha256.clone(), f)).collect();
+        let changed = !r.fonts.keys().eq(next.keys());
+        if changed {
+            r.fonts = next;
+            r.changed();
+        }
+        changed
+    })
+}
+
+/// A digest of the embedded set (32 hex digits), `None` when nothing is embedded. **Part of every
+/// animated-title picture's cache key** when there is one, so frames drawn with another set of fonts
+/// are never served; with none the keys are what they always were.
+pub fn embedded_digest() -> Option<String> {
+    with_registry(|r| r.digest.clone())
+}
+
+/// The embedded set, by SHA-256.
+pub fn embedded_fonts() -> Vec<EmbeddedFont> {
+    with_registry(|r| r.fonts.values().cloned().collect())
+}
+
+/// Whether a family called `family` is installed or embedded (or is the shipped Geist): the one the
+/// title will really be drawn with, rather than the Geist a family nothing has falls to.
+pub fn has_family(family: &str) -> bool {
+    svg_fontdb()
+        .faces()
+        .any(|face| face.families.iter().any(|(name, _)| name == family))
+}
+
+/// Families CSS names for a kind of face rather than a font: never embedded, never looked up.
+pub fn is_generic_family(family: &str) -> bool {
+    matches!(
+        family.trim().to_ascii_lowercase().as_str(),
+        "serif"
+            | "sans-serif"
+            | "monospace"
+            | "cursive"
+            | "fantasy"
+            | "system-ui"
+            | "ui-serif"
+            | "ui-sans-serif"
+            | "ui-monospace"
+            | "ui-rounded"
+            | "emoji"
+            | "math"
+            | "fangsong"
+            | "inherit"
+            | "initial"
+            | "unset"
+            | "revert"
+    )
+}
+
+/// What a font file turned out to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontCheck {
+    /// The family the file calls itself (what text names).
+    pub family: String,
+}
+
+/// The sfnt wrappers a single TrueType / OpenType font starts with. A collection (`ttcf`) is not
+/// one: it holds several faces, and a template carries one file per font.
+fn is_sfnt(data: &[u8]) -> bool {
+    data.starts_with(&[0, 1, 0, 0]) || data.starts_with(b"OTTO") || data.starts_with(b"true")
+}
+
+/// Whether the font's `OS/2` table allows embedding it (`fsType` bit 1 is "restricted licence
+/// embedding"). A font with no such table is taken to allow it.
+pub fn embedding_allowed(data: &[u8]) -> bool {
+    let u16_at = |at: usize| data.get(at..at + 2).map(|b| u16::from_be_bytes([b[0], b[1]]));
+    let u32_at = |at: usize| data.get(at..at + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let Some(tables) = u16_at(4) else { return true };
+    for i in 0..usize::from(tables) {
+        let record = 12 + i * 16;
+        if data.get(record..record + 4) == Some(b"OS/2") {
+            let Some(offset) = u32_at(record + 8) else { return true };
+            return u16_at(offset as usize + 8).is_none_or(|fs_type| fs_type & 0x0002 == 0);
+        }
+    }
+    true
+}
+
+/// Read `data` as the one font it must be: a TrueType / OpenType file `fontdb` can parse, not a
+/// collection. `fontdb` quietly skips what it cannot read, so an empty answer is the refusal.
+pub fn check_font(data: &Arc<Vec<u8>>) -> Result<FontCheck> {
+    if data.starts_with(b"ttcf") {
+        return Err(Error::InvalidArgument(
+            "a font collection (.ttc) cannot be carried: use a single .ttf or .otf".to_string(),
+        ));
+    }
+    if !is_sfnt(data) {
+        return Err(Error::InvalidArgument("not a TrueType or OpenType font".to_string()));
+    }
+    let mut probe = Database::new();
+    let ids = probe.load_font_source(Source::Binary(data.clone()));
+    let face = ids
+        .first()
+        .and_then(|id| probe.face(*id))
+        .ok_or_else(|| Error::InvalidArgument("the font file could not be read".to_string()))?;
+    let family = face
+        .families
+        .first()
+        .map(|(name, _)| name.clone())
+        .ok_or_else(|| Error::InvalidArgument("the font has no family name".to_string()))?;
+    Ok(FontCheck { family })
+}
+
+/// What looking a face up for embedding found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FaceLookup {
+    Found(EmbeddedFont),
+    /// No installed or embedded font has the family.
+    Missing,
+    /// The face lives in a `.ttc` collection or is not a plain sfnt file.
+    NotSingleFile,
+    /// Bigger than the cap (`max` bytes), given.
+    TooLarge(u64),
+    /// The font's licence flags forbid embedding.
+    Restricted,
+}
+
+/// The font file the family `family` is drawn with at `weight` (CSS 100..=900) and `italic`, read for
+/// embedding, `max` bytes at most. The generic families and Geist (which every Kerf has) are the
+/// caller's to leave out.
+pub fn lookup_face(family: &str, weight: u16, italic: bool, max: u64) -> FaceLookup {
+    let db = svg_fontdb();
+    let query = Query {
+        families: &[Family::Name(family)],
+        weight: Weight(weight),
+        style: if italic { Style::Italic } else { Style::Normal },
+        ..Query::default()
+    };
+    let Some(id) = db.query(&query) else {
+        return FaceLookup::Missing;
+    };
+    let Some(face) = db.face(id) else {
+        return FaceLookup::Missing;
+    };
+    if !face.families.iter().any(|(name, _)| name == family) {
+        return FaceLookup::Missing;
+    }
+    let read = db.with_face_data(id, |data, index| {
+        if index != 0 || !is_sfnt(data) {
+            Err(FaceLookup::NotSingleFile)
+        } else if data.len() as u64 > max {
+            Err(FaceLookup::TooLarge(data.len() as u64))
+        } else if !embedding_allowed(data) {
+            Err(FaceLookup::Restricted)
+        } else {
+            Ok(data.to_vec())
+        }
+    });
+    match read {
+        Some(Ok(bytes)) => FaceLookup::Found(EmbeddedFont::new(family, bytes)),
+        Some(Err(why)) => why,
+        None => FaceLookup::Missing,
+    }
 }
 
 /// Read the machine's fonts now if they have not been, so the first animated title (or font list)
@@ -273,6 +596,30 @@ pub(crate) fn with_pinned_default_font<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// A copy of the shipped Geist (`bold` or regular) that calls itself `family` (as many characters as
+/// "Geist" has): the names in the file are replaced in place, in both encodings, so every table keeps its
+/// place. A face a test can embed that looks different from the Geist a family nothing has falls to.
+#[cfg(test)]
+pub(crate) fn shipped_font_renamed(bold: bool, family: &str) -> Vec<u8> {
+    fn replace(data: &mut [u8], from: &[u8], to: &[u8]) {
+        let mut at = 0;
+        while at + from.len() <= data.len() {
+            if &data[at..at + from.len()] == from {
+                data[at..at + to.len()].copy_from_slice(to);
+                at += from.len();
+            } else {
+                at += 1;
+            }
+        }
+    }
+    assert_eq!(family.len(), DEFAULT_FAMILY.len());
+    let utf16 = |s: &str| s.encode_utf16().flat_map(u16::to_be_bytes).collect::<Vec<u8>>();
+    let mut data = if bold { BOLD } else { REGULAR }.to_vec();
+    replace(&mut data, DEFAULT_FAMILY.as_bytes(), family.as_bytes());
+    replace(&mut data, &utf16(DEFAULT_FAMILY), &utf16(family));
+    data
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +757,152 @@ mod tests {
         };
         let font = resolve_text_font(Some(&family), false).expect("an installed family");
         assert_eq!(Some((font.path, font.bold)), resolve_font_file(&family, false));
+    }
+
+    fn family_of(db: &Database, name: &str, weight: u16) -> Option<fontdb::ID> {
+        db.query(&Query {
+            families: &[Family::Name(name)],
+            weight: Weight(weight),
+            ..Query::default()
+        })
+    }
+
+    #[test]
+    fn nothing_embedded_is_the_one_database_built_for_the_process() {
+        assert_eq!(embedded_digest(), None);
+        assert!(Arc::ptr_eq(&svg_fontdb(), &svg_fontdb()));
+        assert!(Arc::ptr_eq(&svg_fontdb(), &base_svg_db()));
+        assert!(Arc::ptr_eq(&svg_fontdb_with(&[]), &base_svg_db()));
+    }
+
+    #[test]
+    fn an_embedded_family_is_drawn_with_and_the_digest_follows_the_set() {
+        let zeist = EmbeddedFont::new("Zeist", shipped_font_renamed(true, "Zeist"));
+        assert!(family_of(&svg_fontdb(), "Zeist", 400).is_none(), "nobody has it yet");
+        assert!(!has_family("Zeist"));
+        assert!(register_embedded(std::slice::from_ref(&zeist)));
+        assert!(has_family("Zeist"));
+        let one = embedded_digest().expect("a digest");
+        assert_eq!(one.len(), 32);
+        let db = svg_fontdb();
+        assert!(Arc::ptr_eq(&db, &svg_fontdb()), "kept while the set does not change");
+        let id = family_of(&db, "Zeist", 400).expect("embedded family found");
+        assert_eq!(db.face(id).unwrap().weight, Weight::BOLD, "the bold face this font is");
+        // System fonts and Geist are still there, and Geist still stands for sans-serif.
+        assert!(has_family(DEFAULT_FAMILY));
+        assert!(db
+            .query(&Query {
+                families: &[Family::SansSerif],
+                ..Query::default()
+            })
+            .is_some());
+
+        // Adding the same font again changes nothing; another one moves the digest and rebuilds.
+        assert!(!register_embedded(std::slice::from_ref(&zeist)));
+        assert_eq!(embedded_digest().as_deref(), Some(one.as_str()));
+        let zeyst = EmbeddedFont::new("Zeyst", shipped_font_renamed(false, "Zeyst"));
+        assert!(register_embedded(std::slice::from_ref(&zeyst)));
+        let two = embedded_digest().unwrap();
+        assert_ne!(two, one);
+        assert!(!Arc::ptr_eq(&db, &svg_fontdb()), "rebuilt for the new set");
+        assert!(has_family("Zeyst") && has_family("Zeist"));
+        assert_eq!(embedded_fonts().len(), 2);
+
+        // Replacing is not adding: the first project's fonts are not the second's.
+        assert!(replace_embedded(vec![zeyst.clone()]));
+        assert!(!has_family("Zeist") && has_family("Zeyst"));
+        assert_ne!(embedded_digest().unwrap(), one);
+        assert!(!replace_embedded(vec![zeyst]), "the same set again");
+        assert!(replace_embedded(Vec::new()));
+        assert_eq!(embedded_digest(), None);
+        assert!(!has_family("Zeyst"));
+        assert!(Arc::ptr_eq(&svg_fontdb(), &base_svg_db()), "and back to the shared one");
+    }
+
+    #[test]
+    fn an_embedded_face_wins_over_an_installed_one_of_the_same_family() {
+        // Geist Regular is in every database. Embed another file that matches a query just as well (the
+        // same face but for a byte of padding at the end): of equal matches the first loaded wins.
+        let mut other = REGULAR.to_vec();
+        other.push(0);
+        let impostor = EmbeddedFont::new("Geist", other.clone());
+        assert!(register_embedded(std::slice::from_ref(&impostor)));
+        let db = svg_fontdb();
+        let id = family_of(&db, "Geist", 400).unwrap();
+        match db.face_source(id).unwrap().0 {
+            Source::Binary(data) => assert_eq!(data.as_ref().as_ref(), other.as_slice(), "the embedded file"),
+            other => panic!("expected the embedded data, got {other:?}"),
+        }
+        replace_embedded(Vec::new());
+        let id = family_of(&svg_fontdb(), "Geist", 400).unwrap();
+        match svg_fontdb().face_source(id).unwrap().0 {
+            Source::Binary(data) => assert_eq!(data.as_ref().as_ref(), REGULAR, "the shipped one again"),
+            other => panic!("expected the shipped data, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_extra_fonts_of_a_poster_are_in_a_database_that_is_registered_nowhere() {
+        let zeist = EmbeddedFont::new("Zeist", shipped_font_renamed(true, "Zeist"));
+        let db = svg_fontdb_with(std::slice::from_ref(&zeist));
+        assert!(family_of(&db, "Zeist", 400).is_some());
+        assert_eq!(embedded_digest(), None);
+        assert!(family_of(&svg_fontdb(), "Zeist", 400).is_none());
+    }
+
+    #[test]
+    fn the_registry_is_per_thread_under_test_so_tests_cannot_see_each_other() {
+        let zeist = EmbeddedFont::new("Zeist", shipped_font_renamed(true, "Zeist"));
+        register_embedded(std::slice::from_ref(&zeist));
+        let there = std::thread::spawn(embedded_digest).join().unwrap();
+        assert_eq!(there, None);
+        replace_embedded(Vec::new());
+    }
+
+    #[test]
+    fn a_font_file_is_checked_for_what_it_is() {
+        let good = Arc::new(shipped_font_renamed(false, "Zeist"));
+        assert_eq!(check_font(&good).unwrap().family, "Zeist");
+        for (bytes, why) in [
+            (b"ttcf\0\0\0\0".to_vec(), "collection"),
+            (b"MZ".to_vec(), "TrueType or OpenType"),
+            (Vec::new(), "TrueType or OpenType"),
+            (good[..40].to_vec(), "could not be read"),
+        ] {
+            let err = check_font(&Arc::new(bytes)).unwrap_err().to_string();
+            assert!(err.contains(why), "{err}");
+        }
+    }
+
+    #[test]
+    fn restricted_embedding_is_read_from_the_os2_table() {
+        let mut font = shipped_font_renamed(false, "Zeist");
+        assert!(embedding_allowed(&font), "Geist is an open font");
+        let tables = usize::from(u16::from_be_bytes([font[4], font[5]]));
+        let record = (0..tables)
+            .map(|i| 12 + i * 16)
+            .find(|r| &font[*r..*r + 4] == b"OS/2")
+            .expect("an OS/2 table");
+        let offset = u32::from_be_bytes(font[record + 8..record + 12].try_into().unwrap()) as usize;
+        font[offset + 8..offset + 10].copy_from_slice(&2u16.to_be_bytes());
+        assert!(!embedding_allowed(&font), "fsType 2: restricted licence embedding");
+        font[offset + 8..offset + 10].copy_from_slice(&8u16.to_be_bytes());
+        assert!(embedding_allowed(&font), "editable embedding is allowed");
+        assert!(embedding_allowed(b"short"));
+    }
+
+    #[test]
+    fn a_face_is_looked_up_for_embedding_with_its_limits() {
+        let font = EmbeddedFont::new("Zeist", shipped_font_renamed(true, "Zeist"));
+        register_embedded(std::slice::from_ref(&font));
+        assert_eq!(lookup_face("Zeist", 700, false, 8 << 20), FaceLookup::Found(font.clone()));
+        assert_eq!(lookup_face("Nobody Has This", 400, false, 8 << 20), FaceLookup::Missing);
+        assert_eq!(
+            lookup_face("Zeist", 400, false, 10),
+            FaceLookup::TooLarge(font.data.len() as u64)
+        );
+        assert!(is_generic_family("Sans-Serif") && is_generic_family("monospace") && !is_generic_family("Roboto"));
+        replace_embedded(Vec::new());
     }
 
     #[test]

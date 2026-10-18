@@ -776,8 +776,11 @@ so the feature is **only** activated through these forwards — which is what ma
   PNG, and nothing in the graph is animated, so an export, the scrubbed still, the stream and an agent's contact sheet draw one
   title from one rasteriser. `raster::render(svg, pw, ph, opacity)` fits the document "contain" into the rectangle, clipped to its
   own viewport (a slide-in from outside the `viewBox` is not seen in the margin), with the alpha already multiplied by the
-  opacity (the graph has no `colorchannelmixer` for it); fonts are `fonts::svg_fontdb()` (system + shipped Geist, Geist standing
-  for serif and sans-serif and for the family nothing has, so text never vanishes); an `<image>` `href` that is not `data:` is
+  opacity (the graph has no `colorchannelmixer` for it); fonts are `fonts::svg_fontdb()` (the open project's **embedded** fonts,
+  then the system's and the shipped Geist, Geist standing for serif and sans-serif and for the family nothing has, so text never
+  vanishes; an embedded face is loaded first so it beats an installed one of the same family — a template's typeface wins on the
+  machine that also has another build of it; `fonts::replace_embedded` / `register_embedded` change the set, and the database is
+  rebuilt only when its digest changes, else it is the one built for the process); an `<image>` `href` that is not `data:` is
   nothing (no file read, no network), `resources_dir` is `None`, and a `data:` image is decoded only after its **header** says it
   is within 16 Mpx (`svg/images.rs`: `imagesize`, the crate usvg sizes with; the decoders allocate what the header claims, so
   60,000 x 60,000 bytes-of-header aborted the process) — the resolver answers "nothing" for one that is not, whatever the
@@ -854,9 +857,15 @@ so the feature is **only** activated through these forwards — which is what ma
   - **The cache** (`<cache>/kerf/svg/<pid>/<key>/NNNNNN.png` + a `complete` marker, else a private `kerf-svg-<uid>` directory in the
     temp one, else a unique `0700` `kerf-svg-<pid>-<nanos>-<n>` made with a plain `mkdir`): `key` = SHA-256 of `RASTER_VERSION`, the
     sanitised source, the document clock at the first picture, the rate, the picture count, the pixel size and the opacity —
-    **not the position** (moving a title keeps its frames) and **not the fonts**: the font database and this directory are both
-    built once per process and the directory is emptied at the first use (`claim_dir`: a pid is reused, and a marker left by an
-    earlier run is not trusted). A frame is renamed into place whole, so one that exists is right and an interrupted run resumes;
+    **not the position** (moving a title keeps its frames) and **not the installed fonts**: the system's database and this
+    directory are both built once per process and the directory is emptied at the first use (`claim_dir`: a pid is reused, and a
+    marker left by an earlier run is not trusted). **The embedded fonts are in the key when there are any**
+    (`svg_layer::digest` mixes in `fonts::embedded_digest()`, a hash of the set's SHA-256s; with none nothing is added, so every
+    existing key and the golden argv are byte for byte what they were): opening another project or applying a template changes the
+    set, and a picture drawn with another one is not served (the `DocCache`, which only parses, ignores it). The digest is read when
+    a key is made and the database when the picture is drawn; a project opened between the two (during an export being
+    prepared) can draw one picture under the neighbour's key, the same window the plan epoch has. Under `cfg(test)` the registry is
+    per thread, so tests cannot key each other's pictures; `tests/embedded_fonts.rs` runs the process-wide one. A frame is renamed into place whole, so one that exists is right and an interrupted run resumes;
     the marker is last, and `mark_complete` refuses a directory that is gone (it used to recreate it empty, "complete"). A
     sequence is **ready** when the marker is there and so are its first and last picture. Consecutive missing frames whose `at()`
     text is the same are one render and hard links (copy where links fail). Directories of dead pids are removed at the first use

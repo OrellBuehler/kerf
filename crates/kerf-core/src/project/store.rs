@@ -17,17 +17,30 @@ struct Migration {
     needed: fn(&Connection) -> bool,
     /// Whether the step drops or rewrites data. Only such a step refuses to run without a backup.
     destructive: bool,
+    /// Whether a build that cannot write must still refuse a file that lacks what the step adds.
+    /// False when every read tolerates the absence (an extra table), so a write-protected file that
+    /// predates the step opens as it is rather than being turned away.
+    needed_to_read: bool,
 }
 
 /// `MIGRATIONS[i]` upgrades schema `i` to `i + 1`. Version 0 is every file written before
 /// `PRAGMA user_version` was used — the legacy baseline. Append one step per change; never edit
 /// a shipped one. Steps run after `SCHEMA` has created any table the file lacked, so each must
 /// tolerate that (`IF NOT EXISTS`, probe before `ALTER`).
-const MIGRATIONS: &[Migration] = &[Migration {
-    run: v0_to_v1,
-    needed: v0_to_v1_needed,
-    destructive: false,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        run: v0_to_v1,
+        needed: v0_to_v1_needed,
+        destructive: false,
+        needed_to_read: true,
+    },
+    Migration {
+        run: v1_to_v2,
+        needed: v1_to_v2_needed,
+        destructive: false,
+        needed_to_read: false,
+    },
+];
 
 /// The schema this build writes and the newest it opens.
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -52,14 +65,41 @@ fn v0_to_v1_needed(conn: &Connection) -> bool {
     V1_COLUMNS.iter().any(|c| !has_column(conn, "assets", c))
 }
 
+/// v2: the table of fonts a project embeds (a template's typeface travels with it). Also in `SCHEMA`
+/// for a new file; `CREATE TABLE IF NOT EXISTS`, so it does not matter which ran first.
+fn v1_to_v2(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS fonts (
+            sha256 TEXT PRIMARY KEY,
+            family TEXT NOT NULL,
+            data   BLOB NOT NULL
+        )",
+    )
+}
+
+fn v1_to_v2_needed(conn: &Connection) -> bool {
+    !has_table(conn, "fonts")
+}
+
+pub(crate) fn has_table(conn: &Connection, table: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        params![table],
+        |r| r.get(0),
+    )
+    .unwrap_or(false)
+}
+
 /// The steps from `found` on that would change this file.
 fn pending(conn: &Connection, found: u32) -> impl Iterator<Item = &'static Migration> + '_ {
     MIGRATIONS.iter().skip(found as usize).filter(move |m| (m.needed)(conn))
 }
 
-/// Whether bringing a file at `found` forward would change anything but its version stamp.
+/// Whether a file at `found` lacks something this build cannot read it without: a step that would
+/// change the file *and* that reads depend on. (An added table that reads tolerate missing does not
+/// count: such a file opens read-only as it is.)
 pub(crate) fn needs_upgrade(conn: &Connection, found: u32) -> bool {
-    pending(conn, found).next().is_some()
+    pending(conn, found).any(|m| m.needed_to_read)
 }
 
 pub(crate) fn user_version(conn: &Connection) -> Result<u32> {

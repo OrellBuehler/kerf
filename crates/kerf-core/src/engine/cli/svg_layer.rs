@@ -159,10 +159,21 @@ fn clamped_opacity(o: &SvgOverlay) -> f64 {
     }
 }
 
-/// A digest of what decides a picture, as 32 hex digits.
+/// A digest of what decides a picture, as 32 hex digits. **The fonts a project embeds are part of it**
+/// (`fonts::embedded_digest`, the set the drawing will use): another set, another picture. With none
+/// embedded nothing is added, so a project without them keeps the keys it always had.
 fn digest(parts: impl FnOnce(&mut Sha256)) -> String {
+    digest_with(fonts::embedded_digest().as_deref(), parts)
+}
+
+/// [`digest`] for a given embedded font set (`None` for none).
+fn digest_with(embedded_fonts: Option<&str>, parts: impl FnOnce(&mut Sha256)) -> String {
     let mut hash = Sha256::new();
     hash.update(RASTER_VERSION.to_le_bytes());
+    if let Some(fonts) = embedded_fonts {
+        hash.update(b"embedded fonts");
+        hash.update(fonts.as_bytes());
+    }
     parts(&mut hash);
     hash.finalize()[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -514,7 +525,8 @@ impl DocCache {
 
     /// `svg` read, or the read kept from before. The lock is not held while it is read.
     fn get(&self, svg: &str) -> Result<Arc<SvgDoc>> {
-        let key = digest(|h| hash_svg(h, svg));
+        // Reading a document does not depend on the fonts it will be drawn with.
+        let key = digest_with(None, |h| hash_svg(h, svg));
         {
             let mut cache = self.0.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(at) = cache.iter().position(|(k, _)| *k == key) {
@@ -1072,6 +1084,7 @@ mod tests {
             opacity: 1.0,
             offset: 0.0,
             preset: None,
+            template: None,
         }
     }
 
@@ -1180,6 +1193,51 @@ mod tests {
             shifted.svg_overlays[0].end += 1.0 / 32.0;
             assert_eq!(svg_sequences(&shifted, &exact)[0].first_frame, 33);
             assert_eq!(key(&shifted, &exact), key(&tl, &exact));
+        });
+    }
+
+    #[test]
+    fn the_fonts_a_project_embeds_are_part_of_every_picture_key_and_none_leaves_it_alone() {
+        use crate::fonts::{self, EmbeddedFont};
+        crate::svg::raster::with_pinned_dir(PIN, || {
+            let (tl, _) = cut(vec![overlay(sliding(), 1.0, 3.0)]);
+            let held = {
+                let mut still = tl.clone();
+                still.svg_overlays[0].svg = doc("<rect width=\"10\" height=\"10\"/>");
+                still
+            };
+            let f = fmt(1920, 1080, 30.0);
+            let keys = |tl: &Timeline| {
+                (
+                    svg_sequences(tl, &f)[0].dir.clone(),
+                    still_svgs(tl, 960, 540, 2.0).first().map(|s| s.path.clone()),
+                )
+            };
+            assert_eq!(fonts::embedded_digest(), None);
+            let (bare, bare_held) = (keys(&tl), keys(&held));
+            // With nothing embedded a key is what it always was.
+            assert_eq!(
+                svg_sequences(&tl, &f)[0].dir.file_name().unwrap().to_str().unwrap().len(),
+                32,
+                "32 hex digits"
+            );
+            let a = EmbeddedFont::new("Zeist", fonts::shipped_font_renamed(true, "Zeist"));
+            assert!(fonts::register_embedded(std::slice::from_ref(&a)));
+            let (with_a, held_a) = (keys(&tl), keys(&held));
+            assert_ne!(with_a.0, bare.0, "a sequence drawn without the font is not served");
+            assert_ne!(with_a.1, bare.1, "nor a still");
+            assert_ne!(held_a.0, bare_held.0, "nor a held picture");
+            // The same set is the same key (a project reopened finds its frames), another set another.
+            assert!(!fonts::register_embedded(std::slice::from_ref(&a)));
+            assert_eq!(keys(&tl), with_a);
+            let b = EmbeddedFont::new("Zeyst", fonts::shipped_font_renamed(false, "Zeyst"));
+            assert!(fonts::register_embedded(std::slice::from_ref(&b)));
+            let with_ab = keys(&tl);
+            assert_ne!(with_ab.0, with_a.0);
+            // Back to nothing: the original keys, byte for byte.
+            assert!(fonts::replace_embedded(Vec::new()));
+            assert_eq!(keys(&tl), bare);
+            assert_eq!(keys(&held), bare_held);
         });
     }
 

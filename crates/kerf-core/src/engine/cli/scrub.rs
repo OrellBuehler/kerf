@@ -1388,6 +1388,7 @@ mod tests {
             opacity: 1.0,
             offset: 0.0,
             preset: None,
+            template: None,
         });
         let snap = snap_of(&timeline, &assets);
         assert!(snap.plain(88) && snap.plain(89), "just before it");

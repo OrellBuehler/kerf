@@ -224,6 +224,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at TEXT NOT NULL
 );
 
+-- Fonts the project embeds (a template's typeface travels with it), by the SHA-256 of the file.
+-- Added by schema v2 (`store::MIGRATIONS`); older files get it from the migration.
+CREATE TABLE IF NOT EXISTS fonts (
+    sha256 TEXT PRIMARY KEY,
+    family TEXT NOT NULL,
+    data   BLOB NOT NULL
+);
+
 -- Covers `claim_next_task` (WHERE status = 'queued' ORDER BY created_at LIMIT 1)
 -- and the queue/asset list sorts. Idempotent, so safe to apply to older files.
 CREATE INDEX IF NOT EXISTS idx_tasks_status_created ON tasks (status, created_at);
@@ -283,6 +291,10 @@ pub struct Project {
     recovery: Option<crate::recovery::RecoveryDir>,
     /// How many revisions the history keeps (see [`Project::set_history_limit`]).
     history_limit: usize,
+    /// The fonts this project embeds, kept beside the `fonts` table so that becoming the shared
+    /// project ([`Project::replace_with`]) can make them the drawing fonts without reading the table
+    /// under the lock. A `RefCell`, like the overrides above.
+    embedded: RefCell<Vec<crate::fonts::EmbeddedFont>>,
 }
 
 /// How many revisions a project keeps by default: every one is the whole timeline, so an
@@ -354,6 +366,7 @@ impl Project {
             edit_carried: RefCell::new(Vec::new()),
             recovery,
             history_limit: default_history_limit(),
+            embedded: RefCell::new(Vec::new()),
         }
     }
 
@@ -436,12 +449,19 @@ impl Project {
     /// new epoch. Call it under the lock the shared project sits behind, so no reader sees the new
     /// project under the old epoch either.
     ///
+    /// The swap also makes `other`'s embedded fonts the ones titles are drawn with (they were registered
+    /// when it was opened, but another project may have been opened or edited since), from what it
+    /// already holds in memory: no table is read under the lock.
+    ///
     /// Returns the project replaced, for the caller to [`Self::close`] once it has released the
     /// lock — closing deletes an untitled one's recovery directory, since replacing it means it
     /// was saved, recovered into another, or let go.
     #[must_use = "close the replaced project once the lock is released"]
     pub fn replace_with(&mut self, other: Project) -> Project {
         let old = std::mem::replace(self, other);
+        // The fonts titles are drawn with are the active project's, whatever another project registered
+        // between this one being opened and being swapped in.
+        self.activate_fonts();
         crate::plan_epoch::bump_plan_epoch();
         old
     }
@@ -534,6 +554,7 @@ impl Project {
                     "this project was made by an older Kerf and needs upgrading, but its file is read-only — copy it somewhere you can write to and open the copy".into(),
                 ));
             }
+            self.register_fonts_logged();
             return Ok(());
         }
         if !blank && found < store::SCHEMA_VERSION {
@@ -576,7 +597,16 @@ impl Project {
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('created_at', ?1)",
             params![Utc::now().to_rfc3339()],
         )?;
+        self.register_fonts_logged();
         Ok(())
+    }
+
+    /// Opening a project makes its embedded fonts the ones titles are drawn with. A project whose fonts
+    /// cannot be read still opens: its titles fall back to the installed ones.
+    fn register_fonts_logged(&self) {
+        if let Err(e) = self.register_fonts() {
+            tracing::warn!(error = %e, "could not read the fonts this project embeds");
+        }
     }
 
     // ---- meta -------------------------------------------------------------
@@ -4819,6 +4849,7 @@ impl Project {
             opacity,
             offset: 0.0,
             preset,
+            template: None,
         };
         self.edit_timeline("Add animated title", move |timeline| {
             if timeline.svg_overlays.len() >= MAX_SVG_OVERLAYS {
@@ -4894,6 +4925,8 @@ impl Project {
             if let Some(doc) = &doc {
                 o.svg = doc.sanitized().to_string();
                 o.preset = None;
+                // New artwork: the controls point into the old one.
+                o.template = None;
                 warnings = doc.warnings().to_vec();
                 regenerate = false;
             } else if patch.preset_params.is_some() || patch.preset_kind.is_some() {
@@ -5655,6 +5688,7 @@ mod store;
 pub use store::{backup_path as schema_backup_path, SCHEMA_VERSION};
 mod exports;
 pub use exports::{DeliveryInputs, ExportedFile};
+mod templates;
 
 #[cfg(test)]
 mod linked_tests;
