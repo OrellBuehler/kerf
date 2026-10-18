@@ -341,7 +341,13 @@ fn an_asset_remembers_its_score_across_a_save_and_a_reopen() {
     project.insert_asset(&a).unwrap();
     let path = std::env::temp_dir().join(format!("kerf-music-{}.kerf", Uuid::new_v4()));
     project.save_as(&path).unwrap();
-    let loaded = Project::open(&path).unwrap().list_assets().unwrap().remove(0);
+    let Some(loaded) = Project::open(&path)
+        .ok()
+        .and_then(|p| p.list_assets().ok())
+        .and_then(|a| a.into_iter().next())
+    else {
+        panic!("the reopened project lists the asset");
+    };
     std::fs::remove_file(&path).ok();
     assert_eq!(loaded.music_score, Some(s));
     // An asset that was not composed has none, and its JSON omits the key.
@@ -428,7 +434,7 @@ fn a_clip_is_measured_over_its_source_range_at_its_gain() {
             assert_eq!((*start, *secs), (4.0, 6.0));
             assert!((*gain - 0.5).abs() < 1e-6);
         }
-        other => panic!("{other:?}"),
+        _ => panic!("a clip is measured from its file"),
     }
     // The score's sections, cut to the clip's source range: the drop from 4 s to 10 s.
     assert_eq!(plan.windows.len(), 1);
@@ -518,12 +524,9 @@ fn a_composed_score_is_rendered_placed_and_measured_by_section() {
     let (intro, drop) = (&balance.windows[0], &balance.windows[1]);
     assert_eq!((intro.label.as_deref(), drop.label.as_deref()), (Some("intro"), Some("drop")));
     // The drop has the beat and the bass; the intro is a pad: the drop is the louder and carries more low end.
-    assert!(
-        drop.loudness_lufs.unwrap() > intro.loudness_lufs.unwrap() + 3.0,
-        "{intro:?} {drop:?}"
-    );
+    assert!(drop.loudness_lufs.unwrap() > intro.loudness_lufs.unwrap() + 3.0);
     let low = |w: &crate::engine::WindowBalance| w.bands[0].share_pct + w.bands[1].share_pct;
-    assert!(low(drop) > low(intro), "{} vs {}", low(drop), low(intro));
+    assert!(low(drop) > low(intro));
     assert!(balance.overall.rms_dbfs.unwrap() < -8.0);
 
     // Composing it again with the score edited swaps the clip's audio, and the mix measures too.
