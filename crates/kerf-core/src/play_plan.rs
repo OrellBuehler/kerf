@@ -251,7 +251,7 @@ impl PlayCut {
     }
 
     /// What a drawn plan still costs too much to play: see [`PlayRefusal`].
-    fn playing_refusal(&self, plan: &RenderPlan) -> Option<PlayRefusal> {
+    pub fn playing_refusal(&self, plan: &RenderPlan) -> Option<PlayRefusal> {
         if let Some(layer) = plan.layers.iter().find(|l| l.timing.reversed && !l.is_image) {
             return Some(PlayRefusal::Reversed(layer.name.clone()));
         }

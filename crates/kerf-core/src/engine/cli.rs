@@ -7587,6 +7587,28 @@ pub fn timeline_frame(
     run_still(timeline, assets, opts, t, max_width, None, &StillOutput::JpegPipe { quality })
 }
 
+/// The composited still at `t` as its Y'CbCr samples: limited-range 4:4:4 planes (Y, then Cb,
+/// then Cr) of the frame [`timeline_frame`] would encode, with its size. The scopes read this
+/// rather than an RGB conversion, whose matrix is the composite's and not the delivery's.
+pub fn timeline_frame_yuv(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    max_width: u32,
+) -> Result<(u32, u32, Vec<u8>)> {
+    let fmt = export_format(&timeline.for_render(), assets, opts);
+    let (w, h) = still_size(fmt.width, fmt.height, max_width);
+    let planes = run_still(timeline, assets, opts, t, max_width, None, &StillOutput::Yuv444Pipe)?;
+    if planes.len() != (w as usize) * (h as usize) * 3 {
+        return Err(Error::Engine(format!(
+            "could not render timeline frame at {t:.3}s: {} bytes for a {w}x{h} frame",
+            planes.len()
+        )));
+    }
+    Ok((w, h, planes))
+}
+
 /// [`timeline_frame`] of one `region` of the composited canvas. The canvas is
 /// rendered large enough that the region alone comes out `max_width` wide
 /// (capped at the delivery frame, so nothing is invented), then cropped — a
@@ -7815,6 +7837,8 @@ pub enum StillOutput {
     /// Raw `rgb24` on stdout — only for [`composite_color_policy`]'s probe, which
     /// wants the converted pixels themselves.
     RgbPipe,
+    /// Raw planar `yuv444p` on stdout — [`timeline_frame_yuv`], for the scopes.
+    Yuv444Pipe,
 }
 
 /// The image formats a cover frame can be written as.
@@ -7869,6 +7893,9 @@ impl StillOutput {
             }
             StillOutput::RgbPipe => {
                 a.extend(["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"].map(String::from));
+            }
+            StillOutput::Yuv444Pipe => {
+                a.extend(["-f", "rawvideo", "-pix_fmt", "yuv444p", "pipe:1"].map(String::from));
             }
             StillOutput::File { path, format, quality } => {
                 if *format == ImageFormat::Jpeg {

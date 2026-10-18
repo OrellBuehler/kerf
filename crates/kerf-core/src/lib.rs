@@ -22,7 +22,9 @@ pub mod platform;
 pub mod play_plan;
 pub mod project;
 pub mod proxy;
+pub mod render_bar;
 pub mod render_plan;
+pub mod scopes;
 
 mod engine;
 
