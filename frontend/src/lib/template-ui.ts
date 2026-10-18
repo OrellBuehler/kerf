@@ -4,6 +4,7 @@
 // label, the attribute a kind of control most likely sets, the refusals the engine will make said before the
 // round trip, and the words around an outcome. The engine stays the authority: nothing here is the only check.
 
+import { SVG_COLOUR_NAMES } from './svg-color-names';
 import type { ImportOutcome, SvgElementId, TemplateControl, TemplateInfo, TemplateKind, TemplateSaved } from './types';
 
 // ---- limits (kerf-core `template/validate.rs`) ----------------------------------------------------
@@ -70,6 +71,10 @@ export function forbiddenAttribute(name: string): boolean {
 
 const ATTRIBUTE_NAME = /^(?:xlink:)?[A-Za-z_][A-Za-z0-9_.-]{0,63}$/;
 
+/** A control character other than a tab or a line break (`has_control_chars`): XML cannot carry them, and a name, a
+ *  description or a label should not either. */
+export const hasControlChars = (text: string): boolean => /\p{Cc}/u.test(text.replace(/[\t\n]/g, ''));
+
 // ---- ids ------------------------------------------------------------------------------------------
 
 /** `[A-Za-z][A-Za-z0-9_-]{0,63}`: a control's id is a key in JSON and a name in a tool call. */
@@ -121,6 +126,43 @@ export function numericAttributes(svg: string, elementId: string): string[] {
 }
 
 const PLAIN_NUMBER = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
+
+// Which element holds which, read from the same source: a walk of the tags with a stack, comments, CDATA and
+// processing instructions skipped. A control that replaces an element's text replaces what is inside it.
+
+const TAG_TOKEN =
+	/<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\?[\s\S]*?\?>|<![^>]*>|<\/([A-Za-z_][\w:.-]*)\s*>|<([A-Za-z_][\w:.-]*)((?:"[^"]*"|'[^']*'|[^'">])*?)(\/?)>/g;
+
+let nested: { svg: string; found: Map<string, string[][]> } | null = null;
+
+/** For each element id, the ids of the elements above it (one list per element that carries the id), outermost first. */
+function idsAbove(svg: string): Map<string, string[][]> {
+	if (nested?.svg === svg) return nested.found;
+	const found = new Map<string, string[][]>();
+	const open: (string | null)[] = [];
+	for (const m of svg.matchAll(TAG_TOKEN)) {
+		if (m[1] !== undefined) {
+			open.pop();
+			continue;
+		}
+		if (m[2] === undefined) continue;
+		let id: string | null = null;
+		for (const a of m[3].matchAll(ATTRIBUTE)) {
+			if (a[1] === 'id') {
+				id = a[2] ?? a[3] ?? '';
+				break;
+			}
+		}
+		if (id !== null) found.set(id, [...(found.get(id) ?? []), open.filter((x): x is string => x !== null)]);
+		if (m[4] !== '/') open.push(id);
+	}
+	nested = { svg, found };
+	return found;
+}
+
+/** Whether the element `outer` has the element `inner` somewhere inside it (an element does not hold itself). */
+export const holds = (svg: string, outer: string, inner: string): boolean =>
+	outer !== inner && (idsAbove(svg).get(inner) ?? []).some((above) => above.includes(outer));
 
 const DATA_IMAGE = /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/i;
 
@@ -177,17 +219,29 @@ export function defaultAttribute(kind: TemplateKind, tag: string, present: Reado
 	}
 }
 
+const fits = (kind: TemplateKind, tag: string): boolean => (kind === 'text' ? TEXT_TAGS.includes(tag) : kind === 'image' ? tag === 'image' : true);
+
+/** The ids that more than one element carries, with how many do: an engine refuses to aim a control at one of them. */
+export function duplicateIds(elements: readonly SvgElementId[]): Map<string, number> {
+	const counts = new Map<string, number>();
+	for (const e of elements) counts.set(e.id, (counts.get(e.id) ?? 0) + 1);
+	for (const [id, n] of counts) if (n < 2) counts.delete(id);
+	return counts;
+}
+
 /** The elements a kind can aim at, in the title's order: text at a text element, an image at an `<image>`, anything
- *  else at any element with an id. */
+ *  else at any element with an id. An id that two or more elements carry is not targetable (`ambiguousFor` lists them). */
 export function elementsFor(kind: TemplateKind, elements: readonly SvgElementId[]): SvgElementId[] {
-	const seen = new Set<string>();
-	return elements.filter((e) => {
-		if (seen.has(e.id)) return false;
-		seen.add(e.id);
-		if (kind === 'text') return TEXT_TAGS.includes(e.tag);
-		if (kind === 'image') return e.tag === 'image';
-		return true;
-	});
+	const dup = duplicateIds(elements);
+	return elements.filter((e) => !dup.has(e.id) && fits(kind, e.tag));
+}
+
+/** The ids a kind could aim at by what they are, but that more than one element carries, each once with how many do:
+ *  shown apart, not offered, so they are not simply missing. */
+export function ambiguousFor(kind: TemplateKind, elements: readonly SvgElementId[]): { id: string; count: number }[] {
+	return [...duplicateIds(elements)]
+		.filter(([id]) => elements.some((e) => e.id === id && fits(kind, e.tag)))
+		.map(([id, count]) => ({ id, count }));
 }
 
 // ---- the dialog's draft ---------------------------------------------------------------------------
@@ -277,6 +331,10 @@ function bound(text: string): number | undefined {
 	return Number.isFinite(n) ? n : undefined;
 }
 
+/** The id was typed in: from now on the label leaves it alone. Emptied, it stays empty (`controlProblem` says so) — it is
+ *  not rewritten from the label under the caret. */
+export const editId = (d: DraftControl, id: string): DraftControl => ({ ...d, id, idTouched: true });
+
 /** The label changed: the id follows it until the id has been edited by hand, kept clear of the others' ids. */
 export function relabel(d: DraftControl, label: string, others: readonly DraftControl[]): DraftControl {
 	if (d.idTouched) return { ...d, label };
@@ -328,7 +386,9 @@ export function controlProblem(d: DraftControl, all: readonly DraftControl[], ct
 	const label = d.label.trim();
 	if (!label) return 'Give it a label: it is what you read next to the field.';
 	if ([...label].length > MAX_LABEL_CHARS) return `A label is at most ${MAX_LABEL_CHARS} characters.`;
+	if (hasControlChars(label)) return 'A label cannot have control characters in it.';
 	const id = d.id.trim();
+	if (!id) return 'Give it an id: it is how an agent or a script names this control.';
 	if (!isControlId(id)) {
 		return `The id starts with a letter, then letters, digits, - or _ (${MAX_ID_CHARS} at most).`;
 	}
@@ -338,6 +398,8 @@ export function controlProblem(d: DraftControl, all: readonly DraftControl[], ct
 		if (!t.element) return 'Pick the element it changes.';
 		const tag = ctx.elements.find((e) => e.id === t.element)?.tag;
 		if (tag === undefined) return `The title has no element with the id “${t.element}”.`;
+		const used = ctx.elements.filter((e) => e.id === t.element).length;
+		if (used > 1) return `${used} elements are called “${t.element}”: give each its own id in the SVG source first.`;
 		if (d.kind === 'text' && !TEXT_TAGS.includes(tag)) return `“${t.element}” is a <${tag}>, not text: aim a text control at a <text> or <tspan>.`;
 		if (d.kind === 'image' && tag !== 'image') return `“${t.element}” is a <${tag}>, not an <image>.`;
 		if (!takesAttribute(d.kind)) continue;
@@ -371,6 +433,18 @@ export function controlProblem(d: DraftControl, all: readonly DraftControl[], ct
 			return `“${o.label.trim() || o.id}” already sets ${what}.`;
 		}
 	}
+	// A control that replaces an element's text replaces what is inside it, including another control's target.
+	if (d.kind === 'text') {
+		for (const t of d.targets) {
+			if (!t.element) continue;
+			for (const o of all) {
+				const inner = o.targets.find((u) => u.element && holds(ctx.svg, t.element, u.element));
+				if (!inner) continue;
+				const by = o.key === d.key ? 'this control also' : `“${o.label.trim() || o.id}”`;
+				return `This control replaces the text of “${t.element}”, and that holds “${inner.element}”, which ${by} sets. Aim it at the inner text, or drop one of them.`;
+			}
+		}
+	}
 	return null;
 }
 
@@ -385,13 +459,21 @@ export interface DraftCheck {
 }
 
 export function checkDraft(name: string, description: string, drafts: readonly DraftControl[], ctx: DraftContext): DraftCheck {
+	// A blank name is the title's own: the engine takes it (`build_template`), so only a bad one is refused.
 	const n = name.trim();
-	const nameProblem = !n
-		? 'Give the template a name.'
-		: [...n].length > MAX_NAME_CHARS
+	const nameProblem =
+		[...n].length > MAX_NAME_CHARS
 			? `A name is at most ${MAX_NAME_CHARS} characters.`
-			: null;
-	const descriptionProblem = [...description].length > MAX_DESCRIPTION_CHARS ? `A description is at most ${MAX_DESCRIPTION_CHARS} characters.` : null;
+			: hasControlChars(n)
+				? 'A name cannot have control characters in it.'
+				: null;
+	const about = description.trim();
+	const descriptionProblem =
+		[...about].length > MAX_DESCRIPTION_CHARS
+			? `A description is at most ${MAX_DESCRIPTION_CHARS} characters.`
+			: hasControlChars(about)
+				? 'A description cannot have control characters in it.'
+				: null;
 	const controls = drafts.map((d) => controlProblem(d, drafts, ctx));
 	const tooMany = drafts.length > MAX_CONTROLS;
 	return { name: nameProblem, description: descriptionProblem, controls, ok: !nameProblem && !descriptionProblem && !tooMany && controls.every((c) => c === null) };
@@ -405,6 +487,15 @@ export function targetsLine(control: Pick<TemplateControl, 'targets'>): string {
 
 // ---- values ---------------------------------------------------------------------------------------
 
+/** A colour a `color` control may write (`valid_svg_color`): `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`, one of SVG's colour
+ *  names (any case: the engine's reader lowercases it), `none` or `currentColor` spelled so. Nothing with a function in
+ *  it, a `@` or a `0x`: those are FFmpeg's spellings. `color` is trimmed already. */
+export function validSvgColor(color: string): boolean {
+	if (color.startsWith('#')) return /^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(color);
+	if (color === 'none' || color === 'currentColor') return true;
+	return /^[A-Za-z]+$/.test(color) && SVG_COLOUR_NAMES.has(color.toLowerCase());
+}
+
 /** Why the engine would refuse `raw` for this control, in words for the field, or `null`. Text is taken as typed;
  *  the others are trimmed first (`normalizeValue`). */
 export function valueRefusal(control: Pick<TemplateControl, 'kind' | 'min' | 'max'>, raw: string): string | null {
@@ -415,8 +506,9 @@ export function valueRefusal(control: Pick<TemplateControl, 'kind' | 'min' | 'ma
 			return null;
 		case 'color': {
 			const c = raw.trim();
+			if (validSvgColor(c)) return null;
 			if (/^(?:rgba?|hsla?)\(/i.test(c)) return 'Write the color as #rrggbb (or #rrggbbaa), not as a function.';
-			if (/^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(c) || /^[A-Za-z]+$/.test(c)) return null;
+			if (/^[A-Za-z]+$/.test(c)) return `“${c}” is not a color name SVG knows. Use #rrggbb, #rgb or #rrggbbaa, a name, none or currentColor.`;
 			return 'Use #rrggbb, #rgb or #rrggbbaa, a color name, none or currentColor.';
 		}
 		case 'number': {

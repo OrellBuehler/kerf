@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
 	addTarget,
+	ambiguousFor,
 	appliedLine,
 	attributeChoices,
 	changeKind,
@@ -10,10 +11,13 @@ import {
 	defaultAttribute,
 	deleteMessage,
 	draftFrom,
+	duplicateIds,
+	editId,
 	elementAttributes,
 	elementsFor,
 	exportFileName,
 	fontsLine,
+	holds,
 	imageHref,
 	importLine,
 	isControlId,
@@ -32,6 +36,7 @@ import {
 	targetsLine,
 	templateTooltip,
 	toControl,
+	validSvgColor,
 	valueRefusal,
 	type DraftContext,
 	type DraftControl
@@ -180,7 +185,7 @@ describe('which attribute a control sets', () => {
 		expect(elementsFor('text', ELEMENTS).map((e) => e.id)).toEqual(['headline']);
 		expect(elementsFor('image', ELEMENTS).map((e) => e.id)).toEqual(['logo', 'old']);
 		expect(elementsFor('color', ELEMENTS)).toHaveLength(ELEMENTS.length);
-		expect(elementsFor('number', [...ELEMENTS, { id: 'dot', tag: 'circle' }])).toHaveLength(ELEMENTS.length);
+		expect(elementsFor('number', [...ELEMENTS, { id: 'extra', tag: 'circle' }])).toHaveLength(ELEMENTS.length + 1);
 	});
 });
 
@@ -192,6 +197,16 @@ describe('drafting a control', () => {
 		expect(relabel(newDraft(3, ctx), 'Brand colour', [other]).id).toBe('brand-colour-2');
 		expect(relabel({ ...a, idTouched: true }, 'Something else', []).id).toBe('brand-colour');
 		expect(relabel(a, '   ', []).id).toBe('');
+	});
+
+	test('an id typed in, or emptied, is left as it is: the label never rewrites it again', () => {
+		const a = relabel(newDraft(1, ctx), 'Brand colour', []);
+		const typed = editId(a, 'logo-colour');
+		expect(typed).toMatchObject({ id: 'logo-colour', idTouched: true });
+		const emptied = editId(typed, '');
+		expect(emptied).toMatchObject({ id: '', idTouched: true });
+		expect(relabel(emptied, 'Another label', []).id).toBe('');
+		expect(controlProblem(emptied, [emptied], ctx)).toContain('Give it an id');
 	});
 
 	test('a new control with a single choice of element has it picked', () => {
@@ -333,17 +348,153 @@ describe('what is wrong with a control', () => {
 	test('the whole form: a name, and every control clear', () => {
 		const good = checkDraft('End card', '', [draft()], ctx);
 		expect(good).toEqual({ name: null, description: null, controls: [null], ok: true });
-		expect(checkDraft('  ', '', [], ctx)).toMatchObject({ name: expect.stringContaining('name'), ok: false });
+		expect(checkDraft('  ', '', [], ctx)).toEqual({ name: null, description: null, controls: [], ok: true });
 		expect(checkDraft('x'.repeat(121), '', [], ctx).name).toContain('120');
 		expect(checkDraft('Card', 'y'.repeat(2001), [], ctx).ok).toBe(false);
 		expect(checkDraft('Card', '', [draft({ label: '' })], ctx).ok).toBe(false);
 		expect(checkDraft('Card', '', [], ctx).ok).toBe(true);
 	});
 
+	test('a blank name is allowed: the engine takes the title’s own, as `build_template` has it', () => {
+		expect(checkDraft('', '', [draft()], ctx).ok).toBe(true);
+		expect(checkDraft('   ', '  ', [], ctx).ok).toBe(true);
+	});
+
+	test('no control characters in a name, a description or a label (a tab and a line break are fine)', () => {
+		expect(checkDraft('Car\u0007d', '', [], ctx).name).toContain('control characters');
+		expect(checkDraft('Card', 'a\u0000b', [], ctx).description).toContain('control characters');
+		expect(checkDraft('Card', 'two\nlines\tand a tab', [], ctx).ok).toBe(true);
+		expect(checkDraft('A\tB', '', [], ctx).ok).toBe(true);
+		expect(controlProblem(draft({ label: 'Tag\u001Bline' }), [], ctx)).toContain('control characters');
+		expect(controlProblem(draft({ label: 'Tag\tline' }), [], ctx)).toBeNull();
+	});
+
+	test('lengths are counted on the trimmed text, in characters, as the engine does', () => {
+		expect(checkDraft(`  ${'x'.repeat(120)}  `, '', [], ctx).name).toBeNull();
+		expect(checkDraft('x'.repeat(121), '', [], ctx).name).toContain('120');
+		expect(checkDraft('Card', `${'y'.repeat(2000)}   `, [], ctx).description).toBeNull();
+		expect(checkDraft('Card', '', [draft({ label: '😀'.repeat(80) })], ctx).ok).toBe(true);
+		expect(checkDraft('Card', '', [draft({ label: '😀'.repeat(81) })], ctx).ok).toBe(false);
+	});
+
 	test('a control is described by where it writes', () => {
 		expect(targetsLine({ targets: [{ element: 'headline' }] })).toBe('text of headline');
 		expect(targetsLine({ targets: [{ element: 'top', attribute: 'stop-color' }] })).toBe('stop-color of top');
 		expect(targetsLine({ targets: [{ element: 'a' }, { element: 'b' }, { element: 'c' }, { element: 'd' }] })).toBe('text of a, text of b +2');
+	});
+});
+
+describe('an id more than one element carries', () => {
+	const dupes = [
+		{ id: 'title', tag: 'text' },
+		{ id: 'title', tag: 'text' },
+		{ id: 'sub', tag: 'text' },
+		{ id: 'bar', tag: 'rect' },
+		{ id: 'bar', tag: 'circle' },
+		{ id: 'logo', tag: 'image' }
+	];
+	const art = '<svg xmlns="http://www.w3.org/2000/svg"><text id="title">A</text><text id="title">B</text><text id="sub">C</text></svg>';
+	const dupCtx: DraftContext = { svg: art, elements: dupes };
+
+	test('is not offered as a target, and is listed apart with how many carry it', () => {
+		expect(duplicateIds(dupes)).toEqual(new Map([['title', 2], ['bar', 2]]));
+		expect(elementsFor('text', dupes).map((e) => e.id)).toEqual(['sub']);
+		expect(elementsFor('color', dupes).map((e) => e.id)).toEqual(['sub', 'logo']);
+		expect(ambiguousFor('text', dupes)).toEqual([{ id: 'title', count: 2 }]);
+		expect(ambiguousFor('image', dupes)).toEqual([]);
+		expect(ambiguousFor('color', dupes)).toEqual([{ id: 'title', count: 2 }, { id: 'bar', count: 2 }]);
+	});
+
+	test('is a problem for a control that already aims at it, as the engine counts the elements', () => {
+		const d = draft({ targets: [{ element: 'title', attribute: '', touched: false }] });
+		expect(controlProblem(d, [d], dupCtx)).toContain('2 elements are called “title”');
+		const ok = draft({ targets: [{ element: 'sub', attribute: '', touched: false }] });
+		expect(controlProblem(ok, [ok], dupCtx)).toBeNull();
+		expect(newDraft(1, dupCtx, 'text').targets[0].element).toBe('sub');
+	});
+});
+
+describe('text that holds another control’s target', () => {
+	const NESTED =
+		'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">' +
+		'<!-- <text id="fake"> --><g id="card"><text id="outer" fill="red">Hello <tspan id="inner" fill="blue">world</tspan></text>' +
+		'<text id="beside">x</text></g><![CDATA[ <text id="cdata"> ]]><rect id="leaf" fill="red"/></svg>';
+	const elements = [
+		{ id: 'card', tag: 'g' },
+		{ id: 'outer', tag: 'text' },
+		{ id: 'inner', tag: 'tspan' },
+		{ id: 'beside', tag: 'text' },
+		{ id: 'leaf', tag: 'rect' }
+	];
+	const nctx: DraftContext = { svg: NESTED, elements };
+	const text = (key: number, id: string, element: string) =>
+		draft({ key, id, label: id, targets: [{ element, attribute: '', touched: false }] });
+	const color = (key: number, id: string, element: string, attribute = 'fill') =>
+		draft({ key, id, label: id, kind: 'color', targets: [{ element, attribute, touched: true }] });
+
+	test('knows which element is inside which, through comments, CDATA and self-closing tags', () => {
+		expect(holds(NESTED, 'outer', 'inner')).toBe(true);
+		expect(holds(NESTED, 'card', 'inner')).toBe(true);
+		expect(holds(NESTED, 'card', 'beside')).toBe(true);
+		expect(holds(NESTED, 'card', 'leaf')).toBe(false);
+		expect(holds(NESTED, 'inner', 'outer')).toBe(false);
+		expect(holds(NESTED, 'outer', 'beside')).toBe(false);
+		expect(holds(NESTED, 'outer', 'leaf')).toBe(false);
+		expect(holds(NESTED, 'outer', 'outer')).toBe(false);
+		expect(holds(NESTED, 'outer', 'fake')).toBe(false);
+		expect(holds(NESTED, 'outer', 'nowhere')).toBe(false);
+	});
+
+	test('a text control on the outer text cannot sit beside a control on the inner element', () => {
+		const outer = text(1, 'greeting', 'outer');
+		const inner = color(2, 'accent', 'inner');
+		expect(controlProblem(outer, [outer, inner], nctx)).toContain('replaces the text of “outer”');
+		expect(controlProblem(outer, [outer, inner], nctx)).toContain('“inner”');
+		expect(controlProblem(outer, [outer, inner], nctx)).toContain('“accent”');
+		expect(checkDraft('Card', '', [outer, inner], nctx).ok).toBe(false);
+		const innerText = text(3, 'word', 'inner');
+		expect(controlProblem(outer, [outer, innerText], nctx)).toContain('“word”');
+		const group = { ...text(4, 'all', 'card'), kind: 'color' as const, targets: [{ element: 'card', attribute: 'fill', touched: true }] };
+		expect(controlProblem(outer, [outer, group], nctx)).toBeNull();
+	});
+
+	test('the order of the controls does not matter, and one control’s own targets count', () => {
+		const outer = text(1, 'greeting', 'outer');
+		const inner = color(2, 'accent', 'inner');
+		expect(controlProblem(outer, [inner, outer], nctx)).toContain('replaces the text of “outer”');
+		const both = draft({ targets: [{ element: 'outer', attribute: '', touched: false }, { element: 'inner', attribute: '', touched: false }] });
+		expect(controlProblem(both, [both], nctx)).toContain('this control also sets');
+	});
+
+	test('neighbours and the inner control’s own fill on the outer element are fine', () => {
+		const outer = text(1, 'greeting', 'outer');
+		const beside = text(2, 'other', 'beside');
+		const fill = color(3, 'ink', 'outer');
+		const leaf = color(4, 'leaf', 'leaf');
+		expect(controlProblem(outer, [outer, beside, fill, leaf], nctx)).toBeNull();
+		expect(checkDraft('Card', '', [outer, beside, fill, leaf], nctx).ok).toBe(true);
+	});
+});
+
+describe('a color the engine takes', () => {
+	test('hex in its four lengths, the SVG names in any case, none and currentColor spelled so', () => {
+		for (const ok of ['#fff', '#FFFF', '#ffffff', '#FFFFFF80', 'red', 'RED', 'CornflowerBlue', 'transparent', 'none', 'currentColor']) {
+			expect(validSvgColor(ok)).toBe(true);
+		}
+	});
+
+	test('nothing else: not a word SVG does not know, a function, a hex of another length, FFmpeg’s spellings', () => {
+		for (const bad of ['', '#', '#ggg', '#12', '#12345', '#1234567', 'reddish', 'rgb', 'None', 'currentcolor', 'CURRENTCOLOR', 'rgb(1,2,3)', 'hsl(10 40% 30%)', 'red@0.5', '0xff0000', 'red;', 'red blue', 'a(b)', '"red"', 'javascript:1']) {
+			expect(validSvgColor(bad)).toBe(false);
+		}
+	});
+
+	test('a field says why in words: a function, a word SVG does not know, anything else', () => {
+		expect(valueRefusal({ kind: 'color' }, 'reddish')).toContain('not a color name');
+		expect(valueRefusal({ kind: 'color' }, 'rgb(1, 2, 3)')).toContain('not as a function');
+		expect(valueRefusal({ kind: 'color' }, 'None')).not.toBeNull();
+		expect(valueRefusal({ kind: 'color' }, ' CornflowerBlue ')).toBeNull();
+		expect(valueRefusal({ kind: 'color' }, '#12345')).toContain('#rrggbb');
 	});
 });
 

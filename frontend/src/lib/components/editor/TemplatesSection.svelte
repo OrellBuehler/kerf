@@ -1,8 +1,9 @@
 <script lang="ts">
 	// The Templates section of the Titles controls: the library of motion templates (an animated title kept with the
 	// parts that can change — a tagline, a brand color, a logo), a card each, and the way in from a `.kerftemplate`
-	// file. It reads the library when it opens, after its own actions and on `templates-changed` (a save, an import
-	// or a delete, the app's or an agent's). A file in the library that would not read is listed, not hidden.
+	// file. It reads the library when it opens and on `templates-changed` (a save, an import or a delete, the app's
+	// own — announced by `api.ts` — or an agent's), so every mounted grid hears it. A file in the library that would
+	// not read is listed, not hidden.
 	import Btn from './Btn.svelte';
 	import EmptyState from './EmptyState.svelte';
 	import Icon from './Icon.svelte';
@@ -53,7 +54,7 @@
 		if (importing) return;
 		importing = true;
 		try {
-			if (await importTemplateFile()) await load();
+			await importTemplateFile();
 		} finally {
 			importing = false;
 		}
@@ -79,7 +80,7 @@
 <div data-templates style="margin-bottom:14px">
 	{#if failed}
 		<div role="alert" style="font-size:12px;line-height:1.4;color:var(--text-muted)">
-			Couldn't read your templates — {failed}
+			Couldn't read your templates — {tidyReason(failed)}
 			<Btn size="sm" variant="ghost" onclick={() => void load()}>Try again</Btn>
 		</div>
 	{:else if list && templates.length === 0}
@@ -94,7 +95,7 @@
 	{:else if templates.length > 0}
 		<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:6px">
 			{#each templates as t (t.id)}
-				<TemplateCard info={t} {aspect} changed={() => void load()} />
+				<TemplateCard info={t} {aspect} />
 			{/each}
 		</div>
 	{/if}

@@ -2957,10 +2957,12 @@ export async function saveTemplate(
 ): Promise<TemplateSaved> {
 	if (!inTauri()) {
 		const saved = saveTemplateFrom(devTimeline, overlayId, name, description, controls);
-		noteTemplatesChangedDev();
+		noteTemplatesChanged();
 		return saved;
 	}
-	return invoke<TemplateSaved>('save_template', { overlayId, name, description: description ?? null, controls });
+	const saved = await invoke<TemplateSaved>('save_template', { overlayId, name, description: description ?? null, controls });
+	noteTemplatesChanged();
+	return saved;
 }
 
 /** Add a library template to the timeline as an animated title from `start` to `end` (default: its own
@@ -2998,12 +3000,9 @@ export async function setTemplateValues(overlayId: string, values: Record<string
 /** Bring a `.kerftemplate` file into the library. Never overwrites: the same template is `already_present`,
  *  another one with its id is kept under a new id (`added_as_copy`). */
 export async function importTemplate(path: string): Promise<ImportOutcome> {
-	if (!inTauri()) {
-		const outcome = importTemplateDev(path);
-		if (outcome.status !== 'already_present') noteTemplatesChangedDev();
-		return outcome;
-	}
-	return invoke<ImportOutcome>('import_template', { path });
+	const outcome = inTauri() ? await invoke<ImportOutcome>('import_template', { path }) : importTemplateDev(path);
+	if (outcome.status !== 'already_present') noteTemplatesChanged();
+	return outcome;
 }
 
 /** Write a library template to `path` (a folder gets `<name>.kerftemplate` in it, a path without an
@@ -3015,26 +3014,33 @@ export async function exportTemplate(templateId: string, path: string): Promise<
 
 /** Remove a template from the library. Titles already made from it keep working. */
 export async function deleteTemplate(templateId: string): Promise<void> {
-	if (!inTauri()) {
-		deleteTemplateDev(templateId);
-		noteTemplatesChangedDev();
-		return;
-	}
-	return invoke<void>('delete_template', { templateId });
+	if (inTauri()) await invoke<void>('delete_template', { templateId });
+	else deleteTemplateDev(templateId);
+	noteTemplatesChanged();
 }
 
-const devTemplateListeners = new Set<() => void>();
-const noteTemplatesChangedDev = () => devTemplateListeners.forEach((cb) => cb());
+const templateListeners = new Set<() => void>();
+/** The page's own save, import or delete went through. The backend's `templates-changed` is an agent's doing (the MCP
+ *  tools): the Tauri commands the GUI calls emit nothing, so every mounted grid would stay as it was. */
+const noteTemplatesChanged = () => [...templateListeners].forEach((cb) => cb());
 
-/** Subscribe to `templates-changed`: the library gained, lost or replaced a template (a save, an import, a delete: the
- *  GUI's own and an agent's). Returns an unlisten fn. The browser harness announces its own saves, imports and deletes. */
+/** Subscribe to `templates-changed`: the library gained, lost or replaced a template. Fires for an agent's change (the
+ *  backend's event) and for this page's own save, import and delete (announced here once the call has resolved, in the
+ *  app and in the harness alike), so every mounted listener hears both. Returns an unlisten fn. */
 export async function onTemplatesChanged(cb: () => void): Promise<() => void> {
-	if (!inTauri()) {
-		devTemplateListeners.add(cb);
-		return () => void devTemplateListeners.delete(cb);
+	templateListeners.add(cb);
+	if (!inTauri()) return () => void templateListeners.delete(cb);
+	try {
+		const { listen } = await import('@tauri-apps/api/event');
+		const off = await listen('templates-changed', () => cb());
+		return () => {
+			templateListeners.delete(cb);
+			off();
+		};
+	} catch (e) {
+		templateListeners.delete(cb);
+		throw e;
 	}
-	const { listen } = await import('@tauri-apps/api/event');
-	return listen('templates-changed', () => cb());
 }
 
 /** Pick a `.kerftemplate` to import; `null` if cancelled. The harness has no file system: it offers the template most

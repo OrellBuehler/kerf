@@ -482,7 +482,7 @@ pressed, ghost / secondary step up the surfaces, disabled is a plain outline in 
 a dimmed copy of the live look), `.k-ibtn` (`IconBtn`, the title bar's gear / bell / version chip and the
 library rail: `aria-pressed` / `aria-selected` / `data-on` is the on state, `data-tone="quiet"` the rail's
 muted rest, `data-accent` the version chip when an update waits; `IconBtn` writes `aria-pressed` only when
-it is given `active`, since a plain icon button announced as "not pressed" reads as a switch) and `.k-tab`
+it is given `active`, since a plain icon button announced as "not pressed" reads as a switch; both default to **`type="button"`** — a bare `<button>` inside a `<form>` submits it, and Enter in the Save-as-template dialog's Name field pressed "Add control" — so a form's own Save says `type="submit"`, here with `form="<id>"` from the modal's footer) and `.k-tab`
 (the workspace tabs). Everything else that is a plain `<button>` or `role=button` and keeps its colours
 inline gets one **veil** (`--hover-fill` / `--press-fill`, an inset `box-shadow` of `text-primary` that
 paints over any fill, because inline styles never set `box-shadow`), except the timeline clips, menu
@@ -1453,9 +1453,17 @@ and `import_template` never overwriting; there is no file system, so an exported
 asks well and shows the result through `<img>` data URLs only. `template-ui.ts` is the pure side (bun-tested): `slugId`
 (a control id from its label: lower case, accents dropped, `-2` past a taken one), `defaultAttribute` (a color's `stop-color`
 on a `stop`, else `fill`; an image's `href`; a font's `font-family`; a number's usual size), `elementsFor` (text at
-`text` / `tspan`, an image at `<image>`), the draft model (`DraftControl`, `relabel` / `changeKind` / `pickElement`),
+`text` / `tspan`, an image at `<image>`; an id that two or more elements carry is **not targetable** — the engine refuses it
+— and `ambiguousFor` lists it apart, as a disabled "used by N elements" option, so it is not simply missing), the draft model
+(`DraftControl`, `relabel` / `changeKind` / `pickElement` / `editId`: the id follows the label only until it has been edited,
+and an id emptied by hand stays empty and says so instead of snapping back to the slug),
 `controlProblem` / `checkDraft` (kerf-core's `validate_controls` said before the round trip — the engine still has the last
-word), `valueRefusal` / `normalizeValue` / `plainDecimal` (a value as the engine takes it: numbers unitless, plain decimal),
+word: ids, targets and attributes, **text that holds another control's target** — `holds`, a walk of the source's tags with a
+stack —, control characters in a name, description or label, lengths in characters of the trimmed text; a **blank name is
+allowed**, `build_template` takes the title's own), `valueRefusal` / `validSvgColor` / `normalizeValue` / `plainDecimal` (a
+value as the engine takes it: numbers unitless, plain decimal; a color is `valid_svg_color` exactly — four hex lengths, one of
+the 148 `svgtypes` names in any case (`svg-color-names.ts`, shared with the harness), `none`, `currentColor` spelled so,
+nothing else),
 `pickColor` / `swatchOf`, and the words (`savedLine`, `importLine`, `appliedLine`). It reads a title's *source* only for
 names and values (`elementAttributes`, `imageHref`: a regular-expression walk of the start tags, so an element is offered
 the attribute it has; a picture is shown only if it is a `data:image/png|jpeg|gif|webp` URL). `template-actions.ts` runs
@@ -1465,29 +1473,35 @@ them (`addTemplateHere`, `importTemplateFile`, `exportTemplateFile`, `deleteTemp
 the `TemplateEdit`'s timeline like any edit and the first selects the new title. **Library**: `TemplatesSection` is part
 of `TitlesControls`, so the Titles tab and the Inspector's Titles lane both have it: an `Import…` ghost button on the
 `TEMPLATES` heading, one `TemplateCard` each (poster in the delivery frame's shape, the duration as a chip over it, name,
-`N controls`, font families; a click adds it at the playhead; the `⋯` button and a right-click offer *Add at the
+`N controls`, font families; a click adds it at the playhead; the `⋯` button (named "More actions for <name>") and a right-click offer *Add at the
 playhead*, *Export…* — a save dialog for `.kerftemplate`, the harness answers `/harness/<name>` and keeps the "file" for
-`importTemplate` — and *Delete…* — confirmed, titles made from it keep working). The grid reads the library when it opens,
-after its own actions and on `templates-changed` (`onTemplatesChanged`; the harness announces its own saves, imports and
-deletes); `problems` are a collapsed one-line `<details>`; an empty library explains how to make one. There is no drag to
+`importTemplate` — and *Delete…* — confirmed, titles made from it keep working). The grid reads the library when it opens
+and on `templates-changed` (`onTemplatesChanged`), which fires for the backend's event (an agent's change: the Tauri
+commands emit none) **and** for the page's own save, import and delete — `api.ts` announces them once the call has
+resolved, in the app and in the harness alike — so every mounted grid (the Titles tab, the Inspector's lane) refreshes; `problems` are a collapsed one-line `<details>`; an empty library explains how to make one. There is no drag to
 the timeline: the preset tiles have none either. **Save as template…** (`SaveTemplateDialog` over `Modal`; `ui.saveTemplateDialog`,
-mounted by the page and counted in `modalOpen`): name (blank = the title's own name, as the engine has it), description, and
-a list of controls (`TemplateControlEditor`): label, kind, an id that follows the label until edited, the element(s)
+mounted by the page and counted in `modalOpen`): name (blank = the title's own name, as the engine has it; it is the field's placeholder), description, and
+a list of controls (`TemplateControlEditor`; every field of a row is named by its control's label, or `control N` before it has
+one): label, kind, an id that follows the label until edited, the element(s)
 from `svgElementIds` (`id · tag`, only those the kind can aim at), the attribute (a select for color / image, fixed for
 font, none for text, free with the element's own numeric attributes as suggestions for a number), min / max for a
-number; each control's problem is under it and Save waits on all; the engine's refusal is shown in the dialog and its
+number; each control's problem is under it and Save waits on all — Save is the form's submit button, so Enter in a field saves
+once nothing is wrong; the engine's refusal (through `tidyReason`) is shown in the dialog and its
 warnings (a font that could not be embedded) in a toast. A title that is itself from a template starts with its
 controls. **Inspector**: an animated title gets a **Template** section (`TemplateSection`) — first, above Timing, when it
 came from a template (a field per control: text, a swatch + hex field, a number with its `min` / `max`, a font select
 over `ui.availableFonts`, an image thumbnail + *Choose image…* → `pickImageFile` → `templateImageValue`; one
-`set_template_values` edit per committed change — `change` / blur, never per keystroke, to the title the field took focus
-on (`FieldEdits`), unchanged values write nothing, a refused one toasts and puts the field back; a control whose
+`set_template_values` edit per committed change — text, color and font on `change`, a **number on blur or Enter** (its spinner
+and arrow keys fire `change` at every step), never per keystroke, to the title the field took focus on (`FieldEdits`), unchanged
+values write nothing, a refused one toasts and puts the field back; a change that arrives while another edit is in flight
+(`editor.busy`) is **held with what was typed** and made when that edit ends, one at a time, not put back (the proposal on
+screen says so, `holdForPreview`, and puts the field back); a control whose
 element left the artwork says so) and last, for custom artwork, as *Save as template…*; preset titles have no ids to
 aim at and no section. Editing the SVG source ends the link (the section says so). A swatch for a color *name* asks the
 browser's canvas (`css-color.ts`). Harness: `?empty=1` has no templates, `?templateproblems=1` lists an unreadable file;
 `template-dev.ts` now refuses what core does (nested text controls, `attribute_name_ok`, control characters in name /
 description / label, a blank name falling back to the title's, Rust's `f64` grammar for numbers, 128 KiB after the
-splice). Tests: `template-ui`, `template-actions`, `template-wiring`, `css-color`, `api-templates`.
+splice). Tests: `template-ui`, `template-actions`, `template-wiring`, `css-color`, `api-templates`, `api-templates-changed` (the desktop half of `templates-changed`).
 
 **Animated SVG titles in the editor.** The engine draws the artwork (resvg, into every preview and export frame), so the
 page **never inlines the SVG** — `svg-titles.test.ts` fails on any `{@html}` / `innerHTML` in `src/` — and shows it only as an

@@ -10,15 +10,16 @@
 		KIND_CHOICES,
 		MAX_TARGETS,
 		addTarget,
+		ambiguousFor,
 		attributeChoices,
 		changeKind,
+		editId,
 		elementsFor,
 		numericAttributes,
 		pickElement,
 		relabel,
 		removeTarget,
 		setAttribute,
-		slugId,
 		takesAttribute,
 		type DraftContext,
 		type DraftControl
@@ -28,6 +29,7 @@
 
 	let {
 		draft,
+		index,
 		others,
 		ctx,
 		problem,
@@ -35,6 +37,8 @@
 		onremove
 	}: {
 		draft: DraftControl;
+		/** Its place in the dialog's list, from 0: what names it to a screen reader until it has a label. */
+		index: number;
 		/** Every other control of the dialog: an id is kept clear of theirs. */
 		others: readonly DraftControl[];
 		ctx: DraftContext;
@@ -46,19 +50,14 @@
 	const uid = $props.id();
 	const closed = $derived(attributeChoices(draft.kind));
 	const options = $derived(elementsFor(draft.kind, ctx.elements));
+	const ambiguous = $derived(ambiguousFor(draft.kind, ctx.elements));
+	// Every field of a row says whose it is: ten rows of "Id" and "Remove" are not ten things to a screen reader.
+	const who = $derived(draft.label.trim() ? `“${draft.label.trim()}”` : `control ${index + 1}`);
 
 	const field =
 		'box-sizing:border-box;height:var(--control-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:var(--text-sm);padding:0 8px;min-width:0';
 	const label = 'font-size:12px;color:var(--text-muted)';
 	const row = 'display:grid;grid-template-columns:62px minmax(0,1fr);align-items:center;column-gap:8px';
-
-	function setId(value: string) {
-		onchange(
-			value === ''
-				? { ...draft, id: draft.label.trim() ? slugId(draft.label, others.map((o) => o.id)) : '', idTouched: false }
-				: { ...draft, id: value, idTouched: true }
-		);
-	}
 </script>
 
 <div
@@ -74,13 +73,13 @@
 			type="text"
 			value={draft.label}
 			placeholder="Label, e.g. Tagline"
-			aria-label="Label"
+			aria-label="Label of control {index + 1}"
 			oninput={(e) => onchange(relabel(draft, e.currentTarget.value, others))}
 			style="{field};flex:1"
 		/>
 		<select
 			class="k-select"
-			aria-label="Kind of control"
+			aria-label="Kind of {who}"
 			use:tip={KIND_CHOICES.find((k) => k.id === draft.kind)?.hint}
 			value={draft.kind}
 			onchange={(e) => onchange(changeKind(draft, e.currentTarget.value as TemplateKind, ctx))}
@@ -90,7 +89,7 @@
 				<option value={k.id}>{k.label}</option>
 			{/each}
 		</select>
-		<IconBtn title="Remove this control" size={28} data-tone="quiet" onclick={onremove}><Icon n="trash" s={14} /></IconBtn>
+		<IconBtn title="Remove {who}" size={28} data-tone="quiet" onclick={onremove}><Icon n="trash" s={14} /></IconBtn>
 	</div>
 
 	<label style={row}>
@@ -100,8 +99,8 @@
 			value={draft.id}
 			spellcheck="false"
 			autocomplete="off"
-			aria-label="Id, how an agent or a script names this control"
-			oninput={(e) => setId(e.currentTarget.value)}
+			aria-label="Id of {who}, how an agent or a script names it"
+			oninput={(e) => onchange(editId(draft, e.currentTarget.value))}
 			style="{field};font-family:var(--font-mono)"
 		/>
 	</label>
@@ -114,7 +113,7 @@
 			<div style="display:flex;align-items:center;gap:6px;min-width:0">
 				<select
 					class="k-select"
-					aria-label={draft.targets.length > 1 ? `Element ${i + 1}` : 'Element it changes'}
+					aria-label={draft.targets.length > 1 ? `Element ${i + 1} that ${who} changes` : `Element that ${who} changes`}
 					value={t.element}
 					onchange={(e) => onchange(pickElement(draft, i, e.currentTarget.value, ctx))}
 					style="flex:1;min-width:0"
@@ -123,7 +122,10 @@
 					{#each options as e (e.id)}
 						<option value={e.id}>{e.id} · {e.tag}</option>
 					{/each}
-					{#if t.element && !listed}
+					{#each ambiguous as a (a.id)}
+						<option value={a.id} disabled={a.id !== t.element}>{a.id} · used by {a.count} elements</option>
+					{/each}
+					{#if t.element && !listed && !ambiguous.some((a) => a.id === t.element)}
 						<option value={t.element}>{t.element}</option>
 					{/if}
 				</select>
@@ -136,7 +138,7 @@
 					{:else if closed}
 						<select
 							class="k-select"
-							aria-label="Attribute it sets"
+							aria-label="Attribute {who} sets"
 							value={t.attribute}
 							onchange={(e) => onchange(setAttribute(draft, i, e.currentTarget.value))}
 							style="width:112px;flex:none;font-family:var(--font-mono)"
@@ -156,7 +158,7 @@
 							placeholder="attribute"
 							spellcheck="false"
 							autocomplete="off"
-							aria-label="Attribute it sets, e.g. font-size"
+							aria-label="Attribute {who} sets, e.g. font-size"
 							oninput={(e) => onchange(setAttribute(draft, i, e.currentTarget.value))}
 							style="{field};width:112px;flex:none;font-family:var(--font-mono)"
 						/>
@@ -168,7 +170,7 @@
 					{/if}
 				{/if}
 				{#if draft.targets.length > 1}
-					<IconBtn title="Stop changing this element" size={24} data-tone="quiet" onclick={() => onchange(removeTarget(draft, i))}
+					<IconBtn title="Stop {who} changing {t.element ? `“${t.element}”` : 'this element'}" size={24} data-tone="quiet" onclick={() => onchange(removeTarget(draft, i))}
 						><Icon n="x" s={13} /></IconBtn
 					>
 				{/if}
@@ -179,7 +181,14 @@
 		<div style={row}>
 			<span></span>
 			<div>
-				<Btn size="sm" variant="ghost" icon="plus" iconSize={12} onclick={() => onchange(addTarget(draft))}>Change another element too</Btn>
+				<Btn
+					size="sm"
+					variant="ghost"
+					icon="plus"
+					iconSize={12}
+					aria-label="Change another element too, for {who}"
+					onclick={() => onchange(addTarget(draft))}>Change another element too</Btn
+				>
 			</div>
 		</div>
 	{/if}
@@ -193,7 +202,7 @@
 					inputmode="decimal"
 					value={draft.min}
 					placeholder="min"
-					aria-label="Smallest value, optional"
+					aria-label="Smallest value of {who}, optional"
 					oninput={(e) => onchange({ ...draft, min: e.currentTarget.value })}
 					style="{field};width:72px;font-family:var(--font-mono);text-align:right"
 				/>
@@ -203,7 +212,7 @@
 					inputmode="decimal"
 					value={draft.max}
 					placeholder="max"
-					aria-label="Largest value, optional"
+					aria-label="Largest value of {who}, optional"
 					oninput={(e) => onchange({ ...draft, max: e.currentTarget.value })}
 					style="{field};width:72px;font-family:var(--font-mono);text-align:right"
 				/>

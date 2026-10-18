@@ -12,16 +12,7 @@
 	import { timeDisplay } from '$lib/time-display.svelte';
 	import type { TemplateInfo } from '$lib/types';
 
-	let {
-		info,
-		aspect,
-		changed
-	}: {
-		info: TemplateInfo;
-		aspect: { width: number; height: number };
-		/** The library lost this template: the list reads it again. */
-		changed: () => void;
-	} = $props();
+	let { info, aspect }: { info: TemplateInfo; aspect: { width: number; height: number } } = $props();
 
 	const id = $derived(info.id);
 	let poster = $state<string | null>(null);
@@ -46,7 +37,7 @@
 		{ label: 'Add at the playhead', icon: 'plus', disabled: editor.locked, action: () => void addTemplateHere(info) },
 		{ type: 'separator' },
 		{ label: 'Export…', icon: 'upload', action: () => void exportTemplateFile(info) },
-		{ label: 'Delete…', icon: 'trash', danger: true, action: () => void deleteTemplateFile(info).then((gone) => gone && changed()) }
+		{ label: 'Delete…', icon: 'trash', danger: true, action: () => void deleteTemplateFile(info) }
 	]);
 
 	function openMenu(e: MouseEvent) {
@@ -103,7 +94,7 @@
 	<IconBtn
 		class="more"
 		size={24}
-		title="More about {info.name}"
+		title="More actions for {info.name}"
 		aria-haspopup="menu"
 		onclick={openMenu}
 		style="position:absolute;top:8px;right:8px;background:color-mix(in srgb,var(--surface-void) 72%,transparent);color:var(--text-on-video)"

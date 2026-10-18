@@ -27,6 +27,10 @@ describe('the Templates section', () => {
 		expect(read('lib/api.ts')).toContain("listen('templates-changed'");
 	});
 
+	test('a card’s menu button names its card', () => {
+		expect(read(`${EDITOR}TemplateCard.svelte`)).toContain('title="More actions for {info.name}"');
+	});
+
 	test('a card’s picture is an image through a data URL, never the SVG itself', () => {
 		const card = read(`${EDITOR}TemplateCard.svelte`);
 		expect(card).toContain('<img');
@@ -63,10 +67,25 @@ describe('the Inspector', () => {
 	test('a field commits on change, not on every key, and to the title it began on', () => {
 		const section = read(`${EDITOR}TemplateSection.svelte`);
 		expect(section).not.toMatch(/\boninput=\{[^}]*write\(/);
-		expect(section.match(/onchange=\{[^}]*write\(/g)?.length).toBeGreaterThanOrEqual(5);
+		expect(section.match(/onchange=\{[^}]*write\(/g)?.length).toBeGreaterThanOrEqual(4);
 		expect(section).toContain('new FieldEdits<string>()');
 		expect(section).toContain("edits.end(el, { scope: o.id, text: el.value })");
 		expect(section).toContain('setTemplateValue(id, control, next)');
+	});
+
+	test('a number commits on blur or Enter, not on every step of its arrows', () => {
+		const section = read(`${EDITOR}TemplateSection.svelte`);
+		const field = /<input\s+type="number"[^>]*?\/>|<input\s+type="number"[\s\S]*?style="[^"]*"\s*\/>/.exec(section)![0];
+		expect(field).toContain('onblur={(e) => write(e.currentTarget, c)}');
+		expect(field).toContain("e.key === 'Enter'");
+		expect(field).not.toContain('onchange');
+	});
+
+	test('a change made while another edit runs is held and made after it, not put back', () => {
+		const section = read(`${EDITOR}TemplateSection.svelte`);
+		expect(section).toContain('if (editor.busy) {');
+		expect(section).toMatch(/\$effect\(\(\) => \{\s*if \(editor\.busy \|\| held\.length === 0\) return;/);
+		expect(section).not.toMatch(/if \(editor\.locked\) return back/);
 	});
 
 	test('an edit in flight keeps the focus: pending, never a native disabled', () => {
@@ -81,6 +100,27 @@ describe('the Save as template dialog', () => {
 		const page = read('routes/+page.svelte');
 		expect(page).toContain('<SaveTemplateDialog overlayId={ui.saveTemplateDialog.overlayId}');
 		expect(page).toContain('ui.saveTemplateDialog !== null');
+	});
+
+	test('Enter saves: the footer Save is the form’s submit button, and no button in the form submits it', () => {
+		const dialog = read(`${EDITOR}SaveTemplateDialog.svelte`);
+		const id = /<form[^>]*\sid="([^"]+)"/.exec(dialog)![1];
+		expect(dialog).toMatch(new RegExp(`type="submit"\\s+form="${id}"`));
+		expect(dialog).toContain('onsubmit={save}');
+		expect(dialog).not.toMatch(/onclick=\{\(\) => void save\(\)\}/);
+		for (const atom of ['Btn', 'IconBtn']) {
+			expect(read(`${EDITOR}${atom}.svelte`)).toContain("type = 'button'");
+			expect(read(`${EDITOR}${atom}.svelte`)).toMatch(/<button\s+\{type\}/);
+		}
+	});
+
+	test('the engine’s words go through tidyReason, and each row of controls says whose it is', () => {
+		const dialog = read(`${EDITOR}SaveTemplateDialog.svelte`);
+		expect(dialog).toContain('refused = tidyReason(errorMessage(err))');
+		const row = read(`${EDITOR}TemplateControlEditor.svelte`);
+		expect(row).toContain('index: number');
+		for (const name of ['Remove {who}', 'Id of {who}', 'Kind of {who}', 'Stop {who} changing']) expect(row).toContain(name);
+		expect(dialog).toContain('index={i}');
 	});
 
 	test('shows the engine’s refusal where the fields are and keeps what was typed', () => {

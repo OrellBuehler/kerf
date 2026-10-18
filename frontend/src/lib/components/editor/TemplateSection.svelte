@@ -1,8 +1,11 @@
 <script lang="ts">
 	// The Inspector's Template section for an animated SVG title. A title that came from a template shows one field
-	// per control — text, color, number, font, image — and each committed change (on change or blur, never per
-	// keystroke) is one `set_template_values` edit. A custom title instead offers to be kept as a template. The
+	// per control — text, color, number, font, image — and each committed change is one `set_template_values` edit: a
+	// text, color or font field on change, a number on blur or Enter (every step of its arrows would be an edit), never
+	// per keystroke. A change made while another edit runs keeps what was typed and is made when that edit is done.
+	// A custom title instead offers to be kept as a template. The
 	// artwork stays the engine's: nothing here edits the SVG, and a picture is shown only as an <img> data URL.
+	import { untrack } from 'svelte';
 	import InspectorSection from './InspectorSection.svelte';
 	import Btn from './Btn.svelte';
 	import Icon from './Icon.svelte';
@@ -10,7 +13,7 @@
 	import { ui } from '$lib/editor-ui.svelte';
 	import { FieldEdits } from '$lib/field-edit';
 	import { cssColorHex } from '$lib/css-color';
-	import { report } from '$lib/ops';
+	import { holdForPreview, report } from '$lib/ops';
 	import { setTemplateImage, setTemplateValue } from '$lib/template-actions';
 	import {
 		controlCount,
@@ -51,36 +54,66 @@
 			: !!template && template.values[c.id] === undefined;
 	const swatch = (value: string): string => swatchOf(value) ?? cssColorHex(value) ?? swatchHex(value);
 
-	/** Write a field's change to the title it took focus on. `shown` is what the field goes back to when nothing is
-	 *  written (an unchanged value, a refusal, an edit in flight); `make` turns the field's text into the value
-	 *  (a color pick keeps the alpha the value had). */
-	async function write(
+	/** A change that came in while another edit was running: the field keeps what was typed and the change is made when
+	 *  that edit has finished (`editor.busy` ends), one at a time. */
+	interface Change {
+		el: HTMLInputElement | HTMLSelectElement;
+		/** The title the field took focus on. */
+		id: string;
+		control: string;
+		typed: string;
+		make: (typed: string, was: string) => string;
+	}
+	let held = $state.raw<Change[]>([]);
+
+	$effect(() => {
+		if (editor.busy || held.length === 0) return;
+		const [next, ...rest] = held;
+		held = rest;
+		untrack(() => void commit(next));
+	});
+
+	/** What a field shows for a control now: the title's value (a color picker, its swatch). */
+	function shownNow(el: HTMLInputElement | HTMLSelectElement, id: string, control: string): string {
+		const now = editor.svgOverlays.find((t) => t.id === id)?.template?.values[control] ?? '';
+		return el.type === 'color' ? swatch(now) : now;
+	}
+
+	/** A field committed. `make` turns the field's text into the value (a color pick keeps the alpha the value had). */
+	function write(
 		el: HTMLInputElement | HTMLSelectElement,
 		c: TemplateControl,
-		shown: string,
 		make: (typed: string, was: string) => string = (typed) => typed
 	) {
 		const { scope: id, text } = edits.end(el, { scope: o.id, text: el.value });
-		const back = (to: string) => {
-			if (el.isConnected) el.value = to;
+		return commit({ el, id, control: c.id, typed: text, make });
+	}
+
+	async function commit({ el, id, control: controlId, typed, make }: Change) {
+		const back = () => {
+			if (el.isConnected) el.value = shownNow(el, id, controlId);
 		};
 		const title = editor.svgOverlays.find((t) => t.id === id);
-		const control = title?.template?.controls.find((x) => x.id === c.id);
+		const control = title?.template?.controls.find((x) => x.id === controlId);
 		if (!title || !control) return;
 		const was = title.template!.values[control.id] ?? '';
-		const next = make(text, was);
-		// An edit in flight, or the proposal on screen: a select changed from the keyboard writes nothing.
-		if (editor.locked) return back(shown);
+		const next = make(typed, was);
 		const unchanged =
 			valueRefusal(control, next) === null &&
 			(control.kind === 'text' ? next === was : normalizeValue(control, next) === normalizeValue(control, was));
-		if (unchanged) return back(shown);
+		if (unchanged) return back();
+		// The proposal on screen: nothing can be written, and the field says so instead of just going back.
+		if (holdForPreview()) return back();
+		// An edit in flight: what was typed stays in the field until that edit is done.
+		if (editor.busy) {
+			held = [...held.filter((h) => h.el !== el), { el, id, control: controlId, typed, make }];
+			return;
+		}
 		try {
 			await setTemplateValue(id, control, next);
 		} catch (e) {
 			report(e);
-			const now = editor.svgOverlays.find((t) => t.id === id)?.template?.values[control.id] ?? shown;
-			back(control.kind === 'color' && el.type === 'color' ? swatch(now) : now);
+			back();
 		}
 	}
 
@@ -133,7 +166,7 @@
 						onfocus={noteFocus}
 						oninput={noteTyped}
 						oncompositionend={noteTyped}
-						onchange={(e) => write(e.currentTarget, c, value)}
+						onchange={(e) => write(e.currentTarget, c)}
 						style="{field};width:100%"
 					/>
 				{:else if c.kind === 'color'}
@@ -147,7 +180,7 @@
 							aria-label="{c.label}: pick a color"
 							onclick={swallow}
 							onfocus={noteFocus}
-							onchange={(e) => write(e.currentTarget, c, swatch(value), (picked, was) => pickColor(was, picked))}
+							onchange={(e) => write(e.currentTarget, c, (picked, was) => pickColor(was, picked))}
 						/>
 						<input
 							type="text"
@@ -158,7 +191,7 @@
 							onfocus={noteFocus}
 							oninput={noteTyped}
 							oncompositionend={noteTyped}
-							onchange={(e) => write(e.currentTarget, c, value)}
+							onchange={(e) => write(e.currentTarget, c)}
 							style="{field};flex:1;font-family:var(--font-mono)"
 						/>
 					</div>
@@ -174,7 +207,8 @@
 						onfocus={noteFocus}
 						oninput={noteTyped}
 						oncompositionend={noteTyped}
-						onchange={(e) => write(e.currentTarget, c, value)}
+						onblur={(e) => write(e.currentTarget, c)}
+						onkeydown={(e) => e.key === 'Enter' && write(e.currentTarget, c)}
 						style="{field};width:110px;font-family:var(--font-mono);text-align:right"
 					/>
 				{:else if c.kind === 'font'}
@@ -185,7 +219,7 @@
 						aria-disabled={editor.locked || undefined}
 						onmousedown={swallow}
 						onfocus={noteFocus}
-						onchange={(e) => write(e.currentTarget, c, value)}
+						onchange={(e) => write(e.currentTarget, c)}
 					>
 						{#each fonts as f (f)}
 							<option value={f}>{f}</option>

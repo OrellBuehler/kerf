@@ -6,9 +6,9 @@
 // escaped, and read back into `TemplateInstance.values` the way the backend reads them from the `svg`.
 // There is no file system here: an exported template is kept under its path in memory so an import of that
 // path round-trips, and a picture for an `image` control is a fixed one.
-import { checkRect, isSvgColour, MAX_SVG_OVERLAYS } from './svg-dev';
+import { checkRect, MAX_SVG_OVERLAYS } from './svg-dev';
 import { svgDisplayName } from './svg-titles';
-import { plainDecimal } from './template-ui';
+import { plainDecimal, validSvgColor } from './template-ui';
 import type {
 	ImportOutcome,
 	SvgElementId,
@@ -214,12 +214,7 @@ function checkValue(control: TemplateControl, raw: string): string {
 			return raw;
 		case 'color': {
 			const color = raw.trim();
-			const ok =
-				/^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(color) ||
-				color === 'none' ||
-				color === 'currentColor' ||
-				(/^[A-Za-z]+$/.test(color) && isSvgColour(color));
-			if (!ok) throw invalid(`“${raw}” is not a colour for “${id}” (use #rrggbb, #rrggbbaa or a colour name)`);
+			if (!validSvgColor(color)) throw invalid(`“${raw}” is not a colour for “${id}” (use #rrggbb, #rrggbbaa or a colour name)`);
 			return color;
 		}
 		case 'number': {

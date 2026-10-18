@@ -10,6 +10,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { svgElementIds } from '$lib/api';
 	import { errorMessage } from '$lib/ops';
+	import { tidyReason } from '$lib/failure-copy';
 	import { svgDisplayName } from '$lib/svg-titles';
 	import { saveTitleAsTemplate } from '$lib/template-actions';
 	import {
@@ -63,7 +64,7 @@
 			(e) => {
 				if (!live) return;
 				elements = [];
-				elementsError = errorMessage(e);
+				elementsError = tidyReason(errorMessage(e));
 			}
 		);
 		return () => {
@@ -93,7 +94,7 @@
 			await saveTitleAsTemplate(title.id, name, description, drafts.map(toControl));
 			onClose();
 		} catch (err) {
-			refused = errorMessage(err);
+			refused = tidyReason(errorMessage(err));
 		} finally {
 			saving = false;
 		}
@@ -121,6 +122,7 @@
 				data-name
 				type="text"
 				bind:value={name}
+				placeholder={start ? svgDisplayName(start) : ''}
 				autocomplete="off"
 				style="{field};height:var(--control-sm);padding:0 8px"
 			/>
@@ -163,6 +165,7 @@
 		{#each drafts as d, i (d.key)}
 			<TemplateControlEditor
 				draft={d}
+				index={i}
 				others={drafts.filter((o) => o.key !== d.key)}
 				{ctx}
 				problem={check.controls[i] ?? null}
@@ -191,8 +194,9 @@
 				size="md"
 				icon="layout-template"
 				data-rescue
-				disabled={!check.ok || saving || !loaded}
-				onclick={() => void save()}>Save template</Btn
+				type="submit"
+				form="save-template-form"
+				disabled={!check.ok || saving || !loaded}>Save template</Btn
 			>
 		</div>
 	{/snippet}
