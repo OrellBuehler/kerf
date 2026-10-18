@@ -67,7 +67,10 @@ the webview, decides what an SVG may do; `check_params` refuses empty text first
 `generate_captions` / `clear_captions` (caption the whole cut, in timeline
 time), `import_captions` / `import_captions_text` (a subtitle file by path / by text —
 the text variant is what an `<input type=file>` or a paste uses; both return
-`{timeline, summary}` rather than a bare `Timeline`), `export_srt`, `refine_transcript` (re-time words + label speakers on the cached transcript via `run_refine`, shared
+`{timeline, summary}` rather than a bare `Timeline`), `export_srt`, `export_captions` (the cut's
+captions as `.srt` / `.vtt`), `export_interchange` (OTIO / EDL, returns `{path, report}`),
+`export_markers` (CSV / YouTube chapters, `{path, report}`) — each snapshots under the lock and
+builds and writes the file on the blocking pool —, `refine_transcript` (re-time words + label speakers on the cached transcript via `run_refine`, shared
 with MCP: lock released, background lane, `analysis-progress`, stopped by `cancel_analysis`; returns the
 analysis), `remove_silence`, `snap_to_beats`,
 `smart_crop` (frame each shot for the delivery frame),

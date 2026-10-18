@@ -170,14 +170,14 @@ the frame at full source detail.
 `set_master_volume` · `set_master_limiter` ·
 `add_overlay` · `update_overlay` · `remove_overlay` · `set_overlay_keyframes` ·
 `add_svg_overlay` · `update_svg_overlay` · `remove_svg_overlay` · `list_svg_presets` ·
-`generate_captions` · `import_captions` · `clear_captions` · `export_srt` · `list_fonts` ·
+`generate_captions` · `import_captions` · `clear_captions` · `export_srt` · `export_captions` · `list_fonts` ·
 `set_delivery_format` · `set_asset_projection`
 </details>
 
 <details>
 <summary><b>Render & hand-off</b></summary>
 
-`export` · `export_capabilities` · `export_cover` · `platform_check` · `get_levels` · `stage_edits` ·
+`export` · `export_capabilities` · `export_cover` · `export_interchange` · `export_markers` · `platform_check` · `get_levels` · `stage_edits` ·
 `staged_diff` · `apply_staged_edits` · `discard_staged_edits` · `revision_diff` ·
 `list_tasks` · `add_task` · `claim_next_task` · `complete_task` · `fail_task` ·
 `resolve_task` · `remove_task` · `history` · `undo` · `redo` · `revert_to` ·

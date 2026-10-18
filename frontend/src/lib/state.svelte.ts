@@ -149,6 +149,7 @@ import type {
 	SvgSource,
 	TextKeyframe,
 	Marker,
+	MarkerPatch,
 	TextOverlay,
 	Timeline,
 	Transform,
@@ -920,7 +921,7 @@ class EditorState {
 	addMarker(time: number, name: string, color?: string) {
 		return this.#apply(addMarker(time, name, color));
 	}
-	updateMarker(markerId: string, patch: { time?: number; name?: string; color?: string }) {
+	updateMarker(markerId: string, patch: MarkerPatch) {
 		return this.#apply(updateMarker(markerId, patch));
 	}
 	removeMarker(markerId: string) {
@@ -1135,7 +1136,7 @@ class EditorState {
 	clearCaptions() {
 		return this.#apply(clearCaptions());
 	}
-	/** Caption the cut from a subtitle file on disk (`.srt` / `.ass` / `.ssa`).
+	/** Caption the cut from a subtitle file on disk (`.srt` / `.vtt` / `.ass` / `.ssa`).
 	 *  One `Import captions` revision that replaces the generated / imported
 	 *  captions; resolves to what the import did (see `describeImport`). */
 	importCaptions(path: string, req?: CaptionImportRequest) {

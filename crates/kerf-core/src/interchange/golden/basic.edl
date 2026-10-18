@@ -1,0 +1,14 @@
+TITLE: Kerf basic
+FCM: NON-DROP FRAME
+
+001  INTERVIE V     C        00:00:10:00 00:00:15:00 01:00:00:00 01:00:05:00
+* FROM CLIP NAME: Interview Take 1.mov
+* SOURCE FILE: /media/Interview Take 1.mov
+
+002  B_ROLL   V     C        00:00:04:00 00:00:08:00 01:00:05:00 01:00:09:00
+* FROM CLIP NAME: b-roll.mp4
+* SOURCE FILE: /media/b-roll.mp4
+
+003  LOGO_CAR V     C        00:00:00:00 00:00:03:00 01:00:11:00 01:00:14:00
+* FROM CLIP NAME: logo card.png
+* SOURCE FILE: C:\Stills\logo card.png

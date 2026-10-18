@@ -1675,16 +1675,28 @@ fn add_marker(state: State<'_, AppState>, time: f64, name: String, color: Option
 }
 
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 fn update_marker(
     state: State<'_, AppState>,
     marker_id: String,
     time: Option<f64>,
     name: Option<String>,
     color: Option<String>,
+    duration: Option<f64>,
+    comment: Option<String>,
+    kind: Option<kerf_core::MarkerKind>,
 ) -> CmdResult<Timeline> {
     let id = id(&marker_id)?;
+    let patch = kerf_core::MarkerPatch {
+        time,
+        name,
+        color,
+        duration,
+        comment,
+        kind,
+    };
     let project = state.project();
-    project.update_marker(id, time, name, color).map_err(|e| e.to_string())?;
+    project.edit_marker(id, patch).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -1927,6 +1939,72 @@ async fn export_srt(state: State<'_, AppState>, asset_id: String, output_path: S
         let srt = lock_user(&shared).transcript_srt(id).map_err(|e| e.to_string())?;
         std::fs::write(&output_path, srt).map_err(|e| e.to_string())?;
         Ok(output_path)
+    })
+    .await
+}
+
+/// Write the cut's captions (its generated overlays, as the export draws them)
+/// to `output_path` as SubRip or WebVTT, by `format` or the path's extension.
+#[tauri::command]
+async fn export_captions(
+    state: State<'_, AppState>,
+    output_path: String,
+    format: Option<kerf_core::SubtitleFormat>,
+) -> CmdResult<String> {
+    require_local_output_path(&output_path)?;
+    let path = std::path::PathBuf::from(&output_path);
+    let format = match format {
+        Some(f) => f,
+        None => kerf_core::SubtitleFormat::from_path(&path).map_err(|e| e.to_string())?,
+    };
+    let timeline = lock_user(&state.project).working_timeline().map_err(|e| e.to_string())?;
+    blocking(move || {
+        let text = Project::captions_document(&timeline, format).map_err(|e| e.to_string())?;
+        Project::write_document(&path, &text).map_err(|e| e.to_string())?;
+        Ok(output_path)
+    })
+    .await
+}
+
+/// Write the cut as OpenTimelineIO or a CMX 3600 EDL (`video_track`: which video
+/// track an EDL holds, 0 = V1), returning the path and what the format dropped.
+#[tauri::command]
+async fn export_interchange(
+    state: State<'_, AppState>,
+    output_path: String,
+    format: kerf_core::InterchangeFormat,
+    video_track: Option<usize>,
+) -> CmdResult<kerf_core::ExportedFile> {
+    require_local_output_path(&output_path)?;
+    let inputs = lock_user(&state.project).delivery_inputs().map_err(|e| e.to_string())?;
+    blocking(move || {
+        let (text, report) =
+            Project::interchange_document(&inputs, format, video_track.unwrap_or(0)).map_err(|e| e.to_string())?;
+        Project::write_document(std::path::Path::new(&output_path), &text).map_err(|e| e.to_string())?;
+        Ok(kerf_core::ExportedFile {
+            path: output_path,
+            report,
+        })
+    })
+    .await
+}
+
+/// Write the markers as a CSV (formula-safe) or as YouTube chapter text.
+#[tauri::command]
+async fn export_markers(
+    state: State<'_, AppState>,
+    output_path: String,
+    format: kerf_core::MarkerListFormat,
+) -> CmdResult<kerf_core::ExportedFile> {
+    require_local_output_path(&output_path)?;
+    let inputs = lock_user(&state.project).delivery_inputs().map_err(|e| e.to_string())?;
+    blocking(move || {
+        let (text, report) = Project::markers_document(&inputs, format).map_err(|e| e.to_string())?;
+        Project::write_document(std::path::Path::new(&output_path), &text).map_err(|e| e.to_string())?;
+        Ok(kerf_core::ExportedFile {
+            path: output_path,
+            report,
+        })
     })
     .await
 }
@@ -2710,6 +2788,9 @@ async fn export_variants(
         .iter()
         .map(|d| kerf_core::ExportVariant::beside(&base, *d))
         .collect();
+    for variant in &variants {
+        kerf_core::check_caption_sidecars(&variant.output, &options).map_err(|e| e.to_string())?;
+    }
     let shared = state.project.clone();
     let cancel = state.export_cancel.clone();
     cancel.store(false, Ordering::SeqCst);
@@ -3728,6 +3809,9 @@ pub fn run() {
             import_captions,
             import_captions_text,
             export_srt,
+            export_captions,
+            export_interchange,
+            export_markers,
             refine_transcript,
             remove_silence,
             snap_to_beats,

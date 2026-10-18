@@ -1,0 +1,681 @@
+{
+  "OTIO_SCHEMA": "Timeline.1",
+  "global_start_time": null,
+  "metadata": {
+    "kerf": {
+      "format": null,
+      "master": {
+        "ceiling_db": -1.5,
+        "limiter": false,
+        "volume": 1.0
+      },
+      "overlays": [],
+      "rate": 24.0,
+      "svg_overlays": []
+    }
+  },
+  "name": "Kerf transitions",
+  "tracks": {
+    "OTIO_SCHEMA": "Stack.1",
+    "children": [
+      {
+        "OTIO_SCHEMA": "Track.1",
+        "children": [
+          {
+            "OTIO_SCHEMA": "Transition.1",
+            "in_offset": {
+              "OTIO_SCHEMA": "RationalTime.1",
+              "rate": 24.0,
+              "value": 0.0
+            },
+            "metadata": {
+              "kerf": {
+                "duration": 0.5,
+                "kind": "crossfade"
+              }
+            },
+            "name": "Crossfade",
+            "out_offset": {
+              "OTIO_SCHEMA": "RationalTime.1",
+              "rate": 24.0,
+              "value": 12.0
+            },
+            "transition_type": "SMPTE_Dissolve"
+          },
+          {
+            "OTIO_SCHEMA": "Clip.2",
+            "active_media_reference_key": "DEFAULT_MEDIA",
+            "effects": [],
+            "enabled": true,
+            "markers": [],
+            "media_references": {
+              "DEFAULT_MEDIA": {
+                "OTIO_SCHEMA": "ExternalReference.1",
+                "available_image_bounds": null,
+                "available_range": {
+                  "OTIO_SCHEMA": "TimeRange.1",
+                  "duration": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "rate": 24.0,
+                    "value": 2400.0
+                  },
+                  "start_time": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "rate": 24.0,
+                    "value": 0.0
+                  }
+                },
+                "metadata": {
+                  "kerf": {
+                    "asset_id": "00000000-0000-0000-0000-000000000001"
+                  }
+                },
+                "name": "shot_a.mov",
+                "target_url": "file:///m/shot_a.mov"
+              }
+            },
+            "metadata": {
+              "kerf": {
+                "asset_id": "00000000-0000-0000-0000-000000000001",
+                "color": {
+                  "brightness": 0.0,
+                  "contrast": 1.0,
+                  "gamma": 1.0,
+                  "saturation": 1.0,
+                  "temperature": 0.0
+                },
+                "fade_in": 0.0,
+                "fade_out": 0.0,
+                "id": "00000000-0000-0000-0000-00000000000b",
+                "source_in": 1.0,
+                "source_out": 3.0,
+                "speed": 1.0,
+                "timeline_start": 0.0,
+                "transform": {
+                  "crop_bottom": 0.0,
+                  "crop_left": 0.0,
+                  "crop_right": 0.0,
+                  "crop_top": 0.0,
+                  "opacity": 1.0,
+                  "pos_x": 0.0,
+                  "pos_y": 0.0,
+                  "rotation": 0.0,
+                  "scale": 1.0
+                },
+                "transition_in": {
+                  "duration": 0.5,
+                  "kind": "crossfade"
+                },
+                "volume": 1.0
+              }
+            },
+            "name": "shot_a.mov",
+            "source_range": {
+              "OTIO_SCHEMA": "TimeRange.1",
+              "duration": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "rate": 24.0,
+                "value": 48.0
+              },
+              "start_time": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "rate": 24.0,
+                "value": 24.0
+              }
+            }
+          },
+          {
+            "OTIO_SCHEMA": "Transition.1",
+            "in_offset": {
+              "OTIO_SCHEMA": "RationalTime.1",
+              "rate": 24.0,
+              "value": 0.0
+            },
+            "metadata": {
+              "kerf": {
+                "duration": 1.0,
+                "kind": "crossfade"
+              }
+            },
+            "name": "Crossfade",
+            "out_offset": {
+              "OTIO_SCHEMA": "RationalTime.1",
+              "rate": 24.0,
+              "value": 24.0
+            },
+            "transition_type": "SMPTE_Dissolve"
+          },
+          {
+            "OTIO_SCHEMA": "Clip.2",
+            "active_media_reference_key": "DEFAULT_MEDIA",
+            "effects": [],
+            "enabled": true,
+            "markers": [],
+            "media_references": {
+              "DEFAULT_MEDIA": {
+                "OTIO_SCHEMA": "ExternalReference.1",
+                "available_image_bounds": null,
+                "available_range": {
+                  "OTIO_SCHEMA": "TimeRange.1",
+                  "duration": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "rate": 24.0,
+                    "value": 2400.0
+                  },
+                  "start_time": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "rate": 24.0,
+                    "value": 0.0
+                  }
+                },
+                "metadata": {
+                  "kerf": {
+                    "asset_id": "00000000-0000-0000-0000-000000000002"
+                  }
+                },
+                "name": "shot_b.mov",
+                "target_url": "file:///m/shot_b.mov"
+              }
+            },
+            "metadata": {
+              "kerf": {
+                "asset_id": "00000000-0000-0000-0000-000000000002",
+                "color": {
+                  "brightness": 0.0,
+                  "contrast": 1.0,
+                  "gamma": 1.0,
+                  "saturation": 1.0,
+                  "temperature": 0.0
+                },
+                "fade_in": 0.0,
+                "fade_out": 0.0,
+                "id": "00000000-0000-0000-0000-00000000000c",
+                "source_in": 20.0,
+                "source_out": 24.0,
+                "speed": 1.0,
+                "timeline_start": 2.0,
+                "transform": {
+                  "crop_bottom": 0.0,
+                  "crop_left": 0.0,
+                  "crop_right": 0.0,
+                  "crop_top": 0.0,
+                  "opacity": 1.0,
+                  "pos_x": 0.0,
+                  "pos_y": 0.0,
+                  "rotation": 0.0,
+                  "scale": 1.0
+                },
+                "transition_in": {
+                  "duration": 1.0,
+                  "kind": "crossfade"
+                },
+                "volume": 1.0
+              }
+            },
+            "name": "shot_b.mov",
+            "source_range": {
+              "OTIO_SCHEMA": "TimeRange.1",
+              "duration": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "rate": 24.0,
+                "value": 96.0
+              },
+              "start_time": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "rate": 24.0,
+                "value": 480.0
+              }
+            }
+          },
+          {
+            "OTIO_SCHEMA": "Transition.1",
+            "in_offset": {
+              "OTIO_SCHEMA": "RationalTime.1",
+              "rate": 24.0,
+              "value": 12.0
+            },
+            "metadata": {
+              "kerf": {
+                "duration": 1.0,
+                "kind": "dip_to_black"
+              }
+            },
+            "name": "Dip to black",
+            "out_offset": {
+              "OTIO_SCHEMA": "RationalTime.1",
+              "rate": 24.0,
+              "value": 12.0
+            },
+            "transition_type": "Custom_Transition"
+          },
+          {
+            "OTIO_SCHEMA": "Clip.2",
+            "active_media_reference_key": "DEFAULT_MEDIA",
+            "effects": [
+              {
+                "OTIO_SCHEMA": "LinearTimeWarp.1",
+                "effect_name": "LinearTimeWarp",
+                "metadata": {},
+                "name": "",
+                "time_scalar": 2.0
+              }
+            ],
+            "enabled": true,
+            "markers": [],
+            "media_references": {
+              "DEFAULT_MEDIA": {
+                "OTIO_SCHEMA": "ExternalReference.1",
+                "available_image_bounds": null,
+                "available_range": {
+                  "OTIO_SCHEMA": "TimeRange.1",
+                  "duration": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "rate": 24.0,
+                    "value": 2400.0
+                  },
+                  "start_time": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "rate": 24.0,
+                    "value": 0.0
+                  }
+                },
+                "metadata": {
+                  "kerf": {
+                    "asset_id": "00000000-0000-0000-0000-000000000003"
+                  }
+                },
+                "name": "shot_a.mp4",
+                "target_url": "file:///m/shot_a.mp4"
+              }
+            },
+            "metadata": {
+              "kerf": {
+                "asset_id": "00000000-0000-0000-0000-000000000003",
+                "color": {
+                  "brightness": 0.0,
+                  "contrast": 1.0,
+                  "gamma": 1.0,
+                  "saturation": 1.0,
+                  "temperature": 0.0
+                },
+                "fade_in": 0.0,
+                "fade_out": 0.0,
+                "id": "00000000-0000-0000-0000-00000000000d",
+                "source_in": 10.0,
+                "source_out": 14.0,
+                "speed": 2.0,
+                "timeline_start": 6.0,
+                "transform": {
+                  "crop_bottom": 0.0,
+                  "crop_left": 0.0,
+                  "crop_right": 0.0,
+                  "crop_top": 0.0,
+                  "opacity": 1.0,
+                  "pos_x": 0.0,
+                  "pos_y": 0.0,
+                  "rotation": 0.0,
+                  "scale": 1.0
+                },
+                "transition_in": {
+                  "duration": 1.0,
+                  "kind": "dip_to_black"
+                },
+                "volume": 1.0
+              }
+            },
+            "name": "shot_a.mp4",
+            "source_range": {
+              "OTIO_SCHEMA": "TimeRange.1",
+              "duration": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "rate": 24.0,
+                "value": 48.0
+              },
+              "start_time": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "rate": 24.0,
+                "value": 240.0
+              }
+            }
+          },
+          {
+            "OTIO_SCHEMA": "Transition.1",
+            "in_offset": {
+              "OTIO_SCHEMA": "RationalTime.1",
+              "rate": 24.0,
+              "value": 0.0
+            },
+            "metadata": {
+              "kerf": {
+                "duration": 0.5,
+                "kind": "slide_left"
+              }
+            },
+            "name": "Slide left",
+            "out_offset": {
+              "OTIO_SCHEMA": "RationalTime.1",
+              "rate": 24.0,
+              "value": 12.0
+            },
+            "transition_type": "Custom_Transition"
+          },
+          {
+            "OTIO_SCHEMA": "Clip.2",
+            "active_media_reference_key": "DEFAULT_MEDIA",
+            "effects": [
+              {
+                "OTIO_SCHEMA": "LinearTimeWarp.1",
+                "effect_name": "LinearTimeWarp",
+                "metadata": {},
+                "name": "",
+                "time_scalar": -1.0
+              }
+            ],
+            "enabled": true,
+            "markers": [],
+            "media_references": {
+              "DEFAULT_MEDIA": {
+                "OTIO_SCHEMA": "ExternalReference.1",
+                "available_image_bounds": null,
+                "available_range": {
+                  "OTIO_SCHEMA": "TimeRange.1",
+                  "duration": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "rate": 24.0,
+                    "value": 2400.0
+                  },
+                  "start_time": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "rate": 24.0,
+                    "value": 0.0
+                  }
+                },
+                "metadata": {
+                  "kerf": {
+                    "asset_id": "00000000-0000-0000-0000-000000000001"
+                  }
+                },
+                "name": "shot_a.mov",
+                "target_url": "file:///m/shot_a.mov"
+              }
+            },
+            "metadata": {
+              "kerf": {
+                "asset_id": "00000000-0000-0000-0000-000000000001",
+                "color": {
+                  "brightness": 0.0,
+                  "contrast": 1.0,
+                  "gamma": 1.0,
+                  "saturation": 1.0,
+                  "temperature": 0.0
+                },
+                "fade_in": 0.0,
+                "fade_out": 0.0,
+                "id": "00000000-0000-0000-0000-00000000000e",
+                "source_in": 50.0,
+                "source_out": 52.0,
+                "speed": -1.0,
+                "timeline_start": 8.0,
+                "transform": {
+                  "crop_bottom": 0.0,
+                  "crop_left": 0.0,
+                  "crop_right": 0.0,
+                  "crop_top": 0.0,
+                  "opacity": 1.0,
+                  "pos_x": 0.0,
+                  "pos_y": 0.0,
+                  "rotation": 0.0,
+                  "scale": 1.0
+                },
+                "transition_in": {
+                  "duration": 0.5,
+                  "kind": "slide_left"
+                },
+                "volume": 1.0
+              }
+            },
+            "name": "shot_a.mov",
+            "source_range": {
+              "OTIO_SCHEMA": "TimeRange.1",
+              "duration": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "rate": 24.0,
+                "value": 48.0
+              },
+              "start_time": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "rate": 24.0,
+                "value": 1200.0
+              }
+            }
+          },
+          {
+            "OTIO_SCHEMA": "Clip.2",
+            "active_media_reference_key": "DEFAULT_MEDIA",
+            "effects": [],
+            "enabled": false,
+            "markers": [],
+            "media_references": {
+              "DEFAULT_MEDIA": {
+                "OTIO_SCHEMA": "ExternalReference.1",
+                "available_image_bounds": null,
+                "available_range": {
+                  "OTIO_SCHEMA": "TimeRange.1",
+                  "duration": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "rate": 24.0,
+                    "value": 2400.0
+                  },
+                  "start_time": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "rate": 24.0,
+                    "value": 0.0
+                  }
+                },
+                "metadata": {
+                  "kerf": {
+                    "asset_id": "00000000-0000-0000-0000-000000000002"
+                  }
+                },
+                "name": "shot_b.mov",
+                "target_url": "file:///m/shot_b.mov"
+              }
+            },
+            "metadata": {
+              "kerf": {
+                "asset_id": "00000000-0000-0000-0000-000000000002",
+                "color": {
+                  "brightness": 0.0,
+                  "contrast": 1.0,
+                  "gamma": 1.0,
+                  "saturation": 1.0,
+                  "temperature": 0.0
+                },
+                "enabled": false,
+                "fade_in": 0.0,
+                "fade_out": 0.0,
+                "id": "00000000-0000-0000-0000-00000000000f",
+                "source_in": 0.0,
+                "source_out": 1.0,
+                "speed": 1.0,
+                "timeline_start": 10.0,
+                "transform": {
+                  "crop_bottom": 0.0,
+                  "crop_left": 0.0,
+                  "crop_right": 0.0,
+                  "crop_top": 0.0,
+                  "opacity": 1.0,
+                  "pos_x": 0.0,
+                  "pos_y": 0.0,
+                  "rotation": 0.0,
+                  "scale": 1.0
+                },
+                "transition_in": null,
+                "volume": 1.0
+              }
+            },
+            "name": "shot_b.mov",
+            "source_range": {
+              "OTIO_SCHEMA": "TimeRange.1",
+              "duration": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "rate": 24.0,
+                "value": 24.0
+              },
+              "start_time": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "rate": 24.0,
+                "value": 0.0
+              }
+            }
+          }
+        ],
+        "effects": [],
+        "enabled": true,
+        "kind": "Video",
+        "markers": [],
+        "metadata": {
+          "kerf": {
+            "duck": false,
+            "id": "00000000-0000-0000-0000-000000000065",
+            "locked": false,
+            "muted": false,
+            "pan": 0.0,
+            "solo": false,
+            "volume": 1.0
+          }
+        },
+        "name": "V1",
+        "source_range": null
+      },
+      {
+        "OTIO_SCHEMA": "Track.1",
+        "children": [
+          {
+            "OTIO_SCHEMA": "Gap.1",
+            "effects": [],
+            "enabled": true,
+            "markers": [],
+            "metadata": {},
+            "name": "",
+            "source_range": {
+              "OTIO_SCHEMA": "TimeRange.1",
+              "duration": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "rate": 24.0,
+                "value": 24.0
+              },
+              "start_time": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "rate": 24.0,
+                "value": 0.0
+              }
+            }
+          },
+          {
+            "OTIO_SCHEMA": "Clip.2",
+            "active_media_reference_key": "DEFAULT_MEDIA",
+            "effects": [],
+            "enabled": true,
+            "markers": [],
+            "media_references": {
+              "DEFAULT_MEDIA": {
+                "OTIO_SCHEMA": "ExternalReference.1",
+                "available_image_bounds": null,
+                "available_range": {
+                  "OTIO_SCHEMA": "TimeRange.1",
+                  "duration": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "rate": 24.0,
+                    "value": 2400.0
+                  },
+                  "start_time": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "rate": 24.0,
+                    "value": 0.0
+                  }
+                },
+                "metadata": {
+                  "kerf": {
+                    "asset_id": "00000000-0000-0000-0000-000000000003"
+                  }
+                },
+                "name": "shot_a.mp4",
+                "target_url": "file:///m/shot_a.mp4"
+              }
+            },
+            "metadata": {
+              "kerf": {
+                "asset_id": "00000000-0000-0000-0000-000000000003",
+                "color": {
+                  "brightness": 0.0,
+                  "contrast": 1.0,
+                  "gamma": 1.0,
+                  "saturation": 1.0,
+                  "temperature": 0.0
+                },
+                "fade_in": 0.0,
+                "fade_out": 0.0,
+                "id": "00000000-0000-0000-0000-000000000010",
+                "source_in": 0.0,
+                "source_out": 1.0,
+                "speed": 1.0,
+                "timeline_start": 1.0,
+                "transform": {
+                  "crop_bottom": 0.0,
+                  "crop_left": 0.0,
+                  "crop_right": 0.0,
+                  "crop_top": 0.0,
+                  "opacity": 1.0,
+                  "pos_x": 0.0,
+                  "pos_y": 0.0,
+                  "rotation": 0.0,
+                  "scale": 1.0
+                },
+                "transition_in": null,
+                "volume": 1.0
+              }
+            },
+            "name": "shot_a.mp4",
+            "source_range": {
+              "OTIO_SCHEMA": "TimeRange.1",
+              "duration": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "rate": 24.0,
+                "value": 24.0
+              },
+              "start_time": {
+                "OTIO_SCHEMA": "RationalTime.1",
+                "rate": 24.0,
+                "value": 0.0
+              }
+            }
+          }
+        ],
+        "effects": [],
+        "enabled": true,
+        "kind": "Video",
+        "markers": [],
+        "metadata": {
+          "kerf": {
+            "duck": false,
+            "id": "00000000-0000-0000-0000-000000000066",
+            "locked": false,
+            "muted": false,
+            "pan": 0.0,
+            "solo": false,
+            "volume": 1.0
+          }
+        },
+        "name": "V2",
+        "source_range": null
+      }
+    ],
+    "effects": [],
+    "enabled": true,
+    "markers": [],
+    "metadata": {},
+    "name": "tracks",
+    "source_range": null
+  }
+}

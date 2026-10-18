@@ -183,7 +183,12 @@
   wants `-3600`. The
   parsers are pure and tolerant — SubRip (BOM, CRLF / CR, missing or absurd indices, a
   `,` or `.` fraction read as a *decimal* fraction, `<i>` / `<font>` and `{\an8}`
-  stripped, no blank line between cues with the index handed back to its cue) and ASS /
+  stripped, no blank line between cues with the index handed back to its cue), **WebVTT**
+  (`parse_vtt`: blank-line blocks; the `WEBVTT` header, `NOTE` / `STYLE` / `REGION` skipped
+  uncounted, an optional cue id, `.` milliseconds and optional hours, cue settings ignored,
+  `<v Speaker>` / `<c.x>` / `<b>` and inline `<00:01.000>` timestamps removed, `&amp;`-style
+  references decoded *after* markup so `&lt;i&gt;` stays text; captions have no speaker
+  field, so a voice's name is dropped; `detect` says `vtt` for a `WEBVTT` first line) and ASS /
   SSA (the `[Events]` `Format:` line picks the columns, `Dialogue:` only, `{…}` blocks
   and `\p` drawings dropped, `\N` / `\h`) — and what they cannot read is **counted,
   never fatal** (`skipped_lines`: empty or zero / negative-length cues, a stray line, a
@@ -229,8 +234,21 @@
   revision computed inside the `edit_timeline` closure (an agent's lands in its
   proposal), and a refused import (no cues, nothing reaching the cut, an asset not on
   the timeline, more than 20,000 captions) writes nothing. Core takes *text*;
-  `read_caption_file` (`.srt` / `.ass` / `.ssa`, regular file, size) runs before the lock
+  `read_caption_file` (`.srt` / `.vtt` / `.ass` / `.ssa`, regular file, size) runs before the lock
   in the Tauri command and the MCP tool.
+  **Caption export** (`captions_export.rs`, pure) is the way back out: `cut_captions` is the
+  timeline's *generated* overlays (a typed title is not a caption) — already in timeline
+  time, projected through trims / reorders / speed when they were written, so a cue is
+  exactly the line the burned-in overlay draws — clipped to `[0, duration]`, control
+  characters dropped; `write_srt` / `write_vtt` round to whole ms (end ≥ start + 1 ms),
+  turn `-->` in SRT text into `->` and escape `& < >` in VTT, and read back through the
+  importers unchanged (a test).
+  **Markers** carry `duration` (0 = a point), `comment` and `kind` (`Comment` / `Chapter`),
+  all `#[serde(default)]` and omitted at their defaults, so a stored timeline is
+  byte-identical. `MarkerPatch` + `Marker::apply` is the one validated edit (time and
+  duration ≥ 0, comment ≤ `MAX_MARKER_COMMENT`, control characters but `\n` / `\t` dropped);
+  `slice` clips a marker's span to the window and the diff names length / kind / comment
+  changes. A `Chapter` marker becomes a chapter of the export (see `engine-cli.md`).
   Inherent helpers (`Timeline::locate`, `Track::end`/`reflow`, `Clip::duration`,
   `Timeline::slice` — the shifted sub-timeline copy behind range export) back the
   operations. **Beat alignment** lives here too and is pure + unit-tested:

@@ -2,10 +2,11 @@
  *  and `Project::import_captions` so the browser dev harness imports exactly what
  *  the backend would.
  *
- *  Two formats, read tolerantly: SubRip (BOM, CRLF, odd indices, `,` or `.`
- *  milliseconds, markup and `{\an8}` overrides) and ASS / SSA (the `[Events]`
- *  `Format:` line decides the columns; override blocks, drawings and `\N` / `\h`
- *  are resolved). What cannot be read is skipped and counted, never fatal.
+ *  Three formats, read tolerantly: SubRip (BOM, CRLF, odd indices, `,` or `.`
+ *  milliseconds, markup and `{\an8}` overrides), WebVTT (header, NOTE / STYLE /
+ *  REGION blocks, cue ids and settings, `<v Speaker>` / inline timestamps,
+ *  entities) and ASS / SSA (the `[Events]` `Format:` line decides the columns;
+ *  override blocks, drawings and `\N` / `\h` are resolved). What cannot be read is skipped and counted, never fatal.
  *  Placing the cues on the cut is `placeCues` in `captions.ts`, which shares its
  *  chunking, timing and fitting with transcript captioning. Kerf-core stays the
  *  authority; this is the same arrangement as `captions.ts`.
@@ -360,11 +361,145 @@ export function parseAss(input: string): ParsedCaptions {
 	return out;
 }
 
+// ---- WebVTT ----------------------------------------------------------------
+
+/** `WEBVTT`, alone or followed by a space, a tab or a header text. */
+const isVttSignature = (line: string) => /^WEBVTT(?:$|[ \t])/.test(line);
+
+/** A block that is not a cue: `NOTE`, `STYLE` or `REGION`. */
+const isVttMetaBlock = (first: string) => !first.includes('-->') && /^(?:NOTE|STYLE|REGION)(?:$|[ \t])/.test(first);
+
+/** `00:01.000 --> 00:00:03.500 line:90%` → `[start, end]`; cue settings are ignored. */
+function parseVttTiming(line: string): [number, number] | null {
+	const at = line.indexOf('-->');
+	if (at < 0) return null;
+	const start = parseTimestamp(line.slice(0, at).trim());
+	const end = parseTimestamp(line.slice(at + 3).trim().split(/\s+/)[0] ?? '');
+	return start === null || end === null ? null : [start, end];
+}
+
+/** Remove inline `<00:00:01.000>` timestamp tags; a tag's `>` is looked for only
+ *  within a timestamp's length. */
+function stripVttTimestamps(line: string): string {
+	if (!line.includes('<')) return line;
+	let out = '';
+	let rest = line;
+	for (;;) {
+		const open = rest.indexOf('<');
+		if (open < 0) break;
+		out += rest.slice(0, open);
+		const after = rest.slice(open + 1);
+		const close = after.slice(0, 16).indexOf('>');
+		if (close >= 0 && /^\d/.test(after) && parseTimestamp(after.slice(0, close)) !== null) {
+			rest = after.slice(close + 1);
+		} else {
+			out += '<';
+			rest = after;
+		}
+	}
+	return out + rest;
+}
+
+const VTT_ENTITIES: Record<string, string> = { amp: '&', lt: '<', gt: '>', nbsp: ' ', quot: '"', apos: "'", lrm: '', rlm: '' };
+
+/** The text a WebVTT reference stands for, or null when it is not one. */
+function vttEntity(name: string): string | null {
+	if (Object.hasOwn(VTT_ENTITIES, name)) return VTT_ENTITIES[name];
+	const num = /^#(?:[xX]([0-9a-fA-F]+)|(\d+))$/.exec(name);
+	if (!num) return null;
+	const code = num[1] !== undefined ? parseInt(num[1], 16) : Number(num[2]);
+	if (!Number.isFinite(code) || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return null;
+	return String.fromCodePoint(code);
+}
+
+/** Decode `&amp;`-style references (within 12 characters); anything else is text. */
+function decodeVttEntities(line: string): string {
+	if (!line.includes('&')) return line;
+	let out = '';
+	let rest = line;
+	for (;;) {
+		const amp = rest.indexOf('&');
+		if (amp < 0) break;
+		out += rest.slice(0, amp);
+		const after = rest.slice(amp + 1);
+		const semi = after.slice(0, 12).indexOf(';');
+		const decoded = semi >= 0 ? vttEntity(after.slice(0, semi)) : null;
+		if (decoded !== null) {
+			out += decoded;
+			rest = after.slice(semi + 1);
+		} else {
+			out += '&';
+			rest = after;
+		}
+	}
+	return out + rest;
+}
+
+const cleanVttLine = (line: string) => decodeVttEntities(stripMarkup(stripVttTimestamps(line)));
+
+/** Read WebVTT text. Never throws: what is unusable is counted in `skipped`.
+ *  Blocks are separated by blank lines; the header and NOTE / STYLE / REGION
+ *  blocks are not cues and are not counted; a cue is an optional id, a timing
+ *  line and its text. Mirrors `captions_import::parse_vtt`. */
+export function parseVtt(input: string): ParsedCaptions {
+	const out: ParsedCaptions = { cues: [], skipped: 0 };
+	const finish = (whole: string[], oversized: boolean, first: boolean) => {
+		let block = whole;
+		if (block.length === 0) return;
+		if (first && isVttSignature(block[0])) {
+			const at = block.findIndex((l) => l.includes('-->'));
+			if (at < 0) return;
+			block = block.slice(at);
+		}
+		if (isVttMetaBlock(block[0])) return;
+		const timing = block[0].includes('-->') ? 0 : 1;
+		const time = timing < block.length ? parseVttTiming(block[timing]) : null;
+		if (!time || oversized) {
+			out.skipped += 1;
+			return;
+		}
+		const [start, end] = time;
+		const text = joinLines(block.slice(timing + 1).map(cleanVttLine));
+		if (!text || end <= start || chars(text) > MAX_CUE_CHARS) {
+			out.skipped += 1;
+			return;
+		}
+		out.cues.push({ start, end, text });
+	};
+	let block: string[] = [];
+	let oversized = false;
+	let first = true;
+	for (const raw of normalizeNewlines(input).split('\n')) {
+		if (out.cues.length > MAX_CAPTION_CUES) break;
+		// Refused before it is cleaned; it still holds its place in the block.
+		if (tooLong(raw)) {
+			oversized = true;
+			block.push('');
+			continue;
+		}
+		const line = raw.trim();
+		if (!line) {
+			if (block.length) {
+				finish(block, oversized, first);
+				first = false;
+			}
+			block = [];
+			oversized = false;
+			continue;
+		}
+		block.push(line);
+	}
+	if (block.length) finish(block, oversized, first);
+	out.cues.sort((a, b) => a.start - b.start);
+	return out;
+}
+
 // ---- entry points ----------------------------------------------------------
 
 /** Guess a format from the text: an ASS file always has a `[Script Info]` or
  *  `[Events]` section; failing that, an SRT `-->` wins over a bare `Dialogue:`. */
 export function detectFormat(text: string): CaptionFormat {
+	if (isVttSignature(text.replace(/^\uFEFF+/, '').trimStart().split(/\r\n|\r|\n/)[0] ?? '')) return 'vtt';
 	let arrow = false;
 	let dialogue = false;
 	for (const raw of text.replace(/^﻿+/, '').split(/\r\n|\r|\n/)) {
@@ -376,7 +511,7 @@ export function detectFormat(text: string): CaptionFormat {
 	return dialogue && !arrow ? 'ass' : 'srt';
 }
 
-/** A format by name or extension (`srt`, `ass`, `ssa`; any case, optional dot). */
+/** A format by name or extension (`srt`, `vtt`, `ass`, `ssa`; any case, optional dot). */
 export function parseFormat(name: string): CaptionFormat | null {
 	switch (name.trim().replace(/^\./, '').toLowerCase()) {
 		case 'srt':
@@ -385,6 +520,9 @@ export function parseFormat(name: string): CaptionFormat | null {
 		case 'ass':
 		case 'ssa':
 			return 'ass';
+		case 'vtt':
+		case 'webvtt':
+			return 'vtt';
 		default:
 			return null;
 	}
@@ -405,7 +543,7 @@ export function parseCaptions(
 ): { format: CaptionFormat; parsed: ParsedCaptions } {
 	if (new TextEncoder().encode(text).length > MAX_CAPTION_FILE_BYTES) throw fileTooLarge();
 	const used = format ?? detectFormat(text);
-	const parsed = used === 'srt' ? parseSrt(text) : parseAss(text);
+	const parsed = used === 'srt' ? parseSrt(text) : used === 'vtt' ? parseVtt(text) : parseAss(text);
 	if (parsed.cues.length > MAX_CAPTION_CUES) {
 		throw new Error(
 			`this file has more than ${MAX_CAPTION_CUES} cues; Kerf imports at most ${MAX_CAPTION_CUES} at a time`
