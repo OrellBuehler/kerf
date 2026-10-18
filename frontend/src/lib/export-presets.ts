@@ -487,8 +487,17 @@ export function validateExport(opts: ExportOptions, hasVideo: boolean, hasAudio:
 		issues.push(`${opts.audio_codec} can't go in a .${info.ext} file.`);
 	}
 	if (wantAudio && opts.audio_bitrate && !bitrateValid(opts.audio_bitrate)) issues.push(`Invalid audio bitrate "${opts.audio_bitrate}".`);
+	if (opts.embed_captions && !carriesSubtitles(opts.container)) {
+		issues.push(`A .${info.ext} file can't carry subtitles; write them beside the export instead.`);
+	}
 	return issues;
 }
+
+/** Whether a container carries a soft subtitle stream (`side_files::subtitle_codec`). */
+export const carriesSubtitles = (c: Container) => c === 'mp4' || c === 'mov' || c === 'mkv' || c === 'webm';
+
+/** Whether a container keeps chapters (`side_files::carries_chapters`). */
+export const carriesChapters = (c: Container) => carriesSubtitles(c) || c === 'm4a';
 
 /** A short human summary of the encode, e.g. "MP4 · H.264 · CRF 20 · 1080p · AAC 192k · faststart". */
 export function buildSummary(opts: ExportOptions, hasVideo: boolean, hasAudio: boolean): string {

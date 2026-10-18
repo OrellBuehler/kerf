@@ -13,9 +13,11 @@
 //! thread pool via [`blocking`], resolving inputs under the shared project lock
 //! and releasing it before the slow part.
 
+mod editor_context;
 mod gpu_preview;
 mod mcp;
 mod popout;
+mod recovery;
 mod settings;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -201,15 +203,24 @@ fn project_path(state: State<'_, AppState>) -> CmdResult<Option<String>> {
     Ok(state.project().path().map(|p| p.display().to_string()))
 }
 
-/// Replace the open project with a fresh, empty in-memory one (no sample data).
-/// Like the seeded sample it isn't persisted until `save_project_as`. The GUI and
-/// the embedded MCP server share this `Project`, so both switch to it.
-#[tauri::command(async)]
-fn new_project(state: State<'_, AppState>) -> CmdResult<Option<String>> {
-    let mut project = state.project();
-    project.replace_with(Project::open_in_memory().map_err(|e| e.to_string())?);
-    state.scrub.clear();
-    Ok(project.path().map(|p| p.display().to_string()))
+/// Replace the open project with a fresh, empty untitled one (no sample data), backed by a
+/// crash-recovery file (`recovery.rs`) but not saved until `save_project_as`. The GUI and the
+/// embedded MCP server share this `Project`, so both switch to it.
+#[tauri::command]
+async fn new_project(app: AppHandle, state: State<'_, AppState>) -> CmdResult<Option<String>> {
+    let shared = state.project.clone();
+    let scrub = state.scrub.clone();
+    blocking(move || {
+        let fresh = recovery::untitled(&app)?;
+        let mut project = lock_user(&shared);
+        let old = project.replace_with(fresh);
+        let path = project.path().map(|p| p.display().to_string());
+        drop(project);
+        old.close();
+        scrub.clear();
+        Ok(path)
+    })
+    .await
 }
 
 /// Open an existing `.kerf` file, replacing the in-memory project. Both the GUI
@@ -224,9 +235,10 @@ async fn open_project(app: AppHandle, state: State<'_, AppState>, path: String) 
         // hold the shared lock, and a failed open leaves the current project intact.
         let opened = Project::open(&path).map_err(|e| e.to_string())?;
         let mut project = lock_user(&shared);
-        project.replace_with(opened);
+        let old = project.replace_with(opened);
         let result = project.path().map(|p| p.display().to_string());
         drop(project);
+        old.close();
         // The frames of the project that was open are of no use to this one.
         scrub.clear();
         // The speech model is remembered per project, so transcribing in the
@@ -275,16 +287,19 @@ async fn save_project_as(state: State<'_, AppState>, path: String) -> CmdResult<
         };
         let opened = Project::open(&path).map_err(|e| e.to_string())?;
         let mut project = lock_user(&shared);
-        if project_fingerprint(&project)? == before {
-            project.replace_with(opened);
+        let old = if project_fingerprint(&project)? == before {
+            project.replace_with(opened)
         } else {
-            // Close the stale copy first: `save_as` deletes the file it replaces,
+            // Close the stale copy first: `save_as` renames over the file it replaces,
             // which Windows refuses while it is open.
             drop(opened);
             project.save_as(&path).map_err(|e| e.to_string())?;
-            project.replace_with(Project::open(&path).map_err(|e| e.to_string())?);
-        }
-        Ok(project.path().map(|p| p.display().to_string()))
+            project.replace_with(Project::open(&path).map_err(|e| e.to_string())?)
+        };
+        let saved = project.path().map(|p| p.display().to_string());
+        drop(project);
+        old.close();
+        Ok(saved)
     })
     .await
 }
@@ -558,6 +573,48 @@ pub(crate) fn run_analysis<'a>(
         analysis: merged,
         failed: run.failed,
     })
+}
+
+/// Re-time an asset's cached transcript to the speech energy and label its speakers, without
+/// re-transcribing — the Tauri command's and the MCP tool's shared body. The transcript is read
+/// under the lock; the decode and clustering run with it released, in the background lane,
+/// streaming `analysis-progress` and giving up on `cancel`; the result is stored under the
+/// lock again, unless a newer transcript landed meanwhile. Only analysis moved, so it says so
+/// with `analysis-status`, not `project-changed`.
+pub(crate) fn run_refine<'a>(
+    app: &AppHandle,
+    lock: &dyn Fn() -> std::sync::MutexGuard<'a, Project>,
+    asset_id: Uuid,
+    cancel: &dyn Fn() -> bool,
+) -> CmdResult<AssetAnalysis> {
+    let (asset, read) = {
+        let project = lock();
+        (
+            project.require_asset(asset_id).map_err(|e| e.to_string())?,
+            project.transcript(asset_id).map_err(|e| e.to_string())?,
+        )
+    };
+    let id_text = asset_id.to_string();
+    let emit = |p: kerf_core::AnalysisProgress| {
+        let _ = app.emit(
+            "analysis-progress",
+            AnalysisProgressEvent {
+                asset_id: id_text.clone(),
+                stage: p.stage,
+                fraction: p.fraction,
+                detail: p.detail,
+            },
+        );
+    };
+    let refined = kerf_core::refine_transcript_media(&asset, read.clone(), &mut |p| emit(p), cancel);
+    emit(kerf_core::AnalysisProgress::stage("done"));
+    let refined = refined.map_err(|e| match e {
+        kerf_core::Error::Cancelled => ANALYSIS_CANCELLED.to_string(),
+        e => e.to_string(),
+    })?;
+    let stored = lock().store_transcript(asset_id, &read, refined).map_err(|e| e.to_string())?;
+    let _ = app.emit("analysis-status", kerf_core::analysis_status(asset_id, Some(&stored)));
+    Ok(stored)
 }
 
 /// Parse the `steps` an adapter was handed (`None` = the default set).
@@ -1626,16 +1683,28 @@ fn add_marker(state: State<'_, AppState>, time: f64, name: String, color: Option
 }
 
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 fn update_marker(
     state: State<'_, AppState>,
     marker_id: String,
     time: Option<f64>,
     name: Option<String>,
     color: Option<String>,
+    duration: Option<f64>,
+    comment: Option<String>,
+    kind: Option<kerf_core::MarkerKind>,
 ) -> CmdResult<Timeline> {
     let id = id(&marker_id)?;
+    let patch = kerf_core::MarkerPatch {
+        time,
+        name,
+        color,
+        duration,
+        comment,
+        kind,
+    };
     let project = state.project();
-    project.update_marker(id, time, name, color).map_err(|e| e.to_string())?;
+    project.edit_marker(id, patch).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -1880,6 +1949,83 @@ async fn export_srt(state: State<'_, AppState>, asset_id: String, output_path: S
         Ok(output_path)
     })
     .await
+}
+
+/// Write the cut's captions (its generated overlays, as the export draws them)
+/// to `output_path` as SubRip or WebVTT, by `format` or the path's extension.
+#[tauri::command]
+async fn export_captions(
+    state: State<'_, AppState>,
+    output_path: String,
+    format: Option<kerf_core::SubtitleFormat>,
+) -> CmdResult<String> {
+    require_local_output_path(&output_path)?;
+    let path = std::path::PathBuf::from(&output_path);
+    let format = match format {
+        Some(f) => f,
+        None => kerf_core::SubtitleFormat::from_path(&path).map_err(|e| e.to_string())?,
+    };
+    let timeline = lock_user(&state.project).working_timeline().map_err(|e| e.to_string())?;
+    blocking(move || {
+        let text = Project::captions_document(&timeline, format).map_err(|e| e.to_string())?;
+        Project::write_document(&path, &text).map_err(|e| e.to_string())?;
+        Ok(output_path)
+    })
+    .await
+}
+
+/// Write the cut as OpenTimelineIO or a CMX 3600 EDL (`video_track`: which video
+/// track an EDL holds, 0 = V1), returning the path and what the format dropped.
+#[tauri::command]
+async fn export_interchange(
+    state: State<'_, AppState>,
+    output_path: String,
+    format: kerf_core::InterchangeFormat,
+    video_track: Option<usize>,
+) -> CmdResult<kerf_core::ExportedFile> {
+    require_local_output_path(&output_path)?;
+    let inputs = lock_user(&state.project).delivery_inputs().map_err(|e| e.to_string())?;
+    blocking(move || {
+        let (text, report) =
+            Project::interchange_document(&inputs, format, video_track.unwrap_or(0)).map_err(|e| e.to_string())?;
+        Project::write_document(std::path::Path::new(&output_path), &text).map_err(|e| e.to_string())?;
+        Ok(kerf_core::ExportedFile {
+            path: output_path,
+            report,
+        })
+    })
+    .await
+}
+
+/// Write the markers as a CSV (formula-safe) or as YouTube chapter text.
+#[tauri::command]
+async fn export_markers(
+    state: State<'_, AppState>,
+    output_path: String,
+    format: kerf_core::MarkerListFormat,
+) -> CmdResult<kerf_core::ExportedFile> {
+    require_local_output_path(&output_path)?;
+    let inputs = lock_user(&state.project).delivery_inputs().map_err(|e| e.to_string())?;
+    blocking(move || {
+        let (text, report) = Project::markers_document(&inputs, format).map_err(|e| e.to_string())?;
+        Project::write_document(std::path::Path::new(&output_path), &text).map_err(|e| e.to_string())?;
+        Ok(kerf_core::ExportedFile {
+            path: output_path,
+            report,
+        })
+    })
+    .await
+}
+
+/// Re-time an asset's cached transcript to the speech energy and label its speakers, without
+/// re-transcribing ([`run_refine`]). Stopped by `cancel_analysis`, like an analysis pass.
+#[tauri::command]
+async fn refine_transcript(app: AppHandle, state: State<'_, AppState>, asset_id: String) -> CmdResult<AssetAnalysis> {
+    let id = id(&asset_id)?;
+    let shared = state.project.clone();
+    let cancel = state.analysis_cancel.clone();
+    cancel.store(false, Ordering::SeqCst);
+    blocking(move || run_refine(&app, &|| lock_user(&shared), id, &|| cancel.load(Ordering::SeqCst))).await
 }
 
 #[tauri::command(async)]
@@ -2650,6 +2796,9 @@ async fn export_variants(
         .iter()
         .map(|d| kerf_core::ExportVariant::beside(&base, *d))
         .collect();
+    for variant in &variants {
+        kerf_core::check_caption_sidecars(&variant.output, &options).map_err(|e| e.to_string())?;
+    }
     let shared = state.project.clone();
     let cancel = state.export_cancel.clone();
     cancel.store(false, Ordering::SeqCst);
@@ -2735,6 +2884,69 @@ async fn export_cover(
         let (timeline, assets) = lock_user(&shared).export_still_inputs().map_err(|e| e.to_string())?;
         let path = Project::render_still(&timeline, &assets, time_secs, &output_path, format).map_err(|e| e.to_string())?;
         Ok(path.to_string_lossy().into_owned())
+    })
+    .await
+}
+
+/// The video scopes of the composited frame at `time_secs`: the export's still of the cut (from
+/// the originals) read with the delivery's matrix. The summary always; the grids in `grids`.
+#[tauri::command]
+async fn get_scopes(
+    state: State<'_, AppState>,
+    time_secs: f64,
+    grids: Option<Vec<kerf_core::scopes::ScopeKind>>,
+    matrix: Option<kerf_core::scopes::ScopeMatrix>,
+    size: Option<kerf_core::scopes::GridSize>,
+    max_width: Option<u32>,
+) -> CmdResult<kerf_core::scopes::Scopes> {
+    let shared = state.project.clone();
+    blocking(move || {
+        let (timeline, assets) = lock_user(&shared).export_still_inputs().map_err(|e| e.to_string())?;
+        let req = kerf_core::scopes::ScopeRequest {
+            time_secs,
+            max_width: max_width.map(|w| w.clamp(64, kerf_core::scopes::MAX_SCOPE_WIDTH)),
+            matrix: matrix.unwrap_or_default(),
+            options: kerf_core::scopes::ScopeOptions {
+                grids: grids.unwrap_or_default(),
+                size: size.unwrap_or_default(),
+            },
+        };
+        kerf_core::scopes::timeline_scopes(&timeline, &assets, &req).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// How the Preview will play each span of the cut (`kerf_core::render_bar`): the GPU preview's
+/// compositor where it is on and draws the frame, the FFmpeg stream where it hands over, and the
+/// spans where playback stalls. `width` is the Preview's render width.
+#[tauri::command]
+async fn get_render_bar(
+    state: State<'_, AppState>,
+    gpu: State<'_, Arc<gpu_preview::GpuPreview>>,
+    width: Option<u32>,
+) -> CmdResult<kerf_core::render_bar::RenderBar> {
+    let shared = state.project.clone();
+    let caps = gpu.is_enabled().then_some(kerf_gpu::Compositor::CAPS);
+    blocking(move || {
+        let (timeline, assets, waits) = {
+            let project = lock_user(&shared);
+            let (timeline, assets) = project.export_still_inputs().map_err(|e| e.to_string())?;
+            let waits = project.proxy_waits(0.0, None).map_err(|e| e.to_string())?;
+            (timeline, assets, waits)
+        };
+        let req = kerf_core::render_bar::BarRequest {
+            caps,
+            width: width.unwrap_or(960).clamp(64, 1920),
+            color: kerf_core::composite_color_policy(),
+            media: &kerf_core::ProxyMedia,
+            // Named, not with the build's progress: the bar is asked again on an edit, not as a
+            // proxy builds, so a percentage would go stale under the pointer.
+            waits: waits
+                .iter()
+                .map(|w| (w.asset_id, format!("{} of {}", kerf_core::proxy::PROXY_WAIT_PREFIX, w.name)))
+                .collect(),
+        };
+        Ok(kerf_core::render_bar::render_bar(&timeline, &assets, &req))
     })
     .await
 }
@@ -2888,6 +3100,14 @@ fn agent_status() -> AgentStatus {
         last_seen_secs: mcp::agent_last_seen_secs(),
         error: mcp::server_error(),
     }
+}
+
+/// What the editor window shows (playhead, selection, marks, visible range,
+/// focused panel), for the MCP `get_editor_context` tool. The webview sends it
+/// debounced and as a heartbeat; it is kept in app state, not in the project.
+#[tauri::command(async)]
+fn report_ui_context(state: State<'_, editor_context::EditorContextState>, context: editor_context::UiContext) {
+    state.report(context);
 }
 
 // ---- app settings ----------------------------------------------------------
@@ -3466,12 +3686,16 @@ pub fn run() {
             scrub: scrub.clone(),
         })
         .manage(popout::PopoutState::default())
+        .manage(editor_context::EditorContextState::default())
+        .manage(Mutex::new(recovery::RecoveryState::default()))
         .on_window_event(popout::on_window_event)
         .setup(move |app| {
             // Logging needs the resolved app data directory, so set it up here
             // (before anything else in setup) rather than at the top of `run`.
             init_logging(app.handle());
             install_panic_hook();
+            // The untitled project moves into a crash-recovery file before anything can edit it.
+            recovery::start(app.handle());
             // The editor window is built here, not by Tauri from the config (`create:
             // false` there): only a builder can carry the handler that lets a panel
             // be detached into a window of its own. Otherwise exactly what the config
@@ -3627,6 +3851,10 @@ pub fn run() {
             import_captions,
             import_captions_text,
             export_srt,
+            export_captions,
+            export_interchange,
+            export_markers,
+            refine_transcript,
             remove_silence,
             snap_to_beats,
             smart_crop,
@@ -3672,11 +3900,14 @@ pub fn run() {
             cancel_export,
             cancel_analysis,
             export_cover,
+            get_scopes,
+            get_render_bar,
             platform_targets,
             platform_check,
             reveal_path,
             mcp_endpoint,
             agent_status,
+            report_ui_context,
             get_settings,
             set_settings,
             read_text_file,
@@ -3686,6 +3917,10 @@ pub fn run() {
             log_frontend,
             show_main_window,
             take_launch_project,
+            recovery::list_recoveries,
+            recovery::recover_project,
+            recovery::discard_recovery,
+            recovery::discard_recovery_at_exit,
             popout::popout_expect,
             popout::popout_cancel,
             popout::close_popout,
@@ -3694,10 +3929,11 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building Kerf")
-        .run(|_app, event| {
+        .run(|app, event| {
             // The logfile's last line then says whether the end was a clean exit
             // or a crash.
             if let tauri::RunEvent::Exit = event {
+                recovery::on_exit(app);
                 tracing::info!("kerf exiting");
             }
         });

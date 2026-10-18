@@ -5,8 +5,20 @@ used under the MIT License below. The adapted code is listed here.
 
 ## Adapted from FilmCraft
 
-- crates/kerf-core/src/engine/audio_sync.rs — from FilmCraft crates/audio-dsp/src/sync.rs
-
+- `crates/kerf-core/src/interchange/mod.rs` — from FilmCraft `crates/interchange/src/lib.rs` (the `Report` merge design), `crates/interchange/src/common.rs` (`path_to_file_url`) and `crates/time/src/lib.rs` (drop-frame timecode)
+- `crates/kerf-core/src/interchange/edl.rs` — from FilmCraft `crates/interchange/src/edl.rs`
+- `crates/kerf-core/src/interchange/otio.rs` — from FilmCraft `crates/interchange/src/otio.rs`
+- `crates/kerf-core/src/interchange/markers.rs` — from FilmCraft `crates/engine/src/marker_export.rs` (CSV formula escaping)
+- `crates/kerf-app/src/mcp/args.rs` — from FilmCraft `crates/automation/src/server.rs` (the strict-argument check)
+- `crates/kerf-app/src/mcp.rs` (`every_tool_is_titled_and_annotated`) — from FilmCraft `crates/automation/src/server.rs` (`tools_are_titled_and_annotated`)
+- `crates/kerf-core/src/engine/vad.rs` — from FilmCraft `crates/speech/src/vad.rs`
+- `crates/kerf-core/src/engine/diarize.rs` — from FilmCraft `crates/speech/src/diarize.rs`
+- `crates/kerf-core/src/engine/mel.rs` — from FilmCraft `crates/speech/src/mel.rs`
+- `crates/kerf-core/src/project/store.rs` (`vacuum_into_atomic` and its tests) — from FilmCraft `crates/format/src/atomic.rs`
+- `crates/kerf-core/src/timecode.rs` — from FilmCraft `crates/time/src/lib.rs` (`parse_timecode`, `frames_to_fields`, `fields_to_frames`)
+- `frontend/src/lib/timecode.ts` (drop-frame fields and timecode parsing) — from FilmCraft `crates/time/src/lib.rs`
+- `frontend/src/lib/keymap.ts` (`KEY_PRESETS`) — from FilmCraft `crates/engine/src/shortcut_presets.rs`
+- `crates/kerf-core/src/engine/audio_sync.rs` — from FilmCraft `crates/audio-dsp/src/sync.rs`
 
 ## FilmCraft license
 

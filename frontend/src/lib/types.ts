@@ -69,6 +69,23 @@ export interface TranscriptSegment {
 	start: number;
 	end: number;
 	text: string;
+	/** The line's words with their own source times, when known. Absent in a transcript
+	 *  made before words were recorded and in imported captions. */
+	words?: Word[];
+	/** Who speaks the line (`S1`, `S2`, …), when speakers were labelled. */
+	speaker?: string | null;
+}
+
+/** One word of a transcript line, in the asset's source time. */
+export interface Word {
+	text: string;
+	start: number;
+	end: number;
+	confidence?: number | null;
+	/** Spread over the line by character share (the backend reports no word times), then
+	 *  tightened to the speech energy. */
+	estimated?: boolean;
+	speaker?: string | null;
 }
 
 export interface Loudness {
@@ -530,8 +547,8 @@ export interface CaptionOptions {
 	size?: number;
 }
 
-/** A subtitle format Kerf reads: SubRip (`.srt`) or ASS / SSA (`.ass`, `.ssa`). */
-export type CaptionFormat = 'srt' | 'ass';
+/** A subtitle format Kerf reads: SubRip (`.srt`), WebVTT (`.vtt`) or ASS / SSA (`.ass`, `.ssa`). */
+export type CaptionFormat = 'srt' | 'ass' | 'vtt';
 
 /** Which clock an imported subtitle file's times are on. `timeline`: a subtitle
  *  track made for the finished cut (the default). `source`: the file times one
@@ -717,6 +734,51 @@ export interface Marker {
 	time: number;
 	name: string;
 	color?: string | null;
+	/** How long the marked span runs from `time`, seconds. Absent / 0 is a point. */
+	duration?: number;
+	/** A free-form note. Absent is none. */
+	comment?: string;
+	/** Absent is `comment`. A `chapter` starts a chapter of the exported file. */
+	kind?: MarkerKind;
+}
+
+/** What a marker is for — mirrors `kerf_core::MarkerKind`. */
+export type MarkerKind = 'comment' | 'chapter';
+
+/** A change to a marker; each absent field is left alone. */
+export interface MarkerPatch {
+	time?: number;
+	name?: string;
+	color?: string;
+	duration?: number;
+	comment?: string;
+	kind?: MarkerKind;
+}
+
+/** A subtitle format Kerf writes (`kerf_core::SubtitleFormat`). */
+export type SubtitleFormat = 'srt' | 'vtt';
+
+/** An interchange format (`kerf_core::InterchangeFormat`). */
+export type InterchangeFormat = 'otio' | 'edl';
+
+/** A marker list a delivery carries (`kerf_core::MarkerListFormat`). */
+export type MarkerListFormat = 'csv' | 'youtube';
+
+/** One line of an export `Report`: what was dropped or approximated, and how often. */
+export interface ReportEntry {
+	level: 'info' | 'warning';
+	message: string;
+	count: number;
+}
+
+export interface Report {
+	entries: ReportEntry[];
+}
+
+/** A side-file written, and what its format could not carry (`kerf_core::ExportedFile`). */
+export interface ExportedFile {
+	path: string;
+	report: Report;
 }
 
 /** The frame the project is cut *for* — the shape of the delivered video.
@@ -991,6 +1053,14 @@ export interface ExportOptions {
 	/** Reach the target with one measured static gain and a true-peak limiter instead of
 	 *  `loudnorm` (the export measures the mix first; dynamics stay as mixed). */
 	loudness_static?: boolean;
+	/** Mux the cut's captions in as a soft subtitle stream (mp4 / mov / mkv / webm). */
+	embed_captions?: boolean;
+	/** Caption files written beside the export (`cut.srt`, `cut.vtt`), once it completes. */
+	caption_sidecars?: SubtitleFormat[];
+	/** Replace caption files already beside the export; otherwise the export is refused. */
+	overwrite_sidecars?: boolean;
+	/** Leave the generated captions out of the picture (typed titles are still drawn). */
+	skip_burned_captions?: boolean;
 }
 
 /** What syncing a clip to another by their sound found (`kerf_core::AudioSync`). */
@@ -1222,6 +1292,18 @@ export interface StemsResult {
  *  tagged): a `.kerf` that exists, or one named on the command line that is not
  *  there — never created, so the page says so instead. */
 export type LaunchRequest = { open: string } | { missing: string };
+
+/** An untitled project a crashed Kerf left behind (kerf-core `RecoveryInfo`), offered at launch. */
+export interface RecoveryInfo {
+	id: string;
+	/** When its file was last written (ISO 8601), if known. */
+	modified_at: string | null;
+	assets: number;
+	clips: number;
+	/** Edits in its history, the initial state not counted. */
+	edits: number;
+	last_edit: string | null;
+}
 
 /** A newer signed release found on GitHub by the updater. */
 export interface UpdateInfo {
@@ -1463,4 +1545,112 @@ export interface PlayAsk {
 export interface MusicFitted {
 	timeline: Timeline;
 	report: MusicFitReport;
+}
+
+/** What the editor window shows, reported for an agent's `get_editor_context`
+ *  (`crates/kerf-app/src/editor_context.rs`). Timeline seconds; ids are the live timeline's. */
+export interface UiContext {
+	playhead: number;
+	selected_clip_ids: string[];
+	mark_in: number | null;
+	mark_out: number | null;
+	visible_range: { start: number; end: number } | null;
+	focused_panel: string | null;
+	selected_asset_id: string | null;
+}
+
+/** A scope the Scopes panel draws (`kerf_core::scopes::ScopeKind`). */
+export type ScopeKind = 'waveform' | 'parade' | 'vectorscope' | 'histogram';
+/** The Y'CbCr matrix the scopes read the frame with; `auto` is the delivery's. */
+export type ScopeMatrix = 'auto' | 'bt601' | 'bt709' | 'bt2020';
+
+export interface ScopeGridSize {
+	columns: number;
+	rows: number;
+	vector: number;
+}
+
+/** One channel over every pixel of the frame: levels 0..1, pixels clipped at 0 and at 1. */
+export interface ScopeChannel {
+	min: number;
+	max: number;
+	mean: number;
+	clipped_low: number;
+	clipped_high: number;
+	clipped_low_pct: number;
+	clipped_high_pct: number;
+}
+
+/** Mean Cb / Cr (-0.5..0.5), the hue (degrees from +Cb) and saturation (|CbCr| / 0.5) of
+ *  that mean, and the mean of every pixel's saturation. */
+export interface ScopeChroma {
+	cb: number;
+	cr: number;
+	hue_deg: number;
+	saturation: number;
+	mean_saturation: number;
+}
+
+export interface ScopePeak {
+	cb: number;
+	cr: number;
+	hue_deg: number;
+	saturation: number;
+	share: number;
+}
+
+export interface ScopeSummary {
+	width: number;
+	height: number;
+	matrix: 'bt601' | 'bt709' | 'bt2020';
+	red: ScopeChannel;
+	green: ScopeChannel;
+	blue: ScopeChannel;
+	luma: ScopeChannel;
+	chroma: ScopeChroma;
+	peaks: ScopePeak[];
+}
+
+/** Counts: `counts[row * columns + column]`, row 0 the lowest level (the most negative Cr on
+ *  the vectorscope, Cb across). */
+export interface ScopeGrid {
+	columns: number;
+	rows: number;
+	counts: number[];
+}
+
+/** 256 bins per channel. */
+export interface ScopeHistogram {
+	red: number[];
+	green: number[];
+	blue: number[];
+	luma: number[];
+}
+
+/** `kerf_core::scopes::Scopes`: the summary always, the grids that were asked for. */
+export interface Scopes {
+	summary: ScopeSummary;
+	waveform?: ScopeGrid;
+	/** Red, green, blue. */
+	parade?: ScopeGrid[];
+	vectorscope?: ScopeGrid;
+	histogram?: ScopeHistogram;
+}
+
+/** How the Preview plays a span (`kerf_core::render_bar::BarState`). */
+export type BarState = 'gpu' | 'stream' | 'stall';
+
+export interface BarSpan {
+	start: number;
+	end: number;
+	state: BarState;
+	/** A stable key for the reason (`reversed`, `proxy_wait`, `mask`, `gpu`, …). */
+	kind: string;
+	reason: string;
+}
+
+/** `kerf_core::render_bar::RenderBar`: with the GPU preview off only the stalls are listed. */
+export interface RenderBar {
+	gpu_preview: boolean;
+	spans: BarSpan[];
 }

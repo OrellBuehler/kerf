@@ -1,5 +1,13 @@
 import { describe, expect, test } from 'bun:test';
-import { CONFIRM, UNSAVED, UPDATE_UNSAVED_NOTE, installPrompt, proceedAfter, unsavedChoice } from './confirm-copy';
+import {
+	CONFIRM,
+	UNSAVED,
+	UPDATE_UNSAVED_NOTE,
+	installPrompt,
+	leaveAfter,
+	proceedAfter,
+	unsavedChoice
+} from './confirm-copy';
 
 describe('the unsaved-project prompts', () => {
 	test('say the same fact the same way, and name each ending', () => {
@@ -44,6 +52,25 @@ describe('which choice a native answer is', () => {
 	test('Replace says Discard where Close says Don’t save', () => {
 		expect(unsavedChoice('Discard', UNSAVED.replace)).toBe('discard');
 		expect(unsavedChoice('Discard', UNSAVED.close)).toBe('cancel');
+	});
+});
+
+describe('leaving', () => {
+	test("only Don't save lets the recovery session go", async () => {
+		let letGo = 0;
+		const go = async () => void letGo++;
+		expect(await leaveAfter('discard', async () => true, go)).toBe(true);
+		expect(letGo).toBe(1);
+		expect(await leaveAfter('cancel', async () => true, go)).toBe(false);
+		expect(await leaveAfter('save', async () => true, go)).toBe(true);
+		expect(await leaveAfter('save', async () => false, go)).toBe(false);
+		expect(letGo).toBe(1);
+	});
+	test('a failure to let it go still leaves', async () => {
+		const fail = async () => {
+			throw new Error('no backend');
+		};
+		expect(await leaveAfter('discard', async () => true, fail)).toBe(true);
 	});
 });
 

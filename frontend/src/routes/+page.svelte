@@ -35,11 +35,15 @@
 	} from '$lib/ops';
 	import { allowsRepeat, type ActionId } from '$lib/keymap';
 	import { runMenuCommand } from '$lib/menu-commands';
-	import { saveCoverFrame, saveProject } from '$lib/file-actions';
+	import { exportCaptionFile, exportInterchangeFile, exportMarkerList, saveCoverFrame, saveProject } from '$lib/file-actions';
 	import { importCaptionFile } from '$lib/title-actions';
 	import {
+		askRecovery,
 		askUnsaved,
+		discardRecovery,
+		discardRecoveryAtExit,
 		inTauri,
+		listRecoveries,
 		isMediaPath,
 		confirmAction,
 		onAnalysisStatus,
@@ -47,18 +51,21 @@
 		onWindowCloseRequested,
 		openReleases,
 		quitApp,
+		reportUiContext,
 		revealLogs,
 		setWindowTitle,
 		showMainWindow,
 		takeLaunchProject
 	} from '$lib/api';
 	import { windowTitle } from '$lib/window-title';
+	import { createContextReporter, uiContext } from '$lib/editor-context';
 	import { finishImport, importMedia } from '$lib/import-media';
 	import { clipsIn, exportButtonState } from '$lib/export-button';
 	import { afterPaint, fontsReady, revealWindow } from '$lib/reveal';
 	import { missingProjectMessage } from '$lib/launch';
+	import { recoveryCopy } from '$lib/recovery';
 	import { tip } from '$lib/tip';
-	import { CONFIRM, UNSAVED, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
+	import { CONFIRM, UNSAVED, leaveAfter, proceedAfter, type UnsavedCopy } from '$lib/confirm-copy';
 	import { changeIndex, changePoints, stepChange } from '$lib/staged-diff';
 	import { clampPlayhead, secondFrames, stepFrames } from '$lib/frames';
 	import { isPagingKey, onEditorSurface } from '$lib/focus-area';
@@ -83,6 +90,26 @@
 	$effect(() => {
 		void editor.assets.map((a) => a.id).join(',');
 		untrack(() => void mediaStatus.refresh());
+	});
+
+	// What the editor shows, for an agent's `get_editor_context` (throttled, `editor-context.ts`).
+	$effect(() => {
+		if (!inTauri()) return;
+		const reporter = createContextReporter((c) => void reportUiContext(c).catch(() => {}));
+		$effect(() =>
+			reporter.update(
+				uiContext({
+					time: ui.time,
+					selectedClipIds: editor.selectedClipIds,
+					markIn: ui.markIn,
+					markOut: ui.markOut,
+					view: ui.timelineView,
+					panel: ui.focusedPanel,
+					assetId: editor.selectedAssetId
+				})
+			)
+		);
+		return () => reporter.stop();
 	});
 
 	// A modal over the editor window puts what is in the detached windows out of reach too.
@@ -142,7 +169,7 @@
 		// would drop it without a word, so ask first.
 		void onWindowCloseRequested(
 			() => editor.hasUnsavedWork,
-			() => proceedUnsaved(UNSAVED.close)
+			() => leaveUnsaved(UNSAVED.close)
 		).then((un) => unlisteners.push(un));
 
 		// Each asset's preview proxy and per-kind analysis, kept current by the backend's events
@@ -250,6 +277,7 @@
 				// goes through the same path as the event, unsaved-work question
 				// included. A path that is not there is reported, never created.
 				await firstLoad;
+				await offerRecoveries();
 				const launched = await takeLaunchProject().catch(() => null);
 				if (launched && 'open' in launched) await openProjectAt(launched.open);
 				else if (launched) toast.error(missingProjectMessage(launched.missing));
@@ -266,10 +294,37 @@
 		return !editor.hasUnsavedWork || proceedUnsaved(UNSAVED.replace);
 	}
 
+	/** Untitled projects a crashed run left behind, newest first: Recover opens one (asking about
+	 *  this project's unsaved work first) and the rest wait for the next launch, Discard deletes it,
+	 *  Not now keeps it for the next launch. */
+	async function offerRecoveries() {
+		const found = await listRecoveries().catch(() => []);
+		for (const info of found) {
+			const choice = await askRecovery(recoveryCopy(info));
+			try {
+				if (choice === 'discard') await discardRecovery(info.id);
+				if (choice !== 'recover' || !(await okToReplace())) continue;
+				if (await editor.recoverProject(info.id)) {
+					ui.projectReplaced();
+					await agent.load();
+					toast.success('Recovered the unsaved project', { description: 'Save it to keep it.' });
+					return;
+				}
+			} catch (e) {
+				toast.error("Couldn't recover the project", { description: e instanceof Error ? e.message : String(e) });
+			}
+		}
+	}
+
 	/** The unsaved-project prompt and what its answer means: whether to go ahead. "Save…" opens
 	 *  the save dialog and goes ahead only once the project is on disk. */
 	async function proceedUnsaved(copy: UnsavedCopy): Promise<boolean> {
 		return proceedAfter(await askUnsaved(copy), saveProject);
+	}
+
+	/** [`proceedUnsaved`] for closing or quitting: "Don't save" also lets the recovery session go. */
+	async function leaveUnsaved(copy: UnsavedCopy): Promise<boolean> {
+		return leaveAfter(await askUnsaved(copy), saveProject, discardRecoveryAtExit);
 	}
 
 	async function onNew() {
@@ -334,7 +389,7 @@
 		}
 		await quitApp(
 			() => editor.hasUnsavedWork,
-			() => proceedUnsaved(UNSAVED.quit)
+			() => leaveUnsaved(UNSAVED.quit)
 		);
 	}
 
@@ -439,6 +494,11 @@
 		'file.export': () => onExport(),
 		'file.importCaptions': () => void importCaptionFile(),
 		'file.saveCover': () => void saveCoverFrame(),
+		'file.exportCaptions': () => void exportCaptionFile(),
+		'file.exportOtio': () => void exportInterchangeFile('otio'),
+		'file.exportEdl': () => void exportInterchangeFile('edl'),
+		'file.exportMarkers': () => void exportMarkerList('csv'),
+		'file.exportChapters': () => void exportMarkerList('youtube'),
 		'app.settings': () => settings.toggle(),
 		'app.quit': () => void onQuit(),
 
@@ -517,6 +577,13 @@
 		'playback.jumpForward': () => step(secondFrames(editor.fps)),
 		'playback.toStart': () => ui.seek(0),
 		'playback.toEnd': () => ui.seek(editor.duration),
+		// The timeline's timecode where it is on screen, else the transport's.
+		'playback.goToTimecode': () => {
+			const fields = [...document.querySelectorAll<HTMLInputElement>('[data-timecode-entry]')].filter((el) => el.getClientRects().length > 0);
+			const field = fields.find((el) => el.dataset.timecodeEntry === 'timeline') ?? fields[0];
+			if (!field) return false;
+			field.focus();
+		},
 
 		'marker.add': () =>
 			void editor

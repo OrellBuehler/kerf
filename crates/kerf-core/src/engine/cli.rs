@@ -884,7 +884,7 @@ pub(crate) fn projection_from_shape(path: Option<&Path>, width: Option<u32>, hei
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("insv") || e.eq_ignore_ascii_case("insp"));
     match (insta360, width, height) {
-        (true, Some(w), Some(h)) if h > 0 && w == h * 2 => Some(Projection::DualFisheye),
+        (true, Some(w), Some(h)) if h > 0 && h.checked_mul(2) == Some(w) => Some(Projection::DualFisheye),
         _ => None,
     }
 }
@@ -3786,6 +3786,26 @@ pub struct ExportOptions {
     #[serde(skip)]
     #[schemars(skip)]
     pub loudness_gain_db: Option<f64>,
+    /// Mux the cut's captions in as a soft subtitle stream (`mov_text` in mp4 / mov,
+    /// `webvtt` in webm, `srt` in mkv). Refused for a container that carries none.
+    pub embed_captions: bool,
+    /// Write the cut's captions beside the export, one file per format
+    /// (`cut.mp4` → `cut.srt` / `cut.vtt`).
+    pub caption_sidecars: Vec<crate::captions_export::SubtitleFormat>,
+    /// Replace caption files already beside the output (the MCP `export` tool's `overwrite`,
+    /// or the GUI's confirmation); otherwise an export that would is refused.
+    pub overwrite_sidecars: bool,
+    /// Leave the generated captions out of the picture (typed titles are still drawn), for
+    /// a delivery that carries them as a subtitle track or a file instead.
+    pub skip_burned_captions: bool,
+    /// Set by the render, never by a caller: the SubRip file of the cut's captions
+    /// to mux in (see `side_files`).
+    #[serde(skip)]
+    pub subtitle_input: Option<String>,
+    /// Set by the render, never by a caller: the FFMETADATA file of the cut's
+    /// chapter markers to mux in.
+    #[serde(skip)]
+    pub chapters_input: Option<String>,
 }
 
 /// The most static loudness normalization raises or lowers a mix, in dB: a near-silent
@@ -3867,6 +3887,12 @@ impl Default for ExportOptions {
             loudness: None,
             loudness_static: false,
             loudness_gain_db: None,
+            embed_captions: false,
+            caption_sidecars: Vec::new(),
+            overwrite_sidecars: false,
+            skip_burned_captions: false,
+            subtitle_input: None,
+            chapters_input: None,
         }
     }
 }
@@ -4129,6 +4155,12 @@ pub fn validate_export(opts: &ExportOptions, has_video: bool, has_audio: bool) -
                 issues.push(format!("Invalid audio bitrate \"{b}\"."));
             }
         }
+    }
+    if opts.embed_captions && side_files::subtitle_codec(c).is_none() {
+        issues.push(format!(
+            "A .{} file can't carry subtitles; write them beside the export instead.",
+            c.ext()
+        ));
     }
     issues
 }
@@ -4471,7 +4503,10 @@ fn build_export_args_phase(
 ) -> Result<Vec<String>> {
     // Drop muted / solo-shadowed tracks and disabled clips up front, and cut the range an export
     // of one span draws, so the rest of the builder never has to reason about either.
-    let cut = export_timeline(timeline, opts);
+    let mut cut = export_timeline(timeline, opts);
+    if opts.skip_burned_captions {
+        cut.overlays.retain(|o| !o.generated);
+    }
     let timeline = &cut;
 
     // Stream gating: decide what the graph emits and what we `-map`, in lockstep.
@@ -4511,6 +4546,11 @@ fn build_export_args_phase(
     if want_video {
         svg_layer::push_inputs(&svg_layer::svg_sequences(timeline, &fmt), &fmt, &mut args);
     }
+    let side = if pass == PassPhase::First {
+        side_files::SideInputs::default()
+    } else {
+        side_files::push_inputs(opts, &mut args)
+    };
 
     let total = timeline.duration();
     let graph = build_filter_complex(timeline, assets, &fmt, total, opts, want_video, want_audio, &plan);
@@ -4524,6 +4564,7 @@ fn build_export_args_phase(
         args.push("-map".to_string());
         args.push("[outa]".to_string());
     }
+    side_files::push_maps(&side, &mut args);
 
     // ---- video output options (only when a codec is explicitly chosen; a bare
     // default still maps [outv] and lets ffmpeg pick the encoder, as before) ----
@@ -5388,11 +5429,20 @@ pub fn render_with_progress(
     let Some(_titles) = svg_layer::prepare_export(timeline, assets, opts, progress, cancel)? else {
         return Ok(RenderStatus::Cancelled);
     };
-    retry_export_in_software(
-        opts,
+    // The captions and chapters to mux in are files for the length of the export. The caption
+    // files beside it are checked first and written only once it has completed, so a cancelled or
+    // failed export never touches a file already there.
+    let (opts, _side) = side_files::prepare(timeline, opts)?;
+    side_files::check_sidecars(output, &opts)?;
+    let result = retry_export_in_software(
+        &opts,
         |o, hw_used| render_attempt(timeline, assets, output, o, progress, cancel, hw_used),
         convict_hardware_decode,
-    )
+    )?;
+    if result == RenderStatus::Completed {
+        side_files::write_sidecars(timeline, output, &opts)?;
+    }
+    Ok(result)
 }
 
 /// Fill in `opts.loudness_gain_db` for a static loudness normalization that has not been
@@ -5565,12 +5615,19 @@ fn export_resource(args: &[String], facts_of: &dyn Fn(&str) -> InputFacts, lane_
     }
     // Inputs, in groups: everything up to and including each `-i <path>`.
     let mut group_hwaccel: Option<&str> = None;
+    let mut side_input = false;
     let mut graph: Option<&str> = None;
     let mut inputs = 0;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "-hwaccel" => group_hwaccel = rest.next().map(String::as_str),
+            // The captions and chapters a render muxes in decode no picture.
+            "-f" => side_input = rest.next().is_some_and(|f| side_files::is_side_format(f)),
+            "-i" if side_input => {
+                side_input = false;
+                rest.next();
+            }
             "-i" => {
                 inputs += 1;
                 let Some(path) = rest.next() else { return cpu::Resource::Cpu };
@@ -5659,6 +5716,12 @@ pub struct VariantProgress {
 /// not started never existed. `opts` is the encode shared by all of them; its
 /// `resolution` and `fit` are replaced per variant by the delivery. Returns the
 /// status and how many files were completed.
+/// Refuse an export whose caption files would replace ones already beside `output`, unless
+/// `opts.overwrite_sidecars` allows it. A multi-format export asks this of every variant first.
+pub fn check_caption_sidecars(output: &Path, opts: &ExportOptions) -> Result<()> {
+    side_files::check_sidecars(output, opts)
+}
+
 pub fn render_variants(
     timeline: &Timeline,
     assets: &[Asset],
@@ -7831,6 +7894,36 @@ pub fn timeline_frame(
     run_still(timeline, assets, opts, t, max_width, None, &StillOutput::JpegPipe { quality })
 }
 
+/// The composited still at `t` as its Y'CbCr samples: limited-range 4:4:4 planes (Y, then Cb,
+/// then Cr) of the frame [`timeline_frame`] would encode, with its size. The scopes read this
+/// rather than an RGB conversion, whose matrix is the composite's and not the delivery's.
+pub fn timeline_frame_yuv(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    max_width: u32,
+) -> Result<(u32, u32, Vec<u8>)> {
+    let fmt = export_format(&timeline.for_render(), assets, opts);
+    let (w, h) = still_size(fmt.width, fmt.height, max_width);
+    let planes = run_still(
+        timeline,
+        assets,
+        opts,
+        t,
+        max_width,
+        None,
+        &StillOutput::Yuv444Pipe { width: w, height: h },
+    )?;
+    if planes.len() != (w as usize) * (h as usize) * 3 {
+        return Err(Error::Engine(format!(
+            "could not render timeline frame at {t:.3}s: {} bytes for a {w}x{h} frame",
+            planes.len()
+        )));
+    }
+    Ok((w, h, planes))
+}
+
 /// [`timeline_frame`] of one `region` of the composited canvas. The canvas is
 /// rendered large enough that the region alone comes out `max_width` wide
 /// (capped at the delivery frame, so nothing is invented), then cropped — a
@@ -7898,6 +7991,12 @@ fn run_still(
     out: &StillOutput,
 ) -> Result<Vec<u8>> {
     let piping = matches!(out, StillOutput::JpegPipe { .. });
+    // The scopes are a measurement, not the frame the user is waiting to see: niced. Their output
+    // size is known, so the read buffer is allocated once instead of doubling through ~3 MB.
+    let (background, capacity) = match out {
+        StillOutput::Yuv444Pipe { width, height } => (true, (*width as usize) * (*height as usize) * 3),
+        _ => (false, 0),
+    };
     let hw_used = std::cell::Cell::new(false);
     // The titles' pictures, on disk and kept for the run (and its software retry).
     let _titles = still_titles(timeline, assets, opts, t, max_width, region)?;
@@ -7905,7 +8004,8 @@ fn run_still(
         let mut args = build_still_args(timeline, assets, o, t, max_width, region, out)?;
         hw_used.set(tune_still_args(&mut args, assets, HostOs::CURRENT));
         let bin = ffmpeg_bin();
-        let output = output_bounded(command(&bin).args(&args), STILL_TIMEOUT).map_err(|e| match e.kind() {
+        let mut cmd = if background { bg_command(&bin) } else { command(&bin) };
+        let output = output_bounded(cmd.args(&args), STILL_TIMEOUT, capacity).map_err(|e| match e.kind() {
             std::io::ErrorKind::TimedOut => Error::Engine(format!(
                 "could not render timeline frame at {t:.3}s: ffmpeg did not answer in {} s and was stopped",
                 STILL_TIMEOUT.as_secs()
@@ -7946,9 +8046,9 @@ const STILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// `Command::output()` with a deadline: run `cmd` with its stdin closed and both output pipes
 /// read, and kill it if it has not finished in `limit` (`ErrorKind::TimedOut`). The calling thread
-/// reads stdout to its end, a watchdog kills the process at the deadline (which ends that read),
+/// reads stdout to its end (into a buffer of `capacity` bytes up front), a watchdog kills the process at the deadline (which ends that read),
 /// and nothing waits on the child while the watchdog could need it.
-fn output_bounded(cmd: &mut Command, limit: std::time::Duration) -> std::io::Result<std::process::Output> {
+fn output_bounded(cmd: &mut Command, limit: std::time::Duration, capacity: usize) -> std::io::Result<std::process::Output> {
     use std::io::Read;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{channel, RecvTimeoutError};
@@ -7981,7 +8081,7 @@ fn output_bounded(cmd: &mut Command, limit: std::time::Duration) -> std::io::Res
         }
         text
     });
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(capacity);
     let read = match stdout.as_mut() {
         Some(o) => o.read_to_end(&mut out).map(|_| ()),
         None => Ok(()),
@@ -8061,6 +8161,9 @@ pub enum StillOutput {
     /// Raw `rgb24` on stdout — only for [`composite_color_policy`]'s probe, which
     /// wants the converted pixels themselves.
     RgbPipe,
+    /// Raw planar `yuv444p` on stdout — [`timeline_frame_yuv`], for the scopes. The frame's size
+    /// sizes the read buffer; the argv does not carry it (the graph scales to `max_width`).
+    Yuv444Pipe { width: u32, height: u32 },
 }
 
 /// The image formats a cover frame can be written as.
@@ -8115,6 +8218,9 @@ impl StillOutput {
             }
             StillOutput::RgbPipe => {
                 a.extend(["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"].map(String::from));
+            }
+            StillOutput::Yuv444Pipe { .. } => {
+                a.extend(["-f", "rawvideo", "-pix_fmt", "yuv444p", "pipe:1"].map(String::from));
             }
             StillOutput::File { path, format, quality } => {
                 if *format == ImageFormat::Jpeg {
@@ -8662,6 +8768,10 @@ use still_fx::{still_layers, StillFades};
 /// Animated SVG titles as PNG sequences and stills: drawn before ffmpeg is spawned, overlaid by it.
 mod svg_layer;
 
+/// The cut's captions and chapter markers muxed into an export, and the caption
+/// files written beside it.
+mod side_files;
+
 /// Titles through the real ffmpeg (`#[ignore]`d).
 #[cfg(test)]
 mod svg_rendered;
@@ -8669,6 +8779,10 @@ mod svg_rendered;
 /// Which slot a job takes, the cores' or the hardware's.
 #[cfg(test)]
 mod lane_tests;
+
+/// ffprobe's JSON and ffmpeg's logs, mutated: nothing panics.
+#[cfg(test)]
+mod hostile_tests;
 
 /// The deadline on a one-shot still's process.
 #[cfg(all(test, unix))]
@@ -10156,6 +10270,27 @@ mod tests {
         let args = build_still_args(&timeline, &assets, &ExportOptions::default(), 1.0, u32::MAX, None, &out).unwrap();
         assert!(args.windows(2).any(|w| w[0] == "-vcodec" && w[1] == "png"));
         assert!(!args.contains(&"-q:v".to_string()), "-q:v is meaningless for png: {args:?}");
+    }
+
+    #[test]
+    fn the_scopes_still_pipes_raw_yuv444_and_is_otherwise_the_jpeg_still() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let assets = vec![asset.clone()];
+        let timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
+        let o = ExportOptions::default();
+        let yuv = StillOutput::Yuv444Pipe { width: 960, height: 540 };
+        let args = build_still_args(&timeline, &assets, &o, 1.0, 960, None, &yuv).unwrap();
+        let tail = ["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv444p", "pipe:1"];
+        assert_eq!(&args[args.len() - tail.len()..], tail.map(String::from).as_slice());
+        let jpeg = build_still_args(&timeline, &assets, &o, 1.0, 960, None, &StillOutput::JpegPipe { quality: 3 }).unwrap();
+        let head = |a: &[String]| a[..a.iter().position(|x| x == "-frames:v").unwrap()].to_vec();
+        assert_eq!(head(&args), head(&jpeg), "only the sink differs");
+        // The size only sizes the read buffer.
+        let other = StillOutput::Yuv444Pipe { width: 1, height: 1 };
+        assert_eq!(
+            build_still_args(&timeline, &assets, &o, 1.0, 960, None, &other).unwrap(),
+            args
+        );
     }
 
     #[test]
@@ -12168,11 +12303,13 @@ mod tests {
                 start: 1.5,
                 end: 3.0,
                 text: "first".into(),
+                ..Default::default()
             },
             TranscriptSegment {
                 start: 3.0,
                 end: 4.25,
                 text: "second".into(),
+                ..Default::default()
             },
         ]);
         assert!(srt.contains("1\n00:00:01,500 --> 00:00:03,000\nfirst"), "{srt}");

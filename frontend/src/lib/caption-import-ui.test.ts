@@ -339,7 +339,7 @@ describe('words around the import', () => {
 
 describe('files and paths', () => {
 	test('the picker offers the extensions the backend reads', () => {
-		expect([...CAPTION_EXTENSIONS]).toEqual(['srt', 'ass', 'ssa']);
+		expect([...CAPTION_EXTENSIONS]).toEqual(['srt', 'vtt', 'ass', 'ssa']);
 	});
 
 	test('a base name takes either separator', () => {

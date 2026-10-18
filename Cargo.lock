@@ -2497,6 +2497,7 @@ dependencies = [
  "flate2",
  "fontdb",
  "imagesize",
+ "kerf-core",
  "libc",
  "misaki-rs",
  "ort",

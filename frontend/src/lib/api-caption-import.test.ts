@@ -69,7 +69,7 @@ describe('picking a subtitle file (desktop)', () => {
 	test('opens the native dialog on subtitle extensions and answers with the path', async () => {
 		dialogAnswer = '/home/me/subs/movie.srt';
 		expect(await pickCaptionFile()).toEqual({ kind: 'path', path: '/home/me/subs/movie.srt', name: 'movie.srt' });
-		expect(opened).toEqual([{ multiple: false, filters: [{ name: 'Subtitles', extensions: ['srt', 'ass', 'ssa'] }] }]);
+		expect(opened).toEqual([{ multiple: false, filters: [{ name: 'Subtitles', extensions: ['srt', 'vtt', 'ass', 'ssa'] }] }]);
 	});
 
 	test('names a Windows path by its file', async () => {

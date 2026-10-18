@@ -127,8 +127,12 @@
   that were cut out get none. It reads through `for_render`, so a muted track is
   as uncaptioned as it is unheard; it chunks a sentence to `CaptionOptions`
   (a speech model emits whole sentences and a whole sentence does not fit a
-  9:16 frame), timing lines by *character share*
-  because neither speech backend reports word timings; lines too short to read
+  9:16 frame). A segment **with `words`** is chunked over its words (`word_chunks`, the same
+  `max_words` / `max_chars` rule): a line runs from its first word's start to the next line's, or
+  across a pause to its last word's end + `CAPTION_HOLD` (0.5 s; the last line no further than the
+  segment end), and is kept only if the span its words are *spoken* in meets the clip (a hold
+  reaching past an in-point captions nothing). One **without** words (an imported cue, an older
+  transcript) is timed by *character share* as before, so those caption byte-identically; lines too short to read
   merge back into a neighbour instead of flashing; and no two lines are ever on
   screen at once (captions are one lane of text, and the same footage reaching
   the cut twice would otherwise collide with itself). `TextOverlay.generated`
@@ -179,7 +183,12 @@
   wants `-3600`. The
   parsers are pure and tolerant — SubRip (BOM, CRLF / CR, missing or absurd indices, a
   `,` or `.` fraction read as a *decimal* fraction, `<i>` / `<font>` and `{\an8}`
-  stripped, no blank line between cues with the index handed back to its cue) and ASS /
+  stripped, no blank line between cues with the index handed back to its cue), **WebVTT**
+  (`parse_vtt`: blank-line blocks; the `WEBVTT` header, `NOTE` / `STYLE` / `REGION` skipped
+  uncounted, an optional cue id, `.` milliseconds and optional hours, cue settings ignored,
+  `<v Speaker>` / `<c.x>` / `<b>` and inline `<00:01.000>` timestamps removed, `&amp;`-style
+  references decoded *after* markup so `&lt;i&gt;` stays text; captions have no speaker
+  field, so a voice's name is dropped; `detect` says `vtt` for a `WEBVTT` first line) and ASS /
   SSA (the `[Events]` `Format:` line picks the columns, `Dialogue:` only, `{…}` blocks
   and `\p` drawings dropped, `\N` / `\h`) — and what they cannot read is **counted,
   never fatal** (`skipped_lines`: empty or zero / negative-length cues, a stray line, a
@@ -225,8 +234,21 @@
   revision computed inside the `edit_timeline` closure (an agent's lands in its
   proposal), and a refused import (no cues, nothing reaching the cut, an asset not on
   the timeline, more than 20,000 captions) writes nothing. Core takes *text*;
-  `read_caption_file` (`.srt` / `.ass` / `.ssa`, regular file, size) runs before the lock
+  `read_caption_file` (`.srt` / `.vtt` / `.ass` / `.ssa`, regular file, size) runs before the lock
   in the Tauri command and the MCP tool.
+  **Caption export** (`captions_export.rs`, pure) is the way back out: `cut_captions` is the
+  timeline's *generated* overlays (a typed title is not a caption) — already in timeline
+  time, projected through trims / reorders / speed when they were written, so a cue is
+  exactly the line the burned-in overlay draws — clipped to `[0, duration]`, control
+  characters dropped; `write_srt` / `write_vtt` round to whole ms (end ≥ start + 1 ms),
+  turn `-->` in SRT text into `->` and escape `& < >` in VTT, and read back through the
+  importers unchanged (a test).
+  **Markers** carry `duration` (0 = a point), `comment` and `kind` (`Comment` / `Chapter`),
+  all `#[serde(default)]` and omitted at their defaults, so a stored timeline is
+  byte-identical. `MarkerPatch` + `Marker::apply` is the one validated edit (time and
+  duration ≥ 0, comment ≤ `MAX_MARKER_COMMENT`, control characters but `\n` / `\t` dropped);
+  `slice` clips a marker's span to the window and the diff names length / kind / comment
+  changes. A `Chapter` marker becomes a chapter of the export (see `engine-cli.md`).
   Inherent helpers (`Timeline::locate`, `Track::end`/`reflow`, `Clip::duration`,
   `Timeline::slice` — the shifted sub-timeline copy behind range export) back the
   operations. **Beat alignment** lives here too and is pure + unit-tested:
@@ -319,6 +341,18 @@
   `Slipped clip … footage +0.03s (in-point 10.00s → 10.03s)` — two decimals (three
   if two would show a real shift as zero), signed as `slip_clip` is (`+` = later in
   its footage, so a reversed clip's window moving down prints `+`), not a `+0.0s` trim.
+- **Invariants** (`model/check.rs`, pure + unit-tested): `Timeline::check()` refuses a timeline no
+  edit should leave — a non-finite time, gain or speed; a clip whose `source_out <= source_in`; a
+  negative fade or transition; a text / SVG overlay that does not end after it starts; a non-finite
+  keyframe or marker time; a track, clip or overlay id used twice. `Project::run_edit` takes
+  `known_violations()` before the edit and calls `check_new(&known)` after it, on every edit (live and
+  staged) before the transaction commits: only a violation (rule + item id) the edit **introduced** is
+  refused, so a file an older build left broken can still be edited, and a failing edit persists
+  nothing. The message names the item ("the clip at 0:04.0 on V1 has a negative fade", "the text
+  “hi” at 0:01.0 must end after it starts").
+  **Overlaps are not checked**: Kerf allows them (an explicit `add_clip`, a trim into the next clip, old
+  files), and the ripple already treats an overlap the edit did not make as old news. Nothing is indexed
+  by position in the stored timeline (everything is by id), so there is no index range to check.
 - **Fit music to length** (`model/music_fit.rs`, pure + unit-tested): `plan_music_fit(music,
   target, rate)` keeps the intro (before the first downbeat) and the ending (after the last
   whole bar) and walks the bars between, **jumping only between repeating phrases**
@@ -429,3 +463,15 @@
   drawing of each preset are written to `frontend/src/lib/fixtures/svg-presets.json` for the browser harness
   (`svg_preset_fixture_is_what_this_engine_does`; after an intended preset change run
   `KERF_BLESS_SVG_PRESETS=1 cargo test -p kerf-core --no-default-features -- svg_preset_fixture`).
+- `timecode.rs` — SMPTE timecode at the timeline's `f64` rate: `TimecodeRate` (nominal base, frames
+  dropped per minute — drop-frame at 29.97 / 59.94, told by closeness to `30000/1001` / `60000/1001`),
+  `fields` / `frames` / `format` and `parse` (Premiere-style entry, relative `+` / `-`, a dropped label
+  read as its minute's first frame), all held to `MAX_TIMECODE_FRAME` so the TS mirror (`timecode.ts`) does
+  the same integer arithmetic in doubles. Pure; the frontend's tests replay its cases.
+- `hostile.rs` (only under `cfg(test)` or the `test-support` feature, which kerf-gpu, kerf-app and kerf-core's own integration tests turn on as a dev-dependency; never in a release build) — seeded mutation for robustness tests: every prefix, bounded
+  rounds of bit flips / inserted / deleted / duplicated bytes, and each number pushed to the edges of
+  `u32` / `i64` / `f64` (`number_variants`), each case under `catch_unwind`. Used by
+  `tests/hostile_input.rs` (caption files and their import, the stored timeline), `engine/cli/hostile_tests.rs`
+  (ffprobe JSON, source traits, silence / scene logs), `source_probe.rs`, kerf-gpu's y4m / `showinfo` and
+  kerf-app's settings; `frontend/src/lib/hostile-input.test.ts` is the page's twin. A panic found keeps its
+  input as a regression test.

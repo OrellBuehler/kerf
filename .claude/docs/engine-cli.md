@@ -365,7 +365,26 @@ so the feature is **only** activated through these forwards — which is what ma
   -16, broadcast -23 LUFS, all -1 dBTP, `loudnorm` TP half a dB under) wins over the bool;
   youtube is byte-identical to `loudnorm: true`.
   `ExportOptions.loudnorm` appends a single-pass `loudnorm` to -14 LUFS
-  on the final mix, and `ExportOptions.range` renders only a span by building the
+  on the final mix. **Captions and chapters ride along** (`cli/side_files.rs`):
+  `ExportOptions.embed_captions` muxes the cut's captions as a soft subtitle stream
+  (`mov_text` in mp4 / mov, `webvtt` in webm, `srt` in mkv; `validate_export` refuses it for
+  any other container) — **not the default track** (`-disposition:s:0 0`), since the captions
+  are burned in as well unless `skip_burned_captions` (neutral `false`, omitted) drops the
+  generated overlays from the picture — and `caption_sidecars` writes `.srt` / `.vtt` beside the
+  output **only once the render has completed** (a cancelled or failed export never touches a
+  file there), an existing one refused up front unless `overwrite_sidecars` (the MCP `overwrite`,
+  the GUI's confirmation; `check_caption_sidecars` checks every variant first). Captions asked
+  for when the cut has none are refused; a range they do not reach just carries none. Chapter
+  markers become the
+  file's chapters in mp4 / mov / mkv / webm / m4a. The builders stay pure: the render
+  (`side_files::prepare`, from `for_render` + the range slice) writes a SubRip and an
+  FFMETADATA temp file and names them in the render-only `#[serde(skip)]` fields
+  `subtitle_input` / `chapters_input`; the builder then adds `-f srt -i …` / `-f ffmetadata
+  -i …` after the clips and titles, `-map N:s:0 -c:s <codec>` and `-map_chapters M`
+  (skipped on a first pass). Unset, nothing is added — the golden oracle is unchanged —
+  and `export_resource` skips those inputs when judging the GPU lane. The `#[ignore]`d
+  `ffprobe_sees_the_subtitle_stream_and_the_chapters` renders mp4 / mkv / webm and probes.
+  `ExportOptions.range` renders only a span by building the
   graph from `Timeline::slice(start, end)` (a shifted sub-timeline copy — boundary
   clips retrimmed honoring speed/reverse, keyframes resampled, overlays clipped).
   **The master bus** (`Timeline.master: MasterBus {volume, limiter, ceiling_db}`,
@@ -1047,3 +1066,15 @@ so the feature is **only** activated through these forwards — which is what ma
   `build_still_args`* under its own mutex, so a builder that asked would deadlock, and a non-probing read would
   answer differently before and after the first probe. The plan mirrors it (`PlanStream::matrix()` is BT.709 for a
   labelled layer under any policy, which a translucent round trip reads).
+
+**Scopes** (`scopes.rs`, pure but for `timeline_scopes`). The frame is `timeline_frame_yuv`: the still's own graph with a
+`StillOutput::Yuv444Pipe` sink (`-f rawvideo -pix_fmt yuv444p`, a new sink, so no golden moves), from the **originals**
+(`export_still_inputs`) at the delivery width — the Y'CbCr samples the file holds, not an `rgb24` pipe, whose matrix is the
+composite's (BT.601 on FFmpeg 6) rather than the one a player decodes the untagged delivery with. `yuv444_to_rgba` decodes
+them limited-range with the delivery's matrix (`delivery_matrix`: BT.709 at 1280 wide or over 576 tall, else BT.601; a
+caller can name `bt601` / `bt709` / `bt2020`), clipping what the cube cannot hold, as a screen does. `analyze` reads every
+pixel for the summary and the histogram (min / max / mean, pixels at 0 and 255 — a single clipped pixel is counted, which a
+decimated read misses) and a decimated frame (at most 480 x 270 samples) for the waveform, parade and vectorscope grids and
+the peaks (a 64² vectorscope, cells with at least 1 % of the samples). A measurement, not a frame anyone waits to see:
+ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still's spawn-time tuning, at most
+`MAX_SCOPE_WIDTH` (3840) wide, the pipe read into a buffer sized from the frame (`output_bounded`'s `capacity`). `scopes_of_a_rendered_frame` (`#[ignore]`d) holds a one-pixel clip through the real graph.

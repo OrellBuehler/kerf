@@ -185,6 +185,33 @@ show done. Analysis runs in the **background lane** of the heavy-job queue (`cpu
 behind exports and preview proxies; transcription takes its slot after its model download, which is
 not heavy work. Kinds that read sound are not run on a file with none (`resolve_steps`).
 
+**Words and speakers** (`transcript.rs` pure; `engine/vad.rs`, `engine/mel.rs`, `engine/diarize.rs`,
+adapted from FilmCraft). A `TranscriptSegment` carries `words: Vec<Word {text, start, end,
+confidence?, estimated, speaker?}>` and a `speaker` (`S1`, `S2`, … by first appearance), both
+`#[serde(default)]` and skipped when empty, so old projects load and re-save byte-identical. The
+in-process backend sets `token_timestamps` and builds words from the text tokens (`id < eot`; a token
+starting with a space starts a word; bytes joined before UTF-8 decoding, since a token can end
+mid-character; clamped to the segment; confidence = mean token `p`) — `words_from_tokens`. **The ffmpeg
+`whisper` filter reports segments only** (no token timings in its SRT/JSON), so its words are spread
+over the line by character share and marked `estimated` (`estimate_words`). Then every transcription
+(and a voiceover's script) is **refined** from one 16 kHz mono `decode_audio`: `vad::Levels` tightens
+each word inward past 10 ms frames below a threshold 30 % of the way from the noise floor (p10 of
+frames above −100 dBFS) to the speech level (p95), ≥ 6 dB over the floor, a word keeping ≥ 60 ms;
+`diarize` chunks the words at ≥ 250 ms pauses / 4 s (chunks < 0.7 s join a neighbour), takes the
+mean + std of MFCC 1–19 (40 Slaney mel bands, Whisper's 25 ms / 10 ms framing, `realfft`, computed
+frame by frame so an hour never holds its spectrogram) over each chunk's voiced frames, scales them by
+the file's spread, and clusters with average linkage (Lance–Williams updates + cached nearest
+neighbours; a row whose neighbour merged rescans only when the merged distance grew, so ties cost
+nothing: about O(n²) time on real input, O(n³) worst case, n² memory) until the closest pair is > 0.4
+apart and ≤ 6 remain; clusters under 5 % of the voiced frames fold into their neighbour. n is capped at
+`MAX_CHUNKS` (3000, a 36 MB matrix) by merging neighbouring chunks, and chunks whose vectors all coincide
+are one speaker without clustering. A segment's speaker is the one with most of its word-time
+(`speaker_ranges` goes by each word's own label). The refinement runs in the background lane, waits
+for the heavy-job slot and holds it (`refine_transcript_media`, static); the in-process backend refines
+from the samples it already decoded (`Transcriber::refines`). A refinement that does not finish — a
+failed decode, a cancel, a stop while queued — keeps the transcript with estimated words and no
+speakers: a finished transcription is never thrown away.
+
 **Voiceover works in every build too** (`engine/tts.rs`, always compiled, no cargo
 feature): Kokoro-82M text-to-speech, **in-process on ONNX Runtime**. Nothing of it
 ships — `ort` is built `load-dynamic`, and the runtime library (Microsoft's release

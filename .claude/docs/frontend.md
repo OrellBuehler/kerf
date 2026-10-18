@@ -101,8 +101,8 @@ editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Bt
 and `StatusBar` as fixed chrome around a **dockable workspace** (`Workspace.svelte`, composed by
 `routes/+page.svelte`). The workspace is `dockview` (the vanilla package; its
 `--dv-*` variables are mapped onto Kerf tokens in `styles/dockview-kerf.css` so
-it follows the theme) hosting seven panels — `LibraryPanel`, `Preview`, `Timeline`,
-`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer` — each a Svelte component
+it follows the theme) hosting eight panels — `LibraryPanel`, `Preview`, `Timeline`,
+`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer`, `Scopes` — each a Svelte component
 `mount`ed into a dockview content element, so every panel is resizable by its
 sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
 and closable; the **Window** menu reopens one (the library left of the
@@ -298,7 +298,9 @@ still turns amber when an update is waiting, which is why it stayed out of Help;
 has *Check for updates…*. The OS window's title is `• interview.kerf — Kerf` (`window-title.ts`; the dot leads while there is
 unsaved work), set through `setWindowTitle` and the `core:window:allow-set-title` capability. The project's path moved to the status bar. **The menus**
 (`MenuBar.svelte` over the pure, bun-tested `menus.ts`): *File* (New, Open…, Save…,
-Import media…, Import captions…, Export…, Save cover frame…, Settings, Quit — Save is
+Import media…, Import captions…, Export…, Save cover frame…, an **Export as** submenu — Export captions…,
+Export OTIO…, Export EDL…, Export markers as CSV…, Export YouTube chapters…, the last two off until
+there is a marker (`MenuState.hasMarkers`) —, Settings, Quit — Save is
 "as…" once the project has a file, since a saved project is its own SQLite file and
 `save_project_as` is the only save there is), *Edit* (Undo / Redo, Cut / Copy / Paste /
 Duplicate, Delete / Ripple delete / Select all, **Tool** and **Clip** submenus —
@@ -306,7 +308,7 @@ the five tools as radios, and trim / detach / link — Ripple mode and Snapping 
 Keyboard shortcuts…), *View* (zoom, **Track height**, Overview strip, Safe-area guides,
 **Delivery frame**, **Workspace**), *Window* (every panel as a tick, Reset <workspace>
 workspace, Reset all workspaces — which asks first when any arrangement is stored),
-*Playback* (Play / pause, Go to start / end, back and forward a frame and a second,
+*Playback* (Play / pause, Go to start / end, Go to timecode, back and forward a frame and a second,
 Shuttle J / K / L, Set / Clear in and out, markers — the transport lives in the Preview
 panel and a panel can be closed, so the whole of it is here as registry actions with
 their bindings), *Help* (Keyboard shortcuts…, Check for updates…, Release notes, Show log folder,
@@ -646,6 +648,22 @@ filters, the `import_captions` arguments — in `api-caption-import.test.ts`.
 The **cover frame** is saved from the preview's context menu
 (`Save cover frame…` → `export_cover` at the playhead), and both a finished
 export and a saved cover offer **Show in folder** in their toast.
+The side-file exports (`file-actions.ts`: `exportCaptionFile`, `exportInterchangeFile`,
+`exportMarkerList`) ask for a path (`pickSavePath`) and toast the backend's `Report` as the
+description (`export-report.ts`: warnings first, `(×n)` counts; a warning toast when anything was
+dropped), so the notification log keeps what an OTIO / EDL could not carry; the harness writes no
+file and says so. The **export dialog** has a *Captions & chapters* section when the cut has
+captions or chapter markers: embed as a subtitle track (only for a container that carries one,
+`carriesSubtitles`, mirrored in `validateExport`; switching to one that cannot turns it off),
+*Keep captions out of the picture* (`skip_burned_captions`, with a line on why: the embedded
+track is off by default and the captions are otherwise burned in), `.srt` / `.vtt` sidecars, and
+a line saying how many chapter markers become chapters; with no captions in the cut all of these
+are reset to off. A sidecar that already exists comes back as a refusal naming it, which the
+dialog turns into a *Replace caption files?* confirmation and a rerun with `overwrite_sidecars`.
+**Markers** are edited in `MarkerDialog.svelte` (the marker's context menu, *Edit marker…*:
+name, Comment / Chapter, length, comment, one `update_marker` through `marker-edit.ts`, which
+sends only what changed); *Make it a chapter / a comment* flips the kind; a marker with a length
+draws its span under the ruler chip, and the tooltip names the kind, span and comment.
 `Preview` shows the composited frame under the playhead, and during
 **forward 1× playback it switches to the streamed frame source** (`start_playback`)
 — per-frame `get_timeline_frame` decodes stay for scrubbing, shuttle and the
@@ -768,7 +786,12 @@ files`; `export-progress` then carries `variant` / `total`. The
 **Transcript tab** of the library (`TranscriptPanel.svelte`, over the pure, bun-tested
 `src/lib/transcript.ts`) **is an editing surface**: lines resolve to the clip carrying them,
 click seeks, the playhead line highlights, and `×` cuts the sentence from the timeline
-(`cut_clip_range`); cut lines render struck through. When it is *empty* it says which
+(`cut_clip_range`, over its words' bounds when it has words, so the pauses either side stay); cut
+lines render struck through. A line resolves to the clip showing most of its cut range (not its
+midpoint), so a line whose words are gone reads as cut. With two or more speakers a label heads each
+change of speaker and a select filters the lines to one; a transcript with no speakers offers **Label
+speakers** (`ui.refineTranscript` → `refine_transcript`, shown and stoppable like an analysis pass).
+When it is *empty* it says which
 of the five reasons applies (nothing selected / no backend / model not downloaded /
 not analyzed / no speech) and offers the matching action — a model picker + download,
 or Analyze — instead of a dead end. The **agent panel is a real MCP task
@@ -815,6 +838,11 @@ engine. Below the queue, the **History** section renders
 `editor.history` (the `Revision[]` edit log, attributed to user/agent/system) with one-click
 `editor.revertTo(seq)`, and each row expands to *what* that revision changed
 (`revision_diff`).
+
+**Editor context.** So that an agent knows what "this clip" is, the page reports the playhead,
+selection, in/out marks, `ui.timelineView` (the timeline's visible seconds), `ui.focusedPanel`
+(dockview's active panel) and the selected asset through `reportUiContext` (`editor-context.ts`:
+throttled, unchanged state not re-sent, a 30 s heartbeat; a no-op in the harness) — `app.md`.
 
 **The Preview with nothing on the timeline** is `PreviewEmpty` (it was a clapperboard and "No media loaded"): a card of three steps — *Import
 media*, *Cut it on the timeline*, *Export* — each marked done / current / to do from the project (`firstRunSteps`, `first-run.ts`: an
@@ -1039,6 +1067,13 @@ Tab, or focus given back (Escape, a chord), so it cannot leak into a later dialo
 come back too); Voiceover ignores it while the script is non-empty (`scrimCloses`) and keeps the
 script as a draft (`kerf.voiceover.draft`, cleared by a successful generate, not kept for a script
 regenerated from an existing voiceover); Settings / Update / Fit / Stems still close on it.
+**Recovering a crashed untitled project**: after the first load (and before a launch file is
+opened) `offerRecoveries` in `+page.svelte` asks `listRecoveries` and, per session, newest first,
+`askRecovery(recoveryCopy(info))` — a native three-button dialog, **Recover · Discard · Not now**
+(`recovery.ts` holds the copy and `recoveryChoice`; a dismissed or unrecognised answer is Not now, and
+the two-button fallback offers Recover / Not now, never Discard). Recover asks about this project's
+unsaved work first (`okToReplace`), then `editor.recoverProject(id)`; after one recovery the rest wait
+for the next launch. The browser harness has none.
 **Nothing unsaved is dropped silently**: once saved a project is a
 SQLite file and every edit is committed as it happens, so only a never-saved,
 non-empty project (`editor.hasUnsavedWork`) can be lost — New, Open, the window's
@@ -1118,6 +1153,18 @@ action has since taken one (`applyReset`) — and Reset all, and a read-only lis
 abandoning drags and closing menus and dialogs, Tab, Enter / Space on a focused
 control, a widget's arrows, wheel and click modifiers). Focus goes back to a row
 after every change: focus left on the page behind a modal stops Escape closing it.
+**Presets** (`KEY_PRESETS` in `keymap.ts`): Kerf (the defaults), Premiere Pro, DaVinci Resolve and
+Final Cut Pro, each an override table over existing action ids (a `mac` table where the Mac's keys
+differ), applied as ordinary overrides (`presetOverrides`), so resolving, conflicts and per-row Reset are
+the usual ones. The Keyboard section's **Preset** select shows the one in force (`presetOf`, *Custom* when
+none) and replaces stored changes only after a Replace / Keep question. `keymap-presets.test.ts` holds
+every preset to known action ids, readable chords and no collision on either platform. Left out, and why:
+
+| Preset | Not mapped | Why |
+| --- | --- | --- |
+| Premiere Pro | Ripple Edit / Rate Stretch / Pen / Hand / Zoom / Type tools, Add Edit (⌘K), Insert / Overwrite (, .), Lift / Extract (; '), next / previous edit (↑ ↓), 5-frame steps, workspaces (⌥⇧1–9), Duplicate (⌘⇧/), apply transitions (⌘D, ⇧D) | No such action in Kerf; ⌥⇧ / ⇧ + digit types a symbol, which a layout-following chord reads as the symbol; ⇧/ is not a chord. Ripple mode takes B. |
+| DaVinci Resolve | Pages (⇧2–8), Trim mode's roll / slip / slide split, Blade at playhead (⌘B), Insert / Overwrite (F9 F10), next / previous edit, Loop (⌘/) | No such action, or ⇧ + digit (as above); the Trim tool (T) is Roll. Trim start / end are `{` / `}` (what ⇧[ / ⇧] type on a US layout), which a layout that needs AltGr for them cannot press. |
+| Final Cut Pro | Position / Range / Hand / Zoom tools, Blade at playhead (⌘B), Connect / Insert / Append (Q W E), 10-frame steps, Share destinations | No such action; ⇧← / ⇧→ stay a second. |
 
 **Settings** are their own runes singleton (`src/lib/settings.svelte.ts`) behind
 the title bar's gear (⌘,): `SettingsDialog.svelte` is a section rail plus a
@@ -1364,3 +1411,16 @@ pointercancel / lost capture / blur abandon; `data-svg-box`, never the artwork),
 preview like a title. Delete removes it with an Undo toast. **Review**: `staged-diff.ts` marks an animated title by its
 `overlay_id` like a text title, and resolves an `overlay_removed` against `svg_overlays` too (the ghost's `svg` flag, named by
 `svgDisplayName`). Wiring is held by `svg-wiring.test.ts`, the actions by `title-actions-svg.test.ts`, the state by `state-svg.test.ts`.
+
+## Scopes panel
+
+`Scopes.svelte`, docked in the Color preset between the preview and the inspector (a layout stored before it is
+offered it like the mixer in Audio: `UNSTAMPED_OFFERED` leaves it out, `EARLIER_PRESETS.color` is the old Color). A
+selector picks waveform / RGB parade / vectorscope / histogram (remembered in `localStorage`), drawn on a canvas from
+`get_scopes`' grids by `scopes-view.ts` (pure, bun-tested: log density, row 0 at the bottom, 75 % targets and the
+skin-tone line on the vectorscope), and the readout under it is the summary (`summaryLines`: a clipped channel is
+counted in pixels and warns). The frame is the export's still from the originals at 960 wide, niced, so it is a real
+decode: one request in flight, the newest playhead and cut asked for once it lands, 150 ms after the last change while
+paused and every 2 s while playing, nothing while the panel is hidden. Colours are the `--scope-*` tokens (derived from
+the theme's bases in `kerf-tokens.css`; the parade's blue is the theme's own `blue-500`), resolved again on a theme
+change. The harness answers colour bars (`harnessScopes`).

@@ -81,9 +81,28 @@ describe('File', () => {
 			'Import captions…',
 			'Export…',
 			'Save cover frame…',
+			'Export as',
 			'Settings…',
 			'Quit Kerf'
 		]);
+	});
+
+	test('Export as holds the side-file exports, the marker lists off until there is a marker', () => {
+		const sub = (over: Partial<MenuState>) => {
+			const e = find(menu('file', over).items, 'Export as');
+			return e.kind === 'submenu' ? e.items : [];
+		};
+		expect(labels(sub({ hasClips: true }))).toEqual([
+			'Export captions…',
+			'Export OTIO…',
+			'Export EDL…',
+			'Export markers as CSV…',
+			'Export YouTube chapters…'
+		]);
+		const csv = find(sub({ hasClips: true, hasMarkers: false }), 'Export markers as CSV…');
+		expect('disabled' in csv && csv.disabled).toBe(true);
+		const on = find(sub({ hasClips: true, hasMarkers: true }), 'Export markers as CSV…');
+		expect('disabled' in on && on.disabled).toBe(false);
 	});
 
 	test('Export… follows the title bar’s button: off with a reason for an empty cut, on once there is a clip, and on while a render runs', () => {
@@ -231,6 +250,7 @@ describe('Playback', () => {
 			'playback.toggle',
 			'playback.toStart',
 			'playback.toEnd',
+			'playback.goToTimecode',
 			'playback.stepBack',
 			'playback.stepForward',
 			'playback.jumpBack',

@@ -30,6 +30,11 @@ import type {
 	PlatformReport,
 	EditSource,
 	ExportOptions,
+	ExportedFile,
+	InterchangeFormat,
+	MarkerListFormat,
+	MarkerPatch,
+	SubtitleFormat,
 	ExportProgress,
 	Filmstrip,
 	GpuPreviewDiagnostics,
@@ -40,6 +45,7 @@ import type {
 	Property,
 	PropertyKey,
 	LaunchRequest,
+	RecoveryInfo,
 	Levels,
 	MasterBus,
 	MusicFit,
@@ -51,7 +57,12 @@ import type {
 	Projection,
 	Reframe,
 	ReframeKeyframe,
+	RenderBar,
 	Revision,
+	ScopeGridSize,
+	ScopeKind,
+	ScopeMatrix,
+	Scopes,
 	AppSettings,
 	SettingsView,
 	SplitSide,
@@ -78,6 +89,7 @@ import type {
 	Transition,
 	TranscriptionStatus,
 	TranscriptSegment,
+	UiContext,
 	UpdateInfo,
 	VideoEffect,
 	VoiceoverProgress,
@@ -128,12 +140,16 @@ import { analysisKindDone, ALL_KINDS } from './analysis-steps';
 import { sampleFilmstrip } from './sample-filmstrip';
 import { synthPcm } from './sample-audio';
 import { sampleFrameJpeg } from './sample-frame';
+import { harnessScopes } from './scopes-view';
+import { harnessRenderBar } from './render-bar';
 import { renderedFps } from './timecode';
 import { playbackFps } from './playback-sync';
 import { parsePlaybackMessage } from './frame-transport';
 import { captionsForTimeline, resolveCaptions } from './captions';
+import { estimateWords } from './transcript';
 import { describeError, logFrontend } from './log';
 import { parseLaunchRequest } from './launch';
+import { recoveryChoice, type RecoveryChoice, type RecoveryCopy } from './recovery';
 import { DEV_MODEL_BYTES, STEM_NAMES, STEMS_CANCELLED, devStemAssets, placeStems } from './stems';
 import {
 	addSvgOverlayTo,
@@ -218,9 +234,9 @@ const sampleAnalysis: Record<string, AssetAnalysis> = {
 		],
 		scene_changes: [0, 30, 75, 110],
 		transcript: [
-			{ start: 0, end: 5.5, text: 'Welcome back to the channel.' },
-			{ start: 5.5, end: 12.5, text: 'Today we are talking about non-destructive editing.' },
-			{ start: 14, end: 22, text: 'The agent watches the footage with you and proposes a cut.' }
+			{ start: 0, end: 5.5, text: 'Welcome back to the channel.', speaker: 'S1' },
+			{ start: 5.5, end: 12.5, text: 'Today we are talking about non-destructive editing.', speaker: 'S1' },
+			{ start: 14, end: 22, text: 'The agent watches the footage with you and proposes a cut.', speaker: 'S2' }
 		],
 		loudness: { integrated_lufs: -16.2, loudness_range: 6.4, true_peak_dbtp: -1.5, threshold_lufs: -26.5 },
 		onsets: [0.5, 1.2, 2.0, 2.8, 3.6, 5.6],
@@ -745,6 +761,50 @@ export async function onPopoutClosed(cb: (label: string) => void): Promise<() =>
 export async function takeLaunchProject(): Promise<LaunchRequest | null> {
 	if (!inTauri()) return null;
 	return parseLaunchRequest(await invoke<unknown>('take_launch_project'));
+}
+
+/** Untitled projects a crashed Kerf left behind, newest first. The browser harness has none. */
+export async function listRecoveries(): Promise<RecoveryInfo[]> {
+	if (!inTauri()) return [];
+	return invoke<RecoveryInfo[]>('list_recoveries');
+}
+
+/** Make a left-behind project the open one (still untitled); `false` outside Tauri. */
+export async function recoverProject(id: string): Promise<boolean> {
+	if (!inTauri()) return false;
+	await invoke('recover_project', { id });
+	return true;
+}
+
+/** The user chose "Don't save" as the app closes: delete this project's recovery session at
+ *  exit instead of offering it at the next launch. */
+export async function discardRecoveryAtExit(): Promise<void> {
+	if (!inTauri()) return;
+	await invoke('discard_recovery_at_exit');
+}
+
+/** Delete a left-behind project. */
+export async function discardRecovery(id: string): Promise<void> {
+	if (!inTauri()) return;
+	await invoke('discard_recovery', { id });
+}
+
+/** The recovery prompt: Recover, Discard and Not now (`recovery.ts`). Where the native dialog
+ *  cannot show three named buttons it asks Recover / Not now, so Discard is never the fallback;
+ *  closing the dialog is Not now. The browser harness has `window.confirm`. */
+export async function askRecovery(copy: RecoveryCopy): Promise<RecoveryChoice> {
+	if (!inTauri()) return window.confirm(copy.message) ? 'recover' : 'later';
+	const { message: show } = await import('@tauri-apps/plugin-dialog');
+	try {
+		const answer = await show(copy.message, {
+			title: copy.title,
+			kind: 'info',
+			buttons: { yes: copy.recover, no: copy.discard, cancel: copy.later }
+		});
+		return recoveryChoice(answer, copy);
+	} catch {
+		return (await confirmAction(copy.message, copy.title, { ok: copy.recover, cancel: copy.later })) ? 'recover' : 'later';
+	}
 }
 
 /** Discard the open project for a fresh, empty one; `false` outside Tauri. */
@@ -2318,16 +2378,16 @@ export async function addMarker(time: number, name: string, color?: string): Pro
 	return invoke<Timeline>('add_marker', { time, name, color });
 }
 
-export async function updateMarker(
-	markerId: string,
-	patch: { time?: number; name?: string; color?: string }
-): Promise<Timeline> {
+export async function updateMarker(markerId: string, patch: MarkerPatch): Promise<Timeline> {
 	if (!inTauri()) {
 		const m = devTimeline.markers?.find((x) => x.id === markerId);
 		if (m) {
 			if (patch.time !== undefined) m.time = patch.time;
 			if (patch.name !== undefined) m.name = patch.name;
 			if (patch.color !== undefined) m.color = patch.color || null;
+			if (patch.duration !== undefined) m.duration = patch.duration || undefined;
+			if (patch.comment !== undefined) m.comment = patch.comment.trimEnd() || undefined;
+			if (patch.kind !== undefined) m.kind = patch.kind === 'comment' ? undefined : patch.kind;
 			devTimeline.markers = [...(devTimeline.markers ?? [])].sort((a, b) => a.time - b.time);
 		}
 		recordDev('Update marker');
@@ -2510,7 +2570,7 @@ export async function clearCaptions(): Promise<Timeline> {
 	return invoke<Timeline>('clear_captions');
 }
 
-/** Caption the cut from a `.srt` / `.ass` / `.ssa` file on disk. `base` is
+/** Caption the cut from a `.srt` / `.vtt` / `.ass` / `.ssa` file on disk. `base` is
  *  `timeline` (the file is a subtitle track for the finished cut — the default) or
  *  `source` with an `assetId` (the file times that asset's own footage and is
  *  projected through its clips like a transcript); `options` is the same look
@@ -2531,7 +2591,7 @@ export async function importCaptions(path: string, req: CaptionImportRequest = {
 }
 
 /** `importCaptions` for text the page already holds — a file read through an
- *  `<input type=file>`, or pasted. `format` is `srt` / `ass`; omitted, it is
+ *  `<input type=file>`, or pasted. `format` is `srt` / `vtt` / `ass`; omitted, it is
  *  guessed from the text. This is the variant the browser harness runs. */
 export async function importCaptionsText(
 	text: string,
@@ -2565,7 +2625,7 @@ export type CaptionFilePick =
 	| { kind: 'path'; path: string; name: string }
 	| { kind: 'text'; text: string; name: string; format: CaptionFormat | null };
 
-/** Pick a `.srt` / `.ass` / `.ssa` file; `null` if cancelled. Desktop: the native
+/** Pick a `.srt` / `.vtt` / `.ass` / `.ssa` file; `null` if cancelled. Desktop: the native
  *  dialog, answering with the path (`importCaptions` reads it, with its guards).
  *  Browser: an `<input type=file>` read as text, for `importCaptionsText`. In the
  *  browser the picker must be opened straight from the click, before any `await`,
@@ -2599,10 +2659,63 @@ export async function pickCaptionFile(): Promise<CaptionFilePick | null> {
 	return { kind: 'path', path: selected, name: baseName(selected) };
 }
 
+/** Re-time an asset's cached transcript to the speech energy and label its speakers (`S1`,
+ *  `S2`, …) without re-transcribing. The harness spreads each line's words by character share
+ *  and keeps the speakers it was seeded with. */
+export async function refineTranscript(assetId: string): Promise<AssetAnalysis> {
+	if (!inTauri()) {
+		const analysis = sampleAnalysis[assetId];
+		if (!analysis?.transcript.length) throw new Error('asset has no transcript; transcribe it first');
+		analysis.transcript = analysis.transcript.map((seg) => {
+			const speaker = seg.speaker ?? 'S1';
+			return { ...seg, speaker, words: seg.words?.length ? seg.words : estimateWords({ ...seg, speaker }) };
+		});
+		return { ...analysis };
+	}
+	return invoke<AssetAnalysis>('refine_transcript', { assetId });
+}
+
 /** Write an asset's transcript to a `.srt` file; returns the path. */
 export async function exportSrt(assetId: string, outputPath: string): Promise<string> {
 	if (!inTauri()) return outputPath;
 	return invoke<string>('export_srt', { assetId, outputPath });
+}
+
+/** What the browser harness answers for a side-file export: nothing is written there. */
+const harnessFile = (path: string): ExportedFile => ({
+	path,
+	report: { entries: [{ level: 'info', message: 'the browser harness writes no file; the desktop app does', count: 1 }] }
+});
+
+/** Write the cut's captions as SubRip or WebVTT (by `format`, else the path's extension). */
+export async function exportCaptions(outputPath: string, format?: SubtitleFormat): Promise<string> {
+	if (!inTauri()) return outputPath;
+	return invoke<string>('export_captions', { outputPath, format: format ?? null });
+}
+
+/** Write the cut as OpenTimelineIO or a CMX 3600 EDL (`videoTrack`: which video track an EDL holds). */
+export async function exportInterchange(
+	outputPath: string,
+	format: InterchangeFormat,
+	videoTrack?: number
+): Promise<ExportedFile> {
+	if (!inTauri()) return harnessFile(outputPath);
+	return invoke<ExportedFile>('export_interchange', { outputPath, format, videoTrack: videoTrack ?? null });
+}
+
+/** Write the markers as a formula-safe CSV or as YouTube chapter text. */
+export async function exportMarkers(outputPath: string, format: MarkerListFormat): Promise<ExportedFile> {
+	if (!inTauri()) return harnessFile(outputPath);
+	return invoke<ExportedFile>('export_markers', { outputPath, format });
+}
+
+/** Ask where to save a side-file; `null` if cancelled. The browser harness answers
+ *  `defaultPath`, so the export flow stays explorable there. */
+export async function pickSavePath(name: string, extensions: string[], defaultPath: string): Promise<string | null> {
+	if (!inTauri()) return defaultPath;
+	const { save } = await import('@tauri-apps/plugin-dialog');
+	const path = await save({ filters: [{ name, extensions }], defaultPath });
+	return typeof path === 'string' ? path : null;
 }
 
 export async function removeSilence(assetId: string): Promise<Timeline> {
@@ -3131,6 +3244,33 @@ export async function getTimelineFrame(timeSecs: number, maxWidth = 960): Promis
 }
 
 /**
+ * The video scopes of the composited frame at `timeSecs` (`get_scopes`): the export's still of
+ * the cut, from the originals, read with the delivery's matrix (or `matrix`). The numeric summary
+ * always; the `grids` asked for at `size`. A real decode, so callers throttle it. In the browser
+ * harness: the scopes of colour bars.
+ */
+export async function getScopes(
+	timeSecs: number,
+	grids: ScopeKind[] = [],
+	size?: ScopeGridSize,
+	matrix: ScopeMatrix = 'auto',
+	maxWidth?: number
+): Promise<Scopes> {
+	if (!inTauri()) return harnessScopes(grids, size);
+	return invoke<Scopes>('get_scopes', { timeSecs, grids, size: size ?? null, matrix, maxWidth: maxWidth ?? null });
+}
+
+/**
+ * How the Preview will play each span of the cut (`get_render_bar`): the GPU preview where it
+ * is on and draws it, the FFmpeg stream where it hands over, and the spans where playback stalls.
+ * `width` is the Preview's render width. In the browser harness: the reversed clips.
+ */
+export async function getRenderBar(width = 960): Promise<RenderBar> {
+	if (!inTauri()) return harnessRenderBar(devTimeline);
+	return invoke<RenderBar>('get_render_bar', { width });
+}
+
+/**
  * The frame under the playhead for the Preview panel — drawn by the GPU compositor in the
  * native surface when the GPU preview is on and draws it exactly, else FFmpeg's JPEG (the
  * same one {@link getTimelineFrame} returns), in the same call, with the reasons. `overlays`
@@ -3537,6 +3677,13 @@ export async function mcpEndpoint(): Promise<string> {
 export async function agentStatus(): Promise<{ endpoint: string; last_seen_secs: number | null; error: string | null }> {
 	if (!inTauri()) return { endpoint: 'http://127.0.0.1:7777/mcp', last_seen_secs: null, error: null };
 	return invoke<{ endpoint: string; last_seen_secs: number | null; error: string | null }>('agent_status');
+}
+
+/** Tell the backend what the editor shows, for an agent's `get_editor_context`
+ *  (`editor-context.ts` throttles it). The browser harness has no agent to ask, so nothing is sent. */
+export async function reportUiContext(context: UiContext): Promise<void> {
+	if (!inTauri()) return;
+	await invoke('report_ui_context', { context });
 }
 
 // ---- app settings ----------------------------------------------------------
