@@ -929,8 +929,8 @@ export interface StagedEdit {
 	base_seq: number;
 	task_id?: string | null;
 	note?: string | null;
-	/** The agent session (its MCP session id) the proposal belongs to, when one was named. */
-	owner?: string | null;
+	/** Some agent session owns the proposal. (The session id itself never leaves the backend.) */
+	owned_by_agent?: boolean;
 	edits: string[];
 	/** How many of the latest staged steps `undoStagedEdit` can still take back (absent: none). */
 	undo_depth?: number;

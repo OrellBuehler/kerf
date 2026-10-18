@@ -28,13 +28,15 @@ logging is not up yet, so it returns what it set and `setup` logs it.
 
 **Library and project commands.** `remove_asset { assetId, force? }` → `{asset, clips_removed, timeline}` (refused while
 a clip of the cut or of a proposal uses the asset unless `force`; the proxies and waveform cache go with the lock
-released), `relink_asset { assetId, newPath }` → `Relinked` (probe with the lock released, `apply_relink` under it,
-`forget_media_caches` released again), `missing_assets` → `MissingAsset[]` (the files are stat-ed with the lock
-released: a share that went away can take long to say so), `paths_exist { paths }` → `boolean[]` (the export dialog's
+released), `relink_asset { assetId, newPath }` → `Relinked` (`relink_inputs` under the lock, `probe_relink` — the probe and a
+comparison of both files' ends — with it released, `apply_relink_probed` under it, `forget_media_caches` released
+again; `cancel_import` stops the probe), `missing_assets` → `MissingAsset[]` (`missing_assets_inputs` under the lock,
+`find_missing_assets` stat-ing the files with it released: a share that went away can take long to say so), `paths_exist { paths }` → `boolean[]` (the export dialog's
 overwrite check), `recent_projects`, `open_recent { path }` (a vanished file is dropped from the list, never created —
 `open_project` refuses a path that names nothing too) and `clear_recent_projects`. Staged proposals:
 `apply_staged_subset { entryIds, force? }` → `SubsetApplied`, `undo_staged_edit` → `{label, staged}`,
-`discarded_staged_edit`, `restore_discarded_edits`; `apply_staged_edit`, `apply_staged_subset` and `resolve_task` make the
+`discarded_staged_edit`, `restore_discarded_edits` (a `StagedEdit` carries `owned_by_agent`, never the agent's session id);
+`apply_staged_edit`, `apply_staged_subset` and `resolve_task` make the
 proxies again when the proposal also marked assets (a 360 projection). `get_history` and `list_tasks` take optional
 `limit` / `offset` (a window from the newest end, oldest first). Ids that fail to parse name their argument
 (`invalid clip_id "…": not an id …`, `clip_ids[2]` for a list).
@@ -203,8 +205,8 @@ earlier export sitting at that path, and the commands neither remove nor compare
 ones stay, and its `VariantProgress` is the `export-progress` event as it is. With `smart_crop` the shots are
 framed first (`sample_framings_with`, `export_cancel` stops it), streaming the same event with `waiting:
 "framing the shots"` so the bar does not sit at 0%. Every output path is checked against the project's own
-files (`Project::check_output_path`, under the lock before the lock-free render: a source file, a capture, a
-proxy, the project database) in `export_timeline`, `export_variants`, `export_cover` and `export_srt`, and
+files (`Project::output_path_inputs` read under the lock, `check_output_path_with` — which canonicalises and stats — run
+after it is released and before the lock-free render: a source file, a capture, a proxy, the project database) in `export_timeline`, `export_variants`, `export_cover` and `export_srt`, and
 `require_local_output_path` refuses UNC / network paths (`\\host\share`, `//host/share`, the mixed
 forms and `\\?\UNC\…`; only the verbatim local-drive spelling `\\?\C:\…` passes). The error carries
 ffmpeg's stderr tail. `start_playback` resolves `Ok` for a stop or supersede but rejects with the

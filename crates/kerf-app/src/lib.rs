@@ -315,22 +315,38 @@ async fn remove_asset(state: State<'_, AppState>, asset_id: String, force: Optio
     .await
 }
 
+/// The error an abandoned relink returns, for the webview to stay quiet on.
+const RELINK_CANCELLED: &str = "relink cancelled";
+
 /// Point an asset at another file: the media was moved, renamed or restored from a backup.
-/// The new file is probed with the lock released and must be the same kind of media (same
-/// streams, about the same length); the asset keeps its id, its place in the library and every
-/// clip cut from it, and its analysis is kept only when the file is the old media moved.
+/// The new file is probed, and compared with the old one's bytes, with the lock released
+/// (`relink_inputs` → `probe_relink` → `apply_relink_probed`); it must be the same kind of media
+/// (same streams, about the same length). The asset keeps its id, its place in the library and
+/// every clip cut from it, and its analysis is kept only when the file is the old media moved.
+/// Refused for an agent, as removing media is.
 #[tauri::command]
 async fn relink_asset(app: AppHandle, state: State<'_, AppState>, asset_id: String, new_path: String) -> CmdResult<Relinked> {
     let asset_id = id(&asset_id, "asset_id")?;
     let shared = state.project.clone();
     let scrub = state.scrub.clone();
+    // The probe reads both files; `cancel_import` stops it like it stops an import's.
+    let cancelled = state.import_stop.begin();
     blocking(move || {
-        let generation = lock_user(&shared).generation();
-        let probed = Project::probe_asset(std::path::Path::new(&new_path)).map_err(|e| e.to_string())?;
+        let (old, generation) = {
+            let project = lock_user(&shared);
+            (
+                project.relink_inputs(asset_id).map_err(|e| e.to_string())?,
+                project.generation(),
+            )
+        };
+        let probe = Project::probe_relink(&old, std::path::Path::new(&new_path), &cancelled).map_err(|e| match e {
+            kerf_core::Error::Cancelled => RELINK_CANCELLED.to_string(),
+            other => other.to_string(),
+        })?;
         let relinked = {
             let project = lock_user(&shared);
             require_generation(&project, generation, "relinking")?;
-            project.apply_relink(asset_id, &probed).map_err(|e| e.to_string())?
+            project.apply_relink_probed(asset_id, &probe).map_err(|e| e.to_string())?
         };
         if relinked.previous_path != relinked.asset.path {
             Project::forget_media_caches(std::path::Path::new(&relinked.previous_path));
@@ -351,27 +367,8 @@ async fn relink_asset(app: AppHandle, state: State<'_, AppState>, asset_id: Stri
 async fn missing_assets(state: State<'_, AppState>) -> CmdResult<Vec<MissingAsset>> {
     let shared = state.project.clone();
     blocking(move || {
-        let (assets, timeline) = {
-            let project = lock_user(&shared);
-            (
-                project.list_assets().map_err(|e| e.to_string())?,
-                project.timeline().map_err(|e| e.to_string())?,
-            )
-        };
-        let mut used: std::collections::HashMap<Uuid, usize> = std::collections::HashMap::new();
-        for clip in timeline.tracks.iter().flat_map(|t| t.clips.iter()) {
-            *used.entry(clip.asset_id).or_default() += 1;
-        }
-        Ok(assets
-            .into_iter()
-            .filter(|a| !std::path::Path::new(&a.path).exists())
-            .map(|a| MissingAsset {
-                clips: used.get(&a.id).copied().unwrap_or(0),
-                asset_id: a.id,
-                name: a.name,
-                path: a.path,
-            })
-            .collect())
+        let files = lock_user(&shared).missing_assets_inputs().map_err(|e| e.to_string())?;
+        Ok(Project::find_missing_assets(files))
     })
     .await
 }
@@ -2215,13 +2212,14 @@ async fn export_srt(state: State<'_, AppState>, asset_id: String, output_path: S
     require_local_output_path(&output_path)?;
     let shared = state.project.clone();
     blocking(move || {
-        let srt = {
+        let (protected, srt) = {
             let project = lock_user(&shared);
-            project
-                .check_output_path(std::path::Path::new(&output_path))
-                .map_err(|e| e.to_string())?;
-            project.transcript_srt(id).map_err(|e| e.to_string())?
+            (
+                project.output_path_inputs().map_err(|e| e.to_string())?,
+                project.transcript_srt(id).map_err(|e| e.to_string())?,
+            )
         };
+        Project::check_output_path_with(std::path::Path::new(&output_path), &protected).map_err(|e| e.to_string())?;
         std::fs::write(&output_path, srt).map_err(|e| e.to_string())?;
         Ok(output_path)
     })
@@ -3037,16 +3035,15 @@ async fn export_timeline(
     // Snapshot the timeline + assets under the lock, then release it before the
     // (seconds-to-minutes) ffmpeg render. Otherwise the export would hold the
     // shared Project mutex for its whole duration and freeze every other GUI
-    // command and the MCP agent until it finished. The output is checked under it
-    // too: a render must not write over a source file, a proxy or the project itself.
-    let (timeline, assets) = {
+    // command and the MCP agent until it finished. What the output must not be (a source
+    // file, a proxy, the project itself) is read under it too; the check, which
+    // canonicalises and stats, runs without it.
+    let (timeline, assets, protected) = {
         let project = state.project();
-        project
-            .check_output_path(std::path::Path::new(&output_path))
-            .map_err(|e| e.to_string())?;
         (
             project.timeline().map_err(|e| e.to_string())?,
             project.list_assets().map_err(|e| e.to_string())?,
+            project.output_path_inputs().map_err(|e| e.to_string())?,
         )
     };
 
@@ -3055,6 +3052,7 @@ async fn export_timeline(
     cancel.store(false, Ordering::SeqCst);
 
     blocking(move || {
+        Project::check_output_path_with(std::path::Path::new(&output_path), &protected).map_err(|e| e.to_string())?;
         // Stream `export-progress` events ({ fraction, elapsed_secs, eta_secs }) so
         // the UI can show a bar + ETA. ffmpeg emits ~2/sec, no extra throttle needed.
         let mut on_progress = |p: kerf_core::ExportProgress| {
@@ -3128,11 +3126,9 @@ async fn export_variants(
 
     blocking(move || {
         // None of the files may be a source, a proxy or the project itself.
-        {
-            let project = lock_user(&shared);
-            for variant in &variants {
-                project.check_output_path(&variant.output).map_err(|e| e.to_string())?;
-            }
+        let protected = lock_user(&shared).output_path_inputs().map_err(|e| e.to_string())?;
+        for variant in &variants {
+            Project::check_output_path_with(&variant.output, &protected).map_err(|e| e.to_string())?;
         }
         // Frame first — plan under the lock, sample without it, apply under it
         // again — then snapshot and render with the lock released, like a
@@ -3222,13 +3218,14 @@ async fn export_cover(
     blocking(move || {
         // Same shape as every heavy command: resolve under the lock, render
         // without it. A 4K still is a real decode.
-        let (timeline, assets) = {
+        let ((timeline, assets), protected) = {
             let project = lock_user(&shared);
-            project
-                .check_output_path(std::path::Path::new(&output_path))
-                .map_err(|e| e.to_string())?;
-            project.export_still_inputs().map_err(|e| e.to_string())?
+            (
+                project.export_still_inputs().map_err(|e| e.to_string())?,
+                project.output_path_inputs().map_err(|e| e.to_string())?,
+            )
         };
+        Project::check_output_path_with(std::path::Path::new(&output_path), &protected).map_err(|e| e.to_string())?;
         let path = Project::render_still_cancellable(&timeline, &assets, time_secs, &output_path, format, &|| {
             cancel.load(Ordering::SeqCst)
         })

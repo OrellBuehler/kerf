@@ -47,6 +47,8 @@ describe('a staged proposal', () => {
 		}
 		expect(new Set(staged.diff.entries.map((e) => e.id)).size).toBe(staged.diff.entries.length);
 		expect(staged.undo_depth).toBe(staged.edits.length);
+		expect(staged.owned_by_agent).toBe(true);
+		expect('owner' in staged).toBe(false);
 	});
 
 	test('undo takes back the last step, then a discard can be taken back too', async () => {
@@ -156,6 +158,13 @@ describe('removing media', () => {
 		const history = await api.getHistory();
 		expect(history).toHaveLength(before + 1);
 		expect(history[history.length - 1].label).toBe('Remove media interview.mp4');
+	});
+
+	test('history does not bring removed media back: undo names it', async () => {
+		await expect(api.undo()).rejects.toThrow('removed from the library (interview.mp4)');
+		await expect(api.revertTo(0)).rejects.toThrow('removed from the library (interview.mp4)');
+		// The cut is as the removal left it.
+		expect(clipsOf(await api.getTimeline(), INTERVIEW)).toEqual([]);
 	});
 
 	test('an unused asset goes without a revision', async () => {

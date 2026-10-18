@@ -415,11 +415,29 @@ function recordDev(label: string) {
 function devRestore(seq: number): Timeline {
 	const rev = devHistory.find((r) => r.seq === seq);
 	if (rev) {
+		// History does not bring removed media back (`Project::restore`): a step with a clip of an asset that
+		// is no longer in the library is refused, naming it.
+		const gone = [
+			...new Set(
+				rev.snapshot.tracks
+					.flatMap((t) => t.clips)
+					.filter((c) => !assetById(c.asset_id))
+					.map((c) => devRemovedNames.get(c.asset_id) ?? c.asset_id)
+			)
+		];
+		if (gone.length > 0) {
+			throw new Error(
+				`that step uses media that was removed from the library (${gone.join(', ')}) — undo and redo cannot bring it back; import the file again to cut from it, or go back to a step from before it was used`
+			);
+		}
 		devTimeline = structuredClone(rev.snapshot);
 		devHead = seq;
 	}
 	return snapshot();
 }
+
+/** The names of the media removed from the harness library, for the refusal above. */
+const devRemovedNames = new Map<string, string>();
 
 function trackEnd(t: Track): number {
 	return t.clips.reduce((m, c) => Math.max(m, c.timeline_start + clipDuration(c)), 0);
@@ -597,6 +615,7 @@ export async function removeAsset(assetId: string, force = false): Promise<Asset
 			devStaged.edit.diff.entries = devStaged.edit.diff.entries.filter((e) => !e.clip_id || !gone.has(e.clip_id));
 		}
 		sampleAssets.splice(sampleAssets.indexOf(asset), 1);
+		devRemovedNames.set(assetId, asset.name);
 		delete sampleAnalysis[assetId];
 		delete devProxy[assetId];
 		devMissing.delete(assetId);
@@ -3298,6 +3317,7 @@ function seedDevStaged() {
 			base_seq: devHead,
 			task_id: devTasks.find((t) => t.status === 'ready')?.id ?? null,
 			note: 'Tighten the intro',
+			owned_by_agent: true,
 			edits: steps.map((st) => st.label),
 			undo_depth: steps.length,
 			created_at: now(),
