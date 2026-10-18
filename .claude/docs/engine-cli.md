@@ -526,6 +526,9 @@ so the feature is **only** activated through these forwards — which is what ma
   is float, so nothing clips until the mix is written and the master can still bring
   it under. `levels.ts` `levelNotes` mirrors the words exactly (a string in both
   languages' tests pins that).
+  **`stream_mix_pcm`** (same file) is the other reader of that graph: `build_mix_pcm_args` is `build_filter_complex` (no meters)
+  with `-map [outa] -ac N -ar R -f f32le pipe:1`, streamed through `pump_pcm_cancellable` — what band balance measures over
+  a range of the mix (`engine-media.md`); ungated, `cap_args`-capped and niced like the agent's other reads.
   **`Clip.mask`** cuts a clip to a rectangle or ellipse (centre / size in
   fractions of the rendered frame, feathered, optionally inverted): outside it
   the clip goes transparent and a lower track shows through. Deliberately *one*

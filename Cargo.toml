@@ -111,6 +111,10 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.simd-adler32]
 opt-level = 3
+# The SoundFont synthesizer behind composing music (engine::compose) renders a minute of seven
+# instruments in a few seconds optimised and several times slower than real time unoptimised.
+[profile.dev.package.rustysynth]
+opt-level = 3
 
 [profile.release]
 opt-level = 3

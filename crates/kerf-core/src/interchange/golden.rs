@@ -27,6 +27,7 @@ fn asset(n: u128, path: &str, duration: f64, image: bool) -> Asset {
         imported_at: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
         source_paths: Vec::new(),
         voiceover: None,
+        music_score: None,
     }
 }
 

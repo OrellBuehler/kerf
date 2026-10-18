@@ -151,6 +151,39 @@ fn a_v1_file_gains_the_proposals_owner_columns_and_keeps_a_backup() {
 }
 
 #[test]
+fn a_v2_file_gains_the_music_score_column_and_keeps_a_backup() {
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    edited(1).0.save_as(&path).unwrap();
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute_batch("ALTER TABLE assets DROP COLUMN music_score").unwrap();
+    }
+    let project = Project::open(&path).unwrap();
+    assert_eq!(version_of(&path), SCHEMA_VERSION);
+    assert_eq!(version_of(&schema_backup_path(&path, 2)), 2, "the file as it was is kept");
+    // The asset that was there reads back with no score, and a composed one can now be stored.
+    assert!(project.list_assets().unwrap()[0].music_score.is_none());
+    let mut composed = asset("/m/a.wav", 8.0, vec![stream(StreamKind::Audio)]);
+    composed.music_score = Some(crate::model::sample_song(crate::model::MusicStyle::Lofi));
+    project.insert_asset(&composed).unwrap();
+    let back = project
+        .list_assets()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.id == composed.id)
+        .unwrap();
+    assert_eq!(back.music_score, composed.music_score);
+    drop(project);
+    // Already there: opening again changes nothing and makes no second backup.
+    let files = std::fs::read_dir(&dir).unwrap().count();
+    drop(Project::open(&path).unwrap());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), files);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn a_backup_that_cannot_be_written_does_not_stop_an_additive_upgrade() {
     let dir = scratch();
     let path = dir.join("cut.kerf");

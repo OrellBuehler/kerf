@@ -69,6 +69,7 @@ pub(crate) fn test_asset(streams: Vec<StreamInfo>) -> Asset {
         imported_at: Utc::now(),
         source_paths: Vec::new(),
         voiceover: None,
+        music_score: None,
     }
 }
 
@@ -210,6 +211,7 @@ pub(crate) fn av_asset(id: Uuid, duration: f64) -> Asset {
         imported_at: Utc::now(),
         source_paths: Vec::new(),
         voiceover: None,
+        music_score: None,
     }
 }
 
@@ -224,6 +226,7 @@ pub(crate) fn img_asset(id: Uuid) -> Asset {
         imported_at: Utc::now(),
         source_paths: Vec::new(),
         voiceover: None,
+        music_score: None,
     }
 }
 

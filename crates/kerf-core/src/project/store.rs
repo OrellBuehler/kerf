@@ -34,6 +34,11 @@ const MIGRATIONS: &[Migration] = &[
         needed: v1_to_v2_needed,
         destructive: false,
     },
+    Migration {
+        run: v2_to_v3,
+        needed: v2_to_v3_needed,
+        destructive: false,
+    },
 ];
 
 /// The schema this build writes and the newest it opens.
@@ -74,6 +79,19 @@ fn v1_to_v2(conn: &Connection) -> rusqlite::Result<()> {
 
 fn v1_to_v2_needed(conn: &Connection) -> bool {
     V2_COLUMNS.iter().any(|c| !has_column(conn, "staged", c))
+}
+
+/// v3: an asset remembers the score it was composed from (`music_score`, JSON). Audio a build
+/// without composing wrote has none.
+fn v2_to_v3(conn: &Connection) -> rusqlite::Result<()> {
+    if !has_column(conn, "assets", "music_score") {
+        conn.execute("ALTER TABLE assets ADD COLUMN music_score TEXT", [])?;
+    }
+    Ok(())
+}
+
+fn v2_to_v3_needed(conn: &Connection) -> bool {
+    !has_column(conn, "assets", "music_score")
 }
 
 /// The steps from `found` on that would change this file.

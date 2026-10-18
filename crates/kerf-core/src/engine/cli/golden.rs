@@ -404,7 +404,7 @@ fn pool() -> Vec<Asset> {
     let imported_at = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
     let asset = |(i, (name, duration, streams)): (usize, (&str, f64, Vec<StreamInfo>))| Asset {
         id: Uuid::from_u128(i as u128 + 1), path: format!("/golden/{name}.mp4"), name: name.into(), duration, streams, imported_at,
-        source_paths: Vec::new(), voiceover: None,
+        source_paths: Vec::new(), voiceover: None, music_score: None,
     };
     let mut pool: Vec<Asset> = specs.into_iter().enumerate().map(asset).collect();
     debug_assert_eq!(pool.len(), LIBRARY);

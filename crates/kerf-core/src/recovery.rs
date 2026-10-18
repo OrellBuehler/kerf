@@ -287,6 +287,7 @@ mod tests {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         }
     }
 

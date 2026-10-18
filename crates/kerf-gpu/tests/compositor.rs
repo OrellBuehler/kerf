@@ -49,6 +49,7 @@ fn asset(w: u32, h: u32) -> Asset {
         imported_at: Utc::now(),
         source_paths: Vec::new(),
         voiceover: None,
+        music_score: None,
     }
 }
 

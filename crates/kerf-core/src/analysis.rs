@@ -209,6 +209,21 @@ impl RhythmAnalyzer for FfmpegRhythmAnalyzer {
     }
 }
 
+/// The rhythm of music Kerf composed: read off its score, which is exact because the audio was
+/// made on the score's grid — never a detector's guess at audio whose tempo, bars and chords are
+/// already known. No decode, so a re-analysis of composed music keeps what placing it wrote.
+pub struct ScoreRhythm;
+
+impl RhythmAnalyzer for ScoreRhythm {
+    fn analyze_rhythm(&self, asset: &Asset, _cancel: CancelFn) -> Result<Rhythm> {
+        let score = asset
+            .music_score
+            .as_ref()
+            .ok_or_else(|| Error::InvalidArgument("that asset was not composed from a score".to_string()))?;
+        score.rhythm(asset.duration)
+    }
+}
+
 /// Report a model download as analysis progress, so the caller only ever sees
 /// one progress shape. Shared by both whisper backends.
 fn model_progress(progress: ProgressFn<'_>) -> impl FnMut(whisper::DownloadProgress) + '_ {
@@ -954,7 +969,12 @@ pub fn analyze_asset_steps(
     let silence = FfmpegSilenceDetector::default();
     let scene = FfmpegSceneDetector::default();
     let loudness = FfmpegLoudnessAnalyzer;
-    let rhythm = FfmpegRhythmAnalyzer::default();
+    let measured_rhythm = FfmpegRhythmAnalyzer::default();
+    let rhythm: &dyn RhythmAnalyzer = if asset.music_score.is_some() {
+        &ScoreRhythm
+    } else {
+        &measured_rhythm
+    };
 
     // Built only when asked for: finding out whether the ffmpeg binary has the whisper
     // filter spawns it once, which a run that does not transcribe has no use for.
@@ -973,7 +993,7 @@ pub fn analyze_asset_steps(
         scene: &scene,
         transcriber: transcriber.as_ref(),
         loudness: &loudness,
-        rhythm: &rhythm,
+        rhythm,
     };
     Ok(analyze_steps(asset, &kinds, &providers, progress, on_step, cancel))
 }
@@ -1099,6 +1119,22 @@ mod tests {
             crate::engine::test_support::video_stream(1920, 1080, 30.0),
             crate::engine::test_support::audio_stream(48_000, 2),
         ])
+    }
+
+    #[test]
+    fn composed_music_is_analysed_from_its_score_not_measured() {
+        let score = crate::model::sample_song(crate::model::MusicStyle::Pop);
+        let mut a = asset();
+        a.duration = score.duration_s();
+        a.music_score = Some(score);
+        let r = ScoreRhythm.analyze_rhythm(&a, NEVER_CANCEL).unwrap();
+        let tempo = r.tempo.unwrap();
+        assert_eq!(tempo.bpm, 120.0);
+        assert!(tempo.confidence >= 1.0 - 1e-9);
+        assert_eq!(r.music.unwrap().bar_chroma.len(), 40);
+        assert_eq!(r.audio_class.unwrap().class, AudioClass::Music);
+        // Anything that was not composed is refused, so a detector's work is never replaced by it.
+        assert!(ScoreRhythm.analyze_rhythm(&asset(), NEVER_CANCEL).is_err());
     }
 
     /// Providers that record which of them ran and answer with canned data — or fail.
