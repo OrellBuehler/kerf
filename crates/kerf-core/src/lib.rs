@@ -11,6 +11,7 @@ mod clip_timing;
 pub mod error;
 pub mod fonts;
 pub mod frame_pick;
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod hostile;
 pub mod layer_geometry;

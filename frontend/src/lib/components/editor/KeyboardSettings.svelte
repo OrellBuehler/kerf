@@ -170,9 +170,10 @@
 	function pickPreset(e: Event & { currentTarget: HTMLSelectElement }) {
 		const id = e.currentTarget.value as KeyPresetId;
 		if (!keyPreset(id) || id === settings.keyPreset) return;
-		if (changed > 0) {
+		// Only a keyboard of the user's own is asked about; another preset is just swapped.
+		if (changed > 0 && settings.keyPreset === null) {
 			// The select shows what is in force until the question is answered.
-			e.currentTarget.value = settings.keyPreset ?? 'custom';
+			e.currentTarget.value = 'custom';
 			confirmingReset = false;
 			confirmingPreset = id;
 			return;

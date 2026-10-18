@@ -10,7 +10,12 @@
 	import { formatTimecode, parseTimecode, timecodeFrameAt, timecodeRate } from '$lib/timecode';
 	import { tip } from '$lib/tip';
 
-	let { entry, size = 12, weight = 600 }: { entry: 'timeline' | 'preview'; size?: number; weight?: number } = $props();
+	let {
+		entry,
+		size = 12,
+		weight = 600,
+		describedby
+	}: { entry: 'timeline' | 'preview'; size?: number; weight?: number; describedby?: string } = $props();
 
 	let input = $state<HTMLInputElement | null>(null);
 	let editing = $state(false);
@@ -66,7 +71,8 @@
 	inputmode="numeric"
 	spellcheck="false"
 	autocomplete="off"
-	aria-label="Playhead timecode"
+	aria-label={entry === 'timeline' ? 'Timeline playhead timecode' : 'Transport playhead timecode'}
+	aria-describedby={describedby}
 	aria-invalid={invalid}
 	use:tip={settings.tip(
 		'Go to timecode',

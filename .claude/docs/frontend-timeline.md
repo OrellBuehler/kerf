@@ -281,11 +281,11 @@ step), the mark and marker tooltips, the trim readouts, the keyframe tooltips an
 survives only in the Inspector's editable seconds fields and in the prose that mirrors Rust (`diff.ts`
 `formatTime`). **The timeline's clock** is the ruler's corner (`data-timeline-time`: playhead in amber, `/`, the cut's length;
 an empty cut is `00:00:00:00`, not the lane's 8 s minimum); the toolbar's unlabelled length is gone, and ripple's cue there
-is its icon. The ruler stays non-drop (its steps are nominal seconds). **The playhead's timecode is typed into**
+is its icon. At a drop-frame rate the ruler labels are drop-frame too, frames and all (`tickLabel`), so a tick reads as the playhead would there; its ticks stay on whole frames of nominal seconds. **The playhead's timecode is typed into**
 (`TimecodeField.svelte`, in the clock and in the transport; **Go to timecode**, `playback.goToTimecode`, ⌘G by default,
 focuses the timeline's, else the transport's): `parseTimecode` reads Premiere-style entry — any of `:;.,` between
 fields, fewer fields filling from the right (`1.00` a second), bare digits as right-aligned pairs (`1000` is
-`00:00:10:00`), `+15` / `-1.00` relative to the frame shown, a dropped drop-frame label as its minute's first frame.
+`00:00:10:00`), `+15` / `-1.00` relative to the frame shown, an overflowing field carried into the next first, a dropped drop-frame label as its minute's first frame, all-empty fields (`:`) refused.
 Enter seeks to the frame (`frameTime`); Escape, Tab or a click away leave the playhead alone; an unreadable entry
 turns red and stays.
 

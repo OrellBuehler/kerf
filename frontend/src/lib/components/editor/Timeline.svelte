@@ -2675,10 +2675,17 @@
 				<!-- Where the playhead is, and how long the cut is: the timeline's own clock, so a scrub or a
 				     drag here does not need the Preview on screen to say what time it is. The playhead's half is
 				     where a timecode is typed (`TimecodeField`). -->
-				<span data-timeline-time style="display:inline-flex;align-items:baseline;gap:6px">
-					<TimecodeField entry="timeline" />
+				<span
+					data-timeline-time
+					role="timer"
+					aria-label="Playhead {tc(ui.time)} of {tc(editor.duration)}"
+					style="display:inline-flex;align-items:baseline;gap:6px"
+				>
+					<TimecodeField entry="timeline" describedby="timeline-cut-length" />
 					<span aria-hidden="true" style="font-size:11px;color:var(--text-muted)">/</span>
-					<span use:tip={'The length of the cut'} style="font-size:11px;color:var(--text-muted)">{tc(editor.duration)}</span>
+					<span id="timeline-cut-length" use:tip={'The length of the cut'} style="font-size:11px;color:var(--text-muted)"
+						>{tc(editor.duration)}</span
+					>
 				</span>
 				<span style="flex:1"></span>
 				{#if editor.rippleMode}

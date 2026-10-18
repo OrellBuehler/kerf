@@ -434,7 +434,7 @@
   `fields` / `frames` / `format` and `parse` (Premiere-style entry, relative `+` / `-`, a dropped label
   read as its minute's first frame), all held to `MAX_TIMECODE_FRAME` so the TS mirror (`timecode.ts`) does
   the same integer arithmetic in doubles. Pure; the frontend's tests replay its cases.
-- `hostile.rs` (`#[doc(hidden)]`, tests only) — seeded mutation for robustness tests: every prefix, bounded
+- `hostile.rs` (only under `cfg(test)` or the `test-support` feature, which kerf-gpu, kerf-app and kerf-core's own integration tests turn on as a dev-dependency; never in a release build) — seeded mutation for robustness tests: every prefix, bounded
   rounds of bit flips / inserted / deleted / duplicated bytes, and each number pushed to the edges of
   `u32` / `i64` / `f64` (`number_variants`), each case under `catch_unwind`. Used by
   `tests/hostile_input.rs` (caption files and their import, the stored timeline), `engine/cli/hostile_tests.rs`

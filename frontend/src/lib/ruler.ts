@@ -8,12 +8,13 @@
  * A ruler is read against the timecode beside it, so its steps are *timecode*
  * steps: a second is `nominal` frames (30 at 29.97 too, the non-drop count), and a
  * step under a second is a whole number of frames. A label is then the project's
- * own `HH:MM:SS` / `HH:MM:SS:FF` of its tick (`timecode.ts`) and never reads a frame
+ * own `HH:MM:SS` / `HH:MM:SS:FF` of its tick (`timecode.ts`; drop-frame `HH;MM;SS;FF` at 29.97
+ * and 59.94, always with its frames) and never reads a frame
  * off the one it is, whatever the rate. Between two labelled (major) ticks sit
  * minor ticks, a taller one halfway when the division is even; once a frame is wide
  * enough the frame ticks are the minors. */
 
-import { formatTimecode } from './timecode';
+import { formatTimecode, timecodeRate } from './timecode';
 
 /** The least room, px, between two labels. */
 export const MIN_LABEL_PX = 100;
@@ -131,10 +132,11 @@ export function minorTicksIn(loSec: number, hiSec: number, grid: RulerGrid, limi
 }
 
 /** The label of tick `k` on a grid: the project timecode of its time — `HH:MM:SS` for a
- *  whole-second step, `HH:MM:SS:FF` below it. Non-drop at 29.97 too: the steps are nominal
- *  seconds, which a drop-frame label would read off by the frames dropped so far. */
+ *  whole-second step, `HH:MM:SS:FF` below it. At a drop-frame rate it is the drop-frame label,
+ *  frames and all, as the playhead's reads (Premiere's ruler too): the ticks stay on whole frames
+ *  of nominal seconds, and a label cut at the second would read off by the frames dropped so far. */
 export function tickLabel(k: number, grid: RulerGrid, fps: number): string {
-	return formatTimecode(k * grid.step, fps, { frames: grid.frames, dropFrame: false });
+	return formatTimecode(k * grid.step, fps, { frames: grid.frames || timecodeRate(fps).drop > 0 });
 }
 
 /** Frames are drawn on the ruler once one is at least this wide, px. */

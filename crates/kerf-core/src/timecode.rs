@@ -91,8 +91,9 @@ impl TimecodeRate {
     /// - bare digits are right-aligned pairs, `HHMMSSFF` (`1000` is `00:00:10:00`);
     /// - a leading `+` / `-` is relative to `current`: `+15` is 15 frames on, `-1.00` a second back.
     ///
-    /// A field past its range (`90` frames) carries, as in Premiere. `None` for what is not a
-    /// timecode; the result is held to `0..=MAX_TIMECODE_FRAME`.
+    /// A field past its range (`90` frames) carries into the next before a drop-frame label is
+    /// read, as in Premiere. `None` for what is not a timecode (fields that are all empty, `:`, too);
+    /// the result is held to `0..=MAX_TIMECODE_FRAME`.
     pub fn parse(self, input: &str, current: i64) -> Option<i64> {
         let text = input.trim();
         let (sign, body) = match text.as_bytes().first()? {
@@ -128,7 +129,7 @@ impl TimecodeRate {
                 pairs
             }
         } else {
-            if parts.len() > 4 || !parts.iter().all(|p| digits(p)) {
+            if parts.len() > 4 || !parts.iter().all(|p| digits(p)) || parts.iter().all(|p| p.is_empty()) {
                 return None;
             }
             parts.iter().map(|p| field(p)).collect::<Option<_>>()?
@@ -138,12 +139,12 @@ impl TimecodeRate {
         } else {
             let mut hmsf = [0; 4];
             hmsf[4 - fields.len()..].copy_from_slice(&fields);
+            // A field past its range carries into the next, then the label is read as a label.
             let [h, m, s, f] = hmsf;
-            if self.is_drop() && m < 60 && s < 60 && f < self.base {
-                self.frames(h, m, s, f)
-            } else {
-                (h * 3600 + m * 60 + s) * self.base + f
-            }
+            let (s, f) = (s + f / self.base, f % self.base);
+            let (m, s) = (m + s / 60, s % 60);
+            let (h, m) = (h + m / 60, m % 60);
+            self.frames(h, m, s, f)
         };
         let frame = match sign {
             Some(sign) => current.clamp(0, MAX_TIMECODE_FRAME) + sign * frames.min(MAX_TIMECODE_FRAME),
@@ -300,6 +301,13 @@ mod tests {
             "--1",
             "1234567890:0",
             "+1234567890",
+            ":",
+            ".",
+            "::",
+            ":;.,",
+            "+:",
+            "-.",
+            "+::",
         ] {
             assert_eq!(r.parse(text, 0), None, "{text:?}");
         }
@@ -312,8 +320,13 @@ mod tests {
         assert_eq!(r.parse("00:01:00:02", 0), Some(1800));
         assert_eq!(r.parse("1000200", 0), Some(107_952));
         assert_eq!(r.parse("+1.00", 10), Some(40));
-        // Out of range fields carry as non-drop counts.
+        // A field past its range carries first, and the label it makes is read as drop-frame.
         assert_eq!(r.parse("0:0:0:45", 0), Some(45));
+        assert_eq!(r.parse("0:0:60:0", 0), Some(1800));
+        assert_eq!(r.parse("0:0:0:1800", 0), Some(1800));
+        assert_eq!(r.parse("0:0:59:45", 0), r.parse("00;01;00;15", 0));
+        assert_eq!(r.parse("0:70:0:0", 0), r.parse("1:10:0:0", 0));
+        assert_eq!(r.parse("0:70:0:0", 0), Some(125_874));
     }
 
     #[test]

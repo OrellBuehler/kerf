@@ -306,7 +306,7 @@ the five tools as radios, and trim / detach / link — Ripple mode and Snapping 
 Keyboard shortcuts…), *View* (zoom, **Track height**, Overview strip, Safe-area guides,
 **Delivery frame**, **Workspace**), *Window* (every panel as a tick, Reset <workspace>
 workspace, Reset all workspaces — which asks first when any arrangement is stored),
-*Playback* (Play / pause, Go to start / end, back and forward a frame and a second,
+*Playback* (Play / pause, Go to start / end, Go to timecode, back and forward a frame and a second,
 Shuttle J / K / L, Set / Clear in and out, markers — the transport lives in the Preview
 panel and a panel can be closed, so the whole of it is here as registry actions with
 their bindings), *Help* (Keyboard shortcuts…, Check for updates…, Release notes, Show log folder,
@@ -1119,7 +1119,7 @@ every preset to known action ids, readable chords and no collision on either pla
 | Preset | Not mapped | Why |
 | --- | --- | --- |
 | Premiere Pro | Ripple Edit / Rate Stretch / Pen / Hand / Zoom / Type tools, Add Edit (⌘K), Insert / Overwrite (, .), Lift / Extract (; '), next / previous edit (↑ ↓), 5-frame steps, workspaces (⌥⇧1–9), Duplicate (⌘⇧/), apply transitions (⌘D, ⇧D) | No such action in Kerf; ⌥⇧ / ⇧ + digit types a symbol, which a layout-following chord reads as the symbol; ⇧/ is not a chord. Ripple mode takes B. |
-| DaVinci Resolve | Pages (⇧2–8), Trim mode's roll / slip / slide split, Blade at playhead (⌘B), Insert / Overwrite (F9 F10), next / previous edit, Loop (⌘/) | No such action, or ⇧ + digit (as above); the Trim tool (T) is Roll. |
+| DaVinci Resolve | Pages (⇧2–8), Trim mode's roll / slip / slide split, Blade at playhead (⌘B), Insert / Overwrite (F9 F10), next / previous edit, Loop (⌘/) | No such action, or ⇧ + digit (as above); the Trim tool (T) is Roll. Trim start / end are `{` / `}` (what ⇧[ / ⇧] type on a US layout), which a layout that needs AltGr for them cannot press. |
 | Final Cut Pro | Position / Range / Hand / Zoom tools, Blade at playhead (⌘B), Connect / Insert / Append (Q W E), 10-frame steps, Share destinations | No such action; ⇧← / ⇧→ stay a second. |
 
 **Settings** are their own runes singleton (`src/lib/settings.svelte.ts`) behind

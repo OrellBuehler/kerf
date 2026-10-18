@@ -129,7 +129,14 @@ describe('timecode entry and drop-frame (mirror of timecode.rs)', () => {
 			'1:+5',
 			'--1',
 			'1234567890:0',
-			'+1234567890'
+			'+1234567890',
+			':',
+			'.',
+			'::',
+			':;.,',
+			'+:',
+			'-.',
+			'+::'
 		]) {
 			expect([text, parseTimecode(text, r, 0)]).toEqual([text, null]);
 		}
@@ -141,7 +148,13 @@ describe('timecode entry and drop-frame (mirror of timecode.rs)', () => {
 		expect(parseTimecode('00:01:00:02', r, 0)).toBe(1800);
 		expect(parseTimecode('1000200', r, 0)).toBe(107_952);
 		expect(parseTimecode('+1.00', r, 10)).toBe(40);
+		// A field past its range carries first, and the label it makes is read as drop-frame.
 		expect(parseTimecode('0:0:0:45', r, 0)).toBe(45);
+		expect(parseTimecode('0:0:60:0', r, 0)).toBe(1800);
+		expect(parseTimecode('0:0:0:1800', r, 0)).toBe(1800);
+		expect(parseTimecode('0:0:59:45', r, 0)).toBe(parseTimecode('00;01;00;15', r, 0));
+		expect(parseTimecode('0:70:0:0', r, 0)).toBe(parseTimecode('1:10:0:0', r, 0));
+		expect(parseTimecode('0:70:0:0', r, 0)).toBe(125_874);
 	});
 
 	test('huge entries are held, not wrapped', () => {

@@ -123,7 +123,8 @@ const isDigits = (s: string) => /^[0-9]*$/.test(s);
 	* `TimecodeRate::parse`: `01:02:03:04` with any of `:;.,` between the fields (fewer fill from the
 	* right, so `1.00` is a second); bare digits as right-aligned pairs (`1000` is `00:00:10:00`); a
 	* leading `+` / `-` relative to `current` (`+15` frames on, `-1.00` a second back). A field past its
-	* range carries. `null` for what is not a timecode; the frame is held to `0..MAX_TIMECODE_FRAME`. */
+	* range carries into the next before a drop-frame label is read. `null` for what is not a timecode
+	* (fields that are all empty, `:`, too); the frame is held to `0..MAX_TIMECODE_FRAME`. */
 export function parseTimecode(input: string, r: TimecodeRate, current: number): number | null {
 	const text = input.trim();
 	if (text === '') return null;
@@ -142,15 +143,19 @@ export function parseTimecode(input: string, r: TimecodeRate, current: number): 
 			for (let end = bare.length; end > 0; end -= 2) fields.unshift(Number(bare.slice(Math.max(0, end - 2), end)));
 		}
 	} else {
-		if (parts.length > 4 || !parts.every((p) => p.length <= MAX_FIELD_DIGITS && isDigits(p))) return null;
+		if (parts.length > 4 || !parts.every((p) => p.length <= MAX_FIELD_DIGITS && isDigits(p)) || parts.every((p) => p === '')) return null;
 		fields = parts.map((p) => (p === '' ? 0 : Number(p)));
 	}
 	let frames: number;
 	if (sign !== null && parts.length === 1) {
 		frames = fields[0];
 	} else {
-		const [h, m, s, f] = [...new Array<number>(4 - fields.length).fill(0), ...fields];
-		frames = r.drop > 0 && m < 60 && s < 60 && f < r.base ? timecodeFrames(r, h, m, s, f) : (h * 3600 + m * 60 + s) * r.base + f;
+		// A field past its range carries into the next, then the label is read as a label.
+		let [h, m, s, f] = [...new Array<number>(4 - fields.length).fill(0), ...fields];
+		[s, f] = [s + Math.floor(f / r.base), f % r.base];
+		[m, s] = [m + Math.floor(s / 60), s % 60];
+		[h, m] = [h + Math.floor(m / 60), m % 60];
+		frames = timecodeFrames(r, h, m, s, f);
 	}
 	return clampFrame(sign === null ? frames : clampFrame(current) + sign * Math.min(frames, MAX_TIMECODE_FRAME));
 }
