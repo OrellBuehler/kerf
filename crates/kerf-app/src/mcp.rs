@@ -650,6 +650,26 @@ struct SetMasterLimiterParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetMasterTruePeakParams {
+    #[schemars(
+        description = "true makes the master limiter hold the true peak (it runs 4x oversampled, so the peaks between samples stay under the ceiling too); false is the plain sample-peak limiter"
+    )]
+    enabled: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SyncByAudioParams {
+    #[schemars(description = "UUID of the clip that stays put: the timing reference")]
+    reference_clip_id: String,
+    #[schemars(description = "UUID of the clip to move into sync with the reference (its linked partners move with it)")]
+    clip_id: String,
+    #[schemars(
+        description = "Move the clip even when the match is not reliable (confidence under 8 or distinct under 1.5). Default false: an unreliable match is reported and nothing moves"
+    )]
+    force: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct GetLevelsParams {
     #[schemars(description = "Measure only this span of the cut, {start, end} in timeline seconds. Omit for the whole cut")]
     range: Option<TimeRange>,
@@ -2357,6 +2377,20 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Make the master limiter (set_master_limiter) hold the true peak instead of only the sample \
+                       peak: it then runs on the mix upsampled four times, so the peaks between samples — what \
+                       get_levels and the platforms measure as dBTP — stay under its ceiling too, and a ceiling of \
+                       -1 really means -1 dBTP. Costs a little render time; does nothing while the limiter is off \
+                       (the setting is kept). Returns the master bus."
+    )]
+    fn set_master_true_peak(&self, Parameters(p): Parameters<SetMasterTruePeakParams>) -> Result<String, McpError> {
+        self.edit(|project| {
+            let master = project.set_master_true_peak(p.enabled).map_err(core_err)?;
+            json(&master)
+        })
+    }
+
+    #[tool(
         description = "Choose how ducked tracks (set_track_duck) dip under the rest of the mix on export. With \
                        depth_db, a speech gate: whenever the other tracks speak the ducked tracks drop by exactly \
                        that much (ramping down in ~50 ms and back ~300 ms after the speech stops) — -12 is a good \
@@ -3331,6 +3365,34 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Sync a clip to another by their sound: decodes both clips' audio, finds the offset where \
+                       they match (GCC-PHAT cross-correlation, to a fraction of a millisecond) and moves the clip \
+                       so the same moment lands at the same timeline time — a camera's scratch audio against the \
+                       recorder, two cameras on one stage. Both clips need sound and normal forward speed, and must \
+                       not be linked to each other. Returns `offset` (seconds the clip moved; positive is later), \
+                       `timeline_start`, `confidence` (peak over noise, >= 8 is clear), `distinct` (peak over the \
+                       next-best match, >= 1.5 is unambiguous — music can match at several offsets), `reliable`, \
+                       `inverted` (one recording has flipped polarity) and `applied`. An unreliable match does not \
+                       move anything unless force is true."
+    )]
+    async fn sync_clips_by_audio(&self, Parameters(p): Parameters<SyncByAudioParams>) -> Result<String, McpError> {
+        let (reference, clip) = (parse_id(&p.reference_clip_id)?, parse_id(&p.clip_id)?);
+        let force = p.force.unwrap_or(false);
+        let project = self.project.clone();
+        let sync = blocking(move || {
+            // Resolve under the lock, decode and correlate without it, move under it again.
+            let plan = lock_agent(&project).audio_sync_inputs(reference, clip).map_err(core_err)?;
+            let measured = Project::measure_audio_sync(&plan).map_err(core_err)?;
+            lock_agent(&project).apply_audio_sync(&measured, force).map_err(core_err)
+        })
+        .await?;
+        if sync.applied {
+            self.changed();
+        }
+        json(&sync)
+    }
+
+    #[tool(
         description = "Cut to the beat: ripple a track's cuts onto the beat grid of the analyzed music on the audio tracks, retrimming each clip so its outgoing cut lands on a beat. Analyze the music asset first"
     )]
     fn snap_to_beats(&self, Parameters(p): Parameters<SnapToBeatsParams>) -> Result<String, McpError> {
@@ -3660,7 +3722,9 @@ impl KerfMcp {
         description = "Render the timeline to a file with full ffmpeg encode control (container, video/audio codec, \
                        rate control, resolution, fps, bitrate, faststart, gif, audio-only …). Omit `options` for the \
                        safe H.264/AAC MP4 default. `options.loudness` normalizes the mix to a platform target: \
-                       youtube / spotify (-14 LUFS), apple (-16), broadcast (EBU R128, -23), all at -1 dBTP. A render takes minutes: send a `progressToken` in the request's \
+                       youtube / spotify (-14 LUFS), apple (-16), broadcast (EBU R128, -23), all at -1 dBTP; add \
+                       `options.loudness_static: true` to get there with one measured gain and a true-peak limiter \
+                       (the mix's dynamics untouched; the render measures it first) instead of loudnorm's riding gain. A render takes minutes:send a `progressToken` in the request's \
                        `_meta` to receive progress notifications while it runs, and cancel the request \
                        (`notifications/cancelled`) to stop it — a cancelled render deletes its half-written file \
                        rather than leaving a broken one behind. Refuses to overwrite an existing file unless \

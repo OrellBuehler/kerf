@@ -13742,19 +13742,22 @@ mod tests {
         );
 
         // Off, or with the limiter off, the graph is the sample-peak one / the neutral one.
-        let (plain, _) = master_cut(MasterBus {
+        let with = |master: MasterBus| {
+            let mut t = tl.clone();
+            t.master = master;
+            mix_of(&t, &assets, &ExportOptions::default())
+        };
+        let g = with(MasterBus {
             limiter: true,
             ..MasterBus::default()
         });
-        let (parked, _) = master_cut(MasterBus {
-            true_peak: true,
-            ..MasterBus::default()
-        });
-        let g = mix_of(&plain, &assets, &ExportOptions::default());
         assert!(!g.contains("aresample"), "{g}");
         assert_eq!(
-            mix_of(&parked, &assets, &ExportOptions::default()),
-            mix_of(&master_cut(MasterBus::default()).0, &assets, &ExportOptions::default())
+            with(MasterBus {
+                true_peak: true,
+                ..MasterBus::default()
+            }),
+            with(MasterBus::default())
         );
     }
 

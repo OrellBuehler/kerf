@@ -746,6 +746,9 @@ export interface MasterBus {
 	 *  bus drops by exactly that many dB (negative, clamped to -40..-1) while the rest speaks.
 	 *  The backend omits it when unset. */
 	duck_depth_db?: number | null;
+	/** The limiter holds the true peak (runs 4x oversampled). Absent / false is the sample-peak
+	 *  limiter; the backend omits it when off. */
+	true_peak?: boolean;
 }
 
 export interface Timeline {
@@ -985,6 +988,34 @@ export interface ExportOptions {
 	loudnorm?: boolean;
 	/** Normalize the final mix to a platform's loudness target. Wins over `loudnorm`. */
 	loudness?: LoudnessPreset | null;
+	/** Reach the target with one measured static gain and a true-peak limiter instead of
+	 *  `loudnorm` (the export measures the mix first; dynamics stay as mixed). */
+	loudness_static?: boolean;
+}
+
+/** What syncing a clip to another by their sound found (`kerf_core::AudioSync`). */
+export interface AudioSync {
+	reference_id: string;
+	clip_id: string;
+	/** Seconds the clip moves on the timeline; positive is later. */
+	offset: number;
+	/** Where the clip starts in sync. */
+	timeline_start: number;
+	/** Correlation peak over its RMS; 8 or more is a clear match. */
+	confidence: number;
+	/** Peak over the next-best match more than 50 ms away; 1.5 or more is unambiguous. */
+	distinct: number;
+	reliable: boolean;
+	/** One recording has inverted polarity. */
+	inverted: boolean;
+	/** The clip was moved (an unreliable match is only reported unless forced). */
+	applied: boolean;
+}
+
+/** `sync_clips_by_audio`'s answer: the sync and the timeline after it. */
+export interface SyncedByAudio {
+	sync: AudioSync;
+	timeline: Timeline;
 }
 
 /** A delivery's loudness target (`kerf_core::LoudnessPreset`): YouTube and Spotify -14 LUFS,

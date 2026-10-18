@@ -125,6 +125,10 @@ zeros and a model would take that for silence. `set_speech_model` is the write s
 is *selected*, so downloading without selecting was a silent no-op) — it makes
 both writes the GUI picker makes, though the picker itself only re-reads at
 launch, so a model an agent selects shows there on the next start.
+`sync_clips_by_audio { reference_clip_id, clip_id, force? }` moves a clip into sync with another by
+their sound (inputs under `lock_agent`, decode + correlate without it, `apply_audio_sync` under it
+again) and answers `AudioSync` (offset, confidence, distinct, reliable, inverted, applied);
+`project-changed` only when it moved. `export`'s `options.loudness_static` is in its description.
 `smart_crop` frames each shot for the delivery frame (the server `instructions`
 pair it with `set_delivery_format`, since reshaping to 9:16 otherwise keeps
 whatever was in the middle). `export_variants` is the one-call multi-format
@@ -216,7 +220,7 @@ speech gate; omitted = compressor), `stems_status` and `separate_stems { asset_i
 (async, progress through the token like `generate_voiceover`, cancel via `context.ct`, the
 GUI sees `stems-progress`; answers `StemsPlaced`), and `export`'s `options.loudness` preset. The server
 `instructions` route music under a cut through analyze → fit_music → duck.
-`set_master_volume` / `set_master_limiter` are staged edits like any other;
+`set_master_volume` / `set_master_limiter` / `set_master_true_peak` are staged edits like any other;
 `get_levels` (`range?`, `loudnorm?`) measures the working timeline (the proposal) and takes
 `context.ct` as its cancel, and the server `instructions` — now a `const INSTRUCTIONS`, so a
 test can pin them — send a social cut through it (-14 LUFS, true peak under -1 dBTP, fix with

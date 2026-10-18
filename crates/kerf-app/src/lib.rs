@@ -1104,6 +1104,14 @@ fn set_master_limiter(state: State<'_, AppState>, enabled: bool, ceiling_db: Opt
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// Make the master limiter hold the true peak (4x oversampled) or the sample peak.
+#[tauri::command(async)]
+fn set_master_true_peak(state: State<'_, AppState>, enabled: bool) -> CmdResult<Timeline> {
+    let project = state.project();
+    project.set_master_true_peak(enabled).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
 /// Choose how ducked tracks dip: `depth_db` (negative dB) for the speech gate, omitted
 /// for the sidechain compressor.
 #[tauri::command(async)]
@@ -2752,6 +2760,39 @@ async fn smart_crop(state: State<'_, AppState>, clip_id: Option<String>) -> CmdR
     .await
 }
 
+/// What syncing a clip by its sound found, and the timeline after it.
+#[derive(serde::Serialize)]
+struct SyncedByAudio {
+    sync: kerf_core::AudioSync,
+    timeline: Timeline,
+}
+
+/// Move `clip_id` so its sound lines up with `reference_id`'s (linked partners follow).
+/// An unreliable match is reported without moving anything unless `force`.
+#[tauri::command]
+async fn sync_clips_by_audio(
+    state: State<'_, AppState>,
+    reference_id: String,
+    clip_id: String,
+    force: Option<bool>,
+) -> CmdResult<SyncedByAudio> {
+    let (reference, clip) = (id(&reference_id)?, id(&clip_id)?);
+    let shared = state.project.clone();
+    blocking(move || {
+        let plan = lock_user(&shared)
+            .audio_sync_inputs(reference, clip)
+            .map_err(|e| e.to_string())?;
+        let measured = Project::measure_audio_sync(&plan).map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        let sync = project
+            .apply_audio_sync(&measured, force.unwrap_or(false))
+            .map_err(|e| e.to_string())?;
+        let timeline = project.timeline().map_err(|e| e.to_string())?;
+        Ok(SyncedByAudio { sync, timeline })
+    })
+    .await
+}
+
 /// Every publishing target Kerf knows about, with its frame and length limits.
 #[tauri::command(async)]
 fn platform_targets() -> Vec<kerf_core::PlatformTarget> {
@@ -3531,6 +3572,7 @@ pub fn run() {
             set_master_volume,
             set_master_limiter,
             set_master_duck,
+            set_master_true_peak,
             plan_music_fit,
             fit_music,
             stems_status,
@@ -3588,6 +3630,7 @@ pub fn run() {
             remove_silence,
             snap_to_beats,
             smart_crop,
+            sync_clips_by_audio,
             extract_audio,
             add_asset_audio,
             detach_audio,

@@ -5,6 +5,8 @@ used under the MIT License below. The adapted code is listed here.
 
 ## Adapted from FilmCraft
 
+- crates/kerf-core/src/engine/audio_sync.rs — from FilmCraft crates/audio-dsp/src/sync.rs
+
 
 ## FilmCraft license
 

@@ -20,6 +20,21 @@ export const fadeInOf = (clip: GainClip): number => (clip.fade_in ?? 0) + (clip.
 /** A clip's fade-out length, seconds. */
 export const fadeOutOf = (clip: GainClip): number => clip.fade_out ?? 0;
 
+/** Whether the fade-in is wholly a dissolve or motion transition's overlap — half of a crossfade
+ *  pair, which the export ramps constant-power (`afade` `curve=qsin`: `sin(x·π/2)`). A fade with a
+ *  clip fade in it, or a dip, stays linear, as there. */
+export const crossfadeIn = (clip: GainClip): boolean =>
+	!(clip.fade_in ?? 0) && (clip.transition_in?.duration ?? 0) > 0 && !clip.transition_in!.kind.startsWith('dip_');
+
+/** The gain a fade-in leaves at `x` of the way through it (0..1). */
+export const fadeInGain = (clip: GainClip, x: number): number => {
+	const p = Math.max(0, x);
+	return crossfadeIn(clip) ? Math.sin((Math.min(1, p) * Math.PI) / 2) : p;
+};
+
+/** How many straight ramps the preview draws a constant-power fade-in with. */
+export const CROSSFADE_STEPS = 16;
+
 /**
  * The gain of a clip at timeline time `t`, for a clip that spans `[start, end]`:
  * its volume, shaped by the fade in and out. `level` is whatever else rides it —
@@ -31,9 +46,18 @@ export function clipGainAt(clip: GainClip, t: number, start: number, end: number
 	let v = volumeAt(clip, t - start) * level;
 	const fi = fadeInOf(clip);
 	const fo = fadeOutOf(clip);
-	if (fi > 0 && t < start + fi) v *= Math.max(0, (t - start) / fi);
+	if (fi > 0 && t < start + fi) v *= fadeInGain(clip, (t - start) / fi);
 	if (fo > 0 && t > end - fo) v *= Math.max(0, (end - t) / fo);
 	return v;
+}
+
+/** The times inside a fade-in the preview ramps through: its end alone for a linear fade,
+ *  every step of the curve for a constant-power one. */
+export function fadeInTimes(clip: GainClip, start: number): number[] {
+	const fi = fadeInOf(clip);
+	if (fi <= 0) return [];
+	const n = crossfadeIn(clip) ? CROSSFADE_STEPS : 1;
+	return Array.from({ length: n }, (_, k) => start + (fi * (k + 1)) / n);
 }
 
 /** One command of a keyed clip's gain automation: ramp to `value` by `time`, or — `jump` — set
@@ -71,9 +95,8 @@ export function gainAutomation(clip: GainClip, start: number, end: number, from:
 		times.add(start + t);
 		if (i > 0 && polyline[i - 1][0] === t && polyline[i - 1][1] !== v) steps.add(start + t);
 	});
-	const fi = fadeInOf(clip);
 	const fo = fadeOutOf(clip);
-	if (fi > 0) times.add(start + fi);
+	for (const t of fadeInTimes(clip, start)) times.add(t);
 	if (fo > 0) times.add(end - fo);
 	times.add(end);
 	const out: GainPoint[] = [];

@@ -1,7 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import {
 	clipGainAt,
+	CROSSFADE_STEPS,
+	crossfadeIn,
 	fadeInOf,
+	fadeInTimes,
 	fadeOutOf,
 	gainAtFullScale,
 	gainAutomation,
@@ -71,6 +74,29 @@ describe('clipGainAt', () => {
 		expect(clipGainAt(x, 1, 0, 10)).toBe(0.5);
 		expect(fadeOutOf({} as never)).toBe(0);
 		expect(clipGainAt({} as never, 3, 0, 10)).toBe(1);
+	});
+});
+
+describe('a crossfade-in is constant-power, as the export draws it', () => {
+	const x = { volume: 1, transition_in: { kind: 'crossfade', duration: 2 } } as never;
+	test('sin over the overlap, so it and the outgoing cos sum to unit power', () => {
+		expect(crossfadeIn(x)).toBe(true);
+		for (const f of [0, 0.25, 0.5, 0.75, 1]) {
+			const inc = clipGainAt(x, 10 + 2 * f, 10, 20);
+			expect(inc).toBeCloseTo(Math.sin((f * Math.PI) / 2), 12);
+			expect(inc ** 2 + Math.cos((f * Math.PI) / 2) ** 2).toBeCloseTo(1, 12);
+		}
+		expect(fadeInTimes(x, 10)).toHaveLength(CROSSFADE_STEPS);
+		expect(fadeInTimes(x, 10).at(-1)).toBe(12);
+	});
+	test('a clip fade beside it, a dip, or no transition stays linear', () => {
+		const mixed = { volume: 1, fade_in: 0.5, transition_in: { kind: 'crossfade', duration: 1.5 } } as never;
+		const dip = { volume: 1, transition_in: { kind: 'dip_to_black', duration: 2 } } as never;
+		for (const c of [mixed, dip, { volume: 1, fade_in: 2 } as never]) {
+			expect(crossfadeIn(c)).toBe(false);
+			expect(clipGainAt(c, 11, 10, 20)).toBeCloseTo(0.5, 12);
+			expect(fadeInTimes(c, 10)).toEqual([12]);
+		}
 	});
 });
 

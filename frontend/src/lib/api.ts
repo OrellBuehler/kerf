@@ -58,6 +58,7 @@ import type {
 	StagedEdit,
 	StemsProgress,
 	StemsResult,
+	SyncedByAudio,
 	StemsStatus,
 	StreamKind,
 	SvgCheck,
@@ -1775,11 +1776,17 @@ function storeDevMaster(next: MasterBus) {
 		next = { ...next };
 		delete next.duck_depth_db;
 	}
+	// `true_peak` is not written while off.
+	if (!next.true_peak) {
+		next = { ...next };
+		delete next.true_peak;
+	}
 	const untouched =
 		next.volume === DEFAULT_MASTER.volume &&
 		next.limiter === DEFAULT_MASTER.limiter &&
 		next.ceiling_db === DEFAULT_MASTER.ceiling_db &&
-		next.duck_depth_db === undefined;
+		next.duck_depth_db === undefined &&
+		next.true_peak === undefined;
 	if (untouched) delete devTimeline.master;
 	else devTimeline.master = next;
 }
@@ -1813,6 +1820,17 @@ export async function setMasterLimiter(enabled: boolean, ceilingDb?: number | nu
 		return snapshot();
 	}
 	return invoke<Timeline>('set_master_limiter', { enabled, ceilingDb: ceiling });
+}
+
+/** Make the master limiter hold the true peak (4x oversampled on export) or only the sample
+ *  peak. Kept while the limiter is off. One revision; the preview's limiter is the same either way. */
+export async function setMasterTruePeak(enabled: boolean): Promise<Timeline> {
+	if (!inTauri()) {
+		storeDevMaster({ ...masterOf(devTimeline), true_peak: enabled });
+		recordDev(enabled ? 'Limit true peaks' : 'Limit sample peaks');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_master_true_peak', { enabled });
 }
 
 /**
@@ -2705,6 +2723,37 @@ export async function smartCrop(clipId?: string): Promise<Timeline> {
 		return snapshot();
 	}
 	return invoke<Timeline>('smart_crop', { clipId });
+}
+
+/** Move `clipId` so its sound lines up with `referenceId`'s (a camera's scratch audio against
+ *  the recorder): the backend decodes both and cross-correlates them. Linked partners move with
+ *  it. A match that is not `reliable` is reported and nothing moves unless `force`. The harness
+ *  has no sound to compare: it answers as if both recordings started together (the same source
+ *  second at the same timeline time) with a clear match. */
+export async function syncClipsByAudio(referenceId: string, clipId: string, force = false): Promise<SyncedByAudio> {
+	if (!inTauri()) {
+		if (referenceId === clipId) throw new Error('a clip cannot be synced to itself');
+		const ref = locate(devTimeline, referenceId);
+		const own = locate(devTimeline, clipId);
+		if (!ref || !own) throw new Error('clip not found');
+		if (linkPartners(devTimeline, clipId).includes(referenceId)) {
+			throw new Error('the two clips are linked and move together; detach them first');
+		}
+		const [r, c] = [ref[0].clips[ref[1]], own[0].clips[own[1]]];
+		for (const x of [r, c]) {
+			if (!assetById(x.asset_id)?.streams.some((st) => st.kind === 'audio')) throw new Error(`clip ${x.id} has no sound to sync by`);
+			if ((x.speed ?? 1) !== 1) throw new Error(`clip ${x.id} plays at another speed or reversed; sync needs both at normal speed`);
+		}
+		const start = r.timeline_start - r.source_in + c.source_in;
+		if (start < 0) throw new Error(`in sync the clip would start ${(-start).toFixed(3)}s before the timeline does; move the reference later first`);
+		const offset = start - c.timeline_start;
+		const timeline = await moveClip(clipId, start);
+		return {
+			sync: { reference_id: referenceId, clip_id: clipId, offset, timeline_start: start, confidence: 24, distinct: 3, reliable: true, inverted: false, applied: true },
+			timeline
+		};
+	}
+	return invoke<SyncedByAudio>('sync_clips_by_audio', { referenceId, clipId, force });
 }
 
 /** Give an asset's sound its own clip on an audio track, for every use of the asset on a

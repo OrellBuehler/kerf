@@ -138,3 +138,8 @@
   clips (`bt709`, `smpte170m`, full-range `yuvj420p` `bt709`) and must then be exactly where the HDR clip's was. It moves no digest.
   The 400 animated-title cases (`6000..6400`) were blessed with the label in (blocks `60`..`63`; the first 6000 are the digests the label gave);
   with the label text stripped from every argv all 64 block digests equal the ones committed before it.
+- **Constant-power crossfades** (`afade …:curve=qsin` on a fade that is wholly a transition's overlap)
+  re-blessed `export.txt` alone: 2511 of 6400 export cases moved (`KERF_GOLDEN_CASES` before / after, with
+  the curve compiled out for the before), exactly the new `audio-crossfade-qsin` family
+  (`KERF_GOLDEN_FAMILIES`); no still or preview digest moved. `MasterBus.true_peak` and
+  `ExportOptions.loudness_static` landed in the same change and move nothing (both off in every case).

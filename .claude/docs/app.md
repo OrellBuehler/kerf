@@ -35,7 +35,7 @@ ripple mode) and `split_remove_clips { cuts, side }` (`cuts: [{clip_id, at}]`, o
 `ripple_delete`, `cut_clip_range` (remove a **source-time** span from a clip and
 ripple closed — the transcript-editing primitive), `add_track`, `remove_track`,
 `set_track_duck`, `set_track_volume` / `set_track_pan`, `set_master_volume` /
-`set_master_limiter` / `set_master_duck` (`depthDb?`; the master bus; each returns the
+`set_master_limiter` / `set_master_duck` (`depthDb?`) / `set_master_true_peak` (`enabled`; the master bus; each returns the
 `Timeline`), `plan_music_fit` (`clipId`, `target?` → `MusicFit`), `fit_music` (`clipId`,
 `target?`, `fadeOut` → `{timeline, report}`), `stems_status`, `separate_stems` (`assetId`, `clipId?` →
 `{placed, timeline}`; streams `stems-progress`, rejects `stems cancelled`), `cancel_stems`, `get_levels` (`range?`,
@@ -69,6 +69,8 @@ time), `import_captions` / `import_captions_text` (a subtitle file by path / by 
 the text variant is what an `<input type=file>` or a paste uses; both return
 `{timeline, summary}` rather than a bare `Timeline`), `export_srt`, `remove_silence`, `snap_to_beats`,
 `smart_crop` (frame each shot for the delivery frame),
+`sync_clips_by_audio` (`referenceId`, `clipId`, `force?` → `{sync: AudioSync, timeline}`; heavy, the
+lock-free inputs → measure → apply split),
 `extract_audio` (detaches an asset's cut clips and reports what it skipped, see Linked A/V) / `add_asset_audio`
 (an asset's whole audio as a clip) / `detach_audio_clips`,
 `detach_audio` / `reattach_audio` / `reattach_audio_clips` / `link_clips` / `unlink_clips`, `concatenate` — each

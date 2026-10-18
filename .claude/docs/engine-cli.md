@@ -401,6 +401,19 @@ so the feature is **only** activated through these forwards — which is what ma
   `safe_volume` / `safe_ceiling_db` re-clamp in the builder (a `.kerf` never passes
   the clamping ops), and `DiffKind::MasterChanged` stops a master-only agent
   proposal diffing as empty and being discarded by `apply_staged`.
+  **`MasterBus.true_peak`** (opt-in, not written while off, read only with the limiter on) runs the
+  limiter oversampled: `aresample=<4×rate>,alimiter=…,aresample=<rate>` (`oversampled`), so the
+  peaks between samples stay under the ceiling (rendered: an 11 kHz tone pushed into a -1 dB ceiling
+  reads ≤ -0.9 dBTP with it, more without). Latency probing is the same `limiter_filter`.
+  **Static loudness** (`ExportOptions.loudness_static`, with a `loudness` / `loudnorm` target):
+  instead of single-pass `loudnorm` (which rides the gain and overshoots TP), `render_with_progress`
+  (and `render_variants`, once for every variant) first runs one `levels::static_loudness_gain` pass —
+  the export's own metered graph with the normalization off — and fills the `serde(skip)`
+  `loudness_gain_db` with `target − I` (±`LOUDNESS_MAX_GAIN_DB` 30; 0 for a mix under the gate); the
+  builder then emits `volume=<g>dB` (omitted under 0.005) and the oversampled limiter at the target's
+  -1 dBTP less `STATIC_TP_MARGIN_DB` 0.3 (the resample back rings over what it held). Off, every graph
+  is byte-identical; a cancel during the measure is `Cancelled`. Rendered: two passages 18 dB apart
+  land on -14 / -23 LUFS ±0.5 and stay 18 dB apart, TP ≤ -0.95; clicks given +10 dB stay ≤ -0.95 dBTP.
   **Levels** (`Project::levels_inputs` → static `measure_levels` → `engine::mix_levels`,
   `engine/cli/levels.rs`; lock-free split again): one ffmpeg pass over the export's own
   audio graph. `build_filter_complex_metered` is `build_filter_complex` plus taps
@@ -443,7 +456,13 @@ so the feature is **only** activated through these forwards — which is what ma
   already moved the frames to `timeline_start`, so every `fade` (in / out, dip,
   dissolve) starts at `timeline_start + …` — timed from 0 they blacked out any
   later clip with a fade-out and dropped its fade-in and transitions. Audio is
-  re-based to the clip before `adelay`, so its `afade`s stay clip-local.
+  re-based to the clip before `adelay`, so its `afade`s stay clip-local. **A crossfade is
+  constant-power**: an `afade` that is wholly a transition's overlap (`ClipFx::afade_in` on the
+  incoming clip, `tail` on the outgoing one, with no clip fade or dip folded into it) gets
+  `:curve=qsin` (sin in, cos out; linear ramps dipped 3 dB mid-way), anything mixed keeps the old
+  linear ramp. Rendered: `a_crossfade_keeps_the_power_constant` (two tones, ±0.3 dB through the
+  overlap; -2 dB at a quarter with the curve compiled out). `audio-mix.ts` mirrors it (`crossfadeIn`,
+  `fadeInTimes`: the preview ramps through 16 points of the sine).
   **The scrubbed still draws fades, dips, dissolves, slides and pushes as the file does**
   (`engine/cli/still_fx.rs`; it used to show each clip's own span unfaded — the incoming clip alone
   inside a dissolve, 176 levels off the export's frame — and the agent's `timeline_frame`, the cover

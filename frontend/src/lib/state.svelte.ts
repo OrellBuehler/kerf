@@ -58,6 +58,7 @@ import {
 	removeSilence,
 	snapToBeats,
 	smartCrop,
+	syncClipsByAudio,
 	removeTrack,
 	setTrackDuck,
 	setMask,
@@ -65,6 +66,7 @@ import {
 	setTrackPan,
 	setMasterVolume,
 	setMasterLimiter,
+	setMasterTruePeak,
 	setMasterDuck,
 	fitMusic,
 	setDeliveryFormat,
@@ -110,6 +112,7 @@ import {
 	undo as apiUndo
 } from './api';
 import type {
+	AudioSync,
 	ClipCut,
 	ClipMove,
 	SplitSide,
@@ -879,6 +882,10 @@ class EditorState {
 	setMasterLimiter(enabled: boolean, ceilingDb?: number | null) {
 		return this.#apply(setMasterLimiter(enabled, ceilingDb));
 	}
+	/** The master limiter holds the true peak (4x oversampled on export) or only the sample peak. */
+	setMasterTruePeak(enabled: boolean) {
+		return this.#apply(setMasterTruePeak(enabled));
+	}
 	/** How ducked tracks dip: a negative `depthDb` is the speech gate (that many dB under speech,
 	 *  `-40..-1`), omitted the sidechain compressor. */
 	setMasterDuck(depthDb?: number | null) {
@@ -1162,6 +1169,18 @@ class EditorState {
 	 */
 	smartCrop(clipId?: string) {
 		return this.#apply(smartCrop(clipId));
+	}
+	/** Move `clipId` so its sound lines up with `referenceId`'s; resolves to what was found.
+	 *  An unreliable match moves nothing unless `force`. One `Move clip` revision when it moves. */
+	async syncByAudio(referenceId: string, clipId: string, force = false): Promise<AudioSync> {
+		let sync!: AudioSync;
+		await this.#apply(
+			syncClipsByAudio(referenceId, clipId, force).then((r) => {
+				sync = r.sync;
+				return r.timeline;
+			})
+		);
+		return sync;
 	}
 	/** Detach the sound of every clip of an asset still playing its own (one revision); resolves
 	 *  to what was detached and what was skipped (a locked track). */

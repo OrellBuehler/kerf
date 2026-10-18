@@ -547,6 +547,15 @@ YouTube −14 / Spotify −14 / Apple −16 / Broadcast −23 LUFS (`LOUDNESS_TA
 target and `loudness` wins over it exactly as in the engine (`loudnessChoice`), and
 `withLoudness` clears the flag in the same move so Off cannot be turned back into YouTube
 by a flag left set. The chosen target also reads in the summary line (`… · AAC 192k · -16 LUFS`).
+With a target, **Keep the dynamics** writes `ExportOptions.loudness_static` (one measured gain and a
+true-peak limiter instead of `loudnorm`; the hint under it says which). The Mixer's master FX block has a
+**True peak** toggle beside the limiter (`setMasterTruePeak`, dimmed while the limiter is off; export-only —
+the preview's limiter is the same either way, and `fxSummary` does not mention it).
+The clip menu offers **Sync by audio** when exactly two clips are selected and one is right-clicked:
+`audio-sync.ts` `syncOffer` greys it with the backend's refusals (no sound, speed ≠ 1, linked to each other,
+locked track); `editor.syncByAudio` moves the clicked clip to the other (`describeSync` toast, and a
+**Move anyway** action — `force` — for a match that was not reliable). The harness answers as if both
+recordings started together.
 The options are remembered for the session (`export-draft.ts`: `ui.exportDraft`, written when the
 dialog closes, restored by `restoreDraft` unless the project has been re-cut for another frame since —
 a remembered 9:16 preset must not open on a 16:9 cut — and dropped by `ui.projectReplaced()` when a

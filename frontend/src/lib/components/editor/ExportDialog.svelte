@@ -438,6 +438,14 @@
 					(v) => patch(withLoudness(opts, v as LoudnessChoice))
 				)}
 				<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0;line-height:1.45">{loudnessHint}</p>
+				{#if loudness !== 'off'}
+					{@render toggleRow('Keep the dynamics', !!opts.loudness_static, (v) => patch({ loudness_static: v }))}
+					<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0;line-height:1.45">
+						{opts.loudness_static
+							? 'Measures the mix first, then moves it by one gain and holds the true peak with a limiter — quiet and loud passages keep their distance. The export takes a little longer.'
+							: 'Off, the level is evened out as it plays (loudnorm), which narrows the gap between quiet and loud passages.'}
+					</p>
+				{/if}
 			{/if}
 		{/if}
 		<!-- one cut, every platform -->

@@ -35,7 +35,7 @@
 import { getAudio } from './api';
 import type { Clip, MasterBus, Timeline } from './types';
 import { panGains } from './mixer';
-import { clipGainAt, fadeInOf, fadeOutOf, gainAutomation, limiterParams } from './audio-mix';
+import { clipGainAt, fadeInTimes, fadeOutOf, gainAutomation, limiterParams } from './audio-mix';
 import { clipSounds } from './mixer-strips';
 import { clampMasterVolume, masterOf, trackRenders } from './levels';
 import { readBlock, type Reading } from './meter';
@@ -368,7 +368,6 @@ export class AudioEngine {
 		// approximates as an extra fade-in (the export folds it in the same way).
 		// The track fader multiplies the clip's own gain, as it does on export — on the
 		// bus, which `clipGainAt` leaves out (its product with the clip's is the same).
-		const fi = fadeInOf(clip);
 		const fo = fadeOutOf(clip);
 		const env = (tl: number) => clipGainAt(clip, tl, clipStart, clipEnd);
 		const t0 = Math.max(clipStart, nowT);
@@ -383,7 +382,8 @@ export class AudioEngine {
 			}
 			return;
 		}
-		if (fi > 0 && clipStart + fi > t0) gain.gain.linearRampToValueAtTime(env(clipStart + fi), at(clipStart + fi));
+		// A constant-power fade-in is drawn as a run of short ramps along its curve.
+		for (const t of fadeInTimes(clip, clipStart).filter((t) => t > t0)) gain.gain.linearRampToValueAtTime(env(t), at(t));
 		const foStart = Math.max(clipEnd - fo, t0);
 		if (fo > 0 && clipEnd > t0) {
 			gain.gain.setValueAtTime(env(foStart), at(foStart));

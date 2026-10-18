@@ -236,9 +236,48 @@ mod tests {
         moved.source_in = 11.0;
         assert!((synced_start(&moved, &c, &m) - (8.0 - 1.0 + 2.5)).abs() < 1e-12);
         // A clip trimmed at its head after the measure starts later by the trim.
-        let mut trimmed = c.clone();
+        let mut trimmed = c;
         trimmed.source_in = 4.0;
         assert!((synced_start(&r, &trimmed, &m) - 8.5).abs() < 1e-12);
+    }
+
+    /// Two files of one pink-noise take, the second starting 1.25 s into the first: decoded
+    /// through ffmpeg and correlated, the offset comes back to the sample.
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn two_recordings_of_one_take_line_up_through_ffmpeg() {
+        use crate::engine::test_support::StatusBounded;
+        let dir = std::env::temp_dir().join(format!("kerf-sync-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.flac"), dir.join("b.flac"));
+        let run = |args: &[&str], out: &std::path::Path| {
+            let ok = crate::engine::ffmpeg_command()
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(args)
+                .arg(out)
+                .status_bounded()
+                .expect("run ffmpeg");
+            assert!(ok.success());
+        };
+        run(&["-f", "lavfi", "-i", "anoisesrc=d=12:c=pink:seed=7:r=48000"], &a);
+        let a_path = a.to_string_lossy().into_owned();
+        run(&["-ss", "1.25", "-i", &a_path, "-af", "volume=0.3"], &b);
+        let side = |path: &std::path::Path, start: f64, secs: f64| SyncSide {
+            clip_id: Uuid::new_v4(),
+            path: path.to_path_buf(),
+            start,
+            secs,
+        };
+        for (clip_start, want) in [(0.0, 1.25), (2.0, 3.25)] {
+            let plan = AudioSyncPlan {
+                reference: side(&a, 0.0, 12.0),
+                clip: side(&b, clip_start, 6.0),
+            };
+            let m = Project::measure_audio_sync(&plan).expect("measure");
+            assert!((m.lag - want).abs() < 1.0 / f64::from(SYNC_SAMPLE_RATE), "{m:?}");
+            assert!(m.reliable && !m.inverted, "{m:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
