@@ -25,6 +25,9 @@ pub enum Error {
     #[error("overlay not found: {0}")]
     OverlayNotFound(uuid::Uuid),
 
+    #[error("animated title not found: {0}")]
+    SvgOverlayNotFound(uuid::Uuid),
+
     #[error("revision not found: {0}")]
     RevisionNotFound(i64),
 

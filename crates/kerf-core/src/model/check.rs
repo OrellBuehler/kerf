@@ -44,6 +44,14 @@ impl Timeline {
                 return invalid(format!("overlay {} has a keyframe at a time that is not a number", o.id));
             }
         }
+        for o in &self.svg_overlays {
+            if !overlays.insert(o.id) {
+                return invalid(format!("animated title {} appears twice", o.id));
+            }
+            if !o.start.is_finite() || !o.end.is_finite() || o.end <= o.start {
+                return invalid(format!("animated title {} must end after it starts", o.id));
+            }
+        }
         if self.markers.iter().any(|m| !m.time.is_finite()) {
             return invalid("a marker is at a time that is not a number".to_string());
         }
