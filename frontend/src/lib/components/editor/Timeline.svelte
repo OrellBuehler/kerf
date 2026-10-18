@@ -30,14 +30,15 @@
 		trimSelection,
 		unlinkSelection
 	} from '$lib/ops';
-	import { importCaptionFile } from '$lib/title-actions';
+	import { addAnimatedTitle, addCustomSvgTitle, importCaptionFile } from '$lib/title-actions';
 	import { keyframeOffer } from '$lib/keyframe-copy';
 	import type { ActionId } from '$lib/keymap';
 	import { DELIVERY_PRESETS, fitLabel, presetFor } from '$lib/delivery-formats';
 	import { setDeliveryPreset } from '$lib/menu-commands';
 	import { importMenuEntries, importableAssets } from '$lib/caption-import-ui';
-	import type { Clip, Marker, StreamKind, TextOverlay, Track } from '$lib/types';
-	import { GENERATED_TITLE_FILL, packRows, snapSpanStart, snapTime, trimSpan } from '$lib/titles';
+	import type { Clip, Marker, StreamKind, SvgOverlay, TextOverlay, Track } from '$lib/types';
+	import { GENERATED_TITLE_FILL, SVG_TITLE_FILL, packRows, snapSpanStart, snapTime, trimSpan } from '$lib/titles';
+	import { SVG_PRESETS, svgDisplayName, svgTooltip } from '$lib/svg-titles';
 	import { faderToGain, gainLabel, gainToFader, panLabel } from '$lib/mixer';
 	import { trackHasSound } from '$lib/mixer-strips';
 	import { clampEdge, quantizeSpanStart, quantizeTime, splitPoint, startBefore, trimEdit } from '$lib/frames';
@@ -983,7 +984,7 @@
 		if (t?.moved) return snapLines([t.pos], magnetsOn(t.trackId, t.clipId));
 		const td = titleDrag;
 		if (td?.moved) {
-			const others = editor.overlays.filter((o) => o.id !== td.id).flatMap((o) => [o.start, o.end]);
+			const others = otherTitleEdges(td.id);
 			const marks = magnetList({ playhead: ui.time, beats: beatTimes, bars: barTimes, edges: allClipEdges(), titles: others });
 			return snapLines(td.mode === 'move' ? [td.start, td.end] : td.mode === 'l' ? [td.start] : [td.end], marks);
 		}
@@ -1641,7 +1642,7 @@
 			return;
 		}
 		const plain = !e.shiftKey && !e.ctrlKey && !e.metaKey;
-		if (plain && (editor.selectedClipIds.length > 0 || editor.selectedOverlayId)) {
+		if (plain && (editor.selectedClipIds.length > 0 || editor.selectedOverlayId || editor.selectedSvgOverlayId)) {
 			editor.clearSelection();
 			return;
 		}
@@ -2153,19 +2154,19 @@
 
 	// The titles lane is not a track, so it follows the global height choice.
 	const titleMetrics = $derived(TITLE_METRICS[ui.heights.all]);
-	const titleRows = $derived(packRows(editor.overlays));
-	/** No title or caption on the cut: the lane is a strip (`track-heights.ts`). */
-	const titlesEmpty = $derived(editor.overlays.length === 0);
+	// The lane holds text titles and animated SVG titles in the same packed rows.
+	const titleRows = $derived(packRows([...editor.overlays, ...editor.svgOverlays]));
+	const titleCount = $derived(editor.overlays.length + editor.svgOverlays.length);
+	/** No title, caption or animated title on the cut: the lane is a strip (`track-heights.ts`). */
+	const titlesEmpty = $derived(titleCount === 0);
 	const titleLaneH = $derived(
-		titleLaneHeightFor(
-			ui.heights.all,
-			Math.max(1, ...[...titleRows.values()].map((r) => r + 1)),
-			editor.overlays.length
-		)
+		titleLaneHeightFor(ui.heights.all, Math.max(1, ...[...titleRows.values()].map((r) => r + 1)), titleCount)
 	);
 
 	type TitleDrag = {
 		id: string;
+		/** A text title or an animated SVG title: the same gesture, written by a different edit. */
+		kind: 'text' | 'svg';
 		mode: 'move' | 'l' | 'r';
 		grabSec: number;
 		origStart: number;
@@ -2177,23 +2178,30 @@
 	let titleDrag = $state<TitleDrag | null>(null);
 	let titleLaneEl = $state<HTMLElement | null>(null);
 
+	/** The edges of every title on the lane — text and animated — but `id`'s own. */
+	function otherTitleEdges(id: string): number[] {
+		return [...editor.overlays, ...editor.svgOverlays].filter((o) => o.id !== id).flatMap((o) => [o.start, o.end]);
+	}
+
 	/** Where a title's edges snap to: 0, the playhead, beats and bars, every clip edge and the other titles'. */
 	function titleSnapPoints(id: string): number[] {
 		const pts = [0, ui.time, ...beatTimes, ...barTimes];
 		for (const t of editor.timeline.tracks)
 			for (const c of t.clips) pts.push(c.timeline_start, c.timeline_start + clipDuration(c));
-		for (const o of editor.overlays) if (o.id !== id) pts.push(o.start, o.end);
+		pts.push(...otherTitleEdges(id));
 		return pts;
 	}
 
-	function onTitlePointerDown(e: PointerEvent, o: TextOverlay, mode: 'move' | 'l' | 'r') {
+	function onTitlePointerDown(e: PointerEvent, o: TextOverlay | SvgOverlay, mode: 'move' | 'l' | 'r', kind: 'text' | 'svg' = 'text') {
 		if (e.button !== 0) return;
 		e.stopPropagation();
-		editor.selectOverlay(o.id);
+		if (kind === 'svg') editor.selectSvgOverlay(o.id);
+		else editor.selectOverlay(o.id);
 		if (holdForReview(e)) return;
 		const left = titleLaneEl?.getBoundingClientRect().left ?? 0;
 		titleDrag = {
 			id: o.id,
+			kind,
 			mode,
 			grabSec: laneTime(e.clientX, left) - o.start,
 			origStart: o.start,
@@ -2234,7 +2242,11 @@
 		titleDrag = null;
 		if (!d) return;
 		if (!d.moved) return; // a plain click selected the title at the press and leaves the playhead alone
-		void editor.retimeOverlay(d.id, d.start, d.end).catch(err);
+		// An edit that removed it under the drag (an undo, an agent) leaves nothing to write.
+		if (d.kind === 'svg' && !editor.svgOverlays.some((o) => o.id === d.id)) return;
+		// One edit either way: an animated title's update re-times a preset's artwork in the same revision.
+		if (d.kind === 'svg') void editor.updateSvgOverlay(d.id, { start: d.start, end: d.end }).catch(err);
+		else void editor.retimeOverlay(d.id, d.start, d.end).catch(err);
 	}
 
 	const addTitleHere = () => void editor.addTitle('Title', ui.time, ui.time + 3).catch(err);
@@ -2255,6 +2267,31 @@
 		]);
 	}
 
+	function onSvgContextMenu(e: MouseEvent, o: SvgOverlay) {
+		e.stopPropagation();
+		editor.selectSvgOverlay(o.id);
+		contextMenu.show(e, [
+			{ label: 'Go to start', icon: 'skip-back', action: () => ui.seek(o.start, { snap: 'up', end: o.end }) },
+			...(o.preset
+				? []
+				: [
+						{
+							label: 'Edit SVG source',
+							icon: 'code-xml',
+							action: () => (ui.svgSourceFocus = o.id)
+						} satisfies MenuItem
+					]),
+			{ type: 'separator' },
+			{
+				label: 'Remove animated title',
+				icon: 'trash',
+				danger: true,
+				shortcut: settings.shortcut('edit.delete'),
+				action: () => void editor.removeSvgOverlay(o.id).catch(err)
+			}
+		]);
+	}
+
 	function onTitleLaneContextMenu(e: MouseEvent) {
 		e.stopPropagation();
 		// Importing captions: timed to the cut, or to one of the clips it shows. The
@@ -2262,6 +2299,15 @@
 		const { entries, more } = importMenuEntries(importableAssets(editor.timeline, editor.assets));
 		contextMenu.show(e, [
 			{ label: 'Add title at playhead', icon: 'captions', action: addTitleHere },
+			...SVG_PRESETS.map(
+				(p): MenuItem => ({
+					label: `Add animated ${p.label.toLowerCase()}`,
+					icon: 'orbit',
+					disabled: editor.busy,
+					action: () => void addAnimatedTitle(p.kind)
+				})
+			),
+			{ label: 'Add custom SVG title…', icon: 'code-xml', disabled: editor.busy, action: () => void addCustomSvgTitle() },
 			{ type: 'separator' },
 			...entries.map(
 				(m): MenuItem => ({
@@ -2761,7 +2807,7 @@
 			>
 				<span style="font-family:var(--font-mono);font-size:12px;font-weight:600;color:var(--text-secondary);flex:none">T</span>
 				<span style="font-size:11px;color:var(--text-muted);flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-					>Titles · {editor.overlays.length}</span
+					>Titles · {titleCount}</span
 				>
 				<button
 					use:tip={'Add a title at the playhead'}
@@ -3098,6 +3144,50 @@
 							<span
 								role="presentation"
 								onpointerdown={(e) => onTitlePointerDown(e, o, 'r')}
+								style="position:absolute;right:0;top:0;bottom:0;width:6px;cursor:ew-resize;z-index:3;touch-action:none"
+							></span>
+						{/if}
+					</button>
+					{#if live}
+						<div
+							style="position:absolute;left:{live.start * pxPerSec}px;top:{titleMetrics.pad + row * titleMetrics.row}px;height:{titleMetrics.row - 3}px;width:{Math.max(
+								6,
+								(live.end - live.start) * pxPerSec
+							)}px;border:1.5px dashed var(--kerf-400);border-radius:2px;background:color-mix(in srgb,var(--drag-ghost) 16%,transparent);pointer-events:none;z-index:25"
+						></div>
+					{/if}
+				{/each}
+				{#each editor.svgOverlays as o (o.id)}
+					{@const live = titleDrag?.moved && titleDrag.id === o.id ? titleDrag : null}
+					{@const row = titleRows.get(o.id) ?? 0}
+					{@const width = Math.max(6, (o.end - o.start) * pxPerSec)}
+					{@const selected = editor.selectedSvgOverlayId === o.id}
+					<!-- An animated SVG title: the same block as a title, in the same rows, behind a motion
+					     icon and its own fill and edge so it reads as artwork, not text. -->
+					<button
+						class="ktitle"
+						data-kind="svg"
+						data-diff={diff?.titles.get(o.id)}
+						onpointerdown={(e) => onTitlePointerDown(e, o, 'move', 'svg')}
+						oncontextmenu={(e) => onSvgContextMenu(e, o)}
+						onclick={(e) => e.stopPropagation()}
+						use:tip={svgTooltip(o)}
+						style="position:absolute;left:{o.start * pxPerSec}px;top:{titleMetrics.pad + row * titleMetrics.row}px;height:{titleMetrics.row - 3}px;width:{width}px;border-radius:2px;overflow:hidden;display:flex;align-items:center;gap:4px;padding:0 7px;touch-action:none;opacity:{live ? 0.4 : 1};cursor:{titleDrag ? 'grabbing' : 'grab'};text-align:left;background:{SVG_TITLE_FILL};border:{selected ? '1.5px solid var(--kerf-400)' : '1px solid var(--track-video-edge)'};box-shadow:{selected ? '0 0 0 1px var(--kerf-500)' : 'none'}"
+					>
+						{#if width > 34}<span style="position:relative;display:inline-flex;flex:none;color:var(--text-on-video)"><Icon n="orbit" s={titleMetrics.font + 1} /></span>{/if}
+						<span
+							style="position:relative;font-size:{titleMetrics.font}px;font-weight:600;color:var(--text-on-video);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
+							>{svgDisplayName(o)}</span
+						>
+						{#if width > 24}
+							<span
+								role="presentation"
+								onpointerdown={(e) => onTitlePointerDown(e, o, 'l', 'svg')}
+								style="position:absolute;left:0;top:0;bottom:0;width:6px;cursor:ew-resize;z-index:3;touch-action:none"
+							></span>
+							<span
+								role="presentation"
+								onpointerdown={(e) => onTitlePointerDown(e, o, 'r', 'svg')}
 								style="position:absolute;right:0;top:0;bottom:0;width:6px;cursor:ew-resize;z-index:3;touch-action:none"
 							></span>
 						{/if}

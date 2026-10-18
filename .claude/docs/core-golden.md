@@ -13,9 +13,17 @@
   families `colour-keyed-*`, `volume-keyed*`, `channel-*`) and **400 more** with an AMF or VAAPI
   encoder (`hw_encoder_for`, by index: `h264/hevc/av1_amf` and `h264/hevc/av1_vaapi`, which exist
   nowhere in the first 5600; families `codec-amf-av1`, `codec-vaapi-*`, `rate-amf-quality`,
-  `rate-vaapi-*`, `vaapi-device`, `vaapi-upload`), have their
+  `rate-vaapi-*`, `vaapi-device`, `vaapi-upload`) and **400 more** with animated SVG titles (`svg_for`, on dice seeded by the case:
+  one to three overlays of four fixed artworks — never a preset, whose text would put the machine's libm in the cache key — half in a box
+  that may hang off the frame, a third translucent, a fifth part-way into their animation; every eighth case forced to the gif container,
+  no dice; the cache directory pinned at `/kerf-test/svg` by `pinned`, and a still or the playhead may land on a title's edge (the edge
+  list gains the titles' edges, a different pick from the same single draw; every third case plays from a frame of the stream's own grid
+  in the middle of its first title, `svg_playhead`, no dice, because the drawn playhead is between frames and a stream from one never reads
+  `-start_number`); families `svg-input`, `svg-held`, `svg-overlay`, `svg-two`, `svg-partly-off`, `svg-restamp`, `still-svg`,
+  `still-svg-one-file`, `preview-svg-*` (`input`, `held`, `seek`, `overlay`) and
+  the structural `svg-under-text`, `svg-gif`, `svg-offset`, which gave 28 to hundreds of cases each), have their
   `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
-  FNV-1a digests, committed as 60 block digests each in
+  FNV-1a digests, committed as 64 block digests each in
   `engine/cli/golden/{export,still,preview}.txt` (LF: `.gitattributes`, and the comparison
   ignores `\r`). A refactor of the graph builders must leave all three untouched; an
   intended argv change moves the files of the builders it touched. (`build_proxy_args` and
@@ -24,7 +32,8 @@
   `KERF_GOLDEN_BLESS=1 cargo test -p kerf-core --no-default-features golden -- --nocapture`
   (exactly `1`): it rewrites **all three** files and says so, and `git diff` is the guard —
   only the files you meant to change should move. It is **machine-independent**: the
-  builders read the machine in five places and each is pinned — the preview's
+  builders read the machine in six places and each is pinned (the sixth is the animated titles' cache
+  directory, `svg::raster::with_pinned_dir`) — the preview's
   `decode_hwaccel()` (through `build_preview_args_with`), `zscale_available()` (a `cfg(test)`
   thread-local override; every HDR case is built both ways), `alimiter_latency_available()`
   (the same kind of override, `with_alimiter_latency`; every case is built with the option,
@@ -50,6 +59,9 @@
   dice of its own — so all three files re-blessed but only 428 of the 4000 per-case digests
   moved (`KERF_GOLDEN_CASES` before / after) and the rest are byte-identical. Raising
   `LIBRARY` (a new generated asset) moves the draws of every case; a new twin moves none.
+  Reading an animated title differently (a document that cannot move as one looped file, a stream
+  reading the title's sequence from `-start_number`, a still as `-f image2 -pattern_type none`) re-blessed
+  all three files and moved **only blocks 60..63** (the title cases): the diff is four lines a file.
   The **keyed-zoom fix** (zoom last in the chain, `rotate` filling `black@0` when keyed)
   re-blessed `export.txt` and `preview.txt` and left `still.txt` alone: 2027 export and 1507
   preview of 4000 cases moved, exactly the ones whose graph holds a moving zoom (1814 / 1298,
@@ -95,6 +107,9 @@
 - **Sample-exact `adelay`** (a clip starting between milliseconds is delayed by samples)
   re-blessed `export.txt` alone: 2718 of 4800 cases moved, exactly the new
   `audio-delay-samples` family (`S:all=1`); still and preview carry no sound.
+- **The animated-title round** (appended, nothing re-blessed): the three files gained exactly four block lines each (`60`..`63`, 12 insertions,
+  0 deletions in `git diff`), so every one of the 6000 earlier per-case digests is the one the commit before gave. The HW swap is now restricted
+  to its own range (`5600..6000`) so it does not reach the title cases, and the time draws take the titles' edges only where titles exist.
 - **The hardware-encoder round** (AMF recalibrated, `-quality quality`, VAAPI): `export.txt`
   re-blessed, `still.txt` / `preview.txt` only gained the four appended block lines. Of the first
   5600 cases exactly 282 export digests moved (`KERF_GOLDEN_CASES` before / after) — every case whose
@@ -102,3 +117,24 @@
   (`KERF_GOLDEN_FAMILIES`) — and no other: no still, no preview, no case of any other encoder. All 56
   old export *blocks* differ only because each holds AMF cases. The appended cases' codec swap has no
   dice, so the generator's draws are untouched.
+- **The BT.709 label** (`setparams=colorspace=bt709` on an untagged HD clip that shares its graph with an input naming a
+  matrix; `engine-cli.md`) re-blessed all three files as one new family: `bt709-label`, `still-bt709-label`,
+  `preview-bt709-label` (the needle in the argv). Of 6000 cases 3054 export, 644 still and 2139 preview digests moved
+  (2852 / 610 / 1993 of the first 5600), exactly the cases hitting those families, and `KERF_GOLDEN_CASES` before / after
+  with the label text (`setparams=colorspace=bt709,`, the first filter of the chain) stripped from the new argv gives the old
+  digest of every case in all three kinds, so the label is the only change. (Moving it from behind the geometry to the head of
+  the chain, once a dip to white showed a label behind the fit `scale` is not a tag, moved the same 3054 / 644 / 2139 cases
+  and no other.) The corpus holds HDR as its only matrix-naming footage, so the cases are the ones that put an untagged
+  HD clip (`interview`, `broll`, `phone`, `wide`, `sphere`, `lenses` and their padded twins) in a graph with an HLG or PQ
+  one. The structural families `bt709-mix`, `still-bt709-mix` and `preview-bt709-mix` are an oracle by asset *name* (the
+  export's graph is the range's slice, the preview's the cut from the playhead, a still's the layers on screen), and the
+  test fails unless the label is in an argv exactly when it says so: no single-clip case, no case of untagged footage
+  only and no audio-only export moved. Tagged SDR footage, SD, MJPEG, RGB and alpha are covered by the builders' unit
+  tests (`engine/cli/bt709_label.rs`), and the corpus' blind spot, its stills carrying no tag, by a **metamorphic test**
+  (`a_decoders_default_tag_names_no_matrix_in_any_graph_of_the_corpus`, no digests): each case that holds an HDR clip is built
+  again with that clip replaced, same size and place, by a shape the probe really gives (a PNG with alpha or grey, `gbr`; a JPEG,
+  a WebP and MJPEG video, `bt470bg`; RGB video; and one shape per rule, each kept off by that rule alone: a moving `rgba` with `gbr`,
+  MJPEG and SpeedHQ at `yuv422p`, JPEG-LS grey, a decode-only `thp`, AMV, an `rgb24` with `bt470bg` from FFV1) and the label must be in no argv, and by explicitly tagged H.264
+  clips (`bt709`, `smpte170m`, full-range `yuvj420p` `bt709`) and must then be exactly where the HDR clip's was. It moves no digest.
+  The 400 animated-title cases (`6000..6400`) were blessed with the label in (blocks `60`..`63`; the first 6000 are the digests the label gave);
+  with the label text stripped from every argv all 64 block digests equal the ones committed before it.

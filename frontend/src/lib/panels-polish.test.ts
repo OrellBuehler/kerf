@@ -269,7 +269,8 @@ describe('smaller things the review asked for', () => {
 
 	test('a clip’s Remove is red ink on the neutral edge, not an alarm-coloured outline', () => {
 		expect(rule(CONTROLS, ".k-btn[data-variant='destructive'][data-quiet]")).toContain('--k-edge: var(--border-strong)');
-		expect(read(`${EDITOR}Inspector.svelte`).match(/data-quiet/g)?.length).toBe(2);
+		// the clip's Remove, the title's, and the animated title's
+		expect(read(`${EDITOR}Inspector.svelte`).match(/data-quiet/g)?.length).toBe(3);
 	});
 });
 

@@ -102,10 +102,16 @@ export const DEFAULT_FRAME_H = 1080;
  *  unreadable. The theme guard computes this exact mix per preset. */
 export const GENERATED_TITLE_FILL = 'color-mix(in srgb,var(--track-text) 70%,var(--scrim))';
 
+/** The block fill of an animated SVG title in the titles lane: the title colour drawn toward the video track's,
+ *  so it reads as neither a text title nor a clip. Both are dark under the light `--text-on-video` label in every
+ *  theme, and a mix of two such colours is darker than the lighter of them, so the label keeps its contrast (the theme
+ *  guard computes this exact mix per preset). */
+export const SVG_TITLE_FILL = 'color-mix(in srgb,var(--track-text) 50%,var(--track-video))';
+
 const clamp = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), hi);
 const round3 = (v: number) => Math.round(v * 1000) / 1000;
 
-export const isVisibleAt = (o: TextOverlay, t: number) => t >= o.start && t <= o.end;
+export const isVisibleAt = (o: Pick<TextOverlay, 'start' | 'end'>, t: number) => t >= o.start && t <= o.end;
 
 function lerp(points: [number, number][], at: number): number | undefined {
 	if (points.length === 0) return undefined;
@@ -165,11 +171,13 @@ export function withKeyframeAt(o: TextOverlay, t: number, x: number, y: number):
 	return [...keep, { time: local, pos_x: x, pos_y: y, opacity }].sort((a, b) => a.time - b.time);
 }
 
-/** Row index per overlay so that overlapping ones stack instead of covering each other. */
-export function packRows(overlays: TextOverlay[]): Map<string, number> {
+/** Row index per item so that overlapping ones stack instead of covering each other. The titles lane packs
+ *  its text overlays and its animated SVG titles together, so this takes anything with an id and a span;
+ *  items that tie on both ends keep the order they were given in. */
+export function packRows<T extends { id: string; start: number; end: number }>(items: readonly T[]): Map<string, number> {
 	const rows = new Map<string, number>();
 	const ends: number[] = [];
-	for (const o of [...overlays].sort((a, b) => a.start - b.start || a.end - b.end)) {
+	for (const o of [...items].sort((a, b) => a.start - b.start || a.end - b.end)) {
 		let r = ends.findIndex((end) => end <= o.start + 1e-6);
 		if (r < 0) r = ends.length;
 		ends[r] = o.end;

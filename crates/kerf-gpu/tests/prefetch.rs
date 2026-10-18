@@ -85,6 +85,7 @@ fn at(a: &Asset, t: f64) -> PlanLayer {
             ..Track::new(StreamKind::Video, "V1".to_string())
         }],
         overlays: Vec::new(),
+        svg_overlays: Vec::new(),
         markers: Vec::new(),
         format: None,
         master: Default::default(),

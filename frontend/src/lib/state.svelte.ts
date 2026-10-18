@@ -35,6 +35,9 @@ import {
 	moveClip,
 	moveClips,
 	removeOverlay,
+	addSvgOverlay as apiAddSvgOverlay,
+	removeSvgOverlay as apiRemoveSvgOverlay,
+	updateSvgOverlay as apiUpdateSvgOverlay,
 	setAudioEffects,
 	setKeyframes,
 	setPropertyKeyframes,
@@ -138,6 +141,10 @@ import type {
 	StagedEdit,
 	StemsPlaced,
 	StreamKind,
+	SvgLayout,
+	SvgOverlay,
+	SvgOverlayPatch,
+	SvgSource,
 	TextKeyframe,
 	Marker,
 	TextOverlay,
@@ -194,6 +201,9 @@ class EditorState {
 	/** The title being edited. Exclusive with the clip selection: a title is its
 	 *  own item on the titles lane, not a property of whichever clip is selected. */
 	selectedOverlayId = $state<string | null>(null);
+	/** The animated SVG title being edited. Exclusive with the clip and title selections, for the
+	 *  same reason: the Inspector shows one subject. */
+	selectedSvgOverlayId = $state<string | null>(null);
 	selectedMetadata = $state<AssetMetadata | null>(null);
 	analyses = $state<Record<string, AssetAnalysis>>({});
 	history = $state<Revision[]>([]);
@@ -243,6 +253,9 @@ class EditorState {
 		this.timeline = tl;
 		if (this.selectedOverlayId && !(tl.overlays ?? []).some((o) => o.id === this.selectedOverlayId)) {
 			this.selectedOverlayId = null;
+		}
+		if (this.selectedSvgOverlayId && !(tl.svg_overlays ?? []).some((o) => o.id === this.selectedSvgOverlayId)) {
+			this.selectedSvgOverlayId = null;
 		}
 		// A clip another edit removed (an undo, an agent) is no longer selected —
 		// the Inspector would otherwise keep a clip that is not there.
@@ -300,6 +313,7 @@ class EditorState {
 	 */
 	selectClip(clipId: string, mode: PickMode = 'replace', alone = false) {
 		this.selectedOverlayId = null;
+		this.selectedSvgOverlayId = null;
 		const track = this.timeline.tracks.find((t) => t.clips.some((c) => c.id === clipId));
 		this.#setSelection(
 			clickSelectLinked(this.timeline, this.#selection(), clipId, mode, track ? track.clips.map((c) => c.id) : null, alone)
@@ -310,6 +324,7 @@ class EditorState {
 	 *  member: `primary` when it is one, else the last. */
 	selectClips(ids: readonly string[], primary: string | null = null) {
 		this.selectedOverlayId = null;
+		this.selectedSvgOverlayId = null;
 		this.#setSelection(normalize(ids, primary));
 	}
 
@@ -323,6 +338,7 @@ class EditorState {
 	selectAll() {
 		const ids = this.timeline.tracks.filter((t) => !t.locked).flatMap((t) => t.clips.map((c) => c.id));
 		this.selectedOverlayId = null;
+		this.selectedSvgOverlayId = null;
 		this.selectedClipIds = ids;
 		this.selectedClipId = ids.at(-1) ?? null;
 	}
@@ -331,6 +347,7 @@ class EditorState {
 		this.selectedClipId = null;
 		this.selectedClipIds = [];
 		this.selectedOverlayId = null;
+		this.selectedSvgOverlayId = null;
 	}
 
 	/** Select a title, dropping the clip selection so the Inspector shows one thing. */
@@ -339,6 +356,17 @@ class EditorState {
 		if (overlayId) {
 			this.selectedClipId = null;
 			this.selectedClipIds = [];
+			this.selectedSvgOverlayId = null;
+		}
+	}
+
+	/** Select an animated SVG title, dropping the clip and title selections. */
+	selectSvgOverlay(overlayId: string | null) {
+		this.selectedSvgOverlayId = overlayId;
+		if (overlayId) {
+			this.selectedClipId = null;
+			this.selectedClipIds = [];
+			this.selectedOverlayId = null;
 		}
 	}
 
@@ -386,6 +414,15 @@ class EditorState {
 		return this.overlays.find((o) => o.id === this.selectedOverlayId);
 	}
 
+	/** The animated SVG titles in draw order, from the timeline being shown (the backend omits an empty list). */
+	get svgOverlays(): SvgOverlay[] {
+		return this.timeline.svg_overlays ?? [];
+	}
+
+	get selectedSvgOverlay(): SvgOverlay | undefined {
+		return this.svgOverlays.find((o) => o.id === this.selectedSvgOverlayId);
+	}
+
 	/** Timeline length in seconds. Memoized: `timeline` is reassigned wholesale
 	 *  on every edit, so this recomputes only then — not on every playhead tick
 	 *  (the rAF playback loop reads it ~60×/sec). */
@@ -415,6 +452,7 @@ class EditorState {
 		return (
 			this.assets.length > 0 ||
 			(this.timeline.overlays?.length ?? 0) > 0 ||
+			(this.timeline.svg_overlays?.length ?? 0) > 0 ||
 			this.timeline.tracks.some((t) => t.clips.length > 0)
 		);
 	}
@@ -511,6 +549,7 @@ class EditorState {
 		this.selectedClipId = null;
 		this.selectedClipIds = [];
 		this.selectedOverlayId = null;
+		this.selectedSvgOverlayId = null;
 		await this.load();
 		return true;
 	}
@@ -523,6 +562,7 @@ class EditorState {
 		this.selectedClipId = null;
 		this.selectedClipIds = [];
 		this.selectedOverlayId = null;
+		this.selectedSvgOverlayId = null;
 		await this.load();
 		return true;
 	}
@@ -1060,6 +1100,26 @@ class EditorState {
 	removeOverlay(overlayId: string) {
 		if (this.selectedOverlayId === overlayId) this.selectedOverlayId = null;
 		return this.#apply(() => removeOverlay(overlayId));
+	}
+	/** Add an animated SVG title (custom artwork or a preset) from `start`, to `end` or as long as the artwork
+	 *  runs. Custom SVG has been through `validateSvg` first when the caller wants its warnings. */
+	addSvgOverlay(source: SvgSource, start: number, end?: number | null, layout?: SvgLayout) {
+		return this.#apply(() => apiAddSvgOverlay(source, start, end, layout));
+	}
+	/** Add an animated SVG title and select it. */
+	async addSvgTitle(source: SvgSource, start: number, end?: number | null, layout?: SvgLayout) {
+		const known = new Set(this.svgOverlays.map((o) => o.id));
+		await this.addSvgOverlay(source, start, end, layout);
+		const created = this.svgOverlays.find((o) => !known.has(o.id));
+		if (created) this.selectSvgOverlay(created.id);
+		return created;
+	}
+	updateSvgOverlay(overlayId: string, patch: SvgOverlayPatch) {
+		return this.#apply(() => apiUpdateSvgOverlay(overlayId, patch));
+	}
+	removeSvgOverlay(overlayId: string) {
+		if (this.selectedSvgOverlayId === overlayId) this.selectedSvgOverlayId = null;
+		return this.#apply(() => apiRemoveSvgOverlay(overlayId));
 	}
 	setOverlayKeyframes(overlayId: string, keyframes: TextKeyframe[]) {
 		return this.#apply(() => setOverlayKeyframes(overlayId, keyframes));
