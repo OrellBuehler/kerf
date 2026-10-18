@@ -205,7 +205,8 @@ fn a_lut_maps_a_known_colour_and_its_intensity_mixes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// FFmpeg's `colorbalance` (4.4 and later) on one channel value `v` of a pixel of lightness `l`.
+/// FFmpeg's `colorbalance` (4.4 and later) on one channel value `v` of a pixel whose `l` is its largest
+/// plus its smallest channel (the filter's own `l`: the sum, not the mean).
 fn colorbalance(v: f64, l: f64, s: f64, m: f64, h: f64) -> f64 {
     let (a, b, scale) = (4.0, 0.333, 0.7);
     let s = s * ((b - l) * a + 0.5).clamp(0.0, 1.0) * scale;
@@ -228,7 +229,7 @@ fn wheels_render_as_colorbalance_numbers() {
             },
         ),
         (
-            "0x808080",
+            "0x404040",
             Wheels {
                 midtones: wheel(-0.4, 0.0, 0.0),
                 ..Wheels::default()
@@ -259,7 +260,7 @@ fn wheels_render_as_colorbalance_numbers() {
         };
         let got = exported(&asset, &grade, &dir, &format!("{color}-wheels"));
         let rgb = plain.map(|v| f64::from(v) / 255.0);
-        let l = (rgb.iter().cloned().fold(0.0, f64::max) + rgb.iter().cloned().fold(1.0, f64::min)) / 2.0;
+        let l = rgb.iter().copied().fold(0.0, f64::max) + rgb.iter().copied().fold(1.0, f64::min);
         let (s, m, h) = (wheels.shadows.rgb(), wheels.midtones.rgb(), wheels.highlights.rgb());
         let want = [0, 1, 2].map(|c| 255.0 * colorbalance(rgb[c], l, s[c], m[c], h[c]));
         assert_near(color, got, want);
@@ -287,10 +288,10 @@ fn all_three_render_in_order_on_one_clip() {
         }),
         curves: Some(curves),
         wheels: Some(Wheels {
-            midtones: Wheel {
+            highlights: Wheel {
                 x: 0.0,
                 y: 0.0,
-                lightness: 0.1,
+                lightness: -0.1,
             },
             ..Wheels::default()
         }),
@@ -300,8 +301,8 @@ fn all_three_render_in_order_on_one_clip() {
     let p = plain.map(|v| f64::from(v) / 255.0);
     let looked = [p[1], p[2], p[0]];
     let inverted = looked.map(|v| 1.0 - v);
-    let l = (inverted.iter().cloned().fold(0.0, f64::max) + inverted.iter().cloned().fold(1.0, f64::min)) / 2.0;
-    let want = inverted.map(|v| 255.0 * colorbalance(v, l, 0.0, 0.1, 0.0));
+    let l = inverted.iter().copied().fold(0.0, f64::max) + inverted.iter().copied().fold(1.0, f64::min);
+    let want = inverted.map(|v| 255.0 * colorbalance(v, l, 0.0, 0.0, -0.1));
     assert_near("all", got, want);
     let _ = std::fs::remove_dir_all(&dir);
 }

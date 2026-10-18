@@ -61,6 +61,7 @@ import {
 	removeTrack,
 	setTrackDuck,
 	setMask,
+	setGrade,
 	setTrackVolume,
 	setTrackPan,
 	setMasterVolume,
@@ -131,6 +132,7 @@ import type {
 	Easing,
 	Keyframe,
 	Mask,
+	Grade,
 	MusicFitReport,
 	Projection,
 	Property,
@@ -864,6 +866,9 @@ class EditorState {
 	/** Cut a clip to a shape, or `null` to clear the mask. */
 	setMask(clipId: string, mask: Mask | null) {
 		return this.#apply(setMask(clipId, mask));
+	}
+	setGrade(clipId: string, grade: Grade) {
+		return this.#apply(setGrade(clipId, grade));
 	}
 	setTrackVolume(trackId: string, volume: number) {
 		return this.#apply(setTrackVolume(trackId, volume));

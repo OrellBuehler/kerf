@@ -6,6 +6,9 @@ import {
 	evalShape,
 	gradeIsIdentity,
 	lutName,
+	addPoint,
+	movePoint,
+	nearestPoint,
 	normalizeCurve,
 	normalizeGrade,
 	normalizeWheel,
@@ -95,5 +98,26 @@ describe('the LUT', () => {
 	test('its name is the file name on either separator', () => {
 		expect(lutName('/a/b/look.cube')).toBe('look.cube');
 		expect(lutName('C:\\luts\\film.cube')).toBe('film.cube');
+	});
+});
+
+describe('the curve editor', () => {
+	const base = pts([[0, 0], [0.5, 0.5], [1, 1]]);
+	test('a dragged point stays between its neighbours', () => {
+		expect(movePoint(base, 1, 1.5, 0.7)[1]).toEqual({ x: 0.99, y: 0.7 });
+		expect(movePoint(base, 1, -1, 2)[1]).toEqual({ x: 0.01, y: 1 });
+		expect(movePoint(base, 0, 0.3, 0.2)[0]).toEqual({ x: 0.3, y: 0.2 });
+	});
+
+	test('a point is added in order, and not on top of another or past the cap', () => {
+		expect(addPoint(base, 0.25, 0.4)).toEqual({ points: pts([[0, 0], [0.25, 0.4], [0.5, 0.5], [1, 1]]), index: 1 });
+		expect(addPoint(base, 0.505, 0.4)).toBeNull();
+		const full = Array.from({ length: MAX_CURVE_POINTS }, (_, i) => ({ x: i / 15, y: 0 }));
+		expect(addPoint(full, 0.51, 0.5)).toBeNull();
+	});
+
+	test('the nearest point in reach is the one picked', () => {
+		expect(nearestPoint(base, 0.48, 0.52, 0.05)).toBe(1);
+		expect(nearestPoint(base, 0.3, 0.3, 0.05)).toBe(-1);
 	});
 });

@@ -9,6 +9,7 @@
 	import EmptyState from './EmptyState.svelte';
 	import CheckRow from './CheckRow.svelte';
 	import SliderRow from './SliderRow.svelte';
+	import GradeSections from './GradeSections.svelte';
 	import TitlesControls from './TitlesControls.svelte';
 	import MediaChips from './MediaChips.svelte';
 	import AssetInspector from './AssetInspector.svelte';
@@ -1425,6 +1426,8 @@
 				{@render rangeRow('Warmth', col.temperature ?? 0, { min: -1, max: 1, step: 0.05, neutral: DEFAULT_COLOR.temperature ?? 0 }, (v, at) => setCol({ temperature: v }, at), 'temperature')}
 				{@render rangeRow('Gamma', col.gamma, { min: 0.1, max: 3, step: 0.05, neutral: DEFAULT_COLOR.gamma }, (v, at) => setCol({ gamma: v }, at), 'gamma')}
 				</InspectorSection>
+
+				<GradeSections {clip} />
 
 			<InspectorSection title="Mask" summary={mask ? (mask.shape === 'rect' ? 'Rectangle' : 'Ellipse') : 'None'}>
 			<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:6px">

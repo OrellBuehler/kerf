@@ -26,8 +26,8 @@ use crate::clip_timing::{
 };
 use crate::error::{Error, Result};
 use crate::model::{
-    pix_fmt_layout, Asset, AudioEffect, Clip, Color, Delivery, Grade, Hdr, Mask, MaskShape, PixLayout, Projection, Property, Reframe,
-    ReframeKeyframe, ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform,
+    pix_fmt_layout, Asset, AudioEffect, Clip, Color, Delivery, Grade, Hdr, Mask, MaskShape, PixLayout, Projection, Property,
+    Reframe, ReframeKeyframe, ResolvedReframe, SalienceMap, StreamInfo, StreamKind, TextOverlay, TimeRange, Timeline, Transform,
     VideoEffect,
 };
 use crate::render_plan::{still_size, CompositeColorPolicy};

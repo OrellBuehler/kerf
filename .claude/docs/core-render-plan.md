@@ -225,6 +225,9 @@
   truncated as `geq` stores it (`engine::cli::rendered`, `a_mask_plane_is_the_geq_planes_sample_for_sample`: 21 million samples equal on both
   FFmpegs), at the size of the picture the `geq` sees — `LayerGeometry::picture`, or the fit-size `stages[0].keep` when a moving zoom
   comes last — so a compositor draws a mask with no FFmpeg and no per-frame cost.
+  **A grade is refused**: `PlanLayer.grade` is the clip's `Grade`, and curves, wheels or a LUT that changes the picture
+  are `Unsupported::Grade(layer, what)` (kind `grade`) whatever the caps — no compositor pass or parity case draws
+  `lutrgb` / `colorbalance` / `lut3d` or their RGB round trip yet.
   **Colour and partly-keyed transforms in the plan.** `PlanLayer.color` is `Clip::color_at(local)`, sampled
   per frame (a still plan draws it like a static grade; the ZoomBehind check reads it), and a **Motion**
   plan with a keyed colour is refused (`Unsupported::KeyedColor`, until `GpuCaps::keyed_color`: the

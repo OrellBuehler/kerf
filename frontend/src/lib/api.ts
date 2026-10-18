@@ -26,6 +26,8 @@ import type {
 	ClipMove,
 	Mask,
 	Color,
+	Grade,
+	LutInfo,
 	Delivery,
 	PlatformReport,
 	EditSource,
@@ -85,6 +87,7 @@ import type {
 	VoiceoverStatus,
 	WaveformRange
 } from './types';
+import { normalizeGrade } from './grade';
 import { unsavedChoice, type UnsavedChoice, type UnsavedCopy } from './confirm-copy';
 import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
 import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
@@ -1742,6 +1745,36 @@ export async function setMask(clipId: string, mask: Mask | null): Promise<Timeli
 		return snapshot();
 	}
 	return invoke<Timeline>('set_mask', { clipId, mask });
+}
+
+/** Replace a clip's curves, colour wheels and LUT. The backend checks a LUT file before it is set. */
+export async function setGrade(clipId: string, grade: Grade): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found) {
+			const g = normalizeGrade(grade);
+			const clip = found[0].clips[found[1]];
+			if (Object.keys(g).length) clip.grade = g;
+			else delete clip.grade;
+		}
+		recordDev('Set grade');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_grade', { clipId, grade });
+}
+
+/** What a `.cube` file holds, or why it is not a usable LUT (thrown). */
+export async function inspectLut(path: string): Promise<LutInfo> {
+	if (!inTauri()) return { path, size: 33, title: 'Harness look' };
+	return invoke<LutInfo>('inspect_lut', { path });
+}
+
+/** Pick a `.cube` LUT file; `null` if cancelled. The harness hands back a stand-in path. */
+export async function pickLutFile(): Promise<string | null> {
+	if (!inTauri()) return '/harness/looks/teal-orange.cube';
+	const { open } = await import('@tauri-apps/plugin-dialog');
+	const selected = await open({ multiple: false, filters: [{ name: 'Cube LUT', extensions: ['cube'] }] });
+	return typeof selected === 'string' ? selected : null;
 }
 
 /** Set a track's fader — the gain riding every clip on it. */

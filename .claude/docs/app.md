@@ -45,6 +45,8 @@ width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
 (one revision; `ripple: true` is the multi-select ripple delete, via
 `with_ripple`; omitted follows the project's mode), `set_volume`, `set_fade`,
 `set_speed`, `set_transform`, `set_color`, `set_transition`, `set_mask`,
+`set_grade { clipId, grade }` (curves / wheels / LUT; the LUT file is checked off the lock, `blocking`),
+`inspect_lut { path }` (→ `LutInfo {path, size, title}`, or why it is not a usable `.cube`),
 `set_video_effects`,
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
 `set_keyframe_easing { clipId, time, easing, prop? }` (the key within a millisecond of `time`; with

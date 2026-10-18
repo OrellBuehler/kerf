@@ -17,10 +17,10 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use base64::Engine as _;
 use kerf_core::{
     AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipLut, ClipMove,
-    Curves, Delivery,
-    EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property, PropertyKey, ReframeKeyframe,
-    Region, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout, SvgOverlay, SvgOverlayPatch, SvgOverlayResult, SvgPreset,
-    SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange, Timeline, Transition, TransitionKind, VideoEffect, Wheels,
+    Curves, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property, PropertyKey,
+    ReframeKeyframe, Region, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout, SvgOverlay, SvgOverlayPatch, SvgOverlayResult,
+    SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange, Timeline, Transition, TransitionKind,
+    VideoEffect, Wheels,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ServerCapabilities, ServerConfig};
@@ -846,7 +846,9 @@ struct GradeParams {
         description = "Absolute path of a .cube 3D LUT file to look the clip up through (after the color numbers, before the curves). The file is checked now: a 3D table of size 2 to 65 with a 0..1 domain. Pass \"\" to remove the LUT; omit to leave it unchanged"
     )]
     lut_path: Option<String>,
-    #[schemars(description = "How much of the LUT, 0..1 (1 = all of it, the default for a new LUT); alone, changes the current LUT's")]
+    #[schemars(
+        description = "How much of the LUT, 0..1 (1 = all of it, the default for a new LUT); alone, changes the current LUT's"
+    )]
     lut_intensity: Option<f64>,
 }
 
@@ -2706,7 +2708,7 @@ impl KerfMcp {
                     grade.lut = Some(ClipLut {
                         path: path.to_string(),
                         intensity: intensity.unwrap_or(1.0),
-                    })
+                    });
                 }
                 (None, Some(intensity)) => {
                     let lut = grade

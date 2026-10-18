@@ -5,6 +5,9 @@ used under the MIT License below. The adapted code is listed here.
 
 ## Adapted from FilmCraft
 
+- `crates/kerf-core/src/model/grade.rs` (monotone cubic curve, wheel hue offset) — from FilmCraft `crates/render/src/effects.rs` (`curve_lut`, `wheel_rgb`)
+- `frontend/src/lib/grade.ts` (its TS mirror) — from FilmCraft `crates/render/src/effects.rs` (`curve_lut`, `wheel_rgb`)
+- `crates/kerf-core/src/color_lut.rs` (tetrahedral interpolation, `.cube` parsing) — from FilmCraft `crates/color/src/lut.rs`
 
 ## FilmCraft license
 

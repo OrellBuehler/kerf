@@ -632,7 +632,26 @@ so the feature is **only** activated through these forwards — which is what ma
   an unkeyed clip does (a constant `scale`, a constant `rotate=…:fillcolor=none`, `colorchannelmixer`);
   the overlay's `x` / `y` are each the curve or the static offset (`curve_or_static`). Any keyed number
   makes the clip "animated" for the pad / centre decision exactly as the bundle did, so a bundle clip
-  (all five keyed) is byte-identical. **A keyed colour is an `eq` with `eval=frame`** (`eq_filter_keyed`):
+  (all five keyed) is byte-identical. **The grade after the `eq`** (`Clip.grade`, `model/grade.rs`; filters in `engine/cli/grade.rs`, the same in
+  `video_clip_chain` and `still_clip_chain_graded`): **LUT → curves → wheels** (Lumetri's order: basic, creative,
+  curves, wheels), after the tone-map and the `eq`, before effects and any alpha plane; each part is omitted at neutral
+  (no grade, a LUT at 0 %, identity curves, neutral wheels), so no golden moved. **Curves are `lutrgb` expressions**, not a
+  file: per channel `st(0,val/maxval)`, the channel's curve then the master as a balanced `if(lt(..))` tree over the
+  points down to one segment's Horner cubic (the model's Fritsch–Carlson constants, printed exactly), then
+  `round(maxval*clip(ld(0),0,1))` — the integer FFmpeg stores is the model's at any depth (a unit test evaluates the
+  expression for every 8- and 10-bit value). `curves` would draw its own overshooting spline; `lut1d` truncates and
+  needs a file. **The LUT is `lut3d=file='…':interp=tetrahedral` over Kerf's copy** (`color_lut.rs`): the user's
+  `.cube` is parsed strictly (3D only, size 2–65, unit domain, `size³` finite rows, 32 MB cap; FFmpeg's reader ignores a
+  `DOMAIN_MIN` before the size and misreads CR-only files), rewritten to `<cache>/kerf/luts/<fnv>.cube` with the
+  intensity baked in (exact: tetrahedral interpolation of an affine table is itself), path escaped like `fontfile=`. A
+  missing or broken file at render time is **left out** with a warning, like a missing font. **Wheels are
+  `colorbalance`**: a puck `(x, y)` in the unit disc is `(x, -x/2 + √3/2 y, -x/2 - √3/2 y)` plus the lightness on all
+  three, held to ±1, rounded to 1e-4, zeros omitted; the filter weighs its ranges by a pixel's max + min (a sum, not
+  the mean: measured, 6.1 and 9.0.2), so midtones act on fairly dark pixels and a mid grey is highlights. All three are RGB filters: FFmpeg negotiates one conversion in and
+  one out around them. `grade_rendered.rs` (`#[ignore]`d, 6.1 and 9.0.2) holds the export and the still to the model
+  within 4 levels (inverting / S / per-channel curves, a channel-rotating and a squaring LUT at 100 / 50 %, a missing
+  LUT, each wheel range, all three in order).
+  **A keyed colour is an `eq` with `eval=frame`** (`eq_filter_keyed`):
   each keyed number a quoted expression of the frame's time `t` — `t` is the frame timestamp, which
   `setpts` has put on the timeline, so clip-local time is `(t-start)` as everywhere else — the unkeyed
   numbers stay the plain numbers, the temperature is `gamma_r='1+0.3*(…)'` / `gamma_b='1-0.3*(…)'`.

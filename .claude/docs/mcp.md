@@ -88,6 +88,9 @@ detached (`source_audio: false`) carries none — its linked audio clip is the o
 `link` on exactly the edits that carry linked clips (`link_is_an_optional_argument_on_exactly_the_edits_that_carry_linked_clips`
 pins it against the generated schemas, the way `ripple` is pinned); `timeline_summary` gives each
 track `linked_clips` / `detached_sound_clips`, and the server `instructions` carry one paragraph.
+**Grading over MCP**: `set_grade` (`clip_id`, `curves?` `{master, red, green, blue: [{x, y}]}`, `wheels?`
+`{shadows, midtones, highlights: {x, y, lightness}}`, `lut_path?` (`""` removes), `lut_intensity?`): omitted parts are
+kept; a new LUT file is read and checked before the lock is taken; the clip comes back.
 **Per-property animation over MCP**: `set_property_keyframes` (`clip_id`, `prop`, `keys:
 [{time, value, easing?}]`; `[]` makes the number static again; the clip comes back) animates one number —
 a transform number, a colour number or the clip's volume — independently of the rest,

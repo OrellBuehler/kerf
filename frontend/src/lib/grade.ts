@@ -219,3 +219,46 @@ export function wheelHue(x: number, y: number): [number, number, number] {
 	const to = (v: number) => Math.round(128 + 127 * v * lift);
 	return [to(r), to(g), to(b)];
 }
+
+// ---- the curve editor's edits (pure; one of them per gesture) -----------------
+
+/** Least gap kept between two points' inputs while one is dragged. */
+export const MIN_POINT_GAP = 0.01;
+
+/** The points with point `i` moved to `(x, y)`, held between its neighbours so the order never changes. */
+export function movePoint(points: readonly CurvePoint[], i: number, x: number, y: number): CurvePoint[] {
+	const lo = i > 0 ? points[i - 1].x + MIN_POINT_GAP : 0;
+	const hi = i < points.length - 1 ? points[i + 1].x - MIN_POINT_GAP : 1;
+	const out = points.map((p) => ({ ...p }));
+	out[i] = { x: Math.min(Math.max(finite01(x), lo), Math.max(lo, hi)), y: finite01(y) };
+	return out;
+}
+
+/** The points with one added at `(x, y)` and where it landed, or `null` when there is no room (too
+ *  close to another point, or the curve is full). */
+export function addPoint(points: readonly CurvePoint[], x: number, y: number): { points: CurvePoint[]; index: number } | null {
+	if (points.length >= MAX_CURVE_POINTS) return null;
+	const p = { x: finite01(x), y: finite01(y) };
+	if (points.some((q) => Math.abs(q.x - p.x) < MIN_POINT_GAP)) return null;
+	const out = [...points.map((q) => ({ ...q })), p].sort((a, b) => a.x - b.x);
+	return { points: out, index: out.indexOf(p) };
+}
+
+/** The point within `radius` of `(x, y)`, the nearest one, or `-1`. */
+export function nearestPoint(points: readonly CurvePoint[], x: number, y: number, radius: number): number {
+	let best = -1;
+	let bestD = radius;
+	points.forEach((p, i) => {
+		const d = Math.hypot(p.x - x, p.y - y);
+		if (d <= bestD) {
+			best = i;
+			bestD = d;
+		}
+	});
+	return best;
+}
+
+/** The curves with one channel's points replaced. */
+export function withChannel(curves: Curves | null | undefined, channel: CurveChannel, points: CurvePoint[]): Curves {
+	return { ...(curves ?? {}), [channel]: points };
+}

@@ -5,7 +5,9 @@
   references a source range (`source_in`/`source_out`) of an asset at a
   `timeline_start` — non-destructive. Besides the geometry (`Transform`) / color
   (`Color`) / `Transition` fields, a clip carries a `Vec<VideoEffect>` and
-  `Vec<AudioEffect>` (per-clip filter chains) and a `Vec<Keyframe>` (transform
+  `Vec<AudioEffect>` (per-clip filter chains), a `Grade` (`model/grade.rs`: optional curves, colour wheels and a
+  `.cube` LUT reference, normalized by `Grade::normalized`, omitted from the JSON when empty, not keyable; diffed as
+  "curves set" / "LUT … at N%"; `grade.ts` is its TS mirror) and a `Vec<Keyframe>` (transform
   **animation** — `Clip::transform_at` interpolates it, the engine renders the
   motion). **Each key carries an `Easing`** for the segment that *leaves* it (`Linear` —
   the default, omitted from the JSON so every existing project and graph is

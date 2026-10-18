@@ -13,9 +13,9 @@
 //! graph evaluate the same polynomial.
 //!
 //! **Wheels** are FFmpeg's `colorbalance` (shadows / midtones / highlights, weighted by each pixel's
-//! lightness): a wheel's puck `(x, y)` in the unit disc picks a hue (red at 0°, green at 120°, blue
-//! at 240°, counter-clockwise) and a strength, and its `lightness` adds to all three channels of
-//! its range. [`Wheel::rgb`] is the filter's three numbers for that range, exactly.
+//! max + min, the filter's own "lightness": a sum, not a mean): a wheel's puck `(x, y)` in the unit
+//! disc picks a hue (red at 0°, green at 120°, blue at 240°, counter-clockwise) and a strength, and
+//! its `lightness` adds to all three channels of its range. [`Wheel::rgb`] is the filter's three numbers for that range, exactly.
 
 use super::*;
 
