@@ -45,7 +45,8 @@ width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
 (one revision; `ripple: true` is the multi-select ripple delete, via
 `with_ripple`; omitted follows the project's mode), `set_volume`, `set_fade`,
 `set_speed`, `set_transform`, `set_color`, `set_transition`, `set_mask`,
-`set_grade { clipId, grade }` (curves / wheels / LUT; the LUT file is checked off the lock, `blocking`),
+`set_grade { clipId, grade }` (curves / wheels / LUT; a LUT path the clip did not have is checked off the lock,
+`blocking`, so a curve edit on a clip whose LUT went missing still applies),
 `inspect_lut { path }` (→ `LutInfo {path, size, title}`, or why it is not a usable `.cube`),
 `set_video_effects`,
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
@@ -69,7 +70,9 @@ the webview, decides what an SVG may do; `check_params` refuses empty text first
 `generate_captions` / `clear_captions` (caption the whole cut, in timeline
 time), `import_captions` / `import_captions_text` (a subtitle file by path / by text —
 the text variant is what an `<input type=file>` or a paste uses; both return
-`{timeline, summary}` rather than a bare `Timeline`), `export_srt`, `remove_silence`, `snap_to_beats`,
+`{timeline, summary}` rather than a bare `Timeline`), `export_srt`, `refine_transcript` (re-time words + label speakers on the cached transcript via `run_refine`, shared
+with MCP: lock released, background lane, `analysis-progress`, stopped by `cancel_analysis`; returns the
+analysis), `remove_silence`, `snap_to_beats`,
 `smart_crop` (frame each shot for the delivery frame),
 `extract_audio` (detaches an asset's cut clips and reports what it skipped, see Linked A/V) / `add_asset_audio`
 (an asset's whole audio as a clip) / `detach_audio_clips`,
@@ -85,6 +88,10 @@ and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**
 `skim_asset` is how an agent looks at footage,
 `get_preview_frame` (`hint: "forward"` is a frame of GPU playback) / `set_preview_bounds` / `gpu_preview_status` / `gpu_preview_diagnostics` (the GPU preview, below; GUI-only),
 `get_timeline_frame` (the composited still at a time; see Scrubbed frames below),
+`get_scopes` (`kerf_core::scopes` of the export's still at a time, from the originals: the summary and the grids asked
+for; the MCP tool of the same name) / `get_render_bar` (`kerf_core::render_bar` over the working cut, for the GPU
+preview's `Compositor::CAPS` when the setting is on, the proxy waits and the measured colour policy; GUI-only, see
+`frontend-timeline.md`),
 detached panels (`popout_expect` / `popout_cancel` / `popout_focus` / `popout_move` / `close_popout`, see Detached panels below; GUI-only, no MCP tool),
 `start_playback { playback_id, start, fps?, max_width?, on_frame }` / `stop_playback` — streamed
 composited frames over a `tauri::ipc::Channel<InvokeResponseBody>`, **raw bytes** (`playback_message`:
@@ -206,6 +213,35 @@ one enables the command **with no scope of its own** (`allow-default-urls` is a
 separate permission), so it is listed in object form with an `allow` entry for
 `https://github.com/OrellBuehler/kerf/*` — without a scope every `openUrl` call
 comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
+
+**Editor context (`editor_context.rs`).** `report_ui_context` takes what the editor shows —
+playhead, selected clip ids, in/out marks, the visible timeline range (`ui.timelineView`,
+written by the timeline), the focused dock panel (`ui.focusedPanel`, dockview's active panel)
+and the selected asset — into `EditorContextState`, its own `Mutex` in app state and never the
+`Project` (a view of the window, not the cut). `editor-context.ts` throttles it to the latest
+state once per 300 ms, only when it changed, and re-sends it every 30 s as a heartbeat; the MCP
+`get_editor_context` reads it back with `age_secs`, and `stale` once a report is over 90 s old.
+
+**Crash recovery** (`recovery.rs`): the untitled project is never only in memory. `setup` resolves
+`<app data>/recovery` (the debug identity's own data dir, so a dev run never touches an installed Kerf's
+sessions) and swaps the launch's empty project for `Project::create_recovery` there — in `setup`, not at
+the top of `run()`, because a second launch is handed to the first by the single-instance plugin before
+`setup` and must not make a session. `new_project` (now `async` + `blocking`) makes a fresh session the
+same way (`recovery::untitled`; no data dir or no file locking falls back to in-memory). Replacing the
+project (`replace_with`: Open, New, Save As, Recover) deletes the old session — each command
+`close()`s the returned project after dropping the lock. A clean exit (`RunEvent::Exit`) uses
+`close_at_exit`: an untouched session goes, one holding work stays to be offered next launch (the close
+guard can be bypassed, and `hasUnsavedWork` is narrower than recovery's rule); a crash leaves it.
+An explicit **Don't save** in the close / quit prompt calls `discard_recovery_at_exit` (`leaveAfter`
+in `confirm-copy.ts`), which records the current session's id; at exit that session is deleted even
+with work (`close_on_exit`, matched by id, so a project replaced since is not). A prompt that failed
+or a close that asked nothing never sets it.
+`list_recoveries` scans once per run (`kerf_core::recovery::scan`, skipping our own session) and keeps
+what it found **locked** in `RecoveryState` until `recover_project { id }` (opens it as the untitled
+project, like `open_project`: scrub cleared, speech model restored, proxies queued) or
+`discard_recovery { id }` (deletes it); one left alone is offered again next launch. No MCP tools —
+recovery is the user's call at launch. `project_path` stays `null` for a recovery-backed project, so
+the GUI still treats it as unsaved.
 
 **Scrubbed frames.** `get_timeline_frame` and the GPU preview's JPEG route go through `AppState.scrub`, one
 `kerf_core::ScrubFrames` per process: the frame of the cut's grid that holds the time, from a bounded cache or from

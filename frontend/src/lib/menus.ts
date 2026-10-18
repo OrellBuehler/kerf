@@ -235,6 +235,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			sep,
 			act('playback.toStart'),
 			act('playback.toEnd'),
+			act('playback.goToTimecode'),
 			sep,
 			act('playback.stepBack'),
 			act('playback.stepForward'),

@@ -832,6 +832,7 @@ pub fn build_transcript(sentences: &[Sentence], durations: &[f64]) -> Vec<Transc
             start: at,
             end: at + duration,
             text: sentence.text.clone(),
+            ..Default::default()
         });
         at += duration;
     }

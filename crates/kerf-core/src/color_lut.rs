@@ -62,7 +62,7 @@ fn numbers(rest: &str, line: usize) -> Result<Vec<f32>> {
             t.parse::<f32>()
                 .ok()
                 .filter(|v| v.is_finite())
-                .ok_or_else(|| bad(line, format!("{t:?} is not a finite number")))
+                .ok_or_else(|| bad(line, "a value is not a finite number"))
         })
         .collect()
 }
@@ -113,7 +113,7 @@ impl Lut3d {
             let first = content.split_whitespace().next().unwrap_or("");
             if first.starts_with(|c: char| c.is_ascii_alphabetic()) {
                 if !data.is_empty() {
-                    return Err(bad(line, format!("{first} after the table")));
+                    return Err(bad(line, "a keyword after the table"));
                 }
                 let rest = &content[first.len()..];
                 match first {
@@ -142,7 +142,7 @@ impl Lut3d {
                     "LUT_1D_SIZE" | "LUT_1D_INPUT_RANGE" => {
                         return Err(bad(line, "a 1D table or shaper is not supported, only a 3D LUT"));
                     }
-                    other => return Err(bad(line, format!("unsupported keyword {other}"))),
+                    _ => return Err(bad(line, "an unsupported keyword")),
                 }
                 continue;
             }
@@ -297,6 +297,8 @@ fn resolved() -> &'static Mutex<HashMap<Source, PathBuf>> {
 /// the source changed or the copy went. `None` when the source is missing or not a usable LUT, or no
 /// directory can be written: the graph leaves the LUT out.
 pub(crate) fn lut_file(lut: &ClipLut) -> Option<PathBuf> {
+    static PRUNED: std::sync::Once = std::sync::Once::new();
+    PRUNED.call_once(|| lut_dirs().for_each(|d| prune_dir(&d, SystemTime::now())));
     let lut = lut.normalized();
     let meta = std::fs::metadata(&lut.path).ok()?;
     let key = Source {
@@ -338,6 +340,49 @@ fn lut_dirs() -> impl Iterator<Item = PathBuf> {
         .chain(std::iter::once_with(|| crate::fonts::private_dir_named(&std::env::temp_dir(), "kerf-luts")).flatten())
 }
 
+/// A copy unused for this long is deleted on the first LUT lookup of a run.
+const CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+/// What the copies may take together; past it the least recently used go first.
+const CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The copies in `dir` to delete: older than [`CACHE_MAX_AGE`] (a temp file left by a crash
+/// included), then the least recently used until the rest fit in [`CACHE_MAX_BYTES`].
+fn prune_plan(mut files: Vec<(PathBuf, u64, SystemTime)>, now: SystemTime) -> Vec<PathBuf> {
+    files.sort_by_key(|f| std::cmp::Reverse(f.2));
+    let mut kept = 0u64;
+    let mut out = Vec::new();
+    for (path, len, used) in files {
+        let old = now.duration_since(used).is_ok_and(|age| age > CACHE_MAX_AGE);
+        if old || kept + len > CACHE_MAX_BYTES {
+            out.push(path);
+        } else {
+            kept += len;
+        }
+    }
+    out
+}
+
+fn prune_dir(dir: &Path, now: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let files = entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.ends_with(".cube") || name.ends_with(".tmp")
+        })
+        .filter_map(|e| {
+            let meta = e.metadata().ok().filter(std::fs::Metadata::is_file)?;
+            Some((e.path(), meta.len(), meta.modified().ok()?))
+        })
+        .collect();
+    for path in prune_plan(files, now) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// FNV-1a: a name for the file (the content is compared whole before it is trusted).
 fn digest(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -352,6 +397,11 @@ fn digest(bytes: &[u8]) -> u64 {
 fn write_once(dir: &Path, file: &str, bytes: &[u8]) -> Option<PathBuf> {
     let path = dir.join(file);
     if std::fs::read(&path).is_ok_and(|have| have == bytes) {
+        // Marked as used, so the pruning of a later run keeps it.
+        let _ = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|f| f.set_modified(SystemTime::now()));
         return Some(path);
     }
     std::fs::create_dir_all(dir).ok()?;
@@ -439,6 +489,34 @@ pub(crate) mod tests {
         for (what, text) in cases {
             assert!(Lut3d::parse_cube(&text).is_err(), "{what} should be refused");
         }
+    }
+
+    #[test]
+    fn an_error_names_the_line_and_not_the_file_content() {
+        let ok = cube_text(2, |c| c);
+        for text in [
+            ok.replace("# a comment", "SECRET_hunter2 1"),
+            ok.replace("1 1 1\n", "1 hunter2 1\n"),
+            format!("{ok}hunter2 0 0\n"),
+        ] {
+            let e = Lut3d::parse_cube(&text).unwrap_err().to_string();
+            assert!(e.contains("(line ") && !e.contains("hunter2"), "{e}");
+        }
+    }
+
+    #[test]
+    fn the_cache_drops_old_copies_then_the_least_recently_used() {
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1 << 32);
+        let ago = |days: u64| now - std::time::Duration::from_secs(days * 24 * 3600);
+        let mb = 1024 * 1024;
+        let files = vec![
+            (PathBuf::from("old"), mb, ago(31)),
+            (PathBuf::from("new"), 200 * mb, ago(0)),
+            (PathBuf::from("mid"), 50 * mb, ago(2)),
+            (PathBuf::from("lru"), 10 * mb, ago(3)),
+        ];
+        assert_eq!(prune_plan(files, now), [PathBuf::from("lru"), PathBuf::from("old")]);
+        assert!(prune_plan(vec![(PathBuf::from("a"), mb, ago(1))], now).is_empty());
     }
 
     #[test]

@@ -681,10 +681,6 @@ pub(crate) fn composite_matrix(layers: &[PlanLayer], policy: CompositeColorPolic
     (matrix, unsupported)
 }
 
-/// Why a compositor with `caps` does not draw `effect`: it is not one it draws (the detail says
-/// what it is, and why that one is hard), or its value is one FFmpeg's own filter refuses (`gblur`
-/// takes a sigma of 0 to 1024, `unsharp` an amount of -2 to 5), so the frame goes to FFmpeg, which
-/// fails it the same way.
 /// What of a clip's [`Grade`] a compositor would have to draw, or `None` for an identity grade.
 fn grade_refusal(grade: &Grade) -> Option<&'static str> {
     if grade.lut().is_some() {
@@ -698,6 +694,10 @@ fn grade_refusal(grade: &Grade) -> Option<&'static str> {
     }
 }
 
+/// Why a compositor with `caps` does not draw `effect`: it is not one it draws (the detail says
+/// what it is, and why that one is hard), or its value is one FFmpeg's own filter refuses (`gblur`
+/// takes a sigma of 0 to 1024, `unsharp` an amount of -2 to 5), so the frame goes to FFmpeg, which
+/// fails it the same way.
 fn effect_refusal(effect: &VideoEffect, caps: &GpuCaps) -> Option<&'static str> {
     if !caps.effects.contains(EffectKinds::of(effect)) {
         return Some(match effect {

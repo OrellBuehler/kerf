@@ -277,6 +277,23 @@ pub struct Project {
     /// The linked partners an edit carried a trim to (`Timeline::carry_extent_edit`), so
     /// `run_edit` can lane-check them once the ripple has run. Filled while an edit runs.
     edit_carried: RefCell<Vec<Uuid>>,
+    /// The crash-recovery directory an untitled project lives in (see [`crate::recovery`]),
+    /// locked while this is open. Declared after `conn` so the file closes before the lock goes.
+    recovery: Option<crate::recovery::RecoveryDir>,
+    /// How many revisions the history keeps (see [`Project::set_history_limit`]).
+    history_limit: usize,
+}
+
+/// How many revisions a project keeps by default: every one is the whole timeline, so an
+/// unbounded history grows the file without limit. `KERF_HISTORY_LIMIT` overrides it.
+pub const DEFAULT_HISTORY_LIMIT: usize = 500;
+
+fn default_history_limit() -> usize {
+    std::env::var("KERF_HISTORY_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_HISTORY_LIMIT)
+        .max(1)
 }
 
 /// What an edit's revision label says about the sounds it trimmed to make room: nothing
@@ -325,18 +342,24 @@ fn resolve_analysis_proxy(
 }
 
 impl Project {
-    /// Create (or overwrite the schema of) a `.kerf` file on disk.
-    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let project = Self {
-            conn: Connection::open(&path)?,
-            path: Some(path),
+    fn with_conn(conn: Connection, path: Option<PathBuf>, recovery: Option<crate::recovery::RecoveryDir>) -> Self {
+        Self {
+            conn,
+            path,
             actor: EditSource::User,
             ripple_override: Cell::new(None),
             links_override: Cell::new(None),
             edit_notes: RefCell::new(Vec::new()),
             edit_carried: RefCell::new(Vec::new()),
-        };
+            recovery,
+            history_limit: default_history_limit(),
+        }
+    }
+
+    /// Create (or overwrite the schema of) a `.kerf` file on disk.
+    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let project = Self::with_conn(Connection::open(&path)?, Some(path), None);
         project.init()?;
         Ok(project)
     }
@@ -344,32 +367,66 @@ impl Project {
     /// Open an existing `.kerf` file, ensuring the schema is present.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let project = Self {
-            conn: Connection::open(&path)?,
-            path: Some(path),
-            actor: EditSource::User,
-            ripple_override: Cell::new(None),
-            links_override: Cell::new(None),
-            edit_notes: RefCell::new(Vec::new()),
-            edit_carried: RefCell::new(Vec::new()),
-        };
+        let project = Self::with_conn(Connection::open(&path)?, Some(path), None);
         project.init()?;
         Ok(project)
     }
 
     /// An in-memory project, handy for tests and a throwaway sample.
     pub fn open_in_memory() -> Result<Self> {
-        let project = Self {
-            conn: Connection::open_in_memory()?,
-            path: None,
-            actor: EditSource::User,
-            ripple_override: Cell::new(None),
-            links_override: Cell::new(None),
-            edit_notes: RefCell::new(Vec::new()),
-            edit_carried: RefCell::new(Vec::new()),
-        };
+        let project = Self::with_conn(Connection::open_in_memory()?, None, None);
         project.init()?;
         Ok(project)
+    }
+
+    /// A new untitled project backed by a locked recovery directory under `root`, so a crash
+    /// before the first Save loses nothing. It reads as unsaved (`path()` is `None`).
+    pub fn create_recovery(root: &Path) -> Result<Self> {
+        let dir = crate::recovery::RecoveryDir::create(root)?;
+        let conn = match Connection::open(dir.project_path()) {
+            Ok(conn) => conn,
+            Err(e) => {
+                let _ = dir.remove();
+                return Err(e.into());
+            }
+        };
+        let project = Self::with_conn(conn, None, Some(dir));
+        if let Err(e) = project.init() {
+            project.close();
+            return Err(e);
+        }
+        Ok(project)
+    }
+
+    /// Reopen a session a crashed Kerf left behind; it stays untitled and keeps its directory
+    /// (and lock) until it is saved or let go.
+    pub fn open_recovered(found: crate::recovery::Recoverable) -> Result<Self> {
+        let dir = found.dir;
+        let project = Self::with_conn(Connection::open(dir.project_path())?, None, Some(dir));
+        project.init()?;
+        Ok(project)
+    }
+
+    /// The recovery session this untitled project lives in, if it has one.
+    pub fn recovery_id(&self) -> Option<&str> {
+        self.recovery.as_ref().map(|r| r.id())
+    }
+
+    pub fn recovery_dir(&self) -> Option<&Path> {
+        self.recovery.as_ref().map(|r| r.dir())
+    }
+
+    /// Close the project; an untitled one's recovery directory goes with it. Call it with no lock
+    /// held: deleting a directory is file-system work.
+    pub fn close(self) {
+        let Self { conn, recovery, .. } = self;
+        drop(conn);
+        if let Some(dir) = recovery {
+            let path = dir.dir().to_path_buf();
+            if let Err(e) = dir.remove() {
+                tracing::warn!(dir = %path.display(), error = %e, "could not delete a recovery directory");
+            }
+        }
     }
 
     /// Become `other` (a project just opened or created), for the one `Project` the app and its MCP
@@ -377,9 +434,40 @@ impl Project {
     /// that took its inputs from this project between that and the swap read the old project under the
     /// new epoch. Call it under the lock the shared project sits behind, so no reader sees the new
     /// project under the old epoch either.
-    pub fn replace_with(&mut self, other: Project) {
-        *self = other;
+    ///
+    /// Returns the project replaced, for the caller to [`Self::close`] once it has released the
+    /// lock — closing deletes an untitled one's recovery directory, since replacing it means it
+    /// was saved, recovered into another, or let go.
+    #[must_use = "close the replaced project once the lock is released"]
+    pub fn replace_with(&mut self, other: Project) -> Project {
+        let old = std::mem::replace(self, other);
         crate::plan_epoch::bump_plan_epoch();
+        old
+    }
+
+    /// Close the project as the app exits: an untitled one's recovery directory is deleted only
+    /// when it holds no work. The close guard asks about unsaved work, but it can be bypassed (a
+    /// dialog that fails, a quit that skips it), and what it calls unsaved is narrower than what
+    /// a recovery offers; anything left is offered at the next launch.
+    pub fn close_at_exit(self) {
+        let keep = match (&self.recovery, self.recovery.as_ref().map(|r| r.project_path())) {
+            (Some(dir), Some(path)) => match crate::recovery::summarize_conn(&self.conn, dir.id(), &path) {
+                Ok(info) => info.is_some(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not tell whether the untitled project holds work; keeping it");
+                    true
+                }
+            },
+            _ => false,
+        };
+        if keep {
+            if let Some(id) = self.recovery_id() {
+                tracing::info!(session = id, "keeping the untitled project for recovery");
+            }
+            drop(self);
+        } else {
+            self.close();
+        }
     }
 
     /// Set who subsequent edits are attributed to in the history. The MCP server
@@ -399,18 +487,20 @@ impl Project {
     /// in-memory project itself is unchanged; the caller reopens the file (via
     /// [`Project::open`]) to make subsequent edits write through to it. This is
     /// how "Save As" turns the throwaway sample into a persistent project.
+    ///
+    /// Atomic: the snapshot is written beside the target and renamed over it only once it is
+    /// whole and on disk, so a failure leaves any file already there untouched. Saving a project
+    /// onto its own file is a no-op — its edits are already there.
     pub fn save_as(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        // `VACUUM INTO` refuses to write to an existing file; the save dialog
-        // has already confirmed any overwrite, so clear it first.
-        if path.exists() {
-            std::fs::remove_file(path)?;
+        if let Some(own) = &self.path {
+            let same =
+                |a: &Path, b: &Path| matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b);
+            if own == path || same(own, path) {
+                return Ok(());
+            }
         }
-        let dst = path
-            .to_str()
-            .ok_or_else(|| Error::InvalidArgument(format!("non-UTF-8 project path: {}", path.display())))?;
-        self.conn.execute("VACUUM INTO ?1", params![dst])?;
-        Ok(())
+        store::vacuum_into_atomic(&self.conn, path)
     }
 
     /// An in-memory project seeded with demo assets, analysis, and a timeline.
@@ -429,20 +519,32 @@ impl Project {
             }
         }))?;
         crate::plan_epoch::bump_plan_epoch();
-        self.conn.execute_batch(SCHEMA)?;
 
-        // `CREATE TABLE IF NOT EXISTS` leaves an existing table's columns alone,
-        // so a column added after a `.kerf` file was written has to be migrated
-        // onto it explicitly. Adding one is cheap and lossless; the guard is a
-        // probe for the column rather than a schema version because that is the
-        // whole of the migration story so far.
-        let has_source_paths = self.conn.prepare("SELECT source_paths FROM assets LIMIT 1").is_ok();
-        if !has_source_paths {
-            self.conn.execute("ALTER TABLE assets ADD COLUMN source_paths TEXT", [])?;
+        // `PRAGMA user_version` is the file's schema (`store::MIGRATIONS`). A newer one is refused
+        // before anything is written; an older one is copied aside, then upgraded a step at a time.
+        let found = store::user_version(&self.conn)?;
+        store::check_supported(found)?;
+        let blank = store::is_blank(&self.conn)?;
+        if !blank && self.conn.is_readonly(rusqlite::MAIN_DB)? {
+            // A write-protected file opens as it is: nothing is stamped, backed up or added. One
+            // that needs a real upgrade cannot be read by this build without writing to it.
+            if found < store::SCHEMA_VERSION && store::needs_upgrade(&self.conn, found) {
+                return Err(Error::Other(
+                    "this project was made by an older Kerf and needs upgrading, but its file is read-only — copy it somewhere you can write to and open the copy".into(),
+                ));
+            }
+            return Ok(());
         }
-        let has_voiceover = self.conn.prepare("SELECT voiceover FROM assets LIMIT 1").is_ok();
-        if !has_voiceover {
-            self.conn.execute("ALTER TABLE assets ADD COLUMN voiceover TEXT", [])?;
+        if !blank && found < store::SCHEMA_VERSION {
+            if let Some(path) = &self.path {
+                store::backup_before_upgrade(&self.conn, path, found)?;
+            }
+        }
+        self.conn.execute_batch(SCHEMA)?;
+        if blank {
+            store::stamp_current(&self.conn)?;
+        } else {
+            store::migrate(&self.conn, found)?;
         }
 
         let has_timeline: bool = self
@@ -1528,6 +1630,8 @@ impl Project {
             // links nothing skips all of it, and the snapshot with it.
             let sync = links && timeline.has_links();
             let before = (ripple || sync).then(|| timeline.clone());
+            // What an older build left broken is not this edit's to answer for.
+            let known = timeline.known_violations();
             let result = f(timeline)?;
             if let Some(before) = &before {
                 // What the edit itself left, before the per-lane ripple moves each track
@@ -1553,6 +1657,7 @@ impl Project {
             if timeline.has_links() {
                 timeline.dissolve_all_orphans();
             }
+            timeline.check_new(&known)?;
             Ok(result)
         };
         // While the agent has a staging session open its edits go to the
@@ -1793,7 +1898,8 @@ impl Project {
         self.set_meta(HISTORY_HEAD, &seq.to_string())
     }
 
-    /// Append a revision after the current head, dropping any redo branch.
+    /// Append a revision after the current head, dropping any redo branch, then
+    /// [prune](Self::prune_history) the oldest beyond the limit.
     fn record_revision(&self, label: &str, source: EditSource, snapshot: &str) -> Result<i64> {
         let head = self.head()?;
         self.conn.execute("DELETE FROM history WHERE seq > ?1", params![head])?;
@@ -1804,7 +1910,31 @@ impl Project {
             params![seq, label, source.as_str(), snapshot, Utc::now().to_rfc3339()],
         )?;
         self.set_head(seq)?;
+        self.prune_history(seq)?;
         Ok(seq)
+    }
+
+    /// Keep the newest `history_limit` revisions, up to `newest` (the head, just recorded — so the
+    /// redo branch is already gone and the head is always kept). A staged proposal's `base_seq`
+    /// and everything after it are kept whatever the limit. The oldest revision left is the new
+    /// baseline: undo stops there and [`Self::revision_diff`] reads it as changing nothing.
+    fn prune_history(&self, newest: i64) -> Result<()> {
+        let mut floor = newest - self.history_limit as i64 + 1;
+        let base: Option<i64> = self
+            .conn
+            .query_row("SELECT base_seq FROM staged WHERE id = 1", [], |r| r.get(0))
+            .optional()?;
+        if let Some(base) = base {
+            floor = floor.min(base);
+        }
+        self.conn.execute("DELETE FROM history WHERE seq < ?1", params![floor])?;
+        Ok(())
+    }
+
+    /// How many revisions the history keeps from now on (at least 1, the current one); older
+    /// ones are dropped as new edits land. Defaults to [`DEFAULT_HISTORY_LIMIT`].
+    pub fn set_history_limit(&mut self, limit: usize) {
+        self.history_limit = limit.max(1);
     }
 
     /// Restore the stored snapshot at `seq` as the live timeline and move the
@@ -1923,10 +2053,13 @@ impl Project {
     /// and changed nothing.
     pub fn revision_diff(&self, seq: i64) -> Result<TimelineDiff> {
         let timeline = self.revision_timeline(seq)?;
-        if seq <= 0 {
-            return Ok(timeline.diff(&timeline));
-        }
-        self.diff_revisions(seq - 1, seq)
+        // The oldest revision a pruned history kept is its baseline too.
+        let previous = match self.revision_timeline(seq - 1) {
+            Ok(previous) if seq > 0 => previous,
+            Err(Error::RevisionNotFound(_)) | Ok(_) => return Ok(timeline.diff(&timeline)),
+            Err(e) => return Err(e),
+        };
+        Ok(previous.diff(&timeline))
     }
 
     // ---- timeline operations ---------------------------------------------
@@ -3967,11 +4100,13 @@ impl Project {
                     start: 0.0,
                     end: 5.5,
                     text: "Welcome back to the channel.".to_string(),
+                    ..Default::default()
                 },
                 crate::model::TranscriptSegment {
                     start: 5.5,
                     end: 12.5,
                     text: "Today we are talking about non-destructive editing.".to_string(),
+                    ..Default::default()
                 },
             ],
             loudness: Some(crate::model::Loudness {
@@ -4528,10 +4663,12 @@ impl Project {
     }
 
     pub fn add_overlay(&self, text: String, start: f64, end: f64) -> Result<TextOverlay> {
+        // Judged after the clamp: `(-2, 0)` would otherwise become an overlay of no length.
+        let start = start.max(0.0);
         if !start.is_finite() || !end.is_finite() || end <= start {
             return Err(Error::InvalidArgument("overlay end must be after start".to_string()));
         }
-        let overlay = TextOverlay::new(text, start.max(0.0), end);
+        let overlay = TextOverlay::new(text, start, end);
         self.edit_timeline("Add text overlay", move |timeline| {
             timeline.overlays.push(overlay.clone());
             Ok(overlay)
@@ -4932,6 +5069,7 @@ impl Project {
                 start: c.start + req.offset,
                 end: c.end + req.offset,
                 text: c.text.clone(),
+                ..Default::default()
             })
             .collect();
         let (first, last) = (cues[0].start, cues.iter().map(|c| c.end).fold(f64::MIN, f64::max));
@@ -5185,6 +5323,75 @@ impl Project {
             return Err(Error::InvalidArgument("asset has no transcript".to_string()));
         }
         Ok(crate::model::transcript_to_srt(&analysis.transcript))
+    }
+
+    /// An asset's cached transcript; an error that says why when there is none.
+    pub fn transcript(&self, asset_id: Uuid) -> Result<Vec<TranscriptSegment>> {
+        self.require_asset(asset_id)?;
+        let transcript = self.get_analysis(asset_id)?.map(|a| a.transcript).unwrap_or_default();
+        if transcript.is_empty() {
+            return Err(Error::InvalidArgument(
+                "asset has no transcript; run analyze_asset with the transcript step first".to_string(),
+            ));
+        }
+        Ok(transcript)
+    }
+
+    /// Store a re-timed / speaker-labelled transcript ([`crate::refine_transcript_media`])
+    /// for an asset, replacing the cached one and leaving every other kind as it was. `read`
+    /// is the transcript the refinement started from: when the cache no longer holds it (a
+    /// transcription finished meanwhile) nothing is stored, so a newer transcript is not
+    /// overwritten by a refinement of the older one.
+    pub fn store_transcript(
+        &self,
+        asset_id: Uuid,
+        read: &[TranscriptSegment],
+        transcript: Vec<TranscriptSegment>,
+    ) -> Result<AssetAnalysis> {
+        if self.transcript(asset_id)? != read {
+            return Err(Error::InvalidArgument(
+                "the transcript changed while it was being refined; refine it again".to_string(),
+            ));
+        }
+        self.merge_analysis(&AssetAnalysis {
+            asset_id,
+            transcript,
+            ran: vec![crate::model::AnalysisKind::Transcript],
+            ..AssetAnalysis::default()
+        })
+    }
+
+    /// When each speaker of an asset's transcript talks, in source time (only `speaker`'s
+    /// when given); words less than `join_gap` seconds apart are one range.
+    pub fn speaker_ranges(
+        &self,
+        asset_id: Uuid,
+        speaker: Option<&str>,
+        join_gap: f64,
+    ) -> Result<Vec<crate::transcript::SpeakerRanges>> {
+        let transcript = self.transcript(asset_id)?;
+        if !transcript.iter().any(|s| s.speaker.is_some()) {
+            return Err(Error::InvalidArgument(
+                "the transcript has no speaker labels; refine it (refine_transcript) to label speakers".to_string(),
+            ));
+        }
+        let ranges = crate::transcript::speaker_ranges(&transcript, speaker, join_gap.max(0.0));
+        if let (Some(want), true) = (speaker, ranges.is_empty()) {
+            let mut known: Vec<String> = transcript.iter().filter_map(|s| s.speaker.clone()).collect();
+            known.sort();
+            known.dedup();
+            return Err(Error::InvalidArgument(format!(
+                "no speaker {want:?} in the transcript; it has {}",
+                known.join(", ")
+            )));
+        }
+        Ok(ranges)
+    }
+
+    /// The filler words (`fillers`, else the usual um / uh / you know…) in an asset's
+    /// transcript, by word bounds, in source time.
+    pub fn filler_words(&self, asset_id: Uuid, fillers: &[String]) -> Result<Vec<crate::transcript::FillerWord>> {
+        Ok(crate::transcript::filler_words(&self.transcript(asset_id)?, fillers))
     }
 }
 
@@ -5442,12 +5649,18 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
         .map_err(|e| Error::Other(format!("invalid datetime {s}: {e}")))
 }
 
+mod store;
+pub use store::{backup_path as schema_backup_path, SCHEMA_VERSION};
+
 #[cfg(test)]
 mod linked_tests;
 
 /// The Rust half of the differential corpus the browser harness is replayed against.
 #[cfg(test)]
 mod linked_corpus;
+
+#[cfg(test)]
+mod persist_tests;
 
 /// What [`Project::place_stems`] did: the stem assets (in `STEM_NAMES` order) and the
 /// clips it laid under the separated clip, if one was named.
@@ -5654,11 +5867,13 @@ mod tests {
                     start: 0.0,
                     end: 1.6,
                     text: "Welcome to the shop.".into(),
+                    ..Default::default()
                 },
                 TranscriptSegment {
                     start: 1.85,
                     end: 4.0,
                     text: "We open at nine.".into(),
+                    ..Default::default()
                 },
             ],
         });
@@ -5737,7 +5952,10 @@ mod tests {
         let assets = project.list_assets().unwrap();
         assert_eq!(assets.len(), 1);
         assert!(assets[0].voiceover.is_none());
+        let backup = schema_backup_path(&path, 0);
+        assert!(backup.exists(), "the pre-upgrade file is kept beside it");
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
     }
 
     fn asset_with(path: &str, streams: Vec<StreamInfo>) -> Asset {
@@ -6016,6 +6234,66 @@ mod tests {
         // preview never breaks or blocks on a proxy that hasn't landed yet.
         let asset = asset_with("/no-such-kerf-source.mp4", vec![vid_stream(false)]);
         assert_eq!(Project::preview_source(&asset), PathBuf::from(&asset.path));
+    }
+
+    #[test]
+    fn a_stored_transcript_answers_speakers_and_fillers() {
+        use crate::model::Word;
+        let project = Project::open_in_memory().unwrap();
+        let asset = project
+            .insert_or_get_asset(&asset_with("/kerf-speakers.mp4", vec![vid_stream(false)]))
+            .unwrap();
+        assert!(project.transcript(asset.id).is_err());
+        let word = |text: &str, start: f64, end: f64, sp: &str| Word {
+            text: text.into(),
+            start,
+            end,
+            speaker: Some(sp.into()),
+            ..Word::default()
+        };
+        let line = |words: Vec<Word>, sp: &str| TranscriptSegment {
+            start: words[0].start,
+            end: words[words.len() - 1].end,
+            text: words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "),
+            words,
+            speaker: Some(sp.into()),
+        };
+        let plain = vec![TranscriptSegment {
+            start: 0.0,
+            end: 2.4,
+            text: "Um, hello hi".into(),
+            ..TranscriptSegment::default()
+        }];
+        project
+            .merge_analysis(&AssetAnalysis {
+                asset_id: asset.id,
+                transcript: plain.clone(),
+                ran: vec![crate::model::AnalysisKind::Transcript],
+                ..AssetAnalysis::default()
+            })
+            .unwrap();
+        let refined = vec![
+            line(vec![word("Um,", 0.0, 0.3, "S1"), word("hello", 0.4, 0.9, "S1")], "S1"),
+            line(vec![word("hi", 2.0, 2.4, "S2")], "S2"),
+        ];
+        project.store_transcript(asset.id, &plain, refined.clone()).unwrap();
+        // A refinement of a transcript that has since been replaced is refused.
+        let stale = project.store_transcript(asset.id, &plain, plain.clone()).unwrap_err();
+        assert!(stale.to_string().contains("changed"), "{stale}");
+        assert_eq!(project.transcript(asset.id).unwrap(), refined);
+        let s2 = project.speaker_ranges(asset.id, Some("S2"), 0.5).unwrap();
+        assert_eq!(s2.len(), 1);
+        assert_eq!((s2[0].ranges[0].start, s2[0].ranges[0].end), (2.0, 2.4));
+        assert!(project
+            .speaker_ranges(asset.id, Some("S9"), 0.5)
+            .unwrap_err()
+            .to_string()
+            .contains("S1, S2"));
+        let fillers = project.filler_words(asset.id, &[]).unwrap();
+        assert_eq!(fillers.len(), 1);
+        assert_eq!((fillers[0].start, fillers[0].end), (0.0, 0.3));
+        let analysis = project.get_analysis(asset.id).unwrap().unwrap();
+        assert!(analysis.ran.contains(&crate::model::AnalysisKind::Transcript));
     }
 
     #[test]
@@ -8364,7 +8642,7 @@ mod tests {
         let mut shared = Project::open_in_memory().unwrap();
         let opened = Project::open_in_memory().unwrap();
         let before = bumps_here();
-        shared.replace_with(opened);
+        shared.replace_with(opened).close();
         assert!(bumps_here() > before);
     }
 

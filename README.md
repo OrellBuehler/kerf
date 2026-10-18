@@ -134,13 +134,14 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (87)
+### The tools (131)
 
 <details>
 <summary><b>See / analyze</b></summary>
 
 `list_assets` · `import_asset` · `get_asset_metadata` · `analyze_asset` ·
-`get_timeline_state` · `timeline_summary` · `get_waveform` · `get_energy` ·
+`get_timeline_state` · `timeline_summary` · `get_editor_context` (what the user has
+selected and where the playhead is) · `get_waveform` · `get_energy` ·
 **`get_frame`** (drill-in frame) · **`skim_asset`** (contact-sheet montage) ·
 **`preview_timeline`** (the composited cut) · **`preview_svg_overlay`** (an animated title
 as a contact sheet of moments) · `validate_svg` — the bold ones return images the model

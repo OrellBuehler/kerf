@@ -884,7 +884,7 @@ pub(crate) fn projection_from_shape(path: Option<&Path>, width: Option<u32>, hei
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("insv") || e.eq_ignore_ascii_case("insp"));
     match (insta360, width, height) {
-        (true, Some(w), Some(h)) if h > 0 && w == h * 2 => Some(Projection::DualFisheye),
+        (true, Some(w), Some(h)) if h > 0 && h.checked_mul(2) == Some(w) => Some(Projection::DualFisheye),
         _ => None,
     }
 }
@@ -5677,7 +5677,31 @@ fn export_preflight(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions)
     if !issues.is_empty() {
         return Err(Error::InvalidArgument(issues.join(" ")));
     }
+    check_export_luts(timeline)?;
     Ok((has_video, has_audio))
+}
+
+/// An export refuses a LUT it cannot apply (the preview and stills leave it out instead): the file
+/// would otherwise be silently missing from the delivered picture. Reads the disk, off the lock.
+fn check_export_luts(timeline: &Timeline) -> Result<()> {
+    let clips = timeline
+        .tracks
+        .iter()
+        .filter(|t| t.kind == StreamKind::Video)
+        .flat_map(|t| t.clips.iter())
+        .filter(|c| c.enabled);
+    for lut in clips.filter_map(|c| c.grade.lut()) {
+        let why = match crate::color_lut::inspect_lut(&lut.path) {
+            Err(e) => e.to_string(),
+            Ok(_) if crate::color_lut::lut_file(&lut).is_none() => "Kerf could not write its copy of it".to_string(),
+            Ok(_) => continue,
+        };
+        return Err(Error::InvalidArgument(format!(
+            "cannot export: the LUT {} cannot be applied ({why}); choose another file or clear it",
+            lut.path
+        )));
+    }
+    Ok(())
 }
 
 /// One export run with `opts` exactly as given (no fallback).
@@ -7643,7 +7667,10 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
         p.push(eq_filter(&clip.color));
     }
     // The LUT, the curves and the wheels, after the `eq` (see `grade`), before any alpha plane.
-    p.extend(grade_filters(&clip.grade));
+    p.extend(grade_filters(
+        &clip.grade,
+        if fx.label_bt709 { Some("bt709") } else { fx.frame_matrix },
+    ));
     // Color-space video effects (blur / sharpen / grayscale / invert / vignette),
     // applied in author order, before any alpha plane.
     for e in &clip.effects {
@@ -7750,6 +7777,36 @@ pub fn timeline_frame(
     run_still(timeline, assets, opts, t, max_width, None, &StillOutput::JpegPipe { quality })
 }
 
+/// The composited still at `t` as its Y'CbCr samples: limited-range 4:4:4 planes (Y, then Cb,
+/// then Cr) of the frame [`timeline_frame`] would encode, with its size. The scopes read this
+/// rather than an RGB conversion, whose matrix is the composite's and not the delivery's.
+pub fn timeline_frame_yuv(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    max_width: u32,
+) -> Result<(u32, u32, Vec<u8>)> {
+    let fmt = export_format(&timeline.for_render(), assets, opts);
+    let (w, h) = still_size(fmt.width, fmt.height, max_width);
+    let planes = run_still(
+        timeline,
+        assets,
+        opts,
+        t,
+        max_width,
+        None,
+        &StillOutput::Yuv444Pipe { width: w, height: h },
+    )?;
+    if planes.len() != (w as usize) * (h as usize) * 3 {
+        return Err(Error::Engine(format!(
+            "could not render timeline frame at {t:.3}s: {} bytes for a {w}x{h} frame",
+            planes.len()
+        )));
+    }
+    Ok((w, h, planes))
+}
+
 /// [`timeline_frame`] of one `region` of the composited canvas. The canvas is
 /// rendered large enough that the region alone comes out `max_width` wide
 /// (capped at the delivery frame, so nothing is invented), then cropped — a
@@ -7817,14 +7874,22 @@ fn run_still(
     out: &StillOutput,
 ) -> Result<Vec<u8>> {
     let piping = matches!(out, StillOutput::JpegPipe { .. });
+    // The scopes are a measurement, not the frame the user is waiting to see: niced. Their output
+    // size is known, so the read buffer is allocated once instead of doubling through ~3 MB.
+    let (background, capacity) = match out {
+        StillOutput::Yuv444Pipe { width, height } => (true, (*width as usize) * (*height as usize) * 3),
+        _ => (false, 0),
+    };
     let hw_used = std::cell::Cell::new(false);
     // The titles' pictures, on disk and kept for the run (and its software retry).
     let _titles = still_titles(timeline, assets, opts, t, max_width, region)?;
     let run = |o: &ExportOptions| -> Result<Vec<u8>> {
         let mut args = build_still_args(timeline, assets, o, t, max_width, region, out)?;
         hw_used.set(tune_still_args(&mut args, assets, HostOs::CURRENT));
+        let _script = externalize_filter_complex(&mut args, "still")?;
         let bin = ffmpeg_bin();
-        let output = output_bounded(command(&bin).args(&args), STILL_TIMEOUT).map_err(|e| match e.kind() {
+        let mut cmd = if background { bg_command(&bin) } else { command(&bin) };
+        let output = output_bounded(cmd.args(&args), STILL_TIMEOUT, capacity).map_err(|e| match e.kind() {
             std::io::ErrorKind::TimedOut => Error::Engine(format!(
                 "could not render timeline frame at {t:.3}s: ffmpeg did not answer in {} s and was stopped",
                 STILL_TIMEOUT.as_secs()
@@ -7865,9 +7930,9 @@ const STILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// `Command::output()` with a deadline: run `cmd` with its stdin closed and both output pipes
 /// read, and kill it if it has not finished in `limit` (`ErrorKind::TimedOut`). The calling thread
-/// reads stdout to its end, a watchdog kills the process at the deadline (which ends that read),
+/// reads stdout to its end (into a buffer of `capacity` bytes up front), a watchdog kills the process at the deadline (which ends that read),
 /// and nothing waits on the child while the watchdog could need it.
-fn output_bounded(cmd: &mut Command, limit: std::time::Duration) -> std::io::Result<std::process::Output> {
+fn output_bounded(cmd: &mut Command, limit: std::time::Duration, capacity: usize) -> std::io::Result<std::process::Output> {
     use std::io::Read;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{channel, RecvTimeoutError};
@@ -7900,7 +7965,7 @@ fn output_bounded(cmd: &mut Command, limit: std::time::Duration) -> std::io::Res
         }
         text
     });
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(capacity);
     let read = match stdout.as_mut() {
         Some(o) => o.read_to_end(&mut out).map(|_| ()),
         None => Ok(()),
@@ -7980,6 +8045,9 @@ pub enum StillOutput {
     /// Raw `rgb24` on stdout — only for [`composite_color_policy`]'s probe, which
     /// wants the converted pixels themselves.
     RgbPipe,
+    /// Raw planar `yuv444p` on stdout — [`timeline_frame_yuv`], for the scopes. The frame's size
+    /// sizes the read buffer; the argv does not carry it (the graph scales to `max_width`).
+    Yuv444Pipe { width: u32, height: u32 },
 }
 
 /// The image formats a cover frame can be written as.
@@ -8035,6 +8103,9 @@ impl StillOutput {
             StillOutput::RgbPipe => {
                 a.extend(["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"].map(String::from));
             }
+            StillOutput::Yuv444Pipe { .. } => {
+                a.extend(["-f", "rawvideo", "-pix_fmt", "yuv444p", "pipe:1"].map(String::from));
+            }
             StillOutput::File { path, format, quality } => {
                 if *format == ImageFormat::Jpeg {
                     a.extend(["-q:v".to_string(), quality.to_string()]);
@@ -8078,7 +8149,7 @@ pub fn export_seek_arg(seconds: f64) -> String {
 ///
 /// Every video clip whose timeline span contains `t` is decoded at its
 /// corresponding source time (`-ss` input seek), put through the same geometry /
-/// color chain the export uses ([`still_clip_chain`] mirrors [`video_clip_chain`]
+/// color chain the export uses ([`still_clip_chain_graded`] mirrors [`video_clip_chain`]
 /// minus the time-domain `trim`/`setpts`/`fps` steps and the fades not changing
 /// the picture at `t`), then `overlay`d onto a black canvas in **track-then-timeline order** — so later tracks composite on
 /// top and gaps fall through to black, matching export framing. The output canvas
@@ -8206,12 +8277,19 @@ fn build_still_args_rendered(
         let rf = clip.reframe_at(ac.local_time);
         let hdr = asset_of(clip.asset_id).and_then(|a| a.hdr());
         let tone = hdr.map(|h| format!("{},", tonemap_filter(h))).unwrap_or_default();
+        let stream = asset_of(clip.asset_id).and_then(|a| a.streams.iter().find(|s| s.kind == StreamKind::Video));
+        let matrix = if layer.label_bt709 {
+            Some("bt709")
+        } else {
+            crate::model::frame_matrix(stream, hdr.is_some())
+        };
         chains.push(format!(
             "[{n}:v]{tone}{chain}[v{n}]",
             chain = still_clip_chain_graded(
                 &tf,
                 &ac.color(),
                 &clip.grade,
+                matrix,
                 &clip.effects,
                 rf.as_ref(),
                 &canvas,
@@ -8293,6 +8371,7 @@ fn still_clip_chain_graded(
     tf: &Transform,
     color: &Color,
     grade: &Grade,
+    frame_matrix: Option<&str>,
     effects: &[VideoEffect],
     reframe: Option<&ResolvedReframe>,
     canvas: &StillCanvas,
@@ -8355,7 +8434,7 @@ fn still_clip_chain_graded(
     if !color.is_identity() {
         p.push(eq_filter(color));
     }
-    p.extend(grade_filters(grade));
+    p.extend(grade_filters(grade, frame_matrix));
     for e in effects {
         if let Some(f) = video_effect_filter(e) {
             p.push(f);
@@ -8405,6 +8484,7 @@ fn still_clip_chain(
         tf,
         color,
         &Grade::default(),
+        None,
         effects,
         reframe,
         canvas,
@@ -8607,6 +8687,10 @@ mod svg_rendered;
 /// Which slot a job takes, the cores' or the hardware's.
 #[cfg(test)]
 mod lane_tests;
+
+/// ffprobe's JSON and ffmpeg's logs, mutated: nothing panics.
+#[cfg(test)]
+mod hostile_tests;
 
 /// The deadline on a one-shot still's process.
 #[cfg(all(test, unix))]
@@ -10098,6 +10182,27 @@ mod tests {
         let args = build_still_args(&timeline, &assets, &ExportOptions::default(), 1.0, u32::MAX, None, &out).unwrap();
         assert!(args.windows(2).any(|w| w[0] == "-vcodec" && w[1] == "png"));
         assert!(!args.contains(&"-q:v".to_string()), "-q:v is meaningless for png: {args:?}");
+    }
+
+    #[test]
+    fn the_scopes_still_pipes_raw_yuv444_and_is_otherwise_the_jpeg_still() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let assets = vec![asset.clone()];
+        let timeline = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
+        let o = ExportOptions::default();
+        let yuv = StillOutput::Yuv444Pipe { width: 960, height: 540 };
+        let args = build_still_args(&timeline, &assets, &o, 1.0, 960, None, &yuv).unwrap();
+        let tail = ["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv444p", "pipe:1"];
+        assert_eq!(&args[args.len() - tail.len()..], tail.map(String::from).as_slice());
+        let jpeg = build_still_args(&timeline, &assets, &o, 1.0, 960, None, &StillOutput::JpegPipe { quality: 3 }).unwrap();
+        let head = |a: &[String]| a[..a.iter().position(|x| x == "-frames:v").unwrap()].to_vec();
+        assert_eq!(head(&args), head(&jpeg), "only the sink differs");
+        // The size only sizes the read buffer.
+        let other = StillOutput::Yuv444Pipe { width: 1, height: 1 };
+        assert_eq!(
+            build_still_args(&timeline, &assets, &o, 1.0, 960, None, &other).unwrap(),
+            args
+        );
     }
 
     #[test]
@@ -12110,11 +12215,13 @@ mod tests {
                 start: 1.5,
                 end: 3.0,
                 text: "first".into(),
+                ..Default::default()
             },
             TranscriptSegment {
                 start: 3.0,
                 end: 4.25,
                 text: "second".into(),
+                ..Default::default()
             },
         ]);
         assert!(srt.contains("1\n00:00:01,500 --> 00:00:03,000\nfirst"), "{srt}");

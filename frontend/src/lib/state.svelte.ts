@@ -7,6 +7,7 @@ import {
 	addReframeKeyframe,
 	addOverlay,
 	analyzeAsset,
+	refineTranscript,
 	generateCaptions,
 	clearCaptions,
 	importCaptions,
@@ -50,6 +51,7 @@ import {
 	updateOverlay,
 	newProject as apiNewProject,
 	openProject as apiOpenProject,
+	recoverProject as apiRecoverProject,
 	pickMediaPaths,
 	projectPath,
 	redo as apiRedo,
@@ -543,6 +545,18 @@ class EditorState {
 		return true;
 	}
 
+	/** Open an untitled project a crashed Kerf left behind; resolves true if recovered. */
+	async recoverProject(id: string): Promise<boolean> {
+		if (!(await apiRecoverProject(id))) return false;
+		this.selectedAssetId = null;
+		this.selectedClipId = null;
+		this.selectedClipIds = [];
+		this.selectedOverlayId = null;
+		this.selectedSvgOverlayId = null;
+		await this.load();
+		return true;
+	}
+
 	/** Persist the project to a chosen `.kerf` file; resolves true if saved. */
 	async saveProjectAs(): Promise<boolean> {
 		const path = await apiSaveProjectAs(this.currentPath ?? undefined);
@@ -689,6 +703,17 @@ class EditorState {
 	 *  merge the result into local caches. */
 	async analyze(assetId: string, steps?: readonly AnalysisKind[]): Promise<AssetAnalysis> {
 		const analysis = await analyzeAsset(assetId, steps);
+		this.analyses[assetId] = analysis;
+		if (assetId === this.selectedAssetId && this.selectedMetadata) {
+			this.selectedMetadata = { ...this.selectedMetadata, analysis };
+		}
+		return analysis;
+	}
+
+	/** Re-time the selected asset's transcript words and label its speakers, keeping the
+	 *  local caches in step. */
+	async refineTranscript(assetId: string): Promise<AssetAnalysis> {
+		const analysis = await refineTranscript(assetId);
 		this.analyses[assetId] = analysis;
 		if (assetId === this.selectedAssetId && this.selectedMetadata) {
 			this.selectedMetadata = { ...this.selectedMetadata, analysis };

@@ -67,7 +67,7 @@
 
 	let channel = $state<CurveChannel>('master');
 	/** The points of `channel` while a gesture moves them; `null` between gestures. */
-	let draft = $state<CurvePoint[] | null>(null);
+	let draft = $state.raw<CurvePoint[] | null>(null);
 	let canvas = $state<HTMLCanvasElement | null>(null);
 
 	const stored = (ch: CurveChannel) => grade.curves?.[ch] ?? [];
@@ -148,33 +148,77 @@
 		return { x: (e.clientX - r.left) / r.width, y: 1 - (e.clientY - r.top) / r.height };
 	}
 
+	const sameCurve = (a: readonly CurvePoint[], b: readonly CurvePoint[]) =>
+		JSON.stringify(normalizeCurve(a)) === JSON.stringify(normalizeCurve(b));
+
+	/** Writes the channel's points, unless they are what the clip already has. */
 	function writeCurve(clipId: string, ch: CurveChannel, points: CurvePoint[]) {
+		if (sameCurve(points, stored(ch))) return Promise.resolve();
 		return write(clipId, { ...grade, curves: withChannel(grade.curves, ch, normalizeCurve(points)) });
 	}
+
+	/** A click that only added a point (or put the puck down) waits this long for the second click
+	 *  of a double-click, which undoes it, so a double-click writes no edit and its opposite. */
+	const DOUBLE_CLICK_MS = 300;
+	let pending: { key: string; timer: ReturnType<typeof setTimeout>; flush: () => void } | null = null;
+	function defer(key: string, flush: () => void) {
+		settle(key);
+		const timer = setTimeout(() => {
+			pending = null;
+			flush();
+		}, DOUBLE_CLICK_MS);
+		pending = { key, timer, flush };
+	}
+	/** Drops the waiting click if it is `key`'s (true), or writes it now if it is another control's. */
+	function settle(key: string): boolean {
+		const p = pending;
+		if (!p) return false;
+		clearTimeout(p.timer);
+		pending = null;
+		if (p.key === key) return true;
+		p.flush();
+		return false;
+	}
+	$effect(() => () => settle(''));
 
 	function curveDown(e: PointerEvent) {
 		if (e.button !== 0 || editor.busy) return;
 		const clipId = clip.id;
 		const ch = channel;
+		// The second click of a double-click lands on the point the first one is still waiting to add.
+		const carried = settle(`curve:${ch}`);
 		const start = shown(ch);
 		const p = at(e);
 		let index = nearestPoint(start, p.x, p.y, HIT);
 		let points = start;
+		let added = carried;
 		if (index < 0) {
-			const added = addPoint(start, p.x, p.y);
-			if (!added) return;
-			points = added.points;
-			index = added.index;
+			const next = addPoint(start, p.x, p.y);
+			if (!next) return;
+			points = next.points;
+			index = next.index;
+			added = true;
 		}
 		draft = points;
+		let moved = false;
 		const target = e.currentTarget as HTMLElement;
 		beginDrag(e, {
 			move(ev) {
+				moved = true;
 				const r = target.getBoundingClientRect();
 				draft = movePoint(points, index, (ev.clientX - r.left) / r.width, 1 - (ev.clientY - r.top) / r.height);
 			},
 			async commit() {
 				const done = draft ?? points;
+				if (!moved && added) {
+					const mine = draft;
+					defer(`curve:${ch}`, () => {
+						void writeCurve(clipId, ch, done).then(() => {
+							if (draft === mine) draft = null;
+						});
+					});
+					return;
+				}
 				await writeCurve(clipId, ch, done);
 				draft = null;
 			},
@@ -192,6 +236,8 @@
 		if (i < 0) return;
 		e.preventDefault();
 		e.stopPropagation();
+		settle(`curve:${channel}`);
+		draft = null;
 		void writeCurve(clip.id, channel, pts.filter((_, j) => j !== i));
 	}
 
@@ -200,10 +246,13 @@
 	const WHEEL = 84;
 	const RANGE_LABEL: Record<WheelRange, string> = { shadows: 'Shadows', midtones: 'Midtones', highlights: 'Highlights' };
 	const wheels = $derived(grade.wheels ?? NEUTRAL_WHEELS);
-	let puck = $state<{ range: WheelRange; wheel: Wheel } | null>(null);
+	let puck = $state.raw<{ range: WheelRange; wheel: Wheel } | null>(null);
 	const wheelOf = (r: WheelRange) => (puck?.range === r ? puck.wheel : wheels[r]);
 
 	function writeWheel(clipId: string, range: WheelRange, wheel: Wheel) {
+		const next = normalizeWheel(wheel);
+		const now = normalizeWheel(wheels[range]);
+		if (next.x === now.x && next.y === now.y && next.lightness === now.lightness) return Promise.resolve();
 		return write(clipId, { ...grade, wheels: { ...wheels, [range]: normalizeWheel(wheel) } });
 	}
 
@@ -244,11 +293,25 @@
 			const p = wheelPoint(el, ev);
 			puck = { range, wheel: normalizeWheel({ ...base, x: p.x, y: p.y }) };
 		};
+		settle(`wheel:${range}`);
 		place(e);
+		let moved = false;
 		beginDrag(e, {
-			move: place,
+			move(ev) {
+				moved = true;
+				place(ev);
+			},
 			async commit() {
 				const done = puck?.wheel ?? base;
+				if (!moved) {
+					const mine = puck;
+					defer(`wheel:${range}`, () => {
+						void writeWheel(clipId, range, done).then(() => {
+							if (puck === mine) puck = null;
+						});
+					});
+					return;
+				}
 				await writeWheel(clipId, range, done);
 				puck = null;
 			},
@@ -266,8 +329,9 @@
 	// ---- LUT -------------------------------------------------------------------
 
 	let info = $state<{ path: string; info: LutInfo | null; error: string | null } | null>(null);
+	const lutPath = $derived(grade.lut?.path);
 	$effect(() => {
-		const path = grade.lut?.path;
+		const path = lutPath;
 		if (!path) {
 			info = null;
 			return;
@@ -330,7 +394,11 @@
 				aria-valuenow={Math.round(Math.hypot(w.x, w.y) * 100)}
 				style="position:relative;width:{WHEEL}px;height:{WHEEL}px;flex:none;cursor:crosshair;touch-action:none"
 				onpointerdown={(e) => wheelDown(e, range)}
-				ondblclick={() => writeWheel(clip.id, range, { ...w, x: 0, y: 0 })}
+				ondblclick={() => {
+					settle(`wheel:${range}`);
+					puck = null;
+					void writeWheel(clip.id, range, { ...wheels[range], x: 0, y: 0 });
+				}}
 			>
 				<canvas
 					use:paintDisc

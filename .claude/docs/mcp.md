@@ -34,6 +34,12 @@ SVG sheet, a drawing JPEG would smear): a caption
 actually *see* (rmcp wants bare base64 + MIME, **not** a `data:` URL). `preview_timeline` stays the one-shot
 still (`composite_timeline_frame`, the working cut, the exact time asked): the scrub cache and its windows
 (`app.md`) are the GUI's, where frames come one after another from a dragged playhead.
+**`get_scopes`** measures instead of showing (`kerf_core::scopes`, `engine-cli.md`): the summary of the frame the
+export writes at a time — per channel min / max / mean, pixels clipped at 0 and 1 counted over every pixel, the mean
+chroma's hue and saturation, the densest vectorscope spots — so an agent checks exposure, clipping or a cast with no
+image tokens; `grids` (waveform / parade / vectorscope / histogram, default 64 x 64 / 48, each `grid_size` field
+optional) only when asked, `max_width` clamped to 3840. There is no
+tool for the render bar (`get_render_bar`): how the GUI's preview plays a span is nothing an agent acts on.
 **Look, then look closer**: `get_frame` and `preview_timeline` take an optional
 `region` (a `Region` — fractions of the frame, normalized into it) that is
 cropped out *before* the scale to `max_width`, and `skim_asset` takes a `cell`
@@ -90,7 +96,9 @@ pins it against the generated schemas, the way `ripple` is pinned); `timeline_su
 track `linked_clips` / `detached_sound_clips`, and the server `instructions` carry one paragraph.
 **Grading over MCP**: `set_grade` (`clip_id`, `curves?` `{master, red, green, blue: [{x, y}]}`, `wheels?`
 `{shadows, midtones, highlights: {x, y, lightness}}`, `lut_path?` (`""` removes), `lut_intensity?`): omitted parts are
-kept; a new LUT file is read and checked before the lock is taken; the clip comes back.
+kept, the same `lut_path` without an intensity keeps the current one; a new LUT file is read and checked before the
+lock is taken; the clip comes back. The nested curves / wheels are MCP-only mirrors (`CurvesArg`, `WheelsArg`, …) with
+`deny_unknown_fields`, so `mastre` is refused; the persisted model stays lenient.
 **Per-property animation over MCP**: `set_property_keyframes` (`clip_id`, `prop`, `keys:
 [{time, value, easing?}]`; `[]` makes the number static again; the clip comes back) animates one number —
 a transform number, a colour number or the clip's volume — independently of the rest,
@@ -237,6 +245,19 @@ the audience), and `export_cover` writes the thumbnail.
 out, since an agent that does not know its edits are held back would report a cut
 the user has not got.
 
+**Transcript reads.** Words are most of a transcript (~1.4 MB for two hours), so `analyze_asset` and
+`get_asset_metadata` strip them (`without_words`). `get_transcript { asset_id, words?, speaker?, from?,
+to?, limit? }` returns the lines overlapping the source window with their `speaker`, at most `limit`
+(default 200, ≤ 2000) with `next_from` to page on; `words: true` (default false) adds the words,
+estimated on the fly for a transcript cached before words were recorded. `speaker_ranges { asset_id,
+speaker?, join_gap? }` (gap clamped 0..10 s, default 0.75) is "cut to speaker": each speaker's
+source-time ranges (by each word's label, not the line's majority) and speaking time.
+`find_filler_words { asset_id, fillers? }` (≤ 100) returns fillers by word bounds for
+`cut_clip_range`. `refine_transcript { asset_id }` re-times words and labels speakers on a cached
+transcript through `crate::run_refine`, the Tauri command's body: background lane, `analysis-progress`,
+stopped by `analysis_cancel`, refused if a newer transcript landed meanwhile, `analysis-status` after
+(not `project-changed`: only analysis moved).
+
 **Proxies and analysis steps.** `analyze_asset { asset_id, steps? }` runs only the named kinds
 (`silence`, `scenes`, `loudness`, `rhythm`, `transcript`, `all`; aliases such as `tempo` / `transcription`
 parse) and merges them into the cache; omitted, it runs what the user left on in Settings ›
@@ -254,3 +275,24 @@ a full-detail frame of the original.
 tools take the project as the agent (`lock_agent`: activity stamped, edits attributed). Asking
 `analyze_asset` for nothing it can run — everything switched off and no `steps`, or only audio steps on
 a file with no audio — is an invalid-params error, not an empty result.
+
+**Strict arguments, hints and editor context.** The `call_tool` override refuses a call
+naming a key its tool's `input_schema` does not list (`mcp/args.rs`) as invalid params
+(-32602), naming the key and the accepted ones (or "it takes no arguments") — serde drops
+an unknown key, so `trim { rippel: false }` used to trim with the project's mode and report
+success. The accepted set follows `allOf` / `anyOf` / `oneOf` and local `$ref`s (a
+`#[serde(flatten)]` struct or enum), and a schema with `additionalProperties` (a flattened
+map) accepts anything. Only **top-level** keys are checked; keys inside a nested object
+(`export`'s `options`, a `moves` entry) are still dropped by serde. schemars does not list
+`#[serde(alias)]` names, so the check would refuse them: parameter structs take no alias
+(`mcp_parameters_take_no_serde_alias` scans `mcp.rs`). Every tool has a `title` and the four hints from the table in
+`mcp/hints.rs`, applied to the routes once in `router()`; `every_tool_is_titled_and_annotated`
+fails on a tool missing from it (and on an entry naming no tool), so **a new tool needs a
+row there**. Staged (or undoable) agent edits are not destructive; applying / discarding a
+proposal, `resolve_task` / `remove_task`, undo / redo / `revert_to` (the live cut), the
+exports (a file outside the project) and `delete_proxy` are. Reads and previews are
+`readOnlyHint`, and `openWorldHint` marks the tools that may download a model.
+`get_editor_context` returns what the webview last reported (`app.md`): playhead,
+`selected_clip_ids`, `mark_in` / `mark_out`, `visible_range`, `focused_panel`,
+`selected_asset_id`, with `age_secs` and `stale`; before any report (headless) it is
+`{reported: false, stale: true, note}`. The `instructions` point "this clip" / "here" at it.

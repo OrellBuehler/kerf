@@ -2,9 +2,19 @@
 // timeline clip currently carrying it, so a line can seek to itself, be cut
 // out, and read as struck through once it is gone.
 
-import type { Clip, Track, TranscriptSegment } from './types';
+import type { Clip, Track, TranscriptSegment, Word } from './types';
 
-export type TxLine = { t: string; s: string; start: number; end: number; clip: Clip | null };
+export type TxLine = {
+	t: string;
+	s: string;
+	start: number;
+	end: number;
+	clip: Clip | null;
+	speaker: string | null;
+	/** What cutting the line removes: its words' bounds when it has words (the pauses
+	 *  either side stay), else the whole line. */
+	cut: { start: number; end: number };
+};
 
 export function fmtClock(s: number): string {
 	const m = Math.floor(s / 60);
@@ -21,21 +31,65 @@ export function srcToTimeline(c: Clip, src: number): number {
 	return c.timeline_start + Math.max(0, off) / mag;
 }
 
-/** Each segment resolved (by its midpoint) to the clip showing it — null once
- *  cut out. */
+/** Each segment resolved to the clip showing the most of what cutting it removes (its
+ *  words, else the whole line) — null once that is cut out, so a line whose words are gone
+ *  but whose pauses remain reads as cut. */
 export function transcriptLines(segments: TranscriptSegment[], assetId: string | null, tracks: Track[]): TxLine[] {
 	return segments.map((seg) => {
-		const mid = (seg.start + seg.end) / 2;
+		const words = seg.words ?? [];
+		const cut = words.length
+			? { start: words[0].start, end: Math.max(words[words.length - 1].end, words[0].start) }
+			: { start: seg.start, end: seg.end };
 		let clip: Clip | null = null;
-		outer: for (const tr of tracks) {
+		let best = 0;
+		for (const tr of tracks) {
 			for (const c of tr.clips) {
-				if (c.asset_id === assetId && mid > c.source_in && mid < c.source_out) {
+				if (c.asset_id !== assetId) continue;
+				const overlap =
+					cut.end > cut.start
+						? Math.min(cut.end, c.source_out) - Math.max(cut.start, c.source_in)
+						: cut.start > c.source_in && cut.start < c.source_out
+							? Number.MIN_VALUE
+							: 0;
+				if (overlap > best) {
+					best = overlap;
 					clip = c;
-					break outer;
 				}
 			}
 		}
-		return { t: fmtClock(seg.start), s: seg.text, start: seg.start, end: seg.end, clip };
+		return {
+			t: fmtClock(seg.start),
+			s: seg.text,
+			start: seg.start,
+			end: seg.end,
+			clip,
+			speaker: seg.speaker ?? null,
+			cut
+		};
+	});
+}
+
+/** The speaker labels in a transcript, in order of first appearance. */
+export function speakersOf(segments: TranscriptSegment[]): string[] {
+	const out: string[] = [];
+	for (const s of segments) if (s.speaker && !out.includes(s.speaker)) out.push(s.speaker);
+	return out;
+}
+
+/** A line's words spread over its span in proportion to their character length,
+ *  each marked `estimated`. Mirrors `transcript::estimate_words`. */
+export function estimateWords(seg: TranscriptSegment): Word[] {
+	const texts = seg.text.split(/\s+/).filter(Boolean);
+	const span = seg.end - seg.start;
+	if (!texts.length || !(Number.isFinite(seg.start) && Number.isFinite(span) && span > 0)) return [];
+	const weights = texts.map((t) => Math.max([...t].length, 1));
+	const total = weights.reduce((a, b) => a + b, 0);
+	let acc = 0;
+	return texts.map((text, i) => {
+		const start = seg.start + (span * acc) / total;
+		acc += weights[i];
+		const end = i + 1 === texts.length ? seg.end : seg.start + (span * acc) / total;
+		return { text, start, end, estimated: true, speaker: seg.speaker ?? null };
 	});
 }
 

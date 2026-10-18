@@ -26,48 +26,92 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
+/// The source picture: its size, and whether the file is tagged BT.709 throughout.
+#[derive(Clone, Copy)]
+struct Shape {
+    w: u32,
+    h: u32,
+    bt709: bool,
+}
+
+const SMALL: Shape = Shape {
+    w: CW,
+    h: CH,
+    bt709: false,
+};
+const HD: Shape = Shape {
+    w: 1280,
+    h: 720,
+    bt709: true,
+};
+
 /// A lossless one-second flat clip of `color`.
 fn flat(dir: &Path, color: &str) -> Asset {
-    let path = dir.join(format!("flat-{color}.mp4"));
+    flat_as(dir, color, SMALL)
+}
+
+fn flat_as(dir: &Path, color: &str, shape: Shape) -> Asset {
+    let Shape { w, h, bt709 } = shape;
+    let path = dir.join(format!("flat-{color}-{w}x{h}.mp4"));
     if !path.exists() {
-        let made = command(&ffmpeg_bin())
-            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
-            .arg(format!("color=c={color}:s={CW}x{CH}:r=30:d=1"))
-            .args(["-c:v", "libx264", "-crf", "0", "-g", "1", "-pix_fmt", "yuv420p"])
-            .arg(&path)
-            .status_bounded()
-            .expect("run ffmpeg");
+        let mut cmd = command(&ffmpeg_bin());
+        cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(format!("color=c={color}:s={w}x{h}:r=30:d=1"))
+            .args(["-c:v", "libx264", "-crf", "0", "-g", "1", "-pix_fmt", "yuv420p"]);
+        if bt709 {
+            cmd.args(["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]);
+        }
+        let made = cmd.arg(&path).status_bounded().expect("run ffmpeg");
         assert!(made.success());
     }
-    let mut asset = test_asset(vec![video_stream(CW, CH, 30.0)]);
+    let mut stream = video_stream(w, h, 30.0);
+    if bt709 {
+        stream.pix_fmt = Some("yuv420p".into());
+        stream.color_space = Some("bt709".into());
+        stream.color_primaries = Some("bt709".into());
+        stream.color_transfer = Some("bt709".into());
+    }
+    let mut asset = test_asset(vec![stream]);
     asset.path = path.to_string_lossy().into_owned();
     asset.duration = 1.0;
     asset
 }
 
-fn options() -> ExportOptions {
+fn options(shape: Shape) -> ExportOptions {
     ExportOptions {
-        resolution: Some((CW, CH)),
+        resolution: Some((shape.w, shape.h)),
         fps: Some(30.0),
         ..ExportOptions::default()
     }
 }
 
-fn centre(frame: &[u8]) -> [i32; 3] {
-    let at = ((CH / 2 * CW + CW / 2) * 3) as usize;
+fn centre(frame: &[u8], shape: Shape) -> [i32; 3] {
+    let at = ((shape.h / 2 * shape.w + shape.w / 2) * 3) as usize;
     [i32::from(frame[at]), i32::from(frame[at + 1]), i32::from(frame[at + 2])]
 }
 
 /// The centre pixel of the export's frame at 0.5 s, as rgb24.
 fn exported(asset: &Asset, grade: &Grade, dir: &Path, tag: &str) -> [i32; 3] {
+    exported_as(asset, grade, dir, tag, SMALL)
+}
+
+fn exported_as(asset: &Asset, grade: &Grade, dir: &Path, tag: &str, shape: Shape) -> [i32; 3] {
     let mut clip = make_clip(asset.id, 0.0, 1.0, 0.0);
     clip.grade = grade.clone();
     let timeline = single(vec![clip]);
     let out = dir.join(format!("{tag}.rgb"));
-    let mut args = build_export_args(&timeline, std::slice::from_ref(asset), "unused.mkv", &options()).unwrap();
+    let mut args = build_export_args(&timeline, std::slice::from_ref(asset), "unused.mkv", &options(shape)).unwrap();
     let graph = args.iter().position(|a| a == "-filter_complex").unwrap() + 1;
     args.truncate(graph + 1);
-    args.extend(["-map", "[outv]", "-f", "rawvideo", "-pix_fmt", "rgb24", "-y"].map(String::from));
+    // The composite takes the black base's (absent) tag, so a BT.709 picture is read as one here:
+    // the model is the grade in the clip's own RGB.
+    let read = if shape.bt709 {
+        args[graph].push_str(";[outv]scale=in_color_matrix=bt709,format=rgb24[rgb]");
+        "[rgb]"
+    } else {
+        "[outv]"
+    };
+    args.extend(["-map", read, "-f", "rawvideo", "-pix_fmt", "rgb24", "-y"].map(String::from));
     args.push(out.to_string_lossy().into_owned());
     let run = command(&ffmpeg_bin()).args(&args).stdin(Stdio::null()).output().unwrap();
     assert!(
@@ -77,23 +121,28 @@ fn exported(asset: &Asset, grade: &Grade, dir: &Path, tag: &str) -> [i32; 3] {
         String::from_utf8_lossy(&run.stderr)
     );
     let bytes = std::fs::read(&out).unwrap();
-    let frame = (CW * CH * 3) as usize;
+    let frame = (shape.w * shape.h * 3) as usize;
     assert!(bytes.len() >= frame * 16, "{tag}: {} bytes", bytes.len());
-    let at = centre(&bytes[frame * 15..frame * 16]);
+    let at = centre(&bytes[frame * 15..frame * 16], shape);
+    // The still's RGB is the composite's, whose matrix is this FFmpeg's policy
+    // (`composite_color_policy`), not the clip's: it is held to the export for untagged footage only.
+    if shape.bt709 {
+        return at;
+    }
     let still = {
         let args = build_still_args(
             &timeline,
             std::slice::from_ref(asset),
-            &options(),
+            &options(shape),
             0.5,
-            CW,
+            shape.w,
             None,
             &StillOutput::RgbPipe,
         )
         .unwrap();
         let run = command(&ffmpeg_bin()).args(&args).stdin(Stdio::null()).output().unwrap();
         assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
-        centre(&run.stdout)
+        centre(&run.stdout, shape)
     };
     assert!(
         (0..3).all(|c| (at[c] - still[c]).abs() <= TOLERANCE),
@@ -304,5 +353,63 @@ fn all_three_render_in_order_on_one_clip() {
     let l = inverted.iter().copied().fold(0.0, f64::max) + inverted.iter().copied().fold(1.0, f64::min);
     let want = inverted.map(|v| 255.0 * colorbalance(v, l, 0.0, 0.0, -0.1));
     assert_near("all", got, want);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The colour tags of the file the export writes, as ffprobe reads them.
+fn delivered_tags(asset: &Asset, grade: &Grade, dir: &Path, tag: &str) -> String {
+    let mut clip = make_clip(asset.id, 0.0, 1.0, 0.0);
+    clip.grade = grade.clone();
+    let timeline = single(vec![clip]);
+    let out = dir.join(format!("{tag}.mkv"));
+    let out_s = out.to_string_lossy().into_owned();
+    let args = build_export_args(&timeline, std::slice::from_ref(asset), &out_s, &options(HD)).unwrap();
+    let run = command(&ffmpeg_bin()).args(&args).stdin(Stdio::null()).output().unwrap();
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    let probe = command(&ffprobe_bin())
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries"])
+        .arg("stream=color_space,color_primaries,color_transfer,color_range")
+        .args(["-of", "csv=p=0"])
+        .arg(&out)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&probe.stdout).trim().to_string()
+}
+
+#[test]
+#[ignore = "drives the real ffmpeg"]
+fn an_hd_bt709_clip_keeps_its_matrix_and_tags_through_the_grade() {
+    let dir = scratch("hd709");
+    let asset = flat_as(&dir, "0x3C78B4", HD);
+    let plain = exported_as(&asset, &Grade::default(), &dir, "plain", HD);
+    let curves = Curves {
+        red: pts(&[(0.0, 0.0), (0.25, 0.1), (0.5, 0.6), (0.75, 0.95), (1.0, 1.0)]),
+        ..Curves::default()
+    };
+    let grade = Grade {
+        curves: Some(curves.clone()),
+        ..Grade::default()
+    };
+    let got = exported_as(&asset, &grade, &dir, "curves", HD);
+    let want = [0, 1, 2].map(|c| 255.0 * curves.apply(c, f64::from(plain[c]) / 255.0));
+    assert_near("hd curves", got, want);
+    let rotate = dir.join("rotate.cube");
+    std::fs::write(&rotate, cube_text(2, |[r, g, b]| [g, b, r])).unwrap();
+    let lut = Grade {
+        lut: Some(ClipLut {
+            path: rotate.to_string_lossy().into_owned(),
+            intensity: 1.0,
+        }),
+        ..Grade::default()
+    };
+    let got = exported_as(&asset, &lut, &dir, "lut", HD);
+    let p = plain.map(f64::from);
+    assert_near("hd lut", got, [p[1], p[2], p[0]]);
+    assert_eq!(
+        delivered_tags(&asset, &grade, &dir, "graded"),
+        delivered_tags(&asset, &Grade::default(), &dir, "ungraded"),
+        "a graded clip is tagged as an ungraded one"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

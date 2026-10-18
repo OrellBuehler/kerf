@@ -292,6 +292,26 @@ impl Wheels {
     }
 }
 
+/// The YCbCr matrix tag (FFmpeg's `setparams` name) the frames of a clip from `stream` carry into its
+/// grade: BT.709 after a tone-map, else the stream's own tag when it names a YCbCr matrix the grade
+/// knows how to give back. `None` for an untagged or RGB picture (FFmpeg's BT.601 default both ways).
+/// A clip the graph labels BT.709 is BT.709 whatever this says.
+pub fn frame_matrix(stream: Option<&StreamInfo>, tone_mapped: bool) -> Option<&'static str> {
+    if tone_mapped {
+        return Some("bt709");
+    }
+    let s = stream.filter(|s| s.has_a_yuv_tag())?;
+    match s.color_space.as_deref()?.trim() {
+        "bt709" => Some("bt709"),
+        "smpte170m" => Some("smpte170m"),
+        "bt470bg" => Some("bt470bg"),
+        "bt2020nc" => Some("bt2020nc"),
+        "fcc" => Some("fcc"),
+        "smpte240m" => Some("smpte240m"),
+        _ => None,
+    }
+}
+
 /// A `.cube` 3D LUT a clip is looked up through, and how much of it (`0..=1`, in hundredths).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ClipLut {
@@ -407,6 +427,24 @@ impl Grade {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_frame_matrix_is_the_stated_yuv_tag() {
+        use crate::engine::test_support::{image_stream, video_stream};
+        let tagged = |tag: &str| {
+            let mut s = video_stream(1920, 1080, 30.0);
+            s.pix_fmt = Some("yuv420p".into());
+            s.color_space = Some(tag.into());
+            s
+        };
+        assert_eq!(frame_matrix(Some(&tagged("bt709")), false), Some("bt709"));
+        assert_eq!(frame_matrix(Some(&tagged("bt470bg")), false), Some("bt470bg"));
+        assert_eq!(frame_matrix(Some(&tagged("unknown")), false), None);
+        assert_eq!(frame_matrix(Some(&tagged("gbr")), false), None);
+        assert_eq!(frame_matrix(Some(&video_stream(1920, 1080, 30.0)), false), None);
+        assert_eq!(frame_matrix(None, true), Some("bt709"));
+        assert_eq!(frame_matrix(Some(&image_stream(64, 64)), false), None);
+    }
 
     fn pts(p: &[(f64, f64)]) -> Vec<CurvePoint> {
         p.iter().map(|&(x, y)| CurvePoint { x, y }).collect()

@@ -644,13 +644,24 @@ so the feature is **only** activated through these forwards — which is what ma
   `.cube` is parsed strictly (3D only, size 2–65, unit domain, `size³` finite rows, 32 MB cap; FFmpeg's reader ignores a
   `DOMAIN_MIN` before the size and misreads CR-only files), rewritten to `<cache>/kerf/luts/<fnv>.cube` with the
   intensity baked in (exact: tetrahedral interpolation of an affine table is itself), path escaped like `fontfile=`. A
-  missing or broken file at render time is **left out** with a warning, like a missing font. **Wheels are
+  missing or broken file is **left out** of a preview or still with a warning, like a missing font, and **refused by an
+  export** (`check_export_luts` in `export_preflight`, naming the file). The builders read the disk for the copy, so they
+  run off the project lock. The copies are pruned on the first lookup of a run: older than 30 days (a reused copy's mtime
+  is touched), then least recently used past 256 MB. Parse errors give the line and a fixed message, never the file's
+  text. **Wheels are
   `colorbalance`**: a puck `(x, y)` in the unit disc is `(x, -x/2 + √3/2 y, -x/2 - √3/2 y)` plus the lightness on all
   three, held to ±1, rounded to 1e-4, zeros omitted; the filter weighs its ranges by a pixel's max + min (a sum, not
-  the mean: measured, 6.1 and 9.0.2), so midtones act on fairly dark pixels and a mid grey is highlights. All three are RGB filters: FFmpeg negotiates one conversion in and
-  one out around them. `grade_rendered.rs` (`#[ignore]`d, 6.1 and 9.0.2) holds the export and the still to the model
-  within 4 levels (inverting / S / per-channel curves, a channel-rotating and a squaring LUT at 100 / 50 %, a missing
-  LUT, each wheel range, all three in order).
+  the mean: measured, 6.1 and 9.0.2), so midtones act on fairly dark pixels and a mid grey is highlights. All three are RGB filters: FFmpeg converts in
+  with the frames' matrix, but **6.1 converts back as BT.601 and leaves the tag `unknown`** (a BT.709 HD clip came back 7
+  levels off, mis-tagged; 9.0.2 keeps both). So for a tagged picture (`ClipFx::frame_matrix` / `model::frame_matrix`:
+  the stream's YCbCr tag, BT.709 after a tone-map or the graph's BT.709 label) the grade ends in
+  `scale=out_color_matrix=<m>,format=yuv444p|yuv444p10le|yuv444p12le|yuv444p16le,setparams=colorspace=<m>`; an untagged
+  picture is BT.601 both ways and gets nothing. `the_grade_text_is_pinned` pins the curves / wheels / matrix text.
+  `grade_rendered.rs` (`#[ignore]`d, 6.1 and 9.0.2) holds the export and the still to the model within 4 levels
+  (inverting / S / per-channel curves, a channel-rotating and a squaring LUT at 100 / 50 %, a missing LUT, each wheel
+  range, all three in order) and an HD BT.709 clip's export to the model in its own RGB, delivered with the ungraded
+  clip's tags. That clip's still is not held to the model: its RGB is the composite's matrix
+  (`composite_color_policy`), not the clip's.
   **A keyed colour is an `eq` with `eval=frame`** (`eq_filter_keyed`):
   each keyed number a quoted expression of the frame's time `t` — `t` is the frame timestamp, which
   `setpts` has put on the timeline, so clip-local time is `(t-start)` as everywhere else — the unkeyed
@@ -1044,3 +1055,15 @@ so the feature is **only** activated through these forwards — which is what ma
   `build_still_args`* under its own mutex, so a builder that asked would deadlock, and a non-probing read would
   answer differently before and after the first probe. The plan mirrors it (`PlanStream::matrix()` is BT.709 for a
   labelled layer under any policy, which a translucent round trip reads).
+
+**Scopes** (`scopes.rs`, pure but for `timeline_scopes`). The frame is `timeline_frame_yuv`: the still's own graph with a
+`StillOutput::Yuv444Pipe` sink (`-f rawvideo -pix_fmt yuv444p`, a new sink, so no golden moves), from the **originals**
+(`export_still_inputs`) at the delivery width — the Y'CbCr samples the file holds, not an `rgb24` pipe, whose matrix is the
+composite's (BT.601 on FFmpeg 6) rather than the one a player decodes the untagged delivery with. `yuv444_to_rgba` decodes
+them limited-range with the delivery's matrix (`delivery_matrix`: BT.709 at 1280 wide or over 576 tall, else BT.601; a
+caller can name `bt601` / `bt709` / `bt2020`), clipping what the cube cannot hold, as a screen does. `analyze` reads every
+pixel for the summary and the histogram (min / max / mean, pixels at 0 and 255 — a single clipped pixel is counted, which a
+decimated read misses) and a decimated frame (at most 480 x 270 samples) for the waveform, parade and vectorscope grids and
+the peaks (a 64² vectorscope, cells with at least 1 % of the samples). A measurement, not a frame anyone waits to see:
+ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still's spawn-time tuning, at most
+`MAX_SCOPE_WIDTH` (3840) wide, the pipe read into a buffer sized from the frame (`output_bounded`'s `capacity`). `scopes_of_a_rendered_frame` (`#[ignore]`d) holds a one-pixel clip through the real graph.

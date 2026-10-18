@@ -18,7 +18,12 @@
 //! **The wheels are `colorbalance`**, each range's three numbers [`Wheel::rgb`], a zero omitted.
 //!
 //! All three filters work in RGB: FFmpeg converts the picture once on the way in (they share one
-//! negotiated format) and once on the way out.
+//! negotiated format, read with the frames' own matrix) and once on the way out. **The way out is
+//! Kerf's** for a tagged picture: FFmpeg 6.1 would convert back as BT.601 and leave the matrix tag
+//! `unknown` (a BT.709 HD clip measured 4 levels off its ungraded neighbour, and delivered
+//! mis-tagged), so the grade ends in a `scale` to the frames' matrix, a 4:4:4 format of the
+//! negotiated depth, and the tag set again (`setparams`). An untagged picture is BT.601 both ways
+//! already, and gets nothing.
 
 use super::*;
 use crate::model::{CurveSegment, CurveShape, Curves, Grade, Wheel, Wheels};
@@ -114,14 +119,38 @@ pub(super) fn lut_filter(path: &Path) -> String {
     )
 }
 
-/// The grade's filters, in chain order; empty for an identity grade.
-pub(super) fn grade_filters(grade: &Grade) -> Vec<String> {
+/// `scale`'s name for a matrix tag.
+fn scale_matrix(tag: &str) -> &str {
+    match tag {
+        "bt470bg" => "bt470",
+        "bt2020nc" => "bt2020",
+        other => other,
+    }
+}
+
+/// Back from RGB into the frames' YCbCr matrix `tag`, tagged so (see the module docs).
+pub(super) fn back_to_yuv(tag: &str) -> [String; 3] {
+    [
+        format!("scale=out_color_matrix={}", scale_matrix(tag)),
+        "format=yuv444p|yuv444p10le|yuv444p12le|yuv444p16le".to_string(),
+        format!("setparams=colorspace={tag}"),
+    ]
+}
+
+/// The grade's filters, in chain order, for frames tagged `matrix`; empty for an identity grade.
+///
+/// Reads the disk for a LUT (its copy, [`crate::color_lut::lut_file`]): the builders run off the
+/// project lock.
+pub(super) fn grade_filters(grade: &Grade, matrix: Option<&str>) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(path) = grade.lut().as_ref().and_then(crate::color_lut::lut_file) {
         out.push(lut_filter(&path));
     }
     out.extend(grade.curves().as_ref().and_then(curves_filter));
     out.extend(grade.wheels().as_ref().and_then(wheels_filter));
+    if let Some(tag) = matrix.filter(|_| !out.is_empty()) {
+        out.extend(back_to_yuv(tag));
+    }
     out
 }
 
@@ -404,7 +433,8 @@ mod tests {
 
     #[test]
     fn an_identity_grade_adds_nothing_and_a_missing_lut_is_left_out() {
-        assert!(grade_filters(&Grade::default()).is_empty());
+        assert!(grade_filters(&Grade::default(), None).is_empty());
+        assert!(grade_filters(&Grade::default(), Some("bt709")).is_empty());
         let g = Grade {
             lut: Some(ClipLut {
                 path: "/definitely/not/here.cube".into(),
@@ -420,6 +450,64 @@ mod tests {
             }),
             ..Grade::default()
         };
-        assert_eq!(grade_filters(&g), vec!["colorbalance=rm=0.1:gm=0.1:bm=0.1".to_string()]);
+        assert_eq!(grade_filters(&g, None), vec!["colorbalance=rm=0.1:gm=0.1:bm=0.1".to_string()]);
+    }
+
+    #[test]
+    fn an_export_refuses_a_lut_it_cannot_apply() {
+        use crate::engine::test_support::{make_clip, single};
+        let mut clip = make_clip(uuid::Uuid::new_v4(), 0.0, 1.0, 0.0);
+        clip.grade.lut = Some(ClipLut {
+            path: "/definitely/not/here.cube".into(),
+            intensity: 1.0,
+        });
+        let e = check_export_luts(&single(vec![clip.clone()])).unwrap_err().to_string();
+        assert!(e.contains("/definitely/not/here.cube") && e.contains("cannot export"), "{e}");
+        // At 0 % it changes nothing and is left out, so it does not stop the export; nor does a
+        // disabled clip.
+        clip.grade.lut.as_mut().unwrap().intensity = 0.0;
+        assert!(check_export_luts(&single(vec![clip.clone()])).is_ok());
+        clip.grade.lut.as_mut().unwrap().intensity = 1.0;
+        clip.enabled = false;
+        assert!(check_export_luts(&single(vec![clip])).is_ok());
+    }
+
+    /// The argv text of a grade, pinned the way the golden oracle pins a graph: a change here is a
+    /// change to every graded export.
+    #[test]
+    fn the_grade_text_is_pinned() {
+        let g = Grade {
+            curves: Some(Curves {
+                master: pts(&[(0.0, 0.1), (0.5, 0.6), (1.0, 0.9)]),
+                blue: pts(&[(0.0, 1.0), (1.0, 0.0)]),
+                ..Curves::default()
+            }),
+            wheels: Some(Wheels {
+                shadows: Wheel {
+                    x: -0.3,
+                    y: 0.0,
+                    lightness: 0.0,
+                },
+                highlights: Wheel {
+                    x: 0.0,
+                    y: 0.2,
+                    lightness: 0.05,
+                },
+                ..Wheels::default()
+            }),
+            lut: None,
+        };
+        assert_eq!(
+            grade_filters(&g, Some("bt709")).join(","),
+            concat!(
+                r"lutrgb=r='st(0,val/maxval);st(0,if(lt(ld(0),0),0.1,if(gte(ld(0),1),0.9,if(lt(ld(0),0.5),(st(3,(ld(0)-0)*2);0.1+ld(3)*(0.5+ld(3)*(0.09999999999999998+ld(3)*(-0.09999999999999998)))),(st(3,(ld(0)-0.5)*2);0.6+ld(3)*(0.4+ld(3)*((-0.19999999999999996)+ld(3)*0.09999999999999998)))))));round(maxval*clip(ld(0),0,1))':g='st(0,val/maxval);st(0,if(lt(ld(0),0),0.1,if(gte(ld(0),1),0.9,if(lt(ld(0),0.5),(st(3,(ld(0)-0)*2);0.1+ld(3)*(0.5+ld(3)*(0.09999999999999998+ld(3)*(-0.09999999999999998)))),(st(3,(ld(0)-0.5)*2);0.6+ld(3)*(0.4+ld(3)*((-0.19999999999999996)+ld(3)*0.09999999999999998)))))));round(maxval*clip(ld(0),0,1))':b='st(0,val/maxval);st(0,if(lt(ld(0),0),1,if(gte(ld(0),1),0,(st(3,(ld(0)-0)*1);1+ld(3)*((-1)+ld(3)*(0+ld(3)*0))))));st(0,if(lt(ld(0),0),0.1,if(gte(ld(0),1),0.9,if(lt(ld(0),0.5),(st(3,(ld(0)-0)*2);0.1+ld(3)*(0.5+ld(3)*(0.09999999999999998+ld(3)*(-0.09999999999999998)))),(st(3,(ld(0)-0.5)*2);0.6+ld(3)*(0.4+ld(3)*((-0.19999999999999996)+ld(3)*0.09999999999999998)))))));round(maxval*clip(ld(0),0,1))'",
+                r",colorbalance=rs=-0.3:gs=0.15:bs=0.15:rh=0.05:gh=0.2232:bh=-0.1232,scale=out_color_matrix=bt709,format=yuv444p|yuv444p10le|yuv444p12le|yuv444p16le,setparams=colorspace=bt709"
+            )
+        );
+        assert_eq!(
+            grade_filters(&g, Some("bt470bg")).last().unwrap(),
+            "setparams=colorspace=bt470bg"
+        );
+        assert!(grade_filters(&g, Some("bt470bg")).contains(&"scale=out_color_matrix=bt470".to_string()));
     }
 }

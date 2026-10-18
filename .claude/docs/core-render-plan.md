@@ -195,6 +195,11 @@
   `Planner::new` / `at_frame` / `span` / `first_unsupported` over a 500-clip, five-track cut
   (print-only; here 0.8 ms to plan the cut, 3 µs a frame with five layers on screen and 5 µs
   a frame for `span` / `first_unsupported` with `reasons` at 1080p).
+  **`render_bar.rs`** (pure) is the timeline's render bar: `PlayCut::new(.., 0.0, ..)` over the whole cut, every
+  grid frame judged (`at_frame`, `PlayCut::playing_refusal`, `reasons(caps, still_size(frame, width))`) and run-length
+  encoded by state and kind into `BarSpan { start, end, state: gpu | stream | stall, kind, reason }`; `caps: None` is
+  the GPU preview off (only stalls), `waits` the Proxy-only proxy waits; a frame with no layer and no title is no span,
+  a cut with no video none at all, a rate outside 1..60 fps the stream's (`frontend-timeline.md` has the semantics).
   **`PlayCut`** (`play_plan.rs`, pure) is the cut a compositor that **plays** draws, which is what
   `stream_preview` plays: a `PlanMode::Motion` planner over `Timeline::slice(start, ..)`, so the clips'
   `fps` picks, fades and dissolves are the export's of that slice. `start` is a frame of the project's
