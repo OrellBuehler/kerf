@@ -156,6 +156,7 @@ import type {
 } from './types';
 import { clipDuration } from './types';
 import { timelineFps } from './timecode';
+import { trimRefusal } from './trim-tools';
 import { Generation, ReadOrder } from './generation';
 import { retimeKeyframes, withKeyframeAt } from './titles';
 import { normalize, pruneSelection, type PickMode } from './selection';
@@ -809,6 +810,11 @@ class EditorState {
 	/** Trim a clip; the partners that share the edge follow it unless `link` is `false`. */
 	trim(clipId: string, sourceIn?: number, sourceOut?: number, timelineStart?: number, link?: boolean) {
 		return this.#apply(() => trimClip(clipId, sourceIn, sourceOut, timelineStart, link));
+	}
+	/** The sentence the backend would refuse a trim with (footage it does not have, a lane it would land on,
+	 *  after the ripple when that is on), or `null` when it takes it — answered here, from the cut on screen. */
+	trimRefusal(clipId: string, sourceIn?: number, sourceOut?: number, link?: boolean): string | null {
+		return trimRefusal(this.timeline, { ripple: this.rippleMode, assets: this.assets }, clipId, sourceIn, sourceOut, undefined, link);
 	}
 	reorder(trackId: string, clipId: string, newIndex: number) {
 		return this.#apply(() => reorderClip(trackId, clipId, newIndex));

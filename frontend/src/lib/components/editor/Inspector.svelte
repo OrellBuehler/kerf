@@ -542,6 +542,14 @@
 		}
 	}
 
+	/** A typed In / Out, asked of the port of the backend's own rules first (`trimRefusal`): footage the file does
+	 *  not have, a negative start, a lane it would land on — said at once, in the backend's words. */
+	async function trimChecked(clipId: string, sourceIn?: number, sourceOut?: number) {
+		const why = editor.trimRefusal(clipId, sourceIn, sourceOut);
+		if (why) throw new Error(why);
+		await editor.trim(clipId, sourceIn, sourceOut);
+	}
+
 	// Right-click anywhere on the panel that isn't an editable field (those keep
 	// the native menu for copy / paste). Adapts to whether a clip is selected.
 	function onInspectorContextMenu(e: MouseEvent) {
@@ -1315,11 +1323,11 @@
 			<div class="k-overline" style="margin:12px 0 4px">Trim source</div>
 			{@render timeRow('In', clip.source_in, sourceFps, (v, at) => {
 				const c = clipOf(at);
-				if (c) void run(() => editor.trim(c.id, v, undefined));
+				if (c) void run(() => trimChecked(c.id, v, undefined));
 			})}
 			{@render timeRow('Out', clip.source_out, sourceFps, (v, at) => {
 				const c = clipOf(at);
-				if (c) void run(() => editor.trim(c.id, undefined, v));
+				if (c) void run(() => trimChecked(c.id, undefined, v));
 			})}
 			</InspectorSection>
 

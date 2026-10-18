@@ -26,7 +26,9 @@ import {
 	clampFades,
 	footageOf,
 	handles,
+	MAX_SPEED,
 	MIN_EDIT_CLIP,
+	MIN_SPEED,
 	moveHead,
 	moveTail,
 	rebaseAnimation,
@@ -823,6 +825,10 @@ export function setSpeedLinked(timeline: Timeline, clipId: string, speed: number
 		const next = (p.speed ?? 1) * ratio;
 		if (!Number.isFinite(next) || next === 0)
 			throw invalid('a linked clip would end up with no speed');
+		if (Math.abs(next) < MIN_SPEED || Math.abs(next) > MAX_SPEED)
+			throw invalid(
+				`a linked clip would end up at ${Math.abs(next).toFixed(3)}× — a clip's speed stays within ${MIN_SPEED}× to ${MAX_SPEED}×`
+			);
 		updates.push([p, next]);
 	}
 	timeline.tracks[ti].clips[ci].speed = speed;

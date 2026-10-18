@@ -517,7 +517,8 @@ function devEnv(ripple: boolean | undefined, link: boolean | undefined): ops.Edi
 		ripple: ripple ?? devRippleMode,
 		links: devLinks(link),
 		footage: devLimits(),
-		hasAudio: (assetId) => !!assetById(assetId)?.streams.some((s) => s.kind === 'audio')
+		hasAudio: (assetId) => !!assetById(assetId)?.streams.some((s) => s.kind === 'audio'),
+		asset: (assetId) => assetById(assetId)
 	};
 }
 
@@ -1743,11 +1744,9 @@ export async function setRippleMode(on: boolean): Promise<boolean> {
 
 export async function cutClip(assetId: string, start: number, end: number): Promise<Timeline> {
 	if (!inTauri()) {
-		devEdit(undefined, () => {
-			const track = trackForAsset(devTimeline, assetId);
-			track.clips.push({ id: uid(), asset_id: assetId, source_in: start, source_out: end, timeline_start: trackEnd(track), volume: 1, fade_in: 0, fade_out: 0 });
-		});
-		recordDev('Add clip');
+		const asset = assetById(assetId);
+		if (!asset) throw new Error(`asset not found: ${assetId}`);
+		devRun((tl) => ops.addClip(tl, devEnv(undefined, undefined), asset, null, start, end));
 		return snapshot();
 	}
 	return invoke<Timeline>('cut_clip', { assetId, start, end });
@@ -1761,12 +1760,9 @@ export async function addClip(
 	timelineStart?: number
 ): Promise<Timeline> {
 	if (!inTauri()) {
-		devEdit(undefined, () => {
-			const track = (trackId && devTimeline.tracks.find((t) => t.id === trackId)) || trackForAsset(devTimeline, assetId);
-			const start = timelineStart ?? trackEnd(track);
-			track.clips.push({ id: uid(), asset_id: assetId, source_in: sourceIn, source_out: sourceOut, timeline_start: start, volume: 1, fade_in: 0, fade_out: 0 });
-		});
-		recordDev('Add clip');
+		const asset = assetById(assetId);
+		if (!asset) throw new Error(`asset not found: ${assetId}`);
+		devRun((tl) => ops.addClip(tl, devEnv(undefined, undefined), asset, trackId, sourceIn, sourceOut, timelineStart));
 		return snapshot();
 	}
 	return invoke<Timeline>('add_clip', { assetId, trackId, sourceIn, sourceOut, timelineStart });
