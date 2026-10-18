@@ -1,6 +1,45 @@
 # kerf-app (`crates/kerf-app/src/lib.rs`, `main.rs`)
 
-Tauri v2 shell. **CSP is on** (`app.security.csp` in `tauri.conf.json`, an object so Tauri can add its hashes): `default-src 'self'`, scripts `'self'` only (Tauri hashes SvelteKit's inline bootstrap in the fallback `index.html`), styles allow `'unsafe-inline'` because the UI is styled with inline `style` attributes, fonts are `'self' data:` (Geist, Geist Mono and Space Grotesk are self-hosted through `@fontsource-variable/*` and bundled by Vite, so the app never reaches a font host — there is no `fonts.googleapis.com` / `fonts.gstatic.com` entry to restore), images `data:` (frames are data URLs), `connect-src ipc: http://ipc.localhost`, no objects or `<base>`. Anything new that loads from the network or a `blob:` has to be added there deliberately. **Panics log a backtrace** (`install_panic_hook` forces capture; the release profile strips only `debuginfo`, keeping the symbol table so frames carry function names at a modest size cost). **One instance per identity**: `tauri-plugin-single-instance` is the first plugin in `run()`. A second launch focuses the running window (unminimizing it) and, when its argv carries a `.kerf` path (resolved against the second launch's cwd by `project_arg`), emits `open-project-file` to the webview, which asks about unsaved work like any other open and calls `open_project`. **The first launch's own argv is honoured too**: `run()` resolves it through the same `project_arg` (`launch_project`, pure — the `exists` check is a parameter) against the process cwd into `AppState.launch` (a `LaunchSlot`), and the webview **pulls** it once with `take_launch_project` after its listeners and first `editor.load()` are in place — a command, not an event, because an event emitted before the page has a listener is lost. It returns `{open: path}` once (a reloaded webview must not reopen it over the user's edits) and goes through the same `openProjectAt` as `open-project-file`, unsaved-work question included. **A second launch that arrives while the webview is still booting** would hit the same lost event, so until the webview has asked the slot *holds* its request instead (newest wins; one lock covers both halves, so a request is delivered exactly one way) and only afterwards is it emitted. A `.kerf` argument naming nothing on disk is never opened — `Project::open` would *create* it — and comes back as `{missing: path}` (second launch: the `launch-project-missing` event), which the page toasts as `File not found: …`. (A macOS Finder open arrives as `RunEvent::Opened`, not argv, and no `fileAssociations` are configured; neither is handled.) **The main window starts hidden** (`visible: false`, with `backgroundColor` = Kerf Dark's `surface-app`, which a bun test pins equal to `app.html`'s paint): the webview calls `show_main_window` once the settings are in (theme applied, dock built) and a frame has painted (`reveal.ts`: first the bundled interface fonts, `fontsReady` over `document.fonts.load`, *or* 400 ms, so the first frame is not the system fallback re-flowing; then two animation frames *or* a 150 ms timer, since a hidden page may never get a frame), and a 3 s `REVEAL_FAILSAFE` thread shows it anyway so a crashed bundle cannot leave an invisible app. `reveal_once` over `AppState.main_window_shown` makes the first asker win and the rest no-ops (a timer firing after the user minimized the window must not pop it back up) — but only a `show` that *worked* (a window existed and `show()` succeeded) keeps the claim, so a request that finds no window gives it back and the failsafe retries every 500 ms. A second launch always brings the window forward (`unminimize` + `show` + `set_focus`) and marks the reveal done only if that worked — it can run before the config windows exist, and then the failsafe is still armed. It is a command rather than the window API so the capability needs no `core:window:allow-show` (a Rust test pins its absence), and the debug identity cannot diverge: `tauri.dev.conf.json` merges only `identifier` (also pinned). **Not verifiable without a display**: whether the *first visible frame* is already painted when `show()` lands (a hidden window may not render until shown, which is why `backgroundColor` exists) and how long the timer-vs-frame race takes per OS — check both on a real desktop. **Setup warms the fonts**: `std::thread::spawn(kerf_core::fonts::warm)` reads the system fonts (hundreds of faces on a Mac) off the first Play of an animated title. `lib.rs::run()` is the entry (`main.rs` just calls it); it owns the
+Tauri v2 shell. **CSP is on** (`app.security.csp` in `tauri.conf.json`, an object so Tauri can add its hashes): `default-src 'self'`, scripts `'self'` only (Tauri hashes SvelteKit's inline bootstrap in the fallback `index.html`), styles allow `'unsafe-inline'` because the UI is styled with inline `style` attributes, fonts are `'self' data:` (Geist, Geist Mono and Space Grotesk are self-hosted through `@fontsource-variable/*` and bundled by Vite, so the app never reaches a font host — there is no `fonts.googleapis.com` / `fonts.gstatic.com` entry to restore), images `data:` (frames are data URLs), `connect-src ipc: http://ipc.localhost`, no objects or `<base>`. Anything new that loads from the network or a `blob:` has to be added there deliberately. **Panics log a backtrace** (`install_panic_hook` forces capture; the release profile strips only `debuginfo`, keeping the symbol table so frames carry function names at a modest size cost). **One instance per identity**: `tauri-plugin-single-instance` is the first plugin in `run()`. A second launch focuses the running window (unminimizing it) and, when its argv carries a `.kerf` path (resolved against the second launch's cwd by `project_arg`), emits `open-project-file` to the webview, which asks about unsaved work like any other open and calls `open_project`. **The first launch's own argv is honoured too**: `run()` resolves it through the same `project_arg` (`launch_project`, pure — the `exists` check is a parameter) against the process cwd into `AppState.launch` (a `LaunchSlot`), and the webview **pulls** it once with `take_launch_project` after its listeners and first `editor.load()` are in place — a command, not an event, because an event emitted before the page has a listener is lost. It returns `{open: path}` once (a reloaded webview must not reopen it over the user's edits) and goes through the same `openProjectAt` as `open-project-file`, unsaved-work question included. With nothing named on the command line and `reopen_last_project` on, setup holds the newest `recent_projects` entry whose file still exists in the same slot (`settings::reopen_target`, pure), so the page opens it exactly like a named one. **A second launch that arrives while the webview is still booting** would hit the same lost event, so until the webview has asked the slot *holds* its request instead (newest wins; one lock covers both halves, so a request is delivered exactly one way) and only afterwards is it emitted. A `.kerf` argument naming nothing on disk is never opened — `Project::open` would *create* it — and comes back as `{missing: path}` (second launch: the `launch-project-missing` event), which the page toasts as `File not found: …`. (A macOS Finder open arrives as `RunEvent::Opened`, not argv, and no `fileAssociations` are configured; neither is handled.) **The main window starts hidden** (`visible: false`, with `backgroundColor` = Kerf Dark's `surface-app`, which a bun test pins equal to `app.html`'s paint): the webview calls `show_main_window` once the settings are in (theme applied, dock built) and a frame has painted (`reveal.ts`: first the bundled interface fonts, `fontsReady` over `document.fonts.load`, *or* 400 ms, so the first frame is not the system fallback re-flowing; then two animation frames *or* a 150 ms timer, since a hidden page may never get a frame), and a 3 s `REVEAL_FAILSAFE` thread shows it anyway so a crashed bundle cannot leave an invisible app. `reveal_once` over `AppState.main_window_shown` makes the first asker win and the rest no-ops (a timer firing after the user minimized the window must not pop it back up) — but only a `show` that *worked* (a window existed and `show()` succeeded) keeps the claim, so a request that finds no window gives it back and the failsafe retries every 500 ms. A second launch always brings the window forward (`unminimize` + `show` + `set_focus`) and marks the reveal done only if that worked — it can run before the config windows exist, and then the failsafe is still armed. It is a command rather than the window API so the capability needs no `core:window:allow-show` (a Rust test pins its absence), and the debug identity cannot diverge: `tauri.dev.conf.json` merges only `identifier` (also pinned). **Jobs land in the project they started for.** Every job that resolves its inputs under the lock, releases it and
+applies a result later notes `Project::generation()` with the inputs and checks it when it comes back
+(`require_generation`): import (and the stitch), analysis (each finished step and the final merge — `run_analysis`
+is shared with the MCP tool), voiceover, stems, levels, smart crop and the export's framing pass, captions import,
+relink and the proxy rebuild's un-decline, and `respawn_proxies` (stops queueing a replaced project's assets).
+Where the webview has a quiet "cancelled" string (analysis, voiceover, stems, levels) a replaced project returns
+that; elsewhere the error says `the project was replaced while …; the result was dropped`.
+`save_project_as` asks the same of its reopen and swaps it in only if `Project::change_count()` (every row the
+connection wrote: analysis merged by a background job, the ripple flag, meta, a declined proxy — not only edits) is
+what it was; otherwise it saves again under one held lock. **Cancel flags**: `export_cancel`, `analysis_cancel`
+(`AppState`, readable from `mcp.rs` as `app.state::<AppState>()`; `AppState::begin_analysis()` clears it and hands it
+back for a new run), `levels_cancel`, `voiceover_cancel`, `stems_cancel`, `model_cancel` (`cancel_model_download`),
+`cover_cancel` (`cancel_cover_export` → `cover export cancelled`), `smart_crop_cancel` (`cancel_smart_crop` → `smart
+crop cancelled`, progress as `smart-crop-progress { fraction }`) and `import_stop` (`cancel_import` → `import
+cancelled`): imports run side by side, so their stop is a count (`StopEpoch`) that ends every import begun before it
+and none begun after, rather than a flag to reset under a job about to start.
+
+**Playback ids.** The page builds a stream's id as `session * 2^32 + n` (`playback-id.ts`), the session being what
+`playback_session` hands out per page load; `Playbacks` keeps the highest id begun as the one that should run
+(`fetch_max`) and the highest stopped id (`stopped >= id` ends a stream), so a start that arrives after a newer one, a
+stop that arrives before its start, and a reloaded page whose counter restarted at 1 all resolve by comparison.
+
+**Process start.** `use_bundled_ffmpeg()` sets `KERF_FFMPEG` / `KERF_FFPROBE` and is the **first statement of `run()`**,
+before the runtime, the webview or any thread exists (`set_var` races every concurrent read of the environment);
+logging is not up yet, so it returns what it set and `setup` logs it.
+
+**Library and project commands.** `remove_asset { assetId, force? }` → `{asset, clips_removed, timeline}` (refused while
+a clip of the cut or of a proposal uses the asset unless `force`; the proxies and waveform cache go with the lock
+released), `relink_asset { assetId, newPath }` → `Relinked` (probe with the lock released, `apply_relink` under it,
+`forget_media_caches` released again), `missing_assets` → `MissingAsset[]` (the files are stat-ed with the lock
+released: a share that went away can take long to say so), `paths_exist { paths }` → `boolean[]` (the export dialog's
+overwrite check), `recent_projects`, `open_recent { path }` (a vanished file is dropped from the list, never created —
+`open_project` refuses a path that names nothing too) and `clear_recent_projects`. Staged proposals:
+`apply_staged_subset { entryIds, force? }` → `SubsetApplied`, `undo_staged_edit` → `{label, staged}`,
+`discarded_staged_edit`, `restore_discarded_edits`; `apply_staged_edit`, `apply_staged_subset` and `resolve_task` make the
+proxies again when the proposal also marked assets (a 360 projection). `get_history` and `list_tasks` take optional
+`limit` / `offset` (a window from the newest end, oldest first). Ids that fail to parse name their argument
+(`invalid clip_id "…": not an id …`, `clip_ids[2]` for a list).
+
+**Not verifiable without a display**: whether the *first visible frame* is already painted when `show()` lands (a hidden window may not render until shown, which is why `backgroundColor` exists) and how long the timer-vs-frame race takes per OS — check both on a real desktop. **Setup warms the fonts**: `std::thread::spawn(kerf_core::fonts::warm)` reads the system fonts (hundreds of faces on a Mac) off the first Play of an animated title. `lib.rs::run()` is the entry (`main.rs` just calls it); it owns the
 `Arc<Mutex<Project>>` (cloned into both the Tauri managed state and `mcp::serve`) and
 registers a command per `Project` op — reads (`list_assets`,
 `get_timeline`, `get_asset_metadata`), `import_asset` / `analyze_asset(assetId, steps?)` (`steps`: any of `silence`,
@@ -21,7 +60,7 @@ every probe on a thread of its own, so the open never waits for N ffprobes); the
 inside its `blocking` closure for that reason. `set_settings` re-queues the missing proxies after a
 `proxy_size` / `preview_source` change; `get_timeline_frame`, `get_preview_frame` and `start_playback`
 refuse under Proxy only while a clip's proxy is building, `get_frame` does not), speech-to-text (`transcription_status`,
-`set_speech_model`, `download_speech_model` → emits `model-progress`), ripple mode
+`set_speech_model`, `download_speech_model` → emits `model-progress`; `cancel_model_download` stops it, rejecting `model download cancelled`), ripple mode
 (`get_ripple_mode` / `set_ripple_mode { on }` — both answer the bool, a setting
 that records no revision and returns no timeline), voiceover
 (`voiceover_status`, `prepare_voiceover` / `generate_voiceover` → emit
@@ -135,9 +174,18 @@ not the whole object — only the fields that changed (`{workspaces}`, `{theme}`
 `{keybindings}`, `{cpu_percent}`), merged into the file under a mutex, and only those fields are
 pushed into the engine (so a layout write never re-applies the stored CPU share
 over a `KERF_CPU_PERCENT` override). The write is atomic (temp file in the same
-directory, fsync, rename over), and a file that does not parse is moved aside to
-`settings.corrupt-<unix-ms>.json` before defaults load, so the next save cannot
-destroy an imported theme), `read_text_file` / `write_text_file`
+directory, fsync, rename over) and **happens before the patch is put into force**
+(a write that fails is an error and changes nothing). A file that cannot be read, is not UTF-8,
+is not JSON or is not an object is moved aside to `settings.corrupt-<unix-ms>.json` before defaults
+load, so the next save cannot destroy an imported theme; a file that parses is read **field by field**
+(`parse`): a value that does not fit its field (an unknown enum name, a number out of range, the wrong
+JSON type) is logged and leaves only that field at its default. The file also carries `time_display`
+(`timecode` | `seconds`), `reopen_last_project` and `recent_projects` (newest first, at most 10; kept by
+the app — `open_project`, `open_recent` and `save_project_as` push the path, `recent_projects` drops the
+files that are gone, `clear_recent_projects` empties it — and not writable by a patch).
+`reset_settings` puts every preference back to its default and into force, keeping the old file as
+`settings.reset-<unix-ms>.json` and the recent list (`settings::reset_keep` is the one place to add
+what a reset must not lose); `reveal_settings_file` shows the file in the OS file manager), `read_text_file` / `write_text_file`
 (a theme file the user picked, imported or exported — the only commands that
 read a caller-chosen path, so both take only `.json` paths, refuse a non-regular file, and cap read and write at 1 MiB)
 and `agent_status` (the MCP endpoint, an `error` when the server could not bind — the agent panel then says the port is taken instead of showing a dead endpoint — plus how
@@ -146,13 +194,20 @@ many seconds ago an agent last spoke to it, or `null` if none ever has —
 `initialize` is the one moment an agent is known to be there; a
 streamable-HTTP client holds no connection between calls, so there is no socket
 to report and the panel judges from the age instead of the green dot it used to
-show unconditionally). A **failed render deletes what it wrote** (`discard_partial`, in both
-`export_timeline` and the MCP `export`): only if this run touched the file
-(mtime differs from before), so a failure before ffmpeg opened the output cannot
-delete the earlier export sitting at that path. `export_variants` renders its
-files one `render_variants` call at a time so a failure names the file in flight —
-that one is removed, the finished ones stay. The error carries ffmpeg's stderr
-tail. `start_playback` resolves `Ok` for a stop or supersede but rejects with the
+show unconditionally). A **failed or cancelled render deletes what it wrote**, and the engine does it
+(`kerf_core::discard_partial`, inside `render_with_progress` and so inside `render_variants`; lib.rs
+re-exports `discard_partial` / `file_mtime` only for the MCP `export`): only if this run touched the file
+(mtime differs from before), so a failure or a cancel before ffmpeg opened the output cannot delete the
+earlier export sitting at that path, and the commands neither remove nor compare anything themselves.
+`export_variants` is one `render_variants` call over every file: the one in flight is removed, the finished
+ones stay, and its `VariantProgress` is the `export-progress` event as it is. With `smart_crop` the shots are
+framed first (`sample_framings_with`, `export_cancel` stops it), streaming the same event with `waiting:
+"framing the shots"` so the bar does not sit at 0%. Every output path is checked against the project's own
+files (`Project::check_output_path`, under the lock before the lock-free render: a source file, a capture, a
+proxy, the project database) in `export_timeline`, `export_variants`, `export_cover` and `export_srt`, and
+`require_local_output_path` refuses UNC / network paths (`\\host\share`, `//host/share`, the mixed
+forms and `\\?\UNC\…`; only the verbatim local-drive spelling `\\?\C:\…` passes). The error carries
+ffmpeg's stderr tail. `start_playback` resolves `Ok` for a stop or supersede but rejects with the
 ffmpeg error when a stream someone is still watching dies, so the preview can say
 why it went black. It calls `kerf_core::stream_preview_until` with "superseded or stopped" as the
 cancel, so a stop or a seek also ends the drawing of an animated title's pictures that comes before the
@@ -204,6 +259,44 @@ one enables the command **with no scope of its own** (`allow-default-urls` is a
 separate permission), so it is listed in object form with an `allow` entry for
 `https://github.com/OrellBuehler/kerf/*` — without a scope every `openUrl` call
 comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
+
+**Command index** (every name in `generate_handler!`; the prose above says what they do):
+*project* `project_path`, `new_project`, `open_project`, `save_project_as`, `recent_projects`, `open_recent`,
+`clear_recent_projects`, `take_launch_project`, `show_main_window`; *library* `list_assets`, `get_asset_metadata`,
+`list_fonts`, `import_asset`, `cancel_import`, `remove_asset`, `relink_asset`, `missing_assets`, `paths_exist`,
+`set_asset_projection`; *analysis, proxies, transcription* `analyze_asset`, `cancel_analysis`, `analysis_statuses`,
+`proxy_statuses`, `rebuild_proxy`, `delete_proxy`, `transcription_status`, `set_speech_model`, `download_speech_model`,
+`cancel_model_download`; *voiceover, stems, mixing* `voiceover_status`, `prepare_voiceover`, `generate_voiceover`,
+`cancel_voiceover`, `stems_status`, `separate_stems`, `cancel_stems`, `get_levels`, `cancel_levels`, `plan_music_fit`,
+`fit_music`, `set_track_volume`, `set_track_pan`, `set_master_volume`, `set_master_limiter`, `set_master_duck`;
+*timeline* `get_timeline`, `get_ripple_mode`, `set_ripple_mode`, `cut_clip`, `add_clip`, `split_clip`, `trim_clip`,
+`reorder_clip`, `move_clip`, `move_clips`, `ripple_delete`, `cut_clip_range`, `roll_edit`, `slip_clip`, `slide_clip`,
+`split_remove`, `split_remove_clips`, `insert_clips`, `duplicate_clips`, `remove_clip`, `remove_clips`, `add_track`,
+`remove_track`, `set_track_duck`, `set_track_muted`, `set_track_solo`, `set_track_locked`, `set_clip_enabled`,
+`set_delivery_format`, `concatenate`, `remove_silence`, `snap_to_beats`, `smart_crop`, `cancel_smart_crop`;
+*linked A/V* `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
+`reattach_audio_clips`, `link_clips`, `unlink_clips`; *clip properties* `set_volume`, `set_fade`, `set_speed`,
+`set_transform`, `set_color`, `set_transition`, `set_mask`, `set_video_effects`, `set_audio_effects`, `set_keyframes`,
+`add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`, `copy_keyframes`, `clear_keyframes`, `set_reframe`,
+`clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`; *markers, text, titles, captions* `add_marker`,
+`update_marker`, `remove_marker`, `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
+`add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `validate_svg`, `list_svg_presets`,
+`svg_preset_preview`, `generate_captions`, `clear_captions`, `import_captions`, `import_captions_text`, `export_srt`;
+*history and review* `get_history`, `revision_diff`, `undo`, `redo`, `revert_to`, `get_staged_edit`,
+`get_staged_timeline`, `apply_staged_edit`, `apply_staged_subset`, `discard_staged_edit`, `undo_staged_edit`,
+`discarded_staged_edit`, `restore_discarded_edits`, `list_tasks`, `add_task`, `resolve_task`, `remove_task`;
+*preview and media* `get_frame`, `get_timeline_frame`, `get_preview_frame`, `set_preview_bounds`, `gpu_preview_status`,
+`gpu_preview_diagnostics`, `playback_session`, `start_playback`, `stop_playback`, `get_waveform`, `get_waveform_range`,
+`get_filmstrip`, `get_audio`, `get_energy`; *delivery* `hw_encoders`, `export_timeline`, `export_variants`,
+`cancel_export`, `export_cover`, `cancel_cover_export`, `platform_targets`, `platform_check`, `reveal_path`;
+*agent and app* `mcp_endpoint`, `agent_status`, `get_settings`, `set_settings`, `reset_settings`, `reveal_settings_file`,
+`read_text_file`, `write_text_file`, `log_dir`, `reveal_logs`, `log_frontend`; *detached panels* `popout_expect`,
+`popout_cancel`, `close_popout`, `popout_focus`, `popout_move`.
+**Events**: `project-changed`, `analysis-progress`, `analysis-status`, `proxy-progress`, `proxy-ready`,
+`export-progress`, `import-progress`, `model-progress`, `smart-crop-progress`, `voiceover-progress`, `stems-progress`,
+`gpu-preview-checked`, `popout-closed`, `open-project-file`, `launch-project-missing`. `platform_targets` is wired: the
+Deliver panel's verdict (`platform-verdict.ts`) takes the targets from it (`platformTargets()`, asked once) for the size a
+soft frame is made for; the browser harness answers with the mirror in `platforms.ts`.
 
 **Scrubbed frames.** `get_timeline_frame` and the GPU preview's JPEG route go through `AppState.scrub`, one
 `kerf_core::ScrubFrames` per process: the frame of the cut's grid that holds the time, from a bounded cache or from
