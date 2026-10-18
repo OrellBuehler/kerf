@@ -19,12 +19,17 @@
 	import { windows } from '$lib/windows.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import {
+		addMarker,
 		deleteSelection,
 		detachSelection,
+		duplicateClips,
+		holdForPreview,
 		linkSelection,
+		pasteClips,
 		reattachSelection,
 		copyKeyframesOf,
 		pasteKeyframesOnto,
+		report,
 		selectionLinkPlans,
 		splitSelection,
 		trimSelection,
@@ -48,8 +53,7 @@
 	import { cutReadout, moveReadout, trimEdgeMonitor, trimEdgeReadout, trimLimitWhy } from '$lib/gesture-readout';
 	import { diffView, type DiffView } from '$lib/staged-diff';
 	import { applyProposal, discardProposal } from '$lib/proposal-actions';
-	import { PREVIEW_READ_ONLY } from '$lib/state.svelte';
-	import { proposalLine, touchedOnLive } from '$lib/proposal-ui';
+	import { PREVIEW_READ_ONLY_REASON, proposalLine, touchedOnLive } from '$lib/proposal-ui';
 	import { displayTracks, opensAudioGroup } from '$lib/track-order';
 	import { NUDGE_QUIET_MS, nudgeFrames, nudgedStart } from '$lib/nudge';
 	import {
@@ -94,7 +98,7 @@
 	import { linkPartners } from '$lib/link-groups';
 	import { ALT_HINT, linkBadges, marqueeSelectLinked, onlyPartners } from '$lib/link-ui';
 	import { analyzeSubmenuItem } from '$lib/analyze-menu';
-	import { muteItem, removeRows } from '$lib/menu-items';
+	import { heldForPreview, muteItem, removeRows } from '$lib/menu-items';
 	import { doneCount, doneSummary } from '$lib/analysis-steps';
 	import { mediaStatus } from '$lib/media-status.svelte';
 	import { linkedTrimBounds, linkedTrimPreview } from '$lib/linked-trim';
@@ -147,11 +151,6 @@
 	/** A press that would start a gesture while the proposal is on screen: the cut is read-only then, so no
 	 *  gesture starts — it is remembered, and the first move past the slop (or a razor click) says why. */
 	let previewPress = $state<{ x: number; y: number } | null>(null);
-	function reviewing(): boolean {
-		if (!editor.previewingStaged) return false;
-		toast.info(PREVIEW_READ_ONLY);
-		return true;
-	}
 	function holdForReview(e: PointerEvent): boolean {
 		if (!editor.previewingStaged) return false;
 		previewPress = { x: e.clientX, y: e.clientY };
@@ -659,9 +658,9 @@
 
 	const laneTime = (clientX: number, laneLeft: number) => (clientX - laneLeft) / pxPerSec;
 
-	function err(e: unknown) {
-		toast.error(e instanceof Error ? e.message : String(e));
-	}
+	const err = report;
+	/** The rows of a menu that edit the cut, off while the proposal is previewed. */
+	const held = (items: MenuItem[]): MenuItem[] => heldForPreview(items, editor.previewingStaged);
 
 	// The tools, now that the toolbar row is gone: [tool, icon, name, the action whose
 	// key selects it] — the tooltip is read from the keymap, so it shows the key the user
@@ -713,7 +712,7 @@
 		}
 		if (ui.tool === 'razor') {
 			e.stopPropagation();
-			if (reviewing()) return;
+			if (holdForPreview()) return;
 			// Snapped like any other placement, then held half a frame inside the clip.
 			const at = splitPoint(
 				snapPoint(laneTime(e.clientX, laneLeft), t.id, ''),
@@ -856,6 +855,7 @@
 		scrubbing = false;
 		markDrag = null;
 		markerDrag = null;
+		previewPress = null;
 		// A marquee abandoned gives the selection back as it found it — and the click
 		// that still follows when the button comes up is not a click on the lane
 		// (it would seek, and clear what was just restored).
@@ -1130,7 +1130,7 @@
 		const k = nudgeFrames(e.key, e.shiftKey, fps);
 		if (k === null || t.locked || ui.tool !== 'pointer' || drag || trimDrag || tg) return;
 		// The proposal on screen is read-only: say so rather than start a nudge that cannot be written.
-		if (reviewing()) {
+		if (holdForPreview()) {
 			e.preventDefault();
 			e.stopPropagation();
 			return;
@@ -1173,7 +1173,7 @@
 			if ((e.buttons & 1) === 0) previewPress = null;
 			else if (Math.hypot(e.clientX - p.x, e.clientY - p.y) >= DRAG_SLOP) {
 				previewPress = null;
-				reviewing();
+				holdForPreview();
 			}
 			return;
 		}
@@ -1240,6 +1240,7 @@
 
 	function onPointerUp(e: PointerEvent) {
 		alt = e.altKey;
+		previewPress = null;
 		releaseCapture();
 		if (scrubbing) {
 			scrubbing = false;
@@ -1675,7 +1676,7 @@
 
 	function onLaneDragOver(e: DragEvent, t: Track) {
 		const a = ui.dndAsset;
-		if (!a || a.kind !== t.kind || t.locked) {
+		if (!a || a.kind !== t.kind || t.locked || editor.previewingStaged) {
 			dropGhost = null; // wrong-kind track: not a drop target
 			return;
 		}
@@ -1700,6 +1701,11 @@
 		dropGhost = null;
 		ui.dndAsset = null;
 		if (!a || a.kind !== t.kind) return;
+		if (editor.previewingStaged) {
+			e.preventDefault();
+			holdForPreview();
+			return;
+		}
 		if (t.locked) {
 			toast.error(`Track ${t.name} is locked`);
 			return;
@@ -1731,11 +1737,11 @@
 	const FADE_DEFAULT = 0.5;
 	function toggleFadeIn() {
 		const c = editor.selectedClip;
-		if (c) void editor.setFade(c.id, c.fade_in > 0 ? 0 : FADE_DEFAULT);
+		if (c) void editor.setFade(c.id, c.fade_in > 0 ? 0 : FADE_DEFAULT).catch(err);
 	}
 	function toggleFadeOut() {
 		const c = editor.selectedClip;
-		if (c) void editor.setFade(c.id, undefined, c.fade_out > 0 ? 0 : FADE_DEFAULT);
+		if (c) void editor.setFade(c.id, undefined, c.fade_out > 0 ? 0 : FADE_DEFAULT).catch(err);
 	}
 
 	// ---- context menus -------------------------------------------------------
@@ -1768,27 +1774,29 @@
 
 	function trackItems(t: Track): MenuItem[] {
 		return [
-			{ label: 'Add video track', icon: 'video', action: () => onAddTrack('video') },
-			{ label: 'Add audio track', icon: 'audio-waveform', action: () => onAddTrack('audio') },
-			{ type: 'separator' },
-			{
-				...muteItem(t),
-				action: () => void editor.setTrackMuted(t.id, !t.muted).catch(err)
-			},
-			{
-				label: t.solo ? 'Clear solo' : 'Solo track',
-				icon: 'headphones',
-				action: () => void editor.setTrackSolo(t.id, !t.solo).catch(err)
-			},
-			{
-				label: t.locked ? 'Unlock track' : 'Lock track',
-				icon: 'lock',
-				action: () => void editor.setTrackLocked(t.id, !t.locked).catch(err)
-			},
+			...held([
+				{ label: 'Add video track', icon: 'video', action: () => onAddTrack('video') },
+				{ label: 'Add audio track', icon: 'audio-waveform', action: () => onAddTrack('audio') },
+				{ type: 'separator' },
+				{
+					...muteItem(t),
+					action: () => void editor.setTrackMuted(t.id, !t.muted).catch(err)
+				},
+				{
+					label: t.solo ? 'Clear solo' : 'Solo track',
+					icon: 'headphones',
+					action: () => void editor.setTrackSolo(t.id, !t.solo).catch(err)
+				},
+				{
+					label: t.locked ? 'Unlock track' : 'Lock track',
+					icon: 'lock',
+					action: () => void editor.setTrackLocked(t.id, !t.locked).catch(err)
+				}
+			]),
 			{ type: 'separator' },
 			...heightItems(t),
 			{ type: 'separator' },
-			{ label: `Remove track ${t.name}`, icon: 'trash', danger: true, action: () => onRemoveTrack(t) }
+			...held([{ label: `Remove track ${t.name}`, icon: 'trash', danger: true, action: () => onRemoveTrack(t) }])
 		];
 	}
 
@@ -1828,27 +1836,29 @@
 			editor.assets.find((a) => a.id === c.asset_id)
 		);
 		contextMenu.show(e, [
-			{
-				label: n > 1 ? 'Split selected at playhead' : 'Split at playhead',
-				icon: 'Scissors',
-				shortcut: settings.shortcut('edit.split'),
-				disabled: !within || !!t.locked,
-				reason: !within ? 'Move the playhead into this clip first' : t.locked ? `Track ${t.name} is locked` : undefined,
-				// The playhead can be anywhere between frames; the cut is on one (`planPlayheadSplit`).
-				action: () => void splitSelection()
-			},
-			{
-				label: n > 1 ? 'Trim starts to playhead' : 'Trim start to playhead',
-				shortcut: settings.shortcut('edit.trimStart'),
-				disabled: !within || !!t.locked,
-				action: () => void trimSelection('left')
-			},
-			{
-				label: n > 1 ? 'Trim ends to playhead' : 'Trim end to playhead',
-				shortcut: settings.shortcut('edit.trimEnd'),
-				disabled: !within || !!t.locked,
-				action: () => void trimSelection('right')
-			},
+			...held([
+				{
+					label: n > 1 ? 'Split selected at playhead' : 'Split at playhead',
+					icon: 'Scissors',
+					shortcut: settings.shortcut('edit.split'),
+					disabled: !within || !!t.locked,
+					reason: !within ? 'Move the playhead into this clip first' : t.locked ? `Track ${t.name} is locked` : undefined,
+					// The playhead can be anywhere between frames; the cut is on one (`planPlayheadSplit`).
+					action: () => void splitSelection()
+				},
+				{
+					label: n > 1 ? 'Trim starts to playhead' : 'Trim start to playhead',
+					shortcut: settings.shortcut('edit.trimStart'),
+					disabled: !within || !!t.locked,
+					action: () => void trimSelection('left')
+				},
+				{
+					label: n > 1 ? 'Trim ends to playhead' : 'Trim end to playhead',
+					shortcut: settings.shortcut('edit.trimEnd'),
+					disabled: !within || !!t.locked,
+					action: () => void trimSelection('right')
+				}
+			]),
 			{ type: 'separator' },
 			{
 				label: n > 1 ? `Copy ${n} clips` : 'Copy',
@@ -1859,124 +1869,124 @@
 					if (k) toast(k === 1 ? 'Clip copied' : `${k} clips copied`);
 				}
 			},
-			{
-				label: n > 1 ? `Duplicate ${n} clips` : 'Duplicate',
-				shortcut: settings.shortcut('edit.duplicate'),
-				action: () =>
-					void editor
-						.duplicateSelection()
-						.then((k) => k && toast(k === 1 ? 'Clip duplicated' : `${k} clips duplicated`))
-						.catch(err)
-			},
-			{ type: 'separator' },
-			...(lp.detach.show
-				? [
-						{
-							label: lp.detach.label,
-							icon: 'volume-x',
-							shortcut: settings.shortcut('edit.detachAudio'),
-							disabled: lp.detach.reason !== null,
-							reason: lp.detach.reason ?? undefined,
-							action: () => void detachSelection()
-						} satisfies MenuItem
-					]
-				: []),
-			...(lp.reattach.show
-				? [
-						{
-							label: lp.reattach.label,
-							icon: 'audio-waveform',
-							shortcut: settings.shortcut('edit.reattachAudio'),
-							disabled: lp.reattach.reason !== null,
-							reason: lp.reattach.reason ?? undefined,
-							action: () => void reattachSelection()
-						} satisfies MenuItem
-					]
-				: []),
-			{
-				label: lp.link.label,
-				icon: 'link',
-				shortcut: settings.shortcut('edit.link'),
-				disabled: lp.link.reason !== null,
-				reason: lp.link.reason ?? undefined,
-				action: () => void linkSelection()
-			},
-			{
-				label: lp.unlink.label,
-				icon: 'unlink',
-				shortcut: settings.shortcut('edit.unlink'),
-				disabled: lp.unlink.reason !== null,
-				reason: lp.unlink.reason ?? undefined,
-				action: () => void unlinkSelection()
-			},
+			...held([
+				{
+					label: n > 1 ? `Duplicate ${n} clips` : 'Duplicate',
+					shortcut: settings.shortcut('edit.duplicate'),
+					action: () => void duplicateClips()
+				},
+				{ type: 'separator' },
+				...(lp.detach.show
+					? [
+							{
+								label: lp.detach.label,
+								icon: 'volume-x',
+								shortcut: settings.shortcut('edit.detachAudio'),
+								disabled: lp.detach.reason !== null,
+								reason: lp.detach.reason ?? undefined,
+								action: () => void detachSelection()
+							} satisfies MenuItem
+						]
+					: []),
+				...(lp.reattach.show
+					? [
+							{
+								label: lp.reattach.label,
+								icon: 'audio-waveform',
+								shortcut: settings.shortcut('edit.reattachAudio'),
+								disabled: lp.reattach.reason !== null,
+								reason: lp.reattach.reason ?? undefined,
+								action: () => void reattachSelection()
+							} satisfies MenuItem
+						]
+					: []),
+				{
+					label: lp.link.label,
+					icon: 'link',
+					shortcut: settings.shortcut('edit.link'),
+					disabled: lp.link.reason !== null,
+					reason: lp.link.reason ?? undefined,
+					action: () => void linkSelection()
+				},
+				{
+					label: lp.unlink.label,
+					icon: 'unlink',
+					shortcut: settings.shortcut('edit.unlink'),
+					disabled: lp.unlink.reason !== null,
+					reason: lp.unlink.reason ?? undefined,
+					action: () => void unlinkSelection()
+				}
+			]),
 			{ type: 'separator' },
 			...clipAnalysisItems(c, e),
 			{ type: 'separator' },
-			...(fit.show
-				? [
-						{
-							label: 'Fit to video…',
-							icon: 'music',
-							disabled: fit.reason !== null,
-							reason: fit.reason ?? undefined,
-							action: () => ui.openFitMusic(c.id)
-						} satisfies MenuItem
-					]
-				: []),
-			...(stems.show
-				? [
-						{
-							label: 'Separate stems under this clip…',
-							icon: 'layers',
-							disabled: stems.reason !== null,
-							reason: stems.reason ?? undefined,
-							action: () => ui.openStems(c.asset_id, c.id)
-						} satisfies MenuItem
-					]
-				: []),
-			...(fit.show || stems.show ? [{ type: 'separator' } satisfies MenuItem] : []),
-			{
-				label: 'Copy keyframes',
-				icon: 'diamond',
-				disabled: kf.copy.disabled,
-				reason: kf.copy.reason,
-				action: () => copyKeyframesOf(c.id)
-			},
-			{
-				label: 'Paste keyframes',
-				icon: 'clipboard',
-				disabled: kf.paste.disabled,
-				reason: kf.paste.reason,
-				action: () => void pasteKeyframesOnto(c.id)
-			},
-			{ type: 'separator' },
-			{
-				label: enabled ? 'Disable clip' : 'Enable clip',
-				icon: enabled ? 'eye-off' : 'eye',
-				disabled: !!t.locked,
-				action: () => void editor.setClipEnabled(c.id, !enabled).catch(err)
-			},
-			{ type: 'separator' },
-			{
-				label: c.fade_in > 0 ? 'Remove fade-in' : 'Add fade-in',
-				action: () => void editor.setFade(c.id, c.fade_in > 0 ? 0 : FADE_DEFAULT).catch(err)
-			},
-			{
-				label: c.fade_out > 0 ? 'Remove fade-out' : 'Add fade-out',
-				action: () => void editor.setFade(c.id, undefined, c.fade_out > 0 ? 0 : FADE_DEFAULT).catch(err)
-			},
-			{ type: 'separator' },
-			// "Only this clip" deletes the picture and keeps its sound, or the other way round: `link: false`.
-			...removeRows({
-				count: n,
-				linked,
-				locked: !!t.locked,
-				trackName: t.name,
-				removeKey: settings.shortcut('edit.delete'),
-				rippleKey: settings.shortcut('edit.rippleDelete'),
-				remove: (ripple) => removeClip(c.id, ripple),
-				removeAlone: (ripple) => removeAlone(c.id, ripple)
-			})
+			...held([
+				...(fit.show
+					? [
+							{
+								label: 'Fit to video…',
+								icon: 'music',
+								disabled: fit.reason !== null,
+								reason: fit.reason ?? undefined,
+								action: () => ui.openFitMusic(c.id)
+							} satisfies MenuItem
+						]
+					: []),
+				...(stems.show
+					? [
+							{
+								label: 'Separate stems under this clip…',
+								icon: 'layers',
+								disabled: stems.reason !== null,
+								reason: stems.reason ?? undefined,
+								action: () => ui.openStems(c.asset_id, c.id)
+							} satisfies MenuItem
+						]
+					: []),
+				...(fit.show || stems.show ? [{ type: 'separator' } satisfies MenuItem] : []),
+				{
+					label: 'Copy keyframes',
+					icon: 'diamond',
+					disabled: kf.copy.disabled,
+					reason: kf.copy.reason,
+					action: () => copyKeyframesOf(c.id)
+				},
+				{
+					label: 'Paste keyframes',
+					icon: 'clipboard',
+					disabled: kf.paste.disabled,
+					reason: kf.paste.reason,
+					action: () => void pasteKeyframesOnto(c.id)
+				},
+				{ type: 'separator' },
+				{
+					label: enabled ? 'Disable clip' : 'Enable clip',
+					icon: enabled ? 'eye-off' : 'eye',
+					disabled: !!t.locked,
+					action: () => void editor.setClipEnabled(c.id, !enabled).catch(err)
+				},
+				{ type: 'separator' },
+				{
+					label: c.fade_in > 0 ? 'Remove fade-in' : 'Add fade-in',
+					action: () => void editor.setFade(c.id, c.fade_in > 0 ? 0 : FADE_DEFAULT).catch(err)
+				},
+				{
+					label: c.fade_out > 0 ? 'Remove fade-out' : 'Add fade-out',
+					action: () => void editor.setFade(c.id, undefined, c.fade_out > 0 ? 0 : FADE_DEFAULT).catch(err)
+				},
+				{ type: 'separator' },
+				// "Only this clip" deletes the picture and keeps its sound, or the other way round: `link: false`.
+				...removeRows({
+					count: n,
+					linked,
+					locked: !!t.locked,
+					trackName: t.name,
+					removeKey: settings.shortcut('edit.delete'),
+					rippleKey: settings.shortcut('edit.rippleDelete'),
+					remove: (ripple) => removeClip(c.id, ripple),
+					removeAlone: (ripple) => removeAlone(c.id, ripple)
+				})
+			])
 		]);
 	}
 
@@ -2257,13 +2267,15 @@
 		contextMenu.show(e, [
 			{ label: 'Go to start', icon: 'skip-back', action: () => ui.seek(o.start, { snap: 'up', end: o.end }) },
 			{ type: 'separator' },
-			{
-				label: o.generated ? 'Remove caption' : 'Remove title',
-				icon: 'trash',
-				danger: true,
-				shortcut: settings.shortcut('edit.delete'),
-				action: () => void editor.removeOverlay(o.id).catch(err)
-			}
+			...held([
+				{
+					label: o.generated ? 'Remove caption' : 'Remove title',
+					icon: 'trash',
+					danger: true,
+					shortcut: settings.shortcut('edit.delete'),
+					action: () => void editor.removeOverlay(o.id).catch(err)
+				}
+			])
 		]);
 	}
 
@@ -2272,23 +2284,27 @@
 		editor.selectSvgOverlay(o.id);
 		contextMenu.show(e, [
 			{ label: 'Go to start', icon: 'skip-back', action: () => ui.seek(o.start, { snap: 'up', end: o.end }) },
-			...(o.preset
-				? []
-				: [
-						{
-							label: 'Edit SVG source',
-							icon: 'code-xml',
-							action: () => (ui.svgSourceFocus = o.id)
-						} satisfies MenuItem
-					]),
+			...held(
+				o.preset
+					? []
+					: [
+							{
+								label: 'Edit SVG source',
+								icon: 'code-xml',
+								action: () => (ui.svgSourceFocus = o.id)
+							}
+						]
+			),
 			{ type: 'separator' },
-			{
-				label: 'Remove animated title',
-				icon: 'trash',
-				danger: true,
-				shortcut: settings.shortcut('edit.delete'),
-				action: () => void editor.removeSvgOverlay(o.id).catch(err)
-			}
+			...held([
+				{
+					label: 'Remove animated title',
+					icon: 'trash',
+					danger: true,
+					shortcut: settings.shortcut('edit.delete'),
+					action: () => void editor.removeSvgOverlay(o.id).catch(err)
+				}
+			])
 		]);
 	}
 
@@ -2298,25 +2314,27 @@
 		// controls in Titles carry the same import with every clip to choose from.
 		const { entries, more } = importMenuEntries(importableAssets(editor.timeline, editor.assets));
 		contextMenu.show(e, [
-			{ label: 'Add title at playhead', icon: 'captions', action: addTitleHere },
-			...SVG_PRESETS.map(
-				(p): MenuItem => ({
-					label: `Add animated ${p.label.toLowerCase()}`,
-					icon: 'orbit',
-					disabled: editor.busy,
-					action: () => void addAnimatedTitle(p.kind)
-				})
-			),
-			{ label: 'Add custom SVG title…', icon: 'code-xml', disabled: editor.busy, action: () => void addCustomSvgTitle() },
-			{ type: 'separator' },
-			...entries.map(
-				(m): MenuItem => ({
-					label: m.label,
-					icon: 'file-text',
-					disabled: editor.busy,
-					action: () => void importCaptionFile(m.choice)
-				})
-			),
+			...held([
+				{ label: 'Add title at playhead', icon: 'captions', action: addTitleHere },
+				...SVG_PRESETS.map(
+					(p): MenuItem => ({
+						label: `Add animated ${p.label.toLowerCase()}`,
+						icon: 'orbit',
+						disabled: editor.busy,
+						action: () => void addAnimatedTitle(p.kind)
+					})
+				),
+				{ label: 'Add custom SVG title…', icon: 'code-xml', disabled: editor.busy, action: () => void addCustomSvgTitle() },
+				{ type: 'separator' },
+				...entries.map(
+					(m): MenuItem => ({
+						label: m.label,
+						icon: 'file-text',
+						disabled: editor.busy,
+						action: () => void importCaptionFile(m.choice)
+					})
+				)
+			]),
 			...(more > 0
 				? [{ type: 'info', label: `${more} more clip${more === 1 ? '' : 's'}`, value: 'in Titles' } satisfies MenuItem]
 				: [])
@@ -2362,7 +2380,7 @@
 	let markerDrag: { id: string; time: number } | null = $state(null);
 	let renaming = $state<string | null>(null);
 
-	const addMarkerHere = () => void editor.addMarkerAtPlayhead(ui.time).catch(err);
+	const addMarkerHere = () => void addMarker();
 
 	function onMarkerPointerDown(e: PointerEvent, m: Marker) {
 		if (e.button !== 0 || renaming === m.id) return;
@@ -2385,14 +2403,16 @@
 		e.stopPropagation();
 		contextMenu.show(e, [
 			{ label: 'Go to marker', icon: 'bookmark', action: () => ui.seek(m.time) },
-			{ label: 'Rename', action: () => (renaming = m.id) },
-			{ type: 'separator' },
-			{
-				label: 'Remove marker',
-				icon: 'trash',
-				danger: true,
-				action: () => void editor.removeMarker(m.id).catch(err)
-			}
+			...held([
+				{ label: 'Rename', action: () => (renaming = m.id) },
+				{ type: 'separator' },
+				{
+					label: 'Remove marker',
+					icon: 'trash',
+					danger: true,
+					action: () => void editor.removeMarker(m.id).catch(err)
+				}
+			])
 		]);
 	}
 
@@ -2400,27 +2420,25 @@
 	// and lane menus stopPropagation, so only the bare background reaches this.
 	function onTimelineContextMenu(e: MouseEvent) {
 		contextMenu.show(e, [
-			{ label: 'Add video track', icon: 'video', action: () => onAddTrack('video') },
-			{ label: 'Add audio track', icon: 'audio-waveform', action: () => onAddTrack('audio') },
-			{ type: 'separator' },
-			{
-				label: editor.clipboard.length > 1 ? `Paste ${editor.clipboard.length} clips` : 'Paste',
-				icon: 'copy',
-				shortcut: settings.shortcut('edit.paste'),
-				disabled: editor.clipboard.length === 0,
-				action: () =>
-					void editor
-						.paste(ui.time)
-						.then((k) => k && toast(k === 1 ? 'Clip pasted' : `${k} clips pasted`))
-						.catch(err)
-			},
-			{ type: 'separator' },
-			{
-				label: 'Add marker at playhead',
-				icon: 'bookmark',
-				shortcut: settings.shortcut('marker.add'),
-				action: addMarkerHere
-			},
+			...held([
+				{ label: 'Add video track', icon: 'video', action: () => onAddTrack('video') },
+				{ label: 'Add audio track', icon: 'audio-waveform', action: () => onAddTrack('audio') },
+				{ type: 'separator' },
+				{
+					label: editor.clipboard.length > 1 ? `Paste ${editor.clipboard.length} clips` : 'Paste',
+					icon: 'copy',
+					shortcut: settings.shortcut('edit.paste'),
+					disabled: editor.clipboard.length === 0,
+					action: () => void pasteClips()
+				},
+				{ type: 'separator' },
+				{
+					label: 'Add marker at playhead',
+					icon: 'bookmark',
+					shortcut: settings.shortcut('marker.add'),
+					action: addMarkerHere
+				}
+			]),
 			{ type: 'separator' },
 			{
 				label: ui.snap ? 'Disable snapping' : 'Enable snapping',
@@ -2551,8 +2569,22 @@
 				)}
 			{/each}
 			<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
-			{@render toolBtn(settings.tip('Undo', 'edit.undo'), 'Undo', 'undo', null, () => void editor.undo(), !editor.canUndo)}
-			{@render toolBtn(settings.tip('Redo', 'edit.redo'), 'Redo', 'redo', null, () => void editor.redo(), !editor.canRedo)}
+			{@render toolBtn(
+				editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : settings.tip('Undo', 'edit.undo'),
+				'Undo',
+				'undo',
+				null,
+				() => void editor.undo(),
+				!editor.canUndo || editor.previewingStaged
+			)}
+			{@render toolBtn(
+				editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : settings.tip('Redo', 'edit.redo'),
+				'Redo',
+				'redo',
+				null,
+				() => void editor.redo(),
+				!editor.canRedo || editor.previewingStaged
+			)}
 		</div>
 		{#if editor.busy}<Badge tone="agent" dot>working…</Badge>{/if}
 		{#if editor.selectedClips.length > 1}
@@ -2586,15 +2618,17 @@
 					>Fade</span
 				>
 				<ToolbarToggle
-					title="Toggle a {FADE_DEFAULT}s fade-in on the selected clip"
+					title={editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : `Toggle a ${FADE_DEFAULT}s fade-in on the selected clip`}
 					label="Fade in"
 					pressed={sc.fade_in > 0}
+					disabled={editor.previewingStaged}
 					onclick={toggleFadeIn}>in</ToolbarToggle
 				>
 				<ToolbarToggle
-					title="Toggle a {FADE_DEFAULT}s fade-out on the selected clip"
+					title={editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : `Toggle a ${FADE_DEFAULT}s fade-out on the selected clip`}
 					label="Fade out"
 					pressed={sc.fade_out > 0}
+					disabled={editor.previewingStaged}
 					onclick={toggleFadeOut}>out</ToolbarToggle
 				>
 			</span>
@@ -2689,16 +2723,27 @@
 			</span>
 			<span style="width:1px;height:16px;background:var(--border-strong);margin:0 4px"></span>
 			<span style="display:inline-flex;align-items:center;gap:6px">
-				<ToolbarToggle title="Add a video track" onclick={() => onAddTrack('video')}>+ V</ToolbarToggle>
-				<ToolbarToggle title="Add an audio track" onclick={() => onAddTrack('audio')}>+ A</ToolbarToggle>
+				<ToolbarToggle
+					title={editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : 'Add a video track'}
+					disabled={editor.previewingStaged}
+					onclick={() => onAddTrack('video')}>+ V</ToolbarToggle
+				>
+				<ToolbarToggle
+					title={editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : 'Add an audio track'}
+					disabled={editor.previewingStaged}
+					onclick={() => onAddTrack('audio')}>+ A</ToolbarToggle
+				>
 				<!-- The frame the cut is made for: the preview is this shape, and so is the export. -->
 				<ToolbarToggle
-					title={delivery.format
+					title={editor.previewingStaged
+						? PREVIEW_READ_ONLY_REASON
+						: delivery.format
 						? `Delivering ${delivery.format.width}\u00d7${delivery.format.height} — ${fitLabel(delivery.format.fit)}. Click to change.`
 						: 'The frame follows the footage. Click to cut for a delivery shape.'}
 					icon="crop"
 					iconSize={12}
 					on={!!delivery.format}
+					disabled={editor.previewingStaged}
 					aria-haspopup="menu"
 					onclick={pickDelivery}>{delivery.label}</ToolbarToggle
 				>
@@ -2919,7 +2964,7 @@
 								max="1"
 								step="0.005"
 								value={gainToFader(t.volume ?? 1)}
-								disabled={editor.busy}
+								disabled={editor.locked}
 								aria-label="{t.name} level"
 								use:tip={`Level ${gainLabel(t.volume ?? 1)} — double-click for unity`}
 								onchange={(e) => void editor.setTrackVolume(t.id, faderToGain(+e.currentTarget.value)).catch(err)}
@@ -2932,7 +2977,7 @@
 								max="1"
 								step="0.05"
 								value={t.pan ?? 0}
-								disabled={editor.busy}
+								disabled={editor.locked}
 								aria-label="{t.name} pan"
 								use:tip={`Pan ${panLabel(t.pan ?? 0)} — double-click to centre`}
 								onchange={(e) => void editor.setTrackPan(t.id, +e.currentTarget.value).catch(err)}
@@ -3000,7 +3045,7 @@
 					<span
 						data-tick-label
 						style="position:absolute;left:{t.t * pxPerSec + 4}px;top:5px;font-family:var(--font-mono);font-size:10px;line-height:12px;color:var(--text-muted);pointer-events:none;white-space:nowrap"
-						>{tickLabel(t.k, grid, editor.fps)}</span
+						>{tickLabel(t.k, grid, editor.fps, timeDisplay.mode)}</span
 					>
 				{/each}
 				{#each sceneXs as x (x)}

@@ -182,6 +182,42 @@ describe('reading the proposal', () => {
 		expect(editor.staged).not.toBeNull();
 	});
 
+	test('a newer read that failed does not throw away an older one that succeeded', async () => {
+		let release!: (v: StagedEdit | null) => void;
+		const slow = new Promise<StagedEdit | null>((r) => (release = r));
+		stagedReads = [() => slow, () => Promise.reject(new Error('busy'))];
+		const older = editor.refreshStaged();
+		await editor.refreshStaged();
+		expect(editor.staged?.diff.entries.length).toBe(1);
+		release(staged(7));
+		await older;
+		expect(editor.staged?.diff.entries.length).toBe(7);
+	});
+
+	test('a read of the old project’s proposal still out when another is loaded does not put it back', async () => {
+		let release!: (v: StagedEdit | null) => void;
+		stagedReads = [() => new Promise<StagedEdit | null>((r) => (release = r))];
+		const old = editor.refreshStaged();
+		stagedNow = null;
+		await editor.load();
+		expect(editor.staged).toBeNull();
+		release(staged(3));
+		await old;
+		expect(editor.staged).toBeNull();
+	});
+
+	test('nor does one that was out when the proposal was applied', async () => {
+		let release!: (v: StagedEdit | null) => void;
+		await editor.previewStaged();
+		stagedReads = [() => new Promise<StagedEdit | null>((r) => (release = r))];
+		const late = editor.refreshStaged();
+		await editor.applyStaged(false);
+		expect(editor.staged).toBeNull();
+		release(staged(2));
+		await late;
+		expect(editor.staged).toBeNull();
+	});
+
 	test('the proposal going away ends a preview that was on', async () => {
 		await editor.previewStaged();
 		stagedNow = null;

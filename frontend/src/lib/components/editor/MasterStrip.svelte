@@ -19,7 +19,7 @@
 	import Icon from './Icon.svelte';
 	import { editor } from '$lib/state.svelte';
 	import { audio } from '$lib/audio';
-	import { toast } from '$lib/notifications.svelte';
+	import { report } from '$lib/ops';
 	import {
 		CEILING_STEP,
 		ceilingLabel,
@@ -38,6 +38,7 @@
 	import type { StereoMeter } from '$lib/meter';
 	import type { SliderKey } from '$lib/slider-gesture';
 	import { readingText, scopeLabel } from '$lib/levels-view';
+	import { timeDisplay } from '$lib/time-display.svelte';
 	import type { MasterBus } from '$lib/types';
 	import type { MeasureResult } from '$lib/editor-ui.svelte';
 	import { fxSummary, loadMasterFxOpen, saveMasterFxOpen } from '$lib/master-fx';
@@ -90,9 +91,7 @@
 		if (master.duck_depth_db != null) lastDepth = master.duck_depth_db;
 	});
 
-	function err(e: unknown) {
-		toast.error(e instanceof Error ? e.message : String(e));
-	}
+	const err = report;
 
 	const APPROX =
 		'The export runs a lookahead limiter (alimiter). The preview plays an approximation — a compressor with a hard knee at the ceiling — so a very hot mix can read a little over it. Measure reads the real thing.';
@@ -316,7 +315,7 @@
 	{#if result}
 		<div class="scope" class:stale>
 			<span use:tip={stale ? 'The cut changed after this was measured — measure again' : undefined}
-				>{stale ? 'Out of date · ' : ''}{scopeLabel(result.range, result.levels.duration)}</span
+				>{stale ? 'Out of date · ' : ''}{scopeLabel(result.range, result.levels.duration, (s) => timeDisplay.fmt(s))}</span
 			>
 			{#if result.levels.estimated}
 				<Badge tone="warning" style="height:16px;padding:0 5px;font-size:var(--text-2xs);margin-top:2px"

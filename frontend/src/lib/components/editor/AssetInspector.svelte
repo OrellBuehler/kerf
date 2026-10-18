@@ -20,7 +20,7 @@
 	import { proxyActions } from '$lib/proxy-info';
 	import { deleteProxy, rebuildProxy } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
-	import { exportTranscriptSrt } from '$lib/ops';
+	import { exportTranscriptSrt, report } from '$lib/ops';
 	import { tip } from '$lib/tip';
 	import type { Asset } from '$lib/types';
 
@@ -42,9 +42,7 @@
 	const act = $derived(proxyActions(proxy));
 	const KIND: Record<string, string> = { video: 'Video', audio: 'Audio', image: 'Still' };
 
-	function err(e: unknown) {
-		toast.error(e instanceof Error ? e.message : String(e));
-	}
+	const err = report;
 </script>
 
 {#snippet row(f: Fact)}

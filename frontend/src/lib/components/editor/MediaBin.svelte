@@ -10,7 +10,7 @@
 	import { editor } from '$lib/state.svelte';
 	import { mediaStatus } from '$lib/media-status.svelte';
 	import { analyzeSubmenuItem } from '$lib/analyze-menu';
-	import { appendAllMedia, exportTranscriptSrt } from '$lib/ops';
+	import { appendAllMedia, exportTranscriptSrt, report } from '$lib/ops';
 		import { proxyActions } from '$lib/proxy-info';
 	import { deleteProxy, rebuildProxy } from '$lib/api';
 	import { contextMenu } from '$lib/context-menu.svelte';
@@ -67,9 +67,7 @@
 		void editor.select(assetId);
 	}
 
-	function err(e: unknown) {
-		toast.error(e instanceof Error ? e.message : String(e));
-	}
+	const err = report;
 
 	// Drag an asset out of the bin; the timeline lanes accept the drop and add a
 	// clip. `ui.dndAsset` carries the payload (dataTransfer is opaque on dragover).

@@ -259,3 +259,38 @@ describe('frame ticks', () => {
 		expect(frameTicksIn(0, 1e6, 30, 2000, 300).length).toBe(300);
 	});
 });
+
+describe('tickLabel in seconds mode', () => {
+	test('a whole-second step is m:ss, h:mm:ss from an hour, and never a tenth it does not have', () => {
+		const g = rulerGrid(8, 30);
+		expect(g.frames).toBe(false);
+		expect(tickLabel(0, g, 30, 'seconds')).toBe('0:00');
+		const five = { step: 5, frames: false, divisions: 1 };
+		expect(tickLabel(13, five, 30, 'seconds')).toBe('1:05');
+		expect(tickLabel(720, five, 30, 'seconds')).toBe('1:00:00');
+		expect(tickLabel(721, five, 30, 'seconds')).toBe('1:00:05');
+	});
+
+	test('a step of a timecode second at 29.97 is labelled by the second it is nearest', () => {
+		const g = { step: 30 / 29.97, frames: false, divisions: 1 };
+		expect(tickLabel(59, g, 29.97, 'seconds')).toBe('0:59');
+		expect(tickLabel(60, g, 29.97, 'seconds')).toBe('1:00');
+	});
+
+	test('below a second the fraction is there, to the millisecond, so two frame ticks never read alike', () => {
+		const frame = { step: 1 / 30, frames: true, divisions: 1 };
+		const labels = Array.from({ length: 31 }, (_, k) => tickLabel(k, frame, 30, 'seconds'));
+		expect(new Set(labels).size).toBe(31);
+		expect(labels[1]).toBe('0:00.033');
+		expect(labels[15]).toBe('0:00.5');
+		expect(labels[30]).toBe('0:01.0');
+		expect(tickLabel(3, { step: 0.5, frames: true, divisions: 1 }, 30, 'seconds')).toBe('0:01.5');
+	});
+
+	test('timecode is still the default, and says the same as before', () => {
+		const g = rulerGrid(8, 30);
+		expect(tickLabel(13, { step: 5, frames: false, divisions: 1 }, 30)).toBe('00:01:05');
+		expect(tickLabel(13, { step: 5, frames: false, divisions: 1 }, 30, 'timecode')).toBe('00:01:05');
+		expect(tickLabel(0, g, 30)).toBe(tickLabel(0, g, 30, 'timecode'));
+	});
+});

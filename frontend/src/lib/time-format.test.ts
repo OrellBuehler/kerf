@@ -8,7 +8,8 @@ import {
 	isTimeMode,
 	parseFrameTime,
 	parseTime,
-	roundToFrame
+	roundToFrame,
+	timeHint
 } from './time-format';
 import { formatTimecode } from './timecode';
 import { clock } from './clock';
@@ -129,5 +130,57 @@ describe('what a typed time means', () => {
 		expect(parseFrameTime('4.6', 30)).toBeCloseTo(4.6, 9);
 		expect(parseFrameTime('4.62', 30)).toBeCloseTo(139 / 30, 9);
 		expect(parseFrameTime('nope', 30)).toBeNull();
+	});
+});
+
+describe('a bare colon time is read the way the mode prints one', () => {
+	test('timecode mode: the last field is frames — 1:05 is a second and five frames', () => {
+		expect(parseTime('1:05', 30, 'timecode')).toBeCloseTo(1 + 5 / 30, 9);
+		expect(parseTime('1:05', 30)).toBeCloseTo(1 + 5 / 30, 9);
+		expect(parseTime('1:02:03', 30, 'timecode')).toBeCloseTo(62 + 3 / 30, 9);
+		expect(parseTime('1:75', 30, 'timecode')).toBeNull();
+		expect(parseTime('75:10', 30, 'timecode')).toBeNull();
+	});
+
+	test('seconds mode: M:SS and H:MM:SS — 1:05 is a minute and five seconds', () => {
+		expect(parseTime('1:05', 30, 'seconds')).toBe(65);
+		expect(parseTime('0:12', 30, 'seconds')).toBe(12);
+		expect(parseTime('12:15', 30, 'seconds')).toBe(735);
+		expect(parseTime('1:02:03', 30, 'seconds')).toBe(3723);
+		expect(parseTime('75:10', 30, 'seconds')).toBe(4510);
+	});
+
+	test('seconds mode refuses a field that does not exist', () => {
+		for (const bad of ['1:75', '0:60', '1:61:00', '1:02:75', ':12', '12:', '1::2']) expect([bad, parseTime(bad, 30, 'seconds')]).toEqual([bad, null]);
+	});
+
+	test('what the mode itself prints reads back as the same time', () => {
+		for (const t of [0, 5, 59, 60, 65, 125, 3599, 3600, 3723]) {
+			expect(parseTime(formatTime(t, 30, 'seconds'), 30, 'seconds')).toBe(t);
+			expect(parseTime(formatTime(t, 30, 'timecode'), 30, 'timecode')).toBeCloseTo(t, 9);
+		}
+	});
+
+	test('the spellings that mean one thing are read alike in both modes', () => {
+		for (const mode of ['timecode', 'seconds'] as const) {
+			expect(parseTime('12.5', 30, mode)).toBe(12.5);
+			expect(parseTime('375f', 30, mode)).toBe(12.5);
+			expect(parseTime('0:12.5', 30, mode)).toBe(12.5);
+			expect(parseTime('1:02:03.25', 30, mode)).toBe(3723.25);
+			expect(parseTime('00:00:12:15', 30, mode)).toBe(12.5);
+		}
+	});
+
+	test('a field that is a frame position puts what was typed on a frame, in the mode', () => {
+		expect(parseFrameTime('1:05', 30, 'seconds')).toBe(65);
+		expect(parseFrameTime('1:05', 30, 'timecode')).toBeCloseTo(35 / 30, 9);
+		expect(parseFrameTime('1:75', 30, 'seconds')).toBeNull();
+	});
+
+	test('the hint after a refusal names the spellings of the mode', () => {
+		expect(timeHint('timecode')).toContain('00:00:12:15');
+		expect(timeHint('seconds')).toContain('1:02:03');
+		expect(timeHint('seconds')).not.toContain('00:00:12:15');
+		expect(timeHint()).toBe(timeHint('timecode'));
 	});
 });

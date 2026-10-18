@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { cutSignature, isLocalPreset, quickTarget, silenceOutcome, targetNote } from './quick-edits';
+import { QUICK_EDIT_HELD, cutSignature, heldWhilePreviewing, isLocalPreset, quickTarget, silenceOutcome, targetNote } from './quick-edits';
 import { PRESETS } from './components/editor/data';
 import type { Timeline } from './types';
 
@@ -56,5 +56,16 @@ describe('what the panel says about it', () => {
 	test('the signature tells an edit from a no-op', () => {
 		expect(cutSignature(cut('a', 'b'))).toBe(cutSignature(cut('a', 'b')));
 		expect(cutSignature(cut('a', 'b'))).not.toBe(cutSignature(cut('a')));
+	});
+});
+
+describe('while the proposal is previewed', () => {
+	test('the presets Kerf runs itself are held — they analyze media and read the proposal’s cut — and the queued ones are not', () => {
+		for (const p of PRESETS) expect([p, heldWhilePreviewing(p, true)]).toEqual([p, isLocalPreset(p)]);
+		for (const p of PRESETS) expect(heldWhilePreviewing(p, false)).toBe(false);
+	});
+
+	test('and the reason says what to do', () => {
+		expect(QUICK_EDIT_HELD).toContain('Exit the preview');
 	});
 });

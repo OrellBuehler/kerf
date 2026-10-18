@@ -4,7 +4,7 @@
 // (`timeDisplay.mode = …`); nothing else sets it.
 
 import { editor } from './state.svelte';
-import { DEFAULT_TIME_MODE, formatField, formatRange, formatTime, parseFrameTime, parseTime, type TimeMode } from './time-format';
+import { DEFAULT_TIME_MODE, formatField, formatRange, formatTime, parseFrameTime, parseTime, timeHint, type TimeMode } from './time-format';
 
 class TimeDisplay {
 	mode = $state<TimeMode>(DEFAULT_TIME_MODE);
@@ -24,14 +24,20 @@ class TimeDisplay {
 		return formatField(seconds, fps, this.mode);
 	}
 
-	/** What typed text means in seconds, as typed (not on a frame), or null. */
+	/** What typed text means in seconds, as typed (not on a frame), or null. A bare colon time (`1:05`) is read the
+	 *  way the mode prints one. */
 	parse(text: string, fps: number = editor.fps): number | null {
-		return parseTime(text, fps);
+		return parseTime(text, fps, this.mode);
 	}
 
 	/** What typed text means as a frame position, or null. */
 	parseFrame(text: string, fps: number = editor.fps): number | null {
-		return parseFrameTime(text, fps);
+		return parseFrameTime(text, fps, this.mode);
+	}
+
+	/** The spellings a field takes, for the message after a refusal. */
+	hint(): string {
+		return timeHint(this.mode);
 	}
 }
 

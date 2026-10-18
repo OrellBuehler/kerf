@@ -14,6 +14,7 @@ import { focusableRows, stepRow, typeaheadRow, type NavRow } from './menu-nav';
 import { DELIVERY_PRESETS, fitLabel } from './delivery-formats';
 import { exportButtonState } from './export-button';
 import { PANEL_IDS, PANELS, type PanelId } from './layout';
+import { PREVIEW_READ_ONLY_REASON } from './proposal-ui';
 import { detachBlocked, type PanelLocation } from './popouts';
 import { HEIGHT_PRESETS, PRESET_LABEL, PRESET_PX, type HeightPreset } from './track-heights';
 import { WORKSPACE_SPECS, workspaceSpec, type WorkspaceId } from './workspaces';
@@ -79,6 +80,8 @@ export interface MenuState {
 	detachedPanels: readonly PanelId[];
 	/** The desktop app: some commands have nothing to act on in a browser. */
 	desktop: boolean;
+	/** The agent's proposal is on the timeline, read-only: every entry that edits the cut is off, with the reason. */
+	previewing: boolean;
 }
 
 const sep: MenuEntry = { kind: 'separator' };
@@ -93,6 +96,10 @@ const NEEDS_CLIPS = 'The cut has no clips';
 const DESKTOP_ONLY = 'Available in the desktop app';
 
 export function buildMenus(s: MenuState): MenuDef[] {
+	// An entry that edits the cut: off while the proposal is previewed (the cut on screen is the agent's, not the
+	// project's), whatever else would have made it so. Entries that only look or copy are not passed through this.
+	const hold = <T extends Common>(extra: T): T | { disabled: true; reason: string } =>
+		s.previewing ? { disabled: true, reason: PREVIEW_READ_ONLY_REASON } : extra;
 	const sel = { disabled: !s.hasSelection, reason: s.hasSelection ? undefined : NEEDS_SELECTION };
 	const clips = { disabled: !s.hasClips, reason: s.hasClips ? undefined : NEEDS_CLIPS };
 	const desk = { disabled: !s.desktop, reason: s.desktop ? undefined : DESKTOP_ONLY };
@@ -110,7 +117,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			act('file.save', s.saved ? { label: 'Save project as…' } : {}),
 			sep,
 			act('file.import'),
-			act('file.importCaptions'),
+			act('file.importCaptions', hold({})),
 			sep,
 			act('file.export', { disabled: exportOff.disabled, reason: exportOff.reason }),
 			act('file.saveCover', { ...clips }),
@@ -132,17 +139,17 @@ export function buildMenus(s: MenuState): MenuDef[] {
 		id: 'edit',
 		label: 'Edit',
 		items: [
-			act('edit.undo', { disabled: !s.canUndo }),
-			act('edit.redo', { disabled: !s.canRedo }),
+			act('edit.undo', hold({ disabled: !s.canUndo })),
+			act('edit.redo', hold({ disabled: !s.canRedo })),
 			sep,
-			act('edit.cut', { ...sel }),
+			act('edit.cut', hold({ ...sel })),
 			act('edit.copy', { ...sel }),
-			act('edit.paste'),
-			act('edit.duplicate', { ...sel }),
-			act('edit.split', { ...clips }),
+			act('edit.paste', hold({})),
+			act('edit.duplicate', hold({ ...sel })),
+			act('edit.split', hold({ ...clips })),
 			sep,
-			act('edit.delete', { ...sel }),
-			act('edit.rippleDelete', { ...sel }),
+			act('edit.delete', hold({ ...sel })),
+			act('edit.rippleDelete', hold({ ...sel })),
 			act('edit.selectAll', { ...clips }),
 			sep,
 			{
@@ -154,28 +161,28 @@ export function buildMenus(s: MenuState): MenuDef[] {
 				kind: 'submenu',
 				label: 'Clip',
 				items: [
-					act('edit.trimStart', { ...sel }),
-					act('edit.trimEnd', { ...sel }),
+					act('edit.trimStart', hold({ ...sel })),
+					act('edit.trimEnd', hold({ ...sel })),
 					sep,
-					act('edit.detachAudio', { ...sel }),
-					act('edit.reattachAudio', { ...sel }),
+					act('edit.detachAudio', hold({ ...sel })),
+					act('edit.reattachAudio', hold({ ...sel })),
 					sep,
-					act('edit.link', { ...sel }),
-					act('edit.unlink', { ...sel })
+					act('edit.link', hold({ ...sel })),
+					act('edit.unlink', hold({ ...sel }))
 				]
 			},
 			{
 				kind: 'submenu',
 				label: 'Roll, slip, slide',
 				items: [
-					act('edit.rollBack', { ...clips }),
-					act('edit.rollForward', { ...clips }),
+					act('edit.rollBack', hold({ ...clips })),
+					act('edit.rollForward', hold({ ...clips })),
 					sep,
-					act('edit.slipBack', { ...sel }),
-					act('edit.slipForward', { ...sel }),
+					act('edit.slipBack', hold({ ...sel })),
+					act('edit.slipForward', hold({ ...sel })),
 					sep,
-					act('edit.slideBack', { ...sel }),
-					act('edit.slideForward', { ...sel })
+					act('edit.slideBack', hold({ ...sel })),
+					act('edit.slideForward', hold({ ...sel }))
 				]
 			},
 			sep,
@@ -227,7 +234,8 @@ export function buildMenus(s: MenuState): MenuDef[] {
 						label: p.label === 'Source' ? 'Source shape' : p.label,
 						hint: p.format ? `${p.format.width}×${p.format.height} — ${fitLabel(p.format.fit)}` : p.hint,
 						role: 'radio',
-						checked: s.delivery === p.id
+						checked: s.delivery === p.id,
+						...hold({})
 					})
 				)
 			},

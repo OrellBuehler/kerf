@@ -13,6 +13,13 @@ export const LOCAL_PRESETS: ReadonlySet<string> = new Set(['Remove silences', 'C
 
 export const isLocalPreset = (preset: string): boolean => LOCAL_PRESETS.has(preset);
 
+/** Why a preset that edits the cut is off while the proposal is previewed. */
+export const QUICK_EDIT_HELD = 'Exit the preview first — this edits your cut';
+
+/** Whether a preset is held back: one Kerf runs itself reads the cut on screen, which is the agent's proposal while it is
+ *  previewed, and analyzes media before it writes; a queued one only asks the agent and is never held. */
+export const heldWhilePreviewing = (preset: string, previewing: boolean): boolean => previewing && isLocalPreset(preset);
+
 /** The presets that read one asset (its silences); the others work on the whole cut. */
 const ONE_ASSET = new Set(['Remove silences']);
 

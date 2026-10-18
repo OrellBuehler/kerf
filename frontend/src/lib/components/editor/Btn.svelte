@@ -40,12 +40,12 @@
 	data-variant={variant}
 	data-size={size}
 	style={style || undefined}
-	aria-disabled={pending ? 'true' : undefined}
 	onclick={(e: MouseEvent) => {
 		if (pending) return;
 		(onclick as ((e: MouseEvent) => void) | undefined)?.(e);
 	}}
 	{...rest}
+	aria-disabled={pending ? 'true' : (rest['aria-disabled'] as boolean | 'true' | 'false' | undefined)}
 >
 	{#if icon}<Icon n={icon} s={iconSize ?? 14} />{/if}
 	{@render children?.()}
