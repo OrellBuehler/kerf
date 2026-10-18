@@ -1128,6 +1128,12 @@
 		}
 		const k = nudgeFrames(e.key, e.shiftKey, fps);
 		if (k === null || t.locked || ui.tool !== 'pointer' || drag || trimDrag || tg) return;
+		// The proposal on screen is read-only: say so rather than start a nudge that cannot be written.
+		if (reviewing()) {
+			e.preventDefault();
+			e.stopPropagation();
+			return;
+		}
 		// The arrows are this clip's while it has the keyboard; the playhead's keys stand down for it.
 		e.preventDefault();
 		e.stopPropagation();

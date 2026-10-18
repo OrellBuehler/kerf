@@ -17,7 +17,7 @@
 	import Icon from '$lib/components/editor/Icon.svelte';
 	import Btn from '$lib/components/editor/Btn.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
-	import { editor, EditRefused } from '$lib/state.svelte';
+	import { editor, EditRefused, PreviewReadOnly } from '$lib/state.svelte';
 	import { agent } from '$lib/agent.svelte';
 	import { applyProposal, discardProposal } from '$lib/proposal-actions';
 	import { changeWord } from '$lib/proposal-ui';
@@ -69,7 +69,7 @@
 	import { changeIndex, changePoints, stepChange } from '$lib/staged-diff';
 	import { clampPlayhead, secondFrames, stepFrames } from '$lib/frames';
 	import { isPagingKey, onEditorSurface } from '$lib/focus-area';
-	import type { AnalysisProgress, ModelProgress } from '$lib/types';
+	import type { ModelProgress } from '$lib/types';
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
 	 *  may fire: Space / Delete / J-K-L would edit the live project under it. */
@@ -147,7 +147,9 @@
 		const onRefusal = (ev: PromiseRejectionEvent) => {
 			if (!(ev.reason instanceof EditRefused)) return;
 			ev.preventDefault();
-			toast.error(ev.reason.message);
+			// Previewing a proposal is a state, not a failure.
+			if (ev.reason instanceof PreviewReadOnly) toast.info(ev.reason.message);
+			else toast.error(ev.reason.message);
 		};
 		window.addEventListener('unhandledrejection', onRefusal);
 		unlisteners.push(() => window.removeEventListener('unhandledrejection', onRefusal));
@@ -625,7 +627,7 @@
 		// operate it, so J/K/L still shuttle after a fader was clicked.
 		if (target?.closest('input:not([type="range"]):not([type="checkbox"]):not([type="radio"]), textarea, select, [contenteditable="true"]')) return;
 		const k = e.key.toLowerCase();
-		const operates = k === ' ' || k === 'enter' || (k.startsWith('arrow') && !(e.ctrlKey || e.metaKey || e.altKey));
+		const operates = k === ' ' || k === 'enter' || k.startsWith('arrow');
 		if (operates && target?.closest('input, button, summary, [role="slider"], [role="tab"], [role="menuitem"]')) return;
 		// The menu bar has its own keys; a letter typed in an open menu is a jump to an
 		// entry, not the razor tool (it stops what it takes; this is for what it leaves).

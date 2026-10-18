@@ -167,6 +167,14 @@ export class EditRefused extends Error {
 	}
 }
 
+/** The page's own refusal while the proposal is previewed: not a failure, so it is said as a notice, not an error. */
+export class PreviewReadOnly extends EditRefused {
+	constructor() {
+		super(PREVIEW_READ_ONLY);
+		this.name = 'PreviewReadOnly';
+	}
+}
+
 class EditorState {
 	assets = $state<Asset[]>([]);
 	timeline = $state<Timeline>({ tracks: [] });
@@ -714,7 +722,7 @@ class EditorState {
 		return this.busy || this.previewingStaged;
 	}
 	#assertEditable() {
-		if (this.previewingStaged) throw new EditRefused(PREVIEW_READ_ONLY);
+		if (this.previewingStaged) throw new PreviewReadOnly();
 	}
 
 	/**
@@ -734,6 +742,9 @@ class EditorState {
 			this.#liveTimeline = null;
 			this.#setTimeline(tl);
 			await this.refreshHistory();
+			// The proposal's `stale` flag is the backend's, and an edit just flipped it: re-read it, so the review
+			// says "you have edited since" now and not only when the agent next stages something.
+			if (this.staged && !o.review) await this.refreshStaged();
 		} catch (e) {
 			throw e instanceof EditRefused ? e : new EditRefused(this.#msg(e), e);
 		} finally {
@@ -1227,15 +1238,16 @@ class EditorState {
 	// ---- history (undo / redo / revert) -------------------------------------
 
 	undo() {
-		this.clearSelection();
+		// Refused while the proposal is previewed (`#apply`): the selection it would clear is the proposal's.
+		if (!this.previewingStaged) this.clearSelection();
 		return this.#apply(() => apiUndo());
 	}
 	redo() {
-		this.clearSelection();
+		if (!this.previewingStaged) this.clearSelection();
 		return this.#apply(() => apiRedo());
 	}
 	revertTo(seq: number) {
-		this.clearSelection();
+		if (!this.previewingStaged) this.clearSelection();
 		return this.#apply(() => apiRevertTo(seq));
 	}
 	/** What one revision changed; null where the backend can't say (browser). */

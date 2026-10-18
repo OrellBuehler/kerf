@@ -58,7 +58,7 @@ afterAll(() => {
 	mock.module('./api', () => real);
 });
 
-const { editor, EditRefused, PREVIEW_READ_ONLY } = await import('./state.svelte');
+const { editor, EditRefused, PreviewReadOnly, PREVIEW_READ_ONLY } = await import('./state.svelte');
 
 beforeEach(async () => {
 	calls.length = 0;
@@ -100,6 +100,7 @@ describe('the timeline is read-only while the proposal is on screen', () => {
 	test('an edit is refused before the backend is asked, and the preview stays', async () => {
 		await editor.previewStaged();
 		await expect(editor.split('c1', 3)).rejects.toBeInstanceOf(EditRefused);
+		await expect(editor.split('c1', 3)).rejects.toBeInstanceOf(PreviewReadOnly);
 		await expect(editor.split('c1', 3)).rejects.toThrow(PREVIEW_READ_ONLY);
 		expect(calls).toEqual([]);
 		expect(editor.previewingStaged).toBe(true);
@@ -200,6 +201,20 @@ describe('reading the proposal', () => {
 		await reading;
 		expect(editor.previewingStaged).toBe(false);
 		expect(editor.timeline.tracks[0].clips[0].source_out).toBe(10);
+	});
+});
+
+describe('an edit while a proposal waits', () => {
+	test('re-reads it, so the review says "you have edited since" at once — the stale flag is the backend’s', async () => {
+		expect(editor.staged?.stale).toBe(false);
+		stagedNow = { ...staged(), stale: true };
+		await editor.split('c1', 3);
+		expect(editor.staged?.stale).toBe(true);
+	});
+
+	test('and an apply or a discard does not need to', async () => {
+		await editor.discardStaged();
+		expect(editor.staged).toBeNull();
 	});
 });
 

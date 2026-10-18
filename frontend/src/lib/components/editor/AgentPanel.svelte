@@ -15,7 +15,6 @@
 	import { confirmReplaceCaptions } from '$lib/title-actions';
 	import { QUICK_EDIT_STEPS } from '$lib/analysis-steps';
 	import { applyProposal, discardProposal, inspectChange } from '$lib/proposal-actions';
-	import { changeWord } from '$lib/proposal-ui';
 	import { cutSignature, isLocalPreset, quickTarget, silenceOutcome, targetNote } from '$lib/quick-edits';
 	import { STATUS_MAP, PRESETS } from './data';
 	import { agentLine, showComposerHint } from '$lib/agent-status';
