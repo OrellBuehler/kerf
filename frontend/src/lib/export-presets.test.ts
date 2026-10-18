@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
+	carriesChapters,
+	carriesSubtitles,
 	CONTAINERS,
 	FRAME_RATES,
 	GPU_PRESET_ID,
@@ -152,6 +154,17 @@ describe('the hardware encoders', () => {
 		expect(lossless('libx264')).toContain('-crf 0');
 		expect(lossless('libvpx-vp9')).toContain('-lossless 1');
 		expect(lossless('h264_vaapi')).not.toContain('-crf');
+	});
+
+	test('only containers with a subtitle codec take embedded captions, as the engine validates', () => {
+		const base = applyPreset('web_1080p');
+		expect(carriesSubtitles('mp4') && carriesSubtitles('mov') && carriesSubtitles('mkv') && carriesSubtitles('webm')).toBe(true);
+		expect(carriesSubtitles('gif')).toBe(false);
+		expect(carriesChapters('m4a')).toBe(true);
+		expect(carriesChapters('wav')).toBe(false);
+		expect(validateExport({ ...base, embed_captions: true }, true, true)).toEqual([]);
+		const gif = validateExport({ ...base, container: 'gif', video_codec: 'gif', embed_captions: true }, true, false);
+		expect(gif).toContain("A .gif file can't carry subtitles; write them beside the export instead.");
 	});
 
 	test('VAAPI is an 8-bit 4:2:0 encoder, as the engine validates', () => {

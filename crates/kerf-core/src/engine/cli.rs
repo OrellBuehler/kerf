@@ -3775,6 +3775,26 @@ pub struct ExportOptions {
     pub loudnorm: bool,
     /// Normalize the final mix to a platform's loudness target. Wins over `loudnorm`.
     pub loudness: Option<LoudnessPreset>,
+    /// Mux the cut's captions in as a soft subtitle stream (`mov_text` in mp4 / mov,
+    /// `webvtt` in webm, `srt` in mkv). Refused for a container that carries none.
+    pub embed_captions: bool,
+    /// Write the cut's captions beside the export, one file per format
+    /// (`cut.mp4` → `cut.srt` / `cut.vtt`).
+    pub caption_sidecars: Vec<crate::captions_export::SubtitleFormat>,
+    /// Replace caption files already beside the output (the MCP `export` tool's `overwrite`,
+    /// or the GUI's confirmation); otherwise an export that would is refused.
+    pub overwrite_sidecars: bool,
+    /// Leave the generated captions out of the picture (typed titles are still drawn), for
+    /// a delivery that carries them as a subtitle track or a file instead.
+    pub skip_burned_captions: bool,
+    /// Set by the render, never by a caller: the SubRip file of the cut's captions
+    /// to mux in (see `side_files`).
+    #[serde(skip)]
+    pub subtitle_input: Option<String>,
+    /// Set by the render, never by a caller: the FFMETADATA file of the cut's
+    /// chapter markers to mux in.
+    #[serde(skip)]
+    pub chapters_input: Option<String>,
 }
 
 /// A delivery's loudness target: integrated loudness and the true-peak ceiling.
@@ -3846,6 +3866,12 @@ impl Default for ExportOptions {
             range: None,
             loudnorm: false,
             loudness: None,
+            embed_captions: false,
+            caption_sidecars: Vec::new(),
+            overwrite_sidecars: false,
+            skip_burned_captions: false,
+            subtitle_input: None,
+            chapters_input: None,
         }
     }
 }
@@ -4108,6 +4134,12 @@ pub fn validate_export(opts: &ExportOptions, has_video: bool, has_audio: bool) -
                 issues.push(format!("Invalid audio bitrate \"{b}\"."));
             }
         }
+    }
+    if opts.embed_captions && side_files::subtitle_codec(c).is_none() {
+        issues.push(format!(
+            "A .{} file can't carry subtitles; write them beside the export instead.",
+            c.ext()
+        ));
     }
     issues
 }
@@ -4450,7 +4482,10 @@ fn build_export_args_phase(
 ) -> Result<Vec<String>> {
     // Drop muted / solo-shadowed tracks and disabled clips up front, and cut the range an export
     // of one span draws, so the rest of the builder never has to reason about either.
-    let cut = export_timeline(timeline, opts);
+    let mut cut = export_timeline(timeline, opts);
+    if opts.skip_burned_captions {
+        cut.overlays.retain(|o| !o.generated);
+    }
     let timeline = &cut;
 
     // Stream gating: decide what the graph emits and what we `-map`, in lockstep.
@@ -4490,6 +4525,11 @@ fn build_export_args_phase(
     if want_video {
         svg_layer::push_inputs(&svg_layer::svg_sequences(timeline, &fmt), &fmt, &mut args);
     }
+    let side = if pass == PassPhase::First {
+        side_files::SideInputs::default()
+    } else {
+        side_files::push_inputs(opts, &mut args)
+    };
 
     let total = timeline.duration();
     let graph = build_filter_complex(timeline, assets, &fmt, total, opts, want_video, want_audio, &plan);
@@ -4503,6 +4543,7 @@ fn build_export_args_phase(
         args.push("-map".to_string());
         args.push("[outa]".to_string());
     }
+    side_files::push_maps(&side, &mut args);
 
     // ---- video output options (only when a codec is explicitly chosen; a bare
     // default still maps [outv] and lets ffmpeg pick the encoder, as before) ----
@@ -5362,11 +5403,20 @@ pub fn render_with_progress(
     let Some(_titles) = svg_layer::prepare_export(timeline, assets, opts, progress, cancel)? else {
         return Ok(RenderStatus::Cancelled);
     };
-    retry_export_in_software(
-        opts,
+    // The captions and chapters to mux in are files for the length of the export. The caption
+    // files beside it are checked first and written only once it has completed, so a cancelled or
+    // failed export never touches a file already there.
+    let (opts, _side) = side_files::prepare(timeline, opts)?;
+    side_files::check_sidecars(output, &opts)?;
+    let result = retry_export_in_software(
+        &opts,
         |o, hw_used| render_attempt(timeline, assets, output, o, progress, cancel, hw_used),
         convict_hardware_decode,
-    )
+    )?;
+    if result == RenderStatus::Completed {
+        side_files::write_sidecars(timeline, output, &opts)?;
+    }
+    Ok(result)
 }
 
 /// Run an export attempt, and once more in software when one that asked an input for hardware
@@ -5520,12 +5570,19 @@ fn export_resource(args: &[String], facts_of: &dyn Fn(&str) -> InputFacts, lane_
     }
     // Inputs, in groups: everything up to and including each `-i <path>`.
     let mut group_hwaccel: Option<&str> = None;
+    let mut side_input = false;
     let mut graph: Option<&str> = None;
     let mut inputs = 0;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "-hwaccel" => group_hwaccel = rest.next().map(String::as_str),
+            // The captions and chapters a render muxes in decode no picture.
+            "-f" => side_input = rest.next().is_some_and(|f| side_files::is_side_format(f)),
+            "-i" if side_input => {
+                side_input = false;
+                rest.next();
+            }
             "-i" => {
                 inputs += 1;
                 let Some(path) = rest.next() else { return cpu::Resource::Cpu };
@@ -5614,6 +5671,12 @@ pub struct VariantProgress {
 /// not started never existed. `opts` is the encode shared by all of them; its
 /// `resolution` and `fit` are replaced per variant by the delivery. Returns the
 /// status and how many files were completed.
+/// Refuse an export whose caption files would replace ones already beside `output`, unless
+/// `opts.overwrite_sidecars` allows it. A multi-format export asks this of every variant first.
+pub fn check_caption_sidecars(output: &Path, opts: &ExportOptions) -> Result<()> {
+    side_files::check_sidecars(output, opts)
+}
+
 pub fn render_variants(
     timeline: &Timeline,
     assets: &[Asset],
@@ -8679,6 +8742,10 @@ use still_fx::{still_layers, StillFades};
 
 /// Animated SVG titles as PNG sequences and stills: drawn before ffmpeg is spawned, overlaid by it.
 mod svg_layer;
+
+/// The cut's captions and chapter markers muxed into an export, and the caption
+/// files written beside it.
+mod side_files;
 
 /// Titles through the real ffmpeg (`#[ignore]`d).
 #[cfg(test)]

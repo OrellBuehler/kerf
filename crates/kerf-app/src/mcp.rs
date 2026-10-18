@@ -167,14 +167,14 @@ struct CaptionParams {
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 struct ImportCaptionsParams {
     #[schemars(
-        description = "Absolute path of a .srt, .ass or .ssa subtitle file (at most 5 MiB). Give this or `text`, not both."
+        description = "Absolute path of a .srt, .vtt, .ass or .ssa subtitle file (at most 5 MiB). Give this or `text`, not both."
     )]
     path: Option<String>,
     #[schemars(
         description = "The subtitle file's text itself, for captions you wrote rather than found on disk (SubRip is the easy one to write). Give this or `path`, not both."
     )]
     text: Option<String>,
-    #[schemars(description = "`srt` or `ass`. Omit to detect it from the content, which is almost always right.")]
+    #[schemars(description = "`srt`, `vtt` or `ass`. Omit to detect it from the content, which is almost always right.")]
     format: Option<String>,
     #[schemars(
         description = "Which clock the cue times are on. `timeline` (default): the file is a subtitle track for the finished cut, so a cue at 0:12 shows at 0:12 of the timeline (cues after the cut ends are dropped). `source`: the file times one asset's own footage — a transcript, or subtitles for the uncut recording — and needs asset_id; each cue is projected through every clip of that asset, so it follows trims, reorders and speed changes and a cue whose footage was cut gets no caption. Giving asset_id alone implies `source`."
@@ -692,6 +692,17 @@ struct AddMarkerParams {
     #[schemars(description = "Optional CSS color for the ruler chip")]
     #[serde(default)]
     color: Option<String>,
+    #[schemars(description = "How long the marked span runs from `time`, seconds; 0 is a point marker")]
+    #[serde(default)]
+    duration: Option<f64>,
+    #[schemars(description = "A free-form note (a review comment, a chapter description); an empty string clears it")]
+    #[serde(default)]
+    comment: Option<String>,
+    #[schemars(
+        description = "`comment` (the default: a note on the cut) or `chapter` (starts a chapter: written into the export's chapter list and the YouTube chapter text)"
+    )]
+    #[serde(default)]
+    kind: Option<kerf_core::MarkerKind>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -707,6 +718,17 @@ struct UpdateMarkerParams {
     #[schemars(description = "New CSS color, or an empty string to clear it")]
     #[serde(default)]
     color: Option<String>,
+    #[schemars(description = "How long the marked span runs from `time`, seconds; 0 is a point marker")]
+    #[serde(default)]
+    duration: Option<f64>,
+    #[schemars(description = "A free-form note (a review comment, a chapter description); an empty string clears it")]
+    #[serde(default)]
+    comment: Option<String>,
+    #[schemars(
+        description = "`comment` (the default: a note on the cut) or `chapter` (starts a chapter: written into the export's chapter list and the YouTube chapter text)"
+    )]
+    #[serde(default)]
+    kind: Option<kerf_core::MarkerKind>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1289,6 +1311,48 @@ struct OverlayKeyframesParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ExportCaptionsParams {
+    #[schemars(description = "Absolute local .srt or .vtt file path to write — no URLs or ffmpeg protocol sinks")]
+    output_path: String,
+    #[schemars(description = "`srt` or `vtt`; omit to follow the path's extension")]
+    #[serde(default)]
+    format: Option<kerf_core::SubtitleFormat>,
+    #[schemars(
+        description = "Overwrite an existing file at output_path (default false — the call fails naming the path so you can pick a new one or opt in)"
+    )]
+    overwrite: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ExportInterchangeParams {
+    #[schemars(description = "Absolute local output path (.otio or .edl) — no URLs or ffmpeg protocol sinks")]
+    output_path: String,
+    #[schemars(description = "`otio` (OpenTimelineIO, every track) or `edl` (CMX 3600, one video track)")]
+    format: kerf_core::InterchangeFormat,
+    #[schemars(description = "EDL only: which video track to write, 0 = the first (V1). Default 0.")]
+    #[serde(default)]
+    video_track: Option<usize>,
+    #[schemars(
+        description = "Overwrite an existing file at output_path (default false — the call fails naming the path so you can pick a new one or opt in)"
+    )]
+    overwrite: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ExportMarkersParams {
+    #[schemars(description = "Absolute local output path (.csv or .txt) — no URLs or ffmpeg protocol sinks")]
+    output_path: String,
+    #[schemars(
+        description = "`csv` (every marker as a spreadsheet row, formula-safe) or `youtube` (chapter lines for a video description, from the chapter markers — every marker when none is a chapter)"
+    )]
+    format: kerf_core::MarkerListFormat,
+    #[schemars(
+        description = "Overwrite an existing file at output_path (default false — the call fails naming the path so you can pick a new one or opt in)"
+    )]
+    overwrite: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ExportSrtParams {
     #[schemars(description = "UUID of the asset whose transcript to export")]
     asset_id: String,
@@ -1440,7 +1504,12 @@ struct ExportParams {
                        preset; hwaccel (\"auto\"/\"cuda\"/\"vaapi\"/\"videotoolbox\"/\"qsv\" — GPU \
                        decode, composes with any encoder); resolution ([w,h]); fps; audio_bitrate \
                        (\"192k\"); include_audio; faststart; range ({start,end} timeline seconds — \
-                       render only that span).")]
+                       render only that span); embed_captions (mux the cut's captions in as a soft \
+                       subtitle stream — mp4/mov/mkv/webm only, not shown by default); \
+                       skip_burned_captions (leave the captions out of the picture); caption_sidecars \
+                       ([\"srt\",\"vtt\"] — caption files beside the output, written once the render \
+                       completes; an existing one is refused unless overwrite is true). Chapter markers \
+                       become the file's chapters.")]
     #[serde(default)]
     options: Option<ExportOptions>,
     #[schemars(
@@ -2666,17 +2735,34 @@ impl KerfMcp {
                        the user can see and jump to. Good for reporting findings from skim_asset."
     )]
     fn add_marker(&self, Parameters(p): Parameters<AddMarkerParams>) -> Result<String, McpError> {
+        let patch = kerf_core::MarkerPatch {
+            color: p.color,
+            duration: p.duration,
+            comment: p.comment,
+            kind: p.kind,
+            ..kerf_core::MarkerPatch::default()
+        };
         self.edit(|project| {
-            let marker = project.add_marker(p.time, p.name, p.color).map_err(core_err)?;
+            let marker = project.add_marker_with(p.time, p.name, patch).map_err(core_err)?;
             json(&marker)
         })
     }
 
-    #[tool(description = "Move, rename or recolor a marker; omitted fields are left alone")]
+    #[tool(
+        description = "Move, rename, recolor or re-kind a marker, or set its duration or comment; omitted fields are left alone"
+    )]
     fn update_marker(&self, Parameters(p): Parameters<UpdateMarkerParams>) -> Result<String, McpError> {
         let marker_id = parse_id(&p.marker_id)?;
+        let patch = kerf_core::MarkerPatch {
+            time: p.time,
+            name: p.name,
+            color: p.color,
+            duration: p.duration,
+            comment: p.comment,
+            kind: p.kind,
+        };
         self.edit(|project| {
-            let marker = project.update_marker(marker_id, p.time, p.name, p.color).map_err(core_err)?;
+            let marker = project.edit_marker(marker_id, patch).map_err(core_err)?;
             json(&marker)
         })
     }
@@ -3410,7 +3496,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Caption the cut from a subtitle file: SubRip (.srt) or ASS/SSA (.ass, .ssa), by path or as text you pass in. Cue times are taken as TIMELINE time by default (a subtitle track made for the finished cut); pass base=source with asset_id when the file instead times one asset's own footage (a transcript, subtitles for the uncut recording) and each cue is projected through that asset's clips like a transcript, following trims, reorders and speed changes. Long cues are split into readable lines, sized to fit the delivery frame, never two on screen at once — the same machinery as generate_captions, in the `style` you pick (`word_punch` for a vertical cut). Markup, styles and positions in the file are ignored; unreadable entries are skipped and counted. The captions REPLACE any previously generated or imported ones (a later generate_captions replaces these too — captions are one lane of text), and hand-made titles are left alone. Caption last, like generate_captions: a later edit does not move them. Pass offset (seconds, may be negative) when the file's clock does not start where the picture does. Returns a summary: cues read, placed, skipped_lines, dropped_outside (not on the cut at all: past its end or before its start, or footage that was cut out), dropped_short (on the cut but too brief to read), dropped_overlap (lost its slot to another cue), captions written and replaced. At most 10,000 cues / 100,000 words are read and 20,000 captions written per import — a refused import changes nothing."
+        description = "Caption the cut from a subtitle file: SubRip (.srt), WebVTT (.vtt) or ASS/SSA (.ass, .ssa), by path or as text you pass in. Cue times are taken as TIMELINE time by default (a subtitle track made for the finished cut); pass base=source with asset_id when the file instead times one asset's own footage (a transcript, subtitles for the uncut recording) and each cue is projected through that asset's clips like a transcript, following trims, reorders and speed changes. Long cues are split into readable lines, sized to fit the delivery frame, never two on screen at once — the same machinery as generate_captions, in the `style` you pick (`word_punch` for a vertical cut). Markup, styles and positions in the file are ignored; unreadable entries are skipped and counted. The captions REPLACE any previously generated or imported ones (a later generate_captions replaces these too — captions are one lane of text), and hand-made titles are left alone. Caption last, like generate_captions: a later edit does not move them. Pass offset (seconds, may be negative) when the file's clock does not start where the picture does. Returns a summary: cues read, placed, skipped_lines, dropped_outside (not on the cut at all: past its end or before its start, or footage that was cut out), dropped_short (on the cut but too brief to read), dropped_overlap (lost its slot to another cue), captions written and replaced. At most 10,000 cues / 100,000 words are read and 20,000 captions written per import — a refused import changes nothing."
     )]
     async fn import_captions(&self, Parameters(p): Parameters<ImportCaptionsParams>) -> Result<String, McpError> {
         let asset = p.asset_id.as_deref().map(parse_id).transpose()?;
@@ -3611,6 +3697,68 @@ impl KerfMcp {
         };
         std::fs::write(path, srt).map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(format!("wrote {}", p.output_path))
+    }
+
+    #[tool(
+        description = "Write the cut's captions (the generated / imported caption overlays, timed as the export draws them) to a SubRip (.srt) or WebVTT (.vtt) file. Fails when the cut has no captions. Refuses to overwrite an existing file unless overwrite is true."
+    )]
+    async fn export_captions(&self, Parameters(p): Parameters<ExportCaptionsParams>) -> Result<String, McpError> {
+        crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
+        let path = std::path::PathBuf::from(&p.output_path);
+        refuse_overwrite(&path, p.overwrite.unwrap_or(false))?;
+        let format = match p.format {
+            Some(f) => f,
+            None => kerf_core::SubtitleFormat::from_path(&path).map_err(core_err)?,
+        };
+        let timeline = self.lock().working_timeline().map_err(core_err)?;
+        blocking(move || {
+            let text = Project::captions_document(&timeline, format).map_err(core_err)?;
+            Project::write_document(&path, &text).map_err(core_err)
+        })
+        .await?;
+        Ok(format!("wrote {}", p.output_path))
+    }
+
+    #[tool(
+        description = "Hand the cut to another editor: write it as OpenTimelineIO (.otio: every track, clips, gaps, transitions, speed as LinearTimeWarp, markers, media references to the original files, each clip's full Kerf state in metadata.kerf) or a CMX 3600 EDL (.edl: one video track, frame-quantized at the timeline rate, 8-character reels, dissolves, M2 speed lines, drop-frame timecode at 29.97/59.94). Returns the path and a report of everything the format dropped or approximated (merged, with counts). Refuses to overwrite an existing file unless overwrite is true."
+    )]
+    async fn export_interchange(&self, Parameters(p): Parameters<ExportInterchangeParams>) -> Result<String, McpError> {
+        crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
+        let path = std::path::PathBuf::from(&p.output_path);
+        refuse_overwrite(&path, p.overwrite.unwrap_or(false))?;
+        let inputs = self.lock().delivery_inputs().map_err(core_err)?;
+        let (format, track) = (p.format, p.video_track.unwrap_or(0));
+        let report = blocking(move || {
+            let (text, report) = Project::interchange_document(&inputs, format, track).map_err(core_err)?;
+            Project::write_document(&path, &text).map_err(core_err)?;
+            Ok(report)
+        })
+        .await?;
+        json(&kerf_core::ExportedFile {
+            path: p.output_path,
+            report,
+        })
+    }
+
+    #[tool(
+        description = "Write the markers as a CSV (every marker: name, kind, start/end timecode, seconds, comment, colour; cells that look like spreadsheet formulas are defused) or as YouTube chapter text (`0:00 Intro` lines from the chapter markers; the report says when YouTube would refuse them). Refuses to overwrite an existing file unless overwrite is true."
+    )]
+    async fn export_markers(&self, Parameters(p): Parameters<ExportMarkersParams>) -> Result<String, McpError> {
+        crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
+        let path = std::path::PathBuf::from(&p.output_path);
+        refuse_overwrite(&path, p.overwrite.unwrap_or(false))?;
+        let inputs = self.lock().delivery_inputs().map_err(core_err)?;
+        let format = p.format;
+        let report = blocking(move || {
+            let (text, report) = Project::markers_document(&inputs, format).map_err(core_err)?;
+            Project::write_document(&path, &text).map_err(core_err)?;
+            Ok(report)
+        })
+        .await?;
+        json(&kerf_core::ExportedFile {
+            path: p.output_path,
+            report,
+        })
     }
 
     #[tool(
@@ -4070,7 +4218,10 @@ impl KerfMcp {
     ) -> Result<String, McpError> {
         crate::require_local_output_path(&p.output_path).map_err(|e| McpError::invalid_params(e, None))?;
         refuse_overwrite(std::path::Path::new(&p.output_path), p.overwrite.unwrap_or(false))?;
-        let opts = p.options.unwrap_or_default();
+        let opts = ExportOptions {
+            overwrite_sidecars: p.overwrite.unwrap_or(false),
+            ..p.options.unwrap_or_default()
+        };
         let project = self.project.clone();
         let output_path = p.output_path;
 
@@ -4194,8 +4345,13 @@ impl KerfMcp {
             .map(|d| kerf_core::ExportVariant::beside(&base, *d))
             .collect();
         let overwrite = p.overwrite.unwrap_or(false);
+        let opts = ExportOptions {
+            overwrite_sidecars: overwrite,
+            ..opts
+        };
         for variant in &variants {
             refuse_overwrite(&variant.output, overwrite)?;
+            kerf_core::check_caption_sidecars(&variant.output, &opts).map_err(core_err)?;
         }
         let project = self.project.clone();
 
@@ -4903,12 +5059,17 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              are placed in timeline time, so a later trim or remove_silence moves \
              the words out from under them — re-run generate_captions after any \
              further edit and it replaces its own set, leaving typed titles \
-             alone. import_captions brings in a .srt / .ass / .ssa file instead \
+             alone. import_captions brings in a .srt / .vtt / .ass / .ssa file instead \
              (base=timeline for a subtitle track made for the finished cut, \
              base=source with asset_id for a file that times one asset's own \
              footage) and replaces that same caption set — so it is the caption \
              step too: do it last, and re-run it after further edits. export_srt \
-             writes a subtitle file. \
+             writes an asset's transcript as a subtitle file; export_captions writes \
+             the cut's captions (.srt / .vtt), and export's embed_captions / \
+             caption_sidecars carry them with the render. A marker of kind `chapter` \
+             becomes a chapter of the exported file; export_markers writes the \
+             markers as CSV or YouTube chapters, and export_interchange hands the \
+             cut to another editor as OTIO or a CMX 3600 EDL. \
              For motion graphics beyond a text overlay, add_svg_overlay puts an \
              animated SVG title on the cut: a ready-made preset (list_svg_presets: \
              fade_up, typewriter, lower_third, word_pop, filled in with `params`) \
@@ -4970,7 +5131,8 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              get_music_structure to look first), and set_track_duck plus \
              set_master_duck dips it under dialogue. Call export to render, and export_cover to \
              write the thumbnail the platform shows before anyone presses play. \
-             export / export_srt / export_cover / export_variants all take an \
+             export / export_srt / export_captions / export_interchange / \
+             export_markers / export_cover / export_variants all take an \
              absolute local output path and refuse to overwrite a file that's \
              already there unless you pass overwrite=true.";
 
@@ -5464,7 +5626,7 @@ mod tests {
         assert!(caption_source(srt.to_str(), None).unwrap().contains("Hi"));
         let txt = dir.join("cues.txt");
         std::fs::write(&txt, "x").unwrap();
-        assert!(invalid(caption_source(txt.to_str(), None)).contains(".srt, .ass or .ssa"));
+        assert!(invalid(caption_source(txt.to_str(), None)).contains(".srt, .vtt, .ass or .ssa"));
         assert!(invalid(caption_source(dir.join("missing.srt").to_str(), None)).contains("cannot read"));
         std::fs::remove_dir_all(&dir).unwrap();
     }

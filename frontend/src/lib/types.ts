@@ -594,8 +594,8 @@ export interface CaptionOptions {
 	size?: number;
 }
 
-/** A subtitle format Kerf reads: SubRip (`.srt`) or ASS / SSA (`.ass`, `.ssa`). */
-export type CaptionFormat = 'srt' | 'ass';
+/** A subtitle format Kerf reads: SubRip (`.srt`), WebVTT (`.vtt`) or ASS / SSA (`.ass`, `.ssa`). */
+export type CaptionFormat = 'srt' | 'ass' | 'vtt';
 
 /** Which clock an imported subtitle file's times are on. `timeline`: a subtitle
  *  track made for the finished cut (the default). `source`: the file times one
@@ -783,6 +783,51 @@ export interface Marker {
 	time: number;
 	name: string;
 	color?: string | null;
+	/** How long the marked span runs from `time`, seconds. Absent / 0 is a point. */
+	duration?: number;
+	/** A free-form note. Absent is none. */
+	comment?: string;
+	/** Absent is `comment`. A `chapter` starts a chapter of the exported file. */
+	kind?: MarkerKind;
+}
+
+/** What a marker is for — mirrors `kerf_core::MarkerKind`. */
+export type MarkerKind = 'comment' | 'chapter';
+
+/** A change to a marker; each absent field is left alone. */
+export interface MarkerPatch {
+	time?: number;
+	name?: string;
+	color?: string;
+	duration?: number;
+	comment?: string;
+	kind?: MarkerKind;
+}
+
+/** A subtitle format Kerf writes (`kerf_core::SubtitleFormat`). */
+export type SubtitleFormat = 'srt' | 'vtt';
+
+/** An interchange format (`kerf_core::InterchangeFormat`). */
+export type InterchangeFormat = 'otio' | 'edl';
+
+/** A marker list a delivery carries (`kerf_core::MarkerListFormat`). */
+export type MarkerListFormat = 'csv' | 'youtube';
+
+/** One line of an export `Report`: what was dropped or approximated, and how often. */
+export interface ReportEntry {
+	level: 'info' | 'warning';
+	message: string;
+	count: number;
+}
+
+export interface Report {
+	entries: ReportEntry[];
+}
+
+/** A side-file written, and what its format could not carry (`kerf_core::ExportedFile`). */
+export interface ExportedFile {
+	path: string;
+	report: Report;
 }
 
 /** The frame the project is cut *for* — the shape of the delivered video.
@@ -1051,6 +1096,14 @@ export interface ExportOptions {
 	loudnorm?: boolean;
 	/** Normalize the final mix to a platform's loudness target. Wins over `loudnorm`. */
 	loudness?: LoudnessPreset | null;
+	/** Mux the cut's captions in as a soft subtitle stream (mp4 / mov / mkv / webm). */
+	embed_captions?: boolean;
+	/** Caption files written beside the export (`cut.srt`, `cut.vtt`), once it completes. */
+	caption_sidecars?: SubtitleFormat[];
+	/** Replace caption files already beside the export; otherwise the export is refused. */
+	overwrite_sidecars?: boolean;
+	/** Leave the generated captions out of the picture (typed titles are still drawn). */
+	skip_burned_captions?: boolean;
 }
 
 /** A delivery's loudness target (`kerf_core::LoudnessPreset`): YouTube and Spotify -14 LUFS,

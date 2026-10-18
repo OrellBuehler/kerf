@@ -111,6 +111,37 @@
   plus the overall fraction). Sequential on purpose: an export takes every core
   it is given and `cpu::lease` would serialize them anyway, and a cancel is
   then clean — the file in flight is deleted, the finished ones kept.
+  **Side-files of a delivery** (`project/exports.rs`): `delivery_inputs` snapshots the
+  working timeline, the *original* assets, the render frame rate (`render_geometry`) and the
+  project's name under the lock; the static `captions_document` (refused with no captions;
+  it and `markers_document` read `for_render`, as the export does),
+  `interchange_document` (OTIO / EDL, refused with no clips) and `markers_document` (CSV /
+  YouTube, refused with no markers) build the text with it released, and `write_document`
+  writes it. `edit_marker` / `add_marker_with` take a `MarkerPatch` as one revision.
+  **Interchange** (`interchange/`, pure, no file I/O) returns text plus a `Report` (`Level`
+  info / warning, identical messages merged with a count — FilmCraft's design). **OTIO**
+  (`otio.rs`): every track (`enabled` = not muted), gaps, `Transition.1` from `transition_fx`
+  (a dissolve or motion transition is `in_offset` 0 / `out_offset` the achieved overlap, a
+  dip `d/2` either side, none written for a hard cut), `LinearTimeWarp` for speed, an
+  `ExternalReference` `file://` URL to `Asset::path`, the timeline's markers on the stack, and
+  `metadata.kerf` holding each clip's whole serde state, each track's mixer flags, the
+  overlays, SVG titles, format and master. **EDL** (`edl.rs`): one video track
+  (`video_track`, 0 = V1), record from `01:00:00:00`, source from the file's zero, frames at
+  the rate (`Timebase`: NTSC rates exact, drop-frame at 29.97 / 59.94 with `;` before the
+  frames), 8-character reels from the file stem made unique per file, `* FROM CLIP NAME` /
+  `* TO CLIP NAME` / `* SOURCE FILE`, a dissolve as the outgoing `C` line plus the incoming
+  `D nnn` (`BL` with no predecessor), dips written as cuts and slides / pushes as dissolves
+  (reported), `M2` at speed × timebase (negative reversed) with the source out at
+  `src_in ± record frames × |speed|` (counting down when reversed), disabled clips left out,
+  and the sound of A/V clips reported as not written (events are channel `V`).
+  Golden text in `interchange/golden/*.{otio,edl}` (`golden.rs`; bless with
+  `KERF_INTERCHANGE_BLESS=1 cargo test -p kerf-core --no-default-features interchange`).
+  **Marker lists** (`interchange/markers.rs`): `markers_csv` (RFC 4180, every cell quoted,
+  free-text cells starting with `= + - @` / tab / CR — or one of the four after leading
+  whitespace — prefixed with `'`), `youtube_chapters` (chapter markers, else all; `0:00 Intro`
+  added when the first is later, fewer than three or shorter than 10 s reported, not
+  enforced) and `ffmetadata_chapters` (chapter markers only, each to the next or its own
+  duration, `= ; # \` and newlines escaped; `None` with none).
   The **agent task queue** is a real `tasks` table (one row per `Task`,
   columns not JSON): `add_task` / `list_tasks` / `claim_next_task` / `complete_task`
   / `fail_task` / `resolve_task` / `remove_task` drive the `queued → working →
