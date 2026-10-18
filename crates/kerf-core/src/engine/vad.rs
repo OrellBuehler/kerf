@@ -92,7 +92,8 @@ impl Levels {
 }
 
 /// [`Levels::tighten`] for one batch of words.
-pub fn tighten_words(audio: &[f32], words: &mut [Word]) {
+#[cfg(test)]
+fn tighten_words(audio: &[f32], words: &mut [Word]) {
     Levels::of(audio).tighten(words);
 }
 

@@ -336,3 +336,96 @@
   a full window makes the export's tail and fade-in cover the same samples (offset windows
   played both copies at full gain — +65 % peak in the Python prototype). An overrun with
   `fade_out` is cut at the target and faded over `FIT_FADE_S`.
+- **Animated SVG overlays** (`Timeline.svg_overlays: Vec<SvgOverlay>`, `svg/`, pure +
+  unit-tested; the engine side is `engine-cli.md`). An overlay is SMIL-animated vector art
+  drawn between `start` and `end`, fit *contain* and centred into the rect `x, y, width, height`
+  (frame fractions), above the clips and below text overlays (list order; captions stay on
+  top). **`svg` stores the sanitised source, so stored == rendered**: `svg::sanitize` is an
+  allow-list run once on the way in — scripts, `foreignObject` / `iframe` / `audio` / `video`,
+  elements outside resvg's vocabulary, `on*` and foreign-namespace attributes, anything but
+  `#fragment` links (an `<image>` may carry `data:image/png|jpeg|gif|webp`, **whose header says at most 16 Mpx** — the
+  decoder allocates what the header claims — else its `href` is cut with a warning; `svg/images.rs`: PNG / GIF / WebP by
+  `imagesize`, **JPEG by our own marker walk** (`jpeg_size`: it skips the `0xFF` fill bytes the format allows before a marker, which
+  `imagesize` takes for a marker and so errors on or lands on a decoy frame header; the largest frame header before the end of the image
+  is the size)), external `url()`,
+  `@import`, `@keyframes` and `animation*` / `transition*` (warning "CSS animations are not
+  rendered — use SMIL"); a plain DOCTYPE is cut, one with an internal subset is refused; caps
+  128 KiB, 20,000 elements, depth 64, 2,000 animations, 1,000 values each, `MAX_SVG_OVERLAYS` =
+  50 a timeline. **Depth is read off the bytes before roxmltree sees the text** (`nesting_exceeds`: it
+  recurses per open element with no limit of its own, and ~3,500 nested `<g>` — 25 KB — abort a 2 MiB
+  thread's stack; comments / CDATA / PIs and quoted values are skipped); an animation's `attributeName`
+  must be an XML name with at most one prefix (`is_attribute_name`) because `at` writes it into the
+  document as markup (`x="1" href="/etc/passwd" onload="a" y` was an injection), and only `xlink:href` of
+  the XLink attributes survives, **and only when no unprefixed `href` is beside it** — resvg reads
+  `xlink:width` as `width` and the unprefixed `href` over the XLink one, and **roxmltree's bare-name
+  `node.attribute("href")` matches `xlink:href` too** (use `sanitize::plain_attribute` for "no namespace"). **It is a splice, not a re-serialisation** (byte ranges of the original, so the
+  second pass over its own output changes nothing — a test sweeps nasty inputs for exactly
+  that). **`SvgDoc::parse` + `SvgDoc::at(doc_t)`** are the evaluator: the document is read once
+  (roxmltree, then a usvg parse to refuse what resvg cannot size — a `viewBox` or pixel
+  `width`/`height` is required, since resvg sizes a bare document to its content and an
+  animation would change that per frame; `<use>` / `feImage` expansion is counted from the XML
+  *first* — more than 100,000 drawn nodes, 128 levels or a reference cycle is refused (a ring of
+  **gradients** by `href` is not: each only lends its stops, and usvg breaks the loop), since usvg
+  expands a cycle to its million-node limit before it notices; the target of a `use` is its unprefixed
+  `href`, else `xlink:href`, as resvg's, and a `url(#id)` in `fill` / `stroke` / `mask` / `clip-path` /
+  `filter` / `marker-*` (attribute, **every declaration of `style`**, or a `<style>` rule — see below) counts the target again for every element that draws it; a `pattern` /
+  gradient / `filter` `href` is followed too, and `<image>` pixels are summed the same way — more than 64 Mpx decoded in a frame,
+  each `<use>` of an image decoding it again, is refused — and `SvgDoc::widest_image_pixels` is what a frame's decode must hold),
+  and `at` returns a *static* SVG for one moment —
+  animation elements cut out, animated attributes spliced in — which is what every renderer is
+  handed, so a still, a stream and an export of the same moment are one picture. A CSS property
+  (`opacity`, `fill`, `visibility`…) is written by appending `;prop:value` to `style` (a rule in
+  `<style>` beats a presentation attribute, an inline declaration beats the rule; no leading `;` after an
+  empty or `;`-ended style, where resvg's CSS reader would drop it); geometry is a replaced / inserted
+  attribute. The value an animation starts from is the element's own, else for an **inherited** property
+  (`values::is_inherited`: fill, stroke*, font-*, letter-spacing, visibility, …) the nearest ancestor's
+  `style` declaration or attribute, else the initial one (`opacity`, `display`, `stop-color` are not inherited) **The subset**: `animate`, `animateColor`, `set`,
+  `animateTransform`; `begin` / `end` clock values, `id.begin|end ± offset` syncbases (resolved
+  once, memoised, 32 deep, a cycle is unresolved), `indefinite`; an `end` list with an **unresolved** item (an event, a syncbase on nothing or on an animation that
+  never begins / ends) leaves the interval open — its natural length — where one whose times all precede the begin
+  makes no interval; `dur`, `repeatCount` /
+  `repeatDur`, `min` / `max`, `fill`, `restart`, `values` / `from` / `to` / `by`, `keyTimes`,
+  `calcMode` linear / discrete / paced / spline (Newton + bisection), `additive`, `accumulate`
+  (ignored for a `to`-only animation, as in SMIL; the repeat index is an `f64`, not a saturating `u32`)
+  and the sandwich (begin time, then document order; a transform sum post-multiplies onto the
+  base transform). A frozen value is the last one when the active duration is an exact multiple
+  of `dur`, else the value at `AD mod dur`. Colours blend per sRGB channel, paths blend only on
+  one command sequence, mixed units and keywords step. **Anything else is a warning, never a
+  failure** (`SvgDoc::warnings` / `check_svg`): events, `repeat()`, `accessKey`, wallclock never
+  fire; `animateMotion`, `animate` on `transform`, animating `href` / `style` / `on*` and a base value that comes
+  from a `<style>` rule is not seen (the default is used) — all dropped or ignored with a warning. **Dropped too is anything that
+  would make the guard (which reads the document as stored) wrong afterwards**: an animation of `mask` / `filter` / `clip-path` / `clip` / `marker*` / `id` / `class`, one whose `values` / `from` / `to` / `by` hold a
+  `url(` **unless it animates `fill` or `stroke` between gradients** (a paint server is a handful of stops however often it
+  is used; "gradient" = an element that is the only one with its id, so there is no doubt which element `url(#g)` reaches), and one of `radius` / `order` / `numOctaves`
+  (they set the cost of a filter primitive). **A `<style>` rule keeps its `url(#id)`** (Illustrator's "Internal CSS" writes
+  `.stN{clip-path:url(#SVGID_n_)}`): `svg/rules.rs` reads every rule's *subject* (its last compound selector) and counts the
+  reference on each element that subject could match — the name, classes and id it spells out, nothing else (an ancestor, a
+  pseudo-class or an attribute test only narrows, so ignoring them over-counts), and **every** element when it cannot read the
+  selector (`*`, `svg|rect`, an escape). A rule that reaches the elements inside what it points at (`rect { mask: url(#m) }` over a
+  mask holding a rect) makes that mask refer to itself and is refused like any loop. **A later element repeating an `id` loses it**
+  (warning): usvg reaches the *last* element of an id through `url(#id)` and an href chain and the first through `<use>`, the guard
+  one, so the sanitiser leaves one — the first, which is also the browser's. A document whose filters, layers or overdraw
+  would take seconds a frame is refused when it is read
+  (`svg/cost.rs`: `feMorphology` radius, `feConvolveMatrix` order and `feTurbulence` octaves times the region, plus a pixmap per
+  isolated group and the pixels each path covers, all **at the scale resvg really draws with — every group's `transform`
+  multiplied on the way down, the `viewBox` one usvg puts on the root and an animated one included — and a region held to
+  resvg's own 5x canvas**; at a nominal 1080p when read, and again by the rasteriser on each moment's tree at the real size).
+  `svg::may_animate(src)` is false when the sanitised text has no animation element (a text test; `true` is only "maybe"), which is
+  what lets the engine keep such a title as one picture. Start and end are held to 24 h (`MAX_SVG_SECONDS`).
+  `natural_duration` (all animations settled; `None` for a still or an endless loop) is what
+  `add_svg_overlay` defaults the end to, held to 2–30 s (else 4 s; `SvgDoc::default_span`).
+  `SvgOverlayPatch` has `svg` (custom artwork), `preset_params` (re-fill) and `preset_kind` (another
+  preset, same id and draw order; `svg` excludes both, custom art refuses both). **Presets** (`SvgPresetKind`
+  `fade_up` / `typewriter` / `lower_third` / `word_pop`, `svg::render_preset`) are only SVG the
+  subset understands, drawn for a viewBox equal to the delivery frame (`Timeline::preset_frame`:
+  `format`, else 1920x1080), blank and static at their duration. `SvgOverlay.preset` remembers
+  how they were made, and **the artwork is re-made** when the span changes length, the params
+  change, the delivery format changes (`set_delivery_format`) and in `for_delivery` for a new
+  shape (custom art is only scaled). `slice` clips and shifts like text but adds the cut-off
+  front to `offset` (`SvgOverlay::doc_time(t)` = `t - start + offset`), so a range export or the
+  playback hand-over joins the animation part-way instead of replaying it. Ripple never moves
+  overlays; the diff reuses `OverlayAdded` / `Changed` / `Removed` with `overlay_id`
+  ("Added animated title “X” at 0:01.0–0:04.0"); `CutSummary.has_text` stays text-only. The catalogue and one
+  drawing of each preset are written to `frontend/src/lib/fixtures/svg-presets.json` for the browser harness
+  (`svg_preset_fixture_is_what_this_engine_does`; after an intended preset change run
+  `KERF_BLESS_SVG_PRESETS=1 cargo test -p kerf-core --no-default-features -- svg_preset_fixture`).

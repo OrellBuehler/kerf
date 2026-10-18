@@ -295,6 +295,13 @@ pub struct PlanStream {
     pub pix_fmt: Option<String>,
     /// The YCbCr matrix the stream declares, as ffprobe names it.
     pub color_space: Option<String>,
+    /// The export graph **labels this picture BT.709** (`setparams`): it is untagged HD YCbCr
+    /// beside an input of the same graph that names a matrix (`model::bt709_labels`), decided over
+    /// the original's stream and the inputs of the graph the plan mirrors (every clip of the cut for
+    /// a Motion plan, the layers on screen for a Still). The label is the matrix FFmpeg converts
+    /// the picture with inside the graph, whatever [`PlanStream::color_space`] says. `false` for
+    /// the stream of any plan that did not set it.
+    pub label_bt709: bool,
 }
 
 impl PlanStream {
@@ -307,8 +314,9 @@ impl PlanStream {
     /// The matrix FFmpeg converts this picture with *inside* a graph (the frame's
     /// own, which `scale` takes from its colourspace tag): BT.709 and BT.2020 as
     /// tagged, BT.601 for the SMPTE 170M / BT.470 BG tags **and for none at all**
-    /// (swscale's default) — and for an RGB picture, which is converted to YCbCr
-    /// with that default.
+    /// (swscale's default; a `reserved` value is read as none) — and for an RGB picture, which
+    /// is converted to YCbCr with that default. A picture the graph labels BT.709
+    /// ([`PlanStream::label_bt709`]) is BT.709 whatever its file says.
     ///
     /// `None` when it cannot be known: a matrix the compositor has no coefficients
     /// for, or an asset whose pixel format was never recorded. For such an asset
@@ -319,8 +327,11 @@ impl PlanStream {
         if self.layout() == Some(PixLayout::Rgb) {
             return Some(YuvMatrix::Bt601);
         }
+        if self.label_bt709 {
+            return Some(YuvMatrix::Bt709);
+        }
         match self.color_space.as_deref() {
-            None | Some("smpte170m") | Some("bt470bg") => Some(YuvMatrix::Bt601),
+            None | Some("smpte170m") | Some("bt470bg") | Some("reserved") => Some(YuvMatrix::Bt601),
             Some("bt709") => Some(YuvMatrix::Bt709),
             Some("bt2020nc") => Some(YuvMatrix::Bt2020),
             Some(_) => None,
@@ -373,6 +384,7 @@ impl PlanStream {
             color_primaries: s.color_primaries.clone(),
             pix_fmt: s.pix_fmt.clone(),
             color_space: s.color_space.clone(),
+            label_bt709: false,
         })
     }
 }
@@ -600,6 +612,10 @@ pub struct RenderPlan {
     pub layers: Vec<PlanLayer>,
     /// The text overlays live at this frame, in the order they are drawn (on top).
     pub overlays: Vec<PlanText>,
+    /// The animated SVG titles on screen at this frame, in the order they are laid (under the
+    /// text). Only named: a compositor does not draw them, so a frame holding one is refused
+    /// ([`Unsupported::Svg`]) and FFmpeg draws it from the pictures resvg made.
+    pub svg: Vec<Uuid>,
     /// Clips that are on screen but whose source has no picture to draw. `index` is the
     /// number of drawn layers below it: the slot in `layers` it would have taken.
     pub pictureless: Vec<Pictureless>,
@@ -1097,6 +1113,10 @@ impl RenderPlan {
                     out.push(Unsupported::TextBorder);
                 }
             }
+        }
+        // resvg draws an animated title and FFmpeg overlays its pictures: no compositor pass does either.
+        if !self.svg.is_empty() {
+            out.push(Unsupported::Svg);
         }
         // The compositor implements swscale's default (bicubic) only.
         if let Some(s) = self.canvas.scaler.as_deref().filter(|s| !s.eq_ignore_ascii_case("bicubic")) {
@@ -1680,6 +1700,7 @@ mod tests {
             (Some("bt709"), false),
             (Some("smpte170m"), false),
             (Some("bt470bg"), false),
+            (Some("reserved"), false),
             (Some("bt2020nc"), false),
             (Some("bt2020c"), true),
             (Some("smpte240m"), true),
@@ -1731,6 +1752,7 @@ mod tests {
             (None, YuvMatrix::Bt601),
             (Some("smpte170m"), YuvMatrix::Bt601),
             (Some("bt470bg"), YuvMatrix::Bt601),
+            (Some("reserved"), YuvMatrix::Bt601),
             (Some("bt709"), YuvMatrix::Bt709),
             (Some("bt2020nc"), YuvMatrix::Bt2020),
         ] {
@@ -2060,7 +2082,21 @@ mod tests {
         assert_eq!(of(None), Some(YuvMatrix::Bt601));
         assert_eq!(of(Some("bt709")), Some(YuvMatrix::Bt709));
         assert_eq!(of(Some("bt2020nc")), Some(YuvMatrix::Bt2020));
+        assert_eq!(of(Some("reserved")), Some(YuvMatrix::Bt601));
         assert_eq!(of(Some("smpte240m")), None);
+    }
+
+    #[test]
+    fn a_labelled_picture_is_bt709_whatever_its_file_says() {
+        let mut s = PlanStream::of(&video(640, 360)).unwrap();
+        s.label_bt709 = true;
+        for tag in [None, Some("smpte170m"), Some("reserved"), Some("bt709")] {
+            s.color_space = tag.map(Into::into);
+            assert_eq!(s.matrix(), Some(YuvMatrix::Bt709), "{tag:?}");
+        }
+        // A picture of an asset that never recorded its pixel format has no known matrix at all.
+        s.pix_fmt = None;
+        assert_eq!(s.matrix(), None);
     }
 
     #[test]

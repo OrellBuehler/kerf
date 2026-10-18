@@ -85,7 +85,9 @@ import {
 	Diamond,
 	Globe,
 	CircleAlert,
-	ChevronUp
+	ChevronUp,
+	CodeXml,
+	Orbit
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -181,7 +183,10 @@ export const icons: Record<string, LucideIcon> = {
 	// 360 footage, and a failure that is not the app's own (a task that failed).
 	'globe': Globe,
 	'circle-alert': CircleAlert,
-	'chevron-up': ChevronUp
+	'chevron-up': ChevronUp,
+	// Animated SVG titles: motion on the titles lane, and the source a custom one is written in.
+	'orbit': Orbit,
+	'code-xml': CodeXml
 };
 
 export type IconName = keyof typeof icons;

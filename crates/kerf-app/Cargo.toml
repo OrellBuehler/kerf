@@ -71,4 +71,4 @@ webkit2gtk = "2.0"
 x11rb.workspace = true
 raw-window-handle.workspace = true
 # The process's own Xlib display (`gpu_preview::x11::display`), opened through libX11 at runtime.
-libloading = "0.8"
+libloading = "0.9"
