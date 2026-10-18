@@ -70,7 +70,13 @@ fn hostile_captions_import_onto_the_cut_without_panicking() {
             return;
         };
         let _ = project.import_captions(&file, CaptionImportRequest::default());
-        let _ = project.import_captions(&file, CaptionImportRequest { offset: -3600.0, ..Default::default() });
+        let _ = project.import_captions(
+            &file,
+            CaptionImportRequest {
+                offset: -3600.0,
+                ..Default::default()
+            },
+        );
         imported.set(imported.get() + 1);
     });
     assert!(imported.get() > 0);

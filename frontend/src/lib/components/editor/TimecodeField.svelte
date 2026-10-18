@@ -16,6 +16,7 @@
 	let editing = $state(false);
 	let draft = $state('');
 	let invalid = $state(false);
+	let fresh = false;
 
 	const shown = $derived(formatTimecode(ui.time, editor.fps));
 	const dropFrame = $derived(timecodeRate(editor.fps).drop > 0);
@@ -24,6 +25,7 @@
 		editing = true;
 		draft = shown;
 		invalid = false;
+		fresh = true;
 		queueMicrotask(() => input?.select());
 	}
 
@@ -44,6 +46,7 @@
 	}
 
 	function onkeydown(e: KeyboardEvent) {
+		fresh = false;
 		if (e.key === 'Enter') {
 			e.preventDefault();
 			commit();
@@ -76,6 +79,11 @@
 		invalid = false;
 	}}
 	onfocus={begin}
+	onmouseup={(e) => {
+		// The click that focused it would put the caret where it landed and drop the selection.
+		if (fresh) e.preventDefault();
+		fresh = false;
+	}}
 	onblur={end}
 	{onkeydown}
 	class="tc"

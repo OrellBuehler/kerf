@@ -273,13 +273,21 @@ them only from the editor surface (`focus-area.ts`: the page, the timeline or th
 the dock container around one); `[` / `]` work from anywhere. The mark is a frame drawn just
 inside the clip's border (`::after`, under `ClipOverlays` — handles, edges and the link badge draw over it — and
 `pointer-events: none`), not an outline, so the partner highlight and the focus ring still show on a marked clip.
-**One timecode** (`timecode.ts`): `HH:MM:SS:FF`, non-drop, hours always there so `00:00:20:15` is not read as
+**One timecode** (`timecode.ts`, the mirror of kerf-core `timecode.rs`; `timecode-entry.test.ts` replays its cases):
+`HH:MM:SS:FF`, **drop-frame `HH;MM;SS;FF` at 29.97 and 59.94** (told by closeness to `30000/1001` / `60000/1001`,
+since the rate is an `f64`), non-drop at every other rate, hours always there so `00:00:20:15` is not read as
 minutes:seconds:frames — the transport, the timeline's clock, the status bar, the ruler (`HH:MM:SS` for a whole-second
 step), the mark and marker tooltips, the trim readouts, the keyframe tooltips and the export range. `mm:ss.cc`
 survives only in the Inspector's editable seconds fields and in the prose that mirrors Rust (`diff.ts`
 `formatTime`). **The timeline's clock** is the ruler's corner (`data-timeline-time`: playhead in amber, `/`, the cut's length;
 an empty cut is `00:00:00:00`, not the lane's 8 s minimum); the toolbar's unlabelled length is gone, and ripple's cue there
-is its icon.
+is its icon. The ruler stays non-drop (its steps are nominal seconds). **The playhead's timecode is typed into**
+(`TimecodeField.svelte`, in the clock and in the transport; **Go to timecode**, `playback.goToTimecode`, ⌘G by default,
+focuses the timeline's, else the transport's): `parseTimecode` reads Premiere-style entry — any of `:;.,` between
+fields, fewer fields filling from the right (`1.00` a second), bare digits as right-aligned pairs (`1000` is
+`00:00:10:00`), `+15` / `-1.00` relative to the frame shown, a dropped drop-frame label as its minute's first frame.
+Enter seeks to the frame (`frameTime`); Escape, Tab or a click away leave the playhead alone; an unreadable entry
+turns red and stays.
 
 The transport's **scrub bar** (`ScrubBar.svelte`, `scrub.ts`) shows the time under the pointer on a chip above the rail
 (`chipLeft` keeps it inside the bar, and it follows the pointer while the bar is held) and a tick per marker (`markerTicks`:

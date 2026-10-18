@@ -1109,6 +1109,18 @@ action has since taken one (`applyReset`) — and Reset all, and a read-only lis
 abandoning drags and closing menus and dialogs, Tab, Enter / Space on a focused
 control, a widget's arrows, wheel and click modifiers). Focus goes back to a row
 after every change: focus left on the page behind a modal stops Escape closing it.
+**Presets** (`KEY_PRESETS` in `keymap.ts`): Kerf (the defaults), Premiere Pro, DaVinci Resolve and
+Final Cut Pro, each an override table over existing action ids (a `mac` table where the Mac's keys
+differ), applied as ordinary overrides (`presetOverrides`), so resolving, conflicts and per-row Reset are
+the usual ones. The Keyboard section's **Preset** select shows the one in force (`presetOf`, *Custom* when
+none) and replaces stored changes only after a Replace / Keep question. `keymap-presets.test.ts` holds
+every preset to known action ids, readable chords and no collision on either platform. Left out, and why:
+
+| Preset | Not mapped | Why |
+| --- | --- | --- |
+| Premiere Pro | Ripple Edit / Rate Stretch / Pen / Hand / Zoom / Type tools, Add Edit (⌘K), Insert / Overwrite (, .), Lift / Extract (; '), next / previous edit (↑ ↓), 5-frame steps, workspaces (⌥⇧1–9), Duplicate (⌘⇧/), apply transitions (⌘D, ⇧D) | No such action in Kerf; ⌥⇧ / ⇧ + digit types a symbol, which a layout-following chord reads as the symbol; ⇧/ is not a chord. Ripple mode takes B. |
+| DaVinci Resolve | Pages (⇧2–8), Trim mode's roll / slip / slide split, Blade at playhead (⌘B), Insert / Overwrite (F9 F10), next / previous edit, Loop (⌘/) | No such action, or ⇧ + digit (as above); the Trim tool (T) is Roll. |
+| Final Cut Pro | Position / Range / Hand / Zoom tools, Blade at playhead (⌘B), Connect / Insert / Append (Q W E), 10-frame steps, Share destinations | No such action; ⇧← / ⇧→ stay a second. |
 
 **Settings** are their own runes singleton (`src/lib/settings.svelte.ts`) behind
 the title bar's gear (⌘,): `SettingsDialog.svelte` is a section rail plus a

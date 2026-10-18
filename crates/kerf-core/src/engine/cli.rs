@@ -884,7 +884,7 @@ pub(crate) fn projection_from_shape(path: Option<&Path>, width: Option<u32>, hei
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("insv") || e.eq_ignore_ascii_case("insp"));
     match (insta360, width, height) {
-        (true, Some(w), Some(h)) if h > 0 && w == h * 2 => Some(Projection::DualFisheye),
+        (true, Some(w), Some(h)) if h > 0 && h.checked_mul(2) == Some(w) => Some(Projection::DualFisheye),
         _ => None,
     }
 }

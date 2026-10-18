@@ -5,6 +5,9 @@ used under the MIT License below. The adapted code is listed here.
 
 ## Adapted from FilmCraft
 
+- `crates/kerf-core/src/timecode.rs` — from FilmCraft `crates/time/src/lib.rs` (`parse_timecode`, `frames_to_fields`, `fields_to_frames`)
+- `frontend/src/lib/timecode.ts` (drop-frame fields and timecode parsing) — from FilmCraft `crates/time/src/lib.rs`
+- `frontend/src/lib/keymap.ts` (`KEY_PRESETS`) — from FilmCraft `crates/engine/src/shortcut_presets.rs`
 
 ## FilmCraft license
 

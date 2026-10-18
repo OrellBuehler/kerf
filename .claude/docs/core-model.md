@@ -429,3 +429,15 @@
   drawing of each preset are written to `frontend/src/lib/fixtures/svg-presets.json` for the browser harness
   (`svg_preset_fixture_is_what_this_engine_does`; after an intended preset change run
   `KERF_BLESS_SVG_PRESETS=1 cargo test -p kerf-core --no-default-features -- svg_preset_fixture`).
+- `timecode.rs` — SMPTE timecode at the timeline's `f64` rate: `TimecodeRate` (nominal base, frames
+  dropped per minute — drop-frame at 29.97 / 59.94, told by closeness to `30000/1001` / `60000/1001`),
+  `fields` / `frames` / `format` and `parse` (Premiere-style entry, relative `+` / `-`, a dropped label
+  read as its minute's first frame), all held to `MAX_TIMECODE_FRAME` so the TS mirror (`timecode.ts`) does
+  the same integer arithmetic in doubles. Pure; the frontend's tests replay its cases.
+- `hostile.rs` (`#[doc(hidden)]`, tests only) — seeded mutation for robustness tests: every prefix, bounded
+  rounds of bit flips / inserted / deleted / duplicated bytes, and each number pushed to the edges of
+  `u32` / `i64` / `f64` (`number_variants`), each case under `catch_unwind`. Used by
+  `tests/hostile_input.rs` (caption files and their import, the stored timeline), `engine/cli/hostile_tests.rs`
+  (ffprobe JSON, source traits, silence / scene logs), `source_probe.rs`, kerf-gpu's y4m / `showinfo` and
+  kerf-app's settings; `frontend/src/lib/hostile-input.test.ts` is the page's twin. A panic found keeps its
+  input as a regression test.
