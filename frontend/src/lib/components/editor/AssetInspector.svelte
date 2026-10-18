@@ -8,6 +8,8 @@
 	import MediaChips from './MediaChips.svelte';
 	import AnalysisRun from './AnalysisRun.svelte';
 	import InspectorSection from './InspectorSection.svelte';
+	import MusicStructure from './MusicStructure.svelte';
+	import { musicSummary } from '$lib/music-ui';
 	import { VIDEO_THUMB_BG } from './data';
 	import { editor } from '$lib/state.svelte';
 	import { ui } from '$lib/editor-ui.svelte';
@@ -21,6 +23,7 @@
 	import { deleteProxy, rebuildProxy } from '$lib/api';
 	import { toast } from '$lib/notifications.svelte';
 	import { exportTranscriptSrt, report } from '$lib/ops';
+	import { relinkMediaFlow, removeMediaFlow } from '$lib/library-actions';
 	import { tip } from '$lib/tip';
 	import { settings } from '$lib/settings.svelte';
 	import { placementOut } from '$lib/editing-prefs';
@@ -40,6 +43,8 @@
 		})
 	);
 	const spec = $derived(specLine(info));
+	/** Music with a fitted bar grid: its structure is shown under Analysis. */
+	const music = $derived(editor.analysisFor(asset.id)?.music ?? null);
 	const proxy = $derived(mediaStatus.proxy(asset.id));
 	const act = $derived(proxyActions(proxy));
 	const KIND: Record<string, string> = { video: 'Video', audio: 'Audio', image: 'Still' };
@@ -82,6 +87,17 @@
 			</div>
 		</div>
 	</div>
+	{#if mediaStatus.isMissing(asset.id)}
+		<div
+			role="alert"
+			data-testid="asset-missing"
+			style="margin-top:8px;padding:8px 10px;border-radius:var(--radius-sm);background:color-mix(in srgb,var(--danger) 14%,transparent);border:var(--line-width) solid color-mix(in srgb,var(--danger) 40%,transparent);font-size:12px;line-height:1.5;color:var(--text-primary)"
+		>
+			The file is not at <span style="font-family:var(--font-mono);overflow-wrap:anywhere">{asset.path}</span>. The clips cut from it
+			stay on the timeline; previews and export need the file.
+			<div style="margin-top:6px"><Btn size="sm" variant="secondary" icon="link" onclick={() => void relinkMediaFlow(asset)}>Relink…</Btn></div>
+		</div>
+	{/if}
 	{#if spec}
 		<div style="margin-top:8px;font-size:12px;color:var(--text-muted);line-height:1.4">{spec}</div>
 	{/if}
@@ -137,6 +153,19 @@
 		{/if}
 	</div>
 
+	<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
+		<Btn size="sm" variant="ghost" icon="link" iconSize={12} title="Point this media at another file" onclick={() => void relinkMediaFlow(asset)}>Relink…</Btn>
+		<Btn
+			size="sm"
+			variant="ghost"
+			icon="trash"
+			iconSize={12}
+			pending={editor.locked}
+			title="Take this media out of the project"
+			onclick={() => void removeMediaFlow(asset)}>Remove…</Btn
+		>
+	</div>
+
 	<InspectorSection title="Media" summary={`${info.duration}${info.resolution ? ` · ${info.resolution}` : ''}`} open>
 		{#each facts.media as f (f.label)}{@render row(f)}{/each}
 	</InspectorSection>
@@ -144,6 +173,12 @@
 	<InspectorSection title="Analysis" summary={doneCount(mediaStatus.analysis(asset.id))} open>
 		{#each facts.analysis as f (f.label)}{@render row(f)}{/each}
 	</InspectorSection>
+
+	{#if music}
+		<InspectorSection title="Music structure" summary={musicSummary(music)} open>
+			<MusicStructure assetId={asset.id} {music} />
+		</InspectorSection>
+	{/if}
 
 	{#if facts.proxy.length > 0}
 		<InspectorSection title="Proxy" summary={facts.proxy[0].value}>

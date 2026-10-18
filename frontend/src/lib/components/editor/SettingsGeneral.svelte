@@ -4,8 +4,6 @@
 	import Btn from './Btn.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { TIME_MODES, formatTime, type TimeMode } from '$lib/time-format';
-	import { confirmAction } from '$lib/api';
-	import { CONFIRM } from '$lib/confirm-copy';
 	import { shortPath } from '$lib/media-info';
 	import { fileName } from '$lib/failure-copy';
 	import { tip } from '$lib/tip';
@@ -13,10 +11,6 @@
 	// 4.4 s in a 30 fps cut: what each mode makes of the same moment.
 	const example = (mode: TimeMode) => formatTime(4.4, 30, mode);
 
-	async function clear() {
-		const c = CONFIRM.clearRecent;
-		if (await confirmAction(c.message, c.title, c)) await settings.clearRecent();
-	}
 </script>
 
 <SettingRow id="time-display" label="Time display">
@@ -68,6 +62,6 @@
 				</li>
 			{/each}
 		</ul>
-		<Btn variant="secondary" size="sm" icon="trash" onclick={clear}>Clear recent projects</Btn>
+		<Btn variant="secondary" size="sm" icon="trash" onclick={() => void settings.clearRecentAsked()}>Clear recent projects</Btn>
 	{/if}
 </SettingRow>

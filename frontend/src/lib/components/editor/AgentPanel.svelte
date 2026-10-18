@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
 	import Badge from './Badge.svelte';
 	import Btn from './Btn.svelte';
@@ -10,18 +11,21 @@
 	import { agent } from '$lib/agent.svelte';
 	import { settings } from '$lib/settings.svelte';
 	import { dismissTask, readyCard, resolveReady } from '$lib/agent-tasks';
-	import { agentStatus, mcpConnectionInfo } from '$lib/api';
+	import { agentStatus, getStagedTimeline, mcpConnectionInfo } from '$lib/api';
 	import { contextMenu } from '$lib/context-menu.svelte';
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { diffHeadline, groupEntries, polarity } from '$lib/diff';
 	import { confirmReplaceCaptions } from '$lib/title-actions';
 	import { QUICK_EDIT_STEPS } from '$lib/analysis-steps';
-	import { applyProposal, discardProposal, inspectChange } from '$lib/proposal-actions';
+	import { applyPicked, applyProposal, discardProposal, inspectChange, restoreProposal, undoProposalStep } from '$lib/proposal-actions';
+	import { entryId } from '$lib/staged-subset';
+	import { applyLabel, comingAlong, groupState, keepPresent, pickLine, pickRows, toggled, toggledGroup } from '$lib/review-picks';
+	import { changeWord } from '$lib/proposal-ui';
 	import { QUICK_EDIT_HELD, cutSignature, heldWhilePreviewing, isLocalPreset, quickTarget, silenceOutcome, targetNote } from '$lib/quick-edits';
 	import { holdForPreview, report } from '$lib/ops';
 	import { STATUS_MAP, PRESETS } from './data';
 	import { agentLine, showComposerHint } from '$lib/agent-status';
-	import type { DiffEntry, EditSource, McpConnectionInfo, Task, TaskStatus, TimelineDiff } from '$lib/types';
+	import type { DiffEntry, EditSource, McpConnectionInfo, Task, TaskStatus, Timeline, TimelineDiff } from '$lib/types';
 	import { tip } from '$lib/tip';
 
 	const working = $derived(agent.working);
@@ -137,6 +141,27 @@
 	const groups = $derived(staged ? groupEntries(staged.diff.entries) : []);
 	let applying = $state(false);
 
+	// Picking some of the changes instead of all (`review-picks.ts`): the ids of the changes ticked, and what comes
+	// along with them — read off the live cut and the proposal, so the card says so before the press.
+	let picks = $state<ReadonlySet<string>>(new Set());
+	const rows = $derived(staged ? pickRows(staged.diff.entries, staged.asset_changes ?? []) : []);
+	$effect(() => {
+		const kept = keepPresent(untrack(() => picks), rows);
+		if (kept !== untrack(() => picks)) picks = kept;
+	});
+	let proposedCut = $state<Timeline | null>(null);
+	$effect(() => {
+		const stamp = staged?.updated_at;
+		if (!stamp || picks.size === 0) return;
+		void getStagedTimeline().then(
+			(t) => {
+				if (staged?.updated_at === stamp) proposedCut = t;
+			},
+			() => {}
+		);
+	});
+	const along = $derived(staged ? comingAlong(staged.diff.entries, picks, [editor.liveTimeline, proposedCut]) : new Map<string, string>());
+
 	// The setup card is for a panel with nothing in it; once a proposal lands it is the proposal that matters,
 	// and at 1280×720 the card pushed it off the screen. (Asked for again, it opens again.)
 	let hadStaged = false;
@@ -161,7 +186,9 @@
 	async function onApply() {
 		applying = true;
 		try {
-			await applyProposal();
+			// Nothing ticked is the whole proposal; ticked changes go alone (and what comes with them).
+			if (picks.size === 0) await applyProposal();
+			else if (await applyPicked([...picks])) picks = new Set();
 		} finally {
 			applying = false;
 		}
@@ -457,6 +484,19 @@
 		{/if}
 	</div>
 
+	{#if !settings.agentReview}
+		<!-- Review is the safety the Agent settings can turn off; the panel says so while it is. -->
+		<div
+			role="status"
+			data-testid="review-off-note"
+			style="flex:none;display:flex;align-items:center;gap:8px;padding:6px 12px;background:color-mix(in srgb,var(--orange-400) 12%,transparent);border-bottom:var(--line-width) solid color-mix(in srgb,var(--orange-400) 35%,transparent);font-size:12px;line-height:1.4;color:var(--text-primary)"
+		>
+			<Icon n="alert-triangle" s={13} color="var(--orange-400)" />
+			<span style="flex:1;min-width:0">Review is off — an agent’s edits land on your timeline as it makes them.</span>
+			<Btn variant="ghost" size="sm" onclick={() => settings.openSection('agent')}>Turn on</Btn>
+		</div>
+	{/if}
+
 	<div style="flex:1;min-height:0;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:12px">
 		<!-- how to connect an agent: under the status line it answers -->
 		{#if showConnect && !serverError}
@@ -490,11 +530,21 @@
 		<!-- the agent's pending proposal -->
 		{#if staged}
 			<div
+				data-testid="proposal-card"
 				style="flex:none;border-radius:var(--radius-md);background:var(--surface-raised);border:var(--line-width) solid var(--agent-border);border-left:calc(var(--line-width) * 2) solid var(--agent-500);overflow:clip"
 			>
 				<div style="display:flex;align-items:center;gap:8px;padding:10px 11px 0">
 					<Icon n="git-pull-request-arrow" s={14} color="var(--agent-300)" />
 					<span style="flex:1;font-size:13px;font-weight:600;color:var(--text-primary)">Proposed changes</span>
+					{#if (staged.undo_depth ?? 0) > 0}
+						<IconBtn
+							size={24}
+							data-testid="proposal-undo-step"
+							aria-label="Undo the agent’s latest step"
+							title={{ text: 'Undo the agent’s latest step', detail: `${staged.edits[staged.edits.length - 1] ?? 'The last step'} — inside the proposal; your cut is not touched` }}
+							onclick={() => void undoProposalStep()}><Icon n="undo" s={13} /></IconBtn
+						>
+					{/if}
 					<Badge tone="agent">review</Badge>
 				</div>
 				<div style="padding:7px 11px 0 32px">
@@ -513,37 +563,112 @@
 					</div>
 				{/if}
 
-				<div style="padding:10px 11px 10px 32px;display:flex;flex-direction:column;gap:9px">
+				<!-- Picking: tick the changes to apply only those (`review-picks.ts`); a picture and its sound go together. -->
+				<div
+					data-testid="pick-line"
+					style="margin:9px 11px 0 32px;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-muted);line-height:1.45"
+				>
+					<span style="flex:1;min-width:0">{pickLine(picks.size, along.size, rows.length)}</span>
+					{#if picks.size > 0}
+						<Btn variant="ghost" size="sm" onclick={() => (picks = new Set())}>Clear</Btn>
+					{/if}
+				</div>
+
+				<div style="padding:8px 11px 10px 11px;display:flex;flex-direction:column;gap:9px">
 					{#each groups as group (group.label)}
+						{@const gids = group.entries.map(entryId)}
+						{@const gstate = groupState(gids, picks)}
 						<div>
-							<div class="k-overline" style="margin-bottom:4px">{group.label}</div>
+							<label class="k-overline" style="display:flex;align-items:center;gap:7px;margin-bottom:4px;cursor:pointer">
+								<input
+									type="checkbox"
+									checked={gstate === 'all'}
+									indeterminate={gstate === 'some'}
+									aria-label="Pick every change under {group.label}"
+									onchange={() => (picks = toggledGroup(picks, gids))}
+									style="accent-color:var(--agent-500);cursor:pointer;margin:0"
+								/>
+								{group.label}
+							</label>
 							<div style="display:flex;flex-direction:column;gap:2px">
 								{#each group.entries as e, i (`${e.kind}-${i}-${e.summary}`)}
 									{@const tone = polarity(e.kind)}
-									<button
-										onclick={() => void inspectChange(e)}
-										disabled={e.at == null && !e.clip_id && !e.overlay_id}
-										use:tip={e.at == null && !e.clip_id && !e.overlay_id ? e.summary : `Look at this change: ${e.summary}`}
-										style="display:flex;gap:7px;align-items:baseline;width:100%;text-align:left;padding:3px 4px;border:none;border-radius:var(--radius-sm);background:transparent;color:inherit;cursor:{e.at ==
-										null && !e.clip_id && !e.overlay_id
-											? 'default'
-											: 'pointer'}"
-									>
-										<span
-											style="flex:none;width:9px;font-family:var(--font-mono);font-size:12px;color:{polarityTint[tone]}"
-											>{polarityMark[tone]}</span
-										>
-										<span style="flex:1;min-width:0;font-size:12px;line-height:1.45;color:var(--text-secondary)">
-											{e.summary}
-											{#if e.detail}<span style="color:var(--text-muted)"> · {e.detail}</span>{/if}
-										</span>
-									</button>
+									{@const id = entryId(e)}
+									{@const comes = along.get(id)}
+									<div style="display:flex;gap:6px;align-items:flex-start">
+										<input
+											type="checkbox"
+											checked={picks.has(id) || comes !== undefined}
+											disabled={comes !== undefined}
+											aria-label="Pick: {e.summary}"
+											data-testid="pick-{id}"
+											onchange={() => (picks = toggled(picks, id))}
+											style="accent-color:var(--agent-500);cursor:pointer;margin:6px 0 0;flex:none"
+										/>
+										<div style="flex:1;min-width:0">
+											<button
+												onclick={() => void inspectChange(e)}
+												disabled={e.at == null && !e.clip_id && !e.overlay_id}
+												use:tip={e.at == null && !e.clip_id && !e.overlay_id ? e.summary : `Look at this change: ${e.summary}`}
+												style="display:flex;gap:7px;align-items:baseline;width:100%;text-align:left;padding:3px 4px;border:none;border-radius:var(--radius-sm);background:transparent;color:inherit;cursor:{e.at ==
+												null && !e.clip_id && !e.overlay_id
+													? 'default'
+													: 'pointer'}"
+											>
+												<span
+													style="flex:none;width:9px;font-family:var(--font-mono);font-size:12px;color:{polarityTint[tone]}"
+													>{polarityMark[tone]}</span
+												>
+												<span style="flex:1;min-width:0;font-size:12px;line-height:1.45;color:var(--text-secondary)">
+													{e.summary}
+													{#if e.detail}<span style="color:var(--text-muted)"> · {e.detail}</span>{/if}
+												</span>
+											</button>
+											{#if comes}
+												<div data-testid="comes-along" style="padding:0 4px 3px 20px;font-size:11px;line-height:1.4;color:var(--agent-300)">
+													Comes along — {comes}
+												</div>
+											{/if}
+										</div>
+									</div>
 								{/each}
 							</div>
 						</div>
 					{/each}
+					{#if (staged.asset_changes ?? []).length > 0}
+						<div>
+							<div class="k-overline" style="margin-bottom:4px">Library</div>
+							<div style="display:flex;flex-direction:column;gap:2px">
+								{#each staged.asset_changes ?? [] as c (c.id)}
+									<label style="display:flex;gap:6px;align-items:flex-start;cursor:pointer">
+										<input
+											type="checkbox"
+											checked={picks.has(c.id)}
+											aria-label="Pick: {c.summary}"
+											onchange={() => (picks = toggled(picks, c.id))}
+											style="accent-color:var(--agent-500);cursor:pointer;margin:6px 0 0;flex:none"
+										/>
+										<span style="flex:1;min-width:0;padding:3px 4px;font-size:12px;line-height:1.45;color:var(--text-secondary)">{c.summary}</span>
+									</label>
+								{/each}
+							</div>
+						</div>
+					{/if}
 				</div>
-
+			</div>
+		{:else if editor.discarded}
+			<!-- A proposal thrown away can be brought back until another one is staged. -->
+			<div
+				data-testid="discarded-card"
+				style="flex:none;display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:var(--radius-md);background:var(--surface-inset);border:var(--line-width) dashed var(--border-strong)"
+			>
+				<Icon n="history" s={14} color="var(--text-muted)" />
+				<span style="flex:1;min-width:0;font-size:12px;line-height:1.45;color:var(--text-secondary)">
+					You discarded {changeWord(editor.discarded.diff.entries.length + (editor.discarded.asset_changes ?? []).length)}{editor.discarded.note
+						? ` — ${editor.discarded.note}`
+						: ''}.
+				</span>
+				<Btn variant="secondary" size="sm" icon="rotate-ccw" iconSize={12} data-testid="restore-discarded" onclick={() => void restoreProposal()}>Restore</Btn>
 			</div>
 		{/if}
 
@@ -565,6 +690,9 @@
 					{#each queue as t (t.id)}
 						{@render taskCard(t)}
 					{/each}
+					{#if agent.more}
+						<Btn variant="ghost" size="sm" data-testid="tasks-older" onclick={() => void agent.showOlder()}>Show older tasks</Btn>
+					{/if}
 				{/if}
 			</div>
 		</div>
@@ -616,7 +744,7 @@
 
 		<!-- history -->
 		<div style="flex:none">
-			{@render secHead('History', `${editor.history.length} edit${editor.history.length === 1 ? '' : 's'}`)}
+			{@render secHead('History', `${editor.history.length}${editor.historyMore ? '+' : ''} edit${editor.history.length === 1 && !editor.historyMore ? '' : 's'}`)}
 			<div style="display:flex;flex-direction:column;gap:1px">
 				{#each revisions as rev (rev.seq)}
 					<div
@@ -677,6 +805,9 @@
 						</div>
 					{/if}
 				{/each}
+				{#if editor.historyMore}
+					<Btn variant="ghost" size="sm" data-testid="history-older" onclick={() => void editor.showOlderHistory()}>Show older edits</Btn>
+				{/if}
 			</div>
 		</div>
 	</div>
@@ -689,7 +820,9 @@
 			data-review-actions
 			style="flex:none;display:flex;align-items:center;gap:7px;padding:8px 12px;background:var(--surface-raised);border-top:var(--line-width) solid var(--agent-border)"
 		>
-			<Btn variant="primary" size="sm" style="flex:1" disabled={applying} onclick={onApply}>{applying ? 'Applying…' : 'Apply'}</Btn>
+			<Btn variant="primary" size="sm" style="flex:1" disabled={applying} data-testid="proposal-apply" onclick={onApply}
+				>{applyLabel(picks.size + along.size, rows.length, applying)}</Btn
+			>
 			<Btn
 				size="sm"
 				icon={editor.previewingStaged ? 'eye-off' : 'eye'}

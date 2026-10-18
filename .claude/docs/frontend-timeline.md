@@ -56,7 +56,7 @@ no longer stopped by its neighbours (it pushes them — only the source's footag
 links off: the trim applied to a scratch copy of the lanes, then `ripple.ts`'s `rippleFrom`,
 sync lock included — see Linked A/V below), because a left-edge trim keeps the clip's start
 rather than holding the right edge — one ghost per clip it moves, on whichever track, the
-moved clips dimmed, red and inert if the backend would decline the ripple. The bounds are asked again at every move
+moved clips dimmed, red and inert if the backend would decline the ripple. **A trim may not leave the trimmed clip on another clip of its lane** (judged after the ripple, which may make the room: `ripple.ts`'s `checkOwnLanes`, `Timeline::check_own_lanes`), nor ask for footage past the asset's end or before 0 — the same rule refuses an added clip, and `set_speed` is held to `MIN_SPEED..MAX_SPEED` (`link-ops.ts`, `clip-limits.test.ts`). The bounds are asked again at every move
 and at the release, since the mode can flip mid-drag. `load()` reads the flag on every
 load (so Open and New refresh it; `state-ripple.test.ts` pins that). *Selection* is a set: `selection.ts` holds every way of
 changing `selectedClipIds` + the primary (`selectedClipId`, the clip the Inspector edits —

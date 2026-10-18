@@ -67,6 +67,7 @@
 		timingSummary
 	} from '$lib/inspector-summary';
 	import { fitOffer, musicSummary } from '$lib/music-ui';
+	import MusicStructure from './MusicStructure.svelte';
 	import { DEGREES, NUMBER_COL, PERCENT, SECONDS, TIMES, readout, type RowSpec } from '$lib/slider-row';
 	import { FieldEdits } from '$lib/field-edit';
 	import { tip } from '$lib/tip';
@@ -1369,6 +1370,7 @@
 					{musicOffer.reason ??
 						'Repeats or drops whole phrases on bar lines, keeping the intro and the ending, until the music lasts as long as the picture.'}
 				</div>
+				<div style="margin-top:10px"><MusicStructure assetId={clip.asset_id} {music} /></div>
 				</InspectorSection>
 			{/if}
 

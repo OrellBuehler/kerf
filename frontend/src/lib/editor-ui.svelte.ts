@@ -109,6 +109,8 @@ class EditorUi {
 	exportDialog = $state(false);
 	/** The About dialog (Help › About Kerf). */
 	aboutDialog = $state(false);
+	/** The Relink-media dialog: opens on its own when a project comes up with media whose file is gone. */
+	relinkDialog = $state(false);
 	/** The read-only shortcut cheat sheet (`?`, Help › Keyboard shortcuts). */
 	shortcutSheet = $state(false);
 	/** The options the export dialog was last closed on, for the session (`export-draft.ts`). */
@@ -248,6 +250,14 @@ class EditorUi {
 
 	closeAbout() {
 		this.aboutDialog = false;
+	}
+
+	openRelink() {
+		this.relinkDialog = true;
+	}
+
+	closeRelink() {
+		this.relinkDialog = false;
 	}
 
 	openShortcuts() {

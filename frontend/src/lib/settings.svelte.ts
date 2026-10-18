@@ -9,11 +9,12 @@
 // so this holds only the resolved view and writes through `api.ts` — which
 // keeps the browser harness working over localStorage.
 
-import { clearRecentProjects, exportThemeFile, getSettings, importThemeFile, recentProjects, resetSettings, setMcpSettings, setSettings } from './api';
+import { clearRecentProjects, confirmAction, exportThemeFile, getSettings, importThemeFile, recentProjects, resetSettings, setMcpSettings, setSettings } from './api';
 import { toast } from './notifications.svelte';
 import { ui } from './editor-ui.svelte';
 import { mediaStatus } from './media-status.svelte';
 import { timeDisplay } from './time-display.svelte';
+import { CONFIRM } from './confirm-copy';
 import { DEFAULT_EDITING, clampSeconds, parseEditing, type EditingPrefs } from './editing-prefs';
 import { gpuPreview } from './gpu-preview.svelte';
 import { applyTheme, parseTheme, PRESETS, presetIdFor, themeJson, clampShape, upgradeStoredTheme, type ColorToken, type PresetId, type ShapeToken, type ThumbStyle, type Theme } from './theme';
@@ -358,6 +359,12 @@ class SettingsStore {
 		} catch {
 			/* a list that cannot be read is an empty menu, not a toast */
 		}
+	}
+
+	/** Forget the recent projects once the user has said so (File › Open Recent › Clear, Settings › General). */
+	async clearRecentAsked() {
+		const c = CONFIRM.clearRecent;
+		if (await confirmAction(c.message, c.title, c)) await this.clearRecent();
 	}
 
 	async clearRecent() {

@@ -12,6 +12,7 @@
 	import FitMusicDialog from '$lib/components/editor/FitMusicDialog.svelte';
 	import StemsDialog from '$lib/components/editor/StemsDialog.svelte';
 	import ShortcutSheet from '$lib/components/editor/ShortcutSheet.svelte';
+	import RelinkDialog from '$lib/components/editor/RelinkDialog.svelte';
 	import ContextMenu from '$lib/components/editor/ContextMenu.svelte';
 	import NotificationCenter from '$lib/components/editor/NotificationCenter.svelte';
 	import Icon from '$lib/components/editor/Icon.svelte';
@@ -47,8 +48,10 @@
 	} from '$lib/ops';
 	import { allowsRepeat, type ActionId } from '$lib/keymap';
 	import { runMenuCommand } from '$lib/menu-commands';
+	import type { MenuCommand } from '$lib/menus';
 	import { saveCoverFrame, saveProject } from '$lib/file-actions';
 	import { importCaptionFile } from '$lib/title-actions';
+	import { checkMissingOnOpen } from '$lib/library-actions';
 	import {
 		askUnsaved,
 		inTauri,
@@ -88,6 +91,7 @@
 			ui.voiceoverDialog !== null ||
 			ui.aboutDialog ||
 			ui.fitMusicDialog !== null ||
+			ui.relinkDialog ||
 			ui.stemsDialog !== null ||
 			ui.shortcutSheet
 	);
@@ -142,6 +146,8 @@
 
 	onMount(() => {
 		const firstLoad = editor.load();
+		// A project that comes up with media whose file is gone offers to relink it.
+		void firstLoad.then(() => checkMissingOnOpen());
 		void agent.load();
 		void ui.loadFonts();
 		void ui.loadTranscriptionStatus();
@@ -230,6 +236,7 @@
 			ui.projectReplaced();
 			await agent.load();
 			toast.info(`The agent switched to ${editor.projectName}`);
+			void checkMissingOnOpen();
 		}
 		/** The flag changed behind our back (an agent set it): re-read it, and say so
 		 *  — it is the user's own toolbar setting that moved. */
@@ -339,8 +346,9 @@
 		}
 	}
 
-	/** Open a project file — `path` when a launch handed one over, else the picker. */
-	async function openProjectAt(path?: string) {
+	/** Open a project file — `path` when a launch handed one over, else the picker; `recent` when it is one of
+	 *  File › Open Recent's (a file that has gone is then dropped from the list and said so). */
+	async function openProjectAt(path?: string, recent = false) {
 		if (!inTauri()) {
 			toast.info('Opening a project file is available in the desktop app.');
 			return;
@@ -348,14 +356,25 @@
 		if (renderRunning()) return;
 		if (!(await okToReplace())) return;
 		try {
-			if (await editor.openProject(path)) {
+			if (await (recent && path ? editor.openRecent(path) : editor.openProject(path))) {
 				ui.projectReplaced();
 				await agent.load();
 				toast.success(`Opened ${editor.projectName}`);
+				void checkMissingOnOpen();
 			}
 		} catch (e) {
 			toast.error(e instanceof Error ? e.message : String(e));
+		} finally {
+			// Opening puts the project at the top of the recent list; a file that has gone drops off it.
+			void settings.refreshRecent();
 		}
+	}
+
+	/** File › Open Recent's entries, and the one that clears the list; everything else is `runMenuCommand`'s. */
+	function onMenuCommand(c: MenuCommand) {
+		if (c.type === 'recent') void openProjectAt(c.path, true);
+		else if (c.type === 'recent-clear') void settings.clearRecentAsked();
+		else runMenuCommand(c);
 	}
 
 	async function onSave() {
@@ -669,7 +688,7 @@
 	inert={modalOpen}
 	style="position:fixed;inset:0;display:flex;flex-direction:column;background:var(--surface-void)"
 >
-	<TitleBar onAction={runAction} onCommand={runMenuCommand} />
+	<TitleBar onAction={runAction} onCommand={onMenuCommand} />
 	<!-- While a proposal is on screen the editor is showing a cut that is not
 	     the project's yet; say so where it cannot be missed, and keep its three answers — apply, discard, go
 	     back — in reach, so the review does not need the Agent panel open. The timeline is read-only here. -->
@@ -807,6 +826,10 @@
 
 {#if ui.shortcutSheet}
 	<ShortcutSheet onClose={() => ui.closeShortcuts()} />
+{/if}
+
+{#if ui.relinkDialog}
+	<RelinkDialog onClose={() => ui.closeRelink()} />
 {/if}
 
 <ContextMenu />

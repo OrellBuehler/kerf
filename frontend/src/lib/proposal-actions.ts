@@ -8,6 +8,7 @@ import { ui } from './editor-ui.svelte';
 import { toast } from './notifications.svelte';
 import { errorMessage } from './ops';
 import { discardNeedsConfirm, reviewTarget } from './proposal-ui';
+import { subsetTone } from './review-picks';
 import { editor } from './state.svelte';
 import type { DiffEntry } from './types';
 
@@ -38,7 +39,49 @@ export async function discardProposal(): Promise<boolean> {
 	}
 	try {
 		await editor.discardStaged();
-		toast.info('Discarded the proposed changes');
+		// A discard made by mistake is one press from undone: the backend keeps the last proposal thrown away.
+		toast.info('Discarded the proposed changes', { action: { label: 'Undo', onClick: () => void restoreProposal() } });
+		return true;
+	} catch (e) {
+		toast.error(errorMessage(e));
+		return false;
+	}
+}
+
+/** Bring the proposal that was thrown away back (the toast's Undo, the Agent panel's Restore). */
+export async function restoreProposal(): Promise<boolean> {
+	try {
+		await editor.restoreDiscarded();
+		toast.success('Brought the proposed changes back');
+		return true;
+	} catch (e) {
+		toast.error(errorMessage(e));
+		return false;
+	}
+}
+
+/** Accept only the picked changes (`entryIds`, from `review-picks.ts`). A stale cut asks first, as for the whole
+ *  proposal. Says what went in — core's own sentence, with what came along and what no longer applied — and leaves
+ *  the rest of the proposal open for review. Resolves to whether anything was applied. */
+export async function applyPicked(entryIds: string[]): Promise<boolean> {
+	const staged = editor.staged;
+	if (!staged || entryIds.length === 0) return false;
+	if (staged.stale && !(await confirmAction(CONFIRM.staleApply.message, CONFIRM.staleApply.title, CONFIRM.staleApply))) return false;
+	try {
+		const done = await editor.applyStagedSubset(entryIds, staged.stale);
+		(subsetTone(done) === 'warning' ? toast.warning : toast.success)(done.message);
+		return true;
+	} catch (e) {
+		toast.error(errorMessage(e));
+		return false;
+	}
+}
+
+/** Take back the agent's latest step inside the proposal; the live cut is untouched. */
+export async function undoProposalStep(): Promise<boolean> {
+	try {
+		const label = await editor.undoStagedStep();
+		toast.info(`Took “${label}” back out of the proposal`);
 		return true;
 	} catch (e) {
 		toast.error(errorMessage(e));

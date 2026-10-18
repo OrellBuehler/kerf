@@ -17,6 +17,8 @@
 	import type { MenuItem } from '$lib/context-menu.svelte';
 	import { getFrame, inTauri, revealPath } from '$lib/api';
 	import { importMedia } from '$lib/import-media';
+	import { relinkMediaFlow, removeMediaFlow } from '$lib/library-actions';
+	import { missingLine } from '$lib/library-copy';
 	import { toast } from '$lib/notifications.svelte';
 	import { thumbnails } from '$lib/thumbnails';
 	import { audioExtraction, mediaInfo, shortPath, specLine, thumbTime, type MediaInfo } from '$lib/media-info';
@@ -236,6 +238,21 @@
 			});
 		}
 
+		const gone = mediaStatus.isMissing(asset.id);
+		items.push({ type: 'separator' });
+		items.push({
+			label: gone ? 'Relink media…' : 'Relink to another file…',
+			icon: 'link',
+			action: () => void relinkMediaFlow(asset)
+		});
+		items.push({
+			label: 'Remove from project…',
+			icon: 'trash',
+			danger: true,
+			disabled: editor.locked,
+			reason: editor.locked ? 'Exit the proposal preview to edit' : undefined,
+			action: () => void removeMediaFlow(asset)
+		});
 		items.push({ type: 'separator' });
 		items.push({
 			label: 'Copy path',
@@ -310,6 +327,18 @@
 			{/if}
 		{:else}
 			<!-- asset list; the count and the import actions are the library's header -->
+			{#if mediaStatus.missingList.length > 0}
+				<!-- Files the project expects and the disk does not have: said once, over the list, with the way out. -->
+				<div
+					role="alert"
+					data-testid="missing-banner"
+					style="margin-bottom:8px;padding:8px 10px;border-radius:var(--radius-sm);background:color-mix(in srgb,var(--danger) 14%,transparent);border:var(--line-width) solid color-mix(in srgb,var(--danger) 40%,transparent);display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-primary)"
+				>
+					<Icon n="alert-triangle" s={13} color="var(--danger)" />
+					<span style="flex:1;min-width:0">{missingLine(mediaStatus.missingList)}</span>
+					<Btn size="sm" variant="secondary" onclick={() => ui.openRelink()}>Relink…</Btn>
+				</div>
+			{/if}
 			<div style="display:flex;flex-direction:column;gap:8px">
 				{#each assets as a (a.asset.id)}
 					{@const sel = a.asset.id === editor.selectedAssetId}
@@ -385,6 +414,11 @@ Drag onto a timeline track to add a clip · right-click for details`}
 							{/if}
 							{#if a.info.kind === 'image'}
 								<Badge tone="neutral">still</Badge>
+							{/if}
+							{#if mediaStatus.isMissing(a.asset.id)}
+								<span use:tip={`The file is not at ${a.asset.path}. Right-click to relink it.`}>
+									<Badge tone="danger">missing</Badge>
+								</span>
 							{/if}
 							{#if a.info.uses > 0}
 								<span use:tip={`Used in ${a.info.uses === 1 ? '1 clip' : `${a.info.uses} clips`} on the timeline`}>

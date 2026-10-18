@@ -8,6 +8,7 @@ import { toast } from './notifications.svelte';
 import { coverLine, failure, savedLine } from './failure-copy';
 import { ui } from './editor-ui.svelte';
 import { isCancelled } from './ops';
+import { settings } from './settings.svelte';
 
 /** Write the frame under the playhead as a cover image — the thumbnail a
  *  platform shows before anyone presses play. Rendered at the full delivery
@@ -43,6 +44,7 @@ export async function saveProject(): Promise<boolean> {
 		toast.error("Couldn't save the project", { description: e instanceof Error ? e.message : String(e) });
 		return false;
 	}
+	void settings.refreshRecent();
 	const path = editor.currentPath;
 	toast.success(path ? savedLine(path) : `Saved ${editor.projectName}`, {
 		...(path ? { action: { label: 'Show in folder', onClick: () => void revealPath(path).catch(() => {}) } } : {})

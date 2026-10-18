@@ -170,6 +170,7 @@ import type {
 import { clipDuration } from './types';
 import { timelineFps } from './timecode';
 import { trimRefusal } from './trim-tools';
+import { HISTORY_PAGE, redoable, undoable } from './paging';
 import { Generation, ReadOrder } from './generation';
 import { retimeKeyframes, withKeyframeAt } from './titles';
 import { normalize, pruneSelection, type PickMode } from './selection';
@@ -228,6 +229,11 @@ class EditorState {
 	selectedMetadata = $state<AssetMetadata | null>(null);
 	analyses = $state<Record<string, AssetAnalysis>>({});
 	history = $state<Revision[]>([]);
+	/** How many of the newest edits are loaded: a project is read from its latest `HISTORY_PAGE`, and more are
+	 *  asked for (`showOlderHistory`) — a long session is hundreds of revisions, and every edit re-reads the list. */
+	historyLimit = HISTORY_PAGE;
+	/** There may be edits older than the ones loaded. */
+	historyMore = $state(false);
 	/** The proposal a connected agent has staged, or null. */
 	staged = $state<StagedEdit | null>(null);
 	/** While true, `timeline` holds the *proposed* cut, not the live one. */
@@ -496,13 +502,11 @@ class EditorState {
 	}
 
 	get canUndo(): boolean {
-		const i = this.history.findIndex((r) => r.current);
-		return i > 0;
+		return undoable(this.history, this.historyMore);
 	}
 
 	get canRedo(): boolean {
-		const i = this.history.findIndex((r) => r.current);
-		return i >= 0 && i < this.history.length - 1;
+		return redoable(this.history);
 	}
 
 	assetName(assetId: string): string {
@@ -551,16 +555,19 @@ class EditorState {
 			// saved with ripple on has to open that way, and a new one has to reset
 			// the toggle, so it is read with everything else every load. (It never
 			// rejects — a failed read keeps what was showing.)
+			// A project is read from its newest edits; older ones are asked for (`showOlderHistory`).
+			this.historyLimit = HISTORY_PAGE;
 			const [assets, timeline, history, currentPath] = await Promise.all([
 				listAssets(),
 				getTimeline(),
-				getHistory(),
+				getHistory(this.historyLimit),
 				projectPath(),
 				this.loadRippleMode()
 			]);
 			this.assets = assets;
 			this.#setTimeline(timeline);
 			this.history = history;
+			this.historyMore = history.length >= this.historyLimit;
 			this.currentPath = currentPath;
 			this.loadEpoch++;
 			await this.refreshStaged();
@@ -771,10 +778,18 @@ class EditorState {
 
 	async refreshHistory() {
 		try {
-			this.history = await getHistory();
+			const history = await getHistory(this.historyLimit);
+			this.history = history;
+			this.historyMore = history.length >= this.historyLimit;
 		} catch {
 			/* history is best-effort; ignore */
 		}
+	}
+
+	/** Load another page of older edits (the Agent panel's History lists them newest first). */
+	async showOlderHistory() {
+		this.historyLimit += HISTORY_PAGE;
+		await this.refreshHistory();
 	}
 
 	/** Pick one or more media files and import them. All files probe

@@ -27,7 +27,11 @@ export type MenuCommand =
 	| { type: 'height'; preset: HeightPreset }
 	| { type: 'panel'; panel: PanelId }
 	/** Move a panel into a window of its own, or give it back. */
-	| { type: 'detach'; panel: PanelId };
+	| { type: 'detach'; panel: PanelId }
+	/** File › Open Recent: open this project file. */
+	| { type: 'recent'; path: string }
+	/** File › Open Recent › Clear: forget the list (after asking). */
+	| { type: 'recent-clear' };
 
 /** How an entry is announced and drawn: a plain item, a tickable one, or one of a
  *  group of which exactly one is ticked. */
@@ -82,6 +86,8 @@ export interface MenuState {
 	desktop: boolean;
 	/** The agent's proposal is on the timeline, read-only: every entry that edits the cut is off, with the reason. */
 	previewing: boolean;
+	/** The `.kerf` files opened or saved most recently, newest first (File › Open Recent). */
+	recent: readonly string[];
 }
 
 const sep: MenuEntry = { kind: 'separator' };
@@ -94,6 +100,38 @@ const act = (id: ActionId, extra: Partial<Omit<Extract<MenuEntry, { kind: 'actio
 const NEEDS_SELECTION = 'Select a clip first';
 const NEEDS_CLIPS = 'The cut has no clips';
 const DESKTOP_ONLY = 'Available in the desktop app';
+
+const lastSegment = (path: string) => path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+
+/** The entries of File › Open Recent: each project by its file name — with its folder after it when two share one —
+ *  then the way to clear the list. With none, one greyed entry that says where they come from. */
+export function recentItems(recent: readonly string[]): MenuEntry[] {
+	if (recent.length === 0)
+		return [
+			{
+				kind: 'command',
+				command: { type: 'recent-clear' },
+				label: 'No recent projects',
+				role: 'item',
+				disabled: true,
+				reason: 'Projects you open or save are listed here'
+			}
+		];
+	const names = recent.map(lastSegment);
+	const parentOf = (p: string) => p.split(/[\\/]/).filter(Boolean).slice(-2, -1)[0] ?? '';
+	return [
+		...recent.map(
+			(p, i): MenuEntry => ({
+				kind: 'command',
+				command: { type: 'recent', path: p },
+				label: names.filter((n) => n === names[i]).length > 1 ? `${names[i]} — ${parentOf(p)}` : names[i],
+				role: 'item'
+			})
+		),
+		sep,
+		{ kind: 'command', command: { type: 'recent-clear' }, label: 'Clear recent projects…', role: 'item' }
+	];
+}
 
 export function buildMenus(s: MenuState): MenuDef[] {
 	// An entry that edits the cut: off while the proposal is previewed (the cut on screen is the agent's, not the
@@ -112,6 +150,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 		items: [
 			act('file.new'),
 			act('file.open'),
+			{ kind: 'submenu', label: 'Open Recent', items: recentItems(s.recent) },
 			sep,
 			// The registry's own label is "Save project…"; once the project has a file the same command writes a copy.
 			act('file.save', s.saved ? { label: 'Save project as…' } : {}),

@@ -42,5 +42,9 @@ export function runMenuCommand(c: MenuCommand): void {
 		case 'detach':
 			popout.toggle(c.panel);
 			break;
+		// File › Open Recent needs the page's unsaved-work question; the page runs those (`onMenuCommand`).
+		case 'recent':
+		case 'recent-clear':
+			break;
 	}
 }
