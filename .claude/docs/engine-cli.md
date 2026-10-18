@@ -460,9 +460,12 @@ so the feature is **only** activated through these forwards — which is what ma
   constant-power**: an `afade` that is wholly a transition's overlap (`ClipFx::afade_in` on the
   incoming clip, `tail` on the outgoing one, with no clip fade or dip folded into it) gets
   `:curve=qsin` (sin in, cos out; linear ramps dipped 3 dB mid-way), anything mixed keeps the old
-  linear ramp. Rendered: `a_crossfade_keeps_the_power_constant` (two tones, ±0.3 dB through the
+  linear ramp, and so does a crossfade between two clips of **one asset** (`ClipFx::afade_in_same` /
+  `tail_same`): that sound is correlated — a music fit's splice, a cut inside one take — and a linear
+  pair sums it to unity where qsin swells +3 dB (the music-fit render tests are sample-exact on it). Rendered: `a_crossfade_keeps_the_power_constant` (two tones, ±0.3 dB through the
   overlap; -2 dB at a quarter with the curve compiled out). `audio-mix.ts` mirrors it (`crossfadeIn`,
-  `fadeInTimes`: the preview ramps through 16 points of the sine).
+  `fadeInTimes`: the preview ramps through 16 points of the sine; `crossfadesFromItself` is the
+  same-asset rule).
   **The scrubbed still draws fades, dips, dissolves, slides and pushes as the file does**
   (`engine/cli/still_fx.rs`; it used to show each clip's own span unfaded — the incoming clip alone
   inside a dissolve, 176 levels off the export's frame — and the agent's `timeline_frame`, the cover

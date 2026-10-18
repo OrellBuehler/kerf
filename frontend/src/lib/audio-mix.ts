@@ -8,10 +8,13 @@
  *    gain. */
 
 import { propertyCurve, volumeAnimated, volumeAt } from './channels';
-import type { Clip } from './types';
+import { clipDuration, type Clip } from './types';
 
-/** What decides a clip's gain: its volume, fades and a transition into it. */
-export type GainClip = Pick<Clip, 'volume' | 'fade_in' | 'fade_out' | 'transition_in' | 'channels'>;
+/** What decides a clip's gain: its volume, fades and a transition into it. `same_source` (the
+ *  preview's own, from `crossfadesFromItself`) marks a crossfade from a clip of the same asset. */
+export type GainClip = Pick<Clip, 'volume' | 'fade_in' | 'fade_out' | 'transition_in' | 'channels'> & {
+	same_source?: boolean;
+};
 
 /** A clip's fade-in length, seconds. A transition approximates as an extra fade-in
  *  (the export folds it in the same way). */
@@ -22,9 +25,26 @@ export const fadeOutOf = (clip: GainClip): number => clip.fade_out ?? 0;
 
 /** Whether the fade-in is wholly a dissolve or motion transition's overlap — half of a crossfade
  *  pair, which the export ramps constant-power (`afade` `curve=qsin`: `sin(x·π/2)`). A fade with a
- *  clip fade in it, or a dip, stays linear, as there. */
+ *  clip fade in it, a dip, or a crossfade from the same asset (correlated sound) stays linear, as there. */
 export const crossfadeIn = (clip: GainClip): boolean =>
-	!(clip.fade_in ?? 0) && (clip.transition_in?.duration ?? 0) > 0 && !clip.transition_in!.kind.startsWith('dip_');
+	!(clip.fade_in ?? 0) &&
+	!clip.same_source &&
+	(clip.transition_in?.duration ?? 0) > 0 &&
+	!clip.transition_in!.kind.startsWith('dip_');
+
+/** Whether `clip`'s transition crossfades from a clip of its own asset: the clip just before it
+ *  on its track, touching it (`transition_fx`'s partner), plays the same asset. */
+export function crossfadesFromItself(clips: Clip[], clip: Clip): boolean {
+	if (!clip.transition_in) return false;
+	const before = clips
+		.filter((c) => c.id !== clip.id && c.timeline_start < clip.timeline_start)
+		.sort((a, b) => b.timeline_start - a.timeline_start)[0];
+	return (
+		!!before &&
+		before.asset_id === clip.asset_id &&
+		Math.abs(before.timeline_start + clipDuration(before) - clip.timeline_start) < 1e-3
+	);
+}
 
 /** The gain a fade-in leaves at `x` of the way through it (0..1). */
 export const fadeInGain = (clip: GainClip, x: number): number => {

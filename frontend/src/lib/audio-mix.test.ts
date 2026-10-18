@@ -3,6 +3,7 @@ import {
 	clipGainAt,
 	CROSSFADE_STEPS,
 	crossfadeIn,
+	crossfadesFromItself,
 	fadeInOf,
 	fadeInTimes,
 	fadeOutOf,
@@ -88,6 +89,16 @@ describe('a crossfade-in is constant-power, as the export draws it', () => {
 		}
 		expect(fadeInTimes(x, 10)).toHaveLength(CROSSFADE_STEPS);
 		expect(fadeInTimes(x, 10).at(-1)).toBe(12);
+	});
+	test('a crossfade from a clip of the same asset is correlated sound and stays linear', () => {
+		const a = { id: 'a', asset_id: 's', source_in: 0, source_out: 10, timeline_start: 0 } as never;
+		const b = { id: 'b', asset_id: 's', source_in: 20, source_out: 30, timeline_start: 10, transition_in: { kind: 'crossfade', duration: 2 } };
+		expect(crossfadesFromItself([a, b as never], b as never)).toBe(true);
+		expect(crossfadesFromItself([a, { ...b, asset_id: 'o' } as never], { ...b, asset_id: 'o' } as never)).toBe(false);
+		expect(crossfadesFromItself([a, { ...b, timeline_start: 12 } as never], { ...b, timeline_start: 12 } as never)).toBe(false);
+		const same = { ...b, volume: 1, same_source: true } as never;
+		expect(crossfadeIn(same)).toBe(false);
+		expect(clipGainAt(same, 11, 10, 20)).toBeCloseTo(0.5, 12);
 	});
 	test('a clip fade beside it, a dip, or no transition stays linear', () => {
 		const mixed = { volume: 1, fade_in: 0.5, transition_in: { kind: 'crossfade', duration: 1.5 } } as never;

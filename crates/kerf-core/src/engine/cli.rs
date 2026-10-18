@@ -8527,14 +8527,21 @@ fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, 
     // A fade that is wholly a transition's overlap is half of a crossfade pair, and
     // the pair is constant-power (`qsin`: sin in, cos out, so the summed power stays
     // put) where linear ramps dip about 3 dB at the midpoint. A fade with a clip fade
-    // or a dip in it keeps the linear ramp it always had.
-    let crossfade = |fade: f64, own: f64| if fade > 0.0 && own <= 0.0 { ":curve=qsin" } else { "" };
+    // or a dip in it keeps the linear ramp it always had, and so does a crossfade
+    // between two clips of one asset: correlated sound, which a linear pair keeps at unity.
+    let crossfade = |fade: f64, own: f64, same: bool| {
+        if fade > 0.0 && own <= 0.0 && !same {
+            ":curve=qsin"
+        } else {
+            ""
+        }
+    };
     if fi > 0.0 {
-        let curve = crossfade(fx.afade_in, clip.fade_in + fx.black_in + fx.white_in);
+        let curve = crossfade(fx.afade_in, clip.fade_in + fx.black_in + fx.white_in, fx.afade_in_same);
         p.push(format!("afade=t=in:st=0:d={}{curve}", fi.clamp(0.0, dur)));
     }
     if fo > 0.0 {
-        let curve = crossfade(fx.tail, clip.fade_out + fx.black_out + fx.white_out);
+        let curve = crossfade(fx.tail, clip.fade_out + fx.black_out + fx.white_out, fx.tail_same);
         p.push(format!(
             "afade=t=out:st={}:d={}{curve}",
             (dur - fo).max(0.0),
@@ -13856,22 +13863,31 @@ mod tests {
 
     #[test]
     fn a_crossfade_is_constant_power_and_a_clip_fade_stays_linear() {
-        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let (asset, other) = (av_asset(Uuid::new_v4(), 20.0), av_asset(Uuid::new_v4(), 20.0));
+        let both = [asset.clone(), other.clone()];
         let a = make_clip(asset.id, 0.0, 10.0, 0.0);
-        let mut b = make_clip(asset.id, 0.0, 10.0, 10.0);
+        let mut b = make_clip(other.id, 0.0, 10.0, 10.0);
         b.transition_in = Some(crate::model::Transition {
             kind: TransitionKind::Crossfade,
             duration: 1.0,
         });
-        let g = graph_of(&single(vec![a.clone(), b.clone()]), std::slice::from_ref(&asset));
+        let g = graph_of(&single(vec![a.clone(), b.clone()]), &both);
         assert!(g.contains("afade=t=out:st=10:d=1:curve=qsin,"), "{g}");
         assert!(g.contains("afade=t=in:st=0:d=1:curve=qsin,"), "{g}");
+
+        // Two clips of one asset carry correlated sound: the linear pair keeps it at unity.
+        let mut same = b.clone();
+        same.asset_id = asset.id;
+        let g = graph_of(&single(vec![a.clone(), same]), std::slice::from_ref(&asset));
+        assert!(g.contains("afade=t=out:st=10:d=1,"), "{g}");
+        assert!(g.contains("afade=t=in:st=0:d=1,"), "{g}");
+        assert!(!g.contains("qsin"), "{g}");
 
         // A clip fade beside the transition keeps the one linear ramp it always had.
         let (mut a2, mut b2) = (a.clone(), b.clone());
         a2.fade_out = 0.5;
         b2.fade_in = 0.25;
-        let g = graph_of(&single(vec![a2, b2]), std::slice::from_ref(&asset));
+        let g = graph_of(&single(vec![a2, b2]), &both);
         assert!(g.contains("afade=t=out:st=9.5:d=1.5,"), "{g}");
         assert!(g.contains("afade=t=in:st=0:d=1.25,"), "{g}");
         assert!(!g.contains("qsin"), "{g}");
@@ -13882,7 +13898,7 @@ mod tests {
             kind: TransitionKind::DipToBlack,
             duration: 1.0,
         });
-        let g = graph_of(&single(vec![a, dip]), &[asset]);
+        let g = graph_of(&single(vec![a, dip]), &both);
         assert!(g.contains("afade=t=in:st=0:d=0.5,"), "{g}");
         assert!(!g.contains("qsin"), "{g}");
     }

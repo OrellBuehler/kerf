@@ -92,6 +92,11 @@ pub struct ClipFx {
     /// for a crossfade; a motion transition sets it too, because the picture
     /// sliding is no reason for the audio to cut hard.
     pub afade_in: f64,
+    /// The sound either side of the crossfade into this clip (`afade_in`) / out of it (`tail`)
+    /// is one asset's, so correlated — a music fit's splice, a cut inside one take. Such a
+    /// pair stays linear: its gains sum to one, where a constant-power pair would swell.
+    pub afade_in_same: bool,
+    pub tail_same: bool,
     /// Motion transitions, as `(dx, dy, seconds)` with the offsets in frame
     /// widths and heights. `move_in` is where the incoming clip starts before
     /// travelling to its position; `move_out` is where the outgoing clip is
@@ -226,6 +231,10 @@ pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
                             // no handle — it just becomes a hard cut).
                             let overlap = d.min(p.duration()).min(clip.duration()).min(avail.max(0.0));
                             fx[base + pj].tail = fx[base + pj].tail.max(overlap);
+                            if overlap > 0.0 && p.asset_id == clip.asset_id {
+                                fx[base + pj].tail_same = true;
+                                fx[base + j].afade_in_same = true;
+                            }
                             if overlap > 0.0 && tr.kind.pushes() {
                                 if let Some((dx, dy)) = slide {
                                     // The outgoing clip leaves the way the incoming one
