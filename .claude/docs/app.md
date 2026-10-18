@@ -80,9 +80,11 @@ that records no revision and returns no timeline), voiceover
 (`voiceover_status`, `prepare_voiceover` / `generate_voiceover` → emit
 `voiceover-progress`, `cancel_voiceover`), composed music (`music_status`; `prepare_music` downloads the SoundFont;
 `compose_music { request }` takes a core `ComposeRequest` — `{score, track_id?, at?, align?, replace_clip_id?}` — checks
-and aligns it under the lock, renders with the lock released and lands it through `place_music` with the plan's
-**pinned** `at`, answering the `Composed` fields flattened (`asset`, `clip`, `score` as rendered, `align`, `replaced`)
-plus the refreshed `timeline`; both emit `music-progress` — the voiceover's payload, stages `download_soundfont`,
+and aligns it under the lock (rehearsing the placement too, so a start on another clip of the track is refused before
+the render, as the project's ripple flag decides), renders with the lock released and lands it through `place_music`
+with the request's own `track_id` / `at` / `replace_clip_id` as given (a refused placement stores nothing), answering the
+`Composed` fields flattened (`asset`, `clip`, `score` as rendered, `align`, `replaced`: the ids of the clips replaced —
+the whole bed of `replace_clip_id`, empty when a clip was added) plus the refreshed `timeline`; both emit `music-progress` — the voiceover's payload, stages `download_soundfont`,
 `waiting`, `render` — and `cancel_music` rejects `music cancelled`), band balance (`get_band_balance { request }`, a core
 `BandBalanceRequest`, answering `BandBalance`; the decode runs with the lock released and `cancel_band_balance` rejects
 `band balance cancelled`), every editing

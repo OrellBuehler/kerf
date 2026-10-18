@@ -4845,8 +4845,8 @@ pub use score::{
     bar_seconds, duration_s as score_duration_s, expand as expand_score, plan_score_to_picture, AlignOptions, AlignReport,
     Arrangement, BeatReading, Chord, Colour, CutAlignment, HitKind, InstrumentOverrides, Key, Makeup, Mix, Mode, MusicScore,
     MusicStyle, NoteEvent, Quality, Resolved, Role, ScoreHit, ScoreSection, SectionKind, SectionSpan, Sidechain,
-    DEFAULT_MAX_TEMPO_CHANGE, MAX_BPM, MAX_HITS, MAX_SCORE_BARS, MAX_SCORE_SECONDS, MAX_SECTIONS, MAX_SECTION_BARS, MIN_BPM,
-    RELEASE_TAIL_S, ROLES,
+    DEFAULT_MAX_TEMPO_CHANGE, MAX_BPM, MAX_HITS, MAX_SCORE_BARS, MAX_SCORE_SECONDS, MAX_SECTIONS, MAX_SECTION_BARS, MAX_SEED,
+    MIN_BPM, RELEASE_TAIL_S, ROLES,
 };
 
 #[cfg(test)]

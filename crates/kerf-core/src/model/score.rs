@@ -36,6 +36,10 @@ pub const MAX_SCORE_BARS: u32 = 400;
 pub const MAX_SCORE_SECONDS: f64 = 600.0;
 pub const MAX_HITS: usize = 256;
 pub const MAX_CHORDS_PER_SECTION: usize = 64;
+/// The largest seed: 2^53 - 1, the largest integer a JavaScript number (and so a JSON round-trip
+/// through the webview or an agent) holds exactly. A bigger one would come back as another seed
+/// and render another piece.
+pub const MAX_SEED: u64 = (1 << 53) - 1;
 
 /// How long the sound rings on after the last bar, seconds (shortened at fast tempos so it is
 /// never a whole extra bar): the final chord's release and the reverb. A score lasts
@@ -240,8 +244,10 @@ pub struct MusicScore {
     pub sections: Vec<ScoreSection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hits: Vec<ScoreHit>,
-    /// Varies the humanization and the hook; the same score and seed are the same audio.
+    /// Varies the humanization and the hook; the same score and seed are the same audio. 0 to
+    /// 2^53 - 1 (9007199254740991): the largest integer JSON in JavaScript keeps exactly.
     #[serde(default)]
+    #[schemars(range(max = MAX_SEED))]
     pub seed: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruments: Option<InstrumentOverrides>,
@@ -312,6 +318,12 @@ impl MusicScore {
             return Err(invalid(format!("bpm must be {MIN_BPM}..={MAX_BPM} (got {})", self.bpm)));
         }
         let key = Key::parse(&self.key).map_err(invalid)?;
+        if self.seed > MAX_SEED {
+            return Err(invalid(format!(
+                "seed must be 0..={MAX_SEED} (2^53 - 1, so it survives JSON in JavaScript; got {})",
+                self.seed
+            )));
+        }
         if self.sections.is_empty() {
             return Err(invalid("the score needs at least one section".to_string()));
         }
@@ -627,6 +639,31 @@ mod tests {
             ..Default::default()
         });
         assert!(s.validate().unwrap_err().to_string().contains("instruments.lead"));
+    }
+
+    #[test]
+    fn a_seed_must_survive_a_trip_through_javascript() {
+        let mut s = song(MusicStyle::Pop);
+        s.seed = MAX_SEED;
+        s.validate().unwrap();
+        // The biggest seed is the biggest integer an f64 (a JS number) holds exactly.
+        let json = serde_json::to_string(&s).unwrap();
+        let through_js: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let as_number = through_js["seed"].as_u64().unwrap() as f64;
+        assert_eq!(as_number as u64, MAX_SEED);
+        assert_eq!(
+            (MAX_SEED + 1) as f64,
+            (MAX_SEED + 2) as f64,
+            "2^53 and 2^53 + 1 are one JS number"
+        );
+        s.seed = MAX_SEED + 1;
+        let e = s.validate().unwrap_err().to_string();
+        assert!(
+            e.contains("seed must be 0..=9007199254740991") && e.contains("JavaScript"),
+            "{e}"
+        );
+        s.seed = u64::MAX;
+        assert!(s.validate().unwrap_err().to_string().contains("seed"));
     }
 
     #[test]

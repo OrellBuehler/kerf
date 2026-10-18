@@ -312,14 +312,23 @@
   audio track, of a **composed** asset, with no clip of the bed linked to a picture — then the music's start (the
   **earliest clip of the replaced bed**, else `at`, else the end of the track) and, with `align`, the **working
   timeline's** cuts (the boundaries *between* the clips of a video track, the picture's first start and last end being
-  its edges) or markers go to `plan_score_to_picture`. The plan holds the fitted score, the `AlignReport`, the
+  its edges) or markers go to `plan_score_to_picture`. **Last, the placement is rehearsed** (`check_music_fits`): a
+  stand-in asset of the fitted score's length goes through the same `put_music` and then `ripple_lanes` (when
+  `ripple_active()` — the project's flag or a `with_ripple` override around the call) and `check_own_lanes`, exactly
+  what `edit_timeline` does, so a start (`at`) that lands on another clip of the track, or a longer recomposed piece
+  that would run into the next clip, is refused **before the render** with edit_timeline's own words ("the clip would
+  overlap another clip on M at …"); with ripple on a piece that only *pushes* what is there passes (a start *inside* a
+  clip still fails: ripple never splits one). The render is never shorter than the score (`ceil` frames), so the
+  rehearsal can pass what placing refuses by a frame, never the reverse. The plan holds the fitted score, the `AlignReport`, the
   request's own `track_id` / `at` / `replace_clip_id` **as given** (a `None` start is resolved when the music is
   placed, after what the track holds *then*), `replaces` (the clip ids of the bed, in time order; empty when a clip is
   added) and `music_start` (what the alignment used; informational) → static `synthesize_music(score, progress,
   cancel) -> Asset` (renders with the lock released, probes, names it `Music: <title>`) → `place_music(asset,
-  track_id?, timeline_start?, replace_clip_id?)` under the lock: **the score is resolved and the target checked
-  before anything is stored** (an unresolvable score, a bad or locked target store no asset and no analysis); then the
-  asset is stored (the same score is the same file, so the same asset), **its analysis is written from the score**
+  track_id?, timeline_start?, replace_clip_id?)` under the lock: the score is resolved first (`rhythm`), then **the
+  asset, its analysis and the edit are one transaction** — the store and the analysis run *inside* the `edit_timeline`
+  closure, so a refused placement (a locked or bad target, a clip in the way, a bed linked to a picture) rolls back
+  and stores no asset and no analysis, a staged agent edit included (an asset that was already in the library stays);
+  the asset is stored (the same score is the same file, so the same asset), **its analysis is written from the score**
   (`Rhythm` kind: the exact grid as a full-confidence `Tempo`, the bars and phrases as `MusicAnalysis`, onsets, class
   music — nothing is analysed, so `get_music_structure`, `fit_music` and the beat snap work at once; other kinds an
   earlier pass cached stay), and **one `Add music` edit** puts the clip on the audio track named **`M`** (`MUSIC_TRACK`,

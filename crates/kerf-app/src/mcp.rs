@@ -213,6 +213,7 @@ struct VoiceoverParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ComposeAlignParams {
     #[schemars(
         description = "What to fit the music to: `cuts` (the boundaries between the clips of a video track; the picture's first start and last end are not cuts) or `markers` (every timeline marker). Read from the cut you are proposing, staged edits included."
@@ -245,11 +246,11 @@ struct ComposeMusicParams {
     )]
     align: Option<ComposeAlignParams>,
     #[schemars(
-        description = "UUID of a music clip made by compose_music: swap it to the new render instead of adding a clip. This is how a score is edited and composed again. The clip keeps its place, gain, fades and effects; its length becomes the new render's."
+        description = "UUID of a music clip made by compose_music: replace its music with the new render instead of adding a clip. This is how a score is edited and composed again. The WHOLE bed goes: every clip of that clip's asset on its track (what fit_music made of one piece, in segments) becomes ONE clip of the new render, at the earliest of their starts, with the gain, fade-in and effects of the first and the fade-out of the last; its length becomes the render's. Refused: a clip that is not composed music, a locked track, music linked to a picture (unlink_clips first). The answer's `replaced` lists the clip ids that were replaced."
     )]
     replace_clip_id: Option<String>,
     #[schemars(
-        description = "Ripple override for placing the music. Omitted, the project's ripple mode applies (get_ripple_mode). Matters when a replacement is longer than the clip it replaces: with ripple on, the later clips on its track are pushed later; with it off, a replacement that would run into the next clip is refused. Appending to the track moves nothing either way."
+        description = "Ripple override for placing the music, and for the check made before it renders. Omitted, the project's ripple mode applies (get_ripple_mode). It matters when the music lands on or runs into other clips of its track: with ripple on they are pushed later (a start inside a clip is still refused, ripple never splits a clip); with it off the request is refused before anything renders. Appending to the track moves nothing either way. Ripple is an attempt: it is skipped on a locked track, and a lane it would leave overlapping is refused."
     )]
     ripple: Option<bool>,
     #[schemars(
@@ -3966,11 +3967,11 @@ impl KerfMcp {
                        style: tropical_house (four-on-the-floor, marimba stabs, pan-flute hook, 100-120 BPM), pop (backbeat, fingered bass, piano, strings, 100-124), lofi (lazy swung boom-bap, Rhodes sevenths, vibraphone, 70-90), cinematic (strings, horns, timpani and big hits, 60-100), ambient (pad and harp, no real beat, 55-80), rock (power-chord guitar, picked bass, live drums, 100-150); music_status lists them with a tempo. \
                        sections = [{kind, bars, chords, energy?}] played in order, bars 1-128 each, 400 bars and 10 minutes at most. kind shapes the arrangement: intro (sparse: pad and a hint of the groove), verse (the steady groove), build (pulsing bass, a snare roll that quickens, a riser into whatever follows), drop (everything at once, with a crash and impact), breakdown (no kick or bass: pad, keys and hook), outro (thins out and its last bar resolves on the tonic chord). A typical piece: intro, build, drop, breakdown, build, drop, outro. energy 0-1 sets how loud and busy a section is when its kind's default is not what you want (intro 0.3, verse 0.5, build 0.7, drop 1, breakdown 0.3, outro 0.3). \
                        chords: ONE per bar; a list shorter than bars cycles, so [\"vi\",\"IV\",\"I\",\"V\"] over 8 bars plays the four chords twice. Write chord names (C, Em, F#m7, Gsus4, D/F#, Bbmaj7, E5, Cadd9, Am7b5 — types: maj min dim aug sus2 sus4 5 7 maj7 m7 m7b5 dim7 6 m6 add9 madd9 9 maj9 m9) or roman numerals in the score's key (I, V, vi, IV, ii7, bVII): upper case is major, lower case minor, a trailing 7 / maj7 / sus4 etc. adds the type, a leading b or # moves the root a semitone, and numerals count the key's own scale (in A minor, VI is F and VII is G). lofi turns plain triads into sevenths and ambient adds a ninth. \
-                       hits = [{at_s, kind}] — moments in the picture, at_s in seconds from the START OF THE MUSIC (not the timeline): impact (a crash, timpani and low boom), riser (a rising sweep about a bar long that peaks at at_s), dropout (everything but the effects goes silent for one beat from at_s), whoosh (a ~1 s sweep peaking at at_s). A drop already opens with its own crash and impact, so hits are for moments in the picture the sections do not cover (align adds them at cuts for you). seed varies the humanization and the hook; instruments overrides a role's General MIDI program (drums, bass, pad, keys, lead: 0-127). A score that is wrong (an unknown chord, bars 0, a hit past the end) is refused with the offending section or chord named. \
-                       ALIGN: with align {to: \"cuts\" | \"markers\", track_id?, max_tempo_change?} the score is fitted to the picture of the cut you are proposing before it is rendered: the tempo is nudged (within max_tempo_change, default 0.06 = 6 %) so as many cuts as possible land on beats (a downbeat counts double), then an impact is added on every cut that lands on a downbeat and a dropout plus riser before a drop that a cut lands within a beat of. To make a cut hit hard, lay out the sections so a drop starts near it. Cuts are the boundaries between the clips of a video track (default: the first); give `at` if the music does not start at 0. Align after the picture is cut: a later edit moves the cuts, and the music is then composed again with replace_clip_id. The answer's `align` lists the cuts on a beat / downbeat before and after and the hits added, and `score` is the score actually rendered (new bpm, added hits). \
-                       RECOMPOSE: the score rides on its asset (list_assets shows `music_score`). To change a piece, edit that score and call again with replace_clip_id set to the music's clip: it keeps its place, gain, fades and effects and takes the new length. \
+                       hits = [{at_s, kind}] — moments in the picture, at_s in seconds from the START OF THE MUSIC (not the timeline): impact (a crash, timpani and low boom), riser (a rising sweep about a bar long that peaks at at_s), dropout (everything but the effects goes silent for one beat from at_s), whoosh (a ~1 s sweep peaking at at_s). A drop already opens with its own crash and impact, so hits are for moments in the picture the sections do not cover (align adds them at cuts for you). seed (an integer 0-9007199254740991, i.e. 2^53 - 1; a bigger one is refused) varies the humanization and the hook; instruments overrides a role's General MIDI program (drums, bass, pad, keys, lead: 0-127). A score that is wrong (an unknown chord, bars 0, a hit past the end) is refused with the offending section or chord named, and so is a field the score does not have: a misspelled `chord`, `enrgy` or `at` is an error, not a silent default. \
+                       ALIGN: with align {to: \"cuts\" | \"markers\", track_id?, max_tempo_change?} the score is fitted to the picture of the cut you are proposing before it is rendered. The tempo is nudged (within max_tempo_change, default 0.06 = 6 %, at most 0.25; never to one that ends the piece before a hit you wrote) so as many cuts as possible land on beats (a downbeat counts double). Then hits are added: an impact on every cut that lands on a downbeat; and for each `drop` that starts more than a beat in and that a cut lands within a beat of, a dropout (a beat of silence) one beat before it, plus a riser peaking at the drop's start — except when the drop follows a build (the build ends in its own riser) or starts earlier than half a bar, where only the dropout is added. Hits within 50 ms of one you wrote are not added twice, and a score stops at 256 hits (`align.notes` says if some were left out). To make a cut hit hard, lay out the sections so a drop starts near it. Cuts are the boundaries between the clips of a video track (default: the first); give `at` if the music does not start at 0. Align after the picture is cut: a later edit moves the cuts, and the music is then composed again with replace_clip_id. The answer's `align` lists the cuts on a beat / downbeat before and after and the hits added, and `score` is the score actually rendered (new bpm, added hits). \
+                       RECOMPOSE: the score rides on its asset (list_assets shows `music_score`). To change a piece, edit that score and call again with replace_clip_id set to any clip of the music: the WHOLE bed is replaced — every clip of that asset on its track (fit_music turns one piece into several segments) becomes ONE clip of the new render, at the earliest of their starts, with the named clip's id, the first one's gain, fade-in and effects, the last one's fade-out and the new length (fit_music it again if the piece should be another length). Refused before anything renders: a clip that is not composed music, a locked track, music linked to a picture (unlink_clips first), and — with ripple off — a longer piece that would run into the next clip. The answer's `replaced` lists the clip ids that were replaced (empty when a clip was added). \
                        The asset's tempo and bar structure are written from the score, so get_music_structure, fit_music and snap_to_beats work at once (no analyze_asset needed). Then: fit_music if the picture is longer or shorter than the piece (or compose to the length you need), set_track_duck plus set_master_duck to dip it under dialogue, and check it with get_levels and get_band_balance. \
-                       The first call downloads the SoundFont (~32 MB). A piece renders in seconds to about a minute — send a `progressToken` for progress (stages download_soundfont, waiting, render) and cancel the request to stop it, or pass `background: true` for a job_id. The rendered audio lands for the user at once like an import; placing it on the timeline is an ordinary staged edit. `track_id`, `replace_clip_id` and `align` are checked before anything renders. Returns {asset, clip, score, align, replaced}."
+                       The first call downloads the SoundFont (~32 MB). A piece renders in seconds to about a minute — send a `progressToken` for progress (stages download_soundfont, waiting, render) and cancel the request to stop it, or pass `background: true` for a job_id. The rendered audio lands for the user at once like an import; placing it on the timeline is an ordinary staged edit. Before anything renders it is checked that the score is valid, that the track, the replaced clip and the align target are usable and not locked, and — by rehearsing the placement under the ripple in force — that the music will not land on another clip of its track (the refusal says where); if the cut changes while it renders, placing it is checked again and, if refused, stores nothing. Returns {asset, clip, score, align, replaced: [clip ids]}."
     )]
     async fn compose_music(
         &self,
@@ -3994,12 +3995,17 @@ impl KerfMcp {
             replace_clip_id: id("replace_clip_id", &p.replace_clip_id)?,
         };
         let owner = self.owner();
-        // Everything that can be said wrong about the request is said now, before a minute of
-        // rendering. A proposal another session owns refuses here too, not after the render.
+        // Checked now, before a minute of rendering, under the ripple this call will have: the
+        // score, the track, clip and align target, a locked track and a rehearsal of the
+        // placement (landing on another clip of the track is refused as `edit_timeline` refuses
+        // it). A proposal another session owns refuses here too. What changes while it renders
+        // is checked again when the music is placed, and a refusal there stores nothing.
         let (plan, generation) = {
             let project = lock_agent_edit(&self.project, owner.as_deref())?;
             (
-                project.compose_music_inputs(&request).map_err(core_err)?,
+                project
+                    .with_ripple(p.ripple, |project| project.compose_music_inputs(&request))
+                    .map_err(core_err)?,
                 project.generation(),
             )
         };
@@ -7538,6 +7544,14 @@ mod tests {
             "fit_music",
             "ONE per bar",
             "progressToken",
+            "9007199254740991",
+            "WHOLE bed",
+            "unlink_clips",
+            "replaced",
+            "half a bar",
+            "build",
+            "256 hits",
+            "misspelled",
         ] {
             assert!(compose.contains(needle), "the description should mention {needle}");
         }
@@ -7602,10 +7616,49 @@ mod tests {
         assert_eq!(p.align.unwrap().to, kerf_core::AlignTo::Cuts);
 
         let mut bad = p.score;
+        bad.seed = kerf_core::MAX_SEED + 1;
+        let e = super::core_err(bad.validate().unwrap_err());
+        assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(e.message.contains("seed must be 0..=9007199254740991"), "{}", e.message);
+        bad.seed = 0;
         bad.sections[1].chords = vec!["Hm".to_string()];
         let e = super::core_err(bad.validate().unwrap_err());
         assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert!(e.message.contains("sections[1]") && e.message.contains("Hm"), "{}", e.message);
+    }
+
+    /// A misspelled field is an error, not a default: in the score, in its sections and hits, and in
+    /// the align block.
+    #[test]
+    fn a_misspelled_compose_music_field_is_refused() {
+        let call = |score: serde_json::Value, align: serde_json::Value| {
+            serde_json::from_value::<super::ComposeMusicParams>(serde_json::json!({ "score": score, "align": align }))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        let score = |section: serde_json::Value, extra: serde_json::Value| {
+            let mut s = serde_json::json!({"bpm": 100, "key": "C", "style": "pop", "sections": [section]});
+            if let (Some(s), Some(extra)) = (s.as_object_mut(), extra.as_object()) {
+                s.extend(extra.clone());
+            }
+            s
+        };
+        let section = serde_json::json!({"kind": "drop", "bars": 4, "chords": ["C"]});
+        let ok_align = serde_json::json!({"to": "cuts"});
+        call(score(section.clone(), serde_json::json!({})), ok_align.clone()).unwrap();
+        let typo = serde_json::json!({"kind": "drop", "bars": 4, "chords": ["C"], "enrgy": 0.9});
+        assert!(call(score(typo, serde_json::json!({})), ok_align.clone())
+            .unwrap_err()
+            .contains("unknown field `enrgy`"));
+        assert!(call(score(section.clone(), serde_json::json!({"tempo": 90})), ok_align)
+            .unwrap_err()
+            .contains("unknown field `tempo`"));
+        let e = call(
+            score(section, serde_json::json!({})),
+            serde_json::json!({"to": "cuts", "max_tempo": 0.1}),
+        )
+        .unwrap_err();
+        assert!(e.contains("unknown field `max_tempo`"), "{e}");
     }
 
     /// A music request routes compose (aligned to the cuts) → fit → duck → measure.

@@ -260,20 +260,28 @@ GUI sees `stems-progress`; answers `StemsPlaced`), and `export`'s `options.loudn
 `instructions` route music under a cut through analyze → fit_music → duck.
 **Composed music**: `compose_music { score, track_id?, at?, align?, replace_clip_id?, ripple?, background? }` is
 `generate_voiceover`'s shape: `score` is the core `MusicScore` itself (its schema, with the doc comments as
-descriptions), `track_id` / `replace_clip_id` / `align.track_id` are strings parsed with `parse_arg` (so a bad id names
-its argument), `align` is `{to: cuts|markers, track_id?, max_tempo_change?}`. The request is checked, and the score
-fitted to the picture, **before anything renders** — `compose_music_inputs` under `lock_agent_edit` (a proposal
-another session owns refuses here, not after a minute of rendering; an invalid score, a bad track or a replaced clip
-that is not composed music is `invalid_params` naming the section / chord) and it reads the **working timeline**
+descriptions; a misspelled field in it, in a section, hit or `align` is an error — `deny_unknown_fields` there and on
+the local `ComposeAlignParams` — and `seed` is bounded to 2^53 − 1 so it survives JSON), `track_id` / `replace_clip_id`
+/ `align.track_id` are strings parsed with `parse_arg` (so a bad id names its argument), `align` is `{to:
+cuts|markers, track_id?, max_tempo_change?}`. The request is checked, and the score fitted to the picture, **before
+anything renders** — `compose_music_inputs` under `lock_agent_edit` and `with_ripple(p.ripple, …)` (a proposal
+another session owns refuses here, not after a minute of rendering; an invalid score, a bad or locked track, a
+replaced clip that is not composed music or is linked, or a placement that would land on another clip of the track
+under the ripple in force is `invalid_params` naming the section / chord / lane) and it reads the **working timeline**
 (staged cuts included). It then renders with the lock released (`synthesize_music` on `plan.score`, progress stages
 `download_soundfont` / `waiting` / `render` to the client's token **and** re-emitted as the GUI's `music-progress`;
 the GUI's `cancel_music` ends it too via `begin_music`, and so does a replaced project, `stop_or_replaced`) and
-lands it with `place_music(&asset, plan.track_id, plan.at, plan.replace_clip_id)` — `plan.at`, the **pinned** start
-the alignment was computed for, not the request's — under `lock_agent_edit` + `with_ripple(ripple)`: the asset and
-its score-written analysis land at once, the placement stages. `track_id` is not `M`-only: any audio track. The answer
+lands it with `place_music(&asset, plan.track_id, plan.at, plan.replace_clip_id)` — the request's own placement,
+**as given** (a missing `at` means after what the track holds *when it is placed*) — under `lock_agent_edit` +
+`with_ripple(ripple)`: the asset and its score-written analysis land at once, the placement stages, and a placement
+that is refused (the cut changed while it rendered) stores neither. `track_id` is not `M`-only: any audio track.
+`replace_clip_id` replaces the **whole bed** (every clip of its asset on the track becomes one clip). The answer
 is `{asset, clip, score, align, replaced}` — `score` is the score **as rendered** (the aligned tempo and added hits),
+`replaced` the ids of the clips that were replaced (`plan.replaces`; empty when a clip was added),
 and the asset drops its own `music_score` copy (`list_assets` still shows it, which is how an agent finds the score
-to edit before a `replace_clip_id` call). `music_status` is its read side (SoundFont ready, bytes to fetch,
+to edit before a `replace_clip_id` call). The ALIGN paragraph of the description is the rule of `plan_score_to_picture`
+as it is: the dropout before a drop is always added, the riser only when the drop does not follow a build and starts at
+least half a bar in (a test pins the words). `music_status` is its read side (SoundFont ready, bytes to fetch,
 compositions in flight, the styles). `get_band_balance { asset_id? | clip_id? | range?, sections? }` is
 `get_levels`' shape (read-only, resolve under `lock_agent_as`, decode with the lock released, `context.ct` and a
 replaced project stop it): exactly one target is checked by the core (`invalid_params` otherwise), and the answer is the

@@ -400,7 +400,7 @@
 - **Music scores** (`model/score.rs` + `score/{chord,arrange,align}.rs`, pure + unit-tested): a `MusicScore`
   (`bpm` 40–240, `key` `G` / `F#m` / `Bb` / `Ebm`, a `MusicStyle` — `tropical_house`, `pop`, `lofi`,
   `cinematic`, `ambient`, `rock` —, `sections: [{kind: intro|verse|build|drop|breakdown|outro, bars, chords,
-  energy?}]`, `hits: [{at_s, kind: impact|riser|dropout|whoosh}]`, `seed`, `instruments?` GM-program overrides)
+  energy?}]`, `hits: [{at_s, kind: impact|riser|dropout|whoosh}]`, `seed` (0 to `MAX_SEED` = 2^53 − 1, the largest integer a JS number keeps through JSON; a bigger one is refused), `instruments?` GM-program overrides)
   is 4/4 only, rides on `Asset.music_score` and renders through `engine::compose` (`engine-media.md`). **Chords**
   are names (`C`, `Em`, `F#m7`, `Gsus4`, `D/F#`, `Bbmaj7`, `E5`, `Cadd9`, `Am7b5`) or **roman numerals in the key's own
   scale** (in A minor `VI` is F, `VII` is G, `i` is Am; case is quality, a leading `b` / `#` moves the root), one per

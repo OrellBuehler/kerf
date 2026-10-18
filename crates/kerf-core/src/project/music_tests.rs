@@ -739,6 +739,182 @@ fn a_locked_track_or_a_bad_target_is_refused_before_anything_renders_or_is_store
 }
 
 #[test]
+fn a_start_over_other_clips_is_refused_before_the_render_unless_ripple_pushes() {
+    let project = Project::open_in_memory().unwrap();
+    // 2 + 8 bars at 120 BPM: 20 s of music on M, then a second piece after it.
+    let (_, first) = project
+        .place_music(&composed("/m/a.wav", &score(120.0, 8)), None, Some(0.0), None)
+        .unwrap();
+    let req = |at: Option<f64>| ComposeRequest {
+        score: score(120.0, 4),
+        track_id: None,
+        at,
+        align: None,
+        replace_clip_id: None,
+    };
+
+    // Inside the first piece: refused with edit_timeline's words, ripple or not (ripple never
+    // splits a clip to make room).
+    for ripple in [false, true] {
+        let e = project
+            .with_ripple(Some(ripple), |p| p.compose_music_inputs(&req(Some(5.0))))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("would overlap another clip on M"), "ripple {ripple}: {e}");
+    }
+    // On the first piece's start: off, it collides; on, it pushes the piece along.
+    let e = project
+        .with_ripple(Some(false), |p| p.compose_music_inputs(&req(Some(0.0))))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("would overlap another clip on M"), "{e}");
+    project
+        .with_ripple(Some(true), |p| p.compose_music_inputs(&req(Some(0.0))))
+        .unwrap();
+    // The project's own flag counts the same as an override.
+    project.set_ripple_mode(true).unwrap();
+    project.compose_music_inputs(&req(Some(0.0))).unwrap();
+    project.set_ripple_mode(false).unwrap();
+    assert!(project.compose_music_inputs(&req(Some(0.0))).is_err());
+
+    // Free space, the end of the track and "after what it holds" all fit.
+    project.compose_music_inputs(&req(Some(first.timeline_end()))).unwrap();
+    project.compose_music_inputs(&req(Some(first.timeline_end() + 3.0))).unwrap();
+    let plan = project.compose_music_inputs(&req(None)).unwrap();
+    assert_eq!(plan.at, None);
+    // The rehearsal changed nothing: no track, clip, asset or revision.
+    assert_eq!(project.list_assets().unwrap().len(), 1);
+    assert_eq!(music_clips(&project).len(), 1);
+}
+
+#[test]
+fn a_tempo_nudge_that_lengthens_the_piece_is_checked_at_its_aligned_length() {
+    // Cuts at 4 and 8 s. At 122 BPM the 6-bar piece lasts 13.30 s; aligned to 120 BPM, where the
+    // cuts are downbeats, it lasts 13.50 s.
+    let (project, _) = picture();
+    let tail = composed("/m/tail.wav", &score(120.0, 1));
+    project.place_music(&tail, None, Some(13.4), None).unwrap();
+    let req = |align: bool| ComposeRequest {
+        score: score(122.0, 4),
+        track_id: None,
+        at: Some(0.0),
+        align: align.then_some(ScoreAlign {
+            to: AlignTo::Cuts,
+            track_id: None,
+            max_tempo_change: None,
+        }),
+        replace_clip_id: None,
+    };
+    let off = |align: bool| {
+        project
+            .with_ripple(Some(false), |p| p.compose_music_inputs(&req(align)))
+            .map_err(|e| e.to_string())
+    };
+    let plain = off(false).unwrap();
+    assert!(plain.score.duration_s() < 13.4);
+    let e = off(true).unwrap_err();
+    assert!(e.contains("would overlap another clip on M"), "{e}");
+}
+
+#[test]
+fn recomposing_a_longer_piece_is_refused_up_front_without_ripple_and_pushes_with_it() {
+    let project = Project::open_in_memory().unwrap();
+    let (bed, end) = fitted_bed(&project, "/m/a.wav", 0.0, 22.0);
+    follower_after(&project, end);
+    let req = |bars: u32| ComposeRequest {
+        score: score(120.0, bars),
+        track_id: None,
+        at: None,
+        align: None,
+        replace_clip_id: Some(bed[0]),
+    };
+    let off = |bars: u32| {
+        project
+            .with_ripple(Some(false), |p| p.compose_music_inputs(&req(bars)))
+            .map_err(|e| e.to_string())
+    };
+    let on = |bars: u32| {
+        project
+            .with_ripple(Some(true), |p| p.compose_music_inputs(&req(bars)))
+            .map_err(|e| e.to_string())
+    };
+    let e = off(30).unwrap_err();
+    assert!(e.contains("would overlap another clip on M"), "{e}");
+    on(30).unwrap();
+    // A shorter one fits either way.
+    off(6).unwrap();
+    on(6).unwrap();
+}
+
+#[test]
+fn a_refused_placement_stores_neither_the_asset_nor_its_analysis() {
+    let project = Project::open_in_memory().unwrap();
+    let (bed, end) = fitted_bed(&project, "/m/a.wav", 0.0, 22.0);
+    follower_after(&project, end);
+    let assets = project.list_assets().unwrap().len();
+    let history = project.history().unwrap().len();
+
+    // Too long for the gap behind the bed, ripple off: the edit is refused ...
+    let long = composed("/m/long.wav", &score(120.0, 30));
+    let e = project
+        .with_ripple(Some(false), |p| p.place_music(&long, None, None, Some(bed[0])))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("would overlap another clip"), "{e}");
+    // ... and leaves nothing of the new render in the library.
+    assert_eq!(project.list_assets().unwrap().len(), assets);
+    assert!(project.asset_by_path("/m/long.wav").unwrap().is_none());
+    assert!(project.get_analysis(long.id).unwrap().is_none(), "no orphan analysis either");
+    assert_eq!(project.history().unwrap().len(), history);
+
+    // An asset that was already there stays when a later placement of it is refused.
+    let (known, _) = project
+        .place_music(&composed("/m/known.wav", &score(120.0, 2)), None, None, None)
+        .unwrap();
+    let again = composed("/m/known.wav", &score(120.0, 2));
+    let track = project
+        .timeline()
+        .unwrap()
+        .tracks
+        .iter()
+        .find(|t| t.name == MUSIC_TRACK)
+        .unwrap()
+        .id;
+    let e = project
+        .with_ripple(Some(false), |p| p.place_music(&again, Some(track), Some(1.0), None))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("would overlap another clip"), "{e}");
+    assert_eq!(project.asset_by_path("/m/known.wav").unwrap().unwrap().id, known.id);
+    assert!(project.get_analysis(known.id).unwrap().is_some());
+
+    // The same for an agent, whose placement is staged: nothing lands from a refused one.
+    let mut agent = Project::open_in_memory().unwrap();
+    agent.set_actor(EditSource::Agent);
+    let (_, held) = agent
+        .place_music(&composed("/m/a.wav", &score(120.0, 8)), None, Some(0.0), None)
+        .unwrap();
+    let late = composed("/m/late.wav", &score(120.0, 2));
+    let e = agent
+        .with_ripple(Some(false), |p| {
+            let m = agent
+                .working_timeline()
+                .unwrap()
+                .tracks
+                .iter()
+                .find(|t| t.name == MUSIC_TRACK)
+                .unwrap()
+                .id;
+            p.place_music(&late, Some(m), Some(held.timeline_start + 1.0), None)
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("would overlap another clip"), "{e}");
+    assert!(agent.asset_by_path("/m/late.wav").unwrap().is_none());
+    assert!(agent.get_analysis(late.id).unwrap().is_none());
+}
+
+#[test]
 fn a_linked_bed_is_not_replaced() {
     let project = Project::open_in_memory().unwrap();
     let (_, clip) = project
