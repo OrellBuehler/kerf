@@ -142,9 +142,10 @@ back a reviewable result.
 `list_assets` · `import_asset` · `get_asset_metadata` · `analyze_asset` ·
 `get_timeline_state` · `timeline_summary` · `get_waveform` · `get_energy` ·
 **`get_frame`** (drill-in frame) · **`skim_asset`** (contact-sheet montage) ·
-**`preview_timeline`** (the composited cut) — the last three return images the model can
-see, and `get_frame` / `preview_timeline` take a `region` to **zoom** into a quarter of the
-frame at full source detail.
+**`preview_timeline`** (the composited cut) · **`preview_svg_overlay`** (an animated title
+as a contact sheet of moments) · `validate_svg` — the bold ones return images the model
+can see, and `get_frame` / `preview_timeline` take a `region` to **zoom** into a quarter of
+the frame at full source detail.
 </details>
 
 <details>
@@ -167,6 +168,7 @@ frame at full source detail.
 `set_reframe_keyframes` · `add_reframe_keyframe` · `set_track_volume` · `set_track_pan` ·
 `set_master_volume` · `set_master_limiter` ·
 `add_overlay` · `update_overlay` · `remove_overlay` · `set_overlay_keyframes` ·
+`add_svg_overlay` · `update_svg_overlay` · `remove_svg_overlay` · `list_svg_presets` ·
 `generate_captions` · `import_captions` · `clear_captions` · `export_srt` · `list_fonts` ·
 `set_delivery_format` · `set_asset_projection`
 </details>

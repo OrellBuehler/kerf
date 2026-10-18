@@ -735,6 +735,45 @@ fn lower_priority(cmd: &mut Command) {
     }
 }
 
+/// Drop the calling thread to below-normal scheduling priority: [`background`]'s counterpart for a
+/// worker thread of this process (the rasterisers of an animated title), at the same budgets — left
+/// alone at 100%. The thread is not restored; call it first thing in a thread that ends with its work.
+///
+/// Linux lowers the thread's own nice value by 10, **relative to what it has** like [`background`]'s
+/// `nice(10)` (a thread already lower stays lower). macOS puts it in the *utility* QoS class — below
+/// the interface's, but not the *background* class (`PRIO_DARWIN_BG`), which throttles disk I/O hard
+/// and what these threads write is a picture a user is waiting to see. **Windows is left alone**:
+/// `SetThreadPriority` needs a binding Kerf does not otherwise carry.
+pub fn background_thread() {
+    if limited() {
+        lower_current_thread();
+    }
+}
+
+/// [`background_thread`] at any budget.
+fn lower_current_thread() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `nice` takes no pointers; Linux keeps a nice value per thread, so it is the calling
+        // thread's alone that moves, and lowering a priority needs no privilege (a failure changes nothing).
+        unsafe {
+            libc::nice(10);
+        }
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        extern "C" {
+            // `pthread/qos.h`: `qos_class_t` is an `unsigned int`; the call affects the calling thread.
+            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        }
+        const QOS_CLASS_UTILITY: u32 = 0x11;
+        // SAFETY: plain integers in, the calling thread's own class changed; a failure changes nothing.
+        unsafe {
+            pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+        }
+    }
+}
+
 /// Held by every test that takes the heavy-job slot or moves the budget: they share one
 /// process-wide gate, and a test that waits for it (or counts who is waiting) cannot be
 /// run beside one that holds it.
@@ -761,6 +800,54 @@ mod tests {
         assert_eq!(threads_for(16, 75), 12);
         assert_eq!(threads_for(16, 50), 8);
         assert_eq!(threads_for(12, 75), 9);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn nice_of_this_thread() -> i32 {
+        // SAFETY: reads the scheduling priority of our own task id.
+        unsafe { libc::getpriority(libc::PRIO_PROCESS as _, libc::gettid() as libc::id_t) }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_worker_thread_drops_below_normal_priority_alone() {
+        let _serial = exclusive();
+        let restore = cpu_percent();
+        // The thread, not the process: the thread that asks is lowered, this one is not.
+        let before = nice_of_this_thread();
+        set_cpu_percent(MIN_CPU_PERCENT);
+        let lowered = std::thread::spawn(|| {
+            background_thread();
+            nice_of_this_thread()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(lowered, (before + 10).min(19), "below normal, from {before}");
+        assert_eq!(nice_of_this_thread(), before, "the caller's own priority is untouched");
+        // Relative, as `background`'s `nice(10)` is: a thread that is already lower is never raised.
+        let already = std::thread::spawn(|| {
+            // SAFETY: lowers this thread's own priority.
+            unsafe {
+                libc::nice(12);
+            }
+            let start = nice_of_this_thread();
+            background_thread();
+            (start, nice_of_this_thread())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(already.1, (already.0 + 10).min(19), "from {}", already.0);
+        assert!(already.1 >= already.0, "never raised");
+        // At 100% the priority is not touched at all.
+        set_cpu_percent(100);
+        let left = std::thread::spawn(|| {
+            background_thread();
+            nice_of_this_thread()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(left, before);
+        set_cpu_percent(restore);
     }
 
     #[test]

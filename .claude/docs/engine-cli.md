@@ -59,7 +59,10 @@ so the feature is **only** activated through these forwards — which is what ma
   path. `source_traits` is the one cached ffprobe per file that answers HDR, the
   lead and the container — killed after 20 s, one probe however many threads ask, a failure
   remembered 60 s like `proxy_video_info`'s (`engine/source_probe.rs`'s `ProbeCache`, which the
-  GPU frame source's seek-point probe sits behind too). The clone is a frame the original has no counterpart
+  GPU frame source's seek-point probe sits behind too). **An encode reads it once**
+  (`generate_proxy_with` takes the traits first and gives them to `proxy_path_for`, the tone-map and the pad): a
+  second reading, after a wait in the proxy lane, could answer otherwise once a failed probe's minute had passed,
+  and write a plain picture under the tone-mapped or padded name (or the other way round) and keep it for good. The clone is a frame the original has no counterpart
   for, so a clip read from the proxy's start with no `-ss` (`clip_seek` 0 — a cut
   from the very head of the source) would hold it for `lead` while the export
   starts on the real first frame: `transition_fx` sets `ClipFx.head_pad` from the
@@ -555,7 +558,7 @@ so the feature is **only** activated through these forwards — which is what ma
     14 levels off on one-pixel chroma lines; the window is the export. `Snapshot::plain` refuses (the one-shot draws
     it) a fade, dissolve, slide, push or tail, a source that is not a whole multiple of the cut's rate (24 or 25 in 30,
     1.5x, 0.5x: the `fps` pick follows where the slice starts), the last frame of a title (`drawtext`'s `between`
-    includes `end`), 360 and HDR.
+    includes `end`), an animated SVG title on screen (below), 360 and HDR.
   - **Measured** (`tests/scrub_bench.rs`, release, 1280x720 proxies at 960 px, 4 shared cores, 3 runs;
     `docs/review-2026-10-10/after/perf-4/`), 1 layer / 3, FFmpeg 9.0.2: one-shot 50-71 / 94-119 ms; first frame of a
     window 71-89 / 104-132 (10 to 20 ms *more* than a still); next frames of a 60 Hz drag 0.0-0.1 / 4.8-9.0 ms; a held
@@ -740,6 +743,120 @@ so the feature is **only** activated through these forwards — which is what ma
   Cyrillic; Greek (a few letters) and CJK draw as `drawtext`'s missing-glyph boxes, as they did in a system Sans without
   them. The golden pins the default at a fixed path (`fonts::with_pinned_default_font`). `text_raster_graph` is the same
   `drawtext` for the GPU compositor's rasteriser (`gpu.md`).
+  **Animated SVG titles** (`Timeline.svg_overlays`, `engine/cli/svg_layer.rs`, `svg/raster.rs`; the SMIL subset is `core-model.md`).
+  ffmpeg never sees an SVG: resvg draws `SvgDoc::at(doc_t)` — a static document per moment — into a PNG, ffmpeg `overlay`s the
+  PNG, and nothing in the graph is animated, so an export, the scrubbed still, the stream and an agent's contact sheet draw one
+  title from one rasteriser. `raster::render(svg, pw, ph, opacity)` fits the document "contain" into the rectangle, clipped to its
+  own viewport (a slide-in from outside the `viewBox` is not seen in the margin), with the alpha already multiplied by the
+  opacity (the graph has no `colorchannelmixer` for it); fonts are `fonts::svg_fontdb()` (system + shipped Geist, Geist standing
+  for serif and sans-serif and for the family nothing has, so text never vanishes); an `<image>` `href` that is not `data:` is
+  nothing (no file read, no network), `resources_dir` is `None`, and a `data:` image is decoded only after its **header** says it
+  is within 16 Mpx (`svg/images.rs`: `imagesize`, the crate usvg sizes with; the decoders allocate what the header claims, so
+  60,000 x 60,000 bytes-of-header aborted the process) — the resolver answers "nothing" for one that is not, whatever the
+  document says. `render` also refuses a picture that would cost more than `cost::MAX_FRAME_OPS` (2e9 per-pixel operations:
+  `feMorphology` is `(2r)^2` a pixel, `feConvolveMatrix` its order, `feTurbulence` its octaves, plus a pixmap per isolated group and
+  the pixels each path covers). **The estimate walks usvg's tree as resvg draws it**: the transform carried down is the root
+  transform given to `resvg::render` times every group's own `transform` (a `viewBox` bigger or smaller than the size is a transform
+  on usvg's root group; `<g transform="scale(1000)">` and an `animateTransform` count), a mask / pattern / `feImage` restarts from
+  the transform resvg gives it, and a region or layer is held to `max_filter_bbox` (5W x 5H of the pixmap, the region itself in an
+  `feImage`), not to the canvas. It runs on the static document of *that moment* (`at(t)`) at the size drawn, so a title that grows
+  into a heavy filter is refused at the frame where it does, before that frame is drawn; the same walk runs at a nominal 1080p when a
+  document is read. A pattern tile larger than a layer may be is refused (the allocation would abort). **Bounded, not interruptible**:
+  resvg cannot be stopped half way through a picture, so what keeps `prepare` (the `PREVIEW_DRAWING` slot, the foreground lease) from
+  being held for minutes is that one picture is held to seconds, and a cancel or the deadline is looked at between pictures. **Draw order**: clips, then SVG overlays in list order, then text
+  (captions on top): the clips land on `vsvg`, and the titles end on `vtext` / `vcomp` (gif) / the final pad, so a graph without
+  titles is byte-identical (golden `0..6000` unmoved).
+  - **An export or a stream reads a numbered sequence**: `-f image2 -framerate {fps} -i {dir}/%06d.png` after the clips' inputs
+    (`svg_layer::push_inputs`, `%` in the directory escaped `%%`; `push_inputs` itself is untouched, so the levels graph, which has
+    no picture, adds none). Frame `j` is the document at `doc_t0 + j/fps` for exactly the output frames the overlay's
+    `between(t,start,end)` is true on (closed at both ends, `Rational::frame_time`, and not past the cut's last frame). The chain
+    is `[n:v]settb=expr=den/num,setpts=N+k0[svgI]` then `overlay=x:y:eof_action=pass:enable='between(t,start,end)'`: **counted in
+    frames, not seconds** (`PTS-STARTPTS+k0*den/num/TB` truncates in doubles and puts a picture a frame off; a mutation to `N+k0+1`
+    fails two rendered tests). `x`/`y` are the rectangle's pixel corner (`round(x*W)`, may be negative; a rectangle off the frame or
+    over 50 Mpx is left out). The image2 input needs no `-hwaccel`; `export_resource` sees an input that is no asset and
+    keeps such an export on the cores' slot. A title at or past the end of the cut, or at a position that is not a time, is left
+    out before its frame is searched for (`window`; the helpers clamp at 1e9 s — a start of 1e300 used to loop or overflow), and
+    a title's `start` / `end` are held to 24 h on add and update (`MAX_SVG_SECONDS`).
+  - **A document that cannot move is one picture** (`Kind::Held`; `svg::may_animate(src)` is false when the sanitised text has no
+    animation element — a text test, so the builders stay pure): `-f image2 -pattern_type none -loop 1 -framerate {fps} -i
+    {dir}/000000.png`, the same `settb,setpts=N+k` chain, one PNG instead of a link a frame, keyed by artwork, size and opacity only
+    (not by when, how long, rate or clock, so trimming a held title keeps its picture). The loop is infinite and ends with the main
+    input (measured, ffmpeg 6.1.1, two-pass and the stream included). A text that mentions an animation the reader dropped is
+    still a sequence of links.
+  - **The stream's pictures are named for the title, not the playhead** (`stream_sequences(titles, total, sliced, start, fmt)`;
+    `PreviewCut` keeps the unsliced titles): a title is drawn once on the output's frame grid, keyed exactly as an export of that
+    cut at that size and rate would, and a stream from any playhead **on a frame of its grid** (to a millionth of a frame) reads
+    the directory from picture `j0` (`-start_number j0`, omitted at 0) landing on the sliced frame `first + j0 - frame_at(start)`
+    (`setpts=N+k`); one between frames keeps the exact per-playhead sequence (the title would be a fraction of a frame off the
+    picture under it). `build_filter_complex_with` takes those sequences so the graph indexes the inputs the argv carries.
+    `prepare` draws only `SvgSeq::needed()` (the rest of the title from the playhead), writes `complete` only when every picture
+    is there, and later streams draw only what is missing — a replay or a seek back draws nothing.
+  - **The pictures are on disk before ffmpeg is spawned** (no spawn has a stdin; two-pass and the software retry re-run ffmpeg):
+    `render_with_progress` calls `svg_layer::prepare_export` before `retry_export_in_software`, once for the lot, and holds the pins
+    until the render is over; a cut whose titles are drawn already never leases. Otherwise it takes its own foreground
+    `cpu::lease_waiting` (saying so through `ExportProgress.waiting`, then `"rendering animated titles"`), draws on
+    `lease.threads()` threads and releases the lease before ffmpeg asks for its own; a cancel is polled 40 times a second and is
+    `RenderStatus::Cancelled`. `export_timeline` (for_render + range slice) is what the builder and `prepare_export` both start
+    from, and a variant (`render_variants`) prepares its own size. **A request that would be refused is refused first**
+    (`export_preflight`: no clips, `validate_export`), before a title is drawn. The stream (`stream_preview_once`: `preview_cut` →
+    `prepare_preview` → `preview_args`; `build_preview_args[_with]` are the test/golden seam over the same two) draws its titles
+    on the budget's threads, ungated, for at most 10 s counted from the call (`animated title too heavy to preview`), **one
+    preparation at a time** (`PreviewSlot` on a `PreviewGate`: a seek that supersedes a stream waits for it to notice, not beside it;
+    the process has one gate and a test the calling thread's own, so stream tests do not wait for or cancel each other —
+    `prepare_preview_in` takes a named one for a test that puts two threads on it) and **with a
+    cancel**: `stream_preview_until(.., cancel, on_frame)` (`stream_preview_with` is it with `|| false`; `start_playback` passes
+    "superseded or stopped"), looked at 40 times a second, before each document is read and every 16 frames of the compare. A
+    picture in flight is finished first. **Memory and priority**: `prepare` runs no more threads than
+    `RENDER_MEMORY` (1 GiB) allows (12 bytes a pixel of the picture + 8 a pixel of the widest embedded image, per thread). **An
+    export's titles (`prepare`, `Priority::Behind`) draw with `cpu::background_thread()`** (below normal when the budget is under 100%:
+    `nice(10)` on the thread on Linux, relative to what it has like `cpu::background`; the *utility* QoS class on macOS, not
+    `PRIO_DARWIN_BG`, whose I/O throttling is hard; **Windows left alone** — no binding for `SetThreadPriority` in the tree), **the
+    stream's (`prepare_as(.., Priority::Normal)`) do not**: Play is waiting for them, with 10 s, and a thread at utility QoS / nice 10
+    beside a running ffmpeg or a test suite gets a fraction of a core (the macOS CI run of `a_text_heavy_title_is_drawn_inside_the_streams_budget`
+    went past 10 s where Linux took 3.9; not reproducible off a Mac, so the three changes here are the measured and the
+    reasoned causes together); the budget still caps how many. **The fonts are read before the drawing, outside the deadline**
+    (`fonts::warm()` in `prepare_as` once there is something to draw; the deadline is moved by the time it took, and Setup warms
+    them at launch): the first picture of a process loads every installed face, hundreds on a Mac, from a cold disk. **A picture
+    of the cache is `raster::encode_frame_png`** (`png` `Fast` + `Sub`, clear and opaque pixels passed through, the rest
+    un-multiplied by tiny-skia's own rule; a test pins the decoded pixels equal to `encode_png`'s): the default level was most of
+    a picture's cost (release, 960 x 540: 13.7 ms -> 1.2), and unoptimised it was 195 ms (a debug build runs the stream's 10 s too:
+    the workspace `Cargo.toml` optimises `png`, `fdeflate`, `crc32fast` and `simd-adler32` in the dev profile, which with the quick level took the ignored
+    budget test from 3.9 s to 0.7 s on 4 cores). `encode_png` stays for the agent's contact sheet, where size matters. The parsed
+    documents are kept (`DocCache`, last 6 by digest of the source) so a scrub or a replay reads a title once.
+  - **The cache** (`<cache>/kerf/svg/<pid>/<key>/NNNNNN.png` + a `complete` marker, else a private `kerf-svg-<uid>` directory in the
+    temp one, else a unique `0700` `kerf-svg-<pid>-<nanos>-<n>` made with a plain `mkdir`): `key` = SHA-256 of `RASTER_VERSION`, the
+    sanitised source, the document clock at the first picture, the rate, the picture count, the pixel size and the opacity —
+    **not the position** (moving a title keeps its frames) and **not the fonts**: the font database and this directory are both
+    built once per process and the directory is emptied at the first use (`claim_dir`: a pid is reused, and a marker left by an
+    earlier run is not trusted). A frame is renamed into place whole, so one that exists is right and an interrupted run resumes;
+    the marker is last, and `mark_complete` refuses a directory that is gone (it used to recreate it empty, "complete"). A
+    sequence is **ready** when the marker is there and so are its first and last picture. Consecutive missing frames whose `at()`
+    text is the same are one render and hard links (copy where links fail). Directories of dead pids are removed at the first use
+    (Windows: untouched for a day); within the process `raster::trim` holds the total to `KERF_SVG_CACHE_MB` (1024), dropping the
+    least recently used sequence or `still-*.png`, **never a pinned one** (`raster::Pin`, taken before the marker is looked at).
+    **The check and the removal are one step**: `evict` takes the pins' lock, and renames the entry to `.gone-*` before it deletes
+    it, so a pin taken during a trim either stops it or finds the place empty; **an entry that will not rename (a handle open on it on Windows) is left whole and tried at the next trim**, never emptied: deleting its files after the lock lets a preparer pin and re-mark a directory whose frames are going, and under the lock stalls every pin. Trim runs only
+    after something was written. `raster::with_pinned_dir` (tests, per thread) fixes the directory so the builders stay pure and
+    the golden oracle machine-independent. **An argv path is the cache directory's text, then `/` and the names below it**
+    (`svg_layer::argv_root`; `SvgSeq.input`, `StillSvg.input`), never `Path::join`: on Windows `join` puts a `\` before the key
+    (`/kerf-test/svg\<key>/%06d.png`), so the argv, the path assertions and the golden digests would differ by OS. The `PathBuf`s
+    (`dir`, `path`) stay for the file system, and only the directory's `%` is doubled for the sequence.
+  - **A still reads one PNG** (`still_svgs`: the overlays with `start <= t < end` at the still's own size; `still-{key}.png`, the
+    key over the document clock at `t`; `-f image2 -pattern_type none -i path`, so a `%d`, `[` or `*` in the cache path is a
+    character of it — ffmpeg 6.1 otherwise looks for `a1 [1]/still-….png` and a glob): `run_still` calls `still_titles` (drawn on the
+    calling thread, ungated, pinned) before spawning, so `timeline_frame`, `timeline_frame_region`, `export_still` and the MCP `preview_timeline` get it. The scrub cache
+    needs no `stat` of such a file (`file_stamp`: its name is its content, and it may not exist yet when the key is asked for);
+    `Snapshot::plain` is false from a title's first frame to its last (the one-shot draws it), and `window_args` cuts the titles
+    out of its slice so a window never names a picture that is not there.
+  - **Measured** (`svg_rendered.rs`, `#[ignore]`d, ffmpeg 6.1.1): a box sliding 26 px/s makes a frame off a pixel off; every
+    export frame equals the scrubbed still of its moment within 2 levels at 24 / 25 / 29.97 / 30 / 60 fps, frames outside the
+    title are the plain cut exactly, both ends are drawn and the frame after is not; a range export continues the animation
+    (offset), a translucent title partly off the frame equals its still, a two-pass export draws once (and a second export finds
+    the sequence drawn), gif and 10-bit exports, a `%` in the cache path (and `%d [1]*?` for stills and held pictures), a cancel, a
+    held title (export frames equal the still, the export ends with the cut, stream and two-pass), a stream replayed or started
+    elsewhere reading the one directory, and the stream (from the playhead mid-title the
+    box is already across). A 10 s text-heavy lower third at 960 px: 301 frames in 3.0 s on 4 shared cores (10 ms a frame).
+    **Not drawn**: `animateMotion`, CSS animation, an `<image>` whose `href` is not a `data:` URL of PNG / JPEG / GIF / WebP.
   **360 footage** is reprojected by `v360`: `StreamInfo.projection` is detected at
   probe time (`detect_projection` — a `Spherical Mapping` side-data entry, or an
   Insta360 `.insv` whose frame is two squares side by side; deliberately *no*
@@ -897,3 +1014,73 @@ so the feature is **only** activated through these forwards — which is what ma
   a stripped-tag phone file does not abort the graph with "no path between
   colorspaces". Assets saved before these fields existed deserialize as SDR with
   the coded size; re-importing the file re-probes it.
+  **The BT.709 label** (`model::bt709_labels`, `BT709_LABEL` = `setparams=colorspace=bt709`). FFmpeg reads a picture
+  that names no matrix as BT.601, every player shows untagged HD as BT.709, and FFmpeg 9 negotiates the matrix along
+  the graph: untagged HD beside a BT.709 clip is *converted* from the BT.601 it was read as (its colours 28 dB off the footage's,
+  against 42.7 dB labelled) and the GPU compositor refuses the stack. So an **untagged HD YCbCr input is labelled
+  BT.709 when another input of the same graph names a matrix** (HDR, which the graph tone-maps to a tagged BT.709 picture,
+  or a tag that is the *file's* word: not `unknown` / `unspecified` / `reserved`, and **not a decoder's default** —
+  probed on 6.1.1 and 9.0.2, a PNG of any layout (`rgb24`, `rgba`, `gray`) is tagged `gbr` (so is RGB video, depending on the
+  encoder: FFV1 `bgr0` on 9.0.2 and not on 6.1.1), a JPEG and a WebP `bt470bg`, and the `mjpeg`, `amv`, `speedhq` and `jpegls` decoders
+  (MJPEG video, AMV, NDI's SpeedHQ, JPEG-LS) tag **everything** they decode `bt470bg`, whatever the pixel format (JPEG-LS `rgb24`, `gray`
+  and `gray16le` alike), as do the decode-only `mjpegb`, `sp5x`, `thp` and `smvjpeg`, which share MJPEG's decoder
+  initialisation (no encoder, so no sample file to probe; `mxpeg` is listed on the same assumption), so a logo, a photo or a webcam clip beside HD names nothing;
+  `StreamInfo::names_a_matrix`, `DEFAULT_TAG_CODECS`), and only then. HD is mpv's rule, `width >= 1280 ||
+  height > 576`, on the **original's** displayed size (a proxy at a small size in Settings is still labelled as its
+  original is: the preview's assets keep the original's metadata and the plan reads it, `PlanStream::label_bt709`);
+  YCbCr on the `pix_fmt_layout` allow-list; never `yuvj…` (JFIF, a webcam's MJPEG), RGB, grey, alpha or a still image.
+  **The principle is "a tag a decoder writes by default is not the file's word", not a mirror of those exclusions**: the
+  naming exclusion is by decoder (`DEFAULT_TAG_CODECS`), by `gbr`, by RGB and by still image. Grey, alpha and SD pictures are
+  never labelled but do name a matrix when tagged, and so does `yuvj…` footage from any other codec: FFmpeg's h264 decoder
+  calls every full-range stream `yuvj420p`, and OBS's, a drone's or a phone's `h264 yuvj420p pc bt709` is a stated matrix that
+  labels the untagged HD beside it (an *untagged* `yuvj` clip is still never labelled itself). The golden oracle holds it over
+  the whole corpus by metamorphosis
+  (`a_decoders_default_tag_names_no_matrix_in_any_graph_of_the_corpus`: every case with an HDR clip is built again with that
+  clip replaced by each of those shapes, one rule at a time, and by explicitly tagged H.264 clips as the control). `Asset::hdr()` is the first video
+  stream's, like every graph input (`[i:v]`) and the label. **A single clip, and any graph with no
+  input naming a matrix, is byte-identical** (the golden oracle holds it for all 6000 cases: stripping the label from
+  the new argv gives the old one). It is not a proxy label: proxies of untagged HD stay untagged, so no proxy key
+  moves and nothing is re-encoded, and the preview's graph (original metadata, proxy pixels) labels exactly as the
+  export's does. One table decides it, `ClipFx.label_bt709` (`transition_fx` → `graph_bt709_labels`, indexed like the
+  rest of `fx`), so `build_filter_complex` (the export, the levels meter, the playback stream, the scrub window) and
+  the planner read the same answer; the still decides over its own inputs, the layers on screen
+  (`StillLayer.label_bt709`). **The decision is the graph's, not the frame's**: a BT.709 clip anywhere in the cut labels
+  an HD clip that is never on screen with it (negotiation is per graph), and a stream, a scrub window or a ranged
+  export that starts past it, being a graph of its own, does not hold it (opaque pictures are the same either way; a
+  translucent HD layer, coloured text or a dip to white differs, measured on the clip alone labelled against not (below): a window frame is the
+  export's or the still's picture, as `scrub.rs` says, and the one-shot still of a frame decides over the layers on screen;
+  the difference is a translucent layer 1 level in the export on 9.0.2 and 8 on 6.1.1 (6.1.1: still 14, stream 11, scrub window 14),
+  coloured text 16 levels on its own pixels on 9.0.2 and none on 6.1.1, a dip to white 2 levels on 9.0.2 and 15 on 6.1.1 in the
+  export).
+  The filter is **the first of the clip's chain**, ahead of `trim` and every scaler; **never** the
+  `-colorspace` output option, which FFmpeg 9 takes as an order to convert (22 levels). It is a tag, not a conversion: the
+  picture is then what a file tagged BT.709 would be, to the bit in all four builders and in every chain
+  (`a_labelled_input_renders_as_a_file_tagged_bt709_is_in_all_four_builders` renders opaque, translucent, graded, rotated,
+  vignetted and fading layers; `a_labelled_clip_dips_through_white_as_a_file_tagged_bt709_does` the dip). **Why first, and not
+  after the geometry** (the first design, measured closer to the footage beside a BT.601 neighbour, 42.7 against 38.7 dB): FFmpeg
+  has the nearest scaler convert the picture for a filter that only takes another pixel format, and the fit `scale` is that scaler
+  for a dip to white's `fade` (RGB only). A label behind it states the matrix of a picture already read as BT.601: the round trip
+  went BT.601 out of YUV and BT.709 back, up to 17 levels (9.0.2) and 31 (6.1.1) off the same footage tagged in the file on every
+  frame of the clip (32.0 and 26.7 dB in the render test), and the GPU, which draws the labelled clip as BT.709, was that far off
+  the export. Ahead of everything there is nothing it can miss. The cost is exactly the tag's: beside a BT.601 neighbour, the stack
+  FFmpeg 9 converts and the GPU refuses, the HD clip lands 38.7 dB from the footage's colours where it would have been 42.7 dB
+  (the unlabelled 28.0). It also makes **untagged HD beside
+  footage tagged `smpte170m` / `bt470bg` a mixed stack** where FFmpeg read both as BT.601: the export converts the HD
+  into the neighbour's matrix (the colours become right, the argv moves) and the GPU now refuses it on 9.0.2.
+  **FFmpeg 6.1 (`FixedBt601`)**: the label negotiates nothing there and only changes an HD layer that takes the RGB round
+  trip in a mixed stack: a translucent one, or an HD clip dipping through white (`yuv420p -> rgb24 -> yuv420p`, which reads
+  the matrix the label states). Measured on 6.1.1 in the render scenario of `a_labelled_clip_dips_through_white_as_a_file_tagged_bt709_does`
+  and its translucent twin (1 s of BT.709 footage with 1 s of untagged HD, 640x360 at 10 fps, a 0.6 s dip; the label on against the
+  same argv with `setparams=colorspace=bt709,` removed, over **every frame** of the lossless export and on all planes, worst level
+  on any plane): a translucent HD layer 40.7 dB / 8 levels in the export, 39.2 / 14 in the still, 39.7 / 21 in the stream's
+  first frame and 38.6 / 23 in the scrub window's (towards the BT.709 reading a tagged layer already has); a dip to white
+  33.0 dB / 15 levels into the HD clip and 32.5 / 15 out of it. The round trip is in the chain for every frame of the clip, so the
+  15 levels are on every frame where the picture is fully visible (the ramp's own frames read 0, 5, 11 into the HD clip and 15, 11, 5 out of it
+  as the white takes over). On 9.0.2 the same
+  scenarios move 39.5 dB / 9 (export), 38.2 / 14, 37.9 / 23 and 38.1 / 24 for the translucent layer, and 33.1 dB / 16 into and 27.9 / 32
+  out of the HD clip for the dip, mostly the matrix negotiation the label settles (the stack's other frames move by it too).
+  Opaque pictures, text, fades to black, grades, rotations, masks, vignettes and dissolves are byte-identical there. It is applied under
+  every policy because the builders cannot ask for the policy: `composite_color_policy()` is measured *by running
+  `build_still_args`* under its own mutex, so a builder that asked would deadlock, and a non-probing read would
+  answer differently before and after the first probe. The plan mirrors it (`PlanStream::matrix()` is BT.709 for a
+  labelled layer under any policy, which a translucent round trip reads).
