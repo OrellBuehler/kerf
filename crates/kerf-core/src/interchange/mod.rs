@@ -333,10 +333,10 @@ mod tests {
         let df60 = Timebase::new(59.94).unwrap();
         assert!(df60.drop);
         assert_eq!(df60.timecode(3600), "00:01:00;04");
-        let nd = Timebase::new(23.976).unwrap();
-        assert!(!nd.drop);
-        assert_eq!(nd.base, 24);
-        assert_eq!(nd.timecode(nd.frames_of(1, 0, 0, 0)), "01:00:00:00");
+        let ndf = Timebase::new(23.976).unwrap();
+        assert!(!ndf.drop);
+        assert_eq!(ndf.base, 24);
+        assert_eq!(ndf.timecode(ndf.frames_of(1, 0, 0, 0)), "01:00:00:00");
         assert_eq!(Timebase::new(25.0).unwrap().timecode(25 * 3661 + 3), "01:01:01:03");
         assert!(Timebase::new(0.0).is_err());
         assert!(Timebase::new(f64::NAN).is_err());
