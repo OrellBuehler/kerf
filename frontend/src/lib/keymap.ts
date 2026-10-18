@@ -364,7 +364,7 @@ const ACTION_LIST = [
 		group: 'project',
 		context: 'global',
 		defaults: [],
-		hint: 'Puts a .srt / .ass / .ssa file on the cut as captions, timed to the finished cut.'
+		hint: 'Puts a .srt / .vtt / .ass / .ssa file on the cut as captions, timed to the finished cut.'
 	},
 	{
 		id: 'file.saveCover',
@@ -374,6 +374,51 @@ const ACTION_LIST = [
 		context: 'global',
 		defaults: [],
 		hint: 'Writes the frame under the playhead, at the full delivery frame, as an image.'
+	},
+	{
+		id: 'file.exportCaptions',
+		repeat: false,
+		label: 'Export captions…',
+		group: 'project',
+		context: 'global',
+		defaults: [],
+		hint: "Writes the cut's captions as a .srt or .vtt file, timed as the export draws them."
+	},
+	{
+		id: 'file.exportOtio',
+		repeat: false,
+		label: 'Export OTIO…',
+		group: 'project',
+		context: 'global',
+		defaults: [],
+		hint: 'Hands the cut to another editor as OpenTimelineIO: every track, transitions, speed and markers.'
+	},
+	{
+		id: 'file.exportEdl',
+		repeat: false,
+		label: 'Export EDL…',
+		group: 'project',
+		context: 'global',
+		defaults: [],
+		hint: 'Writes the first video track as a CMX 3600 edit decision list.'
+	},
+	{
+		id: 'file.exportMarkers',
+		repeat: false,
+		label: 'Export markers as CSV…',
+		group: 'project',
+		context: 'global',
+		defaults: [],
+		hint: 'Every marker as a spreadsheet row: name, kind, timecode, comment.'
+	},
+	{
+		id: 'file.exportChapters',
+		repeat: false,
+		label: 'Export YouTube chapters…',
+		group: 'project',
+		context: 'global',
+		defaults: [],
+		hint: 'Chapter lines for a video description, from the chapter markers.'
 	},
 	{ id: 'app.settings', repeat: false, label: 'Settings…', group: 'project', context: 'global', defaults: ['Mod+,'] },
 	{ id: 'app.quit', repeat: false, label: 'Quit Kerf', group: 'project', context: 'global', defaults: [] },

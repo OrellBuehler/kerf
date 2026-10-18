@@ -8,6 +8,8 @@
 	import HeightGlyph from './HeightGlyph.svelte';
 	import ToolbarToggle from './ToolbarToggle.svelte';
 	import Minimap from './Minimap.svelte';
+	import MarkerDialog from './MarkerDialog.svelte';
+	import { markerTip } from '$lib/marker-edit';
 	import { toast } from '$lib/notifications.svelte';
 	import { ui, type Tool } from '$lib/editor-ui.svelte';
 	import { editor } from '$lib/state.svelte';
@@ -2289,6 +2291,8 @@
 	/** Marker being dragged along the ruler, and the id being renamed inline. */
 	let markerDrag: { id: string; time: number } | null = $state(null);
 	let renaming = $state<string | null>(null);
+	/** The marker whose name, kind, length and comment are open in the dialog. */
+	let editingMarker = $state<string | null>(null);
 
 	const addMarkerHere = () => void editor.addMarkerAtPlayhead(ui.time).catch(err);
 
@@ -2313,6 +2317,11 @@
 		contextMenu.show(e, [
 			{ label: 'Go to marker', icon: 'bookmark', action: () => ui.seek(m.time) },
 			{ label: 'Rename', action: () => (renaming = m.id) },
+			{ label: 'Edit marker…', icon: 'file-text', action: () => (editingMarker = m.id) },
+			{
+				label: m.kind === 'chapter' ? 'Make it a comment' : 'Make it a chapter',
+				action: () => void editor.updateMarker(m.id, { kind: m.kind === 'chapter' ? 'comment' : 'chapter' }).catch(err)
+			},
 			{ type: 'separator' },
 			{
 				label: 'Remove marker',
@@ -2932,7 +2941,7 @@
 					{@const accent = m.color || 'var(--agent-400)'}
 					<span
 						role="presentation"
-						use:tip={`${m.name} — ${tc(mt)}`}
+						use:tip={markerTip(m, tc(mt))}
 						onpointerdown={(e) => onMarkerPointerDown(e, m)}
 						ondblclick={() => (renaming = m.id)}
 						oncontextmenu={(e) => onMarkerContextMenu(e, m)}
@@ -2940,6 +2949,12 @@
 							pxPerSec}px;top:0;bottom:0;width:8px;z-index:29;cursor:ew-resize;touch-action:none;display:flex;align-items:center"
 					>
 						<span style="position:absolute;left:-1px;top:0;bottom:0;width:2px;background:{accent}"></span>
+						{#if m.duration}
+							<span
+								style="position:absolute;left:0;bottom:0;height:3px;width:{m.duration *
+									pxPerSec}px;background:{accent};opacity:.6;pointer-events:none"
+							></span>
+						{/if}
 						{#if renaming === m.id}
 							<!-- svelte-ignore a11y_autofocus -->
 							<input
@@ -3517,6 +3532,10 @@
 		</div>
 	</div>
 </div>
+
+{#if editingMarker}
+	<MarkerDialog markerId={editingMarker} onClose={() => (editingMarker = null)} />
+{/if}
 
 <style>
 	/* A locked lane is hatched: the track header says so too, but a lane that looks like any other is

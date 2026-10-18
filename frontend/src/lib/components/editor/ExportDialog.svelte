@@ -16,7 +16,7 @@
 	import { frameKey, restoreDraft } from '$lib/export-draft';
 	import { judgeable } from '$lib/platform-verdict';
 	import type { RowSpec } from '$lib/slider-row';
-	import type { Container, ExportOptions, Fit, RateControl } from '$lib/types';
+	import type { Container, ExportOptions, Fit, RateControl, SubtitleFormat } from '$lib/types';
 	import { exportedLine, failure } from '$lib/failure-copy';
 	import {
 		PRESETS,
@@ -34,6 +34,8 @@
 		RESOLUTIONS,
 		frameRateOptions,
 		applyPreset,
+		carriesChapters,
+		carriesSubtitles,
 		presetsFor,
 		containerInfo,
 		isHwCodec,
@@ -49,6 +51,14 @@
 	} from '$lib/export-presets';
 
 	let { onClose }: { onClose: () => void } = $props();
+
+	const hasCaptions = $derived((editor.timeline.overlays ?? []).some((o) => o.generated));
+	const chapterCount = $derived(editor.markers.filter((m) => m.kind === 'chapter').length);
+	const sidecar = (f: SubtitleFormat) => (opts.caption_sidecars ?? []).includes(f);
+	function toggleSidecar(f: SubtitleFormat, on: boolean) {
+		const rest = (opts.caption_sidecars ?? []).filter((x) => x !== f);
+		patch({ caption_sidecars: on ? [...rest, f] : rest });
+	}
 
 	// The export opens on the frame the project is cut for. A 9:16 project whose
 	// dialog defaulted to Web 1080p opened already landscape — and the readiness
@@ -171,7 +181,7 @@
 		return path.replace(/\.[^./\\]+$/, '') + '.' + ext;
 	}
 	function changeContainer(c: Container) {
-		opts = reconcileContainer({ ...opts, container: c });
+		opts = reconcileContainer({ ...opts, container: c, embed_captions: opts.embed_captions && carriesSubtitles(c) });
 		activePreset = 'custom';
 		customRes = false;
 		if (outputPath) outputPath = swapExt(outputPath, containerInfo(c).ext);
@@ -633,6 +643,22 @@
 			{@render toggleRow('Fast start (web streaming)', opts.faststart, (v) => patch({ faststart: v }))}
 		{/if}
 		{@render textRow('Title', opts.metadata_title ?? '', 'optional', (v) => patch({ metadata_title: v || null }))}
+
+		{#if hasCaptions || (chapterCount > 0 && carriesChapters(opts.container))}
+			{@render secHead('Captions & chapters')}
+			{#if hasCaptions}
+				{#if carriesSubtitles(opts.container)}
+					{@render toggleRow('Embed captions as a subtitle track', !!opts.embed_captions, (v) => patch({ embed_captions: v }))}
+				{/if}
+				{@render toggleRow('Write .srt beside the export', sidecar('srt'), (v) => toggleSidecar('srt', v))}
+				{@render toggleRow('Write .vtt beside the export', sidecar('vtt'), (v) => toggleSidecar('vtt', v))}
+			{/if}
+			{#if chapterCount > 0 && carriesChapters(opts.container)}
+				<div style="font-size:12px;color:var(--text-muted);padding:4px 0">
+					{chapterCount === 1 ? '1 chapter marker becomes' : `${chapterCount} chapter markers become`} the file's chapters.
+				</div>
+			{/if}
+		{/if}
 
 		<!-- command preview -->
 		<button

@@ -30,6 +30,11 @@ import type {
 	PlatformReport,
 	EditSource,
 	ExportOptions,
+	ExportedFile,
+	InterchangeFormat,
+	MarkerListFormat,
+	MarkerPatch,
+	SubtitleFormat,
 	ExportProgress,
 	Filmstrip,
 	GpuPreviewDiagnostics,
@@ -2300,16 +2305,16 @@ export async function addMarker(time: number, name: string, color?: string): Pro
 	return invoke<Timeline>('add_marker', { time, name, color });
 }
 
-export async function updateMarker(
-	markerId: string,
-	patch: { time?: number; name?: string; color?: string }
-): Promise<Timeline> {
+export async function updateMarker(markerId: string, patch: MarkerPatch): Promise<Timeline> {
 	if (!inTauri()) {
 		const m = devTimeline.markers?.find((x) => x.id === markerId);
 		if (m) {
 			if (patch.time !== undefined) m.time = patch.time;
 			if (patch.name !== undefined) m.name = patch.name;
 			if (patch.color !== undefined) m.color = patch.color || null;
+			if (patch.duration !== undefined) m.duration = patch.duration || undefined;
+			if (patch.comment !== undefined) m.comment = patch.comment.trimEnd() || undefined;
+			if (patch.kind !== undefined) m.kind = patch.kind === 'comment' ? undefined : patch.kind;
 			devTimeline.markers = [...(devTimeline.markers ?? [])].sort((a, b) => a.time - b.time);
 		}
 		recordDev('Update marker');
@@ -2492,7 +2497,7 @@ export async function clearCaptions(): Promise<Timeline> {
 	return invoke<Timeline>('clear_captions');
 }
 
-/** Caption the cut from a `.srt` / `.ass` / `.ssa` file on disk. `base` is
+/** Caption the cut from a `.srt` / `.vtt` / `.ass` / `.ssa` file on disk. `base` is
  *  `timeline` (the file is a subtitle track for the finished cut — the default) or
  *  `source` with an `assetId` (the file times that asset's own footage and is
  *  projected through its clips like a transcript); `options` is the same look
@@ -2513,7 +2518,7 @@ export async function importCaptions(path: string, req: CaptionImportRequest = {
 }
 
 /** `importCaptions` for text the page already holds — a file read through an
- *  `<input type=file>`, or pasted. `format` is `srt` / `ass`; omitted, it is
+ *  `<input type=file>`, or pasted. `format` is `srt` / `vtt` / `ass`; omitted, it is
  *  guessed from the text. This is the variant the browser harness runs. */
 export async function importCaptionsText(
 	text: string,
@@ -2547,7 +2552,7 @@ export type CaptionFilePick =
 	| { kind: 'path'; path: string; name: string }
 	| { kind: 'text'; text: string; name: string; format: CaptionFormat | null };
 
-/** Pick a `.srt` / `.ass` / `.ssa` file; `null` if cancelled. Desktop: the native
+/** Pick a `.srt` / `.vtt` / `.ass` / `.ssa` file; `null` if cancelled. Desktop: the native
  *  dialog, answering with the path (`importCaptions` reads it, with its guards).
  *  Browser: an `<input type=file>` read as text, for `importCaptionsText`. In the
  *  browser the picker must be opened straight from the click, before any `await`,
@@ -2585,6 +2590,43 @@ export async function pickCaptionFile(): Promise<CaptionFilePick | null> {
 export async function exportSrt(assetId: string, outputPath: string): Promise<string> {
 	if (!inTauri()) return outputPath;
 	return invoke<string>('export_srt', { assetId, outputPath });
+}
+
+/** What the browser harness answers for a side-file export: nothing is written there. */
+const harnessFile = (path: string): ExportedFile => ({
+	path,
+	report: { entries: [{ level: 'info', message: 'the browser harness writes no file; the desktop app does', count: 1 }] }
+});
+
+/** Write the cut's captions as SubRip or WebVTT (by `format`, else the path's extension). */
+export async function exportCaptions(outputPath: string, format?: SubtitleFormat): Promise<string> {
+	if (!inTauri()) return outputPath;
+	return invoke<string>('export_captions', { outputPath, format: format ?? null });
+}
+
+/** Write the cut as OpenTimelineIO or a CMX 3600 EDL (`videoTrack`: which video track an EDL holds). */
+export async function exportInterchange(
+	outputPath: string,
+	format: InterchangeFormat,
+	videoTrack?: number
+): Promise<ExportedFile> {
+	if (!inTauri()) return harnessFile(outputPath);
+	return invoke<ExportedFile>('export_interchange', { outputPath, format, videoTrack: videoTrack ?? null });
+}
+
+/** Write the markers as a formula-safe CSV or as YouTube chapter text. */
+export async function exportMarkers(outputPath: string, format: MarkerListFormat): Promise<ExportedFile> {
+	if (!inTauri()) return harnessFile(outputPath);
+	return invoke<ExportedFile>('export_markers', { outputPath, format });
+}
+
+/** Ask where to save a side-file; `null` if cancelled. The browser harness answers
+ *  `defaultPath`, so the export flow stays explorable there. */
+export async function pickSavePath(name: string, extensions: string[], defaultPath: string): Promise<string | null> {
+	if (!inTauri()) return defaultPath;
+	const { save } = await import('@tauri-apps/plugin-dialog');
+	const path = await save({ filters: [{ name, extensions }], defaultPath });
+	return typeof path === 'string' ? path : null;
 }
 
 export async function removeSilence(assetId: string): Promise<Timeline> {

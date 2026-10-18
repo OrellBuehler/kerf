@@ -59,6 +59,8 @@ export interface MenuState {
 	canRedo: boolean;
 	/** The cut has a clip at all / a clip is selected. */
 	hasClips: boolean;
+	/** The cut has a marker (the marker exports need one). */
+	hasMarkers?: boolean;
 	/** A render is under way: File › Export… then reopens its dialog (the title bar's button does too). */
 	exporting: boolean;
 	hasSelection: boolean;
@@ -90,11 +92,13 @@ const act = (id: ActionId, extra: Partial<Omit<Extract<MenuEntry, { kind: 'actio
 
 const NEEDS_SELECTION = 'Select a clip first';
 const NEEDS_CLIPS = 'The cut has no clips';
+const NEEDS_MARKERS = 'The cut has no markers';
 const DESKTOP_ONLY = 'Available in the desktop app';
 
 export function buildMenus(s: MenuState): MenuDef[] {
 	const sel = { disabled: !s.hasSelection, reason: s.hasSelection ? undefined : NEEDS_SELECTION };
 	const clips = { disabled: !s.hasClips, reason: s.hasClips ? undefined : NEEDS_CLIPS };
+	const markers = { disabled: !s.hasMarkers, reason: s.hasMarkers ? undefined : NEEDS_MARKERS };
 	const desk = { disabled: !s.desktop, reason: s.desktop ? undefined : DESKTOP_ONLY };
 	// The one rule the title bar's Export button and the shortcut use too (`export-button.ts`).
 	const exportOff = exportButtonState({ clips: s.hasClips ? 1 : 0, running: s.exporting });
@@ -113,6 +117,18 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			sep,
 			act('file.export', { disabled: exportOff.disabled, reason: exportOff.reason }),
 			act('file.saveCover', { ...clips }),
+			{
+				kind: 'submenu',
+				label: 'Export as',
+				items: [
+					act('file.exportCaptions', { ...clips }),
+					act('file.exportOtio', { ...clips }),
+					act('file.exportEdl', { ...clips }),
+					sep,
+					act('file.exportMarkers', { ...markers }),
+					act('file.exportChapters', { ...markers })
+				]
+			},
 			sep,
 			act('app.settings'),
 			sep,

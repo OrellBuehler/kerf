@@ -35,7 +35,7 @@
 	} from '$lib/ops';
 	import { allowsRepeat, type ActionId } from '$lib/keymap';
 	import { runMenuCommand } from '$lib/menu-commands';
-	import { saveCoverFrame, saveProject } from '$lib/file-actions';
+	import { exportCaptionFile, exportInterchangeFile, exportMarkerList, saveCoverFrame, saveProject } from '$lib/file-actions';
 	import { importCaptionFile } from '$lib/title-actions';
 	import {
 		askUnsaved,
@@ -439,6 +439,11 @@
 		'file.export': () => onExport(),
 		'file.importCaptions': () => void importCaptionFile(),
 		'file.saveCover': () => void saveCoverFrame(),
+		'file.exportCaptions': () => void exportCaptionFile(),
+		'file.exportOtio': () => void exportInterchangeFile('otio'),
+		'file.exportEdl': () => void exportInterchangeFile('edl'),
+		'file.exportMarkers': () => void exportMarkerList('csv'),
+		'file.exportChapters': () => void exportMarkerList('youtube'),
 		'app.settings': () => settings.toggle(),
 		'app.quit': () => void onQuit(),
 

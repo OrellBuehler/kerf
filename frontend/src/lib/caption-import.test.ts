@@ -14,6 +14,7 @@ import {
 	parseFormat,
 	parseSrt,
 	parseTimestamp,
+	parseVtt,
 	resolveBase
 } from './caption-import';
 import { captionsForTimeline, placeCues, resolveCaptions } from './captions';
@@ -287,6 +288,44 @@ describe('hostile input', () => {
 	});
 });
 
+describe('WebVTT', () => {
+	const VTT =
+		'﻿WEBVTT - a header\r\nKind: captions\r\n\r\nSTYLE\r\n::cue { color: yellow }\r\n\r\nREGION\r\nid:fred width:40%\r\n\r\nNOTE a comment\r\nspanning lines\r\n\r\nintro\r\n00:01.000 --> 00:00:03.500 line:90% align:start\r\n<v.loud Ann Smith>Hello <b>there</b>\r\nsecond line\r\n\r\n00:00:04.000 --> 00:00:05.000\r\n<i>plain</i> &amp; &lt;tags&gt;<00:00:04.500> late\r\n\r\nNOTE\r\nafter a cue\r\n\r\n1:00:06.250 --> 1:00:07.000 position:10%\r\n<c.yellow>an hour in</c>\r\n';
+
+	test('a file reads with its header, blocks, ids and settings dropped', () => {
+		const parsed = parseVtt(VTT);
+		expect(parsed.skipped).toBe(0);
+		expect(parsed.cues).toEqual([
+			cue(1, 3.5, 'Hello there\nsecond line'),
+			cue(4, 5, 'plain & <tags> late'),
+			cue(3606.25, 3607, 'an hour in')
+		]);
+		expect(parseCaptions(VTT).format).toBe('vtt');
+	});
+
+	test('entities and timestamps are text unless they are markup', () => {
+		const parsed = parseVtt('WEBVTT\n\n00:01.000 --> 00:02.000\na &unknown; b & c &#233;&#xE9; &lrm;d <3 <laughs> <0x>\n');
+		expect(texts(parsed)).toEqual(['a &unknown; b & c éé d <3 <laughs> <0x>']);
+	});
+
+	test('broken cues are counted and a signature is optional', () => {
+		const parsed = parseVtt(
+			'00:01.000 --> 00:02.000\nno header\n\nid only\n\n00:03.000 --> 00:02.000\nbackwards\n\n00:04.000 --> 00:05.000\n\nWEBVTT\n00:06.000 --> 00:07.000\na late signature is only an id\n'
+		);
+		expect(texts(parsed)).toEqual(['no header', 'a late signature is only an id']);
+		expect(parsed.skipped).toBe(3);
+		expect(texts(parseVtt('WEBVTT\n00:01.000 --> 00:02.000\nno blank line\n'))).toEqual(['no blank line']);
+		expect(parseVtt('WEBVTT\n').cues).toEqual([]);
+	});
+
+	test('a line over the cap refuses its cue', () => {
+		const long = 'x'.repeat(MAX_LINE_CHARS + 1);
+		const parsed = parseVtt(`WEBVTT\n\n00:01.000 --> 00:02.000\n${long}\n\n00:03.000 --> 00:04.000\nok\n`);
+		expect(texts(parsed)).toEqual(['ok']);
+		expect(parsed.skipped).toBe(1);
+	});
+});
+
 describe('entry points', () => {
 	test('the format is guessed from the text', () => {
 		expect(detectFormat(ASS)).toBe('ass');
@@ -296,7 +335,10 @@ describe('entry points', () => {
 		expect(detectFormat('1\n00:00:01,000 --> 00:00:02,000\nDialogue: a play')).toBe('srt');
 		expect(detectFormat('')).toBe('srt');
 		expect(parseFormat('.SSA')).toBe('ass');
-		expect(parseFormat('vtt')).toBeNull();
+		expect(parseFormat('vtt')).toBe('vtt');
+		expect(parseFormat('sub')).toBeNull();
+		expect(detectFormat('\uFEFFWEBVTT\n\n00:01.000 --> 00:02.000\nHi')).toBe('vtt');
+		expect(detectFormat('WEBVTTX\n00:01.000 --> 00:02.000\nHi')).toBe('srt');
 	});
 
 	test('a named format wins over a guess, and the cue count is capped', () => {
