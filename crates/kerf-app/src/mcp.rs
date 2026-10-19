@@ -3322,7 +3322,8 @@ impl KerfMcp {
                        trimmed, split, cut, removed, retimed, disabled or reordered and nothing is added or pasted \
                        onto it (its clips' volume, fades, effects, grade, transform and keyframes stay editable). You \
                        may lock a track; only the user can unlock one — `locked: false` on a locked track is refused, \
-                       so ask them."
+                       so ask them. The answer is the track as it now holds for you: in a proposal, a track the user \
+                       unlocked since it began cannot be locked again from it (the answer says `locked: false`)."
     )]
     fn set_track_locked(&self, Parameters(p): Parameters<SetTrackLockedParams>) -> Result<String, McpError> {
         let track_id = parse_arg("track_id", &p.track_id)?;

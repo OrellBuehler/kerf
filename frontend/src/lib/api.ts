@@ -172,6 +172,7 @@ import {
 } from './edit-modes';
 import { dissolveAllOrphans, linkPartners, withLinkPartners } from './link-groups';
 import * as ops from './link-ops';
+import { landingLocks } from './track-locks';
 import { runEdit } from './link-ops';
 import { sourceLimits } from './trim-tools';
 import { clampCeiling, clampDuckDepth, clampMasterVolume, DEFAULT_MASTER, estimateLevels, masterOf } from './levels';
@@ -4415,8 +4416,14 @@ export async function getStagedTimeline(): Promise<Timeline | null> {
 export async function applyStagedEdit(force = false): Promise<Timeline> {
 	if (!inTauri()) {
 		if (!devStaged) throw new Error('no staged edit is pending');
-		if (devStagedStale() && !force) throw new Error(STALE_MESSAGE);
-		devTimeline = structuredClone(devStaged.timeline);
+		const stale = devStagedStale();
+		if (stale && !force) throw new Error(STALE_MESSAGE);
+		const landing = structuredClone(devStaged.timeline);
+		if (stale) {
+			// Forced over newer work, the locks are the user's as they are now (`apply_staged`).
+			landingLocks(landing, devStaged.base, devTimeline);
+		}
+		devTimeline = landing;
 		recordDev(devStaged.edit.note ?? 'Agent edit');
 		devHistory[devHead].source = 'agent';
 		// Accepting the edits finishes the task they were staged under, as `apply_staged` does.
