@@ -117,6 +117,11 @@ pub struct ClipFx {
     /// from the start with no seek, such an input opens with the pad's clone of the
     /// first frame, which the original it stands for has no frame for.
     pub head_pad: bool,
+    /// Seconds between the start of the clip's file and its first picture, for a source whose
+    /// video starts after its sound ([`StreamInfo::lead`] of the asset's video stream; `0.0`
+    /// for an ordinary file, a still and a sound). A window that starts inside it is read
+    /// without a seek ([`clip_seek`]) and its picture placed by [`picture_delay`].
+    pub lead: f64,
     /// The clip's picture is untagged HD YCbCr and shares the graph with an input that names a
     /// matrix, so the chain labels it BT.709 (`setparams=colorspace=bt709`, the first filter of its chain):
     /// FFmpeg 9 would otherwise read it as BT.601 and convert it into its neighbour's matrix.
@@ -165,6 +170,7 @@ pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
         fx[flat].alpha = asset.is_some_and(|a| a.has_alpha());
         fx[flat].head_pad = asset.is_some_and(|a| is_head_padded_proxy(&a.path));
         let stream = asset.and_then(|a| a.streams.iter().find(|s| s.kind == StreamKind::Video));
+        fx[flat].lead = stream.filter(|s| !s.image).map_or(0.0, |s| s.lead);
         fx[flat].frame_matrix = crate::model::frame_matrix(stream, fx[flat].hdr.is_some());
     }
     for (fx, label) in fx.iter_mut().zip(graph_bt709_labels(timeline, assets)) {
@@ -326,12 +332,36 @@ pub fn clip_source_window(clip: &Clip, fx: &ClipFx) -> (f64, f64) {
 /// for no seek — head clips keep byte-identical args. `SEEK_EPS` skips a
 /// pointless sub-millisecond seek. Callers must express the in-graph trim
 /// relative to this value.
-pub fn clip_seek(window_start: f64) -> f64 {
+///
+/// `lead` is [`ClipFx::lead`]: a window that starts before a late-starting source's
+/// first picture is not seeked either. A demuxer has no video there to seek to, and
+/// the MOV one then lands every stream on the first picture, so the sound before it
+/// was lost and the clip's audio played early by the rest of the lead; decoding from
+/// the head costs at most the lead.
+pub fn clip_seek(window_start: f64, lead: f64) -> f64 {
     const SEEK_EPS: f64 = 1e-3;
-    if window_start > SEEK_EPS {
+    if window_start > SEEK_EPS && window_start >= lead {
         window_start
     } else {
         0.0
+    }
+}
+
+/// How long into its clip a late-starting source's first picture plays, in timeline
+/// seconds: `(lead - window start) / speed` for a forward clip whose window starts
+/// before it, else `0.0`. The chain's `setpts` puts the first frame it keeps at the
+/// clip's start, which for such a window is the source's first picture — `lead`
+/// seconds into the file, where the window's sound is still playing — so the picture
+/// was early by this much against its own sound; the chain adds it back
+/// (`video_clip_chain`) and the `fps` pick with it (`frame_pick`). Nothing of the clip
+/// is drawn before it, as the source has no picture there. A reversed clip plays its
+/// window's end first, so its stream already starts on time and the lead is the end
+/// of the clip it leaves without a picture.
+pub fn picture_delay(window_start: f64, lead: f64, speed: f64, reversed: bool) -> f64 {
+    if reversed || window_start >= lead {
+        0.0
+    } else {
+        (lead - window_start) / speed
     }
 }
 
@@ -379,7 +409,8 @@ pub fn fade_alpha(a: u8, factor: u32) -> u8 {
 
 /// One `fade` of a clip's picture. `st` is on the **timeline** (`setpts` has
 /// already moved the frames there), `d` is clamped to the clip's length with its
-/// tail.
+/// tail and is never 0. A fade-in starts on the clip's first picture, which on a
+/// late-starting source is [`picture_delay`] after its start ([`ClipTiming::fades`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FadeStep {
     pub edge: FadeEdge,
@@ -676,21 +707,53 @@ impl<'a> ClipTiming<'a> {
         t >= start && t <= end
     }
 
+    /// How long into the clip its first picture plays: the [`picture_delay`] of its source
+    /// window on a late-starting source, else `0.0`.
+    pub fn picture_delay(&self) -> f64 {
+        let (start, _) = clip_source_window(self.clip, self.fx);
+        picture_delay(start, self.fx.lead, self.clip.speed_mag(), self.clip.is_reversed())
+    }
+
     /// The fades of the clip's picture, in the order the chain applies them: its
     /// own fade-in and out merged with a dip to black's, then a dip to white's,
     /// then a dissolve's alpha ramp. A step is only present when it has length.
+    ///
+    /// A fade-in starts on the clip's first picture: [`ClipTiming::picture_delay`] after its
+    /// start on a late-starting source (nothing of the clip is drawn before it), where a ramp
+    /// from the clip's start would be spent on the gap — a fade-in or a dissolve no longer than
+    /// the delay was never seen, the picture cutting in at full strength after the background.
+    /// A fade keeps its length, within what is left of the clip. A dissolve's ramp instead ends
+    /// where the outgoing clip's tail does (`len - delay` long), so the incoming picture is
+    /// whole when the outgoing one goes; one no longer than the delay is over before the picture
+    /// comes, and has no step. A step of no length is left out: FFmpeg reads `d=0` as its
+    /// default of 25 frames.
     pub fn fades(&self) -> Vec<FadeStep> {
         let (clip, fx) = (self.clip, self.fx);
         let dur = self.duration();
         let t0 = clip.timeline_start;
-        let step = |edge, tint, len: f64| FadeStep {
-            edge,
-            tint,
-            st: match edge {
-                FadeEdge::In => t0,
-                FadeEdge::Out => t0 + (dur - len).max(0.0),
+        let delay = self.picture_delay();
+        let step = |edge, tint, len: f64| match (edge, tint) {
+            (FadeEdge::In, FadeTint::Alpha) if delay > 0.0 => FadeStep {
+                edge,
+                tint,
+                st: t0 + delay,
+                d: (len - delay).clamp(0.0, (dur - delay).max(0.0)),
             },
-            d: len.clamp(0.0, dur),
+            (FadeEdge::In, _) if delay > 0.0 => FadeStep {
+                edge,
+                tint,
+                st: t0 + delay,
+                d: len.clamp(0.0, (dur - delay).max(0.0)),
+            },
+            _ => FadeStep {
+                edge,
+                tint,
+                st: match edge {
+                    FadeEdge::In => t0,
+                    FadeEdge::Out => t0 + (dur - len).max(0.0),
+                },
+                d: len.clamp(0.0, dur),
+            },
         };
         let fi = clip.fade_in + fx.black_in;
         let fo = clip.fade_out + fx.black_out;
@@ -703,7 +766,10 @@ impl<'a> ClipTiming<'a> {
             (fx.xfade_in, FadeEdge::In, FadeTint::Alpha),
         ] {
             if len > 0.0 {
-                steps.push(step(edge, tint, len));
+                let s = step(edge, tint, len);
+                if s.d > 0.0 {
+                    steps.push(s);
+                }
             }
         }
         steps
@@ -1060,10 +1126,96 @@ mod tests {
 
     #[test]
     fn a_seek_is_only_made_past_the_head() {
-        assert_eq!(clip_seek(0.0), 0.0);
-        assert_eq!(clip_seek(0.0005), 0.0);
-        assert_eq!(clip_seek(0.002), 0.002);
-        assert_eq!(clip_seek(12.5), 12.5);
+        assert_eq!(clip_seek(0.0, 0.0), 0.0);
+        assert_eq!(clip_seek(0.0005, 0.0), 0.0);
+        assert_eq!(clip_seek(0.002, 0.0), 0.002);
+        assert_eq!(clip_seek(12.5, 0.0), 12.5);
+    }
+
+    #[test]
+    fn a_late_starting_sources_lead_rides_along_and_its_fade_in_starts_on_the_first_picture() {
+        let mut stream = video_stream(1920, 1080, 30.0);
+        stream.lead = 0.5;
+        let late = test_asset(vec![stream]);
+        let mut head = make_clip(late.id, 0.0, 3.0, 2.0);
+        head.fade_in = 0.4;
+        head.fade_out = 0.3;
+        let tl = single(vec![head]);
+        let fx = transition_fx(&tl, std::slice::from_ref(&late));
+        assert_eq!(fx[0].lead, 0.5);
+        let t = timing(&tl, &fx, 0);
+        assert_eq!(t.picture_delay(), 0.5);
+        let fades = t.fades();
+        // The fade-in keeps its length and starts on the first picture; the fade-out is unmoved.
+        assert_eq!((fades[0].edge, fades[0].st, fades[0].d), (FadeEdge::In, 2.5, 0.4));
+        assert_eq!((fades[1].edge, fades[1].st, fades[1].d), (FadeEdge::Out, 4.7, 0.3));
+        // An ordinary source, a still image and a clip past the lead are what they were.
+        let plain = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let mut same = tl.clone();
+        same.tracks[0].clips[0].asset_id = plain.id;
+        let fx = transition_fx(&same, std::slice::from_ref(&plain));
+        assert_eq!((fx[0].lead, timing(&same, &fx, 0).fades()[0].st), (0.0, 2.0));
+        let mut past = tl.clone();
+        past.tracks[0].clips[0].source_in = 0.5;
+        let fx = transition_fx(&past, std::slice::from_ref(&late));
+        assert_eq!((fx[0].lead, timing(&past, &fx, 0).picture_delay()), (0.5, 0.0));
+        let still = img_asset(Uuid::new_v4());
+        let tl = single(vec![make_clip(still.id, 0.0, 3.0, 0.0)]);
+        assert_eq!(transition_fx(&tl, std::slice::from_ref(&still))[0].lead, 0.0);
+    }
+
+    #[test]
+    fn a_late_starting_clips_dissolve_ends_with_the_tail_and_a_dip_starts_on_its_first_picture() {
+        let mut stream = video_stream(1920, 1080, 30.0);
+        stream.lead = 0.5;
+        let late = test_asset(vec![stream]);
+        let plain = asset();
+        let cut = |kind, secs: f64| {
+            let out = make_clip(plain.id, 0.0, 10.0, 0.0);
+            let mut inc = make_clip(late.id, 0.0, 5.0, 10.0);
+            inc.transition_in = Some(Transition { kind, duration: secs });
+            let tl = single(vec![out, inc]);
+            let fx = transition_fx(&tl, &[plain.clone(), late.clone()]);
+            (tl, fx)
+        };
+        // A dissolve of 0.8 s: the outgoing tail ends at 10.8, and the incoming ramp runs from its
+        // first picture (10.5) to there.
+        let (tl, fx) = cut(TransitionKind::Crossfade, 0.8);
+        assert_eq!(fx[0].tail, 0.8);
+        let ramp: Vec<_> = timing(&tl, &fx, 1)
+            .fades()
+            .into_iter()
+            .filter(|s| s.tint == FadeTint::Alpha)
+            .collect();
+        assert_eq!(ramp.len(), 1);
+        assert_eq!((ramp[0].st, ramp[0].d), (10.5, 0.8 - 0.5));
+        // One no longer than the delay is over before the picture comes: no step (a `d=0` fade
+        // would be FFmpeg's 25 frames).
+        let (tl, fx) = cut(TransitionKind::Crossfade, 0.4);
+        assert!(timing(&tl, &fx, 1).fades().iter().all(|s| s.tint != FadeTint::Alpha));
+        // A dip's fade up from black starts on the first picture and keeps its length.
+        let (tl, fx) = cut(TransitionKind::DipToBlack, 0.8);
+        let up = timing(&tl, &fx, 1).fades()[0];
+        assert_eq!(
+            (up.edge, up.tint, up.st, up.d),
+            (FadeEdge::In, FadeTint::Black, 10.5, fx[1].black_in)
+        );
+    }
+
+    #[test]
+    fn a_window_inside_a_late_starting_sources_lead_is_read_from_the_head_and_its_picture_waits() {
+        // Video 0.5 s after the sound: a window from 0.25 s is not seeked, and its first
+        // picture (the file's 0.5 s) plays a quarter second into the clip — half that at speed 2.
+        assert_eq!(clip_seek(0.25, 0.5), 0.0);
+        assert_eq!(clip_seek(0.5, 0.5), 0.5);
+        assert_eq!(clip_seek(3.0, 0.5), 3.0);
+        assert_eq!(picture_delay(0.25, 0.5, 1.0, false), 0.25);
+        assert_eq!(picture_delay(0.0, 0.5, 2.0, false), 0.25);
+        assert_eq!(picture_delay(0.0, 0.5, 0.5, false), 1.0);
+        // Past the lead, on an ordinary file and played backwards: no delay.
+        assert_eq!(picture_delay(0.5, 0.5, 1.0, false), 0.0);
+        assert_eq!(picture_delay(0.0, 0.0, 1.0, false), 0.0);
+        assert_eq!(picture_delay(0.0, 0.5, 1.0, true), 0.0);
     }
 
     #[test]

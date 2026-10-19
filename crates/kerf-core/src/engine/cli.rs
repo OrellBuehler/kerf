@@ -586,6 +586,7 @@ struct ProbeStream {
     sample_rate: Option<String>,
     channels: Option<u16>,
     duration: Option<String>,
+    start_time: Option<String>,
     color_transfer: Option<String>,
     color_primaries: Option<String>,
     color_space: Option<String>,
@@ -692,6 +693,17 @@ fn probe_from_json(parsed: ProbeJson, path: Option<&Path>) -> ProbeResult {
             .iter()
             .any(|s| s.codec_type.as_deref() == Some("video") && is_still_codec(s.codec_name.as_deref()));
 
+    let secs = |t: Option<&String>| t.and_then(|t| t.trim().parse::<f64>().ok()).filter(|t| t.is_finite());
+    // A video's lead is measured from the earliest picture or sound, not the container's start:
+    // a subtitle or data track can start the container earlier, and the export rebases the
+    // sound to its own first sample as it does the picture, so only the gap between them is
+    // a lead (the libav probe measures the same).
+    let av_start = parsed
+        .streams
+        .iter()
+        .filter(|s| matches!(s.codec_type.as_deref(), Some("video" | "audio")))
+        .filter_map(|s| secs(s.start_time.as_ref()))
+        .reduce(f64::min);
     let mut streams = Vec::new();
     let mut max_stream_dur = 0.0_f64;
     for s in &parsed.streams {
@@ -742,9 +754,17 @@ fn probe_from_json(parsed: ProbeJson, path: Option<&Path>) -> ProbeResult {
             } else {
                 None
             },
+            lead: if is_video && !still {
+                video_lead(secs(s.start_time.as_ref()), av_start)
+            } else {
+                0.0
+            },
         });
     }
     let duration = format_dur.unwrap_or(max_stream_dur).max(0.0);
+    for s in &mut streams {
+        s.lead = lead_within(s.lead, duration);
+    }
     ProbeResult { duration, streams }
 }
 
@@ -1497,6 +1517,7 @@ fn probe_composite_red(ffmpeg: &str, ffprobe: &str, tag_bt709: bool, deadline: I
             color_primaries: None,
             pix_fmt: Some("yuv420p".to_string()),
             color_space: tag_bt709.then(|| "bt709".to_string()),
+            lead: 0.0,
         }],
         imported_at: chrono::Utc::now(),
         source_paths: Vec::new(),
@@ -2960,6 +2981,27 @@ fn head_lead(stream_start: Option<f64>, format_start: Option<f64>) -> f64 {
 /// inside the error of the container's own timestamps; anything above shifts a
 /// seek by a whole frame for the stretch of each frame interval it covers.
 const HEAD_PAD_MIN: f64 = 0.001;
+
+/// A video stream's [`StreamInfo::lead`] from its start and the earliest start of the file's
+/// picture and sound streams (pure): the [`head_lead`] when it is above [`HEAD_PAD_MIN`], else
+/// `0.0`. Unlike [`SourceTraits::lead`] a transport stream is measured too: the export reads
+/// its sound beside its picture.
+pub(crate) fn video_lead(stream_start: Option<f64>, av_start: Option<f64>) -> f64 {
+    Some(head_lead(stream_start, av_start))
+        .filter(|&lead| needs_head_pad(lead))
+        .unwrap_or(0.0)
+}
+
+/// A lead as the file's `duration` allows it (pure): one that reaches the end of the file is
+/// a broken start time, not a picture that never comes, and reads as none — otherwise every
+/// window would start inside it and no clip of the file would ever be seeked.
+pub(crate) fn lead_within(lead: f64, duration: f64) -> f64 {
+    if lead < duration {
+        lead
+    } else {
+        0.0
+    }
+}
 
 /// Whether a source with this [`head_lead`] needs its proxy's head filled in.
 fn needs_head_pad(lead: f64) -> bool {
@@ -4794,7 +4836,7 @@ fn plan_inputs(timeline: &Timeline, assets: &[Asset], fx: &[ClipFx]) -> InputPla
             let (start, _) = clip_source_window(clip, &fx[flat]);
             // Key on the exact emitted seek string: two clips share an input iff
             // their `-i` arguments (path is implied by asset_id) are identical.
-            let key = (clip.asset_id, format!("{}", clip_seek(start)));
+            let key = (clip.asset_id, format!("{}", clip_seek(start, fx[flat].lead)));
             *seen.entry(key).or_insert_with(|| {
                 let i = representatives.len();
                 representatives.push(flat);
@@ -4859,7 +4901,7 @@ fn push_inputs(
                 args.push("-hwaccel".to_string());
                 args.push(hw.to_string());
             }
-            let seek = clip_seek(start);
+            let seek = clip_seek(start, fx[rep].lead);
             if seek > 0.0 {
                 args.push("-ss".to_string());
                 args.push(export_seek_arg(seek));
@@ -8297,7 +8339,7 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // Relative to the input-side `-ss` (see `build_export_args_phase`): when the
     // window is fast-seeked the trim starts at 0, otherwise it is unchanged. A still
     // image is never seeked (it is `-loop`ed from t=0), so its trim stays absolute.
-    let seek = if is_image { 0.0 } else { clip_seek(trim_start) };
+    let seek = if is_image { 0.0 } else { clip_seek(trim_start, fx.lead) };
 
     let reframe = clip.reframe.as_ref();
     let crop = t.has_crop().then(|| {
@@ -8343,10 +8385,17 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     if reframe.is_none() {
         p.extend(crop.clone());
     }
+    // `setpts` puts the first frame kept at the clip's start; a window that starts inside a
+    // late-starting source's lead keeps no frame until the source's first picture, which
+    // plays `picture_delay` into the clip, in sync with the sound beside it.
+    let start = match timing.picture_delay() {
+        d if d > 0.0 => format!("({}+{d})", clip.timeline_start),
+        _ => clip.timeline_start.to_string(),
+    };
     if (s - 1.0).abs() < 1e-9 {
-        p.push(format!("setpts=PTS-STARTPTS+{}/TB", clip.timeline_start));
+        p.push(format!("setpts=PTS-STARTPTS+{start}/TB"));
     } else {
-        p.push(format!("setpts=(PTS-STARTPTS)/{}+{}/TB", s, clip.timeline_start));
+        p.push(format!("setpts=(PTS-STARTPTS)/{s}+{start}/TB"));
     }
     if let Some(rf) = reframe {
         // Hoisted above `v360` so a 50 fps source exporting at 30 reprojects 30
@@ -9396,7 +9445,7 @@ fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, 
     // Mirror the video crossfade tail (extends below source_in when reversed) and
     // the same input-side `-ss` fast-seek, so the atrim is relative to the seek.
     let (trim_start, trim_end) = clip_source_window(clip, fx);
-    let seek = clip_seek(trim_start);
+    let seek = clip_seek(trim_start, fx.lead);
     let delay = audio_delay(clip.timeline_start, fmt.sample_rate);
     let fi = clip.fade_in + fx.black_in + fx.white_in + fx.afade_in;
     let fo = clip.fade_out + fx.black_out + fx.white_out + fx.tail;
@@ -9632,6 +9681,10 @@ mod sweep;
 /// The `fps` pick against the frames the export renders (`#[ignore]`d).
 #[cfg(test)]
 mod picked;
+
+/// A source whose video starts late keeps its sync in the export (`#[ignore]`d).
+#[cfg(test)]
+mod late_start;
 
 /// A keyframed zoom with every other feature of a clip, measured per output frame
 /// against `transform_at` and the scrubbed still (`#[ignore]`d).
@@ -13910,6 +13963,93 @@ mod tests {
         let json = r#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264","width":5760,"height":2880,"r_frame_rate":"30/1"}],"format":{"duration":"20.0"}}"#;
         let r = probe_from_json(serde_json::from_str(json).unwrap(), Some(Path::new("/media/ultrawide.mp4")));
         assert_eq!(r.streams[0].projection, None);
+    }
+
+    #[test]
+    fn probe_records_how_late_the_video_starts() {
+        let probe = |video: &str, audio: &str| {
+            let json = format!(
+                r#"{{"streams":[{{"index":0,"codec_type":"video","codec_name":"h264","width":64,"height":36,"r_frame_rate":"25/1"{video}}},
+                    {{"index":1,"codec_type":"audio","codec_name":"aac"{audio}}}],"format":{{"duration":"5.0","start_time":"0.000000"}}}}"#
+            );
+            let r = probe_from_json(serde_json::from_str(&json).unwrap(), None);
+            (r.streams[0].lead, r.streams[1].lead)
+        };
+        let at = |t: &str| format!(r#","start_time":"{t}""#);
+        assert_eq!(probe(&at("0.500000"), &at("0.000000")), (0.5, 0.0));
+        assert_eq!(probe(&at("1.521333"), &at("1.400000")).0, 1.521333 - 1.4);
+        // A millisecond or less, an early video and a missing start are an ordinary file.
+        assert_eq!(probe(&at("0.000500"), &at("0.000000")).0, 0.0);
+        assert_eq!(probe(&at("0.000000"), &at("0.200000")).0, 0.0);
+        assert_eq!(probe("", &at("0.000000")).0, 0.0);
+        assert_eq!(probe(&at("0.5"), "").0, 0.0);
+        // A start at or past the end of the file is a broken one, not a lead.
+        assert_eq!(probe(&at("5.000000"), &at("0.000000")).0, 0.0);
+        assert_eq!(probe(&at("9.000000"), &at("0.000000")).0, 0.0);
+    }
+
+    #[test]
+    fn a_text_track_that_starts_the_container_earlier_is_no_lead() {
+        // Picture and sound both at 40 ms, a subtitle and a data track at 0: the export rebases
+        // the picture and the sound to the clip's start alike, so there is nothing to delay.
+        let json = |video: &str| {
+            format!(
+                r#"{{"streams":[
+                    {{"index":0,"codec_type":"video","codec_name":"h264","width":64,"height":36,"r_frame_rate":"25/1","start_time":"{video}"}},
+                    {{"index":1,"codec_type":"audio","codec_name":"aac","start_time":"0.040000"}},
+                    {{"index":2,"codec_type":"subtitle","codec_name":"subrip","start_time":"0.000000"}},
+                    {{"index":3,"codec_type":"data","codec_name":"bin_data","start_time":"0.000000"}}],
+                    "format":{{"duration":"5.0","start_time":"0.000000"}}}}"#
+            )
+        };
+        let leads = |video: &str| -> Vec<f64> {
+            probe_from_json(serde_json::from_str(&json(video)).unwrap(), None)
+                .streams
+                .iter()
+                .map(|s| s.lead)
+                .collect()
+        };
+        assert_eq!(leads("0.040000"), vec![0.0; 4]);
+        // A video 80 ms behind its sound, with the same text track: 80 ms.
+        let late = leads("0.120000");
+        assert!((late[0] - 0.08).abs() < 1e-12, "{late:?}");
+        assert_eq!(late[1..], [0.0; 3]);
+    }
+
+    #[test]
+    fn a_window_inside_a_late_starting_sources_lead_is_unseeked_and_its_picture_placed_late() {
+        let mut asset = av_asset(Uuid::new_v4(), 20.0);
+        asset.streams[0].lead = 0.5;
+        let assets = vec![asset.clone()];
+        let graph = |clip: Clip| {
+            let args = build_export_args(&single(vec![clip]), &assets, "out.mp4", &ExportOptions::default()).unwrap();
+            let at = args.iter().position(|a| a == "-filter_complex").unwrap() + 1;
+            (args.iter().any(|a| a == "-ss"), args[at].clone())
+        };
+        // Inside the lead: no `-ss` for the picture or the sound, and the picture placed
+        // `(lead - source_in) / speed` after the clip's start, spelled beside it.
+        let (seeked, g) = graph(make_clip(asset.id, 0.2, 5.0, 3.0));
+        assert!(
+            !seeked && g.contains("trim=start=0.2:end=5,setpts=PTS-STARTPTS+(3+0.3)/TB"),
+            "{g}"
+        );
+        assert!(g.contains("atrim=start=0.2:end=5,asetpts=PTS-STARTPTS"), "{g}");
+        let mut fast = make_clip(asset.id, 0.0, 10.0, 0.0);
+        fast.speed = 2.0;
+        let (_, g) = graph(fast);
+        assert!(g.contains("setpts=(PTS-STARTPTS)/2+(0+0.25)/TB"), "{g}");
+        // Past the lead, and played backwards: the argv an ordinary file gets.
+        let (seeked, g) = graph(make_clip(asset.id, 0.5, 5.0, 3.0));
+        assert!(seeked && g.contains("setpts=PTS-STARTPTS+3/TB"), "{g}");
+        let mut back = make_clip(asset.id, 0.0, 5.0, 3.0);
+        back.speed = -1.0;
+        let (_, g) = graph(back);
+        assert!(g.contains("reverse,setpts=PTS-STARTPTS+3/TB"), "{g}");
+        // A fade-in starts on the first picture.
+        let mut faded = make_clip(asset.id, 0.0, 5.0, 3.0);
+        faded.fade_in = 0.4;
+        let (_, g) = graph(faded);
+        assert!(g.contains("fade=t=in:st=3.5:d=0.4"), "{g}");
     }
 
     #[test]
@@ -18292,6 +18432,7 @@ mod tests {
                     color_primaries: None,
                     pix_fmt: Some("yuv420p".to_string()),
                     color_space: color_space.map(str::to_string),
+                    lead: 0.0,
                 }],
                 imported_at: chrono::Utc::now(),
                 source_paths: Vec::new(),

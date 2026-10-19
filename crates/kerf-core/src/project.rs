@@ -2136,6 +2136,10 @@ impl Project {
                 // must not convert it again.
                 *asset = asset.as_sdr_proxy();
                 asset.path = source.to_string_lossy().into_owned();
+                // Only a padded proxy keeps the original's lead (`media::decoded_lead`).
+                for s in asset.streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
+                    s.lead = crate::media::decoded_lead(&asset.path, true, s.lead, 0.0);
+                }
             }
         }
         assets
@@ -5482,6 +5486,7 @@ impl Project {
                     color_primaries: None,
                     pix_fmt: None,
                     color_space: None,
+                    lead: 0.0,
                 },
                 StreamInfo {
                     index: 1,
@@ -5499,6 +5504,7 @@ impl Project {
                     color_primaries: None,
                     pix_fmt: None,
                     color_space: None,
+                    lead: 0.0,
                 },
             ],
             imported_at: Utc::now(),
@@ -5528,6 +5534,7 @@ impl Project {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -7783,6 +7790,7 @@ mod tests {
             color_primaries: None,
             pix_fmt: None,
             color_space: None,
+            lead: 0.0,
         }
     }
 
@@ -7803,6 +7811,7 @@ mod tests {
             color_primaries: None,
             pix_fmt: None,
             color_space: None,
+            lead: 0.0,
         }
     }
 
@@ -8573,6 +8582,7 @@ mod tests {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -10083,6 +10093,7 @@ mod tests {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -10130,6 +10141,7 @@ mod tests {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -10184,6 +10196,7 @@ mod tests {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -10293,6 +10306,7 @@ mod tests {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -10357,6 +10371,7 @@ mod tests {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
