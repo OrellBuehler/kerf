@@ -610,6 +610,10 @@ pub struct PlanLayer {
     pub fx: LayerFx,
     /// `Some` for a clip with a keyed transform or colour number.
     pub animated: Option<Animated>,
+    /// The alpha the export's `geq` writes at this frame for an opacity keyed below 1:
+    /// `(int)(opacity(T) * 255)`, the curve evaluated in the expression's own arithmetic at the
+    /// clip's `fps` time. `None` in a still plan, and for a clip whose opacity has no key below 1.
+    pub keyed_alpha: Option<u8>,
     pub timing: PlanTiming,
 }
 

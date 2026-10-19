@@ -58,7 +58,7 @@ use crate::clip_timing::{
     clip_seek, clip_source_window, clips_with_fx, ffmpeg_frame_time, graph_bt709_labels, ClipFx, ClipTiming, FadeEdge, FadeStep,
     MotionKeys, Rational,
 };
-use crate::engine::{render_geometry, safe_color, valid_color, Container, ExportOptions};
+use crate::engine::{keyframe_value, render_geometry, safe_color, valid_color, Container, ExportOptions};
 use crate::error::{Error, Result};
 use crate::frame_pick::{FpsPick, Pick};
 use crate::layer_geometry::Keyed;
@@ -645,6 +645,12 @@ impl Planner {
                         tail: planned.tail && eval >= clip.timeline_end(),
                     },
                     animated: planned.animated,
+                    keyed_alpha: (motion && planned.animated.is_some_and(|a| a.opacity)).then(|| {
+                        let pick = self.canvas.pick_fps;
+                        let t = ffmpeg_frame_time(u64::try_from(frame).unwrap_or(0), pick.num, pick.den);
+                        let opacity = keyframe_value(&clip.property_curve(Property::Opacity), t, clip.timeline_start);
+                        (opacity * 255.0) as u8
+                    }),
                     timing: PlanTiming {
                         window: planned.window,
                         source_window: planned.source_window,
@@ -1434,6 +1440,46 @@ mod tests {
         assert!(still.matte && still.stages.len() == 1);
         assert!(!export.matte && export.stages.len() == 2);
         assert_eq!((export.picture, export.origin), ((1080, 608), (0, 656)));
+    }
+
+    #[test]
+    fn an_export_frame_carries_the_alpha_its_geq_writes_for_a_keyed_opacity() {
+        use crate::model::PropertyKey;
+        let a = asset();
+        let mut clip = make_clip(a.id, 0.0, 4.0, 0.25);
+        clip.set_property_keys(
+            Property::Opacity,
+            vec![
+                PropertyKey::new(0.0, 1.0),
+                PropertyKey::new(0.6, 0.3),
+                PropertyKey::new(1.3, 0.75),
+            ],
+        );
+        let curve = clip.property_curve(Property::Opacity);
+        let tl = single(vec![clip]);
+        for (fps, (num, den)) in [(30.0, (30, 1)), (30000.0 / 1001.0, (30000, 1001))] {
+            let motion = planner(&tl, std::slice::from_ref(&a), PlanMode::Motion, &opts(fps));
+            for k in 8..60u64 {
+                let plan = motion.at_frame(k).unwrap();
+                let want = (keyframe_value(&curve, ffmpeg_frame_time(k, num, den), 0.25) * 255.0) as u8;
+                assert_eq!(plan.layers[0].keyed_alpha, Some(want), "{fps} fps frame {k}");
+            }
+        }
+        // A still samples the opacity and draws it like a static one; a curve that never leaves 1 has no `geq`.
+        let still = planner(&tl, std::slice::from_ref(&a), PlanMode::Still, &opts(30.0))
+            .at(1.0)
+            .unwrap();
+        assert_eq!(still.layers[0].keyed_alpha, None);
+        let mut opaque = make_clip(a.id, 0.0, 4.0, 0.0);
+        opaque.set_property_keys(
+            Property::Opacity,
+            vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 1.0)],
+        );
+        let tl = single(vec![opaque]);
+        let plan = planner(&tl, std::slice::from_ref(&a), PlanMode::Motion, &opts(30.0))
+            .at_frame(10)
+            .unwrap();
+        assert_eq!(plan.layers[0].keyed_alpha, None);
     }
 
     #[test]

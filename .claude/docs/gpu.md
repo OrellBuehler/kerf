@@ -11,7 +11,7 @@ Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is 
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
 `Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
-draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `mask` and the blur / sharpen / grayscale / invert `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
+draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `keyed_opacity`, `mask` and the blur / sharpen / grayscale / invert `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
 
@@ -644,6 +644,15 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   is `Unknown`. `kerf_gpu::prepare(&plan)` measures it ahead of the render lock; `Compositor::with_geq_edge` pins it.
 * Refused (`MaskWith`): a mask on a **rotated** layer, or one below full opacity (the sampled one: its alpha goes through `colorchannelmixer`).
 
+**Keyed opacity** (export frames). FFmpeg's chain has a `geq` whose alpha is `(int)(opacity(T) * 255)` (`T` the frame's time on the
+clip's `fps` grid) where a constant opacity takes `colorchannelmixer` and the RGB round trip. The plan evaluates it
+(`PlanLayer::keyed_alpha`, `core-render-plan.md`) and the compositor blends with that one alpha in integers (`LayerFades::alpha`),
+no round trip; the clip's fades and a dissolve's ramp act on it as on any alpha plane. The `geq` also copies Y, U and V through
+`lum` / `cb` / `cr`, so on a build whose `geq` reads a plane's last column and row one in (6.1) the blend reads them so too
+(`mask_edge`, as for a mask). Byte for byte at the picture's size (linear, eased, held, bezier off the frame grid, a tree of many
+keys, 29.97, with fades, in a dissolve); the scaler's level on a pip or an odd size; `ROTATED` turned. A mask with it is refused
+on the frames below 1 (`MaskWith`: one `geq` multiplies both).
+
 **Effects.**
 
 * `Grayscale` (`hue=s=0`: U, V to 128) and `Invert` (`negate`: `255 - v` on Y, U, V) are tables, composed with `eq`'s and applied in the scaler's vertical
@@ -690,8 +699,8 @@ a dissolve, dip, slide or push into a zooming clip and out of one) hold the boun
 
 | Bound (Y / UV) | Cases | Why |
 | --- | --- | --- |
-| 0 | a mask at the picture's size (20 of 27 mask rows), grayscale, invert, sharpen at the picture's size | integer arithmetic, reproduced |
-| 1 (`SCALED`) | a layer the compositor scales, a mask on it, a one-stage zoom | swscale's x86 scaler is not bit-exact with the C arithmetic the shader follows |
+| 0 | a mask at the picture's size (20 of 27 mask rows), grayscale, invert, sharpen, a keyed opacity (its fades and dissolve included) at the picture's size | integer arithmetic, reproduced |
+| 1 (`SCALED`) | a layer the compositor scales, a mask or a keyed opacity on it, a one-stage zoom | swscale's x86 scaler is not bit-exact with the C arithmetic the shader follows |
 | 1 (`EFFECT`) | a blur at the picture's size | `gblur`'s SIMD summation order (above) |
 | 2 | a layer the compositor scales *and* makes translucent, no effect (`tests/playback.rs`, `play/pip/translucent and scaled`, measured Y 2 / UV 2 on both FFmpegs); `EFFECT_SCALED`: a blur, grayscale or invert on a scaled or translucent layer; a blur then a sharpen of at most 0.5 even unscaled and opaque (the blur's level times the gain); a sharpen of at most 0.5 after a scale. `CASCADED`: a zoom (the fit scale, then the zoom's). `ZOOMED_MASK`: a soft mask edge on a zoomed picture. Rotated, graded and scaled, dip to white (Y three on BT.709, `WHITE_709`) | two of the causes above on one sample; the RGB kernel for white |
 

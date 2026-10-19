@@ -526,7 +526,11 @@ impl LayerFades {
             fade_in: FADE_FULL,
             fade_out: FADE_FULL,
             black: if plan.on_alpha_plane(layer) { 0 } else { 16 },
-            alpha: (geom.opacity * 255.0).round().clamp(0.0, 255.0) as u32,
+            // A keyed opacity is the `geq`'s alpha, which the plan evaluates; a constant one goes through
+            // `colorchannelmixer` (below).
+            alpha: layer
+                .keyed_alpha
+                .map_or_else(|| (geom.opacity * 255.0).round().clamp(0.0, 255.0) as u32, u32::from),
             ramp: FADE_FULL,
             white_in: FADE_FULL,
             white_out: FADE_FULL,
@@ -642,7 +646,7 @@ fn extent(w: u32, h: u32) -> wgpu::Extent3d {
 /// render lock**, with the plan in hand, so the first masked frame does not pay for it under the
 /// lock; a compositor pinned with [`Compositor::with_geq_edge`] needs none of it.
 pub fn prepare(plan: &RenderPlan) {
-    if plan.layers.iter().any(|l| l.mask.is_some()) {
+    if plan.layers.iter().any(|l| l.mask.is_some() || l.keyed_alpha.is_some()) {
         let _ = kerf_core::geq_edge();
     }
 }
@@ -656,6 +660,8 @@ impl Compositor {
     /// * `motion`, `fades`, `transitions`, `dip_white`: fades, dips, dissolves, slides and pushes, in
     ///   still plans and in export frames (`tests/motion_parity.rs`);
     /// * `keyed_zoom`: a moving zoom drawn last, as FFmpeg's chain has it;
+    /// * `keyed_opacity`: an export frame's `geq` alpha, the value the plan evaluates
+    ///   ([`kerf_core::PlanLayer::keyed_alpha`]);
     /// * `mask`, and the blur, sharpen, grayscale and invert `effects`.
     ///
     /// A vignette, a chroma key and the combinations the plan names (`Unsupported`) stay FFmpeg's.
@@ -673,6 +679,7 @@ impl Compositor {
         caps.transitions = true;
         caps.dip_white = true;
         caps.keyed_zoom = true;
+        caps.keyed_opacity = true;
         caps.mask = true;
         caps.effects = EffectKinds::BLUR
             .union(EffectKinds::SHARPEN)
@@ -1655,8 +1662,8 @@ impl Compositor {
             }
             None => None,
         };
-        // (Only a masked layer asks: the first answer is a child process.)
-        let mask_edge = if mask.is_none() {
+        // (Only a layer with a `geq` asks, a mask's or a keyed opacity's: the first answer is a child process.)
+        let mask_edge = if mask.is_none() && layer.keyed_alpha.is_none() {
             false
         } else {
             match self.geq_edge() {
@@ -1667,14 +1674,14 @@ impl Compositor {
                     let (mw, mh) = if geom.matte { geom.layer } else { (pw, ph) };
                     if mw.div_ceil(2) < 2 || mh.div_ceil(2) < 2 {
                         return Err(unsupported(format!(
-                            "a mask on a {mw}x{mh} frame, on an FFmpeg whose geq reads a plane's last column and row one in"
+                            "a mask or a keyed opacity (a geq) on a {mw}x{mh} frame, on an FFmpeg whose geq reads a plane's last column and row one in"
                         )));
                     }
                     true
                 }
                 GeqEdge::Unknown => {
                     return Err(unsupported(
-                        "a mask, until FFmpeg's geq can be measured (it reads a plane's last column and row differently on some builds)".into(),
+                        "a mask or a keyed opacity, until FFmpeg's geq can be measured (it reads a plane's last column and row differently on some builds)".into(),
                     ));
                 }
             }
@@ -2056,7 +2063,12 @@ impl Compositor {
             let (clw, clh) = chroma_size(lw, lh);
             let (pcw, pch) = chroma_size(geom.picture.0, geom.picture.1);
             let mut params = ComposeParams {
-                opacity: [geom.opacity, 0.0, 0.0, 0.0],
+                opacity: [
+                    layer.keyed_alpha.map_or(geom.opacity, |a| f32::from(a) / 255.0),
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
                 matte: [matte[0], matte[1], matte[2], 0.0],
                 origin: [geom.origin.0, geom.origin.1],
                 layer: [lw as i32, lh as i32],

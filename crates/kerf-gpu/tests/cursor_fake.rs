@@ -202,6 +202,7 @@ fn layer(path: String, pick: Pick) -> PlanLayer {
         reframe: None,
         fx: LayerFx::default(),
         animated: None,
+        keyed_alpha: None,
         timing: PlanTiming {
             window: (0.0, 10.0),
             source_window: (0.0, 10.0),
