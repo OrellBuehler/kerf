@@ -2643,9 +2643,9 @@
 					label: editor.clipboard.length > 1 ? `Paste ${editor.clipboard.length} clips` : 'Paste',
 					icon: 'copy',
 					shortcut: settings.shortcut('edit.paste'),
-					disabled: editor.clipboard.length === 0 || 'reason' in pastePlacements(editor.timeline, editor.clipboard),
+					disabled: editor.clipboard.length === 0 || 'reason' in pastePlacements(editor.timeline, editor.clipboard, editor.assets),
 					reason: (() => {
-						const aimed = pastePlacements(editor.timeline, editor.clipboard);
+						const aimed = pastePlacements(editor.timeline, editor.clipboard, editor.assets);
 						return 'reason' in aimed ? aimed.reason : undefined;
 					})(),
 					action: () => void pasteClips()

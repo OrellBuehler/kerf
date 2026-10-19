@@ -57,6 +57,16 @@ describe('a locked track', () => {
 		expect(() => ops.addClip(cut(true, true), env, asset, null, 0, 1, 50)).toThrow('every video track is locked');
 	});
 
+	test('a paste puts nothing on a track it cannot play on (`Project::insert_clips`)', () => {
+		const t = cut(false);
+		t.tracks.push({ id: 'a1', kind: 'audio', name: 'A1', locked: false, clips: [] } as never);
+		const known = { ...env, asset: (id: string) => (id === 'm' ? { name: 'm', duration: 9, streams: [{ kind: 'audio' }] } : { name: 'a', duration: 60, streams: [{ kind: 'video' }] }) };
+		const sound = { ...clip('s', 0, 0), asset_id: 'm' } as Clip;
+		expect(() => ops.insertClips(t, known, [{ track_id: 'v2', clip: sound }], 0)).toThrow('a clip with no picture cannot go on video track V2');
+		expect(() => ops.insertClips(t, known, [{ track_id: 'a1', clip: clip('p', 0, 0) }], 0)).toThrow('a clip with no sound cannot go on audio track A1');
+		expect(() => ops.insertClips(t, known, [{ track_id: 'a1', clip: sound }], 0)).not.toThrow();
+	});
+
 	test('the sound of an asset gets a track of its own when every audio track is locked', () => {
 		const t = cut(false);
 		t.tracks.push({ id: 'a1', kind: 'audio', name: 'A1', locked: true, clips: [] } as never);

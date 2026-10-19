@@ -1101,7 +1101,7 @@ class EditorState {
 	 *  unlocked one of its kind when that track is locked (`pastePlacements`). */
 	async paste(at: number): Promise<number> {
 		if (this.clipboard.length === 0) return 0;
-		const aimed = pastePlacements(this.timeline, this.clipboard);
+		const aimed = pastePlacements(this.timeline, this.clipboard, this.assets);
 		if ('reason' in aimed) throw new Error(aimed.reason);
 		await this.#apply(() => insertClips(aimed.placements, at));
 		return this.clipboard.length;

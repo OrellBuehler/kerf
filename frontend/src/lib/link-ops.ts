@@ -68,7 +68,7 @@ export interface EditEnv {
 	footage: SourceLimits;
 	hasAudio: (assetId: string) => boolean;
 	/** An asset's name and length, for the sentence that says a clip ran past its end. */
-	asset?: (assetId: string) => { name: string; duration: number } | undefined;
+	asset?: (assetId: string) => { name: string; duration: number; streams?: readonly { kind: string }[] } | undefined;
 }
 
 export interface Edited<R = void> {
@@ -509,6 +509,16 @@ export function insertClips(tl: Timeline, env: EditEnv, placements: readonly Pas
 			const staged: { ti: number; clip: Clip }[] = placements.map((p) => {
 				ensureTrackEditable(t, p.track_id);
 				const ti = t.tracks.findIndex((x) => x.id === p.track_id);
+				// A clip only on a track it can play on: a picture (a title is one) on video, sound on audio — judged
+				// where the asset's streams are known, as `Project::insert_clips` does.
+				const streams = p.clip.generator ? undefined : env.asset?.(p.clip.asset_id)?.streams;
+				const picture = p.clip.generator ? true : streams ? streams.some((x) => x.kind === 'video') : true;
+				const sound = p.clip.generator ? false : streams ? streams.some((x) => x.kind === 'audio') : true;
+				const track = t.tracks[ti];
+				if (!(track.kind === 'audio' ? sound : picture)) {
+					const [kind, has] = track.kind === 'audio' ? ['audio', 'sound'] : ['video', 'picture'];
+					throw invalid(`a clip with no ${has} cannot go on ${kind} track ${track.name} — paste it on a track of its kind`);
+				}
 				const copy: Clip = JSON.parse(JSON.stringify(p.clip));
 				copy.id = newId();
 				copy.timeline_start = where + (p.clip.timeline_start - base);

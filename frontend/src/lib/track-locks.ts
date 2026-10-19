@@ -3,7 +3,7 @@
 // only meet that refusal is off, with the reason, and a paste aimed at a locked track goes somewhere it can land.
 
 import type { Placement } from './api';
-import type { Timeline, Track } from './types';
+import type { Asset, Clip, Timeline, Track } from './types';
 
 /** The track a clip is on when that track is locked, else `null`. */
 export function lockedTrackOf(timeline: Timeline, clipId: string): Track | null {
@@ -26,9 +26,27 @@ export function duplicateBlocked(timeline: Timeline, ids: readonly string[]): st
 	return null;
 }
 
-/** The clipboard as it can land: each clip on the track it was copied from, unless that track is locked
- *  (or gone) — then on the first unlocked track of its kind. With no such track, the reason it cannot. */
-export function pastePlacements(timeline: Timeline, clipboard: readonly Placement[]): { placements: Placement[] } | { reason: string } {
+/** The kind of track a clip whose own track is gone goes on, from what its footage has: a title or a
+ *  picture alone is video, sound alone is audio. Footage with both cannot say (a detached sound is a clip
+ *  of its picture's own asset), nor can footage the bin no longer holds: `null`. */
+export function clipKind(clip: Clip, assets: readonly Pick<Asset, 'id' | 'streams'>[]): Track['kind'] | null {
+	if (clip.generator) return 'video';
+	const streams = assets.find((a) => a.id === clip.asset_id)?.streams;
+	if (!streams) return null;
+	const picture = streams.some((s) => s.kind === 'video');
+	const sound = streams.some((s) => s.kind === 'audio');
+	if (picture === sound) return null;
+	return picture ? 'video' : 'audio';
+}
+
+/** The clipboard as it can land: each clip on the track it was copied from, unless that track is locked —
+ *  then on the first unlocked track of that track's kind — or gone, then on the first unlocked track of the
+ *  clip's own kind (`clipKind`). With no such track, or no telling the kind, the reason it cannot. */
+export function pastePlacements(
+	timeline: Timeline,
+	clipboard: readonly Placement[],
+	assets: readonly Pick<Asset, 'id' | 'streams'>[]
+): { placements: Placement[] } | { reason: string } {
 	const placements: Placement[] = [];
 	for (const p of clipboard) {
 		const source = timeline.tracks.find((t) => t.id === p.track_id);
@@ -36,7 +54,8 @@ export function pastePlacements(timeline: Timeline, clipboard: readonly Placemen
 			placements.push(p);
 			continue;
 		}
-		const kind = source?.kind ?? (timeline.tracks.find((t) => t.clips.some((c) => c.id === p.clip.id))?.kind ?? 'video');
+		const kind = source?.kind ?? clipKind(p.clip, assets);
+		if (!kind) return { reason: 'A copied clip’s track is gone, and its footage does not say which kind of track it goes on' };
 		const open = timeline.tracks.find((t) => t.kind === kind && !t.locked);
 		if (!open) return { reason: `Every ${kind === 'audio' ? 'audio' : 'video'} track is locked` };
 		placements.push({ ...p, track_id: open.id });

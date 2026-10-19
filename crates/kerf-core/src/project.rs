@@ -286,6 +286,27 @@ fn owned_by_other(owner: Option<&str>, caller: Option<&str>) -> bool {
     matches!(owner, Some(o) if caller != Some(o))
 }
 
+/// The ids of the locked tracks of `timeline`.
+fn locked_ids(timeline: &Timeline) -> HashSet<Uuid> {
+    timeline.tracks.iter().filter(|t| t.locked).map(|t| t.id).collect()
+}
+
+/// Whether a track of an agent's proposal is locked for the agent: locked on the live cut now, or locked by
+/// the proposal itself (`own`) where the cut it branched from (`base`) was not. A lock the proposal only
+/// inherited follows the live cut — the user may have lifted it since.
+fn effective_lock(own: bool, id: &Uuid, base: &HashSet<Uuid>, live: &HashSet<Uuid>) -> bool {
+    live.contains(id) || (own && !base.contains(id))
+}
+
+/// Lay [`effective_lock`] over a proposal's tracks, returning each track's own flag to put back.
+fn lay_effective_locks(proposal: &mut Timeline, base: &HashSet<Uuid>, live: &HashSet<Uuid>) -> HashMap<Uuid, bool> {
+    let own: HashMap<Uuid, bool> = proposal.tracks.iter().map(|t| (t.id, t.locked)).collect();
+    for track in &mut proposal.tracks {
+        track.locked = effective_lock(track.locked, &track.id, base, live);
+    }
+    own
+}
+
 /// Where a clip of `kind` goes when the edit names no track: the first unlocked track of that kind.
 /// Every one of them locked refuses (a locked track is never written to); none at all is the old
 /// "no suitable track".
@@ -2429,15 +2450,13 @@ impl Project {
                 // edit and taken off again, so the proposal does not record the user's lock as a
                 // change of its own (one the agent made itself stays).
                 let live_locks = self.live_locks()?;
+                let base_locks = locked_ids(&serde_json::from_str(&row.base)?);
                 let f = move |timeline: &mut Timeline| -> Result<R> {
-                    let own: HashMap<Uuid, bool> = timeline.tracks.iter().map(|t| (t.id, t.locked)).collect();
-                    for track in &mut timeline.tracks {
-                        track.locked |= live_locks.contains(&track.id);
-                    }
+                    let own = lay_effective_locks(timeline, &base_locks, &live_locks);
                     let out = f(timeline);
                     for track in &mut timeline.tracks {
                         if let Some(&was) = own.get(&track.id) {
-                            if track.locked == (was || live_locks.contains(&track.id)) {
+                            if track.locked == effective_lock(was, &track.id, &base_locks, &live_locks) {
                                 track.locked = was;
                             }
                         }
@@ -2508,11 +2527,10 @@ impl Project {
     /// has to see the lock it will be refused by.
     pub fn working_timeline(&self) -> Result<Timeline> {
         if self.actor == EditSource::Agent {
-            if let Some(mut timeline) = self.staged_timeline()? {
-                let live = self.live_locks()?;
-                for track in &mut timeline.tracks {
-                    track.locked |= live.contains(&track.id);
-                }
+            if let Some(row) = self.staged_row()? {
+                let mut timeline: Timeline = serde_json::from_str(&row.timeline)?;
+                let base = locked_ids(&serde_json::from_str(&row.base)?);
+                lay_effective_locks(&mut timeline, &base, &self.live_locks()?);
                 return Ok(timeline);
             }
         }
@@ -2521,7 +2539,7 @@ impl Project {
 
     /// The tracks locked on the live cut.
     fn live_locks(&self) -> Result<HashSet<Uuid>> {
-        Ok(self.timeline()?.tracks.iter().filter(|t| t.locked).map(|t| t.id).collect())
+        Ok(locked_ids(&self.timeline()?))
     }
 
     fn staged_row(&self) -> Result<Option<StagedRow>> {
@@ -2832,12 +2850,21 @@ impl Project {
         // would miss "undo, then make an unrelated edit" landing right back on
         // the seq the proposal was staged from with completely different
         // content underneath it.
-        if self.timeline_json()? != row.base && !force {
+        let stale = self.timeline_json()? != row.base;
+        if stale && !force {
             return Err(Error::StagedEditStale);
         }
         let base: Timeline = serde_json::from_str(&row.base)?;
-        let proposed: Timeline = serde_json::from_str(&row.timeline)?;
+        let mut proposed: Timeline = serde_json::from_str(&row.timeline)?;
         let diff = base.diff(&proposed);
+        // Forced over newer work, the locks are the user's as they are now (and those the proposal added):
+        // a lock it only inherited, which the user has since lifted, is not put back.
+        let landing = if stale {
+            lay_effective_locks(&mut proposed, &locked_ids(&base), &self.live_locks()?);
+            timeline_to_json(&proposed)?
+        } else {
+            row.timeline.clone()
+        };
         // A session that staged nothing (or staged and undid it) just closes —
         // recording a revision here would put an edit that changed nothing into
         // the user's history.
@@ -2854,8 +2881,8 @@ impl Project {
         };
         let tx = self.conn.unchecked_transaction()?;
         if !diff.is_empty() {
-            self.save_timeline_str(&row.timeline)?;
-            self.record_revision(&label, EditSource::Agent, &row.timeline)?;
+            self.save_timeline_str(&landing)?;
+            self.record_revision(&label, EditSource::Agent, &landing)?;
         }
         for change in &row.assets {
             self.apply_asset_change(change)?;
@@ -3904,6 +3931,17 @@ impl Project {
         }
         let at = at.max(0.0);
         let base = placements.iter().map(|(_, c)| c.timeline_start).fold(f64::INFINITY, f64::min);
+        // What each clip's footage has, to keep it off a track it cannot play on: a picture on a video track
+        // (a title is one), sound on an audio track. A clip whose asset is unknown here is not judged.
+        let mut streams: HashMap<Uuid, (bool, bool)> = HashMap::new();
+        for (_, clip) in placements {
+            if !clip.is_generated() && !streams.contains_key(&clip.asset_id) {
+                if let Some(asset) = self.get_asset(clip.asset_id)? {
+                    let video = asset.streams.iter().any(|s| s.kind == StreamKind::Video);
+                    streams.insert(clip.asset_id, (video, asset.has_audio()));
+                }
+            }
+        }
 
         self.edit_timeline_exact("Insert clips", |timeline| {
             // A copy is a new clip, so it cannot share a link group with the original
@@ -3931,6 +3969,23 @@ impl Project {
                     .iter()
                     .position(|t| t.id == *track_id)
                     .ok_or(Error::TrackNotFound(*track_id))?;
+                let track = &timeline.tracks[ti];
+                let (picture, sound) = if clip.is_generated() {
+                    (true, false)
+                } else {
+                    streams.get(&clip.asset_id).copied().unwrap_or((true, true))
+                };
+                let fits = match track.kind {
+                    StreamKind::Audio => sound,
+                    _ => picture,
+                };
+                if !fits {
+                    let (kind, has) = if track.kind == StreamKind::Audio { ("audio", "sound") } else { ("video", "picture") };
+                    return Err(Error::InvalidArgument(format!(
+                        "a clip with no {has} cannot go on {kind} track {} — paste it on a track of its kind",
+                        track.name
+                    )));
+                }
                 let mut copy = clip.clone();
                 copy.id = Uuid::new_v4();
                 copy.timeline_start = at + (clip.timeline_start - base);
@@ -4212,7 +4267,7 @@ impl Project {
             let track = timeline.track_mut(track_id).ok_or(Error::TrackNotFound(track_id))?;
             if agent && !locked && track.locked {
                 return Err(Error::InvalidArgument(format!(
-                    "track {} is locked, and only the user can unlock it — ask them to",
+                    "track {} is locked, and an agent cannot unlock a track — ask the user to",
                     track.name
                 )));
             }
@@ -12446,7 +12501,7 @@ mod tests {
             let refused = op(&project, &b, &c, v1);
             assert!(
                 matches!(&refused, Err(Error::InvalidArgument(why)) if why == "track V1 is locked"),
-                "{name}: {refused:?}"
+                "{name} is refused on the locked track"
             );
             assert_eq!(
                 serde_json::to_value(project.timeline().unwrap()).unwrap(),
@@ -12487,17 +12542,17 @@ mod tests {
         let moved = project.move_clip(c.id, 40.0, Some(v2));
         assert!(
             matches!(&moved, Err(Error::InvalidArgument(why)) if why == "track V2 is locked"),
-            "{moved:?}"
+            "a move onto a locked track is refused"
         );
         let added = project.add_clip_to_timeline(asset, Some(v2), 0.0, 1.0, Some(50.0));
         assert!(
             matches!(&added, Err(Error::InvalidArgument(why)) if why == "track V2 is locked"),
-            "{added:?}"
+            "an add to a named locked track is refused"
         );
         let pasted = project.insert_clips(&[(v2, a)], 50.0);
         assert!(
             matches!(&pasted, Err(Error::InvalidArgument(why)) if why == "track V2 is locked"),
-            "{pasted:?}"
+            "a paste onto a locked track is refused"
         );
 
         // Named no track, a clip goes to the first unlocked one of its kind — and with every one of
@@ -12517,7 +12572,7 @@ mod tests {
         let nowhere = project.add_clip_to_timeline(asset, None, 0.0, 1.0, Some(60.0));
         assert!(
             matches!(&nowhere, Err(Error::InvalidArgument(why)) if why.contains("every video track is locked")),
-            "{nowhere:?}"
+            "with every video track locked nothing is added"
         );
         assert!(matches!(project.concatenate(&[asset]), Err(Error::InvalidArgument(_))));
     }
@@ -12538,7 +12593,7 @@ mod tests {
             let refused = op(&project, &b, &c, v1);
             assert!(
                 matches!(&refused, Err(Error::InvalidArgument(why)) if why.contains("locked")),
-                "{name}: {refused:?}"
+                "{name} is refused on the locked track"
             );
         }
         // A look is still the agent's to propose, and the user's lock is not recorded as part of
@@ -12573,6 +12628,37 @@ mod tests {
     }
 
     #[test]
+    fn a_lock_the_proposal_inherited_follows_the_user_and_one_it_added_stays() {
+        let (mut project, _, [a, b, _]) = abutting_project();
+        let v1 = project.timeline().unwrap().tracks[0].id;
+        project.set_track_locked(v1, true).unwrap();
+        // The proposal branches off a cut with V1 locked…
+        project.set_actor(EditSource::Agent);
+        project.set_volume(a.id, 0.5).unwrap();
+        let v2 = project.add_track(StreamKind::Video, None).unwrap().id;
+        project.set_track_locked(v2, true).unwrap();
+        // …and the user lifts that lock while it is open.
+        project.set_actor(EditSource::User);
+        project.set_track_locked(v1, false).unwrap();
+
+        project.set_actor(EditSource::Agent);
+        let seen = project.working_timeline().unwrap();
+        assert!(!seen.track(v1).unwrap().locked, "the inherited lock follows the user");
+        assert!(seen.track(v2).unwrap().locked, "the lock the agent made itself stays");
+        project.split_at(b.id, b.timeline_start + 1.0).unwrap();
+        assert!(project.set_track_locked(v2, false).is_err(), "and an agent still cannot lift it");
+
+        // Forced in over the user's newer work, the user's unlock is not undone.
+        project.set_actor(EditSource::User);
+        let landed = project.apply_staged(true).unwrap();
+        assert!(!landed.track(v1).unwrap().locked);
+        assert!(landed.track(v2).unwrap().locked);
+        let live = project.timeline().unwrap();
+        assert!(!live.track(v1).unwrap().locked && live.track(v2).unwrap().locked);
+        assert_eq!(live.tracks[0].clips.len(), 4, "the split landed");
+    }
+
+    #[test]
     fn an_agent_may_lock_a_track_but_only_the_user_unlocks_one() {
         for review in [true, false] {
             let (mut project, _, _) = abutting_project();
@@ -12584,8 +12670,8 @@ mod tests {
             project.set_actor(EditSource::Agent);
             let refused = project.set_track_locked(v1, false);
             assert!(
-                matches!(&refused, Err(Error::InvalidArgument(why)) if why == "track V1 is locked, and only the user can unlock it — ask them to"),
-                "review {review}: {refused:?}"
+                matches!(&refused, Err(Error::InvalidArgument(why)) if why == "track V1 is locked, and an agent cannot unlock a track — ask the user to"),
+                "review {review}: the agent may not unlock"
             );
             assert!(project.timeline().unwrap().track(v1).unwrap().locked, "review {review}");
 
@@ -12598,6 +12684,38 @@ mod tests {
     }
 
     #[test]
+    fn a_paste_does_not_put_a_clip_on_a_track_it_cannot_play_on() {
+        let project = Project::open_in_memory().unwrap();
+        let music = project.insert_or_get_asset(&asset_with("/kind/music.wav", vec![aud_stream()])).unwrap();
+        let silent = project.insert_or_get_asset(&asset_with("/kind/silent.mp4", vec![vid_stream(false)])).unwrap();
+        let both = project
+            .insert_or_get_asset(&asset_with("/kind/both.mp4", vec![vid_stream(false), aud_stream()]))
+            .unwrap();
+        let sound = project.add_asset_audio(music.id).unwrap();
+        let picture = project.cut_clip(silent.id, 0.0, 1.0).unwrap();
+        let footage = project.cut_clip(both.id, 0.0, 1.0).unwrap();
+        let timeline = project.timeline().unwrap();
+        let v1 = timeline.first_track_of(StreamKind::Video).unwrap();
+        let a1 = timeline.first_track_of(StreamKind::Audio).unwrap();
+        let revisions = project.history().unwrap().len();
+
+        let on_video = project.insert_clips(&[(v1, sound)], 50.0);
+        assert!(
+            matches!(&on_video, Err(Error::InvalidArgument(why)) if why.starts_with("a clip with no picture cannot go on video track V1")),
+            "sound alone is refused on a video track"
+        );
+        let on_audio = project.insert_clips(&[(a1, picture)], 50.0);
+        assert!(
+            matches!(&on_audio, Err(Error::InvalidArgument(why)) if why.starts_with("a clip with no sound cannot go on audio track A1")),
+            "a picture with no sound is refused on an audio track"
+        );
+        assert_eq!(project.history().unwrap().len(), revisions, "nothing was written");
+        // Footage with both goes on either: a detached sound is a clip of the picture's own asset.
+        project.insert_clips(&[(a1, footage.clone())], 50.0).unwrap();
+        project.insert_clips(&[(v1, footage)], 50.0).unwrap();
+    }
+
+    #[test]
     fn an_agent_may_not_remove_a_locked_track_and_the_user_may() {
         let (mut project, _, _) = abutting_project();
         project.set_agent_review(false);
@@ -12607,7 +12725,7 @@ mod tests {
         let refused = project.remove_track(v2);
         assert!(
             matches!(&refused, Err(Error::InvalidArgument(why)) if why == "track V2 is locked — only the user can remove it"),
-            "{refused:?}"
+            "an agent may not remove a locked track"
         );
         project.set_actor(EditSource::User);
         project.remove_track(v2).unwrap();
@@ -12622,7 +12740,7 @@ mod tests {
         let named = project.place_voiceover(&voiceover_asset("/vo/a.wav"), Some(a2), None);
         assert!(
             matches!(&named, Err(Error::InvalidArgument(why)) if why.contains("is locked")),
-            "{named:?}"
+            "a named locked track is refused"
         );
         assert!(
             project.list_assets().unwrap().is_empty(),
@@ -12643,7 +12761,7 @@ mod tests {
         let lane = project.place_voiceover(&voiceover_asset("/vo/c.wav"), None, None);
         assert!(
             matches!(&lane, Err(Error::InvalidArgument(why)) if why == "track VO is locked"),
-            "{lane:?}"
+            "the locked voiceover lane is refused"
         );
         assert_eq!(project.list_assets().unwrap().len(), 1);
     }
@@ -12677,7 +12795,7 @@ mod tests {
         let named = project.snap_to_beats(Some(v1), None);
         assert!(
             matches!(&named, Err(Error::InvalidArgument(why)) if why == "track V1 is locked"),
-            "{named:?}"
+            "a named locked track is refused"
         );
         // Named no track, it aligns the unlocked ones: none here.
         assert_eq!(project.snap_to_beats(None, None).unwrap(), 0);

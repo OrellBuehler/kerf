@@ -32,11 +32,16 @@
   `… unlock one, or add a track`, and `add_asset_audio` makes a new audio track as a detach does). **The lock
   is the user's**: an agent may lock a track but not unlock one (`set_track_locked(false)` refused, review on or
   off, so a lock is never only advisory) nor remove a locked one; the user may remove their own. **A lock set
-  while an agent's proposal is open holds for it**: `working_timeline()` lays the live cut's locks over the
-  proposal for every agent read (so `get_timeline_state` shows the lock it is refused by), and `run_edit`'s
-  staged path does the same for the edit and takes them off again, so the stored proposal never records the
-  user's lock as its own. A forced accept (`apply_staged(force)`) of a stale proposal lands the proposal's
-  timeline, so a lock the user set after it branched is dropped with the rest of their newer work.
+  while an agent's proposal is open holds for it, and one lifted follows too**: a track is locked for the agent
+  when it is locked live now, or the proposal locked it where the cut it branched from had not
+  (`effective_lock`: `live || (proposal && !base)` — a lock the proposal only inherited follows the user, who
+  may have lifted it since). `working_timeline()` lays that over the proposal for every agent read (so
+  `get_timeline_state` shows the lock it is refused by), and `run_edit`'s staged path does the same for the edit
+  and takes it off again, so the stored proposal never records the user's lock as its own. A forced accept
+  (`apply_staged(force)`) of a stale proposal lands its timeline with the same locks, so the user's current
+  locks survive it and an inherited lock they lifted is not put back. A paste (`insert_clips`) also refuses a
+  clip on a track it cannot play on — no picture on a video track, no sound on an audio track (a title is a
+  picture; footage with both may go on either, as a detached sound does).
   `link-ops.ts` mirrors all of it for the harness (`link-ops.test.ts`, `api-locks.test.ts`).
   `roll_edit` / `slip_clip` / `slide_clip` (`Roll edit` / `Slip clip` / `Slide
   clip`, one revision each, `source_limits()` read before the edit) are

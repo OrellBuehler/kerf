@@ -353,7 +353,7 @@ mod tests {
         );
         assert!(
             matches!(&named, Err(Error::InvalidArgument(why)) if why == "track V1 is locked"),
-            "{named:?}"
+            "a title on a named locked track is refused"
         );
         let placed = p.add_title_clip(ART, 1.0, None, TitleClipPlacement::default()).unwrap();
         assert_ne!(placed.track_id, v1);
