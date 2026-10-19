@@ -1119,11 +1119,12 @@ describe('no key is hard-coded outside the registry', () => {
 			.map((f) => f.slice(SRC.length + 1))
 			.sort();
 		// Widgets with their own keys (a tab rail, a dialog's Escape, a drag's
-		// Escape, a text field's Enter, a slider's arrows) are not shortcuts and are
+		// Escape, a text field's Enter, a slider's or a curve handle's arrows) are not shortcuts and are
 		// listed so a new one is a decision.
 		expect(handlers).toEqual([
 			'lib/components/editor/AgentPanel.svelte',
 			'lib/components/editor/ContextMenu.svelte',
+			'lib/components/editor/DopeGraph.svelte',
 			'lib/components/editor/DopeSheet.svelte',
 			'lib/components/editor/EasingPopover.svelte',
 			'lib/components/editor/FitMusicDialog.svelte',
