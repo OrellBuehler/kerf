@@ -431,6 +431,28 @@ mod tests {
     }
 
     #[test]
+    fn a_title_clip_on_a_locked_track_takes_a_box_as_it_takes_new_artwork() {
+        let project = Project::open_in_memory().unwrap();
+        let placed = project
+            .add_title_clip(ART, 0.0, Some(4.0), TitleClipPlacement::default())
+            .unwrap();
+        project.set_track_locked(placed.track_id, true).unwrap();
+        let edited = project.set_title_text_box(placed.clip.id, "name", shrink(250.0)).unwrap();
+        assert!(svg_of(&edited).contains("data-kerf-text"));
+        let converted = project.convert_title_text(placed.clip.id, TitleTextForm::Text).unwrap();
+        assert_eq!(restore_text(svg_of(&converted)).unwrap(), svg_of(&converted));
+        let patch = crate::project::TitleClipPatch {
+            name: Some("Renamed".into()),
+            ..Default::default()
+        };
+        project.update_title_clip_parsed(placed.clip.id, patch, None).unwrap();
+        let tl = project.timeline().unwrap();
+        let (clip, title) = tl.title_clips().next().unwrap();
+        assert_eq!((clip.timeline_start, clip.source_in, clip.source_out), (0.0, 0.0, 4.0));
+        assert_eq!(title.name, "Renamed");
+    }
+
+    #[test]
     fn a_title_clip_takes_a_box_and_a_preset_or_a_changed_title_is_refused() {
         let project = Project::open_in_memory().unwrap();
         let clip = project
