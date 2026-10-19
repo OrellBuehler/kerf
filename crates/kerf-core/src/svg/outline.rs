@@ -25,7 +25,7 @@
 //! colour glyph, or a result over the title's size cap.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -35,8 +35,10 @@ use fontdb::{Database, Family, Query, Stretch, Style, Weight, ID};
 use roxmltree::{Document, Node, NodeId, NodeType};
 use skrifa::MetadataProvider;
 
+use super::glyph_smil::{self, IdSource, UnitGeom};
 use super::sanitize::{apply, escape_attr, nesting_exceeds, SVG_NS, XLINK_NS};
-use super::{invalid, xml_options, MAX_BYTES, MAX_DEPTH};
+use super::text_animation::{AnimateBy, TextAnimation, ANIMATE_MARK};
+use super::{invalid, xml_options, MAX_ANIMATIONS, MAX_BYTES, MAX_DEPTH};
 use crate::error::Result;
 use crate::fonts;
 use crate::text::{self, Align, Baseline, Face, Paragraph, Run, Variation};
@@ -64,6 +66,12 @@ const MAX_TEXTS: usize = 256;
 const MAX_COORD: f32 = 1e6;
 /// The fewest bytes a glyph's path takes (`<path d="M0 0h1v1h-1z"/>`).
 const MIN_GLYPH_BYTES: usize = 24;
+/// The fewest bytes the group of an animated unit takes beyond its paths.
+const MIN_UNIT_BYTES: usize = 40;
+/// Most units (characters, words or lines) of one text an animation is compiled for.
+const MAX_UNITS: usize = 600;
+/// Most amounts a document's animations are sampled at in all (a unit a grid of 120 a second): about a tenth of a second.
+const MAX_WORK: usize = 3_000_000;
 
 /// What setting a document's text as outlines did.
 #[derive(Debug, Clone, PartialEq)]
@@ -216,6 +224,32 @@ enum El<'a, 'i> {
     /// A generated element inside the text `parent` (`depth` 0 is the group of glyphs, 1 a path or a
     /// span's group in it, 2 a path in that).
     Made(&'static str, u8, Node<'a, 'i>),
+    /// A generated element of an animated text's units (`glyph_smil.rs`): the group of a unit (1; a span's
+    /// group inside it 2), the paths in them (2, 3), a blur's `filter` (2) with its `feGaussianBlur` (3) and the
+    /// `animate` in that (4), and the unit's own animations (2). Its parent follows from the tag and depth.
+    Anim(&'static str, u8, Node<'a, 'i>),
+}
+
+/// The generated elements of an animated text a rule could match, as `(tag, depth)` of [`El::Anim`].
+const ANIMATED_MADE: &[(&str, u8)] = &[
+    ("g", 1),
+    ("g", 2),
+    ("path", 2),
+    ("path", 3),
+    ("filter", 2),
+    ("feGaussianBlur", 3),
+    ("animate", 2),
+    ("animate", 4),
+    ("animateTransform", 2),
+];
+
+/// The tag and depth of the parent of a generated element of an animated text (below depth 1).
+fn anim_parent(tag: &str, depth: u8) -> (&'static str, u8) {
+    match (tag, depth) {
+        ("feGaussianBlur", 3) => ("filter", 2),
+        ("animate", 4) => ("feGaussianBlur", 3),
+        (_, d) => ("g", d - 1),
+    }
 }
 
 impl simplecss::Element for El<'_, '_> {
@@ -224,6 +258,11 @@ impl simplecss::Element for El<'_, '_> {
             El::Real(n, renamed) => n.parent_element().map(|p| El::Real(p, renamed)),
             El::Made(_, 0, text) => Some(El::Real(text, Some(text.id()))),
             El::Made(_, depth, text) => Some(El::Made("g", depth - 1, text)),
+            El::Anim(_, 1, text) => Some(El::Made("g", 0, text)),
+            El::Anim(tag, depth, text) => {
+                let (parent, d) = anim_parent(tag, depth);
+                Some(El::Anim(parent, d, text))
+            }
         }
     }
 
@@ -231,7 +270,7 @@ impl simplecss::Element for El<'_, '_> {
         match *self {
             El::Real(n, renamed) => n.prev_sibling_element().map(|p| El::Real(p, renamed)),
             El::Made(_, 0, text) => text.last_element_child().map(|c| El::Real(c, Some(text.id()))),
-            El::Made(..) => None,
+            El::Made(..) | El::Anim(..) => None,
         }
     }
 
@@ -239,7 +278,7 @@ impl simplecss::Element for El<'_, '_> {
         match *self {
             El::Real(n, renamed) if renamed == Some(n.id()) => name == "g",
             El::Real(n, _) => n.tag_name().name() == name,
-            El::Made(made, ..) => made == name,
+            El::Made(made, ..) | El::Anim(made, ..) => made == name,
         }
     }
 
@@ -254,6 +293,8 @@ impl simplecss::Element for El<'_, '_> {
             // whatever their values, a selector on them is taken to match.
             El::Made("g", ..) => SPAN_PAINT.contains(&name),
             El::Made(..) => matches!(name, "d" | "fill" | "stroke"),
+            // Whatever the animation wrote there: a selector on any attribute is taken to match.
+            El::Anim(..) => true,
         }
     }
 
@@ -364,15 +405,19 @@ impl<'a> Cascade<'a> {
                 .any(|r| r.selector.matches(&El::Real(node, None)) != r.selector.matches(&El::Real(node, Some(text))))
     }
 
-    /// Whether a rule matches a generated element of `text`.
-    fn touches_made(&self, text: Node) -> bool {
+    /// Whether a rule matches a generated element of `text` (`animated`: of its units too).
+    fn touches_made(&self, text: Node, animated: bool) -> bool {
         let made = [
             El::Made("g", 0, text),
             El::Made("path", 1, text),
             El::Made("g", 1, text),
             El::Made("path", 2, text),
         ];
-        self.sheet.rules.iter().any(|r| made.iter().any(|m| r.selector.matches(m)))
+        let units = ANIMATED_MADE.iter().map(|&(tag, depth)| El::Anim(tag, depth, text));
+        self.sheet
+            .rules
+            .iter()
+            .any(|r| made.iter().any(|m| r.selector.matches(m)) || (animated && units.clone().any(|m| r.selector.matches(&m))))
     }
 
     /// `font-size` at `node` (usvg's: from the root down, relative units on the size above).
@@ -936,6 +981,51 @@ struct Ctx<'a, 'd> {
     faces: Faces<'d>,
     /// The bytes the outlines may still add before the title is over its size cap.
     room: usize,
+    /// The ids the document has, and the number the next blur filter's id tries.
+    ids: HashSet<String>,
+    next_blur: usize,
+    /// The animation elements the document may still be given before it is over their cap.
+    animations: usize,
+    /// The amounts the document's animations may still be sampled at (a unit costs a grid of them).
+    work: usize,
+}
+
+impl Ctx<'_, '_> {
+    fn new<'a, 'd>(
+        src: &'a str,
+        doc: &'a Document,
+        css: &'a Cascade<'a>,
+        anims: &'a [Animation],
+        uses: &'a [NodeId],
+        faces: Faces<'d>,
+    ) -> Ctx<'a, 'd> {
+        let existing = doc
+            .descendants()
+            .filter(|n| {
+                n.is_element()
+                    && matches!(
+                        n.tag_name().name(),
+                        "animate" | "set" | "animateColor" | "animateTransform" | "animateMotion"
+                    )
+            })
+            .count();
+        Ctx {
+            src,
+            css,
+            anims,
+            uses,
+            faces,
+            room: MAX_BYTES.saturating_sub(src.len()),
+            ids: doc
+                .descendants()
+                .filter(Node::is_element)
+                .filter_map(|n| n.attribute("id").map(str::to_string))
+                .collect(),
+            next_blur: 0,
+            animations: MAX_ANIMATIONS.saturating_sub(existing),
+            work: MAX_WORK,
+        }
+    }
 }
 
 /// `node` set by the text engine, `Ok(None)` when it has nothing to draw, or why it stays text.
@@ -974,6 +1064,10 @@ fn set(cx: &mut Ctx, node: Node) -> std::result::Result<Option<Set>, String> {
             return Err(attr.to_string());
         }
     }
+    let animation = match node.attribute(ANIMATE_MARK) {
+        None => None,
+        Some(raw) => Some(TextAnimation::from_attribute(raw).map_err(|e| format!("{ANIMATE_MARK} does not read: {e}"))?),
+    };
     // The owners of text: the element, then its spans.
     let mut owners: Vec<Node> = vec![node];
     let mut pieces: Vec<Piece> = Vec::new();
@@ -1019,7 +1113,7 @@ fn set(cx: &mut Ctx, node: Node) -> std::result::Result<Option<Set>, String> {
             _ => {}
         }
     }
-    if cx.css.moves(node, node.id()) || cx.css.touches_made(node) {
+    if cx.css.moves(node, node.id()) || cx.css.touches_made(node, animation.is_some()) {
         return Err("a style rule that would match it differently".into());
     }
     if let Some(next) = node.next_sibling_element() {
@@ -1073,7 +1167,9 @@ fn set(cx: &mut Ctx, node: Node) -> std::result::Result<Option<Set>, String> {
     // Each character that is not a space is a path of at least this much: a text that cannot fit is not
     // laid out to find that out.
     let visible = chars.iter().filter(|(c, _)| !c.is_whitespace()).count();
-    if visible.saturating_mul(MIN_GLYPH_BYTES) > cx.room {
+    // An animated glyph also carries its group and animations (a hundred bytes at the least).
+    let least = MIN_GLYPH_BYTES + if animation.is_some() { MIN_UNIT_BYTES } else { 0 };
+    if visible.saturating_mul(least) > cx.room {
         return Err(format!("outlines that would take the title over {} KiB", MAX_BYTES / 1024));
     }
     let specs: Vec<Spec> = owners
@@ -1244,6 +1340,15 @@ fn set(cx: &mut Ctx, node: Node) -> std::result::Result<Option<Set>, String> {
         g.y += y;
     }
     lay.bounds = lay.bounds.map(|[x0, y0, x1, y1]| [x0 + x, y0 + y, x1 + x, y1 + y]);
+    let units = animation.map(|animation| units_of(&text, &lay, animation));
+    if let Some(u) = &units {
+        if u.count > MAX_UNITS {
+            return Err(format!(
+                "{} units to animate (most {MAX_UNITS}): animate by word or line",
+                u.count
+            ));
+        }
+    }
     let paint: Vec<String> = owners
         .iter()
         .enumerate()
@@ -1253,9 +1358,56 @@ fn set(cx: &mut Ctx, node: Node) -> std::result::Result<Option<Set>, String> {
         lay,
         owner_of,
         paint,
+        units,
         open: r.start + 1..r.start + 5,
         close,
     }))
+}
+
+/// Which unit of `animation` each glyph of `lay` belongs to (`None`: none, a glyph of a space), and how many
+/// units there are.
+fn units_of(text: &str, lay: &text::Layout, animation: TextAnimation) -> Units {
+    let (of_glyph, count) = match animation.by {
+        AnimateBy::Line => {
+            // A line is a unit if a glyph of it has an outline: counted in the order lines are laid out.
+            let mut lines: Vec<usize> = lay
+                .glyphs
+                .iter()
+                .filter(|g| {
+                    text.get(g.cluster..)
+                        .and_then(|t| t.chars().next())
+                        .is_some_and(|c| !c.is_whitespace())
+                })
+                .map(|g| g.line)
+                .collect();
+            lines.sort_unstable();
+            lines.dedup();
+            let of = lay
+                .glyphs
+                .iter()
+                .map(|g| {
+                    let visible = text
+                        .get(g.cluster..)
+                        .and_then(|t| t.chars().next())
+                        .is_some_and(|c| !c.is_whitespace());
+                    visible.then(|| lines.binary_search(&g.line).ok()).flatten()
+                })
+                .collect();
+            (of, lines.len())
+        }
+        by => {
+            let (map, count) = glyph_smil::units_of(text, by);
+            (
+                lay.glyphs.iter().map(|g| map.get(g.cluster).copied().flatten()).collect(),
+                count,
+            )
+        }
+    };
+    Units {
+        of_glyph,
+        count,
+        animation,
+    }
 }
 
 /// A text set: its glyphs placed in the element's user space, which owner each run is, each owner's paint
@@ -1264,8 +1416,17 @@ struct Set {
     lay: text::Layout,
     owner_of: Vec<usize>,
     paint: Vec<String>,
+    /// The units an animation moves, if the text has one.
+    units: Option<Units>,
     open: Range<usize>,
     close: usize,
+}
+
+/// A text's animation and which unit each of its glyphs is in.
+struct Units {
+    of_glyph: Vec<Option<usize>>,
+    count: usize,
+    animation: TextAnimation,
 }
 
 /// The splices that set `node` as outlines, `Ok(None)` when it has nothing to draw, or why it stays text.
@@ -1282,9 +1443,28 @@ fn plan(cx: &mut Ctx, node: Node) -> std::result::Result<Option<Cuts>, String> {
             num(x0)
         ));
     }
+    match &set.units {
+        None => glyphs_out(&set, 0..set.lay.glyphs.len(), None, &mut out),
+        Some(units) => animated_out(cx, &set, units, &mut out)?,
+    }
+    out.push_str("</g>");
+    if set.units.is_some() && out.len() > cx.room {
+        return Err(format!("the animation would take the title over {} KiB", MAX_BYTES / 1024));
+    }
+    Ok(Some(vec![
+        (set.open, format!("g {TEXT_MARK}=\"\"")),
+        (set.close..set.close, out),
+        (set.close + 2..set.close + 6, "g".to_string()),
+    ]))
+}
+
+/// The paths of the glyphs at `indices` of `set`, a span's own paint grouped round its glyphs. `shift` is the
+/// point they are written relative to.
+fn glyphs_out(set: &Set, indices: impl IntoIterator<Item = usize>, shift: Option<(f32, f32)>, out: &mut String) {
     let mut open: Option<usize> = None;
     let mut d = String::new();
-    for g in &set.lay.glyphs {
+    for i in indices {
+        let g = &set.lay.glyphs[i];
         let owner = set.owner_of[g.run];
         let group = (!set.paint[owner].is_empty()).then_some(owner);
         if open != group {
@@ -1299,7 +1479,16 @@ fn plan(cx: &mut Ctx, node: Node) -> std::result::Result<Option<Cuts>, String> {
             open = group;
         }
         d.clear();
-        if text::glyph_path(g, &mut d) {
+        let drawn = match shift {
+            None => text::glyph_path(g, &mut d),
+            Some((sx, sy)) => {
+                let mut moved = g.clone();
+                moved.x -= sx;
+                moved.y -= sy;
+                text::glyph_path(&moved, &mut d)
+            }
+        };
+        if drawn {
             out.push_str("<path d=\"");
             out.push_str(&d);
             out.push_str("\"/>");
@@ -1308,12 +1497,77 @@ fn plan(cx: &mut Ctx, node: Node) -> std::result::Result<Option<Cuts>, String> {
     if open.is_some() {
         out.push_str("</g>");
     }
-    out.push_str("</g>");
-    Ok(Some(vec![
-        (set.open, format!("g {TEXT_MARK}=\"\"")),
-        (set.close..set.close, out),
-        (set.close + 2..set.close + 6, "g".to_string()),
-    ]))
+}
+
+/// How far above a unit's baseline it turns and scales about, in em.
+const PIVOT_LIFT: f32 = 0.35;
+
+/// A text's glyphs by unit, each unit in the group its animation makes (`glyph_smil::wrap`), or bare when the
+/// animation leaves it as it is.
+fn animated_out(cx: &mut Ctx, set: &Set, units: &Units, out: &mut String) -> std::result::Result<(), String> {
+    let mut members: Vec<Vec<usize>> = vec![Vec::new(); units.count];
+    let mut loose = Vec::new();
+    for (i, unit) in units.of_glyph.iter().enumerate() {
+        match unit {
+            Some(u) => members[*u].push(i),
+            None => loose.push(i),
+        }
+    }
+    let rounded = |v: f32| (v * 100.0).round() / 100.0;
+    let cost = members.iter().filter(|m| !m.is_empty()).count() * glyph_smil::grid_points(&units.animation);
+    if cost > cx.work {
+        return Err("too long or too many units to animate (shorten the animation or animate by word)".into());
+    }
+    cx.work -= cost;
+    let mut budget = cx.animations;
+    let mut src = IdSource {
+        taken: &cx.ids,
+        next: cx.next_blur,
+    };
+    for (unit, glyphs) in members.iter().enumerate() {
+        if glyphs.is_empty() {
+            continue;
+        }
+        let boxes: Vec<[f32; 4]> = glyphs
+            .iter()
+            .filter_map(|i| text::glyph_bounds(&set.lay.glyphs[*i]))
+            .collect();
+        let first = &set.lay.glyphs[glyphs[0]];
+        let wrap = boxes
+            .iter()
+            .copied()
+            .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])
+            .and_then(|bounds| {
+                let geom = UnitGeom {
+                    bounds,
+                    pivot: (
+                        rounded((bounds[0] + bounds[2]) / 2.0),
+                        rounded(first.y - PIVOT_LIFT * first.size),
+                    ),
+                    size: first.size,
+                };
+                glyph_smil::wrap(&units.animation, unit, units.count, &geom, &mut src)
+            });
+        match wrap {
+            Some(w) => {
+                if w.animations > budget {
+                    return Err(format!("more than {MAX_ANIMATIONS} animations in the title"));
+                }
+                budget -= w.animations;
+                out.push_str(&w.open);
+                glyphs_out(set, glyphs.iter().copied(), w.pivot, out);
+                out.push_str("</g>");
+            }
+            None => glyphs_out(set, glyphs.iter().copied(), None, out),
+        }
+        if out.len() > cx.room {
+            return Err(format!("the animation would take the title over {} KiB", MAX_BYTES / 1024));
+        }
+    }
+    cx.next_blur = src.next;
+    cx.animations = budget;
+    glyphs_out(set, loose, None, out);
+    Ok(())
 }
 
 /// A span's own paint as attributes (` fill="#f00"`), what its glyphs' group carries.
@@ -1357,24 +1611,24 @@ pub(crate) fn outline_text(src: &str, db: &Database) -> Result<Outlined> {
     let css = Cascade::new(&doc);
     let anims = animations(&doc);
     let uses = use_targets(&doc);
-    let mut cx = Ctx {
+    let mut cx = Ctx::new(
         src,
-        css: &css,
-        anims: &anims,
-        uses: &uses,
-        faces: Faces {
+        &doc,
+        &css,
+        &anims,
+        &uses,
+        Faces {
             db,
             read: HashMap::new(),
             fallbacks: HashMap::new(),
         },
-        room: MAX_BYTES.saturating_sub(src.len()),
-    };
+    );
     let mut cuts = Vec::new();
     let mut count = 0;
     let mut warnings = Vec::new();
     let mut kept = Vec::new();
     // The outlined texts: their label, and what drawing them with their font would lose.
-    let mut outlined: Vec<(String, Option<&str>)> = Vec::new();
+    let mut outlined: Vec<(String, Option<String>)> = Vec::new();
     for node in doc
         .descendants()
         .filter(|n| {
@@ -1386,13 +1640,16 @@ pub(crate) fn outline_text(src: &str, db: &Database) -> Result<Outlined> {
         .take(MAX_TEXTS)
     {
         let boxed = css.declared(node).get("inline-size").is_some_and(|v| v != "auto");
-        let loses = if boxed && node.attribute(FIT_MARK).map(str::trim) == Some("shrink") {
-            Some("so it does not shrink to fit its box")
+        let mut loses: Vec<&str> = Vec::new();
+        if boxed && node.attribute(FIT_MARK).map(str::trim) == Some("shrink") {
+            loses.push("it does not shrink to fit its box");
         } else if boxed || css.get(node, "white-space", true).as_deref() == Some("pre-line") {
-            Some("so its lines do not wrap")
-        } else {
-            None
-        };
+            loses.push("its lines do not wrap");
+        }
+        if node.attribute(ANIMATE_MARK).is_some() {
+            loses.push("its animation does not play");
+        }
+        let loses = (!loses.is_empty()).then(|| format!("so {}", loses.join(" and ")));
         match plan(&mut cx, node) {
             Ok(Some(mut c)) => {
                 let grown = c.iter().map(|(r, s)| s.len().saturating_sub(r.len())).sum::<usize>();
@@ -1500,6 +1757,10 @@ mod tests {
                 fallbacks: HashMap::new(),
             },
             room: MAX_BYTES,
+            ids: HashSet::new(),
+            next_blur: 0,
+            animations: MAX_ANIMATIONS,
+            work: MAX_WORK,
         };
         doc.descendants()
             .filter(|n| n.is_element() && n.tag_name().name() == "text")
@@ -1597,6 +1858,10 @@ mod tests {
                     fallbacks: HashMap::new(),
                 },
                 room: MAX_BYTES,
+                ids: HashSet::new(),
+                next_blur: 0,
+                animations: MAX_ANIMATIONS,
+                work: MAX_WORK,
             };
             let node = doc_.descendants().find(|n| n.has_tag_name((SVG_NS, "text"))).unwrap();
             let [x0, y0, x1, y1] = set(&mut cx, node).unwrap().unwrap().lay.bounds.unwrap();
@@ -1669,6 +1934,10 @@ mod tests {
             (
                 "a box that shrinks",
                 r#"<text id="n" x="5" y="50" font-family="Geist" font-size="30" inline-size="80" data-kerf-fit="shrink">Long name</text>"#,
+            ),
+            (
+                "an animation",
+                r#"<text id="a" x="5" y="50" font-family="Geist" font-size="30" data-kerf-animate='{"by":"word","duration":1.5,"range":{"offset":{"from":0.0,"to":1.0}},"properties":{"y":0.5,"opacity":0.0,"blur":0.25,"rotation":-20.0}}'>Kite fun</text>"#,
             ),
             ("one kept as text", r#"<text x="5" y="50" dx="2" font-family="Geist">kept</text><text x="5" y="90" font-family="Geist">set</text>"#),
             ("none", r#"<rect width="1" height="1"/>"#),
@@ -1966,5 +2235,293 @@ mod tests {
         )));
         assert_eq!(out.count, 1);
         assert_eq!(out.kept, vec!["the text “kept” (dx)".to_string()]);
+    }
+
+    // ---- text animations (`data-kerf-animate`, `glyph_smil.rs`) ----------------------------------------
+
+    use crate::svg::{text_animation_preset, TextAnimation};
+
+    fn animated(text: &str, preset: &str) -> String {
+        let a = text_animation_preset(preset).unwrap().animation;
+        animated_with(text, &a)
+    }
+
+    fn animated_with(text: &str, a: &TextAnimation) -> String {
+        doc(&format!(
+            r##"<rect width="400" height="200" fill="#123"/><text id="t" x="20" y="110" font-family="Geist" font-size="60" fill="#fe8" data-kerf-animate='{}'>{text}</text>"##,
+            a.to_attribute()
+        ))
+    }
+
+    /// The same title without the attribute: the text at rest.
+    fn at_rest(src: &str) -> String {
+        let start = src.find(" data-kerf-animate='").unwrap();
+        let end = src[start + 20..].find('\'').unwrap() + start + 21;
+        format!("{}{}", &src[..start], &src[end..])
+    }
+
+    /// Pixels of `parsed` at `t` that are not the background (a light ink on dark).
+    fn ink(parsed: &SvgDoc, t: f64) -> Vec<u8> {
+        pixels(&parsed.at(t))
+    }
+
+    fn lit(frame: &[u8], columns: std::ops::Range<usize>) -> usize {
+        frame
+            .chunks(4)
+            .enumerate()
+            .filter(|(i, p)| columns.contains(&(i % 400)) && p[0] > 160 && p[1] > 160)
+            .count()
+    }
+
+    #[test]
+    fn an_animated_text_is_a_group_of_glyph_groups_that_reads_back_and_restores() {
+        let src = animated("Hello", "rise");
+        let out = outline(&src);
+        assert_eq!(out.count, 1, "{:?}", out.kept);
+        assert!(out.warnings.is_empty() && out.kept.is_empty(), "{:?}", out.warnings);
+        assert_eq!(out.svg.matches("<animateTransform").count(), 5, "one a letter");
+        assert_eq!(out.svg.matches("attributeName=\"opacity\"").count(), 5);
+        assert_eq!(
+            restore_text(&out.svg).unwrap(),
+            src,
+            "the animation is generated: restoring drops it"
+        );
+        let parsed = SvgDoc::parse(&out.svg).unwrap();
+        assert_eq!(parsed.sanitized(), out.svg, "the sanitiser leaves it as it is");
+        assert!(parsed.warnings().is_empty(), "{:?}", parsed.warnings());
+        assert!(parsed.is_animated());
+        assert_eq!(parsed.natural_duration(), Some(1.4));
+        // Making it again gives the same bytes.
+        assert_eq!(outline(&src).svg, out.svg);
+    }
+
+    #[test]
+    fn a_rising_text_is_hidden_at_the_start_and_is_the_text_at_rest_at_the_end() {
+        let src = animated("Hello", "rise");
+        let out = outline(&src);
+        let parsed = SvgDoc::parse(&out.svg).unwrap();
+        let backdrop = pixels(&doc(r##"<rect width="400" height="200" fill="#123"/>"##));
+        assert_eq!(ink(&parsed, 0.0), backdrop, "every letter starts transparent");
+        let rest = SvgDoc::parse(&outline(&at_rest(&src)).svg).unwrap();
+        assert_eq!(
+            ink(&parsed, 1.4),
+            ink(&rest, 0.0),
+            "the last frame is the text as it is without the animation"
+        );
+        assert_eq!(ink(&parsed, 9.0), ink(&parsed, 1.4), "and it holds");
+        // In between, letters are part way: some ink, not all of it, and the first letter leads.
+        let mid = ink(&parsed, 0.5);
+        let full = ink(&rest, 0.0);
+        let (mid_ink, full_ink) = (lit(&mid, 0..400), lit(&full, 0..400));
+        assert!(mid_ink > 0 && mid_ink < full_ink, "{mid_ink} of {full_ink}");
+        assert!(lit(&mid, 20..80) >= lit(&mid, 200..400), "left to right");
+    }
+
+    #[test]
+    fn a_typewriter_shows_the_letters_in_order_one_at_a_time() {
+        let src = animated("Hello world", "typewriter");
+        let out = outline(&src);
+        let parsed = SvgDoc::parse(&out.svg).unwrap();
+        let rest = SvgDoc::parse(&outline(&at_rest(&src)).svg).unwrap();
+        let end = ink(&rest, 0.0);
+        let mut last = 0;
+        for i in 0..=15 {
+            let frame = ink(&parsed, f64::from(i) * 0.1);
+            let shown = lit(&frame, 0..400);
+            assert!(shown >= last, "letters only appear: {shown} after {last} at {i}");
+            last = shown;
+        }
+        assert_eq!(lit(&ink(&parsed, 0.0), 0..400), 0);
+        assert_eq!(lit(&ink(&parsed, 1.5), 0..400), lit(&end, 0..400));
+        // Half way through, the left half has its letters and the right half none.
+        let half = ink(&parsed, 0.75);
+        assert!(
+            lit(&half, 20..110) > 0 && lit(&half, 300..400) == 0,
+            "{} {}",
+            lit(&half, 20..110),
+            lit(&half, 300..400)
+        );
+    }
+
+    #[test]
+    fn a_word_or_a_line_moves_as_one_and_a_letter_turns_about_itself() {
+        let a = TextAnimation {
+            by: AnimateBy::Word,
+            ..text_animation_preset("drop_in").unwrap().animation
+        };
+        let out = outline(&animated_with("one two three", &a));
+        assert_eq!(
+            out.svg.matches("<animate attributeName=\"opacity\"").count(),
+            3,
+            "{}",
+            out.svg
+        );
+        let lines = TextAnimation {
+            by: AnimateBy::Line,
+            ..text_animation_preset("drop_in").unwrap().animation
+        };
+        let src = doc(&format!(
+            r##"<text id="t" x="20" y="60" font-family="Geist" font-size="30" style="white-space:pre-line" data-kerf-animate='{}'>one
+two
+three</text>"##,
+            lines.to_attribute()
+        ));
+        let out = outline(&src);
+        assert_eq!(out.count, 1, "{:?}", out.kept);
+        assert_eq!(
+            out.svg.matches("<animate attributeName=\"opacity\"").count(),
+            3,
+            "a unit a line"
+        );
+        // A letter that spins in turns about its own middle: its ink stays where the letter is.
+        let src = animated("I", "spin_in");
+        let parsed = SvgDoc::parse(&outline(&src).svg).unwrap();
+        let rest = pixels(&SvgDoc::parse(&outline(&at_rest(&src)).svg).unwrap().at(0.0));
+        let box_of = |frame: &[u8]| {
+            let (mut x0, mut y0, mut x1, mut y1) = (400usize, 200usize, 0usize, 0usize);
+            for (i, p) in frame.chunks(4).enumerate() {
+                if p[0] > 120 && p[1] > 120 {
+                    let (x, y) = (i % 400, i / 400);
+                    (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+                }
+            }
+            ((x0 + x1) as f64 / 2.0, (y0 + y1) as f64 / 2.0)
+        };
+        let (cx, cy) = box_of(&rest);
+        let mid = pixels(&parsed.at(0.45));
+        assert!(lit(&mid, 0..400) > 0, "part way in there is a letter");
+        let (mx, my) = box_of(&mid);
+        assert!(
+            (mx - cx).abs() < 6.0 && (my - cy).abs() < 14.0,
+            "centre ({mx}, {my}) vs ({cx}, {cy})"
+        );
+    }
+
+    #[test]
+    fn a_blur_comes_into_focus_and_the_text_at_rest_is_sharp() {
+        let src = animated("Blur", "blur_in");
+        let out = outline(&src);
+        assert_eq!(out.count, 1, "{:?}", out.kept);
+        assert!(out.svg.contains("<feGaussianBlur"), "{}", out.svg);
+        let parsed = SvgDoc::parse(&out.svg).unwrap();
+        assert!(parsed.warnings().is_empty(), "{:?}", parsed.warnings());
+        let rest = pixels(&SvgDoc::parse(&outline(&at_rest(&src)).svg).unwrap().at(0.0));
+        let end = ink(&parsed, parsed.natural_duration().unwrap() + 1.0);
+        let differ = rest
+            .chunks(4)
+            .zip(end.chunks(4))
+            .filter(|(p, q)| p.iter().zip(q.iter()).any(|(x, y)| x.abs_diff(*y) > 6))
+            .count();
+        assert!(differ < 30, "{differ} pixels differ between sharp and the blur at zero");
+        // Part way, a letter is soft: its edge pixels are in between.
+        let mid = ink(&parsed, 0.6);
+        let soft = mid
+            .chunks(4)
+            .filter(|p| p[0] > 40 && p[0] < 140 && p[1] > 40 && p[1] < 140)
+            .count();
+        assert!(lit(&mid, 0..400) > 0 || soft > 0);
+    }
+
+    #[test]
+    fn a_wiggle_moves_every_letter_on_its_own_the_same_way_every_time() {
+        let src = animated("Wiggle", "wiggle");
+        let out = outline(&src);
+        assert_eq!(out.count, 1);
+        assert_eq!(outline(&src).svg, out.svg);
+        let parsed = SvgDoc::parse(&out.svg).unwrap();
+        assert!(parsed.warnings().is_empty(), "{:?}", parsed.warnings());
+        let rest = pixels(&SvgDoc::parse(&outline(&at_rest(&src)).svg).unwrap().at(0.0));
+        assert_eq!(ink(&parsed, 0.0), rest, "it starts at rest");
+        assert_eq!(ink(&parsed, 3.0), rest, "and settles");
+        assert_ne!(ink(&parsed, 1.3), rest, "in between it is off");
+        let mut other = text_animation_preset("wiggle").unwrap().animation;
+        other.wiggle.as_mut().unwrap().seed = 8;
+        assert_ne!(outline(&animated_with("Wiggle", &other)).svg, out.svg);
+    }
+
+    #[test]
+    fn an_animated_text_that_cannot_be_outlined_stays_text_and_says_the_animation_will_not_play() {
+        let a = text_animation_preset("rise").unwrap().animation.to_attribute();
+        // Positioned: stays text.
+        let out = outline(&doc(&format!(
+            r#"<text id="t" x="5" y="50" dx="2" font-family="Geist" data-kerf-animate='{a}'>kept</text>"#
+        )));
+        assert_eq!(out.count, 0);
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert!(out.warnings[0].contains("its animation does not play"), "{:?}", out.warnings);
+        // A rule that could match what the animation makes: stays text.
+        let out = outline(&doc(&format!(
+            r#"<style>g path{{fill:red}}</style><text id="t" x="5" y="50" font-family="Geist" data-kerf-animate='{a}'>kept</text>"#
+        )));
+        assert_eq!(out.count, 0, "{}", out.svg);
+        assert!(out.kept[0].contains("style rule"), "{:?}", out.kept);
+        // The same rule leaves an unanimated text alone only if it did already: unchanged behaviour.
+        let still = outline(&doc(
+            r#"<style>g path{fill:red}</style><text id="t" x="5" y="50" font-family="Geist">kept</text>"#,
+        ));
+        assert_eq!(still.count, 0);
+        // An attribute that is not ours: stays text, saying so.
+        let out = outline(&doc(
+            r#"<text id="t" x="5" y="50" font-family="Geist" data-kerf-animate='{"by":"letter"}'>kept</text>"#,
+        ));
+        assert_eq!(out.count, 0);
+        assert!(out.kept[0].contains("data-kerf-animate does not read"), "{:?}", out.kept);
+        let out = outline(&doc(
+            r#"<text id="t" x="5" y="50" font-family="Geist" data-kerf-animate='{"properties":{}}'>kept</text>"#,
+        ));
+        assert!(out.kept[0].contains("changes nothing"), "{:?}", out.kept);
+    }
+
+    #[test]
+    fn an_animation_that_would_take_the_title_over_its_cap_leaves_the_text_as_text() {
+        let long = "word ".repeat(1_200);
+        let out = outline(&animated(&long, "rise"));
+        assert_eq!(out.count, 0);
+        assert!(out.warnings[0].contains("its animation does not play"), "{:?}", out.warnings);
+        // By word the units are fewer, but the glyphs are what weigh: still refused, never half done.
+        let a = TextAnimation {
+            by: AnimateBy::Word,
+            ..text_animation_preset("fade_in").unwrap().animation
+        };
+        let out = outline(&animated_with(&long, &a));
+        assert_eq!(out.count, 0);
+        assert!(!out.svg.contains("kf-blur"), "nothing half done");
+    }
+
+    #[test]
+    fn two_animated_texts_get_blur_filters_of_their_own_and_the_ids_do_not_clash() {
+        let a = text_animation_preset("blur_in").unwrap().animation.to_attribute();
+        let src = doc(&format!(
+            r#"<filter id="kf-blur-0"/><text id="a" x="5" y="50" font-family="Geist" font-size="30" data-kerf-animate='{a}'>ab</text><text id="b" x="5" y="120" font-family="Geist" font-size="30" data-kerf-animate='{a}'>cd</text>"#
+        ));
+        let out = outline(&src);
+        assert_eq!(out.count, 2);
+        let ids: Vec<&str> = out
+            .svg
+            .match_indices("<filter id=\"")
+            .map(|(i, _)| &out.svg[i + 12..i + 12 + 10])
+            .collect();
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(ids.len(), 5, "the document's own filter and four letters: {ids:?}");
+        assert_eq!(unique.len(), ids.len(), "{ids:?}");
+        let parsed = SvgDoc::parse(&out.svg).unwrap();
+        assert_eq!(parsed.sanitized(), out.svg, "no id was dropped");
+    }
+
+    #[test]
+    fn a_long_animation_of_many_units_is_refused_before_it_is_sampled() {
+        let mut slow = text_animation_preset("rise").unwrap().animation;
+        slow.delay = 30.0;
+        slow.duration = 30.0;
+        // 490 units for a minute is 3.5 million amounts: more than a document is given.
+        let text = "iiii lll ".repeat(70);
+        let out = outline(&animated_with(&text, &slow));
+        assert_eq!(out.count, 0);
+        assert!(out.kept[0].contains("too long or too many units"), "{:?}", out.kept);
+        // By word it is 140 units, well inside.
+        slow.by = AnimateBy::Word;
+        assert_eq!(outline(&animated_with(&text, &slow)).count, 1);
     }
 }

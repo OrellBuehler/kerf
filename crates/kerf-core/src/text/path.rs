@@ -108,6 +108,70 @@ impl OutlinePen for Writer<'_> {
     }
 }
 
+/// Tracks the box of every point an outline mentions (control points included, so the box holds the curve).
+struct Bounds {
+    k: f64,
+    x: f64,
+    y: f64,
+    min: [f64; 2],
+    max: [f64; 2],
+    any: bool,
+}
+
+impl Bounds {
+    fn take(&mut self, x: f32, y: f32) {
+        let (px, py) = (self.x + f64::from(x) * self.k, self.y - f64::from(y) * self.k);
+        self.min = [self.min[0].min(px), self.min[1].min(py)];
+        self.max = [self.max[0].max(px), self.max[1].max(py)];
+        self.any = true;
+    }
+}
+
+impl OutlinePen for Bounds {
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.take(x, y);
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.take(x, y);
+    }
+
+    fn quad_to(&mut self, cx0: f32, cy0: f32, x: f32, y: f32) {
+        self.take(cx0, cy0);
+        self.take(x, y);
+    }
+
+    fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
+        self.take(cx0, cy0);
+        self.take(cx1, cy1);
+        self.take(x, y);
+    }
+
+    fn close(&mut self) {}
+}
+
+/// The box `[x0, y0, x1, y1]` of `glyph`'s outline in user units, where [`glyph_path`] draws it (the hull of
+/// its points, so a little more than the ink); `None` for a glyph with no outline.
+pub fn glyph_bounds(glyph: &Glyph) -> Option<[f32; 4]> {
+    let face = &glyph.face;
+    let font = face.font();
+    let outline = font.outline_glyphs().get(GlyphId::new(glyph.id))?;
+    let location = face.location(&glyph.variations);
+    let mut pen = Bounds {
+        k: f64::from(glyph.size) / f64::from(face.units_per_em()),
+        x: f64::from(glyph.x),
+        y: f64::from(glyph.y),
+        min: [f64::INFINITY; 2],
+        max: [f64::NEG_INFINITY; 2],
+        any: false,
+    };
+    outline
+        .draw(DrawSettings::unhinted(Size::unscaled(), &location), &mut pen)
+        .ok()?;
+    pen.any
+        .then(|| [pen.min[0] as f32, pen.min[1] as f32, pen.max[0] as f32, pen.max[1] as f32])
+}
+
 /// Append the outline of `glyph` to `out` as path data, in user units at the glyph's origin. Returns
 /// whether anything was written (a space has no outline).
 pub fn glyph_path(glyph: &Glyph, out: &mut String) -> bool {

@@ -1,5 +1,5 @@
-//! A title's text as the user shapes it: the box a text wraps or shrinks to, and whether its text is drawn
-//! as glyph outlines or with its fonts. For any title but a preset (drawn from its parameters), floating or
+//! A title's text as the user shapes it: the box a text wraps or shrinks to, the animation it plays, and
+//! whether its text is drawn as glyph outlines or with its fonts. For any title but a preset (drawn from its parameters), floating or
 //! on a track, custom artwork or a template.
 //!
 //! The same lock-free shape as a template's values: [`Project::title_text_inputs`] reads the title under
@@ -15,7 +15,7 @@ use super::title_clips::TitleClipResult;
 use super::{Project, SvgOverlayResult, TitleEdited};
 use crate::error::{Error, Result};
 use crate::fonts;
-use crate::svg::{restore_text, set_text_box, SvgDoc, TextBox};
+use crate::svg::{has_outlines, restore_text, set_text_animation, set_text_box, SvgDoc, TextAnimation, TextBox};
 use crate::template::{read_values, validate_controls_shape, TemplateControl};
 
 /// How a title's text is drawn.
@@ -83,6 +83,42 @@ impl TitleTextInputs {
             {
                 return Err(Error::InvalidArgument(format!(
                     "{why} cannot be drawn as outlines, so a box would not be drawn"
+                )));
+            }
+        }
+        Ok(self.prepared(doc, Vec::new()))
+    }
+
+    /// Give the `<text>` whose id is `element` the animation `animation` (or none): its text is set as outlines
+    /// again, which is where the animation is compiled into per-glyph SMIL, so a text that would stay text cannot
+    /// play one and is an error saying why (taking one away is not). A title whose text was not outlines is
+    /// outlined for an animation; taking the animation away leaves it as it was. Slow (the sanitiser, the text
+    /// engine): not for under the project lock.
+    pub fn text_animation(&self, element: &str, animation: Option<&TextAnimation>) -> Result<PreparedText> {
+        // An attribute a control sets is that control's to change.
+        let control = self.controls.iter().flatten().find(|c| {
+            c.targets
+                .iter()
+                .any(|t| t.element == element && t.attribute.as_deref() == Some(crate::svg::ANIMATE_ATTRIBUTE))
+        });
+        if let Some(c) = control {
+            return Err(Error::InvalidArgument(format!(
+                "the template's control \u{201c}{}\u{201d} sets the animation of \u{201c}{element}\u{201d}: change it there",
+                c.label
+            )));
+        }
+        let animated = set_text_animation(&restore_text(&self.svg)?, element, animation)?;
+        if animation.is_none() && !has_outlines(&self.svg) {
+            return Ok(self.prepared(SvgDoc::parse(&animated)?, Vec::new()));
+        }
+        let (doc, _, kept) = self.read(&animated)?;
+        if animation.is_some() {
+            if let Some(why) = kept
+                .iter()
+                .find(|k| k.starts_with(&format!("the text \u{201c}{element}\u{201d} ")))
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "{why} cannot be drawn as outlines, so its animation would not play"
                 )));
             }
         }
@@ -229,6 +265,20 @@ impl Project {
         self.set_title_text_parsed(title_id, prepared, "Set text box")
     }
 
+    /// The same for [`TitleTextInputs::text_animation`]. **Tests only.**
+    #[cfg(test)]
+    pub fn set_title_text_animation(
+        &self,
+        title_id: Uuid,
+        element: &str,
+        animation: Option<TextAnimation>,
+    ) -> Result<TitleEdited> {
+        let prepared = self
+            .title_text_inputs(title_id)?
+            .text_animation(element, animation.as_ref())?;
+        self.set_title_text_parsed(title_id, prepared, "Set text animation")
+    }
+
     /// The same for [`TitleTextInputs::convert`]. **Tests only.**
     #[cfg(test)]
     pub fn convert_title_text(&self, title_id: Uuid, form: TitleTextForm) -> Result<TitleEdited> {
@@ -242,7 +292,7 @@ mod tests {
     use super::*;
     use crate::model::{SvgPreset, SvgPresetKind, SvgPresetParams};
     use crate::project::{SvgLayout, SvgSource, TitleClipPlacement};
-    use crate::svg::{text_box_of, TextFit};
+    use crate::svg::{text_animation_of, text_animation_preset, text_box_of, TextFit};
 
     const ART: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 200"><rect width="400" height="200" fill="#123"/><text id="name" x="20" y="100" font-family="Geist" font-size="48" fill="#fff">Somebody with a long name</text><text id="moved" x="20" y="160" dx="2" font-family="Geist">kept</text></svg>"##;
 
@@ -490,5 +540,183 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("try again"), "{err}");
+    }
+
+    fn rise() -> TextAnimation {
+        text_animation_preset("rise").unwrap().animation
+    }
+
+    #[test]
+    fn an_animation_outlines_the_title_plays_per_glyph_and_is_read_back_from_its_text_form() {
+        let project = Project::open_in_memory().unwrap();
+        let id = custom(&project);
+        let edited = project.set_title_text_animation(id, "name", Some(rise())).unwrap();
+        let svg = svg_of(&edited);
+        assert!(svg.contains("data-kerf-text") && svg.contains("<animateTransform"), "{svg}");
+        assert!(edited.warnings().is_empty(), "{:?}", edited.warnings());
+        assert_eq!(text_animation_of(&restore_text(svg).unwrap(), "name"), Some(rise()));
+        let doc = crate::svg::SvgDoc::parse(svg).unwrap();
+        assert_eq!(doc.natural_duration(), Some(rise().end()));
+        assert!(project.history().unwrap().iter().any(|r| r.label == "Set text animation"));
+        // Taken away: the title is the text, outlined, as it was.
+        let none = project.set_title_text_animation(id, "name", None).unwrap();
+        assert!(!svg_of(&none).contains("animateTransform") && !svg_of(&none).contains("data-kerf-animate"));
+        assert_eq!(restore_text(svg_of(&none)).unwrap(), ART);
+        // A text that would stay text cannot play one: refused, saying why, with nothing written.
+        let revisions = project.history().unwrap().len();
+        let err = project
+            .set_title_text_animation(id, "moved", Some(rise()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("“moved”") && err.contains("dx") && err.contains("would not play"),
+            "{err}"
+        );
+        assert!(project.set_title_text_animation(id, "nope", Some(rise())).is_err());
+        assert!(project
+            .set_title_text_animation(id, "name", Some(TextAnimation::default()))
+            .is_err());
+        assert_eq!(project.history().unwrap().len(), revisions);
+    }
+
+    #[test]
+    fn taking_an_animation_off_custom_artwork_that_was_never_outlined_leaves_its_form_alone() {
+        let project = Project::open_in_memory().unwrap();
+        let withit = ART.replace(
+            r#"<text id="name""#,
+            &format!(r#"<text id="name" data-kerf-animate='{}'"#, rise().to_attribute()),
+        );
+        let id = project
+            .add_svg_overlay(SvgSource::Custom(withit), 0.0, Some(4.0), SvgLayout::default())
+            .unwrap();
+        assert!(
+            id.warnings.iter().any(|w| w == crate::svg::ANIMATE_NOTE),
+            "drawn with fonts, it says its animation does not play: {:?}",
+            id.warnings
+        );
+        let none = project.set_title_text_animation(id.overlay.id, "name", None).unwrap();
+        assert_eq!(svg_of(&none), ART, "no outlines were made to take it off");
+        // Outlined for an animation, with the note gone.
+        let played = project.set_title_text_animation(id.overlay.id, "name", Some(rise())).unwrap();
+        assert!(svg_of(&played).contains("data-kerf-text"));
+        assert!(
+            !played.warnings().iter().any(|w| w == crate::svg::ANIMATE_NOTE),
+            "{:?}",
+            played.warnings()
+        );
+    }
+
+    #[test]
+    fn a_title_clip_plays_an_animation_even_on_a_locked_track_and_a_preset_title_is_refused() {
+        let project = Project::open_in_memory().unwrap();
+        let placed = project
+            .add_title_clip(ART, 0.0, Some(4.0), TitleClipPlacement::default())
+            .unwrap();
+        project.set_track_locked(placed.track_id, true).unwrap();
+        let edited = project
+            .set_title_text_animation(placed.clip.id, "name", Some(rise()))
+            .unwrap();
+        assert!(matches!(edited, TitleEdited::Clip(_)));
+        assert!(svg_of(&edited).contains("animateTransform"));
+        let tl = project.timeline().unwrap();
+        let (clip, _) = tl.title_clips().next().unwrap();
+        assert_eq!((clip.timeline_start, clip.source_in, clip.source_out), (0.0, 0.0, 4.0));
+        let preset = project
+            .add_svg_overlay(
+                SvgSource::Preset(SvgPreset {
+                    kind: SvgPresetKind::FadeUp,
+                    params: SvgPresetParams::new("Hi"),
+                }),
+                0.0,
+                Some(4.0),
+                SvgLayout::default(),
+            )
+            .unwrap()
+            .overlay
+            .id;
+        let err = project
+            .set_title_text_animation(preset, "name", Some(rise()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("preset"), "{err}");
+    }
+
+    #[test]
+    fn a_template_title_keeps_its_animation_through_its_values_and_a_saved_template_carries_it() {
+        let project = Project::open_in_memory().unwrap();
+        let t = crate::template::fixtures::template();
+        let o = project
+            .apply_template(
+                &t,
+                &[("tagline".to_string(), "Kite fun".to_string())].into(),
+                0.0,
+                None,
+                SvgLayout::default(),
+            )
+            .unwrap()
+            .overlay;
+        project.set_title_text_animation(o.id, "tag", Some(rise())).unwrap();
+        let again = project
+            .set_title_values(o.id, &[("tagline".to_string(), "Kite fun forever".to_string())].into())
+            .unwrap();
+        let svg = svg_of(&again);
+        assert!(svg.contains("animateTransform"), "{svg}");
+        assert_eq!(text_animation_of(&restore_text(svg).unwrap(), "tag"), Some(rise()));
+        assert_eq!(
+            svg.matches("attributeName=\"opacity\"").count() - t_opacity_animations(&t),
+            "Kite fun forever".chars().filter(|c| !c.is_whitespace()).count(),
+            "one opacity animation a letter of the new text"
+        );
+        // Saved as a template, the animation is on the text: applying it plays it.
+        let source = project.template_source(o.id).unwrap();
+        let built = crate::template::build_template(
+            &source,
+            crate::template::TemplateSaveRequest {
+                name: "Animated".into(),
+                description: String::new(),
+                controls: o.template.as_ref().unwrap().controls.clone(),
+            },
+            Uuid::new_v4(),
+        )
+        .unwrap();
+        assert!(built.template.svg.contains("<text") && built.template.svg.contains("data-kerf-animate"));
+        assert!(
+            !built.template.svg.contains("animateTransform"),
+            "the generated animation is not saved"
+        );
+        let prepared = built.template.prepare(&Default::default()).unwrap();
+        assert!(prepared.doc.sanitized().contains("animateTransform"));
+        assert!(prepared.doc.is_animated());
+    }
+
+    fn t_opacity_animations(t: &crate::template::Template) -> usize {
+        t.svg.matches("attributeName=\"opacity\"").count()
+    }
+
+    #[test]
+    fn a_control_that_sets_the_animation_attribute_owns_it() {
+        let project = Project::open_in_memory().unwrap();
+        let mut t = crate::template::fixtures::template();
+        t.svg = t.svg.replace(r#"<text id="tag""#, r#"<text id="tag" data-kerf-animate="1""#);
+        t.manifest.controls.push(crate::template::TemplateControl {
+            id: "anim".into(),
+            label: "Animation".into(),
+            kind: crate::template::TemplateKind::Number,
+            targets: vec![crate::template::TemplateTarget {
+                element: "tag".into(),
+                attribute: Some("data-kerf-animate".into()),
+            }],
+            min: None,
+            max: None,
+        });
+        let o = project
+            .apply_template(&t, &Default::default(), 0.0, None, SvgLayout::default())
+            .unwrap()
+            .overlay;
+        let err = project
+            .set_title_text_animation(o.id, "tag", Some(rise()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("“Animation”") && err.contains("change it there"), "{err}");
     }
 }

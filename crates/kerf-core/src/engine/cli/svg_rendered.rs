@@ -824,6 +824,89 @@ fn a_text_set_through_a_control_still_fades_in() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A text typed out letter by letter (a text animation compiled into per-glyph SMIL), through the real export.
+fn typed_title(animation: &crate::svg::TextAnimation) -> String {
+    let art = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {W} {H}\"><text id=\"t\" x=\"3\" y=\"26\" font-family=\"Geist\" \
+         font-size=\"22\" font-weight=\"bold\" fill=\"#ffffff\" data-kerf-animate='{}'>Kerf</text></svg>",
+        animation.to_attribute()
+    );
+    let doc = crate::svg::SvgDoc::parse(&art)
+        .unwrap()
+        .outlined(&crate::fonts::svg_fontdb())
+        .unwrap();
+    assert!(
+        doc.is_animated() && doc.sanitized().contains("<animate"),
+        "{}",
+        doc.sanitized()
+    );
+    doc.sanitized().to_string()
+}
+
+fn white(frame: &[u8]) -> usize {
+    frame.chunks(3).filter(|p| p[0] > 200 && p[1] > 200 && p[2] > 200).count()
+}
+
+#[test]
+#[ignore = "drives the real ffmpeg"]
+fn a_typed_text_arrives_letter_by_letter_in_the_export_and_each_frame_is_its_still() {
+    let dir = scratch("typed");
+    with_pinned_dir(dir.join("cache").to_str().unwrap(), || {
+        let bg = background(&dir, "30");
+        let assets = [bg.clone()];
+        let mut typewriter = crate::svg::text_animation_preset("typewriter").unwrap().animation;
+        typewriter.duration = 1.0;
+        let with = cut(&bg, vec![title(typed_title(&typewriter), 0.0, 3.0)]);
+        let mut without = with.clone();
+        without.svg_overlays.clear();
+        let opts = options(30.0);
+        let typed = export_rgb(&with, &assets, &opts, &dir, "typed");
+        let plain = export_rgb(&without, &assets, &opts, &dir, "plain");
+        assert_eq!(typed.len(), plain.len());
+        assert_eq!(typed[0], plain[0], "every letter starts hidden");
+        let counts: Vec<usize> = typed[..=30].iter().map(|f| white(f)).collect();
+        assert!(counts.windows(2).all(|w| w[0] <= w[1]), "letters only arrive: {counts:?}");
+        assert_eq!(counts[0], 0);
+        assert!(counts[15] > 0 && counts[15] < counts[30], "half way: {counts:?}");
+        assert_eq!(typed[45], typed[85], "and the text holds once typed");
+        assert_ne!(typed[45], plain[45]);
+        for k in [4usize, 11, 19, 27, 36] {
+            let still = still_rgb(&with, &assets, &opts, k as f64 / 30.0);
+            let worst = distance(&typed[k], &still);
+            assert!(worst <= 2, "frame {k} is {worst} levels off its still");
+        }
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+#[ignore = "drives the real ffmpeg"]
+fn a_wiggling_blurred_text_is_the_same_picture_in_every_export_of_it() {
+    let dir = scratch("wiggle");
+    with_pinned_dir(dir.join("cache").to_str().unwrap(), || {
+        let bg = background(&dir, "30");
+        let assets = [bg.clone()];
+        let mut animation = crate::svg::text_animation_preset("wiggle").unwrap().animation;
+        animation.properties.blur = 0.15;
+        animation.duration = 2.0;
+        let with = cut(&bg, vec![title(typed_title(&animation), 0.0, 3.0)]);
+        let opts = options(30.0);
+        let first = export_rgb(&with, &assets, &opts, &dir, "first");
+        assert_eq!(
+            first,
+            export_rgb(&with, &assets, &opts, &dir, "second"),
+            "seeded: the same every time"
+        );
+        assert_eq!(first[0], first[89], "it starts and ends at rest");
+        assert_ne!(first[0], first[30], "and moves in between");
+        for k in [10usize, 25, 41] {
+            let still = still_rgb(&with, &assets, &opts, k as f64 / 30.0);
+            assert!(distance(&first[k], &still) <= 2, "frame {k}");
+        }
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[allow(clippy::print_stderr)]
 fn eprintln_timing(took: std::time::Duration, frames: u32) {
     eprintln!(
