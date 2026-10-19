@@ -848,7 +848,10 @@ mod tests {
         assert_eq!(c.crop_window_at(0.0), (0.0, 0.0, 1.0, 1.0));
         // Pans and a zoom held at 1 show the whole picture: not animated, nothing to draw.
         c.set_property_keys(Property::CropX, vec![key(0.0, -1.0, Easing::Linear)]);
-        c.set_property_keys(Property::CropZoom, vec![key(0.0, 1.0, Easing::Linear), key(2.0, 1.0, Easing::Linear)]);
+        c.set_property_keys(
+            Property::CropZoom,
+            vec![key(0.0, 1.0, Easing::Linear), key(2.0, 1.0, Easing::Linear)],
+        );
         assert!(c.is_keyed(Property::CropZoom) && !c.crop_animated());
         assert_eq!(c.crop_window_at(1.0), (0.0, 0.0, 1.0, 1.0));
         c.set_property_keys(Property::CropX, vec![]);
@@ -1543,6 +1546,57 @@ mod tests {
                     bezier(0.3264332254175324, 0.5558502990076779, 0.6856271141503777, 1.0)
                 ),
                 (2.0, 2.0, Easing::Linear),
+            ]
+        );
+        // A keyed mask and crop, sampled.
+        let mut m = clip();
+        m.mask = Some(Mask::default());
+        m.set_property_keys(
+            Property::MaskX,
+            vec![key(0.0, 0.2, Easing::EaseInOut), key(2.0, 0.8, Easing::Linear)],
+        );
+        m.set_property_keys(
+            Property::MaskWidth,
+            vec![key(0.5, 0.3, Easing::EaseOut), key(1.5, 2.5, Easing::Linear)],
+        );
+        m.set_property_keys(
+            Property::CropZoom,
+            vec![key(0.0, 1.0, bezier(0.2, 0.9, 0.3, 1.0)), key(2.0, 3.0, Easing::Linear)],
+        );
+        m.set_property_keys(
+            Property::CropX,
+            vec![key(0.0, -0.5, Easing::Linear), key(2.0, 0.5, Easing::Linear)],
+        );
+        let sampled: Vec<(f64, f64, (f64, f64, f64, f64))> = [0.7, 1.3]
+            .iter()
+            .map(|&t| {
+                let mask = m.mask_at(t).unwrap();
+                (mask.x, mask.width, m.crop_window_at(t))
+            })
+            .collect();
+        assert_eq!(
+            sampled,
+            [
+                (
+                    0.3543110794166814,
+                    0.8226810657360628,
+                    (
+                        0.26972959942593694,
+                        0.3173289405011023,
+                        0.3653421189977955,
+                        0.3653421189977955
+                    )
+                ),
+                (
+                    0.6456889205833187,
+                    1.8910558007089358,
+                    (
+                        0.38105606409439846,
+                        0.33135309921252043,
+                        0.3372938015749592,
+                        0.3372938015749592
+                    )
+                ),
             ]
         );
     }

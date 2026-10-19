@@ -129,6 +129,19 @@ describe('the numbers kerf-core pins', () => {
 			[2, 2, 'linear']
 		]);
 	});
+
+	test('a keyed mask and crop, sampled', () => {
+		const m = clip();
+		m.mask = { shape: 'rect', x: 0.5, y: 0.5, width: 0.5, height: 0.5, feather: 0.15, inverted: false };
+		setPropertyKeys(m, 'mask_x', [key(0, 0.2, 'ease_in_out'), key(2, 0.8)]);
+		setPropertyKeys(m, 'mask_width', [key(0.5, 0.3, 'ease_out'), key(1.5, 2.5)]);
+		setPropertyKeys(m, 'crop_zoom', [key(0, 1, { bezier: { x1: 0.2, y1: 0.9, x2: 0.3, y2: 1 } }), key(2, 3)]);
+		setPropertyKeys(m, 'crop_x', [key(0, -0.5), key(2, 0.5)]);
+		expect([0.7, 1.3].map((t) => [maskAt(m, t)?.x, maskAt(m, t)?.width, cropWindowAt(m, t)])).toEqual([
+			[0.3543110794166814, 0.8226810657360628, [0.26972959942593694, 0.3173289405011023, 0.3653421189977955, 0.3653421189977955]],
+			[0.6456889205833187, 1.8910558007089358, [0.38105606409439846, 0.33135309921252043, 0.3372938015749592, 0.3372938015749592]]
+		]);
+	});
 });
 
 describe('the resolver', () => {

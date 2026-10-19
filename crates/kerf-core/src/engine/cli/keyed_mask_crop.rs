@@ -388,7 +388,14 @@ fn psnr(a: &[u8], b: &[u8]) -> (f64, i32) {
         worst = worst.max(d.abs());
     }
     let mse = sum / a.len() as f64;
-    (if mse == 0.0 { f64::INFINITY } else { 10.0 * (255.0 * 255.0 / mse).log10() }, worst)
+    (
+        if mse == 0.0 {
+            f64::INFINITY
+        } else {
+            10.0 * (255.0 * 255.0 / mse).log10()
+        },
+        worst,
+    )
 }
 
 fn check_crop(dir: &Path, case: &CropCase) {
@@ -416,7 +423,11 @@ fn check_crop(dir: &Path, case: &CropCase) {
         );
     }
     let spread = xs.iter().copied().fold(f64::MIN, f64::max) - xs.iter().copied().fold(f64::MAX, f64::min);
-    assert!(spread > 5.0, "{}: the box only moved {spread:.1} px: the keys did nothing", case.name);
+    assert!(
+        spread > 5.0,
+        "{}: the box only moved {spread:.1} px: the keys did nothing",
+        case.name
+    );
     // What: a detailed picture (one frame of `testsrc2`, held), every fifth output frame against
     // the still of the same moment, which reads the window through the same `perspective`.
     let src = detailed(dir);

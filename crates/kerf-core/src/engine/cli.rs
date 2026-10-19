@@ -7593,13 +7593,15 @@ fn keyed_mask_alpha(clip: &Clip, mask: &Mask, opacity: Option<&str>) -> String {
 /// each side of the picture, placed by the pans in the room left over. Output pixel `x` reads the
 /// picture at `left * W + (x + 0.5) * side - 0.5` — pixel centres, as a scale reads them, so the
 /// neutral window reads every pixel where it is — which puts the top-left corner at
-/// `((1 + pan) * W / 2 - 0.5) * (1 - side)`. The same text for the export's curves and the still's
+/// `((1 + pan) * W / 2 - 0.5) * (1 - side)` and the bottom-right one at
+/// `W - ((1 - pan) * W / 2 + 0.5) * (1 - side)` (the same point plus `side * W`, written so each
+/// corner holds one copy of each curve). The same text for the export's curves and the still's
 /// numbers, so both evaluate one formula.
 fn crop_corners(side: &str, pan_x: &str, pan_y: &str) -> String {
     let x0 = format!("((1+{pan_x})*W/2-0.5)*(1-{side})");
     let y0 = format!("((1+{pan_y})*H/2-0.5)*(1-{side})");
-    let x1 = format!("{x0}+{side}*W");
-    let y1 = format!("{y0}+{side}*H");
+    let x1 = format!("W-((1-{pan_x})*W/2+0.5)*(1-{side})");
+    let y1 = format!("H-((1-{pan_y})*H/2+0.5)*(1-{side})");
     format!("x0='{x0}':y0='{y0}':x1='{x1}':y1='{y0}':x2='{x0}':y2='{y1}':x3='{x1}':y3='{y1}'")
 }
 
@@ -7611,11 +7613,7 @@ fn crop_corners(side: &str, pan_x: &str, pan_y: &str) -> String {
 fn keyed_crop_fps(fps: f64, first: f64) -> (String, Rational, i64) {
     let rate = Rational::from_fps_filter(fps).unwrap_or(Rational { num: 30, den: 1 });
     let micros = (first * 1e6) as i64;
-    let slot = crate::frame_pick::rescale_near(
-        i128::from(micros),
-        i128::from(rate.num),
-        1_000_000 * i128::from(rate.den),
-    ) as i64;
+    let slot = crate::frame_pick::rescale_near(i128::from(micros), i128::from(rate.num), 1_000_000 * i128::from(rate.den)) as i64;
     (format!("fps=fps={fps}:start_time={first}"), rate, slot)
 }
 
@@ -7641,7 +7639,11 @@ fn crop_remap_filter(clip: &Clip, rate: Rational, first: i64) -> String {
     };
     format!(
         "perspective={}:interpolation=linear:eval=frame",
-        crop_corners(&format!("(1/{})", n(Property::CropZoom)), &n(Property::CropX), &n(Property::CropY))
+        crop_corners(
+            &format!("(1/{})", n(Property::CropZoom)),
+            &n(Property::CropX),
+            &n(Property::CropY)
+        )
     )
 }
 
@@ -14202,9 +14204,15 @@ mod tests {
         assert!(g.contains("if(lte(ld(4)\\,0.000001)\\,lte("), "{g}");
         assert!(!g.contains(&mask_filter(&Mask::default())), "{g}");
         // Beside a keyed opacity, the opacity is in slot 5.
-        clip.set_property_keys(Property::Opacity, vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(2.0, 0.5)]);
+        clip.set_property_keys(
+            Property::Opacity,
+            vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(2.0, 0.5)],
+        );
         let g = graph_of(&single(vec![clip]), &[av_asset(Uuid::new_v4(), 20.0)]);
-        assert!(g.contains("+st(5,if(lt((T-2),0),1,") && g.contains("*ld(5)*alpha(X,Y)'"), "{g}");
+        assert!(
+            g.contains("+st(5,if(lt((T-2),0),1,") && g.contains("*ld(5)*alpha(X,Y)'"),
+            "{g}"
+        );
     }
 
     #[test]
@@ -14231,10 +14239,7 @@ mod tests {
         assert_eq!(g.matches(",fps=").count(), 1, "one fps: {g}");
         assert!(g.contains(":interpolation=linear:eval=frame"), "{g}");
         assert!(!g.contains("geq="), "{g}");
-        assert!(
-            window < g.find("scale=").unwrap(),
-            "the window is cut before the fit: {g}"
-        );
+        assert!(window < g.find("scale=").unwrap(), "the window is cut before the fit: {g}");
         // A clip off the frame grid: `start_time` (1.02 s, slot 30.6) rounded to slot 31.
         let mut late = clip.clone();
         late.timeline_start = 1.02;

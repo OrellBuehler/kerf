@@ -180,11 +180,11 @@ colour-keyed-gamma :gamma='if(lt((t-
 colour-keyed-temperature :gamma_r='1+0.3*(
 volume-keyed volume='if(lt((t-
 volume-keyed-frames asetnsamples=n=128:p=0,volume=
-mask-keyed )/2*W)
-mask-keyed-feather if(lte((
-preview-mask-keyed )/2*W)
-crop-keyed :a='alpha(((1-(1/
-preview-crop-keyed :a='alpha(((1-(1/
+mask-keyed a='if(eq(X,0),st(
+mask-keyed-feather if(lte(ld(4)
+preview-mask-keyed a='if(eq(X,0),st(
+crop-keyed perspective=x0=
+preview-crop-keyed perspective=x0=
 hdr-zscale zscale=tin=
 hdr-colorspace colorspace=all=bt709:iall=bt2020
 hdr-pq tin=smpte2084
