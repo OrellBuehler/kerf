@@ -4817,6 +4817,30 @@ fn chroma_keys_are_drawn_as_the_filter_draws_them() {
     c.effects = vec![a_key("green", 0.2, 0.15)];
     let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
     check("chroma-key/graded", &tl, &[m.bars.clone(), m.testsrc.clone()], &[0.5], STRICT);
+    // Cut without a scale: a Cover crop of a 640x360 picture into 640x300, and a crop on top of it (the
+    // cropped 640x324 covers the frame as it is); and a vignette ahead of the key (exact, so the key is).
+    let cover = Some(Delivery::new(640, 300, Fit::Cover));
+    for (name, edit, format) in [
+        ("cover", Box::new(|_: &mut Clip| {}) as Box<dyn Fn(&mut Clip)>, cover),
+        ("cropped-cover", Box::new(|c: &mut Clip| c.transform.crop_top = 0.1), cover),
+        (
+            "after-a-vignette",
+            Box::new(|c: &mut Clip| c.effects.insert(0, kerf_core::VideoEffect::Vignette)),
+            None,
+        ),
+    ] {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.effects = vec![a_key("green", 0.2, 0.15)];
+        edit(&mut c);
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], format);
+        check(
+            &format!("chroma-key/{name}"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            &[0.5],
+            STRICT,
+        );
+    }
     // Every sample its own colour: the window's edges and every grade of alpha.
     let mut c = clip(&m.noise, 0.0, m.noise.duration, 0.0);
     c.effects = vec![a_key("0x808080", 0.05, 0.3)];

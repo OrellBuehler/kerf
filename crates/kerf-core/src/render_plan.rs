@@ -731,6 +731,14 @@ fn effect_refusal(effect: &VideoEffect, caps: &GpuCaps) -> Option<&'static str> 
         VideoEffect::Sharpen { amount } if !(amount.is_finite() && (-2.0..=5.0).contains(amount)) => {
             Some("a sharpen amount outside -2 to 5, which unsharp refuses")
         }
+        VideoEffect::ChromaKey { similarity, blend, .. }
+            if !(similarity.is_finite()
+                && (0.00001..=1.0).contains(similarity)
+                && blend.is_finite()
+                && (0.0..=1.0).contains(blend)) =>
+        {
+            Some("a chroma key similarity outside 0.00001 to 1 or blend outside 0 to 1, which chromakey refuses")
+        }
         _ => None,
     }
 }
@@ -865,6 +873,19 @@ impl RenderPlan {
                 reasons.push(Unsupported::Effects(
                     self.layer_ref(n, layer),
                     "a chroma key after a scale or a blur: its alpha is a distance in the chroma, which their one-level difference from FFmpeg's moves by up to 1/blend levels",
+                ));
+            }
+            // The key's window keeps what it last read where the picture ends; a picture under two samples a
+            // side has no such row or column (the compositor's rule for it needs one).
+            let (pw, ph) = if zoom_last {
+                (geom.stages[0].keep.w, geom.stages[0].keep.h)
+            } else {
+                geom.picture
+            };
+            if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) && (pw < 2 || ph < 2) {
+                reasons.push(Unsupported::Effects(
+                    self.layer_ref(n, layer),
+                    "a chroma key on a picture narrower or shorter than 2",
                 ));
             }
             if err > MAX_SHARPEN_ERROR {
@@ -2674,6 +2695,35 @@ mod tests {
             }),
             vec![]
         );
+        // A crop and a Cover that cut the picture without scaling it (the cropped 640x324 covers 640x300 as it
+        // is), and a vignette ahead of the key (exact).
+        assert_eq!(
+            why_of(video(640, 360), Some(Delivery::new(640, 300, Fit::Cover)), &|c| {
+                c.transform.crop_top = 0.1;
+                c.effects = vec![key()];
+            }),
+            vec![]
+        );
+        assert_eq!(
+            why_of(video(640, 360), Some(Delivery::new(640, 300, Fit::Cover)), &|c| c.effects =
+                vec![key()]),
+            vec![]
+        );
+        assert_eq!(why(&|c| c.effects = vec![VideoEffect::Vignette, key()]), vec![]);
+        // Not with an option `chromakey` refuses itself.
+        for (similarity, blend) in [(0.0, 0.1), (1.5, 0.1), (0.1, -0.1), (0.1, 1.01), (f64::NAN, 0.1)] {
+            let refused = why(&|c| {
+                c.effects = vec![VideoEffect::ChromaKey {
+                    color: "green".into(),
+                    similarity,
+                    blend,
+                }];
+            });
+            assert!(effects(&refused, "chromakey refuses"), "{similarity} {blend}: {refused:?}");
+        }
+        // Not on a picture under two samples a side (where the window's edge rules need a row and a column).
+        let thin = why_of(video(640, 1), None, &|c| c.effects = vec![key()]);
+        assert!(effects(&thin, "narrower or shorter than 2"), "{thin:?}");
         // Not after a scale or a blur, wherever the blur is in the list (the key runs after every effect).
         assert!(effects(
             &why(&|c| {

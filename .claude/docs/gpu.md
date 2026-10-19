@@ -675,16 +675,18 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   (`chroma_key_add`, round to nearest even), and the rest of the filter's `double` arithmetic is monotone in the sum, so it is 255 thresholds
   the CPU finds by bisection (`chroma_key_thresholds`) and the shader counts. **Outside the picture** a window entry is not reloaded: it keeps
   what the filter last wrote there in the same slice, the key colour where a slice starts, so the first sample of each slice depends on the
-  graph's **slice threads** (`min(h, threads)`): the compositor takes them from `kerf_core::cpu_graph_threads()` (the budget's when it caps the
-  export, else FFmpeg's default of cores + 1, at most 16; `Compositor::with_graph_threads` pins it). An FFmpeg run with another thread count
-  differs at those samples, as FFmpeg's own runs do. Byte for byte against the filter, still and export (`Compositor::chroma_key_alpha` reads
-  the plane back for the plane-level test). **Gap:** a `yuv420p` picture whose full range is only a `color_range=pc` tag (VP9, likely HEVC / AV1) is
+  graph's **slice threads** (`min(h, threads)`), and the compositor uses those of the graph the frame stands in for, read at each draw
+  (`Compositor::graph_threads_for`): one for a paused frame or scrub window whose every input is a proxy or an image (`single_frame_args`),
+  else `kerf_core::cpu_graph_threads()` (the budget's when it caps the graph, else FFmpeg's default of cores + 1, at most 16), which is the
+  playback stream's and an export's; `Compositor::with_graph_threads` pins it. An FFmpeg run with another thread count differs at those
+  samples, as FFmpeg's own runs do. Byte for byte against the filter at the same thread count (`Compositor::chroma_key_alpha` reads the
+  plane back for the plane-level test; the parity stills and export frames use the budget's). **Gap:** a `yuv420p` picture whose full range is only a `color_range=pc` tag (VP9, likely HEVC / AV1) is
   not seen, as `StreamInfo` does not record the range: FFmpeg keys its raw chroma, the compositor the converted one (a follow-up records it).
 * Refused (`Effects`): a vignette on a picture that is not `yuv420p` or whose format says full range (FFmpeg vignettes it in its own
   format: other planes, another dither course), a vignette map over the device's storage-buffer limit; a chroma key after a scale or a
   blur (its alpha moves by up to 1/blend levels for a level of chroma, and a blend of 0 flips it 0 to 255: drawn only on chroma that is
   FFmpeg's to the level), on a picture that is not `yuv420p` or whose format says full range, on a rotated layer or one below full
-  opacity, or on one narrower or shorter than 2; `MaskWith`: a mask over a chroma key (`geq` multiplies the key's alpha). A sigma outside 0 to 1024
+  opacity, on one narrower or shorter than 2, or with a similarity or a blend `chromakey` refuses (0.00001 to 1, 0 to 1); `MaskWith`: a mask over a chroma key (`geq` multiplies the key's alpha). A sigma outside 0 to 1024
   or an amount outside -2 to 5 (FFmpeg's options refuse them too), a blur over the device's storage-buffer limit, and a **sharpen that amplifies a difference upstream of it** (judged with the geometry, so by render size): FFmpeg's scale or blur is a level from ours, and `unsharp` carries it through at worst `1 + 2|amount|` at an edge sample and rounds up a level more with each further sharpen (its `>> 16` floors). From the first source (a scale before the effects: every stage, or the fit scale when a zoom comes last; or a blur with sigma > 0) the worst case starts at 1 and each later sharpen that is not zero at `unsharp`'s 16 bits adds `ceil(2 * err * |amount|)`; the frame is refused when it passes 2. So one sharpen of at most 0.5 is drawn (0.6 is not), and any second one is refused, however small. With no source upstream a sharpen is exact at any amount, chained or not, and a blur after it counts for nothing. `Matte`: a blur, a sharpen, a vignette or a chroma key on a
   letterbox (they would see the bars as picture; tables and a grade carry the bars through). By the picture (`effect_on_picture_refusal`): an invert,
   blur or sharpen on a **full-range** picture or one whose format was never recorded (`maybe_full_range_in(policy)`: where FFmpeg 9 negotiates the range this
@@ -784,7 +786,7 @@ everything and fails nothing); every run writes `target/parity/report.txt`.
 `tests/bench.rs` times a still on the GPU against FFmpeg at 1080p / 4K and 1 / 3 / 6
 layers, decode apart from composite (`KERF_BENCH=1`), and a captioned frame cold (FFmpeg rasterises the caption: one
 process, +30 to +95 ms on lavapipe by FFmpeg and size) and warm (the atlas: a few ms, inside the noise), and a mask, a blur, a sharpen and a
-moving zoom frame against FFmpeg's still and export (`bench_a_mask_a_blur_and_a_moving_zoom`: the mask plane's one-off cost apart), and a chroma key at 1080p (`bench_a_chroma_key`: on lavapipe the key pass is about 200 ms a frame, nine emulated `double` adds a sample; FFmpeg about 80 ms a still and 15 ms an export frame on 3 slice threads; a real GPU unmeasured).
+moving zoom frame against FFmpeg's still and export (`bench_a_mask_a_blur_and_a_moving_zoom`: the mask plane's one-off cost apart), and a chroma key at 1080p (`bench_a_chroma_key`: on lavapipe the key pass is about 200 ms a frame, nine emulated `double` adds a sample; to FFmpeg the key adds about 80 ms to a still and 15 ms to an export frame on 3 slice threads; a real GPU unmeasured).
 `tests/coverage.rs` plans the review's archetypes (no decode, no adapter), still plans and export frames, and tells how many
 frames a compositor draws before and after fades and transitions (still plans: the captioned 9:16 talking head 96.0% to 100%, the
 same without captions 96.0% to 100%, the 16:9 montage with dissolves, dips and a slide 78.8% to 100%; export frames: 0% to 100% for those, since a Motion plan was

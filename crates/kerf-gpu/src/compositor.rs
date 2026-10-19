@@ -314,9 +314,9 @@ pub struct Compositor {
     geq_edge: Option<GeqEdge>,
     /// `chromakey`'s distance terms ([`effects::chroma_key_terms`]), uploaded by the first keyed frame.
     key_terms: OnceLock<wgpu::Buffer>,
-    /// The threads FFmpeg's filter graph slices a frame into: `chromakey` starts its window over at
-    /// each slice, so its alpha at the first sample of a slice depends on them.
-    graph_threads: u32,
+    /// The threads FFmpeg's filter graph slices a frame into, when pinned ([`Compositor::with_graph_threads`]);
+    /// else they are the graph's the frame stands in for ([`Compositor::graph_threads_for`]).
+    graph_threads: Option<u32>,
 }
 
 /// The passes over a layer's planes between the scaler and the blend (`planeops.wgsl`, `blur.wgsl`):
@@ -785,13 +785,29 @@ impl Compositor {
         self
     }
 
-    /// Draw `chromakey` as an FFmpeg filter graph of `threads` slice threads draws it (the default is
-    /// what an export on this machine runs: [`kerf_core::cpu_graph_threads`]): the first sample of each
-    /// slice but the first has no window carried over from the row before it.
+    /// Draw `chromakey` as an FFmpeg filter graph of `threads` slice threads draws it, for every plan,
+    /// instead of [`Compositor::graph_threads_for`]: the first sample of each slice but the first has no
+    /// window carried over from the row before it.
     #[must_use]
     pub fn with_graph_threads(mut self, threads: u32) -> Self {
-        self.graph_threads = threads.max(1);
+        self.graph_threads = Some(threads.max(1));
         self
+    }
+
+    /// The slice threads of the FFmpeg graph `plan`'s frame stands in for, read at each draw (the budget
+    /// moves): a paused frame or a scrub window whose every input is a proxy or an image runs its graph on
+    /// one (`cpu::single_frame_args`); any other still, the playback stream and an export the budget's when
+    /// it caps them, else FFmpeg's default ([`kerf_core::cpu_graph_threads`]). Pinned, the pinned count.
+    pub fn graph_threads_for(&self, plan: &RenderPlan) -> u32 {
+        if let Some(threads) = self.graph_threads {
+            return threads;
+        }
+        let single = plan.mode == kerf_core::PlanMode::Still && plan.layers.iter().all(|l| l.source.proxy || l.is_image);
+        if single {
+            1
+        } else {
+            u32::try_from(kerf_core::cpu_graph_threads()).unwrap_or(1).max(1)
+        }
     }
 
     fn geq_edge(&self) -> GeqEdge {
@@ -1044,7 +1060,7 @@ impl Compositor {
                 vignettes: VignetteMaps::default(),
                 geq_edge: None,
                 key_terms: OnceLock::new(),
-                graph_threads: u32::try_from(kerf_core::cpu_graph_threads()).unwrap_or(1),
+                graph_threads: None,
             })
         })
     }
@@ -1668,9 +1684,9 @@ impl Compositor {
         })
     }
 
-    /// The alpha plane the compositor keys `frame` to (`chromakey.wgsl`, at the picture's own size, with this
-    /// compositor's graph threads): what a keyed layer is blended with, read back so the pass can be compared
-    /// with the filter directly.
+    /// The alpha plane the compositor keys `frame` to (`chromakey.wgsl`, at the picture's own size, with the
+    /// pinned graph threads, else an export's): what a keyed layer is blended with, read back so the pass can
+    /// be compared with the filter directly.
     pub fn chroma_key_alpha(&self, frame: &YuvFrame, key: &effects::ChromaKeyOptions) -> Result<Vec<u8>, GpuError> {
         let (w, h) = (frame.width, frame.height);
         if !frame.is_consistent() || w < 2 || h < 2 {
@@ -1685,12 +1701,21 @@ impl Compositor {
         let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("chroma key"),
         });
-        let alpha = self.chroma_key_plane(&mut enc, &planes, key);
+        let threads = self
+            .graph_threads
+            .unwrap_or_else(|| u32::try_from(kerf_core::cpu_graph_threads()).unwrap_or(1).max(1));
+        let alpha = self.chroma_key_plane(&mut enc, &planes, key, threads);
         Ok(read_texels(&self.gpu, enc, &alpha.texture, w, h, 1)?.data)
     }
 
     /// `chromakey`'s alpha plane, at the picture's size, from its chroma (`chromakey.wgsl`).
-    fn chroma_key_plane(&self, enc: &mut wgpu::CommandEncoder, planes: &[Plane; 3], key: &effects::ChromaKeyOptions) -> Plane {
+    fn chroma_key_plane(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        planes: &[Plane; 3],
+        key: &effects::ChromaKeyOptions,
+        threads: u32,
+    ) -> Plane {
         let device = &self.gpu.device;
         let (w, h) = (planes[0].w, planes[0].h);
         let words = |bits: &[u64]| -> Vec<u32> { bits.iter().flat_map(|b| [(b >> 32) as u32, *b as u32]).collect() };
@@ -1709,7 +1734,7 @@ impl Compositor {
         let params = KeyParams {
             size: [w, h],
             key: [u32::from(key.uv[0]), u32::from(key.uv[1])],
-            slices: self.graph_threads.min(h),
+            slices: threads.min(h),
             pad: [0; 3],
         };
         let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2359,7 +2384,7 @@ impl Compositor {
             // The mask is the alpha plane (`geq` rewrites it); nothing else gives the layer one but the
             // dissolve's ramp, which acts on whatever plane there is.
             let mut alpha: Option<Plane> = match &look.key {
-                Some(key) => Some(self.chroma_key_plane(&mut enc, &current, key)),
+                Some(key) => Some(self.chroma_key_plane(&mut enc, &current, key, self.graph_threads_for(plan))),
                 None => look
                     .mask
                     .as_ref()

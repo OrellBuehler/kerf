@@ -422,6 +422,90 @@ fn a_chroma_keys_alpha_is_the_references_at_any_thread_count() {
 
 #[test]
 #[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn the_key_runs_on_the_slices_of_the_graph_the_frame_stands_in_for() {
+    let a = asset(64, 36);
+    let export = u32::try_from(kerf_core::cpu_graph_threads()).unwrap();
+    let c = compositor();
+    // A paused frame of originals is the budget's graph; one of proxies or images is `single_frame_args`' one thread.
+    let mut still = plan_for(&a, Clip::new(a.id, 0.0, 1.0, 0.0));
+    assert_eq!(c.graph_threads_for(&still), export);
+    still.layers[0].source.proxy = true;
+    assert_eq!(c.graph_threads_for(&still), 1);
+    still.layers[0].source.proxy = false;
+    still.layers[0].is_image = true;
+    assert_eq!(c.graph_threads_for(&still), 1);
+    // The playback stream and an export run the budget's whatever they read.
+    let tl = timeline_of(vec![Clip::new(a.id, 0.0, 1.0, 0.0)]);
+    let planner = Planner::new(
+        &tl,
+        std::slice::from_ref(&a),
+        &ExportOptions::default(),
+        PlanRequest::motion(POLICY),
+    )
+    .unwrap();
+    let mut motion = planner.at_frame(3).unwrap();
+    motion.layers[0].source.proxy = true;
+    assert_eq!(c.graph_threads_for(&motion), export);
+    // Pinned, pinned.
+    let pinned = compositor().with_graph_threads(7);
+    assert_eq!((pinned.graph_threads_for(&still), pinned.graph_threads_for(&motion)), (7, 7));
+}
+
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn a_keyed_layer_is_blended_with_the_keys_alpha_at_an_odd_chroma_size() {
+    use kerf_gpu::effects::{self, ChromaKeyOptions};
+    let (w, h) = (98u32, 62u32);
+    let a = asset(w, h);
+    let uv = effects::chroma_key_uv([0, 128, 0]);
+    let mut frame = noise(w, h, 9);
+    let near = |c: u8, n: u8| (i32::from(c) + i32::from(n % 61) - 30) as u8;
+    frame.u = frame.u.iter().map(|n| near(uv[0], *n)).collect();
+    frame.v = frame.v.iter().rev().map(|n| near(uv[1], *n)).collect();
+    let mut c = Clip::new(a.id, 0.0, 1.0, 0.0);
+    c.effects = vec![VideoEffect::ChromaKey {
+        color: "green".into(),
+        similarity: 0.02,
+        blend: 0.2,
+    }];
+    let threads = compositor().graph_threads_for(&plan_for(&a, c.clone()));
+    let key = ChromaKeyOptions {
+        uv,
+        similarity: 0.02,
+        blend: 0.2,
+    };
+    let alpha = effects::chroma_key_plane(&frame.u, &frame.v, w, h, &key, threads);
+    // (A graded alpha, so the blend is held at many levels of it.)
+    let levels: std::collections::BTreeSet<u8> = alpha.iter().copied().collect();
+    assert!(levels.len() > 20, "{levels:?}");
+    let got = drawn_planes(&a, c, &frame, (w, h));
+    // `overlay` over the black base (Y 16, U and V 128): luma with each sample's alpha, chroma with its block's average.
+    let blend = |d: u32, s: u8, al: u32| ((d * (255 - al) + u32::from(s) * al + 128) * 257) >> 16;
+    for (i, (y, al)) in got.y.iter().zip(&alpha).enumerate() {
+        assert_eq!(u32::from(*y), blend(16, frame.y[i], u32::from(*al)), "luma sample {i}");
+    }
+    let (cw, ch) = (w as usize / 2, h as usize / 2);
+    for cy in 0..ch {
+        for cx in 0..cw {
+            let at = |dx: usize, dy: usize| u32::from(alpha[(2 * cy + dy) * w as usize + 2 * cx + dx]);
+            // (`overlay` averages what its last column and row have, as for a mask.)
+            let (right, below) = (cx + 1 < cw, cy + 1 < ch);
+            let al = if right && below {
+                (at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1)) >> 2
+            } else {
+                let ah = if right { (at(0, 0) + at(1, 0)) >> 1 } else { at(0, 0) };
+                let av = if below { (at(0, 0) + at(0, 1)) >> 1 } else { at(0, 0) };
+                (av + ah) >> 1
+            };
+            let i = cy * cw + cx;
+            assert_eq!(u32::from(got.u[i]), blend(128, frame.u[i], al), "U ({cx}, {cy})");
+            assert_eq!(u32::from(got.v[i]), blend(128, frame.v[i], al), "V ({cx}, {cy})");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
 fn a_mask_is_the_alpha_plane_blended_over_black() {
     use kerf_core::{Mask, MaskShape};
     let (w, h) = (64u32, 36u32);

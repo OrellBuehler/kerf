@@ -372,8 +372,21 @@ mod tests {
         assert!(table_unaccepted.is_empty(), "in the table but rejected: {table_unaccepted:?}");
     }
 
-    /// The other direction, for what is left out: ffmpeg really does refuse these, so keeping
-    /// them out is not squeamishness.
+    #[test]
+    fn a_colours_rgb_is_read_from_its_name_or_its_hex_digits_and_its_alpha_is_left_out() {
+        assert_eq!(color_rgb("green"), Some([0, 128, 0]));
+        assert_eq!(color_rgb("LimeGreen"), Some([50, 205, 50]));
+        assert_eq!(color_rgb("#FFAA00"), Some([255, 170, 0]));
+        assert_eq!(color_rgb("#ffaa00cc"), Some([255, 170, 0]));
+        assert_eq!(color_rgb("0x123456"), Some([0x12, 0x34, 0x56]));
+        assert_eq!(color_rgb("0xabcdef80"), Some([0xab, 0xcd, 0xef]));
+        assert_eq!(color_rgb("white@0.5"), Some([255, 255, 255]));
+        assert_eq!(color_rgb("#00ff00@0x80"), Some([0, 255, 0]));
+        for bad in ["grey", "#fff", "0XAABBCC", "white,black", "white@2", ""] {
+            assert_eq!(color_rgb(bad), None, "{bad}");
+        }
+    }
+
     #[test]
     #[ignore = "drives the ffmpeg binary"]
     fn every_colour_is_the_rgb_ffmpeg_draws_it_in() {
@@ -396,6 +409,8 @@ mod tests {
         assert_eq!(color_rgb("white,black"), None);
     }
 
+    /// The other direction, for what is left out: ffmpeg really does refuse these, so keeping
+    /// them out is not squeamishness.
     #[test]
     #[ignore = "drives the ffmpeg binary"]
     fn what_valid_color_rejects_that_looks_like_a_colour_is_refused_by_ffmpeg_too() {
