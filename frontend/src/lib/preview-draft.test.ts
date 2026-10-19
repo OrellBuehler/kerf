@@ -94,6 +94,9 @@ describe('a slider drag is drafted as the edit it writes', () => {
 		const graded = sample({ channels: [{ prop: 'brightness', keys: [{ time: 0, value: 0 }] }] });
 		expect(colorDraft(graded, 'c1', { brightness: 0.3 })).toBeNull();
 		expect(colorDraft(graded, 'c1', { saturation: 2 })).not.toBeNull();
+		const masked = sample({ mask: DEFAULT_MASK, channels: [{ prop: 'mask_x', keys: [{ time: 0, value: 0.2 }] }] });
+		expect(maskDraft(masked, 'c1', { x: 0.3 })).toBeNull();
+		expect(maskDraft(masked, 'c1', { feather: 0.3 })?.clips[0].clip.mask?.feather).toBe(0.3);
 	});
 
 	test('a clip the cut does not hold is no draft', () => {

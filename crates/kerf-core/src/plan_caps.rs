@@ -196,6 +196,9 @@ pub enum Unsupported {
     Delivery(String),
     /// The delivery is a gif, which goes through a palette the compositor does not build.
     Gif,
+    /// The delivery fits footage over a blurred copy of itself ([`crate::model::Fit::Blur`]): FFmpeg's
+    /// `boxblur` on a thumbnail scaled back up, with no compositor pass or parity case yet.
+    BlurFill,
     /// The canvas and each clip's `fps` filter parse the delivery rate to different rationals
     /// (`canvas`, `clips`), so a clip's frame slots are not the canvas's frames: the pick
     /// assumes one grid.
@@ -255,6 +258,11 @@ pub enum Unsupported {
     KeyedOpacity(LayerRef),
     /// Keyframed colour correction in an export frame (`eq` with `eval=frame`).
     KeyedColor(LayerRef),
+    /// A keyframed mask in an export frame (its `geq` reads the mask's numbers at the frame's time).
+    KeyedMask(LayerRef),
+    /// A keyframed crop (a `perspective` reading the picture through its window, in the export and
+    /// the FFmpeg still alike).
+    KeyedCrop(LayerRef),
     /// A keyframed zoom in an export frame, which FFmpeg draws as the last stage of the chain.
     KeyedZoom(LayerRef),
     /// A moving zoom with something in front of it that the compositor does not draw in FFmpeg's
@@ -301,6 +309,7 @@ impl Unsupported {
             Self::Motion => "motion",
             Self::Delivery(_) => "delivery",
             Self::Gif => "gif",
+            Self::BlurFill => "blur_fill",
             Self::PickRate { .. } => "pick_rate",
             Self::Hdr(_) => "hdr",
             Self::AlphaPicture(..) => "alpha_picture",
@@ -323,6 +332,8 @@ impl Unsupported {
             Self::Tail(_) => "tail",
             Self::KeyedOpacity(_) => "keyed_opacity",
             Self::KeyedColor(_) => "keyed_color",
+            Self::KeyedMask(_) => "keyed_mask",
+            Self::KeyedCrop(_) => "keyed_crop",
             Self::KeyedZoom(_) => "keyed_zoom",
             Self::ZoomBehind(..) => "zoom_behind",
             Self::Text => "text",
@@ -356,6 +367,7 @@ impl fmt::Display for Unsupported {
             Self::Motion => f.write_str("the plan is of an export frame (motion mode), which the compositor does not draw yet"),
             Self::Delivery(pf) => write!(f, "the delivery is {pf}, and the compositor draws 8-bit 4:2:0 only"),
             Self::Gif => f.write_str("a gif delivery goes through a palette the compositor does not build"),
+            Self::BlurFill => f.write_str("the delivery fills the frame with a blurred copy of the footage, which the compositor does not draw"),
             Self::PickRate { canvas, clips } => write!(
                 f,
                 "the delivery rate is {}/{} on the canvas and {}/{} on a clip's fps filter, which are different frame grids",
@@ -405,6 +417,14 @@ impl fmt::Display for Unsupported {
             Self::KeyedColor(l) => write!(
                 f,
                 "{l}: keyframed colour correction (an eq written per frame, which no compositor pass draws or has a parity case for yet)"
+            ),
+            Self::KeyedMask(l) => write!(
+                f,
+                "{l}: a keyframed mask (a geq alpha written per frame, which no compositor pass draws or has a parity case for yet)"
+            ),
+            Self::KeyedCrop(l) => write!(
+                f,
+                "{l}: a keyframed crop (a perspective reading the picture through its window, which no compositor pass draws)"
             ),
             Self::KeyedZoom(l) => write!(
                 f,
@@ -488,6 +508,7 @@ mod tests {
         let kinds = [
             Unsupported::Motion.kind(),
             Unsupported::Gif.kind(),
+            Unsupported::BlurFill.kind(),
             Unsupported::Text.kind(),
             Unsupported::TextWithoutFont.kind(),
             Unsupported::TextBorder.kind(),

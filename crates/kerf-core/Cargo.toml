@@ -72,6 +72,14 @@ png = "0.18"
 # and a `data:` URL is decoded the way usvg decodes it; both crates are resvg's own.
 imagesize = "0.15"
 data-url = "0.3"
+# The text engine (see text): the shaper, font reader, bidi and CSS cascade usvg already links, at
+# its versions, plus UAX #14 line breaking. Template text is set as glyph outlines with them.
+harfrust = "0.12"
+skrifa = { version = "0.44", default-features = false, features = ["std"] }
+unicode-bidi = "0.3"
+unicode-script = "0.5"
+unicode-linebreak = "0.1.5"
+simplecss = "0.2"
 ffmpeg-next = { workspace = true, optional = true }
 whisper-rs = { version = "0.16.0", optional = true }
 

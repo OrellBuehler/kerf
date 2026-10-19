@@ -197,3 +197,32 @@ keyed by its clip's transform, not by a rectangle), colour and effects, and exte
   dispatch, and `svg_layer::clip_sequences` the place that asks for pictures. The graph only needs a sequence of PNGs on the output
   grid (`ClipStamp`), so any CPU renderer fits.
 - The golden family is `title_clip_for` (cases 6400..6800); append another family rather than changing its dice.
+
+## Phase 2 as built (part 1: the engine and outlines)
+
+The text engine is `kerf-core/src/text/` (ported from EffectCraft `crates/text`, trimmed to SVG text: `face.rs`, `layout.rs`,
+`path.rs`), on the harfrust / skrifa / unicode-bidi / simplecss versions usvg already links, plus `unicode-linebreak`. The SVG
+binding is `svg/outline.rs`. Details: `core-project.md` ("Text as glyph outlines").
+
+- **Where**: `Template::prepare` and `TemplateEditInputs::prepare` (so floating titles and title clips both), as the 1b notes
+  suggested. Values always go into the **text form** (`svg::restore_text`), then `SvgDoc::outlined(db)` sets it again.
+- **Stored form**: the `<text>` renamed `<g data-kerf-text="">`, everything it had still inside, plus a generated
+  `<g data-kerf-glyphs="">` (bounding-box path, one path per glyph). Reversible byte for byte; `read_values`, `apply_values`, the
+  controls and the save dialog work unchanged. **Schema step v8**, a JSON step with no table change: the shape is the same
+  string, but an older build draws the title and cannot set its text again (it splices into the hidden runs).
+- **Fonts**: the `font-family` stays in the source, so `collect_unused_fonts` keeps a template's fonts while its controls can
+  set the text again, and the `FontSet` / cache key are unchanged. A missing font no longer changes the picture.
+- **Fidelity**: glyph origins and the bounding box match usvg's to 0.02 units, the picture to anti-aliasing. Whatever the engine
+  cannot draw exactly stays text (the list is in `outline.rs` and `core-project.md`).
+- **Wrapping**: SVG 2 `inline-size` and `white-space: pre-line` (with `line-height`) are honoured by outlines only.
+- **Golden / raster**: no graph change, `RASTER_VERSION` unchanged, no new golden family.
+
+### Left for part 2 and later
+
+- A way to set the box in the product: `inline-size` from the save dialog or inspector, and **fit** (shrink a text to its box,
+  the engine's `Layout::width` is the measure), so a long tagline wraps or fits without editing the SVG.
+- Outlining custom (non-template) titles on request ("convert text to outlines"), a Tauri command and an MCP tool.
+- More of SVG text as outlines: positioned `<tspan>` lines (`x` + `dy`), a gradient or pattern paint (one bounding box for the
+  text), decorations, right-to-left paragraphs, small caps and font features, `font-variation-settings`.
+- Phase 3 builds on the per-glyph paths: `Glyph.cluster` and `Glyph.line` give the character, word and line indices the
+  selectors need (the paths are in visual order).

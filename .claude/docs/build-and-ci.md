@@ -83,7 +83,13 @@ GPU compositor against each FFmpeg, on lavapipe); a `libav` job compiles the `ff
 `libav-render` features against the Ubuntu dev libraries.
 CI's cargo caches save only from `main` (`save-if`); PRs restore them. Saving per PR ref
 filled the 10 GB cache: the pinned FFmpeg archives `main` had just saved were gone within
-the hour, and every macOS run went back to evermeet.cx and its 429s.
+the hour, and every macOS run went back to evermeet.cx and its 429s. PR runs still missed
+that cache, so **`mirror-ffmpeg.yml`** (on a `main` push that touches the script, or
+dispatch) keeps the pins not already on GitHub as assets of the `ffmpeg-mirror`
+prerelease (`--latest=false`, so the updater feed never sees it), named
+`<sha256>-<file>` like a kept archive. `fetch-ffmpeg.mjs` tries that asset once before
+evermeet; the digest still decides. A PR that moves the macOS pin fetches from evermeet
+until it merges.
 
 **Publishing a release would open a gap in the feed**, so the workflow closes it:
 the new tag becomes `releases/latest` the moment it is published, but its

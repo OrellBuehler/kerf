@@ -104,7 +104,17 @@
   (below); v2→v3 adds the `fonts` table (below); v3→v4 adds `assets.music_score`; v4→v5 changes no table — a clip may be a
   generated title (`Clip.generator`, in the timeline JSON), and the number alone keeps an older build, which would read such a clip
   as one of missing media and drop its title on the next save, from opening the file (a JSON step: `needed` always, so the file is
-  copied aside first; `persisted/timelines-v5.json` holds a title clip). A step's `needed_to_read` says whether a build that
+  copied aside first; `persisted/timelines-v5.json` holds a title clip); v5→v6 is a JSON step for `Fit::Blur` (`"fit":"blur"`
+  in a delivery frame, a variant an older build fails on) and `StreamInfo.lead` (an asset stream's late-start offset, a field
+  an older build drops on its next write): `run` a no-op, `needed` always, `needed_to_read` false;
+  `persisted/timelines-v6.json` holds a blurred-fill cut; v6→v7 is the same kind of JSON step for keyed mask and crop numbers
+  (`Property` `mask_x`, `mask_y`, `mask_width`, `mask_height`, `mask_feather`, `crop_zoom`, `crop_x`, `crop_y` in a clip's
+  channels: variants an older build fails on, and with them the whole timeline); `persisted/timelines-v7.json` holds a cut
+  keying both; v7→v8 is a JSON step for a **new meaning** in the same shape: a template title's `svg` may hold its text as
+  glyph outlines (`<g data-kerf-text="">`, "Text as glyph outlines" below), which an older build draws but splices new values
+  into the hidden text of (its `set_template_values` reports success and nothing visible changes) and saves as a template;
+  `persisted/timelines-v8.json` holds an outlined template title. `persist_tests` pins which steps a file has pending with
+  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7]`). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2 and v4 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a
@@ -119,8 +129,8 @@
   JSON in the tables too** (timeline, history, proposal, analysis, asset streams): a change an older build
   would drop (an unknown field, at its next write) or misread (an unknown variant) is a step of its own —
   `run` a no-op (or a JSON rewrite), `needed` always (so the file is copied aside first), `needed_to_read`
-  false. `persist_tests` keeps `persisted/timelines-v<N>.json` (the sample's timeline and one of each golden
-  oracle family) for each version that moved the stored shape: every one must still read, and the newest must
+  false. `persist_tests` keeps `persisted/timelines-v<N>.json` (the sample's timeline and eight of the golden
+  oracle's) for each version that moved the stored shape: every one must still read, and the newest must
   round-trip unchanged, so moving the shape fails until a step is appended and `KERF_BLESS_PERSISTED=1`
   writes the new version's file (add it to `PERSISTED`); a tables-only step needs no file. `meta.kerf_version` is the build that made the file, `meta.last_kerf_version`
   the last one that opened it to write. **Save As is atomic** (`vacuum_into_atomic`):
@@ -466,6 +476,37 @@
     its end tag, `<x/>` is opened). `read_values` reads those same direct runs, so the value shown is the value
     a set writes (a word inside a `<tspan>` is its own control's). **The result then goes through
     `SvgDoc::parse`** (the sanitiser has the last word). An animation that animates the same attribute keeps its own values: a control sets the base.
+  * **Text as glyph outlines** (`svg/outline.rs` on the text engine `text/`; plan phase 2). `Template::prepare` and
+    `TemplateEditInputs::prepare` splice the values into the title's **text form** (`svg::restore_text`), sanitise, then
+    `SvgDoc::outlined(db)` sets each `<text>` it can as glyph paths with the fonts the title would be drawn with
+    (`fonts::svg_fontdb_with(template fonts)` on apply, `fonts::snapshot_for([svg]).db()` on a values change) and reads the
+    result again. **The form is reversible**: the element is renamed `<g data-kerf-text="">` with every attribute, text run,
+    `<tspan>` and animation still in it (none draws inside a `<g>`), plus one generated last child `<g data-kerf-glyphs="">`
+    (an invisible `fill="none" stroke="none"` path of usvg's metric bounding box, so a filter / mask region measured on the
+    group does not move, then a `<path>` per glyph; a span with its own paint gets a `<g>` with that paint around its
+    glyphs). `restore_text` renames it back and drops the generated child, byte for byte. So `read_values` / `apply_values`
+    work unchanged, `build_template` and `element_ids` restore first (a template and the save dialog see `<text>`), and the
+    kept `font-family` keeps the fonts in the project while the controls can set the text again (`collect_unused_fonts`
+    unchanged). A title draws the same with or without its fonts installed. **It draws what resvg drew** — the engine lays
+    one chunk out as usvg does (font query plus `serif` fallback, per-character fallback faces, kerning on unless CSS
+    `font-kerning: none` or `kerning="0"`, letter spacing after every cluster but the last and not in cursive scripts, word
+    spacing, `wght` / `wdth` / `ital` / `slnt` and auto `opsz` variations, `dominant-baseline`, usvg's white-space
+    trimming, its cascade through `simplecss`), pinned against usvg's glyph origins and bounding box and against the
+    picture (`svg::outline` tests). **What only outlines honour**: SVG 2 `inline-size` wraps (UAX #14, greedy, lines on the
+    anchor) and `white-space: pre-line` breaks at a newline, one `line-height` apart (`normal`: the face's ascent, descent
+    and gap). **Anything else stays text**, drawn with its font as before: positioned or nested `<tspan>`s, `textPath`,
+    `dx` / `dy` / `rotate` / `textLength` / an `x` list, a text inside `<clipPath>`, right-to-left or vertical text,
+    decorations, small caps and other font features, `font-variation-settings`, a `url()` or `context-*` paint (every glyph
+    would be its own bounding box), dashes, an animation of a layout property on it or an ancestor (or of anything but
+    paint / opacity / visibility / display / transform on itself, or of a span), a `<style>` rule that would match
+    differently once it is a `<g>` (or match a generated element), a character no installed face has, a colour glyph, or
+    outlines that would take the title over 128 KiB (nothing is outlined then). A text kept as text that uses `inline-size`
+    or `pre-line` is a warning (its lines do not wrap). A text a `<use>` instances (or one inside what it instances) stays
+    text, and so does one with non-default `shape-rendering`, a marker, or a stroke under negative `letter-spacing`. A
+    text that cannot fit the cap (24 bytes a visible character at least) is refused before it is laid out. A values change
+    outlines with the embedded fonts the **new** title names (a font control may name one the old did not).
+    `restore_text` refuses a source over the size or nesting cap before parsing it (it reads stored, unsanitised JSON). An
+    older build would splice into the hidden runs, so this is schema step v8. MCP's `get_timeline_state` shows the text form.
   * **Lock-free shape.** The zip, the fonts, the sanitiser and the poster are all outside the project lock.
     Apply: `TemplateLibrary::get(id)` (or any `Template`) → `Template::prepare(&values)` →
     `PreparedTemplate` → under the lock `Project::apply_template_parsed(prepared, start, end?, SvgLayout)`.

@@ -37,6 +37,7 @@ pub mod render_plan;
 pub mod scopes;
 pub mod svg;
 pub mod template;
+pub mod text;
 pub mod timecode;
 pub mod transcript;
 

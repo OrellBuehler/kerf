@@ -23,7 +23,7 @@ use super::source_probe::{ProbeCache, SOURCE_PROBE_TIMEOUT};
 use super::ProbeResult;
 use crate::clip_timing::{
     clip_seek, clip_source_window, is_cache_proxy, is_head_padded_proxy, transition_fx, ClipFx, ClipTiming, FadeEdge, FadeStep,
-    FadeTint, HEAD_PADDED_SUFFIX,
+    FadeTint, Rational, HEAD_PADDED_SUFFIX,
 };
 use crate::error::{Error, Result};
 use crate::model::{
@@ -4178,7 +4178,8 @@ pub struct ExportOptions {
     /// Output WxH, baked into the filtergraph. Even-clamped.
     pub resolution: Option<(u32, u32)>,
     /// How footage of a different shape is fitted to that frame — letterboxed
-    /// (the default) or filled and cropped. Only matters when the two differ.
+    /// (the default), filled and cropped, or letterboxed over a blurred copy of
+    /// itself. Only matters when the two differ.
     pub fit: Fit,
     /// Output fps, baked into the filtergraph; never emits `-r`.
     pub fps: Option<f64>,
@@ -7020,6 +7021,7 @@ fn build_filter_complex_with(
 ) -> FilterGraph {
     let has_audio = |clip: &crate::model::Clip| clip_sounds(clip, assets);
     let is_image = |clip: &crate::model::Clip| assets.iter().find(|a| a.id == clip.asset_id).is_some_and(|a| a.is_image());
+    let picture_of = |clip: &crate::model::Clip| picture_size(assets.iter().find(|a| a.id == clip.asset_id));
     let layout = fmt.channel_layout();
 
     // Assign each clip its ffmpeg input index (track-then-storage order, matching
@@ -7156,11 +7158,23 @@ fn build_filter_complex_with(
             } else {
                 format!("{input}:v")
             };
+            // A clip the blurred fill does not suit is placed with Contain's chain.
+            let contained;
+            let clip_fmt =
+                if fmt.fit == Fit::Blur && !takes_blur_fill(clip, picture_of(clip), (fmt.width, fmt.height), fx[*flat].alpha) {
+                    contained = ExportFormat {
+                        fit: Fit::Contain,
+                        ..fmt.clone()
+                    };
+                    &contained
+                } else {
+                    fmt
+                };
             chains.push(format!(
                 "[{src}]{chain}[v{flat}]",
                 chain = video_clip_chain_stamped(
                     clip,
-                    fmt,
+                    clip_fmt,
                     &fx[*flat],
                     is_image(clip),
                     plan.stamps.get(*flat).copied().flatten(),
@@ -7550,6 +7564,143 @@ fn mask_filter(mask: &Mask) -> String {
     format!(
         "geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({keep})*alpha(X,Y)'",
         keep = mask_keep_expr(mask)
+    )
+}
+
+/// The `geq` slot a keyed opacity beside a keyed mask is kept in (the mask's numbers take
+/// `0..5`, in [`Property::MASK`] order).
+const OPACITY_SLOT: usize = Property::MASK.len();
+
+/// The alpha of a clip whose mask has a keyed number: [`mask_keep_expr`] with each keyed number
+/// its curve over `geq`'s `T`, times a keyed opacity's curve when there is one (`opacity`), so a
+/// frame of it is [`mask_keep_expr`] of [`Clip::mask_at`] that moment.
+///
+/// `geq` evaluates its expression for every pixel, and a curve is a tree of comparisons, so
+/// the curves are evaluated **once a row**: at its first pixel (`X` 0) each is stored in a slot
+/// (`st`) and every other pixel reads it back (`ld`). A slice thread has its own copy of the
+/// expression and so its own slots, and walks its rows from `X` 0. A feather keyed to nothing is
+/// the hard edge a static mask with no feather gets.
+fn keyed_mask_alpha(clip: &Clip, mask: &Mask, opacity: Option<&str>) -> String {
+    let m = mask.normalized();
+    let mut stores: Vec<String> = Property::MASK
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| clip.is_keyed(**p))
+        .map(|(slot, p)| {
+            format!(
+                "st({slot},{})",
+                keyframe_expr(&clip.property_curve(*p), "T", clip.timeline_start)
+            )
+        })
+        .collect();
+    if let Some(op) = opacity {
+        stores.push(format!("st({OPACITY_SLOT},{op})"));
+    }
+    let slot = |p: Property| Property::MASK.iter().position(|q| *q == p).unwrap_or(0);
+    let n = |p: Property, v: f64| {
+        if clip.is_keyed(p) {
+            format!("ld({})", slot(p))
+        } else {
+            fnum(v)
+        }
+    };
+    let half = |p: Property, v: f64| {
+        if clip.is_keyed(p) {
+            format!("ld({})/2", slot(p))
+        } else {
+            fnum(v / 2.0)
+        }
+    };
+    let dx = format!(
+        "(X-{cx}*W)/({rw}*W)",
+        cx = n(Property::MaskX, m.x),
+        rw = half(Property::MaskWidth, m.width)
+    );
+    let dy = format!(
+        "(Y-{cy}*H)/({rh}*H)",
+        cy = n(Property::MaskY, m.y),
+        rh = half(Property::MaskHeight, m.height)
+    );
+    let d = match m.shape {
+        MaskShape::Rect => format!("max(abs({dx})\\,abs({dy}))"),
+        MaskShape::Ellipse => format!("hypot({dx}\\,{dy})"),
+    };
+    let inside = if clip.is_keyed(Property::MaskFeather) {
+        let f = n(Property::MaskFeather, m.feather);
+        format!("if(lte({f}\\,0.000001)\\,lte({d}\\,1)\\,clip((1-{d})/{f}\\,0\\,1))")
+    } else if m.feather <= 1e-6 {
+        format!("lte({d}\\,1)")
+    } else {
+        format!("clip((1-{d})/{f}\\,0\\,1)", f = fnum(m.feather))
+    };
+    let keep = if m.inverted { format!("(1-{inside})") } else { inside };
+    let op = if opacity.is_some() {
+        format!("*ld({OPACITY_SLOT})")
+    } else {
+        String::new()
+    };
+    format!(
+        "geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='if(eq(X,0),{stores},0);({keep}){op}*alpha(X,Y)'",
+        stores = stores.join("+")
+    )
+}
+
+/// The corners `perspective` (`sense=source`: the picture's points its output's corners `(0,0)` ..
+/// `(W,H)` read from) is given for the animated crop's window ([`Clip::crop_window_at`]): `side` of
+/// each side of the picture, placed by the pans in the room left over. Output pixel `x` reads the
+/// picture at `left * W + (x + 0.5) * side - 0.5` — pixel centres, as a scale reads them, so the
+/// neutral window reads every pixel where it is — which puts the top-left corner at
+/// `((1 + pan) * W / 2 - 0.5) * (1 - side)` and the bottom-right one at
+/// `W - ((1 - pan) * W / 2 + 0.5) * (1 - side)` (the same point plus `side * W`, written so each
+/// corner holds one copy of each curve). The same text for the export's curves and the still's
+/// numbers, so both evaluate one formula.
+fn crop_corners(side: &str, pan_x: &str, pan_y: &str) -> String {
+    let x0 = format!("((1+{pan_x})*W/2-0.5)*(1-{side})");
+    let y0 = format!("((1+{pan_y})*H/2-0.5)*(1-{side})");
+    let x1 = format!("W-((1-{pan_x})*W/2+0.5)*(1-{side})");
+    let y1 = format!("H-((1-{pan_y})*H/2+0.5)*(1-{side})");
+    format!("x0='{x0}':y0='{y0}':x1='{x1}':y1='{y0}':x2='{x0}':y2='{y1}':x3='{x1}':y3='{y1}'")
+}
+
+/// The `fps` ahead of a keyed crop: with its first frame's slot pinned (`start_time`, the time the
+/// chain's `setpts` puts its first frame at), so that slot is known here — `perspective` has no
+/// clock, only a count of its frames (`in`, from 1), and frame `in` is output frame
+/// `first + in - 1`. Returns the filter and that first frame: `fps` rounds `start_time`, read as
+/// whole microseconds, to its own ticks half away from zero.
+fn keyed_crop_fps(fps: f64, first: f64) -> (String, Rational, i64) {
+    let rate = Rational::from_fps_filter(fps).unwrap_or(Rational { num: 30, den: 1 });
+    let micros = (first * 1e6) as i64;
+    let slot = crate::frame_pick::rescale_near(i128::from(micros), i128::from(rate.num), 1_000_000 * i128::from(rate.den)) as i64;
+    (format!("fps=fps={fps}:start_time={first}"), rate, slot)
+}
+
+/// The `perspective` that draws a keyed crop: [`crop_corners`] of the window's curves over the
+/// time of the frame (`(first + in - 1) * den / num`, the time the graph evaluates output frame
+/// `first + in - 1` at), re-evaluated every frame. It keeps the picture's size — that is why the
+/// crop is keyed as a zoom and a pan — and reads it bilinearly, a fixed lookup per frame instead
+/// of an expression per pixel.
+fn crop_remap_filter(clip: &Clip, rate: Rational, first: i64) -> String {
+    let at = first - 1;
+    let frame = match at {
+        0 => "in".to_string(),
+        a if a > 0 => format!("in+{a}"),
+        a => format!("in-{}", -a),
+    };
+    let t = format!("(({frame})*{}/{})", rate.den, rate.num);
+    let n = |p: Property| {
+        if clip.is_keyed(p) {
+            format!("({})", keyframe_expr(&clip.property_curve(p), &t, clip.timeline_start))
+        } else {
+            fnum(p.neutral())
+        }
+    };
+    format!(
+        "perspective={}:interpolation=linear:eval=frame",
+        crop_corners(
+            &format!("(1/{})", n(Property::CropZoom)),
+            &n(Property::CropX),
+            &n(Property::CropY)
+        )
     )
 }
 
@@ -8247,6 +8398,57 @@ fn fade_filter(step: &FadeStep) -> String {
     format!("fade=t={edge}:st={}:d={}{tint}", step.st, step.d)
 }
 
+/// The [`Fit::Blur`] fit of a picture into a `w`x`h` frame (pure): split in two, the
+/// picture scaled to fit (`decrease`, with `even` and the delivery's scaler flags `sf`, as
+/// the Contain fit) over a copy scaled to cover a thumbnail an eighth of the frame on each
+/// side (even, at least 4x4), cropped to it, box-blurred twice and scaled back up — a blur of
+/// a few dozen pixels, at the cost of one on a thumbnail. `label` names the chain's inner pads,
+/// unique within its graph. Its text joins a chain like a filter:
+/// `...,split[..];...;[..][..]overlay=...,...`. Which clips take it is [`takes_blur_fill`]'s.
+///
+/// The `overlay` composes in 8-bit 4:2:0 (its default) unless `deep`: an HDR picture, fitted ahead
+/// of its tone-map, composes in 10 bits (`format=yuv420p10`, FFmpeg 4.4 on) so the fill does not
+/// band it; an SDR one keeps the default.
+fn blur_fill(w: u32, h: u32, even: &str, sf: &str, deep: bool, label: &str) -> String {
+    let (bw, bh) = ((w / 16 * 2).max(4), (h / 16 * 2).max(4));
+    // A radius above half the chroma plane is refused; a sixteenth of the thumbnail's smaller
+    // side, whole pixels (so the strength is only roughly the same from one frame size to another).
+    let radius = (bw.min(bh) / 16).max(1);
+    format!(
+        "split[{label}b][{label}f];\
+         [{label}b]scale={bw}:{bh}:force_original_aspect_ratio=increase:flags=bilinear,crop={bw}:{bh},\
+         boxblur={radius}:2,scale={w}:{h}:flags=bilinear[{label}bb];\
+         [{label}f]scale={w}:{h}:force_original_aspect_ratio=decrease{even}{sf}[{label}ff];\
+         [{label}bb][{label}ff]overlay=(W-w)/2:(H-h)/2{format}",
+        format = if deep { ":format=yuv420p10" } else { "" }
+    )
+}
+
+/// Whether `clip` takes the [`Fit::Blur`] fill in a `frame`-sized delivery (pure), its picture
+/// `picture` (the probed, displayed size) and `alpha` whether it carries an alpha channel. Only a
+/// picture placed by the plain fit that leaves bars: not one moved, scaled, rotated, cropped or
+/// animated by its transform, not a 360 reframe (which draws the frame itself), not one that is
+/// see-through (an alpha source, a chroma key, a mask: the fill would show through it as a
+/// blurred halo) and not one of the frame's own shape or of an unknown one (nothing to fill).
+/// Anything else is placed with Contain's own chain, byte for byte.
+fn takes_blur_fill(clip: &Clip, picture: Option<(u32, u32)>, frame: (u32, u32), alpha: bool) -> bool {
+    let other_shape =
+        picture.is_some_and(|(w, h)| w > 0 && h > 0 && u64::from(w) * u64::from(frame.1) != u64::from(h) * u64::from(frame.0));
+    clip.transform.is_identity()
+        && !clip.is_animated()
+        && clip.reframe.is_none()
+        && clip.mask.is_none()
+        && !alpha
+        && !clip.effects.iter().any(|e| e.produces_alpha())
+        && other_shape
+}
+
+/// The displayed size of `asset`'s picture, when it was probed.
+fn picture_size(asset: Option<&Asset>) -> Option<(u32, u32)> {
+    let stream = asset?.streams.iter().find(|s| s.kind == StreamKind::Video)?;
+    Some((stream.width?, stream.height?))
+}
+
 /// The video filter chain for one clip (everything between its `[i:v]` input
 /// and its `[v{i}]` output): trim, optional reverse / crop / retime, 360
 /// reprojection, fit or transform geometry, color correction, per-clip video
@@ -8269,7 +8471,9 @@ fn fade_filter(step: &FadeStep) -> String {
 /// between them. Every other clip keeps the chain it always had.
 ///
 /// `instance` is the clip's unique flat index, used to name its `v360` so
-/// `sendcmd` can address it; it is unused for clips that do not reframe.
+/// `sendcmd` can address it and the inner pads of a [`Fit::Blur`] fill; it is unused
+/// for clips that do neither. A `fmt` whose fit is `Blur` gives the clip the fill: the caller
+/// passes Contain for a clip that does not take it ([`takes_blur_fill`]).
 #[cfg(test)]
 fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool, instance: &str) -> String {
     video_clip_chain_stamped(clip, fmt, fx, is_image, None, instance)
@@ -8331,6 +8535,9 @@ fn video_clip_chain_stamped(
             ct = t.crop_top
         )
     });
+    // A keyed crop is a per-frame `geq` after the static one, on the timeline clock (after
+    // `setpts`), and after `fps` so it draws only the frames the export keeps.
+    let crop_keyed = clip.crop_animated();
 
     let mut p: Vec<String> = Vec::new();
     // The label is the first filter of the chain, so that all of it reads what a file tagged BT.709
@@ -8366,6 +8573,8 @@ fn video_clip_chain_stamped(
     if reframe.is_none() {
         p.extend(crop.clone());
     }
+    // A keyed crop's `fps` pins its first frame where `setpts` puts it (see `keyed_crop_fps`).
+    let (crop_fps, crop_rate, crop_first) = keyed_crop_fps(fmt.fps, clip.timeline_start + timing.picture_delay());
     if stamp.is_none() {
         // `setpts` puts the first frame kept at the clip's start; a window that starts inside a
         // late-starting source's lead keeps no frame until the source's first picture, which
@@ -8384,7 +8593,11 @@ fn video_clip_chain_stamped(
         // Hoisted above `v360` so a 50 fps source exporting at 30 reprojects 30
         // frames a second rather than reprojecting 50 and discarding 20 — each
         // of which would have rebuilt the remap LUT.
-        p.push(format!("fps={}", fmt.fps));
+        if crop_keyed {
+            p.push(crop_fps.clone());
+        } else {
+            p.push(format!("fps={}", fmt.fps));
+        }
         // `sendcmd` sits upstream of `v360`: a command takes effect as a frame
         // passes through, so downstream it would land one frame late. Both sit
         // after `setpts`, which puts the timestamps `sendcmd` matches on the
@@ -8403,6 +8616,12 @@ fn video_clip_chain_stamped(
         ));
         p.extend(crop);
     }
+    if crop_keyed {
+        if reframe.is_none() {
+            p.push(crop_fps);
+        }
+        p.push(crop_remap_filter(clip, crop_rate, crop_first));
+    }
     let sf = fmt.scale_flags();
     // `zscale` (the tone-map, which follows the geometry) refuses a picture whose size is
     // not a multiple of its chroma subsampling, and a Contain fit of 4:3 footage into a
@@ -8412,9 +8631,19 @@ fn video_clip_chain_stamped(
     // the overlay (not padded full-frame), and its zoom is re-evaluated per frame.
     let geom_identity = t.is_identity() && !anim;
     match fmt.fit {
+        // The whole picture over a blurred copy of itself that covers the frame: a
+        // full-size canvas, as the padded identity case is.
+        Fit::Blur if geom_identity => p.push(blur_fill(
+            fmt.width,
+            fmt.height,
+            if tone_mapped { ":force_divisible_by=2" } else { "" },
+            &sf,
+            tone_mapped,
+            &format!("bf{instance}"),
+        )),
         // Fit inside the frame; the identity case then pads out to full size so
         // the overlay lands on a complete canvas.
-        Fit::Contain => {
+        Fit::Contain | Fit::Blur => {
             p.push(format!(
                 "scale={w}:{h}:force_original_aspect_ratio=decrease{even}{sf}",
                 w = fmt.width,
@@ -8463,7 +8692,7 @@ fn video_clip_chain_stamped(
         }
     }
     p.push("setsar=1".to_string());
-    if reframe.is_none() {
+    if reframe.is_none() && !crop_keyed {
         p.push(format!("fps={}", fmt.fps));
     }
     // HDR → SDR, once per clip, as late as the geometry allows: after the fit
@@ -8513,6 +8742,7 @@ fn video_clip_chain_stamped(
     // filter in the chain, and two back-to-back passes would double it.
     let opacity_expr = anim_opacity.then(|| keyframe_expr(&clip.property_curve(Property::Opacity), "T", clip.timeline_start));
     match (&clip.mask, opacity_expr) {
+        (Some(mask), expr) if clip.mask_animated() => p.push(keyed_mask_alpha(clip, mask, expr.as_deref())),
         (Some(mask), Some(expr)) => p.push(format!(
             "geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({keep})*({expr})*alpha(X,Y)'",
             keep = mask_keep_expr(mask)
@@ -9217,10 +9447,27 @@ fn build_still_args_rendered(
                 &clip.effects,
                 rf.as_ref(),
                 &canvas,
-                clip.mask.as_ref(),
+                clip.mask_at(ac.local_time).as_ref(),
+                clip.crop_animated().then(|| {
+                    let local = ac.local_time;
+                    (
+                        1.0 / clip.property_at(Property::CropZoom, local),
+                        clip.property_at(Property::CropX, local),
+                        clip.property_at(Property::CropY, local),
+                    )
+                }),
                 clip.zoom_animated(),
                 &layer.fades,
-                layer.label_bt709
+                layer.label_bt709,
+                (fmt.fit == Fit::Blur
+                    && takes_blur_fill(
+                        clip,
+                        picture_size(asset_of(clip.asset_id)),
+                        (fmt.width, fmt.height),
+                        asset_of(clip.asset_id).is_some_and(Asset::has_alpha)
+                    ))
+                .then(|| format!("bf{n}"))
+                .as_deref()
             )
         ));
         let out = format!("ov{n}");
@@ -9290,6 +9537,11 @@ struct StillCanvas {
 /// it over the layers on screen, and puts it where [`video_clip_chain`] does, ahead of everything.
 ///
 /// `grade` is the clip's curves, wheels and LUT, right after the `eq`, as `video_clip_chain` places them.
+///
+/// `blur_label` names the inner pads of a [`Fit::Blur`] fill ([`blur_fill`]), unique in the graph,
+/// and is `None` for a clip the export gives none ([`takes_blur_fill`]: an animated one, whose pose
+/// is not the plain fit even where it samples to it, a see-through one, a reframe, one of the
+/// frame's own shape), which is then placed as under Contain.
 #[allow(clippy::too_many_arguments)]
 fn still_clip_chain_graded(
     tf: &Transform,
@@ -9300,9 +9552,11 @@ fn still_clip_chain_graded(
     reframe: Option<&ResolvedReframe>,
     canvas: &StillCanvas,
     mask: Option<&Mask>,
+    keyed_crop: Option<(f64, f64, f64)>,
     zoom_last: bool,
     fades: &StillFades,
     label_bt709: bool,
+    blur_label: Option<&str>,
 ) -> String {
     let StillCanvas { w: ow, h: oh, fit, sf } = canvas;
     let (ow, oh, fit) = (*ow, *oh, *fit);
@@ -9328,12 +9582,24 @@ fn still_clip_chain_graded(
         p.push(reframe_filter(r, ow, oh, PREVIEW_INTERP, None));
     }
     p.extend(crop);
+    // A keyed crop's window at this moment, through the very `perspective` the export runs it
+    // with (`crop_remap_filter`), so the still is the file's frame.
+    p.extend(keyed_crop.map(|(side, x, y)| {
+        format!(
+            "perspective={}:interpolation=linear",
+            crop_corners(&fnum(side), &fnum(x), &fnum(y))
+        )
+    }));
     // The same base fit `video_clip_chain` applies, so a Cover delivery crops in
     // the scrubbed still exactly as it will in the file. Letterboxing here while
     // the export cropped meant the one frame you look at while cutting was the
     // one shape you were never going to ship.
     match fit {
-        Fit::Contain => p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=decrease{sf}")),
+        Fit::Blur if tf.is_identity() && blur_label.is_some() => {
+            // The still tone-maps ahead of the chain: its picture is 8-bit SDR here.
+            p.push(blur_fill(ow, oh, "", sf, false, blur_label.unwrap_or_default()));
+        }
+        Fit::Contain | Fit::Blur => p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=decrease{sf}")),
         Fit::Cover => {
             p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=increase{sf}"));
             p.push(format!("crop={ow}:{oh}"));
@@ -9342,8 +9608,9 @@ fn still_clip_chain_graded(
     let mut late_zoom: Option<String> = None;
     if tf.is_identity() {
         // Cover already fills the frame; padding it would be a no-op that still
-        // costs a filter, so only the letterboxed path needs it.
-        if fit == Fit::Contain {
+        // costs a filter, so only the letterboxed path needs it (a blurred fill is the
+        // frame; a clip that does not take one is letterboxed as under Contain).
+        if fit == Fit::Contain || (fit == Fit::Blur && blur_label.is_none()) {
             p.push(format!("pad={ow}:{oh}:(ow-iw)/2:(oh-ih)/2"));
         }
     } else if (tf.scale - 1.0).abs() > 1e-9 {
@@ -9413,9 +9680,11 @@ fn still_clip_chain(
         reframe,
         canvas,
         mask,
+        None,
         zoom_last,
         fades,
         label_bt709,
+        Some("bf0"),
     )
 }
 
@@ -9689,6 +9958,10 @@ mod sweep;
 #[cfg(test)]
 mod picked;
 
+/// The blurred fill through the real `ffmpeg` (`#[ignore]`d).
+#[cfg(test)]
+mod blur_rendered;
+
 /// A source whose video starts late keeps its sync in the export (`#[ignore]`d).
 #[cfg(test)]
 mod late_start;
@@ -9706,6 +9979,10 @@ mod keyed_zoom;
 /// the export renders (`#[ignore]`d).
 #[cfg(test)]
 mod keyed_channels;
+
+/// A keyed mask and a keyed crop against the pictures the export and the still render (`#[ignore]`d).
+#[cfg(test)]
+mod keyed_mask_crop;
 
 /// Curves, wheels and a LUT against the pictures the export and the still render (`#[ignore]`d).
 #[cfg(test)]
@@ -14107,6 +14384,76 @@ mod tests {
     }
 
     #[test]
+    fn a_keyed_mask_reads_its_numbers_per_frame_and_a_static_one_is_as_it_was() {
+        use crate::model::{Property, PropertyKey};
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 2.0);
+        clip.mask = Some(Mask::default());
+        let still_graph = graph_of(&single(vec![clip.clone()]), std::slice::from_ref(&asset));
+        assert!(still_graph.contains(&mask_filter(&Mask::default())), "{still_graph}");
+        clip.set_property_keys(Property::MaskX, vec![PropertyKey::new(0.0, 0.2), PropertyKey::new(4.0, 0.8)]);
+        clip.set_property_keys(Property::MaskFeather, vec![PropertyKey::new(1.0, 0.0)]);
+        let g = graph_of(&single(vec![clip.clone()]), &[asset]);
+        // The curves once a row, at its first pixel, over the frame's own time (from the clip's
+        // start): the centre in slot 0, the feather (keyed to a hard edge here) in slot 4, read
+        // back by every pixel; the width still static; the feather behind a guard against
+        // dividing by nothing.
+        assert!(g.contains("a='if(eq(X,0),st(0,if(lt((T-2),0),0.2,"), "{g}");
+        assert!(g.contains("+st(4,0),0);"), "{g}");
+        assert!(g.contains("(X-ld(0)*W)/(0.25*W)"), "{g}");
+        assert!(g.contains("if(lte(ld(4)\\,0.000001)\\,lte("), "{g}");
+        assert!(!g.contains(&mask_filter(&Mask::default())), "{g}");
+        // Beside a keyed opacity, the opacity is in slot 5.
+        clip.set_property_keys(
+            Property::Opacity,
+            vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(2.0, 0.5)],
+        );
+        let g = graph_of(&single(vec![clip]), &[av_asset(Uuid::new_v4(), 20.0)]);
+        assert!(
+            g.contains("+st(5,if(lt((T-2),0),1,") && g.contains("*ld(5)*alpha(X,Y)'"),
+            "{g}"
+        );
+    }
+
+    #[test]
+    fn a_keyed_crop_reads_the_picture_through_its_window_after_fps_and_the_static_crop() {
+        use crate::model::{Property, PropertyKey};
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 1.0);
+        clip.transform.crop_left = 0.1;
+        clip.set_property_keys(
+            Property::CropZoom,
+            vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(2.0, 2.0)],
+        );
+        let g = graph_of(&single(vec![clip.clone()]), std::slice::from_ref(&asset));
+        let crop = g.find("crop=w=iw*0.9").expect("the static crop");
+        let setpts = g.find("setpts=").unwrap();
+        // The first frame's slot pinned at the clip's start: frame 30 of 30 fps.
+        let fps = g.find("fps=fps=30:start_time=1,").expect("the pinned fps");
+        // `perspective` counts its frames from 1: frame `in` is output frame `29 + in`, at
+        // `(in+29)/30` s, from the clip's start; a pan unkeyed is centred.
+        let window = g
+            .find("perspective=x0='((1+0)*W/2-0.5)*(1-(1/(if(lt((((in+29)*1/30)-1),0),1,")
+            .expect("the window");
+        assert!(crop < setpts && setpts < fps && fps < window, "{g}");
+        assert_eq!(g.matches(",fps=").count(), 1, "one fps: {g}");
+        assert!(g.contains(":interpolation=linear:eval=frame"), "{g}");
+        assert!(!g.contains("geq="), "{g}");
+        assert!(window < g.find("scale=").unwrap(), "the window is cut before the fit: {g}");
+        // A clip off the frame grid: `start_time` (1.02 s, slot 30.6) rounded to slot 31.
+        let mut late = clip.clone();
+        late.timeline_start = 1.02;
+        let g = graph_of(&single(vec![late]), std::slice::from_ref(&asset));
+        assert!(g.contains("((in+30)*1/30)"), "{g}");
+        // A zoom held at 1 is no crop: the chain is the static one.
+        let mut held = clip.clone();
+        held.set_property_keys(Property::CropZoom, vec![PropertyKey::new(0.0, 1.0)]);
+        held.set_property_keys(Property::CropX, vec![PropertyKey::new(0.0, 0.5)]);
+        let g = graph_of(&single(vec![held]), &[asset]);
+        assert!(!g.contains("perspective") && !g.contains("start_time"), "{g}");
+    }
+
+    #[test]
     fn opacity_uses_an_alpha_channel() {
         let asset = av_asset(Uuid::new_v4(), 20.0);
         let mut clip = make_clip(asset.id, 0.0, 10.0, 0.0);
@@ -16869,6 +17216,125 @@ mod tests {
         // The window is off-centre — a plain Cover would have taken the middle.
         assert!(chain.contains(&format!("x=iw*{}", crop.left)), "{chain}");
         assert!(crop.left < 0.3, "the subject is left of centre: {crop:?}");
+    }
+
+    #[test]
+    fn a_blurred_fill_puts_the_fitted_picture_over_a_blurred_cover_copy() {
+        assert_eq!(
+            blur_fill(1080, 1920, "", ":flags=bicubic", false, "bf0"),
+            "split[bf0b][bf0f];\
+             [bf0b]scale=134:240:force_original_aspect_ratio=increase:flags=bilinear,crop=134:240,\
+             boxblur=8:2,scale=1080:1920:flags=bilinear[bf0bb];\
+             [bf0f]scale=1080:1920:force_original_aspect_ratio=decrease:flags=bicubic[bf0ff];\
+             [bf0bb][bf0ff]overlay=(W-w)/2:(H-h)/2"
+        );
+        // A tiny frame keeps a thumbnail whose chroma plane takes a radius of 1.
+        assert!(blur_fill(40, 24, ":force_divisible_by=2", "", false, "x")
+            .contains("scale=4:4:force_original_aspect_ratio=increase:flags=bilinear,crop=4:4,boxblur=1:2"));
+        // An HDR picture composes in 10 bits ahead of its tone-map, on even sizes.
+        let fmt = ExportFormat {
+            width: 1080,
+            height: 1920,
+            fit: Fit::Blur,
+            ..ExportFormat::default()
+        };
+        let hlg = ClipFx {
+            hdr: Some(Hdr::Hlg),
+            ..ClipFx::default()
+        };
+        let deep = video_clip_chain(&make_clip(Uuid::new_v4(), 0.0, 5.0, 0.0), &fmt, &hlg, false, "c0");
+        assert!(
+            deep.contains("decrease:force_divisible_by=2[bfc0ff];[bfc0bb][bfc0ff]overlay=(W-w)/2:(H-h)/2:format=yuv420p10,"),
+            "{deep}"
+        );
+        assert!(
+            deep.find(":format=yuv420p10").unwrap() < deep.find("zscale").unwrap(),
+            "{deep}"
+        );
+        let asset = av_asset(Uuid::new_v4(), 30.0);
+        let graph = |clip: Clip, fit: Fit| {
+            let mut tl = single(vec![clip]);
+            tl.format = Some(Delivery::new(1080, 1920, fit));
+            let args = build_export_args(&tl, std::slice::from_ref(&asset), "out.mp4", &ExportOptions::default()).unwrap();
+            let at = args.iter().position(|a| a == "-filter_complex").unwrap() + 1;
+            args[at].clone()
+        };
+        let plain = make_clip(asset.id, 0.0, 5.0, 0.0);
+        let g = graph(plain.clone(), Fit::Blur);
+        assert!(
+            g.contains("[0:v]trim=start=0:end=5,setpts=PTS-STARTPTS+0/TB,split[bfc0b][bfc0f];"),
+            "{g}"
+        );
+        assert!(g.contains("[bfc0bb][bfc0ff]overlay=(W-w)/2:(H-h)/2,setsar=1,"), "{g}");
+        assert!(!g.contains("pad="), "the fill is the frame: {g}");
+        // Contain is what it was, and a clip placed by its transform gets Contain's chain.
+        let contain = graph(plain.clone(), Fit::Contain);
+        assert!(contain.contains("force_original_aspect_ratio=decrease,pad=1080:1920") && !contain.contains("boxblur"));
+        let mut pip = plain.clone();
+        pip.transform.scale = 0.5;
+        let (blurred, contained) = (graph(pip.clone(), Fit::Blur), graph(pip, Fit::Contain));
+        assert_eq!(blurred, contained);
+        // Nor does a see-through picture (the fill would show through it as a halo), a 360
+        // reframe, or a picture of the frame's own shape: Contain's graph, byte for byte.
+        let mut keyed = plain.clone();
+        keyed.effects.push(VideoEffect::ChromaKey {
+            color: "green".into(),
+            similarity: 0.1,
+            blend: 0.0,
+        });
+        let mut masked = plain.clone();
+        masked.mask = Some(crate::model::Mask::default());
+        let mut reframed = plain.clone();
+        reframed.reframe = Some(crate::model::Reframe::new(crate::model::Projection::Flat));
+        for clip in [keyed, masked, reframed] {
+            assert_eq!(graph(clip.clone(), Fit::Blur), graph(clip, Fit::Contain));
+        }
+        let fill_of = |picture, alpha| takes_blur_fill(&plain, picture, (1080, 1920), alpha);
+        assert!(fill_of(Some((1920, 1080)), false));
+        assert!(!fill_of(Some((1920, 1080)), true), "an alpha source");
+        assert!(!fill_of(Some((540, 960)), false), "the frame's own shape");
+        assert!(!fill_of(None, false) && !fill_of(Some((0, 0)), false), "an unknown shape");
+        let wide = |fit| {
+            let mut tl = single(vec![plain.clone()]);
+            tl.format = Some(Delivery::new(1920, 1080, fit));
+            build_export_args(&tl, std::slice::from_ref(&asset), "out.mp4", &ExportOptions::default()).unwrap()
+        };
+        assert_eq!(wide(Fit::Blur), wide(Fit::Contain), "nothing to fill");
+        // The scrubbed still: the same fill, labelled per layer.
+        let mut tl = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
+        tl.tracks.push(video_track(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]));
+        tl.format = Some(Delivery::new(1080, 1920, Fit::Blur));
+        let out = StillOutput::JpegPipe { quality: 2 };
+        let args = build_still_args(
+            &tl,
+            std::slice::from_ref(&asset),
+            &ExportOptions::default(),
+            1.0,
+            540,
+            None,
+            &out,
+        )
+        .unwrap();
+        let g = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        assert!(g.contains("split[bf0b][bf0f]") && g.contains("split[bf1b][bf1f]"), "{g}");
+        assert!(
+            g.contains("scale=66:120:force_original_aspect_ratio=increase:flags=bilinear,crop=66:120,boxblur=4:2,scale=540:960"),
+            "{g}"
+        );
+        // An alpha source takes no fill, in the export or the still: Contain's graphs.
+        let mut sticker = asset.clone();
+        sticker.streams[0].pix_fmt = Some("yuva420p".into());
+        let both = |fit| {
+            let mut tl = single(vec![make_clip(sticker.id, 0.0, 5.0, 0.0)]);
+            tl.format = Some(Delivery::new(1080, 1920, fit));
+            let assets = std::slice::from_ref(&sticker);
+            let opts = ExportOptions::default();
+            (
+                build_export_args(&tl, assets, "out.mp4", &opts).unwrap(),
+                build_still_args(&tl, assets, &opts, 1.0, 540, None, &out).unwrap(),
+            )
+        };
+        assert_eq!(both(Fit::Blur), both(Fit::Contain));
     }
 
     #[test]

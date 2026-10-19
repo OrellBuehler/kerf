@@ -146,6 +146,10 @@
   before the source's first picture are `Early` (nothing drawn), as in the export.
   A rate whose canvas and `fps=` parses differ (`29.970029`) is refused in Motion
   (`Unsupported::PickRate`): the pick assumes one grid.
+  A blurred-fill delivery (`Fit::Blur`) is refused whenever a layer is on screen, still and motion
+  alike (`Unsupported::BlurFill`, `size_free_reasons`): the fill is FFmpeg's `boxblur` on a thumbnail
+  with no compositor pass or parity case. `LayerGeometry` places the picture as under `Contain`, and so
+  does its port (`layer-geometry.ts`, `croppable`: the corpus replays blurred cases).
   **Traps for the `FrameSource` that will feed it** (A1b): `showinfo` pts under `-copyts
   -start_at_zero -ss` are already start-relative, so pass `start_us = 0`; use the decoder's
   best-effort timestamps (AVI has no frame pts); a streaming cursor needs `STARTPTS`, one
@@ -244,8 +248,14 @@
   **Colour and partly-keyed transforms in the plan.** `PlanLayer.color` is `Clip::color_at(local)`, sampled
   per frame (a still plan draws it like a static grade; the ZoomBehind check reads it), and a **Motion**
   plan with a keyed colour is refused (`Unsupported::KeyedColor`, until `GpuCaps::keyed_color`: the
-  file's `eq` is written per frame, and no pass or parity case draws one yet). `Animated` is `Some` for a
-  keyed transform *or* colour and `Animated.keys` (`layer_geometry::Keyed {scale, rotation, rotates,
+  file's `eq` is written per frame, and no pass or parity case draws one yet). A **keyed mask** is the same:
+  `PlanLayer.mask` is `Clip::mask_at(local)`, a still plan draws it as a static mask (the FFmpeg still draws
+  `mask_at` through the static `geq`, the compositor `mask_alpha_plane` of it), and a Motion plan is refused
+  (`Unsupported::KeyedMask`, no cap). A **keyed crop** is refused in both modes (`Unsupported::KeyedCrop`): the
+  export *and* the FFmpeg still read the picture through its window with `perspective` (fixed-point, bilinear),
+  which no compositor pass draws, and the layer's transform keeps only the static crop. `Animated.mask` /
+  `Animated.crop` say so. `Animated` is `Some` for a
+  keyed transform, colour, mask or crop and `Animated.keys` (`layer_geometry::Keyed {scale, rotation, rotates,
   opacity}`) says which transform numbers are keyed, because a clip keyed in part is not built like one
   keyed in full: a keyed zoom is a second `scale` even at 1, an unkeyed one is the static scale (a second
   scale only when it is not 1); a keyed turn is the `hypot` box, an unkeyed one the tight `rotw` box; a keyed

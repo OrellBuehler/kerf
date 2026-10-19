@@ -133,12 +133,32 @@ async function download(url) {
   }
 }
 
+// Pins not already on GitHub are mirrored as assets of this repo's
+// `ffmpeg-mirror` prerelease (`mirror-ffmpeg.yml`), named like a kept archive, and
+// tried once before the upstream mirror. A missing or altered asset falls through.
+const MIRROR = "https://github.com/OrellBuehler/kerf/releases/download/ffmpeg-mirror";
+
+async function fromMirror(name, sha256) {
+  try {
+    const res = await fetch(`${MIRROR}/${name}`, { signal: AbortSignal.timeout(120_000) });
+    if (!res.ok) return null;
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const digest = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
+    if (digest !== sha256) return null;
+    console.log(`\u2713 mirrored ${name}`);
+    return { bytes, digest };
+  } catch {
+    return null;
+  }
+}
+
 // `KERF_FFMPEG_ARCHIVES` names a directory that keeps verified archives between
 // runs (CI caches it), so a pin already fetched is never asked of a mirror again.
 // The digest is checked either way; a stale or damaged copy is fetched afresh.
 async function fetchPinned(url, sha256) {
+  const name = `${sha256}-${url.split("/").pop().replace(/[^\w.-]/g, "_")}`;
   const keep = process.env.KERF_FFMPEG_ARCHIVES;
-  const kept = keep && join(keep, `${sha256}-${url.split("/").pop().replace(/[^\w.-]/g, "_")}`);
+  const kept = keep && join(keep, name);
   if (kept && (await Bun.file(kept).exists())) {
     const bytes = new Uint8Array(await Bun.file(kept).arrayBuffer());
     const digest = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
@@ -147,7 +167,7 @@ async function fetchPinned(url, sha256) {
       return { bytes, digest };
     }
   }
-  const got = await download(url);
+  const got = (!url.startsWith("https://github.com/") && (await fromMirror(name, sha256))) || (await download(url));
   if (kept && got.digest === sha256) {
     await mkdir(keep, { recursive: true });
     await Bun.write(kept, got.bytes);

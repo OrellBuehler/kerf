@@ -402,7 +402,8 @@ export interface Keyframe {
 }
 
 /** One animatable number of a clip (kerf-core's `Property`): a transform number, a colour
- *  number, or the clip's own gain (linear). */
+ *  number, the clip's own gain (linear), a number of its mask or the animated crop (a zoom into
+ *  the picture and where its window sits). */
 export type Property =
 	| 'scale'
 	| 'pos_x'
@@ -414,7 +415,15 @@ export type Property =
 	| 'saturation'
 	| 'gamma'
 	| 'temperature'
-	| 'volume';
+	| 'volume'
+	| 'mask_x'
+	| 'mask_y'
+	| 'mask_width'
+	| 'mask_height'
+	| 'mask_feather'
+	| 'crop_zoom'
+	| 'crop_x'
+	| 'crop_y';
 
 /** One key of a property's own animation. `time` is seconds from the clip's start. */
 export interface PropertyKey {
@@ -1310,8 +1319,9 @@ export interface ExportOptions {
 	hwaccel?: string | null;
 	resolution?: [number, number] | null;
 	/** How footage of a different shape is fitted to `resolution`: letterboxed
-	 *  (`contain`, the default) or filled and cropped (`cover`). Only matters
-	 *  when the delivery aspect differs from the footage. */
+	 *  (`contain`, the default), filled and cropped (`cover`), or letterboxed over a
+	 *  blurred copy of itself (`blur`). Only matters when the delivery aspect differs
+	 *  from the footage. */
 	fit?: Fit;
 	fps?: number | null;
 	scaler?: string | null;
@@ -1373,8 +1383,9 @@ export interface SyncedByAudio {
  *  Apple -16, EBU R128 broadcast -23, all with a -1 dBTP true-peak ceiling. */
 export type LoudnessPreset = 'youtube' | 'spotify' | 'apple' | 'broadcast';
 
-/** How a clip's picture is fitted to an output frame of a different shape. */
-export type Fit = 'contain' | 'cover';
+/** How a clip's picture is fitted to an output frame of a different shape: `blur` is `contain`
+ *  over a blurred, enlarged copy of the picture (a clip placed by its transform gets plain bars). */
+export type Fit = 'contain' | 'cover' | 'blur';
 
 /** A place a finished cut gets published, mirroring `kerf_core::platform`. */
 export interface PlatformTarget {

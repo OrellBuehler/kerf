@@ -424,7 +424,34 @@ so the feature is **only** activated through these forwards — which is what ma
   fit and pads, `Cover` scales with `force_original_aspect_ratio=increase` and crops
   — which is what makes the vertical / square presets produce a usable shot rather
   than a strip of picture in a black field. It sets the *base* fit only; a clip with
-  its own transform still composes on top.
+  its own transform still composes on top. **`Blur`** is Contain over a blurred copy of the
+  same picture that covers the frame (`blur_fill`, pure): `split`, the copy scaled to *cover* a
+  thumbnail an eighth of the frame on each side (`2*floor(w/16)` x `2*floor(h/16)`, at least 4x4,
+  bilinear) and cropped to it, `boxblur=r:2` (r = a sixteenth of the thumbnail's smaller side, whole
+  pixels, at least 1 — under half the chroma plane, which `boxblur` requires — so the strength is
+  only roughly the same from one frame size to another), scaled back up bilinear, and the picture's
+  own Contain `scale` (the delivery's flags, `force_divisible_by=2` ahead of a tone-map) `overlay`'d
+  centred on it — a full-frame picture, so it takes the place of `pad`. A blur of a few dozen pixels
+  at the cost of one on a thumbnail. The inner pads are named per clip (`bf<instance>` in the export,
+  `bf<layer>` in the still); the string joins the chain like one filter
+  (`...,split[..];...;[..][..]overlay=...,setsar=1,...`). **Which clips take it** is
+  `takes_blur_fill`'s (pure), the same answer for the export and the still: a picture placed by the
+  plain fit that leaves bars. Not one moved, scaled, rotated, cropped or keyframed by its transform
+  (a picture-in-picture on its own fill is not what anyone asked for; the still asks of the clip,
+  not of its sampled pose), not a 360 reframe (it draws the frame itself), not a see-through one —
+  an alpha source (`Asset::has_alpha`, which the still is given as the export is), a chroma key, a
+  mask: the fill would show through its clear part as a blurred halo — and not one of the frame's
+  own shape or of an unprobed one (nothing to fill; it would cost ~7 ms a frame for nothing). Those
+  are given a Contain format by the caller, so their argv is Contain's byte for byte (`pad`
+  included in the still). The still's thumbnail is an eighth of the *still's* canvas. The
+  `overlay` composes in 8-bit 4:2:0 (its default) except for an HDR clip, fitted ahead of its
+  tone-map, which takes `format=yuv420p10` (FFmpeg 4.4 has it) so the fill does not band it; the
+  still tone-maps first, so it keeps the default. The GPU compositor refuses the whole frame (`Unsupported::BlurFill`, still and motion),
+  so the preview is FFmpeg's. Rendered in `cli/blur_rendered.rs` (`#[ignore]`d, 6.1 and 9.0): a
+  white / black source in a vertical frame keeps the picture, its bars are the picture blurred
+  across the edge (Contain's are black), the still draws the export's frame (3 levels at worst),
+  and a half-transparent FFV1 source renders under Blur exactly as under Contain; a 10-bit HLG ramp's
+  picture is Contain's to 2 levels (the tone-map's error diffusion), 5 with an 8-bit overlay.
   **The shape itself is a property of the project**, not of one render:
   `Timeline.format: Option<Delivery>` (`{width, height, fit}`) is the frame the cut
   is being made *for*. `export_format` applies it between the footage-derived
@@ -872,6 +899,34 @@ so the feature is **only** activated through these forwards — which is what ma
   under a moving zoom, beside a static grade and in a range export
   (`engine/cli/keyed_channels.rs`, `#[ignore]`d; without `eval=frame` it fails at the second frame). A test
   picture's luma must sit away from 128 or a `contrast` ramp does nothing visible (it pivots there).
+  **A keyed mask** is the mask's own alpha `geq` (`keyed_mask_alpha`): the same distance and feather ramp as
+  `mask_keep_expr`, but each keyed number's curve (over `geq`'s `T`) is evaluated **once a row** — at `X` 0 it is
+  stored with `st(slot,…)` (slots 0–4 in `Property::MASK` order, a keyed opacity beside it in 5) and every other
+  pixel reads `ld(slot)`; a slice thread has its own expression copy and walks its rows from `X` 0. A keyed
+  feather is guarded `if(lte(F,0.000001),lte(d,1),clip((1-d)/F,0,1))` so a feather keyed to nothing is the
+  static hard edge; a static mask's argv is untouched. **A keyed crop** is `perspective` (`crop_remap_filter`,
+  `crop_corners`; `sense=source`, `interpolation=linear`, `eval=frame`) reading the picture through the window of
+  `Clip::crop_window_at`: `S = 1/zoom`, top-left corner `((1+pan)*W/2-0.5)*(1-S)`, bottom-right
+  `W-((1-pan)*W/2+0.5)*(1-S)` (pixel centres; each corner holds one copy of each curve). It is placed after the
+  static `crop` and `setpts`, before the fit `scale` (source resolution, the picture keeps its size).
+  `perspective` has no clock, only its frame count `in` (from 1), so the `fps` ahead of it is hoisted there
+  **with `start_time` pinned** to the chain's first timeline time (`keyed_crop_fps`): `fps` rounds it (whole
+  microseconds) to its own ticks half away from zero (`frame_pick::rescale_near`), so frame `in` is output frame
+  `k0 + in - 1` at time `(k0 + in - 1) * den / num`. The FFmpeg still runs the same `crop_corners` text with the
+  numbers of that moment. A crop whose zoom never leaves 1 is not animated (`crop_animated`) and writes nothing.
+  **Cost, measured on FFmpeg 6.1** (12 frames of 4K `testsrc2` scaled to 1080p for the crop, 1080p for the mask,
+  three eased keys per number): a keyed crop as a per-pixel `geq` took 241.6 s, as `perspective` 1.9 s (a fixed
+  lookup table per frame); a keyed mask with its curves per pixel 43.2 s, once a row 7.7 s, against 6.45 s for
+  the static mask. The graph grows with the keys: each curve is a balanced `if` tree, written 8 times (once per
+  corner coordinate) for the crop's zoom and 4 times for each pan — about 2.2 MB of graph (spilled to a file
+  like any long graph) with 100 eased keys on all three.
+  **Parity, measured on FFmpeg 6.1** (`engine/cli/keyed_mask_crop.rs`, `#[ignore]`d; 4.4 and 9.0 were not
+  available where it was written): a keyed mask's every fifth output frame is within 4 levels (mean ≤ 0.4) of the
+  still of the same moment, which draws `mask_at` through the static `geq` (centre, size, feather to a hard edge
+  and back, an inverted ellipse, beside a keyed opacity, speed 2, reversed, late, a range export); a keyed crop
+  puts a box within 1 px of where the window of that moment says on **every** output frame, and on detailed
+  content (`testsrc2`) every fifth frame is ≥ 50 dB PSNR and within 8 levels of the still (zoom, pan at a held
+  zoom, on top of a static crop, speed 2, reversed, late and off the frame grid, a range export).
   **A keyed volume** is `asetnsamples=n=128:p=0,volume='…':eval=frame` placed *after* `atempo`, so its `t`
   is the clip's own playing time (checked at speed 0.5 / 2, reversed, late on the timeline, range
   export). `volume` holds one gain for a whole frame and decoders hand over 1024 samples (21 ms) — a fade
@@ -932,7 +987,10 @@ so the feature is **only** activated through these forwards — which is what ma
   sans-serif and for the family nothing has, so text never vanishes; an embedded face is loaded first so it beats an installed one of
   the same family — a template's typeface wins on the machine that also has another build of it; `fonts::replace_embedded` /
   `register_embedded` change the registered set, a `FontSet` is immutable and builds its database once, on first use, outside the
-  registry's lock (the one built for the process when no embedded font is named); an `<image>` `href` that is not `data:` is
+  registry's lock (the one built for the process when no embedded font is named); a template title's text is already glyph
+  paths (`svg/outline.rs`, `core-project.md` "Text as glyph outlines"), so it draws the same whatever is installed — its source
+  still names its families, so its `FontSet` and key are what they were, and nothing in the raster path or the graph changed
+  (`RASTER_VERSION` and the golden stand); an `<image>` `href` that is not `data:` is
   nothing (no file read, no network), `resources_dir` is `None`, and a `data:` image is decoded only after its **header** says it
   is within 16 Mpx (`svg/images.rs`: `imagesize`, the crate usvg sizes with; the decoders allocate what the header claims, so
   60,000 x 60,000 bytes-of-header aborted the process) — the resolver answers "nothing" for one that is not, whatever the

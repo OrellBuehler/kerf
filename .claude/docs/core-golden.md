@@ -25,14 +25,22 @@
   exported at two or three delivery frames by one run (`together_for`, on dice of its own: framings on the clips,
   titles on every other case, captions and chapters to mux on a quarter, the encode made one the run takes, every
   tenth an audio-only container that none does; their export text is `together::build_together_args` plus its
-  `sinks_from_end`; families `together-*`) and **400 more** with titles on tracks (`title_clip_for`, on dice seeded by
+  `sinks_from_end`; families `together-*`), **400 more** with titles on tracks (`title_clip_for`, on dice seeded by
   the case, the same four artworks: after the last clip of the lowest video track — touching it under a transition of any
   kind or across a gap — or over the cut on a video track of their own, some head-trimmed, faded or placed; the title
   cases get none of the SVG, gif, playhead or multi-delivery tweaks of the families before; families `title-clip-held`,
   `preview-title-clip-held` and the structural `title-clip`, `title-clip-dip`, `title-clip-under-transition`,
-  `still-title-clip`, `preview-title-clip`; appending them moved none of the first 6800 cases), have their
+  `still-title-clip`, `preview-title-clip`; appending them moved none of the first 6800 cases) and **400 more** with a
+  blurred fill (`Fit::Blur` on the export options and on the delivery frame when the cut has one, no dice, no titles; an
+  HDR clip's fill composes in `yuv420p10`; families `blur-fill`, `still-blur-fill`, `preview-blur-fill`, needle `boxblur=`:
+  appending it added four block lines a file and moved none of the first 7200 cases; each appended family is bounded to
+  its own range of cases) and **400 more** with a keyed mask or crop (`mask_crop_for`, on dice seeded by case and
+  clip, without titles or a second delivery frame: some mask numbers keyed on a mask the clip had or was given, a
+  feather keyed to nothing in places, the crop's zoom and pan each with its own chance; families `mask-keyed`,
+  `mask-keyed-feather`, `preview-mask-keyed`, `crop-keyed`, `preview-crop-keyed`; the first 7600 digests did not
+  move, 4 block lines appended to each file), have their
   `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
-  FNV-1a digests, committed as 72 block digests each in
+  FNV-1a digests, committed as 80 block digests each in
   `engine/cli/golden/{export,still,preview}.txt` (LF: `.gitattributes`, and the comparison
   ignores `\r`). A refactor of the graph builders must leave all three untouched; an
   intended argv change moves the files of the builders it touched. (`build_proxy_args` and

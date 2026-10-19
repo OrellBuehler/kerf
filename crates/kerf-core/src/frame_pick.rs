@@ -146,7 +146,7 @@ impl Pick {
 }
 
 /// `av_rescale_rnd(a, b, c, AV_ROUND_NEAR_INF)` for `c > 0`: `a * b / c`, halves away from zero.
-fn rescale_near(a: i128, b: i128, c: i128) -> i128 {
+pub(crate) fn rescale_near(a: i128, b: i128, c: i128) -> i128 {
     let n = a * b;
     if n >= 0 {
         (n + c / 2) / c

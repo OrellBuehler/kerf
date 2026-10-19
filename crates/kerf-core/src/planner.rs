@@ -304,18 +304,22 @@ impl Planner {
                 fades: timing.fades(),
                 keys: timing.motion_keys(),
                 tail: fx.tail > 0.0,
-                animated: (clip.is_animated() || clip.color_animated()).then(|| Animated {
-                    keys: clip.is_animated().then(|| Keyed {
-                        scale: clip.is_keyed(Property::Scale),
-                        rotation: clip.is_keyed(Property::Rotation),
+                animated: (clip.is_animated() || clip.color_animated() || clip.mask_animated() || clip.crop_animated()).then(
+                    || Animated {
+                        keys: clip.is_animated().then(|| Keyed {
+                            scale: clip.is_keyed(Property::Scale),
+                            rotation: clip.is_keyed(Property::Rotation),
+                            rotates: clip.property_keys(Property::Rotation).iter().any(|k| k.value != 0.0),
+                            opacity: clip.is_keyed(Property::Opacity),
+                        }),
                         rotates: clip.property_keys(Property::Rotation).iter().any(|k| k.value != 0.0),
-                        opacity: clip.is_keyed(Property::Opacity),
-                    }),
-                    rotates: clip.property_keys(Property::Rotation).iter().any(|k| k.value != 0.0),
-                    opacity: clip.property_keys(Property::Opacity).iter().any(|k| k.value < 1.0),
-                    zooms: clip.zoom_animated(),
-                    color: clip.color_animated(),
-                }),
+                        opacity: clip.property_keys(Property::Opacity).iter().any(|k| k.value < 1.0),
+                        zooms: clip.zoom_animated(),
+                        color: clip.color_animated(),
+                        mask: clip.mask_animated(),
+                        crop: clip.crop_animated(),
+                    },
+                ),
                 effects,
             });
         }
@@ -630,7 +634,7 @@ impl Planner {
                     projection: asset.projection,
                     hdr: planned.hdr,
                     effects: planned.effects.clone(),
-                    mask: clip.mask.map(|m| m.normalized()),
+                    mask: clip.mask_at(local),
                     reframe,
                     fx: LayerFx {
                         fades: planned.fades.clone(),
@@ -1575,6 +1579,16 @@ mod tests {
             ..opts(30.0)
         };
         assert!(has(&at(PlanMode::Motion, &gif), |u| matches!(u, Unsupported::Gif)));
+        // A blurred fill is FFmpeg's, in a still as in an export frame.
+        let blur = ExportOptions {
+            resolution: Some((1080, 1920)),
+            fit: Fit::Blur,
+            ..opts(30.0)
+        };
+        for mode in [PlanMode::Still, PlanMode::Motion] {
+            assert!(has(&at(mode, &blur), |u| matches!(u, Unsupported::BlurFill)));
+            assert!(!has(&at(mode, &opts(30.0)), |u| matches!(u, Unsupported::BlurFill)));
+        }
         // A zoom that moves is the last stage of the export's chain (`keyed_zoom.rs`), which
         // the compositor does not order that way yet.
         let mut zoom = make_clip(assets[0].id, 0.0, 4.0, 0.0);
@@ -1765,6 +1779,59 @@ mod tests {
             .at_frame(60)
             .unwrap();
         assert!(plan.layers[0].animated.is_none());
+    }
+
+    #[test]
+    fn a_keyed_mask_is_sampled_per_frame_and_a_keyed_crop_is_refused_in_every_frame() {
+        use crate::model::{Mask, Property, PropertyKey};
+        let a = asset();
+        let assets = [a.clone()];
+        let mut clip = make_clip(a.id, 0.0, 4.0, 1.0);
+        clip.mask = Some(Mask::default());
+        clip.transform.crop_left = 0.2;
+        clip.set_property_keys(Property::MaskX, vec![PropertyKey::new(0.0, 0.2), PropertyKey::new(2.0, 0.8)]);
+        clip.set_property_keys(
+            Property::CropZoom,
+            vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(2.0, 3.0)],
+        );
+        let tl = single(vec![clip.clone()]);
+        // Frame 60 of 30 fps is t = 2.0, a second into the clip: halfway along both ramps.
+        let still = planner(&tl, &assets, PlanMode::Still, &opts(30.0)).at_frame(60).unwrap();
+        let motion = planner(&tl, &assets, PlanMode::Motion, &opts(30.0)).at_frame(60).unwrap();
+        for plan in [&still, &motion] {
+            let layer = &plan.layers[0];
+            assert!((layer.mask.unwrap().x - 0.5).abs() < 1e-9, "{:?}", layer.mask);
+            // The static crop is the layer's; the keyed window is not folded into it.
+            assert_eq!(layer.transform, clip.transform);
+            let animated = layer.animated.unwrap();
+            assert!(animated.mask && animated.crop && animated.keys.is_none() && !animated.color);
+        }
+        // A still draws the sampled mask like a static one; the crop is FFmpeg's `perspective` in a
+        // still too, so it is refused in both.
+        let why = |plan: &RenderPlan| plan.reasons(&GpuCaps::A0, plan.size(u32::MAX));
+        let still_why = why(&still);
+        assert!(!has(&still_why, |u| matches!(u, Unsupported::KeyedMask(_))));
+        assert!(has(&still_why, |u| matches!(u, Unsupported::KeyedCrop(_))));
+        let motion_why = why(&motion);
+        assert!(has(&motion_why, |u| matches!(u, Unsupported::KeyedMask(_))));
+        assert!(has(&motion_why, |u| matches!(u, Unsupported::KeyedCrop(_))));
+        // A crop whose zoom never leaves 1 is no keyed crop.
+        let mut held = clip.clone();
+        held.mask = None;
+        held.channels.clear();
+        held.set_property_keys(Property::CropZoom, vec![PropertyKey::new(0.0, 1.0)]);
+        held.set_property_keys(Property::CropX, vec![PropertyKey::new(0.0, 0.5)]);
+        let plan = planner(&single(vec![held]), &assets, PlanMode::Motion, &opts(30.0))
+            .at_frame(60)
+            .unwrap();
+        assert!(plan.layers[0].animated.is_none());
+        // A mask's keys without a mask key nothing, and a static mask is no keyed one.
+        let mut bare = make_clip(a.id, 0.0, 4.0, 1.0);
+        bare.set_property_keys(Property::MaskX, vec![PropertyKey::new(0.0, 0.2), PropertyKey::new(2.0, 0.8)]);
+        let plan = planner(&single(vec![bare]), &assets, PlanMode::Motion, &opts(30.0))
+            .at_frame(60)
+            .unwrap();
+        assert!(plan.layers[0].animated.is_none() && plan.layers[0].mask.is_none());
     }
 
     #[test]

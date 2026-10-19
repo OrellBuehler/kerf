@@ -12,6 +12,7 @@ import { popout } from './popout.svelte';
 import { toast } from './notifications.svelte';
 import { holdForPreview, report } from './ops';
 import type { MenuCommand } from './menus';
+import type { Fit } from './types';
 
 /** Cut the project for a delivery frame (`null`: follow the footage). Changing it
  *  reshapes the preview, the scrubbed still and the export together, so the
@@ -23,6 +24,18 @@ export async function setDeliveryPreset(id: string): Promise<void> {
 	try {
 		await editor.setDeliveryFormat(p.format);
 		toast.success(p.format ? `Cutting for ${p.label} (${fitLabel(p.format.fit)})` : 'Following the footage');
+	} catch (err) {
+		report(err);
+	}
+}
+
+/** Keep the delivery frame and change how footage of another shape meets it. */
+export async function setDeliveryFit(fit: Fit): Promise<void> {
+	const format = editor.timeline.format;
+	if (!format || format.fit === fit || holdForPreview()) return;
+	try {
+		await editor.setDeliveryFormat({ ...format, fit });
+		toast.success(`Footage now ${fitLabel(fit)}`);
 	} catch (err) {
 		report(err);
 	}

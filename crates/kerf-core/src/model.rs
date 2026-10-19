@@ -1561,8 +1561,14 @@ pub struct Mask {
     pub inverted: bool,
 }
 
+/// The feather a new mask gets.
+pub const DEFAULT_MASK_FEATHER: f64 = 0.15;
+/// The smallest and largest a mask's side may be, as a fraction of the frame.
+pub const MIN_MASK_SIZE: f64 = 0.01;
+pub const MAX_MASK_SIZE: f64 = 2.0;
+
 fn default_feather() -> f64 {
-    0.15
+    DEFAULT_MASK_FEATHER
 }
 
 impl Default for Mask {
@@ -1588,8 +1594,8 @@ impl Mask {
             shape: self.shape,
             x: clamp01(self.x),
             y: clamp01(self.y),
-            width: finite_or(self.width, 0.5).clamp(0.01, 2.0),
-            height: finite_or(self.height, 0.5).clamp(0.01, 2.0),
+            width: finite_or(self.width, 0.5).clamp(MIN_MASK_SIZE, MAX_MASK_SIZE),
+            height: finite_or(self.height, 0.5).clamp(MIN_MASK_SIZE, MAX_MASK_SIZE),
             feather: clamp01(self.feather),
             inverted: self.inverted,
         }
@@ -4027,7 +4033,8 @@ impl Marker {
 /// which is right when the delivery matches the footage and wrong the moment it
 /// doesn't: a 16:9 shot rendered at 1080x1920 becomes a 1080x608 strip in a
 /// mostly-black frame — technically the whole picture, and not something anyone
-/// would post. `Cover` fills the frame and throws away the overflow instead.
+/// would post. `Cover` fills the frame and throws away the overflow instead; `Blur`
+/// keeps the whole picture and fills the bars with a blurred, enlarged copy of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Fit {
@@ -4037,6 +4044,11 @@ pub enum Fit {
     Contain,
     /// Scale to cover the frame and crop what hangs over the edges.
     Cover,
+    /// `Contain` over a blurred copy of the same picture scaled to cover the frame: the
+    /// whole shot, with the bars filled by its own colours (the vertical-video habit for
+    /// landscape footage). A clip whose geometry is not the plain fit (scaled, moved,
+    /// rotated, cropped or animated) is placed as under `Contain`, with no fill.
+    Blur,
 }
 
 impl Fit {
@@ -4044,6 +4056,7 @@ impl Fit {
         match self {
             Fit::Contain => "contain",
             Fit::Cover => "cover",
+            Fit::Blur => "blur",
         }
     }
 }
@@ -4063,7 +4076,8 @@ pub struct Delivery {
     pub width: u32,
     pub height: u32,
     /// How footage of a different shape meets that frame. `Cover` is the useful
-    /// default for a reframed delivery; `Contain` keeps the whole picture.
+    /// default for a reframed delivery; `Contain` keeps the whole picture, and `Blur`
+    /// keeps it over a blurred copy of itself.
     #[serde(default)]
     pub fit: Fit,
 }
