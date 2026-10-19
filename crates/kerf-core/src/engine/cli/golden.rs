@@ -1016,6 +1016,15 @@ fn hw_encoder_for(n: usize) -> &'static str {
     ["h264_amf", "hevc_amf", "av1_amf", "h264_vaapi", "hevc_vaapi", "av1_vaapi"][n % 6]
 }
 
+/// One timeline of each family: what `project::persist_tests` freezes as the shape a file stores.
+pub(crate) fn sample_timelines() -> Vec<Timeline> {
+    let assets = pool();
+    [0, 4, CASES + MASTER_CASES, CASES + MASTER_CASES + 1, SVG_FIRST, TITLE_FIRST]
+        .into_iter()
+        .map(|i| case(i, &assets).timeline)
+        .collect()
+}
+
 struct Case {
     timeline: Timeline,
     opts: ExportOptions,

@@ -27,6 +27,14 @@ struct Migration {
 /// `PRAGMA user_version` was used — the legacy baseline. Append one step per change; never edit
 /// a shipped one. Steps run after `SCHEMA` has created any table the file lacked, so each must
 /// tolerate that (`IF NOT EXISTS`, probe before `ALTER`).
+///
+/// The version covers **the JSON the tables hold** too (timeline, history, proposal, analysis, asset
+/// streams): every shipped build since 0.26 refuses a newer version, while one that is let in drops a
+/// field it does not know at its next write and fails on a variant it does not know. So a change an
+/// older build would drop or misread (a new field, a new variant, a new meaning) is a step of its own:
+/// `run` does nothing (or rewrites the JSON), `needed` is always true (the file is copied aside before
+/// the older build is locked out of it) and `needed_to_read` false. `persist_tests` keeps a timeline
+/// per version and fails when the stored shape moves without one.
 const MIGRATIONS: &[Migration] = &[
     Migration {
         run: v0_to_v1,
@@ -141,13 +149,13 @@ fn v3_to_v4_needed(conn: &Connection) -> bool {
 /// v5: a clip on a video track may be a generated title (`Clip.generator`, in the timeline's JSON).
 /// Nothing in the file's tables changes, so the step writes nothing but the number; the number is what
 /// keeps an older build, which would read such a clip as one of missing media and drop its title on the
-/// next save, from opening the file.
+/// next save, from opening the file. Needed always, so the file is copied aside before that happens.
 fn v4_to_v5(_conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
 fn v4_to_v5_needed(_conn: &Connection) -> bool {
-    false
+    true
 }
 
 /// The steps from `found` on that would change this file.
