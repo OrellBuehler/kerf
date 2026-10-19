@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { clipKind, duplicateBlocked, lockedReason, pastePlacements } from './track-locks';
+import { clipKind, duplicateBlocked, landingLocks, lockedReason, pastePlacements } from './track-locks';
 import type { Clip, Timeline } from './types';
 
 const clip = (id: string, start = 0) => ({ id, asset_id: 'a', source_in: 0, source_out: 1, timeline_start: start, volume: 1, fade_in: 0, fade_out: 0 }) as Clip;
@@ -65,5 +65,19 @@ describe('a clip whose track is gone', () => {
 		expect(clipKind(gone('y', 'missing').clip, assets)).toBeNull();
 		const refused = pastePlacements(cut(), [gone('x', 'a')], assets);
 		expect('reason' in refused && refused.reason).toContain('does not say which kind of track');
+	});
+});
+
+describe('a forced accept keeps the user’s locks', () => {
+	test('an inherited lock the user lifted stays lifted; one the proposal added, and the user’s own, hold', () => {
+		const base = cut({ v1: true });
+		const live = cut({ a1: true });
+		const landing = cut({ v1: true, v2: true });
+		landingLocks(landing, base, live);
+		expect(landing.tracks.map((t) => [t.name, !!t.locked])).toEqual([
+			['V1', false],
+			['V2', true],
+			['A1', true]
+		]);
 	});
 });

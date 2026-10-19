@@ -67,6 +67,29 @@ describe('a locked track', () => {
 		expect(() => ops.insertClips(t, known, [{ track_id: 'a1', clip: sound }], 0)).not.toThrow();
 	});
 
+	test('a title goes on no audio track, and footage with both goes on either', () => {
+		const t = cut(false);
+		t.tracks.push({ id: 'a1', kind: 'audio', name: 'A1', locked: false, clips: [] } as never);
+		const known = { ...env, asset: () => ({ name: 'a', duration: 60, streams: [{ kind: 'video' }, { kind: 'audio' }] }) };
+		const title = { ...clip('t', 0, 0), generator: { kind: 'svg' } } as never as Clip;
+		expect(() => ops.insertClips(t, known, [{ track_id: 'a1', clip: title }], 0)).toThrow('a clip with no sound cannot go on audio track A1');
+		expect(() => ops.insertClips(t, known, [{ track_id: 'a1', clip: clip('x', 0, 0) }], 0)).not.toThrow();
+		expect(() => ops.insertClips(t, known, [{ track_id: 'v2', clip: clip('y', 0, 0) }], 0)).not.toThrow();
+	});
+
+	test('a clip is added to a named track only of its kind, and a duplicate stays where it is', () => {
+		const t = cut(false);
+		t.tracks.push({ id: 'a1', kind: 'audio', name: 'A1', locked: false, clips: [] } as never);
+		const music = { id: 'm', name: 'm', duration: 9, streams: [{ kind: 'audio' }] } as never;
+		expect(() => ops.addClip(t, env, music, 'v2', 0, 1, 0)).toThrow('a clip with no picture cannot go on video track V2 — add it to a track of its kind');
+		expect(() => ops.addClip(t, env, music, 'a1', 0, 1, 0)).not.toThrow();
+		// A sound already on a video track (an older project's) is duplicated where it is.
+		t.tracks[1].clips.push({ ...clip('s', 0, 0), asset_id: 'm' } as Clip);
+		const known = { ...env, asset: () => ({ name: 'm', duration: 9, streams: [{ kind: 'audio' }] }) };
+		const dup = ops.duplicateClips(t, known, ['s'], 20);
+		expect(dup.timeline.tracks[1].clips.map((c) => c.id)).toContain(dup.result[0].id);
+	});
+
 	test('the sound of an asset gets a track of its own when every audio track is locked', () => {
 		const t = cut(false);
 		t.tracks.push({ id: 'a1', kind: 'audio', name: 'A1', locked: true, clips: [] } as never);
