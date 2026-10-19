@@ -281,7 +281,8 @@
 	function exportFailed(e: unknown) {
 		const m = msg(e);
 		// A user-requested stop is not a failure — keep the dialog open quietly.
-		if (m === 'export cancelled') toast.info('Export cancelled');
+		// A stopped single pass of several files says it removed them all.
+		if (m.startsWith('export cancelled')) toast.info('E' + m.slice(1));
 		else toast.error(failure('Export failed', e));
 	}
 	async function render(finalOpts: ExportOptions) {

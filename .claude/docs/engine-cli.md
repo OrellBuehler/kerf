@@ -503,7 +503,13 @@ so the feature is **only** activated through these forwards — which is what ma
   `build_together_args` (pure) builds each variant's graph with the export's own
   `build_filter_complex_with` over `for_delivery` + `export_timeline`, then `relabel`s it into a
   namespace (`d<k>_…`; the scanner reads a `[` as ffmpeg's parser does — not quoted, not escaped —
-  and a golden test reads every corpus graph back unchanged through it). The clips' inputs must be
+  and a golden test reads every corpus graph back unchanged through it). Filter **instance names**
+  are not labels, so they are named apart at the build (`build_filter_complex_with`'s `instances`,
+  empty for every graph that runs alone): frame `k > 0` names a keyed reframe `v360@d<k>c3` and its
+  `sendcmd` targets that name — `sendcmd` delivers to the first instance of a name only, so a shared
+  `v360@c3` left every other frame's camera at its static pose. The first frame keeps the single
+  export's names. `v360` is the only commanded instance the export graph has (`ebur128@` is the
+  metered graph's, `drawtext` / `volume` take no commands). The clips' inputs must be
   the same argv for every variant (they are: `for_delivery` moves crops and captions only), and each
   input picture read by more than one graph is decoded once and `[N:v]split=K[inN_k]`; the mix is
   the first variant's alone, `[d0_outa]asplit=K[mixk]`, so every file carries the same samples.
@@ -511,6 +517,7 @@ so the feature is **only** activated through these forwards — which is what ma
   captions / chapters inputs come once after those and are mapped into every output, and each
   output gets `push_output_opts` (the tail `build_export_args_phase` shares) and its path;
   `sinks_from_end` locates the outputs after `tune_inputs` and the spill move the indices.
+  `render_variants` returns a `VariantsRun` (status, files completed, whether one run wrote them).
   `render_together` follows `render_with_progress` once for the lot (hwaccel request, titles drawn
   per frame, side files once, sidecars checked first and written after, the software rerun,
   `discard_partial` of every output on anything but `Completed`), and runs through
@@ -524,7 +531,8 @@ so the feature is **only** activated through these forwards — which is what ma
   first 6400 cases; its `together-*` family appends 400 cases of this builder). Rendered
   (`cli/together_rendered.rs`, `#[ignore]`d): x264 `-crf 0` + FLAC in Matroska from two clips with
   sound, a 9:16 framing and an animated title, whole and as a range — every `framemd5` line of
-  each file equals the variant rendered alone; a stop removes all three files, a stop before the
+  each file equals the variant rendered alone, and so does every file of a keyed 360 reframe
+  (`a_keyed_reframe_pans_in_every_file`); a stop removes all three files, a stop before the
   run spares the files already there. The x264 output of a lossy encode is not compared (the
   encoder threads differ between the two runs).
   **Levels** (`Project::levels_inputs` → static `measure_levels` → `engine::mix_levels`,

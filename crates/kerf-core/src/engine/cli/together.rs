@@ -167,6 +167,7 @@ pub(super) fn build_together_args(
                 &plan,
                 false,
                 Some(&titles[k]),
+                &if k == 0 { String::new() } else { format!("d{k}") },
             )
         })
         .collect();
@@ -381,12 +382,15 @@ mod tests {
         (timeline_of(vec![video_track(vec![clip])]), vec![asset])
     }
 
+    /// Named as `ExportVariant::beside` names them, spelled out so the argv is the same on every OS.
     fn variants() -> Vec<ExportVariant> {
-        let base = Path::new("/out/cut.mp4");
-        vec![
-            ExportVariant::beside(base, Delivery::new(1080, 1920, Fit::Cover)),
-            ExportVariant::beside(base, Delivery::new(1080, 1080, Fit::Cover)),
-        ]
+        [(1080, 1920, "9x16"), (1080, 1080, "1x1")]
+            .into_iter()
+            .map(|(w, h, shape)| ExportVariant {
+                delivery: Delivery::new(w, h, Fit::Cover),
+                output: PathBuf::from(format!("/out/cut-{shape}.mp4")),
+            })
+            .collect()
     }
 
     #[test]
@@ -475,6 +479,49 @@ mod tests {
             });
             assert!(graph.contains(&moved), "variant {k}: {moved}\nnot in {graph}");
         }
+    }
+
+    #[test]
+    fn each_frame_commands_its_own_reframe() {
+        let mut stream = video_stream(1024, 512, 30.0);
+        stream.projection = Some(crate::model::Projection::Equirect);
+        let mut asset = av_asset(uuid::Uuid::new_v4(), 10.0);
+        asset.streams = vec![stream];
+        let mut clip = Clip::for_asset(&asset, 0.0, 4.0, 0.0);
+        let key = |time, yaw| crate::model::ReframeKeyframe {
+            time,
+            yaw,
+            pitch: 0.0,
+            roll: 0.0,
+            fov: 100.0,
+        };
+        clip.reframe.as_mut().expect("a 360 clip reframes").keyframes = vec![key(0.0, 0.0), key(4.0, 90.0)];
+        let timeline = timeline_of(vec![video_track(vec![clip])]);
+        let assets = vec![asset];
+        let variants = variants();
+        let built = build_together_args(&timeline, &assets, &variants, &ExportOptions::default())
+            .unwrap()
+            .unwrap()
+            .args;
+        let graph = &built[built.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        for name in ["v360@c0", "v360@d1c0"] {
+            assert_eq!(graph.matches(&format!("{name}=")).count(), 1, "{name}: {graph}");
+            assert!(graph.contains(&format!("{name} yaw")), "{name} is commanded: {graph}");
+        }
+        // The first frame's graph is the one it exports alone, instance names and all.
+        let single = build_export_args(
+            &timeline.for_delivery(variants[0].delivery),
+            &assets,
+            "/x.mp4",
+            &variant_opts(&ExportOptions::default(), variants[0].delivery),
+        )
+        .unwrap();
+        let own = &single[single.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        let moved = relabel(own, |l| match input_pad(l) {
+            Some(_) => "in0_0".to_string(),
+            None => format!("d0_{l}"),
+        });
+        assert!(graph.contains(&moved), "{moved}\nnot in {graph}");
     }
 
     #[test]

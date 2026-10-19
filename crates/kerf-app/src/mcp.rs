@@ -5139,9 +5139,7 @@ impl KerfMcp {
                         project.list_assets().map_err(core_err)?,
                     )
                 };
-                let together = std::cell::Cell::new(false);
                 let mut on_progress = |progress: kerf_core::VariantProgress| {
-                    together.set(together.get() | progress.together);
                     let mut message = match progress.waiting {
                         Some(why) => why.to_string(),
                         None if progress.together => format!("rendering {} together ({})", progress.total, labels.join(", ")),
@@ -5158,7 +5156,7 @@ impl KerfMcp {
                     run.progress(Some(progress.fraction), message);
                 };
                 // Core removes the file of a variant that failed or was cancelled in flight.
-                let (status, done) = kerf_core::render_variants(
+                let ended = kerf_core::render_variants(
                     &timeline,
                     &assets,
                     &render_variants,
@@ -5172,10 +5170,10 @@ impl KerfMcp {
                 let range = opts.range.map(|r| (r.start, r.end));
                 let mut outputs = Vec::new();
                 let project = lock_agent_as(&project, owner.as_deref());
-                for v in render_variants.iter().take(done) {
+                for v in render_variants.iter().take(ended.completed) {
                     outputs.push(variant_output(&project, v, range)?);
                 }
-                Ok((status, outputs, together.get()))
+                Ok((ended.status, outputs, ended.together))
             })
             .await;
             let framed = framed.load(Ordering::SeqCst);

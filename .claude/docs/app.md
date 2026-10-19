@@ -274,7 +274,8 @@ so a cancel lands before the handler's future can be dropped): only if this run 
 (mtime differs from before), so a failure or a cancel before ffmpeg opened the output cannot delete the
 earlier export sitting at that path, and the commands neither remove nor compare anything themselves.
 `export_variants` is one `render_variants` call over every file, in one ffmpeg run unless `single_pass` is
-false (or the encode cannot share one): a stopped single pass removes every file, one after another the one in
+false (or the encode cannot share one): a stopped single pass removes every file (rejecting with `export cancelled;
+all N files were removed`), one after another the one in
 flight is removed and the finished ones stay; its `VariantProgress` (`together` for a single pass) is the
 `export-progress` event as it is. With `smart_crop` the shots are
 framed first (`sample_framings_with`, `export_cancel` stops it), streaming the same event with `waiting:

@@ -324,6 +324,7 @@ together-second-frame [d1_vbase]
 together-chapters -map_chapters
 together-subtitles -disposition:s:0 0
 together-refused NOT-TOGETHER
+together-reframe-named v360@d1c
 ";
 
 // ---- a seeded generator --------------------------------------------------------
@@ -1038,6 +1039,16 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     c
 }
 
+/// A variant of `/golden/out.mp4`, named as `ExportVariant::beside` names it but spelled out:
+/// `beside` joins with the platform's separator, and the digests must hold on every OS.
+fn together_variant(delivery: Delivery) -> ExportVariant {
+    let (w, h) = delivery.ratio();
+    ExportVariant {
+        delivery,
+        output: format!("/golden/out-{w}x{h}.mp4").into(),
+    }
+}
+
 /// The `j`-th multi-delivery case, on dice of its own: two or three delivery frames, titles on every
 /// other case, framings on the clips, captions and chapters to mux on a quarter, and an encode one
 /// run takes — every tenth case keeps an audio-only container, which none does.
@@ -1071,8 +1082,7 @@ fn together_for(c: &mut Case, j: usize) {
     let mut frames = FRAMES.to_vec();
     for _ in 0..r.pick(&[2, 2, 3]) {
         let (w, h, fit) = frames.remove(r.below(frames.len()));
-        c.variants
-            .push(ExportVariant::beside(Path::new("/golden/out.mp4"), Delivery::new(w, h, fit)));
+        c.variants.push(together_variant(Delivery::new(w, h, fit)));
     }
     let o = &mut c.opts;
     if matches!(o.rate_control, RateControl::TwoPass) {

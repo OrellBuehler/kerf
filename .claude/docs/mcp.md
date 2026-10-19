@@ -171,7 +171,7 @@ platforms it is `ready_for` and its non-tip issues — judged at *that* file's
 frame and over the span of the export's `range` (`variant_output` →
 `cut_summary_in(Some(frame), range)`), so the agent does not run
 `platform_check` per variant afterwards. `single_pass` (default true) is `render_variants`'
-`together`; the result says whether the run was one (`single_pass`), and a cancelled one removed
+`together`; the result says whether the run was one (`single_pass`, from `VariantsRun.together`), and a cancelled one removed
 every file (`export cancelled; the N files rendering together were removed`). `generate_captions` / `clear_captions` caption the
 cut; its `style` picks `lines` or `word_punch` and the `instructions` say to
 prefer the latter for a vertical cut, since nothing in a tool list tells an

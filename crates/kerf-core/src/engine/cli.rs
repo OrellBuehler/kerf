@@ -4985,8 +4985,8 @@ fn build_export_args_phase(
 }
 
 /// What follows an output's maps: the encoders and their settings, an explicit mute (`muted`: the
-/// cut has sound and the export drops it) and the muxer's flags. `streams` is whether the graph
-/// feeds the output a picture and a sound.
+/// cut has sound and the export drops it) and the muxer's flags. `(has_video, has_audio)` is
+/// whether the graph feeds the output a picture and a sound.
 fn push_output_opts(
     args: &mut Vec<String>,
     opts: &ExportOptions,
@@ -5483,6 +5483,7 @@ fn preview_args(cut: &PreviewCut, assets: &[Asset], quality: u8) -> Result<Vec<S
         &plan,
         false,
         Some(&titles),
+        "",
     );
     args.push("-filter_complex".to_string());
     args.push(graph.filter);
@@ -6248,7 +6249,7 @@ pub fn check_caption_sidecars(output: &Path, opts: &ExportOptions) -> Result<()>
 /// not started never existed. A variant that **fails** is removed the same way (its partial
 /// file, if the run touched it; the finished ones stay). `opts` is the encode shared by all of
 /// them; its `resolution` and `fit` are replaced per variant by the delivery. Returns the
-/// status and how many files were completed.
+/// status, how many files were completed and whether they rendered in one run.
 pub fn render_variants(
     timeline: &Timeline,
     assets: &[Asset],
@@ -6257,19 +6258,28 @@ pub fn render_variants(
     together: bool,
     progress: &mut dyn FnMut(VariantProgress),
     cancel: &dyn Fn() -> bool,
-) -> Result<(RenderStatus, usize)> {
+) -> Result<VariantsRun> {
     if variants.is_empty() {
         return Err(Error::InvalidArgument("no delivery formats to export".to_string()));
     }
     let total = variants.len();
     let started = Instant::now();
+    let run = |status, completed, together| VariantsRun {
+        status,
+        completed,
+        together,
+    };
     let Some(opts) = prepare_variants(timeline, assets, variants, opts, progress, cancel)? else {
-        return Ok((RenderStatus::Cancelled, 0));
+        return Ok(run(
+            RenderStatus::Cancelled,
+            0,
+            together && together::renders_together(variants, opts),
+        ));
     };
     if together {
         match together::render_together(timeline, assets, variants, &opts, progress, cancel)? {
-            Some(RenderStatus::Completed) => return Ok((RenderStatus::Completed, total)),
-            Some(RenderStatus::Cancelled) => return Ok((RenderStatus::Cancelled, 0)),
+            Some(RenderStatus::Completed) => return Ok(run(RenderStatus::Completed, total, true)),
+            Some(RenderStatus::Cancelled) => return Ok(run(RenderStatus::Cancelled, 0, true)),
             None => {}
         }
     }
@@ -6299,10 +6309,20 @@ pub fn render_variants(
         // export at that path alone, where the unconditional remove used here deleted it.
         let status = render_with_progress(&framed, assets, &variant.output, &per_variant, &mut on_progress, cancel)?;
         if status == RenderStatus::Cancelled {
-            return Ok((RenderStatus::Cancelled, i));
+            return Ok(run(RenderStatus::Cancelled, i, false));
         }
     }
-    Ok((RenderStatus::Completed, total))
+    Ok(run(RenderStatus::Completed, total, false))
+}
+
+/// How a multi-format export ended ([`render_variants`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VariantsRun {
+    pub status: RenderStatus,
+    /// How many files were completed (none from a stopped single run: it removed them all).
+    pub completed: usize,
+    /// Whether the files were (or, stopped before it began, would have been) written by one run.
+    pub together: bool,
 }
 
 /// What an export is refused for before anything is drawn or spawned — an empty timeline, options
@@ -6895,13 +6915,17 @@ fn build_filter_complex_metered(
     plan: &InputPlan,
     meter: bool,
 ) -> FilterGraph {
-    build_filter_complex_with(timeline, assets, fmt, total, opts, want_video, want_audio, plan, meter, None)
+    build_filter_complex_with(
+        timeline, assets, fmt, total, opts, want_video, want_audio, plan, meter, None, "",
+    )
 }
 
 /// [`build_filter_complex_metered`] with the animated titles' sequences given: the playback stream
 /// reads the ones named for a title, not for the playhead ([`svg_layer::stream_sequences`]), and the
 /// graph must index the very inputs its argv carries. `None` is the cut's own
-/// ([`svg_layer::svg_sequences`]).
+/// ([`svg_layer::svg_sequences`]). `instances` prefixes the names of the filter instances a
+/// command targets (a reframe's `v360@c3`), so graphs that share one run keep theirs apart;
+/// empty for every graph that runs alone.
 #[allow(clippy::too_many_arguments)]
 fn build_filter_complex_with(
     timeline: &Timeline,
@@ -6914,6 +6938,7 @@ fn build_filter_complex_with(
     plan: &InputPlan,
     meter: bool,
     titles: Option<&[svg_layer::SvgSeq<'_>]>,
+    instances: &str,
 ) -> FilterGraph {
     let has_audio = |clip: &crate::model::Clip| clip_sounds(clip, assets);
     let is_image = |clip: &crate::model::Clip| assets.iter().find(|a| a.id == clip.asset_id).is_some_and(|a| a.is_image());
@@ -7055,7 +7080,7 @@ fn build_filter_complex_with(
             };
             chains.push(format!(
                 "[{src}]{chain}[v{flat}]",
-                chain = video_clip_chain(clip, fmt, &fx[*flat], is_image(clip), &format!("c{flat}"))
+                chain = video_clip_chain(clip, fmt, &fx[*flat], is_image(clip), &format!("{instances}c{flat}"))
             ));
             let out = if n == last {
                 composite_pad.to_string()
@@ -16698,7 +16723,9 @@ mod tests {
             ExportVariant::beside(&base, Delivery::new(200, 200, Fit::Cover)),
         ];
         let mut ticks = Vec::new();
-        let (status, done) = render_variants(
+        let VariantsRun {
+            status, completed: done, ..
+        } = render_variants(
             &timeline,
             &[asset],
             &variants,

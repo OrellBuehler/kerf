@@ -677,7 +677,9 @@ mod real {
             ..ExportOptions::default()
         };
         let second = std::cell::Cell::new(false);
-        let (status, done) = render_variants(
+        let VariantsRun {
+            status, completed: done, ..
+        } = render_variants(
             &timeline,
             &assets,
             &variants,

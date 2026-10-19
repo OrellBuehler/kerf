@@ -4042,8 +4042,10 @@ async fn export_variants(
             &mut on_progress,
             &|| cancel(),
         ) {
-            Ok((kerf_core::RenderStatus::Completed, _)) => {}
-            Ok((kerf_core::RenderStatus::Cancelled, _)) => return Err("export cancelled".to_string()),
+            Ok(run) if run.status == kerf_core::RenderStatus::Completed => {}
+            // A stopped single pass took every file with it; the dialog says so.
+            Ok(run) if run.together => return Err(format!("export cancelled; all {} files were removed", variants.len())),
+            Ok(_) => return Err("export cancelled".to_string()),
             Err(e) => return Err(e.to_string()),
         }
         Ok(variants.iter().map(|v| v.output.to_string_lossy().into_owned()).collect())

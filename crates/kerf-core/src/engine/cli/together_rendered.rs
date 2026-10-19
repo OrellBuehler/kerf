@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::engine::test_support::{audio_stream, make_clip, test_asset, timeline_of, video_stream, video_track, StatusBounded};
-use crate::model::{Framing, SvgOverlay};
+use crate::model::{Clip, Framing, SvgOverlay};
 use crate::svg::raster::with_pinned_dir;
 
 fn scratch(tag: &str) -> PathBuf {
@@ -149,7 +149,9 @@ fn one_run_writes_the_files_the_variants_rendered_one_by_one_write() {
             let one_by_one = variants(&dir.join(format!("{tag}-apart.mkv")));
             let together = variants(&dir.join(format!("{tag}-together.mkv")));
             let mut seen = false;
-            let (status, done) = render_variants(
+            let VariantsRun {
+                status, completed: done, ..
+            } = render_variants(
                 &timeline,
                 &assets,
                 &one_by_one,
@@ -160,7 +162,11 @@ fn one_run_writes_the_files_the_variants_rendered_one_by_one_write() {
             )
             .expect("one by one");
             assert_eq!((status, done, seen), (RenderStatus::Completed, 3, false));
-            let (status, done) = render_variants(
+            let VariantsRun {
+                status,
+                completed: done,
+                together: one_run,
+            } = render_variants(
                 &timeline,
                 &assets,
                 &together,
@@ -170,7 +176,11 @@ fn one_run_writes_the_files_the_variants_rendered_one_by_one_write() {
                 &|| false,
             )
             .expect("together");
-            assert_eq!((status, done, seen), (RenderStatus::Completed, 3, true), "{tag}");
+            assert_eq!(
+                (status, done, seen, one_run),
+                (RenderStatus::Completed, 3, true, true),
+                "{tag}"
+            );
             for (a, b) in one_by_one.iter().zip(&together) {
                 let (apart, joint) = (frames(&a.output), frames(&b.output));
                 assert!(apart.lines().count() > 60, "{tag}: {apart}");
@@ -192,6 +202,70 @@ fn one_run_writes_the_files_the_variants_rendered_one_by_one_write() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A keyed 360 reframe: each frame's `v360` is commanded by its own `sendcmd`, so every file pans
+/// as it does rendered alone (one shared instance name left all but the first at the static pose).
+#[test]
+#[ignore = "drives the ffmpeg binary"]
+fn a_keyed_reframe_pans_in_every_file() {
+    let _gate = crate::engine::cpu::test_lock();
+    let dir = scratch("reframe");
+    let path = dir.join("sphere.mkv");
+    let made = command(&ffmpeg_bin())
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=512x256:r=30:d=2",
+        ])
+        .args(["-c:v", "libx264", "-crf", "0", "-g", "15", "-pix_fmt", "yuv420p"])
+        .arg(&path)
+        .status_bounded()
+        .expect("run ffmpeg");
+    assert!(made.success());
+    let mut stream = video_stream(512, 256, 30.0);
+    stream.projection = Some(crate::model::Projection::Equirect);
+    let mut asset = test_asset(vec![stream]);
+    asset.path = path.to_string_lossy().into_owned();
+    asset.duration = 2.0;
+    let mut clip = Clip::for_asset(&asset, 0.0, 2.0, 0.0);
+    let key = |time, yaw| crate::model::ReframeKeyframe {
+        time,
+        yaw,
+        pitch: 0.0,
+        roll: 0.0,
+        fov: 90.0,
+    };
+    clip.reframe.as_mut().expect("a 360 clip reframes").keyframes = vec![key(0.0, 0.0), key(2.0, 120.0)];
+    let timeline = timeline_of(vec![video_track(vec![clip])]);
+    let assets = vec![asset];
+    let one_by_one = variants(&dir.join("apart.mkv"));
+    let together = variants(&dir.join("together.mkv"));
+    let opts = lossless();
+    render_variants(&timeline, &assets, &one_by_one, &opts, false, &mut |_| {}, &|| false).expect("one by one");
+    let mut seen = false;
+    render_variants(
+        &timeline,
+        &assets,
+        &together,
+        &opts,
+        true,
+        &mut |p| seen |= p.together,
+        &|| false,
+    )
+    .expect("together");
+    assert!(seen, "rendered in one run");
+    for (a, b) in one_by_one.iter().zip(&together) {
+        let (apart, joint) = (frames(&a.output), frames(&b.output));
+        assert!(apart.lines().count() >= 60, "{apart}");
+        assert_eq!(apart, joint, "{} and {} differ", a.output.display(), b.output.display());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 #[ignore = "drives the ffmpeg binary"]
 fn a_cancelled_run_removes_every_file_it_touched_and_spares_the_rest() {
@@ -203,7 +277,9 @@ fn a_cancelled_run_removes_every_file_it_touched_and_spares_the_rest() {
     with_pinned_dir(dir.join("cache").to_str().unwrap(), || {
         // Once ffmpeg has opened every output, a Stop takes all of them: none was finished.
         let going = std::cell::Cell::new(false);
-        let (status, done) = render_variants(
+        let VariantsRun {
+            status, completed: done, ..
+        } = render_variants(
             &timeline,
             &assets,
             &variants,
@@ -225,7 +301,7 @@ fn a_cancelled_run_removes_every_file_it_touched_and_spares_the_rest() {
         }
         let (holding, release) = (AtomicBool::new(false), AtomicBool::new(false));
         let waiting = AtomicBool::new(false);
-        let (status, _) = std::thread::scope(|scope| {
+        let VariantsRun { status, .. } = std::thread::scope(|scope| {
             scope.spawn(|| {
                 let _slot = crate::engine::cpu::lease_waiting(&mut |_| {}, &|| false).expect("the slot");
                 holding.store(true, Ordering::SeqCst);
