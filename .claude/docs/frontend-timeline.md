@@ -441,7 +441,13 @@ clip's own ffmpeg chain (`audio_effects_filter`, the same string the export rend
 the chain is part of the buffer cache key and retuning an EQ re-fetches. It runs before
 this engine's gain envelope where the export runs it after the clip gain — audible only
 to a level-dependent effect, and keeping volume in Web Audio is what lets the fader stay
-live instead of re-fetching PCM on every drag. Reverse shuttle is still silent. The
+live instead of re-fetching PCM on every drag. **Reverse shuttle is audible**: a negative rate
+plays each clip behind the playhead backwards from where the playhead meets it (its end, or the
+playhead inside it), varispeed like the forward shuttle, from a buffer stored the other way round
+(`#buffer(clip, backwards)`: a forward clip's samples back-to-front, a reversed clip's front-to-back,
+the `MAX_WINDOW` window held at the end the playhead enters by) and through the same gain envelope met
+in reverse (`gainAutomationBack` in `audio-mix.ts`: the forward pass's points in the order they are
+reached, a keyed step met from above); the clock counts down. The
 playhead follows the audio clock — edits mid-playback re-anchor via
 `ui.resync()` from a `+page.svelte` effect. The timeline
 toolbar's `+ V` / `+ A` add tracks and each track header has a `×` to remove one

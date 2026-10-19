@@ -29,13 +29,29 @@
    than guessed at. They run before this file's gain envelope where the export
    runs them after the clip gain — audible only to a level-dependent effect, and
    keeping volume here is what lets the fader stay live instead of re-fetching
-   PCM on every drag. Reverse shuttle is still silent: this is a preview monitor,
-   not the export mix. */
+   PCM on every drag.
+
+   Reverse shuttle is audible too: a negative rate plays each clip's sound
+   backwards from where the playhead meets it — its end, or the playhead itself
+   inside it — at the shuttle's speed, from a buffer stored the other way round
+   (`#buffer`'s `backwards`), with the same gain envelope met in reverse
+   (`gainAutomationBack`). Like the forward shuttle it is varispeed: 2× is an
+   octave up. */
 
 import { getAudio } from './api';
 import type { Clip, MasterBus, Timeline } from './types';
 import { panGains } from './mixer';
-import { clipGainAt, crossfadePair, fadeInTimes, fadeOutOf, gainAutomation, type GainClip, limiterParams } from './audio-mix';
+import {
+	clipGainAt,
+	crossfadePair,
+	fadeInTimes,
+	fadeOutOf,
+	gainAutomation,
+	gainAutomationBack,
+	type GainClip,
+	limiterParams,
+	STEP_LEAD
+} from './audio-mix';
 import { clipSounds } from './mixer-strips';
 import { clampMasterVolume, masterOf, trackRenders } from './levels';
 import { readBlock, type Reading } from './meter';
@@ -46,7 +62,8 @@ import { outputLatency } from './output-latency';
  *  wire while staying honest enough to judge a cut. */
 const RATE = 32000;
 /** Longest audio window fetched per clip, in source seconds — bounds memory on
- *  very long clips (playback inside one clip goes silent past this). */
+ *  very long clips (playback inside one clip goes silent past this; reverse
+ *  playback, which enters a clip at its end, holds the window there). */
 const MAX_WINDOW = 600;
 /** Total decoded source seconds kept in the buffer cache before eviction. */
 const CACHE_CAP = 1800;
@@ -153,11 +170,12 @@ export class AudioEngine {
 		return s.anchorTime + (this.#ctx.currentTime - s.anchorCtx) * s.rate;
 	}
 
-	/** (Re)start playback of every audio-bearing clip from timeline time `t`.
-	 *  Reverse rates stop audio — the playhead falls back to wall-clock. */
+	/** (Re)start playback of every audio-bearing clip from timeline time `t` at `rate` — negative
+	 *  plays backwards (reverse shuttle), and the clock then counts down. */
 	start(timeline: Timeline, audioAssets: ReadonlySet<string>, t: number, rate: number) {
 		this.stop();
-		if (rate <= 0) return;
+		if (rate === 0 || !Number.isFinite(rate)) return;
+		const back = rate < 0;
 		const ctx = (this.#ctx ??= this.#env.createContext());
 		if (ctx.state === 'suspended') void ctx.resume();
 		const session: Session = { anchorTime: t, anchorCtx: ctx.currentTime, rate, nodes: [], buses: new Map() };
@@ -173,13 +191,15 @@ export class AudioEngine {
 				// A picture whose sound was detached is silent — its audio clip plays it
 				// (`clip_sounds` in the export graph): scheduling both is the doubling.
 				if (!clipSounds(clip, audioAssets)) return false;
+				// Still ahead of the playhead in the direction it runs.
+				if (back) return clip.timeline_start < t;
 				return clip.timeline_start + (clip.source_out - clip.source_in) / speedMag(clip) > t;
 			});
 			if (playing.length === 0) continue;
 			const bus = this.#makeBus(ctx, track.volume ?? 1, track.pan ?? 0);
 			session.buses.set(track.id, bus);
 			for (const clip of playing) {
-				void this.#buffer(clip)
+				void this.#buffer(clip, back)
 					.then((buf) => {
 						// Buffers resolve async; only schedule into the session that asked.
 						if (buf && this.#session === session) this.#schedule(clip, buf, session, bus, crossfadePair(track.clips, clip));
@@ -348,21 +368,27 @@ export class AudioEngine {
 		const clipEnd = clipStart + dur;
 		const now = ctx.currentTime;
 		const nowT = s.anchorTime + (now - s.anchorCtx) * s.rate;
-		if (clipEnd <= nowT) return;
+		const back = s.rate < 0;
+		if (back ? clipStart >= nowT : clipEnd <= nowT) return;
 
 		const src = ctx.createBufferSource();
 		src.buffer = buf;
-		src.playbackRate.value = mag * s.rate;
+		src.playbackRate.value = mag * Math.abs(s.rate);
 		const gain = ctx.createGain();
 		src.connect(gain);
 		gain.connect(bus.input);
 		s.nodes.push({ src, gain });
 
-		// Timeline time -> context time under this session's anchor and rate.
+		// Timeline time -> context time under this session's anchor and rate (a negative rate
+		// meets the later times first).
 		const at = (tl: number) => s.anchorCtx + (tl - s.anchorTime) / s.rate;
-		const offsetSrc = clipStart < nowT ? (nowT - clipStart) * mag : 0;
+		// Where the buffer begins on the timeline: the clip's start, or — played backwards, from a
+		// buffer stored the other way round — its end.
+		const entry = back ? clipEnd : clipStart;
+		const inside = back ? clipEnd > nowT : clipStart < nowT;
+		const offsetSrc = inside ? Math.abs(nowT - entry) * mag : 0;
 		if (offsetSrc >= buf.duration) return;
-		src.start(Math.max(at(clipStart), now), offsetSrc, buf.duration - offsetSrc);
+		src.start(Math.max(at(entry), now), offsetSrc, buf.duration - offsetSrc);
 
 		// Gain envelope: clip volume shaped by fade-in/out. A transition
 		// approximates as an extra fade-in (the export folds it in the same way).
@@ -371,6 +397,17 @@ export class AudioEngine {
 		const shaped: GainClip = powerPair ? { ...clip, power_pair: true } : clip;
 		const fo = fadeOutOf(clip);
 		const env = (tl: number) => clipGainAt(shaped, tl, clipStart, clipEnd);
+		if (back) {
+			// Backwards the envelope is met from the end down: the gain just below the playhead,
+			// then every point of it in the order it is reached.
+			const t0 = Math.min(clipEnd, nowT);
+			gain.gain.setValueAtTime(env(t0 - STEP_LEAD), Math.max(at(t0), now));
+			for (const p of gainAutomationBack(shaped, clipStart, clipEnd, t0)) {
+				if (p.jump) gain.gain.setValueAtTime(p.value, at(p.time));
+				else gain.gain.linearRampToValueAtTime(p.value, at(p.time));
+			}
+			return;
+		}
 		const t0 = Math.max(clipStart, nowT);
 		gain.gain.setValueAtTime(env(t0), Math.max(at(t0), now));
 		const keyed = gainAutomation(shaped, clipStart, clipEnd, t0);
@@ -392,12 +429,15 @@ export class AudioEngine {
 		}
 	}
 
-	/** Fetch + decode the clip's source window, cached. Reversed clips get the
-	 *  samples stored back-to-front so scheduling stays forward-only. */
-	async #buffer(clip: Clip): Promise<AudioBuffer | null> {
-		const rev = (clip.speed ?? 1) < 0;
-		// Cap the window at MAX_WINDOW source seconds; a reversed clip plays from
-		// source_out downward, so its window is anchored at the top instead.
+	/** Fetch + decode the clip's source window, cached, stored in the order the playhead meets it:
+	 *  `backwards` (reverse shuttle) from the clip's end. A reversed clip's samples are stored
+	 *  back-to-front, and played backwards they are front-to-back again, so scheduling stays
+	 *  forward-only either way. */
+	async #buffer(clip: Clip, backwards = false): Promise<AudioBuffer | null> {
+		const rev = ((clip.speed ?? 1) < 0) !== backwards;
+		// Cap the window at MAX_WINDOW source seconds where the playhead enters the clip: a
+		// reversed clip plays from source_out downward, and so does a forward one played
+		// backwards, so their window is anchored at the top instead.
 		const sin = rev ? Math.max(clip.source_in, clip.source_out - MAX_WINDOW) : clip.source_in;
 		const sout = rev ? clip.source_out : Math.min(clip.source_out, clip.source_in + MAX_WINDOW);
 		if (sout - sin <= 0) return null;
