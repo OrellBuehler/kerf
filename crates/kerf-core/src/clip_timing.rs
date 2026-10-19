@@ -167,7 +167,8 @@ pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
     for (flat, clip) in timeline.tracks.iter().flat_map(|t| t.clips.iter()).enumerate() {
         let asset = assets.iter().find(|a| a.id == clip.asset_id);
         fx[flat].hdr = asset.and_then(|a| a.hdr());
-        fx[flat].alpha = asset.is_some_and(|a| a.has_alpha());
+        // A title's pictures are drawn on a transparent canvas.
+        fx[flat].alpha = asset.is_some_and(|a| a.has_alpha()) || clip.is_generated();
         fx[flat].head_pad = asset.is_some_and(|a| is_head_padded_proxy(&a.path));
         let stream = asset.and_then(|a| a.streams.iter().find(|s| s.kind == StreamKind::Video));
         fx[flat].lead = stream.filter(|s| !s.image).map_or(0.0, |s| s.lead);
@@ -232,7 +233,8 @@ pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
                             // A still loops (`-loop 1`), so it never runs out
                             // of source: its handle is unbounded, the same
                             // reason the timeline lets a still extend freely.
-                            let avail = if is_still(p.asset_id) {
+                            // A title's document runs on past its out-point too.
+                            let avail = if is_still(p.asset_id) || p.is_generated() {
                                 f64::INFINITY
                             } else if p.is_reversed() {
                                 p.source_in / p.speed_mag()

@@ -547,6 +547,7 @@ impl Planner {
         let mut layers = Vec::new();
         let mut originals: Vec<Option<&StreamInfo>> = Vec::new();
         let mut pictureless = Vec::new();
+        let mut titles: Vec<Uuid> = Vec::new();
         // A still's tail window is judged at the slot's start, which can be before `eval` (the `t`
         // it was asked for, inside the frame): look from there.
         let from = if motion { eval } else { eval.min(tail_at) };
@@ -563,6 +564,11 @@ impl Planner {
                     eval < clip.timeline_end() || (planned.tail && tail_at < clip.timeline_end() + planned.fx.tail)
                 };
                 if !on {
+                    continue;
+                }
+                // A title on a track is resvg's pictures in FFmpeg's graph, as a floating one is.
+                if clip.is_generated() {
+                    titles.push(clip.id);
                     continue;
                 }
                 let asset = planned.asset.as_ref().ok_or(Error::AssetNotFound(clip.asset_id))?;
@@ -680,6 +686,7 @@ impl Planner {
             .iter()
             .filter(|(_, start, end)| eval >= *start && if motion { eval <= *end } else { eval < *end })
             .map(|(id, ..)| *id)
+            .chain(titles)
             .collect();
         Ok(RenderPlan {
             time: slot,

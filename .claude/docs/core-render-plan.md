@@ -64,6 +64,8 @@
   clock), `pick_fps` (the `fps=` filter's parse, `av_d2q` with `INT_MAX` — the grid clips
   are placed on; the same for every rate with small terms, different for `29.970029`),
   `pix_fmt`, gif and composite colour policy.
+  **A title clip** (a generated clip, `core-model.md`) is no layer: a frame it is on names it in `RenderPlan::svg` after the
+  floating titles, by clip id, so the compositor refuses the frame (`Unsupported::Svg`) and FFmpeg draws it from resvg's pictures.
   **Two modes.** `Still` is the contract the GPU path started with (`build_still_args`:
   one sampled transform, half-open spans, text drawn statically) **and the FFmpeg still's own frame
   inside a transition** (`engine/cli/still_fx.rs`): the fades still changing the picture, counted at the
@@ -218,7 +220,9 @@
   not draw — `PlayRefusal::Plan(Unsupported)` — or draws exactly but **not in time** (`Reversed`: the cursor
   reads the clip's whole window before its first frame; `MovingText`: a title whose position is keyed
   is a new `drawtext` rasterisation per frame), with `handover`, the time a stream that carries on must
-  start at (`SpanPlan::handover` of the slice's windows, in the cut's time).
+  start at (`SpanPlan::handover` of the slice's windows, in the cut's time). `PlayCut::resume(from, reach,
+  horizon, size, caps)` is its converse: the first frame within `reach` from which every frame for `horizon` is
+  drawn (frames planned in order, each once), where a play the stream took over can be handed back to the compositor.
   `engine/cli/sweep.rs` holds
   the Motion plan against the **evaluated** graph (a ~50-line evaluator for
   `keyframe_expr`'s grammar: zoom / rotate / opacity, the overlay's x/y against the

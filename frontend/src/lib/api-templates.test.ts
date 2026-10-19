@@ -197,7 +197,7 @@ describe('applying a template (browser harness)', () => {
 		expect(titles(timeline).find((t) => t.id === overlay_id)!.template!.values.who).toBe('é'.repeat(300));
 		const before = (await head()).seq;
 		await expect(applyTemplate(info.id, { who: 'é'.repeat(1000) }, 0)).rejects.toThrow(/the SVG is larger than 128 KiB/);
-		await expect(setTemplateValues(overlay_id, { who: 'é'.repeat(1000) })).rejects.toThrow(/the SVG is larger than 128 KiB/);
+		await expect(setTemplateValues(overlay_id!, { who: 'é'.repeat(1000) })).rejects.toThrow(/the SVG is larger than 128 KiB/);
 		expect((await head()).seq).toBe(before);
 	});
 
@@ -220,8 +220,8 @@ describe('setting values (browser harness)', () => {
 	test('changes only the controls named, keeps the id, timing and placement, in one revision', async () => {
 		const { overlay_id } = await applyTemplate(SAMPLE_TEMPLATE_ID, { tagline: 'Bye' }, 1, 4, { x: 0.2 });
 		const before = (await head()).seq;
-		const done = await setTemplateValues(overlay_id, { headline: 'Hello', brand: 'navy' });
-		expect(done.overlay_id).toBe(overlay_id);
+		const done = await setTemplateValues(overlay_id!, { headline: 'Hello', brand: 'navy' });
+		expect(done.overlay_id).toBe(overlay_id!);
 		const o = titles(done.timeline).find((t) => t.id === overlay_id)!;
 		expect([o.start, o.end, o.x]).toEqual([1, 4, 0.2]);
 		expect(o.template?.values).toEqual({
@@ -239,10 +239,10 @@ describe('setting values (browser harness)', () => {
 
 	test('a refused value leaves the title as it was', async () => {
 		const { overlay_id } = await applyTemplate(SAMPLE_TEMPLATE_ID, {}, 0);
-		const svg = (await sampleTitle(overlay_id)).svg;
-		await expect(setTemplateValues(overlay_id, { headline: 'ok', brand: 'rgb(0,0,0)' })).rejects.toThrow(/not a colour/);
-		expect((await sampleTitle(overlay_id)).svg).toBe(svg);
-		await expect(setTemplateValues(overlay_id, { nope: 'x' })).rejects.toThrow(/no control called/);
+		const svg = (await sampleTitle(overlay_id!)).svg;
+		await expect(setTemplateValues(overlay_id!, { headline: 'ok', brand: 'rgb(0,0,0)' })).rejects.toThrow(/not a colour/);
+		expect((await sampleTitle(overlay_id!)).svg).toBe(svg);
+		await expect(setTemplateValues(overlay_id!, { nope: 'x' })).rejects.toThrow(/no control called/);
 	});
 
 	test('a title that is not from a template, or is not there, rejects', async () => {
@@ -253,20 +253,20 @@ describe('setting values (browser harness)', () => {
 
 	test('a rename or a move keeps the template; replacing the artwork ends it, as in the engine', async () => {
 		const { overlay_id } = await applyTemplate(SAMPLE_TEMPLATE_ID, {}, 0);
-		await updateSvgOverlay(overlay_id, { name: 'Renamed', x: 0.1, end: 7 });
-		const kept = await sampleTitle(overlay_id);
+		await updateSvgOverlay(overlay_id!, { name: 'Renamed', x: 0.1, end: 7 });
+		const kept = await sampleTitle(overlay_id!);
 		expect([kept.name, kept.x, kept.end]).toEqual(['Renamed', 0.1, 7]);
 		expect(kept.template?.template_id).toBe(SAMPLE_TEMPLATE_ID);
-		await updateSvgOverlay(overlay_id, { svg: ART });
-		const ended = await sampleTitle(overlay_id);
+		await updateSvgOverlay(overlay_id!, { svg: ART });
+		const ended = await sampleTitle(overlay_id!);
 		expect(ended.template).toBeUndefined();
-		await expect(setTemplateValues(overlay_id, { headline: 'x' })).rejects.toThrow(/not a template title/);
+		await expect(setTemplateValues(overlay_id!, { headline: 'x' })).rejects.toThrow(/not a template title/);
 	});
 
 	test('undo brings the old values back', async () => {
 		const { overlay_id } = await applyTemplate(SAMPLE_TEMPLATE_ID, {}, 0);
 		const applied = (await head()).seq;
-		await setTemplateValues(overlay_id, { headline: 'Changed' });
+		await setTemplateValues(overlay_id!, { headline: 'Changed' });
 		const back = await revertTo(applied);
 		expect(titles(back).find((t) => t.id === overlay_id)!.template?.values.headline).toBe('Thanks for watching');
 	});
@@ -425,7 +425,7 @@ describe('moving templates in and out of the library (browser harness)', () => {
 		await deleteTemplate(SAMPLE_TEMPLATE_ID);
 		expect((await listTemplates()).templates).toEqual([]);
 		await expect(applyTemplate(SAMPLE_TEMPLATE_ID, {}, 0)).rejects.toThrow(/no template/);
-		const done = await setTemplateValues(overlay_id, { tagline: 'Still here' });
+		const done = await setTemplateValues(overlay_id!, { tagline: 'Still here' });
 		expect(titles(done.timeline).find((t) => t.id === overlay_id)!.template?.values.tagline).toBe('Still here');
 	});
 

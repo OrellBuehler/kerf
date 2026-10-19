@@ -816,6 +816,9 @@ impl Timeline {
     pub fn detach_audio(&mut self, clip_id: Uuid, has_audio: bool) -> Result<Detached> {
         let (vi, ci) = self.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
         let clip = self.tracks[vi].clips[ci].clone();
+        if clip.is_generated() {
+            return Err(Error::InvalidArgument("a title has no sound to detach".to_string()));
+        }
         if self.tracks[vi].kind != StreamKind::Video {
             return Err(Error::InvalidArgument(
                 "only a clip on a video track has sound of its own to detach".to_string(),

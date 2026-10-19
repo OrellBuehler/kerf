@@ -874,8 +874,8 @@ edits folds from a chevron in it, and its one legend line says what the two icon
 `+page.svelte` brings it forward once when a proposal lands (`editor.staged`
 going null → set) — a review nobody can see is not a review. Under **Quick
 edits**, four preset chips run an edit now (`quick-edits.ts`: `Remove silences` / `Frame for the delivery`
-/ `Caption the cut` (analyzes whatever is in the cut but not yet transcribed,
-then captions it) / `Cut to the beat` — which
+/ `Caption the cut` (analyzes whatever is in the cut but not yet transcribed — `cutAssets`, which
+leaves out titles on tracks: they have no asset — then captions it) / `Cut to the beat` — which
 analyzes whatever is on the audio tracks first, then calls `snap_to_beats`, and says
 "No cuts were near a beat" instead of claiming an alignment when the grid never reached
 them); **the task is recorded only after the edit has run** (`record`: add, then resolve), so a connected agent never sees a task it could claim and redo (short of a window of two IPC round trips: `add_task` has no already-done form, so the task is `queued` until the `resolve_task` that follows — closing it needs a backend command that creates it done), and a failed edit leaves nothing in the queue. The rest enqueue for the agent — `Assemble rough cut` is one of them now: it used to run the same silence removal as `Remove silences` under a bigger name. Remove silences acts on `quickTarget`: the footage of the selected clip, else the selected library asset, else the first picture on the cut, and says which (a line under the chips, the toast naming it, "Nothing to remove" when the cut did not change); the local chips are off while a proposal is previewed. In the browser there is no agent, so
@@ -1037,12 +1037,37 @@ effect ran again without a seek, `playSession`) the session starts at the audibl
 than the playhead the play began at, so a rebuild within the latency of Play or a seek does not rewind the picture. A hand-over starts the stream through the same ladder (`takeover`): the stream is *not* `streaming` (so the route stays `gpu` and the
 surface stays up) until its first frame **at or past where the GPU stops** is shown, and only then does the GPU's session end and the surface go. A
 session that was given up on is **barred** for the rest of that play (`gpuBarred`: until a deliberate seek or an edit, not for a stream restart for
-lag), so the renderers never flip back and forth. Under Proxy only the first request is rejected as the stream is (`playWaiting` →
+lag), so a GPU that failed or cannot keep up never flips back and forth with the stream. **A play the stream took over at a refusal is taken back**
+(`TakeBack`, `gpu-playback.ts`): when the session stopped where the engine said (`GpuPlayback.resumable`: a planned hand-over, or a decline at Play
+whose answer names the refused frame; not `failed`: a frame that failed, `session`, an overload, or a request that was rejected or never answered,
+`giveUp`), the stream, once it has been on show for `READY_SETTLE` (1 s), asks `frames.ready(at, ..)` (`hint: 'ready'`, with the pump's `client` and
+next `seq`, so a ready request that reaches the backend after a newer request of the page, the paused frame once the play stops, is superseded and
+primes nothing over it) for `lead` past what is heard and no earlier than the refused frame: `READY_LEAD` (0.6 s), twice what the last answer
+took, or room for the GPU's session to begin its first frame early after the route is back (first frame + `SHOW_AHEAD` + 0.1 s), whichever is
+most, capped at `READY_MAX_LEAD` (2.5 s) so what is made ready is played well inside the backend's 10 s. Only `stream` with no `play` ends the
+take-back for the play (`never`: the setting, no surface, no plan from there); `stream` with `play.ahead` (nothing within the backend's 4 s yet), a
+superseded answer and a request that failed (logged) are `later`, asked again `READY_EVERY` (1 s) after the answer came, doubling with each `later`
+in a row up to `READY_MAX_WAIT` (8 s), so a cut the GPU draws none of costs the one worker that draws a scan every 8 s at most. A `ready` answer's
+`play.resume` is where the play from there is made ready. The GPU's session begins a first frame's cost before it (`firstFrameLead`: what the last
+take-back's first frame cost, `learnedLead`, kept apart from the steady round trip of the session the stream took over, `handoverTrip`, which is the
+estimate until a take-back has been measured; never less than a frame), and `SHOW_AHEAD` (0.3 s) before the session begins the route is the
+surface's again (`returning`: `streaming && !returning` in the route, so the bounds go out visible; the surface is not shown before a frame is drawn on
+it, and the pump, `streaming && gpuPlay === null`, asks nothing). The `GpuPlayback(fps, resume, true)` holds its picture at `resume`, and once its
+first frame is on the screen (`gpuShown`) the stream stops, the bar is lifted and the play is the GPU's again (and may hand over again later). A
+session that declines before it drew (a refused frame, the bounds not delivered yet, something over the frame on a surface above the page) leaves
+the stream playing; one that failed ends the take-back (`abandonTakeBack`). A declined session and a time made ready that went by (`MISSED_AFTER`)
+are asked about again after a wait of their own count (`TakeBack.retry`: 1, 2, 4, 8 s, which a `ready` answer does not reset and only a play taken
+back does, the next hand-over's `TakeBack` starting from nothing), so a take-back that keeps failing at the switch costs a primed play every 8 s at
+most, and pausing, a seek or an edit ends it. **What is left at the switch:** the first frame is begun by an estimate of what it
+costs, so it can land a frame early (the picture holds a frame ahead of the sound) or late (the stream already showed a frame or two past `resume`,
+and they are shown again); and the take-back is in the audible time, so from a stream that never was the GPU's (declined at Play, read from the
+plain clock) the picture steps back by the output latency. Under Proxy only the first request is rejected as the stream is (`playWaiting` →
 `playbackWaiting`). The status bar names the renderer of each drawn frame (`GPU 960×540 · 14 ms · adapter`; a repeat is not a new frame and
 changes nothing). Pausing ends the session (the effect's cleanup), and the settled frame comes back through the ordinary GPU route. In the
 browser harness `getPreviewFrame` answers a forward request `stream` (no GPU), so playback is the synthesised stream as ever; `?gpusurface=1` pretends
 a surface and has the GPU play, `&gpuplay=stream` has it decline every session and `&gpuplay=ahead` has it draw for two seconds and announce a
-refusal (the hand-over). Tests: `gpu-playback.test.ts` (the request arithmetic, the decision, the hand-over, the overload),
+refusal (the hand-over), and take the play back at once when asked (`ready`), so a play cycles GPU, stream, GPU. Tests: `gpu-playback.test.ts`
+(the request arithmetic, the decision, the hand-over, the overload, `resumable` and `TakeBack`), the Preview's wiring pinned in `playback-sync.test.ts`,
 `output-latency.test.ts`, the `GPU playback` cases of `frame-pump.test.ts` (the pump over the real Svelte runtime), and the ladder's `startup`.
 
 **Shared components** (`components/editor/`; `shared-components.test.ts` keeps the dialogs, the Inspector's rows and the toolbar on them).
@@ -1642,6 +1667,21 @@ browser's canvas (`css-color.ts`). Harness: `?empty=1` has no templates, `?templ
 `template-dev.ts` now refuses what core does (nested text controls, `attribute_name_ok`, control characters in name /
 description / label, a blank name falling back to the title's, Rust's `f64` grammar for numbers, 128 KiB after the
 splice). Tests: `template-ui`, `template-actions`, `template-wiring`, `css-color`, `api-templates`, `api-templates-changed` (the desktop half of `templates-changed`).
+
+**Titles on tracks in the editor.** A title clip is a `Clip` with `generator: {kind: 'title', name, svg, template?}` and
+`asset_id` `GENERATED_ASSET` (`types.ts`); `title-clips.ts` (bun-tested) is the pure side — `isTitleClip` / `titleOf` /
+`titleName`, `findTitle(timeline, id)` (a `TitleRef` for a floating title or a title clip: what `TemplateSection`, the save
+dialog and `setTemplateValue` read through `editor.titleById`), `titleClip` and `placeTitleClip` (kerf-core's placement: the named
+video track, else the lowest unlocked one free over the span, else a new `V{n}` on top). `api.ts`: `applyTemplateClip(templateId,
+values, start, duration?, trackId?, name?)`, `addTitleClip(svg, start, duration?, trackId?, name?)`, `updateTitleClip(clipId,
+patch)` → `TemplateEdit` with `clip_id`; `setTemplateValues` takes either id (the harness's `setTemplateValuesIn` answers
+`overlay` or `clip`, `applyTemplateClipTo` places one, and `setSpeed` refuses a title as the engine's invariant does).
+`editor.applyTemplateClip` / `addTitleClip` / `updateTitleClip` select the clip they made; `editor.select` of the generated asset
+looks nothing up. **Template card**: *Add to a track at the playhead* beside *Add at the playhead*. **Inspector**: a selected
+title clip shows its name with the template mark, a **Title** section (the name field, through `FieldEdits` like every plain
+field: `renameTitle` writes to the clip it took focus on) and the **Template** section of a floating title (`TemplateSection`
+takes `{id, svg, template}`), and has no Speed section; Timing, Fades, Transform (keyframes: an animated placement), Color, Mask
+and Transition are the clip's. Tests: `title-clips.test.ts`.
 
 **Animated SVG titles in the editor.** The engine draws the artwork (resvg, into every preview and export frame), so the
 page **never inlines the SVG** — `svg-titles.test.ts` fails on any `{@html}` / `innerHTML` in `src/` — and shows it only as an

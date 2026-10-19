@@ -783,6 +783,10 @@ fn stream_through(name: &str, inputs: &PlanInputs, from: f64, seconds: f64, widt
     )
 }
 
+/// How long after a `ready` answer the page begins the session that takes the play back: it asks
+/// `READY_LEAD` (0.6 s) ahead and begins a first frame before the time made ready.
+const TAKEN_AFTER: Duration = Duration::from_millis(500);
+
 #[test]
 #[ignore = "timings; KERF_BENCH=1; needs ffmpeg and a GPU adapter"]
 fn a_play_session_through_the_frame_path() {
@@ -837,6 +841,9 @@ fn a_play_session_through_the_frame_path() {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let (mut gpu_decode, mut primed_decode, mut quick_decode) = (Vec::new(), Vec::new(), Vec::new());
         let (mut gpu_wait, mut primed_wait, mut quick_wait) = (Vec::new(), Vec::new(), Vec::new());
+        // Taking a play back from the stream: the `ready` request (the scan from there, the play primed), then the
+        // first frame of the session the page begins `READY_LEAD` later, which adopts it.
+        let (mut ready_ms, mut taken_starts, mut taken_decode, mut taken_wait) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let primed_play = |at: f64, n: u64, dwell: Duration| {
             // The playhead rests on the paused frame at `at`; the play from it is made ready.
             let rest = FrameRequest::new(Arc::clone(&take), at, width, false);
@@ -881,6 +888,23 @@ fn a_play_session_through_the_frame_path() {
             quick_decode.extend(timings.map(|t| t.decode_ms));
             quick_wait.extend(timings.map(|t| t.present_ms));
 
+            let current = preview.inputs(&take).expect("inputs");
+            let began = Instant::now();
+            let ready = preview.ready_play(&current, &key(300 + n), at, false).expect("an answer");
+            assert_eq!(ready.renderer, "ready", "{:?}", ready.reasons);
+            ready_ms.push(ms(began.elapsed()));
+            let resume = ready.play.and_then(|p| p.resume).expect("where");
+            std::thread::sleep(TAKEN_AFTER);
+            let began = Instant::now();
+            let answer = preview.play(&current, &key(400 + n), resume, false).expect("an answer");
+            assert_eq!(answer.renderer, "gpu", "{:?}", answer.reasons);
+            assert!(lock(&preview.primed).is_none(), "the session adopted the play made ready");
+            taken_starts.push(ms(began.elapsed()));
+            taken_decode.extend(answer.timings.map(|t| t.decode_ms));
+            taken_wait.extend(answer.timings.map(|t| t.present_ms));
+            preview.end_play();
+            std::thread::sleep(Duration::from_millis(150));
+
             let began = Instant::now();
             let mut first = None;
             let request = kerf_core::PlaybackRequest {
@@ -908,6 +932,7 @@ fn a_play_session_through_the_frame_path() {
             ("cold   ", &gpu_starts, &mut gpu_decode, &gpu_wait),
             ("rested ", &primed_starts, &mut primed_decode, &primed_wait),
             ("instant", &quick_starts, &mut quick_decode, &quick_wait),
+            ("taken back", &taken_starts, &mut taken_decode, &taken_wait),
         ] {
             let _ = writeln!(
                 out,
@@ -929,6 +954,11 @@ fn a_play_session_through_the_frame_path() {
             out,
             "start latency, stream_preview         (start to first JPEG): {}",
             row("", &mut stream_starts)
+        );
+        let _ = writeln!(
+            out,
+            "a play taken back from the stream: the ready request (scan + primed): {}",
+            row("", &mut ready_ms)
         );
 
         // A play across the cut (5 s) with the page simulated, and the stream for the same span.

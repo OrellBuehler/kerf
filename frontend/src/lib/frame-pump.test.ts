@@ -134,6 +134,7 @@ interface Harness {
 		streamShown: boolean;
 		streamDrawn(aspect: number): void;
 		showStreamed(url: string): void;
+		ready(time: number, overlays: boolean, width: number, session: number): Promise<PreviewFrameResult>;
 	};
 	stop: () => void;
 	time: number;
@@ -865,16 +866,22 @@ describe('GPU playback', () => {
 			playWaiting: (_pb, m) => waiting.push(m)
 		});
 		await settle();
-		h.playback = new GpuPlayback(30);
+		const rejected = new GpuPlayback(30);
+		h.playback = rejected;
 		await settle();
 		expect(failed).toHaveLength(1);
 		expect(handovers).toEqual(["true:the GPU preview's frame worker stopped"]);
+		// A request that failed is the GPU's failure: the stream does not give the play back to it.
+		expect(rejected.failed).toBe(true);
+		expect(rejected.resumable).toBe(false);
 
 		reject = 'waiting for the preview proxy of "a.mp4" (40%)';
-		h.playback = new GpuPlayback(30);
+		const waits = new GpuPlayback(30);
+		h.playback = waits;
 		await settle();
 		expect(waiting).toHaveLength(1);
 		expect(failed, 'a wait is not a failure').toHaveLength(1);
+		expect(waits.failed).toBe(false);
 		h.stop();
 	});
 
@@ -994,7 +1001,8 @@ describe('GPU playback', () => {
 			playHandover: (_pb, _ahead, now, why) => handovers.push([now, why])
 		});
 		await settle();
-		h.playback = new GpuPlayback(30);
+		const silent = new GpuPlayback(30);
+		h.playback = silent;
 		await settle();
 		clock = 3;
 		h.time = 0.5;
@@ -1005,6 +1013,31 @@ describe('GPU playback', () => {
 		await settle();
 		expect(handovers).toEqual([[true, 'the GPU stopped answering']]);
 		expect(failed).toHaveLength(1);
+		// Given up on: the stream that takes over does not give the play back to it.
+		expect(silent.failed).toBe(true);
+		expect(silent.ended).toBe(true);
+		h.stop();
+	});
+
+	test('a ready request is one of the pump\'s: its page, the next number, the session, and nothing drawn', async () => {
+		const r = recorder({
+			gpu: async (t, _o, play) =>
+				play?.ready
+					? { renderer: 'ready', frame: null, reasons: [], timings: null, play: { session: play.session, start: t, frame: 0, repeat: false, ahead: null, resume: t } }
+					: { renderer: 'gpu', frame: null, reasons: [], timings: null }
+		});
+		const h = harness({ enabled: true, overlaysCapable: true, ...r });
+		await settle();
+		const before = r.orders.length;
+		const answer = await h.frames.ready(4.2, false, 640, 77);
+		expect(answer.renderer).toBe('ready');
+		expect(r.asked.at(-1)).toBe('play@4.2');
+		expect(r.plays.at(-1)).toEqual({ session: 77, ready: true });
+		expect(r.widths.at(-1)).toBe(640);
+		const order = r.orders.at(-1)!;
+		expect(order.client).toBe(r.orders[0].client);
+		expect(order.seq, 'numbered after every request the pump made before it').toBeGreaterThan(r.orders[before - 1].seq);
+		expect(h.frames.gpuShown, 'a ready answer changes nothing on show').toBe(true);
 		h.stop();
 	});
 

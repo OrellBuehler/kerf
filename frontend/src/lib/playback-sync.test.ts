@@ -637,7 +637,19 @@ describe('the Preview\u2019s hand-over to the stream', () => {
 	});
 
 	test('reads the clock as it always did in a stream that does not continue a takeover', () => {
-		expect(source).toContain('if (!barred) takeoverLatency = 0;');
+		expect(source).toContain('if (!barred) {\n\t\t\t\ttakeoverLatency = 0;');
+	});
+
+	test('takes the play back past a refusal the engine named, with the stream on show until the GPU drew', () => {
+		// Only a session that stopped where the engine said (not one that failed, fell behind or went silent).
+		expect(source).toContain('takeBack = pb.resumable && ahead ? new TakeBack(ahead.at) : null;');
+		// The surface's route comes back while the stream still paints, and the pump asks the GPU only once a session is begun.
+		expect(source).toContain('streaming: streaming && !returning,');
+		expect(source).toContain('streaming: () => streaming && gpuPlay === null,');
+		// The session holds its picture at the time made ready, which is in the audible time.
+		expect(source).toContain('new GpuPlayback(playFps, tb.resume, true)');
+		// The stream stops once the GPU's first frame is on the screen, and the play is the GPU's again.
+		expect(source).toContain('if (returning && frames.gpuShown) untrack(finishTakeBack);');
 	});
 
 	test('a plain stream is the clock itself, with no limit on where it starts', () => {

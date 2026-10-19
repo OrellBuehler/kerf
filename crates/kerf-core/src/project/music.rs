@@ -644,6 +644,9 @@ impl Project {
         } else if let Some(id) = req.clip_id {
             let timeline = self.working_timeline()?;
             let clip = timeline.clip(id).ok_or(Error::ClipNotFound(id))?;
+            if clip.is_generated() {
+                return Err(Error::InvalidArgument("that clip is a title, which has no sound".to_string()));
+            }
             let asset = self.require_asset(clip.asset_id)?;
             let secs = (clip.source_out - clip.source_in).max(0.0);
             resolve_file(asset, clip.source_in, secs, clip.volume, "clip")?
@@ -653,14 +656,10 @@ impl Project {
                 return Err(invalid("range needs 0 <= start < end, in seconds"));
             }
             let (timeline, assets) = self.levels_inputs()?;
-            let cut = timeline.for_render().duration();
-            if cut <= 0.0 || range.start >= cut {
-                return Err(invalid(format!(
-                    "range starts at {:.1}s but the cut is {cut:.1}s long",
-                    range.start
-                )));
+            if let Some(why) = timeline.range_past_the_sound(range.start) {
+                return Err(invalid(why));
             }
-            let end = range.end.min(cut);
+            let end = range.end.min(timeline.untitled_duration());
             let name = "mix".to_string();
             return self.band_plan_for_mix(timeline, assets, range, end, name, req);
         };
