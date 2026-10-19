@@ -112,10 +112,11 @@ pub use platform::{
 pub use play_plan::{PlayAhead, PlayCut, PlayRefusal};
 pub use project::{
     AlignTo, AudioSync, AudioSyncMeasure, AudioSyncPlan, BandBalance, BandBalanceRequest, BandPlan, BandSource, ComposePlan,
-    ComposeRequest, Composed, DeliveryInputs, ExportedFile, FramingPlan, MissingAsset, Page, Project, RelinkCheck, Relinked,
-    RemovedAsset, ScoreAlign, SmartCropJob, SmartCropPlan, StemsPlaced, SubsetApplied, SvgChecked, SvgLayout, SvgOverlayResult,
-    SvgSource, SyncSide, TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited, DEFAULT_HISTORY_LIMIT,
-    MAX_CHANNEL_KEYS, MAX_SYNC_SECONDS, MUSIC_TRACK, SCHEMA_VERSION, STAGED_UNDO_DEPTH, SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
+    ComposeRequest, Composed, DeliveryInputs, ExportedFile, FramingPlan, MissingAsset, Page, PreparedText, Project, RelinkCheck,
+    Relinked, RemovedAsset, ScoreAlign, SmartCropJob, SmartCropPlan, StemsPlaced, SubsetApplied, SvgChecked, SvgLayout,
+    SvgOverlayResult, SvgSource, SyncSide, TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited, TitleTextForm,
+    TitleTextInputs, DEFAULT_HISTORY_LIMIT, MAX_CHANNEL_KEYS, MAX_SYNC_SECONDS, MUSIC_TRACK, SCHEMA_VERSION, STAGED_UNDO_DEPTH,
+    SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
 };
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use recovery::{Recoverable, RecoveryInfo};

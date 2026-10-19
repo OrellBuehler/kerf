@@ -145,6 +145,8 @@ pub(super) const TOOLS: &[(&str, &str, Effect)] = &[
     ("save_template", "Save template", Edit),
     ("apply_template", "Apply template", Edit),
     ("set_template_values", "Set template values", Set),
+    ("set_title_text_box", "Set title text box", Set),
+    ("convert_title_text", "Convert title text", Set),
     ("import_template", "Import template", Set),
     ("export_template", "Export template", Destroy),
     ("delete_template", "Delete template", Erase),

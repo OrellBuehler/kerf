@@ -285,6 +285,14 @@ template?, svg_bytes}, warnings}`; `set_template_values` dispatches on the id (`
 the title clip; `save_template` and `preview_svg_overlay` take a title clip's id too. `timeline_summary` lists `title_clips`
 (the clips are also counted in their tracks); `get_timeline_state` elides a large title clip's source like a floating one's. The
 instructions say a title can be a clip on a track that takes a transition (a dip to white into an end card).
+**A title's text over MCP** (`mcp/templates.rs`). **`set_title_text_box { title_id, element, width?, fit? }`** gives a `<text>`
+of any title but a preset a box (`width` in the title's units, omitted to take it away; `fit` `wrap` | `shrink`) and
+**`convert_title_text { title_id, to: "outlines" | "text" }`** draws its text as glyph outlines or with its fonts (a template
+title cannot go back to text). Both take `title_text_inputs` and prepare on `blocking` before the lock, then `edit()` runs
+`set_title_text_parsed`, answering the overlay or the title clip (`title_text_outcome`, which `set_template_values` shares);
+both are idempotent sets. `svg_bytes` in `SvgOverlaySummary` / `TitleClipSummary` is the **text form's** size
+(`text_form_bytes`, the source `get_timeline_state` shows), not the stored one with its paths; `validate_svg`'s is the sanitised
+document's (an agent's own source is never outlined). The instructions name `set_title_text_box` for text of any length.
 `import_asset` refuses a UNC / device-namespace `path` before any filesystem call (`require_local_input_path`), then a URL,
 protocol, relative path or missing file (`validate_import_path`). It is the one write that does **not** stage — a file on disk is not
 an edit to the user's cut, so imported media (and its background proxy) lands for
@@ -579,7 +587,8 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
   `compose_music`, `music_status`, `separate_stems`, `stems_status`.
 - **Titles, captions, markers, frame**: `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
   `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `add_title_clip`, `update_title_clip`, `list_svg_presets`, `validate_svg`, `preview_svg_overlay`,
-  `preview_svg_preset`, `list_templates`, `save_template`, `apply_template`, `set_template_values`, `import_template`,
+  `preview_svg_preset`, `list_templates`, `save_template`, `apply_template`, `set_template_values`, `set_title_text_box`,
+  `convert_title_text`, `import_template`,
   `export_template`, `delete_template`, `generate_captions`, `import_captions`, `clear_captions`, `export_srt`, `export_captions`, `add_marker`,
   `update_marker`, `remove_marker`, `set_delivery_format`.
 - **Voiceover**: `generate_voiceover`, `voiceover_status`.

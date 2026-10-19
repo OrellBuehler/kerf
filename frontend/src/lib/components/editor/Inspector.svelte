@@ -11,6 +11,7 @@
 	import SliderRow from './SliderRow.svelte';
 	import GradeSections from './GradeSections.svelte';
 	import TemplateSection from './TemplateSection.svelte';
+	import TextSection from './TextSection.svelte';
 	import MediaChips from './MediaChips.svelte';
 	import AnalysisRun from './AnalysisRun.svelte';
 	import AssetInspector from './AssetInspector.svelte';
@@ -73,6 +74,7 @@
 	import ComposedMusic from './ComposedMusic.svelte';
 	import { scoreTitle } from '#lib/music-score';
 	import { titleName, titleOf } from '#lib/title-clips';
+	import { isOutlined, textForm } from '#lib/title-text';
 
 	const clip = $derived(editor.selectedClip);
 	/** Rename the title clip the name field took focus on (one edit; an unchanged name writes nothing). */
@@ -444,11 +446,14 @@
 	let sourceWarnings = $state<string[]>([]);
 	let sourceRuns = $state<number | null>(null);
 	let applying = $state(false);
-	const draftDirty = $derived(svgTitle ? draft !== svgTitle.svg : false);
+	// A title whose text is glyph outlines shows it as the `<text>` it was: the paths are the engine's.
+	const shownSource = $derived(svgTitle ? textForm(svgTitle.svg) : '');
+	const sourceOutlined = $derived(svgTitle ? isOutlined(svgTitle.svg) : false);
+	const draftDirty = $derived(svgTitle ? draft !== shownSource : false);
 
 	$effect(() => {
 		const id = svgTitle?.id ?? null;
-		const text = svgTitle?.svg ?? '';
+		const text = shownSource;
 		untrack(() => {
 			if (!id) {
 				seeded = null;
@@ -497,7 +502,7 @@
 		}
 	}
 	function revertSource() {
-		if (svgTitle) draft = svgTitle.svg;
+		if (svgTitle) draft = shownSource;
 		sourceError = null;
 	}
 
@@ -1258,10 +1263,17 @@
 				SMIL animation (animate, set, animateTransform) is drawn; scripts, external images and CSS animations are not. Make the
 				viewBox the frame. Times count from the start of the title.
 			</div>
+			{#if sourceOutlined && !o.template}
+				<div data-source-outlined style="font-size:12px;color:var(--text-muted);margin-top:6px;line-height:1.4">
+					Its text is drawn as outlines and shown here as text. Applying a change draws it with its fonts until you draw it as
+					outlines again (Text, below).
+				</div>
+			{/if}
 		</InspectorSection>
 	{/if}
 
 	{#if !o.template && !o.preset}<TemplateSection {o} />{/if}
+	{#if !o.preset}<TextSection o={{ id: o.id, name: svgDisplayName(o), svg: o.svg, template: o.template }} />{/if}
 
 	<div style="margin-top:18px">
 		<Btn
@@ -1449,6 +1461,7 @@
 					</div>
 				</InspectorSection>
 				<TemplateSection o={{ id: clip.id, svg: titleClip.svg, template: titleClip.template }} />
+				<TextSection o={{ id: clip.id, name: titleName(titleClip), svg: titleClip.svg, template: titleClip.template }} />
 			{:else}
 			<InspectorSection title="Speed" summary={`${Math.abs(speed).toFixed(2)}×${speed < 0 ? ' · reverse' : ''}`}>
 			{@render rangeRow('Rate', Math.abs(speed), { min: 0.25, max: 4, step: 0.25, neutral: 1, ...TIMES }, (v, at) => {

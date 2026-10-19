@@ -13,13 +13,14 @@
 //! glyphs inherit the element's paint (a `<tspan>`'s own paint goes on a `<g>` around its glyphs), the
 //! box path gives the group the bounding box usvg gives the text (a filter or mask region measured on it
 //! stays put), and animations of the element's paint, opacity, visibility or transform drive the group
-//! as they drove the text. It adds what usvg lacks: `inline-size` wraps lines (SVG 2) and
-//! `white-space: pre-line` breaks them at a newline.
+//! as they drove the text. It adds what usvg lacks: `inline-size` wraps lines (SVG 2), or with
+//! `data-kerf-fit="shrink"` sets the text on one line made smaller until it fits (everything that follows
+//! the font size scaled together), and `white-space: pre-line` breaks lines at a newline.
 //!
 //! **Anything else stays text**, drawn by resvg with its font as before: positioned or nested `<tspan>`s,
 //! `textPath`, `dx` / `dy` / `rotate` / `textLength`, vertical or right-to-left text, decorations, font
-//! features and variation settings, a gradient or pattern paint (each glyph would be its own bounding
-//! box), dashes, an animation of anything that moves the glyphs, a `<style>` rule that would match
+//! features and variation settings, a gradient or pattern paint measured on the bounding box (each glyph
+//! would be its own; one in `userSpaceOnUse` is drawn the same), dashes, an animation of anything that moves the glyphs, a `<style>` rule that would match
 //! differently once the element is a `<g>` (or match a generated element), a character no font has, a
 //! colour glyph, or a result over the title's size cap.
 
@@ -44,6 +45,9 @@ use crate::text::{self, Align, Baseline, Face, Paragraph, Run, Variation};
 pub(crate) const TEXT_MARK: &str = "data-kerf-text";
 /// The mark of the generated group of glyphs inside it.
 pub(crate) const GLYPHS_MARK: &str = "data-kerf-glyphs";
+/// How a text with an `inline-size` fits its box: absent (or `wrap`) its lines wrap, `shrink` sets it on
+/// one line (and at each newline) and makes it smaller until it fits. A text drawn with its font ignores it.
+pub(crate) const FIT_MARK: &str = "data-kerf-fit";
 
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 /// usvg's defaults: `font-size` and the resolution of absolute units.
@@ -68,6 +72,8 @@ pub(crate) struct Outlined {
     /// How many `<text>` elements are outlines now.
     pub(crate) count: usize,
     pub(crate) warnings: Vec<String>,
+    /// Each text that stays text and why ("the text “t” (a <tspan> with dy)").
+    pub(crate) kept: Vec<String>,
 }
 
 /// Properties whose animation moves glyphs: a text driven by one (on itself or an ancestor) stays text.
@@ -636,6 +642,41 @@ impl Spec {
     }
 }
 
+/// Whether a `url(#id)` paint is drawn the same on each glyph's path as on the text: a gradient or a
+/// pattern laid out in user space (its own `gradientUnits`, or `patternUnits` and `patternContentUnits`,
+/// or the first an `href` chain gives). One measured on the bounding box would be measured on each glyph.
+fn user_space_paint(node: Node, value: &str) -> bool {
+    let Ok(svgtypes::Paint::FuncIRI(id, _)) = svgtypes::Paint::from_str(value) else {
+        return false;
+    };
+    let doc = node.document();
+    let find = |id: &str| doc.descendants().find(|n| n.is_element() && n.attribute("id") == Some(id));
+    let Some(mut at) = find(id) else {
+        return false;
+    };
+    let kind = at.tag_name().name();
+    let names: &[&str] = match kind {
+        "linearGradient" | "radialGradient" => &["gradientUnits"],
+        "pattern" => &["patternUnits", "patternContentUnits"],
+        _ => return false,
+    };
+    let mut units: [Option<&str>; 2] = [None, None];
+    for _ in 0..16 {
+        for (i, name) in names.iter().enumerate() {
+            units[i] = units[i].or_else(|| at.attribute(*name).map(str::trim));
+        }
+        let href = at.attribute("href").or_else(|| at.attribute((XLINK_NS, "href")));
+        match href.and_then(|h| h.trim().strip_prefix('#')).and_then(find) {
+            Some(next) if next != at => at = next,
+            _ => break,
+        }
+    }
+    match kind {
+        "pattern" => units[0] == Some("userSpaceOnUse") && units[1] != Some("objectBoundingBox"),
+        _ => units[0] == Some("userSpaceOnUse"),
+    }
+}
+
 fn spec(css: &Cascade, owner: Node) -> std::result::Result<Spec, String> {
     let refuse = |prop: &str, ok: &[&str], inherited: bool| -> std::result::Result<(), String> {
         match css.get(owner, prop, inherited) {
@@ -681,7 +722,7 @@ fn spec(css: &Cascade, owner: Node) -> std::result::Result<Spec, String> {
     }
     for p in ["fill", "stroke"] {
         if let Some(v) = css.get(owner, p, true) {
-            if v.contains("url(") || v.starts_with("context-") {
+            if v.starts_with("context-") || (v.contains("url(") && !user_space_paint(owner, &v)) {
                 return Err(format!("{p} “{v}”"));
             }
         }
@@ -1065,16 +1106,23 @@ fn set(cx: &mut Ctx, node: Node) -> std::result::Result<Option<Set>, String> {
         Some(v) => Some(length_at(v, || font_size).ok_or_else(|| format!("inline-size “{v}”"))?),
     }
     .filter(|w| *w > 0.0);
+    // Shrunk to its box: set on one line (and at each newline) no wider than `inline-size`.
+    let shrink = width.is_some() && node.attribute(FIT_MARK).map(str::trim) == Some("shrink");
+    // The line height, and whether it follows the font size (a number, `em`, `ex`, a percentage).
     let line_height = match cx.css.find(node, "line-height", true) {
         None => None,
         Some((_, v)) if v == "normal" => None,
         Some((at, v)) => {
             let fs = cx.css.font_size(at);
             match v.parse::<f32>() {
-                Ok(n) if n.is_finite() && n >= 0.0 => Some(n * font_size),
+                Ok(n) if n.is_finite() && n >= 0.0 => Some((n * font_size, true)),
                 _ => match svgtypes::Length::from_str(&v) {
-                    Ok(len) if len.unit == svgtypes::LengthUnit::Percent => Some(len.number as f32 * fs * 0.01),
-                    _ => Some(length_at(&v, || fs).ok_or_else(|| format!("line-height “{v}”"))?),
+                    Ok(len) if len.unit == svgtypes::LengthUnit::Percent => Some((len.number as f32 * fs * 0.01, true)),
+                    Ok(len) => {
+                        let relative = matches!(len.unit, svgtypes::LengthUnit::Em | svgtypes::LengthUnit::Ex);
+                        Some((length_at(&v, || fs).ok_or_else(|| format!("line-height “{v}”"))?, relative))
+                    }
+                    Err(_) => return Err(format!("line-height “{v}”")),
                 },
             }
         }
@@ -1141,10 +1189,40 @@ fn set(cx: &mut Ctx, node: Node) -> std::result::Result<Option<Set>, String> {
         &runs,
         &Paragraph {
             align: anchor,
-            width,
-            line_height,
+            width: width.filter(|_| !shrink),
+            line_height: line_height.map(|(h, _)| h),
         },
     );
+    if let (true, Some(avail)) = (shrink, width) {
+        // Everything that follows the font size, scaled together until the widest line fits (the optical
+        // size moves with the size, so a pass may land a little wide).
+        let mut k = 1.0f32;
+        for _ in 0..4 {
+            let w = lay.width();
+            if w <= avail * (1.0 + 1e-4) || w <= 0.0 {
+                break;
+            }
+            k *= avail / w;
+            let scaled: Vec<Run> = runs
+                .iter()
+                .map(|r| Run {
+                    size: r.size * k,
+                    letter_spacing: r.letter_spacing * k,
+                    word_spacing: r.word_spacing * k,
+                    ..r.clone()
+                })
+                .collect();
+            lay = text::layout(
+                &text,
+                &scaled,
+                &Paragraph {
+                    align: anchor,
+                    width: None,
+                    line_height: line_height.map(|(h, relative)| if relative { h * k } else { h }),
+                },
+            );
+        }
+    }
     if let Some(c) = lay.missing.first() {
         return Err(format!("no font has “{c}”"));
     }
@@ -1260,13 +1338,14 @@ fn num(v: f32) -> String {
 /// outlines honour (`inline-size`, `white-space: pre-line`) says so in a warning. If the outlines would
 /// take the title past its size cap, nothing is outlined.
 pub(crate) fn outline_text(src: &str, db: &Database) -> Result<Outlined> {
-    let unchanged = |warnings| Outlined {
+    let unchanged = |warnings, kept| Outlined {
         svg: src.to_string(),
         count: 0,
         warnings,
+        kept,
     };
     if !src.contains("<text") && !src.contains(":text") {
-        return Ok(unchanged(Vec::new()));
+        return Ok(unchanged(Vec::new(), Vec::new()));
     }
     let doc = Document::parse_with_options(src, xml_options()).map_err(|e| invalid(format!("not valid XML: {e}")))?;
     let css = Cascade::new(&doc);
@@ -1287,7 +1366,9 @@ pub(crate) fn outline_text(src: &str, db: &Database) -> Result<Outlined> {
     let mut cuts = Vec::new();
     let mut count = 0;
     let mut warnings = Vec::new();
-    let mut wrapping = Vec::new();
+    let mut kept = Vec::new();
+    // The outlined texts: their label, and what drawing them with their font would lose.
+    let mut outlined: Vec<(String, Option<&str>)> = Vec::new();
     for node in doc
         .descendants()
         .filter(|n| {
@@ -1298,24 +1379,29 @@ pub(crate) fn outline_text(src: &str, db: &Database) -> Result<Outlined> {
         })
         .take(MAX_TEXTS)
     {
-        let wraps = css.declared(node).get("inline-size").is_some_and(|v| v != "auto")
-            || css.get(node, "white-space", true).as_deref() == Some("pre-line");
+        let boxed = css.declared(node).get("inline-size").is_some_and(|v| v != "auto");
+        let loses = if boxed && node.attribute(FIT_MARK).map(str::trim) == Some("shrink") {
+            Some("so it does not shrink to fit its box")
+        } else if boxed || css.get(node, "white-space", true).as_deref() == Some("pre-line") {
+            Some("so its lines do not wrap")
+        } else {
+            None
+        };
         match plan(&mut cx, node) {
             Ok(Some(mut c)) => {
                 let grown = c.iter().map(|(r, s)| s.len().saturating_sub(r.len())).sum::<usize>();
                 cx.room = cx.room.saturating_sub(grown);
                 cuts.append(&mut c);
                 count += 1;
-                if wraps {
-                    wrapping.push(label(&node));
-                }
+                outlined.push((label(&node), loses));
             }
             Ok(None) => {}
             Err(why) => {
                 tracing::debug!(text = %label(&node), %why, "text kept as text");
-                if wraps {
+                kept.push(format!("the text {} ({why})", label(&node)));
+                if let Some(loses) = loses {
                     warnings.push(format!(
-                        "the text {} is drawn with its font, not as outlines ({why}), so its lines do not wrap",
+                        "the text {} is drawn with its font, not as outlines ({why}), {loses}",
                         label(&node)
                     ));
                 }
@@ -1323,20 +1409,28 @@ pub(crate) fn outline_text(src: &str, db: &Database) -> Result<Outlined> {
         }
     }
     if count == 0 {
-        return Ok(unchanged(warnings));
+        return Ok(unchanged(warnings, kept));
     }
     let svg = apply(src, cuts);
     if svg.len() > MAX_BYTES {
+        let over = format!("they would take the title over {} KiB", MAX_BYTES / 1024);
         let mut warnings = warnings;
-        for l in wrapping {
-            warnings.push(format!(
-                "the text {l} is drawn with its font, not as outlines (they would take the title over {} KiB), so its lines do not wrap",
-                MAX_BYTES / 1024
-            ));
+        for (l, loses) in outlined {
+            kept.push(format!("the text {l} ({over})"));
+            if let Some(loses) = loses {
+                warnings.push(format!(
+                    "the text {l} is drawn with its font, not as outlines ({over}), {loses}"
+                ));
+            }
         }
-        return Ok(unchanged(warnings));
+        return Ok(unchanged(warnings, kept));
     }
-    Ok(Outlined { svg, count, warnings })
+    Ok(Outlined {
+        svg,
+        count,
+        warnings,
+        kept,
+    })
 }
 
 fn label(node: &Node) -> String {
@@ -1377,6 +1471,14 @@ mod tests {
 
     /// Every glyph of every outlined text: id and origin.
     fn ours(src: &str) -> Vec<(u32, f32, f32)> {
+        laid(src)
+            .iter()
+            .flat_map(|lay| lay.glyphs.iter().map(|g| (g.id, g.x, g.y)))
+            .collect()
+    }
+
+    /// Each text of `src` as the engine sets it.
+    fn laid(src: &str) -> Vec<text::Layout> {
         let doc = Document::parse_with_options(src, xml_options()).unwrap();
         let css = Cascade::new(&doc);
         let anims = animations(&doc);
@@ -1393,12 +1495,10 @@ mod tests {
             },
             room: MAX_BYTES,
         };
-        let mut out = Vec::new();
-        for node in doc.descendants().filter(|n| n.is_element() && n.tag_name().name() == "text") {
-            let set = set(&mut cx, node).unwrap().unwrap();
-            out.extend(set.lay.glyphs.iter().map(|g| (g.id, g.x, g.y)));
-        }
-        out
+        doc.descendants()
+            .filter(|n| n.is_element() && n.tag_name().name() == "text")
+            .map(|node| set(&mut cx, node).unwrap().unwrap().lay)
+            .collect()
     }
 
     /// Every glyph usvg lays the same document out with.
@@ -1537,6 +1637,69 @@ mod tests {
             .filter(|(p, q)| p.iter().zip(q.iter()).any(|(x, y)| x.abs_diff(*y) > 24))
             .count();
         assert!(differ < 8, "{differ} pixels differ");
+    }
+
+    const CORPUS_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../frontend/src/lib/fixtures/outline-corpus.json"
+    );
+
+    /// Titles and what outlining them wrote, for the frontend's port of `restore_text` (`title-text.ts`'s
+    /// `textForm`, replayed by `outline-corpus.test.ts`).
+    fn corpus() -> serde_json::Value {
+        let cases: Vec<serde_json::Value> = [
+            ("plain", r#"<text id="t" x="20" y="100" font-family="Geist" font-size="40">Hi</text>"#),
+            (
+                "spans and an animation",
+                "<text x=\"5\" y=\"50\" font-family=\"Geist\">\n  a <tspan id=\"s\" font-weight=\"bold\" fill=\"#f00\">b</tspan>\n  <animate attributeName=\"opacity\" from=\"0\" to=\"1\" dur=\"1s\"/>\n</text><text x=\"5\" y=\"90\">c</text>",
+            ),
+            ("cdata", r#"<text x="5" y="50" font-family="Geist"><![CDATA[a < b </text>]]></text>"#),
+            ("entities", r#"<text x="5" y="50" font-family="Geist">fish &amp; chips &lt;/text&gt;</text>"#),
+            ("comment", r#"<text x="5" y="50" font-family="Geist">a<!-- </text> -->b</text>"#),
+            ("processing instruction", r#"<text x="5" y="50" font-family="Geist">a<?pi </text> ?>b</text>"#),
+            ("spaced end tag", r#"<text x="5" y="50" font-family="Geist">spaced</text >"#),
+            ("attribute", r#"<text x="5" y="50" font-family="Geist" data-x="&lt;/text&gt; &gt;">attr</text>"#),
+            ("self-closing", r#"<text x="5" y="50" font-family="Geist"/><text x="5" y="90" font-family="Geist">after</text>"#),
+            (
+                "a box that shrinks",
+                r#"<text id="n" x="5" y="50" font-family="Geist" font-size="30" inline-size="80" data-kerf-fit="shrink">Long name</text>"#,
+            ),
+            ("one kept as text", r#"<text x="5" y="50" dx="2" font-family="Geist">kept</text><text x="5" y="90" font-family="Geist">set</text>"#),
+            ("none", r#"<rect width="1" height="1"/>"#),
+        ]
+        .into_iter()
+        .map(|(name, body)| {
+            let text = doc(body);
+            let outlined = outline(&text).svg;
+            serde_json::json!({ "name": name, "outlined": outlined, "text": text })
+        })
+        .collect();
+        serde_json::json!({
+            "about": "Written by kerf-core (svg/outline.rs); replayed by outline-corpus.test.ts. Regenerate: KERF_BLESS_CORPUS=1 cargo test -p kerf-core --no-default-features -- outline_corpus",
+            "cases": cases,
+        })
+    }
+
+    #[test]
+    fn outline_corpus_is_what_this_engine_writes() {
+        let fresh = format!("{}\n", serde_json::to_string(&corpus()).expect("serializes"));
+        if std::env::var_os("KERF_BLESS_CORPUS").is_some() {
+            std::fs::write(CORPUS_PATH, &fresh).expect("writes the corpus");
+            return;
+        }
+        let on_disk = std::fs::read_to_string(CORPUS_PATH)
+            .expect("frontend/src/lib/fixtures/outline-corpus.json — generate it with KERF_BLESS_CORPUS=1")
+            .replace("\r\n", "\n");
+        assert!(
+            on_disk == fresh,
+            "the outline corpus is stale: regenerate with KERF_BLESS_CORPUS=1 cargo test -p kerf-core \
+             --no-default-features -- outline_corpus, then run `bun test` — the replay says what textForm has to follow"
+        );
+        // Every case is one restore_text gives back.
+        for case in corpus()["cases"].as_array().unwrap() {
+            let (outlined, text) = (case["outlined"].as_str().unwrap(), case["text"].as_str().unwrap());
+            assert_eq!(restore_text(outlined).unwrap(), text, "{}", case["name"]);
+        }
     }
 
     #[test]
@@ -1716,5 +1879,84 @@ mod tests {
         ));
         assert!(out.svg.contains(r##"<g fill="#f00" stroke="#00f"><path"##), "{}", out.svg);
         assert_eq!(out.svg.matches("<path d=").count(), 3, "{}", out.svg);
+    }
+
+    #[test]
+    fn a_text_shrinks_to_fit_its_box_on_one_line() {
+        let long = "A name far too long for the box";
+        let shrunk = doc(&format!(
+            r#"<text x="20" y="80" font-family="Geist" font-size="40" letter-spacing="2" inline-size="200" data-kerf-fit="shrink">{long}</text>"#
+        ));
+        let lay = laid(&shrunk).remove(0);
+        assert_eq!(lay.lines.len(), 1);
+        let w = lay.width();
+        assert!(w <= 200.02 && w > 199.0, "{w}");
+        assert!(lay.glyphs.iter().all(|g| g.size < 40.0 && (g.y - 80.0).abs() < 0.01));
+        // One that fits already is left at its size, and a newline still breaks (pre-line), each line fitted.
+        let short = doc(
+            r#"<text x="20" y="80" font-family="Geist" font-size="20" inline-size="200" data-kerf-fit="shrink">Short</text>"#,
+        );
+        assert!(laid(&short)[0].glyphs.iter().all(|g| g.size == 20.0));
+        let two = doc(&format!(
+            "<text x=\"20\" y=\"80\" font-family=\"Geist\" font-size=\"40\" white-space=\"pre-line\" inline-size=\"200\" data-kerf-fit=\"shrink\">{long}\nshort</text>"
+        ));
+        let lay = laid(&two).remove(0);
+        assert_eq!(lay.lines.len(), 2);
+        assert!(lay.width() <= 200.02);
+        // Middle-anchored, the shrunk line is centred on its anchor.
+        let middle = doc(&format!(
+            r#"<text x="200" y="80" font-family="Geist" font-size="40" text-anchor="middle" inline-size="200" data-kerf-fit="shrink">{long}</text>"#
+        ));
+        let line = &laid(&middle)[0].lines[0];
+        assert!((line.x + line.width / 2.0).abs() < 0.01, "{line:?}");
+        // Without a box, the mark means nothing; kept as text, it says it does not shrink.
+        let unboxed = doc(&format!(
+            r#"<text x="20" y="80" font-family="Geist" font-size="40" data-kerf-fit="shrink">{long}</text>"#
+        ));
+        assert!(laid(&unboxed)[0].glyphs.iter().all(|g| g.size == 40.0));
+        let kept = outline(&doc(&format!(
+            r#"<text id="t" x="20" y="80" dx="1" font-family="Geist" inline-size="200" data-kerf-fit="shrink">{long}</text>"#
+        )));
+        assert!(kept.warnings.iter().any(|w| w.contains("shrink")), "{:?}", kept.warnings);
+    }
+
+    #[test]
+    fn a_user_space_gradient_or_pattern_is_drawn_the_same_on_the_glyphs() {
+        let src = doc(concat!(
+            r##"<linearGradient id="base" gradientUnits="userSpaceOnUse" x1="0" x2="400"><stop offset="0" stop-color="#f40"/><stop offset="1" stop-color="#04f"/></linearGradient>"##,
+            r##"<linearGradient id="g" href="#base"/>"##,
+            r##"<pattern id="p" patternUnits="userSpaceOnUse" width="12" height="12"><rect width="6" height="12" fill="#0c8"/></pattern>"##,
+            r##"<text x="10" y="90" font-family="Geist" font-size="64" fill="url(#g)">Gradient</text>"##,
+            r##"<text x="10" y="180" font-family="Geist" font-size="64" fill="#222" stroke="url(#p)" stroke-width="3">Pattern</text>"##,
+        ));
+        let out = outline(&src);
+        assert_eq!(out.count, 2, "{}", out.svg);
+        let (a, b) = (pixels(&src), pixels(&out.svg));
+        let differ = a
+            .chunks(4)
+            .zip(b.chunks(4))
+            .filter(|(p, q)| p.iter().zip(q.iter()).any(|(x, y)| x.abs_diff(*y) > 24))
+            .count();
+        assert!(differ < 8, "{differ} pixels differ");
+        // Measured on the bounding box (by default, or through the chain), it stays text.
+        for body in [
+            r##"<linearGradient id="g"><stop offset="0" stop-color="red"/></linearGradient><text x="5" y="50" fill="url(#g)">a</text>"##,
+            r##"<linearGradient id="b" gradientUnits="objectBoundingBox"/><linearGradient id="g" href="#b"/><text x="5" y="50" fill="url(#g)">a</text>"##,
+            r##"<pattern id="p" width="1" height="1"/><text x="5" y="50" fill="url(#p)">a</text>"##,
+            r##"<pattern id="p" patternUnits="userSpaceOnUse" patternContentUnits="objectBoundingBox" width="9" height="9"/><text x="5" y="50" fill="url(#p)">a</text>"##,
+            r##"<filter id="f"/><text x="5" y="50" fill="url(#f)">a</text>"##,
+        ] {
+            assert_eq!(outline(&doc(body)).count, 0, "{body}");
+        }
+    }
+
+    #[test]
+    fn each_text_that_stays_text_says_why() {
+        let out = outline(&doc(concat!(
+            r#"<text id="kept" x="5" y="50" dx="3" font-family="Geist">moved</text>"#,
+            r#"<text id="set" x="5" y="90" font-family="Geist">set</text>"#,
+        )));
+        assert_eq!(out.count, 1);
+        assert_eq!(out.kept, vec!["the text “kept” (dx)".to_string()]);
     }
 }

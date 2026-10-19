@@ -31,6 +31,7 @@ pub mod raster;
 mod rules;
 mod sanitize;
 pub(crate) mod splice;
+mod text_box;
 mod values;
 
 use std::collections::{HashMap, HashSet};
@@ -46,6 +47,7 @@ use values::{TransformType, Value};
 
 pub use outline::restore_text;
 pub use presets::{check_params, preset_infos, render_preset, SvgPresetInfo, SvgPresetParamInfo, DEFAULT_FRAME};
+pub use text_box::{set_text_box, text_box_of, TextBox, TextFit, MAX_BOX_WIDTH};
 
 /// Whether sanitised source could move at all: whether it holds an animation element (`animate`,
 /// `animateColor`, `animateTransform`, `animateMotion` or `set`, with or without a prefix). A cheap
@@ -303,22 +305,27 @@ impl SvgDoc {
     /// Slow (the text engine, and the sanitiser once more when anything was outlined): not for under the
     /// project lock.
     pub(crate) fn outlined(self, db: &fontdb::Database) -> Result<SvgDoc> {
+        Ok(self.outlined_counted(db)?.0)
+    }
+
+    /// [`SvgDoc::outlined`], with how many texts are outlines now and each that stays text and why.
+    pub(crate) fn outlined_counted(self, db: &fontdb::Database) -> Result<(SvgDoc, usize, Vec<String>)> {
         let out = outline::outline_text(&self.src, db)?;
-        let mut doc = match out.count {
-            0 => self,
-            _ => match SvgDoc::parse(&out.svg) {
+        let (mut doc, count) = match out.count {
+            0 => (self, 0),
+            n => match SvgDoc::parse(&out.svg) {
                 Ok(mut doc) => {
                     doc.warnings = self.warnings;
-                    doc
+                    (doc, n)
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "a title's outlines did not read; its text is drawn with its fonts");
-                    self
+                    (self, 0)
                 }
             },
         };
         doc.warnings.extend(out.warnings);
-        Ok(doc)
+        Ok((doc, count, out.kept))
     }
 
     /// The sanitised source.

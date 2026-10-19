@@ -287,6 +287,107 @@ struct ParaLine {
     height: f32,
 }
 
+/// The widths of a paragraph's ranges, from each cluster's advance (by its byte) and the letter spacing
+/// after it.
+struct Widths<'a> {
+    text: &'a str,
+    cluster_adv: &'a [f32],
+    spacing: &'a [f32],
+    /// Sums from the start: a range is one subtraction however often a break is tried. Sums of many f32s
+    /// drift, so a width this close to what it is compared with is summed directly instead.
+    sums: Vec<f32>,
+    near: f32,
+}
+
+impl<'a> Widths<'a> {
+    fn new(text: &'a str, cluster_adv: &'a [f32], spacing: &'a [f32]) -> Self {
+        let mut sums = vec![0.0f32; cluster_adv.len() + 1];
+        for (i, a) in cluster_adv.iter().enumerate() {
+            sums[i + 1] = sums[i] + a;
+        }
+        let total = cluster_adv.iter().map(|a| a.abs()).sum::<f32>();
+        Self {
+            text,
+            cluster_adv,
+            spacing,
+            sums,
+            near: total * 1e-4 + 1e-3,
+        }
+    }
+
+    /// Where `r`'s content ends: before its trailing white space at a wrap.
+    fn content_end(&self, r: &Range<usize>, wrapped: bool) -> usize {
+        if !wrapped {
+            return r.end;
+        }
+        let mut end = r.end;
+        for (b, c) in self.text[r.clone()].char_indices().rev() {
+            if !c.is_whitespace() {
+                break;
+            }
+            end = r.start + b;
+        }
+        end
+    }
+
+    /// The cluster that ends a line's content (white space at a wrap left out): its letter spacing does
+    /// not count, as usvg leaves it off a chunk's last cluster.
+    fn last_cluster(&self, r: &Range<usize>, wrapped: bool) -> Option<usize> {
+        let end = self.content_end(r, wrapped);
+        self.text[r.start..end]
+            .char_indices()
+            .rev()
+            .map(|(b, _)| r.start + b)
+            .find(|b| self.cluster_adv[*b] != 0.0 || self.spacing[*b] != 0.0)
+    }
+
+    /// The advance of `r`'s content: from the running sums, or (`exact`) summed in order as the pen does.
+    fn content(&self, r: &Range<usize>, wrapped: bool, exact: bool) -> f32 {
+        let end = self.content_end(r, wrapped);
+        let sum = if exact {
+            self.cluster_adv[r.start..end].iter().sum()
+        } else {
+            self.sums[end] - self.sums[r.start]
+        };
+        sum - self.last_cluster(r, wrapped).map_or(0.0, |b| self.spacing[b])
+    }
+
+    /// Whether `r` fits in `avail`: from the sums unless that is too close to call.
+    fn fits(&self, r: &Range<usize>, avail: f32) -> bool {
+        let w = self.content(r, true, false);
+        if (w - avail).abs() <= self.near {
+            return self.content(r, true, true) <= avail;
+        }
+        w <= avail
+    }
+}
+
+/// The lines of a paragraph wrapped greedily at its UAX #14 break opportunities: each takes as much as
+/// fits in `avail` (one too long for a line on its own takes a line).
+fn wrap(widths: &Widths, avail: f32) -> Vec<Range<usize>> {
+    let text = widths.text;
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    let mut start = 0usize;
+    let mut last_ok: Option<usize> = None;
+    for (p, _) in unicode_linebreak::linebreaks(text) {
+        loop {
+            if widths.fits(&(start..p), avail) || last_ok.is_none() {
+                last_ok = Some(p);
+                break;
+            }
+            let Some(b) = last_ok.take() else { break };
+            ranges.push(start..b);
+            start = b;
+        }
+    }
+    ranges.push(start..text.len());
+    ranges.retain(|r| !r.is_empty());
+    if ranges.is_empty() {
+        ranges.push(0..text.len());
+    }
+    ranges
+}
+
 /// Lay out one paragraph (no newline) that starts at byte `base` of the whole text.
 fn paragraph(
     text: &str,
@@ -367,67 +468,16 @@ fn paragraph(
             cluster_adv[cl] += it.glyphs[k].adv;
         }
     }
-    // Sums from the start, so a line's width is one subtraction however often a break is tried (and,
-    // for a line from the start, the very sum the pen makes).
-    let mut sums = vec![0.0f32; cluster_adv.len() + 1];
-    for (i, a) in cluster_adv.iter().enumerate() {
-        sums[i + 1] = sums[i] + a;
-    }
-    let range_w = |r: Range<usize>| -> f32 { sums[r.end] - sums[r.start] };
-    let trailing_ws = |r: &Range<usize>| -> usize {
-        let mut end = r.end;
-        for (b, c) in text[r.clone()].char_indices().rev() {
-            if !c.is_whitespace() {
-                break;
-            }
-            end = r.start + b;
-        }
-        end
+    let widths = Widths::new(text, &cluster_adv, &spacing);
+    let ranges = match width {
+        None => vec![0..text.len()],
+        Some(avail) => wrap(&widths, avail),
     };
-    // The cluster that ends a line's content (white space at a wrap left out): its letter spacing does
-    // not count, as usvg leaves it off a chunk's last cluster.
-    let last_cluster = |r: &Range<usize>, wrapped: bool| -> Option<usize> {
-        let end = if wrapped { trailing_ws(r) } else { r.end };
-        text[r.start..end]
-            .char_indices()
-            .rev()
-            .map(|(b, _)| r.start + b)
-            .find(|b| cluster_adv[*b] != 0.0 || spacing[*b] != 0.0)
-    };
-    let content_w = |r: &Range<usize>, wrapped: bool| -> f32 {
-        let end = if wrapped { trailing_ws(r) } else { r.end };
-        range_w(r.start..end) - last_cluster(r, wrapped).map_or(0.0, |b| spacing[b])
-    };
-    let mut ranges: Vec<Range<usize>> = Vec::new();
-    match width {
-        None => ranges.push(0..text.len()),
-        Some(avail) => {
-            let mut start = 0usize;
-            let mut last_ok: Option<usize> = None;
-            for (p, _) in unicode_linebreak::linebreaks(text) {
-                loop {
-                    let w = content_w(&(start..p), true);
-                    if w <= avail || last_ok.is_none() {
-                        last_ok = Some(p);
-                        break;
-                    }
-                    let Some(b) = last_ok.take() else { break };
-                    ranges.push(start..b);
-                    start = b;
-                }
-            }
-            ranges.push(start..text.len());
-            ranges.retain(|r| !r.is_empty());
-            if ranges.is_empty() {
-                ranges.push(0..text.len());
-            }
-        }
-    }
     let nlines = ranges.len();
     let mut out = Vec::new();
     for (li, r) in ranges.into_iter().enumerate() {
         let wrapped = li + 1 < nlines;
-        let end_cluster = last_cluster(&r, wrapped);
+        let end_cluster = widths.last_cluster(&r, wrapped);
         let (levels, vruns) = bidi.visual_runs(r.clone());
         let mut pen = 0.0f32;
         let mut glyphs = Vec::new();
@@ -485,7 +535,7 @@ fn paragraph(
         }
         out.push(ParaLine {
             range: base + r.start..base + r.end,
-            width: content_w(&r, wrapped),
+            width: widths.content(&r, wrapped, true),
             glyphs,
             boxes,
             shifts: if shifts.0 <= shifts.1 { shifts } else { (0.0, 0.0) },
@@ -697,5 +747,63 @@ mod tests {
         let space = set(" ", Paragraph::default());
         let mut d = String::new();
         assert!(!super::super::glyph_path(&space.glyphs[0], &mut d));
+    }
+
+    /// The same greedy wrap with every width summed directly, cluster by cluster.
+    fn wrapped_by(widths: &Widths, avail: f32, exact: bool) -> Vec<Range<usize>> {
+        let mut ranges = Vec::new();
+        let (mut start, mut last_ok) = (0usize, None);
+        for (p, _) in unicode_linebreak::linebreaks(widths.text) {
+            loop {
+                if widths.content(&(start..p), true, exact) <= avail || last_ok.is_none() {
+                    last_ok = Some(p);
+                    break;
+                }
+                let Some(b) = last_ok.take() else { break };
+                ranges.push(start..b);
+                start = b;
+            }
+        }
+        ranges.push(start..widths.text.len());
+        ranges.retain(|r: &Range<usize>| !r.is_empty());
+        ranges
+    }
+
+    #[test]
+    fn a_long_paragraph_breaks_where_the_direct_sums_do() {
+        // 3000 characters of words, advances that f32 sums do not hold exactly.
+        let mut seed = 0x2545_f491_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let mut text = String::new();
+        while text.len() < 3000 {
+            for _ in 0..1 + next() % 9 {
+                text.push('a');
+            }
+            text.push(' ');
+        }
+        let adv: Vec<f32> = (0..=text.len())
+            .map(|_| 3.0 + (next() % 14_000) as f32 / 1000.0 * 1.1)
+            .collect();
+        let spacing: Vec<f32> = (0..=text.len()).map(|i| if i % 7 == 0 { 0.37 } else { 0.0 }).collect();
+        let widths = Widths::new(&text, &adv, &spacing);
+        // Widths in general, and widths exactly as wide as a line is: where a break is decided by the last
+        // bits of a sum.
+        let mut avails: Vec<f32> = (0..60).map(|i| 40.0 + i as f32 * 7.13).collect();
+        for avail in avails.clone() {
+            let lines = wrapped_by(&widths, avail, true);
+            avails.extend(lines.iter().skip(1).step_by(9).map(|r| widths.content(r, true, true)));
+        }
+        let mut flipped = 0;
+        for avail in avails {
+            let want = wrapped_by(&widths, avail, true);
+            assert_eq!(wrap(&widths, avail), want, "at {avail}");
+            flipped += usize::from(wrapped_by(&widths, avail, false) != want);
+        }
+        assert!(flipped > 0, "the running sums alone break some of these differently");
     }
 }

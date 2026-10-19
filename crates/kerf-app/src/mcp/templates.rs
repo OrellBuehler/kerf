@@ -142,6 +142,44 @@ pub(super) struct ApplyTemplateParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub(super) struct SetTitleTextBoxParams {
+    #[schemars(
+        description = "UUID of an animated title: a floating one (timeline_summary's `svg_overlays`) or a title clip (`title_clips`). Not a preset title, which is drawn from its parameters"
+    )]
+    title_id: String,
+    #[schemars(
+        description = "The `id` of the <text> element to give the box; get_timeline_state shows the title's source (a template's text controls name theirs)"
+    )]
+    element: String,
+    #[schemars(
+        description = "The box's width in the title's own units (its viewBox), from the text's x as text-anchor places it (start: rightward; middle: half each side). Omit or null to take the box away"
+    )]
+    width: Option<f64>,
+    #[schemars(
+        description = "\"wrap\" (default): the lines wrap at the width (and at a newline with white-space: pre-line). \"shrink\": the text stays on one line (one per newline) and is made smaller, never larger, until it fits — for a name or a tagline of any length"
+    )]
+    fit: Option<kerf_core::svg::TextFit>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub(super) struct ConvertTitleTextParams {
+    #[schemars(description = "UUID of an animated title: a floating one or a title clip, not a preset title")]
+    title_id: String,
+    #[schemars(
+        description = "\"outlines\": draw the title's text as the paths of its glyphs (the same on every machine, whatever fonts it has; the only form in which a text box wraps or shrinks). \"text\": draw it with its fonts again (not for a template title, whose text is set as outlines whenever its values change)"
+    )]
+    to: kerf_core::TitleTextForm,
+}
+
+/// A title-text edit answered the way the other title edits are.
+fn title_text_outcome(done: TitleEdited) -> Result<String, McpError> {
+    match done {
+        TitleEdited::Overlay(out) => json(&SvgOverlayOutcome::from(*out)),
+        TitleEdited::Clip(out) => json(&TitleClipOutcome::from(*out)),
+    }
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub(super) struct SetTemplateValuesParams {
     #[schemars(
         description = "UUID of an animated title that came from a template: a floating one (its entry in timeline_summary's `svg_overlays` has a `template`) or a title clip (in `title_clips`)"
@@ -419,12 +457,64 @@ impl KerfMcp {
         let overlay_id = parse_arg("overlay_id", &p.overlay_id)?;
         let (project, owner) = (self.project.clone(), self.owner());
         let prepared = blocking(move || prepare_values(&project, owner.as_deref(), overlay_id, p.values, p.image_files)).await?;
-        self.edit(
-            |project| match project.set_title_values_parsed(overlay_id, prepared).map_err(core_err)? {
-                TitleEdited::Overlay(out) => json(&SvgOverlayOutcome::from(*out)),
-                TitleEdited::Clip(out) => json(&TitleClipOutcome::from(*out)),
-            },
-        )
+        self.edit(|project| title_text_outcome(project.set_title_values_parsed(overlay_id, prepared).map_err(core_err)?))
+    }
+
+    #[tool(
+        description = "Give a <text> of an animated title (custom or a template, floating or a title clip; not a \
+                       preset) a box: a `width` its lines wrap to, or with fit=\"shrink\" a width it stays on one line \
+                       within, made smaller until it fits (a name of any length on a lower third). Omit `width` to take \
+                       the box away. A box is drawn only when the text is glyph outlines, so the title's text is set as \
+                       outlines (see convert_title_text); a text that cannot be one is drawn with its font and runs on, \
+                       which `warnings` says. One edit; the title keeps its id, timing, placement and template values. \
+                       If the title changed while this ran, it says so: call again."
+    )]
+    async fn set_title_text_box(&self, Parameters(p): Parameters<SetTitleTextBoxParams>) -> Result<String, McpError> {
+        let title_id = parse_arg("title_id", &p.title_id)?;
+        let text_box = kerf_core::svg::TextBox {
+            width: p.width,
+            fit: p.fit.unwrap_or_default(),
+        };
+        let (project, owner, element) = (self.project.clone(), self.owner(), p.element);
+        let prepared = blocking(move || {
+            let inputs = lock_agent_as(&project, owner.as_deref())
+                .title_text_inputs(title_id)
+                .map_err(core_err)?;
+            inputs.text_box(&element, &text_box).map_err(core_err)
+        })
+        .await?;
+        self.edit(|project| {
+            title_text_outcome(
+                project
+                    .set_title_text_parsed(title_id, prepared, "Set text box")
+                    .map_err(core_err)?,
+            )
+        })
+    }
+
+    #[tool(
+        description = "Draw an animated title's text as glyph outlines (to=\"outlines\": the same on every machine \
+                       whatever fonts it has, and what a text box needs) or with its fonts again (to=\"text\"). A \
+                       template title's text is outlines already and cannot go back. Each text that cannot be an \
+                       outline (a textPath, positioned tspans, right-to-left or vertical text, ...) stays text and \
+                       `warnings` says why; a title none of whose text can is an error. get_timeline_state shows the \
+                       source as text either way. One edit."
+    )]
+    async fn convert_title_text(&self, Parameters(p): Parameters<ConvertTitleTextParams>) -> Result<String, McpError> {
+        let title_id = parse_arg("title_id", &p.title_id)?;
+        let (project, owner, form) = (self.project.clone(), self.owner(), p.to);
+        let prepared = blocking(move || {
+            let inputs = lock_agent_as(&project, owner.as_deref())
+                .title_text_inputs(title_id)
+                .map_err(core_err)?;
+            inputs.convert(form).map_err(core_err)
+        })
+        .await?;
+        let label = match form {
+            kerf_core::TitleTextForm::Outlines => "Draw text as outlines",
+            kerf_core::TitleTextForm::Text => "Draw text with its fonts",
+        };
+        self.edit(|project| title_text_outcome(project.set_title_text_parsed(title_id, prepared, label).map_err(core_err)?))
     }
 
     #[tool(
@@ -607,6 +697,13 @@ mod tests {
             assert!(working.svg_overlays.iter().any(|o| o.svg.contains(">See you soon</text>")));
             out
         };
+        // The size an agent is told is that of the source it reads.
+        let text_form = kerf_core::svg::restore_text(&out.overlay.svg).unwrap();
+        assert!(text_form.len() < out.overlay.svg.len());
+        assert_eq!(
+            serde_json::to_value(SvgOverlayOutcome::from(out.clone())).unwrap()["overlay"]["svg_bytes"],
+            text_form.len()
+        );
         let summary = serde_json::to_value(SvgOverlayOutcome::from(out)).unwrap();
         assert_eq!(summary["overlay"]["name"], "End card");
         assert_eq!(summary["overlay"]["start"], 10.0);
