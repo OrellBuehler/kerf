@@ -30,8 +30,19 @@ static PENDING: AtomicU32 = AtomicU32::new(0);
 static LISTENER: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
 
 /// Who to wake when an area is newly marked. One per process; a second is refused (`false`).
+///
+/// A project is opened before anyone listens, so areas are marked by then and would never be newly
+/// marked again until someone took them: a listener set while marks are pending is woken at once.
 pub fn set_listener(listener: impl Fn() + Send + Sync + 'static) -> bool {
-    LISTENER.set(Box::new(listener)).is_ok()
+    if LISTENER.set(Box::new(listener)).is_err() {
+        return false;
+    }
+    if PENDING.load(Ordering::Acquire) != 0 {
+        if let Some(listener) = LISTENER.get() {
+            listener();
+        }
+    }
+    true
 }
 
 /// The areas marked since the last take, and the set emptied.
@@ -78,6 +89,13 @@ pub(crate) fn table_area(table: &str) -> u32 {
 mod tests {
     use super::*;
 
+    /// Held by the tests that take the marks: the other tests of the process only ever add some.
+    static TAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn taking() -> std::sync::MutexGuard<'static, ()> {
+        TAKING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn each_table_belongs_to_an_area_and_the_rest_are_the_projects() {
         assert_eq!(table_area("timeline"), TIMELINE);
@@ -90,10 +108,30 @@ mod tests {
         assert_eq!(names(ALL).len(), 5);
     }
 
+    /// Marks made before anyone listened (the project opened at launch) wake the listener as it is
+    /// set, so a write to an area already marked is not lost: the listener takes the stale marks and
+    /// the next write marks again. The listener is the process's one, so only this test sets it.
+    #[test]
+    fn a_listener_set_late_is_woken_for_the_marks_already_made() {
+        static WOKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let _taking = taking();
+        mark(TIMELINE | PROJECT);
+        assert!(set_listener(|| {
+            WOKEN.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert!(WOKEN.load(Ordering::SeqCst) >= 1, "woken for what was pending");
+        assert!(!set_listener(|| {}), "one listener per process");
+        let before = WOKEN.load(Ordering::SeqCst);
+        take();
+        mark(TIMELINE);
+        assert!(WOKEN.load(Ordering::SeqCst) > before, "a mark after the take wakes it again");
+    }
+
     /// An edit, a task and a proposal each mark their area. The marks are the process's, so other
     /// tests may add theirs and take them: only what this one did is asserted, read after each write.
     #[test]
     fn writes_mark_the_areas_they_change() {
+        let _taking = taking();
         let project = crate::Project::open_in_memory().unwrap();
         let areas = std::cell::Cell::new(0u32);
         let wrote = |f: &dyn Fn()| {

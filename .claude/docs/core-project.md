@@ -231,8 +231,9 @@
   also marks the written table's area (`TIMELINE` timeline / history, `PROPOSAL` staged / staged_undo,
   `TASKS`, `ASSETS` assets / analysis, `PROJECT` the rest), and `swap_in` marks them all. Marks gather in
   one process-wide set until `take()`; the `set_listener` callback runs (under the lock, on the writing
-  thread) only when an area goes from clean to marked, so it must only wake something — the MCP activity
-  stream (mcp.md) is its one listener. Same blind spots as the epoch; a rolled-back write still marks.
+  thread) only when an area goes from clean to marked, and once as it is set if marks are pending (the
+  project opened at launch marked them before anyone listened), so it must only wake something — the MCP
+  activity stream (mcp.md) is its one listener. Same blind spots as the epoch; a rolled-back write still marks.
   The **agent task queue** is a real `tasks` table (one row per `Task`,
   columns not JSON): `add_task` / `list_tasks` / `claim_next_task` / `complete_task`
   / `fail_task` / `resolve_task` / `remove_task` drive the `queued → working →

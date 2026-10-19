@@ -14,16 +14,17 @@
 //! its own lock is released, and the project's areas from `kerf_core::project_activity`, woken by
 //! its listener (under the project lock — it only wakes [`pump_project`], which takes the marks a
 //! moment later and publishes with no lock held). Each session reads the channel on a task of its
-//! own, gathers what arrived in a short window (a job's progress ticks collapse to one), and sends.
-//! A session too slow to keep up falls behind the channel's capacity and is told every resource it
-//! subscribed changed (it re-reads), so it costs neither memory nor the engine anything. A session's
-//! task ends with the session: its [`Listener`] is dropped with the last handle of the session's
-//! server, which cancels the task.
+//! own (started by its first subscription), gathers what arrived in a short window (a job's progress
+//! ticks collapse to one), and sends. A session too slow to keep up falls behind the channel's
+//! capacity and is told every resource it subscribed changed (it re-reads), so it costs neither
+//! memory nor the engine anything. A session's task ends with the session — its [`Listener`] is
+//! dropped with the last handle of the session's server, which cancels the task — or once the client
+//! has asked nothing for [`CLIENT_QUIET`], so that our own sends do not keep a gone client's session
+//! alive.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kerf_core::project_activity as areas;
 use rmcp::model::{Resource, ResourceTemplate, ResourceUpdatedNotificationParam};
@@ -45,6 +46,11 @@ const GATHER: Duration = Duration::from_millis(200);
 /// How long one notification may take to reach a session's stream before the batch is given up on
 /// (and the next one tells everything again).
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a client may ask nothing before its session is sent nothing more and its subscriptions
+/// go: rmcp's own idle limit for a session.
+const CLIENT_QUIET: Duration = Duration::from_secs(300);
+/// The most resources one session may subscribe to.
+const MAX_SUBSCRIPTIONS: usize = 64;
 
 /// What happened.
 #[derive(Debug, Clone, PartialEq)]
@@ -130,8 +136,13 @@ pub fn known(uri: &str) -> bool {
 
 /// The job id a `kerf://jobs/{job_id}` names.
 pub fn job_of(uri: &str) -> Option<&str> {
-    uri.strip_prefix(JOB_URI_PREFIX)
-        .filter(|id| !id.is_empty() && !id.contains('/'))
+    uri.strip_prefix(JOB_URI_PREFIX).filter(|id| is_job_id(id))
+}
+
+/// Whether `id` has the shape the jobs registry gives one: `job-` and eight lowercase hex digits.
+fn is_job_id(id: &str) -> bool {
+    id.strip_prefix("job-")
+        .is_some_and(|hex| hex.len() == 8 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
 }
 
 /// What arrived in one gathering window.
@@ -204,11 +215,29 @@ async fn next_batch(rx: &mut broadcast::Receiver<Event>, ended: &CancellationTok
 #[derive(Clone, Default)]
 pub struct Listener(Arc<Shared>);
 
-#[derive(Default)]
 struct Shared {
-    subscribed: Mutex<BTreeSet<String>>,
-    started: AtomicBool,
+    /// What the session subscribed to, and whether its task is running: one lock, so a task that
+    /// stops and a subscribe that starts one cannot pass each other.
+    state: Mutex<Subscriptions>,
+    /// When the client last asked the server anything.
+    last_request: Mutex<Instant>,
     ended: CancellationToken,
+}
+
+#[derive(Default)]
+struct Subscriptions {
+    uris: BTreeSet<String>,
+    running: bool,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            state: Mutex::default(),
+            last_request: Mutex::new(Instant::now()),
+            ended: CancellationToken::new(),
+        }
+    }
 }
 
 impl Drop for Shared {
@@ -218,52 +247,88 @@ impl Drop for Shared {
 }
 
 impl Listener {
-    /// Start sending this session what it subscribes to, through `peer` (once; a second call does
-    /// nothing).
-    pub fn start(&self, peer: Peer<RoleServer>) {
-        if self.0.started.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let rx = channel().subscribe();
-        let shared = Arc::downgrade(&self.0);
-        let ended = self.0.ended.clone();
-        tauri::async_runtime::spawn(forward(rx, shared, ended, peer));
+    /// The client asked something: it is there. A session whose client has asked nothing for
+    /// [`CLIENT_QUIET`] is sent nothing more (see [`forward`]).
+    pub fn touch(&self) {
+        *self.0.last_request.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
     }
 
-    /// Subscribe to `uri` ([`known`] only).
-    pub fn subscribe(&self, uri: &str) -> Result<(), McpError> {
-        if !known(uri) {
-            return Err(unknown_resource(uri));
+    /// Subscribe to `uri` ([`known`] only, at most [`MAX_SUBSCRIPTIONS`]) and, on the first, start
+    /// the session's task, which sends through `peer`.
+    pub fn subscribe(&self, uri: &str, peer: Peer<RoleServer>) -> Result<(), McpError> {
+        if self.add(uri)? {
+            let rx = channel().subscribe();
+            let shared = Arc::downgrade(&self.0);
+            let ended = self.0.ended.clone();
+            tauri::async_runtime::spawn(forward(rx, shared, ended, peer));
         }
-        self.subscriptions().insert(uri.to_string());
         Ok(())
     }
 
-    pub fn unsubscribe(&self, uri: &str) {
-        self.subscriptions().remove(uri);
+    /// Record a subscription to `uri`: whether the session's task has to be started for it.
+    fn add(&self, uri: &str) -> Result<bool, McpError> {
+        if !known(uri) {
+            return Err(unknown_resource(uri));
+        }
+        self.touch();
+        let mut state = self.state();
+        if !state.uris.contains(uri) && state.uris.len() >= MAX_SUBSCRIPTIONS {
+            return Err(McpError::invalid_params(
+                format!("a session may subscribe to {MAX_SUBSCRIPTIONS} resources; unsubscribe from one first"),
+                None,
+            ));
+        }
+        state.uris.insert(uri.to_string());
+        Ok(!std::mem::replace(&mut state.running, true))
     }
 
-    fn subscriptions(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
-        self.0.subscribed.lock().unwrap_or_else(|e| e.into_inner())
+    pub fn unsubscribe(&self, uri: &str) {
+        self.touch();
+        self.state().uris.remove(uri);
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, Subscriptions> {
+        self.0.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl Shared {
+    /// The resources to tell about, or `None` when the client has been quiet too long: its
+    /// subscriptions are dropped and the task is to stop.
+    fn subscribed_unless_quiet(&self) -> Option<BTreeSet<String>> {
+        let quiet = self.last_request.lock().unwrap_or_else(|e| e.into_inner()).elapsed() >= CLIENT_QUIET;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if quiet {
+            state.uris.clear();
+            state.running = false;
+            return None;
+        }
+        Some(state.uris.clone())
     }
 }
 
 /// A `resources/*` request naming no resource of this server.
 pub fn unknown_resource(uri: &str) -> McpError {
     McpError::resource_not_found(
-        format!("no resource {uri:?}: kerf://project, kerf://tasks, kerf://jobs and kerf://jobs/{{job_id}} exist"),
+        format!(
+            "no resource {uri:?}: kerf://project, kerf://tasks, kerf://jobs and kerf://jobs/{{job_id}} (a job_id as a tool answered it, job-xxxxxxxx) exist"
+        ),
         None,
     )
 }
 
 /// The task of one session: batches in, a notification per subscribed resource that changed out.
+///
+/// A notification counts as activity on the session for rmcp's idle expiry, so a task that sent for
+/// ever would keep the session of a client that is gone alive, and with it the proposal it owns.
+/// So the task stops, and the subscriptions go, once the client has asked nothing for
+/// [`CLIENT_QUIET`] (rmcp's own idle limit): liveness follows the client, not our sends.
 async fn forward(mut rx: broadcast::Receiver<Event>, shared: Weak<Shared>, ended: CancellationToken, peer: Peer<RoleServer>) {
     let mut behind = false;
     while let Some(mut batch) = next_batch(&mut rx, &ended).await {
         batch.lagged |= std::mem::take(&mut behind);
-        let subscribed = match shared.upgrade() {
-            Some(shared) => shared.subscribed.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-            None => return,
+        let Some(subscribed) = shared.upgrade().and_then(|s| s.subscribed_unless_quiet()) else {
+            return;
         };
         for uri in batch.updated(&subscribed) {
             let sent = tokio::time::timeout(
@@ -284,13 +349,15 @@ async fn forward(mut rx: broadcast::Receiver<Event>, shared: Weak<Shared>, ended
 }
 
 /// `subscriptions/listen` (protocol `2026-07-28`): the same batches, sent through the subscription's
-/// own sink, for the resources it accepted, until the request is cancelled.
+/// own sink, for the resources it accepted, until the request is cancelled. A send that takes over
+/// [`SEND_TIMEOUT`] ends the subscription.
 pub async fn listen(subscribed: Vec<String>, sink: rmcp::service::SubscriptionSink, ended: CancellationToken) {
     let mut rx = channel().subscribe();
     while let Some(batch) = next_batch(&mut rx, &ended).await {
         for uri in batch.updated(&subscribed) {
-            if sink.notify_resource_updated(uri).await.is_err() {
-                return;
+            match tokio::time::timeout(SEND_TIMEOUT, sink.notify_resource_updated(uri)).await {
+                Ok(Ok(())) => {}
+                _ => return,
             }
         }
     }
@@ -314,11 +381,17 @@ mod tests {
 
     #[test]
     fn a_batch_names_only_the_subscribed_resources_it_changed() {
-        let all = uris(&[PROJECT_URI, TASKS_URI, JOBS_URI, "kerf://jobs/job-1", "kerf://jobs/job-2"]);
-        let b = batch(&[Event::Job("job-1".into()), Event::Job("job-1".into())]);
+        let all = uris(&[
+            PROJECT_URI,
+            TASKS_URI,
+            JOBS_URI,
+            "kerf://jobs/job-0000000a",
+            "kerf://jobs/job-0000000b",
+        ]);
+        let b = batch(&[Event::Job("job-0000000a".into()), Event::Job("job-0000000a".into())]);
         assert_eq!(
             b.updated(&all),
-            uris(&[JOBS_URI, "kerf://jobs/job-1"]),
+            uris(&[JOBS_URI, "kerf://jobs/job-0000000a"]),
             "a job's ticks are one"
         );
         let b = batch(&[Event::Project(areas::TASKS)]);
@@ -346,18 +419,53 @@ mod tests {
         for uri in [PROJECT_URI, TASKS_URI, JOBS_URI, "kerf://jobs/job-1a2b3c4d"] {
             assert!(known(uri), "{uri}");
         }
-        for uri in ["kerf://jobs/", "kerf://jobs/a/b", "kerf://timeline", "file:///etc/passwd", ""] {
+        for uri in [
+            "kerf://jobs/",
+            "kerf://jobs/a/b",
+            "kerf://jobs/job-1",
+            "kerf://jobs/job-1A2B3C4D",
+            "kerf://jobs/job-1a2b3c4d5",
+            "kerf://jobs/job-1a2b3c4g",
+            "kerf://timeline",
+            "file:///etc/passwd",
+            "",
+        ] {
             assert!(!known(uri), "{uri}");
         }
         let listener = Listener::default();
-        assert!(listener.subscribe("kerf://nope").is_err());
-        listener.subscribe(TASKS_URI).unwrap();
-        listener.subscribe(TASKS_URI).unwrap();
-        assert_eq!(listener.subscriptions().len(), 1);
+        assert!(listener.add("kerf://nope").is_err());
+        assert!(listener.add(TASKS_URI).unwrap(), "the first subscription starts the task");
+        assert!(!listener.add(TASKS_URI).unwrap(), "and only the first");
+        assert_eq!(listener.state().uris.len(), 1);
         listener.unsubscribe(TASKS_URI);
-        assert!(listener.subscriptions().is_empty());
+        assert!(listener.state().uris.is_empty());
+        for i in 0..MAX_SUBSCRIPTIONS {
+            listener.add(&format!("{JOB_URI_PREFIX}job-{i:08x}")).unwrap();
+        }
+        assert!(listener.add(PROJECT_URI).is_err(), "a session holds a bounded number");
+        assert!(
+            listener.add(&format!("{JOB_URI_PREFIX}job-{:08x}", 0)).is_ok(),
+            "one it holds is no new one"
+        );
         assert_eq!(resources().len(), 3);
         assert_eq!(resource_templates().len(), 1);
+    }
+
+    /// A client that has asked nothing for the idle limit is sent nothing more: its subscriptions go
+    /// and the task stops, so its session can expire. A request in time keeps them.
+    #[test]
+    fn a_quiet_client_loses_its_subscriptions() {
+        let listener = Listener::default();
+        assert!(listener.add(PROJECT_URI).unwrap());
+        assert_eq!(listener.0.subscribed_unless_quiet().unwrap().len(), 1);
+        let Some(long_ago) = Instant::now().checked_sub(CLIENT_QUIET) else {
+            return;
+        };
+        *listener.0.last_request.lock().unwrap() = long_ago;
+        assert!(listener.0.subscribed_unless_quiet().is_none());
+        assert!(listener.state().uris.is_empty() && !listener.state().running);
+        assert!(listener.add(PROJECT_URI).unwrap(), "subscribing again starts a task again");
+        assert_eq!(listener.0.subscribed_unless_quiet().unwrap().len(), 1, "it was a request");
     }
 
     /// Events are gathered for a moment and then come as one batch; a reader that was not reading
@@ -378,6 +486,35 @@ mod tests {
         assert!(b.lagged, "{b:?}");
         ended.cancel();
         assert!(next_batch(&mut rx, &ended).await.is_none(), "an ended session stops reading");
+    }
+
+    /// The project's writes reach the channel. A project opened and written before the pump started
+    /// (as the app's is at launch) left its areas marked; the pump takes those at once, so a later
+    /// write to an area that was already marked is still announced. The listener is the process's
+    /// one, so only this test starts the pump.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_projects_writes_are_published_once_the_pump_runs() {
+        async fn tasks_published(mut rx: broadcast::Receiver<Event>) -> bool {
+            let heard = tokio::time::timeout(Duration::from_secs(5), async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(Event::Project(changed)) if changed & areas::TASKS != 0 => return true,
+                        Err(broadcast::error::RecvError::Closed) => return false,
+                        _ => {}
+                    }
+                }
+            })
+            .await;
+            heard == Ok(true)
+        }
+        let project = kerf_core::Project::open_in_memory().unwrap();
+        project.add_task("queued before anyone listened").unwrap();
+        let stale = tasks_published(channel().subscribe());
+        pump_project();
+        assert!(stale.await, "the marks made before the pump are taken and published");
+        let fresh = tasks_published(channel().subscribe());
+        project.add_task("queued after the pump started").unwrap();
+        assert!(fresh.await, "a write to an area marked before is announced");
     }
 
     /// The session's task ends when the last handle of the session's listener is dropped.

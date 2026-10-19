@@ -380,7 +380,11 @@ impl KerfMcp {
                 "job_id": id,
                 "tool": tool,
                 "state": JobState::Running,
-                "next": "poll job_status with this job_id (cancel_job stops it); the result arrives there",
+                "next": format!(
+                    "poll job_status with this job_id (cancel_job stops it), or subscribe to the resource \
+                     kerf://jobs/{id} to be told when it moves and read it once right after subscribing \
+                     (nothing before the subscription is replayed); the result arrives there"
+                ),
             }));
         }
         let (run, relay) = foreground(context);

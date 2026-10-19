@@ -1401,17 +1401,13 @@ mod tests {
             info
         }
 
-        async fn on_initialized(&self, context: rmcp::service::NotificationContext<rmcp::service::RoleServer>) {
-            self.0.start(context.peer);
-        }
-
         #[allow(deprecated)]
         async fn subscribe(
             &self,
             request: rmcp::model::SubscribeRequestParams,
-            _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+            context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
         ) -> Result<(), rmcp::ErrorData> {
-            self.0.subscribe(&request.uri)
+            self.0.subscribe(&request.uri, context.peer)
         }
     }
 
@@ -1443,13 +1439,14 @@ mod tests {
             return Err(code);
         }
         let deadline = std::time::Instant::now() + wait;
+        // A read that times out part-way keeps what it read: the rest of the line follows it.
         let mut line = String::new();
         while std::time::Instant::now() < deadline {
-            line.clear();
             match reader.read_line(&mut line) {
                 Ok(0) => break,
                 Ok(_) if needles.iter().all(|n| line.contains(n)) => return Ok(line.trim().to_string()),
-                _ => {}
+                Ok(_) => line.clear(),
+                Err(_) => {}
             }
         }
         Err(200)

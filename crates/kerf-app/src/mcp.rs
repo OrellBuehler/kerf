@@ -5344,22 +5344,7 @@ impl KerfMcp {
                        skipping `offset` of the newest; `next_offset` pages back through older ones."
     )]
     fn list_tasks(&self, Parameters(p): Parameters<PageParams>) -> Result<String, McpError> {
-        let (offset, limit) = reads::page_of(p.offset, p.limit, 50, 500);
-        let (tasks, total) = self
-            .lock()
-            .list_tasks_page(kerf_core::Page {
-                limit: Some(limit),
-                offset,
-            })
-            .map_err(core_err)?;
-        let end = offset + tasks.len();
-        json(&serde_json::json!({
-            "total": total,
-            "offset": offset,
-            "returned": tasks.len(),
-            "next_offset": (end < total).then_some(end),
-            "tasks": tasks,
-        }))
+        tasks_page(&self.lock(), p)
     }
 
     #[tool(description = "Enqueue a new task (status: queued) for an agent to claim")]
@@ -5867,26 +5852,6 @@ impl KerfMcp {
         Ok(out)
     }
 
-    /// What `kerf://project` reads: which project is open (`generation` moves when another one is),
-    /// the cut this session works on in brief, and the proposal staged on it, if any.
-    fn project_brief(&self) -> Result<String, McpError> {
-        let brief = {
-            let project = self.lock();
-            let timeline = project.working_timeline().map_err(core_err)?;
-            let staged = project.staged().map_err(core_err)?;
-            serde_json::json!({
-                "generation": project.generation(),
-                "timeline": reads::timeline_brief(&timeline),
-                "proposal": staged.map(|s| serde_json::json!({
-                    "owned_by_agent": s.owned_by_agent,
-                    "edits": s.edits.len(),
-                    "stale": s.stale,
-                })),
-            })
-        };
-        json(&brief)
-    }
-
     /// Tell the webview the project changed so it re-fetches and renders live.
     fn changed(&self) {
         self.notify("project-changed");
@@ -6006,6 +5971,57 @@ fn lock_agent(project: &Mutex<Project>) -> MutexGuard<'_, Project> {
         tracing::warn!(error = %e, "could not look at who owns the staged proposal");
     }
     guard
+}
+
+/// A page of the task queue, as `list_tasks` answers it.
+fn tasks_page(project: &Project, page: PageParams) -> Result<String, McpError> {
+    let (offset, limit) = reads::page_of(page.offset, page.limit, 50, 500);
+    let (tasks, total) = project
+        .list_tasks_page(kerf_core::Page {
+            limit: Some(limit),
+            offset,
+        })
+        .map_err(core_err)?;
+    let end = offset + tasks.len();
+    json(&serde_json::json!({
+        "total": total,
+        "offset": offset,
+        "returned": tasks.len(),
+        "next_offset": (end < total).then_some(end),
+        "tasks": tasks,
+    }))
+}
+
+/// What `kerf://project` reads: which project is open (`generation` moves when another one is), the
+/// cut the session works on in brief, and the proposal staged on it, if any.
+fn project_brief(project: &Project) -> Result<String, McpError> {
+    let timeline = project.working_timeline().map_err(core_err)?;
+    let staged = project.staged().map_err(core_err)?;
+    json(&serde_json::json!({
+        "generation": project.generation(),
+        "timeline": reads::timeline_brief(&timeline),
+        "proposal": staged.map(|s| serde_json::json!({
+            "owned_by_agent": s.owned_by_agent,
+            "edits": s.edits.len(),
+            "stale": s.stale,
+        })),
+    }))
+}
+
+/// The text of the resource `uri` (`activity`): the polling tools' answers — `kerf://jobs` is
+/// `list_jobs`, a job its `job_status`, `kerf://tasks` the first page of `list_tasks`,
+/// `kerf://project` [`project_brief`]. The project is read under its lock as the session `owner`;
+/// the jobs need none.
+fn resource_text(project: &Mutex<Project>, owner: Option<&str>, uri: &str) -> Result<String, McpError> {
+    match uri {
+        activity::PROJECT_URI => project_brief(&lock_agent_as(project, owner)),
+        activity::TASKS_URI => tasks_page(&lock_agent_as(project, owner), PageParams::default()),
+        activity::JOBS_URI => json(&jobs::jobs().list()),
+        other => match activity::job_of(other).and_then(|id| jobs::jobs().view(id)) {
+            Some(view) => json(&view),
+            None => Err(activity::unknown_resource(other)),
+        },
+    }
 }
 
 /// [`lock_agent`] for a particular agent session (`owner`, its rmcp session id) — what the
@@ -6297,7 +6313,9 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              kerf://jobs/{job_id} (one job), kerf://jobs, kerf://tasks and \
              kerf://project are announced with notifications/resources/updated when \
              they change, whoever changed them (the user editing the cut included); \
-             read one for the details. Results are kept small: get_asset_metadata and analyze_asset \
+             read one for the details, and read it once right after subscribing — what \
+             changed before is not replayed. A subscribed client that sends no request \
+             (a ping is enough) for five minutes loses its subscriptions. Results are kept small: get_asset_metadata and analyze_asset \
              summarise an analysis (counts, durations, the head of the transcript), \
              and get_transcript (lines with their speakers; words=true adds each \
              line's timed words, best over a from/to window) / get_analysis_detail \
@@ -6361,6 +6379,7 @@ impl ServerHandler for KerfMcp {
     ) -> Result<rmcp::model::CallToolResponse, McpError> {
         let tool = request.name.to_string();
         self.note_session(&context);
+        self.listener.touch();
         let result = match reject_unknown_arguments(&request) {
             Ok(()) => {
                 let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
@@ -6389,9 +6408,9 @@ impl ServerHandler for KerfMcp {
         info
     }
 
-    /// The session is up: start telling it about the resources it subscribes to (`activity`).
-    async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
-        self.listener.start(context.peer);
+    async fn ping(&self, _context: RequestContext<RoleServer>) -> Result<(), McpError> {
+        self.listener.touch();
+        Ok(())
     }
 
     async fn list_resources(
@@ -6399,6 +6418,7 @@ impl ServerHandler for KerfMcp {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::ListResourcesResult, McpError> {
+        self.listener.touch();
         Ok(rmcp::model::ListResourcesResult::with_all_items(activity::resources()))
     }
 
@@ -6407,6 +6427,7 @@ impl ServerHandler for KerfMcp {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::ListResourceTemplatesResult, McpError> {
+        self.listener.touch();
         Ok(rmcp::model::ListResourceTemplatesResult::with_all_items(
             activity::resource_templates(),
         ))
@@ -6420,16 +6441,9 @@ impl ServerHandler for KerfMcp {
         request: rmcp::model::ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::ReadResourceResponse, McpError> {
+        self.listener.touch();
         let uri = request.uri;
-        let text = match uri.as_str() {
-            activity::PROJECT_URI => self.project_brief()?,
-            activity::TASKS_URI => self.list_tasks(Parameters(PageParams::default()))?,
-            activity::JOBS_URI => json(&jobs::jobs().list())?,
-            other => match activity::job_of(other).and_then(|id| jobs::jobs().view(id)) {
-                Some(view) => json(&view)?,
-                None => return Err(activity::unknown_resource(other)),
-            },
-        };
+        let text = resource_text(&self.project, self.owner().as_deref(), &uri)?;
         Ok(rmcp::model::ReadResourceResult::new(vec![
             rmcp::model::ResourceContents::text(text, uri).with_mime_type("application/json")
         ])
@@ -6440,9 +6454,16 @@ impl ServerHandler for KerfMcp {
     async fn subscribe(
         &self,
         request: rmcp::model::SubscribeRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        self.listener.subscribe(&request.uri)
+        // A job is subscribed to while the registry knows it: one that never was, or ended over an
+        // hour ago, would never be told about.
+        if let Some(id) = activity::job_of(&request.uri) {
+            if jobs::jobs().view(id).is_none() {
+                return Err(activity::unknown_resource(&request.uri));
+            }
+        }
+        self.listener.subscribe(&request.uri, context.peer)
     }
 
     #[allow(deprecated)]
@@ -6774,6 +6795,45 @@ mod tests {
         svg_sheet_caption, svg_sheet_times, svg_source, track_gaps, variant_output, ClipMoveParams, SvgMoments,
         SvgOverlaySummary, SvgPreviewTitle, SvgValidation,
     };
+
+    /// The resources read what the polling tools answer: the project's brief, the queue's first
+    /// page, the jobs, one job; a job the registry does not know is not found.
+    #[test]
+    fn a_resource_reads_what_its_polling_tool_answers() {
+        use super::{activity, jobs, resource_text};
+        let project = std::sync::Mutex::new(kerf_core::Project::sample().unwrap());
+        let read =
+            |uri: &str| -> serde_json::Value { serde_json::from_str(&resource_text(&project, None, uri).unwrap()).unwrap() };
+        let brief = read(activity::PROJECT_URI);
+        let generation = project.lock().unwrap().generation();
+        assert_eq!(brief["generation"], generation);
+        assert!(brief["timeline"].is_object(), "{brief}");
+        assert!(brief["proposal"].is_null(), "no proposal staged: {brief}");
+
+        project.lock().unwrap().add_task("tighten the intro").unwrap();
+        let tasks = read(activity::TASKS_URI);
+        assert!(tasks["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["prompt"] == "tighten the intro"));
+        assert!(tasks["total"].as_u64().unwrap() >= 1);
+
+        let (id, _run) = jobs::jobs().begin("export").unwrap();
+        let job = read(&format!("{}{id}", activity::JOB_URI_PREFIX));
+        assert_eq!(job["job_id"], id.as_str());
+        assert!(read(activity::JOBS_URI)
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["job_id"] == id.as_str()));
+        jobs::jobs().finish(&id, Ok("{}".to_string()));
+
+        for missing in ["kerf://jobs/job-00000000", "kerf://jobs/nope", "kerf://timeline"] {
+            let err = resource_text(&project, None, missing).unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND, "{missing}");
+        }
+    }
 
     #[test]
     fn set_grade_refuses_a_misspelt_key_inside_the_curves_or_wheels() {
