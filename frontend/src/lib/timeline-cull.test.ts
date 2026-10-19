@@ -6,6 +6,8 @@ import {
 	blockMark,
 	clipBox,
 	clipPadding,
+	ghostsInView,
+	laneButtons,
 	laneDrawing,
 	mayPromote,
 	pinnedClips,
@@ -72,13 +74,59 @@ describe('laneDrawing', () => {
 });
 
 describe('pinnedClips', () => {
-	test('the pressed, hovered, focused and nudged clips, and nothing that is absent', () => {
-		expect([...pinnedClips({ pressed: ['a', null, undefined, 'b'], hovered: 'c', focused: null, nudged: 'a' })].sort()).toEqual([
-			'a',
-			'b',
-			'c'
-		]);
+	test('the pressed, focused and nudged clips, and nothing that is absent', () => {
+		expect([...pinnedClips({ pressed: ['a', null, undefined, 'b'], focused: 'c', nudged: 'a' })].sort()).toEqual(['a', 'b', 'c']);
 		expect(pinnedClips({}).size).toBe(0);
+	});
+});
+
+describe('laneButtons', () => {
+	// 3000 one-second clips at 0.5 px/s: every one in view is a block.
+	const long = lane(3000);
+	const drawing = laneDrawing(long, dur, 0.5, 0, 1600, none);
+
+	test('the hovered block is promoted on top, and the drawing is not touched', () => {
+		const blocks = drawing.blocks;
+		const buttons = laneButtons(drawing, 'c40');
+		expect(buttons.map((c) => c.id)).toEqual([...drawing.buttons.map((c) => c.id), 'c40']);
+		expect(drawing.blocks).toBe(blocks);
+		expect(drawing.blocks.some((c) => c.id === 'c40')).toBe(true);
+	});
+
+	test('with nothing hovered, or a hovered clip that is no block, the drawing’s own buttons', () => {
+		expect(laneButtons(drawing, null)).toBe(drawing.buttons);
+		expect(laneButtons(drawing, 'nope')).toBe(drawing.buttons);
+		const short = laneDrawing(lane(3), dur, 100, 0, 1600, none);
+		expect(laneButtons(short, 'c1')).toBe(short.buttons);
+	});
+
+	test('a hover change leaves the drawing as it was: hover is not one of its inputs', () => {
+		const again = laneDrawing(long, dur, 0.5, 0, 1600, none);
+		expect(again.blocks.map((c) => c.id)).toEqual(drawing.blocks.map((c) => c.id));
+	});
+});
+
+describe('ghostsInView', () => {
+	// The clips a ripple trim shifts on a 1000-clip lane, at 40 px/s.
+	const ghosts = Array.from({ length: 1000 }, (_, i) => ({ id: `g${i}`, start: i + 0.5, dur: 1 }));
+
+	test('only the ghosts whose box meets the window', () => {
+		const shown = ghostsInView(ghosts, 40, 0, 1600, 2);
+		expect(shown.map((g) => g.id)).toEqual(Array.from({ length: 40 }, (_, i) => `g${i}`));
+		expect(ghostsInView(ghosts, 40, 20000, 21600, 2)[0].id).toBe('g499');
+	});
+
+	test('a ghost is at least its minimum width, as it is drawn', () => {
+		const thin = [{ start: 10, dur: 0.001 }];
+		expect(ghostsInView(thin, 40, 401, 500, 2)).toHaveLength(1);
+		expect(ghostsInView(thin, 40, 402, 500, 2)).toHaveLength(0);
+		expect(ghostsInView(thin, 40, 402, 500, 6)).toHaveLength(1);
+	});
+
+	test('a window edge touching a box is not a meeting', () => {
+		const g = [{ start: 1, dur: 1 }];
+		expect(ghostsInView(g, 100, 200, 300, 2)).toHaveLength(0);
+		expect(ghostsInView(g, 100, 0, 100, 2)).toHaveLength(0);
 	});
 });
 

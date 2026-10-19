@@ -40,7 +40,9 @@ offset it was grabbed at. A razor cut keeps half a frame
 either side (`splitPoint`; a clip with no interior frame says so), the context menu's
 split quantizes the playhead (and shows no key: `C` is the Razor *tool*, and nothing splits at
 the playhead from the keyboard yet), and Escape / pointercancel / blur abandon a clip, edge or
-title drag.
+title drag. The click that still follows an abandoned press when the button comes up lands on the lane
+once the pointer has left the clip, so it is swallowed as a marquee's is (`resetDragState`, and the
+roll / slip / slide tools' abandon): it would otherwise seek or clear the selection.
 **Ripple, the selection set, group moves and zoom** are the timeline's editing layer, each
 a pure bun-tested module under the component. *Ripple*: `editor.rippleMode` mirrors the
 project flag — read in `load()` (so launch, New and Open) and again on the
@@ -128,11 +130,16 @@ what the button would show (`blockMark`): the track's colours resolved from the 
 (`--agent-400`), a hovered clip's partners (`--kerf-300`) as the block's edge, faded while disabled or moved by
 a gesture, grey when off, and the lane's own filter (a locked lane's desaturation, a silent track's grey).
 **Only what the pointer or the keyboard holds is a button wherever it is** (`pinnedClips`): the pressed clip
-(a drag's or a trim's, both sides of a rolled cut), the hovered, the focused and the nudged one. What a
+(a drag's or a trim's, both sides of a rolled cut), the focused and the nudged one. What a
 gesture only moves — a dragged selection, the clips a ripple trim shifts — is drawn from the model (the
-ghosts), so a select-all or a ripple trim over a long cut mounts nothing more (`?long=1000`: Ctrl+A 9.7 s →
-0.26 s, with `selectionUnits` made one pass — it was O(n²) in the Inspector). The canvas promotes the block
-under the pointer to a button on pointer move (not while a button is down or a gesture runs: `mayPromote`),
+ghosts, and of those only the ones in view: `ghostsInView`), so a select-all or a ripple trim over a long cut
+mounts nothing more (`?long=1000`: Ctrl+A 9.7 s → 0.26 s, with `selectionUnits` made one pass — it was O(n²)
+in the Inspector; a 20-step ripple trim 3.8 s → 2.1–2.5 s, 59 ghosts drawn instead of 1000). The canvas
+promotes the block under the pointer to a button on pointer move (not while a button is down or a gesture
+runs: `mayPromote`). **Hover is not an input of the drawing**: the promoted button is added on top of it
+(`laneButtons`), so a hover change leaves every lane's `blocks` array, and its canvas, as it was; and
+`hoverPartners` is one shared empty set for every clip without partners, so the draw effect, which reads
+it for the `lit` mark, runs again only when partners light (`?long=3000` at fit: 121 → 17 ms a hover change),
 and the promoted clip clears the hover when the pointer leaves it — the canvas does only when the pointer
 leaves for something that is not a clip, or the two would swap for ever; a narrow clip's button has no
 padding (`clipPadding`), so it is the block's 6 px and not 16. A press or right-click on a block without a
