@@ -872,7 +872,9 @@ struct SetDeliveryFormatParams {
     #[schemars(description = "Delivery frame height in pixels, e.g. 1920 for a 9:16 vertical cut")]
     height: Option<u32>,
     #[schemars(description = "How footage of a different shape meets the frame: \"cover\" (the default) \
-                              fills and crops, \"contain\" scales the whole picture in and letterboxes")]
+                              fills and crops, \"contain\" scales the whole picture in and letterboxes, \
+                              \"blur\" scales the whole picture in over a blurred, enlarged copy of itself \
+                              that fills the bars")]
     fit: Option<Fit>,
 }
 
@@ -3194,7 +3196,9 @@ impl KerfMcp {
                        it, so what you look at while cutting is what ships. With \"cover\" (the default) \
                        a 16:9 shot is filled and cropped to the frame, which means the crop decides what \
                        survives: check preview_timeline and use set_transform's position to slide the \
-                       important part of a shot back into frame. Omit width and height to clear it."
+                       important part of a shot back into frame. With \"blur\" the whole shot shows, the \
+                       bars filled with a blurred copy of it (a clip moved or scaled by its transform gets \
+                       plain bars). Omit width and height to clear it."
     )]
     fn set_delivery_format(&self, Parameters(p): Parameters<SetDeliveryFormatParams>) -> Result<String, McpError> {
         let format = match (p.width, p.height) {

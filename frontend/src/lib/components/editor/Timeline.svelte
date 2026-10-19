@@ -41,8 +41,8 @@
 	import { addAnimatedTitle, addCustomSvgTitle, addTitleHere, dropCaptions, importCaptionFile, makeCaptions } from '#lib/title-actions';
 	import { keyframeOffer } from '#lib/keyframe-copy';
 	import type { ActionId } from '#lib/keymap';
-	import { DELIVERY_PRESETS, fitLabel, presetFor } from '#lib/delivery-formats';
-	import { setDeliveryPreset } from '#lib/menu-commands';
+	import { DELIVERY_PRESETS, deliveryTip, fitChoices, presetFor } from '#lib/delivery-formats';
+	import { setDeliveryFit, setDeliveryPreset } from '#lib/menu-commands';
 	import { generatedCount, importMenuEntries, importableAssets } from '#lib/caption-import-ui';
 	import type { Clip, Marker, PreviewDraft, StreamKind, SvgOverlay, TextOverlay, Track } from '#lib/types';
 	import { moveDraft, trimDraft } from '#lib/preview-draft';
@@ -732,11 +732,24 @@
 		const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
 		contextMenu.show(
 			new MouseEvent('contextmenu', { clientX: r.right, clientY: r.bottom + 2 }),
-			DELIVERY_PRESETS.map((p) => ({
-				label: p.label === 'Source' ? 'Source shape' : `${p.label} — ${p.hint}`,
-				icon: p.id === delivery.id ? 'check' : undefined,
-				action: () => void setDeliveryPreset(p.id)
-			})),
+			[
+				...DELIVERY_PRESETS.map((p) => ({
+					label: p.label === 'Source' ? 'Source shape' : `${p.label} — ${p.hint}`,
+					icon: p.id === delivery.id ? 'check' : undefined,
+					action: () => void setDeliveryPreset(p.id)
+				})),
+				// With a frame set: how footage of another shape meets it (the project's fit ticked).
+				...(editor.timeline.format
+					? [
+							{ type: 'separator' as const },
+							...fitChoices(editor.timeline.format).map((c) => ({
+								label: c.label,
+								icon: c.checked ? 'check' : undefined,
+								action: () => void setDeliveryFit(c.fit)
+							}))
+						]
+					: [])
+			],
 			e.currentTarget as Node
 		);
 	}
@@ -2875,9 +2888,7 @@
 				<ToolbarToggle
 					title={editor.previewingStaged
 						? PREVIEW_READ_ONLY_REASON
-						: delivery.format
-						? `Delivering ${delivery.format.width}\u00d7${delivery.format.height} — ${fitLabel(delivery.format.fit)}. Click to change.`
-						: 'The frame follows the footage. Click to cut for a delivery shape.'}
+						: deliveryTip(editor.timeline.format)}
 					icon="crop"
 					iconSize={12}
 					on={!!delivery.format}

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { DELIVERY_PRESETS, VARIANT_PRESETS, fitLabel, formatsFor, hasPicture, presetFor, ratioLabel, variantPath } from './delivery-formats';
+import { DELIVERY_FITS, DELIVERY_PRESETS, deliveryTip, fitChoices, VARIANT_PRESETS, fitLabel, formatsFor, hasPicture, presetFor, ratioLabel, variantPath } from './delivery-formats';
 
 describe('variantPath', () => {
 	test('splices the shape into the file name beside the base', () => {
@@ -57,6 +57,11 @@ describe('fitLabel', () => {
 	test('says what the fit does, not what it is called', () => {
 		expect(fitLabel('cover')).toBe('fill & crop');
 		expect(fitLabel('contain')).toBe('fit & letterbox');
+		expect(fitLabel('blur')).toBe('fit & blurred fill');
+	});
+
+	test('every fit a frame can take is offered once', () => {
+		expect([...DELIVERY_FITS].sort()).toEqual(['blur', 'contain', 'cover']);
 	});
 });
 
@@ -90,5 +95,22 @@ describe('hasPicture', () => {
 		expect(hasPicture({ tracks: [track('audio', [clip])] } as never)).toBe(false);
 		expect(hasPicture({ tracks: [track('video', [])] } as never)).toBe(false);
 		expect(hasPicture({ tracks: [] } as never)).toBe(false);
+	});
+});
+
+describe('the delivery frame button', () => {
+	test("says and ticks the project's fit, not the matching preset's", () => {
+		// 9:16 is a preset that fills; the project fits over a blurred fill.
+		const blurred = { width: 1080, height: 1920, fit: 'blur' as const };
+		expect(presetFor(blurred).format?.fit).toBe('cover');
+		expect(deliveryTip(blurred)).toBe('Delivering 1080\u00d71920 — fit & blurred fill. Click to change.');
+		expect(fitChoices(blurred).filter((c) => c.checked).map((c) => c.fit)).toEqual(['blur']);
+		expect(fitChoices(blurred).map((c) => c.label)).toEqual([
+			'Footage: fill & crop',
+			'Footage: fit & letterbox',
+			'Footage: fit & blurred fill'
+		]);
+		expect(fitChoices(null)).toEqual([]);
+		expect(deliveryTip(null)).toBe('The frame follows the footage. Click to cut for a delivery shape.');
 	});
 });

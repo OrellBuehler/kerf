@@ -164,6 +164,8 @@ again; `context.ct` cancels it, a slot wait goes out as a progress notification)
 `AudioSync` (offset, confidence, distinct — `null` for no rival peak —, reliable, inverted, applied);
 `project-changed` only when it moved. Its description says only each clip's used source window is
 compared. `export_variants` progress says `measuring the mix's loudness` while a static normalization meters. `export`'s `options.loudness_static` is in its description.
+`set_delivery_format`'s `fit` takes `cover` (the default), `contain` or `blur` (the whole
+picture over a blurred, enlarged copy of itself; a clip placed by its transform gets plain bars).
 `smart_crop` frames each shot for the delivery frame (the server `instructions`
 pair it with `set_delivery_format`, since reshaping to 9:16 otherwise keeps
 whatever was in the middle). `export_variants` is the one-call multi-format

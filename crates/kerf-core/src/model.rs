@@ -4027,7 +4027,8 @@ impl Marker {
 /// which is right when the delivery matches the footage and wrong the moment it
 /// doesn't: a 16:9 shot rendered at 1080x1920 becomes a 1080x608 strip in a
 /// mostly-black frame — technically the whole picture, and not something anyone
-/// would post. `Cover` fills the frame and throws away the overflow instead.
+/// would post. `Cover` fills the frame and throws away the overflow instead; `Blur`
+/// keeps the whole picture and fills the bars with a blurred, enlarged copy of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Fit {
@@ -4037,6 +4038,11 @@ pub enum Fit {
     Contain,
     /// Scale to cover the frame and crop what hangs over the edges.
     Cover,
+    /// `Contain` over a blurred copy of the same picture scaled to cover the frame: the
+    /// whole shot, with the bars filled by its own colours (the vertical-video habit for
+    /// landscape footage). A clip whose geometry is not the plain fit (scaled, moved,
+    /// rotated, cropped or animated) is placed as under `Contain`, with no fill.
+    Blur,
 }
 
 impl Fit {
@@ -4044,6 +4050,7 @@ impl Fit {
         match self {
             Fit::Contain => "contain",
             Fit::Cover => "cover",
+            Fit::Blur => "blur",
         }
     }
 }
@@ -4063,7 +4070,8 @@ pub struct Delivery {
     pub width: u32,
     pub height: u32,
     /// How footage of a different shape meets that frame. `Cover` is the useful
-    /// default for a reframed delivery; `Contain` keeps the whole picture.
+    /// default for a reframed delivery; `Contain` keeps the whole picture, and `Blur`
+    /// keeps it over a blurred copy of itself.
     #[serde(default)]
     pub fit: Fit,
 }
