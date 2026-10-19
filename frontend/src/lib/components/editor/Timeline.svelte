@@ -38,12 +38,12 @@
 		trimSelection,
 		unlinkSelection
 	} from '#lib/ops';
-	import { addAnimatedTitle, addCustomSvgTitle, importCaptionFile } from '#lib/title-actions';
+	import { addAnimatedTitle, addCustomSvgTitle, addTitleHere, dropCaptions, importCaptionFile, makeCaptions } from '#lib/title-actions';
 	import { keyframeOffer } from '#lib/keyframe-copy';
 	import type { ActionId } from '#lib/keymap';
 	import { DELIVERY_PRESETS, fitLabel, presetFor } from '#lib/delivery-formats';
 	import { setDeliveryPreset } from '#lib/menu-commands';
-	import { importMenuEntries, importableAssets } from '#lib/caption-import-ui';
+	import { generatedCount, importMenuEntries, importableAssets } from '#lib/caption-import-ui';
 	import type { Clip, Marker, StreamKind, SvgOverlay, TextOverlay, Track } from '#lib/types';
 	import { GENERATED_TITLE_FILL, SVG_TITLE_FILL, packRows, snapSpanStart, snapTime, trimSpan } from '#lib/titles';
 	import { SVG_PRESETS, svgDisplayName, svgTooltip } from '#lib/svg-titles';
@@ -2345,8 +2345,6 @@
 		else void editor.retimeOverlay(d.id, d.start, d.end).catch(err);
 	}
 
-	const addTitleHere = () => void editor.addTitle('Title', ui.time, ui.time + settings.editing.title_seconds).catch(err);
-
 	function onTitleContextMenu(e: MouseEvent, o: TextOverlay) {
 		e.stopPropagation();
 		editor.selectOverlay(o.id);
@@ -2399,9 +2397,10 @@
 		// Importing captions: timed to the cut, or to one of the clips it shows. The
 		// controls in Titles carry the same import with every clip to choose from.
 		const { entries, more } = importMenuEntries(importableAssets(editor.timeline, editor.assets));
+		const captions = generatedCount(editor.liveTimeline.overlays);
 		contextMenu.show(e, [
 			...held([
-				{ label: 'Add title at playhead', icon: 'captions', action: addTitleHere },
+				{ label: 'Add title at playhead', icon: 'captions', shortcut: settings.shortcut('title.add'), action: () => void addTitleHere() },
 				...SVG_PRESETS.map(
 					(p): MenuItem => ({
 						label: `Add animated ${p.label.toLowerCase()}`,
@@ -2412,6 +2411,16 @@
 				),
 				{ label: 'Add custom SVG title…', icon: 'code-xml', disabled: editor.busy, action: () => void addCustomSvgTitle() },
 				{ type: 'separator' },
+				{
+					label: captions > 0 ? 'Regenerate captions' : 'Generate captions',
+					icon: 'captions',
+					disabled: editor.busy,
+					shortcut: settings.shortcut('title.generateCaptions'),
+					action: () => void makeCaptions()
+				},
+				...(captions > 0
+					? [{ label: 'Clear captions', icon: 'trash', danger: true, disabled: editor.busy, action: () => void dropCaptions() } satisfies MenuItem]
+					: []),
 				...entries.map(
 					(m): MenuItem => ({
 						label: m.label,
@@ -2931,7 +2940,7 @@
 				<!-- Nothing on the titles lane: a strip, and the whole of its header adds a title. -->
 				<button
 					data-title-add
-					use:tip={'Add a title at the playhead'}
+					use:tip={settings.tip('Add a title at the playhead', 'title.add')}
 					aria-label="Add a title"
 					disabled={editor.busy}
 					onclick={addTitleHere}
@@ -2950,7 +2959,7 @@
 					>Titles · {titleCount}</span
 				>
 				<button
-					use:tip={'Add a title at the playhead'}
+					use:tip={settings.tip('Add a title at the playhead', 'title.add')}
 					aria-label="Add a title"
 					disabled={editor.busy}
 					onclick={addTitleHere}
