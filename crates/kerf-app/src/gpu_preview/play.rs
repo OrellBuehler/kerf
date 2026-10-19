@@ -25,6 +25,12 @@
 //! so the page hands over before it gets there. A frame that fails mid-session ends the session the
 //! same way (`stream`, with where to start).
 //!
+//! **Taking a play back.** While the stream plays (it took a session over, or the session was declined
+//! for a frame the GPU does not draw, which the answer names), the page asks where the GPU can play again
+//! (`hint = ready`, [`GpuPreview::ready_play`]): the first frame within [`REACH`] from which it draws a
+//! whole horizon ([`PlayCut::resume`](kerf_core::PlayCut::resume)). The play from there is primed, and the
+//! page's next session, begun there, adopts it; that session decides for itself as any other does.
+//!
 //! **Prefetch.** A thread of its own ([`Feeder`]) looks two seconds ahead of the playhead: it opens
 //! the cursor of every clip that is about to come on screen ([`CursorFeed`]; the file's probes and the
 //! process start are paid before the cut and not after it) and has the titles of the coming frames

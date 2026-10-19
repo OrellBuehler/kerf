@@ -982,12 +982,24 @@ effect ran again without a seek, `playSession`) the session starts at the audibl
 than the playhead the play began at, so a rebuild within the latency of Play or a seek does not rewind the picture. A hand-over starts the stream through the same ladder (`takeover`): the stream is *not* `streaming` (so the route stays `gpu` and the
 surface stays up) until its first frame **at or past where the GPU stops** is shown, and only then does the GPU's session end and the surface go. A
 session that was given up on is **barred** for the rest of that play (`gpuBarred`: until a deliberate seek or an edit, not for a stream restart for
-lag), so the renderers never flip back and forth. Under Proxy only the first request is rejected as the stream is (`playWaiting` →
+lag), so the renderers never flip back and forth. **A play the stream took over at a refusal is taken back** (`TakeBack`, `gpu-playback.ts`): when the
+session stopped where the engine said (`GpuPlayback.resumable`: a planned hand-over, or a decline at Play whose answer names the refused frame — not a
+frame that failed, `session`, nor an overload or a silent backend, `giveUp`), the stream, once on show, asks `getPreviewFrame(at, .., { session, ready:
+true })` (`hint: 'ready'`) for `READY_LEAD` (0.6 s) past what is heard and no earlier than the refused frame, once a second (`READY_EVERY`) while the
+answer is `stream` with `play.ahead` (nothing within the backend's reach yet). A `ready` answer's `play.resume` is where the play from there is made
+ready: `SHOW_AHEAD` (0.3 s) before it the route is the surface's again (`returning`: `streaming && !returning` in the route, so the bounds go out
+visible; the surface is not shown before a frame is drawn on it, and the pump, `streaming && gpuPlay === null`, asks nothing), a first frame's cost before
+it (the round trip of the session the stream took over, at least a frame) a `GpuPlayback(fps, resume, true)` begins and holds its picture there, and once
+its first frame is on the screen (`gpuShown`) the stream stops, the bar is lifted and the play is the GPU's again (and may hand over again later). A
+session that declines or fails before it drew leaves the stream playing (`abandonTakeBack`; asked again if the reason is still a refused frame), a
+time made ready that went by is asked for again (`MISSED_AFTER`), and pausing, a seek or an edit ends it. The take-back is in the audible time: from
+a stream that never was the GPU's (declined at Play, so read from the plain clock) the picture steps back by the output latency at the switch. Under Proxy only the first request is rejected as the stream is (`playWaiting` →
 `playbackWaiting`). The status bar names the renderer of each drawn frame (`GPU 960×540 · 14 ms · adapter`; a repeat is not a new frame and
 changes nothing). Pausing ends the session (the effect's cleanup), and the settled frame comes back through the ordinary GPU route. In the
 browser harness `getPreviewFrame` answers a forward request `stream` (no GPU), so playback is the synthesised stream as ever; `?gpusurface=1` pretends
 a surface and has the GPU play, `&gpuplay=stream` has it decline every session and `&gpuplay=ahead` has it draw for two seconds and announce a
-refusal (the hand-over). Tests: `gpu-playback.test.ts` (the request arithmetic, the decision, the hand-over, the overload),
+refusal (the hand-over), and take the play back at once when asked (`ready`), so a play cycles GPU, stream, GPU. Tests: `gpu-playback.test.ts`
+(the request arithmetic, the decision, the hand-over, the overload, `resumable` and `TakeBack`), the Preview's wiring pinned in `playback-sync.test.ts`,
 `output-latency.test.ts`, the `GPU playback` cases of `frame-pump.test.ts` (the pump over the real Svelte runtime), and the ladder's `startup`.
 
 **Shared components** (`components/editor/`; `shared-components.test.ts` keeps the dialogs, the Inspector's rows and the toolbar on them).
