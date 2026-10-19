@@ -3,10 +3,16 @@ import {
 	DEFAULT_STARTUP,
 	GpuPlayback,
 	MAX_ROUND_TRIP,
+	MISSED_AFTER,
 	Median,
 	OVERLOAD_AFTER,
 	NO_PLAY,
+	READY_EVERY,
+	READY_LEAD,
+	SHOW_AHEAD,
+	TakeBack,
 	frameIndex,
+	nextSession,
 	pictureTime,
 	playSession,
 	playStart
@@ -382,5 +388,93 @@ describe('sessions', () => {
 		const a = new GpuPlayback(30);
 		const b = new GpuPlayback(30);
 		expect(b.session).toBeGreaterThan(a.session);
+	});
+});
+
+describe('a play the stream took over is given back', () => {
+	const ready = (resume: number): PreviewFrameResult => ({
+		renderer: 'ready',
+		frame: null,
+		reasons: [],
+		timings: null,
+		play: play({ resume })
+	});
+
+	test('past a refusal the engine named, unless the GPU failed, fell behind or stopped answering', () => {
+		const planned = new GpuPlayback(30);
+		planned.answer(drew({ ahead: ahead(4) }), 0.02, 0);
+		expect(planned.resumable).toBe(true);
+		const declined = new GpuPlayback(30);
+		declined.answer(stream(ahead(1)), 0.02, 0);
+		expect(declined.resumable).toBe(true);
+		const failed = new GpuPlayback(30);
+		failed.answer(stream({ ...ahead(1), kind: 'session' }), 0.02, 0);
+		expect(failed.resumable).toBe(false);
+		const nowhere = new GpuPlayback(30);
+		nowhere.answer(stream(null), 0.02, 0);
+		expect(nowhere.resumable).toBe(false);
+		const silent = new GpuPlayback(30);
+		silent.answer(drew({ ahead: ahead(4) }), 0.02, 0);
+		silent.giveUp();
+		expect(silent.resumable).toBe(false);
+		expect(silent.ended).toBe(true);
+		const slow = new GpuPlayback(30);
+		for (let at = 0; at <= 2; at += 0.1) slow.answer(drew({ ahead: ahead(9) }), 0.2, at);
+		expect(slow.overloaded).toBe(true);
+		expect(slow.resumable).toBe(false);
+	});
+
+	test('asks ahead of what is heard, no earlier than where the GPU stopped, and once a second while nothing is ready', () => {
+		const tb = new TakeBack(5);
+		expect(tb.ask(1)).toBe(5);
+		expect(tb.ask(1.5)).toBeNull();
+		expect(tb.answer(stream(ahead(5)))).toBe('later');
+		expect(tb.ask(1.5)).toBeNull();
+		expect(tb.ask(1 + READY_EVERY)).toBe(5);
+		tb.answer(stream(ahead(6)));
+		expect(tb.ask(6)).toBe(6 + READY_LEAD);
+	});
+
+	test('brings the surface back, then begins the session a first frame ahead of the time made ready', () => {
+		const tb = new TakeBack(2);
+		expect(tb.ask(2.5)).toBe(2.5 + READY_LEAD);
+		expect(tb.answer(ready(3.2))).toBe('ready');
+		expect(tb.resume).toBe(3.2);
+		// Nothing more is asked while it is ready.
+		expect(tb.ask(4)).toBeNull();
+		expect(tb.showing(3.2 - SHOW_AHEAD - 0.01)).toBe(false);
+		expect(tb.showing(3.2 - SHOW_AHEAD)).toBe(true);
+		expect(tb.due(3.1, 0.05)).toBe(false);
+		expect(tb.due(3.16, 0.05)).toBe(true);
+		// Missed: the play got past it before a session began there; it is asked for again.
+		expect(tb.due(3.2 + MISSED_AFTER + 0.01, 0.05)).toBe(false);
+		expect(tb.missed(3.2 + MISSED_AFTER + 0.01)).toBe(true);
+		tb.retry();
+		expect(tb.resume).toBeNull();
+		expect(tb.ask(3.5)).toBe(3.5 + READY_LEAD);
+	});
+
+	test('gives up on a play that is not one to take back, and asks nothing once over', () => {
+		const tb = new TakeBack(1);
+		tb.ask(0);
+		expect(tb.answer(stream(null))).toBe('never');
+		expect(tb.over).toBe(true);
+		expect(tb.ask(10)).toBeNull();
+		const errored = new TakeBack(1);
+		errored.ask(0);
+		expect(errored.answer(null)).toBe('never');
+		// An answer after the play was taken back, paused or sought changes nothing.
+		const ended = new TakeBack(1);
+		ended.ask(0);
+		ended.end();
+		expect(ended.answer(ready(2))).toBe('never');
+		expect(ended.resume).toBeNull();
+	});
+
+	test('session numbers are never shared between sessions and ready requests', () => {
+		const a = new GpuPlayback(30).session;
+		const b = nextSession();
+		const c = new GpuPlayback(30).session;
+		expect(new Set([a, b, c]).size).toBe(3);
 	});
 });

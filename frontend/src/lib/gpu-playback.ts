@@ -144,10 +144,15 @@ export interface PlayStep {
 
 let sessions = 0;
 
+/** A session number of this page no session has had (the backend tells a page's sessions apart by it). */
+export function nextSession(): number {
+	return ++sessions;
+}
+
 /** One GPU play session as the page sees it. */
 export class GpuPlayback {
 	/** This session's number to the backend (a page-wide count: a new session never shares one). */
-	readonly session = ++sessions;
+	readonly session = nextSession();
 	/** `pending` until the first answer decides it. */
 	decided: 'pending' | 'gpu' = 'pending';
 	/** Where the GPU stops, as the last answer said (`null`: nowhere in sight). */
@@ -161,6 +166,7 @@ export class GpuPlayback {
 	private deciding = false;
 	private over = false;
 	private handing = false;
+	private gaveUp = false;
 	private slowSince: number | null = null;
 	private pending = 0;
 	private waitingSince: number | null = null;
@@ -311,5 +317,102 @@ export class GpuPlayback {
 	/** The session is over (paused, sought, handed to the stream). */
 	end() {
 		this.over = true;
+	}
+
+	/** The GPU stopped answering: the stream takes over, and the play is not given back to it. */
+	giveUp() {
+		this.gaveUp = true;
+		this.over = true;
+	}
+
+	/**
+	 * Whether the stream that takes this session over may give the play back to the GPU once it is past where the
+	 * GPU stops: the engine said where (a frame it does not draw, or does not draw in time), and the GPU neither
+	 * failed a frame (`session`), fell behind nor stopped answering.
+	 */
+	get resumable(): boolean {
+		return this.ahead !== null && this.ahead.kind !== 'session' && !this.overloaded && !this.gaveUp;
+	}
+}
+
+/** A `ready` request asks where the GPU takes the play back from this far past the time that is heard, seconds:
+ *  what the backend makes ready there (the cursors of that frame) has started before the play gets to it. */
+export const READY_LEAD = 0.6;
+/** ...and asks again after this much of the play while nothing is ready (the backend looks 4 s ahead). */
+export const READY_EVERY = 1;
+/** The route goes back to the surface this long before the GPU's session begins, so the bounds the backend has
+ *  are the shown ones by then (the surface is not shown before a frame is drawn on it). */
+export const SHOW_AHEAD = 0.3;
+/** A play made ready and not begun within this long of its time is gone (the backend adopts it within 0.15 s). */
+export const MISSED_AFTER = 0.15;
+
+/**
+ * Taking a play back from the stream, as the page sees it. The stream plays because the GPU stopped before a frame
+ * it does not draw (or never began: one was in its first five seconds). While the stream plays, the page asks the
+ * backend where, a little ahead of what is heard, the GPU draws a whole horizon again (`ready`); the backend makes
+ * the play from there ready and says `resume`. The surface's route comes back `SHOW_AHEAD` before it, the GPU's
+ * session begins `lead` before it (what its first frame costs) and holds its picture there, and the stream stops once
+ * the GPU's first frame is on the screen. Nothing ready within reach: asked again `READY_EVERY` later.
+ */
+export class TakeBack {
+	/** Where the GPU takes the play back, once the backend has said. */
+	resume: number | null = null;
+	private askedAt = -Infinity;
+	private asking = false;
+	private done = false;
+
+	/** `from`: where the GPU stopped (the frame it does not draw); nothing before it is asked for. */
+	constructor(readonly from: number) {}
+
+	/** The time to ask `ready` for now, or `null` (one is in flight, one is ready, or it was asked a moment ago). */
+	ask(heard: number): number | null {
+		if (this.done || this.asking || this.resume !== null || heard - this.askedAt < READY_EVERY) return null;
+		this.askedAt = heard;
+		this.asking = true;
+		return Math.max(this.from, heard + READY_LEAD);
+	}
+
+	/** The backend's answer to it: `ready` with where, `later` (nothing within reach yet), or `never` (not this play). */
+	answer(result: PreviewFrameResult | null): 'ready' | 'later' | 'never' {
+		this.asking = false;
+		if (this.done) return 'never';
+		const resume = result?.play?.resume;
+		if (result?.renderer === 'ready' && typeof resume === 'number' && Number.isFinite(resume)) {
+			this.resume = resume;
+			return 'ready';
+		}
+		if (result?.renderer === 'stream' && result.play?.ahead) return 'later';
+		this.done = true;
+		return 'never';
+	}
+
+	/** The surface's route should be back: the GPU's session is about to begin. */
+	showing(heard: number): boolean {
+		return this.resume !== null && heard >= this.resume - SHOW_AHEAD;
+	}
+
+	/** The GPU's session should begin now: its first frame, `lead` seconds of work, lands at `resume`. */
+	due(heard: number, lead: number): boolean {
+		return this.resume !== null && heard >= this.resume - Math.max(0, lead) && !this.missed(heard);
+	}
+
+	/** The time made ready went by before a session began there: it is asked for again. */
+	missed(heard: number): boolean {
+		return this.resume !== null && heard > this.resume + MISSED_AFTER;
+	}
+
+	/** Ask again (the time made ready was missed, or the session begun there was declined before it drew). */
+	retry() {
+		this.resume = null;
+		this.askedAt = -Infinity;
+	}
+
+	/** Nothing more is asked (the play was taken back, paused or sought). */
+	end() {
+		this.done = true;
+	}
+
+	get over(): boolean {
+		return this.done;
 	}
 }

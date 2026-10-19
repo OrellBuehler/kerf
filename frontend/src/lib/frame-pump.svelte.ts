@@ -173,6 +173,7 @@ export function createFramePump(deps: FramePumpDeps) {
 			return;
 		}
 		if (playback.stalled(now())) {
+			playback.giveUp();
 			deps.gpuFailed(new Error('the GPU preview stopped answering during playback'));
 			deps.playHandover?.(playback, playback.ahead, true, 'the GPU stopped answering');
 			return;
