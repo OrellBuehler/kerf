@@ -73,6 +73,17 @@ fn source(dir: &Path, name: &str, picture: &str) -> Asset {
     asset
 }
 
+/// One frame of `testsrc2` held for the whole clip: every pixel different from its neighbours,
+/// and the same picture whichever source frame a pick lands on.
+fn detailed(dir: &Path) -> Asset {
+    std::fs::create_dir_all(dir.join("detail")).expect("temp dir");
+    source(
+        dir,
+        "detail",
+        &format!("testsrc2=s={W}x{H}:r=30:d=1,select=eq(n\\,0),loop=loop=299:size=1,setpts=N/(30*TB)"),
+    )
+}
+
 fn white(dir: &Path) -> Asset {
     source(dir, "white", &format!("color=c=white:s={W}x{H}:r=30:d=8"))
 }
@@ -330,6 +341,7 @@ struct CropCase {
     name: &'static str,
     decorate: fn(&mut Clip),
     range: Option<(f64, f64)>,
+    start: f64,
 }
 
 fn crop_case(name: &'static str, decorate: fn(&mut Clip)) -> CropCase {
@@ -337,6 +349,7 @@ fn crop_case(name: &'static str, decorate: fn(&mut Clip)) -> CropCase {
         name,
         decorate,
         range: None,
+        start: 0.0,
     }
 }
 
@@ -349,30 +362,50 @@ fn zoom_into_the_box(c: &mut Clip) {
     c.set_property_keys(Property::CropY, vec![key(0.0, -0.3, Easing::Linear)]);
 }
 
-fn check_crop(dir: &Path, case: &CropCase) {
-    let src = boxed(dir);
+/// The clip of a crop case on `src`.
+fn crop_clip(src: &Asset, case: &CropCase) -> Clip {
     let mut probe = Clip::new(src.id, 0.0, 1.0, 0.0);
     (case.decorate)(&mut probe);
-    let mut clip = make_clip(src.id, 1.0, 1.0 + 2.5 * probe.speed_mag(), 0.0);
+    let mut clip = make_clip(src.id, 1.0, 1.0 + 2.5 * probe.speed_mag(), case.start);
     (case.decorate)(&mut clip);
-    let timeline = timeline_of(vec![video_track(vec![clip.clone()])]);
-    let assets = vec![src];
+    clip
+}
+
+/// The window the export shows at `local`: the keyed one inside what the static crop leaves.
+fn window_at(clip: &Clip, local: f64) -> (f64, f64, f64, f64) {
+    let t = clip.transform_at(local);
+    let (cw, ch) = (1.0 - t.crop_left - t.crop_right, 1.0 - t.crop_top - t.crop_bottom);
+    let (l, top, w, h) = clip.crop_window_at(local);
+    (t.crop_left + cw * l, t.crop_top + ch * top, cw * w, ch * h)
+}
+
+/// The peak signal-to-noise ratio of two rgb24 frames, in dB, and their largest difference.
+fn psnr(a: &[u8], b: &[u8]) -> (f64, i32) {
+    let (mut sum, mut worst) = (0.0, 0);
+    for (x, y) in a.iter().zip(b) {
+        let d = i32::from(*x) - i32::from(*y);
+        sum += f64::from(d * d);
+        worst = worst.max(d.abs());
+    }
+    let mse = sum / a.len() as f64;
+    (if mse == 0.0 { f64::INFINITY } else { 10.0 * (255.0 * 255.0 / mse).log10() }, worst)
+}
+
+fn check_crop(dir: &Path, case: &CropCase) {
+    let tag = format!("crop-{}", case.name.replace([' ', ','], "-"));
     let mut opts = options();
     opts.range = case.range.map(|(start, end)| TimeRange { start, end });
-    let tag = format!("crop-{}", case.name.replace([' ', ','], "-"));
+    let offset = case.range.map_or(0.0, |r| r.0);
+    // Where: a white box on black, its centre on every output frame where the window of that
+    // moment puts it.
+    let src = boxed(dir);
+    let clip = crop_clip(&src, case);
+    let timeline = timeline_of(vec![video_track(vec![clip.clone()])]);
+    let assets = vec![src];
     let frames = export_frames(&timeline, &assets, &opts, dir, &tag);
-    let shown = frames_of(&frames, &clip, case.range.map_or(0.0, |r| r.0));
-    let (mut compared, mut xs) = (0, Vec::new());
-    for (k, t, frame) in &shown {
-        let local = t - clip.timeline_start;
-        let tf = clip.framing_at(local);
-        let window = (
-            tf.crop_left,
-            tf.crop_top,
-            1.0 - tf.crop_left - tf.crop_right,
-            1.0 - tf.crop_top - tf.crop_bottom,
-        );
-        let want = box_in_window(window);
+    let mut xs = Vec::new();
+    for (k, t, frame) in frames_of(&frames, &clip, offset) {
+        let want = box_in_window(window_at(&clip, t - clip.timeline_start));
         let got = bright_centre(frame).unwrap_or_else(|| panic!("{}: frame {k} lost the box", case.name));
         xs.push(got.0);
         let off = (got.0 - want.0).abs().max((got.1 - want.1).abs());
@@ -381,29 +414,37 @@ fn check_crop(dir: &Path, case: &CropCase) {
             "{}: frame {k} (t = {t:.4}) draws the box at {got:?}, the window of that moment puts it at {want:?}",
             case.name
         );
+    }
+    let spread = xs.iter().copied().fold(f64::MIN, f64::max) - xs.iter().copied().fold(f64::MAX, f64::min);
+    assert!(spread > 5.0, "{}: the box only moved {spread:.1} px: the keys did nothing", case.name);
+    // What: a detailed picture (one frame of `testsrc2`, held), every fifth output frame against
+    // the still of the same moment, which reads the window through the same `perspective`.
+    let src = detailed(dir);
+    let clip = crop_clip(&src, case);
+    let timeline = timeline_of(vec![video_track(vec![clip.clone()])]);
+    let assets = vec![src];
+    let frames = export_frames(&timeline, &assets, &opts, &dir.join("detail"), &tag);
+    let mut compared = 0;
+    for (k, t, frame) in frames_of(&frames, &clip, offset) {
         if k % 5 != 0 {
             continue;
         }
-        let still = bright_centre(&still_frame(&timeline, &assets, &opts, *t)).expect("the still shows the box");
-        // The still is a static `crop`, which rounds its corner and its size down to even source
-        // pixels in 4:2:0 (as a static crop's always did): the same window, up to three source
-        // pixels' slack, magnified by the zoom.
-        let off = (got.0 - still.0).abs().max((got.1 - still.1).abs());
+        let still = still_frame(&timeline, &assets, &opts, t);
+        let (db, worst) = psnr(frame, &still);
         assert!(
-            off <= 1.0 + 3.0 / window.2,
-            "{}: frame {k} (t = {t:.4}) draws the box at {got:?}, the still of that moment at {still:?}",
+            db >= CROP_PSNR && worst <= CROP_WORST,
+            "{}: frame {k} (t = {t:.4}) is {db:.1} dB (worst {worst} levels) off the still of that moment",
             case.name
         );
         compared += 1;
     }
-    let spread = xs.iter().copied().fold(f64::MIN, f64::max) - xs.iter().copied().fold(f64::MAX, f64::min);
-    assert!(
-        spread > 5.0,
-        "{}: the box only moved {spread:.1} px: the keys did nothing",
-        case.name
-    );
     assert!(compared >= 6, "{}: only {compared} frames compared", case.name);
 }
+
+/// How close the export's keyed crop and the still of the same moment have to be on a detailed
+/// picture: the same `perspective`, the same window to the last bits of a double.
+const CROP_PSNR: f64 = 50.0;
+const CROP_WORST: i32 = 8;
 
 #[test]
 #[ignore = "needs the ffmpeg binary"]
@@ -433,6 +474,15 @@ fn a_keyed_crop_puts_the_picture_where_its_window_says_on_every_output_frame() {
             range: Some((0.3, 2.1)),
             ..crop_case("cut by a range export", zoom_into_the_box)
         },
+        // Half a frame off the grid: the pinned `fps` rounds the start to a slot.
+        CropCase {
+            start: 1.0 + 0.5 / 30.0,
+            ..crop_case("late, off the frame grid", zoom_into_the_box)
+        },
+        crop_case("reversed", |c| {
+            zoom_into_the_box(c);
+            c.speed = -1.0;
+        }),
     ];
     for case in &cases {
         check_crop(&dir, case);

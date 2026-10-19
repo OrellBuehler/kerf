@@ -5878,7 +5878,14 @@ impl Project {
                     )));
                 }
             }
-            let tracks = source.property_keys_shifted(&props, offset);
+            // Every keyed number, when none is named: a mask's numbers only onto a clip that has a
+            // mask (they would be refused, and the rest would not be copied).
+            let maskless = props.is_empty() && timeline.clip(to_clip).is_some_and(|c| c.mask.is_none());
+            let tracks: Vec<PropertyTrack> = source
+                .property_keys_shifted(&props, offset)
+                .into_iter()
+                .filter(|t| !(maskless && t.prop.is_mask()))
+                .collect();
             if tracks.is_empty() {
                 return Err(Error::InvalidArgument("the source clip has no keyframes to copy".to_string()));
             }
@@ -9686,6 +9693,12 @@ mod tests {
         project.set_mask(clip.id, Some(Mask::default())).unwrap();
         let keyed = project.set_property_keyframes(clip.id, Property::MaskX, keys).unwrap();
         assert!(keyed.mask_animated() && keyed.crop_animated());
+        // Copying every keyed number onto a clip with no mask leaves the mask's behind; naming
+        // one is still refused.
+        let other = project.cut_clip(clip.asset_id, 0.0, 5.0).unwrap();
+        let copied = project.copy_keyframes(clip.id, other.id, &[], 0.0).unwrap();
+        assert!(copied.crop_animated() && !copied.is_keyed(Property::MaskX));
+        assert!(project.copy_keyframes(clip.id, other.id, &[Property::MaskX], 0.0).is_err());
         let cleared = project.set_mask(clip.id, None).unwrap();
         assert!(!cleared.is_keyed(Property::MaskX) && cleared.crop_animated());
     }

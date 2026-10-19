@@ -45,6 +45,7 @@
 		channelOf,
 		colorAnimated,
 		cropAnimated,
+		CROP_PROPERTIES,
 		colorAt,
 		isKeyed,
 		maskAt,
@@ -1526,7 +1527,7 @@
 					setTf({ opacity: v }, at), undefined, liveTf((v) => ({ opacity: v })))}
 				</InspectorSection>
 
-				<InspectorSection title="Framing" summary={hasCrop ? 'Cropped' : cropAnimated(clip) ? 'Crop motion' : 'Full frame'}>
+				<InspectorSection title="Framing" summary={[hasCrop && 'Cropped', cropAnimated(clip) && 'Crop motion'].filter(Boolean).join(' · ') || 'Full frame'}>
 				<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
 					<Btn
 						size="sm"
@@ -1564,7 +1565,19 @@
 				{@render rangeRow('Right', tf.crop_right, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_right }, (v, at) => setTf({ crop_right: v }, at), undefined, liveTf((v) => ({ crop_right: v })))}
 				{@render rangeRow('Top', tf.crop_top, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_top }, (v, at) => setTf({ crop_top: v }, at), undefined, liveTf((v) => ({ crop_top: v })))}
 				{@render rangeRow('Bottom', tf.crop_bottom, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_bottom }, (v, at) => setTf({ crop_bottom: v }, at), undefined, liveTf((v) => ({ crop_bottom: v })))}
-				<div class="k-overline" style="margin:8px 0 2px">Crop motion</div>
+				<div style="display:flex;align-items:center;gap:8px;margin:8px 0 2px">
+					<span class="k-overline" style="flex:1">Crop motion</span>
+					<Btn
+						variant="ghost"
+						size="sm"
+						pending={editor.locked}
+						disabled={!CROP_PROPERTIES.some((p) => isKeyed(clip, p))}
+						title={'Take out every Crop motion key (the crop above stays)'}
+						onclick={() =>
+							run(() => editor.setPropertyTracks(clip.id, CROP_PROPERTIES.filter((p) => isKeyed(clip, p)).map((prop) => ({ prop, keys: [] }))))}
+						>Clear</Btn
+					>
+				</div>
 				<div style="font:var(--type-caption);color:var(--text-muted);margin:0 0 4px">
 					A push-in or a pan inside the picture (and inside the crop above). It is always keyed: a change keys it at the playhead.
 				</div>

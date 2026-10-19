@@ -3091,7 +3091,8 @@ export async function copyKeyframes(
 		if (!from) throw new Error(`clip ${fromClipId} not found`);
 		if (!to) throw new Error(`clip ${toClipId} not found`);
 		const source = from[0].clips[from[1]];
-		const tracks = propertyKeysShifted(source, props, offset);
+		const maskless = props.length === 0 && !to[0].clips[to[1]].mask;
+		const tracks = propertyKeysShifted(source, props, offset).filter((t) => !(maskless && isMaskProperty(t.prop)));
 		if (tracks.length === 0) throw new Error('the source clip has no keyframes to copy');
 		for (const t of tracks) {
 			if (t.keys.length === 0) throw new Error(`the source clip has no ${t.prop} keyframes`);

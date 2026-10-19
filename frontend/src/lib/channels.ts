@@ -1,7 +1,7 @@
 /**
  * Per-property keyframe channels: the faithful TS mirror of kerf-core's `model/channels.rs`
  * (`Property`, `PropertyTrack`, `Clip::property_keys` / `property_curve` / `property_at`,
- * `color_at`, `volume_at`, `mask_at`, `crop_window_at`, `framing_at`, `upsert`, `rebase_head`).
+ * `color_at`, `volume_at`, `mask_at`, `crop_window_at`, `upsert`, `rebase_head`).
  * Any one number of a clip — a transform number, a colour number, the clip's volume, a number of
  * its mask or the animated crop (a zoom and a pan, see `cropWindowAt`) — can have keys of its own;
  * a number with a track is
@@ -338,8 +338,9 @@ export const volumeAt = (clip: Animatable, local: number) => propertyAt(clip, 'v
 
 /** Whether a number of the clip's mask is keyed and it has a mask to key (`Clip::mask_animated`). */
 export const maskAnimated = (clip: Animatable) => !!clip.mask && MASK_PROPERTIES.some((p) => isKeyed(clip, p));
-/** Whether the animated crop is keyed (`Clip::crop_animated`). */
-export const cropAnimated = (clip: Animatable) => CROP_PROPERTIES.some((p) => isKeyed(clip, p));
+/** Whether the animated crop cuts anything: its zoom is keyed and some key zooms in
+ *  (`Clip::crop_animated`; a zoom held at 1 shows the whole picture whatever the pans say). */
+export const cropAnimated = (clip: Animatable) => propertyKeys(clip, 'crop_zoom').some((k) => k.value > 1);
 
 /** The clip's mask at `local`, normalized (`Clip::mask_at`). */
 export function maskAt(clip: Animatable, local: number): Mask | undefined {
@@ -365,17 +366,6 @@ export function cropWindowAt(clip: Animatable, local: number): [number, number, 
 	return [at(propertyAt(clip, 'crop_x', local)), at(propertyAt(clip, 'crop_y', local)), side, side];
 }
 
-/** `transformAt` with the animated crop folded into the crop edges (`Clip::framing_at`). */
-export function framingAt(clip: Animatable, local: number): Transform {
-	const t = transformAt(clip, local);
-	if (!cropAnimated(clip)) return t;
-	const [l, top, w, h] = cropWindowAt(clip, local);
-	const cw = Math.max(1 - t.crop_left - t.crop_right, 0);
-	const ch = Math.max(1 - t.crop_top - t.crop_bottom, 0);
-	const left = t.crop_left + cw * l;
-	const up = t.crop_top + ch * top;
-	return { ...t, crop_left: left, crop_top: up, crop_right: 1 - left - cw * w, crop_bottom: 1 - up - ch * h };
-}
 
 // ---- edits (mutate `clip`: the harness works on a scratch copy) ------------------------
 

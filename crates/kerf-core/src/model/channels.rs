@@ -16,7 +16,8 @@
 //! whole picture, 2 = half of it on each axis) and where that window sits in the room left over,
 //! [`Property::CropX`] / [`Property::CropY`] (-1 = against the left / top edge, 0 = centred, 1 =
 //! against the right / bottom one). It can never show anything outside the picture, its size
-//! never changes, and its neutral values (1, 0, 0) are no crop at all ([`Clip::crop_window_at`]).
+//! never changes, and its neutral values (1, 0, 0) are no crop at all ([`Clip::crop_window_at`]):
+//! a crop whose zoom never leaves 1 is not animated.
 //!
 //! **One resolver.** What a property does is [`Clip::property_keys`], and everything else
 //! reads that: the eased polyline ([`Clip::property_curve`]) the export writes into its
@@ -496,9 +497,11 @@ impl Clip {
         self.mask.is_some() && Property::MASK.iter().any(|p| self.is_keyed(*p))
     }
 
-    /// Whether the animated crop is keyed.
+    /// Whether the animated crop cuts anything: its zoom is keyed and some key zooms in. A zoom
+    /// held at 1 shows the whole picture whatever the pans say, so such keys draw nothing and
+    /// cost nothing (as a keyed rotation at 0 or opacity at 1 do).
     pub fn crop_animated(&self) -> bool {
-        Property::CROP.iter().any(|p| self.is_keyed(*p))
+        self.property_keys(Property::CropZoom).iter().any(|k| k.value > 1.0)
     }
 
     /// The clip's mask at `local` seconds from its start (normalized): every keyed number its
@@ -536,25 +539,6 @@ impl Clip {
             side,
             side,
         )
-    }
-
-    /// [`Clip::transform_at`] with the animated crop folded into the crop edges: what the
-    /// picture at `local` is cut to, as a static crop would cut it. The still and the GPU plan
-    /// draw a keyed crop this way at one instant (the export writes it per frame).
-    pub fn framing_at(&self, local: f64) -> Transform {
-        let mut t = self.transform_at(local);
-        if !self.crop_animated() {
-            return t;
-        }
-        let (l, top, w, h) = self.crop_window_at(local);
-        let cw = (1.0 - t.crop_left - t.crop_right).max(0.0);
-        let ch = (1.0 - t.crop_top - t.crop_bottom).max(0.0);
-        let (left, top) = (t.crop_left + cw * l, t.crop_top + ch * top);
-        t.crop_right = 1.0 - left - cw * w;
-        t.crop_bottom = 1.0 - top - ch * h;
-        t.crop_left = left;
-        t.crop_top = top;
-        t
     }
 
     // ---- edits ------------------------------------------------------------------
@@ -859,14 +843,20 @@ mod tests {
     }
 
     #[test]
-    fn a_keyed_crop_is_a_window_of_the_picture_s_own_shape_inside_the_static_crop() {
+    fn a_keyed_crop_is_a_window_of_the_picture_s_own_shape_and_one_that_never_zooms_is_none() {
         let mut c = clip();
         assert_eq!(c.crop_window_at(0.0), (0.0, 0.0, 1.0, 1.0));
-        assert_eq!(c.framing_at(0.0), c.transform_at(0.0));
+        // Pans and a zoom held at 1 show the whole picture: not animated, nothing to draw.
+        c.set_property_keys(Property::CropX, vec![key(0.0, -1.0, Easing::Linear)]);
+        c.set_property_keys(Property::CropZoom, vec![key(0.0, 1.0, Easing::Linear), key(2.0, 1.0, Easing::Linear)]);
+        assert!(c.is_keyed(Property::CropZoom) && !c.crop_animated());
+        assert_eq!(c.crop_window_at(1.0), (0.0, 0.0, 1.0, 1.0));
+        c.set_property_keys(Property::CropX, vec![]);
         c.set_property_keys(
             Property::CropZoom,
             vec![key(0.0, 1.0, Easing::Linear), key(2.0, 4.0, Easing::Linear)],
         );
+        assert!(c.crop_animated());
         // Centred by default: zoom 2.5 at 1 s is 0.4 of each side, 0.3 either side of it.
         let (l, t, w, h) = c.crop_window_at(1.0);
         assert!((w - 0.4).abs() < 1e-12 && w == h && (l - 0.3).abs() < 1e-12 && (t - 0.3).abs() < 1e-12);
@@ -875,16 +865,6 @@ mod tests {
         c.set_property_keys(Property::CropY, vec![key(0.0, 1.0, Easing::Linear)]);
         let (l, t, w, h) = c.crop_window_at(1.0);
         assert!(l.abs() < 1e-12 && (t + h - 1.0).abs() < 1e-12 && (l + w) <= 1.0);
-        // Folded into a static crop: the window is of what that crop leaves.
-        c.transform.crop_left = 0.1;
-        c.transform.crop_right = 0.3;
-        let f = c.framing_at(1.0);
-        assert!((f.crop_left - 0.1).abs() < 1e-12, "{f:?}");
-        assert!((1.0 - f.crop_left - f.crop_right - 0.6 * 0.4).abs() < 1e-12, "{f:?}");
-        assert!(
-            (f.crop_bottom).abs() < 1e-12 && (1.0 - f.crop_top - f.crop_bottom - 0.4).abs() < 1e-12,
-            "{f:?}"
-        );
         // The zoom never goes out past the whole picture.
         assert!(Property::CropZoom.check(0.5).is_err() && Property::CropZoom.clamp(0.5) == 1.0);
         assert_eq!(Property::CropZoom.neutral(), 1.0);

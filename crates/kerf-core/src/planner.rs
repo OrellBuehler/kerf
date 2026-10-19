@@ -621,7 +621,7 @@ impl Planner {
                     source_time,
                     clip_time: local,
                     stream,
-                    transform: clip.framing_at(local),
+                    transform: clip.transform_at(local),
                     color: clip.color_at(local),
                     grade: clip.grade.clone(),
                     name: asset.name.clone(),
@@ -1765,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn a_keyed_mask_and_crop_are_sampled_per_frame_and_only_an_export_frame_is_refused_them() {
+    fn a_keyed_mask_is_sampled_per_frame_and_a_keyed_crop_is_refused_in_every_frame() {
         use crate::model::{Mask, Property, PropertyKey};
         let a = asset();
         let assets = [a.clone()];
@@ -1784,25 +1784,30 @@ mod tests {
         for plan in [&still, &motion] {
             let layer = &plan.layers[0];
             assert!((layer.mask.unwrap().x - 0.5).abs() < 1e-9, "{:?}", layer.mask);
-            // Zoom 2 into the 0.8-wide picture the static crop leaves, centred: 0.4 of it.
-            let t = layer.transform;
-            assert!((t.crop_left - 0.4).abs() < 1e-9 && (t.crop_right - 0.2).abs() < 1e-9, "{t:?}");
-            assert!(
-                (t.crop_top - 0.25).abs() < 1e-9 && (t.crop_bottom - 0.25).abs() < 1e-9,
-                "{t:?}"
-            );
+            // The static crop is the layer's; the keyed window is not folded into it.
+            assert_eq!(layer.transform, clip.transform);
             let animated = layer.animated.unwrap();
             assert!(animated.mask && animated.crop && animated.keys.is_none() && !animated.color);
         }
+        // A still draws the sampled mask like a static one; the crop is FFmpeg's `perspective` in a
+        // still too, so it is refused in both.
         let why = |plan: &RenderPlan| plan.reasons(&GpuCaps::A0, plan.size(u32::MAX));
         let still_why = why(&still);
-        assert!(!has(&still_why, |u| matches!(
-            u,
-            Unsupported::KeyedMask(_) | Unsupported::KeyedCrop(_)
-        )));
+        assert!(!has(&still_why, |u| matches!(u, Unsupported::KeyedMask(_))));
+        assert!(has(&still_why, |u| matches!(u, Unsupported::KeyedCrop(_))));
         let motion_why = why(&motion);
         assert!(has(&motion_why, |u| matches!(u, Unsupported::KeyedMask(_))));
         assert!(has(&motion_why, |u| matches!(u, Unsupported::KeyedCrop(_))));
+        // A crop whose zoom never leaves 1 is no keyed crop.
+        let mut held = clip.clone();
+        held.mask = None;
+        held.channels.clear();
+        held.set_property_keys(Property::CropZoom, vec![PropertyKey::new(0.0, 1.0)]);
+        held.set_property_keys(Property::CropX, vec![PropertyKey::new(0.0, 0.5)]);
+        let plan = planner(&single(vec![held]), &assets, PlanMode::Motion, &opts(30.0))
+            .at_frame(60)
+            .unwrap();
+        assert!(plan.layers[0].animated.is_none());
         // A mask's keys without a mask key nothing, and a static mask is no keyed one.
         let mut bare = make_clip(a.id, 0.0, 4.0, 1.0);
         bare.set_property_keys(Property::MaskX, vec![PropertyKey::new(0.0, 0.2), PropertyKey::new(2.0, 0.8)]);

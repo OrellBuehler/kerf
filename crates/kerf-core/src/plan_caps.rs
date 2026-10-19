@@ -257,7 +257,8 @@ pub enum Unsupported {
     KeyedColor(LayerRef),
     /// A keyframed mask in an export frame (its `geq` reads the mask's numbers at the frame's time).
     KeyedMask(LayerRef),
-    /// A keyframed crop in an export frame (a `geq` reading the picture through a moving window).
+    /// A keyframed crop (a `perspective` reading the picture through its window, in the export and
+    /// the FFmpeg still alike).
     KeyedCrop(LayerRef),
     /// A keyframed zoom in an export frame, which FFmpeg draws as the last stage of the chain.
     KeyedZoom(LayerRef),
@@ -418,7 +419,7 @@ impl fmt::Display for Unsupported {
             ),
             Self::KeyedCrop(l) => write!(
                 f,
-                "{l}: a keyframed crop (a geq reading the picture through a moving window, bilinear, which no compositor pass draws)"
+                "{l}: a keyframed crop (a perspective reading the picture through its window, which no compositor pass draws)"
             ),
             Self::KeyedZoom(l) => write!(
                 f,

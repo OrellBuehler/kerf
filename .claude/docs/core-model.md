@@ -120,13 +120,15 @@
   can follow (`crop`'s `w` / `h` are evaluated once); the keyed crop is a window of the *statically cropped*
   picture with its own aspect, `1 / zoom` of each side, placed by the pan in the room left over
   (`Clip::crop_window_at`), so it never shows anything outside the picture and its size never changes. It has no
-  static value (neutral 1, 0, 0) and sits on top of the four static edges; `Clip::framing_at` is `transform_at`
-  with the window folded into the crop edges — what the still and the GPU plan draw at one instant.
+  static value (neutral 1, 0, 0) and sits on top of the four static edges. **`crop_animated` is "some zoom key
+  zooms in"**: a zoom held at 1 shows the whole picture whatever the pans say, so such keys draw nothing, cost
+  nothing and are not refused by the GPU plan (as a keyed rotation at 0 or opacity at 1).
   `mask_animated` is "a mask number is keyed **and** the clip has a mask": keying one on a clip without a mask is
   refused (`check_keyable` in `set_property_keyframes` / `set_property_tracks` / `copy_keyframes`; no keys is
-  always fine), and `set_mask(None)` drops the mask's keys. `frontend/src/lib/channels.ts`
+  always fine; `copy_keyframes` with no `props` leaves a mask's numbers behind for a destination with no mask
+  instead of refusing the copy), and `set_mask(None)` drops the mask's keys. `frontend/src/lib/channels.ts`
   is the faithful TS mirror (resolver, `upsertKey`, `rebaseHead`, `propertyKeysShifted`, ranges, `maskAt`,
-  `cropWindowAt`, `framingAt`, `keyableProblem`; its key copies own their bezier easing (`ownEasing`), since a
+  `cropWindowAt`, `cropAnimated`, `keyableProblem`; its key copies own their bezier easing (`ownEasing`), since a
   curve read off the editor's reactive timeline is a proxy the harness's `structuredClone` refuses; both
   suites pin the same samples, head-cut keys and split beziers bit for bit), used by the harness, the
   Inspector's sampled pose and the preview's gain (`gainAutomation`).

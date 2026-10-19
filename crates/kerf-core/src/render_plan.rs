@@ -54,10 +54,9 @@ pub(crate) struct ActiveClip<'a> {
 
 impl ActiveClip<'_> {
     /// The clip's transform sampled at this instant, so a keyframed clip shows
-    /// its pose rather than the static one, with a keyed crop folded into its crop edges
-    /// ([`Clip::framing_at`]).
+    /// its pose rather than the static one.
     pub(crate) fn transform(&self) -> Transform {
-        self.clip.framing_at(self.local_time)
+        self.clip.transform_at(self.local_time)
     }
 
     /// The clip's colour sampled at this instant (a keyed number is its curve's value).
@@ -423,9 +422,9 @@ pub struct Animated {
     /// draws the mask sampled at its instant ([`Clip::mask_at`]) as a static one; an export frame
     /// is refused (no compositor pass draws a moving mask yet).
     pub mask: bool,
-    /// The crop is keyed: the export reads the picture through a moving window with a `geq`
-    /// (bilinear). A still plan draws the window at its instant as a static crop
-    /// ([`Clip::framing_at`]); an export frame is refused.
+    /// The crop is keyed ([`Clip::crop_animated`]): the export and the FFmpeg still read the
+    /// picture through its window with a `perspective` (bilinear, fixed-point), which no
+    /// compositor pass draws, so every frame of it is refused.
     pub crop: bool,
 }
 
@@ -1113,7 +1112,7 @@ impl RenderPlan {
             if self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.mask) {
                 out.push(Unsupported::KeyedMask(at()));
             }
-            if self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.crop) {
+            if layer.animated.is_some_and(|a| a.crop) {
                 out.push(Unsupported::KeyedCrop(at()));
             }
             if layer.animated.is_some_and(|a| a.zooms) {

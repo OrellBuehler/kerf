@@ -206,6 +206,22 @@ describe('property keyframes (browser harness)', () => {
 		expect(propertyKeys(clipOf(after, 'c1'), 'opacity')).toHaveLength(3);
 	});
 
+	test('copying every keyed number leaves a mask’s numbers behind for a clip with no mask', async () => {
+		await setMask('c1', { shape: 'rect', x: 0.5, y: 0.5, width: 0.5, height: 0.5, feather: 0.15 });
+		await setPropertyTracks('c1', [
+			{ prop: 'mask_x', keys: [k(0, 0.2), k(2, 0.8)] },
+			{ prop: 'opacity', keys: [k(0, 1), k(2, 0.5)] }
+		]);
+		const t = await copyKeyframes('c1', 'c2');
+		const dest = clipOf(t, 'c2');
+		expect(isKeyed(dest, 'opacity')).toBe(true);
+		expect(isKeyed(dest, 'mask_x')).toBe(false);
+		await expect(copyKeyframes('c1', 'c2', ['mask_x'])).rejects.toThrow('no mask');
+		await setMask('c1', null);
+		await setPropertyKeyframes('c1', 'opacity', []);
+		await setPropertyKeyframes('c2', 'opacity', []);
+	});
+
 	test('a mask is keyed only on a clip with one, and clearing it clears its keys', async () => {
 		await setMask('c1', null);
 		await expect(setPropertyKeyframes('c1', 'mask_x', [k(0, 0.2), k(2, 0.8)])).rejects.toThrow('no mask');

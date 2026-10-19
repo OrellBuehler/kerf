@@ -4,8 +4,8 @@ import {
 	clampProperty,
 	clearTransformAnimation,
 	colorAt,
+	cropAnimated,
 	cropWindowAt,
-	framingAt,
 	insertPropertyKey,
 	isKeyed,
 	keyableProblem,
@@ -476,7 +476,11 @@ describe('mask and crop channels (the same numbers as channels.rs)', () => {
 	test('a keyed crop is a window of the picture’s own shape inside the static crop', () => {
 		const c = clip();
 		expect(cropWindowAt(c, 0)).toEqual([0, 0, 1, 1]);
-		expect(framingAt(c, 0)).toEqual(transformAt(c, 0));
+		setPropertyKeys(c, 'crop_x', [key(0, -1)]);
+		setPropertyKeys(c, 'crop_zoom', [key(0, 1), key(2, 1)]);
+		expect(isKeyed(c, 'crop_zoom') && !cropAnimated(c)).toBe(true);
+		expect(cropWindowAt(c, 1)).toEqual([0, 0, 1, 1]);
+		setPropertyKeys(c, 'crop_x', []);
 		setPropertyKeys(c, 'crop_zoom', [key(0, 1), key(2, 4)]);
 		let [l, t, w, h] = cropWindowAt(c, 1);
 		expect(Math.abs(w - 0.4)).toBeLessThan(1e-12);
@@ -488,11 +492,6 @@ describe('mask and crop channels (the same numbers as channels.rs)', () => {
 		[l, t, w, h] = cropWindowAt(c, 1);
 		expect(Math.abs(l)).toBeLessThan(1e-12);
 		expect(Math.abs(t + h - 1)).toBeLessThan(1e-12);
-		c.transform = { ...c.transform!, crop_left: 0.1, crop_right: 0.3 };
-		const f = framingAt(c, 1);
-		expect(Math.abs(f.crop_left - 0.1)).toBeLessThan(1e-12);
-		expect(Math.abs(1 - f.crop_left - f.crop_right - 0.6 * 0.4)).toBeLessThan(1e-12);
-		expect(Math.abs(f.crop_bottom)).toBeLessThan(1e-12);
 		expect(propertyProblem('crop_zoom', 0.5)).toBeDefined();
 		expect(clampProperty('crop_zoom', 0.5)).toBe(1);
 	});
