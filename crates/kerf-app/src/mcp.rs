@@ -3835,7 +3835,10 @@ impl KerfMcp {
     )]
     async fn update_title_clip(&self, Parameters(p): Parameters<UpdateTitleClipParams>) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        let patch = TitleClipPatch { name: p.name, svg: p.svg };
+        let patch = TitleClipPatch {
+            name: p.name,
+            svg: p.svg,
+        };
         let (patch, doc) = blocking(move || {
             let doc = patch.svg.as_deref().map(SvgDoc::parse).transpose().map_err(core_err)?;
             Ok((patch, doc))
@@ -8516,6 +8519,14 @@ mod tests {
         }
         assert!(property("update_svg_overlay", "preset_kind").is_some());
         assert!(property("get_timeline_state", "full_svg").is_some());
+        // A title on a track: its own tools, and a template put on one.
+        let mut needs = required("add_title_clip");
+        needs.sort();
+        assert_eq!(needs, ["start", "svg"]);
+        assert_eq!(required("update_title_clip"), ["clip_id"]);
+        assert!(property("apply_template", "on_track").is_some() && property("apply_template", "track_id").is_some());
+        assert!(description("add_title_clip").contains("dip_to_white"));
+        assert!(description("apply_template").contains("on_track"));
         assert!(description("update_svg_overlay").contains("preset_kind"));
         assert!(
             description("preview_svg_overlay").contains("PNG") && description("preview_svg_overlay").contains("preview_timeline")

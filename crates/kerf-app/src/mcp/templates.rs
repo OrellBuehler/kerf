@@ -658,6 +658,41 @@ mod tests {
     }
 
     #[test]
+    fn a_template_on_a_track_is_a_staged_title_clip_whose_values_change_by_its_clip_id() {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("on-track");
+        let (shared, library, done, _) = saved(&dir);
+        let prepared = prepare_template(&library, &done.info.id, values(&[("tagline", "End")]), None).unwrap();
+        let out = {
+            let agent = super::super::lock_agent_edit(&shared, Some("session-a")).unwrap();
+            let out = agent
+                .apply_template_clip_parsed(prepared, 5.0, Some(3.0), TitleClipPlacement::default())
+                .unwrap();
+            assert_eq!(agent.timeline().unwrap().title_clips().count(), 0, "staged, not applied");
+            out
+        };
+        let clip = out.clip.id;
+        let summary = serde_json::to_value(TitleClipOutcome::from(out)).unwrap();
+        assert_eq!(summary["title_clip"]["name"], "End card");
+        assert_eq!(
+            (summary["title_clip"]["start"].as_f64(), summary["title_clip"]["end"].as_f64()),
+            (Some(5.0), Some(8.0))
+        );
+        assert_eq!(summary["title_clip"]["template"]["values"]["tagline"], "End");
+        assert!(summary["title_clip"].get("svg").is_none(), "{summary}");
+
+        let prepared = prepare_values(&shared, Some("session-a"), clip, values(&[("tagline", "Bye")]), None).unwrap();
+        let agent = super::super::lock_agent_edit(&shared, Some("session-a")).unwrap();
+        let TitleEdited::Clip(changed) = agent.set_title_values_parsed(clip, prepared).unwrap() else {
+            panic!("the title clip was changed");
+        };
+        let title = changed.clip.title_clip().unwrap();
+        assert_eq!(title.template.as_ref().unwrap().values["tagline"], "Bye");
+        drop(agent);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_template_the_library_lacks_or_a_control_it_does_not_have_is_the_callers_to_fix() {
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch("missing");
