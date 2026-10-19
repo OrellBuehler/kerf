@@ -1083,10 +1083,7 @@ mod tests {
         let slower = resolve_animation(Some("rise"), None, Some(0.5), Some(3.0)).unwrap().unwrap();
         assert_eq!((slower.delay, slower.duration), (0.5, 3.0));
         assert_eq!(slower.properties, rise.properties, "only the timing changed");
-        let own = kerf_core::svg::TextAnimation {
-            duration: 2.0,
-            ..rise.clone()
-        };
+        let own = kerf_core::svg::TextAnimation { duration: 2.0, ..rise };
         assert_eq!(
             resolve_animation(None, Some(own.clone()), None, None).unwrap(),
             Some(own.clone())
