@@ -917,6 +917,7 @@
 		if (trimDrag?.moved) return trimDrag.edge === 'r' ? trimDrag.pos : trimDrag.origEnd;
 		if (titleDrag?.moved) return titleDrag.end;
 		if (tg?.moved && tgPreview) return Math.max(...tgPreview.ghosts.map((g) => g.start + g.dur));
+		if (dropGhost) return dropGhost.start + dropGhost.dur;
 		return null;
 	});
 

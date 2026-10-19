@@ -197,7 +197,8 @@ describe('fitZoom', () => {
 	});
 
 	test('a fitted lane is never a pixel wider than the width it was fitted to', () => {
-		// 1700 / 30 * 30 is 1700.0000000000002: a lane one pixel too wide, a scrollbar.
+		// Fitted to 1010 px, a 30 s cut has 962 px of room, and 962 / 30 * 30 is 962.0000000000001:
+		// rounded up, a 1011 px lane, a scrollbar.
 		for (const duration of [30, 29.99, 20.5, 47, 12.34]) {
 			for (let viewW = LANE_MIN_PX; viewW <= 4000; viewW++) {
 				const z = fitZoom(duration, viewW)!;

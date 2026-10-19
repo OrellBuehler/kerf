@@ -32,8 +32,8 @@ export const MIN_SPAN_SEC = 8;
  *  millions (and lose sub-pixel precision past 2^24); this stays well inside. */
 export const LANE_PX_CAP = 8_000_000;
 
-/** How far past a whole pixel a product may land and still be that pixel: `(w / d) * d` can be
- *  `w + 2e-13`, and rounding that up makes a fitted lane a pixel wider than its window. */
+/** How far past a whole pixel a product may land and still be that pixel: `(962 / 30) * 30` is
+ *  `962.0000000000001`, and rounding that up makes a fitted lane a pixel wider than its window. */
 const PX_EPSILON = 1e-6;
 
 /** The width of the lane for a cut `duration` seconds long at `pxPerSec`. */
