@@ -131,14 +131,15 @@
 //!   over a zoom that holds are drawn (`time/keyframes+rotation+opacity`).
 //! * **Masks and effects** (`masks_cut_a_layer_to_a_shape`, `effects_are_drawn_as_their_filters_draw_them`,
 //!   `the_effect_filters_match_ffmpeg_plane_by_plane`): a mask's alpha is `geq`'s, blended per sample (luma)
-//!   and over each 2x2 block's average (chroma) like `overlay`; grayscale, invert and sharpen are exact;
-//!   a blur is `gblur`'s float recursion in the portable order, one level off on a few samples in a hundred
-//!   thousand (FFmpeg's own SIMD orders the same sums otherwise). A mask on a letterbox is cut from the
-//!   whole padded frame, as `geq` is. A vignette, a chroma key, a mask on a rotated or translucent layer, a
-//!   blur or a sharpen on a letterbox, an invert / blur / sharpen on a full-range picture (FFmpeg runs it on
-//!   the raw values and converts the range afterwards: an invert 8 levels off, a sharpen's overshoot 26)
-//!   and an invert of a gray picture (its chroma stays 128 in FFmpeg) are refused. On a 10-bit, 4:2:2,
-//!   4:4:4, RGB or gray picture the effects and masks are drawn at the plain source's own figures.
+//!   and over each 2x2 block's average (chroma) like `overlay`; grayscale, invert, sharpen and vignette are
+//!   exact; a blur is `gblur`'s float recursion in the portable order, one level off on a few samples in a
+//!   hundred thousand (FFmpeg's own SIMD orders the same sums otherwise). A mask on a letterbox is cut from
+//!   the whole padded frame, as `geq` is. A chroma key, a mask on a rotated or translucent layer, a blur, a
+//!   sharpen or a vignette on a letterbox, a vignette on a picture that is not `yuv420p`, an invert / blur /
+//!   sharpen on a full-range picture (FFmpeg runs it on the raw values and converts the range afterwards: an
+//!   invert 8 levels off, a sharpen's overshoot 26) and an invert of a gray picture (its chroma stays 128 in
+//!   FFmpeg) are refused. On a 10-bit, 4:2:2, 4:4:4, RGB or gray picture the other effects and masks are
+//!   drawn at the plain source's own figures.
 //! * **`geq` on FFmpeg 6.1 copies a plane's last column and row from the ones before them** (its bilinear
 //!   read clamps to `w - 2` / `h - 2`; 9.0 copies them), so a masked picture's right-most column and bottom
 //!   row differ between the two FFmpegs (up to 224 levels of chroma at the bottom row of a frame whose picture
@@ -2174,20 +2175,22 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
         1.25,
         Refusal::Plan("moving zoom"),
     );
-    // What the compositor does not draw of an effect or a mask: a vignette (its dither is a counter that runs
-    // on from frame to frame), a chroma key (an alpha from a float colour distance), a mask on a turned layer
-    // or one below full opacity, a blur or a sharpen on the padded frame of a letterbox, a value the filters refuse.
+    // What the compositor does not draw of an effect or a mask: a chroma key (an alpha from a float colour
+    // distance), a mask on a turned layer or one below full opacity, a blur, a sharpen or a vignette on the
+    // padded frame of a letterbox, a vignette on a picture that is not yuv420p, a value the filters refuse.
     let effect = |e: kerf_core::VideoEffect| {
         let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
         c.effects = vec![e];
         timeline(vec![vec![c]], None)
     };
+    let mut vignetted = clip(&m.yuv444, 0.0, 2.0, 0.0);
+    vignetted.effects = vec![kerf_core::VideoEffect::Vignette];
     check_refused(
-        "refused/vignette",
-        &effect(kerf_core::VideoEffect::Vignette),
-        std::slice::from_ref(&m.testsrc),
+        "refused/vignette-on-a-444-picture",
+        &timeline(vec![vec![vignetted]], None),
+        std::slice::from_ref(&m.yuv444),
         0.5,
-        Refusal::Plan("vignette"),
+        Refusal::Plan("yuv420p"),
     );
     check_refused(
         "refused/chroma-key",
@@ -2251,6 +2254,15 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
     check_refused(
         "refused/blur-on-a-letterbox",
         &timeline(vec![vec![blurred]], Some(Delivery::new(360, 640, Fit::Contain))),
+        std::slice::from_ref(&m.testsrc),
+        0.5,
+        Refusal::Plan("letterboxed"),
+    );
+    let mut vignetted = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    vignetted.effects = vec![kerf_core::VideoEffect::Vignette];
+    check_refused(
+        "refused/vignette-on-a-letterbox",
+        &timeline(vec![vec![vignetted]], Some(Delivery::new(360, 640, Fit::Contain))),
         std::slice::from_ref(&m.testsrc),
         0.5,
         Refusal::Plan("letterboxed"),
@@ -4460,10 +4472,12 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         ("sharpen-neg", vec![E::Sharpen { amount: -1.5 }]),
         ("grayscale", vec![E::Grayscale]),
         ("invert", vec![E::Invert]),
+        ("vignette", vec![E::Vignette]),
         (
             "chain",
             vec![E::Sharpen { amount: 1.0 }, E::Grayscale, E::Blur { sigma: 2.0 }, E::Invert],
         ),
+        ("vignette-chain", vec![E::Invert, E::Vignette, E::Blur { sigma: 2.0 }]),
     ] {
         for (asset, label) in [(&m.testsrc, "testsrc2"), (&m.bars, "bars")] {
             let mut c = clip(asset, 0.0, 2.0, 0.0);
@@ -4517,6 +4531,33 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             &[m.bars.clone(), m.testsrc.clone()],
             &[0.5],
             limits,
+        );
+    }
+    // A vignette's map is the picture's at the size the filter sees it: scaled, odd-sized, in a Cover frame.
+    for (name, edit, format) in [
+        (
+            "scaled",
+            Box::new(|c: &mut Clip| c.transform.scale = 0.6) as Box<dyn Fn(&mut Clip)>,
+            None,
+        ),
+        ("odd", Box::new(|c: &mut Clip| c.transform.scale = 0.33), None),
+        ("graded", Box::new(|c: &mut Clip| c.color.contrast = 1.25), None),
+        (
+            "cover",
+            Box::new(|_: &mut Clip| {}),
+            Some(Delivery::new(960, 540, Fit::Cover)),
+        ),
+    ] {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        edit(&mut c);
+        c.effects = vec![E::Vignette];
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], format);
+        check(
+            &format!("effect/vignette-{name}"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            &[0.5],
+            STRICT,
         );
     }
     // A sharpen whose gain on a scale's or a blur's level passes 2 is FFmpeg's: past half strength after a scale
@@ -4710,6 +4751,7 @@ fn the_effect_filters_match_ffmpeg_plane_by_plane() {
     let cases: Vec<(&str, E, String, bool)> = vec![
         ("invert", E::Invert, "negate".into(), true),
         ("grayscale", E::Grayscale, "hue=s=0".into(), true),
+        ("vignette", E::Vignette, "vignette".into(), true),
         (
             "sharpen 1",
             E::Sharpen { amount: 1.0 },
