@@ -158,6 +158,14 @@ fn v4_to_v5_needed(_conn: &Connection) -> bool {
     true
 }
 
+/// The index (the version each upgrades from) of every step from `found` on that would change this file.
+#[cfg(test)]
+pub(crate) fn pending_steps(conn: &Connection, found: u32) -> Vec<u32> {
+    (found..SCHEMA_VERSION)
+        .filter(|v| (MIGRATIONS[*v as usize].needed)(conn))
+        .collect()
+}
+
 /// The steps from `found` on that would change this file.
 fn pending(conn: &Connection, found: u32) -> impl Iterator<Item = &'static Migration> + '_ {
     MIGRATIONS.iter().skip(found as usize).filter(move |m| (m.needed)(conn))
