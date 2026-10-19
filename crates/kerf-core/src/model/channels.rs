@@ -5,7 +5,19 @@
 //! [`PropertyTrack`] is one number (a [`Property`]) with keys of its own — a time, a value
 //! and the [`Easing`] of the segment that leaves it — and can be a transform number (scale,
 //! position, rotation, opacity), a colour number (brightness, contrast, saturation, gamma,
-//! temperature) or the clip's volume.
+//! temperature), the clip's volume, a number of its [`Mask`] (centre, size, feather) or its
+//! **animated crop**.
+//!
+//! **The crop is keyed as a zoom and a pan, not as four edges.** The four static edges
+//! ([`Transform::crop_left`] ...) change the picture's shape, and a filter graph fixes a picture's
+//! size when it is configured: an edge that moves per frame would need a picture that changes
+//! size per frame, which almost nothing downstream can follow. So the keyed crop is a window of
+//! the (statically cropped) picture with the picture's own aspect: [`Property::CropZoom`] (1 = the
+//! whole picture, 2 = half of it on each axis) and where that window sits in the room left over,
+//! [`Property::CropX`] / [`Property::CropY`] (-1 = against the left / top edge, 0 = centred, 1 =
+//! against the right / bottom one). It can never show anything outside the picture, its size
+//! never changes, and its neutral values (1, 0, 0) are no crop at all ([`Clip::crop_window_at`]):
+//! a crop whose zoom never leaves 1 is not animated.
 //!
 //! **One resolver.** What a property does is [`Clip::property_keys`], and everything else
 //! reads that: the eased polyline ([`Clip::property_curve`]) the export writes into its
@@ -44,10 +56,21 @@ pub enum Property {
     Temperature,
     /// The clip's own gain, linear (`Clip::volume`).
     Volume,
+    /// The [`Mask`]'s centre, size and feather (only drawn while the clip has a mask).
+    MaskX,
+    MaskY,
+    MaskWidth,
+    MaskHeight,
+    MaskFeather,
+    /// The animated crop: how far it zooms into the picture (1 = not at all) ...
+    CropZoom,
+    /// ... and where its window sits, -1 (left / top) to 1 (right / bottom).
+    CropX,
+    CropY,
 }
 
 impl Property {
-    pub const ALL: [Property; 11] = [
+    pub const ALL: [Property; 19] = [
         Property::Scale,
         Property::PosX,
         Property::PosY,
@@ -59,6 +82,14 @@ impl Property {
         Property::Gamma,
         Property::Temperature,
         Property::Volume,
+        Property::MaskX,
+        Property::MaskY,
+        Property::MaskWidth,
+        Property::MaskHeight,
+        Property::MaskFeather,
+        Property::CropZoom,
+        Property::CropX,
+        Property::CropY,
     ];
 
     /// The five numbers of a [`Transform`] that [`Clip::keyframes`] animates together.
@@ -79,6 +110,18 @@ impl Property {
         Property::Temperature,
     ];
 
+    /// The five numbers of a [`Mask`].
+    pub const MASK: [Property; 5] = [
+        Property::MaskX,
+        Property::MaskY,
+        Property::MaskWidth,
+        Property::MaskHeight,
+        Property::MaskFeather,
+    ];
+
+    /// The three numbers of the animated crop.
+    pub const CROP: [Property; 3] = [Property::CropZoom, Property::CropX, Property::CropY];
+
     /// The wire name (the JSON the model, the Tauri commands and the MCP tools share).
     pub fn as_str(self) -> &'static str {
         match self {
@@ -93,6 +136,14 @@ impl Property {
             Property::Gamma => "gamma",
             Property::Temperature => "temperature",
             Property::Volume => "volume",
+            Property::MaskX => "mask_x",
+            Property::MaskY => "mask_y",
+            Property::MaskWidth => "mask_width",
+            Property::MaskHeight => "mask_height",
+            Property::MaskFeather => "mask_feather",
+            Property::CropZoom => "crop_zoom",
+            Property::CropX => "crop_x",
+            Property::CropY => "crop_y",
         }
     }
 
@@ -114,6 +165,14 @@ impl Property {
         Self::COLOR.contains(&self)
     }
 
+    pub fn is_mask(self) -> bool {
+        Self::MASK.contains(&self)
+    }
+
+    pub fn is_crop(self) -> bool {
+        Self::CROP.contains(&self)
+    }
+
     /// The range the static setter accepts (`None` is unbounded on that side) — what a key's
     /// value is checked against when it is written and held to when it is read.
     pub fn range(self) -> (Option<f64>, Option<f64>) {
@@ -126,6 +185,11 @@ impl Property {
             Property::Saturation => (Some(0.0), Some(3.0)),
             Property::Gamma => (Some(0.1), Some(10.0)),
             Property::Volume => (Some(0.0), Some(MAX_CHANNEL_VOLUME)),
+            // What `Mask::normalized` holds a static mask to.
+            Property::MaskX | Property::MaskY | Property::MaskFeather => (Some(0.0), Some(1.0)),
+            Property::MaskWidth | Property::MaskHeight => (Some(MIN_MASK_SIZE), Some(MAX_MASK_SIZE)),
+            Property::CropZoom => (Some(1.0), Some(MAX_CROP_ZOOM)),
+            Property::CropX | Property::CropY => (Some(-1.0), Some(1.0)),
         }
     }
 
@@ -175,7 +239,10 @@ impl Property {
             | Property::Contrast
             | Property::Saturation
             | Property::Gamma
-            | Property::Volume => 1.0,
+            | Property::Volume
+            | Property::CropZoom => 1.0,
+            Property::MaskX | Property::MaskY | Property::MaskWidth | Property::MaskHeight => 0.5,
+            Property::MaskFeather => DEFAULT_MASK_FEATHER,
             _ => 0.0,
         }
     }
@@ -185,10 +252,21 @@ impl Property {
         match self {
             Property::PosX => "position x",
             Property::PosY => "position y",
+            Property::MaskX => "mask x",
+            Property::MaskY => "mask y",
+            Property::MaskWidth => "mask width",
+            Property::MaskHeight => "mask height",
+            Property::MaskFeather => "mask feather",
+            Property::CropZoom => "crop zoom",
+            Property::CropX => "crop x",
+            Property::CropY => "crop y",
             other => other.as_str(),
         }
     }
 }
+
+/// The deepest the animated crop zooms: a tenth of the picture on each axis.
+pub const MAX_CROP_ZOOM: f64 = 10.0;
 
 /// A scale smaller than this is read as this (a scale of 0 is "unset" to FFmpeg's `scale`).
 const MIN_CHANNEL_SCALE: f64 = 1e-6;
@@ -366,6 +444,13 @@ impl Clip {
             Property::Gamma => self.color.gamma,
             Property::Temperature => self.color.temperature,
             Property::Volume => f64::from(self.volume),
+            Property::MaskX => self.mask.map_or(0.5, |m| m.normalized().x),
+            Property::MaskY => self.mask.map_or(0.5, |m| m.normalized().y),
+            Property::MaskWidth => self.mask.map_or(0.5, |m| m.normalized().width),
+            Property::MaskHeight => self.mask.map_or(0.5, |m| m.normalized().height),
+            Property::MaskFeather => self.mask.map_or(DEFAULT_MASK_FEATHER, |m| m.normalized().feather),
+            Property::CropZoom => 1.0,
+            Property::CropX | Property::CropY => 0.0,
         }
     }
 
@@ -404,6 +489,56 @@ impl Clip {
     /// not included.
     pub fn volume_at(&self, local: f64) -> f64 {
         self.property_at(Property::Volume, local)
+    }
+
+    /// Whether a number of the clip's mask is keyed *and* the clip has a mask to key (keys of a
+    /// mask that was taken away draw nothing).
+    pub fn mask_animated(&self) -> bool {
+        self.mask.is_some() && Property::MASK.iter().any(|p| self.is_keyed(*p))
+    }
+
+    /// Whether the animated crop cuts anything: its zoom is keyed and some key zooms in. A zoom
+    /// held at 1 shows the whole picture whatever the pans say, so such keys draw nothing and
+    /// cost nothing (as a keyed rotation at 0 or opacity at 1 do).
+    pub fn crop_animated(&self) -> bool {
+        self.property_keys(Property::CropZoom).iter().any(|k| k.value > 1.0)
+    }
+
+    /// The clip's mask at `local` seconds from its start (normalized): every keyed number its
+    /// curve's value, the rest the static mask's.
+    pub fn mask_at(&self, local: f64) -> Option<Mask> {
+        let mask = self.mask?.normalized();
+        if !self.mask_animated() {
+            return Some(mask);
+        }
+        Some(
+            Mask {
+                x: self.property_at(Property::MaskX, local),
+                y: self.property_at(Property::MaskY, local),
+                width: self.property_at(Property::MaskWidth, local),
+                height: self.property_at(Property::MaskHeight, local),
+                feather: self.property_at(Property::MaskFeather, local),
+                ..mask
+            }
+            .normalized(),
+        )
+    }
+
+    /// The window of the (statically cropped) picture the animated crop shows at `local`, as
+    /// `(left, top, width, height)` fractions of it: `1 / zoom` of each side, placed by the pan
+    /// in the room the zoom leaves. `(0, 0, 1, 1)` when nothing is keyed.
+    pub fn crop_window_at(&self, local: f64) -> (f64, f64, f64, f64) {
+        if !self.crop_animated() {
+            return (0.0, 0.0, 1.0, 1.0);
+        }
+        let side = 1.0 / self.property_at(Property::CropZoom, local);
+        let at = |pan: f64| (1.0 - side) * (1.0 + pan) / 2.0;
+        (
+            at(self.property_at(Property::CropX, local)),
+            at(self.property_at(Property::CropY, local)),
+            side,
+            side,
+        )
     }
 
     // ---- edits ------------------------------------------------------------------
@@ -681,6 +816,61 @@ mod tests {
             assert_eq!(Property::parse(p.as_str()), Some(p));
             assert_eq!(serde_json::to_value(p).unwrap(), p.as_str());
         }
+    }
+
+    #[test]
+    fn a_keyed_mask_is_sampled_over_the_static_one_and_a_mask_taken_away_draws_nothing() {
+        let mut c = clip();
+        assert_eq!(c.mask_at(1.0), None);
+        c.set_property_keys(
+            Property::MaskX,
+            vec![key(0.0, 0.2, Easing::Linear), key(2.0, 0.6, Easing::Linear)],
+        );
+        assert!(!c.mask_animated() && c.mask_at(1.0).is_none(), "no mask, nothing to key");
+        c.mask = Some(Mask {
+            y: 0.3,
+            feather: 0.4,
+            ..Mask::default()
+        });
+        assert!(c.mask_animated());
+        let m = c.mask_at(1.0).unwrap();
+        assert!((m.x - 0.4).abs() < 1e-12 && m.y == 0.3 && m.feather == 0.4, "{m:?}");
+        assert_eq!(c.static_value(Property::MaskY), 0.3);
+        // Out of range on file, held to the static mask's range on read.
+        c.set_property_keys(Property::MaskWidth, vec![key(0.0, 7.0, Easing::Linear)]);
+        assert_eq!(c.mask_at(0.0).unwrap().width, MAX_MASK_SIZE);
+        assert!(Property::MaskFeather.check(1.5).is_err() && Property::MaskX.check(0.5).is_ok());
+    }
+
+    #[test]
+    fn a_keyed_crop_is_a_window_of_the_picture_s_own_shape_and_one_that_never_zooms_is_none() {
+        let mut c = clip();
+        assert_eq!(c.crop_window_at(0.0), (0.0, 0.0, 1.0, 1.0));
+        // Pans and a zoom held at 1 show the whole picture: not animated, nothing to draw.
+        c.set_property_keys(Property::CropX, vec![key(0.0, -1.0, Easing::Linear)]);
+        c.set_property_keys(
+            Property::CropZoom,
+            vec![key(0.0, 1.0, Easing::Linear), key(2.0, 1.0, Easing::Linear)],
+        );
+        assert!(c.is_keyed(Property::CropZoom) && !c.crop_animated());
+        assert_eq!(c.crop_window_at(1.0), (0.0, 0.0, 1.0, 1.0));
+        c.set_property_keys(Property::CropX, vec![]);
+        c.set_property_keys(
+            Property::CropZoom,
+            vec![key(0.0, 1.0, Easing::Linear), key(2.0, 4.0, Easing::Linear)],
+        );
+        assert!(c.crop_animated());
+        // Centred by default: zoom 2.5 at 1 s is 0.4 of each side, 0.3 either side of it.
+        let (l, t, w, h) = c.crop_window_at(1.0);
+        assert!((w - 0.4).abs() < 1e-12 && w == h && (l - 0.3).abs() < 1e-12 && (t - 0.3).abs() < 1e-12);
+        // A pan of -1 / 1 puts the window against the edge, never past it.
+        c.set_property_keys(Property::CropX, vec![key(0.0, -1.0, Easing::Linear)]);
+        c.set_property_keys(Property::CropY, vec![key(0.0, 1.0, Easing::Linear)]);
+        let (l, t, w, h) = c.crop_window_at(1.0);
+        assert!(l.abs() < 1e-12 && (t + h - 1.0).abs() < 1e-12 && (l + w) <= 1.0);
+        // The zoom never goes out past the whole picture.
+        assert!(Property::CropZoom.check(0.5).is_err() && Property::CropZoom.clamp(0.5) == 1.0);
+        assert_eq!(Property::CropZoom.neutral(), 1.0);
     }
 
     #[test]
@@ -1356,6 +1546,57 @@ mod tests {
                     bezier(0.3264332254175324, 0.5558502990076779, 0.6856271141503777, 1.0)
                 ),
                 (2.0, 2.0, Easing::Linear),
+            ]
+        );
+        // A keyed mask and crop, sampled.
+        let mut m = clip();
+        m.mask = Some(Mask::default());
+        m.set_property_keys(
+            Property::MaskX,
+            vec![key(0.0, 0.2, Easing::EaseInOut), key(2.0, 0.8, Easing::Linear)],
+        );
+        m.set_property_keys(
+            Property::MaskWidth,
+            vec![key(0.5, 0.3, Easing::EaseOut), key(1.5, 2.5, Easing::Linear)],
+        );
+        m.set_property_keys(
+            Property::CropZoom,
+            vec![key(0.0, 1.0, bezier(0.2, 0.9, 0.3, 1.0)), key(2.0, 3.0, Easing::Linear)],
+        );
+        m.set_property_keys(
+            Property::CropX,
+            vec![key(0.0, -0.5, Easing::Linear), key(2.0, 0.5, Easing::Linear)],
+        );
+        let sampled: Vec<_> = [0.7, 1.3]
+            .iter()
+            .map(|&t| {
+                let mask = m.mask_at(t).unwrap();
+                (mask.x, mask.width, m.crop_window_at(t))
+            })
+            .collect();
+        assert_eq!(
+            sampled,
+            [
+                (
+                    0.3543110794166814,
+                    0.8226810657360628,
+                    (
+                        0.26972959942593694,
+                        0.3173289405011023,
+                        0.3653421189977955,
+                        0.3653421189977955
+                    )
+                ),
+                (
+                    0.6456889205833187,
+                    1.8910558007089358,
+                    (
+                        0.38105606409439846,
+                        0.33135309921252043,
+                        0.3372938015749592,
+                        0.3372938015749592
+                    )
+                ),
             ]
         );
     }

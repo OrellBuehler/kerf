@@ -1,7 +1,7 @@
-//! The golden argv oracle: 7600 seeded timelines (4000, then 800 with a master bus, then 800
+//! The golden argv oracle: 8000 seeded timelines (4000, then 800 with a master bus, then 800
 //! with per-property channels, then 400 with an AMF or VAAPI encoder, then 400 with animated SVG
 //! titles, then 400 exported at several delivery frames in one run, then 400 with titles on tracks,
-//! then 400 with a blurred fill) whose ffmpeg argv must not move.
+//! then 400 with a blurred fill, then 400 with a keyed mask or crop) whose ffmpeg argv must not move.
 //!
 //! `build_export_args_phase`, `build_still_args` and `build_preview_args_with` are
 //! built for every case and their argv reduced to a digest, checked against three
@@ -64,6 +64,13 @@
 //! on the export's options and on the delivery frame when the cut has one; no dice, no titles). The
 //! first 7200 per-case digests are the ones the commit before it gave; only 4 block lines were
 //! appended to each file.
+//!
+//! **The keyed mask and crop family is appended the same way**: the [`MASK_CROP_CASES`] after the
+//! blurred-fill ones draw from the same generator (and get the channel family's channels, but no
+//! titles and one delivery frame) and then have numbers of their mask and the animated crop keyed
+//! ([`mask_crop_for`], on dice of its own seeded by the case and the clip). The first 7600
+//! per-case digests are the ones the commit before those numbers could be keyed gave; only 4 block
+//! lines were appended to each file.
 //!
 //! **Machine-independent by construction.** The builders read the machine in five
 //! places, each pinned: the preview's decode acceleration (the
@@ -129,7 +136,10 @@ const TITLE_FIRST: usize = TOGETHER_FIRST + TOGETHER_CASES;
 /// The blurred-fill cases appended after the title-clip ones (see the module docs).
 const BLUR_CASES: usize = 400;
 const BLUR_FIRST: usize = TITLE_FIRST + TITLE_CASES;
-const TOTAL: usize = BLUR_FIRST + BLUR_CASES;
+/// The keyed mask and crop cases appended after the blurred-fill ones (see the module docs).
+const MASK_CROP_CASES: usize = 400;
+const MASK_CROP_FIRST: usize = BLUR_FIRST + BLUR_CASES;
+const TOTAL: usize = MASK_CROP_FIRST + MASK_CROP_CASES;
 const BLOCK: usize = 100;
 const MIN_PER_FAMILY: usize = 20;
 const KINDS: [&str; 3] = ["export", "still", "preview"];
@@ -189,6 +199,11 @@ colour-keyed-gamma :gamma='if(lt((t-
 colour-keyed-temperature :gamma_r='1+0.3*(
 volume-keyed volume='if(lt((t-
 volume-keyed-frames asetnsamples=n=128:p=0,volume=
+mask-keyed a='if(eq(X,0),st(
+mask-keyed-feather if(lte(ld(4)
+preview-mask-keyed a='if(eq(X,0),st(
+crop-keyed perspective=x0=
+preview-crop-keyed perspective=x0=
 hdr-zscale zscale=tin=
 hdr-colorspace colorspace=all=bt709:iall=bt2020
 hdr-pq tin=smpte2084
@@ -654,6 +669,7 @@ fn channels_for(tl: &mut Timeline, j: usize) {
         Property::Gamma => (0.4, 2.5),
         Property::Temperature => (-1.0, 1.0),
         Property::Volume => (0.0, 2.0),
+        _ => (0.0, 1.0),
     };
     for (n, clip) in tl.tracks.iter_mut().flat_map(|t| &mut t.clips).enumerate() {
         let mut r = Rng::new((1 << 40) + (j as u64) * 64 + n as u64);
@@ -691,6 +707,57 @@ fn channels_for(tl: &mut Timeline, j: usize) {
             let p = r.pick(&Property::TRANSFORM);
             let held = if r.chance(0.5) { Vec::new() } else { keys(&mut r, p) };
             clip.set_property_keys(p, held);
+        }
+    }
+}
+
+/// The keyed mask and crop of the `j`-th mask-and-crop case: on dice of their own (seeded by the
+/// case and the clip's place in it), so the family never rolls the generator's. About half the
+/// clips get a mask (the one they had, or a new one) with some of its numbers keyed — a feather
+/// keyed to nothing in places — and about half get the animated crop keyed: a zoom alone, a pan
+/// alone, or both, each with its own chance, so one and all of the three are covered.
+fn mask_crop_for(tl: &mut Timeline, j: usize) {
+    const EASINGS: [Easing; 4] = [Easing::Linear, Easing::Hold, Easing::EaseInOut, Easing::EaseOut];
+    let range = |p: Property| match p {
+        Property::MaskX | Property::MaskY => (0.1, 0.9),
+        Property::MaskWidth | Property::MaskHeight => (0.05, 1.4),
+        Property::MaskFeather => (0.0, 0.6),
+        Property::CropZoom => (1.0, 3.5),
+        _ => (-1.0, 1.0),
+    };
+    for (n, clip) in tl.tracks.iter_mut().flat_map(|t| &mut t.clips).enumerate() {
+        let mut r = Rng::new((2 << 40) + (j as u64) * 64 + n as u64);
+        let span = clip.duration() * 1.1 + 0.2;
+        let keys = |r: &mut Rng, p: Property| {
+            let (lo, hi) = range(p);
+            let mut keys: Vec<PropertyKey> = (0..1 + r.below(4))
+                .map(|_| PropertyKey {
+                    time: r.real(0.0, span),
+                    value: if p == Property::MaskFeather && r.chance(0.2) {
+                        0.0
+                    } else {
+                        r.real(lo, hi)
+                    },
+                    easing: r.pick(&EASINGS),
+                })
+                .collect();
+            keys.sort_by(|a, b| a.time.total_cmp(&b.time));
+            keys
+        };
+        if r.chance(0.5) {
+            clip.mask.get_or_insert_with(Mask::default);
+            for p in Property::MASK {
+                if r.chance(0.5) {
+                    clip.set_property_keys(p, keys(&mut r, p));
+                }
+            }
+        }
+        if r.chance(0.5) {
+            for p in Property::CROP {
+                if r.chance(0.6) {
+                    clip.set_property_keys(p, keys(&mut r, p));
+                }
+            }
         }
     }
 }
@@ -1108,12 +1175,22 @@ fn hw_encoder_for(n: usize) -> &'static str {
 
 /// One timeline of each family: what `project::persist_tests` freezes as the shape a file stores
 /// (the blurred-fill one is the first of its family whose cut has a delivery frame, which is where
-/// the timeline stores the fit).
+/// the timeline stores the fit; the keyed mask and crop one the first of its family keying both).
 pub(crate) fn sample_timelines() -> Vec<Timeline> {
     let assets = pool();
-    let blur = (BLUR_FIRST..TOTAL)
+    let blur = (BLUR_FIRST..MASK_CROP_FIRST)
         .find(|&i| case(i, &assets).timeline.format.is_some())
         .expect("a blurred-fill case with a delivery frame");
+    let keys = |i: usize, props: &[Property]| {
+        let tl = case(i, &assets).timeline;
+        tl.tracks
+            .iter()
+            .flat_map(|t| &t.clips)
+            .any(|c| props.iter().any(|p| c.is_keyed(*p)))
+    };
+    let mask_crop = (MASK_CROP_FIRST..TOTAL)
+        .find(|&i| keys(i, &Property::MASK) && keys(i, &Property::CROP))
+        .expect("a case keying a mask and a crop");
     [
         0,
         4,
@@ -1122,6 +1199,7 @@ pub(crate) fn sample_timelines() -> Vec<Timeline> {
         SVG_FIRST,
         TITLE_FIRST,
         blur,
+        mask_crop,
     ]
     .into_iter()
     .map(|i| case(i, &assets).timeline)
@@ -1164,10 +1242,13 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     if (TITLE_FIRST..BLUR_FIRST).contains(&i) {
         title_clip_for(&mut timeline, i - TITLE_FIRST);
     }
-    if (BLUR_FIRST..TOTAL).contains(&i) {
+    if (BLUR_FIRST..MASK_CROP_FIRST).contains(&i) {
         if let Some(format) = timeline.format.as_mut() {
             format.fit = Fit::Blur;
         }
+    }
+    if (MASK_CROP_FIRST..TOTAL).contains(&i) {
+        mask_crop_for(&mut timeline, i - MASK_CROP_FIRST);
     }
     let dur = timeline.duration();
     let edges: Vec<f64> = (timeline.tracks.iter().flat_map(|t| &t.clips))
@@ -1197,7 +1278,7 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     if (SVG_FIRST..TOGETHER_FIRST).contains(&i) {
         opts.container = svg_container_for(i - SVG_FIRST).unwrap_or(opts.container);
     }
-    if (BLUR_FIRST..TOTAL).contains(&i) {
+    if (BLUR_FIRST..MASK_CROP_FIRST).contains(&i) {
         opts.fit = Fit::Blur;
     }
     let pass = match r.below(20) { 0..=11 => PassPhase::Single, 12..=15 => PassPhase::First, _ => PassPhase::Second };
