@@ -987,18 +987,23 @@ lag), so a GPU that failed or cannot keep up never flips back and forth with the
 whose answer names the refused frame; not `failed`: a frame that failed, `session`, an overload, or a request that was rejected or never answered,
 `giveUp`), the stream, once it has been on show for `READY_SETTLE` (1 s), asks `frames.ready(at, ..)` (`hint: 'ready'`, with the pump's `client` and
 next `seq`, so a ready request that reaches the backend after a newer request of the page, the paused frame once the play stops, is superseded and
-primes nothing over it) for `lead` past what is heard (`READY_LEAD`, 0.6 s, or twice what the last answer took) and no earlier than the refused frame.
-Only `stream` with no `play` ends the take-back for the play (`never`: the setting, no surface, no plan from there); `stream` with `play.ahead` (nothing
-within the backend's 4 s yet), a superseded answer and a request that failed (logged) are `later`, asked again after `READY_EVERY` (1 s), doubling
-with each `later` in a row up to `READY_MAX_WAIT` (8 s), so a cut the GPU draws none of costs the one worker that draws a scan every 8 s at most. A
-`ready` answer's `play.resume` is where the play from there is made ready: `SHOW_AHEAD` (0.3 s) before it the route is the surface's again
-(`returning`: `streaming && !returning` in the route, so the bounds go out visible; the surface is not shown before a frame is drawn on it, and the
-pump, `streaming && gpuPlay === null`, asks nothing), a first frame's cost before it (`takeBackLead`: the round trip of the session the stream took
-over, then what each take-back's first frame cost) a `GpuPlayback(fps, resume, true)` begins and holds its picture there, and once its first frame is
-on the screen (`gpuShown`) the stream stops, the bar is lifted and the play is the GPU's again (and may hand over again later). A session that
-declines before it drew (a refused frame, the bounds not delivered yet, something over the frame on a surface above the page) leaves the stream
-playing and is asked about again after the wait; one that failed ends the take-back (`abandonTakeBack`). A time made ready that went by is asked for
-again (`MISSED_AFTER`), and pausing, a seek or an edit ends it. **What is left at the switch:** the first frame is begun by an estimate of what it
+primes nothing over it) for `lead` past what is heard and no earlier than the refused frame: `READY_LEAD` (0.6 s), twice what the last answer
+took, or room for the GPU's session to begin its first frame early after the route is back (first frame + `SHOW_AHEAD` + 0.1 s), whichever is
+most, capped at `READY_MAX_LEAD` (2.5 s) so what is made ready is played well inside the backend's 10 s. Only `stream` with no `play` ends the
+take-back for the play (`never`: the setting, no surface, no plan from there); `stream` with `play.ahead` (nothing within the backend's 4 s yet), a
+superseded answer and a request that failed (logged) are `later`, asked again `READY_EVERY` (1 s) after the answer came, doubling with each `later`
+in a row up to `READY_MAX_WAIT` (8 s), so a cut the GPU draws none of costs the one worker that draws a scan every 8 s at most. A `ready` answer's
+`play.resume` is where the play from there is made ready. The GPU's session begins a first frame's cost before it (`firstFrameLead`: what the last
+take-back's first frame cost, `learnedLead`, kept apart from the steady round trip of the session the stream took over, `handoverTrip`, which is the
+estimate until a take-back has been measured; never less than a frame), and `SHOW_AHEAD` (0.3 s) before the session begins the route is the
+surface's again (`returning`: `streaming && !returning` in the route, so the bounds go out visible; the surface is not shown before a frame is drawn on
+it, and the pump, `streaming && gpuPlay === null`, asks nothing). The `GpuPlayback(fps, resume, true)` holds its picture at `resume`, and once its
+first frame is on the screen (`gpuShown`) the stream stops, the bar is lifted and the play is the GPU's again (and may hand over again later). A
+session that declines before it drew (a refused frame, the bounds not delivered yet, something over the frame on a surface above the page) leaves
+the stream playing; one that failed ends the take-back (`abandonTakeBack`). A declined session and a time made ready that went by (`MISSED_AFTER`)
+are asked about again after a wait of their own count (`TakeBack.retry`: 1, 2, 4, 8 s, which a `ready` answer does not reset and only a play taken
+back does, the next hand-over's `TakeBack` starting from nothing), so a take-back that keeps failing at the switch costs a primed play every 8 s at
+most, and pausing, a seek or an edit ends it. **What is left at the switch:** the first frame is begun by an estimate of what it
 costs, so it can land a frame early (the picture holds a frame ahead of the sound) or late (the stream already showed a frame or two past `resume`,
 and they are shown again); and the take-back is in the audible time, so from a stream that never was the GPU's (declined at Play, read from the
 plain clock) the picture steps back by the output latency. Under Proxy only the first request is rejected as the stream is (`playWaiting` →

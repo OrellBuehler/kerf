@@ -226,9 +226,15 @@
 	let returning = $state(false);
 	/** Stops the stream once the GPU has taken the play back; set by the playback effect while it runs. */
 	let endStreamForGpu: (() => void) | null = null;
-	/** What the first frame of a session costs, seconds: the GPU's session that takes the play back begins this long
-	 *  before the time made ready, so its first frame is on the screen when the play gets there. */
-	let takeBackLead = 0.05;
+	/** What the first frame of a session that took a play back cost, as the last one measured it (null before any):
+	 *  the next take-back's session begins this long before the time made ready, so its first frame is on the screen
+	 *  when the play gets there. */
+	let learnedLead: number | null = null;
+	/** The steady round trip of the session the stream took over: the estimate before any take-back was measured. */
+	let handoverTrip = 0;
+	/** How long before the time made ready the GPU's session begins: the learned first frame, else the steady round
+	 *  trip, else 50 ms, and never less than a frame. */
+	const firstFrameLead = () => Math.max(learnedLead ?? (handoverTrip > 0 ? handoverTrip : 0.05), 1 / playFps);
 	/** What the playback effect last saw of the play: an edit or a resize re-runs it mid-play (its GPU session is
 	 *  rebuilt from the audible picture, no earlier than the playhead the play began at), a seek or a Play from rest
 	 *  does not (`playSession`). */
@@ -275,7 +281,7 @@
 		gpuBarred = { seek: ui.seekEpoch, timeline: editor.timeline };
 		// Past where the GPU stops it may take the play back, unless it failed, fell behind or stopped answering.
 		takeBack = pb.resumable && ahead ? new TakeBack(ahead.at) : null;
-		if (pb.roundTrip > 0) takeBackLead = pb.roundTrip;
+		if (pb.roundTrip > 0) handoverTrip = pb.roundTrip;
 		// What the stream is told about where the GPU stops: an at-once hand-over has no use for a refusal that
 		// is still ahead (the pane would hold the GPU's last picture until the stream got there).
 		const stops = takeoverAhead(ahead, now, ui.time - pb.offsetAt(ui.time), pb.roundTrip, playFps);
@@ -494,13 +500,14 @@
 			returning = false;
 			tb.retry(heard);
 		}
-		const at = tb.ask(heard);
+		const lead = firstFrameLead();
+		const at = tb.ask(heard, lead);
 		if (at !== null) {
 			void askTakeBack(tb, at);
 			return;
 		}
-		if (tb.showing(heard)) returning = true;
-		if (returning && tb.resume !== null && tb.due(heard, takeBackLead)) {
+		if (tb.showing(heard, lead)) returning = true;
+		if (returning && tb.resume !== null && tb.due(heard, lead)) {
 			gpuPlay = new GpuPlayback(playFps, tb.resume, true);
 		}
 	}
@@ -527,7 +534,7 @@
 		if (!pb || pb.drawn === 0) return;
 		logFrontend('info', `GPU playback took the play back from the stream at ${pb.from.toFixed(2)} s`, 'playback');
 		// What this first frame cost is how early the next take-back begins its session.
-		if (pb.roundTrip > 0) takeBackLead = pb.roundTrip;
+		if (pb.roundTrip > 0) learnedLead = pb.roundTrip;
 		takeBack?.end();
 		takeBack = null;
 		returning = false;

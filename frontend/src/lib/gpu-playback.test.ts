@@ -9,6 +9,7 @@ import {
 	NO_PLAY,
 	READY_EVERY,
 	READY_LEAD,
+	READY_MAX_LEAD,
 	READY_MAX_WAIT,
 	READY_SETTLE,
 	SHOW_AHEAD,
@@ -452,27 +453,57 @@ describe('a play the stream took over is given back', () => {
 			at = next;
 		}
 		expect(waits).toEqual([READY_EVERY, 2, 4, READY_MAX_WAIT, READY_MAX_WAIT, READY_MAX_WAIT]);
-		// A ready answer starts the count again.
-		tb.answer(ready(at + 1));
-		tb.retry(at + 2);
-		expect(tb.ask(at + 2 + READY_EVERY)).not.toBeNull();
 	});
 
-	test('asks further ahead when the answers are slow', () => {
+	test('waits from the answer, not from the question', () => {
+		const tb = new TakeBack(0);
+		tb.ask(0);
+		expect(tb.ask(READY_SETTLE)).not.toBeNull();
+		tb.answer(stream(ahead(99)), 0.5);
+		expect(tb.ask(READY_SETTLE + 0.5 + READY_EVERY - 0.01)).toBeNull();
+		expect(tb.ask(READY_SETTLE + 0.5 + READY_EVERY)).not.toBeNull();
+	});
+
+	test('a time made ready that comes to nothing waits longer each time, and a ready answer does not reset that', () => {
+		const tb = new TakeBack(0);
+		tb.ask(0);
+		let at = READY_SETTLE;
+		expect(tb.ask(at)).not.toBeNull();
+		const waits: number[] = [];
+		for (let n = 0; n < 5; n++) {
+			tb.answer(ready(at + 1));
+			// Missed, or the session begun there declined before it drew.
+			const gone = at + 1.2;
+			tb.retry(gone);
+			let next = gone;
+			while (tb.ask(next) === null) next += 0.05;
+			waits.push(Math.round((next - gone) * 10) / 10);
+			at = next;
+		}
+		expect(waits).toEqual([READY_EVERY, 2, 4, READY_MAX_WAIT, READY_MAX_WAIT]);
+	});
+
+	test('asks further ahead when the answers are slow or the first frame is, never past the limit', () => {
 		const tb = new TakeBack(0);
 		tb.ask(0);
 		tb.ask(READY_SETTLE);
 		tb.answer(stream(ahead(9)), 0.9);
-		expect(tb.lead).toBeCloseTo(1.8);
+		expect(tb.lead()).toBeCloseTo(1.8);
 		let at = READY_SETTLE;
 		let asked: number | null = null;
 		while (asked === null) asked = tb.ask((at += 0.05));
 		expect(asked).toBeCloseTo(at + 1.8);
 		tb.answer(ready(at + 1.8), 0.1);
-		expect(tb.lead).toBe(READY_LEAD);
+		expect(tb.lead()).toBe(READY_LEAD);
+		// Room for the session to begin a slow first frame early, after the route is back.
+		expect(tb.lead(0.6)).toBeCloseTo(0.6 + SHOW_AHEAD + 0.1);
+		// What is made ready waits for the play: never further than the limit.
+		tb.answer(stream(ahead(9)), 3);
+		expect(tb.lead()).toBe(READY_MAX_LEAD);
+		expect(tb.lead(5)).toBe(READY_MAX_LEAD);
 	});
 
-	test('brings the surface back, then begins the session a first frame ahead of the time made ready', () => {
+	test('brings the surface back before the session begins, which begins a first frame ahead of the time made ready', () => {
 		const tb = new TakeBack(2);
 		tb.ask(1.5);
 		expect(tb.ask(2.5)).toBe(2.5 + READY_LEAD);
@@ -480,8 +511,10 @@ describe('a play the stream took over is given back', () => {
 		expect(tb.resume).toBe(3.2);
 		// Nothing more is asked while it is ready.
 		expect(tb.ask(4)).toBeNull();
-		expect(tb.showing(3.2 - SHOW_AHEAD - 0.01)).toBe(false);
-		expect(tb.showing(3.2 - SHOW_AHEAD)).toBe(true);
+		expect(tb.showing(3.2 - 0.05 - SHOW_AHEAD - 0.01, 0.05)).toBe(false);
+		expect(tb.showing(3.2 - 0.05 - SHOW_AHEAD, 0.05)).toBe(true);
+		// A slow first frame brings the route back that much earlier.
+		expect(tb.showing(3.2 - 0.5 - SHOW_AHEAD, 0.5)).toBe(true);
 		expect(tb.due(3.1, 0.05)).toBe(false);
 		expect(tb.due(3.16, 0.05)).toBe(true);
 		// Missed: the play got past it before a session began there; it is asked for again after the wait.
