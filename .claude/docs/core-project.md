@@ -112,7 +112,15 @@
   the version is stamped), and a backup that fails (full disk, read-only folder) is a warning unless a
   pending step is destructive. A **read-only** file (SQLite fell back to read-only) opens as it is,
   nothing written; one that needs a real upgrade is refused with a "copy it somewhere you can write"
-  message. `SCHEMA` still runs first, so a step must tolerate tables it creates. **Save As is atomic** (`vacuum_into_atomic`):
+  message. `SCHEMA` still runs first, so a step must tolerate tables it creates. **The version covers the
+  JSON in the tables too** (timeline, history, proposal, analysis, asset streams): a change an older build
+  would drop (an unknown field, at its next write) or misread (an unknown variant) is a step of its own —
+  `run` a no-op (or a JSON rewrite), `needed` always (so the file is copied aside first), `needed_to_read`
+  false. `persist_tests` keeps `persisted/timelines-v<N>.json` (the sample's timeline and five of the golden
+  oracle's) for each version that moved the stored shape: every one must still read, and the newest must
+  round-trip unchanged, so moving the shape fails until a step is appended and `KERF_BLESS_PERSISTED=1`
+  writes the new version's file (add it to `PERSISTED`); a tables-only step needs no file. `meta.kerf_version` is the build that made the file, `meta.last_kerf_version`
+  the last one that opened it to write. **Save As is atomic** (`vacuum_into_atomic`):
   `VACUUM INTO` a hidden temp file in the target's directory, fsync it, rename it over the target,
   fsync the directory on unix; any failure removes the temp file and leaves the old target as it was.
   Each save first deletes this target's own `.<name>.<uuid>.tmp` files over an hour old (a crashed
@@ -405,8 +413,11 @@
     the declared size is what counts), no entries sharing bytes (`has_overlapping_entries`) — then each
     entry is capped (manifest 256 KiB, title 128 KiB, poster 4 MiB, font 8 MiB) and must be exactly as
     long as its header says. Unknown entries are ignored. The manifest's `format` and `version` are
-    looked at before the rest is parsed: another version is refused by name, a newer one as "made by a
-    newer Kerf". A font must be a plain sfnt (`fonts::check_font`: not a `.ttc`, `fontdb` can parse it)
+    looked at before the rest is parsed: a newer version is refused as "made by a newer Kerf", an older one
+    is brought forward by `model::UPGRADES` (`UPGRADES[i]` rewrites the JSON of version `i + 1` into `i + 2`;
+    `VERSION` is `1 + UPGRADES.len()`; append one per format change) as it is read — a library file keeps its
+    bytes. **A manifest field this build does not know is refused** (`unknown_field`, by its path, a `null`
+    counting as absent) rather than dropped, so a format change must bump the version. A font must be a plain sfnt (`fonts::check_font`: not a `.ttc`, `fontdb` can parse it)
     and its manifest family becomes the family the file really is; **one whose `OS/2` `fsType` does not
     allow embedding (`fonts::embedding_allowed`: restricted licence 0x0002, preview & print 0x0004, bitmap
     only 0x0200) refuses the whole file** — when a file is read, so `import` and `get` both — as a font that

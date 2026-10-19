@@ -27,6 +27,14 @@ struct Migration {
 /// `PRAGMA user_version` was used — the legacy baseline. Append one step per change; never edit
 /// a shipped one. Steps run after `SCHEMA` has created any table the file lacked, so each must
 /// tolerate that (`IF NOT EXISTS`, probe before `ALTER`).
+///
+/// The version covers **the JSON the tables hold** too (timeline, history, proposal, analysis, asset
+/// streams): every shipped build since 0.26 refuses a newer version, while one that is let in drops a
+/// field it does not know at its next write and fails on a variant it does not know. So a change an
+/// older build would drop or misread (a new field, a new variant, a new meaning) is a step of its own:
+/// `run` does nothing (or rewrites the JSON), `needed` is always true (the file is copied aside before
+/// the older build is locked out of it) and `needed_to_read` false. `persist_tests` keeps a timeline
+/// per version and fails when the stored shape moves without one.
 const MIGRATIONS: &[Migration] = &[
     Migration {
         run: v0_to_v1,
