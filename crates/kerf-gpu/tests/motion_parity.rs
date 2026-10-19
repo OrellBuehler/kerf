@@ -2597,6 +2597,33 @@ fn a_moving_zoom_behind_a_rotation_or_an_opacity_is_refused() {
         upto(1.0, 30.0),
         "an opacity below 1",
     );
+    // A keyed opacity that holds 1 and then falls (the keys take every number): while it holds, its `geq` is
+    // the identity on the alpha plane, copying Y, U and V (one in at the edge on 6.1) ahead of the zoom, and the
+    // frame is drawn; once it falls the alpha plane would be scaled with the zoom, and the frame is refused.
+    let mut fading = zooming(&m.testsrc, 1.0, 1.6, (0.0, 0.0));
+    fading.keyframes = vec![
+        zoom_key(0.0, 1.0, 0.0, 0.0),
+        zoom_key(0.5, 1.3, 0.0, 0.0),
+        kerf_core::Keyframe {
+            opacity: 0.3,
+            ..zoom_key(1.0, 1.6, 0.0, 0.0)
+        },
+    ];
+    let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![fading]], None);
+    check_motion(Check {
+        case: "keyed opacity + moving zoom (curve holds 1, then falls)",
+        tl: &tl,
+        assets: &assets,
+        opts: at_fps(30.0),
+        frames: upto(1.0, 30.0),
+        limits: SCALED,
+        look: &LOOK_ZOOM,
+        rotated: false,
+        refusing: Some(&refusing(
+            "ZoomBehind(an opacity below 1)",
+            |u| matches!(u, Unsupported::ZoomBehind(_, w) if w.contains("opacity below 1")),
+        )),
+    });
     let out = clip(&m.bars, 0.5, 1.5, 0.0);
     let mut inc = zooming(&m.testsrc, 1.0, 1.4, (0.0, 0.0));
     inc.timeline_start = 1.0;

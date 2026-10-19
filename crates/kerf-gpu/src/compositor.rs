@@ -735,9 +735,9 @@ fn extent(w: u32, h: u32) -> wgpu::Extent3d {
 }
 
 /// Do ahead of a frame what a plan needs measured and what takes a while: today FFmpeg's `geq`, for a
-/// masked plan (one short child process, once per process). Call it from a blocking thread **off the
-/// render lock**, with the plan in hand, so the first masked frame does not pay for it under the
-/// lock; a compositor pinned with [`Compositor::with_geq_edge`] needs none of it.
+/// plan with a mask or a keyed opacity (the export's `geq`; one short child process, once per process).
+/// Call it from a blocking thread **off the render lock**, with the plan in hand, so the first such
+/// frame does not pay for it under the lock; a compositor pinned with [`Compositor::with_geq_edge`] needs none of it.
 pub fn prepare(plan: &RenderPlan) {
     if plan.layers.iter().any(|l| l.mask.is_some() || l.keyed_alpha.is_some()) {
         let _ = kerf_core::geq_edge();
@@ -785,7 +785,7 @@ impl Compositor {
 
     /// Pin what FFmpeg's `geq` does at a plane's last column and row, instead of measuring the
     /// ffmpeg this process runs ([`kerf_core::geq_edge`], one child process, on the first masked
-    /// frame unless [`prepare`] ran ahead of it): for a host that knows its ffmpeg, and for tests.
+    /// or keyed-opacity frame unless [`prepare`] ran ahead of it): for a host that knows its ffmpeg, and for tests.
     #[must_use]
     pub fn with_geq_edge(mut self, edge: GeqEdge) -> Self {
         self.geq_edge = Some(edge);

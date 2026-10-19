@@ -836,10 +836,19 @@ fn a_keyed_value_is_its_expression_to_the_last_bit() {
         clip.set_property_keys(Property::Opacity, keys);
         let points = clip.property_curve(Property::Opacity);
         let expr = keyframe_expr(&points, "T", clip.timeline_start);
+        // Points out of order are sorted first, as the expression does.
+        let backwards: Vec<_> = points.iter().rev().copied().collect();
+        let backwards_expr = keyframe_expr(&backwards, "T", clip.timeline_start);
         for k in 0..240u64 {
             for (num, den) in [(30, 1), (30000, 1001), (25, 1), (24000, 1001)] {
                 let t = ffmpeg_frame_time(k, num, den);
                 let want = eval(&expr, &[("T", t)]);
+                assert_eq!(
+                    keyframe_value(&backwards, t, clip.timeline_start).to_bits(),
+                    eval(&backwards_expr, &[("T", t)]).to_bits(),
+                    "{} points, reversed, at {t}",
+                    points.len()
+                );
                 let got = keyframe_value(&points, t, clip.timeline_start);
                 assert_eq!(
                     got.to_bits(),

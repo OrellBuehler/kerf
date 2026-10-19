@@ -7826,8 +7826,16 @@ fn keyframe_expr(points: &[(f64, f64)], tvar: &str, start: f64) -> String {
 /// comparisons, and the same line through it. A filter that keys a number per frame (`geq`'s
 /// opacity) can be followed to the last bit.
 pub(crate) fn keyframe_value(points: &[(f64, f64)], t: f64, start: f64) -> f64 {
-    let mut pts = points.to_vec();
-    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // (A curve is sorted already; the stable sort of one that is changes nothing, so it is not copied.)
+    let sorted;
+    let pts: &[(f64, f64)] = if points.windows(2).all(|w| w[0].0.total_cmp(&w[1].0).is_le()) {
+        points
+    } else {
+        let mut copy = points.to_vec();
+        copy.sort_by(|a, b| a.0.total_cmp(&b.0));
+        sorted = copy;
+        &sorted
+    };
     match pts.len() {
         0 => return 0.0,
         1 => return pts[0].1,

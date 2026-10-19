@@ -640,8 +640,8 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
 * **FFmpeg 6.1's `geq` reads a plane's last column and row one in** (its bilinear read clamps to `w - 2` / `h - 2`): the masked picture's right-most
   column and bottom row, on all three planes, are their neighbours'; 9.0 copies them. `kerf_core::geq_edge()` measures which (the filter over a 16x16
   picture of distinct samples, once per process, outside any lock; `Unknown`, not a guess, retried after a backoff). The blend then reads the layer one in
-  (`ComposeParams::edge`, a letterbox included), a late zoom's planes are shifted before its scale (`fs_edge`), and a mask is `Unsupported` while the build
-  is `Unknown`. `kerf_gpu::prepare(&plan)` measures it ahead of the render lock; `Compositor::with_geq_edge` pins it.
+  (`ComposeParams::edge`, a letterbox included), a late zoom's planes are shifted before its scale (`fs_edge`), and a mask or a keyed opacity is `Unsupported` while the
+  build is `Unknown`. `kerf_gpu::prepare(&plan)` measures it ahead of the render lock; `Compositor::with_geq_edge` pins it.
 * Refused (`MaskWith`): a mask on a **rotated** layer, or one below full opacity (the sampled one: its alpha goes through `colorchannelmixer`).
 
 **Keyed opacity** (export frames). FFmpeg's chain has a `geq` whose alpha is `(int)(opacity(T) * 255)` (`T` the frame's time on the
@@ -653,7 +653,9 @@ no round trip; the clip's fades and a dissolve's ramp act on it as on any alpha 
 keys, 29.97, with fades, in a dissolve); the scaler's level on a pip or an odd size; `ROTATED` turned. A mask with it is drawn
 while the curve holds 1 (the `geq` writes the mask, byte for byte) and refused on the frames below it (`MaskWith`: one `geq`
 multiplies both); **the alpha judged is the `geq`'s own (`keyed_alpha < 255`), not the sampled opacity**, which can sit on the
-other side of 1 by the last bit. A **chroma key under it is refused for the clip** (`Effects`, on the frames at 255 too, so a clip is
+other side of 1 by the last bit. **Before a moving zoom** it is drawn on the frames where the curve holds 1 (the `geq` is the identity on
+the alpha plane and copies Y, U, V: the zoom-last path of a mask, `edge_planes` ahead of the scale; `SCALED`, measured 1 / 1 on 6.1.1 and
+9.0.2) and refused once it falls (`ZoomBehind`: its alpha plane would be scaled with the zoom). A **chroma key under it is refused for the clip** (`Effects`, on the frames at 255 too, so a clip is
 not drawn by two renderers in turn): that `geq` reads the key's plane (`alpha(X,Y)`), and on a build that reads a plane's last
 column and row one in (6.1) it reads the key's alpha there one in, which the compositor's key does not (measured on the frames at
 255: luma 21 off at the edge, 2636 samples over 14 frames; 9.0.2 is exact, so shifting the key's alpha under `mask_edge` is the
