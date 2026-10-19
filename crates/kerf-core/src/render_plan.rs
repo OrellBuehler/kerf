@@ -966,6 +966,11 @@ impl RenderPlan {
                 out.push(Unsupported::FullRangeCut);
             }
         }
+        // A blurred fill is FFmpeg's (`boxblur` on a thumbnail, scaled back up): refused, still and
+        // motion alike, wherever a layer is on screen (a frame of nothing but the canvas is drawn).
+        if self.canvas.fit == Fit::Blur && !self.layers.is_empty() {
+            out.push(Unsupported::BlurFill);
+        }
         out.extend(self.pictureless.iter().cloned().map(Unsupported::NoPicture));
         for (n, layer) in self.layers.iter().enumerate() {
             let at = || LayerRef {

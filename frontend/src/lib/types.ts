@@ -1310,8 +1310,9 @@ export interface ExportOptions {
 	hwaccel?: string | null;
 	resolution?: [number, number] | null;
 	/** How footage of a different shape is fitted to `resolution`: letterboxed
-	 *  (`contain`, the default) or filled and cropped (`cover`). Only matters
-	 *  when the delivery aspect differs from the footage. */
+	 *  (`contain`, the default), filled and cropped (`cover`), or letterboxed over a
+	 *  blurred copy of itself (`blur`). Only matters when the delivery aspect differs
+	 *  from the footage. */
 	fit?: Fit;
 	fps?: number | null;
 	scaler?: string | null;
@@ -1373,8 +1374,9 @@ export interface SyncedByAudio {
  *  Apple -16, EBU R128 broadcast -23, all with a -1 dBTP true-peak ceiling. */
 export type LoudnessPreset = 'youtube' | 'spotify' | 'apple' | 'broadcast';
 
-/** How a clip's picture is fitted to an output frame of a different shape. */
-export type Fit = 'contain' | 'cover';
+/** How a clip's picture is fitted to an output frame of a different shape: `blur` is `contain`
+ *  over a blurred, enlarged copy of the picture (a clip placed by its transform gets plain bars). */
+export type Fit = 'contain' | 'cover' | 'blur';
 
 /** A place a finished cut gets published, mirroring `kerf_core::platform`. */
 export interface PlatformTarget {

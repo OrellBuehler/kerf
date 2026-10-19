@@ -2,7 +2,7 @@
 // mirrors kerf_core::engine (validate_export, build_export_args) so the UI
 // reflects exactly what the backend will do.
 
-import type { Container, ExportOptions, Fit, LoudnessPreset, RateControl } from './types';
+import type { Container, Delivery, ExportOptions, Fit, LoudnessPreset, RateControl } from './types';
 import { DEFAULT_EXPORT_OPTIONS } from './types';
 
 export interface ContainerInfo {
@@ -200,7 +200,8 @@ export const AUDIO_BITRATES = ['96k', '128k', '160k', '192k', '256k', '320k', '3
 export const SAMPLE_RATES = [44100, 48000];
 export const FITS: { id: Fit; label: string; hint: string }[] = [
 	{ id: 'contain', label: 'Fit (letterbox)', hint: 'Whole frame, black bars where the shapes differ.' },
-	{ id: 'cover', label: 'Fill (crop)', hint: 'Fills the frame; the overflow is cropped off.' }
+	{ id: 'cover', label: 'Fill (crop)', hint: 'Fills the frame; the overflow is cropped off.' },
+	{ id: 'blur', label: 'Fit (blurred fill)', hint: 'Whole frame, the bars filled with a blurred copy of the shot.' }
 ];
 
 /** The loudness targets an export can normalize to — `kerf_core::LoudnessPreset`, in the order the
@@ -412,6 +413,17 @@ export function applyPreset(id: string, hw: readonly string[] = []): ExportOptio
 	return { ...DEFAULT_EXPORT_OPTIONS, ...(p?.opts ?? {}) };
 }
 
+/** The export the dialog opens on for a project cut for `format`: a preset that renders exactly
+ *  that frame, else the default with its resolution cleared (so the project frame is what renders),
+ *  and the project's own fit either way — a 9:16 project fitted over a blurred fill must not export
+ *  cropped because the 9:16 preset fills. */
+export function initialExport(format: Delivery | null | undefined): { id: string; opts: ExportOptions } {
+	if (!format) return { id: 'web_1080p', opts: applyPreset('web_1080p') };
+	const hit = PRESETS.find((p) => p.opts.resolution?.[0] === format.width && p.opts.resolution?.[1] === format.height);
+	if (hit) return { id: hit.id, opts: { ...applyPreset(hit.id), fit: format.fit } };
+	return { id: 'custom', opts: { ...applyPreset('web_1080p'), resolution: null, fit: format.fit } };
+}
+
 export function containerInfo(c: Container): ContainerInfo {
 	return CONTAINERS.find((x) => x.id === c) ?? CONTAINERS[0];
 }
@@ -522,8 +534,9 @@ export function buildSummary(opts: ExportOptions, hasVideo: boolean, hasAudio: b
 		}
 		parts.push(opts.resolution ? `${opts.resolution[0]}×${opts.resolution[1]}` : 'source');
 		// Worth surfacing: at a delivery aspect that differs from the footage it
-		// decides between a cropped shot and a letterboxed one.
+		// decides between a cropped shot, a letterboxed one and one over a blurred fill.
 		if (opts.resolution && opts.fit === 'cover') parts.push('filled');
+		if (opts.resolution && opts.fit === 'blur') parts.push('blurred fill');
 		if (opts.fps) parts.push(`${opts.fps}fps`);
 	}
 	if (wantAudio && opts.audio_codec) {

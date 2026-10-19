@@ -368,7 +368,7 @@
 							}
 						}}
 						use:tip={`${a.asset.path}
-Drag onto a timeline track to add a clip · right-click for details`}
+Drag onto a timeline track to add a clip · right-click for actions`}
 						style="display:flex;flex-direction:column;gap:6px;padding:7px;border-radius:var(--radius-sm);background:{sel ? 'var(--surface-hover)' : 'var(--surface-raised)'};border:var(--line-width) solid {sel ? 'var(--kerf-500)' : 'var(--border-subtle)'};cursor:grab"
 					>
 						<div style="display:flex;gap:9px;align-items:center">
