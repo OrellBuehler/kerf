@@ -101,7 +101,10 @@
   `MIGRATIONS` (one step each, each in its own transaction stamping the version it reached; never edit
   a shipped step, append one). Version 0 is every file written before versions existed (the legacy
   baseline; v0→v1 is the old probe-then-`ALTER` columns); v1→v2 adds `staged.owner` / `staged.assets`
-  (below); v2→v3 adds the `fonts` table (below); v3→v4 adds `assets.music_score`. A step's `needed_to_read` says whether a build that
+  (below); v2→v3 adds the `fonts` table (below); v3→v4 adds `assets.music_score`; v4→v5 is a JSON step for
+  `Fit::Blur` (`"fit":"blur"` in a delivery frame, a variant an older build fails on: `run` a no-op, `needed` always, so every
+  older file is copied aside once — the no-op probes of the earlier steps still decide nothing on their own — and
+  `needed_to_read` false; `persisted/timelines-v5.json` holds a blurred-fill cut). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2 and v4 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a

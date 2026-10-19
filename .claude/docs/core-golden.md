@@ -24,9 +24,10 @@
   the structural `svg-under-text`, `svg-gif`, `svg-offset`, which gave 28 to hundreds of cases each) and **400 more** with a
   blurred fill (`Fit::Blur` on the export options and on the delivery frame when the cut has one, no dice, no titles; families
   `blur-fill`, `still-blur-fill`, `preview-blur-fill`, needle `boxblur=`: appending it added four block lines a file and moved
-  none of the first 6400), have their
+  none of the first 6400; keeping the fill to the clips that leave bars and are not see-through, `takes_blur_fill`, then
+  moved blocks 64..67 alone), have their
   `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
-  FNV-1a digests, committed as 64 block digests each in
+  FNV-1a digests, committed as 68 block digests each in
   `engine/cli/golden/{export,still,preview}.txt` (LF: `.gitattributes`, and the comparison
   ignores `\r`). A refactor of the graph builders must leave all three untouched; an
   intended argv change moves the files of the builders it touched. (`build_proxy_args` and
