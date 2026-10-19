@@ -68,7 +68,7 @@ export interface EditEnv {
 	footage: SourceLimits;
 	hasAudio: (assetId: string) => boolean;
 	/** An asset's name and length, for the sentence that says a clip ran past its end. */
-	asset?: (assetId: string) => { name: string; duration: number } | undefined;
+	asset?: (assetId: string) => { name: string; duration: number; streams?: readonly { kind: string }[] } | undefined;
 }
 
 export interface Edited<R = void> {
@@ -146,12 +146,39 @@ function locate(tl: Timeline, clipId: string): [Track, number] | null {
 	return at ? [tl.tracks[at[0]], at[1]] : null;
 }
 
+/** `Timeline::ensure_editable`: a layout edit to a clip on a locked track is refused (its look and
+ *  sound stay editable). */
+export function ensureEditable(tl: Timeline, clipId: string) {
+	const found = locate(tl, clipId);
+	if (!found) throw clipNotFound(clipId);
+	if (found[0].locked) throw invalid(`track ${found[0].name} is locked`);
+}
+
+/** `Timeline::ensure_track_editable`: nothing is put on (or re-laid on) a locked track. */
+export function ensureTrackEditable(tl: Timeline, trackId: string) {
+	const track = tl.tracks.find((x) => x.id === trackId);
+	if (!track) throw new Error(`track not found: ${trackId}`);
+	if (track.locked) throw invalid(`track ${track.name} is locked`);
+}
+
+/** `default_track`: where a clip of `kind` goes when the edit names no track — the first unlocked one. */
+export function defaultTrack(tl: Timeline, kind: Track['kind']): Track {
+	const track = tl.tracks.find((x) => x.kind === kind && !x.locked);
+	if (track) return track;
+	if (tl.tracks.some((x) => x.kind === kind))
+		throw invalid(`every ${kind === 'audio' ? 'audio' : 'video'} track is locked — unlock one, or add a track`);
+	throw new Error('no suitable track for asset');
+}
+
 // ---- split / trim / cut ----------------------------------------------------------
 
 /** `Project::split_at`: the clip, and every partner that has `at` inside it, split there. */
 export function splitAt(tl: Timeline, env: EditEnv, clipId: string, at: number): Edited<[Clip, Clip]> {
 	return edited(
-		runEdit(tl, env, (t) => (env.links ? splitClipLinked(t, clipId, at) : splitClip(t, clipId, at))),
+		runEdit(tl, env, (t) => {
+			ensureEditable(t, clipId);
+			return env.links ? splitClipLinked(t, clipId, at) : splitClip(t, clipId, at);
+		}),
 		'Split clip'
 	);
 }
@@ -180,8 +207,8 @@ export function addClip(
 	const id = newId();
 	return edited(
 		runEdit(tl, { ...env, lanes: [id] }, (t) => {
-			const track = trackId ? t.tracks.find((x) => x.id === trackId) : t.tracks.find((x) => x.kind === kind);
-			if (!track) throw new Error(trackId ? `track not found: ${trackId}` : 'no suitable track for asset');
+			if (trackId) ensureTrackEditable(t, trackId);
+			const track = trackId ? t.tracks.find((x) => x.id === trackId)! : defaultTrack(t, kind as Track['kind']);
 			const start = timelineStart ?? track.clips.reduce((m, c) => Math.max(m, c.timeline_start + clipDuration(c)), 0);
 			const clip: Clip = { id, asset_id: asset.id, source_in: sourceIn, source_out: sourceOut, timeline_start: start, volume: 1, fade_in: 0, fade_out: 0 };
 			track.clips.push(clip);
@@ -208,6 +235,7 @@ export function trim(
 	if (sourceIn != null && sourceIn < 0) throw invalid('source_in must be >= 0');
 	return edited(
 		runEdit(tl, { ...env, anchors: [clipId], lanes: [clipId] }, (t, notes, carried) => {
+			ensureEditable(t, clipId);
 			const found = locate(t, clipId);
 			if (!found) throw clipNotFound(clipId);
 			const [track, ci] = found;
@@ -237,9 +265,10 @@ export function trim(
 /** `Project::cut_clip_range`: a source span out of a clip; never rippled, it closes its own gap. */
 export function cutRange(tl: Timeline, env: EditEnv, clipId: string, from: number, to: number): Edited<Clip[]> {
 	return edited(
-		runEdit(tl, { ...env, ripple: false, anchors: [clipId] }, (t, notes) =>
-			env.links ? cutClipRangeLinked(t, clipId, from, to, notes) : cutClipRange(t, clipId, from, to)
-		),
+		runEdit(tl, { ...env, ripple: false, anchors: [clipId] }, (t, notes) => {
+			ensureEditable(t, clipId);
+			return env.links ? cutClipRangeLinked(t, clipId, from, to, notes) : cutClipRange(t, clipId, from, to);
+		}),
 		'Cut range'
 	);
 }
@@ -248,6 +277,7 @@ export function cutRange(tl: Timeline, env: EditEnv, clipId: string, from: numbe
 export function rippleDelete(tl: Timeline, env: EditEnv, clipId: string): Edited<void> {
 	return edited(
 		runEdit(tl, { ...env, ripple: false, anchors: [clipId] }, (t, notes) => {
+			ensureEditable(t, clipId);
 			if (env.links) rippleDeleteLinked(t, clipId, notes);
 			else rippleDeleteClip(t, clipId);
 		}),
@@ -277,8 +307,8 @@ export function removeClips(tl: Timeline, env: EditEnv, ids: readonly string[]):
 export function remove(tl: Timeline, env: EditEnv, clipId: string): Edited<number> {
 	if (env.links && linkPartners(tl, clipId).length > 0) return removeClips(tl, env, [clipId]);
 	const done = runEdit(tl, { ...env, anchors: [clipId] }, (t) => {
-		const found = locate(t, clipId);
-		if (!found) throw clipNotFound(clipId);
+		ensureEditable(t, clipId);
+		const found = locate(t, clipId)!;
 		found[0].clips.splice(found[1], 1);
 		return 1;
 	});
@@ -292,6 +322,7 @@ export function setSpeed(tl: Timeline, env: EditEnv, clipId: string, speed: numb
 		throw invalid(`speed must be between ${MIN_SPEED}× and ${MAX_SPEED}× (negative to reverse), got ${speed}`);
 	return edited(
 		runEdit(tl, { ...env, anchors: [clipId] }, (t) => {
+			ensureEditable(t, clipId);
 			if (env.links) return setSpeedLinked(t, clipId, speed);
 			const found = locate(t, clipId);
 			if (!found) throw clipNotFound(clipId);
@@ -315,8 +346,8 @@ export function moveClips(tl: Timeline, env: EditEnv, moves: readonly ClipMove[]
 export function reorder(tl: Timeline, env: EditEnv, trackId: string, clipId: string, newIndex: number): Edited<void> {
 	return edited(
 		runEdit(tl, { ...env, ripple: false, anchors: [clipId] }, (t) => {
-			const track = t.tracks.find((x) => x.id === trackId);
-			if (!track) throw new Error(`track not found: ${trackId}`);
+			ensureTrackEditable(t, trackId);
+			const track = t.tracks.find((x) => x.id === trackId)!;
 			const cur = track.clips.findIndex((c) => c.id === clipId);
 			if (cur < 0) throw clipNotFound(clipId);
 			const [clip] = track.clips.splice(cur, 1);
@@ -410,9 +441,10 @@ export function extractAudio(tl: Timeline, env: EditEnv, assetId: string): Edite
 export function addAssetAudio(tl: Timeline, env: EditEnv, asset: Pick<Asset, 'id' | 'duration'>): Edited<Clip> {
 	return edited(
 		runEdit(tl, { ...env, ripple: false }, (t) => {
-			let track = t.tracks.find((x) => x.kind === 'audio');
+			// Every audio track locked, the sound gets one of its own, as a detach does.
+			let track = t.tracks.find((x) => x.kind === 'audio' && !x.locked);
 			if (!track) {
-				track = { id: newId(), kind: 'audio', name: 'A1', clips: [] };
+				track = { id: newId(), kind: 'audio', name: `A${t.tracks.filter((x) => x.kind === 'audio').length + 1}`, clips: [] };
 				t.tracks.push(track);
 			}
 			const start = track.clips.reduce((m, c) => Math.max(m, c.timeline_start + clipDuration(c)), 0);
@@ -475,8 +507,18 @@ export function insertClips(tl: Timeline, env: EditEnv, placements: readonly Pas
 				})
 			);
 			const staged: { ti: number; clip: Clip }[] = placements.map((p) => {
+				ensureTrackEditable(t, p.track_id);
 				const ti = t.tracks.findIndex((x) => x.id === p.track_id);
-				if (ti < 0) throw new Error(`track not found: ${p.track_id}`);
+				// A clip only on a track it can play on: a picture (a title is one) on video, sound on audio — judged
+				// where the asset's streams are known, as `Project::insert_clips` does.
+				const streams = p.clip.generator ? undefined : env.asset?.(p.clip.asset_id)?.streams;
+				const picture = p.clip.generator ? true : streams ? streams.some((x) => x.kind === 'video') : true;
+				const sound = p.clip.generator ? false : streams ? streams.some((x) => x.kind === 'audio') : true;
+				const track = t.tracks[ti];
+				if (!(track.kind === 'audio' ? sound : picture)) {
+					const [kind, has] = track.kind === 'audio' ? ['audio', 'sound'] : ['video', 'picture'];
+					throw invalid(`a clip with no ${has} cannot go on ${kind} track ${track.name} — paste it on a track of its kind`);
+				}
 				const copy: Clip = JSON.parse(JSON.stringify(p.clip));
 				copy.id = newId();
 				copy.timeline_start = where + (p.clip.timeline_start - base);

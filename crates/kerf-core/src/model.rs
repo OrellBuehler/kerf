@@ -3676,7 +3676,9 @@ pub struct Track {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub solo: bool,
     /// Locked against editing. Purely an editing guard — a locked track still
-    /// renders; the GUI refuses to drag, trim or razor its clips.
+    /// renders; every edit that changes what is on it, where, how long or whether it
+    /// plays is refused (`Timeline::ensure_editable`), while its clips' look and sound
+    /// stay editable.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub locked: bool,
     /// The track fader: a linear gain riding every clip on the track *after* its
@@ -4607,6 +4609,11 @@ impl Timeline {
     /// The id of the first track of a given kind, if any.
     pub fn first_track_of(&self, kind: StreamKind) -> Option<Uuid> {
         self.tracks.iter().find(|t| t.kind == kind).map(|t| t.id)
+    }
+
+    /// The first track of `kind` that is not locked: where an edit that names no track puts a clip.
+    pub fn first_unlocked_track_of(&self, kind: StreamKind) -> Option<Uuid> {
+        self.tracks.iter().find(|t| t.kind == kind && !t.locked).map(|t| t.id)
     }
 
     /// Beat timestamps of the audio tracks mapped onto the timeline, ascending
@@ -5564,6 +5571,22 @@ impl Timeline {
             return Err(Error::InvalidArgument(format!("track {} is locked", self.tracks[ti].name)));
         }
         Ok((ti, ci))
+    }
+
+    /// Refuse a layout edit to a clip on a locked track (or one that is not there). A lock guards
+    /// what is on a track, where, how long and whether it plays; a clip's look and sound stay
+    /// editable, as the Inspector leaves them.
+    pub fn ensure_editable(&self, clip_id: Uuid) -> Result<()> {
+        self.editable_clip(clip_id).map(drop)
+    }
+
+    /// Refuse an edit that puts a clip on (or reorders) a locked track.
+    pub fn ensure_track_editable(&self, track_id: Uuid) -> Result<()> {
+        let track = self.track(track_id).ok_or(Error::TrackNotFound(track_id))?;
+        if track.locked {
+            return Err(Error::InvalidArgument(format!("track {} is locked", track.name)));
+        }
+        Ok(())
     }
 
     /// Where the first clip of lane `ti` that starts at or after `end` (less the

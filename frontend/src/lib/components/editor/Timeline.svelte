@@ -22,6 +22,7 @@
 	import { onWindow } from '#lib/window-events';
 	import { windows } from '#lib/windows.svelte';
 	import type { MenuItem } from '#lib/context-menu.svelte';
+	import { duplicateBlocked, pastePlacements } from '#lib/track-locks';
 	import {
 		addMarker,
 		deleteSelection,
@@ -2035,6 +2036,8 @@
 		);
 		// Two clips selected: the clicked one can be moved into sync with the other by their sound.
 		const sync = syncOffer(editor.timeline, editor.assets, editor.selectedClipIds, c.id);
+		// A duplicate stays on its own track, which a lock closes.
+		const dupWhy = duplicateBlocked(editor.timeline, editor.selectedClipIds.length > 0 ? editor.selectedClipIds : [c.id]);
 		contextMenu.show(e, [
 			...held([
 				{
@@ -2073,6 +2076,8 @@
 				{
 					label: n > 1 ? `Duplicate ${n} clips` : 'Duplicate',
 					shortcut: settings.shortcut('edit.duplicate'),
+					disabled: !!dupWhy,
+					reason: dupWhy ?? undefined,
 					action: () => void duplicateClips()
 				},
 				{ type: 'separator' },
@@ -2669,7 +2674,11 @@
 					label: editor.clipboard.length > 1 ? `Paste ${editor.clipboard.length} clips` : 'Paste',
 					icon: 'copy',
 					shortcut: settings.shortcut('edit.paste'),
-					disabled: editor.clipboard.length === 0,
+					disabled: editor.clipboard.length === 0 || 'reason' in pastePlacements(editor.timeline, editor.clipboard, editor.assets),
+					reason: (() => {
+						const aimed = pastePlacements(editor.timeline, editor.clipboard, editor.assets);
+						return 'reason' in aimed ? aimed.reason : undefined;
+					})(),
 					action: () => void pasteClips()
 				},
 				{ type: 'separator' },
