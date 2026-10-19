@@ -8184,9 +8184,10 @@ fn fade_filter(step: &FadeStep) -> String {
 /// unique within its graph. Its text joins a chain like a filter:
 /// `...,split[..];...;[..][..]overlay=...,...`. Which clips take it is [`takes_blur_fill`]'s.
 ///
-/// The `overlay` composes in 8-bit 4:2:0 (its default): a 10-bit HDR picture is fitted at 8 bits
-/// ahead of the tone-map. `format=yuv420p10` would keep it, but FFmpeg 4.4 has no such format.
-fn blur_fill(w: u32, h: u32, even: &str, sf: &str, label: &str) -> String {
+/// The `overlay` composes in 8-bit 4:2:0 (its default) unless `deep`: an HDR picture, fitted ahead
+/// of its tone-map, composes in 10 bits (`format=yuv420p10`, FFmpeg 4.4 on) so the fill does not
+/// band it; an SDR one keeps the default.
+fn blur_fill(w: u32, h: u32, even: &str, sf: &str, deep: bool, label: &str) -> String {
     let (bw, bh) = ((w / 16 * 2).max(4), (h / 16 * 2).max(4));
     // A radius above half the chroma plane is refused; a sixteenth of the thumbnail's smaller
     // side, whole pixels (so the strength is only roughly the same from one frame size to another).
@@ -8196,7 +8197,8 @@ fn blur_fill(w: u32, h: u32, even: &str, sf: &str, label: &str) -> String {
          [{label}b]scale={bw}:{bh}:force_original_aspect_ratio=increase:flags=bilinear,crop={bw}:{bh},\
          boxblur={radius}:2,scale={w}:{h}:flags=bilinear[{label}bb];\
          [{label}f]scale={w}:{h}:force_original_aspect_ratio=decrease{even}{sf}[{label}ff];\
-         [{label}bb][{label}ff]overlay=(W-w)/2:(H-h)/2"
+         [{label}bb][{label}ff]overlay=(W-w)/2:(H-h)/2{format}",
+        format = if deep { ":format=yuv420p10" } else { "" }
     )
 }
 
@@ -8371,6 +8373,7 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
             fmt.height,
             if tone_mapped { ":force_divisible_by=2" } else { "" },
             &sf,
+            tone_mapped,
             &format!("bf{instance}"),
         )),
         // Fit inside the frame; the identity case then pads out to full size so
@@ -9284,7 +9287,8 @@ fn still_clip_chain_graded(
     // one shape you were never going to ship.
     match fit {
         Fit::Blur if tf.is_identity() && blur_label.is_some() => {
-            p.push(blur_fill(ow, oh, "", sf, blur_label.unwrap_or_default()));
+            // The still tone-maps ahead of the chain: its picture is 8-bit SDR here.
+            p.push(blur_fill(ow, oh, "", sf, false, blur_label.unwrap_or_default()));
         }
         Fit::Contain | Fit::Blur => p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=decrease{sf}")),
         Fit::Cover => {
@@ -16734,7 +16738,7 @@ mod tests {
     #[test]
     fn a_blurred_fill_puts_the_fitted_picture_over_a_blurred_cover_copy() {
         assert_eq!(
-            blur_fill(1080, 1920, "", ":flags=bicubic", "bf0"),
+            blur_fill(1080, 1920, "", ":flags=bicubic", false, "bf0"),
             "split[bf0b][bf0f];\
              [bf0b]scale=134:240:force_original_aspect_ratio=increase:flags=bilinear,crop=134:240,\
              boxblur=8:2,scale=1080:1920:flags=bilinear[bf0bb];\
@@ -16742,8 +16746,28 @@ mod tests {
              [bf0bb][bf0ff]overlay=(W-w)/2:(H-h)/2"
         );
         // A tiny frame keeps a thumbnail whose chroma plane takes a radius of 1.
-        assert!(blur_fill(40, 24, ":force_divisible_by=2", "", "x")
+        assert!(blur_fill(40, 24, ":force_divisible_by=2", "", false, "x")
             .contains("scale=4:4:force_original_aspect_ratio=increase:flags=bilinear,crop=4:4,boxblur=1:2"));
+        // An HDR picture composes in 10 bits ahead of its tone-map, on even sizes.
+        let fmt = ExportFormat {
+            width: 1080,
+            height: 1920,
+            fit: Fit::Blur,
+            ..ExportFormat::default()
+        };
+        let hlg = ClipFx {
+            hdr: Some(Hdr::Hlg),
+            ..ClipFx::default()
+        };
+        let deep = video_clip_chain(&make_clip(Uuid::new_v4(), 0.0, 5.0, 0.0), &fmt, &hlg, false, "c0");
+        assert!(
+            deep.contains("decrease:force_divisible_by=2[bfc0ff];[bfc0bb][bfc0ff]overlay=(W-w)/2:(H-h)/2:format=yuv420p10,"),
+            "{deep}"
+        );
+        assert!(
+            deep.find(":format=yuv420p10").unwrap() < deep.find("zscale").unwrap(),
+            "{deep}"
+        );
         let asset = av_asset(Uuid::new_v4(), 30.0);
         let graph = |clip: Clip, fit: Fit| {
             let mut tl = single(vec![clip]);

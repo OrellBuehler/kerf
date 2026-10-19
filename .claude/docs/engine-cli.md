@@ -408,14 +408,15 @@ so the feature is **only** activated through these forwards — which is what ma
   mask: the fill would show through its clear part as a blurred halo — and not one of the frame's
   own shape or of an unprobed one (nothing to fill; it would cost ~7 ms a frame for nothing). Those
   are given a Contain format by the caller, so their argv is Contain's byte for byte (`pad`
-  included in the still). The still's thumbnail is an eighth of the *still's* canvas. **Limit:**
-  the `overlay` composes in 8-bit 4:2:0 (its default), so a 10-bit HLG / PQ picture is fitted at
-  8 bits ahead of its tone-map; `format=yuv420p10` would keep it, but FFmpeg 4.4 has no such
-  format. The GPU compositor refuses the whole frame (`Unsupported::BlurFill`, still and motion),
+  included in the still). The still's thumbnail is an eighth of the *still's* canvas. The
+  `overlay` composes in 8-bit 4:2:0 (its default) except for an HDR clip, fitted ahead of its
+  tone-map, which takes `format=yuv420p10` (FFmpeg 4.4 has it) so the fill does not band it; the
+  still tone-maps first, so it keeps the default. The GPU compositor refuses the whole frame (`Unsupported::BlurFill`, still and motion),
   so the preview is FFmpeg's. Rendered in `cli/blur_rendered.rs` (`#[ignore]`d, 6.1 and 9.0): a
   white / black source in a vertical frame keeps the picture, its bars are the picture blurred
   across the edge (Contain's are black), the still draws the export's frame (3 levels at worst),
-  and a half-transparent FFV1 source renders under Blur exactly as under Contain.
+  and a half-transparent FFV1 source renders under Blur exactly as under Contain; a 10-bit HLG ramp's
+  picture is Contain's to 2 levels (the tone-map's error diffusion), 5 with an 8-bit overlay.
   **The shape itself is a property of the project**, not of one render:
   `Timeline.format: Option<Delivery>` (`{width, height, fit}`) is the frame the cut
   is being made *for*. `export_format` applies it between the footage-derived
