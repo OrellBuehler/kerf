@@ -571,9 +571,10 @@ function locate(tl: Timeline, clipId: string): [Track, number] | null {
 function assetById(id: string): Asset | undefined {
 	return sampleAssets.find((a) => a.id === id);
 }
+/** `default_track` for an asset: the first unlocked track of its main kind (`ops.defaultTrack`). */
 function trackForAsset(tl: Timeline, assetId: string): Track {
 	const hasVideo = assetById(assetId)?.streams.some((s) => s.kind === 'video');
-	return tl.tracks.find((t) => t.kind === (hasVideo ? 'video' : 'audio')) ?? tl.tracks[0];
+	return ops.defaultTrack(tl, hasVideo ? 'video' : 'audio');
 }
 
 // ---- ripple mode (browser dev fallback) -----------------------------------
@@ -2406,6 +2407,8 @@ export async function moveClip(clipId: string, timelineStart: number, trackId?: 
 			// A clip with partners is moved as the group it is, through the group move.
 			return moveClips([{ clip_id: clipId, timeline_start: start, track_id: trackId }], link);
 		}
+		ops.ensureEditable(devTimeline, clipId);
+		if (trackId) ops.ensureTrackEditable(devTimeline, trackId);
 		const found = locate(devTimeline, clipId);
 		if (found) {
 			const [srcTrack, ci] = found;
@@ -2796,6 +2799,7 @@ export async function setTrackLocked(trackId: string, locked: boolean): Promise<
 
 export async function setClipEnabled(clipId: string, enabled: boolean): Promise<Timeline> {
 	if (!inTauri()) {
+		ops.ensureEditable(devTimeline, clipId);
 		const found = locate(devTimeline, clipId);
 		if (found) found[0].clips[found[1]].enabled = enabled;
 		recordDev(enabled ? 'Enable clip' : 'Disable clip');
@@ -3897,7 +3901,9 @@ export async function snapToBeats(trackId?: string, tolerance?: number): Promise
 		// its change to its partners (`carryLinksSince`, inside `ops.carrySince`).
 		devRun((tl) =>
 			ops.carrySince(tl, devEnv(false, undefined), (t) => {
-				const targets = t.tracks.filter((x) => (trackId ? x.id === trackId : x.kind === 'video'));
+				// A named track must be unlocked; named none, the unlocked video tracks (`Project::snap_to_beats`).
+				if (trackId) ops.ensureTrackEditable(t, trackId);
+				const targets = t.tracks.filter((x) => (trackId ? x.id === trackId : x.kind === 'video' && !x.locked));
 				for (const track of targets) alignCutsToBeats(track.clips, beats, tol, limitFor);
 			})
 		);

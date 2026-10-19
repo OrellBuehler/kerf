@@ -16,6 +16,19 @@
 //!   [`sharpen_plane`] is the filter on one plane. Exact, on every build.
 //! * **grayscale** is `hue=s=0`: U and V to 128, luma untouched; **invert** is `negate`: `255 - v` on
 //!   all three planes. Both are tables ([`GRAYSCALE`], [`INVERT`]), composed with `eq`'s.
+//! * **vignette** is `vignette` with its defaults (`vf_vignette.c`: angle `PI/5`, held as a `float` by
+//!   `av_clipf`; centre `w/2`, `h/2`; forward, `eval=init`, dither on) on a `yuv420p` picture. A factor per
+//!   luma sample, `cos(angle * d / dmax)^4` in `double` (`d` from the sample's offset to the centre, each
+//!   axis truncated to an integer; 0 past `dmax`, half the diagonal) stored as a `float` ([`vignette_map`]);
+//!   luma becomes `(int)(f * s + dither)` and chroma `(int)(f * (s - 127) + 127 + dither)` (chroma reads
+//!   the factor of its block's top-left luma sample), the products and the `+ 127` in `float`, the dither
+//!   added in `double`. The **dither** is an LCG (`state * 1664525 + 1013904223`, from 0), one step per sample,
+//!   Y then U then V in raster order, that **runs on across frames**: sample `i` of the filter's `n`th
+//!   frame is dithered by state number `n * samples_per_frame + i` ([`lcg_at`], its period is 2^32).
+//!   [`vignette_luma`] and [`vignette_chroma`] do the arithmetic in integers (the `float` roundings
+//!   made exactly, so no backend's contraction into a fused multiply-add can change a level), which is
+//!   what `vignette.wgsl` does; [`vignette_planes`] is the filter on a frame. Exact, held to FFmpeg's
+//!   output byte for byte.
 //!
 //! None of it is on the alpha plane (FFmpeg runs these ahead of `format=yuva420p`).
 
@@ -143,9 +156,332 @@ pub fn then(first: &[[u8; 256]; 3], next: &[[u8; 256]; 3]) -> [[u8; 256]; 3] {
     std::array::from_fn(|p| std::array::from_fn(|i| next[p][usize::from(first[p][i])]))
 }
 
+/// `vignette`'s LCG: `state * A + C`, from 0.
+pub const LCG_A: u32 = 1_664_525;
+pub const LCG_C: u32 = 1_013_904_223;
+
+/// The LCG's state after `i` steps from 0: the dither of sample `i` of the filter's run is this over 2^32.
+/// By halving (`O(log i)`): a row's first state in [`vignette_steps`].
+pub fn lcg_at(i: u32) -> u32 {
+    let (mut acc_a, mut acc_c) = (1u32, 0u32);
+    let (mut a, mut c) = (LCG_A, LCG_C);
+    let mut i = i;
+    while i > 0 {
+        if i & 1 == 1 {
+            acc_a = acc_a.wrapping_mul(a);
+            acc_c = acc_c.wrapping_mul(a).wrapping_add(c);
+        }
+        c = c.wrapping_mul(a.wrapping_add(1));
+        a = a.wrapping_mul(a);
+        i >>= 1;
+    }
+    acc_c
+}
+
+/// The LCG's states over a `w` x `h` plane whose first sample is step `base` of the run, as the shader
+/// reads them: `A^x` and `G_x` for each column (`state(i + x) = A^x * state(i) + G_x`), then each row's
+/// first state. A sample is then one multiply-add, where jumping to it is 32 steps.
+pub fn vignette_steps(base: u32, w: u32, h: u32) -> Vec<u32> {
+    let mut steps = Vec::with_capacity(2 * w as usize + h as usize);
+    let (mut a, mut g) = (1u32, 0u32);
+    let mut adds = Vec::with_capacity(w as usize);
+    for _ in 0..w {
+        steps.push(a);
+        adds.push(g);
+        a = a.wrapping_mul(LCG_A);
+        g = g.wrapping_mul(LCG_A).wrapping_add(LCG_C);
+    }
+    steps.extend(adds);
+    steps.extend((0..h).map(|r| lcg_at(base.wrapping_add(r.wrapping_mul(w)))));
+    steps
+}
+
+/// The samples `vignette` steps its dither through for a `w` x `h` `yuv420p` frame.
+pub fn vignette_samples(w: u32, h: u32) -> u64 {
+    let (cw, ch) = (u64::from(w.div_ceil(2)), u64::from(h.div_ceil(2)));
+    u64::from(w) * u64::from(h) + 2 * cw * ch
+}
+
+/// `vignette`'s factor for each luma sample of a `w` x `h` picture (`update_context` with the defaults),
+/// row by row: computed in `double` and stored as `float`, as the filter's `fmap` is.
+pub fn vignette_map(w: u32, h: u32) -> Vec<f32> {
+    // `av_clipf` clips the angle as a `float`: `PI/5` one `float` rounding up, which takes the factor a `float`
+    // step lower on some samples (a level, where the sum sits just over an integer).
+    let angle = f64::from((std::f64::consts::PI / 5.0) as f32);
+    let (x0, y0) = (f64::from(w) / 2.0, f64::from(h) / 2.0);
+    let dmax = (f64::from(w) / 2.0).hypot(f64::from(h) / 2.0);
+    let mut map = Vec::with_capacity(w as usize * h as usize);
+    for y in 0..h {
+        // `const int yy = (y - s->y0) * s->yscale`: truncated toward zero, the scale 1 (`setsar=1` comes first).
+        let yy = (f64::from(y) - y0) as i32;
+        for x in 0..w {
+            let xx = (f64::from(x) - x0) as i32;
+            let d = f64::from(xx).hypot(f64::from(yy)) / dmax;
+            let v = if d > 1.0 {
+                0.0
+            } else {
+                let c = (angle * d).cos();
+                (c * c) * (c * c)
+            };
+            map.push(v as f32);
+        }
+    }
+    map
+}
+
+/// `m` (non-zero) rounded to 24 significant bits, half to even, as a `float` holds it: the mantissa and
+/// how far it was shifted (`m ≈ mantissa << shift`).
+fn round24(m: u32) -> (u32, i32) {
+    let len = 32 - m.leading_zeros();
+    if len <= 24 {
+        return (m, 0);
+    }
+    let sh = len - 24;
+    let mut q = m >> sh;
+    let rem = m & ((1u32 << sh) - 1);
+    let half = 1u32 << (sh - 1);
+    if rem > half || (rem == half && q & 1 == 1) {
+        q += 1;
+    }
+    if q == 1 << 24 {
+        return (q >> 1, sh as i32 + 1);
+    }
+    (q, sh as i32)
+}
+
+/// A `float` factor as an integer mantissa and its power of two (`f = m * 2^e`); `None` for 0.
+fn factor(f: f32) -> Option<(u32, i32)> {
+    let bits = f.to_bits();
+    let exp = ((bits >> 23) & 0xff) as i32;
+    (exp != 0).then(|| ((bits & 0x7f_ffff) | 0x80_0000, exp - 127 - 23))
+}
+
+/// `(int)(v + state / 2^32)` for `v = m * 2^e`, `0 <= v <= 255` with no bit below 2^-32: the integer part,
+/// and one more when the fraction and the dither reach 1 (the `double` sum is exact here).
+fn floor_dithered(m: u32, e: i32, state: u32) -> u8 {
+    if m == 0 {
+        return 0;
+    }
+    let (int, frac) = if e >= 0 {
+        (m << e, 0)
+    } else {
+        (m >> -e, m & ((1u32 << -e) - 1))
+    };
+    // The fraction in 32 bits (`e >= -32` here: every value has a bit at 2^-25 or above).
+    let f32bits = if e >= 0 { 0 } else { frac << (32 + e) };
+    let carry = u32::from(f32bits != 0 && state >= f32bits.wrapping_neg());
+    (int + carry).min(255) as u8
+}
+
+/// One luma sample through `vignette`: `(int)(f * s + dither)`, the product in `float`.
+pub fn vignette_luma(f: f32, s: u8, state: u32) -> u8 {
+    let Some((mf, ef)) = factor(f) else {
+        return 0;
+    };
+    let p = mf * u32::from(s);
+    if p == 0 {
+        return 0;
+    }
+    let (m, sh) = round24(p);
+    floor_dithered(m, ef + sh, state)
+}
+
+/// One chroma sample through `vignette`: `(int)(f * (s - 127) + 127 + dither)`, the product and the
+/// sum in `float`.
+pub fn vignette_chroma(f: f32, s: u8, state: u32) -> u8 {
+    let d = i32::from(s) - 127;
+    let Some((mf, ef)) = factor(f).filter(|_| d != 0) else {
+        return 127;
+    };
+    let (mq, sh) = round24(mf * d.unsigned_abs());
+    let eq = ef + sh;
+    // `q + 127` exactly, in units of 2^eq (`eq` is -25 at the least, so 127 << 25 still fits).
+    let unit = 127u32 << -eq;
+    let sum = if d > 0 { unit + mq } else { unit - mq };
+    if sum == 0 {
+        return 0;
+    }
+    let (m, sh) = round24(sum);
+    floor_dithered(m, eq + sh, state)
+}
+
+/// A `w` x `h` `yuv420p` frame through `vignette`, the `n`th frame the filter has seen.
+pub fn vignette_planes(y: &[u8], u: &[u8], v: &[u8], w: u32, h: u32, n: u64) -> [Vec<u8>; 3] {
+    let map = vignette_map(w, h);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let mut i = (n.wrapping_mul(vignette_samples(w, h))) as u32;
+    let mut out_y = Vec::with_capacity(y.len());
+    for row in 0..h {
+        for x in 0..w {
+            let at = (row * w + x) as usize;
+            out_y.push(vignette_luma(map[at], y[at], lcg_at(i)));
+            i = i.wrapping_add(1);
+        }
+    }
+    let mut chroma = |plane: &[u8]| {
+        let mut out = Vec::with_capacity(plane.len());
+        for row in 0..ch {
+            for x in 0..cw {
+                let f = map[((row * 2) * w + x * 2) as usize];
+                out.push(vignette_chroma(f, plane[(row * cw + x) as usize], lcg_at(i)));
+                i = i.wrapping_add(1);
+            }
+        }
+        out
+    };
+    let out_u = chroma(u);
+    let out_v = chroma(v);
+    [out_y, out_u, out_v]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plane_s_steps_are_the_lcg_at_every_sample() {
+        for (base, w, h) in [(0u32, 7u32, 5u32), (123_456_789, 13, 4), (u32::MAX - 20, 9, 6)] {
+            let steps = vignette_steps(base, w, h);
+            let (pow, add, rows) = (
+                &steps[..w as usize],
+                &steps[w as usize..2 * w as usize],
+                &steps[2 * w as usize..],
+            );
+            for y in 0..h {
+                for x in 0..w {
+                    let at = pow[x as usize].wrapping_mul(rows[y as usize]).wrapping_add(add[x as usize]);
+                    assert_eq!(at, lcg_at(base.wrapping_add(y * w + x)), "{base} {x},{y}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_lcg_is_jumped_to_where_stepping_gets() {
+        let mut state = 0u32;
+        for i in 0..5000u32 {
+            assert_eq!(lcg_at(i), state, "step {i}");
+            state = state.wrapping_mul(LCG_A).wrapping_add(LCG_C);
+        }
+        // Its period is 2^32: an index past it is the same state.
+        assert_eq!(lcg_at(7), lcg_at(7));
+        assert_eq!(lcg_at(1), LCG_C);
+    }
+
+    /// What the C code computes, in the C code's own precision.
+    fn direct(f: f32, s: u8, state: u32, chroma: bool) -> u8 {
+        let dv = f64::from(state) / 4_294_967_296.0;
+        let v = if chroma {
+            f64::from(f * (f32::from(s) - 127.0) + 127.0) + dv
+        } else {
+            f64::from(f * f32::from(s)) + dv
+        };
+        (v as i32).clamp(0, 255) as u8
+    }
+
+    #[test]
+    fn the_integer_arithmetic_is_the_float_and_double_arithmetic_of_the_filter() {
+        // The factors of a real map (and the ends of their range), every sample value, and dithers that
+        // fall either side of each fraction.
+        let mut factors: Vec<f32> = vignette_map(97, 55).into_iter().step_by(7).collect();
+        factors.extend([0.0, 1.0, 0.999_999_94, 0.428_9, f32::from_bits(1.0f32.to_bits() - 1)]);
+        let mut seen = 0u64;
+        for &f in &factors {
+            for s in 0..=255u8 {
+                for chroma in [false, true] {
+                    let base = f64::from(if chroma {
+                        f * (f32::from(s) - 127.0) + 127.0
+                    } else {
+                        f * f32::from(s)
+                    });
+                    let frac = base - base.floor();
+                    let edge = ((1.0 - frac) * 4_294_967_296.0) as u64;
+                    for state in [0u64, 1, edge.saturating_sub(1), edge, edge + 1, u64::from(u32::MAX), 1 << 31] {
+                        let state = state.min(u64::from(u32::MAX)) as u32;
+                        let got = if chroma {
+                            vignette_chroma(f, s, state)
+                        } else {
+                            vignette_luma(f, s, state)
+                        };
+                        assert_eq!(
+                            got,
+                            direct(f, s, state, chroma),
+                            "f {f:e} s {s} chroma {chroma} state {state}"
+                        );
+                        seen += 1;
+                    }
+                }
+            }
+        }
+        assert!(seen > 300_000);
+    }
+
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn the_reference_is_ffmpegs_vignette_frame_after_frame() {
+        // A flat 640x360 picture of Y 81, U and V 166 has seven samples in ten frames whose sum sits a few
+        // millionths over an integer: they hold the factor to the `float` angle's.
+        for (w, h, frames, flat) in [(96u32, 54u32, 4u64, false), (97, 55, 4, false), (640, 360, 10, true)] {
+            let size = format!("{w}x{h}");
+            let src = if flat {
+                let (luma, chroma) = ((w * h) as usize, (w.div_ceil(2) * h.div_ceil(2)) as usize);
+                let frame: Vec<u8> = [vec![81; luma], vec![166; 2 * chroma]].concat();
+                frame.repeat(frames as usize)
+            } else {
+                let out = kerf_core::ffmpeg_command()
+                    .args(["-v", "error", "-f", "lavfi", "-i"])
+                    .arg(format!("testsrc2=size=128x72:rate=30:duration=1,scale={w}:{h}"))
+                    .args(["-frames:v", &frames.to_string(), "-pix_fmt", "yuv420p", "-f", "rawvideo", "-"])
+                    .output()
+                    .expect("ffmpeg");
+                assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+                out.stdout
+            };
+            let mut child = kerf_core::ffmpeg_command()
+                .args([
+                    "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", &size, "-r", "30", "-i", "-",
+                ])
+                .args(["-vf", "vignette", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .expect("ffmpeg");
+            let mut stdin = child.stdin.take().expect("stdin");
+            let input = src.clone();
+            let feed = std::thread::spawn(move || std::io::Write::write_all(&mut stdin, &input));
+            let out = child.wait_with_output().expect("ffmpeg");
+            feed.join().unwrap().expect("fed");
+            let per = vignette_samples(w, h) as usize;
+            assert_eq!(out.stdout.len(), per * frames as usize);
+            let (luma, chroma) = ((w * h) as usize, (w.div_ceil(2) * h.div_ceil(2)) as usize);
+            for n in 0..frames {
+                let at = n as usize * per;
+                let planes = |b: &[u8]| {
+                    (
+                        b[at..at + luma].to_vec(),
+                        b[at + luma..at + luma + chroma].to_vec(),
+                        b[at + luma + chroma..at + per].to_vec(),
+                    )
+                };
+                let (y, u, v) = planes(&src);
+                let (fy, fu, fv) = planes(&out.stdout);
+                let [gy, gu, gv] = vignette_planes(&y, &u, &v, w, h, n);
+                assert!(gy == fy && gu == fu && gv == fv, "{w}x{h} frame {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_map_is_one_in_the_middle_falls_off_and_is_zero_past_half_the_diagonal() {
+        let (w, h) = (64u32, 36u32);
+        let map = vignette_map(w, h);
+        let at = |x: u32, y: u32| map[(y * w + x) as usize];
+        assert_eq!(at(32, 18), 1.0);
+        assert!(at(0, 0) > 0.0 && at(0, 0) < at(16, 9) && at(16, 9) < at(32, 18));
+        // The corner is at half the diagonal: cos(PI/5)^4.
+        let corner = (std::f64::consts::PI / 5.0).cos().powi(4) as f32;
+        assert!((at(0, 0) - corner).abs() < 1e-3, "{}", at(0, 0));
+    }
 
     #[test]
     fn a_flat_plane_stays_flat_under_a_blur() {

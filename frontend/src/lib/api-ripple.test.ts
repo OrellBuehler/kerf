@@ -128,8 +128,9 @@ describe('ripple mode (browser harness)', () => {
 		await withFourthClip();
 		await setRippleMode(true);
 		await setTrackLocked('v1', true);
-		const t = await trimClip('c1', 0, 10);
-		expect(starts(t, 0)).toEqual([0, 12.5, 24]);
+		// A trim on it is refused outright (`Timeline::ensure_editable`), so nothing on it moves.
+		await expect(trimClip('c1', 0, 10)).rejects.toThrow('track V1 is locked');
+		expect(starts(await getTimeline(), 0)).toEqual([0, 12.5, 24]);
 	});
 
 	test('a trim that makes a clip empty is refused, as the backend refuses it', async () => {
