@@ -10011,6 +10011,10 @@ mod blur_rendered;
 #[cfg(test)]
 mod late_start;
 
+/// The master limiter through the real `ffmpeg`, the corpus the preview's port replays (`#[ignore]`d).
+#[cfg(test)]
+mod alimiter_corpus;
+
 /// A keyframed zoom with every other feature of a clip, measured per output frame
 /// against `transform_at` and the scrubbed still (`#[ignore]`d).
 #[cfg(test)]

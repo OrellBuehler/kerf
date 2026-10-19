@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { fxSummary, loadMasterFxOpen, MASTER_FX_KEY, saveMasterFxOpen } from './master-fx';
+import { fxSummary, limiterNote, loadMasterFxOpen, MASTER_FX_KEY, saveMasterFxOpen } from './master-fx';
 
 describe('the folded FX line', () => {
   const bus = { limiter: false, ceiling_db: -1.5, duck_depth_db: null as number | null | undefined };
@@ -38,5 +38,25 @@ describe('remembering the block', () => {
       delete (globalThis as { localStorage?: unknown }).localStorage;
     }
     expect(loadMasterFxOpen()).toBe(false);
+  });
+});
+
+describe('what the limiter tooltips say about the preview', () => {
+  test('the worklet runs the export’s limiter, on the preview’s own mix', () => {
+    const note = limiterNote('exact');
+    expect(note).toContain('runs the export’s limiter');
+    expect(note).toContain('on the preview’s mix');
+    expect(note).toContain('mono 32 kHz');
+    expect(note).toContain('no ducking');
+    expect(note).not.toContain('approximation');
+  });
+
+  test('the fallback says it approximates, and nothing claims to be the export', () => {
+    expect(limiterNote('approximate')).toContain('approximation');
+    expect(limiterNote('pending')).toContain('approximation until then');
+    for (const kind of ['exact', 'approximate', 'pending'] as const) {
+      expect(limiterNote(kind)).not.toContain('as it will export');
+      expect(limiterNote(kind)).toContain('Measure reads the exported mix.');
+    }
   });
 });

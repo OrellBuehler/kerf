@@ -4,8 +4,9 @@
 	// limiter are edits like any other (one per gesture, in the history); while they
 	// are held the preview follows them (`audio.liveMaster`).
 	//
-	// The preview's limiter is an approximation — a compressor with a hard knee at the
-	// ceiling — and the toggle's tooltip says so; Measure reads the real thing.
+	// The preview's limiter is the export's own (`alimiter`, ported sample for sample and run
+	// in an AudioWorklet by `audio.ts`) on the preview's mix — or, where the worklet cannot run, an
+	// approximation; the tooltips say which (`limiterNote`, from `audio.limiterKind()`).
 	//
 	// The limiter, its ceiling and the duck mode are the strip's FX block: folded by default and remembered
 	// (`master-fx.ts`), so the fader gets the strip's height and a limiter that is on still says so.
@@ -41,7 +42,7 @@
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import type { MasterBus } from '#lib/types';
 	import type { MeasureResult } from '#lib/editor-ui.svelte';
-	import { fxSummary, loadMasterFxOpen, saveMasterFxOpen } from '#lib/master-fx';
+	import { fxSummary, limiterNote, loadMasterFxOpen, saveMasterFxOpen } from '#lib/master-fx';
 	import { settings } from '#lib/settings.svelte';
 	import { tip } from '#lib/tip';
 
@@ -93,8 +94,10 @@
 
 	const err = report;
 
-	const APPROX =
-		'The export runs a lookahead limiter (alimiter). The preview plays an approximation — a compressor with a hard knee at the ceiling — so a very hot mix can read a little over it. Measure reads the real thing.';
+	/** Which limiter the preview plays, kept as the engine learns it. */
+	let limiterKind = $state(audio.limiterKind());
+	$effect(() => audio.onLimiterKind((kind) => (limiterKind = kind)));
+	const LIMITER_NOTE = $derived(limiterNote(limiterKind));
 
 	// ---- the fader ----------------------------------------------------------
 	function fadePreview(v: number) {
@@ -213,8 +216,8 @@
 				class:on={master.limiter}
 				aria-pressed={master.limiter}
 				use:tip={master.limiter
-					? `Limiter on — holds the finished mix under ${ceilingLabel(master.ceiling_db)}. ${APPROX}`
-					: `Limiter off — turn it on to hold the finished mix under the ceiling. ${APPROX}`}
+					? `Limiter on — holds the finished mix under ${ceilingLabel(master.ceiling_db)}. ${LIMITER_NOTE}`
+					: `Limiter off — turn it on to hold the finished mix under the ceiling. ${LIMITER_NOTE}`}
 				onclick={toggleLimiter}>Limiter</button
 			>
 			<div class="ceiling" class:dim={!master.limiter}>
@@ -230,7 +233,7 @@
 						valueText={ceilingLabel}
 						tip="Limiter ceiling {ceilingLabel(ceiling)} — the level the finished mix is held under. Drag, or ← → to nudge {CEILING_STEP.normal} dB ({settings.modLabel('shift')} {CEILING_STEP.coarse}, {settings.modLabel('alt')} {CEILING_STEP.fine}); double-click for {ceilingLabel(
 							MASTER_DEFAULT_CEILING_DB
-						)}. {APPROX}"
+						)}. {LIMITER_NOTE}"
 						detent={ceilingToPos(MASTER_DEFAULT_CEILING_DB)}
 						accent="var(--text-muted)"
 						onpreview={ceilingMove}

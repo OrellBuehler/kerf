@@ -239,6 +239,15 @@ struct BlurParams {
     pad: [f32; 3],
 }
 
+/// `vignette.wgsl`'s uniform: one plane (its dither is in [`effects::vignette_steps`]).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct VignetteParams {
+    size: [u32; 2],
+    map_w: u32,
+    chroma: u32,
+}
+
 /// One plane on the GPU. A handle: cloning shares the texture.
 #[derive(Clone)]
 struct Plane {
@@ -290,6 +299,7 @@ pub struct Compositor {
     text: TextPass,
     ops: PlaneOps,
     masks: MaskCache,
+    vignettes: VignetteMaps,
     /// What FFmpeg's `geq` does at a plane's last column and row, when the host knows it: else probed.
     geq_edge: Option<GeqEdge>,
 }
@@ -307,6 +317,65 @@ struct PlaneOps {
     blur_v: wgpu::ComputePipeline,
     blur_out_layout: wgpu::BindGroupLayout,
     blur_out: wgpu::RenderPipeline,
+    vignette_layout: wgpu::BindGroupLayout,
+    vignette: wgpu::RenderPipeline,
+}
+
+/// `vignette`'s factor map for one picture size ([`effects::vignette_map`], as `float` bits) on the GPU,
+/// made once because it does not change (the filter's `eval=init`).
+struct VignetteMap {
+    w: u32,
+    h: u32,
+    gpu: wgpu::Buffer,
+}
+
+/// The vignette maps in use, newest first: a few sizes at once (a cut's clips at their fit sizes).
+#[derive(Default)]
+struct VignetteMaps(Mutex<Vec<Arc<VignetteMap>>>);
+
+/// How many sizes of vignette map are kept.
+const VIGNETTE_MAPS: usize = 4;
+
+impl VignetteMaps {
+    fn held(&self, w: u32, h: u32) -> Option<Arc<VignetteMap>> {
+        let mut maps = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = maps.iter().position(|m| (m.w, m.h) == (w, h))?;
+        let map = maps.remove(at);
+        maps.insert(0, Arc::clone(&map));
+        Some(map)
+    }
+
+    /// The map for `w` x `h`, made (tens of milliseconds at 1080p) outside the lock when it is not held.
+    fn get(&self, device: &wgpu::Device, w: u32, h: u32) -> Arc<VignetteMap> {
+        if let Some(map) = self.held(w, h) {
+            return map;
+        }
+        let bits: Vec<u32> = effects::vignette_map(w, h).into_iter().map(f32::to_bits).collect();
+        let gpu = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("vignette map"),
+            contents: bytemuck::cast_slice(&bits),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        if let Some(map) = self.held(w, h) {
+            return map;
+        }
+        let map = Arc::new(VignetteMap { w, h, gpu });
+        let mut maps = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        maps.insert(0, Arc::clone(&map));
+        maps.truncate(VIGNETTE_MAPS);
+        map
+    }
+}
+
+/// Where the frames a layer's chain has passed on so far come from, for a filter that counts them
+/// (`vignette`'s dither): a still graph runs the one frame it shows through the chain (0); an export
+/// frame needs the clip's own count, which only the cursor that reads it knows ([`MotionFrames::counts`]).
+#[derive(Clone, Copy)]
+enum Counts<'a> {
+    /// No counts: a Still plan's layers are 0, an export frame that needs one is refused.
+    None,
+    /// One per layer of the plan, in layer order.
+    Of(&'a [Option<u64>]),
 }
 
 /// A mask's alpha plane for one picture size (`kerf_core::mask_alpha_plane`), made once because a
@@ -421,6 +490,8 @@ enum Step {
     Table(Box<[[u8; 256]; 3]>),
     Blur(Gaussian),
     Sharpen(i32),
+    /// `vignette`, dithered from the layer's frame count ([`Drawn::count`]).
+    Vignette,
 }
 
 /// What drawing overlays needs: `text.wgsl`'s pipeline, a mask for the blends that have none (the
@@ -500,6 +571,8 @@ struct Drawn<'a> {
     filters: Vec<[PlaneFilters; 3]>,
     fades: LayerFades,
     look: LayerLook,
+    /// The frames the layer's chain has passed on before this one (`vignette`'s dither runs on from them).
+    count: u64,
 }
 
 /// What the `fade` filters of a layer's chain do at this frame, as the passes take them:
@@ -684,7 +757,8 @@ impl Compositor {
         caps.effects = EffectKinds::BLUR
             .union(EffectKinds::SHARPEN)
             .union(EffectKinds::GRAYSCALE)
-            .union(EffectKinds::INVERT);
+            .union(EffectKinds::INVERT)
+            .union(EffectKinds::VIGNETTE);
         caps
     };
 
@@ -944,6 +1018,7 @@ impl Compositor {
                 },
                 ops,
                 masks: MaskCache::default(),
+                vignettes: VignetteMaps::default(),
                 geq_edge: None,
             })
         })
@@ -1058,6 +1133,20 @@ impl Compositor {
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/blur_out.wgsl").into()),
         });
         let blur_out = render("blur out", &out_module, &blur_out_layout, "fs_out");
+        let vignette_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("vignette"),
+            entries: &[
+                entry(0, uniform, wgpu::ShaderStages::FRAGMENT),
+                entry(1, texture, wgpu::ShaderStages::FRAGMENT),
+                entry(2, storage(true), wgpu::ShaderStages::FRAGMENT),
+                entry(3, storage(true), wgpu::ShaderStages::FRAGMENT),
+            ],
+        });
+        let vignette_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kerf vignette"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/vignette.wgsl").into()),
+        });
+        let vignette = render("vignette", &vignette_module, &vignette_layout, "fs_vignette");
         PlaneOps {
             layout,
             lut,
@@ -1069,6 +1158,8 @@ impl Compositor {
             blur_v,
             blur_out_layout,
             blur_out,
+            vignette_layout,
+            vignette,
         }
     }
 
@@ -1474,6 +1565,67 @@ impl Compositor {
         [out, input[1].clone(), input[2].clone()]
     }
 
+    /// `vignette` on the three planes of the `count`th frame the layer's chain has passed on: each sample's
+    /// dither is the LCG's state at its step in the filter's run (`effects.rs`).
+    fn vignette_planes(&self, enc: &mut wgpu::CommandEncoder, input: &[Plane; 3], count: u64) -> [Plane; 3] {
+        let device = &self.gpu.device;
+        let (w, h) = (input[0].w, input[0].h);
+        let map = self.vignettes.get(device, w, h);
+        let buffer = &map.gpu;
+        // The run's step at this frame's first sample, then each plane's: Y, U, V in turn.
+        let start = count.wrapping_mul(effects::vignette_samples(w, h));
+        let luma = u64::from(w) * u64::from(h);
+        let chroma = u64::from(input[1].w) * u64::from(input[1].h);
+        let offsets = [0, luma, luma + chroma];
+        std::array::from_fn(|pi| {
+            let plane = &input[pi];
+            let params = VignetteParams {
+                size: [plane.w, plane.h],
+                map_w: w,
+                chroma: u32::from(pi > 0),
+            };
+            let steps = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("vignette steps"),
+                contents: bytemuck::cast_slice(&effects::vignette_steps(
+                    start.wrapping_add(offsets[pi]) as u32,
+                    plane.w,
+                    plane.h,
+                )),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("vignette params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("vignette"),
+                layout: &self.ops.vignette_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: ubuf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&plane.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: steps.as_entire_binding(),
+                    },
+                ],
+            });
+            let out = self.out_plane("vignetted", plane);
+            self.pass(enc, &self.ops.vignette, &out.view, &bind, None, None);
+            out
+        })
+    }
+
     /// `gblur` on all three planes, each at its own size with the same sigma.
     fn blur_planes(&self, enc: &mut wgpu::CommandEncoder, input: &[Plane; 3], g: &Gaussian) -> [Plane; 3] {
         let device = &self.gpu.device;
@@ -1644,6 +1796,19 @@ impl Compositor {
                     split = true;
                     steps.push(Step::Sharpen(a));
                 }
+                VideoEffect::Vignette => {
+                    let limit = self.gpu.device.limits().max_storage_buffer_binding_size;
+                    if u64::from(pw) * u64::from(ph) * 4 > limit {
+                        return Err(unsupported(format!(
+                            "a vignette of a {pw}x{ph} picture, over this device's {limit}-byte storage buffer"
+                        )));
+                    }
+                    if let Some(table) = pending.take() {
+                        steps.push(Step::Table(Box::new(table)));
+                    }
+                    split = true;
+                    steps.push(Step::Vignette);
+                }
                 other => return Err(unsupported(format!("the {} effect is not drawn", other.name()))),
             }
         }
@@ -1717,6 +1882,19 @@ impl Compositor {
         self.composite_as(plan, frames, size, Output::Rgb)?.pixels()
     }
 
+    /// [`Compositor::composite_shared`] with each layer's frame count ([`crate::MotionFrames::counts`]),
+    /// which an export frame's `vignette` needs.
+    pub fn composite_counted(
+        &self,
+        plan: &RenderPlan,
+        frames: &[Option<Arc<YuvFrame>>],
+        counts: &[Option<u64>],
+        size: (u32, u32),
+    ) -> Result<RgbaFrame, GpuError> {
+        self.composite_texts(plan, frames, size, Output::Rgb, Texts::Cut, Counts::Of(counts))?
+            .pixels()
+    }
+
     /// [`Compositor::composite`] stopping before the final YUV -> RGB conversion:
     /// the canvas as the 8-bit Y, U and V planes the layers were blended in (the
     /// chroma planes at half size). It exists so the scaler and the blend can be
@@ -1724,7 +1902,7 @@ impl Compositor {
     /// A plan with overlays and no layer is `Unsupported`: its text is blended in RGB, and
     /// returning the black planes without it would be a frame that silently lacks its text.
     pub fn composite_yuv(&self, plan: &RenderPlan, frames: &[Option<YuvFrame>], size: (u32, u32)) -> Result<YuvFrame, GpuError> {
-        self.yuv_planes(plan, frames, size)
+        self.yuv_planes(plan, frames, Counts::None, size)
     }
 
     /// [`Compositor::composite_yuv`] over shared frames (a [`crate::MotionFrames`]'s or a [`FrameSource`]'s).
@@ -1734,16 +1912,31 @@ impl Compositor {
         frames: &[Option<Arc<YuvFrame>>],
         size: (u32, u32),
     ) -> Result<YuvFrame, GpuError> {
-        self.yuv_planes(plan, frames, size)
+        self.yuv_planes(plan, frames, Counts::None, size)
+    }
+
+    /// [`Compositor::composite_yuv_shared`] with each layer's frame count ([`crate::MotionFrames::counts`]),
+    /// which an export frame's `vignette` needs.
+    pub fn composite_yuv_counted(
+        &self,
+        plan: &RenderPlan,
+        frames: &[Option<Arc<YuvFrame>>],
+        counts: &[Option<u64>],
+        size: (u32, u32),
+    ) -> Result<YuvFrame, GpuError> {
+        self.yuv_planes(plan, frames, Counts::Of(counts), size)
     }
 
     fn yuv_planes<F: Borrow<YuvFrame>>(
         &self,
         plan: &RenderPlan,
         frames: &[Option<F>],
+        counts: Counts,
         size: (u32, u32),
     ) -> Result<YuvFrame, GpuError> {
-        let canvas = self.composite_as(plan, frames, size, Output::Yuv)?.pixels()?;
+        let canvas = self
+            .composite_texts(plan, frames, size, Output::Yuv, Texts::Cut, counts)?
+            .pixels()?;
         let (w, h) = (canvas.width as usize, canvas.height as usize);
         let at = |x: usize, y: usize, c: usize| canvas.data[(y * w + x) * 4 + c];
         let chroma = |c: usize| -> Vec<u8> {
@@ -1771,7 +1964,7 @@ impl Compositor {
         size: (u32, u32),
         output: Output,
     ) -> Result<Rendered, GpuError> {
-        self.composite_texts(plan, frames, size, output, Texts::Cut)
+        self.composite_texts(plan, frames, size, output, Texts::Cut, Counts::None)
     }
 
     fn composite_texts<F: Borrow<YuvFrame>>(
@@ -1781,6 +1974,7 @@ impl Compositor {
         size: (u32, u32),
         output: Output,
         texts: Texts,
+        counts: Counts,
     ) -> Result<Rendered, GpuError> {
         let reasons = plan.reasons(&self.caps(), size);
         if !reasons.is_empty() {
@@ -1865,6 +2059,11 @@ impl Compositor {
             }
             let fades = LayerFades::of(plan, layer, &geom)?;
             let look = self.look_of(layer, &geom)?;
+            let count = if look.steps.iter().any(|s| matches!(s, Step::Vignette)) {
+                layer_count(plan, n, counts)?
+            } else {
+                0
+            };
             drawn.push(Drawn {
                 layer,
                 frame,
@@ -1872,6 +2071,7 @@ impl Compositor {
                 filters,
                 fades,
                 look,
+                count,
             });
         }
         // FFmpeg rasterises what text there is, here, before the GPU is touched. No project lock is
@@ -1973,6 +2173,7 @@ impl Compositor {
             filters,
             fades,
             look,
+            count,
         } in drawn
         {
             let (cw, ch) = frame.chroma_size();
@@ -2007,6 +2208,7 @@ impl Compositor {
                     Step::Table(rows) => self.table_planes(&mut enc, &current, rows),
                     Step::Blur(g) => self.blur_planes(&mut enc, &current, g),
                     Step::Sharpen(amount) => self.sharpen_planes(&mut enc, &current, *amount),
+                    Step::Vignette => self.vignette_planes(&mut enc, &current, *count),
                 };
             }
             // (Where the zoom comes last the planes are shifted here, ahead of the zoom's scale; else
@@ -2525,7 +2727,7 @@ impl Compositor {
         let frames = source.frames(&plan.layers, hint)?;
         let decode = t0.elapsed();
         let t1 = Instant::now();
-        let rendered = match self.composite_texts(plan, &frames, size, Output::Texture, texts)? {
+        let rendered = match self.composite_texts(plan, &frames, size, Output::Texture, texts, Counts::None)? {
             Rendered::Texture(texture) => texture,
             Rendered::Pixels(_) => return Err(GpuError::Gpu("pixels were rendered where a texture was asked for".into())),
         };
@@ -2571,10 +2773,11 @@ impl Compositor {
         })?;
         let decode = t0.elapsed();
         let t1 = Instant::now();
-        let rendered = match self.composite_as(plan, &frames, size, Output::Texture)? {
-            Rendered::Texture(texture) => texture,
-            Rendered::Pixels(_) => return Err(GpuError::Gpu("pixels were rendered where a texture was asked for".into())),
-        };
+        let rendered =
+            match self.composite_texts(plan, &frames, size, Output::Texture, Texts::Cut, Counts::Of(motion.counts()))? {
+                Rendered::Texture(texture) => texture,
+                Rendered::Pixels(_) => return Err(GpuError::Gpu("pixels were rendered where a texture was asked for".into())),
+            };
         Ok((
             rendered,
             RenderTimings {
@@ -2591,6 +2794,24 @@ impl Compositor {
     /// costs nothing.
     pub fn warm_text(&self, plan: &RenderPlan, size: (u32, u32)) -> Result<(), GpuError> {
         self.prepare_text(plan, size, Texts::Cut).map(|_| ())
+    }
+}
+
+/// How many frames layer `n`'s chain has passed on before this one: none in a still graph (it runs
+/// the one frame it shows through the chain); an export frame's is its clip's, counted by the cursor.
+fn layer_count(plan: &RenderPlan, n: usize, counts: Counts) -> Result<u64, GpuError> {
+    if plan.mode == kerf_core::PlanMode::Still {
+        return Ok(0);
+    }
+    match counts {
+        Counts::Of(counts) => counts.get(n).copied().flatten().ok_or_else(|| {
+            GpuError::Unsupported(format!(
+                "layer {n}: a vignette on a frame whose place in its clip is not known"
+            ))
+        }),
+        Counts::None => Err(GpuError::Unsupported(
+            "a vignette in an export frame needs its clip's frames counted".into(),
+        )),
     }
 }
 

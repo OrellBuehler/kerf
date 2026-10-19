@@ -332,7 +332,7 @@ fn play(case: Case) -> (usize, i32, f64) {
         assert!(why.is_empty(), "{name}: frame {j}: the plan is refused: {why:?}");
         let pictures = motion.frames(&plan).unwrap_or_else(|e| panic!("{name}: frame {j}: {e}"));
         let drawn = compositor()
-            .composite_yuv_shared(&plan, &pictures, size)
+            .composite_yuv_counted(&plan, &pictures, motion.counts(), size)
             .unwrap_or_else(|e| panic!("{name}: frame {j}: {e}"));
         let index = match against {
             Against::Slice => j as usize,

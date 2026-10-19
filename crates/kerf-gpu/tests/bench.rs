@@ -501,7 +501,7 @@ fn bench_a_frame_inside_a_transition() {
     let _ = std::fs::write(out.join("bench-transitions.txt"), &report);
 }
 
-/// A moving zoom, a mask and the effects, frame by frame: FFmpeg's own still of the frame, and the
+/// A moving zoom, a mask and the effects (a vignette among them), frame by frame: FFmpeg's own still of the frame, and the
 /// export graph's per-frame cost (what `geq` costs: 93 ms of CPU a 960x540 frame and 402 ms at 1080p
 /// in the review), against the compositor — a still (decode, then the passes and the readback) and an
 /// export frame through `MotionFrames`, forward, the mask plane already made (a mask does not move: it
@@ -553,6 +553,7 @@ fn bench_a_mask_a_blur_and_a_moving_zoom() {
             "sharpen 0.5",
             Box::new(|c| c.effects = vec![VideoEffect::Sharpen { amount: 0.5 }]),
         ),
+        ("vignette", Box::new(|c| c.effects = vec![VideoEffect::Vignette])),
         (
             "keyed opacity 1 -> 0.3",
             Box::new(|c| {
@@ -670,7 +671,8 @@ fn bench_a_mask_a_blur_and_a_moving_zoom() {
                 let plan = planner.at_frame(k).expect("plan");
                 assert!(plan.reasons(&Compositor::CAPS, size).is_empty(), "{label} frame {k}");
                 let frames = motion.frames(&plan).expect("cursor frames");
-                comp.composite_shared(&plan, &frames, size).expect("composite");
+                comp.composite_counted(&plan, &frames, motion.counts(), size)
+                    .expect("composite");
             }
             let gpu_time = t0.elapsed();
             if run > 0 {
