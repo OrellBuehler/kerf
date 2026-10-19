@@ -148,7 +148,11 @@ export const EASING_CHOICES: { id: string; label: string; easing: Easing }[] = [
 	{ id: 'hold', label: 'Hold', easing: 'hold' },
 	{ id: 'snappy', label: 'Snappy', easing: { bezier: { x1: 0.2, y1: 0.9, x2: 0.3, y2: 1 } } },
 	{ id: 'gentle', label: 'Gentle', easing: { bezier: { x1: 0.45, y1: 0.05, x2: 0.55, y2: 0.95 } } },
-	{ id: 'drift', label: 'Drift', easing: { bezier: { x1: 0.1, y1: 0.6, x2: 0.4, y2: 1 } } }
+	{ id: 'drift', label: 'Drift', easing: { bezier: { x1: 0.1, y1: 0.6, x2: 0.4, y2: 1 } } },
+	{ id: 'glide', label: 'Glide', easing: { bezier: { x1: 0.3, y1: 0, x2: 0.15, y2: 1 } } },
+	{ id: 'settle', label: 'Settle', easing: { bezier: { x1: 0.05, y1: 0.75, x2: 0.25, y2: 1 } } },
+	{ id: 'lift', label: 'Lift', easing: { bezier: { x1: 0.55, y1: 0, x2: 0.85, y2: 0.45 } } },
+	{ id: 'whip', label: 'Whip', easing: { bezier: { x1: 0.8, y1: 0, x2: 0.2, y2: 1 } } }
 ];
 
 /** The menu entry an easing is (custom beziers that match none read as `custom`). */

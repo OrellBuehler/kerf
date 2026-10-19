@@ -193,7 +193,18 @@ describe('fitZoom', () => {
 	test('puts the whole cut, and the lane tail, in the visible width', () => {
 		const z = fitZoom(120, 1248)!;
 		expect(z).toBeCloseTo((1248 - LANE_TAIL_PX) / 120, 9);
-		expect(laneWidth(120, z)).toBeLessThanOrEqual(1248 + 1);
+		expect(laneWidth(120, z)).toBe(1248);
+	});
+
+	test('a fitted lane is never a pixel wider than the width it was fitted to', () => {
+		// Fitted to 1010 px, a 30 s cut has 962 px of room, and 962 / 30 * 30 is 962.0000000000001:
+		// rounded up, a 1011 px lane, a scrollbar.
+		for (const duration of [30, 29.99, 20.5, 47, 12.34]) {
+			for (let viewW = LANE_MIN_PX; viewW <= 4000; viewW++) {
+				const z = fitZoom(duration, viewW)!;
+				if (z < ZOOM_MAX) expect(laneWidth(duration, z)).toBeLessThanOrEqual(viewW);
+			}
+		}
 	});
 
 	test('a short cut zooms in to fill the width', () => {

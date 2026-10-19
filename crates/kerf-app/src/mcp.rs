@@ -18,9 +18,9 @@ use base64::Engine as _;
 use kerf_core::{
     AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipLut, ClipMove,
     CurvePoint, Curves, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property,
-    PropertyKey, ReframeKeyframe, Region, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout, SvgOverlay, SvgOverlayPatch,
-    SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange, Timeline, Transition,
-    TransitionKind, VideoEffect, Wheel, Wheels,
+    PropertyKey, PropertyTrack, ReframeKeyframe, Region, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout, SvgOverlay,
+    SvgOverlayPatch, SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange, Timeline,
+    Transition, TransitionKind, VideoEffect, Wheel, Wheels,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
@@ -1305,6 +1305,37 @@ struct PropertyKeyframesParams {
                        0.1–10, volume 0–4 (linear gain), scale > 0. At most 1000 keys."
     )]
     keys: Vec<PropertyKey>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PropertyTracksParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(
+        description = "The numbers to re-key, each {\"prop\":name, \"keys\":[...]} exactly as set_property_keyframes \
+                       takes its prop and keys (pass [] keys to make that number static). Each number at most once; \
+                       numbers not listed are untouched."
+    )]
+    tracks: Vec<PropertyTrackArg>,
+}
+
+/// One number's keys for `set_property_tracks`: the model's [`PropertyTrack`] with `keys` required
+/// and a key it does not name (`key`) refused — the persisted type reads either as no keys, which
+/// would silently make the number static.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PropertyTrackArg {
+    prop: Property,
+    keys: Vec<PropertyKey>,
+}
+
+impl From<PropertyTrackArg> for PropertyTrack {
+    fn from(a: PropertyTrackArg) -> Self {
+        Self {
+            prop: a.prop,
+            keys: a.keys,
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -3470,6 +3501,20 @@ impl KerfMcp {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project.set_property_keyframes(clip_id, p.prop, p.keys).map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
+        description = "Re-key SEVERAL numbers of one clip in a single edit — the same keys set_property_keyframes \
+                       takes, for each number listed: retime a move and its fade together, or set a whole look's \
+                       colour keys at once, as one undo step. Numbers not listed are untouched. Returns the clip."
+    )]
+    fn set_property_tracks(&self, Parameters(p): Parameters<PropertyTracksParams>) -> Result<String, McpError> {
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
+        self.edit(|project| {
+            let tracks = p.tracks.into_iter().map(PropertyTrack::from).collect();
+            let out = project.set_property_tracks(clip_id, tracks).map_err(core_err)?;
             json(&out)
         })
     }
@@ -6629,6 +6674,25 @@ mod tests {
             serde_json::json!({"clip_id": "c", "curves": {"master": [{"x": 0, "y": 1, "z": 2}]}}),
             serde_json::json!({"clip_id": "c", "wheels": {"midtone": {}}}),
             serde_json::json!({"clip_id": "c", "wheels": {"shadows": {"lightnes": 0.1}}}),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn set_property_tracks_refuses_a_track_without_its_keys() {
+        let parse = |v: serde_json::Value| serde_json::from_value::<super::PropertyTracksParams>(v);
+        let ok = parse(serde_json::json!({
+            "clip_id": "c",
+            "tracks": [{"prop": "opacity", "keys": []}, {"prop": "volume", "keys": [{"time": 0, "value": 1}]}]
+        }))
+        .unwrap();
+        let tracks: Vec<kerf_core::PropertyTrack> = ok.tracks.into_iter().map(Into::into).collect();
+        assert_eq!(tracks[1].keys.len(), 1);
+        for bad in [
+            serde_json::json!({"clip_id": "c", "tracks": [{"prop": "opacity"}]}),
+            serde_json::json!({"clip_id": "c", "tracks": [{"prop": "opacity", "key": [{"time": 0, "value": 1}]}]}),
+            serde_json::json!({"clip_id": "c", "tracks": [{"prop": "opacity", "keys": [], "easing": "hold"}]}),
         ] {
             assert!(parse(bad.clone()).is_err(), "{bad}");
         }

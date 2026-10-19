@@ -23,6 +23,9 @@ pub(super) struct ScreenLog {
     pub(super) at: Vec<Instant>,
     /// Wait for the GPU to finish the frame, as a presented frame is on screen only then.
     pub(super) complete_with: Option<Arc<Gpu>>,
+    /// With `complete_with`, keep the picture of the last frame, read back.
+    keep: bool,
+    picture: Option<Vec<u8>>,
 }
 
 pub(super) struct NullScreen {
@@ -42,10 +45,19 @@ impl Screen for NullScreen {
 
     fn present(&mut self, frame: &RenderedFrame, _dest: PixelRect, _surround: Surround) -> Result<(), GpuError> {
         let complete = lock(&self.log).complete_with.clone();
-        if let Some(gpu) = complete {
-            frame.read_back(&gpu)?;
-        }
+        let keep = lock(&self.log).keep;
+        let picture = match complete {
+            Some(gpu) if keep => Some(frame.read_back(&gpu)?.data),
+            Some(gpu) => {
+                frame.read_back(&gpu)?;
+                None
+            }
+            None => None,
+        };
         let mut log = lock(&self.log);
+        if picture.is_some() {
+            log.picture = picture;
+        }
         log.presented.push((frame.width, frame.height));
         log.at.push(Instant::now());
         Ok(())
@@ -478,4 +490,176 @@ fn a_frame_the_plan_refuses_is_counted_by_kind() {
         d.tally
     );
     assert!(d.tally.line().contains("overlays 1"));
+}
+
+/// A preview over a real device whose screen keeps the last picture it was given, read back.
+fn keeping() -> (GpuPreview, Arc<Mutex<ScreenLog>>, Arc<Gpu>) {
+    let log = Arc::new(Mutex::new(ScreenLog::default()));
+    let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter (install mesa-vulkan-drivers for lavapipe)");
+    {
+        let mut l = lock(&log);
+        l.complete_with = Some(Arc::clone(&gpu));
+        l.keep = true;
+    }
+    (preview_on(&log, Arc::clone(&gpu)), log, gpu)
+}
+
+fn picture(log: &Arc<Mutex<ScreenLog>>) -> Vec<u8> {
+    lock(log).picture.take().expect("a picture")
+}
+
+fn ask(preview: &GpuPreview, take: &TakeInputs, t: f64, draft: Option<PreviewDraft>) -> PreviewFrameResult {
+    let request = FrameRequest::new(Arc::clone(take), t, 320, false);
+    let request = match draft {
+        Some(draft) => request.drafted(draft),
+        None => request,
+    };
+    preview.serve(&request).expect("a frame")
+}
+
+fn one_clip(track_id: uuid::Uuid, clip: kerf_core::Clip) -> PreviewDraft {
+    PreviewDraft {
+        clips: vec![draft::DraftClip { track_id, clip }],
+        overlays: Vec::new(),
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_drag_frame_is_the_picture_the_edit_draws_once_it_is_written() {
+    let _turn = exclusive();
+    let (preview, log, _gpu) = keeping();
+    let (take, shared) = taker(project());
+    let _ = ask(&preview, &take, 0.5, None);
+    wait_open(&preview);
+
+    let before = ask(&preview, &take, 0.5, None);
+    assert_eq!(before.renderer, "gpu", "{:?}", before.reasons);
+    let plain = picture(&log);
+
+    // An Inspector drag: the first clip scaled, moved and brightened.
+    let timeline = lock(&shared).working_timeline().expect("a timeline");
+    let track = timeline.tracks[0].id;
+    let mut clip = timeline.tracks[0].clips[0].clone();
+    clip.transform.scale = 0.5;
+    clip.transform.pos_x = 0.1;
+    clip.color.brightness = 0.1;
+    let dragged = ask(&preview, &take, 0.5, Some(one_clip(track, clip.clone())));
+    assert_eq!(dragged.renderer, "gpu", "{:?}", dragged.reasons);
+    let drag_picture = picture(&log);
+    assert!(drag_picture != plain, "the drag frame shows the drag");
+    assert_eq!(
+        lock(&shared).working_timeline().unwrap().tracks[0].clips[0].transform.scale,
+        1.0,
+        "nothing was written"
+    );
+    {
+        let project = lock(&shared);
+        project
+            .set_transform(clip.id, Some(0.5), Some(0.1), None, None, None, None, None, None, None)
+            .expect("the edit");
+        project
+            .set_color(clip.id, Some(0.1), None, None, None, None)
+            .expect("the edit");
+    }
+    let written = ask(&preview, &take, 0.5, None);
+    assert_eq!(written.renderer, "gpu", "{:?}", written.reasons);
+    assert!(
+        picture(&log) == drag_picture,
+        "the drag frame is the frame of the edit, once written"
+    );
+
+    // A clip moved on the timeline: the second clip dragged from 1 s to 3 s, drawn at 3.5 s.
+    let timeline = lock(&shared).working_timeline().expect("a timeline");
+    let mut second = timeline.tracks[0].clips[1].clone();
+    second.timeline_start = 3.0;
+    let moved = ask(&preview, &take, 3.5, Some(one_clip(track, second.clone())));
+    assert_eq!(moved.renderer, "gpu", "{:?}", moved.reasons);
+    let move_picture = picture(&log);
+    lock(&shared)
+        .move_clips(&[kerf_core::ClipMove {
+            clip_id: second.id,
+            timeline_start: 3.0,
+            track_id: None,
+        }])
+        .expect("the move");
+    let written = ask(&preview, &take, 3.5, None);
+    assert_eq!(written.renderer, "gpu", "{:?}", written.reasons);
+    assert!(picture(&log) == move_picture, "the moved clip's frame, once written");
+
+    // A drag the edits would write but the GPU does not draw (a mask on a rotated layer, which the plan
+    // refuses): the frame is FFmpeg's, of the cut as it is, with the plan's reason and the note.
+    let timeline = lock(&shared).working_timeline().expect("a timeline");
+    let mut masked = timeline.tracks[0].clips[0].clone();
+    masked.transform.rotation = 10.0;
+    masked.mask = Some(kerf_core::Mask::default());
+    let unsupported = ask(&preview, &take, 0.5, Some(one_clip(track, masked)));
+    assert_eq!(unsupported.renderer, "ffmpeg");
+    assert!(unsupported.frame.is_some());
+    assert!(
+        unsupported.reasons.iter().any(|r| r.contains("a mask on a rotated layer")),
+        "the plan's own refusal, not the draft's: {:?}",
+        unsupported.reasons
+    );
+    assert_eq!(
+        unsupported.reasons.last().map(String::as_str),
+        Some(DRAFT_NOTE),
+        "{:?}",
+        unsupported.reasons
+    );
+
+    // A drag into what no drafted edit writes (an effect added): the draft is refused, and the frame is
+    // the cut as it is.
+    let mut vignetted = timeline.tracks[0].clips[0].clone();
+    vignetted.effects.push(kerf_core::VideoEffect::Vignette);
+    let refused = ask(&preview, &take, 0.5, Some(one_clip(track, vignetted)));
+    assert_eq!(refused.renderer, "ffmpeg");
+    assert!(refused.frame.is_some());
+    assert!(refused.reasons[0].contains("a drag changes only"), "{:?}", refused.reasons);
+    assert_eq!(
+        refused.reasons.last().map(String::as_str),
+        Some(DRAFT_NOTE),
+        "{:?}",
+        refused.reasons
+    );
+
+    // A draft that is not of this cut is the cut as it is, and says why.
+    let stranger = kerf_core::Clip::new(uuid::Uuid::new_v4(), 0.0, 1.0, 0.0);
+    let lost = ask(&preview, &take, 0.5, Some(one_clip(track, stranger)));
+    assert_eq!(lost.renderer, "ffmpeg");
+    assert!(lost.reasons[0].contains("not in the cut"), "{:?}", lost.reasons);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_drag_that_walks_forward_reads_ahead_and_draws_the_frames_a_scrub_draws() {
+    let _turn = exclusive();
+    let (take, _shared) = taker(project());
+    let times: Vec<f64> = (0..12).map(|n| 0.1 + f64::from(n) / 30.0).collect();
+    let walk = |forward: bool, order: &[f64]| -> Vec<(f64, Vec<u8>)> {
+        let (preview, log, _gpu) = keeping();
+        let _ = ask(&preview, &take, 0.05, None);
+        wait_open(&preview);
+        order
+            .iter()
+            .map(|&t| {
+                let inputs = preview.inputs(&take).expect("inputs");
+                let want = Want {
+                    scrubbing: true,
+                    forward,
+                    ..Want::at(t)
+                };
+                let r = preview.frame(&inputs, want, 320).expect("a frame");
+                assert_eq!(r.renderer, "gpu", "{:?}", r.reasons);
+                (t, picture(&log))
+            })
+            .collect()
+    };
+    let ahead = walk(true, &times);
+    let backward: Vec<f64> = times.iter().rev().copied().collect();
+    let scrubbed = walk(false, &backward);
+    for (t, read_ahead) in &ahead {
+        let (_, scrub) = scrubbed.iter().find(|(s, _)| s == t).expect("the same time");
+        assert!(read_ahead == scrub, "the frame at {t} read ahead is the one a scrub draws");
+    }
 }

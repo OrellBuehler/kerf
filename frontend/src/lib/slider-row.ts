@@ -67,6 +67,11 @@ export class Pending<S> {
 	drop(): void {
 		this.#began = null;
 	}
+
+	/** What the edit under way began on, if one is. */
+	get scope(): S | undefined {
+		return this.#began?.scope;
+	}
 }
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));

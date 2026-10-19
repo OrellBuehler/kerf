@@ -8,7 +8,9 @@ import {
 	setFade,
 	setKeyframeEasing,
 	setKeyframes,
+	getHistory,
 	setPropertyKeyframes,
+	setPropertyTracks,
 	splitClip
 } from './api';
 import { colorAt, propertyKeys, transformAt, volumeAt } from './channels';
@@ -157,5 +159,36 @@ describe('property keyframes (browser harness)', () => {
 		for (const local of [0, 0.5, 1, 2.5]) {
 			expect(volumeAt(tail!, local)).toBeCloseTo(volumeAt(before, local + 4), 9);
 		}
+	});
+
+	test('several numbers are re-keyed in one edit, and a refused list writes nothing', async () => {
+		await addKeyframe('c1', 0, { scale: 1, opacity: 1 });
+		await addKeyframe('c1', 4, { scale: 2, opacity: 0 });
+		const before = (await getHistory()).length;
+		const t = await setPropertyTracks('c1', [
+			{ prop: 'scale', keys: [k(1, 1), k(5, 2)] },
+			{ prop: 'volume', keys: [k(0, 1), k(2, 0.5)] }
+		]);
+		const c = clipOf(t, 'c1');
+		expect(propertyKeys(c, 'scale')[0].time).toBe(1);
+		expect(propertyKeys(c, 'opacity')).toHaveLength(2);
+		expect(volumeAt(c, 1)).toBeCloseTo(0.75, 12);
+		const history = await getHistory();
+		expect(history).toHaveLength(before + 1);
+		expect(history.at(-1)!.label).toBe('Edit keyframes');
+		for (const [tracks, why] of [
+			[[], 'at least one'],
+			[
+				[
+					{ prop: 'gamma', keys: [] },
+					{ prop: 'gamma', keys: [k(0, 1)] }
+				],
+				'more than once'
+			],
+			[[{ prop: 'opacity', keys: [k(0, 2)] }], 'within 0..=1']
+		] as const) {
+			await expect(setPropertyTracks('c1', tracks as never)).rejects.toThrow(why);
+		}
+		expect(await getHistory()).toHaveLength(before + 1);
 	});
 });
