@@ -4962,13 +4962,47 @@ fn build_export_args_phase(
     }
     side_files::push_maps(&side, &mut args);
 
+    let muted = timeline_has_audio && !want_audio && pass != PassPhase::First && !c.is_video_only();
+    push_output_opts(
+        &mut args,
+        opts,
+        &fmt,
+        (graph.has_video, graph.has_audio),
+        muted,
+        pass,
+        passlog,
+    );
+
+    if pass == PassPhase::First {
+        args.push("-an".to_string());
+        args.push("-f".to_string());
+        args.push("null".to_string());
+        args.push(null_sink.to_string());
+    } else {
+        args.push(output_path.to_string());
+    }
+    Ok(args)
+}
+
+/// What follows an output's maps: the encoders and their settings, an explicit mute (`muted`: the
+/// cut has sound and the export drops it) and the muxer's flags. `streams` is whether the graph
+/// feeds the output a picture and a sound.
+fn push_output_opts(
+    args: &mut Vec<String>,
+    opts: &ExportOptions,
+    fmt: &ExportFormat,
+    (has_video, has_audio): (bool, bool),
+    muted: bool,
+    pass: PassPhase,
+    passlog: &str,
+) {
     // ---- video output options (only when a codec is explicitly chosen; a bare
     // default still maps [outv] and lets ffmpeg pick the encoder, as before) ----
-    if graph.has_video {
+    if has_video {
         if let Some(vc) = opts.video_codec.as_deref() {
             args.push("-c:v".to_string());
             args.push(vc.to_string());
-            push_video_opts(&mut args, opts, vc, pass, passlog);
+            push_video_opts(args, opts, vc, pass, passlog);
             // `-pix_fmt` must equal the graph terminal `format=`; gif is pal8, and a VAAPI
             // encoder's frames are on the device, formatted by the graph's tail.
             if vc != "gif" && enc_family(vc) != EncFamily::Vaapi {
@@ -4979,7 +5013,7 @@ fn build_export_args_phase(
     }
 
     // ---- audio output options ----
-    if graph.has_audio {
+    if has_audio {
         if let Some(ac) = opts.audio_codec.as_deref() {
             args.push("-c:a".to_string());
             args.push(ac.to_string());
@@ -5002,18 +5036,18 @@ fn build_export_args_phase(
     }
     // Explicit mute: the timeline has audio but the user dropped it (distinct
     // from a timeline that simply has no audio).
-    if timeline_has_audio && !want_audio && pass != PassPhase::First && !c.is_video_only() {
+    if muted {
         args.push("-an".to_string());
     }
 
     // ---- muxer / misc (skipped on the two-pass analysis pass, whose output is
     // the null muxer — it rejects mov/gif muxer options like -movflags) ----
     if pass != PassPhase::First {
-        if opts.faststart && c.supports_faststart() {
+        if opts.faststart && opts.container.supports_faststart() {
             args.push("-movflags".to_string());
             args.push("+faststart".to_string());
         }
-        if c == Container::Gif {
+        if opts.container == Container::Gif {
             args.push("-loop".to_string());
             args.push(if opts.gif_loop { "0" } else { "-1" }.to_string());
         }
@@ -5023,16 +5057,6 @@ fn build_export_args_phase(
             args.push(format!("title={title}"));
         }
     }
-
-    if pass == PassPhase::First {
-        args.push("-an".to_string());
-        args.push("-f".to_string());
-        args.push("null".to_string());
-        args.push(null_sink.to_string());
-    } else {
-        args.push(output_path.to_string());
-    }
-    Ok(args)
 }
 
 /// Append the `-c:v`-private options for `vc`: rate control, speed preset,
@@ -6171,6 +6195,7 @@ pub fn prepare_variants(
             elapsed_secs: p.elapsed_secs,
             eta_secs: None,
             waiting: p.waiting,
+            together: false,
         });
     };
     match measure_static_loudness(timeline, assets, &mut opts, has_audio, &mut on_meter, cancel) {
@@ -6180,7 +6205,8 @@ pub fn prepare_variants(
 }
 
 /// Progress across a multi-format export: the overall [`ExportProgress`] plus
-/// which variant is rendering, so a bar can say "2 of 3 · 9:16".
+/// which variant is rendering, so a bar can say "2 of 3 · 9:16" — or, for variants
+/// rendered in one run (`together`), that all of them are.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct VariantProgress {
     /// Zero-based index of the variant being rendered.
@@ -6195,6 +6221,10 @@ pub struct VariantProgress {
     /// [`ExportProgress::waiting`]: queued for the slot, or metering the mix's loudness.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting: Option<&'static str>,
+    /// Every variant is rendering in the one run ([`render_variants`] `together`): `variant`
+    /// is then 0 and `fraction` is each file's as much as the whole.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub together: bool,
 }
 
 /// Refuse an export whose caption files would replace ones already beside `output`, unless
@@ -6206,9 +6236,14 @@ pub fn check_caption_sidecars(output: &Path, opts: &ExportOptions) -> Result<()>
 /// Render the same cut once per variant — one file per delivery frame, each
 /// shot wearing the crop it carries for that shape ([`Timeline::for_delivery`]).
 ///
-/// Variants render one after another rather than at once: an export already
-/// takes every core it is given (`cpu::lease` would serialize them anyway),
-/// and a cancelled batch is then clean — the variant in flight is deleted like
+/// With `together`, every variant that can is written by **one** ffmpeg run
+/// ([`together::render_together`]): the sources are decoded once and `split` into each
+/// frame's graph, the mix is built once and `asplit` to each file. A cancelled or failed run
+/// then removes every file it touched (all of them were in flight) and reports none completed.
+/// What one run cannot write (a two-pass or hardware encode, an audio-only container, two
+/// variants named alike) renders one after another, as it does without `together`.
+///
+/// One after another, a cancelled batch is clean — the variant in flight is deleted like
 /// a cancelled single export, the ones already finished are kept, and the ones
 /// not started never existed. A variant that **fails** is removed the same way (its partial
 /// file, if the run touched it; the finished ones stay). `opts` is the encode shared by all of
@@ -6219,6 +6254,7 @@ pub fn render_variants(
     assets: &[Asset],
     variants: &[ExportVariant],
     opts: &ExportOptions,
+    together: bool,
     progress: &mut dyn FnMut(VariantProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<(RenderStatus, usize)> {
@@ -6230,6 +6266,13 @@ pub fn render_variants(
     let Some(opts) = prepare_variants(timeline, assets, variants, opts, progress, cancel)? else {
         return Ok((RenderStatus::Cancelled, 0));
     };
+    if together {
+        match together::render_together(timeline, assets, variants, &opts, progress, cancel)? {
+            Some(RenderStatus::Completed) => return Ok((RenderStatus::Completed, total)),
+            Some(RenderStatus::Cancelled) => return Ok((RenderStatus::Cancelled, 0)),
+            None => {}
+        }
+    }
     for (i, variant) in variants.iter().enumerate() {
         let framed = timeline.for_delivery(variant.delivery);
         let per_variant = ExportOptions {
@@ -6248,6 +6291,7 @@ pub fn render_variants(
                 elapsed_secs,
                 eta_secs,
                 waiting: p.waiting,
+                together: false,
             });
         };
         // `render_with_progress` discards a failed or cancelled variant's partial file, but only
@@ -6590,6 +6634,21 @@ fn run_ffmpeg_progress_as(
     progress: &mut dyn FnMut(ExportProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<RenderStatus> {
+    run_ffmpeg_progress_into(args, &[], output, bar, resource, progress, cancel)
+}
+
+/// [`run_ffmpeg_progress_as`] for a run that writes several files: `sinks` is the argv index of
+/// each output path, so each encoder is capped to its share of the budget
+/// ([`cpu::limit_outputs_args`]). Empty is one output, the last argument ([`cpu::limit_args`]).
+fn run_ffmpeg_progress_into(
+    args: &[String],
+    sinks: &[usize],
+    output: &Path,
+    bar: Bar,
+    resource: cpu::Resource,
+    progress: &mut dyn FnMut(ExportProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<RenderStatus> {
     use std::io::{BufRead, BufReader, Read};
     use std::process::Stdio;
 
@@ -6616,7 +6675,11 @@ fn run_ffmpeg_progress_as(
         Err(e) => return Err(e),
     };
     let mut args = args.to_vec();
-    cpu::limit_args(&mut args, cpu.threads());
+    if sinks.len() > 1 {
+        cpu::limit_outputs_args(&mut args, cpu.threads(), sinks);
+    } else {
+        cpu::limit_args(&mut args, cpu.threads());
+    }
     let args = &args[..];
     tracing::info!(output = %output.display(), resource = ?cpu.resource(), "exporting timeline");
     tracing::debug!(command = %format!("{bin} {}", args.join(" ")), "ffmpeg export command");
@@ -9398,6 +9461,13 @@ mod svg_layer;
 /// The cut's captions and chapter markers muxed into an export, and the caption
 /// files written beside it.
 mod side_files;
+
+/// Every delivery frame of a multi-format export in one ffmpeg run.
+mod together;
+
+/// The one run held to the variants rendered one by one, frame for frame (`#[ignore]`d).
+#[cfg(test)]
+mod together_rendered;
 
 /// Titles through the real ffmpeg (`#[ignore]`d).
 #[cfg(test)]
@@ -16633,6 +16703,7 @@ mod tests {
             &[asset],
             &variants,
             &ExportOptions::default(),
+            false,
             &mut |p| ticks.push(p),
             &|| false,
         )

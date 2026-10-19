@@ -4657,17 +4657,20 @@ export async function exportTimeline(outputPath: string, options: ExportOptions)
 	return invoke<string>('export_timeline', { outputPath, options });
 }
 
-/** Render the cut once per delivery frame — one file per shape beside
+/** Render the cut at every delivery frame — one file per shape beside
  *  `outputPath`, named by shape (`cut-9x16.mp4`). With `smartCrop` every shot
- *  is framed for every shape first, recorded on the clips as one revision. */
+ *  is framed for every shape first, recorded on the clips as one revision.
+ *  `singlePass` (the default) writes every file from one decode of the cut where
+ *  the encode allows; false renders them one after another. */
 export async function exportVariants(
 	outputPath: string,
 	formats: Delivery[],
 	smartCrop: boolean,
-	options: ExportOptions
+	options: ExportOptions,
+	singlePass = true
 ): Promise<string[]> {
 	if (!inTauri()) throw new Error('export is only available in the desktop app');
-	return invoke<string[]>('export_variants', { outputPath, formats, smartCrop, options });
+	return invoke<string[]>('export_variants', { outputPath, formats, smartCrop, singlePass, options });
 }
 
 /** Ask the backend to stop the in-flight export; it then rejects with `export cancelled`. */

@@ -165,11 +165,14 @@ delivery: `formats` are shape names (`9:16` / `1:1` / `4:5` / `16:9`, or
 `WxH` — `Delivery::parse`), it runs the framing pass first unless
 `smart_crop` is false (the one write it makes, `project-changed` only when a
 clip actually changed), renders through `render_variants` with progress on
-the client's token naming the file in flight, and reports each file with the
+the client's token naming the file in flight (`rendering 3 together (9:16, 1:1, 16:9)` for a
+single pass), and reports each file with the
 platforms it is `ready_for` and its non-tip issues — judged at *that* file's
 frame and over the span of the export's `range` (`variant_output` →
 `cut_summary_in(Some(frame), range)`), so the agent does not run
-`platform_check` per variant afterwards. `generate_captions` / `clear_captions` caption the
+`platform_check` per variant afterwards. `single_pass` (default true) is `render_variants`'
+`together`; the result says whether the run was one (`single_pass`), and a cancelled one removed
+every file (`export cancelled; the N files rendering together were removed`). `generate_captions` / `clear_captions` caption the
 cut; its `style` picks `lines` or `word_punch` and the `instructions` say to
 prefer the latter for a vertical cut, since nothing in a tool list tells an
 agent that the subtitle shape is not what social captions look like. They also

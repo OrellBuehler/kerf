@@ -284,10 +284,11 @@ pub fn render_variants(
     assets: &[crate::model::Asset],
     variants: &[ExportVariant],
     opts: &ExportOptions,
+    together: bool,
     progress: &mut dyn FnMut(VariantProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<(RenderStatus, usize)> {
-    cli::render_variants(timeline, assets, variants, opts, progress, cancel)
+    cli::render_variants(timeline, assets, variants, opts, together, progress, cancel)
 }
 
 #[cfg(test)]

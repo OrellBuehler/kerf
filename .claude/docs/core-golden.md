@@ -21,7 +21,11 @@
   in the middle of its first title, `svg_playhead`, no dice, because the drawn playhead is between frames and a stream from one never reads
   `-start_number`); families `svg-input`, `svg-held`, `svg-overlay`, `svg-two`, `svg-partly-off`, `svg-restamp`, `still-svg`,
   `still-svg-one-file`, `preview-svg-*` (`input`, `held`, `seek`, `overlay`) and
-  the structural `svg-under-text`, `svg-gif`, `svg-offset`, which gave 28 to hundreds of cases each), have their
+  the structural `svg-under-text`, `svg-gif`, `svg-offset`, which gave 28 to hundreds of cases each) and **400 more**
+  exported at two or three delivery frames by one run (`together_for`, on dice of its own: framings on the clips,
+  titles on every other case, captions and chapters to mux on a quarter, the encode made one the run takes, every
+  tenth an audio-only container that none does; their export text is `together::build_together_args` plus its
+  `sinks_from_end`; families `together-*`), have their
   `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
   FNV-1a digests, committed as 64 block digests each in
   `engine/cli/golden/{export,still,preview}.txt` (LF: `.gitattributes`, and the comparison

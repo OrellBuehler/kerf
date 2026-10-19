@@ -682,6 +682,7 @@ mod real {
             &assets,
             &variants,
             &opts,
+            false,
             &mut |p| {
                 if p.variant == 1 && p.fraction > 0.5 {
                     second.set(true);
@@ -717,7 +718,9 @@ mod real {
             video_bitrate: Some("not a bitrate".into()),
             ..ExportOptions::default()
         };
-        render_variants(&timeline, &assets, &variants, &opts, &mut |_| {}, &|| false).expect_err("invalid options");
+        for together in [false, true] {
+            render_variants(&timeline, &assets, &variants, &opts, together, &mut |_| {}, &|| false).expect_err("invalid options");
+        }
         for v in &variants {
             assert_eq!(std::fs::read(&v.output).unwrap(), b"earlier", "{}", v.output.display());
         }

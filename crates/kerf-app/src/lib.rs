@@ -3934,8 +3934,11 @@ struct FramingProgress {
 /// Render the cut once per delivery frame — one file per shape beside
 /// `output_path`, named by shape (`cut-9x16.mp4`). With `smart_crop`, every
 /// shot is framed for every shape first (one revision, reused by later
-/// exports); the project frame's own crop is never touched. Streams the same
-/// `export-progress` event as a single export, with `variant` / `total` added.
+/// exports); the project frame's own crop is never touched. `single_pass`
+/// (default true) writes every file from one decode of the cut where the encode
+/// allows; false renders them one after another. Streams the same
+/// `export-progress` event as a single export, with `variant` / `total` (and
+/// `together` for a single pass) added.
 #[tauri::command]
 async fn export_variants(
     app: AppHandle,
@@ -3943,8 +3946,10 @@ async fn export_variants(
     output_path: String,
     formats: Vec<Delivery>,
     smart_crop: bool,
+    single_pass: Option<bool>,
     options: ExportOptions,
 ) -> CmdResult<Vec<String>> {
+    let single_pass = single_pass.unwrap_or(true);
     if formats.is_empty() {
         return Err("pick at least one delivery frame".to_string());
     }
@@ -4021,13 +4026,22 @@ async fn export_variants(
                 project.list_assets().map_err(|e| e.to_string())?,
             )
         };
-        // `render_variants` writes the files one after another and removes the one that failed
-        // or was cancelled (only if this run touched it); the finished ones stay. Its progress
-        // is the event the webview already reads: which file, of how many, and the whole.
+        // `render_variants` writes the files in one run (or one after another) and removes what
+        // failed or was cancelled (only if this run touched it); one after another, the finished
+        // ones stay. Its progress is the event the webview already reads: which file, of how
+        // many (or all of them together), and the whole.
         let mut on_progress = |p: kerf_core::VariantProgress| {
             let _ = app.emit("export-progress", p);
         };
-        match kerf_core::render_variants(&timeline, &assets, &variants, &options, &mut on_progress, &|| cancel()) {
+        match kerf_core::render_variants(
+            &timeline,
+            &assets,
+            &variants,
+            &options,
+            single_pass,
+            &mut on_progress,
+            &|| cancel(),
+        ) {
             Ok((kerf_core::RenderStatus::Completed, _)) => {}
             Ok((kerf_core::RenderStatus::Cancelled, _)) => return Err("export cancelled".to_string()),
             Err(e) => return Err(e.to_string()),

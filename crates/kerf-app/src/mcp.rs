@@ -1699,6 +1699,14 @@ struct ExportVariantsParams {
     )]
     overwrite: Option<bool>,
     #[schemars(
+        description = "Render every file in one pass (default true): the sources are decoded and the mix is built \
+                              once, then split into each frame — about one export's decode for all of them. Falls back \
+                              to one file after another where one pass cannot (two-pass or hardware encoders, an \
+                              audio-only container). A cancelled or failed single pass removes every file. false \
+                              renders the files one after another, keeping the finished ones if a later one is cancelled."
+    )]
+    single_pass: Option<bool>,
+    #[schemars(
         description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
@@ -5043,8 +5051,10 @@ impl KerfMcp {
                        project's own frame is untouched. Files land beside output_path named by shape \
                        (`cut-9x16.mp4`). Reports each file with the platforms it is ready for and any issue, so \
                        there is no need to run platform_check per variant afterwards. Progress and cancellation \
-                       work as in `export` (and `background: true` returns a job_id); cancelling keeps the files already \
-                       finished and deletes the one in flight. Refuses to overwrite any existing variant file unless overwrite is true."
+                       work as in `export` (and `background: true` returns a job_id). The files render in one pass by \
+                       default (single_pass): one decode of the sources split into every frame, so cancelling removes \
+                       them all; with single_pass false they render one after another and cancelling keeps the files \
+                       already finished and deletes the one in flight. Refuses to overwrite any existing variant file unless overwrite is true."
     )]
     async fn export_variants(
         &self,
@@ -5088,6 +5098,7 @@ impl KerfMcp {
         self.check_outputs(&variants.iter().map(|v| v.output.clone()).collect::<Vec<_>>())
             .await?;
         let smart_crop = p.smart_crop.unwrap_or(true);
+        let single_pass = p.single_pass.unwrap_or(true);
         let (me, owner) = (self.clone(), self.owner());
         let generation = self.lock().generation();
         // The GUI's Stop on an export ends the framing pass and every file of this one too.
@@ -5128,9 +5139,12 @@ impl KerfMcp {
                         project.list_assets().map_err(core_err)?,
                     )
                 };
+                let together = std::cell::Cell::new(false);
                 let mut on_progress = |progress: kerf_core::VariantProgress| {
+                    together.set(together.get() | progress.together);
                     let mut message = match progress.waiting {
                         Some(why) => why.to_string(),
+                        None if progress.together => format!("rendering {} together ({})", progress.total, labels.join(", ")),
                         None => format!(
                             "rendering {} of {} ({})",
                             progress.variant + 1,
@@ -5144,11 +5158,16 @@ impl KerfMcp {
                     run.progress(Some(progress.fraction), message);
                 };
                 // Core removes the file of a variant that failed or was cancelled in flight.
-                let (status, done) =
-                    kerf_core::render_variants(&timeline, &assets, &render_variants, &opts, &mut on_progress, &|| {
-                        run.cancelled()
-                    })
-                    .map_err(core_err)?;
+                let (status, done) = kerf_core::render_variants(
+                    &timeline,
+                    &assets,
+                    &render_variants,
+                    &opts,
+                    single_pass,
+                    &mut on_progress,
+                    &|| run.cancelled(),
+                )
+                .map_err(core_err)?;
                 // Judged per file, at the frame that file actually is and over the span it writes.
                 let range = opts.range.map(|r| (r.start, r.end));
                 let mut outputs = Vec::new();
@@ -5156,16 +5175,27 @@ impl KerfMcp {
                 for v in render_variants.iter().take(done) {
                     outputs.push(variant_output(&project, v, range)?);
                 }
-                Ok((status, outputs))
+                Ok((status, outputs, together.get()))
             })
             .await;
             let framed = framed.load(Ordering::SeqCst);
             if framed > 0 {
                 me.changed();
             }
-            let (status, outputs) = result?;
+            let (status, outputs, together) = result?;
             match status {
-                kerf_core::RenderStatus::Completed => json(&serde_json::json!({ "clips_framed": framed, "outputs": outputs })),
+                kerf_core::RenderStatus::Completed => json(&serde_json::json!({
+                    "clips_framed": framed,
+                    "single_pass": together,
+                    "outputs": outputs,
+                })),
+                kerf_core::RenderStatus::Cancelled if together => Err(McpError::internal_error(
+                    format!(
+                        "export cancelled; the {} files rendering together were removed",
+                        variants.len()
+                    ),
+                    None,
+                )),
                 kerf_core::RenderStatus::Cancelled => Err(McpError::internal_error(
                     format!(
                         "export cancelled after {} of {} files; the one in flight was removed",
@@ -6190,8 +6220,8 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              width, and without this the middle is what survives, subject or \
              not. Look at the result with preview_timeline; the crop is an \
              ordinary transform the user can adjust. When the same cut is \
-             going to several places, export_variants renders it once per \
-             shape (9:16, 1:1, 4:5, 16:9) in one call, framing each shot for \
+             going to several places, export_variants renders it at every \
+             shape (9:16, 1:1, 4:5, 16:9) in one call and one pass, framing each shot for \
              each shape and reporting what each file is ready for — prefer it \
              to exporting three times by hand. \
              Your edits are STAGED, not applied. While the user has review switched \
