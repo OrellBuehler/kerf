@@ -147,6 +147,8 @@ import {
 	channelOf,
 	clearTransformAnimation,
 	insertPropertyKey,
+	isMaskProperty,
+	keyableProblem,
 	poseTransform,
 	pruneChannels,
 	propertyKeysProblem,
@@ -2573,7 +2575,15 @@ export async function setTrackDuck(trackId: string, duck: boolean): Promise<Time
 export async function setMask(clipId: string, mask: Mask | null): Promise<Timeline> {
 	if (!inTauri()) {
 		const found = locate(devTimeline, clipId);
-		if (found) found[0].clips[found[1]].mask = mask;
+		if (found) {
+			const clip = found[0].clips[found[1]];
+			clip.mask = mask;
+			// Clearing the mask clears its keys (`Project::set_mask`).
+			if (!mask && clip.channels) {
+				clip.channels = clip.channels.filter((c) => !isMaskProperty(c.prop));
+				if (clip.channels.length === 0) delete clip.channels;
+			}
+		}
 		recordDev(mask ? 'Mask clip' : 'Clear mask');
 		return snapshot();
 	}
@@ -3067,6 +3077,8 @@ export async function setPropertyKeyframes(clipId: string, prop: Property, keys:
 		if (problem) throw new Error(problem);
 		const found = locate(devTimeline, clipId);
 		if (!found) throw new Error(`clip ${clipId} not found`);
+		const keyable = keyableProblem(found[0].clips[found[1]], prop, keys);
+		if (keyable) throw new Error(keyable);
 		setPropertyKeys(found[0].clips[found[1]], prop, keys);
 		recordDev(`Set ${prop === 'pos_x' ? 'position x' : prop === 'pos_y' ? 'position y' : prop} keyframes`);
 		return snapshot();
@@ -3086,6 +3098,10 @@ export async function setPropertyTracks(clipId: string, tracks: PropertyTrack[])
 		}
 		const found = locate(devTimeline, clipId);
 		if (!found) throw new Error(`clip ${clipId} not found`);
+		for (const t of tracks) {
+			const keyable = keyableProblem(found[0].clips[found[1]], t.prop, t.keys);
+			if (keyable) throw new Error(keyable);
+		}
 		for (const t of tracks) setPropertyKeys(found[0].clips[found[1]], t.prop, t.keys);
 		recordDev('Edit keyframes');
 		return snapshot();
@@ -3111,12 +3127,17 @@ export async function copyKeyframes(
 		if (!from) throw new Error(`clip ${fromClipId} not found`);
 		if (!to) throw new Error(`clip ${toClipId} not found`);
 		const source = from[0].clips[from[1]];
-		const tracks = propertyKeysShifted(source, props, offset);
+		const maskless = props.length === 0 && !to[0].clips[to[1]].mask;
+		const tracks = propertyKeysShifted(source, props, offset).filter((t) => !(maskless && isMaskProperty(t.prop)));
 		if (tracks.length === 0) throw new Error('the source clip has no keyframes to copy');
 		for (const t of tracks) {
 			if (t.keys.length === 0) throw new Error(`the source clip has no ${t.prop} keyframes`);
 		}
 		const dest = to[0].clips[to[1]];
+		for (const t of tracks) {
+			const keyable = keyableProblem(dest, t.prop, t.keys);
+			if (keyable) throw new Error(keyable);
+		}
 		for (const t of tracks) setPropertyKeys(dest, t.prop, t.keys);
 		recordDev('Copy keyframes');
 		return snapshot();

@@ -6,7 +6,7 @@
 // A key is named by its number and its time (`KeyRef`), not by its index: an edit re-sorts the
 // rows, and the selection that comes back is the keys where the gesture put them.
 
-import { PROPERTIES, clampProperty, isKeyed, propertyKeys, propertyLabel } from './channels';
+import { PROPERTIES, clampProperty, isKeyed, ownEasing, propertyKeys, propertyLabel } from './channels';
 import { easedPoints } from './easing';
 import { snapToFrame } from './frames';
 import type { Animatable } from './channels';
@@ -40,12 +40,9 @@ export interface DopeEdit {
 
 const byTime = (a: { time: number }, b: { time: number }) => a.time - b.time;
 const isSame = (a: number, b: number) => Math.abs(a - b) <= SAME_TIME;
-/** An easing of our own: a curve read off the editor's (reactive) timeline is a proxy, which the
- *  harness's history cannot clone. */
-const own = (e: Easing): Easing => (typeof e === 'string' ? e : { bezier: { ...e.bezier } });
 const plain = (k: PropertyKey): PropertyKey => {
 	const out: PropertyKey = { time: k.time, value: k.value };
-	if (k.easing && k.easing !== 'linear') out.easing = own(k.easing);
+	if (k.easing && k.easing !== 'linear') out.easing = ownEasing(k.easing);
 	return out;
 };
 
@@ -185,7 +182,7 @@ export function copyKeys(clip: Animatable, sel: readonly KeyRef[]): KeyClipboard
 	return {
 		keys: keys.map(({ prop, k }) => {
 			const out: KeyClipboard['keys'][number] = { prop, offset: k.time - first, value: k.value };
-			if (k.easing && k.easing !== 'linear') out.easing = own(k.easing);
+			if (k.easing && k.easing !== 'linear') out.easing = ownEasing(k.easing);
 			return out;
 		})
 	};
@@ -202,7 +199,7 @@ export function pasteKeys(clip: Animatable, board: KeyClipboard, at: number): Do
 		if (mine.length === 0) continue;
 		const placed = mine.map((k) => {
 			const out: PropertyKey = { time: start + k.offset, value: clampProperty(prop, k.value) };
-			if (k.easing) out.easing = own(k.easing);
+			if (k.easing) out.easing = ownEasing(k.easing);
 			return out;
 		});
 		tracks.push({ prop, keys: landInto(propertyKeys(clip, prop), placed) });
@@ -231,7 +228,7 @@ export function easeKeys(clip: Animatable, sel: readonly KeyRef[], easing: Easin
 				const out = plain(k);
 				if (!isSelected(targets, prop, k.time)) return out;
 				if (easing === 'linear') delete out.easing;
-				else out.easing = own(easing);
+				else out.easing = ownEasing(easing);
 				return out;
 			})
 		})),

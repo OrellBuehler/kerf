@@ -34,9 +34,13 @@
   blurred fill (`Fit::Blur` on the export options and on the delivery frame when the cut has one, no dice, no titles; an
   HDR clip's fill composes in `yuv420p10`; families `blur-fill`, `still-blur-fill`, `preview-blur-fill`, needle `boxblur=`:
   appending it added four block lines a file and moved none of the first 7200 cases; each appended family is bounded to
-  its own range of cases), have their
+  its own range of cases) and **400 more** with a keyed mask or crop (`mask_crop_for`, on dice seeded by case and
+  clip, without titles or a second delivery frame: some mask numbers keyed on a mask the clip had or was given, a
+  feather keyed to nothing in places, the crop's zoom and pan each with its own chance; families `mask-keyed`,
+  `mask-keyed-feather`, `preview-mask-keyed`, `crop-keyed`, `preview-crop-keyed`; the first 7600 digests did not
+  move, 4 block lines appended to each file), have their
   `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
-  FNV-1a digests, committed as 76 block digests each in
+  FNV-1a digests, committed as 80 block digests each in
   `engine/cli/golden/{export,still,preview}.txt` (LF: `.gitattributes`, and the comparison
   ignores `\r`). A refactor of the graph builders must leave all three untouched; an
   intended argv change moves the files of the builders it touched. (`build_proxy_args` and

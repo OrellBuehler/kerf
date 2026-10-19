@@ -4,9 +4,15 @@ import {
 	clampProperty,
 	clearTransformAnimation,
 	colorAt,
+	cropAnimated,
+	cropWindowAt,
 	insertPropertyKey,
 	isKeyed,
+	keyableProblem,
 	keyTime,
+	maskAt,
+	MAX_MASK_SIZE,
+	propertyLabel,
 	propertyAt,
 	propertyKeys,
 	propertyKeysProblem,
@@ -121,6 +127,19 @@ describe('the numbers kerf-core pins', () => {
 			[0, 1, { bezier: { x1: 0, y1: 0, x2: 0.4542081650096481, y2: 0.5719165400747731 } }],
 			[1, 1.5, { bezier: { x1: 0.3264332254175324, y1: 0.5558502990076779, x2: 0.6856271141503777, y2: 1 } }],
 			[2, 2, 'linear']
+		]);
+	});
+
+	test('a keyed mask and crop, sampled', () => {
+		const m = clip();
+		m.mask = { shape: 'rect', x: 0.5, y: 0.5, width: 0.5, height: 0.5, feather: 0.15, inverted: false };
+		setPropertyKeys(m, 'mask_x', [key(0, 0.2, 'ease_in_out'), key(2, 0.8)]);
+		setPropertyKeys(m, 'mask_width', [key(0.5, 0.3, 'ease_out'), key(1.5, 2.5)]);
+		setPropertyKeys(m, 'crop_zoom', [key(0, 1, { bezier: { x1: 0.2, y1: 0.9, x2: 0.3, y2: 1 } }), key(2, 3)]);
+		setPropertyKeys(m, 'crop_x', [key(0, -0.5), key(2, 0.5)]);
+		expect([0.7, 1.3].map((t) => [maskAt(m, t)?.x, maskAt(m, t)?.width, cropWindowAt(m, t)])).toEqual([
+			[0.3543110794166814, 0.8226810657360628, [0.26972959942593694, 0.3173289405011023, 0.3653421189977955, 0.3653421189977955]],
+			[0.6456889205833187, 1.8910558007089358, [0.38105606409439846, 0.33135309921252043, 0.3372938015749592, 0.3372938015749592]]
 		]);
 	});
 });
@@ -445,5 +464,48 @@ describe('poseTransform mirrors Clip::pose_transform', () => {
 		setPropertyKeys(rounded, 'pos_x', [key(0, 0, 'hold'), key(4, 1)]);
 		poseTransform(rounded, Math.round(keyTime(c, playhead) * 1000) / 1000, { pos_x: 0.5 });
 		expect(propertyAt(rounded, 'pos_x', keyTime(c, playhead))).toBe(0);
+	});
+});
+
+describe('mask and crop channels (the same numbers as channels.rs)', () => {
+	test('a keyed mask is sampled over the static one, and a mask taken away draws nothing', () => {
+		const c = clip();
+		expect(maskAt(c, 1)).toBeUndefined();
+		setPropertyKeys(c, 'mask_x', [key(0, 0.2), key(2, 0.6)]);
+		expect(maskAt(c, 1)).toBeUndefined();
+		expect(keyableProblem(c, 'mask_x', [key(0, 0.2)])).toContain('no mask');
+		expect(keyableProblem(c, 'mask_x', [])).toBeUndefined();
+		expect(keyableProblem(c, 'crop_zoom', [key(0, 2)])).toBeUndefined();
+		c.mask = { shape: 'rect', x: 0.5, y: 0.3, width: 0.5, height: 0.5, feather: 0.4 };
+		const m = maskAt(c, 1)!;
+		expect(Math.abs(m.x - 0.4)).toBeLessThan(1e-12);
+		expect([m.y, m.feather]).toEqual([0.3, 0.4]);
+		setPropertyKeys(c, 'mask_width', [key(0, 7)]);
+		expect(maskAt(c, 0)!.width).toBe(MAX_MASK_SIZE);
+		expect(propertyProblem('mask_feather', 1.5)).toBeDefined();
+		expect(propertyLabel('mask_feather')).toBe('mask feather');
+	});
+
+	test('a keyed crop is a window of the picture’s own shape inside the static crop', () => {
+		const c = clip();
+		expect(cropWindowAt(c, 0)).toEqual([0, 0, 1, 1]);
+		setPropertyKeys(c, 'crop_x', [key(0, -1)]);
+		setPropertyKeys(c, 'crop_zoom', [key(0, 1), key(2, 1)]);
+		expect(isKeyed(c, 'crop_zoom') && !cropAnimated(c)).toBe(true);
+		expect(cropWindowAt(c, 1)).toEqual([0, 0, 1, 1]);
+		setPropertyKeys(c, 'crop_x', []);
+		setPropertyKeys(c, 'crop_zoom', [key(0, 1), key(2, 4)]);
+		let [l, t, w, h] = cropWindowAt(c, 1);
+		expect(Math.abs(w - 0.4)).toBeLessThan(1e-12);
+		expect(w).toBe(h);
+		expect(Math.abs(l - 0.3)).toBeLessThan(1e-12);
+		expect(Math.abs(t - 0.3)).toBeLessThan(1e-12);
+		setPropertyKeys(c, 'crop_x', [key(0, -1)]);
+		setPropertyKeys(c, 'crop_y', [key(0, 1)]);
+		[l, t, w, h] = cropWindowAt(c, 1);
+		expect(Math.abs(l)).toBeLessThan(1e-12);
+		expect(Math.abs(t + h - 1)).toBeLessThan(1e-12);
+		expect(propertyProblem('crop_zoom', 0.5)).toBeDefined();
+		expect(clampProperty('crop_zoom', 0.5)).toBe(1);
 	});
 });
