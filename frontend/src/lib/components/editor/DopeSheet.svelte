@@ -203,10 +203,10 @@
 
 	// ---- gestures ----------------------------------------------------------------
 
+	/** A press on a key. The drag is captured by the lanes, not the diamond: a diamond may go
+	 *  mid-drag (the key it drew landed on another), which would end the capture. */
 	function keyDown(e: PointerEvent, prop: Property, time: number) {
-		if (e.button !== 0 || !clip) return;
-		e.stopPropagation();
-		root?.focus({ preventScroll: true });
+		if (!clip) return;
 		const additive = e.shiftKey || e.ctrlKey || e.metaKey;
 		const hit = isSelected(live, prop, time);
 		const base = hit ? live : additive ? [...live, { prop, time }] : [{ prop, time }];
@@ -249,6 +249,8 @@
 	function laneDown(e: PointerEvent) {
 		if (e.button !== 0 || !clip) return;
 		root?.focus({ preventScroll: true });
+		const key = e.target instanceof Element ? e.target.closest<HTMLElement>('[data-prop]') : null;
+		if (key) return keyDown(e, key.dataset.prop as Property, Number(key.dataset.time));
 		const additive = e.shiftKey || e.ctrlKey || e.metaKey;
 		const x0 = xIn(e);
 		const y0 = yIn(e);
@@ -419,7 +421,8 @@
 										aria-label={keyName(r.label, k.time)}
 										aria-pressed={on}
 										use:tip={keyName(r.label, k.time)}
-										onpointerdown={(e) => keyDown(e, r.prop, k.time)}
+										data-prop={r.prop}
+										data-time={String(k.time)}
 										onclick={(e) => {
 											if (e.detail === 0) selection = toggleKey(live, { prop: r.prop, time: k.time });
 										}}
