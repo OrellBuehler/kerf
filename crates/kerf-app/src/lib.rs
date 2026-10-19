@@ -3448,6 +3448,15 @@ async fn get_preview_frame(
             }
             request = request.forward(client, session);
         }
+        Some("ready") => {
+            let (Some(client), Some(session)) = (client.clone(), session) else {
+                return Err("a ready request names its client and session".to_string());
+            };
+            if draft.is_some() {
+                return Err("a ready request takes no draft".to_string());
+            }
+            request = request.ready(client, session);
+        }
         Some(other) => return Err(format!("unknown preview frame hint {other:?}")),
     }
     if let Some(draft) = draft {

@@ -49,6 +49,9 @@ const AFTER: f64 = 0.15;
 /// A cut made ready, and the cursors of its first frame opened.
 pub(super) struct Primed {
     epoch: u64,
+    /// The time it was made to play from (the paused playhead, or where a play is taken back from the
+    /// stream); the cut's start is that frame's, or the grid frame before a transition it is inside of.
+    at: f64,
     pub(super) cut: Arc<PlayCut>,
     pub(super) motion: MotionFrames,
     source: Arc<FrameSource>,
@@ -58,12 +61,11 @@ pub(super) struct Primed {
 impl Primed {
     /// Whether a play from `t` on this backend and these inputs is the one this was made for.
     fn fits(&self, epoch: u64, t: f64, source: &Arc<FrameSource>, now: Instant) -> bool {
-        let start = self.cut.start();
         self.epoch == epoch
             && Arc::ptr_eq(&self.source, source)
             && now.duration_since(self.created) < PRIME_TTL
-            && t >= start - BEFORE
-            && t <= start + AFTER
+            && t >= self.at - BEFORE
+            && t <= self.at + AFTER
     }
 }
 
@@ -136,6 +138,19 @@ impl Primer {
             return;
         }
         state.play_due = Some(due);
+        self.ensure_thread(&mut state, preview);
+        drop(state);
+        self.wake.notify_all();
+    }
+
+    /// What was primed outside the thread (a play made ready to be taken back from the stream) is dropped
+    /// `ttl` from now unless it is played.
+    pub(super) fn expire_after(self: &Arc<Self>, preview: &Weak<GpuPreview>, ttl: Duration) {
+        let mut state = lock(&self.state);
+        if state.stopped {
+            return;
+        }
+        state.expire = Some(Instant::now() + ttl);
         self.ensure_thread(&mut state, preview);
         drop(state);
         self.wake.notify_all();
@@ -272,39 +287,10 @@ impl GpuPreview {
         if !self.check.is_open(&drawing.adapter) {
             return false;
         }
-        let Ok(cut) = PlayCut::new(&inputs.timeline, &inputs.assets, t, (self.policy)(), &ProxyMedia) else {
+        let Ok(primed) = self.make_primed(inputs, t, technique, &bounds, &drawing) else {
             return false;
         };
-        let Ok(first) = cut.plan(t) else {
-            return false;
-        };
-        let Ok((_, size)) = self.sized(technique, &bounds, &drawing.host, &first) else {
-            return false;
-        };
-        // A session the stream will play is not primed.
-        if cut.ahead(t, HORIZON, size, &drawing.compositor.caps()).is_some() {
-            return false;
-        }
-        let motion = MotionFrames::with_config(Arc::clone(&drawing.source), play_config());
-        let feed = motion.feed();
-        for layer in &first.layers {
-            // Opens the file's probes and starts its `ffmpeg`, here and not on a frame; a clip that cannot be
-            // opened ends the priming (what was opened is killed with `motion`).
-            if !matches!(feed.open(layer, t), Ok(Opened::Waiting { .. })) {
-                return false;
-            }
-        }
-        let primed = Primed {
-            epoch: inputs.epoch(),
-            cut: Arc::new(cut),
-            motion,
-            source: Arc::clone(&drawing.source),
-            created: Instant::now(),
-        };
-        let still_there = self.drawing().is_ok_and(|now| Arc::ptr_eq(&now.source, &primed.source));
-        if !still_there {
-            return false;
-        }
+        let layers = primed.motion.feed().waiting();
         // A newer paused frame arrived while the probes ran, or a play began: this is not the playhead any
         // more. Decided under the lock a play takes its primed session from (`take_primed`): a play that has
         // started is seen here (`playing` counts a request being served as well as a session held, and a
@@ -313,9 +299,63 @@ impl GpuPreview {
         if self.primer.pending() || self.playing() || !self.is_enabled() {
             return false;
         }
-        tracing::debug!(start = primed.cut.start(), layers = first.layers.len(), "a play is primed");
+        tracing::debug!(start = primed.cut.start(), layers, "a play is primed");
         *slot = Some(primed);
         true
+    }
+
+    /// The play from `t` made ready: its cut, its first `HORIZON` scanned (a play the stream would have is not
+    /// primed), and the cursors of its first frame opened. `Err` says why not.
+    pub(super) fn make_primed(
+        &self,
+        inputs: &PlanInputs,
+        t: f64,
+        technique: super::Technique,
+        bounds: &super::Bounds,
+        drawing: &super::Drawing,
+    ) -> Result<Primed, String> {
+        let cut = PlayCut::new(&inputs.timeline, &inputs.assets, t, (self.policy)(), &ProxyMedia)
+            .map_err(|e| format!("no plan to play from here: {e}"))?;
+        let first = cut.plan(t).map_err(|e| format!("no plan for the first frame: {e}"))?;
+        let (_, size) = self.sized(technique, bounds, &drawing.host, &first).map_err(|r| r.text)?;
+        if let Some(ahead) = cut.ahead(t, HORIZON, size, &drawing.compositor.caps()) {
+            return Err(format!("{} (at {:.2} s)", ahead.why, ahead.at));
+        }
+        let motion = MotionFrames::with_config(Arc::clone(&drawing.source), play_config());
+        let feed = motion.feed();
+        for layer in &first.layers {
+            // Opens the file's probes and starts its `ffmpeg`, here and not on a frame; a clip that cannot be
+            // opened ends the priming (what was opened is killed with `motion`).
+            feed.check(layer).map_err(|e| e.to_string())?;
+            match feed.open(layer, t) {
+                Ok(Opened::Waiting { .. }) => {}
+                Ok(_) => return Err(format!("{} could not be opened ahead of its frame", layer.name)),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        let primed = Primed {
+            epoch: inputs.epoch(),
+            at: t,
+            cut: Arc::new(cut),
+            motion,
+            source: Arc::clone(&drawing.source),
+            created: Instant::now(),
+        };
+        let still_there = self.drawing().is_ok_and(|now| Arc::ptr_eq(&now.source, &primed.source));
+        if !still_there {
+            return Err("the GPU preview was restarted while the play was made ready".into());
+        }
+        Ok(primed)
+    }
+
+    /// Hold `primed` for the play that adopts it ([`GpuPreview::take_primed`]), dropped after [`PRIME_TTL`]
+    /// unplayed (what was held before is dropped now).
+    pub(super) fn keep_primed(&self, primed: Primed) {
+        let old = lock(&self.primed).replace(primed);
+        drop(old);
+        if let Some(me) = self.me.get() {
+            self.primer.expire_after(me, PRIME_TTL);
+        }
     }
 
     /// The primed session, if a play from `t` is the one it was made for. Anything else primed is dropped.

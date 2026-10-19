@@ -935,6 +935,8 @@ pub struct FrameRequest {
     order: Option<Order>,
     /// The play session this is a frame of (`hint = forward`), when it is.
     play: Option<PlayKey>,
+    /// Not a frame: the page asks where the GPU can take the play back from the stream (`hint = ready`).
+    ready: bool,
 }
 
 impl FrameRequest {
@@ -950,6 +952,7 @@ impl FrameRequest {
             draft: None,
             order: None,
             play: None,
+            ready: false,
         }
     }
 
@@ -967,6 +970,14 @@ impl FrameRequest {
             client: client.into(),
             session,
         });
+        self
+    }
+
+    /// Not a frame: where, from this request's time on, the GPU can take session `session` of `client` back
+    /// from the stream ([`play`]'s `ready_play`). Nothing is drawn.
+    pub fn ready(mut self, client: impl Into<String>, session: u64) -> Self {
+        self = self.forward(client, session);
+        self.ready = true;
         self
     }
 
@@ -1422,6 +1433,9 @@ impl GpuPreview {
     fn serve(&self, request: &FrameRequest) -> Result<PreviewFrameResult, String> {
         let inputs = self.inputs(&request.take)?;
         if let Some(key) = &request.play {
+            if request.ready {
+                return self.ready_play(&inputs, key, request.t, request.overlays);
+            }
             return self.play(&inputs, key, request.t, request.overlays);
         }
         self.end_play();

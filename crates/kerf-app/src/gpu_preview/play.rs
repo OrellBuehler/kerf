@@ -53,6 +53,14 @@ use super::{lock, GpuPreview, PreviewFrameResult, Want};
 /// How far ahead, seconds, a session looks for a frame the compositor does not draw.
 pub const HORIZON: f64 = 5.0;
 
+/// How far ahead, seconds, a `ready` request looks for where the GPU can take a play back from the stream:
+/// what is primed there waits at most this long (and the page's switch) for the play to get to it.
+pub const REACH: f64 = 4.0;
+
+/// How much more than [`HORIZON`], seconds, is drawn from where a play is taken back: the session's first
+/// request comes a frame or two after it, and scans its own horizon from there.
+const RESUME_SLACK: f64 = 0.5;
+
 /// How much playback, seconds, passes between two scans.
 const RESCAN: f64 = 0.5;
 
@@ -124,6 +132,9 @@ pub struct PlayInfo {
     pub repeat: bool,
     /// The first frame ahead that the GPU will not draw, within the scan's reach, if any.
     pub ahead: Option<AheadInfo>,
+    /// To a `ready` request: the time from which the GPU takes the play back from the stream (its play
+    /// is primed there), or `None` while no such time is within [`REACH`].
+    pub resume: Option<f64>,
 }
 
 /// What the sessions of this run did (`gpu_preview_diagnostics`).
@@ -375,12 +386,7 @@ impl PlaySession {
                 ahead: self.cut.ahead(t, HORIZON, size, caps),
             });
         }
-        let scanned = self.scan.as_ref().and_then(|s| s.ahead.clone()).map(|a| AheadInfo {
-            at: a.at,
-            handover: a.handover,
-            kind: a.why.kind(),
-            why: a.why.to_string(),
-        });
+        let scanned = self.scan.as_ref().and_then(|s| s.ahead.clone()).map(AheadInfo::from);
         let refused = self
             .feeder
             .as_ref()
@@ -404,6 +410,31 @@ impl PlaySession {
             frame,
             repeat,
             ahead,
+            resume: None,
+        }
+    }
+}
+
+/// Why a session is the stream's from its first request: the reasons, and the frame the GPU would not
+/// draw when that is the reason (the page may take the play back once it has passed: [`REACH`]).
+pub(super) struct Declined {
+    reasons: Vec<Reason>,
+    ahead: Option<AheadInfo>,
+}
+
+impl From<Vec<Reason>> for Declined {
+    fn from(reasons: Vec<Reason>) -> Self {
+        Self { reasons, ahead: None }
+    }
+}
+
+impl From<PlayAhead> for AheadInfo {
+    fn from(a: PlayAhead) -> Self {
+        Self {
+            at: a.at,
+            handover: a.handover,
+            kind: a.why.kind(),
+            why: a.why.to_string(),
         }
     }
 }
@@ -436,9 +467,18 @@ impl GpuPreview {
                     lock(&self.play_tally).sessions += 1;
                     held = Some(session);
                 }
-                Err(reasons) => {
+                Err(Declined { reasons, ahead }) => {
                     lock(&self.play_tally).declined += 1;
-                    return Ok(self.stream_answer(reasons, None));
+                    // A frame the GPU would not draw says where: the page may take the play back past it.
+                    let play = ahead.map(|ahead| PlayInfo {
+                        session: key.session,
+                        start: t,
+                        frame: 0,
+                        repeat: false,
+                        ahead: Some(ahead),
+                        resume: None,
+                    });
+                    return Ok(self.stream_answer(reasons, play));
                 }
             }
         }
@@ -589,31 +629,11 @@ impl GpuPreview {
         t: f64,
         overlays: bool,
         now: Instant,
-    ) -> Result<PlaySession, Vec<Reason>> {
+    ) -> Result<PlaySession, Declined> {
         let one = |kind: &'static str, why: String| vec![Reason::new(kind, why)];
-        if !self.is_enabled() {
-            return Err(one("preview_off", "the GPU preview is off".into()));
-        }
-        let Some(technique) = self.technique.technique else {
-            return Err(one(
-                "no_surface",
-                self.technique
-                    .note
-                    .clone()
-                    .unwrap_or_else(|| "no preview surface here".into()),
-            ));
-        };
-        let Some(bounds) = lock(&self.bounds).current else {
-            return Err(one("no_bounds", "the preview has not reported where it is".into()));
-        };
+        let (technique, bounds) = self.play_surface(overlays)?;
         if !bounds.visible {
-            return Err(one("hidden", "the preview surface is hidden".into()));
-        }
-        if overlays && !technique.overlays() {
-            return Err(one(
-                "overlays",
-                "the page has something to draw over the picture, and this surface sits above the page".into(),
-            ));
+            return Err(one("hidden", "the preview surface is hidden".into()).into());
         }
         self.ensure_backend(technique, now).map_err(|why| one("backend", why))?;
         let drawing = self.drawing().map_err(|r| vec![r])?;
@@ -636,7 +656,10 @@ impl GpuPreview {
         // All or nothing: a frame in the next few seconds that the GPU does not draw is the stream's
         // for the whole session, not a switch of renderer partway through it.
         if let Some(ahead) = cut.ahead(t, HORIZON, size, &caps) {
-            return Err(one(ahead.why.kind(), format!("{} (at {:.2} s)", ahead.why, ahead.at)));
+            return Err(Declined {
+                reasons: one(ahead.why.kind(), format!("{} (at {:.2} s)", ahead.why, ahead.at)),
+                ahead: Some(ahead.into()),
+            });
         }
         // The clips on screen at the playhead are looked at now, off the frame's path, for what only the
         // frame source can see (a container whose seeks are not trusted, a format of unknown layout): the
@@ -644,7 +667,7 @@ impl GpuPreview {
         let feed = motion.feed();
         for layer in &first.layers {
             if let Err(error) = feed.check(layer) {
-                return Err(one(super::error_kind(&error), error.to_string()));
+                return Err(one(super::error_kind(&error), error.to_string()).into());
             }
         }
         // Nothing the user looks at before the GPU has been checked against this FFmpeg.
@@ -676,6 +699,140 @@ impl GpuPreview {
             present_ms: 0.0,
             worst_ms: 0.0,
         })
+    }
+
+    /// What a play is drawn on: the technique and the bounds the page last reported (shown or not), or why
+    /// there is none to play on.
+    fn play_surface(&self, overlays: bool) -> Result<(super::Technique, super::Bounds), Vec<Reason>> {
+        let one = |kind: &'static str, why: String| vec![Reason::new(kind, why)];
+        if !self.is_enabled() {
+            return Err(one("preview_off", "the GPU preview is off".into()));
+        }
+        let Some(technique) = self.technique.technique else {
+            return Err(one(
+                "no_surface",
+                self.technique
+                    .note
+                    .clone()
+                    .unwrap_or_else(|| "no preview surface here".into()),
+            ));
+        };
+        let Some(bounds) = lock(&self.bounds).current else {
+            return Err(one("no_bounds", "the preview has not reported where it is".into()));
+        };
+        if overlays && !technique.overlays() {
+            return Err(one(
+                "overlays",
+                "the page has something to draw over the picture, and this surface sits above the page".into(),
+            ));
+        }
+        Ok((technique, bounds))
+    }
+
+    /// Serve a `ready` request: the stream plays the cut (it took the play over before a frame the GPU does
+    /// not draw, or the play began with it), and the page asks where, from `t` on, the GPU can take it back.
+    /// That is the first frame within [`REACH`] from which the GPU draws [`HORIZON`] and a little more
+    /// ([`PlayCut::resume`]); the play from there is primed (its cut made, the cursors of its first frame
+    /// opened) and the answer is `ready` with `play.resume`, so the page's next session, begun there, adopts it
+    /// and draws its first frame from what is already decoded. Nothing is drawn and the surface is not shown.
+    /// `stream` with `play.ahead` is "not within reach, ask again later"; `stream` with no `play` is "not this
+    /// play" (the setting, the surface, the self-test, no plan from there).
+    pub(super) fn ready_play(
+        &self,
+        inputs: &PlanInputs,
+        key: &PlayKey,
+        t: f64,
+        overlays: bool,
+    ) -> Result<PreviewFrameResult, String> {
+        // The session the stream took over from is over, and so is anything primed for another playhead.
+        self.end_play();
+        self.drop_primed();
+        let not = |reasons: Vec<Reason>| Ok(self.ready_answer("stream", reasons, None));
+        let (technique, bounds) = match self.play_surface(overlays) {
+            Ok(surface) => surface,
+            Err(reasons) => return not(reasons),
+        };
+        let drawing = match self.drawing() {
+            Ok(drawing) => drawing,
+            Err(reason) => return not(vec![reason]),
+        };
+        if !self.check.is_open(&drawing.adapter) {
+            return not(vec![Reason::new(
+                "self_test",
+                "the GPU has not been checked against this FFmpeg",
+            )]);
+        }
+        let cut = match PlayCut::new(&inputs.timeline, &inputs.assets, t, (self.policy)(), &ProxyMedia) {
+            Ok(cut) => cut,
+            Err(e) => return not(vec![Reason::new("no_plan", format!("no plan to play from here: {e}"))]),
+        };
+        let size = match cut.plan(t).map_err(|e| e.to_string()).and_then(|first| {
+            self.sized(technique, &bounds, &drawing.host, &first)
+                .map(|(_, size)| size)
+                .map_err(|r| r.text)
+        }) {
+            Ok(size) => size,
+            Err(why) => return not(vec![Reason::new("no_plan", why)]),
+        };
+        let caps = drawing.compositor.caps();
+        let info = |ahead: Option<AheadInfo>, resume: Option<f64>| PlayInfo {
+            session: key.session,
+            start: cut.start(),
+            frame: cut.frame_at(t),
+            repeat: false,
+            ahead,
+            resume,
+        };
+        // A little more than a session scans: its first request is a frame or two after the time asked for.
+        let Some(at) = cut.resume(t, REACH, HORIZON + RESUME_SLACK, size, &caps) else {
+            let ahead = cut.ahead(t, REACH, size, &caps).map(AheadInfo::from);
+            let why = ahead.as_ref().map_or_else(String::new, |a| a.why.clone());
+            return Ok(self.ready_answer(
+                "stream",
+                vec![Reason::new(
+                    "not_yet",
+                    format!("nothing the GPU plays within {REACH} s: {why}"),
+                )],
+                Some(info(ahead, None)),
+            ));
+        };
+        match self.make_primed(inputs, at, technique, &bounds, &drawing) {
+            Ok(primed) => {
+                let start = primed.cut.start();
+                self.keep_primed(primed);
+                tracing::debug!(
+                    from = t,
+                    resume = at,
+                    start,
+                    "a play is ready to be taken back from the stream"
+                );
+                Ok(self.ready_answer("ready", Vec::new(), Some(info(None, Some(at)))))
+            }
+            // A clip there that cannot be opened: past it, the page asks again.
+            Err(why) => Ok(self.ready_answer(
+                "stream",
+                vec![Reason::new("cursor", why.clone())],
+                Some(info(
+                    Some(AheadInfo {
+                        at,
+                        handover: cut.handover_at(at),
+                        kind: "cursor",
+                        why,
+                    }),
+                    None,
+                )),
+            )),
+        }
+    }
+
+    fn ready_answer(&self, renderer: &'static str, reasons: Vec<Reason>, play: Option<PlayInfo>) -> PreviewFrameResult {
+        PreviewFrameResult {
+            renderer,
+            frame: None,
+            reasons: reasons.into_iter().map(|r| r.text).collect(),
+            timings: None,
+            play,
+        }
     }
 
     /// One frame of a session: the frame at `t`, drawn and shown — or nothing new drawn when the
@@ -989,6 +1146,7 @@ mod tests {
                     kind: "mask",
                     why: "a mask".into(),
                 }),
+                resume: Some(9.0),
             }),
         };
         let json = serde_json::to_value(&result).expect("json");
@@ -996,7 +1154,7 @@ mod tests {
         assert_eq!(
             json["play"],
             serde_json::json!({"session": 3, "start": 1.5, "frame": 12, "repeat": false,
-                "ahead": {"at": 6.0, "handover": 5.5, "kind": "mask", "why": "a mask"}})
+                "ahead": {"at": 6.0, "handover": 5.5, "kind": "mask", "why": "a mask"}, "resume": 9.0})
         );
         let plain = serde_json::to_value(PreviewFrameResult::superseded()).expect("json");
         assert!(plain["play"].is_null());
