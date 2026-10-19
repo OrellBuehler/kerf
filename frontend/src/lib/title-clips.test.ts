@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import { addTitleClip, applyTemplateClip, getTimeline, revertTo, saveTemplate, setSpeed, setTemplateValues, updateTitleClip } from './api';
 import { resetDevTemplates, SAMPLE_TEMPLATE_ID } from './template-dev';
-import { findTitle, placeTitleClip, titleClip, titleName, titleOf } from './title-clips';
+import { findTitle, MAX_TITLE_SECONDS, placeTitleClip, titleClip, titleName, titleOf } from './title-clips';
+import { sourceLimits } from './trim-tools';
 import { GENERATED_ASSET } from './types';
 import type { Clip, Timeline } from './types';
 
@@ -54,6 +55,10 @@ describe('placing a title clip', () => {
 		expect(() => placeTitleClip(tl, titleClip({ name: '', svg: ART }, 0, 1), 'a1')).toThrow('not a video track');
 		const unlocked = cut();
 		expect(() => placeTitleClip(unlocked, titleClip({ name: '', svg: ART }, 3, 1), 'v1')).toThrow('overlap');
+	});
+
+	test('a title reaches as far as its document may run, as the engine says', () => {
+		expect(sourceLimits([]).get(GENERATED_ASSET)).toBe(MAX_TITLE_SECONDS);
 	});
 
 	test('a title is named by itself, its template, else a placeholder; and found floating or on a track', () => {
